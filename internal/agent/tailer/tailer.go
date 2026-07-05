@@ -70,10 +70,13 @@ type Config struct {
 	// tailed (e.g. the observability namespace itself, to avoid feedback
 	// loops through the collector's own output).
 	ExcludeNamespaces []string
-	MetadataWait      time.Duration
-	Metadata          MetadataSource
-	Exporter          LogExporter
-	Logger            *slog.Logger
+	// AttrFilter selects which resource attributes are exported (nil keeps
+	// all).
+	AttrFilter   *attrs.Filter
+	MetadataWait time.Duration
+	Metadata     MetadataSource
+	Exporter     LogExporter
+	Logger       *slog.Logger
 }
 
 // Tailer tails all container logs in a directory. All methods run on the
@@ -411,6 +414,7 @@ func (t *Tailer) resolveMetadata(ctx context.Context, f *file) bool {
 	res := pcommon.NewResource()
 	attrs.Pod(res, md.Pod)
 	attrs.Container(res, md.Container)
+	t.cfg.AttrFilter.Apply(res)
 	f.resource = res
 	f.resolved = true
 	return true

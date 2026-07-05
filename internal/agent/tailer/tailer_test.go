@@ -13,6 +13,7 @@ import (
 
 	"go.opentelemetry.io/collector/pdata/plog"
 
+	"github.com/JohanLindvall/kubescrape/internal/agent/attrs"
 	"github.com/JohanLindvall/kubescrape/internal/kubemeta"
 )
 
@@ -22,15 +23,19 @@ func (fakeMeta) Container(_ context.Context, id string, _ time.Duration) (*kubem
 	return &kubemeta.ContainerMetadata{
 		ContainerID: id,
 		Container:   kubemeta.Container{Name: "app", ID: id},
-		Pod:         kubemeta.Pod{Name: "pod1", Namespace: "ns1", UID: "uid1", NodeName: "node1"},
+		Pod: kubemeta.Pod{
+			Name: "pod1", Namespace: "ns1", UID: "uid1", NodeName: "node1",
+			Labels: map[string]string{"app": "x"},
+		},
 	}, nil
 }
 
 type fakeExporter struct {
-	mu      sync.Mutex
-	fail    int // fail this many exports before succeeding
-	records []string
-	batches int
+	mu       sync.Mutex
+	fail     int // fail this many exports before succeeding
+	records  []string
+	resAttrs map[string]any // resource attributes of the last batch
+	batches  int
 }
 
 func (f *fakeExporter) ExportLogs(_ context.Context, ld plog.Logs) error {
@@ -43,6 +48,7 @@ func (f *fakeExporter) ExportLogs(_ context.Context, ld plog.Logs) error {
 	f.batches++
 	for i := 0; i < ld.ResourceLogs().Len(); i++ {
 		rl := ld.ResourceLogs().At(i)
+		f.resAttrs = rl.Resource().Attributes().AsRaw()
 		for j := 0; j < rl.ScopeLogs().Len(); j++ {
 			lrs := rl.ScopeLogs().At(j).LogRecords()
 			for k := 0; k < lrs.Len(); k++ {
@@ -267,6 +273,31 @@ func TestMultiline(t *testing.T) {
 	}
 	if !joined || !plain {
 		t.Fatalf("joined=%v plain=%v records=%q", joined, plain, exp.get())
+	}
+}
+
+func TestAttrFilter(t *testing.T) {
+	dir := t.TempDir()
+	exp := &fakeExporter{}
+	tl := newTestTailer(dir, "", exp)
+	filter, err := attrs.NewFilter("", `k8s\.pod\.label\..*`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tl.cfg.AttrFilter = filter
+	stop := startTailer(t, tl)
+	defer stop()
+
+	writeLog(t, dir, "2026-07-05T10:00:00Z stdout F hi")
+	waitFor(t, func() bool { return len(exp.get()) == 1 }, "record")
+
+	exp.mu.Lock()
+	defer exp.mu.Unlock()
+	if _, ok := exp.resAttrs["k8s.pod.label.app"]; ok {
+		t.Fatalf("filtered attribute exported: %v", exp.resAttrs)
+	}
+	if exp.resAttrs["k8s.pod.name"] != "pod1" {
+		t.Fatalf("kept attributes damaged: %v", exp.resAttrs)
 	}
 }
 

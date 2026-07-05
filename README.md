@@ -224,6 +224,14 @@ ServiceAccount token (`nodes/metrics` RBAC, see
 (all default true; the kubelet scrapes additionally require
 `-kubelet-endpoint`).
 
+**Resource attribute filtering.** `-resource-attrs-enable` and
+`-resource-attrs-disable` take comma-separated regexes matched against the
+full attribute key (anchored). An attribute is exported when it matches the
+enable set (empty = enable all) and does not match the disable set (empty =
+disable none). Applies uniformly to log and metric resources, e.g.
+`-resource-attrs-disable='k8s\.pod\.label\..*,k8s\.namespace\.label\..*'`
+drops all label attributes.
+
 For a local test pipeline, `hack/otel-collector.yaml` deploys a contrib
 collector with a debug exporter; the agent's own internal metrics stay small.
 

@@ -162,6 +162,7 @@ func (s *Scraper) scrapeNodeMetrics(ctx context.Context) error {
 		a.PutStr("k8s.node.name", node)
 		a.PutStr("service.name", "kubelet")
 		a.PutStr("url.full", url)
+		s.cfg.AttrFilter.Apply(res)
 	}, s.cfg.BatchPoints, s.cfg.StartTime, time.Now())
 	return s.parseAndExport(ctx, resp.Body, false, false, b, url)
 }
@@ -287,6 +288,7 @@ func (cb *cadvisorBatcher) scope(labels []Label) (pmetric.ScopeMetrics, string) 
 
 	rm := cb.md.ResourceMetrics().AppendEmpty()
 	cb.fillResource(rm.Resource(), ident)
+	cb.s.cfg.AttrFilter.Apply(rm.Resource())
 	sm := rm.ScopeMetrics().AppendEmpty()
 	sm.Scope().SetName("github.com/JohanLindvall/kubescrape/agent/promscrape/cadvisor")
 	cb.scopes[key] = sm

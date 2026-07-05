@@ -12,6 +12,7 @@ import (
 
 	"go.opentelemetry.io/collector/pdata/pmetric"
 
+	"github.com/JohanLindvall/kubescrape/internal/agent/attrs"
 	"github.com/JohanLindvall/kubescrape/internal/kubemeta"
 )
 
@@ -280,6 +281,39 @@ func TestScrapeExemplarsDisabled(t *testing.T) {
 	m := exp.batches[0].ResourceMetrics().At(0).ScopeMetrics().At(0).Metrics().At(0)
 	if m.Sum().DataPoints().At(0).Exemplars().Len() != 0 {
 		t.Fatal("exemplars attached despite being disabled")
+	}
+}
+
+func TestScrapeAttrFilter(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("m 1\n"))
+	}))
+	defer srv.Close()
+
+	filter, err := attrs.NewFilter("", `k8s\.pod\.label\..*,url\.full,k8s\.service\..*`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := testTarget(srv.URL)
+	target.Pod.Labels = map[string]string{"app": "x"}
+
+	exp := &captureExporter{}
+	s := New(Config{
+		Node: "node1", Interval: time.Hour, Timeout: 5 * time.Second,
+		Targets: staticTargets{target}, Exporter: exp, StartTime: time.Now(),
+		AttrFilter: filter,
+	})
+	if err := s.scrapeTarget(context.Background(), target); err != nil {
+		t.Fatal(err)
+	}
+	got := exp.batches[0].ResourceMetrics().At(0).Resource().Attributes()
+	for _, banned := range []string{"k8s.pod.label.app", "url.full", "k8s.service.name"} {
+		if _, ok := got.Get(banned); ok {
+			t.Errorf("filtered attribute %q still present: %v", banned, got.AsRaw())
+		}
+	}
+	if v, _ := got.Get("k8s.pod.name"); v.Str() != "pod1" {
+		t.Fatalf("kept attributes damaged: %v", got.AsRaw())
 	}
 }
 

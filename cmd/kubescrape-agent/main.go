@@ -17,6 +17,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/JohanLindvall/kubescrape/internal/agent/attrs"
 	"github.com/JohanLindvall/kubescrape/internal/agent/metaclient"
 	"github.com/JohanLindvall/kubescrape/internal/agent/otlpexport"
 	"github.com/JohanLindvall/kubescrape/internal/agent/promscrape"
@@ -59,6 +60,9 @@ func run() error {
 		kubeletToken    = flag.String("kubelet-token-file", "/var/run/secrets/kubernetes.io/serviceaccount/token", "bearer token file for the kubelet (re-read per scrape)")
 		kubeletInsecure = flag.Bool("kubelet-insecure-tls", true, "skip TLS verification for the kubelet (its serving certificate is typically self-signed)")
 
+		attrsEnable  = flag.String("resource-attrs-enable", "", "comma-separated anchored regexes; only matching resource attributes are exported (empty enables all)")
+		attrsDisable = flag.String("resource-attrs-disable", "", "comma-separated anchored regexes; matching resource attributes are dropped (empty disables none)")
+
 		// Pipeline toggles.
 		logsOn     = flag.Bool("logs", true, "tail container logs")
 		metricsOn  = flag.Bool("metrics", true, "scrape annotation-discovered pod/service targets")
@@ -77,6 +81,11 @@ func run() error {
 
 	log := slog.New(slog.NewTextHandler(os.Stderr, nil))
 	slog.SetDefault(log)
+
+	attrFilter, err := attrs.NewFilter(*attrsEnable, *attrsDisable)
+	if err != nil {
+		return fmt.Errorf("resource attribute filter: %w", err)
+	}
 
 	// The metadata client's HTTP timeout must exceed the server-side wait.
 	meta := metaclient.New(*metadataURL, *metadataWait+10*time.Second)
@@ -99,6 +108,7 @@ func run() error {
 			Multiline:         *multilineOn,
 			MultilineTimeout:  *multilineWait,
 			ExcludeNamespaces: splitList(*excludeNs),
+			AttrFilter:        attrFilter,
 			MetadataWait:      *metadataWait,
 			Metadata:          meta,
 			Exporter:          exporter,
@@ -132,10 +142,11 @@ func run() error {
 				InsecureTLS:    *kubeletInsecure,
 				Meta:           meta,
 			},
-			Logger:    log,
-			Targets:   meta,
-			Exporter:  exporter,
-			StartTime: time.Now(),
+			AttrFilter: attrFilter,
+			Logger:     log,
+			Targets:    meta,
+			Exporter:   exporter,
+			StartTime:  time.Now(),
 		})
 		wg.Add(1)
 		go func() {

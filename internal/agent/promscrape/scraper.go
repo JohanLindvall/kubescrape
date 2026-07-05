@@ -45,11 +45,14 @@ type Config struct {
 	DisableTargets bool
 	// Kubelet configures scraping of the kubelet's cadvisor and node
 	// metrics endpoints.
-	Kubelet   KubeletConfig
-	Logger    *slog.Logger
-	Targets   TargetSource
-	Exporter  MetricExporter
-	StartTime time.Time // cumulative-sum start timestamp (agent start)
+	Kubelet KubeletConfig
+	// AttrFilter selects which resource attributes are exported (nil keeps
+	// all).
+	AttrFilter *attrs.Filter
+	Logger     *slog.Logger
+	Targets    TargetSource
+	Exporter   MetricExporter
+	StartTime  time.Time // cumulative-sum start timestamp (agent start)
 }
 
 // Scraper periodically scrapes all targets of one node and exports the
@@ -199,6 +202,7 @@ func (s *Scraper) scrapeTarget(ctx context.Context, t kubemeta.ScrapeTarget) err
 		attrs.Pod(res, t.Pod)
 		attrs.Service(res, t.Service)
 		res.Attributes().PutStr("url.full", t.URL)
+		s.cfg.AttrFilter.Apply(res)
 	}, s.cfg.BatchPoints, s.cfg.StartTime, time.Now())
 	return s.parseAndExport(ctx, resp.Body, openMetrics, s.cfg.Exemplars, b, t.URL)
 }

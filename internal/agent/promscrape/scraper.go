@@ -40,6 +40,12 @@ type Config struct {
 	// Exemplars negotiates the OpenMetrics format and attaches exemplars to
 	// counter and histogram data points.
 	Exemplars bool
+	// DisableTargets turns off scraping of annotation-discovered pod and
+	// service targets (the kubelet scrapes are configured separately).
+	DisableTargets bool
+	// Kubelet configures scraping of the kubelet's cadvisor and node
+	// metrics endpoints.
+	Kubelet   KubeletConfig
 	Logger    *slog.Logger
 	Targets   TargetSource
 	Exporter  MetricExporter
@@ -57,6 +63,11 @@ type Scraper struct {
 	cfg  Config
 	http *http.Client
 	log  *slog.Logger
+
+	// kubelet state; podCache is only touched by the (single) cadvisor
+	// scrape goroutine.
+	kubeletHTTP *http.Client
+	podCache    map[string]podCacheEntry
 }
 
 // New creates a Scraper.
@@ -83,7 +94,9 @@ func New(cfg Config) *Scraper {
 				IdleConnTimeout:     90 * time.Second,
 			},
 		},
-		log: log,
+		log:         log,
+		kubeletHTTP: newKubeletHTTPClient(cfg.Kubelet, cfg.Timeout),
+		podCache:    make(map[string]podCacheEntry),
 	}
 }
 
@@ -103,14 +116,38 @@ func (s *Scraper) Run(ctx context.Context) {
 }
 
 func (s *Scraper) cycle(ctx context.Context) {
-	targets, err := s.cfg.Targets.NodeTargets(ctx, s.cfg.Node)
-	if err != nil {
-		s.log.Error("fetching scrape targets", "node", s.cfg.Node, "error", err)
-		return
+	var targets []kubemeta.ScrapeTarget
+	if !s.cfg.DisableTargets {
+		var err error
+		targets, err = s.cfg.Targets.NodeTargets(ctx, s.cfg.Node)
+		if err != nil {
+			s.log.Error("fetching scrape targets", "node", s.cfg.Node, "error", err)
+			// The kubelet scrapes below do not depend on the target list.
+		}
 	}
 
 	sem := make(chan struct{}, s.cfg.Concurrency)
 	var wg sync.WaitGroup
+	spawn := func(what string, scrape func(context.Context) error) {
+		sem <- struct{}{}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			defer func() { <-sem }()
+			if err := scrape(ctx); err != nil && ctx.Err() == nil {
+				s.log.Warn(what+" scrape failed", "error", err)
+			}
+		}()
+	}
+	if s.cfg.Kubelet.Endpoint != "" {
+		if s.cfg.Kubelet.Cadvisor {
+			spawn("cadvisor", s.scrapeCadvisor)
+		}
+		if s.cfg.Kubelet.NodeMetrics {
+			spawn("node metrics", s.scrapeNodeMetrics)
+		}
+	}
+
 	for _, t := range targets {
 		select {
 		case <-ctx.Done():
@@ -158,55 +195,33 @@ func (s *Scraper) scrapeTarget(ctx context.Context, t kubemeta.ScrapeTarget) err
 	// regardless of Accept, so detect from the response.
 	openMetrics := strings.Contains(resp.Header.Get("Content-Type"), "openmetrics")
 
-	b := newBatcher(t, s.cfg.BatchPoints, s.cfg.StartTime, time.Now())
-	conv := newConverter(b)
-	parser := NewParser(s.cfg.MaxLineBytes, openMetrics, s.cfg.Exemplars)
-	samples := 0
-	malformed, err := parser.Parse(resp.Body, func(sample Sample) error {
-		samples++
-		if s.cfg.MaxSamples > 0 && samples > s.cfg.MaxSamples {
-			return ErrTooManySamples
-		}
-		conv.add(sample)
-		if b.points >= s.cfg.BatchPoints {
-			return s.cfg.Exporter.ExportMetrics(ctx, b.take())
-		}
-		return nil
-	})
-	if err != nil {
-		return err
-	}
-	conv.finish()
-	if b.points > 0 {
-		if err := s.cfg.Exporter.ExportMetrics(ctx, b.take()); err != nil {
-			return err
-		}
-	}
-	if malformed > 0 {
-		s.log.Warn("scrape had malformed lines", "url", t.URL, "malformed", malformed, "samples", samples)
-	}
-	return nil
+	b := newBatcher(func(res pcommon.Resource) {
+		attrs.Pod(res, t.Pod)
+		attrs.Service(res, t.Service)
+		res.Attributes().PutStr("url.full", t.URL)
+	}, s.cfg.BatchPoints, s.cfg.StartTime, time.Now())
+	return s.parseAndExport(ctx, resp.Body, openMetrics, s.cfg.Exemplars, b, t.URL)
 }
 
-// batcher accumulates samples of one target into a pmetric.Metrics payload,
-// grouping data points by metric name.
+// batcher accumulates samples of one source into a pmetric.Metrics payload
+// with a single resource, grouping data points by metric name.
 type batcher struct {
-	target   kubemeta.ScrapeTarget
-	limit    int
-	startTS  pcommon.Timestamp
-	scrapeTS pcommon.Timestamp
-	md       pmetric.Metrics
-	sm       pmetric.ScopeMetrics
-	byName   map[string]pmetric.Metric
-	points   int
+	fillResource func(pcommon.Resource)
+	limit        int
+	startTS      pcommon.Timestamp
+	scrapeTS     pcommon.Timestamp
+	md           pmetric.Metrics
+	sm           pmetric.ScopeMetrics
+	byName       map[string]pmetric.Metric
+	points       int
 }
 
-func newBatcher(t kubemeta.ScrapeTarget, limit int, start, scrape time.Time) *batcher {
+func newBatcher(fillResource func(pcommon.Resource), limit int, start, scrape time.Time) *batcher {
 	b := &batcher{
-		target:   t,
-		limit:    limit,
-		startTS:  pcommon.NewTimestampFromTime(start),
-		scrapeTS: pcommon.NewTimestampFromTime(scrape),
+		fillResource: fillResource,
+		limit:        limit,
+		startTS:      pcommon.NewTimestampFromTime(start),
+		scrapeTS:     pcommon.NewTimestampFromTime(scrape),
 	}
 	b.reset()
 	return b
@@ -215,9 +230,7 @@ func newBatcher(t kubemeta.ScrapeTarget, limit int, start, scrape time.Time) *ba
 func (b *batcher) reset() {
 	b.md = pmetric.NewMetrics()
 	rm := b.md.ResourceMetrics().AppendEmpty()
-	attrs.Pod(rm.Resource(), b.target.Pod)
-	attrs.Service(rm.Resource(), b.target.Service)
-	rm.Resource().Attributes().PutStr("url.full", b.target.URL)
+	b.fillResource(rm.Resource())
 	sm := rm.ScopeMetrics().AppendEmpty()
 	sm.Scope().SetName("github.com/JohanLindvall/kubescrape/agent/promscrape")
 	b.sm = sm
@@ -231,3 +244,5 @@ func (b *batcher) take() pmetric.Metrics {
 	b.reset()
 	return md
 }
+
+func (b *batcher) count() int { return b.points }

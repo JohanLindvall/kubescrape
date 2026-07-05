@@ -122,6 +122,12 @@ identity, labels and annotations:
 }
 ```
 
+### `GET /v1/pods/{namespace}/{name}`
+
+Full metadata for one pod looked up by name (the agent uses this to
+attribute cadvisor series). Deleted pods stay resolvable until their
+tombstone expires or a new pod with the same name replaces them.
+
 ### `GET /healthz`, `GET /readyz`
 
 Liveness is always `200`; readiness turns `200` once the initial informer
@@ -189,6 +195,34 @@ With `-scrape-exemplars` the agent negotiates the OpenMetrics format and
 attaches **exemplars** to counter and histogram points (`trace_id`/`span_id`
 map to the OTLP trace/span fields, other exemplar labels become filtered
 attributes). `-scrape-max-samples` can cap pathological targets.
+
+**Kubelet metrics.** With `-kubelet-endpoint` (e.g.
+`https://$(NODE_IP):10250`) the agent also scrapes, authenticated with its
+ServiceAccount token (`nodes/metrics` RBAC, see
+[deploy/agent.yaml](deploy/agent.yaml)):
+
+* **cadvisor** (`/metrics/cadvisor`): per-container cgroup metrics, split
+  into one OTLP resource per pod and container. The `id` label (the cgroup
+  path, e.g. `/kubepods/burstable/pod<uid>/<containerID>`; both cgroupfs and
+  systemd layouts) is the primary identity: the container ID resolves the
+  **exact container incarnation** through `GET /v1/containers/{id}`, and the
+  pod UID disambiguates same-name pod recreations. Pod-level series without
+  a container cgroup — such as `container_network_*` — resolve by name via
+  `GET /v1/pods/{namespace}/{name}`, cross-checked against the cgroup pod
+  UID. Identity labels move into the resource attributes (owners, labels,
+  namespace metadata included); the remaining labels stay on the data
+  points. `-cadvisor-rollups=false` drops the rollup aggregates — the
+  cgroup hierarchy above pods (`/`, `/kubepods`, QoS and system slices) and
+  pod-level rows of container-scoped families (the pod cgroup rolls its
+  containers up) — while keeping container-level series, genuinely
+  pod-scoped families (`container_network_*`) and `machine_*`.
+* **node metrics** (`/metrics`): the kubelet's own metrics under a node-level
+  resource (`k8s.node.name`, `service.name: kubelet`).
+
+**Pipeline toggles.** Each pipeline is individually switchable: `-logs`,
+`-metrics` (annotation-discovered targets), `-cadvisor` and `-node-metrics`
+(all default true; the kubelet scrapes additionally require
+`-kubelet-endpoint`).
 
 For a local test pipeline, `hack/otel-collector.yaml` deploys a contrib
 collector with a debug exporter; the agent's own internal metrics stay small.

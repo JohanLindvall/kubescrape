@@ -54,8 +54,17 @@ func run() error {
 		metricsBatch      = flag.Int("metrics-batch-size", 10000, "export metrics in chunks of this many data points")
 		maxSamples        = flag.Int("scrape-max-samples", 0, "abort a single scrape beyond this many samples (0 = unlimited)")
 		exemplars         = flag.Bool("scrape-exemplars", false, "negotiate OpenMetrics and attach exemplars to counter and histogram data points")
-		disableLogs       = flag.Bool("disable-logs", false, "disable the log tailer")
-		disableMetrics    = flag.Bool("disable-metrics", false, "disable the Prometheus scraper")
+
+		kubeletEndpoint = flag.String("kubelet-endpoint", "", "kubelet base URL, e.g. https://$(NODE_IP):10250 (empty disables the cadvisor and node-metrics scrapes)")
+		kubeletToken    = flag.String("kubelet-token-file", "/var/run/secrets/kubernetes.io/serviceaccount/token", "bearer token file for the kubelet (re-read per scrape)")
+		kubeletInsecure = flag.Bool("kubelet-insecure-tls", true, "skip TLS verification for the kubelet (its serving certificate is typically self-signed)")
+
+		// Pipeline toggles.
+		logsOn     = flag.Bool("logs", true, "tail container logs")
+		metricsOn  = flag.Bool("metrics", true, "scrape annotation-discovered pod/service targets")
+		cadvisorOn = flag.Bool("cadvisor", true, "scrape <kubelet-endpoint>/metrics/cadvisor (per-container metrics)")
+		rollupsOn  = flag.Bool("cadvisor-rollups", true, "include cadvisor rollup series: cgroups above pod level and pod-level rows of container-scoped families")
+		nodeOn     = flag.Bool("node-metrics", true, "scrape <kubelet-endpoint>/metrics (kubelet/node metrics)")
 	)
 	flag.Parse()
 
@@ -80,7 +89,7 @@ func run() error {
 
 	var wg sync.WaitGroup
 
-	if !*disableLogs {
+	if *logsOn {
 		tl := tailer.New(tailer.Config{
 			Dir:               *logDir,
 			CheckpointFile:    *checkpointFile,
@@ -103,26 +112,38 @@ func run() error {
 		log.Info("log tailer started", "dir", *logDir, "checkpoint", *checkpointFile)
 	}
 
-	if !*disableMetrics {
+	kubeletScrapes := *kubeletEndpoint != "" && (*cadvisorOn || *nodeOn)
+	if *metricsOn || kubeletScrapes {
 		sc := promscrape.New(promscrape.Config{
-			Node:        *nodeName,
-			Interval:    *scrapeInterval,
-			Timeout:     *scrapeTimeout,
-			Concurrency: *scrapeConcurrency,
-			BatchPoints: *metricsBatch,
-			MaxSamples:  *maxSamples,
-			Exemplars:   *exemplars,
-			Logger:      log,
-			Targets:     meta,
-			Exporter:    exporter,
-			StartTime:   time.Now(),
+			Node:           *nodeName,
+			Interval:       *scrapeInterval,
+			Timeout:        *scrapeTimeout,
+			Concurrency:    *scrapeConcurrency,
+			BatchPoints:    *metricsBatch,
+			MaxSamples:     *maxSamples,
+			Exemplars:      *exemplars,
+			DisableTargets: !*metricsOn,
+			Kubelet: promscrape.KubeletConfig{
+				Endpoint:       *kubeletEndpoint,
+				Cadvisor:       *cadvisorOn,
+				DisableRollups: !*rollupsOn,
+				NodeMetrics:    *nodeOn,
+				TokenFile:      *kubeletToken,
+				InsecureTLS:    *kubeletInsecure,
+				Meta:           meta,
+			},
+			Logger:    log,
+			Targets:   meta,
+			Exporter:  exporter,
+			StartTime: time.Now(),
 		})
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			sc.Run(ctx)
 		}()
-		log.Info("prometheus scraper started", "node", *nodeName, "interval", *scrapeInterval)
+		log.Info("prometheus scraper started", "node", *nodeName, "interval", *scrapeInterval,
+			"targets", *metricsOn, "cadvisor", kubeletScrapes && *cadvisorOn, "nodeMetrics", kubeletScrapes && *nodeOn)
 	}
 
 	<-ctx.Done()

@@ -16,14 +16,22 @@ import (
 // point (one per bucket line otherwise).
 const maxExemplarsPerPoint = 16
 
+// sink receives converted points; implemented by batcher (one resource per
+// target) and cadvisorBatcher (one resource per pod/container).
+type sink interface {
+	addNumber(s Sample, monotonic bool)
+	addHistogram(family string, acc *histAcc)
+	addSummary(family string, acc *summAcc)
+}
+
 // converter turns the sample stream into OTLP points. Gauges and counters
-// pass straight through to the batcher; histogram and summary component
+// pass straight through to the sink; histogram and summary component
 // series (_bucket/_sum/_count, quantiles) are accumulated per family and per
 // label set and emitted as proper Histogram/Summary data points when the
 // family ends. Memory is bounded by the largest single family, not the
 // scrape.
 type converter struct {
-	b      *batcher
+	b      sink
 	family string
 	hists  map[string]*histAcc
 	summs  map[string]*summAcc
@@ -60,7 +68,7 @@ type quantileValue struct {
 	q, v float64
 }
 
-func newConverter(b *batcher) *converter {
+func newConverter(b sink) *converter {
 	return &converter{
 		b:     b,
 		hists: make(map[string]*histAcc),
@@ -256,6 +264,21 @@ func (b *batcher) addHistogram(family string, acc *histAcc) {
 		return
 	}
 
+	dp := m.Histogram().DataPoints().AppendEmpty()
+	dp.SetStartTimestamp(b.startTS)
+	dp.SetTimestamp(b.pointTS(acc.ts))
+	fillHistogramPoint(dp, acc)
+	putLabels(dp.Attributes(), acc.labels)
+	for _, e := range acc.exemplars {
+		setExemplar(dp.Exemplars().AppendEmpty(), e, b.scrapeTS)
+	}
+	b.points++
+}
+
+// fillHistogramPoint converts accumulated cumulative buckets into the OTLP
+// shape: bounds exclude +Inf, bucket counts are de-cumulated, the overflow
+// bucket is derived from the total count.
+func fillHistogramPoint(dp pmetric.HistogramDataPoint, acc *histAcc) {
 	sort.Slice(acc.buckets, func(i, j int) bool { return acc.buckets[i].le < acc.buckets[j].le })
 	// Deduplicate repeated le values (keep the last occurrence).
 	buckets := acc.buckets[:0]
@@ -272,10 +295,6 @@ func (b *batcher) addHistogram(family string, acc *histAcc) {
 			total = buckets[n-1].cum
 		}
 	}
-
-	dp := m.Histogram().DataPoints().AppendEmpty()
-	dp.SetStartTimestamp(b.startTS)
-	dp.SetTimestamp(b.pointTS(acc.ts))
 	dp.SetCount(total)
 	if acc.hasSum {
 		dp.SetSum(acc.sum)
@@ -294,12 +313,6 @@ func (b *batcher) addHistogram(family string, acc *histAcc) {
 	}
 	// Overflow bucket: everything above the last finite bound.
 	counts.Append(monotonicDiff(total, prev))
-
-	putLabels(dp.Attributes(), acc.labels)
-	for _, e := range acc.exemplars {
-		setExemplar(dp.Exemplars().AppendEmpty(), e, b.scrapeTS)
-	}
-	b.points++
 }
 
 // addSummary emits one Summary data point from accumulated quantiles.
@@ -318,6 +331,13 @@ func (b *batcher) addSummary(family string, acc *summAcc) {
 	dp := m.Summary().DataPoints().AppendEmpty()
 	dp.SetStartTimestamp(b.startTS)
 	dp.SetTimestamp(b.pointTS(acc.ts))
+	fillSummaryPoint(dp, acc)
+	putLabels(dp.Attributes(), acc.labels)
+	b.points++
+}
+
+// fillSummaryPoint sets count, sum and sorted quantile values.
+func fillSummaryPoint(dp pmetric.SummaryDataPoint, acc *summAcc) {
 	if acc.hasCount {
 		dp.SetCount(acc.count)
 	}
@@ -330,8 +350,6 @@ func (b *batcher) addSummary(family string, acc *summAcc) {
 		q.SetQuantile(qv.q)
 		q.SetValue(qv.v)
 	}
-	putLabels(dp.Attributes(), acc.labels)
-	b.points++
 }
 
 func (b *batcher) pointTS(tsMs int64) pcommon.Timestamp {

@@ -1,7 +1,36 @@
 # kubescrape-agent: per-node DaemonSet tailing containerd logs and scraping
-# Prometheus targets, exporting OTLP to an OpenTelemetry collector. It talks
-# only to the kubescrape metadata service and the collector — no Kubernetes
-# API access, so no RBAC is needed.
+# Prometheus targets (including the kubelet's cadvisor endpoint), exporting
+# OTLP to an OpenTelemetry collector. Pod metadata comes from the kubescrape
+# metadata service; the ServiceAccount exists solely to authenticate to the
+# kubelet for cadvisor (nodes/metrics).
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: kubescrape-agent
+  namespace: monitoring
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kubescrape-agent
+rules:
+  - apiGroups: [""]
+    resources: ["nodes/metrics"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: kubescrape-agent
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: kubescrape-agent
+subjects:
+  - kind: ServiceAccount
+    name: kubescrape-agent
+    namespace: monitoring
+---
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:
@@ -18,6 +47,7 @@ spec:
       labels:
         app: kubescrape-agent
     spec:
+      serviceAccountName: kubescrape-agent
       tolerations:
         - key: node-role.kubernetes.io/control-plane
           operator: Exists
@@ -34,11 +64,19 @@ spec:
             - -scrape-interval=30s
             # Do not tail the collector's own output (feedback loop).
             - -logs-exclude-namespaces=monitoring
+            # Enables the cadvisor and node-metrics scrapes; disable
+            # individual pipelines with -logs=false, -metrics=false,
+            # -cadvisor=false or -node-metrics=false.
+            - -kubelet-endpoint=https://$(NODE_IP):10250
           env:
             - name: NODE_NAME
               valueFrom:
                 fieldRef:
                   fieldPath: spec.nodeName
+            - name: NODE_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.hostIP
           securityContext:
             # Container log files under /var/log/pods are root-readable only.
             runAsUser: 0

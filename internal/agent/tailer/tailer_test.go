@@ -270,6 +270,21 @@ func TestMultiline(t *testing.T) {
 	}
 }
 
+func TestNonCRILinePassthrough(t *testing.T) {
+	dir := t.TempDir()
+	exp := &fakeExporter{}
+	tl := newTestTailer(dir, "", exp)
+	stop := startTailer(t, tl)
+	defer stop()
+
+	// A line that is not CRI-formatted is forwarded as-is rather than lost.
+	writeLog(t, dir, "plain text, no CRI prefix")
+	waitFor(t, func() bool { return len(exp.get()) == 1 }, "passthrough record")
+	if exp.get()[0] != "plain text, no CRI prefix" {
+		t.Fatalf("records = %v", exp.get())
+	}
+}
+
 func TestParseFileName(t *testing.T) {
 	id, ns, ok := parseFileName("mypod_myns_app-abc123.log")
 	if !ok || id != "abc123" || ns != "myns" {

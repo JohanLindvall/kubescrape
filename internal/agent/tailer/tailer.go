@@ -2,12 +2,18 @@
 // /var/log/containers and exports the entries as OTLP logs with resource
 // attributes fetched from the kubescrape metadata service.
 //
+// Log lines flow through the two-stage github.com/JohanLindvall/multiline
+// pipeline: the cri stage parses the CRI format and rejoins partial-line
+// fragments, and the multiline stage joins application-level multi-line
+// entries such as stack traces.
+//
 // Design: a single sweep goroutine polls all files (bounded bytes per file
-// per sweep), assembles CRI entries, and batches them. Export happens inline
-// in the sweep with retries; file offsets are only committed (and
-// checkpointed) after a successful export, and on failure the files are
-// rewound to the committed offsets so the data is re-read — at-least-once
-// delivery with no unbounded in-memory queue.
+// per sweep), feeds the pipeline, and batches emitted entries. Export
+// happens inline in the sweep with retries; file offsets are only committed
+// (and checkpointed) after a successful export — never past lines still
+// buffered in the pipeline — and on failure the files are rewound to the
+// committed offsets so the data is re-read: at-least-once delivery with no
+// unbounded in-memory queue.
 package tailer
 
 import (
@@ -25,11 +31,11 @@ import (
 	"time"
 
 	"github.com/JohanLindvall/multiline"
+	"github.com/JohanLindvall/multiline/cri"
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/plog"
 
 	"github.com/JohanLindvall/kubescrape/internal/agent/attrs"
-	"github.com/JohanLindvall/kubescrape/internal/agent/crilog"
 	"github.com/JohanLindvall/kubescrape/internal/agent/metaclient"
 	"github.com/JohanLindvall/kubescrape/internal/kubemeta"
 )
@@ -55,10 +61,10 @@ type Config struct {
 	MaxEntryBytes    int // cap on one assembled log entry
 	MaxBytesPerSweep int // per file; keeps one chatty container from starving others
 	// Multiline joins application-level multi-line entries (stack traces,
-	// ...) using github.com/JohanLindvall/multiline's default matcher.
+	// ...); CRI partial-line rejoining is always on.
 	Multiline bool
-	// MultilineTimeout flushes a buffered multi-line group that has not
-	// completed within this duration.
+	// MultilineTimeout flushes buffered fragment runs and multi-line groups
+	// that have not completed within this duration.
 	MultilineTimeout time.Duration
 	// ExcludeNamespaces lists namespaces whose container logs are not
 	// tailed (e.g. the observability namespace itself, to avoid feedback
@@ -94,16 +100,19 @@ type file struct {
 	lineStart int64  // offset of the first byte not yet consumed as a line
 	committed int64  // offset covered by successful exports / checkpoint
 	pending   []byte // incomplete physical line carried between sweeps
-	asm       *crilog.Assembler
-	// entryStart is the offset of the first physical line of the CRI entry
-	// currently being assembled.
-	entryStart int64
 
-	// Multi-line aggregation (nil when disabled). fifo tracks, per stream,
-	// the file offset range of every CRI entry buffered in the aggregator so
-	// emitted groups map back to exact offsets.
-	ml   *multiline.Multiline[mlData]
-	fifo map[string][]mlItem
+	// Two-stage pipeline: criStage rejoins CRI fragments into logical lines
+	// (stage-1 data is the physical start offset), traces joins stack traces
+	// (nil when Multiline is off; data is the first line's timestamp).
+	criStage *cri.Aggregator[int64]
+	traces   *multiline.Aggregator[time.Time]
+	// Per pipeline key ("<containerID>/<stream>"): lastEnd is the end offset
+	// of the newest physical line fed; runStart is the start offset of the
+	// oldest physical line not yet emitted by stage 1; fifo holds the offset
+	// ranges of logical lines buffered in stage 2.
+	lastEnd  map[string]int64
+	runStart map[string]int64
+	fifo     map[string][]logItem
 
 	resource    pcommon.Resource // resolved metadata, valid when resolved
 	resolved    bool
@@ -111,23 +120,23 @@ type file struct {
 	gone        bool
 }
 
-type mlData struct {
-	time   time.Time
-	stream string
-}
+type logItem struct{ start, end int64 }
 
-type mlItem struct {
-	start, end int64
-	trunc      bool
-}
-
-// watermark returns the lowest start offset still buffered in the
-// aggregator; committed offsets must not advance past it.
+// watermark returns the lowest offset still buffered in the pipeline;
+// committed offsets must not advance past it.
 func (f *file) watermark() (int64, bool) {
 	wm := int64(-1)
+	lower := func(v int64) {
+		if wm < 0 || v < wm {
+			wm = v
+		}
+	}
+	for _, v := range f.runStart {
+		lower(v)
+	}
 	for _, items := range f.fifo {
-		if len(items) > 0 && (wm < 0 || items[0].start < wm) {
-			wm = items[0].start
+		if len(items) > 0 {
+			lower(items[0].start)
 		}
 	}
 	return wm, wm >= 0
@@ -193,12 +202,10 @@ func (t *Tailer) Run(ctx context.Context) {
 		select {
 		case <-ctx.Done():
 			t.sweep(context.Background())
-			// Emit multi-line groups still buffered; their offsets commit
-			// with the final flush, so nothing is re-read after a restart.
+			// Drain the pipelines; the emitted entries' offsets commit with
+			// the final flush, so nothing is re-read after a restart.
 			for _, f := range t.files {
-				if f.ml != nil {
-					_ = f.ml.Stop(context.Background())
-				}
+				t.stopPipeline(context.Background(), f)
 			}
 			t.flush(context.Background())
 			t.saveCheckpoints()
@@ -258,12 +265,8 @@ func (t *Tailer) scanDir(checkpoints map[string]checkpoint, initial bool) {
 		f := &file{
 			path:        path,
 			containerID: id,
-			asm:         crilog.NewAssembler(t.cfg.MaxEntryBytes),
 		}
-		if t.cfg.Multiline {
-			f.ml = t.newAggregator(f)
-			f.fifo = make(map[string][]mlItem)
-		}
+		t.newPipeline(f)
 		if initial {
 			if cp, ok := checkpoints[path]; ok {
 				f.committed = cp.Offset
@@ -283,8 +286,88 @@ func (t *Tailer) scanDir(checkpoints map[string]checkpoint, initial bool) {
 	}
 }
 
+// newPipeline (re)creates the file's aggregation stages with empty state.
+func (t *Tailer) newPipeline(f *file) {
+	f.lastEnd = make(map[string]int64)
+	f.runStart = make(map[string]int64)
+	f.fifo = make(map[string][]logItem)
+
+	if t.cfg.Multiline {
+		f.traces = multiline.New(func(_ context.Context, e multiline.Entry[time.Time]) error {
+			items := f.fifo[e.Key]
+			n := min(e.Lines, len(items)) // Lines > len(items) must not happen; defensive
+			if n == 0 {
+				return nil
+			}
+			end := items[n-1].end
+			f.fifo[e.Key] = items[n:]
+			t.emit(f, entry{
+				time: e.Data, stream: streamOf(e.Key), body: e.Text,
+				truncated: e.Truncated, match: e.Match, offset: end,
+			})
+			return nil
+		}, multiline.WithMaxBytes(t.cfg.MaxEntryBytes), multiline.WithMaxLines(512))
+	} else {
+		f.traces = nil
+	}
+
+	// Stage 1 hands every rejoined logical line downstream. Emission is
+	// synchronous inside Add/Flush*, so lastEnd[key] is exactly the end
+	// offset of the line's last fragment.
+	f.criStage = cri.New(func(ctx context.Context, key, line string, when time.Time, start int64) error {
+		delete(f.runStart, key)
+		end := f.lastEnd[key]
+		if f.traces == nil {
+			t.emit(f, entry{time: when, stream: streamOf(key), body: line, offset: end})
+			return nil
+		}
+		f.fifo[key] = append(f.fifo[key], logItem{start: start, end: end})
+		return f.traces.AddAt(ctx, key, line, when, when)
+	}, multiline.WithMaxBytes(t.cfg.MaxEntryBytes))
+}
+
+// emit appends one completed entry to the batch.
+func (t *Tailer) emit(f *file, e entry) {
+	e.file = f
+	t.batch = append(t.batch, e)
+}
+
+// streamOf extracts the stream from a pipeline key ("<id>/<stream>"); ""
+// for non-CRI passthrough lines.
+func streamOf(key string) string {
+	if i := strings.LastIndexByte(key, '/'); i >= 0 {
+		return key[i+1:]
+	}
+	return ""
+}
+
+// feedLine pushes one raw physical line spanning [start, end) into the
+// pipeline.
+func (t *Tailer) feedLine(ctx context.Context, f *file, raw string, start, end int64) {
+	key := f.containerID
+	if l, ok := cri.Parse(raw); ok {
+		key += "/" + l.Stream
+	}
+	f.lastEnd[key] = end
+	if _, ok := f.runStart[key]; !ok {
+		f.runStart[key] = start
+	}
+	if err := f.criStage.Add(ctx, f.containerID, raw, start); err != nil {
+		t.log.Warn("log pipeline", "path", f.path, "error", err)
+	}
+}
+
+// stopPipeline drains both stages into the batch.
+func (t *Tailer) stopPipeline(ctx context.Context, f *file) {
+	_ = f.criStage.Stop(ctx)
+	if f.traces != nil {
+		_ = f.traces.Stop(ctx)
+	}
+}
+
 // sweep reads newly appended data from every file.
 func (t *Tailer) sweep(ctx context.Context) {
+	cutoff := time.Now().Add(-t.cfg.MultilineTimeout)
 	for path, f := range t.files {
 		if f.gone {
 			t.drop(f)
@@ -297,61 +380,14 @@ func (t *Tailer) sweep(ctx context.Context) {
 		if err := t.readFile(ctx, f); err != nil && !errors.Is(err, os.ErrNotExist) {
 			t.log.Warn("reading log file", "path", path, "error", err)
 		}
-		if f.ml != nil {
-			// Emit buffered groups that did not complete in time.
-			_ = f.ml.FlushBefore(ctx, time.Now().Add(-t.cfg.MultilineTimeout))
+		// Age out fragment runs and multi-line groups that never completed.
+		_ = f.criStage.FlushBefore(ctx, cutoff)
+		if f.traces != nil {
+			_ = f.traces.FlushBefore(ctx, cutoff)
 		}
 		if len(t.batch) >= t.cfg.BatchSize {
 			t.flush(ctx)
 		}
-	}
-}
-
-// newAggregator creates the per-file multi-line aggregator. Emitted groups
-// pop their exact per-stream offset ranges from the FIFO (group size =
-// joined-line count; CRI entry bodies never contain newlines).
-func (t *Tailer) newAggregator(f *file) *multiline.Multiline[mlData] {
-	return multiline.New(func(_ context.Context, line, match string, data mlData) error {
-		items := f.fifo[data.stream]
-		n := strings.Count(line, "\n") + 1
-		if n > len(items) {
-			n = len(items) // defensive; must not happen
-		}
-		if n == 0 {
-			return nil
-		}
-		truncated := false
-		for _, it := range items[:n] {
-			truncated = truncated || it.trunc
-		}
-		end := items[n-1].end
-		f.fifo[data.stream] = items[n:]
-		t.batch = append(t.batch, entry{
-			file:      f,
-			time:      data.time,
-			stream:    data.stream,
-			body:      line,
-			truncated: truncated,
-			match:     match,
-			offset:    end,
-		})
-		return nil
-	}, multiline.WithMaxBytes(t.cfg.MaxEntryBytes), multiline.WithMaxLines(512))
-}
-
-// feed routes one assembled CRI entry into the batch, via the multi-line
-// aggregator when enabled. [start, end) is the entry's file offset range.
-func (t *Tailer) feed(ctx context.Context, f *file, e crilog.Entry, start, end int64) {
-	if f.ml == nil {
-		t.batch = append(t.batch, entry{
-			file: f, time: e.Time, stream: e.Stream,
-			body: string(e.Body), truncated: e.Truncated, offset: end,
-		})
-		return
-	}
-	f.fifo[e.Stream] = append(f.fifo[e.Stream], mlItem{start: start, end: end, trunc: e.Truncated})
-	if err := f.ml.Add(ctx, string(e.Body), e.Stream, mlData{time: e.Time, stream: e.Stream}); err != nil {
-		t.log.Warn("multiline aggregation", "path", f.path, "error", err)
 	}
 }
 
@@ -418,7 +454,7 @@ func (t *Tailer) readFile(ctx context.Context, f *file) error {
 	return nil
 }
 
-// consume splits pending bytes into physical lines and feeds the assembler.
+// consume splits pending bytes into physical lines and feeds the pipeline.
 func (t *Tailer) consume(ctx context.Context, f *file) {
 	for {
 		i := bytes.IndexByte(f.pending, '\n')
@@ -438,16 +474,7 @@ func (t *Tailer) consume(ctx context.Context, f *file) {
 		if len(line) == 0 {
 			continue
 		}
-		parsed, err := crilog.Parse(line)
-		if err != nil {
-			continue
-		}
-		if !f.asm.Pending() {
-			f.entryStart = start
-		}
-		if e, done := f.asm.Add(parsed); done {
-			t.feed(ctx, f, e, f.entryStart, f.lineStart)
-		}
+		t.feedLine(ctx, f, string(line), start, f.lineStart)
 	}
 }
 
@@ -488,19 +515,15 @@ func (t *Tailer) ensureOpen(f *file) error {
 	return nil
 }
 
-// reopen resets state after rotation; the next sweep reopens from offset 0.
+// reopen drains the pipeline (the buffered data belongs to the rotated-away
+// file) and resets state; the next sweep reopens from offset 0.
 func (t *Tailer) reopen(ctx context.Context, f *file) {
 	if f.f != nil {
 		_ = f.f.Close()
 		f.f = nil
 	}
-	if e, ok := f.asm.Flush(); ok {
-		t.feed(ctx, f, e, f.entryStart, f.lineStart)
-	}
-	if f.ml != nil {
-		_ = f.ml.Stop(ctx) // emit buffered groups; offsets refer to the old file
-		clear(f.fifo)
-	}
+	t.stopPipeline(ctx, f)
+	t.newPipeline(f)
 	f.inode = 0
 	f.committed = 0
 	f.readPos = 0
@@ -508,14 +531,10 @@ func (t *Tailer) reopen(ctx context.Context, f *file) {
 	f.pending = f.pending[:0]
 }
 
-// drop closes a removed file, flushing any assembled remainder.
+// drop closes a removed file, draining the pipeline.
 func (t *Tailer) drop(f *file) {
-	if e, ok := f.asm.Flush(); ok && f.resolved {
-		t.feed(context.Background(), f, e, f.entryStart, f.lineStart)
-	}
-	if f.ml != nil {
-		_ = f.ml.Stop(context.Background())
-		clear(f.fifo)
+	if f.resolved {
+		t.stopPipeline(context.Background(), f)
 	}
 	if f.f != nil {
 		_ = f.f.Close()
@@ -549,7 +568,9 @@ func (t *Tailer) flush(ctx context.Context) {
 		lr.SetTimestamp(pcommon.NewTimestampFromTime(e.time))
 		lr.SetObservedTimestamp(now)
 		lr.Body().SetStr(e.body)
-		lr.Attributes().PutStr("log.iostream", e.stream)
+		if e.stream != "" {
+			lr.Attributes().PutStr("log.iostream", e.stream)
+		}
 		if e.truncated {
 			lr.Attributes().PutBool("log.truncated", true)
 		}
@@ -568,8 +589,8 @@ func (t *Tailer) flush(ctx context.Context) {
 		}
 	} else {
 		for f, off := range maxOffsets {
-			// Never commit past entries still buffered in the multi-line
-			// aggregator; they have not been exported yet.
+			// Never commit past lines still buffered in the pipeline; they
+			// have not been exported yet.
 			if wm, ok := f.watermark(); ok && wm < off {
 				off = wm
 			}
@@ -600,7 +621,8 @@ func (t *Tailer) exportWithRetry(ctx context.Context, ld plog.Logs) error {
 }
 
 // rewind seeks a file back to its committed offset so unexported data is
-// read again.
+// read again. Pipeline state is discarded without emitting: the buffered
+// lines sit after the committed offset and will be re-read and re-fed.
 func (t *Tailer) rewind(f *file) {
 	if f.f == nil {
 		return
@@ -613,13 +635,7 @@ func (t *Tailer) rewind(f *file) {
 	f.readPos = f.committed
 	f.lineStart = f.committed
 	f.pending = f.pending[:0]
-	_, _ = f.asm.Flush() // discard partial assembly; it will be rebuilt
-	if f.ml != nil {
-		// Discard buffered groups without emitting: their lines sit after
-		// the committed offset and will be re-read and re-fed.
-		f.ml = t.newAggregator(f)
-		clear(f.fifo)
-	}
+	t.newPipeline(f)
 }
 
 // --- checkpoints ---

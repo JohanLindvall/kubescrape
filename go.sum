@@ -1,5 +1,5 @@
-github.com/JohanLindvall/multiline v0.0.0-20260603065439-cf07080a2194 h1:O8lCCWhDpgicO7iYQ5aAXw9jSY9I4yWeX5YfTmKiRCM=
-github.com/JohanLindvall/multiline v0.0.0-20260603065439-cf07080a2194/go.mod h1:VvDXbSmMMqtXbNbhudFSGci/hHgrsPvr3ubJzmKxOhU=
+github.com/JohanLindvall/multiline v0.0.1 h1:YMyPte802WmHe1JKdEBC4uG4cB0oIRv8kebEi9s/f+w=
+github.com/JohanLindvall/multiline v0.0.1/go.mod h1:vfQiA/IdBuVxf2ckHscR8qyO/mX9y192q6C3PDQPvUM=
 github.com/cespare/xxhash/v2 v2.3.0 h1:UL815xU9SqsFlibzuggzjXhog7bL6oX9BbNZnL2UFvs=
 github.com/cespare/xxhash/v2 v2.3.0/go.mod h1:VGX0DQ3Q6kWi7AoAeZDth3/j3BFtOZR5XLFGgcrjCOs=
 github.com/creack/pty v1.1.9/go.mod h1:oKZEueFk5CKHvIhNR5MUki03XCEU+Q6VDXinZuGJ33E=

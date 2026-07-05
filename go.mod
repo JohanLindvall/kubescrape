@@ -3,6 +3,7 @@ module github.com/JohanLindvall/kubescrape
 go 1.26.3
 
 require (
+	github.com/JohanLindvall/multiline v0.0.1
 	go.opentelemetry.io/collector/pdata v1.61.0
 	google.golang.org/grpc v1.82.0
 	k8s.io/api v0.34.1
@@ -11,7 +12,6 @@ require (
 )
 
 require (
-	github.com/JohanLindvall/multiline v0.0.0-20260603065439-cf07080a2194 // indirect
 	github.com/davecgh/go-spew v1.1.1 // indirect
 	github.com/emicklei/go-restful/v3 v3.12.2 // indirect
 	github.com/fxamacker/cbor/v2 v2.9.0 // indirect

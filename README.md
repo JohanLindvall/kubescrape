@@ -156,11 +156,12 @@ node with only `/var/log` (read-only) and a small state directory mounted —
 it needs no Kubernetes API access, only the metadata service and the
 collector.
 
-**Logs.** The agent tails `/var/log/containers`, parses the CRI log format
-(including partial-line reassembly and rotation), joins application-level
-multi-line entries such as stack traces with
-[JohanLindvall/multiline](https://github.com/JohanLindvall/multiline), and
-exports OTLP log records with resource attributes (`k8s.pod.name`,
+**Logs.** The agent tails `/var/log/containers` and runs each file through
+the two-stage [JohanLindvall/multiline](https://github.com/JohanLindvall/multiline)
+pipeline: the `cri` stage parses the CRI log format and rejoins partial-line
+fragments, and the multiline stage joins application-level multi-line entries
+such as stack traces (Go, Java, Python, .NET, Ruby, Rust, PHP). It exports
+OTLP log records with resource attributes (`k8s.pod.name`,
 `k8s.deployment.name`, `container.id`, pod/namespace labels, …) resolved via
 `GET /v1/containers/{id}` — the blocking wait covers containers whose
 metadata has not reached the API server yet. Delivery is at-least-once:
@@ -177,10 +178,17 @@ avoid feeding the collector its own output.
 metric batches of at most `-metrics-batch-size` data points (default 10 000),
 each exported and released before parsing continues, so a target exposing
 100k+ series never resides in memory (measured: ~28 MB agent RSS while
-continuously scraping a 100 000-series endpoint). Counters (and histogram
-and summary `_bucket`/`_sum`/`_count` series) become cumulative monotonic
-sums; gauges, untyped series and quantiles become gauges. `-scrape-max-samples`
-can cap pathological targets.
+continuously scraping a 100 000-series endpoint). Conversion is type-faithful:
+counters become cumulative monotonic sums; histogram families
+(`_bucket`/`_sum`/`_count`) are grouped per label set into proper OTLP
+**Histogram** data points (de-cumulated bucket counts, explicit bounds);
+summaries become OTLP **Summary** points with quantile values; gauges and
+untyped series become gauges. Family grouping preserves the streaming
+property — state is bounded by the largest single family, not the scrape.
+With `-scrape-exemplars` the agent negotiates the OpenMetrics format and
+attaches **exemplars** to counter and histogram points (`trace_id`/`span_id`
+map to the OTLP trace/span fields, other exemplar labels become filtered
+attributes). `-scrape-max-samples` can cap pathological targets.
 
 For a local test pipeline, `hack/otel-collector.yaml` deploys a contrib
 collector with a debug exporter; the agent's own internal metrics stay small.

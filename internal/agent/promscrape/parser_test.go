@@ -6,13 +6,17 @@ import (
 	"testing"
 )
 
-func parseAll(t *testing.T, input string) []Sample {
+func parseAllMode(t *testing.T, input string, openMetrics, exemplars bool) []Sample {
 	t.Helper()
-	p := NewParser(1 << 20)
+	p := NewParser(1<<20, openMetrics, exemplars)
 	var out []Sample
 	malformed, err := p.Parse(strings.NewReader(input), func(s Sample) error {
 		cp := s
 		cp.Labels = append([]Label(nil), s.Labels...)
+		if s.Exemplar != nil {
+			ex := copyExemplar(*s.Exemplar)
+			cp.Exemplar = &ex
+		}
 		out = append(out, cp)
 		return nil
 	})
@@ -23,6 +27,10 @@ func parseAll(t *testing.T, input string) []Sample {
 		t.Fatalf("%d malformed lines", malformed)
 	}
 	return out
+}
+
+func parseAll(t *testing.T, input string) []Sample {
+	return parseAllMode(t, input, false, false)
 }
 
 func TestParseBasic(t *testing.T) {
@@ -40,21 +48,21 @@ untyped_metric{a="b"} 1
 		t.Fatalf("got %d samples: %+v", len(samples), samples)
 	}
 	s := samples[0]
-	if s.Name != "http_requests_total" || s.Kind != KindSum || s.Value != 1027 || s.TimestampMs != 1395066363000 {
+	if s.Name != "http_requests_total" || s.Role != RoleCounter || s.Value != 1027 || s.TimestampMs != 1395066363000 {
 		t.Fatalf("sample = %+v", s)
 	}
 	if len(s.Labels) != 2 || s.Labels[0] != (Label{"method", "get"}) || s.Labels[1] != (Label{"code", "200"}) {
 		t.Fatalf("labels = %+v", s.Labels)
 	}
-	if samples[2].Kind != KindGauge || samples[2].Value != 36.5 {
+	if samples[2].Role != RoleGauge || samples[2].Value != 36.5 {
 		t.Fatalf("gauge = %+v", samples[2])
 	}
-	if samples[3].Kind != KindGauge {
+	if samples[3].Role != RoleGauge {
 		t.Fatalf("untyped should map to gauge: %+v", samples[3])
 	}
 }
 
-func TestParseHistogramAndSummary(t *testing.T) {
+func TestParseHistogramAndSummaryRoles(t *testing.T) {
 	samples := parseAll(t, `
 # TYPE http_duration histogram
 http_duration_bucket{le="0.1"} 100
@@ -66,26 +74,34 @@ rpc_latency{quantile="0.99"} 3.2
 rpc_latency_sum 8000
 rpc_latency_count 2000
 `)
-	kinds := map[string]SampleKind{}
-	for _, s := range samples {
-		key := s.Name
-		if len(s.Labels) > 0 {
-			key += "/" + s.Labels[0].Name
-		}
-		kinds[key] = s.Kind
+	want := []struct {
+		role   SampleRole
+		family string
+	}{
+		{RoleHistogramBucket, "http_duration"},
+		{RoleHistogramBucket, "http_duration"},
+		{RoleHistogramSum, "http_duration"},
+		{RoleHistogramCount, "http_duration"},
+		{RoleSummaryQuantile, "rpc_latency"},
+		{RoleSummarySum, "rpc_latency"},
+		{RoleSummaryCount, "rpc_latency"},
 	}
-	expect := map[string]SampleKind{
-		"http_duration_bucket/le": KindSum,
-		"http_duration_sum":       KindSum,
-		"http_duration_count":     KindSum,
-		"rpc_latency/quantile":    KindGauge,
-		"rpc_latency_sum":         KindSum,
-		"rpc_latency_count":       KindSum,
+	if len(samples) != len(want) {
+		t.Fatalf("got %d samples", len(samples))
 	}
-	for k, want := range expect {
-		if kinds[k] != want {
-			t.Errorf("%s: kind = %v, want %v", k, kinds[k], want)
+	for i, w := range want {
+		if samples[i].Role != w.role || samples[i].Family != w.family {
+			t.Errorf("sample %d (%s): role=%v family=%q, want role=%v family=%q",
+				i, samples[i].Name, samples[i].Role, samples[i].Family, w.role, w.family)
 		}
+	}
+}
+
+func TestParseCounterTotalSuffixFamily(t *testing.T) {
+	// OpenMetrics style: TYPE names the family, samples carry _total.
+	samples := parseAll(t, "# TYPE requests counter\nrequests_total 5\n")
+	if len(samples) != 1 || samples[0].Role != RoleCounter || samples[0].Family != "requests" {
+		t.Fatalf("samples = %+v", samples)
 	}
 }
 
@@ -115,24 +131,25 @@ neg{} -1.5e3
 }
 
 func TestParseMalformed(t *testing.T) {
-	p := NewParser(1 << 20)
+	p := NewParser(1<<20, false, false)
 	var good int
 	malformed, err := p.Parse(strings.NewReader(`ok_metric 1
 {no_name} 1
 bad_value x
 missing_value
+trailing_garbage 1 123 junk
 ok_metric2 2
 `), func(s Sample) error { good++; return nil })
 	if err != nil {
 		t.Fatal(err)
 	}
-	if good != 2 || malformed != 3 {
+	if good != 2 || malformed != 4 {
 		t.Fatalf("good=%d malformed=%d", good, malformed)
 	}
 }
 
 func TestParseLongLineSkipped(t *testing.T) {
-	p := NewParser(256)
+	p := NewParser(256, false, false)
 	input := "short 1\nlong{x=\"" + strings.Repeat("a", 1000) + "\"} 2\nshort2 3\n"
 	var names []string
 	malformed, err := p.Parse(strings.NewReader(input), func(s Sample) error {
@@ -148,7 +165,7 @@ func TestParseLongLineSkipped(t *testing.T) {
 }
 
 func TestParseAbort(t *testing.T) {
-	p := NewParser(1 << 20)
+	p := NewParser(1<<20, false, false)
 	count := 0
 	_, err := p.Parse(strings.NewReader("a 1\nb 2\nc 3\n"), func(s Sample) error {
 		count++
@@ -159,6 +176,68 @@ func TestParseAbort(t *testing.T) {
 	})
 	if err != ErrTooManySamples || count != 2 {
 		t.Fatalf("err=%v count=%d", err, count)
+	}
+}
+
+func TestParseOpenMetrics(t *testing.T) {
+	input := `# TYPE requests counter
+requests_total{code="200"} 10 1700000000.5 # {trace_id="4bf92f3577b34da6a3ce929d0e0e4736",span_id="00f067aa0ba902b7",user="x"} 1.5 1700000000.25
+requests_total{code="500"} 2
+# TYPE lat histogram
+lat_bucket{le="1"} 5 # {trace_id="4bf92f3577b34da6a3ce929d0e0e4736"} 0.7
+lat_bucket{le="+Inf"} 6
+lat_count 6
+lat_sum 4.2
+# EOF
+this line must not be parsed
+`
+	samples := parseAllMode(t, input, true, true)
+	if len(samples) != 6 {
+		t.Fatalf("got %d samples: %+v", len(samples), samples)
+	}
+
+	s := samples[0]
+	// OpenMetrics timestamps are float seconds.
+	if s.TimestampMs != 1700000000500 {
+		t.Errorf("timestamp = %d", s.TimestampMs)
+	}
+	if s.Exemplar == nil {
+		t.Fatal("missing exemplar")
+	}
+	if s.Exemplar.Value != 1.5 || s.Exemplar.TimestampMs != 1700000000250 {
+		t.Errorf("exemplar = %+v", s.Exemplar)
+	}
+	if len(s.Exemplar.Labels) != 3 || s.Exemplar.Labels[2] != (Label{"user", "x"}) {
+		t.Errorf("exemplar labels = %+v", s.Exemplar.Labels)
+	}
+	if samples[1].Exemplar != nil {
+		t.Error("sample without exemplar got one")
+	}
+	if samples[2].Role != RoleHistogramBucket || samples[2].Exemplar == nil {
+		t.Errorf("bucket sample = %+v", samples[2])
+	}
+}
+
+func TestParseOpenMetricsExemplarsDisabled(t *testing.T) {
+	input := "# TYPE r counter\nr_total 1 # {trace_id=\"abc\"} 0.5\n# EOF\n"
+	samples := parseAllMode(t, input, true, false)
+	if len(samples) != 1 || samples[0].Exemplar != nil {
+		t.Fatalf("samples = %+v", samples)
+	}
+}
+
+func TestParseClassicRejectsExemplarSyntax(t *testing.T) {
+	p := NewParser(1<<20, false, true)
+	var good int
+	malformed, err := p.Parse(strings.NewReader("a 1 # {x=\"y\"} 2\nb 2\n"), func(s Sample) error {
+		good++
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if good != 1 || malformed != 1 {
+		t.Fatalf("good=%d malformed=%d", good, malformed)
 	}
 }
 
@@ -177,7 +256,7 @@ func BenchmarkParseLargeScrape(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		p := NewParser(1 << 20)
+		p := NewParser(1<<20, false, false)
 		n := 0
 		if _, err := p.Parse(strings.NewReader(input), func(s Sample) error { n++; return nil }); err != nil {
 			b.Fatal(err)

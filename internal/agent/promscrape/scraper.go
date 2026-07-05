@@ -6,6 +6,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -36,10 +37,13 @@ type Config struct {
 	BatchPoints  int           // flush to the exporter after this many data points
 	MaxLineBytes int           // skip exposition lines longer than this
 	MaxSamples   int           // abort a single scrape beyond this many samples (0 = unlimited)
-	Logger       *slog.Logger
-	Targets      TargetSource
-	Exporter     MetricExporter
-	StartTime    time.Time // cumulative-sum start timestamp (agent start)
+	// Exemplars negotiates the OpenMetrics format and attaches exemplars to
+	// counter and histogram data points.
+	Exemplars bool
+	Logger    *slog.Logger
+	Targets   TargetSource
+	Exporter  MetricExporter
+	StartTime time.Time // cumulative-sum start timestamp (agent start)
 }
 
 // Scraper periodically scrapes all targets of one node and exports the
@@ -133,7 +137,11 @@ func (s *Scraper) scrapeTarget(ctx context.Context, t kubemeta.ScrapeTarget) err
 	if err != nil {
 		return err
 	}
-	req.Header.Set("Accept", "text/plain;version=0.0.4")
+	if s.cfg.Exemplars {
+		req.Header.Set("Accept", "application/openmetrics-text;version=1.0.0;q=1,text/plain;version=0.0.4;q=0.5")
+	} else {
+		req.Header.Set("Accept", "text/plain;version=0.0.4")
+	}
 	resp, err := s.http.Do(req)
 	if err != nil {
 		return err
@@ -146,15 +154,20 @@ func (s *Scraper) scrapeTarget(ctx context.Context, t kubemeta.ScrapeTarget) err
 		return fmt.Errorf("status %d", resp.StatusCode)
 	}
 
+	// The target decides the format; some exporters serve OpenMetrics
+	// regardless of Accept, so detect from the response.
+	openMetrics := strings.Contains(resp.Header.Get("Content-Type"), "openmetrics")
+
 	b := newBatcher(t, s.cfg.BatchPoints, s.cfg.StartTime, time.Now())
-	parser := NewParser(s.cfg.MaxLineBytes)
+	conv := newConverter(b)
+	parser := NewParser(s.cfg.MaxLineBytes, openMetrics, s.cfg.Exemplars)
 	samples := 0
 	malformed, err := parser.Parse(resp.Body, func(sample Sample) error {
 		samples++
 		if s.cfg.MaxSamples > 0 && samples > s.cfg.MaxSamples {
 			return ErrTooManySamples
 		}
-		b.add(sample)
+		conv.add(sample)
 		if b.points >= s.cfg.BatchPoints {
 			return s.cfg.Exporter.ExportMetrics(ctx, b.take())
 		}
@@ -163,6 +176,7 @@ func (s *Scraper) scrapeTarget(ctx context.Context, t kubemeta.ScrapeTarget) err
 	if err != nil {
 		return err
 	}
+	conv.finish()
 	if b.points > 0 {
 		if err := s.cfg.Exporter.ExportMetrics(ctx, b.take()); err != nil {
 			return err
@@ -216,42 +230,4 @@ func (b *batcher) take() pmetric.Metrics {
 	md := b.md
 	b.reset()
 	return md
-}
-
-func (b *batcher) add(s Sample) {
-	m, ok := b.byName[s.Name]
-	if !ok {
-		m = b.sm.Metrics().AppendEmpty()
-		m.SetName(s.Name)
-		switch s.Kind {
-		case KindSum:
-			sum := m.SetEmptySum()
-			sum.SetIsMonotonic(true)
-			sum.SetAggregationTemporality(pmetric.AggregationTemporalityCumulative)
-		default:
-			m.SetEmptyGauge()
-		}
-		b.byName[s.Name] = m
-	}
-
-	var dp pmetric.NumberDataPoint
-	switch m.Type() {
-	case pmetric.MetricTypeSum:
-		dp = m.Sum().DataPoints().AppendEmpty()
-		dp.SetStartTimestamp(b.startTS)
-	default:
-		dp = m.Gauge().DataPoints().AppendEmpty()
-	}
-	dp.SetDoubleValue(s.Value)
-	if s.TimestampMs != 0 {
-		dp.SetTimestamp(pcommon.Timestamp(s.TimestampMs * int64(time.Millisecond)))
-	} else {
-		dp.SetTimestamp(b.scrapeTS)
-	}
-	labels := dp.Attributes()
-	labels.EnsureCapacity(len(s.Labels))
-	for _, l := range s.Labels {
-		labels.PutStr(l.Name, l.Value)
-	}
-	b.points++
 }

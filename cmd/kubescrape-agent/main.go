@@ -53,6 +53,7 @@ func run() error {
 		scrapeConcurrency = flag.Int("scrape-concurrency", 4, "concurrent target scrapes")
 		metricsBatch      = flag.Int("metrics-batch-size", 10000, "export metrics in chunks of this many data points")
 		maxSamples        = flag.Int("scrape-max-samples", 0, "abort a single scrape beyond this many samples (0 = unlimited)")
+		exemplars         = flag.Bool("scrape-exemplars", false, "negotiate OpenMetrics and attach exemplars to counter and histogram data points")
 		disableLogs       = flag.Bool("disable-logs", false, "disable the log tailer")
 		disableMetrics    = flag.Bool("disable-metrics", false, "disable the Prometheus scraper")
 	)
@@ -110,6 +111,7 @@ func run() error {
 			Concurrency: *scrapeConcurrency,
 			BatchPoints: *metricsBatch,
 			MaxSamples:  *maxSamples,
+			Exemplars:   *exemplars,
 			Logger:      log,
 			Targets:     meta,
 			Exporter:    exporter,

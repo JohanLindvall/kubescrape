@@ -2,9 +2,9 @@
 // to OTLP metrics.
 //
 // The parser is a single-pass streaming parser for the Prometheus text
-// exposition format: it never buffers more than one line, so memory use is
-// independent of the scrape size (relevant for endpoints exposing 100k+
-// series).
+// exposition format (classic and OpenMetrics): it never buffers more than
+// one line, so memory use is independent of the scrape size (relevant for
+// endpoints exposing 100k+ series).
 package promscrape
 
 import (
@@ -27,16 +27,21 @@ const (
 	TypeSummary
 )
 
-// SampleKind is how an individual sample should be represented, derived from
-// the family type and the series suffix.
-type SampleKind int
+// SampleRole classifies how one series sample participates in its family,
+// derived from the family type and the series suffix.
+type SampleRole int
 
 const (
-	// KindGauge covers gauges, untyped series and summary quantiles.
-	KindGauge SampleKind = iota
-	// KindSum covers counters and the cumulative _bucket/_sum/_count series
-	// of histograms and summaries.
-	KindSum
+	// RoleGauge covers gauges and untyped series.
+	RoleGauge SampleRole = iota
+	// RoleCounter covers counter samples (with or without _total suffix).
+	RoleCounter
+	RoleHistogramBucket
+	RoleHistogramSum
+	RoleHistogramCount
+	RoleSummaryQuantile
+	RoleSummarySum
+	RoleSummaryCount
 )
 
 // Label is one label pair (excluding __name__).
@@ -45,13 +50,28 @@ type Label struct {
 	Value string
 }
 
-// Sample is one parsed series sample.
-type Sample struct {
-	Name        string
-	Kind        SampleKind
+// Exemplar is an OpenMetrics exemplar attached to a sample.
+type Exemplar struct {
 	Labels      []Label // valid only during the callback
 	Value       float64
-	TimestampMs int64 // 0 when the exposition carries no timestamp
+	TimestampMs int64 // 0 when absent
+}
+
+// Sample is one parsed series sample.
+type Sample struct {
+	// Name is the full series name (e.g. "http_duration_bucket").
+	Name string
+	// Family is the metric family the sample belongs to (e.g.
+	// "http_duration"); equal to Name for gauges/untyped series.
+	Family string
+	Role   SampleRole
+	Labels []Label // valid only during the callback
+	Value  float64
+	// TimestampMs is 0 when the exposition carries no timestamp.
+	TimestampMs int64
+	// Exemplar is non-nil when the sample carries one and exemplar parsing
+	// is enabled; valid only during the callback.
+	Exemplar *Exemplar
 }
 
 // maxTrackedFamilies bounds the TYPE table so a pathological endpoint cannot
@@ -62,25 +82,38 @@ const maxTrackedFamilies = 100_000
 // scrape.
 type Parser struct {
 	maxLineBytes int
-	types        map[string]MetricType
-	labels       []Label // reused between lines
-	scratch      []byte  // for lines spanning bufio reads
+	// openMetrics switches timestamp units to seconds (float), honors the
+	// "# EOF" terminator and allows exemplars.
+	openMetrics bool
+	// exemplars enables parsing of "# {...} v [ts]" exemplar suffixes
+	// (OpenMetrics only).
+	exemplars bool
+
+	types    map[string]MetricType
+	labels   []Label // reused between lines
+	exLabels []Label // reused between lines
+	exemplar Exemplar
+	scratch  []byte // for lines spanning bufio reads
+	eof      bool   // saw "# EOF"
 }
 
 // NewParser creates a parser that skips physical lines longer than
-// maxLineBytes.
-func NewParser(maxLineBytes int) *Parser {
+// maxLineBytes. openMetrics selects OpenMetrics semantics (typically from
+// the response Content-Type); withExemplars additionally parses exemplars.
+func NewParser(maxLineBytes int, openMetrics, withExemplars bool) *Parser {
 	return &Parser{
 		maxLineBytes: maxLineBytes,
+		openMetrics:  openMetrics,
+		exemplars:    openMetrics && withExemplars,
 		types:        make(map[string]MetricType),
 	}
 }
 
 // Parse reads the exposition text from r, invoking emit for every sample.
-// The Sample (including Labels) is only valid during the callback. A non-nil
-// error from emit aborts the parse. Malformed lines are skipped, counted and
-// reported; a malformed count with a nil error means a partially usable
-// scrape.
+// The Sample (including Labels and Exemplar) is only valid during the
+// callback. A non-nil error from emit aborts the parse. Malformed lines are
+// skipped, counted and reported; a malformed count with a nil error means a
+// partially usable scrape.
 func (p *Parser) Parse(r io.Reader, emit func(Sample) error) (malformed int, err error) {
 	br := bufio.NewReaderSize(r, 64*1024)
 	for {
@@ -90,6 +123,9 @@ func (p *Parser) Parse(r io.Reader, emit func(Sample) error) (malformed int, err
 				return malformed, err
 			} else if !ok {
 				malformed++
+			}
+			if p.eof {
+				return malformed, nil
 			}
 		} else if tooLong {
 			malformed++
@@ -160,17 +196,21 @@ func (p *Parser) parseLine(line []byte, emit func(Sample) error, emitErr *error)
 	if !ok {
 		return false
 	}
-	s.Kind = p.kindOf(s.Name)
+	s.Role, s.Family = p.classify(s.Name)
 	if err := emit(s); err != nil {
 		*emitErr = err
 	}
 	return true
 }
 
-// parseComment records # TYPE declarations; HELP and other comments are
-// ignored.
+// parseComment records # TYPE declarations and the OpenMetrics # EOF
+// terminator; HELP/UNIT and other comments are ignored.
 func (p *Parser) parseComment(line []byte) {
 	fields := bytes.Fields(line)
+	if p.openMetrics && len(fields) == 2 && string(fields[1]) == "EOF" {
+		p.eof = true
+		return
+	}
 	if len(fields) != 4 || string(fields[1]) != "TYPE" {
 		return
 	}
@@ -193,44 +233,52 @@ func (p *Parser) parseComment(line []byte) {
 	p.types[string(fields[2])] = t
 }
 
-// kindOf resolves the sample kind from the family type table, accounting for
-// the _bucket/_sum/_count series of histograms and summaries.
-func (p *Parser) kindOf(name string) SampleKind {
+// classify resolves the sample role and family from the TYPE table,
+// accounting for the _bucket/_sum/_count/_total series suffixes.
+func (p *Parser) classify(name string) (SampleRole, string) {
 	if t, ok := p.types[name]; ok {
 		switch t {
 		case TypeCounter:
-			return KindSum
+			return RoleCounter, name
 		case TypeSummary:
 			// Quantile series carry the family name itself.
-			return KindGauge
+			return RoleSummaryQuantile, name
 		default:
-			return KindGauge
+			return RoleGauge, name
 		}
 	}
 	if base, found := strings.CutSuffix(name, "_bucket"); found {
 		if p.types[base] == TypeHistogram {
-			return KindSum
+			return RoleHistogramBucket, base
 		}
 	}
 	if base, found := strings.CutSuffix(name, "_sum"); found {
-		if t, ok := p.types[base]; ok && (t == TypeHistogram || t == TypeSummary) {
-			return KindSum
+		switch p.types[base] {
+		case TypeHistogram:
+			return RoleHistogramSum, base
+		case TypeSummary:
+			return RoleSummarySum, base
 		}
 	}
 	if base, found := strings.CutSuffix(name, "_count"); found {
-		if t, ok := p.types[base]; ok && (t == TypeHistogram || t == TypeSummary) {
-			return KindSum
+		switch p.types[base] {
+		case TypeHistogram:
+			return RoleHistogramCount, base
+		case TypeSummary:
+			return RoleSummaryCount, base
 		}
 	}
 	if base, found := strings.CutSuffix(name, "_total"); found {
 		if p.types[base] == TypeCounter {
-			return KindSum
+			return RoleCounter, base
 		}
 	}
-	return KindGauge
+	return RoleGauge, name
 }
 
-// parseSample parses `name{labels} value [timestamp_ms]`.
+// parseSample parses
+//
+//	name{labels} value [timestamp] [# {exemplar-labels} value [timestamp]]
 func (p *Parser) parseSample(line []byte) (Sample, bool) {
 	var s Sample
 
@@ -249,7 +297,7 @@ func (p *Parser) parseSample(line []byte) (Sample, bool) {
 	p.labels = p.labels[:0]
 	if len(rest) > 0 && rest[0] == '{' {
 		var ok bool
-		rest, ok = p.parseLabels(rest[1:])
+		rest, ok = p.parseLabels(rest[1:], &p.labels)
 		if !ok {
 			return s, false
 		}
@@ -257,35 +305,112 @@ func (p *Parser) parseSample(line []byte) (Sample, bool) {
 	s.Labels = p.labels
 
 	// Value.
-	rest = bytes.TrimLeft(rest, " \t")
-	i = 0
-	for i < len(rest) && rest[i] != ' ' && rest[i] != '\t' {
-		i++
-	}
-	if i == 0 {
+	var ok bool
+	s.Value, rest, ok = p.parseFloatToken(rest)
+	if !ok {
 		return s, false
 	}
-	v, err := strconv.ParseFloat(string(rest[:i]), 64)
-	if err != nil {
-		return s, false
-	}
-	s.Value = v
 
-	// Optional timestamp (milliseconds).
-	rest = bytes.TrimLeft(rest[i:], " \t")
-	if len(rest) > 0 {
-		ts, err := strconv.ParseInt(string(rest), 10, 64)
-		if err != nil {
+	// Optional timestamp.
+	rest = bytes.TrimLeft(rest, " \t")
+	if len(rest) > 0 && rest[0] != '#' {
+		s.TimestampMs, rest, ok = p.parseTimestampToken(rest)
+		if !ok {
 			return s, false
 		}
-		s.TimestampMs = ts
+		rest = bytes.TrimLeft(rest, " \t")
+	}
+
+	// Optional exemplar (OpenMetrics).
+	if len(rest) > 0 {
+		if rest[0] != '#' || !p.openMetrics {
+			return s, false
+		}
+		if !p.exemplars {
+			return s, true // valid line; exemplar intentionally ignored
+		}
+		ex, ok := p.parseExemplar(rest[1:])
+		if !ok {
+			return s, false
+		}
+		s.Exemplar = ex
 	}
 	return s, true
 }
 
-// parseLabels parses the label pairs after '{' and returns the remainder
-// after the closing '}'.
-func (p *Parser) parseLabels(rest []byte) ([]byte, bool) {
+// parseExemplar parses "{labels} value [timestamp]" into the parser's
+// reusable exemplar.
+func (p *Parser) parseExemplar(rest []byte) (*Exemplar, bool) {
+	rest = bytes.TrimLeft(rest, " \t")
+	if len(rest) == 0 || rest[0] != '{' {
+		return nil, false
+	}
+	p.exLabels = p.exLabels[:0]
+	rest, ok := p.parseLabels(rest[1:], &p.exLabels)
+	if !ok {
+		return nil, false
+	}
+	p.exemplar = Exemplar{Labels: p.exLabels}
+	p.exemplar.Value, rest, ok = p.parseFloatToken(rest)
+	if !ok {
+		return nil, false
+	}
+	rest = bytes.TrimLeft(rest, " \t")
+	if len(rest) > 0 {
+		p.exemplar.TimestampMs, rest, ok = p.parseTimestampToken(rest)
+		if !ok || len(bytes.TrimLeft(rest, " \t")) > 0 {
+			return nil, false
+		}
+	}
+	return &p.exemplar, true
+}
+
+// parseFloatToken reads one whitespace-delimited float.
+func (p *Parser) parseFloatToken(rest []byte) (float64, []byte, bool) {
+	rest = bytes.TrimLeft(rest, " \t")
+	i := 0
+	for i < len(rest) && rest[i] != ' ' && rest[i] != '\t' {
+		i++
+	}
+	if i == 0 {
+		return 0, nil, false
+	}
+	v, err := strconv.ParseFloat(string(rest[:i]), 64)
+	if err != nil {
+		return 0, nil, false
+	}
+	return v, rest[i:], true
+}
+
+// parseTimestampToken reads one timestamp token: integer milliseconds in the
+// classic format, (possibly fractional) seconds in OpenMetrics. Returns
+// milliseconds.
+func (p *Parser) parseTimestampToken(rest []byte) (int64, []byte, bool) {
+	i := 0
+	for i < len(rest) && rest[i] != ' ' && rest[i] != '\t' {
+		i++
+	}
+	if i == 0 {
+		return 0, nil, false
+	}
+	tok := string(rest[:i])
+	if p.openMetrics {
+		f, err := strconv.ParseFloat(tok, 64)
+		if err != nil {
+			return 0, nil, false
+		}
+		return int64(f * 1000), rest[i:], true
+	}
+	ts, err := strconv.ParseInt(tok, 10, 64)
+	if err != nil {
+		return 0, nil, false
+	}
+	return ts, rest[i:], true
+}
+
+// parseLabels parses the label pairs after '{' into dst and returns the
+// remainder after the closing '}'.
+func (p *Parser) parseLabels(rest []byte, dst *[]Label) ([]byte, bool) {
 	for {
 		rest = bytes.TrimLeft(rest, " \t")
 		if len(rest) == 0 {
@@ -315,7 +440,7 @@ func (p *Parser) parseLabels(rest []byte) ([]byte, bool) {
 		if !ok {
 			return nil, false
 		}
-		p.labels = append(p.labels, Label{Name: name, Value: value})
+		*dst = append(*dst, Label{Name: name, Value: value})
 		rest = bytes.TrimLeft(rem, " \t")
 		if len(rest) > 0 && rest[0] == ',' {
 			rest = rest[1:]

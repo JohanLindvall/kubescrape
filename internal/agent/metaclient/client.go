@@ -41,6 +41,16 @@ func (c *Client) Container(ctx context.Context, id string, wait time.Duration) (
 	return &md, nil
 }
 
+// PodByName fetches metadata for one pod by namespace and name.
+func (c *Client) PodByName(ctx context.Context, namespace, name string) (*kubemeta.Pod, error) {
+	u := fmt.Sprintf("%s/v1/pods/%s/%s", c.base, url.PathEscape(namespace), url.PathEscape(name))
+	var pod kubemeta.Pod
+	if err := c.getJSON(ctx, u, &pod); err != nil {
+		return nil, err
+	}
+	return &pod, nil
+}
+
 // NodeTargets fetches the Prometheus scrape targets (with embedded pod
 // metadata) for a node.
 func (c *Client) NodeTargets(ctx context.Context, node string) ([]kubemeta.ScrapeTarget, error) {

@@ -68,6 +68,7 @@ func New(cfg Config) *Server {
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /v1/containers/{id...}", s.handleContainer)
+	mux.HandleFunc("GET /v1/pods/{namespace}/{name}", s.handlePod)
 	mux.HandleFunc("GET /v1/nodes/{node}/targets", s.handleNodeTargets)
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -123,6 +124,24 @@ func (s *Server) handleContainer(w http.ResponseWriter, r *http.Request) {
 		Container:   res.Container,
 		Pod:         res.Pod,
 	})
+}
+
+// handlePod serves GET /v1/pods/{namespace}/{name}: full metadata for one
+// pod looked up by name (used by the agent to attribute cadvisor series).
+// Deleted pods stay resolvable until their tombstone expires.
+func (s *Server) handlePod(w http.ResponseWriter, r *http.Request) {
+	if !s.isReady() {
+		writeError(w, http.StatusServiceUnavailable, "informer caches not synced")
+		return
+	}
+	namespace, name := r.PathValue("namespace"), r.PathValue("name")
+	np, ok := s.store.GetPodByName(namespace, name)
+	if !ok {
+		writeError(w, http.StatusNotFound, fmt.Sprintf("pod %s/%s not found", namespace, name))
+		return
+	}
+	s.enrich(&np.Pod, np.OwnerRefs)
+	writeJSON(w, http.StatusOK, np.Pod)
 }
 
 // handleNodeTargets serves GET /v1/nodes/{node}/targets.

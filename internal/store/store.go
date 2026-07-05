@@ -29,6 +29,10 @@ type Store struct {
 	pods        map[types.UID]*record
 	byContainer map[string]*containerEntry
 	byNode      map[string]map[types.UID]*record
+	// byPodName indexes pods by "namespace/name". A deleted pod stays
+	// resolvable until its tombstone expires or a new pod with the same name
+	// replaces it.
+	byPodName map[string]*record
 	// waiters holds blocked GetContainer calls keyed by the normalized
 	// container ID they are waiting for; each channel is closed when that
 	// specific ID becomes resolvable.
@@ -62,6 +66,7 @@ func New(ttl time.Duration) *Store {
 		pods:        make(map[types.UID]*record),
 		byContainer: make(map[string]*containerEntry),
 		byNode:      make(map[string]map[types.UID]*record),
+		byPodName:   make(map[string]*record),
 		waiters:     make(map[string][]chan struct{}),
 	}
 }
@@ -143,7 +148,7 @@ func (s *Store) UpsertPod(p *corev1.Pod) {
 		}
 		m[p.UID] = rec
 	}
-
+	s.byPodName[pod.Namespace+"/"+pod.Name] = rec
 }
 
 // DeletePod tombstones a pod. Its metadata (and its container IDs) remain
@@ -166,6 +171,7 @@ func (s *Store) DeletePod(uid types.UID) {
 				delete(s.byContainer, id)
 			}
 		}
+		s.dropNameIndexLocked(rec)
 		delete(s.pods, uid)
 		return
 	}
@@ -249,6 +255,20 @@ func (s *Store) lookupLocked(id string) (ContainerResult, bool) {
 	return ContainerResult{Container: e.container, Pod: rec.pod, OwnerRefs: rec.ownerRefs}, true
 }
 
+// GetPodByName returns the pod with the given namespace and name; deleted
+// pods stay resolvable (with DeletedAt set) until their tombstone expires or
+// a new pod with the same name replaces them.
+func (s *Store) GetPodByName(namespace, name string) (NodePod, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	rec := s.byPodName[namespace+"/"+name]
+	if rec == nil || (!rec.expireAt.IsZero() && s.now().After(rec.expireAt)) {
+		return NodePod{}, false
+	}
+	return NodePod{Pod: rec.pod, OwnerRefs: rec.ownerRefs}, true
+}
+
 // PodsOnNode returns all live pods scheduled on the given node.
 func (s *Store) PodsOnNode(node string) []NodePod {
 	s.mu.RLock()
@@ -284,6 +304,7 @@ func (s *Store) Sweep() {
 	removed := false
 	for uid, rec := range s.pods {
 		if !rec.expireAt.IsZero() && now.After(rec.expireAt) {
+			s.dropNameIndexLocked(rec)
 			delete(s.pods, uid)
 			removed = true
 		}
@@ -326,6 +347,15 @@ func (s *Store) expireEntryLocked(id string, e *containerEntry) {
 		return
 	}
 	e.expireAt = s.now().Add(s.ttl)
+}
+
+// dropNameIndexLocked removes rec from the name index unless a newer pod
+// with the same name has already replaced it.
+func (s *Store) dropNameIndexLocked(rec *record) {
+	key := rec.pod.Namespace + "/" + rec.pod.Name
+	if s.byPodName[key] == rec {
+		delete(s.byPodName, key)
+	}
 }
 
 func (s *Store) removeFromNodeLocked(node string, uid types.UID) {

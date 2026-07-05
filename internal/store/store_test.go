@@ -329,6 +329,49 @@ func TestResurrectAfterOutOfOrderDelete(t *testing.T) {
 	}
 }
 
+func TestGetPodByName(t *testing.T) {
+	s, clk := newTestStore(time.Minute)
+	s.UpsertPod(makePod("uid1", "pod1", "node1", "1", map[string]string{"app": "abc"}))
+
+	np, ok := s.GetPodByName("default", "pod1")
+	if !ok || np.Pod.UID != "uid1" {
+		t.Fatalf("lookup failed: ok=%v pod=%+v", ok, np.Pod)
+	}
+	if _, ok := s.GetPodByName("default", "nope"); ok {
+		t.Fatal("unknown pod resolved")
+	}
+	if _, ok := s.GetPodByName("other", "pod1"); ok {
+		t.Fatal("wrong namespace resolved")
+	}
+
+	// Deleted pods stay resolvable until the tombstone expires...
+	s.DeletePod("uid1")
+	np, ok = s.GetPodByName("default", "pod1")
+	if !ok || np.Pod.DeletedAt == nil {
+		t.Fatalf("tombstone lookup: ok=%v deletedAt=%v", ok, np.Pod.DeletedAt)
+	}
+	// ...unless a new pod with the same name replaces them.
+	s.UpsertPod(makePod("uid2", "pod1", "node1", "1", map[string]string{"app": "def"}))
+	np, ok = s.GetPodByName("default", "pod1")
+	if !ok || np.Pod.UID != "uid2" || np.Pod.DeletedAt != nil {
+		t.Fatalf("replacement lookup: %+v", np.Pod)
+	}
+
+	// Expiry of the old tombstone must not evict the replacement.
+	clk.Advance(2 * time.Minute)
+	s.Sweep()
+	if np, ok = s.GetPodByName("default", "pod1"); !ok || np.Pod.UID != "uid2" {
+		t.Fatalf("replacement gone after sweep: ok=%v", ok)
+	}
+
+	s.DeletePod("uid2")
+	clk.Advance(2 * time.Minute)
+	s.Sweep()
+	if _, ok := s.GetPodByName("default", "pod1"); ok {
+		t.Fatal("expired tombstone still resolvable")
+	}
+}
+
 func TestOwnerRefsCarried(t *testing.T) {
 	s, _ := newTestStore(time.Minute)
 	pod := makePod("uid1", "pod1", "node1", "1", map[string]string{"app": "abc"})

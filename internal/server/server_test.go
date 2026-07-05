@@ -160,6 +160,19 @@ func TestBadWaitParameter(t *testing.T) {
 	getJSON(t, srv.URL+"/v1/containers/x?wait=-1s", http.StatusBadRequest, nil)
 }
 
+func TestPodEndpoint(t *testing.T) {
+	st := store.New(time.Minute)
+	addPod(st)
+	srv := testServer(t, st, closedChan())
+
+	var pod kubemeta.Pod
+	getJSON(t, srv.URL+"/v1/pods/default/web-abc-xyz", http.StatusOK, &pod)
+	if pod.UID != "pod-uid" || len(pod.Owners) != 1 || pod.NamespaceMetadata == nil {
+		t.Fatalf("pod = %+v", pod)
+	}
+	getJSON(t, srv.URL+"/v1/pods/default/nope", http.StatusNotFound, nil)
+}
+
 func TestNodeTargets(t *testing.T) {
 	st := store.New(time.Minute)
 	addPod(st)

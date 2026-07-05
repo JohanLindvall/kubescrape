@@ -1,0 +1,207 @@
+// Package scrape derives Prometheus scrape targets from pod and service
+// metadata using the conventional prometheus.io/* annotations.
+package scrape
+
+import (
+	"net"
+	"strconv"
+	"strings"
+
+	"github.com/JohanLindvall/kubescrape/internal/kubemeta"
+	"github.com/JohanLindvall/kubescrape/internal/services"
+)
+
+// Conventional annotations, as used by the classic Prometheus
+// kubernetes_sd relabeling configuration. The port annotation accepts a
+// comma-separated list of entries.
+const (
+	AnnotationScrape = "prometheus.io/scrape"
+	AnnotationPath   = "prometheus.io/path"
+	AnnotationPort   = "prometheus.io/port"
+	AnnotationScheme = "prometheus.io/scheme"
+)
+
+// PodTargets returns the scrape targets derived from a pod's own
+// annotations, or nil if the pod is not annotated for scraping or is not
+// scrapeable (no IP, already finished).
+//
+// Each entry of the port annotation may be a port number or the name of a
+// declared container port. Without a port annotation, every declared
+// container port becomes a target. The pod (including any owners the caller
+// resolved) is embedded in each target.
+func PodTargets(pod kubemeta.Pod) []kubemeta.ScrapeTarget {
+	if pod.Annotations[AnnotationScrape] != "true" || !scrapeable(pod) {
+		return nil
+	}
+	scheme, path := schemeAndPath(pod.Annotations)
+	var targets []kubemeta.ScrapeTarget
+	for _, port := range podPorts(pod) {
+		t := makeTarget(pod, scheme, path, port)
+		t.Source = "pod"
+		targets = append(targets, t)
+	}
+	return targets
+}
+
+// ServiceTargets returns the scrape targets for a pod derived from the
+// annotations of a Service that selects it, or nil if the service is not
+// annotated for scraping or the pod is not scrapeable.
+//
+// Each entry of the service's port annotation may be a service port number
+// or a service port name; without the annotation every service port is used.
+// Service ports are translated to pod ports via their targetPort (named
+// container port, explicit number, or the port itself).
+func ServiceTargets(pod kubemeta.Pod, svc *services.Service) []kubemeta.ScrapeTarget {
+	if svc == nil || svc.Annotations[AnnotationScrape] != "true" || !scrapeable(pod) {
+		return nil
+	}
+	scheme, path := schemeAndPath(svc.Annotations)
+	info := &kubemeta.Service{
+		Name:        svc.Name,
+		Namespace:   svc.Namespace,
+		UID:         svc.UID,
+		Labels:      svc.Labels,
+		Annotations: svc.Annotations,
+	}
+	var targets []kubemeta.ScrapeTarget
+	seen := make(map[int32]struct{})
+	for _, sp := range selectServicePorts(svc) {
+		port, ok := targetPodPort(pod, sp)
+		if !ok {
+			continue
+		}
+		if _, dup := seen[port]; dup {
+			continue
+		}
+		seen[port] = struct{}{}
+		t := makeTarget(pod, scheme, path, port)
+		t.Source = "service"
+		t.Service = info
+		targets = append(targets, t)
+	}
+	return targets
+}
+
+func scrapeable(pod kubemeta.Pod) bool {
+	if pod.PodIP == "" || pod.DeletedAt != nil {
+		return false
+	}
+	return pod.Phase != "Succeeded" && pod.Phase != "Failed"
+}
+
+func schemeAndPath(annotations map[string]string) (scheme, path string) {
+	scheme = annotations[AnnotationScheme]
+	if scheme != "https" {
+		scheme = "http"
+	}
+	path = annotations[AnnotationPath]
+	if path == "" {
+		path = "/metrics"
+	}
+	if !strings.HasPrefix(path, "/") {
+		path = "/" + path
+	}
+	return scheme, path
+}
+
+func makeTarget(pod kubemeta.Pod, scheme, path string, port int32) kubemeta.ScrapeTarget {
+	address := net.JoinHostPort(pod.PodIP, strconv.Itoa(int(port)))
+	return kubemeta.ScrapeTarget{
+		URL:     scheme + "://" + address + path,
+		Scheme:  scheme,
+		Address: address,
+		Port:    port,
+		Path:    path,
+		Pod:     pod,
+	}
+}
+
+// podPorts resolves the pod's port annotation (each entry a number or a
+// named container port); without an annotation, all declared container
+// ports. Entries that resolve to nothing are skipped.
+func podPorts(pod kubemeta.Pod) []int32 {
+	var ports []int32
+	seen := make(map[int32]struct{})
+	add := func(p int32) {
+		if _, ok := seen[p]; ok || p < 1 || p > 65535 {
+			return
+		}
+		seen[p] = struct{}{}
+		ports = append(ports, p)
+	}
+
+	ann, ok := pod.Annotations[AnnotationPort]
+	if !ok || strings.TrimSpace(ann) == "" {
+		for _, c := range pod.Containers {
+			for _, p := range c.Ports {
+				add(p.Port)
+			}
+		}
+		return ports
+	}
+	for _, entry := range splitList(ann) {
+		if n, err := strconv.Atoi(entry); err == nil {
+			add(int32(n))
+			continue
+		}
+		for _, c := range pod.Containers {
+			for _, p := range c.Ports {
+				if p.Name == entry {
+					add(p.Port)
+				}
+			}
+		}
+	}
+	return ports
+}
+
+// selectServicePorts resolves the service's port annotation (each entry a
+// service port number or name) against its declared ports; without an
+// annotation, all service ports.
+func selectServicePorts(svc *services.Service) []services.Port {
+	ann, ok := svc.Annotations[AnnotationPort]
+	if !ok || strings.TrimSpace(ann) == "" {
+		return svc.Ports
+	}
+	var out []services.Port
+	for _, entry := range splitList(ann) {
+		n, numeric := 0, false
+		if v, err := strconv.Atoi(entry); err == nil {
+			n, numeric = v, true
+		}
+		for _, sp := range svc.Ports {
+			if sp.Name == entry || (numeric && sp.Port == int32(n)) {
+				out = append(out, sp)
+			}
+		}
+	}
+	return out
+}
+
+// targetPodPort translates a service port to the pod port it targets.
+func targetPodPort(pod kubemeta.Pod, sp services.Port) (int32, bool) {
+	if sp.TargetPortName != "" {
+		for _, c := range pod.Containers {
+			for _, p := range c.Ports {
+				if p.Name == sp.TargetPortName {
+					return p.Port, true
+				}
+			}
+		}
+		return 0, false
+	}
+	if sp.TargetPortNum != 0 {
+		return sp.TargetPortNum, true
+	}
+	return sp.Port, true
+}
+
+func splitList(s string) []string {
+	var out []string
+	for _, part := range strings.Split(s, ",") {
+		if part = strings.TrimSpace(part); part != "" {
+			out = append(out, part)
+		}
+	}
+	return out
+}

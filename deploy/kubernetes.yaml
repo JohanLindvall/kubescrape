@@ -1,0 +1,97 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: monitoring
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: kubescrape
+  namespace: monitoring
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kubescrape
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "namespaces", "services"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["apps"]
+    resources: ["replicasets", "deployments"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["batch"]
+    resources: ["jobs", "cronjobs"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: kubescrape
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: kubescrape
+subjects:
+  - kind: ServiceAccount
+    name: kubescrape
+    namespace: monitoring
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kubescrape
+  namespace: monitoring
+  labels:
+    app: kubescrape
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: kubescrape
+  template:
+    metadata:
+      labels:
+        app: kubescrape
+    spec:
+      serviceAccountName: kubescrape
+      containers:
+        - name: kubescrape
+          image: ghcr.io/johanlindvall/kubescrape:latest
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65532
+            readOnlyRootFilesystem: true
+          args:
+            - -listen=:8080
+            - -wait-timeout=5s
+            - -cache-ttl=5m
+          ports:
+            - name: http
+              containerPort: 8080
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kubescrape
+  namespace: monitoring
+spec:
+  selector:
+    app: kubescrape
+  ports:
+    - name: http
+      port: 80
+      targetPort: http

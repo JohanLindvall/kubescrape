@@ -1,0 +1,95 @@
+# Sample workloads for exercising kubescrape:
+# - a Deployment (pod -> ReplicaSet -> Deployment owner chain) annotated for
+#   Prometheus scraping,
+# - a CronJob (pod -> Job -> CronJob owner chain),
+# - a Deployment WITHOUT pod annotations plus an annotated Service selecting
+#   it (service-based scrape discovery).
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: kubescrape-demo
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: demo-web
+  namespace: kubescrape-demo
+  labels:
+    app: demo-web
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: demo-web
+  template:
+    metadata:
+      labels:
+        app: demo-web
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "80"
+        prometheus.io/path: "/metrics"
+    spec:
+      containers:
+        - name: web
+          image: nginx:1.27-alpine
+          ports:
+            - name: http
+              containerPort: 80
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: demo-svc-web
+  namespace: kubescrape-demo
+  labels:
+    app: demo-svc-web
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: demo-svc-web
+  template:
+    metadata:
+      labels:
+        app: demo-svc-web
+    spec:
+      containers:
+        - name: web
+          image: nginx:1.27-alpine
+          ports:
+            - name: http
+              containerPort: 80
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: demo-svc
+  namespace: kubescrape-demo
+  annotations:
+    prometheus.io/scrape: "true"
+    prometheus.io/path: "/svc-metrics"
+spec:
+  selector:
+    app: demo-svc-web
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: demo-tick
+  namespace: kubescrape-demo
+spec:
+  schedule: "* * * * *"
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          restartPolicy: Never
+          containers:
+            - name: tick
+              image: busybox:1.37
+              command: ["sh", "-c", "date; sleep 5"]

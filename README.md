@@ -12,6 +12,9 @@ Two cooperating services:
   an [OpenTelemetry collector](https://github.com/open-telemetry/opentelemetry-collector-contrib),
   enriched with resource attributes fetched from the metadata service.
 
+Full flag and config-file reference with examples:
+[docs/CONFIGURATION.md](docs/CONFIGURATION.md).
+
 ## How it works
 
 * On startup the service performs a single **LIST** of all pods and then keeps

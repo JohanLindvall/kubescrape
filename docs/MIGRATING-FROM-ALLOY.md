@@ -1,13 +1,13 @@
-# Migrating from cmb-alloy to kubescrape
+# Migrating from Grafana Alloy to kubescrape
 
-This guide maps each cmb-alloy component onto its kubescrape equivalent.
+This guide maps each Alloy component onto its kubescrape equivalent.
 kubescrape is deployed with the [Helm chart](../charts/kubescrape); unlike
 the Alloy configuration, nothing is hard-coded — every behavior below is a
 flag or a config-file entry.
 
 ## Architecture differences
 
-| | cmb-alloy | kubescrape |
+| | Alloy | kubescrape |
 |---|---|---|
 | Topology | 3–5 clustered Deployment replicas | metadata service (Deployment) + per-node agent (DaemonSet) |
 | Target distribution | Alloy clustering | node-local by construction (each agent scrapes its node's pods) |
@@ -168,7 +168,7 @@ agent:
 ```
 
 with an `otelcol.processor.filter`/debug exporter pair (or a routing
-connector) on the receiving collector, exactly as cmb-alloy's
+connector) on the receiving collector, exactly as Alloy's
 `output_debug_otlp` does.
 
 ## Not covered — keep a collector for these
@@ -184,9 +184,9 @@ connector) on the receiving collector, exactly as cmb-alloy's
 
 ## Rollout approach
 
-1. Deploy kubescrape alongside cmb-alloy with the OTLP output pointed at a
+1. Deploy kubescrape alongside Alloy with the OTLP output pointed at a
    staging tenant; compare series and attributes.
 2. Move the metric filters over first (largest cost lever), then the
    splitters, then attribute parity.
-3. Cut over the exporters, scale cmb-alloy down, keep it available for
+3. Cut over the exporters, scale Alloy down, keep it available for
    rollback until a full retention period has passed.

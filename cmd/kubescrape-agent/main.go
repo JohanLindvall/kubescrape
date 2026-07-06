@@ -63,6 +63,7 @@ func run() error {
 		multilineOn     = flag.Bool("logs-multiline", true, "join application-level multi-line entries (stack traces, ...)")
 		multilineWait   = flag.Duration("logs-multiline-timeout", time.Second, "flush incomplete multi-line groups after this long")
 		excludeNs       = flag.String("logs-exclude-namespaces", "", "comma-separated namespaces whose container logs are not tailed")
+		logsEnrich      = flag.Bool("logs-enrich", true, "parse per-line metadata (timestamp, severity, trace/span IDs, exception details) into the OTLP record fields via github.com/JohanLindvall/enrich")
 		logsWatch       = flag.Bool("logs-watch", true, "use file events (fsnotify) to trigger reads and discovery; polling remains the fallback")
 		logsPoll        = flag.Duration("logs-poll-interval", 500*time.Millisecond, "fallback sweep interval for the log tailer")
 		logsFingerprint = flag.Int("logs-fingerprint-bytes", 1024, "file-head hash length used with the inode as file identity (negative = inode only)")
@@ -72,6 +73,7 @@ func run() error {
 		journaldDir    = flag.String("journald-dir", "", "journal directory (journalctl -D); empty uses the system default")
 		journaldUnits  = flag.String("journald-units", "", "comma-separated systemd units to read (empty reads everything)")
 		journaldCursor = flag.String("journald-cursor-file", "", "file persisting the journal cursor across restarts (empty disables; every start then begins at the tail)")
+		journaldEnrich = flag.Bool("journald-enrich", true, "parse per-message metadata into the OTLP record fields (as -logs-enrich); an explicit level in the message wins over the journal priority")
 		journaldBatch  = flag.Int("journald-batch-size", 1024, "flush journal entries after this many")
 		journaldFlush  = flag.Duration("journald-flush-interval", 2*time.Second, "flush journal entries at least this often")
 
@@ -164,6 +166,7 @@ func run() error {
 			MaxEntryBytes:     *maxEntryBytes,
 			Multiline:         *multilineOn,
 			MultilineTimeout:  *multilineWait,
+			Enrich:            *logsEnrich,
 			ExcludeNamespaces: splitList(*excludeNs),
 			Attrs:             attrBuilders.Logs,
 			NodeInfo:          nodeInfo,
@@ -189,6 +192,7 @@ func run() error {
 			BatchSize:     *journaldBatch,
 			FlushInterval: *journaldFlush,
 			MaxEntryBytes: *maxEntryBytes,
+			Enrich:        *journaldEnrich,
 			Attrs:         attrBuilders.Journal,
 			NodeInfo:      nodeInfo,
 			Exporter:      exporter,

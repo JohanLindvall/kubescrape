@@ -34,6 +34,7 @@ type fakeExporter struct {
 	mu       sync.Mutex
 	fail     int // fail this many exports before succeeding
 	records  []string
+	full     []plog.Logs    // deep copies of the exported batches
 	resAttrs map[string]any // resource attributes of the last batch
 	batches  int
 }
@@ -46,6 +47,9 @@ func (f *fakeExporter) ExportLogs(_ context.Context, ld plog.Logs) error {
 		return errors.New("collector down")
 	}
 	f.batches++
+	cp := plog.NewLogs()
+	ld.CopyTo(cp)
+	f.full = append(f.full, cp)
 	for i := 0; i < ld.ResourceLogs().Len(); i++ {
 		rl := ld.ResourceLogs().At(i)
 		f.resAttrs = rl.Resource().Attributes().AsRaw()
@@ -63,6 +67,28 @@ func (f *fakeExporter) get() []string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([]string(nil), f.records...)
+}
+
+// record returns the exported log record at global index i.
+func (f *fakeExporter) record(i int) (plog.LogRecord, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	n := 0
+	for _, ld := range f.full {
+		for r := 0; r < ld.ResourceLogs().Len(); r++ {
+			rl := ld.ResourceLogs().At(r)
+			for s := 0; s < rl.ScopeLogs().Len(); s++ {
+				lrs := rl.ScopeLogs().At(s).LogRecords()
+				for k := 0; k < lrs.Len(); k++ {
+					if n == i {
+						return lrs.At(k), true
+					}
+					n++
+				}
+			}
+		}
+	}
+	return plog.LogRecord{}, false
 }
 
 const logName = "pod1_ns1_app-0123456789abcdef.log"
@@ -147,6 +173,47 @@ func TestTailAndExport(t *testing.T) {
 	// Appends are picked up incrementally.
 	writeLog(t, dir, "2026-07-05T10:00:04Z stdout F more")
 	waitFor(t, func() bool { return len(exp.get()) == 4 }, "4th record")
+}
+
+func TestEnrichedRecords(t *testing.T) {
+	dir := t.TempDir()
+	exp := &fakeExporter{}
+	tl := newTestTailer(dir, "", exp)
+	tl.cfg.Enrich = true
+	stop := startTailer(t, tl)
+	defer stop()
+
+	writeLog(t, dir,
+		`2026-07-05T10:00:00Z stdout F {"@t":"2026-01-02T03:04:05Z","level":"error","traceid":"0af7651916cd43dd8448eb211c80319c","msg":"boom"}`,
+		"2026-07-05T10:00:01Z stdout F plain line",
+	)
+	waitFor(t, func() bool { return len(exp.get()) == 2 }, "2 log records")
+
+	lr, ok := exp.record(0)
+	if !ok {
+		t.Fatal("record 0 missing")
+	}
+	if lr.SeverityNumber() != plog.SeverityNumberError || lr.SeverityText() != "error" {
+		t.Errorf("severity = %v %q", lr.SeverityNumber(), lr.SeverityText())
+	}
+	if !lr.Timestamp().AsTime().Equal(time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)) {
+		t.Errorf("timestamp = %v; want the line's own", lr.Timestamp().AsTime())
+	}
+	if lr.TraceID().IsEmpty() {
+		t.Error("trace id not set")
+	}
+
+	// The plain line keeps the CRI timestamp and default severity.
+	lr, ok = exp.record(1)
+	if !ok {
+		t.Fatal("record 1 missing")
+	}
+	if !lr.Timestamp().AsTime().Equal(time.Date(2026, 7, 5, 10, 0, 1, 0, time.UTC)) {
+		t.Errorf("plain-line timestamp = %v; want the CRI one", lr.Timestamp().AsTime())
+	}
+	if lr.SeverityNumber() != plog.SeverityNumberUnspecified {
+		t.Errorf("plain-line severity = %v", lr.SeverityNumber())
+	}
 }
 
 func TestExportFailureRewinds(t *testing.T) {

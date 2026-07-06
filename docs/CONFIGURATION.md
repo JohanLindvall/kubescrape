@@ -116,6 +116,7 @@ kubescrape-agent \
 | `-logs-max-entry-bytes` | `1MiB` | truncate assembled entries beyond this |
 | `-logs-multiline` | `true` | join stack traces (Go, Java, Python, .NET, Ruby, Rust, PHP) via [multiline](https://github.com/JohanLindvall/multiline) |
 | `-logs-multiline-timeout` | `1s` | flush incomplete multi-line groups after this long |
+| `-logs-enrich` | `true` | parse per-line metadata via [enrich](https://github.com/JohanLindvall/enrich): a timestamp in the line replaces the CRI time, an explicit level sets the severity, trace/span IDs fill the OTLP trace fields, exception/template/source-context details become record attributes. JSON, logfmt and common plain-text formats are recognized; the body is never modified |
 | `-logs-exclude-namespaces` | — | comma-separated namespaces not tailed — **always exclude the namespace of your collector** to avoid feedback loops |
 
 Delivery is at-least-once: offsets are committed only after the collector
@@ -141,6 +142,7 @@ attributes).
 | `-journald-cursor-file` | — | persists the journal cursor across restarts; empty means every start begins at the tail |
 | `-journald-batch-size` | `1024` | flush after this many entries |
 | `-journald-flush-interval` | `2s` | flush at least this often |
+| `-journald-enrich` | `true` | per-message enrichment as `-logs-enrich`; an explicit level in the message wins over the journal priority |
 
 Delivery is at-least-once: the cursor is committed only after a successful
 export; on export failure or subprocess death, journalctl restarts from the

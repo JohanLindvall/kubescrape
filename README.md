@@ -211,6 +211,19 @@ are checkpointed to disk (`-checkpoint-file`) so restarts resume where they
 left off. Set `-logs-exclude-namespaces` to the observability namespace to
 avoid feeding the collector its own output.
 
+**Log enrichment** (`-logs-enrich`, default true). Each exported line is run
+through [JohanLindvall/enrich](https://github.com/JohanLindvall/enrich),
+which recognizes JSON (Serilog/Pino/Envoy/Azure envelopes and common key
+spellings), logfmt, and a table of plain-text formats (nginx, klog, redis,
+syslog prefixes, Go/Java/Python/.NET stack traces). Whatever the line itself
+carries is promoted into the OTLP record — a parsed timestamp replaces the
+CRI write time, an explicit level sets the severity, trace/span IDs land in
+the first-class trace fields (GUID-style request IDs included), and template
+/ source-context / service / exception details become record attributes
+(`log.template`, `log.source_context`, `exception.type`, …). The body is
+never modified, and lines without recognizable metadata are exported
+unchanged.
+
 **Metrics.** Each `-scrape-interval` the agent fetches
 `GET /v1/nodes/$NODE/targets` and scrapes every target concurrently
 (bounded by `-scrape-concurrency`). The exposition body is **stream-parsed**
@@ -267,7 +280,9 @@ successful export, and on export failure or subprocess death journalctl is
 restarted from the committed cursor with backoff. `-journald-units` restricts
 to specific units, `-journald-dir` reads a non-default journal directory,
 `-journald-path` names the binary — which the default distroless image does
-**not** contain; bring an image that provides it.
+**not** contain; bring an image that provides it. `-journald-enrich`
+(default true) applies the same per-line enrichment as `-logs-enrich`; an
+explicit level found in the message wins over the journal priority.
 
 **Pipeline toggles.** Each pipeline is individually switchable: `-logs`,
 `-metrics` (annotation-discovered targets), `-cadvisor` and `-node-metrics`

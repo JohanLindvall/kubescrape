@@ -46,6 +46,7 @@ import (
 	"go.opentelemetry.io/collector/pdata/plog"
 
 	"github.com/JohanLindvall/kubescrape/internal/agent/attrs"
+	"github.com/JohanLindvall/kubescrape/internal/agent/logenrich"
 	"github.com/JohanLindvall/kubescrape/internal/agent/metaclient"
 	"github.com/JohanLindvall/kubescrape/internal/kubemeta"
 	"github.com/JohanLindvall/kubescrape/internal/obs"
@@ -82,6 +83,10 @@ type Config struct {
 	// Multiline joins application-level multi-line entries (stack traces,
 	// ...); CRI partial-line rejoining is always on.
 	Multiline bool
+	// Enrich parses metadata out of each line (timestamp, severity,
+	// trace/span IDs, exception details, ...) into the record's OTLP fields
+	// and attributes.
+	Enrich bool
 	// MultilineTimeout flushes buffered fragment runs and multi-line groups
 	// that have not completed within this duration.
 	MultilineTimeout time.Duration
@@ -825,6 +830,9 @@ func (t *Tailer) flush(ctx context.Context) {
 		}
 		if e.match != "" {
 			lr.Attributes().PutStr("log.multiline.match", e.match)
+		}
+		if t.cfg.Enrich {
+			logenrich.Apply(lr, e.body)
 		}
 		if e.offset > maxOffsets[e.file] {
 			maxOffsets[e.file] = e.offset

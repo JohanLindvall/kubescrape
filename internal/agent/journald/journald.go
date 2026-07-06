@@ -25,6 +25,7 @@ import (
 	"go.opentelemetry.io/collector/pdata/plog"
 
 	"github.com/JohanLindvall/kubescrape/internal/agent/attrs"
+	"github.com/JohanLindvall/kubescrape/internal/agent/logenrich"
 	"github.com/JohanLindvall/kubescrape/internal/obs"
 )
 
@@ -51,6 +52,12 @@ type Config struct {
 	BatchSize     int           // flush after this many entries
 	FlushInterval time.Duration // flush at least this often
 	MaxEntryBytes int           // cap on one journal message
+
+	// Enrich parses metadata out of each message (timestamp, severity,
+	// trace/span IDs, exception details, ...) into the record's OTLP fields
+	// and attributes; an explicit level in the message wins over the journal
+	// priority.
+	Enrich bool
 
 	// Attrs builds the exported resource attributes (nil = defaults).
 	Attrs *attrs.Builder
@@ -324,6 +331,9 @@ func (r *Reader) convert() plog.Logs {
 		}
 		if e.pid != 0 {
 			lr.Attributes().PutInt("process.pid", e.pid)
+		}
+		if r.cfg.Enrich {
+			logenrich.Apply(lr, e.body)
 		}
 	}
 	return ld

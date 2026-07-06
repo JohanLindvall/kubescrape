@@ -110,6 +110,7 @@ spec:
             {{- end }}
             - -kubelet-insecure-tls={{ .Values.agent.kubeletInsecureTLS }}
             - -checkpoint-file={{ .Values.agent.checkpointFile }}
+            - -logs-enrich={{ .Values.agent.logsEnrich }}
             - -logs-watch={{ .Values.agent.logsWatch }}
             - -logs-poll-interval={{ .Values.agent.logsPollInterval }}
             - -logs-fingerprint-bytes={{ .Values.agent.logsFingerprintBytes }}
@@ -130,6 +131,7 @@ spec:
             - -journald-cursor-file={{ .Values.agent.journald.cursorFile }}
             - -journald-batch-size={{ .Values.agent.journald.batchSize }}
             - -journald-flush-interval={{ .Values.agent.journald.flushInterval }}
+            - -journald-enrich={{ .Values.agent.journald.enrich }}
             {{- end }}
             - -log-level={{ .Values.logLevel }}
             - -log-format={{ .Values.logFormat }}

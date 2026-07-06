@@ -60,6 +60,8 @@ agent:
     cursorFile: /var/lib/kubescrape-agent/journal.cursor
     batchSize: 1024
     flushInterval: 2s
+    # As logsEnrich; a level in the message wins over the journal priority.
+    enrich: true
 
   # Kubelet scraping; empty disables cadvisor and node metrics.
   kubeletEndpoint: "https://$(NODE_IP):10250"
@@ -82,6 +84,9 @@ agent:
 
   logsExcludeNamespaces: [monitoring]
   checkpointFile: /var/lib/kubescrape-agent/checkpoints.json
+  # Parse per-line metadata (timestamp, severity, trace/span IDs, exception
+  # details) into the OTLP record fields (JohanLindvall/enrich).
+  logsEnrich: true
   logsWatch: true
   logsPollInterval: 500ms
   logsFingerprintBytes: 1024

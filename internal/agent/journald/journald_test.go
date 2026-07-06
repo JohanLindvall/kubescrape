@@ -206,6 +206,32 @@ func TestJournalRestartAfterExit(t *testing.T) {
 	}
 }
 
+func TestJournalEnrich(t *testing.T) {
+	// The JSON message carries its own level, which must win over the
+	// journal's PRIORITY (6 = info) when enrichment is on.
+	dir := t.TempDir()
+	path := filepath.Join(dir, "journalctl")
+	msg := `{\"@t\":\"2026-01-02T03:04:05Z\",\"level\":\"error\",\"msg\":\"boom\"}`
+	script := "#!/bin/sh\n" +
+		`echo '{"__CURSOR":"c0","MESSAGE":"` + msg + `","PRIORITY":"6","_SYSTEMD_UNIT":"a.service","__REALTIME_TIMESTAMP":"1700000000000000"}'` + "\n" +
+		"exec sleep 60\n"
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	exp, _ := startReader(t, Config{Path: path, Enrich: true})
+	waitFor(t, "one record", func() bool { return len(exp.records()) == 1 })
+
+	exp.mu.Lock()
+	defer exp.mu.Unlock()
+	lr := exp.batches[0].ResourceLogs().At(0).ScopeLogs().At(0).LogRecords().At(0)
+	if lr.SeverityNumber() != plog.SeverityNumberError || lr.SeverityText() != "error" {
+		t.Errorf("severity = %v %q; want the line's own level over PRIORITY", lr.SeverityNumber(), lr.SeverityText())
+	}
+	if !lr.Timestamp().AsTime().Equal(time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)) {
+		t.Errorf("timestamp = %v; want the line's own", lr.Timestamp().AsTime())
+	}
+}
+
 func TestFieldString(t *testing.T) {
 	fields := map[string]any{
 		"S":     "plain",

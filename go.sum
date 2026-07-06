@@ -1,3 +1,9 @@
+github.com/JohanLindvall/enrich v0.0.2 h1:mdJVl4yefvO5BsuGr7Yqx+fxcyY1rm+sxUh5mcmGeJc=
+github.com/JohanLindvall/enrich v0.0.2/go.mod h1:DTwPRYwtgPU1ao0X5eBLthmXwms8LOdQiD9gCeRpQaA=
+github.com/JohanLindvall/lightning v0.0.53 h1:5lwBmRyK5tEf6Jrdsoy8awgrphacWGwEsRZh5eVNanM=
+github.com/JohanLindvall/lightning v0.0.53/go.mod h1:uGs5O1o/2myfnC3XsItHKPCIKDpVae66exbxNpSq430=
+github.com/JohanLindvall/logfmt v0.0.4 h1:/o5H00Bz0q93YNgMRbOymoNKpWRNqiL2ixMu3HFUN7I=
+github.com/JohanLindvall/logfmt v0.0.4/go.mod h1:7OQnFCJ0ITh+nWHT+W/eETUIkaYA1+YpZ4lOOXH7EsU=
 github.com/JohanLindvall/multiline v0.0.1 h1:YMyPte802WmHe1JKdEBC4uG4cB0oIRv8kebEi9s/f+w=
 github.com/JohanLindvall/multiline v0.0.1/go.mod h1:vfQiA/IdBuVxf2ckHscR8qyO/mX9y192q6C3PDQPvUM=
 github.com/beorn7/perks v1.0.1 h1:VlbKKnNfV8bJzeqoa4cOKqO6bYr3WgKZxO8Z16+hsOM=

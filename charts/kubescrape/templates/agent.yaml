@@ -109,6 +109,9 @@ spec:
             {{- end }}
             - -kubelet-insecure-tls={{ .Values.agent.kubeletInsecureTLS }}
             - -checkpoint-file={{ .Values.agent.checkpointFile }}
+            - -logs-watch={{ .Values.agent.logsWatch }}
+            - -logs-poll-interval={{ .Values.agent.logsPollInterval }}
+            - -logs-fingerprint-bytes={{ .Values.agent.logsFingerprintBytes }}
             - -logs-multiline={{ .Values.agent.multiline }}
             - -logs-exclude-namespaces={{ join "," .Values.agent.logsExcludeNamespaces }}
             - -scrape-interval={{ .Values.agent.scrapeInterval }}

@@ -50,14 +50,17 @@ func run() error {
 		logLevel  = flag.String("log-level", "info", "log level: debug, info, warn, error")
 		logFormat = flag.String("log-format", "text", "log format: text or json")
 
-		logDir         = flag.String("log-dir", "/var/log/containers", "directory of containerd log symlinks")
-		checkpointFile = flag.String("checkpoint-file", "", "file persisting log read offsets across restarts (empty disables)")
-		logsBatch      = flag.Int("logs-batch-size", 1024, "flush logs after this many entries")
-		logsFlush      = flag.Duration("logs-flush-interval", 2*time.Second, "flush logs at least this often")
-		maxEntryBytes  = flag.Int("logs-max-entry-bytes", 1<<20, "truncate assembled log entries beyond this size")
-		multilineOn    = flag.Bool("logs-multiline", true, "join application-level multi-line entries (stack traces, ...)")
-		multilineWait  = flag.Duration("logs-multiline-timeout", time.Second, "flush incomplete multi-line groups after this long")
-		excludeNs      = flag.String("logs-exclude-namespaces", "", "comma-separated namespaces whose container logs are not tailed")
+		logDir          = flag.String("log-dir", "/var/log/containers", "directory of containerd log symlinks")
+		checkpointFile  = flag.String("checkpoint-file", "", "file persisting log read offsets across restarts (empty disables)")
+		logsBatch       = flag.Int("logs-batch-size", 1024, "flush logs after this many entries")
+		logsFlush       = flag.Duration("logs-flush-interval", 2*time.Second, "flush logs at least this often")
+		maxEntryBytes   = flag.Int("logs-max-entry-bytes", 1<<20, "truncate assembled log entries beyond this size")
+		multilineOn     = flag.Bool("logs-multiline", true, "join application-level multi-line entries (stack traces, ...)")
+		multilineWait   = flag.Duration("logs-multiline-timeout", time.Second, "flush incomplete multi-line groups after this long")
+		excludeNs       = flag.String("logs-exclude-namespaces", "", "comma-separated namespaces whose container logs are not tailed")
+		logsWatch       = flag.Bool("logs-watch", true, "use file events (fsnotify) to trigger reads and discovery; polling remains the fallback")
+		logsPoll        = flag.Duration("logs-poll-interval", 500*time.Millisecond, "fallback sweep interval for the log tailer")
+		logsFingerprint = flag.Int("logs-fingerprint-bytes", 1024, "file-head hash length used with the inode as file identity (negative = inode only)")
 
 		scrapeInterval    = flag.Duration("scrape-interval", 30*time.Second, "Prometheus scrape interval")
 		scrapeTimeout     = flag.Duration("scrape-timeout", 15*time.Second, "per-target scrape timeout")
@@ -139,6 +142,9 @@ func run() error {
 		tl := tailer.New(tailer.Config{
 			Dir:               *logDir,
 			CheckpointFile:    *checkpointFile,
+			Watch:             *logsWatch,
+			PollInterval:      *logsPoll,
+			FingerprintBytes:  *logsFingerprint,
 			FlushInterval:     *logsFlush,
 			BatchSize:         *logsBatch,
 			MaxEntryBytes:     *maxEntryBytes,

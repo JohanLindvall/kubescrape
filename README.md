@@ -166,7 +166,13 @@ collector.
 the two-stage [JohanLindvall/multiline](https://github.com/JohanLindvall/multiline)
 pipeline: the `cri` stage parses the CRI log format and rejoins partial-line
 fragments, and the multiline stage joins application-level multi-line entries
-such as stack traces (Go, Java, Python, .NET, Ruby, Rust, PHP). It exports
+such as stack traces (Go, Java, Python, .NET, Ruby, Rust, PHP). Reads and
+discovery are event-driven (fsnotify, `-logs-watch`) with a polling fallback
+(`-logs-poll-interval`). File identity is the inode plus a head fingerprint
+(`-logs-fingerprint-bytes`), so checkpoints never mis-resume into a
+different file after inode reuse or in-place rewrites; rename rotation
+drains the old file to EOF before switching, truncation restarts at zero,
+and removed files are drained before being dropped. It exports
 OTLP log records with resource attributes (`k8s.pod.name`,
 `k8s.deployment.name`, `container.id`, pod/namespace labels, …) resolved via
 `GET /v1/containers/{id}` — the blocking wait covers containers whose
@@ -290,6 +296,9 @@ flag exposed as a value, and renders `agent.attrsConfig` /
 ```sh
 helm install kubescrape charts/kubescrape -n monitoring -f my-values.yaml
 ```
+
+Migrating from a Grafana Alloy setup? See
+[docs/MIGRATING-FROM-CMB-ALLOY.md](docs/MIGRATING-FROM-CMB-ALLOY.md).
 
 For a local test pipeline, `hack/otel-collector.yaml` deploys a contrib
 collector with a debug exporter; the agent's own internal metrics stay small.

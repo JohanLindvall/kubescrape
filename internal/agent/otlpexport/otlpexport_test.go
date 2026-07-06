@@ -3,16 +3,22 @@ package otlpexport
 import (
 	"context"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"go.opentelemetry.io/collector/pdata/plog"
+	"go.opentelemetry.io/collector/pdata/plog/plogotlp"
 	"go.opentelemetry.io/collector/pdata/pmetric"
 	"go.opentelemetry.io/collector/pdata/pmetric/pmetricotlp"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/metadata"
 )
 
 func testMetrics() pmetric.Metrics {
@@ -93,6 +99,91 @@ func TestHTTPExportRetries(t *testing.T) {
 	calls.Store(-100)
 	if err := c.ExportMetrics(context.Background(), testMetrics()); err == nil {
 		t.Fatal("expected error after exhausted retries")
+	}
+}
+
+type grpcState struct {
+	mu      sync.Mutex
+	logs    int
+	metrics int
+	auth    string
+}
+
+func (s *grpcState) captureAuth(ctx context.Context) {
+	if md, ok := metadata.FromIncomingContext(ctx); ok {
+		if v := md.Get("authorization"); len(v) > 0 {
+			s.auth = v[0]
+		}
+	}
+}
+
+type logSink struct {
+	plogotlp.UnimplementedGRPCServer
+	st *grpcState
+}
+
+func (s *logSink) Export(ctx context.Context, req plogotlp.ExportRequest) (plogotlp.ExportResponse, error) {
+	s.st.mu.Lock()
+	defer s.st.mu.Unlock()
+	s.st.logs += req.Logs().LogRecordCount()
+	s.st.captureAuth(ctx)
+	return plogotlp.NewExportResponse(), nil
+}
+
+type metricSink struct {
+	pmetricotlp.UnimplementedGRPCServer
+	st *grpcState
+}
+
+func (s *metricSink) Export(ctx context.Context, req pmetricotlp.ExportRequest) (pmetricotlp.ExportResponse, error) {
+	s.st.mu.Lock()
+	defer s.st.mu.Unlock()
+	s.st.metrics += req.Metrics().DataPointCount()
+	s.st.captureAuth(ctx)
+	return pmetricotlp.NewExportResponse(), nil
+}
+
+func TestGRPCExport(t *testing.T) {
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sink := &grpcState{}
+	srv := grpc.NewServer()
+	plogotlp.RegisterGRPCServer(srv, &logSink{st: sink})
+	pmetricotlp.RegisterGRPCServer(srv, &metricSink{st: sink})
+	go func() { _ = srv.Serve(lis) }()
+	defer srv.Stop()
+
+	tokenFile := filepath.Join(t.TempDir(), "token")
+	if err := os.WriteFile(tokenFile, []byte("grpc-tok"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c, err := New(Config{
+		Endpoint: lis.Addr().String(), Protocol: "grpc", Insecure: true,
+		Timeout: 5 * time.Second, BearerTokenFile: tokenFile,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	ld := plog.NewLogs()
+	ld.ResourceLogs().AppendEmpty().ScopeLogs().AppendEmpty().LogRecords().AppendEmpty().Body().SetStr("hi")
+	if err := c.ExportLogs(context.Background(), ld); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.ExportMetrics(context.Background(), testMetrics()); err != nil {
+		t.Fatal(err)
+	}
+
+	sink.mu.Lock()
+	defer sink.mu.Unlock()
+	if sink.logs != 1 || sink.metrics != 1 {
+		t.Fatalf("received logs=%d metrics=%d", sink.logs, sink.metrics)
+	}
+	if sink.auth != "Bearer grpc-tok" {
+		t.Fatalf("authorization = %q", sink.auth)
 	}
 }
 

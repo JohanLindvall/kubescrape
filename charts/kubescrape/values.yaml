@@ -51,6 +51,9 @@ agent:
 
   logsExcludeNamespaces: [monitoring]
   checkpointFile: /var/lib/kubescrape-agent/checkpoints.json
+  logsWatch: true
+  logsPollInterval: 500ms
+  logsFingerprintBytes: 1024
   multiline: true
   scrapeInterval: 30s
   scrapeExemplars: false

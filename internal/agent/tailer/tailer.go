@@ -7,13 +7,21 @@
 // fragments, and the multiline stage joins application-level multi-line
 // entries such as stack traces.
 //
-// Design: a single sweep goroutine polls all files (bounded bytes per file
-// per sweep), feeds the pipeline, and batches emitted entries. Export
-// happens inline in the sweep with retries; file offsets are only committed
-// (and checkpointed) after a successful export — never past lines still
-// buffered in the pipeline — and on failure the files are rewound to the
-// committed offsets so the data is re-read: at-least-once delivery with no
-// unbounded in-memory queue.
+// Design: a single sweep goroutine reads all files (bounded bytes per file
+// per sweep), feeds the pipeline, and batches emitted entries. Sweeps are
+// triggered by fsnotify events (writes on the log directories, symlink
+// creation/removal) with a polling ticker as fallback; polling alone remains
+// available with Watch off. Export happens inline in the sweep with retries;
+// file offsets are only committed (and checkpointed) after a successful
+// export — never past lines still buffered in the pipeline — and on failure
+// the files are rewound to the committed offsets so the data is re-read:
+// at-least-once delivery with no unbounded in-memory queue.
+//
+// Rotation handling: a file's identity is its inode plus a fingerprint (hash
+// of the first FingerprintBytes), so checkpoints never mis-resume into a
+// different file that reuses an inode. On rename rotation the old fd is
+// drained to EOF before switching to the new file; in-place truncation
+// restarts at offset zero; removed files are drained before being dropped.
 package tailer
 
 import (
@@ -21,6 +29,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"hash/fnv"
 	"io"
 	"log/slog"
 	"os"
@@ -32,6 +41,7 @@ import (
 
 	"github.com/JohanLindvall/multiline"
 	"github.com/JohanLindvall/multiline/cri"
+	"github.com/fsnotify/fsnotify"
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/plog"
 
@@ -53,8 +63,16 @@ type MetadataSource interface {
 
 // Config configures the tailer.
 type Config struct {
-	Dir              string // /var/log/containers
-	CheckpointFile   string // "" disables checkpointing
+	Dir            string // /var/log/containers
+	CheckpointFile string // "" disables checkpointing
+	// Watch uses fsnotify events to trigger reads and discovery; the poll
+	// ticker remains as a fallback for missed events.
+	Watch bool
+	// FingerprintBytes is the length of the file-head hash used (with the
+	// inode) as the file identity for checkpoint resumption and rewrite
+	// detection; 0 means the 1024-byte default, negative relies on the
+	// inode alone.
+	FingerprintBytes int
 	PollInterval     time.Duration
 	FlushInterval    time.Duration
 	BatchSize        int // flush after this many entries
@@ -91,6 +109,10 @@ type Tailer struct {
 	lastFlush      time.Time
 	lastCheckpoint time.Time
 	retryBackoff   time.Duration // initial export retry backoff
+
+	// Event-driven mode (nil watcher = pure polling).
+	watcher   *fsnotify.Watcher
+	watchRefs map[string]int // watched target directories, refcounted
 }
 
 // file state invariant: lineStart + len(pending) == readPos, where lineStart
@@ -99,6 +121,17 @@ type file struct {
 	path        string
 	containerID string
 	inode       uint64
+	// fp is the identity fingerprint: a hash of the first fp.Len bytes.
+	// Together with the inode it prevents a checkpoint from resuming into a
+	// different file (inode reuse, replaced content).
+	fp fingerprint
+	// targetDir is the watched directory of the symlink target.
+	targetDir string
+	// dirty marks files with pending fsnotify write events.
+	dirty bool
+	// lastMod is the modtime observed by the previous sweep, used to detect
+	// same-size in-place rewrites.
+	lastMod time.Time
 
 	f         *os.File
 	readPos   int64  // fd position
@@ -126,6 +159,42 @@ type file struct {
 }
 
 type logItem struct{ start, end int64 }
+
+// fingerprint identifies file content: an FNV-1a hash of the first Len
+// bytes. A zero Len means "not recorded" and matches anything.
+type fingerprint struct {
+	Len  int64
+	Hash uint64
+}
+
+// computeFingerprint hashes the first n bytes of f (independent of the read
+// offset).
+func computeFingerprint(f io.ReaderAt, n int64) (fingerprint, error) {
+	if n <= 0 {
+		return fingerprint{}, nil
+	}
+	buf := make([]byte, n)
+	read, err := f.ReadAt(buf, 0)
+	if err != nil && !errors.Is(err, io.EOF) {
+		return fingerprint{}, err
+	}
+	if int64(read) < n {
+		buf = buf[:read]
+	}
+	h := fnv.New64a()
+	_, _ = h.Write(buf)
+	return fingerprint{Len: int64(len(buf)), Hash: h.Sum64()}, nil
+}
+
+// matches reports whether the file still begins with the fingerprinted
+// content.
+func (fp fingerprint) matches(f io.ReaderAt) bool {
+	if fp.Len == 0 {
+		return true
+	}
+	cur, err := computeFingerprint(f, fp.Len)
+	return err == nil && cur == fp
+}
 
 // watermark returns the lowest offset still buffered in the pipeline;
 // committed offsets must not advance past it.
@@ -181,6 +250,11 @@ func New(cfg Config) *Tailer {
 	if cfg.MultilineTimeout <= 0 {
 		cfg.MultilineTimeout = time.Second
 	}
+	if cfg.FingerprintBytes == 0 {
+		cfg.FingerprintBytes = 1024
+	} else if cfg.FingerprintBytes < 0 {
+		cfg.FingerprintBytes = 0
+	}
 	log := cfg.Logger
 	if log == nil {
 		log = slog.Default()
@@ -195,6 +269,26 @@ func New(cfg Config) *Tailer {
 
 // Run tails until ctx is done, then flushes what it has.
 func (t *Tailer) Run(ctx context.Context) {
+	if t.cfg.Watch {
+		w, err := fsnotify.NewWatcher()
+		if err != nil {
+			t.log.Warn("fsnotify unavailable, falling back to polling", "error", err)
+		} else if err := w.Add(t.cfg.Dir); err != nil {
+			t.log.Warn("watching log directory failed, falling back to polling", "dir", t.cfg.Dir, "error", err)
+			_ = w.Close()
+		} else {
+			t.watcher = w
+			t.watchRefs = make(map[string]int)
+			defer func() { _ = w.Close() }()
+		}
+	}
+	var events <-chan fsnotify.Event
+	var watchErrs <-chan error
+	if t.watcher != nil {
+		events = t.watcher.Events
+		watchErrs = t.watcher.Errors
+	}
+
 	t.scanDir(t.loadCheckpoints(), true)
 	t.lastFlush = time.Now()
 
@@ -202,11 +296,17 @@ func (t *Tailer) Run(ctx context.Context) {
 	defer dirTicker.Stop()
 	poll := time.NewTicker(t.cfg.PollInterval)
 	defer poll.Stop()
+	// debounce coalesces bursts of write events into one dirty sweep.
+	debounce := time.NewTimer(0)
+	if !debounce.Stop() {
+		<-debounce.C
+	}
+	defer debounce.Stop()
 
 	for {
 		select {
 		case <-ctx.Done():
-			t.sweep(context.Background())
+			t.sweep(context.Background(), true)
 			// Drain the pipelines; the emitted entries' offsets commit with
 			// the final flush, so nothing is re-read after a restart.
 			for _, f := range t.files {
@@ -217,16 +317,92 @@ func (t *Tailer) Run(ctx context.Context) {
 			return
 		case <-dirTicker.C:
 			t.scanDir(nil, false)
+		case ev := <-events:
+			if t.handleEvent(ev) {
+				debounce.Reset(50 * time.Millisecond)
+			}
+		case err := <-watchErrs:
+			t.log.Warn("fsnotify", "error", err)
+		case <-debounce.C:
+			t.sweep(ctx, false)
+			t.housekeeping(ctx)
 		case <-poll.C:
-			t.sweep(ctx)
-			if len(t.batch) > 0 && time.Since(t.lastFlush) >= t.cfg.FlushInterval {
-				t.flush(ctx)
-			}
-			if t.cfg.CheckpointFile != "" && time.Since(t.lastCheckpoint) >= 10*time.Second {
-				t.saveCheckpoints()
-			}
+			t.sweep(ctx, true)
+			t.housekeeping(ctx)
 		}
 	}
+}
+
+// housekeeping flushes and checkpoints on their intervals.
+func (t *Tailer) housekeeping(ctx context.Context) {
+	if len(t.batch) > 0 && time.Since(t.lastFlush) >= t.cfg.FlushInterval {
+		t.flush(ctx)
+	}
+	if t.cfg.CheckpointFile != "" && time.Since(t.lastCheckpoint) >= 10*time.Second {
+		t.saveCheckpoints()
+	}
+}
+
+// handleEvent processes one fsnotify event; it reports whether a dirty sweep
+// should be scheduled.
+func (t *Tailer) handleEvent(ev fsnotify.Event) bool {
+	dir := filepath.Dir(ev.Name)
+	if dir == t.cfg.Dir {
+		// Symlink appeared/disappeared: rediscover immediately.
+		if ev.Op&(fsnotify.Create|fsnotify.Remove|fsnotify.Rename) != 0 {
+			t.scanDir(nil, false)
+			return true
+		}
+		// The log file may live directly in the watched directory (no
+		// symlink indirection): treat writes like target-dir events.
+		if f, ok := t.files[ev.Name]; ok && ev.Op&fsnotify.Write != 0 {
+			f.dirty = true
+			return true
+		}
+		return false
+	}
+	// A write/create in a watched target directory: mark the files tailing
+	// that directory (rotation creates a new file there, too).
+	dirty := false
+	for _, f := range t.files {
+		if f.targetDir == dir {
+			f.dirty = true
+			dirty = true
+		}
+	}
+	return dirty
+}
+
+// watchTarget registers the file's resolved log directory with the watcher.
+func (t *Tailer) watchTarget(f *file) {
+	if t.watcher == nil || f.targetDir != "" {
+		return
+	}
+	target, err := filepath.EvalSymlinks(f.path)
+	if err != nil {
+		return // next open retries
+	}
+	dir := filepath.Dir(target)
+	if t.watchRefs[dir] == 0 {
+		if err := t.watcher.Add(dir); err != nil {
+			t.log.Debug("watching log target directory", "dir", dir, "error", err)
+			return
+		}
+	}
+	t.watchRefs[dir]++
+	f.targetDir = dir
+}
+
+// unwatchTarget releases the file's directory watch.
+func (t *Tailer) unwatchTarget(f *file) {
+	if t.watcher == nil || f.targetDir == "" {
+		return
+	}
+	if t.watchRefs[f.targetDir]--; t.watchRefs[f.targetDir] <= 0 {
+		delete(t.watchRefs, f.targetDir)
+		_ = t.watcher.Remove(f.targetDir)
+	}
+	f.targetDir = ""
 }
 
 // parseFileName extracts the container ID and namespace from a
@@ -270,12 +446,14 @@ func (t *Tailer) scanDir(checkpoints map[string]checkpoint, initial bool) {
 		f := &file{
 			path:        path,
 			containerID: id,
+			dirty:       true, // read on the first (event-driven) sweep
 		}
 		t.newPipeline(f)
 		if initial {
 			if cp, ok := checkpoints[path]; ok {
 				f.committed = cp.Offset
 				f.inode = cp.Inode
+				f.fp = fingerprint{Len: cp.FingerprintLen, Hash: cp.FingerprintHash}
 			} else if st, err := os.Stat(path); err == nil {
 				// Present before the agent started and no checkpoint: start
 				// at the end to avoid re-ingesting history.
@@ -370,8 +548,9 @@ func (t *Tailer) stopPipeline(ctx context.Context, f *file) {
 	}
 }
 
-// sweep reads newly appended data from every file.
-func (t *Tailer) sweep(ctx context.Context) {
+// sweep reads newly appended data; all sweeps every file (polling
+// fallback), otherwise only files marked dirty by events are read.
+func (t *Tailer) sweep(ctx context.Context, all bool) {
 	cutoff := time.Now().Add(-t.cfg.MultilineTimeout)
 	for path, f := range t.files {
 		if f.gone {
@@ -379,9 +558,13 @@ func (t *Tailer) sweep(ctx context.Context) {
 			delete(t.files, path)
 			continue
 		}
+		if !all && !f.dirty {
+			continue
+		}
 		if !f.resolved && !t.resolveMetadata(ctx, f) {
 			continue
 		}
+		f.dirty = false
 		if err := t.readFile(ctx, f); err != nil && !errors.Is(err, os.ErrNotExist) {
 			t.log.Warn("reading log file", "path", path, "error", err)
 		}
@@ -433,11 +616,13 @@ func (t *Tailer) readFile(ctx context.Context, f *file) error {
 
 	budget := t.cfg.MaxBytesPerSweep
 	buf := make([]byte, 64*1024)
+	read := 0
 	for budget > 0 {
 		limit := min(len(buf), budget)
 		n, err := f.f.Read(buf[:limit])
 		if n > 0 {
 			budget -= n
+			read += n
 			f.pending = append(f.pending, buf[:n]...)
 			f.readPos += int64(n)
 			t.consume(ctx, f)
@@ -450,16 +635,54 @@ func (t *Tailer) readFile(ctx context.Context, f *file) error {
 		}
 	}
 
-	// Rotation/truncation: the path now names a different file, or it
-	// shrank below our position.
+	// Rotation/truncation detection.
 	st, err := os.Stat(f.path)
 	if err != nil {
 		return err
 	}
-	if inodeOf(st) != f.inode || st.Size() < f.readPos {
+	switch {
+	case inodeOf(st) != f.inode:
+		// Rename rotation: the path names a new file. Drain what the old
+		// writer appended after our last read, then switch.
+		t.drainFile(ctx, f)
+		t.reopen(ctx, f)
+	case st.Size() < f.readPos:
+		// In-place truncation: the unread tail is gone; restart at zero.
+		// (Draining would read the replacement content mid-stream.)
+		t.reopen(ctx, f)
+	case read == 0 && !st.ModTime().Equal(f.lastMod) && !f.fp.matches(f.f):
+		// The file changed without yielding new bytes past our offset and
+		// its head no longer matches: truncated and rewritten to a size at
+		// or beyond our position (same-size copytruncate). Restart.
 		t.reopen(ctx, f)
 	}
+	f.lastMod = st.ModTime()
 	return nil
+}
+
+// drainFile reads the (rotated-away or removed) file to EOF so no bytes
+// written between our last read and the rotation are lost. Bounded to keep a
+// still-active writer from pinning the sweep.
+func (t *Tailer) drainFile(ctx context.Context, f *file) {
+	if f.f == nil {
+		return
+	}
+	budget := 4 * t.cfg.MaxBytesPerSweep
+	buf := make([]byte, 64*1024)
+	for budget > 0 {
+		limit := min(len(buf), budget)
+		n, err := f.f.Read(buf[:limit])
+		if n > 0 {
+			budget -= n
+			f.pending = append(f.pending, buf[:n]...)
+			f.readPos += int64(n)
+			t.consume(ctx, f)
+		}
+		if err != nil {
+			return
+		}
+	}
+	t.log.Warn("rotated file still growing, leaving remainder", "path", f.path)
 }
 
 // consume splits pending bytes into physical lines and feeds the pipeline.
@@ -486,7 +709,10 @@ func (t *Tailer) consume(ctx context.Context, f *file) {
 	}
 }
 
-// ensureOpen opens the file at the committed offset on first use.
+// ensureOpen opens the file at the committed offset on first use. The
+// offset is only honored when the file's identity (inode and fingerprint)
+// still matches; otherwise the path names a different file and reading
+// starts from the top.
 func (t *Tailer) ensureOpen(f *file) error {
 	if f.f != nil {
 		return nil
@@ -502,9 +728,7 @@ func (t *Tailer) ensureOpen(f *file) error {
 	}
 	inode := inodeOf(st)
 	start := f.committed
-	if f.inode != 0 && f.inode != inode {
-		// The checkpoint refers to a rotated-away file; start from the top
-		// of the current one.
+	if f.inode != 0 && (f.inode != inode || !f.fp.matches(fh)) {
 		start = 0
 	}
 	if start > st.Size() {
@@ -514,17 +738,25 @@ func (t *Tailer) ensureOpen(f *file) error {
 		_ = fh.Close()
 		return err
 	}
+	fp, err := computeFingerprint(fh, min(int64(t.cfg.FingerprintBytes), st.Size()))
+	if err != nil {
+		_ = fh.Close()
+		return err
+	}
 	f.f = fh
 	f.inode = inode
+	f.fp = fp
 	f.readPos = start
 	f.lineStart = start
 	f.committed = start
 	f.pending = f.pending[:0]
+	t.watchTarget(f)
 	return nil
 }
 
 // reopen drains the pipeline (the buffered data belongs to the rotated-away
-// file) and resets state; the next sweep reopens from offset 0.
+// file) and resets state; the next sweep reopens from offset 0. The file is
+// marked dirty so an event-driven loop picks the new file up immediately.
 func (t *Tailer) reopen(ctx context.Context, f *file) {
 	if f.f != nil {
 		_ = f.f.Close()
@@ -533,21 +765,26 @@ func (t *Tailer) reopen(ctx context.Context, f *file) {
 	t.stopPipeline(ctx, f)
 	t.newPipeline(f)
 	f.inode = 0
+	f.fp = fingerprint{}
 	f.committed = 0
 	f.readPos = 0
 	f.lineStart = 0
 	f.pending = f.pending[:0]
+	f.dirty = true
 }
 
-// drop closes a removed file, draining the pipeline.
+// drop closes a removed file, draining first the fd (bytes appended since
+// the last read) and then the pipeline.
 func (t *Tailer) drop(f *file) {
 	if f.resolved {
+		t.drainFile(context.Background(), f)
 		t.stopPipeline(context.Background(), f)
 	}
 	if f.f != nil {
 		_ = f.f.Close()
 		f.f = nil
 	}
+	t.unwatchTarget(f)
 }
 
 // flush exports the batch. On success offsets are committed; on failure the
@@ -649,8 +886,10 @@ func (t *Tailer) rewind(f *file) {
 // --- checkpoints ---
 
 type checkpoint struct {
-	Offset int64  `json:"offset"`
-	Inode  uint64 `json:"inode"`
+	Offset          int64  `json:"offset"`
+	Inode           uint64 `json:"inode"`
+	FingerprintLen  int64  `json:"fpLen,omitempty"`
+	FingerprintHash uint64 `json:"fpHash,omitempty"`
 }
 
 func (t *Tailer) loadCheckpoints() map[string]checkpoint {
@@ -676,7 +915,19 @@ func (t *Tailer) saveCheckpoints() {
 	}
 	cps := make(map[string]checkpoint, len(t.files))
 	for path, f := range t.files {
-		cps[path] = checkpoint{Offset: f.committed, Inode: f.inode}
+		// Extend the fingerprint once the file has grown past the initial
+		// hash length, up to the configured size.
+		if f.f != nil && f.fp.Len < int64(t.cfg.FingerprintBytes) {
+			if st, err := f.f.Stat(); err == nil && st.Size() > f.fp.Len {
+				if fp, err := computeFingerprint(f.f, min(int64(t.cfg.FingerprintBytes), st.Size())); err == nil {
+					f.fp = fp
+				}
+			}
+		}
+		cps[path] = checkpoint{
+			Offset: f.committed, Inode: f.inode,
+			FingerprintLen: f.fp.Len, FingerprintHash: f.fp.Hash,
+		}
 	}
 	data, err := json.Marshal(cps)
 	if err != nil {

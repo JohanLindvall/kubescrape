@@ -284,7 +284,11 @@ func TestAttrFilter(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	tl.cfg.AttrFilter = filter
+	builder, err := attrs.NewBuilder(&attrs.Config{Static: map[string]string{"cluster": "test"}}, filter)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tl.cfg.Attrs = builder
 	stop := startTailer(t, tl)
 	defer stop()
 
@@ -298,6 +302,9 @@ func TestAttrFilter(t *testing.T) {
 	}
 	if exp.resAttrs["k8s.pod.name"] != "pod1" {
 		t.Fatalf("kept attributes damaged: %v", exp.resAttrs)
+	}
+	if exp.resAttrs["cluster"] != "test" {
+		t.Fatalf("static attribute missing: %v", exp.resAttrs)
 	}
 }
 

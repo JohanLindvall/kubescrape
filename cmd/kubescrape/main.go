@@ -28,6 +28,7 @@ import (
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/clientcmd"
+	"k8s.io/klog/v2"
 
 	"github.com/JohanLindvall/kubescrape/internal/owners"
 	"github.com/JohanLindvall/kubescrape/internal/server"
@@ -57,6 +58,8 @@ func run() error {
 
 	log := slog.New(slog.NewTextHandler(os.Stderr, nil))
 	slog.SetDefault(log)
+	// client-go logs through klog; route it into the same slog handler.
+	klog.SetSlogLogger(log)
 
 	cfg, err := buildConfig(*kubeconfig)
 	if err != nil {

@@ -159,10 +159,9 @@ func (s *Scraper) scrapeNodeMetrics(ctx context.Context) error {
 	node := s.cfg.Node
 	b := newBatcher(func(res pcommon.Resource) {
 		a := res.Attributes()
-		a.PutStr("k8s.node.name", node)
 		a.PutStr("service.name", "kubelet")
 		a.PutStr("url.full", url)
-		s.cfg.AttrFilter.Apply(res)
+		s.cfg.Attrs.Build(res, attrs.Context{Node: node})
 	}, s.cfg.BatchPoints, s.cfg.StartTime, time.Now())
 	return s.parseAndExport(ctx, resp.Body, false, false, b, url)
 }
@@ -288,7 +287,6 @@ func (cb *cadvisorBatcher) scope(labels []Label) (pmetric.ScopeMetrics, string) 
 
 	rm := cb.md.ResourceMetrics().AppendEmpty()
 	cb.fillResource(rm.Resource(), ident)
-	cb.s.cfg.AttrFilter.Apply(rm.Resource())
 	sm := rm.ScopeMetrics().AppendEmpty()
 	sm.Scope().SetName("github.com/JohanLindvall/kubescrape/agent/promscrape/cadvisor")
 	cb.scopes[key] = sm
@@ -300,56 +298,55 @@ func (cb *cadvisorBatcher) scope(labels []Label) (pmetric.ScopeMetrics, string) 
 // then the pod (by name, cross-checked against the cgroup pod UID), then the
 // raw label identity.
 func (cb *cadvisorBatcher) fillResource(res pcommon.Resource, ident cadvisorIdentity) {
-	res.Attributes().PutStr("k8s.node.name", cb.s.cfg.Node)
+	ctx := attrs.Context{Node: cb.s.cfg.Node}
+	resolved := false
 
 	// Exact container incarnation via the cgroup container ID.
 	if ident.containerID != "" {
 		if md := cb.s.containerMeta(cb.ctx, ident.containerID); md != nil {
-			attrs.Pod(res, md.Pod)
-			attrs.Container(res, md.Container)
-			return
+			ctx.Pod, ctx.Container = &md.Pod, &md.Container
+			resolved = true
 		}
 	}
-
-	if ident.pod == "" && ident.podUID == "" {
-		return // node-level (machine_* or hierarchy cgroups)
-	}
-
-	if ident.pod != "" {
+	if !resolved && ident.pod != "" {
 		if meta := cb.s.podMeta(cb.ctx, ident.namespace, ident.pod); meta != nil &&
 			(ident.podUID == "" || meta.UID == ident.podUID) {
-			attrs.Pod(res, *meta)
+			ctx.Pod = meta
+			resolved = true
 			if ident.container != "" {
-				for _, c := range meta.Containers {
-					if c.Name == ident.container {
-						attrs.Container(res, c)
-						return
+				for i := range meta.Containers {
+					if meta.Containers[i].Name == ident.container {
+						ctx.Container = &meta.Containers[i]
+						break
 					}
 				}
-				res.Attributes().PutStr("k8s.container.name", ident.container)
+				if ctx.Container == nil {
+					res.Attributes().PutStr("k8s.container.name", ident.container)
+				}
 			}
-			return
 		}
 	}
-
-	// Metadata unavailable (or a same-name pod replaced this one): keep the
-	// identity from the labels and the cgroup path.
-	a := res.Attributes()
-	if ident.namespace != "" {
-		a.PutStr("k8s.namespace.name", ident.namespace)
+	if !resolved && (ident.pod != "" || ident.podUID != "") {
+		// Metadata unavailable (or a same-name pod replaced this one): keep
+		// the identity from the labels and the cgroup path.
+		a := res.Attributes()
+		if ident.namespace != "" {
+			a.PutStr("k8s.namespace.name", ident.namespace)
+		}
+		if ident.pod != "" {
+			a.PutStr("k8s.pod.name", ident.pod)
+		}
+		if ident.podUID != "" {
+			a.PutStr("k8s.pod.uid", ident.podUID)
+		}
+		if ident.container != "" {
+			a.PutStr("k8s.container.name", ident.container)
+		}
+		if ident.containerID != "" {
+			a.PutStr("container.id", ident.containerID)
+		}
 	}
-	if ident.pod != "" {
-		a.PutStr("k8s.pod.name", ident.pod)
-	}
-	if ident.podUID != "" {
-		a.PutStr("k8s.pod.uid", ident.podUID)
-	}
-	if ident.container != "" {
-		a.PutStr("k8s.container.name", ident.container)
-	}
-	if ident.containerID != "" {
-		a.PutStr("container.id", ident.containerID)
-	}
+	cb.s.cfg.Attrs.Build(res, ctx)
 }
 
 func (cb *cadvisorBatcher) metric(labels []Label, name string, shape func(pmetric.Metric)) pmetric.Metric {

@@ -70,9 +70,8 @@ type Config struct {
 	// tailed (e.g. the observability namespace itself, to avoid feedback
 	// loops through the collector's own output).
 	ExcludeNamespaces []string
-	// AttrFilter selects which resource attributes are exported (nil keeps
-	// all).
-	AttrFilter   *attrs.Filter
+	// Attrs builds the exported resource attributes (nil = defaults).
+	Attrs        *attrs.Builder
 	MetadataWait time.Duration
 	Metadata     MetadataSource
 	Exporter     LogExporter
@@ -412,9 +411,7 @@ func (t *Tailer) resolveMetadata(ctx context.Context, f *file) bool {
 		return false
 	}
 	res := pcommon.NewResource()
-	attrs.Pod(res, md.Pod)
-	attrs.Container(res, md.Container)
-	t.cfg.AttrFilter.Apply(res)
+	t.cfg.Attrs.Build(res, attrs.Context{Pod: &md.Pod, Container: &md.Container})
 	f.resource = res
 	f.resolved = true
 	return true

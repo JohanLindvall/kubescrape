@@ -294,6 +294,13 @@ func TestScrapeAttrFilter(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	builder, err := attrs.NewBuilder(&attrs.Config{
+		Static:     map[string]string{"cluster": "test"},
+		Attributes: map[string]string{"app": `{{ index .Pod.Labels "app" }}`},
+	}, filter)
+	if err != nil {
+		t.Fatal(err)
+	}
 	target := testTarget(srv.URL)
 	target.Pod.Labels = map[string]string{"app": "x"}
 
@@ -301,7 +308,7 @@ func TestScrapeAttrFilter(t *testing.T) {
 	s := New(Config{
 		Node: "node1", Interval: time.Hour, Timeout: 5 * time.Second,
 		Targets: staticTargets{target}, Exporter: exp, StartTime: time.Now(),
-		AttrFilter: filter,
+		Attrs: builder,
 	})
 	if err := s.scrapeTarget(context.Background(), target); err != nil {
 		t.Fatal(err)
@@ -314,6 +321,13 @@ func TestScrapeAttrFilter(t *testing.T) {
 	}
 	if v, _ := got.Get("k8s.pod.name"); v.Str() != "pod1" {
 		t.Fatalf("kept attributes damaged: %v", got.AsRaw())
+	}
+	// Static and template attributes are injected before the filter runs.
+	if v, _ := got.Get("cluster"); v.Str() != "test" {
+		t.Errorf("static attribute missing: %v", got.AsRaw())
+	}
+	if v, _ := got.Get("app"); v.Str() != "x" {
+		t.Errorf("template attribute missing: %v", got.AsRaw())
 	}
 }
 

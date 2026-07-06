@@ -224,13 +224,32 @@ ServiceAccount token (`nodes/metrics` RBAC, see
 (all default true; the kubelet scrapes additionally require
 `-kubelet-endpoint`).
 
-**Resource attribute filtering.** `-resource-attrs-enable` and
-`-resource-attrs-disable` take comma-separated regexes matched against the
-full attribute key (anchored). An attribute is exported when it matches the
-enable set (empty = enable all) and does not match the disable set (empty =
-disable none). Applies uniformly to log and metric resources, e.g.
-`-resource-attrs-disable='k8s\.pod\.label\..*,k8s\.namespace\.label\..*'`
-drops all label attributes.
+**Resource attributes.** How resource attributes are built is configurable
+and applies uniformly to log and metric resources:
+
+* `-resource-attrs-enable` / `-resource-attrs-disable` — comma-separated
+  regexes matched against the full attribute key (anchored). An attribute is
+  exported when it matches the enable set (empty = enable all) and does not
+  match the disable set (empty = disable none), e.g.
+  `-resource-attrs-disable='k8s\.pod\.label\..*,k8s\.namespace\.label\..*'`
+  drops all label attributes.
+* `-resource-attrs-static=cluster=prod,env=eu` — fixed attributes added to
+  every exported resource.
+* `-resource-attrs-config=attrs.yaml` — full control, including template
+  attributes built from the pod/container/service metadata:
+
+  ```yaml
+  defaults: true            # include the built-in k8s.* mapping
+  static:
+    cluster: prod-eu
+  attributes:               # Go templates over {Node, Pod, Container, Service}
+    team: '{{ index .Pod.Labels "team" }}'
+    container.image: '{{ with .Container }}{{ .Image }}{{ end }}'
+  ```
+
+  Template attributes that render empty or fail (e.g. `.Container` on a
+  pod-level resource) are omitted. Order: defaults → static → templates →
+  filter.
 
 For a local test pipeline, `hack/otel-collector.yaml` deploys a contrib
 collector with a debug exporter; the agent's own internal metrics stay small.

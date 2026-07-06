@@ -46,13 +46,12 @@ type Config struct {
 	// Kubelet configures scraping of the kubelet's cadvisor and node
 	// metrics endpoints.
 	Kubelet KubeletConfig
-	// AttrFilter selects which resource attributes are exported (nil keeps
-	// all).
-	AttrFilter *attrs.Filter
-	Logger     *slog.Logger
-	Targets    TargetSource
-	Exporter   MetricExporter
-	StartTime  time.Time // cumulative-sum start timestamp (agent start)
+	// Attrs builds the exported resource attributes (nil = defaults).
+	Attrs     *attrs.Builder
+	Logger    *slog.Logger
+	Targets   TargetSource
+	Exporter  MetricExporter
+	StartTime time.Time // cumulative-sum start timestamp (agent start)
 }
 
 // Scraper periodically scrapes all targets of one node and exports the
@@ -199,10 +198,8 @@ func (s *Scraper) scrapeTarget(ctx context.Context, t kubemeta.ScrapeTarget) err
 	openMetrics := strings.Contains(resp.Header.Get("Content-Type"), "openmetrics")
 
 	b := newBatcher(func(res pcommon.Resource) {
-		attrs.Pod(res, t.Pod)
-		attrs.Service(res, t.Service)
 		res.Attributes().PutStr("url.full", t.URL)
-		s.cfg.AttrFilter.Apply(res)
+		s.cfg.Attrs.Build(res, attrs.Context{Pod: &t.Pod, Service: t.Service})
 	}, s.cfg.BatchPoints, s.cfg.StartTime, time.Now())
 	return s.parseAndExport(ctx, resp.Body, openMetrics, s.cfg.Exemplars, b, t.URL)
 }

@@ -62,6 +62,8 @@ func run() error {
 
 		attrsEnable  = flag.String("resource-attrs-enable", "", "comma-separated anchored regexes; only matching resource attributes are exported (empty enables all)")
 		attrsDisable = flag.String("resource-attrs-disable", "", "comma-separated anchored regexes; matching resource attributes are dropped (empty disables none)")
+		attrsStatic  = flag.String("resource-attrs-static", "", "comma-separated key=value attributes added to every exported resource")
+		attrsConfig  = flag.String("resource-attrs-config", "", "YAML file declaring resource attribute building (defaults, static, template attributes)")
 
 		// Pipeline toggles.
 		logsOn     = flag.Bool("logs", true, "tail container logs")
@@ -82,9 +84,9 @@ func run() error {
 	log := slog.New(slog.NewTextHandler(os.Stderr, nil))
 	slog.SetDefault(log)
 
-	attrFilter, err := attrs.NewFilter(*attrsEnable, *attrsDisable)
+	attrBuilder, err := buildAttrs(*attrsConfig, *attrsStatic, *attrsEnable, *attrsDisable)
 	if err != nil {
-		return fmt.Errorf("resource attribute filter: %w", err)
+		return fmt.Errorf("resource attributes: %w", err)
 	}
 
 	// The metadata client's HTTP timeout must exceed the server-side wait.
@@ -108,7 +110,7 @@ func run() error {
 			Multiline:         *multilineOn,
 			MultilineTimeout:  *multilineWait,
 			ExcludeNamespaces: splitList(*excludeNs),
-			AttrFilter:        attrFilter,
+			Attrs:             attrBuilder,
 			MetadataWait:      *metadataWait,
 			Metadata:          meta,
 			Exporter:          exporter,
@@ -142,11 +144,11 @@ func run() error {
 				InsecureTLS:    *kubeletInsecure,
 				Meta:           meta,
 			},
-			AttrFilter: attrFilter,
-			Logger:     log,
-			Targets:    meta,
-			Exporter:   exporter,
-			StartTime:  time.Now(),
+			Attrs:     attrBuilder,
+			Logger:    log,
+			Targets:   meta,
+			Exporter:  exporter,
+			StartTime: time.Now(),
 		})
 		wg.Add(1)
 		go func() {
@@ -161,6 +163,37 @@ func run() error {
 	log.Info("shutting down")
 	wg.Wait()
 	return nil
+}
+
+// buildAttrs assembles the resource-attribute builder from the config file
+// and the flags; flag statics override config statics.
+func buildAttrs(configPath, static, enable, disable string) (*attrs.Builder, error) {
+	filter, err := attrs.NewFilter(enable, disable)
+	if err != nil {
+		return nil, err
+	}
+	var cfg *attrs.Config
+	if configPath != "" {
+		if cfg, err = attrs.LoadConfig(configPath); err != nil {
+			return nil, err
+		}
+	}
+	flagStatic, err := attrs.ParseStatic(static)
+	if err != nil {
+		return nil, err
+	}
+	if flagStatic != nil {
+		if cfg == nil {
+			cfg = &attrs.Config{}
+		}
+		if cfg.Static == nil {
+			cfg.Static = map[string]string{}
+		}
+		for k, v := range flagStatic {
+			cfg.Static[k] = v
+		}
+	}
+	return attrs.NewBuilder(cfg, filter)
 }
 
 func splitList(s string) []string {

@@ -86,6 +86,7 @@ spec:
           command: ["/kubescrape-agent"]
           args:
             - -metadata-endpoint=http://{{ .Release.Name }}.{{ .Release.Namespace }}
+            - -listen={{ .Values.agent.listen }}
             - -otlp-endpoint={{ .Values.agent.otlp.endpoint }}
             - -otlp-protocol={{ .Values.agent.otlp.protocol }}
             - -otlp-insecure={{ .Values.agent.otlp.insecure }}
@@ -116,6 +117,20 @@ spec:
             - -logs-exclude-namespaces={{ join "," .Values.agent.logsExcludeNamespaces }}
             - -scrape-interval={{ .Values.agent.scrapeInterval }}
             - -scrape-exemplars={{ .Values.agent.scrapeExemplars }}
+            - -scrape-health-metrics={{ .Values.agent.scrapeHealthMetrics }}
+            {{- if .Values.agent.journald.enabled }}
+            - -journald
+            - -journald-path={{ .Values.agent.journald.path }}
+            {{- with .Values.agent.journald.dir }}
+            - -journald-dir={{ . }}
+            {{- end }}
+            {{- with .Values.agent.journald.units }}
+            - -journald-units={{ join "," . }}
+            {{- end }}
+            - -journald-cursor-file={{ .Values.agent.journald.cursorFile }}
+            - -journald-batch-size={{ .Values.agent.journald.batchSize }}
+            - -journald-flush-interval={{ .Values.agent.journald.flushInterval }}
+            {{- end }}
             - -log-level={{ .Values.logLevel }}
             - -log-format={{ .Values.logFormat }}
             {{- if .Values.agent.staticAttrs }}
@@ -147,6 +162,13 @@ spec:
           securityContext:
             runAsUser: 0
             readOnlyRootFilesystem: true
+          ports:
+            - name: http
+              containerPort: {{ (split ":" .Values.agent.listen)._1 | int }}
+          readinessProbe:
+            httpGet: {path: /readyz, port: http}
+          livenessProbe:
+            httpGet: {path: /healthz, port: http}
           volumeMounts:
             - name: varlog
               mountPath: /var/log
@@ -166,6 +188,13 @@ spec:
             {{- if .Values.agent.otlp.bearerTokenSecret.name }}
             - name: otlp-token
               mountPath: /etc/kubescrape/otlp-token
+              readOnly: true
+            {{- end }}
+            {{- if .Values.agent.journald.enabled }}
+            # Volatile journals; persistent ones live under the /var/log
+            # mount above.
+            - name: runlogjournal
+              mountPath: /run/log/journal
               readOnly: true
             {{- end }}
           resources: {{ toYaml .Values.agent.resources | nindent 12 }}
@@ -191,6 +220,12 @@ spec:
         - name: otlp-token
           secret:
             secretName: {{ .Values.agent.otlp.bearerTokenSecret.name }}
+        {{- end }}
+        {{- if .Values.agent.journald.enabled }}
+        - name: runlogjournal
+          hostPath:
+            path: /run/log/journal
+            type: DirectoryOrCreate
         {{- end }}
 {{- if .Values.networkPolicy.enabled }}
 ---

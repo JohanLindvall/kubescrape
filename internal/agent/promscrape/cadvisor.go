@@ -61,8 +61,9 @@ type chunker interface {
 }
 
 // parseAndExport streams one scrape body through the series filter and the
-// converter into cb, exporting a chunk whenever BatchPoints accumulate.
-func (s *Scraper) parseAndExport(ctx context.Context, body io.Reader, openMetrics, withExemplars bool, cb chunker, pipeline, what string) error {
+// converter into cb, exporting a chunk whenever BatchPoints accumulate. It
+// returns the number of samples parsed.
+func (s *Scraper) parseAndExport(ctx context.Context, body io.Reader, openMetrics, withExemplars bool, cb chunker, pipeline, what string) (int, error) {
 	filter := s.cfg.Filters.filterFor(pipeline)
 	conv := newConverter(cb)
 	parser := NewParser(s.cfg.MaxLineBytes, openMetrics, withExemplars)
@@ -82,18 +83,18 @@ func (s *Scraper) parseAndExport(ctx context.Context, body io.Reader, openMetric
 		return nil
 	})
 	if err != nil {
-		return err
+		return samples, err
 	}
 	conv.finish()
 	if cb.count() > 0 {
 		if err := s.cfg.Exporter.ExportMetrics(ctx, cb.take()); err != nil {
-			return err
+			return samples, err
 		}
 	}
 	if malformed > 0 {
 		s.log.Warn("scrape had malformed lines", "target", what, "malformed", malformed, "samples", samples)
 	}
-	return nil
+	return samples, nil
 }
 
 // kubeletGet fetches a kubelet URL with bearer-token authentication. The
@@ -127,14 +128,14 @@ func (s *Scraper) kubeletGet(ctx context.Context, url string) (*http.Response, e
 // the pod identity as labels (namespace/pod/container); they are routed into
 // one OTLP resource per pod and container, with full metadata resolved
 // through the metadata service.
-func (s *Scraper) scrapeCadvisor(ctx context.Context) error {
+func (s *Scraper) scrapeCadvisor(ctx context.Context) (int, error) {
 	ctx, cancel := context.WithTimeout(ctx, s.cfg.Timeout)
 	defer cancel()
 
 	url := strings.TrimRight(s.cfg.Kubelet.Endpoint, "/") + "/metrics/cadvisor"
 	resp, err := s.kubeletGet(ctx, url)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	defer func() {
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
@@ -146,14 +147,14 @@ func (s *Scraper) scrapeCadvisor(ctx context.Context) error {
 }
 
 // scrapeNodeMetrics scrapes <kubelet>/metrics under a node-level resource.
-func (s *Scraper) scrapeNodeMetrics(ctx context.Context) error {
+func (s *Scraper) scrapeNodeMetrics(ctx context.Context) (int, error) {
 	ctx, cancel := context.WithTimeout(ctx, s.cfg.Timeout)
 	defer cancel()
 
 	url := strings.TrimRight(s.cfg.Kubelet.Endpoint, "/") + "/metrics"
 	resp, err := s.kubeletGet(ctx, url)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	defer func() {
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))

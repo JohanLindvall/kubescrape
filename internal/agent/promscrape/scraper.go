@@ -15,6 +15,7 @@ import (
 
 	"github.com/JohanLindvall/kubescrape/internal/agent/attrs"
 	"github.com/JohanLindvall/kubescrape/internal/kubemeta"
+	"github.com/JohanLindvall/kubescrape/internal/obs"
 )
 
 // MetricExporter sends one OTLP metrics payload.
@@ -58,10 +59,13 @@ type Config struct {
 	// style) into per-object resources; they resolve metadata through
 	// Kubelet.Meta.
 	Splitters []*Splitter
-	Logger    *slog.Logger
-	Targets   TargetSource
-	Exporter  MetricExporter
-	StartTime time.Time // cumulative-sum start timestamp (agent start)
+	// HealthMetrics exports synthetic up / scrape_duration_seconds /
+	// scrape_samples_scraped gauges per target after every cycle.
+	HealthMetrics bool
+	Logger        *slog.Logger
+	Targets       TargetSource
+	Exporter      MetricExporter
+	StartTime     time.Time // cumulative-sum start timestamp (agent start)
 }
 
 // Scraper periodically scrapes all targets of one node and exports the
@@ -140,52 +144,127 @@ func (s *Scraper) cycle(ctx context.Context) {
 	}
 
 	sem := make(chan struct{}, s.cfg.Concurrency)
-	var wg sync.WaitGroup
-	spawn := func(what string, scrape func(context.Context) error) {
-		sem <- struct{}{}
+	var (
+		wg       sync.WaitGroup
+		healthMu sync.Mutex
+		outcomes []scrapeOutcome
+	)
+	record := func(o scrapeOutcome) {
+		result := "ok"
+		if !o.ok {
+			result = "error"
+		}
+		obs.Scrapes.WithLabelValues(o.pipeline, result).Inc()
+		obs.ScrapeDuration.WithLabelValues(o.pipeline).Observe(o.duration.Seconds())
+		obs.ScrapeSamples.WithLabelValues(o.pipeline).Add(float64(o.samples))
+		if s.cfg.HealthMetrics {
+			healthMu.Lock()
+			outcomes = append(outcomes, o)
+			healthMu.Unlock()
+		}
+	}
+	spawn := func(pipeline, url string, target *kubemeta.ScrapeTarget, scrape func(context.Context) (int, error)) bool {
+		select {
+		case <-ctx.Done():
+			return false
+		case sem <- struct{}{}:
+		}
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			defer func() { <-sem }()
-			if err := scrape(ctx); err != nil && ctx.Err() == nil {
-				s.log.Warn(what+" scrape failed", "error", err)
+			start := time.Now()
+			samples, err := scrape(ctx)
+			record(scrapeOutcome{
+				pipeline: pipeline, url: url, target: target,
+				ok: err == nil, duration: time.Since(start), samples: samples,
+			})
+			if err != nil && ctx.Err() == nil {
+				s.log.Warn("scrape failed", "pipeline", pipeline, "url", url, "error", err)
 			}
 		}()
+		return true
 	}
 	if s.cfg.Kubelet.Endpoint != "" {
+		base := strings.TrimRight(s.cfg.Kubelet.Endpoint, "/")
 		if s.cfg.Kubelet.Cadvisor {
-			spawn("cadvisor", s.scrapeCadvisor)
+			spawn(pipelineCadvisor, base+"/metrics/cadvisor", nil, s.scrapeCadvisor)
 		}
 		if s.cfg.Kubelet.NodeMetrics {
-			spawn("node metrics", s.scrapeNodeMetrics)
+			spawn(pipelineNode, base+"/metrics", nil, s.scrapeNodeMetrics)
 		}
 	}
 
-	for _, t := range targets {
-		select {
-		case <-ctx.Done():
-			return
-		case sem <- struct{}{}:
+	for i := range targets {
+		t := targets[i]
+		if !spawn(pipelineTargets, t.URL, &t, func(ctx context.Context) (int, error) {
+			return s.scrapeTarget(ctx, t)
+		}) {
+			break // ctx done; join what already started
 		}
-		wg.Add(1)
-		go func(t kubemeta.ScrapeTarget) {
-			defer wg.Done()
-			defer func() { <-sem }()
-			if err := s.scrapeTarget(ctx, t); err != nil && ctx.Err() == nil {
-				s.log.Warn("scrape failed", "url", t.URL, "pod", t.Pod.Namespace+"/"+t.Pod.Name, "error", err)
-			}
-		}(t)
 	}
 	wg.Wait()
+
+	if s.cfg.HealthMetrics && len(outcomes) > 0 && ctx.Err() == nil {
+		s.exportHealth(ctx, outcomes)
+	}
 }
 
-func (s *Scraper) scrapeTarget(ctx context.Context, t kubemeta.ScrapeTarget) error {
+// scrapeOutcome is the health record of one scrape.
+type scrapeOutcome struct {
+	pipeline string
+	url      string
+	target   *kubemeta.ScrapeTarget // nil for the kubelet scrapes
+	ok       bool
+	duration time.Duration
+	samples  int
+}
+
+// exportHealth emits the Prometheus-style synthetic series (up,
+// scrape_duration_seconds, scrape_samples_scraped) for every scrape of the
+// cycle, on the target's resource.
+func (s *Scraper) exportHealth(ctx context.Context, outcomes []scrapeOutcome) {
+	md := pmetric.NewMetrics()
+	ts := pcommon.NewTimestampFromTime(time.Now())
+	for _, o := range outcomes {
+		rm := md.ResourceMetrics().AppendEmpty()
+		res := rm.Resource()
+		res.Attributes().PutStr("url.full", o.url)
+		if o.target != nil {
+			s.attrsFor(pipelineTargets).Build(res, attrs.Context{Pod: &o.target.Pod, Service: o.target.Service, Node: s.nodeInfo()})
+		} else {
+			res.Attributes().PutStr("service.name", "kubelet")
+			s.attrsFor(o.pipeline).Build(res, attrs.Context{Node: s.nodeInfo()})
+		}
+		sm := rm.ScopeMetrics().AppendEmpty()
+		sm.Scope().SetName("github.com/JohanLindvall/kubescrape/agent/promscrape")
+		gauge := func(name string, v float64) {
+			m := sm.Metrics().AppendEmpty()
+			m.SetName(name)
+			dp := m.SetEmptyGauge().DataPoints().AppendEmpty()
+			dp.SetDoubleValue(v)
+			dp.SetTimestamp(ts)
+		}
+		up := 0.0
+		if o.ok {
+			up = 1
+		}
+		gauge("up", up)
+		gauge("scrape_duration_seconds", o.duration.Seconds())
+		gauge("scrape_samples_scraped", float64(o.samples))
+	}
+	if err := s.cfg.Exporter.ExportMetrics(ctx, md); err != nil && ctx.Err() == nil {
+		s.log.Warn("exporting scrape health metrics", "error", err)
+	}
+}
+
+func (s *Scraper) scrapeTarget(ctx context.Context, t kubemeta.ScrapeTarget) (int, error) {
 	ctx, cancel := context.WithTimeout(ctx, s.cfg.Timeout)
 	defer cancel()
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, t.URL, nil)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	if s.cfg.Exemplars {
 		req.Header.Set("Accept", "application/openmetrics-text;version=1.0.0;q=1,text/plain;version=0.0.4;q=0.5")
@@ -194,14 +273,14 @@ func (s *Scraper) scrapeTarget(ctx context.Context, t kubemeta.ScrapeTarget) err
 	}
 	resp, err := s.http.Do(req)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	defer func() {
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
 		_ = resp.Body.Close()
 	}()
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("status %d", resp.StatusCode)
+		return 0, fmt.Errorf("status %d", resp.StatusCode)
 	}
 
 	// The target decides the format; some exporters serve OpenMetrics

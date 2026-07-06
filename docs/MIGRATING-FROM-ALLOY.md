@@ -171,14 +171,35 @@ with an `otelcol.processor.filter`/debug exporter pair (or a routing
 connector) on the receiving collector, exactly as Alloy's
 `output_debug_otlp` does.
 
+### `discover_servicemonitors` / `prometheus.operator.servicemonitors`
+
+`service.serviceMonitors: true` in the chart (flag `-servicemonitors` on the
+metadata service). Monitors select Services by label within their
+`namespaceSelector`; endpoint `port`/`targetPort`/`path`/`scheme` are
+honored. Per-endpoint authentication, relabelings and interval overrides are
+**not** interpreted — convert those monitors to annotated Services or
+metrics-config rules.
+
+### `loki.source.kubernetes_events`
+
+`service.events.enabled: true` in the chart (flag `-events` on the metadata
+service): Kubernetes events are exported as OTLP log records with
+`k8s.event.*` attributes, and events about pods carry the full pod resource
+attributes.
+
+### `loki.source.journal`
+
+`agent.journald.enabled: true` (flag `-journald`): the agent tails the
+systemd journal via a journalctl subprocess with an at-least-once cursor
+checkpoint — but the default distroless image contains no journalctl, so
+supply an image that does.
+
 ## Not covered — keep a collector for these
 
 * **`input_otlp`** (apps pushing OTLP for enrichment/forwarding): kubescrape
   is pull/tail only. Keep an OpenTelemetry collector (with the
   k8sattributes processor) as the OTLP endpoint, or point apps directly at
   the backend.
-* **`discover_servicemonitors`**: ServiceMonitor CRDs are not read. Convert
-  ServiceMonitors to annotated Services where possible.
 * **`input_pyroscope` / `output_pyroscope`**: profiles are out of scope;
   push them directly to the backend.
 

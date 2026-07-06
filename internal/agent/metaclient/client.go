@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/JohanLindvall/kubescrape/internal/kubemeta"
+	"github.com/JohanLindvall/kubescrape/internal/obs"
 )
 
 // Client talks to a kubescrape metadata service.
@@ -81,6 +82,7 @@ func (c *Client) getJSON(ctx context.Context, u string, v any) error {
 	}
 	resp, err := c.http.Do(req)
 	if err != nil {
+		obs.MetadataRequests.WithLabelValues("error").Inc()
 		return err
 	}
 	defer func() {
@@ -89,8 +91,14 @@ func (c *Client) getJSON(ctx context.Context, u string, v any) error {
 	}()
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		if resp.StatusCode == http.StatusNotFound {
+			obs.MetadataRequests.WithLabelValues("not_found").Inc()
+		} else {
+			obs.MetadataRequests.WithLabelValues("error").Inc()
+		}
 		return &StatusError{Code: resp.StatusCode, Body: strings.TrimSpace(string(body))}
 	}
+	obs.MetadataRequests.WithLabelValues("ok").Inc()
 	return json.NewDecoder(resp.Body).Decode(v)
 }
 

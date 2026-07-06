@@ -48,6 +48,7 @@ import (
 	"github.com/JohanLindvall/kubescrape/internal/agent/attrs"
 	"github.com/JohanLindvall/kubescrape/internal/agent/metaclient"
 	"github.com/JohanLindvall/kubescrape/internal/kubemeta"
+	"github.com/JohanLindvall/kubescrape/internal/obs"
 )
 
 // LogExporter sends one OTLP logs payload.
@@ -467,6 +468,7 @@ func (t *Tailer) scanDir(checkpoints map[string]checkpoint, initial bool) {
 			f.gone = true
 		}
 	}
+	obs.LogFiles.Set(float64(len(t.files)))
 }
 
 // newPipeline (re)creates the file's aggregation stages with empty state.
@@ -623,6 +625,7 @@ func (t *Tailer) readFile(ctx context.Context, f *file) error {
 		if n > 0 {
 			budget -= n
 			read += n
+			obs.LogBytes.Add(float64(n))
 			f.pending = append(f.pending, buf[:n]...)
 			f.readPos += int64(n)
 			t.consume(ctx, f)
@@ -758,6 +761,7 @@ func (t *Tailer) ensureOpen(f *file) error {
 // file) and resets state; the next sweep reopens from offset 0. The file is
 // marked dirty so an event-driven loop picks the new file up immediately.
 func (t *Tailer) reopen(ctx context.Context, f *file) {
+	obs.LogRotations.Inc()
 	if f.f != nil {
 		_ = f.f.Close()
 		f.f = nil
@@ -829,10 +833,12 @@ func (t *Tailer) flush(ctx context.Context) {
 
 	if err := t.exportWithRetry(ctx, ld); err != nil {
 		t.log.Error("exporting logs failed, rewinding", "records", len(t.batch), "error", err)
+		obs.LogExportFailures.Inc()
 		for f := range maxOffsets {
 			t.rewind(f)
 		}
 	} else {
+		obs.LogEntries.Add(float64(len(t.batch)))
 		for f, off := range maxOffsets {
 			// Never commit past lines still buffered in the pipeline; they
 			// have not been exported yet.

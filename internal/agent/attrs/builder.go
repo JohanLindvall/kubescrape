@@ -33,7 +33,7 @@ type Context struct {
 }
 
 // Pipeline names accepted under Config.Pipelines.
-var pipelineNames = []string{"logs", "targets", "cadvisor", "node"}
+var pipelineNames = []string{"logs", "targets", "cadvisor", "node", "journal"}
 
 // Config declares how resource attributes are built. It is loaded from YAML
 // (-resource-attrs-config):
@@ -45,7 +45,7 @@ var pipelineNames = []string{"logs", "targets", "cadvisor", "node"}
 //	  team: '{{ index .Pod.Labels "team" }}'
 //	  service.name: '{{ coalesce (index .Pod.Labels "gp/service-name") (index .Pod.Labels "app.kubernetes.io/name") .Pod.Name }}'
 //	  k8s.node.zone: '{{ with .Node }}{{ index .Labels "topology.kubernetes.io/zone" }}{{ end }}'
-//	pipelines:                # per-pipeline overrides (logs|targets|cadvisor|node)
+//	pipelines:                # per-pipeline overrides (logs|targets|cadvisor|node|journal)
 //	  node:
 //	    attributes:
 //	      service.name: aks-node
@@ -103,6 +103,7 @@ type Builders struct {
 	Targets  *Builder
 	Cadvisor *Builder
 	Node     *Builder
+	Journal  *Builder
 }
 
 // NewBuilders compiles the per-pipeline builders from cfg (nil = defaults
@@ -112,7 +113,7 @@ func NewBuilders(cfg *Config, filter *Filter) (*Builders, error) {
 	if err != nil {
 		return nil, err
 	}
-	b := &Builders{Logs: base, Targets: base, Cadvisor: base, Node: base}
+	b := &Builders{Logs: base, Targets: base, Cadvisor: base, Node: base, Journal: base}
 	if cfg == nil {
 		return b, nil
 	}
@@ -131,6 +132,8 @@ func NewBuilders(cfg *Config, filter *Filter) (*Builders, error) {
 			b.Cadvisor = pb
 		case "node":
 			b.Node = pb
+		case "journal":
+			b.Journal = pb
 		}
 	}
 	return b, nil

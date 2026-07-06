@@ -83,13 +83,21 @@ Pods served from the tombstone cache additionally carry `pod.deletedAt`.
 ### `GET /v1/nodes/{node}/targets`
 
 Prometheus scrape targets for all live pods scheduled on `node`. Targets come
-from two sources:
+from three sources:
 
-* **pod annotations** — the conventional annotations on the pod itself, and
+* **pod annotations** — the conventional annotations on the pod itself,
 * **service annotations** — the same annotations on any Service whose
   selector matches the pod; service ports are translated to pod ports via
   their `targetPort` (named container port, explicit number, or the service
-  port itself).
+  port itself), and
+* **ServiceMonitors** (opt-in, `-servicemonitors`) — Prometheus-Operator
+  `monitoring.coreos.com/v1` ServiceMonitor resources whose selector matches
+  a Service backing the pod. Endpoint `port` (service port name),
+  `targetPort` (pod port number or container-port name), `path` and `scheme`
+  are honored; per-endpoint authentication, relabelings and intervals are
+  not. These targets carry `source: "servicemonitor"` and a
+  `monitor: "<namespace>/<name>"` field. If the CRD is absent at startup the
+  feature disables itself with a warning.
 
 | Annotation             | Meaning                                                        |
 |------------------------|----------------------------------------------------------------|
@@ -131,10 +139,13 @@ Full metadata for one pod looked up by name (the agent uses this to
 attribute cadvisor series). Deleted pods stay resolvable until their
 tombstone expires or a new pod with the same name replaces them.
 
-### `GET /healthz`, `GET /readyz`
+### `GET /healthz`, `GET /readyz`, `GET /metrics`
 
 Liveness is always `200`; readiness turns `200` once the initial informer
-cache sync has completed.
+cache sync has completed. `/metrics` exposes the service's internal metrics
+in Prometheus format (`kubescrape_store_pods`, `kubescrape_store_containers`,
+`kubescrape_http_requests_total{pattern,code}`,
+`kubescrape_events_exported_total`, plus Go runtime metrics).
 
 ## Running
 
@@ -150,9 +161,23 @@ make build           # or: go build ./cmd/kubescrape
 | `-wait-timeout` | `5s`    | default and maximum time a container lookup blocks waiting for metadata  |
 | `-cache-ttl`    | `5m`    | retention of metadata for deleted pods and replaced container IDs        |
 | `-resync`       | `0`     | informer resync period (0 = watch stream only)                            |
+| `-servicemonitors` | `false` | serve targets for ServiceMonitor CRDs (see above)                      |
+| `-events`       | `false` | export Kubernetes events as OTLP log records                             |
+
+With `-events` the service watches `corev1.Events` and exports them as OTLP
+log records (batched, at-most-once): the event message becomes the body,
+`reason`/`count`/`reportingComponent` become attributes, `type: Warning` maps
+to severity Warn, and events about pods get the full pod resource attributes
+(owners, labels) from the store — other objects get `k8s.object.*` plus the
+well-known workload attribute for their kind. Events already in the informer's
+initial list (history) are skipped. The OTLP connection shares the agent's
+exporter flags: `-otlp-endpoint`, `-otlp-protocol`, `-otlp-insecure`,
+`-otlp-tls-ca-file`, `-otlp-tls-insecure-skip-verify`,
+`-otlp-bearer-token-file`, `-otlp-timeout`.
 
 In-cluster it needs `get`/`list`/`watch` on `pods`, `services`, `namespaces`,
-`replicasets.apps`, `deployments.apps`, `jobs.batch` and `cronjobs.batch`
+`events`, `replicasets.apps`, `deployments.apps`, `jobs.batch`,
+`cronjobs.batch` and (optionally) `servicemonitors.monitoring.coreos.com`
 cluster-wide — see [deploy/kubernetes.yaml](deploy/kubernetes.yaml).
 
 `make image` builds a container image from the [Dockerfile](Dockerfile);
@@ -203,7 +228,11 @@ property — state is bounded by the largest single family, not the scrape.
 With `-scrape-exemplars` the agent negotiates the OpenMetrics format and
 attaches **exemplars** to counter and histogram points (`trace_id`/`span_id`
 map to the OTLP trace/span fields, other exemplar labels become filtered
-attributes). `-scrape-max-samples` can cap pathological targets.
+attributes). `-scrape-max-samples` can cap pathological targets. After each
+scrape cycle the agent exports synthetic **health gauges** per target —
+`up` (1/0), `scrape_duration_seconds` and `scrape_samples_scraped` — under
+the target's own resource attributes (`-scrape-health-metrics`, default
+true), so dead endpoints are visible exactly like with Prometheus.
 
 **Kubelet metrics.** With `-kubelet-endpoint` (e.g.
 `https://$(NODE_IP):10250`) the agent also scrapes, authenticated with its
@@ -228,10 +257,28 @@ ServiceAccount token (`nodes/metrics` RBAC, see
 * **node metrics** (`/metrics`): the kubelet's own metrics under a node-level
   resource (`k8s.node.name`, `service.name: kubelet`).
 
+**journald** (opt-in, `-journald`). The agent tails the systemd journal by
+running `journalctl -f -o json` as a subprocess and exporting the entries as
+OTLP log records, one resource per unit (`service.name` = unit without
+`.service`, `systemd.unit`, plus the configured node attributes; syslog
+priorities map to OTLP severities). Delivery is at-least-once: the cursor of
+the newest exported entry is persisted (`-journald-cursor-file`) only after a
+successful export, and on export failure or subprocess death journalctl is
+restarted from the committed cursor with backoff. `-journald-units` restricts
+to specific units, `-journald-dir` reads a non-default journal directory,
+`-journald-path` names the binary — which the default distroless image does
+**not** contain; bring an image that provides it.
+
 **Pipeline toggles.** Each pipeline is individually switchable: `-logs`,
 `-metrics` (annotation-discovered targets), `-cadvisor` and `-node-metrics`
 (all default true; the kubelet scrapes additionally require
-`-kubelet-endpoint`).
+`-kubelet-endpoint`), plus the opt-in `-journald`.
+
+**Self-observability.** `-listen` (default `:8081`) serves `GET /healthz`,
+`GET /readyz` and `GET /metrics` with the agent's internal metrics: log
+entries/bytes/rotations and export failures, scrapes and scrape duration/
+samples per pipeline, exports per signal and outcome, metadata lookups,
+journal entries and subprocess restarts.
 
 **Metric filtering and splitting.** `-metrics-config` points at a YAML file
 with two sections. `pipelines` holds ordered keep/drop rules per pipeline
@@ -269,7 +316,7 @@ and applies uniformly to log and metric resources:
     container.image: '{{ with .Container }}{{ .Image }}{{ end }}'
     k8s.node.zone: '{{ with .Node }}{{ index .Labels "topology.kubernetes.io/zone" }}{{ end }}'
     service.name: '{{ with .Pod }}{{ coalesce (index .Labels "gp/service-name") (index .Labels "app.kubernetes.io/name") .Name }}{{ end }}'
-  pipelines:                # overrides for logs|targets|cadvisor|node
+  pipelines:                # overrides for logs|targets|cadvisor|node|journal
     node:
       attributes:
         service.name: kubelet

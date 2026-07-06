@@ -90,6 +90,29 @@ func (ix *Index) Delete(namespace string, uid types.UID) {
 	}
 }
 
+// All returns the services in the given namespaces (nil = every namespace).
+func (ix *Index) All(namespaces []string) []*Service {
+	ix.mu.RLock()
+	defer ix.mu.RUnlock()
+
+	var out []*Service
+	appendNS := func(ns string) {
+		for _, svc := range ix.byNamespace[ns] {
+			out = append(out, svc)
+		}
+	}
+	if namespaces == nil {
+		for ns := range ix.byNamespace {
+			appendNS(ns)
+		}
+		return out
+	}
+	for _, ns := range namespaces {
+		appendNS(ns)
+	}
+	return out
+}
+
 // Matching returns the services in namespace whose selector matches the
 // given pod labels. Services without a selector never match.
 func (ix *Index) Matching(namespace string, podLabels map[string]string) []*Service {

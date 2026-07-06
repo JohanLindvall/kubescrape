@@ -66,7 +66,7 @@ func TestSplitterScrape(t *testing.T) {
 		Splitters: ksmSplitters(t),
 		Kubelet:   KubeletConfig{Meta: meta},
 	})
-	if err := s.scrapeTarget(context.Background(), target); err != nil {
+	if _, err := s.scrapeTarget(context.Background(), target); err != nil {
 		t.Fatal(err)
 	}
 

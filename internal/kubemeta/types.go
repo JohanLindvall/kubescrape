@@ -108,7 +108,9 @@ type ScrapeTarget struct {
 	Port    int32  `json:"port"`
 	Path    string `json:"path"`
 	Source  string `json:"source"`
-	// Service is set when Source is "service".
+	// Service is set when Source is "service" or "servicemonitor".
 	Service *Service `json:"service,omitempty"`
-	Pod     Pod      `json:"pod"`
+	// Monitor names the ServiceMonitor that produced the target.
+	Monitor string `json:"monitor,omitempty"`
+	Pod     Pod    `json:"pod"`
 }

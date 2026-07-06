@@ -15,13 +15,17 @@ metadata:
   name: kubescrape
 rules:
   - apiGroups: [""]
-    resources: ["pods", "namespaces", "services", "nodes"]
+    resources: ["pods", "namespaces", "services", "nodes", "events"]
     verbs: ["get", "list", "watch"]
   - apiGroups: ["apps"]
     resources: ["replicasets", "deployments"]
     verbs: ["get", "list", "watch"]
   - apiGroups: ["batch"]
     resources: ["jobs", "cronjobs"]
+    verbs: ["get", "list", "watch"]
+  # Optional: ServiceMonitor discovery (-servicemonitors).
+  - apiGroups: ["monitoring.coreos.com"]
+    resources: ["servicemonitors"]
     verbs: ["get", "list", "watch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1

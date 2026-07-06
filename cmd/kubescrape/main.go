@@ -20,7 +20,10 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/client-go/dynamic"
+	"k8s.io/client-go/dynamic/dynamicinformer"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/metadata"
@@ -30,8 +33,12 @@ import (
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/klog/v2"
 
+	"github.com/JohanLindvall/kubescrape/internal/agent/otlpexport"
+	"github.com/JohanLindvall/kubescrape/internal/events"
+	"github.com/JohanLindvall/kubescrape/internal/obs"
 	"github.com/JohanLindvall/kubescrape/internal/owners"
 	"github.com/JohanLindvall/kubescrape/internal/server"
+	"github.com/JohanLindvall/kubescrape/internal/servicemonitors"
 	"github.com/JohanLindvall/kubescrape/internal/services"
 	"github.com/JohanLindvall/kubescrape/internal/store"
 )
@@ -52,6 +59,19 @@ func run() error {
 		resync     = flag.Duration("resync", 0, "informer resync period (0 disables periodic resync; the watch stream keeps the cache current)")
 		logLevel   = flag.String("log-level", "info", "log level: debug, info, warn, error")
 		logFormat  = flag.String("log-format", "text", "log format: text or json")
+
+		// ServiceMonitor CRDs (opt-in).
+		monitorsOn = flag.Bool("servicemonitors", false, "serve targets for monitoring.coreos.com ServiceMonitors selecting pod-backed Services (no per-endpoint auth or relabelings)")
+
+		// Kubernetes events -> OTLP logs (opt-in).
+		eventsOn     = flag.Bool("events", false, "export Kubernetes events as OTLP log records")
+		otlpEndpoint = flag.String("otlp-endpoint", "otel-collector.monitoring:4317", "OTLP endpoint for the events exporter: host:port for grpc, base URL for http")
+		otlpProtocol = flag.String("otlp-protocol", "grpc", "OTLP transport: grpc or http")
+		otlpInsecure = flag.Bool("otlp-insecure", true, "use a plaintext gRPC connection")
+		otlpSkipTLS  = flag.Bool("otlp-tls-insecure-skip-verify", false, "skip TLS certificate verification towards the collector")
+		otlpCAFile   = flag.String("otlp-tls-ca-file", "", "PEM CA bundle for verifying the collector")
+		otlpBearer   = flag.String("otlp-bearer-token-file", "", "file with a bearer token sent on every export (re-read periodically)")
+		otlpTimeout  = flag.Duration("otlp-timeout", 15*time.Second, "per-export timeout")
 	)
 	flag.Parse()
 
@@ -97,6 +117,7 @@ func run() error {
 	}
 
 	st := store.New(*cacheTTL)
+	obs.RegisterStoreStats(st.Stats)
 
 	// Full pods (spec+status are needed); managedFields are dropped before
 	// the objects enter the informer cache.
@@ -169,6 +190,73 @@ func run() error {
 	}
 	resolver := owners.NewFromListers(listers)
 
+	var monitors *servicemonitors.Index
+	if *monitorsOn {
+		if _, err := client.Discovery().ServerResourcesForGroupVersion(servicemonitors.GVR.GroupVersion().String()); err != nil {
+			log.Warn("servicemonitors requested but the CRD group is unavailable; disabling", "error", err)
+		} else {
+			dynClient, err := dynamic.NewForConfig(cfg)
+			if err != nil {
+				return fmt.Errorf("creating dynamic client: %w", err)
+			}
+			dynFactory := dynamicinformer.NewDynamicSharedInformerFactory(dynClient, *resync)
+			smInformer := dynFactory.ForResource(servicemonitors.GVR).Informer()
+			monitors = servicemonitors.NewIndex()
+			upsert := func(obj any) {
+				if u, ok := obj.(*unstructured.Unstructured); ok {
+					if err := monitors.Upsert(u); err != nil {
+						log.Warn("parsing servicemonitor", "error", err)
+					}
+				}
+			}
+			if _, err := smInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+				AddFunc:    upsert,
+				UpdateFunc: func(_, obj any) { upsert(obj) },
+				DeleteFunc: func(obj any) {
+					if tombstone, ok := obj.(cache.DeletedFinalStateUnknown); ok {
+						obj = tombstone.Obj
+					}
+					if u, ok := obj.(*unstructured.Unstructured); ok {
+						monitors.Delete(u.GetNamespace(), u.GetName())
+					}
+				},
+			}); err != nil {
+				return fmt.Errorf("registering servicemonitor handler: %w", err)
+			}
+			dynFactory.Start(ctx.Done())
+			synced = append(synced, smInformer.HasSynced)
+			log.Info("servicemonitor discovery enabled")
+		}
+	}
+
+	if *eventsOn {
+		exporter, err := otlpexport.New(otlpexport.Config{
+			Endpoint:           *otlpEndpoint,
+			Protocol:           *otlpProtocol,
+			Insecure:           *otlpInsecure,
+			InsecureSkipVerify: *otlpSkipTLS,
+			CAFile:             *otlpCAFile,
+			BearerTokenFile:    *otlpBearer,
+			Timeout:            *otlpTimeout,
+		})
+		if err != nil {
+			return fmt.Errorf("creating events OTLP exporter: %w", err)
+		}
+		defer func() { _ = exporter.Close() }()
+
+		ev := events.New(events.Config{Store: st, Exporter: exporter, Logger: log})
+		evInformer := factory.Core().V1().Events().Informer()
+		if _, err := evInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+			AddFunc:    ev.OnAdd,
+			UpdateFunc: ev.OnUpdate,
+		}); err != nil {
+			return fmt.Errorf("registering event handler: %w", err)
+		}
+		synced = append(synced, evInformer.HasSynced)
+		go ev.Run(ctx)
+		log.Info("kubernetes events exporter started", "endpoint", *otlpEndpoint)
+	}
+
 	factory.Start(ctx.Done())
 	metaFactory.Start(ctx.Done())
 	go st.Run(ctx)
@@ -188,6 +276,7 @@ func run() error {
 		Handler: server.New(server.Config{
 			Store:    st,
 			Services: svcIndex,
+			Monitors: monitors,
 			Resolver: resolver,
 			MaxWait:  *maxWait,
 			Ready:    ready,

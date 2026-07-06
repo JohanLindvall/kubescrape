@@ -22,6 +22,8 @@ import (
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/metadata"
+
+	"github.com/JohanLindvall/kubescrape/internal/obs"
 )
 
 // Config configures the exporter.
@@ -169,6 +171,12 @@ func (c *Client) bearer() (string, error) {
 // ExportLogs sends one logs payload (single attempt; the tailer retries and
 // rewinds).
 func (c *Client) ExportLogs(ctx context.Context, ld plog.Logs) error {
+	err := c.exportLogsOnce(ctx, ld)
+	obs.Exports.WithLabelValues("logs", outcome(err)).Inc()
+	return err
+}
+
+func (c *Client) exportLogsOnce(ctx context.Context, ld plog.Logs) error {
 	ctx, cancel := context.WithTimeout(ctx, c.cfg.Timeout)
 	defer cancel()
 	if c.conn != nil {
@@ -186,6 +194,13 @@ func (c *Client) ExportLogs(ctx context.Context, ld plog.Logs) error {
 	return c.httpPost(ctx, c.logsURL, body)
 }
 
+func outcome(err error) string {
+	if err != nil {
+		return "error"
+	}
+	return "ok"
+}
+
 // ExportMetrics sends one metrics payload with bounded retries.
 func (c *Client) ExportMetrics(ctx context.Context, md pmetric.Metrics) error {
 	var err error
@@ -199,7 +214,9 @@ func (c *Client) ExportMetrics(ctx context.Context, md pmetric.Metrics) error {
 			}
 			backoff *= 2
 		}
-		if err = c.exportMetricsOnce(ctx, md); err == nil {
+		err = c.exportMetricsOnce(ctx, md)
+		obs.Exports.WithLabelValues("metrics", outcome(err)).Inc()
+		if err == nil {
 			return nil
 		}
 	}

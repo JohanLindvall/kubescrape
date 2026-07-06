@@ -132,7 +132,7 @@ func TestScrapeCadvisor(t *testing.T) {
 	meta := &fakeMetaSource{}
 	exp := &captureExporter{}
 	s := newKubeletScraper(t, srv.URL, meta, exp, false)
-	if err := s.scrapeCadvisor(context.Background()); err != nil {
+	if _, err := s.scrapeCadvisor(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	if gotAuth != "Bearer tok123" || gotPath != "/metrics/cadvisor" {
@@ -197,7 +197,7 @@ func TestScrapeCadvisor(t *testing.T) {
 
 	// Second scrape: metadata comes from the cache.
 	pc, cc := meta.podCalls.Load(), meta.containerCalls.Load()
-	if err := s.scrapeCadvisor(context.Background()); err != nil {
+	if _, err := s.scrapeCadvisor(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	if meta.podCalls.Load() != pc || meta.containerCalls.Load() != cc {
@@ -213,7 +213,7 @@ func TestScrapeCadvisorRollupsDisabled(t *testing.T) {
 
 	exp := &captureExporter{}
 	s := newKubeletScraper(t, srv.URL, &fakeMetaSource{}, exp, true)
-	if err := s.scrapeCadvisor(context.Background()); err != nil {
+	if _, err := s.scrapeCadvisor(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 
@@ -282,7 +282,7 @@ func TestScrapeNodeMetrics(t *testing.T) {
 
 	exp := &captureExporter{}
 	s := newKubeletScraper(t, srv.URL, &fakeMetaSource{}, exp, false)
-	if err := s.scrapeNodeMetrics(context.Background()); err != nil {
+	if _, err := s.scrapeNodeMetrics(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	if gotPath != "/metrics" {
@@ -307,7 +307,7 @@ func TestScrapeCadvisorAuthError(t *testing.T) {
 
 	exp := &captureExporter{}
 	s := newKubeletScraper(t, srv.URL, &fakeMetaSource{}, exp, false)
-	if err := s.scrapeCadvisor(context.Background()); err == nil {
+	if _, err := s.scrapeCadvisor(context.Background()); err == nil {
 		t.Fatal("expected error for 403")
 	}
 	if len(exp.batches) != 0 {

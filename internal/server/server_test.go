@@ -9,10 +9,12 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
 
 	"github.com/JohanLindvall/kubescrape/internal/kubemeta"
+	"github.com/JohanLindvall/kubescrape/internal/servicemonitors"
 	"github.com/JohanLindvall/kubescrape/internal/services"
 	"github.com/JohanLindvall/kubescrape/internal/store"
 )
@@ -276,6 +278,115 @@ func TestNodeTargetsFromService(t *testing.T) {
 	}
 	if tg.Pod.Name != "svc-web-1" || tg.Pod.NamespaceMetadata == nil {
 		t.Errorf("pod metadata = %+v", tg.Pod)
+	}
+}
+
+func TestNodeTargetsFromServiceMonitor(t *testing.T) {
+	st := store.New(time.Minute)
+	// Neither the pod nor the service carries prometheus.io annotations.
+	st.UpsertPod(&corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            "mon-web-1",
+			Namespace:       "default",
+			UID:             types.UID("pod3-uid"),
+			ResourceVersion: "1",
+			Labels:          map[string]string{"app": "mon-web"},
+		},
+		Spec: corev1.PodSpec{
+			NodeName: "node1",
+			Containers: []corev1.Container{{
+				Name:  "app",
+				Image: "img",
+				Ports: []corev1.ContainerPort{{Name: "metrics", ContainerPort: 9090}},
+			}},
+		},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodRunning,
+			PodIP: "10.1.2.5",
+		},
+	})
+	idx := services.NewIndex()
+	idx.Upsert(&corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "mon-web",
+			Namespace: "default",
+			UID:       types.UID("svc3-uid"),
+			Labels:    map[string]string{"team": "obs"},
+		},
+		Spec: corev1.ServiceSpec{
+			Selector: map[string]string{"app": "mon-web"},
+			Ports:    []corev1.ServicePort{{Name: "http-metrics", Port: 80, TargetPort: intstr.FromString("metrics")}},
+		},
+	})
+	monitors := servicemonitors.NewIndex()
+	upsertMonitor := func(name string, spec map[string]any) {
+		t.Helper()
+		if err := monitors.Upsert(&unstructured.Unstructured{Object: map[string]any{
+			"metadata": map[string]any{"namespace": "monitoring", "name": name},
+			"spec":     spec,
+		}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Selects the service across namespaces via its port name.
+	upsertMonitor("web", map[string]any{
+		"selector":          map[string]any{"matchLabels": map[string]any{"team": "obs"}},
+		"namespaceSelector": map[string]any{"any": true},
+		"endpoints":         []any{map[string]any{"port": "http-metrics", "path": "stats"}},
+	})
+	// Same service, targetPort override by container-port name; same URL as a
+	// direct pod target would produce.
+	upsertMonitor("web-direct", map[string]any{
+		"selector":          map[string]any{"matchLabels": map[string]any{"team": "obs"}},
+		"namespaceSelector": map[string]any{"any": true},
+		"endpoints":         []any{map[string]any{"targetPort": "metrics"}},
+	})
+	// Label mismatch: never selected.
+	upsertMonitor("other", map[string]any{
+		"selector":          map[string]any{"matchLabels": map[string]any{"team": "other"}},
+		"namespaceSelector": map[string]any{"any": true},
+		"endpoints":         []any{map[string]any{"port": "http-metrics"}},
+	})
+	// Namespace mismatch: defaults to the monitor's own namespace, which
+	// does not contain the service.
+	upsertMonitor("own-ns-only", map[string]any{
+		"selector":  map[string]any{"matchLabels": map[string]any{"team": "obs"}},
+		"endpoints": []any{map[string]any{"port": "http-metrics", "path": "/never"}},
+	})
+
+	srv := httptest.NewServer(New(Config{
+		Store:    st,
+		Services: idx,
+		Monitors: monitors,
+		Resolver: stubResolver{},
+		MaxWait:  500 * time.Millisecond,
+		Ready:    closedChan(),
+	}).Handler())
+	t.Cleanup(srv.Close)
+
+	var resp struct {
+		Targets []kubemeta.ScrapeTarget `json:"targets"`
+	}
+	getJSON(t, srv.URL+"/v1/nodes/node1/targets", http.StatusOK, &resp)
+	if len(resp.Targets) != 2 {
+		t.Fatalf("targets = %+v", resp.Targets)
+	}
+	byURL := map[string]kubemeta.ScrapeTarget{}
+	for _, tg := range resp.Targets {
+		byURL[tg.URL] = tg
+	}
+	tg, ok := byURL["http://10.1.2.5:9090/stats"]
+	if !ok {
+		t.Fatalf("port-name endpoint target missing; got %+v", resp.Targets)
+	}
+	if tg.Source != "servicemonitor" || tg.Monitor != "monitoring/web" {
+		t.Errorf("target = %+v", tg)
+	}
+	if tg.Service == nil || tg.Service.Name != "mon-web" {
+		t.Errorf("service metadata = %+v", tg.Service)
+	}
+	if tg2, ok := byURL["http://10.1.2.5:9090/metrics"]; !ok || tg2.Monitor != "monitoring/web-direct" {
+		t.Errorf("targetPort-override target = %+v", tg2)
 	}
 }
 

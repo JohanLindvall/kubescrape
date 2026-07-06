@@ -10,10 +10,14 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/JohanLindvall/kubescrape/internal/obs"
+
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 
 	"github.com/JohanLindvall/kubescrape/internal/kubemeta"
 	"github.com/JohanLindvall/kubescrape/internal/scrape"
+	"github.com/JohanLindvall/kubescrape/internal/servicemonitors"
 	"github.com/JohanLindvall/kubescrape/internal/services"
 	"github.com/JohanLindvall/kubescrape/internal/store"
 )
@@ -30,6 +34,8 @@ type MetadataResolver interface {
 type Config struct {
 	Store    *store.Store
 	Services *services.Index
+	// Monitors serves ServiceMonitor-derived targets (nil = disabled).
+	Monitors *servicemonitors.Index
 	Resolver MetadataResolver
 	// MaxWait is the default and maximum time a container lookup may block
 	// waiting for metadata to appear. Requests may shorten it with ?wait=.
@@ -43,6 +49,7 @@ type Config struct {
 type Server struct {
 	store    *store.Store
 	services *services.Index
+	monitors *servicemonitors.Index
 	resolver MetadataResolver
 	maxWait  time.Duration
 	ready    <-chan struct{}
@@ -58,6 +65,7 @@ func New(cfg Config) *Server {
 	return &Server{
 		store:    cfg.Store,
 		services: cfg.Services,
+		monitors: cfg.Monitors,
 		resolver: cfg.Resolver,
 		maxWait:  cfg.MaxWait,
 		ready:    cfg.Ready,
@@ -68,10 +76,11 @@ func New(cfg Config) *Server {
 // Handler returns the HTTP routes.
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /v1/containers/{id...}", s.handleContainer)
-	mux.HandleFunc("GET /v1/pods/{namespace}/{name}", s.handlePod)
-	mux.HandleFunc("GET /v1/nodes/{node}/targets", s.handleNodeTargets)
-	mux.HandleFunc("GET /v1/nodes/{node}/metadata", s.handleNodeMetadata)
+	mux.HandleFunc("GET /v1/containers/{id...}", counted("/v1/containers", s.handleContainer))
+	mux.HandleFunc("GET /v1/pods/{namespace}/{name}", counted("/v1/pods", s.handlePod))
+	mux.HandleFunc("GET /v1/nodes/{node}/targets", counted("/v1/nodes/targets", s.handleNodeTargets))
+	mux.HandleFunc("GET /v1/nodes/{node}/metadata", counted("/v1/nodes/metadata", s.handleNodeMetadata))
+	mux.Handle("GET /metrics", obs.Handler())
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))
@@ -85,6 +94,25 @@ func (s *Server) Handler() http.Handler {
 		_, _ = w.Write([]byte("ok"))
 	})
 	return mux
+}
+
+// counted wraps a handler with the per-pattern request counter.
+func counted(pattern string, h http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		rec := &statusRecorder{ResponseWriter: w, code: http.StatusOK}
+		h(rec, r)
+		obs.HTTPRequests.WithLabelValues(pattern, strconv.Itoa(rec.code)).Inc()
+	}
+}
+
+type statusRecorder struct {
+	http.ResponseWriter
+	code int
+}
+
+func (r *statusRecorder) WriteHeader(code int) {
+	r.code = code
+	r.ResponseWriter.WriteHeader(code)
 }
 
 // handleContainer serves GET /v1/containers/{id}?wait=2s.
@@ -171,6 +199,7 @@ func (s *Server) handleNodeTargets(w http.ResponseWriter, r *http.Request) {
 	node := r.PathValue("node")
 	pods := s.store.PodsOnNode(node)
 	targets := make([]kubemeta.ScrapeTarget, 0)
+	monitored := s.monitoredServices()
 	for _, np := range pods {
 		// Cheap pre-check before the (per-pod) enrichment work: does the pod
 		// or any service selecting it opt into scraping?
@@ -178,7 +207,7 @@ func (s *Server) handleNodeTargets(w http.ResponseWriter, r *http.Request) {
 		podAnnotated := np.Pod.Annotations[scrape.AnnotationScrape] == "true"
 		svcAnnotated := false
 		for _, svc := range matched {
-			if svc.Annotations[scrape.AnnotationScrape] == "true" {
+			if svc.Annotations[scrape.AnnotationScrape] == "true" || len(monitored[svc.UID]) > 0 {
 				svcAnnotated = true
 				break
 			}
@@ -191,6 +220,9 @@ func (s *Server) handleNodeTargets(w http.ResponseWriter, r *http.Request) {
 		podTargets := scrape.PodTargets(np.Pod)
 		for _, svc := range matched {
 			podTargets = append(podTargets, scrape.ServiceTargets(np.Pod, svc)...)
+			for _, sme := range monitored[svc.UID] {
+				podTargets = append(podTargets, scrape.MonitorTargets(np.Pod, svc, sme.monitor, sme.endpoint)...)
+			}
 		}
 		// The same endpoint can be reachable via pod and service
 		// annotations; keep the first occurrence (pod source wins).
@@ -207,6 +239,33 @@ func (s *Server) handleNodeTargets(w http.ResponseWriter, r *http.Request) {
 		"node":    node,
 		"targets": targets,
 	})
+}
+
+// monitorEndpoint pairs a ServiceMonitor endpoint with its monitor name.
+type monitorEndpoint struct {
+	monitor  string
+	endpoint servicemonitors.Endpoint
+}
+
+// monitoredServices maps Service UIDs to the ServiceMonitor endpoints
+// selecting them, resolved once per request.
+func (s *Server) monitoredServices() map[string][]monitorEndpoint {
+	if s.monitors == nil {
+		return nil
+	}
+	out := map[string][]monitorEndpoint{}
+	for _, m := range s.monitors.All() {
+		for _, svc := range s.services.All(m.ServiceNamespaces()) {
+			if !m.Selector.Matches(labels.Set(svc.Labels)) {
+				continue
+			}
+			name := m.Namespace + "/" + m.Name
+			for _, ep := range m.Endpoints {
+				out[svc.UID] = append(out[svc.UID], monitorEndpoint{monitor: name, endpoint: ep})
+			}
+		}
+	}
+	return out
 }
 
 // enrich fills in owner-chain and namespace metadata on a pod.

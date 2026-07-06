@@ -7,9 +7,11 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/signal"
 	"strings"
@@ -19,10 +21,12 @@ import (
 	"time"
 
 	"github.com/JohanLindvall/kubescrape/internal/agent/attrs"
+	"github.com/JohanLindvall/kubescrape/internal/agent/journald"
 	"github.com/JohanLindvall/kubescrape/internal/agent/metaclient"
 	"github.com/JohanLindvall/kubescrape/internal/agent/otlpexport"
 	"github.com/JohanLindvall/kubescrape/internal/agent/promscrape"
 	"github.com/JohanLindvall/kubescrape/internal/agent/tailer"
+	"github.com/JohanLindvall/kubescrape/internal/obs"
 )
 
 func main() {
@@ -35,6 +39,7 @@ func main() {
 func run() error {
 	var (
 		nodeName     = flag.String("node-name", os.Getenv("NODE_NAME"), "name of the node this agent runs on (default $NODE_NAME)")
+		listen       = flag.String("listen", ":8081", "HTTP listen address for /healthz, /readyz and /metrics (empty disables)")
 		metadataURL  = flag.String("metadata-endpoint", "http://kubescrape.monitoring", "base URL of the kubescrape metadata service")
 		metadataWait = flag.Duration("metadata-wait", 5*time.Second, "how long the metadata service may block waiting for a new container")
 		otlpEndpoint = flag.String("otlp-endpoint", "otel-collector.monitoring:4317", "OTLP endpoint: host:port for grpc, base URL for http")
@@ -62,12 +67,21 @@ func run() error {
 		logsPoll        = flag.Duration("logs-poll-interval", 500*time.Millisecond, "fallback sweep interval for the log tailer")
 		logsFingerprint = flag.Int("logs-fingerprint-bytes", 1024, "file-head hash length used with the inode as file identity (negative = inode only)")
 
+		journaldOn     = flag.Bool("journald", false, "tail the systemd journal via journalctl (the binary must exist in the image)")
+		journaldPath   = flag.String("journald-path", "journalctl", "journalctl binary")
+		journaldDir    = flag.String("journald-dir", "", "journal directory (journalctl -D); empty uses the system default")
+		journaldUnits  = flag.String("journald-units", "", "comma-separated systemd units to read (empty reads everything)")
+		journaldCursor = flag.String("journald-cursor-file", "", "file persisting the journal cursor across restarts (empty disables; every start then begins at the tail)")
+		journaldBatch  = flag.Int("journald-batch-size", 1024, "flush journal entries after this many")
+		journaldFlush  = flag.Duration("journald-flush-interval", 2*time.Second, "flush journal entries at least this often")
+
 		scrapeInterval    = flag.Duration("scrape-interval", 30*time.Second, "Prometheus scrape interval")
 		scrapeTimeout     = flag.Duration("scrape-timeout", 15*time.Second, "per-target scrape timeout")
 		scrapeConcurrency = flag.Int("scrape-concurrency", 4, "concurrent target scrapes")
 		metricsBatch      = flag.Int("metrics-batch-size", 10000, "export metrics in chunks of this many data points")
 		maxSamples        = flag.Int("scrape-max-samples", 0, "abort a single scrape beyond this many samples (0 = unlimited)")
 		exemplars         = flag.Bool("scrape-exemplars", false, "negotiate OpenMetrics and attach exemplars to counter and histogram data points")
+		healthMetrics     = flag.Bool("scrape-health-metrics", true, "export synthetic up/scrape_duration_seconds/scrape_samples_scraped gauges per target")
 		metricsConfig     = flag.String("metrics-config", "", "YAML file with per-pipeline keep/drop rules for scraped series and target splitters (empty keeps all)")
 
 		kubeletEndpoint = flag.String("kubelet-endpoint", "", "kubelet base URL, e.g. https://$(NODE_IP):10250 (empty disables the cadvisor and node-metrics scrapes)")
@@ -166,6 +180,28 @@ func run() error {
 		log.Info("log tailer started", "dir", *logDir, "checkpoint", *checkpointFile)
 	}
 
+	if *journaldOn {
+		jr := journald.New(journald.Config{
+			Path:          *journaldPath,
+			Dir:           *journaldDir,
+			Units:         splitList(*journaldUnits),
+			CursorFile:    *journaldCursor,
+			BatchSize:     *journaldBatch,
+			FlushInterval: *journaldFlush,
+			MaxEntryBytes: *maxEntryBytes,
+			Attrs:         attrBuilders.Journal,
+			NodeInfo:      nodeInfo,
+			Exporter:      exporter,
+			Logger:        log,
+		})
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			jr.Run(ctx)
+		}()
+		log.Info("journald reader started", "path", *journaldPath, "units", *journaldUnits, "cursor", *journaldCursor)
+	}
+
 	kubeletScrapes := *kubeletEndpoint != "" && (*cadvisorOn || *nodeOn)
 	if *metricsOn || kubeletScrapes {
 		sc := promscrape.New(promscrape.Config{
@@ -176,6 +212,7 @@ func run() error {
 			BatchPoints:    *metricsBatch,
 			MaxSamples:     *maxSamples,
 			Exemplars:      *exemplars,
+			HealthMetrics:  *healthMetrics,
 			DisableTargets: !*metricsOn,
 			Kubelet: promscrape.KubeletConfig{
 				Endpoint:       *kubeletEndpoint,
@@ -202,6 +239,30 @@ func run() error {
 		}()
 		log.Info("prometheus scraper started", "node", *nodeName, "interval", *scrapeInterval,
 			"targets", *metricsOn, "cadvisor", kubeletScrapes && *cadvisorOn, "nodeMetrics", kubeletScrapes && *nodeOn)
+	}
+
+	if *listen != "" {
+		mux := http.NewServeMux()
+		ok := func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("ok"))
+		}
+		mux.HandleFunc("GET /healthz", ok)
+		mux.HandleFunc("GET /readyz", ok)
+		mux.Handle("GET /metrics", obs.Handler())
+		srv := &http.Server{Addr: *listen, Handler: mux, ReadHeaderTimeout: 10 * time.Second}
+		go func() {
+			if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				log.Error("health/metrics server failed", "error", err)
+			}
+		}()
+		go func() {
+			<-ctx.Done()
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			_ = srv.Shutdown(shutdownCtx)
+		}()
+		log.Info("health/metrics server started", "addr", *listen)
 	}
 
 	<-ctx.Done()

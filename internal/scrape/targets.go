@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/JohanLindvall/kubescrape/internal/kubemeta"
+	"github.com/JohanLindvall/kubescrape/internal/servicemonitors"
 	"github.com/JohanLindvall/kubescrape/internal/services"
 )
 
@@ -80,6 +81,67 @@ func ServiceTargets(pod kubemeta.Pod, svc *services.Service) []kubemeta.ScrapeTa
 		targets = append(targets, t)
 	}
 	return targets
+}
+
+// MonitorTargets returns the scrape targets for a pod derived from one
+// ServiceMonitor endpoint of a Service selecting it. The endpoint's port
+// names a Service port; targetPort (number or container-port name)
+// overrides the pod port directly.
+func MonitorTargets(pod kubemeta.Pod, svc *services.Service, monitor string, ep servicemonitors.Endpoint) []kubemeta.ScrapeTarget {
+	if svc == nil || !scrapeable(pod) {
+		return nil
+	}
+	scheme := ep.Scheme
+	if scheme != "https" {
+		scheme = "http"
+	}
+	path := ep.Path
+	if path == "" {
+		path = "/metrics"
+	}
+	if !strings.HasPrefix(path, "/") {
+		path = "/" + path
+	}
+
+	port, ok := monitorPodPort(pod, svc, ep)
+	if !ok {
+		return nil
+	}
+	info := &kubemeta.Service{
+		Name:        svc.Name,
+		Namespace:   svc.Namespace,
+		UID:         svc.UID,
+		Labels:      svc.Labels,
+		Annotations: svc.Annotations,
+	}
+	t := makeTarget(pod, scheme, path, port)
+	t.Source = "servicemonitor"
+	t.Service = info
+	t.Monitor = monitor
+	return []kubemeta.ScrapeTarget{t}
+}
+
+// monitorPodPort resolves the pod port a ServiceMonitor endpoint targets.
+func monitorPodPort(pod kubemeta.Pod, svc *services.Service, ep servicemonitors.Endpoint) (int32, bool) {
+	if ep.TargetPort != nil {
+		if n := ep.TargetPort.IntValue(); n > 0 {
+			return int32(n), true
+		}
+		for _, c := range pod.Containers {
+			for _, p := range c.Ports {
+				if p.Name == ep.TargetPort.StrVal {
+					return p.Port, true
+				}
+			}
+		}
+		return 0, false
+	}
+	for _, sp := range svc.Ports {
+		if sp.Name == ep.Port {
+			return targetPodPort(pod, sp)
+		}
+	}
+	return 0, false
 }
 
 func scrapeable(pod kubemeta.Pod) bool {

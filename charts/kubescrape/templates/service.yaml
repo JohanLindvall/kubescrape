@@ -12,13 +12,17 @@ metadata:
   labels: {{ include "kubescrape.labels" . | nindent 4 }}
 rules:
   - apiGroups: [""]
-    resources: ["pods", "namespaces", "services", "nodes"]
+    resources: ["pods", "namespaces", "services", "nodes", "events"]
     verbs: ["get", "list", "watch"]
   - apiGroups: ["apps"]
     resources: ["replicasets", "deployments"]
     verbs: ["get", "list", "watch"]
   - apiGroups: ["batch"]
     resources: ["jobs", "cronjobs"]
+    verbs: ["get", "list", "watch"]
+  # Optional: ServiceMonitor discovery (-servicemonitors).
+  - apiGroups: ["monitoring.coreos.com"]
+    resources: ["servicemonitors"]
     verbs: ["get", "list", "watch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
@@ -66,11 +70,32 @@ spec:
             - -listen={{ .Values.service.listen }}
             - -wait-timeout={{ .Values.service.waitTimeout }}
             - -cache-ttl={{ .Values.service.cacheTTL }}
+            - -servicemonitors={{ .Values.service.serviceMonitors }}
+            {{- if .Values.service.events.enabled }}
+            - -events
+            - -otlp-endpoint={{ .Values.service.events.otlp.endpoint }}
+            - -otlp-protocol={{ .Values.service.events.otlp.protocol }}
+            - -otlp-insecure={{ .Values.service.events.otlp.insecure }}
+            - -otlp-tls-insecure-skip-verify={{ .Values.service.events.otlp.tlsInsecureSkipVerify }}
+            {{- with .Values.service.events.otlp.caFile }}
+            - -otlp-tls-ca-file={{ . }}
+            {{- end }}
+            - -otlp-timeout={{ .Values.service.events.otlp.timeout }}
+            {{- if .Values.service.events.otlp.bearerTokenSecret.name }}
+            - -otlp-bearer-token-file=/etc/kubescrape/otlp-token/{{ .Values.service.events.otlp.bearerTokenSecret.key }}
+            {{- end }}
+            {{- end }}
             - -log-level={{ .Values.logLevel }}
             - -log-format={{ .Values.logFormat }}
             {{- range .Values.service.extraArgs }}
             - {{ . }}
             {{- end }}
+          {{- if and .Values.service.events.enabled .Values.service.events.otlp.bearerTokenSecret.name }}
+          volumeMounts:
+            - name: otlp-token
+              mountPath: /etc/kubescrape/otlp-token
+              readOnly: true
+          {{- end }}
           ports:
             - name: http
               containerPort: 8080
@@ -79,6 +104,12 @@ spec:
           livenessProbe:
             httpGet: {path: /healthz, port: http}
           resources: {{ toYaml .Values.service.resources | nindent 12 }}
+      {{- if and .Values.service.events.enabled .Values.service.events.otlp.bearerTokenSecret.name }}
+      volumes:
+        - name: otlp-token
+          secret:
+            secretName: {{ .Values.service.events.otlp.bearerTokenSecret.name }}
+      {{- end }}
 ---
 apiVersion: v1
 kind: Service

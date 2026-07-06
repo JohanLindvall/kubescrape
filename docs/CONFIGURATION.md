@@ -17,6 +17,7 @@ manifests live in [deploy/](../deploy).
 - [Agent: general](#agent-general)
 - [Agent: OTLP export](#agent-otlp-export)
 - [Agent: log collection](#agent-log-collection)
+- [Agent: journald](#agent-journald)
 - [Agent: metrics scraping](#agent-metrics-scraping)
 - [Agent: kubelet scrapes (cadvisor, node)](#agent-kubelet-scrapes)
 - [Resource attributes (`-resource-attrs-config`)](#resource-attributes)
@@ -38,18 +39,26 @@ kubescrape -listen :8080 -wait-timeout 5s -cache-ttl 5m -log-format json
 | `-wait-timeout` | `5s` | default and maximum time a container lookup blocks waiting for metadata (`?wait=` can shorten per request, never lengthen) |
 | `-cache-ttl` | `5m` | how long metadata of deleted pods and replaced container IDs stays resolvable (tombstones) |
 | `-resync` | `0` | informer resync period (0 = watch stream only) |
+| `-servicemonitors` | `false` | serve targets for `monitoring.coreos.com/v1` ServiceMonitors selecting pod-backed Services (endpoint `port`/`targetPort`/`path`/`scheme`; no per-endpoint auth or relabelings). Self-disables with a warning when the CRD is absent |
+| `-events` | `false` | export Kubernetes events as OTLP log records (batched; history from the initial list is skipped; pod events carry full pod resource attributes) |
+| `-otlp-*` | as the agent | with `-events`: `-otlp-endpoint`, `-otlp-protocol`, `-otlp-insecure`, `-otlp-tls-ca-file`, `-otlp-tls-insecure-skip-verify`, `-otlp-bearer-token-file`, `-otlp-timeout` |
 | `-log-level` | `info` | `debug`, `info`, `warn`, `error` |
 | `-log-format` | `text` | `text` or `json` (client-go's klog is routed through the same handler) |
 
+`GET /metrics` serves the service's internal metrics (store sizes, HTTP
+requests per pattern/status, exported events).
+
 RBAC (cluster-wide `get`/`list`/`watch`): `pods`, `services`, `namespaces`,
-`nodes`, `replicasets.apps`, `deployments.apps`, `jobs.batch`,
-`cronjobs.batch` — see [deploy/kubernetes.yaml](../deploy/kubernetes.yaml).
+`nodes`, `events`, `replicasets.apps`, `deployments.apps`, `jobs.batch`,
+`cronjobs.batch`, `servicemonitors.monitoring.coreos.com` — see
+[deploy/kubernetes.yaml](../deploy/kubernetes.yaml).
 
 ## Agent: general
 
 | Flag | Default | Description |
 |---|---|---|
 | `-node-name` | `$NODE_NAME` | the node this agent runs on (set via the downward API) |
+| `-listen` | `:8081` | serves `/healthz`, `/readyz` and `/metrics` (the agent's internal metrics); empty disables |
 | `-metadata-endpoint` | `http://kubescrape.monitoring` | base URL of the metadata service |
 | `-metadata-wait` | `5s` | server-side wait for not-yet-known containers (covers the gap between container start and the kubelet posting its status) |
 | `-node-metadata-refresh` | `1m` | refresh interval for the node's labels/annotations used in attribute templates (0 disables) |
@@ -63,6 +72,7 @@ Pipeline toggles (all default `true`):
 | `-metrics` | annotation-discovered pod/service targets |
 | `-cadvisor` | `<kubelet-endpoint>/metrics/cadvisor` (needs `-kubelet-endpoint`) |
 | `-node-metrics` | `<kubelet-endpoint>/metrics` (needs `-kubelet-endpoint`) |
+| `-journald` | systemd journal tailing (default `false`, [below](#agent-journald)) |
 
 ## Agent: OTLP export
 
@@ -114,6 +124,28 @@ pipeline; on export failure the files rewind to the committed offset.
 Rotation handling (rename, copytruncate — including same-size rewrites —
 deletion) is automatic.
 
+## Agent: journald
+
+Opt-in with `-journald`. The agent runs `journalctl -f -o json` as a
+subprocess and exports the entries as OTLP log records, one resource per
+systemd unit (`service.name` = the unit without `.service`, `systemd.unit`,
+plus node attributes via the `journal` attrs pipeline; syslog priorities map
+to OTLP severities; `syslog.identifier` and `process.pid` become record
+attributes).
+
+| Flag | Default | Description |
+|---|---|---|
+| `-journald-path` | `journalctl` | the binary — the default distroless image does **not** contain it; use an image that does |
+| `-journald-dir` | — | journal directory (`journalctl -D`); empty reads the system default |
+| `-journald-units` | — | comma-separated units; empty reads everything |
+| `-journald-cursor-file` | — | persists the journal cursor across restarts; empty means every start begins at the tail |
+| `-journald-batch-size` | `1024` | flush after this many entries |
+| `-journald-flush-interval` | `2s` | flush at least this often |
+
+Delivery is at-least-once: the cursor is committed only after a successful
+export; on export failure or subprocess death, journalctl restarts from the
+committed cursor with backoff (re-reading anything in flight).
+
 ## Agent: metrics scraping
 
 | Flag | Default | Description |
@@ -124,6 +156,7 @@ deletion) is automatic.
 | `-metrics-batch-size` | `10000` | export chunk size in data points — a 100k-series target is exported in ten chunks and never held in memory |
 | `-scrape-max-samples` | `0` | abort a single scrape beyond this many samples (0 = unlimited) |
 | `-scrape-exemplars` | `false` | negotiate OpenMetrics and attach exemplars to counter and histogram points (`trace_id`/`span_id` map to OTLP trace/span fields) |
+| `-scrape-health-metrics` | `true` | export synthetic `up`, `scrape_duration_seconds` and `scrape_samples_scraped` gauges per target after each cycle |
 | `-metrics-config` | — | YAML file with series filters and target splitters ([below](#metrics-config)) |
 
 Histograms and summaries are converted to proper OTLP Histogram/Summary
@@ -182,8 +215,8 @@ attributes:
     (index .Labels "app.kubernetes.io/name") .Name }}{{ end }}
   infra: '{{ with .Pod }}{{ if regexMatch "-system$" .Namespace }}yes{{ end }}{{ end }}'
 
-# Per-pipeline overrides (logs | targets | cadvisor | node); maps merge with
-# the pipeline entry winning.
+# Per-pipeline overrides (logs | targets | cadvisor | node | journal); maps
+# merge with the pipeline entry winning.
 pipelines:
   node:
     attributes:
@@ -271,6 +304,14 @@ once, pod source wins):
 | `prometheus.io/port` | comma-separated port numbers and/or names; absent = every declared port |
 | `prometheus.io/path` | default `/metrics` |
 | `prometheus.io/scheme` | `http` (default) or `https` |
+
+With `-servicemonitors` on the metadata service, Prometheus-Operator
+ServiceMonitors are a third target source: a monitor's `selector` picks
+Services by label (within `namespaceSelector`), each endpoint's `port` names
+a service port (or `targetPort` addresses the pod port directly), and `path`
+and `scheme` are honored. Everything else on the endpoint (authentication,
+relabelings, intervals) is ignored — scraping stays node-local and
+unauthenticated.
 
 ## Helm values
 

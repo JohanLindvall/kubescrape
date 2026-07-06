@@ -71,7 +71,10 @@ type Config struct {
 	// loops through the collector's own output).
 	ExcludeNamespaces []string
 	// Attrs builds the exported resource attributes (nil = defaults).
-	Attrs        *attrs.Builder
+	Attrs *attrs.Builder
+	// NodeInfo supplies the agent node's metadata for attribute templates
+	// (nil = omitted; the pod's nodeName still fills k8s.node.name).
+	NodeInfo     func() *attrs.NodeInfo
 	MetadataWait time.Duration
 	Metadata     MetadataSource
 	Exporter     LogExporter
@@ -411,7 +414,11 @@ func (t *Tailer) resolveMetadata(ctx context.Context, f *file) bool {
 		return false
 	}
 	res := pcommon.NewResource()
-	t.cfg.Attrs.Build(res, attrs.Context{Pod: &md.Pod, Container: &md.Container})
+	actx := attrs.Context{Pod: &md.Pod, Container: &md.Container}
+	if t.cfg.NodeInfo != nil {
+		actx.Node = t.cfg.NodeInfo()
+	}
+	t.cfg.Attrs.Build(res, actx)
 	f.resource = res
 	f.resolved = true
 	return true

@@ -308,7 +308,7 @@ func TestScrapeAttrFilter(t *testing.T) {
 	s := New(Config{
 		Node: "node1", Interval: time.Hour, Timeout: 5 * time.Second,
 		Targets: staticTargets{target}, Exporter: exp, StartTime: time.Now(),
-		Attrs: builder,
+		Attrs: &attrs.Builders{Targets: builder},
 	})
 	if err := s.scrapeTarget(context.Background(), target); err != nil {
 		t.Fatal(err)

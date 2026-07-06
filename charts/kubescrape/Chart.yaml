@@ -1,0 +1,6 @@
+apiVersion: v2
+name: kubescrape
+description: Kubernetes metadata service and OTLP node agent (logs, Prometheus targets, cadvisor and node metrics)
+type: application
+version: 0.1.0
+appVersion: "latest"

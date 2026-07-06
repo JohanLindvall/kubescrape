@@ -14,6 +14,7 @@ import (
 	"os/signal"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -36,9 +37,18 @@ func run() error {
 		nodeName     = flag.String("node-name", os.Getenv("NODE_NAME"), "name of the node this agent runs on (default $NODE_NAME)")
 		metadataURL  = flag.String("metadata-endpoint", "http://kubescrape.monitoring", "base URL of the kubescrape metadata service")
 		metadataWait = flag.Duration("metadata-wait", 5*time.Second, "how long the metadata service may block waiting for a new container")
-		otlpEndpoint = flag.String("otlp-endpoint", "otel-collector.monitoring:4317", "OTLP gRPC endpoint of the OpenTelemetry collector")
-		otlpInsecure = flag.Bool("otlp-insecure", true, "use a plaintext OTLP connection")
-		otlpTimeout  = flag.Duration("otlp-timeout", 15*time.Second, "per-export timeout")
+		otlpEndpoint = flag.String("otlp-endpoint", "otel-collector.monitoring:4317", "OTLP endpoint: host:port for grpc, base URL for http")
+		otlpProtocol = flag.String("otlp-protocol", "grpc", "OTLP transport: grpc or http")
+		otlpInsecure = flag.Bool("otlp-insecure", true, "use a plaintext gRPC connection (for http, use an http:// endpoint)")
+		otlpSkipTLS  = flag.Bool("otlp-tls-insecure-skip-verify", false, "skip TLS certificate verification towards the collector")
+		otlpCAFile   = flag.String("otlp-tls-ca-file", "", "PEM CA bundle for verifying the collector")
+		otlpBearer   = flag.String("otlp-bearer-token-file", "", "file with a bearer token sent on every export (re-read periodically)")
+		otlpTimeout  = flag.Duration("otlp-timeout", 15*time.Second, "per-export-attempt timeout")
+		otlpRetries  = flag.Int("otlp-retry-attempts", 3, "tries per metrics export (logs retry via the tailer's rewind)")
+		otlpBackoff  = flag.Duration("otlp-retry-backoff", time.Second, "initial backoff between metric export retries, doubled per attempt")
+
+		logLevel  = flag.String("log-level", "info", "log level: debug, info, warn, error")
+		logFormat = flag.String("log-format", "text", "log format: text or json")
 
 		logDir         = flag.String("log-dir", "/var/log/containers", "directory of containerd log symlinks")
 		checkpointFile = flag.String("checkpoint-file", "", "file persisting log read offsets across restarts (empty disables)")
@@ -55,6 +65,7 @@ func run() error {
 		metricsBatch      = flag.Int("metrics-batch-size", 10000, "export metrics in chunks of this many data points")
 		maxSamples        = flag.Int("scrape-max-samples", 0, "abort a single scrape beyond this many samples (0 = unlimited)")
 		exemplars         = flag.Bool("scrape-exemplars", false, "negotiate OpenMetrics and attach exemplars to counter and histogram data points")
+		metricsConfig     = flag.String("metrics-config", "", "YAML file with per-pipeline keep/drop rules for scraped series and target splitters (empty keeps all)")
 
 		kubeletEndpoint = flag.String("kubelet-endpoint", "", "kubelet base URL, e.g. https://$(NODE_IP):10250 (empty disables the cadvisor and node-metrics scrapes)")
 		kubeletToken    = flag.String("kubelet-token-file", "/var/run/secrets/kubernetes.io/serviceaccount/token", "bearer token file for the kubelet (re-read per scrape)")
@@ -63,7 +74,8 @@ func run() error {
 		attrsEnable  = flag.String("resource-attrs-enable", "", "comma-separated anchored regexes; only matching resource attributes are exported (empty enables all)")
 		attrsDisable = flag.String("resource-attrs-disable", "", "comma-separated anchored regexes; matching resource attributes are dropped (empty disables none)")
 		attrsStatic  = flag.String("resource-attrs-static", "", "comma-separated key=value attributes added to every exported resource")
-		attrsConfig  = flag.String("resource-attrs-config", "", "YAML file declaring resource attribute building (defaults, static, template attributes)")
+		attrsConfig  = flag.String("resource-attrs-config", "", "YAML file declaring resource attribute building (defaults, static, template attributes, per-pipeline overrides)")
+		nodeRefresh  = flag.Duration("node-metadata-refresh", time.Minute, "refresh interval for the node's labels/annotations used in attribute templates (0 disables the lookup)")
 
 		// Pipeline toggles.
 		logsOn     = flag.Bool("logs", true, "tail container logs")
@@ -81,10 +93,13 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	log := slog.New(slog.NewTextHandler(os.Stderr, nil))
+	log, err := newLogger(*logLevel, *logFormat)
+	if err != nil {
+		return err
+	}
 	slog.SetDefault(log)
 
-	attrBuilder, err := buildAttrs(*attrsConfig, *attrsStatic, *attrsEnable, *attrsDisable)
+	attrBuilders, err := buildAttrs(*attrsConfig, *attrsStatic, *attrsEnable, *attrsDisable)
 	if err != nil {
 		return fmt.Errorf("resource attributes: %w", err)
 	}
@@ -92,7 +107,27 @@ func run() error {
 	// The metadata client's HTTP timeout must exceed the server-side wait.
 	meta := metaclient.New(*metadataURL, *metadataWait+10*time.Second)
 
-	exporter, err := otlpexport.New(*otlpEndpoint, *otlpInsecure, *otlpTimeout)
+	nodeInfo := startNodeInfo(ctx, meta, *nodeName, *nodeRefresh, log)
+
+	var metricFilters *promscrape.MetricFilters
+	var splitters []*promscrape.Splitter
+	if *metricsConfig != "" {
+		if metricFilters, splitters, err = promscrape.LoadMetricsConfig(*metricsConfig); err != nil {
+			return fmt.Errorf("metrics config: %w", err)
+		}
+	}
+
+	exporter, err := otlpexport.New(otlpexport.Config{
+		Endpoint:           *otlpEndpoint,
+		Protocol:           *otlpProtocol,
+		Insecure:           *otlpInsecure,
+		InsecureSkipVerify: *otlpSkipTLS,
+		CAFile:             *otlpCAFile,
+		BearerTokenFile:    *otlpBearer,
+		Timeout:            *otlpTimeout,
+		RetryAttempts:      *otlpRetries,
+		RetryBackoff:       *otlpBackoff,
+	})
 	if err != nil {
 		return fmt.Errorf("creating OTLP exporter: %w", err)
 	}
@@ -110,7 +145,8 @@ func run() error {
 			Multiline:         *multilineOn,
 			MultilineTimeout:  *multilineWait,
 			ExcludeNamespaces: splitList(*excludeNs),
-			Attrs:             attrBuilder,
+			Attrs:             attrBuilders.Logs,
+			NodeInfo:          nodeInfo,
 			MetadataWait:      *metadataWait,
 			Metadata:          meta,
 			Exporter:          exporter,
@@ -144,7 +180,10 @@ func run() error {
 				InsecureTLS:    *kubeletInsecure,
 				Meta:           meta,
 			},
-			Attrs:     attrBuilder,
+			Attrs:     attrBuilders,
+			NodeInfo:  nodeInfo,
+			Filters:   metricFilters,
+			Splitters: splitters,
 			Logger:    log,
 			Targets:   meta,
 			Exporter:  exporter,
@@ -165,9 +204,42 @@ func run() error {
 	return nil
 }
 
-// buildAttrs assembles the resource-attribute builder from the config file
-// and the flags; flag statics override config statics.
-func buildAttrs(configPath, static, enable, disable string) (*attrs.Builder, error) {
+// startNodeInfo provides the node's labels/annotations for attribute
+// templates, refreshed in the background from the metadata service.
+func startNodeInfo(ctx context.Context, meta *metaclient.Client, nodeName string, refresh time.Duration, log *slog.Logger) func() *attrs.NodeInfo {
+	var current atomic.Pointer[attrs.NodeInfo]
+	current.Store(&attrs.NodeInfo{Name: nodeName})
+	if refresh > 0 {
+		fetch := func() {
+			fctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+			defer cancel()
+			md, err := meta.Node(fctx, nodeName)
+			if err != nil {
+				log.Debug("fetching node metadata", "node", nodeName, "error", err)
+				return
+			}
+			current.Store(&attrs.NodeInfo{Name: nodeName, Labels: md.Labels, Annotations: md.Annotations})
+		}
+		go func() {
+			fetch()
+			ticker := time.NewTicker(refresh)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					fetch()
+				}
+			}
+		}()
+	}
+	return current.Load
+}
+
+// buildAttrs assembles the per-pipeline resource-attribute builders from the
+// config file and the flags; flag statics override config statics.
+func buildAttrs(configPath, static, enable, disable string) (*attrs.Builders, error) {
 	filter, err := attrs.NewFilter(enable, disable)
 	if err != nil {
 		return nil, err
@@ -193,7 +265,24 @@ func buildAttrs(configPath, static, enable, disable string) (*attrs.Builder, err
 			cfg.Static[k] = v
 		}
 	}
-	return attrs.NewBuilder(cfg, filter)
+	return attrs.NewBuilders(cfg, filter)
+}
+
+// newLogger builds the slog logger from the -log-level/-log-format flags.
+func newLogger(level, format string) (*slog.Logger, error) {
+	var lvl slog.Level
+	if err := lvl.UnmarshalText([]byte(level)); err != nil {
+		return nil, fmt.Errorf("log level %q: %w", level, err)
+	}
+	opts := &slog.HandlerOptions{Level: lvl}
+	switch format {
+	case "text":
+		return slog.New(slog.NewTextHandler(os.Stderr, opts)), nil
+	case "json":
+		return slog.New(slog.NewJSONHandler(os.Stderr, opts)), nil
+	default:
+		return nil, fmt.Errorf("log format %q (want text or json)", format)
+	}
 }
 
 func splitList(s string) []string {

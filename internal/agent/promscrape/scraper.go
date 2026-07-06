@@ -46,8 +46,18 @@ type Config struct {
 	// Kubelet configures scraping of the kubelet's cadvisor and node
 	// metrics endpoints.
 	Kubelet KubeletConfig
-	// Attrs builds the exported resource attributes (nil = defaults).
-	Attrs     *attrs.Builder
+	// Attrs holds the per-pipeline resource attribute builders (nil =
+	// defaults).
+	Attrs *attrs.Builders
+	// NodeInfo supplies the agent node's metadata for attribute templates
+	// (nil = name only, from Node).
+	NodeInfo func() *attrs.NodeInfo
+	// Filters drops/keeps scraped series per pipeline (nil = keep all).
+	Filters *MetricFilters
+	// Splitters re-attribute series of matching targets (kube-state-metrics
+	// style) into per-object resources; they resolve metadata through
+	// Kubelet.Meta.
+	Splitters []*Splitter
 	Logger    *slog.Logger
 	Targets   TargetSource
 	Exporter  MetricExporter
@@ -66,10 +76,11 @@ type Scraper struct {
 	http *http.Client
 	log  *slog.Logger
 
-	// kubelet state; podCache is only touched by the (single) cadvisor
-	// scrape goroutine.
 	kubeletHTTP *http.Client
-	podCache    map[string]podCacheEntry
+	// podCache backs the metadata lookups of the cadvisor batcher and the
+	// splitters; splitters run on concurrent scrape goroutines.
+	cacheMu  sync.Mutex
+	podCache map[string]podCacheEntry
 }
 
 // New creates a Scraper.
@@ -197,11 +208,16 @@ func (s *Scraper) scrapeTarget(ctx context.Context, t kubemeta.ScrapeTarget) err
 	// regardless of Accept, so detect from the response.
 	openMetrics := strings.Contains(resp.Header.Get("Content-Type"), "openmetrics")
 
-	b := newBatcher(func(res pcommon.Resource) {
-		res.Attributes().PutStr("url.full", t.URL)
-		s.cfg.Attrs.Build(res, attrs.Context{Pod: &t.Pod, Service: t.Service})
-	}, s.cfg.BatchPoints, s.cfg.StartTime, time.Now())
-	return s.parseAndExport(ctx, resp.Body, openMetrics, s.cfg.Exemplars, b, t.URL)
+	var cb chunker
+	if sp := s.splitterFor(t.Pod); sp != nil {
+		cb = newSplitBatcher(s, ctx, t, sp, time.Now())
+	} else {
+		cb = newBatcher(func(res pcommon.Resource) {
+			res.Attributes().PutStr("url.full", t.URL)
+			s.attrsFor(pipelineTargets).Build(res, attrs.Context{Pod: &t.Pod, Service: t.Service, Node: s.nodeInfo()})
+		}, s.cfg.BatchPoints, s.cfg.StartTime, time.Now())
+	}
+	return s.parseAndExport(ctx, resp.Body, openMetrics, s.cfg.Exemplars, cb, pipelineTargets, t.URL)
 }
 
 // batcher accumulates samples of one source into a pmetric.Metrics payload
@@ -247,3 +263,36 @@ func (b *batcher) take() pmetric.Metrics {
 }
 
 func (b *batcher) count() int { return b.points }
+
+// Pipeline identifiers for attribute-builder selection.
+const (
+	pipelineTargets  = "targets"
+	pipelineCadvisor = "cadvisor"
+	pipelineNode     = "node"
+)
+
+// attrsFor picks the attribute builder for a pipeline; nil is valid (built-in
+// defaults).
+func (s *Scraper) attrsFor(pipeline string) *attrs.Builder {
+	if s.cfg.Attrs == nil {
+		return nil
+	}
+	switch pipeline {
+	case pipelineCadvisor:
+		return s.cfg.Attrs.Cadvisor
+	case pipelineNode:
+		return s.cfg.Attrs.Node
+	default:
+		return s.cfg.Attrs.Targets
+	}
+}
+
+// nodeInfo returns the agent node's metadata for templates.
+func (s *Scraper) nodeInfo() *attrs.NodeInfo {
+	if s.cfg.NodeInfo != nil {
+		if n := s.cfg.NodeInfo(); n != nil {
+			return n
+		}
+	}
+	return &attrs.NodeInfo{Name: s.cfg.Node}
+}

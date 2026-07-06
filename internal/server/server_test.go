@@ -31,6 +31,13 @@ func (stubResolver) Namespace(name string) *kubemeta.ObjectMeta {
 	return &kubemeta.ObjectMeta{UID: "ns-" + name, Labels: map[string]string{"kubernetes.io/metadata.name": name}}
 }
 
+func (stubResolver) Node(name string) *kubemeta.ObjectMeta {
+	if name == "node1" {
+		return &kubemeta.ObjectMeta{UID: "node-uid", Labels: map[string]string{"agentpool": "system"}}
+	}
+	return nil
+}
+
 func closedChan() <-chan struct{} {
 	ch := make(chan struct{})
 	close(ch)
@@ -171,6 +178,18 @@ func TestPodEndpoint(t *testing.T) {
 		t.Fatalf("pod = %+v", pod)
 	}
 	getJSON(t, srv.URL+"/v1/pods/default/nope", http.StatusNotFound, nil)
+}
+
+func TestNodeMetadataEndpoint(t *testing.T) {
+	st := store.New(time.Minute)
+	srv := testServer(t, st, closedChan())
+
+	var meta kubemeta.NodeMetadata
+	getJSON(t, srv.URL+"/v1/nodes/node1/metadata", http.StatusOK, &meta)
+	if meta.Name != "node1" || meta.Labels["agentpool"] != "system" {
+		t.Fatalf("node metadata = %+v", meta)
+	}
+	getJSON(t, srv.URL+"/v1/nodes/ghost/metadata", http.StatusNotFound, nil)
 }
 
 func TestNodeTargets(t *testing.T) {

@@ -90,6 +90,19 @@ func TestResolveNonFollowedKinds(t *testing.T) {
 	}
 }
 
+func TestNodeMetadata(t *testing.T) {
+	r := fakeResolver(map[string]*metav1.PartialObjectMetadata{
+		"nodes//node1": obj("node-uid", map[string]string{"agentpool": "system"}),
+	})
+	got := r.Node("node1")
+	if got == nil || got.UID != "node-uid" || got.Labels["agentpool"] != "system" {
+		t.Fatalf("got %+v", got)
+	}
+	if r.Node("missing") != nil {
+		t.Fatal("unknown node should resolve to nil")
+	}
+}
+
 func TestNamespaceMetadata(t *testing.T) {
 	r := fakeResolver(map[string]*metav1.PartialObjectMetadata{
 		"namespaces//prod": obj("ns-uid", map[string]string{"env": "prod"}),

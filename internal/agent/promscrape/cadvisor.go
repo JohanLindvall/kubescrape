@@ -60,9 +60,10 @@ type chunker interface {
 	count() int
 }
 
-// parseAndExport streams one scrape body through the converter into cb,
-// exporting a chunk whenever BatchPoints accumulate.
-func (s *Scraper) parseAndExport(ctx context.Context, body io.Reader, openMetrics, withExemplars bool, cb chunker, what string) error {
+// parseAndExport streams one scrape body through the series filter and the
+// converter into cb, exporting a chunk whenever BatchPoints accumulate.
+func (s *Scraper) parseAndExport(ctx context.Context, body io.Reader, openMetrics, withExemplars bool, cb chunker, pipeline, what string) error {
+	filter := s.cfg.Filters.filterFor(pipeline)
 	conv := newConverter(cb)
 	parser := NewParser(s.cfg.MaxLineBytes, openMetrics, withExemplars)
 	samples := 0
@@ -70,6 +71,9 @@ func (s *Scraper) parseAndExport(ctx context.Context, body io.Reader, openMetric
 		samples++
 		if s.cfg.MaxSamples > 0 && samples > s.cfg.MaxSamples {
 			return ErrTooManySamples
+		}
+		if !filter.Keep(sample.Name, sample.Labels) {
+			return nil
 		}
 		conv.add(sample)
 		if cb.count() >= s.cfg.BatchPoints {
@@ -138,7 +142,7 @@ func (s *Scraper) scrapeCadvisor(ctx context.Context) error {
 	}()
 
 	cb := newCadvisorBatcher(s, time.Now(), ctx)
-	return s.parseAndExport(ctx, resp.Body, false, false, cb, url)
+	return s.parseAndExport(ctx, resp.Body, false, false, cb, pipelineCadvisor, url)
 }
 
 // scrapeNodeMetrics scrapes <kubelet>/metrics under a node-level resource.
@@ -156,14 +160,13 @@ func (s *Scraper) scrapeNodeMetrics(ctx context.Context) error {
 		_ = resp.Body.Close()
 	}()
 
-	node := s.cfg.Node
 	b := newBatcher(func(res pcommon.Resource) {
 		a := res.Attributes()
 		a.PutStr("service.name", "kubelet")
 		a.PutStr("url.full", url)
-		s.cfg.Attrs.Build(res, attrs.Context{Node: node})
+		s.attrsFor(pipelineNode).Build(res, attrs.Context{Node: s.nodeInfo()})
 	}, s.cfg.BatchPoints, s.cfg.StartTime, time.Now())
-	return s.parseAndExport(ctx, resp.Body, false, false, b, url)
+	return s.parseAndExport(ctx, resp.Body, false, false, b, pipelineNode, url)
 }
 
 // podMetaCacheTTL bounds how long resolved (or not-found) metadata is reused
@@ -298,7 +301,7 @@ func (cb *cadvisorBatcher) scope(labels []Label) (pmetric.ScopeMetrics, string) 
 // then the pod (by name, cross-checked against the cgroup pod UID), then the
 // raw label identity.
 func (cb *cadvisorBatcher) fillResource(res pcommon.Resource, ident cadvisorIdentity) {
-	ctx := attrs.Context{Node: cb.s.cfg.Node}
+	ctx := attrs.Context{Node: cb.s.nodeInfo()}
 	resolved := false
 
 	// Exact container incarnation via the cgroup container ID.
@@ -346,7 +349,7 @@ func (cb *cadvisorBatcher) fillResource(res pcommon.Resource, ident cadvisorIden
 			a.PutStr("container.id", ident.containerID)
 		}
 	}
-	cb.s.cfg.Attrs.Build(res, ctx)
+	cb.s.attrsFor(pipelineCadvisor).Build(res, ctx)
 }
 
 func (cb *cadvisorBatcher) metric(labels []Label, name string, shape func(pmetric.Metric)) pmetric.Metric {
@@ -472,10 +475,10 @@ func (cb *cadvisorBatcher) putFilteredLabels(attrs pcommon.Map, labels []Label) 
 // unknown.
 func (s *Scraper) podMeta(ctx context.Context, namespace, pod string) *kubemeta.Pod {
 	key := "n\x00" + namespace + "/" + pod
-	if e, ok := s.podCache[key]; ok && time.Since(e.fetched) < podMetaCacheTTL {
+	if e, ok := s.cacheGet(key); ok {
 		return e.pod
 	}
-	meta, err := s.cfg.Kubelet.Meta.PodByName(ctx, namespace, pod)
+	meta, err := s.metaSource().PodByName(ctx, namespace, pod)
 	if err != nil {
 		meta = nil
 		if ctx.Err() != nil {
@@ -487,17 +490,17 @@ func (s *Scraper) podMeta(ctx context.Context, namespace, pod string) *kubemeta.
 }
 
 // containerMeta resolves the exact container incarnation by runtime ID; nil
-// when unknown. The lookup is non-blocking (wait 0): cadvisor only reports
-// containers that already exist.
+// when unknown. The lookup is non-blocking (wait 0): the scraped series only
+// reference containers that already exist.
 func (s *Scraper) containerMeta(ctx context.Context, containerID string) *kubemeta.ContainerMetadata {
 	key := "c\x00" + containerID
-	if e, ok := s.podCache[key]; ok && time.Since(e.fetched) < podMetaCacheTTL {
+	if e, ok := s.cacheGet(key); ok {
 		if e.pod == nil {
 			return nil
 		}
 		return &kubemeta.ContainerMetadata{ContainerID: containerID, Container: *e.container, Pod: *e.pod}
 	}
-	md, err := s.cfg.Kubelet.Meta.Container(ctx, containerID, 0)
+	md, err := s.metaSource().Container(ctx, containerID, 0)
 	if err != nil {
 		if ctx.Err() != nil {
 			return nil // do not negative-cache cancellations
@@ -509,7 +512,26 @@ func (s *Scraper) containerMeta(ctx context.Context, containerID string) *kubeme
 	return md
 }
 
+// metaSource returns the metadata source shared by the kubelet scrapes and
+// the splitters. Splitters require Kubelet.Meta to be set even when the
+// kubelet scrapes are disabled.
+func (s *Scraper) metaSource() MetaSource {
+	return s.cfg.Kubelet.Meta
+}
+
+func (s *Scraper) cacheGet(key string) (podCacheEntry, bool) {
+	s.cacheMu.Lock()
+	defer s.cacheMu.Unlock()
+	e, ok := s.podCache[key]
+	if !ok || time.Since(e.fetched) >= podMetaCacheTTL {
+		return podCacheEntry{}, false
+	}
+	return e, true
+}
+
 func (s *Scraper) cachePut(key string, e podCacheEntry) {
+	s.cacheMu.Lock()
+	defer s.cacheMu.Unlock()
 	s.podCache[key] = e
 	// Opportunistic pruning keeps the cache bounded by live pods/containers.
 	if len(s.podCache) > 8192 {

@@ -26,6 +26,12 @@ type ObjectMeta struct {
 	Annotations map[string]string `json:"annotations,omitempty"`
 }
 
+// NodeMetadata is the response of the node metadata endpoint.
+type NodeMetadata struct {
+	Name string `json:"name"`
+	ObjectMeta
+}
+
 // ContainerPort is a port declared on a container spec.
 type ContainerPort struct {
 	Name     string `json:"name,omitempty"`

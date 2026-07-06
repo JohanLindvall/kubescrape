@@ -1,8 +1,17 @@
-// Package otlpexport sends OTLP payloads to a collector over gRPC.
+// Package otlpexport sends OTLP payloads to a collector over gRPC or HTTP.
 package otlpexport
 
 import (
+	"bytes"
 	"context"
+	"crypto/tls"
+	"crypto/x509"
+	"fmt"
+	"io"
+	"net/http"
+	"os"
+	"strings"
+	"sync"
 	"time"
 
 	"go.opentelemetry.io/collector/pdata/plog"
@@ -12,53 +21,245 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/metadata"
 )
 
-// Client exports logs and metrics to one OTLP/gRPC endpoint.
+// Config configures the exporter.
+type Config struct {
+	// Endpoint is host:port for gRPC, or a base URL (scheme required) for
+	// HTTP, e.g. "otel-collector:4317" or "https://ingest.example.com:443".
+	Endpoint string
+	// Protocol is "grpc" or "http" (OTLP/HTTP protobuf on /v1/logs and
+	// /v1/metrics).
+	Protocol string
+	// Insecure uses plaintext for gRPC (ignored for HTTP; use an http:// or
+	// https:// endpoint).
+	Insecure bool
+	// InsecureSkipVerify disables TLS certificate verification.
+	InsecureSkipVerify bool
+	// CAFile adds a PEM CA bundle for verifying the collector.
+	CAFile string
+	// BearerTokenFile is re-read every minute and sent as
+	// "Authorization: Bearer <token>". Empty disables.
+	BearerTokenFile string
+	// Timeout bounds one export attempt.
+	Timeout time.Duration
+	// RetryAttempts is the number of tries per metrics export (logs have
+	// their own at-least-once retry in the tailer). Minimum 1.
+	RetryAttempts int
+	// RetryBackoff is the initial backoff between metric retries, doubled
+	// per attempt.
+	RetryBackoff time.Duration
+}
+
+// Client exports logs and metrics to one OTLP endpoint.
 type Client struct {
+	cfg Config
+
+	// gRPC transport.
 	conn    *grpc.ClientConn
 	logs    plogotlp.GRPCClient
 	metrics pmetricotlp.GRPCClient
-	timeout time.Duration
+
+	// HTTP transport.
+	httpClient *http.Client
+	logsURL    string
+	metricsURL string
+
+	tokenMu      sync.Mutex
+	token        string
+	tokenFetched time.Time
 }
 
-// New connects (lazily) to an OTLP gRPC endpoint such as
-// "otel-collector.monitoring:4317".
-func New(endpoint string, insecureConn bool, timeout time.Duration) (*Client, error) {
-	creds := credentials.NewTLS(nil)
-	if insecureConn {
-		creds = insecure.NewCredentials()
+// New creates a Client for cfg.
+func New(cfg Config) (*Client, error) {
+	if cfg.Protocol == "" {
+		cfg.Protocol = "grpc"
 	}
-	conn, err := grpc.NewClient(endpoint,
-		grpc.WithTransportCredentials(creds),
-		grpc.WithDefaultCallOptions(grpc.MaxCallSendMsgSize(64*1024*1024)),
-	)
+	if cfg.RetryAttempts < 1 {
+		cfg.RetryAttempts = 1
+	}
+	if cfg.RetryBackoff <= 0 {
+		cfg.RetryBackoff = time.Second
+	}
+	c := &Client{cfg: cfg}
+
+	tlsCfg, err := buildTLS(cfg)
 	if err != nil {
 		return nil, err
 	}
-	return &Client{
-		conn:    conn,
-		logs:    plogotlp.NewGRPCClient(conn),
-		metrics: pmetricotlp.NewGRPCClient(conn),
-		timeout: timeout,
-	}, nil
+
+	switch cfg.Protocol {
+	case "grpc":
+		creds := credentials.NewTLS(tlsCfg)
+		if cfg.Insecure {
+			creds = insecure.NewCredentials()
+		}
+		conn, err := grpc.NewClient(cfg.Endpoint,
+			grpc.WithTransportCredentials(creds),
+			grpc.WithDefaultCallOptions(grpc.MaxCallSendMsgSize(64*1024*1024)),
+		)
+		if err != nil {
+			return nil, err
+		}
+		c.conn = conn
+		c.logs = plogotlp.NewGRPCClient(conn)
+		c.metrics = pmetricotlp.NewGRPCClient(conn)
+	case "http":
+		base := strings.TrimRight(cfg.Endpoint, "/")
+		if !strings.Contains(base, "://") {
+			return nil, fmt.Errorf("http endpoint %q needs a scheme (http:// or https://)", cfg.Endpoint)
+		}
+		c.logsURL = base + "/v1/logs"
+		c.metricsURL = base + "/v1/metrics"
+		c.httpClient = &http.Client{
+			Timeout:   cfg.Timeout,
+			Transport: &http.Transport{TLSClientConfig: tlsCfg, MaxIdleConnsPerHost: 2},
+		}
+	default:
+		return nil, fmt.Errorf("protocol %q (want grpc or http)", cfg.Protocol)
+	}
+	return c, nil
+}
+
+func buildTLS(cfg Config) (*tls.Config, error) {
+	tlsCfg := &tls.Config{InsecureSkipVerify: cfg.InsecureSkipVerify}
+	if cfg.CAFile != "" {
+		pem, err := os.ReadFile(cfg.CAFile)
+		if err != nil {
+			return nil, fmt.Errorf("reading CA file: %w", err)
+		}
+		pool := x509.NewCertPool()
+		if !pool.AppendCertsFromPEM(pem) {
+			return nil, fmt.Errorf("no certificates in %s", cfg.CAFile)
+		}
+		tlsCfg.RootCAs = pool
+	}
+	return tlsCfg, nil
 }
 
 // Close tears down the connection.
-func (c *Client) Close() error { return c.conn.Close() }
+func (c *Client) Close() error {
+	if c.conn != nil {
+		return c.conn.Close()
+	}
+	return nil
+}
 
-// ExportLogs sends one logs payload.
+// bearer returns the current token, re-reading the file at most once per
+// minute (ServiceAccount tokens rotate).
+func (c *Client) bearer() (string, error) {
+	if c.cfg.BearerTokenFile == "" {
+		return "", nil
+	}
+	c.tokenMu.Lock()
+	defer c.tokenMu.Unlock()
+	if time.Since(c.tokenFetched) < time.Minute && c.token != "" {
+		return c.token, nil
+	}
+	data, err := os.ReadFile(c.cfg.BearerTokenFile)
+	if err != nil {
+		return "", fmt.Errorf("reading bearer token: %w", err)
+	}
+	c.token = strings.TrimSpace(string(data))
+	c.tokenFetched = time.Now()
+	return c.token, nil
+}
+
+// ExportLogs sends one logs payload (single attempt; the tailer retries and
+// rewinds).
 func (c *Client) ExportLogs(ctx context.Context, ld plog.Logs) error {
-	ctx, cancel := context.WithTimeout(ctx, c.timeout)
+	ctx, cancel := context.WithTimeout(ctx, c.cfg.Timeout)
 	defer cancel()
-	_, err := c.logs.Export(ctx, plogotlp.NewExportRequestFromLogs(ld))
+	if c.conn != nil {
+		ctx, err := c.grpcAuth(ctx)
+		if err != nil {
+			return err
+		}
+		_, err = c.logs.Export(ctx, plogotlp.NewExportRequestFromLogs(ld))
+		return err
+	}
+	body, err := plogotlp.NewExportRequestFromLogs(ld).MarshalProto()
+	if err != nil {
+		return err
+	}
+	return c.httpPost(ctx, c.logsURL, body)
+}
+
+// ExportMetrics sends one metrics payload with bounded retries.
+func (c *Client) ExportMetrics(ctx context.Context, md pmetric.Metrics) error {
+	var err error
+	backoff := c.cfg.RetryBackoff
+	for attempt := 0; attempt < c.cfg.RetryAttempts; attempt++ {
+		if attempt > 0 {
+			select {
+			case <-ctx.Done():
+				return err
+			case <-time.After(backoff):
+			}
+			backoff *= 2
+		}
+		if err = c.exportMetricsOnce(ctx, md); err == nil {
+			return nil
+		}
+	}
 	return err
 }
 
-// ExportMetrics sends one metrics payload.
-func (c *Client) ExportMetrics(ctx context.Context, md pmetric.Metrics) error {
-	ctx, cancel := context.WithTimeout(ctx, c.timeout)
+func (c *Client) exportMetricsOnce(ctx context.Context, md pmetric.Metrics) error {
+	ctx, cancel := context.WithTimeout(ctx, c.cfg.Timeout)
 	defer cancel()
-	_, err := c.metrics.Export(ctx, pmetricotlp.NewExportRequestFromMetrics(md))
-	return err
+	if c.conn != nil {
+		ctx, err := c.grpcAuth(ctx)
+		if err != nil {
+			return err
+		}
+		_, err = c.metrics.Export(ctx, pmetricotlp.NewExportRequestFromMetrics(md))
+		return err
+	}
+	body, err := pmetricotlp.NewExportRequestFromMetrics(md).MarshalProto()
+	if err != nil {
+		return err
+	}
+	return c.httpPost(ctx, c.metricsURL, body)
+}
+
+// grpcAuth attaches the bearer token as outgoing gRPC metadata.
+func (c *Client) grpcAuth(ctx context.Context) (context.Context, error) {
+	token, err := c.bearer()
+	if err != nil {
+		return nil, err
+	}
+	if token == "" {
+		return ctx, nil
+	}
+	return metadata.AppendToOutgoingContext(ctx, "authorization", "Bearer "+token), nil
+}
+
+func (c *Client) httpPost(ctx context.Context, url string, body []byte) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/x-protobuf")
+	token, err := c.bearer()
+	if err != nil {
+		return err
+	}
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+		_ = resp.Body.Close()
+	}()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 256))
+		return fmt.Errorf("status %d: %s", resp.StatusCode, strings.TrimSpace(string(msg)))
+	}
+	return nil
 }

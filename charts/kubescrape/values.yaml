@@ -1,0 +1,76 @@
+image:
+  repository: ghcr.io/johanlindvall/kubescrape
+  tag: ""            # defaults to .Chart.AppVersion
+  pullPolicy: IfNotPresent
+
+logLevel: info       # both components
+logFormat: text
+
+# The metadata service (Deployment).
+service:
+  replicas: 1
+  listen: ":8080"
+  waitTimeout: 5s
+  cacheTTL: 5m
+  extraArgs: []
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+  podDisruptionBudget:
+    enabled: false
+    maxUnavailable: 1
+
+# The per-node agent (DaemonSet).
+agent:
+  # Pipeline toggles.
+  logs: true
+  metrics: true
+  cadvisor: true
+  cadvisorRollups: true
+  nodeMetrics: true
+
+  # Kubelet scraping; empty disables cadvisor and node metrics.
+  kubeletEndpoint: "https://$(NODE_IP):10250"
+  kubeletInsecureTLS: true
+
+  otlp:
+    endpoint: "otel-collector.monitoring:4317"
+    protocol: grpc          # grpc | http
+    insecure: true
+    tlsInsecureSkipVerify: false
+    caFile: ""
+    retryAttempts: 3
+    retryBackoff: 1s
+    timeout: 15s
+    # Bearer token from a Secret, mounted and passed via
+    # -otlp-bearer-token-file.
+    bearerTokenSecret:
+      name: ""
+      key: token
+
+  logsExcludeNamespaces: [monitoring]
+  checkpointFile: /var/lib/kubescrape-agent/checkpoints.json
+  multiline: true
+  scrapeInterval: 30s
+  scrapeExemplars: false
+
+  # Static resource attributes (key: value), e.g. cluster: prod-eu.
+  staticAttrs: {}
+  # Rendered verbatim into the -resource-attrs-config file. See the README
+  # (defaults / static / attributes / pipelines).
+  attrsConfig: {}
+  # Rendered verbatim into the -metrics-config file (pipelines filter rules
+  # and splitters).
+  metricsConfig: {}
+
+  extraArgs: []
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+    limits:
+      memory: 512Mi
+
+networkPolicy:
+  enabled: false

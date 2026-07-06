@@ -224,6 +224,18 @@ ServiceAccount token (`nodes/metrics` RBAC, see
 (all default true; the kubelet scrapes additionally require
 `-kubelet-endpoint`).
 
+**Metric filtering and splitting.** `-metrics-config` points at a YAML file
+with two sections. `pipelines` holds ordered keep/drop rules per pipeline
+(`all`, `targets`, `cadvisor`, `node`) — first match wins, no match keeps;
+rules match the series name and label values with anchored regexes, so
+"drop `container_network_*` except `interface=eth0`" is a keep rule followed
+by a drop rule. `splitters` re-attribute targets whose series describe
+*other* objects (kube-state-metrics style): per-target match + per-family
+`groupBy` rules move identity labels into per-object resources, optionally
+enriched through the metadata service (by `container.id` or namespace/name,
+cross-checked against a mapped pod UID). Unmatched series stay on the
+target's own resource.
+
 **Resource attributes.** How resource attributes are built is configurable
 and applies uniformly to log and metric resources:
 
@@ -236,7 +248,8 @@ and applies uniformly to log and metric resources:
 * `-resource-attrs-static=cluster=prod,env=eu` — fixed attributes added to
   every exported resource.
 * `-resource-attrs-config=attrs.yaml` — full control, including template
-  attributes built from the pod/container/service metadata:
+  attributes built from the node/pod/container/service metadata and
+  per-pipeline overrides:
 
   ```yaml
   defaults: true            # include the built-in k8s.* mapping
@@ -245,11 +258,38 @@ and applies uniformly to log and metric resources:
   attributes:               # Go templates over {Node, Pod, Container, Service}
     team: '{{ index .Pod.Labels "team" }}'
     container.image: '{{ with .Container }}{{ .Image }}{{ end }}'
+    k8s.node.zone: '{{ with .Node }}{{ index .Labels "topology.kubernetes.io/zone" }}{{ end }}'
+    service.name: '{{ with .Pod }}{{ coalesce (index .Labels "gp/service-name") (index .Labels "app.kubernetes.io/name") .Name }}{{ end }}'
+  pipelines:                # overrides for logs|targets|cadvisor|node
+    node:
+      attributes:
+        service.name: kubelet
   ```
 
-  Template attributes that render empty or fail (e.g. `.Container` on a
-  pod-level resource) are omitted. Order: defaults → static → templates →
-  filter.
+  Template functions beyond the built-ins: `env`, `coalesce`, `default`,
+  `regexMatch`, `regexReplace`. `.Node` carries the node's labels and
+  annotations, resolved through the metadata service and refreshed every
+  `-node-metadata-refresh`. Template attributes that render empty or fail
+  (e.g. `.Container` on a pod-level resource) are omitted. Order: defaults →
+  static → templates → filter.
+
+**Export.** `-otlp-protocol` selects gRPC or OTLP/HTTP;
+`-otlp-bearer-token-file` (re-read periodically) authenticates either
+transport; `-otlp-tls-ca-file`/`-otlp-tls-insecure-skip-verify` control TLS;
+metric exports retry with `-otlp-retry-attempts`/`-otlp-retry-backoff`
+(logs already retry through the tailer's rewind). Both binaries take
+`-log-level` and `-log-format` (text/json), and the metadata service routes
+client-go's klog output through the same handler.
+
+## Helm chart
+
+[charts/kubescrape](charts/kubescrape) deploys both components with every
+flag exposed as a value, and renders `agent.attrsConfig` /
+`agent.metricsConfig` values directly into the mounted config files:
+
+```sh
+helm install kubescrape charts/kubescrape -n monitoring -f my-values.yaml
+```
 
 For a local test pipeline, `hack/otel-collector.yaml` deploys a contrib
 collector with a debug exporter; the agent's own internal metrics stay small.

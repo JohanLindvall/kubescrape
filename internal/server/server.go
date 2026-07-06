@@ -19,10 +19,11 @@ import (
 )
 
 // MetadataResolver enriches pods with related-object metadata: the full
-// owner chain and the pod's namespace metadata.
+// owner chain, the pod's namespace metadata and node metadata.
 type MetadataResolver interface {
 	Resolve(namespace string, refs []metav1.OwnerReference) []kubemeta.Owner
 	Namespace(name string) *kubemeta.ObjectMeta
+	Node(name string) *kubemeta.ObjectMeta
 }
 
 // Config configures the HTTP server.
@@ -70,6 +71,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/containers/{id...}", s.handleContainer)
 	mux.HandleFunc("GET /v1/pods/{namespace}/{name}", s.handlePod)
 	mux.HandleFunc("GET /v1/nodes/{node}/targets", s.handleNodeTargets)
+	mux.HandleFunc("GET /v1/nodes/{node}/metadata", s.handleNodeMetadata)
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))
@@ -142,6 +144,22 @@ func (s *Server) handlePod(w http.ResponseWriter, r *http.Request) {
 	}
 	s.enrich(&np.Pod, np.OwnerRefs)
 	writeJSON(w, http.StatusOK, np.Pod)
+}
+
+// handleNodeMetadata serves GET /v1/nodes/{node}/metadata: the node's
+// labels and annotations (used by the agent for node-level attributes).
+func (s *Server) handleNodeMetadata(w http.ResponseWriter, r *http.Request) {
+	if !s.isReady() {
+		writeError(w, http.StatusServiceUnavailable, "informer caches not synced")
+		return
+	}
+	node := r.PathValue("node")
+	meta := s.resolver.Node(node)
+	if meta == nil {
+		writeError(w, http.StatusNotFound, fmt.Sprintf("node %q not found", node))
+		return
+	}
+	writeJSON(w, http.StatusOK, kubemeta.NodeMetadata{Name: node, ObjectMeta: *meta})
 }
 
 // handleNodeTargets serves GET /v1/nodes/{node}/targets.

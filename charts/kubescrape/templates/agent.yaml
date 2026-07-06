@@ -1,0 +1,208 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ .Release.Name }}-agent
+  namespace: {{ .Release.Namespace }}
+  labels: {{ include "kubescrape.labels" . | nindent 4 }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ .Release.Name }}-agent
+  labels: {{ include "kubescrape.labels" . | nindent 4 }}
+rules:
+  # Solely for authenticating to the kubelet (cadvisor / node metrics).
+  - apiGroups: [""]
+    resources: ["nodes/metrics"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ .Release.Name }}-agent
+  labels: {{ include "kubescrape.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ .Release.Name }}-agent
+subjects:
+  - kind: ServiceAccount
+    name: {{ .Release.Name }}-agent
+    namespace: {{ .Release.Namespace }}
+{{- if .Values.agent.attrsConfig }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Release.Name }}-agent-attrs
+  namespace: {{ .Release.Namespace }}
+  labels: {{ include "kubescrape.labels" . | nindent 4 }}
+data:
+  attrs.yaml: |
+    {{- toYaml .Values.agent.attrsConfig | nindent 4 }}
+{{- end }}
+{{- if .Values.agent.metricsConfig }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Release.Name }}-agent-metrics
+  namespace: {{ .Release.Namespace }}
+  labels: {{ include "kubescrape.labels" . | nindent 4 }}
+data:
+  metrics.yaml: |
+    {{- toYaml .Values.agent.metricsConfig | nindent 4 }}
+{{- end }}
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ .Release.Name }}-agent
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: {{ .Release.Name }}-agent
+    {{- include "kubescrape.labels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      app: {{ .Release.Name }}-agent
+  template:
+    metadata:
+      labels:
+        app: {{ .Release.Name }}-agent
+      annotations:
+        checksum/attrs: {{ .Values.agent.attrsConfig | toYaml | sha256sum }}
+        checksum/metrics: {{ .Values.agent.metricsConfig | toYaml | sha256sum }}
+    spec:
+      serviceAccountName: {{ .Release.Name }}-agent
+      tolerations:
+        - key: node-role.kubernetes.io/control-plane
+          operator: Exists
+          effect: NoSchedule
+      containers:
+        - name: agent
+          image: {{ include "kubescrape.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["/kubescrape-agent"]
+          args:
+            - -metadata-endpoint=http://{{ .Release.Name }}.{{ .Release.Namespace }}
+            - -otlp-endpoint={{ .Values.agent.otlp.endpoint }}
+            - -otlp-protocol={{ .Values.agent.otlp.protocol }}
+            - -otlp-insecure={{ .Values.agent.otlp.insecure }}
+            - -otlp-tls-insecure-skip-verify={{ .Values.agent.otlp.tlsInsecureSkipVerify }}
+            {{- with .Values.agent.otlp.caFile }}
+            - -otlp-tls-ca-file={{ . }}
+            {{- end }}
+            - -otlp-timeout={{ .Values.agent.otlp.timeout }}
+            - -otlp-retry-attempts={{ .Values.agent.otlp.retryAttempts }}
+            - -otlp-retry-backoff={{ .Values.agent.otlp.retryBackoff }}
+            {{- if .Values.agent.otlp.bearerTokenSecret.name }}
+            - -otlp-bearer-token-file=/etc/kubescrape/otlp-token/{{ .Values.agent.otlp.bearerTokenSecret.key }}
+            {{- end }}
+            - -logs={{ .Values.agent.logs }}
+            - -metrics={{ .Values.agent.metrics }}
+            - -cadvisor={{ .Values.agent.cadvisor }}
+            - -cadvisor-rollups={{ .Values.agent.cadvisorRollups }}
+            - -node-metrics={{ .Values.agent.nodeMetrics }}
+            {{- with .Values.agent.kubeletEndpoint }}
+            - -kubelet-endpoint={{ . }}
+            {{- end }}
+            - -kubelet-insecure-tls={{ .Values.agent.kubeletInsecureTLS }}
+            - -checkpoint-file={{ .Values.agent.checkpointFile }}
+            - -logs-multiline={{ .Values.agent.multiline }}
+            - -logs-exclude-namespaces={{ join "," .Values.agent.logsExcludeNamespaces }}
+            - -scrape-interval={{ .Values.agent.scrapeInterval }}
+            - -scrape-exemplars={{ .Values.agent.scrapeExemplars }}
+            - -log-level={{ .Values.logLevel }}
+            - -log-format={{ .Values.logFormat }}
+            {{- if .Values.agent.staticAttrs }}
+            - -resource-attrs-static=
+              {{- $pairs := list }}
+              {{- range $k, $v := .Values.agent.staticAttrs }}
+              {{- $pairs = append $pairs (printf "%s=%s" $k $v) }}
+              {{- end }}
+              {{- join "," $pairs }}
+            {{- end }}
+            {{- if .Values.agent.attrsConfig }}
+            - -resource-attrs-config=/etc/kubescrape/attrs/attrs.yaml
+            {{- end }}
+            {{- if .Values.agent.metricsConfig }}
+            - -metrics-config=/etc/kubescrape/metrics/metrics.yaml
+            {{- end }}
+            {{- range .Values.agent.extraArgs }}
+            - {{ . }}
+            {{- end }}
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: NODE_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.hostIP
+          securityContext:
+            runAsUser: 0
+            readOnlyRootFilesystem: true
+          volumeMounts:
+            - name: varlog
+              mountPath: /var/log
+              readOnly: true
+            - name: state
+              mountPath: /var/lib/kubescrape-agent
+            {{- if .Values.agent.attrsConfig }}
+            - name: attrs-config
+              mountPath: /etc/kubescrape/attrs
+              readOnly: true
+            {{- end }}
+            {{- if .Values.agent.metricsConfig }}
+            - name: metrics-config
+              mountPath: /etc/kubescrape/metrics
+              readOnly: true
+            {{- end }}
+            {{- if .Values.agent.otlp.bearerTokenSecret.name }}
+            - name: otlp-token
+              mountPath: /etc/kubescrape/otlp-token
+              readOnly: true
+            {{- end }}
+          resources: {{ toYaml .Values.agent.resources | nindent 12 }}
+      volumes:
+        - name: varlog
+          hostPath:
+            path: /var/log
+        - name: state
+          hostPath:
+            path: /var/lib/kubescrape-agent
+            type: DirectoryOrCreate
+        {{- if .Values.agent.attrsConfig }}
+        - name: attrs-config
+          configMap:
+            name: {{ .Release.Name }}-agent-attrs
+        {{- end }}
+        {{- if .Values.agent.metricsConfig }}
+        - name: metrics-config
+          configMap:
+            name: {{ .Release.Name }}-agent-metrics
+        {{- end }}
+        {{- if .Values.agent.otlp.bearerTokenSecret.name }}
+        - name: otlp-token
+          secret:
+            secretName: {{ .Values.agent.otlp.bearerTokenSecret.name }}
+        {{- end }}
+{{- if .Values.networkPolicy.enabled }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ .Release.Name }}
+  namespace: {{ .Release.Namespace }}
+  labels: {{ include "kubescrape.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app: {{ .Release.Name }}
+  policyTypes: [Ingress]
+  ingress:
+    - ports:
+        - port: 8080
+{{- end }}

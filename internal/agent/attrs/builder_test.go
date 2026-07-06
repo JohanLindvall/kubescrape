@@ -12,7 +12,10 @@ import (
 
 func testCtx() Context {
 	return Context{
-		Node: "node1",
+		Node: &NodeInfo{
+			Name:   "node1",
+			Labels: map[string]string{"topology.kubernetes.io/zone": "eu-1", "agentpool": "system"},
+		},
 		Pod: &kubemeta.Pod{
 			Name: "pod1", Namespace: "ns1", UID: "u1",
 			Labels: map[string]string{"team": "core"},
@@ -119,6 +122,83 @@ attributes:
 	}
 	if _, err := LoadConfig(path); err == nil {
 		t.Fatal("unknown fields must error")
+	}
+}
+
+func TestBuilderTemplateFuncs(t *testing.T) {
+	t.Setenv("TEST_CLUSTER", "prod-eu")
+	got := build(t, &Config{
+		Attributes: map[string]string{
+			"cluster":       `{{ env "TEST_CLUSTER" }}`,
+			"svc":           `{{ coalesce (index .Pod.Labels "gp/service-name") (index .Pod.Labels "team") .Pod.Name }}`,
+			"fallback":      `{{ default "unknown" (index .Pod.Labels "nope") }}`,
+			"zone":          `{{ with .Node }}{{ index .Labels "topology.kubernetes.io/zone" }}{{ end }}`,
+			"infra":         `{{ if regexMatch "^tigera-operator$|-system$" .Pod.Namespace }}gp-infrastructure{{ end }}`,
+			"trimmed-image": `{{ with .Container }}{{ regexReplace ":.*$" "" .Image }}{{ end }}`,
+		},
+	}, nil, testCtx())
+
+	want := map[string]string{
+		"cluster":       "prod-eu",
+		"svc":           "core", // team label wins over pod name
+		"fallback":      "unknown",
+		"zone":          "eu-1",
+		"trimmed-image": "img",
+	}
+	for k, v := range want {
+		if got[k] != v {
+			t.Errorf("%s = %v, want %q (all: %v)", k, got[k], v, got)
+		}
+	}
+	if _, ok := got["infra"]; ok {
+		t.Errorf("infra should be omitted for namespace ns1: %v", got)
+	}
+}
+
+func TestBuildersPipelines(t *testing.T) {
+	off := false
+	cfg := &Config{
+		Static:     map[string]string{"cluster": "prod"},
+		Attributes: map[string]string{"team": `{{ index .Pod.Labels "team" }}`},
+		Pipelines: map[string]*Config{
+			"node": {
+				Defaults:   &off,
+				Static:     map[string]string{"scope": "node"},
+				Attributes: map[string]string{"team": "infra"},
+			},
+		},
+	}
+	bs, err := NewBuilders(cfg, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	res := pcommon.NewResource()
+	bs.Targets.Build(res, testCtx())
+	got := res.Attributes().AsRaw()
+	if got["cluster"] != "prod" || got["team"] != "core" || got["k8s.pod.name"] != "pod1" {
+		t.Fatalf("targets attrs = %v", got)
+	}
+
+	res = pcommon.NewResource()
+	bs.Node.Build(res, testCtx())
+	got = res.Attributes().AsRaw()
+	// Pipeline override: defaults off, statics merged, attribute replaced.
+	if got["cluster"] != "prod" || got["scope"] != "node" || got["team"] != "infra" {
+		t.Fatalf("node attrs = %v", got)
+	}
+	if _, ok := got["k8s.pod.name"]; ok {
+		t.Fatalf("node pipeline must have defaults off: %v", got)
+	}
+}
+
+func TestLoadConfigPipelineValidation(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "attrs.yaml")
+	if err := os.WriteFile(path, []byte("pipelines:\n  bogus:\n    static: {a: b}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadConfig(path); err == nil {
+		t.Fatal("unknown pipeline name must error")
 	}
 }
 

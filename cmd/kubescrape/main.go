@@ -50,13 +50,29 @@ func run() error {
 		maxWait    = flag.Duration("wait-timeout", 5*time.Second, "default and maximum time a container lookup blocks waiting for metadata to appear (shorten per request with ?wait=)")
 		cacheTTL   = flag.Duration("cache-ttl", 5*time.Minute, "how long metadata of deleted pods and replaced container IDs stays resolvable")
 		resync     = flag.Duration("resync", 0, "informer resync period (0 disables periodic resync; the watch stream keeps the cache current)")
+		logLevel   = flag.String("log-level", "info", "log level: debug, info, warn, error")
+		logFormat  = flag.String("log-format", "text", "log format: text or json")
 	)
 	flag.Parse()
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	log := slog.New(slog.NewTextHandler(os.Stderr, nil))
+	var lvl slog.Level
+	if err := lvl.UnmarshalText([]byte(*logLevel)); err != nil {
+		return fmt.Errorf("log level %q: %w", *logLevel, err)
+	}
+	opts := &slog.HandlerOptions{Level: lvl}
+	var handler slog.Handler
+	switch *logFormat {
+	case "text":
+		handler = slog.NewTextHandler(os.Stderr, opts)
+	case "json":
+		handler = slog.NewJSONHandler(os.Stderr, opts)
+	default:
+		return fmt.Errorf("log format %q (want text or json)", *logFormat)
+	}
+	log := slog.New(handler)
 	slog.SetDefault(log)
 	// client-go logs through klog; route it into the same slog handler.
 	klog.SetSlogLogger(log)

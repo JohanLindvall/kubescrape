@@ -23,9 +23,10 @@ var (
 	JobGVR        = batchv1.SchemeGroupVersion.WithResource("jobs")
 	CronJobGVR    = batchv1.SchemeGroupVersion.WithResource("cronjobs")
 	NamespaceGVR  = corev1.SchemeGroupVersion.WithResource("namespaces")
+	NodeGVR       = corev1.SchemeGroupVersion.WithResource("nodes")
 
 	AllGVRs = []schema.GroupVersionResource{
-		ReplicaSetGVR, DeploymentGVR, JobGVR, CronJobGVR, NamespaceGVR,
+		ReplicaSetGVR, DeploymentGVR, JobGVR, CronJobGVR, NamespaceGVR, NodeGVR,
 	}
 )
 
@@ -111,7 +112,16 @@ func (r *Resolver) Resolve(namespace string, refs []metav1.OwnerReference) []kub
 
 // Namespace returns the metadata of a namespace, or nil if unknown.
 func (r *Resolver) Namespace(name string) *kubemeta.ObjectMeta {
-	m := r.get(NamespaceGVR, "", name)
+	return r.clusterScoped(NamespaceGVR, name)
+}
+
+// Node returns the metadata of a node, or nil if unknown.
+func (r *Resolver) Node(name string) *kubemeta.ObjectMeta {
+	return r.clusterScoped(NodeGVR, name)
+}
+
+func (r *Resolver) clusterScoped(gvr schema.GroupVersionResource, name string) *kubemeta.ObjectMeta {
+	m := r.get(gvr, "", name)
 	if m == nil {
 		return nil
 	}

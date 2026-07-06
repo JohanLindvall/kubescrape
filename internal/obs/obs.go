@@ -38,6 +38,10 @@ var (
 		Name: "kubescrape_log_rotations_total",
 		Help: "Log file rotations and truncations handled.",
 	})
+	LogEnriched = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "kubescrape_log_enriched_total",
+		Help: "Log records by the enrichment strategy that matched (json, logfmt, pattern, none).",
+	}, []string{"format"})
 )
 
 // Scrape pipeline (agent).

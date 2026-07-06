@@ -1,6 +1,7 @@
 package logenrich
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -76,6 +77,28 @@ func TestApplyGUIDTraceID(t *testing.T) {
 	Apply(lr, `{"request_id":"0af76519-16cd-43dd-8448-eb211c80319c","msg":"x"}`)
 	if lr.TraceID().IsEmpty() {
 		t.Error("dashed GUID trace id not parsed")
+	}
+}
+
+func TestApplyStacktraceDeduped(t *testing.T) {
+	// Pattern-parsed exceptions: the trace is a verbatim slice of the body
+	// and must not be duplicated as an attribute.
+	lr := newRecord()
+	line := "Unhandled exception. System.InvalidOperationException: boom\n   at Acme.Worker.Run() in /src/Worker.cs:line 42"
+	Apply(lr, line)
+	if v, ok := lr.Attributes().Get("exception.stacktrace"); ok {
+		t.Errorf("duplicated stacktrace attribute: %q", v.Str())
+	}
+	if v, _ := lr.Attributes().Get("exception.type"); v.Str() != "System.InvalidOperationException" {
+		t.Errorf("exception.type = %q", v.Str())
+	}
+
+	// JSON-carried exceptions: the body is the raw JSON, the unescaped trace
+	// is new information and stays.
+	lr = newRecord()
+	Apply(lr, `{"@l":"Error","@m":"boom","@x":"System.InvalidOperationException: boom\r\n   at Acme.Worker.Run()"}`)
+	if v, ok := lr.Attributes().Get("exception.stacktrace"); !ok || !strings.Contains(v.Str(), "at Acme.Worker.Run()") {
+		t.Errorf("JSON stacktrace attribute missing or wrong: %q", v.Str())
 	}
 }
 

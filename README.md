@@ -222,7 +222,11 @@ the first-class trace fields (GUID-style request IDs included), and template
 / source-context / service / exception details become record attributes
 (`log.template`, `log.source_context`, `exception.type`, …). The body is
 never modified, and lines without recognizable metadata are exported
-unchanged.
+unchanged. Stack traces recognized in plain text are *not* duplicated into
+`exception.stacktrace` — they already are the body; JSON-carried traces are,
+since there the body is the raw JSON. Hit rates per strategy are exported as
+`kubescrape_log_enriched_total{format="json|logfmt|pattern|none"}` on the
+agent's `/metrics`.
 
 **Metrics.** Each `-scrape-interval` the agent fetches
 `GET /v1/nodes/$NODE/targets` and scrapes every target concurrently
@@ -291,9 +295,9 @@ explicit level found in the message wins over the journal priority.
 
 **Self-observability.** `-listen` (default `:8081`) serves `GET /healthz`,
 `GET /readyz` and `GET /metrics` with the agent's internal metrics: log
-entries/bytes/rotations and export failures, scrapes and scrape duration/
-samples per pipeline, exports per signal and outcome, metadata lookups,
-journal entries and subprocess restarts.
+entries/bytes/rotations and export failures, enrichment hit rates per
+format, scrapes and scrape duration/samples per pipeline, exports per signal
+and outcome, metadata lookups, journal entries and subprocess restarts.
 
 **Metric filtering and splitting.** `-metrics-config` points at a YAML file
 with two sections. `pipelines` holds ordered keep/drop rules per pipeline

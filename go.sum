@@ -1,5 +1,5 @@
-github.com/JohanLindvall/enrich v0.0.2 h1:mdJVl4yefvO5BsuGr7Yqx+fxcyY1rm+sxUh5mcmGeJc=
-github.com/JohanLindvall/enrich v0.0.2/go.mod h1:DTwPRYwtgPU1ao0X5eBLthmXwms8LOdQiD9gCeRpQaA=
+github.com/JohanLindvall/enrich v0.0.4 h1:1iQkoQ6Lr+Pp/F7djlykhp08a+A71VHJj99qsX1UpG4=
+github.com/JohanLindvall/enrich v0.0.4/go.mod h1:DTwPRYwtgPU1ao0X5eBLthmXwms8LOdQiD9gCeRpQaA=
 github.com/JohanLindvall/lightning v0.0.53 h1:5lwBmRyK5tEf6Jrdsoy8awgrphacWGwEsRZh5eVNanM=
 github.com/JohanLindvall/lightning v0.0.53/go.mod h1:uGs5O1o/2myfnC3XsItHKPCIKDpVae66exbxNpSq430=
 github.com/JohanLindvall/logfmt v0.0.4 h1:/o5H00Bz0q93YNgMRbOymoNKpWRNqiL2ixMu3HFUN7I=

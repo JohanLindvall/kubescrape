@@ -3,7 +3,7 @@ module github.com/JohanLindvall/kubescrape
 go 1.26.3
 
 require (
-	github.com/JohanLindvall/enrich v0.0.2
+	github.com/JohanLindvall/enrich v0.0.4
 	github.com/JohanLindvall/multiline v0.0.1
 	github.com/fsnotify/fsnotify v1.10.1
 	github.com/prometheus/client_golang v1.23.2

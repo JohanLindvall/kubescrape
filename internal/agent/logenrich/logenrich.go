@@ -11,6 +11,8 @@ import (
 	"github.com/JohanLindvall/enrich"
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/plog"
+
+	"github.com/JohanLindvall/kubescrape/internal/obs"
 )
 
 // Apply enriches one log record from its line. Fields already set on the
@@ -23,6 +25,11 @@ func Apply(lr plog.LogRecord, line string) {
 	if e == nil {
 		return
 	}
+	format := e.Format
+	if format == enrich.FormatNone {
+		format = "none"
+	}
+	obs.LogEnriched.WithLabelValues(format).Inc()
 
 	if !e.Time.IsZero() {
 		lr.SetTimestamp(pcommon.NewTimestampFromTime(e.Time))
@@ -55,7 +62,13 @@ func Apply(lr plog.LogRecord, line string) {
 	putStr("azure.event_category", e.EventCategory)
 	putStr("exception.type", e.ExceptionType)
 	putStr("exception.message", e.ExceptionMessage)
-	putStr("exception.stacktrace", e.ExceptionStackTrace)
+	// Pattern-parsed stack traces are verbatim slices of the body (which can
+	// be a megabyte-scale multiline entry) — exporting them again as an
+	// attribute doubles the record. JSON-carried traces stay: there the body
+	// is the raw JSON, not the readable trace.
+	if e.Format != enrich.FormatPattern {
+		putStr("exception.stacktrace", e.ExceptionStackTrace)
+	}
 }
 
 // parseHexID decodes an ID of want bytes from hex, tolerating dashes

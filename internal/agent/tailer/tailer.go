@@ -182,37 +182,92 @@ type file struct {
 	// (nil when Multiline is off; data is the first line's timestamp).
 	criStage *cri.Aggregator[int64]
 	traces   *multiline.Aggregator[time.Time]
-	// Per pipeline key ("<containerID>/<stream>"): lastEnd is the end offset
-	// of the newest physical line fed; runStart is the start offset of the
-	// oldest physical line not yet emitted by stage 1; fifo holds the offset
-	// ranges of logical lines buffered in stage 2.
-	lastEnd  map[string]int64
-	runStart map[string]int64
-	fifo     map[string][]logItem
+	// ledger tracks which byte offsets are safe to checkpoint and how a group
+	// buffered across a rotation is recovered.
+	ledger
 
 	resource    pcommon.Resource // resolved metadata, valid when resolved
 	resolved    bool
 	nextMetaTry time.Time
 	gone        bool
-
-	// gen counts rename rotations across which the pipeline was carried (a
-	// multi-line group straddled the boundary). It bumps in reopen and stamps
-	// emitted entries so flush commits only current-inode offsets.
-	gen int
-	// carried names the rotated-away files whose unexported tails are buffered
-	// in the pipeline as part of a straddling group, oldest first; nil when
-	// none. A group that straddles several rotations accumulates one entry per
-	// rotation. Checkpointed so a crash before the group exports can re-read
-	// every tail.
-	carried []rotatedPrefix
-	// carriedFed reports whether the carried prefixes are present in the
-	// current pipeline incarnation. False after a fresh pipeline (rewind or
-	// restart) with carried still set, meaning the prefixes must be re-read
-	// before the new inode is consumed.
-	carriedFed bool
 }
 
 type logItem struct{ start, end int64 }
+
+// ledger is the byte-offset durability accounting for one file's two-stage
+// pipeline: it decides how far the checkpoint may safely advance and how a
+// multi-line group buffered across a rename rotation survives a crash. It is
+// embedded in file (fields/methods are used unqualified as f.fifo, f.gen,
+// f.watermark(), ...).
+//
+// # Offsets within one inode
+//
+// A physical line spans [start, end) bytes. lastEnd, runStart and fifo are
+// keyed by pipeline key ("<containerID>/<stream>"): lastEnd is the end of the
+// newest physical line fed; runStart is the start of the oldest physical line
+// not yet emitted by stage 1 (the CRI P/F rejoiner); fifo holds the [start,end)
+// ranges of the logical lines currently buffered in stage 2 (the trace joiner).
+// The multiline package hands the emitter only the *first* line's payload, so
+// an emitted group's end offset is recovered by popping Entry.Lines items off
+// its fifo and taking the last one's end. watermark() is the lowest offset
+// still buffered anywhere; the checkpoint must never advance past it, or a
+// crash would skip un-exported lines.
+//
+// # Across a rename rotation (multi-line join + crash safety)
+//
+// When a group straddles a rename rotation the pipeline is carried into the new
+// inode instead of being flushed (see reopen). Two problems follow, solved by
+// gen and carried:
+//
+//   - gen (rotation generation) stamps every emitted entry; flush commits only
+//     offsets of entries whose gen == the file's current gen. This keeps the
+//     pre-rotation lines already drained from the old inode — which carry
+//     old-inode offsets — from advancing the new inode's checkpoint. reanchor()
+//     zeroes the offsets still buffered from the old inode at the moment of the
+//     switch, so watermark reflects the new inode's origin.
+//   - carried lists the rotated-away files (oldest first, one per hop) whose
+//     tails are buffered but not yet exported; it is checkpointed. On restart
+//     or after a rewind (carriedFed == false) those tails are re-read from the
+//     rotated files before the new inode, reconstructing the group with no
+//     loss. carried clears once the group exports (watermark shows nothing
+//     buffered).
+type ledger struct {
+	lastEnd  map[string]int64
+	runStart map[string]int64
+	fifo     map[string][]logItem
+
+	gen        int
+	carried    []rotatedPrefix
+	carriedFed bool
+}
+
+// reset clears the per-inode offset maps for a fresh pipeline incarnation. It
+// leaves gen and carried untouched (they persist across a carried rotation);
+// carriedFed goes false so any carried tails are re-read before the new inode.
+func (l *ledger) reset() {
+	l.carriedFed = false
+	l.lastEnd = make(map[string]int64)
+	l.runStart = make(map[string]int64)
+	l.fifo = make(map[string][]logItem)
+}
+
+// reanchor resets the offsets still buffered in the pipeline to the new inode's
+// origin, so watermark holds the new inode's checkpoint at 0 until the carried
+// group completes and the (new-inode) offset of its final line becomes the
+// commit point.
+func (l *ledger) reanchor() {
+	for k := range l.lastEnd {
+		l.lastEnd[k] = 0
+	}
+	for k := range l.runStart {
+		l.runStart[k] = 0
+	}
+	for _, items := range l.fifo {
+		for i := range items {
+			items[i] = logItem{}
+		}
+	}
+}
 
 // rotatedPrefix is the unexported tail of a rotated-away file, held until the
 // straddling multi-line group completes and exports.
@@ -260,17 +315,17 @@ func (fp fingerprint) matches(f io.ReaderAt) bool {
 
 // watermark returns the lowest offset still buffered in the pipeline;
 // committed offsets must not advance past it.
-func (f *file) watermark() (int64, bool) {
+func (l *ledger) watermark() (int64, bool) {
 	wm := int64(-1)
 	lower := func(v int64) {
 		if wm < 0 || v < wm {
 			wm = v
 		}
 	}
-	for _, v := range f.runStart {
+	for _, v := range l.runStart {
 		lower(v)
 	}
-	for _, items := range f.fifo {
+	for _, items := range l.fifo {
 		if len(items) > 0 {
 			lower(items[0].start)
 		}
@@ -553,10 +608,7 @@ func (t *Tailer) scanDir(checkpoints map[string]checkpoint, initial bool) {
 // carried prefix (if any) is no longer present in the fresh pipeline and must
 // be re-read before the current inode is consumed.
 func (t *Tailer) newPipeline(f *file) {
-	f.carriedFed = false
-	f.lastEnd = make(map[string]int64)
-	f.runStart = make(map[string]int64)
-	f.fifo = make(map[string][]logItem)
+	f.reset()
 
 	if t.cfg.Multiline {
 		f.traces = multiline.New(func(_ context.Context, e multiline.Entry[time.Time]) error {
@@ -873,7 +925,7 @@ func (t *Tailer) reopen(ctx context.Context, f *file, renamed bool) {
 		// accumulates one entry per hop, all re-readable on crash.
 		f.carried = append(f.carried, rotatedPrefix{inode: f.inode, fp: f.fp, from: f.committed, to: f.readPos})
 		f.carriedFed = true // the prefixes are already live in the pipeline
-		t.reanchorPipeline(f)
+		f.reanchor()
 		f.gen++
 	} else {
 		t.stopPipeline(ctx, f)
@@ -889,24 +941,6 @@ func (t *Tailer) reopen(ctx context.Context, f *file, renamed bool) {
 	f.dirty = true
 }
 
-// reanchorPipeline resets the offsets of data buffered in the pipeline to the
-// new inode's origin, so watermark holds the new inode's checkpoint at 0 until
-// the carried group completes and the (new-inode) offset of its final line
-// becomes the commit point.
-func (t *Tailer) reanchorPipeline(f *file) {
-	for k := range f.lastEnd {
-		f.lastEnd[k] = 0
-	}
-	for k := range f.runStart {
-		f.runStart[k] = 0
-	}
-	for _, items := range f.fifo {
-		for i := range items {
-			items[i] = logItem{}
-		}
-	}
-}
-
 // feedCarriedPrefix re-reads the rotated-away files' tails (the unexported
 // prefix of a straddling group) and feeds them, oldest first, into the fresh
 // pipeline so the group reconstructs before the new inode's continuation is
@@ -920,7 +954,7 @@ func (t *Tailer) feedCarriedPrefix(ctx context.Context, f *file) {
 	defer func() {
 		// Re-anchor + bump so the new inode is consumed at a fresh generation,
 		// matching reopen's carry path.
-		t.reanchorPipeline(f)
+		f.reanchor()
 		f.gen++
 	}()
 	for i := range f.carried {

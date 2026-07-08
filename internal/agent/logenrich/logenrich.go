@@ -15,12 +15,24 @@ import (
 	"github.com/JohanLindvall/kubescrape/internal/obs"
 )
 
-// Apply enriches one log record from its line. Fields already set on the
-// record are overridden only when the line carries the corresponding
-// metadata: a parsed timestamp replaces the record timestamp (the ingest
-// time belongs in ObservedTimestamp), and an explicit level replaces the
-// severity. enrich's severity numbers are the OTLP severity numbers.
+// Apply enriches one log record from an explicit line (the tailer/journald
+// path). A parsed timestamp replaces the record timestamp (the CRI/journal
+// ingest time belongs in ObservedTimestamp) and an explicit level replaces
+// the severity; enrich's severity numbers are the OTLP severity numbers.
 func Apply(lr plog.LogRecord, line string) {
+	apply(lr, line, true)
+}
+
+// ApplyBody enriches one log record from its own body (the OTLP ingest path).
+// Unlike Apply it never overwrites a timestamp, severity, trace/span ID or
+// attribute the sender already set — the sender is authoritative.
+func ApplyBody(lr plog.LogRecord) {
+	apply(lr, lr.Body().Str(), false)
+}
+
+// apply parses line and promotes its metadata onto lr. When overwrite is
+// false, only fields the record leaves unset are filled.
+func apply(lr plog.LogRecord, line string, overwrite bool) {
 	e := enrich.Parse(line)
 	if e == nil {
 		return
@@ -31,25 +43,35 @@ func Apply(lr plog.LogRecord, line string) {
 	}
 	obs.LogEnriched.WithLabelValues(format).Inc()
 
-	if !e.Time.IsZero() {
+	if !e.Time.IsZero() && (overwrite || lr.Timestamp() == 0) {
 		lr.SetTimestamp(pcommon.NewTimestampFromTime(e.Time))
 	}
-	if e.SeverityNumber > 0 {
+	if e.SeverityNumber > 0 && (overwrite || lr.SeverityNumber() == plog.SeverityNumberUnspecified) {
 		lr.SetSeverityNumber(plog.SeverityNumber(e.SeverityNumber))
 		lr.SetSeverityText(e.Severity)
 	}
-	if id, ok := parseHexID(e.TraceID, 16); ok {
-		lr.SetTraceID(pcommon.TraceID(id))
+	if (overwrite || lr.TraceID().IsEmpty()) && e.TraceID != "" {
+		if id, ok := parseHexID(e.TraceID, 16); ok {
+			lr.SetTraceID(pcommon.TraceID(id))
+		}
 	}
-	if id, ok := parseHexID(e.SpanID, 8); ok {
-		lr.SetSpanID(pcommon.SpanID([8]byte(id[:8])))
+	if (overwrite || lr.SpanID().IsEmpty()) && e.SpanID != "" {
+		if id, ok := parseHexID(e.SpanID, 8); ok {
+			lr.SetSpanID(pcommon.SpanID([8]byte(id[:8])))
+		}
 	}
 
 	attrs := lr.Attributes()
 	putStr := func(key, val string) {
-		if val != "" {
-			attrs.PutStr(key, val)
+		if val == "" {
+			return
 		}
+		if !overwrite {
+			if _, exists := attrs.Get(key); exists {
+				return
+			}
+		}
+		attrs.PutStr(key, val)
 	}
 	putStr("log.template", e.Template)
 	putStr("log.template_hash", e.TemplateHash)

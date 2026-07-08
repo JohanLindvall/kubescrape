@@ -22,8 +22,11 @@ import (
 
 	"github.com/JohanLindvall/kubescrape/internal/agent/attrs"
 	"github.com/JohanLindvall/kubescrape/internal/agent/journald"
+	"github.com/JohanLindvall/kubescrape/internal/agent/logattrs"
 	"github.com/JohanLindvall/kubescrape/internal/agent/metaclient"
 	"github.com/JohanLindvall/kubescrape/internal/agent/otlpexport"
+	"github.com/JohanLindvall/kubescrape/internal/agent/otlpingest"
+	"github.com/JohanLindvall/kubescrape/internal/agent/positions"
 	"github.com/JohanLindvall/kubescrape/internal/agent/promscrape"
 	"github.com/JohanLindvall/kubescrape/internal/agent/tailer"
 	"github.com/JohanLindvall/kubescrape/internal/obs"
@@ -56,7 +59,8 @@ func run() error {
 		logFormat = flag.String("log-format", "text", "log format: text or json")
 
 		logDir          = flag.String("log-dir", "/var/log/containers", "directory of containerd log symlinks")
-		checkpointFile  = flag.String("checkpoint-file", "", "file persisting log read offsets across restarts (empty disables)")
+		positionsFile   = flag.String("positions-file", "", "single file persisting BOTH log offsets and the journald cursor across restarts (overrides -checkpoint-file and -journald-cursor-file when set)")
+		checkpointFile  = flag.String("checkpoint-file", "", "file persisting log read offsets across restarts (empty disables; ignored when -positions-file is set)")
 		logsBatch       = flag.Int("logs-batch-size", 1024, "flush logs after this many entries")
 		logsFlush       = flag.Duration("logs-flush-interval", 2*time.Second, "flush logs at least this often")
 		maxEntryBytes   = flag.Int("logs-max-entry-bytes", 1<<20, "truncate assembled log entries beyond this size")
@@ -64,6 +68,7 @@ func run() error {
 		multilineWait   = flag.Duration("logs-multiline-timeout", time.Second, "flush incomplete multi-line groups after this long")
 		excludeNs       = flag.String("logs-exclude-namespaces", "", "comma-separated namespaces whose container logs are not tailed")
 		logsEnrich      = flag.Bool("logs-enrich", true, "parse per-line metadata (timestamp, severity, trace/span IDs, exception details) into the OTLP record fields via github.com/JohanLindvall/enrich")
+		logAttrsConfig  = flag.String("log-attributes-config", "", "YAML file mapping JSON/logfmt keys in the log line to resource/scope/log attributes (applies to -logs and -journald)")
 		logsWatch       = flag.Bool("logs-watch", true, "use file events (fsnotify) to trigger reads and discovery; polling remains the fallback")
 		logsPoll        = flag.Duration("logs-poll-interval", 500*time.Millisecond, "fallback sweep interval for the log tailer")
 		logsFingerprint = flag.Int("logs-fingerprint-bytes", 1024, "file-head hash length used with the inode as file identity (negative = inode only)")
@@ -102,6 +107,16 @@ func run() error {
 		cadvisorOn = flag.Bool("cadvisor", true, "scrape <kubelet-endpoint>/metrics/cadvisor (per-container metrics)")
 		rollupsOn  = flag.Bool("cadvisor-rollups", true, "include cadvisor rollup series: cgroups above pod level and pod-level rows of container-scoped families")
 		nodeOn     = flag.Bool("node-metrics", true, "scrape <kubelet-endpoint>/metrics (kubelet/node metrics)")
+
+		// OTLP ingest (apps push telemetry to the local agent for enrichment).
+		ingestOn      = flag.Bool("ingest", false, "receive pushed OTLP logs/metrics and enrich them with k8s attributes before forwarding")
+		ingestGRPC    = flag.String("ingest-grpc-endpoint", ":4317", "listen address for pushed OTLP/gRPC (empty disables)")
+		ingestHTTP    = flag.String("ingest-http-endpoint", ":4318", "listen address for pushed OTLP/HTTP protobuf on /v1/logs and /v1/metrics (empty disables)")
+		ingestWait    = flag.Duration("ingest-metadata-wait", 0, "how long an ingest metadata lookup may block for not-yet-known objects")
+		ingestMetrics = flag.String("ingest-metrics-mode", "auto", "how pushed metrics resolve their object: resource (id on the resource), datapoint (id on each point, split into per-object resources), or auto")
+		ingestCidKeys = flag.String("ingest-container-id-keys", "container.id,k8s.container.id", "comma-separated attribute keys inspected for a container id")
+		ingestUIDKeys = flag.String("ingest-pod-uid-keys", "k8s.pod.uid", "comma-separated attribute keys inspected for a pod uid")
+		ingestEnrich  = flag.Bool("ingest-logs-enrich", true, "parse pushed log-record bodies for timestamp/severity/trace as -logs-enrich does, filling only fields the sender left unset")
 	)
 	flag.Parse()
 
@@ -121,6 +136,25 @@ func run() error {
 	attrBuilders, err := buildAttrs(*attrsConfig, *attrsStatic, *attrsEnable, *attrsDisable)
 	if err != nil {
 		return fmt.Errorf("resource attributes: %w", err)
+	}
+
+	// A single positions file, when configured, backs both the log tailer's
+	// offsets and the journald cursor.
+	var posStore *positions.Store
+	if *positionsFile != "" {
+		posStore = positions.Open(*positionsFile)
+	}
+
+	// Optional log-line attribute lifting, shared by the tailer and journald.
+	var logAttrs *logattrs.Extractor
+	if *logAttrsConfig != "" {
+		cfg, err := logattrs.LoadConfig(*logAttrsConfig)
+		if err != nil {
+			return fmt.Errorf("log attributes config: %w", err)
+		}
+		if logAttrs, err = logattrs.New(cfg); err != nil {
+			return fmt.Errorf("log attributes config: %w", err)
+		}
 	}
 
 	// The metadata client's HTTP timeout must exceed the server-side wait.
@@ -158,6 +192,8 @@ func run() error {
 		tl := tailer.New(tailer.Config{
 			Dir:               *logDir,
 			CheckpointFile:    *checkpointFile,
+			Positions:         posStore,
+			LogAttrs:          logAttrs,
 			Watch:             *logsWatch,
 			PollInterval:      *logsPoll,
 			FingerprintBytes:  *logsFingerprint,
@@ -189,10 +225,12 @@ func run() error {
 			Dir:           *journaldDir,
 			Units:         splitList(*journaldUnits),
 			CursorFile:    *journaldCursor,
+			Positions:     posStore,
 			BatchSize:     *journaldBatch,
 			FlushInterval: *journaldFlush,
 			MaxEntryBytes: *maxEntryBytes,
 			Enrich:        *journaldEnrich,
+			LogAttrs:      logAttrs,
 			Attrs:         attrBuilders.Journal,
 			NodeInfo:      nodeInfo,
 			Exporter:      exporter,
@@ -204,6 +242,41 @@ func run() error {
 			jr.Run(ctx)
 		}()
 		log.Info("journald reader started", "path", *journaldPath, "units", *journaldUnits, "cursor", *journaldCursor)
+	}
+
+	if *ingestOn {
+		mode := otlpingest.MetricsMode(*ingestMetrics)
+		switch mode {
+		case otlpingest.MetricsResource, otlpingest.MetricsDatapoint, otlpingest.MetricsAuto:
+		default:
+			return fmt.Errorf("invalid -ingest-metrics-mode %q (want resource, datapoint or auto)", *ingestMetrics)
+		}
+		enr := otlpingest.NewEnricher(otlpingest.Config{
+			ContainerIDKeys: splitList(*ingestCidKeys),
+			PodUIDKeys:      splitList(*ingestUIDKeys),
+			Wait:            *ingestWait,
+			MetricsMode:     mode,
+			EnrichLines:     *ingestEnrich,
+			Attrs:           attrBuilders.Ingest,
+			NodeInfo:        nodeInfo,
+			Meta:            meta,
+			Logger:          log,
+		})
+		srv := otlpingest.NewServer(otlpingest.ServerConfig{
+			GRPCAddr: *ingestGRPC,
+			HTTPAddr: *ingestHTTP,
+			Enricher: enr,
+			Exporter: exporter,
+			Logger:   log,
+		})
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := srv.Run(ctx); err != nil {
+				log.Error("otlp ingest server failed", "error", err)
+			}
+		}()
+		log.Info("otlp ingest started", "grpc", *ingestGRPC, "http", *ingestHTTP, "metricsMode", *ingestMetrics)
 	}
 
 	kubeletScrapes := *kubeletEndpoint != "" && (*cadvisorOn || *nodeOn)

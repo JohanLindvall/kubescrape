@@ -269,6 +269,20 @@ func (s *Store) GetPodByName(namespace, name string) (NodePod, bool) {
 	return NodePod{Pod: rec.pod, OwnerRefs: rec.ownerRefs}, true
 }
 
+// GetPodByUID returns the pod with the given UID. Deleted pods stay
+// resolvable until their tombstone expires (as with the container endpoint),
+// so pushed telemetry that lags a pod deletion still attributes correctly.
+func (s *Store) GetPodByUID(uid string) (NodePod, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	rec := s.pods[types.UID(uid)]
+	if rec == nil || (!rec.expireAt.IsZero() && s.now().After(rec.expireAt)) {
+		return NodePod{}, false
+	}
+	return NodePod{Pod: rec.pod, OwnerRefs: rec.ownerRefs}, true
+}
+
 // PodsOnNode returns all live pods scheduled on the given node.
 func (s *Store) PodsOnNode(node string) []NodePod {
 	s.mu.RLock()

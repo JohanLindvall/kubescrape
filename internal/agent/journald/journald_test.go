@@ -10,6 +10,8 @@ import (
 	"time"
 
 	"go.opentelemetry.io/collector/pdata/plog"
+
+	"github.com/JohanLindvall/kubescrape/internal/agent/logattrs"
 )
 
 // captureExporter records exported batches; Fail(n) makes the next n
@@ -229,6 +231,41 @@ func TestJournalEnrich(t *testing.T) {
 	}
 	if !lr.Timestamp().AsTime().Equal(time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)) {
 		t.Errorf("timestamp = %v; want the line's own", lr.Timestamp().AsTime())
+	}
+}
+
+func TestJournalLogAttrs(t *testing.T) {
+	// Structured JSON messages carry a tenant; as a resource attribute it
+	// splits records into separate resources even within one unit.
+	path := stubJournalctl(t,
+		[]string{"a.service", "a.service"},
+		[]string{`{\"tenant\":\"x\",\"req\":\"r1\"}`, `{\"tenant\":\"y\",\"req\":\"r2\"}`})
+	ex, err := logattrs.New(&logattrs.Config{Rules: []logattrs.Rule{
+		{Key: "tenant", Attribute: "tenant.id", Target: logattrs.TargetResource},
+		{Key: "req", Target: logattrs.TargetLog},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	exp, _ := startReader(t, Config{Path: path, LogAttrs: ex})
+	waitFor(t, "2 records", func() bool { return len(exp.records()) == 2 })
+
+	exp.mu.Lock()
+	defer exp.mu.Unlock()
+	tenants := map[string]int{}
+	for _, ld := range exp.batches {
+		for i := 0; i < ld.ResourceLogs().Len(); i++ {
+			rl := ld.ResourceLogs().At(i)
+			v, _ := rl.Resource().Attributes().Get("tenant.id")
+			n := 0
+			for j := 0; j < rl.ScopeLogs().Len(); j++ {
+				n += rl.ScopeLogs().At(j).LogRecords().Len()
+			}
+			tenants[v.Str()] += n
+		}
+	}
+	if tenants["x"] != 1 || tenants["y"] != 1 {
+		t.Errorf("tenant record counts = %+v (want one resource each)", tenants)
 	}
 }
 

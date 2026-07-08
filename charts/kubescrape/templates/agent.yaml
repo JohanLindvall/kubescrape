@@ -53,6 +53,18 @@ data:
   metrics.yaml: |
     {{- toYaml .Values.agent.metricsConfig | nindent 4 }}
 {{- end }}
+{{- if .Values.agent.logAttributesConfig }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Release.Name }}-agent-logattrs
+  namespace: {{ .Release.Namespace }}
+  labels: {{ include "kubescrape.labels" . | nindent 4 }}
+data:
+  logattrs.yaml: |
+    {{- toYaml .Values.agent.logAttributesConfig | nindent 4 }}
+{{- end }}
 ---
 apiVersion: apps/v1
 kind: DaemonSet
@@ -73,6 +85,7 @@ spec:
       annotations:
         checksum/attrs: {{ .Values.agent.attrsConfig | toYaml | sha256sum }}
         checksum/metrics: {{ .Values.agent.metricsConfig | toYaml | sha256sum }}
+        checksum/logattrs: {{ .Values.agent.logAttributesConfig | toYaml | sha256sum }}
     spec:
       serviceAccountName: {{ .Release.Name }}-agent
       tolerations:
@@ -109,8 +122,15 @@ spec:
             - -kubelet-endpoint={{ . }}
             {{- end }}
             - -kubelet-insecure-tls={{ .Values.agent.kubeletInsecureTLS }}
+            {{- if .Values.agent.positionsFile }}
+            - -positions-file={{ .Values.agent.positionsFile }}
+            {{- else }}
             - -checkpoint-file={{ .Values.agent.checkpointFile }}
+            {{- end }}
             - -logs-enrich={{ .Values.agent.logsEnrich }}
+            {{- if .Values.agent.logAttributesConfig }}
+            - -log-attributes-config=/etc/kubescrape/logattrs/logattrs.yaml
+            {{- end }}
             - -logs-watch={{ .Values.agent.logsWatch }}
             - -logs-poll-interval={{ .Values.agent.logsPollInterval }}
             - -logs-fingerprint-bytes={{ .Values.agent.logsFingerprintBytes }}
@@ -132,6 +152,19 @@ spec:
             - -journald-batch-size={{ .Values.agent.journald.batchSize }}
             - -journald-flush-interval={{ .Values.agent.journald.flushInterval }}
             - -journald-enrich={{ .Values.agent.journald.enrich }}
+            {{- end }}
+            {{- if .Values.agent.ingest.enabled }}
+            - -ingest
+            - -ingest-grpc-endpoint={{ .Values.agent.ingest.grpcEndpoint }}
+            - -ingest-http-endpoint={{ .Values.agent.ingest.httpEndpoint }}
+            - -ingest-metrics-mode={{ .Values.agent.ingest.metricsMode }}
+            - -ingest-logs-enrich={{ .Values.agent.ingest.logsEnrich }}
+            {{- with .Values.agent.ingest.containerIdKeys }}
+            - -ingest-container-id-keys={{ join "," . }}
+            {{- end }}
+            {{- with .Values.agent.ingest.podUidKeys }}
+            - -ingest-pod-uid-keys={{ join "," . }}
+            {{- end }}
             {{- end }}
             - -log-level={{ .Values.logLevel }}
             - -log-format={{ .Values.logFormat }}
@@ -167,11 +200,26 @@ spec:
           ports:
             - name: http
               containerPort: {{ (split ":" .Values.agent.listen)._1 | int }}
+            {{- if .Values.agent.ingest.enabled }}
+            {{- with .Values.agent.ingest.grpcEndpoint }}
+            - name: otlp-grpc
+              containerPort: {{ (split ":" .)._1 | int }}
+            {{- end }}
+            {{- with .Values.agent.ingest.httpEndpoint }}
+            - name: otlp-http
+              containerPort: {{ (split ":" .)._1 | int }}
+            {{- end }}
+            {{- end }}
           readinessProbe:
             httpGet: {path: /readyz, port: http}
           livenessProbe:
             httpGet: {path: /healthz, port: http}
           volumeMounts:
+            {{- if .Values.agent.logAttributesConfig }}
+            - name: logattrs-config
+              mountPath: /etc/kubescrape/logattrs
+              readOnly: true
+            {{- end }}
             - name: varlog
               mountPath: /var/log
               readOnly: true
@@ -217,6 +265,11 @@ spec:
         - name: metrics-config
           configMap:
             name: {{ .Release.Name }}-agent-metrics
+        {{- end }}
+        {{- if .Values.agent.logAttributesConfig }}
+        - name: logattrs-config
+          configMap:
+            name: {{ .Release.Name }}-agent-logattrs
         {{- end }}
         {{- if .Values.agent.otlp.bearerTokenSecret.name }}
         - name: otlp-token

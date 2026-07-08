@@ -139,6 +139,12 @@ Full metadata for one pod looked up by name (the agent uses this to
 attribute cadvisor series). Deleted pods stay resolvable until their
 tombstone expires or a new pod with the same name replaces them.
 
+### `GET /v1/pod-uids/{uid}`
+
+Full metadata for one pod looked up by UID (the agent's OTLP-ingest enricher
+uses this to attribute pushed telemetry that carries a `k8s.pod.uid`).
+Tombstone-aware like the other pod lookups.
+
 ### `GET /healthz`, `GET /readyz`, `GET /metrics`
 
 Liveness is always `200`; readiness turns `200` once the initial informer
@@ -228,6 +234,36 @@ since there the body is the raw JSON. Hit rates per strategy are exported as
 `kubescrape_log_enriched_total{format="json|logfmt|pattern|none"}` on the
 agent's `/metrics`.
 
+**Log attributes from the line** (`-log-attributes-config`). Beyond the fixed
+set enrich recognizes, a YAML config lifts *arbitrary* keys out of a
+structured line onto the record. Each rule names a JSON or logfmt `key`
+(dotted keys descend into nested JSON), the `attribute` to set (defaults to
+the key), and a `target` of `resource`, `scope`, or `log` (default):
+
+```yaml
+rules:
+  - key: tenant             # {"tenant":"acme",...} or tenant=acme
+    attribute: tenant.id
+    target: resource        # groups records with different tenants into
+                            # separate OTLP resources
+  - key: http.status_code   # nested JSON path
+    target: log
+```
+
+JSON is scanned once for all rules with the
+[lightning](https://github.com/JohanLindvall/lightning) toolkit and logfmt
+with the [logfmt](https://github.com/JohanLindvall/logfmt) reader — no
+`encoding/json` in the hot path. Values keep their type (numbers → int/double,
+booleans → bool). Because resource and scope attributes determine an OTLP
+record's grouping, records whose line-derived resource/scope attributes differ
+are split into distinct `ResourceLogs`/`ScopeLogs`. The same config applies to
+journald messages.
+
+**Positions.** `-checkpoint-file` persists log offsets; `-journald-cursor-file`
+persists the journald cursor. `-positions-file` unifies both into a single
+JSON file (one thing to mount), so a restart resumes every input from one
+place; it overrides the two separate flags when set.
+
 **Metrics.** Each `-scrape-interval` the agent fetches
 `GET /v1/nodes/$NODE/targets` and scrapes every target concurrently
 (bounded by `-scrape-concurrency`). The exposition body is **stream-parsed**
@@ -288,10 +324,28 @@ to specific units, `-journald-dir` reads a non-default journal directory,
 (default true) applies the same per-line enrichment as `-logs-enrich`; an
 explicit level found in the message wins over the journal priority.
 
+**OTLP ingest** (opt-in `-ingest`). Applications on the node can push their
+own OTLP to the local agent, which enriches it with Kubernetes attributes and
+forwards it — closing the gap that otherwise needs a separate collector with
+the k8sattributes processor. The agent listens for OTLP/gRPC
+(`-ingest-grpc-endpoint`, default `:4317`) and OTLP/HTTP protobuf
+(`-ingest-http-endpoint`, default `:4318`, on `/v1/logs` and `/v1/metrics`).
+For each pushed resource it finds a container ID (`container.id` /
+`k8s.container.id`, keys configurable) or a pod UID (`k8s.pod.uid`), resolves
+the metadata service (a container ID pins the exact incarnation), and merges
+the k8s resource attributes **without overwriting anything the sender already
+set**. Pushed log bodies additionally run the same line enrichment as the
+tailer (`-ingest-logs-enrich`, filling only fields the sender left unset).
+Metrics resolve per `-ingest-metrics-mode`: `resource` (the ID is a resource
+attribute), `datapoint` (the ID is a per-point label; points are split into
+one resource per object, as a kube-state-metrics-style stream needs), or
+`auto` (resource when every resource carries an ID, else split). Enrichment
+outcomes count into `kubescrape_ingest_resources_total{outcome}`.
+
 **Pipeline toggles.** Each pipeline is individually switchable: `-logs`,
 `-metrics` (annotation-discovered targets), `-cadvisor` and `-node-metrics`
 (all default true; the kubelet scrapes additionally require
-`-kubelet-endpoint`), plus the opt-in `-journald`.
+`-kubelet-endpoint`), plus the opt-in `-journald` and `-ingest`.
 
 **Self-observability.** `-listen` (default `:8081`) serves `GET /healthz`,
 `GET /readyz` and `GET /metrics` with the agent's internal metrics: log
@@ -335,7 +389,7 @@ and applies uniformly to log and metric resources:
     container.image: '{{ with .Container }}{{ .Image }}{{ end }}'
     k8s.node.zone: '{{ with .Node }}{{ index .Labels "topology.kubernetes.io/zone" }}{{ end }}'
     service.name: '{{ with .Pod }}{{ coalesce (index .Labels "gp/service-name") (index .Labels "app.kubernetes.io/name") .Name }}{{ end }}'
-  pipelines:                # overrides for logs|targets|cadvisor|node|journal
+  pipelines:                # overrides for logs|targets|cadvisor|node|journal|ingest
     node:
       attributes:
         service.name: kubelet

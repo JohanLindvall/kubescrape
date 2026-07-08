@@ -14,6 +14,8 @@ import (
 	"go.opentelemetry.io/collector/pdata/plog"
 
 	"github.com/JohanLindvall/kubescrape/internal/agent/attrs"
+	"github.com/JohanLindvall/kubescrape/internal/agent/logattrs"
+	"github.com/JohanLindvall/kubescrape/internal/agent/positions"
 	"github.com/JohanLindvall/kubescrape/internal/kubemeta"
 )
 
@@ -213,6 +215,94 @@ func TestEnrichedRecords(t *testing.T) {
 	}
 	if lr.SeverityNumber() != plog.SeverityNumberUnspecified {
 		t.Errorf("plain-line severity = %v", lr.SeverityNumber())
+	}
+}
+
+func TestLogAttrsGrouping(t *testing.T) {
+	dir := t.TempDir()
+	exp := &fakeExporter{}
+	tl := newTestTailer(dir, "", exp)
+	ex, err := logattrs.New(&logattrs.Config{Rules: []logattrs.Rule{
+		{Key: "tenant", Attribute: "tenant.id", Target: logattrs.TargetResource},
+		{Key: "req", Target: logattrs.TargetLog},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tl.cfg.LogAttrs = ex
+	stop := startTailer(t, tl)
+	defer stop()
+
+	// Two lines for tenant A, one for tenant B, one non-structured — the
+	// tenant attribute is a resource attribute, so A and B must land in
+	// separate ResourceLogs.
+	writeLog(t, dir,
+		`2026-07-05T10:00:00Z stdout F {"tenant":"a","req":"r1"}`,
+		`2026-07-05T10:00:01Z stdout F {"tenant":"b","req":"r2"}`,
+		`2026-07-05T10:00:02Z stdout F {"tenant":"a","req":"r3"}`,
+		`2026-07-05T10:00:03Z stdout F plain line`,
+	)
+	waitFor(t, func() bool { return len(exp.get()) == 4 }, "4 records")
+
+	exp.mu.Lock()
+	tenantCounts := map[string]int{}
+	for _, ld := range exp.full {
+		for i := 0; i < ld.ResourceLogs().Len(); i++ {
+			rl := ld.ResourceLogs().At(i)
+			tenant := "<none>"
+			if v, ok := rl.Resource().Attributes().Get("tenant.id"); ok {
+				tenant = v.Str()
+			}
+			n := 0
+			for j := 0; j < rl.ScopeLogs().Len(); j++ {
+				n += rl.ScopeLogs().At(j).LogRecords().Len()
+			}
+			tenantCounts[tenant] += n
+		}
+	}
+	exp.mu.Unlock() // record() below locks exp.mu itself
+	if tenantCounts["a"] != 2 || tenantCounts["b"] != 1 || tenantCounts["<none>"] != 1 {
+		t.Errorf("tenant record counts = %+v", tenantCounts)
+	}
+	// The log-target attribute lands on the record.
+	lr, ok := exp.record(0)
+	if !ok {
+		t.Fatal("record 0 missing")
+	}
+	if v, ok := lr.Attributes().Get("req"); !ok || v.Str() != "r1" {
+		t.Errorf("req attribute = %v", v.AsRaw())
+	}
+}
+
+func TestPositionsStoreResume(t *testing.T) {
+	dir := t.TempDir()
+	posPath := filepath.Join(dir, "positions.json")
+	exp := &fakeExporter{}
+	tl := newTestTailer(dir, "", exp)
+	tl.cfg.Positions = positions.Open(posPath)
+	stop := startTailer(t, tl)
+	writeLog(t, dir,
+		"2026-07-05T10:00:00Z stdout F one",
+		"2026-07-05T10:00:01Z stdout F two",
+	)
+	waitFor(t, func() bool { return len(exp.get()) == 2 }, "2 records")
+	stop() // shutdown persists offsets to the positions store
+
+	// The positions file recorded the offset; it is not empty.
+	if len(positions.Open(posPath).Logs()) == 0 {
+		t.Fatal("positions file has no log offsets after save")
+	}
+
+	// A fresh tailer sharing the positions store resumes and does not re-read.
+	exp2 := &fakeExporter{}
+	tl2 := newTestTailer(dir, "", exp2)
+	tl2.cfg.Positions = positions.Open(posPath)
+	stop2 := startTailer(t, tl2)
+	defer stop2()
+	writeLog(t, dir, "2026-07-05T10:00:02Z stdout F three")
+	waitFor(t, func() bool { return len(exp2.get()) == 1 }, "only the new record")
+	if got := exp2.get(); got[0] != "three" {
+		t.Fatalf("resumed tailer re-read: %v", got)
 	}
 }
 

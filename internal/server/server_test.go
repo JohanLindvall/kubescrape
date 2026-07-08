@@ -182,6 +182,19 @@ func TestPodEndpoint(t *testing.T) {
 	getJSON(t, srv.URL+"/v1/pods/default/nope", http.StatusNotFound, nil)
 }
 
+func TestPodByUIDEndpoint(t *testing.T) {
+	st := store.New(time.Minute)
+	addPod(st)
+	srv := testServer(t, st, closedChan())
+
+	var pod kubemeta.Pod
+	getJSON(t, srv.URL+"/v1/pod-uids/pod-uid", http.StatusOK, &pod)
+	if pod.Name != "web-abc-xyz" || pod.UID != "pod-uid" || len(pod.Owners) != 1 || pod.NamespaceMetadata == nil {
+		t.Fatalf("pod = %+v", pod)
+	}
+	getJSON(t, srv.URL+"/v1/pod-uids/nope", http.StatusNotFound, nil)
+}
+
 func TestNodeMetadataEndpoint(t *testing.T) {
 	st := store.New(time.Minute)
 	srv := testServer(t, st, closedChan())

@@ -25,7 +25,9 @@ import (
 	"go.opentelemetry.io/collector/pdata/plog"
 
 	"github.com/JohanLindvall/kubescrape/internal/agent/attrs"
+	"github.com/JohanLindvall/kubescrape/internal/agent/logattrs"
 	"github.com/JohanLindvall/kubescrape/internal/agent/logenrich"
+	"github.com/JohanLindvall/kubescrape/internal/agent/positions"
 	"github.com/JohanLindvall/kubescrape/internal/obs"
 )
 
@@ -48,6 +50,9 @@ type Config struct {
 	// CursorFile persists the last exported cursor across restarts (""
 	// disables persistence; every start then begins at the tail).
 	CursorFile string
+	// Positions, when set, persists the cursor to the shared positions store
+	// instead of CursorFile (which is then ignored).
+	Positions *positions.Store
 
 	BatchSize     int           // flush after this many entries
 	FlushInterval time.Duration // flush at least this often
@@ -58,6 +63,9 @@ type Config struct {
 	// and attributes; an explicit level in the message wins over the journal
 	// priority.
 	Enrich bool
+	// LogAttrs lifts configured keys out of structured messages onto the
+	// record as resource/scope/log attributes (nil = none).
+	LogAttrs *logattrs.Extractor
 
 	// Attrs builds the exported resource attributes (nil = defaults).
 	Attrs *attrs.Builder
@@ -294,17 +302,24 @@ func (r *Reader) convert() plog.Logs {
 	ld := plog.NewLogs()
 	scopes := make(map[string]plog.ScopeLogs, 4)
 	for _, e := range r.batch {
-		key := e.unit
-		if key == "" {
-			key = e.ident
+		var extracted logattrs.Result
+		if r.cfg.LogAttrs != nil {
+			extracted = r.cfg.LogAttrs.Extract(e.body)
 		}
+		unit := e.unit
+		if unit == "" {
+			unit = e.ident
+		}
+		// Line-derived resource/scope attributes split records into their own
+		// resources, so they participate in the grouping key.
+		key := unit + "\x01" + logattrs.Key(extracted.Resource) + "\x01" + logattrs.Key(extracted.Scope)
 		sl, ok := scopes[key]
 		if !ok {
 			rl := ld.ResourceLogs().AppendEmpty()
 			res := rl.Resource()
 			// Identity attributes go in before Build so templates and the
 			// filter see them.
-			name := key
+			name := unit
 			if name == "" {
 				name = "journald"
 			}
@@ -317,7 +332,9 @@ func (r *Reader) convert() plog.Logs {
 				actx.Node = r.cfg.NodeInfo()
 			}
 			r.cfg.Attrs.Build(res, actx)
+			logattrs.Put(res.Attributes(), extracted.Resource)
 			sl = rl.ScopeLogs().AppendEmpty()
+			logattrs.Put(sl.Scope().Attributes(), extracted.Scope)
 			scopes[key] = sl
 		}
 		lr := sl.LogRecords().AppendEmpty()
@@ -332,6 +349,7 @@ func (r *Reader) convert() plog.Logs {
 		if e.pid != 0 {
 			lr.Attributes().PutInt("process.pid", e.pid)
 		}
+		logattrs.Put(lr.Attributes(), extracted.Log)
 		if r.cfg.Enrich {
 			logenrich.Apply(lr, e.body)
 		}
@@ -393,6 +411,9 @@ func fieldString(fields map[string]any, key string) string {
 }
 
 func (r *Reader) loadCursor() string {
+	if r.cfg.Positions != nil {
+		return r.cfg.Positions.JournalCursor()
+	}
 	if r.cfg.CursorFile == "" {
 		return ""
 	}
@@ -408,6 +429,12 @@ func (r *Reader) loadCursor() string {
 
 // saveCursor persists the committed cursor atomically (write + rename).
 func (r *Reader) saveCursor() {
+	if r.cfg.Positions != nil {
+		if err := r.cfg.Positions.SetJournalCursor(r.cursor); err != nil {
+			r.log.Warn("writing journal cursor to positions file", "error", err)
+		}
+		return
+	}
 	if r.cfg.CursorFile == "" {
 		return
 	}

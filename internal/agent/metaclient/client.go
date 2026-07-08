@@ -52,6 +52,16 @@ func (c *Client) PodByName(ctx context.Context, namespace, name string) (*kubeme
 	return &pod, nil
 }
 
+// PodByUID fetches metadata for one pod by UID.
+func (c *Client) PodByUID(ctx context.Context, uid string) (*kubemeta.Pod, error) {
+	u := fmt.Sprintf("%s/v1/pod-uids/%s", c.base, url.PathEscape(uid))
+	var pod kubemeta.Pod
+	if err := c.getJSON(ctx, u, &pod); err != nil {
+		return nil, err
+	}
+	return &pod, nil
+}
+
 // Node fetches the labels and annotations of a node.
 func (c *Client) Node(ctx context.Context, name string) (*kubemeta.NodeMetadata, error) {
 	u := fmt.Sprintf("%s/v1/nodes/%s/metadata", c.base, url.PathEscape(name))

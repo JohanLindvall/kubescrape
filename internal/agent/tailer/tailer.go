@@ -29,6 +29,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"hash/fnv"
 	"io"
 	"log/slog"
@@ -46,8 +47,10 @@ import (
 	"go.opentelemetry.io/collector/pdata/plog"
 
 	"github.com/JohanLindvall/kubescrape/internal/agent/attrs"
+	"github.com/JohanLindvall/kubescrape/internal/agent/logattrs"
 	"github.com/JohanLindvall/kubescrape/internal/agent/logenrich"
 	"github.com/JohanLindvall/kubescrape/internal/agent/metaclient"
+	"github.com/JohanLindvall/kubescrape/internal/agent/positions"
 	"github.com/JohanLindvall/kubescrape/internal/kubemeta"
 	"github.com/JohanLindvall/kubescrape/internal/obs"
 )
@@ -66,7 +69,10 @@ type MetadataSource interface {
 // Config configures the tailer.
 type Config struct {
 	Dir            string // /var/log/containers
-	CheckpointFile string // "" disables checkpointing
+	CheckpointFile string // "" disables the standalone checkpoint file
+	// Positions, when set, persists offsets to the shared positions store
+	// instead of CheckpointFile (which is then ignored).
+	Positions *positions.Store
 	// Watch uses fsnotify events to trigger reads and discovery; the poll
 	// ticker remains as a fallback for missed events.
 	Watch bool
@@ -87,6 +93,9 @@ type Config struct {
 	// trace/span IDs, exception details, ...) into the record's OTLP fields
 	// and attributes.
 	Enrich bool
+	// LogAttrs lifts configured keys out of structured lines onto the record
+	// as resource/scope/log attributes (nil = none).
+	LogAttrs *logattrs.Extractor
 	// MultilineTimeout flushes buffered fragment runs and multi-line groups
 	// that have not completed within this duration.
 	MultilineTimeout time.Duration
@@ -344,7 +353,7 @@ func (t *Tailer) housekeeping(ctx context.Context) {
 	if len(t.batch) > 0 && time.Since(t.lastFlush) >= t.cfg.FlushInterval {
 		t.flush(ctx)
 	}
-	if t.cfg.CheckpointFile != "" && time.Since(t.lastCheckpoint) >= 10*time.Second {
+	if (t.cfg.Positions != nil || t.cfg.CheckpointFile != "") && time.Since(t.lastCheckpoint) >= 10*time.Second {
 		t.saveCheckpoints()
 	}
 }
@@ -796,6 +805,30 @@ func (t *Tailer) drop(f *file) {
 	t.unwatchTarget(f)
 }
 
+// logGrouper places records into ResourceLogs/ScopeLogs keyed by (file,
+// resource attributes, scope attributes), so line-derived resource/scope
+// attributes split records into the right resources. Without line attributes
+// there is one scope per file, matching the previous behavior.
+type logGrouper struct {
+	ld     plog.Logs
+	scopes map[string]plog.ScopeLogs
+}
+
+func (g *logGrouper) scope(f *file, resAttrs, scopeAttrs []logattrs.Attr) plog.ScopeLogs {
+	key := fmt.Sprintf("%p\x01%s\x01%s", f, logattrs.Key(resAttrs), logattrs.Key(scopeAttrs))
+	if sl, ok := g.scopes[key]; ok {
+		return sl
+	}
+	rl := g.ld.ResourceLogs().AppendEmpty()
+	f.resource.CopyTo(rl.Resource())
+	logattrs.Put(rl.Resource().Attributes(), resAttrs)
+	sl := rl.ScopeLogs().AppendEmpty()
+	sl.Scope().SetName("github.com/JohanLindvall/kubescrape/agent/tailer")
+	logattrs.Put(sl.Scope().Attributes(), scopeAttrs)
+	g.scopes[key] = sl
+	return sl
+}
+
 // flush exports the batch. On success offsets are committed; on failure the
 // files are rewound to the committed offsets so the data is re-read.
 func (t *Tailer) flush(ctx context.Context) {
@@ -804,20 +837,17 @@ func (t *Tailer) flush(ctx context.Context) {
 		return
 	}
 	ld := plog.NewLogs()
-	var (
-		cur        *file
-		slr        plog.ScopeLogs
-		maxOffsets = make(map[*file]int64)
-	)
+	g := &logGrouper{ld: ld, scopes: map[string]plog.ScopeLogs{}}
+	maxOffsets := make(map[*file]int64)
 	now := pcommon.NewTimestampFromTime(time.Now())
 	for _, e := range t.batch {
-		if e.file != cur {
-			cur = e.file
-			rl := ld.ResourceLogs().AppendEmpty()
-			cur.resource.CopyTo(rl.Resource())
-			slr = rl.ScopeLogs().AppendEmpty()
-			slr.Scope().SetName("github.com/JohanLindvall/kubescrape/agent/tailer")
+		// Extract configured line attributes; resource/scope ones drive the
+		// grouping so records land under the right ResourceLogs/ScopeLogs.
+		var extracted logattrs.Result
+		if t.cfg.LogAttrs != nil {
+			extracted = t.cfg.LogAttrs.Extract(e.body)
 		}
+		slr := g.scope(e.file, extracted.Resource, extracted.Scope)
 		lr := slr.LogRecords().AppendEmpty()
 		lr.SetTimestamp(pcommon.NewTimestampFromTime(e.time))
 		lr.SetObservedTimestamp(now)
@@ -831,6 +861,7 @@ func (t *Tailer) flush(ctx context.Context) {
 		if e.match != "" {
 			lr.Attributes().PutStr("log.multiline.match", e.match)
 		}
+		logattrs.Put(lr.Attributes(), extracted.Log)
 		if t.cfg.Enrich {
 			logenrich.Apply(lr, e.body)
 		}
@@ -899,14 +930,14 @@ func (t *Tailer) rewind(f *file) {
 
 // --- checkpoints ---
 
-type checkpoint struct {
-	Offset          int64  `json:"offset"`
-	Inode           uint64 `json:"inode"`
-	FingerprintLen  int64  `json:"fpLen,omitempty"`
-	FingerprintHash uint64 `json:"fpHash,omitempty"`
-}
+// checkpoint is one file's persisted position (shared shape with the
+// unified positions store).
+type checkpoint = positions.LogPos
 
 func (t *Tailer) loadCheckpoints() map[string]checkpoint {
+	if t.cfg.Positions != nil {
+		return t.cfg.Positions.Logs()
+	}
 	if t.cfg.CheckpointFile == "" {
 		return nil
 	}
@@ -924,7 +955,7 @@ func (t *Tailer) loadCheckpoints() map[string]checkpoint {
 
 func (t *Tailer) saveCheckpoints() {
 	t.lastCheckpoint = time.Now()
-	if t.cfg.CheckpointFile == "" {
+	if t.cfg.Positions == nil && t.cfg.CheckpointFile == "" {
 		return
 	}
 	cps := make(map[string]checkpoint, len(t.files))
@@ -942,6 +973,12 @@ func (t *Tailer) saveCheckpoints() {
 			Offset: f.committed, Inode: f.inode,
 			FingerprintLen: f.fp.Len, FingerprintHash: f.fp.Hash,
 		}
+	}
+	if t.cfg.Positions != nil {
+		if err := t.cfg.Positions.SetLogs(cps); err != nil {
+			t.log.Warn("writing positions file", "error", err)
+		}
+		return
 	}
 	data, err := json.Marshal(cps)
 	if err != nil {

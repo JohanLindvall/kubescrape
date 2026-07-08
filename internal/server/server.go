@@ -78,6 +78,7 @@ func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /v1/containers/{id...}", counted("/v1/containers", s.handleContainer))
 	mux.HandleFunc("GET /v1/pods/{namespace}/{name}", counted("/v1/pods", s.handlePod))
+	mux.HandleFunc("GET /v1/pod-uids/{uid}", counted("/v1/pod-uids", s.handlePodByUID))
 	mux.HandleFunc("GET /v1/nodes/{node}/targets", counted("/v1/nodes/targets", s.handleNodeTargets))
 	mux.HandleFunc("GET /v1/nodes/{node}/metadata", counted("/v1/nodes/metadata", s.handleNodeMetadata))
 	mux.Handle("GET /metrics", obs.Handler())
@@ -168,6 +169,24 @@ func (s *Server) handlePod(w http.ResponseWriter, r *http.Request) {
 	np, ok := s.store.GetPodByName(namespace, name)
 	if !ok {
 		writeError(w, http.StatusNotFound, fmt.Sprintf("pod %s/%s not found", namespace, name))
+		return
+	}
+	s.enrich(&np.Pod, np.OwnerRefs)
+	writeJSON(w, http.StatusOK, np.Pod)
+}
+
+// handlePodByUID serves GET /v1/pod-uids/{uid}: full metadata for one pod
+// looked up by UID (used by the OTLP ingest enricher to attribute pushed
+// telemetry). Deleted pods stay resolvable until their tombstone expires.
+func (s *Server) handlePodByUID(w http.ResponseWriter, r *http.Request) {
+	if !s.isReady() {
+		writeError(w, http.StatusServiceUnavailable, "informer caches not synced")
+		return
+	}
+	uid := r.PathValue("uid")
+	np, ok := s.store.GetPodByUID(uid)
+	if !ok {
+		writeError(w, http.StatusNotFound, fmt.Sprintf("pod uid %q not found", uid))
 		return
 	}
 	s.enrich(&np.Pod, np.OwnerRefs)

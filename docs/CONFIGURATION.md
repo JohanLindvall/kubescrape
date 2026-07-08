@@ -18,6 +18,8 @@ manifests live in [deploy/](../deploy).
 - [Agent: OTLP export](#agent-otlp-export)
 - [Agent: log collection](#agent-log-collection)
 - [Agent: journald](#agent-journald)
+- [Agent: log attributes](#agent-log-attributes)
+- [Agent: OTLP ingest](#agent-otlp-ingest)
 - [Agent: metrics scraping](#agent-metrics-scraping)
 - [Agent: kubelet scrapes (cadvisor, node)](#agent-kubelet-scrapes)
 - [Resource attributes (`-resource-attrs-config`)](#resource-attributes)
@@ -108,6 +110,8 @@ kubescrape-agent \
 |---|---|---|
 | `-log-dir` | `/var/log/containers` | directory of containerd log symlinks |
 | `-checkpoint-file` | — | persists committed offsets across restarts (mount a hostPath); empty disables |
+| `-positions-file` | — | single file holding BOTH log offsets and the journald cursor; overrides `-checkpoint-file` and `-journald-cursor-file` when set |
+| `-log-attributes-config` | — | YAML file lifting JSON/logfmt keys from the line onto attributes ([below](#agent-log-attributes)) |
 | `-logs-watch` | `true` | fsnotify events trigger reads and discovery; polling remains the fallback |
 | `-logs-poll-interval` | `500ms` | fallback sweep interval |
 | `-logs-fingerprint-bytes` | `1024` | file-head hash length used with the inode as file identity (guards against inode reuse and in-place rewrites); negative = inode only |
@@ -147,6 +151,50 @@ attributes).
 Delivery is at-least-once: the cursor is committed only after a successful
 export; on export failure or subprocess death, journalctl restarts from the
 committed cursor with backoff (re-reading anything in flight).
+
+## Agent: log attributes
+
+`-log-attributes-config` points at a YAML file lifting configured keys out of
+each structured log line (JSON or logfmt) onto the exported record. Applies to
+both `-logs` and `-journald`.
+
+```yaml
+rules:
+  - key: tenant             # JSON/logfmt key; dotted keys descend into JSON
+    attribute: tenant.id    # exported name (defaults to key)
+    target: resource        # resource | scope | log (default log)
+  - key: http.status_code   # nested JSON path a.b.c
+    target: log
+```
+
+JSON is scanned once for all rule paths with the
+[lightning](https://github.com/JohanLindvall/lightning) toolkit; logfmt uses
+the [logfmt](https://github.com/JohanLindvall/logfmt) reader. Values keep their
+JSON type (integers → int, fractional → double, booleans → bool). Because
+resource and scope attributes decide an OTLP record's grouping, records whose
+line-derived resource/scope attributes differ are split into separate
+`ResourceLogs`/`ScopeLogs`.
+
+## Agent: OTLP ingest
+
+Opt-in with `-ingest`: the agent receives OTLP that apps push to the node and
+enriches each resource with k8s attributes deduced from a container ID or pod
+UID already on the data, forwarding through the same exporter. Enrichment
+never overwrites an attribute the sender set.
+
+| Flag | Default | Description |
+|---|---|---|
+| `-ingest-grpc-endpoint` | `:4317` | OTLP/gRPC listen address; empty disables |
+| `-ingest-http-endpoint` | `:4318` | OTLP/HTTP protobuf listen address (`/v1/logs`, `/v1/metrics`); empty disables |
+| `-ingest-metrics-mode` | `auto` | `resource` (ID on the resource), `datapoint` (ID per point → split into per-object resources), or `auto` |
+| `-ingest-logs-enrich` | `true` | parse pushed log bodies as `-logs-enrich`, filling only fields the sender left unset |
+| `-ingest-container-id-keys` | `container.id,k8s.container.id` | attribute keys inspected for a container ID |
+| `-ingest-pod-uid-keys` | `k8s.pod.uid` | attribute keys inspected for a pod UID |
+| `-ingest-metadata-wait` | `0` | how long a lookup may block for a not-yet-known object |
+
+A container ID resolves the exact container incarnation; a pod UID resolves
+the pod. Outcomes count into `kubescrape_ingest_resources_total{outcome}`
+(`enriched` / `unresolved`).
 
 ## Agent: metrics scraping
 
@@ -217,7 +265,7 @@ attributes:
     (index .Labels "app.kubernetes.io/name") .Name }}{{ end }}
   infra: '{{ with .Pod }}{{ if regexMatch "-system$" .Namespace }}yes{{ end }}{{ end }}'
 
-# Per-pipeline overrides (logs | targets | cadvisor | node | journal); maps
+# Per-pipeline overrides (logs | targets | cadvisor | node | journal | ingest); maps
 # merge with the pipeline entry winning.
 pipelines:
   node:

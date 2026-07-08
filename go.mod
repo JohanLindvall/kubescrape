@@ -4,6 +4,8 @@ go 1.26.3
 
 require (
 	github.com/JohanLindvall/enrich v0.0.4
+	github.com/JohanLindvall/lightning v0.0.53
+	github.com/JohanLindvall/logfmt v0.0.4
 	github.com/JohanLindvall/multiline v0.0.1
 	github.com/fsnotify/fsnotify v1.10.1
 	github.com/prometheus/client_golang v1.23.2
@@ -17,8 +19,6 @@ require (
 )
 
 require (
-	github.com/JohanLindvall/lightning v0.0.53 // indirect
-	github.com/JohanLindvall/logfmt v0.0.4 // indirect
 	github.com/beorn7/perks v1.0.1 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/davecgh/go-spew v1.1.1 // indirect

@@ -97,6 +97,14 @@ var (
 	})
 )
 
+// OTLP ingest (agent).
+var (
+	Ingested = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "kubescrape_ingest_resources_total",
+		Help: "Pushed OTLP resources by enrichment outcome (enriched, unresolved).",
+	}, []string{"outcome"})
+)
+
 // HTTP server (metadata service).
 var (
 	HTTPRequests = promauto.NewCounterVec(prometheus.CounterOpts{

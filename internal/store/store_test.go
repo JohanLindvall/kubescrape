@@ -386,3 +386,28 @@ func TestOwnerRefsCarried(t *testing.T) {
 		t.Fatalf("owner refs = %+v", res.OwnerRefs)
 	}
 }
+
+func TestGetPodByUID(t *testing.T) {
+	s, clk := newTestStore(time.Minute)
+	s.UpsertPod(makePod("uid1", "pod1", "node1", "1", map[string]string{"app": "abc"}))
+
+	np, ok := s.GetPodByUID("uid1")
+	if !ok || np.Pod.Name != "pod1" {
+		t.Fatalf("GetPodByUID = %+v ok=%v", np.Pod, ok)
+	}
+	if _, ok := s.GetPodByUID("nope"); ok {
+		t.Fatal("unknown uid resolved")
+	}
+
+	// Deleted pods stay resolvable until the tombstone expires (as the
+	// container endpoint does), then disappear.
+	s.DeletePod("uid1")
+	if _, ok := s.GetPodByUID("uid1"); !ok {
+		t.Fatal("deleted pod not resolvable within TTL")
+	}
+	clk.Advance(2 * time.Minute)
+	s.Sweep()
+	if _, ok := s.GetPodByUID("uid1"); ok {
+		t.Fatal("expired pod still resolvable by uid")
+	}
+}

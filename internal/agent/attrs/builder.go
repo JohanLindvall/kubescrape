@@ -33,7 +33,7 @@ type Context struct {
 }
 
 // Pipeline names accepted under Config.Pipelines.
-var pipelineNames = []string{"logs", "targets", "cadvisor", "node", "journal"}
+var pipelineNames = []string{"logs", "targets", "cadvisor", "node", "journal", "ingest"}
 
 // Config declares how resource attributes are built. It is loaded from YAML
 // (-resource-attrs-config):
@@ -104,6 +104,7 @@ type Builders struct {
 	Cadvisor *Builder
 	Node     *Builder
 	Journal  *Builder
+	Ingest   *Builder
 }
 
 // NewBuilders compiles the per-pipeline builders from cfg (nil = defaults
@@ -113,7 +114,7 @@ func NewBuilders(cfg *Config, filter *Filter) (*Builders, error) {
 	if err != nil {
 		return nil, err
 	}
-	b := &Builders{Logs: base, Targets: base, Cadvisor: base, Node: base, Journal: base}
+	b := &Builders{Logs: base, Targets: base, Cadvisor: base, Node: base, Journal: base, Ingest: base}
 	if cfg == nil {
 		return b, nil
 	}
@@ -134,6 +135,8 @@ func NewBuilders(cfg *Config, filter *Filter) (*Builders, error) {
 			b.Node = pb
 		case "journal":
 			b.Journal = pb
+		case "ingest":
+			b.Ingest = pb
 		}
 	}
 	return b, nil

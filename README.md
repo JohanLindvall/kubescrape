@@ -206,7 +206,12 @@ discovery are event-driven (fsnotify, `-logs-watch`) with a polling fallback
 (`-logs-fingerprint-bytes`), so checkpoints never mis-resume into a
 different file after inode reuse or in-place rewrites; rename rotation
 drains the old file to EOF before switching, truncation restarts at zero,
-and removed files are drained before being dropped. It exports
+and removed files are drained before being dropped. A multi-line group (a CRI
+partial-line run or a stack trace) that **straddles a rename rotation is
+joined into one record** rather than split: the pipeline is carried across the
+inode switch, and — for zero loss across a crash mid-rotation — the
+rotated-away file is recorded in the checkpoint and re-read on restart to
+reconstruct the group. It exports
 OTLP log records with resource attributes (`k8s.pod.name`,
 `k8s.deployment.name`, `container.id`, pod/namespace labels, …) resolved via
 `GET /v1/containers/{id}` — the blocking wait covers containers whose

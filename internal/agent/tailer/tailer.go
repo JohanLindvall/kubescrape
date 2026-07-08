@@ -130,8 +130,31 @@ type Tailer struct {
 	watchRefs map[string]int // watched target directories, refcounted
 }
 
-// file state invariant: lineStart + len(pending) == readPos, where lineStart
-// is the file offset of pending[0] (the first unconsumed byte).
+// file is the tailer's state for one tracked log file under the watched
+// directory (`/var/log/containers/<pod>_<ns>_<container>-<id>.log`), i.e. the
+// current on-disk log of a single container instance. The Tailer holds one
+// per path in its files map. It is owned entirely by the single Run goroutine
+// and never shared.
+//
+// It is a streaming cursor, not a buffer of the container's history: reads
+// advance readPos, whole physical lines are handed to the two-stage pipeline,
+// and emitted entries are appended to the batch and forgotten. Only the
+// unfinished tail (pending) and the pipeline's in-flight groups are retained
+// between sweeps.
+//
+// A file's lifetime is one inode. Rotation, truncation, or a same-size
+// copytruncate is detected against inode+fp and handled by reopen, which
+// resets the byte offsets and rebuilds the pipeline — so a container whose log
+// rotates is represented by a succession of file values, each with offsets
+// local to its own inode. Offsets are therefore only meaningful within one
+// file, which is why the pipeline and its accounting live here rather than
+// globally.
+//
+// Metadata (resource) is resolved lazily from the container ID before any of
+// the file's data is consumed, so every emitted record can be attributed.
+//
+// State invariant: lineStart + len(pending) == readPos, where lineStart is the
+// file offset of pending[0] (the first byte not yet consumed as a line).
 type file struct {
 	path        string
 	containerID string
@@ -171,9 +194,31 @@ type file struct {
 	resolved    bool
 	nextMetaTry time.Time
 	gone        bool
+
+	// gen counts rename rotations across which the pipeline was carried (a
+	// multi-line group straddled the boundary). It bumps in reopen and stamps
+	// emitted entries so flush commits only current-inode offsets.
+	gen int
+	// carried names the rotated-away file whose unexported tail is buffered in
+	// the pipeline as part of a straddling group; nil when none. It is
+	// checkpointed so a crash before the group exports can re-read the tail.
+	carried *rotatedPrefix
+	// carriedFed reports whether carried's prefix is present in the current
+	// pipeline incarnation. False after a fresh pipeline (rewind or restart)
+	// with carried still set, meaning the prefix must be re-read before the
+	// new inode is consumed.
+	carriedFed bool
 }
 
 type logItem struct{ start, end int64 }
+
+// rotatedPrefix is the unexported tail of a rotated-away file, held until the
+// straddling multi-line group completes and exports.
+type rotatedPrefix struct {
+	inode    uint64
+	fp       fingerprint
+	from, to int64
+}
 
 // fingerprint identifies file content: an FNV-1a hash of the first Len
 // bytes. A zero Len means "not recorded" and matches anything.
@@ -243,6 +288,11 @@ type entry struct {
 	// offset is the file offset just after the physical line that completed
 	// this entry; committing it marks the entry as exported.
 	offset int64
+	// gen is the file's rotation generation when the entry was emitted. Only
+	// entries of the file's current generation drive its committed offset:
+	// pre-rotation entries carry offsets in the old inode's space (recoverable
+	// via file.carried) and must not advance the new inode's checkpoint.
+	gen int
 }
 
 // New creates a Tailer.
@@ -469,6 +519,17 @@ func (t *Tailer) scanDir(checkpoints map[string]checkpoint, initial bool) {
 				f.committed = cp.Offset
 				f.inode = cp.Inode
 				f.fp = fingerprint{Len: cp.FingerprintLen, Hash: cp.FingerprintHash}
+				if cp.Pending != nil {
+					// A group straddled a rotation at shutdown/crash: its
+					// prefix is re-read from the rotated file before this
+					// (new) inode is consumed. carriedFed is already false.
+					f.carried = &rotatedPrefix{
+						inode: cp.Pending.Inode,
+						fp:    fingerprint{Len: cp.Pending.FingerprintLen, Hash: cp.Pending.FingerprintHash},
+						from:  cp.Pending.From,
+						to:    cp.Pending.To,
+					}
+				}
 			} else if st, err := os.Stat(path); err == nil {
 				// Present before the agent started and no checkpoint: start
 				// at the end to avoid re-ingesting history.
@@ -485,8 +546,11 @@ func (t *Tailer) scanDir(checkpoints map[string]checkpoint, initial bool) {
 	obs.LogFiles.Set(float64(len(t.files)))
 }
 
-// newPipeline (re)creates the file's aggregation stages with empty state.
+// newPipeline (re)creates the file's aggregation stages with empty state. A
+// carried prefix (if any) is no longer present in the fresh pipeline and must
+// be re-read before the current inode is consumed.
 func (t *Tailer) newPipeline(f *file) {
+	f.carriedFed = false
 	f.lastEnd = make(map[string]int64)
 	f.runStart = make(map[string]int64)
 	f.fifo = make(map[string][]logItem)
@@ -528,6 +592,7 @@ func (t *Tailer) newPipeline(f *file) {
 // emit appends one completed entry to the batch.
 func (t *Tailer) emit(f *file, e entry) {
 	e.file = f
+	e.gen = f.gen
 	t.batch = append(t.batch, e)
 }
 
@@ -629,6 +694,12 @@ func (t *Tailer) readFile(ctx context.Context, f *file) error {
 	if err := t.ensureOpen(f); err != nil {
 		return err
 	}
+	// A group straddled a rename rotation and the pipeline was since discarded
+	// (rewind or restart): re-read the rotated-away prefix before the new inode
+	// so the group reconstructs.
+	if f.carried != nil && !f.carriedFed {
+		t.feedCarriedPrefix(ctx, f)
+	}
 
 	budget := t.cfg.MaxBytesPerSweep
 	buf := make([]byte, 64*1024)
@@ -660,18 +731,19 @@ func (t *Tailer) readFile(ctx context.Context, f *file) error {
 	switch {
 	case inodeOf(st) != f.inode:
 		// Rename rotation: the path names a new file. Drain what the old
-		// writer appended after our last read, then switch.
+		// writer appended after our last read, then switch — carrying a
+		// straddling multi-line group across the boundary.
 		t.drainFile(ctx, f)
-		t.reopen(ctx, f)
+		t.reopen(ctx, f, true)
 	case st.Size() < f.readPos:
 		// In-place truncation: the unread tail is gone; restart at zero.
 		// (Draining would read the replacement content mid-stream.)
-		t.reopen(ctx, f)
+		t.reopen(ctx, f, false)
 	case read == 0 && !st.ModTime().Equal(f.lastMod) && !f.fp.matches(f.f):
 		// The file changed without yielding new bytes past our offset and
 		// its head no longer matches: truncated and rewritten to a size at
 		// or beyond our position (same-size copytruncate). Restart.
-		t.reopen(ctx, f)
+		t.reopen(ctx, f, false)
 	}
 	f.lastMod = st.ModTime()
 	return nil
@@ -771,17 +843,38 @@ func (t *Tailer) ensureOpen(f *file) error {
 	return nil
 }
 
-// reopen drains the pipeline (the buffered data belongs to the rotated-away
-// file) and resets state; the next sweep reopens from offset 0. The file is
-// marked dirty so an event-driven loop picks the new file up immediately.
-func (t *Tailer) reopen(ctx context.Context, f *file) {
+// reopen switches to the file now at the path and resets the byte position so
+// the next sweep reads the new inode from offset 0. The file is marked dirty
+// so an event-driven loop picks it up immediately.
+//
+// On a rename rotation (renamed) where a multi-line group still straddles the
+// boundary — data remains buffered in the pipeline after the old inode was
+// drained — the pipeline is carried across instead of flushed, so the group
+// joins the pre- and post-rotation lines into one record. The buffered offsets
+// are re-anchored to the new inode's origin, the rotation generation bumps
+// (so the already-drained pre-rotation entries do not advance the new inode's
+// checkpoint), and the rotated-away file is recorded in f.carried so a crash
+// before the group exports can re-read its tail on restart.
+//
+// Otherwise (truncation, copytruncate, or a rename with nothing buffered) the
+// pipeline is flushed and reset as before — carrying makes no sense when the
+// content was replaced.
+func (t *Tailer) reopen(ctx context.Context, f *file, renamed bool) {
 	obs.LogRotations.Inc()
 	if f.f != nil {
 		_ = f.f.Close()
 		f.f = nil
 	}
-	t.stopPipeline(ctx, f)
-	t.newPipeline(f)
+	if _, buffered := f.watermark(); renamed && buffered {
+		f.carried = &rotatedPrefix{inode: f.inode, fp: f.fp, from: f.committed, to: f.readPos}
+		f.carriedFed = true // the prefix is already live in the pipeline
+		t.reanchorPipeline(f)
+		f.gen++
+	} else {
+		t.stopPipeline(ctx, f)
+		t.newPipeline(f)
+		f.carried = nil
+	}
 	f.inode = 0
 	f.fp = fingerprint{}
 	f.committed = 0
@@ -789,6 +882,123 @@ func (t *Tailer) reopen(ctx context.Context, f *file) {
 	f.lineStart = 0
 	f.pending = f.pending[:0]
 	f.dirty = true
+}
+
+// reanchorPipeline resets the offsets of data buffered in the pipeline to the
+// new inode's origin, so watermark holds the new inode's checkpoint at 0 until
+// the carried group completes and the (new-inode) offset of its final line
+// becomes the commit point.
+func (t *Tailer) reanchorPipeline(f *file) {
+	for k := range f.lastEnd {
+		f.lastEnd[k] = 0
+	}
+	for k := range f.runStart {
+		f.runStart[k] = 0
+	}
+	for _, items := range f.fifo {
+		for i := range items {
+			items[i] = logItem{}
+		}
+	}
+}
+
+// feedCarriedPrefix re-reads the rotated-away file's tail (the unexported
+// prefix of a straddling group) and feeds it into the fresh pipeline, so the
+// group reconstructs before the new inode's continuation is consumed. Fed at
+// the pre-rotation generation and then re-anchored + bumped, exactly as the
+// live rotation does, so the prefix's offsets never advance the new inode's
+// checkpoint. If the rotated file can no longer be found (already deleted by
+// the runtime), the group is left to complete with only the post-rotation
+// lines — the pre-rotation data is genuinely gone from disk.
+func (t *Tailer) feedCarriedPrefix(ctx context.Context, f *file) {
+	p := f.carried
+	f.carriedFed = true
+	defer func() {
+		// Re-anchor + bump so the new inode is consumed at a fresh generation,
+		// matching reopen's carry path.
+		t.reanchorPipeline(f)
+		f.gen++
+	}()
+
+	path, ok := t.findRotated(f, p)
+	if !ok {
+		t.log.Warn("carried log prefix source not found; multi-line group across rotation may be truncated",
+			"path", f.path, "inode", p.inode)
+		return
+	}
+	fh, err := os.Open(path)
+	if err != nil {
+		t.log.Warn("opening carried log prefix", "path", path, "error", err)
+		return
+	}
+	defer func() { _ = fh.Close() }()
+	if _, err := fh.Seek(p.from, 0); err != nil {
+		t.log.Warn("seeking carried log prefix", "path", path, "error", err)
+		return
+	}
+
+	remaining := p.to - p.from
+	var carry []byte
+	pos := p.from
+	buf := make([]byte, 64*1024)
+	for remaining > 0 {
+		n, rerr := fh.Read(buf[:min(int64(len(buf)), remaining)])
+		if n > 0 {
+			remaining -= int64(n)
+			carry = append(carry, buf[:n]...)
+			for {
+				i := bytes.IndexByte(carry, '\n')
+				if i < 0 {
+					break
+				}
+				line := carry[:i]
+				start := pos
+				pos += int64(i + 1)
+				carry = carry[i+1:]
+				if len(line) > 0 {
+					t.feedLine(ctx, f, string(line), start, pos)
+				}
+			}
+		}
+		if rerr != nil {
+			break
+		}
+	}
+}
+
+// findRotated locates the rotated-away file matching p's identity in the log's
+// resolved target directory (where the runtime keeps rotated files).
+func (t *Tailer) findRotated(f *file, p *rotatedPrefix) (string, bool) {
+	dir := f.targetDir
+	if dir == "" {
+		if target, err := filepath.EvalSymlinks(f.path); err == nil {
+			dir = filepath.Dir(target)
+		}
+	}
+	if dir == "" {
+		return "", false
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return "", false
+	}
+	for _, de := range entries {
+		full := filepath.Join(dir, de.Name())
+		st, err := os.Stat(full)
+		if err != nil || inodeOf(st) != p.inode {
+			continue
+		}
+		fh, err := os.Open(full)
+		if err != nil {
+			continue
+		}
+		match := p.fp.matches(fh)
+		_ = fh.Close()
+		if match {
+			return full, true
+		}
+	}
+	return "", false
 }
 
 // drop closes a removed file, draining first the fd (bytes appended since
@@ -839,6 +1049,7 @@ func (t *Tailer) flush(ctx context.Context) {
 	ld := plog.NewLogs()
 	g := &logGrouper{ld: ld, scopes: map[string]plog.ScopeLogs{}}
 	maxOffsets := make(map[*file]int64)
+	touched := make(map[*file]struct{})
 	now := pcommon.NewTimestampFromTime(time.Now())
 	for _, e := range t.batch {
 		// Extract configured line attributes; resource/scope ones drive the
@@ -865,7 +1076,11 @@ func (t *Tailer) flush(ctx context.Context) {
 		if t.cfg.Enrich {
 			logenrich.Apply(lr, e.body)
 		}
-		if e.offset > maxOffsets[e.file] {
+		touched[e.file] = struct{}{}
+		// Only entries of the file's current rotation generation advance its
+		// checkpoint; pre-rotation entries carry old-inode offsets recoverable
+		// via file.carried and must not move the new inode's commit point.
+		if e.gen == e.file.gen && e.offset > maxOffsets[e.file] {
 			maxOffsets[e.file] = e.offset
 		}
 	}
@@ -873,19 +1088,29 @@ func (t *Tailer) flush(ctx context.Context) {
 	if err := t.exportWithRetry(ctx, ld); err != nil {
 		t.log.Error("exporting logs failed, rewinding", "records", len(t.batch), "error", err)
 		obs.LogExportFailures.Inc()
-		for f := range maxOffsets {
+		for f := range touched {
 			t.rewind(f)
 		}
 	} else {
 		obs.LogEntries.Add(float64(len(t.batch)))
-		for f, off := range maxOffsets {
-			// Never commit past lines still buffered in the pipeline; they
-			// have not been exported yet.
-			if wm, ok := f.watermark(); ok && wm < off {
-				off = wm
+		for f := range touched {
+			if off, ok := maxOffsets[f]; ok {
+				// Never commit past lines still buffered in the pipeline; they
+				// have not been exported yet.
+				if wm, wok := f.watermark(); wok && wm < off {
+					off = wm
+				}
+				if off > f.committed {
+					f.committed = off
+				}
 			}
-			if off > f.committed {
-				f.committed = off
+			// Once the carried group has fully drained (nothing buffered), its
+			// record has been exported, so the rotated-away prefix is no longer
+			// needed for recovery.
+			if f.carried != nil {
+				if _, wok := f.watermark(); !wok {
+					f.carried = nil
+				}
 			}
 		}
 	}
@@ -969,10 +1194,20 @@ func (t *Tailer) saveCheckpoints() {
 				}
 			}
 		}
-		cps[path] = checkpoint{
+		cp := checkpoint{
 			Offset: f.committed, Inode: f.inode,
 			FingerprintLen: f.fp.Len, FingerprintHash: f.fp.Hash,
 		}
+		if f.carried != nil {
+			cp.Pending = &positions.Prefix{
+				Inode:           f.carried.inode,
+				FingerprintLen:  f.carried.fp.Len,
+				FingerprintHash: f.carried.fp.Hash,
+				From:            f.carried.from,
+				To:              f.carried.to,
+			}
+		}
+		cps[path] = cp
 	}
 	if t.cfg.Positions != nil {
 		if err := t.cfg.Positions.SetLogs(cps); err != nil {

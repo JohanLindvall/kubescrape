@@ -19,6 +19,19 @@ type LogPos struct {
 	Inode           uint64 `json:"inode"`
 	FingerprintLen  int64  `json:"fpLen,omitempty"`
 	FingerprintHash uint64 `json:"fpHash,omitempty"`
+	// Pending, when set, names a rotated-away file whose tail is still part of
+	// a multi-line group buffered across the rotation. On restart it is
+	// re-read before the current file so the group reconstructs without loss.
+	Pending *Prefix `json:"pending,omitempty"`
+}
+
+// Prefix identifies the unexported tail of a rotated-away log file.
+type Prefix struct {
+	Inode           uint64 `json:"inode"`
+	FingerprintLen  int64  `json:"fpLen,omitempty"`
+	FingerprintHash uint64 `json:"fpHash,omitempty"`
+	From            int64  `json:"from"`
+	To              int64  `json:"to"`
 }
 
 // doc is the on-disk shape.

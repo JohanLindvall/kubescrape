@@ -306,6 +306,160 @@ func TestPositionsStoreResume(t *testing.T) {
 	}
 }
 
+func newMultilineTailer(dir, checkpoint string, exp *fakeExporter, pos *positions.Store) *Tailer {
+	tl := New(Config{
+		Dir:              dir,
+		CheckpointFile:   checkpoint,
+		Positions:        pos,
+		PollInterval:     20 * time.Millisecond,
+		FlushInterval:    30 * time.Millisecond,
+		BatchSize:        1000,
+		Multiline:        true,
+		MultilineTimeout: 3 * time.Second,
+		MetadataWait:     time.Second,
+		Metadata:         fakeMeta{},
+		Exporter:         exp,
+	})
+	tl.retryBackoff = 10 * time.Millisecond
+	return tl
+}
+
+func writeLines(t *testing.T, path string, lines ...string) {
+	t.Helper()
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	for _, l := range lines {
+		if _, err := fmt.Fprintln(f, l); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// panicLines builds a Go panic to split across a rename rotation: the first
+// frames go in the old inode, the rest (and the terminating line) in the new
+// inode. The CRI timestamps must be near now, or the multiline stage's
+// age-out (FlushBefore against the real clock) flushes the group before the
+// continuation arrives.
+func panicLines() (start, rest []string) {
+	ts := timeNowCRI()
+	start = []string{
+		ts + " stderr F panic: boom",
+		ts + " stderr F ",
+		ts + " stderr F goroutine 1 [running]:",
+	}
+	rest = []string{
+		ts + " stderr F main.main()",
+		ts + " stderr F \t/app/main.go:10 +0x20",
+		ts + " stdout F normal line",
+	}
+	return start, rest
+}
+
+func timeNowCRI() string { return time.Now().UTC().Format(time.RFC3339Nano) }
+
+func panicRecords(exp *fakeExporter) (joined, count int) {
+	for _, r := range exp.get() {
+		if strings.Contains(r, "panic: boom") {
+			count++
+			if strings.Contains(r, "main.go:10") {
+				joined++
+			}
+		}
+	}
+	return joined, count
+}
+
+func TestMultilineJoinsAcrossRotation(t *testing.T) {
+	dir := t.TempDir()
+	exp := &fakeExporter{}
+	tl := newMultilineTailer(dir, "", exp, nil)
+	stop := startTailer(t, tl)
+	defer stop()
+
+	path := filepath.Join(dir, logName)
+	// Warm up so the file is open (its fd survives the rename below).
+	writeLog(t, dir, timeNowCRI()+" stdout F first")
+	waitFor(t, func() bool { return len(exp.get()) == 1 }, "warmup record")
+
+	// The trace begins in the current inode, then the file is rotated away and
+	// the continuation lands in a fresh inode — the group straddles both.
+	start, rest := panicLines()
+	writeLines(t, path, start...)
+	if err := os.Rename(path, path+".1"); err != nil {
+		t.Fatal(err)
+	}
+	writeLines(t, path, rest...)
+
+	waitFor(t, func() bool { j, _ := panicRecords(exp); return j == 1 }, "trace joined across rotation")
+	if j, n := panicRecords(exp); j != 1 || n != 1 {
+		t.Fatalf("panic joined=%d count=%d (want 1/1 — not split): %q", j, n, exp.get())
+	}
+}
+
+func TestMultilineRecoversPrefixAfterRestart(t *testing.T) {
+	dir := t.TempDir()
+
+	// The rotated-away file holds the start of a trace.
+	start, rest := panicLines()
+	oldPath := filepath.Join(dir, "0.log.rotated")
+	writeLines(t, oldPath, start...)
+	oldSt, err := os.Stat(oldPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldFh, err := os.Open(oldPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldFp, err := computeFingerprint(oldFh, min(1024, oldSt.Size()))
+	_ = oldFh.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The current file holds the continuation and the terminating line.
+	writeLines(t, filepath.Join(dir, logName), rest...)
+
+	// A checkpoint as a crash would have left it: committed 0 on the new inode,
+	// with a pending prefix naming the rotated file.
+	posPath := filepath.Join(dir, "positions.json")
+	seed := positions.Open(posPath)
+	if err := seed.SetLogs(map[string]positions.LogPos{
+		filepath.Join(dir, logName): {
+			Offset: 0, Inode: 0,
+			Pending: &positions.Prefix{
+				Inode: inodeOfPath(t, oldPath), FingerprintLen: oldFp.Len, FingerprintHash: oldFp.Hash,
+				From: 0, To: oldSt.Size(),
+			},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	exp := &fakeExporter{}
+	tl := newMultilineTailer(dir, "", exp, positions.Open(posPath))
+	stop := startTailer(t, tl)
+	defer stop()
+
+	waitFor(t, func() bool { j, _ := panicRecords(exp); return j == 1 },
+		"trace reconstructed from rotated prefix + new inode")
+	if j, n := panicRecords(exp); j != 1 || n != 1 {
+		t.Fatalf("prefix recovery joined=%d count=%d (want 1/1): %q", j, n, exp.get())
+	}
+}
+
+func inodeOfPath(t *testing.T, path string) uint64 {
+	t.Helper()
+	st, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return inodeOf(st)
+}
+
 func TestExportFailureRewinds(t *testing.T) {
 	dir := t.TempDir()
 	exp := &fakeExporter{fail: 3} // one full retry cycle fails

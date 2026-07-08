@@ -57,11 +57,13 @@ agent:
     path: journalctl
     dir: ""
     units: []
-    cursorFile: /var/lib/kubescrape-agent/journal.cursor
     batchSize: 1024
     flushInterval: 2s
     # As logsEnrich; a level in the message wins over the journal priority.
     enrich: true
+    # NOTE: journald cursor persistence requires agent.positionsFile to be set
+    # (there is no standalone journald cursor file); without it, every restart
+    # begins at the journal tail.
 
   # Receive OTLP pushed by apps on the node and enrich it with k8s attributes
   # from a container.id / k8s.pod.uid on the data before forwarding.
@@ -96,7 +98,8 @@ agent:
   logsExcludeNamespaces: [monitoring]
   checkpointFile: /var/lib/kubescrape-agent/checkpoints.json
   # A single file for BOTH log offsets and the journald cursor; when set it
-  # overrides checkpointFile and journald.cursorFile.
+  # overrides checkpointFile for logs, and is the only way to persist the
+  # journald cursor.
   positionsFile: ""
   # Parse per-line metadata (timestamp, severity, trace/span IDs, exception
   # details) into the OTLP record fields (JohanLindvall/enrich).

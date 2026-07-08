@@ -12,6 +12,7 @@ import (
 	"go.opentelemetry.io/collector/pdata/plog"
 
 	"github.com/JohanLindvall/kubescrape/internal/agent/logattrs"
+	"github.com/JohanLindvall/kubescrape/internal/agent/positions"
 )
 
 // captureExporter records exported batches; Fail(n) makes the next n
@@ -142,18 +143,16 @@ func TestJournalCursorResume(t *testing.T) {
 	path := stubJournalctl(t,
 		[]string{"a.service", "a.service", "a.service"},
 		[]string{"one", "two", "three"})
-	cursorFile := filepath.Join(t.TempDir(), "cursor")
+	posPath := filepath.Join(t.TempDir(), "positions.json")
+	pos := positions.Open(posPath)
 
-	exp, cancel := startReader(t, Config{Path: path, CursorFile: cursorFile})
+	exp, cancel := startReader(t, Config{Path: path, Positions: pos})
 	waitFor(t, "first run's 3 records", func() bool { return len(exp.records()) == 3 })
-	waitFor(t, "cursor committed", func() bool {
-		data, err := os.ReadFile(cursorFile)
-		return err == nil && string(data) == "c02"
-	})
+	waitFor(t, "cursor committed", func() bool { return pos.JournalCursor() == "c02" })
 	cancel()
 
 	// A fresh reader resumes past the committed cursor: nothing re-emitted.
-	exp2, _ := startReader(t, Config{Path: path, CursorFile: cursorFile})
+	exp2, _ := startReader(t, Config{Path: path, Positions: positions.Open(posPath)})
 	time.Sleep(150 * time.Millisecond)
 	if got := exp2.records(); len(got) != 0 {
 		t.Fatalf("resumed run re-emitted %v", got)
@@ -164,12 +163,10 @@ func TestJournalExportFailureRereads(t *testing.T) {
 	path := stubJournalctl(t,
 		[]string{"a.service", "a.service"},
 		[]string{"one", "two"})
-	cursorFile := filepath.Join(t.TempDir(), "cursor")
-
 	exp := &captureExporter{failures: 1}
 	r := New(Config{
 		Path:           path,
-		CursorFile:     cursorFile,
+		Positions:      positions.Open(filepath.Join(t.TempDir(), "positions.json")),
 		Exporter:       exp,
 		FlushInterval:  20 * time.Millisecond,
 		RestartBackoff: 10 * time.Millisecond,
@@ -197,8 +194,7 @@ func TestJournalRestartAfterExit(t *testing.T) {
 	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	cursorFile := filepath.Join(dir, "cursor")
-	exp, _ := startReader(t, Config{Path: path, CursorFile: cursorFile})
+	exp, _ := startReader(t, Config{Path: path, Positions: positions.Open(filepath.Join(dir, "positions.json"))})
 
 	waitFor(t, "one record", func() bool { return len(exp.records()) == 1 })
 	// Give it a few restart cycles; the record must not repeat.

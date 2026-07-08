@@ -47,11 +47,8 @@ type Config struct {
 	// Units restricts to these systemd units (journalctl -u, repeated);
 	// empty reads everything.
 	Units []string
-	// CursorFile persists the last exported cursor across restarts (""
-	// disables persistence; every start then begins at the tail).
-	CursorFile string
-	// Positions, when set, persists the cursor to the shared positions store
-	// instead of CursorFile (which is then ignored).
+	// Positions persists the last exported cursor across restarts (nil = no
+	// persistence; every start then begins at the tail).
 	Positions *positions.Store
 
 	BatchSize     int           // flush after this many entries
@@ -414,36 +411,15 @@ func (r *Reader) loadCursor() string {
 	if r.cfg.Positions != nil {
 		return r.cfg.Positions.JournalCursor()
 	}
-	if r.cfg.CursorFile == "" {
-		return ""
-	}
-	data, err := os.ReadFile(r.cfg.CursorFile)
-	if err != nil {
-		if !os.IsNotExist(err) {
-			r.log.Warn("reading journal cursor", "file", r.cfg.CursorFile, "error", err)
-		}
-		return ""
-	}
-	return strings.TrimSpace(string(data))
+	return ""
 }
 
-// saveCursor persists the committed cursor atomically (write + rename).
+// saveCursor persists the committed cursor to the shared positions store.
 func (r *Reader) saveCursor() {
-	if r.cfg.Positions != nil {
-		if err := r.cfg.Positions.SetJournalCursor(r.cursor); err != nil {
-			r.log.Warn("writing journal cursor to positions file", "error", err)
-		}
+	if r.cfg.Positions == nil {
 		return
 	}
-	if r.cfg.CursorFile == "" {
-		return
-	}
-	tmp := r.cfg.CursorFile + ".tmp"
-	if err := os.WriteFile(tmp, []byte(r.cursor), 0o600); err != nil {
-		r.log.Warn("writing journal cursor", "file", tmp, "error", err)
-		return
-	}
-	if err := os.Rename(tmp, r.cfg.CursorFile); err != nil {
-		r.log.Warn("committing journal cursor", "file", r.cfg.CursorFile, "error", err)
+	if err := r.cfg.Positions.SetJournalCursor(r.cursor); err != nil {
+		r.log.Warn("writing journal cursor to positions file", "error", err)
 	}
 }

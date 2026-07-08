@@ -148,7 +148,6 @@ spec:
             {{- with .Values.agent.journald.units }}
             - -journald-units={{ join "," . }}
             {{- end }}
-            - -journald-cursor-file={{ .Values.agent.journald.cursorFile }}
             - -journald-batch-size={{ .Values.agent.journald.batchSize }}
             - -journald-flush-interval={{ .Values.agent.journald.flushInterval }}
             - -journald-enrich={{ .Values.agent.journald.enrich }}

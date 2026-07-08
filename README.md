@@ -267,10 +267,11 @@ record's grouping, records whose line-derived resource/scope attributes differ
 are split into distinct `ResourceLogs`/`ScopeLogs`. The same config applies to
 journald messages.
 
-**Positions.** `-checkpoint-file` persists log offsets; `-journald-cursor-file`
-persists the journald cursor. `-positions-file` unifies both into a single
-JSON file (one thing to mount), so a restart resumes every input from one
-place; it overrides the two separate flags when set.
+**Positions.** `-checkpoint-file` persists log offsets. `-positions-file`
+persists BOTH log offsets and the journald cursor in a single JSON file (one
+thing to mount), so a restart resumes every input from one place; it overrides
+`-checkpoint-file` for logs and is the only way the journald cursor is
+persisted (without it, journald begins at the tail each start).
 
 **Metrics.** Each `-scrape-interval` the agent fetches
 `GET /v1/nodes/$NODE/targets` and scrapes every target concurrently
@@ -323,7 +324,7 @@ running `journalctl -f -o json` as a subprocess and exporting the entries as
 OTLP log records, one resource per unit (`service.name` = unit without
 `.service`, `systemd.unit`, plus the configured node attributes; syslog
 priorities map to OTLP severities). Delivery is at-least-once: the cursor of
-the newest exported entry is persisted (`-journald-cursor-file`) only after a
+the newest exported entry is persisted (via `-positions-file`) only after a
 successful export, and on export failure or subprocess death journalctl is
 restarted from the committed cursor with backoff. `-journald-units` restricts
 to specific units, `-journald-dir` reads a non-default journal directory,

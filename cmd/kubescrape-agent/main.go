@@ -59,7 +59,7 @@ func run() error {
 		logFormat = flag.String("log-format", "text", "log format: text or json")
 
 		logDir          = flag.String("log-dir", "/var/log/containers", "directory of containerd log symlinks")
-		positionsFile   = flag.String("positions-file", "", "single file persisting BOTH log offsets and the journald cursor across restarts (overrides -checkpoint-file and -journald-cursor-file when set)")
+		positionsFile   = flag.String("positions-file", "", "single file persisting BOTH log offsets and the journald cursor across restarts (overrides -checkpoint-file for logs; required for journald cursor persistence)")
 		checkpointFile  = flag.String("checkpoint-file", "", "file persisting log read offsets across restarts (empty disables; ignored when -positions-file is set)")
 		logsBatch       = flag.Int("logs-batch-size", 1024, "flush logs after this many entries")
 		logsFlush       = flag.Duration("logs-flush-interval", 2*time.Second, "flush logs at least this often")
@@ -77,7 +77,6 @@ func run() error {
 		journaldPath   = flag.String("journald-path", "journalctl", "journalctl binary")
 		journaldDir    = flag.String("journald-dir", "", "journal directory (journalctl -D); empty uses the system default")
 		journaldUnits  = flag.String("journald-units", "", "comma-separated systemd units to read (empty reads everything)")
-		journaldCursor = flag.String("journald-cursor-file", "", "file persisting the journal cursor across restarts (empty disables; every start then begins at the tail)")
 		journaldEnrich = flag.Bool("journald-enrich", true, "parse per-message metadata into the OTLP record fields (as -logs-enrich); an explicit level in the message wins over the journal priority")
 		journaldBatch  = flag.Int("journald-batch-size", 1024, "flush journal entries after this many")
 		journaldFlush  = flag.Duration("journald-flush-interval", 2*time.Second, "flush journal entries at least this often")
@@ -224,7 +223,6 @@ func run() error {
 			Path:          *journaldPath,
 			Dir:           *journaldDir,
 			Units:         splitList(*journaldUnits),
-			CursorFile:    *journaldCursor,
 			Positions:     posStore,
 			BatchSize:     *journaldBatch,
 			FlushInterval: *journaldFlush,
@@ -241,7 +239,7 @@ func run() error {
 			defer wg.Done()
 			jr.Run(ctx)
 		}()
-		log.Info("journald reader started", "path", *journaldPath, "units", *journaldUnits, "cursor", *journaldCursor)
+		log.Info("journald reader started", "path", *journaldPath, "units", *journaldUnits, "positions", *positionsFile)
 	}
 
 	if *ingestOn {

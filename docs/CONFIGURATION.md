@@ -111,7 +111,7 @@ kubescrape-agent \
 |---|---|---|
 | `-log-dir` | `/var/log/containers` | directory of containerd log symlinks |
 | `-checkpoint-file` | — | persists committed offsets across restarts (mount a hostPath); empty disables |
-| `-positions-file` | — | single file holding BOTH log offsets and the journald cursor; overrides `-checkpoint-file` and `-journald-cursor-file` when set |
+| `-positions-file` | — | single file holding BOTH log offsets and the journald cursor; overrides `-checkpoint-file` for logs and is the only way to persist the journald cursor |
 | `-log-attributes-config` | — | YAML file lifting JSON/logfmt keys from the line onto attributes ([below](#agent-log-attributes)) |
 | `-logs-watch` | `true` | fsnotify events trigger reads and discovery; polling remains the fallback |
 | `-logs-poll-interval` | `500ms` | fallback sweep interval |
@@ -144,14 +144,15 @@ attributes).
 | `-journald-path` | `journalctl` | the binary — the default distroless image does **not** contain it; use an image that does |
 | `-journald-dir` | — | journal directory (`journalctl -D`); empty reads the system default |
 | `-journald-units` | — | comma-separated units; empty reads everything |
-| `-journald-cursor-file` | — | persists the journal cursor across restarts; empty means every start begins at the tail |
 | `-journald-batch-size` | `1024` | flush after this many entries |
 | `-journald-flush-interval` | `2s` | flush at least this often |
 | `-journald-enrich` | `true` | per-message enrichment as `-logs-enrich`; an explicit level in the message wins over the journal priority |
 
 Delivery is at-least-once: the cursor is committed only after a successful
 export; on export failure or subprocess death, journalctl restarts from the
-committed cursor with backoff (re-reading anything in flight).
+committed cursor with backoff (re-reading anything in flight). The cursor is
+persisted only through `-positions-file` (there is no standalone journald
+cursor file); without it, every start begins at the journal tail.
 
 ## Agent: log attributes
 

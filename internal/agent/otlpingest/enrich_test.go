@@ -3,6 +3,7 @@ package otlpingest
 import (
 	"context"
 	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -13,14 +14,14 @@ import (
 )
 
 // fakeMeta resolves a fixed set of container IDs and pod UIDs.
+// fakeMeta resolves a fixed set of IDs. It is read-only after construction so
+// it is safe to share across concurrent enrichers (see TestEnricherConcurrent).
 type fakeMeta struct {
 	containers map[string]*kubemeta.ContainerMetadata
 	pods       map[string]*kubemeta.Pod
-	calls      int
 }
 
 func (f *fakeMeta) Container(_ context.Context, id string, _ time.Duration) (*kubemeta.ContainerMetadata, error) {
-	f.calls++
 	if md, ok := f.containers[id]; ok {
 		return md, nil
 	}
@@ -28,7 +29,6 @@ func (f *fakeMeta) Container(_ context.Context, id string, _ time.Duration) (*ku
 }
 
 func (f *fakeMeta) PodByUID(_ context.Context, uid string) (*kubemeta.Pod, error) {
-	f.calls++
 	if p, ok := f.pods[uid]; ok {
 		return p, nil
 	}
@@ -223,6 +223,43 @@ func TestEnrichMetricsAutoUsesResourceWhenPresent(t *testing.T) {
 	if v, _ := out.ResourceMetrics().At(0).Resource().Attributes().Get("k8s.pod.name"); v.Str() != "web-1" {
 		t.Errorf("resource not enriched: %q", v.Str())
 	}
+}
+
+// TestEnricherConcurrent exercises the enricher from many goroutines at once —
+// the ingest gRPC/HTTP servers call it concurrently. Run it under
+// `CGO_ENABLED=1 go test -race` to check for data races; without -race it still
+// surfaces panics, deadlocks, or corrupted output.
+func TestEnricherConcurrent(t *testing.T) {
+	e := NewEnricher(Config{Meta: newMeta(), MetricsMode: MetricsAuto, EnrichLines: true})
+	const workers = 32
+	var wg sync.WaitGroup
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			for i := 0; i < 50; i++ {
+				ld := plog.NewLogs()
+				rl := ld.ResourceLogs().AppendEmpty()
+				rl.Resource().Attributes().PutStr("container.id", "cafe01")
+				rl.ScopeLogs().AppendEmpty().LogRecords().AppendEmpty().Body().SetStr(`{"level":"warn"}`)
+				e.EnrichLogs(context.Background(), ld)
+				if v, ok := rl.Resource().Attributes().Get("k8s.pod.name"); !ok || v.Str() != "web-1" {
+					t.Errorf("worker %d: enrichment = %v", w, v.AsRaw())
+					return
+				}
+
+				md := gaugeMetrics(nil,
+					map[string]any{"container.id": "cafe01"},
+					map[string]any{"k8s.pod.uid": "pod-uid-2"})
+				out := e.EnrichMetrics(context.Background(), md)
+				if got := collectPodNames(out); got["web-1"] != 1 || got["web-2"] != 1 {
+					t.Errorf("worker %d: split = %+v", w, got)
+					return
+				}
+			}
+		}(w)
+	}
+	wg.Wait()
 }
 
 func TestEnrichCustomIDKeys(t *testing.T) {

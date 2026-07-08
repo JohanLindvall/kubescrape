@@ -199,14 +199,16 @@ type file struct {
 	// multi-line group straddled the boundary). It bumps in reopen and stamps
 	// emitted entries so flush commits only current-inode offsets.
 	gen int
-	// carried names the rotated-away file whose unexported tail is buffered in
-	// the pipeline as part of a straddling group; nil when none. It is
-	// checkpointed so a crash before the group exports can re-read the tail.
-	carried *rotatedPrefix
-	// carriedFed reports whether carried's prefix is present in the current
-	// pipeline incarnation. False after a fresh pipeline (rewind or restart)
-	// with carried still set, meaning the prefix must be re-read before the
-	// new inode is consumed.
+	// carried names the rotated-away files whose unexported tails are buffered
+	// in the pipeline as part of a straddling group, oldest first; nil when
+	// none. A group that straddles several rotations accumulates one entry per
+	// rotation. Checkpointed so a crash before the group exports can re-read
+	// every tail.
+	carried []rotatedPrefix
+	// carriedFed reports whether the carried prefixes are present in the
+	// current pipeline incarnation. False after a fresh pipeline (rewind or
+	// restart) with carried still set, meaning the prefixes must be re-read
+	// before the new inode is consumed.
 	carriedFed bool
 }
 
@@ -519,16 +521,17 @@ func (t *Tailer) scanDir(checkpoints map[string]checkpoint, initial bool) {
 				f.committed = cp.Offset
 				f.inode = cp.Inode
 				f.fp = fingerprint{Len: cp.FingerprintLen, Hash: cp.FingerprintHash}
-				if cp.Pending != nil {
-					// A group straddled a rotation at shutdown/crash: its
-					// prefix is re-read from the rotated file before this
-					// (new) inode is consumed. carriedFed is already false.
-					f.carried = &rotatedPrefix{
-						inode: cp.Pending.Inode,
-						fp:    fingerprint{Len: cp.Pending.FingerprintLen, Hash: cp.Pending.FingerprintHash},
-						from:  cp.Pending.From,
-						to:    cp.Pending.To,
-					}
+				for _, pp := range cp.Pending {
+					// A group straddled one or more rotations at shutdown/crash:
+					// its prefixes are re-read from the rotated files (oldest
+					// first) before this (new) inode is consumed. carriedFed is
+					// already false.
+					f.carried = append(f.carried, rotatedPrefix{
+						inode: pp.Inode,
+						fp:    fingerprint{Len: pp.FingerprintLen, Hash: pp.FingerprintHash},
+						from:  pp.From,
+						to:    pp.To,
+					})
 				}
 			} else if st, err := os.Stat(path); err == nil {
 				// Present before the agent started and no checkpoint: start
@@ -866,8 +869,10 @@ func (t *Tailer) reopen(ctx context.Context, f *file, renamed bool) {
 		f.f = nil
 	}
 	if _, buffered := f.watermark(); renamed && buffered {
-		f.carried = &rotatedPrefix{inode: f.inode, fp: f.fp, from: f.committed, to: f.readPos}
-		f.carriedFed = true // the prefix is already live in the pipeline
+		// Append this rotation's tail; a group straddling several rotations
+		// accumulates one entry per hop, all re-readable on crash.
+		f.carried = append(f.carried, rotatedPrefix{inode: f.inode, fp: f.fp, from: f.committed, to: f.readPos})
+		f.carriedFed = true // the prefixes are already live in the pipeline
 		t.reanchorPipeline(f)
 		f.gen++
 	} else {
@@ -902,16 +907,15 @@ func (t *Tailer) reanchorPipeline(f *file) {
 	}
 }
 
-// feedCarriedPrefix re-reads the rotated-away file's tail (the unexported
-// prefix of a straddling group) and feeds it into the fresh pipeline, so the
-// group reconstructs before the new inode's continuation is consumed. Fed at
-// the pre-rotation generation and then re-anchored + bumped, exactly as the
-// live rotation does, so the prefix's offsets never advance the new inode's
-// checkpoint. If the rotated file can no longer be found (already deleted by
-// the runtime), the group is left to complete with only the post-rotation
-// lines — the pre-rotation data is genuinely gone from disk.
+// feedCarriedPrefix re-reads the rotated-away files' tails (the unexported
+// prefix of a straddling group) and feeds them, oldest first, into the fresh
+// pipeline so the group reconstructs before the new inode's continuation is
+// consumed. Fed at the pre-rotation generation and then re-anchored + bumped,
+// exactly as the live rotation does, so the prefix offsets never advance the
+// new inode's checkpoint. A prefix whose rotated file can no longer be found
+// (already deleted/compressed by the runtime) is skipped — that segment is
+// genuinely gone from disk.
 func (t *Tailer) feedCarriedPrefix(ctx context.Context, f *file) {
-	p := f.carried
 	f.carriedFed = true
 	defer func() {
 		// Re-anchor + bump so the new inode is consumed at a fresh generation,
@@ -919,7 +923,14 @@ func (t *Tailer) feedCarriedPrefix(ctx context.Context, f *file) {
 		t.reanchorPipeline(f)
 		f.gen++
 	}()
+	for i := range f.carried {
+		t.feedPrefix(ctx, f, f.carried[i])
+	}
+}
 
+// feedPrefix re-reads one rotated file's [from,to) range and feeds its lines
+// into the pipeline.
+func (t *Tailer) feedPrefix(ctx context.Context, f *file, p rotatedPrefix) {
 	path, ok := t.findRotated(f, p)
 	if !ok {
 		t.log.Warn("carried log prefix source not found; multi-line group across rotation may be truncated",
@@ -968,7 +979,7 @@ func (t *Tailer) feedCarriedPrefix(ctx context.Context, f *file) {
 
 // findRotated locates the rotated-away file matching p's identity in the log's
 // resolved target directory (where the runtime keeps rotated files).
-func (t *Tailer) findRotated(f *file, p *rotatedPrefix) (string, bool) {
+func (t *Tailer) findRotated(f *file, p rotatedPrefix) (string, bool) {
 	dir := f.targetDir
 	if dir == "" {
 		if target, err := filepath.EvalSymlinks(f.path); err == nil {
@@ -1198,14 +1209,14 @@ func (t *Tailer) saveCheckpoints() {
 			Offset: f.committed, Inode: f.inode,
 			FingerprintLen: f.fp.Len, FingerprintHash: f.fp.Hash,
 		}
-		if f.carried != nil {
-			cp.Pending = &positions.Prefix{
-				Inode:           f.carried.inode,
-				FingerprintLen:  f.carried.fp.Len,
-				FingerprintHash: f.carried.fp.Hash,
-				From:            f.carried.from,
-				To:              f.carried.to,
-			}
+		for _, c := range f.carried {
+			cp.Pending = append(cp.Pending, positions.Prefix{
+				Inode:           c.inode,
+				FingerprintLen:  c.fp.Len,
+				FingerprintHash: c.fp.Hash,
+				From:            c.from,
+				To:              c.to,
+			})
 		}
 		cps[path] = cp
 	}

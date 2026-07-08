@@ -8,17 +8,32 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/JohanLindvall/kubescrape/internal/kubemeta"
 	"github.com/JohanLindvall/kubescrape/internal/obs"
 )
 
-// Client talks to a kubescrape metadata service.
+// Client talks to a kubescrape metadata service. Responses carrying
+// Cache-Control/ETag are cached so repeat lookups (common on the concurrent
+// ingest and cadvisor paths) are served locally or revalidated cheaply with a
+// conditional GET.
 type Client struct {
 	base string
 	http *http.Client
+	now  func() time.Time
+
+	mu    sync.Mutex
+	cache map[string]cacheEntry
+}
+
+type cacheEntry struct {
+	body    []byte
+	etag    string
+	expires time.Time
 }
 
 // New creates a client for the service at base (e.g.
@@ -26,8 +41,10 @@ type Client struct {
 // the wait passed to Container.
 func New(base string, timeout time.Duration) *Client {
 	return &Client{
-		base: strings.TrimRight(base, "/"),
-		http: &http.Client{Timeout: timeout},
+		base:  strings.TrimRight(base, "/"),
+		http:  &http.Client{Timeout: timeout},
+		now:   time.Now,
+		cache: make(map[string]cacheEntry),
 	}
 }
 
@@ -86,9 +103,26 @@ func (c *Client) NodeTargets(ctx context.Context, node string) ([]kubemeta.Scrap
 }
 
 func (c *Client) getJSON(ctx context.Context, u string, v any) error {
+	key := cacheKey(u)
+
+	// Fresh cache entry: serve without a request.
+	c.mu.Lock()
+	entry, cached := c.cache[key]
+	if cached && c.now().Before(entry.expires) {
+		body := entry.body
+		c.mu.Unlock()
+		obs.MetadataRequests.WithLabelValues("cached").Inc()
+		return json.Unmarshal(body, v)
+	}
+	c.mu.Unlock()
+
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
 		return err
+	}
+	// Revalidate a stale-but-present entry cheaply.
+	if cached && entry.etag != "" {
+		req.Header.Set("If-None-Match", entry.etag)
 	}
 	resp, err := c.http.Do(req)
 	if err != nil {
@@ -99,7 +133,30 @@ func (c *Client) getJSON(ctx context.Context, u string, v any) error {
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
 		_ = resp.Body.Close()
 	}()
-	if resp.StatusCode != http.StatusOK {
+
+	switch {
+	case resp.StatusCode == http.StatusNotModified && cached:
+		// Unchanged: extend the cached entry's freshness and serve it.
+		entry.expires = c.now().Add(maxAge(resp))
+		c.mu.Lock()
+		c.cache[key] = entry
+		c.mu.Unlock()
+		obs.MetadataRequests.WithLabelValues("not_modified").Inc()
+		return json.Unmarshal(entry.body, v)
+	case resp.StatusCode == http.StatusOK:
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			obs.MetadataRequests.WithLabelValues("error").Inc()
+			return err
+		}
+		if ttl := maxAge(resp); ttl > 0 {
+			c.mu.Lock()
+			c.cache[key] = cacheEntry{body: body, etag: resp.Header.Get("ETag"), expires: c.now().Add(ttl)}
+			c.mu.Unlock()
+		}
+		obs.MetadataRequests.WithLabelValues("ok").Inc()
+		return json.Unmarshal(body, v)
+	default:
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
 		if resp.StatusCode == http.StatusNotFound {
 			obs.MetadataRequests.WithLabelValues("not_found").Inc()
@@ -108,8 +165,32 @@ func (c *Client) getJSON(ctx context.Context, u string, v any) error {
 		}
 		return &StatusError{Code: resp.StatusCode, Body: strings.TrimSpace(string(body))}
 	}
-	obs.MetadataRequests.WithLabelValues("ok").Inc()
-	return json.NewDecoder(resp.Body).Decode(v)
+}
+
+// cacheKey identifies the resource independent of transient request params
+// (the container endpoint's ?wait= must not fragment the cache).
+func cacheKey(u string) string {
+	parsed, err := url.Parse(u)
+	if err != nil {
+		return u
+	}
+	q := parsed.Query()
+	q.Del("wait")
+	parsed.RawQuery = q.Encode()
+	return parsed.String()
+}
+
+// maxAge extracts the Cache-Control max-age; zero when absent or unparseable.
+func maxAge(resp *http.Response) time.Duration {
+	for _, part := range strings.Split(resp.Header.Get("Cache-Control"), ",") {
+		part = strings.TrimSpace(part)
+		if v, ok := strings.CutPrefix(part, "max-age="); ok {
+			if secs, err := strconv.Atoi(v); err == nil && secs > 0 {
+				return time.Duration(secs) * time.Second
+			}
+		}
+	}
+	return 0
 }
 
 // StatusError is a non-200 response from the metadata service.

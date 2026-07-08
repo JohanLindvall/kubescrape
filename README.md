@@ -166,6 +166,7 @@ make build           # or: go build ./cmd/kubescrape
 | `-kubeconfig`   | —       | kubeconfig path; defaults to in-cluster config, then `$KUBECONFIG`/`~/.kube/config` |
 | `-wait-timeout` | `5s`    | default and maximum time a container lookup blocks waiting for metadata  |
 | `-cache-ttl`    | `5m`    | retention of metadata for deleted pods and replaced container IDs        |
+| `-metadata-cache-ttl` | `10s` | `Cache-Control`/`ETag` max-age on metadata responses; agents cache lookups client-side (0 disables) |
 | `-resync`       | `0`     | informer resync period (0 = watch stream only)                            |
 | `-servicemonitors` | `false` | serve targets for ServiceMonitor CRDs (see above)                      |
 | `-events`       | `false` | export Kubernetes events as OTLP log records                             |
@@ -207,11 +208,13 @@ discovery are event-driven (fsnotify, `-logs-watch`) with a polling fallback
 different file after inode reuse or in-place rewrites; rename rotation
 drains the old file to EOF before switching, truncation restarts at zero,
 and removed files are drained before being dropped. A multi-line group (a CRI
-partial-line run or a stack trace) that **straddles a rename rotation is
-joined into one record** rather than split: the pipeline is carried across the
-inode switch, and — for zero loss across a crash mid-rotation — the
-rotated-away file is recorded in the checkpoint and re-read on restart to
-reconstruct the group. It exports
+partial-line run or a stack trace) that **straddles one or more rename
+rotations is joined into one record** rather than split: the pipeline is
+carried across each inode switch, and — for zero loss across a crash
+mid-rotation — the rotated-away files are recorded in the checkpoint and
+re-read in order on restart to reconstruct the group. (This spans only
+rotations the agent observed; a rotation so fast the intermediate file is
+never read loses that segment, as with any tailer.) It exports
 OTLP log records with resource attributes (`k8s.pod.name`,
 `k8s.deployment.name`, `container.id`, pod/namespace labels, …) resolved via
 `GET /v1/containers/{id}` — the blocking wait covers containers whose

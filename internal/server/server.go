@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"hash/fnv"
 	"log/slog"
 	"net/http"
 	"strconv"
@@ -40,6 +41,10 @@ type Config struct {
 	// MaxWait is the default and maximum time a container lookup may block
 	// waiting for metadata to appear. Requests may shorten it with ?wait=.
 	MaxWait time.Duration
+	// CacheTTL sets the max-age on metadata responses (Cache-Control + ETag),
+	// letting the agent's HTTP client serve repeat lookups locally. 0 disables
+	// cache headers.
+	CacheTTL time.Duration
 	// Ready is closed once the informer caches have synced.
 	Ready  <-chan struct{}
 	Logger *slog.Logger
@@ -52,6 +57,7 @@ type Server struct {
 	monitors *servicemonitors.Index
 	resolver MetadataResolver
 	maxWait  time.Duration
+	cacheTTL time.Duration
 	ready    <-chan struct{}
 	log      *slog.Logger
 }
@@ -68,6 +74,7 @@ func New(cfg Config) *Server {
 		monitors: cfg.Monitors,
 		resolver: cfg.Resolver,
 		maxWait:  cfg.MaxWait,
+		cacheTTL: cfg.CacheTTL,
 		ready:    cfg.Ready,
 		log:      log,
 	}
@@ -150,7 +157,7 @@ func (s *Server) handleContainer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.enrich(&res.Pod, res.OwnerRefs)
-	writeJSON(w, http.StatusOK, kubemeta.ContainerMetadata{
+	s.writeCached(w, r, kubemeta.ContainerMetadata{
 		ContainerID: res.Container.ID,
 		Container:   res.Container,
 		Pod:         res.Pod,
@@ -172,7 +179,7 @@ func (s *Server) handlePod(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.enrich(&np.Pod, np.OwnerRefs)
-	writeJSON(w, http.StatusOK, np.Pod)
+	s.writeCached(w, r, np.Pod)
 }
 
 // handlePodByUID serves GET /v1/pod-uids/{uid}: full metadata for one pod
@@ -190,7 +197,7 @@ func (s *Server) handlePodByUID(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.enrich(&np.Pod, np.OwnerRefs)
-	writeJSON(w, http.StatusOK, np.Pod)
+	s.writeCached(w, r, np.Pod)
 }
 
 // handleNodeMetadata serves GET /v1/nodes/{node}/metadata: the node's
@@ -206,7 +213,7 @@ func (s *Server) handleNodeMetadata(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, fmt.Sprintf("node %q not found", node))
 		return
 	}
-	writeJSON(w, http.StatusOK, kubemeta.NodeMetadata{Name: node, ObjectMeta: *meta})
+	s.writeCached(w, r, kubemeta.NodeMetadata{Name: node, ObjectMeta: *meta})
 }
 
 // handleNodeTargets serves GET /v1/nodes/{node}/targets.
@@ -344,6 +351,39 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(v)
+}
+
+// writeCached serves a 200 metadata response with standard HTTP cache headers
+// (Cache-Control max-age + ETag), so the agent's client can serve repeat
+// lookups locally and revalidate cheaply with If-None-Match (304). With a zero
+// TTL it falls back to a plain uncached JSON write.
+func (s *Server) writeCached(w http.ResponseWriter, r *http.Request, v any) {
+	if s.cacheTTL <= 0 {
+		writeJSON(w, http.StatusOK, v)
+		return
+	}
+	body, err := json.Marshal(v)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "encoding response")
+		return
+	}
+	etag := `"` + strconv.FormatUint(fnvHash(body), 16) + `"`
+	h := w.Header()
+	h.Set("Content-Type", "application/json")
+	h.Set("Cache-Control", "max-age="+strconv.Itoa(int(s.cacheTTL.Seconds())))
+	h.Set("ETag", etag)
+	if match := r.Header.Get("If-None-Match"); match != "" && match == etag {
+		w.WriteHeader(http.StatusNotModified)
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(body)
+}
+
+func fnvHash(b []byte) uint64 {
+	h := fnv.New64a()
+	_, _ = h.Write(b)
+	return h.Sum64()
 }
 
 func writeError(w http.ResponseWriter, status int, msg string) {

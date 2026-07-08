@@ -11,12 +11,14 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"go.opentelemetry.io/collector/pdata/plog"
 
 	"github.com/JohanLindvall/kubescrape/internal/agent/attrs"
 	"github.com/JohanLindvall/kubescrape/internal/agent/logattrs"
 	"github.com/JohanLindvall/kubescrape/internal/agent/positions"
 	"github.com/JohanLindvall/kubescrape/internal/kubemeta"
+	"github.com/JohanLindvall/kubescrape/internal/obs"
 )
 
 type fakeMeta struct{}
@@ -430,10 +432,10 @@ func TestMultilineRecoversPrefixAfterRestart(t *testing.T) {
 	if err := seed.SetLogs(map[string]positions.LogPos{
 		filepath.Join(dir, logName): {
 			Offset: 0, Inode: 0,
-			Pending: &positions.Prefix{
+			Pending: []positions.Prefix{{
 				Inode: inodeOfPath(t, oldPath), FingerprintLen: oldFp.Len, FingerprintHash: oldFp.Hash,
 				From: 0, To: oldSt.Size(),
-			},
+			}},
 		},
 	}); err != nil {
 		t.Fatal(err)
@@ -448,6 +450,114 @@ func TestMultilineRecoversPrefixAfterRestart(t *testing.T) {
 		"trace reconstructed from rotated prefix + new inode")
 	if j, n := panicRecords(exp); j != 1 || n != 1 {
 		t.Fatalf("prefix recovery joined=%d count=%d (want 1/1): %q", j, n, exp.get())
+	}
+}
+
+// panicLines3 splits a Go panic into three parts for a double rename rotation.
+func panicLines3() (a, b, c []string) {
+	ts := timeNowCRI()
+	a = []string{
+		ts + " stderr F panic: boom",
+		ts + " stderr F ",
+	}
+	b = []string{
+		ts + " stderr F goroutine 1 [running]:",
+		ts + " stderr F main.main()",
+	}
+	c = []string{
+		ts + " stderr F \t/app/main.go:10 +0x20",
+		ts + " stdout F normal line",
+	}
+	return a, b, c
+}
+
+func TestMultilineJoinsAcrossDoubleRotation(t *testing.T) {
+	dir := t.TempDir()
+	exp := &fakeExporter{}
+	tl := newMultilineTailer(dir, "", exp, nil)
+	stop := startTailer(t, tl)
+	defer stop()
+
+	path := filepath.Join(dir, logName)
+	writeLog(t, dir, timeNowCRI()+" stdout F first")
+	waitFor(t, func() bool { return len(exp.get()) == 1 }, "warmup record")
+
+	// The trace straddles two rename rotations: part A in inode0, B in inode1,
+	// C (with the terminator) in inode2.
+	a, b, c := panicLines3()
+	base := testutil.ToFloat64(obs.LogRotations)
+	writeLines(t, path, a...)
+	if err := os.Rename(path, path+".1"); err != nil {
+		t.Fatal(err)
+	}
+	writeLines(t, path, b...)
+	// The join only works across rotations the tailer actually observes (it
+	// follows the symlink, not every intermediate rotated file). Wait until it
+	// has processed the first rotation, then let it read B from inode1 before
+	// rotating again, so the group genuinely spans two hops. (Reading B into
+	// the still-open group can't be observed via an emitted record, so settle
+	// briefly — well under the 3s multiline timeout.)
+	waitFor(t, func() bool { return testutil.ToFloat64(obs.LogRotations) >= base+1 }, "first rotation observed")
+	time.Sleep(300 * time.Millisecond)
+	if err := os.Rename(path, path+".2"); err != nil {
+		t.Fatal(err)
+	}
+	writeLines(t, path, c...)
+
+	waitFor(t, func() bool { j, _ := panicRecords(exp); return j == 1 }, "trace joined across two rotations")
+	if j, n := panicRecords(exp); j != 1 || n != 1 {
+		t.Fatalf("panic joined=%d count=%d (want 1/1 across two rotations): %q", j, n, exp.get())
+	}
+}
+
+func TestMultilineRecoversAcrossDoubleRotation(t *testing.T) {
+	dir := t.TempDir()
+	a, b, c := panicLines3()
+
+	// Two rotated-away files hold the first two segments of the trace.
+	old1 := filepath.Join(dir, "0.log.1")
+	old2 := filepath.Join(dir, "0.log.2")
+	writeLines(t, old1, a...)
+	writeLines(t, old2, b...)
+	writeLines(t, filepath.Join(dir, logName), c...) // current inode
+
+	pend := func(path string) positions.Prefix {
+		st, err := os.Stat(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		fh, err := os.Open(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		fp, err := computeFingerprint(fh, min(1024, st.Size()))
+		_ = fh.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+		return positions.Prefix{Inode: inodeOf(st), FingerprintLen: fp.Len, FingerprintHash: fp.Hash, From: 0, To: st.Size()}
+	}
+
+	posPath := filepath.Join(dir, "positions.json")
+	seed := positions.Open(posPath)
+	if err := seed.SetLogs(map[string]positions.LogPos{
+		filepath.Join(dir, logName): {
+			// Oldest first — the order they must be replayed.
+			Pending: []positions.Prefix{pend(old1), pend(old2)},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	exp := &fakeExporter{}
+	tl := newMultilineTailer(dir, "", exp, positions.Open(posPath))
+	stop := startTailer(t, tl)
+	defer stop()
+
+	waitFor(t, func() bool { j, _ := panicRecords(exp); return j == 1 },
+		"trace reconstructed from two rotated prefixes + new inode")
+	if j, n := panicRecords(exp); j != 1 || n != 1 {
+		t.Fatalf("double-rotation recovery joined=%d count=%d (want 1/1): %q", j, n, exp.get())
 	}
 }
 

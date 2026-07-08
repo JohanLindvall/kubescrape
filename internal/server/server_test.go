@@ -403,6 +403,62 @@ func TestNodeTargetsFromServiceMonitor(t *testing.T) {
 	}
 }
 
+func TestCacheHeadersAndRevalidation(t *testing.T) {
+	st := store.New(time.Minute)
+	addPod(st)
+	srv := httptest.NewServer(New(Config{
+		Store:    st,
+		Services: services.NewIndex(),
+		Resolver: stubResolver{},
+		MaxWait:  500 * time.Millisecond,
+		CacheTTL: 30 * time.Second,
+		Ready:    closedChan(),
+	}).Handler())
+	t.Cleanup(srv.Close)
+
+	resp, err := http.Get(srv.URL + "/v1/containers/cafe01")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status %d", resp.StatusCode)
+	}
+	if cc := resp.Header.Get("Cache-Control"); cc != "max-age=30" {
+		t.Errorf("Cache-Control = %q", cc)
+	}
+	etag := resp.Header.Get("ETag")
+	if etag == "" {
+		t.Fatal("no ETag")
+	}
+
+	// A conditional GET with the matching ETag returns 304.
+	req, _ := http.NewRequest(http.MethodGet, srv.URL+"/v1/containers/cafe01", nil)
+	req.Header.Set("If-None-Match", etag)
+	resp2, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp2.Body.Close()
+	if resp2.StatusCode != http.StatusNotModified {
+		t.Fatalf("conditional GET status = %d; want 304", resp2.StatusCode)
+	}
+}
+
+func TestNoCacheHeadersWhenDisabled(t *testing.T) {
+	st := store.New(time.Minute)
+	addPod(st)
+	srv := testServer(t, st, closedChan()) // CacheTTL 0
+	resp, err := http.Get(srv.URL + "/v1/containers/cafe01")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if cc := resp.Header.Get("Cache-Control"); cc != "" {
+		t.Errorf("Cache-Control = %q; want none", cc)
+	}
+}
+
 func TestNotReady(t *testing.T) {
 	st := store.New(time.Minute)
 	addPod(st)

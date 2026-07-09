@@ -7,6 +7,7 @@ require (
 	github.com/JohanLindvall/lightning v0.0.53
 	github.com/JohanLindvall/logfmt v0.0.4
 	github.com/JohanLindvall/multiline v0.0.1
+	github.com/bmatcuk/doublestar/v4 v4.10.0
 	github.com/fsnotify/fsnotify v1.10.1
 	github.com/prometheus/client_golang v1.23.2
 	go.opentelemetry.io/collector/pdata v1.61.0

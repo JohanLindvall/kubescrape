@@ -1,11 +1,14 @@
-// Package tailer tails containerd container log files under
-// /var/log/containers and exports the entries as OTLP logs with resource
-// attributes fetched from the kubescrape metadata service.
+// Package tailer tails log files selected by configurable sources (see
+// sources.go) and exports the entries as OTLP logs. The default source is
+// containerd container logs under /var/log/containers, whose resource
+// attributes are fetched from the kubescrape metadata service; plain sources
+// tail arbitrary files with static resource attributes. Both use the same
+// rotation, offset and multi-line machinery.
 //
 // Log lines flow through the two-stage github.com/JohanLindvall/multiline
 // pipeline: the cri stage parses the CRI format and rejoins partial-line
-// fragments, and the multiline stage joins application-level multi-line
-// entries such as stack traces.
+// fragments (containerd sources only), and the multiline stage joins
+// application-level multi-line entries such as stack traces.
 //
 // Design: a single sweep goroutine reads all files (bounded bytes per file
 // per sweep), feeds the pipeline, and batches emitted entries. Sweeps are
@@ -68,7 +71,12 @@ type MetadataSource interface {
 
 // Config configures the tailer.
 type Config struct {
-	Dir            string // /var/log/containers
+	// Dir is the containerd log directory used to build the default source
+	// when Sources is empty (/var/log/containers).
+	Dir string
+	// Sources selects which files to tail and how (containerd vs plain). Empty
+	// means a single containerd source over Dir.
+	Sources        []Source
 	CheckpointFile string // "" disables the standalone checkpoint file
 	// Positions, when set, persists offsets to the shared positions store
 	// instead of CheckpointFile (which is then ignored).
@@ -119,7 +127,9 @@ type Config struct {
 type Tailer struct {
 	cfg            Config
 	log            *slog.Logger
-	files          map[string]*file // by path
+	sources        []*compiledSource
+	scanDirs       map[string]struct{} // fixed base dirs of all include globs, watched for new files
+	files          map[string]*file    // by path
 	batch          []entry
 	lastFlush      time.Time
 	lastCheckpoint time.Time
@@ -156,8 +166,12 @@ type Tailer struct {
 // State invariant: lineStart + len(pending) == readPos, where lineStart is the
 // file offset of pending[0] (the first byte not yet consumed as a line).
 type file struct {
-	path        string
-	containerID string
+	path string
+	// source is the configured source this file belongs to; it selects
+	// containerd (CRI + metadata) vs plain handling. The rotation, offset and
+	// multi-line machinery below is identical for both.
+	source      *compiledSource
+	containerID string // set for containerd files only
 	inode       uint64
 	// fp is the identity fingerprint: a hash of the first fp.Len bytes.
 	// Together with the inode it prevents a checkpoint from resuming into a
@@ -381,9 +395,18 @@ func New(cfg Config) *Tailer {
 	if log == nil {
 		log = slog.Default()
 	}
+	sources := compileSources(cfg.Sources, cfg.Dir, cfg.Multiline)
+	scanDirs := map[string]struct{}{}
+	for _, s := range sources {
+		for _, d := range s.scanBaseDirs() {
+			scanDirs[d] = struct{}{}
+		}
+	}
 	return &Tailer{
 		cfg:          cfg,
 		log:          log,
+		sources:      sources,
+		scanDirs:     scanDirs,
 		files:        make(map[string]*file),
 		retryBackoff: time.Second,
 	}
@@ -392,16 +415,25 @@ func New(cfg Config) *Tailer {
 // Run tails until ctx is done, then flushes what it has.
 func (t *Tailer) Run(ctx context.Context) {
 	if t.cfg.Watch {
-		w, err := fsnotify.NewWatcher()
-		if err != nil {
+		if w, err := fsnotify.NewWatcher(); err != nil {
 			t.log.Warn("fsnotify unavailable, falling back to polling", "error", err)
-		} else if err := w.Add(t.cfg.Dir); err != nil {
-			t.log.Warn("watching log directory failed, falling back to polling", "dir", t.cfg.Dir, "error", err)
-			_ = w.Close()
 		} else {
-			t.watcher = w
-			t.watchRefs = make(map[string]int)
-			defer func() { _ = w.Close() }()
+			watched := 0
+			for dir := range t.scanDirs {
+				if err := w.Add(dir); err != nil {
+					t.log.Warn("watching log directory failed", "dir", dir, "error", err)
+					continue
+				}
+				watched++
+			}
+			if watched == 0 {
+				t.log.Warn("no log directories watched, falling back to polling")
+				_ = w.Close()
+			} else {
+				t.watcher = w
+				t.watchRefs = make(map[string]int)
+				defer func() { _ = w.Close() }()
+			}
 		}
 	}
 	var events <-chan fsnotify.Event
@@ -469,14 +501,15 @@ func (t *Tailer) housekeeping(ctx context.Context) {
 // should be scheduled.
 func (t *Tailer) handleEvent(ev fsnotify.Event) bool {
 	dir := filepath.Dir(ev.Name)
-	if dir == t.cfg.Dir {
-		// Symlink appeared/disappeared: rediscover immediately.
+	if _, isScanDir := t.scanDirs[dir]; isScanDir {
+		// A file (or symlink) appeared/disappeared in a discovery directory:
+		// rediscover immediately.
 		if ev.Op&(fsnotify.Create|fsnotify.Remove|fsnotify.Rename) != 0 {
 			t.scanDir(nil, false)
 			return true
 		}
-		// The log file may live directly in the watched directory (no
-		// symlink indirection): treat writes like target-dir events.
+		// The log file may live directly in the watched directory (no symlink
+		// indirection): treat writes like target-dir events.
 		if f, ok := t.files[ev.Name]; ok && ev.Op&fsnotify.Write != 0 {
 			f.dirty = true
 			return true
@@ -545,56 +578,43 @@ func parseFileName(name string) (containerID, namespace string, ok bool) {
 	return containerID, namespace, true
 }
 
-// scanDir discovers new and removed log files. checkpoints is non-nil only
-// on the initial scan.
+// scanDir discovers new and removed log files across all sources by globbing
+// their include patterns. checkpoints is non-nil only on the initial scan.
 func (t *Tailer) scanDir(checkpoints map[string]checkpoint, initial bool) {
-	entries, err := os.ReadDir(t.cfg.Dir)
-	if err != nil {
-		t.log.Error("reading log directory", "dir", t.cfg.Dir, "error", err)
-		return
-	}
-	seen := make(map[string]struct{}, len(entries))
-	for _, de := range entries {
-		name := de.Name()
-		id, namespace, ok := parseFileName(name)
-		if !ok || slices.Contains(t.cfg.ExcludeNamespaces, namespace) {
-			continue
-		}
-		path := filepath.Join(t.cfg.Dir, name)
-		seen[path] = struct{}{}
-		if _, known := t.files[path]; known {
-			continue
-		}
-		f := &file{
-			path:        path,
-			containerID: id,
-			dirty:       true, // read on the first (event-driven) sweep
-		}
-		t.newPipeline(f)
-		if initial {
-			if cp, ok := checkpoints[path]; ok {
-				f.committed = cp.Offset
-				f.inode = cp.Inode
-				f.fp = fingerprint{Len: cp.FingerprintLen, Hash: cp.FingerprintHash}
-				for _, pp := range cp.Pending {
-					// A group straddled one or more rotations at shutdown/crash:
-					// its prefixes are re-read from the rotated files (oldest
-					// first) before this (new) inode is consumed. carriedFed is
-					// already false.
-					f.carried = append(f.carried, rotatedPrefix{
-						inode: pp.Inode,
-						fp:    fingerprint{Len: pp.FingerprintLen, Hash: pp.FingerprintHash},
-						from:  pp.From,
-						to:    pp.To,
-					})
-				}
-			} else if st, err := os.Stat(path); err == nil {
-				// Present before the agent started and no checkpoint: start
-				// at the end to avoid re-ingesting history.
-				f.committed = st.Size()
+	seen := make(map[string]struct{})
+	for _, src := range t.sources {
+		for _, path := range src.glob() {
+			if _, done := seen[path]; done {
+				continue // an earlier source already claimed this file
 			}
+			if !src.matches(path) {
+				continue // excluded
+			}
+			if st, err := os.Stat(path); err != nil || st.IsDir() {
+				continue // unreadable or a directory (glob can match dirs)
+			}
+			var id string
+			if src.containerd {
+				cid, namespace, ok := parseFileName(filepath.Base(path))
+				if !ok || slices.Contains(t.cfg.ExcludeNamespaces, namespace) {
+					continue
+				}
+				id = cid
+			}
+			seen[path] = struct{}{}
+			if _, known := t.files[path]; known {
+				continue
+			}
+			f := &file{
+				path:        path,
+				source:      src,
+				containerID: id,
+				dirty:       true, // read on the first (event-driven) sweep
+			}
+			t.newPipeline(f)
+			t.initFile(f, checkpoints, initial)
+			t.files[path] = f
 		}
-		t.files[path] = f
 	}
 	for path, f := range t.files {
 		if _, ok := seen[path]; !ok {
@@ -604,13 +624,40 @@ func (t *Tailer) scanDir(checkpoints map[string]checkpoint, initial bool) {
 	obs.LogFiles.Set(float64(len(t.files)))
 }
 
+// initFile seeds a newly discovered file's checkpoint/starting offset.
+func (t *Tailer) initFile(f *file, checkpoints map[string]checkpoint, initial bool) {
+	if !initial {
+		return
+	}
+	if cp, ok := checkpoints[f.path]; ok {
+		f.committed = cp.Offset
+		f.inode = cp.Inode
+		f.fp = fingerprint{Len: cp.FingerprintLen, Hash: cp.FingerprintHash}
+		for _, pp := range cp.Pending {
+			// A group straddled one or more rotations at shutdown/crash: its
+			// prefixes are re-read from the rotated files (oldest first) before
+			// this (new) inode is consumed. carriedFed is already false.
+			f.carried = append(f.carried, rotatedPrefix{
+				inode: pp.Inode,
+				fp:    fingerprint{Len: pp.FingerprintLen, Hash: pp.FingerprintHash},
+				from:  pp.From,
+				to:    pp.To,
+			})
+		}
+	} else if st, err := os.Stat(f.path); err == nil {
+		// Present before the agent started and no checkpoint: start at the end
+		// to avoid re-ingesting history.
+		f.committed = st.Size()
+	}
+}
+
 // newPipeline (re)creates the file's aggregation stages with empty state. A
 // carried prefix (if any) is no longer present in the fresh pipeline and must
 // be re-read before the current inode is consumed.
 func (t *Tailer) newPipeline(f *file) {
 	f.reset()
 
-	if t.cfg.Multiline {
+	if f.source.multiline {
 		f.traces = multiline.New(func(_ context.Context, e multiline.Entry[time.Time]) error {
 			items := f.fifo[e.Key]
 			n := min(e.Lines, len(items)) // Lines > len(items) must not happen; defensive
@@ -629,19 +676,24 @@ func (t *Tailer) newPipeline(f *file) {
 		f.traces = nil
 	}
 
-	// Stage 1 hands every rejoined logical line downstream. Emission is
-	// synchronous inside Add/Flush*, so lastEnd[key] is exactly the end
-	// offset of the line's last fragment.
-	f.criStage = cri.New(func(ctx context.Context, key, line string, when time.Time, start int64) error {
-		delete(f.runStart, key)
-		end := f.lastEnd[key]
-		if f.traces == nil {
-			t.emit(f, entry{time: when, stream: streamOf(key), body: line, offset: end})
-			return nil
-		}
-		f.fifo[key] = append(f.fifo[key], logItem{start: start, end: end})
-		return f.traces.AddAt(ctx, key, line, when, when)
-	}, multiline.WithMaxBytes(t.cfg.MaxEntryBytes))
+	// Containerd files run stage 1 (CRI P/F rejoin) ahead of the trace stage;
+	// plain files feed the trace stage (or emit) directly from feedLine.
+	// Emission is synchronous inside Add/Flush*, so lastEnd[key] is exactly the
+	// end offset of the line's last fragment.
+	if f.source.containerd {
+		f.criStage = cri.New(func(ctx context.Context, key, line string, when time.Time, start int64) error {
+			delete(f.runStart, key)
+			end := f.lastEnd[key]
+			if f.traces == nil {
+				t.emit(f, entry{time: when, stream: streamOf(key), body: line, offset: end})
+				return nil
+			}
+			f.fifo[key] = append(f.fifo[key], logItem{start: start, end: end})
+			return f.traces.AddAt(ctx, key, line, when, when)
+		}, multiline.WithMaxBytes(t.cfg.MaxEntryBytes))
+	} else {
+		f.criStage = nil
+	}
 }
 
 // emit appends one completed entry to the batch.
@@ -660,9 +712,20 @@ func streamOf(key string) string {
 	return ""
 }
 
+// plainKey keys a plain file's single logical stream. It has no '/', so
+// streamOf yields "" (plain files have no CRI stream). Each file owns its own
+// pipeline, so one key per file is enough.
+const plainKey = "line"
+
 // feedLine pushes one raw physical line spanning [start, end) into the
-// pipeline.
+// pipeline. Containerd files go through the CRI stage; plain files feed the
+// trace stage (or emit) directly, sharing the same offset accounting so
+// rotation and cross-rotation multi-line joining work identically.
 func (t *Tailer) feedLine(ctx context.Context, f *file, raw string, start, end int64) {
+	if !f.source.containerd {
+		t.feedPlainLine(ctx, f, raw, start, end)
+		return
+	}
 	key := f.containerID
 	if l, ok := cri.Parse(raw); ok {
 		key += "/" + l.Stream
@@ -676,9 +739,28 @@ func (t *Tailer) feedLine(ctx context.Context, f *file, raw string, start, end i
 	}
 }
 
+// feedPlainLine feeds one line of a non-containerd file. The record timestamp
+// is the ingest time (enrich may override it from the line in flush). There is
+// no stage-1 (CRI) buffer, so the fifo alone tracks the buffered lines and no
+// runStart bookkeeping is needed: the line lands in the fifo before it is fed,
+// so the watermark covers it until the trace stage emits it.
+func (t *Tailer) feedPlainLine(ctx context.Context, f *file, raw string, start, end int64) {
+	when := time.Now()
+	if f.traces == nil {
+		t.emit(f, entry{time: when, body: raw, offset: end})
+		return
+	}
+	f.fifo[plainKey] = append(f.fifo[plainKey], logItem{start: start, end: end})
+	if err := f.traces.AddAt(ctx, plainKey, raw, when, when); err != nil {
+		t.log.Warn("log pipeline", "path", f.path, "error", err)
+	}
+}
+
 // stopPipeline drains both stages into the batch.
 func (t *Tailer) stopPipeline(ctx context.Context, f *file) {
-	_ = f.criStage.Stop(ctx)
+	if f.criStage != nil {
+		_ = f.criStage.Stop(ctx)
+	}
 	if f.traces != nil {
 		_ = f.traces.Stop(ctx)
 	}
@@ -705,7 +787,9 @@ func (t *Tailer) sweep(ctx context.Context, all bool) {
 			t.log.Warn("reading log file", "path", path, "error", err)
 		}
 		// Age out fragment runs and multi-line groups that never completed.
-		_ = f.criStage.FlushBefore(ctx, cutoff)
+		if f.criStage != nil {
+			_ = f.criStage.FlushBefore(ctx, cutoff)
+		}
 		if f.traces != nil {
 			_ = f.traces.FlushBefore(ctx, cutoff)
 		}
@@ -715,10 +799,15 @@ func (t *Tailer) sweep(ctx context.Context, all bool) {
 	}
 }
 
-// resolveMetadata fetches container metadata, backing off between attempts.
-// The file is not consumed until metadata is available; the data waits on
+// resolveMetadata builds the file's resource attributes. Plain files resolve
+// immediately from the source's static attributes plus node metadata;
+// containerd files fetch pod metadata from the service (backing off between
+// attempts), and are not consumed until it is available — the data waits on
 // disk, nothing is lost.
 func (t *Tailer) resolveMetadata(ctx context.Context, f *file) bool {
+	if !f.source.containerd {
+		return t.resolvePlain(f)
+	}
 	if time.Now().Before(f.nextMetaTry) {
 		return false
 	}
@@ -738,6 +827,30 @@ func (t *Tailer) resolveMetadata(ctx context.Context, f *file) bool {
 		actx.Node = t.cfg.NodeInfo()
 	}
 	t.cfg.Attrs.Build(res, actx)
+	f.resource = res
+	f.resolved = true
+	return true
+}
+
+// resolvePlain builds a non-containerd file's resource: node attributes from
+// the builder plus the source's configured static attributes (which win). A
+// source without an explicit service.name defaults it to the source name.
+func (t *Tailer) resolvePlain(f *file) bool {
+	res := pcommon.NewResource()
+	actx := attrs.Context{}
+	if t.cfg.NodeInfo != nil {
+		actx.Node = t.cfg.NodeInfo()
+	}
+	t.cfg.Attrs.Build(res, actx)
+	a := res.Attributes()
+	if _, ok := f.source.attributes["service.name"]; !ok && f.source.name != "" {
+		if _, set := a.Get("service.name"); !set {
+			a.PutStr("service.name", f.source.name)
+		}
+	}
+	for k, v := range f.source.attributes {
+		a.PutStr(k, v)
+	}
 	f.resource = res
 	f.resolved = true
 	return true

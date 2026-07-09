@@ -111,6 +111,18 @@ agent:
   #     - {key: tenant, attribute: tenant.id, target: resource}
   #     - {key: http.status_code, target: log}
   logAttributesConfig: {}
+  # Declare log sources: which files to tail (include/exclude globs, ** via
+  # doublestar) and how (containerd vs plain, with resource attributes for
+  # plain host files). Rendered verbatim into a mounted config; empty tails
+  # -log-dir as containerd logs. Files must be under a mounted path (/var/log
+  # is mounted read-only; add volumes for others). See the README.
+  #   sources:
+  #     - {name: containers, include: ["/var/log/containers/*.log"], containerd: true}
+  #     - name: host
+  #       include: ["/var/log/**/*.log"]
+  #       exclude: ["/var/log/containers/*.log"]
+  #       attributes: {service.name: host-syslog}
+  logsConfig: {}
   logsWatch: true
   logsPollInterval: 500ms
   logsFingerprintBytes: 1024

@@ -17,6 +17,7 @@ manifests live in [deploy/](../deploy).
 - [Agent: general](#agent-general)
 - [Agent: OTLP export](#agent-otlp-export)
 - [Agent: log collection](#agent-log-collection)
+- [Agent: log sources](#agent-log-sources)
 - [Agent: journald](#agent-journald)
 - [Agent: log attributes](#agent-log-attributes)
 - [Agent: OTLP ingest](#agent-otlp-ingest)
@@ -109,7 +110,8 @@ kubescrape-agent \
 
 | Flag | Default | Description |
 |---|---|---|
-| `-log-dir` | `/var/log/containers` | directory of containerd log symlinks |
+| `-log-dir` | `/var/log/containers` | containerd log directory; the default source when `-logs-config` is unset |
+| `-logs-config` | — | YAML declaring log sources (include/exclude globs, containerd vs plain, resource attributes; [below](#agent-log-sources)) |
 | `-checkpoint-file` | — | persists committed offsets across restarts (mount a hostPath); empty disables |
 | `-positions-file` | — | single file holding BOTH log offsets and the journald cursor; overrides `-checkpoint-file` for logs and is the only way to persist the journald cursor |
 | `-log-attributes-config` | — | YAML file lifting JSON/logfmt keys from the line onto attributes ([below](#agent-log-attributes)) |
@@ -153,6 +155,41 @@ export; on export failure or subprocess death, journalctl restarts from the
 committed cursor with backoff (re-reading anything in flight). The cursor is
 persisted only through `-positions-file` (there is no standalone journald
 cursor file); without it, every start begins at the journal tail.
+
+## Agent: log sources
+
+By default the agent tails containerd container logs under `-log-dir`.
+`-logs-config` points at a YAML file that instead declares **sources** —
+arbitrary files selected by globs, each either containerd (CRI parsing + pod
+metadata) or plain (static resource attributes). All sources use the identical
+rotation, offset-checkpoint and cross-rotation multi-line machinery.
+
+```yaml
+sources:
+  - name: containers          # keep tailing container logs
+    include: ["/var/log/containers/*.log"]
+    containerd: true
+  - name: host                # plus arbitrary host logs
+    include: ["/var/log/**/*.log"]     # ** matches any depth (doublestar)
+    exclude: ["/var/log/containers/*.log", "/var/log/azure/*.log"]
+    multiline: true           # optional per-source override
+    attributes:               # resource attributes for these (non-containerd) files
+      service.name: host-syslog
+      log.source: host
+```
+
+Per source: `include`/`exclude` are doublestar globs (`**` supported);
+`containerd` selects CRI handling (filename → container ID → metadata → CRI
+format) versus plain files; `attributes` are static resource attributes stamped
+on plain-file records (node attributes from the resource-attribute builder are
+added too, and `service.name` defaults to the source `name`); `multiline`
+overrides `-logs-multiline` for that source. A file is claimed by the first
+source that matches it. Container logs keep working because the default
+(no-config) behavior is exactly one containerd source over `-log-dir`.
+
+Caveat: a blank line inside a plain file is dropped, so multi-line formats that
+rely on a blank separator (Go panics) do not join for plain files;
+indentation-based traces (Python, Java, .NET) join normally.
 
 ## Agent: log attributes
 

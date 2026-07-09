@@ -58,7 +58,8 @@ func run() error {
 		logLevel  = flag.String("log-level", "info", "log level: debug, info, warn, error")
 		logFormat = flag.String("log-format", "text", "log format: text or json")
 
-		logDir          = flag.String("log-dir", "/var/log/containers", "directory of containerd log symlinks")
+		logDir          = flag.String("log-dir", "/var/log/containers", "directory of containerd log symlinks (the default source when -logs-config is unset)")
+		logsConfig      = flag.String("logs-config", "", "YAML file declaring log sources (include/exclude globs, containerd vs plain, resource attributes); empty tails -log-dir as containerd logs")
 		positionsFile   = flag.String("positions-file", "", "single file persisting BOTH log offsets and the journald cursor across restarts (overrides -checkpoint-file for logs; required for journald cursor persistence)")
 		checkpointFile  = flag.String("checkpoint-file", "", "file persisting log read offsets across restarts (empty disables; ignored when -positions-file is set)")
 		logsBatch       = flag.Int("logs-batch-size", 1024, "flush logs after this many entries")
@@ -188,8 +189,15 @@ func run() error {
 	var wg sync.WaitGroup
 
 	if *logsOn {
+		var logSources []tailer.Source
+		if *logsConfig != "" {
+			if logSources, err = tailer.LoadSourcesConfig(*logsConfig); err != nil {
+				return fmt.Errorf("logs config: %w", err)
+			}
+		}
 		tl := tailer.New(tailer.Config{
 			Dir:               *logDir,
+			Sources:           logSources,
 			CheckpointFile:    *checkpointFile,
 			Positions:         posStore,
 			LogAttrs:          logAttrs,

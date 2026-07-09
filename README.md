@@ -225,6 +225,30 @@ are checkpointed to disk (`-checkpoint-file`) so restarts resume where they
 left off. Set `-logs-exclude-namespaces` to the observability namespace to
 avoid feeding the collector its own output.
 
+**Log sources** (`-logs-config`). By default the agent tails container logs
+under `-log-dir`. A YAML config instead declares **sources** — files selected
+by include/exclude globs (doublestar `**` supported), each either *containerd*
+(CRI parsing + pod metadata, as above) or *plain* (arbitrary host files with
+static resource attributes). Plain files use the **identical** rotation,
+checkpoint and cross-rotation multi-line machinery; they just skip CRI parsing
+and metadata resolution and take their resource attributes from the source's
+`attributes` (plus node attributes, with `service.name` defaulting to the
+source name):
+
+```yaml
+sources:
+  - name: containers
+    include: ["/var/log/containers/*.log"]
+    containerd: true
+  - name: host
+    include: ["/var/log/**/*.log"]
+    exclude: ["/var/log/containers/*.log", "/var/log/azure/*.log"]
+    attributes: {service.name: host-syslog}
+```
+
+A file is claimed by the first matching source; the default (no config) is one
+containerd source over `-log-dir`, so container logs keep working unchanged.
+
 **Log enrichment** (`-logs-enrich`, default true). Each exported line is run
 through [JohanLindvall/enrich](https://github.com/JohanLindvall/enrich),
 which recognizes JSON (Serilog/Pino/Envoy/Azure envelopes and common key

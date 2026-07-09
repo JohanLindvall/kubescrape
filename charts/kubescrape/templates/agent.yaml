@@ -65,6 +65,18 @@ data:
   logattrs.yaml: |
     {{- toYaml .Values.agent.logAttributesConfig | nindent 4 }}
 {{- end }}
+{{- if .Values.agent.logsConfig }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Release.Name }}-agent-logs
+  namespace: {{ .Release.Namespace }}
+  labels: {{ include "kubescrape.labels" . | nindent 4 }}
+data:
+  logs.yaml: |
+    {{- toYaml .Values.agent.logsConfig | nindent 4 }}
+{{- end }}
 ---
 apiVersion: apps/v1
 kind: DaemonSet
@@ -86,6 +98,7 @@ spec:
         checksum/attrs: {{ .Values.agent.attrsConfig | toYaml | sha256sum }}
         checksum/metrics: {{ .Values.agent.metricsConfig | toYaml | sha256sum }}
         checksum/logattrs: {{ .Values.agent.logAttributesConfig | toYaml | sha256sum }}
+        checksum/logs: {{ .Values.agent.logsConfig | toYaml | sha256sum }}
     spec:
       serviceAccountName: {{ .Release.Name }}-agent
       tolerations:
@@ -130,6 +143,9 @@ spec:
             - -logs-enrich={{ .Values.agent.logsEnrich }}
             {{- if .Values.agent.logAttributesConfig }}
             - -log-attributes-config=/etc/kubescrape/logattrs/logattrs.yaml
+            {{- end }}
+            {{- if .Values.agent.logsConfig }}
+            - -logs-config=/etc/kubescrape/logs/logs.yaml
             {{- end }}
             - -logs-watch={{ .Values.agent.logsWatch }}
             - -logs-poll-interval={{ .Values.agent.logsPollInterval }}
@@ -219,6 +235,11 @@ spec:
               mountPath: /etc/kubescrape/logattrs
               readOnly: true
             {{- end }}
+            {{- if .Values.agent.logsConfig }}
+            - name: logs-config
+              mountPath: /etc/kubescrape/logs
+              readOnly: true
+            {{- end }}
             - name: varlog
               mountPath: /var/log
               readOnly: true
@@ -269,6 +290,11 @@ spec:
         - name: logattrs-config
           configMap:
             name: {{ .Release.Name }}-agent-logattrs
+        {{- end }}
+        {{- if .Values.agent.logsConfig }}
+        - name: logs-config
+          configMap:
+            name: {{ .Release.Name }}-agent-logs
         {{- end }}
         {{- if .Values.agent.otlp.bearerTokenSecret.name }}
         - name: otlp-token

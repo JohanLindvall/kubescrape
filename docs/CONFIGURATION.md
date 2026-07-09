@@ -187,6 +187,18 @@ overrides `-logs-multiline` for that source. A file is claimed by the first
 source that matches it. Container logs keep working because the default
 (no-config) behavior is exactly one containerd source over `-log-dir`.
 
+Two more per-source options:
+
+- `encoding` transcodes line content to UTF-8 from a named character set
+  (IANA/WHATWG names — `windows-1252`, `iso-8859-1`, `gbk`, `shift_jis`, …).
+  Empty/`utf-8` means no transcoding. Lines are split on `\n`, so encodings
+  where the newline is not a single `0x0A` byte (UTF-16/32) are unsupported.
+- `compressed` reads matched files as gzip, decompressing on the fly (files
+  ending in `.gz` are detected automatically). Compressed files are treated as
+  **archives** — read once to completion, not tailed — so, unlike plain
+  tailing, pre-existing ones *are* ingested; scope `include` to avoid re-reading
+  unwanted history. A partially-read archive resumes correctly across a restart.
+
 Caveat: a blank line inside a plain file is dropped, so multi-line formats that
 rely on a blank separator (Go panics) do not join for plain files;
 indentation-based traces (Python, Java, .NET) join normally.

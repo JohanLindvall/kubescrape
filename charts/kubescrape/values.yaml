@@ -116,6 +116,9 @@ agent:
   # plain host files). Rendered verbatim into a mounted config; empty tails
   # -log-dir as containerd logs. Files must be under a mounted path (/var/log
   # is mounted read-only; add volumes for others). See the README.
+  # Per source: containerd (CRI) vs plain; attributes (plain resource attrs);
+  # multiline override; encoding (e.g. windows-1252); compressed (gzip / .gz,
+  # read once to completion).
   #   sources:
   #     - {name: containers, include: ["/var/log/containers/*.log"], containerd: true}
   #     - name: host

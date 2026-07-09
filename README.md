@@ -248,6 +248,10 @@ sources:
 
 A file is claimed by the first matching source; the default (no config) is one
 containerd source over `-log-dir`, so container logs keep working unchanged.
+Per source you can also set `encoding:` to transcode non-UTF-8 files
+(`windows-1252`, `gbk`, `shift_jis`, …) and `compressed: true` (or a `.gz`
+name) to read gzip archives — decompressed once to completion, resuming
+correctly across a restart.
 
 **Log enrichment** (`-logs-enrich`, default true). Each exported line is run
 through [JohanLindvall/enrich](https://github.com/JohanLindvall/enrich),

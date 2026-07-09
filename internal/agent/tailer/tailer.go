@@ -29,6 +29,7 @@ package tailer
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"errors"
@@ -172,7 +173,11 @@ type file struct {
 	// multi-line machinery below is identical for both.
 	source      *compiledSource
 	containerID string // set for containerd files only
-	inode       uint64
+	// compressed reads the file as a gzip archive (read once to completion via
+	// readArchive, offsets in decompressed space) rather than tailing it.
+	compressed bool
+	gz         *gzip.Reader
+	inode      uint64
 	// fp is the identity fingerprint: a hash of the first fp.Len bytes.
 	// Together with the inode it prevents a checkpoint from resuming into a
 	// different file (inode reuse, replaced content).
@@ -609,6 +614,7 @@ func (t *Tailer) scanDir(checkpoints map[string]checkpoint, initial bool) {
 				path:        path,
 				source:      src,
 				containerID: id,
+				compressed:  src.compressed || strings.HasSuffix(path, ".gz"),
 				dirty:       true, // read on the first (event-driven) sweep
 			}
 			t.newPipeline(f)
@@ -644,9 +650,10 @@ func (t *Tailer) initFile(f *file, checkpoints map[string]checkpoint, initial bo
 				to:    pp.To,
 			})
 		}
-	} else if st, err := os.Stat(f.path); err == nil {
+	} else if st, err := os.Stat(f.path); err == nil && !f.compressed {
 		// Present before the agent started and no checkpoint: start at the end
-		// to avoid re-ingesting history.
+		// to avoid re-ingesting history. Compressed archives are instead read
+		// whole (committed stays 0).
 		f.committed = st.Size()
 	}
 }
@@ -859,6 +866,9 @@ func (t *Tailer) resolvePlain(f *file) bool {
 // readFile ingests up to MaxBytesPerSweep appended bytes and detects
 // rotation.
 func (t *Tailer) readFile(ctx context.Context, f *file) error {
+	if f.compressed {
+		return t.readArchive(ctx, f)
+	}
 	if err := t.ensureOpen(f); err != nil {
 		return err
 	}
@@ -917,6 +927,93 @@ func (t *Tailer) readFile(ctx context.Context, f *file) error {
 	return nil
 }
 
+// readArchive reads a gzip archive: bounded decompressed bytes per sweep, fed
+// through the same pipeline (offsets are decompressed positions). gzip is not
+// seekable, so on resume openArchive re-decompresses from the start and
+// discards the committed prefix; at EOF the pipeline is drained and the file
+// is done (committed == readPos means a restart discards everything).
+func (t *Tailer) readArchive(ctx context.Context, f *file) error {
+	if f.gz == nil {
+		if err := t.openArchive(f); err != nil {
+			return err
+		}
+	}
+	budget := t.cfg.MaxBytesPerSweep
+	buf := make([]byte, 64*1024)
+	for budget > 0 {
+		n, err := f.gz.Read(buf[:min(len(buf), budget)])
+		if n > 0 {
+			budget -= n
+			obs.LogBytes.Add(float64(n))
+			f.pending = append(f.pending, buf[:n]...)
+			f.readPos += int64(n)
+			t.consume(ctx, f)
+		}
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				t.stopPipeline(ctx, f) // drain a trailing multi-line group
+				t.closeArchive(f)
+			}
+			return nil
+		}
+	}
+	return nil // hit the sweep budget; continue next sweep with f.gz retained
+}
+
+// openArchive opens the gzip file and positions it at the committed offset by
+// discarding that many decompressed bytes.
+func (t *Tailer) openArchive(f *file) error {
+	fh, err := os.Open(f.path)
+	if err != nil {
+		return err
+	}
+	st, err := fh.Stat()
+	if err != nil {
+		_ = fh.Close()
+		return err
+	}
+	inode := inodeOf(st)
+	// A replaced file (different inode or head fingerprint) restarts at zero.
+	if f.inode != 0 && (f.inode != inode || !f.fp.matches(fh)) {
+		f.committed = 0
+	}
+	gz, err := gzip.NewReader(fh)
+	if err != nil {
+		_ = fh.Close()
+		return fmt.Errorf("gzip %s: %w", f.path, err)
+	}
+	if f.committed > 0 {
+		if _, err := io.CopyN(io.Discard, gz, f.committed); err != nil && !errors.Is(err, io.EOF) {
+			_ = gz.Close()
+			_ = fh.Close()
+			return err
+		}
+	}
+	if fp, err := computeFingerprint(fh, min(int64(t.cfg.FingerprintBytes), st.Size())); err == nil {
+		f.fp = fp
+	}
+	f.f = fh
+	f.gz = gz
+	f.inode = inode
+	f.readPos = f.committed
+	f.lineStart = f.committed
+	f.pending = f.pending[:0]
+	t.watchTarget(f)
+	return nil
+}
+
+// closeArchive releases the archive's readers.
+func (t *Tailer) closeArchive(f *file) {
+	if f.gz != nil {
+		_ = f.gz.Close()
+		f.gz = nil
+	}
+	if f.f != nil {
+		_ = f.f.Close()
+		f.f = nil
+	}
+}
+
 // drainFile reads the (rotated-away or removed) file to EOF so no bytes
 // written between our last read and the rotation are lost. Bounded to keep a
 // still-active writer from pinning the sweep.
@@ -962,7 +1059,7 @@ func (t *Tailer) consume(ctx context.Context, f *file) {
 		if len(line) == 0 {
 			continue
 		}
-		t.feedLine(ctx, f, string(line), start, f.lineStart)
+		t.feedLine(ctx, f, f.source.decode(line), start, f.lineStart)
 	}
 }
 
@@ -1114,7 +1211,7 @@ func (t *Tailer) feedPrefix(ctx context.Context, f *file, p rotatedPrefix) {
 				pos += int64(i + 1)
 				carry = carry[i+1:]
 				if len(line) > 0 {
-					t.feedLine(ctx, f, string(line), start, pos)
+					t.feedLine(ctx, f, f.source.decode(line), start, pos)
 				}
 			}
 		}
@@ -1163,10 +1260,14 @@ func (t *Tailer) findRotated(f *file, p rotatedPrefix) (string, bool) {
 // the last read) and then the pipeline.
 func (t *Tailer) drop(f *file) {
 	if f.resolved {
-		t.drainFile(context.Background(), f)
+		if !f.compressed {
+			t.drainFile(context.Background(), f) // archives are complete; nothing to drain
+		}
 		t.stopPipeline(context.Background(), f)
 	}
-	if f.f != nil {
+	if f.compressed {
+		t.closeArchive(f)
+	} else if f.f != nil {
 		_ = f.f.Close()
 		f.f = nil
 	}
@@ -1297,6 +1398,16 @@ func (t *Tailer) exportWithRetry(ctx context.Context, ld plog.Logs) error {
 // read again. Pipeline state is discarded without emitting: the buffered
 // lines sit after the committed offset and will be re-read and re-fed.
 func (t *Tailer) rewind(f *file) {
+	if f.compressed {
+		// gzip is not seekable: close so openArchive re-decompresses from the
+		// committed offset next sweep.
+		t.closeArchive(f)
+		f.readPos = f.committed
+		f.lineStart = f.committed
+		f.pending = f.pending[:0]
+		t.newPipeline(f)
+		return
+	}
 	if f.f == nil {
 		return
 	}

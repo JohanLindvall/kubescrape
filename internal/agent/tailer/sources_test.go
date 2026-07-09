@@ -1,6 +1,8 @@
 package tailer
 
 import (
+	"bytes"
+	"compress/gzip"
 	"os"
 	"path/filepath"
 	"strings"
@@ -110,6 +112,80 @@ func TestPlainSourceTailing(t *testing.T) {
 	}
 	if ra["k8s.node.name"] != "node1" {
 		t.Errorf("node attribute missing: %v", ra)
+	}
+}
+
+func writeGzip(t *testing.T, path string, lines ...string) {
+	t.Helper()
+	var buf bytes.Buffer
+	zw := gzip.NewWriter(&buf)
+	for _, l := range lines {
+		if _, err := zw.Write([]byte(l + "\n")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, buf.Bytes(), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestCompressedSourceReadWhole(t *testing.T) {
+	dir := t.TempDir()
+	exp := &fakeExporter{}
+	// A .gz source; multiline on to prove archives use the pipeline too.
+	tl := newSourceTailer(exp, []Source{{
+		Name:    "archives",
+		Include: []string{filepath.Join(dir, "*.log.gz")},
+	}}, true)
+	stop := startTailer(t, tl)
+	defer stop()
+
+	// Unlike plain tailing, a compressed archive that appears is read in full
+	// (not skipped to the end), including a multi-line Python traceback.
+	writeGzip(t, filepath.Join(dir, "old.log.gz"),
+		"line one",
+		"Traceback (most recent call last):",
+		`  File "x.py", line 3, in <module>`,
+		"    raise RuntimeError('boom')",
+		"line after")
+
+	waitFor(t, func() bool { return len(exp.get()) == 3 }, "3 records (line + joined traceback + line)")
+	got := exp.get()
+	if got[0] != "line one" || got[2] != "line after" {
+		t.Fatalf("records = %q", got)
+	}
+	if !strings.Contains(got[1], "Traceback") || !strings.Contains(got[1], "raise RuntimeError") {
+		t.Fatalf("traceback not joined from archive: %q", got[1])
+	}
+
+	// The archive is read once: no duplicate records over subsequent sweeps.
+	time.Sleep(200 * time.Millisecond)
+	if n := len(exp.get()); n != 3 {
+		t.Fatalf("archive re-read: %d records", n)
+	}
+}
+
+func TestSourceEncoding(t *testing.T) {
+	dir := t.TempDir()
+	exp := &fakeExporter{}
+	tl := newSourceTailer(exp, []Source{{
+		Include:  []string{filepath.Join(dir, "*.log")},
+		Encoding: "windows-1252",
+	}}, false)
+	stop := startTailer(t, tl)
+	defer stop()
+
+	// windows-1252/latin1 bytes: 0xE9 = é, 0xC0 = À. Two lines.
+	raw := []byte("caf\xe9\n\xc0 la carte\n")
+	if err := os.WriteFile(filepath.Join(dir, "app.log"), raw, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, func() bool { return len(exp.get()) == 2 }, "2 decoded records")
+	if got := exp.get(); got[0] != "café" || got[1] != "À la carte" {
+		t.Fatalf("decoded records = %q (want café / À la carte)", got)
 	}
 }
 

@@ -125,7 +125,9 @@ kubescrape-agent \
 | `-logs-multiline` | `true` | join stack traces (Go, Java, Python, .NET, Ruby, Rust, PHP) via [multiline](https://github.com/JohanLindvall/multiline) |
 | `-logs-multiline-timeout` | `1s` | flush incomplete multi-line groups after this long |
 | `-logs-enrich` | `true` | parse per-line metadata via [enrich](https://github.com/JohanLindvall/enrich): a timestamp in the line replaces the CRI time, an explicit level sets the severity, trace/span IDs fill the OTLP trace fields, exception/template/source-context details become record attributes. JSON, logfmt and common plain-text formats are recognized; the body is never modified, and plain-text stack traces are not duplicated into `exception.stacktrace`. Hit rates: `kubescrape_log_enriched_total{format}` on `/metrics` |
-| `-logs-file-attributes` | `false` | stamp `log.file.name` (basename) and `log.file.position` (byte offset past the record) on every record, for each file source |
+| `-logs-file-attributes` | `false` | stamp `log.file.name` (basename) and `log.file.position` (record start offset) on every record, for each file source |
+| `-buffer-dir` | — | directory for a disk-backed export buffer (logs **and** metrics); a collector outage spools here instead of pinning the tailer to old offsets / dropping metrics ([below](#disk-buffer)). Empty disables |
+| `-buffer-max-bytes` | `1GiB` | per-signal cap on the undelivered on-disk backlog; producers back-pressure (the tailer rewinds) when full |
 | `-logs-exclude-namespaces` | — | comma-separated namespaces not tailed — **always exclude the namespace of your collector** to avoid feedback loops |
 | `-logs-metrics-interval` | `30s` | export interval for the `logMetrics` metrics ([below](#agent-log-metrics)) |
 | `-logs-metrics-max-bytes` | `3MiB` | export log-derived metrics in chunks below this many bytes (0 = one payload) |
@@ -136,6 +138,28 @@ acknowledged the batch and never past lines still buffered in the multiline
 pipeline; on export failure the files rewind to the committed offset.
 Rotation handling (rename, copytruncate — including same-size rewrites —
 deletion) is automatic.
+
+### Disk buffer
+
+Without `-buffer-dir`, durability is checkpoint-and-rewind: during a collector
+outage the tailer stops advancing (the source files are the buffer) and scraped
+metrics are dropped and re-scraped. A long outage can lose logs if the source
+files rotate away first.
+
+With `-buffer-dir` set, every export goes through a disk-backed write-ahead
+buffer instead — separate on-disk FIFO spools for logs and metrics. A batch is
+serialized, `fsync`'d, and acknowledged to the producer immediately (so the
+tailer commits its offsets and source logs may rotate away), then a background
+sender drains it to the collector with retries; a batch is removed only after
+the collector accepts it. Delivery stays at-least-once and survives agent
+restarts (a crash-torn tail is truncated on reopen). The undelivered backlog is
+capped per signal by `-buffer-max-bytes`; when full, appends fail and the tailer
+back-pressures (rewinds), so disk stays bounded.
+
+Point `-buffer-dir` at a node-local persistent path (e.g. under the agent's
+state hostPath) so the buffer survives pod restarts. Note that delivered-but-
+not-yet-reclaimed records linger until their whole segment is retired, so
+physical disk use can exceed the backlog cap by up to one segment (8 MiB).
 
 ## Agent: journald
 

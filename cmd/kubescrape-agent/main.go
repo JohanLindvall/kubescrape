@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -28,6 +29,7 @@ import (
 	"github.com/JohanLindvall/kubescrape/internal/agent/otlpingest"
 	"github.com/JohanLindvall/kubescrape/internal/agent/positions"
 	"github.com/JohanLindvall/kubescrape/internal/agent/promscrape"
+	"github.com/JohanLindvall/kubescrape/internal/agent/spool"
 	"github.com/JohanLindvall/kubescrape/internal/agent/tailer"
 	"github.com/JohanLindvall/kubescrape/internal/metrics"
 	"github.com/JohanLindvall/kubescrape/internal/obs"
@@ -71,6 +73,8 @@ func run() error {
 		excludeNs         = flag.String("logs-exclude-namespaces", "", "comma-separated namespaces whose container logs are not tailed")
 		logsEnrich        = flag.Bool("logs-enrich", true, "parse per-line metadata (timestamp, severity, trace/span IDs, exception details) into the OTLP record fields via github.com/JohanLindvall/enrich")
 		logsFileAttrs     = flag.Bool("logs-file-attributes", false, "stamp log.file.name and log.file.position (byte offset) on every log record, for each file source")
+		bufferDir         = flag.String("buffer-dir", "", "directory for a disk-backed export buffer (logs and metrics); a collector outage spools here instead of pinning the tailer to old offsets or dropping metrics (empty disables)")
+		bufferMax         = flag.Int("buffer-max-bytes", 1<<30, "per-signal cap on the undelivered on-disk buffer; producers back-pressure (the tailer rewinds) when full")
 		logsMetricsEvery  = flag.Duration("logs-metrics-interval", 30*time.Second, "export interval for log-derived metrics")
 		logsMetricsBytes  = flag.Int("logs-metrics-max-bytes", 3<<20, "export log-derived metrics in chunks below this many bytes (0 = one payload)")
 		logsMetricsPrefix = flag.String("logs-metrics-name-prefix", "", "prefix prepended to every log-derived metric name")
@@ -199,6 +203,33 @@ func run() error {
 
 	var wg sync.WaitGroup
 
+	// Every consumer exports through `out`. With -buffer-dir set it is a
+	// disk-backed buffer (separate spools for logs and metrics): a collector
+	// outage spools to disk (bounded per signal) instead of pinning the tailer
+	// to old file offsets or dropping scraped metrics. Otherwise it is the raw
+	// client.
+	var out otlpexport.Exporter = exporter
+	if *bufferDir != "" {
+		logSpool, err := spool.Open(filepath.Join(*bufferDir, "logs"), spool.Options{MaxBytes: int64(*bufferMax)})
+		if err != nil {
+			return fmt.Errorf("log buffer: %w", err)
+		}
+		defer func() { _ = logSpool.Close() }()
+		metricSpool, err := spool.Open(filepath.Join(*bufferDir, "metrics"), spool.Options{MaxBytes: int64(*bufferMax)})
+		if err != nil {
+			return fmt.Errorf("metric buffer: %w", err)
+		}
+		defer func() { _ = metricSpool.Close() }()
+		buffered := otlpexport.NewBuffered(exporter, logSpool, metricSpool, *otlpBackoff, log)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			buffered.Run(ctx)
+		}()
+		out = buffered
+		log.Info("disk buffer enabled", "dir", *bufferDir, "max-bytes-per-signal", *bufferMax)
+	}
+
 	// Optional metrics derived from log lines; only these configured metrics are
 	// exported (over the shared OTLP exporter), on their own interval.
 	var logMetrics *metrics.DynamicMetricSet
@@ -213,7 +244,7 @@ func run() error {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			logMetrics.Run(ctx, exporter, *logsMetricsEvery, *logsMetricsBytes)
+			logMetrics.Run(ctx, out, *logsMetricsEvery, *logsMetricsBytes)
 		}()
 		log.Info("log-derived metrics started", "metrics", logMetrics.Count, "interval", *logsMetricsEvery)
 	}
@@ -247,7 +278,7 @@ func run() error {
 			NodeInfo:          nodeInfo,
 			MetadataWait:      *metadataWait,
 			Metadata:          meta,
-			Exporter:          exporter,
+			Exporter:          out,
 			Logger:            log,
 		})
 		wg.Add(1)
@@ -271,7 +302,7 @@ func run() error {
 			LogAttrs:      logAttrs,
 			Attrs:         attrBuilders.Journal,
 			NodeInfo:      nodeInfo,
-			Exporter:      exporter,
+			Exporter:      out,
 			Logger:        log,
 		})
 		wg.Add(1)
@@ -304,7 +335,7 @@ func run() error {
 			GRPCAddr: *ingestGRPC,
 			HTTPAddr: *ingestHTTP,
 			Enricher: enr,
-			Exporter: exporter,
+			Exporter: out,
 			Logger:   log,
 		})
 		wg.Add(1)
@@ -344,7 +375,7 @@ func run() error {
 			Splitters: splitters,
 			Logger:    log,
 			Targets:   meta,
-			Exporter:  exporter,
+			Exporter:  out,
 			StartTime: time.Now(),
 		})
 		wg.Add(1)

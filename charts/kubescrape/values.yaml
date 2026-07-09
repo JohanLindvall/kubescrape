@@ -107,6 +107,13 @@ agent:
   # Stamp log.file.name and log.file.position (byte offset) on every record,
   # for each file source.
   logsFileAttributes: false
+  # Disk-backed export buffer (logs + metrics): on a collector outage records
+  # spool to this directory instead of pinning the tailer to old offsets or
+  # dropping metrics. Empty disables. Point it at the node-local state mount so
+  # it survives pod restarts; bufferMaxBytes caps the undelivered backlog per
+  # signal (the tailer back-pressures when full).
+  bufferDir: ""              # e.g. /var/lib/kubescrape-agent/buffer
+  bufferMaxBytes: 1073741824 # 1GiB
   # All YAML config for the agent lives in one file, rendered verbatim into a
   # mounted ConfigMap and passed via -config. Each section is optional and
   # mirrors the shape of the standalone file it replaces:

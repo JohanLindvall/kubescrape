@@ -103,6 +103,10 @@ spec:
             {{- end }}
             - -logs-enrich={{ .Values.agent.logsEnrich }}
             - -logs-file-attributes={{ .Values.agent.logsFileAttributes }}
+            {{- with .Values.agent.bufferDir }}
+            - -buffer-dir={{ . }}
+            - -buffer-max-bytes={{ int64 $.Values.agent.bufferMaxBytes }}
+            {{- end }}
             {{- if .Values.agent.config }}
             - -config=/etc/kubescrape/config/config.yaml
             {{- end }}

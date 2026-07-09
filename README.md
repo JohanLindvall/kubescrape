@@ -382,6 +382,23 @@ thing to mount), so a restart resumes every input from one place; it overrides
 `-checkpoint-file` for logs and is the only way the journald cursor is
 persisted (without it, journald begins at the tail each start).
 
+**Disk buffer** (`-buffer-dir`, opt-in). By default the agent's durability is
+checkpoint-and-rewind: on a collector outage the tailer stops advancing and the
+source files *are* the buffer — simple, but a long outage risks loss if those
+files rotate away, and scraped metrics are just dropped and re-scraped. Point
+`-buffer-dir` at a (node-local, persistent) directory and every export instead
+goes through a **disk-backed write-ahead buffer** — separate on-disk FIFO
+spools for logs and metrics (`internal/agent/spool`). A batch is serialized,
+`fsync`'d to disk, and acknowledged to the producer immediately (so the tailer
+commits its offsets and the source logs may rotate away), then a background
+sender drains the spool to the collector with retries; a batch is removed only
+after the collector accepts it. Delivery stays at-least-once and **survives
+agent restarts** (a torn tail from a crash is truncated on reopen). The
+undelivered backlog is bounded per signal by `-buffer-max-bytes` (default 1
+GiB); when full, `Append` fails and the tailer back-pressures by rewinding, so
+disk use stays capped. This is the Fluent-Bit-style `filesystem` buffer: it
+absorbs outages up to the cap instead of pinning to source files.
+
 **Metrics.** Each `-scrape-interval` the agent fetches
 `GET /v1/nodes/$NODE/targets` and scrapes every target concurrently
 (bounded by `-scrape-concurrency`). The exposition body is **stream-parsed**

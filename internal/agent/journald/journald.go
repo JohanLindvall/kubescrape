@@ -143,7 +143,9 @@ func (r *Reader) Run(ctx context.Context) {
 		}
 	}
 	// Final flush of whatever is buffered; the subprocess is already gone.
-	r.flush(context.Background())
+	if err := r.flush(context.Background()); err != nil {
+		r.log.Warn("final journal flush failed", "error", err)
+	}
 }
 
 // follow runs one journalctl incarnation, streaming until it exits or an

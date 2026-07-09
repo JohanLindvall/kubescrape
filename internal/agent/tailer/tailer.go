@@ -40,6 +40,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -56,6 +57,7 @@ import (
 	"github.com/JohanLindvall/kubescrape/internal/agent/metaclient"
 	"github.com/JohanLindvall/kubescrape/internal/agent/positions"
 	"github.com/JohanLindvall/kubescrape/internal/kubemeta"
+	"github.com/JohanLindvall/kubescrape/internal/metrics"
 	"github.com/JohanLindvall/kubescrape/internal/obs"
 )
 
@@ -102,9 +104,17 @@ type Config struct {
 	// trace/span IDs, exception details, ...) into the record's OTLP fields
 	// and attributes.
 	Enrich bool
+	// FileAttributes stamps log.file.name (the file's basename) and
+	// log.file.position (the byte offset just past the record) on every emitted
+	// record, for any file source. Opt-in.
+	FileAttributes bool
 	// LogAttrs lifts configured keys out of structured lines onto the record
 	// as resource/scope/log attributes (nil = none).
 	LogAttrs *logattrs.Extractor
+	// LogMetrics derives configured metrics from each exported log record
+	// (nil = none). Its keys resolve against the record's attributes and the
+	// file's resolved resource attributes.
+	LogMetrics *metrics.DynamicMetricSet
 	// MultilineTimeout flushes buffered fragment runs and multi-line groups
 	// that have not completed within this duration.
 	MultilineTimeout time.Duration
@@ -361,8 +371,10 @@ type entry struct {
 	// match names the multiline pattern that produced a joined entry ("" for
 	// plain single lines).
 	match string
-	// offset is the file offset just after the physical line that completed
-	// this entry; committing it marks the entry as exported.
+	// start is the file offset of the first byte of the entry (exposed as
+	// log.file.position); offset is the offset just after the physical line
+	// that completed it, and committing offset marks the entry as exported.
+	start  int64
 	offset int64
 	// gen is the file's rotation generation when the entry was emitted. Only
 	// entries of the file's current generation drive its committed offset:
@@ -671,11 +683,11 @@ func (t *Tailer) newPipeline(f *file) {
 			if n == 0 {
 				return nil
 			}
-			end := items[n-1].end
+			start, end := items[0].start, items[n-1].end
 			f.fifo[e.Key] = items[n:]
 			t.emit(f, entry{
 				time: e.Data, stream: streamOf(e.Key), body: e.Text,
-				truncated: e.Truncated, match: e.Match, offset: end,
+				truncated: e.Truncated, match: e.Match, start: start, offset: end,
 			})
 			return nil
 		}, multiline.WithMaxBytes(t.cfg.MaxEntryBytes), multiline.WithMaxLines(512))
@@ -692,7 +704,9 @@ func (t *Tailer) newPipeline(f *file) {
 			delete(f.runStart, key)
 			end := f.lastEnd[key]
 			if f.traces == nil {
-				t.emit(f, entry{time: when, stream: streamOf(key), body: line, offset: end})
+				// start is the first fragment's offset (threaded through cri as the
+				// entry data), i.e. the logical line's start.
+				t.emit(f, entry{time: when, stream: streamOf(key), body: line, start: start, offset: end})
 				return nil
 			}
 			f.fifo[key] = append(f.fifo[key], logItem{start: start, end: end})
@@ -754,7 +768,7 @@ func (t *Tailer) feedLine(ctx context.Context, f *file, raw string, start, end i
 func (t *Tailer) feedPlainLine(ctx context.Context, f *file, raw string, start, end int64) {
 	when := time.Now()
 	if f.traces == nil {
-		t.emit(f, entry{time: when, body: raw, offset: end})
+		t.emit(f, entry{time: when, body: raw, start: start, offset: end})
 		return
 	}
 	f.fifo[plainKey] = append(f.fifo[plainKey], logItem{start: start, end: end})
@@ -1059,7 +1073,7 @@ func (t *Tailer) consume(ctx context.Context, f *file) {
 		if len(line) == 0 {
 			continue
 		}
-		t.feedLine(ctx, f, f.source.decode(line), start, f.lineStart)
+		t.feedLine(ctx, f, string(line), start, f.lineStart)
 	}
 }
 
@@ -1211,7 +1225,7 @@ func (t *Tailer) feedPrefix(ctx context.Context, f *file, p rotatedPrefix) {
 				pos += int64(i + 1)
 				carry = carry[i+1:]
 				if len(line) > 0 {
-					t.feedLine(ctx, f, f.source.decode(line), start, pos)
+					t.feedLine(ctx, f, string(line), start, pos)
 				}
 			}
 		}
@@ -1331,9 +1345,47 @@ func (t *Tailer) flush(ctx context.Context) {
 		if e.match != "" {
 			lr.Attributes().PutStr("log.multiline.match", e.match)
 		}
+		if t.cfg.FileAttributes {
+			lr.Attributes().PutStr("log.file.name", filepath.Base(e.file.path))
+			lr.Attributes().PutInt("log.file.position", e.start)
+		}
 		logattrs.Put(lr.Attributes(), extracted.Log)
 		if t.cfg.Enrich {
 			logenrich.Apply(lr, e.body)
+		}
+		if t.cfg.LogMetrics != nil {
+			// Metric label/value keys resolve against the record's attributes
+			// (line-derived + enriched) first, then the file's resource
+			// attributes (k8s metadata).
+			recAttrs, resAttrs := lr.Attributes(), e.file.resource.Attributes()
+			lookup := func(k string) (pcommon.Value, bool) {
+				if v, ok := recAttrs.Get(k); ok {
+					return v, true
+				}
+				return resAttrs.Get(k)
+			}
+			labels := func(k string) string {
+				if v, ok := lookup(k); ok {
+					return v.AsString()
+				}
+				return ""
+			}
+			values := func(k string) float64 {
+				v, ok := lookup(k)
+				if !ok {
+					return 0
+				}
+				switch v.Type() {
+				case pcommon.ValueTypeDouble:
+					return v.Double()
+				case pcommon.ValueTypeInt:
+					return float64(v.Int())
+				default:
+					f, _ := strconv.ParseFloat(v.AsString(), 64)
+					return f
+				}
+			}
+			t.cfg.LogMetrics.Add(values, labels, e.body)
 		}
 		touched[e.file] = struct{}{}
 		// Only entries of the file's current rotation generation advance its

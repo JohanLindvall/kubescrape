@@ -58,7 +58,7 @@ func TestHTTPExportWithBearer(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer c.Close()
+	defer func() { _ = c.Close() }()
 	if err := c.ExportMetrics(context.Background(), testMetrics()); err != nil {
 		t.Fatal(err)
 	}
@@ -166,7 +166,7 @@ func TestGRPCExport(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer c.Close()
+	defer func() { _ = c.Close() }()
 
 	ld := plog.NewLogs()
 	ld.ResourceLogs().AppendEmpty().ScopeLogs().AppendEmpty().LogRecords().AppendEmpty().Body().SetStr("hi")

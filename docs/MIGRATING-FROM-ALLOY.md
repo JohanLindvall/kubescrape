@@ -37,16 +37,17 @@ disable individually with `agent.cadvisor` / `agent.nodeMetrics`. The
 
 ```yaml
 agent:
-  attrsConfig:
-    attributes:
-      k8s.node.zone: '{{ with .Node }}{{ index .Labels "topology.kubernetes.io/zone" }}{{ end }}'
-      k8s.node.type: '{{ with .Node }}{{ index .Labels "node.kubernetes.io/instance-type" }}{{ end }}'
-      k8s.node.agentpool: '{{ with .Node }}{{ index .Labels "agentpool" }}{{ end }}'
-      k8s.node.arch: '{{ with .Node }}{{ index .Labels "kubernetes.io/arch" }}{{ end }}'
-    pipelines:
-      node:
-        attributes:
-          service.name: aks-node
+  config:
+    resourceAttributes:
+      attributes:
+        k8s.node.zone: '{{ with .Node }}{{ index .Labels "topology.kubernetes.io/zone" }}{{ end }}'
+        k8s.node.type: '{{ with .Node }}{{ index .Labels "node.kubernetes.io/instance-type" }}{{ end }}'
+        k8s.node.agentpool: '{{ with .Node }}{{ index .Labels "agentpool" }}{{ end }}'
+        k8s.node.arch: '{{ with .Node }}{{ index .Labels "kubernetes.io/arch" }}{{ end }}'
+      pipelines:
+        node:
+          attributes:
+            service.name: aks-node
 ```
 
 cadvisor attribution is *stronger* than the Alloy pipeline: series are keyed
@@ -56,24 +57,25 @@ pause-container/`drop_empty_cadvisor` special cases are built in
 
 ### `filter_metrics` + the node-scrape filter
 
-`agent.metricsConfig.pipelines`: ordered keep/drop rules, first match wins.
+`agent.config.metrics.pipelines`: ordered keep/drop rules, first match wins.
 The keep-exception-then-drop shape translates directly:
 
 ```yaml
 agent:
-  metricsConfig:
-    pipelines:
-      all:
-        - action: keep
-          metrics: 'envoy_(cluster_(upstream_(rq(_total|_xx|_completed)?|cx_total))|requests_total)'
-        - action: drop
-          metrics: '(envoy_|otelcol_|prometheus_|rest_client_|cortex_|csi_|grafana_|loki_|thanos_).+'
-      node:
-        - action: keep
-          metrics: 'container_network_(receive|transmit)_bytes_total'
-          labels: {interface: eth0}
-        - action: drop
-          metrics: 'container_network_.+|container_tasks_state|kubelet_runtime_operations_duration_seconds_bucket'
+  config:
+    metrics:
+      pipelines:
+        all:
+          - action: keep
+            metrics: 'envoy_(cluster_(upstream_(rq(_total|_xx|_completed)?|cx_total))|requests_total)'
+          - action: drop
+            metrics: '(envoy_|otelcol_|prometheus_|rest_client_|cortex_|csi_|grafana_|loki_|thanos_).+'
+        node:
+          - action: keep
+            metrics: 'container_network_(receive|transmit)_bytes_total'
+            labels: {interface: eth0}
+          - action: drop
+            metrics: 'container_network_.+|container_tasks_state|kubelet_runtime_operations_duration_seconds_bucket'
 ```
 
 ### `prometheus_to_otel` (kube-state-metrics, kubelet-stats regrouping)
@@ -82,22 +84,23 @@ The ~400 lines of `groupbyattrs`/`transform` OTTL become splitter rules:
 
 ```yaml
 agent:
-  metricsConfig:
-    splitters:
-      - match:
-          podLabels: {app.kubernetes.io/name: kube-state-metrics}
-        rules:
-          - metrics: 'kube_pod_.+'
-            groupBy:
-              namespace: k8s.namespace.name
-              pod: k8s.pod.name
-              uid: k8s.pod.uid
-              container: k8s.container.name
-              container_id: container.id
-              node: k8s.node.name
-            enrich: true        # full metadata via the metadata service
-          - metrics: 'kube_.+'
-            groupBy: {namespace: k8s.namespace.name}
+  config:
+    metrics:
+      splitters:
+        - match:
+            podLabels: {app.kubernetes.io/name: kube-state-metrics}
+          rules:
+            - metrics: 'kube_pod_.+'
+              groupBy:
+                namespace: k8s.namespace.name
+                pod: k8s.pod.name
+                uid: k8s.pod.uid
+                container: k8s.container.name
+                container_id: container.id
+                node: k8s.node.name
+              enrich: true        # full metadata via the metadata service
+            - metrics: 'kube_.+'
+              groupBy: {namespace: k8s.namespace.name}
 ```
 
 `enrich: true` replaces the `k8sattributes` association: pods resolve by
@@ -113,25 +116,26 @@ namespace-based defaults are templates:
 agent:
   staticAttrs:
     k8s.cluster.name: prod-eu        # replaces resourcedetection env
-  attrsConfig:
-    attributes:
-      service.name: >-
-        {{ with .Pod }}{{ coalesce (index .Labels "gp/service-name")
-        (index .Labels "app.kubernetes.io/name") (index .Labels "app")
-        (index .Labels "k8s-app") .Name }}{{ end }}
-      platform.product.name: >-
-        {{ with .Pod }}{{ coalesce (index .Labels "gp/software-product")
-        (index .Labels "software-product") (index .Labels "app.kubernetes.io/part-of") }}{{ end }}
-      service.namespace: '{{ with .Pod }}{{ .Namespace }}{{ end }}'
-      service.instance.id: >-
-        {{ with .Container }}{{ .ID }}{{ else }}{{ with .Pod }}{{ .UID }}{{ end }}{{ end }}
+  config:
+    resourceAttributes:
+      attributes:
+        service.name: >-
+          {{ with .Pod }}{{ coalesce (index .Labels "gp/service-name")
+          (index .Labels "app.kubernetes.io/name") (index .Labels "app")
+          (index .Labels "k8s-app") .Name }}{{ end }}
+        platform.product.name: >-
+          {{ with .Pod }}{{ coalesce (index .Labels "gp/software-product")
+          (index .Labels "software-product") (index .Labels "app.kubernetes.io/part-of") }}{{ end }}
+        service.namespace: '{{ with .Pod }}{{ .Namespace }}{{ end }}'
+        service.instance.id: >-
+          {{ with .Container }}{{ .ID }}{{ else }}{{ with .Pod }}{{ .UID }}{{ end }}{{ end }}
 ```
 
 Namespace-based defaulting uses `regexMatch`:
 
 ```yaml
-      platform.product.name: >-
-        {{ with .Pod }}{{ if regexMatch "^tigera-operator$|-system$" .Namespace }}gp-infrastructure{{ end }}{{ end }}
+        platform.product.name: >-
+          {{ with .Pod }}{{ if regexMatch "^tigera-operator$|-system$" .Namespace }}gp-infrastructure{{ end }}{{ end }}
 ```
 
 Unwanted attributes are removed with `-resource-attrs-disable` (the
@@ -162,9 +166,10 @@ Expose the label as an attribute and filter in the collector:
 
 ```yaml
 agent:
-  attrsConfig:
-    attributes:
-      debug_otlp_output: '{{ with .Pod }}{{ index .Labels "debug_otlp_output" }}{{ end }}'
+  config:
+    resourceAttributes:
+      attributes:
+        debug_otlp_output: '{{ with .Pod }}{{ index .Labels "debug_otlp_output" }}{{ end }}'
 ```
 
 with an `otelcol.processor.filter`/debug exporter pair (or a routing

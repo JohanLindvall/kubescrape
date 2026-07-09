@@ -8,10 +8,10 @@ require (
 	github.com/JohanLindvall/logfmt v0.0.4
 	github.com/JohanLindvall/multiline v0.0.1
 	github.com/bmatcuk/doublestar/v4 v4.10.0
+	github.com/cespare/xxhash/v2 v2.3.0
 	github.com/fsnotify/fsnotify v1.10.1
 	github.com/prometheus/client_golang v1.23.2
 	go.opentelemetry.io/collector/pdata v1.61.0
-	golang.org/x/text v0.37.0
 	google.golang.org/grpc v1.82.0
 	k8s.io/api v0.34.1
 	k8s.io/apimachinery v0.34.1
@@ -22,7 +22,6 @@ require (
 
 require (
 	github.com/beorn7/perks v1.0.1 // indirect
-	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/davecgh/go-spew v1.1.1 // indirect
 	github.com/emicklei/go-restful/v3 v3.12.2 // indirect
 	github.com/fxamacker/cbor/v2 v2.9.0 // indirect
@@ -57,6 +56,7 @@ require (
 	golang.org/x/oauth2 v0.36.0 // indirect
 	golang.org/x/sys v0.45.0 // indirect
 	golang.org/x/term v0.43.0 // indirect
+	golang.org/x/text v0.37.0 // indirect
 	golang.org/x/time v0.9.0 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260414002931-afd174a4e478 // indirect
 	google.golang.org/protobuf v1.36.11 // indirect

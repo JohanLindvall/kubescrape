@@ -17,14 +17,16 @@ manifests live in [deploy/](../deploy).
 - [Agent: general](#agent-general)
 - [Agent: OTLP export](#agent-otlp-export)
 - [Agent: log collection](#agent-log-collection)
+- [Unified config file (`-config`)](#unified-config-file)
 - [Agent: log sources](#agent-log-sources)
 - [Agent: journald](#agent-journald)
 - [Agent: log attributes](#agent-log-attributes)
+- [Agent: log metrics](#agent-log-metrics)
 - [Agent: OTLP ingest](#agent-otlp-ingest)
 - [Agent: metrics scraping](#agent-metrics-scraping)
 - [Agent: kubelet scrapes (cadvisor, node)](#agent-kubelet-scrapes)
-- [Resource attributes (`-resource-attrs-config`)](#resource-attributes)
-- [Metrics config (`-metrics-config`)](#metrics-config)
+- [Resource attributes](#resource-attributes)
+- [Metrics config](#metrics-config)
 - [Scrape annotations](#scrape-annotations)
 - [Helm values](#helm-values)
 - [Complete example](#complete-example)
@@ -110,11 +112,10 @@ kubescrape-agent \
 
 | Flag | Default | Description |
 |---|---|---|
-| `-log-dir` | `/var/log/containers` | containerd log directory; the default source when `-logs-config` is unset |
-| `-logs-config` | — | YAML declaring log sources (include/exclude globs, containerd vs plain, resource attributes; [below](#agent-log-sources)) |
+| `-config` | — | single YAML file holding all sections: `resourceAttributes`, `logs`, `logAttributes`, `logMetrics`, `metrics` ([below](#unified-config-file)) |
+| `-log-dir` | `/var/log/containers` | containerd log directory; the default source when the `logs` section is unset |
 | `-checkpoint-file` | — | persists committed offsets across restarts (mount a hostPath); empty disables |
 | `-positions-file` | — | single file holding BOTH log offsets and the journald cursor; overrides `-checkpoint-file` for logs and is the only way to persist the journald cursor |
-| `-log-attributes-config` | — | YAML file lifting JSON/logfmt keys from the line onto attributes ([below](#agent-log-attributes)) |
 | `-logs-watch` | `true` | fsnotify events trigger reads and discovery; polling remains the fallback |
 | `-logs-poll-interval` | `500ms` | fallback sweep interval |
 | `-logs-fingerprint-bytes` | `1024` | file-head hash length used with the inode as file identity (guards against inode reuse and in-place rewrites); negative = inode only |
@@ -124,7 +125,11 @@ kubescrape-agent \
 | `-logs-multiline` | `true` | join stack traces (Go, Java, Python, .NET, Ruby, Rust, PHP) via [multiline](https://github.com/JohanLindvall/multiline) |
 | `-logs-multiline-timeout` | `1s` | flush incomplete multi-line groups after this long |
 | `-logs-enrich` | `true` | parse per-line metadata via [enrich](https://github.com/JohanLindvall/enrich): a timestamp in the line replaces the CRI time, an explicit level sets the severity, trace/span IDs fill the OTLP trace fields, exception/template/source-context details become record attributes. JSON, logfmt and common plain-text formats are recognized; the body is never modified, and plain-text stack traces are not duplicated into `exception.stacktrace`. Hit rates: `kubescrape_log_enriched_total{format}` on `/metrics` |
+| `-logs-file-attributes` | `false` | stamp `log.file.name` (basename) and `log.file.position` (byte offset past the record) on every record, for each file source |
 | `-logs-exclude-namespaces` | — | comma-separated namespaces not tailed — **always exclude the namespace of your collector** to avoid feedback loops |
+| `-logs-metrics-interval` | `30s` | export interval for the `logMetrics` metrics ([below](#agent-log-metrics)) |
+| `-logs-metrics-max-bytes` | `3MiB` | export log-derived metrics in chunks below this many bytes (0 = one payload) |
+| `-logs-metrics-name-prefix` | — | prefix prepended to every log-derived metric name |
 
 Delivery is at-least-once: offsets are committed only after the collector
 acknowledged the batch and never past lines still buffered in the multiline
@@ -156,26 +161,43 @@ committed cursor with backoff (re-reading anything in flight). The cursor is
 persisted only through `-positions-file` (there is no standalone journald
 cursor file); without it, every start begins at the journal tail.
 
-## Agent: log sources
+## Unified config file
 
-By default the agent tails containerd container logs under `-log-dir`.
-`-logs-config` points at a YAML file that instead declares **sources** —
-arbitrary files selected by globs, each either containerd (CRI parsing + pod
-metadata) or plain (static resource attributes). All sources use the identical
-rotation, offset-checkpoint and cross-rotation multi-line machinery.
+All of the agent's YAML configuration lives in one file, passed with `-config`.
+Every section is optional and mirrors the shape of the standalone file it
+replaces, so migrating means nesting the former file under its section key:
 
 ```yaml
-sources:
-  - name: containers          # keep tailing container logs
-    include: ["/var/log/containers/*.log"]
-    containerd: true
-  - name: host                # plus arbitrary host logs
-    include: ["/var/log/**/*.log"]     # ** matches any depth (doublestar)
-    exclude: ["/var/log/containers/*.log", "/var/log/azure/*.log"]
-    multiline: true           # optional per-source override
-    attributes:               # resource attributes for these (non-containerd) files
-      service.name: host-syslog
-      log.source: host
+resourceAttributes: {...}          # see Resource attributes
+logs:          {sources: [...]}    # see Agent: log sources
+logAttributes: {rules: [...]}      # see Agent: log attributes
+logMetrics:    {metrics: [...]}    # see Agent: log metrics
+metrics:       {pipelines: {...}, splitters: [...]}   # see Metrics config
+```
+
+The sections below document each in turn.
+
+## Agent: log sources
+
+By default the agent tails containerd container logs under `-log-dir`. The
+`logs` section instead declares **sources** — arbitrary files selected by
+globs, each either containerd (CRI parsing + pod metadata) or plain (static
+resource attributes). All sources use the identical rotation, offset-checkpoint
+and cross-rotation multi-line machinery.
+
+```yaml
+logs:
+  sources:
+    - name: containers          # keep tailing container logs
+      include: ["/var/log/containers/*.log"]
+      containerd: true
+    - name: host                # plus arbitrary host logs
+      include: ["/var/log/**/*.log"]     # ** matches any depth (doublestar)
+      exclude: ["/var/log/containers/*.log", "/var/log/azure/*.log"]
+      multiline: true           # optional per-source override
+      attributes:               # resource attributes for these (non-containerd) files
+        service.name: host-syslog
+        log.source: host
 ```
 
 Per source: `include`/`exclude` are doublestar globs (`**` supported);
@@ -187,12 +209,8 @@ overrides `-logs-multiline` for that source. A file is claimed by the first
 source that matches it. Container logs keep working because the default
 (no-config) behavior is exactly one containerd source over `-log-dir`.
 
-Two more per-source options:
+Per-source option:
 
-- `encoding` transcodes line content to UTF-8 from a named character set
-  (IANA/WHATWG names — `windows-1252`, `iso-8859-1`, `gbk`, `shift_jis`, …).
-  Empty/`utf-8` means no transcoding. Lines are split on `\n`, so encodings
-  where the newline is not a single `0x0A` byte (UTF-16/32) are unsupported.
 - `compressed` reads matched files as gzip, decompressing on the fly (files
   ending in `.gz` are detected automatically). Compressed files are treated as
   **archives** — read once to completion, not tailed — so, unlike plain
@@ -205,17 +223,18 @@ indentation-based traces (Python, Java, .NET) join normally.
 
 ## Agent: log attributes
 
-`-log-attributes-config` points at a YAML file lifting configured keys out of
-each structured log line (JSON or logfmt) onto the exported record. Applies to
-both `-logs` and `-journald`.
+The `logAttributes` section lifts configured keys out of each structured log
+line (JSON or logfmt) onto the exported record. Applies to both `-logs` and
+`-journald`.
 
 ```yaml
-rules:
-  - key: tenant             # JSON/logfmt key; dotted keys descend into JSON
-    attribute: tenant.id    # exported name (defaults to key)
-    target: resource        # resource | scope | log (default log)
-  - key: http.status_code   # nested JSON path a.b.c
-    target: log
+logAttributes:
+  rules:
+    - key: tenant             # JSON/logfmt key; dotted keys descend into JSON
+      attribute: tenant.id    # exported name (defaults to key)
+      target: resource        # resource | scope | log (default log)
+    - key: http.status_code   # nested JSON path a.b.c
+      target: log
 ```
 
 JSON is scanned once for all rule paths with the
@@ -225,6 +244,77 @@ JSON type (integers → int, fractional → double, booleans → bool). Because
 resource and scope attributes decide an OTLP record's grouping, records whose
 line-derived resource/scope attributes differ are split into separate
 `ResourceLogs`/`ScopeLogs`.
+
+## Agent: log metrics
+
+The `logMetrics` section distills log lines into metrics exported over OTLP,
+instead of (or alongside) shipping the lines. Only the configured metrics are
+exported. Runtime knobs are the `-logs-metrics-interval`,
+`-logs-metrics-max-bytes` and `-logs-metrics-name-prefix` flags.
+
+```yaml
+logMetrics:
+  # Resource attributes auto-promoted to a label on every metric so series are
+  # per-pod/namespace/… by default. This is the built-in default; set to [] to
+  # disable set-wide. Metrics override with their own streamLabels.
+  streamLabels: [k8s.namespace.name, k8s.pod.name, k8s.container.name, k8s.node.name, service.name]
+  metrics:
+    - name: http_requests_total
+      type: counter                 # counter (default) | gauge | histogram | summary
+      value: "1"                    # numeric field to observe, or "1" to count lines
+      match: ["level=info"]         # exact selectors (key=value / key!=value)
+      matchRegexp: ["msg=^request"] # regex selectors on the value
+      labels:                       # label DSL (see below)
+        - status=$http_status       # passthrough: label status = field http_status
+        - class=$http_status(_xx)   # mask: 503 → 5xx (keep chars where pattern is _)
+        - path=$path/[0-9]+/:id/    # regex replace: /pattern/replacement/
+        - method                    # bare key: label method = field method
+        - env=prod                  # literal value
+      maxCardinality: 5000          # cap on unique label sets (hard cap 10000)
+      maxAge: 1h                    # expire idle series (default/cap 24h)
+      labelPrefix: ""               # optional prefix on every label name
+    - name: request_duration_seconds
+      type: histogram
+      value: duration_s
+      buckets: [0.1, 0.5, 1, 5]
+      match: ["msg=request completed"]
+    - name: goroutine_panics_total  # __line__ = the whole raw line
+      type: counter
+      value: "1"
+      matchRegexp: ["__line__=^panic:"]
+      streamLabels: [k8s.namespace.name]   # override to aggregate per namespace
+    - name: slow_request_seconds_total
+      type: counter
+      valueRegexp: 'took ([0-9.]+)s' # capture the value from an unstructured line
+      matchRegexp: ["__line__=slow request"]
+    - name: open_connections
+      type: gauge
+      action: inc                   # set (default) | inc | dec | add | sub
+      match: ["event=connect"]
+```
+
+Value, selector and label keys resolve against the record's enriched and
+resource attributes (k8s metadata) first, then straight from the log line's own
+JSON/logfmt fields (dotted keys descend into nested JSON) — so a metric can read
+any field of the line without a separate `logAttributes` rule. Additional knobs:
+
+- **Automatic stream labels** — the k8s identity of the line's pod (namespace,
+  pod, container, node, `service.name`) is added as labels to every metric by
+  default, giving per-pod series out of the box. Override `streamLabels`
+  set-wide or per-metric (a coarser list, or `[]`) to aggregate; an explicit
+  `labels` entry with the same name overrides the automatic one.
+- **`__line__`** is a synthetic selector/label key holding the whole raw line,
+  for filtering on line contents (e.g. `matchRegexp: ["__line__=^panic:"]`).
+- **`valueRegexp`** extracts the observed value from the raw line via a regex
+  capture group (group 1, or the whole match); mutually exclusive with `value`.
+  A line that does not match is skipped.
+- **`action`** (gauge only): `set` (default, last value wins), `inc`/`dec`
+  (±1 per matching line, no value needed), `add`/`sub` (±the observed value).
+
+`histogram` exports cumulative OTLP histograms; `summary` carries a running
+count and sum (no quantiles); `counter` emits a monotonic sum (with synthetic
+zero baseline points). Rules sharing a `name` share one underlying series (and
+must agree on type/action).
 
 ## Agent: OTLP ingest
 
@@ -258,7 +348,9 @@ the pod. Outcomes count into `kubescrape_ingest_resources_total{outcome}`
 | `-scrape-max-samples` | `0` | abort a single scrape beyond this many samples (0 = unlimited) |
 | `-scrape-exemplars` | `false` | negotiate OpenMetrics and attach exemplars to counter and histogram points (`trace_id`/`span_id` map to OTLP trace/span fields) |
 | `-scrape-health-metrics` | `true` | export synthetic `up`, `scrape_duration_seconds` and `scrape_samples_scraped` gauges per target after each cycle |
-| `-metrics-config` | — | YAML file with series filters and target splitters ([below](#metrics-config)) |
+
+Series filters and target splitters live in the `metrics` section of `-config`
+([below](#metrics-config)).
 
 Histograms and summaries are converted to proper OTLP Histogram/Summary
 points (de-cumulated buckets, explicit bounds, quantiles); counters become
@@ -281,9 +373,8 @@ cgroup pod UID.
 
 ## Resource attributes
 
-`-resource-attrs-config` points at a YAML file controlling how resource
-attributes are built for **all** exported data (logs and metrics). Quick
-knobs also exist as flags:
+The `resourceAttributes` section controls how resource attributes are built for
+**all** exported data (logs and metrics). Quick knobs also exist as flags:
 
 * `-resource-attrs-static=cluster=prod,env=eu` — fixed attributes.
 * `-resource-attrs-enable=<regex,...>` / `-resource-attrs-disable=<regex,...>`
@@ -291,37 +382,38 @@ knobs also exist as flags:
   matches the enable set (empty = all) and not the disable set (empty =
   none).
 
-The config file:
+The config section:
 
 ```yaml
-# Include the built-in mapping: k8s.namespace.name, k8s.pod.name,
-# k8s.pod.uid, k8s.node.name, owners (k8s.deployment.name, ...), pod labels
-# (k8s.pod.label.*), namespace labels, container.id, container.image.name,
-# service.name (top owner). Default true.
-defaults: true
+resourceAttributes:
+  # Include the built-in mapping: k8s.namespace.name, k8s.pod.name,
+  # k8s.pod.uid, k8s.node.name, owners (k8s.deployment.name, ...), pod labels
+  # (k8s.pod.label.*), namespace labels, container.id, container.image.name,
+  # service.name (top owner). Default true.
+  defaults: true
 
-# Fixed attributes on every resource (flag statics override these).
-static:
-  k8s.cluster.name: prod-eu
+  # Fixed attributes on every resource (flag statics override these).
+  static:
+    k8s.cluster.name: prod-eu
 
-# Go templates evaluated per resource against {Node, Pod, Container,
-# Service}. Empty or failing templates (e.g. .Container on a pod-level
-# resource) omit the attribute.
-attributes:
-  team: '{{ index .Pod.Labels "team" }}'
-  container.image: '{{ with .Container }}{{ .Image }}{{ end }}'
-  k8s.node.zone: '{{ with .Node }}{{ index .Labels "topology.kubernetes.io/zone" }}{{ end }}'
-  service.name: >-
-    {{ with .Pod }}{{ coalesce (index .Labels "gp/service-name")
-    (index .Labels "app.kubernetes.io/name") .Name }}{{ end }}
-  infra: '{{ with .Pod }}{{ if regexMatch "-system$" .Namespace }}yes{{ end }}{{ end }}'
+  # Go templates evaluated per resource against {Node, Pod, Container,
+  # Service}. Empty or failing templates (e.g. .Container on a pod-level
+  # resource) omit the attribute.
+  attributes:
+    team: '{{ index .Pod.Labels "team" }}'
+    container.image: '{{ with .Container }}{{ .Image }}{{ end }}'
+    k8s.node.zone: '{{ with .Node }}{{ index .Labels "topology.kubernetes.io/zone" }}{{ end }}'
+    service.name: >-
+      {{ with .Pod }}{{ coalesce (index .Labels "gp/service-name")
+      (index .Labels "app.kubernetes.io/name") .Name }}{{ end }}
+    infra: '{{ with .Pod }}{{ if regexMatch "-system$" .Namespace }}yes{{ end }}{{ end }}'
 
-# Per-pipeline overrides (logs | targets | cadvisor | node | journal | ingest); maps
-# merge with the pipeline entry winning.
-pipelines:
-  node:
-    attributes:
-      service.name: kubelet
+  # Per-pipeline overrides (logs | targets | cadvisor | node | journal | ingest);
+  # maps merge with the pipeline entry winning.
+  pipelines:
+    node:
+      attributes:
+        service.name: kubelet
 ```
 
 Template context and functions:
@@ -342,7 +434,8 @@ Order of application: defaults → static → templates → enable/disable filte
 
 ## Metrics config
 
-`-metrics-config` points at a YAML file with two sections.
+The `metrics` section (for scraped series, distinct from `logMetrics`) has two
+subsections.
 
 **`pipelines`** — ordered keep/drop rules per pipeline (`all` is prepended
 to every pipeline; then `targets`, `cadvisor`, `node`). First matching rule
@@ -351,18 +444,19 @@ must all match (a missing label matches `""`). Filtering happens on the
 scraped series names (`foo_bucket`, …) before histogram grouping.
 
 ```yaml
-pipelines:
-  all:
-    - action: keep                # exceptions go before the drop they pierce
-      metrics: 'envoy_requests_total'
-    - action: drop
-      metrics: '(envoy_|otelcol_|prometheus_|go_|process_).+'
-  cadvisor:
-    - action: keep
-      metrics: 'container_network_.+'
-      labels: {interface: eth0}
-    - action: drop
-      metrics: 'container_network_.+'
+metrics:
+  pipelines:
+    all:
+      - action: keep                # exceptions go before the drop they pierce
+        metrics: 'envoy_requests_total'
+      - action: drop
+        metrics: '(envoy_|otelcol_|prometheus_|go_|process_).+'
+    cadvisor:
+      - action: keep
+        metrics: 'container_network_.+'
+        labels: {interface: eth0}
+      - action: drop
+        metrics: 'container_network_.+'
 ```
 
 **`splitters`** — re-attribute targets whose series describe *other*
@@ -375,22 +469,23 @@ service (by `container.id` if mapped, else namespace+name, cross-checked
 against a mapped `k8s.pod.uid`) and carries the full metadata set.
 
 ```yaml
-splitters:
-  - match:                        # all set fields must match the target pod
-      namespace: monitoring       # anchored regex
-      podLabels:
-        app.kubernetes.io/name: kube-state-metrics
-    rules:
-      - metrics: 'kube_pod_.+'
-        groupBy:
-          namespace: k8s.namespace.name
-          pod: k8s.pod.name
-          uid: k8s.pod.uid
-          container: k8s.container.name
-          node: k8s.node.name
-        enrich: true
-      - metrics: 'kube_.+'
-        groupBy: {namespace: k8s.namespace.name}
+metrics:
+  splitters:
+    - match:                        # all set fields must match the target pod
+        namespace: monitoring       # anchored regex
+        podLabels:
+          app.kubernetes.io/name: kube-state-metrics
+      rules:
+        - metrics: 'kube_pod_.+'
+          groupBy:
+            namespace: k8s.namespace.name
+            pod: k8s.pod.name
+            uid: k8s.pod.uid
+            container: k8s.container.name
+            node: k8s.node.name
+          enrich: true
+        - metrics: 'kube_.+'
+          groupBy: {namespace: k8s.namespace.name}
 ```
 
 ## Scrape annotations
@@ -416,9 +511,9 @@ unauthenticated.
 
 ## Helm values
 
-Every flag above maps to a value; `agent.attrsConfig` and
-`agent.metricsConfig` are rendered verbatim into the mounted config files
-(with checksum annotations, so config changes roll the DaemonSet). See
+Every flag above maps to a value; `agent.config` is rendered verbatim into the
+single mounted `-config` file (with a checksum annotation, so config changes
+roll the DaemonSet). See
 [charts/kubescrape/values.yaml](../charts/kubescrape/values.yaml) for the
 full annotated list.
 
@@ -450,38 +545,47 @@ agent:
   staticAttrs:
     k8s.cluster.name: prod-eu
 
-  attrsConfig:
-    attributes:
-      k8s.node.zone: '{{ with .Node }}{{ index .Labels "topology.kubernetes.io/zone" }}{{ end }}'
-      service.name: >-
-        {{ with .Pod }}{{ coalesce (index .Labels "app.kubernetes.io/name")
-        (index .Labels "app") .Name }}{{ end }}
+  config:
+    resourceAttributes:
+      attributes:
+        k8s.node.zone: '{{ with .Node }}{{ index .Labels "topology.kubernetes.io/zone" }}{{ end }}'
+        service.name: >-
+          {{ with .Pod }}{{ coalesce (index .Labels "app.kubernetes.io/name")
+          (index .Labels "app") .Name }}{{ end }}
 
-  metricsConfig:
-    pipelines:
-      all:
-        - action: drop
-          metrics: '(go_|process_)generic_noise_.+'
-      cadvisor:
-        - action: keep
-          metrics: 'container_network_.+'
-          labels: {interface: eth0}
-        - action: drop
-          metrics: 'container_network_.+'
-    splitters:
-      - match:
-          podLabels: {app.kubernetes.io/name: kube-state-metrics}
-        rules:
-          - metrics: 'kube_pod_.+'
-            groupBy:
-              namespace: k8s.namespace.name
-              pod: k8s.pod.name
-              uid: k8s.pod.uid
-              container: k8s.container.name
-              node: k8s.node.name
-            enrich: true
-          - metrics: 'kube_.+'
-            groupBy: {namespace: k8s.namespace.name}
+    logMetrics:
+      metrics:
+        - name: http_requests_total
+          type: counter
+          value: "1"
+          match: ["level=info", "msg=request completed"]
+          labels: [status=$http_status, class=$http_status(_xx)]
+
+    metrics:
+      pipelines:
+        all:
+          - action: drop
+            metrics: '(go_|process_)generic_noise_.+'
+        cadvisor:
+          - action: keep
+            metrics: 'container_network_.+'
+            labels: {interface: eth0}
+          - action: drop
+            metrics: 'container_network_.+'
+      splitters:
+        - match:
+            podLabels: {app.kubernetes.io/name: kube-state-metrics}
+          rules:
+            - metrics: 'kube_pod_.+'
+              groupBy:
+                namespace: k8s.namespace.name
+                pod: k8s.pod.name
+                uid: k8s.pod.uid
+                container: k8s.container.name
+                node: k8s.node.name
+              enrich: true
+            - metrics: 'kube_.+'
+              groupBy: {namespace: k8s.namespace.name}
 ```
 
 ```sh

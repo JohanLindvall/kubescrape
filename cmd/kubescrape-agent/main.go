@@ -29,6 +29,7 @@ import (
 	"github.com/JohanLindvall/kubescrape/internal/agent/positions"
 	"github.com/JohanLindvall/kubescrape/internal/agent/promscrape"
 	"github.com/JohanLindvall/kubescrape/internal/agent/tailer"
+	"github.com/JohanLindvall/kubescrape/internal/metrics"
 	"github.com/JohanLindvall/kubescrape/internal/obs"
 )
 
@@ -41,6 +42,7 @@ func main() {
 
 func run() error {
 	var (
+		configFile   = flag.String("config", "", "unified YAML config file with resourceAttributes, logs, logAttributes, logMetrics and metrics sections (each mirrors its former standalone file)")
 		nodeName     = flag.String("node-name", os.Getenv("NODE_NAME"), "name of the node this agent runs on (default $NODE_NAME)")
 		listen       = flag.String("listen", ":8081", "HTTP listen address for /healthz, /readyz and /metrics (empty disables)")
 		metadataURL  = flag.String("metadata-endpoint", "http://kubescrape.monitoring", "base URL of the kubescrape metadata service")
@@ -58,21 +60,23 @@ func run() error {
 		logLevel  = flag.String("log-level", "info", "log level: debug, info, warn, error")
 		logFormat = flag.String("log-format", "text", "log format: text or json")
 
-		logDir          = flag.String("log-dir", "/var/log/containers", "directory of containerd log symlinks (the default source when -logs-config is unset)")
-		logsConfig      = flag.String("logs-config", "", "YAML file declaring log sources (include/exclude globs, containerd vs plain, resource attributes); empty tails -log-dir as containerd logs")
-		positionsFile   = flag.String("positions-file", "", "single file persisting BOTH log offsets and the journald cursor across restarts (overrides -checkpoint-file for logs; required for journald cursor persistence)")
-		checkpointFile  = flag.String("checkpoint-file", "", "file persisting log read offsets across restarts (empty disables; ignored when -positions-file is set)")
-		logsBatch       = flag.Int("logs-batch-size", 1024, "flush logs after this many entries")
-		logsFlush       = flag.Duration("logs-flush-interval", 2*time.Second, "flush logs at least this often")
-		maxEntryBytes   = flag.Int("logs-max-entry-bytes", 1<<20, "truncate assembled log entries beyond this size")
-		multilineOn     = flag.Bool("logs-multiline", true, "join application-level multi-line entries (stack traces, ...)")
-		multilineWait   = flag.Duration("logs-multiline-timeout", time.Second, "flush incomplete multi-line groups after this long")
-		excludeNs       = flag.String("logs-exclude-namespaces", "", "comma-separated namespaces whose container logs are not tailed")
-		logsEnrich      = flag.Bool("logs-enrich", true, "parse per-line metadata (timestamp, severity, trace/span IDs, exception details) into the OTLP record fields via github.com/JohanLindvall/enrich")
-		logAttrsConfig  = flag.String("log-attributes-config", "", "YAML file mapping JSON/logfmt keys in the log line to resource/scope/log attributes (applies to -logs and -journald)")
-		logsWatch       = flag.Bool("logs-watch", true, "use file events (fsnotify) to trigger reads and discovery; polling remains the fallback")
-		logsPoll        = flag.Duration("logs-poll-interval", 500*time.Millisecond, "fallback sweep interval for the log tailer")
-		logsFingerprint = flag.Int("logs-fingerprint-bytes", 1024, "file-head hash length used with the inode as file identity (negative = inode only)")
+		logDir            = flag.String("log-dir", "/var/log/containers", "directory of containerd log symlinks (the default source when the config's logs section is unset)")
+		positionsFile     = flag.String("positions-file", "", "single file persisting BOTH log offsets and the journald cursor across restarts (overrides -checkpoint-file for logs; required for journald cursor persistence)")
+		checkpointFile    = flag.String("checkpoint-file", "", "file persisting log read offsets across restarts (empty disables; ignored when -positions-file is set)")
+		logsBatch         = flag.Int("logs-batch-size", 1024, "flush logs after this many entries")
+		logsFlush         = flag.Duration("logs-flush-interval", 2*time.Second, "flush logs at least this often")
+		maxEntryBytes     = flag.Int("logs-max-entry-bytes", 1<<20, "truncate assembled log entries beyond this size")
+		multilineOn       = flag.Bool("logs-multiline", true, "join application-level multi-line entries (stack traces, ...)")
+		multilineWait     = flag.Duration("logs-multiline-timeout", time.Second, "flush incomplete multi-line groups after this long")
+		excludeNs         = flag.String("logs-exclude-namespaces", "", "comma-separated namespaces whose container logs are not tailed")
+		logsEnrich        = flag.Bool("logs-enrich", true, "parse per-line metadata (timestamp, severity, trace/span IDs, exception details) into the OTLP record fields via github.com/JohanLindvall/enrich")
+		logsFileAttrs     = flag.Bool("logs-file-attributes", false, "stamp log.file.name and log.file.position (byte offset) on every log record, for each file source")
+		logsMetricsEvery  = flag.Duration("logs-metrics-interval", 30*time.Second, "export interval for log-derived metrics")
+		logsMetricsBytes  = flag.Int("logs-metrics-max-bytes", 3<<20, "export log-derived metrics in chunks below this many bytes (0 = one payload)")
+		logsMetricsPrefix = flag.String("logs-metrics-name-prefix", "", "prefix prepended to every log-derived metric name")
+		logsWatch         = flag.Bool("logs-watch", true, "use file events (fsnotify) to trigger reads and discovery; polling remains the fallback")
+		logsPoll          = flag.Duration("logs-poll-interval", 500*time.Millisecond, "fallback sweep interval for the log tailer")
+		logsFingerprint   = flag.Int("logs-fingerprint-bytes", 1024, "file-head hash length used with the inode as file identity (negative = inode only)")
 
 		journaldOn     = flag.Bool("journald", false, "tail the systemd journal via journalctl (the binary must exist in the image)")
 		journaldPath   = flag.String("journald-path", "journalctl", "journalctl binary")
@@ -89,7 +93,6 @@ func run() error {
 		maxSamples        = flag.Int("scrape-max-samples", 0, "abort a single scrape beyond this many samples (0 = unlimited)")
 		exemplars         = flag.Bool("scrape-exemplars", false, "negotiate OpenMetrics and attach exemplars to counter and histogram data points")
 		healthMetrics     = flag.Bool("scrape-health-metrics", true, "export synthetic up/scrape_duration_seconds/scrape_samples_scraped gauges per target")
-		metricsConfig     = flag.String("metrics-config", "", "YAML file with per-pipeline keep/drop rules for scraped series and target splitters (empty keeps all)")
 
 		kubeletEndpoint = flag.String("kubelet-endpoint", "", "kubelet base URL, e.g. https://$(NODE_IP):10250 (empty disables the cadvisor and node-metrics scrapes)")
 		kubeletToken    = flag.String("kubelet-token-file", "/var/run/secrets/kubernetes.io/serviceaccount/token", "bearer token file for the kubelet (re-read per scrape)")
@@ -98,7 +101,6 @@ func run() error {
 		attrsEnable  = flag.String("resource-attrs-enable", "", "comma-separated anchored regexes; only matching resource attributes are exported (empty enables all)")
 		attrsDisable = flag.String("resource-attrs-disable", "", "comma-separated anchored regexes; matching resource attributes are dropped (empty disables none)")
 		attrsStatic  = flag.String("resource-attrs-static", "", "comma-separated key=value attributes added to every exported resource")
-		attrsConfig  = flag.String("resource-attrs-config", "", "YAML file declaring resource attribute building (defaults, static, template attributes, per-pipeline overrides)")
 		nodeRefresh  = flag.Duration("node-metadata-refresh", time.Minute, "refresh interval for the node's labels/annotations used in attribute templates (0 disables the lookup)")
 
 		// Pipeline toggles.
@@ -133,7 +135,17 @@ func run() error {
 	}
 	slog.SetDefault(log)
 
-	attrBuilders, err := buildAttrs(*attrsConfig, *attrsStatic, *attrsEnable, *attrsDisable)
+	// All YAML config lives in one file; each section is optional.
+	var fileCfg agentConfig
+	if *configFile != "" {
+		c, err := loadAgentConfig(*configFile)
+		if err != nil {
+			return fmt.Errorf("config: %w", err)
+		}
+		fileCfg = *c
+	}
+
+	attrBuilders, err := buildAttrs(fileCfg.ResourceAttributes, *attrsStatic, *attrsEnable, *attrsDisable)
 	if err != nil {
 		return fmt.Errorf("resource attributes: %w", err)
 	}
@@ -147,12 +159,8 @@ func run() error {
 
 	// Optional log-line attribute lifting, shared by the tailer and journald.
 	var logAttrs *logattrs.Extractor
-	if *logAttrsConfig != "" {
-		cfg, err := logattrs.LoadConfig(*logAttrsConfig)
-		if err != nil {
-			return fmt.Errorf("log attributes config: %w", err)
-		}
-		if logAttrs, err = logattrs.New(cfg); err != nil {
+	if fileCfg.LogAttributes != nil {
+		if logAttrs, err = logattrs.New(fileCfg.LogAttributes); err != nil {
 			return fmt.Errorf("log attributes config: %w", err)
 		}
 	}
@@ -164,8 +172,11 @@ func run() error {
 
 	var metricFilters *promscrape.MetricFilters
 	var splitters []*promscrape.Splitter
-	if *metricsConfig != "" {
-		if metricFilters, splitters, err = promscrape.LoadMetricsConfig(*metricsConfig); err != nil {
+	if fileCfg.Metrics != nil {
+		if metricFilters, err = promscrape.NewMetricFilters(&promscrape.FilterConfig{Pipelines: fileCfg.Metrics.Pipelines}); err != nil {
+			return fmt.Errorf("metrics config: %w", err)
+		}
+		if splitters, err = promscrape.NewSplitters(fileCfg.Metrics.Splitters); err != nil {
 			return fmt.Errorf("metrics config: %w", err)
 		}
 	}
@@ -188,10 +199,29 @@ func run() error {
 
 	var wg sync.WaitGroup
 
+	// Optional metrics derived from log lines; only these configured metrics are
+	// exported (over the shared OTLP exporter), on their own interval.
+	var logMetrics *metrics.DynamicMetricSet
+	if fileCfg.LogMetrics != nil && len(fileCfg.LogMetrics.Metrics) > 0 {
+		opts := []metrics.Option{metrics.WithLogger(log), metrics.WithNamePrefix(*logsMetricsPrefix)}
+		if fileCfg.LogMetrics.StreamLabels != nil {
+			opts = append(opts, metrics.WithStreamLabels(*fileCfg.LogMetrics.StreamLabels))
+		}
+		if logMetrics, err = metrics.NewDynamicMetricSet(fileCfg.LogMetrics.Metrics, opts...); err != nil {
+			return fmt.Errorf("logs metrics config: %w", err)
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			logMetrics.Run(ctx, exporter, *logsMetricsEvery, *logsMetricsBytes)
+		}()
+		log.Info("log-derived metrics started", "metrics", logMetrics.Count, "interval", *logsMetricsEvery)
+	}
+
 	if *logsOn {
 		var logSources []tailer.Source
-		if *logsConfig != "" {
-			if logSources, err = tailer.LoadSourcesConfig(*logsConfig); err != nil {
+		if fileCfg.Logs != nil {
+			if logSources, err = tailer.ValidateSources(fileCfg.Logs.Sources); err != nil {
 				return fmt.Errorf("logs config: %w", err)
 			}
 		}
@@ -201,6 +231,7 @@ func run() error {
 			CheckpointFile:    *checkpointFile,
 			Positions:         posStore,
 			LogAttrs:          logAttrs,
+			LogMetrics:        logMetrics,
 			Watch:             *logsWatch,
 			PollInterval:      *logsPoll,
 			FingerprintBytes:  *logsFingerprint,
@@ -210,6 +241,7 @@ func run() error {
 			Multiline:         *multilineOn,
 			MultilineTimeout:  *multilineWait,
 			Enrich:            *logsEnrich,
+			FileAttributes:    *logsFileAttrs,
 			ExcludeNamespaces: splitList(*excludeNs),
 			Attrs:             attrBuilders.Logs,
 			NodeInfo:          nodeInfo,
@@ -389,16 +421,10 @@ func startNodeInfo(ctx context.Context, meta *metaclient.Client, nodeName string
 
 // buildAttrs assembles the per-pipeline resource-attribute builders from the
 // config file and the flags; flag statics override config statics.
-func buildAttrs(configPath, static, enable, disable string) (*attrs.Builders, error) {
+func buildAttrs(cfg *attrs.Config, static, enable, disable string) (*attrs.Builders, error) {
 	filter, err := attrs.NewFilter(enable, disable)
 	if err != nil {
 		return nil, err
-	}
-	var cfg *attrs.Config
-	if configPath != "" {
-		if cfg, err = attrs.LoadConfig(configPath); err != nil {
-			return nil, err
-		}
 	}
 	flagStatic, err := attrs.ParseStatic(static)
 	if err != nil {

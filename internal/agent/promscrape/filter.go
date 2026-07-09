@@ -61,8 +61,8 @@ type MetricFilters struct {
 	Node     *MetricFilter
 }
 
-// MetricsConfig is the top-level metrics config file (-metrics-config):
-// per-pipeline series filters plus target splitters.
+// MetricsConfig is the `metrics` section of the agent config: per-pipeline
+// series filters plus target splitters.
 type MetricsConfig struct {
 	Pipelines map[string][]FilterRule `json:"pipelines,omitempty"`
 	Splitters []SplitterConfig        `json:"splitters,omitempty"`

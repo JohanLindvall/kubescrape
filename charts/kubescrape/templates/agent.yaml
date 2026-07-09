@@ -29,53 +29,17 @@ subjects:
   - kind: ServiceAccount
     name: {{ .Release.Name }}-agent
     namespace: {{ .Release.Namespace }}
-{{- if .Values.agent.attrsConfig }}
+{{- if .Values.agent.config }}
 ---
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: {{ .Release.Name }}-agent-attrs
+  name: {{ .Release.Name }}-agent-config
   namespace: {{ .Release.Namespace }}
   labels: {{ include "kubescrape.labels" . | nindent 4 }}
 data:
-  attrs.yaml: |
-    {{- toYaml .Values.agent.attrsConfig | nindent 4 }}
-{{- end }}
-{{- if .Values.agent.metricsConfig }}
----
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: {{ .Release.Name }}-agent-metrics
-  namespace: {{ .Release.Namespace }}
-  labels: {{ include "kubescrape.labels" . | nindent 4 }}
-data:
-  metrics.yaml: |
-    {{- toYaml .Values.agent.metricsConfig | nindent 4 }}
-{{- end }}
-{{- if .Values.agent.logAttributesConfig }}
----
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: {{ .Release.Name }}-agent-logattrs
-  namespace: {{ .Release.Namespace }}
-  labels: {{ include "kubescrape.labels" . | nindent 4 }}
-data:
-  logattrs.yaml: |
-    {{- toYaml .Values.agent.logAttributesConfig | nindent 4 }}
-{{- end }}
-{{- if .Values.agent.logsConfig }}
----
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: {{ .Release.Name }}-agent-logs
-  namespace: {{ .Release.Namespace }}
-  labels: {{ include "kubescrape.labels" . | nindent 4 }}
-data:
-  logs.yaml: |
-    {{- toYaml .Values.agent.logsConfig | nindent 4 }}
+  config.yaml: |
+    {{- toYaml .Values.agent.config | nindent 4 }}
 {{- end }}
 ---
 apiVersion: apps/v1
@@ -95,10 +59,7 @@ spec:
       labels:
         app: {{ .Release.Name }}-agent
       annotations:
-        checksum/attrs: {{ .Values.agent.attrsConfig | toYaml | sha256sum }}
-        checksum/metrics: {{ .Values.agent.metricsConfig | toYaml | sha256sum }}
-        checksum/logattrs: {{ .Values.agent.logAttributesConfig | toYaml | sha256sum }}
-        checksum/logs: {{ .Values.agent.logsConfig | toYaml | sha256sum }}
+        checksum/config: {{ .Values.agent.config | toYaml | sha256sum }}
     spec:
       serviceAccountName: {{ .Release.Name }}-agent
       tolerations:
@@ -141,11 +102,18 @@ spec:
             - -checkpoint-file={{ .Values.agent.checkpointFile }}
             {{- end }}
             - -logs-enrich={{ .Values.agent.logsEnrich }}
-            {{- if .Values.agent.logAttributesConfig }}
-            - -log-attributes-config=/etc/kubescrape/logattrs/logattrs.yaml
+            - -logs-file-attributes={{ .Values.agent.logsFileAttributes }}
+            {{- if .Values.agent.config }}
+            - -config=/etc/kubescrape/config/config.yaml
             {{- end }}
-            {{- if .Values.agent.logsConfig }}
-            - -logs-config=/etc/kubescrape/logs/logs.yaml
+            {{- with .Values.agent.logsMetrics.interval }}
+            - -logs-metrics-interval={{ . }}
+            {{- end }}
+            {{- with .Values.agent.logsMetrics.maxBytes }}
+            - -logs-metrics-max-bytes={{ . }}
+            {{- end }}
+            {{- with .Values.agent.logsMetrics.namePrefix }}
+            - -logs-metrics-name-prefix={{ . }}
             {{- end }}
             - -logs-watch={{ .Values.agent.logsWatch }}
             - -logs-poll-interval={{ .Values.agent.logsPollInterval }}
@@ -191,12 +159,6 @@ spec:
               {{- end }}
               {{- join "," $pairs }}
             {{- end }}
-            {{- if .Values.agent.attrsConfig }}
-            - -resource-attrs-config=/etc/kubescrape/attrs/attrs.yaml
-            {{- end }}
-            {{- if .Values.agent.metricsConfig }}
-            - -metrics-config=/etc/kubescrape/metrics/metrics.yaml
-            {{- end }}
             {{- range .Values.agent.extraArgs }}
             - {{ . }}
             {{- end }}
@@ -230,14 +192,9 @@ spec:
           livenessProbe:
             httpGet: {path: /healthz, port: http}
           volumeMounts:
-            {{- if .Values.agent.logAttributesConfig }}
-            - name: logattrs-config
-              mountPath: /etc/kubescrape/logattrs
-              readOnly: true
-            {{- end }}
-            {{- if .Values.agent.logsConfig }}
-            - name: logs-config
-              mountPath: /etc/kubescrape/logs
+            {{- if .Values.agent.config }}
+            - name: config
+              mountPath: /etc/kubescrape/config
               readOnly: true
             {{- end }}
             - name: varlog
@@ -245,16 +202,6 @@ spec:
               readOnly: true
             - name: state
               mountPath: /var/lib/kubescrape-agent
-            {{- if .Values.agent.attrsConfig }}
-            - name: attrs-config
-              mountPath: /etc/kubescrape/attrs
-              readOnly: true
-            {{- end }}
-            {{- if .Values.agent.metricsConfig }}
-            - name: metrics-config
-              mountPath: /etc/kubescrape/metrics
-              readOnly: true
-            {{- end }}
             {{- if .Values.agent.otlp.bearerTokenSecret.name }}
             - name: otlp-token
               mountPath: /etc/kubescrape/otlp-token
@@ -276,25 +223,10 @@ spec:
           hostPath:
             path: /var/lib/kubescrape-agent
             type: DirectoryOrCreate
-        {{- if .Values.agent.attrsConfig }}
-        - name: attrs-config
+        {{- if .Values.agent.config }}
+        - name: config
           configMap:
-            name: {{ .Release.Name }}-agent-attrs
-        {{- end }}
-        {{- if .Values.agent.metricsConfig }}
-        - name: metrics-config
-          configMap:
-            name: {{ .Release.Name }}-agent-metrics
-        {{- end }}
-        {{- if .Values.agent.logAttributesConfig }}
-        - name: logattrs-config
-          configMap:
-            name: {{ .Release.Name }}-agent-logattrs
-        {{- end }}
-        {{- if .Values.agent.logsConfig }}
-        - name: logs-config
-          configMap:
-            name: {{ .Release.Name }}-agent-logs
+            name: {{ .Release.Name }}-agent-config
         {{- end }}
         {{- if .Values.agent.otlp.bearerTokenSecret.name }}
         - name: otlp-token

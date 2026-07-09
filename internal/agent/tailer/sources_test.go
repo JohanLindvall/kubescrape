@@ -53,7 +53,7 @@ func TestSourceMatches(t *testing.T) {
 func TestLoadSourcesConfig(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "logs.yaml")
-	os.WriteFile(path, []byte(`sources:
+	_ = os.WriteFile(path, []byte(`sources:
   - name: containers
     include: ["/var/log/containers/*.log"]
     containerd: true
@@ -77,7 +77,7 @@ func TestLoadSourcesConfig(t *testing.T) {
 	}
 
 	// A source without include patterns is rejected.
-	os.WriteFile(path, []byte("sources:\n  - name: bad\n"), 0o644)
+	_ = os.WriteFile(path, []byte("sources:\n  - name: bad\n"), 0o644)
 	if _, err := LoadSourcesConfig(path); err == nil {
 		t.Error("missing include: want error")
 	}
@@ -165,27 +165,6 @@ func TestCompressedSourceReadWhole(t *testing.T) {
 	time.Sleep(200 * time.Millisecond)
 	if n := len(exp.get()); n != 3 {
 		t.Fatalf("archive re-read: %d records", n)
-	}
-}
-
-func TestSourceEncoding(t *testing.T) {
-	dir := t.TempDir()
-	exp := &fakeExporter{}
-	tl := newSourceTailer(exp, []Source{{
-		Include:  []string{filepath.Join(dir, "*.log")},
-		Encoding: "windows-1252",
-	}}, false)
-	stop := startTailer(t, tl)
-	defer stop()
-
-	// windows-1252/latin1 bytes: 0xE9 = é, 0xC0 = À. Two lines.
-	raw := []byte("caf\xe9\n\xc0 la carte\n")
-	if err := os.WriteFile(filepath.Join(dir, "app.log"), raw, 0o644); err != nil {
-		t.Fatal(err)
-	}
-	waitFor(t, func() bool { return len(exp.get()) == 2 }, "2 decoded records")
-	if got := exp.get(); got[0] != "café" || got[1] != "À la carte" {
-		t.Fatalf("decoded records = %q (want café / À la carte)", got)
 	}
 }
 

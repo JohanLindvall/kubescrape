@@ -60,7 +60,7 @@ func TestOpenMissingAndCorrupt(t *testing.T) {
 	// Corrupt file: tolerated, overwritten on next save.
 	dir := t.TempDir()
 	path := filepath.Join(dir, "corrupt.json")
-	os.WriteFile(path, []byte("{not json"), 0o644)
+	_ = os.WriteFile(path, []byte("{not json"), 0o644)
 	s = Open(path)
 	if err := s.SetJournalCursor("c"); err != nil {
 		t.Fatal(err)

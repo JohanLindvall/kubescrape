@@ -119,7 +119,8 @@ func TestPutTypes(t *testing.T) {
 
 func TestKeyStability(t *testing.T) {
 	a := []Attr{{Key: "x", Val: "1"}, {Key: "y", Val: float64(2)}}
-	if Key(a) != Key(a) {
+	b := []Attr{{Key: "x", Val: "1"}, {Key: "y", Val: float64(2)}}
+	if Key(a) != Key(b) {
 		t.Error("Key not stable")
 	}
 	if Key(nil) != "" {
@@ -133,7 +134,7 @@ func TestKeyStability(t *testing.T) {
 func TestLoadConfig(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "la.yaml")
-	os.WriteFile(path, []byte("rules:\n  - key: user.id\n    attribute: enduser.id\n    target: resource\n  - key: level\n"), 0o644)
+	_ = os.WriteFile(path, []byte("rules:\n  - key: user.id\n    attribute: enduser.id\n    target: resource\n  - key: level\n"), 0o644)
 	cfg, err := LoadConfig(path)
 	if err != nil {
 		t.Fatal(err)

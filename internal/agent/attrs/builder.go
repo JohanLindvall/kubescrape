@@ -35,8 +35,8 @@ type Context struct {
 // Pipeline names accepted under Config.Pipelines.
 var pipelineNames = []string{"logs", "targets", "cadvisor", "node", "journal", "ingest"}
 
-// Config declares how resource attributes are built. It is loaded from YAML
-// (-resource-attrs-config):
+// Config declares how resource attributes are built. It is the
+// `resourceAttributes` section of the agent config:
 //
 //	defaults: true            # include the built-in k8s.* mapping
 //	static:                   # fixed attributes on every resource

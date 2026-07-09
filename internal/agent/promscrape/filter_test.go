@@ -125,7 +125,7 @@ splitters:
 
 func TestScrapeWithFilter(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		fmt.Fprint(w, "keep_me 1\ndrop_me 2\n# TYPE hist histogram\nhist_bucket{le=\"+Inf\"} 3\nhist_count 3\nhist_sum 1.5\n")
+		_, _ = fmt.Fprint(w, "keep_me 1\ndrop_me 2\n# TYPE hist histogram\nhist_bucket{le=\"+Inf\"} 3\nhist_count 3\nhist_sum 1.5\n")
 	}))
 	defer srv.Close()
 

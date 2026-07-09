@@ -104,28 +104,38 @@ agent:
   # Parse per-line metadata (timestamp, severity, trace/span IDs, exception
   # details) into the OTLP record fields (JohanLindvall/enrich).
   logsEnrich: true
-  # Lift configured JSON/logfmt keys from the log line onto resource/scope/log
-  # attributes; rendered verbatim into a mounted config (applies to logs and
-  # journald). See the README.
-  #   rules:
-  #     - {key: tenant, attribute: tenant.id, target: resource}
-  #     - {key: http.status_code, target: log}
-  logAttributesConfig: {}
-  # Declare log sources: which files to tail (include/exclude globs, ** via
-  # doublestar) and how (containerd vs plain, with resource attributes for
-  # plain host files). Rendered verbatim into a mounted config; empty tails
-  # -log-dir as containerd logs. Files must be under a mounted path (/var/log
-  # is mounted read-only; add volumes for others). See the README.
-  # Per source: containerd (CRI) vs plain; attributes (plain resource attrs);
-  # multiline override; encoding (e.g. windows-1252); compressed (gzip / .gz,
-  # read once to completion).
-  #   sources:
-  #     - {name: containers, include: ["/var/log/containers/*.log"], containerd: true}
-  #     - name: host
-  #       include: ["/var/log/**/*.log"]
-  #       exclude: ["/var/log/containers/*.log"]
-  #       attributes: {service.name: host-syslog}
-  logsConfig: {}
+  # Stamp log.file.name and log.file.position (byte offset) on every record,
+  # for each file source.
+  logsFileAttributes: false
+  # All YAML config for the agent lives in one file, rendered verbatim into a
+  # mounted ConfigMap and passed via -config. Each section is optional and
+  # mirrors the shape of the standalone file it replaces:
+  #   resourceAttributes: defaults / static / attributes / pipelines
+  #   logs:               sources (include/exclude globs, containerd vs plain,
+  #                       per-source attributes / encoding / compressed)
+  #   logAttributes:      rules lifting JSON/logfmt keys onto attributes
+  #   logMetrics:         metrics derived from log lines (see logsMetrics below)
+  #   metrics:            scraped-series pipelines filter rules and splitters
+  # See docs/CONFIGURATION.md. Example:
+  #   config:
+  #     logs:
+  #       sources:
+  #         - {name: containers, include: ["/var/log/containers/*.log"], containerd: true}
+  #     logAttributes:
+  #       rules:
+  #         - {key: tenant, attribute: tenant.id, target: resource}
+  #     logMetrics:
+  #       metrics:
+  #         - {name: http_requests_total, type: counter, value: "1", match: ["level=error"], labels: ["status=$http_status"]}
+  #     resourceAttributes:
+  #       static: {cluster: prod-eu}
+  config: {}
+  # Runtime settings for log-derived metrics (config.logMetrics); empty uses the
+  # binary defaults (interval 30s, max-bytes 3MiB, no name prefix).
+  logsMetrics:
+    interval: ""
+    maxBytes: ""
+    namePrefix: ""
   logsWatch: true
   logsPollInterval: 500ms
   logsFingerprintBytes: 1024
@@ -136,14 +146,9 @@ agent:
   # per target.
   scrapeHealthMetrics: true
 
-  # Static resource attributes (key: value), e.g. cluster: prod-eu.
+  # Static resource attributes (key: value), e.g. cluster: prod-eu. Merged into
+  # config.resourceAttributes.static via -resource-attrs-static.
   staticAttrs: {}
-  # Rendered verbatim into the -resource-attrs-config file. See the README
-  # (defaults / static / attributes / pipelines).
-  attrsConfig: {}
-  # Rendered verbatim into the -metrics-config file (pipelines filter rules
-  # and splitters).
-  metricsConfig: {}
 
   extraArgs: []
   resources:

@@ -1,0 +1,582 @@
+package metrics
+
+import (
+	"errors"
+	"fmt"
+	"log/slog"
+	"os"
+	"regexp"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"sigs.k8s.io/yaml"
+)
+
+// Metric type names, as written in the `type` field of a Dynamic.
+const (
+	CounterType   = "counter"
+	GaugeType     = "gauge"
+	HistogramType = "histogram"
+	SummaryType   = "summary"
+)
+
+const (
+	defaultMaxAge     = 24 * time.Hour
+	maxMaxAge         = 24 * time.Hour
+	maxCardinalityCap = 10000
+)
+
+// Dynamic declares one metric derived from log lines: which lines it matches,
+// the labels it carries and the value it observes. It is loaded from YAML (see
+// LoadDynamicMetrics / DynamicConfig).
+type Dynamic struct {
+	// Name and Description are the metric's OTLP name and description.
+	Name        string `json:"name"`
+	Description string `json:"description,omitempty"`
+	// Type is counter (default), gauge, histogram or summary.
+	Type string `json:"type,omitempty"`
+	// Action, for a gauge, selects how each observation folds: set (default,
+	// last value wins), inc (+1), dec (-1), add (+value), sub (-value). Ignored
+	// for other types, which always accumulate.
+	Action string `json:"action,omitempty"`
+	// Value names the numeric field to observe, or "1" to count matching lines.
+	Value string `json:"value,omitempty"`
+	// ValueRegexp instead extracts the observed value from the raw line via a
+	// regex: capture group 1 (or the whole match) is parsed as a float, and a
+	// line that does not match is skipped. Use it to pull a number out of an
+	// unstructured line. Mutually exclusive with Value.
+	ValueRegexp string `json:"valueRegexp,omitempty"`
+	// Match are exact label selectors (key=value, or key!=value to negate);
+	// MatchRegexp match the value against a regex. A line must satisfy all of
+	// them. In the tailer selectors resolve against the log line's own fields
+	// and the resource attributes (k8s metadata) alike. The synthetic key
+	// `__line__` matches against the whole raw line.
+	Match       []string `json:"match,omitempty"`
+	MatchRegexp []string `json:"matchRegexp,omitempty"`
+	// Labels are the metric's labels, each `set=$get`: a literal (set=value), a
+	// passthrough (set=$key), a masking pattern (set=$key(_xx)) or a regex
+	// replace (set=$key/re/repl/). A bare `key` both sets and reads itself.
+	Labels []string `json:"labels,omitempty"`
+	// StreamLabels overrides the set-wide automatic stream labels for this
+	// metric: nil inherits them, an explicit list (including the empty list, to
+	// aggregate across all streams) replaces them. Each entry is a resource
+	// attribute key promoted to a like-named label.
+	StreamLabels *[]string `json:"streamLabels,omitempty"`
+	// Buckets are the histogram boundaries (histogram type only).
+	Buckets []float64 `json:"buckets,omitempty"`
+	// MaxCardinality caps unique label combinations (default/hard cap 10000);
+	// MaxAge expires idle series (a Go duration, default/cap 24h).
+	MaxCardinality int    `json:"maxCardinality,omitempty"`
+	MaxAge         string `json:"maxAge,omitempty"`
+	// LabelPrefix is prepended to every set label name.
+	LabelPrefix string `json:"labelPrefix,omitempty"`
+}
+
+// DynamicConfig is the log-derived-metrics config shape (the `logMetrics`
+// section of the unified agent config, or a standalone file).
+type DynamicConfig struct {
+	// StreamLabels are resource attribute keys automatically promoted to a
+	// like-named label on every metric (so series are per-pod/namespace/… by
+	// default), nil meaning the built-in default set. Individual metrics
+	// override via Dynamic.StreamLabels.
+	StreamLabels *[]string `json:"streamLabels,omitempty"`
+	Metrics      []Dynamic `json:"metrics"`
+}
+
+// lineKey is the synthetic label key that resolves to the whole raw line, so
+// selectors and labels can reference the line contents directly.
+const lineKey = "__line__"
+
+// defaultStreamLabels are the resource attributes promoted to metric labels
+// when neither the set nor the metric specifies otherwise.
+var defaultStreamLabels = []string{
+	"k8s.namespace.name",
+	"k8s.pod.name",
+	"k8s.container.name",
+	"k8s.node.name",
+	"service.name",
+}
+
+// LoadDynamicMetrics reads a metric specification from a YAML file with a
+// top-level `metrics:` list.
+func LoadDynamicMetrics(path string) ([]Dynamic, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var cfg DynamicConfig
+	if err := yaml.UnmarshalStrict(data, &cfg); err != nil {
+		return nil, fmt.Errorf("%s: %w", path, err)
+	}
+	return cfg.Metrics, nil
+}
+
+// kind resolves the metric type name to a seriesKind.
+func (d *Dynamic) kind() (seriesKind, error) {
+	switch strings.ToLower(d.Type) {
+	case "", CounterType:
+		return kindCounter, nil
+	case GaugeType:
+		return kindGauge, nil
+	case HistogramType:
+		return kindHistogram, nil
+	case SummaryType:
+		return kindSummary, nil
+	default:
+		return 0, fmt.Errorf("invalid metric type: %s", d.Type)
+	}
+}
+
+// maxAge parses and clamps the expiration duration.
+func (d *Dynamic) maxAge() (time.Duration, error) {
+	if d.MaxAge == "" {
+		return defaultMaxAge, nil
+	}
+	age, err := time.ParseDuration(d.MaxAge)
+	if err != nil {
+		return 0, err
+	}
+	return min(age, maxMaxAge), nil
+}
+
+// validateBuckets checks that histogram bounds increase and that non-histograms
+// declare none.
+func (d *Dynamic) validateBuckets(kind seriesKind) error {
+	if kind != kindHistogram {
+		if len(d.Buckets) > 0 {
+			return errors.New("buckets can only be set for histogram metrics")
+		}
+		return nil
+	}
+	for i := 1; i < len(d.Buckets); i++ {
+		if d.Buckets[i] <= d.Buckets[i-1] {
+			return fmt.Errorf("buckets must be increasing: %v", d.Buckets)
+		}
+	}
+	return nil
+}
+
+// labelTemplate produces one metric label from a line's fields. getKey is the
+// line field it reads ("" for a literal), recorded so the set knows which line
+// fields to parse.
+type labelTemplate struct {
+	setKey string
+	getKey string
+	get    func(lookup func(string) string) string
+}
+
+// metricRule is a compiled Dynamic: a series plus the match/label logic that
+// feeds it.
+type metricRule struct {
+	series     *series
+	match      *selectorSet
+	labels     []labelTemplate
+	streamKeys []string // resource attribute keys promoted to labels
+	value      string
+	valueRe    *regexp.Regexp // extracts the value from the raw line, if set
+}
+
+// needsValue reports whether the rule must read a value (skip the line when it
+// is absent/zero). Gauge inc/dec need none — they only count.
+func (r *metricRule) needsValue() bool {
+	if r.series.kind == kindGauge {
+		return r.series.action != actionInc && r.series.action != actionDec
+	}
+	return true
+}
+
+// readValue resolves the observed value and whether the line should be
+// recorded. It comes from ValueRegexp (a capture off the raw line), the "1"
+// count, or a numeric field via values.
+func (r *metricRule) readValue(values func(string) float64, line string) (float64, bool) {
+	if r.valueRe != nil {
+		m := r.valueRe.FindStringSubmatch(line)
+		if m == nil {
+			return 0, false
+		}
+		s := m[0]
+		if len(m) > 1 {
+			s = m[1]
+		}
+		f, err := strconv.ParseFloat(s, 64)
+		return f, err == nil
+	}
+	if r.value == "1" {
+		return 1, true
+	}
+	if values == nil {
+		return 0, false
+	}
+	v := values(r.value)
+	return v, v != 0
+}
+
+// observe evaluates the rule against one line and records an observation when
+// it matches. buf is reused for the label set and returned (set may grow it).
+func (r *metricRule) observe(values func(string) float64, lookup func(string) string, line string, ctx *matchContext, buf labels) labels {
+	if !r.match.match(lookup, ctx) {
+		return buf
+	}
+	var value float64
+	if r.needsValue() {
+		v, ok := r.readValue(values, line)
+		if !ok {
+			return buf
+		}
+		value = v
+	}
+	buf = buf[:0]
+	// Stream labels first so an explicit label of the same name overrides them.
+	for _, key := range r.streamKeys {
+		buf = buf.set(key, lookup(key))
+	}
+	for _, lt := range r.labels {
+		buf = buf.set(lt.setKey, lt.get(lookup))
+	}
+	r.series.observe(buf, value)
+	return buf
+}
+
+// gaugeAction resolves the fold action for a metric, validating that non-gauge
+// metrics do not set one.
+func (d *Dynamic) gaugeAction(kind seriesKind) (gaugeAction, error) {
+	if d.Action == "" {
+		return actionSet, nil
+	}
+	if kind != kindGauge {
+		return 0, fmt.Errorf("action is only valid for gauge metrics (got %q)", d.Type)
+	}
+	switch strings.ToLower(d.Action) {
+	case "set":
+		return actionSet, nil
+	case "inc":
+		return actionInc, nil
+	case "dec":
+		return actionDec, nil
+	case "add":
+		return actionAdd, nil
+	case "sub":
+		return actionSub, nil
+	default:
+		return 0, fmt.Errorf("invalid gauge action: %s", d.Action)
+	}
+}
+
+// setConfig holds NewDynamicMetricSet options.
+type setConfig struct {
+	namePrefix      string
+	log             *slog.Logger
+	streamLabels    []string
+	streamLabelsSet bool
+}
+
+// Option configures a DynamicMetricSet.
+type Option func(*setConfig)
+
+// WithNamePrefix prepends prefix to every metric name.
+func WithNamePrefix(prefix string) Option {
+	return func(c *setConfig) { c.namePrefix = prefix }
+}
+
+// WithLogger sets the logger used for cardinality warnings.
+func WithLogger(l *slog.Logger) Option {
+	return func(c *setConfig) {
+		if l != nil {
+			c.log = l
+		}
+	}
+}
+
+// WithStreamLabels overrides the default automatic stream labels (resource
+// attribute keys promoted to a like-named label on every metric). Pass an empty
+// (non-nil) slice to disable them set-wide; individual metrics can still
+// override via Dynamic.StreamLabels.
+func WithStreamLabels(keys []string) Option {
+	return func(c *setConfig) { c.streamLabels, c.streamLabelsSet = keys, true }
+}
+
+// DynamicMetricSet is a set of log-derived metrics evaluated per line.
+type DynamicMetricSet struct {
+	rules []*metricRule
+	keys  keyIndex
+	pool  sync.Pool
+	log   *slog.Logger
+	// Count is the number of configured rules.
+	Count int
+}
+
+// addContext is the per-line scratch state pooled across Add calls.
+type addContext struct {
+	ctx  matchContext
+	buf  labels
+	line lineFields
+}
+
+// NewDynamicMetricSet compiles a metric specification into an evaluatable set.
+// Rules sharing a metric name share one underlying series.
+func NewDynamicMetricSet(metrics []Dynamic, opts ...Option) (*DynamicMetricSet, error) {
+	cfg := setConfig{log: slog.Default()}
+	for _, opt := range opts {
+		opt(&cfg)
+	}
+	if !cfg.streamLabelsSet {
+		cfg.streamLabels = defaultStreamLabels
+	}
+
+	set := &DynamicMetricSet{
+		pool: sync.Pool{New: func() any { return &addContext{buf: make(labels, 0, 16)} }},
+		log:  cfg.log,
+	}
+	byName := map[string]*series{}
+	for i := range metrics {
+		rule, err := compileRule(&metrics[i], &cfg, byName)
+		if err != nil {
+			return nil, err
+		}
+		set.rules = append(set.rules, rule)
+	}
+	set.keys = newKeyIndex(set.rules)
+	set.Count = len(set.rules)
+	return set, nil
+}
+
+// compileRule builds one rule, reusing (or creating) the named series in shared.
+func compileRule(d *Dynamic, cfg *setConfig, shared map[string]*series) (*metricRule, error) {
+	kind, err := d.kind()
+	if err != nil {
+		return nil, err
+	}
+	action, err := d.gaugeAction(kind)
+	if err != nil {
+		return nil, err
+	}
+	if err := d.validateBuckets(kind); err != nil {
+		return nil, err
+	}
+	age, err := d.maxAge()
+	if err != nil {
+		return nil, err
+	}
+
+	rule := &metricRule{value: d.Value}
+	if d.ValueRegexp != "" {
+		if d.Value != "" {
+			return nil, errors.New("value and valueRegexp are mutually exclusive")
+		}
+		if rule.valueRe, err = regexp.Compile(d.ValueRegexp); err != nil {
+			return nil, fmt.Errorf("invalid valueRegexp: %w", err)
+		}
+	}
+	if rule.match, err = parseSelectors(d.Match, d.MatchRegexp); err != nil {
+		return nil, err
+	}
+	for _, spec := range d.Labels {
+		lt, err := parseLabelTemplate(spec, d.LabelPrefix)
+		if err != nil {
+			return nil, err
+		}
+		rule.labels = append(rule.labels, lt)
+	}
+	rule.streamKeys = cfg.streamLabels
+	if d.StreamLabels != nil {
+		rule.streamKeys = *d.StreamLabels
+	}
+
+	name := cfg.namePrefix + d.Name
+	if existing, ok := shared[name]; ok {
+		if existing.kind != kind || existing.action != action {
+			return nil, fmt.Errorf("metric %q declared with conflicting type/action", d.Name)
+		}
+		rule.series = existing
+	} else {
+		rule.series = newSeries(seriesSpec{
+			name:       name,
+			desc:       d.Description,
+			kind:       kind,
+			action:     action,
+			maxSize:    min(d.MaxCardinality, maxCardinalityCap),
+			expiration: age,
+			buckets:    d.Buckets,
+			log:        cfg.log,
+		})
+		shared[name] = rule.series
+	}
+	return rule, nil
+}
+
+// Add evaluates every rule against one log line. lookup(key) returns a label
+// value and values(key) a numeric value (both may be nil); keys they don't
+// resolve fall back to fields parsed straight from line (JSON or logfmt), so a
+// metric can read values and labels off the line itself without any separate
+// logAttributes config.
+func (s *DynamicMetricSet) Add(values func(string) float64, lookup func(string) string, line string) {
+	if s == nil || len(s.rules) == 0 {
+		return
+	}
+	ac := s.pool.Get().(*addContext)
+	ac.ctx.reset()
+	ac.line.reset(line)
+
+	// The synthetic __line__ key is the whole raw line; otherwise the caller's
+	// own lookup (record/resource attributes) wins and the line's parsed fields
+	// are the fallback for keys it does not resolve.
+	labelLookup := func(key string) string {
+		if key == lineKey {
+			return line
+		}
+		if lookup != nil {
+			if v := lookup(key); v != "" {
+				return v
+			}
+		}
+		return s.keys.get(&ac.line, key)
+	}
+	valueLookup := func(key string) float64 {
+		if values != nil {
+			if v := values(key); v != 0 {
+				return v
+			}
+		}
+		f, _ := strconv.ParseFloat(s.keys.get(&ac.line, key), 64)
+		return f
+	}
+
+	for _, rule := range s.rules {
+		ac.buf = rule.observe(valueLookup, labelLookup, line, &ac.ctx, ac.buf)
+	}
+	s.pool.Put(ac)
+}
+
+// labelTemplateRe captures the four label forms: an optional `set=`, a `$get`
+// or literal value, and an optional `(pattern)` or `/regex/`.
+var labelTemplateRe = regexp.MustCompile(`^((?P<set>[a-zA-Z_:][a-zA-Z0-9_:.]*)=)?(?P<get>\$?[a-zA-Z_:][a-zA-Z0-9_:.]*)(\((?P<pat>[^)]+)\)|(?P<re>/.+))?$`)
+
+// parseLabelTemplate compiles one `set=$get` label spec. setPrefix, when set,
+// is prepended to the label's name.
+func parseLabelTemplate(spec, setPrefix string) (labelTemplate, error) {
+	match := labelTemplateRe.FindStringSubmatch(spec)
+	if match == nil {
+		return labelTemplate{}, fmt.Errorf("invalid label: %s", spec)
+	}
+	var lt labelTemplate
+	getKey, value, pattern, reSpec := "", "", "", ""
+	for i, name := range labelTemplateRe.SubexpNames() {
+		if match[i] == "" {
+			continue
+		}
+		switch name {
+		case "set":
+			lt.setKey = match[i]
+		case "get":
+			if strings.HasPrefix(match[i], "$") {
+				getKey = match[i][1:]
+			} else {
+				value = match[i]
+			}
+		case "pat":
+			pattern = match[i]
+		case "re":
+			reSpec = match[i]
+		}
+	}
+	// Bare `key`: sets and reads itself.
+	if value != "" && getKey == "" && lt.setKey == "" {
+		getKey, lt.setKey, value = value, value, ""
+	}
+	if setPrefix != "" && lt.setKey != "" {
+		lt.setKey = setPrefix + lt.setKey
+	}
+	if lt.setKey == "" || (value == "" && getKey == "") {
+		return labelTemplate{}, fmt.Errorf("invalid label: %s", spec)
+	}
+
+	get, err := labelGetter(getKey, value, pattern, reSpec, spec)
+	if err != nil {
+		return labelTemplate{}, err
+	}
+	lt.get = get
+	lt.getKey = getKey
+	return lt, nil
+}
+
+// labelGetter builds the value-producing closure for a label template from
+// whichever of the four forms is present.
+func labelGetter(getKey, value, pattern, reSpec, spec string) (func(func(string) string) string, error) {
+	switch {
+	case value != "":
+		return func(func(string) string) string { return value }, nil
+	case pattern != "":
+		return func(lookup func(string) string) string {
+			return maskPattern(lookup(getKey), pattern)
+		}, nil
+	case reSpec != "":
+		pat, repl, err := parseRegexpReplace(reSpec)
+		if err != nil {
+			return nil, fmt.Errorf("invalid label re %q: %w", spec, err)
+		}
+		re, err := regexp.Compile(pat)
+		if err != nil {
+			return nil, fmt.Errorf("invalid label re %q: %w", spec, err)
+		}
+		return func(lookup func(string) string) string {
+			return re.ReplaceAllString(lookup(getKey), repl)
+		}, nil
+	default:
+		return func(lookup func(string) string) string { return lookup(getKey) }, nil
+	}
+}
+
+// maskPattern overlays value onto pattern: each '_' in pattern is replaced by
+// the corresponding character of value, other characters are kept. So value
+// "503" with pattern "_xx" yields "5xx".
+func maskPattern(value, pattern string) string {
+	if pattern == "" {
+		return ""
+	}
+	out := make([]byte, len(pattern))
+	for i := 0; i < len(pattern); i++ {
+		if pattern[i] == '_' && i < len(value) {
+			out[i] = value[i]
+		} else {
+			out[i] = pattern[i]
+		}
+	}
+	return string(out)
+}
+
+// parseRegexpReplace splits a `/pattern/replacement/` spec, honouring
+// backslash escapes.
+func parseRegexpReplace(in string) (pattern, replacement string, err error) {
+	if !strings.HasPrefix(in, "/") {
+		return "", "", errors.New("must start with '/'")
+	}
+	var parts []string
+	var buf strings.Builder
+	var escaped bool
+	for _, ch := range in[1:] {
+		switch {
+		case escaped:
+			buf.WriteRune(ch)
+			escaped = false
+		case ch == '\\':
+			escaped = true
+		case ch == '/':
+			parts = append(parts, buf.String())
+			buf.Reset()
+		default:
+			buf.WriteRune(ch)
+		}
+	}
+	if escaped {
+		return "", "", errors.New("dangling backslash at end")
+	}
+	if buf.Len() > 0 || len(parts) < 2 {
+		parts = append(parts, buf.String())
+	}
+	if len(parts) != 2 {
+		return "", "", errors.New("must be in the form /pattern/replacement/")
+	}
+	return parts[0], parts[1], nil
+}

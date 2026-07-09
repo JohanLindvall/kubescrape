@@ -105,7 +105,7 @@ func TestScrapeChunking(t *testing.T) {
 
 func TestScrapeHealthMetrics(t *testing.T) {
 	okSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		fmt.Fprint(w, "m 1\nn 2\n")
+		_, _ = fmt.Fprint(w, "m 1\nn 2\n")
 	}))
 	defer okSrv.Close()
 	badSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -157,7 +157,7 @@ func TestScrapeHealthMetrics(t *testing.T) {
 func TestScrapeSampleLimit(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		for i := 0; i < 100; i++ {
-			fmt.Fprintf(w, "m%d 1\n", i)
+			_, _ = fmt.Fprintf(w, "m%d 1\n", i)
 		}
 	}))
 	defer srv.Close()

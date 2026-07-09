@@ -103,7 +103,7 @@ func writeLog(t *testing.T, dir string, lines ...string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	for _, l := range lines {
 		if _, err := fmt.Fprintln(f, l); err != nil {
 			t.Fatal(err)
@@ -220,6 +220,34 @@ func TestEnrichedRecords(t *testing.T) {
 	}
 }
 
+func TestFileAttributes(t *testing.T) {
+	dir := t.TempDir()
+	exp := &fakeExporter{}
+	tl := newTestTailer(dir, "", exp)
+	tl.cfg.FileAttributes = true
+	stop := startTailer(t, tl)
+	defer stop()
+
+	line0 := `2026-07-05T10:00:00Z stdout F hello`
+	writeLog(t, dir, line0, `2026-07-05T10:00:01Z stdout F world`)
+	waitFor(t, func() bool { return len(exp.get()) == 2 }, "2 records")
+
+	// log.file.position is the record's start: record 0 begins at 0, record 1
+	// just after the first physical line (its bytes + newline).
+	for i, want := range []int64{0, int64(len(line0) + 1)} {
+		lr, ok := exp.record(i)
+		if !ok {
+			t.Fatalf("record %d missing", i)
+		}
+		if name, ok := lr.Attributes().Get("log.file.name"); !ok || name.Str() != logName {
+			t.Errorf("record %d log.file.name = %v, want %s", i, name.AsRaw(), logName)
+		}
+		if pos, ok := lr.Attributes().Get("log.file.position"); !ok || pos.Int() != want {
+			t.Errorf("record %d log.file.position = %v, want %d", i, pos.AsRaw(), want)
+		}
+	}
+}
+
 func TestLogAttrsGrouping(t *testing.T) {
 	dir := t.TempDir()
 	exp := &fakeExporter{}
@@ -332,7 +360,7 @@ func writeLines(t *testing.T, path string, lines ...string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	for _, l := range lines {
 		if _, err := fmt.Fprintln(f, l); err != nil {
 			t.Fatal(err)
@@ -765,8 +793,8 @@ func TestRotationDrainsOldFile(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	fmt.Fprintln(old, "2026-07-05T10:00:01Z stdout F late")
-	old.Close()
+	_, _ = fmt.Fprintln(old, "2026-07-05T10:00:01Z stdout F late")
+	_ = old.Close()
 	writeLog(t, dir, "2026-07-05T10:00:02Z stdout F after")
 
 	waitFor(t, func() bool { return len(exp.get()) == 3 }, "all records across rotation")

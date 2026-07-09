@@ -102,7 +102,7 @@ func getJSON(t *testing.T, url string, wantStatus int, v any) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != wantStatus {
 		t.Fatalf("GET %s: status %d, want %d", url, resp.StatusCode, wantStatus)
 	}
@@ -420,7 +420,7 @@ func TestCacheHeadersAndRevalidation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status %d", resp.StatusCode)
 	}
@@ -439,7 +439,7 @@ func TestCacheHeadersAndRevalidation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	resp2.Body.Close()
+	_ = resp2.Body.Close()
 	if resp2.StatusCode != http.StatusNotModified {
 		t.Fatalf("conditional GET status = %d; want 304", resp2.StatusCode)
 	}
@@ -453,7 +453,7 @@ func TestNoCacheHeadersWhenDisabled(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	if cc := resp.Header.Get("Cache-Control"); cc != "" {
 		t.Errorf("Cache-Control = %q; want none", cc)
 	}

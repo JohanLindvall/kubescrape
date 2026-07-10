@@ -11,8 +11,8 @@ GOLANGCI_LINT         := $(shell go env GOPATH)/bin/golangci-lint
 all: build
 
 build:
-	go build $(GOFLAGS) -o bin/$(BINARY) ./cmd/kubescrape
-	go build $(GOFLAGS) -o bin/$(BINARY)-agent ./cmd/kubescrape-agent
+	CGO_ENABLED=0 go build $(GOFLAGS) -o bin/$(BINARY) ./cmd/kubescrape
+	CGO_ENABLED=1 go build $(GOFLAGS) -o bin/$(BINARY)-agent ./cmd/kubescrape-agent
 
 test:
 	go test ./...

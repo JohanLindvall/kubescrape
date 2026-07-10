@@ -48,13 +48,11 @@ agent:
   cadvisorRollups: true
   nodeMetrics: true
 
-  # Tail the systemd journal via journalctl. The default distroless image
-  # does NOT contain journalctl; set image.repository/tag to an image that
-  # provides it. dir "" reads the system default (/var/log/journal is
+  # Read the systemd journal natively (libsystemd, via cgo). The default image
+  # ships libsystemd; dir "" reads the system default (/var/log/journal is
   # mounted read-only; set dir to /run/log/journal for volatile journals).
   journald:
     enabled: false
-    path: journalctl
     dir: ""
     units: []
     batchSize: 1024

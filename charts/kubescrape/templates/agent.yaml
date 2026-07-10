@@ -129,7 +129,6 @@ spec:
             - -scrape-health-metrics={{ .Values.agent.scrapeHealthMetrics }}
             {{- if .Values.agent.journald.enabled }}
             - -journald
-            - -journald-path={{ .Values.agent.journald.path }}
             {{- with .Values.agent.journald.dir }}
             - -journald-dir={{ . }}
             {{- end }}

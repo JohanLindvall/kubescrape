@@ -163,25 +163,25 @@ physical disk use can exceed the backlog cap by up to one segment (8 MiB).
 
 ## Agent: journald
 
-Opt-in with `-journald`. The agent runs `journalctl -f -o json` as a
-subprocess and exports the entries as OTLP log records, one resource per
-systemd unit (`service.name` = the unit without `.service`, `systemd.unit`,
-plus node attributes via the `journal` attrs pipeline; syslog priorities map
-to OTLP severities; `syslog.identifier` and `process.pid` become record
-attributes).
+Opt-in with `-journald`. The agent reads the systemd journal natively through
+libsystemd (`github.com/coreos/go-systemd/v22/sdjournal`, cgo — the agent binary
+is built with cgo and the image ships libsystemd) and exports the entries as
+OTLP log records, one resource per systemd unit (`service.name` = the unit
+without `.service`, `systemd.unit`, plus node attributes via the `journal` attrs
+pipeline; syslog priorities map to OTLP severities; `syslog.identifier` and
+`process.pid` become record attributes).
 
 | Flag | Default | Description |
 |---|---|---|
-| `-journald-path` | `journalctl` | the binary — the default distroless image does **not** contain it; use an image that does |
-| `-journald-dir` | — | journal directory (`journalctl -D`); empty reads the system default |
-| `-journald-units` | — | comma-separated units; empty reads everything |
+| `-journald-dir` | — | read a specific journal directory; empty opens the default system journal (set to `/run/log/journal` for volatile journals) |
+| `-journald-units` | — | comma-separated units (matched on `_SYSTEMD_UNIT`); empty reads everything |
 | `-journald-batch-size` | `1024` | flush after this many entries |
 | `-journald-flush-interval` | `2s` | flush at least this often |
 | `-journald-enrich` | `true` | per-message enrichment as `-logs-enrich`; an explicit level in the message wins over the journal priority |
 
 Delivery is at-least-once: the cursor is committed only after a successful
-export; on export failure or subprocess death, journalctl restarts from the
-committed cursor with backoff (re-reading anything in flight). The cursor is
+export; on export failure or a reader error, it restarts from the committed
+cursor with backoff (re-reading anything in flight). The cursor is
 persisted only through `-positions-file` (there is no standalone journald
 cursor file); without it, every start begins at the journal tail.
 

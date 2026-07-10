@@ -1,22 +1,19 @@
-// Package journald tails the systemd journal by running journalctl as a
-// subprocess (`-f -o json`) and exporting the entries as OTLP log records.
-// Delivery is at-least-once: the cursor of the newest exported entry is
-// persisted only after a successful export, and on any failure the
-// subprocess is restarted from the persisted cursor, re-reading whatever was
-// in flight.
+// Package journald reads the systemd journal through libsystemd (via
+// github.com/coreos/go-systemd/v22/sdjournal — cgo) and exports the entries as
+// OTLP log records. Delivery is at-least-once: the cursor of the newest
+// exported entry is persisted only after a successful export, and on any
+// failure the reader restarts from the persisted cursor, re-reading whatever
+// was in flight.
 //
-// The distroless kubescrape image does not contain journalctl; using this
-// input requires an image that provides it (see the chart values).
+// Because it links libsystemd, the agent binary is built with cgo and the
+// image must provide libsystemd (see the Dockerfile). The journal itself is
+// read directly — no journalctl subprocess.
 package journald
 
 import (
-	"bufio"
 	"context"
-	"encoding/json"
 	"fmt"
 	"log/slog"
-	"os"
-	"os/exec"
 	"strconv"
 	"strings"
 	"time"
@@ -38,13 +35,10 @@ type LogExporter interface {
 
 // Config configures the journal reader.
 type Config struct {
-	// Path is the journalctl binary (default "journalctl", resolved via
-	// $PATH).
-	Path string
-	// Dir reads a specific journal directory (journalctl -D); "" uses the
-	// system default.
+	// Dir reads a specific journal directory; "" opens the default system
+	// journal.
 	Dir string
-	// Units restricts to these systemd units (journalctl -u, repeated);
+	// Units restricts to these systemd units (matched on _SYSTEMD_UNIT);
 	// empty reads everything.
 	Units []string
 	// Positions persists the last exported cursor across restarts (nil = no
@@ -72,17 +66,38 @@ type Config struct {
 	Exporter LogExporter
 	Logger   *slog.Logger
 
-	// RestartBackoff is the initial delay before restarting a failed
-	// subprocess or retrying a failed export, doubled up to 30s (default
-	// 1s; tests shorten it).
+	// RestartBackoff is the initial delay before restarting a failed reader or
+	// retrying a failed export, doubled up to 30s (default 1s; tests shorten
+	// it).
 	RestartBackoff time.Duration
 }
 
-// Reader runs journalctl and exports its output. All fields are owned by
-// the single Run goroutine.
+// rawEntry is one journal entry as read from the source: its fields (systemd
+// journal field names → values), opaque cursor, and realtime timestamp.
+type rawEntry struct {
+	fields   map[string]string
+	cursor   string
+	realtime time.Time
+}
+
+// source streams journal entries in order and supports cursor resume.
+type source interface {
+	// next returns the next entry, blocking until one is available or ctx is
+	// done. ok is false with a nil error when the source ends cleanly.
+	next(ctx context.Context) (rawEntry, bool, error)
+	close() error
+}
+
+// openFunc opens a source positioned just after afterCursor ("" = start at the
+// journal tail). It is a field so tests can inject a fake journal.
+type openFunc func(cfg Config, afterCursor string) (source, error)
+
+// Reader reads the journal and exports its entries. All fields are owned by the
+// single Run goroutine.
 type Reader struct {
-	cfg Config
-	log *slog.Logger
+	cfg  Config
+	log  *slog.Logger
+	open openFunc
 
 	batch       []entry
 	lastFlush   time.Time
@@ -102,9 +117,6 @@ type entry struct {
 
 // New creates a Reader.
 func New(cfg Config) *Reader {
-	if cfg.Path == "" {
-		cfg.Path = "journalctl"
-	}
 	if cfg.BatchSize <= 0 {
 		cfg.BatchSize = 1024
 	}
@@ -120,20 +132,20 @@ func New(cfg Config) *Reader {
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
 	}
-	return &Reader{cfg: cfg, log: cfg.Logger}
+	return &Reader{cfg: cfg, log: cfg.Logger, open: openJournal}
 }
 
-// Run reads until ctx is done, restarting the subprocess on any failure.
+// Run reads until ctx is done, restarting the reader on any failure.
 func (r *Reader) Run(ctx context.Context) {
 	r.cursor = r.loadCursor()
 	backoff := r.cfg.RestartBackoff
 	for ctx.Err() == nil {
-		err := r.follow(ctx)
+		err := r.stream(ctx)
 		if ctx.Err() != nil {
 			break
 		}
 		obs.JournalRestarts.Inc()
-		r.log.Warn("journalctl stopped; restarting", "error", err, "backoff", backoff)
+		r.log.Warn("journal reader stopped; restarting", "error", err, "backoff", backoff)
 		select {
 		case <-ctx.Done():
 		case <-time.After(backoff):
@@ -142,71 +154,56 @@ func (r *Reader) Run(ctx context.Context) {
 			backoff = 30 * time.Second
 		}
 	}
-	// Final flush of whatever is buffered; the subprocess is already gone.
+	// Final flush of whatever is buffered.
 	if err := r.flush(context.Background()); err != nil {
 		r.log.Warn("final journal flush failed", "error", err)
 	}
 }
 
-// follow runs one journalctl incarnation, streaming until it exits or an
-// export fails. On export failure the buffered entries are dropped and the
-// subprocess killed; the caller restarts from the committed cursor.
-func (r *Reader) follow(ctx context.Context) error {
-	args := []string{"-f", "-o", "json", "--no-pager"}
-	if r.cursor != "" {
-		args = append(args, "--after-cursor="+r.cursor)
-	} else {
-		// No committed position: start at the tail rather than replaying
-		// the whole journal.
-		args = append(args, "-n", "0")
-	}
-	if r.cfg.Dir != "" {
-		args = append(args, "-D", r.cfg.Dir)
-	}
-	for _, u := range r.cfg.Units {
-		args = append(args, "-u", u)
-	}
-
-	cctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	cmd := exec.CommandContext(cctx, r.cfg.Path, args...)
-	cmd.Stderr = os.Stderr
-	stdout, err := cmd.StdoutPipe()
+// stream opens one journal source and reads until it ends or an export fails.
+// On export failure the buffered entries are dropped; the caller restarts from
+// the committed cursor, re-reading them.
+func (r *Reader) stream(ctx context.Context) error {
+	src, err := r.open(r.cfg, r.cursor)
 	if err != nil {
 		return err
 	}
-	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("starting %s: %w", r.cfg.Path, err)
-	}
-	defer func() {
-		cancel()
-		_ = cmd.Wait()
-	}()
-	r.log.Info("journalctl started", "path", r.cfg.Path, "args", strings.Join(args, " "))
+	defer func() { _ = src.close() }()
 
 	r.batch = r.batch[:0]
 	r.batchCursor = ""
 	r.lastFlush = time.Now()
 
-	// The flush interval must fire even while no entries arrive, so lines
-	// are handed over from a reader goroutine bound to this incarnation.
-	lines := make(chan []byte)
+	// A reader goroutine bound to this source hands entries over so the flush
+	// ticker still fires while no entries arrive. It must stop before src.close
+	// (the journal handle is not safe for concurrent use), so cancel its context
+	// and wait for done before returning.
+	cctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	entries := make(chan rawEntry)
 	readErr := make(chan error, 1)
+	done := make(chan struct{})
 	go func() {
-		defer close(lines)
-		sc := bufio.NewScanner(stdout)
-		sc.Buffer(make([]byte, 64*1024), r.cfg.MaxEntryBytes+64*1024)
-		for sc.Scan() {
-			line := make([]byte, len(sc.Bytes()))
-			copy(line, sc.Bytes())
+		defer close(done)
+		defer close(entries)
+		for {
+			e, ok, err := src.next(cctx)
+			if err != nil {
+				readErr <- err
+				return
+			}
+			if !ok {
+				return
+			}
 			select {
-			case lines <- line:
+			case entries <- e:
 			case <-cctx.Done():
 				return
 			}
 		}
-		readErr <- sc.Err()
 	}()
+	// Ensure the goroutine has fully exited before src.close runs.
+	defer func() { cancel(); <-done }()
 
 	ticker := time.NewTicker(r.cfg.FlushInterval)
 	defer ticker.Stop()
@@ -220,22 +217,19 @@ func (r *Reader) follow(ctx context.Context) error {
 					return err
 				}
 			}
-		case line, ok := <-lines:
+		case e, ok := <-entries:
 			if !ok {
-				// Subprocess output ended: flush what we have, then report.
 				if err := r.flush(ctx); err != nil {
 					return err
 				}
 				select {
 				case err := <-readErr:
-					if err != nil {
-						return fmt.Errorf("reading journalctl output: %w", err)
-					}
+					return fmt.Errorf("reading journal: %w", err)
 				default:
+					return fmt.Errorf("journal source ended")
 				}
-				return fmt.Errorf("journalctl exited")
 			}
-			r.ingest(line)
+			r.ingest(e)
 			if len(r.batch) >= r.cfg.BatchSize {
 				if err := r.flush(ctx); err != nil {
 					return err
@@ -245,33 +239,27 @@ func (r *Reader) follow(ctx context.Context) error {
 	}
 }
 
-// ingest parses one journalctl JSON line into the batch.
-func (r *Reader) ingest(line []byte) {
-	var fields map[string]any
-	if err := json.Unmarshal(line, &fields); err != nil {
-		r.log.Debug("unparsable journal line", "error", err)
-		return
-	}
-	msg := fieldString(fields, "MESSAGE")
+// ingest converts one raw journal entry into the batch.
+func (r *Reader) ingest(re rawEntry) {
+	msg := re.fields["MESSAGE"]
 	if len(msg) > r.cfg.MaxEntryBytes {
 		msg = msg[:r.cfg.MaxEntryBytes]
 	}
 	e := entry{
-		unit:  fieldString(fields, "_SYSTEMD_UNIT"),
-		ident: fieldString(fields, "SYSLOG_IDENTIFIER"),
+		unit:  re.fields["_SYSTEMD_UNIT"],
+		ident: re.fields["SYSLOG_IDENTIFIER"],
 		body:  msg,
+		ts:    re.realtime,
 	}
-	if usec, err := strconv.ParseInt(fieldString(fields, "__REALTIME_TIMESTAMP"), 10, 64); err == nil {
-		e.ts = time.UnixMicro(usec)
-	} else {
+	if e.ts.IsZero() {
 		e.ts = time.Now()
 	}
-	e.severity, e.sevText = severity(fieldString(fields, "PRIORITY"))
-	if pid, err := strconv.ParseInt(fieldString(fields, "_PID"), 10, 64); err == nil {
+	e.severity, e.sevText = severity(re.fields["PRIORITY"])
+	if pid, err := strconv.ParseInt(re.fields["_PID"], 10, 64); err == nil {
 		e.pid = pid
 	}
-	if cursor := fieldString(fields, "__CURSOR"); cursor != "" {
-		r.batchCursor = cursor
+	if re.cursor != "" {
+		r.batchCursor = re.cursor
 	}
 	r.batch = append(r.batch, e)
 }
@@ -377,36 +365,6 @@ func severity(priority string) (plog.SeverityNumber, string) {
 		return plog.SeverityNumberDebug, "debug"
 	}
 	return plog.SeverityNumberUnspecified, ""
-}
-
-// fieldString extracts a journal field that may be a string or (for
-// non-UTF-8 payloads) an array of bytes; multi-valued fields yield the
-// first value.
-func fieldString(fields map[string]any, key string) string {
-	switch v := fields[key].(type) {
-	case string:
-		return v
-	case []any:
-		if len(v) == 0 {
-			return ""
-		}
-		// Either a byte array (numbers) or multiple values.
-		if _, ok := v[0].(float64); ok {
-			b := make([]byte, 0, len(v))
-			for _, n := range v {
-				f, ok := n.(float64)
-				if !ok {
-					return ""
-				}
-				b = append(b, byte(int(f)))
-			}
-			return string(b)
-		}
-		if s, ok := v[0].(string); ok {
-			return s
-		}
-	}
-	return ""
 }
 
 func (r *Reader) loadCursor() string {

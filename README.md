@@ -445,17 +445,18 @@ ServiceAccount token (`nodes/metrics` RBAC, see
 * **node metrics** (`/metrics`): the kubelet's own metrics under a node-level
   resource (`k8s.node.name`, `service.name: kubelet`).
 
-**journald** (opt-in, `-journald`). The agent tails the systemd journal by
-running `journalctl -f -o json` as a subprocess and exporting the entries as
-OTLP log records, one resource per unit (`service.name` = unit without
-`.service`, `systemd.unit`, plus the configured node attributes; syslog
-priorities map to OTLP severities). Delivery is at-least-once: the cursor of
-the newest exported entry is persisted (via `-positions-file`) only after a
-successful export, and on export failure or subprocess death journalctl is
-restarted from the committed cursor with backoff. `-journald-units` restricts
-to specific units, `-journald-dir` reads a non-default journal directory,
-`-journald-path` names the binary — which the default distroless image does
-**not** contain; bring an image that provides it. `-journald-enrich`
+**journald** (opt-in, `-journald`). The agent reads the systemd journal
+natively through libsystemd (`coreos/go-systemd/sdjournal`) and exports the
+entries as OTLP log records, one resource per unit (`service.name` = unit
+without `.service`, `systemd.unit`, plus the configured node attributes; syslog
+priorities map to OTLP severities). Because it links libsystemd, the **agent
+binary is built with cgo** (the metadata service stays fully static) and the
+image ships libsystemd — no `journalctl` binary or subprocess. Delivery is
+at-least-once: the cursor of the newest exported entry is persisted (via
+`-positions-file`) only after a successful export, and on export failure or a
+reader error it restarts from the committed cursor with backoff.
+`-journald-units` restricts to specific units and `-journald-dir` reads a
+non-default journal directory (e.g. `/run/log/journal`). `-journald-enrich`
 (default true) applies the same per-line enrichment as `-logs-enrich`; an
 explicit level found in the message wins over the journal priority.
 

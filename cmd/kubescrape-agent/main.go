@@ -83,8 +83,7 @@ func run() error {
 		logsFingerprint   = flag.Int("logs-fingerprint-bytes", 1024, "file-head hash length used with the inode as file identity (negative = inode only)")
 
 		journaldOn     = flag.Bool("journald", false, "tail the systemd journal via journalctl (the binary must exist in the image)")
-		journaldPath   = flag.String("journald-path", "journalctl", "journalctl binary")
-		journaldDir    = flag.String("journald-dir", "", "journal directory (journalctl -D); empty uses the system default")
+		journaldDir    = flag.String("journald-dir", "", "read a specific journal directory; empty opens the default system journal")
 		journaldUnits  = flag.String("journald-units", "", "comma-separated systemd units to read (empty reads everything)")
 		journaldEnrich = flag.Bool("journald-enrich", true, "parse per-message metadata into the OTLP record fields (as -logs-enrich); an explicit level in the message wins over the journal priority")
 		journaldBatch  = flag.Int("journald-batch-size", 1024, "flush journal entries after this many")
@@ -291,7 +290,6 @@ func run() error {
 
 	if *journaldOn {
 		jr := journald.New(journald.Config{
-			Path:          *journaldPath,
 			Dir:           *journaldDir,
 			Units:         splitList(*journaldUnits),
 			Positions:     posStore,
@@ -310,7 +308,7 @@ func run() error {
 			defer wg.Done()
 			jr.Run(ctx)
 		}()
-		log.Info("journald reader started", "path", *journaldPath, "units", *journaldUnits, "positions", *positionsFile)
+		log.Info("journald reader started", "dir", *journaldDir, "units", *journaldUnits, "positions", *positionsFile)
 	}
 
 	if *ingestOn {

@@ -3,7 +3,6 @@ package journald
 import (
 	"context"
 	"fmt"
-	"os"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -15,8 +14,8 @@ import (
 	"github.com/JohanLindvall/kubescrape/internal/agent/positions"
 )
 
-// captureExporter records exported batches; Fail(n) makes the next n
-// exports error.
+// captureExporter records exported batches; failures makes the next n exports
+// error.
 type captureExporter struct {
 	mu       sync.Mutex
 	batches  []plog.Logs
@@ -52,29 +51,59 @@ func (c *captureExporter) records() []string {
 	return out
 }
 
-// stubJournalctl writes a fake journalctl: it emits the entries whose
-// cursor sorts after --after-cursor (all of them without one), then sleeps.
-// Entry i has cursor "c<i>", unit and message from the arrays.
-func stubJournalctl(t *testing.T, units, messages []string) string {
-	t.Helper()
-	dir := t.TempDir()
-	var body string
-	body = "#!/bin/sh\nafter=\"\"\nfor a in \"$@\"; do case \"$a\" in --after-cursor=*) after=\"${a#--after-cursor=}\";; esac; done\n"
-	for i := range messages {
-		cursor := fmt.Sprintf("c%02d", i)
-		line := fmt.Sprintf(`{"__CURSOR":"%s","MESSAGE":"%s","PRIORITY":"6","_SYSTEMD_UNIT":"%s","_PID":"42","SYSLOG_IDENTIFIER":"stub","__REALTIME_TIMESTAMP":"1700000000%06d"}`,
-			cursor, messages[i], units[i], i)
-		// Emit the entry unless its cursor is <= the resume cursor.
-		body += fmt.Sprintf("if [ -z \"$after\" ] || [ \"%s\" \\> \"$after\" ]; then echo '%s'; fi\n", cursor, line)
+// fakeSource replays a fixed list of entries, then either ends (ended=true, to
+// exercise the restart path) or blocks like a live follower until ctx is done.
+type fakeSource struct {
+	mu      sync.Mutex
+	entries []rawEntry
+	ended   bool
+}
+
+func (f *fakeSource) next(ctx context.Context) (rawEntry, bool, error) {
+	f.mu.Lock()
+	if len(f.entries) > 0 {
+		e := f.entries[0]
+		f.entries = f.entries[1:]
+		f.mu.Unlock()
+		return e, true, nil
 	}
-	// exec so the reader's kill reaches the sleep itself; an orphaned child
-	// would hold the test binary's stderr open and stall `go test` for 60s.
-	body += "exec sleep 60\n"
-	path := filepath.Join(dir, "journalctl")
-	if err := os.WriteFile(path, []byte(body), 0o755); err != nil {
-		t.Fatal(err)
+	f.mu.Unlock()
+	if f.ended {
+		return rawEntry{}, false, nil
 	}
-	return path
+	<-ctx.Done()
+	return rawEntry{}, false, ctx.Err()
+}
+
+func (f *fakeSource) close() error { return nil }
+
+// fakeOpener builds an opener that, on each (re)open, replays the entries whose
+// cursor sorts after afterCursor — mirroring cursor-based resume.
+func fakeOpener(all []rawEntry, ended bool) openFunc {
+	return func(_ Config, afterCursor string) (source, error) {
+		var kept []rawEntry
+		for _, e := range all {
+			if afterCursor == "" || e.cursor > afterCursor {
+				kept = append(kept, e)
+			}
+		}
+		return &fakeSource{entries: kept, ended: ended}, nil
+	}
+}
+
+// entry builds a rawEntry with the common journal fields.
+func mkEntry(cursor, unit, msg, priority string) rawEntry {
+	return rawEntry{
+		fields: map[string]string{
+			"MESSAGE":           msg,
+			"PRIORITY":          priority,
+			"_SYSTEMD_UNIT":     unit,
+			"_PID":              "42",
+			"SYSLOG_IDENTIFIER": "stub",
+		},
+		cursor:   cursor,
+		realtime: time.UnixMicro(1_700_000_000_000000),
+	}
 }
 
 func waitFor(t *testing.T, what string, cond func() bool) {
@@ -89,13 +118,14 @@ func waitFor(t *testing.T, what string, cond func() bool) {
 	t.Fatalf("timed out waiting for %s", what)
 }
 
-func startReader(t *testing.T, cfg Config) (*captureExporter, context.CancelFunc) {
+func startReader(t *testing.T, cfg Config, entries []rawEntry, ended bool, failures int) (*captureExporter, context.CancelFunc) {
 	t.Helper()
-	exp := &captureExporter{}
+	exp := &captureExporter{failures: failures}
 	cfg.Exporter = exp
 	cfg.FlushInterval = 20 * time.Millisecond
 	cfg.RestartBackoff = 10 * time.Millisecond
 	r := New(cfg)
+	r.open = fakeOpener(entries, ended)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() { defer close(done); r.Run(ctx) }()
@@ -104,11 +134,12 @@ func startReader(t *testing.T, cfg Config) (*captureExporter, context.CancelFunc
 }
 
 func TestJournalExport(t *testing.T) {
-	path := stubJournalctl(t,
-		[]string{"kubelet.service", "kubelet.service", "sshd.service"},
-		[]string{"one", "two", "three"})
-	exp, _ := startReader(t, Config{Path: path})
-
+	entries := []rawEntry{
+		mkEntry("c00", "kubelet.service", "one", "6"),
+		mkEntry("c01", "kubelet.service", "two", "6"),
+		mkEntry("c02", "sshd.service", "three", "6"),
+	}
+	exp, _ := startReader(t, Config{}, entries, false, 0)
 	waitFor(t, "3 records", func() bool { return len(exp.records()) == 3 })
 
 	// Per-unit resources: kubelet entries share one, sshd gets its own.
@@ -140,19 +171,21 @@ func TestJournalExport(t *testing.T) {
 }
 
 func TestJournalCursorResume(t *testing.T) {
-	path := stubJournalctl(t,
-		[]string{"a.service", "a.service", "a.service"},
-		[]string{"one", "two", "three"})
+	entries := []rawEntry{
+		mkEntry("c00", "a.service", "one", "6"),
+		mkEntry("c01", "a.service", "two", "6"),
+		mkEntry("c02", "a.service", "three", "6"),
+	}
 	posPath := filepath.Join(t.TempDir(), "positions.json")
 	pos := positions.Open(posPath)
 
-	exp, cancel := startReader(t, Config{Path: path, Positions: pos})
+	exp, cancel := startReader(t, Config{Positions: pos}, entries, false, 0)
 	waitFor(t, "first run's 3 records", func() bool { return len(exp.records()) == 3 })
 	waitFor(t, "cursor committed", func() bool { return pos.JournalCursor() == "c02" })
 	cancel()
 
 	// A fresh reader resumes past the committed cursor: nothing re-emitted.
-	exp2, _ := startReader(t, Config{Path: path, Positions: positions.Open(posPath)})
+	exp2, _ := startReader(t, Config{Positions: positions.Open(posPath)}, entries, false, 0)
 	time.Sleep(150 * time.Millisecond)
 	if got := exp2.records(); len(got) != 0 {
 		t.Fatalf("resumed run re-emitted %v", got)
@@ -160,24 +193,16 @@ func TestJournalCursorResume(t *testing.T) {
 }
 
 func TestJournalExportFailureRereads(t *testing.T) {
-	path := stubJournalctl(t,
-		[]string{"a.service", "a.service"},
-		[]string{"one", "two"})
-	exp := &captureExporter{failures: 1}
-	r := New(Config{
-		Path:           path,
-		Positions:      positions.Open(filepath.Join(t.TempDir(), "positions.json")),
-		Exporter:       exp,
-		FlushInterval:  20 * time.Millisecond,
-		RestartBackoff: 10 * time.Millisecond,
-	})
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan struct{})
-	go func() { defer close(done); r.Run(ctx) }()
-	t.Cleanup(func() { cancel(); <-done })
+	entries := []rawEntry{
+		mkEntry("c00", "a.service", "one", "6"),
+		mkEntry("c01", "a.service", "two", "6"),
+	}
+	// One injected export failure: the uncommitted batch is re-read after the
+	// reader restarts (no cursor committed), so both entries arrive.
+	exp, _ := startReader(t, Config{
+		Positions: positions.Open(filepath.Join(t.TempDir(), "positions.json")),
+	}, entries, false, 1)
 
-	// The failed batch is re-read after the subprocess restart; no cursor
-	// was committed, so both entries arrive.
 	waitFor(t, "re-read records", func() bool { return len(exp.records()) == 2 })
 	if got := exp.records(); got[0] != "one" || got[1] != "two" {
 		t.Fatalf("records = %v", got)
@@ -185,38 +210,26 @@ func TestJournalExportFailureRereads(t *testing.T) {
 }
 
 func TestJournalRestartAfterExit(t *testing.T) {
-	// A stub that exits immediately after emitting one entry: the reader
-	// must restart it and (thanks to the committed cursor) not duplicate.
-	dir := t.TempDir()
-	path := filepath.Join(dir, "journalctl")
-	script := "#!/bin/sh\nafter=\"\"\nfor a in \"$@\"; do case \"$a\" in --after-cursor=*) after=\"${a#--after-cursor=}\";; esac; done\n" +
-		"if [ -z \"$after\" ]; then echo '{\"__CURSOR\":\"c0\",\"MESSAGE\":\"only\",\"PRIORITY\":\"4\",\"_SYSTEMD_UNIT\":\"a.service\",\"__REALTIME_TIMESTAMP\":\"1700000000000000\"}'; fi\n"
-	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	exp, _ := startReader(t, Config{Path: path, Positions: positions.Open(filepath.Join(dir, "positions.json"))})
+	// A source that ends after one entry: the reader restarts it and (thanks to
+	// the committed cursor) does not duplicate.
+	entries := []rawEntry{mkEntry("c0", "a.service", "only", "4")}
+	exp, _ := startReader(t, Config{
+		Positions: positions.Open(filepath.Join(t.TempDir(), "positions.json")),
+	}, entries, true, 0)
 
 	waitFor(t, "one record", func() bool { return len(exp.records()) == 1 })
-	// Give it a few restart cycles; the record must not repeat.
-	time.Sleep(200 * time.Millisecond)
+	time.Sleep(200 * time.Millisecond) // several restart cycles
 	if got := exp.records(); len(got) != 1 {
 		t.Fatalf("records after restarts = %v", got)
 	}
 }
 
 func TestJournalEnrich(t *testing.T) {
-	// The JSON message carries its own level, which must win over the
-	// journal's PRIORITY (6 = info) when enrichment is on.
-	dir := t.TempDir()
-	path := filepath.Join(dir, "journalctl")
-	msg := `{\"@t\":\"2026-01-02T03:04:05Z\",\"level\":\"error\",\"msg\":\"boom\"}`
-	script := "#!/bin/sh\n" +
-		`echo '{"__CURSOR":"c0","MESSAGE":"` + msg + `","PRIORITY":"6","_SYSTEMD_UNIT":"a.service","__REALTIME_TIMESTAMP":"1700000000000000"}'` + "\n" +
-		"exec sleep 60\n"
-	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	exp, _ := startReader(t, Config{Path: path, Enrich: true})
+	// The JSON message carries its own level, which must win over the journal's
+	// PRIORITY (6 = info) when enrichment is on.
+	msg := `{"@t":"2026-01-02T03:04:05Z","level":"error","msg":"boom"}`
+	entries := []rawEntry{mkEntry("c0", "a.service", msg, "6")}
+	exp, _ := startReader(t, Config{Enrich: true}, entries, false, 0)
 	waitFor(t, "one record", func() bool { return len(exp.records()) == 1 })
 
 	exp.mu.Lock()
@@ -231,11 +244,12 @@ func TestJournalEnrich(t *testing.T) {
 }
 
 func TestJournalLogAttrs(t *testing.T) {
-	// Structured JSON messages carry a tenant; as a resource attribute it
-	// splits records into separate resources even within one unit.
-	path := stubJournalctl(t,
-		[]string{"a.service", "a.service"},
-		[]string{`{\"tenant\":\"x\",\"req\":\"r1\"}`, `{\"tenant\":\"y\",\"req\":\"r2\"}`})
+	// Structured JSON messages carry a tenant; as a resource attribute it splits
+	// records into separate resources even within one unit.
+	entries := []rawEntry{
+		mkEntry("c00", "a.service", `{"tenant":"x","req":"r1"}`, "6"),
+		mkEntry("c01", "a.service", `{"tenant":"y","req":"r2"}`, "6"),
+	}
 	ex, err := logattrs.New(&logattrs.Config{Rules: []logattrs.Rule{
 		{Key: "tenant", Attribute: "tenant.id", Target: logattrs.TargetResource},
 		{Key: "req", Target: logattrs.TargetLog},
@@ -243,7 +257,7 @@ func TestJournalLogAttrs(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	exp, _ := startReader(t, Config{Path: path, LogAttrs: ex})
+	exp, _ := startReader(t, Config{LogAttrs: ex}, entries, false, 0)
 	waitFor(t, "2 records", func() bool { return len(exp.records()) == 2 })
 
 	exp.mu.Lock()
@@ -262,25 +276,5 @@ func TestJournalLogAttrs(t *testing.T) {
 	}
 	if tenants["x"] != 1 || tenants["y"] != 1 {
 		t.Errorf("tenant record counts = %+v (want one resource each)", tenants)
-	}
-}
-
-func TestFieldString(t *testing.T) {
-	fields := map[string]any{
-		"S":     "plain",
-		"BYTES": []any{float64('h'), float64('i')},
-		"MULTI": []any{"first", "second"},
-	}
-	if got := fieldString(fields, "S"); got != "plain" {
-		t.Errorf("string = %q", got)
-	}
-	if got := fieldString(fields, "BYTES"); got != "hi" {
-		t.Errorf("bytes = %q", got)
-	}
-	if got := fieldString(fields, "MULTI"); got != "first" {
-		t.Errorf("multi = %q", got)
-	}
-	if got := fieldString(fields, "MISSING"); got != "" {
-		t.Errorf("missing = %q", got)
 	}
 }

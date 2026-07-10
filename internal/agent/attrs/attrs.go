@@ -9,6 +9,20 @@ import (
 	"github.com/JohanLindvall/kubescrape/internal/kubemeta"
 )
 
+// ServiceName derives the OTLP service.name for a pod: the name of its
+// workload owner (Deployment/StatefulSet/DaemonSet/Job/CronJob), falling back
+// to the pod name. A ReplicaSet owner is not used (its Deployment is).
+func ServiceName(pod kubemeta.Pod) string {
+	name := pod.Name
+	for _, o := range pod.Owners {
+		switch o.Kind {
+		case "Deployment", "StatefulSet", "DaemonSet", "Job", "CronJob":
+			name = o.Name
+		}
+	}
+	return name
+}
+
 // Pod sets the pod-level resource attributes.
 func Pod(res pcommon.Resource, pod kubemeta.Pod) {
 	a := res.Attributes()
@@ -18,30 +32,27 @@ func Pod(res pcommon.Resource, pod kubemeta.Pod) {
 	if pod.NodeName != "" {
 		a.PutStr("k8s.node.name", pod.NodeName)
 	}
+	if pod.PodIP != "" {
+		a.PutStr("k8s.pod.ip", pod.PodIP)
+	}
 
-	serviceName := pod.Name
 	for _, o := range pod.Owners {
 		switch o.Kind {
 		case "ReplicaSet":
 			a.PutStr("k8s.replicaset.name", o.Name)
 		case "Deployment":
 			a.PutStr("k8s.deployment.name", o.Name)
-			serviceName = o.Name
 		case "StatefulSet":
 			a.PutStr("k8s.statefulset.name", o.Name)
-			serviceName = o.Name
 		case "DaemonSet":
 			a.PutStr("k8s.daemonset.name", o.Name)
-			serviceName = o.Name
 		case "Job":
 			a.PutStr("k8s.job.name", o.Name)
-			serviceName = o.Name
 		case "CronJob":
 			a.PutStr("k8s.cronjob.name", o.Name)
-			serviceName = o.Name
 		}
 	}
-	a.PutStr("service.name", serviceName)
+	a.PutStr("service.name", ServiceName(pod))
 
 	for k, v := range pod.Labels {
 		a.PutStr("k8s.pod.label."+k, v)
@@ -124,5 +135,24 @@ func Identity(res pcommon.Resource) {
 	}
 	if inst != "" {
 		a.PutStr("service.instance.id", inst)
+	}
+}
+
+// PrefixInstance prepends prefix (+ "-") to service.instance.id so resources
+// produced by an exporter that DESCRIBES other objects — cadvisor, or a
+// kube-state-metrics splitter — get an instance distinct from those objects'
+// own self-scraped metrics (which share the same service.name / namespace).
+// Without it the two collide on (job, instance) with different resource
+// attributes, flapping target_info. Mirrors cmb-alloy's instance_prefix. A
+// resource with no service.instance.id gets the bare prefix. No-op for "".
+func PrefixInstance(res pcommon.Resource, prefix string) {
+	if prefix == "" {
+		return
+	}
+	a := res.Attributes()
+	if v, ok := a.Get("service.instance.id"); ok {
+		a.PutStr("service.instance.id", prefix+"-"+v.AsString())
+	} else {
+		a.PutStr("service.instance.id", prefix)
 	}
 }

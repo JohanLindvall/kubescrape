@@ -61,10 +61,20 @@ type Config struct {
 	Static map[string]string `json:"static,omitempty"`
 	// Attributes maps attribute keys to Go templates over Context.
 	Attributes map[string]string `json:"attributes,omitempty"`
+	// InstancePrefix is prepended to the derived service.instance.id (see
+	// PrefixInstance). It defaults per pipeline (cadvisor -> "cadvisor") so
+	// describing exporters do not collide with self-scraped metrics; set it to
+	// "" to disable, or to any string to override.
+	InstancePrefix *string `json:"instancePrefix,omitempty"`
 	// Pipelines overrides/extends the top-level settings for one pipeline;
 	// static and attribute maps merge with the pipeline entry winning.
 	Pipelines map[string]*Config `json:"pipelines,omitempty"`
 }
+
+// defaultInstancePrefix is the built-in service.instance.id prefix per pipeline
+// (empty for pipelines whose resources are the exporter's own identity). It
+// applies unless the config sets InstancePrefix explicitly.
+var defaultInstancePrefix = map[string]string{"cadvisor": "cadvisor"}
 
 // LoadConfig reads a Config from a YAML file.
 func LoadConfig(path string) (*Config, error) {
@@ -107,50 +117,59 @@ type Builders struct {
 	Ingest   *Builder
 }
 
-// NewBuilders compiles the per-pipeline builders from cfg (nil = defaults
-// everywhere) and one shared filter.
+// NewBuilders compiles one builder per pipeline from cfg (nil = defaults
+// everywhere) and one shared filter. Each pipeline merges the base config with
+// its own section and picks up its default instance prefix.
 func NewBuilders(cfg *Config, filter *Filter) (*Builders, error) {
-	base, err := NewBuilder(cfg, filter)
-	if err != nil {
-		return nil, err
+	b := &Builders{}
+	assign := map[string]**Builder{
+		"logs": &b.Logs, "targets": &b.Targets, "cadvisor": &b.Cadvisor,
+		"node": &b.Node, "journal": &b.Journal, "ingest": &b.Ingest,
 	}
-	b := &Builders{Logs: base, Targets: base, Cadvisor: base, Node: base, Journal: base, Ingest: base}
-	if cfg == nil {
-		return b, nil
-	}
-	for name, sub := range cfg.Pipelines {
+	for _, name := range pipelineNames {
+		var sub *Config
+		if cfg != nil {
+			sub = cfg.Pipelines[name]
+		}
 		merged := mergeConfig(cfg, sub)
+		// Instance-prefix precedence: an explicit pipeline section wins;
+		// otherwise the built-in pipeline default (e.g. cadvisor) beats the
+		// top-level base, so a global prefix can't silently strip cadvisor's
+		// collision protection. mergeConfig already left the base value in place.
+		if sub == nil || sub.InstancePrefix == nil {
+			if p, ok := defaultInstancePrefix[name]; ok {
+				merged.InstancePrefix = &p
+			}
+		}
 		pb, err := NewBuilder(merged, filter)
 		if err != nil {
 			return nil, fmt.Errorf("pipeline %q: %w", name, err)
 		}
-		switch name {
-		case "logs":
-			b.Logs = pb
-		case "targets":
-			b.Targets = pb
-		case "cadvisor":
-			b.Cadvisor = pb
-		case "node":
-			b.Node = pb
-		case "journal":
-			b.Journal = pb
-		case "ingest":
-			b.Ingest = pb
-		}
+		*assign[name] = pb
 	}
 	return b, nil
 }
 
-// mergeConfig overlays a pipeline config onto the base; maps merge with the
-// pipeline winning.
+// mergeConfig overlays a pipeline config onto the base (nil base allowed); maps
+// merge with the pipeline winning.
 func mergeConfig(base, over *Config) *Config {
-	out := &Config{Defaults: base.Defaults}
-	if over != nil && over.Defaults != nil {
-		out.Defaults = over.Defaults
+	out := &Config{}
+	if base != nil {
+		out.Defaults = base.Defaults
+		out.InstancePrefix = base.InstancePrefix
 	}
-	out.Static = mergeMaps(base.Static, overMap(over, func(c *Config) map[string]string { return c.Static }))
-	out.Attributes = mergeMaps(base.Attributes, overMap(over, func(c *Config) map[string]string { return c.Attributes }))
+	if over != nil {
+		if over.Defaults != nil {
+			out.Defaults = over.Defaults
+		}
+		if over.InstancePrefix != nil {
+			out.InstancePrefix = over.InstancePrefix
+		}
+	}
+	out.Static = mergeMaps(overMap(base, func(c *Config) map[string]string { return c.Static }),
+		overMap(over, func(c *Config) map[string]string { return c.Static }))
+	out.Attributes = mergeMaps(overMap(base, func(c *Config) map[string]string { return c.Attributes }),
+		overMap(over, func(c *Config) map[string]string { return c.Attributes }))
 	return out
 }
 
@@ -179,10 +198,11 @@ func mergeMaps(base, over map[string]string) map[string]string {
 // the built-in mapping (unless disabled), static attributes, template
 // attributes, and finally the enable/disable filter.
 type Builder struct {
-	defaults bool
-	static   map[string]string
-	dynamic  []dynamicAttr
-	filter   *Filter
+	defaults       bool
+	static         map[string]string
+	dynamic        []dynamicAttr
+	instancePrefix string
+	filter         *Filter
 }
 
 type dynamicAttr struct {
@@ -253,6 +273,9 @@ func NewBuilder(cfg *Config, filter *Filter) (*Builder, error) {
 	if cfg.Defaults != nil {
 		b.defaults = *cfg.Defaults
 	}
+	if cfg.InstancePrefix != nil {
+		b.instancePrefix = *cfg.InstancePrefix
+	}
 	b.static = cfg.Static
 
 	keys := make([]string, 0, len(cfg.Attributes))
@@ -306,6 +329,8 @@ func (b *Builder) Build(res pcommon.Resource, ctx Context) {
 			res.Attributes().PutStr(d.key, sb.String())
 		}
 	}
+	// Prefix the (possibly template-overridden) instance last, before filtering.
+	PrefixInstance(res, b.instancePrefix)
 	b.filter.Apply(res)
 }
 

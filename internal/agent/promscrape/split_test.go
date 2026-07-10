@@ -203,6 +203,70 @@ func TestSplitterDatapointAttributesOverride(t *testing.T) {
 	}
 }
 
+func TestSplitterInstancePrefix(t *testing.T) {
+	body := "# TYPE kube_pod_info gauge\n" +
+		`kube_pod_info{namespace="ns1",pod="pod1",uid="` + uid1 + `",node="node9"} 1` + "\n"
+	run := func(t *testing.T, sp []*Splitter) pmetric.ResourceMetrics {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = w.Write([]byte(body))
+		}))
+		defer srv.Close()
+		target := testTarget(srv.URL) // owner Deployment "dep1" -> service.name dep1
+		target.Pod.Name = "ksm-abc"
+		target.Pod.Labels = map[string]string{"app.kubernetes.io/name": "kube-state-metrics"}
+		exp := &captureExporter{}
+		s := New(Config{
+			Node: "node1", Interval: time.Hour, Timeout: 5 * time.Second,
+			Targets: staticTargets{target}, Exporter: exp, StartTime: time.Now(),
+			Splitters: sp, Kubelet: KubeletConfig{Meta: &fakeMetaSource{}},
+		})
+		if _, err := s.scrapeTarget(context.Background(), target); err != nil {
+			t.Fatal(err)
+		}
+		rms := exp.batches[0].ResourceMetrics()
+		for i := 0; i < rms.Len(); i++ {
+			if attrStr(rms.At(i).Resource(), "k8s.pod.name") == "pod1" {
+				return rms.At(i)
+			}
+		}
+		t.Fatal("pod1 resource not produced")
+		return pmetric.ResourceMetrics{}
+	}
+
+	splitter := func(prefix *string) []*Splitter {
+		sp, err := NewSplitters([]SplitterConfig{{
+			Match: SplitterMatch{PodLabels: map[string]string{"app.kubernetes.io/name": "kube-state-metrics"}},
+			Rules: []SplitRule{{
+				Metrics:        `kube_pod_.+`,
+				GroupBy:        map[string]string{"namespace": "k8s.namespace.name", "pod": "k8s.pod.name", "uid": "k8s.pod.uid"},
+				InstancePrefix: prefix,
+			}},
+		}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return sp
+	}
+
+	// Default: prefix is the describing target's service.name (dep1).
+	rm := run(t, splitter(nil))
+	if got := attrStr(rm.Resource(), "service.instance.id"); got != "dep1-"+uid1 {
+		t.Errorf("default instance = %q, want dep1-%s", got, uid1)
+	}
+	// Explicit override.
+	custom := "ksm"
+	rm = run(t, splitter(&custom))
+	if got := attrStr(rm.Resource(), "service.instance.id"); got != "ksm-"+uid1 {
+		t.Errorf("override instance = %q, want ksm-%s", got, uid1)
+	}
+	// Empty string disables the prefix.
+	empty := ""
+	rm = run(t, splitter(&empty))
+	if got := attrStr(rm.Resource(), "service.instance.id"); got != uid1 {
+		t.Errorf("disabled instance = %q, want %s", got, uid1)
+	}
+}
+
 func TestSplitterMatch(t *testing.T) {
 	sp, err := NewSplitters([]SplitterConfig{{
 		Match: SplitterMatch{Namespace: "monitoring", PodName: "ksm-.+"},

@@ -78,6 +78,11 @@ type SplitRule struct {
 	// property of the object, not the exporter's identity. nil defaults to
 	// ["k8s.node.name"]; an explicit list (including []) overrides it.
 	DatapointAttributes *[]string `json:"datapointAttributes,omitempty"`
+	// InstancePrefix is prepended to each split resource's service.instance.id
+	// (see attrs.PrefixInstance) so a described object's series don't collide
+	// with its own self-scraped metrics. nil defaults to the describing
+	// target's service.name (e.g. "kube-state-metrics"); "" disables it.
+	InstancePrefix *string `json:"instancePrefix,omitempty"`
 	// Enrich resolves the identified pod/container through the metadata
 	// service.
 	Enrich bool `json:"enrich,omitempty"`
@@ -92,10 +97,11 @@ type Splitter struct {
 }
 
 type compiledSplitRule struct {
-	metrics       *regexp.Regexp // nil matches any
-	groupBy       []groupMapping // sorted by label for deterministic keys
-	datapointAttr []string       // resource attrs moved onto the data points
-	enrich        bool
+	metrics        *regexp.Regexp // nil matches any
+	groupBy        []groupMapping // sorted by label for deterministic keys
+	datapointAttr  []string       // resource attrs moved onto the data points
+	instancePrefix *string        // nil = default to the target's service.name
+	enrich         bool
 }
 
 // defaultDatapointAttrs are moved from a split resource onto its data points
@@ -150,6 +156,7 @@ func NewSplitters(cfgs []SplitterConfig) ([]*Splitter, error) {
 			if r.DatapointAttributes != nil {
 				cr.datapointAttr = *r.DatapointAttributes
 			}
+			cr.instancePrefix = r.InstancePrefix
 			cr.enrich = r.Enrich
 			sp.rules = append(sp.rules, cr)
 		}
@@ -205,6 +212,10 @@ type splitBatcher struct {
 	startTS  pcommon.Timestamp
 	scrapeTS pcommon.Timestamp
 
+	// defaultPrefix is the describing target's own service.name, used as the
+	// split resources' instance prefix unless a rule overrides it.
+	defaultPrefix string
+
 	md     pmetric.Metrics
 	scopes map[string]pmetric.ScopeMetrics
 	byKey  map[string]pmetric.Metric
@@ -219,8 +230,9 @@ type kv struct{ key, value string }
 func newSplitBatcher(s *Scraper, ctx context.Context, t kubemeta.ScrapeTarget, sp *Splitter, scrape time.Time) *splitBatcher {
 	b := &splitBatcher{
 		s: s, ctx: ctx, target: t, sp: sp,
-		startTS:  pcommon.NewTimestampFromTime(s.cfg.StartTime),
-		scrapeTS: pcommon.NewTimestampFromTime(scrape),
+		defaultPrefix: attrs.ServiceName(t.Pod),
+		startTS:       pcommon.NewTimestampFromTime(s.cfg.StartTime),
+		scrapeTS:      pcommon.NewTimestampFromTime(scrape),
 	}
 	b.reset()
 	return b
@@ -354,6 +366,14 @@ func (b *splitBatcher) fillSplitResource(res pcommon.Resource, rule *compiledSpl
 		}
 	}
 	b.s.attrsFor(pipelineTargets).Build(res, ctx)
+	// Distinguish this described object's instance from its own self-scraped
+	// metrics (same service.name/namespace) — default prefix is the describing
+	// target's service.name, matching cmb-alloy's instance_prefix.
+	prefix := b.defaultPrefix
+	if rule.instancePrefix != nil {
+		prefix = *rule.instancePrefix
+	}
+	attrs.PrefixInstance(res, prefix)
 }
 
 func labelValue(labels []Label, name string) string {

@@ -4,7 +4,53 @@ import (
 	"testing"
 
 	"go.opentelemetry.io/collector/pdata/pcommon"
+
+	"github.com/JohanLindvall/kubescrape/internal/kubemeta"
 )
+
+func TestPrefixInstance(t *testing.T) {
+	// Prepend to an existing instance.
+	res := pcommon.NewResource()
+	res.Attributes().PutStr("service.instance.id", "cid")
+	PrefixInstance(res, "cadvisor")
+	if v, _ := res.Attributes().Get("service.instance.id"); v.Str() != "cadvisor-cid" {
+		t.Errorf("prefix over existing = %q, want cadvisor-cid", v.Str())
+	}
+	// Bare prefix when no instance was derived.
+	res = pcommon.NewResource()
+	PrefixInstance(res, "cadvisor")
+	if v, _ := res.Attributes().Get("service.instance.id"); v.Str() != "cadvisor" {
+		t.Errorf("bare prefix = %q, want cadvisor", v.Str())
+	}
+	// Empty prefix is a no-op.
+	res = pcommon.NewResource()
+	res.Attributes().PutStr("service.instance.id", "x")
+	PrefixInstance(res, "")
+	if v, _ := res.Attributes().Get("service.instance.id"); v.Str() != "x" {
+		t.Errorf("empty prefix changed instance to %q", v.Str())
+	}
+}
+
+func TestPodIPAndServiceName(t *testing.T) {
+	res := pcommon.NewResource()
+	Pod(res, kubemeta.Pod{
+		Name: "p", Namespace: "ns", UID: "u", PodIP: "10.0.0.1",
+		Owners: []kubemeta.Owner{{Kind: "ReplicaSet", Name: "rs"}, {Kind: "Deployment", Name: "dep"}},
+	})
+	a := res.Attributes()
+	if v, _ := a.Get("k8s.pod.ip"); v.Str() != "10.0.0.1" {
+		t.Errorf("k8s.pod.ip = %q, want 10.0.0.1", v.Str())
+	}
+	if v, _ := a.Get("service.name"); v.Str() != "dep" {
+		t.Errorf("service.name = %q, want dep (owner)", v.Str())
+	}
+	// No PodIP -> attribute omitted.
+	res = pcommon.NewResource()
+	Pod(res, kubemeta.Pod{Name: "p", Namespace: "ns", UID: "u"})
+	if _, ok := res.Attributes().Get("k8s.pod.ip"); ok {
+		t.Error("k8s.pod.ip set despite empty PodIP")
+	}
+}
 
 func TestIdentity(t *testing.T) {
 	inst := func(seed map[string]string) string {

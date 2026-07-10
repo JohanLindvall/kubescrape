@@ -407,8 +407,17 @@ The `resourceAttributes` section controls how resource attributes are built for
 `service.namespace` (= the k8s namespace) and `service.instance.id` (fallback
 chain: `container.id`, pod-uid[/container], namespace/pod[/container], node) so
 Prometheus/Mimir gets a unique `job` (`service.namespace/service.name`) and
-`instance` — both omitted when a template sets them. Quick knobs also exist as
-flags:
+`instance` — both omitted when a template sets them.
+
+An `instancePrefix` (per pipeline, or per splitter rule) prepends `prefix-` to
+`service.instance.id`. This keeps an exporter that *describes other objects*
+(cadvisor, a kube-state-metrics splitter) from colliding with the described
+pod's own self-scraped `target_info` — they share `service.name`/namespace, so
+without a distinct instance they clash on `(job, instance)` with different
+resource attributes. It defaults to `cadvisor` for the cadvisor pipeline and to
+the describing target's `service.name` for splitter rules; set `""` to disable.
+Precedence: explicit pipeline section > built-in default > top-level base. Quick
+knobs also exist as flags:
 
 * `-resource-attrs-static=cluster=prod,env=eu` — fixed attributes.
 * `-resource-attrs-enable=<regex,...>` / `-resource-attrs-disable=<regex,...>`
@@ -421,9 +430,9 @@ The config section:
 ```yaml
 resourceAttributes:
   # Include the built-in mapping: k8s.namespace.name, k8s.pod.name,
-  # k8s.pod.uid, k8s.node.name, owners (k8s.deployment.name, ...), pod labels
-  # (k8s.pod.label.*), namespace labels, container.id, container.image.name,
-  # service.name (top owner). Default true.
+  # k8s.pod.uid, k8s.node.name, k8s.pod.ip, owners (k8s.deployment.name, ...),
+  # pod labels (k8s.pod.label.*), namespace labels, container.id,
+  # container.image.name, service.name (workload owner). Default true.
   defaults: true
 
   # Fixed attributes on every resource (flag statics override these).
@@ -448,6 +457,8 @@ resourceAttributes:
     node:
       attributes:
         service.name: kubelet
+    cadvisor:
+      instancePrefix: cadvisor   # default; "" disables the collision prefix
 ```
 
 Template context and functions:
@@ -504,7 +515,10 @@ against a mapped `k8s.pod.uid`) and carries the full metadata set.
 `datapointAttributes` (default `[k8s.node.name]`) lists resource attributes to
 emit on the **data points** instead of the resource — the described object's
 node is a property of the object, not the exporter's identity; set `[]` to keep
-everything on the resource, or list more attributes to demote.
+everything on the resource, or list more attributes to demote. `instancePrefix`
+(default: the describing target's `service.name`) prefixes each split resource's
+`service.instance.id` so the described object doesn't collide with its own
+self-scraped `target_info`; set `""` to disable.
 
 ```yaml
 metrics:
@@ -521,6 +535,7 @@ metrics:
             uid: k8s.pod.uid
             container: k8s.container.name
           enrich: true
+          # instancePrefix: kube-state-metrics   # default: target's service.name
         - metrics: 'kube_.+'
           groupBy: {namespace: k8s.namespace.name}
 ```

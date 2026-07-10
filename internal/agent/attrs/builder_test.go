@@ -98,6 +98,67 @@ func TestBuilderBadTemplate(t *testing.T) {
 	}
 }
 
+// instanceOf builds one pipeline's resource and returns its service.instance.id.
+func instanceOf(t *testing.T, b *Builder) string {
+	t.Helper()
+	res := pcommon.NewResource()
+	b.Build(res, testCtx())
+	v, _ := res.Attributes().Get("service.instance.id")
+	return v.Str()
+}
+
+func TestInstancePrefixDefaults(t *testing.T) {
+	// testCtx has container.id "cid" -> derived instance "cid".
+	bs, err := NewBuilders(nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := instanceOf(t, bs.Cadvisor); got != "cadvisor-cid" {
+		t.Errorf("cadvisor instance = %q, want cadvisor-cid (default prefix)", got)
+	}
+	for name, b := range map[string]*Builder{"targets": bs.Targets, "logs": bs.Logs, "node": bs.Node, "ingest": bs.Ingest} {
+		if got := instanceOf(t, b); got != "cid" {
+			t.Errorf("%s instance = %q, want cid (no prefix)", name, got)
+		}
+	}
+}
+
+func TestInstancePrefixConfig(t *testing.T) {
+	empty, custom := "", "ksm"
+	bs, err := NewBuilders(&Config{
+		Pipelines: map[string]*Config{
+			"cadvisor": {InstancePrefix: &empty},  // opt out of the default
+			"targets":  {InstancePrefix: &custom}, // opt in
+		},
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := instanceOf(t, bs.Cadvisor); got != "cid" {
+		t.Errorf("cadvisor instance = %q, want cid (default cleared)", got)
+	}
+	if got := instanceOf(t, bs.Targets); got != "ksm-cid" {
+		t.Errorf("targets instance = %q, want ksm-cid", got)
+	}
+}
+
+func TestInstancePrefixTopLevel(t *testing.T) {
+	prefix := "cluster7"
+	bs, err := NewBuilders(&Config{InstancePrefix: &prefix}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Top-level applies to pipelines without their own default/override...
+	if got := instanceOf(t, bs.Targets); got != "cluster7-cid" {
+		t.Errorf("targets instance = %q, want cluster7-cid", got)
+	}
+	// ...but the cadvisor pipeline's built-in default still wins over the base
+	// (a pipeline default is only overridden by an explicit pipeline setting).
+	if got := instanceOf(t, bs.Cadvisor); got != "cadvisor-cid" {
+		t.Errorf("cadvisor instance = %q, want cadvisor-cid", got)
+	}
+}
+
 func TestLoadConfig(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "attrs.yaml")
 	if err := os.WriteFile(path, []byte(`

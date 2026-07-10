@@ -513,14 +513,28 @@ described object's node is a property of the object, so it stays a queryable
 series label rather than part of the resource identity / `target_info` (the
 cmb-alloy placement); set it to `[]` to keep everything on the resource, or list
 more attributes to demote. Regular (non-split) scrape/cadvisor/node resources
-keep `k8s.node.name` as a resource attribute (the agent's node).
+keep `k8s.node.name` as a resource attribute (the agent's node). Each split rule
+also gets an `instancePrefix` (default: the describing target's `service.name`,
+e.g. `kube-state-metrics`) prepended to `service.instance.id` so a described
+object's series don't collide with its own self-scraped metrics; `""` disables
+it.
 
 **Resource attributes.** How resource attributes are built is configurable
 and applies uniformly to log and metric resources. The built-in mapping also
 derives, for Prometheus/Mimir, `service.namespace` = the k8s namespace and
 `service.instance.id` (fallback chain: `container.id`, pod-uid[/container],
 namespace/pod[/container], node) — so `job` = `service.namespace/service.name`
-and `instance` are unique. Both are omitted when a template sets them.
+and `instance` are unique. Both are omitted when a template sets them. Pods
+also carry `k8s.pod.ip` as a resource attribute (accessible in templates as
+`.Pod.PodIP`; drop it via `-resource-attrs-disable` if unwanted).
+
+An optional `instancePrefix` prepends `prefix-` to the derived
+`service.instance.id`. It defaults to `cadvisor` for the cadvisor pipeline (and
+to the describing target's `service.name` for splitter rules) so that
+describing exporters — whose resources share the pod's `service.name`/namespace
+— don't collide with the pod's own self-scraped `target_info`. Set it per
+pipeline (or per splitter rule); `""` disables it. An explicit pipeline setting
+wins over the built-in default, which wins over a top-level `instancePrefix`.
 
 * `-resource-attrs-enable` / `-resource-attrs-disable` — comma-separated
   regexes matched against the full attribute key (anchored). An attribute is
@@ -548,6 +562,8 @@ and `instance` are unique. Both are omitted when a template sets them.
       node:
         attributes:
           service.name: kubelet
+      cadvisor:
+        instancePrefix: cadvisor   # default; "" to disable collision prefix
   ```
 
   Template functions beyond the built-ins: `env`, `coalesce`, `default`,

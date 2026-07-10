@@ -155,9 +155,11 @@ agent:
 ```
 
 Batching is inherent (`-metrics-batch-size`, `-logs-batch-size`,
-`-logs-flush-interval`). There is no persistent sending queue: metric
-scrapes retry with backoff and re-scrape next interval; log delivery is
-at-least-once via checkpointed offsets.
+`-logs-flush-interval`). By default there is no persistent sending queue:
+metric scrapes retry with backoff and re-scrape next interval; log delivery is
+at-least-once via checkpointed offsets. For Alloy's disk-buffered WAL, set
+`agent.bufferDir` (flag `-buffer-dir`) to spool both logs and metrics to a
+disk-backed buffer during a collector outage, bounded by `-buffer-max-bytes`.
 
 ### `output_debug_otlp` / the `debug_otlp_output` pod label
 
@@ -193,17 +195,23 @@ attributes.
 
 ### `loki.source.journal`
 
-`agent.journald.enabled: true` (flag `-journald`): the agent tails the
-systemd journal via a journalctl subprocess with an at-least-once cursor
-checkpoint — but the default distroless image contains no journalctl, so
-supply an image that does.
+`agent.journald.enabled: true` (flag `-journald`): the agent reads the systemd
+journal natively through libsystemd (`coreos/go-systemd/sdjournal`, cgo — no
+journalctl subprocess), with an at-least-once cursor checkpoint. The default
+image ships libsystemd; the agent binary is built with cgo (the metadata
+service stays static).
+
+### `input_otlp` (apps pushing OTLP)
+
+Built in — `agent.ingest.enabled: true` (flag `-ingest`) receives OTLP/gRPC
+(`:4317`) and OTLP/HTTP (`:4318`) that apps push to the node, enriches each
+resource with k8s attributes from a `container.id`/`k8s.pod.uid` on the data
+(without overwriting sender-set values), and forwards it — replacing the
+collector-with-k8sattributes-processor you'd otherwise keep as the OTLP
+endpoint.
 
 ## Not covered — keep a collector for these
 
-* **`input_otlp`** (apps pushing OTLP for enrichment/forwarding): kubescrape
-  is pull/tail only. Keep an OpenTelemetry collector (with the
-  k8sattributes processor) as the OTLP endpoint, or point apps directly at
-  the backend.
 * **`input_pyroscope` / `output_pyroscope`**: profiles are out of scope;
   push them directly to the backend.
 

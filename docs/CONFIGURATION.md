@@ -8,8 +8,9 @@ kubescrape consists of two binaries built from one image:
 * **`kubescrape-agent`** — the per-node agent (DaemonSet). Tails container
   logs and scrapes Prometheus targets, exporting OTLP.
 
-Everything is configured through flags plus two optional YAML files on the
-agent (resource attributes, metrics filtering/splitting). The
+Everything is configured through flags plus one optional unified YAML file on
+the agent (`-config`, with `resourceAttributes`, `logs`, `logAttributes`,
+`logMetrics` and `metrics` sections). The
 [Helm chart](../charts/kubescrape) exposes all of it as values; the raw
 manifests live in [deploy/](../deploy).
 

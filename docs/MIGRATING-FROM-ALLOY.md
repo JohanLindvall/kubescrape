@@ -97,7 +97,6 @@ agent:
                 uid: k8s.pod.uid
                 container: k8s.container.name
                 container_id: container.id
-                node: k8s.node.name
               enrich: true        # full metadata via the metadata service
             - metrics: 'kube_.+'
               groupBy: {namespace: k8s.namespace.name}

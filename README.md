@@ -502,7 +502,13 @@ by a drop rule. `splitters` re-attribute targets whose series describe
 `groupBy` rules move identity labels into per-object resources, optionally
 enriched through the metadata service (by `container.id` or namespace/name,
 cross-checked against a mapped pod UID). Unmatched series stay on the
-target's own resource.
+target's own resource. `datapointAttributes` (default `[k8s.node.name]`) lists
+resource attributes to emit on the **data points** instead of the resource — a
+described object's node is a property of the object, so it stays a queryable
+series label rather than part of the resource identity / `target_info` (the
+cmb-alloy placement); set it to `[]` to keep everything on the resource, or list
+more attributes to demote. Regular (non-split) scrape/cadvisor/node resources
+keep `k8s.node.name` as a resource attribute (the agent's node).
 
 **Resource attributes.** How resource attributes are built is configurable
 and applies uniformly to log and metric resources. The built-in mapping also

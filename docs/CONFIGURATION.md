@@ -494,6 +494,10 @@ labels stay on the data points, and unmatched series stay on the target's
 own resource. With `enrich: true` the object resolves through the metadata
 service (by `container.id` if mapped, else namespace+name, cross-checked
 against a mapped `k8s.pod.uid`) and carries the full metadata set.
+`datapointAttributes` (default `[k8s.node.name]`) lists resource attributes to
+emit on the **data points** instead of the resource — the described object's
+node is a property of the object, not the exporter's identity; set `[]` to keep
+everything on the resource, or list more attributes to demote.
 
 ```yaml
 metrics:
@@ -509,7 +513,6 @@ metrics:
             pod: k8s.pod.name
             uid: k8s.pod.uid
             container: k8s.container.name
-            node: k8s.node.name
           enrich: true
         - metrics: 'kube_.+'
           groupBy: {namespace: k8s.namespace.name}
@@ -609,7 +612,6 @@ agent:
                 pod: k8s.pod.name
                 uid: k8s.pod.uid
                 container: k8s.container.name
-                node: k8s.node.name
               enrich: true
             - metrics: 'kube_.+'
               groupBy: {namespace: k8s.namespace.name}

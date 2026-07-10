@@ -117,8 +117,17 @@ func TestSplitterScrape(t *testing.T) {
 	if !ok {
 		t.Fatalf("missing ghost resource: %v", keys(byKey))
 	}
-	if attrStr(rm.Resource(), "k8s.pod.uid") != ghostUID || attrStr(rm.Resource(), "k8s.node.name") != "node9" {
+	if attrStr(rm.Resource(), "k8s.pod.uid") != ghostUID {
 		t.Fatalf("ghost resource = %v", rm.Resource().Attributes().AsRaw())
+	}
+	// k8s.node.name is a data-point attribute on a split resource, not a
+	// resource attribute (cmb-alloy placement).
+	if _, onRes := rm.Resource().Attributes().Get("k8s.node.name"); onRes {
+		t.Fatalf("k8s.node.name leaked onto the split resource: %v", rm.Resource().Attributes().AsRaw())
+	}
+	gdp := rm.ScopeMetrics().At(0).Metrics().At(0).Gauge().DataPoints().At(0)
+	if v, _ := gdp.Attributes().Get("k8s.node.name"); v.Str() != "node9" {
+		t.Fatalf("ghost data-point node = %v, want node9 (attrs %v)", v.AsRaw(), gdp.Attributes().AsRaw())
 	}
 
 	// Namespace-scoped rule: no pod attrs, ungrouped labels stay on points.
@@ -141,6 +150,56 @@ func TestSplitterScrape(t *testing.T) {
 	}
 	if v, _ := rm.Resource().Attributes().Get("url.full"); v.Str() == "" {
 		t.Fatal("self resource missing url.full")
+	}
+}
+
+func TestSplitterDatapointAttributesOverride(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(ksmBody))
+	}))
+	defer srv.Close()
+
+	target := testTarget(srv.URL)
+	target.Pod.Name = "ksm-abc"
+	target.Pod.Labels = map[string]string{"app.kubernetes.io/name": "kube-state-metrics"}
+
+	// Override: keep k8s.node.name on the resource (empty datapoint list).
+	sp, err := NewSplitters([]SplitterConfig{{
+		Match: SplitterMatch{PodLabels: map[string]string{"app.kubernetes.io/name": "kube-state-metrics"}},
+		Rules: []SplitRule{{
+			Metrics: `kube_pod_.+`,
+			GroupBy: map[string]string{
+				"namespace": "k8s.namespace.name", "pod": "k8s.pod.name",
+				"uid": "k8s.pod.uid", "node": "k8s.node.name",
+			},
+			DatapointAttributes: &[]string{},
+		}},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	exp := &captureExporter{}
+	s := New(Config{
+		Node: "node1", Interval: time.Hour, Timeout: 5 * time.Second,
+		Targets: staticTargets{target}, Exporter: exp, StartTime: time.Now(),
+		Splitters: sp, Kubelet: KubeletConfig{Meta: &fakeMetaSource{}},
+	})
+	if _, err := s.scrapeTarget(context.Background(), target); err != nil {
+		t.Fatal(err)
+	}
+	rms := exp.batches[0].ResourceMetrics()
+	found := false
+	for i := 0; i < rms.Len(); i++ {
+		res := rms.At(i).Resource()
+		if attrStr(res, "k8s.pod.name") == "ghost" {
+			found = true
+			if attrStr(res, "k8s.node.name") != "node9" {
+				t.Fatalf("override should keep node on the resource: %v", res.Attributes().AsRaw())
+			}
+		}
+	}
+	if !found {
+		t.Fatal("ghost resource not produced")
 	}
 }
 

@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"go.opentelemetry.io/collector/pdata/pcommon"
 	"sigs.k8s.io/yaml"
 )
 
@@ -55,15 +56,16 @@ type Dynamic struct {
 	// `__line__` matches against the whole raw line.
 	Match       []string `json:"match,omitempty"`
 	MatchRegexp []string `json:"matchRegexp,omitempty"`
-	// Labels are the metric's labels, each `set=$get`: a literal (set=value), a
-	// passthrough (set=$key), a masking pattern (set=$key(_xx)) or a regex
-	// replace (set=$key/re/repl/). A bare `key` both sets and reads itself.
+	// Labels are the metric's data-point labels, each `set=$get`: a literal
+	// (set=value), a passthrough (set=$key), a masking pattern (set=$key(_xx))
+	// or a regex replace (set=$key/re/repl/). A bare `key` both sets and reads
+	// itself.
 	Labels []string `json:"labels,omitempty"`
-	// StreamLabels overrides the set-wide automatic stream labels for this
-	// metric: nil inherits them, an explicit list (including the empty list, to
-	// aggregate across all streams) replaces them. Each entry is a resource
-	// attribute key promoted to a like-named label.
-	StreamLabels *[]string `json:"streamLabels,omitempty"`
+	// ResourceLabels are labels lifted onto the metric's OTLP resource instead
+	// of its data points (same DSL as Labels). Use this to make a log-derived
+	// attribute a resource attribute; the log line's own resource attributes are
+	// always on the resource.
+	ResourceLabels []string `json:"resourceLabels,omitempty"`
 	// Buckets are the histogram boundaries (histogram type only).
 	Buckets []float64 `json:"buckets,omitempty"`
 	// MaxCardinality caps unique label combinations (default/hard cap 10000);
@@ -77,27 +79,12 @@ type Dynamic struct {
 // DynamicConfig is the log-derived-metrics config shape (the `logMetrics`
 // section of the unified agent config, or a standalone file).
 type DynamicConfig struct {
-	// StreamLabels are resource attribute keys automatically promoted to a
-	// like-named label on every metric (so series are per-pod/namespace/… by
-	// default), nil meaning the built-in default set. Individual metrics
-	// override via Dynamic.StreamLabels.
-	StreamLabels *[]string `json:"streamLabels,omitempty"`
-	Metrics      []Dynamic `json:"metrics"`
+	Metrics []Dynamic `json:"metrics"`
 }
 
 // lineKey is the synthetic label key that resolves to the whole raw line, so
 // selectors and labels can reference the line contents directly.
 const lineKey = "__line__"
-
-// defaultStreamLabels are the resource attributes promoted to metric labels
-// when neither the set nor the metric specifies otherwise.
-var defaultStreamLabels = []string{
-	"k8s.namespace.name",
-	"k8s.pod.name",
-	"k8s.container.name",
-	"k8s.node.name",
-	"service.name",
-}
 
 // LoadDynamicMetrics reads a metric specification from a YAML file with a
 // top-level `metrics:` list.
@@ -170,12 +157,12 @@ type labelTemplate struct {
 // metricRule is a compiled Dynamic: a series plus the match/label logic that
 // feeds it.
 type metricRule struct {
-	series     *series
-	match      *selectorSet
-	labels     []labelTemplate
-	streamKeys []string // resource attribute keys promoted to labels
-	value      string
-	valueRe    *regexp.Regexp // extracts the value from the raw line, if set
+	series    *series
+	match     *selectorSet
+	labels    []labelTemplate // data-point labels
+	resLabels []labelTemplate // labels lifted onto the resource
+	value     string
+	valueRe   *regexp.Regexp // extracts the value from the raw line, if set
 }
 
 // needsValue reports whether the rule must read a value (skip the line when it
@@ -214,29 +201,31 @@ func (r *metricRule) readValue(values func(string) float64, line string) (float6
 }
 
 // observe evaluates the rule against one line and records an observation when
-// it matches. buf is reused for the label set and returned (set may grow it).
-func (r *metricRule) observe(values func(string) float64, lookup func(string) string, line string, ctx *matchContext, buf labels) labels {
+// it matches. buf/rbuf are reused for the data-point and resource label sets and
+// returned (set may grow them). resAccum is the hash of res (the line's resource
+// attributes), computed once by the caller.
+func (r *metricRule) observe(values func(string) float64, lookup func(string) string, res pcommon.Map, resAccum uint64, line string, ctx *matchContext, buf, rbuf labels) (labels, labels) {
 	if !r.match.match(lookup, ctx) {
-		return buf
+		return buf, rbuf
 	}
 	var value float64
 	if r.needsValue() {
 		v, ok := r.readValue(values, line)
 		if !ok {
-			return buf
+			return buf, rbuf
 		}
 		value = v
 	}
 	buf = buf[:0]
-	// Stream labels first so an explicit label of the same name overrides them.
-	for _, key := range r.streamKeys {
-		buf = buf.set(key, lookup(key))
-	}
 	for _, lt := range r.labels {
 		buf = buf.set(lt.setKey, lt.get(lookup))
 	}
-	r.series.observe(buf, value)
-	return buf
+	rbuf = rbuf[:0]
+	for _, lt := range r.resLabels {
+		rbuf = rbuf.set(lt.setKey, lt.get(lookup))
+	}
+	r.series.observe(buf, value, resAccum, res, rbuf)
+	return buf, rbuf
 }
 
 // gaugeAction resolves the fold action for a metric, validating that non-gauge
@@ -266,10 +255,8 @@ func (d *Dynamic) gaugeAction(kind seriesKind) (gaugeAction, error) {
 
 // setConfig holds NewDynamicMetricSet options.
 type setConfig struct {
-	namePrefix      string
-	log             *slog.Logger
-	streamLabels    []string
-	streamLabelsSet bool
+	namePrefix string
+	log        *slog.Logger
 }
 
 // Option configures a DynamicMetricSet.
@@ -289,14 +276,6 @@ func WithLogger(l *slog.Logger) Option {
 	}
 }
 
-// WithStreamLabels overrides the default automatic stream labels (resource
-// attribute keys promoted to a like-named label on every metric). Pass an empty
-// (non-nil) slice to disable them set-wide; individual metrics can still
-// override via Dynamic.StreamLabels.
-func WithStreamLabels(keys []string) Option {
-	return func(c *setConfig) { c.streamLabels, c.streamLabelsSet = keys, true }
-}
-
 // DynamicMetricSet is a set of log-derived metrics evaluated per line.
 type DynamicMetricSet struct {
 	rules []*metricRule
@@ -310,7 +289,8 @@ type DynamicMetricSet struct {
 // addContext is the per-line scratch state pooled across Add calls.
 type addContext struct {
 	ctx  matchContext
-	buf  labels
+	buf  labels // data-point labels
+	rbuf labels // resource labels
 	line lineFields
 }
 
@@ -321,12 +301,9 @@ func NewDynamicMetricSet(metrics []Dynamic, opts ...Option) (*DynamicMetricSet, 
 	for _, opt := range opts {
 		opt(&cfg)
 	}
-	if !cfg.streamLabelsSet {
-		cfg.streamLabels = defaultStreamLabels
-	}
 
 	set := &DynamicMetricSet{
-		pool: sync.Pool{New: func() any { return &addContext{buf: make(labels, 0, 16)} }},
+		pool: sync.Pool{New: func() any { return &addContext{buf: make(labels, 0, 16), rbuf: make(labels, 0, 8)} }},
 		log:  cfg.log,
 	}
 	byName := map[string]*series{}
@@ -372,16 +349,11 @@ func compileRule(d *Dynamic, cfg *setConfig, shared map[string]*series) (*metric
 	if rule.match, err = parseSelectors(d.Match, d.MatchRegexp); err != nil {
 		return nil, err
 	}
-	for _, spec := range d.Labels {
-		lt, err := parseLabelTemplate(spec, d.LabelPrefix)
-		if err != nil {
-			return nil, err
-		}
-		rule.labels = append(rule.labels, lt)
+	if rule.labels, err = parseLabelTemplates(d.Labels, d.LabelPrefix); err != nil {
+		return nil, err
 	}
-	rule.streamKeys = cfg.streamLabels
-	if d.StreamLabels != nil {
-		rule.streamKeys = *d.StreamLabels
+	if rule.resLabels, err = parseLabelTemplates(d.ResourceLabels, d.LabelPrefix); err != nil {
+		return nil, err
 	}
 
 	name := cfg.namePrefix + d.Name
@@ -410,14 +382,16 @@ func compileRule(d *Dynamic, cfg *setConfig, shared map[string]*series) (*metric
 // value and values(key) a numeric value (both may be nil); keys they don't
 // resolve fall back to fields parsed straight from line (JSON or logfmt), so a
 // metric can read values and labels off the line itself without any separate
-// logAttributes config.
-func (s *DynamicMetricSet) Add(values func(string) float64, lookup func(string) string, line string) {
+// logAttributes config. resource is the line's resource attributes, emitted as
+// the metric's OTLP resource (each distinct resource is its own series).
+func (s *DynamicMetricSet) Add(values func(string) float64, lookup func(string) string, resource pcommon.Map, line string) {
 	if s == nil || len(s.rules) == 0 {
 		return
 	}
 	ac := s.pool.Get().(*addContext)
 	ac.ctx.reset()
 	ac.line.reset(line)
+	resAccum := resourceAccum(resource)
 
 	// The synthetic __line__ key is the whole raw line; otherwise the caller's
 	// own lookup (record/resource attributes) wins and the line's parsed fields
@@ -444,9 +418,25 @@ func (s *DynamicMetricSet) Add(values func(string) float64, lookup func(string) 
 	}
 
 	for _, rule := range s.rules {
-		ac.buf = rule.observe(valueLookup, labelLookup, line, &ac.ctx, ac.buf)
+		ac.buf, ac.rbuf = rule.observe(valueLookup, labelLookup, resource, resAccum, line, &ac.ctx, ac.buf, ac.rbuf)
 	}
 	s.pool.Put(ac)
+}
+
+// parseLabelTemplates compiles a list of label specs.
+func parseLabelTemplates(specs []string, setPrefix string) ([]labelTemplate, error) {
+	if len(specs) == 0 {
+		return nil, nil
+	}
+	out := make([]labelTemplate, 0, len(specs))
+	for _, spec := range specs {
+		lt, err := parseLabelTemplate(spec, setPrefix)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, lt)
+	}
+	return out, nil
 }
 
 // labelTemplateRe captures the four label forms: an optional `set=`, a `$get`

@@ -287,6 +287,9 @@ func (b *Builder) Build(res pcommon.Resource, ctx Context) {
 		if ctx.Service != nil {
 			Service(res, ctx.Service)
 		}
+		// Derive service.namespace / service.instance.id (Mimir job/instance)
+		// from whatever identity attributes ended up on the resource.
+		Identity(res)
 	}
 	if b == nil {
 		return

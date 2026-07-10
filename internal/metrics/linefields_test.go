@@ -23,9 +23,9 @@ func TestLineFieldsJSON(t *testing.T) {
 		t.Fatal(err)
 	}
 	// nil lookup + nil values: everything must come off the line.
-	set.Add(nil, nil, `{"level":"info","bytes":128,"http":{"route":"/api"}}`)
-	set.Add(nil, nil, `{"level":"info","bytes":256,"http":{"route":"/api"}}`)
-	set.Add(nil, nil, `{"level":"debug","bytes":999,"http":{"route":"/api"}}`) // filtered out
+	set.Add(nil, nil, noRes(), `{"level":"info","bytes":128,"http":{"route":"/api"}}`)
+	set.Add(nil, nil, noRes(), `{"level":"info","bytes":256,"http":{"route":"/api"}}`)
+	set.Add(nil, nil, noRes(), `{"level":"debug","bytes":999,"http":{"route":"/api"}}`) // filtered out
 
 	m := exportOne(t, set, "bytes_written_total")
 	dps := m.Summary().DataPoints()
@@ -55,8 +55,8 @@ func TestLineFieldsLogfmt(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	set.Add(nil, nil, `level=info method=GET status=200 msg="ok"`)
-	set.Add(nil, nil, `level=info method=GET status=500 msg="err"`) // filtered
+	set.Add(nil, nil, noRes(), `level=info method=GET status=200 msg="ok"`)
+	set.Add(nil, nil, noRes(), `level=info method=GET status=500 msg="err"`) // filtered
 
 	m := exportOne(t, set, "requests_total")
 	dps := m.Sum().DataPoints()
@@ -95,7 +95,7 @@ func TestCallerLookupWinsOverLine(t *testing.T) {
 		}
 		return ""
 	}
-	set.Add(nil, lookup, `{"level":"info","k8s.pod.name":"from-line"}`)
+	set.Add(nil, lookup, noRes(), `{"level":"info","k8s.pod.name":"from-line"}`)
 
 	exp := &capExporter{}
 	if err := set.Export(context.Background(), exp, 0); err != nil {

@@ -278,22 +278,20 @@ exported. Runtime knobs are the `-logs-metrics-interval`,
 
 ```yaml
 logMetrics:
-  # Resource attributes auto-promoted to a label on every metric so series are
-  # per-pod/namespace/… by default. This is the built-in default; set to [] to
-  # disable set-wide. Metrics override with their own streamLabels.
-  streamLabels: [k8s.namespace.name, k8s.pod.name, k8s.container.name, k8s.node.name, service.name]
   metrics:
     - name: http_requests_total
       type: counter                 # counter (default) | gauge | histogram | summary
       value: "1"                    # numeric field to observe, or "1" to count lines
       match: ["level=info"]         # exact selectors (key=value / key!=value)
       matchRegexp: ["msg=^request"] # regex selectors on the value
-      labels:                       # label DSL (see below)
+      labels:                       # → data-point attributes (label DSL, see below)
         - status=$http_status       # passthrough: label status = field http_status
         - class=$http_status(_xx)   # mask: 503 → 5xx (keep chars where pattern is _)
         - path=$path/[0-9]+/:id/    # regex replace: /pattern/replacement/
         - method                    # bare key: label method = field method
         - env=prod                  # literal value
+      resourceLabels:               # → resource attributes (same DSL)
+        - tenant=$tenant
       maxCardinality: 5000          # cap on unique label sets (hard cap 10000)
       maxAge: 1h                    # expire idle series (default/cap 24h)
       labelPrefix: ""               # optional prefix on every label name
@@ -306,7 +304,6 @@ logMetrics:
       type: counter
       value: "1"
       matchRegexp: ["__line__=^panic:"]
-      streamLabels: [k8s.namespace.name]   # override to aggregate per namespace
     - name: slow_request_seconds_total
       type: counter
       valueRegexp: 'took ([0-9.]+)s' # capture the value from an unstructured line
@@ -322,11 +319,12 @@ resource attributes (k8s metadata) first, then straight from the log line's own
 JSON/logfmt fields (dotted keys descend into nested JSON) — so a metric can read
 any field of the line without a separate `logAttributes` rule. Additional knobs:
 
-- **Automatic stream labels** — the k8s identity of the line's pod (namespace,
-  pod, container, node, `service.name`) is added as labels to every metric by
-  default, giving per-pod series out of the box. Override `streamLabels`
-  set-wide or per-metric (a coarser list, or `[]`) to aggregate; an explicit
-  `labels` entry with the same name overrides the automatic one.
+- **Resource vs data-point attributes** — the log line's own resource attributes
+  (the pod's k8s identity, plus the derived `service.namespace` /
+  `service.instance.id`) become the metric's OTLP **resource**, so metrics group
+  per-pod like scraped metrics (Mimir `job`/`instance`/`target_info`). The
+  metric's `labels` are **data-point** attributes. `resourceLabels` lifts a
+  log-derived label onto the resource instead (same DSL as `labels`).
 - **`__line__`** is a synthetic selector/label key holding the whole raw line,
   for filtering on line contents (e.g. `matchRegexp: ["__line__=^panic:"]`).
 - **`valueRegexp`** extracts the observed value from the raw line via a regex
@@ -398,7 +396,12 @@ cgroup pod UID.
 ## Resource attributes
 
 The `resourceAttributes` section controls how resource attributes are built for
-**all** exported data (logs and metrics). Quick knobs also exist as flags:
+**all** exported data (logs and metrics). The built-in mapping also derives
+`service.namespace` (= the k8s namespace) and `service.instance.id` (fallback
+chain: `container.id`, pod-uid[/container], namespace/pod[/container], node) so
+Prometheus/Mimir gets a unique `job` (`service.namespace/service.name`) and
+`instance` — both omitted when a template sets them. Quick knobs also exist as
+flags:
 
 * `-resource-attrs-static=cluster=prod,env=eu` — fixed attributes.
 * `-resource-attrs-enable=<regex,...>` / `-resource-attrs-disable=<regex,...>`

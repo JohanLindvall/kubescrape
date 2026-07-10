@@ -234,9 +234,6 @@ func run() error {
 	var logMetrics *metrics.DynamicMetricSet
 	if fileCfg.LogMetrics != nil && len(fileCfg.LogMetrics.Metrics) > 0 {
 		opts := []metrics.Option{metrics.WithLogger(log), metrics.WithNamePrefix(*logsMetricsPrefix)}
-		if fileCfg.LogMetrics.StreamLabels != nil {
-			opts = append(opts, metrics.WithStreamLabels(*fileCfg.LogMetrics.StreamLabels))
-		}
 		if logMetrics, err = metrics.NewDynamicMetricSet(fileCfg.LogMetrics.Metrics, opts...); err != nil {
 			return fmt.Errorf("logs metrics config: %w", err)
 		}

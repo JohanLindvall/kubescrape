@@ -6,8 +6,21 @@ import (
 	"testing"
 	"time"
 
+	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/pmetric"
 )
+
+// noRes is an empty resource for tests that don't exercise resource grouping.
+func noRes() pcommon.Map { return pcommon.NewMap() }
+
+// res builds a resource map from key-value pairs.
+func res(m map[string]string) pcommon.Map {
+	r := pcommon.NewMap()
+	for k, v := range m {
+		r.PutStr(k, v)
+	}
+	return r
+}
 
 // capExporter records exported metrics payloads.
 type capExporter struct{ md []pmetric.Metrics }
@@ -77,9 +90,9 @@ func TestDynamicCounter(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	set.Add(nil, labelsFrom(map[string]string{"level": "info", "http_status": "200", "method": "GET"}), "")
-	set.Add(nil, labelsFrom(map[string]string{"level": "info", "http_status": "500", "method": "GET"}), "")
-	set.Add(nil, labelsFrom(map[string]string{"level": "debug", "http_status": "200"}), "")
+	set.Add(nil, labelsFrom(map[string]string{"level": "info", "http_status": "200", "method": "GET"}), noRes(), "")
+	set.Add(nil, labelsFrom(map[string]string{"level": "info", "http_status": "500", "method": "GET"}), noRes(), "")
+	set.Add(nil, labelsFrom(map[string]string{"level": "debug", "http_status": "200"}), noRes(), "")
 
 	m := exportOne(t, set, "test_http_requests_total")
 	if m.Type() != pmetric.MetricTypeSum || !m.Sum().IsMonotonic() {
@@ -117,7 +130,7 @@ func TestDynamicSummary(t *testing.T) {
 	}
 	for _, b := range []string{"10", "20", "30"} { // count 3, sum 60
 		set.Add(valuesFrom(map[string]string{"bytes": b}),
-			labelsFrom(map[string]string{"op": "write", "bytes": b}), "")
+			labelsFrom(map[string]string{"op": "write", "bytes": b}), noRes(), "")
 	}
 
 	m := exportOne(t, set, "test_bytes_summary")
@@ -155,7 +168,7 @@ func TestDynamicHistogram(t *testing.T) {
 	// Observations 0.05, 0.3, 0.7 → cumulative buckets le0.1:1, le0.5:2, le1:3.
 	for _, d := range []string{"0.05", "0.3", "0.7"} {
 		set.Add(valuesFrom(map[string]string{"duration": d}),
-			labelsFrom(map[string]string{"op": "query", "duration": d}), "")
+			labelsFrom(map[string]string{"op": "query", "duration": d}), noRes(), "")
 	}
 
 	m := exportOne(t, set, "test_latency_seconds")
@@ -193,8 +206,8 @@ func TestSharedSeriesByName(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	set.Add(nil, labelsFrom(map[string]string{"kind": "a"}), "")
-	set.Add(nil, labelsFrom(map[string]string{"kind": "b"}), "")
+	set.Add(nil, labelsFrom(map[string]string{"kind": "a"}), noRes(), "")
+	set.Add(nil, labelsFrom(map[string]string{"kind": "b"}), noRes(), "")
 
 	exp := &capExporter{}
 	if err := set.Export(context.Background(), exp, 0); err != nil {

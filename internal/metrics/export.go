@@ -31,36 +31,44 @@ func (s *DynamicMetricSet) Run(ctx context.Context, exp Exporter, interval time.
 	}
 }
 
-// Export sends the current value of every configured metric as OTLP, in chunks
-// kept under maxBytes (0 = a single payload). Rules sharing a series export it
-// once.
+// seriesSamples pairs a series with the samples that belong to one resource.
+type seriesSamples struct {
+	series  *series
+	samples []sample
+}
+
+// Export sends the current value of every configured metric as OTLP, grouped
+// into one ResourceMetrics per distinct log resource (the line's resource
+// attributes become the OTLP resource; the metric's own labels stay on the data
+// points). Output is chunked per resource to stay under maxBytes (0 = a single
+// payload). Rules sharing a series export it once.
 func (s *DynamicMetricSet) Export(ctx context.Context, exp Exporter, maxBytes int) error {
 	if s == nil {
 		return nil
 	}
 	ts := time.Now()
-	md := pmetric.NewMetrics()
-	scope := md.ResourceMetrics().AppendEmpty().ScopeMetrics().AppendEmpty()
+	byResource, order := s.groupByResource()
 
+	md := pmetric.NewMetrics()
 	flush := func(force bool) error {
-		if scope.Metrics().Len() == 0 {
+		if md.ResourceMetrics().Len() == 0 {
 			return nil
 		}
 		if !force && maxBytes > 0 && metricsMarshaler.MetricsSize(md) < maxBytes {
 			return nil
 		}
 		err := exp.ExportMetrics(ctx, md)
-		scope.Metrics().RemoveIf(func(pmetric.Metric) bool { return true })
+		md.ResourceMetrics().RemoveIf(func(pmetric.ResourceMetrics) bool { return true })
 		return err
 	}
 
-	seen := make(map[*series]bool, len(s.rules))
-	for _, rule := range s.rules {
-		if rule.series.name == "" || seen[rule.series] {
-			continue
+	for _, resStr := range order {
+		rm := md.ResourceMetrics().AppendEmpty()
+		putLabels(rm.Resource().Attributes(), resStr)
+		scope := rm.ScopeMetrics().AppendEmpty()
+		for _, ss := range byResource[resStr] {
+			renderSeries(scope, ss.series, ss.samples, ts)
 		}
-		seen[rule.series] = true
-		renderSeries(scope, rule.series, ts)
 		if err := flush(false); err != nil {
 			return err
 		}
@@ -68,10 +76,34 @@ func (s *DynamicMetricSet) Export(ctx context.Context, exp Exporter, maxBytes in
 	return flush(true)
 }
 
-// renderSeries appends one metric and its data points to scope.
-func renderSeries(scope pmetric.ScopeMetrics, s *series, ts time.Time) {
-	samples := s.snapshot()
+// groupByResource snapshots each unique series and buckets its samples by the
+// resource they carry, returning resource → [(series, its samples)] plus the
+// resource order.
+func (s *DynamicMetricSet) groupByResource() (map[string][]seriesSamples, []string) {
+	byResource := map[string][]seriesSamples{}
+	var order []string
+	seen := make(map[*series]bool, len(s.rules))
+	for _, rule := range s.rules {
+		if rule.series.name == "" || seen[rule.series] {
+			continue
+		}
+		seen[rule.series] = true
+		perRes := map[string][]sample{}
+		for _, samp := range rule.series.snapshot() {
+			perRes[samp.resource] = append(perRes[samp.resource], samp)
+		}
+		for resStr, samps := range perRes {
+			if _, ok := byResource[resStr]; !ok {
+				order = append(order, resStr)
+			}
+			byResource[resStr] = append(byResource[resStr], seriesSamples{rule.series, samps})
+		}
+	}
+	return byResource, order
+}
 
+// renderSeries appends one metric and the given samples' data points to scope.
+func renderSeries(scope pmetric.ScopeMetrics, s *series, samples []sample, ts time.Time) {
 	m := scope.Metrics().AppendEmpty()
 	m.SetName(s.name)
 	m.SetDescription(s.desc)

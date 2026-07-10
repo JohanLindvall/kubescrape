@@ -322,21 +322,27 @@ into nested JSON) — so a metric can read any field of the line with no separat
 `logAttributes` config. Series expire after `maxAge` of inactivity and are
 capped at `maxCardinality` unique label combinations (hard cap 10000).
 
+**Resource attributes.** The log line's own resource attributes (the pod's k8s
+identity: namespace, pod, container, node, `service.name`, owners, and the
+derived `service.namespace` / `service.instance.id`) become the metric's OTLP
+**resource** — so log metrics group per-pod just like scraped metrics, giving
+Mimir a proper `job`/`instance`/`target_info`. The metric's own `labels` stay on
+the **data points**. To make a log-derived value a resource attribute instead,
+list it under `resourceLabels` (same DSL as `labels`).
+
 ```yaml
 logMetrics:
-  # Resource attributes auto-promoted to a label on every metric so series are
-  # per-pod/namespace/… by default (override per-metric to aggregate). This is
-  # the built-in default; set it to [] to disable set-wide.
-  streamLabels: [k8s.namespace.name, k8s.pod.name, k8s.container.name, k8s.node.name, service.name]
   metrics:
     - name: http_requests_total
       type: counter
       value: "1"                      # count matching lines
       match: ["level=info"]
-      labels:
+      labels:                         # → data-point attributes
         - status=$http_status         # passthrough of the line's http_status
         - class=$http_status(_xx)     # 503 → 5xx (mask all but the first char)
         - method                      # bare key: label "method" = field "method"
+      resourceLabels:                 # → resource attributes (alongside the pod's)
+        - tenant=$tenant
     - name: request_duration_seconds
       type: histogram
       value: duration_s               # observe this numeric field
@@ -346,7 +352,6 @@ logMetrics:
       type: counter
       value: "1"
       matchRegexp: ["__line__=^panic:"]  # __line__ matches the whole raw line
-      streamLabels: [k8s.namespace.name] # override: aggregate to namespace only
     - name: slow_request_seconds_total
       type: counter
       valueRegexp: 'took ([0-9.]+)s'  # capture a number out of an unstructured line
@@ -359,11 +364,9 @@ logMetrics:
 
 Extras beyond the basics:
 
-- **Automatic stream labels** — the k8s identity of the line's pod (namespace,
-  pod, container, node, `service.name`) is attached to every metric by default,
-  so you get per-pod series without listing them. Override `streamLabels` on a
-  metric (e.g. to a coarser subset, or `[]`) to aggregate; an explicit `labels`
-  entry of the same name wins over the auto one.
+- **`resourceLabels`** lifts a log-derived label onto the resource instead of the
+  data point (e.g. a `tenant` field). The pod's k8s resource attributes are
+  always on the resource.
 - **`__line__`** is a synthetic key holding the whole raw line, so
   `match`/`matchRegexp` (and labels) can filter on line contents directly.
 - **`valueRegexp`** pulls the observed value out of an unstructured line via a
@@ -502,7 +505,11 @@ cross-checked against a mapped pod UID). Unmatched series stay on the
 target's own resource.
 
 **Resource attributes.** How resource attributes are built is configurable
-and applies uniformly to log and metric resources:
+and applies uniformly to log and metric resources. The built-in mapping also
+derives, for Prometheus/Mimir, `service.namespace` = the k8s namespace and
+`service.instance.id` (fallback chain: `container.id`, pod-uid[/container],
+namespace/pod[/container], node) — so `job` = `service.namespace/service.name`
+and `instance` are unique. Both are omitted when a template sets them.
 
 * `-resource-attrs-enable` / `-resource-attrs-disable` — comma-separated
   regexes matched against the full attribute key (anchored). An attribute is

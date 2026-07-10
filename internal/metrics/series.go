@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/cespare/xxhash/v2"
+	"go.opentelemetry.io/collector/pdata/pcommon"
 )
 
 const leLabel = "le"
@@ -34,14 +35,17 @@ const (
 	actionSub                    // gauge -= value
 )
 
-// sample is one label combination's live value. labels is the serialized label
-// set (see labels.String); bucket indexes into series.buckets for histograms.
+// sample is one (resource, label combination) live value. labels is the
+// serialized data-point label set and resource the serialized resource-attribute
+// set (both via labels.String); bucket indexes into series.buckets for
+// histograms.
 type sample struct {
-	value   float64
-	labels  string
-	bucket  int
-	count   uint64
-	initial bool
+	value    float64
+	labels   string
+	resource string
+	bucket   int
+	count    uint64
+	initial  bool
 }
 
 type expiringSample struct {
@@ -133,11 +137,14 @@ func (s *series) initBuckets(buckets []float64) {
 	}
 }
 
-// observe records value for the given label set. For a histogram the value is
-// counted into every bucket whose bound it does not exceed.
-func (s *series) observe(lbls labels, value float64) {
+// observe records value for the given data-point label set, resource, and extra
+// resource labels. The series is keyed by all three together (their hashes
+// XOR-fold into the base accumulator), so per-resource series are distinct. For
+// a histogram the value is counted into every bucket whose bound it does not
+// exceed.
+func (s *series) observe(lbls labels, value float64, resAccum uint64, res pcommon.Map, resLabels labels) {
 	now := loadEpoch()
-	base := s.baseAccum(lbls)
+	base := s.baseAccum(lbls) ^ resAccum ^ resLabels.hashAccum()
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -145,7 +152,7 @@ func (s *series) observe(lbls labels, value float64) {
 		hash := s.streamHash(base, i)
 		samp := s.db[hash]
 		if samp == nil {
-			samp = s.admit(hash, lbls, i, now)
+			samp = s.admit(hash, lbls, i, now, res, resLabels)
 			if samp == nil {
 				continue // capped
 			}
@@ -157,8 +164,8 @@ func (s *series) observe(lbls labels, value float64) {
 	}
 }
 
-// baseAccum hashes the caller's labels once (order-independent). For a
-// histogram it strips any caller-provided "le" so the synthetic per-bucket one
+// baseAccum hashes the caller's data-point labels once (order-independent). For
+// a histogram it strips any caller-provided "le" so the synthetic per-bucket one
 // is the only contribution folded in per bucket.
 func (s *series) baseAccum(lbls labels) uint64 {
 	base := lbls.hashAccum()
@@ -182,7 +189,7 @@ func (s *series) streamHash(base uint64, bucket int) uint64 {
 // admit inserts a new sample for a previously unseen stream, or returns nil
 // (warning at most hourly) when the cardinality cap is reached. It runs only on
 // the cold path, so materializing the full label set here is cheap.
-func (s *series) admit(hash uint64, lbls labels, bucket int, now int64) *expiringSample {
+func (s *series) admit(hash uint64, lbls labels, bucket int, now int64, res pcommon.Map, resLabels labels) *expiringSample {
 	full := lbls
 	if s.kind == kindHistogram {
 		full = lbls.without(leLabel).set(leLabel, s.bucketStr[bucket])
@@ -195,7 +202,10 @@ func (s *series) admit(hash uint64, lbls labels, bucket int, now int64) *expirin
 		}
 		return nil
 	}
-	samp := &expiringSample{sample: sample{labels: full.String(), bucket: bucket, initial: true}, when: now}
+	samp := &expiringSample{
+		sample: sample{labels: full.String(), resource: resourceString(res, resLabels), bucket: bucket, initial: true},
+		when:   now,
+	}
 	s.db[hash] = samp
 	return samp
 }

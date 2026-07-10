@@ -78,3 +78,51 @@ func Service(res pcommon.Resource, svc *kubemeta.Service) {
 	a.PutStr("k8s.service.name", svc.Name)
 	a.PutStr("k8s.service.uid", svc.UID)
 }
+
+// Identity sets service.namespace and service.instance.id so a Prometheus
+// backend (e.g. Mimir) derives a unique job (service.namespace/service.name)
+// and instance (service.instance.id). It reads the identity attributes already
+// on the resource, so it works for pod/container/node resources as well as
+// pre-populated ones (kube-state-metrics splitters, ingest, log metrics).
+// Neither attribute is overwritten if already set, so a template still wins.
+//
+// service.instance.id falls back in order: container.id, pod.uid[/container],
+// namespace/pod[/container], node.name — mirroring the cmb-alloy pipeline.
+func Identity(res pcommon.Resource) {
+	a := res.Attributes()
+	get := func(k string) string {
+		if v, ok := a.Get(k); ok {
+			return v.AsString()
+		}
+		return ""
+	}
+	ns := get("k8s.namespace.name")
+	if ns != "" {
+		if _, ok := a.Get("service.namespace"); !ok {
+			a.PutStr("service.namespace", ns)
+		}
+	}
+	if _, ok := a.Get("service.instance.id"); ok {
+		return
+	}
+	pod, container := get("k8s.pod.name"), get("k8s.container.name")
+	uid, cid, node := get("k8s.pod.uid"), get("container.id"), get("k8s.node.name")
+	var inst string
+	switch {
+	case cid != "":
+		inst = cid
+	case uid != "" && container != "":
+		inst = uid + "/" + container
+	case uid != "":
+		inst = uid
+	case ns != "" && pod != "" && container != "":
+		inst = ns + "/" + pod + "/" + container
+	case ns != "" && pod != "":
+		inst = ns + "/" + pod
+	case node != "":
+		inst = node
+	}
+	if inst != "" {
+		a.PutStr("service.instance.id", inst)
+	}
+}

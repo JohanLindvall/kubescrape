@@ -52,6 +52,9 @@ func newKeyIndex(rules []*metricRule) keyIndex {
 		for _, lt := range r.labels {
 			add(lt.getKey)
 		}
+		for _, lt := range r.resLabels {
+			add(lt.getKey)
+		}
 		for _, key := range r.match.labelKeys() {
 			add(key)
 		}

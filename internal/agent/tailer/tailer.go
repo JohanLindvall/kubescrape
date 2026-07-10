@@ -1356,7 +1356,8 @@ func (t *Tailer) flush(ctx context.Context) {
 		if t.cfg.LogMetrics != nil {
 			// Metric label/value keys resolve against the record's attributes
 			// (line-derived + enriched) first, then the file's resource
-			// attributes (k8s metadata).
+			// attributes (k8s metadata); the file's resource attributes become
+			// the metric's OTLP resource.
 			recAttrs, resAttrs := lr.Attributes(), e.file.resource.Attributes()
 			lookup := func(k string) (pcommon.Value, bool) {
 				if v, ok := recAttrs.Get(k); ok {
@@ -1385,7 +1386,7 @@ func (t *Tailer) flush(ctx context.Context) {
 					return f
 				}
 			}
-			t.cfg.LogMetrics.Add(values, labels, e.body)
+			t.cfg.LogMetrics.Add(values, labels, resAttrs, e.body)
 		}
 		touched[e.file] = struct{}{}
 		// Only entries of the file's current rotation generation advance its

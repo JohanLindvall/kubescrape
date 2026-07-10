@@ -1,6 +1,7 @@
 package metrics
 
 import (
+	"context"
 	"testing"
 	"time"
 )
@@ -45,13 +46,13 @@ func TestGaugeActions(t *testing.T) {
 				Action: c.action,
 				Value:  c.value,
 				Match:  []string{"m=1"},
-			}}, WithStreamLabels(nil))
+			}})
 			if err != nil {
 				t.Fatal(err)
 			}
 			for _, a := range []string{"10", "20", "30"} {
 				set.Add(valuesFrom(map[string]string{"amount": a}),
-					labelsFrom(map[string]string{"m": "1", "amount": a}), "")
+					labelsFrom(map[string]string{"m": "1", "amount": a}), noRes(), "")
 			}
 			got, ok := gaugeValue(t, set, "g", "", "")
 			if !ok || got != c.want {
@@ -77,13 +78,13 @@ func TestValueRegexp(t *testing.T) {
 		Type:        CounterType,
 		ValueRegexp: `latency=([0-9.]+)s`,
 		MatchRegexp: []string{"__line__=^GET"},
-	}}, WithStreamLabels(nil))
+	}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	set.Add(nil, nil, "GET /x latency=0.25s ok")
-	set.Add(nil, nil, "GET /y latency=0.75s ok")
-	set.Add(nil, nil, "POST /z latency=9.9s ok") // __line__ has no GET → filtered
+	set.Add(nil, nil, noRes(), "GET /x latency=0.25s ok")
+	set.Add(nil, nil, noRes(), "GET /y latency=0.75s ok")
+	set.Add(nil, nil, noRes(), "POST /z latency=9.9s ok") // __line__ has no GET → filtered
 
 	m := exportOne(t, set, "latency_seconds_total")
 	var total float64
@@ -114,12 +115,12 @@ func TestLineSelector(t *testing.T) {
 		Type:        CounterType,
 		Value:       "1",
 		MatchRegexp: []string{`__line__=panic:`},
-	}}, WithStreamLabels(nil))
+	}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	set.Add(nil, nil, "goroutine 1 panic: nil deref")
-	set.Add(nil, nil, "all good here")
+	set.Add(nil, nil, noRes(), "goroutine 1 panic: nil deref")
+	set.Add(nil, nil, noRes(), "all good here")
 
 	m := exportOne(t, set, "panics_total")
 	var total float64
@@ -134,76 +135,120 @@ func TestLineSelector(t *testing.T) {
 	}
 }
 
-func TestStreamLabelsAutomaticAndOverride(t *testing.T) {
+// resourceOf returns the metric's exported resource attributes for the given
+// metric name (the first ResourceMetrics containing it).
+func resourceOf(t *testing.T, exp *capExporter, name string) map[string]any {
+	t.Helper()
+	for _, md := range exp.md {
+		rms := md.ResourceMetrics()
+		for i := 0; i < rms.Len(); i++ {
+			rm := rms.At(i)
+			sms := rm.ScopeMetrics()
+			for j := 0; j < sms.Len(); j++ {
+				ms := sms.At(j).Metrics()
+				for k := 0; k < ms.Len(); k++ {
+					if ms.At(k).Name() == name {
+						return rm.Resource().Attributes().AsRaw()
+					}
+				}
+			}
+		}
+	}
+	t.Fatalf("%s not exported", name)
+	return nil
+}
+
+func TestLogResourceBecomesResourceAttrs(t *testing.T) {
 	setTimeForTest(time.Unix(1_700_200_300, 0))
 	defer testEpoch.Store(0)
 
-	// Default stream labels are on: a resource-attribute lookup for
-	// k8s.pod.name is promoted to a label automatically. The second metric
-	// overrides with an empty list to aggregate across pods.
-	set, err := NewDynamicMetricSet([]Dynamic{
-		{Name: "per_pod_total", Type: CounterType, Value: "1", Match: []string{"m=1"}},
-		{Name: "agg_total", Type: CounterType, Value: "1", Match: []string{"m=1"}, StreamLabels: &[]string{}},
-	})
+	// The log line's resource attributes become the metric's OTLP resource; the
+	// metric's own DSL labels stay on the data points. Two pods → two resources.
+	set, err := NewDynamicMetricSet([]Dynamic{{
+		Name:   "http_requests_total",
+		Type:   CounterType,
+		Value:  "1",
+		Match:  []string{"level=info"},
+		Labels: []string{"status=$http_status"},
+	}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	resource := func(k string) string {
-		if k == "k8s.pod.name" {
-			return "pod-a"
-		}
-		return ""
-	}
-	set.Add(nil, resource, `{"m":1}`)
+	set.Add(nil, labelsFrom(map[string]string{"level": "info", "http_status": "200"}),
+		res(map[string]string{"k8s.pod.name": "pod-a", "k8s.namespace.name": "ns"}), "")
+	set.Add(nil, labelsFrom(map[string]string{"level": "info", "http_status": "500"}),
+		res(map[string]string{"k8s.pod.name": "pod-b", "k8s.namespace.name": "ns"}), "")
 
-	perPod := exportOne(t, set, "per_pod_total")
-	found := false
-	dps := perPod.Sum().DataPoints()
+	exp := &capExporter{}
+	if err := set.Export(context.Background(), exp, 0); err != nil {
+		t.Fatal(err)
+	}
+	// Two distinct resources, one per pod.
+	pods := map[string]bool{}
+	statusOnResource := false
+	for _, md := range exp.md {
+		rms := md.ResourceMetrics()
+		for i := 0; i < rms.Len(); i++ {
+			ra := rms.At(i).Resource().Attributes().AsRaw()
+			if p, ok := ra["k8s.pod.name"]; ok {
+				pods[p.(string)] = true
+			}
+			if _, ok := ra["status"]; ok {
+				statusOnResource = true
+			}
+		}
+	}
+	if !pods["pod-a"] || !pods["pod-b"] {
+		t.Errorf("pods on resources = %v, want pod-a and pod-b", pods)
+	}
+	if statusOnResource {
+		t.Error("status (a metric label) leaked onto the resource")
+	}
+	m := exportOne(t, set, "http_requests_total")
+	statusOnDP := false
+	dps := m.Sum().DataPoints()
 	for i := 0; i < dps.Len(); i++ {
-		if v, ok := dps.At(i).Attributes().Get("k8s.pod.name"); ok && v.Str() == "pod-a" {
-			found = true
+		if _, ok := dps.At(i).Attributes().Get("status"); ok {
+			statusOnDP = true
 		}
 	}
-	if !found {
-		t.Error("per_pod_total missing automatic k8s.pod.name stream label")
-	}
-
-	agg := exportOne(t, set, "agg_total")
-	adps := agg.Sum().DataPoints()
-	for i := 0; i < adps.Len(); i++ {
-		if _, ok := adps.At(i).Attributes().Get("k8s.pod.name"); ok {
-			t.Error("agg_total should have no pod label (override to aggregate)")
-		}
+	if !statusOnDP {
+		t.Error("status not present as a data-point attribute")
 	}
 }
 
-func TestExplicitLabelOverridesStreamLabel(t *testing.T) {
+func TestResourceLabelsLiftedToResource(t *testing.T) {
 	setTimeForTest(time.Unix(1_700_200_400, 0))
 	defer testEpoch.Store(0)
 
-	// An explicit label with the same name as a stream label wins.
+	// resourceLabels move a log-derived label onto the resource; labels stay on
+	// the data point.
 	set, err := NewDynamicMetricSet([]Dynamic{{
-		Name:   "t",
-		Type:   CounterType,
-		Value:  "1",
-		Match:  []string{"m=1"},
-		Labels: []string{"k8s.pod.name=fixed"},
-	}}, WithStreamLabels([]string{"k8s.pod.name"}))
+		Name:           "reqs_total",
+		Type:           CounterType,
+		Value:          "1",
+		Match:          []string{"level=info"},
+		Labels:         []string{"status=$http_status"},
+		ResourceLabels: []string{"tenant=$tenant"},
+	}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	set.Add(nil, func(k string) string {
-		if k == "k8s.pod.name" {
-			return "from-resource"
-		}
-		return ""
-	}, `{"m":1}`)
+	set.Add(nil, labelsFrom(map[string]string{"level": "info", "http_status": "200", "tenant": "acme"}),
+		res(map[string]string{"k8s.pod.name": "pod-a"}), "")
 
-	m := exportOne(t, set, "t")
-	dps := m.Sum().DataPoints()
-	for i := 0; i < dps.Len(); i++ {
-		if v, ok := dps.At(i).Attributes().Get("k8s.pod.name"); ok && v.Str() != "fixed" {
-			t.Errorf("k8s.pod.name = %q, want fixed (explicit label wins)", v.Str())
-		}
+	exp := &capExporter{}
+	if err := set.Export(context.Background(), exp, 0); err != nil {
+		t.Fatal(err)
+	}
+	ra := resourceOf(t, exp, "reqs_total")
+	if ra["tenant"] != "acme" {
+		t.Errorf("tenant not lifted to resource: %v", ra)
+	}
+	if ra["k8s.pod.name"] != "pod-a" {
+		t.Errorf("log resource attribute missing: %v", ra)
+	}
+	if _, ok := ra["status"]; ok {
+		t.Error("status (data-point label) leaked onto the resource")
 	}
 }

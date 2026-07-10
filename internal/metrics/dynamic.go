@@ -39,8 +39,12 @@ type Dynamic struct {
 	// Type is counter (default), gauge, histogram or summary.
 	Type string `json:"type,omitempty"`
 	// Action, for a gauge, selects how each observation folds: set (default,
-	// last value wins), inc (+1), dec (-1), add (+value), sub (-value). Ignored
-	// for other types, which always accumulate.
+	// last value wins), inc (+1), dec (-1), add (+value), sub (-value), or a
+	// windowed aggregation min/max/avg/first/sum/count/stddev/range/delta.
+	// Aggregations emit the aggregate on every export and keep it while no new
+	// value arrives; the first value after an export starts a fresh window.
+	// count only tallies matching lines (no value). Ignored for other types,
+	// which always accumulate.
 	Action string `json:"action,omitempty"`
 	// Value names the numeric field to observe, or "1" to count matching lines.
 	Value string `json:"value,omitempty"`
@@ -166,10 +170,13 @@ type metricRule struct {
 }
 
 // needsValue reports whether the rule must read a value (skip the line when it
-// is absent/zero). Gauge inc/dec need none — they only count.
+// is absent/zero). Gauge inc/dec/count only tally lines and need none.
 func (r *metricRule) needsValue() bool {
 	if r.series.kind == kindGauge {
-		return r.series.action != actionInc && r.series.action != actionDec
+		switch r.series.action {
+		case actionInc, actionDec, actionCount:
+			return false
+		}
 	}
 	return true
 }
@@ -248,6 +255,24 @@ func (d *Dynamic) gaugeAction(kind seriesKind) (gaugeAction, error) {
 		return actionAdd, nil
 	case "sub":
 		return actionSub, nil
+	case "min":
+		return actionMin, nil
+	case "max":
+		return actionMax, nil
+	case "avg":
+		return actionAvg, nil
+	case "first":
+		return actionFirst, nil
+	case "sum":
+		return actionSum, nil
+	case "count":
+		return actionCount, nil
+	case "stddev":
+		return actionStddev, nil
+	case "range":
+		return actionRange, nil
+	case "delta":
+		return actionDelta, nil
 	default:
 		return 0, fmt.Errorf("invalid gauge action: %s", d.Action)
 	}

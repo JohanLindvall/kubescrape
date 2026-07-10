@@ -311,7 +311,7 @@ logMetrics:
       matchRegexp: ["__line__=slow request"]
     - name: open_connections
       type: gauge
-      action: inc                   # set (default) | inc | dec | add | sub
+      action: inc                   # set (default) | inc | dec | add | sub | min | max | avg | first | sum | count | stddev | range | delta
       match: ["event=connect"]
 ```
 
@@ -332,7 +332,13 @@ any field of the line without a separate `logAttributes` rule. Additional knobs:
   capture group (group 1, or the whole match); mutually exclusive with `value`.
   A line that does not match is skipped.
 - **`action`** (gauge only): `set` (default, last value wins), `inc`/`dec`
-  (±1 per matching line, no value needed), `add`/`sub` (±the observed value).
+  (±1 per matching line, no value needed), `add`/`sub` (±the observed value),
+  or a windowed aggregation over the values seen in a window: `min`, `max`,
+  `avg`, `first`, `sum`, `count` (matching lines, no value needed), `stddev`
+  (population standard deviation), `range` (max−min), `delta` (last−first). An
+  aggregation emits its value on every export and keeps emitting it while no new
+  value arrives; the first value after an export starts a fresh window (so `avg`
+  is a per-window mean).
 
 `histogram` exports cumulative OTLP histograms; `summary` carries a running
 count and sum (no quantiles); `counter` emits a monotonic sum (with synthetic

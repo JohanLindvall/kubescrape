@@ -358,7 +358,7 @@ logMetrics:
       matchRegexp: ["__line__=slow request"]
     - name: connections
       type: gauge
-      action: inc                     # set (default) | inc | dec | add | sub
+      action: inc                     # set (default)|inc|dec|add|sub|min|max|avg|first|sum|count|stddev|range|delta
       match: ["event=connect"]
 ```
 
@@ -372,7 +372,12 @@ Extras beyond the basics:
 - **`valueRegexp`** pulls the observed value out of an unstructured line via a
   regex capture group (mutually exclusive with `value`).
 - **Gauge `action`** — `set` (default, last value wins), `inc`/`dec` (±1 per
-  line), `add`/`sub` (±the value).
+  line), `add`/`sub` (±the value), or a windowed aggregation over the values seen
+  in a window: `min`, `max`, `avg`, `first`, `sum`, `count` (matching lines),
+  `stddev` (population), `range` (max−min), `delta` (last−first). An aggregation
+  emits its value on every export and keeps emitting it while no new value
+  arrives; the first value after an export starts a fresh window (so `avg` is a
+  per-scrape-window mean, like the old avg-gauge).
 
 Only these configured metrics are exported (no internal bookkeeping series).
 The export interval, chunk size and an optional name prefix are runtime flags:

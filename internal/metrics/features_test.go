@@ -62,6 +62,77 @@ func TestGaugeActions(t *testing.T) {
 	}
 }
 
+func TestGaugeAggregations(t *testing.T) {
+	// Values 10, 5, 20 over one window.
+	const eps = 1e-4
+	cases := []struct {
+		action string
+		want   float64
+	}{
+		{"min", 5},
+		{"max", 20},
+		{"avg", 35.0 / 3.0},   // (10+5+20)/3
+		{"first", 10},         // first value
+		{"sum", 35},           // 10+5+20
+		{"count", 3},          // three matching lines
+		{"stddev", 6.2360956}, // population stddev of {10,5,20}
+		{"range", 15},         // 20 − 5
+		{"delta", 10},         // 20 (last) − 10 (first)
+	}
+	for _, c := range cases {
+		t.Run(c.action, func(t *testing.T) {
+			setTimeForTest(time.Unix(1_700_300_000, 0))
+			defer testEpoch.Store(0)
+			set, err := NewDynamicMetricSet([]Dynamic{{
+				Name: "g", Type: GaugeType, Action: c.action, Value: "v", Match: []string{"m=1"},
+			}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, v := range []string{"10", "5", "20"} {
+				set.Add(valuesFrom(map[string]string{"v": v}), labelsFrom(map[string]string{"m": "1"}), noRes(), "")
+			}
+			got, ok := gaugeValue(t, set, "g", "", "")
+			if !ok || got < c.want-eps || got > c.want+eps {
+				t.Fatalf("%s = %v (ok=%v), want %v", c.action, got, ok, c.want)
+			}
+		})
+	}
+}
+
+func TestGaugeAggregationWindow(t *testing.T) {
+	setTimeForTest(time.Unix(1_700_300_100, 0))
+	defer testEpoch.Store(0)
+	set, err := NewDynamicMetricSet([]Dynamic{{
+		Name: "g", Type: GaugeType, Action: "max", Value: "v", Match: []string{"m=1"},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	add := func(v string) {
+		set.Add(valuesFrom(map[string]string{"v": v}), labelsFrom(map[string]string{"m": "1"}), noRes(), "")
+	}
+
+	add("10")
+	add("20")
+	if got, _ := gaugeValue(t, set, "g", "", ""); got != 20 { // window max = 20 (this export seals)
+		t.Fatalf("first window max = %v, want 20", got)
+	}
+	// No new values: the aggregate keeps being emitted.
+	if got, _ := gaugeValue(t, set, "g", "", ""); got != 20 {
+		t.Fatalf("kept aggregate = %v, want 20", got)
+	}
+	// A new value after an export starts a fresh window — the old 20 is gone.
+	add("7")
+	if got, _ := gaugeValue(t, set, "g", "", ""); got != 7 {
+		t.Fatalf("new window max = %v, want 7 (window reset)", got)
+	}
+	add("9") // folds into the current (post-export) window
+	if got, _ := gaugeValue(t, set, "g", "", ""); got != 9 {
+		t.Fatalf("window max after fold = %v, want 9", got)
+	}
+}
+
 func TestActionOnNonGaugeErrors(t *testing.T) {
 	if _, err := NewDynamicMetricSet([]Dynamic{{Name: "c", Type: CounterType, Action: "inc"}}); err == nil {
 		t.Error("action on a counter: want error")

@@ -33,7 +33,48 @@ const (
 	actionDec                    // gauge -= 1
 	actionAdd                    // gauge += value
 	actionSub                    // gauge -= value
+	// The following aggregate values over a window: the aggregate is emitted on
+	// every export and kept while no new value arrives; the next value after an
+	// export starts a fresh window. actionMin must stay first of this group
+	// (aggregating() tests action >= actionMin). value/value2/count hold the
+	// per-action running state (see record); snapshot renders the aggregate.
+	actionMin    // window minimum (value)
+	actionMax    // window maximum (value)
+	actionAvg    // window mean (value = running sum, count = n)
+	actionFirst  // first value of the window (value)
+	actionSum    // window total (value = running sum)
+	actionCount  // number of matching lines in the window (count; value ignored)
+	actionStddev // window std deviation (value = sum, value2 = sum of squares)
+	actionRange  // window max − min (value = min, value2 = max)
+	actionDelta  // window last − first (value = first, value2 = last)
 )
+
+// aggregating reports whether the series is a windowed-aggregation gauge.
+func (s *series) aggregating() bool { return s.kind == kindGauge && s.action >= actionMin }
+
+// aggregateValue renders a window's stored state into the value to emit.
+func (s *series) aggregateValue(samp *sample) float64 {
+	n := float64(samp.count)
+	switch s.action {
+	case actionAvg:
+		if samp.count > 0 {
+			return samp.value / n
+		}
+		return 0
+	case actionCount:
+		return n
+	case actionStddev:
+		if samp.count == 0 {
+			return 0
+		}
+		mean := samp.value / n
+		return math.Sqrt(math.Max(0, samp.value2/n-mean*mean))
+	case actionRange, actionDelta:
+		return samp.value2 - samp.value // max−min / last−first
+	default: // min, max, first, sum
+		return samp.value
+	}
+}
 
 // sample is one (resource, label combination) live value. labels is the
 // serialized data-point label set and resource the serialized resource-attribute
@@ -41,11 +82,15 @@ const (
 // histograms.
 type sample struct {
 	value    float64
+	value2   float64 // aggregation-specific second accumulator (see gaugeAction)
 	labels   string
 	resource string
 	bucket   int
 	count    uint64
 	initial  bool
+	// sealed marks an aggregation window as already emitted; the next observed
+	// value starts a fresh window (min/max/avg/first/last gauges).
+	sealed bool
 }
 
 type expiringSample struct {
@@ -213,6 +258,49 @@ func (s *series) admit(hash uint64, lbls labels, bucket int, now int64, res pcom
 // record folds one observation into a sample. Gauges apply their action;
 // counters, summaries and histograms accumulate.
 func (s *series) record(samp *expiringSample, value float64) {
+	if s.aggregating() {
+		// A brand-new sample, or the first value after an emit, starts a fresh
+		// window; the rest fold in. value2 seeds to value (correct for range's
+		// max and delta's last); stddev needs value² instead.
+		if samp.sealed || samp.count == 0 {
+			samp.sealed = false
+			samp.value = value
+			samp.value2 = value
+			if s.action == actionStddev {
+				samp.value2 = value * value
+			}
+			samp.count = 1
+			return
+		}
+		switch s.action {
+		case actionMin:
+			if value < samp.value {
+				samp.value = value
+			}
+		case actionMax:
+			if value > samp.value {
+				samp.value = value
+			}
+		case actionAvg, actionSum:
+			samp.value += value // running sum
+		case actionStddev:
+			samp.value += value
+			samp.value2 += value * value
+		case actionRange:
+			if value < samp.value {
+				samp.value = value
+			}
+			if value > samp.value2 {
+				samp.value2 = value
+			}
+		case actionDelta:
+			samp.value2 = value // last (first stays in value)
+		case actionFirst, actionCount:
+			// first: keep the window's first value; count: only the tally matters
+		}
+		samp.count++
+		return
+	}
 	if s.kind == kindGauge {
 		switch s.action {
 		case actionInc:
@@ -242,17 +330,29 @@ func (s *series) snapshot() []sample {
 	defer s.mu.Unlock()
 	out := make([]sample, 0, len(s.db))
 	for hash, samp := range s.db {
-		switch idle := now - samp.when - s.expiration; {
-		case idle >= 4*60:
+		idle := now - samp.when - s.expiration
+		if idle >= 4*60 {
 			delete(s.db, hash)
-		case idle > 0:
+			continue
+		}
+		if s.aggregating() {
+			// Keep emitting the aggregate even when idle; seal the window so the
+			// next observed value starts a fresh one.
+			emit := samp.sample
+			emit.value = s.aggregateValue(&samp.sample)
+			out = append(out, emit)
+			samp.initial = false
+			samp.sealed = true
+			continue
+		}
+		if idle > 0 {
 			samp.initial = false
 			samp.count = 0
 			samp.value = 0
-		default:
-			out = append(out, samp.sample)
-			samp.initial = false
+			continue
 		}
+		out = append(out, samp.sample)
+		samp.initial = false
 	}
 	return out
 }

@@ -267,6 +267,126 @@ func TestSplitterInstancePrefix(t *testing.T) {
 	}
 }
 
+func TestSplitterDropLabelsAndAttributes(t *testing.T) {
+	body := `# TYPE kube_namespace_labels gauge
+kube_namespace_labels{namespace="ns1",label_team="core",label_env="prod",owner="x"} 1
+# TYPE kube_node_labels gauge
+kube_node_labels{node="node9",label_zone="eu-1"} 1
+`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(body))
+	}))
+	defer srv.Close()
+
+	target := testTarget(srv.URL)
+	target.Pod.Name = "ksm-abc"
+	target.Pod.Labels = map[string]string{"app.kubernetes.io/name": "kube-state-metrics"}
+
+	// kube_node_labels keeps its label_* points (ordered first); the generic
+	// labels rule drops them and gets a fallback service.name.
+	sp, err := NewSplitters([]SplitterConfig{{
+		Match: SplitterMatch{PodLabels: map[string]string{"app.kubernetes.io/name": "kube-state-metrics"}},
+		Rules: []SplitRule{
+			{
+				Metrics: `kube_node_labels`,
+				GroupBy: map[string]string{"node": "k8s.node.name"},
+			},
+			{
+				Metrics:    `kube_.+_labels`,
+				GroupBy:    map[string]string{"namespace": "k8s.namespace.name"},
+				DropLabels: `label_.+`,
+				Attributes: map[string]string{"service.name": "unknown"},
+			},
+		},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	exp := &captureExporter{}
+	s := New(Config{
+		Node: "node1", Interval: time.Hour, Timeout: 5 * time.Second,
+		Targets: staticTargets{target}, Exporter: exp, StartTime: time.Now(),
+		Splitters: sp, Kubelet: KubeletConfig{Meta: &fakeMetaSource{}},
+	})
+	if _, err := s.scrapeTarget(context.Background(), target); err != nil {
+		t.Fatal(err)
+	}
+
+	rms := exp.batches[0].ResourceMetrics()
+	for i := 0; i < rms.Len(); i++ {
+		rm := rms.At(i)
+		switch metricNames(rm)[0] {
+		case "kube_namespace_labels":
+			dp := rm.ScopeMetrics().At(0).Metrics().At(0).Gauge().DataPoints().At(0)
+			for _, k := range []string{"label_team", "label_env"} {
+				if _, ok := dp.Attributes().Get(k); ok {
+					t.Errorf("%s not dropped: %v", k, dp.Attributes().AsRaw())
+				}
+			}
+			if v, _ := dp.Attributes().Get("owner"); v.Str() != "x" {
+				t.Errorf("non-matching label lost: %v", dp.Attributes().AsRaw())
+			}
+			if v := attrStr(rm.Resource(), "service.name"); v != "unknown" {
+				t.Errorf("fallback service.name = %q, want unknown", v)
+			}
+		case "kube_node_labels":
+			dp := rm.ScopeMetrics().At(0).Metrics().At(0).Gauge().DataPoints().At(0)
+			if v, _ := dp.Attributes().Get("label_zone"); v.Str() != "eu-1" {
+				t.Errorf("kube_node_labels must keep label_*: %v", dp.Attributes().AsRaw())
+			}
+			if v := attrStr(rm.Resource(), "service.name"); v == "unknown" {
+				t.Error("fallback attribute leaked onto the node-labels rule")
+			}
+		}
+	}
+}
+
+func TestSplitterAttributesDontOverride(t *testing.T) {
+	body := "# TYPE kube_pod_info gauge\n" +
+		`kube_pod_info{namespace="ns1",pod="pod1",uid="` + uid1 + `"} 1` + "\n"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(body))
+	}))
+	defer srv.Close()
+
+	target := testTarget(srv.URL)
+	target.Pod.Name = "ksm-abc"
+	target.Pod.Labels = map[string]string{"app.kubernetes.io/name": "kube-state-metrics"}
+	sp, err := NewSplitters([]SplitterConfig{{
+		Match: SplitterMatch{PodLabels: map[string]string{"app.kubernetes.io/name": "kube-state-metrics"}},
+		Rules: []SplitRule{{
+			Metrics:    `kube_pod_.+`,
+			GroupBy:    map[string]string{"namespace": "k8s.namespace.name", "pod": "k8s.pod.name", "uid": "k8s.pod.uid"},
+			Enrich:     true,
+			Attributes: map[string]string{"service.name": "unknown"},
+		}},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	exp := &captureExporter{}
+	s := New(Config{
+		Node: "node1", Interval: time.Hour, Timeout: 5 * time.Second,
+		Targets: staticTargets{target}, Exporter: exp, StartTime: time.Now(),
+		Splitters: sp, Kubelet: KubeletConfig{Meta: &fakeMetaSource{}},
+	})
+	if _, err := s.scrapeTarget(context.Background(), target); err != nil {
+		t.Fatal(err)
+	}
+	rms := exp.batches[0].ResourceMetrics()
+	for i := 0; i < rms.Len(); i++ {
+		res := rms.At(i).Resource()
+		if attrStr(res, "k8s.pod.name") == "pod1" {
+			// Enrichment resolved the owner; the fallback must not override it.
+			if got := attrStr(res, "service.name"); got != "dep1" {
+				t.Fatalf("service.name = %q, want dep1 (enriched owner)", got)
+			}
+			return
+		}
+	}
+	t.Fatal("pod1 resource not produced")
+}
+
 func TestSplitterMatch(t *testing.T) {
 	sp, err := NewSplitters([]SplitterConfig{{
 		Match: SplitterMatch{Namespace: "monitoring", PodName: "ksm-.+"},

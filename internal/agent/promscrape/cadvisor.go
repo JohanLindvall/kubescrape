@@ -228,7 +228,8 @@ func (cb *cadvisorBatcher) count() int { return cb.points }
 type cadvisorIdentity struct {
 	namespace, pod, container string
 	podUID, containerID       string
-	hasCgroup                 bool // an "id" label was present
+	image                     string // "image" label, container rows only
+	hasCgroup                 bool   // an "id" label was present
 }
 
 func identityOf(labels []Label) cadvisorIdentity {
@@ -246,6 +247,8 @@ func identityOf(labels []Label) cadvisorIdentity {
 			} else {
 				ident.container = l.Value
 			}
+		case "image":
+			ident.image = l.Value
 		case "id":
 			ident.hasCgroup = true
 			ident.podUID, ident.containerID = cgroupIdentity(l.Value)
@@ -253,9 +256,11 @@ func identityOf(labels []Label) cadvisorIdentity {
 	}
 	// Sandbox ("POD") rows are pod-level; with the systemd driver their
 	// cgroup names the pause container, whose ID is not part of the pod's
-	// container statuses — drop it so the row shares the pod resource.
+	// container statuses — drop it so the row shares the pod resource. The
+	// image label names the pause container too, never the workload.
 	if sandbox {
 		ident.containerID = ""
+		ident.image = ""
 	}
 	return ident
 }
@@ -280,10 +285,26 @@ func isIdentityLabel(name string) bool {
 	return name == "namespace" || name == "pod" || name == "container"
 }
 
-// scope returns the ScopeMetrics for the resource identified by the labels,
+// redundantOnPodRow reports whether a label duplicates (or, for network rows'
+// pause-container image/name, contradicts) the resolved resource identity of a
+// pod- or container-identified row: the cgroup path in "id" is already parsed
+// into pod uid + container.id, "name" is the runtime container name behind
+// container.id, "image" lands on the resource. cmb-alloy deletes all three.
+// Rollup rows keep "id" — there it is the only distinguisher between cgroups
+// sharing the node-level resource.
+func redundantOnPodRow(name string) bool {
+	return name == "id" || name == "name" || name == "image"
+}
+
+// podScoped reports whether the sample resolved to a pod- or container-level
+// resource (as opposed to a rollup cgroup or a machine_* row).
+func (id cadvisorIdentity) podScoped() bool {
+	return id.pod != "" || id.podUID != "" || id.containerID != "" || id.container != ""
+}
+
+// scope returns the ScopeMetrics for the resource identified by ident,
 // creating it (with metadata-service enrichment) on first use per batch.
-func (cb *cadvisorBatcher) scope(labels []Label) (pmetric.ScopeMetrics, string) {
-	ident := identityOf(labels)
+func (cb *cadvisorBatcher) scope(ident cadvisorIdentity) (pmetric.ScopeMetrics, string) {
 	key := ident.key()
 	if sm, ok := cb.scopes[key]; ok {
 		return sm, key
@@ -349,12 +370,21 @@ func (cb *cadvisorBatcher) fillResource(res pcommon.Resource, ident cadvisorIden
 		if ident.containerID != "" {
 			a.PutStr("container.id", ident.containerID)
 		}
+		// The image label is elided from container-row data points as
+		// resource-redundant; on an unresolved resource it is the only source.
+		if ident.image != "" && (ident.container != "" || ident.containerID != "") {
+			a.PutStr("container.image.name", ident.image)
+		}
 	}
 	cb.s.attrsFor(pipelineCadvisor).Build(res, ctx)
 }
 
-func (cb *cadvisorBatcher) metric(labels []Label, name string, shape func(pmetric.Metric)) pmetric.Metric {
-	sm, resKey := cb.scope(labels)
+// metric returns the (per-resource) metric for one sample, plus whether the
+// sample's row is pod/container-scoped (its id/name/image labels are then
+// redundant with the resource and elided from the data points).
+func (cb *cadvisorBatcher) metric(labels []Label, name string, shape func(pmetric.Metric)) (pmetric.Metric, bool) {
+	ident := identityOf(labels)
+	sm, resKey := cb.scope(ident)
 	key := resKey + "\x00" + name
 	m, ok := cb.byKey[key]
 	if !ok {
@@ -363,7 +393,7 @@ func (cb *cadvisorBatcher) metric(labels []Label, name string, shape func(pmetri
 		shape(m)
 		cb.byKey[key] = m
 	}
-	return m
+	return m, ident.podScoped()
 }
 
 // drop applies the rollup filter (see KubeletConfig.DisableRollups).
@@ -395,7 +425,7 @@ func (cb *cadvisorBatcher) addNumber(s Sample, monotonic bool) {
 	if cb.drop(s.Name, s.Labels) {
 		return
 	}
-	m := cb.metric(s.Labels, s.Name, func(m pmetric.Metric) {
+	m, podScoped := cb.metric(s.Labels, s.Name, func(m pmetric.Metric) {
 		if monotonic {
 			sum := m.SetEmptySum()
 			sum.SetIsMonotonic(true)
@@ -417,7 +447,7 @@ func (cb *cadvisorBatcher) addNumber(s Sample, monotonic bool) {
 	}
 	dp.SetDoubleValue(s.Value)
 	dp.SetTimestamp(cb.pointTS(s.TimestampMs))
-	cb.putFilteredLabels(dp.Attributes(), s.Labels)
+	cb.putFilteredLabels(dp.Attributes(), s.Labels, podScoped)
 	cb.points++
 }
 
@@ -425,7 +455,7 @@ func (cb *cadvisorBatcher) addHistogram(family string, acc *histAcc) {
 	if cb.drop(family, acc.labels) {
 		return
 	}
-	m := cb.metric(acc.labels, family, func(m pmetric.Metric) {
+	m, podScoped := cb.metric(acc.labels, family, func(m pmetric.Metric) {
 		m.SetEmptyHistogram().SetAggregationTemporality(pmetric.AggregationTemporalityCumulative)
 	})
 	if m.Type() != pmetric.MetricTypeHistogram {
@@ -435,7 +465,7 @@ func (cb *cadvisorBatcher) addHistogram(family string, acc *histAcc) {
 	dp.SetStartTimestamp(cb.startTS)
 	dp.SetTimestamp(cb.pointTS(acc.ts))
 	fillHistogramPoint(dp, acc)
-	cb.putFilteredLabels(dp.Attributes(), acc.labels)
+	cb.putFilteredLabels(dp.Attributes(), acc.labels, podScoped)
 	cb.points++
 }
 
@@ -443,7 +473,7 @@ func (cb *cadvisorBatcher) addSummary(family string, acc *summAcc) {
 	if cb.drop(family, acc.labels) {
 		return
 	}
-	m := cb.metric(acc.labels, family, func(m pmetric.Metric) {
+	m, podScoped := cb.metric(acc.labels, family, func(m pmetric.Metric) {
 		m.SetEmptySummary()
 	})
 	if m.Type() != pmetric.MetricTypeSummary {
@@ -453,7 +483,7 @@ func (cb *cadvisorBatcher) addSummary(family string, acc *summAcc) {
 	dp.SetStartTimestamp(cb.startTS)
 	dp.SetTimestamp(cb.pointTS(acc.ts))
 	fillSummaryPoint(dp, acc)
-	cb.putFilteredLabels(dp.Attributes(), acc.labels)
+	cb.putFilteredLabels(dp.Attributes(), acc.labels, podScoped)
 	cb.points++
 }
 
@@ -464,11 +494,12 @@ func (cb *cadvisorBatcher) pointTS(tsMs int64) pcommon.Timestamp {
 	return cb.scrapeTS
 }
 
-func (cb *cadvisorBatcher) putFilteredLabels(attrs pcommon.Map, labels []Label) {
+func (cb *cadvisorBatcher) putFilteredLabels(attrs pcommon.Map, labels []Label, podScoped bool) {
 	for _, l := range labels {
-		if !isIdentityLabel(l.Name) {
-			attrs.PutStr(l.Name, l.Value)
+		if isIdentityLabel(l.Name) || (podScoped && redundantOnPodRow(l.Name)) {
+			continue
 		}
+		attrs.PutStr(l.Name, l.Value)
 	}
 }
 

@@ -83,6 +83,14 @@ type SplitRule struct {
 	// with its own self-scraped metrics. nil defaults to the describing
 	// target's service.name (e.g. "kube-state-metrics"); "" disables it.
 	InstancePrefix *string `json:"instancePrefix,omitempty"`
+	// DropLabels is an anchored regex on series label names; matching labels
+	// are omitted from the data points (e.g. 'label_.+' to strip the object's
+	// Kubernetes labels off kube_.+_labels series once grouped).
+	DropLabels string `json:"dropLabels,omitempty"`
+	// Attributes are set on the split resource only where absent — fallbacks
+	// for what neither groupBy nor enrichment provided (e.g. a service.name
+	// for label-derived resources).
+	Attributes map[string]string `json:"attributes,omitempty"`
 	// Enrich resolves the identified pod/container through the metadata
 	// service.
 	Enrich bool `json:"enrich,omitempty"`
@@ -97,10 +105,12 @@ type Splitter struct {
 }
 
 type compiledSplitRule struct {
-	metrics        *regexp.Regexp // nil matches any
-	groupBy        []groupMapping // sorted by label for deterministic keys
-	datapointAttr  []string       // resource attrs moved onto the data points
-	instancePrefix *string        // nil = default to the target's service.name
+	metrics        *regexp.Regexp    // nil matches any
+	groupBy        []groupMapping    // sorted by label for deterministic keys
+	datapointAttr  []string          // resource attrs moved onto the data points
+	instancePrefix *string           // nil = default to the target's service.name
+	dropLabels     *regexp.Regexp    // data-point labels to omit; nil keeps all
+	attributes     map[string]string // set-if-absent resource attributes
 	enrich         bool
 }
 
@@ -157,6 +167,12 @@ func NewSplitters(cfgs []SplitterConfig) ([]*Splitter, error) {
 				cr.datapointAttr = *r.DatapointAttributes
 			}
 			cr.instancePrefix = r.InstancePrefix
+			if r.DropLabels != "" {
+				if cr.dropLabels, err = regexp.Compile("^(?:" + r.DropLabels + ")$"); err != nil {
+					return nil, fmt.Errorf("splitter %d rule %d dropLabels: %w", i, j, err)
+				}
+			}
+			cr.attributes = r.Attributes
 			cr.enrich = r.Enrich
 			sp.rules = append(sp.rules, cr)
 		}
@@ -374,6 +390,13 @@ func (b *splitBatcher) fillSplitResource(res pcommon.Resource, rule *compiledSpl
 		prefix = *rule.instancePrefix
 	}
 	attrs.PrefixInstance(res, prefix)
+	// Rule fallbacks fill only what groupBy/enrichment left unset (e.g. a
+	// service.name for resources derived purely from labels).
+	for k, v := range rule.attributes {
+		if _, ok := res.Attributes().Get(k); !ok {
+			res.Attributes().PutStr(k, v)
+		}
+	}
 }
 
 func labelValue(labels []Label, name string) string {
@@ -385,12 +408,15 @@ func labelValue(labels []Label, name string) string {
 	return ""
 }
 
-// putSplitLabels writes the non-grouped labels onto a data point, plus the
-// attributes moved off the split resource (dp).
+// putSplitLabels writes the non-grouped labels onto a data point (minus the
+// rule's dropLabels), plus the attributes moved off the split resource (dp).
 func putSplitLabels(attrsMap pcommon.Map, rule *compiledSplitRule, labels []Label, dp []kv) {
 	for _, l := range labels {
 		grouped := false
 		if rule != nil {
+			if rule.dropLabels != nil && rule.dropLabels.MatchString(l.Name) {
+				continue
+			}
 			for _, g := range rule.groupBy {
 				if g.label == l.Name {
 					grouped = true

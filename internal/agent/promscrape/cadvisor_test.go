@@ -63,7 +63,7 @@ var cadvisorBody = strings.NewReplacer(
 ).Replace(`# TYPE container_cpu_usage_seconds_total counter
 container_cpu_usage_seconds_total{namespace="ns1",pod="pod1",container="app",id="/kubepods/burstable/podUID1/APPCID",image="img:1"} 12.5
 container_cpu_usage_seconds_total{namespace="ns1",pod="pod1",container="POD",id="/kubepods/burstable/podUID1/PAUSECID"} 0.1
-container_cpu_usage_seconds_total{namespace="ns1",pod="ghost",container="app",id="/kubepods/besteffort/podGHOSTUID/GHOSTCID"} 1
+container_cpu_usage_seconds_total{namespace="ns1",pod="ghost",container="app",id="/kubepods/besteffort/podGHOSTUID/GHOSTCID",image="ghostimg:2",name="ghost-app"} 1
 container_cpu_usage_seconds_total{id="/kubepods"} 100
 container_cpu_usage_seconds_total{id="/"} 200
 # TYPE container_network_receive_bytes_total counter
@@ -154,6 +154,14 @@ func TestScrapeCadvisor(t *testing.T) {
 	if attrStr(res, "k8s.deployment.name") != "dep1" || attrStr(res, "k8s.node.name") != "node1" {
 		t.Fatalf("container resource attrs = %v", res.Attributes().AsRaw())
 	}
+	// id/image/name duplicate the resolved resource identity — elided from
+	// pod/container-row data points (cmb-alloy parity).
+	cpuDP := rm.ScopeMetrics().At(0).Metrics().At(0).Sum().DataPoints().At(0)
+	for _, k := range []string{"id", "image", "name"} {
+		if _, ok := cpuDP.Attributes().Get(k); ok {
+			t.Fatalf("redundant %q label on container data point: %v", k, cpuDP.Attributes().AsRaw())
+		}
+	}
 
 	// Pod-level: the sandbox ("POD") row and the network series (no
 	// container label, pod cgroup id) share one pod resource — the pause
@@ -176,12 +184,14 @@ func TestScrapeCadvisor(t *testing.T) {
 		t.Fatalf("network dp attrs = %v", netDP.Attributes().AsRaw())
 	}
 
-	// Unknown pod/container: identity from labels and cgroup path.
+	// Unknown pod/container: identity from labels and cgroup path; the image
+	// label (elided from the data points) becomes the resource's image.
 	rm, ok = byID[ghostUID+"/"+ghostCID+"/app"]
 	if !ok {
 		t.Fatalf("missing ghost resource; have %v", keys(byID))
 	}
-	if attrStr(rm.Resource(), "k8s.pod.name") != "ghost" {
+	if attrStr(rm.Resource(), "k8s.pod.name") != "ghost" ||
+		attrStr(rm.Resource(), "container.image.name") != "ghostimg:2" {
 		t.Fatalf("ghost resource attrs = %v", rm.Resource().Attributes().AsRaw())
 	}
 
@@ -193,6 +203,18 @@ func TestScrapeCadvisor(t *testing.T) {
 	names = metricNames(rm)
 	if len(names) != 2 { // container_cpu (rollups) + machine_cpu_cores
 		t.Fatalf("node-level metrics = %v", names)
+	}
+	// Rollup rows share the node resource; there the cgroup path in "id" is
+	// the only distinguisher and must STAY on the data points.
+	rollupDPs := rm.ScopeMetrics().At(0).Metrics().At(0).Sum().DataPoints()
+	ids := map[string]bool{}
+	for i := 0; i < rollupDPs.Len(); i++ {
+		if v, ok := rollupDPs.At(i).Attributes().Get("id"); ok {
+			ids[v.Str()] = true
+		}
+	}
+	if !ids["/kubepods"] || !ids["/"] {
+		t.Fatalf("rollup data points must keep their id label, got %v", ids)
 	}
 
 	// Second scrape: metadata comes from the cache.

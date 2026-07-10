@@ -53,7 +53,17 @@ agent:
 cadvisor attribution is *stronger* than the Alloy pipeline: series are keyed
 by the cgroup path, the container ID resolves the exact incarnation, and the
 pause-container/`drop_empty_cadvisor` special cases are built in
-(`agent.cadvisorRollups: false` replaces the drop-aggregates filters).
+(`agent.cadvisorRollups: false` replaces the drop-aggregates filters). The
+`cadvisor_network`/`groupbyattrs` label cleanup is built in too: on pod- and
+container-identified rows the `id`/`name`/`image` labels are elided from the
+data points (they duplicate the resolved resource identity; on network rows
+they name the pause container), with `image` preserved as
+`container.image.name` on resources the metadata service could not resolve.
+Rollup rows keep `id` — there the cgroup path is the only distinguisher.
+cadvisor resources get `service.instance.id` prefixed with `cadvisor-`
+(cmb-alloy's `instance_prefix`, see below); Alloy's per-target
+`up`/`scrape_duration_seconds` health series are exported by default
+(`agent.scrapeHealthMetrics`, flag `-scrape-health-metrics`).
 
 ### `filter_metrics` + the node-scrape filter
 
@@ -80,7 +90,10 @@ agent:
 
 ### `prometheus_to_otel` (kube-state-metrics, kubelet-stats regrouping)
 
-The ~400 lines of `groupbyattrs`/`transform` OTTL become splitter rules:
+The ~400 lines of `groupbyattrs`/`transform` OTTL become splitter rules.
+Rules are first-match-wins per series, so order them like the Alloy filter
+pipelines route: the `kube_.+_labels` rules must come *before* `kube_pod_.+`
+(otherwise `kube_pod_labels` lands in the pod pipeline):
 
 ```yaml
 agent:
@@ -90,25 +103,76 @@ agent:
         - match:
             podLabels: {app.kubernetes.io/name: kube-state-metrics}
           rules:
-            - metrics: 'kube_pod_.+'
+            - metrics: 'kube_node_labels'      # keeps its label_* points
+              groupBy: {node: k8s.node.name}
+            - metrics: 'kube_.+_labels'        # the kube_state_labels pipeline
+              groupBy:
+                namespace: k8s.namespace.name
+                label_gp_service_name: service.name
+                label_app_kubernetes_io_name: service.name
+                label_software_product: platform.product.name
+                label_app_kubernetes_io_part_of: platform.product.name
+              dropLabels: 'label_.+'           # delete_matching_keys(^label_.+$)
+              attributes:                      # set ... where attributes[...] == nil
+                service.name: unknown
+                platform.product.name: unknown
+            - metrics: 'kube_pod_.+'           # the kube_state_pod pipeline
               groupBy:
                 namespace: k8s.namespace.name
                 pod: k8s.pod.name
                 uid: k8s.pod.uid
                 container: k8s.container.name
-                container_id: container.id
+                container_id: container.id     # containerd:// prefix stripped
               enrich: true        # full metadata via the metadata service
-            - metrics: 'kube_.+'
+            - metrics: 'kube_.+'               # the kube_state_rest pipeline
               groupBy: {namespace: k8s.namespace.name}
 ```
 
 `enrich: true` replaces the `k8sattributes` association: pods resolve by
 container ID or namespace/name (UID cross-checked), bringing owners, labels
-and namespace metadata along.
+and namespace metadata along. When several `groupBy` labels map to the same
+attribute, labels are applied in name order and non-empty values overwrite —
+`label_gp_service_name` sorts after `label_app_kubernetes_io_name`, so the
+result is Alloy's `coalesce(gp_service_name, app_kubernetes_io_name)`.
+`dropLabels` covers the `delete_matching_keys` datapoint cleanups and
+`attributes` the `where … == nil` fallbacks. Two placement/identity nuances
+of the Alloy pipeline are defaults here (both overridable per rule):
 
-### `otel_process_attrs` label chains and identity attributes
+* `datapointAttributes` (default `[k8s.node.name]`) — the described object's
+  node moves onto the data points, mirroring the `set_otel_attrs` transform
+  that demotes `k8s.node.name` for kube-state-metrics only; regular
+  scraped/cadvisor/node resources keep it as a resource attribute.
+* `instancePrefix` (default: the describing target's `service.name`, i.e.
+  `kube-state-metrics`) — cmb-alloy's `instance_prefix`, keeping split
+  resources' `service.instance.id` from colliding with the described pods'
+  own self-scraped `target_info`.
 
-The `service.name` / `platform.product.name` fallback chains and
+The kubelet-stats regrouping is another splitter matched on that pod, with
+`groupBy: {node_name: k8s.node.name, pod_namespace: k8s.namespace.name,
+pod_name: k8s.pod.name, container_name: k8s.container.name}` and
+`enrich: true`.
+
+### `otel_process_attrs` — Mimir identity (`set_otel_attrs`, `common`)
+
+The whole identity derivation is built in: every resource gets
+`service.namespace` (= the k8s namespace) and `service.instance.id`
+(fallback chain `container.id` → pod-uid[/container] →
+namespace/pod[/container] → node — the `common` transform's `Concat` chain),
+neither overwritten if a template already set it. The `instance_prefix`
+mechanism is the `instancePrefix` config (default `cadvisor` on the cadvisor
+pipeline, the target's `service.name` on splitter rules, `""` disables;
+top-level `resourceAttributes.instancePrefix` covers the
+cluster-name-prefix rule for shared tenants). Placement nuances:
+
+* `k8s.node.name` stays a resource attribute except on split (KSM-style)
+  resources, where `datapointAttributes` demotes it — exactly the
+  `set_otel_attrs` datapoint/resource split.
+* `k8s.pod.ip` is a **resource** attribute here (a deliberate deviation:
+  cmb-alloy demotes it to a datapoint attribute); drop it with
+  `-resource-attrs-disable='k8s\.pod\.ip'` if your backend treats pod IPs
+  as identity-breaking.
+
+The `service.name` / `platform.product.name` label chains and
 namespace-based defaults are templates:
 
 ```yaml
@@ -121,13 +185,12 @@ agent:
         service.name: >-
           {{ with .Pod }}{{ coalesce (index .Labels "gp/service-name")
           (index .Labels "app.kubernetes.io/name") (index .Labels "app")
-          (index .Labels "k8s-app") .Name }}{{ end }}
+          (index .Labels "name") (index .Labels "component")
+          (index .Labels "k8s-app") (index .Labels "control-plane") .Name }}{{ end }}
         platform.product.name: >-
           {{ with .Pod }}{{ coalesce (index .Labels "gp/software-product")
           (index .Labels "software-product") (index .Labels "app.kubernetes.io/part-of") }}{{ end }}
-        service.namespace: '{{ with .Pod }}{{ .Namespace }}{{ end }}'
-        service.instance.id: >-
-          {{ with .Container }}{{ .ID }}{{ else }}{{ with .Pod }}{{ .UID }}{{ end }}{{ end }}
+        k8s.instance.name: '{{ with .Pod }}{{ index .Labels "app.kubernetes.io/instance" }}{{ end }}'
 ```
 
 Namespace-based defaulting uses `regexMatch`:
@@ -139,7 +202,8 @@ Namespace-based defaulting uses `regexMatch`:
 
 Unwanted attributes are removed with `-resource-attrs-disable` (the
 `delete_key` transforms), e.g. `agent.extraArgs:
-["-resource-attrs-disable=k8s\\.pod\\.label\\..*"]`.
+["-resource-attrs-disable=k8s\\.pod\\.label\\..*"]`. `net.host.name`/
+`net.host.port` never exist here, so their deletions have no equivalent.
 
 ### `output_otlp`
 
@@ -209,6 +273,28 @@ resource with k8s attributes from a `container.id`/`k8s.pod.uid` on the data
 (without overwriting sender-set values), and forwards it — replacing the
 collector-with-k8sattributes-processor you'd otherwise keep as the OTLP
 endpoint.
+
+Two association differences from `otelcol.processor.k8sattributes`:
+
+* **No connection-IP association** (`pod_association from = "connection"`).
+  Senders must carry `k8s.pod.uid` (or `container.id`) on their resource;
+  the standard fix is the Downward API on every instrumented workload:
+
+  ```yaml
+  env:
+    - name: POD_UID
+      valueFrom: {fieldRef: {fieldPath: metadata.uid}}
+    - name: OTEL_RESOURCE_ATTRIBUTES
+      value: k8s.pod.uid=$(POD_UID)
+  ```
+
+  This is more reliable than peer-IP association anyway (hostNetwork pods
+  share the node IP; NAT can rewrite sources).
+* **No uid-suffixing of sender-set instances**: cmb-alloy appends
+  `/<pod uid>` to a pushed `service.instance.id` to force uniqueness across
+  replicas; kubescrape never rewrites sender-set attributes. If replicas
+  report colliding instance ids, include the pod uid in the sender's
+  `OTEL_RESOURCE_ATTRIBUTES` (as above — `service.instance.id=$(POD_UID)`).
 
 ## Not covered — keep a collector for these
 

@@ -445,7 +445,12 @@ ServiceAccount token (`nodes/metrics` RBAC, see
   `GET /v1/pods/{namespace}/{name}`, cross-checked against the cgroup pod
   UID. Identity labels move into the resource attributes (owners, labels,
   namespace metadata included); the remaining labels stay on the data
-  points. `-cadvisor-rollups=false` drops the rollup aggregates — the
+  points, except that on pod/container-identified rows the redundant
+  `id`/`name`/`image` labels are elided (the cgroup path and runtime name are
+  already resolved into the resource identity, and on network rows they name
+  the pause container — `image` is kept as `container.image.name` when
+  metadata could not be resolved). Rollup rows keep `id`, their only
+  distinguisher. `-cadvisor-rollups=false` drops the rollup aggregates — the
   cgroup hierarchy above pods (`/`, `/kubepods`, QoS and system slices) and
   pod-level rows of container-scoped families (the pod cgroup rolls its
   containers up) — while keeping container-level series, genuinely
@@ -516,8 +521,10 @@ more attributes to demote. Regular (non-split) scrape/cadvisor/node resources
 keep `k8s.node.name` as a resource attribute (the agent's node). Each split rule
 also gets an `instancePrefix` (default: the describing target's `service.name`,
 e.g. `kube-state-metrics`) prepended to `service.instance.id` so a described
-object's series don't collide with its own self-scraped metrics; `""` disables
-it.
+object's series don't collide with its own self-scraped metrics (`""` disables
+it), a `dropLabels` regex omitting matching label names from the data points
+(e.g. `label_.+` on `kube_.+_labels` families), and set-if-absent `attributes`
+fallbacks (e.g. `service.name: unknown` for label-derived resources).
 
 **Resource attributes.** How resource attributes are built is configurable
 and applies uniformly to log and metric resources. The built-in mapping also

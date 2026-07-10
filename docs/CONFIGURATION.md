@@ -518,7 +518,15 @@ node is a property of the object, not the exporter's identity; set `[]` to keep
 everything on the resource, or list more attributes to demote. `instancePrefix`
 (default: the describing target's `service.name`) prefixes each split resource's
 `service.instance.id` so the described object doesn't collide with its own
-self-scraped `target_info`; set `""` to disable.
+self-scraped `target_info`; set `""` to disable. `dropLabels` (anchored regex on
+label names) omits matching labels from the data points (e.g. `label_.+` strips
+the object's own Kubernetes labels off `kube_.+_labels` series once grouped).
+`attributes` sets resource attributes **only where absent** — fallbacks for what
+neither `groupBy` nor enrichment provided (e.g. `service.name: unknown`).
+Several `groupBy` labels may map to the same attribute: labels apply in name
+order and non-empty values overwrite, giving a deterministic coalesce (e.g.
+`label_gp_service_name` beats `label_app_kubernetes_io_name` for
+`service.name`).
 
 ```yaml
 metrics:
@@ -528,6 +536,10 @@ metrics:
         podLabels:
           app.kubernetes.io/name: kube-state-metrics
       rules:
+        - metrics: 'kube_.+_labels'     # ordered before kube_pod_.+ (first match wins)
+          groupBy: {namespace: k8s.namespace.name}
+          dropLabels: 'label_.+'        # the object's labels stay off the points
+          attributes: {service.name: unknown}   # fallback, set only if absent
         - metrics: 'kube_pod_.+'
           groupBy:
             namespace: k8s.namespace.name

@@ -222,8 +222,13 @@ metadata has not reached the API server yet. Delivery is at-least-once:
 batches (`-logs-batch-size` / `-logs-flush-interval`) are retried, file
 offsets are committed only after a successful export, and committed offsets
 are checkpointed to disk (`-checkpoint-file`) so restarts resume where they
-left off. Set `-logs-exclude-namespaces` to the observability namespace to
-avoid feeding the collector its own output.
+left off. `-logs-pipelined-export` overlaps reading with delivery (one export
+in flight; its commit/rewind applies before the next flush — the invariants
+are unchanged). Per-file backlog is visible as `kubescrape_log_lag_bytes` and
+on `GET /debug/tailer`; a per-file line **rate limit** (`-logs-rate-limit`,
+pause or drop) keeps one runaway pod from consuming the pipeline. Set
+`-logs-exclude-namespaces` to the observability namespace to avoid feeding
+the collector its own output.
 
 **Unified config file** (`-config`). All of the agent's YAML configuration
 lives in one file, passed with `-config`. It has five optional sections, each
@@ -232,7 +237,7 @@ replaces:
 
 ```yaml
 resourceAttributes: {...}   # how exported resource attributes are built
-logs:          {sources: [...]}   # which files to tail and how
+logs:          {sources: [...], rules: [...]}   # what to tail; drop/keep/sample
 logAttributes: {rules: [...]}     # lift line keys onto attributes
 logMetrics:    {metrics: [...]}   # metrics derived from log lines
 metrics:       {pipelines: {...}, splitters: [...]}   # scraped-series rules
@@ -267,6 +272,17 @@ archives — decompressed once to completion, resuming correctly across a
 restart. `-logs-file-attributes` (opt-in) stamps `log.file.name` (basename) and
 `log.file.position` (the byte offset of the record's start) on every record,
 for each file source.
+
+**Log rules** (`logs.rules`). Ordered first-match-wins keep/drop/sample rules
+over every exported record — the cost lever: drop debug lines, health-check
+noise or whole chatty matchers, or keep a deterministic sample of them. The
+selector DSL and key resolution are shared with `logMetrics`
+(`match`/`matchRegexp`, record + resource attributes, line JSON/logfmt fields,
+`__line__` for the raw body) plus `__severity__` for the enriched severity —
+so `action: drop, match: ["__severity__=debug"]` needs no per-app parsing.
+Rules run after enrichment and after log metrics (metrics still count every
+line — count errors while dropping them); dropped records advance offsets
+like exported ones and count into `kubescrape_log_rules_dropped_total`.
 
 **Log enrichment** (`-logs-enrich`, default true). Each exported line is run
 through [JohanLindvall/enrich](https://github.com/JohanLindvall/enrich),

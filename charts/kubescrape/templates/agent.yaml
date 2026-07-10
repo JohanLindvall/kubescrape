@@ -76,6 +76,7 @@ spec:
             - -listen={{ .Values.agent.listen }}
             - -otlp-endpoint={{ .Values.agent.otlp.endpoint }}
             - -otlp-protocol={{ .Values.agent.otlp.protocol }}
+            - -otlp-compression={{ .Values.agent.otlp.compression }}
             - -otlp-insecure={{ .Values.agent.otlp.insecure }}
             - -otlp-tls-insecure-skip-verify={{ .Values.agent.otlp.tlsInsecureSkipVerify }}
             {{- with .Values.agent.otlp.caFile }}
@@ -103,6 +104,12 @@ spec:
             {{- end }}
             - -logs-enrich={{ .Values.agent.logsEnrich }}
             - -logs-file-attributes={{ .Values.agent.logsFileAttributes }}
+            {{- if .Values.agent.logsRateLimit }}
+            - -logs-rate-limit={{ .Values.agent.logsRateLimit }}
+            - -logs-rate-burst={{ .Values.agent.logsRateBurst }}
+            - -logs-rate-drop={{ .Values.agent.logsRateDrop }}
+            {{- end }}
+            - -logs-pipelined-export={{ .Values.agent.logsPipelinedExport }}
             {{- with .Values.agent.bufferDir }}
             - -buffer-dir={{ . }}
             - -buffer-max-bytes={{ int64 $.Values.agent.bufferMaxBytes }}

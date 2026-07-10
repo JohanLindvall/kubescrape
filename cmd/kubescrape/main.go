@@ -65,14 +65,15 @@ func run() error {
 		monitorsOn = flag.Bool("servicemonitors", false, "serve targets for monitoring.coreos.com ServiceMonitors selecting pod-backed Services (no per-endpoint auth or relabelings)")
 
 		// Kubernetes events -> OTLP logs (opt-in).
-		eventsOn     = flag.Bool("events", false, "export Kubernetes events as OTLP log records")
-		otlpEndpoint = flag.String("otlp-endpoint", "otel-collector.monitoring:4317", "OTLP endpoint for the events exporter: host:port for grpc, base URL for http")
-		otlpProtocol = flag.String("otlp-protocol", "grpc", "OTLP transport: grpc or http")
-		otlpInsecure = flag.Bool("otlp-insecure", true, "use a plaintext gRPC connection")
-		otlpSkipTLS  = flag.Bool("otlp-tls-insecure-skip-verify", false, "skip TLS certificate verification towards the collector")
-		otlpCAFile   = flag.String("otlp-tls-ca-file", "", "PEM CA bundle for verifying the collector")
-		otlpBearer   = flag.String("otlp-bearer-token-file", "", "file with a bearer token sent on every export (re-read periodically)")
-		otlpTimeout  = flag.Duration("otlp-timeout", 15*time.Second, "per-export timeout")
+		eventsOn        = flag.Bool("events", false, "export Kubernetes events as OTLP log records")
+		otlpEndpoint    = flag.String("otlp-endpoint", "otel-collector.monitoring:4317", "OTLP endpoint for the events exporter: host:port for grpc, base URL for http")
+		otlpProtocol    = flag.String("otlp-protocol", "grpc", "OTLP transport: grpc or http")
+		otlpCompression = flag.String("otlp-compression", "gzip", "OTLP payload compression: gzip or none")
+		otlpInsecure    = flag.Bool("otlp-insecure", true, "use a plaintext gRPC connection")
+		otlpSkipTLS     = flag.Bool("otlp-tls-insecure-skip-verify", false, "skip TLS certificate verification towards the collector")
+		otlpCAFile      = flag.String("otlp-tls-ca-file", "", "PEM CA bundle for verifying the collector")
+		otlpBearer      = flag.String("otlp-bearer-token-file", "", "file with a bearer token sent on every export (re-read periodically)")
+		otlpTimeout     = flag.Duration("otlp-timeout", 15*time.Second, "per-export timeout")
 	)
 	flag.Parse()
 
@@ -234,6 +235,7 @@ func run() error {
 		exporter, err := otlpexport.New(otlpexport.Config{
 			Endpoint:           *otlpEndpoint,
 			Protocol:           *otlpProtocol,
+			Compression:        *otlpCompression,
 			Insecure:           *otlpInsecure,
 			InsecureSkipVerify: *otlpSkipTLS,
 			CAFile:             *otlpCAFile,

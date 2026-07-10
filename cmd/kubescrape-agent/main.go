@@ -7,6 +7,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -44,20 +45,21 @@ func main() {
 
 func run() error {
 	var (
-		configFile   = flag.String("config", "", "unified YAML config file with resourceAttributes, logs, logAttributes, logMetrics and metrics sections (each mirrors its former standalone file)")
-		nodeName     = flag.String("node-name", os.Getenv("NODE_NAME"), "name of the node this agent runs on (default $NODE_NAME)")
-		listen       = flag.String("listen", ":8081", "HTTP listen address for /healthz, /readyz and /metrics (empty disables)")
-		metadataURL  = flag.String("metadata-endpoint", "http://kubescrape.monitoring", "base URL of the kubescrape metadata service")
-		metadataWait = flag.Duration("metadata-wait", 5*time.Second, "how long the metadata service may block waiting for a new container")
-		otlpEndpoint = flag.String("otlp-endpoint", "otel-collector.monitoring:4317", "OTLP endpoint: host:port for grpc, base URL for http")
-		otlpProtocol = flag.String("otlp-protocol", "grpc", "OTLP transport: grpc or http")
-		otlpInsecure = flag.Bool("otlp-insecure", true, "use a plaintext gRPC connection (for http, use an http:// endpoint)")
-		otlpSkipTLS  = flag.Bool("otlp-tls-insecure-skip-verify", false, "skip TLS certificate verification towards the collector")
-		otlpCAFile   = flag.String("otlp-tls-ca-file", "", "PEM CA bundle for verifying the collector")
-		otlpBearer   = flag.String("otlp-bearer-token-file", "", "file with a bearer token sent on every export (re-read periodically)")
-		otlpTimeout  = flag.Duration("otlp-timeout", 15*time.Second, "per-export-attempt timeout")
-		otlpRetries  = flag.Int("otlp-retry-attempts", 3, "tries per metrics export (logs retry via the tailer's rewind)")
-		otlpBackoff  = flag.Duration("otlp-retry-backoff", time.Second, "initial backoff between metric export retries, doubled per attempt")
+		configFile      = flag.String("config", "", "unified YAML config file with resourceAttributes, logs, logAttributes, logMetrics and metrics sections (each mirrors its former standalone file)")
+		nodeName        = flag.String("node-name", os.Getenv("NODE_NAME"), "name of the node this agent runs on (default $NODE_NAME)")
+		listen          = flag.String("listen", ":8081", "HTTP listen address for /healthz, /readyz and /metrics (empty disables)")
+		metadataURL     = flag.String("metadata-endpoint", "http://kubescrape.monitoring", "base URL of the kubescrape metadata service")
+		metadataWait    = flag.Duration("metadata-wait", 5*time.Second, "how long the metadata service may block waiting for a new container")
+		otlpEndpoint    = flag.String("otlp-endpoint", "otel-collector.monitoring:4317", "OTLP endpoint: host:port for grpc, base URL for http")
+		otlpProtocol    = flag.String("otlp-protocol", "grpc", "OTLP transport: grpc or http")
+		otlpCompression = flag.String("otlp-compression", "gzip", "OTLP payload compression: gzip or none")
+		otlpInsecure    = flag.Bool("otlp-insecure", true, "use a plaintext gRPC connection (for http, use an http:// endpoint)")
+		otlpSkipTLS     = flag.Bool("otlp-tls-insecure-skip-verify", false, "skip TLS certificate verification towards the collector")
+		otlpCAFile      = flag.String("otlp-tls-ca-file", "", "PEM CA bundle for verifying the collector")
+		otlpBearer      = flag.String("otlp-bearer-token-file", "", "file with a bearer token sent on every export (re-read periodically)")
+		otlpTimeout     = flag.Duration("otlp-timeout", 15*time.Second, "per-export-attempt timeout")
+		otlpRetries     = flag.Int("otlp-retry-attempts", 3, "tries per metrics export (logs retry via the tailer's rewind)")
+		otlpBackoff     = flag.Duration("otlp-retry-backoff", time.Second, "initial backoff between metric export retries, doubled per attempt")
 
 		logLevel  = flag.String("log-level", "info", "log level: debug, info, warn, error")
 		logFormat = flag.String("log-format", "text", "log format: text or json")
@@ -71,6 +73,10 @@ func run() error {
 		multilineOn       = flag.Bool("logs-multiline", true, "join application-level multi-line entries (stack traces, ...)")
 		multilineWait     = flag.Duration("logs-multiline-timeout", time.Second, "flush incomplete multi-line groups after this long")
 		excludeNs         = flag.String("logs-exclude-namespaces", "", "comma-separated namespaces whose container logs are not tailed")
+		logsRateLimit     = flag.Float64("logs-rate-limit", 0, "per-file line rate limit in lines/second (0 disables); exhausted files pause until tokens refill")
+		logsRateBurst     = flag.Float64("logs-rate-burst", 0, "rate-limit token bucket size (0 = 2x -logs-rate-limit)")
+		logsRateDrop      = flag.Bool("logs-rate-drop", false, "discard lines over -logs-rate-limit instead of pausing the file")
+		logsPipelined     = flag.Bool("logs-pipelined-export", false, "overlap reading with export delivery (one export in flight; at-least-once semantics unchanged)")
 		logsEnrich        = flag.Bool("logs-enrich", true, "parse per-line metadata (timestamp, severity, trace/span IDs, exception details) into the OTLP record fields via github.com/JohanLindvall/enrich")
 		logsFileAttrs     = flag.Bool("logs-file-attributes", false, "stamp log.file.name and log.file.position (byte offset) on every log record, for each file source")
 		bufferDir         = flag.String("buffer-dir", "", "directory for a disk-backed export buffer (logs and metrics); a collector outage spools here instead of pinning the tailer to old offsets or dropping metrics (empty disables)")
@@ -187,6 +193,7 @@ func run() error {
 	exporter, err := otlpexport.New(otlpexport.Config{
 		Endpoint:           *otlpEndpoint,
 		Protocol:           *otlpProtocol,
+		Compression:        *otlpCompression,
 		Insecure:           *otlpInsecure,
 		InsecureSkipVerify: *otlpSkipTLS,
 		CAFile:             *otlpCAFile,
@@ -245,14 +252,19 @@ func run() error {
 		log.Info("log-derived metrics started", "metrics", logMetrics.Count, "interval", *logsMetricsEvery)
 	}
 
+	var tl *tailer.Tailer // exposed on /debug/tailer when logs are on
 	if *logsOn {
 		var logSources []tailer.Source
+		var logRules *metrics.LineFilter
 		if fileCfg.Logs != nil {
 			if logSources, err = tailer.ValidateSources(fileCfg.Logs.Sources); err != nil {
 				return fmt.Errorf("logs config: %w", err)
 			}
+			if logRules, err = metrics.NewLineFilter(fileCfg.Logs.Rules); err != nil {
+				return fmt.Errorf("logs config: %w", err)
+			}
 		}
-		tl := tailer.New(tailer.Config{
+		tl = tailer.New(tailer.Config{
 			Dir:               *logDir,
 			Sources:           logSources,
 			CheckpointFile:    *checkpointFile,
@@ -265,6 +277,11 @@ func run() error {
 			FlushInterval:     *logsFlush,
 			BatchSize:         *logsBatch,
 			MaxEntryBytes:     *maxEntryBytes,
+			RateLimit:         *logsRateLimit,
+			RateBurst:         *logsRateBurst,
+			RateDrop:          *logsRateDrop,
+			Rules:             logRules,
+			PipelinedExport:   *logsPipelined,
 			Multiline:         *multilineOn,
 			MultilineTimeout:  *multilineWait,
 			Enrich:            *logsEnrich,
@@ -391,6 +408,15 @@ func run() error {
 		mux.HandleFunc("GET /healthz", ok)
 		mux.HandleFunc("GET /readyz", ok)
 		mux.Handle("GET /metrics", obs.Handler())
+		if tl != nil {
+			// Per-file tail positions and lag (refreshed ~10s), largest lag first.
+			mux.HandleFunc("GET /debug/tailer", func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				enc := json.NewEncoder(w)
+				enc.SetIndent("", "  ")
+				_ = enc.Encode(tl.Status())
+			})
+		}
 		srv := &http.Server{Addr: *listen, Handler: mux, ReadHeaderTimeout: 10 * time.Second}
 		go func() {
 			if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {

@@ -37,28 +37,31 @@ type keyIndex struct {
 	want  map[string]bool
 }
 
+// add registers one referenced field key (idempotent; synthetic keys and
+// literals are skipped).
+func (ki *keyIndex) add(key string) {
+	if key == "" || key == "1" || key == lineKey || ki.want[key] {
+		return
+	}
+	ki.want[key] = true
+	ki.keys = append(ki.keys, key)
+	ki.paths = append(ki.paths, strings.Split(key, "."))
+}
+
 // newKeyIndex collects the distinct field keys referenced across rules: label
 // getters, the observed value, and selector labels.
 func newKeyIndex(rules []*metricRule) keyIndex {
 	ki := keyIndex{want: map[string]bool{}}
-	add := func(key string) {
-		if key == "" || key == "1" || key == lineKey || ki.want[key] {
-			return
-		}
-		ki.want[key] = true
-		ki.keys = append(ki.keys, key)
-		ki.paths = append(ki.paths, strings.Split(key, "."))
-	}
 	for _, r := range rules {
-		add(r.value)
+		ki.add(r.value)
 		for _, lt := range r.labels {
-			add(lt.getKey)
+			ki.add(lt.getKey)
 		}
 		for _, lt := range r.resLabels {
-			add(lt.getKey)
+			ki.add(lt.getKey)
 		}
 		for _, key := range r.match.labelKeys() {
-			add(key)
+			ki.add(key)
 		}
 	}
 	return ki

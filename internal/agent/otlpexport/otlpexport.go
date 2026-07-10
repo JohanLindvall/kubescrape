@@ -44,6 +44,9 @@ type Config struct {
 	// BearerTokenFile is re-read every minute and sent as
 	// "Authorization: Bearer <token>". Empty disables.
 	BearerTokenFile string
+	// Compression is "gzip" (the default, matching collector exporters —
+	// telemetry compresses 5-10x) or "none".
+	Compression string
 	// Timeout bounds one export attempt.
 	Timeout time.Duration
 	// RetryAttempts is the number of tries per metrics export (logs have
@@ -84,6 +87,13 @@ func New(cfg Config) (*Client, error) {
 	if cfg.RetryBackoff <= 0 {
 		cfg.RetryBackoff = time.Second
 	}
+	switch cfg.Compression {
+	case "":
+		cfg.Compression = "gzip"
+	case "gzip", "none":
+	default:
+		return nil, fmt.Errorf("compression %q (want gzip or none)", cfg.Compression)
+	}
 	c := &Client{cfg: cfg}
 
 	tlsCfg, err := buildTLS(cfg)
@@ -97,9 +107,13 @@ func New(cfg Config) (*Client, error) {
 		if cfg.Insecure {
 			creds = insecure.NewCredentials()
 		}
+		callOpts := []grpc.CallOption{grpc.MaxCallSendMsgSize(64 * 1024 * 1024)}
+		if cfg.Compression == "gzip" {
+			callOpts = append(callOpts, grpc.UseCompressor(gzipName))
+		}
 		conn, err := grpc.NewClient(cfg.Endpoint,
 			grpc.WithTransportCredentials(creds),
-			grpc.WithDefaultCallOptions(grpc.MaxCallSendMsgSize(64*1024*1024)),
+			grpc.WithDefaultCallOptions(callOpts...),
 		)
 		if err != nil {
 			return nil, err
@@ -254,11 +268,21 @@ func (c *Client) grpcAuth(ctx context.Context) (context.Context, error) {
 }
 
 func (c *Client) httpPost(ctx context.Context, url string, body []byte) error {
+	compressed := c.cfg.Compression == "gzip"
+	if compressed {
+		var err error
+		if body, err = gzipBody(body); err != nil {
+			return err
+		}
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
 		return err
 	}
 	req.Header.Set("Content-Type", "application/x-protobuf")
+	if compressed {
+		req.Header.Set("Content-Encoding", "gzip")
+	}
 	token, err := c.bearer()
 	if err != nil {
 		return err

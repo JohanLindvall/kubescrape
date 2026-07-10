@@ -75,6 +75,7 @@ spec:
             - -events
             - -otlp-endpoint={{ .Values.service.events.otlp.endpoint }}
             - -otlp-protocol={{ .Values.service.events.otlp.protocol }}
+            - -otlp-compression={{ .Values.service.events.otlp.compression }}
             - -otlp-insecure={{ .Values.service.events.otlp.insecure }}
             - -otlp-tls-insecure-skip-verify={{ .Values.service.events.otlp.tlsInsecureSkipVerify }}
             {{- with .Values.service.events.otlp.caFile }}

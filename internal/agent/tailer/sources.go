@@ -7,6 +7,8 @@ import (
 
 	"github.com/bmatcuk/doublestar/v4"
 	"sigs.k8s.io/yaml"
+
+	"github.com/JohanLindvall/kubescrape/internal/metrics"
 )
 
 // Source selects a set of log files by glob and declares how to handle them.
@@ -42,6 +44,11 @@ type Source struct {
 // SourcesConfig is the shape of the `logs` section of the agent config.
 type SourcesConfig struct {
 	Sources []Source `json:"sources"`
+	// Rules are ordered first-match-wins keep/drop/sample rules applied to
+	// every exported log record (all sources; journald is not filtered). No
+	// match keeps. Compiled via metrics.NewLineFilter; key resolution matches
+	// the logMetrics selectors, plus the synthetic __severity__ key.
+	Rules []metrics.LineRule `json:"rules,omitempty"`
 }
 
 // LoadSourcesConfig reads log sources from a YAML file.

@@ -13,6 +13,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/klauspost/compress/gzip"
+
 	"go.opentelemetry.io/collector/pdata/plog"
 	"go.opentelemetry.io/collector/pdata/plog/plogotlp"
 	"go.opentelemetry.io/collector/pdata/pmetric"
@@ -35,13 +37,23 @@ func TestHTTPExportWithBearer(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	var gotAuth, gotCT, gotPath string
+	var gotAuth, gotCT, gotEnc, gotPath string
 	var gotPoints int
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotAuth = r.Header.Get("Authorization")
 		gotCT = r.Header.Get("Content-Type")
+		gotEnc = r.Header.Get("Content-Encoding")
 		gotPath = r.URL.Path
-		body, err := io.ReadAll(r.Body)
+		reader := io.Reader(r.Body)
+		if gotEnc == "gzip" {
+			zr, err := gzip.NewReader(r.Body)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			reader = zr
+		}
+		body, err := io.ReadAll(reader)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
@@ -54,19 +66,35 @@ func TestHTTPExportWithBearer(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c, err := New(Config{Endpoint: srv.URL, Protocol: "http", Timeout: 5 * time.Second, BearerTokenFile: tokenFile})
-	if err != nil {
-		t.Fatal(err)
+	// Default compression is gzip; "none" sends the plain body.
+	for _, compression := range []string{"", "none"} {
+		gotPoints = 0
+		c, err := New(Config{Endpoint: srv.URL, Protocol: "http", Timeout: 5 * time.Second,
+			BearerTokenFile: tokenFile, Compression: compression})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := c.ExportMetrics(context.Background(), testMetrics()); err != nil {
+			t.Fatal(err)
+		}
+		_ = c.Close()
+		if gotAuth != "Bearer tok42" || gotCT != "application/x-protobuf" || gotPath != "/v1/metrics" {
+			t.Fatalf("auth=%q ct=%q path=%q", gotAuth, gotCT, gotPath)
+		}
+		wantEnc := "gzip"
+		if compression == "none" {
+			wantEnc = ""
+		}
+		if gotEnc != wantEnc {
+			t.Fatalf("Content-Encoding = %q, want %q (compression %q)", gotEnc, wantEnc, compression)
+		}
+		if gotPoints != 1 {
+			t.Fatalf("decoded points = %d (compression %q)", gotPoints, compression)
+		}
 	}
-	defer func() { _ = c.Close() }()
-	if err := c.ExportMetrics(context.Background(), testMetrics()); err != nil {
-		t.Fatal(err)
-	}
-	if gotAuth != "Bearer tok42" || gotCT != "application/x-protobuf" || gotPath != "/v1/metrics" {
-		t.Fatalf("auth=%q ct=%q path=%q", gotAuth, gotCT, gotPath)
-	}
-	if gotPoints != 1 {
-		t.Fatalf("decoded points = %d", gotPoints)
+
+	if _, err := New(Config{Endpoint: srv.URL, Protocol: "http", Compression: "snappy"}); err == nil {
+		t.Fatal("invalid compression must error")
 	}
 }
 

@@ -11,6 +11,7 @@ require (
 	github.com/cespare/xxhash/v2 v2.3.0
 	github.com/coreos/go-systemd/v22 v22.7.0
 	github.com/fsnotify/fsnotify v1.10.1
+	github.com/klauspost/compress v1.18.0
 	github.com/prometheus/client_golang v1.23.2
 	go.opentelemetry.io/collector/pdata v1.61.0
 	google.golang.org/grpc v1.82.0

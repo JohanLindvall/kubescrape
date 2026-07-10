@@ -42,6 +42,22 @@ var (
 		Name: "kubescrape_log_enriched_total",
 		Help: "Log records by the enrichment strategy that matched (json, logfmt, pattern, none).",
 	}, []string{"format"})
+	LogLagBytes = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "kubescrape_log_lag_bytes",
+		Help: "Largest per-file backlog: bytes on disk not yet exported and committed (per-file breakdown on /debug/tailer).",
+	})
+	LogLagBytesTotal = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "kubescrape_log_lag_bytes_sum",
+		Help: "Total backlog across tracked files: bytes on disk not yet exported and committed.",
+	})
+	LogRateLimited = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "kubescrape_log_rate_limited_total",
+		Help: "Per-file line rate limit hits: lines discarded (action=drop) or reads paused (action=pause).",
+	}, []string{"action"})
+	LogRulesDropped = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "kubescrape_log_rules_dropped_total",
+		Help: "Log records dropped by the logs rules (including sampled-away lines).",
+	})
 )
 
 // Scrape pipeline (agent).

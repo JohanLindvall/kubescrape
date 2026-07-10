@@ -12,7 +12,7 @@ flag or a config-file entry.
 | Topology | 3–5 clustered Deployment replicas | metadata service (Deployment) + per-node agent (DaemonSet) |
 | Target distribution | Alloy clustering | node-local by construction (each agent scrapes its node's pods) |
 | Kubernetes access | every replica watches pods/nodes/services | only the metadata service watches; agents talk HTTP to it |
-| Logs | not collected | collected (CRI + multiline joining, at-least-once) |
+| Logs | not collected | collected (CRI + multiline joining, at-least-once, drop/keep/sample rules, per-file rate limit) |
 | Delivery | batch processor + sending queue | logs: checkpointed at-least-once with rewind; metrics: bounded retries |
 
 ## Component mapping
@@ -219,7 +219,9 @@ agent:
 ```
 
 Batching is inherent (`-metrics-batch-size`, `-logs-batch-size`,
-`-logs-flush-interval`). By default there is no persistent sending queue:
+`-logs-flush-interval`), and payloads are gzip-compressed by default
+(`-otlp-compression`, klauspost/compress — the counterpart of Alloy's
+snappy/otlphttp gzip). By default there is no persistent sending queue:
 metric scrapes retry with backoff and re-scrape next interval; log delivery is
 at-least-once via checkpointed offsets. For Alloy's disk-buffered WAL, set
 `agent.bufferDir` (flag `-buffer-dir`) to spool both logs and metrics to a

@@ -48,7 +48,7 @@ kubescrape -listen :8080 -wait-timeout 5s -cache-ttl 5m -log-format json
 | `-resync` | `0` | informer resync period (0 = watch stream only) |
 | `-servicemonitors` | `false` | serve targets for `monitoring.coreos.com/v1` ServiceMonitors selecting pod-backed Services (endpoint `port`/`targetPort`/`path`/`scheme`; no per-endpoint auth or relabelings). Self-disables with a warning when the CRD is absent |
 | `-events` | `false` | export Kubernetes events as OTLP log records (batched; history from the initial list is skipped; pod events carry full pod resource attributes) |
-| `-otlp-*` | as the agent | with `-events`: `-otlp-endpoint`, `-otlp-protocol`, `-otlp-insecure`, `-otlp-tls-ca-file`, `-otlp-tls-insecure-skip-verify`, `-otlp-bearer-token-file`, `-otlp-timeout` |
+| `-otlp-*` | as the agent | with `-events`: `-otlp-endpoint`, `-otlp-protocol`, `-otlp-compression`, `-otlp-insecure`, `-otlp-tls-ca-file`, `-otlp-tls-insecure-skip-verify`, `-otlp-bearer-token-file`, `-otlp-timeout` |
 | `-log-level` | `info` | `debug`, `info`, `warn`, `error` |
 | `-log-format` | `text` | `text` or `json` (client-go's klog is routed through the same handler) |
 
@@ -87,6 +87,7 @@ Pipeline toggles (all default `true`):
 |---|---|---|
 | `-otlp-endpoint` | `otel-collector.monitoring:4317` | `host:port` for gRPC, base URL for HTTP |
 | `-otlp-protocol` | `grpc` | `grpc` or `http` (OTLP/HTTP protobuf on `/v1/logs`, `/v1/metrics`) |
+| `-otlp-compression` | `gzip` | payload compression on either transport (`gzip` via klauspost/compress, or `none`); telemetry compresses 5–10x |
 | `-otlp-insecure` | `true` | plaintext gRPC (for HTTP, choose via the URL scheme) |
 | `-otlp-bearer-token-file` | — | sends `Authorization: Bearer <token>` on either transport; re-read every minute, so rotated tokens work |
 | `-otlp-tls-ca-file` | — | PEM CA bundle for verifying the collector |
@@ -130,6 +131,10 @@ kubescrape-agent \
 | `-buffer-dir` | — | directory for a disk-backed export buffer (logs **and** metrics); a collector outage spools here instead of pinning the tailer to old offsets / dropping metrics ([below](#disk-buffer)). Empty disables |
 | `-buffer-max-bytes` | `1GiB` | per-signal cap on the undelivered on-disk backlog; producers back-pressure (the tailer rewinds) when full |
 | `-logs-exclude-namespaces` | — | comma-separated namespaces not tailed — **always exclude the namespace of your collector** to avoid feedback loops |
+| `-logs-rate-limit` | `0` | per-file line rate limit (lines/second, token bucket; 0 disables). An exhausted file is **paused** — reading stops until tokens refill, the backlog stays on disk, nothing is lost (rotation drains bypass the limiter) |
+| `-logs-rate-burst` | `0` | token bucket size (0 = 2× the rate) |
+| `-logs-rate-drop` | `false` | discard lines over the limit instead of pausing (lossy; counted in `kubescrape_log_rate_limited_total{action="drop"}`) |
+| `-logs-pipelined-export` | `false` | overlap reading with export delivery: one export in flight while the sweep keeps reading; its commit/rewind is applied before the next flush (at-least-once semantics unchanged) |
 | `-logs-metrics-interval` | `30s` | export interval for the `logMetrics` metrics ([below](#agent-log-metrics)) |
 | `-logs-metrics-max-bytes` | `3MiB` | export log-derived metrics in chunks below this many bytes (0 = one payload) |
 | `-logs-metrics-name-prefix` | — | prefix prepended to every log-derived metric name |
@@ -139,6 +144,11 @@ acknowledged the batch and never past lines still buffered in the multiline
 pipeline; on export failure the files rewind to the committed offset.
 Rotation handling (rename, copytruncate — including same-size rewrites —
 deletion) is automatic.
+
+Backlog is observable per node — `kubescrape_log_lag_bytes` (largest per-file
+backlog) and `kubescrape_log_lag_bytes_sum` on `/metrics` — and per file on
+`GET /debug/tailer` (path, container, read/committed offsets, lag,
+rate-limited flag; refreshed ~10s, largest lag first).
 
 ### Disk buffer
 
@@ -245,6 +255,38 @@ Per-source option:
 Caveat: a blank line inside a plain file is dropped, so multi-line formats that
 rely on a blank separator (Go panics) do not join for plain files;
 indentation-based traces (Python, Java, .NET) join normally.
+
+### Log rules (drop / keep / sample)
+
+The `logs` section's `rules` list filters exported records: ordered
+first-match-wins, no match keeps. Selectors use the **same DSL and key
+resolution as the `logMetrics` `match`/`matchRegexp`** — keys resolve against
+the record's attributes (line-derived + enriched) and the file's resource
+attributes, with the line's own JSON/logfmt fields as fallback; `__line__`
+matches the whole raw body and `__severity__` the enriched severity text
+(lowercased) — so "drop debug logs" needs no per-app parsing config:
+
+```yaml
+logs:
+  rules:
+    - action: keep                       # exceptions go before the drop they pierce
+      matchRegexp: ["__line__=(ERROR|FATAL)"]
+    - action: drop
+      match: ["__severity__=debug"]
+    - action: drop                       # noisy access logs from one namespace
+      match: ["k8s.namespace.name=ingress"]
+      matchRegexp: ["__line__=GET /healthz"]
+    - action: keep                       # keep 10% of a chatty matcher
+      matchRegexp: ["__line__=cache (hit|miss)"]
+      sample: 0.1                        # deterministic: every 10th matching line
+```
+
+Rules run **after** enrichment (so severity is matchable) and **after**
+`logMetrics` (so metrics still count every line — e.g. count errors while
+dropping them). Dropped records advance offsets exactly like exported ones and
+are counted in `kubescrape_log_rules_dropped_total`. `sample` is only valid on
+keep rules; a matching line beyond the sampled fraction is dropped. journald
+records are not filtered.
 
 ## Agent: log attributes
 

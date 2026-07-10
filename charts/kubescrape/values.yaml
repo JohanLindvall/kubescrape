@@ -21,6 +21,7 @@ service:
     otlp:
       endpoint: "otel-collector.monitoring:4317"
       protocol: grpc          # grpc | http
+      compression: gzip       # gzip | none
       insecure: true
       tlsInsecureSkipVerify: false
       caFile: ""
@@ -70,6 +71,7 @@ agent:
     grpcEndpoint: ":4317"       # empty disables gRPC
     httpEndpoint: ":4318"       # empty disables HTTP (/v1/logs, /v1/metrics)
     metricsMode: auto           # resource | datapoint | auto
+    logsEnrich: true
     logsEnrich: true            # parse pushed log bodies (fills only unset fields)
     containerIdKeys: []         # default: [container.id, k8s.container.id]
     podUidKeys: []              # default: [k8s.pod.uid]
@@ -81,6 +83,7 @@ agent:
   otlp:
     endpoint: "otel-collector.monitoring:4317"
     protocol: grpc          # grpc | http
+    compression: gzip       # gzip | none
     insecure: true
     tlsInsecureSkipVerify: false
     caFile: ""
@@ -102,6 +105,14 @@ agent:
   # Parse per-line metadata (timestamp, severity, trace/span IDs, exception
   # details) into the OTLP record fields (JohanLindvall/enrich).
   logsEnrich: true
+  # Per-file line rate limit (lines/second, 0 disables). Exhausted files
+  # pause (no loss, backlog stays on disk) unless logsRateDrop discards.
+  logsRateLimit: 0
+  logsRateBurst: 0            # 0 = 2x logsRateLimit
+  logsRateDrop: false
+  # Overlap reading with export delivery (one export in flight; at-least-once
+  # semantics unchanged).
+  logsPipelinedExport: false
   # Stamp log.file.name and log.file.position (byte offset) on every record,
   # for each file source.
   logsFileAttributes: false

@@ -42,6 +42,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -122,6 +123,25 @@ type Config struct {
 	// tailed (e.g. the observability namespace itself, to avoid feedback
 	// loops through the collector's own output).
 	ExcludeNamespaces []string
+	// RateLimit caps each file at this many lines per second (token bucket,
+	// 0 disables). By default an exhausted file is PAUSED — reading stops
+	// until tokens refill, leaving the backlog on disk (no loss; a rotation
+	// drain bypasses the limiter). RateDrop discards excess lines instead.
+	RateLimit float64
+	// RateBurst is the token bucket size (default 2x RateLimit).
+	RateBurst float64
+	// RateDrop discards lines over the limit instead of pausing the file.
+	RateDrop bool
+	// Rules filters exported records (ordered keep/drop/sample, nil = keep
+	// all). Evaluated after enrichment — severity is matchable via the
+	// synthetic __severity__ key — and after LogMetrics, so metrics still see
+	// every line. Dropped records advance offsets like exported ones.
+	Rules *metrics.LineFilter
+	// PipelinedExport overlaps reading with export delivery: one export may
+	// be in flight while the sweep keeps reading; its result (commit or
+	// rewind) is applied before the next flush. At-least-once semantics are
+	// unchanged. Off by default (exports happen inline in the sweep).
+	PipelinedExport bool
 	// Attrs builds the exported resource attributes (nil = defaults).
 	Attrs *attrs.Builder
 	// NodeInfo supplies the agent node's metadata for attribute templates
@@ -145,6 +165,18 @@ type Tailer struct {
 	lastFlush      time.Time
 	lastCheckpoint time.Time
 	retryBackoff   time.Duration // initial export retry backoff
+
+	// status is the published per-file snapshot for /debug/tailer (written by
+	// the sweep goroutine in publishStatus, read from HTTP handlers).
+	status      atomic.Pointer[[]FileStatus]
+	lastStatus  time.Time
+	statusEvery time.Duration // snapshot cadence (10s; tests shorten it)
+
+	// Pipelined export (Config.PipelinedExport): the worker channel and the
+	// single outstanding export, owned by the sweep goroutine (see
+	// pipelined.go). exportCh == nil means inline (synchronous) export.
+	exportCh chan *inflight
+	inflight *inflight
 
 	// Event-driven mode (nil watcher = pure polling).
 	watcher   *fsnotify.Watcher
@@ -219,6 +251,13 @@ type file struct {
 	resolved    bool
 	nextMetaTry time.Time
 	gone        bool
+
+	// Per-file line rate limiting (Config.RateLimit): a token bucket refilled
+	// by elapsed time. limited marks a paused file (tokens exhausted, reading
+	// suspended until they refill); drop mode discards lines instead.
+	tokens     float64
+	lastRefill time.Time
+	limited    bool
 }
 
 type logItem struct{ start, end int64 }
@@ -400,6 +439,9 @@ func New(cfg Config) *Tailer {
 	if cfg.MaxBytesPerSweep <= 0 {
 		cfg.MaxBytesPerSweep = 1 << 20
 	}
+	if cfg.RateLimit > 0 && cfg.RateBurst <= 0 {
+		cfg.RateBurst = 2 * cfg.RateLimit
+	}
 	if cfg.MultilineTimeout <= 0 {
 		cfg.MultilineTimeout = time.Second
 	}
@@ -426,6 +468,7 @@ func New(cfg Config) *Tailer {
 		scanDirs:     scanDirs,
 		files:        make(map[string]*file),
 		retryBackoff: time.Second,
+		statusEvery:  10 * time.Second,
 	}
 }
 
@@ -460,6 +503,11 @@ func (t *Tailer) Run(ctx context.Context) {
 		watchErrs = t.watcher.Errors
 	}
 
+	if t.cfg.PipelinedExport {
+		t.exportCh = make(chan *inflight)
+		go t.exportWorker()
+	}
+
 	t.scanDir(t.loadCheckpoints(), true)
 	t.lastFlush = time.Now()
 
@@ -477,6 +525,13 @@ func (t *Tailer) Run(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
+			// Settle any in-flight export and go synchronous for the final
+			// drain, so the last flush commits before checkpointing.
+			t.settleInflight()
+			if t.exportCh != nil {
+				close(t.exportCh)
+				t.exportCh = nil
+			}
 			t.sweep(context.Background(), true)
 			// Drain the pipelines; the emitted entries' offsets commit with
 			// the final flush, so nothing is re-read after a restart.
@@ -504,13 +559,17 @@ func (t *Tailer) Run(ctx context.Context) {
 	}
 }
 
-// housekeeping flushes and checkpoints on their intervals.
+// housekeeping flushes, checkpoints and publishes status on their intervals.
 func (t *Tailer) housekeeping(ctx context.Context) {
+	t.pollInflight()
 	if len(t.batch) > 0 && time.Since(t.lastFlush) >= t.cfg.FlushInterval {
 		t.flush(ctx)
 	}
 	if (t.cfg.Positions != nil || t.cfg.CheckpointFile != "") && time.Since(t.lastCheckpoint) >= 10*time.Second {
 		t.saveCheckpoints()
+	}
+	if time.Since(t.lastStatus) >= t.statusEvery {
+		t.publishStatus()
 	}
 }
 
@@ -893,10 +952,15 @@ func (t *Tailer) readFile(ctx context.Context, f *file) error {
 		t.feedCarriedPrefix(ctx, f)
 	}
 
+	// A paused (rate-limited) file first retries its retained pending bytes;
+	// reading resumes only once they drain.
+	if f.limited {
+		t.consume(ctx, f, false)
+	}
 	budget := t.cfg.MaxBytesPerSweep
 	buf := make([]byte, 64*1024)
 	read := 0
-	for budget > 0 {
+	for budget > 0 && !f.limited {
 		limit := min(len(buf), budget)
 		n, err := f.f.Read(buf[:limit])
 		if n > 0 {
@@ -905,7 +969,7 @@ func (t *Tailer) readFile(ctx context.Context, f *file) error {
 			obs.LogBytes.Add(float64(n))
 			f.pending = append(f.pending, buf[:n]...)
 			f.readPos += int64(n)
-			t.consume(ctx, f)
+			t.consume(ctx, f, false)
 		}
 		if err != nil {
 			if !errors.Is(err, io.EOF) {
@@ -915,10 +979,15 @@ func (t *Tailer) readFile(ctx context.Context, f *file) error {
 		}
 	}
 
-	// Rotation/truncation detection.
+	// Rotation/truncation detection. The rotation machinery must see settled
+	// export state (a failed in-flight export rewinds this file first).
 	st, err := os.Stat(f.path)
 	if err != nil {
 		return err
+	}
+	if inodeOf(st) != f.inode || st.Size() < f.readPos ||
+		(read == 0 && !st.ModTime().Equal(f.lastMod) && !f.fp.matches(f.f)) {
+		t.settle(f)
 	}
 	switch {
 	case inodeOf(st) != f.inode:
@@ -952,16 +1021,19 @@ func (t *Tailer) readArchive(ctx context.Context, f *file) error {
 			return err
 		}
 	}
+	if f.limited {
+		t.consume(ctx, f, false)
+	}
 	budget := t.cfg.MaxBytesPerSweep
 	buf := make([]byte, 64*1024)
-	for budget > 0 {
+	for budget > 0 && !f.limited {
 		n, err := f.gz.Read(buf[:min(len(buf), budget)])
 		if n > 0 {
 			budget -= n
 			obs.LogBytes.Add(float64(n))
 			f.pending = append(f.pending, buf[:n]...)
 			f.readPos += int64(n)
-			t.consume(ctx, f)
+			t.consume(ctx, f, false)
 		}
 		if err != nil {
 			if errors.Is(err, io.EOF) {
@@ -1044,7 +1116,9 @@ func (t *Tailer) drainFile(ctx context.Context, f *file) {
 			budget -= n
 			f.pending = append(f.pending, buf[:n]...)
 			f.readPos += int64(n)
-			t.consume(ctx, f)
+			// Bypass the rate limit: pausing a drain would lose the rotated
+			// inode's remainder when the fd is dropped.
+			t.consume(ctx, f, true)
 		}
 		if err != nil {
 			return
@@ -1054,7 +1128,9 @@ func (t *Tailer) drainFile(ctx context.Context, f *file) {
 }
 
 // consume splits pending bytes into physical lines and feeds the pipeline.
-func (t *Tailer) consume(ctx context.Context, f *file) {
+// unlimited bypasses the per-file rate limit (rotation drains, where pausing
+// would lose the remainder of the rotated-away inode).
+func (t *Tailer) consume(ctx context.Context, f *file, unlimited bool) {
 	for {
 		i := bytes.IndexByte(f.pending, '\n')
 		if i < 0 {
@@ -1065,6 +1141,22 @@ func (t *Tailer) consume(ctx context.Context, f *file) {
 			}
 			return
 		}
+		if !unlimited && !t.allowLine(f) {
+			if !t.cfg.RateDrop {
+				// Pause: keep pending, stop reading until tokens refill.
+				if !f.limited {
+					f.limited = true
+					obs.LogRateLimited.WithLabelValues("pause").Inc()
+				}
+				return
+			}
+			// Drop: discard the line, keep consuming.
+			f.pending = f.pending[i+1:]
+			f.lineStart += int64(i + 1)
+			obs.LogRateLimited.WithLabelValues("drop").Inc()
+			continue
+		}
+		f.limited = false
 		line := f.pending[:i]
 		start := f.lineStart
 		f.pending = f.pending[i+1:]
@@ -1075,6 +1167,26 @@ func (t *Tailer) consume(ctx context.Context, f *file) {
 		}
 		t.feedLine(ctx, f, string(line), start, f.lineStart)
 	}
+}
+
+// allowLine takes one token from the file's rate-limit bucket, refilling it by
+// elapsed time first. Always true when rate limiting is off.
+func (t *Tailer) allowLine(f *file) bool {
+	if t.cfg.RateLimit <= 0 {
+		return true
+	}
+	now := time.Now()
+	if f.lastRefill.IsZero() {
+		f.tokens = t.cfg.RateBurst
+	} else {
+		f.tokens = min(t.cfg.RateBurst, f.tokens+now.Sub(f.lastRefill).Seconds()*t.cfg.RateLimit)
+	}
+	f.lastRefill = now
+	if f.tokens < 1 {
+		return false
+	}
+	f.tokens--
+	return true
 }
 
 // ensureOpen opens the file at the committed offset on first use. The
@@ -1273,6 +1385,7 @@ func (t *Tailer) findRotated(f *file, p rotatedPrefix) (string, bool) {
 // drop closes a removed file, draining first the fd (bytes appended since
 // the last read) and then the pipeline.
 func (t *Tailer) drop(f *file) {
+	t.settle(f) // a failed in-flight export must rewind before we drain
 	if f.resolved {
 		if !f.compressed {
 			t.drainFile(context.Background(), f) // archives are complete; nothing to drain
@@ -1334,15 +1447,28 @@ func (g *logGrouper) newScope(f *file, resAttrs, scopeAttrs []logattrs.Attr) plo
 // closures.
 type metricResolver struct {
 	rec, res pcommon.Map
+	sev      string // lowercased severity text, for __severity__
 	labelFn  func(string) string
 	valueFn  func(string) float64
+	ruleFn   func(string) string
 }
 
 func newMetricResolver() *metricResolver {
 	r := &metricResolver{}
 	r.labelFn = r.label
 	r.valueFn = r.value
+	r.ruleFn = r.ruleLookup
 	return r
+}
+
+// ruleLookup is the label resolver for log rules: the synthetic __severity__
+// key (the enriched severity text, lowercased) plus the usual record/resource
+// attribute chain.
+func (r *metricResolver) ruleLookup(k string) string {
+	if k == "__severity__" {
+		return r.sev
+	}
+	return r.label(k)
 }
 
 func (r *metricResolver) lookup(k string) (pcommon.Value, bool) {
@@ -1378,6 +1504,9 @@ func (r *metricResolver) value(k string) float64 {
 // flush exports the batch. On success offsets are committed; on failure the
 // files are rewound to the committed offsets so the data is re-read.
 func (t *Tailer) flush(ctx context.Context) {
+	// Apply the previous pipelined export's result first: a failure rewinds
+	// its files and purges their read-ahead entries from this batch.
+	t.settleInflight()
 	if len(t.batch) == 0 {
 		t.lastFlush = time.Now()
 		return
@@ -1385,16 +1514,25 @@ func (t *Tailer) flush(ctx context.Context) {
 	ld := plog.NewLogs()
 	g := &logGrouper{ld: ld, plain: map[*file]plog.ScopeLogs{}, scopes: map[string]plog.ScopeLogs{}}
 	maxOffsets := make(map[*file]int64)
+	gens := make(map[*file]int)
 	touched := make(map[*file]struct{})
 	now := pcommon.NewTimestampFromTime(time.Now())
 	// Per-file bound metric state (resource hash computed once per file) and
 	// one reusable key resolver for the whole flush.
 	var bound map[*file]metrics.BoundResource
 	var resolver *metricResolver
-	if t.cfg.LogMetrics != nil {
+	if t.cfg.LogMetrics != nil || t.cfg.Rules != nil {
 		bound = make(map[*file]metrics.BoundResource)
 		resolver = newMetricResolver()
 	}
+	// With rules configured, records are built in a one-record scratch slice
+	// and only MOVED into the batch when kept, so drops never materialize a
+	// resource/scope. Without rules they are built in place, as before.
+	var scratch plog.LogRecordSlice
+	if t.cfg.Rules != nil {
+		scratch = plog.NewLogs().ResourceLogs().AppendEmpty().ScopeLogs().AppendEmpty().LogRecords()
+	}
+	kept := 0
 	for _, e := range t.batch {
 		// Extract configured line attributes; resource/scope ones drive the
 		// grouping so records land under the right ResourceLogs/ScopeLogs.
@@ -1402,8 +1540,13 @@ func (t *Tailer) flush(ctx context.Context) {
 		if t.cfg.LogAttrs != nil {
 			extracted = t.cfg.LogAttrs.Extract(e.body)
 		}
-		slr := g.scope(e.file, extracted.Resource, extracted.Scope)
-		lr := slr.LogRecords().AppendEmpty()
+		var lr plog.LogRecord
+		if t.cfg.Rules != nil {
+			lr = scratch.AppendEmpty()
+		} else {
+			lr = g.scope(e.file, extracted.Resource, extracted.Scope).LogRecords().AppendEmpty()
+			kept++
+		}
 		lr.SetTimestamp(pcommon.NewTimestampFromTime(e.time))
 		lr.SetObservedTimestamp(now)
 		lr.Body().SetStr(e.body)
@@ -1437,7 +1580,19 @@ func (t *Tailer) flush(ctx context.Context) {
 			resolver.rec, resolver.res = lr.Attributes(), e.file.resource.Attributes()
 			b.Add(resolver.valueFn, resolver.labelFn, e.body)
 		}
+		if t.cfg.Rules != nil {
+			resolver.rec, resolver.res = lr.Attributes(), e.file.resource.Attributes()
+			resolver.sev = strings.ToLower(lr.SeverityText())
+			if t.cfg.Rules.Keep(resolver.ruleFn, e.body) {
+				scratch.MoveAndAppendTo(g.scope(e.file, extracted.Resource, extracted.Scope).LogRecords())
+				kept++
+			} else {
+				scratch.RemoveIf(func(plog.LogRecord) bool { return true })
+				obs.LogRulesDropped.Inc()
+			}
+		}
 		touched[e.file] = struct{}{}
+		gens[e.file] = e.file.gen
 		// Only entries of the file's current rotation generation advance its
 		// checkpoint; pre-rotation entries carry old-inode offsets recoverable
 		// via file.carried and must not move the new inode's commit point.
@@ -1446,37 +1601,29 @@ func (t *Tailer) flush(ctx context.Context) {
 		}
 	}
 
-	if err := t.exportWithRetry(ctx, ld); err != nil {
-		t.log.Error("exporting logs failed, rewinding", "records", len(t.batch), "error", err)
-		obs.LogExportFailures.Inc()
-		for f := range touched {
-			t.rewind(f)
-		}
-	} else {
-		obs.LogEntries.Add(float64(len(t.batch)))
-		for f := range touched {
-			if off, ok := maxOffsets[f]; ok {
-				// Never commit past lines still buffered in the pipeline; they
-				// have not been exported yet.
-				if wm, wok := f.watermark(); wok && wm < off {
-					off = wm
-				}
-				if off > f.committed {
-					f.committed = off
-				}
-			}
-			// Once the carried group has fully drained (nothing buffered), its
-			// record has been exported, so the rotated-away prefix is no longer
-			// needed for recovery.
-			if f.carried != nil {
-				if _, wok := f.watermark(); !wok {
-					f.carried = nil
-				}
-			}
-		}
+	inf := &inflight{
+		ctx: ctx, ld: ld, kept: kept,
+		offsets: maxOffsets, gens: gens, touched: touched,
+		done: make(chan struct{}),
 	}
 	t.batch = t.batch[:0]
 	t.lastFlush = time.Now()
+	// An all-dropped batch has nothing to send but its offsets still commit.
+	if kept > 0 && t.exportCh != nil {
+		// Pipelined: hand off and keep reading; the result is applied at the
+		// next flush (or when a rotation/drop settles it earlier).
+		t.inflight = inf
+		t.exportCh <- inf
+		return
+	}
+	if kept > 0 {
+		inf.err = t.exportWithRetry(ctx, ld)
+	}
+	if inf.err != nil {
+		t.failBatch(inf)
+	} else {
+		t.commitBatch(inf)
+	}
 }
 
 func (t *Tailer) exportWithRetry(ctx context.Context, ld plog.Logs) error {

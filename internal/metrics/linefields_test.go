@@ -2,6 +2,8 @@ package metrics
 
 import (
 	"context"
+	"fmt"
+	"sync"
 	"testing"
 	"time"
 )
@@ -111,5 +113,101 @@ func TestCallerLookupWinsOverLine(t *testing.T) {
 	}
 	if found != "from-resource" {
 		t.Errorf("pod = %q, want from-resource (caller lookup wins)", found)
+	}
+}
+
+func TestRawScalarString(t *testing.T) {
+	// The raw-token renderer must match what DecodeAny + a type switch
+	// produced: strings unescaped, bools as literals, numbers round-tripped
+	// through float64; objects/arrays/null/malformed rejected.
+	cases := []struct {
+		raw  string
+		want string
+		ok   bool
+	}{
+		{`"plain"`, "plain", true},
+		{`"esc\"aped\n"`, "esc\"aped\n", true},
+		{`"unicode é"`, "unicode é", true},
+		{`true`, "true", true},
+		{`false`, "false", true},
+		{`42`, "42", true},
+		{`42.50`, "42.5", true}, // float64 round-trip, as before
+		{`-0.125`, "-0.125", true},
+		{`1e3`, "1000", true},
+		{`null`, "", false},
+		{`{"a":1}`, "", false},
+		{`[1,2]`, "", false},
+		{`"unterminated`, "", false},
+		{`truthy`, "", false},
+		{`falsey`, "", false},
+		{`not-a-number`, "", false},
+	}
+	for _, c := range cases {
+		got, ok := rawScalarString([]byte(c.raw))
+		if ok != c.ok || got != c.want {
+			t.Errorf("rawScalarString(%q) = %q,%v want %q,%v", c.raw, got, ok, c.want, c.ok)
+		}
+	}
+}
+
+func TestAddConcurrent(t *testing.T) {
+	// Exercise the pooled per-line contexts (bound closures, scratch reuse)
+	// under concurrency; run with -race to verify no shared state leaks
+	// between goroutines.
+	setTimeForTest(time.Unix(1_700_100_300, 0))
+	defer testEpoch.Store(0)
+	set, err := NewDynamicMetricSet([]Dynamic{{
+		Name:   "reqs_total",
+		Type:   CounterType,
+		Value:  "1",
+		Match:  []string{"level=info"},
+		Labels: []string{"status=$status"},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var wg sync.WaitGroup
+	for g := 0; g < 8; g++ {
+		wg.Add(1)
+		go func(g int) {
+			defer wg.Done()
+			status := fmt.Sprintf("%d", 200+g)
+			lookup := func(k string) string {
+				switch k {
+				case "level":
+					return "info"
+				case "status":
+					return status
+				}
+				return ""
+			}
+			for i := 0; i < 500; i++ {
+				set.Add(nil, lookup, noRes(), "")
+			}
+		}(g)
+	}
+	wg.Wait()
+
+	m := exportOne(t, set, "reqs_total")
+	var total float64
+	real := map[string]bool{} // fresh counters also emit synthetic zero baseline points
+	dps := m.Sum().DataPoints()
+	for i := 0; i < dps.Len(); i++ {
+		dp := dps.At(i)
+		total += dp.DoubleValue()
+		switch dp.DoubleValue() {
+		case 500:
+			v, _ := dp.Attributes().Get("status")
+			real[v.Str()] = true
+		case 0: // baseline
+		default:
+			t.Errorf("data point value = %v, want 0 (baseline) or 500", dp.DoubleValue())
+		}
+	}
+	if total != 8*500 {
+		t.Errorf("total = %v, want %d", total, 8*500)
+	}
+	if len(real) != 8 {
+		t.Errorf("series = %d (%v), want 8 (one per status)", len(real), real)
 	}
 }

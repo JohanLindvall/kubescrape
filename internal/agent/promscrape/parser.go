@@ -78,6 +78,18 @@ type Sample struct {
 // exhaust memory through unique # TYPE lines.
 const maxTrackedFamilies = 100_000
 
+// Interning bounds: metric and label names are low-cardinality and repeat on
+// nearly every line; label values (namespace, pod, le, code, ...) repeat
+// heavily in Kubernetes-style expositions. Both tables live for one scrape.
+// A value longer than maxInternedValueLen or arriving after the table is full
+// is allocated normally, so pathological inputs degrade to the non-interned
+// cost instead of growing memory.
+const (
+	maxInternedNames    = maxTrackedFamilies
+	maxInternedValues   = 8192
+	maxInternedValueLen = 128
+)
+
 // Parser parses one scrape body. Not safe for concurrent use; create one per
 // scrape.
 type Parser struct {
@@ -90,8 +102,10 @@ type Parser struct {
 	exemplars bool
 
 	types    map[string]MetricType
-	labels   []Label // reused between lines
-	exLabels []Label // reused between lines
+	names    map[string]string // interned metric/label names
+	values   map[string]string // interned label values
+	labels   []Label           // reused between lines
+	exLabels []Label           // reused between lines
 	exemplar Exemplar
 	scratch  []byte // for lines spanning bufio reads
 	eof      bool   // saw "# EOF"
@@ -106,7 +120,49 @@ func NewParser(maxLineBytes int, openMetrics, withExemplars bool) *Parser {
 		openMetrics:  openMetrics,
 		exemplars:    openMetrics && withExemplars,
 		types:        make(map[string]MetricType),
+		names:        make(map[string]string),
 	}
+}
+
+// internName returns a canonical string for a metric or label name. The
+// map[string(b)] lookup does not allocate; only a first-seen name does.
+func (p *Parser) internName(b []byte) string {
+	if s, ok := p.names[string(b)]; ok {
+		return s
+	}
+	s := string(b)
+	if len(p.names) < maxInternedNames {
+		p.names[s] = s
+	}
+	return s
+}
+
+// internValue returns a canonical string for a label value, deduplicating the
+// heavy repetition of k8s-style values across a scrape's series.
+func (p *Parser) internValue(b []byte) string {
+	if len(b) > maxInternedValueLen {
+		return string(b)
+	}
+	if s, ok := p.values[string(b)]; ok {
+		return s
+	}
+	s := string(b)
+	if p.values == nil {
+		p.values = make(map[string]string, 256)
+	}
+	if len(p.values) < maxInternedValues {
+		p.values[s] = s
+	}
+	return s
+}
+
+// skipSpaceTab trims leading spaces and tabs (a hand-rolled bytes.TrimLeft:
+// the stdlib builds an ASCII set per call, which dominated parse CPU).
+func skipSpaceTab(b []byte) []byte {
+	for len(b) > 0 && (b[0] == ' ' || b[0] == '\t') {
+		b = b[1:]
+	}
+	return b
 }
 
 // Parse reads the exposition text from r, invoking emit for every sample.
@@ -183,7 +239,7 @@ func trimEOL(b []byte) []byte {
 
 // parseLine handles one line; ok is false for malformed sample lines.
 func (p *Parser) parseLine(line []byte, emit func(Sample) error, emitErr *error) bool {
-	line = bytes.TrimLeft(line, " \t")
+	line = skipSpaceTab(line)
 	if len(line) == 0 {
 		return true
 	}
@@ -290,7 +346,7 @@ func (p *Parser) parseSample(line []byte) (Sample, bool) {
 	if i == 0 {
 		return s, false
 	}
-	s.Name = string(line[:i])
+	s.Name = p.internName(line[:i])
 	rest := line[i:]
 
 	// Labels.
@@ -312,13 +368,13 @@ func (p *Parser) parseSample(line []byte) (Sample, bool) {
 	}
 
 	// Optional timestamp.
-	rest = bytes.TrimLeft(rest, " \t")
+	rest = skipSpaceTab(rest)
 	if len(rest) > 0 && rest[0] != '#' {
 		s.TimestampMs, rest, ok = p.parseTimestampToken(rest)
 		if !ok {
 			return s, false
 		}
-		rest = bytes.TrimLeft(rest, " \t")
+		rest = skipSpaceTab(rest)
 	}
 
 	// Optional exemplar (OpenMetrics).
@@ -341,7 +397,7 @@ func (p *Parser) parseSample(line []byte) (Sample, bool) {
 // parseExemplar parses "{labels} value [timestamp]" into the parser's
 // reusable exemplar.
 func (p *Parser) parseExemplar(rest []byte) (*Exemplar, bool) {
-	rest = bytes.TrimLeft(rest, " \t")
+	rest = skipSpaceTab(rest)
 	if len(rest) == 0 || rest[0] != '{' {
 		return nil, false
 	}
@@ -355,10 +411,10 @@ func (p *Parser) parseExemplar(rest []byte) (*Exemplar, bool) {
 	if !ok {
 		return nil, false
 	}
-	rest = bytes.TrimLeft(rest, " \t")
+	rest = skipSpaceTab(rest)
 	if len(rest) > 0 {
 		p.exemplar.TimestampMs, rest, ok = p.parseTimestampToken(rest)
-		if !ok || len(bytes.TrimLeft(rest, " \t")) > 0 {
+		if !ok || len(skipSpaceTab(rest)) > 0 {
 			return nil, false
 		}
 	}
@@ -367,7 +423,7 @@ func (p *Parser) parseExemplar(rest []byte) (*Exemplar, bool) {
 
 // parseFloatToken reads one whitespace-delimited float.
 func (p *Parser) parseFloatToken(rest []byte) (float64, []byte, bool) {
-	rest = bytes.TrimLeft(rest, " \t")
+	rest = skipSpaceTab(rest)
 	i := 0
 	for i < len(rest) && rest[i] != ' ' && rest[i] != '\t' {
 		i++
@@ -412,7 +468,7 @@ func (p *Parser) parseTimestampToken(rest []byte) (int64, []byte, bool) {
 // remainder after the closing '}'.
 func (p *Parser) parseLabels(rest []byte, dst *[]Label) ([]byte, bool) {
 	for {
-		rest = bytes.TrimLeft(rest, " \t")
+		rest = skipSpaceTab(rest)
 		if len(rest) == 0 {
 			return nil, false
 		}
@@ -427,21 +483,21 @@ func (p *Parser) parseLabels(rest []byte, dst *[]Label) ([]byte, bool) {
 		if i == 0 {
 			return nil, false
 		}
-		name := string(rest[:i])
-		rest = bytes.TrimLeft(rest[i:], " \t")
+		name := p.internName(rest[:i])
+		rest = skipSpaceTab(rest[i:])
 		if len(rest) == 0 || rest[0] != '=' {
 			return nil, false
 		}
-		rest = bytes.TrimLeft(rest[1:], " \t")
+		rest = skipSpaceTab(rest[1:])
 		if len(rest) == 0 || rest[0] != '"' {
 			return nil, false
 		}
-		value, rem, ok := parseQuoted(rest[1:])
+		value, rem, ok := p.parseQuoted(rest[1:])
 		if !ok {
 			return nil, false
 		}
 		*dst = append(*dst, Label{Name: name, Value: value})
-		rest = bytes.TrimLeft(rem, " \t")
+		rest = skipSpaceTab(rem)
 		if len(rest) > 0 && rest[0] == ',' {
 			rest = rest[1:]
 		}
@@ -450,13 +506,13 @@ func (p *Parser) parseLabels(rest []byte, dst *[]Label) ([]byte, bool) {
 
 // parseQuoted parses an escaped label value after the opening quote,
 // returning the value and the remainder after the closing quote. The common
-// escape-free case does not allocate beyond the final string.
-func parseQuoted(rest []byte) (string, []byte, bool) {
+// escape-free case is interned, so a repeated value does not allocate.
+func (p *Parser) parseQuoted(rest []byte) (string, []byte, bool) {
 	// Fast path: no backslashes before the closing quote.
 	for i := 0; i < len(rest); i++ {
 		switch rest[i] {
 		case '"':
-			return string(rest[:i]), rest[i+1:], true
+			return p.internValue(rest[:i]), rest[i+1:], true
 		case '\\':
 			return parseQuotedSlow(rest)
 		}

@@ -16,6 +16,7 @@ import (
 type lineFields struct {
 	line   string
 	values map[string]string
+	raws   [][]byte // reused GetPaths output buffer
 	parsed bool
 }
 
@@ -28,22 +29,23 @@ func (lf *lineFields) reset(line string) {
 }
 
 // keyIndex holds, for a DynamicMetricSet, the distinct line-field keys its
-// rules reference and their dotted JSON paths (parallel slices).
+// rules reference and their dotted JSON paths (parallel slices). want mirrors
+// keys as a set for the logfmt scan (precomputed once, not per line).
 type keyIndex struct {
 	keys  []string
 	paths [][]string
+	want  map[string]bool
 }
 
 // newKeyIndex collects the distinct field keys referenced across rules: label
 // getters, the observed value, and selector labels.
 func newKeyIndex(rules []*metricRule) keyIndex {
-	seen := map[string]bool{}
-	var ki keyIndex
+	ki := keyIndex{want: map[string]bool{}}
 	add := func(key string) {
-		if key == "" || key == "1" || key == lineKey || seen[key] {
+		if key == "" || key == "1" || key == lineKey || ki.want[key] {
 			return
 		}
-		seen[key] = true
+		ki.want[key] = true
 		ki.keys = append(ki.keys, key)
 		ki.paths = append(ki.paths, strings.Split(key, "."))
 	}
@@ -84,18 +86,19 @@ func (ki keyIndex) get(lf *lineFields, key string) string {
 // starts with '{', otherwise logfmt (flat keys only).
 func (ki keyIndex) parse(lf *lineFields) {
 	if t := strings.TrimSpace(lf.line); strings.HasPrefix(t, "{") {
-		raws, err := ljson.GetPaths([]byte(t), ki.paths, nil)
+		// Read-only view: GetPaths only reads the buffer; its outputs alias it.
+		buf := unsafe.Slice(unsafe.StringData(t), len(t))
+		raws, err := ljson.GetPaths(buf, ki.paths, lf.raws)
+		lf.raws = raws
 		if err != nil {
 			return
 		}
 		for i, raw := range raws {
-			if raw == nil {
+			if len(raw) == 0 {
 				continue
 			}
-			if v, err := ljson.DecodeAny(raw); err == nil {
-				if s, ok := scalarString(v); ok {
-					lf.values[ki.keys[i]] = s
-				}
+			if s, ok := rawScalarString(raw); ok {
+				lf.values[ki.keys[i]] = s
 			}
 		}
 		return
@@ -103,30 +106,43 @@ func (ki keyIndex) parse(lf *lineFields) {
 	if strings.IndexByte(lf.line, '=') < 0 {
 		return
 	}
-	want := map[string]bool{}
-	for _, k := range ki.keys {
-		want[k] = true
-	}
 	buf := unsafe.Slice(unsafe.StringData(lf.line), len(lf.line))
 	_ = logfmt.Iterate(buf, func(key, val []byte) bool {
-		if want[string(key)] {
+		if ki.want[string(key)] {
 			lf.values[string(key)] = string(val)
 		}
 		return true
 	})
 }
 
-// scalarString renders a lightning-decoded scalar as a string; objects, arrays
-// and null are rejected.
-func scalarString(v any) (string, bool) {
-	switch t := v.(type) {
-	case string:
-		return t, true
-	case bool:
-		return strconv.FormatBool(t), true
-	case float64:
-		return strconv.FormatFloat(t, 'f', -1, 64), true
-	default:
+// rawScalarString renders a raw JSON scalar token as a string; objects, arrays
+// and null are rejected. It matches what DecodeAny + a type switch produced
+// (numbers round-trip through float64) without boxing the value in an any.
+func rawScalarString(raw []byte) (string, bool) {
+	switch raw[0] {
+	case '"':
+		if len(raw) < 2 || raw[len(raw)-1] != '"' {
+			return "", false
+		}
+		s, err := ljson.UnescapeString(raw[1 : len(raw)-1])
+		return s, err == nil
+	case 't':
+		if string(raw) == "true" { // comparison does not allocate
+			return "true", true
+		}
 		return "", false
+	case 'f':
+		if string(raw) == "false" {
+			return "false", true
+		}
+		return "", false
+	case '{', '[', 'n':
+		return "", false
+	default: // number
+		f, err := ljson.ParseFloat(raw)
+		if err != nil {
+			return "", false
+		}
+		return strconv.FormatFloat(f, 'f', -1, 64), true
 	}
 }

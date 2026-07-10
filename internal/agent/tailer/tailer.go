@@ -1291,25 +1291,88 @@ func (t *Tailer) drop(f *file) {
 // logGrouper places records into ResourceLogs/ScopeLogs keyed by (file,
 // resource attributes, scope attributes), so line-derived resource/scope
 // attributes split records into the right resources. Without line attributes
-// there is one scope per file, matching the previous behavior.
+// there is one scope per file (the plain map — the common case, avoiding the
+// per-record key formatting), matching the previous behavior.
 type logGrouper struct {
 	ld     plog.Logs
+	plain  map[*file]plog.ScopeLogs
 	scopes map[string]plog.ScopeLogs
 }
 
 func (g *logGrouper) scope(f *file, resAttrs, scopeAttrs []logattrs.Attr) plog.ScopeLogs {
+	if len(resAttrs) == 0 && len(scopeAttrs) == 0 {
+		if sl, ok := g.plain[f]; ok {
+			return sl
+		}
+		sl := g.newScope(f, nil, nil)
+		g.plain[f] = sl
+		return sl
+	}
 	key := fmt.Sprintf("%p\x01%s\x01%s", f, logattrs.Key(resAttrs), logattrs.Key(scopeAttrs))
 	if sl, ok := g.scopes[key]; ok {
 		return sl
 	}
+	sl := g.newScope(f, resAttrs, scopeAttrs)
+	g.scopes[key] = sl
+	return sl
+}
+
+func (g *logGrouper) newScope(f *file, resAttrs, scopeAttrs []logattrs.Attr) plog.ScopeLogs {
 	rl := g.ld.ResourceLogs().AppendEmpty()
 	f.resource.CopyTo(rl.Resource())
 	logattrs.Put(rl.Resource().Attributes(), resAttrs)
 	sl := rl.ScopeLogs().AppendEmpty()
 	sl.Scope().SetName("github.com/JohanLindvall/kubescrape/agent/tailer")
 	logattrs.Put(sl.Scope().Attributes(), scopeAttrs)
-	g.scopes[key] = sl
 	return sl
+}
+
+// metricResolver resolves metric label/value keys for one record: the record's
+// attributes (line-derived + enriched) first, then the file's resource
+// attributes (k8s metadata). The two closures are bound once per flush; per
+// record only the rec/res fields change, so record evaluation allocates no
+// closures.
+type metricResolver struct {
+	rec, res pcommon.Map
+	labelFn  func(string) string
+	valueFn  func(string) float64
+}
+
+func newMetricResolver() *metricResolver {
+	r := &metricResolver{}
+	r.labelFn = r.label
+	r.valueFn = r.value
+	return r
+}
+
+func (r *metricResolver) lookup(k string) (pcommon.Value, bool) {
+	if v, ok := r.rec.Get(k); ok {
+		return v, true
+	}
+	return r.res.Get(k)
+}
+
+func (r *metricResolver) label(k string) string {
+	if v, ok := r.lookup(k); ok {
+		return v.AsString()
+	}
+	return ""
+}
+
+func (r *metricResolver) value(k string) float64 {
+	v, ok := r.lookup(k)
+	if !ok {
+		return 0
+	}
+	switch v.Type() {
+	case pcommon.ValueTypeDouble:
+		return v.Double()
+	case pcommon.ValueTypeInt:
+		return float64(v.Int())
+	default:
+		f, _ := strconv.ParseFloat(v.AsString(), 64)
+		return f
+	}
 }
 
 // flush exports the batch. On success offsets are committed; on failure the
@@ -1320,10 +1383,18 @@ func (t *Tailer) flush(ctx context.Context) {
 		return
 	}
 	ld := plog.NewLogs()
-	g := &logGrouper{ld: ld, scopes: map[string]plog.ScopeLogs{}}
+	g := &logGrouper{ld: ld, plain: map[*file]plog.ScopeLogs{}, scopes: map[string]plog.ScopeLogs{}}
 	maxOffsets := make(map[*file]int64)
 	touched := make(map[*file]struct{})
 	now := pcommon.NewTimestampFromTime(time.Now())
+	// Per-file bound metric state (resource hash computed once per file) and
+	// one reusable key resolver for the whole flush.
+	var bound map[*file]metrics.BoundResource
+	var resolver *metricResolver
+	if t.cfg.LogMetrics != nil {
+		bound = make(map[*file]metrics.BoundResource)
+		resolver = newMetricResolver()
+	}
 	for _, e := range t.batch {
 		// Extract configured line attributes; resource/scope ones drive the
 		// grouping so records land under the right ResourceLogs/ScopeLogs.
@@ -1357,36 +1428,14 @@ func (t *Tailer) flush(ctx context.Context) {
 			// Metric label/value keys resolve against the record's attributes
 			// (line-derived + enriched) first, then the file's resource
 			// attributes (k8s metadata); the file's resource attributes become
-			// the metric's OTLP resource.
-			recAttrs, resAttrs := lr.Attributes(), e.file.resource.Attributes()
-			lookup := func(k string) (pcommon.Value, bool) {
-				if v, ok := recAttrs.Get(k); ok {
-					return v, true
-				}
-				return resAttrs.Get(k)
+			// the metric's OTLP resource (hashed once per file via Bind).
+			b, ok := bound[e.file]
+			if !ok {
+				b = t.cfg.LogMetrics.Bind(e.file.resource.Attributes())
+				bound[e.file] = b
 			}
-			labels := func(k string) string {
-				if v, ok := lookup(k); ok {
-					return v.AsString()
-				}
-				return ""
-			}
-			values := func(k string) float64 {
-				v, ok := lookup(k)
-				if !ok {
-					return 0
-				}
-				switch v.Type() {
-				case pcommon.ValueTypeDouble:
-					return v.Double()
-				case pcommon.ValueTypeInt:
-					return float64(v.Int())
-				default:
-					f, _ := strconv.ParseFloat(v.AsString(), 64)
-					return f
-				}
-			}
-			t.cfg.LogMetrics.Add(values, labels, resAttrs, e.body)
+			resolver.rec, resolver.res = lr.Attributes(), e.file.resource.Attributes()
+			b.Add(resolver.valueFn, resolver.labelFn, e.body)
 		}
 		touched[e.file] = struct{}{}
 		// Only entries of the file's current rotation generation advance its

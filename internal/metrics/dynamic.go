@@ -311,12 +311,48 @@ type DynamicMetricSet struct {
 	Count int
 }
 
-// addContext is the per-line scratch state pooled across Add calls.
+// addContext is the per-line scratch state pooled across Add calls. labelFn
+// and valueFn are bound once at construction (closing over the context) so a
+// line's evaluation allocates no closures; the per-line inputs live in the
+// set/values/lookup/raw fields.
 type addContext struct {
 	ctx  matchContext
 	buf  labels // data-point labels
 	rbuf labels // resource labels
 	line lineFields
+
+	set     *DynamicMetricSet
+	values  func(string) float64
+	lookup  func(string) string
+	raw     string
+	labelFn func(string) string
+	valueFn func(string) float64
+}
+
+// labelLookup resolves a label key: the synthetic __line__ key is the whole
+// raw line; otherwise the caller's own lookup (record/resource attributes)
+// wins and the line's parsed fields are the fallback.
+func (ac *addContext) labelLookup(key string) string {
+	if key == lineKey {
+		return ac.raw
+	}
+	if ac.lookup != nil {
+		if v := ac.lookup(key); v != "" {
+			return v
+		}
+	}
+	return ac.set.keys.get(&ac.line, key)
+}
+
+// valueLookup resolves a numeric key the same way.
+func (ac *addContext) valueLookup(key string) float64 {
+	if ac.values != nil {
+		if v := ac.values(key); v != 0 {
+			return v
+		}
+	}
+	f, _ := strconv.ParseFloat(ac.set.keys.get(&ac.line, key), 64)
+	return f
 }
 
 // NewDynamicMetricSet compiles a metric specification into an evaluatable set.
@@ -327,10 +363,14 @@ func NewDynamicMetricSet(metrics []Dynamic, opts ...Option) (*DynamicMetricSet, 
 		opt(&cfg)
 	}
 
-	set := &DynamicMetricSet{
-		pool: sync.Pool{New: func() any { return &addContext{buf: make(labels, 0, 16), rbuf: make(labels, 0, 8)} }},
-		log:  cfg.log,
-	}
+	set := &DynamicMetricSet{log: cfg.log}
+	set.pool = sync.Pool{New: func() any {
+		ac := &addContext{buf: make(labels, 0, 16), rbuf: make(labels, 0, 8), set: set}
+		// Bind the lookup closures once; per-line state flows through fields.
+		ac.labelFn = ac.labelLookup
+		ac.valueFn = ac.valueLookup
+		return ac
+	}}
 	byName := map[string]*series{}
 	for i := range metrics {
 		rule, err := compileRule(&metrics[i], &cfg, byName)
@@ -413,38 +453,47 @@ func (s *DynamicMetricSet) Add(values func(string) float64, lookup func(string) 
 	if s == nil || len(s.rules) == 0 {
 		return
 	}
+	s.add(values, lookup, resource, resourceAccum(resource), line)
+}
+
+// BoundResource is a DynamicMetricSet bound to one resource, with the
+// resource's hash precomputed — use it to Add many lines sharing the same
+// resource attributes (e.g. all records of one file in a flush) without
+// re-hashing the resource per line.
+type BoundResource struct {
+	set   *DynamicMetricSet
+	res   pcommon.Map
+	accum uint64
+}
+
+// Bind precomputes the per-resource state for repeated Adds. Safe on a nil
+// set (Add becomes a no-op).
+func (s *DynamicMetricSet) Bind(resource pcommon.Map) BoundResource {
+	b := BoundResource{set: s, res: resource}
+	if s != nil && len(s.rules) > 0 {
+		b.accum = resourceAccum(resource)
+	}
+	return b
+}
+
+// Add evaluates every rule against one line, as DynamicMetricSet.Add.
+func (b BoundResource) Add(values func(string) float64, lookup func(string) string, line string) {
+	if b.set == nil || len(b.set.rules) == 0 {
+		return
+	}
+	b.set.add(values, lookup, b.res, b.accum, line)
+}
+
+func (s *DynamicMetricSet) add(values func(string) float64, lookup func(string) string, resource pcommon.Map, resAccum uint64, line string) {
 	ac := s.pool.Get().(*addContext)
 	ac.ctx.reset()
 	ac.line.reset(line)
-	resAccum := resourceAccum(resource)
-
-	// The synthetic __line__ key is the whole raw line; otherwise the caller's
-	// own lookup (record/resource attributes) wins and the line's parsed fields
-	// are the fallback for keys it does not resolve.
-	labelLookup := func(key string) string {
-		if key == lineKey {
-			return line
-		}
-		if lookup != nil {
-			if v := lookup(key); v != "" {
-				return v
-			}
-		}
-		return s.keys.get(&ac.line, key)
-	}
-	valueLookup := func(key string) float64 {
-		if values != nil {
-			if v := values(key); v != 0 {
-				return v
-			}
-		}
-		f, _ := strconv.ParseFloat(s.keys.get(&ac.line, key), 64)
-		return f
-	}
+	ac.values, ac.lookup, ac.raw = values, lookup, line
 
 	for _, rule := range s.rules {
-		ac.buf, ac.rbuf = rule.observe(valueLookup, labelLookup, resource, resAccum, line, &ac.ctx, ac.buf, ac.rbuf)
+		ac.buf, ac.rbuf = rule.observe(ac.valueFn, ac.labelFn, resource, resAccum, line, &ac.ctx, ac.buf, ac.rbuf)
 	}
+	ac.values, ac.lookup, ac.raw = nil, nil, "" // do not retain caller state in the pool
 	s.pool.Put(ac)
 }
 

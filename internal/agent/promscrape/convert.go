@@ -3,6 +3,7 @@ package promscrape
 import (
 	"encoding/hex"
 	"math"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -36,6 +37,8 @@ type converter struct {
 	hists  map[string]*histAcc
 	summs  map[string]*summAcc
 	order  []string // first-seen emit order of label sets in the family
+	keyBuf []byte   // reused fingerprint buffer (labelKey)
+	keyLbl []Label  // reused sort scratch (labelKey)
 }
 
 type histAcc struct {
@@ -141,9 +144,10 @@ func (c *converter) flushFamily() {
 }
 
 func (c *converter) hist(s Sample) *histAcc {
-	key := labelKey(s.Labels, "le")
-	acc, ok := c.hists[key]
+	c.labelKey(s.Labels, "le")
+	acc, ok := c.hists[string(c.keyBuf)] // keyed lookup: no allocation
 	if !ok {
+		key := string(c.keyBuf)
 		acc = &histAcc{labels: copyLabelsExcept(s.Labels, "le")}
 		c.hists[key] = acc
 		c.order = append(c.order, key)
@@ -155,9 +159,10 @@ func (c *converter) hist(s Sample) *histAcc {
 }
 
 func (c *converter) summ(s Sample) *summAcc {
-	key := labelKey(s.Labels, "quantile")
-	acc, ok := c.summs[key]
+	c.labelKey(s.Labels, "quantile")
+	acc, ok := c.summs[string(c.keyBuf)] // keyed lookup: no allocation
 	if !ok {
+		key := string(c.keyBuf)
 		acc = &summAcc{labels: copyLabelsExcept(s.Labels, "quantile")}
 		c.summs[key] = acc
 		c.order = append(c.order, key)
@@ -168,19 +173,32 @@ func (c *converter) summ(s Sample) *summAcc {
 	return acc
 }
 
-// labelKey builds a canonical fingerprint of the labels, excluding one name.
-// Exposition label order is stable within a family in practice; the key is
-// order-insensitive anyway to be safe.
-func labelKey(labels []Label, except string) string {
-	parts := make([]string, 0, len(labels))
+// labelKey builds a canonical fingerprint of the labels (excluding one name)
+// into c.keyBuf, reusing c.keyLbl as sort scratch so the hot path does not
+// allocate. Exposition label order is stable within a family in practice; the
+// key is order-insensitive anyway to be safe.
+func (c *converter) labelKey(labels []Label, except string) {
+	c.keyLbl = c.keyLbl[:0]
 	for _, l := range labels {
-		if l.Name == except {
-			continue
+		if l.Name != except {
+			c.keyLbl = append(c.keyLbl, l)
 		}
-		parts = append(parts, l.Name+"\x00"+l.Value)
 	}
-	sort.Strings(parts)
-	return strings.Join(parts, "\x01")
+	// Sorting by (name, value) matches sorting the joined "name\x00value"
+	// strings byte-wise, so the fingerprint is order-insensitive.
+	slices.SortFunc(c.keyLbl, func(a, b Label) int {
+		if r := strings.Compare(a.Name, b.Name); r != 0 {
+			return r
+		}
+		return strings.Compare(a.Value, b.Value)
+	})
+	c.keyBuf = c.keyBuf[:0]
+	for _, l := range c.keyLbl {
+		c.keyBuf = append(c.keyBuf, l.Name...)
+		c.keyBuf = append(c.keyBuf, 0)
+		c.keyBuf = append(c.keyBuf, l.Value...)
+		c.keyBuf = append(c.keyBuf, 1)
+	}
 }
 
 func copyLabelsExcept(labels []Label, except string) []Label {

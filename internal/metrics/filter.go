@@ -43,21 +43,25 @@ func (c *matchContext) reset() {
 	c.falseHashes = c.falseHashes[:0]
 }
 
-// eval returns the memoized result for hash, computing it via fn on first sight.
-func (c *matchContext) eval(hash uint64, fn func() bool) bool {
+// cached returns the memoized result for hash, if known; store records one.
+// (Two calls rather than an eval(hash, func() bool) so the hot path does not
+// allocate a closure per selector per line.)
+func (c *matchContext) cached(hash uint64) (result, known bool) {
 	if slices.Contains(c.falseHashes, hash) {
-		return false
+		return false, true
 	}
 	if slices.Contains(c.trueHashes, hash) {
-		return true
+		return true, true
 	}
-	result := fn()
+	return false, false
+}
+
+func (c *matchContext) store(hash uint64, result bool) {
 	if result {
 		c.trueHashes = append(c.trueHashes, hash)
 	} else {
 		c.falseHashes = append(c.falseHashes, hash)
 	}
-	return result
 }
 
 // labelKeys returns the distinct label names the selectors read, so a caller
@@ -75,14 +79,24 @@ func (s *selectorSet) labelKeys() []string {
 
 // match reports whether every selector holds for the given label lookup.
 func (s *selectorSet) match(lookup func(string) string, ctx *matchContext) bool {
-	for _, sel := range s.exact {
-		hit := ctx.eval(sel.hash, func() bool { return lookup(sel.label) == sel.value })
+	for i := range s.exact {
+		sel := &s.exact[i]
+		hit, known := ctx.cached(sel.hash)
+		if !known {
+			hit = lookup(sel.label) == sel.value
+			ctx.store(sel.hash, hit)
+		}
 		if hit != sel.want {
 			return false
 		}
 	}
-	for _, sel := range s.regex {
-		hit := ctx.eval(sel.hash, func() bool { return sel.re.MatchString(lookup(sel.label)) })
+	for i := range s.regex {
+		sel := &s.regex[i]
+		hit, known := ctx.cached(sel.hash)
+		if !known {
+			hit = sel.re.MatchString(lookup(sel.label))
+			ctx.store(sel.hash, hit)
+		}
 		if hit != sel.want {
 			return false
 		}

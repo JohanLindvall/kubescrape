@@ -145,6 +145,14 @@ Full metadata for one pod looked up by UID (the agent's OTLP-ingest enricher
 uses this to attribute pushed telemetry that carries a `k8s.pod.uid`).
 Tombstone-aware like the other pod lookups.
 
+### `GET /v1/pod-ips/{ip}`
+
+Full metadata for the **live** pod owning a pod IP (the agent's opt-in
+peer-IP attribution for pushed OTLP). Unlike the other pod lookups this is
+deliberately NOT tombstone-aware — pod IPs are recycled quickly, so a deleted
+pod must never resolve — and hostNetwork pods (which share the node IP) are
+not indexed.
+
 ### `GET /healthz`, `GET /readyz`, `GET /metrics`
 
 Liveness is always `200`; readiness turns `200` once the initial informer
@@ -495,7 +503,10 @@ forwards it — closing the gap that otherwise needs a separate collector with
 the k8sattributes processor. The agent listens for OTLP/gRPC
 (`-ingest-grpc-endpoint`, default `:4317`) and OTLP/HTTP protobuf (gzip
 bodies accepted)
-(`-ingest-http-endpoint`, default `:4318`, on `/v1/logs` and `/v1/metrics`).
+(`-ingest-http-endpoint`, default `:4318`, on `/v1/logs`, `/v1/metrics` and
+`/v1/traces`). Traces are enriched the same way and passed through
+(`-ingest-traces`; they bypass the disk buffer — the pushing sender owns
+retry).
 For each pushed resource it finds a container ID (`container.id` /
 `k8s.container.id`, keys configurable) or a pod UID (`k8s.pod.uid`), resolves
 the metadata service (a container ID pins the exact incarnation), and merges
@@ -505,8 +516,15 @@ tailer (`-ingest-logs-enrich`, filling only fields the sender left unset).
 Metrics resolve per `-ingest-metrics-mode`: `resource` (the ID is a resource
 attribute), `datapoint` (the ID is a per-point label; points are split into
 one resource per object, as a kube-state-metrics-style stream needs), or
-`auto` (resource when every resource carries an ID, else split). Enrichment
-outcomes count into `kubescrape_ingest_resources_total{outcome}`.
+`auto` (resource when every resource carries an ID, else split). With
+`-ingest-peer-ip-fallback` (opt-in), a resource carrying **no** ID at all is
+attributed to the pod owning the connection's peer IP (live, non-hostNetwork
+pods only, via `GET /v1/pod-ips/{ip}`) — so unmodified SDKs get k8s
+attribution with zero sender configuration. `-ingest-batch-items` coalesces
+pushed payloads per signal before forwarding (collector batch-processor
+semantics; pair with `-buffer-dir` for at-least-once). Enrichment
+outcomes count into `kubescrape_ingest_resources_total{outcome}` (including
+`peer_ip`).
 
 **Pipeline toggles.** Each pipeline is individually switchable: `-logs`,
 `-metrics` (annotation-discovered targets), `-cadvisor` and `-node-metrics`

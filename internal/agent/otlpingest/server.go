@@ -17,6 +17,8 @@ import (
 	"go.opentelemetry.io/collector/pdata/plog/plogotlp"
 	"go.opentelemetry.io/collector/pdata/pmetric"
 	"go.opentelemetry.io/collector/pdata/pmetric/pmetricotlp"
+	"go.opentelemetry.io/collector/pdata/ptrace"
+	"go.opentelemetry.io/collector/pdata/ptrace/ptraceotlp"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -31,6 +33,12 @@ type Exporter interface {
 	ExportMetrics(ctx context.Context, md pmetric.Metrics) error
 }
 
+// TracesExporter forwards traces; implemented by otlpexport.Client (and
+// Buffered, which passes traces through unbuffered).
+type TracesExporter interface {
+	ExportTraces(ctx context.Context, td ptrace.Traces) error
+}
+
 // ServerConfig configures the ingest listeners. An empty address disables
 // that transport; disabling both makes Run a no-op.
 type ServerConfig struct {
@@ -38,7 +46,10 @@ type ServerConfig struct {
 	HTTPAddr string // default ":4318" when enabled
 	Enricher *Enricher
 	Exporter Exporter
-	Logger   *slog.Logger
+	// Traces accepts pushed traces on /v1/traces and the gRPC trace service,
+	// enriching resources and passing them through. nil disables traces.
+	Traces TracesExporter
+	Logger *slog.Logger
 }
 
 // Server receives pushed OTLP over gRPC and/or HTTP, enriches it, and
@@ -72,6 +83,9 @@ func (s *Server) Run(ctx context.Context) error {
 		grpcSrv = grpc.NewServer()
 		plogotlp.RegisterGRPCServer(grpcSrv, &logsGRPC{s: s})
 		pmetricotlp.RegisterGRPCServer(grpcSrv, &metricsGRPC{s: s})
+		if s.cfg.Traces != nil {
+			ptraceotlp.RegisterGRPCServer(grpcSrv, &tracesGRPC{s: s})
+		}
 		started++
 		go func() { errc <- grpcSrv.Serve(lis) }()
 		s.log.Info("otlp ingest gRPC listening", "addr", s.cfg.GRPCAddr)
@@ -81,6 +95,9 @@ func (s *Server) Run(ctx context.Context) error {
 		mux := http.NewServeMux()
 		mux.HandleFunc("POST /v1/logs", s.handleHTTPLogs)
 		mux.HandleFunc("POST /v1/metrics", s.handleHTTPMetrics)
+		if s.cfg.Traces != nil {
+			mux.HandleFunc("POST /v1/traces", s.handleHTTPTraces)
+		}
 		httpSrv = &http.Server{Addr: s.cfg.HTTPAddr, Handler: mux, ReadHeaderTimeout: 10 * time.Second}
 		started++
 		go func() {
@@ -123,6 +140,7 @@ type logsGRPC struct {
 }
 
 func (g *logsGRPC) Export(ctx context.Context, req plogotlp.ExportRequest) (plogotlp.ExportResponse, error) {
+	ctx = grpcPeerCtx(ctx)
 	ld := req.Logs()
 	g.s.cfg.Enricher.EnrichLogs(ctx, ld)
 	if err := g.s.cfg.Exporter.ExportLogs(ctx, ld); err != nil {
@@ -137,6 +155,7 @@ type metricsGRPC struct {
 }
 
 func (g *metricsGRPC) Export(ctx context.Context, req pmetricotlp.ExportRequest) (pmetricotlp.ExportResponse, error) {
+	ctx = grpcPeerCtx(ctx)
 	md := g.s.cfg.Enricher.EnrichMetrics(ctx, req.Metrics())
 	if err := g.s.cfg.Exporter.ExportMetrics(ctx, md); err != nil {
 		return pmetricotlp.ExportResponse{}, grpcForwardStatus(err)
@@ -168,6 +187,21 @@ func grpcForwardStatus(err error) error {
 	return status.Error(codes.Unavailable, err.Error())
 }
 
+type tracesGRPC struct {
+	ptraceotlp.UnimplementedGRPCServer
+	s *Server
+}
+
+func (g *tracesGRPC) Export(ctx context.Context, req ptraceotlp.ExportRequest) (ptraceotlp.ExportResponse, error) {
+	ctx = grpcPeerCtx(ctx)
+	td := req.Traces()
+	g.s.cfg.Enricher.EnrichTraces(ctx, td)
+	if err := g.s.cfg.Traces.ExportTraces(ctx, td); err != nil {
+		return ptraceotlp.ExportResponse{}, grpcForwardStatus(err)
+	}
+	return ptraceotlp.NewExportResponse(), nil
+}
+
 // --- HTTP (OTLP/HTTP protobuf) ---
 
 func (s *Server) handleHTTPLogs(w http.ResponseWriter, r *http.Request) {
@@ -185,9 +219,10 @@ func (s *Server) handleHTTPLogs(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "malformed OTLP logs payload", http.StatusBadRequest)
 		return
 	}
+	ctx := withPeerIP(r.Context(), r.RemoteAddr)
 	ld := req.Logs()
-	s.cfg.Enricher.EnrichLogs(r.Context(), ld)
-	if err := s.cfg.Exporter.ExportLogs(r.Context(), ld); err != nil {
+	s.cfg.Enricher.EnrichLogs(ctx, ld)
+	if err := s.cfg.Exporter.ExportLogs(ctx, ld); err != nil {
 		http.Error(w, err.Error(), http.StatusServiceUnavailable)
 		return
 	}
@@ -209,13 +244,42 @@ func (s *Server) handleHTTPMetrics(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "malformed OTLP metrics payload", http.StatusBadRequest)
 		return
 	}
-	md := s.cfg.Enricher.EnrichMetrics(r.Context(), req.Metrics())
-	if err := s.cfg.Exporter.ExportMetrics(r.Context(), md); err != nil {
+	ctx := withPeerIP(r.Context(), r.RemoteAddr)
+	md := s.cfg.Enricher.EnrichMetrics(ctx, req.Metrics())
+	if err := s.cfg.Exporter.ExportMetrics(ctx, md); err != nil {
 		http.Error(w, err.Error(), http.StatusServiceUnavailable)
 		return
 	}
 	writeProto(w, pmetricResponse(pmetricotlp.NewExportResponse()))
 }
+
+func (s *Server) handleHTTPTraces(w http.ResponseWriter, r *http.Request) {
+	body, err := readBody(r)
+	if err != nil {
+		code := http.StatusBadRequest
+		if errors.Is(err, errBodyTooLarge) {
+			code = http.StatusRequestEntityTooLarge
+		}
+		http.Error(w, err.Error(), code)
+		return
+	}
+	req := ptraceotlp.NewExportRequest()
+	if err := req.UnmarshalProto(body); err != nil {
+		http.Error(w, "malformed OTLP traces payload", http.StatusBadRequest)
+		return
+	}
+	ctx := withPeerIP(r.Context(), r.RemoteAddr)
+	td := req.Traces()
+	s.cfg.Enricher.EnrichTraces(ctx, td)
+	if err := s.cfg.Traces.ExportTraces(ctx, td); err != nil {
+		http.Error(w, err.Error(), http.StatusServiceUnavailable)
+		return
+	}
+	writeProto(w, ptraceResponse(ptraceotlp.NewExportResponse()))
+}
+
+// ptraceResponse adapts the traces response to the marshaler interface.
+func ptraceResponse(r ptraceotlp.ExportResponse) protoMarshaler { return r }
 
 const maxIngestBody = 16 << 20 // 16 MiB per request
 

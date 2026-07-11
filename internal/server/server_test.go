@@ -475,3 +475,20 @@ func TestReadyEndpoints(t *testing.T) {
 	srv := testServer(t, st, closedChan())
 	getJSON(t, srv.URL+"/readyz", http.StatusOK, nil)
 }
+
+func TestPodByIPEndpoint(t *testing.T) {
+	st := store.New(time.Minute)
+	addPod(st)
+	srv := testServer(t, st, closedChan())
+
+	var pod kubemeta.Pod
+	getJSON(t, srv.URL+"/v1/pod-ips/10.1.2.3", http.StatusOK, &pod)
+	if pod.Name != "web-abc-xyz" || len(pod.Owners) != 1 {
+		t.Fatalf("pod = %+v", pod)
+	}
+	getJSON(t, srv.URL+"/v1/pod-ips/10.9.9.9", http.StatusNotFound, nil)
+
+	// Deleted pods never resolve by IP (the address is recycled).
+	st.DeletePod("pod-uid")
+	getJSON(t, srv.URL+"/v1/pod-ips/10.1.2.3", http.StatusNotFound, nil)
+}

@@ -17,6 +17,7 @@ import (
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/plog"
 	"go.opentelemetry.io/collector/pdata/pmetric"
+	"go.opentelemetry.io/collector/pdata/ptrace"
 
 	"github.com/JohanLindvall/kubescrape/internal/agent/attrs"
 	"github.com/JohanLindvall/kubescrape/internal/agent/logenrich"
@@ -29,6 +30,7 @@ import (
 type MetadataSource interface {
 	Container(ctx context.Context, id string, wait time.Duration) (*kubemeta.ContainerMetadata, error)
 	PodByUID(ctx context.Context, uid string) (*kubemeta.Pod, error)
+	PodByIP(ctx context.Context, ip string) (*kubemeta.Pod, error)
 }
 
 // MetricsMode selects how metric resources are enriched.
@@ -62,6 +64,12 @@ type Config struct {
 	// severity, trace/span IDs and structured fields (as -logs-enrich does),
 	// filling only fields the sender left unset.
 	EnrichLines bool
+	// PeerIPFallback resolves the sending pod by the connection's peer IP
+	// when the resource carries no container ID or pod UID, and merges its
+	// k8s attributes (never overwriting sender values). Opt-in: peer IPs can
+	// be rewritten by NAT, and hostNetwork senders share the node IP (those
+	// never resolve — the metadata service only indexes pod-IP-owning pods).
+	PeerIPFallback bool
 	// Attrs builds the k8s resource attributes (nil = built-in defaults).
 	Attrs *attrs.Builder
 	// NodeInfo supplies the agent node's metadata for attribute templates.
@@ -139,6 +147,15 @@ func (e *Enricher) EnrichLogs(ctx context.Context, ld plog.Logs) {
 	}
 }
 
+// EnrichTraces enriches every resource in td in place (traces are otherwise a
+// passthrough signal).
+func (e *Enricher) EnrichTraces(ctx context.Context, td ptrace.Traces) {
+	rss := td.ResourceSpans()
+	for i := 0; i < rss.Len(); i++ {
+		e.enrichResource(ctx, rss.At(i).Resource())
+	}
+}
+
 // EnrichMetrics enriches md according to the configured mode, returning the
 // (possibly regrouped) metrics to export.
 func (e *Enricher) EnrichMetrics(ctx context.Context, md pmetric.Metrics) pmetric.Metrics {
@@ -213,10 +230,16 @@ func (e *Enricher) build(pod *kubemeta.Pod, container *kubemeta.Container, a pco
 }
 
 // resolve finds a container ID or pod UID in a and fetches its metadata. A
-// container ID is preferred: it resolves the exact incarnation.
+// container ID is preferred: it resolves the exact incarnation. With
+// PeerIPFallback, a resource carrying neither falls back to the pod owning
+// the connection's peer IP.
 func (e *Enricher) resolve(ctx context.Context, a pcommon.Map) (*kubemeta.Pod, *kubemeta.Container, bool) {
 	tok, ok := e.findID(a)
 	if !ok {
+		if pod := e.peerPod(ctx); pod != nil {
+			obs.Ingested.WithLabelValues("peer_ip").Inc()
+			return pod, nil, true
+		}
 		obs.Ingested.WithLabelValues("unresolved").Inc()
 		return nil, nil, false
 	}
@@ -227,6 +250,23 @@ func (e *Enricher) resolve(ctx context.Context, a pcommon.Map) (*kubemeta.Pod, *
 	}
 	obs.Ingested.WithLabelValues("enriched").Inc()
 	return pod, container, true
+}
+
+// peerPod resolves the pushing pod from the connection's peer IP (nil when
+// the fallback is disabled, the peer is unknown, or no live pod owns the IP).
+func (e *Enricher) peerPod(ctx context.Context) *kubemeta.Pod {
+	if !e.cfg.PeerIPFallback {
+		return nil
+	}
+	ip := peerIP(ctx)
+	if ip == "" {
+		return nil
+	}
+	pod, err := e.cfg.Meta.PodByIP(ctx, ip)
+	if err != nil {
+		return nil
+	}
+	return pod
 }
 
 // idToken tags an ID value with its kind so a later lookup knows which

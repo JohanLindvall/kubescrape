@@ -173,6 +173,11 @@ func (g *metricGrouper) resource(id string) pmetric.ResourceMetrics {
 	rm.SetSchemaUrl(g.srcSchema)
 	if id != "" {
 		g.mergeEnrichment(id, rm.Resource().Attributes())
+	} else if pod := g.enricher.peerPod(g.ctx); pod != nil {
+		// No ID anywhere for these points: the opt-in peer-IP fallback still
+		// attributes them to the pushing pod.
+		obs.Ingested.WithLabelValues("peer_ip").Inc()
+		g.enricher.build(pod, nil, rm.Resource().Attributes())
 	}
 	g.rmByID[id] = rm
 	return rm

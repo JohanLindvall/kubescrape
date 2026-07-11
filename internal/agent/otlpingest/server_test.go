@@ -9,6 +9,9 @@ import (
 	"testing"
 	"time"
 
+	"fmt"
+	"sync"
+
 	"github.com/JohanLindvall/kubescrape/internal/agent/otlpexport"
 	"github.com/JohanLindvall/kubescrape/internal/agent/spool"
 	"github.com/klauspost/compress/gzip"
@@ -16,6 +19,8 @@ import (
 	"go.opentelemetry.io/collector/pdata/plog/plogotlp"
 	"go.opentelemetry.io/collector/pdata/pmetric"
 	"go.opentelemetry.io/collector/pdata/pmetric/pmetricotlp"
+	"go.opentelemetry.io/collector/pdata/ptrace"
+	"go.opentelemetry.io/collector/pdata/ptrace/ptraceotlp"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
@@ -362,4 +367,179 @@ func TestAutoSplitKeepsResourceLevelID(t *testing.T) {
 			}
 		}
 	}
+}
+
+func tracesWith(resAttrs map[string]string) ptrace.Traces {
+	td := ptrace.NewTraces()
+	rs := td.ResourceSpans().AppendEmpty()
+	for k, v := range resAttrs {
+		rs.Resource().Attributes().PutStr(k, v)
+	}
+	span := rs.ScopeSpans().AppendEmpty().Spans().AppendEmpty()
+	span.SetName("op")
+	return td
+}
+
+type captureTraces struct{ traces []ptrace.Traces }
+
+func (c *captureTraces) ExportTraces(_ context.Context, td ptrace.Traces) error {
+	c.traces = append(c.traces, td)
+	return nil
+}
+
+// Traces round-trip over HTTP: enriched by container ID and forwarded.
+func TestHTTPTracesRoundTrip(t *testing.T) {
+	texp := &captureTraces{}
+	s := NewServer(ServerConfig{Enricher: newEnricher(newMeta(), MetricsAuto), Exporter: &captureExporter{}, Traces: texp})
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/traces", s.handleHTTPTraces)
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	body, err := ptraceotlp.NewExportRequestFromTraces(tracesWith(map[string]string{"container.id": "cafe01"})).MarshalProto()
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := http.Post(srv.URL+"/v1/traces", "application/x-protobuf", bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d", resp.StatusCode)
+	}
+	if len(texp.traces) != 1 {
+		t.Fatalf("forwarded traces = %d", len(texp.traces))
+	}
+	got := texp.traces[0].ResourceSpans().At(0).Resource().Attributes()
+	if v, ok := got.Get("k8s.pod.name"); !ok || v.Str() != "web-1" {
+		t.Fatalf("trace resource not enriched: %v", got.AsRaw())
+	}
+}
+
+// Peer-IP fallback: a resource with no ID resolves via the connection's peer
+// IP when enabled, and stays untouched when disabled.
+func TestPeerIPFallback(t *testing.T) {
+	enr := NewEnricher(Config{Meta: newMeta(), PeerIPFallback: true})
+	ld := plog.NewLogs()
+	lr := ld.ResourceLogs().AppendEmpty()
+	lr.ScopeLogs().AppendEmpty().LogRecords().AppendEmpty().Body().SetStr("hi")
+
+	ctx := withPeerIP(context.Background(), "10.1.2.3:41234")
+	enr.EnrichLogs(ctx, ld)
+	a := ld.ResourceLogs().At(0).Resource().Attributes()
+	if v, ok := a.Get("k8s.pod.name"); !ok || v.Str() != "web-3" {
+		t.Fatalf("peer-IP fallback did not enrich: %v", a.AsRaw())
+	}
+
+	// Disabled: untouched.
+	enr2 := NewEnricher(Config{Meta: newMeta(), PeerIPFallback: false})
+	ld2 := plog.NewLogs()
+	ld2.ResourceLogs().AppendEmpty().ScopeLogs().AppendEmpty().LogRecords().AppendEmpty().Body().SetStr("hi")
+	enr2.EnrichLogs(ctx, ld2)
+	if n := ld2.ResourceLogs().At(0).Resource().Attributes().Len(); n != 0 {
+		t.Fatalf("fallback disabled but resource enriched: %d attrs", n)
+	}
+
+	// Unknown peer IP: untouched (and no error).
+	ld3 := plog.NewLogs()
+	ld3.ResourceLogs().AppendEmpty().ScopeLogs().AppendEmpty().LogRecords().AppendEmpty().Body().SetStr("hi")
+	enr.EnrichLogs(withPeerIP(context.Background(), "172.99.0.1:1"), ld3)
+	if n := ld3.ResourceLogs().At(0).Resource().Attributes().Len(); n != 0 {
+		t.Fatalf("unknown peer enriched: %d attrs", n)
+	}
+}
+
+// The datapoint splitter's ID-less group also uses the peer-IP fallback.
+func TestPeerIPFallbackSplitMode(t *testing.T) {
+	enr := NewEnricher(Config{Meta: newMeta(), MetricsMode: MetricsDatapoint, PeerIPFallback: true})
+	md := gaugeMetrics(nil, map[string]any{"path": "/x"}) // no IDs anywhere
+	out := enr.EnrichMetrics(withPeerIP(context.Background(), "10.1.2.3:5"), md)
+	got := collectPodNames(out)
+	if got["web-3"] != 1 {
+		t.Fatalf("split-mode peer fallback points = %+v", got)
+	}
+}
+
+// The batcher coalesces small pushes, flushes on timeout, and passes an
+// oversized payload straight through.
+func TestBatcherCoalesces(t *testing.T) {
+	exp := &syncCaptureExporter{}
+	b := NewBatcher(exp, nil, BatchConfig{Items: 5, Timeout: 50 * time.Millisecond}, nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go b.Run(ctx)
+
+	// 5 single-record pushes coalesce into one export.
+	for i := 0; i < 5; i++ {
+		ld := plog.NewLogs()
+		ld.ResourceLogs().AppendEmpty().ScopeLogs().AppendEmpty().LogRecords().AppendEmpty().Body().SetStr(fmt.Sprintf("r%d", i))
+		if err := b.ExportLogs(ctx, ld); err != nil {
+			t.Fatal(err)
+		}
+	}
+	waitForCond(t, func() bool { return exp.logBatches() == 1 && exp.logRecords() == 5 }, "one coalesced batch of 5")
+
+	// A single push below the cap flushes on timeout.
+	ld := plog.NewLogs()
+	ld.ResourceLogs().AppendEmpty().ScopeLogs().AppendEmpty().LogRecords().AppendEmpty().Body().SetStr("lone")
+	if err := b.ExportLogs(ctx, ld); err != nil {
+		t.Fatal(err)
+	}
+	waitForCond(t, func() bool { return exp.logBatches() == 2 }, "timeout flush")
+
+	// An oversized push is exported as-is.
+	big := plog.NewLogs()
+	sl := big.ResourceLogs().AppendEmpty().ScopeLogs().AppendEmpty()
+	for i := 0; i < 9; i++ {
+		sl.LogRecords().AppendEmpty().Body().SetStr("big")
+	}
+	if err := b.ExportLogs(ctx, big); err != nil {
+		t.Fatal(err)
+	}
+	waitForCond(t, func() bool { return exp.logBatches() == 3 && exp.logRecords() == 15 }, "oversized pass-through")
+}
+
+type syncCaptureExporter struct {
+	mu      sync.Mutex
+	batches []plog.Logs
+}
+
+func (c *syncCaptureExporter) ExportLogs(_ context.Context, ld plog.Logs) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	cp := plog.NewLogs()
+	ld.CopyTo(cp)
+	c.batches = append(c.batches, cp)
+	return nil
+}
+
+func (c *syncCaptureExporter) ExportMetrics(context.Context, pmetric.Metrics) error { return nil }
+
+func (c *syncCaptureExporter) logBatches() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return len(c.batches)
+}
+
+func (c *syncCaptureExporter) logRecords() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	n := 0
+	for _, b := range c.batches {
+		n += b.LogRecordCount()
+	}
+	return n
+}
+
+func waitForCond(t *testing.T, cond func() bool, what string) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %s", what)
 }

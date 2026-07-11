@@ -33,6 +33,11 @@ type Store struct {
 	// resolvable until its tombstone expires or a new pod with the same name
 	// replaces it.
 	byPodName map[string]*record
+	// byPodIP indexes LIVE pods by pod IP, for the agent's opt-in peer-IP
+	// resource attribution. hostNetwork pods (PodIP == HostIP, an ambiguous
+	// shared address) are excluded, and deleted pods are removed immediately —
+	// pod IPs are recycled quickly, so a tombstone must never resolve by IP.
+	byPodIP map[string]*record
 	// waiters holds blocked GetContainer calls keyed by the normalized
 	// container ID they are waiting for; each channel is closed when that
 	// specific ID becomes resolvable.
@@ -67,6 +72,7 @@ func New(ttl time.Duration) *Store {
 		byContainer: make(map[string]*containerEntry),
 		byNode:      make(map[string]map[types.UID]*record),
 		byPodName:   make(map[string]*record),
+		byPodIP:     make(map[string]*record),
 		waiters:     make(map[string][]chan struct{}),
 	}
 }
@@ -97,13 +103,14 @@ func (s *Store) UpsertPod(p *corev1.Pod) {
 	if rec != nil && rec.expireAt.IsZero() && rec.resourceVersion == p.ResourceVersion {
 		return // periodic resync, nothing changed
 	}
-	var oldNode string
+	var oldNode, oldIP string
 	var oldIDs map[string]struct{}
 	if rec == nil {
 		rec = &record{}
 		s.pods[p.UID] = rec
 	} else {
 		oldNode = rec.pod.NodeName
+		oldIP = rec.pod.PodIP
 		oldIDs = rec.containerIDs
 	}
 
@@ -149,6 +156,17 @@ func (s *Store) UpsertPod(p *corev1.Pod) {
 		m[p.UID] = rec
 	}
 	s.byPodName[pod.Namespace+"/"+pod.Name] = rec
+
+	ip := pod.PodIP
+	if ip == pod.HostIP {
+		ip = "" // hostNetwork: the node IP is shared, not an identity
+	}
+	if oldIP != ip && oldIP != "" && s.byPodIP[oldIP] == rec {
+		delete(s.byPodIP, oldIP)
+	}
+	if ip != "" {
+		s.byPodIP[ip] = rec
+	}
 }
 
 // DeletePod tombstones a pod. Its metadata (and its container IDs) remain
@@ -164,6 +182,9 @@ func (s *Store) DeletePod(uid types.UID) {
 	}
 	now := s.now()
 	s.removeFromNodeLocked(rec.pod.NodeName, uid)
+	if rec.pod.PodIP != "" && s.byPodIP[rec.pod.PodIP] == rec {
+		delete(s.byPodIP, rec.pod.PodIP)
+	}
 
 	if s.ttl <= 0 {
 		for id := range rec.containerIDs {
@@ -278,6 +299,20 @@ func (s *Store) GetPodByUID(uid string) (NodePod, bool) {
 
 	rec := s.pods[types.UID(uid)]
 	if rec == nil || (!rec.expireAt.IsZero() && s.now().After(rec.expireAt)) {
+		return NodePod{}, false
+	}
+	return NodePod{Pod: rec.pod, OwnerRefs: rec.ownerRefs}, true
+}
+
+// GetPodByIP returns the live pod owning the given pod IP, if any. Deleted
+// pods never resolve (their IP may already belong to a new pod), and
+// hostNetwork pods are not indexed.
+func (s *Store) GetPodByIP(ip string) (NodePod, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	rec := s.byPodIP[ip]
+	if rec == nil || rec.pod.DeletedAt != nil {
 		return NodePod{}, false
 	}
 	return NodePod{Pod: rec.pod, OwnerRefs: rec.ownerRefs}, true

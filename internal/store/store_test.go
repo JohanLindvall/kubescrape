@@ -425,3 +425,46 @@ func TestRunExitsOnCancel(t *testing.T) {
 		t.Fatal("Run did not exit on cancel")
 	}
 }
+
+// GetPodByIP resolves only live, non-hostNetwork pods, and follows IP changes.
+func TestGetPodByIP(t *testing.T) {
+	s := New(time.Minute)
+	s.UpsertPod(&corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "p1", Namespace: "ns", UID: "u1", ResourceVersion: "1"},
+		Status:     corev1.PodStatus{PodIP: "10.0.0.5", HostIP: "192.168.1.1"},
+	})
+	if np, ok := s.GetPodByIP("10.0.0.5"); !ok || np.Pod.Name != "p1" {
+		t.Fatalf("live pod by IP: %+v, %v", np, ok)
+	}
+
+	// hostNetwork pod (PodIP == HostIP) is never indexed.
+	s.UpsertPod(&corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "hostnet", Namespace: "ns", UID: "u2", ResourceVersion: "1"},
+		Status:     corev1.PodStatus{PodIP: "192.168.1.1", HostIP: "192.168.1.1"},
+	})
+	if _, ok := s.GetPodByIP("192.168.1.1"); ok {
+		t.Fatal("hostNetwork pod must not resolve by IP")
+	}
+
+	// IP change moves the mapping.
+	s.UpsertPod(&corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "p1", Namespace: "ns", UID: "u1", ResourceVersion: "2"},
+		Status:     corev1.PodStatus{PodIP: "10.0.0.6", HostIP: "192.168.1.1"},
+	})
+	if _, ok := s.GetPodByIP("10.0.0.5"); ok {
+		t.Fatal("old IP must not resolve after a change")
+	}
+	if np, ok := s.GetPodByIP("10.0.0.6"); !ok || np.Pod.Name != "p1" {
+		t.Fatalf("new IP: %+v, %v", np, ok)
+	}
+
+	// Deleted pods stop resolving immediately (their IP is recycled), even
+	// though the tombstone keeps other lookups alive.
+	s.DeletePod("u1")
+	if _, ok := s.GetPodByIP("10.0.0.6"); ok {
+		t.Fatal("deleted pod must not resolve by IP")
+	}
+	if _, ok := s.GetPodByUID("u1"); !ok {
+		t.Fatal("tombstone must still resolve by UID")
+	}
+}

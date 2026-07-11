@@ -86,6 +86,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/containers/{id...}", counted("/v1/containers", s.handleContainer))
 	mux.HandleFunc("GET /v1/pods/{namespace}/{name}", counted("/v1/pods", s.handlePod))
 	mux.HandleFunc("GET /v1/pod-uids/{uid}", counted("/v1/pod-uids", s.handlePodByUID))
+	mux.HandleFunc("GET /v1/pod-ips/{ip}", counted("/v1/pod-ips", s.handlePodByIP))
 	mux.HandleFunc("GET /v1/nodes/{node}/targets", counted("/v1/nodes/targets", s.handleNodeTargets))
 	mux.HandleFunc("GET /v1/nodes/{node}/metadata", counted("/v1/nodes/metadata", s.handleNodeMetadata))
 	mux.Handle("GET /metrics", obs.Handler())
@@ -194,6 +195,24 @@ func (s *Server) handlePodByUID(w http.ResponseWriter, r *http.Request) {
 	np, ok := s.store.GetPodByUID(uid)
 	if !ok {
 		writeError(w, http.StatusNotFound, fmt.Sprintf("pod uid %q not found", uid))
+		return
+	}
+	s.enrich(&np.Pod, np.OwnerRefs)
+	s.writeCached(w, r, np.Pod)
+}
+
+// handlePodByIP serves GET /v1/pod-ips/{ip}: the LIVE pod owning a pod IP
+// (the agent's opt-in peer-IP attribution for pushed OTLP). Deleted pods and
+// hostNetwork pods never resolve.
+func (s *Server) handlePodByIP(w http.ResponseWriter, r *http.Request) {
+	if !s.isReady() {
+		writeError(w, http.StatusServiceUnavailable, "informer caches not synced")
+		return
+	}
+	ip := r.PathValue("ip")
+	np, ok := s.store.GetPodByIP(ip)
+	if !ok {
+		writeError(w, http.StatusNotFound, fmt.Sprintf("no live pod with IP %q", ip))
 		return
 	}
 	s.enrich(&np.Pod, np.OwnerRefs)

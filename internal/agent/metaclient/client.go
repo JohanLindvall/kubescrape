@@ -80,6 +80,17 @@ func (c *Client) PodByUID(ctx context.Context, uid string) (*kubemeta.Pod, error
 	return &pod, nil
 }
 
+// PodByIP fetches metadata for the live pod owning a pod IP (404 for
+// unknown, deleted, or hostNetwork pods).
+func (c *Client) PodByIP(ctx context.Context, ip string) (*kubemeta.Pod, error) {
+	u := fmt.Sprintf("%s/v1/pod-ips/%s", c.base, url.PathEscape(ip))
+	var pod kubemeta.Pod
+	if err := c.getJSON(ctx, u, &pod); err != nil {
+		return nil, err
+	}
+	return &pod, nil
+}
+
 // Node fetches the labels and annotations of a node.
 func (c *Client) Node(ctx context.Context, name string) (*kubemeta.NodeMetadata, error) {
 	u := fmt.Sprintf("%s/v1/nodes/%s/metadata", c.base, url.PathEscape(name))

@@ -128,6 +128,10 @@ func run() error {
 		ingestCidKeys = flag.String("ingest-container-id-keys", "container.id,k8s.container.id", "comma-separated attribute keys inspected for a container id")
 		ingestUIDKeys = flag.String("ingest-pod-uid-keys", "k8s.pod.uid", "comma-separated attribute keys inspected for a pod uid")
 		ingestEnrich  = flag.Bool("ingest-logs-enrich", true, "parse pushed log-record bodies for timestamp/severity/trace as -logs-enrich does, filling only fields the sender left unset")
+		ingestTraces  = flag.Bool("ingest-traces", true, "accept pushed traces (gRPC + /v1/traces), enrich their resources and pass them through")
+		ingestPeerIP  = flag.Bool("ingest-peer-ip-fallback", false, "attribute pushed telemetry whose resource carries no container id / pod uid to the pod owning the connection's peer IP (hostNetwork senders never resolve)")
+		ingestBatch   = flag.Int("ingest-batch-items", 0, "coalesce pushed payloads per signal to this many items (log records / data points / spans) before forwarding; 0 forwards each request as received")
+		ingestBatchTO = flag.Duration("ingest-batch-timeout", 200*time.Millisecond, "max time a partial ingest batch waits before flushing")
 	)
 	flag.Parse()
 
@@ -338,16 +342,43 @@ func run() error {
 			Wait:            *ingestWait,
 			MetricsMode:     mode,
 			EnrichLines:     *ingestEnrich,
+			PeerIPFallback:  *ingestPeerIP,
 			Attrs:           attrBuilders.Ingest,
 			NodeInfo:        nodeInfo,
 			Meta:            meta,
 			Logger:          log,
 		})
+		var ingestOut otlpingest.Exporter = out
+		var ingestTraceOut otlpingest.TracesExporter
+		if *ingestTraces {
+			// Both Client and Buffered export traces (Buffered passes them
+			// through unbuffered).
+			te, ok := out.(otlpingest.TracesExporter)
+			if !ok {
+				return fmt.Errorf("exporter does not support traces")
+			}
+			ingestTraceOut = te
+		}
+		if *ingestBatch > 0 {
+			batcher := otlpingest.NewBatcher(ingestOut, ingestTraceOut,
+				otlpingest.BatchConfig{Items: *ingestBatch, Timeout: *ingestBatchTO}, log)
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				batcher.Run(ctx)
+			}()
+			ingestOut = batcher
+			if ingestTraceOut != nil {
+				ingestTraceOut = batcher
+			}
+			log.Info("otlp ingest batching enabled", "items", *ingestBatch, "timeout", *ingestBatchTO)
+		}
 		srv := otlpingest.NewServer(otlpingest.ServerConfig{
 			GRPCAddr: *ingestGRPC,
 			HTTPAddr: *ingestHTTP,
 			Enricher: enr,
-			Exporter: out,
+			Exporter: ingestOut,
+			Traces:   ingestTraceOut,
 			Logger:   log,
 		})
 		wg.Add(1)

@@ -19,6 +19,7 @@ import (
 type fakeMeta struct {
 	containers map[string]*kubemeta.ContainerMetadata
 	pods       map[string]*kubemeta.Pod
+	podsByIP   map[string]*kubemeta.Pod
 }
 
 func (f *fakeMeta) Container(_ context.Context, id string, _ time.Duration) (*kubemeta.ContainerMetadata, error) {
@@ -35,6 +36,13 @@ func (f *fakeMeta) PodByUID(_ context.Context, uid string) (*kubemeta.Pod, error
 	return nil, fmt.Errorf("pod uid %s not found", uid)
 }
 
+func (f *fakeMeta) PodByIP(_ context.Context, ip string) (*kubemeta.Pod, error) {
+	if p, ok := f.podsByIP[ip]; ok {
+		return p, nil
+	}
+	return nil, fmt.Errorf("pod ip %s not found", ip)
+}
+
 func newMeta() *fakeMeta {
 	return &fakeMeta{
 		containers: map[string]*kubemeta.ContainerMetadata{
@@ -43,6 +51,9 @@ func newMeta() *fakeMeta {
 		},
 		pods: map[string]*kubemeta.Pod{
 			"pod-uid-2": {Name: "web-2", Namespace: "default", UID: "pod-uid-2", NodeName: "node1"},
+		},
+		podsByIP: map[string]*kubemeta.Pod{
+			"10.1.2.3": {Name: "web-3", Namespace: "default", UID: "pod-uid-3", NodeName: "node1"},
 		},
 	}
 }

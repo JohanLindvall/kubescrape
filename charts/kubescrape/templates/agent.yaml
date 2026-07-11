@@ -152,6 +152,12 @@ spec:
             - -ingest-http-endpoint={{ .Values.agent.ingest.httpEndpoint }}
             - -ingest-metrics-mode={{ .Values.agent.ingest.metricsMode }}
             - -ingest-logs-enrich={{ .Values.agent.ingest.logsEnrich }}
+            - -ingest-traces={{ .Values.agent.ingest.traces }}
+            - -ingest-peer-ip-fallback={{ .Values.agent.ingest.peerIpFallback }}
+            {{- if .Values.agent.ingest.batchItems }}
+            - -ingest-batch-items={{ .Values.agent.ingest.batchItems }}
+            - -ingest-batch-timeout={{ .Values.agent.ingest.batchTimeout }}
+            {{- end }}
             {{- with .Values.agent.ingest.containerIdKeys }}
             - -ingest-container-id-keys={{ join "," . }}
             {{- end }}

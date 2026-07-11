@@ -18,6 +18,8 @@ import (
 	"go.opentelemetry.io/collector/pdata/plog/plogotlp"
 	"go.opentelemetry.io/collector/pdata/pmetric"
 	"go.opentelemetry.io/collector/pdata/pmetric/pmetricotlp"
+	"go.opentelemetry.io/collector/pdata/ptrace"
+	"go.opentelemetry.io/collector/pdata/ptrace/ptraceotlp"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
@@ -65,11 +67,13 @@ type Client struct {
 	conn    *grpc.ClientConn
 	logs    plogotlp.GRPCClient
 	metrics pmetricotlp.GRPCClient
+	traces  ptraceotlp.GRPCClient
 
 	// HTTP transport.
 	httpClient *http.Client
 	logsURL    string
 	metricsURL string
+	tracesURL  string
 
 	tokenMu      sync.Mutex
 	token        string
@@ -121,6 +125,7 @@ func New(cfg Config) (*Client, error) {
 		c.conn = conn
 		c.logs = plogotlp.NewGRPCClient(conn)
 		c.metrics = pmetricotlp.NewGRPCClient(conn)
+		c.traces = ptraceotlp.NewGRPCClient(conn)
 	case "http":
 		base := strings.TrimRight(cfg.Endpoint, "/")
 		if !strings.Contains(base, "://") {
@@ -128,6 +133,7 @@ func New(cfg Config) (*Client, error) {
 		}
 		c.logsURL = base + "/v1/logs"
 		c.metricsURL = base + "/v1/metrics"
+		c.tracesURL = base + "/v1/traces"
 		c.httpClient = &http.Client{
 			Timeout:   cfg.Timeout,
 			Transport: &http.Transport{TLSClientConfig: tlsCfg, MaxIdleConnsPerHost: 2},
@@ -206,6 +212,32 @@ func (c *Client) exportLogsOnce(ctx context.Context, ld plog.Logs) error {
 		return err
 	}
 	return c.httpPost(ctx, c.logsURL, body)
+}
+
+// ExportTraces sends one traces payload (single attempt; the pushing sender
+// retries via the ingest receiver's retryable status).
+func (c *Client) ExportTraces(ctx context.Context, td ptrace.Traces) error {
+	err := c.exportTracesOnce(ctx, td)
+	obs.Exports.WithLabelValues("traces", outcome(err)).Inc()
+	return err
+}
+
+func (c *Client) exportTracesOnce(ctx context.Context, td ptrace.Traces) error {
+	ctx, cancel := context.WithTimeout(ctx, c.cfg.Timeout)
+	defer cancel()
+	if c.conn != nil {
+		ctx, err := c.grpcAuth(ctx)
+		if err != nil {
+			return err
+		}
+		_, err = c.traces.Export(ctx, ptraceotlp.NewExportRequestFromTraces(td))
+		return err
+	}
+	body, err := ptraceotlp.NewExportRequestFromTraces(td).MarshalProto()
+	if err != nil {
+		return err
+	}
+	return c.httpPost(ctx, c.tracesURL, body)
 }
 
 func outcome(err error) string {

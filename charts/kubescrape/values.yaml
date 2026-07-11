@@ -69,10 +69,18 @@ agent:
   ingest:
     enabled: false
     grpcEndpoint: ":4317"       # empty disables gRPC
-    httpEndpoint: ":4318"       # empty disables HTTP (/v1/logs, /v1/metrics)
+    httpEndpoint: ":4318"       # empty disables HTTP (/v1/logs, /v1/metrics, /v1/traces)
     metricsMode: auto           # resource | datapoint | auto
-    logsEnrich: true
     logsEnrich: true            # parse pushed log bodies (fills only unset fields)
+    traces: true                # accept pushed traces, enrich resources, pass through
+    # Attribute telemetry with no container id / pod uid to the pod owning the
+    # connection's peer IP (opt-in; hostNetwork senders never resolve).
+    peerIpFallback: false
+    # Coalesce pushed payloads per signal to this many items before forwarding
+    # (0 forwards each request as received). Pair with the disk buffer for
+    # at-least-once delivery of coalesced batches.
+    batchItems: 0
+    batchTimeout: 200ms
     containerIdKeys: []         # default: [container.id, k8s.container.id]
     podUidKeys: []              # default: [k8s.pod.uid]
 

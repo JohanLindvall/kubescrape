@@ -276,11 +276,19 @@ resource with k8s attributes from a `container.id`/`k8s.pod.uid` on the data
 collector-with-k8sattributes-processor you'd otherwise keep as the OTLP
 endpoint.
 
+Traces are accepted and passed through with the same resource enrichment
+(`-ingest-traces`), and `-ingest-batch-items` plays the role of
+`otelcol.processor.batch` on the pushed path (coalesce per signal, timeout
+flush).
+
 Two association differences from `otelcol.processor.k8sattributes`:
 
-* **No connection-IP association** (`pod_association from = "connection"`).
-  Senders must carry `k8s.pod.uid` (or `container.id`) on their resource;
-  the standard fix is the Downward API on every instrumented workload:
+* **Connection-IP association is opt-in** (`-ingest-peer-ip-fallback`,
+  Alloy's `pod_association from = "connection"`): a resource with no
+  container id / pod uid resolves via the pod owning the connection's peer
+  IP (live, non-hostNetwork pods only). Prefer stamping the ID at the
+  sender — it is immune to NAT and hostNetwork ambiguity — via the Downward
+  API:
 
   ```yaml
   env:
@@ -290,8 +298,6 @@ Two association differences from `otelcol.processor.k8sattributes`:
       value: k8s.pod.uid=$(POD_UID)
   ```
 
-  This is more reliable than peer-IP association anyway (hostNetwork pods
-  share the node IP; NAT can rewrite sources).
 * **No uid-suffixing of sender-set instances**: cmb-alloy appends
   `/<pod uid>` to a pushed `service.instance.id` to force uniqueness across
   replicas; kubescrape never rewrites sender-set attributes. If replicas

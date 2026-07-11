@@ -9,6 +9,7 @@ import (
 
 	"go.opentelemetry.io/collector/pdata/plog"
 	"go.opentelemetry.io/collector/pdata/pmetric"
+	"go.opentelemetry.io/collector/pdata/ptrace"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
@@ -16,12 +17,19 @@ import (
 	"github.com/JohanLindvall/kubescrape/internal/obs"
 )
 
-// Exporter exports both signals; implemented by *Client and *Buffered, so the
-// agent can route every consumer through one value whether or not buffering is
-// enabled.
+// Exporter exports logs and metrics; implemented by *Client and *Buffered, so
+// the agent can route every consumer through one value whether or not
+// buffering is enabled.
 type Exporter interface {
 	ExportLogs(ctx context.Context, ld plog.Logs) error
 	ExportMetrics(ctx context.Context, md pmetric.Metrics) error
+}
+
+// TracesExporter exports traces. *Client implements it natively; *Buffered
+// passes traces through to the inner exporter unbuffered (traces are a
+// passthrough signal — the pushing sender owns retry).
+type TracesExporter interface {
+	ExportTraces(ctx context.Context, td ptrace.Traces) error
 }
 
 // Buffered is a disk-backed write-ahead buffer in front of an exporter, for
@@ -70,6 +78,14 @@ func NewBuffered(inner Exporter, logSpool, metricSpool *spool.Spool, backoff tim
 		}
 	}
 	return b
+}
+
+// ExportTraces passes traces to the inner exporter unbuffered.
+func (b *Buffered) ExportTraces(ctx context.Context, td ptrace.Traces) error {
+	if te, ok := b.inner.(TracesExporter); ok {
+		return te.ExportTraces(ctx, td)
+	}
+	return errors.New("inner exporter does not support traces")
 }
 
 // ExportLogs durably enqueues a log batch (Run sends it); with no log spool it

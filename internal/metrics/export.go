@@ -15,7 +15,10 @@ type Exporter interface {
 
 var metricsMarshaler pmetric.ProtoMarshaler
 
-// Run exports the set's metrics to exp every interval until ctx is done.
+// Run exports the set's metrics to exp every interval until ctx is done. The
+// caller should Export once more after every producer has stopped (the
+// tailer's shutdown flush feeds the set after Run returns), or the last
+// window's samples are lost — series state is not persisted.
 func (s *DynamicMetricSet) Run(ctx context.Context, exp Exporter, interval time.Duration, maxBytes int) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()

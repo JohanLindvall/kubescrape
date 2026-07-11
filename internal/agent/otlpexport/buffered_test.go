@@ -171,3 +171,113 @@ func TestBufferedFullPropagates(t *testing.T) {
 		t.Fatalf("ExportLogs err = %v, want ErrFull", err)
 	}
 }
+
+// errSender fails log exports with a fixed error until unblocked.
+type errSender struct {
+	fakeSender
+	mu2  sync.Mutex
+	errs map[string]error // body -> error to return
+}
+
+func (e *errSender) ExportLogs(ctx context.Context, ld plog.Logs) error {
+	body := ld.ResourceLogs().At(0).ScopeLogs().At(0).LogRecords().At(0).Body().Str()
+	e.mu2.Lock()
+	err := e.errs[body]
+	e.mu2.Unlock()
+	if err != nil {
+		return err
+	}
+	return e.fakeSender.ExportLogs(ctx, ld)
+}
+
+// A permanently rejected batch (HTTP 400 / gRPC InvalidArgument) is dropped so
+// the queue keeps flowing.
+func TestBufferedDropsPermanentRejection(t *testing.T) {
+	send := &errSender{errs: map[string]error{
+		"poison": &HTTPStatusError{Code: 400, Body: "bad payload"},
+	}}
+	b, ls, ms := openBuffer(t, t.TempDir(), &send.fakeSender, 0)
+	defer func() { _ = ls.Close(); _ = ms.Close() }()
+	// Rewire the log sink's send to the classifying sender.
+	b.logs.send = send.ExportLogs
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go b.Run(ctx)
+
+	if err := b.ExportLogs(ctx, logsWith("poison")); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.ExportLogs(ctx, logsWith("good")); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, func() bool {
+		got := send.gotLogs()
+		return len(got) == 1 && got[0] == "good"
+	}, "good batch delivered past the poison one")
+	waitFor(t, func() bool { return ls.Bytes() == 0 }, "poison batch dropped from the spool")
+}
+
+// A batch failing with an ambiguous/transient error is rotated to the back of
+// the queue after the attempt budget, so it cannot block the signal; it is
+// still delivered once the error clears.
+func TestBufferedRequeuesStuckBatch(t *testing.T) {
+	send := &errSender{errs: map[string]error{
+		"stuck": context.DeadlineExceeded,
+	}}
+	b, ls, ms := openBuffer(t, t.TempDir(), &send.fakeSender, 0)
+	defer func() { _ = ls.Close(); _ = ms.Close() }()
+	b.logs.send = send.ExportLogs
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go b.Run(ctx)
+
+	if err := b.ExportLogs(ctx, logsWith("stuck")); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.ExportLogs(ctx, logsWith("good")); err != nil {
+		t.Fatal(err)
+	}
+	// The stuck batch must not block "good".
+	waitFor(t, func() bool {
+		for _, l := range send.gotLogs() {
+			if l == "good" {
+				return true
+			}
+		}
+		return false
+	}, "good batch delivered while stuck batch requeues")
+
+	// Clear the failure: the requeued batch is eventually delivered too.
+	send.mu2.Lock()
+	delete(send.errs, "stuck")
+	send.mu2.Unlock()
+	waitFor(t, func() bool {
+		for _, l := range send.gotLogs() {
+			if l == "stuck" {
+				return true
+			}
+		}
+		return false
+	}, "requeued batch delivered after the error clears")
+}
+
+// A signal with no spool exports directly through the inner exporter instead
+// of panicking (the documented nil-spool contract).
+func TestBufferedNilSpoolExportsDirectly(t *testing.T) {
+	send := &fakeSender{}
+	ls, err := spool.Open(t.TempDir(), spool.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = ls.Close() }()
+	b := NewBuffered(send, ls, nil, 10*time.Millisecond, nil)
+
+	if err := b.ExportMetrics(context.Background(), metricsWith("direct_metric")); err != nil {
+		t.Fatal(err)
+	}
+	if got := send.gotMetrics(); len(got) != 1 || got[0] != "direct_metric" {
+		t.Fatalf("direct metrics = %v", got)
+	}
+}

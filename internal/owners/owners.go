@@ -90,7 +90,12 @@ func (r *Resolver) Resolve(namespace string, refs []metav1.OwnerReference) []kub
 			Controller: ref.Controller != nil && *ref.Controller,
 		}
 		if gvr, ok := kindGVR(ref); ok {
-			if m := r.get(gvr, namespace, ref.Name); m != nil {
+			// The cache is keyed by namespace+name; cross-check the UID so a
+			// deleted-and-recreated owner with the same name (new UID) does
+			// not lend its labels/annotations/parents to the old reference
+			// (reachable while a pod tombstone outlives its owner).
+			if m := r.get(gvr, namespace, ref.Name); m != nil &&
+				(ref.UID == "" || ref.UID == m.UID) {
 				owner.Labels = copyMap(m.Labels)
 				owner.Annotations = copyMap(m.Annotations)
 				out = append(out, owner)

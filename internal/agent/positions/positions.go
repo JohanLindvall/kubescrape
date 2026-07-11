@@ -10,6 +10,7 @@ package positions
 import (
 	"encoding/json"
 	"os"
+	"path/filepath"
 	"sync"
 )
 
@@ -92,16 +93,44 @@ func (s *Store) SetJournalCursor(cursor string) error {
 	return s.save()
 }
 
-// save writes the whole document atomically (write + rename). The caller
-// holds the mutex.
+// save writes the whole document atomically and durably (write + fsync +
+// rename + best-effort directory sync). The caller holds the mutex. Without
+// the fsync a power loss shortly after the rename can leave a zero-length
+// file — and an empty positions file means the tailer skips every existing
+// log to its end and journald seeks to the tail, silently losing the entire
+// unshipped window, precisely when durability matters most.
 func (s *Store) save() error {
 	data, err := json.Marshal(s.doc)
 	if err != nil {
 		return err
 	}
 	tmp := s.path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+	if err := writeFileSync(tmp, data); err != nil {
 		return err
 	}
-	return os.Rename(tmp, s.path)
+	if err := os.Rename(tmp, s.path); err != nil {
+		return err
+	}
+	if d, err := os.Open(filepath.Dir(s.path)); err == nil {
+		_ = d.Sync()
+		_ = d.Close()
+	}
+	return nil
+}
+
+// writeFileSync is os.WriteFile plus an fsync before close.
+func writeFileSync(path string, data []byte) error {
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(data); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		return err
+	}
+	return f.Close()
 }

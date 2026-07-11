@@ -153,6 +153,7 @@ func (c *Client) getJSON(ctx context.Context, u string, v any) error {
 		if ttl := maxAge(resp); ttl > 0 {
 			c.mu.Lock()
 			c.cache[key] = cacheEntry{body: body, etag: resp.Header.Get("ETag"), expires: c.now().Add(ttl)}
+			c.evictLocked()
 			c.mu.Unlock()
 		}
 		obs.MetadataRequests.WithLabelValues("ok").Inc()
@@ -165,6 +166,32 @@ func (c *Client) getJSON(ctx context.Context, u string, v any) error {
 			obs.MetadataRequests.WithLabelValues("error").Inc()
 		}
 		return &StatusError{Code: resp.StatusCode, Body: strings.TrimSpace(string(body))}
+	}
+}
+
+// maxCacheEntries bounds the response cache. Without a cap the map grows by
+// one entry per distinct container/pod URL ever fetched — a steady leak on
+// nodes with pod churn (dead containers are never requested again).
+const maxCacheEntries = 4096
+
+// evictLocked trims the cache when it exceeds the cap: expired entries first,
+// then arbitrary ones (they re-fetch cheaply via ETag revalidation). Caller
+// holds the mutex.
+func (c *Client) evictLocked() {
+	if len(c.cache) <= maxCacheEntries {
+		return
+	}
+	now := c.now()
+	for k, e := range c.cache {
+		if now.After(e.expires) {
+			delete(c.cache, k)
+		}
+	}
+	for k := range c.cache {
+		if len(c.cache) <= maxCacheEntries {
+			break
+		}
+		delete(c.cache, k)
 	}
 }
 

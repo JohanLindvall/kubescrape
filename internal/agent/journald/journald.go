@@ -140,9 +140,16 @@ func (r *Reader) Run(ctx context.Context) {
 	r.cursor = r.loadCursor()
 	backoff := r.cfg.RestartBackoff
 	for ctx.Err() == nil {
+		started := time.Now()
 		err := r.stream(ctx)
 		if ctx.Err() != nil {
 			break
+		}
+		if time.Since(started) >= 30*time.Second {
+			// A stream that ran healthily resets the backoff; otherwise a few
+			// hiccups spread over the agent's lifetime would pin every future
+			// restart at the 30s worst case.
+			backoff = r.cfg.RestartBackoff
 		}
 		obs.JournalRestarts.Inc()
 		r.log.Warn("journal reader stopped; restarting", "error", err, "backoff", backoff)

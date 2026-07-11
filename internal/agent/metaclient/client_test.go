@@ -162,3 +162,30 @@ func TestClientEndpoints(t *testing.T) {
 		t.Fatalf("StatusError = %+v", err)
 	}
 }
+
+// The response cache is bounded: churning through more distinct URLs than the
+// cap does not grow the map without limit.
+func TestCacheEviction(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "max-age=3600")
+		w.Header().Set("ETag", `"x"`)
+		_, _ = w.Write([]byte(`{"name":"p","namespace":"ns","uid":"u"}`))
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, time.Second)
+	for i := 0; i < maxCacheEntries+100; i++ {
+		if _, err := c.PodByUID(context.Background(), fmt.Sprintf("uid-%d", i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	c.mu.Lock()
+	n := len(c.cache)
+	c.mu.Unlock()
+	if n > maxCacheEntries {
+		t.Fatalf("cache size = %d, want <= %d", n, maxCacheEntries)
+	}
+	if n == 0 {
+		t.Fatal("cache unexpectedly empty")
+	}
+}

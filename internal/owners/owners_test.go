@@ -152,3 +152,24 @@ func TestNewFromListers(t *testing.T) {
 		t.Fatalf("missing namespace = %+v", meta)
 	}
 }
+
+// A same-name owner recreated with a new UID must not lend its labels (or
+// parents) to a reference naming the OLD UID — reachable while a pod
+// tombstone outlives its deleted owner.
+func TestResolveUIDMismatchKeepsRefIdentity(t *testing.T) {
+	ctrl := true
+	r := fakeResolver(map[string]*metav1.PartialObjectMetadata{
+		"replicasets/default/web-abc": obj("NEW-uid", map[string]string{"gen": "2"}, metav1.OwnerReference{
+			APIVersion: "apps/v1", Kind: "Deployment", Name: "web", UID: "dep-uid", Controller: &ctrl,
+		}),
+	})
+	got := r.Resolve("default", []metav1.OwnerReference{{
+		APIVersion: "apps/v1", Kind: "ReplicaSet", Name: "web-abc", UID: "OLD-uid", Controller: &ctrl,
+	}})
+	want := []kubemeta.Owner{
+		{APIVersion: "apps/v1", Kind: "ReplicaSet", Name: "web-abc", UID: "OLD-uid", Controller: true},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("got %+v\nwant %+v (new object's labels must not attach to the old UID)", got, want)
+	}
+}

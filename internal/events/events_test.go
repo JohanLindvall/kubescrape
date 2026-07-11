@@ -154,3 +154,67 @@ func TestEventsCountIncrement(t *testing.T) {
 		t.Fatalf("records = %d", exp.records())
 	}
 }
+
+// Recurrences recorded through events.k8s.io/v1 bump series.count while the
+// legacy count/lastTimestamp stay zero — they must re-emit too.
+func TestEventsSeriesIncrement(t *testing.T) {
+	exp := &capture{}
+	e := New(Config{Store: store.New(time.Minute), Exporter: exp, FlushInterval: 20 * time.Millisecond})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go e.Run(ctx)
+
+	now := time.Now().Add(time.Second)
+	old := testEvent("FailedScheduling", "Pod", "p", "u", now)
+	old.Count = 0
+	old.LastTimestamp = metav1.Time{}
+	old.Series = &corev1.EventSeries{Count: 1, LastObservedTime: metav1.MicroTime{Time: now}}
+	newer := testEvent("FailedScheduling", "Pod", "p", "u", now)
+	newer.Count = 0
+	newer.LastTimestamp = metav1.Time{}
+	newer.Series = &corev1.EventSeries{Count: 5, LastObservedTime: metav1.MicroTime{Time: now.Add(time.Second)}}
+
+	e.OnUpdate(old, newer) // series bump -> export
+	e.OnUpdate(newer, newer)
+
+	deadline := time.Now().Add(3 * time.Second)
+	for exp.records() < 1 && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if exp.records() != 1 {
+		t.Fatalf("records = %d, want 1 (series recurrence must re-emit)", exp.records())
+	}
+}
+
+// UID-less events for different objects must not collapse into one resource
+// (the second event would inherit the first object's attributes).
+func TestEventsUIDLessDistinctObjects(t *testing.T) {
+	exp := &capture{}
+	e := New(Config{Store: store.New(time.Minute), Exporter: exp, FlushInterval: 20 * time.Millisecond})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go e.Run(ctx)
+
+	when := time.Now().Add(time.Second)
+	e.OnAdd(testEvent("R1", "Foo", "a", "", when))
+	e.OnAdd(testEvent("R2", "Bar", "b", "", when))
+
+	deadline := time.Now().Add(3 * time.Second)
+	for exp.records() < 2 && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+	}
+	exp.mu.Lock()
+	defer exp.mu.Unlock()
+	kinds := map[string]bool{}
+	for _, b := range exp.batches {
+		rls := b.ResourceLogs()
+		for i := 0; i < rls.Len(); i++ {
+			if v, ok := rls.At(i).Resource().Attributes().Get("k8s.object.kind"); ok {
+				kinds[v.Str()] = true
+			}
+		}
+	}
+	if !kinds["Foo"] || !kinds["Bar"] {
+		t.Fatalf("resource kinds = %v, want both Foo and Bar", kinds)
+	}
+}

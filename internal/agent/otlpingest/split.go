@@ -27,12 +27,17 @@ func (e *Enricher) splitAndEnrich(ctx context.Context, md pmetric.Metrics) pmetr
 			enricher:    e,
 			ctx:         ctx,
 			srcResource: rm.Resource(),
+			srcSchema:   rm.SchemaUrl(),
 			enrichCache: enrichCache,
 			out:         out,
 			rmByID:      map[string]pmetric.ResourceMetrics{},
 			smByID:      map[idScope]pmetric.ScopeMetrics{},
 			metByID:     map[idMetric]pmetric.Metric{},
 		}
+		// Points without their own ID fall back to the resource-level one, so
+		// a mixed batch (auto mode) does not lose enrichment for resources
+		// that carried the ID where it belongs.
+		g.resToken, _ = e.findID(rm.Resource().Attributes())
 		sms := rm.ScopeMetrics()
 		for j := 0; j < sms.Len(); j++ {
 			sm := sms.At(j)
@@ -62,6 +67,8 @@ type metricGrouper struct {
 	enricher    *Enricher
 	ctx         context.Context
 	srcResource pcommon.Resource
+	srcSchema   string
+	resToken    string // resource-level ID, the fallback for ID-less points
 	enrichCache map[string]pcommon.Map
 	out         pmetric.Metrics
 	rmByID      map[string]pmetric.ResourceMetrics
@@ -73,6 +80,9 @@ type metricGrouper struct {
 func (g *metricGrouper) route(sm pmetric.ScopeMetrics, scopeIdx int, m pmetric.Metric, metricIdx int) {
 	move := func(dpAttrs pcommon.Map, copyTo func(dst pmetric.Metric)) {
 		token, _ := g.enricher.findID(dpAttrs)
+		if token == "" {
+			token = g.resToken
+		}
 		dst := g.metric(sm, scopeIdx, m, metricIdx, token)
 		copyTo(dst)
 	}
@@ -122,6 +132,7 @@ func (g *metricGrouper) metric(sm pmetric.ScopeMetrics, scopeIdx int, m pmetric.
 	dst.SetName(m.Name())
 	dst.SetDescription(m.Description())
 	dst.SetUnit(m.Unit())
+	m.Metadata().CopyTo(dst.Metadata())
 	switch m.Type() {
 	case pmetric.MetricTypeGauge:
 		dst.SetEmptyGauge()
@@ -159,6 +170,7 @@ func (g *metricGrouper) resource(id string) pmetric.ResourceMetrics {
 	}
 	rm := g.out.ResourceMetrics().AppendEmpty()
 	g.srcResource.CopyTo(rm.Resource())
+	rm.SetSchemaUrl(g.srcSchema)
 	if id != "" {
 		g.mergeEnrichment(id, rm.Resource().Attributes())
 	}

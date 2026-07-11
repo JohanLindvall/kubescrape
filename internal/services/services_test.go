@@ -122,3 +122,17 @@ func TestAll(t *testing.T) {
 		t.Fatalf("All(empty) = %v", got)
 	}
 }
+
+// Kubernetes selector semantics: a key must be PRESENT on the pod; an
+// empty-string selector value must not match pods lacking the label.
+func TestSelectorRequiresKeyPresence(t *testing.T) {
+	if selects(map[string]string{"app": ""}, map[string]string{}) {
+		t.Error("empty-value selector matched a pod without the label")
+	}
+	if !selects(map[string]string{"app": ""}, map[string]string{"app": ""}) {
+		t.Error("empty-value selector must match an empty-value label")
+	}
+	if !selects(map[string]string{"app": "web"}, map[string]string{"app": "web", "extra": "x"}) {
+		t.Error("exact match failed")
+	}
+}

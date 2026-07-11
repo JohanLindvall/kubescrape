@@ -37,12 +37,18 @@ func Key(attrs []Attr) string {
 	for _, a := range attrs {
 		b.WriteString(a.Key)
 		b.WriteByte('=')
+		// Tag the type and quote strings so differently-typed values ("1" vs
+		// 1) or values containing the separators cannot alias to the same key
+		// and merge records into one mis-attributed resource/scope.
 		switch v := a.Val.(type) {
 		case string:
-			b.WriteString(v)
+			b.WriteByte('s')
+			b.WriteString(strconv.Quote(v))
 		case bool:
+			b.WriteByte('b')
 			b.WriteString(strconv.FormatBool(v))
 		case float64:
+			b.WriteByte('f')
 			b.WriteString(strconv.FormatFloat(v, 'g', -1, 64))
 		}
 		b.WriteByte('\x00')

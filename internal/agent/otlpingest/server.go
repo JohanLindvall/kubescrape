@@ -18,6 +18,11 @@ import (
 	"go.opentelemetry.io/collector/pdata/pmetric"
 	"go.opentelemetry.io/collector/pdata/pmetric/pmetricotlp"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
+	"github.com/JohanLindvall/kubescrape/internal/agent/otlpexport"
+	"github.com/JohanLindvall/kubescrape/internal/agent/spool"
 )
 
 // Exporter forwards enriched telemetry; implemented by otlpexport.Client.
@@ -121,7 +126,7 @@ func (g *logsGRPC) Export(ctx context.Context, req plogotlp.ExportRequest) (plog
 	ld := req.Logs()
 	g.s.cfg.Enricher.EnrichLogs(ctx, ld)
 	if err := g.s.cfg.Exporter.ExportLogs(ctx, ld); err != nil {
-		return plogotlp.ExportResponse{}, err
+		return plogotlp.ExportResponse{}, grpcForwardStatus(err)
 	}
 	return plogotlp.NewExportResponse(), nil
 }
@@ -134,9 +139,33 @@ type metricsGRPC struct {
 func (g *metricsGRPC) Export(ctx context.Context, req pmetricotlp.ExportRequest) (pmetricotlp.ExportResponse, error) {
 	md := g.s.cfg.Enricher.EnrichMetrics(ctx, req.Metrics())
 	if err := g.s.cfg.Exporter.ExportMetrics(ctx, md); err != nil {
-		return pmetricotlp.ExportResponse{}, err
+		return pmetricotlp.ExportResponse{}, grpcForwardStatus(err)
 	}
 	return pmetricotlp.NewExportResponse(), nil
+}
+
+// grpcForwardStatus maps a forwarding failure onto a gRPC status the sender's
+// SDK retries correctly. A bare error would surface as codes.Unknown —
+// NON-retryable per the OTLP spec — making senders permanently drop batches on
+// transient conditions (a full disk buffer, an upstream 5xx). A status error
+// from a gRPC upstream passes through unchanged.
+func grpcForwardStatus(err error) error {
+	if _, ok := status.FromError(err); ok {
+		return err
+	}
+	if errors.Is(err, spool.ErrFull) {
+		return status.Error(codes.Unavailable, err.Error()) // backpressure: retry later
+	}
+	var he *otlpexport.HTTPStatusError
+	if errors.As(err, &he) {
+		if he.Code >= 400 && he.Code < 500 && he.Code != 408 && he.Code != 429 {
+			return status.Error(codes.InvalidArgument, err.Error()) // permanent upstream rejection
+		}
+		return status.Error(codes.Unavailable, err.Error())
+	}
+	// Unclassified forwarding failures are treated as transient: the receiver
+	// is a proxy, and the sender retrying is the safe default.
+	return status.Error(codes.Unavailable, err.Error())
 }
 
 // --- HTTP (OTLP/HTTP protobuf) ---
@@ -144,7 +173,11 @@ func (g *metricsGRPC) Export(ctx context.Context, req pmetricotlp.ExportRequest)
 func (s *Server) handleHTTPLogs(w http.ResponseWriter, r *http.Request) {
 	body, err := readBody(r)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		code := http.StatusBadRequest
+		if errors.Is(err, errBodyTooLarge) {
+			code = http.StatusRequestEntityTooLarge
+		}
+		http.Error(w, err.Error(), code)
 		return
 	}
 	req := plogotlp.NewExportRequest()
@@ -164,7 +197,11 @@ func (s *Server) handleHTTPLogs(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleHTTPMetrics(w http.ResponseWriter, r *http.Request) {
 	body, err := readBody(r)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		code := http.StatusBadRequest
+		if errors.Is(err, errBodyTooLarge) {
+			code = http.StatusRequestEntityTooLarge
+		}
+		http.Error(w, err.Error(), code)
 		return
 	}
 	req := pmetricotlp.NewExportRequest()
@@ -181,6 +218,10 @@ func (s *Server) handleHTTPMetrics(w http.ResponseWriter, r *http.Request) {
 }
 
 const maxIngestBody = 16 << 20 // 16 MiB per request
+
+// errBodyTooLarge maps to 413; truncating silently could ACK a payload whose
+// tail was dropped.
+var errBodyTooLarge = fmt.Errorf("request body exceeds %d bytes", maxIngestBody)
 
 func readBody(r *http.Request) ([]byte, error) {
 	if ct := r.Header.Get("Content-Type"); ct != "" && ct != "application/x-protobuf" {
@@ -199,8 +240,16 @@ func readBody(r *http.Request) ([]byte, error) {
 	default:
 		return nil, fmt.Errorf("unsupported Content-Encoding %q (want gzip or identity)", enc)
 	}
-	// The cap applies to the decompressed size too (zip-bomb guard).
-	return io.ReadAll(io.LimitReader(src, maxIngestBody))
+	// The cap applies to the decompressed size too (zip-bomb guard). Read one
+	// byte beyond it to distinguish at-cap from over-cap and reject the latter.
+	body, err := io.ReadAll(io.LimitReader(src, maxIngestBody+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(body) > maxIngestBody {
+		return nil, errBodyTooLarge
+	}
+	return body, nil
 }
 
 type protoMarshaler interface{ MarshalProto() ([]byte, error) }

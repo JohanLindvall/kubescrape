@@ -58,6 +58,14 @@ var (
 		Name: "kubescrape_log_rules_dropped_total",
 		Help: "Log records dropped by the logs rules (including sampled-away lines).",
 	})
+	BufferDropped = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "kubescrape_buffer_dropped_total",
+		Help: "Buffered batches dropped after a permanent collector rejection (bad payload, auth, unimplemented).",
+	}, []string{"signal"})
+	BufferRequeued = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "kubescrape_buffer_requeued_total",
+		Help: "Buffered batches moved to the back of the queue after repeated transient failures (keeps one stuck batch from blocking the signal).",
+	}, []string{"signal"})
 )
 
 // Scrape pipeline (agent).

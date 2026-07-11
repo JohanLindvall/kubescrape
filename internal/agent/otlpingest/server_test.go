@@ -9,13 +9,17 @@ import (
 	"testing"
 	"time"
 
+	"github.com/JohanLindvall/kubescrape/internal/agent/otlpexport"
+	"github.com/JohanLindvall/kubescrape/internal/agent/spool"
 	"github.com/klauspost/compress/gzip"
 	"go.opentelemetry.io/collector/pdata/plog"
 	"go.opentelemetry.io/collector/pdata/plog/plogotlp"
 	"go.opentelemetry.io/collector/pdata/pmetric"
 	"go.opentelemetry.io/collector/pdata/pmetric/pmetricotlp"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
 )
 
 type captureExporter struct {
@@ -277,5 +281,85 @@ func TestServerGRPC(t *testing.T) {
 	exp.fail = true
 	if _, err := logs.Export(context.Background(), plogotlp.NewExportRequestFromLogs(ld)); err == nil {
 		t.Error("export failure must propagate to the gRPC sender")
+	}
+}
+
+// A gaugeMetrics helper lives in enrich_test.go; these tests reuse it.
+
+// grpcForwardStatus must return retryable codes for transient forwarding
+// failures and permanent codes only for definitive upstream rejections.
+func TestGRPCForwardStatus(t *testing.T) {
+	cases := []struct {
+		err  error
+		want codes.Code
+	}{
+		{spool.ErrFull, codes.Unavailable},
+		{&otlpexport.HTTPStatusError{Code: 503, Body: "overloaded"}, codes.Unavailable},
+		{&otlpexport.HTTPStatusError{Code: 429, Body: "slow down"}, codes.Unavailable},
+		{&otlpexport.HTTPStatusError{Code: 400, Body: "bad"}, codes.InvalidArgument},
+		{context.DeadlineExceeded, codes.Unavailable},
+		{status.Error(codes.ResourceExhausted, "too large"), codes.ResourceExhausted}, // upstream status passes through
+	}
+	for _, c := range cases {
+		got := status.Code(grpcForwardStatus(c.err))
+		if got != c.want {
+			t.Errorf("grpcForwardStatus(%v) = %v, want %v", c.err, got, c.want)
+		}
+	}
+}
+
+// An oversized body must be rejected with 413, not silently truncated (a
+// truncated protobuf could unmarshal and be ACKed with its tail dropped).
+func TestHTTPBodyTooLarge(t *testing.T) {
+	srv := httpTestServer(t, &captureExporter{})
+	big := bytes.Repeat([]byte{0x0a}, maxIngestBody+2)
+	resp, err := http.Post(srv.URL+"/v1/logs", "application/x-protobuf", bytes.NewReader(big))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status = %d, want 413", resp.StatusCode)
+	}
+}
+
+// Auto mode with a mixed batch: the resource that carried its ID at the
+// resource level keeps its enrichment when the batch falls back to splitting.
+func TestAutoSplitKeepsResourceLevelID(t *testing.T) {
+	md := pmetric.NewMetrics()
+	// RM-A: id on the resource, none on the points.
+	rmA := md.ResourceMetrics().AppendEmpty()
+	rmA.SetSchemaUrl("https://example.com/schema/1")
+	rmA.Resource().Attributes().PutStr("container.id", "cafe01")
+	mA := rmA.ScopeMetrics().AppendEmpty().Metrics().AppendEmpty()
+	mA.SetName("a_metric")
+	mA.Metadata().PutStr("prometheus.type", "gauge")
+	mA.SetEmptyGauge().DataPoints().AppendEmpty().SetDoubleValue(1)
+	// RM-B: ids on the points.
+	rmB := md.ResourceMetrics().AppendEmpty()
+	mB := rmB.ScopeMetrics().AppendEmpty().Metrics().AppendEmpty()
+	mB.SetName("b_metric")
+	dpB := mB.SetEmptyGauge().DataPoints().AppendEmpty()
+	dpB.SetDoubleValue(1)
+	dpB.Attributes().PutStr("k8s.pod.uid", "pod-uid-2")
+
+	out := newEnricher(newMeta(), MetricsAuto).EnrichMetrics(context.Background(), md)
+	got := collectPodNames(out)
+	if got["web-1"] != 1 || got["web-2"] != 1 {
+		t.Fatalf("mixed auto-split points = %+v (resource-level ID lost)", got)
+	}
+	// SchemaUrl and metric metadata survive the rebuild.
+	rms := out.ResourceMetrics()
+	for i := 0; i < rms.Len(); i++ {
+		rm := rms.At(i)
+		if name, _ := rm.Resource().Attributes().Get("k8s.pod.name"); name.Str() == "web-1" {
+			if rm.SchemaUrl() != "https://example.com/schema/1" {
+				t.Errorf("schema url = %q", rm.SchemaUrl())
+			}
+			m := rm.ScopeMetrics().At(0).Metrics().At(0)
+			if v, ok := m.Metadata().Get("prometheus.type"); !ok || v.Str() != "gauge" {
+				t.Errorf("metric metadata lost: %v", m.Metadata().AsRaw())
+			}
+		}
 	}
 }

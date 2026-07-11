@@ -354,7 +354,11 @@ func run() error {
 		go func() {
 			defer wg.Done()
 			if err := srv.Run(ctx); err != nil {
-				log.Error("otlp ingest server failed", "error", err)
+				// A dead ingest listener (e.g. the port already bound) must not
+				// leave the agent looking healthy while apps push into a void:
+				// shut the agent down so the failure is visible (CrashLoop).
+				log.Error("otlp ingest server failed; shutting down", "error", err)
+				stop()
 			}
 		}()
 		log.Info("otlp ingest started", "grpc", *ingestGRPC, "http", *ingestHTTP, "metricsMode", *ingestMetrics)
@@ -435,6 +439,15 @@ func run() error {
 	<-ctx.Done()
 	log.Info("shutting down")
 	wg.Wait()
+	if logMetrics != nil {
+		// The tailer's final flush (inside wg.Wait) fed the set; export the
+		// last window before the deferred exporter/buffer close.
+		fctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := logMetrics.Export(fctx, out, *logsMetricsBytes); err != nil {
+			log.Warn("final log-metrics export failed", "error", err)
+		}
+	}
 	return nil
 }
 

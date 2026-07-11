@@ -54,10 +54,13 @@ func New(cfg Config) *Exporter {
 		log = slog.Default()
 	}
 	return &Exporter{
-		cfg:   cfg,
-		log:   log,
-		ch:    make(chan *corev1.Event, 4*cfg.BatchSize),
-		start: time.Now(),
+		cfg: cfg,
+		log: log,
+		ch:  make(chan *corev1.Event, 4*cfg.BatchSize),
+		// Event timestamps have second granularity; truncating the start
+		// keeps a genuinely-new event created in the startup second from
+		// being misclassified as pre-start history.
+		start: time.Now().Truncate(time.Second),
 	}
 }
 
@@ -68,16 +71,27 @@ func (e *Exporter) OnAdd(obj any) {
 	}
 }
 
-// OnUpdate handles informer updates (recurring events bump their count).
+// OnUpdate handles informer updates. Recurrences surface as bumps to the
+// legacy count/lastTimestamp OR — for events recorded through the
+// events.k8s.io/v1 API (most modern controllers and the scheduler) — to
+// series.count/series.lastObservedTime, while the legacy fields stay zero.
 func (e *Exporter) OnUpdate(oldObj, newObj any) {
 	oldEv, ok1 := oldObj.(*corev1.Event)
 	newEv, ok2 := newObj.(*corev1.Event)
 	if !ok1 || !ok2 {
 		return
 	}
-	if newEv.Count > oldEv.Count || !newEv.LastTimestamp.Equal(&oldEv.LastTimestamp) {
+	if newEv.Count > oldEv.Count || !newEv.LastTimestamp.Equal(&oldEv.LastTimestamp) ||
+		seriesCount(newEv) > seriesCount(oldEv) {
 		e.enqueue(newEv)
 	}
+}
+
+func seriesCount(ev *corev1.Event) int32 {
+	if ev.Series == nil {
+		return 0
+	}
+	return ev.Series.Count
 }
 
 func (e *Exporter) enqueue(ev *corev1.Event) {
@@ -99,6 +113,9 @@ func eventTime(ev *corev1.Event) time.Time {
 	}
 	if ev.EventTime.After(t) {
 		t = ev.EventTime.Time
+	}
+	if ev.Series != nil && ev.Series.LastObservedTime.After(t) {
+		t = ev.Series.LastObservedTime.Time
 	}
 	return t
 }
@@ -142,7 +159,11 @@ func (e *Exporter) convert(batch []*corev1.Event) plog.Logs {
 	scopes := make(map[string]plog.ScopeLogs)
 	now := pcommon.NewTimestampFromTime(time.Now())
 	for _, ev := range batch {
-		key := ev.InvolvedObject.Namespace + "\x00" + string(ev.InvolvedObject.UID)
+		// UID is optional on ObjectReference; include kind+name so UID-less
+		// events for different objects get their own (correctly attributed)
+		// resources.
+		key := ev.InvolvedObject.Namespace + "\x00" + string(ev.InvolvedObject.UID) +
+			"\x00" + ev.InvolvedObject.Kind + "\x00" + ev.InvolvedObject.Name
 		sl, ok := scopes[key]
 		if !ok {
 			rl := ld.ResourceLogs().AppendEmpty()

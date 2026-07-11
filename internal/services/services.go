@@ -133,7 +133,11 @@ func (ix *Index) Matching(namespace string, podLabels map[string]string) []*Serv
 
 func selects(selector, labels map[string]string) bool {
 	for k, v := range selector {
-		if labels[k] != v {
+		// Kubernetes selector semantics: the key must be PRESENT and equal.
+		// A bare labels[k] != v would let a selector with an empty value
+		// match every pod lacking the label entirely.
+		got, ok := labels[k]
+		if !ok || got != v {
 			return false
 		}
 	}

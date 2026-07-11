@@ -17,6 +17,8 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"hash/fnv"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -136,19 +138,22 @@ func (s *Spool) load() error {
 }
 
 // openTail opens the newest segment for appending and truncates any torn tail
-// (a frame whose write was interrupted by a crash).
+// (a frame whose write was interrupted by a crash) or orphan bytes beyond the
+// last whole frame (a partial append whose rollback did not complete).
 func (s *Spool) openTail() error {
 	tail := &s.segs[len(s.segs)-1]
 	good, err := lastCompleteOffset(tail.path, tail.size)
 	if err != nil {
 		return err
 	}
-	if good < tail.size {
+	if info, err := os.Stat(tail.path); err != nil {
+		return err
+	} else if info.Size() != good {
 		if err := os.Truncate(tail.path, good); err != nil {
 			return err
 		}
-		tail.size = good
 	}
+	tail.size = good
 	f, err := os.OpenFile(tail.path, os.O_WRONLY|os.O_APPEND, 0o644)
 	if err != nil {
 		return err
@@ -187,7 +192,12 @@ func lastCompleteOffset(path string, size int64) (int64, error) {
 	hdr := make([]byte, frameHeader)
 	for off+frameHeader <= size {
 		if _, err := f.ReadAt(hdr, off); err != nil {
-			break
+			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+				break // file shorter than recorded: torn tail
+			}
+			// A real I/O error is not a truncation point: truncating here
+			// would silently discard valid fsynced frames after it.
+			return 0, err
 		}
 		end := off + frameHeader + int64(binary.BigEndian.Uint32(hdr))
 		if end > size {
@@ -223,6 +233,13 @@ func (s *Spool) Append(data []byte) error {
 	if s.maxBytes > 0 && s.backlog()+frame > s.maxBytes {
 		return ErrFull
 	}
+	if s.w == nil {
+		// A previous failed append could not roll back and closed the handle;
+		// reopen re-verifies the tail and truncates the orphan bytes.
+		if err := s.openTail(); err != nil {
+			return err
+		}
+	}
 	tail := &s.segs[len(s.segs)-1]
 	if tail.size > 0 && tail.size+frame > s.segmentSize {
 		if err := s.appendSegment(tail.seq + 1); err != nil {
@@ -233,17 +250,34 @@ func (s *Spool) Append(data []byte) error {
 	var hdr [frameHeader]byte
 	binary.BigEndian.PutUint32(hdr[:], uint32(len(data)))
 	if _, err := s.w.Write(hdr[:]); err != nil {
+		s.rollbackTail(tail)
 		return err
 	}
 	if _, err := s.w.Write(data); err != nil {
+		s.rollbackTail(tail)
 		return err
 	}
 	if err := s.w.Sync(); err != nil {
+		s.rollbackTail(tail)
 		return err
 	}
 	tail.size += frame
 	s.notify()
 	return nil
+}
+
+// rollbackTail restores the write tail to its last known-good size after a
+// failed append (e.g. ENOSPC mid-frame — the condition a disk spool exists
+// for). O_APPEND writes land at the physical end, so leaving partial bytes
+// would desynchronize the frame stream from the size accounting and could be
+// misparsed as frames after a restart. If the truncate itself fails the
+// handle is closed and the next Append reopens and re-verifies the tail.
+func (s *Spool) rollbackTail(tail *segment) {
+	if err := s.w.Truncate(tail.size); err == nil {
+		return
+	}
+	_ = s.w.Close()
+	s.w = nil
 }
 
 // Pop returns the next record and a commit function that removes it, or ok
@@ -330,29 +364,48 @@ func (s *Spool) Close() error {
 	return nil
 }
 
-// loadCursor reads the persisted {seq, offset}; a missing cursor starts at the
-// oldest segment.
+// loadCursor reads the persisted {seq, offset}; a missing cursor starts at
+// the oldest segment. The record carries a checksum because it is rewritten
+// in place: a torn write on power loss must fall back to redelivering from
+// the oldest segment (duplicates, within at-least-once) rather than seek to a
+// mixed old/new position that silently skips undelivered frames. A legacy
+// 16-byte record (no checksum) is accepted for upgrades.
 func (s *Spool) loadCursor() (seq, off int64, err error) {
 	f, err := os.OpenFile(filepath.Join(s.dir, cursorName), os.O_RDWR|os.O_CREATE, 0o644)
 	if err != nil {
 		return 0, 0, err
 	}
 	s.cursorF = f
-	var buf [16]byte
-	if _, err := f.ReadAt(buf[:], 0); err != nil {
-		return s.segs[0].seq, 0, nil // fresh/short cursor: start at the oldest segment
+	var buf [cursorLen]byte
+	n, _ := f.ReadAt(buf[:], 0)
+	switch {
+	case n >= cursorLen && binary.BigEndian.Uint64(buf[16:]) == cursorSum(buf[:16]):
+		return int64(binary.BigEndian.Uint64(buf[:8])), int64(binary.BigEndian.Uint64(buf[8:16])), nil
+	case n == 16: // legacy pre-checksum cursor
+		return int64(binary.BigEndian.Uint64(buf[:8])), int64(binary.BigEndian.Uint64(buf[8:16])), nil
+	default: // fresh, short, or torn: redeliver from the oldest segment
+		return s.segs[0].seq, 0, nil
 	}
-	return int64(binary.BigEndian.Uint64(buf[:8])), int64(binary.BigEndian.Uint64(buf[8:])), nil
 }
 
-// persistCursor rewrites the 16-byte cursor in place (caller holds the lock).
+const cursorLen = 24 // seq(8) + offset(8) + fnv64a checksum(8)
+
+func cursorSum(b []byte) uint64 {
+	h := fnv.New64a()
+	_, _ = h.Write(b)
+	return h.Sum64()
+}
+
+// persistCursor rewrites the checksummed cursor in place (caller holds the
+// lock).
 func (s *Spool) persistCursor() {
 	if s.cursorF == nil {
 		return
 	}
-	var buf [16]byte
+	var buf [cursorLen]byte
 	binary.BigEndian.PutUint64(buf[:8], uint64(s.segs[0].seq))
-	binary.BigEndian.PutUint64(buf[8:], uint64(s.readOff))
+	binary.BigEndian.PutUint64(buf[8:16], uint64(s.readOff))
+	binary.BigEndian.PutUint64(buf[16:], cursorSum(buf[:16]))
 	if _, err := s.cursorF.WriteAt(buf[:], 0); err == nil {
 		_ = s.cursorF.Sync()
 	}

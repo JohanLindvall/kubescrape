@@ -300,7 +300,19 @@ func (c *Client) httpPost(ctx context.Context, url string, body []byte) error {
 	}()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 256))
-		return fmt.Errorf("status %d: %s", resp.StatusCode, strings.TrimSpace(string(msg)))
+		return &HTTPStatusError{Code: resp.StatusCode, Body: strings.TrimSpace(string(msg))}
 	}
 	return nil
+}
+
+// HTTPStatusError is a non-2xx response from the OTLP/HTTP collector, typed so
+// callers (the buffered drain, the ingest receiver) can classify permanent
+// rejections vs transient failures.
+type HTTPStatusError struct {
+	Code int
+	Body string
+}
+
+func (e *HTTPStatusError) Error() string {
+	return fmt.Sprintf("status %d: %s", e.Code, e.Body)
 }

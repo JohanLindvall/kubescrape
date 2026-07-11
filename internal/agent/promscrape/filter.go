@@ -222,12 +222,28 @@ func (f *MetricFilter) session() *filterSession {
 	if f == nil || len(f.rules) > 64 {
 		return &filterSession{f: f} // no memo; fall back to direct Keep
 	}
-	return &filterSession{f: f, masks: make(map[string]uint64, 64)}
+	s := &filterSession{f: f, masks: make(map[string]uint64, 64)}
+	for _, r := range f.rules {
+		if len(r.labels) > 0 {
+			s.lblMatch = make(map[lblMatchKey]bool, 64)
+			break
+		}
+	}
+	return s
 }
 
 type filterSession struct {
-	f     *MetricFilter
-	masks map[string]uint64 // name -> bitmask of name-matching rules
+	f        *MetricFilter
+	masks    map[string]uint64 // name -> bitmask of name-matching rules
+	lblMatch map[lblMatchKey]bool
+}
+
+// lblMatchKey memoizes one label matcher's verdict on one value: label values
+// repeat heavily within a scrape (bucket boundaries, namespaces, pod names),
+// so each distinct (matcher, value) pair pays the regex once per scrape.
+type lblMatchKey struct {
+	re    *regexp.Regexp
+	value string
 }
 
 func (s *filterSession) Keep(name string, labels []Label) bool {
@@ -249,8 +265,35 @@ func (s *filterSession) Keep(name string, labels []Label) bool {
 	for mask != 0 {
 		i := bits.TrailingZeros64(mask)
 		mask &^= 1 << i
-		if r := &s.f.rules[i]; r.labelsMatch(labels) {
+		if r := &s.f.rules[i]; s.labelsMatch(r, labels) {
 			return !r.drop
+		}
+	}
+	return true
+}
+
+// labelsMatch is compiledRule.labelsMatch with the session's memo in front of
+// each matcher's regex.
+func (s *filterSession) labelsMatch(r *compiledRule, labels []Label) bool {
+	for i := range r.labels {
+		m := &r.labels[i]
+		value := ""
+		for _, l := range labels {
+			if l.Name == m.name {
+				value = l.Value
+				break
+			}
+		}
+		key := lblMatchKey{re: m.re, value: value}
+		matched, ok := s.lblMatch[key]
+		if !ok {
+			matched = m.re.MatchString(value)
+			if len(s.lblMatch) < maxInternedValues { // bound the per-scrape memo
+				s.lblMatch[key] = matched
+			}
+		}
+		if !matched {
+			return false
 		}
 	}
 	return true

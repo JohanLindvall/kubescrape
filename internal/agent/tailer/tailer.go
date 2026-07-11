@@ -261,8 +261,25 @@ type file struct {
 
 	// keyStdout/keyStderr are the precomputed pipeline keys
 	// ("<containerID>/<stream>") — feedLine runs per physical line and must
-	// not rebuild them.
+	// not rebuild them. stStdout/stStderr/stPlain are the matching cached
+	// ledger states (stPlain doubles as the containerd passthrough key's
+	// state); they are re-derived by newPipeline after every reset.
 	keyStdout, keyStderr string
+	stStdout, stStderr   *streamState
+	stPlain              *streamState
+}
+
+// stateFor resolves a pipeline key handed back by an aggregator callback to
+// its stream state. The keys are the fixed per-file set, so the common cases
+// are single string compares (usually pointer-equal).
+func (f *file) stateFor(key string) *streamState {
+	switch key {
+	case f.keyStdout:
+		return f.stStdout
+	case f.keyStderr:
+		return f.stStderr
+	}
+	return f.state(key)
 }
 
 type logItem struct{ start, end int64 }
@@ -270,16 +287,19 @@ type logItem struct{ start, end int64 }
 // ledger is the byte-offset durability accounting for one file's two-stage
 // pipeline: it decides how far the checkpoint may safely advance and how a
 // multi-line group buffered across a rename rotation survives a crash. It is
-// embedded in file (fields/methods are used unqualified as f.fifo, f.gen,
+// embedded in file (fields/methods are used unqualified as f.state(), f.gen,
 // f.watermark(), ...).
 //
 // # Offsets within one inode
 //
-// A physical line spans [start, end) bytes. lastEnd, runStart and fifo are
-// keyed by pipeline key ("<containerID>/<stream>"): lastEnd is the end of the
+// A physical line spans [start, end) bytes. Each pipeline key
+// ("<containerID>/<stream>") owns one streamState: lastEnd is the end of the
 // newest physical line fed; runStart is the start of the oldest physical line
 // not yet emitted by stage 1 (the CRI P/F rejoiner); fifo holds the [start,end)
 // ranges of the logical lines currently buffered in stage 2 (the trace joiner).
+// The set of keys per file is fixed (stdout/stderr, or one plain/passthrough
+// key), so the states live in a small slice and the per-line paths reach them
+// through pointers cached on the file — no map operations per line.
 // The multiline package hands the emitter only the *first* line's payload, so
 // an emitted group's end offset is recovered by popping Entry.Lines items off
 // its fifo and taking the last one's end. watermark() is the lowest offset
@@ -305,23 +325,47 @@ type logItem struct{ start, end int64 }
 //     loss. carried clears once the group exports (watermark shows nothing
 //     buffered).
 type ledger struct {
-	lastEnd  map[string]int64
-	runStart map[string]int64
-	fifo     map[string][]logItem
+	streams []*streamState
 
 	gen        int
 	carried    []rotatedPrefix
 	carriedFed bool
 }
 
-// reset clears the per-inode offset maps for a fresh pipeline incarnation. It
+// streamState is the offset accounting for one pipeline key. stream is the
+// precomputed streamOf(key), stamped on emitted entries. hasRun marks a
+// pending stage-1 run (presence, not just a zero offset).
+type streamState struct {
+	key      string
+	stream   string
+	lastEnd  int64
+	runStart int64
+	hasRun   bool
+	fifo     []logItem
+}
+
+// state returns the key's stream state, creating it on first use. The slice
+// holds at most a few entries, and the compares hit the pointer-equality fast
+// path, so this stays cheaper than a map — but per-line code should use the
+// pointers cached on the file instead.
+func (l *ledger) state(key string) *streamState {
+	for _, st := range l.streams {
+		if st.key == key {
+			return st
+		}
+	}
+	st := &streamState{key: key, stream: streamOf(key)}
+	l.streams = append(l.streams, st)
+	return st
+}
+
+// reset clears the per-inode offset states for a fresh pipeline incarnation. It
 // leaves gen and carried untouched (they persist across a carried rotation);
 // carriedFed goes false so any carried tails are re-read before the new inode.
+// Callers must re-derive any cached state pointers afterwards.
 func (l *ledger) reset() {
 	l.carriedFed = false
-	l.lastEnd = make(map[string]int64)
-	l.runStart = make(map[string]int64)
-	l.fifo = make(map[string][]logItem)
+	l.streams = nil
 }
 
 // reanchor resets the offsets still buffered in the pipeline to the new inode's
@@ -329,15 +373,11 @@ func (l *ledger) reset() {
 // group completes and the (new-inode) offset of its final line becomes the
 // commit point.
 func (l *ledger) reanchor() {
-	for k := range l.lastEnd {
-		l.lastEnd[k] = 0
-	}
-	for k := range l.runStart {
-		l.runStart[k] = 0
-	}
-	for _, items := range l.fifo {
-		for i := range items {
-			items[i] = logItem{}
+	for _, st := range l.streams {
+		st.lastEnd = 0
+		st.runStart = 0
+		for i := range st.fifo {
+			st.fifo[i] = logItem{}
 		}
 	}
 }
@@ -395,12 +435,12 @@ func (l *ledger) watermark() (int64, bool) {
 			wm = v
 		}
 	}
-	for _, v := range l.runStart {
-		lower(v)
-	}
-	for _, items := range l.fifo {
-		if len(items) > 0 {
-			lower(items[0].start)
+	for _, st := range l.streams {
+		if st.hasRun {
+			lower(st.runStart)
+		}
+		if len(st.fifo) > 0 {
+			lower(st.fifo[0].start)
 		}
 	}
 	return wm, wm >= 0
@@ -741,18 +781,27 @@ func (t *Tailer) newPipeline(f *file) {
 	f.reset()
 	f.keyStdout = f.containerID + "/stdout"
 	f.keyStderr = f.containerID + "/stderr"
+	if f.source.containerd {
+		f.stStdout = f.state(f.keyStdout)
+		f.stStderr = f.state(f.keyStderr)
+		f.stPlain = f.state(f.containerID) // non-CRI passthrough lines
+	} else {
+		f.stStdout, f.stStderr = nil, nil
+		f.stPlain = f.state(plainKey)
+	}
 
 	if f.source.multiline {
 		f.traces = multiline.New(func(_ context.Context, e multiline.Entry[time.Time]) error {
-			items := f.fifo[e.Key]
+			st := f.stateFor(e.Key)
+			items := st.fifo
 			n := min(e.Lines, len(items)) // Lines > len(items) must not happen; defensive
 			if n == 0 {
 				return nil
 			}
 			start, end := items[0].start, items[n-1].end
-			f.fifo[e.Key] = items[n:]
+			st.fifo = items[n:]
 			t.emit(f, entry{
-				time: e.Data, stream: streamOf(e.Key), body: e.Text,
+				time: e.Data, stream: st.stream, body: e.Text,
 				truncated: e.Truncated, match: e.Match, start: start, offset: end,
 			})
 			return nil
@@ -763,19 +812,20 @@ func (t *Tailer) newPipeline(f *file) {
 
 	// Containerd files run stage 1 (CRI P/F rejoin) ahead of the trace stage;
 	// plain files feed the trace stage (or emit) directly from feedLine.
-	// Emission is synchronous inside Add/Flush*, so lastEnd[key] is exactly the
-	// end offset of the line's last fragment.
+	// Emission is synchronous inside Add/Flush*, so the state's lastEnd is
+	// exactly the end offset of the line's last fragment.
 	if f.source.containerd {
 		f.criStage = cri.New(func(ctx context.Context, key, line string, when time.Time, start int64) error {
-			delete(f.runStart, key)
-			end := f.lastEnd[key]
+			st := f.stateFor(key)
+			st.hasRun = false
+			end := st.lastEnd
 			if f.traces == nil {
 				// start is the first fragment's offset (threaded through cri as the
 				// entry data), i.e. the logical line's start.
-				t.emit(f, entry{time: when, stream: streamOf(key), body: line, start: start, offset: end})
+				t.emit(f, entry{time: when, stream: st.stream, body: line, start: start, offset: end})
 				return nil
 			}
-			f.fifo[key] = append(f.fifo[key], logItem{start: start, end: end})
+			st.fifo = append(st.fifo, logItem{start: start, end: end})
 			return f.traces.AddAt(ctx, key, line, when, when)
 		}, multiline.WithMaxBytes(t.cfg.MaxEntryBytes))
 	} else {
@@ -813,20 +863,21 @@ func (t *Tailer) feedLine(ctx context.Context, f *file, raw string, start, end i
 		t.feedPlainLine(ctx, f, raw, start, end)
 		return
 	}
-	key := f.containerID
+	st := f.stPlain // non-CRI passthrough
 	if l, ok := cri.Parse(raw); ok {
 		switch l.Stream {
 		case "stdout":
-			key = f.keyStdout
+			st = f.stStdout
 		case "stderr":
-			key = f.keyStderr
+			st = f.stStderr
 		default:
-			key = f.containerID + "/" + l.Stream
+			st = f.state(f.containerID + "/" + l.Stream)
 		}
 	}
-	f.lastEnd[key] = end
-	if _, ok := f.runStart[key]; !ok {
-		f.runStart[key] = start
+	st.lastEnd = end
+	if !st.hasRun {
+		st.runStart = start
+		st.hasRun = true
 	}
 	if err := f.criStage.Add(ctx, f.containerID, raw, start); err != nil {
 		t.log.Warn("log pipeline", "path", f.path, "error", err)
@@ -844,7 +895,7 @@ func (t *Tailer) feedPlainLine(ctx context.Context, f *file, raw string, start, 
 		t.emit(f, entry{time: when, body: raw, start: start, offset: end})
 		return
 	}
-	f.fifo[plainKey] = append(f.fifo[plainKey], logItem{start: start, end: end})
+	f.stPlain.fifo = append(f.stPlain.fifo, logItem{start: start, end: end})
 	if err := f.traces.AddAt(ctx, plainKey, raw, when, when); err != nil {
 		t.log.Warn("log pipeline", "path", f.path, "error", err)
 	}

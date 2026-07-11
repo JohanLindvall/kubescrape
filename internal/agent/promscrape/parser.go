@@ -403,19 +403,29 @@ func (p *Parser) classify(name string) (SampleRole, string) {
 func (p *Parser) parseSample(line []byte) (Sample, bool) {
 	var s Sample
 
-	// Metric name.
+	// Metric name. Consecutive lines of a family share it, so matching the
+	// previous line's name plus its terminator in one memcmp skips the byte
+	// scan entirely.
 	i := 0
-	for i < len(line) && line[i] != '{' && line[i] != ' ' && line[i] != '\t' {
-		i++
+	if n := len(p.lastMetric); n > 0 && n < len(line) && string(line[:n]) == p.lastMetric {
+		switch line[n] {
+		case '{', ' ', '\t':
+			i = n
+			s.Name = p.lastMetric
+		}
 	}
-	if i == 0 {
-		return s, false
-	}
-	if string(line[:i]) == p.lastMetric { // memcmp fast path, no alloc
-		s.Name = p.lastMetric
-	} else {
-		s.Name = p.internName(line[:i])
-		p.lastMetric = s.Name
+	if s.Name == "" {
+		for i = 0; i < len(line) && line[i] != '{' && line[i] != ' ' && line[i] != '\t'; i++ {
+		}
+		if i == 0 {
+			return s, false
+		}
+		if string(line[:i]) == p.lastMetric { // memcmp fast path, no alloc
+			s.Name = p.lastMetric
+		} else {
+			s.Name = p.internName(line[:i])
+			p.lastMetric = s.Name
+		}
 	}
 	rest := line[i:]
 
@@ -545,25 +555,31 @@ func (p *Parser) parseLabels(rest []byte, dst *[]Label) ([]byte, bool) {
 		if rest[0] == '}' {
 			return rest[1:], true
 		}
-		// Label name.
-		i := 0
-		for i < len(rest) && rest[i] != '=' && rest[i] != ' ' && rest[i] != '\t' {
-			i++
-		}
-		if i == 0 {
-			return nil, false
-		}
 		pos := len(*dst)
 		if pos == len(p.lastKV) {
 			p.lastKV = append(p.lastKV, lastKV{})
 		}
 		last := &p.lastKV[pos]
+		// Label name. Consecutive lines of a family repeat names positionally,
+		// so matching the previous line's name plus its '=' terminator in one
+		// memcmp skips the byte scan.
 		var name string
-		if string(rest[:i]) == last.name { // memcmp fast path, no alloc
+		i := 0
+		if n := len(last.name); n > 0 && n < len(rest) && rest[n] == '=' && string(rest[:n]) == last.name {
 			name = last.name
+			i = n
 		} else {
-			name = p.internName(rest[:i])
-			last.name = name
+			for i = 0; i < len(rest) && rest[i] != '=' && rest[i] != ' ' && rest[i] != '\t'; i++ {
+			}
+			if i == 0 {
+				return nil, false
+			}
+			if string(rest[:i]) == last.name { // memcmp fast path, no alloc
+				name = last.name
+			} else {
+				name = p.internName(rest[:i])
+				last.name = name
+			}
 		}
 		rest = skipSpaceTab(rest[i:])
 		if len(rest) == 0 || rest[0] != '=' {
@@ -591,23 +607,23 @@ func (p *Parser) parseLabels(rest []byte, dst *[]Label) ([]byte, bool) {
 // memcmp) before interning, so a repeated value costs neither a hash nor an
 // allocation. last may be nil (exemplar labels).
 func (p *Parser) parseQuoted(rest []byte, last *lastKV) (string, []byte, bool) {
-	// Fast path: no backslashes before the closing quote.
-	for i := 0; i < len(rest); i++ {
-		switch rest[i] {
-		case '"':
-			if last != nil && string(rest[:i]) == last.value {
-				return last.value, rest[i+1:], true
-			}
-			v := p.internValue(rest[:i])
-			if last != nil {
-				last.value = v
-			}
-			return v, rest[i+1:], true
-		case '\\':
-			return parseQuotedSlow(rest)
-		}
+	// Fast path: SIMD-scan for the closing quote; any backslash before it
+	// (including one escaping a quote) routes to the slow path.
+	i := bytes.IndexByte(rest, '"')
+	if i < 0 {
+		return "", nil, false
 	}
-	return "", nil, false
+	if bytes.IndexByte(rest[:i], '\\') >= 0 {
+		return parseQuotedSlow(rest)
+	}
+	if last != nil && string(rest[:i]) == last.value {
+		return last.value, rest[i+1:], true
+	}
+	v := p.internValue(rest[:i])
+	if last != nil {
+		last.value = v
+	}
+	return v, rest[i+1:], true
 }
 
 func parseQuotedSlow(rest []byte) (string, []byte, bool) {

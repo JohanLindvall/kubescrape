@@ -256,9 +256,15 @@ func newSplitBatcher(s *Scraper, ctx context.Context, t kubemeta.ScrapeTarget, s
 
 func (b *splitBatcher) reset() {
 	b.md = pmetric.NewMetrics()
-	b.scopes = make(map[string]pmetric.ScopeMetrics)
-	b.byKey = make(map[string]pmetric.Metric)
-	b.dpAttrs = make(map[string][]kv)
+	if b.scopes == nil {
+		b.scopes = make(map[string]pmetric.ScopeMetrics)
+		b.byKey = make(map[string]pmetric.Metric)
+		b.dpAttrs = make(map[string][]kv)
+	} else {
+		clear(b.scopes)
+		clear(b.byKey)
+		clear(b.dpAttrs)
+	}
 	b.points = 0
 }
 

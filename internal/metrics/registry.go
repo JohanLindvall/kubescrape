@@ -55,7 +55,10 @@ func (r *Registry) Counter(name, desc string) *RegCounter {
 
 // CounterVec registers a labeled monotonic counter.
 func (r *Registry) CounterVec(name, desc string, labelNames ...string) *RegCounterVec {
-	return &RegCounterVec{vec{s: r.add(name, desc, kindCounter, actionSet, nil), keys: labelNames}}
+	return &RegCounterVec{vec[RegCounter]{
+		s: r.add(name, desc, kindCounter, actionSet, nil), keys: labelNames,
+		wrap: func(b bound) *RegCounter { return &RegCounter{b} },
+	}}
 }
 
 // Gauge registers a set-latest gauge.
@@ -65,7 +68,10 @@ func (r *Registry) Gauge(name, desc string) *RegGauge {
 
 // GaugeVec registers a labeled gauge.
 func (r *Registry) GaugeVec(name, desc string, labelNames ...string) *RegGaugeVec {
-	return &RegGaugeVec{vec{s: r.add(name, desc, kindGauge, actionSet, nil), keys: labelNames}}
+	return &RegGaugeVec{vec[RegGauge]{
+		s: r.add(name, desc, kindGauge, actionSet, nil), keys: labelNames,
+		wrap: func(b bound) *RegGauge { return &RegGauge{b} },
+	}}
 }
 
 // GaugeFunc registers a gauge evaluated at export time.
@@ -79,7 +85,10 @@ func (r *Registry) GaugeFunc(name, desc string, fn func() float64) {
 // HistogramVec registers a labeled histogram (nil buckets = the default
 // latency buckets, matching prometheus.DefBuckets).
 func (r *Registry) HistogramVec(name, desc string, buckets []float64, labelNames ...string) *RegHistogramVec {
-	return &RegHistogramVec{vec{s: r.add(name, desc, kindHistogram, actionSet, buckets), keys: labelNames}}
+	return &RegHistogramVec{vec[RegHistogram]{
+		s: r.add(name, desc, kindHistogram, actionSet, buckets), keys: labelNames,
+		wrap: func(b bound) *RegHistogram { return &RegHistogram{b} },
+	}}
 }
 
 // bound is a series observed with a fixed (possibly empty) label set.
@@ -122,58 +131,61 @@ type RegGauge struct{ bound }
 // Set records the current value.
 func (g *RegGauge) Set(v float64) { g.observe(v) }
 
-// vec resolves label values to bound series, caching the label sets so a
-// repeated WithLabelValues on the hot path does not rebuild them.
-type vec struct {
+// vec resolves label values to bound wrappers, caching the WRAPPER per value
+// tuple so a repeated WithLabelValues on the hot path (e.g. a per-log-record
+// counter) neither rebuilds the label set nor allocates the returned pointer.
+type vec[W any] struct {
 	s    *series
 	keys []string
+	wrap func(bound) *W
 
 	mu    sync.Mutex
-	cache map[string]labels
+	cache map[string]*W
 }
 
-func (v *vec) with(vals []string) bound {
-	key := strings.Join(vals, "\x00")
+func (v *vec[W]) with(vals []string) *W {
+	key := strings.Join(vals, "\x00") // one-element joins return vals[0]: no alloc
 	v.mu.Lock()
-	lbls, ok := v.cache[key]
+	w, ok := v.cache[key]
 	if !ok {
-		lbls = make(labels, 0, len(v.keys))
+		lbls := make(labels, 0, len(v.keys))
 		for i, k := range v.keys {
 			if i < len(vals) {
 				lbls = lbls.set(k, vals[i])
 			}
 		}
+		w = v.wrap(bound{s: v.s, lbls: lbls})
 		if v.cache == nil {
-			v.cache = make(map[string]labels)
+			v.cache = make(map[string]*W)
 		}
-		v.cache[key] = lbls
+		v.cache[key] = w
 	}
 	v.mu.Unlock()
-	return bound{s: v.s, lbls: lbls}
+	return w
 }
 
 // RegCounterVec is a labeled monotonic counter.
-type RegCounterVec struct{ vec }
+type RegCounterVec struct{ vec[RegCounter] }
 
 // WithLabelValues binds label values (order matches the registered names).
 func (v *RegCounterVec) WithLabelValues(vals ...string) *RegCounter {
-	return &RegCounter{v.with(vals)}
+	return v.with(vals)
 }
 
 // RegGaugeVec is a labeled gauge.
-type RegGaugeVec struct{ vec }
+type RegGaugeVec struct{ vec[RegGauge] }
 
 // WithLabelValues binds label values.
 func (v *RegGaugeVec) WithLabelValues(vals ...string) *RegGauge {
-	return &RegGauge{v.with(vals)}
+	return v.with(vals)
 }
 
 // RegHistogramVec is a labeled histogram.
-type RegHistogramVec struct{ vec }
+type RegHistogramVec struct{ vec[RegHistogram] }
 
 // WithLabelValues binds label values.
 func (v *RegHistogramVec) WithLabelValues(vals ...string) *RegHistogram {
-	return &RegHistogram{v.with(vals)}
+	return v.with(vals)
 }
 
 // RegHistogram observes into fixed buckets.

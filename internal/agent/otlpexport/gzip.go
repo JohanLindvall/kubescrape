@@ -1,10 +1,10 @@
 package otlpexport
 
 import (
-	"bytes"
 	"io"
 	"sync"
 
+	"github.com/JohanLindvall/bufpool"
 	"github.com/klauspost/compress/gzip"
 	"google.golang.org/grpc/encoding"
 )
@@ -50,21 +50,30 @@ func (p *pooledGzipWriter) Close() error {
 	return err
 }
 
-// httpGzipWriters pools writers for the OTLP/HTTP body path.
-var httpGzipWriters = sync.Pool{New: func() any { return gzip.NewWriter(nil) }}
+// httpGzipWriters pools writers for the OTLP/HTTP body path; httpGzipBufs
+// pools the compressed-body buffers (bufpool's strike heuristic bounds how
+// long an oversized, under-utilized backing array stays pooled).
+var (
+	httpGzipWriters = sync.Pool{New: func() any { return gzip.NewWriter(nil) }}
+	httpGzipBufs    = bufpool.New()
+)
 
-// gzipBody compresses an OTLP/HTTP request body.
-func gzipBody(body []byte) ([]byte, error) {
-	var buf bytes.Buffer
-	buf.Grow(len(body) / 4)
+// gzipBody compresses an OTLP/HTTP request body into a pooled buffer. The
+// buffer returns to its pool on Close, so it can be handed to the HTTP
+// transport as the request body (the transport always closes the body, even
+// on errors); a caller that never reaches the transport must Recycle it.
+func gzipBody(body []byte) (*bufpool.Buffer, error) {
+	buf := httpGzipBufs.Get()
 	z := httpGzipWriters.Get().(*gzip.Writer)
-	z.Reset(&buf)
+	z.Reset(buf)
 	if _, err := z.Write(body); err != nil {
+		buf.Recycle()
 		return nil, err
 	}
 	if err := z.Close(); err != nil {
+		buf.Recycle()
 		return nil, err
 	}
 	httpGzipWriters.Put(z)
-	return buf.Bytes(), nil
+	return buf, nil
 }

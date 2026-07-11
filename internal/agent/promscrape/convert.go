@@ -39,6 +39,11 @@ type converter struct {
 	order  []string // first-seen emit order of label sets in the family
 	keyBuf []byte   // reused fingerprint buffer (labelKey)
 	keyLbl []Label  // reused sort scratch (labelKey)
+	// Freed accumulators are recycled across families (their slices keep
+	// their capacity), so histogram-heavy scrapes stop generating one
+	// accumulator + bucket slice per label set per family.
+	histFree []*histAcc
+	summFree []*summAcc
 }
 
 type histAcc struct {
@@ -133,9 +138,13 @@ func (c *converter) flushFamily() {
 	for _, key := range c.order {
 		if acc, ok := c.hists[key]; ok {
 			c.b.addHistogram(c.family, acc)
+			*acc = histAcc{labels: acc.labels[:0], buckets: acc.buckets[:0], exemplars: acc.exemplars[:0]}
+			c.histFree = append(c.histFree, acc)
 		}
 		if acc, ok := c.summs[key]; ok {
 			c.b.addSummary(c.family, acc)
+			*acc = summAcc{labels: acc.labels[:0], quantiles: acc.quantiles[:0]}
+			c.summFree = append(c.summFree, acc)
 		}
 	}
 	c.order = c.order[:0]
@@ -148,7 +157,13 @@ func (c *converter) hist(s Sample) *histAcc {
 	acc, ok := c.hists[string(c.keyBuf)] // keyed lookup: no allocation
 	if !ok {
 		key := string(c.keyBuf)
-		acc = &histAcc{labels: copyLabelsExcept(s.Labels, "le")}
+		if n := len(c.histFree); n > 0 {
+			acc = c.histFree[n-1]
+			c.histFree = c.histFree[:n-1]
+		} else {
+			acc = &histAcc{}
+		}
+		acc.labels = appendLabelsExcept(acc.labels[:0], s.Labels, "le")
 		c.hists[key] = acc
 		c.order = append(c.order, key)
 	}
@@ -163,7 +178,13 @@ func (c *converter) summ(s Sample) *summAcc {
 	acc, ok := c.summs[string(c.keyBuf)] // keyed lookup: no allocation
 	if !ok {
 		key := string(c.keyBuf)
-		acc = &summAcc{labels: copyLabelsExcept(s.Labels, "quantile")}
+		if n := len(c.summFree); n > 0 {
+			acc = c.summFree[n-1]
+			c.summFree = c.summFree[:n-1]
+		} else {
+			acc = &summAcc{}
+		}
+		acc.labels = appendLabelsExcept(acc.labels[:0], s.Labels, "quantile")
 		c.summs[key] = acc
 		c.order = append(c.order, key)
 	}
@@ -201,14 +222,13 @@ func (c *converter) labelKey(labels []Label, except string) {
 	}
 }
 
-func copyLabelsExcept(labels []Label, except string) []Label {
-	out := make([]Label, 0, len(labels))
+func appendLabelsExcept(dst []Label, labels []Label, except string) []Label {
 	for _, l := range labels {
 		if l.Name != except {
-			out = append(out, l)
+			dst = append(dst, l)
 		}
 	}
-	return out
+	return dst
 }
 
 func copyExemplar(e Exemplar) Exemplar {

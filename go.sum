@@ -1,3 +1,5 @@
+github.com/JohanLindvall/bufpool v0.1.0 h1:IQKXa+go7wLoVHP/nxSLpV23wY5g3DBCRz5AGqwfmIQ=
+github.com/JohanLindvall/bufpool v0.1.0/go.mod h1:W7ZBmQQd7vuO5e5rCtvF8ORIVksJT7kF/+W9ZvnSQaQ=
 github.com/JohanLindvall/enrich v0.0.4 h1:1iQkoQ6Lr+Pp/F7djlykhp08a+A71VHJj99qsX1UpG4=
 github.com/JohanLindvall/enrich v0.0.4/go.mod h1:DTwPRYwtgPU1ao0X5eBLthmXwms8LOdQiD9gCeRpQaA=
 github.com/JohanLindvall/lightning v0.0.53 h1:5lwBmRyK5tEf6Jrdsoy8awgrphacWGwEsRZh5eVNanM=

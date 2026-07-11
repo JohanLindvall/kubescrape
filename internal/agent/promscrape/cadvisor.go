@@ -66,9 +66,10 @@ type chunker interface {
 func (s *Scraper) parseAndExport(ctx context.Context, body io.Reader, openMetrics, withExemplars bool, cb chunker, pipeline, what string) (int, error) {
 	filter := s.cfg.Filters.filterFor(pipeline).session()
 	conv := newConverter(cb)
-	parser := NewParser(s.cfg.MaxLineBytes, openMetrics, withExemplars)
+	parser := getParser(s.cfg.MaxLineBytes, openMetrics, withExemplars)
+	defer putParser(parser)
 	samples := 0
-	malformed, err := parser.Parse(body, func(sample Sample) error {
+	malformed, err := parser.parse(body, func(sample Sample) error {
 		samples++
 		if s.cfg.MaxSamples > 0 && samples > s.cfg.MaxSamples {
 			return ErrTooManySamples
@@ -209,8 +210,13 @@ func newCadvisorBatcher(s *Scraper, scrape time.Time, ctx context.Context) *cadv
 
 func (cb *cadvisorBatcher) reset() {
 	cb.md = pmetric.NewMetrics()
-	cb.scopes = make(map[string]pmetric.ScopeMetrics)
-	cb.byKey = make(map[string]pmetric.Metric)
+	if cb.scopes == nil {
+		cb.scopes = make(map[string]pmetric.ScopeMetrics)
+		cb.byKey = make(map[string]pmetric.Metric)
+	} else {
+		clear(cb.scopes)
+		clear(cb.byKey)
+	}
 	cb.points = 0
 }
 

@@ -336,7 +336,11 @@ func (b *batcher) reset() {
 	sm := rm.ScopeMetrics().AppendEmpty()
 	sm.Scope().SetName("github.com/JohanLindvall/kubescrape/agent/promscrape")
 	b.sm = sm
-	b.byName = make(map[string]pmetric.Metric)
+	if b.byName == nil {
+		b.byName = make(map[string]pmetric.Metric)
+	} else {
+		clear(b.byName)
+	}
 	b.lastOK = false
 	b.points = 0
 }

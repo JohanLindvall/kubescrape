@@ -25,6 +25,8 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/metadata"
 
+	"github.com/JohanLindvall/bufpool"
+
 	"github.com/JohanLindvall/kubescrape/internal/obs"
 )
 
@@ -300,28 +302,41 @@ func (c *Client) grpcAuth(ctx context.Context) (context.Context, error) {
 }
 
 func (c *Client) httpPost(ctx context.Context, url string, body []byte) error {
-	compressed := c.cfg.Compression == "gzip"
-	if compressed {
-		var err error
-		if body, err = gzipBody(body); err != nil {
-			return err
-		}
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+	token, err := c.bearer()
 	if err != nil {
 		return err
+	}
+	var bodyReader io.Reader = bytes.NewReader(body)
+	compressed := c.cfg.Compression == "gzip"
+	var gz *bufpool.Buffer
+	if compressed {
+		if gz, err = gzipBody(body); err != nil {
+			return err
+		}
+		bodyReader = gz
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bodyReader)
+	if err != nil {
+		if gz != nil {
+			gz.Recycle()
+		}
+		return err
+	}
+	if gz != nil {
+		// NewRequest doesn't recognize the pooled buffer type, so set the
+		// length explicitly (the body would go out chunked otherwise). Do NOT
+		// set req.GetBody: a transport-level replay after the first attempt
+		// closes (recycles) the buffer would read reused memory.
+		req.ContentLength = int64(gz.Len())
 	}
 	req.Header.Set("Content-Type", "application/x-protobuf")
 	if compressed {
 		req.Header.Set("Content-Encoding", "gzip")
 	}
-	token, err := c.bearer()
-	if err != nil {
-		return err
-	}
 	if token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
 	}
+	// Do closes the request body even on error, returning gz to its pool.
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return err

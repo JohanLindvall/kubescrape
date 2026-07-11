@@ -52,14 +52,15 @@ func BenchmarkConvertScrape(b *testing.B) {
 		bt := newBatcher(func(pcommon.Resource) {}, 1<<30, time.Unix(1, 0), time.Unix(2, 0))
 		conv := newConverter(bt)
 		fs := filter.session()
-		p := NewParser(1<<20, false, false)
-		_, err := p.Parse(strings.NewReader(input), func(s Sample) error {
+		p := getParser(1<<20, false, false) // the production path: pooled parser + reader
+		_, err := p.parse(strings.NewReader(input), func(s Sample) error {
 			if !fs.Keep(s.Name, s.Labels) {
 				return nil
 			}
 			conv.add(s)
 			return nil
 		})
+		putParser(p)
 		if err != nil {
 			b.Fatal(err)
 		}

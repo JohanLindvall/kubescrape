@@ -296,11 +296,11 @@ func (s *Spool) Pop() (data []byte, commit func(), ok bool) {
 		return nil, nil, false
 	}
 	defer func() { _ = f.Close() }()
-	hdr := make([]byte, frameHeader)
-	if _, err := f.ReadAt(hdr, s.readOff); err != nil {
+	var hdr [frameHeader]byte
+	if _, err := f.ReadAt(hdr[:], s.readOff); err != nil {
 		return nil, nil, false
 	}
-	n := int64(binary.BigEndian.Uint32(hdr))
+	n := int64(binary.BigEndian.Uint32(hdr[:]))
 	if s.readOff+frameHeader+n > head.size {
 		return nil, nil, false // torn (only possible in the write tail)
 	}

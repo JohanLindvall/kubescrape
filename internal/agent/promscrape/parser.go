@@ -14,6 +14,7 @@ import (
 	"io"
 	"strconv"
 	"strings"
+	"sync"
 )
 
 // MetricType is the declared type of a metric family (# TYPE line).
@@ -129,6 +130,56 @@ func NewParser(maxLineBytes int, openMetrics, withExemplars bool) *Parser {
 	}
 }
 
+// parserPool recycles parsers (and their bufio readers) across scrapes: the
+// interned name/value tables stay warm — the same names repeat every scrape —
+// and the 64KiB read buffer stops being per-scrape garbage. The TYPE table is
+// cleared per scrape (its semantics are per-exposition); the intern tables are
+// only cleared once they near their caps, bounding retention.
+var parserPool = sync.Pool{New: func() any {
+	return &pooledParser{
+		Parser: NewParser(0, false, false),
+		reader: bufio.NewReaderSize(nil, parseBufSize),
+	}
+}}
+
+const parseBufSize = 64 * 1024
+
+type pooledParser struct {
+	*Parser
+	reader *bufio.Reader
+}
+
+// getParser returns a recycled parser configured for one scrape.
+func getParser(maxLineBytes int, openMetrics, withExemplars bool) *pooledParser {
+	pp := parserPool.Get().(*pooledParser)
+	p := pp.Parser
+	p.maxLineBytes = maxLineBytes
+	p.openMetrics = openMetrics
+	p.exemplars = openMetrics && withExemplars
+	p.eof = false
+	p.lastMetric = ""
+	p.lastKV = p.lastKV[:0]
+	clear(p.types) // family types are per-exposition
+	if len(p.names) >= maxInternedNames/2 {
+		clear(p.names)
+	}
+	if len(p.values) >= maxInternedValues/2 {
+		clear(p.values)
+	}
+	return pp
+}
+
+func putParser(pp *pooledParser) {
+	pp.reader.Reset(nil) // drop the response body reference
+	parserPool.Put(pp)
+}
+
+// parse runs Parse over r through the pooled reader.
+func (pp *pooledParser) parse(r io.Reader, emit func(Sample) error) (int, error) {
+	pp.reader.Reset(r)
+	return pp.parseFrom(pp.reader, emit)
+}
+
 // lastKV caches the previous line's interned name/value at one label
 // position.
 type lastKV struct {
@@ -182,7 +233,10 @@ func skipSpaceTab(b []byte) []byte {
 // skipped, counted and reported; a malformed count with a nil error means a
 // partially usable scrape.
 func (p *Parser) Parse(r io.Reader, emit func(Sample) error) (malformed int, err error) {
-	br := bufio.NewReaderSize(r, 64*1024)
+	return p.parseFrom(bufio.NewReaderSize(r, parseBufSize), emit)
+}
+
+func (p *Parser) parseFrom(br *bufio.Reader, emit func(Sample) error) (malformed int, err error) {
 	for {
 		line, tooLong, rerr := p.readLine(br)
 		if len(line) > 0 && !tooLong {

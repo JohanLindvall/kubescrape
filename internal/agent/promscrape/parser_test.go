@@ -256,11 +256,12 @@ func BenchmarkParseLargeScrape(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		p := NewParser(1<<20, false, false)
+		p := getParser(1<<20, false, false) // the production path: pooled parser + reader
 		n := 0
-		if _, err := p.Parse(strings.NewReader(input), func(s Sample) error { n++; return nil }); err != nil {
+		if _, err := p.parse(strings.NewReader(input), func(s Sample) error { n++; return nil }); err != nil {
 			b.Fatal(err)
 		}
+		putParser(p)
 		if n != 10_000 {
 			b.Fatalf("n=%d", n)
 		}

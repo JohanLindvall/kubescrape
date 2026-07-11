@@ -15,10 +15,13 @@ import (
 
 	"github.com/klauspost/compress/gzip"
 
+	"github.com/JohanLindvall/kubescrape/internal/agent/spool"
 	"go.opentelemetry.io/collector/pdata/plog"
 	"go.opentelemetry.io/collector/pdata/plog/plogotlp"
 	"go.opentelemetry.io/collector/pdata/pmetric"
 	"go.opentelemetry.io/collector/pdata/pmetric/pmetricotlp"
+	"go.opentelemetry.io/collector/pdata/ptrace"
+	"go.opentelemetry.io/collector/pdata/ptrace/ptraceotlp"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/metadata"
 )
@@ -134,6 +137,7 @@ type grpcState struct {
 	mu      sync.Mutex
 	logs    int
 	metrics int
+	traces  int
 	auth    string
 }
 
@@ -171,6 +175,26 @@ func (s *metricSink) Export(ctx context.Context, req pmetricotlp.ExportRequest) 
 	return pmetricotlp.NewExportResponse(), nil
 }
 
+type traceSink struct {
+	ptraceotlp.UnimplementedGRPCServer
+	st *grpcState
+}
+
+func (s *traceSink) Export(ctx context.Context, req ptraceotlp.ExportRequest) (ptraceotlp.ExportResponse, error) {
+	s.st.mu.Lock()
+	defer s.st.mu.Unlock()
+	s.st.traces += req.Traces().SpanCount()
+	s.st.captureAuth(ctx)
+	return ptraceotlp.NewExportResponse(), nil
+}
+
+func testTraces() ptrace.Traces {
+	td := ptrace.NewTraces()
+	span := td.ResourceSpans().AppendEmpty().ScopeSpans().AppendEmpty().Spans().AppendEmpty()
+	span.SetName("op")
+	return td
+}
+
 func TestGRPCExport(t *testing.T) {
 	lis, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -180,6 +204,7 @@ func TestGRPCExport(t *testing.T) {
 	srv := grpc.NewServer()
 	plogotlp.RegisterGRPCServer(srv, &logSink{st: sink})
 	pmetricotlp.RegisterGRPCServer(srv, &metricSink{st: sink})
+	ptraceotlp.RegisterGRPCServer(srv, &traceSink{st: sink})
 	go func() { _ = srv.Serve(lis) }()
 	defer srv.Stop()
 
@@ -204,11 +229,14 @@ func TestGRPCExport(t *testing.T) {
 	if err := c.ExportMetrics(context.Background(), testMetrics()); err != nil {
 		t.Fatal(err)
 	}
+	if err := c.ExportTraces(context.Background(), testTraces()); err != nil {
+		t.Fatal(err)
+	}
 
 	sink.mu.Lock()
 	defer sink.mu.Unlock()
-	if sink.logs != 1 || sink.metrics != 1 {
-		t.Fatalf("received logs=%d metrics=%d", sink.logs, sink.metrics)
+	if sink.logs != 1 || sink.metrics != 1 || sink.traces != 1 {
+		t.Fatalf("received logs=%d metrics=%d traces=%d", sink.logs, sink.metrics, sink.traces)
 	}
 	if sink.auth != "Bearer grpc-tok" {
 		t.Fatalf("authorization = %q", sink.auth)
@@ -225,4 +253,76 @@ func TestConfigValidation(t *testing.T) {
 	if _, err := New(Config{Endpoint: "x:1", Protocol: "grpc", Insecure: true, CAFile: "/nonexistent"}); err == nil {
 		t.Fatal("missing CA file must error")
 	}
+}
+
+// Traces over OTLP/HTTP round-trip (gzip default), decoded by the server.
+func TestHTTPTracesExport(t *testing.T) {
+	var gotPath string
+	var gotSpans int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		reader := io.Reader(r.Body)
+		if r.Header.Get("Content-Encoding") == "gzip" {
+			zr, err := gzip.NewReader(r.Body)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			reader = zr
+		}
+		body, _ := io.ReadAll(reader)
+		req := ptraceotlp.NewExportRequest()
+		if err := req.UnmarshalProto(body); err == nil {
+			gotSpans = req.Traces().SpanCount()
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	c, err := New(Config{Endpoint: srv.URL, Protocol: "http", Timeout: 5 * time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = c.Close() }()
+	if err := c.ExportTraces(context.Background(), testTraces()); err != nil {
+		t.Fatal(err)
+	}
+	if gotPath != "/v1/traces" || gotSpans != 1 {
+		t.Fatalf("path=%q spans=%d", gotPath, gotSpans)
+	}
+}
+
+// Buffered passes traces through to the inner exporter unbuffered, and
+// reports a clear error when the inner exporter cannot handle traces.
+func TestBufferedTracesPassthrough(t *testing.T) {
+	ls, err := spool.Open(t.TempDir(), spool.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = ls.Close() }()
+
+	inner := &tracesFakeSender{}
+	b := NewBuffered(inner, ls, nil, 10*time.Millisecond, nil)
+	if err := b.ExportTraces(context.Background(), testTraces()); err != nil {
+		t.Fatal(err)
+	}
+	if inner.traces != 1 {
+		t.Fatalf("traces forwarded = %d", inner.traces)
+	}
+
+	// An inner exporter without trace support yields an error, not a panic.
+	b2 := NewBuffered(&fakeSender{}, ls, nil, 10*time.Millisecond, nil)
+	if err := b2.ExportTraces(context.Background(), testTraces()); err == nil {
+		t.Fatal("expected error for non-traces inner exporter")
+	}
+}
+
+type tracesFakeSender struct {
+	fakeSender
+	traces int
+}
+
+func (t *tracesFakeSender) ExportTraces(context.Context, ptrace.Traces) error {
+	t.traces++
+	return nil
 }

@@ -12,6 +12,8 @@ import (
 	"fmt"
 	"sync"
 
+	"errors"
+
 	"github.com/JohanLindvall/kubescrape/internal/agent/otlpexport"
 	"github.com/JohanLindvall/kubescrape/internal/agent/spool"
 	"github.com/klauspost/compress/gzip"
@@ -542,4 +544,170 @@ func waitForCond(t *testing.T, cond func() bool, what string) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatalf("timed out waiting for %s", what)
+}
+
+// The gRPC traces service enriches and forwards, wired through Server.Run.
+func TestServerGRPCTraces(t *testing.T) {
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := lis.Addr().String()
+	_ = lis.Close()
+
+	texp := &captureTraces{}
+	srv := NewServer(ServerConfig{
+		GRPCAddr: addr,
+		Enricher: newEnricher(newMeta(), MetricsAuto),
+		Exporter: &captureExporter{},
+		Traces:   texp,
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { _ = srv.Run(ctx); close(done) }()
+	defer func() { cancel(); <-done }()
+
+	conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	traces := ptraceotlp.NewGRPCClient(conn)
+	td := tracesWith(map[string]string{"container.id": "cafe01"})
+	var lastErr error
+	for i := 0; i < 100; i++ {
+		if _, lastErr = traces.Export(context.Background(), ptraceotlp.NewExportRequestFromTraces(td)); lastErr == nil {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if lastErr != nil {
+		t.Fatal(lastErr)
+	}
+	if len(texp.traces) != 1 {
+		t.Fatalf("forwarded traces = %d", len(texp.traces))
+	}
+	a := texp.traces[0].ResourceSpans().At(0).Resource().Attributes()
+	if v, _ := a.Get("k8s.pod.name"); v.Str() != "web-1" {
+		t.Fatalf("trace resource not enriched over gRPC: %v", a.AsRaw())
+	}
+}
+
+// The batcher coalesces metrics and traces too, and a full queue
+// back-pressures with a retryable error.
+func TestBatcherMetricsTracesAndQueueFull(t *testing.T) {
+	exp := &syncSignalsExporter{}
+	b := NewBatcher(exp, exp, BatchConfig{Items: 4, Timeout: 30 * time.Millisecond}, nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go b.Run(ctx)
+
+	for i := 0; i < 4; i++ {
+		md := pmetric.NewMetrics()
+		dp := md.ResourceMetrics().AppendEmpty().ScopeMetrics().AppendEmpty().Metrics().AppendEmpty()
+		dp.SetName("m")
+		dp.SetEmptyGauge().DataPoints().AppendEmpty().SetDoubleValue(1)
+		if err := b.ExportMetrics(ctx, md); err != nil {
+			t.Fatal(err)
+		}
+	}
+	waitForCond(t, func() bool { return exp.counts("metrics") == 4 && exp.batchCount("metrics") == 1 }, "metrics coalesced")
+
+	if err := b.ExportTraces(ctx, tracesWith(nil)); err != nil {
+		t.Fatal(err)
+	}
+	waitForCond(t, func() bool { return exp.counts("traces") == 1 }, "trace timeout flush")
+
+	// Queue-full backpressure: a second batcher with a tiny queue and a
+	// blocked exporter. The run loop coalesces until the item cap, blocks in
+	// the flush, and further enqueues fill the bounded queue.
+	exp2 := &syncSignalsExporter{}
+	exp2.block(true)
+	b2 := NewBatcher(exp2, nil, BatchConfig{Items: 2, Timeout: time.Hour, QueueLen: 2}, nil)
+	go b2.Run(ctx)
+	fill := func() error {
+		ld := plog.NewLogs()
+		ld.ResourceLogs().AppendEmpty().ScopeLogs().AppendEmpty().LogRecords().AppendEmpty().Body().SetStr("x")
+		return b2.ExportLogs(ctx, ld)
+	}
+	var full bool
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if err := fill(); err != nil {
+			if !errors.Is(err, errBatchQueueFull) {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			full = true
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	exp2.block(false)
+	if !full {
+		t.Fatal("queue never filled")
+	}
+}
+
+// syncSignalsExporter counts items per signal and can block deliveries.
+type syncSignalsExporter struct {
+	mu      sync.Mutex
+	items   map[string]int
+	batches map[string]int
+	blocked chan struct{}
+}
+
+func (c *syncSignalsExporter) add(kind string, n int) {
+	c.mu.Lock()
+	blocked := c.blocked
+	c.mu.Unlock()
+	if blocked != nil {
+		<-blocked
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.items == nil {
+		c.items = map[string]int{}
+		c.batches = map[string]int{}
+	}
+	c.items[kind] += n
+	c.batches[kind]++
+}
+
+func (c *syncSignalsExporter) block(on bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if on && c.blocked == nil {
+		c.blocked = make(chan struct{})
+	} else if !on && c.blocked != nil {
+		close(c.blocked)
+		c.blocked = nil
+	}
+}
+
+func (c *syncSignalsExporter) counts(kind string) int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.items[kind]
+}
+
+func (c *syncSignalsExporter) batchCount(kind string) int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.batches[kind]
+}
+
+func (c *syncSignalsExporter) ExportLogs(_ context.Context, ld plog.Logs) error {
+	c.add("logs", ld.LogRecordCount())
+	return nil
+}
+
+func (c *syncSignalsExporter) ExportMetrics(_ context.Context, md pmetric.Metrics) error {
+	c.add("metrics", md.DataPointCount())
+	return nil
+}
+
+func (c *syncSignalsExporter) ExportTraces(_ context.Context, td ptrace.Traces) error {
+	c.add("traces", td.SpanCount())
+	return nil
 }

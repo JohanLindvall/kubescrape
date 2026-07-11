@@ -2,7 +2,9 @@ package metrics
 
 import (
 	"context"
+	"sync"
 	"testing"
+	"time"
 
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/pmetric"
@@ -115,4 +117,72 @@ func TestRegistryExport(t *testing.T) {
 	if total != 3 {
 		t.Fatalf("re-export counter total = %v (must not reset)", total)
 	}
+}
+
+// Run exports periodically and once more on shutdown; GaugeVec labels land on
+// the data points.
+func TestRegistryRun(t *testing.T) {
+	r := NewRegistry()
+	gv := r.GaugeVec("test_run_gauge", "labeled gauge", "shard")
+	gv.WithLabelValues("a").Set(1)
+	gv.WithLabelValues("b").Set(2)
+
+	res := pcommon.NewResource()
+	res.Attributes().PutStr("service.name", "run-test")
+	exp := &lockedCapExporter{}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { r.Run(ctx, exp, 20*time.Millisecond, res, nil); close(done) }()
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if exp.count() > 0 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	cancel()
+	<-done
+
+	m, ok := exp.snapshot().find("test_run_gauge")
+	if !ok {
+		t.Fatal("gauge never exported")
+	}
+	vals := map[string]float64{}
+	dps := m.Gauge().DataPoints()
+	for i := 0; i < dps.Len(); i++ {
+		if v, ok := dps.At(i).Attributes().Get("shard"); ok {
+			vals[v.Str()] = dps.At(i).DoubleValue()
+		}
+	}
+	if vals["a"] != 1 || vals["b"] != 2 {
+		t.Fatalf("gauge vec values = %v", vals)
+	}
+}
+
+// lockedCapExporter is a capExporter safe for polling from another goroutine
+// (Registry.Run exports concurrently with the test's checks).
+type lockedCapExporter struct {
+	mu    sync.Mutex
+	inner capExporter
+}
+
+func (c *lockedCapExporter) ExportMetrics(ctx context.Context, md pmetric.Metrics) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.inner.ExportMetrics(ctx, md)
+}
+
+func (c *lockedCapExporter) count() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return len(c.inner.md)
+}
+
+func (c *lockedCapExporter) snapshot() *capExporter {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	cp := &capExporter{md: append([]pmetric.Metrics(nil), c.inner.md...)}
+	return cp
 }

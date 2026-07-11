@@ -96,3 +96,21 @@ func TestIdentity(t *testing.T) {
 		t.Errorf("preset instance overwritten: %q", v.Str())
 	}
 }
+
+func TestServiceAttrs(t *testing.T) {
+	res := pcommon.NewResource()
+	Service(res, &kubemeta.Service{Name: "web-svc", UID: "svc-uid"})
+	a := res.Attributes()
+	if v, _ := a.Get("k8s.service.name"); v.Str() != "web-svc" {
+		t.Errorf("k8s.service.name = %q", v.Str())
+	}
+	if v, _ := a.Get("k8s.service.uid"); v.Str() != "svc-uid" {
+		t.Errorf("k8s.service.uid = %q", v.Str())
+	}
+	// nil Service is a no-op.
+	res2 := pcommon.NewResource()
+	Service(res2, nil)
+	if res2.Attributes().Len() != 0 {
+		t.Error("nil service must not set attributes")
+	}
+}

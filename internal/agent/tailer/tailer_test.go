@@ -956,3 +956,37 @@ func TestExcludeNamespaces(t *testing.T) {
 		t.Fatalf("excluded namespace produced records: %v", got)
 	}
 }
+
+// A deleted file is drained (bytes appended since the last read are exported)
+// and then dropped from tracking.
+func TestFileDeletionDrainsAndDrops(t *testing.T) {
+	dir := t.TempDir()
+	exp := &fakeExporter{}
+	tl := newTestTailer(dir, "", exp)
+	stop := startTailer(t, tl)
+	defer stop()
+
+	writeLog(t, dir, timeNowCRI()+" stdout F before-delete")
+	waitFor(t, func() bool { return len(exp.get()) == 1 }, "first record")
+
+	// Append one more line and remove the file before the next sweep is
+	// guaranteed to have read it — the drop path must drain the fd first.
+	writeLog(t, dir, timeNowCRI()+" stdout F final-words")
+	if err := os.Remove(filepath.Join(dir, logName)); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, func() bool {
+		for _, r := range exp.get() {
+			if r == "final-words" {
+				return true
+			}
+		}
+		return false
+	}, "final line drained after deletion")
+
+	// Exactly the two records, no duplicates from the drain.
+	got := exp.get()
+	if len(got) != 2 || got[0] != "before-delete" || got[1] != "final-words" {
+		t.Fatalf("records = %q", got)
+	}
+}

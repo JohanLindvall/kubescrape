@@ -119,3 +119,28 @@ func TestParseHexID(t *testing.T) {
 		t.Error("valid span id rejected")
 	}
 }
+
+// ApplyBody (the ingest path) fills only what the sender left unset.
+func TestApplyBodyNeverOverwrites(t *testing.T) {
+	lr := plog.NewLogRecord()
+	lr.Body().SetStr(`{"level":"error","message":"boom","ts":"2026-07-11T10:00:00Z"}`)
+
+	// Sender set nothing: severity and timestamp come from the body.
+	ApplyBody(lr)
+	if lr.SeverityNumber() != plog.SeverityNumberError {
+		t.Fatalf("severity = %v", lr.SeverityNumber())
+	}
+	if lr.Timestamp() == 0 {
+		t.Fatal("timestamp not filled from body")
+	}
+
+	// Sender-set fields are authoritative.
+	lr2 := plog.NewLogRecord()
+	lr2.Body().SetStr(`{"level":"error","message":"boom"}`)
+	lr2.SetSeverityNumber(plog.SeverityNumberInfo)
+	lr2.SetSeverityText("INFO")
+	ApplyBody(lr2)
+	if lr2.SeverityNumber() != plog.SeverityNumberInfo {
+		t.Fatalf("sender severity overwritten: %v", lr2.SeverityNumber())
+	}
+}

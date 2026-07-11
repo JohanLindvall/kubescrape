@@ -48,7 +48,8 @@ kubescrape -listen :8080 -wait-timeout 5s -cache-ttl 5m -log-format json
 | `-resync` | `0` | informer resync period (0 = watch stream only) |
 | `-servicemonitors` | `false` | serve targets for `monitoring.coreos.com/v1` ServiceMonitors selecting pod-backed Services (endpoint `port`/`targetPort`/`path`/`scheme`; no per-endpoint auth or relabelings). Self-disables with a warning when the CRD is absent |
 | `-events` | `false` | export Kubernetes events as OTLP log records (batched; history from the initial list is skipped; pod events carry full pod resource attributes) |
-| `-otlp-*` | as the agent | with `-events`: `-otlp-endpoint`, `-otlp-protocol`, `-otlp-compression`, `-otlp-insecure`, `-otlp-tls-ca-file`, `-otlp-tls-insecure-skip-verify`, `-otlp-bearer-token-file`, `-otlp-timeout` |
+| `-self-metrics-interval` | `1m` | export the service's own metrics over OTLP at this interval (0 disables) |
+| `-otlp-*` | as the agent | used by `-events` and the self-metrics push: `-otlp-endpoint`, `-otlp-protocol`, `-otlp-compression`, `-otlp-insecure`, `-otlp-tls-ca-file`, `-otlp-tls-insecure-skip-verify`, `-otlp-bearer-token-file`, `-otlp-timeout` |
 | `-log-level` | `info` | `debug`, `info`, `warn`, `error` |
 | `-log-format` | `text` | `text` or `json` (client-go's klog is routed through the same handler) |
 

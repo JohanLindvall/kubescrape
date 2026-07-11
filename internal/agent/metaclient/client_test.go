@@ -189,3 +189,23 @@ func TestCacheEviction(t *testing.T) {
 		t.Fatal("cache unexpectedly empty")
 	}
 }
+
+func TestPodByIP(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/pod-ips/10.0.0.9" {
+			_, _ = w.Write([]byte(`{"name":"web-9","namespace":"ns","uid":"u9"}`))
+			return
+		}
+		http.Error(w, "no live pod", http.StatusNotFound)
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, time.Second)
+	pod, err := c.PodByIP(context.Background(), "10.0.0.9")
+	if err != nil || pod.Name != "web-9" {
+		t.Fatalf("pod=%+v err=%v", pod, err)
+	}
+	if _, err := c.PodByIP(context.Background(), "10.9.9.9"); !IsNotFound(err) {
+		t.Fatalf("want 404, got %v", err)
+	}
+}

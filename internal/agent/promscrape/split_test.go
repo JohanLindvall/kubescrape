@@ -427,3 +427,77 @@ func TestSplitterValidation(t *testing.T) {
 		t.Fatal("bad regex must error")
 	}
 }
+
+// Histograms and summaries route through the splitter with their shape intact.
+func TestSplitterHistogramSummary(t *testing.T) {
+	body := `# TYPE kube_pod_wait_seconds histogram
+kube_pod_wait_seconds_bucket{namespace="ns1",pod="pod1",le="0.1"} 3
+kube_pod_wait_seconds_bucket{namespace="ns1",pod="pod1",le="1"} 5
+kube_pod_wait_seconds_bucket{namespace="ns1",pod="pod1",le="+Inf"} 6
+kube_pod_wait_seconds_sum{namespace="ns1",pod="pod1"} 4.2
+kube_pod_wait_seconds_count{namespace="ns1",pod="pod1"} 6
+# TYPE kube_pod_size_bytes summary
+kube_pod_size_bytes{namespace="ns1",pod="pod1",quantile="0.5"} 100
+kube_pod_size_bytes{namespace="ns1",pod="pod1",quantile="0.99"} 250
+kube_pod_size_bytes_sum{namespace="ns1",pod="pod1"} 1000
+kube_pod_size_bytes_count{namespace="ns1",pod="pod1"} 8
+`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(body))
+	}))
+	defer srv.Close()
+
+	target := testTarget(srv.URL)
+	target.Pod.Name = "ksm-abc"
+	target.Pod.Labels = map[string]string{"app.kubernetes.io/name": "kube-state-metrics"}
+	sp, err := NewSplitters([]SplitterConfig{{
+		Match: SplitterMatch{PodLabels: map[string]string{"app.kubernetes.io/name": "kube-state-metrics"}},
+		Rules: []SplitRule{{
+			Metrics: `kube_pod_.+`,
+			GroupBy: map[string]string{"namespace": "k8s.namespace.name", "pod": "k8s.pod.name"},
+		}},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	exp := &captureExporter{}
+	s := New(Config{
+		Node: "node1", Interval: time.Hour, Timeout: 5 * time.Second,
+		Targets: staticTargets{target}, Exporter: exp, StartTime: time.Now(),
+		Splitters: sp, Kubelet: KubeletConfig{Meta: &fakeMetaSource{}},
+	})
+	if _, err := s.scrapeTarget(context.Background(), target); err != nil {
+		t.Fatal(err)
+	}
+
+	rms := exp.batches[0].ResourceMetrics()
+	var hist, summ pmetric.Metric
+	for i := 0; i < rms.Len(); i++ {
+		if attrStr(rms.At(i).Resource(), "k8s.pod.name") != "pod1" {
+			continue
+		}
+		ms := rms.At(i).ScopeMetrics().At(0).Metrics()
+		for j := 0; j < ms.Len(); j++ {
+			switch ms.At(j).Name() {
+			case "kube_pod_wait_seconds":
+				hist = ms.At(j)
+			case "kube_pod_size_bytes":
+				summ = ms.At(j)
+			}
+		}
+	}
+	if hist.Type() != pmetric.MetricTypeHistogram {
+		t.Fatalf("histogram not routed: %v", hist.Type())
+	}
+	hdp := hist.Histogram().DataPoints().At(0)
+	if hdp.Count() != 6 || hdp.Sum() != 4.2 || hdp.ExplicitBounds().Len() != 2 {
+		t.Fatalf("histogram dp = count %d sum %v bounds %d", hdp.Count(), hdp.Sum(), hdp.ExplicitBounds().Len())
+	}
+	if summ.Type() != pmetric.MetricTypeSummary {
+		t.Fatalf("summary not routed: %v", summ.Type())
+	}
+	sdp := summ.Summary().DataPoints().At(0)
+	if sdp.Count() != 8 || sdp.Sum() != 1000 || sdp.QuantileValues().Len() != 2 {
+		t.Fatalf("summary dp = count %d sum %v quantiles %d", sdp.Count(), sdp.Sum(), sdp.QuantileValues().Len())
+	}
+}

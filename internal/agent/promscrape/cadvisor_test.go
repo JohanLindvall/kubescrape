@@ -336,3 +336,61 @@ func TestScrapeCadvisorAuthError(t *testing.T) {
 		t.Fatalf("batches = %d", len(exp.batches))
 	}
 }
+
+// Histogram and summary families route through the cadvisor batcher with the
+// pod/container resource attribution and their shape intact.
+func TestScrapeCadvisorHistogramSummary(t *testing.T) {
+	body := strings.NewReplacer("UID1", uid1, "APPCID", appCID).Replace(`# TYPE container_lat_seconds histogram
+container_lat_seconds_bucket{namespace="ns1",pod="pod1",container="app",id="/kubepods/burstable/podUID1/APPCID",le="0.1"} 2
+container_lat_seconds_bucket{namespace="ns1",pod="pod1",container="app",id="/kubepods/burstable/podUID1/APPCID",le="+Inf"} 5
+container_lat_seconds_sum{namespace="ns1",pod="pod1",container="app",id="/kubepods/burstable/podUID1/APPCID"} 1.5
+container_lat_seconds_count{namespace="ns1",pod="pod1",container="app",id="/kubepods/burstable/podUID1/APPCID"} 5
+# TYPE container_size_bytes summary
+container_size_bytes{namespace="ns1",pod="pod1",container="app",id="/kubepods/burstable/podUID1/APPCID",quantile="0.9"} 42
+container_size_bytes_sum{namespace="ns1",pod="pod1",container="app",id="/kubepods/burstable/podUID1/APPCID"} 100
+container_size_bytes_count{namespace="ns1",pod="pod1",container="app",id="/kubepods/burstable/podUID1/APPCID"} 3
+`)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(body))
+	}))
+	defer srv.Close()
+
+	exp := &captureExporter{}
+	s := newKubeletScraper(t, srv.URL, &fakeMetaSource{}, exp, false)
+	if _, err := s.scrapeCadvisor(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	rm, ok := resourcesByIdentity(exp.batches[0])[uid1+"/"+appCID+"/app"]
+	if !ok {
+		t.Fatal("container resource missing")
+	}
+	var hist, summ pmetric.Metric
+	ms := rm.ScopeMetrics().At(0).Metrics()
+	for i := 0; i < ms.Len(); i++ {
+		switch ms.At(i).Name() {
+		case "container_lat_seconds":
+			hist = ms.At(i)
+		case "container_size_bytes":
+			summ = ms.At(i)
+		}
+	}
+	if hist.Type() != pmetric.MetricTypeHistogram {
+		t.Fatalf("histogram type = %v", hist.Type())
+	}
+	hdp := hist.Histogram().DataPoints().At(0)
+	if hdp.Count() != 5 || hdp.Sum() != 1.5 || hdp.ExplicitBounds().Len() != 1 {
+		t.Fatalf("histogram dp = count %d sum %v bounds %d", hdp.Count(), hdp.Sum(), hdp.ExplicitBounds().Len())
+	}
+	// Identity labels are elided from histogram data points too.
+	if _, leaked := hdp.Attributes().Get("id"); leaked {
+		t.Fatalf("id label leaked: %v", hdp.Attributes().AsRaw())
+	}
+	if summ.Type() != pmetric.MetricTypeSummary {
+		t.Fatalf("summary type = %v", summ.Type())
+	}
+	sdp := summ.Summary().DataPoints().At(0)
+	if sdp.Count() != 3 || sdp.Sum() != 100 || sdp.QuantileValues().Len() != 1 {
+		t.Fatalf("summary dp = count %d sum %v quantiles %d", sdp.Count(), sdp.Sum(), sdp.QuantileValues().Len())
+	}
+}

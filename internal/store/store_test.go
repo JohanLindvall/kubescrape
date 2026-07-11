@@ -411,3 +411,17 @@ func TestGetPodByUID(t *testing.T) {
 		t.Fatal("expired pod still resolvable by uid")
 	}
 }
+
+// Run is a thin sweeping ticker: it must exit promptly on cancel.
+func TestRunExitsOnCancel(t *testing.T) {
+	s, _ := newTestStore(time.Minute)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { s.Run(ctx); close(done) }()
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run did not exit on cancel")
+	}
+}

@@ -278,3 +278,29 @@ func TestJournalLogAttrs(t *testing.T) {
 		t.Errorf("tenant record counts = %+v (want one resource each)", tenants)
 	}
 }
+
+func TestSeverityMapping(t *testing.T) {
+	cases := []struct {
+		priority string
+		num      plog.SeverityNumber
+		text     string
+	}{
+		{"0", plog.SeverityNumberFatal, "emerg"},
+		{"1", plog.SeverityNumberError3, "alert"},
+		{"2", plog.SeverityNumberError2, "crit"},
+		{"3", plog.SeverityNumberError, "err"},
+		{"4", plog.SeverityNumberWarn, "warning"},
+		{"5", plog.SeverityNumberInfo2, "notice"},
+		{"6", plog.SeverityNumberInfo, "info"},
+		{"7", plog.SeverityNumberDebug, "debug"},
+		{"8", plog.SeverityNumberUnspecified, ""},
+		{"", plog.SeverityNumberUnspecified, ""},
+		{"junk", plog.SeverityNumberUnspecified, ""},
+	}
+	for _, c := range cases {
+		num, text := severity(c.priority)
+		if num != c.num || text != c.text {
+			t.Errorf("severity(%q) = %v,%q want %v,%q", c.priority, num, text, c.num, c.text)
+		}
+	}
+}

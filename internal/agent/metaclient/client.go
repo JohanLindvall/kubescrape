@@ -4,6 +4,7 @@ package metaclient
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -203,8 +204,9 @@ func (e *StatusError) Error() string {
 	return fmt.Sprintf("metadata service returned %d: %s", e.Code, e.Body)
 }
 
-// IsNotFound reports whether err is a 404 from the metadata service.
+// IsNotFound reports whether err is (or wraps) a 404 from the metadata
+// service.
 func IsNotFound(err error) bool {
-	se, ok := err.(*StatusError)
-	return ok && se.Code == http.StatusNotFound
+	var se *StatusError
+	return errors.As(err, &se) && se.Code == http.StatusNotFound
 }

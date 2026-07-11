@@ -3,8 +3,12 @@ package scrape
 import (
 	"testing"
 
+	"time"
+
 	"github.com/JohanLindvall/kubescrape/internal/kubemeta"
+	"github.com/JohanLindvall/kubescrape/internal/servicemonitors"
 	"github.com/JohanLindvall/kubescrape/internal/services"
+	"k8s.io/apimachinery/pkg/util/intstr"
 )
 
 func basePod() kubemeta.Pod {
@@ -223,5 +227,70 @@ func TestServiceTargetsSkipped(t *testing.T) {
 	pod.Phase = "Succeeded"
 	if got := ServiceTargets(pod, baseService()); got != nil {
 		t.Fatal("finished pod should produce no targets")
+	}
+}
+
+func monitorService() *services.Service {
+	return &services.Service{
+		Name: "svc1", Namespace: "default", UID: "svc-uid",
+		Labels: map[string]string{"team": "core"},
+		Ports: []services.Port{
+			{Name: "metrics", Port: 80, TargetPortName: "metrics"},
+			{Name: "direct", Port: 9091, TargetPortNum: 9091},
+		},
+	}
+}
+
+func TestMonitorTargets(t *testing.T) {
+	pod := basePod()
+	svc := monitorService()
+
+	// Service-port name -> named container port.
+	ts := MonitorTargets(pod, svc, "mon/m1", servicemonitors.Endpoint{Port: "metrics"})
+	if len(ts) != 1 {
+		t.Fatalf("targets = %+v", ts)
+	}
+	tg := ts[0]
+	if tg.URL != "http://10.0.0.5:9090/metrics" || tg.Source != "servicemonitor" || tg.Monitor != "mon/m1" {
+		t.Fatalf("target = %+v", tg)
+	}
+	if tg.Service == nil || tg.Service.Name != "svc1" || tg.Service.Labels["team"] != "core" {
+		t.Fatalf("service info = %+v", tg.Service)
+	}
+
+	// Numeric targetPort override + scheme/path handling (missing leading /).
+	tp := intstr.FromInt32(8080)
+	ts = MonitorTargets(pod, svc, "mon/m1", servicemonitors.Endpoint{
+		TargetPort: &tp, Scheme: "https", Path: "custom",
+	})
+	if len(ts) != 1 || ts[0].URL != "https://10.0.0.5:8080/custom" {
+		t.Fatalf("targetPort target = %+v", ts)
+	}
+
+	// Named targetPort resolves against container ports.
+	tpn := intstr.FromString("web")
+	ts = MonitorTargets(pod, svc, "mon/m1", servicemonitors.Endpoint{TargetPort: &tpn})
+	if len(ts) != 1 || ts[0].URL != "http://10.0.0.5:8080/metrics" {
+		t.Fatalf("named targetPort target = %+v", ts)
+	}
+
+	// Unresolvable ports and nil services yield nothing.
+	if ts := MonitorTargets(pod, svc, "m", servicemonitors.Endpoint{Port: "nope"}); ts != nil {
+		t.Fatalf("unknown service port = %+v", ts)
+	}
+	bad := intstr.FromString("nope")
+	if ts := MonitorTargets(pod, svc, "m", servicemonitors.Endpoint{TargetPort: &bad}); ts != nil {
+		t.Fatalf("unknown targetPort = %+v", ts)
+	}
+	if ts := MonitorTargets(pod, nil, "m", servicemonitors.Endpoint{Port: "metrics"}); ts != nil {
+		t.Fatalf("nil service = %+v", ts)
+	}
+
+	// Deleted or IP-less pods are never targets.
+	gone := basePod()
+	now := time.Now()
+	gone.DeletedAt = &now
+	if ts := MonitorTargets(gone, svc, "m", servicemonitors.Endpoint{Port: "metrics"}); ts != nil {
+		t.Fatalf("deleted pod = %+v", ts)
 	}
 }

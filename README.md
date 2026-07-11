@@ -493,7 +493,8 @@ explicit level found in the message wins over the journal priority.
 own OTLP to the local agent, which enriches it with Kubernetes attributes and
 forwards it — closing the gap that otherwise needs a separate collector with
 the k8sattributes processor. The agent listens for OTLP/gRPC
-(`-ingest-grpc-endpoint`, default `:4317`) and OTLP/HTTP protobuf
+(`-ingest-grpc-endpoint`, default `:4317`) and OTLP/HTTP protobuf (gzip
+bodies accepted)
 (`-ingest-http-endpoint`, default `:4318`, on `/v1/logs` and `/v1/metrics`).
 For each pushed resource it finds a container ID (`container.id` /
 `k8s.container.id`, keys configurable) or a pod UID (`k8s.pod.uid`), resolves

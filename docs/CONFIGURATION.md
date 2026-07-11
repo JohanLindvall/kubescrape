@@ -397,7 +397,7 @@ never overwrites an attribute the sender set.
 | Flag | Default | Description |
 |---|---|---|
 | `-ingest-grpc-endpoint` | `:4317` | OTLP/gRPC listen address; empty disables |
-| `-ingest-http-endpoint` | `:4318` | OTLP/HTTP protobuf listen address (`/v1/logs`, `/v1/metrics`); empty disables |
+| `-ingest-http-endpoint` | `:4318` | OTLP/HTTP protobuf listen address (`/v1/logs`, `/v1/metrics`); gzip `Content-Encoding` accepted; empty disables |
 | `-ingest-metrics-mode` | `auto` | `resource` (ID on the resource), `datapoint` (ID per point → split into per-object resources), or `auto` |
 | `-ingest-logs-enrich` | `true` | parse pushed log bodies as `-logs-enrich`, filling only fields the sender left unset |
 | `-ingest-container-id-keys` | `container.id,k8s.container.id` | attribute keys inspected for a container ID |

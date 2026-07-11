@@ -85,3 +85,40 @@ func TestUpsertReplacesAndDeleteRemoves(t *testing.T) {
 		t.Fatalf("deleted service still matches: %+v", got)
 	}
 }
+
+func TestAll(t *testing.T) {
+	ix := NewIndex()
+	svcA := makeService("u1", "a", map[string]string{"app": "a"})
+	svcB := makeService("u2", "b", map[string]string{"app": "b"})
+	svcC := makeService("u3", "c", map[string]string{"app": "c"})
+	svcC.Namespace = "other"
+	ix.Upsert(svcA)
+	ix.Upsert(svcB)
+	ix.Upsert(svcC)
+
+	names := func(list []*Service) map[string]bool {
+		out := map[string]bool{}
+		for _, s := range list {
+			out[s.Namespace+"/"+s.Name] = true
+		}
+		return out
+	}
+
+	// nil = every namespace.
+	all := names(ix.All(nil))
+	if len(all) != 3 || !all["default/a"] || !all["default/b"] || !all["other/c"] {
+		t.Fatalf("All(nil) = %v", all)
+	}
+	// Scoped to one namespace.
+	scoped := names(ix.All([]string{"other"}))
+	if len(scoped) != 1 || !scoped["other/c"] {
+		t.Fatalf("All(other) = %v", scoped)
+	}
+	// Unknown namespace and empty (non-nil) list yield nothing.
+	if got := ix.All([]string{"missing"}); len(got) != 0 {
+		t.Fatalf("All(missing) = %v", got)
+	}
+	if got := ix.All([]string{}); len(got) != 0 {
+		t.Fatalf("All(empty) = %v", got)
+	}
+}

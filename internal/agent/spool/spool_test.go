@@ -176,3 +176,36 @@ func TestTornTailIgnored(t *testing.T) {
 		t.Fatalf("post-repair pop = %q", got)
 	}
 }
+
+func TestBytesAndSignal(t *testing.T) {
+	s, err := Open(t.TempDir(), Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = s.Close() }()
+
+	if s.Bytes() != 0 {
+		t.Fatalf("empty spool backlog = %d", s.Bytes())
+	}
+	if err := s.Append([]byte("hello")); err != nil {
+		t.Fatal(err)
+	}
+	// Append signals waiters (non-blocking channel, one notification pending).
+	select {
+	case <-s.Signal():
+	default:
+		t.Fatal("Append did not signal")
+	}
+	if s.Bytes() <= 0 {
+		t.Fatalf("backlog after append = %d", s.Bytes())
+	}
+	// Consuming and committing shrinks the backlog back to zero.
+	data, commit, ok := popString(t, s)
+	if !ok || data != "hello" {
+		t.Fatalf("pop = %q, %v", data, ok)
+	}
+	commit()
+	if s.Bytes() != 0 {
+		t.Fatalf("backlog after commit = %d", s.Bytes())
+	}
+}

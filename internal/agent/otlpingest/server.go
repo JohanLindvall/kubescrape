@@ -5,10 +5,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+
 	"log/slog"
 	"net"
 	"net/http"
 	"time"
+
+	"github.com/klauspost/compress/gzip"
 
 	"go.opentelemetry.io/collector/pdata/plog"
 	"go.opentelemetry.io/collector/pdata/plog/plogotlp"
@@ -183,7 +186,21 @@ func readBody(r *http.Request) ([]byte, error) {
 	if ct := r.Header.Get("Content-Type"); ct != "" && ct != "application/x-protobuf" {
 		return nil, fmt.Errorf("unsupported Content-Type %q (want application/x-protobuf)", ct)
 	}
-	return io.ReadAll(io.LimitReader(r.Body, maxIngestBody))
+	var src io.Reader = r.Body
+	switch enc := r.Header.Get("Content-Encoding"); enc {
+	case "", "identity":
+	case "gzip": // OTel SDKs commonly gzip OTLP/HTTP
+		zr, err := gzip.NewReader(io.LimitReader(r.Body, maxIngestBody))
+		if err != nil {
+			return nil, fmt.Errorf("gzip body: %w", err)
+		}
+		defer func() { _ = zr.Close() }()
+		src = zr
+	default:
+		return nil, fmt.Errorf("unsupported Content-Encoding %q (want gzip or identity)", enc)
+	}
+	// The cap applies to the decompressed size too (zip-bomb guard).
+	return io.ReadAll(io.LimitReader(src, maxIngestBody))
 }
 
 type protoMarshaler interface{ MarshalProto() ([]byte, error) }

@@ -7,6 +7,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/cache"
 
 	"github.com/JohanLindvall/kubescrape/internal/kubemeta"
 )
@@ -113,5 +114,41 @@ func TestNamespaceMetadata(t *testing.T) {
 	}
 	if r.Namespace("missing") != nil {
 		t.Fatal("unknown namespace should resolve to nil")
+	}
+}
+
+// NewFromListers backs the resolver with real informer listers: verify both
+// the namespaced and cluster-key Get paths and the nil-lister guard.
+func TestNewFromListers(t *testing.T) {
+	rsGVR := schema.GroupVersionResource{Group: "apps", Version: "v1", Resource: "replicasets"}
+	indexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{cache.NamespaceIndex: cache.MetaNamespaceIndexFunc})
+	rs := obj("rs-uid", nil)
+	rs.Name = "web-abc"
+	rs.Namespace = "default"
+	if err := indexer.Add(rs); err != nil {
+		t.Fatal(err)
+	}
+	r := NewFromListers(map[schema.GroupVersionResource]cache.GenericLister{
+		rsGVR: cache.NewGenericLister(indexer, rsGVR.GroupResource()),
+	})
+
+	ctrl := true
+	got := r.Resolve("default", []metav1.OwnerReference{{
+		APIVersion: "apps/v1", Kind: "ReplicaSet", Name: "web-abc", UID: "rs-uid", Controller: &ctrl,
+	}})
+	if len(got) != 1 || got[0].Name != "web-abc" || got[0].Kind != "ReplicaSet" {
+		t.Fatalf("resolved = %+v", got)
+	}
+
+	// Unknown resource kinds (no lister) and unknown names resolve to the
+	// direct reference only, without panicking.
+	got = r.Resolve("default", []metav1.OwnerReference{{
+		APIVersion: "batch/v1", Kind: "Job", Name: "j1", UID: "j-uid", Controller: &ctrl,
+	}})
+	if len(got) != 1 || got[0].Kind != "Job" {
+		t.Fatalf("no-lister resolve = %+v", got)
+	}
+	if meta := r.Namespace("missing"); meta != nil {
+		t.Fatalf("missing namespace = %+v", meta)
 	}
 }

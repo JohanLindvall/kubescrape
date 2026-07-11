@@ -274,3 +274,104 @@ func TestEnrichCustomIDKeys(t *testing.T) {
 		t.Errorf("custom container-id key not honored: %q", v.Str())
 	}
 }
+
+// TestEnrichMetricsSplitAllTypes routes every OTLP metric type through the
+// data-point splitter: sum, histogram, exponential histogram and summary
+// points must land on their per-object resources with values intact.
+func TestEnrichMetricsSplitAllTypes(t *testing.T) {
+	md := pmetric.NewMetrics()
+	sm := md.ResourceMetrics().AppendEmpty().ScopeMetrics().AppendEmpty()
+	sm.Scope().SetName("test-scope")
+
+	sum := sm.Metrics().AppendEmpty()
+	sum.SetName("s_total")
+	s := sum.SetEmptySum()
+	s.SetIsMonotonic(true)
+	s.SetAggregationTemporality(pmetric.AggregationTemporalityCumulative)
+	sdp := s.DataPoints().AppendEmpty()
+	sdp.SetDoubleValue(7)
+	sdp.Attributes().PutStr("container.id", "cafe01")
+
+	hist := sm.Metrics().AppendEmpty()
+	hist.SetName("h")
+	h := hist.SetEmptyHistogram()
+	h.SetAggregationTemporality(pmetric.AggregationTemporalityCumulative)
+	hdp := h.DataPoints().AppendEmpty()
+	hdp.SetCount(3)
+	hdp.SetSum(1.5)
+	hdp.ExplicitBounds().FromRaw([]float64{1, 2})
+	hdp.BucketCounts().FromRaw([]uint64{1, 1, 1})
+	hdp.Attributes().PutStr("container.id", "cafe01")
+
+	exph := sm.Metrics().AppendEmpty()
+	exph.SetName("eh")
+	eh := exph.SetEmptyExponentialHistogram()
+	eh.SetAggregationTemporality(pmetric.AggregationTemporalityDelta)
+	ehdp := eh.DataPoints().AppendEmpty()
+	ehdp.SetCount(2)
+	ehdp.SetScale(1)
+	ehdp.Attributes().PutStr("k8s.pod.uid", "pod-uid-2")
+
+	summ := sm.Metrics().AppendEmpty()
+	summ.SetName("q")
+	qdp := summ.SetEmptySummary().DataPoints().AppendEmpty()
+	qdp.SetCount(5)
+	qdp.SetSum(2.5)
+	qdp.Attributes().PutStr("k8s.pod.uid", "pod-uid-2")
+
+	out := newEnricher(newMeta(), MetricsDatapoint).EnrichMetrics(context.Background(), md)
+
+	byPod := map[string]map[string]pmetric.Metric{}
+	rms := out.ResourceMetrics()
+	for i := 0; i < rms.Len(); i++ {
+		pod := "<none>"
+		if v, ok := rms.At(i).Resource().Attributes().Get("k8s.pod.name"); ok {
+			pod = v.Str()
+		}
+		if byPod[pod] == nil {
+			byPod[pod] = map[string]pmetric.Metric{}
+		}
+		sms := rms.At(i).ScopeMetrics()
+		for j := 0; j < sms.Len(); j++ {
+			if sms.At(j).Scope().Name() != "test-scope" {
+				t.Errorf("scope name lost: %q", sms.At(j).Scope().Name())
+			}
+			ms := sms.At(j).Metrics()
+			for k := 0; k < ms.Len(); k++ {
+				byPod[pod][ms.At(k).Name()] = ms.At(k)
+			}
+		}
+	}
+
+	w1 := byPod["web-1"]
+	if len(w1) != 2 {
+		t.Fatalf("web-1 metrics = %v", w1)
+	}
+	if m := w1["s_total"]; m.Type() != pmetric.MetricTypeSum || !m.Sum().IsMonotonic() ||
+		m.Sum().AggregationTemporality() != pmetric.AggregationTemporalityCumulative ||
+		m.Sum().DataPoints().At(0).DoubleValue() != 7 {
+		t.Errorf("sum = %+v", m)
+	}
+	if m := w1["h"]; m.Type() != pmetric.MetricTypeHistogram ||
+		m.Histogram().AggregationTemporality() != pmetric.AggregationTemporalityCumulative ||
+		m.Histogram().DataPoints().At(0).Count() != 3 ||
+		m.Histogram().DataPoints().At(0).ExplicitBounds().Len() != 2 {
+		t.Errorf("histogram = %+v", m)
+	}
+
+	w2 := byPod["web-2"]
+	if len(w2) != 2 {
+		t.Fatalf("web-2 metrics = %v", w2)
+	}
+	if m := w2["eh"]; m.Type() != pmetric.MetricTypeExponentialHistogram ||
+		m.ExponentialHistogram().AggregationTemporality() != pmetric.AggregationTemporalityDelta ||
+		m.ExponentialHistogram().DataPoints().At(0).Count() != 2 ||
+		m.ExponentialHistogram().DataPoints().At(0).Scale() != 1 {
+		t.Errorf("exponential histogram = %+v", m)
+	}
+	if m := w2["q"]; m.Type() != pmetric.MetricTypeSummary ||
+		m.Summary().DataPoints().At(0).Count() != 5 ||
+		m.Summary().DataPoints().At(0).Sum() != 2.5 {
+		t.Errorf("summary = %+v", m)
+	}
+}

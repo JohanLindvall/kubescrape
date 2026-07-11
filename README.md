@@ -634,7 +634,10 @@ helm install kubescrape charts/kubescrape -n monitoring -f my-values.yaml
 ```
 
 Migrating from a Grafana Alloy setup? See
-[docs/MIGRATING-FROM-ALLOY.md](docs/MIGRATING-FROM-ALLOY.md).
+[docs/MIGRATING-FROM-ALLOY.md](docs/MIGRATING-FROM-ALLOY.md). For how
+kubescrape compares to Alloy/Promtail, Vector, Fluent Bit and the OTel
+Collector — features, delivery semantics and measured performance — see
+[docs/COMPARISON.md](docs/COMPARISON.md).
 
 For a local test pipeline, `hack/otel-collector.yaml` deploys a contrib
 collector with a debug exporter; the agent's own internal metrics stay small.

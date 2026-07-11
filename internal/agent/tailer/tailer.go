@@ -756,8 +756,7 @@ func (t *Tailer) newPipeline(f *file) {
 				truncated: e.Truncated, match: e.Match, start: start, offset: end,
 			})
 			return nil
-		}, multiline.WithMaxBytes(t.cfg.MaxEntryBytes), multiline.WithMaxLines(512),
-			multiline.WithMatcher(traceMatcher))
+		}, multiline.WithMaxBytes(t.cfg.MaxEntryBytes), multiline.WithMaxLines(512))
 	} else {
 		f.traces = nil
 	}

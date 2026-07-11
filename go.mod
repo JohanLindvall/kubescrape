@@ -6,7 +6,7 @@ require (
 	github.com/JohanLindvall/enrich v0.0.4
 	github.com/JohanLindvall/lightning v0.0.53
 	github.com/JohanLindvall/logfmt v0.0.4
-	github.com/JohanLindvall/multiline v0.0.1
+	github.com/JohanLindvall/multiline v0.0.4
 	github.com/bmatcuk/doublestar/v4 v4.10.0
 	github.com/cespare/xxhash/v2 v2.3.0
 	github.com/coreos/go-systemd/v22 v22.7.0

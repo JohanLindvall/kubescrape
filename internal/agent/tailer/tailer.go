@@ -258,6 +258,11 @@ type file struct {
 	tokens     float64
 	lastRefill time.Time
 	limited    bool
+
+	// keyStdout/keyStderr are the precomputed pipeline keys
+	// ("<containerID>/<stream>") — feedLine runs per physical line and must
+	// not rebuild them.
+	keyStdout, keyStderr string
 }
 
 type logItem struct{ start, end int64 }
@@ -734,6 +739,8 @@ func (t *Tailer) initFile(f *file, checkpoints map[string]checkpoint, initial bo
 // be re-read before the current inode is consumed.
 func (t *Tailer) newPipeline(f *file) {
 	f.reset()
+	f.keyStdout = f.containerID + "/stdout"
+	f.keyStderr = f.containerID + "/stderr"
 
 	if f.source.multiline {
 		f.traces = multiline.New(func(_ context.Context, e multiline.Entry[time.Time]) error {
@@ -749,7 +756,8 @@ func (t *Tailer) newPipeline(f *file) {
 				truncated: e.Truncated, match: e.Match, start: start, offset: end,
 			})
 			return nil
-		}, multiline.WithMaxBytes(t.cfg.MaxEntryBytes), multiline.WithMaxLines(512))
+		}, multiline.WithMaxBytes(t.cfg.MaxEntryBytes), multiline.WithMaxLines(512),
+			multiline.WithMatcher(traceMatcher))
 	} else {
 		f.traces = nil
 	}
@@ -808,7 +816,14 @@ func (t *Tailer) feedLine(ctx context.Context, f *file, raw string, start, end i
 	}
 	key := f.containerID
 	if l, ok := cri.Parse(raw); ok {
-		key += "/" + l.Stream
+		switch l.Stream {
+		case "stdout":
+			key = f.keyStdout
+		case "stderr":
+			key = f.keyStderr
+		default:
+			key = f.containerID + "/" + l.Stream
+		}
 	}
 	f.lastEnd[key] = end
 	if _, ok := f.runStart[key]; !ok {

@@ -149,3 +149,58 @@ func TestScrapeWithFilter(t *testing.T) {
 		t.Fatalf("metrics = %v, want only keep_me", names)
 	}
 }
+
+// The memoizing session must agree with the direct Keep on ordering and
+// label-conditional rules, including repeated names (the cached path).
+func TestFilterSession(t *testing.T) {
+	f, err := newMetricFilter([]FilterRule{
+		{Action: "keep", Metrics: "container_network_.+", Labels: map[string]string{"interface": "eth0"}},
+		{Action: "drop", Metrics: "container_network_.+"},
+		{Action: "drop", Metrics: "(go_|process_).+"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cases := []struct {
+		name   string
+		labels []Label
+		want   bool
+	}{
+		{"container_network_receive_bytes_total", []Label{{Name: "interface", Value: "eth0"}}, true},
+		{"container_network_receive_bytes_total", []Label{{Name: "interface", Value: "lo"}}, false},
+		{"container_network_receive_bytes_total", []Label{{Name: "interface", Value: "eth0"}}, true}, // cached name
+		{"go_goroutines", nil, false},
+		{"http_requests_total", nil, true},
+		{"http_requests_total", nil, true}, // cached name
+	}
+	fs := f.session()
+	for _, c := range cases {
+		if got := fs.Keep(c.name, c.labels); got != c.want {
+			t.Errorf("session Keep(%q, %v) = %v, want %v", c.name, c.labels, got, c.want)
+		}
+		if got := f.Keep(c.name, c.labels); got != c.want {
+			t.Errorf("direct Keep(%q, %v) = %v, want %v", c.name, c.labels, got, c.want)
+		}
+	}
+
+	// Nil filter and >64-rule fallback keep working.
+	var nilf *MetricFilter
+	if !nilf.session().Keep("anything", nil) {
+		t.Error("nil filter session must keep")
+	}
+	many := make([]FilterRule, 65)
+	for i := range many {
+		many[i] = FilterRule{Action: "drop", Metrics: fmt.Sprintf("rule%d_.+", i)}
+	}
+	big, err := newMetricFilter(many)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bs := big.session()
+	if bs.masks != nil {
+		t.Error(">64 rules must disable the memo")
+	}
+	if bs.Keep("rule7_x", nil) || !bs.Keep("other", nil) {
+		t.Error(">64-rule fallback verdicts wrong")
+	}
+}

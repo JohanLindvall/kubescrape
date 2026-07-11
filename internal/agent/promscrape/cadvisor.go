@@ -64,7 +64,7 @@ type chunker interface {
 // converter into cb, exporting a chunk whenever BatchPoints accumulate. It
 // returns the number of samples parsed.
 func (s *Scraper) parseAndExport(ctx context.Context, body io.Reader, openMetrics, withExemplars bool, cb chunker, pipeline, what string) (int, error) {
-	filter := s.cfg.Filters.filterFor(pipeline)
+	filter := s.cfg.Filters.filterFor(pipeline).session()
 	conv := newConverter(cb)
 	parser := NewParser(s.cfg.MaxLineBytes, openMetrics, withExemplars)
 	samples := 0

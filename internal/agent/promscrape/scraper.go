@@ -309,7 +309,13 @@ type batcher struct {
 	md           pmetric.Metrics
 	sm           pmetric.ScopeMetrics
 	byName       map[string]pmetric.Metric
-	points       int
+	// lastName/lastMetric short-circuit the byName probe: consecutive samples
+	// almost always belong to the same family, and names are interned so the
+	// comparison is usually pointer-equal.
+	lastName   string
+	lastMetric pmetric.Metric
+	lastOK     bool
+	points     int
 }
 
 func newBatcher(fillResource func(pcommon.Resource), limit int, start, scrape time.Time) *batcher {
@@ -331,6 +337,7 @@ func (b *batcher) reset() {
 	sm.Scope().SetName("github.com/JohanLindvall/kubescrape/agent/promscrape")
 	b.sm = sm
 	b.byName = make(map[string]pmetric.Metric)
+	b.lastOK = false
 	b.points = 0
 }
 

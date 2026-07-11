@@ -101,14 +101,19 @@ type Parser struct {
 	// (OpenMetrics only).
 	exemplars bool
 
-	types    map[string]MetricType
-	names    map[string]string // interned metric/label names
-	values   map[string]string // interned label values
-	labels   []Label           // reused between lines
-	exLabels []Label           // reused between lines
-	exemplar Exemplar
-	scratch  []byte // for lines spanning bufio reads
-	eof      bool   // saw "# EOF"
+	types  map[string]MetricType
+	names  map[string]string // interned metric/label names
+	values map[string]string // interned label values
+	// Consecutive lines of a family are near-identical: lastMetric and the
+	// per-position lastKV short-circuit the intern-map probes with a plain
+	// memcmp (string(b) == s does not allocate), which is ~5x cheaper.
+	lastMetric string
+	lastKV     []lastKV
+	labels     []Label // reused between lines
+	exLabels   []Label // reused between lines
+	exemplar   Exemplar
+	scratch    []byte // for lines spanning bufio reads
+	eof        bool   // saw "# EOF"
 }
 
 // NewParser creates a parser that skips physical lines longer than
@@ -122,6 +127,12 @@ func NewParser(maxLineBytes int, openMetrics, withExemplars bool) *Parser {
 		types:        make(map[string]MetricType),
 		names:        make(map[string]string),
 	}
+}
+
+// lastKV caches the previous line's interned name/value at one label
+// position.
+type lastKV struct {
+	name, value string
 }
 
 // internName returns a canonical string for a metric or label name. The
@@ -346,7 +357,12 @@ func (p *Parser) parseSample(line []byte) (Sample, bool) {
 	if i == 0 {
 		return s, false
 	}
-	s.Name = p.internName(line[:i])
+	if string(line[:i]) == p.lastMetric { // memcmp fast path, no alloc
+		s.Name = p.lastMetric
+	} else {
+		s.Name = p.internName(line[:i])
+		p.lastMetric = s.Name
+	}
 	rest := line[i:]
 
 	// Labels.
@@ -483,7 +499,18 @@ func (p *Parser) parseLabels(rest []byte, dst *[]Label) ([]byte, bool) {
 		if i == 0 {
 			return nil, false
 		}
-		name := p.internName(rest[:i])
+		pos := len(*dst)
+		if pos == len(p.lastKV) {
+			p.lastKV = append(p.lastKV, lastKV{})
+		}
+		last := &p.lastKV[pos]
+		var name string
+		if string(rest[:i]) == last.name { // memcmp fast path, no alloc
+			name = last.name
+		} else {
+			name = p.internName(rest[:i])
+			last.name = name
+		}
 		rest = skipSpaceTab(rest[i:])
 		if len(rest) == 0 || rest[0] != '=' {
 			return nil, false
@@ -492,7 +519,7 @@ func (p *Parser) parseLabels(rest []byte, dst *[]Label) ([]byte, bool) {
 		if len(rest) == 0 || rest[0] != '"' {
 			return nil, false
 		}
-		value, rem, ok := p.parseQuoted(rest[1:])
+		value, rem, ok := p.parseQuoted(rest[1:], last)
 		if !ok {
 			return nil, false
 		}
@@ -506,13 +533,22 @@ func (p *Parser) parseLabels(rest []byte, dst *[]Label) ([]byte, bool) {
 
 // parseQuoted parses an escaped label value after the opening quote,
 // returning the value and the remainder after the closing quote. The common
-// escape-free case is interned, so a repeated value does not allocate.
-func (p *Parser) parseQuoted(rest []byte) (string, []byte, bool) {
+// escape-free case checks the previous line's value at this position (a
+// memcmp) before interning, so a repeated value costs neither a hash nor an
+// allocation. last may be nil (exemplar labels).
+func (p *Parser) parseQuoted(rest []byte, last *lastKV) (string, []byte, bool) {
 	// Fast path: no backslashes before the closing quote.
 	for i := 0; i < len(rest); i++ {
 		switch rest[i] {
 		case '"':
-			return p.internValue(rest[:i]), rest[i+1:], true
+			if last != nil && string(rest[:i]) == last.value {
+				return last.value, rest[i+1:], true
+			}
+			v := p.internValue(rest[:i])
+			if last != nil {
+				last.value = v
+			}
+			return v, rest[i+1:], true
 		case '\\':
 			return parseQuotedSlow(rest)
 		}

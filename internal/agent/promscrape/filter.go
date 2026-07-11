@@ -2,6 +2,7 @@ package promscrape
 
 import (
 	"fmt"
+	"math/bits"
 	"os"
 	"regexp"
 	"sort"
@@ -208,6 +209,49 @@ func (f *MetricFilter) Keep(name string, labels []Label) bool {
 			continue
 		}
 		return !r.drop
+	}
+	return true
+}
+
+// session returns a per-scrape memoizing view of the filter: the set of rules
+// whose NAME regex matches is cached per series name (a bitmask), so a family
+// of thousands of series pays the regex walk once. Safe on a nil receiver;
+// the returned session is single-goroutine (one per scrape), keeping the
+// shared MetricFilter immutable.
+func (f *MetricFilter) session() *filterSession {
+	if f == nil || len(f.rules) > 64 {
+		return &filterSession{f: f} // no memo; fall back to direct Keep
+	}
+	return &filterSession{f: f, masks: make(map[string]uint64, 64)}
+}
+
+type filterSession struct {
+	f     *MetricFilter
+	masks map[string]uint64 // name -> bitmask of name-matching rules
+}
+
+func (s *filterSession) Keep(name string, labels []Label) bool {
+	if s.f == nil {
+		return true
+	}
+	if s.masks == nil {
+		return s.f.Keep(name, labels)
+	}
+	mask, ok := s.masks[name]
+	if !ok {
+		for i, r := range s.f.rules {
+			if r.name == nil || r.name.MatchString(name) {
+				mask |= 1 << i
+			}
+		}
+		s.masks[name] = mask
+	}
+	for mask != 0 {
+		i := bits.TrailingZeros64(mask)
+		mask &^= 1 << i
+		if r := &s.f.rules[i]; r.labelsMatch(labels) {
+			return !r.drop
+		}
 	}
 	return true
 }

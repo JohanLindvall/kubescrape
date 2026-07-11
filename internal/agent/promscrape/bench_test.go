@@ -51,9 +51,10 @@ func BenchmarkConvertScrape(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		bt := newBatcher(func(pcommon.Resource) {}, 1<<30, time.Unix(1, 0), time.Unix(2, 0))
 		conv := newConverter(bt)
+		fs := filter.session()
 		p := NewParser(1<<20, false, false)
 		_, err := p.Parse(strings.NewReader(input), func(s Sample) error {
-			if !filter.Keep(s.Name, s.Labels) {
+			if !fs.Keep(s.Name, s.Labels) {
 				return nil
 			}
 			conv.add(s)

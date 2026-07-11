@@ -231,9 +231,28 @@ func labelFloat(labels []Label, name string) (float64, bool) {
 
 // --- batcher emission ---
 
+// metricByName resolves the batch's metric for a family name, with a
+// last-seen fast path (samples arrive family-ordered).
+func (b *batcher) metricByName(name string) (pmetric.Metric, bool) {
+	if b.lastOK && name == b.lastName {
+		return b.lastMetric, true
+	}
+	m, ok := b.byName[name]
+	if ok {
+		b.lastName, b.lastMetric, b.lastOK = name, m, true
+	}
+	return m, ok
+}
+
+// remember indexes a newly created metric.
+func (b *batcher) remember(name string, m pmetric.Metric) {
+	b.byName[name] = m
+	b.lastName, b.lastMetric, b.lastOK = name, m, true
+}
+
 // addNumber emits a gauge or (monotonic cumulative) sum data point.
 func (b *batcher) addNumber(s Sample, monotonic bool) {
-	m, ok := b.byName[s.Name]
+	m, ok := b.metricByName(s.Name)
 	if !ok {
 		m = b.sm.Metrics().AppendEmpty()
 		m.SetName(s.Name)
@@ -244,7 +263,7 @@ func (b *batcher) addNumber(s Sample, monotonic bool) {
 		} else {
 			m.SetEmptyGauge()
 		}
-		b.byName[s.Name] = m
+		b.remember(s.Name, m)
 	}
 
 	var dp pmetric.NumberDataPoint
@@ -270,13 +289,13 @@ func (b *batcher) addNumber(s Sample, monotonic bool) {
 // buckets: bounds exclude +Inf, bucket counts are de-cumulated, the overflow
 // bucket is derived from the total count.
 func (b *batcher) addHistogram(family string, acc *histAcc) {
-	m, ok := b.byName[family]
+	m, ok := b.metricByName(family)
 	if !ok {
 		m = b.sm.Metrics().AppendEmpty()
 		m.SetName(family)
 		h := m.SetEmptyHistogram()
 		h.SetAggregationTemporality(pmetric.AggregationTemporalityCumulative)
-		b.byName[family] = m
+		b.remember(family, m)
 	}
 	if m.Type() != pmetric.MetricTypeHistogram {
 		return
@@ -335,12 +354,12 @@ func fillHistogramPoint(dp pmetric.HistogramDataPoint, acc *histAcc) {
 
 // addSummary emits one Summary data point from accumulated quantiles.
 func (b *batcher) addSummary(family string, acc *summAcc) {
-	m, ok := b.byName[family]
+	m, ok := b.metricByName(family)
 	if !ok {
 		m = b.sm.Metrics().AppendEmpty()
 		m.SetName(family)
 		m.SetEmptySummary()
-		b.byName[family] = m
+		b.remember(family, m)
 	}
 	if m.Type() != pmetric.MetricTypeSummary {
 		return

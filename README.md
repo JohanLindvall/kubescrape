@@ -156,10 +156,13 @@ not indexed.
 ### `GET /healthz`, `GET /readyz`, `GET /metrics`
 
 Liveness is always `200`; readiness turns `200` once the initial informer
-cache sync has completed. `/metrics` exposes the service's internal metrics
-in Prometheus format (`kubescrape_store_pods`, `kubescrape_store_containers`,
-`kubescrape_http_requests_total{pattern,code}`,
-`kubescrape_events_exported_total`, plus Go runtime metrics).
+cache sync has completed. The service's own metrics (`kubescrape_store_pods`,
+`kubescrape_store_containers`, `kubescrape_http_requests_total{pattern,code}`,
+`kubescrape_events_exported_total`, …) are produced through the same internal
+metrics machinery as everything else and **pushed over OTLP**
+(`-self-metrics-interval`, default 1m; 0 disables). `/metrics` serves only
+the Go runtime and process metrics (`go_*`, `process_*`) in Prometheus text
+format, for debugging the process itself.
 
 ## Running
 
@@ -307,7 +310,7 @@ unchanged. Stack traces recognized in plain text are *not* duplicated into
 `exception.stacktrace` — they already are the body; JSON-carried traces are,
 since there the body is the raw JSON. Hit rates per strategy are exported as
 `kubescrape_log_enriched_total{format="json|logfmt|pattern|none"}` on the
-agent's `/metrics`.
+agent's self-metrics (pushed over OTLP).
 
 **Log attributes from the line** (`logAttributes` section). Beyond the fixed
 set enrich recognizes, this section lifts *arbitrary* keys out of a structured
@@ -531,11 +534,16 @@ outcomes count into `kubescrape_ingest_resources_total{outcome}` (including
 (all default true; the kubelet scrapes additionally require
 `-kubelet-endpoint`), plus the opt-in `-journald` and `-ingest`.
 
-**Self-observability.** `-listen` (default `:8081`) serves `GET /healthz`,
-`GET /readyz` and `GET /metrics` with the agent's internal metrics: log
-entries/bytes/rotations and export failures, enrichment hit rates per
-format, scrapes and scrape duration/samples per pipeline, exports per signal
-and outcome, metadata lookups, journal entries and subprocess restarts.
+**Self-observability.** The agent's own metrics — log entries/bytes/rotations
+and export failures, enrichment hit rates per format, scrapes and scrape
+duration/samples per pipeline, exports per signal and outcome, metadata
+lookups, journal entries and reader restarts — are produced through the same
+internal metrics machinery as everything else and **pushed over OTLP** on
+`-self-metrics-interval` (default 1m, 0 disables) with the agent's own
+resource identity (`service.name: kubescrape-agent`, `k8s.node.name`).
+`-listen` (default `:8081`) serves `GET /healthz`, `GET /readyz`,
+`GET /debug/tailer`, and `GET /metrics` with the Go runtime and process
+metrics (`go_*`, `process_*`) only.
 
 **Metric filtering and splitting** (`metrics` section). This section has two
 subsections. `pipelines` holds ordered keep/drop rules per pipeline

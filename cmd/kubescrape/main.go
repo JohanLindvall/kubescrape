@@ -18,6 +18,8 @@ import (
 	"syscall"
 	"time"
 
+	"go.opentelemetry.io/collector/pdata/pcommon"
+
 	corev1 "k8s.io/api/core/v1"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -66,6 +68,7 @@ func run() error {
 
 		// Kubernetes events -> OTLP logs (opt-in).
 		eventsOn        = flag.Bool("events", false, "export Kubernetes events as OTLP log records")
+		selfMetricsIntv = flag.Duration("self-metrics-interval", time.Minute, "export the service's own metrics over OTLP at this interval (0 disables)")
 		otlpEndpoint    = flag.String("otlp-endpoint", "otel-collector.monitoring:4317", "OTLP endpoint for the events exporter: host:port for grpc, base URL for http")
 		otlpProtocol    = flag.String("otlp-protocol", "grpc", "OTLP transport: grpc or http")
 		otlpCompression = flag.String("otlp-compression", "gzip", "OTLP payload compression: gzip or none")
@@ -231,8 +234,10 @@ func run() error {
 		}
 	}
 
-	if *eventsOn {
-		exporter, err := otlpexport.New(otlpexport.Config{
+	var exporter *otlpexport.Client
+	if *eventsOn || *selfMetricsIntv > 0 {
+		var err error
+		exporter, err = otlpexport.New(otlpexport.Config{
 			Endpoint:           *otlpEndpoint,
 			Protocol:           *otlpProtocol,
 			Compression:        *otlpCompression,
@@ -243,10 +248,22 @@ func run() error {
 			Timeout:            *otlpTimeout,
 		})
 		if err != nil {
-			return fmt.Errorf("creating events OTLP exporter: %w", err)
+			return fmt.Errorf("creating OTLP exporter: %w", err)
 		}
 		defer func() { _ = exporter.Close() }()
+	}
+	if *selfMetricsIntv > 0 {
+		res := pcommon.NewResource()
+		a := res.Attributes()
+		a.PutStr("service.name", "kubescrape")
+		if host, err := os.Hostname(); err == nil {
+			a.PutStr("service.instance.id", host)
+		}
+		go obs.Registry.Run(ctx, exporter, *selfMetricsIntv, res, log)
+		log.Info("self-metrics export started", "interval", *selfMetricsIntv)
+	}
 
+	if *eventsOn {
 		ev := events.New(events.Config{Store: st, Exporter: exporter, Logger: log})
 		evInformer := factory.Core().V1().Events().Informer()
 		if _, err := evInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{

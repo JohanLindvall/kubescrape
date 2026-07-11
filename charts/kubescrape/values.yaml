@@ -10,6 +10,9 @@ logFormat: text
 service:
   replicas: 1
   listen: ":8080"
+  # Export the service's own metrics over OTLP at this interval (0 disables);
+  # uses the events otlp settings below.
+  selfMetricsInterval: 1m
   waitTimeout: 5s
   cacheTTL: 5m
   # Serve targets for monitoring.coreos.com ServiceMonitors that select
@@ -40,8 +43,11 @@ service:
 
 # The per-node agent (DaemonSet).
 agent:
-  # HTTP listen address for /healthz, /readyz and /metrics (self-metrics).
+  # HTTP listen address for /healthz, /readyz, /debug/tailer and /metrics
+  # (Go runtime metrics only; kubescrape_* metrics are pushed over OTLP).
   listen: ":8081"
+  # Export the agent's own metrics over OTLP at this interval (0 disables).
+  selfMetricsInterval: 1m
   # Pipeline toggles.
   logs: true
   metrics: true

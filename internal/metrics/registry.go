@@ -1,0 +1,238 @@
+package metrics
+
+import (
+	"context"
+	"log/slog"
+	"strings"
+	"sync"
+	"time"
+
+	"go.opentelemetry.io/collector/pdata/pcommon"
+	"go.opentelemetry.io/collector/pdata/pmetric"
+)
+
+// Registry is a set of directly-driven series for a process's OWN
+// observability metrics (counters, gauges, histograms), exported over OTLP
+// like every other signal — there is no Prometheus exposition. The API
+// mirrors the prometheus client (Inc/Add/Set/Observe, WithLabelValues) so
+// call sites read the same; the storage is this package's series type.
+//
+// Registry series never expire and have no cardinality cap: label sets come
+// from code, not data.
+type Registry struct {
+	mu     sync.Mutex
+	series []*series
+	funcs  []gaugeFunc
+}
+
+// registryExpiration keeps snapshot's idle handling permanently inactive —
+// a self-metric is cumulative for the process lifetime.
+const registryExpiration = 200 * 365 * 24 * time.Hour
+
+type gaugeFunc struct {
+	s  *series
+	fn func() float64
+}
+
+// NewRegistry creates an empty registry.
+func NewRegistry() *Registry { return &Registry{} }
+
+func (r *Registry) add(name, desc string, kind seriesKind, action gaugeAction, buckets []float64) *series {
+	s := newSeries(seriesSpec{
+		name: name, desc: desc, kind: kind, action: action,
+		expiration: registryExpiration, buckets: buckets,
+	})
+	r.mu.Lock()
+	r.series = append(r.series, s)
+	r.mu.Unlock()
+	return s
+}
+
+// Counter registers a monotonic counter.
+func (r *Registry) Counter(name, desc string) *RegCounter {
+	return &RegCounter{bound{s: r.add(name, desc, kindCounter, actionSet, nil)}}
+}
+
+// CounterVec registers a labeled monotonic counter.
+func (r *Registry) CounterVec(name, desc string, labelNames ...string) *RegCounterVec {
+	return &RegCounterVec{vec{s: r.add(name, desc, kindCounter, actionSet, nil), keys: labelNames}}
+}
+
+// Gauge registers a set-latest gauge.
+func (r *Registry) Gauge(name, desc string) *RegGauge {
+	return &RegGauge{bound{s: r.add(name, desc, kindGauge, actionSet, nil)}}
+}
+
+// GaugeVec registers a labeled gauge.
+func (r *Registry) GaugeVec(name, desc string, labelNames ...string) *RegGaugeVec {
+	return &RegGaugeVec{vec{s: r.add(name, desc, kindGauge, actionSet, nil), keys: labelNames}}
+}
+
+// GaugeFunc registers a gauge evaluated at export time.
+func (r *Registry) GaugeFunc(name, desc string, fn func() float64) {
+	s := r.add(name, desc, kindGauge, actionSet, nil)
+	r.mu.Lock()
+	r.funcs = append(r.funcs, gaugeFunc{s: s, fn: fn})
+	r.mu.Unlock()
+}
+
+// HistogramVec registers a labeled histogram (nil buckets = the default
+// latency buckets, matching prometheus.DefBuckets).
+func (r *Registry) HistogramVec(name, desc string, buckets []float64, labelNames ...string) *RegHistogramVec {
+	return &RegHistogramVec{vec{s: r.add(name, desc, kindHistogram, actionSet, buckets), keys: labelNames}}
+}
+
+// bound is a series observed with a fixed (possibly empty) label set.
+type bound struct {
+	s    *series
+	lbls labels
+}
+
+var emptyResource = pcommon.NewMap()
+
+func (b bound) observe(v float64) { b.s.observe(b.lbls, v, 0, emptyResource, nil) }
+
+// Value returns the current sum across the bound label set's samples (for
+// tests and debugging).
+func (b bound) Value() float64 {
+	want := b.lbls.hash()
+	b.s.mu.Lock()
+	defer b.s.mu.Unlock()
+	var total float64
+	for _, samp := range b.s.db {
+		if lb, err := parseLabels(samp.labels); err == nil && lb.hash() == want {
+			total += samp.value
+		}
+	}
+	return total
+}
+
+// RegCounter is a monotonic counter.
+type RegCounter struct{ bound }
+
+// Inc adds one.
+func (c *RegCounter) Inc() { c.observe(1) }
+
+// Add adds v (must be >= 0).
+func (c *RegCounter) Add(v float64) { c.observe(v) }
+
+// RegGauge is a set-latest gauge.
+type RegGauge struct{ bound }
+
+// Set records the current value.
+func (g *RegGauge) Set(v float64) { g.observe(v) }
+
+// vec resolves label values to bound series, caching the label sets so a
+// repeated WithLabelValues on the hot path does not rebuild them.
+type vec struct {
+	s    *series
+	keys []string
+
+	mu    sync.Mutex
+	cache map[string]labels
+}
+
+func (v *vec) with(vals []string) bound {
+	key := strings.Join(vals, "\x00")
+	v.mu.Lock()
+	lbls, ok := v.cache[key]
+	if !ok {
+		lbls = make(labels, 0, len(v.keys))
+		for i, k := range v.keys {
+			if i < len(vals) {
+				lbls = lbls.set(k, vals[i])
+			}
+		}
+		if v.cache == nil {
+			v.cache = make(map[string]labels)
+		}
+		v.cache[key] = lbls
+	}
+	v.mu.Unlock()
+	return bound{s: v.s, lbls: lbls}
+}
+
+// RegCounterVec is a labeled monotonic counter.
+type RegCounterVec struct{ vec }
+
+// WithLabelValues binds label values (order matches the registered names).
+func (v *RegCounterVec) WithLabelValues(vals ...string) *RegCounter {
+	return &RegCounter{v.with(vals)}
+}
+
+// RegGaugeVec is a labeled gauge.
+type RegGaugeVec struct{ vec }
+
+// WithLabelValues binds label values.
+func (v *RegGaugeVec) WithLabelValues(vals ...string) *RegGauge {
+	return &RegGauge{v.with(vals)}
+}
+
+// RegHistogramVec is a labeled histogram.
+type RegHistogramVec struct{ vec }
+
+// WithLabelValues binds label values.
+func (v *RegHistogramVec) WithLabelValues(vals ...string) *RegHistogram {
+	return &RegHistogram{v.with(vals)}
+}
+
+// RegHistogram observes into fixed buckets.
+type RegHistogram struct{ bound }
+
+// Observe records one value.
+func (h *RegHistogram) Observe(v float64) { h.observe(v) }
+
+// Export renders every registered series into one ResourceMetrics carrying
+// the given resource attributes and sends it.
+func (r *Registry) Export(ctx context.Context, exp Exporter, res pcommon.Resource) error {
+	r.mu.Lock()
+	series := append([]*series(nil), r.series...)
+	funcs := append([]gaugeFunc(nil), r.funcs...)
+	r.mu.Unlock()
+
+	for _, gf := range funcs {
+		gf.s.observe(nil, gf.fn(), 0, emptyResource, nil)
+	}
+
+	md := pmetric.NewMetrics()
+	rm := md.ResourceMetrics().AppendEmpty()
+	res.CopyTo(rm.Resource())
+	scope := rm.ScopeMetrics().AppendEmpty()
+	scope.Scope().SetName("github.com/JohanLindvall/kubescrape/internal/obs")
+	ts := time.Now()
+	for _, s := range series {
+		samples := s.snapshot()
+		if len(samples) == 0 {
+			continue
+		}
+		renderSeries(scope, s, samples, ts)
+	}
+	if rm.ScopeMetrics().At(0).Metrics().Len() == 0 {
+		return nil
+	}
+	return exp.ExportMetrics(ctx, md)
+}
+
+// Run exports the registry every interval until ctx is done, then once more.
+func (r *Registry) Run(ctx context.Context, exp Exporter, interval time.Duration, res pcommon.Resource, log *slog.Logger) {
+	if log == nil {
+		log = slog.Default()
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			fctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			if err := r.Export(fctx, exp, res); err != nil {
+				log.Warn("final self-metrics export failed", "error", err)
+			}
+			cancel()
+			return
+		case <-ticker.C:
+			if err := r.Export(ctx, exp, res); err != nil {
+				log.Warn("exporting self-metrics failed", "error", err)
+			}
+		}
+	}
+}

@@ -68,11 +68,15 @@ spec:
             readOnlyRootFilesystem: true
           args:
             - -listen={{ .Values.service.listen }}
+            - -self-metrics-interval={{ .Values.service.selfMetricsInterval }}
             - -wait-timeout={{ .Values.service.waitTimeout }}
             - -cache-ttl={{ .Values.service.cacheTTL }}
             - -servicemonitors={{ .Values.service.serviceMonitors }}
             {{- if .Values.service.events.enabled }}
             - -events
+            {{- end }}
+            {{- /* The OTLP output serves both the events exporter and the
+                 service's own self-metrics push. */}}
             - -otlp-endpoint={{ .Values.service.events.otlp.endpoint }}
             - -otlp-protocol={{ .Values.service.events.otlp.protocol }}
             - -otlp-compression={{ .Values.service.events.otlp.compression }}
@@ -85,13 +89,12 @@ spec:
             {{- if .Values.service.events.otlp.bearerTokenSecret.name }}
             - -otlp-bearer-token-file=/etc/kubescrape/otlp-token/{{ .Values.service.events.otlp.bearerTokenSecret.key }}
             {{- end }}
-            {{- end }}
             - -log-level={{ .Values.logLevel }}
             - -log-format={{ .Values.logFormat }}
             {{- range .Values.service.extraArgs }}
             - {{ . }}
             {{- end }}
-          {{- if and .Values.service.events.enabled .Values.service.events.otlp.bearerTokenSecret.name }}
+          {{- if .Values.service.events.otlp.bearerTokenSecret.name }}
           volumeMounts:
             - name: otlp-token
               mountPath: /etc/kubescrape/otlp-token

@@ -11,7 +11,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/prometheus/client_golang/prometheus/testutil"
 	"go.opentelemetry.io/collector/pdata/plog"
 
 	"github.com/JohanLindvall/kubescrape/internal/agent/attrs"
@@ -513,7 +512,7 @@ func TestMultilineJoinsAcrossDoubleRotation(t *testing.T) {
 	// The trace straddles two rename rotations: part A in inode0, B in inode1,
 	// C (with the terminator) in inode2.
 	a, b, c := panicLines3()
-	base := testutil.ToFloat64(obs.LogRotations)
+	base := obs.LogRotations.Value()
 	writeLines(t, path, a...)
 	if err := os.Rename(path, path+".1"); err != nil {
 		t.Fatal(err)
@@ -525,7 +524,7 @@ func TestMultilineJoinsAcrossDoubleRotation(t *testing.T) {
 	// rotating again, so the group genuinely spans two hops. (Reading B into
 	// the still-open group can't be observed via an emitted record, so settle
 	// briefly — well under the 3s multiline timeout.)
-	waitFor(t, func() bool { return testutil.ToFloat64(obs.LogRotations) >= base+1 }, "first rotation observed")
+	waitFor(t, func() bool { return obs.LogRotations.Value() >= base+1 }, "first rotation observed")
 	time.Sleep(300 * time.Millisecond)
 	if err := os.Rename(path, path+".2"); err != nil {
 		t.Fatal(err)

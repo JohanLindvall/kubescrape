@@ -74,6 +74,7 @@ spec:
           args:
             - -metadata-endpoint=http://{{ .Release.Name }}.{{ .Release.Namespace }}
             - -listen={{ .Values.agent.listen }}
+            - -self-metrics-interval={{ .Values.agent.selfMetricsInterval }}
             - -otlp-endpoint={{ .Values.agent.otlp.endpoint }}
             - -otlp-protocol={{ .Values.agent.otlp.protocol }}
             - -otlp-compression={{ .Values.agent.otlp.compression }}

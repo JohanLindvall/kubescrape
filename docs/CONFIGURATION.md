@@ -52,8 +52,10 @@ kubescrape -listen :8080 -wait-timeout 5s -cache-ttl 5m -log-format json
 | `-log-level` | `info` | `debug`, `info`, `warn`, `error` |
 | `-log-format` | `text` | `text` or `json` (client-go's klog is routed through the same handler) |
 
-`GET /metrics` serves the service's internal metrics (store sizes, HTTP
-requests per pattern/status, exported events).
+The service's own metrics (store sizes, HTTP requests per pattern/status,
+exported events) are pushed over OTLP on `-self-metrics-interval` (default
+1m, 0 disables) using the `-otlp-*` flags. `GET /metrics` serves only the Go
+runtime and process metrics (`go_*`, `process_*`).
 
 RBAC (cluster-wide `get`/`list`/`watch`): `pods`, `services`, `namespaces`,
 `nodes`, `events`, `replicasets.apps`, `deployments.apps`, `jobs.batch`,
@@ -65,7 +67,8 @@ RBAC (cluster-wide `get`/`list`/`watch`): `pods`, `services`, `namespaces`,
 | Flag | Default | Description |
 |---|---|---|
 | `-node-name` | `$NODE_NAME` | the node this agent runs on (set via the downward API) |
-| `-listen` | `:8081` | serves `/healthz`, `/readyz` and `/metrics` (the agent's internal metrics); empty disables |
+| `-listen` | `:8081` | serves `/healthz`, `/readyz`, `/debug/tailer` and `/metrics` (Go runtime/process metrics only — `kubescrape_*` metrics are OTLP-pushed); empty disables |
+| `-self-metrics-interval` | `1m` | export the agent's own metrics over OTLP at this interval (0 disables); both binaries have this flag |
 | `-metadata-endpoint` | `http://kubescrape.monitoring` | base URL of the metadata service |
 | `-metadata-wait` | `5s` | server-side wait for not-yet-known containers (covers the gap between container start and the kubelet posting its status) |
 | `-node-metadata-refresh` | `1m` | refresh interval for the node's labels/annotations used in attribute templates (0 disables) |
@@ -126,7 +129,7 @@ kubescrape-agent \
 | `-logs-max-entry-bytes` | `1MiB` | truncate assembled entries beyond this |
 | `-logs-multiline` | `true` | join stack traces (Go, Java, Python, .NET, Ruby, Rust, PHP) via [multiline](https://github.com/JohanLindvall/multiline) |
 | `-logs-multiline-timeout` | `1s` | flush incomplete multi-line groups after this long |
-| `-logs-enrich` | `true` | parse per-line metadata via [enrich](https://github.com/JohanLindvall/enrich): a timestamp in the line replaces the CRI time, an explicit level sets the severity, trace/span IDs fill the OTLP trace fields, exception/template/source-context details become record attributes. JSON, logfmt and common plain-text formats are recognized; the body is never modified, and plain-text stack traces are not duplicated into `exception.stacktrace`. Hit rates: `kubescrape_log_enriched_total{format}` on `/metrics` |
+| `-logs-enrich` | `true` | parse per-line metadata via [enrich](https://github.com/JohanLindvall/enrich): a timestamp in the line replaces the CRI time, an explicit level sets the severity, trace/span IDs fill the OTLP trace fields, exception/template/source-context details become record attributes. JSON, logfmt and common plain-text formats are recognized; the body is never modified, and plain-text stack traces are not duplicated into `exception.stacktrace`. Hit rates: `kubescrape_log_enriched_total{format}` in the self-metrics |
 | `-logs-file-attributes` | `false` | stamp `log.file.name` (basename) and `log.file.position` (record start offset) on every record, for each file source |
 | `-buffer-dir` | — | directory for a disk-backed export buffer (logs **and** metrics); a collector outage spools here instead of pinning the tailer to old offsets / dropping metrics ([below](#disk-buffer)). Empty disables |
 | `-buffer-max-bytes` | `1GiB` | per-signal cap on the undelivered on-disk backlog; producers back-pressure (the tailer rewinds) when full |
@@ -146,7 +149,7 @@ Rotation handling (rename, copytruncate — including same-size rewrites —
 deletion) is automatic.
 
 Backlog is observable per node — `kubescrape_log_lag_bytes` (largest per-file
-backlog) and `kubescrape_log_lag_bytes_sum` on `/metrics` — and per file on
+backlog) and `kubescrape_log_lag_bytes_sum` in the self-metrics — and per file on
 `GET /debug/tailer` (path, container, read/committed offsets, lag,
 rate-limited flag; refreshed ~10s, largest lag first).
 

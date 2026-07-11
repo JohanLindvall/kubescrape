@@ -34,6 +34,7 @@ import (
 	"github.com/JohanLindvall/kubescrape/internal/agent/tailer"
 	"github.com/JohanLindvall/kubescrape/internal/metrics"
 	"github.com/JohanLindvall/kubescrape/internal/obs"
+	"go.opentelemetry.io/collector/pdata/pcommon"
 )
 
 func main() {
@@ -47,7 +48,8 @@ func run() error {
 	var (
 		configFile      = flag.String("config", "", "unified YAML config file with resourceAttributes, logs, logAttributes, logMetrics and metrics sections (each mirrors its former standalone file)")
 		nodeName        = flag.String("node-name", os.Getenv("NODE_NAME"), "name of the node this agent runs on (default $NODE_NAME)")
-		listen          = flag.String("listen", ":8081", "HTTP listen address for /healthz, /readyz and /metrics (empty disables)")
+		listen          = flag.String("listen", ":8081", "HTTP listen address for /healthz, /readyz and /debug/tailer (empty disables)")
+		selfMetricsIntv = flag.Duration("self-metrics-interval", time.Minute, "export the agent's own metrics over OTLP at this interval (0 disables)")
 		metadataURL     = flag.String("metadata-endpoint", "http://kubescrape.monitoring", "base URL of the kubescrape metadata service")
 		metadataWait    = flag.Duration("metadata-wait", 5*time.Second, "how long the metadata service may block waiting for a new container")
 		otlpEndpoint    = flag.String("otlp-endpoint", "otel-collector.monitoring:4317", "OTLP endpoint: host:port for grpc, base URL for http")
@@ -238,6 +240,16 @@ func run() error {
 		}()
 		out = buffered
 		log.Info("disk buffer enabled", "dir", *bufferDir, "max-bytes-per-signal", *bufferMax)
+	}
+
+	if *selfMetricsIntv > 0 {
+		res := pcommon.NewResource()
+		a := res.Attributes()
+		a.PutStr("service.name", "kubescrape-agent")
+		a.PutStr("k8s.node.name", *nodeName)
+		attrs.Identity(res)
+		go obs.Registry.Run(ctx, out, *selfMetricsIntv, res, log)
+		log.Info("self-metrics export started", "interval", *selfMetricsIntv)
 	}
 
 	// Optional metrics derived from log lines; only these configured metrics are
@@ -442,7 +454,7 @@ func run() error {
 		}
 		mux.HandleFunc("GET /healthz", ok)
 		mux.HandleFunc("GET /readyz", ok)
-		mux.Handle("GET /metrics", obs.Handler())
+		mux.Handle("GET /metrics", obs.RuntimeHandler())
 		if tl != nil {
 			// Per-file tail positions and lag (refreshed ~10s), largest lag first.
 			mux.HandleFunc("GET /debug/tailer", func(w http.ResponseWriter, _ *http.Request) {

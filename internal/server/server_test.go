@@ -13,6 +13,9 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
 
+	"io"
+	"strings"
+
 	"github.com/JohanLindvall/kubescrape/internal/kubemeta"
 	"github.com/JohanLindvall/kubescrape/internal/servicemonitors"
 	"github.com/JohanLindvall/kubescrape/internal/services"
@@ -491,4 +494,30 @@ func TestPodByIPEndpoint(t *testing.T) {
 	// Deleted pods never resolve by IP (the address is recycled).
 	st.DeletePod("pod-uid")
 	getJSON(t, srv.URL+"/v1/pod-ips/10.1.2.3", http.StatusNotFound, nil)
+}
+
+// /metrics serves Go runtime/process metrics only (kubescrape_* metrics are
+// pushed over OTLP, not exposed here).
+func TestRuntimeMetricsEndpoint(t *testing.T) {
+	st := store.New(time.Minute)
+	srv := testServer(t, st, closedChan())
+
+	resp, err := http.Get(srv.URL + "/metrics")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d", resp.StatusCode)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(body), "go_goroutines") {
+		t.Fatal("go runtime metrics missing")
+	}
+	if strings.Contains(string(body), "kubescrape_") {
+		t.Fatal("kubescrape_* metrics must not be exposed here (they are OTLP-pushed)")
+	}
 }

@@ -33,10 +33,9 @@ func ApplyBody(lr plog.LogRecord) {
 // apply parses line and promotes its metadata onto lr. When overwrite is
 // false, only fields the record leaves unset are filled.
 func apply(lr plog.LogRecord, line string, overwrite bool) {
-	e := enrich.Parse(line)
-	if e == nil {
-		return
-	}
+	var res enrich.Result // stack-held; ParseInto avoids the per-line heap Result
+	enrich.ParseInto(line, &res)
+	e := &res
 	format := e.Format
 	if format == enrich.FormatNone {
 		format = "none"

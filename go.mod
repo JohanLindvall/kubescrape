@@ -4,7 +4,7 @@ go 1.26.3
 
 require (
 	github.com/JohanLindvall/bufpool v0.1.0
-	github.com/JohanLindvall/enrich v0.0.4
+	github.com/JohanLindvall/enrich v0.0.7
 	github.com/JohanLindvall/lightning v0.0.53
 	github.com/JohanLindvall/logfmt v0.0.4
 	github.com/JohanLindvall/multiline v0.0.4

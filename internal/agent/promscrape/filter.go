@@ -260,7 +260,9 @@ func (s *filterSession) Keep(name string, labels []Label) bool {
 				mask |= 1 << i
 			}
 		}
-		s.masks[name] = mask
+		if len(s.masks) < maxTrackedFamilies { // bound the per-scrape memo
+			s.masks[name] = mask
+		}
 	}
 	for mask != 0 {
 		i := bits.TrailingZeros64(mask)

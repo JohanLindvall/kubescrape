@@ -12,6 +12,7 @@ import (
 
 	"go.opentelemetry.io/collector/pdata/plog"
 
+	"github.com/JohanLindvall/kubescrape/internal/obs"
 	"github.com/JohanLindvall/kubescrape/internal/store"
 )
 
@@ -183,6 +184,44 @@ func TestEventsSeriesIncrement(t *testing.T) {
 	}
 	if exp.records() != 1 {
 		t.Fatalf("records = %d, want 1 (series recurrence must re-emit)", exp.records())
+	}
+}
+
+// On shutdown the pending batch is flushed before Run returns — events
+// arriving between the last tick and cancellation must not be lost.
+func TestEventsFinalFlushOnShutdown(t *testing.T) {
+	exp := &capture{}
+	// A long flush interval guarantees the ticker never fires; only the final
+	// flush can export.
+	e := New(Config{Store: store.New(time.Minute), Exporter: exp, FlushInterval: time.Hour})
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { defer close(done); e.Run(ctx) }()
+
+	e.OnAdd(testEvent("Pending", "Pod", "p1", "u1", time.Now().Add(time.Second)))
+	e.OnAdd(testEvent("Pending", "Pod", "p2", "u2", time.Now().Add(time.Second)))
+	// Let Run pick the events up (or leave them queued — the drain covers both).
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+	<-done
+	if exp.records() != 2 {
+		t.Fatalf("records after shutdown = %d, want 2 (final flush)", exp.records())
+	}
+}
+
+// Queue-full drops are counted (and the warn is rate-limited rather than
+// per-event, which this test exercises by volume).
+func TestEventsQueueFullDropsCounted(t *testing.T) {
+	exp := &capture{}
+	e := New(Config{Store: store.New(time.Minute), Exporter: exp, BatchSize: 1})
+	// No Run goroutine: the channel (cap 4*BatchSize = 4) fills, the rest drop.
+	before := obs.EventsDropped.Value()
+	when := time.Now().Add(time.Second)
+	for i := 0; i < 10; i++ {
+		e.OnAdd(testEvent("Flood", "Pod", "p", "u", when))
+	}
+	if got := obs.EventsDropped.Value() - before; got != 6 {
+		t.Fatalf("dropped = %v, want 6 (10 enqueued, queue holds 4)", got)
 	}
 }
 

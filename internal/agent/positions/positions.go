@@ -9,6 +9,8 @@ package positions
 
 import (
 	"encoding/json"
+	"errors"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"sync"
@@ -50,13 +52,21 @@ type Store struct {
 }
 
 // Open loads the store at path, tolerating a missing or corrupt file (it
-// then starts empty). A subsequent Save rewrites it.
-func Open(path string) *Store {
+// then starts empty; a subsequent Save rewrites it). Any other read error is
+// returned: starting empty on a transient EACCES/EIO would skip every
+// existing log to its end and then overwrite the good file on the next Save,
+// silently losing the entire unshipped window the file exists to protect.
+func Open(path string) (*Store, error) {
 	s := &Store{path: path}
-	if data, err := os.ReadFile(path); err == nil {
-		_ = json.Unmarshal(data, &s.doc) // corrupt file → start empty, overwritten on next Save
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return s, nil
+		}
+		return nil, err
 	}
-	return s
+	_ = json.Unmarshal(data, &s.doc) // corrupt file → start empty, overwritten on next Save
+	return s, nil
 }
 
 // Logs returns a copy of the stored log positions.

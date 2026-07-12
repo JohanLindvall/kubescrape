@@ -16,11 +16,12 @@ func TestPrefixInstance(t *testing.T) {
 	if v, _ := res.Attributes().Get("service.instance.id"); v.Str() != "cadvisor-cid" {
 		t.Errorf("prefix over existing = %q, want cadvisor-cid", v.Str())
 	}
-	// Bare prefix when no instance was derived.
+	// No instance derived: the bare prefix must NOT be stamped (a shared
+	// meaningless instance is worse than none).
 	res = pcommon.NewResource()
 	PrefixInstance(res, "cadvisor")
-	if v, _ := res.Attributes().Get("service.instance.id"); v.Str() != "cadvisor" {
-		t.Errorf("bare prefix = %q, want cadvisor", v.Str())
+	if v, ok := res.Attributes().Get("service.instance.id"); ok {
+		t.Errorf("bare prefix stamped = %q, want unset", v.Str())
 	}
 	// Empty prefix is a no-op.
 	res = pcommon.NewResource()

@@ -296,8 +296,7 @@ func NewBuilder(cfg *Config, filter *Filter) (*Builder, error) {
 // Build fills res from ctx. Safe on a nil receiver (defaults only, no
 // filter).
 func (b *Builder) Build(res pcommon.Resource, ctx Context) {
-	defaults := b == nil || b.defaults
-	if defaults {
+	if b == nil || b.defaults {
 		if ctx.Node != nil && ctx.Node.Name != "" {
 			res.Attributes().PutStr("k8s.node.name", ctx.Node.Name)
 		}
@@ -310,24 +309,28 @@ func (b *Builder) Build(res pcommon.Resource, ctx Context) {
 		if ctx.Service != nil {
 			Service(res, ctx.Service)
 		}
-		// Derive service.namespace / service.instance.id (Mimir job/instance)
-		// from whatever identity attributes ended up on the resource.
-		Identity(res)
 	}
+	if b != nil {
+		for key, value := range b.static {
+			res.Attributes().PutStr(key, value)
+		}
+		var sb strings.Builder
+		for _, d := range b.dynamic {
+			sb.Reset()
+			// Execution errors (e.g. a nil .Pod on a node-level resource) and
+			// empty results mean "attribute not applicable here".
+			if err := d.tmpl.Execute(&sb, ctx); err == nil && sb.Len() > 0 {
+				res.Attributes().PutStr(d.key, sb.String())
+			}
+		}
+	}
+	// Derive service.namespace / service.instance.id (Mimir job/instance) from
+	// whatever identity attributes ended up on the resource — including
+	// pre-populated and template/static-set ones, and regardless of the
+	// defaults toggle. Fill-if-absent, so a template-set value still wins.
+	Identity(res)
 	if b == nil {
 		return
-	}
-	for key, value := range b.static {
-		res.Attributes().PutStr(key, value)
-	}
-	var sb strings.Builder
-	for _, d := range b.dynamic {
-		sb.Reset()
-		// Execution errors (e.g. a nil .Pod on a node-level resource) and
-		// empty results mean "attribute not applicable here".
-		if err := d.tmpl.Execute(&sb, ctx); err == nil && sb.Len() > 0 {
-			res.Attributes().PutStr(d.key, sb.String())
-		}
 	}
 	// Prefix the (possibly template-overridden) instance last, before filtering.
 	PrefixInstance(res, b.instancePrefix)

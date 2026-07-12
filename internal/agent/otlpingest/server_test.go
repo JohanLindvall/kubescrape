@@ -3,6 +3,7 @@ package otlpingest
 import (
 	"bytes"
 	"context"
+	mathrand "math/rand"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -100,8 +101,31 @@ func TestHTTPRejectsBadContentType(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = resp.Body.Close() }()
-	if resp.StatusCode != http.StatusBadRequest {
-		t.Errorf("status = %d, want 400", resp.StatusCode)
+	if resp.StatusCode != http.StatusUnsupportedMediaType {
+		t.Errorf("status = %d, want 415", resp.StatusCode)
+	}
+}
+
+// A parameterized media type is still the right media type.
+func TestHTTPParameterizedContentType(t *testing.T) {
+	exp := &captureExporter{}
+	srv := httpTestServer(t, exp)
+	ld := plog.NewLogs()
+	ld.ResourceLogs().AppendEmpty().ScopeLogs().AppendEmpty().LogRecords().AppendEmpty().Body().SetStr("hi")
+	body, err := plogotlp.NewExportRequestFromLogs(ld).MarshalProto()
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := http.Post(srv.URL+"/v1/logs", "application/x-protobuf; charset=utf-8", bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("status = %d, want 200", resp.StatusCode)
+	}
+	if len(exp.logs) != 1 {
+		t.Errorf("exported %d log batches", len(exp.logs))
 	}
 }
 
@@ -129,6 +153,40 @@ func TestHTTPExportFailure(t *testing.T) {
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusServiceUnavailable {
 		t.Errorf("status = %d, want 503", resp.StatusCode)
+	}
+}
+
+// errExporter fails every export with a fixed error.
+type errExporter struct{ err error }
+
+func (e *errExporter) ExportLogs(context.Context, plog.Logs) error          { return e.err }
+func (e *errExporter) ExportMetrics(context.Context, pmetric.Metrics) error { return e.err }
+
+// A permanent upstream rejection must reach the HTTP sender as 400 (do not
+// retry), mirroring the gRPC path — not as a blanket retryable 503.
+func TestHTTPExportPermanentRejection(t *testing.T) {
+	srv := httpTestServer(t, &errExporter{err: &otlpexport.HTTPStatusError{Code: 400, Body: "bad"}})
+	ld := plog.NewLogs()
+	ld.ResourceLogs().AppendEmpty().ScopeLogs().AppendEmpty().LogRecords().AppendEmpty()
+	body, _ := plogotlp.NewExportRequestFromLogs(ld).MarshalProto()
+	resp, err := http.Post(srv.URL+"/v1/logs", "application/x-protobuf", bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400 (permanent rejection must not be retried)", resp.StatusCode)
+	}
+
+	// A retryable upstream condition (spool back-pressure) stays 503.
+	srv2 := httpTestServer(t, &errExporter{err: spool.ErrFull})
+	resp2, err := http.Post(srv2.URL+"/v1/logs", "application/x-protobuf", bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp2.Body.Close() }()
+	if resp2.StatusCode != http.StatusServiceUnavailable {
+		t.Errorf("status = %d, want 503 (back-pressure is retryable)", resp2.StatusCode)
 	}
 }
 
@@ -327,6 +385,50 @@ func TestHTTPBodyTooLarge(t *testing.T) {
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusRequestEntityTooLarge {
 		t.Fatalf("status = %d, want 413", resp.StatusCode)
+	}
+}
+
+// An oversized COMPRESSED body must also surface as 413 — its truncation at
+// the cap would otherwise read as a gzip parse error and blame the sender
+// with a 400. The decompressed cap (zip bomb) is a 413 too.
+func TestHTTPGzipBodyTooLarge(t *testing.T) {
+	srv := httpTestServer(t, &captureExporter{})
+
+	post := func(body []byte) int {
+		t.Helper()
+		req, _ := http.NewRequest(http.MethodPost, srv.URL+"/v1/logs", bytes.NewReader(body))
+		req.Header.Set("Content-Type", "application/x-protobuf")
+		req.Header.Set("Content-Encoding", "gzip")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = resp.Body.Close() }()
+		return resp.StatusCode
+	}
+
+	// Incompressible data: the compressed body itself exceeds the cap.
+	raw := make([]byte, maxIngestBody+(1<<20))
+	rnd := mathrand.New(mathrand.NewSource(1))
+	_, _ = rnd.Read(raw)
+	var buf bytes.Buffer
+	zw := gzip.NewWriter(&buf)
+	_, _ = zw.Write(raw)
+	_ = zw.Close()
+	if buf.Len() <= maxIngestBody {
+		t.Fatalf("test payload compressed to %d bytes, below the cap", buf.Len())
+	}
+	if code := post(buf.Bytes()); code != http.StatusRequestEntityTooLarge {
+		t.Errorf("oversized compressed body status = %d, want 413", code)
+	}
+
+	// Zip bomb: tiny compressed, decompresses beyond the cap.
+	var bomb bytes.Buffer
+	zw = gzip.NewWriter(&bomb)
+	_, _ = zw.Write(make([]byte, maxIngestBody+2))
+	_ = zw.Close()
+	if code := post(bomb.Bytes()); code != http.StatusRequestEntityTooLarge {
+		t.Errorf("zip-bomb status = %d, want 413", code)
 	}
 }
 

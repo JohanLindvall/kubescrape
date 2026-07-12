@@ -87,6 +87,7 @@ func (s *Scraper) parseAndExport(ctx context.Context, body io.Reader, openMetric
 		return samples, err
 	}
 	conv.finish()
+	malformed += conv.malformed // component samples the converter rejected
 	if cb.count() > 0 {
 		if err := s.cfg.Exporter.ExportMetrics(ctx, cb.take()); err != nil {
 			return samples, err
@@ -195,6 +196,19 @@ type cadvisorBatcher struct {
 	scopes map[string]pmetric.ScopeMetrics // resource key -> scope
 	byKey  map[string]pmetric.Metric       // resource key + metric name
 	points int
+
+	// Last-seen memos, mirroring the plain batcher's metricByName/remember:
+	// cadvisor series arrive grouped by family and cgroup, so consecutive
+	// samples often share the identity and metric — a struct compare replaces
+	// the key-building allocations and map probes.
+	lastIdent    cadvisorIdentity
+	lastScope    pmetric.ScopeMetrics
+	lastScopeKey string
+	lastScopeOK  bool
+	lastResKey   string
+	lastName     string
+	lastMetric   pmetric.Metric
+	lastOK       bool
 }
 
 func newCadvisorBatcher(s *Scraper, scrape time.Time, ctx context.Context) *cadvisorBatcher {
@@ -218,6 +232,9 @@ func (cb *cadvisorBatcher) reset() {
 		clear(cb.byKey)
 	}
 	cb.points = 0
+	// The memoized handles point into the previous batch's payload.
+	cb.lastScopeOK = false
+	cb.lastOK = false
 }
 
 func (cb *cadvisorBatcher) take() pmetric.Metrics {
@@ -309,18 +326,23 @@ func (id cadvisorIdentity) podScoped() bool {
 }
 
 // scope returns the ScopeMetrics for the resource identified by ident,
-// creating it (with metadata-service enrichment) on first use per batch.
+// creating it (with metadata-service enrichment) on first use per batch. The
+// previous sample's identity is memoized: a repeat costs a struct compare
+// instead of building the key string.
 func (cb *cadvisorBatcher) scope(ident cadvisorIdentity) (pmetric.ScopeMetrics, string) {
-	key := ident.key()
-	if sm, ok := cb.scopes[key]; ok {
-		return sm, key
+	if cb.lastScopeOK && ident == cb.lastIdent {
+		return cb.lastScope, cb.lastScopeKey
 	}
-
-	rm := cb.md.ResourceMetrics().AppendEmpty()
-	cb.fillResource(rm.Resource(), ident)
-	sm := rm.ScopeMetrics().AppendEmpty()
-	sm.Scope().SetName("github.com/JohanLindvall/kubescrape/agent/promscrape/cadvisor")
-	cb.scopes[key] = sm
+	key := ident.key()
+	sm, ok := cb.scopes[key]
+	if !ok {
+		rm := cb.md.ResourceMetrics().AppendEmpty()
+		cb.fillResource(rm.Resource(), ident)
+		sm = rm.ScopeMetrics().AppendEmpty()
+		sm.Scope().SetName("github.com/JohanLindvall/kubescrape/agent/promscrape/cadvisor")
+		cb.scopes[key] = sm
+	}
+	cb.lastIdent, cb.lastScope, cb.lastScopeKey, cb.lastScopeOK = ident, sm, key, true
 	return sm, key
 }
 
@@ -385,12 +407,16 @@ func (cb *cadvisorBatcher) fillResource(res pcommon.Resource, ident cadvisorIden
 	cb.s.attrsFor(pipelineCadvisor).Build(res, ctx)
 }
 
-// metric returns the (per-resource) metric for one sample, plus whether the
-// sample's row is pod/container-scoped (its id/name/image labels are then
-// redundant with the resource and elided from the data points).
-func (cb *cadvisorBatcher) metric(labels []Label, name string, shape func(pmetric.Metric)) (pmetric.Metric, bool) {
-	ident := identityOf(labels)
+// metric returns the (per-resource) metric for one sample's identity, plus
+// whether the sample's row is pod/container-scoped (its id/name/image labels
+// are then redundant with the resource and elided from the data points).
+func (cb *cadvisorBatcher) metric(ident cadvisorIdentity, name string, shape func(pmetric.Metric)) (pmetric.Metric, bool) {
 	sm, resKey := cb.scope(ident)
+	// Last-seen fast path: consecutive samples of the same resource and family
+	// skip the key concatenation (an allocation) and the map probe.
+	if cb.lastOK && resKey == cb.lastResKey && name == cb.lastName {
+		return cb.lastMetric, ident.podScoped()
+	}
 	key := resKey + "\x00" + name
 	m, ok := cb.byKey[key]
 	if !ok {
@@ -399,15 +425,16 @@ func (cb *cadvisorBatcher) metric(labels []Label, name string, shape func(pmetri
 		shape(m)
 		cb.byKey[key] = m
 	}
+	cb.lastResKey, cb.lastName, cb.lastMetric, cb.lastOK = resKey, name, m, true
 	return m, ident.podScoped()
 }
 
-// drop applies the rollup filter (see KubeletConfig.DisableRollups).
-func (cb *cadvisorBatcher) drop(name string, labels []Label) bool {
+// drop applies the rollup filter (see KubeletConfig.DisableRollups) to one
+// sample's identity.
+func (cb *cadvisorBatcher) drop(name string, ident cadvisorIdentity) bool {
 	if !cb.s.cfg.Kubelet.DisableRollups {
 		return false
 	}
-	ident := identityOf(labels)
 	if ident.rollup() {
 		return true // above pod level
 	}
@@ -428,10 +455,11 @@ func podScopedFamily(name string) bool {
 }
 
 func (cb *cadvisorBatcher) addNumber(s Sample, monotonic bool) {
-	if cb.drop(s.Name, s.Labels) {
+	ident := identityOf(s.Labels) // computed once per sample
+	if cb.drop(s.Name, ident) {
 		return
 	}
-	m, podScoped := cb.metric(s.Labels, s.Name, func(m pmetric.Metric) {
+	m, podScoped := cb.metric(ident, s.Name, func(m pmetric.Metric) {
 		if monotonic {
 			sum := m.SetEmptySum()
 			sum.SetIsMonotonic(true)
@@ -458,10 +486,11 @@ func (cb *cadvisorBatcher) addNumber(s Sample, monotonic bool) {
 }
 
 func (cb *cadvisorBatcher) addHistogram(family string, acc *histAcc) {
-	if cb.drop(family, acc.labels) {
+	ident := identityOf(acc.labels)
+	if cb.drop(family, ident) {
 		return
 	}
-	m, podScoped := cb.metric(acc.labels, family, func(m pmetric.Metric) {
+	m, podScoped := cb.metric(ident, family, func(m pmetric.Metric) {
 		m.SetEmptyHistogram().SetAggregationTemporality(pmetric.AggregationTemporalityCumulative)
 	})
 	if m.Type() != pmetric.MetricTypeHistogram {
@@ -476,10 +505,11 @@ func (cb *cadvisorBatcher) addHistogram(family string, acc *histAcc) {
 }
 
 func (cb *cadvisorBatcher) addSummary(family string, acc *summAcc) {
-	if cb.drop(family, acc.labels) {
+	ident := identityOf(acc.labels)
+	if cb.drop(family, ident) {
 		return
 	}
-	m, podScoped := cb.metric(acc.labels, family, func(m pmetric.Metric) {
+	m, podScoped := cb.metric(ident, family, func(m pmetric.Metric) {
 		m.SetEmptySummary()
 	})
 	if m.Type() != pmetric.MetricTypeSummary {

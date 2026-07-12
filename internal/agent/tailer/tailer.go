@@ -162,6 +162,7 @@ type Tailer struct {
 	scanDirs       map[string]struct{} // fixed base dirs of all include globs, watched for new files
 	files          map[string]*file    // by path
 	batch          []entry
+	readBuf        []byte // reusable read scratch (single sweep goroutine)
 	lastFlush      time.Time
 	lastCheckpoint time.Time
 	retryBackoff   time.Duration // initial export retry backoff
@@ -181,6 +182,20 @@ type Tailer struct {
 	// Event-driven mode (nil watcher = pure polling).
 	watcher   *fsnotify.Watcher
 	watchRefs map[string]int // watched target directories, refcounted
+	// byTargetDir indexes files by their watched target directory so an
+	// fsnotify event marks only that directory's files dirty instead of
+	// scanning the whole files map per event.
+	byTargetDir map[string]map[*file]struct{}
+}
+
+// scratch returns the shared read buffer. The sweep goroutine owns all reads,
+// so one buffer serves every file — the previous per-file-per-sweep make was
+// files x 128KiB/s of steady-state garbage on idle directories.
+func (t *Tailer) scratch() []byte {
+	if t.readBuf == nil {
+		t.readBuf = make([]byte, 64*1024)
+	}
+	return t.readBuf
 }
 
 // file is the tailer's state for one tracked log file under the watched
@@ -219,7 +234,12 @@ type file struct {
 	// readArchive, offsets in decompressed space) rather than tailing it.
 	compressed bool
 	gz         *gzip.Reader
-	inode      uint64
+	// archiveDone marks a compressed file read to completion; size/mod pin
+	// the on-disk identity so sweeps skip it until the file changes.
+	archiveDone bool
+	archiveSize int64
+	archiveMod  time.Time
+	inode       uint64
 	// fp is the identity fingerprint: a hash of the first fp.Len bytes.
 	// Together with the inode it prevents a checkpoint from resuming into a
 	// different file (inode reuse, replaced content).
@@ -282,7 +302,13 @@ func (f *file) stateFor(key string) *streamState {
 	return f.state(key)
 }
 
-type logItem struct{ start, end int64 }
+// logItem is one buffered logical line's offset range; when carries the
+// line's timestamp (CRI-parsed, or the feed time for plain files) so stale
+// items can be recognized (see the fifo pop).
+type logItem struct {
+	start, end int64
+	when       time.Time
+}
 
 // ledger is the byte-offset durability accounting for one file's two-stage
 // pipeline: it decides how far the checkpoint may safely advance and how a
@@ -377,7 +403,10 @@ func (l *ledger) reanchor() {
 		st.lastEnd = 0
 		st.runStart = 0
 		for i := range st.fifo {
-			st.fifo[i] = logItem{}
+			// Zero the offsets only: when must survive, or the fifo's
+			// orphan detection would mistake reanchored live items for
+			// dropped lines.
+			st.fifo[i].start, st.fifo[i].end = 0, 0
 		}
 	}
 }
@@ -640,11 +669,9 @@ func (t *Tailer) handleEvent(ev fsnotify.Event) bool {
 	// A write/create in a watched target directory: mark the files tailing
 	// that directory (rotation creates a new file there, too).
 	dirty := false
-	for _, f := range t.files {
-		if f.targetDir == dir {
-			f.dirty = true
-			dirty = true
-		}
+	for f := range t.byTargetDir[dir] {
+		f.dirty = true
+		dirty = true
 	}
 	return dirty
 }
@@ -667,6 +694,15 @@ func (t *Tailer) watchTarget(f *file) {
 	}
 	t.watchRefs[dir]++
 	f.targetDir = dir
+	if t.byTargetDir == nil {
+		t.byTargetDir = make(map[string]map[*file]struct{})
+	}
+	set := t.byTargetDir[dir]
+	if set == nil {
+		set = make(map[*file]struct{})
+		t.byTargetDir[dir] = set
+	}
+	set[f] = struct{}{}
 }
 
 // unwatchTarget releases the file's directory watch.
@@ -677,6 +713,12 @@ func (t *Tailer) unwatchTarget(f *file) {
 	if t.watchRefs[f.targetDir]--; t.watchRefs[f.targetDir] <= 0 {
 		delete(t.watchRefs, f.targetDir)
 		_ = t.watcher.Remove(f.targetDir)
+	}
+	if set := t.byTargetDir[f.targetDir]; set != nil {
+		delete(set, f)
+		if len(set) == 0 {
+			delete(t.byTargetDir, f.targetDir)
+		}
 	}
 	f.targetDir = ""
 }
@@ -703,8 +745,13 @@ func parseFileName(name string) (containerID, namespace string, ok bool) {
 // their include patterns. checkpoints is non-nil only on the initial scan.
 func (t *Tailer) scanDir(checkpoints map[string]checkpoint, initial bool) {
 	seen := make(map[string]struct{})
+	listingOK := true
 	for _, src := range t.sources {
-		for _, path := range src.glob() {
+		paths, ok := src.glob()
+		if !ok {
+			listingOK = false // a failed glob proves nothing about absent files
+		}
+		for _, path := range paths {
 			if _, done := seen[path]; done {
 				continue // an earlier source already claimed this file
 			}
@@ -712,7 +759,16 @@ func (t *Tailer) scanDir(checkpoints map[string]checkpoint, initial bool) {
 				continue // excluded
 			}
 			if st, err := os.Stat(path); err != nil || st.IsDir() {
-				continue // unreadable or a directory (glob can match dirs)
+				// A transient stat failure on a file we already track must
+				// not mark it gone (drop would delete its checkpoint and a
+				// rediscovery would re-ingest the whole file); only genuine
+				// absence may.
+				if err != nil && !os.IsNotExist(err) {
+					if _, known := t.files[path]; known {
+						seen[path] = struct{}{}
+					}
+				}
+				continue
 			}
 			var id string
 			if src.containerd {
@@ -738,9 +794,11 @@ func (t *Tailer) scanDir(checkpoints map[string]checkpoint, initial bool) {
 			t.files[path] = f
 		}
 	}
-	for path, f := range t.files {
-		if _, ok := seen[path]; !ok {
-			f.gone = true
+	if listingOK {
+		for path, f := range t.files {
+			if _, ok := seen[path]; !ok {
+				f.gone = true
+			}
 		}
 	}
 	obs.LogFiles.Set(float64(len(t.files)))
@@ -794,6 +852,17 @@ func (t *Tailer) newPipeline(f *file) {
 		f.traces = multiline.New(func(_ context.Context, e multiline.Entry[time.Time]) error {
 			st := f.stateFor(e.Key)
 			items := st.fifo
+			// The multiline stage's line/byte caps can drop over-limit lines
+			// without ever emitting them (their runs never complete), leaving
+			// orphaned items that would freeze the watermark — and with it
+			// this file's checkpoint — forever. The entry's first-line time
+			// identifies the true head: timestamps are monotonic per stream,
+			// so strictly-older leading items belong to dropped lines.
+			for len(items) > 0 && items[0].when.Before(e.Data) {
+				items = items[1:]
+				obs.LogFifoDropped.Inc()
+			}
+			st.fifo = items
 			n := min(e.Lines, len(items)) // Lines > len(items) must not happen; defensive
 			if n == 0 {
 				return nil
@@ -817,15 +886,21 @@ func (t *Tailer) newPipeline(f *file) {
 	if f.source.containerd {
 		f.criStage = cri.New(func(ctx context.Context, key, line string, when time.Time, start int64) error {
 			st := f.stateFor(key)
+			// start (threaded through cri as the entry data) is the first
+			// fragment's offset — but it predates a carried rotation, which
+			// reanchor cannot reach inside the cri stage. st.runStart is the
+			// same offset maintained on this side and correctly reanchored,
+			// so prefer it whenever a run is open.
+			if st.hasRun {
+				start = st.runStart
+			}
 			st.hasRun = false
 			end := st.lastEnd
 			if f.traces == nil {
-				// start is the first fragment's offset (threaded through cri as the
-				// entry data), i.e. the logical line's start.
 				t.emit(f, entry{time: when, stream: st.stream, body: line, start: start, offset: end})
 				return nil
 			}
-			st.fifo = append(st.fifo, logItem{start: start, end: end})
+			st.fifo = append(st.fifo, logItem{start: start, end: end, when: when})
 			return f.traces.AddAt(ctx, key, line, when, when)
 		}, multiline.WithMaxBytes(t.cfg.MaxEntryBytes))
 	} else {
@@ -897,7 +972,7 @@ func (t *Tailer) feedPlainLine(ctx context.Context, f *file, raw string, start, 
 		t.emit(f, entry{time: when, body: raw, start: start, offset: end})
 		return
 	}
-	f.stPlain.fifo = append(f.stPlain.fifo, logItem{start: start, end: end})
+	f.stPlain.fifo = append(f.stPlain.fifo, logItem{start: start, end: end, when: when})
 	if err := f.traces.AddAt(ctx, plainKey, raw, when, when); err != nil {
 		t.log.Warn("log pipeline", "path", f.path, "error", err)
 	}
@@ -1025,7 +1100,7 @@ func (t *Tailer) readFile(ctx context.Context, f *file) error {
 		t.consume(ctx, f, false)
 	}
 	budget := t.cfg.MaxBytesPerSweep
-	buf := make([]byte, 64*1024)
+	buf := t.scratch()
 	read := 0
 	for budget > 0 && !f.limited {
 		limit := min(len(buf), budget)
@@ -1084,6 +1159,17 @@ func (t *Tailer) readFile(ctx context.Context, f *file) error {
 // is done (committed == readPos means a restart discards everything).
 func (t *Tailer) readArchive(ctx context.Context, f *file) error {
 	if f.gz == nil {
+		// A fully-consumed archive would otherwise be reopened and
+		// re-decompressed end-to-end on every poll sweep, forever; skip while
+		// the compressed file itself is unchanged.
+		if f.archiveDone {
+			if st, err := os.Stat(f.path); err == nil &&
+				st.Size() == f.archiveSize && st.ModTime().Equal(f.archiveMod) {
+				return nil
+			}
+			f.archiveDone = false
+			f.committed = 0 // content replaced; re-read from the start
+		}
 		if err := t.openArchive(f); err != nil {
 			return err
 		}
@@ -1092,7 +1178,7 @@ func (t *Tailer) readArchive(ctx context.Context, f *file) error {
 		t.consume(ctx, f, false)
 	}
 	budget := t.cfg.MaxBytesPerSweep
-	buf := make([]byte, 64*1024)
+	buf := t.scratch()
 	for budget > 0 && !f.limited {
 		n, err := f.gz.Read(buf[:min(len(buf), budget)])
 		if n > 0 {
@@ -1106,6 +1192,13 @@ func (t *Tailer) readArchive(ctx context.Context, f *file) error {
 			if errors.Is(err, io.EOF) {
 				t.stopPipeline(ctx, f) // drain a trailing multi-line group
 				t.closeArchive(f)
+				// Record the consumed archive's identity so idle sweeps skip
+				// it instead of re-decompressing it from scratch.
+				if st, statErr := os.Stat(f.path); statErr == nil {
+					f.archiveDone = true
+					f.archiveSize = st.Size()
+					f.archiveMod = st.ModTime()
+				}
 			}
 			return nil
 		}
@@ -1155,6 +1248,30 @@ func (t *Tailer) openArchive(f *file) error {
 	return nil
 }
 
+// drainArchive finishes reading a mid-read archive from its still-open fd
+// (the file may already be unlinked) so its remainder is not lost when the
+// file drops.
+func (t *Tailer) drainArchive(ctx context.Context, f *file) {
+	if f.gz == nil {
+		return
+	}
+	buf := t.scratch()
+	for {
+		n, err := f.gz.Read(buf)
+		if n > 0 {
+			obs.LogBytes.Add(float64(n))
+			f.pending = append(f.pending, buf[:n]...)
+			f.readPos += int64(n)
+			// Bypass the rate limit like drainFile: pausing would lose the
+			// remainder when the fd closes.
+			t.consume(ctx, f, true)
+		}
+		if err != nil {
+			return
+		}
+	}
+}
+
 // closeArchive releases the archive's readers.
 func (t *Tailer) closeArchive(f *file) {
 	if f.gz != nil {
@@ -1174,13 +1291,19 @@ func (t *Tailer) drainFile(ctx context.Context, f *file) {
 	if f.f == nil {
 		return
 	}
-	budget := 4 * t.cfg.MaxBytesPerSweep
-	buf := make([]byte, 64*1024)
-	for budget > 0 {
-		limit := min(len(buf), budget)
-		n, err := f.f.Read(buf[:limit])
+	// Drain to EOF: whatever is left in the rotated-away inode is unreachable
+	// once the fd closes, so a byte budget here means permanent loss (a
+	// backlog over the budget is realistic — kubelet rotates at 10MiB, and
+	// rate-limit pause mode accumulates arbitrary backlogs). The cap below is
+	// only a circuit breaker against a pathological writer that keeps the old
+	// fd open and outruns us forever.
+	const drainCap = 1 << 30
+	buf := t.scratch()
+	var drained int64
+	for drained < drainCap {
+		n, err := f.f.Read(buf)
 		if n > 0 {
-			budget -= n
+			drained += int64(n)
 			f.pending = append(f.pending, buf[:n]...)
 			f.readPos += int64(n)
 			// Bypass the rate limit: pausing a drain would lose the rotated
@@ -1191,7 +1314,7 @@ func (t *Tailer) drainFile(ctx context.Context, f *file) {
 			return
 		}
 	}
-	t.log.Warn("rotated file still growing, leaving remainder", "path", f.path)
+	t.log.Error("rotated file still growing after draining 1GiB, abandoning remainder", "path", f.path)
 }
 
 // consume splits pending bytes into physical lines and feeds the pipeline.
@@ -1334,6 +1457,11 @@ func (t *Tailer) reopen(ctx context.Context, f *file, renamed bool) {
 		t.stopPipeline(ctx, f)
 		t.newPipeline(f)
 		f.carried = nil
+		// The entries stopPipeline just emitted carry old-content offsets; the
+		// new inode starts at 0, so those offsets must not drive its
+		// checkpoint. Bumping the generation makes flush's gen check discard
+		// them for commit purposes (they still export).
+		f.gen++
 	}
 	f.inode = 0
 	f.fp = fingerprint{}
@@ -1388,7 +1516,7 @@ func (t *Tailer) feedPrefix(ctx context.Context, f *file, p rotatedPrefix) {
 	remaining := p.to - p.from
 	var carry []byte
 	pos := p.from
-	buf := make([]byte, 64*1024)
+	buf := t.scratch()
 	for remaining > 0 {
 		n, rerr := fh.Read(buf[:min(int64(len(buf)), remaining)])
 		if n > 0 {
@@ -1454,8 +1582,12 @@ func (t *Tailer) findRotated(f *file, p rotatedPrefix) (string, bool) {
 func (t *Tailer) drop(f *file) {
 	t.settle(f) // a failed in-flight export must rewind before we drain
 	if f.resolved {
-		if !f.compressed {
-			t.drainFile(context.Background(), f) // archives are complete; nothing to drain
+		if f.compressed {
+			// A large archive is read incrementally across sweeps; a deletion
+			// mid-read leaves the rest readable from the open fd.
+			t.drainArchive(context.Background(), f)
+		} else {
+			t.drainFile(context.Background(), f)
 		}
 		t.stopPipeline(context.Background(), f)
 	}
@@ -1476,7 +1608,15 @@ func (t *Tailer) drop(f *file) {
 type logGrouper struct {
 	ld     plog.Logs
 	plain  map[*file]plog.ScopeLogs
-	scopes map[string]plog.ScopeLogs
+	scopes map[scopeKey]plog.ScopeLogs
+}
+
+// scopeKey identifies one (file, line-derived resource attrs, scope attrs)
+// group without the fmt.Sprintf allocation the old string key paid per
+// attribute-carrying record.
+type scopeKey struct {
+	f          *file
+	res, scope string
 }
 
 func (g *logGrouper) scope(f *file, resAttrs, scopeAttrs []logattrs.Attr) plog.ScopeLogs {
@@ -1488,7 +1628,7 @@ func (g *logGrouper) scope(f *file, resAttrs, scopeAttrs []logattrs.Attr) plog.S
 		g.plain[f] = sl
 		return sl
 	}
-	key := fmt.Sprintf("%p\x01%s\x01%s", f, logattrs.Key(resAttrs), logattrs.Key(scopeAttrs))
+	key := scopeKey{f: f, res: logattrs.Key(resAttrs), scope: logattrs.Key(scopeAttrs)}
 	if sl, ok := g.scopes[key]; ok {
 		return sl
 	}
@@ -1516,7 +1656,7 @@ type metricResolver struct {
 	rec, res pcommon.Map
 	sev      string // lowercased severity text, for __severity__
 	labelFn  func(string) string
-	valueFn  func(string) float64
+	valueFn  func(string) (float64, bool)
 	ruleFn   func(string) string
 }
 
@@ -1552,19 +1692,19 @@ func (r *metricResolver) label(k string) string {
 	return ""
 }
 
-func (r *metricResolver) value(k string) float64 {
+func (r *metricResolver) value(k string) (float64, bool) {
 	v, ok := r.lookup(k)
 	if !ok {
-		return 0
+		return 0, false
 	}
 	switch v.Type() {
 	case pcommon.ValueTypeDouble:
-		return v.Double()
+		return v.Double(), true
 	case pcommon.ValueTypeInt:
-		return float64(v.Int())
+		return float64(v.Int()), true
 	default:
-		f, _ := strconv.ParseFloat(v.AsString(), 64)
-		return f
+		f, err := strconv.ParseFloat(v.AsString(), 64)
+		return f, err == nil
 	}
 }
 
@@ -1579,7 +1719,7 @@ func (t *Tailer) flush(ctx context.Context) {
 		return
 	}
 	ld := plog.NewLogs()
-	g := &logGrouper{ld: ld, plain: map[*file]plog.ScopeLogs{}, scopes: map[string]plog.ScopeLogs{}}
+	g := &logGrouper{ld: ld, plain: map[*file]plog.ScopeLogs{}, scopes: map[scopeKey]plog.ScopeLogs{}}
 	maxOffsets := make(map[*file]int64)
 	gens := make(map[*file]int)
 	touched := make(map[*file]struct{})
@@ -1673,6 +1813,7 @@ func (t *Tailer) flush(ctx context.Context) {
 		offsets: maxOffsets, gens: gens, touched: touched,
 		done: make(chan struct{}),
 	}
+	clear(t.batch) // unpin the exported bodies (a burst otherwise stays reachable)
 	t.batch = t.batch[:0]
 	t.lastFlush = time.Now()
 	// An all-dropped batch has nothing to send but its offsets still commit.

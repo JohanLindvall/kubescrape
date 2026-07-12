@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"os"
 	"sync"
 	"time"
 
@@ -57,6 +58,13 @@ func NewBuffered(inner Exporter, logSpool, metricSpool *spool.Spool, backoff tim
 		log = slog.Default()
 	}
 	b := &Buffered{inner: inner}
+	// The drain owns retry policy; when the inner exporter is the raw client,
+	// bypass its own bounded retries so attempts do not multiply (drain x
+	// client = up to 15 wire sends per cycle otherwise).
+	sendLogs, sendMetrics := inner.ExportLogs, inner.ExportMetrics
+	if c, ok := inner.(*Client); ok {
+		sendLogs, sendMetrics = c.exportLogsOnce, c.exportMetricsOnce
+	}
 	if logSpool != nil {
 		lm := plog.ProtoMarshaler{}
 		lu := plog.ProtoUnmarshaler{}
@@ -64,7 +72,7 @@ func NewBuffered(inner Exporter, logSpool, metricSpool *spool.Spool, backoff tim
 			spool: logSpool, backoff: backoff, log: log, kind: "logs",
 			marshal:   lm.MarshalLogs,
 			unmarshal: lu.UnmarshalLogs,
-			send:      inner.ExportLogs,
+			send:      sendLogs,
 		}
 	}
 	if metricSpool != nil {
@@ -74,7 +82,7 @@ func NewBuffered(inner Exporter, logSpool, metricSpool *spool.Spool, backoff tim
 			spool: metricSpool, backoff: backoff, log: log, kind: "metrics",
 			marshal:   mm.MarshalMetrics,
 			unmarshal: mu.UnmarshalMetrics,
-			send:      inner.ExportMetrics,
+			send:      sendMetrics,
 		}
 	}
 	return b
@@ -124,6 +132,7 @@ type sink[T any] struct {
 	unmarshal func([]byte) (T, error)
 	send      func(context.Context, T) error
 	backoff   time.Duration
+	cur       time.Duration // current backoff, persisted across trySend cycles of a failing head
 	log       *slog.Logger
 	kind      string
 }
@@ -143,7 +152,15 @@ func (s *sink[T]) drain(ctx context.Context) {
 		return
 	}
 	for {
-		data, commit, ok := s.spool.Pop()
+		data, commit, ok, err := s.spool.Pop()
+		if err != nil {
+			lost := "false"
+			if errors.Is(err, os.ErrNotExist) {
+				lost = "true" // the head segment vanished; its frames were skipped
+			}
+			obs.BufferReadErrors.WithLabelValues(s.kind, lost).Inc()
+			s.log.Error("disk buffer read failed", "signal", s.kind, "lost_segment", lost, "error", err)
+		}
 		if !ok {
 			select {
 			case <-ctx.Done():
@@ -173,11 +190,15 @@ func (s *sink[T]) drain(ctx context.Context) {
 		case sendStuck:
 			// Repeated transient failures: rotate the batch to the back of the
 			// queue so one undeliverable batch cannot block the signal —
-			// delivery keeps being attempted every cycle. If the spool is full
-			// the batch stays at the head and the next loop retries in place.
-			if err := s.spool.Append(data); err == nil {
-				obs.BufferRequeued.WithLabelValues(s.kind).Inc()
-				commit()
+			// delivery keeps being attempted every cycle. Requeueing is
+			// pointless churn (a full rewrite + fsync) when this is the only
+			// queued batch, so it stays at the head then. If the spool is full
+			// the batch also stays put and the next loop retries in place.
+			if s.spool.Bytes() > int64(len(data))+spool.FrameOverhead {
+				if err := s.spool.Append(data); err == nil {
+					obs.BufferRequeued.WithLabelValues(s.kind).Inc()
+					commit()
+				}
 			}
 		}
 	}
@@ -200,13 +221,19 @@ const stuckAfterAttempts = 5
 // error is a permanent rejection, the attempt budget is spent, or ctx is
 // cancelled.
 func (s *sink[T]) trySend(ctx context.Context, v T) sendResult {
-	backoff := s.backoff
+	// The backoff persists across trySend cycles (s.cur) so a long outage
+	// actually reaches the 30s cap instead of restarting at s.backoff every
+	// stuckAfterAttempts sends; success resets it.
+	if s.cur < s.backoff {
+		s.cur = s.backoff
+	}
 	for attempt := 1; ; attempt++ {
 		err := s.send(ctx, v)
 		if err == nil {
+			s.cur = 0
 			return sendOK
 		}
-		if permanentError(err) {
+		if IsPermanent(err) {
 			s.log.Warn("buffered export permanently rejected", "signal", s.kind, "error", err)
 			return sendRejected
 		}
@@ -214,31 +241,39 @@ func (s *sink[T]) trySend(ctx context.Context, v T) sendResult {
 			s.log.Warn("buffered export still failing, requeueing", "signal", s.kind, "error", err, "attempts", attempt)
 			return sendStuck
 		}
-		s.log.Warn("buffered export failed, retrying", "signal", s.kind, "error", err, "backoff", backoff)
+		s.log.Warn("buffered export failed, retrying", "signal", s.kind, "error", err, "backoff", s.cur)
 		select {
 		case <-ctx.Done():
 			return sendCancelled
-		case <-time.After(backoff):
+		case <-time.After(s.cur):
 		}
-		if backoff *= 2; backoff > 30*time.Second {
-			backoff = 30 * time.Second
+		if s.cur *= 2; s.cur > 30*time.Second {
+			s.cur = 30 * time.Second
 		}
 	}
 }
 
-// permanentError reports whether err is a definitive collector rejection that
-// retrying cannot fix. Ambiguous codes (Unavailable, ResourceExhausted,
-// timeouts) are treated as transient — the requeue path bounds their damage.
-func permanentError(err error) bool {
+// IsPermanent reports whether err is a definitive collector rejection that
+// retrying cannot fix (bad payload, unimplemented signal). Everything
+// ambiguous is transient. Deliberately transient despite the OTLP spec
+// listing them non-retryable: auth failures (401/403, Unauthenticated,
+// PermissionDenied) and 404 — a rotating bearer token, a collector rolling
+// out behind an ingress, or a route being reprogrammed produces them for
+// windows the disk buffer exists to survive; the bounded requeue path caps
+// their cost, whereas classifying them permanent drains the whole backlog
+// into drops. OutOfRange is retryable per the OTLP failure table.
+func IsPermanent(err error) bool {
 	var he *HTTPStatusError
 	if errors.As(err, &he) {
-		return he.Code >= 400 && he.Code < 500 &&
-			he.Code != 408 && he.Code != 429 // request-timeout / throttled are transient
+		switch he.Code {
+		case 400, 405, 413, 414, 415, 422, 431:
+			return true
+		}
+		return false
 	}
 	if st, ok := status.FromError(err); ok {
 		switch st.Code() {
-		case codes.InvalidArgument, codes.Unimplemented, codes.FailedPrecondition,
-			codes.PermissionDenied, codes.Unauthenticated, codes.OutOfRange:
+		case codes.InvalidArgument, codes.Unimplemented, codes.FailedPrecondition:
 			return true
 		}
 	}

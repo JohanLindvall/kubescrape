@@ -273,6 +273,73 @@ func TestEnricherConcurrent(t *testing.T) {
 	wg.Wait()
 }
 
+// A group keyed by a point-level ID must not inherit the source resource's
+// own ID attributes — they name a different object.
+func TestSplitStripsForeignResourceID(t *testing.T) {
+	md := gaugeMetrics(map[string]string{"container.id": "cafe01"},
+		map[string]any{"k8s.pod.uid": "pod-uid-2"}, // its own object
+		map[string]any{"path": "/x"},               // falls back to the resource's ID
+	)
+	out := newEnricher(newMeta(), MetricsDatapoint).EnrichMetrics(context.Background(), md)
+	rms := out.ResourceMetrics()
+	for i := 0; i < rms.Len(); i++ {
+		a := rms.At(i).Resource().Attributes()
+		pod, _ := a.Get("k8s.pod.name")
+		cid, hasCID := a.Get("container.id")
+		switch pod.Str() {
+		case "web-2": // point-ID group: the resource's container.id was foreign
+			if hasCID {
+				t.Errorf("web-2 group kept foreign container.id %q", cid.Str())
+			}
+		case "web-1": // fallback group: the resource's own ID is correct
+			if !hasCID || cid.Str() != "cafe01" {
+				t.Errorf("web-1 group lost its own container.id: %q", cid.Str())
+			}
+		default:
+			t.Errorf("unexpected group %q: %v", pod.Str(), a.AsRaw())
+		}
+	}
+	if rms.Len() != 2 {
+		t.Fatalf("resources = %d, want 2", rms.Len())
+	}
+}
+
+// countingMeta counts container lookups over the fake.
+type countingMeta struct {
+	*fakeMeta
+	mu    sync.Mutex
+	calls int
+}
+
+func (c *countingMeta) Container(ctx context.Context, id string, wait time.Duration) (*kubemeta.ContainerMetadata, error) {
+	c.mu.Lock()
+	c.calls++
+	c.mu.Unlock()
+	return c.fakeMeta.Container(ctx, id, wait)
+}
+
+// N resources sharing one ID in a single request do one metadata lookup and
+// one attribute build (the per-request memo).
+func TestEnrichLogsMemoizesPerRequest(t *testing.T) {
+	meta := &countingMeta{fakeMeta: newMeta()}
+	ld := plog.NewLogs()
+	for i := 0; i < 3; i++ {
+		rl := ld.ResourceLogs().AppendEmpty()
+		rl.Resource().Attributes().PutStr("container.id", "cafe01")
+		rl.ScopeLogs().AppendEmpty().LogRecords().AppendEmpty().Body().SetStr("hi")
+	}
+	newEnricher(meta, MetricsAuto).EnrichLogs(context.Background(), ld)
+	for i := 0; i < 3; i++ {
+		a := ld.ResourceLogs().At(i).Resource().Attributes()
+		if v, _ := a.Get("k8s.pod.name"); v.Str() != "web-1" {
+			t.Errorf("resource %d not enriched: %q", i, v.Str())
+		}
+	}
+	if meta.calls != 1 {
+		t.Errorf("container lookups = %d, want 1 (memoized per request)", meta.calls)
+	}
+}
+
 func TestEnrichCustomIDKeys(t *testing.T) {
 	ld := plog.NewLogs()
 	rl := ld.ResourceLogs().AppendEmpty()

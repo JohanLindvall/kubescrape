@@ -144,6 +144,7 @@ spec:
             - -journald-units={{ join "," . }}
             {{- end }}
             - -journald-batch-size={{ .Values.agent.journald.batchSize }}
+            - -journald-max-batch-bytes={{ .Values.agent.journald.maxBatchBytes }}
             - -journald-flush-interval={{ .Values.agent.journald.flushInterval }}
             - -journald-enrich={{ .Values.agent.journald.enrich }}
             {{- end }}

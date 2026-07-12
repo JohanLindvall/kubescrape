@@ -4,7 +4,9 @@ import (
 	"context"
 	"fmt"
 	"regexp"
+	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -105,7 +107,11 @@ type Splitter struct {
 }
 
 type compiledSplitRule struct {
-	metrics        *regexp.Regexp    // nil matches any
+	metrics *regexp.Regexp // nil matches any
+	// keyPrefix stamps the rule's identity into the split resource key: two
+	// rules with equal-cardinality groupBy sets must not merge objects whose
+	// label VALUES collide (kube_pod_info{pod="x"} vs kube_node_info{node="x"}).
+	keyPrefix      string
 	groupBy        []groupMapping    // sorted by label for deterministic keys
 	datapointAttr  []string          // resource attrs moved onto the data points
 	instancePrefix *string           // nil = default to the target's service.name
@@ -145,7 +151,7 @@ func NewSplitters(cfgs []SplitterConfig) ([]*Splitter, error) {
 			return nil, fmt.Errorf("splitter %d: no rules", i)
 		}
 		for j, r := range cfg.Rules {
-			var cr compiledSplitRule
+			cr := compiledSplitRule{keyPrefix: strconv.Itoa(j) + "\x00"}
 			if r.Metrics != "" {
 				if cr.metrics, err = regexp.Compile("^(?:" + r.Metrics + ")$"); err != nil {
 					return nil, fmt.Errorf("splitter %d rule %d metrics: %w", i, j, err)
@@ -239,6 +245,22 @@ type splitBatcher struct {
 	// its data points (rule.datapointAttr).
 	dpAttrs map[string][]kv
 	points  int
+
+	// Last-seen memos, mirroring the plain batcher's metricByName/remember:
+	// KSM series arrive grouped by family and object, so consecutive samples
+	// usually route to the same resource and metric — a memcmp replaces the
+	// key-building allocation and map probes.
+	vals        []string // route scratch: current sample's groupBy values
+	lastVals    []string // previous sample's groupBy values
+	lastRule    *compiledSplitRule
+	lastKey     string
+	lastSM      pmetric.ScopeMetrics
+	lastDP      []kv
+	lastRouteOK bool
+	lastMResKey string
+	lastMName   string
+	lastM       pmetric.Metric
+	lastMOK     bool
 }
 
 type kv struct{ key, value string }
@@ -266,6 +288,9 @@ func (b *splitBatcher) reset() {
 		clear(b.dpAttrs)
 	}
 	b.points = 0
+	// The memoized handles point into the previous batch's payload.
+	b.lastRouteOK = false
+	b.lastMOK = false
 }
 
 func (b *splitBatcher) take() pmetric.Metrics {
@@ -278,45 +303,63 @@ func (b *splitBatcher) count() int { return b.points }
 
 // route returns the scope, resource key, and rule for one series (rule nil for
 // the target's own resource), plus the resource attributes moved onto its data
-// points (rule.datapointAttr — split resources only).
+// points (rule.datapointAttr — split resources only). The previous sample's
+// (rule, groupBy values) are memoized: a repeat costs value memcmps instead of
+// rebuilding the key.
 func (b *splitBatcher) route(name string, labels []Label) (pmetric.ScopeMetrics, string, *compiledSplitRule, []kv) {
 	rule := b.sp.ruleFor(name)
+	b.vals = b.vals[:0]
+	if rule != nil {
+		for _, g := range rule.groupBy {
+			b.vals = append(b.vals, labelValue(labels, g.label))
+		}
+	}
+	if b.lastRouteOK && rule == b.lastRule && slices.Equal(b.vals, b.lastVals) {
+		return b.lastSM, b.lastKey, rule, b.lastDP
+	}
+
+	// The key carries the rule's identity: two rules with equal-cardinality
+	// groupBy sets must not merge objects whose values collide.
 	var key strings.Builder
 	if rule == nil {
 		key.WriteString("self")
 	} else {
-		for _, g := range rule.groupBy {
-			key.WriteString(labelValue(labels, g.label))
+		key.WriteString(rule.keyPrefix)
+		for _, v := range b.vals {
+			key.WriteString(v)
 			key.WriteByte(0)
 		}
 	}
 	ks := key.String()
-	if sm, ok := b.scopes[ks]; ok {
-		return sm, ks, rule, b.dpAttrs[ks]
-	}
-
-	rm := b.md.ResourceMetrics().AppendEmpty()
+	sm, ok := b.scopes[ks]
 	var dp []kv
-	if rule == nil {
-		b.fillSelfResource(rm.Resource())
+	if ok {
+		dp = b.dpAttrs[ks]
 	} else {
-		b.fillSplitResource(rm.Resource(), rule, labels)
-		// A split resource describes ANOTHER object (kube-state-metrics style);
-		// the configured attributes (default k8s.node.name) are properties of
-		// that object, not the exporter's identity, so move them off the resource
-		// onto the data points — a queryable series label rather than part of the
-		// resource / target_info.
-		for _, attr := range rule.datapointAttr {
-			if v, ok := rm.Resource().Attributes().Get(attr); ok {
-				dp = append(dp, kv{attr, v.AsString()})
-				rm.Resource().Attributes().Remove(attr)
+		rm := b.md.ResourceMetrics().AppendEmpty()
+		if rule == nil {
+			b.fillSelfResource(rm.Resource())
+		} else {
+			b.fillSplitResource(rm.Resource(), rule, labels)
+			// A split resource describes ANOTHER object (kube-state-metrics style);
+			// the configured attributes (default k8s.node.name) are properties of
+			// that object, not the exporter's identity, so move them off the resource
+			// onto the data points — a queryable series label rather than part of the
+			// resource / target_info.
+			for _, attr := range rule.datapointAttr {
+				if v, ok := rm.Resource().Attributes().Get(attr); ok {
+					dp = append(dp, kv{attr, v.AsString()})
+					rm.Resource().Attributes().Remove(attr)
+				}
 			}
+			b.dpAttrs[ks] = dp
 		}
-		b.dpAttrs[ks] = dp
+		sm = rm.ScopeMetrics().AppendEmpty()
+		sm.Scope().SetName("github.com/JohanLindvall/kubescrape/agent/promscrape")
+		b.scopes[ks] = sm
 	}
-	sm := rm.ScopeMetrics().AppendEmpty()
-	sm.Scope().SetName("github.com/JohanLindvall/kubescrape/agent/promscrape")
-	b.scopes[ks] = sm
+	b.lastVals = append(b.lastVals[:0], b.vals...)
+	b.lastRule, b.lastKey, b.lastSM, b.lastDP, b.lastRouteOK = rule, ks, sm, dp, true
 	return sm, ks, rule, dp
 }
 
@@ -441,6 +484,11 @@ func putSplitLabels(attrsMap pcommon.Map, rule *compiledSplitRule, labels []Labe
 
 func (b *splitBatcher) metric(name string, labels []Label, shape func(pmetric.Metric)) (pmetric.Metric, *compiledSplitRule, []kv) {
 	sm, resKey, rule, dp := b.route(name, labels)
+	// Last-seen fast path: consecutive samples of the same object and family
+	// skip the key concatenation (an allocation) and the map probe.
+	if b.lastMOK && resKey == b.lastMResKey && name == b.lastMName {
+		return b.lastM, rule, dp
+	}
 	key := resKey + "\x00" + name
 	m, ok := b.byKey[key]
 	if !ok {
@@ -449,6 +497,7 @@ func (b *splitBatcher) metric(name string, labels []Label, shape func(pmetric.Me
 		shape(m)
 		b.byKey[key] = m
 	}
+	b.lastMResKey, b.lastMName, b.lastM, b.lastMOK = resKey, name, m, true
 	return m, rule, dp
 }
 

@@ -161,6 +161,11 @@ func (s *Store) UpsertPod(p *corev1.Pod) {
 	if ip == pod.HostIP {
 		ip = "" // hostNetwork: the node IP is shared, not an identity
 	}
+	if finishedPhase(pod.Phase) {
+		// A finished pod's status may retain a podIP the CNI has already
+		// recycled; it must never claim (or keep) the IP mapping.
+		ip = ""
+	}
 	if oldIP != ip && oldIP != "" && s.byPodIP[oldIP] == rec {
 		delete(s.byPodIP, oldIP)
 	}
@@ -219,17 +224,31 @@ func (s *Store) GetContainer(ctx context.Context, id string) (ContainerResult, b
 	}
 	// Fast path: read lock only.
 	s.mu.RLock()
-	res, ok := s.lookupLocked(id)
+	res, ok, gone := s.lookupLocked(id)
 	s.mu.RUnlock()
 	if ok {
 		return res, true
 	}
+	if gone {
+		// Expired tombstone: the container is definitively deleted, so
+		// waiting for its metadata to (re)appear would just burn the budget.
+		return ContainerResult{}, false
+	}
 	for {
+		// Double-checked: the ID may have been indexed since the read-locked
+		// miss (e.g. every waiter waking at once); re-checking under the read
+		// lock keeps such lookup bursts from serializing on the write lock.
+		s.mu.RLock()
+		res, ok, gone = s.lookupLocked(id)
+		s.mu.RUnlock()
+		if ok || gone {
+			return res, ok
+		}
 		s.mu.Lock()
-		res, ok := s.lookupLocked(id)
-		if ok {
+		res, ok, gone = s.lookupLocked(id)
+		if ok || gone {
 			s.mu.Unlock()
-			return res, true
+			return res, ok
 		}
 		ch := make(chan struct{})
 		s.waiters[id] = append(s.waiters[id], ch)
@@ -260,20 +279,23 @@ func (s *Store) removeWaiter(id string, ch chan struct{}) {
 	}
 }
 
-func (s *Store) lookupLocked(id string) (ContainerResult, bool) {
+// lookupLocked resolves a normalized container ID. gone reports an expired
+// (present-but-unswept) tombstone: the ID was known and its pod is
+// definitively deleted, so callers must not block waiting for it.
+func (s *Store) lookupLocked(id string) (res ContainerResult, ok, gone bool) {
 	e := s.byContainer[id]
 	if e == nil {
-		return ContainerResult{}, false
+		return ContainerResult{}, false, false
 	}
 	now := s.now()
 	if !e.expireAt.IsZero() && now.After(e.expireAt) {
-		return ContainerResult{}, false
+		return ContainerResult{}, false, true
 	}
 	rec := s.pods[e.podUID]
 	if rec == nil || (!rec.expireAt.IsZero() && now.After(rec.expireAt)) {
-		return ContainerResult{}, false
+		return ContainerResult{}, false, true
 	}
-	return ContainerResult{Container: e.container, Pod: rec.pod, OwnerRefs: rec.ownerRefs}, true
+	return ContainerResult{Container: e.container, Pod: rec.pod, OwnerRefs: rec.ownerRefs}, true, false
 }
 
 // GetPodByName returns the pod with the given namespace and name; deleted
@@ -305,17 +327,23 @@ func (s *Store) GetPodByUID(uid string) (NodePod, bool) {
 }
 
 // GetPodByIP returns the live pod owning the given pod IP, if any. Deleted
-// pods never resolve (their IP may already belong to a new pod), and
-// hostNetwork pods are not indexed.
+// and finished pods never resolve (their IP may already belong to a new
+// pod), and hostNetwork pods are not indexed.
 func (s *Store) GetPodByIP(ip string) (NodePod, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
 	rec := s.byPodIP[ip]
-	if rec == nil || rec.pod.DeletedAt != nil {
+	if rec == nil || rec.pod.DeletedAt != nil || finishedPhase(rec.pod.Phase) {
 		return NodePod{}, false
 	}
 	return NodePod{Pod: rec.pod, OwnerRefs: rec.ownerRefs}, true
+}
+
+// finishedPhase reports whether a pod phase means the pod has stopped
+// running (its IP is eligible for reuse by the CNI).
+func finishedPhase(phase string) bool {
+	return phase == "Succeeded" || phase == "Failed"
 }
 
 // PodsOnNode returns all live pods scheduled on the given node.

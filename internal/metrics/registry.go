@@ -3,6 +3,7 @@ package metrics
 import (
 	"context"
 	"log/slog"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -50,7 +51,7 @@ func (r *Registry) add(name, desc string, kind seriesKind, action gaugeAction, b
 
 // Counter registers a monotonic counter.
 func (r *Registry) Counter(name, desc string) *RegCounter {
-	return &RegCounter{bound{s: r.add(name, desc, kindCounter, actionSet, nil)}}
+	return &RegCounter{newBound(r.add(name, desc, kindCounter, actionSet, nil), nil)}
 }
 
 // CounterVec registers a labeled monotonic counter.
@@ -63,7 +64,7 @@ func (r *Registry) CounterVec(name, desc string, labelNames ...string) *RegCount
 
 // Gauge registers a set-latest gauge.
 func (r *Registry) Gauge(name, desc string) *RegGauge {
-	return &RegGauge{bound{s: r.add(name, desc, kindGauge, actionSet, nil)}}
+	return &RegGauge{newBound(r.add(name, desc, kindGauge, actionSet, nil), nil)}
 }
 
 // GaugeVec registers a labeled gauge.
@@ -91,15 +92,24 @@ func (r *Registry) HistogramVec(name, desc string, buckets []float64, labelNames
 	}}
 }
 
-// bound is a series observed with a fixed (possibly empty) label set.
+// bound is a series observed with a fixed (possibly empty) label set. The
+// label accumulators are precomputed at construction so a hot-path Inc does
+// not rehash the label set on every call.
 type bound struct {
-	s    *series
-	lbls labels
+	s           *series
+	lbls        labels
+	base, check uint64
+}
+
+func newBound(s *series, lbls labels) bound {
+	return bound{s: s, lbls: lbls, base: lbls.hashAccum(), check: lbls.checkAccum()}
 }
 
 var emptyResource = pcommon.NewMap()
 
-func (b bound) observe(v float64) { b.s.observe(b.lbls, v, 0, emptyResource, nil) }
+func (b bound) observe(v float64) {
+	b.s.observePre(b.lbls, b.base, b.check, v, emptyResource)
+}
 
 // Value returns the current sum across the bound label set's samples (for
 // tests and debugging).
@@ -143,8 +153,24 @@ type vec[W any] struct {
 	cache map[string]*W
 }
 
+// vecKey builds a collision-proof cache key: values are length-prefixed, so a
+// value containing the old separator byte cannot alias another tuple (e.g.
+// ("x\x00y","z") vs ("x","y\x00z")). The single-value case stays alloc-free.
+func vecKey(vals []string) string {
+	if len(vals) == 1 {
+		return vals[0]
+	}
+	var sb strings.Builder
+	for _, v := range vals {
+		sb.WriteString(strconv.Itoa(len(v)))
+		sb.WriteByte(':')
+		sb.WriteString(v)
+	}
+	return sb.String()
+}
+
 func (v *vec[W]) with(vals []string) *W {
-	key := strings.Join(vals, "\x00") // one-element joins return vals[0]: no alloc
+	key := vecKey(vals)
 	v.mu.Lock()
 	w, ok := v.cache[key]
 	if !ok {
@@ -154,7 +180,7 @@ func (v *vec[W]) with(vals []string) *W {
 				lbls = lbls.set(k, vals[i])
 			}
 		}
-		w = v.wrap(bound{s: v.s, lbls: lbls})
+		w = v.wrap(newBound(v.s, lbls))
 		if v.cache == nil {
 			v.cache = make(map[string]*W)
 		}
@@ -203,7 +229,7 @@ func (r *Registry) Export(ctx context.Context, exp Exporter, res pcommon.Resourc
 	r.mu.Unlock()
 
 	for _, gf := range funcs {
-		gf.s.observe(nil, gf.fn(), 0, emptyResource, nil)
+		gf.s.observe(nil, gf.fn(), resKey{}, emptyResource, nil)
 	}
 
 	md := pmetric.NewMetrics()

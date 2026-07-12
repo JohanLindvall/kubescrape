@@ -129,10 +129,12 @@ func NewEnricher(cfg Config) *Enricher {
 // severity, trace/span IDs and structured fields (as the tailer does),
 // without overwriting values the sender already set.
 func (e *Enricher) EnrichLogs(ctx context.Context, ld plog.Logs) {
+	// One lookup + attribute build per distinct ID across the request.
+	cache := map[string]pcommon.Map{}
 	rls := ld.ResourceLogs()
 	for i := 0; i < rls.Len(); i++ {
 		rl := rls.At(i)
-		e.enrichResource(ctx, rl.Resource())
+		e.enrichResource(ctx, rl.Resource(), cache)
 		if !e.cfg.EnrichLines {
 			continue
 		}
@@ -150,9 +152,10 @@ func (e *Enricher) EnrichLogs(ctx context.Context, ld plog.Logs) {
 // EnrichTraces enriches every resource in td in place (traces are otherwise a
 // passthrough signal).
 func (e *Enricher) EnrichTraces(ctx context.Context, td ptrace.Traces) {
+	cache := map[string]pcommon.Map{}
 	rss := td.ResourceSpans()
 	for i := 0; i < rss.Len(); i++ {
-		e.enrichResource(ctx, rss.At(i).Resource())
+		e.enrichResource(ctx, rss.At(i).Resource(), cache)
 	}
 }
 
@@ -177,9 +180,10 @@ func (e *Enricher) EnrichMetrics(ctx context.Context, md pmetric.Metrics) pmetri
 // enrichMetricResources enriches each ResourceMetrics from its own resource
 // attributes.
 func (e *Enricher) enrichMetricResources(ctx context.Context, md pmetric.Metrics) {
+	cache := map[string]pcommon.Map{}
 	rms := md.ResourceMetrics()
 	for i := 0; i < rms.Len(); i++ {
-		e.enrichResource(ctx, rms.At(i).Resource())
+		e.enrichResource(ctx, rms.At(i).Resource(), cache)
 	}
 }
 
@@ -196,20 +200,67 @@ func (e *Enricher) allResourcesHaveID(md pmetric.Metrics) bool {
 }
 
 // enrichResource resolves the ID on res and merges the k8s attributes it maps
-// to, without overwriting attributes the sender already set.
-func (e *Enricher) enrichResource(ctx context.Context, res pcommon.Resource) {
-	e.applyMetadata(ctx, res.Attributes())
+// to, without overwriting attributes the sender already set. cache memoizes
+// the built attributes per ID token for the duration of one request.
+func (e *Enricher) enrichResource(ctx context.Context, res pcommon.Resource, cache map[string]pcommon.Map) {
+	e.applyMetadata(ctx, res.Attributes(), cache)
 }
 
 // applyMetadata looks up the ID in a and merges the derived k8s attributes
 // into a, leaving existing keys untouched. It reports whether an ID resolved.
-func (e *Enricher) applyMetadata(ctx context.Context, a pcommon.Map) bool {
-	pod, container, ok := e.resolve(ctx, a)
+func (e *Enricher) applyMetadata(ctx context.Context, a pcommon.Map, cache map[string]pcommon.Map) bool {
+	tok, ok := e.findID(a)
 	if !ok {
+		if pod := e.peerPod(ctx); pod != nil {
+			obs.Ingested.WithLabelValues("peer_ip").Inc()
+			e.build(pod, nil, a)
+			return true
+		}
+		obs.Ingested.WithLabelValues("unresolved").Inc()
 		return false
 	}
-	e.build(pod, container, a)
+	built := e.builtAttrs(ctx, cache, tok)
+	if built.Len() == 0 {
+		return false
+	}
+	mergeAttrs(built, a)
 	return true
+}
+
+// builtAttrs returns the k8s attributes for a kind-tagged ID token, doing the
+// metadata lookup and attribute build (and the enriched/unresolved counting)
+// once per distinct token per cache. An empty map means the ID did not
+// resolve.
+func (e *Enricher) builtAttrs(ctx context.Context, cache map[string]pcommon.Map, token string) pcommon.Map {
+	if built, ok := cache[token]; ok {
+		return built
+	}
+	built := pcommon.NewMap()
+	if pod, container := e.lookupByID(ctx, token); pod != nil {
+		r := pcommon.NewResource()
+		actx := attrs.Context{Pod: pod, Container: container}
+		if e.cfg.NodeInfo != nil {
+			actx.Node = e.cfg.NodeInfo()
+		}
+		e.cfg.Attrs.Build(r, actx)
+		r.Attributes().CopyTo(built)
+		obs.Ingested.WithLabelValues("enriched").Inc()
+	} else {
+		obs.Ingested.WithLabelValues("unresolved").Inc()
+	}
+	cache[token] = built
+	return built
+}
+
+// mergeAttrs adds src's attributes to dst, never overwriting keys the sender
+// already set.
+func mergeAttrs(src, dst pcommon.Map) {
+	src.Range(func(k string, v pcommon.Value) bool {
+		if _, exists := dst.Get(k); !exists {
+			v.CopyTo(dst.PutEmpty(k))
+		}
+		return true
+	})
 }
 
 // build merges the k8s attributes for pod/container into a, never overwriting
@@ -221,35 +272,7 @@ func (e *Enricher) build(pod *kubemeta.Pod, container *kubemeta.Container, a pco
 		actx.Node = e.cfg.NodeInfo()
 	}
 	e.cfg.Attrs.Build(built, actx)
-	built.Attributes().Range(func(k string, v pcommon.Value) bool {
-		if _, exists := a.Get(k); !exists {
-			v.CopyTo(a.PutEmpty(k))
-		}
-		return true
-	})
-}
-
-// resolve finds a container ID or pod UID in a and fetches its metadata. A
-// container ID is preferred: it resolves the exact incarnation. With
-// PeerIPFallback, a resource carrying neither falls back to the pod owning
-// the connection's peer IP.
-func (e *Enricher) resolve(ctx context.Context, a pcommon.Map) (*kubemeta.Pod, *kubemeta.Container, bool) {
-	tok, ok := e.findID(a)
-	if !ok {
-		if pod := e.peerPod(ctx); pod != nil {
-			obs.Ingested.WithLabelValues("peer_ip").Inc()
-			return pod, nil, true
-		}
-		obs.Ingested.WithLabelValues("unresolved").Inc()
-		return nil, nil, false
-	}
-	pod, container := e.lookupByID(ctx, tok)
-	if pod == nil {
-		obs.Ingested.WithLabelValues("unresolved").Inc()
-		return nil, nil, false
-	}
-	obs.Ingested.WithLabelValues("enriched").Inc()
-	return pod, container, true
+	mergeAttrs(built.Attributes(), a)
 }
 
 // peerPod resolves the pushing pod from the connection's peer IP (nil when

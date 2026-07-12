@@ -5,6 +5,7 @@ package events
 import (
 	"context"
 	"log/slog"
+	"sync/atomic"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -38,6 +39,9 @@ type Exporter struct {
 	log   *slog.Logger
 	ch    chan *corev1.Event
 	start time.Time
+	// lastDropWarn rate-limits the queue-full warning (unix nanos); every drop
+	// still counts into obs.EventsDropped.
+	lastDropWarn atomic.Int64
 }
 
 // New creates an Exporter. Events older than the start time (the informer's
@@ -101,7 +105,14 @@ func (e *Exporter) enqueue(ev *corev1.Event) {
 	select {
 	case e.ch <- ev:
 	default:
-		e.log.Warn("event queue full, dropping event", "reason", ev.Reason)
+		obs.EventsDropped.Inc()
+		// One warning per ~10s: a sustained overload would otherwise log per
+		// dropped event.
+		now := time.Now().UnixNano()
+		if last := e.lastDropWarn.Load(); now-last >= int64(10*time.Second) &&
+			e.lastDropWarn.CompareAndSwap(last, now) {
+			e.log.Warn("event queue full, dropping events", "reason", ev.Reason)
+		}
 	}
 }
 
@@ -120,12 +131,12 @@ func eventTime(ev *corev1.Event) time.Time {
 	return t
 }
 
-// Run batches and exports until ctx is done.
+// Run batches and exports until ctx is done, then flushes what is pending.
 func (e *Exporter) Run(ctx context.Context) {
 	ticker := time.NewTicker(e.cfg.FlushInterval)
 	defer ticker.Stop()
 	var batch []*corev1.Event
-	flush := func() {
+	flush := func(ctx context.Context) {
 		if len(batch) == 0 {
 			return
 		}
@@ -141,14 +152,29 @@ func (e *Exporter) Run(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
+			// Export the pending batch (and whatever is already queued) before
+			// returning, on a short background timeout — mirroring the
+			// self-metrics registry's final export.
+			for {
+				select {
+				case ev := <-e.ch:
+					batch = append(batch, ev)
+					continue
+				default:
+				}
+				break
+			}
+			fctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			flush(fctx)
+			cancel()
 			return
 		case ev := <-e.ch:
 			batch = append(batch, ev)
 			if len(batch) >= e.cfg.BatchSize {
-				flush()
+				flush(ctx)
 			}
 		case <-ticker.C:
-			flush()
+			flush(ctx)
 		}
 	}
 }

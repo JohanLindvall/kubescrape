@@ -124,6 +124,10 @@ func parseSelectors(exact, regex []string) (*selectorSet, error) {
 		if err != nil {
 			return nil, fmt.Errorf("invalid regex selector %q: %w", in, err)
 		}
+		// The memo caches raw match outcomes by hash; an exact and a regex
+		// selector over the same label+expression text test different things,
+		// so the regex kind must not share the exact kind's slot.
+		hash = combineHash(hash, regexSelectorKind)
 		set.regex = append(set.regex, regexSelector{label: label, re: re, want: want, hash: hash})
 	}
 	return set, nil
@@ -146,6 +150,9 @@ func parseSelector(in string) (label, expr string, want bool, hash uint64, err e
 	hash = xxhash.Sum64String(label + "\n" + expr)
 	return label, expr, want, hash, nil
 }
+
+// regexSelectorKind discriminates regex-selector memo hashes from exact ones.
+const regexSelectorKind = 0x9e3779b97f4a7c15
 
 func unescapeSelector(s string) string {
 	s = strings.ReplaceAll(s, `\\`, `\`)

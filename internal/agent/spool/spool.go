@@ -35,6 +35,10 @@ const (
 	segSuffix           = ".seg"
 	cursorName          = "cursor"
 	frameHeader         = 4 // uint32 big-endian length prefix
+
+	// FrameOverhead is the per-record framing cost in bytes, for callers
+	// sizing backlog comparisons against record lengths.
+	FrameOverhead = frameHeader
 )
 
 // Options configure a Spool.
@@ -60,13 +64,16 @@ type Spool struct {
 	segmentSize int64
 	maxBytes    int64
 
-	mu      sync.Mutex
-	segs    []segment // ascending by seq; segs[0] is the read head, last is the write tail
-	w       *os.File  // append handle for the newest segment
-	cursorF *os.File
-	readOff int64 // offset within segs[0] of the next unread frame
-	signal  chan struct{}
-	closed  bool
+	mu          sync.Mutex
+	segs        []segment // ascending by seq; segs[0] is the read head, last is the write tail
+	w           *os.File  // append handle for the newest segment
+	cursorF     *os.File
+	cursorSized bool     // cursor file is exactly cursorLen, safe to rewrite in place
+	readF       *os.File // cached read handle for the head segment
+	readSeq     int64    // segment seq readF is open on
+	readOff     int64    // offset within segs[0] of the next unread frame
+	signal      chan struct{}
+	closed      bool
 }
 
 // Open opens or creates the spool rooted at dir.
@@ -280,33 +287,40 @@ func (s *Spool) rollbackTail(tail *segment) {
 	s.w = nil
 }
 
-// Pop returns the next record and a commit function that removes it, or ok
-// false when the queue is empty. The record is not removed until commit is
-// called, so a crash before commit re-delivers it (at-least-once). commit is
-// idempotent.
-func (s *Spool) Pop() (data []byte, commit func(), ok bool) {
+// Pop returns the next record and a commit function that removes it. ok false
+// with a nil error means the queue is empty; a non-nil error means the head
+// frame could not be read — the caller should surface it and retry, and when
+// the error wraps fs.ErrNotExist the head segment was gone and has been
+// skipped (its frames are unrecoverable). The record is not removed until
+// commit is called, so a crash before commit re-delivers it (at-least-once).
+// commit is idempotent.
+func (s *Spool) Pop() (data []byte, commit func(), ok bool, err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	head := &s.segs[0]
 	if s.readOff+frameHeader > head.size {
-		return nil, nil, false
+		return nil, nil, false, nil
 	}
-	f, err := os.Open(head.path)
+	f, err := s.readHandle(head)
 	if err != nil {
-		return nil, nil, false
+		if errors.Is(err, os.ErrNotExist) {
+			s.skipLostHead()
+		}
+		return nil, nil, false, err
 	}
-	defer func() { _ = f.Close() }()
 	var hdr [frameHeader]byte
 	if _, err := f.ReadAt(hdr[:], s.readOff); err != nil {
-		return nil, nil, false
+		s.dropReadHandle() // reopen fresh next time
+		return nil, nil, false, err
 	}
 	n := int64(binary.BigEndian.Uint32(hdr[:]))
 	if s.readOff+frameHeader+n > head.size {
-		return nil, nil, false // torn (only possible in the write tail)
+		return nil, nil, false, nil // torn (only possible in the write tail)
 	}
 	payload := make([]byte, n)
 	if _, err := f.ReadAt(payload, s.readOff+frameHeader); err != nil {
-		return nil, nil, false
+		s.dropReadHandle()
+		return nil, nil, false, err
 	}
 	end := s.readOff + frameHeader + n
 
@@ -321,13 +335,64 @@ func (s *Spool) Pop() (data []byte, commit func(), ok bool) {
 		s.readOff = end
 		// Retire fully-consumed segments (never the write tail).
 		for len(s.segs) > 1 && s.readOff >= s.segs[0].size {
+			if s.readSeq == s.segs[0].seq {
+				s.dropReadHandle()
+			}
 			_ = os.Remove(s.segs[0].path)
 			s.segs = s.segs[1:]
 			s.readOff = 0
 		}
 		s.persistCursor()
 	}
-	return payload, commit, true
+	return payload, commit, true, nil
+}
+
+// readHandle returns a cached open handle for the head segment, reopening when
+// the head changed (Pop used to open the file per call).
+func (s *Spool) readHandle(head *segment) (*os.File, error) {
+	if s.readF != nil && s.readSeq == head.seq {
+		return s.readF, nil
+	}
+	s.dropReadHandle()
+	f, err := os.Open(head.path)
+	if err != nil {
+		return nil, err
+	}
+	s.readF, s.readSeq = f, head.seq
+	return f, nil
+}
+
+func (s *Spool) dropReadHandle() {
+	if s.readF != nil {
+		_ = s.readF.Close()
+		s.readF = nil
+	}
+}
+
+// skipLostHead advances past a head segment whose file has vanished (external
+// cleanup, disk repair): its frames are unrecoverable, so waiting on them
+// would wedge the queue forever. The write tail is never skipped this way —
+// it is recreated empty instead, so appends keep working (caller holds the
+// lock).
+func (s *Spool) skipLostHead() {
+	s.dropReadHandle()
+	if len(s.segs) > 1 {
+		s.segs = s.segs[1:]
+		s.readOff = 0
+		s.persistCursor()
+		return
+	}
+	// The single segment (also the write tail) is gone; start a fresh one.
+	seq := s.segs[0].seq + 1
+	s.segs = s.segs[:0]
+	if s.w != nil {
+		_ = s.w.Close()
+		s.w = nil
+	}
+	s.readOff = 0
+	if err := s.appendSegment(seq); err == nil {
+		s.persistCursor()
+	}
 }
 
 // Signal fires (non-blocking) after each Append so a consumer can wait for work
@@ -353,6 +418,7 @@ func (s *Spool) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.closed = true
+	s.dropReadHandle()
 	if s.w != nil {
 		_ = s.w.Close()
 		s.w = nil
@@ -378,6 +444,12 @@ func (s *Spool) loadCursor() (seq, off int64, err error) {
 	s.cursorF = f
 	var buf [cursorLen]byte
 	n, _ := f.ReadAt(buf[:], 0)
+	// Rewriting 24 bytes in place is only torn-safe when a partial write
+	// cannot parse as a valid cursor: a fresh/short file falls back to
+	// redelivery, but 24-over-16 torn at 16 bytes would parse as a legacy
+	// cursor with a mixed position. The first persist after a legacy load
+	// therefore goes through a rename (see persistCursor).
+	s.cursorSized = n != 16
 	switch {
 	case n >= cursorLen && binary.BigEndian.Uint64(buf[16:]) == cursorSum(buf[:16]):
 		return int64(binary.BigEndian.Uint64(buf[:8])), int64(binary.BigEndian.Uint64(buf[8:16])), nil
@@ -397,7 +469,9 @@ func cursorSum(b []byte) uint64 {
 }
 
 // persistCursor rewrites the checksummed cursor in place (caller holds the
-// lock).
+// lock). The first write over a legacy 16-byte cursor goes through a
+// write-tmp-fsync-rename so a torn upgrade cannot leave 16 mixed bytes that
+// parse as a valid legacy position.
 func (s *Spool) persistCursor() {
 	if s.cursorF == nil {
 		return
@@ -406,6 +480,29 @@ func (s *Spool) persistCursor() {
 	binary.BigEndian.PutUint64(buf[:8], uint64(s.segs[0].seq))
 	binary.BigEndian.PutUint64(buf[8:16], uint64(s.readOff))
 	binary.BigEndian.PutUint64(buf[16:], cursorSum(buf[:16]))
+	if !s.cursorSized {
+		path := filepath.Join(s.dir, cursorName)
+		tmp := path + ".tmp"
+		if err := os.WriteFile(tmp, buf[:], 0o644); err != nil {
+			return
+		}
+		if t, err := os.Open(tmp); err == nil {
+			_ = t.Sync()
+			_ = t.Close()
+		}
+		if err := os.Rename(tmp, path); err != nil {
+			return
+		}
+		s.syncDir()
+		f, err := os.OpenFile(path, os.O_RDWR, 0o644)
+		if err != nil {
+			return
+		}
+		_ = s.cursorF.Close()
+		s.cursorF = f
+		s.cursorSized = true
+		return
+	}
 	if _, err := s.cursorF.WriteAt(buf[:], 0); err == nil {
 		_ = s.cursorF.Sync()
 	}

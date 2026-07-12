@@ -9,6 +9,9 @@ import (
 	"log/slog"
 	"net/http"
 	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/JohanLindvall/kubescrape/internal/obs"
@@ -60,6 +63,17 @@ type Server struct {
 	cacheTTL time.Duration
 	ready    <-chan struct{}
 	log      *slog.Logger
+	now      func() time.Time
+
+	// monMu guards the monitoredServices cache: the monitor→services match
+	// is O(monitors × services) and identical across the per-node target
+	// requests, so it is rebuilt at most once per cacheTTL (the staleness
+	// horizon the metadata cache already accepts). monBuilds counts rebuilds
+	// for tests.
+	monMu      sync.Mutex
+	monCache   map[string][]monitorEndpoint
+	monBuiltAt time.Time
+	monBuilds  atomic.Int64
 }
 
 // New creates a Server.
@@ -77,6 +91,7 @@ func New(cfg Config) *Server {
 		cacheTTL: cfg.CacheTTL,
 		ready:    cfg.Ready,
 		log:      log,
+		now:      time.Now,
 	}
 }
 
@@ -244,7 +259,10 @@ func (s *Server) handleNodeTargets(w http.ResponseWriter, r *http.Request) {
 	node := r.PathValue("node")
 	pods := s.store.PodsOnNode(node)
 	targets := make([]kubemeta.ScrapeTarget, 0)
-	monitored := s.monitoredServices()
+	var monitored map[string][]monitorEndpoint
+	if len(pods) > 0 { // an empty node cannot match any monitored service
+		monitored = s.monitoredServices()
+	}
 	for _, np := range pods {
 		// Cheap pre-check before the (per-pod) enrichment work: does the pod
 		// or any service selecting it opt into scraping?
@@ -293,11 +311,27 @@ type monitorEndpoint struct {
 }
 
 // monitoredServices maps Service UIDs to the ServiceMonitor endpoints
-// selecting them, resolved once per request.
+// selecting them. The map is rebuilt at most once per cacheTTL (with a zero
+// TTL, once per request); callers must treat it as read-only.
 func (s *Server) monitoredServices() map[string][]monitorEndpoint {
 	if s.monitors == nil {
 		return nil
 	}
+	if s.cacheTTL <= 0 {
+		return s.buildMonitoredServices()
+	}
+	s.monMu.Lock()
+	defer s.monMu.Unlock()
+	if now := s.now(); s.monBuiltAt.IsZero() || now.Sub(s.monBuiltAt) >= s.cacheTTL {
+		s.monCache = s.buildMonitoredServices()
+		s.monBuiltAt = now
+	}
+	return s.monCache
+}
+
+// buildMonitoredServices resolves the monitor→services match from scratch.
+func (s *Server) buildMonitoredServices() map[string][]monitorEndpoint {
+	s.monBuilds.Add(1)
 	out := map[string][]monitorEndpoint{}
 	for _, m := range s.monitors.All() {
 		for _, svc := range s.services.All(m.ServiceNamespaces()) {
@@ -391,12 +425,30 @@ func (s *Server) writeCached(w http.ResponseWriter, r *http.Request, v any) {
 	h.Set("Content-Type", "application/json")
 	h.Set("Cache-Control", "max-age="+strconv.Itoa(int(s.cacheTTL.Seconds())))
 	h.Set("ETag", etag)
-	if match := r.Header.Get("If-None-Match"); match != "" && match == etag {
+	if match := r.Header.Get("If-None-Match"); match != "" && etagMatches(match, etag) {
 		w.WriteHeader(http.StatusNotModified)
 		return
 	}
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(body)
+}
+
+// etagMatches evaluates an If-None-Match header against the current entity
+// tag per RFC 9110: a comma-separated list of entity tags compared weakly (a
+// W/ prefix is ignored), with "*" matching any current representation. Our
+// ETags are quoted hex with no embedded commas, so splitting on commas is
+// exact.
+func etagMatches(header, etag string) bool {
+	for _, candidate := range strings.Split(header, ",") {
+		candidate = strings.TrimSpace(candidate)
+		if candidate == "*" {
+			return true
+		}
+		if strings.TrimPrefix(candidate, "W/") == etag {
+			return true
+		}
+	}
+	return false
 }
 
 func fnvHash(b []byte) uint64 {

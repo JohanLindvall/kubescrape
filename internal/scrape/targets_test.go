@@ -108,6 +108,8 @@ func TestPodTargetsSkipped(t *testing.T) {
 		"failed":                    func(p *kubemeta.Pod) { p.Phase = "Failed" },
 		"unknown named port":        func(p *kubemeta.Pod) { p.Annotations[AnnotationPort] = "nosuchport" },
 		"port out of range":         func(p *kubemeta.Pod) { p.Annotations[AnnotationPort] = "70000" },
+		// 4294967376 == 2^32 + 80: int32 truncation would turn it into 80.
+		"port overflows int32": func(p *kubemeta.Pod) { p.Annotations[AnnotationPort] = "4294967376" },
 		"no ports declared": func(p *kubemeta.Pod) {
 			p.Containers[0].Ports = nil
 		},
@@ -194,6 +196,17 @@ func TestServiceTargetsPortSelection(t *testing.T) {
 	targets = ServiceTargets(basePod(), svc)
 	if len(targets) != 2 {
 		t.Fatalf("targets = %+v", targets)
+	}
+}
+
+// A service port annotation overflowing int32 must be skipped, not truncated
+// into a value that matches a real service port.
+func TestServiceTargetsPortOverflowSkipped(t *testing.T) {
+	svc := baseService()
+	// 4294967376 == 2^32 + 80: truncation would select service port 80.
+	svc.Annotations[AnnotationPort] = "4294967376"
+	if targets := ServiceTargets(basePod(), svc); len(targets) != 0 {
+		t.Fatalf("overflowing port annotation selected targets: %+v", targets)
 	}
 }
 

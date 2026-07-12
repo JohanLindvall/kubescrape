@@ -17,6 +17,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/plog"
@@ -24,6 +25,7 @@ import (
 	"github.com/JohanLindvall/kubescrape/internal/agent/attrs"
 	"github.com/JohanLindvall/kubescrape/internal/agent/logattrs"
 	"github.com/JohanLindvall/kubescrape/internal/agent/logenrich"
+	"github.com/JohanLindvall/kubescrape/internal/agent/otlpexport"
 	"github.com/JohanLindvall/kubescrape/internal/agent/positions"
 	"github.com/JohanLindvall/kubescrape/internal/obs"
 )
@@ -48,6 +50,7 @@ type Config struct {
 	BatchSize     int           // flush after this many entries
 	FlushInterval time.Duration // flush at least this often
 	MaxEntryBytes int           // cap on one journal message
+	MaxBatchBytes int           // flush before a batch's summed bodies exceed this (default 1 MiB)
 
 	// Enrich parses metadata out of each message (timestamp, severity,
 	// trace/span IDs, exception details, ...) into the record's OTLP fields
@@ -100,6 +103,7 @@ type Reader struct {
 	open openFunc
 
 	batch       []entry
+	batchBytes  int // summed body sizes of the buffered entries
 	lastFlush   time.Time
 	cursor      string // last successfully exported cursor
 	batchCursor string // cursor of the newest buffered entry
@@ -125,6 +129,9 @@ func New(cfg Config) *Reader {
 	}
 	if cfg.MaxEntryBytes <= 0 {
 		cfg.MaxEntryBytes = 1 << 20
+	}
+	if cfg.MaxBatchBytes <= 0 {
+		cfg.MaxBatchBytes = 1 << 20
 	}
 	if cfg.RestartBackoff <= 0 {
 		cfg.RestartBackoff = time.Second
@@ -177,7 +184,9 @@ func (r *Reader) stream(ctx context.Context) error {
 	}
 	defer func() { _ = src.close() }()
 
+	clear(r.batch)
 	r.batch = r.batch[:0]
+	r.batchBytes = 0
 	r.batchCursor = ""
 	r.lastFlush = time.Now()
 
@@ -236,7 +245,15 @@ func (r *Reader) stream(ctx context.Context) error {
 					return fmt.Errorf("journal source ended")
 				}
 			}
-			r.ingest(e)
+			body := r.sanitize(e.fields["MESSAGE"])
+			// Flush BEFORE the entry that would push the batch over the byte
+			// cap, so one exported payload never exceeds it.
+			if len(r.batch) > 0 && r.batchBytes+len(body) > r.cfg.MaxBatchBytes {
+				if err := r.flush(ctx); err != nil {
+					return err
+				}
+			}
+			r.ingest(e, body)
 			if len(r.batch) >= r.cfg.BatchSize {
 				if err := r.flush(ctx); err != nil {
 					return err
@@ -246,16 +263,34 @@ func (r *Reader) stream(ctx context.Context) error {
 	}
 }
 
-// ingest converts one raw journal entry into the batch.
-func (r *Reader) ingest(re rawEntry) {
-	msg := re.fields["MESSAGE"]
+// sanitize makes one journal message exportable: valid UTF-8 (the journal
+// stores raw bytes) and capped at MaxEntryBytes without splitting a rune.
+func (r *Reader) sanitize(msg string) string {
+	msg = strings.ToValidUTF8(msg, "�")
 	if len(msg) > r.cfg.MaxEntryBytes {
-		msg = msg[:r.cfg.MaxEntryBytes]
+		msg = truncateRunes(msg, r.cfg.MaxEntryBytes)
 	}
+	return msg
+}
+
+// truncateRunes cuts s to at most n bytes on a rune boundary.
+func truncateRunes(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	for n > 0 && !utf8.RuneStart(s[n]) {
+		n--
+	}
+	return s[:n]
+}
+
+// ingest converts one raw journal entry (body already sanitized) into the
+// batch.
+func (r *Reader) ingest(re rawEntry, body string) {
 	e := entry{
 		unit:  re.fields["_SYSTEMD_UNIT"],
 		ident: re.fields["SYSLOG_IDENTIFIER"],
-		body:  msg,
+		body:  body,
 		ts:    re.realtime,
 	}
 	if e.ts.IsZero() {
@@ -269,44 +304,66 @@ func (r *Reader) ingest(re rawEntry) {
 		r.batchCursor = re.cursor
 	}
 	r.batch = append(r.batch, e)
+	r.batchBytes += len(body)
 }
 
-// flush exports the batch; on success the newest cursor is committed.
+// flush exports the batch; on success the newest cursor is committed. A batch
+// the collector permanently rejects is dropped and its cursor committed too —
+// re-reading it forever (the restart path) would wedge the reader on one
+// poison batch. Transient failures return the error; the caller restarts from
+// the committed cursor.
 func (r *Reader) flush(ctx context.Context) error {
 	if len(r.batch) == 0 {
 		return nil
 	}
 	ld := r.convert()
 	if err := r.cfg.Exporter.ExportLogs(ctx, ld); err != nil {
+		if otlpexport.IsPermanent(err) {
+			obs.JournalDropped.Inc()
+			r.log.Warn("journal batch permanently rejected, skipping past it", "entries", len(r.batch), "error", err)
+			r.settleBatch()
+			return nil
+		}
 		obs.LogExportFailures.Inc()
 		return fmt.Errorf("exporting journal batch: %w", err)
 	}
 	obs.JournalEntries.Add(float64(len(r.batch)))
+	r.settleBatch()
+	return nil
+}
+
+// settleBatch clears the batch (releasing the bodies pinned by the backing
+// array) and commits its newest cursor.
+func (r *Reader) settleBatch() {
+	clear(r.batch)
 	r.batch = r.batch[:0]
+	r.batchBytes = 0
 	r.lastFlush = time.Now()
 	if r.batchCursor != "" {
 		r.cursor = r.batchCursor
 		r.saveCursor()
 	}
-	return nil
 }
 
 // convert groups the batch into one resource per unit.
 func (r *Reader) convert() plog.Logs {
 	ld := plog.NewLogs()
 	scopes := make(map[string]plog.ScopeLogs, 4)
+	observed := pcommon.NewTimestampFromTime(time.Now())
 	for _, e := range r.batch {
 		var extracted logattrs.Result
-		if r.cfg.LogAttrs != nil {
-			extracted = r.cfg.LogAttrs.Extract(e.body)
-		}
 		unit := e.unit
 		if unit == "" {
 			unit = e.ident
 		}
 		// Line-derived resource/scope attributes split records into their own
-		// resources, so they participate in the grouping key.
-		key := unit + "\x01" + logattrs.Key(extracted.Resource) + "\x01" + logattrs.Key(extracted.Scope)
+		// resources, so they participate in the grouping key. Without an
+		// extractor the unit alone is the key (no per-entry concatenation).
+		key := unit
+		if r.cfg.LogAttrs != nil {
+			extracted = r.cfg.LogAttrs.Extract(e.body)
+			key = unit + "\x01" + logattrs.Key(extracted.Resource) + "\x01" + logattrs.Key(extracted.Scope)
+		}
 		sl, ok := scopes[key]
 		if !ok {
 			rl := ld.ResourceLogs().AppendEmpty()
@@ -333,7 +390,7 @@ func (r *Reader) convert() plog.Logs {
 		}
 		lr := sl.LogRecords().AppendEmpty()
 		lr.SetTimestamp(pcommon.NewTimestampFromTime(e.ts))
-		lr.SetObservedTimestamp(pcommon.NewTimestampFromTime(time.Now()))
+		lr.SetObservedTimestamp(observed)
 		lr.SetSeverityNumber(e.severity)
 		lr.SetSeverityText(e.sevText)
 		lr.Body().SetStr(e.body)

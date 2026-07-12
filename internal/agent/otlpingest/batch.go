@@ -5,11 +5,15 @@ import (
 	"errors"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"go.opentelemetry.io/collector/pdata/plog"
 	"go.opentelemetry.io/collector/pdata/pmetric"
 	"go.opentelemetry.io/collector/pdata/ptrace"
+
+	"github.com/JohanLindvall/kubescrape/internal/agent/otlpexport"
+	"github.com/JohanLindvall/kubescrape/internal/obs"
 )
 
 // errBatchQueueFull maps to a retryable status for the sender.
@@ -105,8 +109,15 @@ type sigBatch[T any] struct {
 	merge   func(dst, src T)
 	items   int
 	timeout time.Duration
-	log     *slog.Logger
-	kind    string
+	// retryBase is the initial backoff between delivery retries, doubled up to
+	// 30s (tests shorten it).
+	retryBase time.Duration
+	// closed refuses new input once the run loop has begun its shutdown drain
+	// (belt and braces: main stops the ingest server before cancelling Run's
+	// ctx, so no enqueue should race the drain).
+	closed atomic.Bool
+	log    *slog.Logger
+	kind   string
 }
 
 func newSigBatch[T any](cfg BatchConfig, log *slog.Logger, kind string,
@@ -115,16 +126,54 @@ func newSigBatch[T any](cfg BatchConfig, log *slog.Logger, kind string,
 	return &sigBatch[T]{
 		ch: make(chan T, cfg.QueueLen), export: export, fresh: fresh,
 		count: count, merge: merge, items: cfg.Items, timeout: cfg.Timeout,
-		log: log, kind: kind,
+		retryBase: time.Second, log: log, kind: kind,
 	}
 }
 
 func (s *sigBatch[T]) enqueue(v T) error {
+	if s.closed.Load() {
+		return errBatchQueueFull
+	}
 	select {
 	case s.ch <- v:
 		return nil
 	default:
 		return errBatchQueueFull
+	}
+}
+
+// deliver exports one already-acknowledged payload. Transient failures
+// (including spool.ErrFull, the disk buffer's back-pressure signal) are
+// retried with a capped exponential backoff while ctx is alive; during the
+// retries nothing is consumed from the queue, so the bounded channel fills and
+// enqueue back-pressures senders with a retryable error — that chain is the
+// point. Permanent collector rejections (and payloads still failing once ctx
+// is gone) are dropped and counted.
+func (s *sigBatch[T]) deliver(ctx context.Context, v T, n int) {
+	backoff := s.retryBase
+	for {
+		err := s.export(context.Background(), v)
+		if err == nil {
+			return
+		}
+		if otlpexport.IsPermanent(err) {
+			obs.IngestDropped.WithLabelValues(s.kind).Inc()
+			s.log.Warn("batched ingest export permanently rejected, dropping", "signal", s.kind, "records", n, "error", err)
+			return
+		}
+		if ctx.Err() != nil {
+			obs.IngestDropped.WithLabelValues(s.kind).Inc()
+			s.log.Warn("batched ingest export failed during shutdown, dropping", "signal", s.kind, "records", n, "error", err)
+			return
+		}
+		s.log.Warn("batched ingest export failed, retrying", "signal", s.kind, "records", n, "error", err, "backoff", backoff)
+		select {
+		case <-ctx.Done():
+		case <-time.After(backoff):
+		}
+		if backoff *= 2; backoff > 30*time.Second {
+			backoff = 30 * time.Second
+		}
 	}
 }
 
@@ -147,21 +196,24 @@ func (s *sigBatch[T]) run(ctx context.Context) {
 		if accN == 0 {
 			return
 		}
-		if err := s.export(context.Background(), acc); err != nil {
-			s.log.Warn("batched ingest export failed", "signal", s.kind, "records", accN, "error", err)
-		}
+		s.deliver(ctx, acc, accN)
 		acc = s.fresh()
 		accN = 0
 	}
 	for {
 		select {
 		case <-ctx.Done():
-			// Drain what was already acknowledged to senders, then flush.
+			// Refuse new input, then drain what was already acknowledged to
+			// senders and flush. The channel is drained until empty — main
+			// cancels this ctx only after the ingest server has fully stopped,
+			// so no enqueue can race the drain.
+			s.closed.Store(true)
 			for {
 				select {
 				case v := <-s.ch:
-					s.merge(acc, v)
+					// Count BEFORE merging: merge moves the payload out of v.
 					accN += s.count(v)
+					s.merge(acc, v)
 				default:
 					flush()
 					return
@@ -179,9 +231,7 @@ func (s *sigBatch[T]) run(ctx context.Context) {
 				}
 			}
 			if accN == 0 && n >= s.items {
-				if err := s.export(context.Background(), v); err != nil {
-					s.log.Warn("batched ingest export failed", "signal", s.kind, "records", n, "error", err)
-				}
+				s.deliver(ctx, v, n)
 				continue
 			}
 			if accN == 0 {

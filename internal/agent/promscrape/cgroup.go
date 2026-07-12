@@ -12,8 +12,19 @@ import "strings"
 // The QoS segment is absent for Guaranteed pods; container scopes may be
 // prefixed cri-containerd-, crio- or docker-. Unrecognized segments yield
 // empty results.
+//
+// Runs once per cadvisor sample, so the path is walked in place (substring
+// slices) rather than split into an allocated segment slice.
 func cgroupIdentity(id string) (podUID, containerID string) {
-	for _, seg := range strings.Split(id, "/") {
+	for start := 0; start < len(id); {
+		var seg string
+		if i := strings.IndexByte(id[start:], '/'); i >= 0 {
+			seg = id[start : start+i]
+			start += i + 1
+		} else {
+			seg = id[start:]
+			start = len(id)
+		}
 		if seg == "" {
 			continue
 		}

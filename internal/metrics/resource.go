@@ -8,14 +8,20 @@ import (
 // resourceAccum is the order-independent hash accumulator of a resource's
 // attributes (rendered as strings), matching labels.hashAccum so a resource and
 // extra resource labels can be folded into one series key.
-func resourceAccum(res pcommon.Map) uint64 {
-	var h uint64
+func resourceAccum(res pcommon.Map) resKey {
+	var rk resKey
 	res.Range(func(k string, v pcommon.Value) bool {
-		h ^= combineHash(xxhash.Sum64String(k), xxhash.Sum64String(v.AsString()))
+		hk, hv := xxhash.Sum64String(k), xxhash.Sum64String(v.AsString())
+		rk.accum += combineHash(hk, hv)
+		rk.check += combineCheck(hk, hv)
 		return true
 	})
-	return h
+	return rk
 }
+
+// resKey carries a resource's two order-independent hash accumulators (the
+// series key contribution and the collision-check contribution).
+type resKey struct{ accum, check uint64 }
 
 // resourceString serializes a resource's attributes plus any extra resource
 // labels into the sorted label string used to key and later emit the per-metric

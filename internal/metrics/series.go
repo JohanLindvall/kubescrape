@@ -44,7 +44,7 @@ const (
 	actionFirst  // first value of the window (value)
 	actionSum    // window total (value = running sum)
 	actionCount  // number of matching lines in the window (count; value ignored)
-	actionStddev // window std deviation (value = sum, value2 = sum of squares)
+	actionStddev // window std deviation (value = running mean, value2 = M2; Welford)
 	actionRange  // window max − min (value = min, value2 = max)
 	actionDelta  // window last − first (value = first, value2 = last)
 )
@@ -67,8 +67,7 @@ func (s *series) aggregateValue(samp *sample) float64 {
 		if samp.count == 0 {
 			return 0
 		}
-		mean := samp.value / n
-		return math.Sqrt(math.Max(0, samp.value2/n-mean*mean))
+		return math.Sqrt(samp.value2 / n)
 	case actionRange, actionDelta:
 		return samp.value2 - samp.value // max−min / last−first
 	default: // min, max, first, sum
@@ -87,7 +86,11 @@ type sample struct {
 	resource string
 	bucket   int
 	count    uint64
-	initial  bool
+	// check is the independent second hash of the sample's identity; a lookup
+	// whose primary hash matches but whose check differs is a 64-bit
+	// collision between distinct series and is rejected instead of merged.
+	check   uint64
+	initial bool
 	// sealed marks an aggregation window as already emitted; the next observed
 	// value starts a fresh window (min/max/avg/first/last gauges).
 	sealed bool
@@ -118,9 +121,10 @@ type series struct {
 	// hash(bucketStr[i])), precomputed so observe folds a bucket's le label into
 	// the base hash without materializing a per-bucket label set. All nil for
 	// non-histograms, where the single "bucket" carries the value directly.
-	buckets    []float64
-	bucketStr  []string
-	bucketHash []uint64
+	buckets     []float64
+	bucketStr   []string
+	bucketHash  []uint64
+	bucketCheck []uint64
 }
 
 // seriesSpec configures a new series.
@@ -177,8 +181,11 @@ func (s *series) initBuckets(buckets []float64) {
 
 	leHash := xxhash.Sum64String(leLabel)
 	s.bucketHash = make([]uint64, len(s.bucketStr))
+	s.bucketCheck = make([]uint64, len(s.bucketStr))
 	for i, bs := range s.bucketStr {
-		s.bucketHash[i] = combineHash(leHash, xxhash.Sum64String(bs))
+		hv := xxhash.Sum64String(bs)
+		s.bucketHash[i] = combineHash(leHash, hv)
+		s.bucketCheck[i] = combineCheck(leHash, hv)
 	}
 }
 
@@ -187,20 +194,52 @@ func (s *series) initBuckets(buckets []float64) {
 // XOR-fold into the base accumulator), so per-resource series are distinct. For
 // a histogram the value is counted into every bucket whose bound it does not
 // exceed.
-func (s *series) observe(lbls labels, value float64, resAccum uint64, res pcommon.Map, resLabels labels) {
+func (s *series) observe(lbls labels, value float64, resAccum resKey, res pcommon.Map, resLabels labels) {
+	if math.IsNaN(value) {
+		return // NaN records into nothing; admitting it would emit fabricated zeros
+	}
 	now := loadEpoch()
-	base := s.baseAccum(lbls) ^ resAccum ^ resLabels.hashAccum()
+	base, check := s.baseAccum(lbls)
+	base += resAccum.accum + resLabels.hashAccum()
+	check += resAccum.check + resLabels.checkAccum()
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	// A histogram observation is admitted all-or-nothing: admitting only a
+	// prefix of the bucket streams at the cardinality cap exports underflowed
+	// counts (the cumulative-to-absolute conversion needs every stream).
+	if s.maxSize > 0 && len(s.buckets) > 1 {
+		missing := 0
+		for i := range s.buckets {
+			if s.db[s.streamHash(base, i)] == nil {
+				missing++
+			}
+		}
+		if missing > 0 && len(s.db)+missing > s.maxSize {
+			s.warnCapped(lbls, now)
+			return
+		}
+	}
 	for i, bound := range s.buckets {
 		hash := s.streamHash(base, i)
+		streamCheck := check
+		if s.kind == kindHistogram {
+			streamCheck += s.bucketCheck[i]
+		}
 		samp := s.db[hash]
 		if samp == nil {
-			samp = s.admit(hash, lbls, i, now, res, resLabels)
+			samp = s.admit(hash, streamCheck, lbls, i, now, res, resLabels)
 			if samp == nil {
 				continue // capped
 			}
+		} else if samp.check != streamCheck {
+			// 64-bit collision between distinct series (~2^-64 per pair):
+			// refuse to merge; the observation is dropped and logged.
+			if now-s.lastWarn >= 3600 {
+				s.lastWarn = now
+				s.log.Warn("series hash collision, dropping observation", "metric", s.name)
+			}
+			continue
 		}
 		if value <= bound {
 			s.record(samp, value)
@@ -209,24 +248,60 @@ func (s *series) observe(lbls labels, value float64, resAccum uint64, res pcommo
 	}
 }
 
+// observePre is observe for callers with precomputed label accumulators and
+// no resource attributes (the internal registry): hot counters skip rehashing
+// their fixed label set on every bump.
+func (s *series) observePre(lbls labels, base, check uint64, value float64, res pcommon.Map) {
+	if math.IsNaN(value) {
+		return
+	}
+	if s.kind == kindHistogram {
+		// Histograms fold per-bucket labels; take the general path.
+		s.observe(lbls, value, resKey{}, res, nil)
+		return
+	}
+	now := loadEpoch()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	hash := mixHash(base)
+	samp := s.db[hash]
+	if samp == nil {
+		samp = s.admit(hash, check, lbls, 0, now, res, nil)
+		if samp == nil {
+			return
+		}
+	} else if samp.check != check {
+		if now-s.lastWarn >= 3600 {
+			s.lastWarn = now
+			s.log.Warn("series hash collision, dropping observation", "metric", s.name)
+		}
+		return
+	}
+	s.record(samp, value)
+	samp.when = now
+}
+
 // baseAccum hashes the caller's data-point labels once (order-independent). For
 // a histogram it strips any caller-provided "le" so the synthetic per-bucket one
 // is the only contribution folded in per bucket.
-func (s *series) baseAccum(lbls labels) uint64 {
-	base := lbls.hashAccum()
+func (s *series) baseAccum(lbls labels) (base, check uint64) {
+	base = lbls.hashAccum()
+	check = lbls.checkAccum()
 	if s.kind == kindHistogram {
 		if v, ok := lbls.get(leLabel); ok {
-			base ^= combineHash(xxhash.Sum64String(leLabel), xxhash.Sum64String(v))
+			hk, hv := xxhash.Sum64String(leLabel), xxhash.Sum64String(v)
+			base -= combineHash(hk, hv)
+			check -= combineCheck(hk, hv)
 		}
 	}
-	return base
+	return base, check
 }
 
 // streamHash is the finalized hash of bucket i's series: the base accumulator
 // XOR-folded with the bucket's "le" label for a histogram, or just the base.
 func (s *series) streamHash(base uint64, bucket int) uint64 {
 	if s.kind == kindHistogram {
-		return mixHash(base ^ s.bucketHash[bucket])
+		return mixHash(base + s.bucketHash[bucket])
 	}
 	return mixHash(base)
 }
@@ -234,25 +309,30 @@ func (s *series) streamHash(base uint64, bucket int) uint64 {
 // admit inserts a new sample for a previously unseen stream, or returns nil
 // (warning at most hourly) when the cardinality cap is reached. It runs only on
 // the cold path, so materializing the full label set here is cheap.
-func (s *series) admit(hash uint64, lbls labels, bucket int, now int64, res pcommon.Map, resLabels labels) *expiringSample {
+func (s *series) admit(hash, check uint64, lbls labels, bucket int, now int64, res pcommon.Map, resLabels labels) *expiringSample {
 	full := lbls
 	if s.kind == kindHistogram {
 		full = lbls.without(leLabel).set(leLabel, s.bucketStr[bucket])
 	}
 	if s.maxSize > 0 && len(s.db) >= s.maxSize {
-		if now-s.lastWarn >= 3600 {
-			s.lastWarn = now
-			s.log.Info("max label count reached for log metric",
-				"metric", s.name, "labels", full.String(), "maxsize", s.maxSize)
-		}
+		s.warnCapped(full, now)
 		return nil
 	}
 	samp := &expiringSample{
-		sample: sample{labels: full.String(), resource: resourceString(res, resLabels), bucket: bucket, initial: true},
+		sample: sample{labels: full.String(), resource: resourceString(res, resLabels), bucket: bucket, check: check, initial: true},
 		when:   now,
 	}
 	s.db[hash] = samp
 	return samp
+}
+
+// warnCapped logs the cardinality cap at most hourly (caller holds the lock).
+func (s *series) warnCapped(lbls labels, now int64) {
+	if now-s.lastWarn >= 3600 {
+		s.lastWarn = now
+		s.log.Info("max label count reached for log metric",
+			"metric", s.name, "labels", lbls.String(), "maxsize", s.maxSize)
+	}
 }
 
 // record folds one observation into a sample. Gauges apply their action;
@@ -267,7 +347,7 @@ func (s *series) record(samp *expiringSample, value float64) {
 			samp.value = value
 			samp.value2 = value
 			if s.action == actionStddev {
-				samp.value2 = value * value
+				samp.value2 = 0 // M2 of a single-value window
 			}
 			samp.count = 1
 			return
@@ -284,8 +364,13 @@ func (s *series) record(samp *expiringSample, value float64) {
 		case actionAvg, actionSum:
 			samp.value += value // running sum
 		case actionStddev:
-			samp.value += value
-			samp.value2 += value * value
+			// Welford's update: the naive E[x²]−E[x]² form cancels
+			// catastrophically for large values with small spread (values
+			// ~1e9 reported stddev 0).
+			n := float64(samp.count + 1)
+			delta := value - samp.value
+			samp.value += delta / n
+			samp.value2 += delta * (value - samp.value)
 		case actionRange:
 			if value < samp.value {
 				samp.value = value

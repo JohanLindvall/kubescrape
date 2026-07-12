@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"mime"
 
 	"log/slog"
 	"net"
@@ -207,11 +208,7 @@ func (g *tracesGRPC) Export(ctx context.Context, req ptraceotlp.ExportRequest) (
 func (s *Server) handleHTTPLogs(w http.ResponseWriter, r *http.Request) {
 	body, err := readBody(r)
 	if err != nil {
-		code := http.StatusBadRequest
-		if errors.Is(err, errBodyTooLarge) {
-			code = http.StatusRequestEntityTooLarge
-		}
-		http.Error(w, err.Error(), code)
+		http.Error(w, err.Error(), bodyErrorStatus(err))
 		return
 	}
 	req := plogotlp.NewExportRequest()
@@ -223,7 +220,7 @@ func (s *Server) handleHTTPLogs(w http.ResponseWriter, r *http.Request) {
 	ld := req.Logs()
 	s.cfg.Enricher.EnrichLogs(ctx, ld)
 	if err := s.cfg.Exporter.ExportLogs(ctx, ld); err != nil {
-		http.Error(w, err.Error(), http.StatusServiceUnavailable)
+		http.Error(w, err.Error(), httpForwardStatus(err))
 		return
 	}
 	writeProto(w, plogotlp.NewExportResponse())
@@ -232,11 +229,7 @@ func (s *Server) handleHTTPLogs(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleHTTPMetrics(w http.ResponseWriter, r *http.Request) {
 	body, err := readBody(r)
 	if err != nil {
-		code := http.StatusBadRequest
-		if errors.Is(err, errBodyTooLarge) {
-			code = http.StatusRequestEntityTooLarge
-		}
-		http.Error(w, err.Error(), code)
+		http.Error(w, err.Error(), bodyErrorStatus(err))
 		return
 	}
 	req := pmetricotlp.NewExportRequest()
@@ -247,7 +240,7 @@ func (s *Server) handleHTTPMetrics(w http.ResponseWriter, r *http.Request) {
 	ctx := withPeerIP(r.Context(), r.RemoteAddr)
 	md := s.cfg.Enricher.EnrichMetrics(ctx, req.Metrics())
 	if err := s.cfg.Exporter.ExportMetrics(ctx, md); err != nil {
-		http.Error(w, err.Error(), http.StatusServiceUnavailable)
+		http.Error(w, err.Error(), httpForwardStatus(err))
 		return
 	}
 	writeProto(w, pmetricResponse(pmetricotlp.NewExportResponse()))
@@ -256,11 +249,7 @@ func (s *Server) handleHTTPMetrics(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleHTTPTraces(w http.ResponseWriter, r *http.Request) {
 	body, err := readBody(r)
 	if err != nil {
-		code := http.StatusBadRequest
-		if errors.Is(err, errBodyTooLarge) {
-			code = http.StatusRequestEntityTooLarge
-		}
-		http.Error(w, err.Error(), code)
+		http.Error(w, err.Error(), bodyErrorStatus(err))
 		return
 	}
 	req := ptraceotlp.NewExportRequest()
@@ -272,7 +261,7 @@ func (s *Server) handleHTTPTraces(w http.ResponseWriter, r *http.Request) {
 	td := req.Traces()
 	s.cfg.Enricher.EnrichTraces(ctx, td)
 	if err := s.cfg.Traces.ExportTraces(ctx, td); err != nil {
-		http.Error(w, err.Error(), http.StatusServiceUnavailable)
+		http.Error(w, err.Error(), httpForwardStatus(err))
 		return
 	}
 	writeProto(w, ptraceResponse(ptraceotlp.NewExportResponse()))
@@ -281,21 +270,75 @@ func (s *Server) handleHTTPTraces(w http.ResponseWriter, r *http.Request) {
 // ptraceResponse adapts the traces response to the marshaler interface.
 func ptraceResponse(r ptraceotlp.ExportResponse) protoMarshaler { return r }
 
+// httpForwardStatus maps a forwarding failure onto the HTTP status the sender
+// retries correctly (the HTTP counterpart of grpcForwardStatus): a permanent
+// upstream rejection is 400 (the sender must not retry the batch), everything
+// else — spool.ErrFull back-pressure, upstream 5xx, timeouts — is 503
+// (retryable).
+func httpForwardStatus(err error) int {
+	if otlpexport.IsPermanent(err) {
+		return http.StatusBadRequest
+	}
+	return http.StatusServiceUnavailable
+}
+
+// bodyErrorStatus maps a readBody failure to its HTTP status.
+func bodyErrorStatus(err error) int {
+	switch {
+	case errors.Is(err, errBodyTooLarge):
+		return http.StatusRequestEntityTooLarge
+	case errors.Is(err, errUnsupportedType):
+		return http.StatusUnsupportedMediaType
+	}
+	return http.StatusBadRequest
+}
+
 const maxIngestBody = 16 << 20 // 16 MiB per request
 
 // errBodyTooLarge maps to 413; truncating silently could ACK a payload whose
 // tail was dropped.
 var errBodyTooLarge = fmt.Errorf("request body exceeds %d bytes", maxIngestBody)
 
+// errUnsupportedType maps to 415 (wrong media type, not a malformed request).
+var errUnsupportedType = errors.New("unsupported Content-Type")
+
+// cappedReader bounds the compressed request body. Reads past the cap fail
+// with errBodyTooLarge so an oversized upload surfaces as 413 rather than as
+// the gzip parse error its truncation would otherwise produce.
+type cappedReader struct {
+	r      io.Reader
+	remain int64
+}
+
+func (c *cappedReader) Read(p []byte) (int, error) {
+	if c.remain <= 0 {
+		return 0, errBodyTooLarge
+	}
+	if int64(len(p)) > c.remain {
+		p = p[:c.remain]
+	}
+	n, err := c.r.Read(p)
+	c.remain -= int64(n)
+	return n, err
+}
+
 func readBody(r *http.Request) ([]byte, error) {
-	if ct := r.Header.Get("Content-Type"); ct != "" && ct != "application/x-protobuf" {
-		return nil, fmt.Errorf("unsupported Content-Type %q (want application/x-protobuf)", ct)
+	if ct := r.Header.Get("Content-Type"); ct != "" {
+		// Parameterized types ("application/x-protobuf; charset=...") are fine;
+		// only the media type itself must match.
+		if mt, _, err := mime.ParseMediaType(ct); err != nil || mt != "application/x-protobuf" {
+			return nil, fmt.Errorf("%w %q (want application/x-protobuf)", errUnsupportedType, ct)
+		}
 	}
 	var src io.Reader = r.Body
+	var capped *cappedReader
 	switch enc := r.Header.Get("Content-Encoding"); enc {
 	case "", "identity":
 	case "gzip": // OTel SDKs commonly gzip OTLP/HTTP
-		zr, err := gzip.NewReader(io.LimitReader(r.Body, maxIngestBody))
+		// Allow one byte over the cap so an exactly-at-cap compressed body is
+		// not misreported as oversized; the decompressed cap below still holds.
+		capped = &cappedReader{r: r.Body, remain: maxIngestBody + 1}
+		zr, err := gzip.NewReader(capped)
 		if err != nil {
 			return nil, fmt.Errorf("gzip body: %w", err)
 		}
@@ -308,6 +351,11 @@ func readBody(r *http.Request) ([]byte, error) {
 	// byte beyond it to distinguish at-cap from over-cap and reject the latter.
 	body, err := io.ReadAll(io.LimitReader(src, maxIngestBody+1))
 	if err != nil {
+		if capped != nil && capped.remain <= 0 {
+			// The compressed body hit the cap: the "gzip" failure is our own
+			// truncation, not the sender's payload — report 413, not 400.
+			return nil, errBodyTooLarge
+		}
 		return nil, err
 	}
 	if len(body) > maxIngestBody {

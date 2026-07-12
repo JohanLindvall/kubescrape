@@ -1,6 +1,8 @@
 package spool
 
 import (
+	"encoding/binary"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -9,7 +11,7 @@ import (
 
 func popString(t *testing.T, s *Spool) (string, func(), bool) {
 	t.Helper()
-	data, commit, ok := s.Pop()
+	data, commit, ok, _ := s.Pop()
 	if !ok {
 		return "", nil, false
 	}
@@ -35,7 +37,7 @@ func TestAppendPopOrder(t *testing.T) {
 		}
 		commit()
 	}
-	if _, _, ok := s.Pop(); ok {
+	if _, _, ok, _ := s.Pop(); ok {
 		t.Error("queue should be empty")
 	}
 }
@@ -75,7 +77,7 @@ func TestUncommittedRedeliveredAfterRestart(t *testing.T) {
 		}
 		commit()
 	}
-	if _, _, ok := s2.Pop(); ok {
+	if _, _, ok, _ := s2.Pop(); ok {
 		t.Error("queue should be drained after restart")
 	}
 }
@@ -99,7 +101,7 @@ func TestSizeCap(t *testing.T) {
 		t.Fatalf("third append err = %v, want ErrFull", err)
 	}
 	// Draining one frees room again.
-	_, commit, _ := s.Pop()
+	_, commit, _, _ := s.Pop()
 	commit()
 	if err := s.Append(payload); err != nil {
 		t.Fatalf("append after drain: %v", err)
@@ -165,7 +167,7 @@ func TestTornTailIgnored(t *testing.T) {
 		t.Fatalf("pop = %q ok=%v, want intact", got, ok)
 	}
 	commit()
-	if _, _, ok := s2.Pop(); ok {
+	if _, _, ok, _ := s2.Pop(); ok {
 		t.Error("torn frame should not be delivered")
 	}
 	// The tail was truncated, so new appends land cleanly.
@@ -302,7 +304,7 @@ func TestCursorChecksum(t *testing.T) {
 		}
 	}
 	// Consume "a" so the persisted cursor is non-zero.
-	_, commit, ok := s.Pop()
+	_, commit, ok, _ := s.Pop()
 	if !ok {
 		t.Fatal("pop failed")
 	}
@@ -351,5 +353,87 @@ func TestCursorChecksum(t *testing.T) {
 	}
 	if got, _, _ := popString(t, s3); got != "a" {
 		t.Fatalf("after torn cursor Pop = %q, want a (redelivered)", got)
+	}
+}
+
+func TestPopSkipsLostHeadSegment(t *testing.T) {
+	dir := t.TempDir()
+	s, err := Open(dir, Options{SegmentBytes: 16}) // tiny: every record rotates
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = s.Close() }()
+	if err := s.Append([]byte("first-record")); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Append([]byte("second-record")); err != nil {
+		t.Fatal(err)
+	}
+	if len(s.segs) < 2 {
+		t.Fatalf("expected 2 segments, got %d", len(s.segs))
+	}
+	if err := os.Remove(s.segs[0].path); err != nil {
+		t.Fatal(err)
+	}
+	_, _, ok, err := s.Pop()
+	if ok || !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("expected not-exist error, got ok=%v err=%v", ok, err)
+	}
+	data, commit, ok, err := s.Pop()
+	if err != nil || !ok {
+		t.Fatalf("expected next segment's record, got ok=%v err=%v", ok, err)
+	}
+	if string(data) != "second-record" {
+		t.Fatalf("got %q", data)
+	}
+	commit()
+}
+
+func TestLegacyCursorUpgradeViaRename(t *testing.T) {
+	dir := t.TempDir()
+	s, err := Open(dir, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Append([]byte("a")); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Append([]byte("b")); err != nil {
+		t.Fatal(err)
+	}
+	_, commit, ok, _ := s.Pop()
+	if !ok {
+		t.Fatal("expected record")
+	}
+	commit()
+	_ = s.Close()
+
+	// Rewrite the cursor as a legacy 16-byte record (seq + offset, no sum).
+	var legacy [16]byte
+	binary.BigEndian.PutUint64(legacy[:8], 1)
+	binary.BigEndian.PutUint64(legacy[8:16], 5) // frameHeader + len("a")
+	if err := os.WriteFile(filepath.Join(dir, "cursor"), legacy[:], 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	s2, err := Open(dir, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = s2.Close() }()
+	data, commit2, ok, err := s2.Pop()
+	if err != nil || !ok || string(data) != "b" {
+		t.Fatalf("legacy cursor resume: ok=%v err=%v data=%q", ok, err, data)
+	}
+	commit2() // first persist after a legacy load must go through the rename
+	raw, err := os.ReadFile(filepath.Join(dir, "cursor"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(raw) != cursorLen {
+		t.Fatalf("cursor not upgraded: %d bytes", len(raw))
+	}
+	if binary.BigEndian.Uint64(raw[16:]) != cursorSum(raw[:16]) {
+		t.Fatal("upgraded cursor has bad checksum")
 	}
 }

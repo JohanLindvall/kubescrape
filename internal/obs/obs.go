@@ -38,6 +38,10 @@ var (
 		"Buffered batches dropped after a permanent collector rejection (bad payload, auth, unimplemented).", "signal")
 	BufferRequeued = Registry.CounterVec("kubescrape_buffer_requeued_total",
 		"Buffered batches moved to the back of the queue after repeated transient failures (keeps one stuck batch from blocking the signal).", "signal")
+	BufferReadErrors = Registry.CounterVec("kubescrape_buffer_read_errors_total",
+		"Disk-buffer read failures while draining (the head frame could not be read; lost=true means the segment was gone and its frames were skipped).", "signal", "lost")
+	LogFifoDropped = Registry.Counter("kubescrape_log_fifo_orphans_total",
+		"Stale per-line offset entries discarded because the multiline stage dropped over-limit lines it never emitted.")
 )
 
 // Scrape pipeline (agent).
@@ -80,6 +84,20 @@ var (
 var (
 	Ingested = Registry.CounterVec("kubescrape_ingest_resources_total",
 		"Pushed OTLP resources by enrichment outcome (enriched, unresolved, peer_ip).", "outcome")
+	IngestDropped = Registry.CounterVec("kubescrape_ingest_dropped_batches_total",
+		"Acknowledged ingest batches dropped after a permanent collector rejection.", "signal")
+)
+
+// Journald drops (agent).
+var (
+	JournalDropped = Registry.Counter("kubescrape_journal_dropped_batches_total",
+		"Journal batches dropped after a permanent collector rejection (the cursor advances past them).")
+)
+
+// Events drops (metadata service).
+var (
+	EventsDropped = Registry.Counter("kubescrape_events_dropped_total",
+		"Kubernetes events dropped because the export queue was full.")
 )
 
 // HTTP server (metadata service).

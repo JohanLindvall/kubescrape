@@ -66,6 +66,10 @@ type Extractor struct {
 	// paths mirrors rules, one dotted path each, for a single-scan
 	// lightning JSON extraction of every rule at once.
 	paths [][]string
+	// want maps each rule's (dotted) key to the rules using it, so the logfmt
+	// scan captures only configured keys instead of building a map of every
+	// pair.
+	want map[string][]int
 }
 
 type compiledRule struct {
@@ -93,7 +97,7 @@ func New(cfg *Config) (*Extractor, error) {
 	if cfg == nil || len(cfg.Rules) == 0 {
 		return nil, nil
 	}
-	e := &Extractor{}
+	e := &Extractor{want: map[string][]int{}}
 	for i, r := range cfg.Rules {
 		if r.Key == "" {
 			return nil, fmt.Errorf("logattrs rule %d: empty key", i)
@@ -112,6 +116,7 @@ func New(cfg *Config) (*Extractor, error) {
 		path := strings.Split(r.Key, ".")
 		e.rules = append(e.rules, compiledRule{path: path, attr: attr, tgt: tgt})
 		e.paths = append(e.paths, path)
+		e.want[r.Key] = append(e.want[r.Key], i)
 	}
 	return e, nil
 }
@@ -126,7 +131,10 @@ func (e *Extractor) Extract(line string) Result {
 		return res
 	}
 	if t := strings.TrimSpace(line); strings.HasPrefix(t, "{") {
-		vals, err := ljson.GetPaths([]byte(t), e.paths, nil)
+		// Read-only view of the line: lightning never mutates its input, so
+		// the string→[]byte copy is avoidable.
+		buf := unsafe.Slice(unsafe.StringData(t), len(t))
+		vals, err := ljson.GetPaths(buf, e.paths, nil)
 		if err != nil {
 			return res
 		}
@@ -148,15 +156,24 @@ func (e *Extractor) Extract(line string) Result {
 	if strings.IndexByte(line, '=') < 0 {
 		return res
 	}
-	kv := map[string]string{}
+	// Only the configured keys are captured (a duplicate key keeps its last
+	// value, matching the former all-pairs map); results are emitted in rule
+	// order so equal attribute sets always yield equal grouping keys.
+	vals := make([]string, len(e.rules))
+	found := make([]bool, len(e.rules))
 	buf := unsafe.Slice(unsafe.StringData(line), len(line))
 	_ = logfmt.Iterate(buf, func(key, val []byte) bool {
-		kv[string(key)] = string(val)
+		if idxs, ok := e.want[string(key)]; ok { // string(key) lookup: no alloc
+			for _, i := range idxs {
+				vals[i] = string(val)
+				found[i] = true
+			}
+		}
 		return true
 	})
-	for i, r := range e.rules {
-		if v, ok := kv[strings.Join(r.path, ".")]; ok {
-			e.add(&res, i, v)
+	for i := range e.rules {
+		if found[i] {
+			e.add(&res, i, vals[i])
 		}
 	}
 	return res

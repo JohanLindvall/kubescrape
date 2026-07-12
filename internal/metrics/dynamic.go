@@ -184,7 +184,7 @@ func (r *metricRule) needsValue() bool {
 // readValue resolves the observed value and whether the line should be
 // recorded. It comes from ValueRegexp (a capture off the raw line), the "1"
 // count, or a numeric field via values.
-func (r *metricRule) readValue(values func(string) float64, line string) (float64, bool) {
+func (r *metricRule) readValue(values func(string) (float64, bool), line string) (float64, bool) {
 	if r.valueRe != nil {
 		m := r.valueRe.FindStringSubmatch(line)
 		if m == nil {
@@ -203,15 +203,14 @@ func (r *metricRule) readValue(values func(string) float64, line string) (float6
 	if values == nil {
 		return 0, false
 	}
-	v := values(r.value)
-	return v, v != 0
+	return values(r.value) // presence-based: a legitimate 0 records
 }
 
 // observe evaluates the rule against one line and records an observation when
 // it matches. buf/rbuf are reused for the data-point and resource label sets and
 // returned (set may grow them). resAccum is the hash of res (the line's resource
 // attributes), computed once by the caller.
-func (r *metricRule) observe(values func(string) float64, lookup func(string) string, res pcommon.Map, resAccum uint64, line string, ctx *matchContext, buf, rbuf labels) (labels, labels) {
+func (r *metricRule) observe(values func(string) (float64, bool), lookup func(string) string, res pcommon.Map, resAccum resKey, line string, ctx *matchContext, buf, rbuf labels) (labels, labels) {
 	if !r.match.match(lookup, ctx) {
 		return buf, rbuf
 	}
@@ -322,11 +321,11 @@ type addContext struct {
 	line lineFields
 
 	set     *DynamicMetricSet
-	values  func(string) float64
+	values  func(string) (float64, bool)
 	lookup  func(string) string
 	raw     string
 	labelFn func(string) string
-	valueFn func(string) float64
+	valueFn func(string) (float64, bool)
 }
 
 // labelLookup resolves a label key: the synthetic __line__ key is the whole
@@ -345,14 +344,18 @@ func (ac *addContext) labelLookup(key string) string {
 }
 
 // valueLookup resolves a numeric key the same way.
-func (ac *addContext) valueLookup(key string) float64 {
+func (ac *addContext) valueLookup(key string) (float64, bool) {
 	if ac.values != nil {
-		if v := ac.values(key); v != 0 {
-			return v
+		if v, ok := ac.values(key); ok {
+			return v, true
 		}
 	}
-	f, _ := strconv.ParseFloat(ac.set.keys.get(&ac.line, key), 64)
-	return f
+	raw := ac.set.keys.get(&ac.line, key)
+	if raw == "" {
+		return 0, false
+	}
+	f, err := strconv.ParseFloat(raw, 64)
+	return f, err == nil
 }
 
 // NewDynamicMetricSet compiles a metric specification into an evaluatable set.
@@ -433,7 +436,7 @@ func compileRule(d *Dynamic, cfg *setConfig, shared map[string]*series) (*metric
 			desc:       d.Description,
 			kind:       kind,
 			action:     action,
-			maxSize:    min(d.MaxCardinality, maxCardinalityCap),
+			maxSize:    cardinalityCap(d.MaxCardinality),
 			expiration: age,
 			buckets:    d.Buckets,
 			log:        cfg.log,
@@ -449,7 +452,7 @@ func compileRule(d *Dynamic, cfg *setConfig, shared map[string]*series) (*metric
 // metric can read values and labels off the line itself without any separate
 // logAttributes config. resource is the line's resource attributes, emitted as
 // the metric's OTLP resource (each distinct resource is its own series).
-func (s *DynamicMetricSet) Add(values func(string) float64, lookup func(string) string, resource pcommon.Map, line string) {
+func (s *DynamicMetricSet) Add(values func(string) (float64, bool), lookup func(string) string, resource pcommon.Map, line string) {
 	if s == nil || len(s.rules) == 0 {
 		return
 	}
@@ -463,7 +466,7 @@ func (s *DynamicMetricSet) Add(values func(string) float64, lookup func(string) 
 type BoundResource struct {
 	set   *DynamicMetricSet
 	res   pcommon.Map
-	accum uint64
+	accum resKey
 }
 
 // Bind precomputes the per-resource state for repeated Adds. Safe on a nil
@@ -477,14 +480,14 @@ func (s *DynamicMetricSet) Bind(resource pcommon.Map) BoundResource {
 }
 
 // Add evaluates every rule against one line, as DynamicMetricSet.Add.
-func (b BoundResource) Add(values func(string) float64, lookup func(string) string, line string) {
+func (b BoundResource) Add(values func(string) (float64, bool), lookup func(string) string, line string) {
 	if b.set == nil || len(b.set.rules) == 0 {
 		return
 	}
 	b.set.add(values, lookup, b.res, b.accum, line)
 }
 
-func (s *DynamicMetricSet) add(values func(string) float64, lookup func(string) string, resource pcommon.Map, resAccum uint64, line string) {
+func (s *DynamicMetricSet) add(values func(string) (float64, bool), lookup func(string) string, resource pcommon.Map, resAccum resKey, line string) {
 	ac := s.pool.Get().(*addContext)
 	ac.ctx.reset()
 	ac.line.reset(line)
@@ -495,6 +498,17 @@ func (s *DynamicMetricSet) add(values func(string) float64, lookup func(string) 
 	}
 	ac.values, ac.lookup, ac.raw = nil, nil, "" // do not retain caller state in the pool
 	s.pool.Put(ac)
+}
+
+// cardinalityCap resolves the configured MaxCardinality: unset (or negative)
+// means the documented default of maxCardinalityCap — never unlimited, since
+// the cap is the defense against a high-cardinality label (request id, user
+// id) exhausting the node agent's memory.
+func cardinalityCap(configured int) int {
+	if configured <= 0 {
+		return maxCardinalityCap
+	}
+	return min(configured, maxCardinalityCap)
 }
 
 // parseLabelTemplates compiles a list of label specs.

@@ -55,10 +55,14 @@ func labelsFrom(m map[string]string) func(string) string {
 	return func(k string) string { return m[k] }
 }
 
-func valuesFrom(m map[string]string) func(string) float64 {
-	return func(k string) float64 {
-		f, _ := strconv.ParseFloat(m[k], 64)
-		return f
+func valuesFrom(m map[string]string) func(string) (float64, bool) {
+	return func(k string) (float64, bool) {
+		s, ok := m[k]
+		if !ok {
+			return 0, false
+		}
+		f, err := strconv.ParseFloat(s, 64)
+		return f, err == nil
 	}
 }
 

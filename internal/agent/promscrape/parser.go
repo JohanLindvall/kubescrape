@@ -82,11 +82,12 @@ const maxTrackedFamilies = 100_000
 // Interning bounds: metric and label names are low-cardinality and repeat on
 // nearly every line; label values (namespace, pod, le, code, ...) repeat
 // heavily in Kubernetes-style expositions. Both tables live for one scrape.
-// A value longer than maxInternedValueLen or arriving after the table is full
+// A name/value longer than its length cap or arriving after the table is full
 // is allocated normally, so pathological inputs degrade to the non-interned
 // cost instead of growing memory.
 const (
 	maxInternedNames    = maxTrackedFamilies
+	maxInternedNameLen  = 256
 	maxInternedValues   = 8192
 	maxInternedValueLen = 128
 )
@@ -108,8 +109,11 @@ type Parser struct {
 	// Consecutive lines of a family are near-identical: lastMetric and the
 	// per-position lastKV short-circuit the intern-map probes with a plain
 	// memcmp (string(b) == s does not allocate), which is ~5x cheaper.
+	// Exemplar labels have their own positional cache (exLastKV) so
+	// exemplar-bearing lines do not evict the sample-label entries.
 	lastMetric string
 	lastKV     []lastKV
+	exLastKV   []lastKV
 	labels     []Label // reused between lines
 	exLabels   []Label // reused between lines
 	exemplar   Exemplar
@@ -159,6 +163,7 @@ func getParser(maxLineBytes int, openMetrics, withExemplars bool) *pooledParser 
 	p.eof = false
 	p.lastMetric = ""
 	p.lastKV = p.lastKV[:0]
+	p.exLastKV = p.exLastKV[:0]
 	clear(p.types) // family types are per-exposition
 	if len(p.names) >= maxInternedNames/2 {
 		clear(p.names)
@@ -189,6 +194,9 @@ type lastKV struct {
 // internName returns a canonical string for a metric or label name. The
 // map[string(b)] lookup does not allocate; only a first-seen name does.
 func (p *Parser) internName(b []byte) string {
+	if len(b) > maxInternedNameLen {
+		return string(b)
+	}
 	if s, ok := p.names[string(b)]; ok {
 		return s
 	}
@@ -324,34 +332,54 @@ func (p *Parser) parseLine(line []byte, emit func(Sample) error, emitErr *error)
 	return true
 }
 
+// nextField returns the next space/tab-delimited token and the remainder
+// after it.
+func nextField(b []byte) (tok, rest []byte) {
+	b = skipSpaceTab(b)
+	i := 0
+	for i < len(b) && b[i] != ' ' && b[i] != '\t' {
+		i++
+	}
+	return b[:i], b[i:]
+}
+
 // parseComment records # TYPE declarations and the OpenMetrics # EOF
-// terminator; HELP/UNIT and other comments are ignored.
+// terminator; HELP/UNIT and other comments are ignored. Only the leading
+// tokens are examined — a non-directive comment (HELP with its free text,
+// typically the bulk of the comment bytes) returns after the second token
+// instead of being tokenized whole.
 func (p *Parser) parseComment(line []byte) {
-	fields := bytes.Fields(line)
-	if p.openMetrics && len(fields) == 2 && string(fields[1]) == "EOF" {
-		p.eof = true
-		return
+	_, rest := nextField(line) // the leading "#" token
+	directive, rest := nextField(rest)
+	switch {
+	case p.openMetrics && string(directive) == "EOF": // no alloc: memcmp
+		if len(skipSpaceTab(rest)) == 0 {
+			p.eof = true
+		}
+	case string(directive) == "TYPE":
+		family, rest := nextField(rest)
+		typ, rest := nextField(rest)
+		if len(family) == 0 || len(typ) == 0 || len(skipSpaceTab(rest)) != 0 {
+			return
+		}
+		if len(p.types) >= maxTrackedFamilies {
+			return
+		}
+		var t MetricType
+		switch string(typ) {
+		case "counter":
+			t = TypeCounter
+		case "gauge":
+			t = TypeGauge
+		case "histogram":
+			t = TypeHistogram
+		case "summary":
+			t = TypeSummary
+		default:
+			t = TypeUntyped
+		}
+		p.types[string(family)] = t
 	}
-	if len(fields) != 4 || string(fields[1]) != "TYPE" {
-		return
-	}
-	if len(p.types) >= maxTrackedFamilies {
-		return
-	}
-	var t MetricType
-	switch string(fields[3]) {
-	case "counter":
-		t = TypeCounter
-	case "gauge":
-		t = TypeGauge
-	case "histogram":
-		t = TypeHistogram
-	case "summary":
-		t = TypeSummary
-	default:
-		t = TypeUntyped
-	}
-	p.types[string(fields[2])] = t
 }
 
 // classify resolves the sample role and family from the TYPE table,
@@ -433,7 +461,7 @@ func (p *Parser) parseSample(line []byte) (Sample, bool) {
 	p.labels = p.labels[:0]
 	if len(rest) > 0 && rest[0] == '{' {
 		var ok bool
-		rest, ok = p.parseLabels(rest[1:], &p.labels)
+		rest, ok = p.parseLabels(rest[1:], &p.labels, &p.lastKV)
 		if !ok {
 			return s, false
 		}
@@ -482,7 +510,7 @@ func (p *Parser) parseExemplar(rest []byte) (*Exemplar, bool) {
 		return nil, false
 	}
 	p.exLabels = p.exLabels[:0]
-	rest, ok := p.parseLabels(rest[1:], &p.exLabels)
+	rest, ok := p.parseLabels(rest[1:], &p.exLabels, &p.exLastKV)
 	if !ok {
 		return nil, false
 	}
@@ -545,8 +573,10 @@ func (p *Parser) parseTimestampToken(rest []byte) (int64, []byte, bool) {
 }
 
 // parseLabels parses the label pairs after '{' into dst and returns the
-// remainder after the closing '}'.
-func (p *Parser) parseLabels(rest []byte, dst *[]Label) ([]byte, bool) {
+// remainder after the closing '}'. cache is the positional last-seen table
+// for this label block kind (sample labels vs exemplar labels — separate, so
+// exemplars do not evict the sample-label fast path).
+func (p *Parser) parseLabels(rest []byte, dst *[]Label, cache *[]lastKV) ([]byte, bool) {
 	for {
 		rest = skipSpaceTab(rest)
 		if len(rest) == 0 {
@@ -556,10 +586,10 @@ func (p *Parser) parseLabels(rest []byte, dst *[]Label) ([]byte, bool) {
 			return rest[1:], true
 		}
 		pos := len(*dst)
-		if pos == len(p.lastKV) {
-			p.lastKV = append(p.lastKV, lastKV{})
+		if pos == len(*cache) {
+			*cache = append(*cache, lastKV{})
 		}
-		last := &p.lastKV[pos]
+		last := &(*cache)[pos]
 		// Label name. Consecutive lines of a family repeat names positionally,
 		// so matching the previous line's name plus its '=' terminator in one
 		// memcmp skips the byte scan.

@@ -412,6 +412,51 @@ func TestGetPodByUID(t *testing.T) {
 	}
 }
 
+// An expired-but-unswept tombstone must return not-found immediately: the
+// container is definitively gone, so waiting the full budget for it is
+// pointless (and blocks callers for seconds per dead container).
+func TestExpiredTombstoneDoesNotWait(t *testing.T) {
+	s, clk := newTestStore(time.Minute)
+	s.UpsertPod(makePod("uid1", "pod1", "node1", "1", map[string]string{"app": "abc123"}))
+	s.DeletePod("uid1")
+	clk.Advance(time.Minute + time.Second)
+	// No Sweep: the tombstone is expired but still present.
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	start := time.Now()
+	if _, ok := s.GetContainer(ctx, "abc123"); ok {
+		t.Fatal("expired tombstone resolved")
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("lookup took %v; must not wait for an expired tombstone", elapsed)
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if len(s.waiters) != 0 {
+		t.Fatalf("expired-tombstone lookup registered waiters: %v", s.waiters)
+	}
+}
+
+// A replaced container ID whose TTL has lapsed is equally definitive: it can
+// never be reported again, so its lookup must not block either.
+func TestExpiredReplacedIDDoesNotWait(t *testing.T) {
+	s, clk := newTestStore(time.Minute)
+	s.UpsertPod(makePod("uid1", "pod1", "node1", "1", map[string]string{"app": "old111"}))
+	s.UpsertPod(makePod("uid1", "pod1", "node1", "2", map[string]string{"app": "new222"}))
+	clk.Advance(time.Minute + time.Second)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	start := time.Now()
+	if _, ok := s.GetContainer(ctx, "old111"); ok {
+		t.Fatal("expired replaced ID resolved")
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("lookup took %v; must not wait for an expired replaced ID", elapsed)
+	}
+}
+
 // Run is a thin sweeping ticker: it must exit promptly on cancel.
 func TestRunExitsOnCancel(t *testing.T) {
 	s, _ := newTestStore(time.Minute)
@@ -466,5 +511,49 @@ func TestGetPodByIP(t *testing.T) {
 	}
 	if _, ok := s.GetPodByUID("u1"); !ok {
 		t.Fatal("tombstone must still resolve by UID")
+	}
+}
+
+// A finished pod's status may retain a podIP the CNI has already handed to a
+// live pod; the finished pod must neither steal the mapping nor resolve.
+func TestGetPodByIPIgnoresFinishedPods(t *testing.T) {
+	s := New(time.Minute)
+	s.UpsertPod(&corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "live", Namespace: "ns", UID: "live-uid", ResourceVersion: "1"},
+		Status:     corev1.PodStatus{Phase: corev1.PodRunning, PodIP: "10.0.0.7", HostIP: "192.168.1.1"},
+	})
+	// A Succeeded Job pod whose upsert arrives later, still reporting the
+	// same (recycled) IP, must not displace the live owner.
+	s.UpsertPod(&corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "done", Namespace: "ns", UID: "done-uid", ResourceVersion: "1"},
+		Status:     corev1.PodStatus{Phase: corev1.PodSucceeded, PodIP: "10.0.0.7", HostIP: "192.168.1.1"},
+	})
+	if np, ok := s.GetPodByIP("10.0.0.7"); !ok || np.Pod.UID != "live-uid" {
+		t.Fatalf("recycled IP must resolve to the live pod: %+v, %v", np.Pod, ok)
+	}
+
+	// A finished pod's IP alone (no live claimant) must not resolve either.
+	s.UpsertPod(&corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "failed", Namespace: "ns", UID: "failed-uid", ResourceVersion: "1"},
+		Status:     corev1.PodStatus{Phase: corev1.PodFailed, PodIP: "10.0.0.8", HostIP: "192.168.1.1"},
+	})
+	if _, ok := s.GetPodByIP("10.0.0.8"); ok {
+		t.Fatal("finished pod must not resolve by IP")
+	}
+
+	// A running pod that finishes releases its mapping on the phase update.
+	s.UpsertPod(&corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "job", Namespace: "ns", UID: "job-uid", ResourceVersion: "1"},
+		Status:     corev1.PodStatus{Phase: corev1.PodRunning, PodIP: "10.0.0.9", HostIP: "192.168.1.1"},
+	})
+	if _, ok := s.GetPodByIP("10.0.0.9"); !ok {
+		t.Fatal("running pod must resolve by IP")
+	}
+	s.UpsertPod(&corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "job", Namespace: "ns", UID: "job-uid", ResourceVersion: "2"},
+		Status:     corev1.PodStatus{Phase: corev1.PodSucceeded, PodIP: "10.0.0.9", HostIP: "192.168.1.1"},
+	})
+	if _, ok := s.GetPodByIP("10.0.0.9"); ok {
+		t.Fatal("pod that finished must stop resolving by IP")
 	}
 }

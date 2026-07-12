@@ -55,15 +55,30 @@ func (l labels) without(key string) labels {
 	return l
 }
 
-// hashAccum is the order-independent XOR accumulator of the label set: every
-// entry contributes combineHash(hash(key), hash(value)) and they are XORed
-// together. Because XOR is its own inverse a caller can fold a single label in
-// or out by XORing its combined hash — the histogram observe path uses this to
-// add each bucket's "le" label without building a per-bucket slice.
+// hashAccum is the order-independent accumulator of the label set: every
+// entry contributes combineHash(hash(key), hash(value)) and they are summed
+// (wrapping). Summation is order-independent like XOR but not self-inverse
+// under duplication — with XOR, the same key=value pair contributed twice
+// (e.g. in both the data-point labels and the resource labels) cancelled to
+// zero, silently merging distinct series. Addition still supports folding a
+// single label in or out (subtract its combined hash), which the histogram
+// observe path uses for the per-bucket "le".
 func (l labels) hashAccum() uint64 {
 	var h uint64
 	for _, e := range l {
-		h ^= combineHash(xxhash.Sum64String(e.key), xxhash.Sum64String(e.value))
+		h += combineHash(xxhash.Sum64String(e.key), xxhash.Sum64String(e.value))
+	}
+	return h
+}
+
+// checkAccum is a second, independently-mixed accumulator over the same label
+// set. Series lookups compare it on every hash hit, so a residual 64-bit
+// collision between different label multisets is detected instead of silently
+// merging their data (both sums colliding at once is ~2^-128).
+func (l labels) checkAccum() uint64 {
+	var h uint64
+	for _, e := range l {
+		h += combineCheck(xxhash.Sum64String(e.key), xxhash.Sum64String(e.value))
 	}
 	return h
 }
@@ -193,6 +208,13 @@ func combineHash(h1, h2 uint64) uint64 {
 	h ^= hashRound(0, h2)
 	h = bits.RotateLeft64(h, 27)*prime1 + prime4
 	return mixHash(h)
+}
+
+// combineCheck is an alternative mixing of the same two hashes, independent of
+// combineHash (swapped order plus a rotation), for the collision-check
+// accumulator.
+func combineCheck(h1, h2 uint64) uint64 {
+	return combineHash(bits.RotateLeft64(h2, 31), h1)
 }
 
 // mixHash performs the final xxhash avalanche on h.

@@ -406,6 +406,71 @@ func TestNodeTargetsFromServiceMonitor(t *testing.T) {
 	}
 }
 
+// The monitor→services match map is O(monitors × services); with a metadata
+// cache TTL configured it must be rebuilt at most once per TTL, and never for
+// a node with no pods.
+func TestMonitoredServicesCached(t *testing.T) {
+	st := store.New(time.Minute)
+	addPod(st)
+	monitors := servicemonitors.NewIndex()
+	s := New(Config{
+		Store:    st,
+		Services: services.NewIndex(),
+		Monitors: monitors,
+		Resolver: stubResolver{},
+		MaxWait:  500 * time.Millisecond,
+		CacheTTL: 30 * time.Second,
+		Ready:    closedChan(),
+	})
+	srv := httptest.NewServer(s.Handler())
+	t.Cleanup(srv.Close)
+
+	// A node with no pods must not trigger the build at all.
+	getJSON(t, srv.URL+"/v1/nodes/empty-node/targets", http.StatusOK, nil)
+	if n := s.monBuilds.Load(); n != 0 {
+		t.Fatalf("builds after empty-node request = %d, want 0", n)
+	}
+
+	// Two consecutive requests within the TTL share one build.
+	getJSON(t, srv.URL+"/v1/nodes/node1/targets", http.StatusOK, nil)
+	getJSON(t, srv.URL+"/v1/nodes/node1/targets", http.StatusOK, nil)
+	if n := s.monBuilds.Load(); n != 1 {
+		t.Fatalf("builds after two requests = %d, want 1", n)
+	}
+
+	// Past the TTL the map is rebuilt once.
+	now := time.Now()
+	s.now = func() time.Time { return now.Add(time.Minute) }
+	getJSON(t, srv.URL+"/v1/nodes/node1/targets", http.StatusOK, nil)
+	getJSON(t, srv.URL+"/v1/nodes/node1/targets", http.StatusOK, nil)
+	if n := s.monBuilds.Load(); n != 2 {
+		t.Fatalf("builds after TTL expiry = %d, want 2", n)
+	}
+}
+
+// With caching disabled (CacheTTL 0) the map is rebuilt per request —
+// staleness must not exceed what the operator opted into.
+func TestMonitoredServicesUncachedWithoutTTL(t *testing.T) {
+	st := store.New(time.Minute)
+	addPod(st)
+	s := New(Config{
+		Store:    st,
+		Services: services.NewIndex(),
+		Monitors: servicemonitors.NewIndex(),
+		Resolver: stubResolver{},
+		MaxWait:  500 * time.Millisecond,
+		Ready:    closedChan(),
+	})
+	srv := httptest.NewServer(s.Handler())
+	t.Cleanup(srv.Close)
+
+	getJSON(t, srv.URL+"/v1/nodes/node1/targets", http.StatusOK, nil)
+	getJSON(t, srv.URL+"/v1/nodes/node1/targets", http.StatusOK, nil)
+	if n := s.monBuilds.Load(); n != 2 {
+		t.Fatalf("builds = %d, want 2 (no TTL, no caching)", n)
+	}
+}
+
 func TestCacheHeadersAndRevalidation(t *testing.T) {
 	st := store.New(time.Minute)
 	addPod(st)
@@ -435,17 +500,29 @@ func TestCacheHeadersAndRevalidation(t *testing.T) {
 		t.Fatal("no ETag")
 	}
 
-	// A conditional GET with the matching ETag returns 304.
-	req, _ := http.NewRequest(http.MethodGet, srv.URL+"/v1/containers/cafe01", nil)
-	req.Header.Set("If-None-Match", etag)
-	resp2, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatal(err)
+	// A conditional GET with the matching ETag returns 304. Per RFC 9110 the
+	// header is a comma-separated list, a weak W/ prefix still matches, and
+	// "*" matches any representation.
+	conditional := func(t *testing.T, ifNoneMatch string, want int) {
+		t.Helper()
+		req, _ := http.NewRequest(http.MethodGet, srv.URL+"/v1/containers/cafe01", nil)
+		req.Header.Set("If-None-Match", ifNoneMatch)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = resp.Body.Close()
+		if resp.StatusCode != want {
+			t.Fatalf("If-None-Match %q: status = %d; want %d", ifNoneMatch, resp.StatusCode, want)
+		}
 	}
-	_ = resp2.Body.Close()
-	if resp2.StatusCode != http.StatusNotModified {
-		t.Fatalf("conditional GET status = %d; want 304", resp2.StatusCode)
-	}
+	conditional(t, etag, http.StatusNotModified)
+	conditional(t, `"other", `+etag+`, "another"`, http.StatusNotModified)
+	conditional(t, `W/`+etag, http.StatusNotModified)
+	conditional(t, `"stale", W/`+etag, http.StatusNotModified)
+	conditional(t, `*`, http.StatusNotModified)
+	conditional(t, `"other", "another"`, http.StatusOK)
+	conditional(t, `"stale"`, http.StatusOK)
 }
 
 func TestNoCacheHeadersWhenDisabled(t *testing.T) {

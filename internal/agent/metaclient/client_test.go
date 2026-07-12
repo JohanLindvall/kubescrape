@@ -73,6 +73,61 @@ func TestClientRevalidatesAfterTTL(t *testing.T) {
 	}
 }
 
+// A 304 must not clobber a newer 200 entry that a concurrent goroutine stored
+// while the revalidating request was in flight: only the entry whose ETag this
+// request actually validated may have its freshness extended.
+func TestClient304DoesNotClobberNewerEntry(t *testing.T) {
+	c := &Client{now: time.Now, http: &http.Client{Timeout: 5 * time.Second}, cache: make(map[string]cacheEntry)}
+	now := time.Now()
+	c.now = func() time.Time { return now }
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "max-age=60")
+		if r.Header.Get("If-None-Match") == `"v1"` {
+			// Simulate the race: while this revalidation is in flight (the
+			// client lock is released), a concurrent goroutine stores a newer
+			// 200 entry under the same key.
+			key := cacheKey("http://" + r.Host + r.URL.Path)
+			c.mu.Lock()
+			c.cache[key] = cacheEntry{
+				body:    []byte(`{"name":"web-v2","uid":"u1"}`),
+				etag:    `"v2"`,
+				expires: time.Now().Add(time.Hour), // fresh vs. the fake clock
+			}
+			c.mu.Unlock()
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
+		w.Header().Set("ETag", `"v1"`)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"name":"web-v1","uid":"u1"}`))
+	}))
+	t.Cleanup(srv.Close)
+	c.base = srv.URL
+	key := cacheKey(c.base + "/v1/pod-uids/u1")
+
+	ctx := context.Background()
+	if p, err := c.PodByUID(ctx, "u1"); err != nil || p.Name != "web-v1" {
+		t.Fatalf("populate: pod=%+v err=%v", p, err)
+	}
+	now = now.Add(2 * time.Minute) // entry goes stale -> next call revalidates
+
+	// The revalidating request itself still serves the body it validated.
+	if p, err := c.PodByUID(ctx, "u1"); err != nil || p.Name != "web-v1" {
+		t.Fatalf("revalidate: pod=%+v err=%v", p, err)
+	}
+	// But the concurrently stored newer entry must survive the 304.
+	c.mu.Lock()
+	entry := c.cache[key]
+	c.mu.Unlock()
+	if entry.etag != `"v2"` {
+		t.Fatalf("cache etag = %s; 304 clobbered the newer 200 entry", entry.etag)
+	}
+	if p, err := c.PodByUID(ctx, "u1"); err != nil || p.Name != "web-v2" {
+		t.Fatalf("post-304 cache read: pod=%+v err=%v", p, err)
+	}
+}
+
 func TestClientCacheIgnoresWaitParam(t *testing.T) {
 	var hits int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {

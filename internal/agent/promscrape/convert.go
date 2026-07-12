@@ -44,6 +44,10 @@ type converter struct {
 	// accumulator + bucket slice per label set per family.
 	histFree []*histAcc
 	summFree []*summAcc
+	// malformed counts component samples that cannot participate in their
+	// family (a bucket without le, a summary row without quantile); the
+	// caller folds it into the parser's malformed count.
+	malformed int
 }
 
 type histAcc struct {
@@ -94,7 +98,8 @@ func (c *converter) add(s Sample) {
 	case RoleHistogramBucket:
 		le, ok := labelFloat(s.Labels, "le")
 		if !ok {
-			return // malformed bucket
+			c.malformed++ // bucket without le
+			return
 		}
 		acc := c.hist(s)
 		acc.buckets = append(acc.buckets, cumBucket{le: le, cum: uint64(s.Value)})
@@ -110,8 +115,10 @@ func (c *converter) add(s Sample) {
 	case RoleSummaryQuantile:
 		q, ok := labelFloat(s.Labels, "quantile")
 		if !ok {
-			// A summary-typed sample without a quantile label; pass through.
-			c.b.addNumber(s, false)
+			// A summary-typed sample without a quantile label is malformed;
+			// emitting it as a gauge would claim the family name and block
+			// the family's real Summary metric (same name, other shape).
+			c.malformed++
 			return
 		}
 		acc := c.summ(s)

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -308,7 +309,7 @@ func TestPositionsStoreResume(t *testing.T) {
 	posPath := filepath.Join(dir, "positions.json")
 	exp := &fakeExporter{}
 	tl := newTestTailer(dir, "", exp)
-	tl.cfg.Positions = positions.Open(posPath)
+	tl.cfg.Positions, _ = positions.Open(posPath)
 	stop := startTailer(t, tl)
 	writeLog(t, dir,
 		"2026-07-05T10:00:00Z stdout F one",
@@ -318,14 +319,14 @@ func TestPositionsStoreResume(t *testing.T) {
 	stop() // shutdown persists offsets to the positions store
 
 	// The positions file recorded the offset; it is not empty.
-	if len(positions.Open(posPath).Logs()) == 0 {
+	if st, _ := positions.Open(posPath); len(st.Logs()) == 0 {
 		t.Fatal("positions file has no log offsets after save")
 	}
 
 	// A fresh tailer sharing the positions store resumes and does not re-read.
 	exp2 := &fakeExporter{}
 	tl2 := newTestTailer(dir, "", exp2)
-	tl2.cfg.Positions = positions.Open(posPath)
+	tl2.cfg.Positions, _ = positions.Open(posPath)
 	stop2 := startTailer(t, tl2)
 	defer stop2()
 	writeLog(t, dir, "2026-07-05T10:00:02Z stdout F three")
@@ -455,7 +456,7 @@ func TestMultilineRecoversPrefixAfterRestart(t *testing.T) {
 	// A checkpoint as a crash would have left it: committed 0 on the new inode,
 	// with a pending prefix naming the rotated file.
 	posPath := filepath.Join(dir, "positions.json")
-	seed := positions.Open(posPath)
+	seed, _ := positions.Open(posPath)
 	if err := seed.SetLogs(map[string]positions.LogPos{
 		filepath.Join(dir, logName): {
 			Offset: 0, Inode: 0,
@@ -469,7 +470,7 @@ func TestMultilineRecoversPrefixAfterRestart(t *testing.T) {
 	}
 
 	exp := &fakeExporter{}
-	tl := newMultilineTailer(dir, "", exp, positions.Open(posPath))
+	tl := newMultilineTailer(dir, "", exp, mustOpenPositions(t, posPath))
 	stop := startTailer(t, tl)
 	defer stop()
 
@@ -566,7 +567,7 @@ func TestMultilineRecoversAcrossDoubleRotation(t *testing.T) {
 	}
 
 	posPath := filepath.Join(dir, "positions.json")
-	seed := positions.Open(posPath)
+	seed, _ := positions.Open(posPath)
 	if err := seed.SetLogs(map[string]positions.LogPos{
 		filepath.Join(dir, logName): {
 			// Oldest first — the order they must be replayed.
@@ -577,7 +578,7 @@ func TestMultilineRecoversAcrossDoubleRotation(t *testing.T) {
 	}
 
 	exp := &fakeExporter{}
-	tl := newMultilineTailer(dir, "", exp, positions.Open(posPath))
+	tl := newMultilineTailer(dir, "", exp, mustOpenPositions(t, posPath))
 	stop := startTailer(t, tl)
 	defer stop()
 
@@ -989,4 +990,111 @@ func TestFileDeletionDrainsAndDrops(t *testing.T) {
 	if len(got) != 2 || got[0] != "before-delete" || got[1] != "final-words" {
 		t.Fatalf("records = %q", got)
 	}
+}
+
+// TestCopyTruncateWithBufferedGroupCommitsNewOffsets is the regression test
+// for the truncation reopen path: entries flushed out of the old content's
+// pipeline carry old offsets, which must never drive the new inode's
+// checkpoint (the non-carry reopen bumps the generation exactly like the
+// carry path). Before the fix, the committed offset landed in the replaced
+// content's offset space and a restart skipped that many bytes of the new
+// content.
+func TestCopyTruncateWithBufferedGroupCommitsNewOffsets(t *testing.T) {
+	dir := t.TempDir()
+	exp := &fakeExporter{}
+	tl := newTestTailer(dir, filepath.Join(t.TempDir(), "chk"), exp)
+	tl.statusEvery = 20 * time.Millisecond
+	stop := startTailer(t, tl)
+
+	// A fat exported line, then an unterminated CRI P-fragment that stays
+	// buffered in the pipeline.
+	fat := strings.Repeat("x", 2048)
+	writeLog(t, dir, timeNowCRI()+" stdout F "+fat)
+	waitFor(t, func() bool { return len(exp.get()) >= 1 }, "fat line exported")
+	writeLog(t, dir, timeNowCRI()+" stdout P dangling-fragment")
+	// The fragment is buffered once it has been read (ReadPos advanced) but
+	// not committed (the watermark holds the checkpoint at the fat line).
+	waitFor(t, func() bool {
+		for _, fs := range tl.Status() {
+			if fs.ReadPos > fs.Committed && fs.Committed > 0 {
+				return true
+			}
+		}
+		return false
+	}, "fragment buffered")
+
+	// copytruncate: replace the content with something short.
+	if err := os.Truncate(filepath.Join(dir, logName), 0); err != nil {
+		t.Fatal(err)
+	}
+	writeLog(t, dir, timeNowCRI()+" stdout F after-truncate")
+	waitFor(t, func() bool {
+		for _, r := range exp.get() {
+			if r == "after-truncate" {
+				return true
+			}
+		}
+		return false
+	}, "post-truncate line exported")
+
+	// The committed offset must stay within the new content's size.
+	size, err := os.Stat(filepath.Join(dir, logName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, func() bool {
+		for _, fs := range tl.Status() {
+			if fs.Path == filepath.Join(dir, logName) {
+				return fs.Committed > 0 && fs.Committed <= size.Size()
+			}
+		}
+		return false
+	}, "committed offset within the new content")
+	stop()
+}
+
+// TestRotationDrainsFullBacklog: a rename rotation must drain the entire
+// unread remainder of the rotated-away inode, not a byte-budgeted prefix.
+func TestRotationDrainsFullBacklog(t *testing.T) {
+	dir := t.TempDir()
+	exp := &fakeExporter{}
+	tl := newTestTailer(dir, filepath.Join(t.TempDir(), "chk"), exp)
+	tl.cfg.MaxBytesPerSweep = 1024 // the old budget would abandon most of the backlog
+	stop := startTailer(t, tl)
+	defer stop()
+
+	writeLog(t, dir, timeNowCRI()+" stdout F first")
+	waitFor(t, func() bool { return len(exp.get()) >= 1 }, "first line exported")
+
+	// Build a backlog far over 4*MaxBytesPerSweep, then rotate before the
+	// tailer can catch up.
+	var lines []string
+	for i := 0; i < 120; i++ {
+		lines = append(lines, timeNowCRI()+" stdout F backlog-"+strings.Repeat("y", 100)+"-"+strconv.Itoa(i))
+	}
+	writeLog(t, dir, lines...)
+	if err := os.Rename(filepath.Join(dir, logName), filepath.Join(dir, logName+".1")); err != nil {
+		t.Fatal(err)
+	}
+	writeLog(t, dir, timeNowCRI()+" stdout F post-rotate")
+
+	waitFor(t, func() bool {
+		recs := exp.get()
+		n := 0
+		for _, r := range recs {
+			if strings.HasPrefix(r, "backlog-") {
+				n++
+			}
+		}
+		return n == 120
+	}, "all 120 backlog lines exported")
+}
+
+func mustOpenPositions(t *testing.T, path string) *positions.Store {
+	t.Helper()
+	s, err := positions.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return s
 }

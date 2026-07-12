@@ -72,9 +72,11 @@ type Config struct {
 // samples as OTLP metrics.
 //
 // Efficiency: the exposition body is stream-parsed (constant memory per
-// target) and converted into pmetric batches of at most BatchPoints data
-// points, which are exported and released before parsing continues — a
-// 100k-series target never resides fully in memory.
+// target) and converted into pmetric batches flushed once BatchPoints data
+// points accumulate (a histogram/summary family emits all its points at once,
+// so a batch can exceed the limit by the flushing family's point count),
+// which are exported and released before parsing continues — a 100k-series
+// target never resides fully in memory.
 type Scraper struct {
 	cfg  Config
 	http *http.Client

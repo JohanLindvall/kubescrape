@@ -202,7 +202,9 @@ func podPorts(pod kubemeta.Pod) []int32 {
 		return ports
 	}
 	for _, entry := range splitList(ann) {
-		if n, err := strconv.Atoi(entry); err == nil {
+		// ParseInt with a 32-bit size: values overflowing int32 must be
+		// skipped, not truncated into a different (valid-looking) port.
+		if n, err := strconv.ParseInt(entry, 10, 32); err == nil {
 			add(int32(n))
 			continue
 		}
@@ -227,8 +229,9 @@ func selectServicePorts(svc *services.Service) []services.Port {
 	}
 	var out []services.Port
 	for _, entry := range splitList(ann) {
-		n, numeric := 0, false
-		if v, err := strconv.Atoi(entry); err == nil {
+		// As in podPorts: reject rather than truncate values beyond int32.
+		n, numeric := int64(0), false
+		if v, err := strconv.ParseInt(entry, 10, 32); err == nil {
 			n, numeric = v, true
 		}
 		for _, sp := range svc.Ports {

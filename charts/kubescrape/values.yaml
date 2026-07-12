@@ -63,6 +63,7 @@ agent:
     dir: ""
     units: []
     batchSize: 1024
+    maxBatchBytes: 1048576  # flush before a batch's summed message bytes exceed this
     flushInterval: 2s
     # As logsEnrich; a level in the message wins over the journal priority.
     enrich: true

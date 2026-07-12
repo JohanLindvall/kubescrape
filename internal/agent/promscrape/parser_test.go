@@ -226,6 +226,51 @@ func TestParseOpenMetricsExemplarsDisabled(t *testing.T) {
 	}
 }
 
+// Exemplar labels must use their own positional cache: sharing lastKV with
+// the sample labels would make every exemplar-bearing line evict the sample
+// entries, permanently missing the sample-label fast path.
+func TestParseExemplarLabelsSeparateCache(t *testing.T) {
+	input := "# TYPE r counter\n" +
+		`r_total{code="200"} 1 # {trace_id="4bf92f3577b34da6a3ce929d0e0e4736",user="x"} 0.5` + "\n" +
+		`r_total{code="500"} 2 # {trace_id="00f067aa0ba902b74bf92f3577b34da6",user="y"} 0.7` + "\n" +
+		"# EOF\n"
+	p := NewParser(1<<20, true, true)
+	var got []Sample
+	malformed, err := p.Parse(strings.NewReader(input), func(s Sample) error {
+		c := s
+		c.Labels = append([]Label(nil), s.Labels...)
+		if s.Exemplar != nil {
+			e := *s.Exemplar
+			e.Labels = append([]Label(nil), s.Exemplar.Labels...)
+			c.Exemplar = &e
+		}
+		got = append(got, c)
+		return nil
+	})
+	if err != nil || malformed != 0 {
+		t.Fatalf("err=%v malformed=%d", err, malformed)
+	}
+	if len(got) != 2 {
+		t.Fatalf("got %d samples", len(got))
+	}
+	for i, want := range []string{"200", "500"} {
+		if len(got[i].Labels) != 1 || got[i].Labels[0] != (Label{"code", want}) {
+			t.Errorf("sample %d labels = %+v", i, got[i].Labels)
+		}
+		if got[i].Exemplar == nil || len(got[i].Exemplar.Labels) != 2 || got[i].Exemplar.Labels[1].Name != "user" {
+			t.Errorf("sample %d exemplar = %+v", i, got[i].Exemplar)
+		}
+	}
+	// White-box: the sample-label cache still holds the sample's label at
+	// position 0, and the exemplar cache holds the exemplar's.
+	if len(p.lastKV) == 0 || p.lastKV[0].name != "code" {
+		t.Errorf("sample label cache = %+v, want position 0 name %q", p.lastKV, "code")
+	}
+	if len(p.exLastKV) == 0 || p.exLastKV[0].name != "trace_id" {
+		t.Errorf("exemplar label cache = %+v, want position 0 name %q", p.exLastKV, "trace_id")
+	}
+}
+
 func TestParseClassicRejectsExemplarSyntax(t *testing.T) {
 	p := NewParser(1<<20, false, true)
 	var good int

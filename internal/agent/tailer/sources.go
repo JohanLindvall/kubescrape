@@ -145,16 +145,20 @@ func (s *compiledSource) matches(path string) bool {
 // (before exclude filtering, which matches() applies per file). Directories
 // are filtered by the caller; container logs are symlinks to files, so
 // symlink following (os.Stat) is left to the caller.
-func (s *compiledSource) glob() []string {
+func (s *compiledSource) glob() ([]string, bool) {
 	var out []string
+	ok := true
 	for _, g := range s.include {
 		m, err := doublestar.FilepathGlob(g)
 		if err != nil {
+			// An errored pattern proves nothing about which files are gone;
+			// the caller must not treat absence from this listing as removal.
+			ok = false
 			continue
 		}
 		out = append(out, m...)
 	}
-	return out
+	return out, ok
 }
 
 // scanBaseDirs returns the fixed directory prefixes of the include globs (the

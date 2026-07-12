@@ -64,6 +64,12 @@ func TestExtractLogfmt(t *testing.T) {
 	if len(r.Resource) != 1 || r.Resource[0].Val != "acme" {
 		t.Errorf("resource = %+v", r.Resource)
 	}
+
+	// A duplicated key keeps its last value.
+	r = e.Extract(`level=info level=warn`)
+	if len(r.Log) != 1 || r.Log[0].Val != "warn" {
+		t.Errorf("duplicate key = %+v, want last value", r.Log)
+	}
 }
 
 func TestExtractNonStructured(t *testing.T) {

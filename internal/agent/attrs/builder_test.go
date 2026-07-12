@@ -159,6 +159,57 @@ func TestInstancePrefixTopLevel(t *testing.T) {
 	}
 }
 
+// Identity derivation is independent of the defaults toggle and runs after
+// templates: a defaults:false pipeline whose resource carries (pre-populated
+// or template-set) identity attributes still gets service.instance.id.
+func TestIdentityWithDefaultsOff(t *testing.T) {
+	off := false
+	b, err := NewBuilder(&Config{
+		Defaults:   &off,
+		Attributes: map[string]string{"k8s.namespace.name": `{{ .Pod.Namespace }}`, "k8s.pod.name": `{{ .Pod.Name }}`},
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	res := pcommon.NewResource()
+	b.Build(res, testCtx())
+	got := res.Attributes().AsRaw()
+	if got["service.instance.id"] != "ns1/pod1" || got["service.namespace"] != "ns1" {
+		t.Fatalf("identity not derived with defaults off: %v", got)
+	}
+
+	// A template-set instance still wins over the derived one.
+	b2, err := NewBuilder(&Config{
+		Defaults:   &off,
+		Attributes: map[string]string{"k8s.pod.name": `{{ .Pod.Name }}`, "service.instance.id": "tmpl-wins"},
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	res = pcommon.NewResource()
+	b2.Build(res, testCtx())
+	if v, _ := res.Attributes().Get("service.instance.id"); v.Str() != "tmpl-wins" {
+		t.Fatalf("template instance overwritten: %q", v.Str())
+	}
+}
+
+// A prefix must never be stamped on its own: with no derived instance there is
+// nothing to disambiguate, and a shared bare "cadvisor" instance would be
+// worse than none.
+func TestPrefixInstanceSkipsWithoutInstance(t *testing.T) {
+	off := false
+	prefix := "cadvisor"
+	b, err := NewBuilder(&Config{Defaults: &off, InstancePrefix: &prefix}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	res := pcommon.NewResource()
+	b.Build(res, testCtx())
+	if v, ok := res.Attributes().Get("service.instance.id"); ok {
+		t.Fatalf("bare prefix stamped as instance: %q", v.Str())
+	}
+}
+
 func TestLoadConfig(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "attrs.yaml")
 	if err := os.WriteFile(path, []byte(`

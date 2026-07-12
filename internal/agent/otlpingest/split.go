@@ -6,7 +6,6 @@ import (
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/pmetric"
 
-	"github.com/JohanLindvall/kubescrape/internal/agent/attrs"
 	"github.com/JohanLindvall/kubescrape/internal/obs"
 )
 
@@ -76,48 +75,57 @@ type metricGrouper struct {
 	metByID     map[idMetric]pmetric.Metric
 }
 
-// route moves every data point of m into the output metric for its ID.
+// route moves every data point of m into the output metric for its ID. The
+// per-type loops copy directly (no per-point closures — this is the ingest
+// hot path).
 func (g *metricGrouper) route(sm pmetric.ScopeMetrics, scopeIdx int, m pmetric.Metric, metricIdx int) {
-	move := func(dpAttrs pcommon.Map, copyTo func(dst pmetric.Metric)) {
-		token, _ := g.enricher.findID(dpAttrs)
-		if token == "" {
-			token = g.resToken
-		}
-		dst := g.metric(sm, scopeIdx, m, metricIdx, token)
-		copyTo(dst)
-	}
 	switch m.Type() {
 	case pmetric.MetricTypeGauge:
 		dps := m.Gauge().DataPoints()
 		for i := 0; i < dps.Len(); i++ {
 			dp := dps.At(i)
-			move(dp.Attributes(), func(dst pmetric.Metric) { dp.CopyTo(dst.Gauge().DataPoints().AppendEmpty()) })
+			dst := g.metricFor(sm, scopeIdx, m, metricIdx, dp.Attributes())
+			dp.CopyTo(dst.Gauge().DataPoints().AppendEmpty())
 		}
 	case pmetric.MetricTypeSum:
 		dps := m.Sum().DataPoints()
 		for i := 0; i < dps.Len(); i++ {
 			dp := dps.At(i)
-			move(dp.Attributes(), func(dst pmetric.Metric) { dp.CopyTo(dst.Sum().DataPoints().AppendEmpty()) })
+			dst := g.metricFor(sm, scopeIdx, m, metricIdx, dp.Attributes())
+			dp.CopyTo(dst.Sum().DataPoints().AppendEmpty())
 		}
 	case pmetric.MetricTypeHistogram:
 		dps := m.Histogram().DataPoints()
 		for i := 0; i < dps.Len(); i++ {
 			dp := dps.At(i)
-			move(dp.Attributes(), func(dst pmetric.Metric) { dp.CopyTo(dst.Histogram().DataPoints().AppendEmpty()) })
+			dst := g.metricFor(sm, scopeIdx, m, metricIdx, dp.Attributes())
+			dp.CopyTo(dst.Histogram().DataPoints().AppendEmpty())
 		}
 	case pmetric.MetricTypeExponentialHistogram:
 		dps := m.ExponentialHistogram().DataPoints()
 		for i := 0; i < dps.Len(); i++ {
 			dp := dps.At(i)
-			move(dp.Attributes(), func(dst pmetric.Metric) { dp.CopyTo(dst.ExponentialHistogram().DataPoints().AppendEmpty()) })
+			dst := g.metricFor(sm, scopeIdx, m, metricIdx, dp.Attributes())
+			dp.CopyTo(dst.ExponentialHistogram().DataPoints().AppendEmpty())
 		}
 	case pmetric.MetricTypeSummary:
 		dps := m.Summary().DataPoints()
 		for i := 0; i < dps.Len(); i++ {
 			dp := dps.At(i)
-			move(dp.Attributes(), func(dst pmetric.Metric) { dp.CopyTo(dst.Summary().DataPoints().AppendEmpty()) })
+			dst := g.metricFor(sm, scopeIdx, m, metricIdx, dp.Attributes())
+			dp.CopyTo(dst.Summary().DataPoints().AppendEmpty())
 		}
 	}
+}
+
+// metricFor resolves one data point's ID (falling back to the resource-level
+// one) and returns its output metric.
+func (g *metricGrouper) metricFor(sm pmetric.ScopeMetrics, scopeIdx int, m pmetric.Metric, metricIdx int, dpAttrs pcommon.Map) pmetric.Metric {
+	token, _ := g.enricher.findID(dpAttrs)
+	if token == "" {
+		token = g.resToken
+	}
+	return g.metric(sm, scopeIdx, m, metricIdx, token)
 }
 
 // metric returns the output metric for the given ID, creating the resource,
@@ -172,7 +180,15 @@ func (g *metricGrouper) resource(id string) pmetric.ResourceMetrics {
 	g.srcResource.CopyTo(rm.Resource())
 	rm.SetSchemaUrl(g.srcSchema)
 	if id != "" {
-		g.mergeEnrichment(id, rm.Resource().Attributes())
+		if id != g.resToken {
+			// This group is keyed by a point-level ID that differs from the
+			// resource's own: the copied resource's ID attributes describe a
+			// DIFFERENT object and would mislabel (and mis-enrich downstream)
+			// every point in the group. The ""-fallback and resToken groups
+			// keep them — there they are correct.
+			g.stripIDAttrs(rm.Resource().Attributes())
+		}
+		mergeAttrs(g.enricher.builtAttrs(g.ctx, g.enrichCache, id), rm.Resource().Attributes())
 	} else if pod := g.enricher.peerPod(g.ctx); pod != nil {
 		// No ID anywhere for these points: the opt-in peer-IP fallback still
 		// attributes them to the pushing pod.
@@ -183,29 +199,12 @@ func (g *metricGrouper) resource(id string) pmetric.ResourceMetrics {
 	return rm
 }
 
-// mergeEnrichment adds the k8s attributes for id to dst, never overwriting.
-func (g *metricGrouper) mergeEnrichment(id string, dst pcommon.Map) {
-	built, ok := g.enrichCache[id]
-	if !ok {
-		built = pcommon.NewMap()
-		if pod, container := g.enricher.lookupByID(g.ctx, id); pod != nil {
-			r := pcommon.NewResource()
-			actx := attrs.Context{Pod: pod, Container: container}
-			if g.enricher.cfg.NodeInfo != nil {
-				actx.Node = g.enricher.cfg.NodeInfo()
-			}
-			g.enricher.cfg.Attrs.Build(r, actx)
-			r.Attributes().CopyTo(built)
-			obs.Ingested.WithLabelValues("enriched").Inc()
-		} else {
-			obs.Ingested.WithLabelValues("unresolved").Inc()
-		}
-		g.enrichCache[id] = built
+// stripIDAttrs removes the configured container-ID/pod-UID attribute keys.
+func (g *metricGrouper) stripIDAttrs(a pcommon.Map) {
+	for _, k := range g.enricher.containerIDKeys {
+		a.Remove(k)
 	}
-	built.Range(func(k string, v pcommon.Value) bool {
-		if _, exists := dst.Get(k); !exists {
-			v.CopyTo(dst.PutEmpty(k))
-		}
-		return true
-	})
+	for _, k := range g.enricher.podUIDKeys {
+		a.Remove(k)
+	}
 }

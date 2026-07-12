@@ -63,11 +63,11 @@ func BenchmarkDynamicAddAttrs(b *testing.B) {
 		"level": "info", "http_status": "200", "method": "GET", "latency_ms": "42.5",
 	}
 	lookup := func(k string) string { return attrs[k] }
-	values := func(k string) float64 {
+	values := func(k string) (float64, bool) {
 		if k == "latency_ms" {
-			return 42.5
+			return 42.5, true
 		}
-		return 0
+		return 0, false
 	}
 	line := `GET /api/v1/orders 200 42.5ms`
 	b.ReportAllocs()

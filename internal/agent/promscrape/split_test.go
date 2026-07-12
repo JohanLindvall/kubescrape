@@ -387,6 +387,77 @@ func TestSplitterAttributesDontOverride(t *testing.T) {
 	t.Fatal("pod1 resource not produced")
 }
 
+// Two rules with equal-cardinality groupBy sets must not merge objects whose
+// label VALUES collide: kube_pod_info{pod="worker-1"} and
+// kube_node_info{node="worker-1"} describe different objects.
+func TestSplitterRuleIdentityInResourceKey(t *testing.T) {
+	body := `# TYPE kube_pod_info gauge
+kube_pod_info{pod="worker-1"} 1
+# TYPE kube_node_info gauge
+kube_node_info{node="worker-1"} 1
+`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(body))
+	}))
+	defer srv.Close()
+
+	target := testTarget(srv.URL)
+	target.Pod.Name = "ksm-abc"
+	target.Pod.Labels = map[string]string{"app.kubernetes.io/name": "kube-state-metrics"}
+	sp, err := NewSplitters([]SplitterConfig{{
+		Match: SplitterMatch{PodLabels: map[string]string{"app.kubernetes.io/name": "kube-state-metrics"}},
+		Rules: []SplitRule{
+			{
+				Metrics:             `kube_pod_info`,
+				GroupBy:             map[string]string{"pod": "k8s.pod.name"},
+				DatapointAttributes: &[]string{},
+			},
+			{
+				Metrics:             `kube_node_info`,
+				GroupBy:             map[string]string{"node": "k8s.node.name"},
+				DatapointAttributes: &[]string{},
+			},
+		},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	exp := &captureExporter{}
+	s := New(Config{
+		Node: "node1", Interval: time.Hour, Timeout: 5 * time.Second,
+		Targets: staticTargets{target}, Exporter: exp, StartTime: time.Now(),
+		Splitters: sp, Kubelet: KubeletConfig{Meta: &fakeMetaSource{}},
+	})
+	if _, err := s.scrapeTarget(context.Background(), target); err != nil {
+		t.Fatal(err)
+	}
+
+	rms := exp.batches[0].ResourceMetrics()
+	if rms.Len() != 2 {
+		t.Fatalf("got %d resources, want 2 (rules must not merge on value collision)", rms.Len())
+	}
+	var sawPod, sawNode bool
+	for i := 0; i < rms.Len(); i++ {
+		rm := rms.At(i)
+		names := metricNames(rm)
+		switch {
+		case attrStr(rm.Resource(), "k8s.pod.name") == "worker-1":
+			sawPod = true
+			if len(names) != 1 || names[0] != "kube_pod_info" {
+				t.Errorf("pod resource metrics = %v", names)
+			}
+		case attrStr(rm.Resource(), "k8s.node.name") == "worker-1":
+			sawNode = true
+			if len(names) != 1 || names[0] != "kube_node_info" {
+				t.Errorf("node resource metrics = %v", names)
+			}
+		}
+	}
+	if !sawPod || !sawNode {
+		t.Fatalf("missing split resources: pod=%v node=%v", sawPod, sawNode)
+	}
+}
+
 func TestSplitterMatch(t *testing.T) {
 	sp, err := NewSplitters([]SplitterConfig{{
 		Match: SplitterMatch{Namespace: "monitoring", PodName: "ksm-.+"},

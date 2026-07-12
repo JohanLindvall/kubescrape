@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/pmetric"
 
 	"github.com/JohanLindvall/kubescrape/internal/agent/attrs"
@@ -248,6 +249,45 @@ rpc_count 2000
 	if sdp.QuantileValues().Len() != 2 || sdp.QuantileValues().At(1).Quantile() != 0.99 ||
 		sdp.QuantileValues().At(1).Value() != 3.2 {
 		t.Errorf("quantiles = %+v", sdp.QuantileValues())
+	}
+}
+
+// A summary-typed sample without a quantile label must be counted as
+// malformed, not emitted as a gauge under the family name — the gauge would
+// claim the name and silently block the family's real Summary metric.
+func TestSummaryWithoutQuantileCountedMalformed(t *testing.T) {
+	body := `# TYPE rpc summary
+rpc 5
+rpc{quantile="0.5"} 1.1
+rpc_sum 8000
+rpc_count 2000
+`
+	bt := newBatcher(func(pcommon.Resource) {}, 1<<30, time.Unix(1, 0), time.Unix(2, 0))
+	conv := newConverter(bt)
+	p := NewParser(1<<20, false, false)
+	malformed, err := p.Parse(strings.NewReader(body), func(s Sample) error {
+		conv.add(s)
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	conv.finish()
+	if malformed != 0 || conv.malformed != 1 {
+		t.Fatalf("parser malformed = %d, converter malformed = %d, want 0 and 1", malformed, conv.malformed)
+	}
+
+	metrics := bt.take().ResourceMetrics().At(0).ScopeMetrics().At(0).Metrics()
+	if metrics.Len() != 1 {
+		t.Fatalf("got %d metrics, want only the summary", metrics.Len())
+	}
+	m := metrics.At(0)
+	if m.Name() != "rpc" || m.Type() != pmetric.MetricTypeSummary {
+		t.Fatalf("metric = %s %v, want rpc Summary", m.Name(), m.Type())
+	}
+	dp := m.Summary().DataPoints().At(0)
+	if dp.Count() != 2000 || dp.Sum() != 8000 || dp.QuantileValues().Len() != 1 {
+		t.Fatalf("summary dp = count %d sum %v quantiles %d", dp.Count(), dp.Sum(), dp.QuantileValues().Len())
 	}
 }
 

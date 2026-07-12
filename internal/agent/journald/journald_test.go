@@ -4,13 +4,16 @@ import (
 	"context"
 	"fmt"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"go.opentelemetry.io/collector/pdata/plog"
 
 	"github.com/JohanLindvall/kubescrape/internal/agent/logattrs"
+	"github.com/JohanLindvall/kubescrape/internal/agent/otlpexport"
 	"github.com/JohanLindvall/kubescrape/internal/agent/positions"
 )
 
@@ -177,7 +180,7 @@ func TestJournalCursorResume(t *testing.T) {
 		mkEntry("c02", "a.service", "three", "6"),
 	}
 	posPath := filepath.Join(t.TempDir(), "positions.json")
-	pos := positions.Open(posPath)
+	pos, _ := positions.Open(posPath)
 
 	exp, cancel := startReader(t, Config{Positions: pos}, entries, false, 0)
 	waitFor(t, "first run's 3 records", func() bool { return len(exp.records()) == 3 })
@@ -185,7 +188,7 @@ func TestJournalCursorResume(t *testing.T) {
 	cancel()
 
 	// A fresh reader resumes past the committed cursor: nothing re-emitted.
-	exp2, _ := startReader(t, Config{Positions: positions.Open(posPath)}, entries, false, 0)
+	exp2, _ := startReader(t, Config{Positions: mustOpenPositions(t, posPath)}, entries, false, 0)
 	time.Sleep(150 * time.Millisecond)
 	if got := exp2.records(); len(got) != 0 {
 		t.Fatalf("resumed run re-emitted %v", got)
@@ -200,7 +203,7 @@ func TestJournalExportFailureRereads(t *testing.T) {
 	// One injected export failure: the uncommitted batch is re-read after the
 	// reader restarts (no cursor committed), so both entries arrive.
 	exp, _ := startReader(t, Config{
-		Positions: positions.Open(filepath.Join(t.TempDir(), "positions.json")),
+		Positions: mustOpenPositions(t, filepath.Join(t.TempDir(), "positions.json")),
 	}, entries, false, 1)
 
 	waitFor(t, "re-read records", func() bool { return len(exp.records()) == 2 })
@@ -214,7 +217,7 @@ func TestJournalRestartAfterExit(t *testing.T) {
 	// the committed cursor) does not duplicate.
 	entries := []rawEntry{mkEntry("c0", "a.service", "only", "4")}
 	exp, _ := startReader(t, Config{
-		Positions: positions.Open(filepath.Join(t.TempDir(), "positions.json")),
+		Positions: mustOpenPositions(t, filepath.Join(t.TempDir(), "positions.json")),
 	}, entries, true, 0)
 
 	waitFor(t, "one record", func() bool { return len(exp.records()) == 1 })
@@ -279,6 +282,112 @@ func TestJournalLogAttrs(t *testing.T) {
 	}
 }
 
+// permanentExporter rejects the first n batches with a permanent (4xx)
+// collector error, delivering afterwards.
+type permanentExporter struct {
+	captureExporter
+	rejections int
+}
+
+func (p *permanentExporter) ExportLogs(ctx context.Context, ld plog.Logs) error {
+	p.mu.Lock()
+	if p.rejections > 0 {
+		p.rejections--
+		p.mu.Unlock()
+		return &otlpexport.HTTPStatusError{Code: 400, Body: "bad payload"}
+	}
+	p.mu.Unlock()
+	return p.captureExporter.ExportLogs(ctx, ld)
+}
+
+// A permanently rejected batch is dropped and the cursor committed past it —
+// no infinite reopen-and-reread loop on a poison batch.
+func TestJournalPermanentRejectionSkips(t *testing.T) {
+	entries := []rawEntry{
+		mkEntry("c00", "a.service", "poison", "6"),
+	}
+	posPath := filepath.Join(t.TempDir(), "positions.json")
+	pos, _ := positions.Open(posPath)
+
+	exp := &permanentExporter{rejections: 1}
+	cfg := Config{Positions: pos, Exporter: exp, FlushInterval: 20 * time.Millisecond, RestartBackoff: 10 * time.Millisecond}
+	r := New(cfg)
+	r.open = fakeOpener(entries, false)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { defer close(done); r.Run(ctx) }()
+	t.Cleanup(func() { cancel(); <-done })
+
+	// The cursor advances past the dropped batch and nothing is re-emitted.
+	waitFor(t, "cursor committed past the poison batch", func() bool { return pos.JournalCursor() == "c00" })
+	time.Sleep(100 * time.Millisecond)
+	if got := exp.records(); len(got) != 0 {
+		t.Fatalf("dropped batch re-emitted: %v", got)
+	}
+}
+
+// Batches flush before their summed bodies exceed MaxBatchBytes, so one
+// exported payload never blows the collector's request cap.
+func TestJournalBatchByteCap(t *testing.T) {
+	big := strings.Repeat("x", 400)
+	entries := []rawEntry{
+		mkEntry("c00", "a.service", big, "6"),
+		mkEntry("c01", "a.service", big, "6"),
+		mkEntry("c02", "a.service", big, "6"),
+	}
+	exp, _ := startReader(t, Config{MaxBatchBytes: 1000, BatchSize: 100}, entries, false, 0)
+	waitFor(t, "3 records", func() bool { return len(exp.records()) == 3 })
+
+	exp.mu.Lock()
+	defer exp.mu.Unlock()
+	for _, ld := range exp.batches {
+		bytes := 0
+		for i := 0; i < ld.ResourceLogs().Len(); i++ {
+			rl := ld.ResourceLogs().At(i)
+			for j := 0; j < rl.ScopeLogs().Len(); j++ {
+				lrs := rl.ScopeLogs().At(j).LogRecords()
+				for k := 0; k < lrs.Len(); k++ {
+					bytes += len(lrs.At(k).Body().Str())
+				}
+			}
+		}
+		if bytes > 1000 {
+			t.Errorf("batch bodies = %d bytes, over the 1000-byte cap", bytes)
+		}
+	}
+	if len(exp.batches) < 2 {
+		t.Errorf("batches = %d, want the byte cap to split them", len(exp.batches))
+	}
+}
+
+// Bodies are exported as valid UTF-8 and the entry cap never splits a rune.
+func TestJournalSanitizesBodies(t *testing.T) {
+	entries := []rawEntry{
+		mkEntry("c00", "a.service", "bad \xff bytes", "6"),
+		mkEntry("c01", "a.service", "smiles ☺☺☺☺", "6"), // truncation lands mid-rune
+	}
+	exp, _ := startReader(t, Config{MaxEntryBytes: 12}, entries, false, 0)
+	waitFor(t, "2 records", func() bool { return len(exp.records()) == 2 })
+
+	got := exp.records()
+	if got[0] != "bad � byte" { // sanitized, then capped at 12 bytes
+		t.Errorf("body = %q, want the invalid byte replaced", got[0])
+	}
+	for i, body := range got {
+		if !utf8.ValidString(body) {
+			t.Errorf("body %d = %q is not valid UTF-8", i, body)
+		}
+		if len(body) > 12 {
+			t.Errorf("body %d = %q exceeds MaxEntryBytes", i, body)
+		}
+	}
+	// "smiles " is 7 bytes; each ☺ is 3 — the 12-byte cap falls mid-rune and
+	// must back off to 10 bytes.
+	if got[1] != "smiles ☺" {
+		t.Errorf("body = %q, want rune-safe truncation", got[1])
+	}
+}
+
 func TestSeverityMapping(t *testing.T) {
 	cases := []struct {
 		priority string
@@ -303,4 +412,13 @@ func TestSeverityMapping(t *testing.T) {
 			t.Errorf("severity(%q) = %v,%q want %v,%q", c.priority, num, text, c.num, c.text)
 		}
 	}
+}
+
+func mustOpenPositions(t *testing.T, path string) *positions.Store {
+	t.Helper()
+	s, err := positions.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return s
 }

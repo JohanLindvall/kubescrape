@@ -1,6 +1,7 @@
 package promscrape
 
 import (
+	"context"
 	"fmt"
 	"strings"
 	"testing"
@@ -31,6 +32,133 @@ func k8sScrapeBody(series int) string {
 		fmt.Fprintf(&sb, "http_request_duration_seconds_count{namespace=\"prod-payments\",pod=\"payments-6f7b9c%03d\",handler=\"/api\"} 120\n", i%40)
 	}
 	return sb.String()
+}
+
+// ksmSplitBody synthesizes a kube-state-metrics style exposition: family-major
+// order, several rows per object for the phase-style families.
+func ksmSplitBody(pods int) string {
+	var sb strings.Builder
+	sb.WriteString("# TYPE kube_pod_info gauge\n")
+	for i := 0; i < pods; i++ {
+		fmt.Fprintf(&sb, "kube_pod_info{namespace=\"prod-payments\",pod=\"payments-6f7b9c%03d\",uid=\"0a1b2c3d-1111-2222-3333-4444555%05d\",node=\"node9\"} 1\n", i, i)
+	}
+	sb.WriteString("# TYPE kube_pod_status_phase gauge\n")
+	for i := 0; i < pods; i++ {
+		for _, phase := range []string{"Pending", "Running", "Succeeded", "Failed", "Unknown"} {
+			fmt.Fprintf(&sb, "kube_pod_status_phase{namespace=\"prod-payments\",pod=\"payments-6f7b9c%03d\",uid=\"0a1b2c3d-1111-2222-3333-4444555%05d\",phase=\"%s\"} 0\n", i, i, phase)
+		}
+	}
+	return sb.String()
+}
+
+// BenchmarkSplitConvert measures the splitter routing path: parse -> convert
+// -> per-object resources.
+func BenchmarkSplitConvert(b *testing.B) {
+	input := ksmSplitBody(200)
+	sp, err := NewSplitters([]SplitterConfig{{
+		Match: SplitterMatch{PodName: "ksm-.+"},
+		Rules: []SplitRule{{
+			Metrics: `kube_pod_.+`,
+			GroupBy: map[string]string{
+				"namespace": "k8s.namespace.name", "pod": "k8s.pod.name", "uid": "k8s.pod.uid",
+			},
+		}},
+	}})
+	if err != nil {
+		b.Fatal(err)
+	}
+	s := New(Config{
+		Node: "node1", Interval: time.Hour, Timeout: time.Second,
+		Targets: staticTargets{}, Exporter: &captureExporter{},
+		Splitters: sp, Kubelet: KubeletConfig{Meta: &fakeMetaSource{}},
+		StartTime: time.Unix(1, 0),
+	})
+	target := testTarget("http://ksm:8080/metrics")
+	target.Pod.Name = "ksm-abc"
+	var points int
+	b.SetBytes(int64(len(input)))
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		cb := newSplitBatcher(s, context.Background(), target, sp[0], time.Unix(2, 0))
+		conv := newConverter(cb)
+		p := getParser(1<<20, false, false)
+		_, err := p.parse(strings.NewReader(input), func(smp Sample) error {
+			conv.add(smp)
+			return nil
+		})
+		putParser(p)
+		if err != nil {
+			b.Fatal(err)
+		}
+		conv.finish()
+		points = cb.count()
+	}
+	if points == 0 {
+		b.Fatal("no points")
+	}
+}
+
+// cadvisorBenchBody synthesizes a cadvisor exposition: family-major order,
+// per-container rows with cgroup ids, plus a per-device family.
+func cadvisorBenchBody(containers int) string {
+	var sb strings.Builder
+	cg := func(i int) string {
+		return fmt.Sprintf("/kubepods/burstable/pod0a1b2c3d-1111-2222-3333-4444555%05d/d4f00c1e8a2b4c5d6e7f80912a3b4c5d6e7f80912a3b4c5d6e7f80912a3%05d", i, i)
+	}
+	sb.WriteString("# TYPE container_cpu_usage_seconds_total counter\n")
+	for i := 0; i < containers; i++ {
+		fmt.Fprintf(&sb, "container_cpu_usage_seconds_total{namespace=\"prod-payments\",pod=\"payments-6f7b9c%03d\",container=\"app\",id=\"%s\",image=\"img:1\"} 12.5\n", i, cg(i))
+	}
+	sb.WriteString("# TYPE container_fs_usage_bytes gauge\n")
+	for i := 0; i < containers; i++ {
+		for _, dev := range []string{"/dev/sda1", "/dev/sda2", "overlay"} {
+			fmt.Fprintf(&sb, "container_fs_usage_bytes{namespace=\"prod-payments\",pod=\"payments-6f7b9c%03d\",container=\"app\",id=\"%s\",device=\"%s\"} 4096\n", i, cg(i), dev)
+		}
+	}
+	return sb.String()
+}
+
+// BenchmarkCadvisorConvert measures the cadvisor routing path: parse ->
+// identity from the cgroup id -> per-pod/container resources.
+func BenchmarkCadvisorConvert(b *testing.B) {
+	input := cadvisorBenchBody(100)
+	for _, rollups := range []bool{true, false} {
+		name := "rollups"
+		if !rollups {
+			name = "norollups"
+		}
+		b.Run(name, func(b *testing.B) {
+			s := New(Config{
+				Node: "node1", Interval: time.Hour, Timeout: time.Second,
+				Targets: staticTargets{}, Exporter: &captureExporter{},
+				Kubelet:   KubeletConfig{Meta: &fakeMetaSource{}, DisableRollups: !rollups},
+				StartTime: time.Unix(1, 0),
+			})
+			var points int
+			b.SetBytes(int64(len(input)))
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				cb := newCadvisorBatcher(s, time.Unix(2, 0), context.Background())
+				conv := newConverter(cb)
+				p := getParser(1<<20, false, false)
+				_, err := p.parse(strings.NewReader(input), func(smp Sample) error {
+					conv.add(smp)
+					return nil
+				})
+				putParser(p)
+				if err != nil {
+					b.Fatal(err)
+				}
+				conv.finish()
+				points = cb.count()
+			}
+			if points == 0 {
+				b.Fatal("no points")
+			}
+		})
+	}
 }
 
 // BenchmarkConvertScrape measures the full parse -> filter -> convert -> OTLP

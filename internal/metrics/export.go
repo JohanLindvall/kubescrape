@@ -53,30 +53,40 @@ func (s *DynamicMetricSet) Export(ctx context.Context, exp Exporter, maxBytes in
 	byResource, order := s.groupByResource()
 
 	md := pmetric.NewMetrics()
-	flush := func(force bool) error {
+	size := 0 // accumulated payload size, tracked incrementally (O(n) not O(n^2))
+	flush := func() error {
 		if md.ResourceMetrics().Len() == 0 {
-			return nil
-		}
-		if !force && maxBytes > 0 && metricsMarshaler.MetricsSize(md) < maxBytes {
 			return nil
 		}
 		err := exp.ExportMetrics(ctx, md)
 		md.ResourceMetrics().RemoveIf(func(pmetric.ResourceMetrics) bool { return true })
+		size = 0
 		return err
 	}
 
+	scratch := pmetric.NewMetrics()
 	for _, resStr := range order {
-		rm := md.ResourceMetrics().AppendEmpty()
+		// Render into a scratch payload first so the chunk can be flushed
+		// BEFORE it would exceed maxBytes (previously every chunk overflowed
+		// the limit by up to one resource, and maxBytes == 0 exported one
+		// payload per resource instead of the documented single payload).
+		scratch.ResourceMetrics().RemoveIf(func(pmetric.ResourceMetrics) bool { return true })
+		rm := scratch.ResourceMetrics().AppendEmpty()
 		putLabels(rm.Resource().Attributes(), resStr)
 		scope := rm.ScopeMetrics().AppendEmpty()
 		for _, ss := range byResource[resStr] {
 			renderSeries(scope, ss.series, ss.samples, ts)
 		}
-		if err := flush(false); err != nil {
-			return err
+		rmSize := metricsMarshaler.MetricsSize(scratch)
+		if maxBytes > 0 && size > 0 && size+rmSize > maxBytes {
+			if err := flush(); err != nil {
+				return err
+			}
 		}
+		scratch.ResourceMetrics().MoveAndAppendTo(md.ResourceMetrics())
+		size += rmSize
 	}
-	return flush(true)
+	return flush()
 }
 
 // groupByResource snapshots each unique series and buckets its samples by the

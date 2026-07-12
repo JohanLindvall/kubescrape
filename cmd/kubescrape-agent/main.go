@@ -95,6 +95,7 @@ func run() error {
 		journaldUnits  = flag.String("journald-units", "", "comma-separated systemd units to read (empty reads everything)")
 		journaldEnrich = flag.Bool("journald-enrich", true, "parse per-message metadata into the OTLP record fields (as -logs-enrich); an explicit level in the message wins over the journal priority")
 		journaldBatch  = flag.Int("journald-batch-size", 1024, "flush journal entries after this many")
+		journaldBytes  = flag.Int("journald-max-batch-bytes", 1<<20, "flush journal entries before a batch's summed message bytes exceed this")
 		journaldFlush  = flag.Duration("journald-flush-interval", 2*time.Second, "flush journal entries at least this often")
 
 		scrapeInterval    = flag.Duration("scrape-interval", 30*time.Second, "Prometheus scrape interval")
@@ -140,6 +141,15 @@ func run() error {
 	if *nodeName == "" {
 		return fmt.Errorf("node name is required (set -node-name or $NODE_NAME)")
 	}
+	ingestMode := otlpingest.MetricsMode(*ingestMetrics)
+	switch ingestMode {
+	case otlpingest.MetricsResource, otlpingest.MetricsDatapoint, otlpingest.MetricsAuto:
+	default:
+		return fmt.Errorf("invalid -ingest-metrics-mode %q (want resource, datapoint or auto)", *ingestMetrics)
+	}
+	if *ingestOn && *ingestGRPC == "" && *ingestHTTP == "" {
+		return fmt.Errorf("-ingest is set but both -ingest-grpc-endpoint and -ingest-http-endpoint are empty")
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -169,7 +179,9 @@ func run() error {
 	// offsets and the journald cursor.
 	var posStore *positions.Store
 	if *positionsFile != "" {
-		posStore = positions.Open(*positionsFile)
+		if posStore, err = positions.Open(*positionsFile); err != nil {
+			return fmt.Errorf("positions file: %w", err)
+		}
 	}
 
 	// Optional log-line attribute lifting, shared by the tailer and journald.
@@ -180,8 +192,9 @@ func run() error {
 		}
 	}
 
-	// The metadata client's HTTP timeout must exceed the server-side wait.
-	meta := metaclient.New(*metadataURL, *metadataWait+10*time.Second)
+	// The metadata client's HTTP timeout must exceed the server-side wait —
+	// including the ingest lookups' own wait, which may be longer.
+	meta := metaclient.New(*metadataURL, max(*metadataWait, *ingestWait)+10*time.Second)
 
 	nodeInfo := startNodeInfo(ctx, meta, *nodeName, *nodeRefresh, log)
 
@@ -248,7 +261,11 @@ func run() error {
 		a.PutStr("service.name", "kubescrape-agent")
 		a.PutStr("k8s.node.name", *nodeName)
 		attrs.Identity(res)
-		go obs.Registry.Run(ctx, out, *selfMetricsIntv, res, log)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			obs.Registry.Run(ctx, out, *selfMetricsIntv, res, log)
+		}()
 		log.Info("self-metrics export started", "interval", *selfMetricsIntv)
 	}
 
@@ -324,6 +341,7 @@ func run() error {
 			Units:         splitList(*journaldUnits),
 			Positions:     posStore,
 			BatchSize:     *journaldBatch,
+			MaxBatchBytes: *journaldBytes,
 			FlushInterval: *journaldFlush,
 			MaxEntryBytes: *maxEntryBytes,
 			Enrich:        *journaldEnrich,
@@ -341,18 +359,16 @@ func run() error {
 		log.Info("journald reader started", "dir", *journaldDir, "units", *journaldUnits, "positions", *positionsFile)
 	}
 
+	// A fatal pipeline failure (currently only the ingest listener) is stored
+	// here and returned after shutdown so the agent exits non-zero; wg.Wait
+	// orders the write before the read.
+	var fatalErr error
 	if *ingestOn {
-		mode := otlpingest.MetricsMode(*ingestMetrics)
-		switch mode {
-		case otlpingest.MetricsResource, otlpingest.MetricsDatapoint, otlpingest.MetricsAuto:
-		default:
-			return fmt.Errorf("invalid -ingest-metrics-mode %q (want resource, datapoint or auto)", *ingestMetrics)
-		}
 		enr := otlpingest.NewEnricher(otlpingest.Config{
 			ContainerIDKeys: splitList(*ingestCidKeys),
 			PodUIDKeys:      splitList(*ingestUIDKeys),
 			Wait:            *ingestWait,
-			MetricsMode:     mode,
+			MetricsMode:     ingestMode,
 			EnrichLines:     *ingestEnrich,
 			PeerIPFallback:  *ingestPeerIP,
 			Attrs:           attrBuilders.Ingest,
@@ -371,13 +387,20 @@ func run() error {
 			}
 			ingestTraceOut = te
 		}
+		// The batcher stops on its own context, cancelled only after the
+		// ingest server has fully returned: a GracefulStop completing in-flight
+		// RPCs may still enqueue (and ack) payloads, which the batcher's final
+		// drain must see.
+		batchStop := func() {}
 		if *ingestBatch > 0 {
 			batcher := otlpingest.NewBatcher(ingestOut, ingestTraceOut,
 				otlpingest.BatchConfig{Items: *ingestBatch, Timeout: *ingestBatchTO}, log)
+			batchCtx, cancel := context.WithCancel(context.Background())
+			batchStop = cancel
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				batcher.Run(ctx)
+				batcher.Run(batchCtx)
 			}()
 			ingestOut = batcher
 			if ingestTraceOut != nil {
@@ -396,11 +419,14 @@ func run() error {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
+			defer batchStop() // server fully stopped: no more enqueues
 			if err := srv.Run(ctx); err != nil {
 				// A dead ingest listener (e.g. the port already bound) must not
 				// leave the agent looking healthy while apps push into a void:
-				// shut the agent down so the failure is visible (CrashLoop).
+				// shut the agent down and exit non-zero so the failure is
+				// visible (CrashLoop).
 				log.Error("otlp ingest server failed; shutting down", "error", err)
+				fatalErr = fmt.Errorf("otlp ingest server: %w", err)
 				stop()
 			}
 		}()
@@ -491,7 +517,7 @@ func run() error {
 			log.Warn("final log-metrics export failed", "error", err)
 		}
 	}
-	return nil
+	return fatalErr
 }
 
 // startNodeInfo provides the node's labels/annotations for attribute

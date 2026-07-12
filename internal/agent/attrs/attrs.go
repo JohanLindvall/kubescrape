@@ -144,7 +144,8 @@ func Identity(res pcommon.Resource) {
 // own self-scraped metrics (which share the same service.name / namespace).
 // Without it the two collide on (job, instance) with different resource
 // attributes, flapping target_info. Mirrors cmb-alloy's instance_prefix. A
-// resource with no service.instance.id gets the bare prefix. No-op for "".
+// resource with no service.instance.id is left alone — a bare prefix would
+// stamp every such resource with the same meaningless instance. No-op for "".
 func PrefixInstance(res pcommon.Resource, prefix string) {
 	if prefix == "" {
 		return
@@ -152,7 +153,5 @@ func PrefixInstance(res pcommon.Resource, prefix string) {
 	a := res.Attributes()
 	if v, ok := a.Get("service.instance.id"); ok {
 		a.PutStr("service.instance.id", prefix+"-"+v.AsString())
-	} else {
-		a.PutStr("service.instance.id", prefix)
 	}
 }

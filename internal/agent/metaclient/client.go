@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -41,9 +42,25 @@ type cacheEntry struct {
 // "http://kubescrape.monitoring"). The overall request timeout must exceed
 // the wait passed to Container.
 func New(base string, timeout time.Duration) *Client {
+	// A dedicated transport: DefaultTransport's MaxIdleConnsPerHost of 2
+	// forces most connections to close under the highly concurrent ingest
+	// enrichment load (everything goes to the one metadata-service host).
+	transport := &http.Transport{
+		Proxy: http.ProxyFromEnvironment,
+		DialContext: (&net.Dialer{
+			Timeout:   10 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          128,
+		MaxIdleConnsPerHost:   64,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+	}
 	return &Client{
 		base:  strings.TrimRight(base, "/"),
-		http:  &http.Client{Timeout: timeout},
+		http:  &http.Client{Timeout: timeout, Transport: transport},
 		now:   time.Now,
 		cache: make(map[string]cacheEntry),
 	}
@@ -148,10 +165,17 @@ func (c *Client) getJSON(ctx context.Context, u string, v any) error {
 
 	switch {
 	case resp.StatusCode == http.StatusNotModified && cached:
-		// Unchanged: extend the cached entry's freshness and serve it.
-		entry.expires = c.now().Add(maxAge(resp))
+		// Unchanged: extend the cached entry's freshness and serve it. Only
+		// refresh the entry that this request actually validated — a
+		// concurrent goroutine may have stored a newer 200 body under the
+		// same key while the lock was released, which must not be clobbered
+		// with the pre-request entry.
+		expires := c.now().Add(maxAge(resp))
 		c.mu.Lock()
-		c.cache[key] = entry
+		if cur, ok := c.cache[key]; ok && cur.etag == entry.etag {
+			cur.expires = expires
+			c.cache[key] = cur
+		}
 		c.mu.Unlock()
 		obs.MetadataRequests.WithLabelValues("not_modified").Inc()
 		return json.Unmarshal(entry.body, v)

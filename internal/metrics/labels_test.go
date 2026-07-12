@@ -21,13 +21,27 @@ func TestLabelsHashOrderIndependent(t *testing.T) {
 }
 
 func TestLabelsHashAccumFoldable(t *testing.T) {
-	// Folding a label in via XOR must equal hashing the full set — the property
-	// the histogram observe path relies on.
+	// Folding a label in via addition must equal hashing the full set — the
+	// property the histogram observe path relies on.
 	base := labels{{"a", "1"}, {"b", "2"}}
 	full := append(labels{}, base...).set("le", "0.5")
-	folded := base.hashAccum() ^ combineHash(xxhash.Sum64String("le"), xxhash.Sum64String("0.5"))
+	folded := base.hashAccum() + combineHash(xxhash.Sum64String("le"), xxhash.Sum64String("0.5"))
 	if mixHash(folded) != full.hash() {
-		t.Error("XOR-folded le label does not match full hash")
+		t.Error("sum-folded le label does not match full hash")
+	}
+}
+
+func TestLabelsHashNoDuplicateCancellation(t *testing.T) {
+	// The regression the sum fold fixes: with XOR, an identical key=value pair
+	// contributed from two sets (data-point labels and resource labels)
+	// cancelled out, making every user's series hash identical.
+	alice := labels{{"user", "alice"}}
+	bob := labels{{"user", "bob"}}
+	if alice.hashAccum()+alice.hashAccum() == bob.hashAccum()+bob.hashAccum() {
+		t.Error("duplicated pair still cancels: distinct users share a hash")
+	}
+	if alice.checkAccum() == bob.checkAccum() {
+		t.Error("check accumulators collide for distinct values")
 	}
 }
 

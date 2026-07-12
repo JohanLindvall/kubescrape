@@ -2,6 +2,8 @@ package metrics
 
 import (
 	"context"
+	"log/slog"
+	"math"
 	"testing"
 	"time"
 )
@@ -321,5 +323,24 @@ func TestResourceLabelsLiftedToResource(t *testing.T) {
 	}
 	if _, ok := ra["status"]; ok {
 		t.Error("status (data-point label) leaked onto the resource")
+	}
+}
+
+// TestStddevLargeMagnitude pins Welford's numerical stability: the naive
+// E[x²]−E[x]² form catastrophically cancelled for large values with small
+// spread and reported 0.
+func TestStddevLargeMagnitude(t *testing.T) {
+	s := newSeries(seriesSpec{name: "m", kind: kindGauge, action: actionStddev, log: slog.Default()})
+	for _, v := range []float64{1e9, 1e9 + 1, 1e9 + 2} {
+		s.observe(labels{{"k", "v"}}, v, resKey{}, emptyResource, nil)
+	}
+	samps := s.snapshot()
+	if len(samps) != 1 {
+		t.Fatalf("samples: %d", len(samps))
+	}
+	got := s.aggregateValue(&samps[0])
+	want := 0.816496580927726 // population stddev of {0,1,2}
+	if math.Abs(got-want) > 1e-9 {
+		t.Fatalf("stddev = %v, want %v", got, want)
 	}
 }

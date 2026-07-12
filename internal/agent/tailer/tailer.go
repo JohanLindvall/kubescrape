@@ -864,7 +864,8 @@ func (t *Tailer) feedLine(ctx context.Context, f *file, raw string, start, end i
 		return
 	}
 	st := f.stPlain // non-CRI passthrough
-	if l, ok := cri.Parse(raw); ok {
+	l, ok := cri.Parse(raw)
+	if ok {
 		switch l.Stream {
 		case "stdout":
 			st = f.stStdout
@@ -879,7 +880,8 @@ func (t *Tailer) feedLine(ctx context.Context, f *file, raw string, start, end i
 		st.runStart = start
 		st.hasRun = true
 	}
-	if err := f.criStage.Add(ctx, f.containerID, raw, start); err != nil {
+	// AddParsed reuses this parse — the only one on the whole line's path.
+	if err := f.criStage.AddParsed(ctx, f.containerID, raw, l, ok, start); err != nil {
 		t.log.Warn("log pipeline", "path", f.path, "error", err)
 	}
 }

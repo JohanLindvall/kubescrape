@@ -1,3 +1,4 @@
 /bin/
 /hack/bin/
 *.test
+kubescrape-agent

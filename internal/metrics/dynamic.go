@@ -425,6 +425,14 @@ func compileRule(d *Dynamic, cfg *setConfig, shared map[string]*series) (*metric
 	}
 
 	name := cfg.namePrefix + d.Name
+	if name == "" {
+		return nil, fmt.Errorf("metric rule has no name")
+	}
+	if kind == kindHistogram {
+		if cap := cardinalityCap(d.MaxCardinality); cap < len(d.Buckets)+1 {
+			return nil, fmt.Errorf("metric %q: maxCardinality %d is below the histogram's %d bucket streams — nothing could ever be admitted", d.Name, cap, len(d.Buckets)+1)
+		}
+	}
 	if existing, ok := shared[name]; ok {
 		if existing.kind != kind || existing.action != action {
 			return nil, fmt.Errorf("metric %q declared with conflicting type/action", d.Name)

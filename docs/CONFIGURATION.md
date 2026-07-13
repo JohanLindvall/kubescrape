@@ -191,6 +191,7 @@ pipeline; syslog priorities map to OTLP severities; `syslog.identifier` and
 | `-journald-dir` | — | read a specific journal directory; empty opens the default system journal (set to `/run/log/journal` for volatile journals) |
 | `-journald-units` | — | comma-separated units (matched on `_SYSTEMD_UNIT`); empty reads everything |
 | `-journald-batch-size` | `1024` | flush after this many entries |
+| `-journald-max-batch-bytes` | `1048576` | flush before a batch's summed message bytes exceed this |
 | `-journald-flush-interval` | `2s` | flush at least this often |
 | `-journald-enrich` | `true` | per-message enrichment as `-logs-enrich`; an explicit level in the message wins over the journal priority |
 
@@ -339,7 +340,7 @@ logMetrics:
         - env=prod                  # literal value
       resourceLabels:               # → resource attributes (same DSL)
         - tenant=$tenant
-      maxCardinality: 5000          # cap on unique label sets (hard cap 10000)
+      maxCardinality: 5000          # cap on unique label sets (unset = default 10000, also the hard cap)
       maxAge: 1h                    # expire idle series (default/cap 24h)
       labelPrefix: ""               # optional prefix on every label name
     - name: request_duration_seconds
@@ -406,7 +407,8 @@ never overwrites an attribute the sender set.
 | `-ingest-logs-enrich` | `true` | parse pushed log bodies as `-logs-enrich`, filling only fields the sender left unset |
 | `-ingest-traces` | `true` | accept pushed traces (gRPC + `/v1/traces`), enrich their resources the same way, and pass them through (traces bypass the disk buffer — the pushing sender owns retry) |
 | `-ingest-peer-ip-fallback` | `false` | attribute telemetry whose resource carries **no** container id / pod uid to the pod owning the connection's peer IP (`GET /v1/pod-ips/{ip}`, live non-hostNetwork pods only). Opt-in: NAT can rewrite peer addresses, and hostNetwork senders share the node IP and never resolve. Counted as `kubescrape_otlp_ingested_total{outcome="peer_ip"}` |
-| `-ingest-batch-items` | `0` | coalesce pushed payloads per signal to this many items (log records / data points / spans) before forwarding, flushing partial batches after `-ingest-batch-timeout` (200ms). `0` forwards each request as received. Enqueueing acknowledges the sender (collector batch-processor semantics) — pair with `-buffer-dir` for at-least-once delivery of coalesced batches; a full queue back-pressures senders with a retryable error |
+| `-ingest-batch-items` | `0` | coalesce pushed payloads per signal to this many items (log records / data points / spans) before forwarding, flushing partial batches after `-ingest-batch-timeout` (200ms) or before the encoded payload exceeds `-ingest-batch-bytes` (3 MiB). `0` forwards each request as received. Enqueueing acknowledges the sender (collector batch-processor semantics) — pair with `-buffer-dir` for at-least-once delivery of coalesced batches (note: traces are never disk-buffered, so batching trades the sender's own retry for best-effort delivery of acked spans); a full queue back-pressures senders with a retryable error |
+| `-ingest-batch-bytes` | `3145728` | flush a coalescing batch before its encoded size would exceed this (keeps merged payloads under the collector's 4 MiB gRPC recv default) |
 | `-ingest-container-id-keys` | `container.id,k8s.container.id` | attribute keys inspected for a container ID |
 | `-ingest-pod-uid-keys` | `k8s.pod.uid` | attribute keys inspected for a pod UID |
 | `-ingest-metadata-wait` | `0` | how long a lookup may block for a not-yet-known object |

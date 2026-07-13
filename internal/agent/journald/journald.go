@@ -247,7 +247,9 @@ func (r *Reader) stream(ctx context.Context) error {
 			}
 			body := r.sanitize(e.fields["MESSAGE"])
 			// Flush BEFORE the entry that would push the batch over the byte
-			// cap, so one exported payload never exceeds it.
+			// cap. A single entry already over the cap still exports alone
+			// (entries are never split), so one payload can exceed it by up
+			// to MaxEntryBytes.
 			if len(r.batch) > 0 && r.batchBytes+len(body) > r.cfg.MaxBatchBytes {
 				if err := r.flush(ctx); err != nil {
 					return err

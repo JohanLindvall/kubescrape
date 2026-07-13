@@ -8,6 +8,7 @@ import (
 	"hash/fnv"
 	"log/slog"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -264,9 +265,20 @@ func (s *Server) handleNodeTargets(w http.ResponseWriter, r *http.Request) {
 		monitored = s.monitoredServices()
 	}
 	for _, np := range pods {
+		if !scrape.Scrapeable(np.Pod) {
+			continue // finished/deleted pods can never yield targets
+		}
 		// Cheap pre-check before the (per-pod) enrichment work: does the pod
 		// or any service selecting it opt into scraping?
 		matched := s.services.Matching(np.Pod.Namespace, np.Pod.Labels)
+		// Map iteration order in the services index must not decide which
+		// Service a URL-deduped target is attributed to.
+		sort.Slice(matched, func(i, j int) bool {
+			if matched[i].Namespace != matched[j].Namespace {
+				return matched[i].Namespace < matched[j].Namespace
+			}
+			return matched[i].Name < matched[j].Name
+		})
 		podAnnotated := np.Pod.Annotations[scrape.AnnotationScrape] == "true"
 		svcAnnotated := false
 		for _, svc := range matched {
@@ -365,6 +377,11 @@ func (s *Server) waitBudget(r *http.Request) (time.Duration, error) {
 		secs, ierr := strconv.Atoi(v)
 		if ierr != nil {
 			return 0, fmt.Errorf("invalid wait parameter %q: use a duration like 2s", v)
+		}
+		// Clamp before multiplying: a huge value would overflow the Duration
+		// arithmetic before the range checks below could see it.
+		if maxSecs := int(s.maxWait / time.Second); secs > maxSecs {
+			secs = maxSecs
 		}
 		d = time.Duration(secs) * time.Second
 	}

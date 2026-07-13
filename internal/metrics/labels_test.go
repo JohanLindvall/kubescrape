@@ -1,9 +1,11 @@
 package metrics
 
 import (
+	"log/slog"
 	"testing"
 
 	"github.com/cespare/xxhash/v2"
+	"go.opentelemetry.io/collector/pdata/pcommon"
 )
 
 func TestLabelsHashOrderIndependent(t *testing.T) {
@@ -80,5 +82,30 @@ func TestLabelsParseUnparseRoundTrip(t *testing.T) {
 	}
 	if v, _ := back.get("b"); v != "line\nbreak" {
 		t.Errorf("round-trip b = %q", v)
+	}
+}
+
+// TestResourceLabelOverrideKeysMergedIdentity pins resLabelsAccum: a resource
+// label overriding a resource attribute must hash like the merged set that
+// resourceString serializes, so {svc:foo}+override svc=bar and a plain
+// {svc:bar} are ONE series, not two samples with identical serialized
+// identity (duplicate data points in one payload).
+func TestResourceLabelOverrideKeysMergedIdentity(t *testing.T) {
+	resFoo := pcommon.NewMap()
+	resFoo.PutStr("svc", "foo")
+	resBar := pcommon.NewMap()
+	resBar.PutStr("svc", "bar")
+
+	s := newSeries(seriesSpec{name: "m", kind: kindCounter, action: actionSet, log: slog.Default()})
+	s.observe(nil, 1, resourceAccum(resFoo), resFoo, labels{{"svc", "bar"}})
+	s.observe(nil, 1, resourceAccum(resBar), resBar, nil)
+
+	if got := len(s.db); got != 1 {
+		t.Fatalf("distinct samples: %d, want 1 (override must key as the merged set)", got)
+	}
+	for _, samp := range s.db {
+		if samp.value != 2 {
+			t.Fatalf("merged value: %v, want 2", samp.value)
+		}
 	}
 }

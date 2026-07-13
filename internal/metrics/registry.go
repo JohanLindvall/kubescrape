@@ -156,8 +156,10 @@ type vec[W any] struct {
 // vecKey builds a collision-proof cache key: values are length-prefixed, so a
 // value containing the old separator byte cannot alias another tuple (e.g.
 // ("x\x00y","z") vs ("x","y\x00z")). The single-value case stays alloc-free.
-func vecKey(vals []string) string {
-	if len(vals) == 1 {
+func vecKey(keys, vals []string) string {
+	if len(vals) == 1 && len(keys) == 1 {
+		// Only when the vec itself is single-label: a 1-value call against a
+		// multi-label vec must not alias a netstring-encoded tuple.
 		return vals[0]
 	}
 	var sb strings.Builder
@@ -170,7 +172,7 @@ func vecKey(vals []string) string {
 }
 
 func (v *vec[W]) with(vals []string) *W {
-	key := vecKey(vals)
+	key := vecKey(v.keys, vals)
 	v.mu.Lock()
 	w, ok := v.cache[key]
 	if !ok {

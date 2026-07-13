@@ -297,6 +297,13 @@ func (s *Spool) rollbackTail(tail *segment) {
 func (s *Spool) Pop() (data []byte, commit func(), ok bool, err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	// Retire fully-consumed head segments up front. commit's retire loop
+	// rightly never removes the write tail — but when the consumer was fully
+	// caught up (readOff == tail size, the healthy steady state) and an
+	// Append then rotated to a new segment, no commit ever runs again against
+	// the old head, so without this the queue would report empty forever
+	// while the backlog grows. Also heals such wedged spools loaded from disk.
+	s.retireConsumedLocked()
 	head := &s.segs[0]
 	if s.readOff+frameHeader > head.size {
 		return nil, nil, false, nil
@@ -315,7 +322,15 @@ func (s *Spool) Pop() (data []byte, commit func(), ok bool, err error) {
 	}
 	n := int64(binary.BigEndian.Uint32(hdr[:]))
 	if s.readOff+frameHeader+n > head.size {
-		return nil, nil, false, nil // torn (only possible in the write tail)
+		if len(s.segs) > 1 {
+			// A middle segment's size is final, so an overshooting length
+			// prefix is corruption; the remaining frames are unreadable.
+			// Skip the segment (surfaced to the caller) rather than
+			// reporting an empty queue forever.
+			s.skipLostHead()
+			return nil, nil, false, fmt.Errorf("spool: corrupt frame length in segment %d: %w", head.seq, os.ErrNotExist)
+		}
+		return nil, nil, false, nil // torn write tail: wait for the append to finish
 	}
 	payload := make([]byte, n)
 	if _, err := f.ReadAt(payload, s.readOff+frameHeader); err != nil {
@@ -333,18 +348,25 @@ func (s *Spool) Pop() (data []byte, commit func(), ok bool, err error) {
 		}
 		done = true
 		s.readOff = end
-		// Retire fully-consumed segments (never the write tail).
-		for len(s.segs) > 1 && s.readOff >= s.segs[0].size {
-			if s.readSeq == s.segs[0].seq {
-				s.dropReadHandle()
-			}
-			_ = os.Remove(s.segs[0].path)
-			s.segs = s.segs[1:]
-			s.readOff = 0
-		}
+		s.retireConsumedLocked()
 		s.persistCursor()
 	}
 	return payload, commit, true, nil
+}
+
+// retireConsumedLocked removes fully-consumed head segments (never the write
+// tail); caller holds the lock and persists the cursor afterwards if it
+// matters for durability (Pop's opportunistic call relies on the next commit
+// for that).
+func (s *Spool) retireConsumedLocked() {
+	for len(s.segs) > 1 && s.readOff >= s.segs[0].size {
+		if s.readSeq == s.segs[0].seq {
+			s.dropReadHandle()
+		}
+		_ = os.Remove(s.segs[0].path)
+		s.segs = s.segs[1:]
+		s.readOff = 0
+	}
 }
 
 // readHandle returns a cached open handle for the head segment, reopening when
@@ -383,16 +405,22 @@ func (s *Spool) skipLostHead() {
 		return
 	}
 	// The single segment (also the write tail) is gone; start a fresh one.
+	// The old entry is dropped only once the replacement exists — leaving
+	// segs empty would panic every segs[0]/segs[len-1] access (Pop, Append's
+	// openTail, stale commits).
 	seq := s.segs[0].seq + 1
-	s.segs = s.segs[:0]
 	if s.w != nil {
 		_ = s.w.Close()
 		s.w = nil
 	}
-	s.readOff = 0
-	if err := s.appendSegment(seq); err == nil {
-		s.persistCursor()
+	old := s.segs
+	s.segs = s.segs[:0]
+	if err := s.appendSegment(seq); err != nil {
+		s.segs = old // keep the stale entry; reads keep erroring, but no panic
+		return
 	}
+	s.readOff = 0
+	s.persistCursor()
 }
 
 // Signal fires (non-blocking) after each Append so a consumer can wait for work

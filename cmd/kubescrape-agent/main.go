@@ -90,7 +90,7 @@ func run() error {
 		logsPoll          = flag.Duration("logs-poll-interval", 500*time.Millisecond, "fallback sweep interval for the log tailer")
 		logsFingerprint   = flag.Int("logs-fingerprint-bytes", 1024, "file-head hash length used with the inode as file identity (negative = inode only)")
 
-		journaldOn     = flag.Bool("journald", false, "tail the systemd journal via journalctl (the binary must exist in the image)")
+		journaldOn     = flag.Bool("journald", false, "read the systemd journal natively via libsystemd/sdjournal (the image must provide libsystemd)")
 		journaldDir    = flag.String("journald-dir", "", "read a specific journal directory; empty opens the default system journal")
 		journaldUnits  = flag.String("journald-units", "", "comma-separated systemd units to read (empty reads everything)")
 		journaldEnrich = flag.Bool("journald-enrich", true, "parse per-message metadata into the OTLP record fields (as -logs-enrich); an explicit level in the message wins over the journal priority")
@@ -135,6 +135,7 @@ func run() error {
 		ingestPeerIP  = flag.Bool("ingest-peer-ip-fallback", false, "attribute pushed telemetry whose resource carries no container id / pod uid to the pod owning the connection's peer IP (hostNetwork senders never resolve)")
 		ingestBatch   = flag.Int("ingest-batch-items", 0, "coalesce pushed payloads per signal to this many items (log records / data points / spans) before forwarding; 0 forwards each request as received")
 		ingestBatchTO = flag.Duration("ingest-batch-timeout", 200*time.Millisecond, "max time a partial ingest batch waits before flushing")
+		ingestBatchB  = flag.Int("ingest-batch-bytes", 3<<20, "flush a coalescing ingest batch before its encoded size would exceed this many bytes (keeps merged payloads under the collector's 4 MiB gRPC recv default)")
 	)
 	flag.Parse()
 
@@ -394,7 +395,7 @@ func run() error {
 		batchStop := func() {}
 		if *ingestBatch > 0 {
 			batcher := otlpingest.NewBatcher(ingestOut, ingestTraceOut,
-				otlpingest.BatchConfig{Items: *ingestBatch, Timeout: *ingestBatchTO}, log)
+				otlpingest.BatchConfig{Items: *ingestBatch, MaxBatchBytes: *ingestBatchB, Timeout: *ingestBatchTO}, log)
 			batchCtx, cancel := context.WithCancel(context.Background())
 			batchStop = cancel
 			wg.Add(1)
@@ -406,7 +407,7 @@ func run() error {
 			if ingestTraceOut != nil {
 				ingestTraceOut = batcher
 			}
-			log.Info("otlp ingest batching enabled", "items", *ingestBatch, "timeout", *ingestBatchTO)
+			log.Info("otlp ingest batching enabled", "items", *ingestBatch, "maxBytes", *ingestBatchB, "timeout", *ingestBatchTO)
 		}
 		srv := otlpingest.NewServer(otlpingest.ServerConfig{
 			GRPCAddr: *ingestGRPC,

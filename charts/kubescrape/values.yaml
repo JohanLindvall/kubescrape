@@ -88,6 +88,10 @@ agent:
     # at-least-once delivery of coalesced batches.
     batchItems: 0
     batchTimeout: 200ms
+    # Flush a coalescing batch before its encoded size would exceed this many
+    # bytes (keeps merged payloads under the collector's 4 MiB gRPC recv
+    # default).
+    batchBytes: 3145728 # 3 MiB
     containerIdKeys: []         # default: [container.id, k8s.container.id]
     podUidKeys: []              # default: [k8s.pod.uid]
 

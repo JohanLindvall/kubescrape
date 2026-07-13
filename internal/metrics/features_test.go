@@ -338,7 +338,7 @@ func TestStddevLargeMagnitude(t *testing.T) {
 	if len(samps) != 1 {
 		t.Fatalf("samples: %d", len(samps))
 	}
-	got := s.aggregateValue(&samps[0])
+	got := samps[0].value     // snapshot already aggregated the window
 	want := 0.816496580927726 // population stddev of {0,1,2}
 	if math.Abs(got-want) > 1e-9 {
 		t.Fatalf("stddev = %v, want %v", got, want)

@@ -163,6 +163,7 @@ type Tailer struct {
 	files          map[string]*file    // by path
 	batch          []entry
 	readBuf        []byte // reusable read scratch (single sweep goroutine)
+	warnedListing  bool   // a glob-failure warning was already emitted
 	lastFlush      time.Time
 	lastCheckpoint time.Time
 	retryBackoff   time.Duration // initial export retry backoff
@@ -367,7 +368,18 @@ type streamState struct {
 	lastEnd  int64
 	runStart int64
 	hasRun   bool
-	fifo     []logItem
+	// A multi-fragment run closed by its F line is not emitted until the
+	// stage sees the NEXT line for the key (or a flush), by which point
+	// feedLine has already advanced lastEnd past it. closed pins the run's
+	// own boundaries for that deferred emission; hasRun stays true meanwhile
+	// so the watermark keeps covering it. nextStart/hasNext hold the
+	// triggering line's registration, installed by the emission callback.
+	closed      bool
+	closedStart int64
+	closedEnd   int64
+	nextStart   int64
+	hasNext     bool
+	fifo        []logItem
 }
 
 // state returns the key's stream state, creating it on first use. The slice
@@ -402,6 +414,9 @@ func (l *ledger) reanchor() {
 	for _, st := range l.streams {
 		st.lastEnd = 0
 		st.runStart = 0
+		st.closedStart = 0
+		st.closedEnd = 0
+		st.nextStart = 0
 		for i := range st.fifo {
 			// Zero the offsets only: when must survive, or the fifo's
 			// orphan detection would mistake reanchored live items for
@@ -746,6 +761,15 @@ func parseFileName(name string) (containerID, namespace string, ok bool) {
 func (t *Tailer) scanDir(checkpoints map[string]checkpoint, initial bool) {
 	seen := make(map[string]struct{})
 	listingOK := true
+	defer func() {
+		if !listingOK && !t.warnedListing {
+			t.warnedListing = true
+			t.log.Warn("a source glob failed; gone-detection is disabled until listings succeed")
+		}
+		if listingOK {
+			t.warnedListing = false
+		}
+	}()
 	for _, src := range t.sources {
 		paths, ok := src.glob()
 		if !ok {
@@ -886,16 +910,32 @@ func (t *Tailer) newPipeline(f *file) {
 	if f.source.containerd {
 		f.criStage = cri.New(func(ctx context.Context, key, line string, when time.Time, start int64) error {
 			st := f.stateFor(key)
-			// start (threaded through cri as the entry data) is the first
-			// fragment's offset — but it predates a carried rotation, which
-			// reanchor cannot reach inside the cri stage. st.runStart is the
-			// same offset maintained on this side and correctly reanchored,
-			// so prefer it whenever a run is open.
-			if st.hasRun {
-				start = st.runStart
+			var end int64
+			if st.closed {
+				// Deferred emission of an F-closed run: its boundaries were
+				// pinned when the F line was fed (lastEnd has since moved on
+				// to the line that triggered this flush). Both offsets are
+				// ledger-side state, so a carried-rotation reanchor reaches
+				// them (the cri-threaded start predates it).
+				start, end = st.closedStart, st.closedEnd
+				st.closed = false
+				if st.hasNext {
+					// Hand coverage over to the line that triggered the
+					// flush; it is still buffered in the stage.
+					st.runStart, st.hasRun, st.hasNext = st.nextStart, true, false
+				} else {
+					st.hasRun = false
+				}
+			} else {
+				// Emission within the fed line's own AddParsed (single F,
+				// passthrough) or a flush of an unclosed run: runStart is the
+				// reanchor-aware first offset, lastEnd the newest line's end.
+				if st.hasRun {
+					start = st.runStart
+				}
+				st.hasRun = false
+				end = st.lastEnd
 			}
-			st.hasRun = false
-			end := st.lastEnd
 			if f.traces == nil {
 				t.emit(f, entry{time: when, stream: st.stream, body: line, start: start, offset: end})
 				return nil
@@ -950,10 +990,22 @@ func (t *Tailer) feedLine(ctx context.Context, f *file, raw string, start, end i
 			st = f.state(f.containerID + "/" + l.Stream)
 		}
 	}
+	wasOpen := st.hasRun && !st.closed
 	st.lastEnd = end
-	if !st.hasRun {
-		st.runStart = start
-		st.hasRun = true
+	if st.closed {
+		// The pending closed run flushes inside this AddParsed; its callback
+		// installs this line's registration afterwards (runStart must keep
+		// pointing at the older, watermark-clamping offset until then).
+		st.nextStart, st.hasNext = start, true
+	} else if !st.hasRun {
+		st.runStart, st.hasRun = start, true
+	}
+	if ok && !l.Partial && wasOpen {
+		// The F line closes an open multi-fragment run. The stage defers the
+		// emission to the next line fed for this key, so pin the run's own
+		// boundaries now — at callback time lastEnd already belongs to that
+		// next line.
+		st.closed, st.closedStart, st.closedEnd = true, st.runStart, end
 	}
 	// AddParsed reuses this parse — the only one on the whole line's path.
 	if err := f.criStage.AddParsed(ctx, f.containerID, raw, l, ok, start); err != nil {
@@ -1163,12 +1215,14 @@ func (t *Tailer) readArchive(ctx context.Context, f *file) error {
 		// re-decompressed end-to-end on every poll sweep, forever; skip while
 		// the compressed file itself is unchanged.
 		if f.archiveDone {
-			if st, err := os.Stat(f.path); err == nil &&
-				st.Size() == f.archiveSize && st.ModTime().Equal(f.archiveMod) {
-				return nil
+			st, err := os.Stat(f.path)
+			if err != nil || (st.Size() == f.archiveSize && st.ModTime().Equal(f.archiveMod)) {
+				return nil // unchanged (or momentarily unstattable): stay done
 			}
+			// Changed on disk: re-open and let openArchive's inode+fingerprint
+			// identity check decide whether committed must reset — a bare
+			// append or touch must not trigger a full duplicate re-ingest.
 			f.archiveDone = false
-			f.committed = 0 // content replaced; re-read from the start
 		}
 		if err := t.openArchive(f); err != nil {
 			return err
@@ -1256,20 +1310,30 @@ func (t *Tailer) drainArchive(ctx context.Context, f *file) {
 		return
 	}
 	buf := t.scratch()
-	for {
+	if len(f.pending) > 0 {
+		t.consume(ctx, f, true) // see drainFile: a paused file's pending would be lost
+	}
+	// Same circuit breaker as drainFile: an adversarial archive (a gzip bomb
+	// deleted mid-read) must not decompress without bound into memory.
+	const drainCap = 1 << 30
+	var drained int64
+	for drained < drainCap {
 		n, err := f.gz.Read(buf)
 		if n > 0 {
+			drained += int64(n)
 			obs.LogBytes.Add(float64(n))
 			f.pending = append(f.pending, buf[:n]...)
 			f.readPos += int64(n)
 			// Bypass the rate limit like drainFile: pausing would lose the
 			// remainder when the fd closes.
 			t.consume(ctx, f, true)
+			t.flushDuringDrain(ctx, f)
 		}
 		if err != nil {
 			return
 		}
 	}
+	t.log.Error("archive still yielding after draining 1GiB, abandoning remainder", "path", f.path)
 }
 
 // closeArchive releases the archive's readers.
@@ -1299,6 +1363,11 @@ func (t *Tailer) drainFile(ctx context.Context, f *file) {
 	// fd open and outruns us forever.
 	const drainCap = 1 << 30
 	buf := t.scratch()
+	if len(f.pending) > 0 {
+		// A rate-limit-paused file may hold already-read unconsumed lines;
+		// they would be discarded with pending when the fd drops.
+		t.consume(ctx, f, true)
+	}
 	var drained int64
 	for drained < drainCap {
 		n, err := f.f.Read(buf)
@@ -1309,12 +1378,22 @@ func (t *Tailer) drainFile(ctx context.Context, f *file) {
 			// Bypass the rate limit: pausing a drain would lose the rotated
 			// inode's remainder when the fd is dropped.
 			t.consume(ctx, f, true)
+			t.flushDuringDrain(ctx, f)
 		}
 		if err != nil {
 			return
 		}
 	}
 	t.log.Error("rotated file still growing after draining 1GiB, abandoning remainder", "path", f.path)
+}
+
+// flushDuringDrain keeps a large drain from accumulating everything into one
+// batch (and one OTLP payload, likely over the collector's receive limit) and
+// from starving the sweep for the drain's whole duration.
+func (t *Tailer) flushDuringDrain(ctx context.Context, f *file) {
+	if len(t.batch) >= t.cfg.BatchSize {
+		t.flush(ctx)
+	}
 }
 
 // consume splits pending bytes into physical lines and feeds the pipeline.
@@ -1457,6 +1536,16 @@ func (t *Tailer) reopen(ctx context.Context, f *file, renamed bool) {
 		t.stopPipeline(ctx, f)
 		t.newPipeline(f)
 		f.carried = nil
+		if renamed && f.readPos > f.committed {
+			// The drained range [committed, readPos) exists only as batch
+			// entries now; if their export fails (or the process crashes),
+			// the rotated-away file is the only copy. Record it so
+			// feedCarriedPrefix can re-read it — carriedFed stays true, so
+			// nothing is re-read unless a rewind/restart resets it; on a
+			// successful export the commit clears it.
+			f.carried = append(f.carried, rotatedPrefix{inode: f.inode, fp: f.fp, from: f.committed, to: f.readPos})
+			f.carriedFed = true
+		}
 		// The entries stopPipeline just emitted carry old-content offsets; the
 		// new inode starts at 0, so those offsets must not drive its
 		// checkpoint. Bumping the generation makes flush's gen check discard
@@ -1469,6 +1558,11 @@ func (t *Tailer) reopen(ctx context.Context, f *file, renamed bool) {
 	f.readPos = 0
 	f.lineStart = 0
 	f.pending = f.pending[:0]
+	f.limited = false // pending is gone; a paused file must resume reading
+	// Re-derive the watch: the symlink may now point into a different
+	// directory (kept stale, events for the new target dir would be missed
+	// until the poll ticker.)
+	t.unwatchTarget(f)
 	f.dirty = true
 }
 
@@ -1857,11 +1951,14 @@ func (t *Tailer) exportWithRetry(ctx context.Context, ld plog.Logs) error {
 func (t *Tailer) rewind(f *file) {
 	if f.compressed {
 		// gzip is not seekable: close so openArchive re-decompresses from the
-		// committed offset next sweep.
+		// committed offset next sweep. archiveDone must reset with it — the
+		// rewound range needs re-reading even though the file is unchanged.
 		t.closeArchive(f)
+		f.archiveDone = false
 		f.readPos = f.committed
 		f.lineStart = f.committed
 		f.pending = f.pending[:0]
+		f.limited = false // pending is gone; a paused file must resume reading
 		t.newPipeline(f)
 		return
 	}
@@ -1876,6 +1973,7 @@ func (t *Tailer) rewind(f *file) {
 	f.readPos = f.committed
 	f.lineStart = f.committed
 	f.pending = f.pending[:0]
+	f.limited = false // pending is gone; a paused file must resume reading
 	t.newPipeline(f)
 }
 

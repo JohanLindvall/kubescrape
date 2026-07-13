@@ -143,12 +143,20 @@ func (c *converter) finish() {
 
 func (c *converter) flushFamily() {
 	for _, key := range c.order {
+		// Delete as we emit: order can hold a key twice when a family is
+		// TYPE-redeclared mid-exposition (hist() and summ() each append on
+		// first sight in their own map), and re-processing it would emit a
+		// zeroed phantom point AND push the accumulator into the freelist
+		// twice — two later label sets then share one accumulator, silently
+		// destroying a valid family's data.
 		if acc, ok := c.hists[key]; ok {
+			delete(c.hists, key)
 			c.b.addHistogram(c.family, acc)
 			*acc = histAcc{labels: acc.labels[:0], buckets: acc.buckets[:0], exemplars: acc.exemplars[:0]}
 			c.histFree = append(c.histFree, acc)
 		}
 		if acc, ok := c.summs[key]; ok {
+			delete(c.summs, key)
 			c.b.addSummary(c.family, acc)
 			*acc = summAcc{labels: acc.labels[:0], quantiles: acc.quantiles[:0]}
 			c.summFree = append(c.summFree, acc)

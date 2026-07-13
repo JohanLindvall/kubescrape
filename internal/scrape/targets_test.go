@@ -307,3 +307,24 @@ func TestMonitorTargets(t *testing.T) {
 		t.Fatalf("deleted pod = %+v", ts)
 	}
 }
+
+// TestMonitorPodPortOverflowSkipped pins the int32-truncation fix: a
+// string-typed targetPort past int32 (or the port range) must be skipped,
+// not wrapped into a valid-looking port.
+func TestMonitorPodPortOverflowSkipped(t *testing.T) {
+	for _, bad := range []string{"4294967297", "99999999", "0", "-1"} {
+		tp := intstr.FromString(bad)
+		if n, ok := monitorPortNumber(tp); ok {
+			t.Errorf("targetPort %q accepted as %d", bad, n)
+		}
+	}
+	if n, ok := monitorPortNumber(intstr.FromString("8080")); !ok || n != 8080 {
+		t.Errorf("numeric string: %d %v", n, ok)
+	}
+	if n, ok := monitorPortNumber(intstr.FromInt32(9090)); !ok || n != 9090 {
+		t.Errorf("int: %d %v", n, ok)
+	}
+	if _, ok := monitorPortNumber(intstr.FromString("metrics")); ok {
+		t.Error("port name parsed as number")
+	}
+}

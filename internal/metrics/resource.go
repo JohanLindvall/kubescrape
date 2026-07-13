@@ -11,11 +11,42 @@ import (
 func resourceAccum(res pcommon.Map) resKey {
 	var rk resKey
 	res.Range(func(k string, v pcommon.Value) bool {
-		hk, hv := xxhash.Sum64String(k), xxhash.Sum64String(v.AsString())
+		s := v.AsString()
+		if k == "" || s == "" {
+			return true // resourceString's set drops these; the hash must too
+		}
+		hk, hv := xxhash.Sum64String(k), xxhash.Sum64String(s)
 		rk.accum += combineHash(hk, hv)
 		rk.check += combineCheck(hk, hv)
 		return true
 	})
+	return rk
+}
+
+// resLabelsAccum folds the extra resource labels with the same override
+// semantics resourceString applies: a label replacing an existing resource
+// key subtracts the replaced pair, so the hash keys the MERGED set — hashing
+// both pairs made {svc:foo}+override svc=bar collide-or-diverge from
+// {svc:bar} inconsistently with its serialized identity, yielding duplicate
+// data points within one exported resource group.
+func resLabelsAccum(res pcommon.Map, extra labels) resKey {
+	var rk resKey
+	for _, e := range extra {
+		if e.key == "" || e.value == "" {
+			continue
+		}
+		hk := xxhash.Sum64String(e.key)
+		if v, ok := res.Get(e.key); ok {
+			if s := v.AsString(); s != "" {
+				hv := xxhash.Sum64String(s)
+				rk.accum -= combineHash(hk, hv)
+				rk.check -= combineCheck(hk, hv)
+			}
+		}
+		hv := xxhash.Sum64String(e.value)
+		rk.accum += combineHash(hk, hv)
+		rk.check += combineCheck(hk, hv)
+	}
 	return rk
 }
 

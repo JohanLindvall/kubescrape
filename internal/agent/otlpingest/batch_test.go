@@ -121,6 +121,125 @@ func TestBatcherDropsPermanent(t *testing.T) {
 	waitForCond(t, func() bool { return exp.delivered() == 1 }, "subsequent batch delivered")
 }
 
+// The byte cap flushes a batch before a merge would push its encoded size
+// past MaxBatchBytes, and a single payload already beyond the cap passes
+// through as-is (never merged with anything).
+func TestBatcherByteCap(t *testing.T) {
+	sizer := &plog.ProtoMarshaler{}
+	one := oneRecord("payload-of-a-fixed-size")
+	sz := sizer.LogsSize(one)
+
+	// The cap fits exactly two payloads; items would allow far more.
+	exp := &syncCaptureExporter{}
+	b := NewBatcher(exp, nil, BatchConfig{Items: 100, MaxBatchBytes: 2 * sz, Timeout: time.Hour}, nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { defer close(done); b.Run(ctx) }()
+
+	for i := 0; i < 4; i++ {
+		if err := b.ExportLogs(ctx, oneRecord("payload-of-a-fixed-size")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Nothing but the byte cap can flush here (items huge, timeout an hour);
+	// the trailing partial batch flushes on the shutdown drain.
+	waitForCond(t, func() bool { return exp.logBatches() >= 1 }, "byte-cap flush")
+	cancel()
+	<-done
+	if exp.logRecords() != 4 {
+		t.Fatalf("delivered %d records, want 4", exp.logRecords())
+	}
+	if exp.logBatches() != 2 {
+		t.Fatalf("delivered %d batches, want 2 (cap fits two payloads)", exp.logBatches())
+	}
+	for i, ld := range exp.batches {
+		if got := sizer.LogsSize(ld); got > 2*sz {
+			t.Errorf("batch %d encoded size %d exceeds the %d cap", i, got, 2*sz)
+		}
+	}
+
+	// A single payload over the cap is exported unsplit, on its own.
+	exp2 := &syncCaptureExporter{}
+	b2 := NewBatcher(exp2, nil, BatchConfig{Items: 100, MaxBatchBytes: sz - 1, Timeout: time.Hour}, nil)
+	ctx2, cancel2 := context.WithCancel(context.Background())
+	defer cancel2()
+	go b2.Run(ctx2)
+	if err := b2.ExportLogs(ctx2, oneRecord("payload-of-a-fixed-size")); err != nil {
+		t.Fatal(err)
+	}
+	waitForCond(t, func() bool { return exp2.logBatches() == 1 && exp2.logRecords() == 1 }, "oversized pass-through")
+}
+
+// A batch that keeps failing transiently must not wedge the queue forever:
+// after the retry limit it is dropped, counted, and the batcher keeps flowing.
+func TestBatcherDropsAfterRetryLimit(t *testing.T) {
+	exp := &flakyExporter{err: context.DeadlineExceeded, failing: true}
+	b := NewBatcher(exp, nil, BatchConfig{Items: 1, Timeout: 10 * time.Millisecond}, nil)
+	b.logs.retryBase = time.Millisecond
+	b.logs.retryLimit = 3
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go b.Run(ctx)
+
+	before := obs.IngestDropped.WithLabelValues("logs").Value()
+	if err := b.ExportLogs(ctx, oneRecord("never-accepted")); err != nil {
+		t.Fatal(err)
+	}
+	waitForCond(t, func() bool {
+		return obs.IngestDropped.WithLabelValues("logs").Value() == before+1
+	}, "batch dropped after the retry limit")
+
+	// The queue is unwedged: the next batch flows.
+	exp.setFailing(false)
+	if err := b.ExportLogs(ctx, oneRecord("fine")); err != nil {
+		t.Fatal(err)
+	}
+	waitForCond(t, func() bool { return exp.delivered() == 1 }, "subsequent batch delivered")
+}
+
+// The shutdown drain honors the same items/byte chunking as the live path:
+// merging the whole queue into one payload could exceed the collector's recv
+// limit.
+func TestBatcherShutdownDrainChunked(t *testing.T) {
+	// Items chunking: 5 queued single-record payloads drain as 2+2+1.
+	exp := &syncCaptureExporter{}
+	b := NewBatcher(exp, nil, BatchConfig{Items: 2, Timeout: time.Hour, QueueLen: 8}, nil)
+	for i := 0; i < 5; i++ {
+		if err := b.ExportLogs(context.Background(), oneRecord("queued")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	b.Run(ctx) // drains synchronously: ctx is already done
+	if exp.logRecords() != 5 {
+		t.Fatalf("drained %d records, want 5", exp.logRecords())
+	}
+	if exp.logBatches() != 3 {
+		t.Fatalf("drained in %d batches, want 3 (items chunking)", exp.logBatches())
+	}
+	for i, ld := range exp.batches {
+		if n := ld.LogRecordCount(); n > 2 {
+			t.Errorf("drained batch %d has %d records, above the 2-item cap", i, n)
+		}
+	}
+
+	// Byte chunking: a cap fitting two payloads drains 4 as 2+2.
+	sizer := &plog.ProtoMarshaler{}
+	sz := sizer.LogsSize(oneRecord("queued"))
+	exp2 := &syncCaptureExporter{}
+	b2 := NewBatcher(exp2, nil, BatchConfig{Items: 100, MaxBatchBytes: 2 * sz, Timeout: time.Hour, QueueLen: 8}, nil)
+	for i := 0; i < 4; i++ {
+		if err := b2.ExportLogs(context.Background(), oneRecord("queued")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	b2.Run(ctx)
+	if exp2.logRecords() != 4 || exp2.logBatches() != 2 {
+		t.Fatalf("drained %d records in %d batches, want 4 in 2 (byte chunking)", exp2.logRecords(), exp2.logBatches())
+	}
+}
+
 // On shutdown the batcher drains everything already acknowledged to senders
 // and flushes it; once stopped, enqueue fails with the retryable queue-full
 // error instead of acking into a dead channel.

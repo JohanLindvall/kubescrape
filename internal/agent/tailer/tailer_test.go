@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/plog"
 
 	"github.com/JohanLindvall/kubescrape/internal/agent/attrs"
@@ -1097,4 +1098,54 @@ func mustOpenPositions(t *testing.T, path string) *positions.Store {
 		t.Fatal(err)
 	}
 	return s
+}
+
+// TestDeferredCRIEmissionOffsets pins the closed-run ledger fix: the stage
+// defers a multi-fragment run's emission until the next line for the key is
+// fed, so the entry's commit offset must be the F line's end (not the
+// triggering line's), and the triggering P fragment must keep watermark
+// coverage (previously the callback stole its registration).
+func TestDeferredCRIEmissionOffsets(t *testing.T) {
+	dir := t.TempDir()
+	exp := &fakeExporter{}
+	tl := newTestTailer(dir, "", exp)
+	f := &file{
+		path:        filepath.Join(dir, logName),
+		source:      &compiledSource{name: "containers", containerd: true},
+		containerID: "0123456789abcdef",
+		resolved:    true,
+		resource:    pcommon.NewResource(),
+	}
+	tl.newPipeline(f)
+	tl.files[f.path] = f
+
+	l1 := timeNowCRI() + " stdout P hello-"
+	l2 := timeNowCRI() + " stdout F world"
+	l3 := timeNowCRI() + " stdout P dangling-"
+	ctx := context.Background()
+	off := int64(0)
+	for _, l := range []string{l1, l2, l3} {
+		end := off + int64(len(l)) + 1
+		tl.feedLine(ctx, f, l, off, end)
+		off = end
+	}
+	endF := int64(len(l1) + len(l2) + 2)
+
+	// Feeding l3 flushed the closed run: exactly one entry, bounded by the
+	// run's own lines.
+	if len(tl.batch) != 1 {
+		t.Fatalf("batch entries: %d", len(tl.batch))
+	}
+	e := tl.batch[0]
+	if e.body != "hello-world" {
+		t.Fatalf("body %q", e.body)
+	}
+	if e.start != 0 || e.offset != endF {
+		t.Fatalf("entry range [%d,%d), want [0,%d)", e.start, e.offset, endF)
+	}
+	// The dangling fragment must still clamp the watermark.
+	wm, ok := f.watermark()
+	if !ok || wm != endF {
+		t.Fatalf("watermark = %d,%v, want %d,true (fragment lost coverage)", wm, ok, endF)
+	}
 }

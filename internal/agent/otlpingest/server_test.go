@@ -362,6 +362,10 @@ func TestGRPCForwardStatus(t *testing.T) {
 		{&otlpexport.HTTPStatusError{Code: 503, Body: "overloaded"}, codes.Unavailable},
 		{&otlpexport.HTTPStatusError{Code: 429, Body: "slow down"}, codes.Unavailable},
 		{&otlpexport.HTTPStatusError{Code: 400, Body: "bad"}, codes.InvalidArgument},
+		// 401 is transient per otlpexport.IsPermanent (a rotating bearer token
+		// produces it for windows retrying survives) — the sender must retry.
+		{&otlpexport.HTTPStatusError{Code: 401, Body: "unauthorized"}, codes.Unavailable},
+		{&otlpexport.HTTPStatusError{Code: 404, Body: "not here"}, codes.Unavailable},
 		{context.DeadlineExceeded, codes.Unavailable},
 		{status.Error(codes.ResourceExhausted, "too large"), codes.ResourceExhausted}, // upstream status passes through
 	}
@@ -370,6 +374,50 @@ func TestGRPCForwardStatus(t *testing.T) {
 		if got != c.want {
 			t.Errorf("grpcForwardStatus(%v) = %v, want %v", c.err, got, c.want)
 		}
+	}
+}
+
+// A runtime listener failure (the HTTP port already bound) must surface as a
+// non-nil error from Run so main can crash the agent instead of leaving it
+// looking healthy while apps push into a void; a ctx-cancelled shutdown still
+// returns nil.
+func TestRunReturnsListenerError(t *testing.T) {
+	occupied, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = occupied.Close() }()
+
+	srv := NewServer(ServerConfig{
+		HTTPAddr: occupied.Addr().String(),
+		Enricher: newEnricher(newMeta(), MetricsAuto),
+		Exporter: &captureExporter{},
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := srv.Run(ctx); err == nil {
+		t.Fatal("Run = nil with the HTTP port already bound, want error")
+	}
+
+	// A clean ctx-cancelled shutdown returns nil.
+	free, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := free.Addr().String()
+	_ = free.Close()
+	srv2 := NewServer(ServerConfig{
+		HTTPAddr: addr,
+		Enricher: newEnricher(newMeta(), MetricsAuto),
+		Exporter: &captureExporter{},
+	})
+	ctx2, cancel2 := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	go func() { errCh <- srv2.Run(ctx2) }()
+	time.Sleep(50 * time.Millisecond)
+	cancel2()
+	if err := <-errCh; err != nil {
+		t.Fatalf("Run after ctx cancel = %v, want nil", err)
 	}
 }
 

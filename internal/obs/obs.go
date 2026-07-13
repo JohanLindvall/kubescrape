@@ -83,9 +83,9 @@ var (
 // OTLP ingest (agent).
 var (
 	Ingested = Registry.CounterVec("kubescrape_ingest_resources_total",
-		"Pushed OTLP resources by enrichment outcome (enriched, unresolved, peer_ip).", "outcome")
+		"Distinct pushed identities (container id / pod uid, memoized per request) by enrichment outcome (enriched, unresolved, peer_ip).", "outcome")
 	IngestDropped = Registry.CounterVec("kubescrape_ingest_dropped_batches_total",
-		"Acknowledged ingest batches dropped after a permanent collector rejection.", "signal")
+		"Acknowledged ingest batches dropped: permanent collector rejection or the transient-retry limit exhausted.", "signal")
 )
 
 // Journald drops (agent).

@@ -193,6 +193,13 @@ func (c *Client) bearer() (string, error) {
 // ExportLogs sends one logs payload (single attempt; the tailer retries and
 // rewinds).
 func (c *Client) ExportLogs(ctx context.Context, ld plog.Logs) error {
+	return c.exportLogsCounted(ctx, ld)
+}
+
+// exportLogsCounted is the single-attempt send plus the obs.Exports outcome
+// count — the unit both the public method and the buffered drain use, so
+// wire-send outcomes stay counted when -buffer-dir routes around ExportLogs.
+func (c *Client) exportLogsCounted(ctx context.Context, ld plog.Logs) error {
 	err := c.exportLogsOnce(ctx, ld)
 	obs.Exports.WithLabelValues("logs", outcome(err)).Inc()
 	return err
@@ -262,12 +269,19 @@ func (c *Client) ExportMetrics(ctx context.Context, md pmetric.Metrics) error {
 			}
 			backoff *= 2
 		}
-		err = c.exportMetricsOnce(ctx, md)
-		obs.Exports.WithLabelValues("metrics", outcome(err)).Inc()
+		err = c.exportMetricsCounted(ctx, md)
 		if err == nil {
 			return nil
 		}
 	}
+	return err
+}
+
+// exportMetricsCounted is one attempt plus the obs.Exports outcome count (see
+// exportLogsCounted).
+func (c *Client) exportMetricsCounted(ctx context.Context, md pmetric.Metrics) error {
+	err := c.exportMetricsOnce(ctx, md)
+	obs.Exports.WithLabelValues("metrics", outcome(err)).Inc()
 	return err
 }
 

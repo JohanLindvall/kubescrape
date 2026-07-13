@@ -10,6 +10,7 @@ import (
 	"github.com/JohanLindvall/kubescrape/internal/kubemeta"
 	"github.com/JohanLindvall/kubescrape/internal/servicemonitors"
 	"github.com/JohanLindvall/kubescrape/internal/services"
+	"k8s.io/apimachinery/pkg/util/intstr"
 )
 
 // Conventional annotations, as used by the classic Prometheus
@@ -31,7 +32,7 @@ const (
 // container port becomes a target. The pod (including any owners the caller
 // resolved) is embedded in each target.
 func PodTargets(pod kubemeta.Pod) []kubemeta.ScrapeTarget {
-	if pod.Annotations[AnnotationScrape] != "true" || !scrapeable(pod) {
+	if pod.Annotations[AnnotationScrape] != "true" || !Scrapeable(pod) {
 		return nil
 	}
 	scheme, path := schemeAndPath(pod.Annotations)
@@ -53,7 +54,7 @@ func PodTargets(pod kubemeta.Pod) []kubemeta.ScrapeTarget {
 // Service ports are translated to pod ports via their targetPort (named
 // container port, explicit number, or the port itself).
 func ServiceTargets(pod kubemeta.Pod, svc *services.Service) []kubemeta.ScrapeTarget {
-	if svc == nil || svc.Annotations[AnnotationScrape] != "true" || !scrapeable(pod) {
+	if svc == nil || svc.Annotations[AnnotationScrape] != "true" || !Scrapeable(pod) {
 		return nil
 	}
 	scheme, path := schemeAndPath(svc.Annotations)
@@ -88,7 +89,7 @@ func ServiceTargets(pod kubemeta.Pod, svc *services.Service) []kubemeta.ScrapeTa
 // names a Service port; targetPort (number or container-port name)
 // overrides the pod port directly.
 func MonitorTargets(pod kubemeta.Pod, svc *services.Service, monitor string, ep servicemonitors.Endpoint) []kubemeta.ScrapeTarget {
-	if svc == nil || !scrapeable(pod) {
+	if svc == nil || !Scrapeable(pod) {
 		return nil
 	}
 	scheme := ep.Scheme
@@ -121,11 +122,35 @@ func MonitorTargets(pod kubemeta.Pod, svc *services.Service, monitor string, ep 
 	return []kubemeta.ScrapeTarget{t}
 }
 
+// monitorPortNumber extracts a numeric targetPort, bounds-checked to the
+// valid port range; string values that do not parse fall through to the
+// port-name path.
+func monitorPortNumber(tp intstr.IntOrString) (int32, bool) {
+	var n int64
+	switch tp.Type {
+	case intstr.Int:
+		n = int64(tp.IntVal)
+	default:
+		parsed, err := strconv.ParseInt(tp.StrVal, 10, 32)
+		if err != nil {
+			return 0, false
+		}
+		n = parsed
+	}
+	if n < 1 || n > 65535 {
+		return 0, false
+	}
+	return int32(n), true
+}
+
 // monitorPodPort resolves the pod port a ServiceMonitor endpoint targets.
 func monitorPodPort(pod kubemeta.Pod, svc *services.Service, ep servicemonitors.Endpoint) (int32, bool) {
 	if ep.TargetPort != nil {
-		if n := ep.TargetPort.IntValue(); n > 0 {
-			return int32(n), true
+		// IntValue() on a string-typed value Atoi's it ignoring the error and
+		// returns a full int, so parse and bound explicitly: "4294967297"
+		// must be rejected, not truncated to port 1.
+		if n, ok := monitorPortNumber(*ep.TargetPort); ok {
+			return n, true
 		}
 		for _, c := range pod.Containers {
 			for _, p := range c.Ports {
@@ -144,7 +169,9 @@ func monitorPodPort(pod kubemeta.Pod, svc *services.Service, ep servicemonitors.
 	return 0, false
 }
 
-func scrapeable(pod kubemeta.Pod) bool {
+// Scrapeable reports whether a pod can yield scrape targets at all: it must
+// be live (not deleted, not Succeeded/Failed) and have a pod IP.
+func Scrapeable(pod kubemeta.Pod) bool {
 	if pod.PodIP == "" || pod.DeletedAt != nil {
 		return false
 	}

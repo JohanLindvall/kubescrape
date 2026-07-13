@@ -125,6 +125,9 @@ type series struct {
 	bucketStr   []string
 	bucketHash  []uint64
 	bucketCheck []uint64
+	// lastWarn rate-limits the cardinality-cap notice; lastCollision the
+	// hash-collision warn — separate so neither suppresses the other.
+	lastCollision int64
 }
 
 // seriesSpec configures a new series.
@@ -200,52 +203,62 @@ func (s *series) observe(lbls labels, value float64, resAccum resKey, res pcommo
 	}
 	now := loadEpoch()
 	base, check := s.baseAccum(lbls)
-	base += resAccum.accum + resLabels.hashAccum()
-	check += resAccum.check + resLabels.checkAccum()
+	rl := resLabelsAccum(res, resLabels)
+	base += resAccum.accum + rl.accum
+	check += resAccum.check + rl.check
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	// A histogram observation is admitted all-or-nothing: admitting only a
-	// prefix of the bucket streams at the cardinality cap exports underflowed
-	// counts (the cumulative-to-absolute conversion needs every stream).
-	if s.maxSize > 0 && len(s.buckets) > 1 {
+	// Pre-pass over every bucket stream: histogram admission is all-or-nothing
+	// (a partial set of streams exports underflowed cumulative counts), and a
+	// check-hash mismatch anywhere drops the WHOLE observation for the same
+	// reason — a mid-loop skip would leave sibling buckets recording.
+	{
 		missing := 0
 		for i := range s.buckets {
-			if s.db[s.streamHash(base, i)] == nil {
+			samp := s.db[s.streamHash(base, i)]
+			if samp == nil {
 				missing++
+				continue
+			}
+			if samp.check != s.streamCheck(check, i) {
+				// 64-bit collision between distinct series (~2^-64 per
+				// pair): refuse to merge.
+				if now-s.lastCollision >= 3600 {
+					s.lastCollision = now
+					s.log.Warn("series hash collision, dropping observation", "metric", s.name)
+				}
+				return
 			}
 		}
-		if missing > 0 && len(s.db)+missing > s.maxSize {
+		if s.maxSize > 0 && missing > 0 && len(s.db)+missing > s.maxSize {
 			s.warnCapped(lbls, now)
 			return
 		}
 	}
 	for i, bound := range s.buckets {
 		hash := s.streamHash(base, i)
-		streamCheck := check
-		if s.kind == kindHistogram {
-			streamCheck += s.bucketCheck[i]
-		}
 		samp := s.db[hash]
 		if samp == nil {
-			samp = s.admit(hash, streamCheck, lbls, i, now, res, resLabels)
+			samp = s.admit(hash, s.streamCheck(check, i), lbls, i, now, res, resLabels)
 			if samp == nil {
-				continue // capped
+				continue // capped (single-bucket kinds only; histograms pre-checked)
 			}
-		} else if samp.check != streamCheck {
-			// 64-bit collision between distinct series (~2^-64 per pair):
-			// refuse to merge; the observation is dropped and logged.
-			if now-s.lastWarn >= 3600 {
-				s.lastWarn = now
-				s.log.Warn("series hash collision, dropping observation", "metric", s.name)
-			}
-			continue
 		}
 		if value <= bound {
 			s.record(samp, value)
 		}
 		samp.when = now
 	}
+}
+
+// streamCheck is bucket i's collision-check hash (the check-side mirror of
+// streamHash).
+func (s *series) streamCheck(check uint64, bucket int) uint64 {
+	if s.kind == kindHistogram {
+		return check + s.bucketCheck[bucket]
+	}
+	return check
 }
 
 // observePre is observe for callers with precomputed label accumulators and
@@ -271,8 +284,8 @@ func (s *series) observePre(lbls labels, base, check uint64, value float64, res 
 			return
 		}
 	} else if samp.check != check {
-		if now-s.lastWarn >= 3600 {
-			s.lastWarn = now
+		if now-s.lastCollision >= 3600 {
+			s.lastCollision = now
 			s.log.Warn("series hash collision, dropping observation", "metric", s.name)
 		}
 		return

@@ -147,7 +147,9 @@ func parseSelector(in string) (label, expr string, want bool, hash uint64, err e
 		rest = strings.TrimPrefix(rest, "=") // "label!=value"
 	}
 	expr = unescapeSelector(rest)
-	hash = xxhash.Sum64String(label + "\n" + expr)
+	// Hash label and expression separately: a "\n"-joined string let
+	// "a\nb"="c" and "a"="b\nc" share a memo slot.
+	hash = combineHash(xxhash.Sum64String(label), xxhash.Sum64String(expr))
 	return label, expr, want, hash, nil
 }
 

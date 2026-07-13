@@ -440,3 +440,54 @@ func TestScrapeHTTPError(t *testing.T) {
 		t.Fatalf("no batches expected, got %d", len(exp.batches))
 	}
 }
+
+// TestTypeRedeclarationDoesNotCorruptLaterFamilies pins the flushFamily
+// delete-as-emitted fix: a family TYPE-redeclared histogram->summary put its
+// key into order twice, double-freeing an accumulator so two later label sets
+// shared one — a valid family's series were silently destroyed.
+func TestTypeRedeclarationDoesNotCorruptLaterFamilies(t *testing.T) {
+	exposition := `# TYPE weird histogram
+weird_bucket{le="+Inf"} 1
+weird_sum 1
+weird_count 1
+# TYPE weird summary
+weird_sum 1
+weird_count 1
+# TYPE a histogram
+a_bucket{s="1",le="+Inf"} 5
+a_sum{s="1"} 5
+a_count{s="1"} 5
+a_bucket{s="2",le="+Inf"} 7
+a_sum{s="2"} 7
+a_count{s="2"} 7
+`
+	bt := newBatcher(func(pcommon.Resource) {}, 1<<30, time.Unix(1, 0), time.Unix(2, 0))
+	conv := newConverter(bt)
+	p := NewParser(1<<20, false, false)
+	if _, err := p.Parse(strings.NewReader(exposition), func(s Sample) error {
+		conv.add(s)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	conv.finish()
+
+	counts := map[string]uint64{}
+	ms := bt.take().ResourceMetrics().At(0).ScopeMetrics().At(0).Metrics()
+	for k := 0; k < ms.Len(); k++ {
+		m := ms.At(k)
+		if m.Name() != "a" || m.Type() != pmetric.MetricTypeHistogram {
+			continue
+		}
+		dps := m.Histogram().DataPoints()
+		for d := 0; d < dps.Len(); d++ {
+			dp := dps.At(d)
+			if v, ok := dp.Attributes().Get("s"); ok {
+				counts[v.Str()] = dp.Count()
+			}
+		}
+	}
+	if counts["1"] != 5 || counts["2"] != 7 {
+		t.Fatalf("family a corrupted: got counts %v, want s=1:5 s=2:7", counts)
+	}
+}

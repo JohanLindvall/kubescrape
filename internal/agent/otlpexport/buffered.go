@@ -63,7 +63,7 @@ func NewBuffered(inner Exporter, logSpool, metricSpool *spool.Spool, backoff tim
 	// client = up to 15 wire sends per cycle otherwise).
 	sendLogs, sendMetrics := inner.ExportLogs, inner.ExportMetrics
 	if c, ok := inner.(*Client); ok {
-		sendLogs, sendMetrics = c.exportLogsOnce, c.exportMetricsOnce
+		sendLogs, sendMetrics = c.exportLogsCounted, c.exportMetricsCounted
 	}
 	if logSpool != nil {
 		lm := plog.ProtoMarshaler{}
@@ -234,6 +234,7 @@ func (s *sink[T]) trySend(ctx context.Context, v T) sendResult {
 			return sendOK
 		}
 		if IsPermanent(err) {
+			s.cur = 0 // the connection demonstrably works; don't penalize the next batch
 			s.log.Warn("buffered export permanently rejected", "signal", s.kind, "error", err)
 			return sendRejected
 		}

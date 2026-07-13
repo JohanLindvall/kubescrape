@@ -25,7 +25,6 @@ import (
 	"google.golang.org/grpc/status"
 
 	"github.com/JohanLindvall/kubescrape/internal/agent/otlpexport"
-	"github.com/JohanLindvall/kubescrape/internal/agent/spool"
 )
 
 // Exporter forwards enriched telemetry; implemented by otlpexport.Client.
@@ -115,11 +114,15 @@ func (s *Server) Run(ctx context.Context) error {
 		return nil
 	}
 
+	// A runtime listener failure must propagate to the caller (main treats it
+	// as fatal and exits non-zero); a ctx-cancelled shutdown returns nil.
+	var runErr error
 	select {
 	case <-ctx.Done():
 	case err := <-errc:
 		if err != nil {
 			s.log.Error("otlp ingest listener failed", "error", err)
+			runErr = fmt.Errorf("ingest listener: %w", err)
 		}
 	}
 	if grpcSrv != nil {
@@ -130,7 +133,7 @@ func (s *Server) Run(ctx context.Context) error {
 		defer cancel()
 		_ = httpSrv.Shutdown(sctx)
 	}
-	return nil
+	return runErr
 }
 
 // --- gRPC ---
@@ -173,18 +176,14 @@ func grpcForwardStatus(err error) error {
 	if _, ok := status.FromError(err); ok {
 		return err
 	}
-	if errors.Is(err, spool.ErrFull) {
-		return status.Error(codes.Unavailable, err.Error()) // backpressure: retry later
+	// Permanence is classified by otlpexport.IsPermanent (the single source of
+	// truth): only definitive upstream rejections become InvalidArgument (do
+	// not retry). Everything else — spool.ErrFull back-pressure, upstream 5xx,
+	// 401/403/404 windows, timeouts, unclassified failures — is Unavailable:
+	// the receiver is a proxy, and the sender retrying is the safe default.
+	if otlpexport.IsPermanent(err) {
+		return status.Error(codes.InvalidArgument, err.Error())
 	}
-	var he *otlpexport.HTTPStatusError
-	if errors.As(err, &he) {
-		if he.Code >= 400 && he.Code < 500 && he.Code != 408 && he.Code != 429 {
-			return status.Error(codes.InvalidArgument, err.Error()) // permanent upstream rejection
-		}
-		return status.Error(codes.Unavailable, err.Error())
-	}
-	// Unclassified forwarding failures are treated as transient: the receiver
-	// is a proxy, and the sender retrying is the safe default.
 	return status.Error(codes.Unavailable, err.Error())
 }
 

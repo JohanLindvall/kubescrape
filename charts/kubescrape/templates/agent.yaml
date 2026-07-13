@@ -144,7 +144,7 @@ spec:
             - -journald-units={{ join "," . }}
             {{- end }}
             - -journald-batch-size={{ .Values.agent.journald.batchSize }}
-            - -journald-max-batch-bytes={{ .Values.agent.journald.maxBatchBytes }}
+            - -journald-max-batch-bytes={{ int64 .Values.agent.journald.maxBatchBytes }}
             - -journald-flush-interval={{ .Values.agent.journald.flushInterval }}
             - -journald-enrich={{ .Values.agent.journald.enrich }}
             {{- end }}
@@ -159,6 +159,7 @@ spec:
             {{- if .Values.agent.ingest.batchItems }}
             - -ingest-batch-items={{ .Values.agent.ingest.batchItems }}
             - -ingest-batch-timeout={{ .Values.agent.ingest.batchTimeout }}
+            - -ingest-batch-bytes={{ int64 .Values.agent.ingest.batchBytes }}
             {{- end }}
             {{- with .Values.agent.ingest.containerIdKeys }}
             - -ingest-container-id-keys={{ join "," . }}

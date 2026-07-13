@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
@@ -206,6 +207,16 @@ func run() error {
 			}
 			dynFactory := dynamicinformer.NewDynamicSharedInformerFactory(dynClient, *resync)
 			smInformer := dynFactory.ForResource(servicemonitors.GVR).Informer()
+			// Unstructured objects retain managedFields unless stripped, like
+			// the typed informers' transform does.
+			if err := smInformer.SetTransform(func(obj any) (any, error) {
+				if u, ok := obj.(*unstructured.Unstructured); ok {
+					unstructured.RemoveNestedField(u.Object, "metadata", "managedFields")
+				}
+				return obj, nil
+			}); err != nil {
+				return fmt.Errorf("servicemonitor informer transform: %w", err)
+			}
 			monitors = servicemonitors.NewIndex()
 			upsert := func(obj any) {
 				if u, ok := obj.(*unstructured.Unstructured); ok {
@@ -252,6 +263,10 @@ func run() error {
 		}
 		defer func() { _ = exporter.Close() }()
 	}
+	// Exporting goroutines join this group; run waits for them (the events
+	// final flush, the self-metrics final export) before returning, so they
+	// finish before the deferred exporter.Close fires (mirrors the agent).
+	var wg sync.WaitGroup
 	if *selfMetricsIntv > 0 {
 		res := pcommon.NewResource()
 		a := res.Attributes()
@@ -259,7 +274,11 @@ func run() error {
 		if host, err := os.Hostname(); err == nil {
 			a.PutStr("service.instance.id", host)
 		}
-		go obs.Registry.Run(ctx, exporter, *selfMetricsIntv, res, log)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			obs.Registry.Run(ctx, exporter, *selfMetricsIntv, res, log)
+		}()
 		log.Info("self-metrics export started", "interval", *selfMetricsIntv)
 	}
 
@@ -273,7 +292,11 @@ func run() error {
 			return fmt.Errorf("registering event handler: %w", err)
 		}
 		synced = append(synced, evInformer.HasSynced)
-		go ev.Run(ctx)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			ev.Run(ctx)
+		}()
 		log.Info("kubernetes events exporter started", "endpoint", *otlpEndpoint)
 	}
 
@@ -312,18 +335,23 @@ func run() error {
 		errCh <- srv.ListenAndServe()
 	}()
 
+	var runErr error
 	select {
 	case err := <-errCh:
-		return fmt.Errorf("http server: %w", err)
+		runErr = fmt.Errorf("http server: %w", err)
 	case <-ctx.Done():
 		log.Info("shutting down")
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		if err := srv.Shutdown(shutdownCtx); err != nil && !errors.Is(err, context.DeadlineExceeded) {
-			return fmt.Errorf("http shutdown: %w", err)
+			runErr = fmt.Errorf("http shutdown: %w", err)
 		}
-		return nil
 	}
+	// Cancel ctx (a no-op on the signal path) and wait for the exporting
+	// goroutines' final flushes before the deferred exporter.Close fires.
+	stop()
+	wg.Wait()
+	return runErr
 }
 
 // buildConfig prefers an explicit kubeconfig, then in-cluster config, then

@@ -437,3 +437,41 @@ func TestLegacyCursorUpgradeViaRename(t *testing.T) {
 		t.Fatal("upgraded cursor has bad checksum")
 	}
 }
+
+// TestPopAfterCaughtUpRotation pins the retire-in-Pop fix: a consumer fully
+// caught up (readOff == tail size) when an Append rotates to a new segment
+// previously saw "empty" forever — no commit ever ran again to retire the
+// consumed head.
+func TestPopAfterCaughtUpRotation(t *testing.T) {
+	dir := t.TempDir()
+	s, err := Open(dir, Options{SegmentBytes: 32})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = s.Close() }()
+
+	if err := s.Append([]byte("first-record-padding-x")); err != nil {
+		t.Fatal(err)
+	}
+	data, commit, ok, err := s.Pop()
+	if err != nil || !ok || string(data) != "first-record-padding-x" {
+		t.Fatalf("pop 1: ok=%v err=%v data=%q", ok, err, data)
+	}
+	commit() // fully caught up: readOff == segs[0].size, single segment
+
+	// This append exceeds SegmentBytes and rotates to a new segment.
+	if err := s.Append([]byte("second-record-after-rotation")); err != nil {
+		t.Fatal(err)
+	}
+	data, commit, ok, err = s.Pop()
+	if err != nil || !ok {
+		t.Fatalf("pop 2 wedged: ok=%v err=%v backlog=%d", ok, err, s.Bytes())
+	}
+	if string(data) != "second-record-after-rotation" {
+		t.Fatalf("pop 2: %q", data)
+	}
+	commit()
+	if got := s.Bytes(); got != 0 {
+		t.Fatalf("backlog after full drain: %d", got)
+	}
+}

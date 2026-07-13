@@ -115,7 +115,7 @@ func (s *Store) UpsertPod(p *corev1.Pod) {
 	}
 
 	rec.pod = pod
-	rec.ownerRefs = append([]metav1.OwnerReference(nil), p.OwnerReferences...)
+	rec.ownerRefs = cloneOwnerRefs(p.OwnerReferences)
 	rec.resourceVersion = p.ResourceVersion
 	rec.expireAt = time.Time{} // resurrect if a late update follows a delete
 
@@ -172,6 +172,28 @@ func (s *Store) UpsertPod(p *corev1.Pod) {
 	if ip != "" {
 		s.byPodIP[ip] = rec
 	}
+}
+
+// cloneOwnerRefs deep-copies owner references: the struct copy alone would
+// alias the informer object's *bool fields (Controller, BlockOwnerDeletion),
+// and stored records must share nothing with informer-owned memory.
+func cloneOwnerRefs(refs []metav1.OwnerReference) []metav1.OwnerReference {
+	if len(refs) == 0 {
+		return nil
+	}
+	out := make([]metav1.OwnerReference, len(refs))
+	for i, r := range refs {
+		out[i] = r
+		if r.Controller != nil {
+			c := *r.Controller
+			out[i].Controller = &c
+		}
+		if r.BlockOwnerDeletion != nil {
+			b := *r.BlockOwnerDeletion
+			out[i].BlockOwnerDeletion = &b
+		}
+	}
+	return out
 }
 
 // DeletePod tombstones a pod. Its metadata (and its container IDs) remain
@@ -280,8 +302,9 @@ func (s *Store) removeWaiter(id string, ch chan struct{}) {
 }
 
 // lookupLocked resolves a normalized container ID. gone reports an expired
-// (present-but-unswept) tombstone: the ID was known and its pod is
-// definitively deleted, so callers must not block waiting for it.
+// (present-but-unswept) entry — a deleted pod's tombstone or a
+// restart-replaced container ID of a still-live pod; either way the ID can
+// never reappear, so callers must not block waiting for it.
 func (s *Store) lookupLocked(id string) (res ContainerResult, ok, gone bool) {
 	e := s.byContainer[id]
 	if e == nil {

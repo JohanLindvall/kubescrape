@@ -1,3 +1,12 @@
+{{- /* Legacy value keys from before the unified agent config: failing loudly
+beats a --reuse-values upgrade silently dropping the operator's attribute
+templates and metric filters (the agent boots fine without them). */}}
+{{- if .Values.agent.attrsConfig }}
+{{- fail "agent.attrsConfig moved to agent.config.resourceAttributes (unified agent config); migrate your values" }}
+{{- end }}
+{{- if .Values.agent.metricsConfig }}
+{{- fail "agent.metricsConfig moved to agent.config.metrics (unified agent config); migrate your values" }}
+{{- end }}
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -110,6 +119,7 @@ spec:
             - -logs-rate-burst={{ .Values.agent.logsRateBurst }}
             - -logs-rate-drop={{ .Values.agent.logsRateDrop }}
             {{- end }}
+            - -logs-unknown-files={{ .Values.agent.logsUnknownFiles }}
             - -logs-pipelined-export={{ .Values.agent.logsPipelinedExport }}
             {{- with .Values.agent.bufferDir }}
             - -buffer-dir={{ . }}

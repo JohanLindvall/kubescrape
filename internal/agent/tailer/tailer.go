@@ -132,6 +132,15 @@ type Config struct {
 	RateBurst float64
 	// RateDrop discards lines over the limit instead of pausing the file.
 	RateDrop bool
+
+	// UnknownFiles decides where a file present at startup WITHOUT a
+	// checkpoint entry starts: "end" (skip as pre-existing history), "start"
+	// (read whole), or "auto" (default: "start" when the checkpoint store
+	// already has entries — the file appeared while the agent was down, so
+	// its content is unshipped — and "end" on a first-ever run). Note "auto"
+	// and "start" mean adding a new source to a long-running agent ingests
+	// those files' existing content.
+	UnknownFiles string
 	// Rules filters exported records (ordered keep/drop/sample, nil = keep
 	// all). Evaluated after enrichment — severity is matchable via the
 	// synthetic __severity__ key — and after LogMetrics, so metrics still see
@@ -857,11 +866,26 @@ func (t *Tailer) initFile(f *file, checkpoints map[string]checkpoint, initial bo
 				to:    pp.To,
 			})
 		}
-	} else if st, err := os.Stat(f.path); err == nil && !f.compressed {
-		// Present before the agent started and no checkpoint: start at the end
-		// to avoid re-ingesting history. Compressed archives are instead read
-		// whole (committed stays 0).
-		f.committed = st.Size()
+	} else if !f.compressed {
+		// Present at startup with no checkpoint entry. Where to start is
+		// configurable (Config.UnknownFiles): "end" skips it as pre-existing
+		// history; "start" reads it whole; "auto" (default) reads from the
+		// start when the checkpoint store already has entries — the agent ran
+		// before, so this file appeared while it was down and its content is
+		// unshipped, not history. Compressed archives are always read whole.
+		mode := t.cfg.UnknownFiles
+		if mode == "" || mode == "auto" {
+			if len(checkpoints) > 0 {
+				mode = "start"
+			} else {
+				mode = "end"
+			}
+		}
+		if mode == "end" {
+			if st, err := os.Stat(f.path); err == nil {
+				f.committed = st.Size()
+			}
+		}
 	}
 }
 

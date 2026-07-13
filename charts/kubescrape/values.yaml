@@ -129,6 +129,13 @@ agent:
   logsRateLimit: 0
   logsRateBurst: 0            # 0 = 2x logsRateLimit
   logsRateDrop: false
+  # Where a file with no checkpoint entry starts at agent startup: end (skip
+  # as pre-existing history), start (read whole), or auto (start when the
+  # checkpoint store already has entries — the file appeared while the agent
+  # was down and its content is unshipped; end on a first-ever run). Note that
+  # auto/start make adding a new log source ingest those files' existing
+  # content.
+  logsUnknownFiles: auto
   # Overlap reading with export delivery (one export in flight; at-least-once
   # semantics unchanged).
   logsPipelinedExport: false

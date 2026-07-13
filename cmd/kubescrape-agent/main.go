@@ -78,6 +78,7 @@ func run() error {
 		logsRateLimit     = flag.Float64("logs-rate-limit", 0, "per-file line rate limit in lines/second (0 disables); exhausted files pause until tokens refill")
 		logsRateBurst     = flag.Float64("logs-rate-burst", 0, "rate-limit token bucket size (0 = 2x -logs-rate-limit)")
 		logsRateDrop      = flag.Bool("logs-rate-drop", false, "discard lines over -logs-rate-limit instead of pausing the file")
+		logsUnknownFiles  = flag.String("logs-unknown-files", "auto", "where a file with no checkpoint entry starts at startup: end (skip as history), start (read whole), auto (start when the checkpoint store has entries — it appeared while the agent was down — else end)")
 		logsPipelined     = flag.Bool("logs-pipelined-export", false, "overlap reading with export delivery (one export in flight; at-least-once semantics unchanged)")
 		logsEnrich        = flag.Bool("logs-enrich", true, "parse per-line metadata (timestamp, severity, trace/span IDs, exception details) into the OTLP record fields via github.com/JohanLindvall/enrich")
 		logsFileAttrs     = flag.Bool("logs-file-attributes", false, "stamp log.file.name and log.file.position (byte offset) on every log record, for each file source")
@@ -147,6 +148,11 @@ func run() error {
 	case otlpingest.MetricsResource, otlpingest.MetricsDatapoint, otlpingest.MetricsAuto:
 	default:
 		return fmt.Errorf("invalid -ingest-metrics-mode %q (want resource, datapoint or auto)", *ingestMetrics)
+	}
+	switch *logsUnknownFiles {
+	case "auto", "end", "start":
+	default:
+		return fmt.Errorf("invalid -logs-unknown-files %q (want auto, end or start)", *logsUnknownFiles)
 	}
 	if *ingestOn && *ingestGRPC == "" && *ingestHTTP == "" {
 		return fmt.Errorf("-ingest is set but both -ingest-grpc-endpoint and -ingest-http-endpoint are empty")

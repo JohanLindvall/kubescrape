@@ -1171,3 +1171,41 @@ func TestNewFileCheckpointedOnDiscovery(t *testing.T) {
 		return strings.Contains(string(data), logName)
 	}, "checkpoint entry persisted at discovery, before the periodic save")
 }
+
+// TestUnknownFileAutoReadsFromStart pins the "auto" unknown-files semantics:
+// when the checkpoint store already has entries (the agent ran before), a
+// file present at startup without an entry appeared while the agent was down
+// — its content is unshipped, not history, and must be read from the start.
+func TestUnknownFileAutoReadsFromStart(t *testing.T) {
+	dir := t.TempDir()
+	chk := filepath.Join(t.TempDir(), "chk")
+
+	// First run: establish a checkpoint entry for one file.
+	exp1 := &fakeExporter{}
+	tl1 := newTestTailer(dir, chk, exp1)
+	stop1 := startTailer(t, tl1)
+	writeLog(t, dir, timeNowCRI()+" stdout F first-run")
+	waitFor(t, func() bool { return len(exp1.get()) >= 1 }, "first run exported")
+	stop1()
+
+	// While "down": a NEW file appears with content.
+	otherName := "pod2_ns1_app-fedcba9876543210.log"
+	other := filepath.Join(dir, otherName)
+	if err := os.WriteFile(other, []byte(timeNowCRI()+" stdout F while-down\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Second run (auto default): the unknown file must be read from offset 0.
+	exp2 := &fakeExporter{}
+	tl2 := newTestTailer(dir, chk, exp2)
+	stop2 := startTailer(t, tl2)
+	defer stop2()
+	waitFor(t, func() bool {
+		for _, r := range exp2.get() {
+			if r == "while-down" {
+				return true
+			}
+		}
+		return false
+	}, "content written while down is shipped")
+}

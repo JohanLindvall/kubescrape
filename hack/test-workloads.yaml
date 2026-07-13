@@ -3,11 +3,20 @@
 #   Prometheus scraping,
 # - a CronJob (pod -> Job -> CronJob owner chain),
 # - a Deployment WITHOUT pod annotations plus an annotated Service selecting
-#   it (service-based scrape discovery).
+#   it (service-based scrape discovery),
+# - a StatefulSet with a comma-list port annotation (number + port name) and a
+#   sidecar (restartable init) container,
+# - an annotated Service selecting the pod-annotated Deployment (pod-source
+#   URL dedup), and a hostNetwork DaemonSet (excluded from the pod-IP index).
+# The namespace carries labels so namespace-metadata enrichment resolves
+# non-empty.
 apiVersion: v1
 kind: Namespace
 metadata:
   name: kubescrape-demo
+  labels:
+    team: demo
+    env: test
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -93,3 +102,94 @@ spec:
             - name: tick
               image: busybox:1.37
               command: ["sh", "-c", "date; sleep 5"]
+---
+# Multi-port pod annotation (comma-separated numbers AND a port name), plus a
+# sidecar (restartable init) container — exercises the comma-list port
+# invariant, named-port resolution on the pod annotation itself, and
+# sidecar-container indexing.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: demo-multi
+  namespace: kubescrape-demo
+spec:
+  serviceName: demo-multi
+  replicas: 1
+  selector:
+    matchLabels:
+      app: demo-multi
+  template:
+    metadata:
+      labels:
+        app: demo-multi
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9100,extra"
+    spec:
+      initContainers:
+        - name: sidecar
+          image: busybox:1.37
+          restartPolicy: Always
+          command: ["sh", "-c", "while true; do echo sidecar tick; sleep 30; done"]
+      containers:
+        - name: app
+          image: busybox:1.37
+          command: ["sh", "-c", "while true; do echo multi tick; sleep 30; done"]
+          ports:
+            - name: extra
+              containerPort: 9200
+---
+# Headless service for the StatefulSet (also gives it a Service owner path).
+apiVersion: v1
+kind: Service
+metadata:
+  name: demo-multi
+  namespace: kubescrape-demo
+spec:
+  clusterIP: None
+  selector:
+    app: demo-multi
+  ports:
+    - name: extra
+      port: 9200
+---
+# A Service selecting the POD-ANNOTATED deployment with the same port:
+# exercises the pod-source-wins URL dedup between pod and service annotations.
+apiVersion: v1
+kind: Service
+metadata:
+  name: demo-dup
+  namespace: kubescrape-demo
+  annotations:
+    prometheus.io/scrape: "true"
+    prometheus.io/port: "8080"
+spec:
+  selector:
+    app: demo-web
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+---
+# hostNetwork pod: must never be indexed by pod IP (it shares the node IP).
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: demo-hostnet
+  namespace: kubescrape-demo
+spec:
+  selector:
+    matchLabels:
+      app: demo-hostnet
+  template:
+    metadata:
+      labels:
+        app: demo-hostnet
+    spec:
+      hostNetwork: true
+      tolerations:
+        - operator: Exists
+      containers:
+        - name: hostnet
+          image: busybox:1.37
+          command: ["sh", "-c", "while true; do echo hostnet tick; sleep 60; done"]

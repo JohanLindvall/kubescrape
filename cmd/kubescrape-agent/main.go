@@ -46,22 +46,23 @@ func main() {
 
 func run() error {
 	var (
-		configFile      = flag.String("config", "", "unified YAML config file with resourceAttributes, logs, logAttributes, logMetrics and metrics sections (each mirrors its former standalone file)")
-		nodeName        = flag.String("node-name", os.Getenv("NODE_NAME"), "name of the node this agent runs on (default $NODE_NAME)")
-		listen          = flag.String("listen", ":8081", "HTTP listen address for /healthz, /readyz and /debug/tailer (empty disables)")
-		selfMetricsIntv = flag.Duration("self-metrics-interval", time.Minute, "export the agent's own metrics over OTLP at this interval (0 disables)")
-		metadataURL     = flag.String("metadata-endpoint", "http://kubescrape.monitoring", "base URL of the kubescrape metadata service")
-		metadataWait    = flag.Duration("metadata-wait", 5*time.Second, "how long the metadata service may block waiting for a new container")
-		otlpEndpoint    = flag.String("otlp-endpoint", "otel-collector.monitoring:4317", "OTLP endpoint: host:port for grpc, base URL for http")
-		otlpProtocol    = flag.String("otlp-protocol", "grpc", "OTLP transport: grpc or http")
-		otlpCompression = flag.String("otlp-compression", "gzip", "OTLP payload compression: gzip or none")
-		otlpInsecure    = flag.Bool("otlp-insecure", true, "use a plaintext gRPC connection (for http, use an http:// endpoint)")
-		otlpSkipTLS     = flag.Bool("otlp-tls-insecure-skip-verify", false, "skip TLS certificate verification towards the collector")
-		otlpCAFile      = flag.String("otlp-tls-ca-file", "", "PEM CA bundle for verifying the collector")
-		otlpBearer      = flag.String("otlp-bearer-token-file", "", "file with a bearer token sent on every export (re-read periodically)")
-		otlpTimeout     = flag.Duration("otlp-timeout", 15*time.Second, "per-export-attempt timeout")
-		otlpRetries     = flag.Int("otlp-retry-attempts", 3, "tries per metrics export (logs retry via the tailer's rewind)")
-		otlpBackoff     = flag.Duration("otlp-retry-backoff", time.Second, "initial backoff between metric export retries, doubled per attempt")
+		configFile           = flag.String("config", "", "unified YAML config file with resourceAttributes, logs, logAttributes, logMetrics and metrics sections (each mirrors its former standalone file)")
+		nodeName             = flag.String("node-name", os.Getenv("NODE_NAME"), "name of the node this agent runs on (default $NODE_NAME)")
+		listen               = flag.String("listen", ":8081", "HTTP listen address for /healthz, /readyz and /debug/tailer (empty disables)")
+		selfMetricsIntv      = flag.Duration("self-metrics-interval", time.Minute, "export the agent's own metrics over OTLP at this interval (0 disables)")
+		metadataURL          = flag.String("metadata-endpoint", "http://kubescrape.monitoring", "base URL of the kubescrape metadata service")
+		metadataWait         = flag.Duration("metadata-wait", 5*time.Second, "how long the metadata service may block waiting for a new container")
+		otlpEndpoint         = flag.String("otlp-endpoint", "otel-collector.monitoring:4317", "OTLP endpoint: host:port for grpc, base URL for http")
+		otlpProtocol         = flag.String("otlp-protocol", "grpc", "OTLP transport: grpc or http")
+		otlpCompression      = flag.String("otlp-compression", "gzip", "OTLP payload compression: gzip or none")
+		otlpCompressionLevel = flag.Int("otlp-compression-level", 0, "gzip level 1 (fastest, ~2-3x less CPU for ~10% larger payloads) to 9 (smallest); 0 = library default")
+		otlpInsecure         = flag.Bool("otlp-insecure", true, "use a plaintext gRPC connection (for http, use an http:// endpoint)")
+		otlpSkipTLS          = flag.Bool("otlp-tls-insecure-skip-verify", false, "skip TLS certificate verification towards the collector")
+		otlpCAFile           = flag.String("otlp-tls-ca-file", "", "PEM CA bundle for verifying the collector")
+		otlpBearer           = flag.String("otlp-bearer-token-file", "", "file with a bearer token sent on every export (re-read periodically)")
+		otlpTimeout          = flag.Duration("otlp-timeout", 15*time.Second, "per-export-attempt timeout")
+		otlpRetries          = flag.Int("otlp-retry-attempts", 3, "tries per metrics export (logs retry via the tailer's rewind)")
+		otlpBackoff          = flag.Duration("otlp-retry-backoff", time.Second, "initial backoff between metric export retries, doubled per attempt")
 
 		logLevel  = flag.String("log-level", "info", "log level: debug, info, warn, error")
 		logFormat = flag.String("log-format", "text", "log format: text or json")
@@ -220,6 +221,7 @@ func run() error {
 		Endpoint:           *otlpEndpoint,
 		Protocol:           *otlpProtocol,
 		Compression:        *otlpCompression,
+		CompressionLevel:   *otlpCompressionLevel,
 		Insecure:           *otlpInsecure,
 		InsecureSkipVerify: *otlpSkipTLS,
 		CAFile:             *otlpCAFile,

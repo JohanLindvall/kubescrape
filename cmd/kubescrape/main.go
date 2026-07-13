@@ -69,16 +69,17 @@ func run() error {
 		monitorsOn = flag.Bool("servicemonitors", false, "serve targets for monitoring.coreos.com ServiceMonitors selecting pod-backed Services (no per-endpoint auth or relabelings)")
 
 		// Kubernetes events -> OTLP logs (opt-in).
-		eventsOn        = flag.Bool("events", false, "export Kubernetes events as OTLP log records")
-		selfMetricsIntv = flag.Duration("self-metrics-interval", time.Minute, "export the service's own metrics over OTLP at this interval (0 disables)")
-		otlpEndpoint    = flag.String("otlp-endpoint", "otel-collector.monitoring:4317", "OTLP endpoint for the events exporter: host:port for grpc, base URL for http")
-		otlpProtocol    = flag.String("otlp-protocol", "grpc", "OTLP transport: grpc or http")
-		otlpCompression = flag.String("otlp-compression", "gzip", "OTLP payload compression: gzip or none")
-		otlpInsecure    = flag.Bool("otlp-insecure", true, "use a plaintext gRPC connection")
-		otlpSkipTLS     = flag.Bool("otlp-tls-insecure-skip-verify", false, "skip TLS certificate verification towards the collector")
-		otlpCAFile      = flag.String("otlp-tls-ca-file", "", "PEM CA bundle for verifying the collector")
-		otlpBearer      = flag.String("otlp-bearer-token-file", "", "file with a bearer token sent on every export (re-read periodically)")
-		otlpTimeout     = flag.Duration("otlp-timeout", 15*time.Second, "per-export timeout")
+		eventsOn             = flag.Bool("events", false, "export Kubernetes events as OTLP log records")
+		selfMetricsIntv      = flag.Duration("self-metrics-interval", time.Minute, "export the service's own metrics over OTLP at this interval (0 disables)")
+		otlpEndpoint         = flag.String("otlp-endpoint", "otel-collector.monitoring:4317", "OTLP endpoint for the events exporter: host:port for grpc, base URL for http")
+		otlpProtocol         = flag.String("otlp-protocol", "grpc", "OTLP transport: grpc or http")
+		otlpCompression      = flag.String("otlp-compression", "gzip", "OTLP payload compression: gzip or none")
+		otlpCompressionLevel = flag.Int("otlp-compression-level", 0, "gzip level 1 (fastest, ~2-3x less CPU for ~10% larger payloads) to 9 (smallest); 0 = library default")
+		otlpInsecure         = flag.Bool("otlp-insecure", true, "use a plaintext gRPC connection")
+		otlpSkipTLS          = flag.Bool("otlp-tls-insecure-skip-verify", false, "skip TLS certificate verification towards the collector")
+		otlpCAFile           = flag.String("otlp-tls-ca-file", "", "PEM CA bundle for verifying the collector")
+		otlpBearer           = flag.String("otlp-bearer-token-file", "", "file with a bearer token sent on every export (re-read periodically)")
+		otlpTimeout          = flag.Duration("otlp-timeout", 15*time.Second, "per-export timeout")
 	)
 	flag.Parse()
 
@@ -253,6 +254,7 @@ func run() error {
 			Endpoint:           *otlpEndpoint,
 			Protocol:           *otlpProtocol,
 			Compression:        *otlpCompression,
+			CompressionLevel:   *otlpCompressionLevel,
 			Insecure:           *otlpInsecure,
 			InsecureSkipVerify: *otlpSkipTLS,
 			CAFile:             *otlpCAFile,

@@ -264,7 +264,10 @@ func (s *series) streamCheck(check uint64, bucket int) uint64 {
 // observePre is observe for callers with precomputed label accumulators and
 // no resource attributes (the internal registry): hot counters skip rehashing
 // their fixed label set on every bump.
-func (s *series) observePre(lbls labels, base, check uint64, value float64, res pcommon.Map) {
+// observePreHashed is the registry fast path: the bound wrappers bump fixed
+// label sets, so the accumulators AND the finalized hash are precomputed at
+// construction; a bump pays neither the label rehash nor the avalanche.
+func (s *series) observePreHashed(lbls labels, hash, check uint64, value float64, res pcommon.Map) {
 	if math.IsNaN(value) {
 		return
 	}
@@ -276,7 +279,6 @@ func (s *series) observePre(lbls labels, base, check uint64, value float64, res 
 	now := loadEpoch()
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	hash := mixHash(base)
 	samp := s.db[hash]
 	if samp == nil {
 		samp = s.admit(hash, check, lbls, 0, now, res, nil)

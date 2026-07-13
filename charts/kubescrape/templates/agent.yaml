@@ -87,6 +87,7 @@ spec:
             - -otlp-endpoint={{ .Values.agent.otlp.endpoint }}
             - -otlp-protocol={{ .Values.agent.otlp.protocol }}
             - -otlp-compression={{ .Values.agent.otlp.compression }}
+            - -otlp-compression-level={{ int64 .Values.agent.otlp.compressionLevel }}
             - -otlp-insecure={{ .Values.agent.otlp.insecure }}
             - -otlp-tls-insecure-skip-verify={{ .Values.agent.otlp.tlsInsecureSkipVerify }}
             {{- with .Values.agent.otlp.caFile }}

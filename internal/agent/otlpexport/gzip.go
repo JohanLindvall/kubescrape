@@ -3,6 +3,7 @@ package otlpexport
 import (
 	"io"
 	"sync"
+	"sync/atomic"
 
 	"github.com/JohanLindvall/bufpool"
 	"github.com/klauspost/compress/gzip"
@@ -23,10 +24,27 @@ type gzipCodec struct {
 	writers sync.Pool // *gzip.Writer
 }
 
+// gzipLevel is the process-wide gzip level for both the gRPC codec and the
+// HTTP body path (the writer pools are shared, so the level is a process
+// setting; it is fixed at client construction, before the pools warm up).
+var gzipLevel atomic.Int32
+
+func init() { gzipLevel.Store(gzip.DefaultCompression) }
+
+func setGzipLevel(level int) { gzipLevel.Store(int32(level)) }
+
+func newGzipWriter() *gzip.Writer {
+	w, err := gzip.NewWriterLevel(nil, int(gzipLevel.Load()))
+	if err != nil {
+		return gzip.NewWriter(nil)
+	}
+	return w
+}
+
 func (c *gzipCodec) Compress(w io.Writer) (io.WriteCloser, error) {
 	z, ok := c.writers.Get().(*gzip.Writer)
 	if !ok {
-		z = gzip.NewWriter(nil)
+		z = newGzipWriter()
 	}
 	z.Reset(w)
 	return &pooledGzipWriter{Writer: z, pool: &c.writers}, nil
@@ -54,7 +72,7 @@ func (p *pooledGzipWriter) Close() error {
 // pools the compressed-body buffers (bufpool's strike heuristic bounds how
 // long an oversized, under-utilized backing array stays pooled).
 var (
-	httpGzipWriters = sync.Pool{New: func() any { return gzip.NewWriter(nil) }}
+	httpGzipWriters = sync.Pool{New: func() any { return newGzipWriter() }}
 	httpGzipBufs    = bufpool.New()
 )
 

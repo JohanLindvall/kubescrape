@@ -99,16 +99,18 @@ type bound struct {
 	s           *series
 	lbls        labels
 	base, check uint64
+	hash        uint64 // mixHash(base), precomputed — bumps skip the avalanche
 }
 
 func newBound(s *series, lbls labels) bound {
-	return bound{s: s, lbls: lbls, base: lbls.hashAccum(), check: lbls.checkAccum()}
+	base := lbls.hashAccum()
+	return bound{s: s, lbls: lbls, base: base, check: lbls.checkAccum(), hash: mixHash(base)}
 }
 
 var emptyResource = pcommon.NewMap()
 
 func (b bound) observe(v float64) {
-	b.s.observePre(b.lbls, b.base, b.check, v, emptyResource)
+	b.s.observePreHashed(b.lbls, b.hash, b.check, v, emptyResource)
 }
 
 // Value returns the current sum across the bound label set's samples (for

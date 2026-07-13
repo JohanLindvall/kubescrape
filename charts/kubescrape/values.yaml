@@ -25,6 +25,7 @@ service:
       endpoint: "otel-collector.monitoring:4317"
       protocol: grpc          # grpc | http
       compression: gzip       # gzip | none
+      compressionLevel: 0   # gzip level: 1 fastest .. 9 smallest, 0 = library default
       insecure: true
       tlsInsecureSkipVerify: false
       caFile: ""
@@ -103,6 +104,7 @@ agent:
     endpoint: "otel-collector.monitoring:4317"
     protocol: grpc          # grpc | http
     compression: gzip       # gzip | none
+    compressionLevel: 0   # gzip level: 1 fastest .. 9 smallest, 0 = library default
     insecure: true
     tlsInsecureSkipVerify: false
     caFile: ""

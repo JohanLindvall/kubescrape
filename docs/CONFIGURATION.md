@@ -92,6 +92,7 @@ Pipeline toggles (all default `true`):
 | `-otlp-endpoint` | `otel-collector.monitoring:4317` | `host:port` for gRPC, base URL for HTTP |
 | `-otlp-protocol` | `grpc` | `grpc` or `http` (OTLP/HTTP protobuf on `/v1/logs`, `/v1/metrics`) |
 | `-otlp-compression` | `gzip` | payload compression on either transport (`gzip` via klauspost/compress, or `none`); telemetry compresses 5–10x |
+| `-otlp-compression-level` | `0` | gzip level `1` (fastest, ~2-3x less CPU for ~10% larger payloads) to `9` (smallest); `0` = library default |
 | `-otlp-insecure` | `true` | plaintext gRPC (for HTTP, choose via the URL scheme) |
 | `-otlp-bearer-token-file` | — | sends `Authorization: Bearer <token>` on either transport; re-read every minute, so rotated tokens work |
 | `-otlp-tls-ca-file` | — | PEM CA bundle for verifying the collector |

@@ -51,6 +51,10 @@ type Config struct {
 	// Compression is "gzip" (the default, matching collector exporters —
 	// telemetry compresses 5-10x) or "none".
 	Compression string
+	// CompressionLevel is the gzip level (1 fastest .. 9 smallest; 0 = the
+	// library default). Level 1 costs ~2-3x less CPU than the default for
+	// ~10% larger payloads — the right trade on busy nodes.
+	CompressionLevel int
 	// Timeout bounds one export attempt.
 	Timeout time.Duration
 	// RetryAttempts is the number of tries per metrics export (logs have
@@ -100,6 +104,12 @@ func New(cfg Config) (*Client, error) {
 	default:
 		return nil, fmt.Errorf("compression %q (want gzip or none)", cfg.Compression)
 	}
+	if cfg.CompressionLevel < 0 || cfg.CompressionLevel > 9 {
+		return nil, fmt.Errorf("compression level %d (want 0-9)", cfg.CompressionLevel)
+	}
+	if cfg.CompressionLevel != 0 {
+		setGzipLevel(cfg.CompressionLevel)
+	}
 	c := &Client{cfg: cfg}
 
 	tlsCfg, err := buildTLS(cfg)
@@ -137,8 +147,10 @@ func New(cfg Config) (*Client, error) {
 		c.metricsURL = base + "/v1/metrics"
 		c.tracesURL = base + "/v1/traces"
 		c.httpClient = &http.Client{
-			Timeout:   cfg.Timeout,
-			Transport: &http.Transport{TLSClientConfig: tlsCfg, MaxIdleConnsPerHost: 2},
+			Timeout: cfg.Timeout,
+			// One collector host; the ingest receiver forwards concurrently,
+			// so two idle connections would re-dial under load.
+			Transport: &http.Transport{TLSClientConfig: tlsCfg, MaxIdleConnsPerHost: 16, MaxIdleConns: 16, IdleConnTimeout: 90 * time.Second},
 		}
 	default:
 		return nil, fmt.Errorf("protocol %q (want grpc or http)", cfg.Protocol)

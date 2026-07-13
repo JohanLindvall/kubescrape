@@ -121,6 +121,7 @@ spec:
             - -logs-rate-drop={{ .Values.agent.logsRateDrop }}
             {{- end }}
             - -logs-unknown-files={{ .Values.agent.logsUnknownFiles }}
+            - -logs-idle-close={{ .Values.agent.logsIdleClose }}
             - -logs-pipelined-export={{ .Values.agent.logsPipelinedExport }}
             {{- with .Values.agent.bufferDir }}
             - -buffer-dir={{ . }}

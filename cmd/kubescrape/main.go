@@ -12,7 +12,6 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
-	"net/http"
 	"os"
 	"os/signal"
 	"sync"
@@ -317,20 +316,18 @@ func run() error {
 		close(ready)
 	}()
 
-	srv := &http.Server{
-		Addr: *listen,
-		Handler: server.New(server.Config{
-			Store:    st,
-			Services: svcIndex,
-			Monitors: monitors,
-			Resolver: resolver,
-			MaxWait:  *maxWait,
-			CacheTTL: *metaCacheTTL,
-			Ready:    ready,
-			Logger:   log,
-		}).Handler(),
-		ReadHeaderTimeout: 10 * time.Second,
-	}
+	// HTTPServer sets the full hardened timeout set (ReadHeaderTimeout,
+	// Read/WriteTimeout > MaxWait, IdleTimeout); see its doc comment.
+	srv := server.New(server.Config{
+		Store:    st,
+		Services: svcIndex,
+		Monitors: monitors,
+		Resolver: resolver,
+		MaxWait:  *maxWait,
+		CacheTTL: *metaCacheTTL,
+		Ready:    ready,
+		Logger:   log,
+	}).HTTPServer(*listen)
 
 	errCh := make(chan error, 1)
 	go func() {

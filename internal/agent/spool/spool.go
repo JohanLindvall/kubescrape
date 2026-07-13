@@ -306,7 +306,15 @@ func (s *Spool) Pop() (data []byte, commit func(), ok bool, err error) {
 	s.retireConsumedLocked()
 	head := &s.segs[0]
 	if s.readOff+frameHeader > head.size {
-		return nil, nil, false, nil
+		if len(s.segs) > 1 {
+			// A middle segment never grows, so trailing bytes shorter than a
+			// frame header are truncation damage; its remaining frames are
+			// unreadable. Skip the segment (surfaced to the caller) rather
+			// than reporting an empty queue forever while the backlog grows.
+			s.skipLostHead()
+			return nil, nil, false, fmt.Errorf("spool: truncated segment %d: %w", head.seq, os.ErrNotExist)
+		}
+		return nil, nil, false, nil // write tail: wait for the next append
 	}
 	f, err := s.readHandle(head)
 	if err != nil {
@@ -322,15 +330,18 @@ func (s *Spool) Pop() (data []byte, commit func(), ok bool, err error) {
 	}
 	n := int64(binary.BigEndian.Uint32(hdr[:]))
 	if s.readOff+frameHeader+n > head.size {
-		if len(s.segs) > 1 {
-			// A middle segment's size is final, so an overshooting length
-			// prefix is corruption; the remaining frames are unreadable.
-			// Skip the segment (surfaced to the caller) rather than
-			// reporting an empty queue forever.
-			s.skipLostHead()
-			return nil, nil, false, fmt.Errorf("spool: corrupt frame length in segment %d: %w", head.seq, os.ErrNotExist)
-		}
-		return nil, nil, false, nil // torn write tail: wait for the append to finish
+		// An overshooting length prefix is corruption on any segment: a middle
+		// segment's size is final, and the write tail's size only ever covers
+		// whole fsynced frames (Append advances it after Sync, under the lock;
+		// openTail truncates torn tails at load) — so this is never a torn
+		// append in progress. The frame boundaries from here on are lost:
+		// waiting would wedge the queue forever, and on the tail a future
+		// append could grow the segment past the bogus length and deliver
+		// bytes spanning unrelated frames. Skip the segment (surfaced to the
+		// caller); the tail is replaced by a fresh segment so appends keep
+		// working.
+		s.skipLostHead()
+		return nil, nil, false, fmt.Errorf("spool: corrupt frame length in segment %d: %w", head.seq, os.ErrNotExist)
 	}
 	payload := make([]byte, n)
 	if _, err := f.ReadAt(payload, s.readOff+frameHeader); err != nil {
@@ -391,34 +402,40 @@ func (s *Spool) dropReadHandle() {
 	}
 }
 
-// skipLostHead advances past a head segment whose file has vanished (external
-// cleanup, disk repair): its frames are unrecoverable, so waiting on them
-// would wedge the queue forever. The write tail is never skipped this way —
-// it is recreated empty instead, so appends keep working (caller holds the
-// lock).
+// skipLostHead advances past a head segment whose frames are unrecoverable
+// (file vanished, or a corrupt/truncated frame stream): waiting on them would
+// wedge the queue forever. Any remaining file is removed so a restart does
+// not rediscover the dead segment. The write tail is never skipped in place —
+// it is replaced by a fresh segment instead, so appends keep working (caller
+// holds the lock).
 func (s *Spool) skipLostHead() {
 	s.dropReadHandle()
 	if len(s.segs) > 1 {
+		_ = os.Remove(s.segs[0].path) // no-op when the file already vanished
 		s.segs = s.segs[1:]
 		s.readOff = 0
 		s.persistCursor()
 		return
 	}
-	// The single segment (also the write tail) is gone; start a fresh one.
-	// The old entry is dropped only once the replacement exists — leaving
-	// segs empty would panic every segs[0]/segs[len-1] access (Pop, Append's
-	// openTail, stale commits).
+	// The single segment (also the write tail) is unusable; start a fresh
+	// one. The old entry is dropped only once the replacement exists —
+	// leaving segs empty would panic every segs[0]/segs[len-1] access (Pop,
+	// Append's openTail, stale commits).
 	seq := s.segs[0].seq + 1
 	if s.w != nil {
 		_ = s.w.Close()
 		s.w = nil
 	}
+	oldPath := s.segs[0].path
 	old := s.segs
+	// NB: appendSegment appends into the shared backing array, overwriting
+	// old[0] — only oldPath (copied above) identifies the dead file afterwards.
 	s.segs = s.segs[:0]
 	if err := s.appendSegment(seq); err != nil {
 		s.segs = old // keep the stale entry; reads keep erroring, but no panic
 		return
 	}
+	_ = os.Remove(oldPath) // no-op when the file already vanished
 	s.readOff = 0
 	s.persistCursor()
 }

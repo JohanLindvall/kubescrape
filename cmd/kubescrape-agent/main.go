@@ -79,6 +79,7 @@ func run() error {
 		logsRateLimit     = flag.Float64("logs-rate-limit", 0, "per-file line rate limit in lines/second (0 disables); exhausted files pause until tokens refill")
 		logsRateBurst     = flag.Float64("logs-rate-burst", 0, "rate-limit token bucket size (0 = 2x -logs-rate-limit)")
 		logsRateDrop      = flag.Bool("logs-rate-drop", false, "discard lines over -logs-rate-limit instead of pausing the file")
+		logsIdleClose     = flag.Duration("logs-idle-close", 10*time.Minute, "close the fd of a fully-caught-up file after this much inactivity (0 keeps fds open; the file stays tracked and reopens on activity)")
 		logsUnknownFiles  = flag.String("logs-unknown-files", "auto", "where a file with no checkpoint entry starts at startup: end (skip as history), start (read whole), auto (start when the checkpoint store has entries — it appeared while the agent was down — else end)")
 		logsPipelined     = flag.Bool("logs-pipelined-export", false, "overlap reading with export delivery (one export in flight; at-least-once semantics unchanged)")
 		logsEnrich        = flag.Bool("logs-enrich", true, "parse per-line metadata (timestamp, severity, trace/span IDs, exception details) into the OTLP record fields via github.com/JohanLindvall/enrich")
@@ -322,6 +323,8 @@ func run() error {
 			RateLimit:         *logsRateLimit,
 			RateBurst:         *logsRateBurst,
 			RateDrop:          *logsRateDrop,
+			UnknownFiles:      *logsUnknownFiles,
+			IdleClose:         *logsIdleClose,
 			Rules:             logRules,
 			PipelinedExport:   *logsPipelined,
 			Multiline:         *multilineOn,
@@ -499,7 +502,18 @@ func run() error {
 				_ = enc.Encode(tl.Status())
 			})
 		}
-		srv := &http.Server{Addr: *listen, Handler: mux, ReadHeaderTimeout: 10 * time.Second}
+		// Every handler here answers from an in-memory snapshot in
+		// milliseconds, so tight timeouts are safe: ReadHeaderTimeout kills
+		// Slowloris header trickling, Read/WriteTimeout bound trickled bodies
+		// and stuck response writes, IdleTimeout reaps parked keep-alives.
+		srv := &http.Server{
+			Addr:              *listen,
+			Handler:           mux,
+			ReadHeaderTimeout: 10 * time.Second,
+			ReadTimeout:       30 * time.Second,
+			WriteTimeout:      30 * time.Second,
+			IdleTimeout:       120 * time.Second,
+		}
 		go func() {
 			if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 				log.Error("health/metrics server failed", "error", err)

@@ -22,6 +22,7 @@ import (
 	"go.opentelemetry.io/collector/pdata/ptrace/ptraceotlp"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/status"
 
 	"github.com/JohanLindvall/kubescrape/internal/agent/otlpexport"
@@ -80,7 +81,12 @@ func (s *Server) Run(ctx context.Context) error {
 		if err != nil {
 			return fmt.Errorf("ingest gRPC listen %s: %w", s.cfg.GRPCAddr, err)
 		}
-		grpcSrv = grpc.NewServer()
+		// Mirror the HTTP server's IdleTimeout: reap connections apps opened
+		// and abandoned (default gRPC keeps them forever). Message size stays
+		// at the 4 MiB gRPC default — the bound on pushed payloads.
+		grpcSrv = grpc.NewServer(grpc.KeepaliveParams(keepalive.ServerParameters{
+			MaxConnectionIdle: 120 * time.Second,
+		}))
 		plogotlp.RegisterGRPCServer(grpcSrv, &logsGRPC{s: s})
 		pmetricotlp.RegisterGRPCServer(grpcSrv, &metricsGRPC{s: s})
 		if s.cfg.Traces != nil {
@@ -98,7 +104,21 @@ func (s *Server) Run(ctx context.Context) error {
 		if s.cfg.Traces != nil {
 			mux.HandleFunc("POST /v1/traces", s.handleHTTPTraces)
 		}
-		httpSrv = &http.Server{Addr: s.cfg.HTTPAddr, Handler: mux, ReadHeaderTimeout: 10 * time.Second}
+		// ReadHeaderTimeout kills Slowloris header trickling; ReadTimeout
+		// bounds a trickled request body (the handlers read up to 16 MiB and
+		// senders are node-local, so 60s is generous — it also caps handler
+		// runtime via the whole-request read deadline, fine because forwarding
+		// is bounded by the exporter's own much shorter timeout and a cut-off
+		// surfaces as a retryable 503); IdleTimeout reaps parked keep-alives.
+		// WriteTimeout is deliberately omitted: responses are tiny and its
+		// clock would race a slow-but-legal body upload plus the forward.
+		httpSrv = &http.Server{
+			Addr:              s.cfg.HTTPAddr,
+			Handler:           mux,
+			ReadHeaderTimeout: 10 * time.Second,
+			ReadTimeout:       60 * time.Second,
+			IdleTimeout:       120 * time.Second,
+		}
 		started++
 		go func() {
 			if err := httpSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {

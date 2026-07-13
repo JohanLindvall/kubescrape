@@ -133,6 +133,16 @@ type Config struct {
 	// RateDrop discards lines over the limit instead of pausing the file.
 	RateDrop bool
 
+	// IdleClose closes the file descriptor of a fully-caught-up file after
+	// this much inactivity (0 disables). The file stays tracked (checkpoint,
+	// watches) and reopens on the next write event or poll; identity is
+	// re-verified on reopen. Bounds steady-state fd usage at one per ACTIVE
+	// file instead of one per tracked file. Caveat: with no fd held, a
+	// write-then-rotate burst inside one poll interval on an unwatched
+	// (polling-only) setup can lose the burst — the same fast-rotation
+	// window the tailer already documents.
+	IdleClose time.Duration
+
 	// UnknownFiles decides where a file present at startup WITHOUT a
 	// checkpoint entry starts: "end" (skip as pre-existing history), "start"
 	// (read whole), or "auto" (default: "start" when the checkpoint store
@@ -613,12 +623,19 @@ func (t *Tailer) Run(ctx context.Context) {
 	defer dirTicker.Stop()
 	poll := time.NewTicker(t.cfg.PollInterval)
 	defer poll.Stop()
-	// debounce coalesces bursts of write events into one dirty sweep.
+	// debounce coalesces bursts of write events into one dirty sweep. It is
+	// armed by the first event of a burst and NOT re-armed by subsequent
+	// events (debouncePending): resetting per event would postpone the sweep
+	// indefinitely under sustained writes (a busy file emits events more
+	// often than the debounce interval), starving event-driven sweeps down
+	// to the poll fallback — under which sub-poll-interval rename rotations
+	// lose whole segments (the intermediate inode is never opened).
 	debounce := time.NewTimer(0)
 	if !debounce.Stop() {
 		<-debounce.C
 	}
 	defer debounce.Stop()
+	debouncePending := false
 
 	for {
 		select {
@@ -642,12 +659,14 @@ func (t *Tailer) Run(ctx context.Context) {
 		case <-dirTicker.C:
 			t.scanDir(nil, false)
 		case ev := <-events:
-			if t.handleEvent(ev) {
+			if t.handleEvent(ev) && !debouncePending {
+				debouncePending = true
 				debounce.Reset(50 * time.Millisecond)
 			}
 		case err := <-watchErrs:
 			t.log.Warn("fsnotify", "error", err)
 		case <-debounce.C:
+			debouncePending = false
 			t.sweep(ctx, false)
 			t.housekeeping(ctx)
 		case <-poll.C:
@@ -668,6 +687,34 @@ func (t *Tailer) housekeeping(ctx context.Context) {
 	}
 	if time.Since(t.lastStatus) >= t.statusEvery {
 		t.publishStatus()
+	}
+	t.closeIdleFiles()
+}
+
+// closeIdleFiles releases the fds of fully-caught-up files that have been
+// inactive for Config.IdleClose. Only files with nothing unread, unbuffered
+// and uncommitted may close — a held fd is the only access to a rotated-away
+// inode's remainder, so anything in flight keeps its fd.
+func (t *Tailer) closeIdleFiles() {
+	if t.cfg.IdleClose <= 0 {
+		return
+	}
+	now := time.Now()
+	for _, f := range t.files {
+		if f.f == nil || f.compressed || f.dirty || f.limited {
+			continue
+		}
+		if len(f.pending) > 0 || f.readPos != f.committed || len(f.carried) > 0 {
+			continue
+		}
+		if _, buffered := f.watermark(); buffered {
+			continue
+		}
+		if f.lastMod.IsZero() || now.Sub(f.lastMod) < t.cfg.IdleClose {
+			continue
+		}
+		_ = f.f.Close()
+		f.f = nil // ensureOpen reopens and re-verifies identity on activity
 	}
 }
 
@@ -702,14 +749,21 @@ func (t *Tailer) handleEvent(ev fsnotify.Event) bool {
 
 // watchTarget registers the file's resolved log directory with the watcher.
 func (t *Tailer) watchTarget(f *file) {
-	if t.watcher == nil || f.targetDir != "" {
+	if t.watcher == nil {
 		return
 	}
 	target, err := filepath.EvalSymlinks(f.path)
 	if err != nil {
-		return // next open retries
+		return // next open retries; any existing watch stays
 	}
 	dir := filepath.Dir(target)
+	if dir == f.targetDir {
+		return // unchanged (the common case for every reopen)
+	}
+	// Acquire the new directory's watch BEFORE releasing the old one: a
+	// rotation that retargets the symlink must never leave a window with no
+	// OS watch, or a second rotation inside one poll interval goes unseen
+	// and its segment is lost.
 	if t.watchRefs[dir] == 0 {
 		if err := t.watcher.Add(dir); err != nil {
 			t.log.Debug("watching log target directory", "dir", dir, "error", err)
@@ -717,7 +771,6 @@ func (t *Tailer) watchTarget(f *file) {
 		}
 	}
 	t.watchRefs[dir]++
-	f.targetDir = dir
 	if t.byTargetDir == nil {
 		t.byTargetDir = make(map[string]map[*file]struct{})
 	}
@@ -727,6 +780,13 @@ func (t *Tailer) watchTarget(f *file) {
 		t.byTargetDir[dir] = set
 	}
 	set[f] = struct{}{}
+	old := f.targetDir
+	f.targetDir = dir
+	if old != "" {
+		f.targetDir = old
+		t.unwatchTarget(f) // release the previous dir (refcounted)
+		f.targetDir = dir
+	}
 }
 
 // unwatchTarget releases the file's directory watch.
@@ -736,7 +796,17 @@ func (t *Tailer) unwatchTarget(f *file) {
 	}
 	if t.watchRefs[f.targetDir]--; t.watchRefs[f.targetDir] <= 0 {
 		delete(t.watchRefs, f.targetDir)
-		_ = t.watcher.Remove(f.targetDir)
+		// Never remove the watch on a discovery directory: those are watched
+		// unconditionally from Run and both discovery and same-dir tailing
+		// depend on their events. Under a rotation storm every file sharing
+		// the dir can be momentarily unregistered (between reopen and the
+		// next sweep's ensureOpen); dropping the OS watch then silences all
+		// events until a poll tick re-adds it — and the resulting event gap
+		// widens the unregistered windows, cascading into whole rotated
+		// segments being lost.
+		if _, isScanDir := t.scanDirs[f.targetDir]; !isScanDir {
+			_ = t.watcher.Remove(f.targetDir)
+		}
 	}
 	if set := t.byTargetDir[f.targetDir]; set != nil {
 		delete(set, f)
@@ -813,7 +883,12 @@ func (t *Tailer) scanDir(checkpoints map[string]checkpoint, initial bool) {
 				id = cid
 			}
 			seen[path] = struct{}{}
-			if _, known := t.files[path]; known {
+			if known, ok := t.files[path]; ok {
+				// A previous listing may have raced a rename+recreate
+				// rotation (the path momentarily absent between the two
+				// syscalls) and marked the file gone; this listing proves
+				// it is back — unmark it before a sweep drops it.
+				known.gone = false
 				continue
 			}
 			f := &file{
@@ -1079,9 +1154,19 @@ func (t *Tailer) sweep(ctx context.Context, all bool) {
 	cutoff := time.Now().Add(-t.cfg.MultilineTimeout)
 	for path, f := range t.files {
 		if f.gone {
-			t.drop(f)
-			delete(t.files, path)
-			continue
+			if _, err := os.Stat(f.path); err == nil {
+				// A listing raced a rename+recreate rotation: the path was
+				// momentarily absent but is alive again. Dropping now would
+				// discard the tailing state (and, on the next checkpoint
+				// save, its entry) and lose every inode rotated away before
+				// rediscovery; clear the flag and let readFile's rotation
+				// detection handle the identity change instead.
+				f.gone = false
+			} else {
+				t.drop(f)
+				delete(t.files, path)
+				continue
+			}
 		}
 		if !all && !f.dirty {
 			continue
@@ -1592,10 +1677,10 @@ func (t *Tailer) reopen(ctx context.Context, f *file, renamed bool) {
 	f.lineStart = 0
 	f.pending = f.pending[:0]
 	f.limited = false // pending is gone; a paused file must resume reading
-	// Re-derive the watch: the symlink may now point into a different
-	// directory (kept stale, events for the new target dir would be missed
-	// until the poll ticker.)
-	t.unwatchTarget(f)
+	// The next ensureOpen's watchTarget re-derives the symlink target and
+	// switches watches acquire-before-release, so no eager unwatch here — an
+	// unwatched hole between reopen and that sweep would lose a second
+	// rotation happening inside one poll interval.
 	f.dirty = true
 }
 

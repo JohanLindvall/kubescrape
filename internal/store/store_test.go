@@ -65,7 +65,7 @@ func mustGet(t *testing.T, s *Store, id string) ContainerResult {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	res, ok := s.GetContainer(ctx, id)
+	res, ok, _ := s.GetContainer(ctx, id)
 	if !ok {
 		t.Fatalf("container %q not found", id)
 	}
@@ -76,7 +76,7 @@ func mustMiss(t *testing.T, s *Store, id string) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
 	defer cancel()
-	if _, ok := s.GetContainer(ctx, id); ok {
+	if _, ok, _ := s.GetContainer(ctx, id); ok {
 		t.Fatalf("container %q unexpectedly found", id)
 	}
 }
@@ -105,7 +105,7 @@ func TestWaitForContainer(t *testing.T) {
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		res, ok := s.GetContainer(ctx, "late999")
+		res, ok, _ := s.GetContainer(ctx, "late999")
 		if ok {
 			done <- res
 		}
@@ -135,14 +135,14 @@ func TestWaitIsPerContainer(t *testing.T) {
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		_, ok := s.GetContainer(ctx, "wanted1")
+		_, ok, _ := s.GetContainer(ctx, "wanted1")
 		got <- ok
 	}()
 	other := make(chan bool, 1)
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
 		defer cancel()
-		_, ok := s.GetContainer(ctx, "other2")
+		_, ok, _ := s.GetContainer(ctx, "other2")
 		other <- ok
 	}()
 
@@ -179,7 +179,7 @@ func TestManyWaitersSameContainer(t *testing.T) {
 		go func() {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
-			res, ok := s.GetContainer(ctx, "shared123")
+			res, ok, _ := s.GetContainer(ctx, "shared123")
 			results <- ok && res.Pod.Name == "pod1"
 		}()
 	}
@@ -425,7 +425,7 @@ func TestExpiredTombstoneDoesNotWait(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	start := time.Now()
-	if _, ok := s.GetContainer(ctx, "abc123"); ok {
+	if _, ok, _ := s.GetContainer(ctx, "abc123"); ok {
 		t.Fatal("expired tombstone resolved")
 	}
 	if elapsed := time.Since(start); elapsed > time.Second {
@@ -449,7 +449,7 @@ func TestExpiredReplacedIDDoesNotWait(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	start := time.Now()
-	if _, ok := s.GetContainer(ctx, "old111"); ok {
+	if _, ok, _ := s.GetContainer(ctx, "old111"); ok {
 		t.Fatal("expired replaced ID resolved")
 	}
 	if elapsed := time.Since(start); elapsed > time.Second {

@@ -10,6 +10,7 @@ package store
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"time"
 
@@ -20,10 +21,34 @@ import (
 	"github.com/JohanLindvall/kubescrape/internal/kubemeta"
 )
 
+// defaultMaxWaiters bounds the number of concurrently blocked GetContainer
+// calls. Each waiter pins a map entry (keyed by a client-chosen string) and a
+// parked HTTP handler for up to the wait budget, so without a cap a hostile
+// client posting distinct garbage IDs could grow the waiter map without
+// bound. The cap is far above what a legitimate agent fleet produces (agents
+// wait only for containers starting on their own node).
+const defaultMaxWaiters = 16384
+
+// maxWaiterIDLen bounds the container-ID strings held as waiter keys. Real
+// runtime IDs are 64 hex characters; anything wildly longer is garbage that
+// can never appear in a pod status, so blocking (and pinning the bytes as a
+// map key) would only serve memory amplification. Such lookups degrade to a
+// non-blocking miss.
+const maxWaiterIDLen = 256
+
+// ErrTooManyWaiters reports that a container lookup was shed because the
+// store already holds the maximum number of blocked lookups. Callers should
+// surface it as a retryable condition (HTTP 503), never as "not found".
+var ErrTooManyWaiters = errors.New("too many blocked container lookups")
+
 // Store is safe for concurrent use.
 type Store struct {
 	ttl time.Duration
 	now func() time.Time
+
+	// maxWaiters caps concurrently blocked GetContainer calls (see
+	// defaultMaxWaiters); SetMaxWaiters overrides it (tests, tuning).
+	maxWaiters int
 
 	mu          sync.RWMutex
 	pods        map[types.UID]*record
@@ -40,8 +65,10 @@ type Store struct {
 	byPodIP map[string]*record
 	// waiters holds blocked GetContainer calls keyed by the normalized
 	// container ID they are waiting for; each channel is closed when that
-	// specific ID becomes resolvable.
-	waiters map[string][]chan struct{}
+	// specific ID becomes resolvable. nWaiters counts the channels across all
+	// keys (bounded by maxWaiters).
+	waiters  map[string][]chan struct{}
+	nWaiters int
 }
 
 type record struct {
@@ -68,6 +95,7 @@ func New(ttl time.Duration) *Store {
 	return &Store{
 		ttl:         ttl,
 		now:         time.Now,
+		maxWaiters:  defaultMaxWaiters,
 		pods:        make(map[types.UID]*record),
 		byContainer: make(map[string]*containerEntry),
 		byNode:      make(map[string]map[types.UID]*record),
@@ -128,6 +156,7 @@ func (s *Store) UpsertPod(p *corev1.Pod) {
 			for _, ch := range ws {
 				close(ch)
 			}
+			s.nWaiters -= len(ws)
 			delete(s.waiters, id)
 		}
 	}
@@ -239,22 +268,30 @@ func (s *Store) DeletePod(uid types.UID) {
 // metadata for that specific container arrives or ctx is done — waiting is
 // per container ID, not global on the cache. The initial lookup always
 // happens, so an already-expired ctx degrades to a non-blocking lookup.
-func (s *Store) GetContainer(ctx context.Context, id string) (ContainerResult, bool) {
+//
+// The returned error is non-nil only when the lookup was shed by the waiter
+// cap (ErrTooManyWaiters); ok is false then. A plain miss is (false, nil).
+func (s *Store) GetContainer(ctx context.Context, id string) (ContainerResult, bool, error) {
 	id = kubemeta.NormalizeContainerID(id)
 	if id == "" {
-		return ContainerResult{}, false
+		return ContainerResult{}, false, nil
 	}
 	// Fast path: read lock only.
 	s.mu.RLock()
 	res, ok, gone := s.lookupLocked(id)
 	s.mu.RUnlock()
 	if ok {
-		return res, true
+		return res, true, nil
 	}
 	if gone {
 		// Expired tombstone: the container is definitively deleted, so
 		// waiting for its metadata to (re)appear would just burn the budget.
-		return ContainerResult{}, false
+		return ContainerResult{}, false, nil
+	}
+	if len(id) > maxWaiterIDLen {
+		// Can never be a real runtime ID; do not hold client-chosen bytes as
+		// a waiter key (memory amplification) — degrade to a plain miss.
+		return ContainerResult{}, false, nil
 	}
 	for {
 		// Double-checked: the ID may have been indexed since the read-locked
@@ -264,27 +301,40 @@ func (s *Store) GetContainer(ctx context.Context, id string) (ContainerResult, b
 		res, ok, gone = s.lookupLocked(id)
 		s.mu.RUnlock()
 		if ok || gone {
-			return res, ok
+			return res, ok, nil
 		}
 		s.mu.Lock()
 		res, ok, gone = s.lookupLocked(id)
 		if ok || gone {
 			s.mu.Unlock()
-			return res, ok
+			return res, ok, nil
+		}
+		if s.nWaiters >= s.maxWaiters {
+			// Load shedding: every additional waiter is a pinned handler
+			// goroutine + map entry for the full wait budget. Fail fast and
+			// retryable rather than degrading everyone.
+			s.mu.Unlock()
+			return ContainerResult{}, false, ErrTooManyWaiters
 		}
 		ch := make(chan struct{})
 		s.waiters[id] = append(s.waiters[id], ch)
+		s.nWaiters++
 		s.mu.Unlock()
 
 		select {
 		case <-ctx.Done():
 			s.removeWaiter(id, ch)
-			return ContainerResult{}, false
+			return ContainerResult{}, false, nil
 		case <-ch:
 			// The ID was indexed; loop to fetch it.
 		}
 	}
 }
+
+// SetMaxWaiters overrides the blocked-lookup cap (primarily for tests; 0 or
+// negative sheds every blocking lookup). Not safe to call concurrently with
+// lookups.
+func (s *Store) SetMaxWaiters(n int) { s.maxWaiters = n }
 
 func (s *Store) removeWaiter(id string, ch chan struct{}) {
 	s.mu.Lock()
@@ -293,12 +343,20 @@ func (s *Store) removeWaiter(id string, ch chan struct{}) {
 	for i, c := range ws {
 		if c == ch {
 			s.waiters[id] = append(ws[:i], ws[i+1:]...)
+			s.nWaiters--
 			break
 		}
 	}
 	if len(s.waiters[id]) == 0 {
 		delete(s.waiters, id)
 	}
+}
+
+// waiterCount reports the blocked-lookup count (tests).
+func (s *Store) waiterCount() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.nWaiters
 }
 
 // lookupLocked resolves a normalized container ID. gone reports an expired

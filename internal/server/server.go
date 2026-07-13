@@ -121,6 +121,33 @@ func (s *Server) Handler() http.Handler {
 	return mux
 }
 
+// HTTPServer wraps s.Handler() in an http.Server with hardened timeouts. The
+// metadata service fronts a whole DaemonSet fleet, so a single slow, buggy or
+// hostile client must never pin connections and goroutines indefinitely:
+//
+//   - ReadHeaderTimeout kills Slowloris-style header trickling.
+//   - IdleTimeout reaps parked keep-alive connections.
+//   - ReadTimeout and WriteTimeout bound trickled request bodies (which the
+//     handlers never read, but net/http drains before connection reuse) and
+//     stuck response writes. Both MUST exceed MaxWait: the container endpoint
+//     legitimately holds a request for up to MaxWait, WriteTimeout's clock
+//     starts when the request headers are read, and a ReadTimeout shorter
+//     than the handler's runtime cancels the request context (net/http's
+//     background read hits the whole-request read deadline mid-handler),
+//     which would abort legitimate waits early. Hence MaxWait + slack, never
+//     a fixed constant.
+func (s *Server) HTTPServer(addr string) *http.Server {
+	const slack = 30 * time.Second
+	return &http.Server{
+		Addr:              addr,
+		Handler:           s.Handler(),
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       s.maxWait + slack,
+		WriteTimeout:      s.maxWait + slack,
+		IdleTimeout:       120 * time.Second,
+	}
+}
+
 // counted wraps a handler with the per-pattern request counter.
 func counted(pattern string, h http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -140,6 +167,12 @@ func (r *statusRecorder) WriteHeader(code int) {
 	r.ResponseWriter.WriteHeader(code)
 }
 
+// maxContainerIDLen bounds the container-ID path segment. Real runtime IDs
+// are 64 hex characters (plus an optional scheme prefix, stripped before this
+// check); anything longer is rejected up front so hostile IDs never reach the
+// store's waiter map.
+const maxContainerIDLen = 256
+
 // handleContainer serves GET /v1/containers/{id}?wait=2s.
 //
 // The ID may include the runtime prefix ("containerd://..."), URL-escaped or
@@ -152,9 +185,15 @@ func (s *Server) handleContainer(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	id := r.PathValue("id")
-	if kubemeta.NormalizeContainerID(id) == "" {
+	id := kubemeta.NormalizeContainerID(r.PathValue("id"))
+	if id == "" {
 		writeError(w, http.StatusBadRequest, "empty container id")
+		return
+	}
+	if len(id) > maxContainerIDLen {
+		// A real runtime ID is 64 hex characters; a kilobytes-long path
+		// segment is hostile input, not a container that might yet appear.
+		writeError(w, http.StatusBadRequest, "container id too long")
 		return
 	}
 
@@ -168,9 +207,17 @@ func (s *Server) handleContainer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	res, ok := s.store.GetContainer(ctx, id)
+	res, ok, err := s.store.GetContainer(ctx, id)
+	if err != nil {
+		// Waiter cap: shed the blocking lookup as retryable, never as 404 —
+		// the container may exist momentarily, the store is just saturated
+		// with blocked lookups.
+		w.Header().Set("Retry-After", "1")
+		writeError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
 	if !ok {
-		writeError(w, http.StatusNotFound, fmt.Sprintf("container %q not found", kubemeta.NormalizeContainerID(id)))
+		writeError(w, http.StatusNotFound, fmt.Sprintf("container %q not found", id))
 		return
 	}
 	s.enrich(&res.Pod, res.OwnerRefs)

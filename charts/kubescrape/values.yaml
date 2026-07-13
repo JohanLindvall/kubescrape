@@ -138,6 +138,9 @@ agent:
   # auto/start make adding a new log source ingest those files' existing
   # content.
   logsUnknownFiles: auto
+  # Close the fd of a fully-caught-up file after this much inactivity (0 keeps
+  # fds open); bounds steady-state fds at one per active file.
+  logsIdleClose: 10m
   # Overlap reading with export delivery (one export in flight; at-least-once
   # semantics unchanged).
   logsPipelinedExport: false

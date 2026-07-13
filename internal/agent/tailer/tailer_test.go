@@ -1209,3 +1209,157 @@ func TestUnknownFileAutoReadsFromStart(t *testing.T) {
 		return false
 	}, "content written while down is shipped")
 }
+
+// rotateAway renames the live log file aside (the first half of a kubelet
+// rename+recreate rotation), leaving the path momentarily absent.
+func rotateAway(t *testing.T, dir string, gen int) {
+	t.Helper()
+	path := filepath.Join(dir, logName)
+	if err := os.Rename(path, fmt.Sprintf("%s.%d", path, gen)); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestListingDuringRotationDoesNotDropFile reproduces a directory listing
+// racing a rename+recreate rotation: scanDir runs in the instant the path is
+// absent (between the rename and the recreate) and marks the live file gone.
+// A later listing sees the recreated path and must unmark it — otherwise the
+// next sweep drops the file with its state and checkpoint, losing every
+// inode rotated away before rediscovery.
+func TestListingDuringRotationDoesNotDropFile(t *testing.T) {
+	dir := t.TempDir()
+	exp := &fakeExporter{}
+	tl := newTestTailer(dir, "", exp)
+	ctx := context.Background()
+
+	tl.scanDir(nil, true) // initial scan: empty dir
+	writeLog(t, dir, timeNowCRI()+" stdout F one")
+	tl.scanDir(nil, false)
+	tl.sweep(ctx, true)
+	tl.flush(ctx)
+
+	path := filepath.Join(dir, logName)
+	rotateAway(t, dir, 1)
+	tl.scanDir(nil, false) // listing in the absent window: marks gone
+	writeLog(t, dir, timeNowCRI()+" stdout F two")
+	tl.scanDir(nil, false) // path is back: must clear gone
+
+	tl.sweep(ctx, true)
+	if _, ok := tl.files[path]; !ok {
+		t.Fatal("file dropped after a listing raced the rename+recreate rotation")
+	}
+	tl.sweep(ctx, true) // reopen marked the file dirty; read the new inode
+	tl.flush(ctx)
+	got := exp.get()
+	if len(got) != 2 || got[0] != "one" || got[1] != "two" {
+		t.Fatalf("expected [one two] across the rotation, got %v", got)
+	}
+}
+
+// TestGoneFileBackBeforeSweepSurvives covers the sweep-side guard: the file
+// is marked gone by a listing that raced the rotation and NO further listing
+// runs before the sweep. The sweep must re-stat the path and, finding it
+// alive, keep the file instead of dropping it.
+func TestGoneFileBackBeforeSweepSurvives(t *testing.T) {
+	dir := t.TempDir()
+	exp := &fakeExporter{}
+	tl := newTestTailer(dir, "", exp)
+	ctx := context.Background()
+
+	tl.scanDir(nil, true)
+	writeLog(t, dir, timeNowCRI()+" stdout F one")
+	tl.scanDir(nil, false)
+	tl.sweep(ctx, true)
+	tl.flush(ctx)
+
+	path := filepath.Join(dir, logName)
+	rotateAway(t, dir, 1)
+	tl.scanDir(nil, false) // marks gone
+	writeLog(t, dir, timeNowCRI()+" stdout F two")
+
+	tl.sweep(ctx, true) // no listing between recreate and sweep
+	if _, ok := tl.files[path]; !ok {
+		t.Fatal("sweep dropped a file whose path was alive again")
+	}
+	tl.sweep(ctx, true) // reopen marked the file dirty; read the new inode
+	tl.flush(ctx)
+	got := exp.get()
+	if len(got) != 2 || got[0] != "one" || got[1] != "two" {
+		t.Fatalf("expected [one two] across the rotation, got %v", got)
+	}
+
+	// A genuinely deleted file must still be dropped.
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	tl.scanDir(nil, false)
+	tl.sweep(ctx, true)
+	if _, ok := tl.files[path]; ok {
+		t.Fatal("genuinely deleted file was not dropped")
+	}
+}
+
+// TestEventSweepsNotStarvedByContinuousWrites guards the debounce against
+// per-event re-arming: a file written more often than the debounce interval
+// must still get event-driven sweeps (the poll interval here is far too long
+// to deliver anything within the test deadline). With per-event Reset the
+// debounce timer never fires under sustained writes, sweeps degrade to the
+// poll fallback, and sub-poll-interval rename rotations silently lose whole
+// segments.
+func TestEventSweepsNotStarvedByContinuousWrites(t *testing.T) {
+	dir := t.TempDir()
+	exp := &fakeExporter{}
+	tl := New(Config{
+		Dir:           dir,
+		Watch:         true,
+		PollInterval:  time.Hour, // events must carry the test alone
+		FlushInterval: 50 * time.Millisecond,
+		BatchSize:     1000,
+		MetadataWait:  time.Second,
+		Metadata:      fakeMeta{},
+		Exporter:      exp,
+	})
+	tl.retryBackoff = 10 * time.Millisecond
+	stop := startTailer(t, tl)
+	defer stop()
+
+	// Continuous writes: an event at least every few milliseconds.
+	writerCtx, cancelWriter := context.WithCancel(context.Background())
+	defer cancelWriter()
+	go func() {
+		for i := 0; writerCtx.Err() == nil; i++ {
+			writeLog(t, dir, timeNowCRI()+" stdout F line"+strconv.Itoa(i))
+			time.Sleep(2 * time.Millisecond)
+		}
+	}()
+
+	waitFor(t, func() bool { return len(exp.get()) > 0 }, "event-driven sweep exports under sustained writes")
+}
+
+// TestIdleCloseReleasesAndReopens: a fully-caught-up idle file's fd closes
+// after IdleClose, and the file transparently reopens and resumes on new
+// activity without loss or duplication.
+func TestIdleCloseReleasesAndReopens(t *testing.T) {
+	dir := t.TempDir()
+	exp := &fakeExporter{}
+	tl := newTestTailer(dir, filepath.Join(t.TempDir(), "chk"), exp)
+	tl.cfg.IdleClose = 200 * time.Millisecond
+	stop := startTailer(t, tl)
+	defer stop()
+
+	writeLog(t, dir, timeNowCRI()+" stdout F before-idle")
+	waitFor(t, func() bool { return len(exp.get()) == 1 }, "first line exported")
+
+	// Age the file's mtime past IdleClose so housekeeping closes the fd.
+	old := time.Now().Add(-time.Minute)
+	if err := os.Chtimes(filepath.Join(dir, logName), old, old); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(500 * time.Millisecond) // let housekeeping close the idle fd
+
+	writeLog(t, dir, timeNowCRI()+" stdout F after-idle")
+	waitFor(t, func() bool {
+		recs := exp.get()
+		return len(recs) == 2 && recs[1] == "after-idle"
+	}, "file reopened and resumed after idle close")
+}

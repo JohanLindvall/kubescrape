@@ -25,6 +25,7 @@ import (
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/client-go/discovery"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/dynamic/dynamicinformer"
 	"k8s.io/client-go/informers"
@@ -198,8 +199,8 @@ func run() error {
 
 	var monitors *servicemonitors.Index
 	if *monitorsOn {
-		if _, err := client.Discovery().ServerResourcesForGroupVersion(servicemonitors.GVR.GroupVersion().String()); err != nil {
-			log.Warn("servicemonitors requested but the CRD group is unavailable; disabling", "error", err)
+		if err := checkServiceMonitorCRD(client.Discovery()); err != nil {
+			log.Warn("servicemonitors requested but the CRD is unavailable; disabling", "error", err)
 		} else {
 			dynClient, err := dynamic.NewForConfig(cfg)
 			if err != nil {
@@ -365,6 +366,24 @@ func buildConfig(kubeconfig string) (*rest.Config, error) {
 	rules := clientcmd.NewDefaultClientConfigLoadingRules()
 	rules.ExplicitPath = kubeconfig
 	return clientcmd.NewNonInteractiveDeferredLoadingClientConfig(rules, nil).ClientConfig()
+}
+
+// checkServiceMonitorCRD verifies the ServiceMonitor CRD is actually served.
+// The group/version existing is not enough: another monitoring.coreos.com/v1
+// CRD (e.g. PrometheusRule alone) registers the group while servicemonitor
+// LISTs would fail forever, wedging readiness behind an informer that can
+// never sync.
+func checkServiceMonitorCRD(d discovery.DiscoveryInterface) error {
+	list, err := d.ServerResourcesForGroupVersion(servicemonitors.GVR.GroupVersion().String())
+	if err != nil {
+		return err
+	}
+	for _, r := range list.APIResources {
+		if r.Name == servicemonitors.GVR.Resource {
+			return nil
+		}
+	}
+	return fmt.Errorf("resource %q not served by %s", servicemonitors.GVR.Resource, servicemonitors.GVR.GroupVersion())
 }
 
 // stripManagedFields drops managedFields before objects are stored in the

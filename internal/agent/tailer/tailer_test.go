@@ -1149,3 +1149,25 @@ func TestDeferredCRIEmissionOffsets(t *testing.T) {
 		t.Fatalf("watermark = %d,%v, want %d,true (fragment lost coverage)", wm, ok, endF)
 	}
 }
+
+// TestNewFileCheckpointedOnDiscovery pins the crash-window fix: a newly
+// discovered file must have a checkpoint entry persisted immediately, so a
+// kill -9 before the 10s periodic save cannot make the restart treat it as
+// pre-existing history (skip-to-end = silent loss of its unread lines).
+func TestNewFileCheckpointedOnDiscovery(t *testing.T) {
+	dir := t.TempDir()
+	chk := filepath.Join(t.TempDir(), "chk")
+	exp := &fakeExporter{}
+	tl := newTestTailer(dir, chk, exp)
+	stop := startTailer(t, tl)
+	defer stop()
+
+	writeLog(t, dir, timeNowCRI()+" stdout F hello")
+	waitFor(t, func() bool {
+		data, err := os.ReadFile(chk)
+		if err != nil {
+			return false
+		}
+		return strings.Contains(string(data), logName)
+	}, "checkpoint entry persisted at discovery, before the periodic save")
+}

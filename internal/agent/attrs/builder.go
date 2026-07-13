@@ -86,15 +86,30 @@ func LoadConfig(path string) (*Config, error) {
 	if err := yaml.UnmarshalStrict(data, &cfg); err != nil {
 		return nil, fmt.Errorf("%s: %w", path, err)
 	}
-	for name, sub := range cfg.Pipelines {
-		if !slicesContains(pipelineNames, name) {
-			return nil, fmt.Errorf("%s: unknown pipeline %q (want one of %s)", path, name, strings.Join(pipelineNames, ", "))
-		}
-		if sub != nil && len(sub.Pipelines) > 0 {
-			return nil, fmt.Errorf("%s: pipeline %q must not nest pipelines", path, name)
-		}
+	if err := cfg.validatePipelines(); err != nil {
+		return nil, fmt.Errorf("%s: %w", path, err)
 	}
 	return &cfg, nil
+}
+
+// validatePipelines rejects unknown pipeline names (strict YAML parsing cannot
+// catch bad map keys) and nested pipeline sections. It runs in LoadConfig and
+// again in NewBuilders, so the unified agent config path — which unmarshals
+// the section itself — gets the same errors instead of silently ignoring a
+// typo'd pipeline.
+func (c *Config) validatePipelines() error {
+	if c == nil {
+		return nil
+	}
+	for name, sub := range c.Pipelines {
+		if !slicesContains(pipelineNames, name) {
+			return fmt.Errorf("unknown pipeline %q (want one of %s)", name, strings.Join(pipelineNames, ", "))
+		}
+		if sub != nil && len(sub.Pipelines) > 0 {
+			return fmt.Errorf("pipeline %q must not nest pipelines", name)
+		}
+	}
+	return nil
 }
 
 func slicesContains(list []string, s string) bool {
@@ -121,6 +136,9 @@ type Builders struct {
 // everywhere) and one shared filter. Each pipeline merges the base config with
 // its own section and picks up its default instance prefix.
 func NewBuilders(cfg *Config, filter *Filter) (*Builders, error) {
+	if err := cfg.validatePipelines(); err != nil {
+		return nil, err
+	}
 	b := &Builders{}
 	assign := map[string]**Builder{
 		"logs": &b.Logs, "targets": &b.Targets, "cadvisor": &b.Cadvisor,

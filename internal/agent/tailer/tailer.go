@@ -760,6 +760,7 @@ func parseFileName(name string) (containerID, namespace string, ok bool) {
 // their include patterns. checkpoints is non-nil only on the initial scan.
 func (t *Tailer) scanDir(checkpoints map[string]checkpoint, initial bool) {
 	seen := make(map[string]struct{})
+	discovered := false
 	listingOK := true
 	defer func() {
 		if !listingOK && !t.warnedListing {
@@ -816,6 +817,7 @@ func (t *Tailer) scanDir(checkpoints map[string]checkpoint, initial bool) {
 			t.newPipeline(f)
 			t.initFile(f, checkpoints, initial)
 			t.files[path] = f
+			discovered = true
 		}
 	}
 	if listingOK {
@@ -826,6 +828,13 @@ func (t *Tailer) scanDir(checkpoints map[string]checkpoint, initial bool) {
 		}
 	}
 	obs.LogFiles.Set(float64(len(t.files)))
+	if discovered && (t.cfg.Positions != nil || t.cfg.CheckpointFile != "") {
+		// Persist immediately: until a file has a checkpoint entry, a crash
+		// makes the restart treat it as pre-existing history and skip to its
+		// end — the 10s periodic save left every new file a window in which
+		// kill -9 lost its unread lines (and everything written while down).
+		t.saveCheckpoints()
+	}
 }
 
 // initFile seeds a newly discovered file's checkpoint/starting offset.

@@ -304,6 +304,25 @@ func TestBuildersPipelines(t *testing.T) {
 	}
 }
 
+// NewBuilders must reject bad pipeline sections itself: the unified agent
+// config unmarshals the resourceAttributes section without going through
+// LoadConfig, so a typo'd pipeline name (a map key strict YAML parsing cannot
+// catch) or a nested pipelines section must not be silently ignored.
+func TestNewBuildersPipelineValidation(t *testing.T) {
+	if _, err := NewBuilders(&Config{
+		Pipelines: map[string]*Config{"bogus": {Static: map[string]string{"a": "b"}}},
+	}, nil); err == nil {
+		t.Error("unknown pipeline name must error")
+	}
+	if _, err := NewBuilders(&Config{
+		Pipelines: map[string]*Config{"logs": {
+			Pipelines: map[string]*Config{"node": {Static: map[string]string{"a": "b"}}},
+		}},
+	}, nil); err == nil {
+		t.Error("nested pipelines must error")
+	}
+}
+
 func TestLoadConfigPipelineValidation(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "attrs.yaml")
 	if err := os.WriteFile(path, []byte("pipelines:\n  bogus:\n    static: {a: b}\n"), 0o600); err != nil {

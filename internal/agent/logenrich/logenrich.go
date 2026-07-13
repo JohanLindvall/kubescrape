@@ -12,6 +12,7 @@ import (
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/plog"
 
+	"github.com/JohanLindvall/kubescrape/internal/metrics"
 	"github.com/JohanLindvall/kubescrape/internal/obs"
 )
 
@@ -30,17 +31,36 @@ func ApplyBody(lr plog.LogRecord) {
 	apply(lr, lr.Body().Str(), false)
 }
 
+// The enrichment-outcome counters, resolved once per format: the label values
+// are a closed set, so the per-line WithLabelValues map probe (1.5% of flush
+// CPU) is pure overhead.
+var (
+	enrichedJSON    = obs.LogEnriched.WithLabelValues(enrich.FormatJSON)
+	enrichedLogfmt  = obs.LogEnriched.WithLabelValues(enrich.FormatLogfmt)
+	enrichedPattern = obs.LogEnriched.WithLabelValues(enrich.FormatPattern)
+	enrichedNone    = obs.LogEnriched.WithLabelValues("none")
+)
+
+func enrichedCounter(format string) *metrics.RegCounter {
+	switch format {
+	case enrich.FormatJSON:
+		return enrichedJSON
+	case enrich.FormatLogfmt:
+		return enrichedLogfmt
+	case enrich.FormatPattern:
+		return enrichedPattern
+	default:
+		return enrichedNone
+	}
+}
+
 // apply parses line and promotes its metadata onto lr. When overwrite is
 // false, only fields the record leaves unset are filled.
 func apply(lr plog.LogRecord, line string, overwrite bool) {
 	var res enrich.Result // stack-held; ParseInto avoids the per-line heap Result
 	enrich.ParseInto(line, &res)
 	e := &res
-	format := e.Format
-	if format == enrich.FormatNone {
-		format = "none"
-	}
-	obs.LogEnriched.WithLabelValues(format).Inc()
+	enrichedCounter(e.Format).Inc()
 
 	if !e.Time.IsZero() && (overwrite || lr.Timestamp() == 0) {
 		lr.SetTimestamp(pcommon.NewTimestampFromTime(e.Time))

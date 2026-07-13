@@ -183,6 +183,7 @@ type Tailer struct {
 	batch          []entry
 	readBuf        []byte // reusable read scratch (single sweep goroutine)
 	warnedListing  bool   // a glob-failure warning was already emitted
+	lastIdleScan   time.Time
 	lastFlush      time.Time
 	lastCheckpoint time.Time
 	retryBackoff   time.Duration // initial export retry backoff
@@ -699,7 +700,15 @@ func (t *Tailer) closeIdleFiles() {
 	if t.cfg.IdleClose <= 0 {
 		return
 	}
+	// Housekeeping runs on every debounced sweep (up to 20x/s under load);
+	// a coarse inactivity timeout does not need scanning every file (and its
+	// watermark) that often.
 	now := time.Now()
+	scanEvery := min(t.cfg.IdleClose/4, 30*time.Second)
+	if now.Sub(t.lastIdleScan) < scanEvery {
+		return
+	}
+	t.lastIdleScan = now
 	for _, f := range t.files {
 		if f.f == nil || f.compressed || f.dirty || f.limited {
 			continue

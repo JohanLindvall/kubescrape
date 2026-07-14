@@ -130,3 +130,32 @@ func BenchmarkExport(b *testing.B) {
 		}
 	}
 }
+
+// BenchmarkDynamicAddBound measures the path the tailer flush actually takes:
+// the resource is hashed once per flush via Bind, and every line of that file
+// reuses it. The unbound Add benchmarks re-hash the resource per line, which no
+// production caller does, so they understate the share of the remaining work
+// that the data-point label hashing represents.
+func BenchmarkDynamicAddBound(b *testing.B) {
+	setTimeForTest(time.Unix(1_700_400_300, 0))
+	defer testEpoch.Store(0)
+	set := benchRules(b)
+	res := benchResource()
+	attrs := map[string]string{
+		"level": "info", "http_status": "200", "method": "GET", "latency_ms": "42.5",
+	}
+	lookup := func(k string) string { return attrs[k] }
+	values := func(k string) (float64, bool) {
+		if k == "latency_ms" {
+			return 42.5, true
+		}
+		return 0, false
+	}
+	line := `GET /api/v1/orders 200 42.5ms`
+	bound := set.Bind(res)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		bound.Add(values, lookup, line)
+	}
+}

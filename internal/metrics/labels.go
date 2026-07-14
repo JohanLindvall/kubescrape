@@ -83,6 +83,22 @@ func (l labels) checkAccum() uint64 {
 	return h
 }
 
+// accums returns both accumulators in one pass. Callers that need the pair —
+// every series lookup does, to key the sample and to carry its collision check
+// — must use this rather than calling hashAccum and checkAccum in turn: the
+// expensive part of each entry is hashing the key and value strings, and the
+// two accumulators fold the very same two hashes. Computing them once halves
+// the string hashing on the observe path. The results are identical to calling
+// the two separately (TestAccumsMatchSeparate).
+func (l labels) accums() (h, check uint64) {
+	for _, e := range l {
+		hk, hv := xxhash.Sum64String(e.key), xxhash.Sum64String(e.value)
+		h += combineHash(hk, hv)
+		check += combineCheck(hk, hv)
+	}
+	return h, check
+}
+
 // hash is the finalized order-independent hash of the label set.
 func (l labels) hash() uint64 { return mixHash(l.hashAccum()) }
 

@@ -103,8 +103,8 @@ type bound struct {
 }
 
 func newBound(s *series, lbls labels) bound {
-	base := lbls.hashAccum()
-	return bound{s: s, lbls: lbls, base: base, check: lbls.checkAccum(), hash: mixHash(base)}
+	base, check := lbls.accums()
+	return bound{s: s, lbls: lbls, base: base, check: check, hash: mixHash(base)}
 }
 
 var emptyResource = pcommon.NewMap()

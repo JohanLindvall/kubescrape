@@ -407,7 +407,33 @@ type streamState struct {
 	closedEnd   int64
 	nextStart   int64
 	hasNext     bool
-	fifo        []logItem
+
+	// fifo holds the buffered logical lines; the live ones are fifo[fifoHead:].
+	// Consumption advances fifoHead rather than re-slicing fifo, so the backing
+	// array is reused: re-slicing walked the array forward until its capacity
+	// ran out, and since the steady state is one line pushed and one popped, it
+	// then reallocated a one-element array for EVERY subsequent line — the
+	// tailer's whole per-line allocation. Popping the last live item recycles
+	// the array instead (see pop).
+	fifo     []logItem
+	fifoHead int
+}
+
+// live are the buffered items still awaiting emission.
+func (st *streamState) live() []logItem { return st.fifo[st.fifoHead:] }
+
+// push appends one logical line's offset range.
+func (st *streamState) push(it logItem) { st.fifo = append(st.fifo, it) }
+
+// pop discards the first n live items. Once the fifo drains it resets to the
+// base of the backing array, so the steady state never allocates. A partially
+// drained fifo keeps its head offset; it is bounded by the buffered group.
+func (st *streamState) pop(n int) {
+	st.fifoHead += n
+	if st.fifoHead >= len(st.fifo) {
+		st.fifo = st.fifo[:0]
+		st.fifoHead = 0
+	}
 }
 
 // state returns the key's stream state, creating it on first use. The slice
@@ -445,11 +471,12 @@ func (l *ledger) reanchor() {
 		st.closedStart = 0
 		st.closedEnd = 0
 		st.nextStart = 0
-		for i := range st.fifo {
+		live := st.live()
+		for i := range live {
 			// Zero the offsets only: when must survive, or the fifo's
 			// orphan detection would mistake reanchored live items for
 			// dropped lines.
-			st.fifo[i].start, st.fifo[i].end = 0, 0
+			live[i].start, live[i].end = 0, 0
 		}
 	}
 }
@@ -511,8 +538,8 @@ func (l *ledger) watermark() (int64, bool) {
 		if st.hasRun {
 			lower(st.runStart)
 		}
-		if len(st.fifo) > 0 {
-			lower(st.fifo[0].start)
+		if live := st.live(); len(live) > 0 {
+			lower(live[0].start)
 		}
 	}
 	return wm, wm >= 0
@@ -1007,24 +1034,28 @@ func (t *Tailer) newPipeline(f *file) {
 	if f.source.multiline {
 		f.traces = multiline.New(func(_ context.Context, e multiline.Entry[time.Time]) error {
 			st := f.stateFor(e.Key)
-			items := st.fifo
+			items := st.live()
 			// The multiline stage's line/byte caps can drop over-limit lines
 			// without ever emitting them (their runs never complete), leaving
 			// orphaned items that would freeze the watermark — and with it
 			// this file's checkpoint — forever. The entry's first-line time
 			// identifies the true head: timestamps are monotonic per stream,
 			// so strictly-older leading items belong to dropped lines.
-			for len(items) > 0 && items[0].when.Before(e.Data) {
-				items = items[1:]
+			dropped := 0
+			for dropped < len(items) && items[dropped].when.Before(e.Data) {
+				dropped++
 				obs.LogFifoDropped.Inc()
 			}
-			st.fifo = items
+			if dropped > 0 {
+				st.pop(dropped) // persist the drops even if nothing is emitted below
+				items = st.live()
+			}
 			n := min(e.Lines, len(items)) // Lines > len(items) must not happen; defensive
 			if n == 0 {
 				return nil
 			}
 			start, end := items[0].start, items[n-1].end
-			st.fifo = items[n:]
+			st.pop(n)
 			t.emit(f, entry{
 				time: e.Data, stream: st.stream, body: e.Text,
 				truncated: e.Truncated, match: e.Match, start: start, offset: end,
@@ -1072,7 +1103,7 @@ func (t *Tailer) newPipeline(f *file) {
 				t.emit(f, entry{time: when, stream: st.stream, body: line, start: start, offset: end})
 				return nil
 			}
-			st.fifo = append(st.fifo, logItem{start: start, end: end, when: when})
+			st.push(logItem{start: start, end: end, when: when})
 			return f.traces.AddAt(ctx, key, line, when, when)
 		}, multiline.WithMaxBytes(t.cfg.MaxEntryBytes))
 	} else {
@@ -1156,7 +1187,7 @@ func (t *Tailer) feedPlainLine(ctx context.Context, f *file, raw string, start, 
 		t.emit(f, entry{time: when, body: raw, start: start, offset: end})
 		return
 	}
-	f.stPlain.fifo = append(f.stPlain.fifo, logItem{start: start, end: end, when: when})
+	f.stPlain.push(logItem{start: start, end: end, when: when})
 	if err := f.traces.AddAt(ctx, plainKey, raw, when, when); err != nil {
 		t.log.Warn("log pipeline", "path", f.path, "error", err)
 	}

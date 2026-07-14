@@ -109,3 +109,26 @@ func TestResourceLabelOverrideKeysMergedIdentity(t *testing.T) {
 		}
 	}
 }
+
+// TestAccumsMatchSeparate pins the fused accumulator to the two it replaces on
+// the observe path. If they ever diverge, series identity silently changes and
+// every existing series in a running agent would be orphaned.
+func TestAccumsMatchSeparate(t *testing.T) {
+	for _, ls := range []labels{
+		nil,
+		{},
+		{{"a", "1"}},
+		{{"zone", "eu"}, {"status", "3xx"}, {"country", "ad"}},
+		{{"le", "0.5"}, {"handler", "/api"}},
+		{{"dup", "x"}, {"dup", "x"}}, // the duplicate case XOR got wrong
+		{{"k", ""}, {"", "v"}},
+	} {
+		h, c := ls.accums()
+		if want := ls.hashAccum(); h != want {
+			t.Errorf("accums hash %d, hashAccum %d (labels %v)", h, want, ls)
+		}
+		if want := ls.checkAccum(); c != want {
+			t.Errorf("accums check %d, checkAccum %d (labels %v)", c, want, ls)
+		}
+	}
+}

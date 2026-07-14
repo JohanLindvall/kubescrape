@@ -328,8 +328,7 @@ func (s *series) observePreHashed(lbls labels, hash, check uint64, value float64
 // a histogram it strips any caller-provided "le" so the synthetic per-bucket one
 // is the only contribution folded in per bucket.
 func (s *series) baseAccum(lbls labels) (base, check uint64) {
-	base = lbls.hashAccum()
-	check = lbls.checkAccum()
+	base, check = lbls.accums()
 	if s.kind == kindHistogram {
 		if v, ok := lbls.get(leLabel); ok {
 			hk, hv := xxhash.Sum64String(leLabel), xxhash.Sum64String(v)

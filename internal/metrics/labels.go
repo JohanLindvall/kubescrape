@@ -215,22 +215,22 @@ const (
 	prime5 uint64 = 2870177450012600261
 )
 
-// combineHash folds two 64-bit hashes into one using xxhash's mixing steps.
-// Order matters; it is used to combine a key hash with its value hash.
+// combineHash folds two 64-bit hashes into one. The inputs are already xxhash
+// outputs (uniformly mixed), so a linear projection — distinct odd multipliers
+// plus a rotation break the (h1,h2)/(h2,h1) symmetry — followed by one
+// avalanche disperses the pair for the outer wrapping sum. Series hashes are
+// in-memory only (the db is rebuilt on restart; export identity is the labels
+// themselves), so this formula carries no persistence constraint.
 func combineHash(h1, h2 uint64) uint64 {
-	h := prime5 + 16
-	h ^= hashRound(0, h1)
-	h = bits.RotateLeft64(h, 27)*prime1 + prime4
-	h ^= hashRound(0, h2)
-	h = bits.RotateLeft64(h, 27)*prime1 + prime4
-	return mixHash(h)
+	return mixHash(h1*prime1 + bits.RotateLeft64(h2, 29)*prime2)
 }
 
-// combineCheck is an alternative mixing of the same two hashes, independent of
-// combineHash (swapped order plus a rotation), for the collision-check
-// accumulator.
+// combineCheck is a second projection of the same pair for the collision-check
+// accumulator, independent of combineHash (different multipliers, swapped
+// operands, different rotation): a pair collision in one projection is not a
+// collision in the other, keeping the double-collision odds at ~2^-128.
 func combineCheck(h1, h2 uint64) uint64 {
-	return combineHash(bits.RotateLeft64(h2, 31), h1)
+	return mixHash(h2*prime3 + bits.RotateLeft64(h1, 47)*prime4)
 }
 
 // mixHash performs the final xxhash avalanche on h.
@@ -241,11 +241,4 @@ func mixHash(h uint64) uint64 {
 	h *= prime3
 	h ^= h >> 32
 	return h
-}
-
-func hashRound(acc, input uint64) uint64 {
-	acc += input * prime2
-	acc = bits.RotateLeft64(acc, 31)
-	acc *= prime1
-	return acc
 }

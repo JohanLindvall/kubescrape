@@ -263,6 +263,20 @@ type splitBatcher struct {
 	lastMName   string
 	lastM       pmetric.Metric
 	lastMOK     bool
+
+	// Per-scrape regex memos (pure mappings, so they survive reset()): the
+	// first-matching-rule per family name — ruleFor walks every rule's metrics
+	// regex, and a family's series arrive as a run of samples — and the
+	// dropLabels verdict per (rule, label name) — label names are a small
+	// closed set, but putSplitLabels ran the regex per label per data point.
+	ruleMemo map[string]*compiledSplitRule
+	dropMemo map[dropKey]bool
+}
+
+// dropKey memoizes one rule's dropLabels verdict on one label name.
+type dropKey struct {
+	rule *compiledSplitRule
+	name string
 }
 
 type kv struct{ key, value string }
@@ -273,6 +287,8 @@ func newSplitBatcher(s *Scraper, ctx context.Context, t kubemeta.ScrapeTarget, s
 		defaultPrefix: attrs.ServiceName(t.Pod),
 		startTS:       pcommon.NewTimestampFromTime(s.cfg.StartTime),
 		scrapeTS:      pcommon.NewTimestampFromTime(scrape),
+		ruleMemo:      make(map[string]*compiledSplitRule, 64),
+		dropMemo:      make(map[dropKey]bool, 64),
 	}
 	b.reset()
 	return b
@@ -311,7 +327,13 @@ func (b *splitBatcher) size() int  { return b.bytes }
 // (rule, groupBy values) are memoized: a repeat costs value memcmps instead of
 // rebuilding the key.
 func (b *splitBatcher) route(name string, labels []Label) (pmetric.ScopeMetrics, string, *compiledSplitRule, []kv) {
-	rule := b.sp.ruleFor(name)
+	rule, ok := b.ruleMemo[name]
+	if !ok {
+		rule = b.sp.ruleFor(name)
+		if len(b.ruleMemo) < maxTrackedFamilies {
+			b.ruleMemo[name] = rule
+		}
+	}
 	b.vals = b.vals[:0]
 	if rule != nil {
 		for _, g := range rule.groupBy {
@@ -463,11 +485,11 @@ func labelValue(labels []Label, name string) string {
 
 // putSplitLabels writes the non-grouped labels onto a data point (minus the
 // rule's dropLabels), plus the attributes moved off the split resource (dp).
-func putSplitLabels(attrsMap pcommon.Map, rule *compiledSplitRule, labels []Label, dp []kv) {
+func (b *splitBatcher) putSplitLabels(attrsMap pcommon.Map, rule *compiledSplitRule, labels []Label, dp []kv) {
 	for _, l := range labels {
 		grouped := false
 		if rule != nil {
-			if rule.dropLabels != nil && rule.dropLabels.MatchString(l.Name) {
+			if rule.dropLabels != nil && b.dropped(rule, l.Name) {
 				continue
 			}
 			for _, g := range rule.groupBy {
@@ -484,6 +506,19 @@ func putSplitLabels(attrsMap pcommon.Map, rule *compiledSplitRule, labels []Labe
 	for _, a := range dp {
 		attrsMap.PutStr(a.key, a.value)
 	}
+}
+
+// dropped memoizes rule.dropLabels.MatchString(name) per (rule, label name).
+func (b *splitBatcher) dropped(rule *compiledSplitRule, name string) bool {
+	key := dropKey{rule: rule, name: name}
+	verdict, ok := b.dropMemo[key]
+	if !ok {
+		verdict = rule.dropLabels.MatchString(name)
+		if len(b.dropMemo) < maxInternedValues {
+			b.dropMemo[key] = verdict
+		}
+	}
+	return verdict
 }
 
 func (b *splitBatcher) metric(name string, labels []Label, shape func(pmetric.Metric)) (pmetric.Metric, *compiledSplitRule, []kv) {
@@ -529,7 +564,7 @@ func (b *splitBatcher) addNumber(s Sample, monotonic bool) {
 	}
 	dp.SetDoubleValue(s.Value)
 	dp.SetTimestamp(b.pointTS(s.TimestampMs))
-	putSplitLabels(dp.Attributes(), rule, s.Labels, dpa)
+	b.putSplitLabels(dp.Attributes(), rule, s.Labels, dpa)
 	if s.Exemplar != nil {
 		setExemplar(dp.Exemplars().AppendEmpty(), *s.Exemplar, b.scrapeTS)
 	}
@@ -549,7 +584,7 @@ func (b *splitBatcher) addHistogram(family string, acc *histAcc) {
 	dp.SetStartTimestamp(b.startTS)
 	dp.SetTimestamp(b.pointTS(acc.ts))
 	fillHistogramPoint(dp, acc)
-	putSplitLabels(dp.Attributes(), rule, acc.labels, dpa)
+	b.putSplitLabels(dp.Attributes(), rule, acc.labels, dpa)
 	for _, e := range acc.exemplars {
 		setExemplar(dp.Exemplars().AppendEmpty(), e, b.scrapeTS)
 	}
@@ -569,7 +604,7 @@ func (b *splitBatcher) addSummary(family string, acc *summAcc) {
 	dp.SetStartTimestamp(b.startTS)
 	dp.SetTimestamp(b.pointTS(acc.ts))
 	fillSummaryPoint(dp, acc)
-	putSplitLabels(dp.Attributes(), rule, acc.labels, dpa)
+	b.putSplitLabels(dp.Attributes(), rule, acc.labels, dpa)
 	b.points++
 	b.bytes += summBytes(acc)
 }

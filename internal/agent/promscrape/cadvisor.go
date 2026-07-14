@@ -250,14 +250,26 @@ type cadvisorBatcher struct {
 	lastName     string
 	lastMetric   pmetric.Metric
 	lastOK       bool
+
+	// cgroupMemo caches cgroupIdentity per raw "id" value: each container's
+	// cgroup path recurs in every family of the scrape (~60×), and the parse
+	// (plus the systemd layout's uid underscore rewrite) is the expensive part
+	// of identityOf. The mapping is pure, so the memo survives reset() and
+	// lives for the batcher's one scrape.
+	cgroupMemo map[string]cgroupPair
+}
+
+type cgroupPair struct {
+	podUID, containerID string
 }
 
 func newCadvisorBatcher(s *Scraper, scrape time.Time, ctx context.Context) *cadvisorBatcher {
 	cb := &cadvisorBatcher{
-		s:        s,
-		ctx:      ctx,
-		startTS:  pcommon.NewTimestampFromTime(s.cfg.StartTime),
-		scrapeTS: pcommon.NewTimestampFromTime(scrape),
+		s:          s,
+		ctx:        ctx,
+		startTS:    pcommon.NewTimestampFromTime(s.cfg.StartTime),
+		scrapeTS:   pcommon.NewTimestampFromTime(scrape),
+		cgroupMemo: make(map[string]cgroupPair, 256),
 	}
 	cb.reset()
 	return cb
@@ -298,7 +310,7 @@ type cadvisorIdentity struct {
 	hasCgroup                 bool   // an "id" label was present
 }
 
-func identityOf(labels []Label) cadvisorIdentity {
+func (cb *cadvisorBatcher) identityOf(labels []Label) cadvisorIdentity {
 	var ident cadvisorIdentity
 	sandbox := false
 	for _, l := range labels {
@@ -317,7 +329,14 @@ func identityOf(labels []Label) cadvisorIdentity {
 			ident.image = l.Value
 		case "id":
 			ident.hasCgroup = true
-			ident.podUID, ident.containerID = cgroupIdentity(l.Value)
+			pair, ok := cb.cgroupMemo[l.Value]
+			if !ok {
+				pair.podUID, pair.containerID = cgroupIdentity(l.Value)
+				if len(cb.cgroupMemo) < maxTrackedFamilies {
+					cb.cgroupMemo[l.Value] = pair
+				}
+			}
+			ident.podUID, ident.containerID = pair.podUID, pair.containerID
 		}
 	}
 	// Sandbox ("POD") rows are pod-level; with the systemd driver their
@@ -498,7 +517,7 @@ func podScopedFamily(name string) bool {
 }
 
 func (cb *cadvisorBatcher) addNumber(s Sample, monotonic bool) {
-	ident := identityOf(s.Labels) // computed once per sample
+	ident := cb.identityOf(s.Labels) // computed once per sample
 	if cb.drop(s.Name, ident) {
 		return
 	}
@@ -531,7 +550,7 @@ func (cb *cadvisorBatcher) addNumber(s Sample, monotonic bool) {
 }
 
 func (cb *cadvisorBatcher) addHistogram(family string, acc *histAcc) {
-	ident := identityOf(acc.labels)
+	ident := cb.identityOf(acc.labels)
 	if cb.drop(family, ident) {
 		return
 	}
@@ -552,7 +571,7 @@ func (cb *cadvisorBatcher) addHistogram(family string, acc *histAcc) {
 }
 
 func (cb *cadvisorBatcher) addSummary(family string, acc *summAcc) {
-	ident := identityOf(acc.labels)
+	ident := cb.identityOf(acc.labels)
 	if cb.drop(family, ident) {
 		return
 	}

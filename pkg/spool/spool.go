@@ -16,12 +16,12 @@
 // reported rather than handed to the collector as plausible-looking telemetry.
 //
 // A segment whose header is absent or names a version this build does not know
-// is discarded at open (see readSegHeader): the spool is a transient buffer, so
-// carrying a reader for every past or future format would not pay for itself.
-// Adding a format means bumping formatVersion, teaching frameHeaderLen and the
-// frame reader/writer about the new version, and listing it in knownVersions —
-// segments of both versions can then coexist in one directory, each read by its
-// own framing, because the version is per segment rather than per spool.
+// is discarded at open: the spool is a transient buffer, so carrying a reader
+// for every past or future format would not pay for itself. The version is per
+// segment rather than per spool, so when a new format is added (bump
+// formatVersion and extend the frame read/write paths), segments of both
+// versions coexist in one directory, each read with the framing it was written
+// in.
 //
 // Appends fsync the frame before returning, so a producer that has observed a
 // successful Append may safely advance its own checkpoint. A separate `cursor`
@@ -79,11 +79,14 @@ const (
 	// frameHeaderV1 is version 1's frame header: a uint32 big-endian length
 	// plus the xxhash64 of the length bytes and the payload.
 	frameHeaderV1 = 12
-
-	// FrameOverhead is the per-record framing cost in bytes for the current
-	// format, so callers can size backlog comparisons against record lengths.
-	FrameOverhead = frameHeaderV1
 )
+
+// FrameOverhead is the per-record framing cost in bytes for the current
+// format, so callers can size backlog comparisons against record lengths.
+const FrameOverhead = 12
+
+// The exported overhead must track the current format's frame header.
+var _ = [1]struct{}{}[FrameOverhead-frameHeaderV1]
 
 // segMagic opens every segment, followed by the big-endian format version.
 var segMagic = [6]byte{'K', 'S', 'P', 'O', 'O', 'L'}

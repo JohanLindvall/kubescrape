@@ -173,7 +173,7 @@ importable:
 |---|---|
 | [`pkg/promparse`](pkg/promparse) | Streaming parser for the Prometheus text exposition format (classic + OpenMetrics). Never buffers more than a line, so a 100k-series endpoint parses in constant memory; pooled parsers keep the intern tables warm (a large scrape costs a handful of allocations). |
 | [`pkg/spool`](pkg/spool) | Durable on-disk FIFO queue: length-prefixed, xxhash-checksummed frames in rotating segments, `fsync` per append, at-least-once across restarts, size-capped with back-pressure. |
-| [`pkg/kubemeta`](pkg/kubemeta) | The metadata model the service serves — the wire contract for its API — plus `FromPod` and `NormalizeContainerID`. |
+| [`pkg/kubemeta`](pkg/kubemeta) | The metadata model the service serves — the wire contract for its API — plus `NormalizeContainerID`. Pure stdlib; the Kubernetes-object conversion lives in [`pkg/kubemeta/kubeconvert`](pkg/kubemeta/kubeconvert) so clients don't compile `k8s.io/api`. |
 | [`pkg/metaclient`](pkg/metaclient) | HTTP client for that API: blocking container-ID lookups, ETag/Cache-Control caching, no metrics dependency (set `Observe` to feed your own). |
 | [`pkg/logattrs`](pkg/logattrs) | Lifts configured keys out of a JSON or logfmt log line onto an OTLP record, as resource, scope or log attributes. |
 

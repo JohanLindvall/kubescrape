@@ -15,6 +15,7 @@ import (
 
 	"github.com/JohanLindvall/kubescrape/internal/agent/attrs"
 	"github.com/JohanLindvall/kubescrape/pkg/kubemeta"
+	"github.com/JohanLindvall/kubescrape/pkg/promparse"
 )
 
 type captureExporter struct {
@@ -264,7 +265,7 @@ rpc_count 2000
 `
 	bt := newBatcher(func(pcommon.Resource) {}, 1<<30, time.Unix(1, 0), time.Unix(2, 0))
 	conv := newConverter(bt)
-	p := newParser(1<<20, false, false)
+	p := newParser(promparse.Options{MaxLineBytes: 1 << 20})
 	malformed, err := p.Parse(strings.NewReader(body), func(s Sample) error {
 		conv.add(s)
 		return nil
@@ -463,7 +464,7 @@ a_count{s="2"} 7
 `
 	bt := newBatcher(func(pcommon.Resource) {}, 1<<30, time.Unix(1, 0), time.Unix(2, 0))
 	conv := newConverter(bt)
-	p := newParser(1<<20, false, false)
+	p := newParser(promparse.Options{MaxLineBytes: 1 << 20})
 	if _, err := p.Parse(strings.NewReader(exposition), func(s Sample) error {
 		conv.add(s)
 		return nil

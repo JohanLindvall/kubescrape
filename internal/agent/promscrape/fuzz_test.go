@@ -80,7 +80,7 @@ func FuzzConverter(f *testing.F) {
 			res.Attributes().PutStr("url.full", "http://fuzz.local/metrics")
 		}, limit, time.Unix(1e9, 0), time.Unix(1e9+60, 0))
 		conv := newConverter(b)
-		pp := promparse.Get(1<<20, openMetrics, exemplars)
+		pp := promparse.Get(promparse.Options{MaxLineBytes: 1 << 20, OpenMetrics: openMetrics, Exemplars: exemplars})
 		_, err := pp.Parse(bytes.NewReader(data), func(s Sample) error {
 			conv.add(s)
 			if b.count() >= limit {

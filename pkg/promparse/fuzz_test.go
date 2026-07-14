@@ -85,7 +85,7 @@ var knownGoodWant = []flatSample{
 // the test if the result deviates — the alarm for pool-state corruption.
 func parseKnownGood(t *testing.T) {
 	t.Helper()
-	pp := Get(1<<20, false, false)
+	pp := Get(Options{MaxLineBytes: 1 << 20})
 	defer Put(pp)
 	var got []flatSample
 	malformed, err := pp.Parse(bytes.NewReader([]byte(knownGood)), func(s Sample) error {
@@ -124,7 +124,7 @@ func FuzzParser(f *testing.F) {
 			maxLine = 100 // exercise the too-long-line path, incl. bufio spill
 		}
 
-		pp := Get(maxLine, openMetrics, exemplars)
+		pp := Get(Options{MaxLineBytes: maxLine, OpenMetrics: openMetrics, Exemplars: exemplars})
 		samples := 0
 		malformed, err := pp.Parse(bytes.NewReader(data), func(s Sample) error {
 			samples++

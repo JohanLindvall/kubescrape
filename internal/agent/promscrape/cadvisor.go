@@ -67,7 +67,7 @@ type chunker interface {
 func (s *Scraper) parseAndExport(ctx context.Context, body io.Reader, openMetrics, withExemplars bool, cb chunker, pipeline, what string) (int, error) {
 	filter := s.cfg.Filters.filterFor(pipeline).session()
 	conv := newConverter(cb)
-	parser := promparse.Get(s.cfg.MaxLineBytes, openMetrics, withExemplars)
+	parser := promparse.Get(promparse.Options{MaxLineBytes: s.cfg.MaxLineBytes, OpenMetrics: openMetrics, Exemplars: withExemplars})
 	defer promparse.Put(parser)
 	samples := 0
 	malformed, err := parser.Parse(body, func(sample Sample) error {

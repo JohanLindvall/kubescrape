@@ -54,8 +54,10 @@ type Client struct {
 
 	// Observe, if set, is called once per lookup with the outcome (one of the
 	// Outcome* constants). It is the hook callers use to feed their own
-	// metrics without this package depending on a metrics library; it runs on
-	// the caller's goroutine, so keep it cheap and non-blocking.
+	// metrics without this package depending on a metrics library. Set it
+	// before the client is shared between goroutines — it is read without
+	// synchronization — and keep it cheap and non-blocking (it runs on the
+	// caller's goroutine).
 	Observe func(outcome string)
 
 	mu    sync.Mutex

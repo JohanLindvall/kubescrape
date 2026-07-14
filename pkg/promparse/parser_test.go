@@ -8,7 +8,7 @@ import (
 
 func parseAllMode(t *testing.T, input string, openMetrics, exemplars bool) []Sample {
 	t.Helper()
-	p := NewParser(1<<20, openMetrics, exemplars)
+	p := New(Options{MaxLineBytes: 1 << 20, OpenMetrics: openMetrics, Exemplars: exemplars})
 	var out []Sample
 	malformed, err := p.Parse(strings.NewReader(input), func(s Sample) error {
 		cp := s
@@ -131,7 +131,7 @@ neg{} -1.5e3
 }
 
 func TestParseMalformed(t *testing.T) {
-	p := NewParser(1<<20, false, false)
+	p := New(Options{MaxLineBytes: 1 << 20})
 	var good int
 	malformed, err := p.Parse(strings.NewReader(`ok_metric 1
 {no_name} 1
@@ -149,7 +149,7 @@ ok_metric2 2
 }
 
 func TestParseLongLineSkipped(t *testing.T) {
-	p := NewParser(256, false, false)
+	p := New(Options{MaxLineBytes: 256})
 	input := "short 1\nlong{x=\"" + strings.Repeat("a", 1000) + "\"} 2\nshort2 3\n"
 	var names []string
 	malformed, err := p.Parse(strings.NewReader(input), func(s Sample) error {
@@ -165,7 +165,7 @@ func TestParseLongLineSkipped(t *testing.T) {
 }
 
 func TestParseAbort(t *testing.T) {
-	p := NewParser(1<<20, false, false)
+	p := New(Options{MaxLineBytes: 1 << 20})
 	count := 0
 	_, err := p.Parse(strings.NewReader("a 1\nb 2\nc 3\n"), func(s Sample) error {
 		count++
@@ -234,7 +234,7 @@ func TestParseExemplarLabelsSeparateCache(t *testing.T) {
 		`r_total{code="200"} 1 # {trace_id="4bf92f3577b34da6a3ce929d0e0e4736",user="x"} 0.5` + "\n" +
 		`r_total{code="500"} 2 # {trace_id="00f067aa0ba902b74bf92f3577b34da6",user="y"} 0.7` + "\n" +
 		"# EOF\n"
-	p := NewParser(1<<20, true, true)
+	p := New(Options{MaxLineBytes: 1 << 20, OpenMetrics: true, Exemplars: true})
 	var got []Sample
 	malformed, err := p.Parse(strings.NewReader(input), func(s Sample) error {
 		c := s
@@ -272,7 +272,7 @@ func TestParseExemplarLabelsSeparateCache(t *testing.T) {
 }
 
 func TestParseClassicRejectsExemplarSyntax(t *testing.T) {
-	p := NewParser(1<<20, false, true)
+	p := New(Options{MaxLineBytes: 1 << 20, Exemplars: true})
 	var good int
 	malformed, err := p.Parse(strings.NewReader("a 1 # {x=\"y\"} 2\nb 2\n"), func(s Sample) error {
 		good++
@@ -301,7 +301,7 @@ func BenchmarkParseLargeScrape(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		p := Get(1<<20, false, false) // the production path: pooled parser + reader
+		p := Get(Options{MaxLineBytes: 1 << 20}) // the production path: pooled parser + reader
 		n := 0
 		if _, err := p.Parse(strings.NewReader(input), func(s Sample) error { n++; return nil }); err != nil {
 			b.Fatal(err)
@@ -320,10 +320,10 @@ func TestZeroMaxLineBytesParsesNormally(t *testing.T) {
 	body := "# TYPE reqs counter\nreqs{code=\"200\"} 42\n"
 	for name, parse := range map[string]func(emit func(Sample) error) (int, error){
 		"NewParser": func(emit func(Sample) error) (int, error) {
-			return NewParser(0, false, false).Parse(strings.NewReader(body), emit)
+			return New(Options{}).Parse(strings.NewReader(body), emit)
 		},
 		"Get": func(emit func(Sample) error) (int, error) {
-			p := Get(0, false, false)
+			p := Get(Options{})
 			defer Put(p)
 			return p.Parse(strings.NewReader(body), emit)
 		},

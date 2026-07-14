@@ -19,6 +19,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 
 	"github.com/JohanLindvall/kubescrape/pkg/kubemeta"
+	"github.com/JohanLindvall/kubescrape/pkg/kubemeta/kubeconvert"
 )
 
 // defaultMaxWaiters bounds the number of concurrently blocked GetContainer
@@ -122,7 +123,7 @@ type NodePod struct {
 // UpsertPod records the current state of a pod. It is called for informer
 // add and update events (including the initial list).
 func (s *Store) UpsertPod(p *corev1.Pod) {
-	pod, containers := kubemeta.FromPod(p)
+	pod, containers := kubeconvert.FromPod(p)
 
 	s.mu.Lock()
 	defer s.mu.Unlock()

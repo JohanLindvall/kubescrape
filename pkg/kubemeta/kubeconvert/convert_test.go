@@ -1,4 +1,4 @@
-package kubemeta
+package kubeconvert
 
 import (
 	"testing"
@@ -7,88 +7,6 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
-
-func TestNormalizeContainerID(t *testing.T) {
-	cases := map[string]string{
-		"containerd://abc123": "abc123",
-		"docker://abc123":     "abc123",
-		"cri-o://abc123":      "abc123",
-		"containerd:/abc123":  "abc123", // collapsed by HTTP path cleaning
-		"abc123":              "abc123",
-		" containerd://x ":    "x",
-		"":                    "",
-	}
-	for in, want := range cases {
-		if got := NormalizeContainerID(in); got != want {
-			t.Errorf("NormalizeContainerID(%q) = %q, want %q", in, got, want)
-		}
-	}
-}
-
-func testCorePod() *corev1.Pod {
-	created := time.Date(2026, 7, 1, 10, 0, 0, 0, time.UTC)
-	started := created.Add(5 * time.Second)
-	cStarted := created.Add(8 * time.Second)
-	prevStart := created.Add(-time.Hour)
-	prevEnd := created.Add(-30 * time.Minute)
-	return &corev1.Pod{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:              "pod1",
-			Namespace:         "ns1",
-			UID:               "uid-1",
-			Labels:            map[string]string{"app": "web"},
-			Annotations:       map[string]string{"prometheus.io/scrape": "true"},
-			CreationTimestamp: metav1.Time{Time: created},
-		},
-		Spec: corev1.PodSpec{
-			NodeName:       "node1",
-			InitContainers: []corev1.Container{{Name: "init", Image: "init:1"}},
-			Containers: []corev1.Container{{
-				Name:  "app",
-				Image: "app:2",
-				Ports: []corev1.ContainerPort{{Name: "http", ContainerPort: 8080, Protocol: corev1.ProtocolTCP}},
-			}},
-			EphemeralContainers: []corev1.EphemeralContainer{{
-				EphemeralContainerCommon: corev1.EphemeralContainerCommon{Name: "debug", Image: "busybox:1"},
-			}},
-		},
-		Status: corev1.PodStatus{
-			Phase:     corev1.PodRunning,
-			PodIP:     "10.0.0.5",
-			HostIP:    "192.168.1.10",
-			StartTime: &metav1.Time{Time: started},
-			InitContainerStatuses: []corev1.ContainerStatus{{
-				Name:        "init",
-				ContainerID: "containerd://initid",
-				State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{
-					ExitCode:   0,
-					StartedAt:  metav1.Time{Time: created},
-					FinishedAt: metav1.Time{Time: started},
-				}},
-			}},
-			ContainerStatuses: []corev1.ContainerStatus{{
-				Name:         "app",
-				ContainerID:  "containerd://appid2",
-				ImageID:      "sha256:img",
-				RestartCount: 1,
-				Ready:        true,
-				State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{
-					StartedAt: metav1.Time{Time: cStarted},
-				}},
-				LastTerminationState: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{
-					ContainerID: "containerd://appid1",
-					ExitCode:    137,
-					StartedAt:   metav1.Time{Time: prevStart},
-					FinishedAt:  metav1.Time{Time: prevEnd},
-				}},
-			}},
-			EphemeralContainerStatuses: []corev1.ContainerStatus{{
-				Name:  "debug",
-				State: corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: "PodInitializing"}},
-			}},
-		},
-	}
-}
 
 func TestFromPod(t *testing.T) {
 	pod, byID := FromPod(testCorePod())
@@ -183,5 +101,70 @@ func TestFromPodNoStatuses(t *testing.T) {
 	}
 	if pod.Labels != nil || pod.Annotations != nil {
 		t.Fatalf("empty maps must stay nil: %+v", pod)
+	}
+}
+
+func testCorePod() *corev1.Pod {
+	created := time.Date(2026, 7, 1, 10, 0, 0, 0, time.UTC)
+	started := created.Add(5 * time.Second)
+	cStarted := created.Add(8 * time.Second)
+	prevStart := created.Add(-time.Hour)
+	prevEnd := created.Add(-30 * time.Minute)
+	return &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "pod1",
+			Namespace:         "ns1",
+			UID:               "uid-1",
+			Labels:            map[string]string{"app": "web"},
+			Annotations:       map[string]string{"prometheus.io/scrape": "true"},
+			CreationTimestamp: metav1.Time{Time: created},
+		},
+		Spec: corev1.PodSpec{
+			NodeName:       "node1",
+			InitContainers: []corev1.Container{{Name: "init", Image: "init:1"}},
+			Containers: []corev1.Container{{
+				Name:  "app",
+				Image: "app:2",
+				Ports: []corev1.ContainerPort{{Name: "http", ContainerPort: 8080, Protocol: corev1.ProtocolTCP}},
+			}},
+			EphemeralContainers: []corev1.EphemeralContainer{{
+				EphemeralContainerCommon: corev1.EphemeralContainerCommon{Name: "debug", Image: "busybox:1"},
+			}},
+		},
+		Status: corev1.PodStatus{
+			Phase:     corev1.PodRunning,
+			PodIP:     "10.0.0.5",
+			HostIP:    "192.168.1.10",
+			StartTime: &metav1.Time{Time: started},
+			InitContainerStatuses: []corev1.ContainerStatus{{
+				Name:        "init",
+				ContainerID: "containerd://initid",
+				State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{
+					ExitCode:   0,
+					StartedAt:  metav1.Time{Time: created},
+					FinishedAt: metav1.Time{Time: started},
+				}},
+			}},
+			ContainerStatuses: []corev1.ContainerStatus{{
+				Name:         "app",
+				ContainerID:  "containerd://appid2",
+				ImageID:      "sha256:img",
+				RestartCount: 1,
+				Ready:        true,
+				State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{
+					StartedAt: metav1.Time{Time: cStarted},
+				}},
+				LastTerminationState: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{
+					ContainerID: "containerd://appid1",
+					ExitCode:    137,
+					StartedAt:   metav1.Time{Time: prevStart},
+					FinishedAt:  metav1.Time{Time: prevEnd},
+				}},
+			}},
+			EphemeralContainerStatuses: []corev1.ContainerStatus{{
+				Name:  "debug",
+				State: corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: "PodInitializing"}},
+			}},
+		},
 	}
 }

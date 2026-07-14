@@ -1,38 +1,25 @@
-package kubemeta
+// Package kubeconvert converts Kubernetes API objects into the kubemeta wire
+// model. It lives apart from kubemeta so that clients which only decode the
+// model (pkg/metaclient and anything like it) do not compile k8s.io/api and
+// its dependency tree; only the service side, which watches real Kubernetes
+// objects, needs this package.
+package kubeconvert
 
 import (
-	"strings"
-	"unicode"
-
 	corev1 "k8s.io/api/core/v1"
-)
 
-// NormalizeContainerID strips the runtime scheme prefix from a container ID,
-// so "containerd://abc", "docker://abc" and "abc" all normalize to "abc".
-// It also tolerates a collapsed "containerd:/abc" form (as produced by HTTP
-// path cleaning). Container runtime IDs themselves never contain a colon.
-//
-// It is idempotent — the same ID may be normalized again on another path
-// (agent, HTTP handler), which must be a no-op. Hence the cut at the LAST
-// colon (the result can never retain one) and the space trim after the
-// slashes (a malformed "scheme:// id" must not need two passes).
-func NormalizeContainerID(id string) string {
-	id = strings.TrimSpace(id)
-	if i := strings.LastIndexByte(id, ':'); i >= 0 {
-		id = strings.TrimLeftFunc(id[i+1:], func(r rune) bool { return r == '/' || unicode.IsSpace(r) })
-	}
-	return id
-}
+	"github.com/JohanLindvall/kubescrape/pkg/kubemeta"
+)
 
 // FromPod converts an API pod into the served metadata model. It returns the
 // pod plus an index of all known container runtime IDs (normalized) to their
 // container metadata, including the previous incarnation of restarted
 // containers when the kubelet still reports it in lastState.
 //
-// The returned Pod shares no memory with the input object; informer cache
+// The returned kubemeta.Pod shares no memory with the input object; informer cache
 // objects must not be retained or mutated.
-func FromPod(p *corev1.Pod) (Pod, map[string]Container) {
-	pod := Pod{
+func FromPod(p *corev1.Pod) (kubemeta.Pod, map[string]kubemeta.Container) {
+	pod := kubemeta.Pod{
 		Name:        p.Name,
 		Namespace:   p.Namespace,
 		UID:         string(p.UID),
@@ -55,16 +42,16 @@ func FromPod(p *corev1.Pod) (Pod, map[string]Container) {
 			statuses[list[i].Name] = &list[i]
 		}
 	}
-	// Container names are unique across all three lists in the pod spec.
+	// kubemeta.Container names are unique across all three lists in the pod spec.
 	collect(p.Status.InitContainerStatuses)
 	collect(p.Status.ContainerStatuses)
 	collect(p.Status.EphemeralContainerStatuses)
 
-	byID := make(map[string]Container)
+	byID := make(map[string]kubemeta.Container)
 	add := func(name, image string, ports []corev1.ContainerPort, typ string) {
-		c := Container{Name: name, Type: typ, Image: image}
+		c := kubemeta.Container{Name: name, Type: typ, Image: image}
 		for _, pt := range ports {
-			c.Ports = append(c.Ports, ContainerPort{
+			c.Ports = append(c.Ports, kubemeta.ContainerPort{
 				Name:     pt.Name,
 				Port:     pt.ContainerPort,
 				Protocol: string(pt.Protocol),
@@ -73,7 +60,7 @@ func FromPod(p *corev1.Pod) (Pod, map[string]Container) {
 		st := statuses[name]
 		if st != nil {
 			c.RuntimeID = st.ContainerID
-			c.ID = NormalizeContainerID(st.ContainerID)
+			c.ID = kubemeta.NormalizeContainerID(st.ContainerID)
 			c.ImageID = st.ImageID
 			c.RestartCount = st.RestartCount
 			c.Ready = st.Ready
@@ -100,7 +87,7 @@ func FromPod(p *corev1.Pod) (Pod, map[string]Container) {
 		if st != nil && st.LastTerminationState.Terminated != nil && st.LastTerminationState.Terminated.ContainerID != "" {
 			prev := c
 			prev.RuntimeID = st.LastTerminationState.Terminated.ContainerID
-			prev.ID = NormalizeContainerID(prev.RuntimeID)
+			prev.ID = kubemeta.NormalizeContainerID(prev.RuntimeID)
 			prev.Ready = false
 			prev.State = "terminated"
 			prev.WaitingReason = ""
@@ -124,7 +111,7 @@ func FromPod(p *corev1.Pod) (Pod, map[string]Container) {
 	return pod, byID
 }
 
-func fillTerminated(c *Container, t *corev1.ContainerStateTerminated) {
+func fillTerminated(c *kubemeta.Container, t *corev1.ContainerStateTerminated) {
 	exit := t.ExitCode
 	c.ExitCode = &exit
 	if !t.StartedAt.IsZero() {

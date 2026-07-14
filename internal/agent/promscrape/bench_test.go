@@ -83,7 +83,7 @@ func BenchmarkSplitConvert(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		cb := newSplitBatcher(s, context.Background(), target, sp[0], time.Unix(2, 0))
 		conv := newConverter(cb)
-		p := promparse.Get(1<<20, false, false)
+		p := promparse.Get(promparse.Options{MaxLineBytes: 1 << 20})
 		_, err := p.Parse(strings.NewReader(input), func(smp Sample) error {
 			conv.add(smp)
 			return nil
@@ -143,7 +143,7 @@ func BenchmarkCadvisorConvert(b *testing.B) {
 			for i := 0; i < b.N; i++ {
 				cb := newCadvisorBatcher(s, time.Unix(2, 0), context.Background())
 				conv := newConverter(cb)
-				p := promparse.Get(1<<20, false, false)
+				p := promparse.Get(promparse.Options{MaxLineBytes: 1 << 20})
 				_, err := p.Parse(strings.NewReader(input), func(smp Sample) error {
 					conv.add(smp)
 					return nil
@@ -181,7 +181,7 @@ func BenchmarkConvertScrape(b *testing.B) {
 		bt := newBatcher(func(pcommon.Resource) {}, 1<<30, time.Unix(1, 0), time.Unix(2, 0))
 		conv := newConverter(bt)
 		fs := filter.session()
-		p := promparse.Get(1<<20, false, false) // the production path: pooled parser + reader
+		p := promparse.Get(promparse.Options{MaxLineBytes: 1 << 20}) // the production path: pooled parser + reader
 		_, err := p.Parse(strings.NewReader(input), func(s Sample) error {
 			if !fs.Keep(s.Name, s.Labels) {
 				return nil

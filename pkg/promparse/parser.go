@@ -10,7 +10,7 @@
 //
 // Basic use:
 //
-//	p := promparse.NewParser(0, false, false)
+//	p := promparse.New(promparse.Options{})
 //	malformed, err := p.Parse(body, func(s promparse.Sample) error {
 //	    fmt.Println(s.Name, s.Labels, s.Value)
 //	    return nil // Sample and its Labels are only valid during the callback
@@ -19,7 +19,7 @@
 // On a hot path, take a parser from the pool instead — it keeps the intern
 // tables and the read buffer warm across scrapes:
 //
-//	p := promparse.Get(maxLineBytes, openMetrics, withExemplars)
+//	p := promparse.Get(promparse.Options{OpenMetrics: true, Exemplars: true})
 //	defer promparse.Put(p)
 //	malformed, err := p.Parse(body, emit)
 package promparse
@@ -150,10 +150,26 @@ type Parser struct {
 	eof        bool   // saw "# EOF"
 }
 
-// DefaultMaxLineBytes bounds one physical line when no limit is given. The
-// parser holds at most one line, so this is what keeps memory constant against
-// an endpoint that never emits a newline.
+// DefaultMaxLineBytes bounds one physical line when Options leaves
+// MaxLineBytes zero. The parser holds at most one line, so this is what keeps
+// memory constant against an endpoint that never emits a newline.
 const DefaultMaxLineBytes = 1 << 20
+
+// Options configure a parser. The zero value parses classic Prometheus text
+// with the default line bound and no exemplars.
+type Options struct {
+	// MaxLineBytes skips physical lines longer than this
+	// (0 = DefaultMaxLineBytes). Over-long lines are consumed and counted
+	// malformed rather than returned.
+	MaxLineBytes int
+	// OpenMetrics selects OpenMetrics semantics — float-second timestamps,
+	// the "# EOF" terminator — typically decided from the response
+	// Content-Type.
+	OpenMetrics bool
+	// Exemplars additionally parses "# {...}" exemplar suffixes onto samples
+	// (OpenMetrics only; ignored otherwise).
+	Exemplars bool
+}
 
 // normLineBytes maps the zero value onto the default: 0 read literally would
 // make every line "too long" and silently skip the whole exposition.
@@ -164,15 +180,12 @@ func normLineBytes(maxLineBytes int) int {
 	return maxLineBytes
 }
 
-// NewParser creates a parser that skips physical lines longer than
-// maxLineBytes (0 = DefaultMaxLineBytes). openMetrics selects OpenMetrics
-// semantics (typically from the response Content-Type); withExemplars
-// additionally parses exemplars.
-func NewParser(maxLineBytes int, openMetrics, withExemplars bool) *Parser {
+// New creates a parser.
+func New(opts Options) *Parser {
 	return &Parser{
-		maxLineBytes: normLineBytes(maxLineBytes),
-		openMetrics:  openMetrics,
-		exemplars:    openMetrics && withExemplars,
+		maxLineBytes: normLineBytes(opts.MaxLineBytes),
+		openMetrics:  opts.OpenMetrics,
+		exemplars:    opts.OpenMetrics && opts.Exemplars,
 		types:        make(map[string]MetricType),
 		names:        make(map[string]string),
 	}
@@ -185,27 +198,30 @@ func NewParser(maxLineBytes int, openMetrics, withExemplars bool) *Parser {
 // only cleared once they near their caps, bounding retention.
 var parserPool = sync.Pool{New: func() any {
 	return &Pooled{
-		Parser: NewParser(0, false, false),
+		p:      New(Options{}),
 		reader: bufio.NewReaderSize(nil, parseBufSize),
 	}
 }}
 
 const parseBufSize = 64 * 1024
 
+// Pooled is a parser taken from the shared pool: its intern tables stay warm
+// across parses (the same names repeat every scrape) and it carries a reusable
+// read buffer, so a large scrape parses in a handful of allocations. Obtain
+// one with Get, use it for a single Parse, and return it with Put.
 type Pooled struct {
-	*Parser
+	p      *Parser
 	reader *bufio.Reader
 }
 
-// Get returns a pooled parser configured for one parse (maxLineBytes 0 =
-// DefaultMaxLineBytes). Return it with Put when the parse is done; the parser
-// must not be used afterwards.
-func Get(maxLineBytes int, openMetrics, withExemplars bool) *Pooled {
+// Get returns a pooled parser configured for one parse. Return it with Put
+// when the parse is done; the parser must not be used afterwards.
+func Get(opts Options) *Pooled {
 	pp := parserPool.Get().(*Pooled)
-	p := pp.Parser
-	p.maxLineBytes = normLineBytes(maxLineBytes)
-	p.openMetrics = openMetrics
-	p.exemplars = openMetrics && withExemplars
+	p := pp.p
+	p.maxLineBytes = normLineBytes(opts.MaxLineBytes)
+	p.openMetrics = opts.OpenMetrics
+	p.exemplars = opts.OpenMetrics && opts.Exemplars
 	p.eof = false
 	p.lastMetric = ""
 	p.lastKV = p.lastKV[:0]
@@ -230,7 +246,7 @@ func Put(pp *Pooled) {
 // for every sample (see Parser.Parse).
 func (pp *Pooled) Parse(r io.Reader, emit func(Sample) error) (int, error) {
 	pp.reader.Reset(r)
-	return pp.parseFrom(pp.reader, emit)
+	return pp.p.parseFrom(pp.reader, emit)
 }
 
 // lastKV caches the previous line's interned name/value at one label
@@ -733,7 +749,7 @@ func parseQuotedSlow(rest []byte) (string, []byte, bool) {
 
 // ErrTooManySamples can be returned by an emit callback to abort a scrape
 // that exceeds a sample budget.
-var ErrTooManySamples = errors.New("sample limit exceeded")
+var ErrTooManySamples = errors.New("promparse: sample limit exceeded")
 
 func (t MetricType) String() string {
 	switch t {

@@ -41,6 +41,6 @@ const (
 var ErrTooManySamples = promparse.ErrTooManySamples
 
 var (
-	newParser    = promparse.NewParser
+	newParser    = promparse.New
 	copyExemplar = promparse.CopyExemplar
 )

@@ -2,7 +2,6 @@ package spool
 
 import (
 	"bytes"
-	"encoding/binary"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -13,14 +12,12 @@ import (
 
 // FuzzSpoolCorruption builds a valid spool (appends, partial consumption),
 // corrupts bytes at fuzzed offsets in segment/cursor files, and checks the
-// spool stays usable: Open never fails on content corruption, Pop never
-// panics and terminates, Append still works, and — whenever the corruption
-// could not have forged frame boundaries (cursor damage, truncation, a byte
-// flipped inside a payload) — every delivered record is one of the appended
-// payloads (possibly duplicated or with the one flipped byte). Frames carry
-// no checksums by design, so corruption that rewrites framing (length
-// prefixes, appended garbage) may surface garbage records; those cases only
-// assert the structural invariants.
+// spool stays usable: Open never fails on content corruption, Pop never panics
+// and terminates, Append still works, the spool heals, and — because every
+// frame is checksummed over its length and payload together — a damaged record
+// is NEVER delivered. Corruption may cost data (a dropped frame, or a skipped
+// segment when the framing itself is no longer trustworthy), but whatever Pop
+// returns is a record that was really appended.
 func FuzzSpoolCorruption(f *testing.F) {
 	f.Add(uint8(6), uint8(2), uint8(0), uint8(0), uint32(5), uint8(0xff), uint16(0))
 	f.Add(uint8(6), uint8(2), uint8(0), uint8(1), uint32(9), uint8(0), uint16(64))
@@ -59,15 +56,11 @@ func FuzzSpoolCorruption(f *testing.F) {
 		}
 		_ = sp.Close()
 
-		// Snapshot the frame layout so a corrupted offset can be classified as
-		// payload vs framing.
 		files, seq := spoolFiles(t, dir)
 
 		// Corrupt one file.
-		framingIntact := true
 		if len(files) > 0 {
 			path := files[int(target)%len(files)]
-			isCursor := filepath.Base(path) == cursorName
 			raw, err := os.ReadFile(path)
 			if err != nil {
 				t.Fatal(err)
@@ -76,22 +69,14 @@ func FuzzSpoolCorruption(f *testing.F) {
 			case 0: // overwrite one byte
 				if len(raw) > 0 {
 					pos := int(off) % len(raw)
-					if raw[pos] != val {
-						if !isCursor && !inPayload(raw, pos) {
-							framingIntact = false
-						}
-						raw[pos] = val
-						mustWrite(t, path, raw)
-					}
+					raw[pos] = val
+					mustWrite(t, path, raw)
 				}
 			case 1: // truncate
 				raw = raw[:int(off)%(len(raw)+1)]
 				mustWrite(t, path, raw)
 			case 2: // append garbage
 				raw = append(raw, bytes.Repeat([]byte{val}, 1+int(off)%9)...)
-				if !isCursor {
-					framingIntact = false
-				}
 				mustWrite(t, path, raw)
 			}
 		}
@@ -111,9 +96,8 @@ func FuzzSpoolCorruption(f *testing.F) {
 		}
 
 		// Drain: must terminate within a bounded number of Pops, never panic,
-		// and (with framing intact) deliver only appended payloads, the single
-		// flipped-byte variant, or the sentinel.
-		sawSentinel := false
+		// and — the checksum guarantee — deliver ONLY records that were really
+		// appended. A damaged frame is dropped, never handed back mangled.
 		limit := n + 16
 		for i := 0; ; i++ {
 			if i > limit {
@@ -126,23 +110,15 @@ func FuzzSpoolCorruption(f *testing.F) {
 			if !ok {
 				break // empty
 			}
-			if framingIntact && !appended[string(data)] && string(data) != sentinel && !offByOneByte(appended, data) {
-				t.Fatalf("Pop delivered a never-appended record %q (framing intact)", data)
-			}
-			if string(data) == sentinel {
-				sawSentinel = true
+			if !appended[string(data)] && string(data) != sentinel {
+				t.Fatalf("Pop delivered a record that was never appended: %q", data)
 			}
 			commit()
 		}
-		if framingIntact && !sawSentinel {
-			t.Fatalf("sentinel appended after corruption was never delivered (framing intact)")
-		}
 
 		// The spool must heal: within a few probe appends it must round-trip a
-		// fresh record again (a desynchronized tail may cost the first probe —
-		// Pop skips the corrupt segment — but the replacement segment is
-		// clean). With framing intact there is no desync, so the very first
-		// probe must survive.
+		// fresh record again (a corrupt tail may cost the first probe — Pop
+		// skips the segment — but the replacement segment is clean).
 		healed := -1
 	probes:
 		for attempt := 0; attempt < 3; attempt++ {
@@ -163,6 +139,9 @@ func FuzzSpoolCorruption(f *testing.F) {
 				}
 				got := string(data)
 				commit()
+				if got != probe && !appended[got] && got != sentinel && !strings.HasPrefix(got, "probe-") {
+					t.Fatalf("Pop delivered a record that was never appended: %q", got)
+				}
 				if got == probe {
 					healed = attempt
 					break probes
@@ -171,9 +150,6 @@ func FuzzSpoolCorruption(f *testing.F) {
 		}
 		if healed < 0 {
 			t.Fatalf("spool did not heal: three probe records in a row were lost")
-		}
-		if framingIntact && healed != 0 {
-			t.Fatalf("lost %d probe record(s) with framing intact", healed)
 		}
 	})
 }
@@ -202,47 +178,6 @@ func spoolFiles(t *testing.T, dir string) ([]string, []int64) {
 		files = append(files, cursor)
 	}
 	return files, seqs
-}
-
-// inPayload reports whether pos lies inside a frame's payload bytes (not a
-// length prefix) when walking the segment's frames from the start.
-func inPayload(seg []byte, pos int) bool {
-	off := 0
-	for off+frameHeader <= len(seg) {
-		n := int(binary.BigEndian.Uint32(seg[off:]))
-		end := off + frameHeader + n
-		if end > len(seg) {
-			return false // torn tail region
-		}
-		if pos >= off+frameHeader && pos < end {
-			return true
-		}
-		if pos < off+frameHeader {
-			return false // in this frame's header
-		}
-		off = end
-	}
-	return false
-}
-
-// offByOneByte reports whether data equals some appended payload with exactly
-// one byte changed (the corruption we injected).
-func offByOneByte(appended map[string]bool, data []byte) bool {
-	for p := range appended {
-		if len(p) != len(data) {
-			continue
-		}
-		diff := 0
-		for i := 0; i < len(p); i++ {
-			if p[i] != data[i] {
-				diff++
-			}
-		}
-		if diff == 1 {
-			return true
-		}
-	}
-	return false
 }
 
 func mustWrite(t *testing.T, path string, data []byte) {

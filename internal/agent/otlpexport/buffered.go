@@ -154,12 +154,15 @@ func (s *sink[T]) drain(ctx context.Context) {
 	for {
 		data, commit, ok, err := s.spool.Pop()
 		if err != nil {
+			// Both classes drop data and advance: a vanished head segment, and
+			// a frame (or segment) the integrity check rejected. Anything else
+			// is a transient read error that leaves the queue where it was.
 			lost := "false"
-			if errors.Is(err, os.ErrNotExist) {
-				lost = "true" // the head segment vanished; its frames were skipped
+			if errors.Is(err, os.ErrNotExist) || errors.Is(err, spool.ErrCorrupt) {
+				lost = "true"
 			}
 			obs.BufferReadErrors.WithLabelValues(s.kind, lost).Inc()
-			s.log.Error("disk buffer read failed", "signal", s.kind, "lost_segment", lost, "error", err)
+			s.log.Error("disk buffer read failed", "signal", s.kind, "data_lost", lost, "error", err)
 		}
 		if !ok {
 			select {

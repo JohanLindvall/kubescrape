@@ -4,16 +4,38 @@
 // (bounded by a size cap) instead of pinning the tailer to old file offsets, so
 // the source files can rotate away while their data waits on the node.
 //
-// Layout: a directory of segment files (`<seq>.seg`, zero-padded, ascending),
-// each a sequence of length-prefixed frames (4-byte big-endian length + bytes).
+// # On-disk format
+//
+// A directory of segment files (`<seq>.seg`, zero-padded, ascending). Each
+// segment opens with an 8-byte header — the magic "KSPOOL" plus a big-endian
+// uint16 format version — and continues with frames laid out per that version.
+// Version 1 frames are: a 4-byte big-endian length, an 8-byte xxhash64 over the
+// length bytes and the payload together, then the payload. Checksumming the
+// length alongside the payload means a flipped length byte is caught instead of
+// mis-framing the rest of the segment, and a damaged record is dropped and
+// reported rather than handed to the collector as plausible-looking telemetry.
+//
+// A segment whose header is absent or names a version this build does not know
+// is discarded at open (see readSegHeader): the spool is a transient buffer, so
+// carrying a reader for every past or future format would not pay for itself.
+// Adding a format means bumping formatVersion, teaching frameHeaderLen and the
+// frame reader/writer about the new version, and listing it in knownVersions —
+// segments of both versions can then coexist in one directory, each read by its
+// own framing, because the version is per segment rather than per spool.
+//
 // Appends fsync the frame before returning, so a producer that has observed a
-// successful Append may safely advance its own checkpoint. A separate 16-byte
-// `cursor` file records the read position ({segment seq, offset}); it is
-// rewritten in place after each commit. On restart the newest segment's torn
-// tail (a frame interrupted by a crash) is truncated away.
+// successful Append may safely advance its own checkpoint. A separate `cursor`
+// file records the read position ({segment seq, offset}) and is rewritten in
+// place after each commit; a torn cursor fails its checksum on the next load
+// and redelivers from the oldest segment (duplicates, within at-least-once). On
+// restart the newest segment's torn tail — a frame the crash left incomplete —
+// is truncated away, while a frame that is whole but fails its checksum is
+// dropped by Pop when it is reached, so one damaged byte costs one record
+// rather than every record behind it.
 package spool
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -21,25 +43,75 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+
+	"github.com/cespare/xxhash/v2"
 )
 
 // ErrFull is returned by Append when the queue is at its size cap.
 var ErrFull = errors.New("spool: full")
 
+// ErrCorrupt is returned by Pop when the head frame fails its integrity check:
+// a checksum mismatch, a length overrunning the segment, or a segment tail too
+// short to hold a frame header. The damaged data is dropped — the frame alone
+// when the framing is still trustworthy, otherwise the whole segment — and the
+// queue advances, so corruption degrades to reported loss rather than to
+// corrupt telemetry or a wedged queue.
+var ErrCorrupt = errors.New("spool: corrupt")
+
 const (
 	defaultSegmentBytes = 8 << 20
 	segSuffix           = ".seg"
 	cursorName          = "cursor"
-	frameHeader         = 4 // uint32 big-endian length prefix
 
-	// FrameOverhead is the per-record framing cost in bytes, for callers
-	// sizing backlog comparisons against record lengths.
-	FrameOverhead = frameHeader
+	// segHeaderLen is the per-segment header: magic(6) + version(2).
+	segHeaderLen = 8
+
+	// formatVersion is the frame format new segments are written in. Bump it
+	// (and extend frameHeaderLen, knownVersions, and the frame read/write
+	// paths) to change the framing; existing segments keep their own version.
+	formatVersion uint16 = 1
+
+	// frameHeaderV1 is version 1's frame header: a uint32 big-endian length
+	// plus the xxhash64 of the length bytes and the payload.
+	frameHeaderV1 = 12
+
+	// FrameOverhead is the per-record framing cost in bytes for the current
+	// format, so callers can size backlog comparisons against record lengths.
+	FrameOverhead = frameHeaderV1
 )
+
+// segMagic opens every segment, followed by the big-endian format version.
+var segMagic = [6]byte{'K', 'S', 'P', 'O', 'O', 'L'}
+
+// knownVersions are the frame formats this build can read. A segment naming
+// anything else — an older format, or one written by a newer agent — is
+// discarded at open.
+var knownVersions = []uint16{1}
+
+// frameHeaderLen is the frame header size of a segment's format version.
+func frameHeaderLen(version uint16) int64 {
+	switch version {
+	case 1:
+		return frameHeaderV1
+	default:
+		return frameHeaderV1 // unreachable: unknown versions never load
+	}
+}
+
+// frameSum is version 1's integrity check over one frame: the length bytes and
+// the payload together, so a corrupted length cannot masquerade as a valid one.
+func frameSum(lenBytes, payload []byte) uint64 {
+	var d xxhash.Digest // stack-held: no allocation per frame
+	d.Reset()
+	_, _ = d.Write(lenBytes)
+	_, _ = d.Write(payload)
+	return d.Sum64()
+}
 
 // Options configure a Spool.
 type Options struct {
@@ -55,7 +127,14 @@ type segment struct {
 	seq  int64
 	size int64
 	path string
+	// version is the segment's frame format, read from its header. It is per
+	// segment, so a format bump does not invalidate the segments already on
+	// disk — each is read with the framing it was written in.
+	version uint16
 }
+
+// frameHdr is the frame header size for this segment's format.
+func (sg segment) frameHdr() int64 { return frameHeaderLen(sg.version) }
 
 // Spool is a durable FIFO byte queue. One producer (Append) and one consumer
 // (Pop/commit) may run concurrently; all state is mutex-guarded.
@@ -64,16 +143,15 @@ type Spool struct {
 	segmentSize int64
 	maxBytes    int64
 
-	mu          sync.Mutex
-	segs        []segment // ascending by seq; segs[0] is the read head, last is the write tail
-	w           *os.File  // append handle for the newest segment
-	cursorF     *os.File
-	cursorSized bool     // cursor file is exactly cursorLen, safe to rewrite in place
-	readF       *os.File // cached read handle for the head segment
-	readSeq     int64    // segment seq readF is open on
-	readOff     int64    // offset within segs[0] of the next unread frame
-	signal      chan struct{}
-	closed      bool
+	mu      sync.Mutex
+	segs    []segment // ascending by seq; segs[0] is the read head, last is the write tail
+	w       *os.File  // append handle for the newest segment
+	cursorF *os.File
+	readF   *os.File // cached read handle for the head segment
+	readSeq int64    // segment seq readF is open on
+	readOff int64    // offset within segs[0] of the next unread frame
+	signal  chan struct{}
+	closed  bool
 }
 
 // Open opens or creates the spool rooted at dir.
@@ -97,7 +175,7 @@ func (s *Spool) segPath(seq int64) string {
 }
 
 // load discovers existing segments, repairs the write tail, and positions the
-// read cursor.
+// read cursor. Segments in an unreadable format are removed.
 func (s *Spool) load() error {
 	entries, err := os.ReadDir(s.dir)
 	if err != nil {
@@ -116,7 +194,18 @@ func (s *Spool) load() error {
 		if err != nil {
 			return err
 		}
-		s.segs = append(s.segs, segment{seq: seq, size: info.Size(), path: s.segPath(seq)})
+		path := s.segPath(seq)
+		version, ok, err := readSegHeader(path)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			// No header, or a format this build cannot read: the spool is a
+			// transient buffer, so drop it rather than guess at its framing.
+			_ = os.Remove(path)
+			continue
+		}
+		s.segs = append(s.segs, segment{seq: seq, size: info.Size(), path: path, version: version})
 	}
 	sort.Slice(s.segs, func(i, j int) bool { return s.segs[i].seq < s.segs[j].seq })
 
@@ -138,18 +227,44 @@ func (s *Spool) load() error {
 		_ = os.Remove(s.segs[0].path)
 		s.segs = s.segs[1:]
 	}
+	s.readOff = segHeaderLen
 	if s.segs[0].seq == cursorSeq && cursorOff <= s.segs[0].size {
-		s.readOff = cursorOff
+		s.readOff = max(cursorOff, segHeaderLen)
 	}
 	return nil
 }
 
+// readSegHeader returns the segment's format version. ok is false when the file
+// carries no magic or names a version this build cannot read.
+func readSegHeader(path string) (version uint16, ok bool, err error) {
+	f, err := os.Open(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return 0, false, nil
+		}
+		return 0, false, err
+	}
+	defer func() { _ = f.Close() }()
+	var buf [segHeaderLen]byte
+	n, err := f.ReadAt(buf[:], 0)
+	if err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
+		return 0, false, err
+	}
+	if n < segHeaderLen || !bytes.Equal(buf[:len(segMagic)], segMagic[:]) {
+		return 0, false, nil
+	}
+	version = binary.BigEndian.Uint16(buf[len(segMagic):])
+	return version, slices.Contains(knownVersions, version), nil
+}
+
 // openTail opens the newest segment for appending and truncates any torn tail
-// (a frame whose write was interrupted by a crash) or orphan bytes beyond the
-// last whole frame (a partial append whose rollback did not complete).
+// (a frame whose write a crash left incomplete) or orphan bytes beyond the last
+// whole frame (a partial append whose rollback did not complete). A tail in an
+// older format is frozen — never appended to — and a fresh segment takes over,
+// so one file never mixes two framings.
 func (s *Spool) openTail() error {
 	tail := &s.segs[len(s.segs)-1]
-	good, err := lastCompleteOffset(tail.path, tail.size)
+	good, err := lastCompleteOffset(*tail)
 	if err != nil {
 		return err
 	}
@@ -161,6 +276,9 @@ func (s *Spool) openTail() error {
 		}
 	}
 	tail.size = good
+	if tail.version != formatVersion {
+		return s.appendSegment(tail.seq + 1)
+	}
 	f, err := os.OpenFile(tail.path, os.O_WRONLY|os.O_APPEND, 0o644)
 	if err != nil {
 		return err
@@ -169,35 +287,60 @@ func (s *Spool) openTail() error {
 	return nil
 }
 
-// appendSegment creates a new empty segment with the given seq and makes it the
-// write tail.
+// appendSegment creates a new segment with the given seq, writes its header,
+// and makes it the write tail.
 func (s *Spool) appendSegment(seq int64) error {
 	path := s.segPath(seq)
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
 	if err != nil {
 		return err
 	}
+	var hdr [segHeaderLen]byte
+	copy(hdr[:], segMagic[:])
+	binary.BigEndian.PutUint16(hdr[len(segMagic):], formatVersion)
+	if _, err := f.Write(hdr[:]); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		return err
+	}
 	if s.w != nil {
 		_ = s.w.Close()
 	}
 	s.w = f
-	s.segs = append(s.segs, segment{seq: seq, size: 0, path: path})
+	s.segs = append(s.segs, segment{seq: seq, size: segHeaderLen, path: path, version: formatVersion})
 	s.syncDir()
 	return nil
 }
 
-// lastCompleteOffset walks the length-prefixed frames of a segment and returns
-// the offset just past the last whole frame (the truncation point for a torn
-// tail).
-func lastCompleteOffset(path string, size int64) (int64, error) {
-	f, err := os.Open(path)
+// lastCompleteOffset walks a segment's frames by their lengths and returns the
+// offset just past the last structurally complete one — where a torn tail is
+// truncated and the next append lands.
+//
+// It deliberately does not verify checksums. A torn write only ever damages the
+// END of the file, so a frame that is structurally whole but fails its checksum
+// is far more likely to be a durable frame with a damaged byte than a torn one;
+// truncating there would throw away every good frame that follows it. Instead
+// such a frame stays put and Pop drops it individually (reporting ErrCorrupt),
+// so the blast radius of one bad byte is one record. A torn write whose length
+// field itself was mangled is still caught: its bogus length either overruns
+// the file (truncated here) or desynchronizes the walk into garbage that fails
+// the same structural check a frame or two later.
+func lastCompleteOffset(sg segment) (int64, error) {
+	f, err := os.Open(sg.path)
 	if err != nil {
 		return 0, err
 	}
 	defer func() { _ = f.Close() }()
-	var off int64
-	hdr := make([]byte, frameHeader)
-	for off+frameHeader <= size {
+	if sg.size < segHeaderLen {
+		return sg.size, nil // shorter than its own header: nothing usable
+	}
+	fh := sg.frameHdr()
+	off := int64(segHeaderLen)
+	hdr := make([]byte, fh)
+	for off+fh <= sg.size {
 		if _, err := f.ReadAt(hdr, off); err != nil {
 			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
 				break // file shorter than recorded: torn tail
@@ -206,8 +349,8 @@ func lastCompleteOffset(path string, size int64) (int64, error) {
 			// would silently discard valid fsynced frames after it.
 			return 0, err
 		}
-		end := off + frameHeader + int64(binary.BigEndian.Uint32(hdr))
-		if end > size {
+		end := off + fh + int64(binary.BigEndian.Uint32(hdr[:4]))
+		if end > sg.size {
 			break // torn frame
 		}
 		off = end
@@ -231,7 +374,7 @@ func (s *Spool) backlog() int64 {
 // would be exceeded, leaving the queue unchanged so the caller can apply
 // backpressure.
 func (s *Spool) Append(data []byte) error {
-	frame := int64(frameHeader + len(data))
+	frame := int64(frameHeaderV1 + len(data))
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closed {
@@ -248,14 +391,17 @@ func (s *Spool) Append(data []byte) error {
 		}
 	}
 	tail := &s.segs[len(s.segs)-1]
-	if tail.size > 0 && tail.size+frame > s.segmentSize {
+	// Rotate only once the tail holds a frame, so an oversized record cannot
+	// leave an empty segment behind.
+	if tail.size > segHeaderLen && tail.size+frame > s.segmentSize {
 		if err := s.appendSegment(tail.seq + 1); err != nil {
 			return err
 		}
 		tail = &s.segs[len(s.segs)-1]
 	}
-	var hdr [frameHeader]byte
-	binary.BigEndian.PutUint32(hdr[:], uint32(len(data)))
+	var hdr [frameHeaderV1]byte
+	binary.BigEndian.PutUint32(hdr[:4], uint32(len(data)))
+	binary.BigEndian.PutUint64(hdr[4:], frameSum(hdr[:4], data))
 	if _, err := s.w.Write(hdr[:]); err != nil {
 		s.rollbackTail(tail)
 		return err
@@ -289,11 +435,11 @@ func (s *Spool) rollbackTail(tail *segment) {
 
 // Pop returns the next record and a commit function that removes it. ok false
 // with a nil error means the queue is empty; a non-nil error means the head
-// frame could not be read — the caller should surface it and retry, and when
-// the error wraps fs.ErrNotExist the head segment was gone and has been
-// skipped (its frames are unrecoverable). The record is not removed until
-// commit is called, so a crash before commit re-delivers it (at-least-once).
-// commit is idempotent.
+// frame could not be read — the caller should surface it and retry. ErrCorrupt
+// means damaged data was dropped and fs.ErrNotExist that the head segment's
+// file was gone; either way the queue has advanced past it, so the next Pop
+// makes progress. The record is not removed until commit is called, so a crash
+// before commit re-delivers it (at-least-once). commit is idempotent.
 func (s *Spool) Pop() (data []byte, commit func(), ok bool, err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -305,14 +451,16 @@ func (s *Spool) Pop() (data []byte, commit func(), ok bool, err error) {
 	// while the backlog grows. Also heals such wedged spools loaded from disk.
 	s.retireConsumedLocked()
 	head := &s.segs[0]
-	if s.readOff+frameHeader > head.size {
+	fh := head.frameHdr()
+	if s.readOff+fh > head.size {
 		if len(s.segs) > 1 {
 			// A middle segment never grows, so trailing bytes shorter than a
 			// frame header are truncation damage; its remaining frames are
 			// unreadable. Skip the segment (surfaced to the caller) rather
 			// than reporting an empty queue forever while the backlog grows.
+			seq := head.seq
 			s.skipLostHead()
-			return nil, nil, false, fmt.Errorf("spool: truncated segment %d: %w", head.seq, os.ErrNotExist)
+			return nil, nil, false, fmt.Errorf("%w: truncated segment %d", ErrCorrupt, seq)
 		}
 		return nil, nil, false, nil // write tail: wait for the next append
 	}
@@ -323,32 +471,43 @@ func (s *Spool) Pop() (data []byte, commit func(), ok bool, err error) {
 		}
 		return nil, nil, false, err
 	}
-	var hdr [frameHeader]byte
-	if _, err := f.ReadAt(hdr[:], s.readOff); err != nil {
+	hdr := make([]byte, fh)
+	if _, err := f.ReadAt(hdr, s.readOff); err != nil {
 		s.dropReadHandle() // reopen fresh next time
 		return nil, nil, false, err
 	}
-	n := int64(binary.BigEndian.Uint32(hdr[:]))
-	if s.readOff+frameHeader+n > head.size {
-		// An overshooting length prefix is corruption on any segment: a middle
+	n := int64(binary.BigEndian.Uint32(hdr[:4]))
+	if s.readOff+fh+n > head.size {
+		// An overshooting length is corruption on any segment: a middle
 		// segment's size is final, and the write tail's size only ever covers
 		// whole fsynced frames (Append advances it after Sync, under the lock;
 		// openTail truncates torn tails at load) — so this is never a torn
 		// append in progress. The frame boundaries from here on are lost:
 		// waiting would wedge the queue forever, and on the tail a future
 		// append could grow the segment past the bogus length and deliver
-		// bytes spanning unrelated frames. Skip the segment (surfaced to the
-		// caller); the tail is replaced by a fresh segment so appends keep
-		// working.
+		// bytes spanning unrelated frames. Skip the segment; the tail is
+		// replaced by a fresh one so appends keep working.
+		seq := head.seq
 		s.skipLostHead()
-		return nil, nil, false, fmt.Errorf("spool: corrupt frame length in segment %d: %w", head.seq, os.ErrNotExist)
+		return nil, nil, false, fmt.Errorf("%w: frame length in segment %d", ErrCorrupt, seq)
 	}
 	payload := make([]byte, n)
-	if _, err := f.ReadAt(payload, s.readOff+frameHeader); err != nil {
+	if _, err := f.ReadAt(payload, s.readOff+fh); err != nil {
 		s.dropReadHandle()
 		return nil, nil, false, err
 	}
-	end := s.readOff + frameHeader + n
+	end := s.readOff + fh + n
+	if frameSum(hdr[:4], payload) != binary.BigEndian.Uint64(hdr[4:]) {
+		// The record is damaged. Its length still framed it within the
+		// segment, so trust the framing exactly this far: drop the frame,
+		// advance, and let the next Pop re-check. If the length itself was
+		// what got corrupted, the next read lands mid-stream and fails its own
+		// checks, which skips the segment.
+		seq := head.seq
+		s.readOff = end
+		s.persistCursor()
+		return nil, nil, false, fmt.Errorf("%w: frame checksum in segment %d", ErrCorrupt, seq)
+	}
 
 	var done bool
 	commit = func() {
@@ -376,7 +535,7 @@ func (s *Spool) retireConsumedLocked() {
 		}
 		_ = os.Remove(s.segs[0].path)
 		s.segs = s.segs[1:]
-		s.readOff = 0
+		s.readOff = segHeaderLen
 	}
 }
 
@@ -413,7 +572,7 @@ func (s *Spool) skipLostHead() {
 	if len(s.segs) > 1 {
 		_ = os.Remove(s.segs[0].path) // no-op when the file already vanished
 		s.segs = s.segs[1:]
-		s.readOff = 0
+		s.readOff = segHeaderLen
 		s.persistCursor()
 		return
 	}
@@ -436,7 +595,7 @@ func (s *Spool) skipLostHead() {
 		return
 	}
 	_ = os.Remove(oldPath) // no-op when the file already vanished
-	s.readOff = 0
+	s.readOff = segHeaderLen
 	s.persistCursor()
 }
 
@@ -475,12 +634,11 @@ func (s *Spool) Close() error {
 	return nil
 }
 
-// loadCursor reads the persisted {seq, offset}; a missing cursor starts at
-// the oldest segment. The record carries a checksum because it is rewritten
-// in place: a torn write on power loss must fall back to redelivering from
-// the oldest segment (duplicates, within at-least-once) rather than seek to a
-// mixed old/new position that silently skips undelivered frames. A legacy
-// 16-byte record (no checksum) is accepted for upgrades.
+// loadCursor reads the persisted {seq, offset}; a missing, short or torn cursor
+// starts at the oldest segment. The record carries a checksum because it is
+// rewritten in place: a partial write on power loss must fall back to
+// redelivering (duplicates, within at-least-once) rather than seek to a mixed
+// old/new position that silently skips undelivered frames.
 func (s *Spool) loadCursor() (seq, off int64, err error) {
 	f, err := os.OpenFile(filepath.Join(s.dir, cursorName), os.O_RDWR|os.O_CREATE, 0o644)
 	if err != nil {
@@ -489,20 +647,10 @@ func (s *Spool) loadCursor() (seq, off int64, err error) {
 	s.cursorF = f
 	var buf [cursorLen]byte
 	n, _ := f.ReadAt(buf[:], 0)
-	// Rewriting 24 bytes in place is only torn-safe when a partial write
-	// cannot parse as a valid cursor: a fresh/short file falls back to
-	// redelivery, but 24-over-16 torn at 16 bytes would parse as a legacy
-	// cursor with a mixed position. The first persist after a legacy load
-	// therefore goes through a rename (see persistCursor).
-	s.cursorSized = n != 16
-	switch {
-	case n >= cursorLen && binary.BigEndian.Uint64(buf[16:]) == cursorSum(buf[:16]):
+	if n >= cursorLen && binary.BigEndian.Uint64(buf[16:]) == cursorSum(buf[:16]) {
 		return int64(binary.BigEndian.Uint64(buf[:8])), int64(binary.BigEndian.Uint64(buf[8:16])), nil
-	case n == 16: // legacy pre-checksum cursor
-		return int64(binary.BigEndian.Uint64(buf[:8])), int64(binary.BigEndian.Uint64(buf[8:16])), nil
-	default: // fresh, short, or torn: redeliver from the oldest segment
-		return s.segs[0].seq, 0, nil
 	}
+	return s.segs[0].seq, segHeaderLen, nil
 }
 
 const cursorLen = 24 // seq(8) + offset(8) + fnv64a checksum(8)
@@ -514,9 +662,7 @@ func cursorSum(b []byte) uint64 {
 }
 
 // persistCursor rewrites the checksummed cursor in place (caller holds the
-// lock). The first write over a legacy 16-byte cursor goes through a
-// write-tmp-fsync-rename so a torn upgrade cannot leave 16 mixed bytes that
-// parse as a valid legacy position.
+// lock). A torn rewrite fails its checksum on the next load and redelivers.
 func (s *Spool) persistCursor() {
 	if s.cursorF == nil {
 		return
@@ -525,29 +671,6 @@ func (s *Spool) persistCursor() {
 	binary.BigEndian.PutUint64(buf[:8], uint64(s.segs[0].seq))
 	binary.BigEndian.PutUint64(buf[8:16], uint64(s.readOff))
 	binary.BigEndian.PutUint64(buf[16:], cursorSum(buf[:16]))
-	if !s.cursorSized {
-		path := filepath.Join(s.dir, cursorName)
-		tmp := path + ".tmp"
-		if err := os.WriteFile(tmp, buf[:], 0o644); err != nil {
-			return
-		}
-		if t, err := os.Open(tmp); err == nil {
-			_ = t.Sync()
-			_ = t.Close()
-		}
-		if err := os.Rename(tmp, path); err != nil {
-			return
-		}
-		s.syncDir()
-		f, err := os.OpenFile(path, os.O_RDWR, 0o644)
-		if err != nil {
-			return
-		}
-		_ = s.cursorF.Close()
-		s.cursorF = f
-		s.cursorSized = true
-		return
-	}
 	if _, err := s.cursorF.WriteAt(buf[:], 0); err == nil {
 		_ = s.cursorF.Sync()
 	}

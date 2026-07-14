@@ -83,13 +83,14 @@ func TestUncommittedRedeliveredAfterRestart(t *testing.T) {
 }
 
 func TestSizeCap(t *testing.T) {
-	s, err := Open(t.TempDir(), Options{MaxBytes: 32})
+	// Backlog counts the segment header (8) plus each frame (12 + payload).
+	// With 10-byte payloads a frame is 22 bytes: 8 + 22 + 22 = 52 fits, a
+	// third frame (74) does not.
+	s, err := Open(t.TempDir(), Options{MaxBytes: 52})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer func() { _ = s.Close() }()
-	// Each frame is 4 + len bytes. 10-byte payloads → 14 bytes each; two fit
-	// under 32, the third does not.
 	payload := []byte("0123456789")
 	if err := s.Append(payload); err != nil {
 		t.Fatal(err)
@@ -314,7 +315,6 @@ func TestCursorChecksum(t *testing.T) {
 
 	cursor := filepath.Join(dir, cursorName)
 
-	// Legacy format: first 16 bytes of the current cursor.
 	full, err := os.ReadFile(cursor)
 	if err != nil {
 		t.Fatal(err)
@@ -322,6 +322,12 @@ func TestCursorChecksum(t *testing.T) {
 	if len(full) != cursorLen {
 		t.Fatalf("cursor length = %d, want %d", len(full), cursorLen)
 	}
+	_ = seq
+	_ = off
+
+	// A short (e.g. pre-checksum) cursor carries no valid checksum, so it is
+	// not trusted: redeliver from the oldest segment rather than seek to a
+	// position that might skip undelivered frames.
 	if err := os.WriteFile(cursor, full[:16], 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -329,11 +335,8 @@ func TestCursorChecksum(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if s2.segs[0].seq != seq || s2.readOff != off {
-		t.Fatalf("legacy cursor: seq/off = %d/%d, want %d/%d", s2.segs[0].seq, s2.readOff, seq, off)
-	}
-	if got, _, _ := popString(t, s2); got != "b" {
-		t.Fatalf("after legacy cursor Pop = %q, want b", got)
+	if got, _, _ := popString(t, s2); got != "a" {
+		t.Fatalf("after short cursor Pop = %q, want a (redeliver from the start)", got)
 	}
 	_ = s2.Close()
 
@@ -348,8 +351,8 @@ func TestCursorChecksum(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = s3.Close() }()
-	if s3.readOff != 0 {
-		t.Fatalf("torn cursor readOff = %d, want 0 (redeliver)", s3.readOff)
+	if s3.readOff != segHeaderLen {
+		t.Fatalf("torn cursor readOff = %d, want %d (redeliver from the start)", s3.readOff, segHeaderLen)
 	}
 	if got, _, _ := popString(t, s3); got != "a" {
 		t.Fatalf("after torn cursor Pop = %q, want a (redelivered)", got)
@@ -389,30 +392,76 @@ func TestPopSkipsLostHeadSegment(t *testing.T) {
 	commit()
 }
 
-func TestLegacyCursorUpgradeViaRename(t *testing.T) {
+func TestForeignFormatSegmentsDropped(t *testing.T) {
+	dir := t.TempDir()
+	// A segment from an unreadable format: no magic (an older agent), and one
+	// naming a version this build does not know (a newer agent).
+	legacy := filepath.Join(dir, fmt.Sprintf("%020d%s", 5, segSuffix))
+	if err := os.WriteFile(legacy, []byte{0, 0, 0, 3, 'o', 'l', 'd'}, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	future := filepath.Join(dir, fmt.Sprintf("%020d%s", 6, segSuffix))
+	fhdr := make([]byte, segHeaderLen)
+	copy(fhdr, segMagic[:])
+	binary.BigEndian.PutUint16(fhdr[len(segMagic):], 999)
+	if err := os.WriteFile(future, append(fhdr, 'x'), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	s, err := Open(dir, Options{})
+	if err != nil {
+		t.Fatalf("Open with foreign segments: %v", err)
+	}
+	defer func() { _ = s.Close() }()
+	if _, err := os.Stat(legacy); !os.IsNotExist(err) {
+		t.Error("segment without the magic was not discarded")
+	}
+	if _, err := os.Stat(future); !os.IsNotExist(err) {
+		t.Error("segment with an unknown version was not discarded")
+	}
+	// The spool still works, writing the current format.
+	if err := s.Append([]byte("fresh")); err != nil {
+		t.Fatal(err)
+	}
+	if got, commit, ok := popString(t, s); !ok || got != "fresh" {
+		t.Fatalf("Pop = %q (ok=%v), want fresh", got, ok)
+	} else {
+		commit()
+	}
+	version, ok, err := readSegHeader(s.segs[len(s.segs)-1].path)
+	if err != nil || !ok {
+		t.Fatalf("readSegHeader: ok=%v err=%v", ok, err)
+	}
+	if version != formatVersion {
+		t.Fatalf("new segment version = %d, want %d", version, formatVersion)
+	}
+}
+
+// TestCorruptPayloadDropped: a flipped payload byte fails the frame checksum,
+// so the record is dropped and reported — never delivered mangled — and the
+// following records still drain.
+func TestCorruptPayloadDropped(t *testing.T) {
 	dir := t.TempDir()
 	s, err := Open(dir, Options{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Append([]byte("a")); err != nil {
-		t.Fatal(err)
+	for _, v := range []string{"alpha", "bravo", "charlie"} {
+		if err := s.Append([]byte(v)); err != nil {
+			t.Fatal(err)
+		}
 	}
-	if err := s.Append([]byte("b")); err != nil {
-		t.Fatal(err)
-	}
-	_, commit, ok, _ := s.Pop()
-	if !ok {
-		t.Fatal("expected record")
-	}
-	commit()
+	path := s.segs[0].path
 	_ = s.Close()
 
-	// Rewrite the cursor as a legacy 16-byte record (seq + offset, no sum).
-	var legacy [16]byte
-	binary.BigEndian.PutUint64(legacy[:8], 1)
-	binary.BigEndian.PutUint64(legacy[8:16], 5) // frameHeader + len("a")
-	if err := os.WriteFile(filepath.Join(dir, "cursor"), legacy[:], 0o644); err != nil {
+	// Flip a byte inside the first frame's payload (past the segment and frame
+	// headers).
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw[segHeaderLen+frameHeaderV1] ^= 0xff
+	if err := os.WriteFile(path, raw, 0o644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -421,20 +470,22 @@ func TestLegacyCursorUpgradeViaRename(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = s2.Close() }()
-	data, commit2, ok, err := s2.Pop()
-	if err != nil || !ok || string(data) != "b" {
-		t.Fatalf("legacy cursor resume: ok=%v err=%v data=%q", ok, err, data)
+
+	// The damaged record surfaces as ErrCorrupt, not as data.
+	data, _, ok, err := s2.Pop()
+	if ok || data != nil {
+		t.Fatalf("corrupt frame was delivered: %q", data)
 	}
-	commit2() // first persist after a legacy load must go through the rename
-	raw, err := os.ReadFile(filepath.Join(dir, "cursor"))
-	if err != nil {
-		t.Fatal(err)
+	if !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("err = %v, want ErrCorrupt", err)
 	}
-	if len(raw) != cursorLen {
-		t.Fatalf("cursor not upgraded: %d bytes", len(raw))
-	}
-	if binary.BigEndian.Uint64(raw[16:]) != cursorSum(raw[:16]) {
-		t.Fatal("upgraded cursor has bad checksum")
+	// The rest of the segment still drains.
+	for _, want := range []string{"bravo", "charlie"} {
+		got, commit, gotOK := popString(t, s2)
+		if !gotOK || got != want {
+			t.Fatalf("Pop = %q (ok=%v), want %q", got, gotOK, want)
+		}
+		commit()
 	}
 }
 
@@ -474,4 +525,66 @@ func TestPopAfterCaughtUpRotation(t *testing.T) {
 	if got := s.Bytes(); got != 0 {
 		t.Fatalf("backlog after full drain: %d", got)
 	}
+}
+
+// TestCrashRecoveryDeliversUncommitted simulates kill -9: a spool abandoned
+// without Close, with a torn frame left half-written at the tail (the crash
+// interrupted an Append mid-frame). Reopening must truncate the torn frame,
+// deliver every committed-but-unacked record, and keep accepting appends.
+func TestCrashRecoveryDeliversUncommitted(t *testing.T) {
+	dir := t.TempDir()
+	s, err := Open(dir, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"one", "two", "three", "four"}
+	for _, v := range want {
+		if err := s.Append([]byte(v)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Consume the first record; the rest are still owed.
+	got, commit, ok := popString(t, s)
+	if !ok || got != "one" {
+		t.Fatalf("pop = %q (ok=%v)", got, ok)
+	}
+	commit()
+	tail := s.segs[len(s.segs)-1].path
+	// Abandon without Close (kill -9), then leave a torn frame behind: a full
+	// frame header promising bytes that were never written.
+	f, err := os.OpenFile(tail, os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var hdr [frameHeaderV1]byte
+	binary.BigEndian.PutUint32(hdr[:4], 999) // claims 999 bytes; none follow
+	if _, err := f.Write(hdr[:]); err != nil {
+		t.Fatal(err)
+	}
+	_ = f.Close()
+
+	s2, err := Open(dir, Options{})
+	if err != nil {
+		t.Fatalf("Open after crash: %v", err)
+	}
+	defer func() { _ = s2.Close() }()
+	for _, w := range want[1:] {
+		got, commit, ok := popString(t, s2)
+		if !ok || got != w {
+			t.Fatalf("after crash Pop = %q (ok=%v), want %q", got, ok, w)
+		}
+		commit()
+	}
+	if _, _, ok, err := s2.Pop(); ok || err != nil {
+		t.Fatalf("expected an empty queue after draining, got ok=%v err=%v", ok, err)
+	}
+	// The torn frame was truncated, so appends resume cleanly.
+	if err := s2.Append([]byte("after-crash")); err != nil {
+		t.Fatal(err)
+	}
+	got, commit, ok = popString(t, s2)
+	if !ok || got != "after-crash" {
+		t.Fatalf("post-crash append Pop = %q (ok=%v)", got, ok)
+	}
+	commit()
 }

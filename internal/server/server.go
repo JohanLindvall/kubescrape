@@ -485,9 +485,18 @@ func (s *Server) writeCached(w http.ResponseWriter, r *http.Request, v any) {
 		return
 	}
 	etag := `"` + strconv.FormatUint(fnvHash(body), 16) + `"`
+	// max-age has second granularity: a sub-second TTL truncates to 0, which
+	// tells the client not to cache AT ALL — the opposite of a short cache, and
+	// silently (the ETag is still computed on every response). Round up so any
+	// non-zero TTL caches for at least a second; 0 disables caching before we
+	// get here.
+	maxAge := int(s.cacheTTL.Seconds())
+	if maxAge < 1 {
+		maxAge = 1
+	}
 	h := w.Header()
 	h.Set("Content-Type", "application/json")
-	h.Set("Cache-Control", "max-age="+strconv.Itoa(int(s.cacheTTL.Seconds())))
+	h.Set("Cache-Control", "max-age="+strconv.Itoa(maxAge))
 	h.Set("ETag", etag)
 	if match := r.Header.Get("If-None-Match"); match != "" && etagMatches(match, etag) {
 		w.WriteHeader(http.StatusNotModified)

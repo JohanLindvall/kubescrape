@@ -9,6 +9,7 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/plog"
@@ -16,6 +17,7 @@ import (
 	"github.com/JohanLindvall/kubescrape/internal/agent/attrs"
 	"github.com/JohanLindvall/kubescrape/internal/obs"
 	"github.com/JohanLindvall/kubescrape/internal/store"
+	"github.com/JohanLindvall/kubescrape/pkg/kubemeta"
 )
 
 // LogExporter sends one OTLP logs payload; implemented by otlpexport.Client.
@@ -25,11 +27,25 @@ type LogExporter interface {
 
 // Config configures the exporter.
 type Config struct {
-	Store         *store.Store
-	Exporter      LogExporter
+	Store    *store.Store
+	Exporter LogExporter
+	// Owners resolves the involved pod's workload chain and namespace metadata,
+	// exactly as the HTTP API does per request. Without it a pod's events would
+	// carry no k8s.deployment.name/k8s.job.name and would derive service.name
+	// from the POD name — so a workload's events would not share a service.name
+	// with that same pod's logs (whose metadata is owner-resolved), and every
+	// replica would mint a service.name that churns on each rollout.
+	Owners        OwnerResolver
 	BatchSize     int           // flush after this many events
 	FlushInterval time.Duration // flush at least this often
 	Logger        *slog.Logger
+}
+
+// OwnerResolver is the subset of owners.Resolver the exporter needs (the HTTP
+// API's MetadataResolver, minus Node).
+type OwnerResolver interface {
+	Resolve(namespace string, refs []metav1.OwnerReference) []kubemeta.Owner
+	Namespace(name string) *kubemeta.ObjectMeta
 }
 
 // Exporter converts and batches events. Informer handlers feed it; Run
@@ -239,7 +255,16 @@ func (e *Exporter) fillResource(res pcommon.Resource, ev *corev1.Event) {
 	if obj.Kind == "Pod" {
 		if np, ok := e.cfg.Store.GetPodByName(obj.Namespace, obj.Name); ok &&
 			(obj.UID == "" || string(obj.UID) == np.Pod.UID) {
-			attrs.Pod(res, np.Pod)
+			pod := np.Pod
+			// The store never resolves the owner chain (it is lazy, per request,
+			// everywhere else); resolve it here so an event's resource matches
+			// the one that pod's logs and metrics get.
+			if e.cfg.Owners != nil {
+				pod.Owners = e.cfg.Owners.Resolve(pod.Namespace, np.OwnerRefs)
+				pod.NamespaceMetadata = e.cfg.Owners.Namespace(pod.Namespace)
+			}
+			attrs.Pod(res, pod)
+			attrs.Identity(res) // service.namespace + service.instance.id
 			return
 		}
 	}

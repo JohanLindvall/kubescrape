@@ -200,7 +200,13 @@ func (s *Store) UpsertPod(p *corev1.Pod) {
 		delete(s.byPodIP, oldIP)
 	}
 	if ip != "" {
-		s.byPodIP[ip] = rec
+		// Pod IPs recycle, and a terminating pod keeps phase Running: a routine
+		// update to the OLD owner (a condition change while it drains) must not
+		// re-steal an IP the CNI has already handed to a newer pod. Claims are
+		// therefore ordered by creation time — the newest pod owns the IP.
+		if cur := s.byPodIP[ip]; cur == nil || cur == rec || !cur.pod.CreatedAt.After(pod.CreatedAt) {
+			s.byPodIP[ip] = rec
+		}
 	}
 }
 

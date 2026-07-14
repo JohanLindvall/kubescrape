@@ -285,7 +285,7 @@ func run() error {
 	}
 
 	if *eventsOn {
-		ev := events.New(events.Config{Store: st, Exporter: exporter, Logger: log})
+		ev := events.New(events.Config{Store: st, Exporter: exporter, Owners: resolver, Logger: log})
 		evInformer := factory.Core().V1().Events().Informer()
 		if _, err := evInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
 			AddFunc:    ev.OnAdd,

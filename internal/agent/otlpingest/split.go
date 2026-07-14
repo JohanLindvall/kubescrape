@@ -182,11 +182,19 @@ func (g *metricGrouper) resource(id string) pmetric.ResourceMetrics {
 	if id != "" {
 		if id != g.resToken {
 			// This group is keyed by a point-level ID that differs from the
-			// resource's own: the copied resource's ID attributes describe a
-			// DIFFERENT object and would mislabel (and mis-enrich downstream)
-			// every point in the group. The ""-fallback and resToken groups
-			// keep them — there they are correct.
+			// resource's own: the copied resource describes a DIFFERENT object.
+			// Its ID attributes would mislabel (and mis-enrich downstream) every
+			// point in the group — and so would the rest of the sender's identity
+			// (k8s.pod.name, service.name, …), which names the EXPORTER, not the
+			// object. The sender is authoritative about itself, not about others,
+			// so the resolved identity OVERWRITES rather than merges here. Sender
+			// attributes the builder does not supply (cluster name, SDK attrs,
+			// custom) are untouched.
 			g.stripIDAttrs(rm.Resource().Attributes())
+			built := g.enricher.builtAttrs(g.ctx, g.enrichCache, id)
+			overwriteAttrs(built, rm.Resource().Attributes())
+			g.rmByID[id] = rm
+			return rm
 		}
 		mergeAttrs(g.enricher.builtAttrs(g.ctx, g.enrichCache, id), rm.Resource().Attributes())
 	} else if pod := g.enricher.peerPod(g.ctx); pod != nil {

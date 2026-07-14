@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/cespare/xxhash/v2"
 	"go.opentelemetry.io/collector/pdata/plog"
 	"go.opentelemetry.io/collector/pdata/pmetric"
 	"go.opentelemetry.io/collector/pdata/ptrace"
@@ -135,7 +136,36 @@ type sink[T any] struct {
 	cur       time.Duration // current backoff, persisted across trySend cycles of a failing head
 	log       *slog.Logger
 	kind      string
+	// delivered counts batches this sink has successfully exported; stuck
+	// tracks, per stuck payload, how many drain cycles it has failed and what
+	// delivered stood at when it first got stuck (see stuckTooLong).
+	delivered uint64
+	stuck     map[uint64]stuckBatch
 }
+
+type stuckBatch struct {
+	cycles      int
+	deliveredAt uint64 // s.delivered when this payload first got stuck
+}
+
+// maxDrainCycles bounds how many drain cycles a batch may fail — while the
+// collector is demonstrably accepting OTHER batches — before it is dropped as
+// undeliverable. A rejection classified TRANSIENT that is in fact permanent for
+// this ONE payload (canonically an over-limit message, which gRPC reports as
+// ResourceExhausted) would otherwise circle the queue forever: never delivered,
+// never dropped, never counted, holding spool bytes across restarts.
+//
+// The "accepting other batches" condition is what makes this safe. A collector
+// OUTAGE fails every batch too, and dropping there would breach the zero-loss
+// guarantee for logs — so a batch that fails while nothing else is getting
+// through is retried indefinitely, which is exactly right: the outage is the
+// only thing wrong with it. Only a payload the live collector keeps singling
+// out is poison.
+const maxDrainCycles = 3
+
+// maxStuckTracked bounds the stuck map during a long outage (every queued batch
+// fails then, and none is poison).
+const maxStuckTracked = 4096
 
 func (s *sink[T]) enqueue(v T) error {
 	data, err := s.marshal(v)
@@ -193,6 +223,7 @@ func (s *sink[T]) drain(ctx context.Context) {
 		switch s.trySend(ctx, v) {
 		case sendOK:
 			commit()
+			s.delivered++ // proof the collector is alive: see stuckTooLong
 		case sendCancelled:
 			return // ctx cancelled mid-send; leave it queued
 		case sendRejected:
@@ -208,6 +239,13 @@ func (s *sink[T]) drain(ctx context.Context) {
 			// pointless churn (a full rewrite + fsync) when this is the only
 			// queued batch, so it stays at the head then. If the spool is full
 			// the batch also stays put and the next loop retries in place.
+			if s.stuckTooLong(data) {
+				s.log.Error("dropping buffered batch the collector never accepted",
+					"signal", s.kind, "cycles", maxDrainCycles, "bytes", len(data))
+				obs.BufferDropped.WithLabelValues(s.kind).Inc()
+				commit()
+				continue
+			}
 			if s.spool.Bytes() > int64(len(data))+spool.FrameOverhead {
 				if err := s.spool.Append(data); err == nil {
 					obs.BufferRequeued.WithLabelValues(s.kind).Inc()
@@ -216,6 +254,37 @@ func (s *sink[T]) drain(ctx context.Context) {
 			}
 		}
 	}
+}
+
+// stuckTooLong records another failed drain cycle for this payload and reports
+// whether it should now be given up on: it must have failed maxDrainCycles
+// cycles AND the collector must have accepted some other batch since it first
+// got stuck (otherwise this is an outage, not a poison payload, and the batch
+// is retried indefinitely rather than lost).
+//
+// Keying by content hash (rather than threading a counter through the spool
+// format) means the count resets on restart — which is what we want: a fresh
+// process should re-offer the batch, since the collector may have been fixed or
+// upgraded in the meantime.
+func (s *sink[T]) stuckTooLong(data []byte) bool {
+	h := xxhash.Sum64(data)
+	if s.stuck == nil {
+		s.stuck = make(map[uint64]stuckBatch)
+	}
+	st, seen := s.stuck[h]
+	if !seen {
+		if len(s.stuck) >= maxStuckTracked {
+			return false
+		}
+		st.deliveredAt = s.delivered
+	}
+	st.cycles++
+	s.stuck[h] = st
+	if st.cycles < maxDrainCycles || s.delivered == st.deliveredAt {
+		return false
+	}
+	delete(s.stuck, h)
+	return true
 }
 
 type sendResult int

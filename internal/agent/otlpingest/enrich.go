@@ -263,6 +263,18 @@ func mergeAttrs(src, dst pcommon.Map) {
 	})
 }
 
+// overwriteAttrs sets src's attributes on dst, replacing what the sender set.
+// Used only where the resource describes an object OTHER than the sender (the
+// datapoint-split path): there the sender's identity attributes name itself,
+// not the object, so they are not authoritative. Keys absent from src are left
+// alone.
+func overwriteAttrs(src, dst pcommon.Map) {
+	src.Range(func(k string, v pcommon.Value) bool {
+		v.CopyTo(dst.PutEmpty(k))
+		return true
+	})
+}
+
 // build merges the k8s attributes for pod/container into a, never overwriting
 // keys the sender already set.
 func (e *Enricher) build(pod *kubemeta.Pod, container *kubemeta.Container, a pcommon.Map) {

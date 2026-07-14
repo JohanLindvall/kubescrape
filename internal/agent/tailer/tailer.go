@@ -53,13 +53,13 @@ import (
 	"go.opentelemetry.io/collector/pdata/plog"
 
 	"github.com/JohanLindvall/kubescrape/internal/agent/attrs"
-	"github.com/JohanLindvall/kubescrape/internal/agent/logattrs"
 	"github.com/JohanLindvall/kubescrape/internal/agent/logenrich"
-	"github.com/JohanLindvall/kubescrape/internal/agent/metaclient"
 	"github.com/JohanLindvall/kubescrape/internal/agent/positions"
-	"github.com/JohanLindvall/kubescrape/internal/kubemeta"
 	"github.com/JohanLindvall/kubescrape/internal/metrics"
 	"github.com/JohanLindvall/kubescrape/internal/obs"
+	"github.com/JohanLindvall/kubescrape/pkg/kubemeta"
+	"github.com/JohanLindvall/kubescrape/pkg/logattrs"
+	"github.com/JohanLindvall/kubescrape/pkg/metaclient"
 )
 
 // LogExporter sends one OTLP logs payload.

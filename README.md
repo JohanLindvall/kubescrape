@@ -164,6 +164,21 @@ metrics machinery as everything else and **pushed over OTLP**
 the Go runtime and process metrics (`go_*`, `process_*`) in Prometheus text
 format, for debugging the process itself.
 
+## Reusable packages
+
+Most of the code is `internal/`, but the pieces that stand on their own are
+importable:
+
+| Package | What it is |
+|---|---|
+| [`pkg/promparse`](pkg/promparse) | Streaming parser for the Prometheus text exposition format (classic + OpenMetrics). Never buffers more than a line, so a 100k-series endpoint parses in constant memory; pooled parsers keep the intern tables warm (a large scrape costs a handful of allocations). |
+| [`pkg/spool`](pkg/spool) | Durable on-disk FIFO queue: length-prefixed, xxhash-checksummed frames in rotating segments, `fsync` per append, at-least-once across restarts, size-capped with back-pressure. |
+| [`pkg/kubemeta`](pkg/kubemeta) | The metadata model the service serves — the wire contract for its API — plus `FromPod` and `NormalizeContainerID`. |
+| [`pkg/metaclient`](pkg/metaclient) | HTTP client for that API: blocking container-ID lookups, ETag/Cache-Control caching, no metrics dependency (set `Observe` to feed your own). |
+| [`pkg/logattrs`](pkg/logattrs) | Lifts configured keys out of a JSON or logfmt log line onto an OTLP record, as resource, scope or log attributes. |
+
+They carry no `internal/` dependencies, so they are usable outside this module.
+
 ## Running
 
 ```sh

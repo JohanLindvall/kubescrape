@@ -7,9 +7,9 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/JohanLindvall/kubescrape/internal/kubemeta"
 	"github.com/JohanLindvall/kubescrape/internal/servicemonitors"
 	"github.com/JohanLindvall/kubescrape/internal/services"
+	"github.com/JohanLindvall/kubescrape/pkg/kubemeta"
 	"k8s.io/apimachinery/pkg/util/intstr"
 )
 

@@ -6,7 +6,7 @@ package attrs
 import (
 	"go.opentelemetry.io/collector/pdata/pcommon"
 
-	"github.com/JohanLindvall/kubescrape/internal/kubemeta"
+	"github.com/JohanLindvall/kubescrape/pkg/kubemeta"
 )
 
 // ServiceName derives the OTLP service.name for a pod: the name of its

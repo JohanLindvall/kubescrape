@@ -24,16 +24,16 @@ import (
 
 	"github.com/JohanLindvall/kubescrape/internal/agent/attrs"
 	"github.com/JohanLindvall/kubescrape/internal/agent/journald"
-	"github.com/JohanLindvall/kubescrape/internal/agent/logattrs"
-	"github.com/JohanLindvall/kubescrape/internal/agent/metaclient"
 	"github.com/JohanLindvall/kubescrape/internal/agent/otlpexport"
 	"github.com/JohanLindvall/kubescrape/internal/agent/otlpingest"
 	"github.com/JohanLindvall/kubescrape/internal/agent/positions"
 	"github.com/JohanLindvall/kubescrape/internal/agent/promscrape"
-	"github.com/JohanLindvall/kubescrape/internal/agent/spool"
 	"github.com/JohanLindvall/kubescrape/internal/agent/tailer"
 	"github.com/JohanLindvall/kubescrape/internal/metrics"
 	"github.com/JohanLindvall/kubescrape/internal/obs"
+	"github.com/JohanLindvall/kubescrape/pkg/logattrs"
+	"github.com/JohanLindvall/kubescrape/pkg/metaclient"
+	"github.com/JohanLindvall/kubescrape/pkg/spool"
 	"go.opentelemetry.io/collector/pdata/pcommon"
 )
 
@@ -204,6 +204,8 @@ func run() error {
 	// The metadata client's HTTP timeout must exceed the server-side wait —
 	// including the ingest lookups' own wait, which may be longer.
 	meta := metaclient.New(*metadataURL, max(*metadataWait, *ingestWait)+10*time.Second)
+	// The client is dependency-free by design; feed its outcomes to our metrics.
+	meta.Observe = func(outcome string) { obs.MetadataRequests.WithLabelValues(outcome).Inc() }
 
 	nodeInfo := startNodeInfo(ctx, meta, *nodeName, *nodeRefresh, log)
 

@@ -1,4 +1,15 @@
-// Package metaclient is the HTTP client for the kubescrape metadata service.
+// Package metaclient is the HTTP client for the kubescrape metadata service:
+// it resolves a container ID, pod UID or pod IP to the pod/container metadata
+// the service derives from its informer caches.
+//
+// Container lookups may block: a container ID can reach a node's agent up to a
+// second before the kubelet has posted it to the API server, so the service
+// holds the request until the ID appears or the wait elapses (see Container).
+//
+// Responses carrying Cache-Control/ETag are cached, so repeat lookups are
+// served locally or revalidated with a conditional GET. The client has no
+// metrics dependency; set Client.Observe to feed lookup outcomes into whatever
+// metrics library the caller uses.
 package metaclient
 
 import (
@@ -15,8 +26,21 @@ import (
 	"sync"
 	"time"
 
-	"github.com/JohanLindvall/kubescrape/internal/kubemeta"
-	"github.com/JohanLindvall/kubescrape/internal/obs"
+	"github.com/JohanLindvall/kubescrape/pkg/kubemeta"
+)
+
+// Request outcomes reported to Client.Observe.
+const (
+	// OutcomeOK is a fetch that hit the service and returned metadata.
+	OutcomeOK = "ok"
+	// OutcomeCached is a fetch served from the local cache without a request.
+	OutcomeCached = "cached"
+	// OutcomeNotModified is a conditional GET the service answered with 304.
+	OutcomeNotModified = "not_modified"
+	// OutcomeNotFound is a 404 (the object is unknown to the service).
+	OutcomeNotFound = "not_found"
+	// OutcomeError is a transport failure or an unexpected status.
+	OutcomeError = "error"
 )
 
 // Client talks to a kubescrape metadata service. Responses carrying
@@ -28,8 +52,21 @@ type Client struct {
 	http *http.Client
 	now  func() time.Time
 
+	// Observe, if set, is called once per lookup with the outcome (one of the
+	// Outcome* constants). It is the hook callers use to feed their own
+	// metrics without this package depending on a metrics library; it runs on
+	// the caller's goroutine, so keep it cheap and non-blocking.
+	Observe func(outcome string)
+
 	mu    sync.Mutex
 	cache map[string]cacheEntry
+}
+
+// observe reports an outcome when a hook is installed.
+func (c *Client) observe(outcome string) {
+	if c.Observe != nil {
+		c.Observe(outcome)
+	}
 }
 
 type cacheEntry struct {
@@ -140,7 +177,7 @@ func (c *Client) getJSON(ctx context.Context, u string, v any) error {
 	if cached && c.now().Before(entry.expires) {
 		body := entry.body
 		c.mu.Unlock()
-		obs.MetadataRequests.WithLabelValues("cached").Inc()
+		c.observe(OutcomeCached)
 		return json.Unmarshal(body, v)
 	}
 	c.mu.Unlock()
@@ -155,7 +192,7 @@ func (c *Client) getJSON(ctx context.Context, u string, v any) error {
 	}
 	resp, err := c.http.Do(req)
 	if err != nil {
-		obs.MetadataRequests.WithLabelValues("error").Inc()
+		c.observe(OutcomeError)
 		return err
 	}
 	defer func() {
@@ -177,12 +214,12 @@ func (c *Client) getJSON(ctx context.Context, u string, v any) error {
 			c.cache[key] = cur
 		}
 		c.mu.Unlock()
-		obs.MetadataRequests.WithLabelValues("not_modified").Inc()
+		c.observe(OutcomeNotModified)
 		return json.Unmarshal(entry.body, v)
 	case resp.StatusCode == http.StatusOK:
 		body, err := io.ReadAll(resp.Body)
 		if err != nil {
-			obs.MetadataRequests.WithLabelValues("error").Inc()
+			c.observe(OutcomeError)
 			return err
 		}
 		if ttl := maxAge(resp); ttl > 0 {
@@ -191,14 +228,14 @@ func (c *Client) getJSON(ctx context.Context, u string, v any) error {
 			c.evictLocked()
 			c.mu.Unlock()
 		}
-		obs.MetadataRequests.WithLabelValues("ok").Inc()
+		c.observe(OutcomeOK)
 		return json.Unmarshal(body, v)
 	default:
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
 		if resp.StatusCode == http.StatusNotFound {
-			obs.MetadataRequests.WithLabelValues("not_found").Inc()
+			c.observe(OutcomeNotFound)
 		} else {
-			obs.MetadataRequests.WithLabelValues("error").Inc()
+			c.observe(OutcomeError)
 		}
 		return &StatusError{Code: resp.StatusCode, Body: strings.TrimSpace(string(body))}
 	}

@@ -29,6 +29,10 @@ make cluster-down
 
 `hack/test-workloads.yaml` intentionally exercises every code path: a pod-annotated Deployment (ReplicaSet→Deployment chain, pod-source targets), a non-annotated Deployment behind an annotated Service with a named `targetPort` (service-source targets), and a CronJob (Job→CronJob chain).
 
+## Public packages (`pkg/`)
+
+`pkg/promparse` (the exposition parser — `internal/agent/promscrape` aliases its types in `promparse.go`), `pkg/spool`, `pkg/kubemeta`, `pkg/metaclient` and `pkg/logattrs` are importable by other modules. **They must never import `internal/`** (Go would allow it inside this module but break every external consumer) — the boundary is worth re-checking when adding code there. `metaclient` deliberately has no metrics dependency: the agent installs `Client.Observe` to bump `obs.MetadataRequests`.
+
 ## Architecture
 
 Two binaries: `cmd/kubescrape` (metadata service) and `cmd/kubescrape-agent` (per-node DaemonSet: log tailer + Prometheus scraper exporting OTLP). Both live in one image; the DaemonSet overrides `command: ["/kubescrape-agent"]`.

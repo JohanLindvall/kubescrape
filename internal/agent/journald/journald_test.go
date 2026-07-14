@@ -12,9 +12,9 @@ import (
 
 	"go.opentelemetry.io/collector/pdata/plog"
 
-	"github.com/JohanLindvall/kubescrape/internal/agent/logattrs"
 	"github.com/JohanLindvall/kubescrape/internal/agent/otlpexport"
 	"github.com/JohanLindvall/kubescrape/internal/agent/positions"
+	"github.com/JohanLindvall/kubescrape/pkg/logattrs"
 )
 
 // captureExporter records exported batches; failures makes the next n exports

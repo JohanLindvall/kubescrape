@@ -16,7 +16,7 @@ import (
 	"errors"
 
 	"github.com/JohanLindvall/kubescrape/internal/agent/otlpexport"
-	"github.com/JohanLindvall/kubescrape/internal/agent/spool"
+	"github.com/JohanLindvall/kubescrape/pkg/spool"
 	"github.com/klauspost/compress/gzip"
 	"go.opentelemetry.io/collector/pdata/plog"
 	"go.opentelemetry.io/collector/pdata/plog/plogotlp"

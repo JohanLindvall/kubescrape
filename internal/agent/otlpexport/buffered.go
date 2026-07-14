@@ -14,8 +14,8 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
-	"github.com/JohanLindvall/kubescrape/internal/agent/spool"
 	"github.com/JohanLindvall/kubescrape/internal/obs"
+	"github.com/JohanLindvall/kubescrape/pkg/spool"
 )
 
 // Exporter exports logs and metrics; implemented by *Client and *Buffered, so

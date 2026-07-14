@@ -12,7 +12,7 @@ import (
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"sigs.k8s.io/yaml"
 
-	"github.com/JohanLindvall/kubescrape/internal/kubemeta"
+	"github.com/JohanLindvall/kubescrape/pkg/kubemeta"
 )
 
 // NodeInfo is the metadata of the node the agent runs on.

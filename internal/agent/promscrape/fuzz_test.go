@@ -2,10 +2,10 @@ package promscrape
 
 import (
 	"bytes"
-	"fmt"
 	"testing"
 	"time"
 
+	"github.com/JohanLindvall/kubescrape/pkg/promparse"
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/pmetric"
 )
@@ -53,125 +53,6 @@ var fuzzSeedBodies = []string{
 	"m 1 9223372036854775807\nm 1 -9223372036854775808\nm 1 1e300\nm 1 0.0001\n",
 }
 
-// knownGood is a body with an exactly-known parse, used to verify a pooled
-// parser is uncorrupted after parsing fuzz input.
-const knownGood = "# TYPE h histogram\n" +
-	"h_bucket{le=\"1\"} 1\n" +
-	"h_bucket{le=\"+Inf\"} 2\n" +
-	"h_sum 3\n" +
-	"h_count 2\n" +
-	"plain{a=\"b\"} 5\n"
-
-type flatSample struct {
-	name, family string
-	role         SampleRole
-	labels       string
-	value        float64
-}
-
-func flatten(s Sample) flatSample {
-	var lb bytes.Buffer
-	for _, l := range s.Labels {
-		fmt.Fprintf(&lb, "%s=%s;", l.Name, l.Value)
-	}
-	return flatSample{name: s.Name, family: s.Family, role: s.Role, labels: lb.String(), value: s.Value}
-}
-
-var knownGoodWant = []flatSample{
-	{"h_bucket", "h", RoleHistogramBucket, "le=1;", 1},
-	{"h_bucket", "h", RoleHistogramBucket, "le=+Inf;", 2},
-	{"h_sum", "h", RoleHistogramSum, "", 3},
-	{"h_count", "h", RoleHistogramCount, "", 2},
-	{"plain", "plain", RoleGauge, "a=b;", 5},
-}
-
-// parseKnownGood runs the known-good body through a pooled parser and fails
-// the test if the result deviates — the alarm for pool-state corruption.
-func parseKnownGood(t *testing.T) {
-	t.Helper()
-	pp := getParser(1<<20, false, false)
-	defer putParser(pp)
-	var got []flatSample
-	malformed, err := pp.parse(bytes.NewReader([]byte(knownGood)), func(s Sample) error {
-		got = append(got, flatten(s))
-		return nil
-	})
-	if err != nil || malformed != 0 {
-		t.Fatalf("known-good parse: malformed=%d err=%v", malformed, err)
-	}
-	if len(got) != len(knownGoodWant) {
-		t.Fatalf("known-good parse: got %d samples, want %d: %+v", len(got), len(knownGoodWant), got)
-	}
-	for i := range got {
-		if got[i] != knownGoodWant[i] {
-			t.Fatalf("known-good sample %d: got %+v want %+v", i, got[i], knownGoodWant[i])
-		}
-	}
-}
-
-// FuzzParser feeds arbitrary bytes through the pooled parser path in every
-// mode combination. Invariants: no panics; parse of an in-memory reader never
-// errors; the malformed count stays within the physical line count; every
-// emitted sample has a non-empty name and non-empty label names; the pool is
-// not corrupted (a known-good body still parses exactly afterwards).
-func FuzzParser(f *testing.F) {
-	for _, body := range fuzzSeedBodies {
-		for mode := byte(0); mode < 8; mode++ {
-			f.Add([]byte(body), mode)
-		}
-	}
-	f.Fuzz(func(t *testing.T, data []byte, mode byte) {
-		openMetrics := mode&1 != 0
-		exemplars := mode&2 != 0
-		maxLine := 1 << 20
-		if mode&4 != 0 {
-			maxLine = 100 // exercise the too-long-line path, incl. bufio spill
-		}
-
-		pp := getParser(maxLine, openMetrics, exemplars)
-		samples := 0
-		malformed, err := pp.parse(bytes.NewReader(data), func(s Sample) error {
-			samples++
-			if s.Name == "" {
-				t.Errorf("sample %d: empty name", samples)
-			}
-			if s.Family == "" {
-				t.Errorf("sample %d (%q): empty family", samples, s.Name)
-			}
-			for _, l := range s.Labels {
-				if l.Name == "" {
-					t.Errorf("sample %q: empty label name", s.Name)
-				}
-			}
-			if s.Exemplar != nil {
-				if !exemplars {
-					t.Errorf("sample %q: exemplar emitted with exemplars disabled", s.Name)
-				}
-				for _, l := range s.Exemplar.Labels {
-					if l.Name == "" {
-						t.Errorf("sample %q: empty exemplar label name", s.Name)
-					}
-				}
-			}
-			return nil
-		})
-		if err != nil {
-			t.Fatalf("parse returned error for in-memory input: %v", err)
-		}
-		lines := bytes.Count(data, []byte{'\n'}) + 1
-		if malformed < 0 || malformed > lines {
-			t.Fatalf("malformed=%d out of range (lines=%d)", malformed, lines)
-		}
-		if samples+malformed > lines {
-			t.Fatalf("samples=%d + malformed=%d exceeds physical lines %d", samples, malformed, lines)
-		}
-		putParser(pp)
-
-		// The recycled parser must be uncorrupted.
-		parseKnownGood(t)
-	})
-}
-
 // FuzzConverter pipes fuzzed parses through the converter and batcher
 // (including mid-parse chunking via take) and requires that every produced
 // pmetric.Metrics marshals cleanly.
@@ -199,15 +80,15 @@ func FuzzConverter(f *testing.F) {
 			res.Attributes().PutStr("url.full", "http://fuzz.local/metrics")
 		}, limit, time.Unix(1e9, 0), time.Unix(1e9+60, 0))
 		conv := newConverter(b)
-		pp := getParser(1<<20, openMetrics, exemplars)
-		_, err := pp.parse(bytes.NewReader(data), func(s Sample) error {
+		pp := promparse.Get(1<<20, openMetrics, exemplars)
+		_, err := pp.Parse(bytes.NewReader(data), func(s Sample) error {
 			conv.add(s)
 			if b.count() >= limit {
 				checkTaken(b.take())
 			}
 			return nil
 		})
-		putParser(pp)
+		promparse.Put(pp)
 		if err != nil {
 			t.Fatalf("parse returned error: %v", err)
 		}

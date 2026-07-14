@@ -7,10 +7,10 @@ import (
 	"sigs.k8s.io/yaml"
 
 	"github.com/JohanLindvall/kubescrape/internal/agent/attrs"
-	"github.com/JohanLindvall/kubescrape/internal/agent/logattrs"
 	"github.com/JohanLindvall/kubescrape/internal/agent/promscrape"
 	"github.com/JohanLindvall/kubescrape/internal/agent/tailer"
 	"github.com/JohanLindvall/kubescrape/internal/metrics"
+	"github.com/JohanLindvall/kubescrape/pkg/logattrs"
 )
 
 // agentConfig is the single -config YAML file. Each section mirrors the shape

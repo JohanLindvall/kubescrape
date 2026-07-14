@@ -9,7 +9,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/cache"
 
-	"github.com/JohanLindvall/kubescrape/internal/kubemeta"
+	"github.com/JohanLindvall/kubescrape/pkg/kubemeta"
 )
 
 func fakeResolver(objects map[string]*metav1.PartialObjectMetadata) *Resolver {

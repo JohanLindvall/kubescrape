@@ -9,7 +9,7 @@ import (
 	"go.opentelemetry.io/collector/pdata/plog"
 	"go.opentelemetry.io/collector/pdata/pmetric"
 
-	"github.com/JohanLindvall/kubescrape/internal/agent/spool"
+	"github.com/JohanLindvall/kubescrape/pkg/spool"
 )
 
 type fakeSender struct {

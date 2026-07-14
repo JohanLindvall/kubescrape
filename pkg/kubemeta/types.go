@@ -1,5 +1,11 @@
-// Package kubemeta defines the metadata model served over HTTP and the
-// conversion from Kubernetes API objects into that model.
+// Package kubemeta is the metadata model the kubescrape service serves over
+// HTTP — the wire contract for its API, so clients can decode responses
+// without redeclaring the types (pkg/metaclient does exactly that).
+//
+// It also holds the conversion from Kubernetes API objects into that model
+// (FromPod) and NormalizeContainerID, which reduces the runtime-prefixed
+// container IDs Kubernetes reports ("containerd://<hex>", "docker://<hex>")
+// to the bare ID the API and the container runtimes' log filenames use.
 package kubemeta
 
 import "time"

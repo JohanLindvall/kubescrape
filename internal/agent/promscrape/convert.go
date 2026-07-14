@@ -246,11 +246,6 @@ func appendLabelsExcept(dst []Label, labels []Label, except string) []Label {
 	return dst
 }
 
-func copyExemplar(e Exemplar) Exemplar {
-	e.Labels = append([]Label(nil), e.Labels...)
-	return e
-}
-
 func labelFloat(labels []Label, name string) (float64, bool) {
 	for _, l := range labels {
 		if l.Name == name {

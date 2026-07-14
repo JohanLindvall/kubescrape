@@ -9,7 +9,7 @@ import (
 
 	"go.opentelemetry.io/collector/pdata/pmetric"
 
-	"github.com/JohanLindvall/kubescrape/internal/kubemeta"
+	"github.com/JohanLindvall/kubescrape/pkg/kubemeta"
 )
 
 const ksmBody = `# TYPE kube_pod_info gauge

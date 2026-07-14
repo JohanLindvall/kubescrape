@@ -16,10 +16,10 @@ import (
 	"io"
 	"strings"
 
-	"github.com/JohanLindvall/kubescrape/internal/kubemeta"
 	"github.com/JohanLindvall/kubescrape/internal/servicemonitors"
 	"github.com/JohanLindvall/kubescrape/internal/services"
 	"github.com/JohanLindvall/kubescrape/internal/store"
+	"github.com/JohanLindvall/kubescrape/pkg/kubemeta"
 )
 
 type stubResolver struct{}

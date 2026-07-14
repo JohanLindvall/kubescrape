@@ -15,7 +15,7 @@ import (
 
 	"github.com/klauspost/compress/gzip"
 
-	"github.com/JohanLindvall/kubescrape/internal/agent/spool"
+	"github.com/JohanLindvall/kubescrape/pkg/spool"
 	"go.opentelemetry.io/collector/pdata/plog"
 	"go.opentelemetry.io/collector/pdata/plog/plogotlp"
 	"go.opentelemetry.io/collector/pdata/pmetric"

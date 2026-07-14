@@ -1,11 +1,28 @@
-// Package promscrape scrapes Prometheus endpoints and converts the samples
-// to OTLP metrics.
+// Package promparse is a streaming parser for the Prometheus text exposition
+// format, classic and OpenMetrics.
 //
-// The parser is a single-pass streaming parser for the Prometheus text
-// exposition format (classic and OpenMetrics): it never buffers more than
-// one line, so memory use is independent of the scrape size (relevant for
-// endpoints exposing 100k+ series).
-package promscrape
+// It never buffers more than one line, so memory stays independent of the
+// scrape size — a 100k-series endpoint parses in constant memory, which is why
+// it exists rather than using a family-buffering parser. Names and label values
+// are interned per parse and consecutive-line memcmp caches short-circuit the
+// intern probes, so a warm parser from the pool parses a large scrape in a
+// handful of allocations.
+//
+// Basic use:
+//
+//	p := promparse.NewParser(0, false, false)
+//	malformed, err := p.Parse(body, func(s promparse.Sample) error {
+//	    fmt.Println(s.Name, s.Labels, s.Value)
+//	    return nil // Sample and its Labels are only valid during the callback
+//	})
+//
+// On a hot path, take a parser from the pool instead — it keeps the intern
+// tables and the read buffer warm across scrapes:
+//
+//	p := promparse.Get(maxLineBytes, openMetrics, withExemplars)
+//	defer promparse.Put(p)
+//	malformed, err := p.Parse(body, emit)
+package promparse
 
 import (
 	"bufio"
@@ -58,6 +75,14 @@ type Exemplar struct {
 	TimestampMs int64 // 0 when absent
 }
 
+// CopyExemplar returns a deep copy of an exemplar, so it can outlive the emit
+// callback that produced it (Sample, its Labels and its Exemplar all alias
+// parser-owned memory that the next line reuses).
+func CopyExemplar(e Exemplar) Exemplar {
+	e.Labels = append([]Label(nil), e.Labels...)
+	return e
+}
+
 // Sample is one parsed series sample.
 type Sample struct {
 	// Name is the full series name (e.g. "http_duration_bucket").
@@ -75,9 +100,11 @@ type Sample struct {
 	Exemplar *Exemplar
 }
 
-// maxTrackedFamilies bounds the TYPE table so a pathological endpoint cannot
-// exhaust memory through unique # TYPE lines.
-const maxTrackedFamilies = 100_000
+// MaxTrackedFamilies bounds the TYPE table so a pathological endpoint cannot
+// exhaust memory through unique # TYPE lines. It is exported because callers
+// that memoize per parse (a filter caching decisions per series name, say)
+// want the same bound.
+const MaxTrackedFamilies = 100_000
 
 // Interning bounds: metric and label names are low-cardinality and repeat on
 // nearly every line; label values (namespace, pod, le, code, ...) repeat
@@ -86,9 +113,11 @@ const maxTrackedFamilies = 100_000
 // is allocated normally, so pathological inputs degrade to the non-interned
 // cost instead of growing memory.
 const (
-	maxInternedNames    = maxTrackedFamilies
-	maxInternedNameLen  = 256
-	maxInternedValues   = 8192
+	maxInternedNames   = MaxTrackedFamilies
+	maxInternedNameLen = 256
+	// MaxInternedValues bounds the label-value intern table; exported for the
+	// same reason as MaxTrackedFamilies.
+	MaxInternedValues   = 8192
 	maxInternedValueLen = 128
 )
 
@@ -121,12 +150,27 @@ type Parser struct {
 	eof        bool   // saw "# EOF"
 }
 
+// DefaultMaxLineBytes bounds one physical line when no limit is given. The
+// parser holds at most one line, so this is what keeps memory constant against
+// an endpoint that never emits a newline.
+const DefaultMaxLineBytes = 1 << 20
+
+// normLineBytes maps the zero value onto the default: 0 read literally would
+// make every line "too long" and silently skip the whole exposition.
+func normLineBytes(maxLineBytes int) int {
+	if maxLineBytes <= 0 {
+		return DefaultMaxLineBytes
+	}
+	return maxLineBytes
+}
+
 // NewParser creates a parser that skips physical lines longer than
-// maxLineBytes. openMetrics selects OpenMetrics semantics (typically from
-// the response Content-Type); withExemplars additionally parses exemplars.
+// maxLineBytes (0 = DefaultMaxLineBytes). openMetrics selects OpenMetrics
+// semantics (typically from the response Content-Type); withExemplars
+// additionally parses exemplars.
 func NewParser(maxLineBytes int, openMetrics, withExemplars bool) *Parser {
 	return &Parser{
-		maxLineBytes: maxLineBytes,
+		maxLineBytes: normLineBytes(maxLineBytes),
 		openMetrics:  openMetrics,
 		exemplars:    openMetrics && withExemplars,
 		types:        make(map[string]MetricType),
@@ -134,13 +178,13 @@ func NewParser(maxLineBytes int, openMetrics, withExemplars bool) *Parser {
 	}
 }
 
-// parserPool recycles parsers (and their bufio readers) across scrapes: the
+// parserPool recycles parsers (and their bufio readers) across parses: the
 // interned name/value tables stay warm — the same names repeat every scrape —
 // and the 64KiB read buffer stops being per-scrape garbage. The TYPE table is
 // cleared per scrape (its semantics are per-exposition); the intern tables are
 // only cleared once they near their caps, bounding retention.
 var parserPool = sync.Pool{New: func() any {
-	return &pooledParser{
+	return &Pooled{
 		Parser: NewParser(0, false, false),
 		reader: bufio.NewReaderSize(nil, parseBufSize),
 	}
@@ -148,16 +192,18 @@ var parserPool = sync.Pool{New: func() any {
 
 const parseBufSize = 64 * 1024
 
-type pooledParser struct {
+type Pooled struct {
 	*Parser
 	reader *bufio.Reader
 }
 
-// getParser returns a recycled parser configured for one scrape.
-func getParser(maxLineBytes int, openMetrics, withExemplars bool) *pooledParser {
-	pp := parserPool.Get().(*pooledParser)
+// Get returns a pooled parser configured for one parse (maxLineBytes 0 =
+// DefaultMaxLineBytes). Return it with Put when the parse is done; the parser
+// must not be used afterwards.
+func Get(maxLineBytes int, openMetrics, withExemplars bool) *Pooled {
+	pp := parserPool.Get().(*Pooled)
 	p := pp.Parser
-	p.maxLineBytes = maxLineBytes
+	p.maxLineBytes = normLineBytes(maxLineBytes)
 	p.openMetrics = openMetrics
 	p.exemplars = openMetrics && withExemplars
 	p.eof = false
@@ -168,19 +214,21 @@ func getParser(maxLineBytes int, openMetrics, withExemplars bool) *pooledParser 
 	if len(p.names) >= maxInternedNames/2 {
 		clear(p.names)
 	}
-	if len(p.values) >= maxInternedValues/2 {
+	if len(p.values) >= MaxInternedValues/2 {
 		clear(p.values)
 	}
 	return pp
 }
 
-func putParser(pp *pooledParser) {
+// Put returns a pooled parser for reuse.
+func Put(pp *Pooled) {
 	pp.reader.Reset(nil) // drop the response body reference
 	parserPool.Put(pp)
 }
 
-// parse runs Parse over r through the pooled reader.
-func (pp *pooledParser) parse(r io.Reader, emit func(Sample) error) (int, error) {
+// Parse reads the exposition from r through the pooled reader, invoking emit
+// for every sample (see Parser.Parse).
+func (pp *Pooled) Parse(r io.Reader, emit func(Sample) error) (int, error) {
 	pp.reader.Reset(r)
 	return pp.parseFrom(pp.reader, emit)
 }
@@ -220,7 +268,7 @@ func (p *Parser) internValue(b []byte) string {
 	if p.values == nil {
 		p.values = make(map[string]string, 256)
 	}
-	if len(p.values) < maxInternedValues {
+	if len(p.values) < MaxInternedValues {
 		p.values[s] = s
 	}
 	return s
@@ -362,7 +410,7 @@ func (p *Parser) parseComment(line []byte) {
 		if len(family) == 0 || len(typ) == 0 || len(skipSpaceTab(rest)) != 0 {
 			return
 		}
-		if len(p.types) >= maxTrackedFamilies {
+		if len(p.types) >= MaxTrackedFamilies {
 			return
 		}
 		var t MetricType

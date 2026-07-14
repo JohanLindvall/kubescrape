@@ -1,4 +1,4 @@
-package promscrape
+package promparse
 
 import (
 	"math"
@@ -14,7 +14,7 @@ func parseAllMode(t *testing.T, input string, openMetrics, exemplars bool) []Sam
 		cp := s
 		cp.Labels = append([]Label(nil), s.Labels...)
 		if s.Exemplar != nil {
-			ex := copyExemplar(*s.Exemplar)
+			ex := CopyExemplar(*s.Exemplar)
 			cp.Exemplar = &ex
 		}
 		out = append(out, cp)
@@ -301,14 +301,48 @@ func BenchmarkParseLargeScrape(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		p := getParser(1<<20, false, false) // the production path: pooled parser + reader
+		p := Get(1<<20, false, false) // the production path: pooled parser + reader
 		n := 0
-		if _, err := p.parse(strings.NewReader(input), func(s Sample) error { n++; return nil }); err != nil {
+		if _, err := p.Parse(strings.NewReader(input), func(s Sample) error { n++; return nil }); err != nil {
 			b.Fatal(err)
 		}
-		putParser(p)
+		Put(p)
 		if n != 10_000 {
 			b.Fatalf("n=%d", n)
 		}
+	}
+}
+
+// TestZeroMaxLineBytesParsesNormally: 0 means "use the default", not "every
+// line is too long". Read literally it would silently skip every line — the
+// worst kind of default for a public API.
+func TestZeroMaxLineBytesParsesNormally(t *testing.T) {
+	body := "# TYPE reqs counter\nreqs{code=\"200\"} 42\n"
+	for name, parse := range map[string]func(emit func(Sample) error) (int, error){
+		"NewParser": func(emit func(Sample) error) (int, error) {
+			return NewParser(0, false, false).Parse(strings.NewReader(body), emit)
+		},
+		"Get": func(emit func(Sample) error) (int, error) {
+			p := Get(0, false, false)
+			defer Put(p)
+			return p.Parse(strings.NewReader(body), emit)
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			var got []Sample
+			malformed, err := parse(func(s Sample) error {
+				got = append(got, s)
+				return nil
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if malformed != 0 {
+				t.Fatalf("malformed = %d, want 0", malformed)
+			}
+			if len(got) != 1 || got[0].Name != "reqs" || got[0].Value != 42 {
+				t.Fatalf("samples = %+v, want one reqs=42", got)
+			}
+		})
 	}
 }

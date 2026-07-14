@@ -140,6 +140,7 @@ kubescrape-agent \
 | `-logs-rate-burst` | `0` | token bucket size (0 = 2× the rate) |
 | `-logs-rate-drop` | `false` | discard lines over the limit instead of pausing (lossy; counted in `kubescrape_log_rate_limited_total{action="drop"}`) |
 | `-logs-unknown-files` | `auto` | where a file with no checkpoint entry starts at startup: `end` (skip as pre-existing history), `start` (read whole), `auto` (start when the checkpoint store already has entries — the file appeared while the agent was down; end on a first-ever run). `auto`/`start` mean adding a new log source ingests those files' existing content |
+| `-logs-idle-close` | `0` | close a fully-caught-up file's fd after this much inactivity (`0` = never). Bounds steady-state fds at one per *active* file rather than one per tracked file — but the open fd is the only handle to a rotated-away or deleted file's remaining bytes, so enabling this **forfeits the zero-loss guarantee** for the tail of a dying file. Set it only where a node tracks thousands of log files |
 | `-logs-pipelined-export` | `false` | overlap reading with export delivery: one export in flight while the sweep keeps reading; its commit/rewind is applied before the next flush (at-least-once semantics unchanged) |
 | `-logs-metrics-interval` | `30s` | export interval for the `logMetrics` metrics ([below](#agent-log-metrics)) |
 | `-logs-metrics-max-bytes` | `3MiB` | export log-derived metrics in chunks below this many bytes (0 = one payload) |
@@ -427,6 +428,7 @@ the pod. Outcomes count into `kubescrape_ingest_resources_total{outcome}`
 | `-scrape-timeout` | `15s` | per target |
 | `-scrape-concurrency` | `4` | concurrent target scrapes |
 | `-metrics-batch-size` | `10000` | export chunk size in data points — a 100k-series target is exported in ten chunks and never held in memory |
+| `-metrics-batch-bytes` | `3145728` | also flush a chunk once its estimated encoded size reaches this (`0` = size only). The collector's gRPC receive limit applies to the **decompressed** message (4 MiB by default), which a label-rich target (kube-state-metrics, Istio) can exceed well before the point limit — every export of that target would then fail, so this bound is what keeps a chunk deliverable |
 | `-scrape-max-samples` | `0` | abort a single scrape beyond this many samples (0 = unlimited) |
 | `-scrape-exemplars` | `false` | negotiate OpenMetrics and attach exemplars to counter and histogram points (`trace_id`/`span_id` map to OTLP trace/span fields) |
 | `-scrape-health-metrics` | `true` | export synthetic `up`, `scrape_duration_seconds` and `scrape_samples_scraped` gauges per target after each cycle |

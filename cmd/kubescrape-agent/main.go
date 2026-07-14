@@ -79,7 +79,7 @@ func run() error {
 		logsRateLimit     = flag.Float64("logs-rate-limit", 0, "per-file line rate limit in lines/second (0 disables); exhausted files pause until tokens refill")
 		logsRateBurst     = flag.Float64("logs-rate-burst", 0, "rate-limit token bucket size (0 = 2x -logs-rate-limit)")
 		logsRateDrop      = flag.Bool("logs-rate-drop", false, "discard lines over -logs-rate-limit instead of pausing the file")
-		logsIdleClose     = flag.Duration("logs-idle-close", 10*time.Minute, "close the fd of a fully-caught-up file after this much inactivity (0 keeps fds open; the file stays tracked and reopens on activity)")
+		logsIdleClose     = flag.Duration("logs-idle-close", 0, "close the fd of a fully-caught-up file after this much inactivity (0 = never, the default). The open fd is the only way to drain a rotated-away or deleted file, so enabling this trades the zero-loss guarantee for bounded fd usage")
 		logsUnknownFiles  = flag.String("logs-unknown-files", "auto", "where a file with no checkpoint entry starts at startup: end (skip as history), start (read whole), auto (start when the checkpoint store has entries — it appeared while the agent was down — else end)")
 		logsPipelined     = flag.Bool("logs-pipelined-export", false, "overlap reading with export delivery (one export in flight; at-least-once semantics unchanged)")
 		logsEnrich        = flag.Bool("logs-enrich", true, "parse per-line metadata (timestamp, severity, trace/span IDs, exception details) into the OTLP record fields via github.com/JohanLindvall/enrich")
@@ -105,6 +105,7 @@ func run() error {
 		scrapeTimeout     = flag.Duration("scrape-timeout", 15*time.Second, "per-target scrape timeout")
 		scrapeConcurrency = flag.Int("scrape-concurrency", 4, "concurrent target scrapes")
 		metricsBatch      = flag.Int("metrics-batch-size", 10000, "export metrics in chunks of this many data points")
+		metricsBatchBytes = flag.Int("metrics-batch-bytes", 3<<20, "also flush a metrics chunk once its estimated encoded size reaches this many bytes (0 = only -metrics-batch-size). The collector's gRPC receive limit applies to the DECOMPRESSED message (4 MiB by default), and a label-rich target can exceed it well before the point limit — every export of that target would then fail")
 		maxSamples        = flag.Int("scrape-max-samples", 0, "abort a single scrape beyond this many samples (0 = unlimited)")
 		exemplars         = flag.Bool("scrape-exemplars", false, "negotiate OpenMetrics and attach exemplars to counter and histogram data points")
 		healthMetrics     = flag.Bool("scrape-health-metrics", true, "export synthetic up/scrape_duration_seconds/scrape_samples_scraped gauges per target")
@@ -455,6 +456,7 @@ func run() error {
 			Timeout:        *scrapeTimeout,
 			Concurrency:    *scrapeConcurrency,
 			BatchPoints:    *metricsBatch,
+			BatchBytes:     *metricsBatchBytes,
 			MaxSamples:     *maxSamples,
 			Exemplars:      *exemplars,
 			HealthMetrics:  *healthMetrics,

@@ -14,6 +14,7 @@ import (
 	"go.opentelemetry.io/collector/pdata/pmetric"
 
 	"github.com/JohanLindvall/kubescrape/internal/agent/attrs"
+	"github.com/JohanLindvall/kubescrape/internal/obs"
 	"github.com/JohanLindvall/kubescrape/pkg/kubemeta"
 	"github.com/JohanLindvall/kubescrape/pkg/promparse"
 )
@@ -59,14 +60,43 @@ type chunker interface {
 	sink
 	take() pmetric.Metrics
 	count() int
+	size() int // estimated encoded size of the accumulated batch
 }
 
+// defaultBatchBytes bounds one exported chunk well below the 4 MiB default
+// gRPC receive limit of a collector (which applies to the decompressed
+// message), leaving room for the size estimate's error margin.
+const defaultBatchBytes = 3 << 20
+
 // parseAndExport streams one scrape body through the series filter and the
-// converter into cb, exporting a chunk whenever BatchPoints accumulate. It
-// returns the number of samples parsed.
+// converter into cb, exporting a chunk whenever BatchPoints data points or
+// BatchBytes estimated bytes accumulate. It returns the number of samples
+// parsed.
+//
+// An aborted parse (sample limit, a truncated body, a read timeout mid-body)
+// still exports what was converted before the abort: a partial scrape is worth
+// far more than nothing, and every kind here is cumulative, so a missing series
+// simply does not appear for that cycle.
 func (s *Scraper) parseAndExport(ctx context.Context, body io.Reader, openMetrics, withExemplars bool, cb chunker, pipeline, what string) (int, error) {
 	filter := s.cfg.Filters.filterFor(pipeline).session()
-	conv := newConverter(cb)
+	exportFailed := false
+	export := func() error {
+		if err := s.cfg.Exporter.ExportMetrics(ctx, cb.take()); err != nil {
+			exportFailed = true
+			return err
+		}
+		return nil
+	}
+	full := func() bool {
+		return cb.count() >= s.cfg.BatchPoints ||
+			(s.cfg.BatchBytes > 0 && cb.size() >= s.cfg.BatchBytes)
+	}
+	conv := newConverter(cb, func() error {
+		if full() {
+			return export()
+		}
+		return nil
+	})
 	parser := promparse.Get(promparse.Options{MaxLineBytes: s.cfg.MaxLineBytes, OpenMetrics: openMetrics, Exemplars: withExemplars})
 	defer promparse.Put(parser)
 	samples := 0
@@ -78,23 +108,32 @@ func (s *Scraper) parseAndExport(ctx context.Context, body io.Reader, openMetric
 		if !filter.Keep(sample.Name, sample.Labels) {
 			return nil
 		}
-		conv.add(sample)
-		if cb.count() >= s.cfg.BatchPoints {
-			return s.cfg.Exporter.ExportMetrics(ctx, cb.take())
-		}
-		return nil
+		return conv.add(sample)
 	})
 	if err != nil {
+		// Salvage the partially converted scrape. Pointless when the failure
+		// WAS the export (the collector just rejected a chunk) or when the
+		// context is gone (the send cannot succeed either).
+		if !exportFailed && ctx.Err() == nil {
+			if ferr := conv.finish(); ferr == nil && cb.count() > 0 {
+				if eerr := export(); eerr != nil {
+					s.log.Warn("exporting partial scrape", "target", what, "error", eerr)
+				}
+			}
+		}
 		return samples, err
 	}
-	conv.finish()
+	if err := conv.finish(); err != nil {
+		return samples, err
+	}
 	malformed += conv.malformed // component samples the converter rejected
 	if cb.count() > 0 {
-		if err := s.cfg.Exporter.ExportMetrics(ctx, cb.take()); err != nil {
+		if err := export(); err != nil {
 			return samples, err
 		}
 	}
 	if malformed > 0 {
+		obs.ScrapeMalformed.WithLabelValues(pipeline).Add(float64(malformed))
 		s.log.Warn("scrape had malformed lines", "target", what, "malformed", malformed, "samples", samples)
 	}
 	return samples, nil
@@ -197,6 +236,7 @@ type cadvisorBatcher struct {
 	scopes map[string]pmetric.ScopeMetrics // resource key -> scope
 	byKey  map[string]pmetric.Metric       // resource key + metric name
 	points int
+	bytes  int
 
 	// Last-seen memos, mirroring the plain batcher's metricByName/remember:
 	// cadvisor series arrive grouped by family and cgroup, so consecutive
@@ -233,6 +273,7 @@ func (cb *cadvisorBatcher) reset() {
 		clear(cb.byKey)
 	}
 	cb.points = 0
+	cb.bytes = 0
 	// The memoized handles point into the previous batch's payload.
 	cb.lastScopeOK = false
 	cb.lastOK = false
@@ -245,6 +286,7 @@ func (cb *cadvisorBatcher) take() pmetric.Metrics {
 }
 
 func (cb *cadvisorBatcher) count() int { return cb.points }
+func (cb *cadvisorBatcher) size() int  { return cb.bytes }
 
 // cadvisorIdentity is the resource identity of one cadvisor sample: the
 // namespace/pod/container labels plus the pod UID and container ID parsed
@@ -478,12 +520,14 @@ func (cb *cadvisorBatcher) addNumber(s Sample, monotonic bool) {
 	case pmetric.MetricTypeGauge:
 		dp = m.Gauge().DataPoints().AppendEmpty()
 	default:
+		obs.ScrapeCollisions.Inc() // name claimed by a different metric shape
 		return
 	}
 	dp.SetDoubleValue(s.Value)
 	dp.SetTimestamp(cb.pointTS(s.TimestampMs))
 	cb.putFilteredLabels(dp.Attributes(), s.Labels, podScoped)
 	cb.points++
+	cb.bytes += numberBytes(s)
 }
 
 func (cb *cadvisorBatcher) addHistogram(family string, acc *histAcc) {
@@ -495,6 +539,7 @@ func (cb *cadvisorBatcher) addHistogram(family string, acc *histAcc) {
 		m.SetEmptyHistogram().SetAggregationTemporality(pmetric.AggregationTemporalityCumulative)
 	})
 	if m.Type() != pmetric.MetricTypeHistogram {
+		obs.ScrapeCollisions.Inc()
 		return
 	}
 	dp := m.Histogram().DataPoints().AppendEmpty()
@@ -503,6 +548,7 @@ func (cb *cadvisorBatcher) addHistogram(family string, acc *histAcc) {
 	fillHistogramPoint(dp, acc)
 	cb.putFilteredLabels(dp.Attributes(), acc.labels, podScoped)
 	cb.points++
+	cb.bytes += histBytes(acc)
 }
 
 func (cb *cadvisorBatcher) addSummary(family string, acc *summAcc) {
@@ -514,6 +560,7 @@ func (cb *cadvisorBatcher) addSummary(family string, acc *summAcc) {
 		m.SetEmptySummary()
 	})
 	if m.Type() != pmetric.MetricTypeSummary {
+		obs.ScrapeCollisions.Inc()
 		return
 	}
 	dp := m.Summary().DataPoints().AppendEmpty()
@@ -522,6 +569,7 @@ func (cb *cadvisorBatcher) addSummary(family string, acc *summAcc) {
 	fillSummaryPoint(dp, acc)
 	cb.putFilteredLabels(dp.Attributes(), acc.labels, podScoped)
 	cb.points++
+	cb.bytes += summBytes(acc)
 }
 
 func (cb *cadvisorBatcher) pointTS(tsMs int64) pcommon.Timestamp {

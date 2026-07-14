@@ -264,16 +264,16 @@ rpc_sum 8000
 rpc_count 2000
 `
 	bt := newBatcher(func(pcommon.Resource) {}, 1<<30, time.Unix(1, 0), time.Unix(2, 0))
-	conv := newConverter(bt)
+	conv := newConverter(bt, nil)
 	p := newParser(promparse.Options{MaxLineBytes: 1 << 20})
 	malformed, err := p.Parse(strings.NewReader(body), func(s Sample) error {
-		conv.add(s)
+		_ = conv.add(s)
 		return nil
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	conv.finish()
+	_ = conv.finish()
 	if malformed != 0 || conv.malformed != 1 {
 		t.Fatalf("parser malformed = %d, converter malformed = %d, want 0 and 1", malformed, conv.malformed)
 	}
@@ -463,15 +463,15 @@ a_sum{s="2"} 7
 a_count{s="2"} 7
 `
 	bt := newBatcher(func(pcommon.Resource) {}, 1<<30, time.Unix(1, 0), time.Unix(2, 0))
-	conv := newConverter(bt)
+	conv := newConverter(bt, nil)
 	p := newParser(promparse.Options{MaxLineBytes: 1 << 20})
 	if _, err := p.Parse(strings.NewReader(exposition), func(s Sample) error {
-		conv.add(s)
+		_ = conv.add(s)
 		return nil
 	}); err != nil {
 		t.Fatal(err)
 	}
-	conv.finish()
+	_ = conv.finish()
 
 	counts := map[string]uint64{}
 	ms := bt.take().ResourceMetrics().At(0).ScopeMetrics().At(0).Metrics()

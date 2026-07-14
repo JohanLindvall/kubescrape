@@ -14,6 +14,7 @@ import (
 	"go.opentelemetry.io/collector/pdata/pmetric"
 
 	"github.com/JohanLindvall/kubescrape/internal/agent/attrs"
+	"github.com/JohanLindvall/kubescrape/internal/obs"
 	"github.com/JohanLindvall/kubescrape/pkg/kubemeta"
 )
 
@@ -245,6 +246,7 @@ type splitBatcher struct {
 	// its data points (rule.datapointAttr).
 	dpAttrs map[string][]kv
 	points  int
+	bytes   int
 
 	// Last-seen memos, mirroring the plain batcher's metricByName/remember:
 	// KSM series arrive grouped by family and object, so consecutive samples
@@ -288,6 +290,7 @@ func (b *splitBatcher) reset() {
 		clear(b.dpAttrs)
 	}
 	b.points = 0
+	b.bytes = 0
 	// The memoized handles point into the previous batch's payload.
 	b.lastRouteOK = false
 	b.lastMOK = false
@@ -300,6 +303,7 @@ func (b *splitBatcher) take() pmetric.Metrics {
 }
 
 func (b *splitBatcher) count() int { return b.points }
+func (b *splitBatcher) size() int  { return b.bytes }
 
 // route returns the scope, resource key, and rule for one series (rule nil for
 // the target's own resource), plus the resource attributes moved onto its data
@@ -520,6 +524,7 @@ func (b *splitBatcher) addNumber(s Sample, monotonic bool) {
 	case pmetric.MetricTypeGauge:
 		dp = m.Gauge().DataPoints().AppendEmpty()
 	default:
+		obs.ScrapeCollisions.Inc() // name claimed by a different metric shape
 		return
 	}
 	dp.SetDoubleValue(s.Value)
@@ -529,6 +534,7 @@ func (b *splitBatcher) addNumber(s Sample, monotonic bool) {
 		setExemplar(dp.Exemplars().AppendEmpty(), *s.Exemplar, b.scrapeTS)
 	}
 	b.points++
+	b.bytes += numberBytes(s)
 }
 
 func (b *splitBatcher) addHistogram(family string, acc *histAcc) {
@@ -536,6 +542,7 @@ func (b *splitBatcher) addHistogram(family string, acc *histAcc) {
 		m.SetEmptyHistogram().SetAggregationTemporality(pmetric.AggregationTemporalityCumulative)
 	})
 	if m.Type() != pmetric.MetricTypeHistogram {
+		obs.ScrapeCollisions.Inc()
 		return
 	}
 	dp := m.Histogram().DataPoints().AppendEmpty()
@@ -547,6 +554,7 @@ func (b *splitBatcher) addHistogram(family string, acc *histAcc) {
 		setExemplar(dp.Exemplars().AppendEmpty(), e, b.scrapeTS)
 	}
 	b.points++
+	b.bytes += histBytes(acc)
 }
 
 func (b *splitBatcher) addSummary(family string, acc *summAcc) {
@@ -554,6 +562,7 @@ func (b *splitBatcher) addSummary(family string, acc *summAcc) {
 		m.SetEmptySummary()
 	})
 	if m.Type() != pmetric.MetricTypeSummary {
+		obs.ScrapeCollisions.Inc()
 		return
 	}
 	dp := m.Summary().DataPoints().AppendEmpty()
@@ -562,6 +571,7 @@ func (b *splitBatcher) addSummary(family string, acc *summAcc) {
 	fillSummaryPoint(dp, acc)
 	putSplitLabels(dp.Attributes(), rule, acc.labels, dpa)
 	b.points++
+	b.bytes += summBytes(acc)
 }
 
 func (b *splitBatcher) pointTS(tsMs int64) pcommon.Timestamp {

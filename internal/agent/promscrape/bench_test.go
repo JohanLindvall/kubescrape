@@ -82,17 +82,17 @@ func BenchmarkSplitConvert(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		cb := newSplitBatcher(s, context.Background(), target, sp[0], time.Unix(2, 0))
-		conv := newConverter(cb)
+		conv := newConverter(cb, nil)
 		p := promparse.Get(promparse.Options{MaxLineBytes: 1 << 20})
 		_, err := p.Parse(strings.NewReader(input), func(smp Sample) error {
-			conv.add(smp)
+			_ = conv.add(smp)
 			return nil
 		})
 		promparse.Put(p)
 		if err != nil {
 			b.Fatal(err)
 		}
-		conv.finish()
+		_ = conv.finish()
 		points = cb.count()
 	}
 	if points == 0 {
@@ -142,17 +142,17 @@ func BenchmarkCadvisorConvert(b *testing.B) {
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
 				cb := newCadvisorBatcher(s, time.Unix(2, 0), context.Background())
-				conv := newConverter(cb)
+				conv := newConverter(cb, nil)
 				p := promparse.Get(promparse.Options{MaxLineBytes: 1 << 20})
 				_, err := p.Parse(strings.NewReader(input), func(smp Sample) error {
-					conv.add(smp)
+					_ = conv.add(smp)
 					return nil
 				})
 				promparse.Put(p)
 				if err != nil {
 					b.Fatal(err)
 				}
-				conv.finish()
+				_ = conv.finish()
 				points = cb.count()
 			}
 			if points == 0 {
@@ -179,21 +179,21 @@ func BenchmarkConvertScrape(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		bt := newBatcher(func(pcommon.Resource) {}, 1<<30, time.Unix(1, 0), time.Unix(2, 0))
-		conv := newConverter(bt)
+		conv := newConverter(bt, nil)
 		fs := filter.session()
 		p := promparse.Get(promparse.Options{MaxLineBytes: 1 << 20}) // the production path: pooled parser + reader
 		_, err := p.Parse(strings.NewReader(input), func(s Sample) error {
 			if !fs.Keep(s.Name, s.Labels) {
 				return nil
 			}
-			conv.add(s)
+			_ = conv.add(s)
 			return nil
 		})
 		promparse.Put(p)
 		if err != nil {
 			b.Fatal(err)
 		}
-		conv.finish()
+		_ = conv.finish()
 		points = bt.count()
 	}
 	if points == 0 {

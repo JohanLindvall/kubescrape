@@ -142,7 +142,15 @@ func (s *sink[T]) enqueue(v T) error {
 	if err != nil {
 		return err
 	}
-	return s.spool.Append(data)
+	err = s.spool.Append(data)
+	if errors.Is(err, spool.ErrFull) {
+		// Back-pressure for logs (the tailer rewinds and re-reads), but a lost
+		// batch for every producer that cannot rewind — the scraper, the
+		// self-metrics registry, the log-metric exporter. Count it: an
+		// undelivered metric batch must never disappear silently.
+		obs.BufferFull.WithLabelValues(s.kind).Inc()
+	}
+	return err
 }
 
 // drain sends queued batches to the exporter until ctx is done. A nil sink (its
@@ -175,6 +183,9 @@ func (s *sink[T]) drain(ctx context.Context) {
 		}
 		v, err := s.unmarshal(data)
 		if err != nil {
+			// Undecodable payload: the data is gone either way, but the drop
+			// must be counted like every other one.
+			obs.BufferDropped.WithLabelValues(s.kind).Inc()
 			s.log.Warn("dropping corrupt buffered batch", "signal", s.kind, "error", err)
 			commit()
 			continue

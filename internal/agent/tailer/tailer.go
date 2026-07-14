@@ -134,13 +134,17 @@ type Config struct {
 	RateDrop bool
 
 	// IdleClose closes the file descriptor of a fully-caught-up file after
-	// this much inactivity (0 disables). The file stays tracked (checkpoint,
-	// watches) and reopens on the next write event or poll; identity is
-	// re-verified on reopen. Bounds steady-state fd usage at one per ACTIVE
-	// file instead of one per tracked file. Caveat: with no fd held, a
-	// write-then-rotate burst inside one poll interval on an unwatched
-	// (polling-only) setup can lose the burst — the same fast-rotation
-	// window the tailer already documents.
+	// this much inactivity. It bounds steady-state fd usage at one per ACTIVE
+	// file rather than one per tracked file — but it FORFEITS THE ZERO-LOSS
+	// GUARANTEE, so it is off (0) by default.
+	//
+	// The open fd is the only handle to an inode once its name is gone: it is
+	// what lets drainFile read the remainder of a rotated-away or unlinked
+	// file. With the fd released, lines written after the close and before the
+	// tailer next reads (a container's final lines, say, followed by the
+	// kubelet removing its log) are unrecoverable — the path no longer leads
+	// to that inode. Enable it only where bounding fds on a node with
+	// thousands of log files matters more than the tail of a dying file.
 	IdleClose time.Duration
 
 	// UnknownFiles decides where a file present at startup WITHOUT a
@@ -255,6 +259,10 @@ type file struct {
 	// readArchive, offsets in decompressed space) rather than tailing it.
 	compressed bool
 	gz         *gzip.Reader
+	// goneEnd is the EOF offset of a vanished file, captured when it is
+	// drained. committed and readPos both rewind on a failed export, so they
+	// cannot tell whether the drained bytes were ever exported; this can.
+	goneEnd int64
 	// archiveDone marks a compressed file read to completion; size/mod pin
 	// the on-disk identity so sweeps skip it until the file changes.
 	archiveDone bool
@@ -722,6 +730,13 @@ func (t *Tailer) closeIdleFiles() {
 		if f.lastMod.IsZero() || now.Sub(f.lastMod) < t.cfg.IdleClose {
 			continue
 		}
+		// lastMod is the cached mtime from the last read; re-stat so a write
+		// the sweep has not consumed yet cannot have its fd pulled out from
+		// under it.
+		st, err := os.Stat(f.path)
+		if err != nil || st.Size() != f.readPos || !st.ModTime().Equal(f.lastMod) {
+			continue
+		}
 		_ = f.f.Close()
 		f.f = nil // ensureOpen reopens and re-verifies identity on activity
 	}
@@ -1172,8 +1187,18 @@ func (t *Tailer) sweep(ctx context.Context, all bool) {
 				// detection handle the identity change instead.
 				f.gone = false
 			} else {
-				t.drop(f)
-				delete(t.files, path)
+				// The file is gone from disk; its remaining bytes live only
+				// behind our fd. Drain, export, and only let the inode go once
+				// the offsets commit — a failed export must be able to re-read
+				// it (rewind seeks the still-open fd back), or a pod deleted
+				// during a collector outage would lose its final lines.
+				t.drainGone(f)
+				t.flush(ctx)
+				t.settle(f) // apply a pipelined result before deciding
+				if t.settledGone(f) {
+					t.release(f)
+					delete(t.files, path)
+				}
 				continue
 			}
 		}
@@ -1800,18 +1825,37 @@ func (t *Tailer) findRotated(f *file, p rotatedPrefix) (string, bool) {
 
 // drop closes a removed file, draining first the fd (bytes appended since
 // the last read) and then the pipeline.
+// drop drains a vanished file into the batch and releases it. It is the
+// unconditional form (shutdown); the sweep uses drainGone/release so it can
+// hold the fd until the drained lines are actually exported.
 func (t *Tailer) drop(f *file) {
+	t.drainGone(f)
+	t.release(f)
+}
+
+// drainGone reads whatever the vanished file still holds into the batch. The
+// fd stays OPEN: it is the only handle to the now-unlinked inode, so it must
+// outlive a failed export — release only once the offsets commit.
+func (t *Tailer) drainGone(f *file) {
 	t.settle(f) // a failed in-flight export must rewind before we drain
-	if f.resolved {
-		if f.compressed {
-			// A large archive is read incrementally across sweeps; a deletion
-			// mid-read leaves the rest readable from the open fd.
-			t.drainArchive(context.Background(), f)
-		} else {
-			t.drainFile(context.Background(), f)
-		}
-		t.stopPipeline(context.Background(), f)
+	if !f.resolved {
+		return
 	}
+	if f.compressed {
+		// A large archive is read incrementally across sweeps; a deletion
+		// mid-read leaves the rest readable from the open fd.
+		t.drainArchive(context.Background(), f)
+	} else {
+		t.drainFile(context.Background(), f)
+	}
+	t.stopPipeline(context.Background(), f)
+	f.goneEnd = max(f.goneEnd, f.readPos) // the inode's true end, rewind-proof
+}
+
+// release closes the file's handles and watches. After this the inode is
+// unreachable, so it must not be called while data read from it is still
+// uncommitted.
+func (t *Tailer) release(f *file) {
 	if f.compressed {
 		t.closeArchive(f)
 	} else if f.f != nil {
@@ -1819,6 +1863,18 @@ func (t *Tailer) drop(f *file) {
 		f.f = nil
 	}
 	t.unwatchTarget(f)
+}
+
+// settledGone reports whether everything the vanished file held has been
+// committed, so the file (and its unlinked inode) can be let go. It compares
+// against the drained EOF, not readPos: a failed export rewinds readPos back
+// to committed, which would otherwise look settled while the data is still
+// unexported and reachable only through our fd.
+func (t *Tailer) settledGone(f *file) bool {
+	if _, buffered := f.watermark(); buffered {
+		return false
+	}
+	return f.committed >= f.goneEnd && len(f.pending) == 0
 }
 
 // logGrouper places records into ResourceLogs/ScopeLogs keyed by (file,
@@ -2089,13 +2145,17 @@ func (t *Tailer) rewind(f *file) {
 		t.newPipeline(f)
 		return
 	}
-	if f.f == nil {
-		return
-	}
-	if _, err := f.f.Seek(f.committed, 0); err != nil {
-		_ = f.f.Close()
-		f.f = nil
-		return
+	// The pipeline reset below must happen even with no fd open: reopen leaves
+	// f.f nil and marks the rotated-away prefix carriedFed (its lines are live
+	// in the pipeline). Returning early here would discard those lines with the
+	// batch while leaving carriedFed set, so feedCarriedPrefix would never
+	// re-read them — the rotated tail would be lost on the first failed export.
+	// ledger.reset (via newPipeline) is what clears carriedFed and re-arms it.
+	if f.f != nil {
+		if _, err := f.f.Seek(f.committed, 0); err != nil {
+			_ = f.f.Close()
+			f.f = nil // the next ensureOpen reopens and re-verifies identity
+		}
 	}
 	f.readPos = f.committed
 	f.lineStart = f.committed

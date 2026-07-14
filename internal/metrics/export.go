@@ -54,14 +54,20 @@ func (s *DynamicMetricSet) Export(ctx context.Context, exp Exporter, maxBytes in
 
 	md := pmetric.NewMetrics()
 	size := 0 // accumulated payload size, tracked incrementally (O(n) not O(n^2))
-	flush := func() error {
+	// firstErr keeps the first chunk failure but does NOT abort the export: the
+	// snapshot has already sealed every aggregation window and cleared the
+	// counters' initial flag, so abandoning the remaining chunks would discard
+	// data that is gone from the store either way.
+	var firstErr error
+	flush := func() {
 		if md.ResourceMetrics().Len() == 0 {
-			return nil
+			return
 		}
-		err := exp.ExportMetrics(ctx, md)
+		if err := exp.ExportMetrics(ctx, md); err != nil && firstErr == nil {
+			firstErr = err
+		}
 		md.ResourceMetrics().RemoveIf(func(pmetric.ResourceMetrics) bool { return true })
 		size = 0
-		return err
 	}
 
 	scratch := pmetric.NewMetrics()
@@ -79,14 +85,13 @@ func (s *DynamicMetricSet) Export(ctx context.Context, exp Exporter, maxBytes in
 		}
 		rmSize := metricsMarshaler.MetricsSize(scratch)
 		if maxBytes > 0 && size > 0 && size+rmSize > maxBytes {
-			if err := flush(); err != nil {
-				return err
-			}
+			flush()
 		}
 		scratch.ResourceMetrics().MoveAndAppendTo(md.ResourceMetrics())
 		size += rmSize
 	}
-	return flush()
+	flush()
+	return firstErr
 }
 
 // groupByResource snapshots each unique series and buckets its samples by the

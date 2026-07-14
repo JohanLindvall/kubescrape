@@ -422,3 +422,108 @@ func mustOpenPositions(t *testing.T, path string) *positions.Store {
 	}
 	return s
 }
+
+// --- tail-seek semantics (audit regression guards) ---
+
+// tailJournal models the REAL sdjournal seek semantics, which fakeOpener does
+// not: opening with an empty cursor starts at the TAIL (SeekTail+Previous), so
+// entries already read but not yet committed cannot be recovered by reopening.
+// fakeOpener behaves like SeekHead and therefore hides that whole class of
+// loss.
+type tailJournal struct {
+	mu      sync.Mutex
+	entries []rawEntry
+	opens   int
+}
+
+func (j *tailJournal) append(e rawEntry) {
+	j.mu.Lock()
+	j.entries = append(j.entries, e)
+	j.mu.Unlock()
+}
+
+func (j *tailJournal) opened() int {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	return j.opens
+}
+
+func (j *tailJournal) at(i int) (rawEntry, bool) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if i < len(j.entries) {
+		return j.entries[i], true
+	}
+	return rawEntry{}, false
+}
+
+// open positions just after afterCursor, or at the tail when it is empty.
+func (j *tailJournal) open(_ Config, afterCursor string) (source, error) {
+	j.mu.Lock()
+	j.opens++
+	pos := len(j.entries) // tail: only genuinely new entries are seen
+	if afterCursor != "" {
+		pos = 0
+		for i, e := range j.entries {
+			if e.cursor == afterCursor {
+				pos = i + 1
+				break
+			}
+		}
+	}
+	j.mu.Unlock()
+	return &tailSource{j: j, pos: pos}, nil
+}
+
+type tailSource struct {
+	j   *tailJournal
+	pos int
+}
+
+func (s *tailSource) next(ctx context.Context) (rawEntry, bool, error) {
+	for {
+		if e, ok := s.j.at(s.pos); ok {
+			s.pos++
+			return e, true, nil
+		}
+		select {
+		case <-ctx.Done():
+			return rawEntry{}, false, ctx.Err()
+		case <-time.After(2 * time.Millisecond):
+		}
+	}
+}
+
+func (s *tailSource) close() error { return nil }
+
+// TestJournalNoLossBeforeFirstCommit guards the at-least-once bar in the window
+// where NO cursor has been committed yet (the first run, or no positions store
+// at all). A transient export failure used to restart the reader, whose reopen
+// seeked to the journal tail — silently dropping every buffered entry. The
+// reader must instead keep retrying the pending batch until it lands.
+func TestJournalNoLossBeforeFirstCommit(t *testing.T) {
+	j := &tailJournal{entries: []rawEntry{mkEntry("c00", "a.service", "history", "6")}}
+	exp := &captureExporter{failures: 2}
+	r := New(Config{
+		Exporter:       exp,
+		FlushInterval:  20 * time.Millisecond,
+		RestartBackoff: 5 * time.Millisecond,
+	})
+	r.open = j.open
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { defer close(done); r.Run(ctx) }()
+	defer func() { cancel(); <-done }()
+
+	// Only entries appended after the reader opened the journal are in scope.
+	waitFor(t, "journal opened", func() bool { return j.opened() > 0 })
+	j.append(mkEntry("c01", "a.service", "one", "6"))
+	j.append(mkEntry("c02", "a.service", "two", "6"))
+
+	waitFor(t, "both entries despite the failed exports", func() bool {
+		return len(exp.records()) == 2
+	})
+	if got := exp.records(); got[0] != "one" || got[1] != "two" {
+		t.Fatalf("records = %v (history must not be re-read, nothing may be lost)", got)
+	}
+}

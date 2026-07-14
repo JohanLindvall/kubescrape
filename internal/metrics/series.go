@@ -5,6 +5,7 @@ import (
 	"math"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/cespare/xxhash/v2"
@@ -12,6 +13,29 @@ import (
 )
 
 const leLabel = "le"
+
+// Process-wide counts of observations the series store REFUSED. They are
+// exported through obs (which imports this package, so the counters cannot live
+// there) as kubescrape_log_metrics_dropped_*. Every rejection path must bump
+// one of them: a dropped observation that is only logged (at most hourly, per
+// series) is invisible loss.
+var (
+	droppedCapped    atomic.Uint64
+	droppedCollision atomic.Uint64
+	droppedNaN       atomic.Uint64
+)
+
+// DroppedCapped counts observations rejected because the series' label-set
+// cardinality cap was reached (a new label combination could not be admitted).
+func DroppedCapped() uint64 { return droppedCapped.Load() }
+
+// DroppedCollision counts observations rejected because their hash matched an
+// existing sample of a DIFFERENT series (a 64-bit collision; merging them would
+// corrupt both).
+func DroppedCollision() uint64 { return droppedCollision.Load() }
+
+// DroppedNaN counts observations rejected because the extracted value was NaN.
+func DroppedNaN() uint64 { return droppedNaN.Load() }
 
 // seriesKind selects how observations accumulate and how the series exports.
 type seriesKind int
@@ -199,6 +223,7 @@ func (s *series) initBuckets(buckets []float64) {
 // exceed.
 func (s *series) observe(lbls labels, value float64, resAccum resKey, res pcommon.Map, resLabels labels) {
 	if math.IsNaN(value) {
+		droppedNaN.Add(1)
 		return // NaN records into nothing; admitting it would emit fabricated zeros
 	}
 	now := loadEpoch()
@@ -224,6 +249,7 @@ func (s *series) observe(lbls labels, value float64, resAccum resKey, res pcommo
 			if samp.check != s.streamCheck(check, i) {
 				// 64-bit collision between distinct series (~2^-64 per
 				// pair): refuse to merge.
+				droppedCollision.Add(1)
 				if now-s.lastCollision >= 3600 {
 					s.lastCollision = now
 					s.log.Warn("series hash collision, dropping observation", "metric", s.name)
@@ -269,6 +295,7 @@ func (s *series) streamCheck(check uint64, bucket int) uint64 {
 // construction; a bump pays neither the label rehash nor the avalanche.
 func (s *series) observePreHashed(lbls labels, hash, check uint64, value float64, res pcommon.Map) {
 	if math.IsNaN(value) {
+		droppedNaN.Add(1)
 		return
 	}
 	if s.kind == kindHistogram {
@@ -286,6 +313,7 @@ func (s *series) observePreHashed(lbls labels, hash, check uint64, value float64
 			return
 		}
 	} else if samp.check != check {
+		droppedCollision.Add(1)
 		if now-s.lastCollision >= 3600 {
 			s.lastCollision = now
 			s.log.Warn("series hash collision, dropping observation", "metric", s.name)
@@ -341,8 +369,10 @@ func (s *series) admit(hash, check uint64, lbls labels, bucket int, now int64, r
 	return samp
 }
 
-// warnCapped logs the cardinality cap at most hourly (caller holds the lock).
+// warnCapped counts the refused observation and logs the cardinality cap at
+// most hourly (caller holds the lock).
 func (s *series) warnCapped(lbls labels, now int64) {
+	droppedCapped.Add(1)
 	if now-s.lastWarn >= 3600 {
 		s.lastWarn = now
 		s.log.Info("max label count reached for log metric",

@@ -194,6 +194,11 @@ func (g *metricGrouper) resource(id string) pmetric.ResourceMetrics {
 		// attributes them to the pushing pod.
 		obs.Ingested.WithLabelValues("peer_ip").Inc()
 		g.enricher.build(pod, nil, rm.Resource().Attributes())
+	} else {
+		// Nothing identified these points. They are still forwarded (under the
+		// unenriched source resource), but the outcome must show up in the
+		// counters exactly as the resource-mode path's does.
+		obs.Ingested.WithLabelValues("unresolved").Inc()
 	}
 	g.rmByID[id] = rm
 	return rm

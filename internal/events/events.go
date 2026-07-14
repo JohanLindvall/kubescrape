@@ -141,6 +141,11 @@ func (e *Exporter) Run(ctx context.Context) {
 			return
 		}
 		if err := e.cfg.Exporter.ExportLogs(ctx, e.convert(batch)); err != nil {
+			// Delivery is best-effort: there are no retries and no spool, so a
+			// failed export loses the batch. Count it like a queue-full drop —
+			// the shutdown flush suppresses even the warning, and a silent loss
+			// is not acceptable.
+			obs.EventsDropped.Add(float64(len(batch)))
 			if ctx.Err() == nil {
 				e.log.Warn("exporting events", "count", len(batch), "error", err)
 			}

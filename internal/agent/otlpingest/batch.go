@@ -117,6 +117,15 @@ func (b *Batcher) Run(ctx context.Context) {
 // and must not wedge the queue forever.
 const maxDeliverAttempts = 30
 
+// shutdownDrain bounds the WALL TIME the ctx.Done drain may spend delivering
+// the already-acknowledged backlog. Each attempt against a dead collector burns
+// the exporter's full timeout before failing, so a full queue would take
+// QueueLen x that — minutes to an hour, far past any pod termination grace. The
+// process would then be SIGKILLed mid-drain and the rest of the backlog would
+// die UNCOUNTED. Past this deadline the remainder is dropped and counted
+// instead. A healthy collector drains in milliseconds and never reaches it.
+const shutdownDrain = 10 * time.Second
+
 // sigBatch coalesces one signal.
 type sigBatch[T any] struct {
 	ch       chan T
@@ -134,6 +143,9 @@ type sigBatch[T any] struct {
 	// retryLimit caps deliver's transient attempts (default
 	// maxDeliverAttempts; tests shorten it).
 	retryLimit int
+	// drainTimeout bounds the shutdown drain (default shutdownDrain; tests
+	// shorten it).
+	drainTimeout time.Duration
 	// mu orders enqueue against the shutdown drain: enqueue sends under RLock
 	// after checking closed; the run loop sets closed under Lock, so once it
 	// holds the write lock no send can be in flight and draining the channel
@@ -151,7 +163,8 @@ func newSigBatch[T any](cfg BatchConfig, log *slog.Logger, kind string,
 		ch: make(chan T, cfg.QueueLen), export: export, fresh: fresh,
 		count: count, size: size, merge: merge, items: cfg.Items,
 		maxBytes: cfg.MaxBatchBytes, timeout: cfg.Timeout,
-		retryBase: time.Second, retryLimit: maxDeliverAttempts, log: log, kind: kind,
+		retryBase: time.Second, retryLimit: maxDeliverAttempts,
+		drainTimeout: shutdownDrain, log: log, kind: kind,
 	}
 }
 
@@ -246,9 +259,20 @@ func (s *sigBatch[T]) run(ctx context.Context) {
 			s.mu.Lock()
 			s.closed = true
 			s.mu.Unlock()
+			deadline := time.Now().Add(s.drainTimeout)
+			dropped := 0
 			for {
 				select {
 				case v := <-s.ch:
+					if time.Now().After(deadline) {
+						// The backlog cannot be delivered inside the grace
+						// period. Keep draining so nothing is left unaccounted,
+						// but count what dies here instead of being SIGKILLed
+						// with it silently in the queue.
+						obs.IngestDropped.WithLabelValues(s.kind).Inc()
+						dropped += s.count(v)
+						continue
+					}
 					// The drain honors the same items/byte chunking as the
 					// live path: merging everything into one payload could
 					// exceed the collector's recv limit.
@@ -261,7 +285,16 @@ func (s *sigBatch[T]) run(ctx context.Context) {
 					accN += n
 					accBytes += sz
 				default:
-					flush()
+					if accN > 0 && time.Now().After(deadline) {
+						obs.IngestDropped.WithLabelValues(s.kind).Inc()
+						dropped += accN
+					} else {
+						flush()
+					}
+					if dropped > 0 {
+						s.log.Error("ingest shutdown drain deadline exceeded, dropping acknowledged payloads",
+							"signal", s.kind, "records", dropped, "deadline", s.drainTimeout)
+					}
 					return
 				}
 			}

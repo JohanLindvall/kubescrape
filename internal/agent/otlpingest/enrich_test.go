@@ -10,6 +10,7 @@ import (
 	"go.opentelemetry.io/collector/pdata/plog"
 	"go.opentelemetry.io/collector/pdata/pmetric"
 
+	"github.com/JohanLindvall/kubescrape/internal/obs"
 	"github.com/JohanLindvall/kubescrape/pkg/kubemeta"
 )
 
@@ -451,5 +452,27 @@ func TestEnrichMetricsSplitAllTypes(t *testing.T) {
 		m.Summary().DataPoints().At(0).Count() != 5 ||
 		m.Summary().DataPoints().At(0).Sum() != 2.5 {
 		t.Errorf("summary = %+v", m)
+	}
+}
+
+// TestSplitCountsUnresolved: in split mode a group whose points carry no ID
+// and whose peer IP resolves to nothing is forwarded unenriched — the
+// resource-mode path counts that as "unresolved" and the split path must too,
+// or the ingest counters silently under-report unattributed data.
+func TestSplitCountsUnresolved(t *testing.T) {
+	e := NewEnricher(Config{Meta: &fakeMeta{}, MetricsMode: MetricsDatapoint})
+	before := obs.Ingested.WithLabelValues("unresolved").Value()
+
+	md := pmetric.NewMetrics()
+	dp := md.ResourceMetrics().AppendEmpty().ScopeMetrics().AppendEmpty().
+		Metrics().AppendEmpty().SetEmptyGauge().DataPoints().AppendEmpty()
+	dp.SetIntValue(1)
+
+	out := e.EnrichMetrics(context.Background(), md)
+	if out.DataPointCount() != 1 {
+		t.Fatalf("data points = %d, want 1 (unresolved points must still be forwarded)", out.DataPointCount())
+	}
+	if got := obs.Ingested.WithLabelValues("unresolved").Value() - before; got != 1 {
+		t.Fatalf("kubescrape_ingest_resources_total{unresolved} delta = %v, want 1", got)
 	}
 }

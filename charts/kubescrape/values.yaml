@@ -138,9 +138,11 @@ agent:
   # auto/start make adding a new log source ingest those files' existing
   # content.
   logsUnknownFiles: auto
-  # Close the fd of a fully-caught-up file after this much inactivity (0 keeps
-  # fds open); bounds steady-state fds at one per active file.
-  logsIdleClose: 10m
+  # Close the fd of a fully-caught-up file after this much inactivity. The open
+  # fd is the only handle to a rotated-away or deleted file's remaining bytes,
+  # so this trades the zero-loss guarantee for bounded fd usage: 0 (never) is
+  # the default. Set it only if a node tracks thousands of log files.
+  logsIdleClose: 0
   # Overlap reading with export delivery (one export in flight; at-least-once
   # semantics unchanged).
   logsPipelinedExport: false

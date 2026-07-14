@@ -147,6 +147,28 @@ func (r *Reader) Run(ctx context.Context) {
 	r.cursor = r.loadCursor()
 	backoff := r.cfg.RestartBackoff
 	for ctx.Err() == nil {
+		// The restart path recovers unexported entries by RE-READING them from
+		// the committed cursor. That only works once a cursor exists: with none
+		// (the first run, or no positions store at all) a reopen seeks to the
+		// journal TAIL and the buffered entries are gone. So while no cursor has
+		// been committed, keep retrying the pending batch's export instead of
+		// reopening — the journal itself is the buffer, and the moment one
+		// export lands the cursor covers everything that follows.
+		if r.cursor == "" && len(r.batch) > 0 {
+			if err := r.flush(ctx); err != nil {
+				r.log.Warn("journal export failed with no committed cursor; retrying (a reopen would seek to the tail and lose the entries)",
+					"entries", len(r.batch), "error", err, "backoff", backoff)
+				select {
+				case <-ctx.Done():
+				case <-time.After(backoff):
+				}
+				if backoff *= 2; backoff > 30*time.Second {
+					backoff = 30 * time.Second
+				}
+				continue
+			}
+			backoff = r.cfg.RestartBackoff
+		}
 		started := time.Now()
 		err := r.stream(ctx)
 		if ctx.Err() != nil {

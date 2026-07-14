@@ -264,3 +264,122 @@ func TestBatcherShutdownDrainsThenRefuses(t *testing.T) {
 		t.Fatalf("enqueue after shutdown = %v, want errBatchQueueFull", err)
 	}
 }
+
+// --- audit: the shutdown drain gives an acked payload exactly ONE attempt ---
+
+// TestBatcherShutdownDropIsCounted pins the shutdown-drain contract. Enqueue
+// ACKS the sender, and the drain runs with its context already cancelled, so
+// deliver's ctx.Err() branch drops on the FIRST transient failure: an
+// upstream blip at SIGTERM loses acked data (the documented mitigation is
+// -buffer-dir, whose spool.Append cannot fail transiently). The loss is
+// unavoidable without a spool, so the bar is that it is COUNTED and logged —
+// never silent. This test is the alarm on that counter.
+func TestBatcherShutdownDropIsCounted(t *testing.T) {
+	exp := &flakyExporter{err: errors.New("collector down"), failing: true}
+	b := NewBatcher(exp, nil, BatchConfig{Items: 100, Timeout: time.Hour}, nil)
+	b.logs.retryBase = time.Millisecond
+
+	before := obs.IngestDropped.WithLabelValues("logs").Value()
+
+	// Acked by the batcher, still sitting in the queue.
+	if err := b.ExportLogs(context.Background(), oneRecord("acked")); err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { defer close(done); b.Run(ctx) }()
+	cancel()
+	<-done
+
+	if exp.delivered() != 0 {
+		t.Fatalf("delivered = %d, want 0 (exporter is failing)", exp.delivered())
+	}
+	if got := obs.IngestDropped.WithLabelValues("logs").Value() - before; got != 1 {
+		t.Fatalf("kubescrape_ingest_dropped_batches_total{logs} delta = %v, want 1 — an acked-then-dropped payload MUST be counted", got)
+	}
+}
+
+// TestBatcherShutdownDrainStillDelivers is the other half: when the collector
+// is healthy, everything acked before the cancel is delivered by the drain —
+// nothing acked is lost on a clean stop.
+func TestBatcherShutdownDrainStillDelivers(t *testing.T) {
+	exp := &flakyExporter{}
+	b := NewBatcher(exp, nil, BatchConfig{Items: 1000, Timeout: time.Hour}, nil)
+	for i := 0; i < 20; i++ {
+		if err := b.ExportLogs(context.Background(), oneRecord("x")); err != nil {
+			t.Fatalf("enqueue %d: %v", i, err)
+		}
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { defer close(done); b.Run(ctx) }()
+	cancel()
+	<-done
+	if got := exp.delivered(); got != 20 {
+		t.Fatalf("delivered = %d, want 20", got)
+	}
+}
+
+// slowExporter makes every export take `delay` and then fail — a dead
+// collector, where each attempt burns the exporter's full timeout.
+type slowExporter struct {
+	delay time.Duration
+	mu    sync.Mutex
+	calls int
+}
+
+func (s *slowExporter) ExportLogs(context.Context, plog.Logs) error {
+	time.Sleep(s.delay)
+	s.mu.Lock()
+	s.calls++
+	s.mu.Unlock()
+	return errors.New("collector down")
+}
+
+func (s *slowExporter) ExportMetrics(context.Context, pmetric.Metrics) error { return nil }
+
+func (s *slowExporter) attempts() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.calls
+}
+
+// TestBatcherShutdownDrainIsBounded: with a dead collector every drain attempt
+// burns the exporter's full timeout, so an unbounded drain would take
+// QueueLen x timeout — far past the pod's termination grace, and the SIGKILL
+// would then take the rest of the ACKED backlog down silently. The drain must
+// stop attempting past its deadline and DROP-AND-COUNT the remainder.
+func TestBatcherShutdownDrainIsBounded(t *testing.T) {
+	exp := &slowExporter{delay: 60 * time.Millisecond}
+	b := NewBatcher(exp, nil, BatchConfig{Items: 1, Timeout: time.Hour, QueueLen: 64}, nil)
+	b.logs.retryBase = time.Millisecond
+	b.logs.drainTimeout = 50 * time.Millisecond
+
+	const queued = 40
+	for i := 0; i < queued; i++ {
+		if err := b.ExportLogs(context.Background(), oneRecord("acked")); err != nil {
+			t.Fatalf("enqueue %d: %v", i, err)
+		}
+	}
+	before := obs.IngestDropped.WithLabelValues("logs").Value()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	start := time.Now()
+	b.logs.run(ctx)
+	elapsed := time.Since(start)
+
+	// One in-flight attempt (60ms) may overrun the 50ms deadline; the other 39
+	// must not each cost another 60ms.
+	if elapsed > 500*time.Millisecond {
+		t.Fatalf("shutdown drain took %v — it is not bounded by drainTimeout", elapsed)
+	}
+	if got := exp.attempts(); got > 3 {
+		t.Fatalf("export attempts during drain = %d, want <= 3 (deadline must stop the attempts)", got)
+	}
+	// Every acked payload is accounted for: delivered (none here) or counted.
+	if got := obs.IngestDropped.WithLabelValues("logs").Value() - before; got < 1 {
+		t.Fatalf("dropped counter delta = %v, want >= 1 — abandoned acked payloads must be counted", got)
+	}
+}

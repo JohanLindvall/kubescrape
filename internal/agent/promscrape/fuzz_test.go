@@ -79,10 +79,10 @@ func FuzzConverter(f *testing.F) {
 		b := newBatcher(func(res pcommon.Resource) {
 			res.Attributes().PutStr("url.full", "http://fuzz.local/metrics")
 		}, limit, time.Unix(1e9, 0), time.Unix(1e9+60, 0))
-		conv := newConverter(b)
+		conv := newConverter(b, nil)
 		pp := promparse.Get(promparse.Options{MaxLineBytes: 1 << 20, OpenMetrics: openMetrics, Exemplars: exemplars})
 		_, err := pp.Parse(bytes.NewReader(data), func(s Sample) error {
-			conv.add(s)
+			_ = conv.add(s)
 			if b.count() >= limit {
 				checkTaken(b.take())
 			}
@@ -92,7 +92,7 @@ func FuzzConverter(f *testing.F) {
 		if err != nil {
 			t.Fatalf("parse returned error: %v", err)
 		}
-		conv.finish()
+		_ = conv.finish()
 		if conv.malformed < 0 {
 			t.Fatalf("converter malformed count negative: %d", conv.malformed)
 		}

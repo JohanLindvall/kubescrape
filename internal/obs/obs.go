@@ -38,6 +38,8 @@ var (
 		"Buffered batches dropped after a permanent collector rejection (bad payload, auth, unimplemented).", "signal")
 	BufferRequeued = Registry.CounterVec("kubescrape_buffer_requeued_total",
 		"Buffered batches moved to the back of the queue after repeated transient failures (keeps one stuck batch from blocking the signal).", "signal")
+	BufferFull = Registry.CounterVec("kubescrape_buffer_full_total",
+		"Batches the disk buffer refused because the undelivered backlog is at its cap: back-pressure for logs (the tailer rewinds and re-reads), a lost batch for producers that cannot rewind (scrape, self-metrics, log-metrics).", "signal")
 	BufferReadErrors = Registry.CounterVec("kubescrape_buffer_read_errors_total",
 		"Disk-buffer read failures while draining (the head frame could not be read; lost=true means the segment was gone and its frames were skipped).", "signal", "lost")
 	LogFifoDropped = Registry.Counter("kubescrape_log_fifo_orphans_total",
@@ -52,6 +54,10 @@ var (
 		"Scrape duration by pipeline.", nil, "pipeline")
 	ScrapeSamples = Registry.CounterVec("kubescrape_scrape_samples_total",
 		"Samples parsed by pipeline (before filtering).", "pipeline")
+	ScrapeMalformed = Registry.CounterVec("kubescrape_scrape_malformed_total",
+		"Exposition samples dropped as malformed by pipeline (unparseable lines, histogram buckets without le, summary rows without quantile).", "pipeline")
+	ScrapeCollisions = Registry.Counter("kubescrape_scrape_name_collisions_total",
+		"Data points dropped because their family name was already claimed by a metric of another shape in the same batch (a target redeclaring a family's TYPE mid-exposition).")
 )
 
 // OTLP exporter (agent).
@@ -97,7 +103,7 @@ var (
 // Events drops (metadata service).
 var (
 	EventsDropped = Registry.Counter("kubescrape_events_dropped_total",
-		"Kubernetes events dropped because the export queue was full.")
+		"Kubernetes events dropped: the export queue was full, or their export failed (delivery is best-effort — no retries, no spool).")
 )
 
 // HTTP server (metadata service).
@@ -105,6 +111,22 @@ var (
 	HTTPRequests = Registry.CounterVec("kubescrape_http_requests_total",
 		"Metadata API requests by pattern and status code.", "pattern", "code")
 )
+
+// Log-derived metrics (agent): observations the series store refused. The
+// counters live in internal/metrics (which obs imports, so they cannot be
+// declared here) and are surfaced as export-time gauges — cumulative since
+// process start.
+func init() {
+	Registry.GaugeFunc("kubescrape_log_metrics_dropped_capped",
+		"Log-metric observations dropped since start because the metric's label-set cardinality cap was reached.",
+		func() float64 { return float64(metrics.DroppedCapped()) })
+	Registry.GaugeFunc("kubescrape_log_metrics_dropped_collision",
+		"Log-metric observations dropped since start because of a series hash collision.",
+		func() float64 { return float64(metrics.DroppedCollision()) })
+	Registry.GaugeFunc("kubescrape_log_metrics_dropped_nan",
+		"Log-metric observations dropped since start because the extracted value was NaN.",
+		func() float64 { return float64(metrics.DroppedNaN()) })
+}
 
 // RegisterStoreStats exposes store sizes as gauges evaluated at export time.
 func RegisterStoreStats(stats func() (pods, containers int)) {

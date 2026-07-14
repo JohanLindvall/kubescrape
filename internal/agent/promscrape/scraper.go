@@ -31,13 +31,21 @@ type TargetSource interface {
 
 // Config configures the scraper.
 type Config struct {
-	Node         string
-	Interval     time.Duration
-	Timeout      time.Duration // per-target scrape timeout
-	Concurrency  int           // concurrent target scrapes
-	BatchPoints  int           // flush to the exporter after this many data points
-	MaxLineBytes int           // skip exposition lines longer than this
-	MaxSamples   int           // abort a single scrape beyond this many samples (0 = unlimited)
+	Node        string
+	Interval    time.Duration
+	Timeout     time.Duration // per-target scrape timeout
+	Concurrency int           // concurrent target scrapes
+	BatchPoints int           // flush to the exporter after this many data points
+	// BatchBytes flushes a chunk once its estimated OTLP size reaches this
+	// many bytes, whichever limit BatchPoints or BatchBytes hits first (0 =
+	// the default; negative disables the byte bound). A collector's default
+	// gRPC receive limit is 4 MiB on the DECOMPRESSED message, and BatchPoints
+	// alone does not bound bytes: 10k points of a label-rich family marshal to
+	// over 5 MiB, which the collector rejects wholesale — every export of that
+	// target fails and all of its metrics are lost.
+	BatchBytes   int
+	MaxLineBytes int // skip exposition lines longer than this
+	MaxSamples   int // abort a single scrape beyond this many samples (0 = unlimited)
 	// Exemplars negotiates the OpenMetrics format and attaches exemplars to
 	// counter and histogram data points.
 	Exemplars bool
@@ -73,10 +81,12 @@ type Config struct {
 //
 // Efficiency: the exposition body is stream-parsed (constant memory per
 // target) and converted into pmetric batches flushed once BatchPoints data
-// points accumulate (a histogram/summary family emits all its points at once,
-// so a batch can exceed the limit by the flushing family's point count),
-// which are exported and released before parsing continues — a 100k-series
-// target never resides fully in memory.
+// points OR BatchBytes estimated bytes accumulate, which are exported and
+// released before parsing continues — a 100k-series target never resides fully
+// in memory. The byte bound is what keeps a chunk under the collector's 4 MiB
+// default receive limit (a point count does not bound bytes); it is checked
+// between the points of a flushing histogram/summary family too, so one
+// enormous family cannot overshoot it.
 type Scraper struct {
 	cfg  Config
 	http *http.Client
@@ -96,6 +106,9 @@ func New(cfg Config) *Scraper {
 	}
 	if cfg.BatchPoints <= 0 {
 		cfg.BatchPoints = 10_000
+	}
+	if cfg.BatchBytes == 0 {
+		cfg.BatchBytes = defaultBatchBytes
 	}
 	if cfg.MaxLineBytes <= 0 {
 		cfg.MaxLineBytes = 1 << 20
@@ -318,6 +331,7 @@ type batcher struct {
 	lastMetric pmetric.Metric
 	lastOK     bool
 	points     int
+	bytes      int
 }
 
 func newBatcher(fillResource func(pcommon.Resource), limit int, start, scrape time.Time) *batcher {
@@ -345,6 +359,7 @@ func (b *batcher) reset() {
 	}
 	b.lastOK = false
 	b.points = 0
+	b.bytes = 0
 }
 
 // take returns the accumulated payload and starts a fresh batch.
@@ -355,6 +370,7 @@ func (b *batcher) take() pmetric.Metrics {
 }
 
 func (b *batcher) count() int { return b.points }
+func (b *batcher) size() int  { return b.bytes }
 
 // Pipeline identifiers for attribute-builder selection.
 const (

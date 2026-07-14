@@ -106,7 +106,7 @@ func (t *Tailer) commitBatch(inf *inflight) {
 		// needed for recovery.
 		if f.carried != nil {
 			if _, wok := f.watermark(); !wok {
-				f.carried = nil
+				f.closeCarried() // exported: the rotated inodes' fds can go
 			}
 		}
 	}

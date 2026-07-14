@@ -24,6 +24,9 @@ var (
 		"Log files currently tracked.")
 	LogRotations = Registry.Counter("kubescrape_log_rotations_total",
 		"Log file rotations and truncations handled.")
+	LogPrefixLost = Registry.Counter("kubescrape_log_prefix_lost_total",
+		"Rotated-away log segments that could not be re-read (the file was deleted or compressed "+
+			"before its lines were exported, and no open fd survived a restart). These lines are lost.")
 	LogEnriched = Registry.CounterVec("kubescrape_log_enriched_total",
 		"Log records by the enrichment strategy that matched (json, logfmt, pattern, none).", "format")
 	LogLagBytes = Registry.Gauge("kubescrape_log_lag_bytes",

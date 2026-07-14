@@ -16,7 +16,7 @@ package tailer
 //	reopen() leaves f.f == nil, so the flush that fails right after a rotation
 //	rewinds nothing at all.
 //
-// See TestBUG_* below for the exact interleavings.
+// See the tests below for the exact interleavings.
 
 import (
 	"context"
@@ -43,7 +43,7 @@ func driveTailer(dir string, exp *fakeExporter) *Tailer {
 	return tl
 }
 
-// TestBUG_RotationDuringOutageLosesDrainedTail: a rename rotation whose
+// TestRotationDuringOutageKeepsDrainedTail: a rename rotation whose
 // following flush FAILS, and whose next flush SUCCEEDS, permanently loses every
 // line of the rotated-away inode.
 //
@@ -65,7 +65,7 @@ func driveTailer(dir string, exp *fakeExporter) *Tailer {
 //
 // Severity: HIGH — an ordinary kubelet rotation during a collector outage that
 // ends on the very next flush. No crash, no corruption, no unusual config.
-func TestBUG_RotationDuringOutageLosesDrainedTail(t *testing.T) {
+func TestRotationDuringOutageKeepsDrainedTail(t *testing.T) {
 	dir := t.TempDir()
 	ctx := context.Background()
 	exp := &fakeExporter{}
@@ -117,7 +117,7 @@ func TestBUG_RotationDuringOutageLosesDrainedTail(t *testing.T) {
 	}
 }
 
-// TestBUG_DeletionDuringOutageLosesDrainedTail: a log file removed while the
+// TestDeletionDuringOutageKeepsDrainedTail: a log file removed while the
 // collector is down loses its drained remainder if the export of that drain
 // fails.
 //
@@ -138,7 +138,7 @@ func TestBUG_RotationDuringOutageLosesDrainedTail(t *testing.T) {
 // loses its last drained lines. Unlike the rotation case there is no carried
 // prefix to recover from: the fix has to keep the file (and its fd) alive until
 // its offsets are committed.
-func TestBUG_DeletionDuringOutageLosesDrainedTail(t *testing.T) {
+func TestDeletionDuringOutageKeepsDrainedTail(t *testing.T) {
 	dir := t.TempDir()
 	ctx := context.Background()
 	exp := &fakeExporter{}

@@ -487,6 +487,25 @@ type rotatedPrefix struct {
 	inode    uint64
 	fp       fingerprint
 	from, to int64
+	// fd is the rotated inode's still-open handle, kept while this prefix is
+	// uncommitted: the runtime prunes rotated files on its own schedule (a
+	// bounded rotation count), and once it does, findRotated cannot resolve the
+	// prefix by name — but the fd still reaches the unlinked inode. nil after a
+	// restart, where findRotated is the only route.
+	fd *os.File
+}
+
+// closeCarried releases the rotated inodes' retained fds. Only legitimate once
+// their lines are committed (or the file is being dropped) — the fds are the
+// last handle to inodes the runtime may already have unlinked.
+func (f *file) closeCarried() {
+	for i := range f.carried {
+		if f.carried[i].fd != nil {
+			_ = f.carried[i].fd.Close()
+			f.carried[i].fd = nil
+		}
+	}
+	f.carried = nil
 }
 
 // fingerprint identifies file content: an FNV-1a hash of the first Len
@@ -1329,6 +1348,27 @@ func (t *Tailer) readFile(ctx context.Context, f *file) error {
 		t.feedCarriedPrefix(ctx, f)
 	}
 
+	// Copytruncate whose replacement content is LONGER than our read offset:
+	// the post-read check below cannot see it (bytes come back from the stale
+	// offset, so read > 0 and its `read == 0` guard never fires) and we would
+	// resume mid-way into the new file, silently skipping its prefix — and
+	// splitting a line. The head fingerprint is the only witness, so re-verify
+	// it here, BEFORE consuming anything, whenever the file changed on disk
+	// since our last read. Costs one stat plus a fingerprint hash per changed
+	// file per sweep.
+	if f.readPos > 0 && !f.compressed {
+		if st, err := os.Stat(f.path); err == nil &&
+			inodeOf(st) == f.inode && st.Size() >= f.readPos &&
+			!st.ModTime().Equal(f.lastMod) && !f.fp.matches(f.f) {
+			t.settle(f)
+			t.reopen(ctx, f, false)
+			f.lastMod = st.ModTime()
+			if err := t.ensureOpen(f); err != nil {
+				return err
+			}
+		}
+	}
+
 	// A paused (rate-limited) file first retries its retained pending bytes;
 	// reading resumes only once they drain.
 	if f.limited {
@@ -1398,6 +1438,11 @@ func (t *Tailer) readArchive(ctx context.Context, f *file) error {
 		// re-decompressed end-to-end on every poll sweep, forever; skip while
 		// the compressed file itself is unchanged.
 		if f.archiveDone {
+			// Its export has landed: the fd held for recovery can go (otherwise
+			// every consumed archive leaks one for the tailer's lifetime).
+			if f.f != nil && f.committed >= f.readPos {
+				t.closeArchive(f)
+			}
 			st, err := os.Stat(f.path)
 			if err != nil || (st.Size() == f.archiveSize && st.ModTime().Equal(f.archiveMod)) {
 				return nil // unchanged (or momentarily unstattable): stay done
@@ -1428,7 +1473,12 @@ func (t *Tailer) readArchive(ctx context.Context, f *file) error {
 		if err != nil {
 			if errors.Is(err, io.EOF) {
 				t.stopPipeline(ctx, f) // drain a trailing multi-line group
-				t.closeArchive(f)
+				if f.committed >= f.readPos {
+					t.closeArchive(f)
+				} else {
+					// Uncommitted data: hold the fd (see closeArchiveReader).
+					t.closeArchiveReader(f)
+				}
 				// Record the consumed archive's identity so idle sweeps skip
 				// it instead of re-decompressing it from scratch.
 				if st, statErr := os.Stat(f.path); statErr == nil {
@@ -1446,6 +1496,30 @@ func (t *Tailer) readArchive(ctx context.Context, f *file) error {
 // openArchive opens the gzip file and positions it at the committed offset by
 // discarding that many decompressed bytes.
 func (t *Tailer) openArchive(f *file) error {
+	// A retained fd (uncommitted data, reader closed at EOF or by rewind) IS the
+	// archive — reuse it rather than re-opening by path: the file may already be
+	// unlinked, and that fd is then the only handle to the inode. gzip is not
+	// seekable, so rewind the fd itself and re-decompress from the start.
+	if f.f != nil {
+		if _, err := f.f.Seek(0, 0); err != nil {
+			return err
+		}
+		gz, err := gzip.NewReader(f.f)
+		if err != nil {
+			return fmt.Errorf("gzip %s: %w", f.path, err)
+		}
+		if f.committed > 0 {
+			if _, err := io.CopyN(io.Discard, gz, f.committed); err != nil && !errors.Is(err, io.EOF) {
+				_ = gz.Close()
+				return err
+			}
+		}
+		f.gz = gz
+		f.readPos = f.committed
+		f.lineStart = f.committed
+		f.pending = f.pending[:0]
+		return nil
+	}
 	fh, err := os.Open(f.path)
 	if err != nil {
 		return err
@@ -1490,7 +1564,15 @@ func (t *Tailer) openArchive(f *file) error {
 // file drops.
 func (t *Tailer) drainArchive(ctx context.Context, f *file) {
 	if f.gz == nil {
-		return
+		// Reader closed at EOF or by a rewind, but the data is not committed and
+		// the fd is still held: re-decompress the uncommitted suffix from it.
+		if f.f == nil || f.committed >= f.readPos && f.archiveDone {
+			return
+		}
+		if err := t.openArchive(f); err != nil {
+			t.log.Warn("re-opening archive to drain", "path", f.path, "error", err)
+			return
+		}
 	}
 	buf := t.scratch()
 	if len(f.pending) > 0 {
@@ -1521,13 +1603,22 @@ func (t *Tailer) drainArchive(ctx context.Context, f *file) {
 
 // closeArchive releases the archive's readers.
 func (t *Tailer) closeArchive(f *file) {
-	if f.gz != nil {
-		_ = f.gz.Close()
-		f.gz = nil
-	}
+	t.closeArchiveReader(f)
 	if f.f != nil {
 		_ = f.f.Close()
 		f.f = nil
+	}
+}
+
+// closeArchiveReader drops the gzip reader but KEEPS the underlying fd. The fd
+// is the only handle to an unlinked archive, so it must outlive the reader
+// whenever data read from the file is still uncommitted: an export can fail and
+// the runtime can prune the .gz before the retry, and openArchive/drainArchive
+// then re-decompress the uncommitted suffix straight from this fd.
+func (t *Tailer) closeArchiveReader(f *file) {
+	if f.gz != nil {
+		_ = f.gz.Close()
+		f.gz = nil
 	}
 }
 
@@ -1704,21 +1795,36 @@ func (t *Tailer) ensureOpen(f *file) error {
 // content was replaced.
 func (t *Tailer) reopen(ctx context.Context, f *file, renamed bool) {
 	obs.LogRotations.Inc()
-	if f.f != nil {
-		_ = f.f.Close()
-		f.f = nil
+	// The rotated-away inode's fd is handed to the carried prefix that records
+	// it (and closed below if none does): it is the only handle that survives
+	// the runtime deleting the rotated file.
+	old := f.f
+	f.f = nil
+	defer func() {
+		if old != nil {
+			_ = old.Close()
+		}
+	}()
+	keep := func(p rotatedPrefix) rotatedPrefix {
+		p.fd, old = old, nil
+		return p
 	}
 	if _, buffered := f.watermark(); renamed && buffered {
 		// Append this rotation's tail; a group straddling several rotations
 		// accumulates one entry per hop, all re-readable on crash.
-		f.carried = append(f.carried, rotatedPrefix{inode: f.inode, fp: f.fp, from: f.committed, to: f.readPos})
+		f.carried = append(f.carried, keep(rotatedPrefix{inode: f.inode, fp: f.fp, from: f.committed, to: f.readPos}))
 		f.carriedFed = true // the prefixes are already live in the pipeline
 		f.reanchor()
 		f.gen++
 	} else {
 		t.stopPipeline(ctx, f)
 		t.newPipeline(f)
-		f.carried = nil
+		// carried must NOT be reset here. Its entries name EARLIER rotated-away
+		// inodes whose lines are still uncommitted — a second rotation (or a
+		// truncation) during a collector outage does not make them recoverable
+		// any other way, and the failing flush purges them from the batch too.
+		// Dropping the list here lost them outright. Only commitBatch may clear
+		// it: after a successful export with nothing left buffered.
 		if renamed && f.readPos > f.committed {
 			// The drained range [committed, readPos) exists only as batch
 			// entries now; if their export fails (or the process crashes),
@@ -1726,7 +1832,7 @@ func (t *Tailer) reopen(ctx context.Context, f *file, renamed bool) {
 			// feedCarriedPrefix can re-read it — carriedFed stays true, so
 			// nothing is re-read unless a rewind/restart resets it; on a
 			// successful export the commit clears it.
-			f.carried = append(f.carried, rotatedPrefix{inode: f.inode, fp: f.fp, from: f.committed, to: f.readPos})
+			f.carried = append(f.carried, keep(rotatedPrefix{inode: f.inode, fp: f.fp, from: f.committed, to: f.readPos}))
 			f.carriedFed = true
 		}
 		// The entries stopPipeline just emitted carry old-content offsets; the
@@ -1773,18 +1879,29 @@ func (t *Tailer) feedCarriedPrefix(ctx context.Context, f *file) {
 // feedPrefix re-reads one rotated file's [from,to) range and feeds its lines
 // into the pipeline.
 func (t *Tailer) feedPrefix(ctx context.Context, f *file, p rotatedPrefix) {
-	path, ok := t.findRotated(f, p)
-	if !ok {
-		t.log.Warn("carried log prefix source not found; multi-line group across rotation may be truncated",
-			"path", f.path, "inode", p.inode)
-		return
+	// The retained fd first: it reaches the inode even after the runtime has
+	// deleted (or compressed) the rotated file, which findRotated — resolving by
+	// NAME — cannot. Only a restart, where no fd survives, falls back to the path.
+	fh, path := p.fd, ""
+	if fh == nil {
+		var ok bool
+		path, ok = t.findRotated(f, p)
+		if !ok {
+			obs.LogPrefixLost.Inc()
+			t.log.Warn("carried log prefix source not found; lines from the rotated file are lost",
+				"path", f.path, "inode", p.inode)
+			return
+		}
+		opened, err := os.Open(path)
+		if err != nil {
+			t.log.Warn("opening carried log prefix", "path", path, "error", err)
+			return
+		}
+		defer func() { _ = opened.Close() }()
+		fh = opened
+	} else {
+		path = f.path
 	}
-	fh, err := os.Open(path)
-	if err != nil {
-		t.log.Warn("opening carried log prefix", "path", path, "error", err)
-		return
-	}
-	defer func() { _ = fh.Close() }()
 	if _, err := fh.Seek(p.from, 0); err != nil {
 		t.log.Warn("seeking carried log prefix", "path", path, "error", err)
 		return
@@ -1893,6 +2010,7 @@ func (t *Tailer) release(f *file) {
 		_ = f.f.Close()
 		f.f = nil
 	}
+	f.closeCarried() // the file is going: its rotated inodes' fds go with it
 	t.unwatchTarget(f)
 }
 
@@ -2164,10 +2282,12 @@ func (t *Tailer) exportWithRetry(ctx context.Context, ld plog.Logs) error {
 // lines sit after the committed offset and will be re-read and re-fed.
 func (t *Tailer) rewind(f *file) {
 	if f.compressed {
-		// gzip is not seekable: close so openArchive re-decompresses from the
-		// committed offset next sweep. archiveDone must reset with it — the
-		// rewound range needs re-reading even though the file is unchanged.
-		t.closeArchive(f)
+		// gzip is not seekable: drop the reader so openArchive re-decompresses
+		// from the committed offset next sweep. The fd is RETAINED (the archive
+		// may be unlinked before the retry — see closeArchiveReader).
+		// archiveDone must reset with it: the rewound range needs re-reading
+		// even though the file is unchanged.
+		t.closeArchiveReader(f)
 		f.archiveDone = false
 		f.readPos = f.committed
 		f.lineStart = f.committed

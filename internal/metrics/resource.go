@@ -16,8 +16,8 @@ func resourceAccum(res pcommon.Map) resKey {
 			return true // resourceString's set drops these; the hash must too
 		}
 		hk, hv := xxhash.Sum64String(k), xxhash.Sum64String(s)
-		rk.accum += combineHash(hk, hv)
-		rk.check += combineCheck(hk, hv)
+		rk.accum += combineResHash(hk, hv)
+		rk.check += combineResCheck(hk, hv)
 		return true
 	})
 	return rk
@@ -39,13 +39,13 @@ func resLabelsAccum(res pcommon.Map, extra labels) resKey {
 		if v, ok := res.Get(e.key); ok {
 			if s := v.AsString(); s != "" {
 				hv := xxhash.Sum64String(s)
-				rk.accum -= combineHash(hk, hv)
-				rk.check -= combineCheck(hk, hv)
+				rk.accum -= combineResHash(hk, hv)
+				rk.check -= combineResCheck(hk, hv)
 			}
 		}
 		hv := xxhash.Sum64String(e.value)
-		rk.accum += combineHash(hk, hv)
-		rk.check += combineCheck(hk, hv)
+		rk.accum += combineResHash(hk, hv)
+		rk.check += combineResCheck(hk, hv)
 	}
 	return rk
 }

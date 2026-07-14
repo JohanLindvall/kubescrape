@@ -123,6 +123,12 @@ type sample struct {
 type expiringSample struct {
 	sample
 	when int64 // epoch seconds of the last observation
+	// exported reports whether the CURRENT value has already reached an export.
+	// The idle reset must never zero counts that no export has carried: maxAge
+	// may legally be shorter than the export interval, in which case every
+	// observation between two exports would otherwise be observed and destroyed
+	// without ever being emitted.
+	exported bool
 }
 
 // series holds the live values of one metric: a set of label combinations,
@@ -382,6 +388,7 @@ func (s *series) warnCapped(lbls labels, now int64) {
 // record folds one observation into a sample. Gauges apply their action;
 // counters, summaries and histograms accumulate.
 func (s *series) record(samp *expiringSample, value float64) {
+	samp.exported = false // a new value: an export must carry it before it may be reset
 	if s.aggregating() {
 		// A brand-new sample, or the first value after an emit, starts a fresh
 		// window; the rest fold in. value2 seeds to value (correct for range's
@@ -475,13 +482,22 @@ func (s *series) snapshot() []sample {
 			continue
 		}
 		if idle > 0 {
+			// Idle past its expiration: zero it so a later re-appearance starts a
+			// fresh count. But emit it first if this value has never been
+			// exported — with maxAge below the export interval, the observation
+			// would otherwise be destroyed having never left the process.
+			if !samp.exported {
+				out = append(out, samp.sample)
+			}
 			samp.initial = false
 			samp.count = 0
 			samp.value = 0
+			samp.exported = true // the zero needs no further emission
 			continue
 		}
 		out = append(out, samp.sample)
 		samp.initial = false
+		samp.exported = true
 	}
 	return out
 }

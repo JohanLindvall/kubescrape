@@ -401,8 +401,11 @@ func (cb *cadvisorBatcher) scope(ident cadvisorIdentity) (pmetric.ScopeMetrics, 
 		rm := cb.md.ResourceMetrics().AppendEmpty()
 		cb.fillResource(rm.Resource(), ident)
 		sm = rm.ScopeMetrics().AppendEmpty()
-		sm.Scope().SetName("github.com/JohanLindvall/kubescrape/agent/promscrape/cadvisor")
+		sm.Scope().SetName(scopeNameCadvisor)
 		cb.scopes[key] = sm
+		// One resource per pod/container: its attributes count toward the chunk
+		// size (see convert.go).
+		cb.bytes += resourceBytes(rm.Resource(), scopeNameCadvisor)
 	}
 	cb.lastIdent, cb.lastScope, cb.lastScopeKey, cb.lastScopeOK = ident, sm, key, true
 	return sm, key
@@ -486,6 +489,7 @@ func (cb *cadvisorBatcher) metric(ident cadvisorIdentity, name string, shape fun
 		m.SetName(name)
 		shape(m)
 		cb.byKey[key] = m
+		cb.bytes += len(name) + metricOverheadBytes // one descriptor per resource
 	}
 	cb.lastResKey, cb.lastName, cb.lastMetric, cb.lastOK = resKey, name, m, true
 	return m, ident.podScoped()

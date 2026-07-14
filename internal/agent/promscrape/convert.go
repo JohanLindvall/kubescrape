@@ -34,14 +34,42 @@ type sink interface {
 // then fail, losing all of its metrics. These constants approximate the OTLP
 // protobuf encoding (measured within a few percent, always slightly low, which
 // the default BatchBytes headroom absorbs).
+//
+// The non-point bytes are NOT rounding error: the split and cadvisor batchers
+// emit one ResourceMetrics per DESCRIBED OBJECT (pod, container), each carrying
+// a full enriched attribute set plus its own copy of every metric descriptor.
+// Counting only data points underestimated a kube-state-metrics split by ~2x —
+// 10k points flushed at an estimated 3 MiB and encoded to 6.7 MiB, past the
+// very limit the estimate exists to respect. Every resource and metric is
+// therefore charged where it is created.
 const (
-	pointOverheadBytes = 32 // timestamps, value, framing of one data point
-	attrOverheadBytes  = 8  // per-attribute protobuf framing
-	bucketBytes        = 12 // one explicit bound + its count
-	histFixedBytes     = 16 // count + sum
-	quantileBytes      = 18 // quantile + value
-	exemplarBytes      = 48 // value, timestamp, trace/span ids
+	pointOverheadBytes  = 32 // timestamps, value, framing of one data point
+	attrOverheadBytes   = 8  // per-attribute protobuf framing
+	bucketBytes         = 12 // one explicit bound + its count
+	histFixedBytes      = 16 // count + sum
+	quantileBytes       = 18 // quantile + value
+	exemplarBytes       = 48 // value, timestamp, trace/span ids
+	resOverheadBytes    = 24 // ResourceMetrics + Resource + ScopeMetrics framing
+	metricOverheadBytes = 16 // one Metric: descriptor framing, type wrapper, temporality
 )
+
+// The instrumentation scope names stamped on every emitted ScopeMetrics.
+const (
+	scopeName         = "github.com/JohanLindvall/kubescrape/agent/promscrape"
+	scopeNameCadvisor = "github.com/JohanLindvall/kubescrape/agent/promscrape/cadvisor"
+)
+
+// resourceBytes estimates the encoded size of one ResourceMetrics' non-point
+// content: the resource attributes plus the framing of the resource, its scope
+// and the scope name.
+func resourceBytes(res pcommon.Resource, scopeName string) int {
+	n := resOverheadBytes + len(scopeName)
+	res.Attributes().Range(func(k string, v pcommon.Value) bool {
+		n += len(k) + len(v.AsString()) + attrOverheadBytes
+		return true
+	})
+	return n
+}
 
 // labelBytes estimates the encoded size of a label set.
 func labelBytes(labels []Label) int {
@@ -356,10 +384,12 @@ func (b *batcher) metricByName(name string) (pmetric.Metric, bool) {
 	return m, ok
 }
 
-// remember indexes a newly created metric.
+// remember indexes a newly created metric (the sole creation choke point for
+// the plain batcher, so the descriptor's bytes are charged here).
 func (b *batcher) remember(name string, m pmetric.Metric) {
 	b.byName[name] = m
 	b.lastName, b.lastMetric, b.lastOK = name, m, true
+	b.bytes += len(name) + metricOverheadBytes
 }
 
 // addNumber emits a gauge or (monotonic cumulative) sum data point.

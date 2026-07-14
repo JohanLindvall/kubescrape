@@ -221,6 +221,13 @@ func (r *metricRule) observe(values func(string) (float64, bool), lookup func(st
 			return buf, rbuf
 		}
 		value = v
+	} else if r.valueRe != nil {
+		// ValueRegexp both extracts and FILTERS ("a line that does not match is
+		// skipped"). inc/dec/count ignore the extracted value, but the filter
+		// still applies — otherwise they would tally lines the regex rejects.
+		if _, ok := r.readValue(values, line); !ok {
+			return buf, rbuf
+		}
 	}
 	buf = buf[:0]
 	for _, lt := range r.labels {

@@ -221,8 +221,12 @@ const (
 // avalanche disperses the pair for the outer wrapping sum. Series hashes are
 // in-memory only (the db is rebuilt on restart; export identity is the labels
 // themselves), so this formula carries no persistence constraint.
+// The prime5 seed keeps an all-zero pair from folding to zero — a contribution
+// of 0 would make the pair invisible in the wrapping-sum accumulator, merging
+// two label sets that differ only by it. Unreachable in practice (it needs both
+// string hashes to be exactly 0), but the seed is free.
 func combineHash(h1, h2 uint64) uint64 {
-	return mixHash(h1*prime1 + bits.RotateLeft64(h2, 29)*prime2)
+	return mixHash(prime5 + h1*prime1 + bits.RotateLeft64(h2, 29)*prime2)
 }
 
 // combineCheck is a second projection of the same pair for the collision-check
@@ -230,7 +234,30 @@ func combineHash(h1, h2 uint64) uint64 {
 // operands, different rotation): a pair collision in one projection is not a
 // collision in the other, keeping the double-collision odds at ~2^-128.
 func combineCheck(h1, h2 uint64) uint64 {
-	return mixHash(h2*prime3 + bits.RotateLeft64(h1, 47)*prime4)
+	return mixHash(prime2 + h2*prime3 + bits.RotateLeft64(h1, 47)*prime4)
+}
+
+// A series key is the wrapping SUM of its resource pairs and its data-point
+// label pairs. Folded with one combine, those two contributions would live in
+// the SAME hash domain — and a sum cannot tell where a term came from. Two
+// series built from the same multiset of (key, value) pairs, split differently
+// between resource and labels, would then hash identically in BOTH accumulators
+// (the check hash is no help: it is a projection of the same pairs), silently
+// merging distinct series. Concretely, with a rule lifting a line field named
+// like a resource attribute: pod A (resource k8s.pod.name=a) logging peer=b and
+// pod B (resource k8s.pod.name=b) logging peer=a collapse into one sample.
+//
+// combineRes* therefore folds a resource pair under a different seed, giving
+// the resource its own domain. resourceAccum and resLabelsAccum use these (a
+// resourceLabel is lifted ONTO the resource, so it belongs to the resource
+// domain and must cancel a resource key it overrides); data-point labels keep
+// combineHash/combineCheck.
+func combineResHash(h1, h2 uint64) uint64 {
+	return mixHash(prime3 + h1*prime4 + bits.RotateLeft64(h2, 13)*prime1)
+}
+
+func combineResCheck(h1, h2 uint64) uint64 {
+	return mixHash(prime4 + h2*prime5 + bits.RotateLeft64(h1, 37)*prime2)
 }
 
 // mixHash performs the final xxhash avalanche on h.

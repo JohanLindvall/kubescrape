@@ -381,8 +381,11 @@ func (b *splitBatcher) route(name string, labels []Label) (pmetric.ScopeMetrics,
 			b.dpAttrs[ks] = dp
 		}
 		sm = rm.ScopeMetrics().AppendEmpty()
-		sm.Scope().SetName("github.com/JohanLindvall/kubescrape/agent/promscrape")
+		sm.Scope().SetName(scopeName)
 		b.scopes[ks] = sm
+		// One resource per described object: its attributes are a real part of
+		// the encoded batch, not rounding error (see convert.go).
+		b.bytes += resourceBytes(rm.Resource(), scopeName)
 	}
 	b.lastVals = append(b.lastVals[:0], b.vals...)
 	b.lastRule, b.lastKey, b.lastSM, b.lastDP, b.lastRouteOK = rule, ks, sm, dp, true
@@ -535,6 +538,7 @@ func (b *splitBatcher) metric(name string, labels []Label, shape func(pmetric.Me
 		m.SetName(name)
 		shape(m)
 		b.byKey[key] = m
+		b.bytes += len(name) + metricOverheadBytes // one descriptor per resource
 	}
 	b.lastMResKey, b.lastMName, b.lastM, b.lastMOK = resKey, name, m, true
 	return m, rule, dp

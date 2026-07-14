@@ -350,7 +350,7 @@ func (b *batcher) reset() {
 	rm := b.md.ResourceMetrics().AppendEmpty()
 	b.fillResource(rm.Resource())
 	sm := rm.ScopeMetrics().AppendEmpty()
-	sm.Scope().SetName("github.com/JohanLindvall/kubescrape/agent/promscrape")
+	sm.Scope().SetName(scopeName)
 	b.sm = sm
 	if b.byName == nil {
 		b.byName = make(map[string]pmetric.Metric)
@@ -359,7 +359,7 @@ func (b *batcher) reset() {
 	}
 	b.lastOK = false
 	b.points = 0
-	b.bytes = 0
+	b.bytes = resourceBytes(rm.Resource(), scopeName) // this chunk's single resource
 }
 
 // take returns the accumulated payload and starts a fresh batch.

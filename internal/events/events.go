@@ -285,20 +285,7 @@ func (e *Exporter) fillResource(res pcommon.Resource, ev *corev1.Event) {
 		a.PutStr("k8s.object.uid", string(obj.UID))
 	}
 	// Attribute well-known workload kinds like the agent would.
-	switch obj.Kind {
-	case "Deployment":
-		a.PutStr("k8s.deployment.name", obj.Name)
-	case "ReplicaSet":
-		a.PutStr("k8s.replicaset.name", obj.Name)
-	case "StatefulSet":
-		a.PutStr("k8s.statefulset.name", obj.Name)
-	case "DaemonSet":
-		a.PutStr("k8s.daemonset.name", obj.Name)
-	case "Job":
-		a.PutStr("k8s.job.name", obj.Name)
-	case "CronJob":
-		a.PutStr("k8s.cronjob.name", obj.Name)
-	case "Node":
-		a.PutStr("k8s.node.name", obj.Name)
+	if attr, ok := attrs.KindAttribute(obj.Kind); ok {
+		a.PutStr(attr, obj.Name)
 	}
 }

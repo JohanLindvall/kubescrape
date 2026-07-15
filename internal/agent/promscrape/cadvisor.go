@@ -416,34 +416,10 @@ func (cb *cadvisorBatcher) scope(ident cadvisorIdentity) (pmetric.ScopeMetrics, 
 // then the pod (by name, cross-checked against the cgroup pod UID), then the
 // raw label identity.
 func (cb *cadvisorBatcher) fillResource(res pcommon.Resource, ident cadvisorIdentity) {
-	ctx := attrs.Context{Node: cb.s.nodeInfo()}
-	resolved := false
+	// Exact container incarnation via the cgroup container ID, else the pod.
+	ctx, resolved := cb.s.resolveContext(cb.ctx, ident.containerID, ident.namespace, ident.pod, ident.podUID, ident.container, res)
+	ctx.Node = cb.s.nodeInfo()
 
-	// Exact container incarnation via the cgroup container ID.
-	if ident.containerID != "" {
-		if md := cb.s.containerMeta(cb.ctx, ident.containerID); md != nil {
-			ctx.Pod, ctx.Container = &md.Pod, &md.Container
-			resolved = true
-		}
-	}
-	if !resolved && ident.pod != "" {
-		if meta := cb.s.podMeta(cb.ctx, ident.namespace, ident.pod); meta != nil &&
-			(ident.podUID == "" || meta.UID == ident.podUID) {
-			ctx.Pod = meta
-			resolved = true
-			if ident.container != "" {
-				for i := range meta.Containers {
-					if meta.Containers[i].Name == ident.container {
-						ctx.Container = &meta.Containers[i]
-						break
-					}
-				}
-				if ctx.Container == nil {
-					res.Attributes().PutStr("k8s.container.name", ident.container)
-				}
-			}
-		}
-	}
 	if !resolved && (ident.pod != "" || ident.podUID != "") {
 		// Metadata unavailable (or a same-name pod replaced this one): keep
 		// the identity from the labels and the cgroup path.
@@ -535,19 +511,12 @@ func (cb *cadvisorBatcher) addNumber(s Sample, monotonic bool) {
 		}
 	})
 
-	var dp pmetric.NumberDataPoint
-	switch m.Type() {
-	case pmetric.MetricTypeSum:
-		dp = m.Sum().DataPoints().AppendEmpty()
-		dp.SetStartTimestamp(cb.startTS)
-	case pmetric.MetricTypeGauge:
-		dp = m.Gauge().DataPoints().AppendEmpty()
-	default:
-		obs.ScrapeCollisions.Inc() // name claimed by a different metric shape
+	dp, ok := numberDataPoint(m, cb.startTS)
+	if !ok {
 		return
 	}
 	dp.SetDoubleValue(s.Value)
-	dp.SetTimestamp(cb.pointTS(s.TimestampMs))
+	dp.SetTimestamp(pointTS(s.TimestampMs, cb.scrapeTS))
 	cb.putFilteredLabels(dp.Attributes(), s.Labels, podScoped)
 	cb.points++
 	cb.bytes += numberBytes(s)
@@ -567,7 +536,7 @@ func (cb *cadvisorBatcher) addHistogram(family string, acc *histAcc) {
 	}
 	dp := m.Histogram().DataPoints().AppendEmpty()
 	dp.SetStartTimestamp(cb.startTS)
-	dp.SetTimestamp(cb.pointTS(acc.ts))
+	dp.SetTimestamp(pointTS(acc.ts, cb.scrapeTS))
 	fillHistogramPoint(dp, acc)
 	cb.putFilteredLabels(dp.Attributes(), acc.labels, podScoped)
 	cb.points++
@@ -588,18 +557,11 @@ func (cb *cadvisorBatcher) addSummary(family string, acc *summAcc) {
 	}
 	dp := m.Summary().DataPoints().AppendEmpty()
 	dp.SetStartTimestamp(cb.startTS)
-	dp.SetTimestamp(cb.pointTS(acc.ts))
+	dp.SetTimestamp(pointTS(acc.ts, cb.scrapeTS))
 	fillSummaryPoint(dp, acc)
 	cb.putFilteredLabels(dp.Attributes(), acc.labels, podScoped)
 	cb.points++
 	cb.bytes += summBytes(acc)
-}
-
-func (cb *cadvisorBatcher) pointTS(tsMs int64) pcommon.Timestamp {
-	if tsMs != 0 {
-		return pcommon.Timestamp(tsMs * int64(time.Millisecond))
-	}
-	return cb.scrapeTS
 }
 
 func (cb *cadvisorBatcher) putFilteredLabels(attrs pcommon.Map, labels []Label, podScoped bool) {

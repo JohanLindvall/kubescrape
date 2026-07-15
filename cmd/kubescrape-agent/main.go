@@ -28,6 +28,7 @@ import (
 	"github.com/JohanLindvall/kubescrape/internal/agent/otlpingest"
 	"github.com/JohanLindvall/kubescrape/internal/agent/positions"
 	"github.com/JohanLindvall/kubescrape/internal/agent/promscrape"
+	"github.com/JohanLindvall/kubescrape/internal/agent/spanmetrics"
 	"github.com/JohanLindvall/kubescrape/internal/agent/tailer"
 	"github.com/JohanLindvall/kubescrape/internal/metrics"
 	"github.com/JohanLindvall/kubescrape/internal/obs"
@@ -42,6 +43,18 @@ func main() {
 		slog.Error("kubescrape-agent failed", "error", err)
 		os.Exit(1)
 	}
+}
+
+// agentSelfResource is the agent's own OTLP resource identity, shared by its
+// self-metrics and span-metrics exporters (a described service is carried as a
+// data-point dimension, not on this resource).
+func agentSelfResource(node string) pcommon.Resource {
+	res := pcommon.NewResource()
+	a := res.Attributes()
+	a.PutStr("service.name", "kubescrape-agent")
+	a.PutStr("k8s.node.name", node)
+	attrs.Identity(res)
+	return res
 }
 
 func run() error {
@@ -137,6 +150,8 @@ func run() error {
 		ingestUIDKeys = flag.String("ingest-pod-uid-keys", "k8s.pod.uid", "comma-separated attribute keys inspected for a pod uid")
 		ingestEnrich  = flag.Bool("ingest-logs-enrich", true, "parse pushed log-record bodies for timestamp/severity/trace as -logs-enrich does, filling only fields the sender left unset")
 		ingestTraces  = flag.Bool("ingest-traces", true, "accept pushed traces (gRPC + /v1/traces), enrich their resources and pass them through")
+		spanMetrics   = flag.Bool("ingest-span-metrics", false, "derive RED (calls + duration histogram) metrics from ingested spans, dimensioned by service.name/span.name/span.kind/status.code; exported over OTLP (tune via the traceMetrics config section)")
+		spanMetricsIv = flag.Duration("ingest-span-metrics-interval", time.Minute, "export interval for span metrics")
 		ingestPeerIP  = flag.Bool("ingest-peer-ip-fallback", false, "attribute pushed telemetry whose resource carries no container id / pod uid to the pod owning the connection's peer IP (hostNetwork senders never resolve)")
 		ingestBatch   = flag.Int("ingest-batch-items", 0, "coalesce pushed payloads per signal to this many items (log records / data points / spans) before forwarding; 0 forwards each request as received")
 		ingestBatchTO = flag.Duration("ingest-batch-timeout", 200*time.Millisecond, "max time a partial ingest batch waits before flushing")
@@ -271,11 +286,7 @@ func run() error {
 	}
 
 	if *selfMetricsIntv > 0 {
-		res := pcommon.NewResource()
-		a := res.Attributes()
-		a.PutStr("service.name", "kubescrape-agent")
-		a.PutStr("k8s.node.name", *nodeName)
-		attrs.Identity(res)
+		res := agentSelfResource(*nodeName)
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -424,6 +435,27 @@ func run() error {
 				ingestTraceOut = batcher
 			}
 			log.Info("otlp ingest batching enabled", "items", *ingestBatch, "maxBytes", *ingestBatchB, "timeout", *ingestBatchTO)
+		}
+		if *spanMetrics {
+			if ingestTraceOut == nil {
+				log.Warn("-ingest-span-metrics ignored: traces are disabled (-ingest-traces=false)")
+			} else {
+				var smCfg spanmetrics.Config
+				if fileCfg.TraceMetrics != nil {
+					smCfg = *fileCfg.TraceMetrics
+				}
+				gen := spanmetrics.New(smCfg)
+				// Tap the forward path: the generator aggregates each enriched
+				// batch, then hands it on unchanged.
+				ingestTraceOut = gen.Tap(ingestTraceOut)
+				res := agentSelfResource(*nodeName)
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					gen.Run(ctx, out, *spanMetricsIv, res, log)
+				}()
+				log.Info("span metrics from traces enabled", "interval", *spanMetricsIv)
+			}
 		}
 		srv := otlpingest.NewServer(otlpingest.ServerConfig{
 			GRPCAddr: *ingestGRPC,

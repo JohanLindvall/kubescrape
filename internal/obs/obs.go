@@ -97,6 +97,8 @@ var (
 		"Distinct pushed identities (container id / pod uid, memoized per request) by enrichment outcome (enriched, unresolved, peer_ip).", "outcome")
 	IngestDropped = Registry.CounterVec("kubescrape_ingest_dropped_batches_total",
 		"Acknowledged ingest batches dropped: permanent collector rejection or the transient-retry limit exhausted.", "signal")
+	SpanMetricsDropped = Registry.Counter("kubescrape_span_metrics_dropped_total",
+		"Spans not aggregated into span metrics because the dimension-cardinality cap was reached.")
 )
 
 // Journald drops (agent).

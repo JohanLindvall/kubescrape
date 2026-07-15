@@ -402,19 +402,12 @@ func (b *batcher) addNumber(s Sample, monotonic bool) {
 		b.remember(s.Name, m)
 	}
 
-	var dp pmetric.NumberDataPoint
-	switch m.Type() {
-	case pmetric.MetricTypeSum:
-		dp = m.Sum().DataPoints().AppendEmpty()
-		dp.SetStartTimestamp(b.startTS)
-	case pmetric.MetricTypeGauge:
-		dp = m.Gauge().DataPoints().AppendEmpty()
-	default:
-		obs.ScrapeCollisions.Inc() // name claimed by a different metric shape
+	dp, ok := numberDataPoint(m, b.startTS)
+	if !ok {
 		return
 	}
 	dp.SetDoubleValue(s.Value)
-	dp.SetTimestamp(b.pointTS(s.TimestampMs))
+	dp.SetTimestamp(pointTS(s.TimestampMs, b.scrapeTS))
 	putLabels(dp.Attributes(), s.Labels)
 	if s.Exemplar != nil {
 		setExemplar(dp.Exemplars().AppendEmpty(), *s.Exemplar, b.scrapeTS)
@@ -442,7 +435,7 @@ func (b *batcher) addHistogram(family string, acc *histAcc) {
 
 	dp := m.Histogram().DataPoints().AppendEmpty()
 	dp.SetStartTimestamp(b.startTS)
-	dp.SetTimestamp(b.pointTS(acc.ts))
+	dp.SetTimestamp(pointTS(acc.ts, b.scrapeTS))
 	fillHistogramPoint(dp, acc)
 	putLabels(dp.Attributes(), acc.labels)
 	for _, e := range acc.exemplars {
@@ -522,7 +515,7 @@ func (b *batcher) addSummary(family string, acc *summAcc) {
 
 	dp := m.Summary().DataPoints().AppendEmpty()
 	dp.SetStartTimestamp(b.startTS)
-	dp.SetTimestamp(b.pointTS(acc.ts))
+	dp.SetTimestamp(pointTS(acc.ts, b.scrapeTS))
 	fillSummaryPoint(dp, acc)
 	putLabels(dp.Attributes(), acc.labels)
 	b.points++
@@ -545,11 +538,30 @@ func fillSummaryPoint(dp pmetric.SummaryDataPoint, acc *summAcc) {
 	}
 }
 
-func (b *batcher) pointTS(tsMs int64) pcommon.Timestamp {
+// pointTS is the sample's own timestamp (ms) or the scrape time when it carried
+// none. Shared by all three batchers.
+func pointTS(tsMs int64, scrapeTS pcommon.Timestamp) pcommon.Timestamp {
 	if tsMs != 0 {
 		return pcommon.Timestamp(tsMs * int64(time.Millisecond))
 	}
-	return b.scrapeTS
+	return scrapeTS
+}
+
+// numberDataPoint appends a data point of m's kind — Sum stamps the cumulative
+// start time. ok is false, counted as a name collision, when m is neither a Sum
+// nor a Gauge (a family name reused across incompatible metric shapes).
+func numberDataPoint(m pmetric.Metric, startTS pcommon.Timestamp) (pmetric.NumberDataPoint, bool) {
+	switch m.Type() {
+	case pmetric.MetricTypeSum:
+		dp := m.Sum().DataPoints().AppendEmpty()
+		dp.SetStartTimestamp(startTS)
+		return dp, true
+	case pmetric.MetricTypeGauge:
+		return m.Gauge().DataPoints().AppendEmpty(), true
+	default:
+		obs.ScrapeCollisions.Inc()
+		return pmetric.NumberDataPoint{}, false
+	}
 }
 
 func putLabels(attrs pcommon.Map, labels []Label) {

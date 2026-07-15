@@ -244,10 +244,10 @@ func (s *Scraper) exportHealth(ctx context.Context, outcomes []scrapeOutcome) {
 	for _, o := range outcomes {
 		rm := md.ResourceMetrics().AppendEmpty()
 		res := rm.Resource()
-		res.Attributes().PutStr("url.full", o.url)
 		if o.target != nil {
-			s.attrsFor(pipelineTargets).Build(res, attrs.Context{Pod: &o.target.Pod, Service: o.target.Service, Node: s.nodeInfo()})
+			s.fillTargetResource(res, o.url, &o.target.Pod, o.target.Service)
 		} else {
+			res.Attributes().PutStr("url.full", o.url)
 			res.Attributes().PutStr("service.name", "kubelet")
 			s.attrsFor(o.pipeline).Build(res, attrs.Context{Node: s.nodeInfo()})
 		}
@@ -271,6 +271,49 @@ func (s *Scraper) exportHealth(ctx context.Context, outcomes []scrapeOutcome) {
 	if err := s.cfg.Exporter.ExportMetrics(ctx, md); err != nil && ctx.Err() == nil {
 		s.log.Warn("exporting scrape health metrics", "error", err)
 	}
+}
+
+// fillTargetResource stamps url.full and builds a target's own resource
+// attributes (the pipelineTargets set with the pod/service/node context) — the
+// convention shared by the scrape, health, and split-self resources.
+func (s *Scraper) fillTargetResource(res pcommon.Resource, url string, pod *kubemeta.Pod, svc *kubemeta.Service) {
+	res.Attributes().PutStr("url.full", url)
+	s.attrsFor(pipelineTargets).Build(res, attrs.Context{Pod: pod, Service: svc, Node: s.nodeInfo()})
+}
+
+// resolveContext resolves a described object's pod/container through the metadata
+// service — an exact container incarnation by container id, else the pod by
+// namespace+name (cross-checked against uid) with a named container matched
+// within it; a container-name miss stamps k8s.container.name on res. It returns
+// the built attrs.Context (Node NOT set — the caller adds it) and whether
+// anything resolved; on no resolution the caller writes its own identity
+// fallback. Shared by the cadvisor and split batchers.
+func (s *Scraper) resolveContext(ctx context.Context, containerID, namespace, pod, uid, container string, res pcommon.Resource) (attrs.Context, bool) {
+	var actx attrs.Context
+	if containerID != "" {
+		if md := s.containerMeta(ctx, containerID); md != nil {
+			actx.Pod, actx.Container = &md.Pod, &md.Container
+			return actx, true
+		}
+	}
+	if pod != "" {
+		if meta := s.podMeta(ctx, namespace, pod); meta != nil && (uid == "" || meta.UID == uid) {
+			actx.Pod = meta
+			if container != "" {
+				for i := range meta.Containers {
+					if meta.Containers[i].Name == container {
+						actx.Container = &meta.Containers[i]
+						break
+					}
+				}
+				if actx.Container == nil {
+					res.Attributes().PutStr("k8s.container.name", container)
+				}
+			}
+			return actx, true
+		}
+	}
+	return actx, false
 }
 
 func (s *Scraper) scrapeTarget(ctx context.Context, t kubemeta.ScrapeTarget) (int, error) {
@@ -307,8 +350,7 @@ func (s *Scraper) scrapeTarget(ctx context.Context, t kubemeta.ScrapeTarget) (in
 		cb = newSplitBatcher(s, ctx, t, sp, time.Now())
 	} else {
 		cb = newBatcher(func(res pcommon.Resource) {
-			res.Attributes().PutStr("url.full", t.URL)
-			s.attrsFor(pipelineTargets).Build(res, attrs.Context{Pod: &t.Pod, Service: t.Service, Node: s.nodeInfo()})
+			s.fillTargetResource(res, t.URL, &t.Pod, t.Service)
 		}, s.cfg.BatchPoints, s.cfg.StartTime, time.Now())
 	}
 	return s.parseAndExport(ctx, resp.Body, openMetrics, s.cfg.Exemplars, cb, pipelineTargets, t.URL)

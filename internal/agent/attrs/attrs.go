@@ -23,6 +23,29 @@ func ServiceName(pod kubemeta.Pod) string {
 	return name
 }
 
+// KindAttribute maps a Kubernetes object kind to its k8s.<kind>.name resource
+// attribute (e.g. "Deployment" -> "k8s.deployment.name"); ok is false for a kind
+// with no such attribute. Shared by the pod owner-chain and the events exporter.
+func KindAttribute(kind string) (string, bool) {
+	switch kind {
+	case "ReplicaSet":
+		return "k8s.replicaset.name", true
+	case "Deployment":
+		return "k8s.deployment.name", true
+	case "StatefulSet":
+		return "k8s.statefulset.name", true
+	case "DaemonSet":
+		return "k8s.daemonset.name", true
+	case "Job":
+		return "k8s.job.name", true
+	case "CronJob":
+		return "k8s.cronjob.name", true
+	case "Node":
+		return "k8s.node.name", true
+	}
+	return "", false
+}
+
 // Pod sets the pod-level resource attributes.
 func Pod(res pcommon.Resource, pod kubemeta.Pod) {
 	a := res.Attributes()
@@ -37,19 +60,8 @@ func Pod(res pcommon.Resource, pod kubemeta.Pod) {
 	}
 
 	for _, o := range pod.Owners {
-		switch o.Kind {
-		case "ReplicaSet":
-			a.PutStr("k8s.replicaset.name", o.Name)
-		case "Deployment":
-			a.PutStr("k8s.deployment.name", o.Name)
-		case "StatefulSet":
-			a.PutStr("k8s.statefulset.name", o.Name)
-		case "DaemonSet":
-			a.PutStr("k8s.daemonset.name", o.Name)
-		case "Job":
-			a.PutStr("k8s.job.name", o.Name)
-		case "CronJob":
-			a.PutStr("k8s.cronjob.name", o.Name)
+		if attr, ok := KindAttribute(o.Kind); ok {
+			a.PutStr(attr, o.Name)
 		}
 	}
 	a.PutStr("service.name", ServiceName(pod))

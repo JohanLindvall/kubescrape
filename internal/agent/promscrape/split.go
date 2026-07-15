@@ -395,10 +395,7 @@ func (b *splitBatcher) route(name string, labels []Label) (pmetric.ScopeMetrics,
 // fillSelfResource builds the target's own resource, as the plain batcher
 // would.
 func (b *splitBatcher) fillSelfResource(res pcommon.Resource) {
-	res.Attributes().PutStr("url.full", b.target.URL)
-	b.s.attrsFor(pipelineTargets).Build(res, attrs.Context{
-		Pod: &b.target.Pod, Service: b.target.Service, Node: b.s.nodeInfo(),
-	})
+	b.s.fillTargetResource(res, b.target.URL, &b.target.Pod, b.target.Service)
 }
 
 // fillSplitResource builds the resource for one identified object.
@@ -419,33 +416,10 @@ func (b *splitBatcher) fillSplitResource(res pcommon.Resource, rule *compiledSpl
 		}
 	}
 
-	ctx := attrs.Context{}
+	var ctx attrs.Context
 	resolved := false
 	if rule.enrich {
-		if containerID != "" {
-			if md := b.s.containerMeta(b.ctx, containerID); md != nil {
-				ctx.Pod, ctx.Container = &md.Pod, &md.Container
-				resolved = true
-			}
-		}
-		if !resolved && namespace != "" && pod != "" {
-			if meta := b.s.podMeta(b.ctx, namespace, pod); meta != nil &&
-				(uid == "" || meta.UID == uid) {
-				ctx.Pod = meta
-				resolved = true
-				if container != "" {
-					for i := range meta.Containers {
-						if meta.Containers[i].Name == container {
-							ctx.Container = &meta.Containers[i]
-							break
-						}
-					}
-					if ctx.Container == nil {
-						res.Attributes().PutStr("k8s.container.name", container)
-					}
-				}
-			}
-		}
+		ctx, resolved = b.s.resolveContext(b.ctx, containerID, namespace, pod, uid, container, res)
 	}
 	if !resolved {
 		// Identity from the labels, under the mapped attribute names.
@@ -555,19 +529,12 @@ func (b *splitBatcher) addNumber(s Sample, monotonic bool) {
 		}
 	})
 
-	var dp pmetric.NumberDataPoint
-	switch m.Type() {
-	case pmetric.MetricTypeSum:
-		dp = m.Sum().DataPoints().AppendEmpty()
-		dp.SetStartTimestamp(b.startTS)
-	case pmetric.MetricTypeGauge:
-		dp = m.Gauge().DataPoints().AppendEmpty()
-	default:
-		obs.ScrapeCollisions.Inc() // name claimed by a different metric shape
+	dp, ok := numberDataPoint(m, b.startTS)
+	if !ok {
 		return
 	}
 	dp.SetDoubleValue(s.Value)
-	dp.SetTimestamp(b.pointTS(s.TimestampMs))
+	dp.SetTimestamp(pointTS(s.TimestampMs, b.scrapeTS))
 	b.putSplitLabels(dp.Attributes(), rule, s.Labels, dpa)
 	if s.Exemplar != nil {
 		setExemplar(dp.Exemplars().AppendEmpty(), *s.Exemplar, b.scrapeTS)
@@ -586,7 +553,7 @@ func (b *splitBatcher) addHistogram(family string, acc *histAcc) {
 	}
 	dp := m.Histogram().DataPoints().AppendEmpty()
 	dp.SetStartTimestamp(b.startTS)
-	dp.SetTimestamp(b.pointTS(acc.ts))
+	dp.SetTimestamp(pointTS(acc.ts, b.scrapeTS))
 	fillHistogramPoint(dp, acc)
 	b.putSplitLabels(dp.Attributes(), rule, acc.labels, dpa)
 	for _, e := range acc.exemplars {
@@ -606,16 +573,9 @@ func (b *splitBatcher) addSummary(family string, acc *summAcc) {
 	}
 	dp := m.Summary().DataPoints().AppendEmpty()
 	dp.SetStartTimestamp(b.startTS)
-	dp.SetTimestamp(b.pointTS(acc.ts))
+	dp.SetTimestamp(pointTS(acc.ts, b.scrapeTS))
 	fillSummaryPoint(dp, acc)
 	b.putSplitLabels(dp.Attributes(), rule, acc.labels, dpa)
 	b.points++
 	b.bytes += summBytes(acc)
-}
-
-func (b *splitBatcher) pointTS(tsMs int64) pcommon.Timestamp {
-	if tsMs != 0 {
-		return pcommon.Timestamp(tsMs * int64(time.Millisecond))
-	}
-	return b.scrapeTS
 }

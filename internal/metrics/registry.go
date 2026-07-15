@@ -164,7 +164,12 @@ func vecKey(keys, vals []string) string {
 		// multi-label vec must not alias a netstring-encoded tuple.
 		return vals[0]
 	}
+	n := 0
+	for _, v := range vals {
+		n += len(v) + 4 // value + ':' + up to a few length digits
+	}
 	var sb strings.Builder
+	sb.Grow(n) // one allocation instead of the builder's growth reallocs
 	for _, v := range vals {
 		sb.WriteString(strconv.Itoa(len(v)))
 		sb.WriteByte(':')

@@ -58,6 +58,15 @@ func traces(service string, spans ...spanSpec) ptrace.Traces {
 		s.Status().SetCode(sp.status)
 		s.SetStartTimestamp(base)
 		s.SetEndTimestamp(base + pcommon.Timestamp(sp.dur*float64(time.Second)))
+		if sp.traceID != (pcommon.TraceID{}) {
+			s.SetTraceID(sp.traceID)
+		}
+		if sp.spanID != (pcommon.SpanID{}) {
+			s.SetSpanID(sp.spanID)
+		}
+		if sp.parentID != (pcommon.SpanID{}) {
+			s.SetParentSpanID(sp.parentID)
+		}
 		for k, v := range sp.attrs {
 			s.Attributes().PutStr(k, v)
 		}
@@ -66,11 +75,14 @@ func traces(service string, spans ...spanSpec) ptrace.Traces {
 }
 
 type spanSpec struct {
-	name   string
-	kind   ptrace.SpanKind
-	status ptrace.StatusCode
-	dur    float64
-	attrs  map[string]string
+	name     string
+	kind     ptrace.SpanKind
+	status   ptrace.StatusCode
+	dur      float64
+	attrs    map[string]string
+	traceID  pcommon.TraceID
+	spanID   pcommon.SpanID
+	parentID pcommon.SpanID
 }
 
 func dp(m pmetric.Metric) pmetric.NumberDataPointSlice { return m.Sum().DataPoints() }
@@ -173,20 +185,18 @@ func TestCardinalityCap(t *testing.T) {
 	if got := obs.SpanMetricsDropped.Value() - before; got != 2 { // "c" dropped twice
 		t.Fatalf("dropped delta = %v, want 2", got)
 	}
-	if len(g.seen) != 2 {
-		t.Fatalf("admitted tuples = %d, want 2 (cap held)", len(g.seen))
+	if len(g.series) != 2 {
+		t.Fatalf("admitted tuples = %d, want 2 (cap held)", len(g.series))
 	}
 	exp := &capExporter{}
 	_ = g.Export(context.Background(), exp, pcommon.NewResource())
 	calls, _ := exp.find("traces.span.metrics.calls")
-	// Count distinct series by span.name (counters also emit synthetic-zero
-	// points): the cap admitted a and b, never c.
 	names := map[string]bool{}
 	dps := dp(calls)
 	for i := 0; i < dps.Len(); i++ {
 		names[attr(dps.At(i).Attributes(), "span.name")] = true
 	}
-	if len(names) != 2 || names["c"] {
+	if dps.Len() != 2 || len(names) != 2 || names["c"] {
 		t.Fatalf("exported span.name series = %v, want exactly {a,b}", names)
 	}
 }
@@ -266,5 +276,137 @@ func TestDurationSkewClamped(t *testing.T) {
 	s.SetEndTimestamp(pcommon.Timestamp(50)) // end before start
 	if d := durationSeconds(s); d != 0 {
 		t.Fatalf("skewed duration = %v, want 0", d)
+	}
+}
+
+var (
+	tid1 = pcommon.TraceID([16]byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16})
+	sid1 = pcommon.SpanID([8]byte{1, 1, 1, 1, 1, 1, 1, 1})
+	sid2 = pcommon.SpanID([8]byte{2, 2, 2, 2, 2, 2, 2, 2})
+)
+
+func TestSizeCounter(t *testing.T) {
+	g := New(Config{})
+	g.Consume(traces("svc", spanSpec{
+		name: "op", kind: ptrace.SpanKindServer, status: ptrace.StatusCodeOk, dur: 0.01,
+		attrs: map[string]string{"http.route": "/api/v1/users"},
+	}))
+	exp := &capExporter{}
+	if err := g.Export(context.Background(), exp, pcommon.NewResource()); err != nil {
+		t.Fatal(err)
+	}
+	size, ok := exp.find("traces.span.metrics.size")
+	if !ok {
+		t.Fatal("size metric not exported")
+	}
+	if size.Type() != pmetric.MetricTypeSum || !size.Sum().IsMonotonic() || size.Unit() != "By" {
+		t.Fatalf("size is not a monotonic byte sum: type=%v unit=%q", size.Type(), size.Unit())
+	}
+	// name(2) + ids(24) + attr key+value.
+	want := int64(len("op") + 24 + len("http.route") + len("/api/v1/users"))
+	if got := size.Sum().DataPoints().At(0).IntValue(); got != want {
+		t.Fatalf("size = %d, want %d", got, want)
+	}
+}
+
+func TestExemplarsOnDuration(t *testing.T) {
+	g := New(Config{})
+	g.Consume(traces("svc", spanSpec{
+		name: "op", kind: ptrace.SpanKindServer, status: ptrace.StatusCodeOk, dur: 0.03,
+		traceID: tid1, spanID: sid1,
+	}))
+	exp := &capExporter{}
+	if err := g.Export(context.Background(), exp, pcommon.NewResource()); err != nil {
+		t.Fatal(err)
+	}
+	dur, _ := exp.find("traces.span.metrics.duration")
+	hp := dur.Histogram().DataPoints().At(0)
+	if hp.Exemplars().Len() != 1 {
+		t.Fatalf("exemplars = %d, want 1", hp.Exemplars().Len())
+	}
+	ex := hp.Exemplars().At(0)
+	if ex.TraceID() != tid1 || ex.SpanID() != sid1 {
+		t.Fatalf("exemplar ids = %v/%v, want %v/%v", ex.TraceID(), ex.SpanID(), tid1, sid1)
+	}
+	if ex.DoubleValue() < 0.029 || ex.DoubleValue() > 0.031 {
+		t.Fatalf("exemplar value = %v, want ~0.03", ex.DoubleValue())
+	}
+	// Exemplars are reset each export: a second export with no new spans carries
+	// none (the cumulative histogram still exports).
+	exp2 := &capExporter{}
+	_ = g.Export(context.Background(), exp2, pcommon.NewResource())
+	dur2, _ := exp2.find("traces.span.metrics.duration")
+	if n := dur2.Histogram().DataPoints().At(0).Exemplars().Len(); n != 0 {
+		t.Fatalf("exemplars after reset = %d, want 0", n)
+	}
+}
+
+func TestExemplarsDisabled(t *testing.T) {
+	no := false
+	g := New(Config{Exemplars: &no})
+	g.Consume(traces("svc", spanSpec{name: "op", kind: ptrace.SpanKindServer, status: ptrace.StatusCodeOk, dur: 0.03, traceID: tid1, spanID: sid1}))
+	exp := &capExporter{}
+	_ = g.Export(context.Background(), exp, pcommon.NewResource())
+	dur, _ := exp.find("traces.span.metrics.duration")
+	if n := dur.Histogram().DataPoints().At(0).Exemplars().Len(); n != 0 {
+		t.Fatalf("exemplars with Exemplars=false = %d, want 0", n)
+	}
+}
+
+func TestServiceGraph(t *testing.T) {
+	g := New(Config{ServiceGraphs: true})
+	// A client span in service "frontend" calling a server span in "checkout":
+	// the server span's parent is the client span. The two arrive as separate
+	// batches (order independent) — here server first, then client.
+	g.Consume(traces("checkout", spanSpec{
+		name: "POST /pay", kind: ptrace.SpanKindServer, status: ptrace.StatusCodeError, dur: 0.05,
+		traceID: tid1, spanID: sid2, parentID: sid1,
+	}))
+	g.Consume(traces("frontend", spanSpec{
+		name: "call checkout", kind: ptrace.SpanKindClient, status: ptrace.StatusCodeOk, dur: 0.06,
+		traceID: tid1, spanID: sid1,
+	}))
+
+	exp := &capExporter{}
+	if err := g.Export(context.Background(), exp, pcommon.NewResource()); err != nil {
+		t.Fatal(err)
+	}
+	total, ok := exp.find("traces.service_graph.request.total")
+	if !ok {
+		t.Fatal("service graph request.total not exported")
+	}
+	tp := total.Sum().DataPoints().At(0)
+	if attr(tp.Attributes(), "client") != "frontend" || attr(tp.Attributes(), "server") != "checkout" {
+		t.Fatalf("edge = %v, want frontend->checkout", tp.Attributes().AsRaw())
+	}
+	if tp.IntValue() != 1 {
+		t.Fatalf("request.total = %d, want 1", tp.IntValue())
+	}
+	failed, _ := exp.find("traces.service_graph.request.failed")
+	if v := failed.Sum().DataPoints().At(0).IntValue(); v != 1 {
+		t.Fatalf("request.failed = %d, want 1 (server errored)", v)
+	}
+	if _, ok := exp.find("traces.service_graph.request.server"); !ok {
+		t.Fatal("server latency histogram not exported")
+	}
+	if _, ok := exp.find("traces.service_graph.request.client"); !ok {
+		t.Fatal("client latency histogram not exported")
+	}
+	// The edge is complete, so no half-edge is left pending.
+	if n := len(g.sg.pending); n != 0 {
+		t.Fatalf("pending half-edges = %d, want 0", n)
+	}
+}
+
+func TestServiceGraphDisabledByDefault(t *testing.T) {
+	g := New(Config{})
+	if g.sg != nil {
+		t.Fatal("service graph should be nil unless ServiceGraphs is set")
+	}
+	g.Consume(traces("a", spanSpec{name: "x", kind: ptrace.SpanKindClient, status: ptrace.StatusCodeOk, dur: 0.01, traceID: tid1, spanID: sid1}))
+	exp := &capExporter{}
+	_ = g.Export(context.Background(), exp, pcommon.NewResource())
+	if _, ok := exp.find("traces.service_graph.request.total"); ok {
+		t.Fatal("service graph metrics exported when disabled")
 	}
 }

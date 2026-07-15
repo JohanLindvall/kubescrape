@@ -266,6 +266,11 @@ type file struct {
 	// archiveDone marks a compressed file read to completion; size/mod pin
 	// the on-disk identity so sweeps skip it until the file changes.
 	archiveDone bool
+	// archiveEOF: the archive has been read to EOF in this pass, so readPos is
+	// its true end. Distinguishes "delivered" from the post-rewind state, where
+	// readPos == committed == 0 makes any offset comparison trivially true —
+	// closing the fd there would drop an unlinked archive's only handle.
+	archiveEOF  bool
 	archiveSize int64
 	archiveMod  time.Time
 	inode       uint64
@@ -493,6 +498,21 @@ type rotatedPrefix struct {
 	// prefix by name — but the fd still reaches the unlinked inode. nil after a
 	// restart, where findRotated is the only route.
 	fd *os.File
+}
+
+// maxCarriedFds bounds the rotated-inode fds held for recovery across an
+// outage (see reopen).
+const maxCarriedFds = 4
+
+// retainedFds counts the carried prefixes still holding an open fd.
+func (f *file) retainedFds() int {
+	n := 0
+	for i := range f.carried {
+		if f.carried[i].fd != nil {
+			n++
+		}
+	}
+	return n
 }
 
 // closeCarried releases the rotated inodes' retained fds. Only legitimate once
@@ -1433,16 +1453,36 @@ func (t *Tailer) readFile(ctx context.Context, f *file) error {
 // discards the committed prefix; at EOF the pipeline is drained and the file
 // is done (committed == readPos means a restart discards everything).
 func (t *Tailer) readArchive(ctx context.Context, f *file) error {
+	if t.archiveReplaced(f) {
+		// Content replaced under us: the old bytes are gone from the inode, so
+		// (exactly as with a plain-file truncation) nothing about them is
+		// recoverable and joining across the boundary is meaningless. Discard
+		// the pipeline and restart the file from zero.
+		obs.LogRotations.Inc()
+		t.settle(f)
+		t.stopPipeline(ctx, f)
+		t.closeArchive(f)
+		f.committed, f.readPos, f.lineStart = 0, 0, 0
+		f.inode, f.fp = 0, fingerprint{}
+		f.archiveDone, f.archiveEOF = false, false
+		f.pending = f.pending[:0]
+		t.newPipeline(f)
+	}
 	if f.gz == nil {
+		// An fd retained for recovery (see closeArchiveReader) can go once its
+		// data has been exported; otherwise every consumed archive would leak
+		// one. Gated on archiveEOF, not on offsets alone: a rewind leaves
+		// readPos == committed, which would look "delivered" while the data is
+		// in fact still owed. Runs whether or not the archive is marked done —
+		// when the path was replaced under us archiveDone was deliberately left
+		// false, and this is what lets the next openArchive see the replacement.
+		if f.f != nil && f.archiveEOF && f.committed >= f.readPos {
+			t.closeArchive(f)
+		}
 		// A fully-consumed archive would otherwise be reopened and
 		// re-decompressed end-to-end on every poll sweep, forever; skip while
 		// the compressed file itself is unchanged.
 		if f.archiveDone {
-			// Its export has landed: the fd held for recovery can go (otherwise
-			// every consumed archive leaks one for the tailer's lifetime).
-			if f.f != nil && f.committed >= f.readPos {
-				t.closeArchive(f)
-			}
 			st, err := os.Stat(f.path)
 			if err != nil || (st.Size() == f.archiveSize && st.ModTime().Equal(f.archiveMod)) {
 				return nil // unchanged (or momentarily unstattable): stay done
@@ -1473,15 +1513,22 @@ func (t *Tailer) readArchive(ctx context.Context, f *file) error {
 		if err != nil {
 			if errors.Is(err, io.EOF) {
 				t.stopPipeline(ctx, f) // drain a trailing multi-line group
+				f.archiveEOF = true
 				if f.committed >= f.readPos {
 					t.closeArchive(f)
 				} else {
 					// Uncommitted data: hold the fd (see closeArchiveReader).
 					t.closeArchiveReader(f)
 				}
-				// Record the consumed archive's identity so idle sweeps skip
-				// it instead of re-decompressing it from scratch.
-				if st, statErr := os.Stat(f.path); statErr == nil {
+				// Record the consumed archive's identity so idle sweeps skip it
+				// instead of re-decompressing it from scratch — but ONLY if the
+				// path still names the inode we just read. When we finished a
+				// RETAINED fd (its data was uncommitted) and a replacement
+				// archive has since taken the path, stamping the replacement's
+				// size/mtime here would mark IT consumed and its lines would
+				// never be read. Leaving archiveDone false makes the next sweep
+				// open the path fresh, where the identity check resets committed.
+				if st, statErr := os.Stat(f.path); statErr == nil && inodeOf(st) == f.inode {
 					f.archiveDone = true
 					f.archiveSize = st.Size()
 					f.archiveMod = st.ModTime()
@@ -1518,6 +1565,9 @@ func (t *Tailer) openArchive(f *file) error {
 		f.readPos = f.committed
 		f.lineStart = f.committed
 		f.pending = f.pending[:0]
+		if st, err := os.Stat(f.path); err == nil {
+			f.archiveSize, f.archiveMod = st.Size(), st.ModTime()
+		}
 		return nil
 	}
 	fh, err := os.Open(f.path)
@@ -1555,8 +1605,35 @@ func (t *Tailer) openArchive(f *file) error {
 	f.readPos = f.committed
 	f.lineStart = f.committed
 	f.pending = f.pending[:0]
+	f.archiveSize, f.archiveMod = st.Size(), st.ModTime()
 	t.watchTarget(f)
 	return nil
+}
+
+// archiveReplaced reports whether the archive we hold open has been REWRITTEN
+// IN PLACE (same inode, new content: `gzip -c > x.gz`, os.WriteFile). The
+// compressed path has no equivalent of the plain path's rotation detection, and
+// its offsets are DECOMPRESSED positions — so without this, a rewrite makes the
+// reader either resume at a stale offset in the new stream (skipping its prefix
+// and splitting a line) or trip over a corrupt stream mid-member.
+//
+// It is deliberately keyed on the fingerprint of the fd WE hold, not of the
+// path: when the old archive was unlinked and a different file took its name,
+// our fd still sees the original, intact content — that data is still owed and
+// must not be discarded (openArchive keeps reading it; the EOF path declines to
+// mark the replacement consumed).
+func (t *Tailer) archiveReplaced(f *file) bool {
+	if f.f == nil {
+		return false
+	}
+	st, err := os.Stat(f.path)
+	if err != nil {
+		return false // vanished: the gone path drains it from the fd
+	}
+	if st.Size() == f.archiveSize && st.ModTime().Equal(f.archiveMod) {
+		return false // untouched since we opened it
+	}
+	return !f.fp.matches(f.f)
 }
 
 // drainArchive finishes reading a mid-read archive from its still-open fd
@@ -1805,7 +1882,18 @@ func (t *Tailer) reopen(ctx context.Context, f *file, renamed bool) {
 			_ = old.Close()
 		}
 	}()
+	// Retaining an fd per hop is unbounded otherwise: an outage spanning many
+	// rotations would exhaust RLIMIT_NOFILE and — worse — pin every rotated
+	// inode's disk space, filling the node's log volume precisely while the
+	// collector is down. Cap the fds; the prefixes themselves are kept (a
+	// rotated file that still exists is recoverable by name via findRotated).
+	// The fds are held for the OLDEST prefixes on purpose: the runtime prunes
+	// its rotation backlog oldest-first, so those are the ones for which the fd
+	// is the only remaining handle.
 	keep := func(p rotatedPrefix) rotatedPrefix {
+		if f.retainedFds() >= maxCarriedFds {
+			return p // over budget: leave old to the deferred Close
+		}
 		p.fd, old = old, nil
 		return p
 	}
@@ -2289,6 +2377,7 @@ func (t *Tailer) rewind(f *file) {
 		// even though the file is unchanged.
 		t.closeArchiveReader(f)
 		f.archiveDone = false
+		f.archiveEOF = false // the tail is owed again; see the release gate
 		f.readPos = f.committed
 		f.lineStart = f.committed
 		f.pending = f.pending[:0]
@@ -2347,9 +2436,14 @@ func (t *Tailer) saveCheckpoints() {
 	}
 	cps := make(map[string]checkpoint, len(t.files))
 	for path, f := range t.files {
-		// Extend the fingerprint once the file has grown past the initial
-		// hash length, up to the configured size.
-		if f.f != nil && f.fp.Len < int64(t.cfg.FingerprintBytes) {
+		// Extend the fingerprint once the file has grown past the initial hash
+		// length, up to the configured size — but ONLY while the head we already
+		// hashed is still there. Re-hashing unconditionally adopts whatever the
+		// head happens to be now, so a copytruncate landing between a read and
+		// this checkpoint would rewrite fp to the REPLACEMENT's head and blind
+		// the rotation guards (which compare against fp) — silently, and for
+		// every file below FingerprintBytes, i.e. every quiet container.
+		if f.f != nil && f.fp.Len < int64(t.cfg.FingerprintBytes) && f.fp.matches(f.f) {
 			if st, err := f.f.Stat(); err == nil && st.Size() > f.fp.Len {
 				if fp, err := computeFingerprint(f.f, min(int64(t.cfg.FingerprintBytes), st.Size())); err == nil {
 					f.fp = fp

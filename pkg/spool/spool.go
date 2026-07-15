@@ -155,6 +155,11 @@ type Spool struct {
 	readOff int64    // offset within segs[0] of the next unread frame
 	signal  chan struct{}
 	closed  bool
+	// loadCorrupt counts segments dropped at load for a bad or unknown header.
+	// Pop surfaces one ErrCorrupt per drop so the consumer's normal read-error
+	// counting sees it — otherwise a whole segment (up to a full SegmentBytes of
+	// records) would vanish with no signal at all.
+	loadCorrupt int
 }
 
 // Open opens or creates the spool rooted at dir.
@@ -198,31 +203,56 @@ func (s *Spool) load() error {
 			return err
 		}
 		path := s.segPath(seq)
-		version, ok, err := readSegHeader(path)
+		version, ok, corrupt, err := readSegHeader(path)
 		if err != nil {
 			return err
 		}
 		if !ok {
-			// No header, or a format this build cannot read: the spool is a
-			// transient buffer, so drop it rather than guess at its framing.
+			// No readable header, or a format this build cannot read: the spool
+			// is a transient buffer, so drop it rather than guess at its framing.
+			// A DAMAGED header (bit rot, torn create) lost real records — Pop
+			// surfaces one ErrCorrupt so the loss is counted; a merely unknown
+			// version is a deliberate format change whose data the design accepts
+			// dropping, so it stays silent.
 			_ = os.Remove(path)
+			if corrupt {
+				s.loadCorrupt++
+			}
 			continue
 		}
 		s.segs = append(s.segs, segment{seq: seq, size: info.Size(), path: path, version: version})
 	}
 	sort.Slice(s.segs, func(i, j int) bool { return s.segs[i].seq < s.segs[j].seq })
 
+	cursorSeq, cursorOff, haveCursor, err := s.loadCursor()
+	if err != nil {
+		return err
+	}
+
 	if len(s.segs) == 0 {
-		if err := s.appendSegment(1); err != nil {
+		// Every segment was dropped (a format bump or wholesale corruption).
+		// Resume numbering PAST the persisted cursor, never back at 1: segment
+		// seqs must stay monotonic across the spool's life, or a fresh segment
+		// could reuse the exact seq a stale cursor still names and be mistaken
+		// for the consumed one — deleting live, never-delivered records.
+		start := int64(1)
+		if haveCursor {
+			start = max(1, cursorSeq+1)
+		}
+		if err := s.appendSegment(start); err != nil {
 			return err
 		}
 	} else if err := s.openTail(); err != nil {
 		return err
 	}
 
-	cursorSeq, cursorOff, err := s.loadCursor()
-	if err != nil {
-		return err
+	// No valid cursor (fresh spool, or a torn rewrite): start from the oldest
+	// segment. If the cursor names a segment newer than anything on disk it is
+	// foreign or hand-corrupted — discard it and redeliver from the oldest,
+	// which is safe under at-least-once, rather than letting the removal loop
+	// below strip every segment down to the last.
+	if !haveCursor || cursorSeq > s.segs[len(s.segs)-1].seq {
+		cursorSeq, cursorOff = s.segs[0].seq, segHeaderLen
 	}
 	// Drop consumed segments (seq < cursorSeq) left behind by a crash between
 	// deleting a segment and persisting the cursor.
@@ -239,25 +269,30 @@ func (s *Spool) load() error {
 
 // readSegHeader returns the segment's format version. ok is false when the file
 // carries no magic or names a version this build cannot read.
-func readSegHeader(path string) (version uint16, ok bool, err error) {
+// readSegHeader returns the segment's format version. ok is false when the file
+// carries no magic or names a version this build cannot read. corrupt is true
+// only for a DAMAGED header (missing/wrong magic, short read) — genuine loss to
+// count; a valid-magic-but-unknown-version segment (a deliberate format bump or
+// a rollback, whose data the design accepts dropping) is ok=false, corrupt=false.
+func readSegHeader(path string) (version uint16, ok, corrupt bool, err error) {
 	f, err := os.Open(path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return 0, false, nil
+			return 0, false, false, nil
 		}
-		return 0, false, err
+		return 0, false, false, err
 	}
 	defer func() { _ = f.Close() }()
 	var buf [segHeaderLen]byte
 	n, err := f.ReadAt(buf[:], 0)
 	if err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
-		return 0, false, err
+		return 0, false, false, err
 	}
 	if n < segHeaderLen || !bytes.Equal(buf[:len(segMagic)], segMagic[:]) {
-		return 0, false, nil
+		return 0, false, true, nil // damaged header: the records are lost, count it
 	}
 	version = binary.BigEndian.Uint16(buf[len(segMagic):])
-	return version, slices.Contains(knownVersions, version), nil
+	return version, slices.Contains(knownVersions, version), false, nil
 }
 
 // openTail opens the newest segment for appending and truncates any torn tail
@@ -446,6 +481,12 @@ func (s *Spool) rollbackTail(tail *segment) {
 func (s *Spool) Pop() (data []byte, commit func(), ok bool, err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	// Report each segment dropped at load (bad/unknown header) as one corrupt
+	// read, so the caller's read-error metric accounts for the lost records.
+	if s.loadCorrupt > 0 {
+		s.loadCorrupt--
+		return nil, nil, false, fmt.Errorf("%w: unreadable segment dropped at load", ErrCorrupt)
+	}
 	// Retire fully-consumed head segments up front. commit's retire loop
 	// rightly never removes the write tail — but when the consumer was fully
 	// caught up (readOff == tail size, the healthy steady state) and an
@@ -642,18 +683,22 @@ func (s *Spool) Close() error {
 // rewritten in place: a partial write on power loss must fall back to
 // redelivering (duplicates, within at-least-once) rather than seek to a mixed
 // old/new position that silently skips undelivered frames.
-func (s *Spool) loadCursor() (seq, off int64, err error) {
+// loadCursor reads the persisted read position. found is false when no cursor
+// file exists yet or its checksum fails (a torn rewrite); the caller then starts
+// from the oldest segment. It must not reference s.segs — load() calls it before
+// the segment set is established.
+func (s *Spool) loadCursor() (seq, off int64, found bool, err error) {
 	f, err := os.OpenFile(filepath.Join(s.dir, cursorName), os.O_RDWR|os.O_CREATE, 0o644)
 	if err != nil {
-		return 0, 0, err
+		return 0, 0, false, err
 	}
 	s.cursorF = f
 	var buf [cursorLen]byte
 	n, _ := f.ReadAt(buf[:], 0)
 	if n >= cursorLen && binary.BigEndian.Uint64(buf[16:]) == cursorSum(buf[:16]) {
-		return int64(binary.BigEndian.Uint64(buf[:8])), int64(binary.BigEndian.Uint64(buf[8:16])), nil
+		return int64(binary.BigEndian.Uint64(buf[:8])), int64(binary.BigEndian.Uint64(buf[8:16])), true, nil
 	}
-	return s.segs[0].seq, segHeaderLen, nil
+	return 0, 0, false, nil
 }
 
 const cursorLen = 24 // seq(8) + offset(8) + fnv64a checksum(8)

@@ -79,13 +79,13 @@ func FromPod(p *corev1.Pod) (kubemeta.Pod, map[string]kubemeta.Container) {
 		}
 		pod.Containers = append(pod.Containers, c)
 		if c.ID != "" {
-			byID[c.ID] = c
+			byID[c.ID] = clonePorts(c) // own backing array: the model is self-contained
 		}
 		// A restarted container gets a new runtime ID; the kubelet keeps the
 		// previous incarnation in lastState. Index it too so lookups by the
 		// old ID keep resolving while the pod is alive.
 		if st != nil && st.LastTerminationState.Terminated != nil && st.LastTerminationState.Terminated.ContainerID != "" {
-			prev := c
+			prev := clonePorts(c) // a distinct incarnation: never share the current one's ports
 			prev.RuntimeID = st.LastTerminationState.Terminated.ContainerID
 			prev.ID = kubemeta.NormalizeContainerID(prev.RuntimeID)
 			prev.Ready = false
@@ -109,6 +109,17 @@ func FromPod(p *corev1.Pod) (kubemeta.Pod, map[string]kubemeta.Container) {
 		add(ec.Name, ec.Image, ec.Ports, "ephemeral")
 	}
 	return pod, byID
+}
+
+// clonePorts returns a copy of c whose Ports has its own backing array, so a
+// container value stored in a second place (byID, or a prior incarnation) never
+// shares the slice with the one appended to pod.Containers. Ports is the only
+// reference-typed field that is not already freshly allocated per view.
+func clonePorts(c kubemeta.Container) kubemeta.Container {
+	if c.Ports != nil {
+		c.Ports = append([]kubemeta.ContainerPort(nil), c.Ports...)
+	}
+	return c
 }
 
 func fillTerminated(c *kubemeta.Container, t *corev1.ContainerStateTerminated) {

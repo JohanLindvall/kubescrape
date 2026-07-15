@@ -419,6 +419,14 @@ func TestForeignFormatSegmentsDropped(t *testing.T) {
 	if _, err := os.Stat(future); !os.IsNotExist(err) {
 		t.Error("segment with an unknown version was not discarded")
 	}
+	// The magic-less "legacy" segment is surfaced as one corrupt read (its
+	// records are lost and, unlike a known format bump, a missing magic is
+	// indistinguishable from bit rot — so it is counted, not silent). The
+	// unknown-version "future" segment is a deliberate format change and stays
+	// silent.
+	if _, _, _, err := s.Pop(); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("first Pop = %v, want ErrCorrupt for the dropped magic-less segment", err)
+	}
 	// The spool still works, writing the current format.
 	if err := s.Append([]byte("fresh")); err != nil {
 		t.Fatal(err)
@@ -428,7 +436,7 @@ func TestForeignFormatSegmentsDropped(t *testing.T) {
 	} else {
 		commit()
 	}
-	version, ok, err := readSegHeader(s.segs[len(s.segs)-1].path)
+	version, ok, _, err := readSegHeader(s.segs[len(s.segs)-1].path)
 	if err != nil || !ok {
 		t.Fatalf("readSegHeader: ok=%v err=%v", ok, err)
 	}

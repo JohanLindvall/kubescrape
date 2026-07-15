@@ -170,6 +170,10 @@ spec:
             - -ingest-metrics-mode={{ .Values.agent.ingest.metricsMode }}
             - -ingest-logs-enrich={{ .Values.agent.ingest.logsEnrich }}
             - -ingest-traces={{ .Values.agent.ingest.traces }}
+            {{- if .Values.agent.ingest.spanMetrics }}
+            - -ingest-span-metrics
+            - -ingest-span-metrics-interval={{ .Values.agent.ingest.spanMetricsInterval }}
+            {{- end }}
             - -ingest-peer-ip-fallback={{ .Values.agent.ingest.peerIpFallback }}
             {{- if .Values.agent.ingest.batchItems }}
             - -ingest-batch-items={{ int64 .Values.agent.ingest.batchItems }}

@@ -81,6 +81,11 @@ agent:
     metricsMode: auto           # resource | datapoint | auto
     logsEnrich: true            # parse pushed log bodies (fills only unset fields)
     traces: true                # accept pushed traces, enrich resources, pass through
+    # Derive RED metrics (calls counter + duration histogram) from ingested
+    # spans, dimensioned by service.name/span.name/span.kind/status.code, and
+    # export them over OTLP. Tune via the agent.config traceMetrics section.
+    spanMetrics: false
+    spanMetricsInterval: 1m
     # Attribute telemetry with no container id / pod uid to the pod owning the
     # connection's peer IP (opt-in; hostNetwork senders never resolve).
     peerIpFallback: false

@@ -279,6 +279,14 @@ func (s *series) observe(lbls labels, value float64, resAccum resKey, res pcommo
 		}
 		if value <= bound {
 			s.record(samp, value)
+		} else {
+			// An observation changes the whole histogram POINT, not just the
+			// buckets it lands in: the unchanged lower buckets must still be
+			// re-emitted so the exported cumulative distribution stays complete.
+			// Mark them unexported too, or snapshot's per-bucket never-exported
+			// guard would emit ONLY the touched buckets on an idle reset/delete
+			// and silently drop the rest (a strict subset of the distribution).
+			samp.exported = false
 		}
 		samp.when = now
 	}

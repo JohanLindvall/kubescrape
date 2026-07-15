@@ -137,15 +137,16 @@ type sink[T any] struct {
 	log       *slog.Logger
 	kind      string
 	// delivered counts batches this sink has successfully exported; stuck
-	// tracks, per stuck payload, how many drain cycles it has failed and what
-	// delivered stood at when it first got stuck (see stuckTooLong).
+	// tracks, per stuck payload, its accountable failed cycles and whether the
+	// collector has delivered another batch while it was stuck (see stuckTooLong).
 	delivered uint64
 	stuck     map[uint64]stuckBatch
 }
 
 type stuckBatch struct {
-	cycles      int
-	deliveredAt uint64 // s.delivered when this payload first got stuck
+	cycles        int
+	lastDelivered uint64 // s.delivered at this payload's previous failed cycle
+	sawProgress   bool   // the collector delivered another batch while this one was stuck
 }
 
 // maxDrainCycles bounds how many drain cycles a batch may fail — while the
@@ -233,6 +234,7 @@ func (s *sink[T]) drain(ctx context.Context) {
 			s.log.Error("dropping buffered batch permanently rejected by the collector", "signal", s.kind)
 			obs.BufferDropped.WithLabelValues(s.kind).Inc()
 			commit()
+			s.forget(data) // a batch that got stuck then turned permanent must not leak its entry
 		case sendStuck:
 			// Repeated transient failures: rotate the batch to the back of the
 			// queue so one undeliverable batch cannot block the signal —
@@ -258,10 +260,21 @@ func (s *sink[T]) drain(ctx context.Context) {
 }
 
 // stuckTooLong records another failed drain cycle for this payload and reports
-// whether it should now be given up on: it must have failed maxDrainCycles
-// cycles AND the collector must have accepted some other batch since it first
-// got stuck (otherwise this is an outage, not a poison payload, and the batch
-// is retried indefinitely rather than lost).
+// whether it should now be given up on: it must have failed maxDrainCycles times
+// AFTER the collector proved — while this very batch was stuck — that it was
+// alive and still rejecting THIS payload (otherwise this is an outage, not a
+// poison payload, and the batch is retried indefinitely rather than lost).
+//
+// The evidence is sawProgress: s.delivered advancing between two of this
+// payload's own failed cycles means some OTHER batch got through while this one
+// was circling the queue failing — the collector singling this payload out. A
+// batch that fails only during a pure outage (nothing else delivering) never
+// sets it, so it is never dropped. Crucially, deliveries banked BEFORE this
+// payload got stuck, or during a recovery it merely sat behind in the queue
+// without being attempted, do not count: those advance s.delivered without any
+// stuck cycle of ours spanning them, so sawProgress stays false and a single
+// later failure cannot spend the poison budget. (The earlier cumulative
+// "deliveries since first stuck" test dropped good batches on exactly that.)
 //
 // Keying by content hash (rather than threading a counter through the spool
 // format) means the count resets on restart — which is what we want: a fresh
@@ -273,21 +286,26 @@ func (s *sink[T]) stuckTooLong(data []byte) bool {
 		s.stuck = make(map[uint64]stuckBatch)
 	}
 	st, seen := s.stuck[h]
-	if !seen {
-		if len(s.stuck) >= maxStuckTracked {
-			return false
-		}
-		st.deliveredAt = s.delivered
+	if !seen && len(s.stuck) >= maxStuckTracked {
+		return false
 	}
-	st.cycles++
+	if seen && !st.sawProgress && s.delivered > st.lastDelivered {
+		// First proof the collector is alive WHILE this batch is stuck: some other
+		// batch got through since our previous failure. The batch was already
+		// failing that previous cycle too, so credit both laps against the budget
+		// (this also keeps a genuine poison payload dropping on the same cycle as
+		// before). Deliveries banked before we got stuck, or during a recovery we
+		// merely sat behind in the queue, advance s.delivered without any stuck
+		// cycle of ours spanning them, so this never fires for them.
+		st.sawProgress = true
+		st.cycles++
+	}
+	if st.sawProgress {
+		st.cycles++ // a failure the live collector is accountable for
+	}
+	st.lastDelivered = s.delivered
 	s.stuck[h] = st
-	// Drop only after the payload has failed maxDrainCycles times AND the
-	// collector has delivered at least that many OTHER batches since this one
-	// got stuck. deliveredAt is captured at the first failure, so during an
-	// outage (s.delivered frozen) the delta stays 0 and nothing is dropped; a
-	// single delivery on a bumpy recovery is not enough either — only sustained
-	// evidence that the live collector is singling THIS payload out.
-	if st.cycles < maxDrainCycles || s.delivered-st.deliveredAt < uint64(maxDrainCycles) {
+	if st.cycles < maxDrainCycles {
 		return false
 	}
 	delete(s.stuck, h)

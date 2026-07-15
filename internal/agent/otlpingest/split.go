@@ -79,6 +79,14 @@ type metricGrouper struct {
 // per-type loops copy directly (no per-point closures — this is the ingest
 // hot path).
 func (g *metricGrouper) route(sm pmetric.ScopeMetrics, scopeIdx int, m pmetric.Metric, metricIdx int) {
+	if metricPointCount(m) == 0 {
+		// No data points to route (an empty metric, or MetricTypeEmpty): the
+		// per-type loops below would create no shell and the descriptor would be
+		// dropped. Resource mode returns the metric in place, so preserve it here
+		// too under the resource-level ID.
+		g.metric(sm, scopeIdx, m, metricIdx, g.resToken)
+		return
+	}
 	switch m.Type() {
 	case pmetric.MetricTypeGauge:
 		dps := m.Gauge().DataPoints()
@@ -116,6 +124,24 @@ func (g *metricGrouper) route(sm pmetric.ScopeMetrics, scopeIdx int, m pmetric.M
 			dp.CopyTo(dst.Summary().DataPoints().AppendEmpty())
 		}
 	}
+}
+
+// metricPointCount is the number of data points on m, across its type (0 for
+// MetricTypeEmpty).
+func metricPointCount(m pmetric.Metric) int {
+	switch m.Type() {
+	case pmetric.MetricTypeGauge:
+		return m.Gauge().DataPoints().Len()
+	case pmetric.MetricTypeSum:
+		return m.Sum().DataPoints().Len()
+	case pmetric.MetricTypeHistogram:
+		return m.Histogram().DataPoints().Len()
+	case pmetric.MetricTypeExponentialHistogram:
+		return m.ExponentialHistogram().DataPoints().Len()
+	case pmetric.MetricTypeSummary:
+		return m.Summary().DataPoints().Len()
+	}
+	return 0
 }
 
 // metricFor resolves one data point's ID (falling back to the resource-level

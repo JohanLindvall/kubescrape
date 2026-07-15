@@ -4,7 +4,6 @@ import (
 	"encoding/hex"
 	"math"
 	"slices"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -461,8 +460,22 @@ func (b *batcher) addHistogram(family string, acc *histAcc) {
 // fillHistogramPoint converts accumulated cumulative buckets into the OTLP
 // shape: bounds exclude +Inf, bucket counts are de-cumulated, the overflow
 // bucket is derived from the total count.
+// cmpFloat orders two floats for slices.SortFunc; a non-capturing comparator
+// keeps the sort closure off the heap (unlike sort.Slice, which also boxes the
+// slice and swaps via reflection).
+func cmpFloat(a, b float64) int {
+	switch {
+	case a < b:
+		return -1
+	case a > b:
+		return 1
+	default:
+		return 0
+	}
+}
+
 func fillHistogramPoint(dp pmetric.HistogramDataPoint, acc *histAcc) {
-	sort.Slice(acc.buckets, func(i, j int) bool { return acc.buckets[i].le < acc.buckets[j].le })
+	slices.SortFunc(acc.buckets, func(a, b cumBucket) int { return cmpFloat(a.le, b.le) })
 	// Deduplicate repeated le values (keep the last occurrence).
 	buckets := acc.buckets[:0]
 	for i, bk := range acc.buckets {
@@ -529,7 +542,7 @@ func fillSummaryPoint(dp pmetric.SummaryDataPoint, acc *summAcc) {
 	if acc.hasSum {
 		dp.SetSum(acc.sum)
 	}
-	sort.Slice(acc.quantiles, func(i, j int) bool { return acc.quantiles[i].q < acc.quantiles[j].q })
+	slices.SortFunc(acc.quantiles, func(a, b quantileValue) int { return cmpFloat(a.q, b.q) })
 	for _, qv := range acc.quantiles {
 		q := dp.QuantileValues().AppendEmpty()
 		q.SetQuantile(qv.q)

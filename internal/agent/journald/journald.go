@@ -51,12 +51,12 @@ type Config struct {
 	FlushInterval time.Duration // flush at least this often
 	MaxEntryBytes int           // cap on one journal message
 	// MaxBatchBytes flushes before the batch's summed message BODY bytes exceed
-	// this (default 1 MiB). It does not count enrichment attributes, resource
-	// attrs or protobuf framing, so the marshaled payload runs larger — the 1
-	// MiB default leaves ~4x headroom under a collector's 4 MiB gRPC limit, but
-	// tuning it far up with heavy enrichment (large exception.stacktrace) can
-	// push a batch past that limit, where it is rejected (transiently) and
-	// retried rather than split.
+	// this (default 1 MiB) — a soft bound that keeps a batch from growing large
+	// in memory. It counts bodies only, not enrichment attributes or framing, so
+	// the marshaled payload runs larger; the hard guarantee that no payload
+	// exceeds the collector's gRPC receive limit lives in the exporter
+	// (otlpexport.Config.MaxSendBytes), which splits an over-cap payload into
+	// parts before sending.
 	MaxBatchBytes int
 
 	// Enrich parses metadata out of each message (timestamp, severity,

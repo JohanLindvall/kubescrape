@@ -96,6 +96,9 @@ spec:
             - -otlp-timeout={{ .Values.agent.otlp.timeout }}
             - -otlp-retry-attempts={{ .Values.agent.otlp.retryAttempts }}
             - -otlp-retry-backoff={{ .Values.agent.otlp.retryBackoff }}
+            {{- with .Values.agent.otlp.maxSendBytes }}
+            - -otlp-max-send-bytes={{ int64 . }}
+            {{- end }}
             {{- if .Values.agent.otlp.bearerTokenSecret.name }}
             - -otlp-bearer-token-file=/etc/kubescrape/otlp-token/{{ .Values.agent.otlp.bearerTokenSecret.key }}
             {{- end }}

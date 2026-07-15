@@ -100,6 +100,7 @@ Pipeline toggles (all default `true`):
 | `-otlp-timeout` | `15s` | per export attempt |
 | `-otlp-retry-attempts` | `3` | tries per **metrics** export (logs retry via the tailer's rewind, see below) |
 | `-otlp-retry-backoff` | `1s` | initial backoff, doubled per attempt |
+| `-otlp-max-send-bytes` | `0` (≈3.75 MiB) | cap on one payload's encoded protobuf size; a larger payload is split into parts each within the cap before sending, so a non-chunking producer (journald, tailer) never gets a batch rejected wholesale for exceeding the collector's gRPC receive limit. Lower it if the collector's `max_recv_msg_size` is below 4 MiB; negative disables splitting |
 
 Examples:
 

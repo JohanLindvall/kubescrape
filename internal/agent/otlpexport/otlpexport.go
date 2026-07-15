@@ -63,6 +63,13 @@ type Config struct {
 	// RetryBackoff is the initial backoff between metric retries, doubled
 	// per attempt.
 	RetryBackoff time.Duration
+	// MaxSendBytes caps one exported payload's encoded (uncompressed protobuf)
+	// size; a larger payload is split into parts each within the cap before
+	// sending, so a batch that a non-chunking producer (journald, the tailer)
+	// let grow past the collector's gRPC receive limit is delivered in pieces
+	// instead of rejected wholesale. 0 uses the default (just under 4 MiB);
+	// negative disables splitting.
+	MaxSendBytes int
 }
 
 // Client exports logs and metrics to one OTLP endpoint.
@@ -96,6 +103,9 @@ func New(cfg Config) (*Client, error) {
 	}
 	if cfg.RetryBackoff <= 0 {
 		cfg.RetryBackoff = time.Second
+	}
+	if cfg.MaxSendBytes == 0 {
+		cfg.MaxSendBytes = defaultMaxSendBytes
 	}
 	switch cfg.Compression {
 	case "":
@@ -218,6 +228,19 @@ func (c *Client) exportLogsCounted(ctx context.Context, ld plog.Logs) error {
 }
 
 func (c *Client) exportLogsOnce(ctx context.Context, ld plog.Logs) error {
+	parts := splitLogs(ld, c.cfg.MaxSendBytes)
+	for _, part := range parts {
+		// A part-send failure returns immediately; the caller retries the whole
+		// payload, re-sending the parts already delivered — at-least-once
+		// tolerates the duplicates, and nothing commits until every part lands.
+		if err := c.sendLogsOnce(ctx, part); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (c *Client) sendLogsOnce(ctx context.Context, ld plog.Logs) error {
 	ctx, cancel := context.WithTimeout(ctx, c.cfg.Timeout)
 	defer cancel()
 	if c.conn != nil {
@@ -244,6 +267,15 @@ func (c *Client) ExportTraces(ctx context.Context, td ptrace.Traces) error {
 }
 
 func (c *Client) exportTracesOnce(ctx context.Context, td ptrace.Traces) error {
+	for _, part := range splitTraces(td, c.cfg.MaxSendBytes) {
+		if err := c.sendTracesOnce(ctx, part); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (c *Client) sendTracesOnce(ctx context.Context, td ptrace.Traces) error {
 	ctx, cancel := context.WithTimeout(ctx, c.cfg.Timeout)
 	defer cancel()
 	if c.conn != nil {
@@ -298,6 +330,15 @@ func (c *Client) exportMetricsCounted(ctx context.Context, md pmetric.Metrics) e
 }
 
 func (c *Client) exportMetricsOnce(ctx context.Context, md pmetric.Metrics) error {
+	for _, part := range splitMetrics(md, c.cfg.MaxSendBytes) {
+		if err := c.sendMetricsOnce(ctx, part); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (c *Client) sendMetricsOnce(ctx context.Context, md pmetric.Metrics) error {
 	ctx, cancel := context.WithTimeout(ctx, c.cfg.Timeout)
 	defer cancel()
 	if c.conn != nil {

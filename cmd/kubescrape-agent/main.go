@@ -63,6 +63,7 @@ func run() error {
 		otlpTimeout          = flag.Duration("otlp-timeout", 15*time.Second, "per-export-attempt timeout")
 		otlpRetries          = flag.Int("otlp-retry-attempts", 3, "tries per metrics export (logs retry via the tailer's rewind)")
 		otlpBackoff          = flag.Duration("otlp-retry-backoff", time.Second, "initial backoff between metric export retries, doubled per attempt")
+		otlpMaxSendBytes     = flag.Int("otlp-max-send-bytes", 0, "cap on one exported payload's encoded protobuf size; a larger payload is split into parts before sending (0 = default ~3.75 MiB, under the 4 MiB gRPC limit; negative disables)")
 
 		logLevel  = flag.String("log-level", "info", "log level: debug, info, warn, error")
 		logFormat = flag.String("log-format", "text", "log format: text or json")
@@ -233,6 +234,7 @@ func run() error {
 		Timeout:            *otlpTimeout,
 		RetryAttempts:      *otlpRetries,
 		RetryBackoff:       *otlpBackoff,
+		MaxSendBytes:       *otlpMaxSendBytes,
 	})
 	if err != nil {
 		return fmt.Errorf("creating OTLP exporter: %w", err)

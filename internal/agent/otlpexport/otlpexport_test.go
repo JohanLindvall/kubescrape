@@ -326,3 +326,72 @@ func (t *tracesFakeSender) ExportTraces(context.Context, ptrace.Traces) error {
 	t.traces++
 	return nil
 }
+
+// An oversized logs payload is delivered as several POSTs, each within
+// MaxSendBytes, reassembling to the original records. This is the end-to-end
+// guarantee that a non-chunking producer's batch is never rejected wholesale.
+func TestHTTPExportSplitsOversizedLogs(t *testing.T) {
+	const cap = 16 << 10
+	var mu sync.Mutex
+	var sizes []int
+	var bodies []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reader := io.Reader(r.Body)
+		if r.Header.Get("Content-Encoding") == "gzip" {
+			zr, err := gzip.NewReader(r.Body)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			reader = zr
+		}
+		raw, _ := io.ReadAll(reader)
+		req := plogotlp.NewExportRequest()
+		if err := req.UnmarshalProto(raw); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		ld := req.Logs()
+		mu.Lock()
+		sizes = append(sizes, (&plog.ProtoMarshaler{}).LogsSize(ld))
+		for i := 0; i < ld.ResourceLogs().Len(); i++ {
+			rl := ld.ResourceLogs().At(i)
+			for j := 0; j < rl.ScopeLogs().Len(); j++ {
+				lrs := rl.ScopeLogs().At(j).LogRecords()
+				for k := 0; k < lrs.Len(); k++ {
+					bodies = append(bodies, lrs.At(k).Body().Str())
+				}
+			}
+		}
+		mu.Unlock()
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	c, err := New(Config{Endpoint: srv.URL, Protocol: "http", Timeout: 5 * time.Second,
+		Compression: "none", MaxSendBytes: cap})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = c.Close() }()
+
+	// One resource, many records: forces a within-resource split.
+	ld := buildLogs(1, 2000, 60)
+	if err := c.ExportLogs(context.Background(), ld); err != nil {
+		t.Fatal(err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(sizes) < 2 {
+		t.Fatalf("oversized payload arrived in %d POST(s), want it split into several", len(sizes))
+	}
+	for i, sz := range sizes {
+		if sz > cap {
+			t.Errorf("POST %d was %d bytes, over the %d cap", i, sz, cap)
+		}
+	}
+	if got := len(bodies); got != 2000 {
+		t.Fatalf("reassembled %d records, want 2000 (none lost or duplicated)", got)
+	}
+}

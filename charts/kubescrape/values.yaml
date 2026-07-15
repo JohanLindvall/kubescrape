@@ -111,6 +111,11 @@ agent:
     retryAttempts: 3
     retryBackoff: 1s
     timeout: 15s
+    # Cap on one exported payload's encoded protobuf size; a larger payload is
+    # split into parts before sending. 0 = default (~3.75 MiB, under the 4 MiB
+    # gRPC receive limit). Lower it if your collector's max_recv_msg_size is
+    # smaller. Rendered with int64 to avoid scientific notation.
+    maxSendBytes: 0
     # Bearer token from a Secret, mounted and passed via
     # -otlp-bearer-token-file.
     bearerTokenSecret:

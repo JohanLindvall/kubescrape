@@ -249,55 +249,66 @@ func (s *sigBatch[T]) run(ctx context.Context) {
 		accN = 0
 		accBytes = 0
 	}
+	// drainAndReturn refuses new input, then delivers what was already acked to
+	// senders (bounded by drainTimeout) and flushes. Once closed is set under the
+	// write lock no enqueue send can be in flight, so draining the channel until
+	// empty is exact.
+	drainAndReturn := func() {
+		s.mu.Lock()
+		s.closed = true
+		s.mu.Unlock()
+		deadline := time.Now().Add(s.drainTimeout)
+		dropped := 0
+		for {
+			select {
+			case v := <-s.ch:
+				if time.Now().After(deadline) {
+					// The backlog cannot be delivered inside the grace period.
+					// Keep draining so nothing is left unaccounted, but count what
+					// dies here instead of being SIGKILLed with it silently queued.
+					obs.IngestDropped.WithLabelValues(s.kind).Inc()
+					dropped += s.count(v)
+					continue
+				}
+				// The drain honors the same items/byte chunking as the live path:
+				// merging everything into one payload could exceed the collector's
+				// recv limit.
+				n := s.count(v)
+				sz := s.size(v)
+				if accN > 0 && (accN+n > s.items || accBytes+sz > s.maxBytes) {
+					flush()
+				}
+				s.merge(acc, v)
+				accN += n
+				accBytes += sz
+			default:
+				if accN > 0 && time.Now().After(deadline) {
+					obs.IngestDropped.WithLabelValues(s.kind).Inc()
+					dropped += accN
+				} else {
+					flush()
+				}
+				if dropped > 0 {
+					s.log.Error("ingest shutdown drain deadline exceeded, dropping acknowledged payloads",
+						"signal", s.kind, "records", dropped, "deadline", s.drainTimeout)
+				}
+				return
+			}
+		}
+	}
 	for {
+		// Prioritize shutdown: once ctx is done, go straight to the bounded drain
+		// rather than letting the select below nondeterministically process more
+		// queued payloads via the live path — each a full export attempt against a
+		// possibly-dead collector, which delays shutdown past the drain deadline.
+		if ctx.Err() != nil {
+			drainAndReturn()
+			return
+		}
 		select {
 		case <-ctx.Done():
-			// Refuse new input, then drain what was already acknowledged to
-			// senders and flush. Once closed is set under the write lock no
-			// enqueue send can be in flight, so draining the channel until
-			// empty is exact.
-			s.mu.Lock()
-			s.closed = true
-			s.mu.Unlock()
-			deadline := time.Now().Add(s.drainTimeout)
-			dropped := 0
-			for {
-				select {
-				case v := <-s.ch:
-					if time.Now().After(deadline) {
-						// The backlog cannot be delivered inside the grace
-						// period. Keep draining so nothing is left unaccounted,
-						// but count what dies here instead of being SIGKILLed
-						// with it silently in the queue.
-						obs.IngestDropped.WithLabelValues(s.kind).Inc()
-						dropped += s.count(v)
-						continue
-					}
-					// The drain honors the same items/byte chunking as the
-					// live path: merging everything into one payload could
-					// exceed the collector's recv limit.
-					n := s.count(v)
-					sz := s.size(v)
-					if accN > 0 && (accN+n > s.items || accBytes+sz > s.maxBytes) {
-						flush()
-					}
-					s.merge(acc, v)
-					accN += n
-					accBytes += sz
-				default:
-					if accN > 0 && time.Now().After(deadline) {
-						obs.IngestDropped.WithLabelValues(s.kind).Inc()
-						dropped += accN
-					} else {
-						flush()
-					}
-					if dropped > 0 {
-						s.log.Error("ingest shutdown drain deadline exceeded, dropping acknowledged payloads",
-							"signal", s.kind, "records", dropped, "deadline", s.drainTimeout)
-					}
-					return
-				}
-			}
+			drainAndReturn()
+			return
 		case v := <-s.ch:
 			n := s.count(v)
 			// The merged payload's encoded size is exactly the sum of the

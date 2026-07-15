@@ -29,6 +29,7 @@ import (
 	"bytes"
 	"errors"
 	"io"
+	"math"
 	"strconv"
 	"strings"
 	"sync"
@@ -624,7 +625,9 @@ func (p *Parser) parseTimestampToken(rest []byte) (int64, []byte, bool) {
 	tok := string(rest[:i])
 	if p.openMetrics {
 		f, err := strconv.ParseFloat(tok, 64)
-		if err != nil {
+		if err != nil || math.IsInf(f, 0) || math.IsNaN(f) {
+			// A non-finite timestamp (NaN/±Inf parses without error) would become
+			// int64-min after the *1000 conversion; reject the token like Prometheus.
 			return 0, nil, false
 		}
 		return int64(f * 1000), rest[i:], true

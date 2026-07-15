@@ -436,8 +436,17 @@ func compileRule(d *Dynamic, cfg *setConfig, shared map[string]*series) (*metric
 		return nil, fmt.Errorf("metric rule has no name")
 	}
 	if kind == kindHistogram {
-		if cap := cardinalityCap(d.MaxCardinality); cap < len(d.Buckets)+1 {
-			return nil, fmt.Errorf("metric %q: maxCardinality %d is below the histogram's %d bucket streams — nothing could ever be admitted", d.Name, cap, len(d.Buckets)+1)
+		// Guard against the EFFECTIVE bucket count: an empty Buckets is replaced by
+		// defaultBuckets in newSeries, so checking len(d.Buckets)+1 (==1 when empty)
+		// would pass a maxCardinality below the real stream count and then admit
+		// nothing at all (the all-or-nothing histogram pre-pass rejects every
+		// observation) — silent total data loss instead of this compile-time error.
+		streams := len(d.Buckets) + 1
+		if len(d.Buckets) == 0 {
+			streams = len(defaultBuckets) + 1
+		}
+		if cap := cardinalityCap(d.MaxCardinality); cap < streams {
+			return nil, fmt.Errorf("metric %q: maxCardinality %d is below the histogram's %d bucket streams — nothing could ever be admitted", d.Name, cap, streams)
 		}
 	}
 	if existing, ok := shared[name]; ok {
@@ -457,6 +466,13 @@ func compileRule(d *Dynamic, cfg *setConfig, shared map[string]*series) (*metric
 			log:        cfg.log,
 		})
 		shared[name] = rule.series
+	}
+	// A rule that must read a value but names no value source (no `value`, no
+	// `valueRegexp`) resolves the empty key to nothing on every line and records
+	// zero data — a silent misconfiguration. Reject it at compile time. Gauge
+	// inc/dec/count tally lines and legitimately need no value.
+	if rule.needsValue() && rule.value == "" && rule.valueRe == nil {
+		return nil, fmt.Errorf("metric %q: type %q needs a value source — set `value` or `valueRegexp`", d.Name, d.Type)
 	}
 	return rule, nil
 }

@@ -233,8 +233,15 @@ func (e *Exporter) convert(batch []*corev1.Event) plog.Logs {
 		}
 		a := lr.Attributes()
 		a.PutStr("k8s.event.reason", ev.Reason)
-		if ev.Count > 1 {
-			a.PutInt("k8s.event.count", int64(ev.Count))
+		// Modern events.k8s.io/v1 recorders keep the legacy Count at zero and put
+		// occurrence multiplicity in Series.Count (see seriesCount, also used to
+		// decide re-emission). Take the larger so a series event keeps its count.
+		count := ev.Count
+		if sc := seriesCount(ev); sc > count {
+			count = sc
+		}
+		if count > 1 {
+			a.PutInt("k8s.event.count", int64(count))
 		}
 		if src := ev.Source.Component; src != "" {
 			a.PutStr("k8s.event.reporting_component", src)

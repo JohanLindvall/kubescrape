@@ -2,19 +2,23 @@
 // OTLP trace spans, following the OpenTelemetry spanmetrics conventions: a
 // monotonic `calls` counter, a `size` counter (span bytes), and a `duration`
 // histogram (seconds, with trace-id exemplars), dimensioned by service.name /
-// span.name / span.kind / status.code plus configurable extra attributes. With
-// ServiceGraphs it additionally derives service-graph edge metrics (see
-// servicegraph.go).
+// span.name / span.kind / status.code plus configurable extra attributes.
 //
 // It plugs into the agent's OTLP-ingest traces path as a TracesExporter tap —
 // spans are aggregated as a side effect and still forwarded — and the metrics
-// are exported over OTLP on an interval like every other agent metric.
+// are exported over OTLP on an interval like every other agent metric. Each span
+// is aggregated independently, so a node-local agent (which only sees the spans
+// pushed to its node) still produces correct per-service RED metrics; Prometheus
+// sums the cumulative counters across agents. (Service-graph edge metrics, which
+// require pairing a request's client and server spans, are deliberately NOT
+// derived here — those two spans usually land on different nodes' agents, so a
+// single agent never sees both halves.)
 //
 // The generator is a self-contained cumulative aggregator (not the shared
 // metrics.Registry): exemplars are a histogram-data-point feature the Registry
-// cannot express, and owning the aggregation also gives the size counter, units,
-// and the service-graph pairing a single coherent home. A cardinality cap bounds
-// the data-driven label sets.
+// cannot express, and owning the aggregation also gives the size counter and
+// units a single coherent home. A cardinality cap bounds the data-driven label
+// sets.
 package spanmetrics
 
 import (
@@ -22,7 +26,6 @@ import (
 	"log/slog"
 	"sort"
 	"strconv"
-	"strings"
 	"sync"
 	"time"
 
@@ -75,13 +78,6 @@ type Config struct {
 	// Exemplars attaches a trace/span-id exemplar (one per latency bucket, reset
 	// each export) to the duration histogram. nil defaults to true.
 	Exemplars *bool `json:"exemplars,omitempty"`
-	// ServiceGraphs additionally derives service-graph edge metrics (request and
-	// error counts, client/server latency per client→server pair) by pairing a
-	// client span with its child server span.
-	ServiceGraphs bool `json:"serviceGraphs,omitempty"`
-	// ServiceGraphBuckets are the edge-latency histogram boundaries in SECONDS
-	// (default: the span-metrics latency buckets).
-	ServiceGraphBuckets []float64 `json:"serviceGraphBuckets,omitempty"`
 }
 
 // Generator aggregates spans into calls/size/duration metrics (and optional
@@ -97,8 +93,6 @@ type Generator struct {
 	mu     sync.Mutex
 	series map[string]*spanSeries
 	start  time.Time
-
-	sg *serviceGraph // nil unless ServiceGraphs
 }
 
 type spanSeries struct {
@@ -144,9 +138,6 @@ func New(cfg Config) *Generator {
 		series:    make(map[string]*spanSeries),
 		start:     time.Now(),
 	}
-	if cfg.ServiceGraphs {
-		g.sg = newServiceGraph(boundsOrDefault(cfg.ServiceGraphBuckets), maxCard)
-	}
 	return g
 }
 
@@ -172,36 +163,43 @@ func (g *Generator) Consume(td ptrace.Traces) {
 		for j := 0; j < sss.Len(); j++ {
 			spans := sss.At(j).Spans()
 			for k := 0; k < spans.Len(); k++ {
-				span := spans.At(k)
-				g.observe(span, resAttrs, svc)
-				if g.sg != nil {
-					g.sg.consume(span, svc)
-				}
+				g.observe(spans.At(k), resAttrs, svc)
 			}
 		}
 	}
 }
 
 func (g *Generator) observe(span ptrace.Span, resAttrs pcommon.Map, svc string) {
-	vals := make([]string, 0, len(g.names))
-	vals = append(vals, svc, span.Name(), span.Kind().String(), span.Status().Code().String())
-	for _, key := range g.extra {
-		v := attrStr(span.Attributes(), key)
+	// Build the map key on the stack (does not escape → the map[string(key)]
+	// lookup allocates nothing for a warm series). A key over keyScratch bytes
+	// falls back to a one-off heap grow.
+	var keyScratch [256]byte
+	key := keyScratch[:0]
+	key = appendKeyPart(key, svc)
+	key = appendKeyPart(key, span.Name())
+	key = appendKeyPart(key, span.Kind().String())
+	key = appendKeyPart(key, span.Status().Code().String())
+	for _, k := range g.extra {
+		v := attrStr(span.Attributes(), k)
 		if v == "" {
-			v = attrStr(resAttrs, key) // fall back to the resource
+			v = attrStr(resAttrs, k) // fall back to the resource
 		}
-		vals = append(vals, v)
+		key = appendKeyPart(key, v)
 	}
 	d := durationSeconds(span)
 	sz := spanSize(span)
 	idx := bucketIndex(g.bounds, d)
 
 	g.mu.Lock()
-	s := g.admit(vals)
-	if s == nil {
-		g.mu.Unlock()
-		obs.SpanMetricsDropped.Inc()
-		return
+	s, ok := g.series[string(key)]
+	if !ok {
+		if len(g.series) >= g.maxCard {
+			g.mu.Unlock()
+			obs.SpanMetricsDropped.Inc()
+			return
+		}
+		s = &spanSeries{dims: g.dims(span, resAttrs, svc), buckets: make([]uint64, len(g.bounds)+1)}
+		g.series[string(key)] = s
 	}
 	s.calls++
 	s.size += sz
@@ -219,20 +217,18 @@ func (g *Generator) observe(span ptrace.Span, resAttrs pcommon.Map, svc string) 
 	g.mu.Unlock()
 }
 
-// admit returns the series for vals, creating it while under the cardinality cap;
-// nil when the cap is reached. The caller holds g.mu. vals is fresh per span, so
-// it is retained as the series' dimension values without a copy.
-func (g *Generator) admit(vals []string) *spanSeries {
-	key := tupleKey(vals)
-	if s, ok := g.series[key]; ok {
-		return s
+// dims materializes the dimension values for a new series (cold path).
+func (g *Generator) dims(span ptrace.Span, resAttrs pcommon.Map, svc string) []string {
+	vals := make([]string, 0, len(g.names))
+	vals = append(vals, svc, span.Name(), span.Kind().String(), span.Status().Code().String())
+	for _, k := range g.extra {
+		v := attrStr(span.Attributes(), k)
+		if v == "" {
+			v = attrStr(resAttrs, k)
+		}
+		vals = append(vals, v)
 	}
-	if len(g.series) >= g.maxCard {
-		return nil
-	}
-	s := &spanSeries{dims: vals, buckets: make([]uint64, len(g.bounds)+1)}
-	g.series[key] = s
-	return s
+	return vals
 }
 
 // Run exports every interval until ctx is done, then once more.
@@ -279,9 +275,6 @@ func (g *Generator) render(res pcommon.Resource, now time.Time) pmetric.Metrics 
 	ts := pcommon.NewTimestampFromTime(now)
 
 	g.renderRED(sm, start, ts)
-	if g.sg != nil {
-		g.sg.appendMetrics(sm, start, ts, now)
-	}
 	if sm.Metrics().Len() == 0 {
 		return empty // nothing to send this cycle
 	}
@@ -459,19 +452,11 @@ func histMetric(sm pmetric.ScopeMetrics, name, desc string) pmetric.HistogramDat
 	return h.DataPoints()
 }
 
-// tupleKey is a collision-proof key for the cardinality map: values are
-// length-prefixed so ("a","bc") and ("ab","c") never collide.
-func tupleKey(vals []string) string {
-	n := 0
-	for _, v := range vals {
-		n += len(v) + 4 // value + ':' + up to a few length digits
-	}
-	var sb strings.Builder
-	sb.Grow(n) // one allocation instead of the builder's growth reallocs
-	for _, v := range vals {
-		sb.WriteString(strconv.Itoa(len(v)))
-		sb.WriteByte(':')
-		sb.WriteString(v)
-	}
-	return sb.String()
+// appendKeyPart appends one length-prefixed value to a map key so distinct tuples
+// never collide (("a","bc") vs ("ab","c")). Building the key on a stack buffer and
+// looking up via map[string(key)] keeps a warm series allocation-free.
+func appendKeyPart(dst []byte, v string) []byte {
+	dst = strconv.AppendInt(dst, int64(len(v)), 10)
+	dst = append(dst, ':')
+	return append(dst, v...)
 }

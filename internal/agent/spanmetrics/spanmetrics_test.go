@@ -282,7 +282,6 @@ func TestDurationSkewClamped(t *testing.T) {
 var (
 	tid1 = pcommon.TraceID([16]byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16})
 	sid1 = pcommon.SpanID([8]byte{1, 1, 1, 1, 1, 1, 1, 1})
-	sid2 = pcommon.SpanID([8]byte{2, 2, 2, 2, 2, 2, 2, 2})
 )
 
 func TestSizeCounter(t *testing.T) {
@@ -350,63 +349,5 @@ func TestExemplarsDisabled(t *testing.T) {
 	dur, _ := exp.find("traces.span.metrics.duration")
 	if n := dur.Histogram().DataPoints().At(0).Exemplars().Len(); n != 0 {
 		t.Fatalf("exemplars with Exemplars=false = %d, want 0", n)
-	}
-}
-
-func TestServiceGraph(t *testing.T) {
-	g := New(Config{ServiceGraphs: true})
-	// A client span in service "frontend" calling a server span in "checkout":
-	// the server span's parent is the client span. The two arrive as separate
-	// batches (order independent) — here server first, then client.
-	g.Consume(traces("checkout", spanSpec{
-		name: "POST /pay", kind: ptrace.SpanKindServer, status: ptrace.StatusCodeError, dur: 0.05,
-		traceID: tid1, spanID: sid2, parentID: sid1,
-	}))
-	g.Consume(traces("frontend", spanSpec{
-		name: "call checkout", kind: ptrace.SpanKindClient, status: ptrace.StatusCodeOk, dur: 0.06,
-		traceID: tid1, spanID: sid1,
-	}))
-
-	exp := &capExporter{}
-	if err := g.Export(context.Background(), exp, pcommon.NewResource()); err != nil {
-		t.Fatal(err)
-	}
-	total, ok := exp.find("traces.service_graph.request.total")
-	if !ok {
-		t.Fatal("service graph request.total not exported")
-	}
-	tp := total.Sum().DataPoints().At(0)
-	if attr(tp.Attributes(), "client") != "frontend" || attr(tp.Attributes(), "server") != "checkout" {
-		t.Fatalf("edge = %v, want frontend->checkout", tp.Attributes().AsRaw())
-	}
-	if tp.IntValue() != 1 {
-		t.Fatalf("request.total = %d, want 1", tp.IntValue())
-	}
-	failed, _ := exp.find("traces.service_graph.request.failed")
-	if v := failed.Sum().DataPoints().At(0).IntValue(); v != 1 {
-		t.Fatalf("request.failed = %d, want 1 (server errored)", v)
-	}
-	if _, ok := exp.find("traces.service_graph.request.server"); !ok {
-		t.Fatal("server latency histogram not exported")
-	}
-	if _, ok := exp.find("traces.service_graph.request.client"); !ok {
-		t.Fatal("client latency histogram not exported")
-	}
-	// The edge is complete, so no half-edge is left pending.
-	if n := len(g.sg.pending); n != 0 {
-		t.Fatalf("pending half-edges = %d, want 0", n)
-	}
-}
-
-func TestServiceGraphDisabledByDefault(t *testing.T) {
-	g := New(Config{})
-	if g.sg != nil {
-		t.Fatal("service graph should be nil unless ServiceGraphs is set")
-	}
-	g.Consume(traces("a", spanSpec{name: "x", kind: ptrace.SpanKindClient, status: ptrace.StatusCodeOk, dur: 0.01, traceID: tid1, spanID: sid1}))
-	exp := &capExporter{}
-	_ = g.Export(context.Background(), exp, pcommon.NewResource())
-	if _, ok := exp.find("traces.service_graph.request.total"); ok {
-		t.Fatal("service graph metrics exported when disabled")
 	}
 }

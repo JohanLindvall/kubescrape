@@ -99,10 +99,6 @@ var (
 		"Acknowledged ingest batches dropped: permanent collector rejection or the transient-retry limit exhausted.", "signal")
 	SpanMetricsDropped = Registry.Counter("kubescrape_span_metrics_dropped_total",
 		"Spans not aggregated into span metrics because the dimension-cardinality cap was reached.")
-	ServiceGraphDropped = Registry.Counter("kubescrape_service_graph_dropped_total",
-		"Service-graph half-edges or edges not recorded because the cardinality cap was reached.")
-	ServiceGraphUnpaired = Registry.Counter("kubescrape_service_graph_unpaired_total",
-		"Service-graph half-edges dropped because their counterpart span never arrived within the TTL.")
 )
 
 // Journald drops (agent).

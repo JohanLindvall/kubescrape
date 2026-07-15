@@ -85,8 +85,7 @@ agent:
     # duration histogram with trace-id exemplars), dimensioned by
     # service.name/span.name/span.kind/status.code, and export them over OTLP.
     # Tune via the agent.config traceMetrics section (namePrefix / buckets /
-    # dimensions / maxCardinality / exemplars / serviceGraphs — the last also
-    # emits client→server request/error/latency edge metrics).
+    # dimensions / maxCardinality / exemplars).
     spanMetrics: false
     spanMetricsInterval: 1m
     # Attribute telemetry with no container id / pod uid to the pod owning the

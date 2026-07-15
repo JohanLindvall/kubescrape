@@ -1,9 +1,71 @@
 package metrics
 
 import (
+	"context"
 	"testing"
 	"time"
 )
+
+// TestHistogramIdleEmitThroughExport is the end-to-end counterpart to
+// TestHistogramIdleEmitKeepsAllBuckets: it drives the partial-emit scenario
+// through the real Dynamic.Add + Export (OTLP) path and asserts the RENDERED
+// histogram point carries the complete, correct distribution across an idle
+// reset — not just the buckets the last observation touched.
+func TestHistogramIdleEmitThroughExport(t *testing.T) {
+	t0 := int64(1_700_800_000)
+	setTimeForTest(time.Unix(t0, 0))
+	defer testEpoch.Store(0)
+
+	set, err := NewDynamicMetricSet([]Dynamic{{
+		Name:    "lat_seconds",
+		Type:    HistogramType,
+		Value:   "d",
+		Buckets: []float64{1, 5, 7.5, 10},
+		MaxAge:  "30s", // shorter than the (75s) export gap below — the trigger
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	add := func(v string) {
+		set.Add(valuesFrom(map[string]string{"d": v}), labelsFrom(map[string]string{"d": v}), noRes(), "")
+	}
+
+	add("5") // (1,5]
+	if err := set.Export(context.Background(), &capExporter{}, 0); err != nil {
+		t.Fatal(err) // full export; marks buckets exported
+	}
+	setTimeForTest(time.Unix(t0+15, 0))
+	add("8") // (7.5,10] — touches only the upper buckets
+	setTimeForTest(time.Unix(t0+75, 0))
+	idle := &capExporter{} // inspect the idle export in isolation
+	if err := set.Export(context.Background(), idle, 0); err != nil {
+		t.Fatal(err) // idle reset: the point must still carry all buckets
+	}
+
+	m, ok := idle.find("lat_seconds")
+	if !ok {
+		t.Fatal("histogram not exported on the idle reset")
+	}
+	dp := m.Histogram().DataPoints().At(0)
+	if dp.Count() != 2 {
+		t.Fatalf("count = %d, want 2 (both observations)", dp.Count())
+	}
+	if s := dp.Sum(); s < 12.9 || s > 13.1 {
+		t.Fatalf("sum = %v, want 13 (5+8)", s)
+	}
+	// Absolute bucket counts [le1, (1,5], (5,7.5], (7.5,10], +Inf]: the value-5
+	// observation must sit in (1,5], not be dropped or misplaced up to (7.5,10].
+	got := dp.BucketCounts().AsRaw()
+	want := []uint64{0, 1, 0, 1, 0}
+	if len(got) != len(want) {
+		t.Fatalf("bucket counts = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("bucket counts = %v, want %v (value-5 lost from (1,5])", got, want)
+		}
+	}
+}
 
 // TestHistogramIdleEmitKeepsAllBuckets is the regression test for the partial
 // histogram emit: with the export interval longer than maxAge, an observation

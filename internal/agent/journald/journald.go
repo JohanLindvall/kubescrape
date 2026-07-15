@@ -50,7 +50,14 @@ type Config struct {
 	BatchSize     int           // flush after this many entries
 	FlushInterval time.Duration // flush at least this often
 	MaxEntryBytes int           // cap on one journal message
-	MaxBatchBytes int           // flush before a batch's summed bodies exceed this (default 1 MiB)
+	// MaxBatchBytes flushes before the batch's summed message BODY bytes exceed
+	// this (default 1 MiB). It does not count enrichment attributes, resource
+	// attrs or protobuf framing, so the marshaled payload runs larger — the 1
+	// MiB default leaves ~4x headroom under a collector's 4 MiB gRPC limit, but
+	// tuning it far up with heavy enrichment (large exception.stacktrace) can
+	// push a batch past that limit, where it is rejected (transiently) and
+	// retried rather than split.
+	MaxBatchBytes int
 
 	// Enrich parses metadata out of each message (timestamp, severity,
 	// trace/span IDs, exception details, ...) into the record's OTLP fields
@@ -272,9 +279,6 @@ func (r *Reader) stream(ctx context.Context) error {
 				}
 			}
 			body, origLen := r.sanitize(e.fields["MESSAGE"])
-			if origLen > 0 {
-				obs.JournalTruncated.Inc()
-			}
 			// Flush BEFORE the entry that would push the batch over the byte
 			// cap. A single entry already over the cap still exports alone
 			// (entries are never split), so one payload can exceed it by up
@@ -360,6 +364,18 @@ func (r *Reader) flush(ctx context.Context) error {
 		return fmt.Errorf("exporting journal batch: %w", err)
 	}
 	obs.JournalEntries.Add(float64(len(r.batch)))
+	// Count truncations here, not at read time: a batch whose export fails is
+	// re-read from the committed cursor and re-sanitized, so a per-read counter
+	// would double-count. Like JournalEntries, this reflects delivered records.
+	truncated := 0
+	for i := range r.batch {
+		if r.batch[i].origLen > 0 {
+			truncated++
+		}
+	}
+	if truncated > 0 {
+		obs.JournalTruncated.Add(float64(truncated))
+	}
 	r.settleBatch()
 	return nil
 }

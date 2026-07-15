@@ -45,6 +45,18 @@ func main() {
 	}
 }
 
+// agentSelfResource is the agent's own OTLP resource identity, shared by its
+// self-metrics and span-metrics exporters (a described service is carried as a
+// data-point dimension, not on this resource).
+func agentSelfResource(node string) pcommon.Resource {
+	res := pcommon.NewResource()
+	a := res.Attributes()
+	a.PutStr("service.name", "kubescrape-agent")
+	a.PutStr("k8s.node.name", node)
+	attrs.Identity(res)
+	return res
+}
+
 func run() error {
 	var (
 		configFile           = flag.String("config", "", "unified YAML config file with resourceAttributes, logs, logAttributes, logMetrics and metrics sections (each mirrors its former standalone file)")
@@ -274,11 +286,7 @@ func run() error {
 	}
 
 	if *selfMetricsIntv > 0 {
-		res := pcommon.NewResource()
-		a := res.Attributes()
-		a.PutStr("service.name", "kubescrape-agent")
-		a.PutStr("k8s.node.name", *nodeName)
-		attrs.Identity(res)
+		res := agentSelfResource(*nodeName)
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -440,11 +448,7 @@ func run() error {
 				// Tap the forward path: the generator aggregates each enriched
 				// batch, then hands it on unchanged.
 				ingestTraceOut = gen.Tap(ingestTraceOut)
-				res := pcommon.NewResource()
-				ra := res.Attributes()
-				ra.PutStr("service.name", "kubescrape-agent")
-				ra.PutStr("k8s.node.name", *nodeName)
-				attrs.Identity(res)
+				res := agentSelfResource(*nodeName)
 				wg.Add(1)
 				go func() {
 					defer wg.Done()

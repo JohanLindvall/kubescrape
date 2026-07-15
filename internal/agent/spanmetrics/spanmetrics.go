@@ -203,7 +203,12 @@ func durationSeconds(span ptrace.Span) float64 {
 // tupleKey is a collision-proof key for the cardinality set: values are
 // length-prefixed so ("a","bc") and ("ab","c") never collide.
 func tupleKey(vals []string) string {
+	n := 0
+	for _, v := range vals {
+		n += len(v) + 4 // value + ':' + up to a few length digits
+	}
 	var sb strings.Builder
+	sb.Grow(n) // one allocation instead of the builder's growth reallocs
 	for _, v := range vals {
 		sb.WriteString(strconv.Itoa(len(v)))
 		sb.WriteByte(':')

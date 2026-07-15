@@ -2322,10 +2322,34 @@ func (t *Tailer) flush(ctx context.Context) {
 		}
 	}
 
+	// Freeze the commit ceiling at BUILD time. The watermark (lowest offset still
+	// buffered in the pipeline stages) must be sampled now, not when the batch is
+	// later committed: in pipelined mode the commit is applied a flush later, by
+	// which point lines that were buffered when this batch was built may have been
+	// emitted into the NEXT, not-yet-exported batch — so the apply-time watermark
+	// no longer covers them and a live re-read would let committed advance past
+	// unexported lines. carriedDone records, per file, that its carried rotation
+	// prefix was already fully drained into THIS batch, so commitBatch may release
+	// it only when the group genuinely made it into the exported payload.
+	var carriedDone map[*file]struct{}
+	for f := range touched {
+		wm, buffered := f.watermark()
+		if off, ok := maxOffsets[f]; ok && buffered && wm < off {
+			maxOffsets[f] = wm
+		}
+		if f.carried != nil && !buffered {
+			if carriedDone == nil {
+				carriedDone = map[*file]struct{}{}
+			}
+			carriedDone[f] = struct{}{}
+		}
+	}
+
 	inf := &inflight{
 		ctx: ctx, ld: ld, kept: kept,
 		offsets: maxOffsets, gens: gens, touched: touched,
-		done: make(chan struct{}),
+		carriedDone: carriedDone,
+		done:        make(chan struct{}),
 	}
 	clear(t.batch) // unpin the exported bodies (a burst otherwise stays reachable)
 	t.batch = t.batch[:0]

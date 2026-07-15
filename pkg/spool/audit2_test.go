@@ -704,4 +704,10 @@ func TestAudit_HeaderOnlyMiddleSegment(t *testing.T) {
 	if len(got) != 2 {
 		t.Fatalf("an empty middle segment cost more than its own (empty) contents: got %v", got)
 	}
+	// The truncated middle segment's record ("bbb...") is lost — but that loss
+	// must be SURFACED as one ErrCorrupt so the agent counts it, not retired
+	// silently in retireConsumedLocked.
+	if corrupt != 1 {
+		t.Fatalf("header-only middle segment loss went uncounted: ErrCorrupt count=%d, want 1", corrupt)
+	}
 }

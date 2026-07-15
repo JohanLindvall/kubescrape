@@ -29,8 +29,12 @@ type inflight struct {
 	offsets map[*file]int64
 	gens    map[*file]int
 	touched map[*file]struct{}
-	err     error
-	done    chan struct{}
+	// carriedDone holds the touched files whose carried rotation prefix was
+	// already fully drained into this batch at BUILD time; only those may have
+	// their carried fds released once the batch exports (see flush).
+	carriedDone map[*file]struct{}
+	err         error
+	done        chan struct{}
 }
 
 // exportWorker delivers handed-off payloads; inf.err is visible to the sweep
@@ -93,19 +97,20 @@ func (t *Tailer) commitBatch(inf *inflight) {
 		if inf.gens[f] != f.gen {
 			continue // rotated since build; offsets are stale
 		}
-		if off, ok := inf.offsets[f]; ok {
-			if wm, wok := f.watermark(); wok && wm < off {
-				off = wm
-			}
-			if off > f.committed {
-				f.committed = off
-			}
+		// offsets was already clamped to the BUILD-time watermark in flush, so it
+		// never names a line still buffered when this batch was built. Re-reading
+		// f.watermark() here would be wrong in pipelined mode: the commit is
+		// applied a flush later, when those lines may sit in the next, unexported
+		// batch and the live watermark no longer holds committed back for them.
+		if off, ok := inf.offsets[f]; ok && off > f.committed {
+			f.committed = off
 		}
-		// Once the carried group has fully drained (nothing buffered), its
-		// record has been exported, so the rotated-away prefix is no longer
-		// needed for recovery.
+		// Release the carried rotation prefix only if its group was fully drained
+		// into THIS batch at build time — i.e. it really made it into the exported
+		// payload. Judging by the live watermark would fire prematurely when a
+		// concurrently-buffered stream is momentarily quiet.
 		if f.carried != nil {
-			if _, wok := f.watermark(); !wok {
+			if _, done := inf.carriedDone[f]; done {
 				f.closeCarried() // exported: the rotated inodes' fds can go
 			}
 		}

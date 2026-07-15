@@ -155,11 +155,12 @@ type Spool struct {
 	readOff int64    // offset within segs[0] of the next unread frame
 	signal  chan struct{}
 	closed  bool
-	// loadCorrupt counts segments dropped at load for a bad or unknown header.
-	// Pop surfaces one ErrCorrupt per drop so the consumer's normal read-error
-	// counting sees it — otherwise a whole segment (up to a full SegmentBytes of
-	// records) would vanish with no signal at all.
-	loadCorrupt int
+	// pendingCorrupt counts corrupt segments whose records were lost and must be
+	// surfaced: a bad/damaged header dropped at load, or a header-only middle
+	// segment (truncation damage) retired in retireConsumedLocked. Pop surfaces
+	// one ErrCorrupt per count so the consumer's normal read-error counting sees
+	// it — otherwise a whole segment of records would vanish with no signal.
+	pendingCorrupt int
 }
 
 // Open opens or creates the spool rooted at dir.
@@ -216,7 +217,7 @@ func (s *Spool) load() error {
 			// dropping, so it stays silent.
 			_ = os.Remove(path)
 			if corrupt {
-				s.loadCorrupt++
+				s.pendingCorrupt++
 			}
 			continue
 		}
@@ -481,11 +482,12 @@ func (s *Spool) rollbackTail(tail *segment) {
 func (s *Spool) Pop() (data []byte, commit func(), ok bool, err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	// Report each segment dropped at load (bad/unknown header) as one corrupt
-	// read, so the caller's read-error metric accounts for the lost records.
-	if s.loadCorrupt > 0 {
-		s.loadCorrupt--
-		return nil, nil, false, fmt.Errorf("%w: unreadable segment dropped at load", ErrCorrupt)
+	// Report each corrupt segment whose records were lost (dropped at load, or a
+	// header-only middle segment retired below) as one corrupt read, so the
+	// caller's read-error metric accounts for the lost records.
+	if s.pendingCorrupt > 0 {
+		s.pendingCorrupt--
+		return nil, nil, false, fmt.Errorf("%w: unreadable segment dropped", ErrCorrupt)
 	}
 	// Retire fully-consumed head segments up front. commit's retire loop
 	// rightly never removes the write tail — but when the consumer was fully
@@ -574,6 +576,15 @@ func (s *Spool) Pop() (data []byte, commit func(), ok bool, err error) {
 // for that).
 func (s *Spool) retireConsumedLocked() {
 	for len(s.segs) > 1 && s.readOff >= s.segs[0].size {
+		// A non-tail segment sized down to (or below) its bare header carries no
+		// frames yet is not the legitimately-empty write tail: rotation only
+		// freezes a tail once it exceeds the header (see Append), so this is
+		// truncation damage. Retiring it drops its records with readOff already
+		// at the header, so no Pop ever reads — and reports — the loss. Count it
+		// as one corrupt read, matching every other corruption path.
+		if s.segs[0].size <= segHeaderLen {
+			s.pendingCorrupt++
+		}
 		if s.readSeq == s.segs[0].seq {
 			s.dropReadHandle()
 		}

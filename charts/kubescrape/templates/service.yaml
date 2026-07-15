@@ -103,7 +103,7 @@ spec:
           {{- end }}
           ports:
             - name: http
-              containerPort: 8080
+              containerPort: {{ (split ":" .Values.service.listen)._1 | int }}
           readinessProbe:
             httpGet: {path: /readyz, port: http}
           livenessProbe:

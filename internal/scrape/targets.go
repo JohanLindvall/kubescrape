@@ -145,6 +145,13 @@ func monitorPortNumber(tp intstr.IntOrString) (int32, bool) {
 
 // monitorPodPort resolves the pod port a ServiceMonitor endpoint targets.
 func monitorPodPort(pod kubemeta.Pod, svc *services.Service, ep servicemonitors.Endpoint) (int32, bool) {
+	// An endpoint that names neither port nor targetPort resolves to nothing:
+	// prometheus-operator cannot reference a port and emits no scrape config, so
+	// we must not either. Without this guard an empty ep.Port ("") matches a
+	// Service's unnamed port by "" == "" and fabricates a phantom target.
+	if ep.Port == "" && ep.TargetPort == nil {
+		return 0, false
+	}
 	if ep.TargetPort != nil {
 		// IntValue() on a string-typed value Atoi's it ignoring the error and
 		// returns a full int, so parse and bound explicitly: "4294967297"

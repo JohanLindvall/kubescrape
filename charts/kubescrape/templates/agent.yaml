@@ -134,14 +134,14 @@ spec:
             - -logs-metrics-interval={{ . }}
             {{- end }}
             {{- with .Values.agent.logsMetrics.maxBytes }}
-            - -logs-metrics-max-bytes={{ . }}
+            - -logs-metrics-max-bytes={{ int64 . }}
             {{- end }}
             {{- with .Values.agent.logsMetrics.namePrefix }}
             - -logs-metrics-name-prefix={{ . }}
             {{- end }}
             - -logs-watch={{ .Values.agent.logsWatch }}
             - -logs-poll-interval={{ .Values.agent.logsPollInterval }}
-            - -logs-fingerprint-bytes={{ .Values.agent.logsFingerprintBytes }}
+            - -logs-fingerprint-bytes={{ int64 .Values.agent.logsFingerprintBytes }}
             - -logs-multiline={{ .Values.agent.multiline }}
             - -logs-exclude-namespaces={{ join "," .Values.agent.logsExcludeNamespaces }}
             - -scrape-interval={{ .Values.agent.scrapeInterval }}
@@ -155,7 +155,7 @@ spec:
             {{- with .Values.agent.journald.units }}
             - -journald-units={{ join "," . }}
             {{- end }}
-            - -journald-batch-size={{ .Values.agent.journald.batchSize }}
+            - -journald-batch-size={{ int64 .Values.agent.journald.batchSize }}
             - -journald-max-batch-bytes={{ int64 .Values.agent.journald.maxBatchBytes }}
             - -journald-flush-interval={{ .Values.agent.journald.flushInterval }}
             - -journald-enrich={{ .Values.agent.journald.enrich }}
@@ -169,7 +169,7 @@ spec:
             - -ingest-traces={{ .Values.agent.ingest.traces }}
             - -ingest-peer-ip-fallback={{ .Values.agent.ingest.peerIpFallback }}
             {{- if .Values.agent.ingest.batchItems }}
-            - -ingest-batch-items={{ .Values.agent.ingest.batchItems }}
+            - -ingest-batch-items={{ int64 .Values.agent.ingest.batchItems }}
             - -ingest-batch-timeout={{ .Values.agent.ingest.batchTimeout }}
             - -ingest-batch-bytes={{ int64 .Values.agent.ingest.batchBytes }}
             {{- end }}
@@ -285,5 +285,5 @@ spec:
   policyTypes: [Ingress]
   ingress:
     - ports:
-        - port: 8080
+        - port: {{ (split ":" .Values.service.listen)._1 | int }}
 {{- end }}

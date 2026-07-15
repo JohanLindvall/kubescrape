@@ -81,6 +81,8 @@ var (
 		"Journal entries exported.")
 	JournalRestarts = Registry.Counter("kubescrape_journal_restarts_total",
 		"Journal reader restarts.")
+	JournalTruncated = Registry.Counter("kubescrape_journal_truncated_total",
+		"Journal messages truncated at MaxEntryBytes (the record carries log.truncated).")
 )
 
 // Events exporter (metadata service).

@@ -117,6 +117,10 @@ type entry struct {
 	sevText  string
 	pid      int64
 	ident    string // SYSLOG_IDENTIFIER
+	// origLen is the message's byte length before truncation, or 0 if it was
+	// not truncated. A truncated record carries log.truncated + this length so a
+	// consumer can tell a cut body from a whole one.
+	origLen int
 }
 
 // New creates a Reader.
@@ -267,7 +271,10 @@ func (r *Reader) stream(ctx context.Context) error {
 					return fmt.Errorf("journal source ended")
 				}
 			}
-			body := r.sanitize(e.fields["MESSAGE"])
+			body, origLen := r.sanitize(e.fields["MESSAGE"])
+			if origLen > 0 {
+				obs.JournalTruncated.Inc()
+			}
 			// Flush BEFORE the entry that would push the batch over the byte
 			// cap. A single entry already over the cap still exports alone
 			// (entries are never split), so one payload can exceed it by up
@@ -277,7 +284,7 @@ func (r *Reader) stream(ctx context.Context) error {
 					return err
 				}
 			}
-			r.ingest(e, body)
+			r.ingest(e, body, origLen)
 			if len(r.batch) >= r.cfg.BatchSize {
 				if err := r.flush(ctx); err != nil {
 					return err
@@ -289,12 +296,12 @@ func (r *Reader) stream(ctx context.Context) error {
 
 // sanitize makes one journal message exportable: valid UTF-8 (the journal
 // stores raw bytes) and capped at MaxEntryBytes without splitting a rune.
-func (r *Reader) sanitize(msg string) string {
+func (r *Reader) sanitize(msg string) (body string, origLen int) {
 	msg = strings.ToValidUTF8(msg, "�")
 	if len(msg) > r.cfg.MaxEntryBytes {
-		msg = truncateRunes(msg, r.cfg.MaxEntryBytes)
+		return truncateRunes(msg, r.cfg.MaxEntryBytes), len(msg)
 	}
-	return msg
+	return msg, 0
 }
 
 // truncateRunes cuts s to at most n bytes on a rune boundary.
@@ -310,12 +317,13 @@ func truncateRunes(s string, n int) string {
 
 // ingest converts one raw journal entry (body already sanitized) into the
 // batch.
-func (r *Reader) ingest(re rawEntry, body string) {
+func (r *Reader) ingest(re rawEntry, body string, origLen int) {
 	e := entry{
-		unit:  re.fields["_SYSTEMD_UNIT"],
-		ident: re.fields["SYSLOG_IDENTIFIER"],
-		body:  body,
-		ts:    re.realtime,
+		unit:    re.fields["_SYSTEMD_UNIT"],
+		ident:   re.fields["SYSLOG_IDENTIFIER"],
+		body:    body,
+		ts:      re.realtime,
+		origLen: origLen,
 	}
 	if e.ts.IsZero() {
 		e.ts = time.Now()
@@ -418,6 +426,10 @@ func (r *Reader) convert() plog.Logs {
 		lr.SetSeverityNumber(e.severity)
 		lr.SetSeverityText(e.sevText)
 		lr.Body().SetStr(e.body)
+		if e.origLen > 0 {
+			lr.Attributes().PutBool("log.truncated", true)
+			lr.Attributes().PutInt("log.original_length", int64(e.origLen))
+		}
 		if e.ident != "" {
 			lr.Attributes().PutStr("syslog.identifier", e.ident)
 		}

@@ -81,6 +81,11 @@ type record struct {
 	// expireAt is zero while the pod exists in the cluster; once the pod is
 	// deleted it holds the tombstone expiry time.
 	expireAt time.Time
+	// terminating is true once the pod has a deletionTimestamp (graceful
+	// teardown in progress; phase stays Running). Such a pod's status still
+	// carries its now-recycled PodIP, so it must not steal the IP index from a
+	// live pod that legitimately holds it.
+	terminating bool
 }
 
 type containerEntry struct {
@@ -147,6 +152,7 @@ func (s *Store) UpsertPod(p *corev1.Pod) {
 	rec.ownerRefs = cloneOwnerRefs(p.OwnerReferences)
 	rec.resourceVersion = p.ResourceVersion
 	rec.expireAt = time.Time{} // resurrect if a late update follows a delete
+	rec.terminating = p.DeletionTimestamp != nil
 
 	ids := make(map[string]struct{}, len(containers))
 	for id, c := range containers {
@@ -201,10 +207,14 @@ func (s *Store) UpsertPod(p *corev1.Pod) {
 	}
 	if ip != "" {
 		// Pod IPs recycle, and a terminating pod keeps phase Running: a routine
-		// update to the OLD owner (a condition change while it drains) must not
-		// re-steal an IP the CNI has already handed to a newer pod. Claims are
-		// therefore ordered by creation time — the newest pod owns the IP.
-		if cur := s.byPodIP[ip]; cur == nil || cur == rec || !cur.pod.CreatedAt.After(pod.CreatedAt) {
+		// update to the OLD owner (a condition change while it drains) still
+		// carries its now-recycled PodIP and must not steal the index from the
+		// live pod the CNI handed that IP to. So a TERMINATING claimant yields to
+		// a live incumbent; every live pod claims (last-write-wins), including a
+		// late-scheduled OLDER pod legitimately taking a freed IP — creation time
+		// says nothing about who currently holds the address.
+		cur := s.byPodIP[ip]
+		if cur == nil || cur == rec || !rec.terminating || cur.terminating {
 			s.byPodIP[ip] = rec
 		}
 	}

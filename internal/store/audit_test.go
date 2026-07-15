@@ -26,6 +26,16 @@ func runningPod(uid, name, rv, podIP string, created time.Time) *corev1.Pod {
 	}
 }
 
+// terminatingPod is a Running pod that has been marked for deletion (graceful
+// teardown in progress): its status still reports podIP, but a deletionTimestamp
+// is set.
+func terminatingPod(uid, name, rv, podIP string, created time.Time) *corev1.Pod {
+	p := runningPod(uid, name, rv, podIP, created)
+	dt := metav1.NewTime(created.Add(time.Hour))
+	p.DeletionTimestamp = &dt
+	return p
+}
+
 var (
 	tOld = time.Date(2026, 7, 14, 10, 0, 0, 0, time.UTC)
 	tNew = time.Date(2026, 7, 14, 11, 0, 0, 0, time.UTC)
@@ -66,9 +76,9 @@ func TestStaleUpdateCannotReclaimRecycledIP(t *testing.T) {
 	s.UpsertPod(runningPod("a-uid", "old", "1", "10.0.0.5", tOld))
 	// IP recycled to the new pod.
 	s.UpsertPod(runningPod("b-uid", "new", "1", "10.0.0.5", tNew))
-	// Stale-but-Running update for the old pod (e.g. a condition change while
-	// terminating) re-claims the index entry.
-	s.UpsertPod(runningPod("a-uid", "old", "2", "10.0.0.5", tOld))
+	// Stale-but-Running update for the old pod (a condition change while it
+	// drains, deletionTimestamp now set) tries to re-claim the index entry.
+	s.UpsertPod(terminatingPod("a-uid", "old", "2", "10.0.0.5", tOld))
 	if np, ok := s.GetPodByIP("10.0.0.5"); !ok || np.Pod.UID != "b-uid" {
 		t.Errorf("stale update shadowed the live IP owner: got %q ok=%v, want b-uid", np.Pod.UID, ok)
 	}

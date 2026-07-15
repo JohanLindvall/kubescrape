@@ -240,6 +240,14 @@ func (s *series) observe(lbls labels, value float64, resAccum resKey, res pcommo
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.kind != kindHistogram {
+		// Single stream (counter/gauge/summary, bound +Inf): one lookup and one
+		// hash. The two-pass form below exists solely for histogram all-or-nothing
+		// admission; running it here would pay a redundant lookup+avalanche per
+		// matched line.
+		s.recordSingle(s.streamHash(base, 0), check, value, lbls, now, res, resLabels)
+		return
+	}
 	// Pre-pass over every bucket stream: histogram admission is all-or-nothing
 	// (a partial set of streams exports underflowed cumulative counts), and a
 	// check-hash mismatch anywhere drops the WHOLE observation for the same
@@ -320,9 +328,17 @@ func (s *series) observePreHashed(lbls labels, hash, check uint64, value float64
 	now := loadEpoch()
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.recordSingle(hash, check, value, lbls, now, res, nil)
+}
+
+// recordSingle folds one observation into a single-stream metric
+// (counter/gauge/summary): it admits the sample on first sight and refuses a
+// check-hash collision, then records the value. The caller holds s.mu. Shared by
+// observe's non-histogram path and the registry's observePreHashed.
+func (s *series) recordSingle(hash, check uint64, value float64, lbls labels, now int64, res pcommon.Map, resLabels labels) {
 	samp := s.db[hash]
 	if samp == nil {
-		samp = s.admit(hash, check, lbls, 0, now, res, nil)
+		samp = s.admit(hash, check, lbls, 0, now, res, resLabels)
 		if samp == nil {
 			return
 		}

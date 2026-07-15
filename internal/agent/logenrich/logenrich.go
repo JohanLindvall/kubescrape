@@ -123,20 +123,19 @@ func parseHexID(s string, want int) ([16]byte, bool) {
 	if len(s) != want*2 {
 		return out, false
 	}
-	buf := make([]byte, want)
-	if _, err := hex.Decode(buf, []byte(s)); err != nil {
+	// Decode straight into out (no throwaway buffer); want is 8 or 16, both ≤ 16.
+	if _, err := hex.Decode(out[:want], []byte(s)); err != nil {
 		return out, false
 	}
 	nonzero := false
-	for _, b := range buf {
+	for _, b := range out[:want] {
 		if b != 0 {
 			nonzero = true
 			break
 		}
 	}
 	if !nonzero {
-		return out, false
+		return [16]byte{}, false // reject an all-zero ID
 	}
-	copy(out[:], buf)
 	return out, true
 }

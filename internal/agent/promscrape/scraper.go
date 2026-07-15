@@ -252,7 +252,7 @@ func (s *Scraper) exportHealth(ctx context.Context, outcomes []scrapeOutcome) {
 			s.attrsFor(o.pipeline).Build(res, attrs.Context{Node: s.nodeInfo()})
 		}
 		sm := rm.ScopeMetrics().AppendEmpty()
-		sm.Scope().SetName("github.com/JohanLindvall/kubescrape/agent/promscrape")
+		sm.Scope().SetName(scopeName)
 		gauge := func(name string, v float64) {
 			m := sm.Metrics().AppendEmpty()
 			m.SetName(name)

@@ -269,8 +269,6 @@ func (s *Spool) load() error {
 }
 
 // readSegHeader returns the segment's format version. ok is false when the file
-// carries no magic or names a version this build cannot read.
-// readSegHeader returns the segment's format version. ok is false when the file
 // carries no magic or names a version this build cannot read. corrupt is true
 // only for a DAMAGED header (missing/wrong magic, short read) — genuine loss to
 // count; a valid-magic-but-unknown-version segment (a deliberate format bump or
@@ -690,14 +688,11 @@ func (s *Spool) Close() error {
 }
 
 // loadCursor reads the persisted {seq, offset}; a missing, short or torn cursor
-// starts at the oldest segment. The record carries a checksum because it is
-// rewritten in place: a partial write on power loss must fall back to
-// redelivering (duplicates, within at-least-once) rather than seek to a mixed
-// old/new position that silently skips undelivered frames.
-// loadCursor reads the persisted read position. found is false when no cursor
-// file exists yet or its checksum fails (a torn rewrite); the caller then starts
-// from the oldest segment. It must not reference s.segs — load() calls it before
-// the segment set is established.
+// (found is false) starts at the oldest segment. The record carries a checksum
+// because it is rewritten in place: a partial write on power loss must fall back
+// to redelivering (duplicates, within at-least-once) rather than seek to a mixed
+// old/new position that silently skips undelivered frames. It must not reference
+// s.segs — load() calls it before the segment set is established.
 func (s *Spool) loadCursor() (seq, off int64, found bool, err error) {
 	f, err := os.OpenFile(filepath.Join(s.dir, cursorName), os.O_RDWR|os.O_CREATE, 0o644)
 	if err != nil {

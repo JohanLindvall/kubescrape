@@ -279,13 +279,7 @@ func (s *filterSession) Keep(name string, labels []Label) bool {
 func (s *filterSession) labelsMatch(r *compiledRule, labels []Label) bool {
 	for i := range r.labels {
 		m := &r.labels[i]
-		value := ""
-		for _, l := range labels {
-			if l.Name == m.name {
-				value = l.Value
-				break
-			}
-		}
+		value := labelValue(labels, m.name)
 		key := lblMatchKey{re: m.re, value: value}
 		matched, ok := s.lblMatch[key]
 		if !ok {
@@ -303,14 +297,7 @@ func (s *filterSession) labelsMatch(r *compiledRule, labels []Label) bool {
 
 func (r *compiledRule) labelsMatch(labels []Label) bool {
 	for _, m := range r.labels {
-		value := ""
-		for _, l := range labels {
-			if l.Name == m.name {
-				value = l.Value
-				break
-			}
-		}
-		if !m.re.MatchString(value) {
+		if !m.re.MatchString(labelValue(labels, m.name)) {
 			return false
 		}
 	}

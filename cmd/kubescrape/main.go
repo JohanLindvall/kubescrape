@@ -53,6 +53,32 @@ func main() {
 	}
 }
 
+// typedHandler builds informer callbacks that type-assert every payload to T:
+// Add and Update call upsert; Delete unwraps a DeletedFinalStateUnknown
+// tombstone first, then calls del. A payload of the wrong type is ignored.
+func typedHandler[T any](upsert, del func(T)) cache.ResourceEventHandlerFuncs {
+	return cache.ResourceEventHandlerFuncs{
+		AddFunc: func(obj any) {
+			if v, ok := obj.(T); ok {
+				upsert(v)
+			}
+		},
+		UpdateFunc: func(_, obj any) {
+			if v, ok := obj.(T); ok {
+				upsert(v)
+			}
+		},
+		DeleteFunc: func(obj any) {
+			if tombstone, ok := obj.(cache.DeletedFinalStateUnknown); ok {
+				obj = tombstone.Obj
+			}
+			if v, ok := obj.(T); ok {
+				del(v)
+			}
+		},
+	}
+}
+
 func run() error {
 	var (
 		listen       = flag.String("listen", ":8080", "HTTP listen address")
@@ -131,26 +157,10 @@ func run() error {
 	factory := informers.NewSharedInformerFactoryWithOptions(client, *resync,
 		informers.WithTransform(stripManagedFields))
 	podInformer := factory.Core().V1().Pods().Informer()
-	if _, err := podInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
-		AddFunc: func(obj any) {
-			if pod, ok := obj.(*corev1.Pod); ok {
-				st.UpsertPod(pod)
-			}
-		},
-		UpdateFunc: func(_, obj any) {
-			if pod, ok := obj.(*corev1.Pod); ok {
-				st.UpsertPod(pod)
-			}
-		},
-		DeleteFunc: func(obj any) {
-			if tombstone, ok := obj.(cache.DeletedFinalStateUnknown); ok {
-				obj = tombstone.Obj
-			}
-			if pod, ok := obj.(*corev1.Pod); ok {
-				st.DeletePod(pod.UID)
-			}
-		},
-	}); err != nil {
+	if _, err := podInformer.AddEventHandler(typedHandler(
+		func(pod *corev1.Pod) { st.UpsertPod(pod) },
+		func(pod *corev1.Pod) { st.DeletePod(pod.UID) },
+	)); err != nil {
 		return fmt.Errorf("registering pod event handler: %w", err)
 	}
 
@@ -158,26 +168,10 @@ func run() error {
 	// discovery; their specs are small, so the full objects are cached.
 	svcIndex := services.NewIndex()
 	svcInformer := factory.Core().V1().Services().Informer()
-	if _, err := svcInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
-		AddFunc: func(obj any) {
-			if svc, ok := obj.(*corev1.Service); ok {
-				svcIndex.Upsert(svc)
-			}
-		},
-		UpdateFunc: func(_, obj any) {
-			if svc, ok := obj.(*corev1.Service); ok {
-				svcIndex.Upsert(svc)
-			}
-		},
-		DeleteFunc: func(obj any) {
-			if tombstone, ok := obj.(cache.DeletedFinalStateUnknown); ok {
-				obj = tombstone.Obj
-			}
-			if svc, ok := obj.(*corev1.Service); ok {
-				svcIndex.Delete(svc.Namespace, svc.UID)
-			}
-		},
-	}); err != nil {
+	if _, err := svcInformer.AddEventHandler(typedHandler(
+		func(svc *corev1.Service) { svcIndex.Upsert(svc) },
+		func(svc *corev1.Service) { svcIndex.Delete(svc.Namespace, svc.UID) },
+	)); err != nil {
 		return fmt.Errorf("registering service event handler: %w", err)
 	}
 
@@ -219,25 +213,14 @@ func run() error {
 				return fmt.Errorf("servicemonitor informer transform: %w", err)
 			}
 			monitors = servicemonitors.NewIndex()
-			upsert := func(obj any) {
-				if u, ok := obj.(*unstructured.Unstructured); ok {
+			if _, err := smInformer.AddEventHandler(typedHandler(
+				func(u *unstructured.Unstructured) {
 					if err := monitors.Upsert(u); err != nil {
 						log.Warn("parsing servicemonitor", "error", err)
 					}
-				}
-			}
-			if _, err := smInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
-				AddFunc:    upsert,
-				UpdateFunc: func(_, obj any) { upsert(obj) },
-				DeleteFunc: func(obj any) {
-					if tombstone, ok := obj.(cache.DeletedFinalStateUnknown); ok {
-						obj = tombstone.Obj
-					}
-					if u, ok := obj.(*unstructured.Unstructured); ok {
-						monitors.Delete(u.GetNamespace(), u.GetName())
-					}
 				},
-			}); err != nil {
+				func(u *unstructured.Unstructured) { monitors.Delete(u.GetNamespace(), u.GetName()) },
+			)); err != nil {
 				return fmt.Errorf("registering servicemonitor handler: %w", err)
 			}
 			dynFactory.Start(ctx.Done())

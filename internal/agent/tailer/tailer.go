@@ -1651,31 +1651,7 @@ func (t *Tailer) drainArchive(ctx context.Context, f *file) {
 			return
 		}
 	}
-	buf := t.scratch()
-	if len(f.pending) > 0 {
-		t.consume(ctx, f, true) // see drainFile: a paused file's pending would be lost
-	}
-	// Same circuit breaker as drainFile: an adversarial archive (a gzip bomb
-	// deleted mid-read) must not decompress without bound into memory.
-	const drainCap = 1 << 30
-	var drained int64
-	for drained < drainCap {
-		n, err := f.gz.Read(buf)
-		if n > 0 {
-			drained += int64(n)
-			obs.LogBytes.Add(float64(n))
-			f.pending = append(f.pending, buf[:n]...)
-			f.readPos += int64(n)
-			// Bypass the rate limit like drainFile: pausing would lose the
-			// remainder when the fd closes.
-			t.consume(ctx, f, true)
-			t.flushDuringDrain(ctx, f)
-		}
-		if err != nil {
-			return
-		}
-	}
-	t.log.Error("archive still yielding after draining 1GiB, abandoning remainder", "path", f.path)
+	t.drainReader(ctx, f, f.gz, "archive")
 }
 
 // closeArchive releases the archive's readers.
@@ -1706,28 +1682,34 @@ func (t *Tailer) drainFile(ctx context.Context, f *file) {
 	if f.f == nil {
 		return
 	}
-	// Drain to EOF: whatever is left in the rotated-away inode is unreachable
-	// once the fd closes, so a byte budget here means permanent loss (a
-	// backlog over the budget is realistic — kubelet rotates at 10MiB, and
-	// rate-limit pause mode accumulates arbitrary backlogs). The cap below is
-	// only a circuit breaker against a pathological writer that keeps the old
-	// fd open and outruns us forever.
+	t.drainReader(ctx, f, f.f, "file")
+}
+
+// drainReader reads r to EOF into f, consuming and flushing as it goes, so a
+// rotated-away or removed file's uncommitted tail is not lost when its fd drops.
+// Whatever is left in the source once the fd closes is unreachable, so a byte
+// budget here would mean permanent loss (a backlog over the budget is realistic
+// — kubelet rotates at 10MiB, rate-limit pause mode accumulates arbitrary
+// backlogs); the cap is only a circuit breaker against a source that outruns the
+// drain forever (a writer holding the rotated fd open, or a gzip bomb).
+func (t *Tailer) drainReader(ctx context.Context, f *file, r io.Reader, what string) {
 	const drainCap = 1 << 30
 	buf := t.scratch()
 	if len(f.pending) > 0 {
-		// A rate-limit-paused file may hold already-read unconsumed lines;
-		// they would be discarded with pending when the fd drops.
+		// A rate-limit-paused file may hold already-read unconsumed lines; they
+		// would be discarded with pending when the fd drops.
 		t.consume(ctx, f, true)
 	}
 	var drained int64
 	for drained < drainCap {
-		n, err := f.f.Read(buf)
+		n, err := r.Read(buf)
 		if n > 0 {
 			drained += int64(n)
+			obs.LogBytes.Add(float64(n))
 			f.pending = append(f.pending, buf[:n]...)
 			f.readPos += int64(n)
-			// Bypass the rate limit: pausing a drain would lose the rotated
-			// inode's remainder when the fd is dropped.
+			// Bypass the rate limit: pausing a drain would lose the remainder
+			// when the fd is dropped.
 			t.consume(ctx, f, true)
 			t.flushDuringDrain(ctx, f)
 		}
@@ -1735,7 +1717,7 @@ func (t *Tailer) drainFile(ctx context.Context, f *file) {
 			return
 		}
 	}
-	t.log.Error("rotated file still growing after draining 1GiB, abandoning remainder", "path", f.path)
+	t.log.Error("source still yielding after draining 1GiB, abandoning remainder", "path", f.path, "source", what)
 }
 
 // flushDuringDrain keeps a large drain from accumulating everything into one

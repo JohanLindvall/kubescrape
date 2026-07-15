@@ -356,16 +356,11 @@ func appendLabelsExcept(dst []Label, labels []Label, except string) []Label {
 }
 
 func labelFloat(labels []Label, name string) (float64, bool) {
-	for _, l := range labels {
-		if l.Name == name {
-			v, err := strconv.ParseFloat(l.Value, 64)
-			if err != nil {
-				return 0, false
-			}
-			return v, true
-		}
+	v, err := strconv.ParseFloat(labelValue(labels, name), 64)
+	if err != nil {
+		return 0, false // missing label or unparseable value
 	}
-	return 0, false
+	return v, true
 }
 
 // --- batcher emission ---

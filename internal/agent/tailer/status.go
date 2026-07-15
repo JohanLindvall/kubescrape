@@ -1,8 +1,9 @@
 package tailer
 
 import (
+	"cmp"
 	"os"
-	"sort"
+	"slices"
 	"time"
 
 	"github.com/JohanLindvall/kubescrape/internal/obs"
@@ -67,7 +68,7 @@ func (t *Tailer) publishStatus() {
 		}
 		out = append(out, fs)
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].Lag > out[j].Lag })
+	slices.SortFunc(out, func(a, b FileStatus) int { return cmp.Compare(b.Lag, a.Lag) })
 	obs.LogLagBytes.Set(float64(maxLag))
 	obs.LogLagBytesTotal.Set(float64(totalLag))
 	t.status.Store(&out)

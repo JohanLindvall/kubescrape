@@ -58,13 +58,7 @@ func ServiceTargets(pod kubemeta.Pod, svc *services.Service) []kubemeta.ScrapeTa
 		return nil
 	}
 	scheme, path := schemeAndPath(svc.Annotations)
-	info := &kubemeta.Service{
-		Name:        svc.Name,
-		Namespace:   svc.Namespace,
-		UID:         svc.UID,
-		Labels:      svc.Labels,
-		Annotations: svc.Annotations,
-	}
+	info := serviceInfo(svc)
 	var targets []kubemeta.ScrapeTarget
 	seen := make(map[int32]struct{})
 	for _, sp := range selectServicePorts(svc) {
@@ -92,29 +86,13 @@ func MonitorTargets(pod kubemeta.Pod, svc *services.Service, monitor string, ep 
 	if svc == nil || !Scrapeable(pod) {
 		return nil
 	}
-	scheme := ep.Scheme
-	if scheme != "https" {
-		scheme = "http"
-	}
-	path := ep.Path
-	if path == "" {
-		path = "/metrics"
-	}
-	if !strings.HasPrefix(path, "/") {
-		path = "/" + path
-	}
+	scheme, path := defaultSchemePath(ep.Scheme, ep.Path)
 
 	port, ok := monitorPodPort(pod, svc, ep)
 	if !ok {
 		return nil
 	}
-	info := &kubemeta.Service{
-		Name:        svc.Name,
-		Namespace:   svc.Namespace,
-		UID:         svc.UID,
-		Labels:      svc.Labels,
-		Annotations: svc.Annotations,
-	}
+	info := serviceInfo(svc)
 	t := makeTarget(pod, scheme, path, port)
 	t.Source = "servicemonitor"
 	t.Service = info
@@ -186,11 +164,16 @@ func Scrapeable(pod kubemeta.Pod) bool {
 }
 
 func schemeAndPath(annotations map[string]string) (scheme, path string) {
-	scheme = annotations[AnnotationScheme]
+	return defaultSchemePath(annotations[AnnotationScheme], annotations[AnnotationPath])
+}
+
+// defaultSchemePath applies the scrape scheme/path defaults: anything but
+// "https" becomes "http", an empty path becomes "/metrics", and a path is given
+// a leading slash.
+func defaultSchemePath(scheme, path string) (string, string) {
 	if scheme != "https" {
 		scheme = "http"
 	}
-	path = annotations[AnnotationPath]
 	if path == "" {
 		path = "/metrics"
 	}
@@ -198,6 +181,17 @@ func schemeAndPath(annotations map[string]string) (scheme, path string) {
 		path = "/" + path
 	}
 	return scheme, path
+}
+
+// serviceInfo is the kubemeta.Service view stamped onto a service-derived target.
+func serviceInfo(svc *services.Service) *kubemeta.Service {
+	return &kubemeta.Service{
+		Name:        svc.Name,
+		Namespace:   svc.Namespace,
+		UID:         svc.UID,
+		Labels:      svc.Labels,
+		Annotations: svc.Annotations,
+	}
 }
 
 func makeTarget(pod kubemeta.Pod, scheme, path string, port int32) kubemeta.ScrapeTarget {

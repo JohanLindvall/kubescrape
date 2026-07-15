@@ -262,7 +262,7 @@ func (s *Server) handleHTTPMetrics(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), httpForwardStatus(err))
 		return
 	}
-	writeProto(w, pmetricResponse(pmetricotlp.NewExportResponse()))
+	writeProto(w, pmetricotlp.NewExportResponse())
 }
 
 func (s *Server) handleHTTPTraces(w http.ResponseWriter, r *http.Request) {
@@ -283,11 +283,8 @@ func (s *Server) handleHTTPTraces(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), httpForwardStatus(err))
 		return
 	}
-	writeProto(w, ptraceResponse(ptraceotlp.NewExportResponse()))
+	writeProto(w, ptraceotlp.NewExportResponse())
 }
-
-// ptraceResponse adapts the traces response to the marshaler interface.
-func ptraceResponse(r ptraceotlp.ExportResponse) protoMarshaler { return r }
 
 // httpForwardStatus maps a forwarding failure onto the HTTP status the sender
 // retries correctly (the HTTP counterpart of grpcForwardStatus): a permanent
@@ -394,6 +391,3 @@ func writeProto(w http.ResponseWriter, m protoMarshaler) {
 	w.Header().Set("Content-Type", "application/x-protobuf")
 	_, _ = w.Write(b)
 }
-
-// pmetricResponse adapts the metrics response to the marshaler interface.
-func pmetricResponse(r pmetricotlp.ExportResponse) protoMarshaler { return r }

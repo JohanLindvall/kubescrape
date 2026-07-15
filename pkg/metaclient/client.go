@@ -248,6 +248,13 @@ func (c *Client) getJSON(ctx context.Context, u string, v any) error {
 // nodes with pod churn (dead containers are never requested again).
 const maxCacheEntries = 4096
 
+// evictLowWater is the size eviction trims down to once the cap is exceeded.
+// Trimming below the cap (rather than to it) amortizes the two O(n) map sweeps
+// over ~1000 inserts instead of running them on every insert while full — this
+// matters because the sweeps hold the mutex shared across concurrent ingest and
+// cadvisor lookups.
+const evictLowWater = maxCacheEntries * 3 / 4
+
 // evictLocked trims the cache when it exceeds the cap: expired entries first,
 // then arbitrary ones (they re-fetch cheaply via ETag revalidation). Caller
 // holds the mutex.
@@ -262,7 +269,7 @@ func (c *Client) evictLocked() {
 		}
 	}
 	for k := range c.cache {
-		if len(c.cache) <= maxCacheEntries {
+		if len(c.cache) <= evictLowWater {
 			break
 		}
 		delete(c.cache, k)

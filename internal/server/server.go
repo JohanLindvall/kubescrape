@@ -231,55 +231,48 @@ func (s *Server) handleContainer(w http.ResponseWriter, r *http.Request) {
 // handlePod serves GET /v1/pods/{namespace}/{name}: full metadata for one
 // pod looked up by name (used by the agent to attribute cadvisor series).
 // Deleted pods stay resolvable until their tombstone expires.
-func (s *Server) handlePod(w http.ResponseWriter, r *http.Request) {
+// servePod is the shared body of the three pod endpoints: readiness gate,
+// lookup, 404, owner/namespace enrichment, then a cached write. notFound is
+// evaluated lazily so the success path never formats it.
+func (s *Server) servePod(w http.ResponseWriter, r *http.Request, lookup func() (store.NodePod, bool), notFound func() string) {
 	if !s.isReady() {
 		writeError(w, http.StatusServiceUnavailable, "informer caches not synced")
 		return
 	}
-	namespace, name := r.PathValue("namespace"), r.PathValue("name")
-	np, ok := s.store.GetPodByName(namespace, name)
+	np, ok := lookup()
 	if !ok {
-		writeError(w, http.StatusNotFound, fmt.Sprintf("pod %s/%s not found", namespace, name))
+		writeError(w, http.StatusNotFound, notFound())
 		return
 	}
 	s.enrich(&np.Pod, np.OwnerRefs)
 	s.writeCached(w, r, np.Pod)
+}
+
+func (s *Server) handlePod(w http.ResponseWriter, r *http.Request) {
+	namespace, name := r.PathValue("namespace"), r.PathValue("name")
+	s.servePod(w, r,
+		func() (store.NodePod, bool) { return s.store.GetPodByName(namespace, name) },
+		func() string { return fmt.Sprintf("pod %s/%s not found", namespace, name) })
 }
 
 // handlePodByUID serves GET /v1/pod-uids/{uid}: full metadata for one pod
 // looked up by UID (used by the OTLP ingest enricher to attribute pushed
 // telemetry). Deleted pods stay resolvable until their tombstone expires.
 func (s *Server) handlePodByUID(w http.ResponseWriter, r *http.Request) {
-	if !s.isReady() {
-		writeError(w, http.StatusServiceUnavailable, "informer caches not synced")
-		return
-	}
 	uid := r.PathValue("uid")
-	np, ok := s.store.GetPodByUID(uid)
-	if !ok {
-		writeError(w, http.StatusNotFound, fmt.Sprintf("pod uid %q not found", uid))
-		return
-	}
-	s.enrich(&np.Pod, np.OwnerRefs)
-	s.writeCached(w, r, np.Pod)
+	s.servePod(w, r,
+		func() (store.NodePod, bool) { return s.store.GetPodByUID(uid) },
+		func() string { return fmt.Sprintf("pod uid %q not found", uid) })
 }
 
 // handlePodByIP serves GET /v1/pod-ips/{ip}: the LIVE pod owning a pod IP
 // (the agent's opt-in peer-IP attribution for pushed OTLP). Deleted pods and
 // hostNetwork pods never resolve.
 func (s *Server) handlePodByIP(w http.ResponseWriter, r *http.Request) {
-	if !s.isReady() {
-		writeError(w, http.StatusServiceUnavailable, "informer caches not synced")
-		return
-	}
 	ip := r.PathValue("ip")
-	np, ok := s.store.GetPodByIP(ip)
-	if !ok {
-		writeError(w, http.StatusNotFound, fmt.Sprintf("no live pod with IP %q", ip))
-		return
-	}
-	s.enrich(&np.Pod, np.OwnerRefs)
-	s.writeCached(w, r, np.Pod)
+	s.servePod(w, r,
+		func() (store.NodePod, bool) { return s.store.GetPodByIP(ip) },
+		func() string { return fmt.Sprintf("no live pod with IP %q", ip) })
 }
 
 // handleNodeMetadata serves GET /v1/nodes/{node}/metadata: the node's

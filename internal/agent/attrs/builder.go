@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -102,7 +103,7 @@ func (c *Config) validatePipelines() error {
 		return nil
 	}
 	for name, sub := range c.Pipelines {
-		if !slicesContains(pipelineNames, name) {
+		if !slices.Contains(pipelineNames, name) {
 			return fmt.Errorf("unknown pipeline %q (want one of %s)", name, strings.Join(pipelineNames, ", "))
 		}
 		if sub != nil && len(sub.Pipelines) > 0 {
@@ -110,15 +111,6 @@ func (c *Config) validatePipelines() error {
 		}
 	}
 	return nil
-}
-
-func slicesContains(list []string, s string) bool {
-	for _, v := range list {
-		if v == s {
-			return true
-		}
-	}
-	return false
 }
 
 // Builders holds one compiled Builder per pipeline. A nil *Builders (or nil

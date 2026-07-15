@@ -472,9 +472,16 @@ func (s *series) snapshot() []sample {
 			// export. With the export interval past maxAge+grace (both legal and
 			// unclamped) a sample observed just after one export is deleted at
 			// the next, unseen — the same never-exported loss the idle-reset
-			// branch below guards against, one branch up.
-			if !samp.exported && !s.aggregating() {
-				out = append(out, samp.sample)
+			// branch below guards against, one branch up. Aggregating gauges emit
+			// their windowed aggregate (as the aggregating branch does); a value
+			// observed once, then idled straight past the grace before any
+			// snapshot ran the aggregating branch, is otherwise destroyed unseen.
+			if !samp.exported {
+				emit := samp.sample
+				if s.aggregating() {
+					emit.value = s.aggregateValue(&samp.sample)
+				}
+				out = append(out, emit)
 			}
 			delete(s.db, hash)
 			continue

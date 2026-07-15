@@ -62,6 +62,13 @@ func splitLogs(ld plog.Logs, maxBytes int) []plog.Logs {
 		splitBigResourceLogs(rl, maxBytes, &out)
 	}
 	flush()
+	// A non-empty input must never yield zero parts (that would report the
+	// export "delivered" while sending nothing): a resource over the cap with no
+	// scopes at all reaches here empty. Send it whole — it is rejected and
+	// counted at the collector, never silently dropped.
+	if len(out) == 0 && ld.ResourceLogs().Len() > 0 {
+		return []plog.Logs{ld}
+	}
 	return out
 }
 
@@ -80,6 +87,7 @@ func splitBigResourceLogs(rl plog.ResourceLogs, maxBytes int, out *[]plog.Logs) 
 	sls := rl.ScopeLogs()
 	for i := 0; i < sls.Len(); i++ {
 		sl := sls.At(i)
+		emptyScope := sl.LogRecords().Len() == 0
 		ld, recs, nsl := newChunk()
 		sl.Scope().CopyTo(nsl.Scope())
 		nsl.SetSchemaUrl(sl.SchemaUrl())
@@ -98,7 +106,10 @@ func splitBigResourceLogs(rl plog.ResourceLogs, maxBytes int, out *[]plog.Logs) 
 			lr.CopyTo(recs.AppendEmpty())
 			curBytes += recBytes
 		}
-		if recs.Len() > 0 {
+		// Emit the last chunk if it holds records, or the scope was empty — an
+		// empty scope carries identity (attributes, schema URL) that the
+		// under-cap path preserves, so the split must too.
+		if recs.Len() > 0 || emptyScope {
 			*out = append(*out, ld)
 		}
 	}
@@ -152,6 +163,10 @@ func splitMetrics(md pmetric.Metrics, maxBytes int) []pmetric.Metrics {
 		splitBigResourceMetrics(rm, maxBytes, &out)
 	}
 	flush()
+	// A non-empty input must never yield zero parts (see splitLogs).
+	if len(out) == 0 && md.ResourceMetrics().Len() > 0 {
+		return []pmetric.Metrics{md}
+	}
 	return out
 }
 
@@ -168,6 +183,7 @@ func splitBigResourceMetrics(rm pmetric.ResourceMetrics, maxBytes int, out *[]pm
 	sms := rm.ScopeMetrics()
 	for i := 0; i < sms.Len(); i++ {
 		sm := sms.At(i)
+		emptyScope := sm.Metrics().Len() == 0
 		md, ms, nsm := newChunk()
 		sm.Scope().CopyTo(nsm.Scope())
 		nsm.SetSchemaUrl(sm.SchemaUrl())
@@ -186,7 +202,7 @@ func splitBigResourceMetrics(rm pmetric.ResourceMetrics, maxBytes int, out *[]pm
 			m.CopyTo(ms.AppendEmpty())
 			curBytes += mBytes
 		}
-		if ms.Len() > 0 {
+		if ms.Len() > 0 || emptyScope {
 			*out = append(*out, md)
 		}
 	}
@@ -238,6 +254,10 @@ func splitTraces(td ptrace.Traces, maxBytes int) []ptrace.Traces {
 		splitBigResourceSpans(rs, maxBytes, &out)
 	}
 	flush()
+	// A non-empty input must never yield zero parts (see splitLogs).
+	if len(out) == 0 && td.ResourceSpans().Len() > 0 {
+		return []ptrace.Traces{td}
+	}
 	return out
 }
 
@@ -254,6 +274,7 @@ func splitBigResourceSpans(rs ptrace.ResourceSpans, maxBytes int, out *[]ptrace.
 	sss := rs.ScopeSpans()
 	for i := 0; i < sss.Len(); i++ {
 		ss := sss.At(i)
+		emptyScope := ss.Spans().Len() == 0
 		td, spans, nss := newChunk()
 		ss.Scope().CopyTo(nss.Scope())
 		nss.SetSchemaUrl(ss.SchemaUrl())
@@ -272,7 +293,7 @@ func splitBigResourceSpans(rs ptrace.ResourceSpans, maxBytes int, out *[]ptrace.
 			sp.CopyTo(spans.AppendEmpty())
 			curBytes += spBytes
 		}
-		if spans.Len() > 0 {
+		if spans.Len() > 0 || emptyScope {
 			*out = append(*out, td)
 		}
 	}

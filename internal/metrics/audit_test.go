@@ -177,10 +177,13 @@ func TestEvictThenReadmitAtCap(t *testing.T) {
 		t.Fatalf("droppedCapped delta = %d, want 1", got)
 	}
 
-	// Past expiration + 4 min grace: the sweep deletes u=a.
+	// Past expiration + 4 min grace: the sweep deletes u=a. Its single
+	// observation (value 1) never reached an export, so the delete sweep must
+	// emit it once before dropping it (the never-exported guarantee) — then the
+	// sample is gone from the db.
 	setTimeForTest(time.Unix(t0+60+240, 0))
-	if out := s.snapshot(); len(out) != 0 {
-		t.Fatalf("expired sample still exported: %d", len(out))
+	if out := s.snapshot(); len(out) != 1 || out[0].value != 1 {
+		t.Fatalf("expired-but-never-exported sample must ship once on delete: %+v", out)
 	}
 	if len(s.db) != 0 {
 		t.Fatalf("expired sample not deleted: %d", len(s.db))

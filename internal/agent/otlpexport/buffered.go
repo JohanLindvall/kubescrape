@@ -223,7 +223,8 @@ func (s *sink[T]) drain(ctx context.Context) {
 		switch s.trySend(ctx, v) {
 		case sendOK:
 			commit()
-			s.delivered++ // proof the collector is alive: see stuckTooLong
+			s.delivered++  // proof the collector is alive: see stuckTooLong
+			s.forget(data) // a previously-stuck payload that recovered
 		case sendCancelled:
 			return // ctx cancelled mid-send; leave it queued
 		case sendRejected:
@@ -280,11 +281,25 @@ func (s *sink[T]) stuckTooLong(data []byte) bool {
 	}
 	st.cycles++
 	s.stuck[h] = st
-	if st.cycles < maxDrainCycles || s.delivered == st.deliveredAt {
+	// Drop only after the payload has failed maxDrainCycles times AND the
+	// collector has delivered at least that many OTHER batches since this one
+	// got stuck. deliveredAt is captured at the first failure, so during an
+	// outage (s.delivered frozen) the delta stays 0 and nothing is dropped; a
+	// single delivery on a bumpy recovery is not enough either — only sustained
+	// evidence that the live collector is singling THIS payload out.
+	if st.cycles < maxDrainCycles || s.delivered-st.deliveredAt < uint64(maxDrainCycles) {
 		return false
 	}
 	delete(s.stuck, h)
 	return true
+}
+
+// forget drops a payload's stuck-tracking once it is committed, so a batch that
+// eventually succeeds does not leak an entry to the maxStuckTracked cap.
+func (s *sink[T]) forget(data []byte) {
+	if s.stuck != nil {
+		delete(s.stuck, xxhash.Sum64(data))
+	}
 }
 
 type sendResult int

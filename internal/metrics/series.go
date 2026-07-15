@@ -468,6 +468,14 @@ func (s *series) snapshot() []sample {
 	for hash, samp := range s.db {
 		idle := now - samp.when - s.expiration
 		if idle >= 4*60 {
+			// Deleting the sample: emit it first if this value never reached an
+			// export. With the export interval past maxAge+grace (both legal and
+			// unclamped) a sample observed just after one export is deleted at
+			// the next, unseen — the same never-exported loss the idle-reset
+			// branch below guards against, one branch up.
+			if !samp.exported && !s.aggregating() {
+				out = append(out, samp.sample)
+			}
 			delete(s.db, hash)
 			continue
 		}

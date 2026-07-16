@@ -47,6 +47,10 @@ const (
 	dimStatus  = "status.code"
 )
 
+// builtinDims are the fixed dimension label names, in the order observe/dims emit
+// them (extra configured dimensions follow).
+var builtinDims = []string{dimService, dimSpan, dimKind, dimStatus}
+
 // defaultBuckets are the classic spanmetrics latency boundaries in SECONDS.
 var defaultBuckets = []float64{0.002, 0.004, 0.006, 0.008, 0.01, 0.05, 0.1, 0.2, 0.4, 0.8, 1, 1.4, 2, 5, 10, 15}
 
@@ -71,17 +75,16 @@ type Config struct {
 	// Dimensions are extra span (falling back to resource) attribute keys to add
 	// as labels, beyond the four built-ins. A missing attribute yields "".
 	Dimensions []string `json:"dimensions,omitempty"`
-	// MaxCardinality caps the number of distinct dimension tuples (and, for
-	// service graphs, pending half-edges and edges); over the cap, spans/edges
-	// are dropped and counted (default 20000, 0 = default).
+	// MaxCardinality caps the number of distinct dimension tuples; over the cap,
+	// spans are dropped and counted (default 20000, 0 = default).
 	MaxCardinality int `json:"maxCardinality,omitempty"`
 	// Exemplars attaches a trace/span-id exemplar (one per latency bucket, reset
 	// each export) to the duration histogram. nil defaults to true.
 	Exemplars *bool `json:"exemplars,omitempty"`
 }
 
-// Generator aggregates spans into calls/size/duration metrics (and optional
-// service-graph edges). Safe for concurrent Consume from the ingest goroutines.
+// Generator aggregates spans into calls/size/duration metrics. Safe for
+// concurrent Consume from the ingest goroutines.
 type Generator struct {
 	prefix    string
 	names     []string // full dimension label names (built-ins + extras), in order
@@ -127,18 +130,17 @@ func New(cfg Config) *Generator {
 	if cfg.Exemplars != nil {
 		ex = *cfg.Exemplars
 	}
-	names := append([]string{dimService, dimSpan, dimKind, dimStatus}, cfg.Dimensions...)
-	g := &Generator{
+	names := append(append([]string(nil), builtinDims...), cfg.Dimensions...)
+	return &Generator{
 		prefix:    prefix,
 		names:     names,
-		extra:     append([]string(nil), cfg.Dimensions...),
+		extra:     names[len(builtinDims):], // the configured dimensions, aliased (never diverges from names)
 		bounds:    boundsOrDefault(cfg.Buckets),
 		maxCard:   maxCard,
 		exemplars: ex,
 		series:    make(map[string]*spanSeries),
 		start:     time.Now(),
 	}
-	return g
 }
 
 // boundsOrDefault returns a sorted copy of b, or the default buckets when empty.
@@ -265,7 +267,6 @@ func (g *Generator) Export(ctx context.Context, exp Exporter, res pcommon.Resour
 }
 
 func (g *Generator) render(res pcommon.Resource, now time.Time) pmetric.Metrics {
-	empty := pmetric.NewMetrics()
 	md := pmetric.NewMetrics()
 	rm := md.ResourceMetrics().AppendEmpty()
 	res.CopyTo(rm.Resource())
@@ -276,7 +277,7 @@ func (g *Generator) render(res pcommon.Resource, now time.Time) pmetric.Metrics 
 
 	g.renderRED(sm, start, ts)
 	if sm.Metrics().Len() == 0 {
-		return empty // nothing to send this cycle
+		return pmetric.NewMetrics() // nothing to send this cycle
 	}
 	return md
 }

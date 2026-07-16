@@ -2,8 +2,6 @@ package promscrape
 
 import (
 	"context"
-	"net/http"
-	"net/http/httptest"
 	"strings"
 	"testing"
 )
@@ -20,10 +18,7 @@ func TestCadvisorStandaloneContainersStayDistinct(t *testing.T) {
 container_cpu_usage_seconds_total{id="/system.slice/docker-` + cidA + `.scope"} 1
 container_cpu_usage_seconds_total{id="/system.slice/docker-` + cidB + `.scope"} 2
 `
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = w.Write([]byte(body))
-	}))
-	defer srv.Close()
+	srv := serveBody(t, body)
 
 	exp := &captureExporter{}
 	s := newKubeletScraper(t, srv.URL, &fakeMetaSource{}, exp, false)

@@ -1,11 +1,9 @@
 package tailer
 
-// AUDIT round 2 (at-least-once): the TestBUG_* tests below are KNOWN-FAILING
-// repros of log-line LOSS in the areas the existing suite exercises least
-// (multi-hop rotation bookkeeping, copytruncate refill, compressed archives).
-// They are deliberately red: each is the alarm for an unfixed bug, not a
-// regression guard. See the comment on each test for the exact interleaving and
-// the proposed fix.
+// Regression guards (at-least-once) for log-line LOSS bugs found by audit
+// round 2 in the areas the suite exercised least (multi-hop rotation
+// bookkeeping, copytruncate refill, compressed archives), since fixed. See
+// the comment on each test for the exact interleaving it pins.
 
 import (
 	"context"

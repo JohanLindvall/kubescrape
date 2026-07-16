@@ -12,10 +12,10 @@ import (
 // audit_test.go: targeted tests from the 2026-07 audit of the metadata
 // service ingest paths.
 
-// runningPod builds a Running pod. created orders the pods: a recycled IP is
-// only ever handed to a pod created AFTER the one that released it, so the
-// creation timestamp (always set by the API server) is what tells a stale
-// claimant from the live owner.
+// runningPod builds a Running pod. created varies across the pods so the
+// tests can model an IP being released by one pod and handed to another; the
+// claim itself is last-write-wins with terminating pods yielding (creation
+// time deliberately does NOT order it).
 func runningPod(uid, name, rv, podIP string, created time.Time) *corev1.Pod {
 	return &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
@@ -62,15 +62,13 @@ func TestDeleteOfStaleIPClaimantKeepsLiveMapping(t *testing.T) {
 	}
 }
 
-// BUG: same scenario, but the STALE pod receives one more unrelated update
-// (any status/condition change bumps ResourceVersion — routine while a pod
-// terminates) after the new pod claimed the IP. UpsertPod unconditionally
-// re-stamps byPodIP[ip] = rec for a Running-phase pod, so the terminating pod
-// steals the mapping back from the live owner (GetPodByIP now returns the
-// wrong pod), and when its deletion arrives the identity check passes and the
-// entry is removed entirely — the live pod with that IP is unresolvable until
-// its next (unpredictable) informer update. The peer-IP ingest fallback
-// mis-attributes, then loses, telemetry for the live pod.
+// Regression guard: same scenario, but the STALE pod receives one more
+// unrelated update (any status/condition change bumps ResourceVersion —
+// routine while a pod terminates) after the new pod claimed the IP. UpsertPod
+// used to unconditionally re-stamp byPodIP[ip] for a Running-phase pod, so
+// the terminating pod stole the mapping back from the live owner and its
+// later deletion removed the entry entirely. The fix: a terminating pod
+// (DeletionTimestamp set) yields its IP claim to a live incumbent.
 func TestStaleUpdateCannotReclaimRecycledIP(t *testing.T) {
 	s := New(time.Minute)
 	s.UpsertPod(runningPod("a-uid", "old", "1", "10.0.0.5", tOld))

@@ -228,10 +228,7 @@ func TestScrapeCadvisor(t *testing.T) {
 }
 
 func TestScrapeCadvisorRollupsDisabled(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = w.Write([]byte(cadvisorBody))
-	}))
-	defer srv.Close()
+	srv := serveBody(t, cadvisorBody)
 
 	exp := &captureExporter{}
 	s := newKubeletScraper(t, srv.URL, &fakeMetaSource{}, exp, true)
@@ -350,10 +347,7 @@ container_size_bytes{namespace="ns1",pod="pod1",container="app",id="/kubepods/bu
 container_size_bytes_sum{namespace="ns1",pod="pod1",container="app",id="/kubepods/burstable/podUID1/APPCID"} 100
 container_size_bytes_count{namespace="ns1",pod="pod1",container="app",id="/kubepods/burstable/podUID1/APPCID"} 3
 `)
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = w.Write([]byte(body))
-	}))
-	defer srv.Close()
+	srv := serveBody(t, body)
 
 	exp := &captureExporter{}
 	s := newKubeletScraper(t, srv.URL, &fakeMetaSource{}, exp, false)

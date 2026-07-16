@@ -1,22 +1,12 @@
 package tailer
 
-// AUDIT (data-integrity, at-least-once): the two tests below are KNOWN-FAILING
-// repros of log-line LOSS found by the adversarial audit of the log delivery
-// chain. They are deliberately left red — they are the alarm for the bug, not a
-// regression guard for a fixed one. Both share one root cause:
-//
-//	rewind() (tailer.go) early-returns when f.f == nil:
-//
-//	    if f.f == nil {
-//	        return
-//	    }
-//
-//	so it skips newPipeline() -> ledger.reset() -> carriedFed = false, which is
-//	the ONLY in-process mechanism that re-reads a rotated-away file's prefix.
-//	reopen() leaves f.f == nil, so the flush that fails right after a rotation
-//	rewinds nothing at all.
-//
-// See the tests below for the exact interleavings.
+// Regression guards (data-integrity, at-least-once) for log-line LOSS bugs
+// found by the adversarial audit of the log delivery chain, since fixed. Both
+// shared one root cause: rewind() early-returned when f.f == nil, skipping
+// newPipeline() -> ledger.reset() -> carriedFed = false — the only in-process
+// mechanism that re-reads a rotated-away file's prefix — so a flush that
+// failed right after a rotation rewound nothing at all. See the tests below
+// for the exact interleavings.
 
 import (
 	"context"

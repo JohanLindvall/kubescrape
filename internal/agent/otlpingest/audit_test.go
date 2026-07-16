@@ -81,17 +81,14 @@ func TestDatapointModeSplitsDifferentPodsInOneMetric(t *testing.T) {
 	}
 }
 
-// BUG: in datapoint/split mode the output resource for EACH described object is
-// a copy of the SENDER's resource. Only the configured ID keys are stripped
-// (stripIDAttrs); every other identity attribute the sender put on its own
-// resource — k8s.pod.name, service.name, k8s.container.name, k8s.node.name,
-// typical of any SDK with a k8s resource detector or OTEL_RESOURCE_ATTRIBUTES
-// from the downward API — survives the copy. mergeAttrs then refuses to
-// overwrite it ("the sender is authoritative"), so the resource that is
-// supposed to describe pod web-2 claims k8s.pod.name = the exporter's OWN pod
-// and service.name = the exporter's own service. Every split data point is
-// attributed to the pushing pod, silently, and the k8s.pod.uid the enricher
-// filled in disagrees with the k8s.pod.name next to it.
+// Regression guard: in datapoint/split mode the output resource for EACH
+// described object starts as a copy of the SENDER's resource, which carries
+// the sender's own identity attrs (k8s.pod.name, service.name, ... — typical
+// of any SDK with a k8s resource detector). A merge that refused to overwrite
+// them ("the sender is authoritative") attributed every split point to the
+// pushing pod. The fix: on split resources the resolved identity OVERWRITES
+// the copied sender attributes (overwriteAttrs) — the sender is authoritative
+// about itself, not about the other objects it describes.
 func TestSplitResourceUsesDescribedObjectIdentity(t *testing.T) {
 	md := pmetric.NewMetrics()
 	rm := md.ResourceMetrics().AppendEmpty()

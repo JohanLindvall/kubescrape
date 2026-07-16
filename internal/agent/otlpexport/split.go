@@ -71,10 +71,9 @@ func splitLogs(ld plog.Logs, maxBytes int) []plog.Logs {
 		splitBigResourceLogs(rl, maxBytes, &out)
 	}
 	flush()
-	// A non-empty input must never yield zero parts (that would report the
-	// export "delivered" while sending nothing): a resource over the cap with no
-	// scopes at all reaches here empty. Send it whole — it is rejected and
-	// counted at the collector, never silently dropped.
+	// Backstop for the never-zero-parts invariant (a zero-part return would
+	// report the export "delivered" while sending nothing). Logically dead since
+	// the per-resource zero-scope emit above — kept as a cheap final guard.
 	if len(out) == 0 && ld.ResourceLogs().Len() > 0 {
 		return []plog.Logs{ld}
 	}

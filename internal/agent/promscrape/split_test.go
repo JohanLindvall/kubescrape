@@ -2,8 +2,6 @@ package promscrape
 
 import (
 	"context"
-	"net/http"
-	"net/http/httptest"
 	"testing"
 	"time"
 
@@ -49,10 +47,7 @@ func ksmSplitters(t *testing.T) []*Splitter {
 }
 
 func TestSplitterScrape(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = w.Write([]byte(ksmBody))
-	}))
-	defer srv.Close()
+	srv := serveBody(t, ksmBody)
 
 	target := testTarget(srv.URL)
 	target.Pod.Name = "ksm-abc"
@@ -154,10 +149,7 @@ func TestSplitterScrape(t *testing.T) {
 }
 
 func TestSplitterDatapointAttributesOverride(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = w.Write([]byte(ksmBody))
-	}))
-	defer srv.Close()
+	srv := serveBody(t, ksmBody)
 
 	target := testTarget(srv.URL)
 	target.Pod.Name = "ksm-abc"
@@ -207,10 +199,7 @@ func TestSplitterInstancePrefix(t *testing.T) {
 	body := "# TYPE kube_pod_info gauge\n" +
 		`kube_pod_info{namespace="ns1",pod="pod1",uid="` + uid1 + `",node="node9"} 1` + "\n"
 	run := func(t *testing.T, sp []*Splitter) pmetric.ResourceMetrics {
-		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-			_, _ = w.Write([]byte(body))
-		}))
-		defer srv.Close()
+		srv := serveBody(t, body)
 		target := testTarget(srv.URL) // owner Deployment "dep1" -> service.name dep1
 		target.Pod.Name = "ksm-abc"
 		target.Pod.Labels = map[string]string{"app.kubernetes.io/name": "kube-state-metrics"}
@@ -273,10 +262,7 @@ kube_namespace_labels{namespace="ns1",label_team="core",label_env="prod",owner="
 # TYPE kube_node_labels gauge
 kube_node_labels{node="node9",label_zone="eu-1"} 1
 `
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = w.Write([]byte(body))
-	}))
-	defer srv.Close()
+	srv := serveBody(t, body)
 
 	target := testTarget(srv.URL)
 	target.Pod.Name = "ksm-abc"
@@ -344,10 +330,7 @@ kube_node_labels{node="node9",label_zone="eu-1"} 1
 func TestSplitterAttributesDontOverride(t *testing.T) {
 	body := "# TYPE kube_pod_info gauge\n" +
 		`kube_pod_info{namespace="ns1",pod="pod1",uid="` + uid1 + `"} 1` + "\n"
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = w.Write([]byte(body))
-	}))
-	defer srv.Close()
+	srv := serveBody(t, body)
 
 	target := testTarget(srv.URL)
 	target.Pod.Name = "ksm-abc"
@@ -396,10 +379,7 @@ kube_pod_info{pod="worker-1"} 1
 # TYPE kube_node_info gauge
 kube_node_info{node="worker-1"} 1
 `
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = w.Write([]byte(body))
-	}))
-	defer srv.Close()
+	srv := serveBody(t, body)
 
 	target := testTarget(srv.URL)
 	target.Pod.Name = "ksm-abc"
@@ -513,10 +493,7 @@ kube_pod_size_bytes{namespace="ns1",pod="pod1",quantile="0.99"} 250
 kube_pod_size_bytes_sum{namespace="ns1",pod="pod1"} 1000
 kube_pod_size_bytes_count{namespace="ns1",pod="pod1"} 8
 `
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = w.Write([]byte(body))
-	}))
-	defer srv.Close()
+	srv := serveBody(t, body)
 
 	target := testTarget(srv.URL)
 	target.Pod.Name = "ksm-abc"

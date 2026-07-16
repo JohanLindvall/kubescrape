@@ -100,16 +100,7 @@ const logName = "pod1_ns1_app-0123456789abcdef.log"
 
 func writeLog(t *testing.T, dir string, lines ...string) {
 	t.Helper()
-	f, err := os.OpenFile(filepath.Join(dir, logName), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = f.Close() }()
-	for _, l := range lines {
-		if _, err := fmt.Fprintln(f, l); err != nil {
-			t.Fatal(err)
-		}
-	}
+	writeLines(t, filepath.Join(dir, logName), lines...)
 }
 
 func newTestTailer(dir, checkpoint string, exp *fakeExporter) *Tailer {

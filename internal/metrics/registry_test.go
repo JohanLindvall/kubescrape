@@ -10,12 +10,6 @@ import (
 	"go.opentelemetry.io/collector/pdata/pmetric"
 )
 
-// findRegistryMetric returns the named metric from the last export.
-func findRegistryMetric(t *testing.T, exp *capExporter, name string) (pmetric.Metric, bool) {
-	t.Helper()
-	return exp.find(name)
-}
-
 func TestRegistryExport(t *testing.T) {
 	r := NewRegistry()
 	c := r.Counter("test_reg_total", "a counter")
@@ -50,7 +44,7 @@ func TestRegistryExport(t *testing.T) {
 	}
 
 	// Counter: cumulative sum 3 (plus zero-baseline points on first export).
-	m, ok := findRegistryMetric(t, exp, "test_reg_total")
+	m, ok := exp.find("test_reg_total")
 	if !ok || m.Type() != pmetric.MetricTypeSum || !m.Sum().IsMonotonic() {
 		t.Fatalf("counter metric shape wrong: %v", ok)
 	}
@@ -74,7 +68,7 @@ func TestRegistryExport(t *testing.T) {
 	}
 
 	// Gauge: last set wins.
-	m, ok = findRegistryMetric(t, exp, "test_reg_gauge")
+	m, ok = exp.find("test_reg_gauge")
 	if !ok || m.Type() != pmetric.MetricTypeGauge {
 		t.Fatal("gauge missing")
 	}
@@ -83,13 +77,13 @@ func TestRegistryExport(t *testing.T) {
 	}
 
 	// GaugeFunc evaluated at export.
-	m, ok = findRegistryMetric(t, exp, "test_reg_func")
+	m, ok = exp.find("test_reg_func")
 	if !ok || m.Gauge().DataPoints().At(0).DoubleValue() != 7 {
 		t.Fatal("gauge func missing/wrong")
 	}
 
 	// Histogram: count/sum and label.
-	m, ok = findRegistryMetric(t, exp, "test_reg_seconds")
+	m, ok = exp.find("test_reg_seconds")
 	if !ok || m.Type() != pmetric.MetricTypeHistogram {
 		t.Fatal("histogram missing")
 	}

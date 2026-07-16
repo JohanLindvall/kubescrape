@@ -1711,7 +1711,7 @@ func (t *Tailer) drainReader(ctx context.Context, f *file, r io.Reader, what str
 			// Bypass the rate limit: pausing a drain would lose the remainder
 			// when the fd is dropped.
 			t.consume(ctx, f, true)
-			t.flushDuringDrain(ctx, f)
+			t.flushDuringDrain(ctx)
 		}
 		if err != nil {
 			return
@@ -1723,7 +1723,7 @@ func (t *Tailer) drainReader(ctx context.Context, f *file, r io.Reader, what str
 // flushDuringDrain keeps a large drain from accumulating everything into one
 // batch (and one OTLP payload, likely over the collector's receive limit) and
 // from starving the sweep for the drain's whole duration.
-func (t *Tailer) flushDuringDrain(ctx context.Context, f *file) {
+func (t *Tailer) flushDuringDrain(ctx context.Context) {
 	if len(t.batch) >= t.cfg.BatchSize {
 		// SYNCHRONOUS even in pipelined mode: drains run inside rotation/gone
 		// handling, and a handed-off export would still be in flight when reopen
@@ -2050,8 +2050,6 @@ func (t *Tailer) findRotated(f *file, p rotatedPrefix) (string, bool) {
 	return "", false
 }
 
-// drop closes a removed file, draining first the fd (bytes appended since
-// the last read) and then the pipeline.
 // drop drains a vanished file into the batch and releases it. It is the
 // unconditional form (shutdown); the sweep uses drainGone/release so it can
 // hold the fd until the drained lines are actually exported.

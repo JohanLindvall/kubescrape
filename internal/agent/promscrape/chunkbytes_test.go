@@ -18,11 +18,7 @@ const grpcDefaultLimit = 4 << 20
 
 func serve(t *testing.T, body string) string {
 	t.Helper()
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = w.Write([]byte(body))
-	}))
-	t.Cleanup(srv.Close)
-	return srv.URL
+	return serveBody(t, body).URL
 }
 
 // TestChunksStayUnderCollectorLimit: a label-rich family of 10k series marshals

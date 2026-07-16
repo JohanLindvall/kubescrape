@@ -200,14 +200,12 @@ func TestEvictThenReadmitAtCap(t *testing.T) {
 	}
 }
 
-// TestExpiryEmitsBeforeDiscarding: the snapshot idle-reset zeroes a
-// non-aggregating sample WITHOUT emitting it. When the configured maxAge is
-// shorter than the export interval (nothing validates or clamps this — see
-// Dynamic.maxAge, which only caps the maximum), every observation made since
-// the last export is silently destroyed: observed at t, exported never.
-// Expected behavior: an observation must appear in at least one export before
-// the idle reset may zero it (or maxAge must be clamped to >= the export
-// interval). FAILS until fixed.
+// TestExpiryEmitsBeforeDiscarding: the snapshot idle-reset used to zero a
+// non-aggregating sample WITHOUT emitting it — with maxAge shorter than the
+// export interval (legal; nothing clamps it), every observation made since
+// the last export was silently destroyed: observed at t, exported never.
+// Regression guard for the fix: an observation must appear in at least one
+// export before the idle reset may zero it (expiringSample.exported).
 func TestExpiryEmitsBeforeDiscarding(t *testing.T) {
 	t0 := int64(1_700_510_000)
 	setTimeForTest(time.Unix(t0, 0))
@@ -589,12 +587,11 @@ func TestRegistryConcurrentExportAndObserve(t *testing.T) {
 //
 // TestValueRegexpFiltersCountingActions: valueRegexp is documented as
 // "a line that does not match is skipped" — it is both an extractor AND a
-// filter. metricRule.needsValue() (dynamic.go:174) returns false for gauge
-// inc/dec/count, so metricRule.observe (dynamic.go:218) never calls readValue
-// and the regexp is NEVER evaluated: every line passing the selectors is
-// counted, including lines the valueRegexp rejects. Nothing at compile time
-// rejects the combination either. FAILS until fixed (either evaluate valueRe
-// as a filter regardless of needsValue, or reject the config).
+// filter. needsValue() returns false for gauge inc/dec/count, so observe used
+// to skip readValue entirely and the regexp was NEVER evaluated: every line
+// passing the selectors was counted, including lines the valueRegexp rejects.
+// Regression guard for the fix: valueRe is evaluated as a filter even for
+// counting actions.
 func TestValueRegexpFiltersCountingActions(t *testing.T) {
 	setTimeForTest(time.Unix(1_701_000_000, 0))
 	defer testEpoch.Store(0)
@@ -623,21 +620,20 @@ func TestValueRegexpFiltersCountingActions(t *testing.T) {
 
 // --- Angle 9: hash domain separation between the three label namespaces -------
 //
-// TestResourceAndDataPointLabelsHaveSeparateHashDomains: the series key is a plain
-// sum of combineHash(key,value) over the data-point labels (series.go:331), the
-// resource attributes (resource.go:19) and the resource labels (resource.go:47)
-// — all three namespaces fold into ONE accumulator with NO domain tag. So a
-// pair contributed as a DATA-POINT label is indistinguishable from the same pair
-// contributed as a RESOURCE attribute: the primary hash AND the check hash are
-// identical by construction, so the check cannot catch it, and the second
-// observation merges into the first sample — recorded under the wrong identity
-// (its resource label silently becomes a data-point label of another series).
+// TestResourceAndDataPointLabelsHaveSeparateHashDomains: the series key used
+// to be a plain sum of combineHash(key,value) over the data-point labels, the
+// resource attributes and the resource labels — all three namespaces folded
+// into ONE accumulator with NO domain tag. A pair contributed as a DATA-POINT
+// label was indistinguishable from the same pair contributed as a RESOURCE
+// attribute (the primary AND check hashes were identical by construction), so
+// the second observation merged into the first sample — recorded under the
+// wrong identity.
 //
 // Reachable whenever two rules share a metric name (a documented feature —
 // "rules sharing a name share one series") and one lifts a key onto the resource
-// that the other keeps on the data point. FAILS until the resource/resource-label
-// contributions are domain-separated (e.g. fold combineHash(hk^resourceDomain,
-// hv), which keeps the fold-subtract exactness).
+// that the other keeps on the data point. Regression guard for the fix: the
+// resource contributions fold under a separate hash domain
+// (combineResHash/combineResCheck).
 func TestResourceAndDataPointLabelsHaveSeparateHashDomains(t *testing.T) {
 	setTimeForTest(time.Unix(1_701_100_000, 0))
 	defer testEpoch.Store(0)

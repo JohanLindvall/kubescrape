@@ -141,25 +141,24 @@ func monitorPodPort(pod kubemeta.Pod, svc *services.Service, ep servicemonitors.
 		}
 		return 0, false
 	}
-	if ep.TargetPort != nil {
-		// IntValue() on a string-typed value Atoi's it ignoring the error and
-		// returns a full int, so parse and bound explicitly: "4294967297"
-		// must be rejected, not truncated to port 1.
-		if n, ok := monitorPortNumber(*ep.TargetPort); ok {
-			return n, true
-		}
-		// Only a String-typed, non-empty targetPort may resolve by container
-		// port NAME: an Int-typed value always has StrVal == "" (a rejected
-		// number like 0 or 70000 names nothing), and matching "" against an
-		// UNNAMED container port by "" == "" would fabricate a phantom target.
-		if ep.TargetPort.Type != intstr.String || ep.TargetPort.StrVal == "" {
-			return 0, false
-		}
-		for _, c := range pod.Containers {
-			for _, p := range c.Ports {
-				if p.Name == ep.TargetPort.StrVal {
-					return p.Port, true
-				}
+	// Port was empty, so TargetPort is non-nil (the guard above returned for
+	// the neither-set case). IntValue() on a string-typed value Atoi's it
+	// ignoring the error and returns a full int, so parse and bound explicitly:
+	// "4294967297" must be rejected, not truncated to port 1.
+	if n, ok := monitorPortNumber(*ep.TargetPort); ok {
+		return n, true
+	}
+	// Only a String-typed, non-empty targetPort may resolve by container port
+	// NAME: an Int-typed value always has StrVal == "" (a rejected number like
+	// 0 or 70000 names nothing), and matching "" against an UNNAMED container
+	// port by "" == "" would fabricate a phantom target.
+	if ep.TargetPort.Type != intstr.String || ep.TargetPort.StrVal == "" {
+		return 0, false
+	}
+	for _, c := range pod.Containers {
+		for _, p := range c.Ports {
+			if p.Name == ep.TargetPort.StrVal {
+				return p.Port, true
 			}
 		}
 	}

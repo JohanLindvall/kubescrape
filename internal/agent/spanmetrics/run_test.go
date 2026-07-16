@@ -2,7 +2,6 @@ package spanmetrics
 
 import (
 	"context"
-	"sync"
 	"testing"
 	"time"
 
@@ -11,33 +10,13 @@ import (
 	"go.opentelemetry.io/collector/pdata/ptrace"
 )
 
-type syncExporter struct {
-	mu sync.Mutex
-	md []pmetric.Metrics
-}
-
-func (c *syncExporter) ExportMetrics(_ context.Context, md pmetric.Metrics) error {
-	cp := pmetric.NewMetrics()
-	md.CopyTo(cp)
-	c.mu.Lock()
-	c.md = append(c.md, cp)
-	c.mu.Unlock()
-	return nil
-}
-
-func (c *syncExporter) exports() int {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return len(c.md)
-}
-
 // Run must flush once more on shutdown (with a fresh context): spans consumed
 // after the last tick would otherwise be silently lost.
 func TestRunFinalFlushOnShutdown(t *testing.T) {
 	g := New(Config{})
 	g.Consume(traces("svc", spanSpec{name: "op", kind: ptrace.SpanKindServer, status: ptrace.StatusCodeOk, dur: 0.01}))
 
-	exp := &syncExporter{}
+	exp := &capExporter{}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	// A long interval guarantees the ticker never fires; only the shutdown
@@ -63,7 +42,7 @@ func TestRunFinalFlushOnShutdown(t *testing.T) {
 // An idle generator's Export sends nothing (no empty payloads on quiet cycles).
 func TestExportIdleSendsNothing(t *testing.T) {
 	g := New(Config{})
-	exp := &syncExporter{}
+	exp := &capExporter{}
 	if err := g.Export(context.Background(), exp, pcommon.NewResource()); err != nil {
 		t.Fatal(err)
 	}
@@ -123,7 +102,7 @@ func TestTapDoesNotDoubleCountOnRetry(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	exp := &syncExporter{}
+	exp := &capExporter{}
 	if err := g.Export(context.Background(), exp, pcommon.NewResource()); err != nil {
 		t.Fatal(err)
 	}

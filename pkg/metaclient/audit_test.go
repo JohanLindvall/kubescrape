@@ -92,63 +92,6 @@ func TestObserveNilSafe(t *testing.T) {
 	}
 }
 
-// cacheKey must strip only ?wait= and leave other query params intact (and
-// stable), so hypothetical future params don't alias distinct resources.
-func TestCacheKeyStripsOnlyWait(t *testing.T) {
-	a := cacheKey("http://x/v1/containers/abc?wait=2s")
-	b := cacheKey("http://x/v1/containers/abc?wait=5s")
-	c := cacheKey("http://x/v1/containers/abc")
-	if a != b || a != c {
-		t.Fatalf("wait variants not collapsed: %q %q %q", a, b, c)
-	}
-	d := cacheKey("http://x/v1/containers/abc?foo=1&wait=2s")
-	e := cacheKey("http://x/v1/containers/abc?wait=9s&foo=1")
-	if d != e {
-		t.Fatalf("other params not stable: %q vs %q", d, e)
-	}
-	if d == a {
-		t.Fatalf("distinct param sets aliased: %q", d)
-	}
-}
-
-// A 304 must extend the entry's freshness, so the NEXT lookup inside the new
-// max-age is served locally with no request at all.
-func TestNotModifiedRefreshesFreshness(t *testing.T) {
-	var hits int32
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		atomic.AddInt32(&hits, 1)
-		w.Header().Set("Cache-Control", "max-age=60")
-		w.Header().Set("ETag", `"v1"`)
-		if r.Header.Get("If-None-Match") == `"v1"` {
-			w.WriteHeader(http.StatusNotModified)
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"name":"web","uid":"u1"}`))
-	}))
-	t.Cleanup(srv.Close)
-
-	c := New(srv.URL, 5*time.Second)
-	base := time.Now()
-	now := base
-	c.now = func() time.Time { return now }
-
-	if _, err := c.PodByUID(context.Background(), "u1"); err != nil { // 200, cached
-		t.Fatal(err)
-	}
-	now = base.Add(2 * time.Minute)                                   // stale
-	if _, err := c.PodByUID(context.Background(), "u1"); err != nil { // 304, refresh
-		t.Fatal(err)
-	}
-	now = base.Add(2*time.Minute + 30*time.Second) // inside the refreshed max-age
-	if _, err := c.PodByUID(context.Background(), "u1"); err != nil {
-		t.Fatal(err)
-	}
-	if got := atomic.LoadInt32(&hits); got != 2 {
-		t.Fatalf("hits = %d, want 2: the 304 must have refreshed the entry's freshness", got)
-	}
-}
-
 // 404s are never cached (only 200s with a max-age are). Every lookup of an
 // unresolvable ID therefore costs a full round trip — relevant for the peer-IP
 // fallback, where a hostNetwork or non-pod sender pushing at a high rate

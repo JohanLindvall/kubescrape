@@ -13,29 +13,35 @@ import (
 	"github.com/JohanLindvall/kubescrape/internal/obs"
 )
 
-type capExporter struct{ md []pmetric.Metrics }
+// capExporter captures exported metric payloads (mutexed: Run tests read it
+// from the test goroutine while the Run goroutine exports).
+type capExporter struct {
+	mu sync.Mutex
+	md []pmetric.Metrics
+}
 
 func (c *capExporter) ExportMetrics(_ context.Context, md pmetric.Metrics) error {
 	cp := pmetric.NewMetrics()
 	md.CopyTo(cp)
+	c.mu.Lock()
 	c.md = append(c.md, cp)
+	c.mu.Unlock()
 	return nil
 }
 
-// find returns the metric with the given name from the last export.
+func (c *capExporter) exports() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return len(c.md)
+}
+
+// find returns the metric with the given name from any export.
 func (c *capExporter) find(name string) (pmetric.Metric, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	for _, md := range c.md {
-		rms := md.ResourceMetrics()
-		for i := 0; i < rms.Len(); i++ {
-			sms := rms.At(i).ScopeMetrics()
-			for j := 0; j < sms.Len(); j++ {
-				ms := sms.At(j).Metrics()
-				for k := 0; k < ms.Len(); k++ {
-					if ms.At(k).Name() == name {
-						return ms.At(k), true
-					}
-				}
-			}
+		if m, ok := findIn(md, name); ok {
+			return m, true
 		}
 	}
 	return pmetric.Metric{}, false

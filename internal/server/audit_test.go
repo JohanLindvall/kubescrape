@@ -61,15 +61,7 @@ func TestWaitParameterEdgeCases(t *testing.T) {
 func TestETagStableAcrossIdenticalResponses(t *testing.T) {
 	st := store.New(time.Minute)
 	addPod(st)
-	srv := httptest.NewServer(New(Config{
-		Store:    st,
-		Services: services.NewIndex(),
-		Resolver: stubResolver{},
-		MaxWait:  500 * time.Millisecond,
-		CacheTTL: 10 * time.Second,
-		Ready:    closedChan(),
-	}).Handler())
-	t.Cleanup(srv.Close)
+	srv := cachingServer(t, st, 10*time.Second)
 
 	get := func() string {
 		resp, err := http.Get(srv.URL + "/v1/containers/cafe01")

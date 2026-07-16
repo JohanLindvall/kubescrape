@@ -64,10 +64,7 @@ func TestScrapeChunking(t *testing.T) {
 	for i := 0; i < 25; i++ {
 		fmt.Fprintf(&body, "things_total{i=\"%d\"} %d\n", i, i)
 	}
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = w.Write([]byte(body.String()))
-	}))
-	defer srv.Close()
+	srv := serveBody(t, body.String())
 
 	exp := &captureExporter{}
 	s := New(Config{
@@ -192,10 +189,7 @@ rpc{quantile="0.99"} 3.2
 rpc_sum 8000
 rpc_count 2000
 `
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = w.Write([]byte(body))
-	}))
-	defer srv.Close()
+	srv := serveBody(t, body)
 
 	exp := &captureExporter{}
 	s := New(Config{
@@ -377,10 +371,7 @@ func TestScrapeExemplarsDisabled(t *testing.T) {
 }
 
 func TestScrapeAttrFilter(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = w.Write([]byte("m 1\n"))
-	}))
-	defer srv.Close()
+	srv := serveBody(t, "m 1\n")
 
 	filter, err := attrs.NewFilter("", `k8s\.pod\.label\..*,url\.full,k8s\.service\..*`)
 	if err != nil {

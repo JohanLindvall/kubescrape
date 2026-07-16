@@ -5,30 +5,7 @@ import (
 	"context"
 	"strings"
 	"testing"
-
-	"go.opentelemetry.io/collector/pdata/pcommon"
 )
-
-// fuzzTailer builds a tailer plus one resolved containerd file whose pipeline
-// is fed directly (the bench_test.go white-box setup).
-func fuzzTailer(cfg Config) (*Tailer, *file) {
-	cfg.Exporter = nullExporter{}
-	cfg.Metadata = fakeMeta{}
-	if cfg.BatchSize == 0 {
-		cfg.BatchSize = 1 << 30 // never flush implicitly
-	}
-	tl := New(cfg)
-	f := &file{
-		path:        "/var/log/containers/" + logName,
-		source:      &compiledSource{name: "containers", containerd: true, multiline: cfg.Multiline},
-		containerID: "0123456789abcdef",
-		resolved:    true,
-		resource:    pcommon.NewResource(),
-	}
-	tl.newPipeline(f)
-	tl.files[f.path] = f
-	return tl, f
-}
 
 // FuzzFeedLine pushes arbitrary byte lines (split on '\n', as consume does)
 // through feedLine on a containerd file, with the trace-joining stage on and
@@ -70,7 +47,7 @@ func FuzzFeedLine(f *testing.F) {
 		if sizeClass%2 == 1 {
 			maxEntry = 96 // small cap: over-limit truncation and drop paths
 		}
-		tl, file := fuzzTailer(Config{Multiline: multiline, MaxEntryBytes: maxEntry})
+		tl, file := benchTailer(t, Config{Multiline: multiline, MaxEntryBytes: maxEntry})
 		ctx := context.Background()
 
 		var total int64

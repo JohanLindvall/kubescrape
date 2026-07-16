@@ -1,30 +1,22 @@
 package store
 
-// AUDIT round 5 (adversarial review of bbcf4bb): the byPodIP claim is now
-// ordered by CreatedAt.
+// Regression guards for the byPodIP claim ordering. A CreatedAt-ordered claim
+// was tried and abandoned; final semantics: every live pod claims
+// (last-write-wins) and a TERMINATING pod yields to a live incumbent.
 
 import (
 	"testing"
 	"time"
 )
 
-// TestLateScheduledPodClaimsRecycledIP: CreatedAt orders the CLAIM, but the
-// live owner of a recycled IP is not necessarily the newest pod. A pod may be
-// created long before it is scheduled (unschedulable, waiting on a PVC or a
-// node scale-up) and only then get an IP from the CNI — an IP the pod that just
-// died was holding. That dead pod is still in the index with phase Running
-// (terminating pods keep it; the delete event has not landed yet), and it has
-// the LATER CreatedAt, so the guard now refuses the live owner's claim.
-//
-// GetPodByIP then answers with the dead pod for as long as its record survives:
-// the ingest peer-IP fallback stamps the pending pod's telemetry with the wrong
-// k8s.pod.name / service.name. The pre-fix code got this case right (last write
-// wins), so this is a new mis-attribution introduced by the ordering, not a
-// pre-existing one.
-//
-// (Related, one line: metav1.Time has SECOND granularity, so two pods created
-// within the same second compare equal and the ordering degenerates to
-// last-write-wins — the very re-steal the fix exists to prevent.)
+// TestLateScheduledPodClaimsRecycledIP: the live owner of a recycled IP is
+// not necessarily the newest pod. A pod may be created long before it is
+// scheduled (unschedulable, waiting on a PVC or a node scale-up) and only then
+// get an IP from the CNI — an IP a just-died pod was holding, still in the
+// index with phase Running and a LATER CreatedAt. A CreatedAt-ordered claim
+// refused the live owner here (answering the ingest peer-IP fallback with the
+// dead pod), which is why that design was abandoned: a pod's age says nothing
+// about who currently holds the address. This pins the last-write-wins claim.
 func TestLateScheduledPodClaimsRecycledIP(t *testing.T) {
 	s := New(time.Minute)
 

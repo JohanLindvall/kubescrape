@@ -249,7 +249,6 @@ func (g *metricGrouper) resource(id string) pmetric.ResourceMetrics {
 	return rm
 }
 
-// stripIDAttrs removes the configured container-ID/pod-UID attribute keys.
 // putIDAttr re-stamps the described object's raw ID under its canonical
 // (first-configured) attribute key, so unresolved split points remain
 // re-attributable downstream.
@@ -266,6 +265,7 @@ func (g *metricGrouper) putIDAttr(a pcommon.Map, token string) {
 	}
 }
 
+// stripIDAttrs removes the configured container-ID/pod-UID attribute keys.
 func (g *metricGrouper) stripIDAttrs(a pcommon.Map) {
 	for _, k := range g.enricher.containerIDKeys {
 		a.Remove(k)

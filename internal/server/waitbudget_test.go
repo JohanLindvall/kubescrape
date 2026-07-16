@@ -6,7 +6,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/JohanLindvall/kubescrape/internal/services"
 	"github.com/JohanLindvall/kubescrape/internal/store"
 )
 
@@ -42,11 +41,7 @@ func TestWaitBudgetSubSecondMaxWait(t *testing.T) {
 func TestPodByIPUncached(t *testing.T) {
 	st := store.New(time.Minute)
 	addPod(st)
-	srv := httptest.NewServer(New(Config{
-		Store: st, Services: services.NewIndex(), Resolver: stubResolver{},
-		MaxWait: 500 * time.Millisecond, CacheTTL: 10 * time.Second, Ready: closedChan(),
-	}).Handler())
-	t.Cleanup(srv.Close)
+	srv := cachingServer(t, st, 10*time.Second)
 
 	get := func(path string) http.Header {
 		resp, err := http.Get(srv.URL + path)

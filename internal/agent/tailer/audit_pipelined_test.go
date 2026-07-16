@@ -17,16 +17,7 @@ const logName2 = "pod2_ns1_app-fedcba9876543210.log"
 
 func writeLog2(t *testing.T, dir string, lines ...string) {
 	t.Helper()
-	fh, err := os.OpenFile(filepath.Join(dir, logName2), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = fh.Close() }()
-	for _, l := range lines {
-		if _, err := fh.WriteString(l + "\n"); err != nil {
-			t.Fatal(err)
-		}
-	}
+	writeLines(t, filepath.Join(dir, logName2), lines...)
 }
 
 // drivePipelined is driveTailer with pipelined export, driven synchronously by

@@ -66,11 +66,10 @@ func TestCountBumpTwiceEmitsTwice(t *testing.T) {
 	}
 }
 
-// BUG: an event about a pod is attributed with attrs.Pod(res, np.Pod) straight
-// off the store record. The store never resolves the owner chain (that is the
-// server's lazy per-request enrich, which the events exporter does not have —
-// Config carries no owners.Resolver), so np.Pod.Owners is always nil. Two
-// consequences on EVERY pod-event resource:
+// Regression guard: an event about a pod used to be attributed straight off
+// the store record. The store never resolves the owner chain (that is the
+// server's lazy per-request enrich), so np.Pod.Owners was always nil, with
+// two consequences on EVERY pod-event resource:
 //
 //   - no k8s.deployment.name / k8s.replicaset.name / k8s.statefulset.name /
 //     k8s.daemonset.name / k8s.job.name / k8s.cronjob.name, and no namespace
@@ -82,8 +81,9 @@ func TestCountBumpTwiceEmitsTwice(t *testing.T) {
 //     pod replica gets its own service.name (per-replica cardinality that
 //     churns on every rollout).
 //
-// The resource also never goes through attrs.Build/attrs.Identity, so it has no
-// service.namespace or service.instance.id either.
+// The resource also never went through attrs.Identity, so it had no
+// service.namespace or service.instance.id either. The fix: Config carries an
+// owners.Resolver and the exporter finishes each resource with attrs.Identity.
 func TestEventPodResourceCarriesWorkloadAttrs(t *testing.T) {
 	ctrl := true
 	st := store.New(time.Minute)

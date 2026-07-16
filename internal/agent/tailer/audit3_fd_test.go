@@ -1,8 +1,8 @@
 package tailer
 
-// AUDIT round 5 (adversarial review of e39542d): the tailer now RETAINS file
-// descriptors in two new places — one per carried rotation prefix, and the
-// compressed archive's fd past EOF/rewind. These repros pin what that broke.
+// The tailer RETAINS file descriptors in two places — one per carried
+// rotation prefix, and the compressed archive's fd past EOF/rewind. These
+// regression guards pin the loss bugs that introducing that retention fixed.
 
 import (
 	"context"

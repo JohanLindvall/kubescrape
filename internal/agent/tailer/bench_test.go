@@ -18,8 +18,8 @@ type nullExporter struct{}
 func (nullExporter) ExportLogs(context.Context, plog.Logs) error { return nil }
 
 // benchTailer builds a tailer + one resolved containerd file whose pipeline
-// can be fed directly, bypassing the filesystem.
-func benchTailer(b *testing.B, cfg Config) (*Tailer, *file) {
+// can be fed directly, bypassing the filesystem (shared with fuzz_test.go).
+func benchTailer(b testing.TB, cfg Config) (*Tailer, *file) {
 	b.Helper()
 	cfg.Exporter = nullExporter{}
 	cfg.Metadata = fakeMeta{}

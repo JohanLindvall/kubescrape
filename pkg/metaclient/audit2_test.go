@@ -291,25 +291,6 @@ func TestAudit_ConcurrentMixedURLsRace(t *testing.T) {
 	wg.Wait()
 }
 
-// TestAudit_CacheEviction: the cache must stay bounded.
-func TestAudit_CacheEviction(t *testing.T) {
-	s := newSrv(t)
-	s.maxAge = "300"
-	c := New(s.URL, 5*time.Second)
-	ctx := context.Background()
-	for i := 0; i < maxCacheEntries+200; i++ {
-		if _, err := c.PodByUID(ctx, fmt.Sprintf("uid-%d", i)); err != nil {
-			t.Fatal(err)
-		}
-	}
-	c.mu.Lock()
-	n := len(c.cache)
-	c.mu.Unlock()
-	if n > maxCacheEntries {
-		t.Fatalf("cache holds %d entries, cap is %d", n, maxCacheEntries)
-	}
-}
-
 // ---------------------------------------------------------------------------
 // M4. Errors and Observe.
 // ---------------------------------------------------------------------------

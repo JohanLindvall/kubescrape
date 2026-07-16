@@ -74,6 +74,7 @@ type Pod struct {
 	NodeName    string            `json:"nodeName,omitempty"`
 	PodIP       string            `json:"podIP,omitempty"`
 	HostIP      string            `json:"hostIP,omitempty"`
+	HostNetwork bool              `json:"hostNetwork,omitempty"`
 	Phase       string            `json:"phase,omitempty"`
 	Labels      map[string]string `json:"labels,omitempty"`
 	Annotations map[string]string `json:"annotations,omitempty"`

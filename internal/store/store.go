@@ -194,7 +194,11 @@ func (s *Store) UpsertPod(p *corev1.Pod) {
 	s.byPodName[pod.Namespace+"/"+pod.Name] = rec
 
 	ip := pod.PodIP
-	if ip == pod.HostIP {
+	// The spec flag is the authoritative signal; the IP comparison stays as a
+	// backstop for records converted before the field existed. Value equality
+	// alone has a hole: an upsert carrying status.podIP before status.hostIP
+	// is populated would let a hostNetwork pod claim the node IP.
+	if pod.HostNetwork || ip == pod.HostIP {
 		ip = "" // hostNetwork: the node IP is shared, not an identity
 	}
 	if finishedPhase(pod.Phase) {
@@ -346,7 +350,13 @@ func (s *Store) GetContainer(ctx context.Context, id string) (ContainerResult, b
 		select {
 		case <-ctx.Done():
 			s.removeWaiter(id, ch)
-			return ContainerResult{}, false, nil
+			// The deadline and the wakeup can be ready simultaneously (select
+			// picks arbitrarily): if the ID landed within the budget, serve it
+			// rather than 404ing a request whose wait actually succeeded.
+			s.mu.RLock()
+			res, ok, _ = s.lookupLocked(id)
+			s.mu.RUnlock()
+			return res, ok, nil
 		case <-ch:
 			// The ID was indexed; loop to fetch it.
 		}

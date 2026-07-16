@@ -1466,7 +1466,22 @@ func (t *Tailer) readArchive(ctx context.Context, f *file) error {
 		f.inode, f.fp = 0, fingerprint{}
 		f.archiveDone, f.archiveEOF = false, false
 		f.pending = f.pending[:0]
+		// Mirror reopen's reset exactly: the gen bump keeps batched entries
+		// with OLD-stream offsets from committing (or rewinding) into the
+		// replacement's offset space, and a pause-mode rate limit must not
+		// survive the restart — pending is gone and only an allowed line
+		// clears the flag, so a stale `limited` would wedge the file forever.
+		f.gen++
+		f.limited = false
 		t.newPipeline(f)
+	}
+	// A paused (rate-limited) file first retries its retained pending bytes —
+	// and must do so BEFORE the archiveDone short-circuit below: an archive
+	// can hit EOF with its tail still pending (tokens exhausted mid-consume),
+	// and the done path would otherwise return early on every sweep, wedging
+	// those lines forever while the tokens sit refilled and unconsulted.
+	if f.limited {
+		t.consume(ctx, f, false)
 	}
 	if f.gz == nil {
 		// An fd retained for recovery (see closeArchiveReader) can go once its
@@ -1495,9 +1510,6 @@ func (t *Tailer) readArchive(ctx context.Context, f *file) error {
 		if err := t.openArchive(f); err != nil {
 			return err
 		}
-	}
-	if f.limited {
-		t.consume(ctx, f, false)
 	}
 	budget := t.cfg.MaxBytesPerSweep
 	buf := t.scratch()

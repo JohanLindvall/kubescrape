@@ -1,6 +1,7 @@
 package servicemonitors
 
 import (
+	"slices"
 	"testing"
 
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -175,5 +176,32 @@ func TestIndexUnparseableUpdateRemoves(t *testing.T) {
 	}
 	if got := ix.All(); len(got) != 0 {
 		t.Fatalf("stale monitor still served after unparseable update: %d", len(got))
+	}
+}
+
+// All must return monitors in namespace/name order: map iteration order must
+// not decide which monitor a URL-deduped target is attributed to, or the kept
+// target's Monitor field would flip between cache rebuilds.
+func TestAllIsDeterministicallyOrdered(t *testing.T) {
+	ix := NewIndex()
+	spec := map[string]any{
+		"selector":  map[string]any{"matchLabels": map[string]any{"app": "web"}},
+		"endpoints": []any{map[string]any{"port": "metrics"}},
+	}
+	for _, nn := range [][2]string{{"zz", "m1"}, {"aa", "m2"}, {"aa", "m1"}, {"mm", "x"}} {
+		if err := ix.Upsert(monitorObj(nn[0], nn[1], spec)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i := 0; i < 20; i++ { // map order varies per run; make one run enough
+		got := ix.All()
+		var keys []string
+		for _, m := range got {
+			keys = append(keys, m.Namespace+"/"+m.Name)
+		}
+		want := []string{"aa/m1", "aa/m2", "mm/x", "zz/m1"}
+		if !slices.Equal(keys, want) {
+			t.Fatalf("All() order = %v, want %v", keys, want)
+		}
 	}
 }

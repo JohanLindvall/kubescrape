@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"sync"
 	"unsafe"
 
 	ljson "github.com/JohanLindvall/lightning/pkg/json"
@@ -70,6 +71,16 @@ type Extractor struct {
 	// scan captures only configured keys instead of building a map of every
 	// pair.
 	want map[string][]int
+	// scratch pools per-call state: the tailer and journald goroutines share
+	// one Extractor and call Extract per exported line.
+	scratch sync.Pool
+}
+
+// scratch is the reusable per-Extract state.
+type scratch struct {
+	raws  [][]byte
+	vals  []string
+	found []bool
 }
 
 type compiledRule struct {
@@ -124,32 +135,35 @@ func New(cfg *Config) (*Extractor, error) {
 // Extract parses line (JSON when it starts with '{', else logfmt) and returns
 // the configured attributes. A nil Extractor returns an empty Result. JSON is
 // scanned once for all rule paths with the lightning toolkit; logfmt uses the
-// logfmt reader.
+// logfmt reader. Per-call state is pooled and scalars decode straight off the
+// raw tokens (string values alias the line where escape-free), keeping the
+// per-line allocations to the extracted values themselves.
 func (e *Extractor) Extract(line string) Result {
 	var res Result
 	if e == nil {
 		return res
 	}
+	sc, _ := e.scratch.Get().(*scratch)
+	if sc == nil {
+		sc = &scratch{vals: make([]string, len(e.rules)), found: make([]bool, len(e.rules))}
+	}
+	defer e.scratch.Put(sc)
 	if t := strings.TrimSpace(line); strings.HasPrefix(t, "{") {
 		// Read-only view of the line: lightning never mutates its input, so
 		// the string→[]byte copy is avoidable.
 		buf := unsafe.Slice(unsafe.StringData(t), len(t))
-		vals, err := ljson.GetPaths(buf, e.paths, nil)
+		raws, err := ljson.GetPaths(buf, e.paths, sc.raws[:0])
+		sc.raws = raws[:0]
 		if err != nil {
 			return res
 		}
-		for i, raw := range vals {
+		for i, raw := range raws {
 			if raw == nil {
 				continue
 			}
-			v, err := ljson.DecodeAny(raw)
-			if err != nil {
-				continue
+			if v, ok := decodeScalar(raw); ok {
+				e.add(&res, i, v)
 			}
-			if !scalar(v) {
-				continue
-			}
-			e.add(&res, i, v)
 		}
 		return res
 	}
@@ -159,8 +173,10 @@ func (e *Extractor) Extract(line string) Result {
 	// Only the configured keys are captured (a duplicate key keeps its last
 	// value, matching the former all-pairs map); results are emitted in rule
 	// order so equal attribute sets always yield equal grouping keys.
-	vals := make([]string, len(e.rules))
-	found := make([]bool, len(e.rules))
+	vals, found := sc.vals, sc.found
+	for i := range found {
+		vals[i], found[i] = "", false
+	}
 	buf := unsafe.Slice(unsafe.StringData(line), len(line))
 	_ = logfmt.Iterate(buf, func(key, val []byte) bool {
 		if idxs, ok := e.want[string(key)]; ok { // string(key) lookup: no alloc
@@ -179,14 +195,34 @@ func (e *Extractor) Extract(line string) Result {
 	return res
 }
 
-// scalar reports whether a lightning-decoded value is an attribute-worthy
-// scalar (objects, arrays and null are not).
-func scalar(v any) bool {
-	switch v.(type) {
-	case string, float64, bool:
-		return true
-	default:
-		return false
+// decodeScalar renders a raw JSON scalar token as its typed value; objects,
+// arrays and null are not attribute-worthy and report false. Numbers decode as
+// float64 (matching DecodeAny, which this replaces — apply.Put converts whole
+// floats to ints); escape-free strings alias the input line, which outlives
+// the extracted attributes (they are copied into pdata at flush).
+func decodeScalar(raw []byte) (any, bool) {
+	switch raw[0] {
+	case '"':
+		if len(raw) < 2 || raw[len(raw)-1] != '"' {
+			return nil, false
+		}
+		s, err := ljson.UnescapeString(raw[1 : len(raw)-1])
+		if err != nil {
+			return nil, false
+		}
+		return s, true
+	case 't':
+		return true, string(raw) == "true" // comparison does not allocate
+	case 'f':
+		return false, string(raw) == "false"
+	case '{', '[', 'n':
+		return nil, false
+	default: // number
+		f, err := ljson.ParseFloat(raw)
+		if err != nil {
+			return nil, false
+		}
+		return f, true
 	}
 }
 

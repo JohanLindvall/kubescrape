@@ -191,19 +191,23 @@ func renderHistogram(m pmetric.Metric, s *series, samples []sample, ts time.Time
 	hist := m.SetEmptyHistogram()
 	hist.SetAggregationTemporality(pmetric.AggregationTemporalityCumulative)
 
-	points := map[uint64]pmetric.HistogramDataPoint{}
-	counts := map[uint64][]uint64{}
+	// Keyed by the canonical label STRING, not lbls.hash(): the series store
+	// defends 64-bit collisions with a check hash, and dropping that discipline
+	// here would silently merge two label sets' buckets into one corrupted
+	// point. The string is exact and already needed for putLabels.
+	points := map[string]pmetric.HistogramDataPoint{}
+	counts := map[string][]uint64{}
 	for _, sample := range samples {
 		lbls, _ := parseLabels(sample.labels)
 		lbls = lbls.without(leLabel)
-		key := lbls.hash()
+		key := lbls.String()
 
 		dp, ok := points[key]
 		if !ok {
 			dp = hist.DataPoints().AppendEmpty()
 			dp.SetStartTimestamp(now)
 			dp.SetTimestamp(now)
-			putLabels(dp.Attributes(), lbls.String())
+			putLabels(dp.Attributes(), key)
 			dp.ExplicitBounds().FromRaw(bounds)
 			points[key] = dp
 			counts[key] = make([]uint64, len(bounds)+1)

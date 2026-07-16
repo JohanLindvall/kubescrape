@@ -92,3 +92,13 @@ func TestBucketsOnlyForHistogram(t *testing.T) {
 		t.Error("buckets on a counter: want error")
 	}
 }
+
+// A zero or negative maxAge would mark every sample idle on every export,
+// silently turning counters into per-interval deltas; reject at load.
+func TestNonPositiveMaxAgeRejected(t *testing.T) {
+	for _, age := range []string{"0s", "-1h"} {
+		if _, err := NewDynamicMetricSet([]Dynamic{{Name: "x", Type: CounterType, Value: "1", MaxAge: age}}); err == nil {
+			t.Errorf("maxAge %q: want error", age)
+		}
+	}
+}

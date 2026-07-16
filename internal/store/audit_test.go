@@ -134,3 +134,20 @@ func TestResurrectWithChangedContainerIDs(t *testing.T) {
 		t.Fatal("live ID must survive the old ID's expiry")
 	}
 }
+
+// A hostNetwork pod must never claim its IP in the byPodIP index even when the
+// upsert carries status.podIP before status.hostIP is populated: the value
+// comparison (PodIP == HostIP) misses then, and only spec.hostNetwork tells
+// the truth. Peer-IP fallback would otherwise attribute any hostNetwork sender
+// on that node to this pod for a status-update window.
+func TestHostNetworkPodNeverClaimsIPEvenBeforeHostIPSet(t *testing.T) {
+	s := New(time.Minute)
+	p := runningPod("u1", "hostnet", "1", "192.168.1.1", tOld)
+	p.Spec.HostNetwork = true
+	p.Status.HostIP = "" // podIP populated first; hostIP not yet
+	s.UpsertPod(p)
+
+	if got, ok := s.GetPodByIP("192.168.1.1"); ok {
+		t.Fatalf("hostNetwork pod claimed the node IP: %+v", got.Pod.Name)
+	}
+}

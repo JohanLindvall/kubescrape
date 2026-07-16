@@ -8,6 +8,7 @@ package servicemonitors
 
 import (
 	"fmt"
+	"sort"
 	"sync"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -139,7 +140,9 @@ func (ix *Index) Delete(namespace, name string) {
 	delete(ix.monitors, namespace+"/"+name)
 }
 
-// All returns the current monitors.
+// All returns the current monitors, ordered by namespace/name: map iteration
+// order must not decide which monitor a URL-deduped target is attributed to
+// (the same determinism the server enforces for services).
 func (ix *Index) All() []*Monitor {
 	ix.mu.RLock()
 	defer ix.mu.RUnlock()
@@ -147,5 +150,11 @@ func (ix *Index) All() []*Monitor {
 	for _, m := range ix.monitors {
 		out = append(out, m)
 	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Namespace != out[j].Namespace {
+			return out[i].Namespace < out[j].Namespace
+		}
+		return out[i].Name < out[j].Name
+	})
 	return out
 }

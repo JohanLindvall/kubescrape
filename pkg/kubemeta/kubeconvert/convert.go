@@ -26,6 +26,7 @@ func FromPod(p *corev1.Pod) (kubemeta.Pod, map[string]kubemeta.Container) {
 		NodeName:    p.Spec.NodeName,
 		PodIP:       p.Status.PodIP,
 		HostIP:      p.Status.HostIP,
+		HostNetwork: p.Spec.HostNetwork,
 		Phase:       string(p.Status.Phase),
 		Labels:      cloneMap(p.Labels),
 		Annotations: cloneMap(p.Annotations),

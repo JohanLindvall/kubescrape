@@ -294,12 +294,13 @@ func run() error {
 		wg.Wait()
 	}()
 
+	var selfRes pcommon.Resource
 	if *selfMetricsIntv > 0 {
-		res := agentSelfResource(*nodeName)
+		selfRes = agentSelfResource(*nodeName)
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			obs.Registry.Run(ctx, out, *selfMetricsIntv, res, log)
+			obs.Registry.Run(ctx, out, *selfMetricsIntv, selfRes, log)
 		}()
 		log.Info("self-metrics export started", "interval", *selfMetricsIntv)
 	}
@@ -589,6 +590,16 @@ func run() error {
 		defer cancel()
 		if err := logMetrics.Export(fctx, out, *logsMetricsBytes); err != nil {
 			log.Warn("final log-metrics export failed", "error", err)
+		}
+	}
+	if *selfMetricsIntv > 0 {
+		// Registry.Run's own final export raced the final flushes inside
+		// wg.Wait; counters they bumped (last batches, shutdown drops) would
+		// otherwise die unexported. One more export now that everything is done.
+		fctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := obs.Registry.Export(fctx, out, selfRes); err != nil {
+			log.Warn("final self-metrics export failed", "error", err)
 		}
 	}
 	return fatalErr

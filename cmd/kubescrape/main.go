@@ -259,9 +259,10 @@ func run() error {
 		stop()
 		wg.Wait()
 	}()
+	var selfRes pcommon.Resource
 	if *selfMetricsIntv > 0 {
-		res := pcommon.NewResource()
-		a := res.Attributes()
+		selfRes = pcommon.NewResource()
+		a := selfRes.Attributes()
 		a.PutStr("service.name", "kubescrape")
 		if host, err := os.Hostname(); err == nil {
 			a.PutStr("service.instance.id", host)
@@ -269,7 +270,7 @@ func run() error {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			obs.Registry.Run(ctx, exporter, *selfMetricsIntv, res, log)
+			obs.Registry.Run(ctx, exporter, *selfMetricsIntv, selfRes, log)
 		}()
 		log.Info("self-metrics export started", "interval", *selfMetricsIntv)
 	}
@@ -341,6 +342,16 @@ func run() error {
 	// goroutines' final flushes before the deferred exporter.Close fires.
 	stop()
 	wg.Wait()
+	if *selfMetricsIntv > 0 {
+		// Registry.Run's own final export raced the final flushes inside
+		// wg.Wait (the events drain, the last batches); counters they bumped
+		// would otherwise die unexported. One more export now that all are done.
+		fctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := obs.Registry.Export(fctx, exporter, selfRes); err != nil {
+			log.Warn("final self-metrics export failed", "error", err)
+		}
+	}
 	return runErr
 }
 

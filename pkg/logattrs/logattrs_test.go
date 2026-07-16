@@ -152,3 +152,54 @@ func TestLoadConfig(t *testing.T) {
 		t.Error("missing file: want error")
 	}
 }
+
+func BenchmarkExtractJSON(b *testing.B) {
+	e, err := New(&Config{Rules: []Rule{
+		{Key: "trace_id", Attribute: "trace.id", Target: "log"},
+		{Key: "tenant", Attribute: "tenant.id", Target: "resource"},
+		{Key: "component", Attribute: "component", Target: "scope"},
+	}})
+	if err != nil {
+		b.Fatal(err)
+	}
+	line := `{"level":"info","tenant":"acme","component":"api","trace_id":"abc123","msg":"served request","dur_ms":12.5}`
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		r := e.Extract(line)
+		if len(r.Log) != 1 || len(r.Resource) != 1 || len(r.Scope) != 1 {
+			b.Fatal("bad extract")
+		}
+	}
+}
+
+func BenchmarkExtractLogfmt(b *testing.B) {
+	e, err := New(&Config{Rules: []Rule{
+		{Key: "trace_id", Attribute: "trace.id", Target: "log"},
+		{Key: "tenant", Attribute: "tenant.id", Target: "resource"},
+	}})
+	if err != nil {
+		b.Fatal(err)
+	}
+	line := `level=info tenant=acme trace_id=abc123 msg="served request" dur_ms=12.5`
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		r := e.Extract(line)
+		if len(r.Log) != 1 || len(r.Resource) != 1 {
+			b.Fatal("bad extract")
+		}
+	}
+}
+
+func BenchmarkExtractNoMatchJSON(b *testing.B) {
+	e, err := New(&Config{Rules: []Rule{{Key: "trace_id", Attribute: "trace.id", Target: "log"}}})
+	if err != nil {
+		b.Fatal(err)
+	}
+	line := `{"level":"info","msg":"served request","dur_ms":12.5}`
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		if r := e.Extract(line); len(r.Log) != 0 {
+			b.Fatal("bad extract")
+		}
+	}
+}

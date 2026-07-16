@@ -130,6 +130,11 @@ func (d *Dynamic) maxAge() (time.Duration, error) {
 	if err != nil {
 		return 0, err
 	}
+	if age <= 0 {
+		// A zero/negative expiration would mark every sample idle on every
+		// export, silently turning counters into per-interval deltas.
+		return 0, fmt.Errorf("maxAge must be positive: %s", d.MaxAge)
+	}
 	return min(age, maxMaxAge), nil
 }
 

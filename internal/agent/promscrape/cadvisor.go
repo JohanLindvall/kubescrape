@@ -362,7 +362,11 @@ func (id cadvisorIdentity) key() string {
 	if id.podUID != "" {
 		return "u\x00" + id.podUID + "\x00" + id.containerID + "\x00" + id.container
 	}
-	return "n\x00" + id.namespace + "\x00" + id.pod + "\x00" + id.container
+	// containerID must participate: a non-pod cgroup with a parseable container
+	// ID (a standalone, non-k8s container) has no namespace/pod/container labels,
+	// and omitting the ID would merge every such container into one anonymous
+	// resource with indistinguishable, conflicting series.
+	return "n\x00" + id.namespace + "\x00" + id.pod + "\x00" + id.container + "\x00" + id.containerID
 }
 
 // isIdentityLabel reports whether a label moved into the resource.
@@ -420,9 +424,12 @@ func (cb *cadvisorBatcher) fillResource(res pcommon.Resource, ident cadvisorIden
 	ctx, resolved := cb.s.resolveContext(cb.ctx, ident.containerID, ident.namespace, ident.pod, ident.podUID, ident.container, res)
 	ctx.Node = cb.s.nodeInfo()
 
-	if !resolved && (ident.pod != "" || ident.podUID != "") {
-		// Metadata unavailable (or a same-name pod replaced this one): keep
-		// the identity from the labels and the cgroup path.
+	if !resolved && (ident.pod != "" || ident.podUID != "" || ident.containerID != "") {
+		// Metadata unavailable (or a same-name pod replaced this one, or a
+		// standalone non-k8s container the metadata service cannot know): keep
+		// the identity from the labels and the cgroup path — container.id is a
+		// containerID-only row's ONLY distinguisher, since its id/name/image
+		// labels are elided from the data points as pod-scoped-redundant.
 		a := res.Attributes()
 		if ident.namespace != "" {
 			a.PutStr("k8s.namespace.name", ident.namespace)

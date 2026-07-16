@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"hash/fnv"
 	"log/slog"
+	"math"
 	"net/http"
 	"sort"
 	"strconv"
@@ -418,12 +419,14 @@ func (s *Server) waitBudget(r *http.Request) (time.Duration, error) {
 		if ierr != nil {
 			return 0, fmt.Errorf("invalid wait parameter %q: use a duration like 2s", v)
 		}
-		// Clamp before multiplying: a huge value would overflow the Duration
-		// arithmetic before the range checks below could see it.
-		if maxSecs := int(s.maxWait / time.Second); secs > maxSecs {
-			secs = maxSecs
+		// Guard the multiplication against overflow, then let the shared
+		// duration clamp below apply — clamping by TRUNCATED whole seconds here
+		// would turn a sub-second maxWait into 0 (non-blocking) for ?wait=1.
+		if secs > int(math.MaxInt64/int64(time.Second)) {
+			d = s.maxWait
+		} else {
+			d = time.Duration(secs) * time.Second
 		}
-		d = time.Duration(secs) * time.Second
 	}
 	if d < 0 {
 		return 0, fmt.Errorf("wait parameter must not be negative")

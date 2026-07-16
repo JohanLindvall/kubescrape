@@ -102,3 +102,43 @@ func TestStuckEntryForgottenOnPermanentRejection(t *testing.T) {
 		t.Fatalf("stuck map leaked %d entries after a permanent rejection; forget() was not called on the sendRejected path", n)
 	}
 }
+
+// TestBlipDeliveryThenOutageDoesNotDrop: a single delivery during a blip must
+// not let the RESUMED outage's transport failures spend the poison budget — the
+// batch was never refused by a live collector. (Laps count only when the
+// collector actually RESPONDED to the send: sink.stuckResponded.)
+func TestBlipDeliveryThenOutageDoesNotDrop(t *testing.T) {
+	s := &sink[plog.Logs]{kind: "logs"} // stuckResponded=false: transport failures
+	data := []byte("a good batch")
+
+	for i := 0; i < 5; i++ {
+		if s.stuckTooLong(data) {
+			t.Fatalf("dropped during the initial outage at lap %d", i+1)
+		}
+	}
+	s.delivered++ // a blip: one other batch gets through
+	for i := 0; i < 10; i++ {
+		if s.stuckTooLong(data) {
+			t.Fatalf("ZERO-LOSS BREACH: dropped during the resumed outage at lap %d after a single blip delivery", i+1)
+		}
+	}
+}
+
+// TestPoisonRespondedLapsDrop pins the drop path: once another batch delivers
+// while this one is stuck AND the collector keeps RESPONDING with rejections,
+// the poison budget is spent and the batch drops.
+func TestPoisonRespondedLapsDrop(t *testing.T) {
+	s := &sink[plog.Logs]{kind: "logs", stuckResponded: true} // e.g. ResourceExhausted
+	data := []byte("a poison batch")
+
+	if s.stuckTooLong(data) {
+		t.Fatal("dropped on first sighting")
+	}
+	s.delivered++ // the collector accepts another batch while this one is stuck
+	if s.stuckTooLong(data) {
+		t.Fatal("dropped one lap too early")
+	}
+	if !s.stuckTooLong(data) {
+		t.Fatal("poison batch not dropped after maxDrainCycles responded laps")
+	}
+}

@@ -2,6 +2,7 @@ package otlpingest
 
 import (
 	"context"
+	"strings"
 
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/pmetric"
@@ -218,7 +219,17 @@ func (g *metricGrouper) resource(id string) pmetric.ResourceMetrics {
 			// custom) are untouched.
 			g.stripIDAttrs(rm.Resource().Attributes())
 			built := g.enricher.builtAttrs(g.ctx, g.enrichCache, id)
-			overwriteAttrs(built, rm.Resource().Attributes())
+			if built.Len() == 0 {
+				// The described object did NOT resolve. Overwriting nothing would
+				// leave the copied SENDER identity (k8s.pod.name, service.name, …)
+				// labeling a foreign object's points — misattribution, with the ID
+				// stripped so downstream could never re-resolve it. Reduce the
+				// resource to just the described object's raw ID instead.
+				rm.Resource().Attributes().Clear()
+				g.putIDAttr(rm.Resource().Attributes(), id)
+			} else {
+				overwriteAttrs(built, rm.Resource().Attributes())
+			}
 			g.rmByID[id] = rm
 			return rm
 		}
@@ -239,6 +250,22 @@ func (g *metricGrouper) resource(id string) pmetric.ResourceMetrics {
 }
 
 // stripIDAttrs removes the configured container-ID/pod-UID attribute keys.
+// putIDAttr re-stamps the described object's raw ID under its canonical
+// (first-configured) attribute key, so unresolved split points remain
+// re-attributable downstream.
+func (g *metricGrouper) putIDAttr(a pcommon.Map, token string) {
+	if len(token) <= len(tokContainer) {
+		return
+	}
+	keys := g.enricher.containerIDKeys
+	if strings.HasPrefix(token, tokPodUID) {
+		keys = g.enricher.podUIDKeys
+	}
+	if len(keys) > 0 {
+		a.PutStr(keys[0], token[len(tokContainer):])
+	}
+}
+
 func (g *metricGrouper) stripIDAttrs(a pcommon.Map) {
 	for _, k := range g.enricher.containerIDKeys {
 		a.Remove(k)

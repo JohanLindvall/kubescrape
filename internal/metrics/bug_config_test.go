@@ -61,3 +61,24 @@ func TestRuleRequiresValueSource(t *testing.T) {
 		}
 	}
 }
+
+// Rules sharing a metric name must agree on histogram buckets: the second
+// rule's buckets would otherwise be silently ignored (the first rule's series
+// wins), observing into bounds the config never declared.
+func TestSharedNameConflictingBucketsRejected(t *testing.T) {
+	_, err := NewDynamicMetricSet([]Dynamic{
+		{Name: "h", Type: HistogramType, Value: "v", Buckets: []float64{1, 2, 3}},
+		{Name: "h", Type: HistogramType, Value: "v", Buckets: []float64{10, 20}},
+	})
+	if err == nil {
+		t.Fatal("conflicting buckets on a shared metric name compiled")
+	}
+	// Agreeing (or unset) buckets still share the series.
+	if _, err := NewDynamicMetricSet([]Dynamic{
+		{Name: "h", Type: HistogramType, Value: "v", Buckets: []float64{1, 2, 3}},
+		{Name: "h", Type: HistogramType, Value: "w", Buckets: []float64{1, 2, 3}},
+		{Name: "h", Type: HistogramType, Value: "x"},
+	}); err != nil {
+		t.Fatalf("agreeing shared histogram rejected: %v", err)
+	}
+}

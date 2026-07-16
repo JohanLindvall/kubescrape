@@ -1725,7 +1725,16 @@ func (t *Tailer) drainReader(ctx context.Context, f *file, r io.Reader, what str
 // from starving the sweep for the drain's whole duration.
 func (t *Tailer) flushDuringDrain(ctx context.Context, f *file) {
 	if len(t.batch) >= t.cfg.BatchSize {
+		// SYNCHRONOUS even in pipelined mode: drains run inside rotation/gone
+		// handling, and a handed-off export would still be in flight when reopen
+		// bumps f.gen (or release closes fds) — its later failure would then
+		// skip this file's rewind (gen mismatch) and lose the drained backlog.
+		// A sync failure instead rewinds immediately and the drain re-reads
+		// from the seeked-back fd, exactly like non-pipelined mode.
+		prev := t.exportCh
+		t.exportCh = nil
 		t.flush(ctx)
+		t.exportCh = prev
 	}
 }
 
@@ -2059,6 +2068,14 @@ func (t *Tailer) drainGone(f *file) {
 	if !f.resolved {
 		return
 	}
+	// Carried rotated prefixes are OLDER than the current inode's remainder and
+	// must enter the pipeline first. readFile normally feeds them, but a gone
+	// file is never read again — without this, the prefixes' unexported lines
+	// would be closed forever by release() once everything else settles (a pod
+	// deleted during a collector outage after a rotation).
+	if f.carried != nil && !f.carriedFed {
+		t.feedCarriedPrefix(context.Background(), f)
+	}
 	if f.compressed {
 		// A large archive is read incrementally across sweeps; a deletion
 		// mid-read leaves the rest readable from the open fd.
@@ -2090,6 +2107,12 @@ func (t *Tailer) release(f *file) {
 // to committed, which would otherwise look settled while the data is still
 // unexported and reachable only through our fd.
 func (t *Tailer) settledGone(f *file) bool {
+	if f.carried != nil {
+		// Carried rotated prefixes still hold unexported lines whose only
+		// handles are the retained fds release() would close; commitBatch clears
+		// carried once the group exports.
+		return false
+	}
 	if _, buffered := f.watermark(); buffered {
 		return false
 	}

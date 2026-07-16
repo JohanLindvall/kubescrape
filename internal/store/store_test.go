@@ -557,3 +557,17 @@ func TestGetPodByIPIgnoresFinishedPods(t *testing.T) {
 		t.Fatal("pod that finished must stop resolving by IP")
 	}
 }
+
+// Zero-TTL also applies to the RESTART path: a container ID replaced by a new
+// incarnation must expire immediately (expireEntryLocked's ttl<=0 branch), not
+// linger, while the new ID keeps resolving.
+func TestZeroTTLRestartedContainerDeletesImmediately(t *testing.T) {
+	s, _ := newTestStore(0)
+	s.UpsertPod(makePod("uid1", "pod1", "node1", "1", map[string]string{"app": "old111"}))
+	s.UpsertPod(makePod("uid1", "pod1", "node1", "2", map[string]string{"app": "new222"}))
+
+	mustMiss(t, s, "old111")
+	if res := mustGet(t, s, "new222"); res.Container.ID != "new222" {
+		t.Fatalf("new ID resolves to %q", res.Container.ID)
+	}
+}

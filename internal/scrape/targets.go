@@ -137,6 +137,13 @@ func monitorPodPort(pod kubemeta.Pod, svc *services.Service, ep servicemonitors.
 		if n, ok := monitorPortNumber(*ep.TargetPort); ok {
 			return n, true
 		}
+		// Only a String-typed, non-empty targetPort may resolve by container
+		// port NAME: an Int-typed value always has StrVal == "" (a rejected
+		// number like 0 or 70000 names nothing), and matching "" against an
+		// UNNAMED container port by "" == "" would fabricate a phantom target.
+		if ep.TargetPort.Type != intstr.String || ep.TargetPort.StrVal == "" {
+			return 0, false
+		}
 		for _, c := range pod.Containers {
 			for _, p := range c.Ports {
 				if p.Name == ep.TargetPort.StrVal {

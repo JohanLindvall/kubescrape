@@ -233,10 +233,14 @@ func (g *Generator) dims(span ptrace.Span, resAttrs pcommon.Map, svc string) []s
 	return vals
 }
 
-// Run exports every interval until ctx is done, then once more.
+// Run exports every interval until ctx is done, then once more. A non-positive
+// interval falls back to one minute (NewTicker would panic).
 func (g *Generator) Run(ctx context.Context, exp Exporter, interval time.Duration, res pcommon.Resource, log *slog.Logger) {
 	if log == nil {
 		log = slog.Default()
+	}
+	if interval <= 0 {
+		interval = time.Minute
 	}
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
@@ -345,8 +349,16 @@ type tap struct {
 }
 
 func (t *tap) ExportTraces(ctx context.Context, td ptrace.Traces) error {
+	// Forward FIRST, aggregate only on success: a transient failure surfaces to
+	// the sender as retryable, and the re-pushed batch would otherwise aggregate
+	// twice — permanently inflating the cumulative counters across every outage
+	// or back-pressure window. (A retry after a lost ack still double-counts;
+	// that is the unavoidable at-least-once residue.)
+	if err := t.inner.ExportTraces(ctx, td); err != nil {
+		return err
+	}
 	t.gen.Consume(td)
-	return t.inner.ExportTraces(ctx, td)
+	return nil
 }
 
 // --- shared helpers ---

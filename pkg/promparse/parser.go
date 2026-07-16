@@ -625,9 +625,10 @@ func (p *Parser) parseTimestampToken(rest []byte) (int64, []byte, bool) {
 	tok := string(rest[:i])
 	if p.openMetrics {
 		f, err := strconv.ParseFloat(tok, 64)
-		if err != nil || math.IsInf(f, 0) || math.IsNaN(f) {
-			// A non-finite timestamp (NaN/±Inf parses without error) would become
-			// int64-min after the *1000 conversion; reject the token like Prometheus.
+		if err != nil || math.IsNaN(f) || f*1000 < math.MinInt64 || f*1000 >= math.MaxInt64 {
+			// NaN/±Inf parse without error, and a finite-but-huge value (1e300)
+			// overflows the int64 millisecond conversion to implementation-defined
+			// garbage; reject both like Prometheus. The bound check covers ±Inf.
 			return 0, nil, false
 		}
 		return int64(f * 1000), rest[i:], true

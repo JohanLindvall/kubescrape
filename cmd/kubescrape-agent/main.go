@@ -415,6 +415,28 @@ func run() error {
 			}
 			ingestTraceOut = te
 		}
+		// The span-metrics tap wraps the RAW trace exporter, BELOW the batcher:
+		// the tap aggregates only after a successful forward (a retried batch
+		// must not double-count), and under the batcher it runs on the batcher's
+		// own goroutine against a payload nothing else mutates — wrapping above
+		// the batcher would race Consume against the batcher's merge.
+		if *spanMetrics && ingestTraceOut != nil {
+			var smCfg spanmetrics.Config
+			if fileCfg.TraceMetrics != nil {
+				smCfg = *fileCfg.TraceMetrics
+			}
+			gen := spanmetrics.New(smCfg)
+			ingestTraceOut = gen.Tap(ingestTraceOut)
+			res := agentSelfResource(*nodeName)
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				gen.Run(ctx, out, *spanMetricsIv, res, log)
+			}()
+			log.Info("span metrics from traces enabled", "interval", *spanMetricsIv)
+		} else if *spanMetrics {
+			log.Warn("-ingest-span-metrics ignored: traces are disabled (-ingest-traces=false)")
+		}
 		// The batcher stops on its own context, cancelled only after the
 		// ingest server has fully returned: a GracefulStop completing in-flight
 		// RPCs may still enqueue (and ack) payloads, which the batcher's final
@@ -435,27 +457,6 @@ func run() error {
 				ingestTraceOut = batcher
 			}
 			log.Info("otlp ingest batching enabled", "items", *ingestBatch, "maxBytes", *ingestBatchB, "timeout", *ingestBatchTO)
-		}
-		if *spanMetrics {
-			if ingestTraceOut == nil {
-				log.Warn("-ingest-span-metrics ignored: traces are disabled (-ingest-traces=false)")
-			} else {
-				var smCfg spanmetrics.Config
-				if fileCfg.TraceMetrics != nil {
-					smCfg = *fileCfg.TraceMetrics
-				}
-				gen := spanmetrics.New(smCfg)
-				// Tap the forward path: the generator aggregates each enriched
-				// batch, then hands it on unchanged.
-				ingestTraceOut = gen.Tap(ingestTraceOut)
-				res := agentSelfResource(*nodeName)
-				wg.Add(1)
-				go func() {
-					defer wg.Done()
-					gen.Run(ctx, out, *spanMetricsIv, res, log)
-				}()
-				log.Info("span metrics from traces enabled", "interval", *spanMetricsIv)
-			}
 		}
 		srv := otlpingest.NewServer(otlpingest.ServerConfig{
 			GRPCAddr: *ingestGRPC,

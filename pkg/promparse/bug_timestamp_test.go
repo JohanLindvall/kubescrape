@@ -41,3 +41,20 @@ func TestOpenMetricsNonFiniteTimestampRejected(t *testing.T) {
 		t.Fatalf("finite OM timestamp mis-parsed: %+v (malformed=%d)", got, malformed)
 	}
 }
+
+// A finite-but-huge OpenMetrics timestamp must be rejected too: 1e300*1000
+// overflows the int64 millisecond conversion to implementation-defined garbage.
+func TestOpenMetricsHugeFiniteTimestampRejected(t *testing.T) {
+	p := New(Options{MaxLineBytes: 1 << 20, OpenMetrics: true})
+	var samples []Sample
+	malformed, err := p.Parse(strings.NewReader("foo 1 1e300\nbar 1 -1e300\n"), func(s Sample) error {
+		samples = append(samples, s)
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(samples) != 0 || malformed != 2 {
+		t.Fatalf("got %d samples / %d malformed, want 0 / 2", len(samples), malformed)
+	}
+}

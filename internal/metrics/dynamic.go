@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -452,6 +453,12 @@ func compileRule(d *Dynamic, cfg *setConfig, shared map[string]*series) (*metric
 	if existing, ok := shared[name]; ok {
 		if existing.kind != kind || existing.action != action {
 			return nil, fmt.Errorf("metric %q declared with conflicting type/action", d.Name)
+		}
+		// A second rule's buckets/maxCardinality/maxAge would be silently
+		// ignored (the first rule's series wins) — reject a conflicting
+		// histogram bucket declaration like a conflicting type.
+		if kind == kindHistogram && len(d.Buckets) > 0 && !slices.Equal(existing.buckets[:len(existing.buckets)-1], d.Buckets) {
+			return nil, fmt.Errorf("metric %q declared with conflicting buckets", d.Name)
 		}
 		rule.series = existing
 	} else {

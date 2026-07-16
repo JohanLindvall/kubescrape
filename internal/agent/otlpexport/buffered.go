@@ -141,6 +141,10 @@ type sink[T any] struct {
 	// collector has delivered another batch while it was stuck (see stuckTooLong).
 	delivered uint64
 	stuck     map[uint64]stuckBatch
+	// stuckResponded records whether the latest sendStuck's final error carried
+	// a RESPONSE from the collector (vs a transport failure); set by trySend,
+	// read by stuckTooLong (both on the drain goroutine).
+	stuckResponded bool
 }
 
 type stuckBatch struct {
@@ -291,17 +295,27 @@ func (s *sink[T]) stuckTooLong(data []byte) bool {
 	}
 	if seen && !st.sawProgress && s.delivered > st.lastDelivered {
 		// First proof the collector is alive WHILE this batch is stuck: some other
-		// batch got through since our previous failure. The batch was already
-		// failing that previous cycle too, so credit both laps against the budget
-		// (this also keeps a genuine poison payload dropping on the same cycle as
-		// before). Deliveries banked before we got stuck, or during a recovery we
-		// merely sat behind in the queue, advance s.delivered without any stuck
-		// cycle of ours spanning them, so this never fires for them.
+		// batch got through since our previous failure. Deliveries banked before
+		// we got stuck, or during a recovery we merely sat behind in the queue,
+		// advance s.delivered without any stuck cycle of ours spanning them, so
+		// this never fires for them. When this arming lap itself was RESPONDED,
+		// retro-credit the previous lap too (the batch was already failing while
+		// the delivery went through) so a genuine poison payload drops on the
+		// same cycle as before.
 		st.sawProgress = true
-		st.cycles++
+		if s.stuckResponded {
+			st.cycles++
+		}
 	}
-	if st.sawProgress {
-		st.cycles++ // a failure the live collector is accountable for
+	// A lap counts toward the poison budget only when the collector is alive
+	// (sawProgress) AND actually RESPONDED to this lap's send (a rejection, not
+	// a transport failure): after a blip delivery mid-outage, the resumed
+	// outage's connection failures must not spend the budget — only a live
+	// collector repeatedly refusing THIS payload while accepting others is
+	// poison evidence. (A collector rejecting EVERYTHING — a memory-limiter
+	// overload — never arms sawProgress, so nothing drops then either.)
+	if st.sawProgress && s.stuckResponded {
+		st.cycles++
 	}
 	st.lastDelivered = s.delivered
 	s.stuck[h] = st
@@ -310,6 +324,26 @@ func (s *sink[T]) stuckTooLong(data []byte) bool {
 	}
 	delete(s.stuck, h)
 	return true
+}
+
+// respondedError reports whether err carries a response FROM the collector (an
+// HTTP status or a gRPC status), as opposed to a transport-level failure where
+// the collector may simply be down. Unavailable/DeadlineExceeded/Canceled are
+// treated as transport even when server-sent — the conservative direction: an
+// outage must never count toward the poison budget.
+func respondedError(err error) bool {
+	var he *HTTPStatusError
+	if errors.As(err, &he) {
+		return true
+	}
+	if st, ok := status.FromError(err); ok {
+		switch st.Code() {
+		case codes.Unavailable, codes.DeadlineExceeded, codes.Canceled:
+			return false
+		}
+		return true
+	}
+	return false
 }
 
 // forget drops a payload's stuck-tracking once it is committed, so a batch that
@@ -355,6 +389,7 @@ func (s *sink[T]) trySend(ctx context.Context, v T) sendResult {
 			return sendRejected
 		}
 		if attempt >= stuckAfterAttempts {
+			s.stuckResponded = respondedError(err)
 			s.log.Warn("buffered export still failing, requeueing", "signal", s.kind, "error", err, "attempts", attempt)
 			return sendStuck
 		}

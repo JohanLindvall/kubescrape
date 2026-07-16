@@ -235,7 +235,7 @@ func (s *Server) handleContainer(w http.ResponseWriter, r *http.Request) {
 // servePod is the shared body of the three pod endpoints: readiness gate,
 // lookup, 404, owner/namespace enrichment, then a cached write. notFound is
 // evaluated lazily so the success path never formats it.
-func (s *Server) servePod(w http.ResponseWriter, r *http.Request, lookup func() (store.NodePod, bool), notFound func() string) {
+func (s *Server) servePod(w http.ResponseWriter, r *http.Request, cached bool, lookup func() (store.NodePod, bool), notFound func() string) {
 	if !s.isReady() {
 		writeError(w, http.StatusServiceUnavailable, "informer caches not synced")
 		return
@@ -246,12 +246,19 @@ func (s *Server) servePod(w http.ResponseWriter, r *http.Request, lookup func() 
 		return
 	}
 	s.enrich(&np.Pod, np.OwnerRefs)
+	if !cached {
+		// The pod-IP index exists for IMMEDIACY (IPs recycle; deleted pods drop
+		// out at once) — a cached 200 would let metaclient re-serve the OLD
+		// owner of a recycled IP for up to the metadata TTL.
+		writeJSON(w, http.StatusOK, np.Pod)
+		return
+	}
 	s.writeCached(w, r, np.Pod)
 }
 
 func (s *Server) handlePod(w http.ResponseWriter, r *http.Request) {
 	namespace, name := r.PathValue("namespace"), r.PathValue("name")
-	s.servePod(w, r,
+	s.servePod(w, r, true,
 		func() (store.NodePod, bool) { return s.store.GetPodByName(namespace, name) },
 		func() string { return fmt.Sprintf("pod %s/%s not found", namespace, name) })
 }
@@ -261,7 +268,7 @@ func (s *Server) handlePod(w http.ResponseWriter, r *http.Request) {
 // telemetry). Deleted pods stay resolvable until their tombstone expires.
 func (s *Server) handlePodByUID(w http.ResponseWriter, r *http.Request) {
 	uid := r.PathValue("uid")
-	s.servePod(w, r,
+	s.servePod(w, r, true,
 		func() (store.NodePod, bool) { return s.store.GetPodByUID(uid) },
 		func() string { return fmt.Sprintf("pod uid %q not found", uid) })
 }
@@ -271,7 +278,7 @@ func (s *Server) handlePodByUID(w http.ResponseWriter, r *http.Request) {
 // hostNetwork pods never resolve.
 func (s *Server) handlePodByIP(w http.ResponseWriter, r *http.Request) {
 	ip := r.PathValue("ip")
-	s.servePod(w, r,
+	s.servePod(w, r, false, // never cached: see servePod
 		func() (store.NodePod, bool) { return s.store.GetPodByIP(ip) },
 		func() string { return fmt.Sprintf("no live pod with IP %q", ip) })
 }

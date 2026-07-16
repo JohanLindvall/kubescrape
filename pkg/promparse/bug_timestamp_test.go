@@ -58,3 +58,20 @@ func TestOpenMetricsHugeFiniteTimestampRejected(t *testing.T) {
 		t.Fatalf("got %d samples / %d malformed, want 0 / 2", len(samples), malformed)
 	}
 }
+
+// A malformed # TYPE line (missing tokens or trailing garbage) is counted
+// malformed rather than silently ignored.
+func TestMalformedTypeLineCounted(t *testing.T) {
+	p := New(Options{MaxLineBytes: 1 << 20})
+	var samples int
+	malformed, err := p.Parse(strings.NewReader("# TYPE foo\n# TYPE bar counter junk\n# TYPE ok counter\nok_total 1\n"), func(Sample) error {
+		samples++
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if malformed != 2 || samples != 1 {
+		t.Fatalf("malformed = %d samples = %d, want 2 and 1", malformed, samples)
+	}
+}

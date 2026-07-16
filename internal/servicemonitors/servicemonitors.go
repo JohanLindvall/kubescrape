@@ -116,10 +116,14 @@ func NewIndex() *Index {
 	return &Index{monitors: make(map[string]*Monitor)}
 }
 
-// Upsert parses and stores a monitor.
+// Upsert parses and stores a monitor. A monitor UPDATED to an unparseable spec
+// is removed rather than kept: silently serving the previous version forever
+// would diverge from what the manifest declares (prometheus-operator likewise
+// generates no config for an invalid monitor).
 func (ix *Index) Upsert(u *unstructured.Unstructured) error {
 	m, err := Parse(u)
 	if err != nil {
+		ix.Delete(u.GetNamespace(), u.GetName())
 		return err
 	}
 	ix.mu.Lock()

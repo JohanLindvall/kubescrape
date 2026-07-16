@@ -65,7 +65,10 @@ func apply(lr plog.LogRecord, line string, overwrite bool) {
 	if !e.Time.IsZero() && (overwrite || lr.Timestamp() == 0) {
 		lr.SetTimestamp(pcommon.NewTimestampFromTime(e.Time))
 	}
-	if e.SeverityNumber > 0 && (overwrite || lr.SeverityNumber() == plog.SeverityNumberUnspecified) {
+	if e.SeverityNumber > 0 && (overwrite || (lr.SeverityNumber() == plog.SeverityNumberUnspecified && lr.SeverityText() == "")) {
+		// Non-overwrite (ApplyBody): a sender-set SeverityText counts as "the
+		// sender expressed severity" even with the number unset — clobbering the
+		// text would discard sender intent.
 		lr.SetSeverityNumber(plog.SeverityNumber(e.SeverityNumber))
 		lr.SetSeverityText(e.Severity)
 	}

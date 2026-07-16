@@ -352,8 +352,11 @@ func (b *splitBatcher) route(name string, labels []Label) (pmetric.ScopeMetrics,
 	} else {
 		key.WriteString(rule.keyPrefix)
 		for _, v := range b.vals {
+			// Length-prefixed so a label VALUE containing the separator cannot
+			// alias another tuple and merge two described objects.
+			key.WriteString(strconv.Itoa(len(v)))
+			key.WriteByte(':')
 			key.WriteString(v)
-			key.WriteByte(0)
 		}
 	}
 	ks := key.String()

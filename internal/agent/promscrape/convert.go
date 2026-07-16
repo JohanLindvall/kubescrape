@@ -195,6 +195,10 @@ func (c *converter) add(s Sample) error {
 			c.malformed++ // bucket without le
 			return nil
 		}
+		if !validCount(s.Value) {
+			c.malformed++ // uint64(negative/NaN) wraps to ~9.2e18 garbage
+			return nil
+		}
 		acc := c.hist(s)
 		acc.buckets = append(acc.buckets, cumBucket{le: le, cum: uint64(s.Value)})
 		if s.Exemplar != nil && len(acc.exemplars) < maxExemplarsPerPoint {
@@ -204,6 +208,10 @@ func (c *converter) add(s Sample) error {
 		acc := c.hist(s)
 		acc.sum, acc.hasSum = s.Value, true
 	case RoleHistogramCount:
+		if !validCount(s.Value) {
+			c.malformed++
+			return nil
+		}
 		acc := c.hist(s)
 		acc.count, acc.hasCount = uint64(s.Value), true
 	case RoleSummaryQuantile:
@@ -221,6 +229,10 @@ func (c *converter) add(s Sample) error {
 		acc := c.summ(s)
 		acc.sum, acc.hasSum = s.Value, true
 	case RoleSummaryCount:
+		if !validCount(s.Value) {
+			c.malformed++
+			return nil
+		}
 		acc := c.summ(s)
 		acc.count, acc.hasCount = uint64(s.Value), true
 	case RoleCounter:
@@ -353,6 +365,13 @@ func appendLabelsExcept(dst []Label, labels []Label, except string) []Label {
 		}
 	}
 	return dst
+}
+
+// validCount reports whether a cumulative count/bucket value can be a uint64:
+// uint64(negative or NaN) is implementation-defined (~9.2e18 on amd64), so such
+// exposition is counted malformed instead of exported as garbage.
+func validCount(v float64) bool {
+	return v >= 0 && !math.IsNaN(v)
 }
 
 func labelFloat(labels []Label, name string) (float64, bool) {

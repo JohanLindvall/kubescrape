@@ -252,6 +252,13 @@ func run() error {
 	// final flush, the self-metrics final export) before returning, so they
 	// finish before the deferred exporter.Close fires (mirrors the agent).
 	var wg sync.WaitGroup
+	// Registered AFTER exporter.Close (LIFO): an early `return err` below must
+	// stop and drain the started goroutines BEFORE the exporter is closed under
+	// them. The normal path's inline wg.Wait makes this a no-op there.
+	defer func() {
+		stop()
+		wg.Wait()
+	}()
 	if *selfMetricsIntv > 0 {
 		res := pcommon.NewResource()
 		a := res.Attributes()

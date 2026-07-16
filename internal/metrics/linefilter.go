@@ -85,8 +85,11 @@ func NewLineFilter(rules []LineRule) (*LineFilter, error) {
 			if cr.drop {
 				return nil, fmt.Errorf("logs rule %d: sample is only valid on keep rules", i)
 			}
-			if r.Sample <= 0 || r.Sample > 1 {
-				return nil, fmt.Errorf("logs rule %d: sample %v (want 0 < sample <= 1)", i, r.Sample)
+			// The 1e-9 floor keeps 1/sample within uint64 (a pathological
+			// 1e-20 would overflow the float→uint64 conversion into an
+			// implementation-defined counter).
+			if r.Sample < 1e-9 || r.Sample > 1 {
+				return nil, fmt.Errorf("logs rule %d: sample %v (want 1e-9 <= sample <= 1)", i, r.Sample)
 			}
 			cr.every = uint64(math.Round(1 / r.Sample))
 		}

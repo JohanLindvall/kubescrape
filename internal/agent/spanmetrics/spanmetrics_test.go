@@ -330,13 +330,40 @@ func TestExemplarsOnDuration(t *testing.T) {
 	if ex.DoubleValue() < 0.029 || ex.DoubleValue() > 0.031 {
 		t.Fatalf("exemplar value = %v, want ~0.03", ex.DoubleValue())
 	}
-	// Exemplars are reset each export: a second export with no new spans carries
-	// none (the cumulative histogram still exports).
+	// Exemplars are reset after a DELIVERED export: a second export with no new
+	// spans carries none (the cumulative histogram still exports).
 	exp2 := &capExporter{}
 	_ = g.Export(context.Background(), exp2, pcommon.NewResource())
 	dur2, _ := exp2.find("traces.span.metrics.duration")
 	if n := dur2.Histogram().DataPoints().At(0).Exemplars().Len(); n != 0 {
 		t.Fatalf("exemplars after reset = %d, want 0", n)
+	}
+}
+
+type failExporter struct{}
+
+func (failExporter) ExportMetrics(context.Context, pmetric.Metrics) error {
+	return context.DeadlineExceeded
+}
+
+// A FAILED export must not wipe the exemplars unseen: the next successful
+// export still carries them.
+func TestExemplarsSurviveFailedExport(t *testing.T) {
+	g := New(Config{})
+	g.Consume(traces("svc", spanSpec{
+		name: "op", kind: ptrace.SpanKindServer, status: ptrace.StatusCodeOk, dur: 0.03,
+		traceID: tid1, spanID: sid1,
+	}))
+	if err := g.Export(context.Background(), failExporter{}, pcommon.NewResource()); err == nil {
+		t.Fatal("export should have failed")
+	}
+	exp := &capExporter{}
+	if err := g.Export(context.Background(), exp, pcommon.NewResource()); err != nil {
+		t.Fatal(err)
+	}
+	dur, _ := exp.find("traces.span.metrics.duration")
+	if n := dur.Histogram().DataPoints().At(0).Exemplars().Len(); n != 1 {
+		t.Fatalf("exemplars after failed-then-successful export = %d, want 1 (wiped unseen)", n)
 	}
 }
 

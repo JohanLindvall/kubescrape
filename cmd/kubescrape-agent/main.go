@@ -285,6 +285,15 @@ func run() error {
 		log.Info("disk buffer enabled", "dir", *bufferDir, "max-bytes-per-signal", *bufferMax)
 	}
 
+	// Registered AFTER the exporter/spool Close defers (LIFO): an early `return
+	// err` below must stop and drain every started goroutine BEFORE their
+	// exporter and spools are closed under them. The normal path's inline
+	// wg.Wait makes this a no-op there.
+	defer func() {
+		stop()
+		wg.Wait()
+	}()
+
 	if *selfMetricsIntv > 0 {
 		res := agentSelfResource(*nodeName)
 		wg.Add(1)
@@ -391,6 +400,9 @@ func run() error {
 	// here and returned after shutdown so the agent exits non-zero; wg.Wait
 	// orders the write before the read.
 	var fatalErr error
+	if *spanMetrics && !*ingestOn {
+		log.Warn("-ingest-span-metrics ignored: the OTLP ingest receiver is disabled (-ingest=false)")
+	}
 	if *ingestOn {
 		enr := otlpingest.NewEnricher(otlpingest.Config{
 			ContainerIDKeys: splitList(*ingestCidKeys),

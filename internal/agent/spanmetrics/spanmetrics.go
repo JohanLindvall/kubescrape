@@ -262,12 +262,32 @@ func (g *Generator) Run(ctx context.Context, exp Exporter, interval time.Duratio
 }
 
 // Export renders the current cumulative aggregate under res and sends it once.
+// Exemplars are cleared only after a SUCCESSFUL send (recent-evidence semantics
+// per delivered export): a failed send keeps them for the next attempt instead
+// of wiping them unseen.
 func (g *Generator) Export(ctx context.Context, exp Exporter, res pcommon.Resource) error {
 	md := g.render(res, time.Now())
 	if md.ResourceMetrics().Len() == 0 {
 		return nil
 	}
-	return exp.ExportMetrics(ctx, md)
+	if err := exp.ExportMetrics(ctx, md); err != nil {
+		return err
+	}
+	g.clearExemplars()
+	return nil
+}
+
+// clearExemplars resets every recorded exemplar after a delivered export. An
+// exemplar recorded between render and this clear is dropped unseen — the same
+// one-interval recency window the reset has always had.
+func (g *Generator) clearExemplars() {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	for _, s := range g.series {
+		for i := range s.ex {
+			s.ex[i].set = false
+		}
+	}
 }
 
 func (g *Generator) render(res pcommon.Resource, now time.Time) pmetric.Metrics {
@@ -325,7 +345,6 @@ func (g *Generator) renderRED(sm pmetric.ScopeMetrics, start, ts pcommon.Timesta
 			e.SetTimestamp(s.ex[i].ts)
 			e.SetTraceID(s.ex[i].traceID)
 			e.SetSpanID(s.ex[i].spanID)
-			s.ex[i].set = false // exemplars are recent evidence: reset each export
 		}
 	}
 }

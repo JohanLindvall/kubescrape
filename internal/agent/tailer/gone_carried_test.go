@@ -70,3 +70,42 @@ func TestGoneFileDeliversCarriedPrefix(t *testing.T) {
 		}
 	}
 }
+
+// A deleted plain file with an UNTERMINATED final line must deliver the tail
+// and settle — settledGone's pending check would otherwise hold the fd and the
+// files-map entry forever (the missing newline can never arrive).
+func TestGoneFileUnterminatedTailDeliversAndSettles(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+	exp := &fakeExporter{}
+	tl := newSourceTailer(exp, []Source{{
+		Name:    "plain",
+		Include: []string{filepath.Join(dir, "*.txt")},
+	}}, false)
+	path := filepath.Join(dir, "app.txt")
+
+	tl.scanDir(tl.loadCheckpoints(), true)
+	if err := os.WriteFile(path, []byte("done line\nunterminated tail"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	tl.scanDir(nil, false)
+	tl.sweep(ctx, true)
+	tl.flush(ctx)
+
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	tl.scanDir(nil, false) // gone
+	for i := 0; i < 4; i++ {
+		tl.sweep(ctx, true)
+		tl.flush(ctx)
+	}
+
+	got := exp.get()
+	if !slices.Contains(got, "unterminated tail") {
+		t.Fatalf("unterminated tail lost: %v", got)
+	}
+	if _, tracked := tl.files[path]; tracked {
+		t.Fatal("gone file with unterminated tail never settled (fd/map leak)")
+	}
+}

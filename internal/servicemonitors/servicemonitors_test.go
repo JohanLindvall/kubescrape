@@ -154,3 +154,26 @@ func TestIndex(t *testing.T) {
 		t.Fatalf("All() after delete = %+v", got)
 	}
 }
+
+// A monitor UPDATED to an unparseable spec must stop being served — silently
+// keeping the previous version forever would diverge from the manifest
+// (prometheus-operator generates no config for an invalid monitor).
+func TestIndexUnparseableUpdateRemoves(t *testing.T) {
+	ix := NewIndex()
+	if err := ix.Upsert(monitorObj("ns", "a", map[string]any{
+		"selector":  map[string]any{"matchLabels": map[string]any{"app": "a"}},
+		"endpoints": []any{map[string]any{"port": "http"}},
+	})); err != nil {
+		t.Fatal(err)
+	}
+	if err := ix.Upsert(monitorObj("ns", "a", map[string]any{
+		"selector": map[string]any{"matchExpressions": []any{
+			map[string]any{"key": "app", "operator": "Bogus"},
+		}},
+	})); err == nil {
+		t.Fatal("unparseable update accepted")
+	}
+	if got := ix.All(); len(got) != 0 {
+		t.Fatalf("stale monitor still served after unparseable update: %d", len(got))
+	}
+}

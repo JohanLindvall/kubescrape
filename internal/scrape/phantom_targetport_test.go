@@ -39,3 +39,23 @@ func TestMonitorDegenerateTargetPortNoPhantom(t *testing.T) {
 		t.Fatalf("named targetPort broke: %+v", ts)
 	}
 }
+
+// When an endpoint sets BOTH port and targetPort, `port` wins — matching
+// prometheus-operator's precedence (targetPort is its deprecated fallback).
+func TestMonitorPortWinsOverTargetPort(t *testing.T) {
+	pod := basePod()
+	svc := monitorService()
+	tp := intstr.FromString("web") // container port 8080
+	ts := MonitorTargets(pod, svc, "m", servicemonitors.Endpoint{
+		Port: "metrics", TargetPort: &tp, // service port "metrics" -> pod 9090
+	})
+	if len(ts) != 1 || ts[0].Port != 9090 {
+		t.Fatalf("port precedence broken: %+v (want the `port`-resolved 9090, not targetPort's 8080)", ts)
+	}
+	// An unresolvable `port` does NOT fall back to targetPort (operator parity).
+	if ts := MonitorTargets(pod, svc, "m", servicemonitors.Endpoint{
+		Port: "nope", TargetPort: &tp,
+	}); ts != nil {
+		t.Fatalf("unresolvable port fell back to targetPort: %+v", ts)
+	}
+}

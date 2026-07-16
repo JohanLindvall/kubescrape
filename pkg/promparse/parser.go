@@ -382,8 +382,7 @@ func (p *Parser) parseLine(line []byte, emit func(Sample) error, emitErr *error)
 		return true
 	}
 	if line[0] == '#' {
-		p.parseComment(line)
-		return true
+		return p.parseComment(line)
 	}
 
 	s, ok := p.parseSample(line)
@@ -412,8 +411,9 @@ func nextField(b []byte) (tok, rest []byte) {
 // terminator; HELP/UNIT and other comments are ignored. Only the leading
 // tokens are examined — a non-directive comment (HELP with its free text,
 // typically the bulk of the comment bytes) returns after the second token
-// instead of being tokenized whole.
-func (p *Parser) parseComment(line []byte) {
+// instead of being tokenized whole. It reports false for a malformed TYPE
+// line (missing family/type, or trailing garbage) so the caller counts it.
+func (p *Parser) parseComment(line []byte) bool {
 	_, rest := nextField(line) // the leading "#" token
 	directive, rest := nextField(rest)
 	switch {
@@ -425,10 +425,10 @@ func (p *Parser) parseComment(line []byte) {
 		family, rest := nextField(rest)
 		typ, rest := nextField(rest)
 		if len(family) == 0 || len(typ) == 0 || len(skipSpaceTab(rest)) != 0 {
-			return
+			return false // malformed TYPE: counted, not silently ignored
 		}
 		if len(p.types) >= MaxTrackedFamilies {
-			return
+			return true // over the table bound: a deliberate cap, not malformed
 		}
 		var t MetricType
 		switch string(typ) {
@@ -445,6 +445,7 @@ func (p *Parser) parseComment(line []byte) {
 		}
 		p.types[string(family)] = t
 	}
+	return true
 }
 
 // classify resolves the sample role and family from the TYPE table,

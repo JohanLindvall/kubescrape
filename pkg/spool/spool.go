@@ -160,6 +160,9 @@ type Spool struct {
 	// segment (truncation damage) retired in retireConsumedLocked. Pop surfaces
 	// one ErrCorrupt per count so the consumer's normal read-error counting sees
 	// it — otherwise a whole segment of records would vanish with no signal.
+	// Deliberately in-memory: a crash before the next Pop loses only the loss
+	// COUNT (the data is already gone either way); persisting it is not worth a
+	// disk format field.
 	pendingCorrupt int
 }
 

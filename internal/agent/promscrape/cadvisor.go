@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -359,14 +360,23 @@ func (id cadvisorIdentity) rollup() bool {
 // pod UID disambiguates same-name pod recreations and the container ID
 // distinguishes restarted container incarnations.
 func (id cadvisorIdentity) key() string {
+	// The cgroup-derived parts (uid, container id) are validated hex/UUID and
+	// cannot contain the separator; namespace/pod/container come from exporter
+	// LABELS, so they are length-prefixed to keep hostile values from aliasing
+	// another identity.
 	if id.podUID != "" {
-		return "u\x00" + id.podUID + "\x00" + id.containerID + "\x00" + id.container
+		return "u\x00" + id.podUID + "\x00" + id.containerID + "\x00" + lp(id.container)
 	}
 	// containerID must participate: a non-pod cgroup with a parseable container
 	// ID (a standalone, non-k8s container) has no namespace/pod/container labels,
 	// and omitting the ID would merge every such container into one anonymous
 	// resource with indistinguishable, conflicting series.
-	return "n\x00" + id.namespace + "\x00" + id.pod + "\x00" + id.container + "\x00" + id.containerID
+	return "n\x00" + lp(id.namespace) + lp(id.pod) + lp(id.container) + id.containerID
+}
+
+// lp length-prefixes one label-derived key part (collision-proof join).
+func lp(v string) string {
+	return strconv.Itoa(len(v)) + ":" + v
 }
 
 // isIdentityLabel reports whether a label moved into the resource.

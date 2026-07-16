@@ -273,6 +273,11 @@ func (s *Store) DeletePod(uid types.UID) {
 	deletedAt := now
 	rec.pod.DeletedAt = &deletedAt
 	rec.expireAt = now.Add(s.ttl)
+	// Only entries with NO expiry yet are stamped: a replayed DeletePod (an
+	// informer resync) extends the pod tombstone but deliberately not the
+	// container entries — their clocks started at the first deletion (or at a
+	// restart replacement), and the invariant only requires containers to
+	// expire NO LATER than their pod, which re-stamping the pod preserves.
 	for id := range rec.containerIDs {
 		if e := s.byContainer[id]; e != nil && e.podUID == uid && e.expireAt.IsZero() {
 			e.expireAt = rec.expireAt

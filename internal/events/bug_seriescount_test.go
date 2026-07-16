@@ -8,6 +8,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
+	"github.com/JohanLindvall/kubescrape/internal/obs"
 	"github.com/JohanLindvall/kubescrape/internal/store"
 )
 
@@ -53,5 +54,23 @@ func TestEventsSeriesCountAttribute(t *testing.T) {
 	exp.mu.Unlock()
 	if count != 7 {
 		t.Fatalf("k8s.event.count = %d, want 7 (from Series.Count); a modern series event lost its occurrence count", count)
+	}
+}
+
+// An event enqueued AFTER shutdown closed the exporter must be counted as a
+// drop, never parked silently in the channel forever.
+func TestEnqueueAfterShutdownCountsDrop(t *testing.T) {
+	exp := &capture{}
+	e := New(Config{Store: store.New(time.Minute), Exporter: exp, FlushInterval: time.Hour})
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { defer close(done); e.Run(ctx) }()
+	cancel()
+	<-done
+
+	before := obs.EventsDropped.Value()
+	e.OnAdd(testEvent("Late", "Pod", "p", "u", time.Now().Add(time.Second)))
+	if got := obs.EventsDropped.Value() - before; got != 1 {
+		t.Fatalf("post-shutdown enqueue dropped delta = %v, want 1 (counted, not silent)", got)
 	}
 }

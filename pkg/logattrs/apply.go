@@ -22,6 +22,8 @@ func Put(m pcommon.Map, attrs []Attr) {
 			} else {
 				m.PutDouble(a.Key, v)
 			}
+		case int64: // per the Attr contract; DecodeAny yields float64 today
+			m.PutInt(a.Key, v)
 		}
 	}
 }

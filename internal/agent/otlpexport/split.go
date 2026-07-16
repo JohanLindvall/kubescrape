@@ -59,6 +59,15 @@ func splitLogs(ld plog.Logs, maxBytes int) []plog.Logs {
 		}
 		// This resource alone exceeds the cap: split its records.
 		flush()
+		if rl.ScopeLogs().Len() == 0 {
+			// No scopes to split by: send it whole as its own part — rejected
+			// and counted at the collector, never silently dropped (the
+			// len(out)==0 guard below only covers the single-resource case).
+			part := plog.NewLogs()
+			rl.CopyTo(part.ResourceLogs().AppendEmpty())
+			out = append(out, part)
+			continue
+		}
 		splitBigResourceLogs(rl, maxBytes, &out)
 	}
 	flush()
@@ -160,6 +169,13 @@ func splitMetrics(md pmetric.Metrics, maxBytes int) []pmetric.Metrics {
 			continue
 		}
 		flush()
+		if rm.ScopeMetrics().Len() == 0 {
+			// See splitLogs: a scope-less over-cap resource must still ship.
+			part := pmetric.NewMetrics()
+			rm.CopyTo(part.ResourceMetrics().AppendEmpty())
+			out = append(out, part)
+			continue
+		}
 		splitBigResourceMetrics(rm, maxBytes, &out)
 	}
 	flush()
@@ -251,6 +267,13 @@ func splitTraces(td ptrace.Traces, maxBytes int) []ptrace.Traces {
 			continue
 		}
 		flush()
+		if rs.ScopeSpans().Len() == 0 {
+			// See splitLogs: a scope-less over-cap resource must still ship.
+			part := ptrace.NewTraces()
+			rs.CopyTo(part.ResourceSpans().AppendEmpty())
+			out = append(out, part)
+			continue
+		}
 		splitBigResourceSpans(rs, maxBytes, &out)
 	}
 	flush()

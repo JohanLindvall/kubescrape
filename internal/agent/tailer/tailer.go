@@ -2083,6 +2083,16 @@ func (t *Tailer) drainGone(f *file) {
 	} else {
 		t.drainFile(context.Background(), f)
 	}
+	if len(f.pending) > 0 {
+		// An unterminated final line (a process killed mid-write) can never be
+		// completed — the file is gone. Without flushing it here, settledGone's
+		// pending check would hold the fd and the files-map entry forever and
+		// the tail would never be delivered. The synthetic terminator advances
+		// readPos with it so the commit reaches goneEnd.
+		f.pending = append(f.pending, '\n')
+		f.readPos++
+		t.consume(context.Background(), f, true)
+	}
 	t.stopPipeline(context.Background(), f)
 	f.goneEnd = max(f.goneEnd, f.readPos) // the inode's true end, rewind-proof
 }

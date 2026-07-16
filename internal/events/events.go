@@ -5,6 +5,7 @@ package events
 import (
 	"context"
 	"log/slog"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -58,6 +59,13 @@ type Exporter struct {
 	// lastDropWarn rate-limits the queue-full warning (unix nanos); every drop
 	// still counts into obs.EventsDropped.
 	lastDropWarn atomic.Int64
+	// mu orders enqueue against the shutdown drain (the ingest batcher's
+	// pattern): enqueue sends under RLock; once Run sets closed under the write
+	// lock no send can be in flight, so draining the channel until empty is
+	// exact — an informer callback racing shutdown counts a drop instead of
+	// parking an event in the channel forever, uncounted.
+	mu     sync.RWMutex
+	closed bool
 }
 
 // New creates an Exporter. Events older than the start time (the informer's
@@ -118,9 +126,17 @@ func (e *Exporter) enqueue(ev *corev1.Event) {
 	if eventTime(ev).Before(e.start) {
 		return // pre-start history from the initial list
 	}
+	e.mu.RLock()
+	if e.closed {
+		e.mu.RUnlock()
+		obs.EventsDropped.Inc() // shutdown raced the informer callback: counted, not silent
+		return
+	}
 	select {
 	case e.ch <- ev:
+		e.mu.RUnlock()
 	default:
+		e.mu.RUnlock()
 		obs.EventsDropped.Inc()
 		// One warning per ~10s: a sustained overload would otherwise log per
 		// dropped event.
@@ -159,8 +175,9 @@ func (e *Exporter) Run(ctx context.Context) {
 		if err := e.cfg.Exporter.ExportLogs(ctx, e.convert(batch)); err != nil {
 			// Delivery is best-effort: there are no retries and no spool, so a
 			// failed export loses the batch. Count it like a queue-full drop —
-			// the shutdown flush suppresses even the warning, and a silent loss
-			// is not acceptable.
+			// a silent loss is not acceptable. (The ctx.Err guard below only
+			// silences the warn when the CALLER's context died mid-flush; the
+			// shutdown flush runs on a fresh context and does warn.)
 			obs.EventsDropped.Add(float64(len(batch)))
 			if ctx.Err() == nil {
 				e.log.Warn("exporting events", "count", len(batch), "error", err)
@@ -173,6 +190,11 @@ func (e *Exporter) Run(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
+			// Refuse new input first: once closed is set under the write lock no
+			// enqueue send can be in flight, so the sweep below is exact.
+			e.mu.Lock()
+			e.closed = true
+			e.mu.Unlock()
 			// Export the pending batch (and whatever is already queued) before
 			// returning, on a short background timeout — mirroring the
 			// self-metrics registry's final export.

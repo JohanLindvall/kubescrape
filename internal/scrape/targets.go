@@ -130,6 +130,17 @@ func monitorPodPort(pod kubemeta.Pod, svc *services.Service, ep servicemonitors.
 	if ep.Port == "" && ep.TargetPort == nil {
 		return 0, false
 	}
+	// When BOTH are set, `port` wins — prometheus-operator's precedence
+	// (targetPort is its deprecated fallback); differing would scrape a
+	// different pod port than the operator for the same manifest.
+	if ep.Port != "" {
+		for _, sp := range svc.Ports {
+			if sp.Name == ep.Port {
+				return targetPodPort(pod, sp)
+			}
+		}
+		return 0, false
+	}
 	if ep.TargetPort != nil {
 		// IntValue() on a string-typed value Atoi's it ignoring the error and
 		// returns a full int, so parse and bound explicitly: "4294967297"
@@ -150,12 +161,6 @@ func monitorPodPort(pod kubemeta.Pod, svc *services.Service, ep servicemonitors.
 					return p.Port, true
 				}
 			}
-		}
-		return 0, false
-	}
-	for _, sp := range svc.Ports {
-		if sp.Name == ep.Port {
-			return targetPodPort(pod, sp)
 		}
 	}
 	return 0, false

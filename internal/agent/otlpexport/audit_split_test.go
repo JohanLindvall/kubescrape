@@ -504,3 +504,33 @@ func TestBigSplitPreservesEmptyScope(t *testing.T) {
 		t.Fatalf("BUG: over-cap split dropped record-less scope A (its scope attrs/identity); under-cap path keeps it")
 	}
 }
+
+// A scope-less resource whose attributes alone exceed the cap must still ship
+// (as its own part) when OTHER resources share the payload — the len(out)==0
+// guard only covers the single-resource case.
+func TestSplitScopelessOverCapResourceInMixedPayloadShips(t *testing.T) {
+	ld := plog.NewLogs()
+	// Normal resource with a record.
+	rl := ld.ResourceLogs().AppendEmpty()
+	rl.Resource().Attributes().PutStr("service.name", "ok")
+	rl.ScopeLogs().AppendEmpty().LogRecords().AppendEmpty().Body().SetStr("hello")
+	// Scope-less resource with attributes far past the cap.
+	big := ld.ResourceLogs().AppendEmpty()
+	big.Resource().Attributes().PutStr("huge", strings.Repeat("x", 4096))
+
+	parts := splitLogs(ld, 1024)
+	total := 0
+	sawBig := false
+	for _, p := range parts {
+		rls := p.ResourceLogs()
+		total += rls.Len()
+		for i := 0; i < rls.Len(); i++ {
+			if _, ok := rls.At(i).Resource().Attributes().Get("huge"); ok {
+				sawBig = true
+			}
+		}
+	}
+	if total != 2 || !sawBig {
+		t.Fatalf("scope-less over-cap resource dropped from mixed payload: %d resources across %d parts, big=%v", total, len(parts), sawBig)
+	}
+}

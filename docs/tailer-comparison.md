@@ -104,10 +104,139 @@ In descending order of lines saved per guarantee lost:
    the product's core promise.
 3. **Drop pipelined export** — an opt-in perf mode whose settle/gen interplay
    is real complexity, for overlap `-buffer-dir` can provide instead.
+   Expanded below.
 4. **Do the deferred decomposition** — same behavior, better factoring: a
    per-container logical-stream aggregator over a byte-offset durability
    layer. Does not reduce essential complexity, but splits the 2,700-line file
-   along its actual seam.
+   along its actual seam. Expanded below.
+
+## Expanded: dropping pipelined export
+
+**What it is.** `Config.PipelinedExport` overlaps reading with delivery: flush
+hands the payload plus its commit information (the `inflight` struct —
+offsets, unclamped highs, per-file generations, carried-release marks) to one
+worker goroutine and keeps sweeping. At most one export is outstanding; its
+result is applied at the next flush, by `pollInflight` in housekeeping (a
+failure must rewind even when no new lines arrive), or by `settle(f)` when
+rotation machinery is about to touch a file the export references.
+
+**What it actually costs.** The feature's price is not the 158 lines of
+`pipelined.go` — it is a *protocol* the rest of the tailer must observe:
+
+- Every path that mutates file state (rename rotation, truncation,
+  copytruncate, archive replacement, gone-file drain, drop, shutdown) must
+  call `settle(f)` *first*, so an in-flight failure rewinds before the state
+  it would rewind into is destroyed. Forgetting one call site is silent data
+  loss; the gen-check in `commitBatch`/`failBatch` is only a backstop.
+- The commit ceiling must be frozen at *build* time, not apply time: by the
+  time a pipelined result lands, lines that were buffered at build may sit in
+  the next, unexported batch, and the live watermark no longer protects them.
+  This build/apply split is the single most non-obvious invariant in the
+  package.
+- Drains must force-synchronous export (`flushDuringDrain` nils the channel):
+  a handed-off export would still be in flight when `reopen` bumps the
+  generation or `release` closes fds, and its later failure would skip the
+  rewind.
+- The audit record is the argument made concrete: two real bugs traced to
+  exactly this interplay — the settle-triggered rewind invalidating the
+  truncation check's `readPos` (a torn record and a skipped replacement
+  prefix), and an earlier commit-held-by-build-watermark bug. Four test files
+  exist solely to pin the mode.
+
+**What it buys, and the substitute.** Overlap matters when export latency is
+high: inline export blocks the sweep for the round trip (times three retries
+with backoff against a struggling collector). `-buffer-dir` provides the same
+decoupling one layer down — the tailer's "export" becomes an fsync'd append to
+a local spool (sub-millisecond), and the buffered exporter owns retries,
+backoff, and at-least-once across restarts. Back-pressure composes correctly:
+a full spool returns `ErrFull`, the tailer rewinds, same as an export failure.
+
+**The honest niche.** The substitution is not free: the spool costs one
+fsync per append and disk bandwidth, and on diskless or read-only-rootfs nodes
+there is nowhere to put it. Pipelined export exists for exactly that corner —
+overlap without local durability. If that corner is not in the deployment
+matrix, the mode duplicates the buffer's capability at a high invariant cost,
+and removing it deletes `pipelined.go`, every `settle` call site, the
+build-time-freeze subtlety, and four test files, while keeping the gen
+machinery (which rotation needs regardless) and the withheld-commit re-offer
+(which the synchronous path needs too).
+
+## Expanded: the deferred decomposition
+
+**The entanglement.** `tailer.go` fuses three concerns that change for
+different reasons:
+
+1. *Byte acquisition and durability* — fd lifecycle, rotation identity
+   (inode + head fingerprint), copytruncate detection, byte offsets,
+   checkpoints, rewind.
+2. *Logical-stream assembly* — CRI parsing, P/F fragment runs, stack-trace
+   joining, and the ledger/FIFO machinery mapping logical entries back to the
+   byte ranges they came from.
+3. *Delivery* — batching, flush, export, commit.
+
+The fusion point is that pipelines are keyed **per file**, while the thing
+being assembled is a **per-container stream** that merely happens to be
+materialized as a *sequence* of files. Every rotation therefore forces the
+assembly state across a file boundary, and that is precisely the machinery the
+audits kept finding bugs in: carried prefixes, offset re-anchoring, generation
+bumps, the live-path vs restart-path asymmetry (`feedCarriedPrefix` vs
+`findRotated`).
+
+**The proposed shape.** Three layers with the stream, not the file, as the
+stable identity:
+
+- **Segment layer** (durability): tracks each stream's files as an ordered
+  segment list — today's `carried` list promoted from exception-path to
+  primary model, with the current file as the tail segment. Owns discovery,
+  identity, fd caps, archives, and per-segment committed offsets. Emits
+  ordered byte chunks tagged `(stream, segment, range)`. Checkpoint = per
+  stream, a list of `(segment identity, committed offset)` — the shape
+  `positions.Prefix` already has.
+- **Assembly layer**: one CRI+multiline pipeline per *stream*, fed chunks in
+  order. Rotation is invisible here — the joiner never knows a file boundary
+  happened. Entries carry `(segment, range)` provenance; the watermark is the
+  per-stream minimum unemitted `(segment, offset)`.
+- **Delivery layer**: batches entries, exports, commits per-(stream, segment)
+  offsets; a segment is releasable (fd closed, checkpoint entry dropped) when
+  its whole range is committed.
+
+**What structurally disappears.** `gen` exists to disambiguate offsets in the
+old inode's space from the new one's after a rotation; with offsets *paired
+with their segment* the ambiguity cannot be expressed, so the whole
+gen-stamping/gen-checking protocol goes. `reanchor` (re-basing buffered
+offsets onto a new origin) goes for the same reason. The carried-prefix
+recovery paths merge with normal operation: a crash-restart re-reads
+uncommitted segment ranges through the *same* code that live operation uses,
+eliminating the live/restart asymmetry where several audit bugs lived.
+Invariants become type-structural — an offset cannot be applied to the wrong
+inode because it does not exist apart from its segment — instead of
+protocol-discipline ("remember to bump gen before...").
+
+**What is conserved, and the new risks.** Total essential complexity does not
+shrink: segment identity, fingerprint extension, fd budgets, copytruncate
+detection, archive decompression, and the entry-to-byte-range ledger all
+remain — the ledger becomes the assembly layer's provenance tracking rather
+than vanishing. Two risks need explicit guarding: the layer boundary must not
+introduce per-line allocations (chunks handed off as slice views, provenance
+pooled — the pinned `BenchmarkIngestLine` 0 allocs/op is the tripwire), and
+the cross-layer release rule (a segment may only close once the assembler has
+drained it) replaces today's watermark check and needs the same rigor.
+
+**Migration sketch**, each step landable green against the existing test
+suite (which is the asset that makes this tractable at all — the
+interleaving-exact tests pin the behavior being preserved):
+
+1. Introduce the segment list inside the current code — rename `carried` to
+   segments, model the current file as the tail segment. No behavior change.
+2. Key pipelines by container/stream instead of by file.
+3. Move checkpoints to per-stream segment lists (a versioned positions-format
+   migration; the spool already sets the versioning pattern).
+4. Delete `gen`/`reanchor` once every offset is segment-qualified.
+
+**Cost/benefit.** Net line count likely similar or slightly higher; per-file
+complexity much lower; the win is correctness-by-construction for the class of
+bug the audits kept finding. The right trigger: the next bug that lands in the
+carry/gen machinery, or before any new feature that touches rotation.
 
 ## Verdict
 

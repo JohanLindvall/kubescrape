@@ -1131,13 +1131,13 @@ func TestDeferredCRIEmissionOffsets(t *testing.T) {
 	if e.body != "hello-world" {
 		t.Fatalf("body %q", e.body)
 	}
-	if e.start != 0 || e.offset != endF {
-		t.Fatalf("entry range [%d,%d), want [0,%d)", e.start, e.offset, endF)
+	if e.start.off != 0 || e.end.off != endF {
+		t.Fatalf("entry range [%d,%d), want [0,%d)", e.start.off, e.end.off, endF)
 	}
 	// The dangling fragment must still clamp the watermark.
 	wm, ok := f.watermark()
-	if !ok || wm != endF {
-		t.Fatalf("watermark = %d,%v, want %d,true (fragment lost coverage)", wm, ok, endF)
+	if !ok || wm.off != endF {
+		t.Fatalf("watermark = %+v,%v, want off %d,true (fragment lost coverage)", wm, ok, endF)
 	}
 }
 

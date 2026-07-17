@@ -68,9 +68,9 @@ func TestSecondRotationKeepsCarriedPrefix(t *testing.T) {
 	writeLog(t, dir, "2026-07-05T10:00:01Z stdout F two")
 
 	tl.sweep(ctx, true) // re-reads "one", rotation -> carried=[A]
-	tl.flush(ctx)       // FAILS -> rewind (re-arms carriedFed)
-	if len(tl.files[path].carried) != 1 {
-		t.Fatalf("setup: carried = %+v, want the rotated-away inode A", tl.files[path].carried)
+	tl.flush(ctx)       // FAILS -> rewind (re-arms segmentsFed)
+	if len(tl.files[path].segments) != 1 {
+		t.Fatalf("setup: segments = %+v, want the rotated-away inode A", tl.files[path].segments)
 	}
 
 	tl.sweep(ctx, true) // re-feeds A's prefix ("one") + reads "two"
@@ -273,7 +273,7 @@ func TestCompressedArchiveSurvivesDeletionAfterFailedExport(t *testing.T) {
 //
 // state: "one" read from A, export FAILS, A rotated away (carried=[{A,0,L}],
 //
-//	fd closed), export FAILS again (rewind re-arms carriedFed), the runtime
+//	fd closed), export FAILS again (rewind re-arms segmentsFed), the runtime
 //	deletes A.1 -> next sweep cannot find it -> "one" is never re-read.
 //
 // Fix: keep the rotated inode's fd open while a carried prefix references it
@@ -305,7 +305,7 @@ func TestCarriedPrefixSurvivesRotatedFileDeletion(t *testing.T) {
 	}
 	writeLog(t, dir, "2026-07-05T10:00:01Z stdout F two")
 	tl.sweep(ctx, true) // rotation -> carried=[A], A's fd closed
-	tl.flush(ctx)       // FAILS -> rewind re-arms carriedFed (A must be re-read)
+	tl.flush(ctx)       // FAILS -> rewind re-arms segmentsFed (A must be re-read)
 
 	// The runtime prunes the rotated file before the tailer can re-read it.
 	if err := os.Remove(path + ".1"); err != nil {

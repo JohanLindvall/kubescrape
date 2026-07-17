@@ -301,14 +301,14 @@ type file struct {
 	tokens     float64
 	lastRefill time.Time
 	limited    bool
-	// exportedHigh is the highest exported-entry end offset (at exportedHighGen)
-	// whose COMMIT was withheld by the build-time watermark clamp — another
-	// stream's group was still buffered. The next flush touching the file
-	// re-offers it: the bytes are delivered, only the checkpoint lags, and
-	// without the re-offer `committed` freezes below readPos forever (the
-	// high entry belongs to an earlier batch that no later maxOffsets sees).
-	exportedHigh    int64
-	exportedHighGen int
+	// exportedHigh is the highest exported-entry end position whose COMMIT was
+	// withheld by the build-time watermark clamp — another stream's group was
+	// still buffered. The next flush touching the file re-offers it: the bytes
+	// are delivered, only the checkpoint lags, and without the re-offer
+	// `committed` freezes below readPos forever (the high entry belongs to an
+	// earlier batch that no later candidate set sees). A dead segment id here
+	// (truncated away) resolves to nothing and is dropped harmlessly.
+	exportedHigh pos
 	// discarding marks the remainder of an oversized unterminated line: the
 	// accumulated prefix was dropped (see consume), and everything up to the
 	// line's eventual newline is part of the same line, not a record.
@@ -340,15 +340,32 @@ func (f *file) stateFor(key string) *streamState {
 // logItem is one buffered logical line's offset range; when carries the
 // line's timestamp (CRI-parsed, or the feed time for plain files) so stale
 // items can be recognized (see the fifo pop).
+// pos is a byte position qualified by the segment (file incarnation) it lives
+// in: seg is a per-file monotonic id (the live file is the tail segment; each
+// rename rotation closes the tail into a recorded segment and starts a new
+// one). Qualifying every buffered/emitted offset with its segment is what
+// makes cross-rotation offsets unambiguous BY CONSTRUCTION — the old design
+// disambiguated them with a rotation generation stamped on entries and a
+// rewrite of buffered offsets at the rotation instant (reanchor), both of
+// which this type replaces.
+type pos struct {
+	seg int
+	off int64
+}
+
+// less orders positions: segment ids are monotonic, so lexicographic order is
+// stream order.
+func (p pos) less(q pos) bool { return p.seg < q.seg || (p.seg == q.seg && p.off < q.off) }
+
 type logItem struct {
-	start, end int64
+	start, end pos
 	when       time.Time
 }
 
 // ledger is the byte-offset durability accounting for one file's two-stage
 // pipeline: it decides how far the checkpoint may safely advance and how a
 // multi-line group buffered across a rename rotation survives a crash. It is
-// embedded in file (fields/methods are used unqualified as f.state(), f.gen,
+// embedded in file (fields/methods are used unqualified as f.state(), f.tail,
 // f.watermark(), ...).
 //
 // # Offsets within one inode
@@ -369,28 +386,41 @@ type logItem struct {
 //
 // # Across a rename rotation (multi-line join + crash safety)
 //
-// When a group straddles a rename rotation the pipeline is carried into the new
-// inode instead of being flushed (see reopen). Two problems follow, solved by
-// gen and carried:
+// When a group straddles a rename rotation the pipeline is carried into the
+// new inode instead of being flushed (see reopen). Every buffered/emitted
+// offset is a pos — qualified by its segment — so pre-rotation lines commit
+// to THEIR segment's record and can never advance the new tail's checkpoint;
+// there is nothing to re-base and no generation to check.
 //
-//   - gen (rotation generation) stamps every emitted entry; flush commits only
-//     offsets of entries whose gen == the file's current gen. This keeps the
-//     pre-rotation lines already drained from the old inode — which carry
-//     old-inode offsets — from advancing the new inode's checkpoint. reanchor()
-//     zeroes the offsets still buffered from the old inode at the moment of the
-//     switch, so watermark reflects the new inode's origin.
-//   - carried lists the rotated-away files (oldest first, one per hop) whose
-//     tails are buffered but not yet exported; it is checkpointed. On restart
-//     or after a rewind (carriedFed == false) those tails are re-read from the
-//     rotated files before the new inode, reconstructing the group with no
-//     loss. carried clears once the group exports (watermark shows nothing
-//     buffered).
+// segments lists the rotated-away incarnations (oldest first, one per hop)
+// whose bytes are not yet fully committed; it is checkpointed. On restart or
+// after a rewind (segmentsFed == false) the incomplete ranges are re-read
+// from the rotated files before the new inode, reconstructing a straddling
+// group with no loss. A segment leaves the list once its whole range commits.
 type ledger struct {
 	streams []*streamState
 
-	gen        int
-	carried    []rotatedPrefix
-	carriedFed bool
+	// segSeq issues per-file monotonic segment ids; tail is the live file's.
+	// A truncation-style restart (content destroyed, nothing recoverable)
+	// starts a new tail WITHOUT recording the old segment: batch entries
+	// still naming the dead id simply resolve to nothing at commit.
+	segSeq int
+	tail   int
+	// segments are the closed, incompletely-committed incarnations.
+	segments    []*segment
+	segmentsFed bool
+	// feeding is the segment id lines are currently being fed under: 0 (the
+	// normal case) means the tail; feedSegments sets it while re-reading an
+	// old segment so its items/entries carry THAT segment's id.
+	feeding int
+}
+
+// curSeg is the segment id for bytes being fed right now.
+func (l *ledger) curSeg() int {
+	if l.feeding != 0 {
+		return l.feeding
+	}
+	return l.tail
 }
 
 // streamState is the offset accounting for one pipeline key. stream is the
@@ -399,8 +429,8 @@ type ledger struct {
 type streamState struct {
 	key      string
 	stream   string
-	lastEnd  int64
-	runStart int64
+	lastEnd  pos
+	runStart pos
 	hasRun   bool
 	// A multi-fragment run closed by its F line is not emitted until the
 	// stage sees the NEXT line for the key (or a flush), by which point
@@ -409,9 +439,9 @@ type streamState struct {
 	// so the watermark keeps covering it. nextStart/hasNext hold the
 	// triggering line's registration, installed by the emission callback.
 	closed      bool
-	closedStart int64
-	closedEnd   int64
-	nextStart   int64
+	closedStart pos
+	closedEnd   pos
+	nextStart   pos
 	hasNext     bool
 
 	// fifo holds the buffered logical lines; the live ones are fifo[fifoHead:].
@@ -457,47 +487,51 @@ func (l *ledger) state(key string) *streamState {
 	return st
 }
 
-// reset clears the per-inode offset states for a fresh pipeline incarnation. It
-// leaves gen and carried untouched (they persist across a carried rotation);
-// carriedFed goes false so any carried tails are re-read before the new inode.
-// Callers must re-derive any cached state pointers afterwards.
+// reset clears the per-stream offset states for a fresh pipeline incarnation.
+// It leaves the segment list untouched (segments persist across a carried
+// rotation); segmentsFed goes false so incomplete segments are re-read before
+// the new inode. Callers must re-derive any cached state pointers afterwards.
 func (l *ledger) reset() {
-	l.carriedFed = false
+	l.segmentsFed = false
 	l.streams = nil
 }
 
-// reanchor resets the offsets still buffered in the pipeline to the new inode's
-// origin, so watermark holds the new inode's checkpoint at 0 until the carried
-// group completes and the (new-inode) offset of its final line becomes the
-// commit point.
-func (l *ledger) reanchor() {
-	for _, st := range l.streams {
-		st.lastEnd = 0
-		st.runStart = 0
-		st.closedStart = 0
-		st.closedEnd = 0
-		st.nextStart = 0
-		live := st.live()
-		for i := range live {
-			// Zero the offsets only: when must survive, or the fifo's
-			// orphan detection would mistake reanchored live items for
-			// dropped lines.
-			live[i].start, live[i].end = 0, 0
-		}
-	}
+// newTail starts a fresh tail segment and returns its id.
+func (l *ledger) newTail() int {
+	l.segSeq++
+	l.tail = l.segSeq
+	return l.tail
 }
 
-// rotatedPrefix is the unexported tail of a rotated-away file, held until the
-// straddling multi-line group completes and exports.
-type rotatedPrefix struct {
-	inode    uint64
-	fp       fingerprint
-	from, to int64
-	// fd is the rotated inode's still-open handle, kept while this prefix is
-	// uncommitted: the runtime prunes rotated files on its own schedule (a
-	// bounded rotation count), and once it does, findRotated cannot resolve the
-	// prefix by name — but the fd still reaches the unlinked inode. nil after a
-	// restart, where findRotated is the only route.
+// segmentByID resolves a recorded (non-tail) segment; nil for the tail, for
+// dead ids (truncated-away incarnations), and after the segment completed.
+func (l *ledger) segmentByID(id int) *segment {
+	for _, s := range l.segments {
+		if s.id == id {
+			return s
+		}
+	}
+	return nil
+}
+
+// segment is a rotated-away file incarnation whose byte range is not yet
+// fully committed, held (with its fd where the budget allows) until every
+// byte up to `to` commits.
+type segment struct {
+	id    int
+	inode uint64
+	fp    fingerprint
+	// committed is the commit progress within the segment: [committed, to) is
+	// the range still owed (re-read on restart or after a rewind). It starts
+	// at the tail's committed offset when the rotation closes the segment and
+	// advances as the segment's entries export; the segment retires once it
+	// reaches to.
+	committed, to int64
+	// fd is the rotated inode's still-open handle, kept while the segment is
+	// incomplete: the runtime prunes rotated files on its own schedule (a
+	// bounded rotation count), and once it does, findRotated cannot resolve
+	// the segment by name — but the fd still reaches the unlinked inode. nil
+	// after a restart, where findRotated is the only route.
 	fd *os.File
 }
 
@@ -505,28 +539,38 @@ type rotatedPrefix struct {
 // outage (see reopen).
 const maxCarriedFds = 4
 
-// retainedFds counts the carried prefixes still holding an open fd.
+// retainedFds counts the segments still holding an open fd.
 func (f *file) retainedFds() int {
 	n := 0
-	for i := range f.carried {
-		if f.carried[i].fd != nil {
+	for _, s := range f.segments {
+		if s.fd != nil {
 			n++
 		}
 	}
 	return n
 }
 
-// closeCarried releases the rotated inodes' retained fds. Only legitimate once
-// their lines are committed (or the file is being dropped) — the fds are the
-// last handle to inodes the runtime may already have unlinked.
-func (f *file) closeCarried() {
-	for i := range f.carried {
-		if f.carried[i].fd != nil {
-			_ = f.carried[i].fd.Close()
-			f.carried[i].fd = nil
+// retire closes one completed segment's fd and removes it from the list.
+// Only legitimate once its whole range is committed (or the file is being
+// dropped) — the fd is the last handle to an inode the runtime may already
+// have unlinked.
+func (f *file) retire(s *segment) {
+	if s.fd != nil {
+		_ = s.fd.Close()
+		s.fd = nil
+	}
+	f.segments = slices.DeleteFunc(f.segments, func(x *segment) bool { return x == s })
+}
+
+// closeSegments releases every segment unconditionally (drop/release paths).
+func (f *file) closeSegments() {
+	for _, s := range f.segments {
+		if s.fd != nil {
+			_ = s.fd.Close()
+			s.fd = nil
 		}
 	}
-	f.carried = nil
+	f.segments = nil
 }
 
 // fingerprint identifies file content: an FNV-1a hash of the first Len
@@ -565,13 +609,16 @@ func (fp fingerprint) matches(f io.ReaderAt) bool {
 	return err == nil && cur == fp
 }
 
-// watermark returns the lowest offset still buffered in the pipeline;
-// committed offsets must not advance past it.
-func (l *ledger) watermark() (int64, bool) {
-	wm := int64(-1)
-	lower := func(v int64) {
-		if wm < 0 || v < wm {
-			wm = v
+// watermark returns the lowest position still buffered in the pipeline;
+// committed offsets must not advance past it (per segment: a candidate in a
+// segment NEWER than the watermark's commits nothing, one in the SAME segment
+// clamps to the watermark offset, and OLDER segments are unconstrained).
+func (l *ledger) watermark() (pos, bool) {
+	var wm pos
+	found := false
+	lower := func(v pos) {
+		if !found || v.less(wm) {
+			wm, found = v, true
 		}
 	}
 	for _, st := range l.streams {
@@ -582,7 +629,7 @@ func (l *ledger) watermark() (int64, bool) {
 			lower(live[0].start)
 		}
 	}
-	return wm, wm >= 0
+	return wm, found
 }
 
 type entry struct {
@@ -594,16 +641,13 @@ type entry struct {
 	// match names the multiline pattern that produced a joined entry ("" for
 	// plain single lines).
 	match string
-	// start is the file offset of the first byte of the entry (exposed as
-	// log.file.position); offset is the offset just after the physical line
-	// that completed it, and committing offset marks the entry as exported.
-	start  int64
-	offset int64
-	// gen is the file's rotation generation when the entry was emitted. Only
-	// entries of the file's current generation drive its committed offset:
-	// pre-rotation entries carry offsets in the old inode's space (recoverable
-	// via file.carried) and must not advance the new inode's checkpoint.
-	gen int
+	// start is the segment-qualified position of the entry's first byte
+	// (start.off is exposed as log.file.position); end is the position just
+	// past the physical line that completed it. Committing end marks the
+	// entry's bytes exported — against end.seg's record, so a pre-rotation
+	// entry can never advance the new tail's checkpoint.
+	start pos
+	end   pos
 }
 
 // New creates a Tailer.
@@ -775,7 +819,7 @@ func (t *Tailer) closeIdleFiles() {
 		if f.f == nil || f.compressed || f.dirty || f.limited {
 			continue
 		}
-		if len(f.pending) > 0 || f.readPos != f.committed || len(f.carried) > 0 {
+		if len(f.pending) > 0 || f.readPos != f.committed || len(f.segments) > 0 {
 			continue
 		}
 		if _, buffered := f.watermark(); buffered {
@@ -1027,16 +1071,20 @@ func (t *Tailer) initFile(f *file, checkpoints map[string]checkpoint, initial bo
 		f.inode = cp.Inode
 		f.fp = fingerprint{Len: cp.FingerprintLen, Hash: cp.FingerprintHash}
 		for _, pp := range cp.Pending {
-			// A group straddled one or more rotations at shutdown/crash: its
-			// prefixes are re-read from the rotated files (oldest first) before
-			// this (new) inode is consumed. carriedFed is already false.
-			f.carried = append(f.carried, rotatedPrefix{
-				inode: pp.Inode,
-				fp:    fingerprint{Len: pp.FingerprintLen, Hash: pp.FingerprintHash},
-				from:  pp.From,
-				to:    pp.To,
+			// Uncommitted rotated-away ranges at shutdown/crash: re-read from
+			// the rotated files (oldest first) before this (new) inode is
+			// consumed. segmentsFed is already false. Ids are per-process:
+			// issue them in list order, below the tail id issued afterwards.
+			f.segSeq++
+			f.segments = append(f.segments, &segment{
+				id:        f.segSeq,
+				inode:     pp.Inode,
+				fp:        fingerprint{Len: pp.FingerprintLen, Hash: pp.FingerprintHash},
+				committed: pp.From,
+				to:        pp.To,
 			})
 		}
+		f.newTail()
 	} else if !f.compressed {
 		// Present at startup with no checkpoint entry. Where to start is
 		// configurable (Config.UnknownFiles): "end" skips it as pre-existing
@@ -1064,6 +1112,12 @@ func (t *Tailer) initFile(f *file, checkpoints map[string]checkpoint, initial bo
 // carried prefix (if any) is no longer present in the fresh pipeline and must
 // be re-read before the current inode is consumed.
 func (t *Tailer) newPipeline(f *file) {
+	if f.tail == 0 {
+		// First pipeline for this file: issue its tail segment id. Files
+		// restored from a checkpoint re-issue a higher tail in initFile,
+		// above their loaded segments' ids.
+		f.newTail()
+	}
 	f.reset()
 	f.keyStdout = f.containerID + "/stdout"
 	f.keyStderr = f.containerID + "/stderr"
@@ -1103,7 +1157,7 @@ func (t *Tailer) newPipeline(f *file) {
 			st.pop(n)
 			t.emit(f, entry{
 				time: e.Data, stream: st.stream, body: e.Text,
-				truncated: e.Truncated, match: e.Match, start: start, offset: end,
+				truncated: e.Truncated, match: e.Match, start: start, end: end,
 			})
 			return nil
 		}, multiline.WithMaxBytes(t.cfg.MaxEntryBytes), multiline.WithMaxLines(512))
@@ -1116,15 +1170,13 @@ func (t *Tailer) newPipeline(f *file) {
 	// Emission is synchronous inside Add/Flush*, so the state's lastEnd is
 	// exactly the end offset of the line's last fragment.
 	if f.source.containerd {
-		f.criStage = cri.New(func(ctx context.Context, key, line string, when time.Time, start int64) error {
+		f.criStage = cri.New(func(ctx context.Context, key, line string, when time.Time, rawStart int64) error {
 			st := f.stateFor(key)
-			var end int64
+			var start, end pos
 			if st.closed {
 				// Deferred emission of an F-closed run: its boundaries were
 				// pinned when the F line was fed (lastEnd has since moved on
-				// to the line that triggered this flush). Both offsets are
-				// ledger-side state, so a carried-rotation reanchor reaches
-				// them (the cri-threaded start predates it).
+				// to the line that triggered this flush).
 				start, end = st.closedStart, st.closedEnd
 				st.closed = false
 				if st.hasNext {
@@ -1137,15 +1189,17 @@ func (t *Tailer) newPipeline(f *file) {
 			} else {
 				// Emission within the fed line's own AddParsed (single F,
 				// passthrough) or a flush of an unclosed run: runStart is the
-				// reanchor-aware first offset, lastEnd the newest line's end.
+				// run's first position, lastEnd the newest line's end.
 				if st.hasRun {
 					start = st.runStart
+				} else {
+					start = pos{seg: f.curSeg(), off: rawStart} // defensive; hasRun is set before AddParsed
 				}
 				st.hasRun = false
 				end = st.lastEnd
 			}
 			if f.traces == nil {
-				t.emit(f, entry{time: when, stream: st.stream, body: line, start: start, offset: end})
+				t.emit(f, entry{time: when, stream: st.stream, body: line, start: start, end: end})
 				return nil
 			}
 			st.push(logItem{start: start, end: end, when: when})
@@ -1159,7 +1213,6 @@ func (t *Tailer) newPipeline(f *file) {
 // emit appends one completed entry to the batch.
 func (t *Tailer) emit(f *file, e entry) {
 	e.file = f
-	e.gen = f.gen
 	t.batch = append(t.batch, e)
 }
 
@@ -1198,22 +1251,24 @@ func (t *Tailer) feedLine(ctx context.Context, f *file, raw string, start, end i
 			st = f.state(f.containerID + "/" + l.Stream)
 		}
 	}
+	seg := f.curSeg()
+	startPos, endPos := pos{seg, start}, pos{seg, end}
 	wasOpen := st.hasRun && !st.closed
-	st.lastEnd = end
+	st.lastEnd = endPos
 	if st.closed {
 		// The pending closed run flushes inside this AddParsed; its callback
 		// installs this line's registration afterwards (runStart must keep
-		// pointing at the older, watermark-clamping offset until then).
-		st.nextStart, st.hasNext = start, true
+		// pointing at the older, watermark-clamping position until then).
+		st.nextStart, st.hasNext = startPos, true
 	} else if !st.hasRun {
-		st.runStart, st.hasRun = start, true
+		st.runStart, st.hasRun = startPos, true
 	}
 	if ok && !l.Partial && wasOpen {
 		// The F line closes an open multi-fragment run. The stage defers the
 		// emission to the next line fed for this key, so pin the run's own
 		// boundaries now — at callback time lastEnd already belongs to that
 		// next line.
-		st.closed, st.closedStart, st.closedEnd = true, st.runStart, end
+		st.closed, st.closedStart, st.closedEnd = true, st.runStart, endPos
 	}
 	// AddParsed reuses this parse — the only one on the whole line's path.
 	if err := f.criStage.AddParsed(ctx, f.containerID, raw, l, ok, start); err != nil {
@@ -1228,11 +1283,12 @@ func (t *Tailer) feedLine(ctx context.Context, f *file, raw string, start, end i
 // so the watermark covers it until the trace stage emits it.
 func (t *Tailer) feedPlainLine(ctx context.Context, f *file, raw string, start, end int64) {
 	when := time.Now()
+	seg := f.curSeg()
 	if f.traces == nil {
-		t.emit(f, entry{time: when, body: raw, start: start, offset: end})
+		t.emit(f, entry{time: when, body: raw, start: pos{seg, start}, end: pos{seg, end}})
 		return
 	}
-	f.stPlain.push(logItem{start: start, end: end, when: when})
+	f.stPlain.push(logItem{start: pos{seg, start}, end: pos{seg, end}, when: when})
 	if err := f.traces.AddAt(ctx, plainKey, raw, when, when); err != nil {
 		t.log.Warn("log pipeline", "path", f.path, "error", err)
 	}
@@ -1369,7 +1425,7 @@ func (t *Tailer) readFile(ctx context.Context, f *file) error {
 	// A group straddled a rename rotation and the pipeline was since discarded
 	// (rewind or restart): re-read the rotated-away prefix before the new inode
 	// so the group reconstructs.
-	t.feedCarriedPrefix(ctx, f)
+	t.feedSegments(ctx, f)
 
 	// Copytruncate whose replacement content is LONGER than our read offset:
 	// the post-read check below cannot see it (bytes come back from the stale
@@ -1462,8 +1518,8 @@ func (t *Tailer) readArchive(ctx context.Context, f *file) error {
 		obs.LogRotations.Inc()
 		// As in reopen: pause-retained complete pending lines were read from
 		// the OLD stream and are deliverable; feed them before the pipeline is
-		// discarded (the gen bump below keeps their old-stream offsets from
-		// committing into the replacement's space).
+		// discarded (the fresh tail id below makes their old-stream positions
+		// resolve to nothing at commit).
 		if len(f.pending) > 0 {
 			t.consume(ctx, f, true)
 		}
@@ -1472,9 +1528,10 @@ func (t *Tailer) readArchive(ctx context.Context, f *file) error {
 		f.committed = 0
 		f.inode, f.fp = 0, fingerprint{}
 		f.archiveDone, f.archiveEOF = false, false
-		// The gen bump keeps batched entries with OLD-stream offsets from
-		// committing (or rewinding) into the replacement's offset space.
-		f.gen++
+		// A fresh tail id makes batched entries with OLD-stream positions
+		// resolve to nothing at commit: the replaced content is gone and its
+		// id is dead.
+		f.newTail()
 		f.restartAt(0)
 		t.newPipeline(f)
 	}
@@ -1925,8 +1982,8 @@ func (t *Tailer) reopen(ctx context.Context, f *file, renamed bool) {
 			t.log.Warn("unterminated final line lost at rotation", "path", f.path, "bytes", n)
 		}
 	}
-	// The rotated-away inode's fd is handed to the carried prefix that records
-	// it (and closed below if none does): it is the only handle that survives
+	// The rotated-away inode's fd is handed to the segment that records it
+	// (and closed below if none does): it is the only handle that survives
 	// the runtime deleting the rotated file.
 	old := f.f
 	f.f = nil
@@ -1935,56 +1992,53 @@ func (t *Tailer) reopen(ctx context.Context, f *file, renamed bool) {
 			_ = old.Close()
 		}
 	}()
-	// Retaining an fd per hop is unbounded otherwise: an outage spanning many
-	// rotations would exhaust RLIMIT_NOFILE and — worse — pin every rotated
-	// inode's disk space, filling the node's log volume precisely while the
-	// collector is down. Cap the fds; the prefixes themselves are kept (a
-	// rotated file that still exists is recoverable by name via findRotated).
-	// The fds are held for the OLDEST prefixes on purpose: the runtime prunes
-	// its rotation backlog oldest-first, so those are the ones for which the fd
-	// is the only remaining handle.
-	keep := func(p rotatedPrefix) rotatedPrefix {
+	// Retaining an fd per segment is unbounded otherwise: an outage spanning
+	// many rotations would exhaust RLIMIT_NOFILE and — worse — pin every
+	// rotated inode's disk space, filling the node's log volume precisely
+	// while the collector is down. Cap the fds; the segments themselves are
+	// kept (a rotated file that still exists is recoverable by name via
+	// findRotated). The fds are held for the OLDEST segments on purpose: the
+	// runtime prunes its rotation backlog oldest-first, so those are the ones
+	// for which the fd is the only remaining handle.
+	keep := func(sg *segment) *segment {
 		if f.retainedFds() >= maxCarriedFds {
-			return p // over budget: leave old to the deferred Close
+			return sg // over budget: leave old to the deferred Close
 		}
-		p.fd, old = old, nil
-		return p
+		sg.fd, old = old, nil
+		return sg
 	}
 	hopAdded := false
-	if _, buffered := f.watermark(); renamed && buffered {
-		// Append this rotation's tail; a group straddling several rotations
-		// accumulates one entry per hop, all re-readable on crash.
-		f.carried = append(f.carried, keep(rotatedPrefix{inode: f.inode, fp: f.fp, from: f.committed, to: f.readPos}))
-		f.carriedFed = true // the prefixes are already live in the pipeline
-		f.reanchor()
-		f.gen++
+	if renamed && f.readPos > f.committed {
+		// Close the tail into a segment: its uncommitted range [committed,
+		// readPos) is owed. If a group is still buffered the pipeline is
+		// carried below and the segment's items keep their (old-segment)
+		// positions unchanged; either way, if the export of the drained
+		// entries fails (or the process crashes) the rotated-away file is the
+		// only copy, and the segment record is what lets feedSegments re-read
+		// it. It retires in commitBatch once its whole range commits.
+		f.segments = append(f.segments, keep(&segment{
+			id: f.tail, inode: f.inode, fp: f.fp, committed: f.committed, to: f.readPos,
+		}))
 		hopAdded = true
+	}
+	if _, buffered := f.watermark(); renamed && buffered {
+		// A group straddles the rotation: carry the pipeline into the new
+		// inode. Buffered items keep their segment-qualified positions — no
+		// re-basing, no generation — and the fresh tail id below makes the
+		// new inode's bytes unambiguous.
+		f.segmentsFed = true // the segments' lines are already live in the pipeline
 	} else {
 		t.stopPipeline(ctx, f)
 		t.newPipeline(f)
-		// carried must NOT be reset here. Its entries name EARLIER rotated-away
-		// inodes whose lines are still uncommitted — a second rotation (or a
-		// truncation) during a collector outage does not make them recoverable
-		// any other way, and the failing flush purges them from the batch too.
-		// Dropping the list here lost them outright. Only commitBatch may clear
-		// it: after a successful export with nothing left buffered.
+		// The segment list is NOT reset here: earlier segments' lines are
+		// still uncommitted, and a second rotation (or a truncation) during a
+		// collector outage does not make them recoverable any other way.
+		// Segments retire individually in commitBatch.
 		if renamed && f.readPos > f.committed {
-			// The drained range [committed, readPos) exists only as batch
-			// entries now; if their export fails (or the process crashes),
-			// the rotated-away file is the only copy. Record it so
-			// feedCarriedPrefix can re-read it — carriedFed stays true, so
-			// nothing is re-read unless a rewind/restart resets it; on a
-			// successful export the commit clears it.
-			f.carried = append(f.carried, keep(rotatedPrefix{inode: f.inode, fp: f.fp, from: f.committed, to: f.readPos}))
-			f.carriedFed = true
-			hopAdded = true
+			f.segmentsFed = true // drained into the batch; re-read only after a rewind
 		}
-		// The entries stopPipeline just emitted carry old-content offsets; the
-		// new inode starts at 0, so those offsets must not drive its
-		// checkpoint. Bumping the generation makes flush's gen check discard
-		// them for commit purposes (they still export).
-		f.gen++
 	}
+	f.newTail()
 	f.inode = 0
 	f.fp = fingerprint{}
 	f.committed = 0
@@ -2004,35 +2058,29 @@ func (t *Tailer) reopen(ctx context.Context, f *file, renamed bool) {
 	}
 }
 
-// feedCarriedPrefix re-reads the rotated-away files' tails (the unexported
-// prefix of a straddling group) and feeds them, oldest first, into the fresh
-// pipeline so the group reconstructs before the new inode's continuation is
-// consumed. Fed at the pre-rotation generation and then re-anchored + bumped,
-// exactly as the live rotation does, so the prefix offsets never advance the
-// new inode's checkpoint. A prefix whose rotated file can no longer be found
-// (already deleted/compressed by the runtime) is skipped — that segment is
-// genuinely gone from disk.
-func (t *Tailer) feedCarriedPrefix(ctx context.Context, f *file) {
-	if len(f.carried) == 0 || f.carriedFed {
-		// Nothing to feed (or already live in the pipeline): calling through
-		// would spuriously re-anchor and bump the generation.
+// feedSegments re-reads the incomplete segments' owed ranges and feeds them,
+// oldest first, into the fresh pipeline so a straddling group reconstructs
+// before the new inode's continuation is consumed. Each segment's lines are
+// fed UNDER ITS OWN id (l.feeding), so their items and entries carry the
+// segment-qualified positions that route their commits back to the segment's
+// record. A segment whose rotated file can no longer be found (already
+// deleted/compressed by the runtime) is skipped and counted — it is genuinely
+// gone from disk.
+func (t *Tailer) feedSegments(ctx context.Context, f *file) {
+	if len(f.segments) == 0 || f.segmentsFed {
 		return
 	}
-	f.carriedFed = true
-	defer func() {
-		// Re-anchor + bump so the new inode is consumed at a fresh generation,
-		// matching reopen's carry path.
-		f.reanchor()
-		f.gen++
-	}()
-	for i := range f.carried {
-		t.feedPrefix(ctx, f, f.carried[i])
+	f.segmentsFed = true
+	for _, sg := range f.segments {
+		f.feeding = sg.id
+		t.feedPrefix(ctx, f, sg)
 	}
+	f.feeding = 0
 }
 
-// feedPrefix re-reads one rotated file's [from,to) range and feeds its lines
+// feedPrefix re-reads one segment's [committed,to) range and feeds its lines
 // into the pipeline.
-func (t *Tailer) feedPrefix(ctx context.Context, f *file, p rotatedPrefix) {
+func (t *Tailer) feedPrefix(ctx context.Context, f *file, p *segment) {
 	// The retained fd first: it reaches the inode even after the runtime has
 	// deleted (or compressed) the rotated file, which findRotated — resolving by
 	// NAME — cannot. Only a restart, where no fd survives, falls back to the path.
@@ -2056,14 +2104,14 @@ func (t *Tailer) feedPrefix(ctx context.Context, f *file, p rotatedPrefix) {
 	} else {
 		path = f.path
 	}
-	if _, err := fh.Seek(p.from, 0); err != nil {
+	if _, err := fh.Seek(p.committed, 0); err != nil {
 		t.log.Warn("seeking carried log prefix", "path", path, "error", err)
 		return
 	}
 
-	remaining := p.to - p.from
+	remaining := p.to - p.committed
 	var carry []byte
-	pos := p.from
+	cur := p.committed
 	buf := t.scratch()
 	for remaining > 0 {
 		n, rerr := fh.Read(buf[:min(int64(len(buf)), remaining)])
@@ -2076,11 +2124,11 @@ func (t *Tailer) feedPrefix(ctx context.Context, f *file, p rotatedPrefix) {
 					break
 				}
 				line := carry[:i]
-				start := pos
-				pos += int64(i + 1)
+				start := cur
+				cur += int64(i + 1)
 				carry = carry[i+1:]
 				if len(line) > 0 {
-					t.feedLine(ctx, f, string(line), start, pos)
+					t.feedLine(ctx, f, string(line), start, cur)
 				}
 			}
 		}
@@ -2092,7 +2140,7 @@ func (t *Tailer) feedPrefix(ctx context.Context, f *file, p rotatedPrefix) {
 
 // findRotated locates the rotated-away file matching p's identity in the log's
 // resolved target directory (where the runtime keeps rotated files).
-func (t *Tailer) findRotated(f *file, p rotatedPrefix) (string, bool) {
+func (t *Tailer) findRotated(f *file, p *segment) (string, bool) {
 	dir := f.targetDir
 	if dir == "" {
 		if target, err := filepath.EvalSymlinks(f.path); err == nil {
@@ -2144,7 +2192,7 @@ func (t *Tailer) drainGone(f *file) {
 	// file is never read again — without this, the prefixes' unexported lines
 	// would be closed forever by release() once everything else settles (a pod
 	// deleted during a collector outage after a rotation).
-	t.feedCarriedPrefix(context.Background(), f)
+	t.feedSegments(context.Background(), f)
 	if f.compressed {
 		// A large archive is read incrementally across sweeps; a deletion
 		// mid-read leaves the rest readable from the open fd.
@@ -2176,7 +2224,7 @@ func (t *Tailer) release(f *file) {
 		_ = f.f.Close()
 		f.f = nil
 	}
-	f.closeCarried() // the file is going: its rotated inodes' fds go with it
+	f.closeSegments() // the file is going: its rotated inodes' fds go with it
 	t.unwatchTarget(f)
 }
 
@@ -2186,10 +2234,10 @@ func (t *Tailer) release(f *file) {
 // to committed, which would otherwise look settled while the data is still
 // unexported and reachable only through our fd.
 func (t *Tailer) settledGone(f *file) bool {
-	if f.carried != nil {
-		// Carried rotated prefixes still hold unexported lines whose only
-		// handles are the retained fds release() would close; commitBatch clears
-		// carried once the group exports.
+	if len(f.segments) > 0 {
+		// Incomplete segments still hold unexported lines whose only handles
+		// are the retained fds release() would close; commitBatch retires
+		// each segment once its range exports.
 		return false
 	}
 	if _, buffered := f.watermark(); buffered {
@@ -2315,8 +2363,9 @@ func (t *Tailer) flush(ctx context.Context) {
 	}
 	ld := plog.NewLogs()
 	g := &logGrouper{ld: ld, plain: map[*file]plog.ScopeLogs{}, scopes: map[scopeKey]plog.ScopeLogs{}}
-	maxOffsets := make(map[*file]int64)
-	gens := make(map[*file]int)
+	// Per-file, per-segment commit candidates: the max exported end position
+	// per segment, plus full-range proposals for segments an entry spans.
+	cands := make(map[*file]map[int]int64)
 	now := pcommon.NewTimestampFromTime(time.Now())
 	// Per-file bound metric state (resource hash computed once per file) and
 	// one reusable key resolver for the whole flush.
@@ -2362,7 +2411,7 @@ func (t *Tailer) flush(ctx context.Context) {
 		}
 		if t.cfg.FileAttributes {
 			lr.Attributes().PutStr("log.file.name", filepath.Base(e.file.path))
-			lr.Attributes().PutInt("log.file.position", e.start)
+			lr.Attributes().PutInt("log.file.position", e.start.off)
 		}
 		logattrs.Put(lr.Attributes(), extracted.Log)
 		if t.cfg.Enrich {
@@ -2392,51 +2441,61 @@ func (t *Tailer) flush(ctx context.Context) {
 				obs.LogRulesDropped.Inc()
 			}
 		}
-		gens[e.file] = e.file.gen
-		// Only entries of the file's current rotation generation advance its
-		// checkpoint; pre-rotation entries carry old-inode offsets recoverable
-		// via file.carried and must not move the new inode's commit point.
-		if e.gen == e.file.gen && e.offset > maxOffsets[e.file] {
-			maxOffsets[e.file] = e.offset
+		c := cands[e.file]
+		if c == nil {
+			c = make(map[int]int64)
+			cands[e.file] = c
+		}
+		// The entry's bytes end at e.end; segments it TRAVERSED on the way
+		// (start.seg up to but excluding end.seg) are fully covered through
+		// their recorded end, so propose their completion too. A dead segment
+		// id (truncated-away incarnation) resolves to nothing at commit.
+		if e.end.off > c[e.end.seg] {
+			c[e.end.seg] = e.end.off
+		}
+		if e.start.seg != e.end.seg {
+			for _, sg := range e.file.segments {
+				if sg.id >= e.start.seg && sg.id < e.end.seg && sg.to > c[sg.id] {
+					c[sg.id] = sg.to
+				}
+			}
 		}
 	}
 
-	// Freeze the commit ceiling at BUILD time. The watermark (lowest offset still
-	// buffered in the pipeline stages) must be sampled now, not when the batch is
-	// later committed: in pipelined mode the commit is applied a flush later, by
-	// which point lines that were buffered when this batch was built may have been
-	// emitted into the NEXT, not-yet-exported batch — so the apply-time watermark
-	// no longer covers them and a live re-read would let committed advance past
-	// unexported lines. carriedDone records, per file, that its carried rotation
-	// prefix was already fully drained into THIS batch, so commitBatch may release
-	// it only when the group genuinely made it into the exported payload.
-	var carriedDone map[*file]struct{}
-	highs := make(map[*file]int64, len(gens))
-	for f := range gens {
-		off := maxOffsets[f]
-		// Re-offer an earlier batch's exported-but-withheld high offset (same
-		// gen): its bytes are already delivered, only the commit was clamped.
-		if f.exportedHighGen == f.gen && f.exportedHigh > off {
-			off = f.exportedHigh
-			maxOffsets[f] = off
+	// Clamp the candidates to the watermark (the lowest position still
+	// buffered in the pipeline stages): a candidate in a segment NEWER than
+	// the watermark's commits nothing yet, one in the SAME segment clamps to
+	// the watermark offset, and OLDER segments are unconstrained — their
+	// bytes precede everything still buffered.
+	highs := make(map[*file]pos, len(cands))
+	for f, c := range cands {
+		// Re-offer an earlier batch's exported-but-withheld high position:
+		// its bytes are already delivered, only the commit was clamped.
+		if hp := f.exportedHigh; hp.off > 0 && hp.off > c[hp.seg] {
+			c[hp.seg] = hp.off
 		}
-		highs[f] = off
-		wm, buffered := f.watermark()
-		if buffered && wm < off {
-			maxOffsets[f] = wm
-		}
-		if f.carried != nil && !buffered {
-			if carriedDone == nil {
-				carriedDone = map[*file]struct{}{}
+		var high pos
+		for seg, off := range c {
+			if p := (pos{seg, off}); high.less(p) {
+				high = p
 			}
-			carriedDone[f] = struct{}{}
+		}
+		highs[f] = high
+		if wm, buffered := f.watermark(); buffered {
+			for seg, off := range c {
+				switch {
+				case wm.seg < seg:
+					delete(c, seg)
+				case wm.seg == seg && wm.off < off:
+					c[seg] = wm.off
+				}
+			}
 		}
 	}
 
 	inf := &batchInfo{
-		kept:    kept,
-		offsets: maxOffsets, highs: highs, gens: gens,
-		carriedDone: carriedDone,
+		kept:  kept,
+		cands: cands, highs: highs,
 	}
 	clear(t.batch) // unpin the exported bodies (a burst otherwise stays reachable)
 	t.batch = t.batch[:0]
@@ -2502,11 +2561,11 @@ func (t *Tailer) rewind(f *file) {
 		return
 	}
 	// The pipeline reset below must happen even with no fd open: reopen leaves
-	// f.f nil and marks the rotated-away prefix carriedFed (its lines are live
-	// in the pipeline). Returning early here would discard those lines with the
-	// batch while leaving carriedFed set, so feedCarriedPrefix would never
+	// f.f nil and marks the segments fed (their lines are live in the
+	// pipeline). Returning early here would discard those lines with the
+	// batch while leaving segmentsFed set, so feedSegments would never
 	// re-read them — the rotated tail would be lost on the first failed export.
-	// ledger.reset (via newPipeline) is what clears carriedFed and re-arms it.
+	// ledger.reset (via newPipeline) is what clears segmentsFed and re-arms it.
 	if f.f != nil {
 		if _, err := f.f.Seek(f.committed, 0); err != nil {
 			_ = f.f.Close()
@@ -2608,12 +2667,14 @@ func (t *Tailer) saveCheckpoints() {
 			Offset: f.committed, Inode: f.inode,
 			FingerprintLen: f.fp.Len, FingerprintHash: f.fp.Hash,
 		}
-		for _, c := range f.carried {
+		for _, c := range f.segments {
+			// From is the segment's commit PROGRESS: a restart re-reads only
+			// the owed [From, To) remainder.
 			cp.Pending = append(cp.Pending, positions.Prefix{
 				Inode:           c.inode,
 				FingerprintLen:  c.fp.Len,
 				FingerprintHash: c.fp.Hash,
-				From:            c.from,
+				From:            c.committed,
 				To:              c.to,
 			})
 		}

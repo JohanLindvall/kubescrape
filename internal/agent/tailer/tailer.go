@@ -106,7 +106,7 @@ type Config struct {
 	// and attributes.
 	Enrich bool
 	// FileAttributes stamps log.file.name (the file's basename) and
-	// log.file.position (the byte offset just past the record) on every emitted
+	// log.file.position (the record's START byte offset) on every emitted
 	// record, for any file source. Opt-in.
 	FileAttributes bool
 	// LogAttrs lifts configured keys out of structured lines onto the record
@@ -312,6 +312,18 @@ type file struct {
 	tokens     float64
 	lastRefill time.Time
 	limited    bool
+	// exportedHigh is the highest exported-entry end offset (at exportedHighGen)
+	// whose COMMIT was withheld by the build-time watermark clamp — another
+	// stream's group was still buffered. The next flush touching the file
+	// re-offers it: the bytes are delivered, only the checkpoint lags, and
+	// without the re-offer `committed` freezes below readPos forever (the
+	// high entry belongs to an earlier batch that no later maxOffsets sees).
+	exportedHigh    int64
+	exportedHighGen int
+	// discarding marks the remainder of an oversized unterminated line: the
+	// accumulated prefix was dropped (see consume), and everything up to the
+	// line's eventual newline is part of the same line, not a record.
+	discarding bool
 
 	// keyStdout/keyStderr are the precomputed pipeline keys
 	// ("<containerID>/<stream>") — feedLine runs per physical line and must
@@ -757,7 +769,7 @@ func (t *Tailer) housekeeping(ctx context.Context) {
 	if len(t.batch) > 0 && time.Since(t.lastFlush) >= t.cfg.FlushInterval {
 		t.flush(ctx)
 	}
-	if (t.cfg.Positions != nil || t.cfg.CheckpointFile != "") && time.Since(t.lastCheckpoint) >= 10*time.Second {
+	if t.checkpointing() && time.Since(t.lastCheckpoint) >= 10*time.Second {
 		t.saveCheckpoints()
 	}
 	if time.Since(t.lastStatus) >= t.statusEvery {
@@ -814,8 +826,14 @@ func (t *Tailer) handleEvent(ev fsnotify.Event) bool {
 	dir := filepath.Dir(ev.Name)
 	if _, isScanDir := t.scanDirs[dir]; isScanDir {
 		// A file (or symlink) appeared/disappeared in a discovery directory:
-		// rediscover immediately.
+		// rediscover immediately. A recreated symlink names an already-tracked
+		// path — mark that file dirty too, or a RETARGETED link (new target
+		// dir, no events from the old one ever again) waits a full poll
+		// interval before the rotation is even noticed.
 		if ev.Op&(fsnotify.Create|fsnotify.Remove|fsnotify.Rename) != 0 {
+			if f, ok := t.files[ev.Name]; ok {
+				f.dirty = true
+			}
 			t.scanDir(nil, false)
 			return true
 		}
@@ -872,20 +890,23 @@ func (t *Tailer) watchTarget(f *file) {
 	set[f] = struct{}{}
 	old := f.targetDir
 	f.targetDir = dir
-	if old != "" {
-		f.targetDir = old
-		t.unwatchTarget(f) // release the previous dir (refcounted)
-		f.targetDir = dir
-	}
+	t.releaseDir(f, old) // release the previous dir (refcounted; "" is a no-op)
 }
 
 // unwatchTarget releases the file's directory watch.
 func (t *Tailer) unwatchTarget(f *file) {
-	if t.watcher == nil || f.targetDir == "" {
+	t.releaseDir(f, f.targetDir)
+	f.targetDir = ""
+}
+
+// releaseDir drops one reference on a watched target directory and removes
+// f from its dirty-marking index.
+func (t *Tailer) releaseDir(f *file, dir string) {
+	if t.watcher == nil || dir == "" {
 		return
 	}
-	if t.watchRefs[f.targetDir]--; t.watchRefs[f.targetDir] <= 0 {
-		delete(t.watchRefs, f.targetDir)
+	if t.watchRefs[dir]--; t.watchRefs[dir] <= 0 {
+		delete(t.watchRefs, dir)
 		// Never remove the watch on a discovery directory: those are watched
 		// unconditionally from Run and both discovery and same-dir tailing
 		// depend on their events. Under a rotation storm every file sharing
@@ -894,17 +915,16 @@ func (t *Tailer) unwatchTarget(f *file) {
 		// events until a poll tick re-adds it — and the resulting event gap
 		// widens the unregistered windows, cascading into whole rotated
 		// segments being lost.
-		if _, isScanDir := t.scanDirs[f.targetDir]; !isScanDir {
-			_ = t.watcher.Remove(f.targetDir)
+		if _, isScanDir := t.scanDirs[dir]; !isScanDir {
+			_ = t.watcher.Remove(dir)
 		}
 	}
-	if set := t.byTargetDir[f.targetDir]; set != nil {
+	if set := t.byTargetDir[dir]; set != nil {
 		delete(set, f)
 		if len(set) == 0 {
-			delete(t.byTargetDir, f.targetDir)
+			delete(t.byTargetDir, dir)
 		}
 	}
-	f.targetDir = ""
 }
 
 // parseFileName extracts the container ID and namespace from a
@@ -949,10 +969,10 @@ func (t *Tailer) scanDir(checkpoints map[string]checkpoint, initial bool) {
 			if _, done := seen[path]; done {
 				continue // an earlier source already claimed this file
 			}
-			if !src.matches(path) {
-				continue // excluded
+			if src.excluded(path) {
+				continue // the include match is implied: path came from src.glob()
 			}
-			if st, err := os.Stat(path); err != nil || st.IsDir() {
+			if st, err := os.Stat(path); err != nil || !st.Mode().IsRegular() {
 				// A transient stat failure on a file we already track must
 				// not mark it gone (drop would delete its checkpoint and a
 				// rediscovery would re-ingest the whole file); only genuine
@@ -962,12 +982,22 @@ func (t *Tailer) scanDir(checkpoints map[string]checkpoint, initial bool) {
 						seen[path] = struct{}{}
 					}
 				}
+				// Non-regular files (FIFOs, sockets, devices) are never
+				// tracked: open(2)/read(2) on a FIFO block indefinitely and
+				// would wedge the single sweep goroutine node-wide.
 				continue
 			}
 			var id string
 			if src.containerd {
 				cid, namespace, ok := parseFileName(filepath.Base(path))
 				if !ok || slices.Contains(t.cfg.ExcludeNamespaces, namespace) {
+					// The file is CLAIMED by this source even though it is
+					// skipped: an excluded namespace (or an unparseable CRI
+					// name) must not fall through to a later catch-all
+					// source — ExcludeNamespaces is global tailer config
+					// (the observability feedback-loop guard), and a later
+					// source exporting the raw CRI lines would defeat it.
+					seen[path] = struct{}{}
 					continue
 				}
 				id = cid
@@ -1002,7 +1032,7 @@ func (t *Tailer) scanDir(checkpoints map[string]checkpoint, initial bool) {
 		}
 	}
 	obs.LogFiles.Set(float64(len(t.files)))
-	if discovered && (t.cfg.Positions != nil || t.cfg.CheckpointFile != "") {
+	if discovered && t.checkpointing() {
 		// Persist immediately: until a file has a checkpoint entry, a crash
 		// makes the restart treat it as pre-existing history and skip to its
 		// end — the 10s periodic save left every new file a window in which
@@ -1364,9 +1394,7 @@ func (t *Tailer) readFile(ctx context.Context, f *file) error {
 	// A group straddled a rename rotation and the pipeline was since discarded
 	// (rewind or restart): re-read the rotated-away prefix before the new inode
 	// so the group reconstructs.
-	if f.carried != nil && !f.carriedFed {
-		t.feedCarriedPrefix(ctx, f)
-	}
+	t.feedCarriedPrefix(ctx, f)
 
 	// Copytruncate whose replacement content is LONGER than our read offset:
 	// the post-read check below cannot see it (bytes come back from the stale
@@ -1376,7 +1404,7 @@ func (t *Tailer) readFile(ctx context.Context, f *file) error {
 	// it here, BEFORE consuming anything, whenever the file changed on disk
 	// since our last read. Costs one stat plus a fingerprint hash per changed
 	// file per sweep.
-	if f.readPos > 0 && !f.compressed {
+	if f.readPos > 0 {
 		if st, err := os.Stat(f.path); err == nil &&
 			inodeOf(st) == f.inode && st.Size() >= f.readPos &&
 			!st.ModTime().Equal(f.lastMod) && !f.fp.matches(f.f) {
@@ -1403,10 +1431,7 @@ func (t *Tailer) readFile(ctx context.Context, f *file) error {
 		if n > 0 {
 			budget -= n
 			read += n
-			obs.LogBytes.Add(float64(n))
-			f.pending = append(f.pending, buf[:n]...)
-			f.readPos += int64(n)
-			t.consume(ctx, f, false)
+			t.ingestChunk(ctx, f, buf[:n], false)
 		}
 		if err != nil {
 			if !errors.Is(err, io.EOF) {
@@ -1416,13 +1441,26 @@ func (t *Tailer) readFile(ctx context.Context, f *file) error {
 		}
 	}
 
+	// A first read on a file opened at size 0 (a fresh container log) leaves
+	// fp.Len == 0, which matches ANYTHING — extend as soon as content exists,
+	// not only on the checkpoint cadence (which never runs without a store).
+	if read > 0 {
+		t.extendFingerprint(f)
+	}
+
 	// Rotation/truncation detection. The rotation machinery must see settled
-	// export state (a failed in-flight export rewinds this file first).
+	// export state (a failed in-flight export rewinds this file first) — but
+	// the DECISION must be made against the pre-settle read position: settle
+	// can rewind readPos back to committed, and re-evaluating the truncation
+	// predicate against the shrunken value misses a truncation the frozen
+	// stat provably saw (st.Size() < the position we had actually read to),
+	// resuming mid-replacement — a torn record and a skipped prefix.
 	st, err := os.Stat(f.path)
 	if err != nil {
 		return err
 	}
-	if inodeOf(st) != f.inode || st.Size() < f.readPos ||
+	preReadPos := f.readPos
+	if inodeOf(st) != f.inode || st.Size() < preReadPos ||
 		(read == 0 && !st.ModTime().Equal(f.lastMod) && !f.fp.matches(f.f)) {
 		t.settle(f)
 	}
@@ -1433,7 +1471,7 @@ func (t *Tailer) readFile(ctx context.Context, f *file) error {
 		// straddling multi-line group across the boundary.
 		t.drainFile(ctx, f)
 		t.reopen(ctx, f, true)
-	case st.Size() < f.readPos:
+	case st.Size() < preReadPos:
 		// In-place truncation: the unread tail is gone; restart at zero.
 		// (Draining would read the replacement content mid-stream.)
 		t.reopen(ctx, f, false)
@@ -1460,19 +1498,22 @@ func (t *Tailer) readArchive(ctx context.Context, f *file) error {
 		// the pipeline and restart the file from zero.
 		obs.LogRotations.Inc()
 		t.settle(f)
+		// As in reopen: pause-retained complete pending lines were read from
+		// the OLD stream and are deliverable; feed them before the pipeline is
+		// discarded (the gen bump below keeps their old-stream offsets from
+		// committing into the replacement's space).
+		if len(f.pending) > 0 {
+			t.consume(ctx, f, true)
+		}
 		t.stopPipeline(ctx, f)
 		t.closeArchive(f)
-		f.committed, f.readPos, f.lineStart = 0, 0, 0
+		f.committed = 0
 		f.inode, f.fp = 0, fingerprint{}
 		f.archiveDone, f.archiveEOF = false, false
-		f.pending = f.pending[:0]
-		// Mirror reopen's reset exactly: the gen bump keeps batched entries
-		// with OLD-stream offsets from committing (or rewinding) into the
-		// replacement's offset space, and a pause-mode rate limit must not
-		// survive the restart — pending is gone and only an allowed line
-		// clears the flag, so a stale `limited` would wedge the file forever.
+		// The gen bump keeps batched entries with OLD-stream offsets from
+		// committing (or rewinding) into the replacement's offset space.
 		f.gen++
-		f.limited = false
+		f.restartAt(0)
 		t.newPipeline(f)
 	}
 	// A paused (rate-limited) file first retries its retained pending bytes —
@@ -1517,10 +1558,7 @@ func (t *Tailer) readArchive(ctx context.Context, f *file) error {
 		n, err := f.gz.Read(buf[:min(len(buf), budget)])
 		if n > 0 {
 			budget -= n
-			obs.LogBytes.Add(float64(n))
-			f.pending = append(f.pending, buf[:n]...)
-			f.readPos += int64(n)
-			t.consume(ctx, f, false)
+			t.ingestChunk(ctx, f, buf[:n], false)
 		}
 		if err != nil {
 			if errors.Is(err, io.EOF) {
@@ -1552,6 +1590,31 @@ func (t *Tailer) readArchive(ctx context.Context, f *file) error {
 	return nil // hit the sweep budget; continue next sweep with f.gz retained
 }
 
+// gzipAt opens a gzip reader over fh positioned past the first `skip`
+// decompressed bytes (gzip is not seekable, so positioning is decode-and-
+// discard). A header error is wrapped with the path; a mid-stream discard
+// error is returned as-is — the two openArchive branches shared this block
+// verbatim.
+func gzipAt(fh *os.File, path string, skip int64) (*gzip.Reader, error) {
+	gz, err := gzip.NewReader(fh)
+	if err != nil {
+		return nil, fmt.Errorf("gzip %s: %w", path, err)
+	}
+	if skip > 0 {
+		if _, err := io.CopyN(io.Discard, gz, skip); err != nil && !errors.Is(err, io.EOF) {
+			_ = gz.Close()
+			return nil, err
+		}
+	}
+	return gz, nil
+}
+
+// isGzipHeaderErr reports whether err is the wrapped not-a-gzip-file open
+// error (vs a mid-stream read failure).
+func isGzipHeaderErr(err error) bool {
+	return errors.Is(err, gzip.ErrHeader)
+}
+
 // openArchive opens the gzip file and positions it at the committed offset by
 // discarding that many decompressed bytes.
 func (t *Tailer) openArchive(f *file) error {
@@ -1563,20 +1626,15 @@ func (t *Tailer) openArchive(f *file) error {
 		if _, err := f.f.Seek(0, 0); err != nil {
 			return err
 		}
-		gz, err := gzip.NewReader(f.f)
+		gz, err := gzipAt(f.f, f.path, f.committed)
 		if err != nil {
-			return fmt.Errorf("gzip %s: %w", f.path, err)
-		}
-		if f.committed > 0 {
-			if _, err := io.CopyN(io.Discard, gz, f.committed); err != nil && !errors.Is(err, io.EOF) {
-				_ = gz.Close()
-				return err
-			}
+			return err
 		}
 		f.gz = gz
-		f.readPos = f.committed
-		f.lineStart = f.committed
-		f.pending = f.pending[:0]
+		// restartAt also clears `limited`: the wiped pending is re-read from
+		// committed and re-metered by allowLine. Leaving the flag set with
+		// pending empty wedges the file forever (nothing else clears it).
+		f.restartAt(f.committed)
 		if st, err := os.Stat(f.path); err == nil {
 			f.archiveSize, f.archiveMod = st.Size(), st.ModTime()
 		}
@@ -1596,17 +1654,20 @@ func (t *Tailer) openArchive(f *file) error {
 	if f.inode != 0 && (f.inode != inode || !f.fp.matches(fh)) {
 		f.committed = 0
 	}
-	gz, err := gzip.NewReader(fh)
+	gz, err := gzipAt(fh, f.path, f.committed)
 	if err != nil {
 		_ = fh.Close()
-		return fmt.Errorf("gzip %s: %w", f.path, err)
-	}
-	if f.committed > 0 {
-		if _, err := io.CopyN(io.Discard, gz, f.committed); err != nil && !errors.Is(err, io.EOF) {
-			_ = gz.Close()
-			_ = fh.Close()
-			return err
+		if isGzipHeaderErr(err) {
+			// Quarantine under the file's current identity: a stray non-gzip
+			// file matched by a compressed source would otherwise be re-opened
+			// and warn-logged EVERY sweep forever. archiveDone's stat
+			// short-circuit skips it until the content changes, which clears
+			// the mark and retries (a rewritten-valid archive recovers on its
+			// own).
+			f.archiveDone = true
+			f.archiveSize, f.archiveMod = st.Size(), st.ModTime()
 		}
+		return err
 	}
 	if fp, err := computeFingerprint(fh, min(int64(t.cfg.FingerprintBytes), st.Size())); err == nil {
 		f.fp = fp
@@ -1614,9 +1675,8 @@ func (t *Tailer) openArchive(f *file) error {
 	f.f = fh
 	f.gz = gz
 	f.inode = inode
-	f.readPos = f.committed
-	f.lineStart = f.committed
-	f.pending = f.pending[:0]
+	f.restartAt(f.committed)
+	f.archiveEOF = false // a retained EOF mark must not outlive a fresh open
 	f.archiveSize, f.archiveMod = st.Size(), st.ModTime()
 	t.watchTarget(f)
 	return nil
@@ -1717,12 +1777,9 @@ func (t *Tailer) drainReader(ctx context.Context, f *file, r io.Reader, what str
 		n, err := r.Read(buf)
 		if n > 0 {
 			drained += int64(n)
-			obs.LogBytes.Add(float64(n))
-			f.pending = append(f.pending, buf[:n]...)
-			f.readPos += int64(n)
 			// Bypass the rate limit: pausing a drain would lose the remainder
 			// when the fd is dropped.
-			t.consume(ctx, f, true)
+			t.ingestChunk(ctx, f, buf[:n], true)
 			t.flushDuringDrain(ctx)
 		}
 		if err != nil {
@@ -1750,6 +1807,15 @@ func (t *Tailer) flushDuringDrain(ctx context.Context) {
 	}
 }
 
+// ingestChunk accounts one read chunk (byte counter, pending buffer, read
+// position) and consumes it — the shared body of every read/drain loop.
+func (t *Tailer) ingestChunk(ctx context.Context, f *file, chunk []byte, unlimited bool) {
+	obs.LogBytes.Add(float64(len(chunk)))
+	f.pending = append(f.pending, chunk...)
+	f.readPos += int64(len(chunk))
+	t.consume(ctx, f, unlimited)
+}
+
 // consume splits pending bytes into physical lines and feeds the pipeline.
 // unlimited bypasses the per-file rate limit (rotation drains, where pausing
 // would lose the remainder of the rotated-away inode).
@@ -1761,6 +1827,12 @@ func (t *Tailer) consume(ctx context.Context, f *file, unlimited bool) {
 			if len(f.pending) > t.cfg.MaxEntryBytes+4096 {
 				f.lineStart += int64(len(f.pending))
 				f.pending = f.pending[:0]
+				// The line's REMAINDER (everything up to its eventual newline)
+				// is part of the same oversized line: without this flag it
+				// would be fed as a "line" of its own — an arbitrary mid-line
+				// suffix, exported as a garbage record.
+				f.discarding = true
+				obs.LogOversizedDropped.Inc()
 			}
 			return
 		}
@@ -1785,6 +1857,12 @@ func (t *Tailer) consume(ctx context.Context, f *file, unlimited bool) {
 		f.pending = f.pending[i+1:]
 		f.lineStart += int64(i + 1)
 
+		if f.discarding {
+			// The tail of an oversized discarded line; its newline ends the
+			// discard window. Offsets advanced above, nothing is fed.
+			f.discarding = false
+			continue
+		}
 		if len(line) == 0 {
 			continue
 		}
@@ -1875,6 +1953,25 @@ func (t *Tailer) ensureOpen(f *file) error {
 // content was replaced.
 func (t *Tailer) reopen(ctx context.Context, f *file, renamed bool) {
 	obs.LogRotations.Inc()
+	// Complete lines sitting in pending (a rate-limit PAUSE leaves them there)
+	// were read from the pre-rotation content and are deliverable regardless of
+	// what happened to the file on disk since. Feed them now, bypassing the
+	// limiter, before the pipeline is carried or discarded — clearing them
+	// below would convert pause mode's "no loss" into loss. Only a trailing
+	// unterminated fragment legitimately dies with the clear (its terminator
+	// no longer exists anywhere).
+	if len(f.pending) > 0 {
+		t.consume(ctx, f, true)
+		if n := len(f.pending); n > 0 && renamed {
+			// A trailing unterminated fragment of a RENAMED-away inode can
+			// never complete (the old file is not followed after the drain);
+			// it dies with the reset below on every path — live, rewind
+			// re-feed, and crash-restart (feedPrefix feeds only terminated
+			// lines) — so at minimum the loss is visible.
+			obs.LogTornFinalLines.Inc()
+			t.log.Warn("unterminated final line lost at rotation", "path", f.path, "bytes", n)
+		}
+	}
 	// The rotated-away inode's fd is handed to the carried prefix that records
 	// it (and closed below if none does): it is the only handle that survives
 	// the runtime deleting the rotated file.
@@ -1900,6 +1997,7 @@ func (t *Tailer) reopen(ctx context.Context, f *file, renamed bool) {
 		p.fd, old = old, nil
 		return p
 	}
+	hopAdded := false
 	if _, buffered := f.watermark(); renamed && buffered {
 		// Append this rotation's tail; a group straddling several rotations
 		// accumulates one entry per hop, all re-readable on crash.
@@ -1907,6 +2005,7 @@ func (t *Tailer) reopen(ctx context.Context, f *file, renamed bool) {
 		f.carriedFed = true // the prefixes are already live in the pipeline
 		f.reanchor()
 		f.gen++
+		hopAdded = true
 	} else {
 		t.stopPipeline(ctx, f)
 		t.newPipeline(f)
@@ -1925,6 +2024,7 @@ func (t *Tailer) reopen(ctx context.Context, f *file, renamed bool) {
 			// successful export the commit clears it.
 			f.carried = append(f.carried, keep(rotatedPrefix{inode: f.inode, fp: f.fp, from: f.committed, to: f.readPos}))
 			f.carriedFed = true
+			hopAdded = true
 		}
 		// The entries stopPipeline just emitted carry old-content offsets; the
 		// new inode starts at 0, so those offsets must not drive its
@@ -1935,15 +2035,20 @@ func (t *Tailer) reopen(ctx context.Context, f *file, renamed bool) {
 	f.inode = 0
 	f.fp = fingerprint{}
 	f.committed = 0
-	f.readPos = 0
-	f.lineStart = 0
-	f.pending = f.pending[:0]
-	f.limited = false // pending is gone; a paused file must resume reading
+	f.restartAt(0)
 	// The next ensureOpen's watchTarget re-derives the symlink target and
 	// switches watches acquire-before-release, so no eager unwatch here — an
 	// unwatched hole between reopen and that sweep would lose a second
 	// rotation happening inside one poll interval.
 	f.dirty = true
+	if hopAdded {
+		// Persist the hop NOW, not on the 10s checkpoint cadence: a crash in
+		// the window would leave the on-disk checkpoint with no Pending entry,
+		// and the restart path has no other route back to the rotated inode —
+		// the tail would be lost outright, not merely re-read. (Discovery
+		// already persists immediately for the same reason.)
+		t.saveCheckpoints()
+	}
 }
 
 // feedCarriedPrefix re-reads the rotated-away files' tails (the unexported
@@ -1955,6 +2060,11 @@ func (t *Tailer) reopen(ctx context.Context, f *file, renamed bool) {
 // (already deleted/compressed by the runtime) is skipped — that segment is
 // genuinely gone from disk.
 func (t *Tailer) feedCarriedPrefix(ctx context.Context, f *file) {
+	if len(f.carried) == 0 || f.carriedFed {
+		// Nothing to feed (or already live in the pipeline): calling through
+		// would spuriously re-anchor and bump the generation.
+		return
+	}
 	f.carriedFed = true
 	defer func() {
 		// Re-anchor + bump so the new inode is consumed at a fresh generation,
@@ -2062,20 +2172,19 @@ func (t *Tailer) findRotated(f *file, p rotatedPrefix) (string, bool) {
 	return "", false
 }
 
-// drop drains a vanished file into the batch and releases it. It is the
-// unconditional form (shutdown); the sweep uses drainGone/release so it can
-// hold the fd until the drained lines are actually exported.
-func (t *Tailer) drop(f *file) {
-	t.drainGone(f)
-	t.release(f)
-}
-
 // drainGone reads whatever the vanished file still holds into the batch. The
 // fd stays OPEN: it is the only handle to the now-unlinked inode, so it must
 // outlive a failed export — release only once the offsets commit.
 func (t *Tailer) drainGone(f *file) {
 	t.settle(f) // a failed in-flight export must rewind before we drain
 	if !f.resolved {
+		// Nothing was ever read (nothing is read before it can be attributed),
+		// and with the file gone nothing can be: the content is lost. Make the
+		// loss visible — a metadata-service outage overlapping pod deletions
+		// silently eating final logs is exactly what an operator must see.
+		obs.LogUnresolvedLost.Inc()
+		t.log.Warn("file deleted before its metadata resolved; content lost",
+			"path", f.path, "containerID", f.containerID)
 		return
 	}
 	// Carried rotated prefixes are OLDER than the current inode's remainder and
@@ -2083,9 +2192,7 @@ func (t *Tailer) drainGone(f *file) {
 	// file is never read again — without this, the prefixes' unexported lines
 	// would be closed forever by release() once everything else settles (a pod
 	// deleted during a collector outage after a rotation).
-	if f.carried != nil && !f.carriedFed {
-		t.feedCarriedPrefix(context.Background(), f)
-	}
+	t.feedCarriedPrefix(context.Background(), f)
 	if f.compressed {
 		// A large archive is read incrementally across sweeps; a deletion
 		// mid-read leaves the rest readable from the open fd.
@@ -2261,7 +2368,6 @@ func (t *Tailer) flush(ctx context.Context) {
 	g := &logGrouper{ld: ld, plain: map[*file]plog.ScopeLogs{}, scopes: map[scopeKey]plog.ScopeLogs{}}
 	maxOffsets := make(map[*file]int64)
 	gens := make(map[*file]int)
-	touched := make(map[*file]struct{})
 	now := pcommon.NewTimestampFromTime(time.Now())
 	// Per-file bound metric state (resource hash computed once per file) and
 	// one reusable key resolver for the whole flush.
@@ -2328,7 +2434,7 @@ func (t *Tailer) flush(ctx context.Context) {
 		}
 		if t.cfg.Rules != nil {
 			resolver.rec, resolver.res = lr.Attributes(), e.file.resource.Attributes()
-			resolver.sev = strings.ToLower(lr.SeverityText())
+			resolver.sev = lowerSeverity(lr.SeverityText())
 			if t.cfg.Rules.Keep(resolver.ruleFn, e.body) {
 				scratch.MoveAndAppendTo(g.scope(e.file, extracted.Resource, extracted.Scope).LogRecords())
 				kept++
@@ -2337,7 +2443,6 @@ func (t *Tailer) flush(ctx context.Context) {
 				obs.LogRulesDropped.Inc()
 			}
 		}
-		touched[e.file] = struct{}{}
 		gens[e.file] = e.file.gen
 		// Only entries of the file's current rotation generation advance its
 		// checkpoint; pre-rotation entries carry old-inode offsets recoverable
@@ -2357,9 +2462,18 @@ func (t *Tailer) flush(ctx context.Context) {
 	// prefix was already fully drained into THIS batch, so commitBatch may release
 	// it only when the group genuinely made it into the exported payload.
 	var carriedDone map[*file]struct{}
-	for f := range touched {
+	highs := make(map[*file]int64, len(gens))
+	for f := range gens {
+		off := maxOffsets[f]
+		// Re-offer an earlier batch's exported-but-withheld high offset (same
+		// gen): its bytes are already delivered, only the commit was clamped.
+		if f.exportedHighGen == f.gen && f.exportedHigh > off {
+			off = f.exportedHigh
+			maxOffsets[f] = off
+		}
+		highs[f] = off
 		wm, buffered := f.watermark()
-		if off, ok := maxOffsets[f]; ok && buffered && wm < off {
+		if buffered && wm < off {
 			maxOffsets[f] = wm
 		}
 		if f.carried != nil && !buffered {
@@ -2372,7 +2486,7 @@ func (t *Tailer) flush(ctx context.Context) {
 
 	inf := &inflight{
 		ctx: ctx, ld: ld, kept: kept,
-		offsets: maxOffsets, gens: gens, touched: touched,
+		offsets: maxOffsets, highs: highs, gens: gens,
 		carriedDone: carriedDone,
 		done:        make(chan struct{}),
 	}
@@ -2414,6 +2528,20 @@ func (t *Tailer) exportWithRetry(ctx context.Context, ld plog.Logs) error {
 	return err
 }
 
+// restartAt resets the byte-consumption state to off: read/line positions,
+// the pending buffer, and the flags whose lifetime is bound to pending (a
+// rate-limit pause and an oversized-line discard window both die with it —
+// the bytes are re-read and re-evaluated from off). Every restart/rewind
+// path shares this ONE helper deliberately: the archiveReplaced restart once
+// drifted from reopen by omitting two of these resets, each a real bug.
+func (f *file) restartAt(off int64) {
+	f.readPos = off
+	f.lineStart = off
+	f.pending = f.pending[:0]
+	f.limited = false
+	f.discarding = false
+}
+
 // rewind seeks a file back to its committed offset so unexported data is
 // read again. Pipeline state is discarded without emitting: the buffered
 // lines sit after the committed offset and will be re-read and re-fed.
@@ -2427,10 +2555,7 @@ func (t *Tailer) rewind(f *file) {
 		t.closeArchiveReader(f)
 		f.archiveDone = false
 		f.archiveEOF = false // the tail is owed again; see the release gate
-		f.readPos = f.committed
-		f.lineStart = f.committed
-		f.pending = f.pending[:0]
-		f.limited = false // pending is gone; a paused file must resume reading
+		f.restartAt(f.committed)
 		t.newPipeline(f)
 		return
 	}
@@ -2446,10 +2571,7 @@ func (t *Tailer) rewind(f *file) {
 			f.f = nil // the next ensureOpen reopens and re-verifies identity
 		}
 	}
-	f.readPos = f.committed
-	f.lineStart = f.committed
-	f.pending = f.pending[:0]
-	f.limited = false // pending is gone; a paused file must resume reading
+	f.restartAt(f.committed)
 	t.newPipeline(f)
 }
 
@@ -2478,27 +2600,68 @@ func (t *Tailer) loadCheckpoints() map[string]checkpoint {
 	return cps
 }
 
+// extendFingerprint grows a short fingerprint once the file has grown past
+// the initial hash length, up to the configured size — but ONLY while the
+// head we already hashed is still there. Re-hashing unconditionally adopts
+// whatever the head happens to be now, so a copytruncate landing between a
+// read and this call would rewrite fp to the REPLACEMENT's head and blind
+// the rotation guards (which compare against fp) — silently, and for every
+// file below FingerprintBytes, i.e. every quiet container.
+//
+// Called from saveCheckpoints AND from readFile after a successful read:
+// without the read-path call, a deployment with no checkpoint store never
+// extends at all, so a file first opened at size 0 keeps the
+// matches-anything empty fingerprint forever and every fp-based rotation
+// guard is permanently blind for it.
+func (t *Tailer) extendFingerprint(f *file) {
+	if f.f == nil || t.cfg.FingerprintBytes <= 0 || f.fp.Len >= int64(t.cfg.FingerprintBytes) || !f.fp.matches(f.f) {
+		return
+	}
+	if st, err := f.f.Stat(); err == nil && st.Size() > f.fp.Len {
+		if fp, err := computeFingerprint(f.f, min(int64(t.cfg.FingerprintBytes), st.Size())); err == nil {
+			f.fp = fp
+		}
+	}
+}
+
+// lowerSeverity lowercases a severity string without allocating for the
+// values enrichment actually produces (ToLower allocates whenever any byte
+// is uppercase — i.e. for nearly every record on the rules path).
+func lowerSeverity(s string) string {
+	switch s {
+	case "":
+		return ""
+	case "TRACE", "trace":
+		return "trace"
+	case "DEBUG", "debug":
+		return "debug"
+	case "INFO", "info":
+		return "info"
+	case "WARN", "warn":
+		return "warn"
+	case "WARNING", "warning":
+		return "warning"
+	case "ERROR", "error":
+		return "error"
+	case "FATAL", "fatal":
+		return "fatal"
+	}
+	return strings.ToLower(s)
+}
+
+// checkpointing reports whether any checkpoint store is configured.
+func (t *Tailer) checkpointing() bool {
+	return t.cfg.Positions != nil || t.cfg.CheckpointFile != ""
+}
+
 func (t *Tailer) saveCheckpoints() {
 	t.lastCheckpoint = time.Now()
-	if t.cfg.Positions == nil && t.cfg.CheckpointFile == "" {
+	if !t.checkpointing() {
 		return
 	}
 	cps := make(map[string]checkpoint, len(t.files))
 	for path, f := range t.files {
-		// Extend the fingerprint once the file has grown past the initial hash
-		// length, up to the configured size — but ONLY while the head we already
-		// hashed is still there. Re-hashing unconditionally adopts whatever the
-		// head happens to be now, so a copytruncate landing between a read and
-		// this checkpoint would rewrite fp to the REPLACEMENT's head and blind
-		// the rotation guards (which compare against fp) — silently, and for
-		// every file below FingerprintBytes, i.e. every quiet container.
-		if f.f != nil && f.fp.Len < int64(t.cfg.FingerprintBytes) && f.fp.matches(f.f) {
-			if st, err := f.f.Stat(); err == nil && st.Size() > f.fp.Len {
-				if fp, err := computeFingerprint(f.f, min(int64(t.cfg.FingerprintBytes), st.Size())); err == nil {
-					f.fp = fp
-				}
-			}
-		}
+		t.extendFingerprint(f)
 		cp := checkpoint{
 			Offset: f.committed, Inode: f.inode,
 			FingerprintLen: f.fp.Len, FingerprintHash: f.fp.Hash,

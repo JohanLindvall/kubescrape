@@ -27,8 +27,15 @@ type inflight struct {
 	ld      plog.Logs
 	kept    int
 	offsets map[*file]int64
-	gens    map[*file]int
-	touched map[*file]struct{}
+	// highs is the per-file UNCLAMPED batch max offset (current-gen entries
+	// plus any re-offered exportedHigh): what committed could reach once
+	// nothing is buffered. Recorded as file.exportedHigh on successful commit
+	// where the watermark clamp withheld it.
+	highs map[*file]int64
+	// gens (keyed by every file the batch touches) records each file's
+	// rotation generation at BUILD time; commit/fail apply only where the gen
+	// is unchanged.
+	gens map[*file]int
 	// carriedDone holds the touched files whose carried rotation prefix was
 	// already fully drained into this batch at BUILD time; only those may have
 	// their carried fds released once the batch exports (see flush).
@@ -83,7 +90,7 @@ func (t *Tailer) settle(f *file) {
 	if t.inflight == nil {
 		return
 	}
-	if _, ok := t.inflight.touched[f]; ok {
+	if _, ok := t.inflight.gens[f]; ok {
 		t.settleInflight()
 	}
 }
@@ -93,8 +100,8 @@ func (t *Tailer) settle(f *file) {
 // file's rotation generation is unchanged since the batch was built.
 func (t *Tailer) commitBatch(inf *inflight) {
 	obs.LogEntries.Add(float64(inf.kept))
-	for f := range inf.touched {
-		if inf.gens[f] != f.gen {
+	for f, gen := range inf.gens {
+		if gen != f.gen {
 			continue // rotated since build; offsets are stale
 		}
 		// offsets was already clamped to the BUILD-time watermark in flush, so it
@@ -104,6 +111,12 @@ func (t *Tailer) commitBatch(inf *inflight) {
 		// batch and the live watermark no longer holds committed back for them.
 		if off, ok := inf.offsets[f]; ok && off > f.committed {
 			f.committed = off
+		}
+		// Entries past the committed offset were DELIVERED but their commit
+		// was withheld by the build-time watermark clamp; remember the high
+		// so a later flush can re-offer it once nothing is buffered.
+		if hi := inf.highs[f]; hi > f.committed {
+			f.exportedHigh, f.exportedHighGen = hi, f.gen
 		}
 		// Release the carried rotation prefix only if its group was fully drained
 		// into THIS batch at build time — i.e. it really made it into the exported
@@ -124,9 +137,9 @@ func (t *Tailer) commitBatch(inf *inflight) {
 func (t *Tailer) failBatch(inf *inflight) {
 	t.log.Error("exporting logs failed, rewinding", "records", inf.kept, "error", inf.err)
 	obs.LogExportFailures.Inc()
-	rewound := make(map[*file]bool, len(inf.touched))
-	for f := range inf.touched {
-		if inf.gens[f] != f.gen {
+	rewound := make(map[*file]bool, len(inf.gens))
+	for f, gen := range inf.gens {
+		if gen != f.gen {
 			continue
 		}
 		t.rewind(f)

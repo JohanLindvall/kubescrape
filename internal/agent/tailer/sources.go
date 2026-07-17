@@ -130,15 +130,20 @@ func (s *compiledSource) matches(path string) bool {
 			break
 		}
 	}
-	if !included {
-		return false
-	}
+	return included && !s.excluded(path)
+}
+
+// excluded reports whether path hits one of the source's exclude globs. The
+// scan loop uses it directly: glob() output satisfies the includes by
+// construction, and PathMatch re-parses its pattern per call — re-proving
+// inclusion for every listed file every 2s scan was pure waste.
+func (s *compiledSource) excluded(path string) bool {
 	for _, g := range s.exclude {
 		if ok, _ := doublestar.PathMatch(g, path); ok {
-			return false
+			return true
 		}
 	}
-	return true
+	return false
 }
 
 // glob returns the paths currently matching this source's include patterns

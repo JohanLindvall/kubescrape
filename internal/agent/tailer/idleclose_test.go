@@ -8,6 +8,14 @@ import (
 	"go.opentelemetry.io/collector/pdata/pcommon"
 )
 
+// drop drains a vanished file into the batch and releases it unconditionally
+// (test helper; production uses drainGone/release so the fd outlives a failed
+// export).
+func (t *Tailer) drop(f *file) {
+	t.drainGone(f)
+	t.release(f)
+}
+
 // idleFile builds a tracked, resolved file with `content` already on disk and
 // the tailer caught up to `committed`.
 func idleFile(t *testing.T, tl *Tailer, dir, content string, committed int64) *file {

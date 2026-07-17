@@ -47,6 +47,13 @@ var (
 		"Disk-buffer read failures while draining (the head frame could not be read; lost=true means the segment was gone and its frames were skipped).", "signal", "lost")
 	LogFifoDropped = Registry.Counter("kubescrape_log_fifo_orphans_total",
 		"Stale per-line offset entries discarded because the multiline stage dropped over-limit lines it never emitted.")
+	LogUnresolvedLost = Registry.Counter("kubescrape_log_unresolved_lost_total",
+		"Log files deleted before their metadata ever resolved (the metadata service was unreachable "+
+			"or the container unknown for the file's whole life). Their content was never read and is lost.")
+	LogOversizedDropped = Registry.Counter("kubescrape_log_oversized_dropped_total",
+		"Unterminated lines discarded for exceeding the per-entry size bound (no newline within MaxEntryBytes+4096).")
+	LogTornFinalLines = Registry.Counter("kubescrape_log_torn_final_lines_total",
+		"Unterminated final lines of rotated-away files (the fragment can never complete and is dropped).")
 )
 
 // Scrape pipeline (agent).

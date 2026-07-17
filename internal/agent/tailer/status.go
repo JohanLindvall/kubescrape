@@ -59,7 +59,15 @@ func (t *Tailer) publishStatus() {
 		} else {
 			fs.Size = f.readPos // gone/rotating; best effort
 		}
-		if lag := fs.Size - fs.Committed; lag > 0 {
+		lag := fs.Size - fs.Committed
+		if f.compressed {
+			// Size is compressed on-disk bytes but the offsets live in
+			// DECOMPRESSED space — their difference is meaningless. Report
+			// the read-but-uncommitted backlog instead (the unread remainder
+			// is unknowable without decompressing).
+			lag = fs.ReadPos - fs.Committed
+		}
+		if lag > 0 {
 			fs.Lag = lag
 			totalLag += lag
 			if lag > maxLag {

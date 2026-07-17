@@ -160,9 +160,10 @@ func TestOversizedUnterminatedLineKeepsOffsetsExact(t *testing.T) {
 	}
 }
 
-// The pipelined apply-time gen check is the backstop the settle-before-rotation
-// design falls back on: a stale-gen result must neither commit nor rewind.
-func TestPipelinedStaleGenResultIsIgnored(t *testing.T) {
+// The apply-time gen check is a backstop: a stale-gen batch result must
+// neither commit nor rewind (build-time per-entry filtering is the primary
+// guard; this pins the belt-and-braces).
+func TestStaleGenResultIsIgnored(t *testing.T) {
 	dir := t.TempDir()
 	exp := &fakeExporter{}
 	tl := driveTailer(dir, exp)
@@ -175,7 +176,7 @@ func TestPipelinedStaleGenResultIsIgnored(t *testing.T) {
 	tl.newPipeline(f)
 	criStage := f.criStage
 
-	inf := &inflight{
+	inf := &batchInfo{
 		gens:        map[*file]int{f: 0}, // stale: file is at gen 1
 		offsets:     map[*file]int64{f: 100},
 		carriedDone: map[*file]struct{}{f: {}},
@@ -187,8 +188,7 @@ func TestPipelinedStaleGenResultIsIgnored(t *testing.T) {
 	if f.carried == nil {
 		t.Fatal("stale-gen commit cleared carried prefixes")
 	}
-	inf.err = errors.New("boom")
-	tl.failBatch(inf)
+	tl.failBatch(inf, errors.New("boom"))
 	if f.readPos != 42 || f.criStage != criStage {
 		t.Fatalf("stale-gen failure rewound the file: readPos=%d pipelineChanged=%v", f.readPos, f.criStage != criStage)
 	}

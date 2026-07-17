@@ -157,7 +157,6 @@ agent:
   logsIdleClose: 0
   # Overlap reading with export delivery (one export in flight; at-least-once
   # semantics unchanged).
-  logsPipelinedExport: false
   # Stamp log.file.name and log.file.position (byte offset) on every record,
   # for each file source.
   logsFileAttributes: false

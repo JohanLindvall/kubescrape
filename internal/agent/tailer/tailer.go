@@ -160,11 +160,6 @@ type Config struct {
 	// synthetic __severity__ key — and after LogMetrics, so metrics still see
 	// every line. Dropped records advance offsets like exported ones.
 	Rules *metrics.LineFilter
-	// PipelinedExport overlaps reading with export delivery: one export may
-	// be in flight while the sweep keeps reading; its result (commit or
-	// rewind) is applied before the next flush. At-least-once semantics are
-	// unchanged. Off by default (exports happen inline in the sweep).
-	PipelinedExport bool
 	// Attrs builds the exported resource attributes (nil = defaults).
 	Attrs *attrs.Builder
 	// NodeInfo supplies the agent node's metadata for attribute templates
@@ -197,12 +192,6 @@ type Tailer struct {
 	status      atomic.Pointer[[]FileStatus]
 	lastStatus  time.Time
 	statusEvery time.Duration // snapshot cadence (10s; tests shorten it)
-
-	// Pipelined export (Config.PipelinedExport): the worker channel and the
-	// single outstanding export, owned by the sweep goroutine (see
-	// pipelined.go). exportCh == nil means inline (synchronous) export.
-	exportCh chan *inflight
-	inflight *inflight
 
 	// Event-driven mode (nil watcher = pure polling).
 	watcher   *fsnotify.Watcher
@@ -698,11 +687,6 @@ func (t *Tailer) Run(ctx context.Context) {
 		watchErrs = t.watcher.Errors
 	}
 
-	if t.cfg.PipelinedExport {
-		t.exportCh = make(chan *inflight)
-		go t.exportWorker()
-	}
-
 	t.scanDir(t.loadCheckpoints(), true)
 	t.lastFlush = time.Now()
 
@@ -727,13 +711,6 @@ func (t *Tailer) Run(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
-			// Settle any in-flight export and go synchronous for the final
-			// drain, so the last flush commits before checkpointing.
-			t.settleInflight()
-			if t.exportCh != nil {
-				close(t.exportCh)
-				t.exportCh = nil
-			}
 			t.sweep(context.Background(), true)
 			// Drain the pipelines; the emitted entries' offsets commit with
 			// the final flush, so nothing is re-read after a restart.
@@ -765,7 +742,6 @@ func (t *Tailer) Run(ctx context.Context) {
 
 // housekeeping flushes, checkpoints and publishes status on their intervals.
 func (t *Tailer) housekeeping(ctx context.Context) {
-	t.pollInflight()
 	if len(t.batch) > 0 && time.Since(t.lastFlush) >= t.cfg.FlushInterval {
 		t.flush(ctx)
 	}
@@ -1294,7 +1270,6 @@ func (t *Tailer) sweep(ctx context.Context, all bool) {
 				// during a collector outage would lose its final lines.
 				t.drainGone(f)
 				t.flush(ctx)
-				t.settle(f) // apply a pipelined result before deciding
 				if t.settledGone(f) {
 					t.release(f)
 					delete(t.files, path)
@@ -1408,7 +1383,6 @@ func (t *Tailer) readFile(ctx context.Context, f *file) error {
 		if st, err := os.Stat(f.path); err == nil &&
 			inodeOf(st) == f.inode && st.Size() >= f.readPos &&
 			!st.ModTime().Equal(f.lastMod) && !f.fp.matches(f.f) {
-			t.settle(f)
 			t.reopen(ctx, f, false)
 			f.lastMod = st.ModTime()
 			if err := t.ensureOpen(f); err != nil {
@@ -1448,21 +1422,10 @@ func (t *Tailer) readFile(ctx context.Context, f *file) error {
 		t.extendFingerprint(f)
 	}
 
-	// Rotation/truncation detection. The rotation machinery must see settled
-	// export state (a failed in-flight export rewinds this file first) — but
-	// the DECISION must be made against the pre-settle read position: settle
-	// can rewind readPos back to committed, and re-evaluating the truncation
-	// predicate against the shrunken value misses a truncation the frozen
-	// stat provably saw (st.Size() < the position we had actually read to),
-	// resuming mid-replacement — a torn record and a skipped prefix.
+	// Rotation/truncation detection.
 	st, err := os.Stat(f.path)
 	if err != nil {
 		return err
-	}
-	preReadPos := f.readPos
-	if inodeOf(st) != f.inode || st.Size() < preReadPos ||
-		(read == 0 && !st.ModTime().Equal(f.lastMod) && !f.fp.matches(f.f)) {
-		t.settle(f)
 	}
 	switch {
 	case inodeOf(st) != f.inode:
@@ -1471,7 +1434,7 @@ func (t *Tailer) readFile(ctx context.Context, f *file) error {
 		// straddling multi-line group across the boundary.
 		t.drainFile(ctx, f)
 		t.reopen(ctx, f, true)
-	case st.Size() < preReadPos:
+	case st.Size() < f.readPos:
 		// In-place truncation: the unread tail is gone; restart at zero.
 		// (Draining would read the replacement content mid-stream.)
 		t.reopen(ctx, f, false)
@@ -1497,7 +1460,6 @@ func (t *Tailer) readArchive(ctx context.Context, f *file) error {
 		// recoverable and joining across the boundary is meaningless. Discard
 		// the pipeline and restart the file from zero.
 		obs.LogRotations.Inc()
-		t.settle(f)
 		// As in reopen: pause-retained complete pending lines were read from
 		// the OLD stream and are deliverable; feed them before the pipeline is
 		// discarded (the gen bump below keeps their old-stream offsets from
@@ -1794,16 +1756,7 @@ func (t *Tailer) drainReader(ctx context.Context, f *file, r io.Reader, what str
 // from starving the sweep for the drain's whole duration.
 func (t *Tailer) flushDuringDrain(ctx context.Context) {
 	if len(t.batch) >= t.cfg.BatchSize {
-		// SYNCHRONOUS even in pipelined mode: drains run inside rotation/gone
-		// handling, and a handed-off export would still be in flight when reopen
-		// bumps f.gen (or release closes fds) — its later failure would then
-		// skip this file's rewind (gen mismatch) and lose the drained backlog.
-		// A sync failure instead rewinds immediately and the drain re-reads
-		// from the seeked-back fd, exactly like non-pipelined mode.
-		prev := t.exportCh
-		t.exportCh = nil
 		t.flush(ctx)
-		t.exportCh = prev
 	}
 }
 
@@ -2176,7 +2129,6 @@ func (t *Tailer) findRotated(f *file, p rotatedPrefix) (string, bool) {
 // fd stays OPEN: it is the only handle to the now-unlinked inode, so it must
 // outlive a failed export — release only once the offsets commit.
 func (t *Tailer) drainGone(f *file) {
-	t.settle(f) // a failed in-flight export must rewind before we drain
 	if !f.resolved {
 		// Nothing was ever read (nothing is read before it can be attributed),
 		// and with the file gone nothing can be: the content is lost. Make the
@@ -2357,9 +2309,6 @@ func (r *metricResolver) value(k string) (float64, bool) {
 // flush exports the batch. On success offsets are committed; on failure the
 // files are rewound to the committed offsets so the data is re-read.
 func (t *Tailer) flush(ctx context.Context) {
-	// Apply the previous pipelined export's result first: a failure rewinds
-	// its files and purges their read-ahead entries from this batch.
-	t.settleInflight()
 	if len(t.batch) == 0 {
 		t.lastFlush = time.Now()
 		return
@@ -2484,28 +2433,21 @@ func (t *Tailer) flush(ctx context.Context) {
 		}
 	}
 
-	inf := &inflight{
-		ctx: ctx, ld: ld, kept: kept,
+	inf := &batchInfo{
+		kept:    kept,
 		offsets: maxOffsets, highs: highs, gens: gens,
 		carriedDone: carriedDone,
-		done:        make(chan struct{}),
 	}
 	clear(t.batch) // unpin the exported bodies (a burst otherwise stays reachable)
 	t.batch = t.batch[:0]
 	t.lastFlush = time.Now()
 	// An all-dropped batch has nothing to send but its offsets still commit.
-	if kept > 0 && t.exportCh != nil {
-		// Pipelined: hand off and keep reading; the result is applied at the
-		// next flush (or when a rotation/drop settles it earlier).
-		t.inflight = inf
-		t.exportCh <- inf
-		return
-	}
+	var err error
 	if kept > 0 {
-		inf.err = t.exportWithRetry(ctx, ld)
+		err = t.exportWithRetry(ctx, ld)
 	}
-	if inf.err != nil {
-		t.failBatch(inf)
+	if err != nil {
+		t.failBatch(inf, err)
 	} else {
 		t.commitBatch(inf)
 	}

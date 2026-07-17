@@ -21,6 +21,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -72,7 +73,12 @@ func (c *Client) observe(outcome string) {
 }
 
 type cacheEntry struct {
-	body    []byte
+	body []byte
+	// decoded is the body unmarshaled once into the caller's result type
+	// (a pointer), stored so cache hits and 304s skip the JSON decode. It is
+	// never mutated after storing; hits receive a SHALLOW copy — maps/slices
+	// are shared under the same treat-as-immutable contract the store uses.
+	decoded any
 	etag    string
 	expires time.Time
 }
@@ -173,13 +179,17 @@ func (c *Client) NodeTargets(ctx context.Context, node string) ([]kubemeta.Scrap
 func (c *Client) getJSON(ctx context.Context, u string, v any) error {
 	key := cacheKey(u)
 
-	// Fresh cache entry: serve without a request.
+	// Fresh cache entry: serve without a request (and without re-decoding —
+	// the decoded value is stored once and shallow-copied out).
 	c.mu.Lock()
 	entry, cached := c.cache[key]
 	if cached && c.now().Before(entry.expires) {
-		body := entry.body
+		decoded, body := entry.decoded, entry.body
 		c.mu.Unlock()
 		c.observe(OutcomeCached)
+		if shallowCopy(v, decoded) {
+			return nil
+		}
 		return json.Unmarshal(body, v)
 	}
 	c.mu.Unlock()
@@ -217,6 +227,9 @@ func (c *Client) getJSON(ctx context.Context, u string, v any) error {
 		}
 		c.mu.Unlock()
 		c.observe(OutcomeNotModified)
+		if shallowCopy(v, entry.decoded) {
+			return nil
+		}
 		return json.Unmarshal(entry.body, v)
 	case resp.StatusCode == http.StatusOK:
 		body, err := io.ReadAll(resp.Body)
@@ -225,10 +238,21 @@ func (c *Client) getJSON(ctx context.Context, u string, v any) error {
 			return err
 		}
 		if ttl := maxAge(resp); ttl > 0 {
+			// Decode into a value the CACHE owns, not into v: the caller may
+			// overwrite its struct after the call, which must not reach the
+			// cached copy. v gets a shallow copy of the owned value.
+			dec := reflect.New(reflect.TypeOf(v).Elem())
+			if err := json.Unmarshal(body, dec.Interface()); err != nil {
+				c.observe(OutcomeError)
+				return err
+			}
 			c.mu.Lock()
-			c.cache[key] = cacheEntry{body: body, etag: resp.Header.Get("ETag"), expires: c.now().Add(ttl)}
+			c.cache[key] = cacheEntry{body: body, decoded: dec.Interface(), etag: resp.Header.Get("ETag"), expires: c.now().Add(ttl)}
 			c.evictLocked()
 			c.mu.Unlock()
+			c.observe(OutcomeOK)
+			reflect.ValueOf(v).Elem().Set(dec.Elem())
+			return nil
 		}
 		c.observe(OutcomeOK)
 		return json.Unmarshal(body, v)
@@ -276,9 +300,29 @@ func (c *Client) evictLocked() {
 	}
 }
 
+// shallowCopy sets *dst = *src when both are pointers to the same type,
+// reporting success. The copy is shallow: maps and slices stay shared with the
+// cached value, which is never mutated (the store's shallow-copy contract).
+func shallowCopy(dst, src any) bool {
+	if src == nil {
+		return false
+	}
+	dv, sv := reflect.ValueOf(dst), reflect.ValueOf(src)
+	if dv.Kind() != reflect.Pointer || dv.Type() != sv.Type() {
+		return false
+	}
+	dv.Elem().Set(sv.Elem())
+	return true
+}
+
 // cacheKey identifies the resource independent of transient request params
 // (the container endpoint's ?wait= must not fragment the cache).
 func cacheKey(u string) string {
+	// Only the container endpoint ever carries a query (?wait=); everything
+	// else skips the parse/re-encode round trip.
+	if !strings.Contains(u, "?") {
+		return u
+	}
 	parsed, err := url.Parse(u)
 	if err != nil {
 		return u

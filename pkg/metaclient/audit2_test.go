@@ -332,7 +332,7 @@ func TestAudit_ObserveOutcomes(t *testing.T) {
 
 // TestAudit_MalformedJSONObservedOK pins that a 200 whose body will not decode
 // is still reported as OutcomeOK (and cached).
-func TestAudit_MalformedJSONObservedOK(t *testing.T) {
+func TestAudit_MalformedJSONObservedNotCached(t *testing.T) {
 	s := newSrv(t)
 	s.maxAge = "10"
 	s.body = `{"name": ` // truncated JSON
@@ -342,18 +342,19 @@ func TestAudit_MalformedJSONObservedOK(t *testing.T) {
 	if _, err := c.PodByName(context.Background(), "ns", "p"); err == nil {
 		t.Fatal("truncated JSON decoded without error")
 	}
-	if len(got) != 1 || got[0] != OutcomeOK {
-		t.Fatalf("outcome = %v; a body that fails to decode is reported %q and CACHED for max-age, "+
-			"so every retry within the TTL re-fails from the cache", got, OutcomeOK)
+	if len(got) != 1 || got[0] != OutcomeError {
+		t.Fatalf("outcome = %v, want [%s]: a body that fails to decode must not be reported ok", got, OutcomeError)
 	}
-	// Second call: served from the poisoned cache without touching the server.
+	// The malformed body must NOT be cached (decode-before-store): the second
+	// call reaches the server again instead of re-failing from a poisoned
+	// entry for the whole TTL — the same stance as 404s, which are never
+	// cached either.
 	if _, err := c.PodByName(context.Background(), "ns", "p"); err == nil {
 		t.Fatal("second call decoded without error")
 	}
-	if s.hits.Load() != 1 {
-		t.Fatalf("hits = %d", s.hits.Load())
+	if s.hits.Load() != 2 {
+		t.Fatalf("hits = %d, want 2 (malformed 200 must not be cached)", s.hits.Load())
 	}
-	t.Logf("CONTRACT: an undecodable 200 is observed as %q and cached; retries within max-age never reach the service", OutcomeOK)
 }
 
 // TestAudit_ContainerNormalizesID: the runtime prefix must be stripped before

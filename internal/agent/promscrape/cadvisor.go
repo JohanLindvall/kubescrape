@@ -245,12 +245,16 @@ type cadvisorBatcher struct {
 	// the key-building allocations and map probes.
 	lastIdent    cadvisorIdentity
 	lastScope    pmetric.ScopeMetrics
-	lastScopeKey string
 	lastScopeOK  bool
-	lastResKey   string
+	lastMetIdent cadvisorIdentity
 	lastName     string
 	lastMetric   pmetric.Metric
+	lastPodScope bool
 	lastOK       bool
+	// keyBuf is the scratch buffer for identity/metric keys: probes use
+	// map[string(keyBuf)] (no allocation); the string materializes only when a
+	// new resource or metric is inserted.
+	keyBuf []byte
 
 	// cgroupMemo caches cgroupIdentity per raw "id" value: each container's
 	// cgroup path recurs in every family of the scrape (~60×), and the parse
@@ -356,27 +360,42 @@ func (id cadvisorIdentity) rollup() bool {
 	return id.hasCgroup && id.pod == "" && id.podUID == "" && id.containerID == ""
 }
 
-// key identifies the resource. The cgroup-derived identity is preferred: the
-// pod UID disambiguates same-name pod recreations and the container ID
-// distinguishes restarted container incarnations.
-func (id cadvisorIdentity) key() string {
+// appendKey appends the resource identity key to b. The cgroup-derived
+// identity is preferred: the pod UID disambiguates same-name pod recreations
+// and the container ID distinguishes restarted container incarnations. It
+// appends into a caller-owned scratch buffer so the per-sample map probes can
+// use map[string(buf)] lookups without materializing a string (the parser's
+// keyBuf discipline).
+func (id cadvisorIdentity) appendKey(b []byte) []byte {
 	// The cgroup-derived parts (uid, container id) are validated hex/UUID and
 	// cannot contain the separator; namespace/pod/container come from exporter
 	// LABELS, so they are length-prefixed to keep hostile values from aliasing
 	// another identity.
 	if id.podUID != "" {
-		return "u\x00" + id.podUID + "\x00" + id.containerID + "\x00" + lp(id.container)
+		b = append(b, 'u', 0)
+		b = append(b, id.podUID...)
+		b = append(b, 0)
+		b = append(b, id.containerID...)
+		b = append(b, 0)
+		return appendLP(b, id.container)
 	}
 	// containerID must participate: a non-pod cgroup with a parseable container
 	// ID (a standalone, non-k8s container) has no namespace/pod/container labels,
 	// and omitting the ID would merge every such container into one anonymous
 	// resource with indistinguishable, conflicting series.
-	return "n\x00" + lp(id.namespace) + lp(id.pod) + lp(id.container) + id.containerID
+	b = append(b, 'n', 0)
+	b = appendLP(b, id.namespace)
+	b = appendLP(b, id.pod)
+	b = appendLP(b, id.container)
+	return append(b, id.containerID...)
 }
 
-// lp length-prefixes one label-derived key part (collision-proof join).
-func lp(v string) string {
-	return strconv.Itoa(len(v)) + ":" + v
+// appendLP appends one length-prefixed label-derived key part (collision-proof
+// join).
+func appendLP(b []byte, v string) []byte {
+	b = strconv.AppendInt(b, int64(len(v)), 10)
+	b = append(b, ':')
+	return append(b, v...)
 }
 
 // isIdentityLabel reports whether a label moved into the resource.
@@ -404,14 +423,15 @@ func (id cadvisorIdentity) podScoped() bool {
 // scope returns the ScopeMetrics for the resource identified by ident,
 // creating it (with metadata-service enrichment) on first use per batch. The
 // previous sample's identity is memoized: a repeat costs a struct compare
-// instead of building the key string.
-func (cb *cadvisorBatcher) scope(ident cadvisorIdentity) (pmetric.ScopeMetrics, string) {
+// instead of building the key.
+func (cb *cadvisorBatcher) scope(ident cadvisorIdentity) pmetric.ScopeMetrics {
 	if cb.lastScopeOK && ident == cb.lastIdent {
-		return cb.lastScope, cb.lastScopeKey
+		return cb.lastScope
 	}
-	key := ident.key()
-	sm, ok := cb.scopes[key]
+	cb.keyBuf = ident.appendKey(cb.keyBuf[:0])
+	sm, ok := cb.scopes[string(cb.keyBuf)] // no alloc: map read elides the copy
 	if !ok {
+		key := string(cb.keyBuf) // materialize once per new resource per batch
 		rm := cb.md.ResourceMetrics().AppendEmpty()
 		cb.fillResource(rm.Resource(), ident)
 		sm = rm.ScopeMetrics().AppendEmpty()
@@ -421,8 +441,8 @@ func (cb *cadvisorBatcher) scope(ident cadvisorIdentity) (pmetric.ScopeMetrics, 
 		// size (see convert.go).
 		cb.bytes += resourceBytes(rm.Resource(), scopeNameCadvisor)
 	}
-	cb.lastIdent, cb.lastScope, cb.lastScopeKey, cb.lastScopeOK = ident, sm, key, true
-	return sm, key
+	cb.lastIdent, cb.lastScope, cb.lastScopeOK = ident, sm, true
+	return sm
 }
 
 // fillResource builds the resource attributes for one identity, preferring
@@ -469,23 +489,26 @@ func (cb *cadvisorBatcher) fillResource(res pcommon.Resource, ident cadvisorIden
 // whether the sample's row is pod/container-scoped (its id/name/image labels
 // are then redundant with the resource and elided from the data points).
 func (cb *cadvisorBatcher) metric(ident cadvisorIdentity, name string, shape func(pmetric.Metric)) (pmetric.Metric, bool) {
-	sm, resKey := cb.scope(ident)
 	// Last-seen fast path: consecutive samples of the same resource and family
-	// skip the key concatenation (an allocation) and the map probe.
-	if cb.lastOK && resKey == cb.lastResKey && name == cb.lastName {
-		return cb.lastMetric, ident.podScoped()
+	// skip the key building and the map probe entirely.
+	if cb.lastOK && name == cb.lastName && ident == cb.lastMetIdent {
+		return cb.lastMetric, cb.lastPodScope
 	}
-	key := resKey + "\x00" + name
-	m, ok := cb.byKey[key]
+	cb.keyBuf = ident.appendKey(cb.keyBuf[:0])
+	cb.keyBuf = append(cb.keyBuf, 0)
+	cb.keyBuf = append(cb.keyBuf, name...)
+	m, ok := cb.byKey[string(cb.keyBuf)] // no alloc: map read elides the copy
 	if !ok {
-		m = sm.Metrics().AppendEmpty()
+		key := string(cb.keyBuf) // materialize once per new metric per batch
+		// scope() reuses keyBuf, so the key must be materialized first.
+		m = cb.scope(ident).Metrics().AppendEmpty()
 		m.SetName(name)
 		shape(m)
 		cb.byKey[key] = m
 		cb.bytes += len(name) + metricOverheadBytes // one descriptor per resource
 	}
-	cb.lastResKey, cb.lastName, cb.lastMetric, cb.lastOK = resKey, name, m, true
-	return m, ident.podScoped()
+	cb.lastMetIdent, cb.lastName, cb.lastMetric, cb.lastPodScope, cb.lastOK = ident, name, m, ident.podScoped(), true
+	return m, cb.lastPodScope
 }
 
 // drop applies the rollup filter (see KubeletConfig.DisableRollups) to one

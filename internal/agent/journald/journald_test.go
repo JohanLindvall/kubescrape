@@ -97,13 +97,11 @@ func fakeOpener(all []rawEntry, ended bool) openFunc {
 // entry builds a rawEntry with the common journal fields.
 func mkEntry(cursor, unit, msg, priority string) rawEntry {
 	return rawEntry{
-		fields: map[string]string{
-			"MESSAGE":           msg,
-			"PRIORITY":          priority,
-			"_SYSTEMD_UNIT":     unit,
-			"_PID":              "42",
-			"SYSLOG_IDENTIFIER": "stub",
-		},
+		message:  msg,
+		priority: priority,
+		unit:     unit,
+		pid:      "42",
+		ident:    "stub",
 		cursor:   cursor,
 		realtime: time.UnixMicro(1_700_000_000_000000),
 	}

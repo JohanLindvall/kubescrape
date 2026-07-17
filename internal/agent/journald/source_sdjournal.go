@@ -82,22 +82,30 @@ func (s *sdSource) next(ctx context.Context) (rawEntry, bool, error) {
 			s.j.Wait(waitTimeout)
 			continue
 		}
-		e, err := s.j.GetEntry()
+		cursor, err := s.j.GetCursor()
 		if err != nil {
 			return rawEntry{}, false, err
 		}
 		if s.skipCursor != "" {
-			skip := e.Cursor == s.skipCursor
+			skip := cursor == s.skipCursor
 			s.skipCursor = ""
 			if skip {
 				continue // the already-exported resume entry
 			}
 		}
-		return rawEntry{
-			fields:   e.Fields,
-			cursor:   e.Cursor,
-			realtime: time.UnixMicro(int64(e.RealtimeTimestamp)),
-		}, true, nil
+		// Read only the fields the converter consumes: GetEntry would copy
+		// EVERY field of the entry (typically 20-30) through cgo into a fresh
+		// map per entry. A missing field reads as "".
+		re := rawEntry{cursor: cursor}
+		re.message, _ = s.j.GetDataValue("MESSAGE")
+		re.unit, _ = s.j.GetDataValue("_SYSTEMD_UNIT")
+		re.ident, _ = s.j.GetDataValue("SYSLOG_IDENTIFIER")
+		re.priority, _ = s.j.GetDataValue("PRIORITY")
+		re.pid, _ = s.j.GetDataValue("_PID")
+		if usec, err := s.j.GetRealtimeUsec(); err == nil {
+			re.realtime = time.UnixMicro(int64(usec))
+		}
+		return re, true, nil
 	}
 }
 

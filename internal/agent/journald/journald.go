@@ -82,10 +82,17 @@ type Config struct {
 	RestartBackoff time.Duration
 }
 
-// rawEntry is one journal entry as read from the source: its fields (systemd
-// journal field names → values), opaque cursor, and realtime timestamp.
+// rawEntry is one journal entry as read from the source: exactly the fields
+// the converter consumes, plus the opaque cursor and realtime timestamp. The
+// source reads these individually (sdjournal GetDataValue) rather than via
+// GetEntry, which enumerates EVERY field of the entry into a fresh map —
+// 20-30 cgo string copies per entry where five suffice.
 type rawEntry struct {
-	fields   map[string]string
+	message  string
+	unit     string // _SYSTEMD_UNIT
+	ident    string // SYSLOG_IDENTIFIER
+	priority string
+	pid      string // _PID
 	cursor   string
 	realtime time.Time
 }
@@ -278,7 +285,7 @@ func (r *Reader) stream(ctx context.Context) error {
 					return fmt.Errorf("journal source ended")
 				}
 			}
-			body, origLen := r.sanitize(e.fields["MESSAGE"])
+			body, origLen := r.sanitize(e.message)
 			// Flush BEFORE the entry that would push the batch over the byte
 			// cap. A single entry already over the cap still exports alone
 			// (entries are never split), so one payload can exceed it by up
@@ -323,8 +330,8 @@ func truncateRunes(s string, n int) string {
 // batch.
 func (r *Reader) ingest(re rawEntry, body string, origLen int) {
 	e := entry{
-		unit:    re.fields["_SYSTEMD_UNIT"],
-		ident:   re.fields["SYSLOG_IDENTIFIER"],
+		unit:    re.unit,
+		ident:   re.ident,
 		body:    body,
 		ts:      re.realtime,
 		origLen: origLen,
@@ -332,8 +339,8 @@ func (r *Reader) ingest(re rawEntry, body string, origLen int) {
 	if e.ts.IsZero() {
 		e.ts = time.Now()
 	}
-	e.severity, e.sevText = severity(re.fields["PRIORITY"])
-	if pid, err := strconv.ParseInt(re.fields["_PID"], 10, 64); err == nil {
+	e.severity, e.sevText = severity(re.priority)
+	if pid, err := strconv.ParseInt(re.pid, 10, 64); err == nil {
 		e.pid = pid
 	}
 	if re.cursor != "" {

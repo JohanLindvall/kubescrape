@@ -1108,9 +1108,9 @@ func (t *Tailer) initFile(f *file, checkpoints map[string]checkpoint, initial bo
 	}
 }
 
-// newPipeline (re)creates the file's aggregation stages with empty state. A
-// carried prefix (if any) is no longer present in the fresh pipeline and must
-// be re-read before the current inode is consumed.
+// newPipeline (re)creates the file's aggregation stages with empty state.
+// Incomplete segments (if any) are no longer present in the fresh pipeline
+// and must be re-read (feedSegments) before the current inode is consumed.
 func (t *Tailer) newPipeline(f *file) {
 	if f.tail == 0 {
 		// First pipeline for this file: issue its tail segment id. Files
@@ -1518,8 +1518,7 @@ func (t *Tailer) readArchive(ctx context.Context, f *file) error {
 		obs.LogRotations.Inc()
 		// As in reopen: pause-retained complete pending lines were read from
 		// the OLD stream and are deliverable; feed them before the pipeline is
-		// discarded (the fresh tail id below makes their old-stream positions
-		// resolve to nothing at commit).
+		// discarded.
 		if len(f.pending) > 0 {
 			t.consume(ctx, f, true)
 		}
@@ -1949,14 +1948,15 @@ func (t *Tailer) ensureOpen(f *file) error {
 // the next sweep reads the new inode from offset 0. The file is marked dirty
 // so an event-driven loop picks it up immediately.
 //
-// On a rename rotation (renamed) where a multi-line group still straddles the
-// boundary — data remains buffered in the pipeline after the old inode was
-// drained — the pipeline is carried across instead of flushed, so the group
-// joins the pre- and post-rotation lines into one record. The buffered offsets
-// are re-anchored to the new inode's origin, the rotation generation bumps
-// (so the already-drained pre-rotation entries do not advance the new inode's
-// checkpoint), and the rotated-away file is recorded in f.carried so a crash
-// before the group exports can re-read its tail on restart.
+// On a rename rotation (renamed) with an uncommitted range, the old inode is
+// recorded as a segment on f.segments (with the fd where the budget allows)
+// so a crash or rewind before its lines export can re-read the owed range.
+// If a multi-line group still straddles the boundary — data remains buffered
+// in the pipeline after the old inode was drained — the pipeline is carried
+// across instead of flushed, so the group joins the pre- and post-rotation
+// lines into one record: the buffered items keep their (old-segment)
+// positions untouched, and the fresh tail id issued below makes the new
+// inode's bytes unambiguous.
 //
 // Otherwise (truncation, copytruncate, or a rename with nothing buffered) the
 // pipeline is flushed and reset as before — carrying makes no sense when the
@@ -2372,8 +2372,10 @@ func (t *Tailer) flush(ctx context.Context) {
 	var bound map[*file]metrics.BoundResource
 	var resolver *metricResolver
 	if t.cfg.LogMetrics != nil || t.cfg.Rules != nil {
-		bound = make(map[*file]metrics.BoundResource)
 		resolver = newMetricResolver()
+	}
+	if t.cfg.LogMetrics != nil {
+		bound = make(map[*file]metrics.BoundResource) // read only on the LogMetrics path
 	}
 	// With rules configured, records are built in a one-record scratch slice
 	// and only MOVED into the batch when kept, so drops never materialize a
@@ -2691,31 +2693,13 @@ func (t *Tailer) saveCheckpoints() {
 		return
 	}
 	tmp := t.cfg.CheckpointFile + ".tmp"
-	if err := writeFileSync(tmp, data); err != nil {
+	if err := positions.WriteFileSync(tmp, data); err != nil {
 		t.log.Warn("writing checkpoint file", "error", err)
 		return
 	}
 	if err := os.Rename(tmp, t.cfg.CheckpointFile); err != nil {
 		t.log.Warn("replacing checkpoint file", "error", err)
 	}
-}
-
-// writeFileSync is os.WriteFile plus an fsync before close, so the rename
-// that follows cannot surface a zero-length file after a power loss.
-func writeFileSync(path string, data []byte) error {
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
-	if err != nil {
-		return err
-	}
-	if _, err := f.Write(data); err != nil {
-		_ = f.Close()
-		return err
-	}
-	if err := f.Sync(); err != nil {
-		_ = f.Close()
-		return err
-	}
-	return f.Close()
 }
 
 func inodeOf(st os.FileInfo) uint64 {

@@ -3,10 +3,16 @@ package tailer
 // Regression guards (data-integrity, at-least-once) for log-line LOSS bugs
 // found by the adversarial audit of the log delivery chain, since fixed. Both
 // shared one root cause: rewind() early-returned when f.f == nil, skipping
-// newPipeline() -> ledger.reset() -> carriedFed = false — the only in-process
-// mechanism that re-reads a rotated-away file's prefix — so a flush that
-// failed right after a rotation rewound nothing at all. See the tests below
-// for the exact interleavings.
+// newPipeline() -> ledger.reset() -> the segments-fed re-arm — the only
+// in-process mechanism that re-reads a rotated-away file's range — so a flush
+// that failed right after a rotation rewound nothing at all. See the tests
+// below for the exact interleavings.
+//
+// Terminology: the step narrations below predate the segment refactor and use
+// its internal names — carried/gen/carriedFed/feedCarriedPrefix. The current
+// model is segment-qualified positions (pos{seg,off}), the per-file f.segments
+// list, the segmentsFed re-arm, and feedSegments; the interleavings and the
+// guarantees are unchanged.
 
 import (
 	"context"
@@ -28,6 +34,26 @@ func driveTailer(dir string, exp *fakeExporter) *Tailer {
 		MetadataWait:  time.Second,
 		Metadata:      fakeMeta{},
 		Exporter:      exp,
+	})
+	tl.retryBackoff = time.Millisecond
+	return tl
+}
+
+// driveMultilineTailer is driveTailer with stack-trace joining enabled and a
+// small entry cap — multiline is baked into the compiled sources at New()
+// time, so it cannot be toggled on a driveTailer after construction.
+func driveMultilineTailer(dir string, exp *fakeExporter) *Tailer {
+	tl := New(Config{
+		Dir:              dir,
+		PollInterval:     20 * time.Millisecond,
+		FlushInterval:    time.Millisecond,
+		BatchSize:        1 << 20,
+		Multiline:        true,
+		MultilineTimeout: 50 * time.Millisecond,
+		MaxEntryBytes:    64,
+		MetadataWait:     time.Second,
+		Metadata:         fakeMeta{},
+		Exporter:         exp,
 	})
 	tl.retryBackoff = time.Millisecond
 	return tl
@@ -89,7 +115,7 @@ func TestRotationDuringOutageKeepsDrainedTail(t *testing.T) {
 		t.Fatalf("test setup: %d failures left unconsumed", exp.fail)
 	}
 	tl.scanDir(nil, false)
-	tl.sweep(ctx, true) // reads "after"; feedCarriedPrefix is skipped
+	tl.sweep(ctx, true) // reads "after"; feedSegments is skipped
 	tl.flush(ctx)       // succeeds; commitBatch retires the segments
 
 	// Give the tailer every further chance to redeliver.

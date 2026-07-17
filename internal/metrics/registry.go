@@ -270,16 +270,27 @@ func (r *Registry) Run(ctx context.Context, exp Exporter, interval time.Duration
 	for {
 		select {
 		case <-ctx.Done():
-			fctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-			if err := r.Export(fctx, exp, res); err != nil {
-				log.Warn("final self-metrics export failed", "error", err)
-			}
-			cancel()
+			r.FinalExport(exp, res, log)
 			return
 		case <-ticker.C:
 			if err := r.Export(ctx, exp, res); err != nil {
 				log.Warn("exporting self-metrics failed", "error", err)
 			}
 		}
+	}
+}
+
+// FinalExport pushes one last snapshot on a fresh, bounded context — used by
+// Run's shutdown branch and by both mains AFTER wg.Wait, so counters bumped by
+// the final flushes (last batches, shutdown drops) that raced Run's own
+// shutdown export are not lost.
+func (r *Registry) FinalExport(exp Exporter, res pcommon.Resource, log *slog.Logger) {
+	if log == nil {
+		log = slog.Default()
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := r.Export(ctx, exp, res); err != nil {
+		log.Warn("final self-metrics export failed", "error", err)
 	}
 }

@@ -48,17 +48,10 @@ func TestPausePendingSurvivesTruncation(t *testing.T) {
 	if err := os.WriteFile(path, []byte("2026-07-05T10:00:03Z stdout F fresh\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	deadline := time.Now().Add(10 * time.Second)
-	for time.Now().Before(deadline) {
-		tl.sweep(ctx, true)
-		tl.flush(ctx)
+	driveUntil(t, ctx, tl, func() bool {
 		got := exp.get()
-		if slices.Contains(got, "line-2") && slices.Contains(got, "line-3") && slices.Contains(got, "fresh") {
-			return
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
-	t.Fatalf("pause-retained lines lost across truncation: %v", exp.get())
+		return slices.Contains(got, "line-2") && slices.Contains(got, "line-3") && slices.Contains(got, "fresh")
+	}, "pause-retained lines survive the truncation")
 }
 
 // openArchive must clear a stale rate-limit pause when it wipes pending: the
@@ -70,10 +63,7 @@ func TestPausedArchiveReopenDoesNotWedge(t *testing.T) {
 	dir := t.TempDir()
 	ctx := context.Background()
 	exp := &fakeExporter{}
-	tl := newSourceTailer(exp, []Source{{
-		Name:    "archives",
-		Include: []string{filepath.Join(dir, "*.log.gz")},
-	}}, false)
+	tl := newArchiveTailer(dir, exp)
 	tl.cfg.RateLimit = 1
 	tl.cfg.RateBurst = 1
 
@@ -86,21 +76,7 @@ func TestPausedArchiveReopenDoesNotWedge(t *testing.T) {
 
 	// Append a second gzip member: valid gzip, head intact — NOT a rewrite,
 	// so archiveDone clears and openArchive re-opens (wiping pending).
-	fh, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644)
-	if err != nil {
-		t.Fatal(err)
-	}
-	second := filepath.Join(dir, "second.gz")
-	writeGzip(t, second, "b-1")
-	data, err := os.ReadFile(second)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := fh.Write(data); err != nil {
-		t.Fatal(err)
-	}
-	_ = fh.Close()
-	_ = os.Remove(second)
+	appendGzip(t, path, "b-1")
 
 	deadline := time.Now().Add(15 * time.Second)
 	for time.Now().Before(deadline) {
@@ -150,17 +126,10 @@ func TestCarriedHopPersistedAtRotation(t *testing.T) {
 	tl2 := driveTailer(dir, exp2)
 	tl2.cfg.Positions = mustOpenPositions(t, posPath)
 	tl2.scanDir(tl2.loadCheckpoints(), true)
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		tl2.sweep(ctx, true)
-		tl2.flush(ctx)
+	driveUntil(t, ctx, tl2, func() bool {
 		got := exp2.get()
-		if slices.Contains(got, "precious") && slices.Contains(got, "second") {
-			return
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-	t.Fatalf("rotated tail lost across crash (hop not persisted): %v", exp2.get())
+		return slices.Contains(got, "precious") && slices.Contains(got, "second")
+	}, "rotated tail recovered across crash (hop persisted)")
 }
 
 // Without a checkpoint store nothing used to extend fingerprints: a file first
@@ -207,16 +176,8 @@ func TestFingerprintExtendsWithoutCheckpointStore(t *testing.T) {
 	if err := os.Chtimes(path, future, future); err != nil {
 		t.Fatal(err)
 	}
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		tl.sweep(ctx, true)
-		tl.flush(ctx)
-		if slices.Contains(exp.get(), "bbbb") {
-			return
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-	t.Fatalf("same-size rewrite undetected (fingerprint blind): %v", exp.get())
+	driveUntil(t, ctx, tl, func() bool { return slices.Contains(exp.get(), "bbbb") },
+		"same-size rewrite detected (fingerprint not blind)")
 }
 
 // A FIFO matched by a source's glob must never be tracked: open(2)/read(2) on
@@ -290,10 +251,7 @@ func TestNonGzipArchiveQuarantinedUntilRewritten(t *testing.T) {
 	dir := t.TempDir()
 	ctx := context.Background()
 	exp := &fakeExporter{}
-	tl := newSourceTailer(exp, []Source{{
-		Name:    "archives",
-		Include: []string{filepath.Join(dir, "*.log.gz")},
-	}}, false)
+	tl := newArchiveTailer(dir, exp)
 
 	path := filepath.Join(dir, "bad.log.gz")
 	if err := os.WriteFile(path, []byte("this is not gzip"), 0o644); err != nil {
@@ -310,16 +268,8 @@ func TestNonGzipArchiveQuarantinedUntilRewritten(t *testing.T) {
 	// Rewritten with valid gzip: the identity change lifts the quarantine.
 	time.Sleep(10 * time.Millisecond)
 	writeGzip(t, path, "recovered")
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		tl.sweep(ctx, true)
-		tl.flush(ctx)
-		if slices.Contains(exp.get(), "recovered") {
-			return
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-	t.Fatalf("rewritten archive never recovered from quarantine: %v", exp.get())
+	driveUntil(t, ctx, tl, func() bool { return slices.Contains(exp.get(), "recovered") },
+		"rewritten archive recovers from quarantine")
 }
 
 // An unterminated final line of a rotated-away inode is dropped (its

@@ -132,6 +132,40 @@ func writeGzip(t *testing.T, path string, lines ...string) {
 	}
 }
 
+// newArchiveTailer builds a tailer over a single compressed (*.log.gz) source
+// in dir — the fixture nearly every archive test uses.
+func newArchiveTailer(dir string, exp *fakeExporter) *Tailer {
+	return newSourceTailer(exp, []Source{{
+		Name:    "archives",
+		Include: []string{filepath.Join(dir, "*.log.gz")},
+	}}, false)
+}
+
+// appendGzip appends a fresh gzip member (its own lines) to an existing
+// archive — a valid multi-member gzip, head intact, so the file grows without
+// its identity changing.
+func appendGzip(t *testing.T, path string, lines ...string) {
+	t.Helper()
+	var buf bytes.Buffer
+	zw := gzip.NewWriter(&buf)
+	for _, l := range lines {
+		if _, err := zw.Write([]byte(l + "\n")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	fh, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = fh.Close() }()
+	if _, err := fh.Write(buf.Bytes()); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestCompressedSourceReadWhole(t *testing.T) {
 	dir := t.TempDir()
 	exp := &fakeExporter{}

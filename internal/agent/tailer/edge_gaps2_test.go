@@ -93,19 +93,7 @@ func TestWithheldCommitReleasedOnceGroupResolves(t *testing.T) {
 	dir := t.TempDir()
 	ctx := context.Background()
 	exp := &fakeExporter{}
-	tl := New(Config{
-		Dir:              dir,
-		PollInterval:     20 * time.Millisecond,
-		FlushInterval:    time.Millisecond,
-		BatchSize:        1 << 20,
-		Multiline:        true,
-		MultilineTimeout: 50 * time.Millisecond,
-		MaxEntryBytes:    64, // the group below blows straight through this
-		MetadataWait:     time.Second,
-		Metadata:         fakeMeta{},
-		Exporter:         exp,
-	})
-	tl.retryBackoff = time.Millisecond
+	tl := driveMultilineTailer(dir, exp)
 
 	tl.scanDir(tl.loadCheckpoints(), true)
 	start, rest := panicLines()
@@ -309,10 +297,7 @@ func TestArchiveRetainedFdResumeSkipsCommittedPrefix(t *testing.T) {
 	dir := t.TempDir()
 	ctx := context.Background()
 	exp := &fakeExporter{}
-	tl := newSourceTailer(exp, []Source{{
-		Name:    "archives",
-		Include: []string{filepath.Join(dir, "*.log.gz")},
-	}}, false)
+	tl := newArchiveTailer(dir, exp)
 	// One decompressed line is ~8 bytes; cap the sweep to read just line A.
 	tl.cfg.MaxBytesPerSweep = 8
 

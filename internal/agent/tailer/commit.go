@@ -1,8 +1,6 @@
 package tailer
 
 import (
-	"time"
-
 	"github.com/JohanLindvall/kubescrape/internal/obs"
 )
 
@@ -48,9 +46,12 @@ func (t *Tailer) commitBatch(inf *batchInfo) {
 		// high so a later flush can re-offer it once nothing is buffered.
 		if hi := inf.highs[f]; f.committedPos().less(hi) {
 			f.exportedHigh = hi
+		} else if !f.committedPos().less(f.exportedHigh) {
+			// The commit frontier reached the remembered high: the re-offer
+			// is spent; clear it so later flushes stop proposing it.
+			f.exportedHigh = pos{}
 		}
 	}
-	t.lastFlush = time.Now()
 }
 
 // committedPos is the file's overall commit frontier: the oldest incomplete

@@ -145,6 +145,23 @@ func waitFor(t *testing.T, cond func() bool, what string) {
 	t.Fatalf("timed out waiting for %s", what)
 }
 
+// driveUntil pumps sweep+flush on a synchronously-driven tailer (no Run
+// goroutine) until cond holds, failing after 10s. It is the driven twin of
+// waitFor, which watches a tailer already running its own sweep loop.
+func driveUntil(t *testing.T, ctx context.Context, tl *Tailer, cond func() bool, what string) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		tl.sweep(ctx, true)
+		tl.flush(ctx)
+		if cond() {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("timed out driving until %s", what)
+}
+
 func TestTailAndExport(t *testing.T) {
 	dir := t.TempDir()
 	exp := &fakeExporter{}
@@ -1203,10 +1220,10 @@ func TestUnknownFileAutoReadsFromStart(t *testing.T) {
 
 // rotateAway renames the live log file aside (the first half of a kubelet
 // rename+recreate rotation), leaving the path momentarily absent.
-func rotateAway(t *testing.T, dir string, gen int) {
+func rotateAway(t *testing.T, dir string, seq int) {
 	t.Helper()
 	path := filepath.Join(dir, logName)
-	if err := os.Rename(path, fmt.Sprintf("%s.%d", path, gen)); err != nil {
+	if err := os.Rename(path, fmt.Sprintf("%s.%d", path, seq)); err != nil {
 		t.Fatal(err)
 	}
 }

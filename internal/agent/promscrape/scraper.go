@@ -3,7 +3,6 @@ package promscrape
 import (
 	"context"
 	"fmt"
-	"io"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -333,10 +332,7 @@ func (s *Scraper) scrapeTarget(ctx context.Context, t kubemeta.ScrapeTarget) (in
 	if err != nil {
 		return 0, err
 	}
-	defer func() {
-		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
-		_ = resp.Body.Close()
-	}()
+	defer drainClose(resp.Body)
 	if resp.StatusCode != http.StatusOK {
 		return 0, fmt.Errorf("status %d", resp.StatusCode)
 	}

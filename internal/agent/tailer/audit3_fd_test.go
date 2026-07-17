@@ -96,10 +96,7 @@ func TestArchiveReplacementRead(t *testing.T) {
 	dir := t.TempDir()
 	ctx := context.Background()
 	exp := &fakeExporter{fail: 1} // one failed export: the fd is retained
-	tl := newSourceTailer(exp, []Source{{
-		Name:    "archives",
-		Include: []string{filepath.Join(dir, "*.log.gz")},
-	}}, false)
+	tl := newArchiveTailer(dir, exp)
 	path := filepath.Join(dir, "app.log.gz")
 
 	tl.scanDir(tl.loadCheckpoints(), true)
@@ -149,10 +146,7 @@ func TestArchiveRewriteInPlaceDetected(t *testing.T) {
 	dir := t.TempDir()
 	ctx := context.Background()
 	exp := &fakeExporter{}
-	tl := newSourceTailer(exp, []Source{{
-		Name:    "archives",
-		Include: []string{filepath.Join(dir, "*.log.gz")},
-	}}, false)
+	tl := newArchiveTailer(dir, exp)
 	tl.cfg.MaxBytesPerSweep = 40 // read the archive across several sweeps
 	path := filepath.Join(dir, "app.log.gz")
 

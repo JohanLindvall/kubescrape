@@ -3,8 +3,6 @@ package tailer
 // AUDIT round 2: checkpoint-vs-truncation and rate-limit-vs-rotation angles.
 
 import (
-	"bytes"
-	"compress/gzip"
 	"context"
 	"fmt"
 	"os"
@@ -114,10 +112,7 @@ func TestCompressedArchiveGrowsAfterFirstRead(t *testing.T) {
 	dir := t.TempDir()
 	ctx := context.Background()
 	exp := &fakeExporter{}
-	tl := newSourceTailer(exp, []Source{{
-		Name:    "archives",
-		Include: []string{filepath.Join(dir, "*.log.gz")},
-	}}, false)
+	tl := newArchiveTailer(dir, exp)
 	path := filepath.Join(dir, "grow.log.gz")
 
 	tl.scanDir(tl.loadCheckpoints(), true)
@@ -127,22 +122,7 @@ func TestCompressedArchiveGrowsAfterFirstRead(t *testing.T) {
 	tl.flush(ctx)
 
 	// Append a second gzip member (concatenated gzip = valid multistream).
-	var buf bytes.Buffer
-	zw := gzip.NewWriter(&buf)
-	if _, err := zw.Write([]byte("g-three\n")); err != nil {
-		t.Fatal(err)
-	}
-	if err := zw.Close(); err != nil {
-		t.Fatal(err)
-	}
-	fh, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := fh.Write(buf.Bytes()); err != nil {
-		t.Fatal(err)
-	}
-	_ = fh.Close()
+	appendGzip(t, path, "g-three")
 
 	for i := 0; i < 3; i++ {
 		tl.scanDir(nil, false)
@@ -160,10 +140,7 @@ func TestCompressedTruncatedArchiveExportsPrefix(t *testing.T) {
 	dir := t.TempDir()
 	ctx := context.Background()
 	exp := &fakeExporter{}
-	tl := newSourceTailer(exp, []Source{{
-		Name:    "archives",
-		Include: []string{filepath.Join(dir, "*.log.gz")},
-	}}, false)
+	tl := newArchiveTailer(dir, exp)
 	path := filepath.Join(dir, "cut.log.gz")
 
 	tl.scanDir(tl.loadCheckpoints(), true)

@@ -1,5 +1,13 @@
 package tailer
 
+// Terminology: the step narrations in this file predate the segment refactor
+// and use its internal names (carried/gen/carriedFed, and source-line
+// references that have since moved). The current model records each rotated
+// incarnation as a segment on f.segments with its own commit progress; a
+// segment retires individually once its range commits (it is no longer a
+// single list "cleared when empty"). The interleavings and the guarantees are
+// unchanged; these remain valid regression guards.
+
 // Regression guards (at-least-once) for log-line LOSS bugs found by audit
 // round 2 in the areas the suite exercised least (multi-hop rotation
 // bookkeeping, copytruncate refill, compressed archives), since fixed. See
@@ -67,7 +75,7 @@ func TestSecondRotationKeepsCarriedPrefix(t *testing.T) {
 	}
 	writeLog(t, dir, "2026-07-05T10:00:01Z stdout F two")
 
-	tl.sweep(ctx, true) // re-reads "one", rotation -> carried=[A]
+	tl.sweep(ctx, true) // re-reads "one", rotation -> segments=[A]
 	tl.flush(ctx)       // FAILS -> rewind (re-arms segmentsFed)
 	if len(tl.files[path].segments) != 1 {
 		t.Fatalf("setup: segments = %+v, want the rotated-away inode A", tl.files[path].segments)
@@ -81,7 +89,7 @@ func TestSecondRotationKeepsCarriedPrefix(t *testing.T) {
 	}
 	writeLog(t, dir, "2026-07-05T10:00:02Z stdout F three")
 
-	tl.sweep(ctx, true) // re-feeds A + re-reads "two", rotation -> carried nil'd!
+	tl.sweep(ctx, true) // re-feeds A + re-reads "two", second rotation
 	tl.flush(ctx)       // FAILS -> rewind purges "one" and "two" from the batch
 
 	if exp.fail != 0 {
@@ -221,10 +229,7 @@ func TestCompressedArchiveSurvivesDeletionAfterFailedExport(t *testing.T) {
 	dir := t.TempDir()
 	ctx := context.Background()
 	exp := &fakeExporter{}
-	tl := newSourceTailer(exp, []Source{{
-		Name:    "archives",
-		Include: []string{filepath.Join(dir, "*.log.gz")},
-	}}, false)
+	tl := newArchiveTailer(dir, exp)
 	path := filepath.Join(dir, "old.log.gz")
 
 	tl.scanDir(tl.loadCheckpoints(), true)
@@ -304,7 +309,7 @@ func TestCarriedPrefixSurvivesRotatedFileDeletion(t *testing.T) {
 		t.Fatal(err)
 	}
 	writeLog(t, dir, "2026-07-05T10:00:01Z stdout F two")
-	tl.sweep(ctx, true) // rotation -> carried=[A], A's fd closed
+	tl.sweep(ctx, true) // rotation -> segments=[A], A's fd closed
 	tl.flush(ctx)       // FAILS -> rewind re-arms segmentsFed (A must be re-read)
 
 	// The runtime prunes the rotated file before the tailer can re-read it.

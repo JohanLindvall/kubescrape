@@ -1,10 +1,10 @@
 package tailer
 
 // Edge-case coverage from the systematic gap analysis: metadata-resolution
-// failure/backoff, oversized unterminated lines, pipelined gen-mismatch
-// guards, log.truncated, unresolved-gone files, inode-only identity,
-// source claiming, defaulting, shrunk-checkpoint restarts, corrupt
-// checkpoints, and consumed-archive fd release.
+// failure/backoff, oversized unterminated lines, dead-segment commit guards,
+// log.truncated, unresolved-gone files, inode-only identity, source claiming,
+// defaulting, shrunk-checkpoint restarts, corrupt checkpoints, and
+// consumed-archive fd release.
 
 import (
 	"context"
@@ -187,6 +187,18 @@ func TestDeadSegmentCandidateCommitsNothing(t *testing.T) {
 	if len(f.segments) != 0 {
 		t.Fatalf("dead-segment candidate materialized a segment: %v", f.segments)
 	}
+
+	// The old gen-checked pipelined model SKIPPED the rewind of a stale-gen
+	// file at apply time (a rotation might have reset its offsets in between).
+	// Synchronous flush removed that interleaving, so failBatch now rewinds
+	// EVERY batched file unconditionally — including one whose only candidate
+	// names a dead segment: rewind is idempotent (readPos back to committed)
+	// and cannot corrupt the already-restarted offsets.
+	f.readPos = 99 // pretend read-ahead past committed
+	tl.failBatch(inf, errors.New("boom"))
+	if f.readPos != f.committed {
+		t.Fatalf("failBatch did not rewind the dead-segment file: readPos=%d committed=%d", f.readPos, f.committed)
+	}
 }
 
 // An entry truncated by the multiline byte cap carries log.truncated.
@@ -194,21 +206,7 @@ func TestTruncatedEntryCarriesAttribute(t *testing.T) {
 	dir := t.TempDir()
 	ctx := context.Background()
 	exp := &fakeExporter{}
-	// Multiline is baked into the compiled sources at New() time, so build the
-	// tailer with the byte cap and joining enabled from the start.
-	tl := New(Config{
-		Dir:              dir,
-		PollInterval:     20 * time.Millisecond,
-		FlushInterval:    time.Millisecond,
-		BatchSize:        1 << 20,
-		Multiline:        true,
-		MultilineTimeout: 50 * time.Millisecond,
-		MaxEntryBytes:    64,
-		MetadataWait:     time.Second,
-		Metadata:         fakeMeta{},
-		Exporter:         exp,
-	})
-	tl.retryBackoff = time.Millisecond
+	tl := driveMultilineTailer(dir, exp)
 
 	tl.scanDir(tl.loadCheckpoints(), true)
 	// A joined Go panic exceeding the 64-byte cap: the stage truncates the
@@ -451,10 +449,7 @@ func TestConsumedArchiveReleasesFd(t *testing.T) {
 	dir := t.TempDir()
 	ctx := context.Background()
 	exp := &fakeExporter{}
-	tl := newSourceTailer(exp, []Source{{
-		Name:    "archives",
-		Include: []string{filepath.Join(dir, "*.log.gz")},
-	}}, false)
+	tl := newArchiveTailer(dir, exp)
 	path := filepath.Join(dir, "app.log.gz")
 
 	tl.scanDir(tl.loadCheckpoints(), true)

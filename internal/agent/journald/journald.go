@@ -161,6 +161,19 @@ func New(cfg Config) *Reader {
 }
 
 // Run reads until ctx is done, restarting the reader on any failure.
+// sleepBackoff waits out the current backoff (honoring ctx) and returns the
+// next value, doubled and capped at 30s.
+func sleepBackoff(ctx context.Context, backoff time.Duration) time.Duration {
+	select {
+	case <-ctx.Done():
+	case <-time.After(backoff):
+	}
+	if backoff *= 2; backoff > 30*time.Second {
+		backoff = 30 * time.Second
+	}
+	return backoff
+}
+
 func (r *Reader) Run(ctx context.Context) {
 	r.cursor = r.loadCursor()
 	backoff := r.cfg.RestartBackoff
@@ -176,13 +189,7 @@ func (r *Reader) Run(ctx context.Context) {
 			if err := r.flush(ctx); err != nil {
 				r.log.Warn("journal export failed with no committed cursor; retrying (a reopen would seek to the tail and lose the entries)",
 					"entries", len(r.batch), "error", err, "backoff", backoff)
-				select {
-				case <-ctx.Done():
-				case <-time.After(backoff):
-				}
-				if backoff *= 2; backoff > 30*time.Second {
-					backoff = 30 * time.Second
-				}
+				backoff = sleepBackoff(ctx, backoff)
 				continue
 			}
 			backoff = r.cfg.RestartBackoff
@@ -200,13 +207,7 @@ func (r *Reader) Run(ctx context.Context) {
 		}
 		obs.JournalRestarts.Inc()
 		r.log.Warn("journal reader stopped; restarting", "error", err, "backoff", backoff)
-		select {
-		case <-ctx.Done():
-		case <-time.After(backoff):
-		}
-		if backoff *= 2; backoff > 30*time.Second {
-			backoff = 30 * time.Second
-		}
+		backoff = sleepBackoff(ctx, backoff)
 	}
 	// Final flush of whatever is buffered.
 	if err := r.flush(context.Background()); err != nil {

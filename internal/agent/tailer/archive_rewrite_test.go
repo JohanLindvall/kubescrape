@@ -6,23 +6,21 @@ import (
 	"slices"
 	"strings"
 	"testing"
-	"time"
 )
 
 // A compressed archive is read into the batch (not yet flushed) and then
-// REWRITTEN in place (same inode). The archiveReplaced restart must bump
-// f.gen exactly as reopen does: without it the batched entries carry the OLD
-// stream's offsets into commitBatch, stamping committed past the replacement
-// stream's readPos — a later rewind (or a restart via the checkpoint) would
-// then skip that many bytes of the NEW stream, silently losing its lines.
+// REWRITTEN in place (same inode). The archiveReplaced restart must issue a
+// fresh tail segment id (newTail): without it the batched entries carry the
+// OLD stream's segment-qualified positions into commitBatch, stamping
+// committed past the replacement stream's readPos — a later rewind (or a
+// restart via the checkpoint) would then skip that many bytes of the NEW
+// stream, silently losing its lines. The fresh id makes the old positions
+// resolve to a dead segment (committing nothing) instead.
 func TestInPlaceRewrittenArchiveDoesNotCommitStaleOffsets(t *testing.T) {
 	dir := t.TempDir()
 	ctx := context.Background()
 	exp := &fakeExporter{}
-	tl := newSourceTailer(exp, []Source{{
-		Name:    "archives",
-		Include: []string{filepath.Join(dir, "*.log.gz")},
-	}}, false)
+	tl := newArchiveTailer(dir, exp)
 	path := filepath.Join(dir, "app.log.gz")
 
 	tl.scanDir(tl.loadCheckpoints(), true)
@@ -62,10 +60,7 @@ func TestInPlaceRewrittenArchiveClearsRateLimitPause(t *testing.T) {
 	dir := t.TempDir()
 	ctx := context.Background()
 	exp := &fakeExporter{}
-	tl := newSourceTailer(exp, []Source{{
-		Name:    "archives",
-		Include: []string{filepath.Join(dir, "*.log.gz")},
-	}}, false)
+	tl := newArchiveTailer(dir, exp)
 	tl.cfg.RateLimit = 1 // the burst covers one line; the next pauses the file
 	tl.cfg.RateBurst = 1
 
@@ -81,17 +76,8 @@ func TestInPlaceRewrittenArchiveClearsRateLimitPause(t *testing.T) {
 
 	writeGzip(t, path, "new-1") // rewritten in place while paused
 
-	deadline := time.Now().Add(10 * time.Second)
-	for time.Now().Before(deadline) {
-		tl.sweep(ctx, true)
-		tl.flush(ctx)
-		if slices.Contains(exp.get(), "new-1") {
-			return
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
-	t.Fatalf("replacement line never exported: file wedged (limited=%v, exports: %v)",
-		tl.files[path].limited, exp.get())
+	driveUntil(t, ctx, tl, func() bool { return slices.Contains(exp.get(), "new-1") },
+		"replacement line exported (file not wedged)")
 }
 
 // The general form of the wedge, no rewrite involved: a pause-mode
@@ -102,10 +88,7 @@ func TestRateLimitedArchiveTailIsNotStarvedByDoneShortCircuit(t *testing.T) {
 	dir := t.TempDir()
 	ctx := context.Background()
 	exp := &fakeExporter{}
-	tl := newSourceTailer(exp, []Source{{
-		Name:    "archives",
-		Include: []string{filepath.Join(dir, "*.log.gz")},
-	}}, false)
+	tl := newArchiveTailer(dir, exp)
 	tl.cfg.RateLimit = 5
 	tl.cfg.RateBurst = 1
 
@@ -114,15 +97,6 @@ func TestRateLimitedArchiveTailIsNotStarvedByDoneShortCircuit(t *testing.T) {
 	writeGzip(t, path, "line-1", "line-2", "line-3")
 	tl.scanDir(nil, false)
 
-	deadline := time.Now().Add(10 * time.Second)
-	for time.Now().Before(deadline) {
-		tl.sweep(ctx, true)
-		tl.flush(ctx)
-		if slices.Contains(exp.get(), "line-3") {
-			return
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
-	t.Fatalf("archive tail never exported: limited=%v, exports: %v",
-		tl.files[path].limited, exp.get())
+	driveUntil(t, ctx, tl, func() bool { return slices.Contains(exp.get(), "line-3") },
+		"archive tail exported (not starved by the done short-circuit)")
 }

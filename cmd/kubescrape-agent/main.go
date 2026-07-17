@@ -594,11 +594,7 @@ func run() error {
 		// Registry.Run's own final export raced the final flushes inside
 		// wg.Wait; counters they bumped (last batches, shutdown drops) would
 		// otherwise die unexported. One more export now that everything is done.
-		fctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		if err := obs.Registry.Export(fctx, out, selfRes); err != nil {
-			log.Warn("final self-metrics export failed", "error", err)
-		}
+		obs.Registry.FinalExport(out, selfRes, log)
 	}
 	return fatalErr
 }

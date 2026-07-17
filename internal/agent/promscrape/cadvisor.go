@@ -160,11 +160,17 @@ func (s *Scraper) kubeletGet(ctx context.Context, url string) (*http.Response, e
 		return nil, err
 	}
 	if resp.StatusCode != http.StatusOK {
-		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
-		_ = resp.Body.Close()
+		drainClose(resp.Body)
 		return nil, fmt.Errorf("status %d", resp.StatusCode)
 	}
 	return resp, nil
+}
+
+// drainClose reads a bounded remainder of an HTTP body before closing so the
+// keep-alive connection can be reused, then closes it.
+func drainClose(rc io.ReadCloser) {
+	_, _ = io.Copy(io.Discard, io.LimitReader(rc, 1<<20))
+	_ = rc.Close()
 }
 
 // scrapeCadvisor scrapes <kubelet>/metrics/cadvisor. cadvisor series carry
@@ -180,10 +186,7 @@ func (s *Scraper) scrapeCadvisor(ctx context.Context) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	defer func() {
-		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
-		_ = resp.Body.Close()
-	}()
+	defer drainClose(resp.Body)
 
 	cb := newCadvisorBatcher(s, time.Now(), ctx)
 	return s.parseAndExport(ctx, resp.Body, false, false, cb, pipelineCadvisor, url)
@@ -199,10 +202,7 @@ func (s *Scraper) scrapeNodeMetrics(ctx context.Context) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	defer func() {
-		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
-		_ = resp.Body.Close()
-	}()
+	defer drainClose(resp.Body)
 
 	b := newBatcher(func(res pcommon.Resource) {
 		a := res.Attributes()

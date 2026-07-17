@@ -160,37 +160,32 @@ func TestOversizedUnterminatedLineKeepsOffsetsExact(t *testing.T) {
 	}
 }
 
-// The pipelined apply-time gen check is the backstop the settle-before-rotation
-// design falls back on: a stale-gen result must neither commit nor rewind.
-func TestPipelinedStaleGenResultIsIgnored(t *testing.T) {
+// A candidate naming a DEAD segment id (a truncated-away incarnation) must
+// resolve to nothing: neither the tail checkpoint nor any live segment may
+// move. The segment-qualified position IS the staleness check that the old
+// rotation-generation protocol provided.
+func TestDeadSegmentCandidateCommitsNothing(t *testing.T) {
 	dir := t.TempDir()
 	exp := &fakeExporter{}
 	tl := driveTailer(dir, exp)
 
 	f := &file{path: filepath.Join(dir, logName), committed: 7,
 		source: &compiledSource{name: "containers", containerd: true}}
-	f.gen = 1
 	f.readPos = 42
-	f.carried = []rotatedPrefix{{from: 0, to: 5}}
-	tl.newPipeline(f)
-	criStage := f.criStage
+	tl.newPipeline(f) // issues tail id 1
+	deadSeg := f.tail
+	f.newTail() // the old incarnation's id is now dead
 
-	inf := &inflight{
-		gens:        map[*file]int{f: 0}, // stale: file is at gen 1
-		offsets:     map[*file]int64{f: 100},
-		carriedDone: map[*file]struct{}{f: {}},
+	inf := &batchInfo{
+		cands: map[*file]map[int]int64{f: {deadSeg: 100}},
+		highs: map[*file]pos{f: {seg: deadSeg, off: 100}},
 	}
 	tl.commitBatch(inf)
 	if f.committed != 7 {
-		t.Fatalf("stale-gen commit applied: committed = %d, want 7", f.committed)
+		t.Fatalf("dead-segment candidate applied to the tail: committed = %d, want 7", f.committed)
 	}
-	if f.carried == nil {
-		t.Fatal("stale-gen commit cleared carried prefixes")
-	}
-	inf.err = errors.New("boom")
-	tl.failBatch(inf)
-	if f.readPos != 42 || f.criStage != criStage {
-		t.Fatalf("stale-gen failure rewound the file: readPos=%d pipelineChanged=%v", f.readPos, f.criStage != criStage)
+	if len(f.segments) != 0 {
+		t.Fatalf("dead-segment candidate materialized a segment: %v", f.segments)
 	}
 }
 

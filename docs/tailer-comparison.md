@@ -104,11 +104,15 @@ In descending order of lines saved per guarantee lost:
    the product's core promise.
 3. **Drop pipelined export** — an opt-in perf mode whose settle/gen interplay
    is real complexity, for overlap `-buffer-dir` can provide instead.
-   Expanded below.
-4. **Do the deferred decomposition** — same behavior, better factoring: a
-   per-container logical-stream aggregator over a byte-offset durability
-   layer. Does not reduce essential complexity, but splits the 2,700-line file
-   along its actual seam. Expanded below.
+   Expanded below. **Done** (branch `tailer-simplify`).
+4. **Do the deferred decomposition** — same behavior, better factoring.
+   Expanded below. **Done** (branch `tailer-simplify`): offsets are
+   segment-qualified `pos{seg, off}` values, rotations close the tail into
+   per-file `segment` records with individual commit progress, and the
+   rotation-generation protocol (`gen`), the buffered-offset rewrite
+   (`reanchor`), and the all-or-nothing carried release (`carriedDone`) are
+   deleted — the checkpoint format was already a segment list, so no
+   migration was needed.
 
 ## Expanded: dropping pipelined export
 

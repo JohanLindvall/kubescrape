@@ -90,7 +90,7 @@ func TestRotationDuringOutageKeepsDrainedTail(t *testing.T) {
 	}
 	tl.scanDir(nil, false)
 	tl.sweep(ctx, true) // reads "after"; feedCarriedPrefix is skipped
-	tl.flush(ctx)       // succeeds; commitBatch clears f.carried
+	tl.flush(ctx)       // succeeds; commitBatch retires the segments
 
 	// Give the tailer every further chance to redeliver.
 	for i := 0; i < 3; i++ {

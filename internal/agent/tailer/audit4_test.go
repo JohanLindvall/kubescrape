@@ -11,7 +11,6 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
-	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -115,80 +114,6 @@ func TestPausedArchiveReopenDoesNotWedge(t *testing.T) {
 	}
 	t.Fatalf("paused archive wedged after reopen: %v (limited=%v)",
 		exp.get(), tl.files[path].limited)
-}
-
-// The settle-triggered rewind shrinks readPos; the truncation decision must
-// use the PRE-settle position or an in-place rewrite (smaller than what was
-// read, larger than what was committed) goes undetected — the read resumes
-// mid-replacement, exporting a torn record and skipping the real prefix.
-func TestPipelinedSettleRewindStillDetectsTruncation(t *testing.T) {
-	dir := t.TempDir()
-	ctx := context.Background()
-	exp := &fakeExporter{}
-	tl := driveTailer(dir, exp)
-	tl.cfg.PipelinedExport = true
-	tl.exportCh = make(chan *inflight, 1)
-	go tl.exportWorker()
-
-	tl.scanDir(tl.loadCheckpoints(), true)
-	writeLog(t, dir,
-		"2026-07-05T10:00:00Z stdout F aaaa",
-		"2026-07-05T10:00:01Z stdout F bbbb",
-	)
-	tl.scanDir(nil, false)
-	tl.sweep(ctx, true)
-	tl.flush(ctx) // handoff; delivered ok
-	waitFor(t, func() bool { return len(exp.get()) == 2 }, "first batch")
-	tl.sweep(ctx, true)
-	tl.flush(ctx) // applies success -> committed advances
-
-	// Read ahead two more lines whose export FAILS (in flight at rewrite time).
-	exp.mu.Lock()
-	exp.fail = 3
-	exp.mu.Unlock()
-	writeLog(t, dir,
-		"2026-07-05T10:00:02Z stdout F cccc",
-		"2026-07-05T10:00:03Z stdout F dddd",
-	)
-	tl.sweep(ctx, true)
-	tl.flush(ctx) // handoff of the doomed batch
-	time.Sleep(200 * time.Millisecond)
-
-	// In-place rewrite: SMALLER than readPos, LARGER than committed.
-	path := filepath.Join(dir, logName)
-	st, err := os.Stat(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	replacement := "2026-07-05T10:00:04Z stdout F repl-one\n2026-07-05T10:00:05Z stdout F repl-two\n"
-	f := tl.files[path]
-	if int64(len(replacement)) >= st.Size() || int64(len(replacement)) <= f.committed {
-		t.Fatalf("test geometry broken: replacement %d, size %d, committed %d",
-			len(replacement), st.Size(), f.committed)
-	}
-	if err := os.WriteFile(path, []byte(replacement), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	exp.mu.Lock()
-	exp.fail = 0
-	exp.mu.Unlock()
-
-	deadline := time.Now().Add(10 * time.Second)
-	for time.Now().Before(deadline) {
-		tl.sweep(ctx, true)
-		tl.flush(ctx)
-		got := exp.get()
-		if slices.Contains(got, "repl-one") && slices.Contains(got, "repl-two") {
-			for _, r := range got {
-				if strings.Contains(r, "repl") && r != "repl-one" && r != "repl-two" {
-					t.Fatalf("torn record exported: %q in %v", r, got)
-				}
-			}
-			return
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
-	t.Fatalf("replacement prefix never exported (truncation missed): %v", exp.get())
 }
 
 // A carried rotation hop must reach the checkpoint at ROTATION time, not on

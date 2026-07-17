@@ -125,7 +125,6 @@ spec:
             {{- end }}
             - -logs-unknown-files={{ .Values.agent.logsUnknownFiles }}
             - -logs-idle-close={{ .Values.agent.logsIdleClose }}
-            - -logs-pipelined-export={{ .Values.agent.logsPipelinedExport }}
             {{- with .Values.agent.bufferDir }}
             - -buffer-dir={{ . }}
             - -buffer-max-bytes={{ int64 $.Values.agent.bufferMaxBytes }}

@@ -25,7 +25,7 @@ func openFDs(t *testing.T) int {
 }
 
 // TestCarriedPrefixFdsBounded: reopen() now hands the rotated-away inode's fd to
-// the rotatedPrefix it records, and f.carried is only cleared (and its fds
+// the segment it records, and a segment only retires (and its fd
 // closed) by commitBatch — after a SUCCESSFUL export. Nothing bounds the list.
 //
 // A collector outage that spans N rotations therefore appends N prefixes, each
@@ -65,16 +65,16 @@ func TestCarriedPrefixFdsBounded(t *testing.T) {
 
 	f := tl.files[path]
 	held := 0
-	for _, c := range f.carried {
+	for _, c := range f.segments {
 		if c.fd != nil {
 			held++
 		}
 	}
 	after := openFDs(t)
-	t.Logf("carried prefixes=%d retained fds=%d, /proc/self/fd: %d -> %d", len(f.carried), held, base, after)
+	t.Logf("carried segments=%d retained fds=%d, /proc/self/fd: %d -> %d", len(f.segments), held, base, after)
 	if held > 4 || after-base > 4 {
 		t.Fatalf("FD LEAK: %d rotations during one outage retained %d fds (open fds %d -> %d); "+
-			"f.carried is unbounded and its fds are only released on a successful export",
+			"f.segments is unbounded and its fds are only released on a successful export",
 			rotations, held, base, after)
 	}
 }

@@ -48,7 +48,7 @@ func (t *Tailer) publishStatus() {
 			Committed:   f.committed,
 			Resolved:    f.resolved,
 			Compressed:  f.compressed,
-			Carried:     len(f.carried),
+			Carried:     len(f.segments),
 			RateLimited: f.limited,
 		}
 		if f.source != nil {

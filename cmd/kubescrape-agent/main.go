@@ -95,7 +95,6 @@ func run() error {
 		logsRateDrop      = flag.Bool("logs-rate-drop", false, "discard lines over -logs-rate-limit instead of pausing the file")
 		logsIdleClose     = flag.Duration("logs-idle-close", 0, "close the fd of a fully-caught-up file after this much inactivity (0 = never, the default). The open fd is the only way to drain a rotated-away or deleted file, so enabling this trades the zero-loss guarantee for bounded fd usage")
 		logsUnknownFiles  = flag.String("logs-unknown-files", "auto", "where a file with no checkpoint entry starts at startup: end (skip as history), start (read whole), auto (start when the checkpoint store has entries — it appeared while the agent was down — else end)")
-		logsPipelined     = flag.Bool("logs-pipelined-export", false, "overlap reading with export delivery (one export in flight; at-least-once semantics unchanged)")
 		logsEnrich        = flag.Bool("logs-enrich", true, "parse per-line metadata (timestamp, severity, trace/span IDs, exception details) into the OTLP record fields via github.com/JohanLindvall/enrich")
 		logsFileAttrs     = flag.Bool("logs-file-attributes", false, "stamp log.file.name and log.file.position (byte offset) on every log record, for each file source")
 		bufferDir         = flag.String("buffer-dir", "", "directory for a disk-backed export buffer (logs and metrics); a collector outage spools here instead of pinning the tailer to old offsets or dropping metrics (empty disables)")
@@ -352,7 +351,6 @@ func run() error {
 			UnknownFiles:      *logsUnknownFiles,
 			IdleClose:         *logsIdleClose,
 			Rules:             logRules,
-			PipelinedExport:   *logsPipelined,
 			Multiline:         *multilineOn,
 			MultilineTimeout:  *multilineWait,
 			Enrich:            *logsEnrich,

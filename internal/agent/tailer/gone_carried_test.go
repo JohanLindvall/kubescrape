@@ -36,9 +36,9 @@ func TestGoneFileDeliversCarriedPrefix(t *testing.T) {
 	}
 	writeLog(t, dir, "2026-07-05T10:00:01Z stdout F two")
 	tl.sweep(ctx, true) // re-reads "one", rotation -> carried=[A]
-	tl.flush(ctx)       // FAILS -> rewind (re-arms carriedFed)
-	if len(tl.files[path].carried) != 1 {
-		t.Fatalf("setup: carried = %+v, want the rotated-away inode A", tl.files[path].carried)
+	tl.flush(ctx)       // FAILS -> rewind (re-arms segmentsFed)
+	if len(tl.files[path].segments) != 1 {
+		t.Fatalf("setup: segments = %+v, want the rotated-away inode A", tl.files[path].segments)
 	}
 
 	// Another sweep opens inode B and reads "two" (fd now held), still failing.

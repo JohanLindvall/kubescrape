@@ -52,8 +52,8 @@ func FuzzFeedLine(f *testing.F) {
 
 		var total int64
 		checkWatermark := func(when string) {
-			if wm, ok := file.watermark(); ok && (wm < 0 || wm > total) {
-				t.Fatalf("%s: watermark %d out of range [0, %d]", when, wm, total)
+			if wm, ok := file.watermark(); ok && (wm.off < 0 || wm.off > total || wm.seg != file.tail) {
+				t.Fatalf("%s: watermark %+v out of range [0, %d] (tail seg %d)", when, wm, total, file.tail)
 			}
 		}
 
@@ -76,15 +76,18 @@ func FuzzFeedLine(f *testing.F) {
 			if e.file != file {
 				t.Fatalf("entry %d: unexpected file", i)
 			}
-			if e.start < 0 || e.offset > total || e.start > e.offset {
+			if e.start.off < 0 || e.end.off > total || e.start.off > e.end.off {
 				t.Fatalf("entry %d (stream %q body %q): range [%d, %d) outside fed bytes [0, %d]",
-					i, e.stream, clip(e.body), e.start, e.offset, total)
+					i, e.stream, clip(e.body), e.start.off, e.end.off, total)
 			}
-			if prev, ok := lastOffset[e.stream]; ok && e.offset < prev {
+			if e.start.seg != file.tail || e.end.seg != file.tail {
+				t.Fatalf("entry %d: segment ids %d/%d, want tail %d", i, e.start.seg, e.end.seg, file.tail)
+			}
+			if prev, ok := lastOffset[e.stream]; ok && e.end.off < prev {
 				t.Fatalf("entry %d (stream %q body %q): offset %d went backwards (prev %d)",
-					i, e.stream, clip(e.body), e.offset, prev)
+					i, e.stream, clip(e.body), e.end.off, prev)
 			}
-			lastOffset[e.stream] = e.offset
+			lastOffset[e.stream] = e.end.off
 		}
 	})
 }

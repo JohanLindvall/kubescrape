@@ -427,9 +427,7 @@ func TestMultilineJoinsAcrossRotation(t *testing.T) {
 	// the continuation lands in a fresh inode — the group straddles both.
 	start, rest := panicLines()
 	writeLines(t, path, start...)
-	if err := os.Rename(path, path+".1"); err != nil {
-		t.Fatal(err)
-	}
+	rotateAway(t, dir, 1)
 	writeLines(t, path, rest...)
 
 	waitFor(t, func() bool { j, _ := panicRecords(exp); return j == 1 }, "trace joined across rotation")
@@ -524,9 +522,7 @@ func TestMultilineJoinsAcrossDoubleRotation(t *testing.T) {
 	a, b, c := panicLines3()
 	base := obs.LogRotations.Value()
 	writeLines(t, path, a...)
-	if err := os.Rename(path, path+".1"); err != nil {
-		t.Fatal(err)
-	}
+	rotateAway(t, dir, 1)
 	writeLines(t, path, b...)
 	// The join only works across rotations the tailer actually observes (it
 	// follows the symlink, not every intermediate rotated file). Wait until it
@@ -536,9 +532,7 @@ func TestMultilineJoinsAcrossDoubleRotation(t *testing.T) {
 	// briefly — well under the 3s multiline timeout.)
 	waitFor(t, func() bool { return obs.LogRotations.Value() >= base+1 }, "first rotation observed")
 	time.Sleep(300 * time.Millisecond)
-	if err := os.Rename(path, path+".2"); err != nil {
-		t.Fatal(err)
-	}
+	rotateAway(t, dir, 2)
 	writeLines(t, path, c...)
 
 	waitFor(t, func() bool { j, _ := panicRecords(exp); return j == 1 }, "trace joined across two rotations")
@@ -679,10 +673,7 @@ func TestRotation(t *testing.T) {
 	waitFor(t, func() bool { return len(exp.get()) == 1 }, "pre-rotation record")
 
 	// Rotate: rename away and write a fresh file at the same path.
-	path := filepath.Join(dir, logName)
-	if err := os.Rename(path, path+".1"); err != nil {
-		t.Fatal(err)
-	}
+	rotateAway(t, dir, 1)
 	writeLog(t, dir, "2026-07-05T10:00:01Z stdout F after")
 	waitFor(t, func() bool { return len(exp.get()) == 2 }, "post-rotation record")
 	if got := exp.get(); got[1] != "after" {
@@ -795,9 +786,7 @@ func TestRotationDrainsOldFile(t *testing.T) {
 	// mimicking a writer that has not reopened yet — then start the new
 	// file. Nothing may be lost.
 	path := filepath.Join(dir, logName)
-	if err := os.Rename(path, path+".1"); err != nil {
-		t.Fatal(err)
-	}
+	rotateAway(t, dir, 1)
 	old, err := os.OpenFile(path+".1", os.O_APPEND|os.O_WRONLY, 0o644)
 	if err != nil {
 		t.Fatal(err)
@@ -1082,9 +1071,7 @@ func TestRotationDrainsFullBacklog(t *testing.T) {
 		lines = append(lines, timeNowCRI()+" stdout F backlog-"+strings.Repeat("y", 100)+"-"+strconv.Itoa(i))
 	}
 	writeLog(t, dir, lines...)
-	if err := os.Rename(filepath.Join(dir, logName), filepath.Join(dir, logName+".1")); err != nil {
-		t.Fatal(err)
-	}
+	rotateAway(t, dir, 1)
 	writeLog(t, dir, timeNowCRI()+" stdout F post-rotate")
 
 	waitFor(t, func() bool {

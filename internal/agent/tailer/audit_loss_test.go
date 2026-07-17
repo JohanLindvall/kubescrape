@@ -101,10 +101,7 @@ func TestRotationDuringOutageKeepsDrainedTail(t *testing.T) {
 	tl.flush(ctx)       // FAILS -> rewind (f.f open, so this one works)
 
 	// Rotate while the collector is still down.
-	path := filepath.Join(dir, logName)
-	if err := os.Rename(path, path+".1"); err != nil {
-		t.Fatal(err)
-	}
+	rotateAway(t, dir, 1)
 	writeLog(t, dir, "2026-07-05T10:00:01Z stdout F after")
 
 	tl.sweep(ctx, true) // re-reads "precious", detects rotation, reopen()

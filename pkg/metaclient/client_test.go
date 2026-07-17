@@ -266,18 +266,14 @@ func TestPodByIP(t *testing.T) {
 }
 
 func BenchmarkCacheHitPod(b *testing.B) {
-	body := `{"name":"web-abc","namespace":"prod","uid":"u1","nodeName":"n1","podIP":"10.0.0.1",` +
+	s := newSrv(b)
+	s.maxAge = "3600"
+	s.body = `{"name":"web-abc","namespace":"prod","uid":"u1","nodeName":"n1","podIP":"10.0.0.1",` +
 		`"labels":{"app":"web","tier":"fe","team":"core"},"annotations":{"prometheus.io/scrape":"true"},` +
 		`"createdAt":"2026-07-01T10:00:00Z","phase":"Running","containers":[` +
 		`{"name":"app","image":"img:1","id":"c1","ports":[{"name":"http","port":8080}]},` +
 		`{"name":"sidecar","image":"img2:1","id":"c2"}]}`
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Cache-Control", "max-age=3600")
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(body))
-	}))
-	defer srv.Close()
-	c := New(srv.URL, 5*time.Second)
+	c := New(s.URL, 5*time.Second)
 	ctx := context.Background()
 	if _, err := c.PodByUID(ctx, "u1"); err != nil { // populate
 		b.Fatal(err)
@@ -297,13 +293,10 @@ func BenchmarkCacheHitPod(b *testing.B) {
 // caller receives (maps/slices are shared under the treat-as-immutable
 // contract; the struct itself is not).
 func TestCacheHitShallowCopyIsolation(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Cache-Control", "max-age=3600")
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"name":"web","uid":"u1","labels":{"app":"web"}}`))
-	}))
-	defer srv.Close()
-	c := New(srv.URL, 5*time.Second)
+	s := newSrv(t)
+	s.maxAge = "3600"
+	s.body = `{"name":"web","uid":"u1","labels":{"app":"web"}}`
+	c := New(s.URL, 5*time.Second)
 	ctx := context.Background()
 
 	p1, err := c.PodByUID(ctx, "u1")

@@ -31,9 +31,7 @@ func TestGoneFileDeliversCarriedPrefix(t *testing.T) {
 
 	// Rename rotation while the collector is down: inode A becomes a carried
 	// prefix, inode B holds "two".
-	if err := os.Rename(path, path+".1"); err != nil {
-		t.Fatal(err)
-	}
+	rotateAway(t, dir, 1)
 	writeLog(t, dir, "2026-07-05T10:00:01Z stdout F two")
 	tl.sweep(ctx, true) // re-reads "one", rotation -> carried=[A]
 	tl.flush(ctx)       // FAILS -> rewind (re-arms segmentsFed)

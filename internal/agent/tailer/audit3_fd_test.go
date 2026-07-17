@@ -54,9 +54,7 @@ func TestCarriedPrefixFdsBounded(t *testing.T) {
 	base := openFDs(t)
 	const rotations = 25
 	for i := 1; i <= rotations; i++ {
-		if err := os.Rename(path, fmt.Sprintf("%s.%d", path, i)); err != nil {
-			t.Fatal(err)
-		}
+		rotateAway(t, dir, i)
 		writeLog(t, dir, fmt.Sprintf("2026-07-05T10:00:%02dZ stdout F line-%d", i, i))
 		tl.scanDir(nil, false)
 		tl.sweep(ctx, true)

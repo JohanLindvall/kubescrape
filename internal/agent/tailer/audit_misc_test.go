@@ -80,10 +80,7 @@ func TestRateLimitPauseAcrossRotation(t *testing.T) {
 	}
 
 	// Rotate while paused: the backlog lives only in the rotated-away inode.
-	path := filepath.Join(dir, logName)
-	if err := os.Rename(path, path+".1"); err != nil {
-		t.Fatal(err)
-	}
+	rotateAway(t, dir, 1)
 	writeLog(t, dir, "2026-07-05T10:00:01Z stdout F after-rotation")
 
 	// Sweep until the (rate-limited) new inode's line gets through too; the

@@ -114,10 +114,7 @@ func TestCarriedHopPersistedAtRotation(t *testing.T) {
 	tl.flush(ctx) // fails; rewind
 
 	// Rename rotation during the outage.
-	path := filepath.Join(dir, logName)
-	if err := os.Rename(path, path+".1"); err != nil {
-		t.Fatal(err)
-	}
+	rotateAway(t, dir, 1)
 	writeLog(t, dir, "2026-07-05T10:00:01Z stdout F second")
 	tl.sweep(ctx, true) // re-reads precious, detects rotation, records the hop
 	// CRASH: no shutdown, no checkpoint cadence — the tailer is abandoned.
@@ -291,9 +288,7 @@ func TestTornFinalLineAtRotationCounted(t *testing.T) {
 	tl.flush(ctx)
 
 	before := obs.LogTornFinalLines.Value()
-	if err := os.Rename(path, path+".1"); err != nil {
-		t.Fatal(err)
-	}
+	rotateAway(t, dir, 1)
 	writeLog(t, dir, "2026-07-05T10:00:02Z stdout F next")
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {

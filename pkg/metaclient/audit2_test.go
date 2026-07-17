@@ -51,7 +51,7 @@ type srv struct {
 	lastETag string
 }
 
-func newSrv(t *testing.T) *srv {
+func newSrv(t testing.TB) *srv {
 	s := &srv{body: `{"name":"p","namespace":"ns"}`, code: 200}
 	s.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		s.hits.Add(1)

@@ -70,9 +70,7 @@ func TestSecondRotationKeepsCarriedPrefix(t *testing.T) {
 	tl.sweep(ctx, true) // reads "one"
 	tl.flush(ctx)       // FAILS -> rewind
 
-	if err := os.Rename(path, path+".1"); err != nil {
-		t.Fatal(err)
-	}
+	rotateAway(t, dir, 1)
 	writeLog(t, dir, "2026-07-05T10:00:01Z stdout F two")
 
 	tl.sweep(ctx, true) // re-reads "one", rotation -> segments=[A]
@@ -84,9 +82,7 @@ func TestSecondRotationKeepsCarriedPrefix(t *testing.T) {
 	tl.sweep(ctx, true) // re-feeds A's prefix ("one") + reads "two"
 	tl.flush(ctx)       // FAILS -> rewind
 
-	if err := os.Rename(path, path+".2"); err != nil {
-		t.Fatal(err)
-	}
+	rotateAway(t, dir, 2)
 	writeLog(t, dir, "2026-07-05T10:00:02Z stdout F three")
 
 	tl.sweep(ctx, true) // re-feeds A + re-reads "two", second rotation
@@ -305,9 +301,7 @@ func TestCarriedPrefixSurvivesRotatedFileDeletion(t *testing.T) {
 	tl.sweep(ctx, true)
 	tl.flush(ctx) // FAILS -> rewind
 
-	if err := os.Rename(path, path+".1"); err != nil {
-		t.Fatal(err)
-	}
+	rotateAway(t, dir, 1)
 	writeLog(t, dir, "2026-07-05T10:00:01Z stdout F two")
 	tl.sweep(ctx, true) // rotation -> segments=[A], A's fd closed
 	tl.flush(ctx)       // FAILS -> rewind re-arms segmentsFed (A must be re-read)

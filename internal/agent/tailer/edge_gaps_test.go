@@ -305,10 +305,7 @@ func TestNegativeFingerprintBytesInodeOnlyIdentity(t *testing.T) {
 	}
 
 	// Rename rotation: new inode at the path is detected and read from zero.
-	path := filepath.Join(dir, logName)
-	if err := os.Rename(path, path+".1"); err != nil {
-		t.Fatal(err)
-	}
+	rotateAway(t, dir, 1)
 	writeLog(t, dir, "2026-07-05T10:00:02Z stdout F three")
 	for i := 0; i < 3 && !slices.Contains(exp2.get(), "three"); i++ {
 		tl2.sweep(ctx, true)

@@ -10,19 +10,10 @@ type (
 	Sample     = promparse.Sample
 	Label      = promparse.Label
 	Exemplar   = promparse.Exemplar
-	SampleRole = promparse.SampleRole
 	MetricType = promparse.MetricType
-	Parser     = promparse.Parser
 )
 
 const (
-	TypeUntyped   = promparse.TypeUntyped
-	TypeCounter   = promparse.TypeCounter
-	TypeGauge     = promparse.TypeGauge
-	TypeHistogram = promparse.TypeHistogram
-	TypeSummary   = promparse.TypeSummary
-
-	RoleGauge           = promparse.RoleGauge
 	RoleCounter         = promparse.RoleCounter
 	RoleHistogramBucket = promparse.RoleHistogramBucket
 	RoleHistogramSum    = promparse.RoleHistogramSum

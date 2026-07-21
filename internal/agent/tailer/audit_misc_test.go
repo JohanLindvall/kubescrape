@@ -24,7 +24,7 @@ func TestCheckpointBeyondTruncatedSizeRereads(t *testing.T) {
 	exp := &fakeExporter{}
 
 	tl := driveTailer(dir, exp)
-	tl.cfg.CheckpointFile = cp
+	tl.cfg.Positions = mustOpenPositions(t, cp)
 	tl.scanDir(tl.loadCheckpoints(), true)
 	writeLog(t, dir,
 		"2026-07-05T10:00:00Z stdout F old-1",
@@ -44,7 +44,7 @@ func TestCheckpointBeyondTruncatedSizeRereads(t *testing.T) {
 	writeLog(t, dir, "2026-07-05T10:00:01Z stdout F fresh")
 
 	tl2 := driveTailer(dir, exp)
-	tl2.cfg.CheckpointFile = cp
+	tl2.cfg.Positions = mustOpenPositions(t, cp)
 	tl2.scanDir(tl2.loadCheckpoints(), true)
 	tl2.sweep(ctx, true)
 	tl2.flush(ctx)

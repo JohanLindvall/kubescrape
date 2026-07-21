@@ -4,7 +4,38 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"fmt"
+
+	"go.opentelemetry.io/collector/pdata/pcommon"
+	"sigs.k8s.io/yaml"
 )
+
+// LoadDynamicMetrics loads a standalone config file. Production config arrives solely
+// through the unified agent config (cmd/kubescrape-agent -config); this
+// loader survives only for the strict-YAML parse/validate tests here.
+func LoadDynamicMetrics(path string) ([]Dynamic, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var cfg DynamicConfig
+	if err := yaml.UnmarshalStrict(data, &cfg); err != nil {
+		return nil, fmt.Errorf("%s: %w", path, err)
+	}
+	return cfg.Metrics, nil
+}
+
+// Add is the unbound test/bench convenience over add: production exclusively
+// binds a resource first (Bind + BoundResource.Add, which hashes the resource
+// once per flush); the per-call resourceAccum here would be a hot-path
+// regression outside tests.
+func (s *DynamicMetricSet) Add(values func(string) (float64, bool), lookup func(string) string, resource pcommon.Map, line string) {
+	if s == nil || len(s.rules) == 0 {
+		return
+	}
+	s.add(values, lookup, resource, resourceAccum(resource), line)
+}
 
 func TestParseLabelForms(t *testing.T) {
 	get := func(m map[string]string) func(string) string {

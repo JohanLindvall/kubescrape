@@ -67,14 +67,6 @@ func (r *Registry) Gauge(name, desc string) *RegGauge {
 	return &RegGauge{newBound(r.add(name, desc, kindGauge, actionSet, nil), nil)}
 }
 
-// GaugeVec registers a labeled gauge.
-func (r *Registry) GaugeVec(name, desc string, labelNames ...string) *RegGaugeVec {
-	return &RegGaugeVec{vec[RegGauge]{
-		s: r.add(name, desc, kindGauge, actionSet, nil), keys: labelNames,
-		wrap: func(b bound) *RegGauge { return &RegGauge{b} },
-	}}
-}
-
 // GaugeFunc registers a gauge evaluated at export time.
 func (r *Registry) GaugeFunc(name, desc string, fn func() float64) {
 	s := r.add(name, desc, kindGauge, actionSet, nil)
@@ -204,14 +196,6 @@ type RegCounterVec struct{ vec[RegCounter] }
 
 // WithLabelValues binds label values (order matches the registered names).
 func (v *RegCounterVec) WithLabelValues(vals ...string) *RegCounter {
-	return v.with(vals)
-}
-
-// RegGaugeVec is a labeled gauge.
-type RegGaugeVec struct{ vec[RegGauge] }
-
-// WithLabelValues binds label values.
-func (v *RegGaugeVec) WithLabelValues(vals ...string) *RegGauge {
 	return v.with(vals)
 }
 

@@ -3,11 +3,8 @@ package promscrape
 import (
 	"fmt"
 	"math/bits"
-	"os"
 	"regexp"
 	"sort"
-
-	"sigs.k8s.io/yaml"
 )
 
 // FilterConfig declares which scraped series are exported. It is loaded from
@@ -67,27 +64,6 @@ type MetricFilters struct {
 type MetricsConfig struct {
 	Pipelines map[string][]FilterRule `json:"pipelines,omitempty"`
 	Splitters []SplitterConfig        `json:"splitters,omitempty"`
-}
-
-// LoadMetricsConfig reads and compiles the metrics config file.
-func LoadMetricsConfig(path string) (*MetricFilters, []*Splitter, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, nil, err
-	}
-	var cfg MetricsConfig
-	if err := yaml.UnmarshalStrict(data, &cfg); err != nil {
-		return nil, nil, fmt.Errorf("%s: %w", path, err)
-	}
-	filters, err := NewMetricFilters(&FilterConfig{Pipelines: cfg.Pipelines})
-	if err != nil {
-		return nil, nil, fmt.Errorf("%s: %w", path, err)
-	}
-	splitters, err := NewSplitters(cfg.Splitters)
-	if err != nil {
-		return nil, nil, fmt.Errorf("%s: %w", path, err)
-	}
-	return filters, splitters, nil
 }
 
 // NewMetricFilters compiles a FilterConfig.

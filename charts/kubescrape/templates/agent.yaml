@@ -1,12 +1,3 @@
-{{- /* Legacy value keys from before the unified agent config: failing loudly
-beats a --reuse-values upgrade silently dropping the operator's attribute
-templates and metric filters (the agent boots fine without them). */}}
-{{- if .Values.agent.attrsConfig }}
-{{- fail "agent.attrsConfig moved to agent.config.resourceAttributes (unified agent config); migrate your values" }}
-{{- end }}
-{{- if .Values.agent.metricsConfig }}
-{{- fail "agent.metricsConfig moved to agent.config.metrics (unified agent config); migrate your values" }}
-{{- end }}
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -111,11 +102,7 @@ spec:
             - -kubelet-endpoint={{ . }}
             {{- end }}
             - -kubelet-insecure-tls={{ .Values.agent.kubeletInsecureTLS }}
-            {{- if .Values.agent.positionsFile }}
             - -positions-file={{ .Values.agent.positionsFile }}
-            {{- else }}
-            - -checkpoint-file={{ .Values.agent.checkpointFile }}
-            {{- end }}
             - -logs-enrich={{ .Values.agent.logsEnrich }}
             - -logs-file-attributes={{ .Values.agent.logsFileAttributes }}
             {{- if .Values.agent.logsRateLimit }}

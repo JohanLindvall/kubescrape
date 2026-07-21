@@ -130,11 +130,9 @@ agent:
       key: token
 
   logsExcludeNamespaces: [monitoring]
-  checkpointFile: /var/lib/kubescrape-agent/checkpoints.json
-  # A single file for BOTH log offsets and the journald cursor; when set it
-  # overrides checkpointFile for logs, and is the only way to persist the
-  # journald cursor.
-  positionsFile: ""
+  # A single file persisting BOTH log offsets and the journald cursor across
+  # restarts (empty disables persistence).
+  positionsFile: /var/lib/kubescrape-agent/positions.json
   # Parse per-line metadata (timestamp, severity, trace/span IDs, exception
   # details) into the OTLP record fields (JohanLindvall/enrich).
   logsEnrich: true
@@ -155,8 +153,6 @@ agent:
   # so this trades the zero-loss guarantee for bounded fd usage: 0 (never) is
   # the default. Set it only if a node tracks thousands of log files.
   logsIdleClose: 0
-  # Overlap reading with export delivery (one export in flight; at-least-once
-  # semantics unchanged).
   # Stamp log.file.name and log.file.position (byte offset) on every record,
   # for each file source.
   logsFileAttributes: false
@@ -172,7 +168,7 @@ agent:
   # mirrors the shape of the standalone file it replaces:
   #   resourceAttributes: defaults / static / attributes / pipelines
   #   logs:               sources (include/exclude globs, containerd vs plain,
-  #                       per-source attributes / encoding / compressed)
+  #                       per-source attributes / compressed)
   #   logAttributes:      rules lifting JSON/logfmt keys onto attributes
   #   logMetrics:         metrics derived from log lines (see logsMetrics below)
   #   metrics:            scraped-series pipelines filter rules and splitters

@@ -4,7 +4,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"os"
 	"regexp"
 	"slices"
 	"strconv"
@@ -13,7 +12,6 @@ import (
 	"time"
 
 	"go.opentelemetry.io/collector/pdata/pcommon"
-	"sigs.k8s.io/yaml"
 )
 
 // Metric type names, as written in the `type` field of a Dynamic.
@@ -90,20 +88,6 @@ type DynamicConfig struct {
 // lineKey is the synthetic label key that resolves to the whole raw line, so
 // selectors and labels can reference the line contents directly.
 const lineKey = "__line__"
-
-// LoadDynamicMetrics reads a metric specification from a YAML file with a
-// top-level `metrics:` list.
-func LoadDynamicMetrics(path string) ([]Dynamic, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, err
-	}
-	var cfg DynamicConfig
-	if err := yaml.UnmarshalStrict(data, &cfg); err != nil {
-		return nil, fmt.Errorf("%s: %w", path, err)
-	}
-	return cfg.Metrics, nil
-}
 
 // kind resolves the metric type name to a seriesKind.
 func (d *Dynamic) kind() (seriesKind, error) {
@@ -487,19 +471,6 @@ func compileRule(d *Dynamic, cfg *setConfig, shared map[string]*series) (*metric
 		return nil, fmt.Errorf("metric %q: type %q needs a value source — set `value` or `valueRegexp`", d.Name, d.Type)
 	}
 	return rule, nil
-}
-
-// Add evaluates every rule against one log line. lookup(key) returns a label
-// value and values(key) a numeric value (both may be nil); keys they don't
-// resolve fall back to fields parsed straight from line (JSON or logfmt), so a
-// metric can read values and labels off the line itself without any separate
-// logAttributes config. resource is the line's resource attributes, emitted as
-// the metric's OTLP resource (each distinct resource is its own series).
-func (s *DynamicMetricSet) Add(values func(string) (float64, bool), lookup func(string) string, resource pcommon.Map, line string) {
-	if s == nil || len(s.rules) == 0 {
-		return
-	}
-	s.add(values, lookup, resource, resourceAccum(resource), line)
 }
 
 // BoundResource is a DynamicMetricSet bound to one resource, with the

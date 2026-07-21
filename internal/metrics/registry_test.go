@@ -113,13 +113,13 @@ func TestRegistryExport(t *testing.T) {
 	}
 }
 
-// Run exports periodically and once more on shutdown; GaugeVec labels land on
+// Run exports periodically and once more on shutdown; vec labels land on
 // the data points.
 func TestRegistryRun(t *testing.T) {
 	r := NewRegistry()
-	gv := r.GaugeVec("test_run_gauge", "labeled gauge", "shard")
-	gv.WithLabelValues("a").Set(1)
-	gv.WithLabelValues("b").Set(2)
+	cv := r.CounterVec("test_run_counter", "labeled counter", "shard")
+	cv.WithLabelValues("a").Add(1)
+	cv.WithLabelValues("b").Add(2)
 
 	res := pcommon.NewResource()
 	res.Attributes().PutStr("service.name", "run-test")
@@ -139,19 +139,19 @@ func TestRegistryRun(t *testing.T) {
 	cancel()
 	<-done
 
-	m, ok := exp.snapshot().find("test_run_gauge")
+	m, ok := exp.snapshot().find("test_run_counter")
 	if !ok {
-		t.Fatal("gauge never exported")
+		t.Fatal("counter never exported")
 	}
 	vals := map[string]float64{}
-	dps := m.Gauge().DataPoints()
+	dps := m.Sum().DataPoints()
 	for i := 0; i < dps.Len(); i++ {
 		if v, ok := dps.At(i).Attributes().Get("shard"); ok {
 			vals[v.Str()] = dps.At(i).DoubleValue()
 		}
 	}
 	if vals["a"] != 1 || vals["b"] != 2 {
-		t.Fatalf("gauge vec values = %v", vals)
+		t.Fatalf("counter vec values = %v", vals)
 	}
 }
 

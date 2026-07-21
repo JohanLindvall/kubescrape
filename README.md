@@ -247,10 +247,8 @@ OTLP log records with resource attributes (`k8s.pod.name`,
 metadata has not reached the API server yet. Delivery is at-least-once:
 batches (`-logs-batch-size` / `-logs-flush-interval`) are retried, file
 offsets are committed only after a successful export, and committed offsets
-are checkpointed to disk (`-checkpoint-file`) so restarts resume where they
-left off. `-logs-pipelined-export` overlaps reading with delivery (one export
-in flight; its commit/rewind applies before the next flush — the invariants
-are unchanged). Per-file backlog is visible as `kubescrape_log_lag_bytes` and
+are checkpointed to disk (`-positions-file`) so restarts resume where they
+left off. Per-file backlog is visible as `kubescrape_log_lag_bytes` and
 on `GET /debug/tailer`; a per-file line **rate limit** (`-logs-rate-limit`,
 pause or drop) keeps one runaway pod from consuming the pipeline. Set
 `-logs-exclude-namespaces` to the observability namespace to avoid feeding
@@ -426,11 +424,10 @@ The export interval, chunk size and an optional name prefix are runtime flags:
 `-logs-metrics-interval` (default 30s), `-logs-metrics-max-bytes` and
 `-logs-metrics-name-prefix`.
 
-**Positions.** `-checkpoint-file` persists log offsets. `-positions-file`
-persists BOTH log offsets and the journald cursor in a single JSON file (one
-thing to mount), so a restart resumes every input from one place; it overrides
-`-checkpoint-file` for logs and is the only way the journald cursor is
-persisted (without it, journald begins at the tail each start).
+**Positions.** `-positions-file` persists BOTH log offsets and the journald
+cursor in a single JSON file (one thing to mount), so a restart resumes every
+input from one place (without it, offsets reset per `-logs-unknown-files` and
+journald begins at the tail each start).
 
 **Disk buffer** (`-buffer-dir`, opt-in). By default the agent's durability is
 checkpoint-and-rewind: on a collector outage the tailer stops advancing and the

@@ -31,7 +31,6 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"hash/fnv"
@@ -80,10 +79,10 @@ type Config struct {
 	Dir string
 	// Sources selects which files to tail and how (containerd vs plain). Empty
 	// means a single containerd source over Dir.
-	Sources        []Source
-	CheckpointFile string // "" disables the standalone checkpoint file
-	// Positions, when set, persists offsets to the shared positions store
-	// instead of CheckpointFile (which is then ignored).
+	Sources []Source
+	// Positions, when set, persists committed offsets (and, agent-wide, the
+	// journald cursor) to the shared positions store; nil disables
+	// persistence.
 	Positions *positions.Store
 	// Watch uses fsnotify events to trigger reads and discovery; the poll
 	// ticker remains as a fallback for missed events.
@@ -2585,22 +2584,10 @@ func (t *Tailer) rewind(f *file) {
 type checkpoint = positions.LogPos
 
 func (t *Tailer) loadCheckpoints() map[string]checkpoint {
-	if t.cfg.Positions != nil {
-		return t.cfg.Positions.Logs()
-	}
-	if t.cfg.CheckpointFile == "" {
+	if t.cfg.Positions == nil {
 		return nil
 	}
-	data, err := os.ReadFile(t.cfg.CheckpointFile)
-	if err != nil {
-		return nil
-	}
-	var cps map[string]checkpoint
-	if err := json.Unmarshal(data, &cps); err != nil {
-		t.log.Warn("ignoring corrupt checkpoint file", "error", err)
-		return nil
-	}
-	return cps
+	return t.cfg.Positions.Logs()
 }
 
 // extendFingerprint grows a short fingerprint once the file has grown past
@@ -2654,7 +2641,7 @@ func lowerSeverity(s string) string {
 
 // checkpointing reports whether any checkpoint store is configured.
 func (t *Tailer) checkpointing() bool {
-	return t.cfg.Positions != nil || t.cfg.CheckpointFile != ""
+	return t.cfg.Positions != nil
 }
 
 func (t *Tailer) saveCheckpoints() {
@@ -2682,23 +2669,8 @@ func (t *Tailer) saveCheckpoints() {
 		}
 		cps[path] = cp
 	}
-	if t.cfg.Positions != nil {
-		if err := t.cfg.Positions.SetLogs(cps); err != nil {
-			t.log.Warn("writing positions file", "error", err)
-		}
-		return
-	}
-	data, err := json.Marshal(cps)
-	if err != nil {
-		return
-	}
-	tmp := t.cfg.CheckpointFile + ".tmp"
-	if err := positions.WriteFileSync(tmp, data); err != nil {
-		t.log.Warn("writing checkpoint file", "error", err)
-		return
-	}
-	if err := os.Rename(tmp, t.cfg.CheckpointFile); err != nil {
-		t.log.Warn("replacing checkpoint file", "error", err)
+	if err := t.cfg.Positions.SetLogs(cps); err != nil {
+		t.log.Warn("writing positions file", "error", err)
 	}
 }
 

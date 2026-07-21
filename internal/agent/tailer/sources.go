@@ -2,11 +2,9 @@ package tailer
 
 import (
 	"fmt"
-	"os"
 	"path/filepath"
 
 	"github.com/bmatcuk/doublestar/v4"
-	"sigs.k8s.io/yaml"
 
 	"github.com/JohanLindvall/kubescrape/internal/metrics"
 )
@@ -49,19 +47,6 @@ type SourcesConfig struct {
 	// match keeps. Compiled via metrics.NewLineFilter; key resolution matches
 	// the logMetrics selectors, plus the synthetic __severity__ key.
 	Rules []metrics.LineRule `json:"rules,omitempty"`
-}
-
-// LoadSourcesConfig reads log sources from a YAML file.
-func LoadSourcesConfig(path string) ([]Source, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, err
-	}
-	var cfg SourcesConfig
-	if err := yaml.UnmarshalStrict(data, &cfg); err != nil {
-		return nil, fmt.Errorf("%s: %w", path, err)
-	}
-	return ValidateSources(cfg.Sources)
 }
 
 // ValidateSources checks include patterns and globs, returning the sources
@@ -122,17 +107,6 @@ func compileSources(sources []Source, dir string, defaultMultiline bool) []*comp
 }
 
 // matches reports whether path is included by this source and not excluded.
-func (s *compiledSource) matches(path string) bool {
-	included := false
-	for _, g := range s.include {
-		if ok, _ := doublestar.PathMatch(g, path); ok {
-			included = true
-			break
-		}
-	}
-	return included && !s.excluded(path)
-}
-
 // excluded reports whether path hits one of the source's exclude globs. The
 // scan loop uses it directly: glob() output satisfies the includes by
 // construction, and PathMatch re-parses its pattern per call — re-proving

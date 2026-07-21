@@ -136,7 +136,7 @@ func TestFingerprintExtendsWithoutCheckpointStore(t *testing.T) {
 	dir := t.TempDir()
 	ctx := context.Background()
 	exp := &fakeExporter{}
-	tl := driveTailer(dir, exp) // no CheckpointFile, no Positions
+	tl := driveTailer(dir, exp) // no positions store
 
 	tl.scanDir(tl.loadCheckpoints(), true)
 	// Discovered EMPTY: fp.Len == 0.

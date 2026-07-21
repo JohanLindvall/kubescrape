@@ -104,15 +104,19 @@ func writeLog(t *testing.T, dir string, lines ...string) {
 }
 
 func newTestTailer(dir, checkpoint string, exp *fakeExporter) *Tailer {
+	var pos *positions.Store
+	if checkpoint != "" {
+		pos, _ = positions.Open(checkpoint)
+	}
 	tl := New(Config{
-		Dir:            dir,
-		CheckpointFile: checkpoint,
-		PollInterval:   20 * time.Millisecond,
-		FlushInterval:  50 * time.Millisecond,
-		BatchSize:      1000,
-		MetadataWait:   time.Second,
-		Metadata:       fakeMeta{},
-		Exporter:       exp,
+		Dir:           dir,
+		Positions:     pos,
+		PollInterval:  20 * time.Millisecond,
+		FlushInterval: 50 * time.Millisecond,
+		BatchSize:     1000,
+		MetadataWait:  time.Second,
+		Metadata:      fakeMeta{},
+		Exporter:      exp,
 	})
 	tl.retryBackoff = 10 * time.Millisecond
 	return tl
@@ -346,9 +350,11 @@ func TestPositionsStoreResume(t *testing.T) {
 }
 
 func newMultilineTailer(dir, checkpoint string, exp *fakeExporter, pos *positions.Store) *Tailer {
+	if pos == nil && checkpoint != "" {
+		pos, _ = positions.Open(checkpoint)
+	}
 	tl := New(Config{
 		Dir:              dir,
-		CheckpointFile:   checkpoint,
 		Positions:        pos,
 		PollInterval:     20 * time.Millisecond,
 		FlushInterval:    30 * time.Millisecond,

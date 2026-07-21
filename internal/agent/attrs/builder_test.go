@@ -7,8 +7,29 @@ import (
 
 	"go.opentelemetry.io/collector/pdata/pcommon"
 
+	"fmt"
+
 	"github.com/JohanLindvall/kubescrape/pkg/kubemeta"
+	"sigs.k8s.io/yaml"
 )
+
+// LoadConfig loads a standalone config file. Production config arrives solely
+// through the unified agent config (cmd/kubescrape-agent -config); this
+// loader survives only for the strict-YAML parse/validate tests here.
+func LoadConfig(path string) (*Config, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var cfg Config
+	if err := yaml.UnmarshalStrict(data, &cfg); err != nil {
+		return nil, fmt.Errorf("%s: %w", path, err)
+	}
+	if err := cfg.validatePipelines(); err != nil {
+		return nil, fmt.Errorf("%s: %w", path, err)
+	}
+	return &cfg, nil
+}
 
 func testCtx() Context {
 	return Context{

@@ -122,8 +122,7 @@ kubescrape-agent \
 |---|---|---|
 | `-config` | — | single YAML file holding all sections: `resourceAttributes`, `logs`, `logAttributes`, `logMetrics`, `metrics` ([below](#unified-config-file)) |
 | `-log-dir` | `/var/log/containers` | containerd log directory; the default source when the `logs` section is unset |
-| `-checkpoint-file` | — | persists committed offsets across restarts (mount a hostPath); empty disables |
-| `-positions-file` | — | single file holding BOTH log offsets and the journald cursor; overrides `-checkpoint-file` for logs and is the only way to persist the journald cursor |
+| `-positions-file` | — | single JSON file persisting BOTH log offsets and the journald cursor across restarts (mount a hostPath); empty disables persistence |
 | `-logs-watch` | `true` | fsnotify events trigger reads and discovery; polling remains the fallback |
 | `-logs-poll-interval` | `500ms` | fallback sweep interval |
 | `-logs-fingerprint-bytes` | `1024` | file-head hash length used with the inode as file identity (guards against inode reuse and in-place rewrites); negative = inode only |
@@ -142,7 +141,6 @@ kubescrape-agent \
 | `-logs-rate-drop` | `false` | discard lines over the limit instead of pausing (lossy; counted in `kubescrape_log_rate_limited_total{action="drop"}`) |
 | `-logs-unknown-files` | `auto` | where a file with no checkpoint entry starts at startup: `end` (skip as pre-existing history), `start` (read whole), `auto` (start when the checkpoint store already has entries — the file appeared while the agent was down; end on a first-ever run). `auto`/`start` mean adding a new log source ingests those files' existing content |
 | `-logs-idle-close` | `0` | close a fully-caught-up file's fd after this much inactivity (`0` = never). Bounds steady-state fds at one per *active* file rather than one per tracked file — but the open fd is the only handle to a rotated-away or deleted file's remaining bytes, so enabling this **forfeits the zero-loss guarantee** for the tail of a dying file. Set it only where a node tracks thousands of log files |
-| `-logs-pipelined-export` | `false` | overlap reading with export delivery: one export in flight while the sweep keeps reading; its commit/rewind is applied before the next flush (at-least-once semantics unchanged) |
 | `-logs-metrics-interval` | `30s` | export interval for the `logMetrics` metrics ([below](#agent-log-metrics)) |
 | `-logs-metrics-max-bytes` | `3MiB` | export log-derived metrics in chunks below this many bytes (0 = one payload) |
 | `-logs-metrics-name-prefix` | — | prefix prepended to every log-derived metric name |
@@ -410,6 +408,8 @@ never overwrites an attribute the sender set.
 | `-ingest-metrics-mode` | `auto` | `resource` (ID on the resource), `datapoint` (ID per point → split into per-object resources), or `auto` |
 | `-ingest-logs-enrich` | `true` | parse pushed log bodies as `-logs-enrich`, filling only fields the sender left unset |
 | `-ingest-traces` | `true` | accept pushed traces (gRPC + `/v1/traces`), enrich their resources the same way, and pass them through (traces bypass the disk buffer — the pushing sender owns retry) |
+| `-ingest-span-metrics` | `false` | derive RED metrics from ingested spans (OTel spanmetrics conventions: `traces.span.metrics.calls`/`.size`/`.duration` with per-bucket trace-id exemplars), dimensioned by `service.name`/`span.name`/`span.kind`/`status.code` plus the `traceMetrics` config section's extra dimensions. Requires `-ingest-traces` |
+| `-ingest-span-metrics-interval` | `1m` | export interval for the span metrics (exported under the agent's own resource identity; the described service is a data-point label) |
 | `-ingest-peer-ip-fallback` | `false` | attribute telemetry whose resource carries **no** container id / pod uid to the pod owning the connection's peer IP (`GET /v1/pod-ips/{ip}`, live non-hostNetwork pods only). Opt-in: NAT can rewrite peer addresses, and hostNetwork senders share the node IP and never resolve. Counted as `kubescrape_otlp_ingested_total{outcome="peer_ip"}` |
 | `-ingest-batch-items` | `0` | coalesce pushed payloads per signal to this many items (log records / data points / spans) before forwarding, flushing partial batches after `-ingest-batch-timeout` (200ms) or before the encoded payload exceeds `-ingest-batch-bytes` (3 MiB). `0` forwards each request as received. Enqueueing acknowledges the sender (collector batch-processor semantics) — pair with `-buffer-dir` for at-least-once delivery of coalesced batches (note: traces are never disk-buffered, so batching trades the sender's own retry for best-effort delivery of acked spans); a full queue back-pressures senders with a retryable error |
 | `-ingest-batch-bytes` | `3145728` | flush a coalescing batch before its encoded size would exceed this (keeps merged payloads under the collector's 4 MiB gRPC recv default) |

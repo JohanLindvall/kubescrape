@@ -9,7 +9,32 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"sigs.k8s.io/yaml"
 )
+
+// LoadMetricsConfig loads a standalone config file. Production config arrives solely
+// through the unified agent config (cmd/kubescrape-agent -config); this
+// loader survives only for the strict-YAML parse/validate tests here.
+func LoadMetricsConfig(path string) (*MetricFilters, []*Splitter, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, nil, err
+	}
+	var cfg MetricsConfig
+	if err := yaml.UnmarshalStrict(data, &cfg); err != nil {
+		return nil, nil, fmt.Errorf("%s: %w", path, err)
+	}
+	filters, err := NewMetricFilters(&FilterConfig{Pipelines: cfg.Pipelines})
+	if err != nil {
+		return nil, nil, fmt.Errorf("%s: %w", path, err)
+	}
+	splitters, err := NewSplitters(cfg.Splitters)
+	if err != nil {
+		return nil, nil, fmt.Errorf("%s: %w", path, err)
+	}
+	return filters, splitters, nil
+}
 
 func mustFilters(t *testing.T, cfg *FilterConfig) *MetricFilters {
 	t.Helper()

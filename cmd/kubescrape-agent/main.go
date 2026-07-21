@@ -82,8 +82,7 @@ func run() error {
 		logFormat = flag.String("log-format", "text", "log format: text or json")
 
 		logDir            = flag.String("log-dir", "/var/log/containers", "directory of containerd log symlinks (the default source when the config's logs section is unset)")
-		positionsFile     = flag.String("positions-file", "", "single file persisting BOTH log offsets and the journald cursor across restarts (overrides -checkpoint-file for logs; required for journald cursor persistence)")
-		checkpointFile    = flag.String("checkpoint-file", "", "file persisting log read offsets across restarts (empty disables; ignored when -positions-file is set)")
+		positionsFile     = flag.String("positions-file", "", "single file persisting BOTH log offsets and the journald cursor across restarts (empty disables persistence)")
 		logsBatch         = flag.Int("logs-batch-size", 1024, "flush logs after this many entries")
 		logsFlush         = flag.Duration("logs-flush-interval", 2*time.Second, "flush logs at least this often")
 		maxEntryBytes     = flag.Int("logs-max-entry-bytes", 1<<20, "truncate assembled log entries beyond this size")
@@ -335,7 +334,6 @@ func run() error {
 		tl = tailer.New(tailer.Config{
 			Dir:               *logDir,
 			Sources:           logSources,
-			CheckpointFile:    *checkpointFile,
 			Positions:         posStore,
 			LogAttrs:          logAttrs,
 			LogMetrics:        logMetrics,
@@ -368,7 +366,7 @@ func run() error {
 			defer wg.Done()
 			tl.Run(ctx)
 		}()
-		log.Info("log tailer started", "dir", *logDir, "checkpoint", *checkpointFile)
+		log.Info("log tailer started", "dir", *logDir, "positions", *positionsFile)
 	}
 
 	if *journaldOn {

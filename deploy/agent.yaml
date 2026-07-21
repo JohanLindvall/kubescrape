@@ -60,7 +60,7 @@ spec:
           args:
             - -metadata-endpoint=http://kubescrape.monitoring
             - -otlp-endpoint=otel-collector.monitoring:4317
-            - -checkpoint-file=/var/lib/kubescrape-agent/checkpoints.json
+            - -positions-file=/var/lib/kubescrape-agent/positions.json
             - -scrape-interval=30s
             # Do not tail the collector's own output (feedback loop).
             - -logs-exclude-namespaces=monitoring

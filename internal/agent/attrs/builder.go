@@ -11,7 +11,6 @@ import (
 	"text/template"
 
 	"go.opentelemetry.io/collector/pdata/pcommon"
-	"sigs.k8s.io/yaml"
 
 	"github.com/JohanLindvall/kubescrape/pkg/kubemeta"
 )
@@ -76,22 +75,6 @@ type Config struct {
 // (empty for pipelines whose resources are the exporter's own identity). It
 // applies unless the config sets InstancePrefix explicitly.
 var defaultInstancePrefix = map[string]string{"cadvisor": "cadvisor"}
-
-// LoadConfig reads a Config from a YAML file.
-func LoadConfig(path string) (*Config, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, err
-	}
-	var cfg Config
-	if err := yaml.UnmarshalStrict(data, &cfg); err != nil {
-		return nil, fmt.Errorf("%s: %w", path, err)
-	}
-	if err := cfg.validatePipelines(); err != nil {
-		return nil, fmt.Errorf("%s: %w", path, err)
-	}
-	return &cfg, nil
-}
 
 // validatePipelines rejects unknown pipeline names (strict YAML parsing cannot
 // catch bad map keys) and nested pipeline sections. It runs in LoadConfig and

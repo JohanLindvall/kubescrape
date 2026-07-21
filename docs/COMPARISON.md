@@ -103,8 +103,9 @@ magnitude from public benchmarks, not same-machine measurements.
 transform pipelines: Vector ~200–400k events/s/core, Fluent Bit in the same
 range, Promtail/Alloy usually lower once regex stages run. kubescrape reaches
 its number *with* enrichment that comparators need per-app config for. The
-known ceiling: one sweep goroutine per node (a single core), mitigated by
-`-logs-pipelined-export`; Vector/Fluent Bit parallelize across sources.
+known ceiling: one sweep goroutine per node (a single core) — pair with
+`-buffer-dir` to decouple delivery latency from reading;
+Vector/Fluent Bit parallelize across sources.
 
 **Metrics pipeline** — a same-input, same-machine comparison against the
 reference implementation (Prometheus `textparse` v0.313, 12k-sample

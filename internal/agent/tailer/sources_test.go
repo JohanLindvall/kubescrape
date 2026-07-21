@@ -10,7 +10,27 @@ import (
 	"time"
 
 	"github.com/JohanLindvall/kubescrape/internal/agent/attrs"
+
+	"fmt"
+
+	"github.com/bmatcuk/doublestar/v4"
+	"sigs.k8s.io/yaml"
 )
+
+// LoadSourcesConfig loads a standalone config file. Production config arrives solely
+// through the unified agent config (cmd/kubescrape-agent -config); this
+// loader survives only for the strict-YAML parse/validate tests here.
+func LoadSourcesConfig(path string) ([]Source, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var cfg SourcesConfig
+	if err := yaml.UnmarshalStrict(data, &cfg); err != nil {
+		return nil, fmt.Errorf("%s: %w", path, err)
+	}
+	return ValidateSources(cfg.Sources)
+}
 
 func newSourceTailer(exp *fakeExporter, sources []Source, multiline bool) *Tailer {
 	tl := New(Config{
@@ -27,6 +47,21 @@ func newSourceTailer(exp *fakeExporter, sources []Source, multiline bool) *Taile
 	})
 	tl.retryBackoff = 10 * time.Millisecond
 	return tl
+}
+
+// matches reports whether the source would claim path (include minus
+// exclude). Production scans use glob() + excluded() — glob output satisfies
+// the includes by construction — so the combined check lives here, next to
+// the test that pins the include/exclude semantics.
+func (s *compiledSource) matches(path string) bool {
+	included := false
+	for _, g := range s.include {
+		if ok, _ := doublestar.PathMatch(g, path); ok {
+			included = true
+			break
+		}
+	}
+	return included && !s.excluded(path)
 }
 
 func TestSourceMatches(t *testing.T) {

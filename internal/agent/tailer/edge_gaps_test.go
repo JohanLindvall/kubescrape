@@ -280,7 +280,7 @@ func TestNegativeFingerprintBytesInodeOnlyIdentity(t *testing.T) {
 	exp := &fakeExporter{}
 	ckpt := filepath.Join(dir, "ckpt.json")
 	tl := driveTailer(dir, exp)
-	tl.cfg.CheckpointFile = ckpt
+	tl.cfg.Positions = mustOpenPositions(t, ckpt)
 	tl.cfg.FingerprintBytes = -1
 
 	tl.scanDir(tl.loadCheckpoints(), true)
@@ -293,7 +293,7 @@ func TestNegativeFingerprintBytesInodeOnlyIdentity(t *testing.T) {
 	// Restart on the same inode: resume, not re-read.
 	exp2 := &fakeExporter{}
 	tl2 := driveTailer(dir, exp2)
-	tl2.cfg.CheckpointFile = ckpt
+	tl2.cfg.Positions = mustOpenPositions(t, ckpt)
 	tl2.cfg.FingerprintBytes = -1
 	tl2.scanDir(tl2.loadCheckpoints(), true)
 	writeLog(t, dir, "2026-07-05T10:00:01Z stdout F two")
@@ -377,7 +377,7 @@ func TestCheckpointBeyondSizeWithMatchingHeadRestarts(t *testing.T) {
 
 	exp := &fakeExporter{}
 	tl := driveTailer(dir, exp)
-	tl.cfg.CheckpointFile = ckpt
+	tl.cfg.Positions = mustOpenPositions(t, ckpt)
 	tl.cfg.FingerprintBytes = 8 // head-only fingerprint survives the shrink
 
 	tl.scanDir(tl.loadCheckpoints(), true)
@@ -397,7 +397,7 @@ func TestCheckpointBeyondSizeWithMatchingHeadRestarts(t *testing.T) {
 
 	exp2 := &fakeExporter{}
 	tl2 := driveTailer(dir, exp2)
-	tl2.cfg.CheckpointFile = ckpt
+	tl2.cfg.Positions = mustOpenPositions(t, ckpt)
 	tl2.cfg.FingerprintBytes = 8
 	tl2.scanDir(tl2.loadCheckpoints(), true)
 	tl2.sweep(ctx, true)
@@ -411,9 +411,9 @@ func TestCheckpointBeyondSizeWithMatchingHeadRestarts(t *testing.T) {
 	}
 }
 
-// A corrupt standalone checkpoint file must warn-and-continue (files treated
-// as checkpoint-less), and the next save must overwrite it.
-func TestCorruptCheckpointFileIgnored(t *testing.T) {
+// A corrupt positions file must not wedge startup: it loads as empty (files
+// treated as checkpoint-less) and the next save overwrites it.
+func TestCorruptPositionsFileIgnored(t *testing.T) {
 	dir := t.TempDir()
 	ctx := context.Background()
 	ckpt := filepath.Join(dir, "ckpt.json")
@@ -422,7 +422,7 @@ func TestCorruptCheckpointFileIgnored(t *testing.T) {
 	}
 	exp := &fakeExporter{}
 	tl := driveTailer(dir, exp)
-	tl.cfg.CheckpointFile = ckpt
+	tl.cfg.Positions = mustOpenPositions(t, ckpt)
 
 	saved := tl.loadCheckpoints()
 	if len(saved) != 0 {

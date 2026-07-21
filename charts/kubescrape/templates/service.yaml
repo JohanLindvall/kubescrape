@@ -109,7 +109,10 @@ spec:
           livenessProbe:
             httpGet: {path: /healthz, port: http}
           resources: {{ toYaml .Values.service.resources | nindent 12 }}
-      {{- if and .Values.service.events.enabled .Values.service.events.otlp.bearerTokenSecret.name }}
+      {{- /* Gated on the secret alone, matching the volumeMount above: the
+           OTLP output (and its token) also serves the self-metrics push when
+           events are disabled. */}}
+      {{- if .Values.service.events.otlp.bearerTokenSecret.name }}
       volumes:
         - name: otlp-token
           secret:

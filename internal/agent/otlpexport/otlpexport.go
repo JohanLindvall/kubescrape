@@ -35,8 +35,8 @@ type Config struct {
 	// Endpoint is host:port for gRPC, or a base URL (scheme required) for
 	// HTTP, e.g. "otel-collector:4317" or "https://ingest.example.com:443".
 	Endpoint string
-	// Protocol is "grpc" or "http" (OTLP/HTTP protobuf on /v1/logs and
-	// /v1/metrics).
+	// Protocol is "grpc" or "http" (OTLP/HTTP protobuf on /v1/logs,
+	// /v1/metrics and /v1/traces).
 	Protocol string
 	// Insecure uses plaintext for gRPC (ignored for HTTP; use an http:// or
 	// https:// endpoint).

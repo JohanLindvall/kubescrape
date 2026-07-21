@@ -22,7 +22,7 @@ type FileStatus struct {
 	Lag         int64  `json:"lag"`
 	Resolved    bool   `json:"resolved"`
 	Compressed  bool   `json:"compressed,omitempty"`
-	Carried     int    `json:"carriedPrefixes,omitempty"`
+	Segments    int    `json:"segments,omitempty"`
 	RateLimited bool   `json:"rateLimited,omitempty"`
 }
 
@@ -48,7 +48,7 @@ func (t *Tailer) publishStatus() {
 			Committed:   f.committed,
 			Resolved:    f.resolved,
 			Compressed:  f.compressed,
-			Carried:     len(f.segments),
+			Segments:    len(f.segments),
 			RateLimited: f.limited,
 		}
 		if f.source != nil {

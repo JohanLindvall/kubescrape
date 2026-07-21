@@ -2089,13 +2089,13 @@ func (t *Tailer) feedPrefix(ctx context.Context, f *file, p *segment) {
 		path, ok = t.findRotated(f, p)
 		if !ok {
 			obs.LogPrefixLost.Inc()
-			t.log.Warn("carried log prefix source not found; lines from the rotated file are lost",
+			t.log.Warn("rotated segment source not found; its lines are lost",
 				"path", f.path, "inode", p.inode)
 			return
 		}
 		opened, err := os.Open(path)
 		if err != nil {
-			t.log.Warn("opening carried log prefix", "path", path, "error", err)
+			t.log.Warn("opening rotated segment", "path", path, "error", err)
 			return
 		}
 		defer func() { _ = opened.Close() }()
@@ -2104,7 +2104,7 @@ func (t *Tailer) feedPrefix(ctx context.Context, f *file, p *segment) {
 		path = f.path
 	}
 	if _, err := fh.Seek(p.committed, 0); err != nil {
-		t.log.Warn("seeking carried log prefix", "path", path, "error", err)
+		t.log.Warn("seeking rotated segment", "path", path, "error", err)
 		return
 	}
 
@@ -2186,7 +2186,7 @@ func (t *Tailer) drainGone(f *file) {
 			"path", f.path, "containerID", f.containerID)
 		return
 	}
-	// Carried rotated prefixes are OLDER than the current inode's remainder and
+	// Incomplete segments are OLDER than the current inode's remainder and
 	// must enter the pipeline first. readFile normally feeds them, but a gone
 	// file is never read again — without this, the prefixes' unexported lines
 	// would be closed forever by release() once everything else settles (a pod

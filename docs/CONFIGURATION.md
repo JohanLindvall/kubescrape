@@ -10,7 +10,7 @@ kubescrape consists of two binaries built from one image:
 
 Everything is configured through flags plus one optional unified YAML file on
 the agent (`-config`, with `resourceAttributes`, `logs`, `logAttributes`,
-`logMetrics` and `metrics` sections). The
+`logMetrics`, `metrics` and `traceMetrics` sections). The
 [Helm chart](../charts/kubescrape) exposes all of it as values; the raw
 manifests live in [deploy/](../deploy).
 
@@ -49,7 +49,7 @@ kubescrape -listen :8080 -wait-timeout 5s -cache-ttl 5m -log-format json
 | `-servicemonitors` | `false` | serve targets for `monitoring.coreos.com/v1` ServiceMonitors selecting pod-backed Services (endpoint `port`/`targetPort`/`path`/`scheme`; no per-endpoint auth or relabelings). Self-disables with a warning when the CRD is absent |
 | `-events` | `false` | export Kubernetes events as OTLP log records (batched; history from the initial list is skipped; pod events carry full pod resource attributes) |
 | `-self-metrics-interval` | `1m` | export the service's own metrics over OTLP at this interval (0 disables) |
-| `-otlp-*` | as the agent | used by `-events` and the self-metrics push: `-otlp-endpoint`, `-otlp-protocol`, `-otlp-compression`, `-otlp-insecure`, `-otlp-tls-ca-file`, `-otlp-tls-insecure-skip-verify`, `-otlp-bearer-token-file`, `-otlp-timeout` |
+| `-otlp-*` | as the agent | used by `-events` and the self-metrics push: `-otlp-endpoint`, `-otlp-protocol`, `-otlp-compression`, `-otlp-compression-level`, `-otlp-insecure`, `-otlp-tls-ca-file`, `-otlp-tls-insecure-skip-verify`, `-otlp-bearer-token-file`, `-otlp-timeout` |
 | `-log-level` | `info` | `debug`, `info`, `warn`, `error` |
 | `-log-format` | `text` | `text` or `json` (client-go's klog is routed through the same handler) |
 
@@ -75,7 +75,7 @@ RBAC (cluster-wide `get`/`list`/`watch`): `pods`, `services`, `namespaces`,
 | `-node-metadata-refresh` | `1m` | refresh interval for the node's labels/annotations used in attribute templates (0 disables) |
 | `-log-level` / `-log-format` | `info` / `text` | as for the service |
 
-Pipeline toggles (all default `true`):
+Pipeline toggles (all default `true` except the opt-in `-journald`):
 
 | Flag | Enables |
 |---|---|
@@ -152,7 +152,7 @@ Rotation handling (rename, copytruncate — including same-size rewrites —
 deletion) is automatic.
 
 Backlog is observable per node — `kubescrape_log_lag_bytes` (largest per-file
-backlog) and `kubescrape_log_lag_bytes_sum` in the self-metrics — and per file on
+backlog) and `kubescrape_log_lag_total_bytes` in the self-metrics — and per file on
 `GET /debug/tailer` (path, container, read/committed offsets, lag,
 rate-limited flag; refreshed ~10s, largest lag first).
 
@@ -215,6 +215,7 @@ logs:          {sources: [...]}    # see Agent: log sources
 logAttributes: {rules: [...]}      # see Agent: log attributes
 logMetrics:    {metrics: [...]}    # see Agent: log metrics
 metrics:       {pipelines: {...}, splitters: [...]}   # see Metrics config
+traceMetrics:  {dimensions: [...], buckets: [...]}    # see -ingest-span-metrics
 ```
 
 The sections below document each in turn.
@@ -410,7 +411,7 @@ never overwrites an attribute the sender set.
 | `-ingest-traces` | `true` | accept pushed traces (gRPC + `/v1/traces`), enrich their resources the same way, and pass them through (traces bypass the disk buffer — the pushing sender owns retry) |
 | `-ingest-span-metrics` | `false` | derive RED metrics from ingested spans (OTel spanmetrics conventions: `traces.span.metrics.calls`/`.size`/`.duration` with per-bucket trace-id exemplars), dimensioned by `service.name`/`span.name`/`span.kind`/`status.code` plus the `traceMetrics` config section's extra dimensions. Requires `-ingest-traces` |
 | `-ingest-span-metrics-interval` | `1m` | export interval for the span metrics (exported under the agent's own resource identity; the described service is a data-point label) |
-| `-ingest-peer-ip-fallback` | `false` | attribute telemetry whose resource carries **no** container id / pod uid to the pod owning the connection's peer IP (`GET /v1/pod-ips/{ip}`, live non-hostNetwork pods only). Opt-in: NAT can rewrite peer addresses, and hostNetwork senders share the node IP and never resolve. Counted as `kubescrape_otlp_ingested_total{outcome="peer_ip"}` |
+| `-ingest-peer-ip-fallback` | `false` | attribute telemetry whose resource carries **no** container id / pod uid to the pod owning the connection's peer IP (`GET /v1/pod-ips/{ip}`, live non-hostNetwork pods only). Opt-in: NAT can rewrite peer addresses, and hostNetwork senders share the node IP and never resolve. Counted as `kubescrape_ingest_resources_total{outcome="peer_ip"}` |
 | `-ingest-batch-items` | `0` | coalesce pushed payloads per signal to this many items (log records / data points / spans) before forwarding, flushing partial batches after `-ingest-batch-timeout` (200ms) or before the encoded payload exceeds `-ingest-batch-bytes` (3 MiB). `0` forwards each request as received. Enqueueing acknowledges the sender (collector batch-processor semantics) — pair with `-buffer-dir` for at-least-once delivery of coalesced batches (note: traces are never disk-buffered, so batching trades the sender's own retry for best-effort delivery of acked spans); a full queue back-pressures senders with a retryable error |
 | `-ingest-batch-bytes` | `3145728` | flush a coalescing batch before its encoded size would exceed this (keeps merged payloads under the collector's 4 MiB gRPC recv default) |
 | `-ingest-container-id-keys` | `container.id,k8s.container.id` | attribute keys inspected for a container ID |
@@ -419,7 +420,7 @@ never overwrites an attribute the sender set.
 
 A container ID resolves the exact container incarnation; a pod UID resolves
 the pod. Outcomes count into `kubescrape_ingest_resources_total{outcome}`
-(`enriched` / `unresolved`).
+(`enriched` / `unresolved` / `peer_ip`).
 
 ## Agent: metrics scraping
 
@@ -631,7 +632,7 @@ unauthenticated.
 
 ## Helm values
 
-Every flag above maps to a value; `agent.config` is rendered verbatim into the
+The commonly-tuned flags above map to values (the rest are reachable via `agent.extraArgs`/`service.extraArgs`); `agent.config` is rendered verbatim into the
 single mounted `-config` file (with a checksum annotation, so config changes
 roll the DaemonSet). See
 [charts/kubescrape/values.yaml](../charts/kubescrape/values.yaml) for the

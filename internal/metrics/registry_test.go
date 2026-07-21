@@ -180,3 +180,30 @@ func (c *lockedCapExporter) snapshot() *capExporter {
 	cp := &capExporter{md: append([]pmetric.Metrics(nil), c.inner.md...)}
 	return cp
 }
+
+// CounterFunc values are pulled at export time and render as a cumulative
+// monotonic sum (counter semantics for counts owned by foreign atomics).
+func TestRegistryCounterFunc(t *testing.T) {
+	r := NewRegistry()
+	n := 0.0
+	r.CounterFunc("test_func_total", "pulled counter", func() float64 { return n })
+	n = 7
+
+	exp := &capExporter{}
+	if err := r.Export(context.Background(), exp, pcommon.NewResource()); err != nil {
+		t.Fatal(err)
+	}
+	m, ok := exp.find("test_func_total")
+	if !ok {
+		t.Fatal("counter-func never exported")
+	}
+	if m.Type() != pmetric.MetricTypeSum || !m.Sum().IsMonotonic() {
+		t.Fatalf("counter-func rendered as %v (monotonic=%v), want monotonic Sum", m.Type(), m.Sum().IsMonotonic())
+	}
+	// A newly admitted counter zero-backfills two earlier points (counter
+	// birth for Prometheus); the LIVE value is the last data point.
+	dps := m.Sum().DataPoints()
+	if got := dps.At(dps.Len() - 1).DoubleValue(); got != 7 {
+		t.Fatalf("value = %v, want 7", got)
+	}
+}

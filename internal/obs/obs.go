@@ -31,7 +31,7 @@ var (
 		"Log records by the enrichment strategy that matched (json, logfmt, pattern, none).", "format")
 	LogLagBytes = Registry.Gauge("kubescrape_log_lag_bytes",
 		"Largest per-file backlog: bytes on disk not yet exported and committed (per-file breakdown on /debug/tailer).")
-	LogLagBytesTotal = Registry.Gauge("kubescrape_log_lag_bytes_sum",
+	LogLagBytesTotal = Registry.Gauge("kubescrape_log_lag_total_bytes",
 		"Total backlog across tracked files: bytes on disk not yet exported and committed.")
 	LogRateLimited = Registry.CounterVec("kubescrape_log_rate_limited_total",
 		"Per-file line rate limit hits: lines discarded (action=drop) or reads paused (action=pause).", "action")
@@ -131,13 +131,13 @@ var (
 // declared here) and are surfaced as export-time gauges — cumulative since
 // process start.
 func init() {
-	Registry.GaugeFunc("kubescrape_log_metrics_dropped_capped",
+	Registry.CounterFunc("kubescrape_log_metrics_dropped_capped_total",
 		"Log-metric observations dropped since start because the metric's label-set cardinality cap was reached.",
 		func() float64 { return float64(metrics.DroppedCapped()) })
-	Registry.GaugeFunc("kubescrape_log_metrics_dropped_collision",
+	Registry.CounterFunc("kubescrape_log_metrics_dropped_collision_total",
 		"Log-metric observations dropped since start because of a series hash collision.",
 		func() float64 { return float64(metrics.DroppedCollision()) })
-	Registry.GaugeFunc("kubescrape_log_metrics_dropped_nan",
+	Registry.CounterFunc("kubescrape_log_metrics_dropped_nan_total",
 		"Log-metric observations dropped since start because the extracted value was NaN.",
 		func() float64 { return float64(metrics.DroppedNaN()) })
 }

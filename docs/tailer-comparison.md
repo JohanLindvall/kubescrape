@@ -6,9 +6,10 @@ layer, and it supports two things almost nobody else does. This document
 compares the design against the major log shippers and names honestly which
 parts of the complexity are essential and which are self-inflicted.
 
-Sizes as of the deep-audit round: ~3,150 production lines (`tailer.go` 2,723 +
-`sources.go` + `pipelined.go` + `status.go`), 5,607 test lines across 25 test
-files.
+Sizes as of the segment refactor: ~3,000 production lines (`tailer.go` ~2,680
++ `commit.go` + `sources.go` + `status.go`) and roughly twice that in tests.
+The historical sections below describe the PRE-refactor design they analyzed;
+"If it should ever get simpler" records what has since been done.
 
 ## The guarantee matrix
 
@@ -30,8 +31,9 @@ Each competitor weakens at least one leg that this tailer keeps:
 positions back for unsent data: read a line, advance the position, hand the
 entry to a buffered client channel. Crash with data in flight and it is gone —
 an accepted design cost. Delete that one requirement from this tailer and the
-watermark, the ledger FIFOs, the gen-checking, rewind, and the withheld-commit
-machinery all evaporate. That is the single biggest fork in the road.
+watermark, the ledger FIFOs, the segment accounting, rewind, and the
+withheld-commit machinery all evaporate. That is the single biggest fork in
+the road.
 
 **Filebeat** does have the ack-coupled contract — but it buys it with an
 architecture this tailer deliberately avoids: a harvester goroutine per file →
@@ -62,20 +64,22 @@ offset accounting entirely (a crash loses buffered groups).
    input manager + spooler + queue + registrar — well over 10k lines before
    counting libbeat. No single Filebeat file looks scary; the complexity hides
    in the seams between abstractions. The single-sweep-goroutine design means
-   the ledger/watermark/gen *is* the ack plumbing, all in one place. Better
+   the ledger/watermark/segment accounting *is* the ack plumbing, all in one
+   place. Better
    for correctness (the audit rounds could trace every interleaving), worse
    for first impressions.
 
-2. **The cross-rotation multiline join.** The most exotic feature — carried
-   prefixes, gen bumps, re-anchoring, retained fds with caps, checkpoint
-   `Pending` lists, `findRotated` restart recovery. No competitor attempts it;
-   they all break the group at the rotation boundary and ship two
-   half-records. This one guarantee accounts for roughly a third of the
-   package's intricacy, and CLAUDE.md records that the cleaner decomposition
-   (a logical-stream aggregator over a byte-durability layer) is known and
-   deferred. This is the honest "self-inflicted" portion — a real feature, but
-   a rare event, and the deep audit found most of its historical bugs lived
-   exactly here.
+2. **The cross-rotation multiline join.** The most exotic feature — at the
+   time of this analysis: carried prefixes, gen bumps, re-anchoring, retained
+   fds with caps, checkpoint `Pending` lists, `findRotated` restart recovery.
+   No competitor attempts it; they all break the group at the rotation
+   boundary and ship two half-records. This one guarantee accounted for
+   roughly a third of the package's intricacy. The cleaner decomposition (a
+   logical-stream aggregator over a byte-durability layer) has since been
+   DONE — see item 4 below: segment-qualified positions deleted the
+   gen/reanchor protocol outright. This remains the honest "self-inflicted"
+   portion — a real feature, but a rare event, and the deep audit found most
+   of its historical bugs lived exactly here.
 
 3. **Adversarial hardening for cases others document away.** Filebeat's answer
    to copytruncate is "don't". Promtail's answer to buffered-multiline loss is
@@ -95,18 +99,19 @@ why the audits could *prove* properties competitors cannot.
 In descending order of lines saved per guarantee lost:
 
 1. **Drop the cross-rotation join** — accept a split group at rotation like
-   everyone else. Removes the carried/gen/reanchor/findRotated/fd-cap
-   machinery: several hundred lines and the trickiest invariants. The biggest
-   lever by far.
+   everyone else. Post-refactor this means the segment list, feedSegments,
+   findRotated and the fd caps: still the biggest lever, though the segment
+   model has already removed the trickiest invariants (gen/reanchor).
 2. **Decouple send from commit, promtail-style** — positions advance on read.
-   Removes watermarks, rewind, gens, and withheld-highs entirely. Cost:
+   Removes watermarks, rewind, segment commits, and withheld-highs entirely.
+   Cost:
    at-least-once becomes best-effort across crashes. Not recommended — it is
    the product's core promise.
 3. **Drop pipelined export** — an opt-in perf mode whose settle/gen interplay
    is real complexity, for overlap `-buffer-dir` can provide instead.
-   Expanded below. **Done** (branch `tailer-simplify`).
+   Expanded below. **Done** (merged, PR #3).
 4. **Do the deferred decomposition** — same behavior, better factoring.
-   Expanded below. **Done** (branch `tailer-simplify`): offsets are
+   Expanded below. **Done** (merged, PR #3): offsets are
    segment-qualified `pos{seg, off}` values, rotations close the tail into
    per-file `segment` records with individual commit progress, and the
    rotation-generation protocol (`gen`), the buffered-offset rewrite
@@ -116,7 +121,10 @@ In descending order of lines saved per guarantee lost:
 
 ## Expanded: dropping pipelined export
 
-**What it is.** `Config.PipelinedExport` overlaps reading with delivery: flush
+*(Written as the proposal; the removal has since landed. Kept as the record
+of what the mode was and why it went.)*
+
+**What it was.** `Config.PipelinedExport` overlapped reading with delivery: flush
 hands the payload plus its commit information (the `inflight` struct —
 offsets, unclamped highs, per-file generations, carried-release marks) to one
 worker goroutine and keeps sweeping. At most one export is outstanding; its
@@ -124,8 +132,8 @@ result is applied at the next flush, by `pollInflight` in housekeeping (a
 failure must rewind even when no new lines arrive), or by `settle(f)` when
 rotation machinery is about to touch a file the export references.
 
-**What it actually costs.** The feature's price is not the 158 lines of
-`pipelined.go` — it is a *protocol* the rest of the tailer must observe:
+**What it actually cost.** The feature's price was not the 158 lines of
+`pipelined.go` — it was a *protocol* the rest of the tailer had to observe:
 
 - Every path that mutates file state (rename rotation, truncation,
   copytruncate, archive replacement, gone-file drain, drop, shutdown) must
@@ -160,14 +168,19 @@ fsync per append and disk bandwidth, and on diskless or read-only-rootfs nodes
 there is nowhere to put it. Pipelined export exists for exactly that corner —
 overlap without local durability. If that corner is not in the deployment
 matrix, the mode duplicates the buffer's capability at a high invariant cost,
-and removing it deletes `pipelined.go`, every `settle` call site, the
-build-time-freeze subtlety, and four test files, while keeping the gen
-machinery (which rotation needs regardless) and the withheld-commit re-offer
-(which the synchronous path needs too).
+and removing it deleted `pipelined.go`, every `settle` call site, the
+build-time-freeze subtlety, and four test files, while keeping the
+withheld-commit re-offer (which the synchronous path needs too). The gen
+machinery survived this removal but fell to the decomposition below —
+segment-qualified positions made it unnecessary.
 
 ## Expanded: the deferred decomposition
 
-**The entanglement.** `tailer.go` fuses three concerns that change for
+*(Written as the proposal; the decomposition has since landed as described,
+except that no positions-format migration was needed — the checkpoint format
+already was a segment list.)*
+
+**The entanglement.** `tailer.go` fused three concerns that change for
 different reasons:
 
 1. *Byte acquisition and durability* — fd lifecycle, rotation identity

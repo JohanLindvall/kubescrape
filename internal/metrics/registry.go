@@ -75,6 +75,16 @@ func (r *Registry) GaugeFunc(name, desc string, fn func() float64) {
 	r.mu.Unlock()
 }
 
+// CounterFunc registers a monotonic counter whose value is read at export
+// time (for counts owned by another package's atomics). The function must be
+// non-decreasing; it renders as a cumulative monotonic sum.
+func (r *Registry) CounterFunc(name, desc string, fn func() float64) {
+	s := r.add(name, desc, kindCounter, actionSet, nil)
+	r.mu.Lock()
+	r.funcs = append(r.funcs, gaugeFunc{s: s, fn: fn})
+	r.mu.Unlock()
+}
+
 // HistogramVec registers a labeled histogram (nil buckets = the default
 // latency buckets, matching prometheus.DefBuckets).
 func (r *Registry) HistogramVec(name, desc string, buckets []float64, labelNames ...string) *RegHistogramVec {

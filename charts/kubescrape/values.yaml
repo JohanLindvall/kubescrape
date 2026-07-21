@@ -172,6 +172,7 @@ agent:
   #   logAttributes:      rules lifting JSON/logfmt keys onto attributes
   #   logMetrics:         metrics derived from log lines (see logsMetrics below)
   #   metrics:            scraped-series pipelines filter rules and splitters
+  #   traceMetrics:       span-derived RED metrics (see ingestSpanMetrics)
   # See docs/CONFIGURATION.md. Example:
   #   config:
   #     logs:

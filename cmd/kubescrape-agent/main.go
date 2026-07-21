@@ -59,7 +59,7 @@ func agentSelfResource(node string) pcommon.Resource {
 
 func run() error {
 	var (
-		configFile           = flag.String("config", "", "unified YAML config file with resourceAttributes, logs, logAttributes, logMetrics and metrics sections (each mirrors its former standalone file)")
+		configFile           = flag.String("config", "", "unified YAML config file with resourceAttributes, logs, logAttributes, logMetrics, metrics and traceMetrics sections")
 		nodeName             = flag.String("node-name", os.Getenv("NODE_NAME"), "name of the node this agent runs on (default $NODE_NAME)")
 		listen               = flag.String("listen", ":8081", "HTTP listen address for /healthz, /readyz and /debug/tailer (empty disables)")
 		selfMetricsIntv      = flag.Duration("self-metrics-interval", time.Minute, "export the agent's own metrics over OTLP at this interval (0 disables)")
@@ -139,9 +139,9 @@ func run() error {
 		nodeOn     = flag.Bool("node-metrics", true, "scrape <kubelet-endpoint>/metrics (kubelet/node metrics)")
 
 		// OTLP ingest (apps push telemetry to the local agent for enrichment).
-		ingestOn      = flag.Bool("ingest", false, "receive pushed OTLP logs/metrics and enrich them with k8s attributes before forwarding")
+		ingestOn      = flag.Bool("ingest", false, "receive pushed OTLP logs/metrics/traces and enrich them with k8s attributes before forwarding")
 		ingestGRPC    = flag.String("ingest-grpc-endpoint", ":4317", "listen address for pushed OTLP/gRPC (empty disables)")
-		ingestHTTP    = flag.String("ingest-http-endpoint", ":4318", "listen address for pushed OTLP/HTTP protobuf on /v1/logs and /v1/metrics (empty disables)")
+		ingestHTTP    = flag.String("ingest-http-endpoint", ":4318", "listen address for pushed OTLP/HTTP protobuf on /v1/logs, /v1/metrics and /v1/traces (empty disables)")
 		ingestWait    = flag.Duration("ingest-metadata-wait", 0, "how long an ingest metadata lookup may block for not-yet-known objects")
 		ingestMetrics = flag.String("ingest-metrics-mode", "auto", "how pushed metrics resolve their object: resource (id on the resource), datapoint (id on each point, split into per-object resources), or auto")
 		ingestCidKeys = flag.String("ingest-container-id-keys", "container.id,k8s.container.id", "comma-separated attribute keys inspected for a container id")
@@ -399,6 +399,8 @@ func run() error {
 	var fatalErr error
 	if *spanMetrics && !*ingestOn {
 		log.Warn("-ingest-span-metrics ignored: the OTLP ingest receiver is disabled (-ingest=false)")
+	} else if *spanMetrics && !*ingestTraces {
+		log.Warn("-ingest-span-metrics ignored: trace ingestion is disabled (-ingest-traces=false)")
 	}
 	if *ingestOn {
 		enr := otlpingest.NewEnricher(otlpingest.Config{

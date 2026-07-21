@@ -153,6 +153,12 @@ deliberately NOT tombstone-aware — pod IPs are recycled quickly, so a deleted
 pod must never resolve — and hostNetwork pods (which share the node IP) are
 not indexed.
 
+### `GET /v1/nodes/{node}/metadata`
+
+The node's labels and annotations (the agent's `startNodeInfo` provider
+refreshes from this on `-node-metadata-refresh` for `.Node` attribute
+templates).
+
 ### `GET /healthz`, `GET /readyz`, `GET /metrics`
 
 Liveness is always `200`; readiness turns `200` once the initial informer
@@ -204,12 +210,12 @@ to severity Warn, and events about pods get the full pod resource attributes
 (owners, labels) from the store — other objects get `k8s.object.*` plus the
 well-known workload attribute for their kind. Events already in the informer's
 initial list (history) are skipped. The OTLP connection shares the agent's
-exporter flags: `-otlp-endpoint`, `-otlp-protocol`, `-otlp-insecure`,
-`-otlp-tls-ca-file`, `-otlp-tls-insecure-skip-verify`,
-`-otlp-bearer-token-file`, `-otlp-timeout`.
+exporter flags: `-otlp-endpoint`, `-otlp-protocol`, `-otlp-compression`,
+`-otlp-compression-level`, `-otlp-insecure`, `-otlp-tls-ca-file`,
+`-otlp-tls-insecure-skip-verify`, `-otlp-bearer-token-file`, `-otlp-timeout`.
 
 In-cluster it needs `get`/`list`/`watch` on `pods`, `services`, `namespaces`,
-`events`, `replicasets.apps`, `deployments.apps`, `jobs.batch`,
+`nodes`, `events`, `replicasets.apps`, `deployments.apps`, `jobs.batch`,
 `cronjobs.batch` and (optionally) `servicemonitors.monitoring.coreos.com`
 cluster-wide — see [deploy/kubernetes.yaml](deploy/kubernetes.yaml).
 
@@ -255,7 +261,7 @@ pause or drop) keeps one runaway pod from consuming the pipeline. Set
 the collector its own output.
 
 **Unified config file** (`-config`). All of the agent's YAML configuration
-lives in one file, passed with `-config`. It has five optional sections, each
+lives in one file, passed with `-config`. It has six optional sections, each
 described below and each mirroring the shape of the standalone file it
 replaces:
 
@@ -265,6 +271,7 @@ logs:          {sources: [...], rules: [...]}   # what to tail; drop/keep/sample
 logAttributes: {rules: [...]}     # lift line keys onto attributes
 logMetrics:    {metrics: [...]}   # metrics derived from log lines
 metrics:       {pipelines: {...}, splitters: [...]}   # scraped-series rules
+traceMetrics:  {dimensions: [...], buckets: [...]}    # span-derived RED metrics
 ```
 
 **Log sources** (`logs` section). By default the agent tails container logs
@@ -435,7 +442,7 @@ source files *are* the buffer — simple, but a long outage risks loss if those
 files rotate away, and scraped metrics are just dropped and re-scraped. Point
 `-buffer-dir` at a (node-local, persistent) directory and every export instead
 goes through a **disk-backed write-ahead buffer** — separate on-disk FIFO
-spools for logs and metrics (`internal/agent/spool`). A batch is serialized,
+spools for logs and metrics (`pkg/spool`). A batch is serialized,
 `fsync`'d to disk, and acknowledged to the producer immediately (so the tailer
 commits its offsets and the source logs may rotate away), then a background
 sender drains the spool to the collector with retries; a batch is removed only
@@ -667,9 +674,10 @@ collector with a debug exporter; the agent's own internal metrics stay small.
 `make cluster-up` creates a three-node [kind](https://kind.sigs.k8s.io/)
 cluster (one control plane, two workers), downloading `kind` and `kubectl`
 into `hack/bin` if they are not installed. It also deploys sample workloads
-([hack/test-workloads.yaml](hack/test-workloads.yaml)): a Deployment with
-`prometheus.io/*` annotations and a CronJob, so both endpoints and both
-owner-chain shapes (ReplicaSet → Deployment, Job → CronJob) can be exercised:
+([hack/test-workloads.yaml](hack/test-workloads.yaml)): annotated and
+Service-fronted Deployments, a CronJob, a StatefulSet and a DaemonSet, so
+scrape discovery and every owner-chain shape (ReplicaSet → Deployment,
+Job → CronJob, direct owners) can be exercised:
 
 ```sh
 make cluster-up

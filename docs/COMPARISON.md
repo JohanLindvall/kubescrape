@@ -94,12 +94,12 @@ magnitude from public benchmarks, not same-machine measurements.
 
 | Stage | ns/line | allocs |
 |---|---|---|
-| CRI + multiline pipeline + offset ledger | 486 | 2 |
-| + OTLP record building + export | 733 | 6 |
-| + automatic enrichment (production shape) | 1,948 | 7 |
-| + log-metrics + drop rules | 2,387 | 9 |
+| CRI + multiline pipeline + offset ledger | ~210 | 0 |
+| + OTLP record building + export | ~400 | 4 |
+| + automatic enrichment (production shape) | ~780 | 4 |
+| + log-metrics + drop rules | ~1,140 | 5 |
 
-≈ **500k enriched lines/s/core**. Typical published figures for full parse+
+≈ **1.2M enriched lines/s/core**. Typical published figures for full parse+
 transform pipelines: Vector ~200–400k events/s/core, Fluent Bit in the same
 range, Promtail/Alloy usually lower once regex stages run. kubescrape reaches
 its number *with* enrichment that comparators need per-app config for. The

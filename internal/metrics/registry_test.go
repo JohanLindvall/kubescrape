@@ -202,8 +202,45 @@ func TestRegistryCounterFunc(t *testing.T) {
 	}
 	// A newly admitted counter zero-backfills two earlier points (counter
 	// birth for Prometheus); the LIVE value is the last data point.
-	dps := m.Sum().DataPoints()
-	if got := dps.At(dps.Len() - 1).DoubleValue(); got != 7 {
+	last := func(e *capExporter) float64 {
+		m, ok := e.find("test_func_total")
+		if !ok {
+			t.Fatal("counter-func not exported")
+		}
+		dps := m.Sum().DataPoints()
+		return dps.At(dps.Len() - 1).DoubleValue()
+	}
+	if got := last(exp); got != 7 {
 		t.Fatalf("value = %v, want 7", got)
+	}
+
+	// fn returns a CUMULATIVE total: a second export with an unchanged total
+	// must still report 7, not 14 — pushing the total into an accumulating
+	// counter series every export inflated a one-time burst into a permanent
+	// per-interval rate.
+	exp2 := &capExporter{}
+	if err := r.Export(context.Background(), exp2, pcommon.NewResource()); err != nil {
+		t.Fatal(err)
+	}
+	if got := last(exp2); got != 7 {
+		t.Fatalf("second export = %v, want 7 (cumulative fn must not re-add)", got)
+	}
+
+	// Growth appears as growth; a foreign counter reset re-counts from zero.
+	n = 9
+	exp3 := &capExporter{}
+	if err := r.Export(context.Background(), exp3, pcommon.NewResource()); err != nil {
+		t.Fatal(err)
+	}
+	if got := last(exp3); got != 9 {
+		t.Fatalf("third export = %v, want 9", got)
+	}
+	n = 3 // reset (atomic zeroed): the new total counts as fresh growth
+	exp4 := &capExporter{}
+	if err := r.Export(context.Background(), exp4, pcommon.NewResource()); err != nil {
+		t.Fatal(err)
+	}
+	if got := last(exp4); got != 12 {
+		t.Fatalf("post-reset export = %v, want 12 (9 + fresh 3)", got)
 	}
 }

@@ -64,25 +64,13 @@ func (f *file) committedPos() pos {
 	return pos{f.tail, f.committed}
 }
 
-// failBatch rewinds a failed batch's files to their committed offsets and
-// purges any read-ahead entries of those files from the current batch (their
-// bytes will be re-read after the rewind).
+// failBatch rewinds a failed batch's files to their committed offsets; their
+// bytes are re-read after the rewind. (t.batch is always empty here: flush
+// clears it before the synchronous export, and nothing appends during it.)
 func (t *Tailer) failBatch(inf *batchInfo, err error) {
 	t.log.Error("exporting logs failed, rewinding", "records", inf.kept, "error", err)
 	obs.LogExportFailures.Inc()
-	rewound := make(map[*file]bool, len(inf.cands))
 	for f := range inf.cands {
 		t.rewind(f)
-		rewound[f] = true
 	}
-	if len(t.batch) == 0 || len(rewound) == 0 {
-		return
-	}
-	kept := t.batch[:0]
-	for _, e := range t.batch {
-		if !rewound[e.file] {
-			kept = append(kept, e)
-		}
-	}
-	t.batch = kept
 }

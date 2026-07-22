@@ -366,6 +366,9 @@ func run() error {
 			defer wg.Done()
 			tl.Run(ctx)
 		}()
+		if *positionsFile == "" {
+			log.Warn("no -positions-file: offsets are not persisted (a restart re-reads per -logs-unknown-files; journald starts at the tail)")
+		}
 		log.Info("log tailer started", "dir", *logDir, "positions", *positionsFile)
 	}
 
@@ -399,8 +402,6 @@ func run() error {
 	var fatalErr error
 	if *spanMetrics && !*ingestOn {
 		log.Warn("-ingest-span-metrics ignored: the OTLP ingest receiver is disabled (-ingest=false)")
-	} else if *spanMetrics && !*ingestTraces {
-		log.Warn("-ingest-span-metrics ignored: trace ingestion is disabled (-ingest-traces=false)")
 	}
 	if *ingestOn {
 		enr := otlpingest.NewEnricher(otlpingest.Config{

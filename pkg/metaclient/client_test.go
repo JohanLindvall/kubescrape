@@ -314,3 +314,12 @@ func TestCacheHitShallowCopyIsolation(t *testing.T) {
 		t.Fatalf("cache corrupted by caller mutation: %+v", p2)
 	}
 }
+
+func BenchmarkCacheKeyWait(b *testing.B) {
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		if cacheKey("http://x/v1/containers/abcdef0123?wait=2s") != "http://x/v1/containers/abcdef0123" {
+			b.Fatal("bad key")
+		}
+	}
+}

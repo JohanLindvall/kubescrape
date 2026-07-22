@@ -65,7 +65,10 @@ func Open(path string) (*Store, error) {
 		}
 		return nil, err
 	}
-	_ = json.Unmarshal(data, &s.doc) // corrupt file → start empty, overwritten on next Save
+	// A corrupt file must not wedge startup: whatever fields decoded before
+	// the error stay (harmless — re-read is the worst case) and the next
+	// save overwrites the whole doc atomically.
+	_ = json.Unmarshal(data, &s.doc)
 	return s, nil
 }
 
@@ -115,7 +118,7 @@ func (s *Store) save() error {
 		return err
 	}
 	tmp := s.path + ".tmp"
-	if err := WriteFileSync(tmp, data); err != nil {
+	if err := writeFileSync(tmp, data); err != nil {
 		return err
 	}
 	if err := os.Rename(tmp, s.path); err != nil {
@@ -128,9 +131,9 @@ func (s *Store) save() error {
 	return nil
 }
 
-// WriteFileSync is os.WriteFile plus an fsync before close, so a rename that
+// writeFileSync is os.WriteFile plus an fsync before close, so a rename that
 // follows cannot surface a zero-length file after a power loss.
-func WriteFileSync(path string, data []byte) error {
+func writeFileSync(path string, data []byte) error {
 	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
 	if err != nil {
 		return err

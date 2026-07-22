@@ -254,8 +254,13 @@ func (c *Client) getJSON(ctx context.Context, u string, v any) error {
 			reflect.ValueOf(v).Elem().Set(dec.Elem())
 			return nil
 		}
+		if err := json.Unmarshal(body, v); err != nil {
+			// Match the TTL path: an undecodable 200 is an error, not "ok".
+			c.observe(OutcomeError)
+			return err
+		}
 		c.observe(OutcomeOK)
-		return json.Unmarshal(body, v)
+		return nil
 	default:
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
 		if resp.StatusCode == http.StatusNotFound {
@@ -320,8 +325,16 @@ func shallowCopy(dst, src any) bool {
 func cacheKey(u string) string {
 	// Only the container endpoint ever carries a query (?wait=); everything
 	// else skips the parse/re-encode round trip.
-	if !strings.Contains(u, "?") {
+	i := strings.IndexByte(u, '?')
+	if i < 0 {
 		return u
+	}
+	// The common real query is exactly "wait=..." — cut it without the
+	// url.Parse/Encode round trip (~500ns and 5 allocs per Container lookup
+	// on the concurrent ingest path). Anything else (hypothetical future
+	// params) takes the exact strip-and-normalize below.
+	if q := u[i+1:]; strings.HasPrefix(q, "wait=") && !strings.ContainsAny(q, "&;") {
+		return u[:i]
 	}
 	parsed, err := url.Parse(u)
 	if err != nil {

@@ -42,11 +42,13 @@ type fakeExporter struct {
 	full     []plog.Logs    // deep copies of the exported batches
 	resAttrs map[string]any // resource attributes of the last batch
 	batches  int
+	attempts int // every ExportLogs call, including failed ones
 }
 
 func (f *fakeExporter) ExportLogs(_ context.Context, ld plog.Logs) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.attempts++
 	if f.fail > 0 {
 		f.fail--
 		return errors.New("collector down")

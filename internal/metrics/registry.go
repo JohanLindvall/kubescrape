@@ -23,7 +23,7 @@ import (
 type Registry struct {
 	mu     sync.Mutex
 	series []*series
-	funcs  []gaugeFunc
+	funcs  []*gaugeFunc
 }
 
 // registryExpiration keeps snapshot's idle handling permanently inactive —
@@ -33,6 +33,13 @@ const registryExpiration = 200 * 365 * 24 * time.Hour
 type gaugeFunc struct {
 	s  *series
 	fn func() float64
+	// last is the previously pushed cumulative value of a COUNTER func: fn()
+	// returns a running total, but the counter series accumulates observations
+	// (samp.value += v), so each export must push only the delta — pushing the
+	// total re-added the whole count every export, inflating a one-time burst
+	// into a permanent per-interval rate. Only the exporting goroutine touches
+	// it (Run is one goroutine; FinalExport runs after Run has returned).
+	last float64
 }
 
 // NewRegistry creates an empty registry.
@@ -71,7 +78,7 @@ func (r *Registry) Gauge(name, desc string) *RegGauge {
 func (r *Registry) GaugeFunc(name, desc string, fn func() float64) {
 	s := r.add(name, desc, kindGauge, actionSet, nil)
 	r.mu.Lock()
-	r.funcs = append(r.funcs, gaugeFunc{s: s, fn: fn})
+	r.funcs = append(r.funcs, &gaugeFunc{s: s, fn: fn})
 	r.mu.Unlock()
 }
 
@@ -81,7 +88,7 @@ func (r *Registry) GaugeFunc(name, desc string, fn func() float64) {
 func (r *Registry) CounterFunc(name, desc string, fn func() float64) {
 	s := r.add(name, desc, kindCounter, actionSet, nil)
 	r.mu.Lock()
-	r.funcs = append(r.funcs, gaugeFunc{s: s, fn: fn})
+	r.funcs = append(r.funcs, &gaugeFunc{s: s, fn: fn})
 	r.mu.Unlock()
 }
 
@@ -228,11 +235,24 @@ func (h *RegHistogram) Observe(v float64) { h.observe(v) }
 func (r *Registry) Export(ctx context.Context, exp Exporter, res pcommon.Resource) error {
 	r.mu.Lock()
 	series := append([]*series(nil), r.series...)
-	funcs := append([]gaugeFunc(nil), r.funcs...)
+	funcs := append([]*gaugeFunc(nil), r.funcs...)
 	r.mu.Unlock()
 
 	for _, gf := range funcs {
-		gf.s.observe(nil, gf.fn(), resKey{}, emptyResource, nil)
+		v := gf.fn()
+		if gf.s.kind == kindCounter {
+			// Push the delta since the last export (see gaugeFunc.last). A
+			// shrunken value means the underlying counter reset (a foreign
+			// atomic was zeroed): treat the new total as fresh growth.
+			d := v - gf.last
+			if d < 0 {
+				d = v
+			}
+			gf.last = v
+			gf.s.observe(nil, d, resKey{}, emptyResource, nil)
+			continue
+		}
+		gf.s.observe(nil, v, resKey{}, emptyResource, nil)
 	}
 
 	md := pmetric.NewMetrics()

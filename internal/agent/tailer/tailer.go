@@ -1083,6 +1083,29 @@ func (t *Tailer) initFile(f *file, checkpoints map[string]checkpoint, initial bo
 				to:        pp.To,
 			})
 		}
+		// A rotation that happened while the agent was DOWN: the path now
+		// names a DIFFERENT incarnation than the checkpoint. The checkpointed
+		// identity + offset are everything needed to recover the old tail's
+		// remainder from the rotated file — synthesize an open-ended segment
+		// (to = -1: feedSegments reads it to EOF via findRotated and pins the
+		// range, or counts obs.LogPrefixLost and retires it if the runtime
+		// already pruned the file). Previously this remainder was lost
+		// silently and uncounted.
+		if !f.compressed && f.inode != 0 && f.committed > 0 {
+			if st, err := os.Stat(f.path); err == nil && inodeOf(st) != f.inode {
+				f.segSeq++
+				f.segments = append(f.segments, &segment{
+					id:        f.segSeq,
+					inode:     f.inode,
+					fp:        f.fp,
+					committed: f.committed,
+					to:        -1,
+				})
+				f.committed = 0
+				f.inode = 0
+				f.fp = fingerprint{}
+			}
+		}
 		f.newTail()
 	} else if !f.compressed {
 		// Present at startup with no checkpoint entry. Where to start is
@@ -1486,8 +1509,15 @@ func (t *Tailer) readFile(ctx context.Context, f *file) error {
 	case inodeOf(st) != f.inode:
 		// Rename rotation: the path names a new file. Drain what the old
 		// writer appended after our last read, then switch — carrying a
-		// straddling multi-line group across the boundary.
-		t.drainFile(ctx, f)
+		// straddling multi-line group across the boundary. An aborted drain
+		// (mid-drain flush failure rewound this fd) must NOT proceed to
+		// reopen — the old inode is not fully consumed and the segment would
+		// exclude its unread tail; stay on the old inode and retry the whole
+		// rotation next sweep, with the sweep cadence as the backoff.
+		if !t.drainFile(ctx, f) {
+			f.dirty = true
+			return nil
+		}
 		t.reopen(ctx, f, true)
 	case st.Size() < f.readPos:
 		// In-place truncation: the unread tail is gone; restart at zero.
@@ -1740,7 +1770,9 @@ func (t *Tailer) drainArchive(ctx context.Context, f *file) {
 			return
 		}
 	}
-	t.drainReader(ctx, f, f.gz, "archive")
+	// An aborted drain (mid-drain flush failure) retries on a later sweep:
+	// the gone-file loop calls drainGone every sweep until settledGone.
+	_ = t.drainReader(ctx, f, f.gz, "archive")
 }
 
 // closeArchive releases the archive's readers.
@@ -1767,11 +1799,11 @@ func (t *Tailer) closeArchiveReader(f *file) {
 // drainFile reads the (rotated-away or removed) file to EOF so no bytes
 // written between our last read and the rotation are lost. Bounded to keep a
 // still-active writer from pinning the sweep.
-func (t *Tailer) drainFile(ctx context.Context, f *file) {
+func (t *Tailer) drainFile(ctx context.Context, f *file) bool {
 	if f.f == nil {
-		return
+		return true
 	}
-	t.drainReader(ctx, f, f.f, "file")
+	return t.drainReader(ctx, f, f.f, "file")
 }
 
 // drainReader reads r to EOF into f, consuming and flushing as it goes, so a
@@ -1781,7 +1813,15 @@ func (t *Tailer) drainFile(ctx context.Context, f *file) {
 // — kubelet rotates at 10MiB, rate-limit pause mode accumulates arbitrary
 // backlogs); the cap is only a circuit breaker against a source that outruns the
 // drain forever (a writer holding the rotated fd open, or a gzip bomb).
-func (t *Tailer) drainReader(ctx context.Context, f *file, r io.Reader, what string) {
+// drainReader reads r to EOF into the pipeline. It reports false when a
+// mid-drain flush FAILED and rewound this file: the rewind seeks the very fd
+// being drained back to the committed offset, so continuing would re-read the
+// same bytes into a batch whose export just failed — a hot loop burning
+// export attempts on the single sweep goroutine until the 1 GiB cap. The
+// caller must abort and retry the whole drain on a later sweep instead
+// (sweep cadence is the backoff; nothing is lost — the fd stays held and the
+// offsets are rewound).
+func (t *Tailer) drainReader(ctx context.Context, f *file, r io.Reader, what string) bool {
 	const drainCap = 1 << 30
 	buf := t.scratch()
 	if len(f.pending) > 0 {
@@ -1797,13 +1837,18 @@ func (t *Tailer) drainReader(ctx context.Context, f *file, r io.Reader, what str
 			// Bypass the rate limit: pausing a drain would lose the remainder
 			// when the fd is dropped.
 			t.ingestChunk(ctx, f, buf[:n], true)
+			before := f.readPos
 			t.flushDuringDrain(ctx)
+			if f.readPos < before {
+				return false // flush failed and rewound the drained fd
+			}
 		}
 		if err != nil {
-			return
+			return true
 		}
 	}
 	t.log.Error("source still yielding after draining 1GiB, abandoning remainder", "path", f.path, "source", what)
+	return true
 }
 
 // flushDuringDrain keeps a large drain from accumulating everything into one
@@ -2006,26 +2051,54 @@ func (t *Tailer) reopen(ctx context.Context, f *file, renamed bool) {
 		sg.fd, old = old, nil
 		return sg
 	}
+	// The segment's owed range ends at the last FED line boundary, not at
+	// readPos: trailing bytes that never entered the pipeline — a torn final
+	// fragment (counted above), a blank line, a rate-DROPPED or oversized-
+	// discarded line — can never produce a committing entry, and a `to`
+	// covering them pinned the segment below retirement forever (fd + gone
+	// file + checkpoint entry leaked, one per rotation for a writer ending
+	// with a blank line).
+	fedEnd := f.committed
+	for _, st := range f.streams {
+		if st.lastEnd.seg == f.tail && st.lastEnd.off > fedEnd {
+			fedEnd = st.lastEnd.off
+		}
+	}
+	// Whether every PRE-EXISTING segment's owed lines are live (pipeline or
+	// batch) — captured before this rotation appends its own hop. With no
+	// prior segments the answer is vacuously yes (segmentsFed is only
+	// meaningful while segments exist).
+	wasFed := f.segmentsFed || len(f.segments) == 0
 	hopAdded := false
-	if renamed && f.readPos > f.committed {
+	if renamed && fedEnd > f.committed {
 		// Close the tail into a segment: its uncommitted range [committed,
-		// readPos) is owed. If a group is still buffered the pipeline is
+		// fedEnd) is owed. If a group is still buffered the pipeline is
 		// carried below and the segment's items keep their (old-segment)
 		// positions unchanged; either way, if the export of the drained
 		// entries fails (or the process crashes) the rotated-away file is the
 		// only copy, and the segment record is what lets feedSegments re-read
 		// it. It retires in commitBatch once its whole range commits.
 		f.segments = append(f.segments, keep(&segment{
-			id: f.tail, inode: f.inode, fp: f.fp, committed: f.committed, to: f.readPos,
+			id: f.tail, inode: f.inode, fp: f.fp, committed: f.committed, to: fedEnd,
 		}))
 		hopAdded = true
 	}
-	if _, buffered := f.watermark(); renamed && buffered {
+	// segmentsFed asserts EVERY recorded segment's owed lines are live (in
+	// the pipeline or the batch). A mid-drain export failure rewinds and sets
+	// it false — the older segments' re-fed lines were just purged from the
+	// batch — and this rotation must not overclaim them back to "fed": doing
+	// so silently stranded an older rotation's lines until a restart (or
+	// forever without a positions store). The new hop's own lines ARE live
+	// (the drain re-read them after any rewind), so preserving the captured
+	// value is exact.
+	if _, buffered := f.watermark(); renamed && buffered && wasFed {
 		// A group straddles the rotation: carry the pipeline into the new
 		// inode. Buffered items keep their segment-qualified positions — no
 		// re-basing, no generation — and the fresh tail id below makes the
-		// new inode's bytes unambiguous.
-		f.segmentsFed = true // the segments' lines are already live in the pipeline
+		// new inode's bytes unambiguous. (Only when the older segments are
+		// fed: with unfed segments owed, the buffered fragments would sit in
+		// the pipeline AHEAD of the older lines feedSegments must replay
+		// first — flush the group split instead of joining it out of order.)
 	} else {
 		t.stopPipeline(ctx, f)
 		t.newPipeline(f)
@@ -2033,10 +2106,12 @@ func (t *Tailer) reopen(ctx context.Context, f *file, renamed bool) {
 		// still uncommitted, and a second rotation (or a truncation) during a
 		// collector outage does not make them recoverable any other way.
 		// Segments retire individually in commitBatch.
-		if renamed && f.readPos > f.committed {
-			f.segmentsFed = true // drained into the batch; re-read only after a rewind
-		}
 	}
+	// newPipeline's reset cleared segmentsFed; that reset exists for REWINDS
+	// (where the batch was purged). A rotation purges nothing: entries built
+	// from fed segments are still in the unflushed batch, and re-feeding them
+	// would duplicate every one of those records on a plain truncation.
+	f.segmentsFed = wasFed
 	f.newTail()
 	f.inode = 0
 	f.fp = fingerprint{}
@@ -2088,13 +2163,22 @@ func (t *Tailer) feedPrefix(ctx context.Context, f *file, p *segment) {
 		var ok bool
 		path, ok = t.findRotated(f, p)
 		if !ok {
+			// Genuinely gone from disk: count the loss AND retire the record —
+			// an unrecoverable segment kept on the list can never reach its
+			// `to` and would wedge retirement (fd budget, settledGone, the
+			// checkpoint) forever.
 			obs.LogPrefixLost.Inc()
 			t.log.Warn("rotated segment source not found; its lines are lost",
 				"path", f.path, "inode", p.inode)
+			f.retire(p)
 			return
 		}
 		opened, err := os.Open(path)
 		if err != nil {
+			if os.IsNotExist(err) { // pruned between findRotated and open
+				obs.LogPrefixLost.Inc()
+				f.retire(p)
+			}
 			t.log.Warn("opening rotated segment", "path", path, "error", err)
 			return
 		}
@@ -2109,8 +2193,16 @@ func (t *Tailer) feedPrefix(ctx context.Context, f *file, p *segment) {
 	}
 
 	remaining := p.to - p.committed
+	if p.to < 0 {
+		// Open-ended (a rotation that happened while the agent was DOWN: the
+		// checkpoint knows the identity and the committed offset but not
+		// where the rotated file ended). Read to EOF and pin `to` so the
+		// segment can retire.
+		remaining = 1 << 62
+	}
 	var carry []byte
 	cur := p.committed
+	discarding := false // an over-cap line's remainder, dropped to its newline
 	buf := t.scratch()
 	for remaining > 0 {
 		n, rerr := fh.Read(buf[:min(int64(len(buf)), remaining)])
@@ -2120,12 +2212,27 @@ func (t *Tailer) feedPrefix(ctx context.Context, f *file, p *segment) {
 			for {
 				i := bytes.IndexByte(carry, '\n')
 				if i < 0 {
+					// Bound the carried incomplete line exactly as consume
+					// does: a checkpointed segment containing an oversized
+					// line (whose live read was capped and discarded) must
+					// not be slurped whole into memory on replay. The
+					// remainder up to its newline is part of the same line.
+					if len(carry) > t.cfg.MaxEntryBytes+4096 {
+						cur += int64(len(carry))
+						carry = carry[:0]
+						discarding = true
+						obs.LogOversizedDropped.Inc()
+					}
 					break
 				}
 				line := carry[:i]
 				start := cur
 				cur += int64(i + 1)
 				carry = carry[i+1:]
+				if discarding {
+					discarding = false // the newline ends the dropped line
+					continue
+				}
 				if len(line) > 0 {
 					t.feedLine(ctx, f, string(line), start, cur)
 				}
@@ -2133,6 +2240,17 @@ func (t *Tailer) feedPrefix(ctx context.Context, f *file, p *segment) {
 		}
 		if rerr != nil {
 			break
+		}
+	}
+	if p.to < 0 {
+		// The open-ended replay reached EOF: pin the range so entry commits
+		// can retire the segment. Only FED bytes count (a trailing fragment
+		// or blank line can never produce a committing entry) — cur is the
+		// last fed line boundary at this point.
+		if cur > p.committed {
+			p.to = cur
+		} else {
+			f.retire(p) // nothing recoverable was fed
 		}
 	}
 }
@@ -2197,7 +2315,10 @@ func (t *Tailer) drainGone(f *file) {
 		// mid-read leaves the rest readable from the open fd.
 		t.drainArchive(context.Background(), f)
 	} else {
-		t.drainFile(context.Background(), f)
+		// An aborted drain (mid-drain flush failure) is fine here: drainGone
+		// runs every sweep until settledGone, which stays false while the
+		// rewound range is uncommitted.
+		_ = t.drainFile(context.Background(), f)
 	}
 	if len(f.pending) > 0 {
 		// An unterminated final line (a process killed mid-write) can never be

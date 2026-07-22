@@ -87,7 +87,10 @@ func (s *sdSource) next(ctx context.Context) (rawEntry, bool, error) {
 			return rawEntry{}, false, err
 		}
 		if s.skipCursor != "" {
-			skip := cursor == s.skipCursor
+			// TestCursor is the documented comparison: two distinct cursor
+			// strings can name the same entry, so a strcmp can miss the
+			// resume entry and duplicate one record per restart.
+			skip := s.j.TestCursor(s.skipCursor) == nil
 			s.skipCursor = ""
 			if skip {
 				continue // the already-exported resume entry

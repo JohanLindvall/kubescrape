@@ -1,4 +1,11 @@
-package otlpingest
+// Package otlpbatch coalesces pushed OTLP payloads per signal before
+// forwarding, with collector-batch-processor semantics: enqueue acknowledges
+// the sender, a bounded queue back-pressures with a retryable error, and
+// transient export failures retry with capped backoff (bounded by
+// maxDeliverAttempts, then drop+count). It sits between the OTLP-ingest
+// server and the exporter; pair with -buffer-dir for at-least-once delivery
+// of acked batches.
+package otlpbatch
 
 import (
 	"context"
@@ -14,6 +21,19 @@ import (
 	"github.com/JohanLindvall/kubescrape/internal/agent/otlpexport"
 	"github.com/JohanLindvall/kubescrape/internal/obs"
 )
+
+// Exporter forwards logs and metrics; implemented by otlpexport.Client (and
+// Buffered). A consumer-side mirror of otlpingest's interface, so neither
+// package depends on the other for it.
+type Exporter interface {
+	ExportLogs(ctx context.Context, ld plog.Logs) error
+	ExportMetrics(ctx context.Context, md pmetric.Metrics) error
+}
+
+// TracesExporter forwards traces; implemented by otlpexport.Client.
+type TracesExporter interface {
+	ExportTraces(ctx context.Context, td ptrace.Traces) error
+}
 
 // errBatchQueueFull maps to a retryable status for the sender.
 var errBatchQueueFull = errors.New("ingest batch queue full")

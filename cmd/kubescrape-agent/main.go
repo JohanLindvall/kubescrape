@@ -24,6 +24,7 @@ import (
 
 	"github.com/JohanLindvall/kubescrape/internal/agent/attrs"
 	"github.com/JohanLindvall/kubescrape/internal/agent/journald"
+	"github.com/JohanLindvall/kubescrape/internal/agent/otlpbatch"
 	"github.com/JohanLindvall/kubescrape/internal/agent/otlpexport"
 	"github.com/JohanLindvall/kubescrape/internal/agent/otlpingest"
 	"github.com/JohanLindvall/kubescrape/internal/agent/positions"
@@ -456,8 +457,8 @@ func run() error {
 		// drain must see.
 		batchStop := func() {}
 		if *ingestBatch > 0 {
-			batcher := otlpingest.NewBatcher(ingestOut, ingestTraceOut,
-				otlpingest.BatchConfig{Items: *ingestBatch, MaxBatchBytes: *ingestBatchB, Timeout: *ingestBatchTO}, log)
+			batcher := otlpbatch.NewBatcher(ingestOut, ingestTraceOut,
+				otlpbatch.BatchConfig{Items: *ingestBatch, MaxBatchBytes: *ingestBatchB, Timeout: *ingestBatchTO}, log)
 			batchCtx, cancel := context.WithCancel(context.Background())
 			batchStop = cancel
 			wg.Add(1)

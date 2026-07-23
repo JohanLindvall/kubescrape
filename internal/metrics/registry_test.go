@@ -45,6 +45,9 @@ func TestRegistryConcurrentExportAndObserve(t *testing.T) {
 	h := r.HistogramVec("audit_race_hist", "d", []float64{1, 5}, "k")
 	var n atomic.Int64
 	r.GaugeFunc("audit_race_func", "d", func() float64 { return float64(n.Load()) })
+	// A CounterFunc too: its delta state (gaugeFunc.last) is a read-modify-
+	// write that concurrent Exports race on without the per-func mutex.
+	r.CounterFunc("audit_race_cfunc_total", "d", func() float64 { return float64(n.Load()) })
 
 	resAttrs := pcommon.NewResource()
 	stop := make(chan struct{})

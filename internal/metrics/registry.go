@@ -33,12 +33,18 @@ const registryExpiration = 200 * 365 * 24 * time.Hour
 type gaugeFunc struct {
 	s  *series
 	fn func() float64
+	// mu serializes the fn()+delta+observe read-modify-write of `last`
+	// against concurrent Exports. The in-repo wiring is sequential (Run is
+	// one goroutine; FinalExport runs after Run has returned), but the
+	// package's own tests exercise concurrent exporters as a supported
+	// pattern, and unguarded, two overlapping Exports would double-count or
+	// lose counter deltas (and race on `last`).
+	mu sync.Mutex
 	// last is the previously pushed cumulative value of a COUNTER func: fn()
 	// returns a running total, but the counter series accumulates observations
 	// (samp.value += v), so each export must push only the delta — pushing the
 	// total re-added the whole count every export, inflating a one-time burst
-	// into a permanent per-interval rate. Only the exporting goroutine touches
-	// it (Run is one goroutine; FinalExport runs after Run has returned).
+	// into a permanent per-interval rate.
 	last float64
 }
 
@@ -239,6 +245,7 @@ func (r *Registry) Export(ctx context.Context, exp Exporter, res pcommon.Resourc
 	r.mu.Unlock()
 
 	for _, gf := range funcs {
+		gf.mu.Lock()
 		v := gf.fn()
 		if gf.s.kind == kindCounter {
 			// Push the delta since the last export (see gaugeFunc.last). A
@@ -250,9 +257,11 @@ func (r *Registry) Export(ctx context.Context, exp Exporter, res pcommon.Resourc
 			}
 			gf.last = v
 			gf.s.observe(nil, d, resKey{}, emptyResource, nil)
+			gf.mu.Unlock()
 			continue
 		}
 		gf.s.observe(nil, v, resKey{}, emptyResource, nil)
+		gf.mu.Unlock()
 	}
 
 	md := pmetric.NewMetrics()

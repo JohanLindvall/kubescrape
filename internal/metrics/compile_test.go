@@ -158,3 +158,39 @@ func TestNonPositiveMaxAgeRejected(t *testing.T) {
 		}
 	}
 }
+
+// Only `\/` and `\\` are DSL escapes in the /pattern/replacement/ form; any
+// other backslash sequence must reach the regex compiler intact — the escape
+// branch used to eat EVERY backslash, silently compiling `error (d+)` from
+// `error (\d+)` so the replace never fired.
+func TestRegexpReplaceKeepsRegexEscapes(t *testing.T) {
+	cases := []struct {
+		in, pattern, repl string
+	}{
+		{`/error (\d+)/e$1/`, `error (\d+)`, "e$1"},
+		{`/a\/b/x/`, "a/b", "x"},
+		{`/a\\d/y/`, `a\d`, "y"},
+		{`/\s+/ /`, `\s+`, " "},
+	}
+	for _, c := range cases {
+		p, r, err := parseRegexpReplace(c.in)
+		if err != nil {
+			t.Fatalf("%s: %v", c.in, err)
+		}
+		if p != c.pattern || r != c.repl {
+			t.Errorf("%s: got (%q, %q), want (%q, %q)", c.in, p, r, c.pattern, c.repl)
+		}
+	}
+}
+
+// A mask on a missing source field must drop the label, not fabricate one
+// from the mask's literal characters ("_xx" buckets for lines without the
+// field) — matching the plain passthrough's behavior.
+func TestMaskPatternMissingFieldDropsLabel(t *testing.T) {
+	if got := maskPattern("", "_xx"); got != "" {
+		t.Fatalf("maskPattern(missing) = %q, want empty", got)
+	}
+	if got := maskPattern("404", "_xx"); got != "4xx" {
+		t.Fatalf("maskPattern present = %q, want 4xx", got)
+	}
+}

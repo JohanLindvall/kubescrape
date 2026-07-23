@@ -102,7 +102,16 @@ func (ki KeyIndex) Parse(lf *Fields) {
 	buf := unsafe.Slice(unsafe.StringData(lf.line), len(lf.line))
 	_ = logfmt.Iterate(buf, func(key, val []byte) bool {
 		if ki.want[string(key)] {
-			lf.values[string(key)] = string(val)
+			// Iterate yields RAW values (quotes stripped, escapes intact).
+			// Decode them so `msg="a \"b\""` reads as `a "b"` — the JSON path
+			// unescapes, and the same logical value must not match selectors
+			// or mint label values differently depending on the line format.
+			// The fast path (no escapes) costs one byte scan, no copy.
+			if logfmt.NeedsUnescape(val) {
+				lf.values[string(key)] = string(logfmt.Unescape(nil, val))
+			} else {
+				lf.values[string(key)] = string(val)
+			}
 		}
 		return true
 	})

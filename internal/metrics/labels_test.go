@@ -132,3 +132,25 @@ func TestAccumsMatchSeparate(t *testing.T) {
 		}
 	}
 }
+
+// Resource keys are arbitrary config-supplied strings: a key containing '='
+// (or ',', '"', '\') must round-trip String→parseLabels exactly — an
+// unescaped '=' made the parser cut the pair at the wrong place, silently
+// renaming the exported attribute and mangling its value.
+func TestLabelsKeyEscapingRoundTrip(t *testing.T) {
+	in := labels{}
+	in = in.set("evil=key", "v")
+	in = in.set("comma,key", "w")
+	in = in.set(`back\slash`, "x")
+	in = in.set("plain", "y")
+	out, err := parseLabels(in.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if in.String() != out.String() {
+		t.Fatalf("round trip changed the set:\n in: %s\nout: %s", in.String(), out.String())
+	}
+	if got, _ := out.get("evil=key"); got != "v" {
+		t.Fatalf(`get("evil=key") = %q, want "v"`, got)
+	}
+}

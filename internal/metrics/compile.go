@@ -266,6 +266,12 @@ func maskPattern(value, pattern string) string {
 	if pattern == "" {
 		return ""
 	}
+	if value == "" {
+		// A missing source field must not fabricate a label from the mask's
+		// literal characters ("_xx" buckets for lines that lack the field);
+		// an empty value drops the label, matching the plain passthrough.
+		return ""
+	}
 	out := make([]byte, len(pattern))
 	for i := 0; i < len(pattern); i++ {
 		if pattern[i] == '_' && i < len(value) {
@@ -289,6 +295,14 @@ func parseRegexpReplace(in string) (pattern, replacement string, err error) {
 	for _, ch := range in[1:] {
 		switch {
 		case escaped:
+			// Only the DSL's own delimiters are consumed by the escape: `\/`
+			// is a literal slash, `\\` a literal backslash. Any OTHER escape
+			// keeps its backslash so regex classes reach the compiler intact —
+			// consuming it silently turned `error (\d+)` into `error (d+)`,
+			// a pattern that never matches what the user wrote.
+			if ch != '/' && ch != '\\' {
+				buf.WriteRune('\\')
+			}
 			buf.WriteRune(ch)
 			escaped = false
 		case ch == '\\':

@@ -62,7 +62,10 @@ type Dynamic struct {
 	// Labels are the metric's data-point labels, each `set=$get`: a literal
 	// (set=value), a passthrough (set=$key), a masking pattern (set=$key(_xx))
 	// or a regex replace (set=$key/re/repl/). A bare `key` both sets and reads
-	// itself.
+	// itself. In the regex form only `\/` and `\\` are DSL escapes (a literal
+	// slash/backslash); every other backslash sequence passes through to the
+	// regex engine unchanged, so `\d`, `\s` etc. work as written. A mask on a
+	// line missing the source field drops the label (like the passthrough).
 	Labels []string `json:"labels,omitempty"`
 	// ResourceLabels are labels lifted onto the metric's OTLP resource instead
 	// of its data points (same DSL as Labels). Use this to make a log-derived

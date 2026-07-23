@@ -35,3 +35,20 @@ func TestRawScalarString(t *testing.T) {
 		}
 	}
 }
+
+// Logfmt values must decode their escapes like the JSON path does: the same
+// logical value must not match selectors or mint label values differently
+// depending on the line format (raw `a \"b\" c` vs decoded `a "b" c`).
+func TestLogfmtValuesUnescaped(t *testing.T) {
+	ki := NewKeyIndex()
+	ki.Add("msg")
+	ki.Add("plain")
+	var f Fields
+	f.Reset(`msg="a \"b\" c" plain=ok`)
+	if got := ki.Get(&f, "msg"); got != `a "b" c` {
+		t.Fatalf("msg = %q, want unescaped", got)
+	}
+	if got := ki.Get(&f, "plain"); got != "ok" {
+		t.Fatalf("plain = %q", got)
+	}
+}

@@ -124,7 +124,7 @@ func (l labels) String() string {
 		if i > 0 {
 			sb.WriteString(", ")
 		}
-		sb.WriteString(e.key)
+		sb.WriteString(escapeKey(e.key))
 		sb.WriteString(`="`)
 		sb.WriteString(escapeValue(e.value))
 		sb.WriteByte('"')
@@ -142,6 +142,68 @@ func escapeValue(v string) string {
 	return strings.ReplaceAll(v, "\n", `\n`)
 }
 
+// escapeKey escapes a label key: the value escapes plus the key-terminating
+// '=' and the pair-separating ','. Data-point keys are DSL-restricted
+// identifiers and never need it, but RESOURCE keys are arbitrary pcommon map
+// keys from config (attrs templates, logattrs) — an unescaped '=' in one made
+// parseLabels cut the pair at the wrong place, silently renaming the exported
+// attribute and mangling its value.
+func escapeKey(k string) string {
+	if !strings.ContainsAny(k, "=,\"\\\n") {
+		return k
+	}
+	var sb strings.Builder
+	sb.Grow(len(k) + 4)
+	for i := 0; i < len(k); i++ {
+		switch k[i] {
+		case '\\', '=', ',', '"':
+			sb.WriteByte('\\')
+			sb.WriteByte(k[i])
+		case '\n':
+			sb.WriteString(`\n`)
+		default:
+			sb.WriteByte(k[i])
+		}
+	}
+	return sb.String()
+}
+
+// unescapeKey reverses escapeKey. Keys without a backslash return unchanged.
+func unescapeKey(k string) string {
+	if !strings.Contains(k, `\`) {
+		return k
+	}
+	var sb strings.Builder
+	sb.Grow(len(k))
+	for i := 0; i < len(k); i++ {
+		if k[i] == '\\' && i+1 < len(k) {
+			i++
+			if k[i] == 'n' {
+				sb.WriteByte('\n')
+			} else {
+				sb.WriteByte(k[i])
+			}
+			continue
+		}
+		sb.WriteByte(k[i])
+	}
+	return sb.String()
+}
+
+// indexUnescapedEq returns the index of the first '=' not preceded by an
+// (unconsumed) backslash escape, or -1.
+func indexUnescapedEq(s string) int {
+	for i := 0; i < len(s); i++ {
+		switch s[i] {
+		case '\\':
+			i++ // skip the escaped byte
+		case '=':
+			return i
+		}
+	}
+	return -1
+}
+
 var errBadLabelString = errors.New("invalid label string")
 
 // parseLabels parses a `{k="v", ...}` string back into a key-sorted label set.
@@ -152,11 +214,11 @@ func parseLabels(in string) (labels, error) {
 	var out labels
 	s := in[1 : len(in)-1]
 	for s != "" {
-		key, rest, ok := strings.Cut(s, "=")
-		if !ok {
+		eq := indexUnescapedEq(s)
+		if eq < 0 {
 			return nil, errBadLabelString
 		}
-		key = strings.TrimSpace(key)
+		key, rest := unescapeKey(strings.TrimSpace(s[:eq])), s[eq+1:]
 		if key == "" {
 			return nil, errBadLabelString
 		}

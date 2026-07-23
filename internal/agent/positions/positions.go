@@ -11,9 +11,12 @@ import (
 	"encoding/json"
 	"errors"
 	"io/fs"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sync"
+
+	"github.com/JohanLindvall/kubescrape/internal/obs"
 )
 
 // LogPos is one log file's committed position and identity fingerprint.
@@ -67,8 +70,14 @@ func Open(path string) (*Store, error) {
 	}
 	// A corrupt file must not wedge startup: whatever fields decoded before
 	// the error stay (harmless — re-read is the worst case) and the next
-	// save overwrites the whole doc atomically.
-	_ = json.Unmarshal(data, &s.doc)
+	// save overwrites the whole doc atomically. It must not be SILENT
+	// either — recurring corruption across restarts is a failing disk, and
+	// without the count it looks like ordinary restarts with odd re-reads.
+	if err := json.Unmarshal(data, &s.doc); err != nil {
+		obs.PositionsCorrupt.Inc()
+		slog.Warn("positions file corrupt; keeping decodable prefix, affected inputs re-read",
+			"path", path, "error", err)
+	}
 	return s, nil
 }
 

@@ -47,6 +47,9 @@ var (
 		"Disk-buffer read failures while draining (the head frame could not be read; lost=true means the segment was gone and its frames were skipped).", "signal", "lost")
 	LogFifoDropped = Registry.Counter("kubescrape_log_fifo_orphans_total",
 		"Stale per-line offset entries discarded because the multiline stage dropped over-limit lines it never emitted.")
+	PositionsCorrupt = Registry.Counter("kubescrape_positions_corrupt_total",
+		"Positions files that failed to parse at startup (whatever decoded is kept; the affected inputs re-read "+
+			"their window). Recurring bumps across restarts point at a failing disk, not a one-off crash.")
 	LogUnresolvedLost = Registry.Counter("kubescrape_log_unresolved_lost_total",
 		"Log files deleted before their metadata ever resolved (the metadata service was unreachable "+
 			"or the container unknown for the file's whole life). Their content was never read and is lost.")

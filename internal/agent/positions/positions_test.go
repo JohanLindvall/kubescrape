@@ -4,6 +4,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/JohanLindvall/kubescrape/internal/obs"
 )
 
 func TestLogsAndCursorPersistTogether(t *testing.T) {
@@ -57,15 +59,22 @@ func TestOpenMissingAndCorrupt(t *testing.T) {
 		t.Error("missing file not empty")
 	}
 
-	// Corrupt file: tolerated, overwritten on next save.
+	// Corrupt file: tolerated but counted, overwritten on next save.
 	dir := t.TempDir()
 	path := filepath.Join(dir, "corrupt.json")
 	_ = os.WriteFile(path, []byte("{not json"), 0o644)
+	before := obs.PositionsCorrupt.Value()
 	s, _ = Open(path)
+	if got := obs.PositionsCorrupt.Value(); got != before+1 {
+		t.Errorf("PositionsCorrupt = %v, want %v", got, before+1)
+	}
 	if err := s.SetJournalCursor("c"); err != nil {
 		t.Fatal(err)
 	}
 	if s2, _ := Open(path); s2.JournalCursor() != "c" {
 		t.Error("corrupt file not recovered")
+	}
+	if got := obs.PositionsCorrupt.Value(); got != before+1 {
+		t.Error("clean reopen bumped PositionsCorrupt")
 	}
 }

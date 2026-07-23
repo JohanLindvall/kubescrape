@@ -232,6 +232,31 @@ func (s *Store) claimPodIPLocked(rec *record, pod kubemeta.Pod, oldIP string) {
 	}
 }
 
+// promoteIPClaimantLocked re-points byPodIP[ip] at a surviving eligible pod
+// after the current claimant was deleted. Eligibility mirrors
+// claimPodIPLocked: live (not tombstoned), running-phase, non-hostNetwork,
+// status.podIP == ip. A non-terminating claimant is preferred over a
+// terminating one (same precedence the claim path applies); among equals the
+// pick is arbitrary — exactly like concurrent last-write-wins claims.
+func (s *Store) promoteIPClaimantLocked(ip string) {
+	var pick *record
+	for _, r := range s.pods {
+		if !r.expireAt.IsZero() { // tombstoned: not live
+			continue
+		}
+		p := r.pod
+		if p.PodIP != ip || p.HostNetwork || ip == p.HostIP || finishedPhase(p.Phase) {
+			continue
+		}
+		if pick == nil || (pick.terminating && !r.terminating) {
+			pick = r
+		}
+	}
+	if pick != nil {
+		s.byPodIP[ip] = pick
+	}
+}
+
 // cloneOwnerRefs deep-copies owner references: the struct copy alone would
 // alias the informer object's *bool fields (Controller, BlockOwnerDeletion),
 // and stored records must share nothing with informer-owned memory.
@@ -269,6 +294,14 @@ func (s *Store) DeletePod(uid types.UID) {
 	s.removeFromNodeLocked(rec.pod.NodeName, uid)
 	if rec.pod.PodIP != "" && s.byPodIP[rec.pod.PodIP] == rec {
 		delete(s.byPodIP, rec.pod.PodIP)
+		// The deleted claimant may have been STALE: a force-deleted or
+		// node-lost pod (never marked terminating) whose last-write-wins
+		// claim shadowed the live holder. Promote a surviving eligible pod —
+		// without this the live owner stays unresolvable until its next real
+		// update (a same-RV resync short-circuits before re-claiming). The
+		// scan only runs when the deleted pod owned an IP mapping, and only
+		// walks the map once (deletes are informer-rate).
+		s.promoteIPClaimantLocked(rec.pod.PodIP)
 	}
 
 	if s.ttl <= 0 {

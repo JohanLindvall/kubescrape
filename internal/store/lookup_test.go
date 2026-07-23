@@ -348,3 +348,25 @@ func TestLateScheduledPodClaimsRecycledIP(t *testing.T) {
 			np.Pod.UID, ok)
 	}
 }
+
+// Deleting a STALE claimant (force-deleted/node-lost: Running, never marked
+// terminating, its last-write-wins claim shadowing the live holder) must
+// promote the surviving live owner — not orphan the IP until the live pod's
+// next real update (a same-RV resync short-circuits before re-claiming).
+func TestDeleteOfStaleClaimantPromotesLiveOwner(t *testing.T) {
+	s, clk := newTestStore(time.Minute)
+	live := runningPod("live-uid", "live", "1", "10.0.0.5", clk.Now())
+	s.UpsertPod(live)
+	stale := runningPod("stale-uid", "stale", "1", "10.0.0.5", clk.Now()) // ordered after: shadows the live claim
+	s.UpsertPod(stale)
+
+	s.DeletePod(stale.UID)
+
+	got, ok := s.GetPodByIP("10.0.0.5")
+	if !ok {
+		t.Fatal("live IP owner orphaned after stale claimant's deletion")
+	}
+	if got.Pod.Name != "live" {
+		t.Fatalf("promoted %q, want the live owner", got.Pod.Name)
+	}
+}

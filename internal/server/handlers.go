@@ -222,9 +222,16 @@ func (s *Server) waitBudget(r *http.Request) (time.Duration, error) {
 		if ierr != nil {
 			return 0, fmt.Errorf("invalid wait parameter %q: use a duration like 2s", v)
 		}
-		// Guard the multiplication against overflow, then let the shared
+		// Reject negatives BEFORE the multiplication: a large-enough negative
+		// (?wait=-9223372037) overflows time.Duration(secs)*time.Second and
+		// wraps POSITIVE, slipping past the d < 0 check below — inconsistent
+		// with the pinned negatives-are-rejected invariant even though the
+		// clamp bounds it. Then guard positive overflow, and let the shared
 		// duration clamp below apply — clamping by TRUNCATED whole seconds here
 		// would turn a sub-second maxWait into 0 (non-blocking) for ?wait=1.
+		if secs < 0 {
+			return 0, fmt.Errorf("wait parameter must not be negative")
+		}
 		if secs > int(math.MaxInt64/int64(time.Second)) {
 			d = s.maxWait
 		} else {

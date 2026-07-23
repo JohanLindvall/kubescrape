@@ -172,6 +172,16 @@ func (e *Exporter) Run(ctx context.Context) {
 		if len(batch) == 0 {
 			return
 		}
+		if ctx.Err() != nil {
+			// Shutdown racing the ticker/batch-size select: the select can pick
+			// this flush with the run context already cancelled, and the export
+			// would fail instantly (batch dropped) although the ctx.Done branch
+			// one iteration later would have delivered it on a fresh grace
+			// context. Substitute the same grace context here.
+			var cancel context.CancelFunc
+			ctx, cancel = context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+		}
 		if err := e.cfg.Exporter.ExportLogs(ctx, e.convert(batch)); err != nil {
 			// Delivery is best-effort: there are no retries and no spool, so a
 			// failed export loses the batch. Count it like a queue-full drop —

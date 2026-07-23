@@ -40,6 +40,7 @@ func TestWaitParameterEdgeCases(t *testing.T) {
 	// Rejected outright.
 	for _, q := range []string{
 		"wait=-3600",                // negative seconds
+		"wait=-9223372037",          // negative overflow: wraps positive in the naive multiplication
 		"wait=-1h",                  // negative duration
 		"wait=1e18",                 // scientific notation is neither form
 		"wait=99999999999999999999", // overflows int64 in both parsers

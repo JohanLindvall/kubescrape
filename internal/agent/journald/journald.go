@@ -308,10 +308,14 @@ func (r *Reader) stream(ctx context.Context) error {
 
 // sanitize makes one journal message exportable: valid UTF-8 (the journal
 // stores raw bytes) and capped at MaxEntryBytes without splitting a rune.
+// origLen reports the RAW journal length — captured before the UTF-8
+// replacement, whose replacement runes would otherwise inflate/deflate the
+// advertised original size.
 func (r *Reader) sanitize(msg string) (body string, origLen int) {
+	raw := len(msg)
 	msg = strings.ToValidUTF8(msg, "�")
 	if len(msg) > r.cfg.MaxEntryBytes {
-		return truncateRunes(msg, r.cfg.MaxEntryBytes), len(msg)
+		return truncateRunes(msg, r.cfg.MaxEntryBytes), raw
 	}
 	return msg, 0
 }
@@ -409,16 +413,22 @@ func (r *Reader) convert() plog.Logs {
 	for _, e := range r.batch {
 		var extracted logattrs.Result
 		unit := e.unit
+		groupKey := unit
 		if unit == "" {
 			unit = e.ident
+			// Tag ident-derived groups: a syslog identifier that happens to
+			// equal another entry's full unit name must not share its group —
+			// the group's resource carries systemd.unit only for real units,
+			// so sharing mis-attributes whichever entry arrives second.
+			groupKey = "i\x02" + unit
 		}
 		// Line-derived resource/scope attributes split records into their own
 		// resources, so they participate in the grouping key. Without an
 		// extractor the unit alone is the key (no per-entry concatenation).
-		key := unit
+		key := groupKey
 		if r.cfg.LogAttrs != nil {
 			extracted = r.cfg.LogAttrs.Extract(e.body)
-			key = unit + "\x01" + logattrs.Key(extracted.Resource) + "\x01" + logattrs.Key(extracted.Scope)
+			key = groupKey + "\x01" + logattrs.Key(extracted.Resource) + "\x01" + logattrs.Key(extracted.Scope)
 		}
 		sl, ok := scopes[key]
 		if !ok {

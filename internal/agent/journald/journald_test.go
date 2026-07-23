@@ -525,3 +525,40 @@ func TestJournalNoLossBeforeFirstCommit(t *testing.T) {
 		t.Fatalf("records = %v (history must not be re-read, nothing may be lost)", got)
 	}
 }
+
+// An entry with only a syslog identifier must not share a resource group
+// with an entry whose UNIT has the same name: the group's resource carries
+// systemd.unit only for real units, so sharing mis-attributed whichever
+// entry arrived second.
+func TestIdentDoesNotConflateWithUnit(t *testing.T) {
+	entries := []rawEntry{
+		{cursor: "c00", ident: "foo.service", message: "ident-only", priority: "6", realtime: time.Unix(10, 0)},
+		{cursor: "c01", unit: "foo.service", message: "real-unit", priority: "6", realtime: time.Unix(11, 0)},
+	}
+	exp, _ := startReader(t, Config{}, entries, false, 0)
+	waitFor(t, "2 records", func() bool { return len(exp.records()) == 2 })
+
+	exp.mu.Lock()
+	defer exp.mu.Unlock()
+	byBody := map[string]bool{} // body -> resource has systemd.unit
+	for _, ld := range exp.batches {
+		rls := ld.ResourceLogs()
+		for i := 0; i < rls.Len(); i++ {
+			rl := rls.At(i)
+			_, hasUnit := rl.Resource().Attributes().Get("systemd.unit")
+			sls := rl.ScopeLogs()
+			for j := 0; j < sls.Len(); j++ {
+				recs := sls.At(j).LogRecords()
+				for k := 0; k < recs.Len(); k++ {
+					byBody[recs.At(k).Body().AsString()] = hasUnit
+				}
+			}
+		}
+	}
+	if byBody["ident-only"] {
+		t.Fatal("ident-only entry landed on a resource with systemd.unit")
+	}
+	if !byBody["real-unit"] {
+		t.Fatal("real-unit entry lost its systemd.unit resource attribute")
+	}
+}

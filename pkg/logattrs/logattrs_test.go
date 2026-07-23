@@ -203,3 +203,21 @@ func BenchmarkExtractNoMatchJSON(b *testing.B) {
 		}
 	}
 }
+
+// Key must honor the full Attr.Val contract, int64 included: a producer
+// following the contract must not have its values silently dropped from the
+// grouping key (two sets differing only in an int64 value would merge into
+// one mis-attributed resource/scope).
+func TestKeyDistinguishesInt64Values(t *testing.T) {
+	a := Key([]Attr{{Key: "pid", Val: int64(1)}})
+	b := Key([]Attr{{Key: "pid", Val: int64(2)}})
+	if a == b {
+		t.Fatalf("int64 values dropped from the grouping key: %q == %q", a, b)
+	}
+	// And int64 must not alias the float64 or string forms of the same digits.
+	f := Key([]Attr{{Key: "pid", Val: float64(1)}})
+	s := Key([]Attr{{Key: "pid", Val: "1"}})
+	if a == f || a == s {
+		t.Fatalf("int64 aliases another type: i=%q f=%q s=%q", a, f, s)
+	}
+}

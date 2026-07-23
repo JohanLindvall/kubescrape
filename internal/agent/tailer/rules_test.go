@@ -8,12 +8,13 @@ import (
 
 	"go.opentelemetry.io/collector/pdata/pmetric"
 
+	"github.com/JohanLindvall/kubescrape/internal/logline"
 	"github.com/JohanLindvall/kubescrape/internal/metrics"
 )
 
-func mustLineFilter(t *testing.T, rules []metrics.LineRule) *metrics.LineFilter {
+func mustLineFilter(t *testing.T, rules []logline.LineRule) *logline.LineFilter {
 	t.Helper()
-	f, err := metrics.NewLineFilter(rules)
+	f, err := logline.NewLineFilter(rules)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -28,7 +29,7 @@ func TestRulesDrop(t *testing.T) {
 	tl := newTestTailer(dir, "", exp)
 	tl.statusEvery = 30 * time.Millisecond
 	tl.cfg.Enrich = true
-	tl.cfg.Rules = mustLineFilter(t, []metrics.LineRule{
+	tl.cfg.Rules = mustLineFilter(t, []logline.LineRule{
 		{Action: "drop", Match: []string{"__severity__=debug"}},
 	})
 	set, err := metrics.NewDynamicMetricSet([]metrics.Dynamic{{
@@ -75,7 +76,7 @@ func TestRulesAllDropped(t *testing.T) {
 	exp := &fakeExporter{}
 	tl := newTestTailer(dir, "", exp)
 	tl.statusEvery = 30 * time.Millisecond
-	tl.cfg.Rules = mustLineFilter(t, []metrics.LineRule{
+	tl.cfg.Rules = mustLineFilter(t, []logline.LineRule{
 		{Action: "drop", MatchRegexp: []string{"__line__=."}},
 	})
 	stop := startTailer(t, tl)
@@ -100,7 +101,7 @@ func TestRulesSample(t *testing.T) {
 	dir := t.TempDir()
 	exp := &fakeExporter{}
 	tl := newTestTailer(dir, "", exp)
-	tl.cfg.Rules = mustLineFilter(t, []metrics.LineRule{
+	tl.cfg.Rules = mustLineFilter(t, []logline.LineRule{
 		{Action: "keep", MatchRegexp: []string{"__line__=chatty"}, Sample: 0.5},
 	})
 	stop := startTailer(t, tl)

@@ -30,6 +30,7 @@ import (
 	"github.com/JohanLindvall/kubescrape/internal/agent/promscrape"
 	"github.com/JohanLindvall/kubescrape/internal/agent/spanmetrics"
 	"github.com/JohanLindvall/kubescrape/internal/agent/tailer"
+	"github.com/JohanLindvall/kubescrape/internal/logline"
 	"github.com/JohanLindvall/kubescrape/internal/metrics"
 	"github.com/JohanLindvall/kubescrape/internal/obs"
 	"github.com/JohanLindvall/kubescrape/pkg/logattrs"
@@ -322,12 +323,12 @@ func run() error {
 	var tl *tailer.Tailer // exposed on /debug/tailer when logs are on
 	if *logsOn {
 		var logSources []tailer.Source
-		var logRules *metrics.LineFilter
+		var logRules *logline.LineFilter
 		if fileCfg.Logs != nil {
 			if logSources, err = tailer.ValidateSources(fileCfg.Logs.Sources); err != nil {
 				return fmt.Errorf("logs config: %w", err)
 			}
-			if logRules, err = metrics.NewLineFilter(fileCfg.Logs.Rules); err != nil {
+			if logRules, err = logline.NewLineFilter(fileCfg.Logs.Rules); err != nil {
 				return fmt.Errorf("logs config: %w", err)
 			}
 		}

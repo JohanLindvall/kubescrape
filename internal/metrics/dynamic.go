@@ -12,6 +12,8 @@ import (
 	"time"
 
 	"go.opentelemetry.io/collector/pdata/pcommon"
+
+	"github.com/JohanLindvall/kubescrape/internal/logline"
 )
 
 // Metric type names, as written in the `type` field of a Dynamic.
@@ -85,10 +87,6 @@ type DynamicConfig struct {
 	Metrics []Dynamic `json:"metrics"`
 }
 
-// lineKey is the synthetic label key that resolves to the whole raw line, so
-// selectors and labels can reference the line contents directly.
-const lineKey = "__line__"
-
 // kind resolves the metric type name to a seriesKind.
 func (d *Dynamic) kind() (seriesKind, error) {
 	switch strings.ToLower(d.Type) {
@@ -152,7 +150,7 @@ type labelTemplate struct {
 // feeds it.
 type metricRule struct {
 	series    *series
-	match     *selectorSet
+	match     *logline.Selectors
 	labels    []labelTemplate // data-point labels
 	resLabels []labelTemplate // labels lifted onto the resource
 	value     string
@@ -200,8 +198,8 @@ func (r *metricRule) readValue(values func(string) (float64, bool), line string)
 // it matches. buf/rbuf are reused for the data-point and resource label sets and
 // returned (set may grow them). resAccum is the hash of res (the line's resource
 // attributes), computed once by the caller.
-func (r *metricRule) observe(values func(string) (float64, bool), lookup func(string) string, res pcommon.Map, resAccum resKey, line string, ctx *matchContext, buf, rbuf labels) (labels, labels) {
-	if !r.match.match(lookup, ctx) {
+func (r *metricRule) observe(values func(string) (float64, bool), lookup func(string) string, res pcommon.Map, resAccum resKey, line string, ctx *logline.MatchContext, buf, rbuf labels) (labels, labels) {
+	if !r.match.Match(lookup, ctx) {
 		return buf, rbuf
 	}
 	var value float64
@@ -300,7 +298,7 @@ func WithLogger(l *slog.Logger) Option {
 // DynamicMetricSet is a set of log-derived metrics evaluated per line.
 type DynamicMetricSet struct {
 	rules []*metricRule
-	keys  keyIndex
+	keys  logline.KeyIndex
 	pool  sync.Pool
 	log   *slog.Logger
 	// Count is the number of configured rules.
@@ -312,10 +310,10 @@ type DynamicMetricSet struct {
 // line's evaluation allocates no closures; the per-line inputs live in the
 // set/values/lookup/raw fields.
 type addContext struct {
-	ctx  matchContext
+	ctx  logline.MatchContext
 	buf  labels // data-point labels
 	rbuf labels // resource labels
-	line lineFields
+	line logline.Fields
 
 	set     *DynamicMetricSet
 	values  func(string) (float64, bool)
@@ -329,7 +327,7 @@ type addContext struct {
 // raw line; otherwise the caller's own lookup (record/resource attributes)
 // wins and the line's parsed fields are the fallback.
 func (ac *addContext) labelLookup(key string) string {
-	if key == lineKey {
+	if key == logline.LineKey {
 		return ac.raw
 	}
 	if ac.lookup != nil {
@@ -337,7 +335,7 @@ func (ac *addContext) labelLookup(key string) string {
 			return v
 		}
 	}
-	return ac.set.keys.get(&ac.line, key)
+	return ac.set.keys.Get(&ac.line, key)
 }
 
 // valueLookup resolves a numeric key the same way.
@@ -347,7 +345,7 @@ func (ac *addContext) valueLookup(key string) (float64, bool) {
 			return v, true
 		}
 	}
-	raw := ac.set.keys.get(&ac.line, key)
+	raw := ac.set.keys.Get(&ac.line, key)
 	if raw == "" {
 		return 0, false
 	}
@@ -379,7 +377,7 @@ func NewDynamicMetricSet(metrics []Dynamic, opts ...Option) (*DynamicMetricSet, 
 		}
 		set.rules = append(set.rules, rule)
 	}
-	set.keys = newKeyIndex(set.rules)
+	set.keys = buildKeyIndex(set.rules)
 	set.Count = len(set.rules)
 	return set, nil
 }
@@ -411,7 +409,7 @@ func compileRule(d *Dynamic, cfg *setConfig, shared map[string]*series) (*metric
 			return nil, fmt.Errorf("invalid valueRegexp: %w", err)
 		}
 	}
-	if rule.match, err = parseSelectors(d.Match, d.MatchRegexp); err != nil {
+	if rule.match, err = logline.ParseSelectors(d.Match, d.MatchRegexp); err != nil {
 		return nil, err
 	}
 	if rule.labels, err = parseLabelTemplates(d.Labels, d.LabelPrefix); err != nil {
@@ -503,8 +501,8 @@ func (b BoundResource) Add(values func(string) (float64, bool), lookup func(stri
 
 func (s *DynamicMetricSet) add(values func(string) (float64, bool), lookup func(string) string, resource pcommon.Map, resAccum resKey, line string) {
 	ac := s.pool.Get().(*addContext)
-	ac.ctx.reset()
-	ac.line.reset(line)
+	ac.ctx.Reset()
+	ac.line.Reset(line)
 	ac.values, ac.lookup, ac.raw = values, lookup, line
 
 	for _, rule := range s.rules {
@@ -671,4 +669,23 @@ func parseRegexpReplace(in string) (pattern, replacement string, err error) {
 		return "", "", errors.New("must be in the form /pattern/replacement/")
 	}
 	return parts[0], parts[1], nil
+}
+
+// buildKeyIndex collects the distinct field keys referenced across rules:
+// label getters, the observed value, and selector labels.
+func buildKeyIndex(rules []*metricRule) logline.KeyIndex {
+	ki := logline.NewKeyIndex()
+	for _, r := range rules {
+		ki.Add(r.value)
+		for _, lt := range r.labels {
+			ki.Add(lt.getKey)
+		}
+		for _, lt := range r.resLabels {
+			ki.Add(lt.getKey)
+		}
+		for _, key := range r.match.LabelKeys() {
+			ki.Add(key)
+		}
+	}
+	return ki
 }

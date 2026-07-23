@@ -54,6 +54,7 @@ import (
 	"github.com/JohanLindvall/kubescrape/internal/agent/attrs"
 	"github.com/JohanLindvall/kubescrape/internal/agent/logenrich"
 	"github.com/JohanLindvall/kubescrape/internal/agent/positions"
+	"github.com/JohanLindvall/kubescrape/internal/logline"
 	"github.com/JohanLindvall/kubescrape/internal/metrics"
 	"github.com/JohanLindvall/kubescrape/internal/obs"
 	"github.com/JohanLindvall/kubescrape/pkg/kubemeta"
@@ -158,7 +159,7 @@ type Config struct {
 	// all). Evaluated after enrichment — severity is matchable via the
 	// synthetic __severity__ key — and after LogMetrics, so metrics still see
 	// every line. Dropped records advance offsets like exported ones.
-	Rules *metrics.LineFilter
+	Rules *logline.LineFilter
 	// Attrs builds the exported resource attributes (nil = defaults).
 	Attrs *attrs.Builder
 	// NodeInfo supplies the agent node's metadata for attribute templates

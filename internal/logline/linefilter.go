@@ -1,4 +1,4 @@
-package metrics
+package logline
 
 import (
 	"errors"
@@ -30,12 +30,12 @@ type LineRule struct {
 // rule are kept. Compiled once, evaluated per exported log record.
 type LineFilter struct {
 	rules []lineFilterRule
-	keys  keyIndex
+	keys  KeyIndex
 	pool  sync.Pool
 }
 
 type lineFilterRule struct {
-	match  *selectorSet
+	match  *Selectors
 	drop   bool
 	every  uint64 // keep 1 in every (0 = all)
 	picked atomic.Uint64
@@ -44,8 +44,8 @@ type lineFilterRule struct {
 // filterCtx is the pooled per-line evaluation state, mirroring addContext:
 // the lookup closure is bound once so evaluation allocates nothing.
 type filterCtx struct {
-	ctx    matchContext
-	line   lineFields
+	ctx    MatchContext
+	line   Fields
 	filter *LineFilter
 	lookup func(string) string
 	raw    string
@@ -53,7 +53,7 @@ type filterCtx struct {
 }
 
 func (fc *filterCtx) resolve(key string) string {
-	if key == lineKey {
+	if key == LineKey {
 		return fc.raw
 	}
 	if fc.lookup != nil {
@@ -61,7 +61,7 @@ func (fc *filterCtx) resolve(key string) string {
 			return v
 		}
 	}
-	return fc.filter.keys.get(&fc.line, key)
+	return fc.filter.keys.Get(&fc.line, key)
 }
 
 // NewLineFilter compiles rules; empty input yields a nil filter (keep all).
@@ -69,7 +69,7 @@ func NewLineFilter(rules []LineRule) (*LineFilter, error) {
 	if len(rules) == 0 {
 		return nil, nil
 	}
-	f := &LineFilter{keys: keyIndex{want: map[string]bool{}}}
+	f := &LineFilter{keys: NewKeyIndex()}
 	f.rules = make([]lineFilterRule, len(rules))
 	for i := range rules {
 		r := &rules[i]
@@ -96,13 +96,13 @@ func NewLineFilter(rules []LineRule) (*LineFilter, error) {
 		if len(r.Match) == 0 && len(r.MatchRegexp) == 0 {
 			return nil, errors.New("logs rule: empty match would apply to every line; use an explicit __line__ selector instead")
 		}
-		match, err := parseSelectors(r.Match, r.MatchRegexp)
+		match, err := ParseSelectors(r.Match, r.MatchRegexp)
 		if err != nil {
 			return nil, fmt.Errorf("logs rule %d: %w", i, err)
 		}
 		cr.match = match
-		for _, key := range match.labelKeys() {
-			f.keys.add(key)
+		for _, key := range match.LabelKeys() {
+			f.keys.Add(key)
 		}
 	}
 	f.pool = sync.Pool{New: func() any {
@@ -121,14 +121,14 @@ func (f *LineFilter) Keep(lookup func(string) string, line string) bool {
 		return true
 	}
 	fc := f.pool.Get().(*filterCtx)
-	fc.ctx.reset()
-	fc.line.reset(line)
+	fc.ctx.Reset()
+	fc.line.Reset(line)
 	fc.lookup, fc.raw = lookup, line
 
 	keep := true
 	for i := range f.rules {
 		r := &f.rules[i]
-		if !r.match.match(fc.fn, &fc.ctx) {
+		if !r.match.Match(fc.fn, &fc.ctx) {
 			continue
 		}
 		keep = !r.drop

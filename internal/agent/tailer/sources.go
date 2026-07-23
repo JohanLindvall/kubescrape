@@ -6,7 +6,7 @@ import (
 
 	"github.com/bmatcuk/doublestar/v4"
 
-	"github.com/JohanLindvall/kubescrape/internal/metrics"
+	"github.com/JohanLindvall/kubescrape/internal/logline"
 )
 
 // Source selects a set of log files by glob and declares how to handle them.
@@ -44,9 +44,9 @@ type SourcesConfig struct {
 	Sources []Source `json:"sources"`
 	// Rules are ordered first-match-wins keep/drop/sample rules applied to
 	// every exported log record (all sources; journald is not filtered). No
-	// match keeps. Compiled via metrics.NewLineFilter; key resolution matches
+	// match keeps. Compiled via logline.NewLineFilter; key resolution matches
 	// the logMetrics selectors, plus the synthetic __severity__ key.
-	Rules []metrics.LineRule `json:"rules,omitempty"`
+	Rules []logline.LineRule `json:"rules,omitempty"`
 }
 
 // ValidateSources checks include patterns and globs, returning the sources

@@ -3,6 +3,7 @@ package tailer
 import (
 	"testing"
 
+	"github.com/JohanLindvall/kubescrape/internal/logline"
 	"github.com/JohanLindvall/kubescrape/internal/metrics"
 	"github.com/JohanLindvall/kubescrape/internal/obs"
 	"github.com/JohanLindvall/kubescrape/pkg/logattrs"
@@ -40,7 +41,7 @@ func TestMetricResolverRecordAndResourceAttrs(t *testing.T) {
 
 	// A drop rule keyed on the RECORD attribute (metricResolver.ruleLookup's
 	// attribute arm): lines with req.ms=13 are dropped from export.
-	tl.cfg.Rules = mustLineFilter(t, []metrics.LineRule{
+	tl.cfg.Rules = mustLineFilter(t, []logline.LineRule{
 		{Action: "drop", Match: []string{"req.ms=13"}},
 	})
 

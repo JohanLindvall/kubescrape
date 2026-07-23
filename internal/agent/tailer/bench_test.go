@@ -9,6 +9,7 @@ import (
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/plog"
 
+	"github.com/JohanLindvall/kubescrape/internal/logline"
 	"github.com/JohanLindvall/kubescrape/internal/metrics"
 )
 
@@ -114,7 +115,7 @@ func BenchmarkIngestFlush(b *testing.B) {
 					b.Fatal(err)
 				}
 				cfg.LogMetrics = set
-				rules, err := metrics.NewLineFilter([]metrics.LineRule{
+				rules, err := logline.NewLineFilter([]logline.LineRule{
 					{Action: "drop", Match: []string{"__severity__=debug"}},
 				})
 				if err != nil {

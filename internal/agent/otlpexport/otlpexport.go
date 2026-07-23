@@ -137,6 +137,9 @@ func New(cfg Config) (*Client, error) {
 		}
 		callOpts := []grpc.CallOption{grpc.MaxCallSendMsgSize(64 * 1024 * 1024)}
 		if cfg.Compression == "gzip" {
+			if err := assertGzipCodec(); err != nil {
+				return nil, err
+			}
 			callOpts = append(callOpts, grpc.UseCompressor(gzipName))
 		}
 		conn, err := grpc.NewClient(cfg.Endpoint,
@@ -163,6 +166,17 @@ func New(cfg Config) (*Client, error) {
 			// One collector host; the ingest receiver forwards concurrently,
 			// so two idle connections would re-dial under load.
 			Transport: &http.Transport{TLSClientConfig: tlsCfg, MaxIdleConnsPerHost: 16, MaxIdleConns: 16, IdleConnTimeout: 90 * time.Second},
+			// Never follow redirects: Go converts a redirected POST to a
+			// body-less GET (301/302/303), so an http→https-redirecting
+			// ingress would either get a 200 from the wrong endpoint (a
+			// false ack — offsets commit, records were never delivered) or
+			// a 405 from the collector's GET handler (classified permanent
+			// — the buffered drain would drop the whole backlog). Surfacing
+			// the 3xx as a status error keeps it transient: the backlog
+			// survives until the endpoint config is fixed.
+			CheckRedirect: func(*http.Request, []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
 		}
 	default:
 		return nil, fmt.Errorf("protocol %q (want grpc or http)", cfg.Protocol)

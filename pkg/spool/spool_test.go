@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"testing"
 )
 
@@ -595,4 +596,60 @@ func TestCrashRecoveryDeliversUncommitted(t *testing.T) {
 		t.Fatalf("post-crash append Pop = %q (ok=%v)", got, ok)
 	}
 	commit()
+}
+
+// A commit held across a later Pop that skipped a vanished head segment must
+// become a no-op: applying its stale offset to the NEW head would silently
+// retire never-delivered records (the head's seq is captured at Pop time and
+// re-checked at commit).
+func TestStaleCommitAfterSkippedHeadIsNoop(t *testing.T) {
+	dir := t.TempDir()
+	s, err := Open(dir, Options{SegmentBytes: 16}) // tiny: every record rotates
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = s.Close() }()
+
+	// Two records in two segments (rotation on exceeding SegmentBytes).
+	if err := s.Append([]byte("record-one-is-long")); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Append([]byte("record-two-is-long")); err != nil {
+		t.Fatal(err)
+	}
+
+	// Pop record one but HOLD its commit.
+	data, commit, ok, err := s.Pop()
+	if err != nil || !ok || string(data) != "record-one-is-long" {
+		t.Fatalf("pop1: %q ok=%v err=%v", data, ok, err)
+	}
+
+	// The head segment's frame length is corrupted on disk: the next Pop
+	// sees an overshooting length and skips the whole head segment.
+	segs, _ := filepath.Glob(filepath.Join(dir, "*.seg"))
+	sort.Strings(segs)
+	if len(segs) < 2 {
+		t.Fatalf("want 2 segments, got %v", segs)
+	}
+	f, err := os.OpenFile(segs[0], os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteAt([]byte{0xff, 0xff, 0xff, 0xff}, 8); err != nil {
+		t.Fatal(err)
+	}
+	_ = f.Close()
+
+	if _, _, _, err := s.Pop(); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("pop over corrupt head = %v, want ErrCorrupt (skips the segment)", err)
+	}
+
+	// The stale commit must not clobber the new head.
+	commit()
+
+	data, commit2, ok, err := s.Pop()
+	if err != nil || !ok || string(data) != "record-two-is-long" {
+		t.Fatalf("record two lost to a stale commit: %q ok=%v err=%v", data, ok, err)
+	}
+	commit2()
 }

@@ -126,11 +126,22 @@ func (s *Store) save() error {
 	if err != nil {
 		return err
 	}
-	tmp := s.path + ".tmp"
-	if err := writeFileSync(tmp, data); err != nil {
+	// Unique temp name (not a fixed ".tmp"): a terminating pod's agent and
+	// its replacement can briefly run concurrently, and with a shared name
+	// one writer could rename the other's half-written file into place.
+	// Each writer renames only its own fully-synced file; last rename wins
+	// with a complete document either way.
+	tmp, err := os.CreateTemp(filepath.Dir(s.path), filepath.Base(s.path)+".tmp-*")
+	if err != nil {
 		return err
 	}
-	if err := os.Rename(tmp, s.path); err != nil {
+	tmpPath := tmp.Name()
+	if err := writeAndSync(tmp, data); err != nil {
+		_ = os.Remove(tmpPath)
+		return err
+	}
+	if err := os.Rename(tmpPath, s.path); err != nil {
+		_ = os.Remove(tmpPath)
 		return err
 	}
 	if d, err := os.Open(filepath.Dir(s.path)); err == nil {
@@ -140,13 +151,9 @@ func (s *Store) save() error {
 	return nil
 }
 
-// writeFileSync is os.WriteFile plus an fsync before close, so a rename that
+// writeAndSync writes data and fsyncs before closing, so the rename that
 // follows cannot surface a zero-length file after a power loss.
-func writeFileSync(path string, data []byte) error {
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
-	if err != nil {
-		return err
-	}
+func writeAndSync(f *os.File, data []byte) error {
 	if _, err := f.Write(data); err != nil {
 		_ = f.Close()
 		return err

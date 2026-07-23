@@ -2,6 +2,7 @@ package otlpexport
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -393,5 +394,44 @@ func TestHTTPExportSplitsOversizedLogs(t *testing.T) {
 	}
 	if got := len(bodies); got != 2000 {
 		t.Fatalf("reassembled %d records, want 2000 (none lost or duplicated)", got)
+	}
+}
+
+// A redirecting endpoint (e.g. an http→https ingress) must surface as a
+// transient status error, never be followed: Go converts a redirected POST
+// into a body-less GET, which either falsely acks (a 200 from whatever page
+// the redirect lands on, committing offsets for undelivered records) or
+// draws a 405 from the collector's GET handler that IsPermanent would treat
+// as a definitive rejection and drain the disk backlog into drops.
+func TestHTTPRedirectNotFollowed(t *testing.T) {
+	redirectedGET := false
+	final := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			redirectedGET = true
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer final.Close()
+	redir := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, final.URL+r.URL.Path, http.StatusFound)
+	}))
+	defer redir.Close()
+
+	c, err := New(Config{Endpoint: redir.URL, Protocol: "http", Timeout: 5 * time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = c.Close() }()
+
+	exportErr := c.ExportMetrics(context.Background(), testMetrics())
+	var se *HTTPStatusError
+	if !errors.As(exportErr, &se) || se.Code != http.StatusFound {
+		t.Fatalf("export err = %v, want HTTPStatusError with code 302", exportErr)
+	}
+	if IsPermanent(exportErr) {
+		t.Fatal("a redirect must classify as transient: the buffered backlog must survive an endpoint misconfiguration")
+	}
+	if redirectedGET {
+		t.Fatal("client followed the redirect (POST converted to GET)")
 	}
 }

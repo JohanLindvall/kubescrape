@@ -557,6 +557,7 @@ func (s *Spool) Pop() (data []byte, commit func(), ok bool, err error) {
 	}
 
 	var done bool
+	headSeq := head.seq
 	commit = func() {
 		s.mu.Lock()
 		defer s.mu.Unlock()
@@ -564,6 +565,15 @@ func (s *Spool) Pop() (data []byte, commit func(), ok bool, err error) {
 			return
 		}
 		done = true
+		// The head may no longer be the segment this frame was popped from:
+		// a later Pop can hit a vanished/corrupt head and skip to the next
+		// segment. Applying the stale end offset there would silently retire
+		// the NEW head's never-delivered records, so a commit whose segment
+		// is gone is a no-op — the frame's segment was already skipped and
+		// its loss accounted.
+		if len(s.segs) == 0 || s.segs[0].seq != headSeq {
+			return
+		}
 		s.readOff = end
 		s.retireConsumedLocked()
 		s.persistCursor()

@@ -1,6 +1,7 @@
 package otlpexport
 
 import (
+	"fmt"
 	"io"
 	"sync"
 	"sync/atomic"
@@ -19,6 +20,19 @@ func init() {
 }
 
 const gzipName = "gzip"
+
+// assertGzipCodec verifies our klauspost-backed codec still owns the gRPC
+// "gzip" registration. A future dependency importing grpc/encoding/gzip
+// with a later-running init would silently displace it — wire-compatible,
+// but -otlp-compression-level and the pooled writers would be bypassed.
+// Called at client construction so the fragility is a startup error, not a
+// silent behavior change.
+func assertGzipCodec() error {
+	if _, ok := encoding.GetCompressor(gzipName).(*gzipCodec); !ok {
+		return fmt.Errorf("gRPC %q compressor displaced (another package registered one after ours; do not import google.golang.org/grpc/encoding/gzip)", gzipName)
+	}
+	return nil
+}
 
 type gzipCodec struct {
 	writers sync.Pool // *gzip.Writer

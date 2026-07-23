@@ -79,6 +79,104 @@ func typedHandler[T any](upsert, del func(T)) cache.ResourceEventHandlerFuncs {
 	}
 }
 
+// registerCoreInformers wires the pod and service informers into the store
+// and the service index, returning their HasSynced funcs.
+func registerCoreInformers(factory informers.SharedInformerFactory, st *store.Store, svcIndex *services.Index) ([]cache.InformerSynced, error) {
+	podInformer := factory.Core().V1().Pods().Informer()
+	if _, err := podInformer.AddEventHandler(typedHandler(
+		func(pod *corev1.Pod) { st.UpsertPod(pod) },
+		func(pod *corev1.Pod) { st.DeletePod(pod.UID) },
+	)); err != nil {
+		return nil, fmt.Errorf("registering pod event handler: %w", err)
+	}
+
+	// Services are matched against pods for service-annotation based scrape
+	// discovery; their specs are small, so the full objects are cached.
+	svcInformer := factory.Core().V1().Services().Informer()
+	if _, err := svcInformer.AddEventHandler(typedHandler(
+		func(svc *corev1.Service) { svcIndex.Upsert(svc) },
+		func(svc *corev1.Service) { svcIndex.Delete(svc.Namespace, svc.UID) },
+	)); err != nil {
+		return nil, fmt.Errorf("registering service event handler: %w", err)
+	}
+	return []cache.InformerSynced{podInformer.HasSynced, svcInformer.HasSynced}, nil
+}
+
+// registerOwnerInformers wires a metadata-only informer per owner GVR,
+// returning the listers the owner resolver reads and their HasSynced funcs.
+func registerOwnerInformers(metaFactory metadatainformer.SharedInformerFactory) (map[schema.GroupVersionResource]cache.GenericLister, []cache.InformerSynced, error) {
+	listers := make(map[schema.GroupVersionResource]cache.GenericLister, len(owners.AllGVRs))
+	var synced []cache.InformerSynced
+	for _, gvr := range owners.AllGVRs {
+		inf := metaFactory.ForResource(gvr)
+		if err := inf.Informer().SetTransform(stripManagedFields); err != nil {
+			return nil, nil, fmt.Errorf("setting %s informer transform: %w", gvr.Resource, err)
+		}
+		listers[gvr] = inf.Lister()
+		synced = append(synced, inf.Informer().HasSynced)
+	}
+	return listers, synced, nil
+}
+
+// startServiceMonitors sets up and starts the dynamic ServiceMonitor informer.
+// When the CRD is unavailable the feature is disabled with a warning and a nil
+// Index is returned (not an error).
+func startServiceMonitors(ctx context.Context, cfg *rest.Config, disco discovery.DiscoveryInterface, resync time.Duration, log *slog.Logger) (*servicemonitors.Index, cache.InformerSynced, error) {
+	if err := checkServiceMonitorCRD(disco); err != nil {
+		log.Warn("servicemonitors requested but the CRD is unavailable; disabling", "error", err)
+		return nil, nil, nil
+	}
+	dynClient, err := dynamic.NewForConfig(cfg)
+	if err != nil {
+		return nil, nil, fmt.Errorf("creating dynamic client: %w", err)
+	}
+	dynFactory := dynamicinformer.NewDynamicSharedInformerFactory(dynClient, resync)
+	smInformer := dynFactory.ForResource(servicemonitors.GVR).Informer()
+	// Unstructured objects retain managedFields unless stripped, like
+	// the typed informers' transform does.
+	if err := smInformer.SetTransform(func(obj any) (any, error) {
+		if u, ok := obj.(*unstructured.Unstructured); ok {
+			unstructured.RemoveNestedField(u.Object, "metadata", "managedFields")
+		}
+		return obj, nil
+	}); err != nil {
+		return nil, nil, fmt.Errorf("servicemonitor informer transform: %w", err)
+	}
+	monitors := servicemonitors.NewIndex()
+	if _, err := smInformer.AddEventHandler(typedHandler(
+		func(u *unstructured.Unstructured) {
+			if err := monitors.Upsert(u); err != nil {
+				log.Warn("parsing servicemonitor", "error", err)
+			}
+		},
+		func(u *unstructured.Unstructured) { monitors.Delete(u.GetNamespace(), u.GetName()) },
+	)); err != nil {
+		return nil, nil, fmt.Errorf("registering servicemonitor handler: %w", err)
+	}
+	dynFactory.Start(ctx.Done())
+	log.Info("servicemonitor discovery enabled")
+	return monitors, smInformer.HasSynced, nil
+}
+
+// newLogger builds the process logger (mirrors the agent's).
+func newLogger(level, format string) (*slog.Logger, error) {
+	var lvl slog.Level
+	if err := lvl.UnmarshalText([]byte(level)); err != nil {
+		return nil, fmt.Errorf("log level %q: %w", level, err)
+	}
+	opts := &slog.HandlerOptions{Level: lvl}
+	var handler slog.Handler
+	switch format {
+	case "text":
+		handler = slog.NewTextHandler(os.Stderr, opts)
+	case "json":
+		handler = slog.NewJSONHandler(os.Stderr, opts)
+	default:
+		return nil, fmt.Errorf("log format %q (want text or json)", format)
+	}
+	return slog.New(handler), nil
+}
+
 func run() error {
 	var (
 		listen       = flag.String("listen", ":8080", "HTTP listen address")
@@ -111,21 +209,10 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	var lvl slog.Level
-	if err := lvl.UnmarshalText([]byte(*logLevel)); err != nil {
-		return fmt.Errorf("log level %q: %w", *logLevel, err)
+	log, err := newLogger(*logLevel, *logFormat)
+	if err != nil {
+		return err
 	}
-	opts := &slog.HandlerOptions{Level: lvl}
-	var handler slog.Handler
-	switch *logFormat {
-	case "text":
-		handler = slog.NewTextHandler(os.Stderr, opts)
-	case "json":
-		handler = slog.NewJSONHandler(os.Stderr, opts)
-	default:
-		return fmt.Errorf("log format %q (want text or json)", *logFormat)
-	}
-	log := slog.New(handler)
 	slog.SetDefault(log)
 	// client-go logs through klog; route it into the same slog handler.
 	klog.SetSlogLogger(log)
@@ -156,76 +243,32 @@ func run() error {
 	// the objects enter the informer cache.
 	factory := informers.NewSharedInformerFactoryWithOptions(client, *resync,
 		informers.WithTransform(stripManagedFields))
-	podInformer := factory.Core().V1().Pods().Informer()
-	if _, err := podInformer.AddEventHandler(typedHandler(
-		func(pod *corev1.Pod) { st.UpsertPod(pod) },
-		func(pod *corev1.Pod) { st.DeletePod(pod.UID) },
-	)); err != nil {
-		return fmt.Errorf("registering pod event handler: %w", err)
-	}
-
-	// Services are matched against pods for service-annotation based scrape
-	// discovery; their specs are small, so the full objects are cached.
 	svcIndex := services.NewIndex()
-	svcInformer := factory.Core().V1().Services().Informer()
-	if _, err := svcInformer.AddEventHandler(typedHandler(
-		func(svc *corev1.Service) { svcIndex.Upsert(svc) },
-		func(svc *corev1.Service) { svcIndex.Delete(svc.Namespace, svc.UID) },
-	)); err != nil {
-		return fmt.Errorf("registering service event handler: %w", err)
+	synced, err := registerCoreInformers(factory, st, svcIndex)
+	if err != nil {
+		return err
 	}
 
 	// Metadata-only informers (PartialObjectMetadata) for owner-chain and
 	// namespace enrichment: labels/annotations/ownerRefs only, no specs
 	// cached.
 	metaFactory := metadatainformer.NewSharedInformerFactory(metaClient, *resync)
-	listers := make(map[schema.GroupVersionResource]cache.GenericLister, len(owners.AllGVRs))
-	synced := []cache.InformerSynced{podInformer.HasSynced, svcInformer.HasSynced}
-	for _, gvr := range owners.AllGVRs {
-		inf := metaFactory.ForResource(gvr)
-		if err := inf.Informer().SetTransform(stripManagedFields); err != nil {
-			return fmt.Errorf("setting %s informer transform: %w", gvr.Resource, err)
-		}
-		listers[gvr] = inf.Lister()
-		synced = append(synced, inf.Informer().HasSynced)
+	listers, ownerSynced, err := registerOwnerInformers(metaFactory)
+	if err != nil {
+		return err
 	}
+	synced = append(synced, ownerSynced...)
 	resolver := owners.NewFromListers(listers)
 
 	var monitors *servicemonitors.Index
 	if *monitorsOn {
-		if err := checkServiceMonitorCRD(client.Discovery()); err != nil {
-			log.Warn("servicemonitors requested but the CRD is unavailable; disabling", "error", err)
-		} else {
-			dynClient, err := dynamic.NewForConfig(cfg)
-			if err != nil {
-				return fmt.Errorf("creating dynamic client: %w", err)
-			}
-			dynFactory := dynamicinformer.NewDynamicSharedInformerFactory(dynClient, *resync)
-			smInformer := dynFactory.ForResource(servicemonitors.GVR).Informer()
-			// Unstructured objects retain managedFields unless stripped, like
-			// the typed informers' transform does.
-			if err := smInformer.SetTransform(func(obj any) (any, error) {
-				if u, ok := obj.(*unstructured.Unstructured); ok {
-					unstructured.RemoveNestedField(u.Object, "metadata", "managedFields")
-				}
-				return obj, nil
-			}); err != nil {
-				return fmt.Errorf("servicemonitor informer transform: %w", err)
-			}
-			monitors = servicemonitors.NewIndex()
-			if _, err := smInformer.AddEventHandler(typedHandler(
-				func(u *unstructured.Unstructured) {
-					if err := monitors.Upsert(u); err != nil {
-						log.Warn("parsing servicemonitor", "error", err)
-					}
-				},
-				func(u *unstructured.Unstructured) { monitors.Delete(u.GetNamespace(), u.GetName()) },
-			)); err != nil {
-				return fmt.Errorf("registering servicemonitor handler: %w", err)
-			}
-			dynFactory.Start(ctx.Done())
-			synced = append(synced, smInformer.HasSynced)
-			log.Info("servicemonitor discovery enabled")
+		idx, smSynced, err := startServiceMonitors(ctx, cfg, client.Discovery(), *resync, log)
+		if err != nil {
+			return err
+		}
+		if idx != nil {
+			monitors = idx
+			synced = append(synced, smSynced)
 		}
 	}
 

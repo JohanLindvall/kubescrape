@@ -3,12 +3,164 @@ package metrics
 import (
 	"context"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/pmetric"
 )
+
+// TestVecConcurrentFirstUse hammers the wrapper cache's first use of ONE tuple
+// from many goroutines plus concurrent Value() reads (run under -race).
+func TestVecConcurrentFirstUse(t *testing.T) {
+	r := NewRegistry()
+	cv := r.CounterVec("audit_conc_total", "d", "k")
+
+	const goroutines, n = 8, 200
+	var wg sync.WaitGroup
+	for g := 0; g < goroutines; g++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < n; i++ {
+				cv.WithLabelValues("same").Inc()
+				_ = cv.WithLabelValues("same").Value()
+			}
+		}()
+	}
+	wg.Wait()
+	if got := cv.WithLabelValues("same").Value(); got != goroutines*n {
+		t.Fatalf("Value = %v, want %d", got, goroutines*n)
+	}
+}
+
+// TestRegistryConcurrentExportAndObserve runs two exporters against the same
+// registry while counters/gauges/histograms are hammered (run under -race):
+// GaugeFunc evaluation happens inside Export, concurrently with observes.
+func TestRegistryConcurrentExportAndObserve(t *testing.T) {
+	r := NewRegistry()
+	c := r.CounterVec("audit_race_total", "d", "k")
+	g := r.Gauge("audit_race_gauge", "d")
+	h := r.HistogramVec("audit_race_hist", "d", []float64{1, 5}, "k")
+	var n atomic.Int64
+	r.GaugeFunc("audit_race_func", "d", func() float64 { return float64(n.Load()) })
+
+	resAttrs := pcommon.NewResource()
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				c.WithLabelValues("a").Inc()
+				g.Set(float64(i))
+				h.WithLabelValues("a").Observe(2)
+				n.Add(1)
+			}
+		}(i)
+	}
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 50; j++ {
+				if err := r.Export(context.Background(), &capExporter{}, resAttrs); err != nil {
+					t.Error(err)
+				}
+			}
+		}()
+	}
+	time.Sleep(50 * time.Millisecond)
+	close(stop)
+	wg.Wait()
+	if c.WithLabelValues("a").Value() == 0 {
+		t.Fatal("no counter value")
+	}
+}
+
+// TestGaugeFuncReentrant: a GaugeFunc that itself drives registry metrics (and
+// registers nothing new) must not deadlock Export; its value is exported.
+func TestGaugeFuncReentrant(t *testing.T) {
+	r := NewRegistry()
+	c := r.Counter("audit_reentrant_total", "d")
+	r.GaugeFunc("audit_reentrant_gauge", "d", func() float64 {
+		c.Inc() // re-enters the series lock of ANOTHER series during Export
+		return 42
+	})
+
+	resAttrs := pcommon.NewResource()
+	exp := &capExporter{}
+	done := make(chan error, 1)
+	go func() { done <- r.Export(context.Background(), exp, resAttrs) }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Export deadlocked with a re-entrant GaugeFunc")
+	}
+	m, ok := exp.find("audit_reentrant_gauge")
+	if !ok || m.Gauge().DataPoints().At(0).DoubleValue() != 42 {
+		t.Fatal("re-entrant gauge func value missing/wrong")
+	}
+	if c.Value() != 1 {
+		t.Fatalf("counter bumped from GaugeFunc = %v, want 1", c.Value())
+	}
+}
+
+// vecKey's netstring encoding must keep aliasing tuples distinct: with a plain
+// separator, ("x\x00y","z") and ("x","y\x00z") would collide. Only the
+// single-label fast path may return the raw value.
+func TestVecKeyMultiLabelCollisionProof(t *testing.T) {
+	r := NewRegistry()
+	v := r.CounterVec("test_veckey_total", "t", "a", "b")
+	v.WithLabelValues("x\x00y", "z").Add(1)
+	v.WithLabelValues("x", "y\x00z").Add(2)
+	v.WithLabelValues("1:x", "").Add(4)
+	v.WithLabelValues("", "1:x").Add(8)
+
+	// Four distinct tuples → four independent counters.
+	for _, tc := range []struct {
+		vals []string
+		want float64
+	}{
+		{[]string{"x\x00y", "z"}, 1},
+		{[]string{"x", "y\x00z"}, 2},
+		{[]string{"1:x", ""}, 4},
+		{[]string{"", "1:x"}, 8},
+	} {
+		if got := v.WithLabelValues(tc.vals...).Value(); got != tc.want {
+			t.Fatalf("tuple %q = %v, want %v (tuples aliased)", tc.vals, got, tc.want)
+		}
+	}
+}
+
+// Prometheus semantics: an empty label value is equivalent to the label being
+// absent (labels.set drops empty values), so a short call and a padded call
+// deliberately share one series — while values that merely CONTAIN the
+// netstring syntax stay distinct.
+func TestVecKeyEmptyValueEquivalence(t *testing.T) {
+	r := NewRegistry()
+	v := r.CounterVec("test_veckey_short_total", "t", "a", "b")
+	v.WithLabelValues("1:x").Add(1)       // {a="1:x"} — 1 value, 2-label vec
+	v.WithLabelValues("1:x", "").Add(100) // {a="1:x", b=""} ≡ {a="1:x"}
+	v.WithLabelValues("x", "").Add(10)    // {a="x"} — distinct
+
+	if got := v.WithLabelValues("1:x").Value(); got != 101 {
+		t.Fatalf("{a=1:x} = %v, want 101 (empty-b call must merge, not fork)", got)
+	}
+	if got := v.WithLabelValues("x", "").Value(); got != 10 {
+		t.Fatalf("{a=x} = %v, want 10 (must stay distinct from {a=1:x})", got)
+	}
+}
 
 func TestRegistryExport(t *testing.T) {
 	r := NewRegistry()

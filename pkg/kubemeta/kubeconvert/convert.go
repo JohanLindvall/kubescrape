@@ -50,52 +50,13 @@ func FromPod(p *corev1.Pod) (kubemeta.Pod, map[string]kubemeta.Container) {
 
 	byID := make(map[string]kubemeta.Container)
 	add := func(name, image string, ports []corev1.ContainerPort, typ string) {
-		c := kubemeta.Container{Name: name, Type: typ, Image: image}
-		for _, pt := range ports {
-			c.Ports = append(c.Ports, kubemeta.ContainerPort{
-				Name:     pt.Name,
-				Port:     pt.ContainerPort,
-				Protocol: string(pt.Protocol),
-			})
-		}
 		st := statuses[name]
-		if st != nil {
-			c.RuntimeID = st.ContainerID
-			c.ID = kubemeta.NormalizeContainerID(st.ContainerID)
-			c.ImageID = st.ImageID
-			c.RestartCount = st.RestartCount
-			c.Ready = st.Ready
-			switch {
-			case st.State.Running != nil:
-				c.State = "running"
-				t := st.State.Running.StartedAt.Time
-				c.StartedAt = &t
-			case st.State.Terminated != nil:
-				c.State = "terminated"
-				fillTerminated(&c, st.State.Terminated)
-			case st.State.Waiting != nil:
-				c.State = "waiting"
-				c.WaitingReason = st.State.Waiting.Reason
-			}
-		}
+		c := convertContainer(name, image, ports, typ, st)
 		pod.Containers = append(pod.Containers, c)
 		if c.ID != "" {
 			byID[c.ID] = clonePorts(c) // own backing array: the model is self-contained
 		}
-		// A restarted container gets a new runtime ID; the kubelet keeps the
-		// previous incarnation in lastState. Index it too so lookups by the
-		// old ID keep resolving while the pod is alive.
-		if st != nil && st.LastTerminationState.Terminated != nil && st.LastTerminationState.Terminated.ContainerID != "" {
-			prev := clonePorts(c) // a distinct incarnation: never share the current one's ports
-			prev.RuntimeID = st.LastTerminationState.Terminated.ContainerID
-			prev.ID = kubemeta.NormalizeContainerID(prev.RuntimeID)
-			prev.Ready = false
-			prev.State = "terminated"
-			prev.WaitingReason = ""
-			prev.StartedAt = nil
-			prev.FinishedAt = nil
-			prev.ExitCode = nil
-			fillTerminated(&prev, st.LastTerminationState.Terminated)
+		if prev, ok := previousIncarnation(c, st); ok {
 			byID[prev.ID] = prev
 		}
 	}
@@ -110,6 +71,62 @@ func FromPod(p *corev1.Pod) (kubemeta.Pod, map[string]kubemeta.Container) {
 		add(ec.Name, ec.Image, ec.Ports, "ephemeral")
 	}
 	return pod, byID
+}
+
+// convertContainer builds the model for one declared container, folding in
+// its runtime status (state, IDs, restart count) when the kubelet has
+// reported one.
+func convertContainer(name, image string, ports []corev1.ContainerPort, typ string, st *corev1.ContainerStatus) kubemeta.Container {
+	c := kubemeta.Container{Name: name, Type: typ, Image: image}
+	for _, pt := range ports {
+		c.Ports = append(c.Ports, kubemeta.ContainerPort{
+			Name:     pt.Name,
+			Port:     pt.ContainerPort,
+			Protocol: string(pt.Protocol),
+		})
+	}
+	if st == nil {
+		return c
+	}
+	c.RuntimeID = st.ContainerID
+	c.ID = kubemeta.NormalizeContainerID(st.ContainerID)
+	c.ImageID = st.ImageID
+	c.RestartCount = st.RestartCount
+	c.Ready = st.Ready
+	switch {
+	case st.State.Running != nil:
+		c.State = "running"
+		t := st.State.Running.StartedAt.Time
+		c.StartedAt = &t
+	case st.State.Terminated != nil:
+		c.State = "terminated"
+		fillTerminated(&c, st.State.Terminated)
+	case st.State.Waiting != nil:
+		c.State = "waiting"
+		c.WaitingReason = st.State.Waiting.Reason
+	}
+	return c
+}
+
+// previousIncarnation models the container's PREVIOUS runtime incarnation
+// when the kubelet reports one in lastState: a restarted container gets a new
+// runtime ID, and lookups by the old ID must keep resolving while the pod is
+// alive.
+func previousIncarnation(c kubemeta.Container, st *corev1.ContainerStatus) (kubemeta.Container, bool) {
+	if st == nil || st.LastTerminationState.Terminated == nil || st.LastTerminationState.Terminated.ContainerID == "" {
+		return kubemeta.Container{}, false
+	}
+	prev := clonePorts(c) // a distinct incarnation: never share the current one's ports
+	prev.RuntimeID = st.LastTerminationState.Terminated.ContainerID
+	prev.ID = kubemeta.NormalizeContainerID(prev.RuntimeID)
+	prev.Ready = false
+	prev.State = "terminated"
+	prev.WaitingReason = ""
+	prev.StartedAt = nil
+	prev.FinishedAt = nil
+	prev.ExitCode = nil
+	fillTerminated(&prev, st.LastTerminationState.Terminated)
+	return prev, true
 }
 
 // clonePorts returns a copy of c whose Ports has its own backing array, so a

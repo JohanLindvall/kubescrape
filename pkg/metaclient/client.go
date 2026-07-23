@@ -181,19 +181,38 @@ func (c *Client) getJSON(ctx context.Context, u string, v any) error {
 
 	// Fresh cache entry: serve without a request (and without re-decoding —
 	// the decoded value is stored once and shallow-copied out).
-	c.mu.Lock()
-	entry, cached := c.cache[key]
-	if cached && c.now().Before(entry.expires) {
-		decoded, body := entry.decoded, entry.body
-		c.mu.Unlock()
+	entry, cached, fresh := c.lookupEntry(key)
+	if fresh {
 		c.observe(OutcomeCached)
-		if shallowCopy(v, decoded) {
-			return nil
-		}
-		return json.Unmarshal(body, v)
+		return entry.serve(v)
 	}
-	c.mu.Unlock()
+	return c.fetch(ctx, u, key, entry, cached, v)
+}
 
+// lookupEntry reads the cache under the lock, classifying the entry as fresh
+// (serve locally), stale-but-present (revalidate with If-None-Match), or
+// absent.
+func (c *Client) lookupEntry(key string) (entry cacheEntry, cached, fresh bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	entry, cached = c.cache[key]
+	fresh = cached && c.now().Before(entry.expires)
+	return entry, cached, fresh
+}
+
+// serve copies the entry's decoded value into v (shallow — maps/slices are
+// shared under the treat-as-immutable contract), falling back to re-decoding
+// the stored body for a type mismatch.
+func (e cacheEntry) serve(v any) error {
+	if shallowCopy(v, e.decoded) {
+		return nil
+	}
+	return json.Unmarshal(e.body, v)
+}
+
+// fetch performs the HTTP request (revalidating with the entry's ETag when
+// cached), stores a cacheable 200, and decodes into v.
+func (c *Client) fetch(ctx context.Context, u, key string, entry cacheEntry, cached bool, v any) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
 		return err

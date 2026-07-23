@@ -3,6 +3,7 @@ package promscrape
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -12,11 +13,175 @@ import (
 	"testing"
 	"time"
 
+	"github.com/JohanLindvall/kubescrape/pkg/kubemeta"
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/pmetric"
-
-	"github.com/JohanLindvall/kubescrape/pkg/kubemeta"
 )
+
+// TestMemoCadvisorChunkingStable pins that the per-scrape cgroupMemo (which
+// deliberately survives take()/reset()) produces identical series whether the
+// scrape is exported as one chunk or as many.
+func TestMemoCadvisorChunkingStable(t *testing.T) {
+	srv := serveBody(t, string(cadvisorBody))
+
+	run := func(batchPoints int) []string {
+		exp := &captureExporter{}
+		s := newKubeletScraper(t, srv.URL, &fakeMetaSource{}, exp, false)
+		s.cfg.BatchPoints = batchPoints
+		if _, err := s.scrapeCadvisor(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		return identitySeries(exp.batches)
+	}
+
+	whole := run(10000)
+	chunked := run(1) // export after every single point
+	if len(whole) == 0 {
+		t.Fatal("no series")
+	}
+	if strings.Join(whole, "\n") != strings.Join(chunked, "\n") {
+		t.Fatalf("chunked scrape differs from whole scrape:\nwhole:\n%s\n\nchunked:\n%s",
+			strings.Join(whole, "\n"), strings.Join(chunked, "\n"))
+	}
+}
+
+// TestMemoCadvisorSandboxOrderIndependent feeds a sandbox (container="POD") row
+// and a container row that share one cgroup id — the adversarial case for a memo
+// keyed on the raw id value — in both orders. The memo must hold only the parse
+// result, never the sandbox-adjusted identity, so the outcome must not depend on
+// which row was seen first.
+func TestMemoCadvisorSandboxOrderIndependent(t *testing.T) {
+	id := "/kubepods/burstable/pod" + uid1 + "/" + appCID
+	sandboxRow := fmt.Sprintf("container_cpu_usage_seconds_total{namespace=%q,pod=%q,container=\"POD\",id=%q} 0.1\n", "ns1", "pod1", id)
+	containerRow := fmt.Sprintf("container_cpu_usage_seconds_total{namespace=%q,pod=%q,container=%q,id=%q,image=\"img:1\"} 12.5\n", "ns1", "pod1", "app", id)
+	head := "# TYPE container_cpu_usage_seconds_total counter\n"
+
+	run := func(body string) []string {
+		srv := serveBody(t, body)
+		exp := &captureExporter{}
+		s := newKubeletScraper(t, srv.URL, &fakeMetaSource{}, exp, false)
+		if _, err := s.scrapeCadvisor(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		return identitySeries(exp.batches)
+	}
+
+	a := run(head + sandboxRow + containerRow)
+	b := run(head + containerRow + sandboxRow)
+	if strings.Join(a, "\n") != strings.Join(b, "\n") {
+		t.Fatalf("identity depends on row order:\nsandbox-first:\n%s\n\ncontainer-first:\n%s",
+			strings.Join(a, "\n"), strings.Join(b, "\n"))
+	}
+	// Sanity: the sandbox row must NOT carry container.id / image on its resource.
+	if strings.Count(strings.Join(a, "\n"), appCID) == 0 {
+		t.Fatalf("container row lost its container id: %s", strings.Join(a, "\n"))
+	}
+}
+
+// TestMemoCadvisorLargeBodyNoAliasing is the memo-key-lifetime attack: the
+// cgroupMemo retains the raw "id" label value across the whole scrape, so if the
+// parser ever handed out a string aliasing its reused read buffer the memo would
+// misattribute series. It forces every dangerous condition at once — a body far
+// larger than the 64 KiB read buffer (ReadSlice recycles it), ids longer than
+// the value-intern length cap (128) so they are never interned, and more
+// distinct label values than MaxInternedValues (8192) so the intern table fills
+// and later values are fresh allocations. Each sample's VALUE encodes the index
+// of its own container, so any misattribution shows up as a resource whose
+// container.id does not match its data point's value.
+func TestMemoCadvisorLargeBodyNoAliasing(t *testing.T) {
+	const n = 3000
+	uid := func(i int) string { return fmt.Sprintf("%08x-1111-2222-3333-%012x", i, i) }
+	cid := func(i int) string { return fmt.Sprintf("%064x", i) }
+	// systemd layout: > 128 chars, so the value is never interned.
+	id := func(i int) string {
+		return "/kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod" +
+			strings.ReplaceAll(uid(i), "-", "_") + ".slice/cri-containerd-" + cid(i) + ".scope"
+	}
+	var sb strings.Builder
+	for _, fam := range []string{"container_cpu_usage_seconds_total", "container_memory_usage_bytes"} {
+		fmt.Fprintf(&sb, "# TYPE %s gauge\n", fam)
+		for i := 0; i < n; i++ {
+			fmt.Fprintf(&sb, "%s{namespace=\"ns%d\",pod=\"pod-%d\",container=\"app-%d\",id=%q} %d\n",
+				fam, i, i, i, id(i), i)
+		}
+	}
+	if sb.Len() < 64*1024 {
+		t.Fatalf("body too small to exercise the read buffer: %d", sb.Len())
+	}
+	srv := serveBody(t, sb.String())
+	exp := &captureExporter{}
+	s := newKubeletScraper(t, srv.URL, &fakeMetaSource{}, exp, false)
+	s.cfg.BatchPoints = 777 // force many chunk flushes mid-scrape
+	if _, err := s.scrapeCadvisor(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	points := 0
+	for _, md := range exp.batches {
+		rms := md.ResourceMetrics()
+		for i := 0; i < rms.Len(); i++ {
+			rm := rms.At(i)
+			gotCID := attrStr(rm.Resource(), "container.id")
+			gotUID := attrStr(rm.Resource(), "k8s.pod.uid")
+			gotName := attrStr(rm.Resource(), "k8s.container.name")
+			sms := rm.ScopeMetrics()
+			for j := 0; j < sms.Len(); j++ {
+				ms := sms.At(j).Metrics()
+				for k := 0; k < ms.Len(); k++ {
+					dps := ms.At(k).Gauge().DataPoints()
+					for d := 0; d < dps.Len(); d++ {
+						idx := int(dps.At(d).DoubleValue())
+						points++
+						if gotCID != cid(idx) || gotUID != uid(idx) || gotName != fmt.Sprintf("app-%d", idx) {
+							t.Fatalf("sample %d landed on resource uid=%s cid=%s name=%s (want uid=%s cid=%s)",
+								idx, gotUID, gotCID, gotName, uid(idx), cid(idx))
+						}
+					}
+				}
+			}
+		}
+	}
+	if points != 2*n {
+		t.Fatalf("got %d points, want %d", points, 2*n)
+	}
+}
+
+// Standalone (non-k8s) containers — a parseable container ID in the cgroup path
+// but no namespace/pod/container labels — must each get their OWN resource
+// carrying container.id: merging them into one anonymous resource would emit
+// indistinguishable, conflicting series (their id/name/image labels are elided
+// from pod-scoped rows).
+func TestCadvisorStandaloneContainersStayDistinct(t *testing.T) {
+	cidA := strings.Repeat("a", 64)
+	cidB := strings.Repeat("b", 64)
+	body := `# TYPE container_cpu_usage_seconds_total counter
+container_cpu_usage_seconds_total{id="/system.slice/docker-` + cidA + `.scope"} 1
+container_cpu_usage_seconds_total{id="/system.slice/docker-` + cidB + `.scope"} 2
+`
+	srv := serveBody(t, body)
+
+	exp := &captureExporter{}
+	s := newKubeletScraper(t, srv.URL, &fakeMetaSource{}, exp, false)
+	if _, err := s.scrapeCadvisor(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	vals := map[string]float64{} // container.id -> cpu value
+	rms := exp.batches[0].ResourceMetrics()
+	for i := 0; i < rms.Len(); i++ {
+		rm := rms.At(i)
+		cid := attrStr(rm.Resource(), "container.id")
+		ms := rm.ScopeMetrics().At(0).Metrics()
+		for j := 0; j < ms.Len(); j++ {
+			dps := ms.At(j).Sum().DataPoints()
+			for k := 0; k < dps.Len(); k++ {
+				vals[cid] += dps.At(k).DoubleValue()
+			}
+		}
+	}
+	if vals[cidA] != 1 || vals[cidB] != 2 {
+		t.Fatalf("standalone containers merged/mislabeled: per-container.id values = %v", vals)
+	}
+}
 
 const (
 	uid1     = "0a1b2c3d-1111-2222-3333-444455556666"

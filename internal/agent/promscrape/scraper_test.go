@@ -5,18 +5,63 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
-	"go.opentelemetry.io/collector/pdata/pcommon"
-	"go.opentelemetry.io/collector/pdata/pmetric"
-
 	"github.com/JohanLindvall/kubescrape/internal/agent/attrs"
 	"github.com/JohanLindvall/kubescrape/pkg/kubemeta"
 	"github.com/JohanLindvall/kubescrape/pkg/promparse"
+	"go.opentelemetry.io/collector/pdata/pcommon"
+	"go.opentelemetry.io/collector/pdata/pmetric"
 )
+
+// serveBody returns a test server serving a fixed exposition body.
+func serveBody(t *testing.T, body string) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(body))
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// identitySeries flattens every exported batch into "resourcekey|metric|dpattrs=value"
+// strings, so two runs can be compared regardless of chunking.
+func identitySeries(batches []pmetric.Metrics) []string {
+	var out []string
+	for _, md := range batches {
+		rms := md.ResourceMetrics()
+		for i := 0; i < rms.Len(); i++ {
+			rm := rms.At(i)
+			res := fmt.Sprint(rm.Resource().Attributes().AsRaw())
+			sms := rm.ScopeMetrics()
+			for j := 0; j < sms.Len(); j++ {
+				ms := sms.At(j).Metrics()
+				for k := 0; k < ms.Len(); k++ {
+					m := ms.At(k)
+					var dps pmetric.NumberDataPointSlice
+					switch m.Type() {
+					case pmetric.MetricTypeSum:
+						dps = m.Sum().DataPoints()
+					case pmetric.MetricTypeGauge:
+						dps = m.Gauge().DataPoints()
+					default:
+						continue
+					}
+					for d := 0; d < dps.Len(); d++ {
+						dp := dps.At(d)
+						out = append(out, fmt.Sprintf("%s|%s|%v|%v", res, m.Name(), dp.Attributes().AsRaw(), dp.DoubleValue()))
+					}
+				}
+			}
+		}
+	}
+	sort.Strings(out)
+	return out
+}
 
 type captureExporter struct {
 	mu      sync.Mutex

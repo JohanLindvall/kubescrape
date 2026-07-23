@@ -6,8 +6,11 @@ layer, and it supports two things almost nobody else does. This document
 compares the design against the major log shippers and names honestly which
 parts of the complexity are essential and which are self-inflicted.
 
-Sizes as of the segment refactor: ~3,000 production lines (`tailer.go` ~2,680
-+ `commit.go` + `sources.go` + `status.go`) and roughly twice that in tests.
+Sizes as of the segment refactor: ~3,300 production lines, split by concern
+(`tailer.go`, `ledger.go`, `discover.go`, `pipeline.go`, `read.go`,
+`rotate.go`, `archive.go`, `flush.go`, `checkpoint.go`, `sources.go`,
+`status.go`) and roughly one and a half times that in tests, grouped the
+same way.
 The historical sections below describe the PRE-refactor design they analyzed;
 "If it should ever get simpler" records what has since been done.
 

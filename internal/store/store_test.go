@@ -81,138 +81,6 @@ func mustMiss(t *testing.T, s *Store, id string) {
 	}
 }
 
-func TestLookupByContainerID(t *testing.T) {
-	s, _ := newTestStore(time.Minute)
-	s.UpsertPod(makePod("uid1", "pod1", "node1", "1", map[string]string{"app": "abc123"}))
-
-	for _, id := range []string{"abc123", "containerd://abc123", "docker://abc123"} {
-		res := mustGet(t, s, id)
-		if res.Pod.Name != "pod1" || res.Container.Name != "app" || res.Container.ID != "abc123" {
-			t.Errorf("lookup %q: got pod=%q container=%q id=%q", id, res.Pod.Name, res.Container.Name, res.Container.ID)
-		}
-		if res.Pod.DeletedAt != nil {
-			t.Errorf("live pod has DeletedAt set")
-		}
-	}
-	mustMiss(t, s, "nope")
-	mustMiss(t, s, "")
-}
-
-func TestWaitForContainer(t *testing.T) {
-	s, _ := newTestStore(time.Minute)
-
-	done := make(chan ContainerResult, 1)
-	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		res, ok, _ := s.GetContainer(ctx, "late999")
-		if ok {
-			done <- res
-		}
-		close(done)
-	}()
-
-	time.Sleep(50 * time.Millisecond)
-	s.UpsertPod(makePod("uid1", "pod1", "node1", "1", map[string]string{"app": "late999"}))
-
-	select {
-	case res, ok := <-done:
-		if !ok {
-			t.Fatal("waiter returned not-found")
-		}
-		if res.Pod.Name != "pod1" {
-			t.Fatalf("got pod %q", res.Pod.Name)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("waiter did not wake up")
-	}
-}
-
-func TestWaitIsPerContainer(t *testing.T) {
-	s, _ := newTestStore(time.Minute)
-
-	got := make(chan bool, 1)
-	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		_, ok, _ := s.GetContainer(ctx, "wanted1")
-		got <- ok
-	}()
-	other := make(chan bool, 1)
-	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
-		defer cancel()
-		_, ok, _ := s.GetContainer(ctx, "other2")
-		other <- ok
-	}()
-
-	time.Sleep(50 * time.Millisecond)
-	// Indexing "wanted1" must release only its own waiter.
-	s.UpsertPod(makePod("uid1", "pod1", "node1", "1", map[string]string{"app": "wanted1"}))
-
-	if ok := <-got; !ok {
-		t.Fatal("waiter for indexed container did not get a result")
-	}
-	select {
-	case ok := <-other:
-		if ok {
-			t.Fatal("waiter for a different container was satisfied")
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("other waiter never timed out")
-	}
-
-	// All waiter registrations must be cleaned up.
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	if len(s.waiters) != 0 {
-		t.Fatalf("leaked waiters: %v", s.waiters)
-	}
-}
-
-func TestManyWaitersSameContainer(t *testing.T) {
-	s, _ := newTestStore(time.Minute)
-
-	const n = 20
-	results := make(chan bool, n)
-	for i := 0; i < n; i++ {
-		go func() {
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel()
-			res, ok, _ := s.GetContainer(ctx, "shared123")
-			results <- ok && res.Pod.Name == "pod1"
-		}()
-	}
-
-	time.Sleep(50 * time.Millisecond)
-	s.UpsertPod(makePod("uid1", "pod1", "node1", "1", map[string]string{"app": "shared123"}))
-
-	for i := 0; i < n; i++ {
-		select {
-		case ok := <-results:
-			if !ok {
-				t.Fatalf("waiter %d did not get the pod", i)
-			}
-		case <-time.After(5 * time.Second):
-			t.Fatalf("waiter %d never woke up", i)
-		}
-	}
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	if len(s.waiters) != 0 {
-		t.Fatalf("leaked waiters: %v", s.waiters)
-	}
-}
-
-func TestWaitTimesOut(t *testing.T) {
-	s, _ := newTestStore(time.Minute)
-	start := time.Now()
-	mustMiss(t, s, "never")
-	if time.Since(start) > time.Second {
-		t.Fatal("wait took far longer than its context timeout")
-	}
-}
-
 func TestDeletedPodTombstone(t *testing.T) {
 	s, clk := newTestStore(time.Minute)
 	s.UpsertPod(makePod("uid1", "pod1", "node1", "1", map[string]string{"app": "abc123"}))
@@ -291,28 +159,6 @@ func TestLastTerminationStateIndexed(t *testing.T) {
 	}
 }
 
-func TestPodsOnNode(t *testing.T) {
-	s, _ := newTestStore(time.Minute)
-	s.UpsertPod(makePod("uid1", "pod1", "node1", "1", map[string]string{"a": "id1"}))
-	s.UpsertPod(makePod("uid2", "pod2", "node1", "1", map[string]string{"a": "id2"}))
-	s.UpsertPod(makePod("uid3", "pod3", "node2", "1", map[string]string{"a": "id3"}))
-
-	if got := len(s.PodsOnNode("node1")); got != 2 {
-		t.Fatalf("node1 has %d pods, want 2", got)
-	}
-	if got := len(s.PodsOnNode("node2")); got != 1 {
-		t.Fatalf("node2 has %d pods, want 1", got)
-	}
-	if got := len(s.PodsOnNode("other")); got != 0 {
-		t.Fatalf("unknown node has %d pods, want 0", got)
-	}
-
-	s.DeletePod("uid2")
-	if got := len(s.PodsOnNode("node1")); got != 1 {
-		t.Fatalf("node1 has %d pods after delete, want 1", got)
-	}
-}
-
 func TestResurrectAfterOutOfOrderDelete(t *testing.T) {
 	s, _ := newTestStore(time.Minute)
 	s.UpsertPod(makePod("uid1", "pod1", "node1", "1", map[string]string{"app": "abc"}))
@@ -326,49 +172,6 @@ func TestResurrectAfterOutOfOrderDelete(t *testing.T) {
 	}
 	if len(s.PodsOnNode("node1")) != 1 {
 		t.Fatal("resurrected pod missing from node index")
-	}
-}
-
-func TestGetPodByName(t *testing.T) {
-	s, clk := newTestStore(time.Minute)
-	s.UpsertPod(makePod("uid1", "pod1", "node1", "1", map[string]string{"app": "abc"}))
-
-	np, ok := s.GetPodByName("default", "pod1")
-	if !ok || np.Pod.UID != "uid1" {
-		t.Fatalf("lookup failed: ok=%v pod=%+v", ok, np.Pod)
-	}
-	if _, ok := s.GetPodByName("default", "nope"); ok {
-		t.Fatal("unknown pod resolved")
-	}
-	if _, ok := s.GetPodByName("other", "pod1"); ok {
-		t.Fatal("wrong namespace resolved")
-	}
-
-	// Deleted pods stay resolvable until the tombstone expires...
-	s.DeletePod("uid1")
-	np, ok = s.GetPodByName("default", "pod1")
-	if !ok || np.Pod.DeletedAt == nil {
-		t.Fatalf("tombstone lookup: ok=%v deletedAt=%v", ok, np.Pod.DeletedAt)
-	}
-	// ...unless a new pod with the same name replaces them.
-	s.UpsertPod(makePod("uid2", "pod1", "node1", "1", map[string]string{"app": "def"}))
-	np, ok = s.GetPodByName("default", "pod1")
-	if !ok || np.Pod.UID != "uid2" || np.Pod.DeletedAt != nil {
-		t.Fatalf("replacement lookup: %+v", np.Pod)
-	}
-
-	// Expiry of the old tombstone must not evict the replacement.
-	clk.Advance(2 * time.Minute)
-	s.Sweep()
-	if np, ok = s.GetPodByName("default", "pod1"); !ok || np.Pod.UID != "uid2" {
-		t.Fatalf("replacement gone after sweep: ok=%v", ok)
-	}
-
-	s.DeletePod("uid2")
-	clk.Advance(2 * time.Minute)
-	s.Sweep()
-	if _, ok := s.GetPodByName("default", "pod1"); ok {
-		t.Fatal("expired tombstone still resolvable")
 	}
 }
 
@@ -387,76 +190,6 @@ func TestOwnerRefsCarried(t *testing.T) {
 	}
 }
 
-func TestGetPodByUID(t *testing.T) {
-	s, clk := newTestStore(time.Minute)
-	s.UpsertPod(makePod("uid1", "pod1", "node1", "1", map[string]string{"app": "abc"}))
-
-	np, ok := s.GetPodByUID("uid1")
-	if !ok || np.Pod.Name != "pod1" {
-		t.Fatalf("GetPodByUID = %+v ok=%v", np.Pod, ok)
-	}
-	if _, ok := s.GetPodByUID("nope"); ok {
-		t.Fatal("unknown uid resolved")
-	}
-
-	// Deleted pods stay resolvable until the tombstone expires (as the
-	// container endpoint does), then disappear.
-	s.DeletePod("uid1")
-	if _, ok := s.GetPodByUID("uid1"); !ok {
-		t.Fatal("deleted pod not resolvable within TTL")
-	}
-	clk.Advance(2 * time.Minute)
-	s.Sweep()
-	if _, ok := s.GetPodByUID("uid1"); ok {
-		t.Fatal("expired pod still resolvable by uid")
-	}
-}
-
-// An expired-but-unswept tombstone must return not-found immediately: the
-// container is definitively gone, so waiting the full budget for it is
-// pointless (and blocks callers for seconds per dead container).
-func TestExpiredTombstoneDoesNotWait(t *testing.T) {
-	s, clk := newTestStore(time.Minute)
-	s.UpsertPod(makePod("uid1", "pod1", "node1", "1", map[string]string{"app": "abc123"}))
-	s.DeletePod("uid1")
-	clk.Advance(time.Minute + time.Second)
-	// No Sweep: the tombstone is expired but still present.
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	start := time.Now()
-	if _, ok, _ := s.GetContainer(ctx, "abc123"); ok {
-		t.Fatal("expired tombstone resolved")
-	}
-	if elapsed := time.Since(start); elapsed > time.Second {
-		t.Fatalf("lookup took %v; must not wait for an expired tombstone", elapsed)
-	}
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	if len(s.waiters) != 0 {
-		t.Fatalf("expired-tombstone lookup registered waiters: %v", s.waiters)
-	}
-}
-
-// A replaced container ID whose TTL has lapsed is equally definitive: it can
-// never be reported again, so its lookup must not block either.
-func TestExpiredReplacedIDDoesNotWait(t *testing.T) {
-	s, clk := newTestStore(time.Minute)
-	s.UpsertPod(makePod("uid1", "pod1", "node1", "1", map[string]string{"app": "old111"}))
-	s.UpsertPod(makePod("uid1", "pod1", "node1", "2", map[string]string{"app": "new222"}))
-	clk.Advance(time.Minute + time.Second)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	start := time.Now()
-	if _, ok, _ := s.GetContainer(ctx, "old111"); ok {
-		t.Fatal("expired replaced ID resolved")
-	}
-	if elapsed := time.Since(start); elapsed > time.Second {
-		t.Fatalf("lookup took %v; must not wait for an expired replaced ID", elapsed)
-	}
-}
-
 // Run is a thin sweeping ticker: it must exit promptly on cancel.
 func TestRunExitsOnCancel(t *testing.T) {
 	s, _ := newTestStore(time.Minute)
@@ -471,93 +204,6 @@ func TestRunExitsOnCancel(t *testing.T) {
 	}
 }
 
-// GetPodByIP resolves only live, non-hostNetwork pods, and follows IP changes.
-func TestGetPodByIP(t *testing.T) {
-	s := New(time.Minute)
-	s.UpsertPod(&corev1.Pod{
-		ObjectMeta: metav1.ObjectMeta{Name: "p1", Namespace: "ns", UID: "u1", ResourceVersion: "1"},
-		Status:     corev1.PodStatus{PodIP: "10.0.0.5", HostIP: "192.168.1.1"},
-	})
-	if np, ok := s.GetPodByIP("10.0.0.5"); !ok || np.Pod.Name != "p1" {
-		t.Fatalf("live pod by IP: %+v, %v", np, ok)
-	}
-
-	// hostNetwork pod (PodIP == HostIP) is never indexed.
-	s.UpsertPod(&corev1.Pod{
-		ObjectMeta: metav1.ObjectMeta{Name: "hostnet", Namespace: "ns", UID: "u2", ResourceVersion: "1"},
-		Status:     corev1.PodStatus{PodIP: "192.168.1.1", HostIP: "192.168.1.1"},
-	})
-	if _, ok := s.GetPodByIP("192.168.1.1"); ok {
-		t.Fatal("hostNetwork pod must not resolve by IP")
-	}
-
-	// IP change moves the mapping.
-	s.UpsertPod(&corev1.Pod{
-		ObjectMeta: metav1.ObjectMeta{Name: "p1", Namespace: "ns", UID: "u1", ResourceVersion: "2"},
-		Status:     corev1.PodStatus{PodIP: "10.0.0.6", HostIP: "192.168.1.1"},
-	})
-	if _, ok := s.GetPodByIP("10.0.0.5"); ok {
-		t.Fatal("old IP must not resolve after a change")
-	}
-	if np, ok := s.GetPodByIP("10.0.0.6"); !ok || np.Pod.Name != "p1" {
-		t.Fatalf("new IP: %+v, %v", np, ok)
-	}
-
-	// Deleted pods stop resolving immediately (their IP is recycled), even
-	// though the tombstone keeps other lookups alive.
-	s.DeletePod("u1")
-	if _, ok := s.GetPodByIP("10.0.0.6"); ok {
-		t.Fatal("deleted pod must not resolve by IP")
-	}
-	if _, ok := s.GetPodByUID("u1"); !ok {
-		t.Fatal("tombstone must still resolve by UID")
-	}
-}
-
-// A finished pod's status may retain a podIP the CNI has already handed to a
-// live pod; the finished pod must neither steal the mapping nor resolve.
-func TestGetPodByIPIgnoresFinishedPods(t *testing.T) {
-	s := New(time.Minute)
-	s.UpsertPod(&corev1.Pod{
-		ObjectMeta: metav1.ObjectMeta{Name: "live", Namespace: "ns", UID: "live-uid", ResourceVersion: "1"},
-		Status:     corev1.PodStatus{Phase: corev1.PodRunning, PodIP: "10.0.0.7", HostIP: "192.168.1.1"},
-	})
-	// A Succeeded Job pod whose upsert arrives later, still reporting the
-	// same (recycled) IP, must not displace the live owner.
-	s.UpsertPod(&corev1.Pod{
-		ObjectMeta: metav1.ObjectMeta{Name: "done", Namespace: "ns", UID: "done-uid", ResourceVersion: "1"},
-		Status:     corev1.PodStatus{Phase: corev1.PodSucceeded, PodIP: "10.0.0.7", HostIP: "192.168.1.1"},
-	})
-	if np, ok := s.GetPodByIP("10.0.0.7"); !ok || np.Pod.UID != "live-uid" {
-		t.Fatalf("recycled IP must resolve to the live pod: %+v, %v", np.Pod, ok)
-	}
-
-	// A finished pod's IP alone (no live claimant) must not resolve either.
-	s.UpsertPod(&corev1.Pod{
-		ObjectMeta: metav1.ObjectMeta{Name: "failed", Namespace: "ns", UID: "failed-uid", ResourceVersion: "1"},
-		Status:     corev1.PodStatus{Phase: corev1.PodFailed, PodIP: "10.0.0.8", HostIP: "192.168.1.1"},
-	})
-	if _, ok := s.GetPodByIP("10.0.0.8"); ok {
-		t.Fatal("finished pod must not resolve by IP")
-	}
-
-	// A running pod that finishes releases its mapping on the phase update.
-	s.UpsertPod(&corev1.Pod{
-		ObjectMeta: metav1.ObjectMeta{Name: "job", Namespace: "ns", UID: "job-uid", ResourceVersion: "1"},
-		Status:     corev1.PodStatus{Phase: corev1.PodRunning, PodIP: "10.0.0.9", HostIP: "192.168.1.1"},
-	})
-	if _, ok := s.GetPodByIP("10.0.0.9"); !ok {
-		t.Fatal("running pod must resolve by IP")
-	}
-	s.UpsertPod(&corev1.Pod{
-		ObjectMeta: metav1.ObjectMeta{Name: "job", Namespace: "ns", UID: "job-uid", ResourceVersion: "2"},
-		Status:     corev1.PodStatus{Phase: corev1.PodSucceeded, PodIP: "10.0.0.9", HostIP: "192.168.1.1"},
-	})
-	if _, ok := s.GetPodByIP("10.0.0.9"); ok {
-		t.Fatal("pod that finished must stop resolving by IP")
-	}
-}
-
 // Zero-TTL also applies to the RESTART path: a container ID replaced by a new
 // incarnation must expire immediately (expireEntryLocked's ttl<=0 branch), not
 // linger, while the new ID keeps resolving.
@@ -569,5 +215,31 @@ func TestZeroTTLRestartedContainerDeletesImmediately(t *testing.T) {
 	mustMiss(t, s, "old111")
 	if res := mustGet(t, s, "new222"); res.Container.ID != "new222" {
 		t.Fatalf("new ID resolves to %q", res.Container.ID)
+	}
+}
+
+// DeletePod followed by a re-upsert of the SAME UID with DIFFERENT container
+// IDs (delete event raced ahead of the last status update): the pod
+// resurrects, the new IDs index live, and the IDs from before the delete keep
+// the delete-time tombstone TTL rather than becoming immortal or vanishing.
+func TestResurrectWithChangedContainerIDs(t *testing.T) {
+	s, clk := newTestStore(time.Minute)
+	s.UpsertPod(makePod("uid1", "pod1", "node1", "1", map[string]string{"app": "before1"}))
+	s.DeletePod("uid1")
+	s.UpsertPod(makePod("uid1", "pod1", "node1", "2", map[string]string{"app": "after2"}))
+
+	res := mustGet(t, s, "after2")
+	if res.Pod.DeletedAt != nil {
+		t.Fatal("resurrected pod still marked deleted")
+	}
+	// The pre-delete ID stays resolvable for the TTL stamped at delete time...
+	if res := mustGet(t, s, "before1"); res.Pod.UID != "uid1" {
+		t.Fatalf("pre-delete ID resolved to %q", res.Pod.UID)
+	}
+	// ...and expires on schedule.
+	clk.Advance(time.Minute + time.Second)
+	mustMiss(t, s, "before1")
+	if res := mustGet(t, s, "after2"); res.Pod.Name != "pod1" {
+		t.Fatal("live ID must survive the old ID's expiry")
 	}
 }

@@ -1,17 +1,12 @@
 package tailer
 
 import (
-	"bytes"
-	"compress/gzip"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
-
-	"github.com/JohanLindvall/kubescrape/internal/agent/attrs"
-
-	"fmt"
 
 	"github.com/bmatcuk/doublestar/v4"
 	"sigs.k8s.io/yaml"
@@ -30,23 +25,6 @@ func LoadSourcesConfig(path string) ([]Source, error) {
 		return nil, fmt.Errorf("%s: %w", path, err)
 	}
 	return ValidateSources(cfg.Sources)
-}
-
-func newSourceTailer(exp *fakeExporter, sources []Source, multiline bool) *Tailer {
-	tl := New(Config{
-		Sources:          sources,
-		PollInterval:     20 * time.Millisecond,
-		FlushInterval:    30 * time.Millisecond,
-		BatchSize:        1000,
-		Multiline:        multiline,
-		MultilineTimeout: 3 * time.Second,
-		MetadataWait:     time.Second,
-		Metadata:         fakeMeta{},
-		NodeInfo:         func() *attrs.NodeInfo { return &attrs.NodeInfo{Name: "node1"} },
-		Exporter:         exp,
-	})
-	tl.retryBackoff = 10 * time.Millisecond
-	return tl
 }
 
 // matches reports whether the source would claim path (include minus
@@ -150,93 +128,6 @@ func TestPlainSourceTailing(t *testing.T) {
 	}
 }
 
-func writeGzip(t *testing.T, path string, lines ...string) {
-	t.Helper()
-	var buf bytes.Buffer
-	zw := gzip.NewWriter(&buf)
-	for _, l := range lines {
-		if _, err := zw.Write([]byte(l + "\n")); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if err := zw.Close(); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(path, buf.Bytes(), 0o644); err != nil {
-		t.Fatal(err)
-	}
-}
-
-// newArchiveTailer builds a tailer over a single compressed (*.log.gz) source
-// in dir — the fixture nearly every archive test uses.
-func newArchiveTailer(dir string, exp *fakeExporter) *Tailer {
-	return newSourceTailer(exp, []Source{{
-		Name:    "archives",
-		Include: []string{filepath.Join(dir, "*.log.gz")},
-	}}, false)
-}
-
-// appendGzip appends a fresh gzip member (its own lines) to an existing
-// archive — a valid multi-member gzip, head intact, so the file grows without
-// its identity changing.
-func appendGzip(t *testing.T, path string, lines ...string) {
-	t.Helper()
-	var buf bytes.Buffer
-	zw := gzip.NewWriter(&buf)
-	for _, l := range lines {
-		if _, err := zw.Write([]byte(l + "\n")); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if err := zw.Close(); err != nil {
-		t.Fatal(err)
-	}
-	fh, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = fh.Close() }()
-	if _, err := fh.Write(buf.Bytes()); err != nil {
-		t.Fatal(err)
-	}
-}
-
-func TestCompressedSourceReadWhole(t *testing.T) {
-	dir := t.TempDir()
-	exp := &fakeExporter{}
-	// A .gz source; multiline on to prove archives use the pipeline too.
-	tl := newSourceTailer(exp, []Source{{
-		Name:    "archives",
-		Include: []string{filepath.Join(dir, "*.log.gz")},
-	}}, true)
-	stop := startTailer(t, tl)
-	defer stop()
-
-	// Unlike plain tailing, a compressed archive that appears is read in full
-	// (not skipped to the end), including a multi-line Python traceback.
-	writeGzip(t, filepath.Join(dir, "old.log.gz"),
-		"line one",
-		"Traceback (most recent call last):",
-		`  File "x.py", line 3, in <module>`,
-		"    raise RuntimeError('boom')",
-		"line after")
-
-	waitFor(t, func() bool { return len(exp.get()) == 3 }, "3 records (line + joined traceback + line)")
-	got := exp.get()
-	if got[0] != "line one" || got[2] != "line after" {
-		t.Fatalf("records = %q", got)
-	}
-	if !strings.Contains(got[1], "Traceback") || !strings.Contains(got[1], "raise RuntimeError") {
-		t.Fatalf("traceback not joined from archive: %q", got[1])
-	}
-
-	// The archive is read once: no duplicate records over subsequent sweeps.
-	time.Sleep(200 * time.Millisecond)
-	if n := len(exp.get()); n != 3 {
-		t.Fatalf("archive re-read: %d records", n)
-	}
-}
-
 func TestSourceIncludeExclude(t *testing.T) {
 	dir := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(dir, "skip"), 0o755); err != nil {
@@ -304,4 +195,39 @@ func TestPlainMultilineJoinsAcrossRotation(t *testing.T) {
 	if j, n := plainTrace(exp); j != 1 || n != 1 {
 		t.Fatalf("plain traceback joined=%d count=%d (want 1/1): %q", j, n, exp.get())
 	}
+}
+
+// Per-source Multiline overrides the global default in both directions.
+func TestPerSourceMultilineOverride(t *testing.T) {
+	on, off := true, false
+	for _, tc := range []struct {
+		global bool
+		source *bool
+		want   bool
+	}{
+		{false, &on, true},
+		{true, &off, false},
+		{false, nil, false},
+		{true, nil, true},
+	} {
+		srcs := compileSources([]Source{{
+			Name:      "s",
+			Include:   []string{"/tmp/*.log"},
+			Multiline: tc.source,
+		}}, "", tc.global)
+		if got := srcs[0].multiline; got != tc.want {
+			t.Errorf("global=%v source=%v: multiline = %v, want %v",
+				tc.global, ptrStr(tc.source), got, tc.want)
+		}
+	}
+}
+
+func ptrStr(b *bool) string {
+	if b == nil {
+		return "nil"
+	}
+	if *b {
+		return "true"
+	}
+	return "false"
 }

@@ -2,6 +2,7 @@ package metrics
 
 import (
 	"context"
+	"errors"
 	"strconv"
 	"testing"
 	"time"
@@ -9,6 +10,214 @@ import (
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/pmetric"
 )
+
+// TestEmptyResourceExport: lines with an EMPTY resource map export under their
+// own ResourceMetrics with zero attributes, distinct from a populated resource.
+func TestEmptyResourceExport(t *testing.T) {
+	setTimeForTest(time.Unix(1_700_700_000, 0))
+	defer testEpoch.Store(0)
+
+	set, err := NewDynamicMetricSet([]Dynamic{{
+		Name: "lines_total", Type: CounterType, Value: "1", Match: []string{"m=1"},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	set.Add(nil, labelsFrom(map[string]string{"m": "1"}), noRes(), "")
+	set.Add(nil, labelsFrom(map[string]string{"m": "1"}), res(map[string]string{"k8s.pod.name": "p"}), "")
+
+	exp := &capExporter{}
+	if err := set.Export(context.Background(), exp, 0); err != nil {
+		t.Fatal(err)
+	}
+	emptyRMs, podRMs, totalRMs := 0, 0, 0
+	for _, md := range exp.md {
+		rms := md.ResourceMetrics()
+		for i := 0; i < rms.Len(); i++ {
+			totalRMs++
+			switch rms.At(i).Resource().Attributes().Len() {
+			case 0:
+				emptyRMs++
+			default:
+				podRMs++
+			}
+		}
+	}
+	if totalRMs != 2 || emptyRMs != 1 || podRMs != 1 {
+		t.Fatalf("ResourceMetrics: total %d empty %d pod %d, want 2/1/1", totalRMs, emptyRMs, podRMs)
+	}
+}
+
+// --- Angle 5: valueRegexp ----------------------------------------------------
+
+// flakyExporter fails the first chunk and records the rest.
+type flakyExporter struct {
+	calls int
+	names []string
+}
+
+func (f *flakyExporter) ExportMetrics(_ context.Context, md pmetric.Metrics) error {
+	f.calls++
+	if f.calls == 1 {
+		return errors.New("collector unavailable")
+	}
+	rms := md.ResourceMetrics()
+	for i := 0; i < rms.Len(); i++ {
+		if v, ok := rms.At(i).Resource().Attributes().Get("k8s.pod.name"); ok {
+			f.names = append(f.names, v.Str())
+		}
+	}
+	return nil
+}
+
+// TestExportContinuesPastFailedChunk: snapshot() has already sealed the
+// aggregation windows and cleared the counters' initial flag by the time the
+// first chunk is sent, so abandoning the remaining chunks on a failure would
+// discard observations that no longer exist in the store. The export must keep
+// going and report the first error.
+func TestExportContinuesPastFailedChunk(t *testing.T) {
+	set, err := NewDynamicMetricSet([]Dynamic{{
+		Name:  "test_lines_total",
+		Type:  CounterType,
+		Value: "1",
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Three distinct resources -> three chunks at a 1-byte chunk limit.
+	for _, pod := range []string{"pod-a", "pod-b", "pod-c"} {
+		set.Add(nil, labelsFrom(nil), res(map[string]string{"k8s.pod.name": pod}), "")
+	}
+
+	exp := &flakyExporter{}
+	if err := set.Export(context.Background(), exp, 1); err == nil {
+		t.Fatal("Export returned nil; the failed chunk must be reported")
+	}
+	if exp.calls != 3 {
+		t.Fatalf("exporter called %d times, want 3: a failing chunk must not abandon the rest", exp.calls)
+	}
+	if len(exp.names) != 2 {
+		t.Fatalf("delivered %v, want the 2 resources after the failing one", exp.names)
+	}
+}
+
+// resourceOf returns the metric's exported resource attributes for the given
+// metric name (the first ResourceMetrics containing it).
+func resourceOf(t *testing.T, exp *capExporter, name string) map[string]any {
+	t.Helper()
+	for _, md := range exp.md {
+		rms := md.ResourceMetrics()
+		for i := 0; i < rms.Len(); i++ {
+			rm := rms.At(i)
+			sms := rm.ScopeMetrics()
+			for j := 0; j < sms.Len(); j++ {
+				ms := sms.At(j).Metrics()
+				for k := 0; k < ms.Len(); k++ {
+					if ms.At(k).Name() == name {
+						return rm.Resource().Attributes().AsRaw()
+					}
+				}
+			}
+		}
+	}
+	t.Fatalf("%s not exported", name)
+	return nil
+}
+
+func TestLogResourceBecomesResourceAttrs(t *testing.T) {
+	setTimeForTest(time.Unix(1_700_200_300, 0))
+	defer testEpoch.Store(0)
+
+	// The log line's resource attributes become the metric's OTLP resource; the
+	// metric's own DSL labels stay on the data points. Two pods → two resources.
+	set, err := NewDynamicMetricSet([]Dynamic{{
+		Name:   "http_requests_total",
+		Type:   CounterType,
+		Value:  "1",
+		Match:  []string{"level=info"},
+		Labels: []string{"status=$http_status"},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	set.Add(nil, labelsFrom(map[string]string{"level": "info", "http_status": "200"}),
+		res(map[string]string{"k8s.pod.name": "pod-a", "k8s.namespace.name": "ns"}), "")
+	set.Add(nil, labelsFrom(map[string]string{"level": "info", "http_status": "500"}),
+		res(map[string]string{"k8s.pod.name": "pod-b", "k8s.namespace.name": "ns"}), "")
+
+	exp := &capExporter{}
+	if err := set.Export(context.Background(), exp, 0); err != nil {
+		t.Fatal(err)
+	}
+	// Two distinct resources, one per pod.
+	pods := map[string]bool{}
+	statusOnResource := false
+	for _, md := range exp.md {
+		rms := md.ResourceMetrics()
+		for i := 0; i < rms.Len(); i++ {
+			ra := rms.At(i).Resource().Attributes().AsRaw()
+			if p, ok := ra["k8s.pod.name"]; ok {
+				pods[p.(string)] = true
+			}
+			if _, ok := ra["status"]; ok {
+				statusOnResource = true
+			}
+		}
+	}
+	if !pods["pod-a"] || !pods["pod-b"] {
+		t.Errorf("pods on resources = %v, want pod-a and pod-b", pods)
+	}
+	if statusOnResource {
+		t.Error("status (a metric label) leaked onto the resource")
+	}
+	m := exportOne(t, set, "http_requests_total")
+	statusOnDP := false
+	dps := m.Sum().DataPoints()
+	for i := 0; i < dps.Len(); i++ {
+		if _, ok := dps.At(i).Attributes().Get("status"); ok {
+			statusOnDP = true
+		}
+	}
+	if !statusOnDP {
+		t.Error("status not present as a data-point attribute")
+	}
+}
+
+func TestResourceLabelsLiftedToResource(t *testing.T) {
+	setTimeForTest(time.Unix(1_700_200_400, 0))
+	defer testEpoch.Store(0)
+
+	// resourceLabels move a log-derived label onto the resource; labels stay on
+	// the data point.
+	set, err := NewDynamicMetricSet([]Dynamic{{
+		Name:           "reqs_total",
+		Type:           CounterType,
+		Value:          "1",
+		Match:          []string{"level=info"},
+		Labels:         []string{"status=$http_status"},
+		ResourceLabels: []string{"tenant=$tenant"},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	set.Add(nil, labelsFrom(map[string]string{"level": "info", "http_status": "200", "tenant": "acme"}),
+		res(map[string]string{"k8s.pod.name": "pod-a"}), "")
+
+	exp := &capExporter{}
+	if err := set.Export(context.Background(), exp, 0); err != nil {
+		t.Fatal(err)
+	}
+	ra := resourceOf(t, exp, "reqs_total")
+	if ra["tenant"] != "acme" {
+		t.Errorf("tenant not lifted to resource: %v", ra)
+	}
+	if ra["k8s.pod.name"] != "pod-a" {
+		t.Errorf("log resource attribute missing: %v", ra)
+	}
+	if _, ok := ra["status"]; ok {
+		t.Error("status (data-point label) leaked onto the resource")
+	}
+}
 
 // noRes is an empty resource for tests that don't exercise resource grouping.
 func noRes() pcommon.Map { return pcommon.NewMap() }

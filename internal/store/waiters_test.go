@@ -9,6 +9,166 @@ import (
 	"time"
 )
 
+func TestWaitForContainer(t *testing.T) {
+	s, _ := newTestStore(time.Minute)
+
+	done := make(chan ContainerResult, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		res, ok, _ := s.GetContainer(ctx, "late999")
+		if ok {
+			done <- res
+		}
+		close(done)
+	}()
+
+	time.Sleep(50 * time.Millisecond)
+	s.UpsertPod(makePod("uid1", "pod1", "node1", "1", map[string]string{"app": "late999"}))
+
+	select {
+	case res, ok := <-done:
+		if !ok {
+			t.Fatal("waiter returned not-found")
+		}
+		if res.Pod.Name != "pod1" {
+			t.Fatalf("got pod %q", res.Pod.Name)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("waiter did not wake up")
+	}
+}
+
+func TestWaitIsPerContainer(t *testing.T) {
+	s, _ := newTestStore(time.Minute)
+
+	got := make(chan bool, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_, ok, _ := s.GetContainer(ctx, "wanted1")
+		got <- ok
+	}()
+	other := make(chan bool, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+		defer cancel()
+		_, ok, _ := s.GetContainer(ctx, "other2")
+		other <- ok
+	}()
+
+	time.Sleep(50 * time.Millisecond)
+	// Indexing "wanted1" must release only its own waiter.
+	s.UpsertPod(makePod("uid1", "pod1", "node1", "1", map[string]string{"app": "wanted1"}))
+
+	if ok := <-got; !ok {
+		t.Fatal("waiter for indexed container did not get a result")
+	}
+	select {
+	case ok := <-other:
+		if ok {
+			t.Fatal("waiter for a different container was satisfied")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("other waiter never timed out")
+	}
+
+	// All waiter registrations must be cleaned up.
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if len(s.waiters) != 0 {
+		t.Fatalf("leaked waiters: %v", s.waiters)
+	}
+}
+
+func TestManyWaitersSameContainer(t *testing.T) {
+	s, _ := newTestStore(time.Minute)
+
+	const n = 20
+	results := make(chan bool, n)
+	for i := 0; i < n; i++ {
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			res, ok, _ := s.GetContainer(ctx, "shared123")
+			results <- ok && res.Pod.Name == "pod1"
+		}()
+	}
+
+	time.Sleep(50 * time.Millisecond)
+	s.UpsertPod(makePod("uid1", "pod1", "node1", "1", map[string]string{"app": "shared123"}))
+
+	for i := 0; i < n; i++ {
+		select {
+		case ok := <-results:
+			if !ok {
+				t.Fatalf("waiter %d did not get the pod", i)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("waiter %d never woke up", i)
+		}
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if len(s.waiters) != 0 {
+		t.Fatalf("leaked waiters: %v", s.waiters)
+	}
+}
+
+func TestWaitTimesOut(t *testing.T) {
+	s, _ := newTestStore(time.Minute)
+	start := time.Now()
+	mustMiss(t, s, "never")
+	if time.Since(start) > time.Second {
+		t.Fatal("wait took far longer than its context timeout")
+	}
+}
+
+// An expired-but-unswept tombstone must return not-found immediately: the
+// container is definitively gone, so waiting the full budget for it is
+// pointless (and blocks callers for seconds per dead container).
+func TestExpiredTombstoneDoesNotWait(t *testing.T) {
+	s, clk := newTestStore(time.Minute)
+	s.UpsertPod(makePod("uid1", "pod1", "node1", "1", map[string]string{"app": "abc123"}))
+	s.DeletePod("uid1")
+	clk.Advance(time.Minute + time.Second)
+	// No Sweep: the tombstone is expired but still present.
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	start := time.Now()
+	if _, ok, _ := s.GetContainer(ctx, "abc123"); ok {
+		t.Fatal("expired tombstone resolved")
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("lookup took %v; must not wait for an expired tombstone", elapsed)
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if len(s.waiters) != 0 {
+		t.Fatalf("expired-tombstone lookup registered waiters: %v", s.waiters)
+	}
+}
+
+// A replaced container ID whose TTL has lapsed is equally definitive: it can
+// never be reported again, so its lookup must not block either.
+func TestExpiredReplacedIDDoesNotWait(t *testing.T) {
+	s, clk := newTestStore(time.Minute)
+	s.UpsertPod(makePod("uid1", "pod1", "node1", "1", map[string]string{"app": "old111"}))
+	s.UpsertPod(makePod("uid1", "pod1", "node1", "2", map[string]string{"app": "new222"}))
+	clk.Advance(time.Minute + time.Second)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	start := time.Now()
+	if _, ok, _ := s.GetContainer(ctx, "old111"); ok {
+		t.Fatal("expired replaced ID resolved")
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("lookup took %v; must not wait for an expired replaced ID", elapsed)
+	}
+}
+
 // waitForCount polls waiterCount until it reaches want.
 func waitForCount(t *testing.T, s *Store, want int) {
 	t.Helper()

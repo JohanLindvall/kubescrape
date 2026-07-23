@@ -28,6 +28,8 @@ import (
 	"github.com/JohanLindvall/bufpool"
 
 	"github.com/JohanLindvall/kubescrape/internal/obs"
+
+	"github.com/JohanLindvall/kubescrape/pkg/otlpsplit"
 )
 
 // Config configures the exporter.
@@ -105,7 +107,7 @@ func New(cfg Config) (*Client, error) {
 		cfg.RetryBackoff = time.Second
 	}
 	if cfg.MaxSendBytes == 0 {
-		cfg.MaxSendBytes = defaultMaxSendBytes
+		cfg.MaxSendBytes = otlpsplit.DefaultMaxBytes
 	}
 	switch cfg.Compression {
 	case "":
@@ -228,7 +230,7 @@ func (c *Client) exportLogsCounted(ctx context.Context, ld plog.Logs) error {
 }
 
 func (c *Client) exportLogsOnce(ctx context.Context, ld plog.Logs) error {
-	parts := splitLogs(ld, c.cfg.MaxSendBytes)
+	parts := otlpsplit.Logs(ld, c.cfg.MaxSendBytes)
 	for _, part := range parts {
 		// A part-send failure returns immediately; the caller retries the whole
 		// payload, re-sending the parts already delivered — at-least-once
@@ -267,7 +269,7 @@ func (c *Client) ExportTraces(ctx context.Context, td ptrace.Traces) error {
 }
 
 func (c *Client) exportTracesOnce(ctx context.Context, td ptrace.Traces) error {
-	for _, part := range splitTraces(td, c.cfg.MaxSendBytes) {
+	for _, part := range otlpsplit.Traces(td, c.cfg.MaxSendBytes) {
 		if err := c.sendTracesOnce(ctx, part); err != nil {
 			return err
 		}
@@ -330,7 +332,7 @@ func (c *Client) exportMetricsCounted(ctx context.Context, md pmetric.Metrics) e
 }
 
 func (c *Client) exportMetricsOnce(ctx context.Context, md pmetric.Metrics) error {
-	for _, part := range splitMetrics(md, c.cfg.MaxSendBytes) {
+	for _, part := range otlpsplit.Metrics(md, c.cfg.MaxSendBytes) {
 		if err := c.sendMetricsOnce(ctx, part); err != nil {
 			return err
 		}

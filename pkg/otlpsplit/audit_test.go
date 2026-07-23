@@ -1,21 +1,14 @@
-package otlpexport
+package otlpsplit
 
 import (
-	"context"
 	"fmt"
-	"net/http"
-	"net/http/httptest"
 	"strings"
-	"sync/atomic"
 	"testing"
-	"time"
 
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/plog"
 	"go.opentelemetry.io/collector/pdata/pmetric"
 	"go.opentelemetry.io/collector/pdata/ptrace"
-
-	"github.com/JohanLindvall/kubescrape/internal/obs"
 )
 
 // ---------------------------------------------------------------------------
@@ -71,7 +64,7 @@ func TestAuditLogsUpperBoundStress(t *testing.T) {
 	for _, cp := range caps {
 		for _, sh := range shapes {
 			ld := buildAdversarialLogs(sh.res, sh.sc, sh.rec, sh.body)
-			parts := splitLogs(ld, cp)
+			parts := Logs(ld, cp)
 			for i, p := range parts {
 				sz := m.LogsSize(p)
 				single := p.ResourceLogs().Len() == 1 &&
@@ -155,7 +148,7 @@ func TestAuditMetricsPreservationAllTypes(t *testing.T) {
 			}
 		}
 	}
-	parts := splitMetrics(md, 16<<10)
+	parts := Metrics(md, 16<<10)
 	if len(parts) < 2 {
 		t.Fatalf("expected a split, got %d parts", len(parts))
 	}
@@ -227,7 +220,7 @@ func TestAuditTracesPreservationEventsLinks(t *testing.T) {
 			lk.Attributes().PutStr("lk", strings.Repeat("w", 40))
 		}
 	}
-	parts := splitTraces(td, 12<<10)
+	parts := Traces(td, 12<<10)
 	if len(parts) < 2 {
 		t.Fatalf("expected split, got %d parts", len(parts))
 	}
@@ -285,7 +278,7 @@ func TestAuditScopeAttrsPreservedOnBigSplit(t *testing.T) {
 	for i := 0; i < 3000; i++ {
 		sl.LogRecords().AppendEmpty().Body().SetStr(strings.Repeat("x", 40))
 	}
-	parts := splitLogs(ld, 8<<10)
+	parts := Logs(ld, 8<<10)
 	if len(parts) < 2 {
 		t.Fatalf("expected split, got %d", len(parts))
 	}
@@ -309,18 +302,18 @@ func TestAuditScopeAttrsPreservedOnBigSplit(t *testing.T) {
 
 func TestAuditDegenerateInputs(t *testing.T) {
 	// Empty logs, over-cap disabled? within cap → single value.
-	if got := splitLogs(plog.NewLogs(), 4096); len(got) != 1 || got[0].ResourceLogs().Len() != 0 {
+	if got := Logs(plog.NewLogs(), 4096); len(got) != 1 || got[0].ResourceLogs().Len() != 0 {
 		t.Fatalf("empty logs: got %d parts", len(got))
 	}
 	// ResourceLogs with zero ScopeLogs (small) survives as one part.
 	ld := plog.NewLogs()
 	ld.ResourceLogs().AppendEmpty().Resource().Attributes().PutStr("k", "v")
-	if got := splitLogs(ld, 4096); len(got) != 1 || got[0].ResourceLogs().Len() != 1 {
+	if got := Logs(ld, 4096); len(got) != 1 || got[0].ResourceLogs().Len() != 1 {
 		t.Fatalf("zero-scope resource dropped: %d parts", len(got))
 	}
 	// maxBytes=1: an over-cap payload, every record alone (one per part).
 	big := buildLogs(2, 20, 40)
-	parts := splitLogs(big, 1)
+	parts := Logs(big, 1)
 	for i, p := range parts {
 		if n := p.ResourceLogs().At(0).ScopeLogs().At(0).LogRecords().Len(); n != 1 {
 			t.Fatalf("maxBytes=1: part %d holds %d records, want 1", i, n)
@@ -337,7 +330,7 @@ func TestAuditDegenerateInputs(t *testing.T) {
 
 func TestAuditFastPathNoCopy(t *testing.T) {
 	ld := buildLogs(3, 3, 10)
-	parts := splitLogs(ld, 1<<20)
+	parts := Logs(ld, 1<<20)
 	if len(parts) != 1 {
 		t.Fatalf("within-cap split into %d parts", len(parts))
 	}
@@ -345,70 +338,6 @@ func TestAuditFastPathNoCopy(t *testing.T) {
 	parts[0].ResourceLogs().At(0).Resource().Attributes().PutStr("mutated", "yes")
 	if _, ok := ld.ResourceLogs().At(0).Resource().Attributes().Get("mutated"); !ok {
 		t.Fatalf("fast path copied instead of returning the same value")
-	}
-}
-
-// ---------------------------------------------------------------------------
-// Angle 5: obs.Exports counts once per LOGICAL export regardless of part count;
-// a mid-sequence part failure fails fast and is counted exactly once.
-// ---------------------------------------------------------------------------
-
-func TestAuditObsCountsOncePerLogicalExport(t *testing.T) {
-	var posts atomic.Int64
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		posts.Add(1)
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer srv.Close()
-
-	c, err := New(Config{Endpoint: srv.URL, Protocol: "http", Timeout: 5 * time.Second,
-		Compression: "none", MaxSendBytes: 16 << 10})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = c.Close() }()
-
-	before := obs.Exports.WithLabelValues("logs", "ok").Value()
-	if err := c.ExportLogs(context.Background(), buildLogs(1, 2000, 60)); err != nil {
-		t.Fatal(err)
-	}
-	if posts.Load() < 2 {
-		t.Fatalf("expected multiple POSTs, got %d", posts.Load())
-	}
-	if delta := obs.Exports.WithLabelValues("logs", "ok").Value() - before; delta != 1 {
-		t.Fatalf("obs.Exports{logs,ok} delta = %v, want exactly 1 per logical export", delta)
-	}
-}
-
-func TestAuditPartialSendFailsFastCountedOnce(t *testing.T) {
-	var posts atomic.Int64
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		if posts.Add(1) == 2 {
-			http.Error(w, "boom", http.StatusServiceUnavailable) // transient
-			return
-		}
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer srv.Close()
-
-	c, err := New(Config{Endpoint: srv.URL, Protocol: "http", Timeout: 5 * time.Second,
-		Compression: "none", MaxSendBytes: 16 << 10})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = c.Close() }()
-
-	beforeErr := obs.Exports.WithLabelValues("logs", "error").Value()
-	err = c.ExportLogs(context.Background(), buildLogs(1, 2000, 60))
-	if err == nil {
-		t.Fatal("expected error when part 2 fails")
-	}
-	// Fail-fast: no POST after the failing one.
-	if posts.Load() != 2 {
-		t.Fatalf("posts = %d, want 2 (fail-fast, no send after the failure)", posts.Load())
-	}
-	if delta := obs.Exports.WithLabelValues("logs", "error").Value() - beforeErr; delta != 1 {
-		t.Fatalf("obs.Exports{logs,error} delta = %v, want exactly 1", delta)
 	}
 }
 
@@ -433,26 +362,9 @@ func TestOverCapRecordlessResourceSentWhole(t *testing.T) {
 	// A non-empty input must never yield zero parts (that would report the
 	// export delivered while sending nothing): the over-cap record-less resource
 	// is sent whole — rejected and counted at the collector, never dropped.
-	parts := splitLogs(ld, maxBytes)
+	parts := Logs(ld, maxBytes)
 	if len(parts) != 1 {
 		t.Fatalf("over-cap record-less resource produced %d parts, want 1 (sent whole, never silently dropped)", len(parts))
-	}
-
-	// exportLogsOnce therefore makes exactly one wire send, not zero.
-	var posts atomic.Int64
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		posts.Add(1)
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer srv.Close()
-	c, _ := New(Config{Endpoint: srv.URL, Protocol: "http", Timeout: 2 * time.Second,
-		Compression: "none", MaxSendBytes: maxBytes})
-	defer func() { _ = c.Close() }()
-	if err := c.exportLogsOnce(context.Background(), ld); err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if posts.Load() != 1 {
-		t.Fatalf("over-cap payload made %d wire sends, want 1 (never silent success)", posts.Load())
 	}
 }
 
@@ -496,11 +408,11 @@ func TestBigSplitPreservesEmptyScope(t *testing.T) {
 	}
 
 	// Under cap: scope A survives.
-	if got := countScopeA(splitLogs(ld, 1<<20)); got != 1 {
+	if got := countScopeA(Logs(ld, 1<<20)); got != 1 {
 		t.Fatalf("under-cap path unexpectedly dropped empty scope A (%d)", got)
 	}
 	// Over cap: scope A is dropped by splitBigResourceLogs.
-	if got := countScopeA(splitLogs(ld, 8<<10)); got == 0 {
+	if got := countScopeA(Logs(ld, 8<<10)); got == 0 {
 		t.Fatalf("BUG: over-cap split dropped record-less scope A (its scope attrs/identity); under-cap path keeps it")
 	}
 }
@@ -518,7 +430,7 @@ func TestSplitScopelessOverCapResourceInMixedPayloadShips(t *testing.T) {
 	big := ld.ResourceLogs().AppendEmpty()
 	big.Resource().Attributes().PutStr("huge", strings.Repeat("x", 4096))
 
-	parts := splitLogs(ld, 1024)
+	parts := Logs(ld, 1024)
 	total := 0
 	sawBig := false
 	for _, p := range parts {

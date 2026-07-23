@@ -1,4 +1,13 @@
-package otlpexport
+// Package otlpsplit splits OTLP payloads (logs, metrics, traces) into parts
+// whose encoded protobuf size stays within a byte cap, preserving
+// resource/scope grouping. A collector's default gRPC receive limit applies
+// to the DECOMPRESSED message, so producers that batch by record count need
+// exactly this guarantee against wholesale rejection of oversized payloads.
+//
+// Invariant: a non-empty input never yields zero parts — an over-cap
+// record-less resource is sent whole (rejected and counted at the collector,
+// never silently reported delivered).
+package otlpsplit
 
 import (
 	"go.opentelemetry.io/collector/pdata/plog"
@@ -14,7 +23,9 @@ import (
 // proto size (attributes and framing included, not just bodies), keeps every
 // producer safe in one place; producers that already chunk under the cap
 // (promscrape, the ingest batcher) never trip the split.
-const defaultMaxSendBytes = 4<<20 - 256<<10 // 3.75 MiB: under the 4 MiB default, with margin
+// DefaultMaxBytes is a safe per-payload cap: comfortably under the OTLP
+// collector's 4 MiB default gRPC receive limit, with margin for framing.
+const DefaultMaxBytes = 4<<20 - 256<<10 // 3.75 MiB
 
 // elemOverhead absorbs the per-element proto framing (field tag + length
 // prefix) that the fine-grained *Size helpers exclude, so the summed budget
@@ -27,11 +38,11 @@ var (
 	traceMarshaler  ptrace.ProtoMarshaler
 )
 
-// splitLogs partitions ld so each part's encoded size is <= maxBytes,
+// Logs partitions ld so each part's encoded size is <= maxBytes,
 // preserving resource/scope grouping. A single record larger than maxBytes is
 // emitted alone (nothing here can shrink it; it will be rejected and counted).
 // maxBytes <= 0, or a payload already within the cap, returns ld unchanged.
-func splitLogs(ld plog.Logs, maxBytes int) []plog.Logs {
+func Logs(ld plog.Logs, maxBytes int) []plog.Logs {
 	if maxBytes <= 0 || logMarshaler.LogsSize(ld) <= maxBytes {
 		return []plog.Logs{ld}
 	}
@@ -138,10 +149,10 @@ func emptyRecordsRL(rl plog.ResourceLogs) plog.ResourceLogs {
 	return nrl
 }
 
-// splitMetrics partitions md so each part's encoded size is <= maxBytes,
+// Metrics partitions md so each part's encoded size is <= maxBytes,
 // splitting an over-large resource by metric (a single metric over the cap goes
 // alone). Producers that pre-chunk never reach the metric split.
-func splitMetrics(md pmetric.Metrics, maxBytes int) []pmetric.Metrics {
+func Metrics(md pmetric.Metrics, maxBytes int) []pmetric.Metrics {
 	if maxBytes <= 0 || metricMarshaler.MetricsSize(md) <= maxBytes {
 		return []pmetric.Metrics{md}
 	}
@@ -236,10 +247,10 @@ func emptyMetricsRM(rm pmetric.ResourceMetrics) pmetric.ResourceMetrics {
 	return nrm
 }
 
-// splitTraces partitions td so each part's encoded size is <= maxBytes,
+// Traces partitions td so each part's encoded size is <= maxBytes,
 // splitting an over-large resource by span (a single span over the cap goes
 // alone).
-func splitTraces(td ptrace.Traces, maxBytes int) []ptrace.Traces {
+func Traces(td ptrace.Traces, maxBytes int) []ptrace.Traces {
 	if maxBytes <= 0 || traceMarshaler.TracesSize(td) <= maxBytes {
 		return []ptrace.Traces{td}
 	}

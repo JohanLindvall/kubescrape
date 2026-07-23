@@ -1,4 +1,4 @@
-package otlpexport
+package otlpsplit
 
 import (
 	"fmt"
@@ -68,7 +68,7 @@ func TestSplitLogsBounds(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			ld := buildLogs(tc.resources, tc.recordsPer, tc.body)
 			want := collectBodies([]plog.Logs{ld})
-			parts := splitLogs(ld, tc.max)
+			parts := Logs(ld, tc.max)
 
 			// Every part is within the cap, except a part holding a single
 			// record that alone exceeds it (nothing can shrink that).
@@ -112,7 +112,7 @@ func TestSplitMetricsBounds(t *testing.T) {
 			total++
 		}
 	}
-	parts := splitMetrics(md, 16<<10)
+	parts := Metrics(md, 16<<10)
 	got := 0
 	for _, p := range parts {
 		if sz := m.MetricsSize(p); sz > 16<<10 {
@@ -149,7 +149,7 @@ func TestSplitTracesBounds(t *testing.T) {
 			total++
 		}
 	}
-	parts := splitTraces(td, 12<<10)
+	parts := Traces(td, 12<<10)
 	got := 0
 	for _, p := range parts {
 		if sz := m.TracesSize(p); sz > 12<<10 {
@@ -171,12 +171,12 @@ func TestSplitTracesBounds(t *testing.T) {
 // A payload already within the cap is returned as the same single value.
 func TestSplitNoOpWithinCap(t *testing.T) {
 	ld := buildLogs(2, 2, 10)
-	parts := splitLogs(ld, 1<<20)
+	parts := Logs(ld, 1<<20)
 	if len(parts) != 1 {
 		t.Fatalf("in-cap payload split into %d parts", len(parts))
 	}
 	// Disabled (<=0) also returns unchanged.
-	if got := splitLogs(buildLogs(500, 10, 100), -1); len(got) != 1 {
+	if got := Logs(buildLogs(500, 10, 100), -1); len(got) != 1 {
 		t.Fatalf("negative cap should disable splitting, got %d parts", len(got))
 	}
 }

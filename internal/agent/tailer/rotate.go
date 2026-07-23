@@ -110,7 +110,7 @@ func (t *Tailer) reopen(ctx context.Context, f *file, renamed bool) {
 			// A trailing unterminated fragment of a RENAMED-away inode can
 			// never complete (the old file is not followed after the drain);
 			// it dies with the reset below on every path — live, rewind
-			// re-feed, and crash-restart (feedPrefix feeds only terminated
+			// re-feed, and crash-restart (replaySegment feeds only terminated
 			// lines) — so at minimum the loss is visible.
 			obs.LogTornFinalLines.Inc()
 			t.log.Warn("unterminated final line lost at rotation", "path", f.path, "bytes", n)

@@ -12,7 +12,8 @@ import (
 // fuzzMetricSet compiles a rule set that references line fields in every way
 // the DSL allows: JSON dotted paths, logfmt keys, the __line__ synthetic key,
 // value extraction (field, "1", regexp), masks, regex replaces, selectors and
-// resource labels — so fuzzed line content flows through keyIndex/lineFields,
+// resource labels — so fuzzed line content flows through logline's
+// KeyIndex/Fields,
 // the JSON GetPaths/unsafe-string path and the logfmt scanner.
 func fuzzMetricSet(t testing.TB) *DynamicMetricSet {
 	set, err := NewDynamicMetricSet([]Dynamic{

@@ -180,7 +180,7 @@ func Metrics(md pmetric.Metrics, maxBytes int) []pmetric.Metrics {
 		}
 		flush()
 		if rm.ScopeMetrics().Len() == 0 {
-			// See splitLogs: a scope-less over-cap resource must still ship.
+			// See Logs: a scope-less over-cap resource must still ship.
 			part := pmetric.NewMetrics()
 			rm.CopyTo(part.ResourceMetrics().AppendEmpty())
 			out = append(out, part)
@@ -189,7 +189,7 @@ func Metrics(md pmetric.Metrics, maxBytes int) []pmetric.Metrics {
 		splitBigResourceMetrics(rm, maxBytes, &out)
 	}
 	flush()
-	// A non-empty input must never yield zero parts (see splitLogs).
+	// A non-empty input must never yield zero parts (see Logs).
 	if len(out) == 0 && md.ResourceMetrics().Len() > 0 {
 		return []pmetric.Metrics{md}
 	}
@@ -278,7 +278,7 @@ func Traces(td ptrace.Traces, maxBytes int) []ptrace.Traces {
 		}
 		flush()
 		if rs.ScopeSpans().Len() == 0 {
-			// See splitLogs: a scope-less over-cap resource must still ship.
+			// See Logs: a scope-less over-cap resource must still ship.
 			part := ptrace.NewTraces()
 			rs.CopyTo(part.ResourceSpans().AppendEmpty())
 			out = append(out, part)
@@ -287,7 +287,7 @@ func Traces(td ptrace.Traces, maxBytes int) []ptrace.Traces {
 		splitBigResourceSpans(rs, maxBytes, &out)
 	}
 	flush()
-	// A non-empty input must never yield zero parts (see splitLogs).
+	// A non-empty input must never yield zero parts (see Logs).
 	if len(out) == 0 && td.ResourceSpans().Len() > 0 {
 		return []ptrace.Traces{td}
 	}

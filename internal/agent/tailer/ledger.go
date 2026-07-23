@@ -102,6 +102,10 @@ type file struct {
 	resolved    bool
 	nextMetaTry time.Time
 	gone        bool
+	// unresolvedLost: the gone-before-resolve loss was already counted and
+	// its checkpointed segments retired — drainGone must not re-count on the
+	// sweeps between the drain and the release.
+	unresolvedLost bool
 
 	// Per-file line rate limiting (Config.RateLimit): a token bucket refilled
 	// by elapsed time. limited marks a paused file (tokens exhausted, reading
@@ -233,6 +237,22 @@ func (l *ledger) curSeg() int {
 
 // streamState is the offset accounting for one pipeline key. stream is the
 // precomputed streamOf(key), stamped on emitted entries. hasRun marks a
+// fedEnd returns the last FED line boundary of the current tail incarnation
+// (max streamState.lastEnd at the tail, floored at committed): the highest
+// offset a committing entry can ever reach. Bytes past it — a torn final
+// fragment, a blank line, rate-DROPPED or oversize-discarded lines — never
+// entered the pipeline and can never commit, so completion conditions
+// (segment `to`, goneEnd) must compare against this, never raw readPos.
+func (f *file) fedEnd() int64 {
+	end := f.committed
+	for _, st := range f.streams {
+		if st.lastEnd.seg == f.tail && st.lastEnd.off > end {
+			end = st.lastEnd.off
+		}
+	}
+	return end
+}
+
 // pending stage-1 run (presence, not just a zero offset).
 type streamState struct {
 	key      string

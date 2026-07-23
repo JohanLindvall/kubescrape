@@ -1143,3 +1143,153 @@ func TestGoneFileUnterminatedTailDeliversAndSettles(t *testing.T) {
 		t.Fatal("gone file with unterminated tail never settled (fd/map leak)")
 	}
 }
+
+// A gone file whose tail bytes never entered the pipeline (here: a trailing
+// blank line on a plain source) must still settle and be released: goneEnd is
+// the FED boundary, not readPos — committed can never reach bytes that never
+// produced an entry, and comparing against readPos held the fd and the
+// files-map entry forever.
+func TestGoneFileWithTrailingBlankLineSettles(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+	exp := &fakeExporter{}
+	tl := newSourceTailer(exp, []Source{{Name: "plain", Include: []string{dir + "/*.log"}}}, false)
+	path := filepath.Join(dir, "app.log")
+	tl.scanDir(tl.loadCheckpoints(), true) // initial scan first: a pre-existing file would be skipped to its end
+	writeLines(t, path, "a", "b", "")      // trailing blank: consumed, never fed
+	tl.scanDir(nil, false)                 // discover it
+	driveUntil(t, ctx, tl, func() bool { return len(exp.get()) == 2 }, "both lines exported")
+
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	driveUntil(t, ctx, tl, func() bool {
+		tl.scanDir(nil, false)
+		_, tracked := tl.files[path]
+		return !tracked
+	}, "gone file released despite the never-fed trailing blank")
+}
+
+// The rate-DROP variant of the same disease: a chatty pod killed while over
+// its rate limit leaves dropped (never-fed) bytes at the tail. The file must
+// still settle once everything FED has committed.
+func TestGoneFileWithRateDroppedTailSettles(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+	exp := &fakeExporter{}
+	tl := driveTailer(dir, exp)
+	tl.cfg.RateLimit = 2
+	tl.cfg.RateBurst = 2
+	tl.cfg.RateDrop = true
+
+	tl.scanDir(tl.loadCheckpoints(), true)
+	rateLines(t, dir, 0, 6) // burst 2: the tail lines are dropped, never fed
+	tl.scanDir(nil, false)
+	driveUntil(t, ctx, tl, func() bool { return len(exp.get()) >= 2 }, "burst lines exported")
+
+	path := filepath.Join(dir, logName)
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	driveUntil(t, ctx, tl, func() bool {
+		tl.scanDir(nil, false)
+		_, tracked := tl.files[path]
+		return !tracked
+	}, "gone file released despite rate-dropped tail bytes")
+}
+
+// An unresolved gone file that restored checkpointed Pending segments must
+// count its loss ONCE, retire the segments (their content is unattributable),
+// and be released — not re-warn and re-count every sweep forever while
+// settledGone stares at segments that can never commit.
+func TestUnresolvedGoneFileWithSegmentsSettlesOnce(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+
+	// A previous incarnation: real file with a committed checkpoint carrying
+	// an incomplete Pending segment.
+	posPath := filepath.Join(t.TempDir(), "pos.json")
+	pos := mustOpenPositions(t, posPath)
+	path := filepath.Join(dir, logName)
+	writeLog(t, dir, "2026-07-05T10:00:00Z stdout F seed")
+	ino := inodeOfPath(t, path)
+	if err := pos.SetLogs(map[string]positions.LogPos{path: {
+		Offset: 0, Inode: ino,
+		Pending: []positions.Prefix{{Inode: ino + 999, From: 0, To: 100}},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+
+	exp := &fakeExporter{}
+	tl := driveTailer(dir, exp)
+	tl.cfg.Positions = pos
+	tl.cfg.Metadata = &flakyMeta{fails: 1 << 30} // never resolves
+	unresolvedBefore := obs.LogUnresolvedLost.Value()
+	prefixBefore := obs.LogPrefixLost.Value()
+
+	tl.scanDir(tl.loadCheckpoints(), true)
+	tl.sweep(ctx, true) // tracked, unresolved, segments restored
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	driveUntil(t, ctx, tl, func() bool {
+		tl.scanDir(nil, false)
+		_, tracked := tl.files[path]
+		return !tracked
+	}, "unresolved gone file with segments released")
+
+	if got := obs.LogUnresolvedLost.Value(); got != unresolvedBefore+1 {
+		t.Fatalf("LogUnresolvedLost = %v, want exactly %v (one count, not one per sweep)", got, unresolvedBefore+1)
+	}
+	if got := obs.LogPrefixLost.Value(); got != prefixBefore+1 {
+		t.Fatalf("LogPrefixLost = %v, want %v (the retired segment)", got, prefixBefore+1)
+	}
+}
+
+// A checkpointed segment whose rotated file is SHORTER than the recorded
+// range (truncated while the agent was down) must count the missing tail as
+// lost and retire through the normal commit path — not wedge forever below
+// an offset no commit can reach.
+func TestSegmentShorterThanRangeRetires(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+
+	posPath := filepath.Join(t.TempDir(), "pos.json")
+	pos := mustOpenPositions(t, posPath)
+	path := filepath.Join(dir, logName)
+	line := timeNowCRI() + " stdout F short"
+	writeLog(t, dir, line) // the "rotated" content: one short line
+	ino := inodeOfPath(t, path)
+	st, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The checkpointed identity matches the live file (tail caught up at its
+	// size), and the Pending segment claims its range ran to offset 1000 —
+	// far past the file's actual EOF (the rotated source was truncated while
+	// the agent was down; findRotated resolves the inode to this short file).
+	if err := pos.SetLogs(map[string]positions.LogPos{path: {
+		Offset: st.Size(), Inode: ino,
+		Pending: []positions.Prefix{{Inode: ino, From: 0, To: 1000}},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+
+	exp := &fakeExporter{}
+	tl := driveTailer(dir, exp)
+	tl.cfg.Positions = pos
+	prefixBefore := obs.LogPrefixLost.Value()
+
+	tl.scanDir(tl.loadCheckpoints(), true)
+	driveUntil(t, ctx, tl, func() bool {
+		f, tracked := tl.files[path]
+		return tracked && len(f.segments) == 0
+	}, "short segment retired")
+
+	if got := obs.LogPrefixLost.Value(); got != prefixBefore+1 {
+		t.Fatalf("LogPrefixLost = %v, want %v (the unreachable tail)", got, prefixBefore+1)
+	}
+	if got := exp.get(); len(got) != 1 || got[0] != "short" {
+		t.Fatalf("fed prefix must still deliver: %v", got)
+	}
+}

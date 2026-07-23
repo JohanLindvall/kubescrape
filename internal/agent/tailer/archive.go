@@ -92,7 +92,18 @@ func (t *Tailer) readArchive(ctx context.Context, f *file) error {
 		if err != nil {
 			if errors.Is(err, io.EOF) {
 				t.finishArchive(ctx, f)
+				return nil
 			}
+			// A corrupt stream (truncated gzip tail, trailing garbage) is
+			// unrecoverable: the retained reader would return the same error
+			// every sweep forever — fd and reader held, nothing progressing,
+			// nothing reported. Deliver what decoded, count the loss, and
+			// settle under the current identity (finishArchive), so a later
+			// rewrite of the file is still detected and re-read.
+			obs.LogArchiveErrors.Inc()
+			t.log.Warn("archive decode failed; remaining content lost",
+				"path", f.path, "offset", f.readPos, "error", err)
+			t.finishArchive(ctx, f)
 			return nil
 		}
 	}

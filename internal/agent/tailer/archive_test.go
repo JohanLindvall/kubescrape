@@ -10,6 +10,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/JohanLindvall/kubescrape/internal/obs"
 )
 
 func TestCompressedSourceReadWhole(t *testing.T) {
@@ -581,4 +583,39 @@ func TestArchiveRetainedFdResumeSkipsCommittedPrefix(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 	}
 	t.Fatalf("archive remainder never shipped from the retained fd: %v", exp.get())
+}
+
+// A corrupt gzip stream (here: trailing garbage after a valid member) must
+// deliver what decoded, count the loss, and SETTLE — not silently re-read
+// the same error from the retained reader every sweep forever, holding the
+// fd and reader with nothing reported.
+func TestCorruptArchiveTailSettlesCounted(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+	exp := &fakeExporter{}
+	tl := newArchiveTailer(dir, exp)
+	path := filepath.Join(dir, "app.log.gz")
+	writeGzip(t, path, "one", "two")
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.Write([]byte("this is not gzip")); err != nil {
+		t.Fatal(err)
+	}
+	_ = f.Close()
+	errsBefore := obs.LogArchiveErrors.Value()
+
+	tl.scanDir(tl.loadCheckpoints(), true)
+	driveUntil(t, ctx, tl, func() bool {
+		fl, tracked := tl.files[path]
+		return tracked && fl.archiveDone && fl.f == nil && fl.gz == nil
+	}, "corrupt archive settled and released")
+
+	if got := exp.get(); len(got) != 2 || got[0] != "one" || got[1] != "two" {
+		t.Fatalf("decoded prefix must deliver: %v", got)
+	}
+	if got := obs.LogArchiveErrors.Value(); got != errsBefore+1 {
+		t.Fatalf("LogArchiveErrors = %v, want %v (loss must be visible, once)", got, errsBefore+1)
+	}
 }

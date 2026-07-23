@@ -7,6 +7,7 @@ package tailer
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -148,12 +149,7 @@ func (t *Tailer) reopen(ctx context.Context, f *file, renamed bool) {
 	// covering them pinned the segment below retirement forever (fd + gone
 	// file + checkpoint entry leaked, one per rotation for a writer ending
 	// with a blank line).
-	fedEnd := f.committed
-	for _, st := range f.streams {
-		if st.lastEnd.seg == f.tail && st.lastEnd.off > fedEnd {
-			fedEnd = st.lastEnd.off
-		}
-	}
+	fedEnd := f.fedEnd()
 	// Whether every PRE-EXISTING segment's owed lines are live (pipeline or
 	// batch) — captured before this rotation appends its own hop. With no
 	// prior segments the answer is vacuously yes (segmentsFed is only
@@ -297,6 +293,8 @@ func (t *Tailer) replaySegment(ctx context.Context, f *file, p *segment) {
 	}
 	var carry []byte
 	cur := p.committed
+	fed := p.committed // last FED line boundary — the only offset commits can reach
+	var lastErr error
 	discarding := false // an over-cap line's remainder, dropped to its newline
 	buf := t.scratch()
 	for remaining > 0 {
@@ -330,22 +328,43 @@ func (t *Tailer) replaySegment(ctx context.Context, f *file, p *segment) {
 				}
 				if len(line) > 0 {
 					t.feedLine(ctx, f, string(line), start, cur)
+					fed = cur
 				}
 			}
 		}
 		if rerr != nil {
+			lastErr = rerr
 			break
 		}
 	}
 	if p.to < 0 {
 		// The open-ended replay reached EOF: pin the range so entry commits
-		// can retire the segment. Only FED bytes count (a trailing fragment
-		// or blank line can never produce a committing entry) — cur is the
-		// last fed line boundary at this point.
-		if cur > p.committed {
-			p.to = cur
+		// can retire the segment. Only FED bytes count (a trailing fragment,
+		// blank line or discarded oversize run can never produce a committing
+		// entry).
+		if fed > p.committed {
+			p.to = fed
 		} else {
 			f.retire(p) // nothing recoverable was fed
+		}
+		return
+	}
+	if remaining > 0 && errors.Is(lastErr, io.EOF) {
+		// The source ended before the owed range did: the rotated file was
+		// truncated or shortened while the agent was down, or identity
+		// matching landed on a shorter file. The missing tail is
+		// unrecoverable — count it and clamp `to` to the fed boundary so the
+		// segment retires through the normal commit path instead of wedging
+		// forever below an offset no commit can ever reach (fd, checkpoint
+		// Pending entry and committedPos all pinned). A transient read error
+		// (lastErr not EOF) leaves the segment untouched for a retry.
+		obs.LogPrefixLost.Inc()
+		t.log.Warn("rotated segment shorter than its checkpointed range; missing tail lost",
+			"path", path, "committed", p.committed, "to", p.to, "fed", fed)
+		if fed > p.committed {
+			p.to = fed
+		} else {
+			f.retire(p) // nothing recoverable at all
 		}
 	}
 }
@@ -394,9 +413,25 @@ func (t *Tailer) drainGone(f *file) {
 		// and with the file gone nothing can be: the content is lost. Make the
 		// loss visible — a metadata-service outage overlapping pod deletions
 		// silently eating final logs is exactly what an operator must see.
+		// Count ONCE: drainGone re-runs every sweep until settledGone, and a
+		// gone file can never resolve (the gone check precedes metadata
+		// resolution), so re-counting here spammed the metric and the log ~2/s
+		// per file forever.
+		if f.unresolvedLost {
+			return
+		}
+		f.unresolvedLost = true
 		obs.LogUnresolvedLost.Inc()
 		t.log.Warn("file deleted before its metadata resolved; content lost",
 			"path", f.path, "containerID", f.containerID)
+		// Checkpointed segments restored by initFile (created before metadata
+		// could resolve) hold fds and checkpoint entries for content that is
+		// now unattributable. Retire them as lost prefixes — without this
+		// settledGone sees the segments and holds the file forever.
+		for len(f.segments) > 0 {
+			obs.LogPrefixLost.Inc()
+			f.retire(f.segments[0])
+		}
 		return
 	}
 	// Incomplete segments are OLDER than the current inode's remainder and
@@ -426,7 +461,12 @@ func (t *Tailer) drainGone(f *file) {
 		t.consume(context.Background(), f, true)
 	}
 	t.stopPipeline(context.Background(), f)
-	f.goneEnd = max(f.goneEnd, f.readPos) // the inode's true end, rewind-proof
+	// The settle target is the FED boundary, not readPos: trailing consumed-
+	// but-never-fed bytes (a blank final line, a rate-DROPPED or oversized-
+	// discarded tail) can never produce a committing entry, and a goneEnd
+	// covering them held the fd and the files-map entry forever (max keeps it
+	// rewind-proof — a failed export must not lower an already-drained end).
+	f.goneEnd = max(f.goneEnd, f.fedEnd())
 }
 
 // release closes the file's handles and watches. After this the inode is

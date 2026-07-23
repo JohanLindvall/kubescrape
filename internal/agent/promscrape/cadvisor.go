@@ -18,6 +18,8 @@ import (
 	"github.com/JohanLindvall/kubescrape/internal/obs"
 	"github.com/JohanLindvall/kubescrape/pkg/kubemeta"
 	"github.com/JohanLindvall/kubescrape/pkg/promparse"
+
+	"github.com/JohanLindvall/kubescrape/pkg/cgroupid"
 )
 
 // MetaSource resolves pod and container metadata; implemented by
@@ -256,7 +258,7 @@ type cadvisorBatcher struct {
 	// new resource or metric is inserted.
 	keyBuf []byte
 
-	// cgroupMemo caches cgroupIdentity per raw "id" value: each container's
+	// cgroupMemo caches cgroupid.Identity per raw "id" value: each container's
 	// cgroup path recurs in every family of the scrape (~60×), and the parse
 	// (plus the systemd layout's uid underscore rewrite) is the expensive part
 	// of identityOf. The mapping is pure, so the memo survives reset() and
@@ -336,7 +338,7 @@ func (cb *cadvisorBatcher) identityOf(labels []Label) cadvisorIdentity {
 			ident.hasCgroup = true
 			pair, ok := cb.cgroupMemo[l.Value]
 			if !ok {
-				pair.podUID, pair.containerID = cgroupIdentity(l.Value)
+				pair.podUID, pair.containerID = cgroupid.Identity(l.Value)
 				if len(cb.cgroupMemo) < maxTrackedFamilies {
 					cb.cgroupMemo[l.Value] = pair
 				}

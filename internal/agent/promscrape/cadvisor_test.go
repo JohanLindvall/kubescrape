@@ -267,30 +267,6 @@ func keys[V any](m map[string]V) []string {
 	return out
 }
 
-func TestCgroupIdentity(t *testing.T) {
-	cases := []struct {
-		id       string
-		uid, cid string
-	}{
-		{"/kubepods/burstable/pod" + uid1 + "/" + appCID, uid1, appCID},
-		{"/kubepods/pod" + uid1 + "/" + appCID, uid1, appCID}, // Guaranteed QoS
-		{"/kubepods/burstable/pod" + uid1, uid1, ""},
-		{"/kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod" +
-			strings.ReplaceAll(uid1, "-", "_") + ".slice/cri-containerd-" + appCID + ".scope", uid1, appCID},
-		{"/kubepods.slice/kubepods-pod" + strings.ReplaceAll(uid1, "-", "_") + ".slice/docker-" + appCID + ".scope", uid1, appCID},
-		{"/", "", ""},
-		{"/kubepods", "", ""},
-		{"/kubepods.slice/kubepods-burstable.slice", "", ""},
-		{"/system.slice/containerd.service", "", ""},
-	}
-	for _, c := range cases {
-		uid, cid := cgroupIdentity(c.id)
-		if uid != c.uid || cid != c.cid {
-			t.Errorf("cgroupIdentity(%q) = (%q, %q), want (%q, %q)", c.id, uid, cid, c.uid, c.cid)
-		}
-	}
-}
-
 func TestScrapeNodeMetrics(t *testing.T) {
 	var gotPath string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

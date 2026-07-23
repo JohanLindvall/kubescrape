@@ -1,8 +1,12 @@
-package promscrape
+// Package cgroupid extracts Kubernetes pod and container identity from
+// cgroup paths, understanding both the cgroupfs and the systemd cgroup
+// driver layouts. It is the parsing behind cadvisor's `id` label but has no
+// dependency on scraping — any code holding a cgroup path can use it.
+package cgroupid
 
 import "strings"
 
-// cgroupIdentity extracts the pod UID and container ID from a cadvisor "id"
+// Identity extracts the pod UID and container ID from a cadvisor "id"
 // label (the cgroup path). Both the cgroupfs and the systemd driver layouts
 // are understood:
 //
@@ -15,7 +19,7 @@ import "strings"
 //
 // Runs once per cadvisor sample, so the path is walked in place (substring
 // slices) rather than split into an allocated segment slice.
-func cgroupIdentity(id string) (podUID, containerID string) {
+func Identity(id string) (podUID, containerID string) {
 	for start := 0; start < len(id); {
 		var seg string
 		if i := strings.IndexByte(id[start:], '/'); i >= 0 {
@@ -34,7 +38,7 @@ func cgroupIdentity(id string) (podUID, containerID string) {
 		// Pod segment: "pod<uid>" (cgroupfs) or
 		// "kubepods-<qos>-pod<uid_with_underscores>" (systemd).
 		if i := strings.LastIndex(seg, "pod"); i >= 0 {
-			if uid := strings.ReplaceAll(seg[i+3:], "_", "-"); isPodUID(uid) {
+			if uid := strings.ReplaceAll(seg[i+3:], "_", "-"); IsPodUID(uid) {
 				podUID = uid
 				continue
 			}
@@ -45,15 +49,15 @@ func cgroupIdentity(id string) (podUID, containerID string) {
 		if i := strings.LastIndexByte(cand, '-'); i >= 0 {
 			cand = cand[i+1:]
 		}
-		if isContainerID(cand) {
+		if IsContainerID(cand) {
 			containerID = cand
 		}
 	}
 	return podUID, containerID
 }
 
-// isPodUID matches the canonical UID form 8-4-4-4-12 (hex and dashes).
-func isPodUID(s string) bool {
+// IsPodUID matches the canonical UID form 8-4-4-4-12 (hex and dashes).
+func IsPodUID(s string) bool {
 	if len(s) != 36 {
 		return false
 	}
@@ -72,8 +76,8 @@ func isPodUID(s string) bool {
 	return true
 }
 
-// isContainerID matches a 64-character hex runtime container ID.
-func isContainerID(s string) bool {
+// IsContainerID matches a 64-character hex runtime container ID.
+func IsContainerID(s string) bool {
 	if len(s) != 64 {
 		return false
 	}

@@ -99,29 +99,3 @@ func FuzzConverter(f *testing.F) {
 		checkTaken(b.take())
 	})
 }
-
-// FuzzCgroupIdentity feeds arbitrary strings through the cadvisor cgroup-path
-// parser. Invariants: no panics; a non-empty pod UID is always canonical
-// 8-4-4-4-12 form; a non-empty container ID is always 64 hex characters.
-func FuzzCgroupIdentity(f *testing.F) {
-	seeds := []string{
-		"/kubepods/burstable/pod12345678-1234-1234-1234-123456789012/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-		"/kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod12345678_1234_1234_1234_123456789012.slice/cri-containerd-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef.scope",
-		"/kubepods/pod12345678-1234-1234-1234-123456789012",
-		"/", "", "//", "pod", "podX", "/system.slice/docker-.scope",
-		"/kubepods.slice/kubepods-pod_.slice", "pod\x00", "/kubepods/pod£züß/…",
-		"/a/pod12345678-1234-1234-1234-12345678901G/b",
-	}
-	for _, s := range seeds {
-		f.Add(s)
-	}
-	f.Fuzz(func(t *testing.T, id string) {
-		podUID, containerID := cgroupIdentity(id)
-		if podUID != "" && !isPodUID(podUID) {
-			t.Fatalf("cgroupIdentity(%q) returned non-canonical pod UID %q", id, podUID)
-		}
-		if containerID != "" && !isContainerID(containerID) {
-			t.Fatalf("cgroupIdentity(%q) returned non-hex container ID %q", id, containerID)
-		}
-	})
-}

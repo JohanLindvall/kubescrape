@@ -346,3 +346,35 @@ func TestZeroMaxLineBytesParsesNormally(t *testing.T) {
 		})
 	}
 }
+
+// A non-pooled parser reused across expositions must parse each one fully:
+// the previous exposition's `# EOF` flag and TYPE classifications must not
+// leak into the next (the pooled Get/Put path resets them; New()+Parse+Parse
+// is equally legal API use and silently truncated instead).
+func TestParserSequentialReuse(t *testing.T) {
+	p := New(Options{OpenMetrics: true})
+	count := func(body string) int {
+		n := 0
+		if _, err := p.Parse(strings.NewReader(body), func(Sample) error {
+			n++
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+	if got := count("a 1\n# EOF\n"); got != 1 {
+		t.Fatalf("first exposition: %d samples, want 1", got)
+	}
+	if got := count("b 1\nc 2\nd 3\n"); got != 3 {
+		t.Fatalf("second exposition after # EOF: %d samples, want 3 (stale eof truncated)", got)
+	}
+	// Stale TYPE roles must not survive either: `a` was untyped above; now a
+	// histogram — its bucket must classify, and vice versa on a third pass.
+	if got := count("# TYPE a histogram\na_bucket{le=\"+Inf\"} 1\na_count 1\na_sum 1\n# EOF\n"); got != 3 {
+		t.Fatalf("third exposition: %d samples, want 3", got)
+	}
+	if got := count("a_bucket{le=\"+Inf\"} 1\n"); got != 1 {
+		t.Fatalf("fourth exposition: %d samples, want 1", got)
+	}
+}

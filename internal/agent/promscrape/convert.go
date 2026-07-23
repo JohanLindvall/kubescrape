@@ -47,7 +47,7 @@ const (
 	bucketBytes         = 12 // one explicit bound + its count
 	histFixedBytes      = 16 // count + sum
 	quantileBytes       = 18 // quantile + value
-	exemplarBytes       = 48 // value, timestamp, trace/span ids
+	exemplarBytes       = 48 // value, timestamp, trace/span ids (labels charged separately)
 	resOverheadBytes    = 24 // ResourceMetrics + Resource + ScopeMetrics framing
 	metricOverheadBytes = 16 // one Metric: descriptor framing, type wrapper, temporality
 )
@@ -79,19 +79,34 @@ func labelBytes(labels []Label) int {
 	return n
 }
 
+// exemplarSize estimates one exemplar's encoded size INCLUDING its labels:
+// only trace_id/span_id become fixed-size fields — every other label lands in
+// FilteredAttributes, unbounded by the parser (OpenMetrics allows 128 chars of
+// label runes). The old flat 48-byte charge let a 6k-series histogram whose
+// exemplars carried two ~50-char labels flush at an estimated 3 MiB and
+// encode to 8.6 MiB — past the 4 MiB collector receive limit the estimate
+// exists to respect.
+func exemplarSize(e *Exemplar) int {
+	return exemplarBytes + labelBytes(e.Labels)
+}
+
 // numberBytes estimates the encoded size of one number data point.
 func numberBytes(s Sample) int {
 	n := pointOverheadBytes + labelBytes(s.Labels)
 	if s.Exemplar != nil {
-		n += exemplarBytes
+		n += exemplarSize(s.Exemplar)
 	}
 	return n
 }
 
 // histBytes estimates the encoded size of one histogram data point.
 func histBytes(acc *histAcc) int {
-	return pointOverheadBytes + histFixedBytes + labelBytes(acc.labels) +
-		len(acc.buckets)*bucketBytes + len(acc.exemplars)*exemplarBytes
+	n := pointOverheadBytes + histFixedBytes + labelBytes(acc.labels) +
+		len(acc.buckets)*bucketBytes
+	for i := range acc.exemplars {
+		n += exemplarSize(&acc.exemplars[i])
+	}
+	return n
 }
 
 // summBytes estimates the encoded size of one summary data point.
@@ -368,10 +383,12 @@ func appendLabelsExcept(dst []Label, labels []Label, except string) []Label {
 }
 
 // validCount reports whether a cumulative count/bucket value can be a uint64:
-// uint64(negative or NaN) is implementation-defined (~9.2e18 on amd64), so such
-// exposition is counted malformed instead of exported as garbage.
+// uint64(negative, NaN, +Inf or ≥2^63) is implementation-defined (~9.2e18 on
+// amd64), so such exposition is counted malformed instead of exported as
+// garbage. The upper bound mirrors the OM timestamp guard in promparse: the
+// float64 comparison against 2^63 is exact (both representable).
 func validCount(v float64) bool {
-	return v >= 0 && !math.IsNaN(v)
+	return v >= 0 && v < (1<<63) && !math.IsNaN(v)
 }
 
 func labelFloat(labels []Label, name string) (float64, bool) {
@@ -550,7 +567,14 @@ func fillSummaryPoint(dp pmetric.SummaryDataPoint, acc *summAcc) {
 		dp.SetSum(acc.sum)
 	}
 	slices.SortFunc(acc.quantiles, func(a, b quantileValue) int { return cmpFloat(a.q, b.q) })
-	for _, qv := range acc.quantiles {
+	// Deduplicate repeated quantiles (keep the last occurrence), mirroring the
+	// bucket path: duplicate series lines ("0.5" and "0.50") otherwise emit
+	// two entries for one quantile, which a downstream OTLP→Prometheus
+	// translation renders as duplicate samples of the same series.
+	for i, qv := range acc.quantiles {
+		if i+1 < len(acc.quantiles) && acc.quantiles[i+1].q == qv.q {
+			continue
+		}
 		q := dp.QuantileValues().AppendEmpty()
 		q.SetQuantile(qv.q)
 		q.SetValue(qv.v)

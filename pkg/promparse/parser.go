@@ -306,6 +306,14 @@ func skipSpaceTab(b []byte) []byte {
 // skipped, counted and reported; a malformed count with a nil error means a
 // partially usable scrape.
 func (p *Parser) Parse(r io.Reader, emit func(Sample) error) (malformed int, err error) {
+	// Each Parse is one exposition: clear the previous one's terminal state
+	// and family classifications. Without this a reused non-pooled parser
+	// silently truncated its second exposition after one sample (a stale
+	// `# EOF` flag) and carried stale TYPE roles across expositions — Get()
+	// resets the pooled path, but New()+Parse+Parse is a legal use of the
+	// public API and must not corrupt quietly.
+	p.eof = false
+	clear(p.types)
 	return p.parseFrom(bufio.NewReaderSize(r, parseBufSize), emit)
 }
 

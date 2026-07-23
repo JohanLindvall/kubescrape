@@ -74,6 +74,12 @@ lat_bucket{le="1"} -5
 lat_bucket{le="+Inf"} 7
 lat_count NaN
 lat_sum 1
+# TYPE inf summary
+inf_sum 1
+inf_count +Inf
+# TYPE huge summary
+huge_sum 1
+huge_count 1e300
 `
 	bt := newBatcher(func(pcommon.Resource) {}, 1<<30, time.Unix(1, 0), time.Unix(2, 0))
 	conv := newConverter(bt, nil)
@@ -86,8 +92,8 @@ lat_sum 1
 	if err := conv.finish(); err != nil {
 		t.Fatal(err)
 	}
-	if conv.malformed != 3 { // rpc_count, lat_bucket{le=1}, lat_count
-		t.Fatalf("malformed = %d, want 3", conv.malformed)
+	if conv.malformed != 5 { // rpc_count, lat_bucket{le=1}, lat_count, inf_count, huge_count
+		t.Fatalf("malformed = %d, want 5", conv.malformed)
 	}
 	// Nothing exported a wrapped ~9.2e18 count.
 	md := bt.take()
@@ -245,5 +251,81 @@ func TestPartialScrapeExportedOnTruncatedBody(t *testing.T) {
 
 	if exp.points() == 0 {
 		t.Fatal("truncated scrape exported nothing; the parsed prefix must survive")
+	}
+}
+
+// Exemplar-rich scrapes must respect the byte bound too: exemplar labels land
+// in FilteredAttributes and are unbounded by the parser, so charging a flat
+// 48 bytes per exemplar let a conforming OpenMetrics endpoint (two ~50-char
+// exemplar labels per bucket) build 8.6 MiB chunks — over the collector's
+// 4 MiB receive limit, i.e. wholesale rejection of every export.
+func TestExemplarChunksStayUnderCollectorLimit(t *testing.T) {
+	var body strings.Builder
+	body.WriteString("# TYPE lat histogram\n")
+	ex := `# {zvalue="eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",wvalue="ffffffffffffffffffffffffffffffffffffffffffffffff"} 0.5`
+	for i := 0; i < 6000; i++ {
+		for b, le := range []string{"0.001", "0.01", "0.1", "1", "10", "+Inf"} {
+			_, _ = fmt.Fprintf(&body, `lat_bucket{i="%06d",le=%q} %d %s`+"\n", i, le, b+1, ex)
+		}
+		_, _ = fmt.Fprintf(&body, "lat_sum{i=\"%06d\"} 1\nlat_count{i=\"%06d\"} 6\n", i, i)
+	}
+	body.WriteString("# EOF\n")
+	// Exemplars parse only in OpenMetrics mode, detected from Content-Type.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/openmetrics-text; version=1.0.0")
+		_, _ = w.Write([]byte(body.String()))
+	}))
+	t.Cleanup(srv.Close)
+	exp := &captureExporter{}
+	s := New(Config{
+		Node: "node1", Interval: time.Hour, Timeout: 30 * time.Second,
+		Exemplars: true,
+		Targets:   staticTargets{testTarget(srv.URL)},
+		Exporter:  exp,
+		StartTime: time.Now(),
+	})
+	s.cycle(context.Background())
+
+	var m pmetric.ProtoMarshaler
+	total := 0
+	for i, b := range exp.batches {
+		total += b.DataPointCount()
+		if sz := m.MetricsSize(b); sz > grpcDefaultLimit {
+			t.Errorf("batch %d is %d bytes, over the collector's %d-byte limit", i, sz, grpcDefaultLimit)
+		}
+	}
+	if total != 6000 {
+		t.Fatalf("got %d histogram points, want 6000", total)
+	}
+}
+
+// Duplicate quantiles in malformed exposition ("0.5" twice, "0.50") must
+// dedup keep-last like the bucket path — not emit multiple entries for one
+// quantile on a single Summary point.
+func TestDuplicateQuantilesDedupKeepLast(t *testing.T) {
+	body := `# TYPE rpc summary
+rpc{quantile="0.5"} 1
+rpc{quantile="0.5"} 2
+rpc{quantile="0.50"} 3
+rpc{quantile="0.9"} 9
+rpc_sum 1
+rpc_count 4
+`
+	bt := newBatcher(func(pcommon.Resource) {}, 1<<30, time.Unix(1, 0), time.Unix(2, 0))
+	conv := newConverter(bt, nil)
+	p := newParser(promparse.Options{MaxLineBytes: 1 << 20})
+	if _, err := p.Parse(strings.NewReader(body), func(s Sample) error { return conv.add(s) }); err != nil {
+		t.Fatal(err)
+	}
+	if err := conv.finish(); err != nil {
+		t.Fatal(err)
+	}
+	md := bt.take()
+	dp := md.ResourceMetrics().At(0).ScopeMetrics().At(0).Metrics().At(0).Summary().DataPoints().At(0)
+	if dp.QuantileValues().Len() != 2 {
+		t.Fatalf("quantiles = %d, want 2 (0.5 deduped keep-last, 0.9)", dp.QuantileValues().Len())
+	}
+	if q := dp.QuantileValues().At(0); q.Quantile() != 0.5 || q.Value() != 3 {
+		t.Fatalf("q0 = %v/%v, want 0.5/3 (last occurrence wins)", q.Quantile(), q.Value())
 	}
 }

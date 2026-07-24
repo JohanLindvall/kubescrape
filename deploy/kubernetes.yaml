@@ -25,7 +25,7 @@ rules:
     verbs: ["get", "list", "watch"]
   # Optional: ServiceMonitor discovery (-servicemonitors).
   - apiGroups: ["monitoring.coreos.com"]
-    resources: ["servicemonitors"]
+    resources: ["servicemonitors", "podmonitors", "probes"]
     verbs: ["get", "list", "watch"]
   # Optional: monitor endpoints' bearerTokenSecret serving (-scrape-auth-secrets).
   # Grants cluster-wide secret reads — enable deliberately.

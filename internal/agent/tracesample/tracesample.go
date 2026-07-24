@@ -95,9 +95,20 @@ func New(cfg Config, next Exporter) *Sampler {
 
 // ExportTraces drops unsampled spans and forwards the remainder. A payload
 // sampled down to nothing is acked without a send.
+//
+// The INPUT is never mutated: the spanmetrics tap sits above this sampler
+// and aggregates from the payload AFTER a successful forward — pruning in
+// place would feed RED metrics only the sampled subset (and nothing at all
+// for a fully-sampled-away batch). Sampling therefore works on a copy; the
+// all-kept fast path forwards the original without copying.
 func (s *Sampler) ExportTraces(ctx context.Context, td ptrace.Traces) error {
+	if !s.wouldDrop(td) {
+		return s.next.ExportTraces(ctx, td)
+	}
+	out := ptrace.NewTraces()
+	td.CopyTo(out)
 	dropped := 0
-	rss := td.ResourceSpans()
+	rss := out.ResourceSpans()
 	rss.RemoveIf(func(rs ptrace.ResourceSpans) bool {
 		sss := rs.ScopeSpans()
 		sss.RemoveIf(func(ss ptrace.ScopeSpans) bool {
@@ -119,10 +130,34 @@ func (s *Sampler) ExportTraces(ctx context.Context, td ptrace.Traces) error {
 		})
 		return sss.Len() == 0
 	})
-	if td.ResourceSpans().Len() == 0 {
+	if out.ResourceSpans().Len() == 0 {
 		return nil // everything sampled away: acked, nothing to send
 	}
-	return s.next.ExportTraces(ctx, td)
+	return s.next.ExportTraces(ctx, out)
+}
+
+// wouldDrop reports whether any span in td would be dropped — the decision
+// pass that lets the common all-kept case skip the payload copy. It consumes
+// NO rate tokens (allow() mutates the bucket; the real pass does that), so
+// with a rate cap configured it conservatively reports true whenever tokens
+// might run out.
+func (s *Sampler) wouldDrop(td ptrace.Traces) bool {
+	if s.rate > 0 {
+		return true // token accounting happens in the real pass
+	}
+	rss := td.ResourceSpans()
+	for i := 0; i < rss.Len(); i++ {
+		sss := rss.At(i).ScopeSpans()
+		for j := 0; j < sss.Len(); j++ {
+			spans := sss.At(j).Spans()
+			for k := 0; k < spans.Len(); k++ {
+				if !s.keep(spans.At(k)) {
+					return true
+				}
+			}
+		}
+	}
+	return false
 }
 
 // keep is the per-span decision (rate cap excluded).

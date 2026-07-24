@@ -132,3 +132,31 @@ func TestForwardErrorPropagates(t *testing.T) {
 		t.Fatal("forward failure must propagate (the sender owns the retry)")
 	}
 }
+
+// The sampler must NEVER mutate its input: the spanmetrics tap sits above it
+// and aggregates from the payload after a successful forward — an in-place
+// prune would derive RED metrics from the sampled subset only.
+func TestInputPayloadNotMutated(t *testing.T) {
+	next := &capExporter{}
+	s := New(Config{Probability: 0.25}, next)
+	td := payload(1000, false, 0)
+	if err := s.ExportTraces(context.Background(), td); err != nil {
+		t.Fatal(err)
+	}
+	if td.SpanCount() != 1000 {
+		t.Fatalf("input mutated: %d spans left of 1000", td.SpanCount())
+	}
+	if next.spans() >= 1000 || next.spans() == 0 {
+		t.Fatalf("forwarded %d, want a sampled subset", next.spans())
+	}
+	// All-kept fast path forwards without copying and without mutation.
+	next2 := &capExporter{}
+	s2 := New(Config{Probability: 1}, next2)
+	td2 := payload(10, false, 0)
+	if err := s2.ExportTraces(context.Background(), td2); err != nil {
+		t.Fatal(err)
+	}
+	if td2.SpanCount() != 10 || next2.spans() != 10 {
+		t.Fatalf("all-kept path: input=%d forwarded=%d", td2.SpanCount(), next2.spans())
+	}
+}

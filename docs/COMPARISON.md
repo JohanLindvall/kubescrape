@@ -65,7 +65,6 @@ fully attributed — the cache-race gap that per-node watchers accept.
 | ServiceMonitors / PodMonitors / Probes | ✔ subset (port/targetPort/path/scheme, bearer-token auth, insecureSkipVerify, keep/drop metricRelabelings; Probes staticConfig-only) | ✔ full | ✔ via TA |
 | Relabeling | keep/drop/label rules + splitters (narrower, declarative) | ✔ full relabel_configs | ✔ |
 | Native histograms | ✔ opt-in (protobuf exposition → OTLP exponential histograms) | ✔ | ✔ |
-| Host/node metrics | ✔ built-in (`-host-metrics`, node_exporter-compatible names) | ✔ (embedded node_exporter) | ✔ hostmetrics receiver |
 | KSM re-attribution (per-object resources + metadata enrichment) | ✔ **splitters** — unique | ~400 lines of OTTL/groupbyattrs | manual OTTL |
 | cadvisor/kubelet | ✔ exact-incarnation attribution via cgroup ID | label-based | label-based |
 | Mimir job/instance identity conventions | ✔ built-in (`service.namespace`/`instance.id`, collision prefixes) | manual transforms | manual |

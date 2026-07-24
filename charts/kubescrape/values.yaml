@@ -234,11 +234,6 @@ agent:
   #   - "-scrape-native-histograms"  # offer the protobuf exposition to targets
   #                                  # and convert native histograms to OTLP
   #                                  # exponential histograms
-  #   - "-host-metrics"              # node_exporter-compatible system metrics
-  #   - "-host-proc=/host/proc"      # ...needs the host's /proc mounted (use
-  #                                  # extraVolumes/extraVolumeMounts below);
-  #                                  # add -host-rootfs=/host for
-  #                                  # node_filesystem_* metrics
   #   - "-transforms-file=/etc/kubescrape/transforms/transforms.yaml"
   #     # Starlark transforms, hot-reloaded. The file needs its OWN ConfigMap
   #     # mounted as a directory (never subPath — subPath mounts don't see
@@ -248,9 +243,8 @@ agent:
   #     #   extraVolumeMounts:
   #     #     - {name: transforms, mountPath: /etc/kubescrape/transforms, readOnly: true}
   extraArgs: []
-  # Extra volumes/mounts on the agent pod, verbatim — for the host /proc
-  # mount of -host-metrics or the -transforms-file ConfigMap (see extraArgs
-  # above).
+  # Extra volumes/mounts on the agent pod, verbatim — e.g. the
+  # -transforms-file ConfigMap (see extraArgs above).
   extraVolumes: []
   extraVolumeMounts: []
   resources:

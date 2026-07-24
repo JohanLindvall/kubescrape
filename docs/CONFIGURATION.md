@@ -30,7 +30,6 @@ manifests live in [deploy/](../deploy).
 - [Agent: trace sampling](#agent-trace-sampling)
 - [Agent: metrics scraping](#agent-metrics-scraping)
 - [Agent: kubelet scrapes (cadvisor, node)](#agent-kubelet-scrapes)
-- [Agent: host metrics](#agent-host-metrics)
 - [Agent: transforms (Starlark)](#agent-transforms-starlark)
 - [Agent: routing](#agent-routing)
 - [Resource attributes](#resource-attributes)
@@ -90,8 +89,7 @@ manifests — enable deliberately) — see
 | `-node-metadata-refresh` | `1m` | refresh interval for the node's labels/annotations used in attribute templates (0 disables) |
 | `-log-level` / `-log-format` | `info` / `text` | as for the service |
 
-Pipeline toggles (all default `true` except the opt-in `-journald` and
-`-host-metrics`):
+Pipeline toggles (all default `true` except the opt-in `-journald`):
 
 | Flag | Enables |
 |---|---|
@@ -100,7 +98,6 @@ Pipeline toggles (all default `true` except the opt-in `-journald` and
 | `-cadvisor` | `<kubelet-endpoint>/metrics/cadvisor` (needs `-kubelet-endpoint`) |
 | `-node-metrics` | `<kubelet-endpoint>/metrics` (needs `-kubelet-endpoint`) |
 | `-journald` | systemd journal tailing (default `false`, [below](#agent-journald)) |
-| `-host-metrics` | node-level system metrics from /proc (default `false`, [below](#agent-host-metrics)) |
 
 ## Agent: OTLP export
 
@@ -569,24 +566,6 @@ container incarnation through the metadata service; pod-scoped series (e.g.
 `container_network_*`) resolve by namespace/name cross-checked against the
 cgroup pod UID.
 
-## Agent: host metrics
-
-Opt-in with `-host-metrics`: node-level system metrics read straight from
-`/proc` (via `prometheus/procfs`, node_exporter's own parser) and exported
-over OTLP — replacing a separate node_exporter DaemonSet for the core set.
-Metric **names are node_exporter-compatible** (`node_cpu_seconds_total`,
-`node_memory_MemAvailable_bytes`, `node_load1/5/15`, `node_disk_*`,
-`node_network_*`, `node_filesystem_*`), so existing dashboards and alerts
-keep working. The resource is `service.name: node`, `k8s.node.name` and
-`service.instance.id` = the node name — `job="node"` / `instance=<node>`
-after the Mimir mapping.
-
-| Flag | Default | Description |
-|---|---|---|
-| `-host-metrics` | `false` | enable the collector |
-| `-host-metrics-interval` | `30s` | collection interval |
-| `-host-proc` | `/proc` | proc filesystem to read — in-cluster, mount the **host's** `/proc` into the container (e.g. at `/host/proc`) and point this at it, or you measure the agent's own namespace |
-| `-host-rootfs` | — | host root mount for filesystem usage metrics (statfs); empty **skips** the `node_filesystem_*` metrics |
 
 ## Agent: transforms (Starlark)
 
@@ -858,9 +837,8 @@ other authentication schemes and per-endpoint intervals are ignored.
 The commonly-tuned flags above map to values (the rest are reachable via `agent.extraArgs`/`service.extraArgs`); `agent.config` is rendered verbatim into the
 single mounted `-config` file (with a checksum annotation, so config changes
 roll the DaemonSet). `agent.extraVolumes`/`agent.extraVolumeMounts` cover
-the mounts the new opt-ins need: the host `/proc` for `-host-metrics` and
-the dedicated transforms ConfigMap for `-transforms-file` (mounted as a
-directory, not `subPath`). See
+the mount `-transforms-file` needs: its dedicated ConfigMap, mounted as a
+directory (not `subPath`). See
 [charts/kubescrape/values.yaml](../charts/kubescrape/values.yaml) for the
 full annotated list.
 

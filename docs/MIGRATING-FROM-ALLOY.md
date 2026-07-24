@@ -318,13 +318,9 @@ Two association differences from `otelcol.processor.k8sattributes`:
 
 ### `prometheus.exporter.unix` (node_exporter)
 
-`-host-metrics` (via `agent.extraArgs`) collects the core node metric set
-straight from the host's `/proc` with **node_exporter-compatible names**
-(`node_cpu_seconds_total`, `node_memory_*_bytes`, `node_load*`,
-`node_disk_*`, `node_network_*`, `node_filesystem_*`), so dashboards and
-alerts carry over. Mount the host's `/proc` into the agent and point
-`-host-proc` at it; add `-host-rootfs` for filesystem usage. Exporters
-beyond the core set (hwmon, systemd, …) are not covered.
+Not covered: kubescrape does not collect host-level system metrics. Keep a
+node_exporter DaemonSet and scrape it via `prometheus.io/*` annotations (or
+a PodMonitor) like any other target.
 
 ### `otelcol.processor.transform` / OTTL statements
 

@@ -612,20 +612,6 @@ ServiceAccount token (`nodes/metrics` RBAC, see
 * **node metrics** (`/metrics`): the kubelet's own metrics under a node-level
   resource (`k8s.node.name`, `service.name: kubelet`).
 
-**Host metrics** (opt-in, `-host-metrics`). The agent collects node-level
-system metrics straight from `/proc` (via `prometheus/procfs` —
-node_exporter's own parser) and exports them over OTLP, replacing a separate
-node_exporter DaemonSet for the core set. Metric **names are
-node_exporter-compatible** (`node_cpu_seconds_total`,
-`node_memory_*_bytes`, `node_load1/5/15`, `node_disk_*`, `node_network_*`,
-`node_filesystem_*`), so existing dashboards and alerts keep working; the
-resource is `service.name: node` with `service.instance.id` = the node name
-(so `job="node"`, `instance=<node>` after the Mimir mapping). In-cluster,
-mount the host's `/proc` and point `-host-proc` at it (e.g. `/host/proc`);
-filesystem usage additionally needs the host root mounted (`-host-rootfs`)
-and is skipped when unset. `-host-metrics-interval` (default 30s) sets the
-cadence.
-
 **journald** (opt-in, `-journald`). The agent reads the systemd journal
 natively through libsystemd (`coreos/go-systemd/sdjournal`) and exports the
 entries as OTLP log records, one resource per unit (`service.name` = unit
@@ -697,8 +683,7 @@ traceSampling:
 **Pipeline toggles.** Each pipeline is individually switchable: `-logs`,
 `-metrics` (annotation-discovered targets), `-cadvisor` and `-node-metrics`
 (all default true; the kubelet scrapes additionally require
-`-kubelet-endpoint`), plus the opt-in `-journald`, `-ingest` and
-`-host-metrics`.
+`-kubelet-endpoint`), plus the opt-in `-journald`, `-ingest` and.
 
 **Self-observability.** The agent's own metrics — log entries/bytes/rotations
 and export failures, enrichment hit rates per format, scrapes and scrape

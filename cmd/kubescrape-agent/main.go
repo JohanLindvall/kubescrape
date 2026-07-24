@@ -23,7 +23,6 @@ import (
 	"time"
 
 	"github.com/JohanLindvall/kubescrape/internal/agent/attrs"
-	"github.com/JohanLindvall/kubescrape/internal/agent/hostmetrics"
 	"github.com/JohanLindvall/kubescrape/internal/agent/journald"
 	"github.com/JohanLindvall/kubescrape/internal/agent/logscrub"
 	"github.com/JohanLindvall/kubescrape/internal/agent/otlpbatch"
@@ -88,14 +87,9 @@ var (
 
 	transformsFile = flag.String("transforms-file", "", "Starlark transforms file applied to exported logs/metrics/traces at the exporter seam; hot-reloaded on change (mount its ConfigMap as a directory, not subPath). Empty disables")
 
-	nativeHists     = flag.Bool("scrape-native-histograms", false, "offer the Prometheus protobuf exposition to scrape targets and convert native histograms to OTLP exponential histograms")
-	hostMetricsOn   = flag.Bool("host-metrics", false, "collect node-level system metrics from /proc (node_exporter-compatible names: node_cpu_seconds_total, node_memory_*, ...)")
-	hostMetricsIntv = flag.Duration("host-metrics-interval", 30*time.Second, "host metrics collection interval")
-	hostProc        = flag.String("host-proc", "/proc", "proc filesystem to read for -host-metrics (mount the host's /proc, e.g. /host/proc)")
-	hostRootfs      = flag.String("host-rootfs", "", "host root mount for filesystem usage metrics (statfs); empty skips filesystem metrics")
-
-	logLevel  = flag.String("log-level", "info", "log level: debug, info, warn, error")
-	logFormat = flag.String("log-format", "text", "log format: text or json")
+	nativeHists = flag.Bool("scrape-native-histograms", false, "offer the Prometheus protobuf exposition to scrape targets and convert native histograms to OTLP exponential histograms")
+	logLevel    = flag.String("log-level", "info", "log level: debug, info, warn, error")
+	logFormat   = flag.String("log-format", "text", "log format: text or json")
 
 	logDir            = flag.String("log-dir", "/var/log/containers", "directory of containerd log symlinks (the default source when the config's logs section is unset)")
 	positionsFile     = flag.String("positions-file", "", "single file persisting BOTH log offsets and the journald cursor across restarts (empty disables persistence)")
@@ -475,9 +469,6 @@ func run() error {
 		return err
 	}
 	p.startJournald()
-	if err := p.startHostMetrics(); err != nil {
-		return err
-	}
 	if err := p.startIngest(); err != nil {
 		return err
 	}
@@ -588,29 +579,6 @@ func (p *pipelines) startJournald() {
 		jr.Run(p.ctx)
 	})
 	p.log.Info("journald reader started", "dir", *journaldDir, "units", *journaldUnits, "positions", *positionsFile)
-}
-
-// startHostMetrics starts the /proc node-metrics collector.
-func (p *pipelines) startHostMetrics() error {
-	if !*hostMetricsOn {
-		return nil
-	}
-	hm, err := hostmetrics.New(hostmetrics.Config{
-		ProcPath:   *hostProc,
-		RootfsPath: *hostRootfs,
-		Interval:   *hostMetricsIntv,
-		Node:       *nodeName,
-		Exporter:   p.out,
-		Logger:     p.log,
-	})
-	if err != nil {
-		return fmt.Errorf("host metrics: %w", err)
-	}
-	p.spawn(func() {
-		hm.Run(p.ctx)
-	})
-	p.log.Info("host metrics started", "proc", *hostProc, "interval", *hostMetricsIntv, "rootfs", *hostRootfs)
-	return nil
 }
 
 // startIngest starts the OTLP ingest receiver plus its optional batcher and

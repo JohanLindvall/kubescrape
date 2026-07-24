@@ -528,3 +528,37 @@ a_count{s="2"} 7
 		t.Fatalf("family a corrupted: got counts %v, want s=1:5 s=2:7", counts)
 	}
 }
+
+// The /debug/targets snapshot: every scrape of the last cycle appears with
+// its outcome, failures sorted first, error text included.
+func TestScrapeStatusSnapshot(t *testing.T) {
+	good := serveBody(t, "m 1\n")
+	exp := &captureExporter{}
+	s := New(Config{
+		Node: "node1", Interval: time.Hour, Timeout: 2 * time.Second,
+		Targets: staticTargets{
+			testTarget(good.URL),
+			testTarget("http://127.0.0.1:1"), // refused: a failing target
+		},
+		Exporter:  exp,
+		StartTime: time.Now(),
+	})
+	if s.Status() != nil {
+		t.Fatal("status before the first cycle must be nil")
+	}
+	s.cycle(context.Background())
+
+	st := s.Status()
+	if st == nil || len(st.Targets) != 2 {
+		t.Fatalf("status = %+v, want 2 targets", st)
+	}
+	if st.Targets[0].Up || st.Targets[0].Error == "" {
+		t.Fatalf("failures must sort first with an error: %+v", st.Targets[0])
+	}
+	if !st.Targets[1].Up || st.Targets[1].Samples != 1 {
+		t.Fatalf("good target: %+v", st.Targets[1])
+	}
+	if st.Targets[1].Pod == "" || st.Targets[1].Pipeline != "targets" {
+		t.Fatalf("target identity missing: %+v", st.Targets[1])
+	}
+}

@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"go.opentelemetry.io/collector/pdata/pcommon"
@@ -96,6 +97,10 @@ type Scraper struct {
 	// splitters; splitters run on concurrent scrape goroutines.
 	cacheMu  sync.Mutex
 	podCache map[string]podCacheEntry
+
+	// status is the last completed cycle's per-target outcomes, served on the
+	// agent's GET /debug/targets (see status.go).
+	status atomic.Pointer[CycleStatus]
 }
 
 // New creates a Scraper.
@@ -171,11 +176,11 @@ func (s *Scraper) cycle(ctx context.Context) {
 		obs.Scrapes.WithLabelValues(o.pipeline, result).Inc()
 		obs.ScrapeDuration.WithLabelValues(o.pipeline).Observe(o.duration.Seconds())
 		obs.ScrapeSamples.WithLabelValues(o.pipeline).Add(float64(o.samples))
-		if s.cfg.HealthMetrics {
-			healthMu.Lock()
-			outcomes = append(outcomes, o)
-			healthMu.Unlock()
-		}
+		// Collected unconditionally: the /debug/targets snapshot wants every
+		// outcome even when health metrics are off.
+		healthMu.Lock()
+		outcomes = append(outcomes, o)
+		healthMu.Unlock()
 	}
 	spawn := func(pipeline, url string, target *kubemeta.ScrapeTarget, scrape func(context.Context) (int, error)) bool {
 		select {
@@ -189,9 +194,13 @@ func (s *Scraper) cycle(ctx context.Context) {
 			defer func() { <-sem }()
 			start := time.Now()
 			samples, err := scrape(ctx)
+			errStr := ""
+			if err != nil {
+				errStr = err.Error()
+			}
 			record(scrapeOutcome{
 				pipeline: pipeline, url: url, target: target,
-				ok: err == nil, duration: time.Since(start), samples: samples,
+				ok: err == nil, err: errStr, duration: time.Since(start), samples: samples,
 			})
 			if err != nil && ctx.Err() == nil {
 				s.log.Warn("scrape failed", "pipeline", pipeline, "url", url, "error", err)
@@ -219,6 +228,7 @@ func (s *Scraper) cycle(ctx context.Context) {
 	}
 	wg.Wait()
 
+	s.publishStatus(outcomes, time.Now())
 	if s.cfg.HealthMetrics && len(outcomes) > 0 && ctx.Err() == nil {
 		s.exportHealth(ctx, outcomes)
 	}
@@ -230,6 +240,7 @@ type scrapeOutcome struct {
 	url      string
 	target   *kubemeta.ScrapeTarget // nil for the kubelet scrapes
 	ok       bool
+	err      string
 	duration time.Duration
 	samples  int
 }

@@ -64,7 +64,7 @@ func agentSelfResource(node string) pcommon.Resource {
 var (
 	configFile           = flag.String("config", "", "unified YAML config file with resourceAttributes, logs, logAttributes, logMetrics, metrics and traceMetrics sections")
 	nodeName             = flag.String("node-name", os.Getenv("NODE_NAME"), "name of the node this agent runs on (default $NODE_NAME)")
-	listen               = flag.String("listen", ":8081", "HTTP listen address for /healthz, /readyz and /debug/tailer (empty disables)")
+	listen               = flag.String("listen", ":8081", "HTTP listen address for /healthz, /readyz, /debug/tailer and /debug/targets (empty disables)")
 	selfMetricsIntv      = flag.Duration("self-metrics-interval", time.Minute, "export the agent's own metrics over OTLP at this interval (0 disables)")
 	metadataURL          = flag.String("metadata-endpoint", "http://kubescrape.monitoring", "base URL of the kubescrape metadata service")
 	metadataWait         = flag.Duration("metadata-wait", 5*time.Second, "how long the metadata service may block waiting for a new container")
@@ -388,8 +388,8 @@ func run() error {
 	if err := p.startIngest(); err != nil {
 		return err
 	}
-	p.startScraper()
-	p.startDebugServer(tl)
+	sc := p.startScraper()
+	p.startDebugServer(tl, sc)
 
 	<-ctx.Done()
 	log.Info("shutting down")
@@ -592,9 +592,11 @@ func (p *pipelines) startIngest() error {
 }
 
 // startScraper starts the Prometheus scraper (annotation/ServiceMonitor
-// targets and/or kubelet cadvisor+node scrapes).
-func (p *pipelines) startScraper() {
+// targets and/or kubelet cadvisor+node scrapes). The returned Scraper (nil
+// when scraping is off) is exposed on /debug/targets.
+func (p *pipelines) startScraper() *promscrape.Scraper {
 	kubeletScrapes := *kubeletEndpoint != "" && (*cadvisorOn || *nodeOn)
+	var sc0 *promscrape.Scraper
 	if *metricsOn || kubeletScrapes {
 		sc := promscrape.New(promscrape.Config{
 			Node:           *nodeName,
@@ -630,12 +632,14 @@ func (p *pipelines) startScraper() {
 		})
 		p.log.Info("prometheus scraper started", "node", *nodeName, "interval", *scrapeInterval,
 			"targets", *metricsOn, "cadvisor", kubeletScrapes && *cadvisorOn, "nodeMetrics", kubeletScrapes && *nodeOn)
+		sc0 = sc
 	}
+	return sc0
 }
 
 // startDebugServer serves /healthz, /readyz, the Go-runtime /metrics and
 // /debug/tailer on -listen, shutting down on ctx cancel.
-func (p *pipelines) startDebugServer(tl *tailer.Tailer) {
+func (p *pipelines) startDebugServer(tl *tailer.Tailer, sc *promscrape.Scraper) {
 	if *listen == "" {
 		return
 	}
@@ -654,6 +658,16 @@ func (p *pipelines) startDebugServer(tl *tailer.Tailer) {
 			enc := json.NewEncoder(w)
 			enc.SetIndent("", "  ")
 			_ = enc.Encode(tl.Status())
+		})
+	}
+	if sc != nil {
+		// The last scrape cycle's per-target outcomes, failures first: which
+		// targets were discovered, which are down and why.
+		mux.HandleFunc("GET /debug/targets", func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			enc := json.NewEncoder(w)
+			enc.SetIndent("", "  ")
+			_ = enc.Encode(sc.Status())
 		})
 	}
 	// Every handler here answers from an in-memory snapshot in

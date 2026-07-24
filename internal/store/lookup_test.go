@@ -370,3 +370,28 @@ func TestDeleteOfStaleClaimantPromotesLiveOwner(t *testing.T) {
 		t.Fatalf("promoted %q, want the live owner", got.Pod.Name)
 	}
 }
+
+// A live pod shadowed on a recycled IP must be promoted not only when the
+// shadowing pod is DELETED, but also when it transitions to a finished phase
+// (Running->Succeeded), goes hostNetwork, or changes IP — all of which release
+// its claim via claimPodIPLocked, symmetric with DeletePod.
+func TestClaimReleasePromotesLiveOwner(t *testing.T) {
+	s, clk := newTestStore(time.Minute)
+	live := runningPod("live-uid", "live", "1", "10.0.0.5", clk.Now())
+	s.UpsertPod(live)
+	shadow := runningPod("shadow-uid", "shadow", "1", "10.0.0.5", clk.Now()) // shadows the claim
+	s.UpsertPod(shadow)
+
+	// shadow transitions Running->Succeeded (keeps its stale PodIP in status).
+	done := runningPod("shadow-uid", "shadow", "2", "10.0.0.5", clk.Now())
+	done.Status.Phase = corev1.PodSucceeded
+	s.UpsertPod(done)
+
+	got, ok := s.GetPodByIP("10.0.0.5")
+	if !ok {
+		t.Fatal("live IP owner orphaned after the shadowing pod finished")
+	}
+	if got.Pod.Name != "live" {
+		t.Fatalf("promoted %q, want the live owner", got.Pod.Name)
+	}
+}

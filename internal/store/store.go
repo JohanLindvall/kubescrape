@@ -223,6 +223,13 @@ func (s *Store) claimPodIPLocked(rec *record, pod kubemeta.Pod, oldIP string) {
 	}
 	if oldIP != ip && oldIP != "" && s.byPodIP[oldIP] == rec {
 		delete(s.byPodIP, oldIP)
+		// Symmetric with DeletePod: this pod is releasing oldIP (its IP
+		// changed, or it went finished/hostNetwork), so a live pod shadowed on
+		// that IP by the recycle race must be promoted — otherwise it is
+		// unresolvable by IP until its own next real upsert (a same-RV resync
+		// short-circuits before re-claiming). rec already carries its new
+		// (finished/hostNetwork/changed) state, so promote skips it.
+		s.promoteIPClaimantLocked(oldIP)
 	}
 	if ip != "" {
 		cur := s.byPodIP[ip]

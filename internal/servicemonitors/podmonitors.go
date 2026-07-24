@@ -7,6 +7,7 @@ package servicemonitors
 
 import (
 	"fmt"
+	"sort"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -109,5 +110,15 @@ func (x *Index) PodMonitors() []*PodMonitor {
 	for _, m := range x.podMonitors {
 		out = append(out, m)
 	}
+	// Sorted like Monitor.All(): when two PodMonitors select the same pod and
+	// mint the same URL, the URL-dedup in handleNodeTargets keeps the FIRST,
+	// so map-iteration order must not decide which monitor's name / auth /
+	// relabelings ride on the surviving target.
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Namespace != out[j].Namespace {
+			return out[i].Namespace < out[j].Namespace
+		}
+		return out[i].Name < out[j].Name
+	})
 	return out
 }

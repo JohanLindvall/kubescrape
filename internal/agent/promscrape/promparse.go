@@ -14,6 +14,7 @@ type (
 )
 
 const (
+	RoleGauge           = promparse.RoleGauge
 	RoleCounter         = promparse.RoleCounter
 	RoleHistogramBucket = promparse.RoleHistogramBucket
 	RoleHistogramSum    = promparse.RoleHistogramSum

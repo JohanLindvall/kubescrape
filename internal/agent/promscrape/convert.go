@@ -423,6 +423,48 @@ func (b *batcher) remember(name string, m pmetric.Metric) {
 }
 
 // addNumber emits a gauge or (monotonic cumulative) sum data point.
+// expHistBytes estimates one exponential histogram point's encoded size.
+func expHistBytes(p *expPoint) int {
+	return pointOverheadBytes + histFixedBytes + labelBytes(p.labels) +
+		16 + // zero threshold + zero count
+		(len(p.pos)+len(p.neg))*3 + 16 // varint bucket counts + span framing
+}
+
+// addExponential appends one native-histogram point as an OTLP exponential
+// histogram (cumulative; the schema IS the OTLP scale — both are base-2).
+func (b *batcher) addExponential(family string, p expPoint) {
+	m, ok := b.metricByName(family)
+	if !ok {
+		m = b.sm.Metrics().AppendEmpty()
+		m.SetName(family)
+		eh := m.SetEmptyExponentialHistogram()
+		eh.SetAggregationTemporality(pmetric.AggregationTemporalityCumulative)
+		b.remember(family, m)
+		b.bytes += metricOverheadBytes + len(family)
+	}
+	if m.Type() != pmetric.MetricTypeExponentialHistogram {
+		obs.ScrapeCollisions.Inc()
+		return
+	}
+	dp := m.ExponentialHistogram().DataPoints().AppendEmpty()
+	dp.SetStartTimestamp(b.startTS)
+	dp.SetTimestamp(pointTS(p.ts, b.scrapeTS))
+	dp.SetScale(p.schema)
+	dp.SetZeroCount(p.zeroCount)
+	dp.SetZeroThreshold(p.zeroTh)
+	dp.SetCount(p.count)
+	if p.hasSum {
+		dp.SetSum(p.sum)
+	}
+	dp.Positive().SetOffset(p.posOffset)
+	dp.Positive().BucketCounts().FromRaw(p.pos)
+	dp.Negative().SetOffset(p.negOffset)
+	dp.Negative().BucketCounts().FromRaw(p.neg)
+	putLabels(dp.Attributes(), p.labels)
+	b.points++
+	b.bytes += expHistBytes(&p)
+}
+
 func (b *batcher) addNumber(s Sample, monotonic bool) {
 	m, ok := b.metricByName(s.Name)
 	if !ok {

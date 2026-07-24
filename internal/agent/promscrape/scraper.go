@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -80,9 +81,14 @@ type Config struct {
 	Targets       TargetSource
 	// Auth resolves monitor endpoints' bearerTokenSecret refs (metaclient;
 	// nil = targets carrying AuthSecret fail their scrape with an error).
-	Auth      AuthSource
-	Exporter  MetricExporter
-	StartTime time.Time // cumulative-sum start timestamp (agent start)
+	Auth AuthSource
+	// NativeHistograms offers the protobuf exposition format to annotation/
+	// monitor targets (the only format carrying native histograms, which
+	// convert to OTLP exponential histograms). Targets with a splitter keep
+	// the text format (the split batcher has no exponential path).
+	NativeHistograms bool
+	Exporter         MetricExporter
+	StartTime        time.Time // cumulative-sum start timestamp (agent start)
 }
 
 // Scraper periodically scrapes all targets of one node and exports the
@@ -168,6 +174,30 @@ func New(cfg Config) *Scraper {
 		podCache:    make(map[string]podCacheEntry),
 		authCache:   make(map[string]authCacheEntry),
 	}
+}
+
+// scrapeProto runs the protobuf exposition path with the same export/full
+// closures the text path uses.
+func (s *Scraper) scrapeProto(ctx context.Context, body io.Reader, cb chunker, relabel *relabelFilter, what string) (int, error) {
+	export := func() error {
+		return s.cfg.Exporter.ExportMetrics(ctx, cb.take())
+	}
+	full := func() bool {
+		return cb.count() >= s.cfg.BatchPoints ||
+			(s.cfg.BatchBytes > 0 && cb.size() >= s.cfg.BatchBytes)
+	}
+	samples, malformed, err := s.parseProtoAndExport(body, cb, pipelineTargets, relabel, export, full)
+	if malformed > 0 {
+		obs.ScrapeMalformed.WithLabelValues(pipelineTargets).Add(float64(malformed))
+		s.log.Warn("scrape had malformed proto families", "target", what, "malformed", malformed, "samples", samples)
+	}
+	if err != nil {
+		return samples, err
+	}
+	if cb.count() > 0 {
+		return samples, export()
+	}
+	return samples, nil
 }
 
 // authToken resolves a monitor endpoint's bearer token via the metadata
@@ -391,9 +421,13 @@ func (s *Scraper) scrapeTarget(ctx context.Context, t kubemeta.ScrapeTarget) (in
 	if err != nil {
 		return 0, err
 	}
-	if s.cfg.Exemplars {
+	useProto := s.cfg.NativeHistograms && s.splitterFor(t.Pod) == nil
+	switch {
+	case useProto:
+		req.Header.Set("Accept", acceptProto)
+	case s.cfg.Exemplars:
 		req.Header.Set("Accept", "application/openmetrics-text;version=1.0.0;q=1,text/plain;version=0.0.4;q=0.5")
-	} else {
+	default:
 		req.Header.Set("Accept", "text/plain;version=0.0.4")
 	}
 	if t.AuthSecret != "" {
@@ -431,6 +465,9 @@ func (s *Scraper) scrapeTarget(ctx context.Context, t kubemeta.ScrapeTarget) (in
 	relabel, err := s.relabels.session(t.MetricRelabelings)
 	if err != nil {
 		return 0, err // exporting what the user asked to drop is worse than failing visibly
+	}
+	if strings.Contains(resp.Header.Get("Content-Type"), "application/vnd.google.protobuf") {
+		return s.scrapeProto(ctx, resp.Body, cb, relabel, t.URL)
 	}
 	return s.parseAndExportFiltered(ctx, resp.Body, openMetrics, s.cfg.Exemplars, cb, pipelineTargets, t.URL, relabel)
 }

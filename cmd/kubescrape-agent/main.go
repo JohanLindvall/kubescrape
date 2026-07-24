@@ -88,6 +88,7 @@ var (
 
 	transformsFile = flag.String("transforms-file", "", "Starlark transforms file applied to exported logs/metrics/traces at the exporter seam; hot-reloaded on change (mount its ConfigMap as a directory, not subPath). Empty disables")
 
+	nativeHists     = flag.Bool("scrape-native-histograms", false, "offer the Prometheus protobuf exposition to scrape targets and convert native histograms to OTLP exponential histograms")
 	hostMetricsOn   = flag.Bool("host-metrics", false, "collect node-level system metrics from /proc (node_exporter-compatible names: node_cpu_seconds_total, node_memory_*, ...)")
 	hostMetricsIntv = flag.Duration("host-metrics-interval", 30*time.Second, "host metrics collection interval")
 	hostProc        = flag.String("host-proc", "/proc", "proc filesystem to read for -host-metrics (mount the host's /proc, e.g. /host/proc)")
@@ -745,15 +746,16 @@ func (p *pipelines) startScraper() *promscrape.Scraper {
 				InsecureTLS:    *kubeletInsecure,
 				Meta:           p.meta,
 			},
-			Attrs:     p.attrBuilders,
-			NodeInfo:  p.nodeInfo,
-			Filters:   p.filters,
-			Splitters: p.splitters,
-			Logger:    p.log,
-			Targets:   p.meta,
-			Auth:      p.meta,
-			Exporter:  p.out,
-			StartTime: time.Now(),
+			Attrs:            p.attrBuilders,
+			NodeInfo:         p.nodeInfo,
+			Filters:          p.filters,
+			Splitters:        p.splitters,
+			Logger:           p.log,
+			Targets:          p.meta,
+			Auth:             p.meta,
+			NativeHistograms: *nativeHists,
+			Exporter:         p.out,
+			StartTime:        time.Now(),
 		})
 		p.spawn(func() {
 			sc.Run(p.ctx)

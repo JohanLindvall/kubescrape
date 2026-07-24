@@ -138,7 +138,6 @@ func (s *Scraper) protoFamily(mf *dto.MetricFamily, cb chunker, keep func(string
 			if err := emit(Sample{Name: name, Family: name, Role: RoleCounter, Labels: labels, Value: m.GetCounter().GetValue(), TimestampMs: ts}); err != nil {
 				return c, malformed, err
 			}
-			c.samples++
 		case dto.MetricType_GAUGE, dto.MetricType_UNTYPED:
 			v := m.GetGauge().GetValue()
 			if mf.GetType() == dto.MetricType_UNTYPED {
@@ -147,7 +146,6 @@ func (s *Scraper) protoFamily(mf *dto.MetricFamily, cb chunker, keep func(string
 			if err := emit(Sample{Name: name, Family: name, Role: RoleGauge, Labels: labels, Value: v, TimestampMs: ts}); err != nil {
 				return c, malformed, err
 			}
-			c.samples++
 		case dto.MetricType_SUMMARY:
 			sum := m.GetSummary()
 			for _, q := range sum.GetQuantile() {
@@ -155,7 +153,6 @@ func (s *Scraper) protoFamily(mf *dto.MetricFamily, cb chunker, keep func(string
 				if err := emit(Sample{Name: name, Family: name, Role: RoleSummaryQuantile, Labels: ql, Value: q.GetValue(), TimestampMs: ts}); err != nil {
 					return c, malformed, err
 				}
-				c.samples++
 			}
 			if err := emit(Sample{Name: name + "_sum", Family: name, Role: RoleSummarySum, Labels: labels, Value: sum.GetSampleSum(), TimestampMs: ts}); err != nil {
 				return c, malformed, err
@@ -163,7 +160,6 @@ func (s *Scraper) protoFamily(mf *dto.MetricFamily, cb chunker, keep func(string
 			if err := emit(Sample{Name: name + "_count", Family: name, Role: RoleSummaryCount, Labels: labels, Value: float64(sum.GetSampleCount()), TimestampMs: ts}); err != nil {
 				return c, malformed, err
 			}
-			c.samples += 2
 		case dto.MetricType_HISTOGRAM, dto.MetricType_GAUGE_HISTOGRAM:
 			h := m.GetHistogram()
 			if isNative(h) {
@@ -189,7 +185,6 @@ func (s *Scraper) protoFamily(mf *dto.MetricFamily, cb chunker, keep func(string
 				if err := emit(Sample{Name: name + "_bucket", Family: name, Role: RoleHistogramBucket, Labels: bl, Value: float64(b.GetCumulativeCount()), TimestampMs: ts}); err != nil {
 					return c, malformed, err
 				}
-				c.samples++
 			}
 			if err := emit(Sample{Name: name + "_sum", Family: name, Role: RoleHistogramSum, Labels: labels, Value: h.GetSampleSum(), TimestampMs: ts}); err != nil {
 				return c, malformed, err
@@ -197,7 +192,6 @@ func (s *Scraper) protoFamily(mf *dto.MetricFamily, cb chunker, keep func(string
 			if err := emit(Sample{Name: name + "_count", Family: name, Role: RoleHistogramCount, Labels: labels, Value: float64(h.GetSampleCount()), TimestampMs: ts}); err != nil {
 				return c, malformed, err
 			}
-			c.samples += 2
 		default:
 			malformed++
 		}

@@ -5,10 +5,12 @@ import (
 	"encoding/binary"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
 	dto "github.com/prometheus/client_model/go"
+	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/pmetric"
 	"google.golang.org/protobuf/proto"
 )
@@ -146,5 +148,36 @@ func TestDecodeSpansGuards(t *testing.T) {
 	_, _, ok = decodeSpans([]*dto.BucketSpan{{Offset: ptr(int32(0)), Length: ptr(uint32(3))}}, []int64{1})
 	if ok {
 		t.Fatal("missing deltas accepted")
+	}
+}
+
+// The protobuf path must count each classic sample ONCE (emit counts it via
+// the shared counter; the family must not also add it to c.samples). A
+// double-count inflated scrape_samples_scraped and halved MaxSamples.
+func TestProtoClassicSampleCountAccurate(t *testing.T) {
+	c := &dto.Counter{Value: ptr(1.0)}
+	g1 := &dto.Gauge{Value: ptr(2.0)}
+	g2 := &dto.Gauge{Value: ptr(3.0)}
+	fams := []*dto.MetricFamily{
+		{Name: ptr("reqs_total"), Type: dto.MetricType_COUNTER.Enum(), Metric: []*dto.Metric{{Counter: c}}},
+		{Name: ptr("temp"), Type: dto.MetricType_GAUGE.Enum(), Metric: []*dto.Metric{{Gauge: g1}, {Gauge: g2}}},
+	}
+	body := protoBody(t, fams...)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/vnd.google.protobuf; encoding=delimited")
+		_, _ = w.Write(body)
+	}))
+	defer srv.Close()
+	exp := &captureExporter{}
+	s := New(Config{Node: "n1", Interval: time.Hour, Timeout: 5 * time.Second,
+		NativeHistograms: true, Targets: staticTargets{testTarget(srv.URL)}, Exporter: exp, StartTime: time.Now()})
+
+	// 3 real samples (1 counter + 2 gauges); scrapeProto reports the count.
+	got, err := s.scrapeProto(context.Background(), strings.NewReader(string(body)), newBatcher(func(pcommon.Resource) {}, 1<<30, time.Now(), time.Now()), nil, "t")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != 3 {
+		t.Fatalf("proto sample count = %d, want 3 (double-counted?)", got)
 	}
 }

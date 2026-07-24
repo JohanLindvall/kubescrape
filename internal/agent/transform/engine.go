@@ -42,6 +42,13 @@ type starlarkProgram struct {
 func compileStarlark(signal, src string) (*starlarkProgram, error) {
 	opts := &syntax.FileOptions{Set: true, While: true, GlobalReassign: true}
 	thread := &starlark.Thread{Name: "compile:" + signal}
+	// Bound the smoke evaluation like the run path: a top-level comprehension
+	// (e.g. `_ = [x for x in range(1<<40)]`) is a plain expression Starlark
+	// runs at module load, with no step or ctx cap otherwise — an operator
+	// typo would hang the agent at startup (CompileFile is synchronous in
+	// run()) or wedge the reload goroutine forever, breaking the
+	// keep-last-good-program guarantee. maxSteps caps it to a config error.
+	thread.SetMaxExecutionSteps(maxSteps)
 	globals, err := starlark.ExecFileOptions(opts, thread, signal+".star", src, nil)
 	if err != nil {
 		return nil, fmt.Errorf("transforms %s: %w", signal, err)
@@ -114,7 +121,8 @@ func pruneMetrics(md pmetric.Metrics) {
 		sms := rm.ScopeMetrics()
 		sms.RemoveIf(func(sm pmetric.ScopeMetrics) bool {
 			sm.Metrics().RemoveIf(func(m pmetric.Metric) bool {
-				return m.Name() == dropMarker
+				_, drop := m.Metadata().Get(dropMarker)
+				return drop
 			})
 			return sm.Metrics().Len() == 0
 		})

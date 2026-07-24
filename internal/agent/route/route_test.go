@@ -108,3 +108,29 @@ func TestTracesRouting(t *testing.T) {
 		t.Fatalf("traces routed wrong: teamA=%d def=%d", len(teamA.traces), len(def.traces))
 	}
 }
+
+// The router must NOT mutate its input: the ingest batcher retries the same
+// payload object in place, and the spanmetrics tap Consumes it after the
+// forward — an in-place split loses the retried batch and blinds the tap.
+func TestRouterDoesNotMutateInput(t *testing.T) {
+	def, teamA := &capDest{}, &capDest{}
+	r := New(def, []Destination{{Name: "team-a", Namespaces: []string{"team-a-*"}, Exporter: teamA}})
+
+	ld := nsLogs("team-a-prod", "other")
+	if err := r.ExportLogs(context.Background(), ld); err != nil {
+		t.Fatal(err)
+	}
+	if ld.ResourceLogs().Len() != 2 {
+		t.Fatalf("input emptied: %d resources left of 2", ld.ResourceLogs().Len())
+	}
+	// A second export of the SAME object (the batcher's in-place retry) must
+	// re-split identically, not forward an emptied payload.
+	def2, teamA2 := &capDest{}, &capDest{}
+	r2 := New(def2, []Destination{{Name: "team-a", Namespaces: []string{"team-a-*"}, Exporter: teamA2}})
+	if err := r2.ExportLogs(context.Background(), ld); err != nil {
+		t.Fatal(err)
+	}
+	if len(bodies(teamA2.logs)) != 1 || len(bodies(def2.logs)) != 1 {
+		t.Fatalf("retry re-split lost data: teamA=%v def=%v", bodies(teamA2.logs), bodies(def2.logs))
+	}
+}

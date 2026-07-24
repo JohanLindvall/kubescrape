@@ -208,6 +208,14 @@ func (r *logRecord) SetField(name string, v starlark.Value) error {
 		}
 		r.lr.SetSeverityText(s)
 		return nil
+	case "severity_number":
+		n, ok := v.(starlark.Int)
+		if !ok {
+			return fmt.Errorf("severity_number must be an int")
+		}
+		i, _ := n.Int64()
+		r.lr.SetSeverityNumber(plog.SeverityNumber(i))
+		return nil
 	}
 	return fmt.Errorf("cannot set %s", name)
 }
@@ -329,7 +337,12 @@ func (m *metricObj) Attr(name string) (starlark.Value, error) {
 	case "resource":
 		return attrsView{m.res.Attributes()}, nil
 	case "drop":
-		return dropFn{mark: func() { m.m.SetName(dropMarker) }}, nil
+		// Mark in the pdata-internal Metadata map (never serialized to OTLP),
+		// NOT the name — a script doing `m.drop(); m.name = "x"` would
+		// otherwise overwrite a name-based marker and silently un-drop the
+		// metric. Logs/spans mark in an attribute, so drop() is already
+		// order-independent for them; this makes it so for metrics too.
+		return dropFn{mark: func() { m.m.Metadata().PutBool(dropMarker, true) }}, nil
 	}
 	return nil, nil
 }

@@ -227,3 +227,61 @@ func TestReloadSwapsAndKeepsLastGoodOnFailure(t *testing.T) {
 }
 
 func testLogger() *slog.Logger { return slog.Default() }
+
+// drop() then rename must still drop the metric (the marker lives in the
+// pdata-internal Metadata map, not the name field).
+func TestMetricDropThenRename(t *testing.T) {
+	prog, err := Compile([]byte("metrics: |\n  def transform(batch):\n      for m in batch:\n          m.drop()\n          m.name = \"survivor\"\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	next := &capExp{}
+	w := Wrap(next, next, prog)
+	md := pmetric.NewMetrics()
+	md.ResourceMetrics().AppendEmpty().ScopeMetrics().AppendEmpty().Metrics().AppendEmpty().SetName("victim")
+	if err := w.ExportMetrics(context.Background(), md); err != nil {
+		t.Fatal(err)
+	}
+	if len(next.metrics) != 0 {
+		got := next.metrics[0].ResourceMetrics()
+		if got.Len() > 0 {
+			t.Fatalf("drop lost to rename: metric %q exported", got.At(0).ScopeMetrics().At(0).Metrics().At(0).Name())
+		}
+	}
+}
+
+// A top-level comprehension in the transforms file must not hang compile —
+// the step limit bounds it to a config error.
+func TestCompileBoundsTopLevelComprehension(t *testing.T) {
+	done := make(chan error, 1)
+	go func() {
+		_, err := Compile([]byte("logs: |\n  _ = [x for x in range(100000000000)]\n  def transform(batch): pass\n"))
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("unbounded comprehension compiled without error")
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("compile hung on a top-level comprehension (no step limit)")
+	}
+}
+
+// severity_number is settable (advertised in AttrNames; assigning must not
+// fail the export).
+func TestSetSeverityNumber(t *testing.T) {
+	prog, err := Compile([]byte("logs: |\n  def transform(batch):\n      for r in batch:\n          r.severity_number = 17\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	next := &capExp{}
+	w := Wrap(next, next, prog)
+	if err := w.ExportLogs(context.Background(), logsPayload("x")); err != nil {
+		t.Fatal(err)
+	}
+	sev := next.logs[0].ResourceLogs().At(0).ScopeLogs().At(0).LogRecords().At(0).SeverityNumber()
+	if int(sev) != 17 {
+		t.Fatalf("severity_number = %d, want 17", int(sev))
+	}
+}

@@ -7,8 +7,12 @@
 // (producers → transform → router → {default buffered chain | route
 // clients}), splitting each payload per destination. First-matching route
 // wins. A payload where everything matches the default forwards untouched
-// (no copy). Delivery is at-least-once per destination: a failed destination
-// fails the whole export, and the producer's retry re-splits
+// (no copy); a split COPIES resources into per-destination payloads and
+// never mutates the caller's — the ingest batcher retries the same object in
+// place and the spanmetrics tap Consumes it after the forward, so an
+// in-place split would lose a retried batch and blind the tap. Delivery is
+// at-least-once per destination: a failed destination fails the whole
+// export, and the producer's retry re-splits the (untouched) payload
 // deterministically — destinations that already succeeded receive
 // duplicates, which OTLP consumers must tolerate anyway.
 //
@@ -109,13 +113,17 @@ func (r *Router) ExportLogs(ctx context.Context, ld plog.Logs) error {
 	for i := range parts {
 		parts[i] = plog.NewLogs()
 	}
-	idx := 0
-	ld.ResourceLogs().RemoveIf(func(rl plog.ResourceLogs) bool {
-		g := groups[idx]
-		idx++
-		rl.MoveTo(parts[g+1].ResourceLogs().AppendEmpty())
-		return true
-	})
+	// COPY into the destination parts; never mutate the caller's payload. A
+	// producer's retry re-runs the whole export on the SAME object (the ingest
+	// batcher retries in place, the spanmetrics tap Consumes it after
+	// forwarding), so emptying the input would lose the retried batch and feed
+	// the tap zero spans. The split path pays a copy; the all-default fast
+	// path above forwards uncopied.
+	rls := ld.ResourceLogs()
+	for i := 0; i < rls.Len(); i++ {
+		g := groups[i]
+		rls.At(i).CopyTo(parts[g+1].ResourceLogs().AppendEmpty())
+	}
 	var errs []error
 	if parts[0].ResourceLogs().Len() > 0 {
 		errs = append(errs, r.def.ExportLogs(ctx, parts[0]))
@@ -141,13 +149,12 @@ func (r *Router) ExportMetrics(ctx context.Context, md pmetric.Metrics) error {
 	for i := range parts {
 		parts[i] = pmetric.NewMetrics()
 	}
-	idx := 0
-	md.ResourceMetrics().RemoveIf(func(rm pmetric.ResourceMetrics) bool {
-		g := groups[idx]
-		idx++
-		rm.MoveTo(parts[g+1].ResourceMetrics().AppendEmpty())
-		return true
-	})
+	// COPY, never move — see ExportLogs.
+	rms := md.ResourceMetrics()
+	for i := 0; i < rms.Len(); i++ {
+		g := groups[i]
+		rms.At(i).CopyTo(parts[g+1].ResourceMetrics().AppendEmpty())
+	}
 	var errs []error
 	if parts[0].ResourceMetrics().Len() > 0 {
 		errs = append(errs, r.def.ExportMetrics(ctx, parts[0]))
@@ -179,13 +186,13 @@ func (r *Router) ExportTraces(ctx context.Context, td ptrace.Traces) error {
 	for i := range parts {
 		parts[i] = ptrace.NewTraces()
 	}
-	idx := 0
-	td.ResourceSpans().RemoveIf(func(rs ptrace.ResourceSpans) bool {
-		g := groups[idx]
-		idx++
-		rs.MoveTo(parts[g+1].ResourceSpans().AppendEmpty())
-		return true
-	})
+	// COPY, never move — see ExportLogs (the spanmetrics tap Consumes this
+	// same payload after the forward and must still see every span).
+	rss := td.ResourceSpans()
+	for i := 0; i < rss.Len(); i++ {
+		g := groups[i]
+		rss.At(i).CopyTo(parts[g+1].ResourceSpans().AppendEmpty())
+	}
 	var errs []error
 	if parts[0].ResourceSpans().Len() > 0 {
 		if !defOK {

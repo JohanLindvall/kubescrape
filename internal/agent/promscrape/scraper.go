@@ -2,6 +2,7 @@ package promscrape
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -27,6 +28,11 @@ type MetricExporter interface {
 // metaclient.Client.
 type TargetSource interface {
 	NodeTargets(ctx context.Context, node string) ([]kubemeta.ScrapeTarget, error)
+}
+
+// AuthSource resolves scrape-auth secret references ("ns/name/key").
+type AuthSource interface {
+	ScrapeAuth(ctx context.Context, ref string) (string, error)
 }
 
 // Config configures the scraper.
@@ -72,8 +78,11 @@ type Config struct {
 	HealthMetrics bool
 	Logger        *slog.Logger
 	Targets       TargetSource
-	Exporter      MetricExporter
-	StartTime     time.Time // cumulative-sum start timestamp (agent start)
+	// Auth resolves monitor endpoints' bearerTokenSecret refs (metaclient;
+	// nil = targets carrying AuthSecret fail their scrape with an error).
+	Auth      AuthSource
+	Exporter  MetricExporter
+	StartTime time.Time // cumulative-sum start timestamp (agent start)
 }
 
 // Scraper periodically scrapes all targets of one node and exports the
@@ -101,6 +110,20 @@ type Scraper struct {
 	// status is the last completed cycle's per-target outcomes, served on the
 	// agent's GET /debug/targets (see status.go).
 	status atomic.Pointer[CycleStatus]
+
+	// insecureHTTP serves monitor endpoints with tlsConfig.insecureSkipVerify.
+	insecureHTTP *http.Client
+	// authCache holds monitor bearer tokens by "ns/name/key" ref (1-minute
+	// TTL); scrapes run on concurrent goroutines.
+	authMu    sync.Mutex
+	authCache map[string]authCacheEntry
+	// relabels caches monitor endpoints' compiled metricRelabelings.
+	relabels relabelCache
+}
+
+type authCacheEntry struct {
+	token   string
+	fetched time.Time
 }
 
 // New creates a Scraper.
@@ -130,10 +153,44 @@ func New(cfg Config) *Scraper {
 				IdleConnTimeout:     90 * time.Second,
 			},
 		},
+		// For monitor endpoints declaring tlsConfig.insecureSkipVerify:
+		// scoped to those targets only, never the default.
+		insecureHTTP: &http.Client{
+			Timeout: cfg.Timeout,
+			Transport: &http.Transport{
+				TLSClientConfig:     &tls.Config{InsecureSkipVerify: true},
+				MaxIdleConnsPerHost: 2,
+				IdleConnTimeout:     90 * time.Second,
+			},
+		},
 		log:         log,
 		kubeletHTTP: newKubeletHTTPClient(cfg.Kubelet, cfg.Timeout),
 		podCache:    make(map[string]podCacheEntry),
+		authCache:   make(map[string]authCacheEntry),
 	}
+}
+
+// authToken resolves a monitor endpoint's bearer token via the metadata
+// service, cached for a minute (tokens rotate; per-cycle lookups must not
+// hammer the service).
+func (s *Scraper) authToken(ctx context.Context, ref string) (string, error) {
+	s.authMu.Lock()
+	if e, ok := s.authCache[ref]; ok && time.Since(e.fetched) < time.Minute {
+		s.authMu.Unlock()
+		return e.token, nil
+	}
+	s.authMu.Unlock()
+	if s.cfg.Auth == nil {
+		return "", fmt.Errorf("no auth source configured")
+	}
+	token, err := s.cfg.Auth.ScrapeAuth(ctx, ref)
+	if err != nil {
+		return "", err
+	}
+	s.authMu.Lock()
+	s.authCache[ref] = authCacheEntry{token: token, fetched: time.Now()}
+	s.authMu.Unlock()
+	return token, nil
 }
 
 // Run scrapes every Interval until ctx is done. The first cycle starts
@@ -339,7 +396,18 @@ func (s *Scraper) scrapeTarget(ctx context.Context, t kubemeta.ScrapeTarget) (in
 	} else {
 		req.Header.Set("Accept", "text/plain;version=0.0.4")
 	}
-	resp, err := s.http.Do(req)
+	if t.AuthSecret != "" {
+		token, err := s.authToken(ctx, t.AuthSecret)
+		if err != nil {
+			return 0, fmt.Errorf("scrape auth %s: %w", t.AuthSecret, err)
+		}
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	client := s.http
+	if t.InsecureSkipVerify {
+		client = s.insecureHTTP
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		return 0, err
 	}
@@ -360,7 +428,11 @@ func (s *Scraper) scrapeTarget(ctx context.Context, t kubemeta.ScrapeTarget) (in
 			s.fillTargetResource(res, t.URL, &t.Pod, t.Service)
 		}, s.cfg.BatchPoints, s.cfg.StartTime, time.Now())
 	}
-	return s.parseAndExport(ctx, resp.Body, openMetrics, s.cfg.Exemplars, cb, pipelineTargets, t.URL)
+	relabel, err := s.relabels.session(t.MetricRelabelings)
+	if err != nil {
+		return 0, err // exporting what the user asked to drop is worse than failing visibly
+	}
+	return s.parseAndExportFiltered(ctx, resp.Body, openMetrics, s.cfg.Exemplars, cb, pipelineTargets, t.URL, relabel)
 }
 
 // batcher accumulates samples of one source into a pmetric.Metrics payload

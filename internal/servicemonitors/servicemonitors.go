@@ -28,13 +28,72 @@ var GVR = schema.GroupVersionResource{
 
 // Endpoint is one scrape endpoint declaration of a monitor.
 type Endpoint struct {
-	// Port is the Service port name.
+	// Port is the Service port name (ServiceMonitor) or container port name
+	// (PodMonitor).
 	Port string
 	// TargetPort overrides the pod port directly (number or container port
 	// name); nil defers to the service port's targetPort.
 	TargetPort *intstr.IntOrString
 	Path       string
 	Scheme     string
+	// InsecureSkipVerify comes from the endpoint's tlsConfig; agents scrape
+	// https targets without verifying the certificate when set.
+	InsecureSkipVerify bool
+	// BearerSecret references the endpoint's bearerTokenSecret as
+	// "namespace/name/key" (namespace = the monitor's). Served to agents by
+	// the metadata service only when -scrape-auth-secrets is enabled.
+	BearerSecret string
+	// MetricRelabelings holds the keep/drop subset of the endpoint's
+	// metricRelabelings; other actions are ignored (documented).
+	MetricRelabelings []RelabelRule
+}
+
+// RelabelRule is the keep/drop subset of a Prometheus relabel_config,
+// evaluated per sample against sourceLabels joined by ";" (Prometheus
+// semantics; "__name__" refers to the metric name).
+type RelabelRule struct {
+	Action       string   `json:"action"`
+	SourceLabels []string `json:"sourceLabels"`
+	Regex        string   `json:"regex"`
+}
+
+// endpointSpec is the shared endpoint shape of ServiceMonitor endpoints and
+// PodMonitor podMetricsEndpoints.
+type endpointSpec struct {
+	Port       string              `json:"port"`
+	TargetPort *intstr.IntOrString `json:"targetPort"`
+	Path       string              `json:"path"`
+	Scheme     string              `json:"scheme"`
+	TLSConfig  *struct {
+		InsecureSkipVerify bool `json:"insecureSkipVerify"`
+	} `json:"tlsConfig"`
+	BearerTokenSecret *struct {
+		Name string `json:"name"`
+		Key  string `json:"key"`
+	} `json:"bearerTokenSecret"`
+	MetricRelabelings []struct {
+		Action       string   `json:"action"`
+		SourceLabels []string `json:"sourceLabels"`
+		Regex        string   `json:"regex"`
+	} `json:"metricRelabelings"`
+}
+
+// toEndpoint converts the spec shape (BearerSecret namespace filled by the
+// caller).
+func (ep endpointSpec) toEndpoint() Endpoint {
+	out := Endpoint{Port: ep.Port, TargetPort: ep.TargetPort, Path: ep.Path, Scheme: ep.Scheme}
+	if ep.TLSConfig != nil {
+		out.InsecureSkipVerify = ep.TLSConfig.InsecureSkipVerify
+	}
+	if ep.BearerTokenSecret != nil && ep.BearerTokenSecret.Name != "" && ep.BearerTokenSecret.Key != "" {
+		out.BearerSecret = ep.BearerTokenSecret.Name + "/" + ep.BearerTokenSecret.Key
+	}
+	for _, r := range ep.MetricRelabelings {
+		if r.Action == "keep" || r.Action == "drop" {
+			out.MetricRelabelings = append(out.MetricRelabelings, RelabelRule(r))
+		}
+	}
+	return out
 }
 
 // Monitor is one parsed ServiceMonitor.
@@ -69,12 +128,7 @@ type smSpec struct {
 		Any        bool     `json:"any"`
 		MatchNames []string `json:"matchNames"`
 	} `json:"namespaceSelector"`
-	Endpoints []struct {
-		Port       string              `json:"port"`
-		TargetPort *intstr.IntOrString `json:"targetPort"`
-		Path       string              `json:"path"`
-		Scheme     string              `json:"scheme"`
-	} `json:"endpoints"`
+	Endpoints []endpointSpec `json:"endpoints"`
 }
 
 // Parse converts an unstructured ServiceMonitor.
@@ -99,22 +153,30 @@ func Parse(u *unstructured.Unstructured) (*Monitor, error) {
 		Namespaces:   spec.NamespaceSelector.MatchNames,
 	}
 	for _, ep := range spec.Endpoints {
-		m.Endpoints = append(m.Endpoints, Endpoint{
-			Port: ep.Port, TargetPort: ep.TargetPort, Path: ep.Path, Scheme: ep.Scheme,
-		})
+		e := ep.toEndpoint()
+		if e.BearerSecret != "" {
+			e.BearerSecret = m.Namespace + "/" + e.BearerSecret
+		}
+		m.Endpoints = append(m.Endpoints, e)
 	}
 	return m, nil
 }
 
 // Index is the thread-safe monitor store fed by the informer.
 type Index struct {
-	mu       sync.RWMutex
-	monitors map[string]*Monitor
+	mu          sync.RWMutex
+	monitors    map[string]*Monitor
+	podMonitors map[string]*PodMonitor
+	probes      map[string]*Probe
 }
 
 // NewIndex creates an empty index.
 func NewIndex() *Index {
-	return &Index{monitors: make(map[string]*Monitor)}
+	return &Index{
+		monitors:    make(map[string]*Monitor),
+		podMonitors: make(map[string]*PodMonitor),
+		probes:      make(map[string]*Probe),
+	}
 }
 
 // Upsert parses and stores a monitor. A monitor UPDATED to an unparseable spec

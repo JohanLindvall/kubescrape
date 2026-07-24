@@ -21,8 +21,8 @@ import (
 	"go.opentelemetry.io/collector/pdata/pcommon"
 
 	corev1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/discovery"
@@ -156,9 +156,78 @@ func startServiceMonitors(ctx context.Context, cfg *rest.Config, disco discovery
 	)); err != nil {
 		return nil, nil, fmt.Errorf("registering servicemonitor handler: %w", err)
 	}
+	// PodMonitors and Probes are optional siblings — watch whichever the
+	// cluster serves.
+	served, _ := monitoringResources(disco)
+	if served[servicemonitors.PodGVR.Resource] {
+		pmInformer := dynFactory.ForResource(servicemonitors.PodGVR).Informer()
+		if _, err := pmInformer.AddEventHandler(typedHandler(
+			func(u *unstructured.Unstructured) {
+				if err := monitors.UpsertPodMonitor(u); err != nil {
+					log.Warn("parsing podmonitor", "error", err)
+				}
+			},
+			func(u *unstructured.Unstructured) { monitors.DeletePodMonitor(u.GetNamespace(), u.GetName()) },
+		)); err != nil {
+			return nil, nil, fmt.Errorf("registering podmonitor handler: %w", err)
+		}
+		log.Info("podmonitor discovery enabled")
+	}
+	if served[servicemonitors.ProbeGVR.Resource] {
+		prInformer := dynFactory.ForResource(servicemonitors.ProbeGVR).Informer()
+		if _, err := prInformer.AddEventHandler(typedHandler(
+			func(u *unstructured.Unstructured) {
+				if err := monitors.UpsertProbe(u); err != nil {
+					log.Warn("parsing probe", "error", err)
+				}
+			},
+			func(u *unstructured.Unstructured) { monitors.DeleteProbe(u.GetNamespace(), u.GetName()) },
+		)); err != nil {
+			return nil, nil, fmt.Errorf("registering probe handler: %w", err)
+		}
+		log.Info("probe discovery enabled")
+	}
 	dynFactory.Start(ctx.Done())
 	log.Info("servicemonitor discovery enabled")
 	return monitors, smInformer.HasSynced, nil
+}
+
+// k8sSecretReader resolves Secret keys on demand with a short cache (tokens
+// rotate; per-scrape-cycle lookups must not hammer the API server).
+type k8sSecretReader struct {
+	client kubernetes.Interface
+	mu     sync.Mutex
+	cache  map[string]secretCacheEntry
+}
+
+type secretCacheEntry struct {
+	value   string
+	fetched time.Time
+}
+
+func (r *k8sSecretReader) Get(ctx context.Context, namespace, name, key string) (string, error) {
+	ck := namespace + "/" + name + "/" + key
+	r.mu.Lock()
+	if e, ok := r.cache[ck]; ok && time.Since(e.fetched) < time.Minute {
+		r.mu.Unlock()
+		return e.value, nil
+	}
+	r.mu.Unlock()
+	sec, err := r.client.CoreV1().Secrets(namespace).Get(ctx, name, metav1.GetOptions{})
+	if err != nil {
+		return "", err
+	}
+	val, ok := sec.Data[key]
+	if !ok {
+		return "", fmt.Errorf("key %q not in secret", key)
+	}
+	r.mu.Lock()
+	if r.cache == nil {
+		r.cache = map[string]secretCacheEntry{}
+	}
+	r.cache[ck] = secretCacheEntry{value: string(val), fetched: time.Now()}
+	r.mu.Unlock()
+	return string(val), nil
 }
 
 // newLogger builds the process logger (mirrors the agent's).
@@ -200,6 +269,10 @@ func run() error {
 		leaderElect = flag.Bool("leader-elect", false, "use a Lease to elect one replica as the events exporter (required when running >1 replica with -events)")
 		leaseNs     = flag.String("leader-elect-namespace", "monitoring", "namespace of the leader-election Lease")
 		leaseName   = flag.String("leader-elect-name", "kubescrape-events", "name of the leader-election Lease")
+
+		// Serve monitor endpoints' bearerTokenSecret values to agents (opt-in:
+		// needs secrets get RBAC; tokens travel the cluster-internal HTTP).
+		scrapeAuthOn = flag.Bool("scrape-auth-secrets", false, "serve ServiceMonitor/PodMonitor bearerTokenSecret values to agents on /v1/scrape-auth (requires secrets get RBAC)")
 
 		// Kubernetes events -> OTLP logs (opt-in).
 		eventsOn             = flag.Bool("events", false, "export Kubernetes events as OTLP log records")
@@ -391,6 +464,11 @@ func run() error {
 
 	// HTTPServer sets the full hardened timeout set (ReadHeaderTimeout,
 	// Read/WriteTimeout > MaxWait, IdleTimeout); see its doc comment.
+	var secretReader server.SecretReader
+	if *scrapeAuthOn {
+		secretReader = &k8sSecretReader{client: client}
+		log.Info("scrape auth secrets enabled")
+	}
 	srv := server.New(server.Config{
 		Store:    st,
 		Services: svcIndex,
@@ -400,6 +478,7 @@ func run() error {
 		CacheTTL: *metaCacheTTL,
 		Ready:    ready,
 		Logger:   log,
+		Secrets:  secretReader,
 	}).HTTPServer(*listen)
 
 	errCh := make(chan error, 1)
@@ -452,16 +531,26 @@ func buildConfig(kubeconfig string) (*rest.Config, error) {
 // LISTs would fail forever, wedging readiness behind an informer that can
 // never sync.
 func checkServiceMonitorCRD(d discovery.DiscoveryInterface) error {
+	_, err := monitoringResources(d)
+	return err
+}
+
+// monitoringResources lists which monitoring.coreos.com resources the
+// cluster serves (servicemonitors, podmonitors, probes may be installed
+// independently).
+func monitoringResources(d discovery.DiscoveryInterface) (map[string]bool, error) {
 	list, err := d.ServerResourcesForGroupVersion(servicemonitors.GVR.GroupVersion().String())
 	if err != nil {
-		return err
+		return nil, err
 	}
+	out := map[string]bool{}
 	for _, r := range list.APIResources {
-		if r.Name == servicemonitors.GVR.Resource {
-			return nil
-		}
+		out[r.Name] = true
 	}
-	return fmt.Errorf("resource %q not served by %s", servicemonitors.GVR.Resource, servicemonitors.GVR.GroupVersion())
+	if !out[servicemonitors.GVR.Resource] {
+		return nil, fmt.Errorf("resource %q not served by %s", servicemonitors.GVR.Resource, servicemonitors.GVR.GroupVersion())
+	}
+	return out, nil
 }
 
 // stripManagedFields drops managedFields before objects are stored in the

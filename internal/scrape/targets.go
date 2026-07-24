@@ -4,6 +4,7 @@ package scrape
 
 import (
 	"net"
+	"net/url"
 	"strconv"
 	"strings"
 
@@ -62,7 +63,7 @@ func ServiceTargets(pod kubemeta.Pod, svc *services.Service) []kubemeta.ScrapeTa
 	var targets []kubemeta.ScrapeTarget
 	seen := make(map[int32]struct{})
 	for _, sp := range selectServicePorts(svc) {
-		port, ok := targetPodPort(pod, sp)
+		port, ok := TargetPodPort(pod, sp)
 		if !ok {
 			continue
 		}
@@ -97,13 +98,101 @@ func MonitorTargets(pod kubemeta.Pod, svc *services.Service, monitor string, ep 
 	t.Source = "servicemonitor"
 	t.Service = info
 	t.Monitor = monitor
+	stampEndpoint(&t, ep)
 	return []kubemeta.ScrapeTarget{t}
 }
 
-// monitorPortNumber extracts a numeric targetPort, bounds-checked to the
+// stampEndpoint copies the endpoint's auth/TLS/relabeling declarations onto
+// a target.
+func stampEndpoint(t *kubemeta.ScrapeTarget, ep servicemonitors.Endpoint) {
+	t.InsecureSkipVerify = ep.InsecureSkipVerify
+	t.AuthSecret = ep.BearerSecret
+	for _, r := range ep.MetricRelabelings {
+		t.MetricRelabelings = append(t.MetricRelabelings, kubemeta.RelabelRule{
+			Action: r.Action, SourceLabels: r.SourceLabels, Regex: r.Regex,
+		})
+	}
+}
+
+// PodMonitorTargets derives the targets a PodMonitor endpoint declares on a
+// pod (already namespace- and selector-matched by the caller). The endpoint
+// Port names a CONTAINER port; targetPort (deprecated) is a number or
+// container port name.
+func PodMonitorTargets(pod kubemeta.Pod, monitor string, ep servicemonitors.Endpoint) []kubemeta.ScrapeTarget {
+	if !Scrapeable(pod) {
+		return nil
+	}
+	if ep.Port == "" && ep.TargetPort == nil {
+		return nil // same phantom-target guard as ServiceMonitors
+	}
+	scheme, path := defaultSchemePath(ep.Scheme, ep.Path)
+	var port int32
+	switch {
+	case ep.Port != "":
+		p, ok := containerPortByName(pod, ep.Port)
+		if !ok {
+			return nil
+		}
+		port = p
+	default:
+		if n, ok := MonitorPortNumber(*ep.TargetPort); ok {
+			port = n
+		} else if p, ok := containerPortByName(pod, ep.TargetPort.StrVal); ok {
+			port = p
+		} else {
+			return nil
+		}
+	}
+	t := makeTarget(pod, scheme, path, port)
+	t.Source = "podmonitor"
+	t.Monitor = monitor
+	stampEndpoint(&t, ep)
+	return []kubemeta.ScrapeTarget{t}
+}
+
+// containerPortByName finds a declared container port by name.
+func containerPortByName(pod kubemeta.Pod, name string) (int32, bool) {
+	if name == "" {
+		return 0, false
+	}
+	for _, c := range pod.Containers {
+		for _, p := range c.Ports {
+			if p.Name == name {
+				return p.Port, true
+			}
+		}
+	}
+	return 0, false
+}
+
+// ProbeTargets derives the targets a Probe declares against ONE prober pod
+// (a backing pod of the prober Service, matched by the caller): one target
+// per static entry, scraping the prober with module/target params.
+func ProbeTargets(proberPod kubemeta.Pod, probe *servicemonitors.Probe, proberPort int32) []kubemeta.ScrapeTarget {
+	if !Scrapeable(proberPod) {
+		return nil
+	}
+	scheme, path := defaultSchemePath(probe.ProberScheme, probe.ProberPath)
+	var out []kubemeta.ScrapeTarget
+	for _, static := range probe.StaticTargets {
+		t := makeTarget(proberPod, scheme, path, proberPort)
+		q := url.Values{}
+		if probe.Module != "" {
+			q.Set("module", probe.Module)
+		}
+		q.Set("target", static)
+		t.URL += "?" + q.Encode()
+		t.Source = "probe"
+		t.Monitor = probe.Namespace + "/" + probe.Name
+		out = append(out, t)
+	}
+	return out
+}
+
+// MonitorPortNumber extracts a numeric targetPort, bounds-checked to the
 // valid port range; string values that do not parse fall through to the
 // port-name path.
-func monitorPortNumber(tp intstr.IntOrString) (int32, bool) {
+func MonitorPortNumber(tp intstr.IntOrString) (int32, bool) {
 	var n int64
 	switch tp.Type {
 	case intstr.Int:
@@ -136,7 +225,7 @@ func monitorPodPort(pod kubemeta.Pod, svc *services.Service, ep servicemonitors.
 	if ep.Port != "" {
 		for _, sp := range svc.Ports {
 			if sp.Name == ep.Port {
-				return targetPodPort(pod, sp)
+				return TargetPodPort(pod, sp)
 			}
 		}
 		return 0, false
@@ -145,7 +234,7 @@ func monitorPodPort(pod kubemeta.Pod, svc *services.Service, ep servicemonitors.
 	// the neither-set case). IntValue() on a string-typed value Atoi's it
 	// ignoring the error and returns a full int, so parse and bound explicitly:
 	// "4294967297" must be rejected, not truncated to port 1.
-	if n, ok := monitorPortNumber(*ep.TargetPort); ok {
+	if n, ok := MonitorPortNumber(*ep.TargetPort); ok {
 		return n, true
 	}
 	// Only a String-typed, non-empty targetPort may resolve by container port
@@ -282,8 +371,8 @@ func selectServicePorts(svc *services.Service) []services.Port {
 	return out
 }
 
-// targetPodPort translates a service port to the pod port it targets.
-func targetPodPort(pod kubemeta.Pod, sp services.Port) (int32, bool) {
+// TargetPodPort translates a service port to the pod port it targets.
+func TargetPodPort(pod kubemeta.Pod, sp services.Port) (int32, bool) {
 	if sp.TargetPortName != "" {
 		for _, c := range pod.Containers {
 			for _, p := range c.Ports {

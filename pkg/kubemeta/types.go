@@ -117,7 +117,27 @@ type ScrapeTarget struct {
 	Source  string `json:"source"`
 	// Service is set when Source is "service" or "servicemonitor".
 	Service *Service `json:"service,omitempty"`
-	// Monitor names the ServiceMonitor that produced the target.
+	// Monitor names the ServiceMonitor/PodMonitor/Probe that produced the
+	// target ("ns/name").
 	Monitor string `json:"monitor,omitempty"`
-	Pod     Pod    `json:"pod"`
+	// InsecureSkipVerify scrapes an https target without verifying its
+	// certificate (from the monitor endpoint's tlsConfig).
+	InsecureSkipVerify bool `json:"insecureSkipVerify,omitempty"`
+	// AuthSecret references a bearer-token Secret as "namespace/name/key";
+	// agents resolve it via GET /v1/scrape-auth/{ns}/{name}/{key} (served
+	// only when the metadata service runs with -scrape-auth-secrets).
+	AuthSecret string `json:"authSecret,omitempty"`
+	// MetricRelabelings is the keep/drop subset of the endpoint's
+	// metricRelabelings, applied per sample by the agent.
+	MetricRelabelings []RelabelRule `json:"metricRelabelings,omitempty"`
+	Pod               Pod           `json:"pod"`
+}
+
+// RelabelRule is the keep/drop subset of a Prometheus relabel_config:
+// sourceLabels values joined by ";" ("__name__" = metric name) matched
+// against Regex (fully anchored, Prometheus semantics).
+type RelabelRule struct {
+	Action       string   `json:"action"` // keep | drop
+	SourceLabels []string `json:"sourceLabels,omitempty"`
+	Regex        string   `json:"regex,omitempty"`
 }

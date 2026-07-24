@@ -27,6 +27,11 @@ rules:
   - apiGroups: ["monitoring.coreos.com"]
     resources: ["servicemonitors"]
     verbs: ["get", "list", "watch"]
+  # Optional: monitor endpoints' bearerTokenSecret serving (-scrape-auth-secrets).
+  # Grants cluster-wide secret reads — enable deliberately.
+  # - apiGroups: [""]
+  #   resources: ["secrets"]
+  #   verbs: ["get"]
   # Leader election (-leader-elect): one replica exports events.
   - apiGroups: ["coordination.k8s.io"]
     resources: ["leases"]

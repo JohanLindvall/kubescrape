@@ -180,7 +180,9 @@ func (s *Server) handleNodeTargets(w http.ResponseWriter, r *http.Request) {
 				break
 			}
 		}
-		if !podAnnotated && !svcAnnotated {
+		podMonitors := s.podMonitorsFor(np.Pod)
+		probes := s.probesFor(np.Pod)
+		if !podAnnotated && !svcAnnotated && len(podMonitors) == 0 && len(probes) == 0 {
 			continue
 		}
 		s.enrich(&np.Pod, np.OwnerRefs)
@@ -191,6 +193,14 @@ func (s *Server) handleNodeTargets(w http.ResponseWriter, r *http.Request) {
 			for _, sme := range monitored[svc.UID] {
 				podTargets = append(podTargets, scrape.MonitorTargets(np.Pod, svc, sme.monitor, sme.endpoint)...)
 			}
+		}
+		for _, pm := range podMonitors {
+			for _, ep := range pm.Endpoints {
+				podTargets = append(podTargets, scrape.PodMonitorTargets(np.Pod, pm.Namespace+"/"+pm.Name, ep)...)
+			}
+		}
+		for _, pr := range probes {
+			podTargets = append(podTargets, scrape.ProbeTargets(np.Pod, pr.probe, pr.port)...)
 		}
 		// The same endpoint can be reachable via pod and service
 		// annotations; keep the first occurrence (pod source wins).
@@ -207,6 +217,25 @@ func (s *Server) handleNodeTargets(w http.ResponseWriter, r *http.Request) {
 		"node":    node,
 		"targets": targets,
 	})
+}
+
+// handleScrapeAuth serves GET /v1/scrape-auth/{namespace}/{name}/{key}: the
+// bearer token a monitor endpoint's bearerTokenSecret references. Disabled
+// (404) unless the service runs with -scrape-auth-secrets. Responses are
+// never cacheable — a rotated token must not be re-served from a cache.
+func (s *Server) handleScrapeAuth(w http.ResponseWriter, r *http.Request) {
+	if s.secrets == nil {
+		writeError(w, http.StatusNotFound, "scrape auth secrets are not enabled (-scrape-auth-secrets)")
+		return
+	}
+	ns, name, key := r.PathValue("namespace"), r.PathValue("name"), r.PathValue("key")
+	val, err := s.secrets.Get(r.Context(), ns, name, key)
+	if err != nil {
+		writeError(w, http.StatusNotFound, fmt.Sprintf("secret %s/%s key %s: %v", ns, name, key, err))
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	writeJSON(w, http.StatusOK, map[string]string{"value": val})
 }
 
 // waitBudget determines how long a container lookup may block: MaxWait by

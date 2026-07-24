@@ -111,6 +111,20 @@ func New(base string, timeout time.Duration) *Client {
 	}
 }
 
+// ScrapeAuth fetches a monitor endpoint's bearer token by its
+// "namespace/name/key" Secret reference (served only when the metadata
+// service runs with -scrape-auth-secrets). Responses are no-store; callers
+// cache briefly themselves.
+func (c *Client) ScrapeAuth(ctx context.Context, ref string) (string, error) {
+	var out struct {
+		Value string `json:"value"`
+	}
+	if err := c.getJSON(ctx, c.base+"/v1/scrape-auth/"+ref, &out); err != nil {
+		return "", err
+	}
+	return out.Value, nil
+}
+
 // Container fetches metadata for a container ID, letting the service wait up
 // to wait for the metadata to appear.
 func (c *Client) Container(ctx context.Context, id string, wait time.Duration) (*kubemeta.ContainerMetadata, error) {

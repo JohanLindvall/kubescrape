@@ -751,6 +751,7 @@ func (p *pipelines) startScraper() *promscrape.Scraper {
 			Splitters: p.splitters,
 			Logger:    p.log,
 			Targets:   p.meta,
+			Auth:      p.meta,
 			Exporter:  p.out,
 			StartTime: time.Now(),
 		})

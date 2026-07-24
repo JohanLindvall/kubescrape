@@ -78,6 +78,12 @@ const defaultBatchBytes = 3 << 20
 // far more than nothing, and every kind here is cumulative, so a missing series
 // simply does not appear for that cycle.
 func (s *Scraper) parseAndExport(ctx context.Context, body io.Reader, openMetrics, withExemplars bool, cb chunker, pipeline, what string) (int, error) {
+	return s.parseAndExportFiltered(ctx, body, openMetrics, withExemplars, cb, pipeline, what, nil)
+}
+
+// parseAndExportFiltered additionally applies a per-target relabel session
+// (monitor endpoints' metricRelabelings; nil = none).
+func (s *Scraper) parseAndExportFiltered(ctx context.Context, body io.Reader, openMetrics, withExemplars bool, cb chunker, pipeline, what string, relabel *relabelFilter) (int, error) {
 	filter := s.cfg.Filters.filterFor(pipeline).session()
 	exportFailed := false
 	export := func() error {
@@ -106,6 +112,9 @@ func (s *Scraper) parseAndExport(ctx context.Context, body io.Reader, openMetric
 			return ErrTooManySamples
 		}
 		if !filter.Keep(sample.Name, sample.Labels) {
+			return nil
+		}
+		if relabel != nil && !relabel.Keep(sample.Name, sample.Labels) {
 			return nil
 		}
 		return conv.add(sample)

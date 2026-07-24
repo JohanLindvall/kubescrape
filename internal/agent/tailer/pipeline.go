@@ -210,11 +210,19 @@ func (t *Tailer) feedLine(ctx context.Context, f *file, raw string, start, end i
 func (t *Tailer) feedPlainLine(ctx context.Context, f *file, raw string, start, end int64) {
 	when := time.Now()
 	seg := f.curSeg()
+	endPos := pos{seg, end}
+	// Advance the fed boundary exactly as feedLine does for CRI streams.
+	// fedEnd() (max lastEnd at the tail) is what a rename rotation reads to
+	// decide whether to record a segment for the drained-away inode; without
+	// this the plain stream's lastEnd stayed at zero, fedEnd()==committed, no
+	// segment was recorded, and any fed-but-uncommitted plain lines were lost
+	// on a rotation whose export failed (the old inode being the only copy).
+	f.stPlain.lastEnd = endPos
 	if f.traces == nil {
-		t.emit(f, entry{time: when, body: raw, start: pos{seg, start}, end: pos{seg, end}})
+		t.emit(f, entry{time: when, body: raw, start: pos{seg, start}, end: endPos})
 		return
 	}
-	f.stPlain.push(logItem{start: pos{seg, start}, end: pos{seg, end}, when: when})
+	f.stPlain.push(logItem{start: pos{seg, start}, end: endPos, when: when})
 	if err := f.traces.AddAt(ctx, plainKey, raw, when, when); err != nil {
 		t.log.Warn("log pipeline", "path", f.path, "error", err)
 	}

@@ -130,8 +130,15 @@ func (r *Router) ExportLogs(ctx context.Context, ld plog.Logs) error {
 	}
 	for i, d := range r.dests {
 		if p := parts[i+1]; p.ResourceLogs().Len() > 0 {
-			obs.Routed.WithLabelValues(d.Name, "logs").Inc()
-			errs = append(errs, d.Exporter.ExportLogs(ctx, p))
+			err := d.Exporter.ExportLogs(ctx, p)
+			if err == nil {
+				// Count only DELIVERED parts, and only after the send: the
+				// producer (ingest batcher) retries the whole payload on
+				// failure, so counting before the send would tally failed
+				// and retried attempts, not forwarded parts.
+				obs.Routed.WithLabelValues(d.Name, "logs").Inc()
+			}
+			errs = append(errs, err)
 		}
 	}
 	return errors.Join(errs...)
@@ -161,8 +168,11 @@ func (r *Router) ExportMetrics(ctx context.Context, md pmetric.Metrics) error {
 	}
 	for i, d := range r.dests {
 		if p := parts[i+1]; p.ResourceMetrics().Len() > 0 {
-			obs.Routed.WithLabelValues(d.Name, "metrics").Inc()
-			errs = append(errs, d.Exporter.ExportMetrics(ctx, p))
+			err := d.Exporter.ExportMetrics(ctx, p)
+			if err == nil {
+				obs.Routed.WithLabelValues(d.Name, "metrics").Inc() // see ExportLogs
+			}
+			errs = append(errs, err)
 		}
 	}
 	return errors.Join(errs...)
@@ -208,8 +218,11 @@ func (r *Router) ExportTraces(ctx context.Context, td ptrace.Traces) error {
 				errs = append(errs, errors.New("route "+d.Name+" does not support traces"))
 				continue
 			}
-			obs.Routed.WithLabelValues(d.Name, "traces").Inc()
-			errs = append(errs, te.ExportTraces(ctx, p))
+			err := te.ExportTraces(ctx, p)
+			if err == nil {
+				obs.Routed.WithLabelValues(d.Name, "traces").Inc() // see ExportLogs
+			}
+			errs = append(errs, err)
 		}
 	}
 	return errors.Join(errs...)

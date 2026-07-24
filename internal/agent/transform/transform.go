@@ -126,15 +126,26 @@ func (w *Wrapper) Swap(p *Program) { w.program.Store(p) }
 // Active returns the current program (for /debug/transforms).
 func (w *Wrapper) Active() *Program { return w.program.Load() }
 
+// A transform runs on a COPY of the payload, never the caller's object: the
+// scripts mutate pdata in place (lazy host objects alias it), while the ingest
+// batcher retries the SAME object on a transient failure and the spanmetrics
+// tap Consumes it after forwarding. Mutating in place would double-apply a
+// non-idempotent script on retry and feed the tap the post-transform payload.
+// The no-script fast path forwards the original uncopied (matching route and
+// tracesample, which were hardened the same way).
+
 // ExportLogs transforms then forwards.
 func (w *Wrapper) ExportLogs(ctx context.Context, ld plog.Logs) error {
 	if p := w.program.Load(); p != nil && p.logs != nil {
-		if err := p.logs.runLogs(ld); err != nil {
+		out := plog.NewLogs()
+		ld.CopyTo(out)
+		if err := p.logs.runLogs(out); err != nil {
 			return err
 		}
-		if ld.ResourceLogs().Len() == 0 {
+		if out.ResourceLogs().Len() == 0 {
 			return nil // everything dropped: acked, nothing to send
 		}
+		return w.next.ExportLogs(ctx, out)
 	}
 	return w.next.ExportLogs(ctx, ld)
 }
@@ -142,12 +153,15 @@ func (w *Wrapper) ExportLogs(ctx context.Context, ld plog.Logs) error {
 // ExportMetrics transforms then forwards.
 func (w *Wrapper) ExportMetrics(ctx context.Context, md pmetric.Metrics) error {
 	if p := w.program.Load(); p != nil && p.metrics != nil {
-		if err := p.metrics.runMetrics(md); err != nil {
+		out := pmetric.NewMetrics()
+		md.CopyTo(out)
+		if err := p.metrics.runMetrics(out); err != nil {
 			return err
 		}
-		if md.ResourceMetrics().Len() == 0 {
+		if out.ResourceMetrics().Len() == 0 {
 			return nil
 		}
+		return w.next.ExportMetrics(ctx, out)
 	}
 	return w.next.ExportMetrics(ctx, md)
 }
@@ -155,15 +169,24 @@ func (w *Wrapper) ExportMetrics(ctx context.Context, md pmetric.Metrics) error {
 // ExportTraces transforms then forwards.
 func (w *Wrapper) ExportTraces(ctx context.Context, td ptrace.Traces) error {
 	if p := w.program.Load(); p != nil && p.traces != nil {
-		if err := p.traces.runTraces(td); err != nil {
+		if w.nextTraces == nil {
+			return fmt.Errorf("trace transform configured but the exporter does not support traces")
+		}
+		out := ptrace.NewTraces()
+		td.CopyTo(out)
+		if err := p.traces.runTraces(out); err != nil {
 			return err
 		}
-		if td.ResourceSpans().Len() == 0 {
+		if out.ResourceSpans().Len() == 0 {
 			return nil
 		}
+		return w.nextTraces.ExportTraces(ctx, out)
 	}
+	// No traces script: pass through. Require traces capability only when a
+	// script actually exists, so a logs-only transforms file never forces the
+	// trace path to need a traces-capable downstream.
 	if w.nextTraces == nil {
-		return fmt.Errorf("trace transform configured but the exporter does not support traces")
+		return fmt.Errorf("exporter does not support traces")
 	}
 	return w.nextTraces.ExportTraces(ctx, td)
 }

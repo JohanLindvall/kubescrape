@@ -285,3 +285,57 @@ func TestSetSeverityNumber(t *testing.T) {
 		t.Fatalf("severity_number = %d, want 17", int(sev))
 	}
 }
+
+// The transform must NOT mutate its input: the ingest batcher retries the
+// same payload object, and the spanmetrics tap Consumes it after forwarding.
+// A non-idempotent script re-run on the original must produce the same
+// output, and the input must be unchanged for the tap.
+func TestTransformDoesNotMutateInput(t *testing.T) {
+	prog, err := Compile([]byte("logs: |\n  def transform(batch):\n      for r in batch:\n          r.body = \"[node] \" + r.body\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	next := &capExp{}
+	w := Wrap(next, next, prog)
+	ld := logsPayload("hello")
+
+	if err := w.ExportLogs(context.Background(), ld); err != nil {
+		t.Fatal(err)
+	}
+	// Input unchanged.
+	if got := ld.ResourceLogs().At(0).ScopeLogs().At(0).LogRecords().At(0).Body().Str(); got != "hello" {
+		t.Fatalf("input mutated: body = %q", got)
+	}
+	// Forwarded copy transformed once.
+	if got := next.logs[0].ResourceLogs().At(0).ScopeLogs().At(0).LogRecords().At(0).Body().Str(); got != "[node] hello" {
+		t.Fatalf("forwarded = %q", got)
+	}
+	// Re-export the SAME object (batcher retry) — must NOT double-apply.
+	next2 := &capExp{}
+	w2 := Wrap(next2, next2, prog)
+	if err := w2.ExportLogs(context.Background(), ld); err != nil {
+		t.Fatal(err)
+	}
+	if got := next2.logs[0].ResourceLogs().At(0).ScopeLogs().At(0).LogRecords().At(0).Body().Str(); got != "[node] hello" {
+		t.Fatalf("retry double-applied: %q (want single [node] prefix)", got)
+	}
+}
+
+// A logs-only transforms file must not break the trace pass-through when the
+// downstream supports traces.
+func TestLogsOnlyTransformForwardsTraces(t *testing.T) {
+	prog, err := Compile([]byte("logs: |\n  def transform(batch): pass\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	next := &capExp{}
+	w := Wrap(next, next, prog)
+	td := ptrace.NewTraces()
+	td.ResourceSpans().AppendEmpty().ScopeSpans().AppendEmpty().Spans().AppendEmpty().SetName("s")
+	if err := w.ExportTraces(context.Background(), td); err != nil {
+		t.Fatalf("logs-only transform broke traces: %v", err)
+	}
+	if len(next.traces) != 1 {
+		t.Fatal("trace not forwarded")
+	}
+}

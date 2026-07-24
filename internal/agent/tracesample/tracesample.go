@@ -37,7 +37,11 @@ type Config struct {
 	KeepSlowerThan time.Duration `json:"keepSlowerThan,omitempty"`
 	// MaxSpansPerSecond caps forwarded spans after sampling; excess spans are
 	// dropped and counted (0 = uncapped). A hard safety valve, applied to
-	// guard-rail keeps too — a cap that can be exceeded is not a cap.
+	// guard-rail keeps too — a cap that can be exceeded is not a cap. NOTE:
+	// when the ingest batcher retries a payload, the rate bucket is consumed
+	// again for the re-sent spans, so the effective cap can be slightly
+	// stricter than configured under sustained retries — acceptable for a
+	// safety valve (the probability decision stays exact, being per-trace-ID).
 	MaxSpansPerSecond float64 `json:"maxSpansPerSecond,omitempty"`
 }
 

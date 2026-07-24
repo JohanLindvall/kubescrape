@@ -31,6 +31,7 @@ import (
 	"github.com/JohanLindvall/kubescrape/internal/agent/promscrape"
 	"github.com/JohanLindvall/kubescrape/internal/agent/spanmetrics"
 	"github.com/JohanLindvall/kubescrape/internal/agent/tailer"
+	"github.com/JohanLindvall/kubescrape/internal/agent/tracesample"
 	"github.com/JohanLindvall/kubescrape/internal/logline"
 	"github.com/JohanLindvall/kubescrape/internal/metrics"
 	"github.com/JohanLindvall/kubescrape/internal/obs"
@@ -62,7 +63,7 @@ func agentSelfResource(node string) pcommon.Resource {
 // The agent's flag surface. Package-level so the per-pipeline start
 // functions can read them directly; main parses.
 var (
-	configFile           = flag.String("config", "", "unified YAML config file with resourceAttributes, logs, logAttributes, logMetrics, metrics and traceMetrics sections")
+	configFile           = flag.String("config", "", "unified YAML config file with resourceAttributes, logs, logAttributes, logMetrics, metrics, traceMetrics and traceSampling sections")
 	nodeName             = flag.String("node-name", os.Getenv("NODE_NAME"), "name of the node this agent runs on (default $NODE_NAME)")
 	listen               = flag.String("listen", ":8081", "HTTP listen address for /healthz, /readyz, /debug/tailer and /debug/targets (empty disables)")
 	selfMetricsIntv      = flag.Duration("self-metrics-interval", time.Minute, "export the agent's own metrics over OTLP at this interval (0 disables)")
@@ -527,6 +528,15 @@ func (p *pipelines) startIngest() error {
 			return fmt.Errorf("exporter does not support traces")
 		}
 		ingestTraceOut = te
+	}
+	// The sampler sits at the very bottom of the trace path — below the
+	// span-metrics tap, so RED metrics are derived from 100% of spans while
+	// only the sampled subset ships; decisions are per-trace-ID consistent,
+	// so a sender's retry re-samples identically.
+	if cfg := p.fileCfg.TraceSampling; cfg != nil && cfg.Enabled() && ingestTraceOut != nil {
+		ingestTraceOut = tracesample.New(*cfg, ingestTraceOut)
+		p.log.Info("trace sampling enabled", "probability", cfg.Probability,
+			"maxSpansPerSecond", cfg.MaxSpansPerSecond, "keepSlowerThan", cfg.KeepSlowerThan)
 	}
 	// The span-metrics tap wraps the RAW trace exporter, BELOW the batcher:
 	// the tap aggregates only after a successful forward (a retried batch

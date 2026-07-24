@@ -110,6 +110,8 @@ var (
 		"Distinct pushed identities (container id / pod uid, memoized per request) by enrichment outcome (enriched, unresolved, peer_ip).", "outcome")
 	IngestDropped = Registry.CounterVec("kubescrape_ingest_dropped_batches_total",
 		"Acknowledged ingest batches dropped: permanent collector rejection or the transient-retry limit exhausted.", "signal")
+	TraceSpansDropped = Registry.CounterVec("kubescrape_trace_spans_dropped_total",
+		"Ingested spans dropped by the trace sampler (probability = the consistent trace-ID decision, rate = the spans/second cap).", "reason")
 	SpanMetricsDropped = Registry.Counter("kubescrape_span_metrics_dropped_total",
 		"Spans not aggregated into span metrics because the dimension-cardinality cap was reached.")
 )

@@ -10,6 +10,7 @@ import (
 	"github.com/JohanLindvall/kubescrape/internal/agent/promscrape"
 	"github.com/JohanLindvall/kubescrape/internal/agent/spanmetrics"
 	"github.com/JohanLindvall/kubescrape/internal/agent/tailer"
+	"github.com/JohanLindvall/kubescrape/internal/agent/tracesample"
 	"github.com/JohanLindvall/kubescrape/internal/metrics"
 	"github.com/JohanLindvall/kubescrape/pkg/logattrs"
 )
@@ -36,6 +37,11 @@ type agentConfig struct {
 	// (histogram buckets, extra dimensions, cardinality cap). Aggregation is
 	// gated by -ingest-span-metrics; this section only tunes it.
 	TraceMetrics *spanmetrics.Config `json:"traceMetrics,omitempty"`
+	// TraceSampling drops ingested spans before forwarding: consistent
+	// trace-ID probabilistic sampling with keep-errors/keep-slow guard rails
+	// and a spans/second cap. Span metrics still see 100% of spans (the
+	// sampler sits below the spanmetrics tap).
+	TraceSampling *tracesample.Config `json:"traceSampling,omitempty"`
 }
 
 // loadAgentConfig reads and strictly parses the unified config file.

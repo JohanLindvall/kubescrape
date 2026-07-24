@@ -425,6 +425,13 @@ func (t *Tailer) sweep(ctx context.Context, all bool) {
 		if !f.resolved && !t.resolveMetadata(ctx, f) {
 			continue
 		}
+		if f.excluded {
+			// The pod opted out via its annotation; nothing is read, the
+			// file stays tracked (cheap) so rediscovery does not re-resolve
+			// it every sweep.
+			f.dirty = false
+			continue
+		}
 		f.dirty = false
 		if err := t.readFile(ctx, f); err != nil && !errors.Is(err, os.ErrNotExist) {
 			t.log.Warn("reading log file", "path", path, "error", err)

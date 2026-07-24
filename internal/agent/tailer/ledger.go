@@ -15,6 +15,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/JohanLindvall/kubescrape/internal/logline"
 	"github.com/JohanLindvall/multiline"
 	"github.com/JohanLindvall/multiline/cri"
 	"go.opentelemetry.io/collector/pdata/pcommon"
@@ -106,6 +107,12 @@ type file struct {
 	// its checkpointed segments retired — drainGone must not re-count on the
 	// sweeps between the drain and the release.
 	unresolvedLost bool
+	// Per-pod annotation config (podconfig.go), stamped at resolve time:
+	// excluded skips the file entirely; multiline overrides the source's
+	// stack-trace joining; podRules run before the global rules.
+	excluded  bool
+	multiline *bool
+	podRules  *logline.LineFilter
 
 	// Per-file line rate limiting (Config.RateLimit): a token bucket refilled
 	// by elapsed time. limited marks a paused file (tokens exhausted, reading

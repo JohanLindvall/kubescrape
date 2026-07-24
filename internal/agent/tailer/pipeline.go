@@ -36,7 +36,11 @@ func (t *Tailer) newPipeline(f *file) {
 		f.stPlain = f.state(plainKey)
 	}
 
-	if f.source.multiline {
+	ml := f.source.multiline
+	if f.multiline != nil {
+		ml = *f.multiline // pod annotation override
+	}
+	if ml {
 		f.traces = multiline.New(t.traceEmitFunc(f),
 			multiline.WithMaxBytes(t.cfg.MaxEntryBytes), multiline.WithMaxLines(512))
 	} else {

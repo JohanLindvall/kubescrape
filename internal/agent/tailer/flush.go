@@ -149,7 +149,7 @@ func (t *Tailer) newRecordBuilder(ld plog.Logs) *recordBuilder {
 	}
 	// Per-file bound metric state (resource hash computed once per file) and
 	// one reusable key resolver for the whole flush.
-	if t.cfg.LogMetrics != nil || t.cfg.Rules != nil {
+	if t.cfg.LogMetrics != nil || t.cfg.Rules != nil || t.anyPodRules() {
 		b.resolver = newMetricResolver()
 	}
 	if t.cfg.LogMetrics != nil {
@@ -158,10 +158,23 @@ func (t *Tailer) newRecordBuilder(ld plog.Logs) *recordBuilder {
 	// With rules configured, records are built in a one-record scratch slice
 	// and only MOVED into the batch when kept, so drops never materialize a
 	// resource/scope. Without rules they are built in place, as before.
-	if t.cfg.Rules != nil {
+	if t.cfg.Rules != nil || t.anyPodRules() {
 		b.scratch = plog.NewLogs().ResourceLogs().AppendEmpty().ScopeLogs().AppendEmpty().LogRecords()
 	}
 	return b
+}
+
+// anyPodRules reports whether any tracked file carries annotation rules —
+// the flush then needs the scratch slice and resolver even with no global
+// rules configured. O(files) once per flush, only reached when the global
+// pieces would otherwise be skipped.
+func (t *Tailer) anyPodRules() bool {
+	for _, f := range t.files {
+		if f.podRules != nil {
+			return true
+		}
+	}
+	return false
 }
 
 // buildRecord renders one batch entry as an OTLP record (attribute stamping,
@@ -181,7 +194,7 @@ func (t *Tailer) buildRecord(b *recordBuilder, e entry) {
 		extracted = t.cfg.LogAttrs.Extract(e.body)
 	}
 	var lr plog.LogRecord
-	if t.cfg.Rules != nil {
+	if t.cfg.Rules != nil || e.file.podRules != nil {
 		lr = b.scratch.AppendEmpty()
 	} else {
 		lr = b.g.scope(e.file, extracted.Resource, extracted.Scope).LogRecords().AppendEmpty()
@@ -220,10 +233,17 @@ func (t *Tailer) buildRecord(b *recordBuilder, e entry) {
 		b.resolver.rec, b.resolver.res = lr.Attributes(), e.file.resource.Attributes()
 		bm.Add(b.resolver.valueFn, b.resolver.labelFn, e.body)
 	}
-	if t.cfg.Rules != nil {
+	if t.cfg.Rules != nil || e.file.podRules != nil {
 		b.resolver.rec, b.resolver.res = lr.Attributes(), e.file.resource.Attributes()
 		b.resolver.sev = lowerSeverity(lr.SeverityText())
-		if t.cfg.Rules.Keep(b.resolver.ruleFn, e.body) {
+		// Pod-annotation rules first, then the global chain: each is
+		// first-match-wins on its own, a pod drop is final, a pod keep still
+		// passes through the global rules.
+		keep := e.file.podRules == nil || e.file.podRules.Keep(b.resolver.ruleFn, e.body)
+		if keep && t.cfg.Rules != nil {
+			keep = t.cfg.Rules.Keep(b.resolver.ruleFn, e.body)
+		}
+		if keep {
 			b.scratch.MoveAndAppendTo(b.g.scope(e.file, extracted.Resource, extracted.Scope).LogRecords())
 			b.kept++
 		} else {

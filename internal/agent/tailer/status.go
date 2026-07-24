@@ -41,6 +41,9 @@ func (t *Tailer) publishStatus() {
 	out := make([]FileStatus, 0, len(t.files))
 	var maxLag, totalLag int64
 	for _, f := range t.files {
+		if f.excluded {
+			continue // annotation opt-out: nothing is read, lag is not real
+		}
 		fs := FileStatus{
 			Path:        f.path,
 			ContainerID: f.containerID,

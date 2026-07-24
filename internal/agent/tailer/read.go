@@ -46,6 +46,7 @@ func (t *Tailer) resolveMetadata(ctx context.Context, f *file) bool {
 	t.cfg.Attrs.Build(res, actx)
 	f.resource = res
 	f.resolved = true
+	t.applyPodConfig(f, md.Pod.Annotations)
 	return true
 }
 

@@ -9,8 +9,13 @@ COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
 # The metadata service is fully static; the agent is cgo (links libsystemd).
-RUN CGO_ENABLED=0 go build -trimpath -o /kubescrape ./cmd/kubescrape \
-	&& CGO_ENABLED=1 go build -trimpath -o /kubescrape-agent ./cmd/kubescrape-agent
+# -ldflags="-s -w" strips the symbol table and DWARF (~30% smaller image):
+# the release binary is never attached to a debugger, and Go panic stack
+# traces are UNAFFECTED — the runtime reads pclntab, which -s/-w never remove
+# (only external debuggers like delve/gdb lose out). `make build` stays
+# unstripped for local debugging.
+RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /kubescrape ./cmd/kubescrape \
+	&& CGO_ENABLED=1 go build -trimpath -ldflags="-s -w" -o /kubescrape-agent ./cmd/kubescrape-agent
 
 # distroless/base has glibc (the cgo agent needs it); static-debian12 would not
 # run the agent. The agent (command: /kubescrape-agent) needs root to read

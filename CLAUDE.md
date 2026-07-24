@@ -10,7 +10,7 @@ make test               # go test ./...
 go test ./internal/store/ -run TestWaitIsPerContainer -v   # single test
 make vet fmt tidy
 make lint               # golangci-lint v2 (auto-installed to GOPATH/bin; config .golangci.yml)
-make image              # docker build; service is CGO_ENABLED=0 static, agent is CGO_ENABLED=1 (libsystemd/journald) on distroless/base
+make image              # docker build; service is CGO_ENABLED=0 static, agent is CGO_ENABLED=1 (libsystemd/journald) on distroless/base; release binaries strip -s -w (~30% smaller; panic traces unaffected — the runtime reads pclntab). `make build` stays unstripped for delve/gdb.
 ```
 
 `CGO_ENABLED=1 go test -race ./...` works (gcc is available); run it for concurrency-touching changes (store, metaclient cache, otlpingest). The concurrency tests in `internal/store` and `TestEnricherConcurrent` are the targeted exercises.

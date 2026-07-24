@@ -10,6 +10,9 @@ GOLANGCI_LINT         := $(shell go env GOPATH)/bin/golangci-lint
 
 all: build
 
+# Local build: unstripped, so delve/gdb work. The release IMAGE strips with
+# -ldflags="-s -w" (see Dockerfile) for a ~30% smaller binary; that does not
+# affect Go panic stack traces (the runtime reads pclntab, which -s/-w keep).
 build:
 	CGO_ENABLED=0 go build $(GOFLAGS) -o bin/$(BINARY) ./cmd/kubescrape
 	CGO_ENABLED=1 go build $(GOFLAGS) -o bin/$(BINARY)-agent ./cmd/kubescrape-agent

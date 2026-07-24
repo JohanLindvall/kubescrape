@@ -53,6 +53,16 @@ component for each:
   splitters then re-attribute its output into per-object resources; only the
   generation is out of scope.
 
+**In scope — the systemd journal** (`-journald`). Node/system *logs* — the
+kubelet, containerd and other systemd units — **are** collected, unlike the
+host *metrics* above. The line is drawn at operational necessity, not at
+"host vs. Kubernetes": when a node's Kubernetes plane misbehaves, those unit
+logs are where you look, and on many distros they live only in the journal
+(not as container logs). It costs the agent a cgo dependency on libsystemd
+(hence a non-static binary on `distroless/base`), which is accepted for that
+payoff; host metrics, well served by node_exporter, are not worth an
+equivalent cost.
+
 ## API
 
 ### `GET /v1/containers/{id}[?wait=2s]`

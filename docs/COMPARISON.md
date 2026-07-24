@@ -175,3 +175,11 @@ replace the standard component for each:
   deploy kube-state-metrics itself and scrape it. kubescrape's metrics
   splitters then re-attribute its output into per-object resources; only the
   generation is out of scope, the split/enrich capability stays.
+
+The systemd journal (`-journald`) is the deliberate **in-scope** exception to
+the host/node line: node/system *logs* (kubelet, containerd, systemd units)
+are collected even though host *metrics* are not. The distinction is
+operational necessity — those unit logs are how you debug a node's Kubernetes
+plane, and on many distros they exist only in the journal — and it is worth
+the cgo dependency on libsystemd (a non-static agent binary) that host
+metrics, already covered by node_exporter, are not.

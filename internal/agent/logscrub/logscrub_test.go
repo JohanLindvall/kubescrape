@@ -82,3 +82,19 @@ func BenchmarkScrubNoMatch(b *testing.B) {
 		_ = s.Scrub(line)
 	}
 }
+
+// Mixed-case keywords must still be redacted — the (?i) regexes intend
+// case-insensitive matching, so the prefilter must not be narrower.
+func TestScrubMixedCaseKeywords(t *testing.T) {
+	s := mustNew(t, Config{Builtin: []string{"defaults"}})
+	cases := []string{
+		"authorization: bEaReR abc123XYZ.tok.sig",
+		"pAsSwOrD=hunter2",
+		"ApIkEy: sekret-value",
+	}
+	for _, in := range cases {
+		if got := s.Scrub(in); !strings.Contains(got, "[REDACTED]") {
+			t.Errorf("mixed-case not redacted: %q -> %q", in, got)
+		}
+	}
+}

@@ -254,7 +254,13 @@ func (s *sink[T]) drain(ctx context.Context) {
 				continue
 			}
 			if s.spool.Bytes() > int64(len(data))+spool.FrameOverhead {
-				if err := s.spool.Append(data); err == nil {
+				// AppendForce, not Append: the rotate is size-neutral (commit
+				// removes the head frame right after), so a FULL spool must not
+				// make it fail with ErrFull — that would leave the head
+				// uncommitted, so nothing behind it ever drains, s.delivered
+				// never advances, sawProgress never arms, and a poison head at
+				// the cap wedges the whole signal permanently across restarts.
+				if err := s.spool.AppendForce(data); err == nil {
 					obs.BufferRequeued.WithLabelValues(s.kind).Inc()
 					commit()
 				}

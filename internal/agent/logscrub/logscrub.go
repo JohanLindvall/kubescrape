@@ -52,14 +52,39 @@ type pattern struct {
 
 func containsFold(sub string) func(string) bool {
 	lower := strings.ToLower(sub)
-	upper := strings.ToUpper(sub)
-	title := strings.ToUpper(sub[:1]) + sub[1:]
 	return func(s string) bool {
-		// Three exact scans beat a per-line ToLower allocation; mixed-case
-		// beyond Title/UPPER falls through to the (case-insensitive) regex
-		// only when one of the common forms appears.
-		return strings.Contains(s, lower) || strings.Contains(s, title) || strings.Contains(s, upper)
+		// A TRUE ASCII case-insensitive scan: the guarded regexes are (?i), so
+		// the prefilter must not be narrower than them. The old three-casing
+		// (lower/UPPER/Title) check let a mixed-case keyword (`bEaReR`,
+		// `pAsSwOrD`) skip redaction — a real secret-leak gap. Zero-alloc.
+		return asciiIndexFold(s, lower) >= 0
 	}
+}
+
+// asciiIndexFold reports whether lowerSub (already lowercase) occurs in s,
+// ASCII-case-insensitively, without allocating. The prefilter needle is short,
+// so the naive scan is cheaper than the per-line ToLower it replaces.
+func asciiIndexFold(s, lowerSub string) int {
+	n := len(lowerSub)
+	if n == 0 {
+		return 0
+	}
+	for i := 0; i+n <= len(s); i++ {
+		k := 0
+		for ; k < n; k++ {
+			c := s[i+k]
+			if 'A' <= c && c <= 'Z' {
+				c += 'a' - 'A'
+			}
+			if c != lowerSub[k] {
+				break
+			}
+		}
+		if k == n {
+			return i
+		}
+	}
+	return -1
 }
 
 // digitRun reports a run of >= n digits, ignoring single spaces/dashes inside.

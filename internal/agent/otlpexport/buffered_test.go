@@ -281,3 +281,42 @@ func TestBufferedNilSpoolExportsDirectly(t *testing.T) {
 		t.Fatalf("direct metrics = %v", got)
 	}
 }
+
+// A poison (transient-erroring) head at a FULL spool must not wedge the
+// signal: the size-neutral rotate-to-back uses AppendForce, so the good
+// batches behind it still drain. Without the fix the requeue ErrFull's, the
+// head never commits, and nothing behind it is ever attempted.
+func TestBufferedFullSpoolDoesNotWedgeOnPoisonHead(t *testing.T) {
+	send := &errSender{errs: map[string]error{"poison": context.DeadlineExceeded}}
+	b, ls, ms := openBuffer(t, t.TempDir(), &send.fakeSender, 600) // small cap: a few frames
+	defer func() { _ = ls.Close(); _ = ms.Close() }()
+	b.logs.send = send.ExportLogs
+
+	// Poison head, then fill to the cap with good batches.
+	if err := b.ExportLogs(context.Background(), logsWith("poison")); err != nil {
+		t.Fatal(err)
+	}
+	good := 0
+	for i := 0; i < 200; i++ {
+		if err := b.ExportLogs(context.Background(), logsWith("good")); err != nil {
+			break // ErrFull: the spool is at its cap
+		}
+		good++
+	}
+	if good == 0 {
+		t.Fatal("cap too small to hold any good batch behind the poison head")
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go b.Run(ctx)
+
+	waitFor(t, func() bool {
+		for _, l := range send.gotLogs() {
+			if l == "good" {
+				return true
+			}
+		}
+		return false
+	}, "good batch delivered despite a poison head at a full spool")
+}

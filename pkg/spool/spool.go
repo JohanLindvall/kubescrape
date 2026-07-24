@@ -414,13 +414,28 @@ func (s *Spool) backlog() int64 {
 // would be exceeded, leaving the queue unchanged so the caller can apply
 // backpressure.
 func (s *Spool) Append(data []byte) error {
+	return s.append(data, false)
+}
+
+// AppendForce enqueues one record IGNORING the size cap. It exists solely for
+// a size-NEUTRAL rotate-to-back (the caller commits an equal-or-larger head
+// frame immediately after, netting no growth): the cap must not block that,
+// or an undeliverable head at a full spool would wedge the whole signal
+// forever (nothing behind it ever drains). The transient overshoot is one
+// frame, within the documented "physical disk may exceed the cap by up to one
+// segment" tolerance. Do NOT use it for ordinary enqueues.
+func (s *Spool) AppendForce(data []byte) error {
+	return s.append(data, true)
+}
+
+func (s *Spool) append(data []byte, force bool) error {
 	frame := int64(frameHeaderV1 + len(data))
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closed {
 		return errors.New("spool: closed")
 	}
-	if s.maxBytes > 0 && s.backlog()+frame > s.maxBytes {
+	if !force && s.maxBytes > 0 && s.backlog()+frame > s.maxBytes {
 		return ErrFull
 	}
 	if s.w == nil {

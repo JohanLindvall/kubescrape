@@ -460,6 +460,35 @@ func TestAggregatingGaugeEmittedBeforeDelete(t *testing.T) {
 	}
 }
 
+// TestAggregatingGaugeNotReEmittedAtDelete: once the aggregating branch has
+// snapshotted (and thus exported) a window, the later 4-minute grace-DELETE
+// must NOT emit that same window a second time — the DELETE guard is `!exported`
+// and the aggregating branch now marks the window exported. Without that mark
+// the window is double-counted (emitted at the snapshot AND again at delete).
+func TestAggregatingGaugeNotReEmittedAtDelete(t *testing.T) {
+	t0 := int64(1_700_900_000)
+	setTimeForTest(time.Unix(t0, 0))
+	defer testEpoch.Store(0)
+
+	s := newSeries(seriesSpec{name: "g", kind: kindGauge, action: actionAvg, expiration: 30 * time.Second})
+	s.observe(labels{}.set("k", "v"), 5, resKey{}, emptyResource, nil)
+
+	// First snapshot within the grace window: the aggregating branch emits the
+	// window (avg 5) and marks it exported.
+	setTimeForTest(time.Unix(t0+60, 0)) // idle = 60-30 = 30 < 240
+	if got := s.snapshot(); len(got) != 1 || got[0].value != 5 {
+		t.Fatalf("first snapshot = %+v, want one sample value 5", got)
+	}
+
+	// Second snapshot past maxAge+grace with no new observation: the DELETE
+	// branch fires and must emit nothing — the window was already exported.
+	setTimeForTest(time.Unix(t0+400, 0)) // idle = 400-30 = 370 >= 240
+	if got := s.snapshot(); len(got) != 0 {
+		t.Fatalf("delete-time snapshot = %+v, want 0 samples: an already-exported "+
+			"aggregating window was re-emitted at DELETE (double count)", got)
+	}
+}
+
 // TestHistogramIdleEmitThroughExport is the end-to-end counterpart to
 // TestHistogramIdleEmitKeepsAllBuckets: it drives the partial-emit scenario
 // through the real Dynamic.Add + Export (OTLP) path and asserts the RENDERED

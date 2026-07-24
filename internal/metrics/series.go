@@ -512,12 +512,17 @@ func (s *series) snapshot() []sample {
 		}
 		if s.aggregating() {
 			// Keep emitting the aggregate even when idle; seal the window so the
-			// next observed value starts a fresh one.
+			// next observed value starts a fresh one. Mark exported so the
+			// later grace-DELETE branch (guarded by !exported) does not re-emit
+			// this same aggregate a second time — that guard is meant to catch
+			// a window NEVER snapshotted, which the aggregating branch has now
+			// handled.
 			emit := samp.sample
 			emit.value = s.aggregateValue(&samp.sample)
 			out = append(out, emit)
 			samp.initial = false
 			samp.sealed = true
+			samp.exported = true
 			continue
 		}
 		if idle > 0 {

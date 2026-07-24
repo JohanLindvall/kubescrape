@@ -31,10 +31,11 @@ func TestBothContainerIDAndPodUIDPrefersContainer(t *testing.T) {
 	}
 }
 
-// When the container ID is present but unresolvable, the enricher does NOT
-// fall back to the pod UID: findID returns the first ID found, resolvable or
-// not. This pins the current (documented-order, no-fallback) behavior.
-func TestUnresolvableContainerIDDoesNotFallBackToUID(t *testing.T) {
+// When the container ID is present but unresolvable (stale/garbage), the
+// enricher falls back to a resolvable pod UID the sender also provided:
+// container is still preferred when it resolves (see the precedence test
+// above), but a dead container ID must not veto pod-level enrichment.
+func TestUnresolvableContainerIDFallsBackToUID(t *testing.T) {
 	ld := plog.NewLogs()
 	rl := ld.ResourceLogs().AppendEmpty()
 	rl.Resource().Attributes().PutStr("container.id", "unknown")
@@ -42,8 +43,13 @@ func TestUnresolvableContainerIDDoesNotFallBackToUID(t *testing.T) {
 	rl.ScopeLogs().AppendEmpty().LogRecords().AppendEmpty()
 
 	newEnricher(newMeta(), MetricsAuto).EnrichLogs(context.Background(), ld)
-	if _, ok := rl.Resource().Attributes().Get("k8s.pod.name"); ok {
-		t.Error("gained pod attributes; expected no UID fallback after a container-ID miss")
+	a := rl.Resource().Attributes()
+	if v, ok := a.Get("k8s.pod.name"); !ok || v.Str() != "web-2" {
+		t.Errorf("k8s.pod.name = %q ok=%v; expected UID fallback to web-2 after a container-ID miss", v.Str(), ok)
+	}
+	// A stale container ID must not leave a container name behind.
+	if _, ok := a.Get("k8s.container.name"); ok {
+		t.Error("gained a container name from an unresolvable container ID")
 	}
 }
 

@@ -224,8 +224,9 @@ func (e *Enricher) enrichResource(ctx context.Context, res pcommon.Resource, cac
 // applyMetadata looks up the ID in a and merges the derived k8s attributes
 // into a, leaving existing keys untouched. It reports whether an ID resolved.
 func (e *Enricher) applyMetadata(ctx context.Context, a pcommon.Map, cache map[string]pcommon.Map) bool {
-	tok, ok := e.findID(a)
-	if !ok {
+	cTok, cOK := e.tokenFrom(a, e.containerIDKeys, tokContainer)
+	uTok, uOK := e.tokenFrom(a, e.podUIDKeys, tokPodUID)
+	if !cOK && !uOK {
 		if pod := e.peerPod(ctx); pod != nil {
 			obs.Ingested.WithLabelValues("peer_ip").Inc()
 			e.build(pod, nil, a)
@@ -234,12 +235,33 @@ func (e *Enricher) applyMetadata(ctx context.Context, a pcommon.Map, cache map[s
 		obs.Ingested.WithLabelValues("unresolved").Inc()
 		return false
 	}
-	built := e.builtAttrs(ctx, cache, tok)
-	if built.Len() == 0 {
-		return false
+	// Try the container id first, then fall back to the pod uid: a stale
+	// container id the store no longer knows must not block a resolvable pod
+	// uid the sender also provided.
+	if cOK {
+		if built := e.builtAttrs(ctx, cache, cTok); built.Len() > 0 {
+			mergeAttrs(built, a)
+			return true
+		}
 	}
-	mergeAttrs(built, a)
-	return true
+	if uOK {
+		if built := e.builtAttrs(ctx, cache, uTok); built.Len() > 0 {
+			mergeAttrs(built, a)
+			return true
+		}
+	}
+	return false
+}
+
+// tokenFrom returns the first non-empty value under keys as a kind-tagged
+// token. Zero-alloc.
+func (e *Enricher) tokenFrom(a pcommon.Map, keys []string, prefix string) (string, bool) {
+	for _, k := range keys {
+		if v, ok := a.Get(k); ok && v.Str() != "" {
+			return prefix + v.Str(), true
+		}
+	}
+	return "", false
 }
 
 // builtAttrs returns the k8s attributes for a kind-tagged ID token, doing the

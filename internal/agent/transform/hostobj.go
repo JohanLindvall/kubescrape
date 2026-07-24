@@ -22,9 +22,10 @@ import (
 	"go.starlark.net/starlark"
 )
 
-// dropMarker flags an element for post-run pruning. Metrics have no
-// attributes at the metric level, so a dropped metric's NAME is set to it
-// instead — either way the marker never survives into the export.
+// dropMarker flags an element for post-run pruning. Logs and spans carry it
+// as a record/span attribute; metrics carry it in the pdata-internal Metadata
+// map (never serialized) so a drop-then-rename cannot un-drop it. Either way
+// the marker never survives into the export.
 const dropMarker = "__kubescrape_drop__"
 
 // --- attribute map view ---

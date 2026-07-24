@@ -100,10 +100,15 @@ func gzipBody(body []byte) (*bufpool.Buffer, error) {
 	z.Reset(buf)
 	if _, err := z.Write(body); err != nil {
 		buf.Recycle()
+		// A Reset writer is safe to reuse after a Write/Close error (the next
+		// Reset clears its state); returning it avoids leaking the pooled
+		// writer on the (rare) error path.
+		httpGzipWriters.Put(z)
 		return nil, err
 	}
 	if err := z.Close(); err != nil {
 		buf.Recycle()
+		httpGzipWriters.Put(z)
 		return nil, err
 	}
 	httpGzipWriters.Put(z)

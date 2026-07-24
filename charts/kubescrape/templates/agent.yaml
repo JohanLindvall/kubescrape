@@ -238,6 +238,9 @@ spec:
               mountPath: /run/log/journal
               readOnly: true
             {{- end }}
+            {{- with .Values.agent.extraVolumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
           resources: {{ toYaml .Values.agent.resources | nindent 12 }}
       volumes:
         - name: varlog
@@ -262,6 +265,9 @@ spec:
           hostPath:
             path: /run/log/journal
             type: DirectoryOrCreate
+        {{- end }}
+        {{- with .Values.agent.extraVolumes }}
+        {{- toYaml . | nindent 8 }}
         {{- end }}
 {{- if .Values.networkPolicy.enabled }}
 ---

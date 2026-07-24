@@ -52,16 +52,20 @@ fully attributed — the cache-race gap that per-node watchers accept.
 | Log-derived metrics | ✔ counter/gauge/histogram/summary, windowed aggregations, **pushed OTLP with per-pod resources** | ✔ metrics stage (local exposition) | ✔ log_to_metric | ✔ | ✔ count connector |
 | Arbitrary host files / gzip archives | ✔ sources + gzip | ✔ / ✘ | ✔ / ✘ | ✔ / ✘ | ✔ / ✔ |
 | journald | ✔ native (libsystemd) | ✔ | ✔ | ✔ | ✔ |
-| Body rewriting / templating | ✘ deliberate (body is never modified) | ✔ | ✔ VRL | ✔ | ✔ OTTL |
-| General transform language | ✘ | River/stages | **VRL** | Lua/filters | **OTTL** |
+| Secret/PII scrubbing | ✔ `logScrubbing` (curated built-ins + custom regexes, pre-enrichment) | config stages | VRL | config | ✔ redaction processor |
+| Per-workload (annotation) log config | ✔ `kubescrape.io/logs` (exclude, multiline, rules, attributes) | ✘ | ✘ | ~ `fluentbit.io/exclude`, parser annotations | ✘ |
+| Body rewriting / templating | ✔ opt-in (Starlark transforms; the built-in pipeline never modifies bodies) | ✔ | ✔ VRL | ✔ | ✔ OTTL |
+| General transform language | **Starlark** (per-batch, hot-reloaded, opt-in) | River/stages | **VRL** | Lua/filters | **OTTL** |
 
 ### Metrics
 
 | | kubescrape | Alloy/Prometheus/vmagent | OTel prometheus receiver |
 |---|---|---|---|
 | Annotation discovery (`prometheus.io/*`) | ✔ incl. Services with `targetPort` translation, comma port lists | via relabel config | via SD config |
-| ServiceMonitors | ✔ subset (port/targetPort/path/scheme) | ✔ full | ✔ via TA |
+| ServiceMonitors / PodMonitors / Probes | ✔ subset (port/targetPort/path/scheme, bearer-token auth, insecureSkipVerify, keep/drop metricRelabelings; Probes staticConfig-only) | ✔ full | ✔ via TA |
 | Relabeling | keep/drop/label rules + splitters (narrower, declarative) | ✔ full relabel_configs | ✔ |
+| Native histograms | ✔ opt-in (protobuf exposition → OTLP exponential histograms) | ✔ | ✔ |
+| Host/node metrics | ✔ built-in (`-host-metrics`, node_exporter-compatible names) | ✔ (embedded node_exporter) | ✔ hostmetrics receiver |
 | KSM re-attribution (per-object resources + metadata enrichment) | ✔ **splitters** — unique | ~400 lines of OTTL/groupbyattrs | manual OTTL |
 | cadvisor/kubelet | ✔ exact-incarnation attribution via cgroup ID | label-based | label-based |
 | Mimir job/instance identity conventions | ✔ built-in (`service.namespace`/`instance.id`, collision prefixes) | manual transforms | manual |
@@ -74,8 +78,9 @@ fully attributed — the cache-race gap that per-node watchers accept.
 | | kubescrape | Alloy | Vector | Fluent Bit | OTel Collector |
 |---|---|---|---|---|---|
 | OTLP ingest (push) with k8s enrichment | ✔ logs/metrics/traces, peer-IP fallback, batching | ✔ | ✔ | ✔ | ✔ |
-| Traces | passthrough + enrichment only | ✔ full | ✔ | ✔ | ✔ full (sampling etc.) |
-| K8s events | ✔ (service-side, series-aware) | ✔ | ✘ | ✔ | ✔ receiver |
+| Traces | enrichment + RED span metrics + consistent probabilistic sampling (`traceSampling`); no cross-node tail sampling | ✔ full | ✔ | ✔ | ✔ full (tail sampling etc.) |
+| Multi-destination / tenant routing | ✔ per-namespace (`routing`: endpoints, `X-Scope-OrgID` headers; unbuffered by design) | ✔ | ✔ | ✔ | ✔ routing connector |
+| K8s events | ✔ (service-side, series-aware; HA via leader election) | ✔ | ✘ | ✔ | ✔ receiver |
 | Log delivery | **ack-gated at-least-once** + rewind; offsets never pass unacked data | positions synced on timer (loss/dup window) | ✔ e2e acks + disk buffers | offsets on read (not ack) | checkpoints on read (not ack) |
 | Disk buffering | ✔ both signals (fsync'd frames, checksummed cursor, poison-batch handling) | in-memory queue (WAL never GA) | ✔ mature | ✔ filesystem storage | ✔ file storage ext |
 | Compression | gzip (klauspost) | snappy/gzip | ✔ several | ✔ | ✔ several |
@@ -140,19 +145,21 @@ filelog receiver (offsets committed on read, not on acknowledgment).
 - **On Kubernetes, shipping OTLP, wanting zero-config attribution and strong
   delivery guarantees with minimal API-server load** — kubescrape is built
   for exactly this and is the smallest-config option.
-- **Need syslog/kafka/cloud inputs, Windows, remote-write, a transform
-  language, or trace processing** — use Vector, Fluent Bit, Alloy, or the
-  OTel Collector; or run kubescrape for node collection in front of a
-  central collector that does the rest.
+- **Need syslog/kafka/cloud inputs, Windows, remote-write, or whole-trace
+  processing (cross-node tail sampling, service graphs)** — use Vector,
+  Fluent Bit, Alloy, or the OTel Collector; or run kubescrape for node
+  collection in front of a central collector that does the rest.
 - **Deeply invested in Prometheus relabel_configs / Loki** — Alloy is the
   path of least resistance ([migration guide](MIGRATING-FROM-ALLOY.md) if
   you change your mind).
 
 ## Honest gaps
 
-No general transform language (body rewriting is a deliberate non-goal); no
-trace processing beyond enrichment/passthrough; no input breadth; OTLP-only
-output; single-core log ingestion per node; Linux/containerd focus; and years
-less production soak time than any comparator — the invariants are tested
-(race-tested suite, crash/rotation/power-loss cases) but the field mileage is
-not.
+The transform language (Starlark, per exported batch) is deliberately
+narrower than VRL/OTTL and has none of their ecosystem; trace processing is
+node-local only (enrichment, RED span metrics, consistent probabilistic
+sampling — no cross-node tail sampling or service-graph pairing); no input
+breadth; OTLP-only output; single-core log ingestion per node;
+Linux/containerd focus; and years less production soak time than any
+comparator — the invariants are tested (race-tested suite,
+crash/rotation/power-loss cases) but the field mileage is not.

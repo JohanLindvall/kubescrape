@@ -83,21 +83,32 @@ Pods served from the tombstone cache additionally carry `pod.deletedAt`.
 ### `GET /v1/nodes/{node}/targets`
 
 Prometheus scrape targets for all live pods scheduled on `node`. Targets come
-from three sources:
+from four sources:
 
 * **pod annotations** — the conventional annotations on the pod itself,
 * **service annotations** — the same annotations on any Service whose
   selector matches the pod; service ports are translated to pod ports via
   their `targetPort` (named container port, explicit number, or the service
-  port itself), and
+  port itself),
 * **ServiceMonitors** (opt-in, `-servicemonitors`) — Prometheus-Operator
   `monitoring.coreos.com/v1` ServiceMonitor resources whose selector matches
   a Service backing the pod. Endpoint `port` (service port name),
   `targetPort` (pod port number or container-port name), `path` and `scheme`
-  are honored; per-endpoint authentication, relabelings and intervals are
-  not. These targets carry `source: "servicemonitor"` and a
-  `monitor: "<namespace>/<name>"` field. If the CRD is absent at startup the
-  feature disables itself with a warning.
+  are honored, and so are `tlsConfig.insecureSkipVerify`,
+  `bearerTokenSecret` (see `/v1/scrape-auth` below) and the keep/drop subset
+  of `metricRelabelings` (applied per sample by the agent; other relabel
+  actions and per-endpoint intervals are ignored). These targets carry
+  `source: "servicemonitor"` and a `monitor: "<namespace>/<name>"` field. If
+  the CRD is absent at startup the feature disables itself with a warning,
+  and
+* **PodMonitors and Probes** (same `-servicemonitors` gate, watched when the
+  cluster serves those CRDs) — PodMonitor endpoints select pods directly by
+  label and name **container** ports (`source: "podmonitor"`); Probes
+  (`staticConfig` targets only, ingress targets are not interpreted) resolve
+  through the prober Service's backing pods, so the agent on a prober pod's
+  node scrapes `http://<prober-pod>:<port>/probe?module=…&target=…` and
+  probing stays node-local (`source: "probe"`). PodMonitor endpoints honor
+  the same tlsConfig/bearer-token/relabeling subset as ServiceMonitors.
 
 | Annotation             | Meaning                                                        |
 |------------------------|----------------------------------------------------------------|
@@ -151,13 +162,23 @@ Full metadata for the **live** pod owning a pod IP (the agent's opt-in
 peer-IP attribution for pushed OTLP). Unlike the other pod lookups this is
 deliberately NOT tombstone-aware — pod IPs are recycled quickly, so a deleted
 pod must never resolve — and hostNetwork pods (which share the node IP) are
-not indexed.
+not indexed. When the claiming pod is deleted while another live pod reports
+the same IP, the survivor is promoted immediately.
 
 ### `GET /v1/nodes/{node}/metadata`
 
 The node's labels and annotations (the agent's `startNodeInfo` provider
 refreshes from this on `-node-metadata-refresh` for `.Node` attribute
 templates).
+
+### `GET /v1/scrape-auth/{namespace}/{name}/{key}`
+
+One key of a bearer-token Secret referenced by a ServiceMonitor/PodMonitor
+endpoint's `bearerTokenSecret` — agents resolve a target's `authSecret`
+reference through this before scraping. Served **only** when the service
+runs with `-scrape-auth-secrets` (404 otherwise): it needs `secrets get`
+RBAC and ships secret material over the cluster-internal HTTP channel, so it
+is deliberately opt-in.
 
 ### `GET /healthz`, `GET /readyz`, `GET /metrics`
 
@@ -182,6 +203,8 @@ importable:
 | [`pkg/kubemeta`](pkg/kubemeta) | The metadata model the service serves — the wire contract for its API — plus `NormalizeContainerID`. Pure stdlib; the Kubernetes-object conversion lives in [`pkg/kubemeta/kubeconvert`](pkg/kubemeta/kubeconvert) so clients don't compile `k8s.io/api`. |
 | [`pkg/metaclient`](pkg/metaclient) | HTTP client for that API: blocking container-ID lookups, ETag/Cache-Control caching, no metrics dependency (set `Observe` to feed your own). |
 | [`pkg/logattrs`](pkg/logattrs) | Lifts configured keys out of a JSON or logfmt log line onto an OTLP record, as resource, scope or log attributes. |
+| [`pkg/otlpsplit`](pkg/otlpsplit) | Splits an over-cap OTLP payload (logs/metrics/traces) into parts each under a byte limit, preserving resource/scope grouping — the guarantee against wholesale gRPC-limit rejections. |
+| [`pkg/cgroupid`](pkg/cgroupid) | Parses cgroup paths (cgroupfs and systemd layouts) into pod UID / container ID identity — the routing key for kubelet cadvisor series. |
 
 They carry no `internal/` dependencies, so they are usable outside this module.
 
@@ -200,8 +223,12 @@ make build           # or: go build ./cmd/kubescrape
 | `-cache-ttl`    | `5m`    | retention of metadata for deleted pods and replaced container IDs        |
 | `-metadata-cache-ttl` | `10s` | `Cache-Control`/`ETag` max-age on metadata responses; agents cache lookups client-side (0 disables) |
 | `-resync`       | `0`     | informer resync period (0 = watch stream only)                            |
-| `-servicemonitors` | `false` | serve targets for ServiceMonitor CRDs (see above)                      |
+| `-servicemonitors` | `false` | serve targets for ServiceMonitor CRDs — plus PodMonitors and Probes when the cluster serves them (see above) |
+| `-scrape-auth-secrets` | `false` | serve monitor endpoints' `bearerTokenSecret` values on `/v1/scrape-auth` (requires `secrets get` RBAC) |
 | `-events`       | `false` | export Kubernetes events as OTLP log records                             |
+| `-leader-elect` | `false` | elect one replica (via a `coordination.k8s.io` Lease) as the events exporter — required when running more than one replica with `-events` |
+| `-leader-elect-namespace` | `monitoring` | namespace of the leader-election Lease                     |
+| `-leader-elect-name` | `kubescrape-events` | name of the leader-election Lease                       |
 
 With `-events` the service watches `corev1.Events` and exports them as OTLP
 log records (batched, at-most-once): the event message becomes the body,
@@ -214,10 +241,20 @@ exporter flags: `-otlp-endpoint`, `-otlp-protocol`, `-otlp-compression`,
 `-otlp-compression-level`, `-otlp-insecure`, `-otlp-tls-ca-file`,
 `-otlp-tls-insecure-skip-verify`, `-otlp-bearer-token-file`, `-otlp-timeout`.
 
+The service can run **multiple replicas**: every replica serves reads from
+its own informer caches (no election needed there), and with `-leader-elect`
+a Lease gates the events exporter so exactly one replica exports.
+Non-leaders keep watching events (cheap), so failover needs no informer
+warmup — the successor picks up the live stream without replaying history.
+
 In-cluster it needs `get`/`list`/`watch` on `pods`, `services`, `namespaces`,
 `nodes`, `events`, `replicasets.apps`, `deployments.apps`, `jobs.batch`,
 `cronjobs.batch` and (optionally) `servicemonitors.monitoring.coreos.com`
-cluster-wide — see [deploy/kubernetes.yaml](deploy/kubernetes.yaml).
+(plus `podmonitors`/`probes` when those CRDs should be discovered)
+cluster-wide, `get`/`create`/`update` on `leases.coordination.k8s.io` for
+`-leader-elect`, and `secrets get` for `-scrape-auth-secrets` (commented out
+in the manifests — enable deliberately) — see
+[deploy/kubernetes.yaml](deploy/kubernetes.yaml).
 
 `make image` builds a container image from the [Dockerfile](Dockerfile);
 `make test` and `make vet` run the test suite and static checks.
@@ -261,7 +298,7 @@ pause or drop) keeps one runaway pod from consuming the pipeline. Set
 the collector its own output.
 
 **Unified config file** (`-config`). All of the agent's YAML configuration
-lives in one file, passed with `-config`. It has six optional sections, each
+lives in one file, passed with `-config`. Every section is optional, each
 described below and each mirroring the shape of the standalone file it
 replaces:
 
@@ -270,9 +307,15 @@ resourceAttributes: {...}   # how exported resource attributes are built
 logs:          {sources: [...], rules: [...]}   # what to tail; drop/keep/sample
 logAttributes: {rules: [...]}     # lift line keys onto attributes
 logMetrics:    {metrics: [...]}   # metrics derived from log lines
+logScrubbing:  {builtin: [...], rules: [...]}   # redact secrets/PII from bodies
 metrics:       {pipelines: {...}, splitters: [...]}   # scraped-series rules
 traceMetrics:  {dimensions: [...], buckets: [...]}    # span-derived RED metrics
+traceSampling: {probability: 0.1, ...}          # sample ingested spans
+routing:       {routes: [...]}    # per-namespace fan-out / tenancy
 ```
+
+(Starlark transforms are the one exception: they live in their **own** file,
+`-transforms-file`, so they can hot-reload independently — see below.)
 
 **Log sources** (`logs` section). By default the agent tails container logs
 under `-log-dir`. The `logs` section instead declares **sources** — files
@@ -314,6 +357,54 @@ so `action: drop, match: ["__severity__=debug"]` needs no per-app parsing.
 Rules run after enrichment and after log metrics (metrics still count every
 line — count errors while dropping them); dropped records advance offsets
 like exported ones and count into `kubescrape_log_rules_dropped_total`.
+
+**Per-workload log config** (pod annotation `kubescrape.io/logs`). A workload
+can declare its own log handling — no agent config change, no restart — with
+one JSON object in a pod annotation: `exclude` (opt the pod out of
+collection entirely), `multiline` (override stack-trace joining for this
+pod), `serviceName` (override the derived `service.name`), `attributes`
+(extra resource attributes, overwriting — the workload is authoritative
+about itself), and `rules` (keep/drop/sample rules, same shape as
+`logs.rules`, evaluated **before** the global chain: a pod-rule drop is
+final, a pod-rule keep still passes through the global rules):
+
+```yaml
+metadata:
+  annotations:
+    kubescrape.io/logs: |
+      {"multiline": true, "serviceName": "checkout",
+       "attributes": {"team": "payments"},
+       "rules": [{"action": "drop", "matchRegexp": ["level=debug"]}]}
+```
+
+The annotation arrives for free through the metadata resolution every
+container log file already performs and is parsed once per file. A
+malformed annotation must not lose logs: it is warned about and ignored.
+
+**PII scrubbing** (`logScrubbing` section). Redacts sensitive values from log
+bodies **on the agent**, before anything downstream copies from them
+(enrichment, `logAttributes`, log metrics — and before export), so secrets
+never leave the node. `builtin` enables named patterns — `defaults` expands
+to the low-false-positive set (`bearer`, `basic-auth`, `secret-kv`,
+`aws-key`, `private-key`); `email` and `credit-card` are opt-in by name —
+and `rules` adds user regexes (`name`, `regexp`, `replacement`, `$1`-style
+group references; the default replacement is `[REDACTED]`):
+
+```yaml
+logScrubbing:
+  builtin: [defaults, email]
+  rules:
+    - name: session-id
+      regexp: 'session=[0-9a-f]{32}'
+      replacement: 'session=[REDACTED]'
+```
+
+It applies to the tailer, journald and OTLP-ingest log paths alike. Every
+built-in pattern carries a cheap literal prefilter, so the no-match hot path
+costs a few substring scans and zero allocations. Redactions count into
+`kubescrape_log_scrubbed_total{pattern}`; an unknown builtin name or invalid
+regex fails startup (a scrubber that silently skips a pattern is a
+compliance bug).
 
 **Log enrichment** (`-logs-enrich`, default true). Each exported line is run
 through [JohanLindvall/enrich](https://github.com/JohanLindvall/enrich),
@@ -474,7 +565,24 @@ attributes). `-scrape-max-samples` can cap pathological targets. After each
 scrape cycle the agent exports synthetic **health gauges** per target —
 `up` (1/0), `scrape_duration_seconds` and `scrape_samples_scraped` — under
 the target's own resource attributes (`-scrape-health-metrics`, default
-true), so dead endpoints are visible exactly like with Prometheus.
+true), so dead endpoints are visible exactly like with Prometheus. The
+last cycle's per-target outcomes (up/error/duration/samples, failures
+first) are also served on `GET /debug/targets`. Targets derived from
+monitor endpoints may carry `insecureSkipVerify`, a bearer-token secret
+reference (resolved through `GET /v1/scrape-auth/...`, which requires
+`-scrape-auth-secrets` on the service) and keep/drop `metricRelabelings`
+(applied per sample) — all honored by the agent.
+
+**Native histograms** (`-scrape-native-histograms`, opt-in). The agent
+offers the Prometheus **protobuf exposition** to annotation- and
+monitor-discovered targets (the only format that carries native
+histograms) and converts native histograms to OTLP **exponential
+histogram** points; classic series in a protobuf response convert exactly
+as in text. A family carrying both native and classic data uses the native
+representation; custom-bucket histograms (schema −53) fall back to classic
+buckets. Targets that ignore the Accept header keep serving text (the parse
+mode always follows the response Content-Type), and splitter-backed targets
+(kube-state-metrics style) stay on the text path.
 
 **Kubelet metrics.** With `-kubelet-endpoint` (e.g.
 `https://$(NODE_IP):10250`) the agent also scrapes, authenticated with its
@@ -503,6 +611,20 @@ ServiceAccount token (`nodes/metrics` RBAC, see
   pod-scoped families (`container_network_*`) and `machine_*`.
 * **node metrics** (`/metrics`): the kubelet's own metrics under a node-level
   resource (`k8s.node.name`, `service.name: kubelet`).
+
+**Host metrics** (opt-in, `-host-metrics`). The agent collects node-level
+system metrics straight from `/proc` (via `prometheus/procfs` —
+node_exporter's own parser) and exports them over OTLP, replacing a separate
+node_exporter DaemonSet for the core set. Metric **names are
+node_exporter-compatible** (`node_cpu_seconds_total`,
+`node_memory_*_bytes`, `node_load1/5/15`, `node_disk_*`, `node_network_*`,
+`node_filesystem_*`), so existing dashboards and alerts keep working; the
+resource is `service.name: node` with `service.instance.id` = the node name
+(so `job="node"`, `instance=<node>` after the Mimir mapping). In-cluster,
+mount the host's `/proc` and point `-host-proc` at it (e.g. `/host/proc`);
+filesystem usage additionally needs the host root mounted (`-host-rootfs`)
+and is skipped when unset. `-host-metrics-interval` (default 30s) sets the
+cadence.
 
 **journald** (opt-in, `-journald`). The agent reads the systemd journal
 natively through libsystemd (`coreos/go-systemd/sdjournal`) and exports the
@@ -548,10 +670,35 @@ semantics; pair with `-buffer-dir` for at-least-once). Enrichment
 outcomes count into `kubescrape_ingest_resources_total{outcome}` (including
 `peer_ip`).
 
+**Trace sampling** (`traceSampling` section). Ingested spans can be sampled
+before forwarding: `probability` keeps that fraction of **traces** (the
+decision is a hash of the trace ID against a threshold, so it is
+deterministic per trace — all spans of a trace sample identically on every
+node running the same config, and a sender's retry re-samples identically);
+`keepErrors` (default true) always keeps status-ERROR spans and
+`keepSlowerThan` always keeps spans at least that slow, regardless of the
+probability decision; `maxSpansPerSecond` is a hard cap applied after
+sampling (guard-rail keeps included — a cap that can be exceeded is not a
+cap). Dropped spans count into
+`kubescrape_trace_spans_dropped_total{reason="probability"|"rate"}`, and a
+payload sampled down to nothing is acked without a send. The sampler sits
+below the span-metrics tap in the trace path, so span-derived RED metrics
+(`-ingest-span-metrics`) are computed ahead of sampling while only the
+sampled subset ships.
+
+```yaml
+traceSampling:
+  probability: 0.1
+  keepErrors: true          # default
+  keepSlowerThan: 2s
+  maxSpansPerSecond: 500
+```
+
 **Pipeline toggles.** Each pipeline is individually switchable: `-logs`,
 `-metrics` (annotation-discovered targets), `-cadvisor` and `-node-metrics`
 (all default true; the kubelet scrapes additionally require
-`-kubelet-endpoint`), plus the opt-in `-journald` and `-ingest`.
+`-kubelet-endpoint`), plus the opt-in `-journald`, `-ingest` and
+`-host-metrics`.
 
 **Self-observability.** The agent's own metrics — log entries/bytes/rotations
 and export failures, enrichment hit rates per format, scrapes and scrape
@@ -561,8 +708,12 @@ internal metrics machinery as everything else and **pushed over OTLP** on
 `-self-metrics-interval` (default 1m, 0 disables) with the agent's own
 resource identity (`service.name: kubescrape-agent`, `k8s.node.name`).
 `-listen` (default `:8081`) serves `GET /healthz`, `GET /readyz`,
-`GET /debug/tailer`, and `GET /metrics` with the Go runtime and process
-metrics (`go_*`, `process_*`) only.
+`GET /debug/tailer` (per-file positions and lag), `GET /debug/targets` (the
+last scrape cycle's per-target outcomes — up/error/duration/samples,
+failures first), `GET /debug/transforms` (the active transform program's
+content hash, for checking per-node convergence after a reload), and
+`GET /metrics` with the Go runtime and process metrics (`go_*`,
+`process_*`) only.
 
 **Metric filtering and splitting** (`metrics` section). This section has two
 subsections. `pipelines` holds ordered keep/drop rules per pipeline
@@ -641,6 +792,64 @@ wins over the built-in default, which wins over a top-level `instancePrefix`.
   `-node-metadata-refresh`. Template attributes that render empty or fail
   (e.g. `.Container` on a pod-level resource) are omitted. Order: defaults →
   static → templates → filter.
+
+**Starlark transforms** (`-transforms-file`, opt-in). For the cases the
+declarative rules don't cover, a separate YAML file holds one optional
+[Starlark](https://github.com/google/starlark-go) script per signal
+(`logs:`, `metrics:`, `traces:`), each defining `transform(batch)`. The
+script runs once per exported **batch** at the exporter seam, above the disk
+buffer — so spooled bytes are final and a reload never re-interprets a
+durable backlog. Batch elements are **lazy host objects** over the OTLP
+data: log records expose `body`, `severity_text`, `severity_number`,
+`attributes`, `resource` and `drop()`; spans expose `name`, `status_code`,
+`attributes`, `resource`, `drop()`; metrics expose `name`, `resource`,
+`drop()` — mutations are in place, a script pays only for the fields it
+touches, and dropped elements (and emptied groups) are pruned after the run:
+
+```yaml
+logs: |
+  def transform(batch):
+      for r in batch:
+          if r.attributes["level"] == "debug":
+              r.drop()
+          r.resource["env"] = "prod"
+```
+
+The file is **hot-reloaded** (fsnotify on the directory — mount its
+ConfigMap as a directory, not `subPath`, or updates never arrive — with a
+30s poll fallback): reloads compile-then-commit, so a broken edit keeps the
+last good program running (`kubescrape_transform_reloads_total{result}`),
+while a compile failure at startup is fatal. Starlark is hermetic (no I/O,
+no imports) and each run is step-limited, so a pathological script errors
+out instead of wedging an export goroutine
+(`kubescrape_transform_errors_total{signal}`; the failed export retries per
+the producer's usual semantics). The active program's content hash is on
+`GET /debug/transforms`.
+
+**Routing** (`routing` section). Exported payloads can fan out **per
+Kubernetes namespace** to extra destinations or tenants: each route matches
+`k8s.namespace.name` against glob patterns (first matching route wins) and
+forwards to its own OTLP client — a different `endpoint`, extra `headers`
+(e.g. `X-Scope-OrgID` for per-tenant Mimir/Loki), or both; route clients
+otherwise inherit the main `-otlp-*` settings. Unmatched resources use the
+default chain. Payloads are split per destination; a failed destination
+fails the whole export, and the producer's retry re-splits
+deterministically (destinations that already succeeded receive duplicates —
+standard at-least-once). Note that per-route destinations are **direct
+(unbuffered) by design** — only the default chain keeps the disk buffer;
+routes are for tenancy/fan-out, not for doubling the durability machinery.
+Routed parts count into `kubescrape_routed_payload_parts_total{route,signal}`.
+
+```yaml
+routing:
+  routes:
+    - name: team-a
+      namespaces: ["team-a-*"]
+      headers: {X-Scope-OrgID: team-a}
+    - name: audit
+      namespaces: ["payments"]
+      endpoint: audit-collector.security:4317
+```
 
 **Export.** `-otlp-protocol` selects gRPC or OTLP/HTTP;
 `-otlp-bearer-token-file` (re-read periodically) authenticates either

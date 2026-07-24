@@ -9,7 +9,7 @@ flag or a config-file entry.
 
 | | Alloy | kubescrape |
 |---|---|---|
-| Topology | 3–5 clustered Deployment replicas | metadata service (Deployment) + per-node agent (DaemonSet) |
+| Topology | 3–5 clustered Deployment replicas | metadata service (Deployment, HA-capable — all replicas serve reads, `-leader-elect` gates the events exporter) + per-node agent (DaemonSet) |
 | Target distribution | Alloy clustering | node-local by construction (each agent scrapes its node's pods) |
 | Kubernetes access | every replica watches pods/nodes/services | only the metadata service watches; agents talk HTTP to it |
 | Logs | not collected | collected (CRI + multiline joining, at-least-once, drop/keep/sample rules, per-file rate limit) |
@@ -248,16 +248,28 @@ connector) on the receiving collector, exactly as Alloy's
 `service.serviceMonitors: true` in the chart (flag `-servicemonitors` on the
 metadata service). Monitors select Services by label within their
 `namespaceSelector`; endpoint `port`/`targetPort`/`path`/`scheme` are
-honored. Per-endpoint authentication, relabelings and interval overrides are
-**not** interpreted — convert those monitors to annotated Services or
-metrics-config rules.
+honored. **PodMonitors** (endpoints naming container ports) and **Probes**
+(`staticConfig` targets only, resolved through the prober Service's pods so
+probing stays node-local) are discovered under the same flag whenever the
+cluster serves those CRDs — covering `prometheus.operator.podmonitors` and
+`prometheus.operator.probes` too.
+
+Per-endpoint `tlsConfig.insecureSkipVerify` and `bearerTokenSecret` **are**
+interpreted (run the metadata service with `-scrape-auth-secrets` so agents
+can fetch the tokens; it needs `secrets get` RBAC, commented in the
+manifests), and the keep/drop subset of `metricRelabelings` is applied per
+sample by the agent. Other relabel actions, other authentication schemes and
+per-endpoint interval overrides are still **not** interpreted — convert
+those monitors to annotated Services or metrics-config rules.
 
 ### `loki.source.kubernetes_events`
 
 `service.events.enabled: true` in the chart (flag `-events` on the metadata
 service): Kubernetes events are exported as OTLP log records with
 `k8s.event.*` attributes, and events about pods carry the full pod resource
-attributes.
+attributes. Running more than one service replica? Add `-leader-elect` (via
+`service.extraArgs`) so a Lease elects exactly one replica as the events
+exporter — all replicas keep serving metadata reads.
 
 ### `loki.source.journal`
 
@@ -303,6 +315,44 @@ Two association differences from `otelcol.processor.k8sattributes`:
   replicas; kubescrape never rewrites sender-set attributes. If replicas
   report colliding instance ids, include the pod uid in the sender's
   `OTEL_RESOURCE_ATTRIBUTES` (as above — `service.instance.id=$(POD_UID)`).
+
+### `prometheus.exporter.unix` (node_exporter)
+
+`-host-metrics` (via `agent.extraArgs`) collects the core node metric set
+straight from the host's `/proc` with **node_exporter-compatible names**
+(`node_cpu_seconds_total`, `node_memory_*_bytes`, `node_load*`,
+`node_disk_*`, `node_network_*`, `node_filesystem_*`), so dashboards and
+alerts carry over. Mount the host's `/proc` into the agent and point
+`-host-proc` at it; add `-host-rootfs` for filesystem usage. Exporters
+beyond the core set (hwmon, systemd, …) are not covered.
+
+### `otelcol.processor.transform` / OTTL statements
+
+The declarative layers (metrics `pipelines` filters, splitters,
+`logs.rules`, attribute templates) cover most OTTL uses. For the remainder,
+`-transforms-file` runs **Starlark** scripts (`transform(batch)` per signal)
+at the exporter seam: mutate or drop log records / metrics / spans, with
+hot reload (compile-then-commit — a broken edit keeps the last good program)
+and a step limit. It is deliberately narrower than OTTL: per exported batch,
+lazy field access, no I/O.
+
+### `otelcol.processor.probabilistic_sampler` / spanmetrics connector
+
+The `traceSampling` config section samples ingested spans with
+**consistent per-trace-ID decisions** (all agents keep the same traces given
+the same config), `keepErrors`/`keepSlowerThan` guard rails and a
+spans/second cap. `-ingest-span-metrics` is the spanmetrics-connector
+counterpart (same `traces.span.metrics.*` naming), derived ahead of the
+sampler so RED metrics keep full coverage. Cross-node **tail** sampling
+(whole-trace decisions on buffered traces) still needs a central collector.
+
+### Per-tenant exporters (`otelcol.exporter.* + X-Scope-OrgID`)
+
+The `routing` config section fans exported payloads out by Kubernetes
+namespace: per route a distinct endpoint and/or extra headers (e.g.
+`X-Scope-OrgID`), first match wins, everything else stays on the default
+chain. Route destinations are direct (unbuffered) — the default chain keeps
+the `-buffer-dir` durability.
 
 ## Not covered — keep a collector for these
 

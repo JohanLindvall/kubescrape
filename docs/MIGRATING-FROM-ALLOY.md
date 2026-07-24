@@ -248,11 +248,9 @@ connector) on the receiving collector, exactly as Alloy's
 `service.serviceMonitors: true` in the chart (flag `-servicemonitors` on the
 metadata service). Monitors select Services by label within their
 `namespaceSelector`; endpoint `port`/`targetPort`/`path`/`scheme` are
-honored. **PodMonitors** (endpoints naming container ports) and **Probes**
-(`staticConfig` targets only, resolved through the prober Service's pods so
-probing stays node-local) are discovered under the same flag whenever the
-cluster serves those CRDs — covering `prometheus.operator.podmonitors` and
-`prometheus.operator.probes` too.
+honored. **PodMonitors** (endpoints naming container ports) are discovered
+under the same flag whenever the cluster serves that CRD — covering
+`prometheus.operator.podmonitors` too.
 
 Per-endpoint `tlsConfig.insecureSkipVerify` and `bearerTokenSecret` **are**
 interpreted (run the metadata service with `-scrape-auth-secrets` so agents
@@ -348,6 +346,9 @@ the `-buffer-dir` durability.
   (or kube-events) if you need events as logs.
 * **`input_pyroscope` / `output_pyroscope`**: profiles are out of scope;
   push them directly to the backend.
+* **`prometheus.operator.probes`**: blackbox probing has no node affinity and
+  doesn't fit the node-local model; keep the prometheus-operator prober (or a
+  collector's blackbox receiver) for Probe CRDs.
 
 ## Rollout approach
 

@@ -52,7 +52,7 @@ kubescrape -listen :8080 -wait-timeout 5s -cache-ttl 5m -log-format json
 | `-cache-ttl` | `5m` | how long metadata of deleted pods and replaced container IDs stays resolvable (tombstones) |
 | `-metadata-cache-ttl` | `10s` | `max-age` stamped on metadata responses (`Cache-Control` + `ETag`) so the agent's client caches lookups and revalidates with `If-None-Match`/304; 0 disables cache headers |
 | `-resync` | `0` | informer resync period (0 = watch stream only) |
-| `-servicemonitors` | `false` | serve targets for `monitoring.coreos.com/v1` ServiceMonitors selecting pod-backed Services — plus **PodMonitors** (endpoints name container ports) and **Probes** (`staticConfig` only, resolved through the prober Service's pods) when the cluster serves those CRDs. Endpoint `port`/`targetPort`/`path`/`scheme`, `tlsConfig.insecureSkipVerify`, `bearerTokenSecret` and the keep/drop subset of `metricRelabelings` are honored; other relabel actions and per-endpoint intervals are not. Self-disables with a warning when the CRD is absent |
+| `-servicemonitors` | `false` | serve targets for `monitoring.coreos.com/v1` ServiceMonitors selecting pod-backed Services — plus **PodMonitors** (endpoints name container ports) when the cluster serves that CRD. Endpoint `port`/`targetPort`/`path`/`scheme`, `tlsConfig.insecureSkipVerify`, `bearerTokenSecret` and the keep/drop subset of `metricRelabelings` are honored; other relabel actions and per-endpoint intervals are not. Self-disables with a warning when the CRD is absent |
 | `-scrape-auth-secrets` | `false` | serve monitor endpoints' `bearerTokenSecret` values to agents on `GET /v1/scrape-auth/{ns}/{name}/{key}`. Opt-in: requires `secrets get` RBAC (commented out in the manifests) and ships tokens over the cluster-internal HTTP channel |
 | `-self-metrics-interval` | `1m` | export the service's own metrics over OTLP at this interval (0 disables) |
 | `-otlp-*` | as the agent | used by the self-metrics push: `-otlp-endpoint`, `-otlp-protocol`, `-otlp-compression`, `-otlp-compression-level`, `-otlp-insecure`, `-otlp-tls-ca-file`, `-otlp-tls-insecure-skip-verify`, `-otlp-bearer-token-file`, `-otlp-timeout` |
@@ -67,7 +67,7 @@ runtime and process metrics (`go_*`, `process_*`).
 RBAC (cluster-wide `get`/`list`/`watch`): `pods`, `services`, `namespaces`,
 `nodes`, `replicasets.apps`, `deployments.apps`, `jobs.batch`,
 `cronjobs.batch`, `servicemonitors.monitoring.coreos.com` (plus
-`podmonitors`/`probes` when those CRDs should be discovered).
+`podmonitors` when that CRD should be discovered).
 `-scrape-auth-secrets` needs `secrets get` (commented out in the
 manifests — enable deliberately) — see
 [deploy/kubernetes.yaml](../deploy/kubernetes.yaml).
@@ -813,11 +813,6 @@ become additional target sources — scraping stays node-local throughout:
   picks **pods** by label, and each `podMetricsEndpoints` entry's `port`
   names a **container** port (`targetPort` takes a number or container-port
   name).
-* **Probes** (watched when served; `staticConfig` targets only — ingress
-  targets are not interpreted): the prober URL must be the DNS form of a
-  Service; the probe resolves through that Service's backing pods, so the
-  agent on a prober pod's node scrapes
-  `<prober>/probe?module=…&target=…` per static target.
 
 On ServiceMonitor and PodMonitor endpoints, `tlsConfig.insecureSkipVerify`
 and `bearerTokenSecret` are honored (tokens are fetched by agents through

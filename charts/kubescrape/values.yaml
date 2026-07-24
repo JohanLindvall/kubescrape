@@ -17,8 +17,8 @@ service:
   cacheTTL: 5m
   # Serve targets for monitoring.coreos.com ServiceMonitors that select
   # pod-backed Services (needs the CRD installed; RBAC is always granted).
-  # PodMonitors and Probes are discovered under the same flag whenever the
-  # cluster serves those CRDs. Endpoint tlsConfig.insecureSkipVerify,
+  # PodMonitors are discovered under the same flag whenever the
+  # cluster serves that CRD. Endpoint tlsConfig.insecureSkipVerify,
   # bearerTokenSecret and keep/drop metricRelabelings are honored; serving
   # the bearer tokens to agents additionally needs -scrape-auth-secrets
   # (see extraArgs below).

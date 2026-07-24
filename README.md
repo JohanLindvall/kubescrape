@@ -117,14 +117,10 @@ from four sources:
   `source: "servicemonitor"` and a `monitor: "<namespace>/<name>"` field. If
   the CRD is absent at startup the feature disables itself with a warning,
   and
-* **PodMonitors and Probes** (same `-servicemonitors` gate, watched when the
-  cluster serves those CRDs) — PodMonitor endpoints select pods directly by
-  label and name **container** ports (`source: "podmonitor"`); Probes
-  (`staticConfig` targets only, ingress targets are not interpreted) resolve
-  through the prober Service's backing pods, so the agent on a prober pod's
-  node scrapes `http://<prober-pod>:<port>/probe?module=…&target=…` and
-  probing stays node-local (`source: "probe"`). PodMonitor endpoints honor
-  the same tlsConfig/bearer-token/relabeling subset as ServiceMonitors.
+* **PodMonitors** (same `-servicemonitors` gate, watched when the cluster
+  serves the CRD) — PodMonitor endpoints select pods directly by label and
+  name **container** ports (`source: "podmonitor"`), honoring the same
+  tlsConfig/bearer-token/relabeling subset as ServiceMonitors.
 
 | Annotation             | Meaning                                                        |
 |------------------------|----------------------------------------------------------------|
@@ -239,7 +235,7 @@ make build           # or: go build ./cmd/kubescrape
 | `-cache-ttl`    | `5m`    | retention of metadata for deleted pods and replaced container IDs        |
 | `-metadata-cache-ttl` | `10s` | `Cache-Control`/`ETag` max-age on metadata responses; agents cache lookups client-side (0 disables) |
 | `-resync`       | `0`     | informer resync period (0 = watch stream only)                            |
-| `-servicemonitors` | `false` | serve targets for ServiceMonitor CRDs — plus PodMonitors and Probes when the cluster serves them (see above) |
+| `-servicemonitors` | `false` | serve targets for ServiceMonitor CRDs — plus PodMonitors when the cluster serves them (see above) |
 | `-scrape-auth-secrets` | `false` | serve monitor endpoints' `bearerTokenSecret` values on `/v1/scrape-auth` (requires `secrets get` RBAC) |
 
 The service's own metrics are pushed over OTLP (`-self-metrics-interval`);
@@ -254,7 +250,7 @@ its own informer caches, so no coordination between replicas is needed.
 In-cluster it needs `get`/`list`/`watch` on `pods`, `services`, `namespaces`,
 `nodes`, `replicasets.apps`, `deployments.apps`, `jobs.batch`,
 `cronjobs.batch` and (optionally) `servicemonitors.monitoring.coreos.com`
-(plus `podmonitors`/`probes` when those CRDs should be discovered)
+(plus `podmonitors` when that CRD should be discovered)
 cluster-wide, and `secrets get` for `-scrape-auth-secrets` (commented out
 in the manifests — enable deliberately) — see
 [deploy/kubernetes.yaml](deploy/kubernetes.yaml).

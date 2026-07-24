@@ -62,7 +62,7 @@ fully attributed — the cache-race gap that per-node watchers accept.
 | | kubescrape | Alloy/Prometheus/vmagent | OTel prometheus receiver |
 |---|---|---|---|
 | Annotation discovery (`prometheus.io/*`) | ✔ incl. Services with `targetPort` translation, comma port lists | via relabel config | via SD config |
-| ServiceMonitors / PodMonitors / Probes | ✔ subset (port/targetPort/path/scheme, bearer-token auth, insecureSkipVerify, keep/drop metricRelabelings; Probes staticConfig-only) | ✔ full | ✔ via TA |
+| ServiceMonitors / PodMonitors | ✔ subset (port/targetPort/path/scheme, bearer-token auth, insecureSkipVerify, keep/drop metricRelabelings) | ✔ full | ✔ via TA |
 | Relabeling | keep/drop/label rules + splitters (narrower, declarative) | ✔ full relabel_configs | ✔ |
 | Native histograms | ✔ opt-in (protobuf exposition → OTLP exponential histograms) | ✔ | ✔ |
 | KSM re-attribution (per-object resources + metadata enrichment) | ✔ **splitters** — unique | ~400 lines of OTTL/groupbyattrs | manual OTTL |

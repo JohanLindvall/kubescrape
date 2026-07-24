@@ -148,17 +148,19 @@ func (t *Tailer) newRecordBuilder(ld plog.Logs) *recordBuilder {
 		now: pcommon.NewTimestampFromTime(time.Now()),
 	}
 	// Per-file bound metric state (resource hash computed once per file) and
-	// one reusable key resolver for the whole flush.
-	if t.cfg.LogMetrics != nil || t.cfg.Rules != nil || t.anyPodRules() {
+	// one reusable key resolver for the whole flush. anyPodRules is O(files)
+	// so evaluate it once (short-circuited when a global rule set exists).
+	rulesActive := t.cfg.Rules != nil || t.anyPodRules()
+	if t.cfg.LogMetrics != nil || rulesActive {
 		b.resolver = newMetricResolver()
 	}
 	if t.cfg.LogMetrics != nil {
 		b.bound = make(map[*file]metrics.BoundResource) // read only on the LogMetrics path
 	}
-	// With rules configured, records are built in a one-record scratch slice
-	// and only MOVED into the batch when kept, so drops never materialize a
+	// With rules active, records are built in a one-record scratch slice and
+	// only MOVED into the batch when kept, so drops never materialize a
 	// resource/scope. Without rules they are built in place, as before.
-	if t.cfg.Rules != nil || t.anyPodRules() {
+	if rulesActive {
 		b.scratch = plog.NewLogs().ResourceLogs().AppendEmpty().ScopeLogs().AppendEmpty().LogRecords()
 	}
 	return b

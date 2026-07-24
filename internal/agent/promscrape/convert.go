@@ -425,9 +425,13 @@ func (b *batcher) remember(name string, m pmetric.Metric) {
 // addNumber emits a gauge or (monotonic cumulative) sum data point.
 // expHistBytes estimates one exponential histogram point's encoded size.
 func expHistBytes(p *expPoint) int {
+	// 9 bytes/bucket (max sint64 varint) not 3: a busy cumulative counter's
+	// bucket count needs 4-5 bytes and can reach 9 near 2^63, so a
+	// dense-bucket point must not be under-charged into an over-cap batch —
+	// the byte bound is the ONE guard against wholesale collector rejection.
 	return pointOverheadBytes + histFixedBytes + labelBytes(p.labels) +
 		16 + // zero threshold + zero count
-		(len(p.pos)+len(p.neg))*3 + 16 // varint bucket counts + span framing
+		(len(p.pos)+len(p.neg))*9 + 16 // varint bucket counts + span framing
 }
 
 // addExponential appends one native-histogram point as an OTLP exponential

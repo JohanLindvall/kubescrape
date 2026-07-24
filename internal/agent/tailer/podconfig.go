@@ -74,8 +74,18 @@ func (t *Tailer) applyPodConfig(f *file, annotations map[string]string) {
 		t.log.Info("pod opted out of log collection", "path", f.path)
 		return
 	}
-	f.multiline = cfg.Multiline
 	f.podRules = rules
+	if cfg.Multiline != nil && *cfg.Multiline != f.source.multiline {
+		// The pipeline was built at discovery from the source default, before
+		// this annotation was read (metadata resolves on the first sweep,
+		// after newPipeline). Rebuild it now so the override takes effect on
+		// the file's INITIAL pipeline — nothing has been fed yet (reads are
+		// gated on resolution), so reset() only clears empty stream state.
+		// Without this the override was ignored until the next rotation, and
+		// forever for a file that never rotates.
+		f.multiline = cfg.Multiline
+		t.newPipeline(f)
+	}
 	attrsMap := f.resource.Attributes()
 	if cfg.ServiceName != "" {
 		attrsMap.PutStr("service.name", cfg.ServiceName)

@@ -100,3 +100,30 @@ func TestPodAnnotationMalformedIsIgnored(t *testing.T) {
 		t.Fatalf("records = %v", got)
 	}
 }
+
+// The multiline pod-annotation override must affect the file's INITIAL
+// pipeline (it was wired at discovery, before the annotation was read),
+// including for files that never rotate.
+func TestPodAnnotationMultilineOverrideOnInitialPipeline(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+	exp := &fakeExporter{}
+	// Source default multiline OFF (driveTailer); the annotation turns it ON.
+	tl := driveTailer(dir, exp)
+	tl.cfg.MultilineTimeout = 50 * time.Millisecond
+	tl.cfg.Metadata = annotatedMeta{annotation: `{"multiline": true}`}
+
+	tl.scanDir(tl.loadCheckpoints(), true)
+	start, rest := panicLines()
+	writeLog(t, dir, append([]string{}, append(start, rest...)...)...)
+	tl.scanDir(nil, false)
+	driveUntil(t, ctx, tl, func() bool { j, _ := panicRecords(exp); return j == 1 }, "panic trace joined")
+
+	// The stack-trace fragments joined into ONE record (main.go:10 present in
+	// the same record as "panic: boom") — the override reached the initial
+	// pipeline. Without the fix the trace stage was nil and they'd be split.
+	joined, count := panicRecords(exp)
+	if joined != 1 || count != 1 {
+		t.Fatalf("multiline override not applied to initial pipeline: joined=%d count=%d", joined, count)
+	}
+}

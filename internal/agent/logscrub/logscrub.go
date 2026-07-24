@@ -125,6 +125,14 @@ var builtins = map[string]pattern{
 		prefilter: func(s string) bool { return strings.Contains(s, "AKIA") || strings.Contains(s, "ASIA") },
 		repl:      redacted,
 	},
+	// LIMITATION: scrubbing runs per log RECORD. For the line-at-a-time
+	// producers (tailer, journald) a multi-line PEM key logged across
+	// physical lines only has its "-----BEGIN … PRIVATE KEY-----" line
+	// redacted; the base64 body lines are separate records that lack the
+	// "PRIVATE KEY" telltale and pass through. The whole key is redacted only
+	// when it arrives in ONE record (a JSON-embedded key, or the OTLP-ingest
+	// path). This is documented in CLAUDE.md and the config docs; apps should
+	// not log raw private keys.
 	"private-key": {
 		name:      "private-key",
 		re:        regexp.MustCompile(`-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z ]*PRIVATE KEY-----|$)`),

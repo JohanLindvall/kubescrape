@@ -89,19 +89,29 @@ func (s *Scraper) parseProtoAndExport(body io.Reader, cb chunker, pipeline strin
 			malformed++
 			continue
 		}
-		m, bad, ferr := s.protoFamily(&mf, cb, keep, emit)
+		// flushIfFull lets protoFamily flush BETWEEN the points of a single
+		// native-histogram family: a delimited exposition emits one
+		// MetricFamily per metric holding ALL its series, so checking only at
+		// the family boundary would build the whole batch in memory and blow
+		// BatchBytes for a high-cardinality native family (classic samples
+		// already flush mid-family via converter.check).
+		flushIfFull := func() error {
+			if !full() {
+				return nil
+			}
+			if ferr := conv.finish(); ferr != nil {
+				return ferr
+			}
+			return export()
+		}
+		m, bad, ferr := s.protoFamily(&mf, cb, keep, emit, samples, flushIfFull)
 		samples += m.samples
 		malformed += bad
 		if ferr != nil {
 			return samples, malformed + conv.malformed, ferr
 		}
-		if full() {
-			if ferr := conv.finish(); ferr != nil {
-				return samples, malformed + conv.malformed, ferr
-			}
-			if eerr := export(); eerr != nil {
-				return samples, malformed + conv.malformed, eerr
-			}
+		if ferr := flushIfFull(); ferr != nil {
+			return samples, malformed + conv.malformed, ferr
 		}
 	}
 	if ferr := conv.finish(); ferr != nil {
@@ -112,8 +122,11 @@ func (s *Scraper) parseProtoAndExport(body io.Reader, cb chunker, pipeline strin
 
 type protoCounts struct{ samples int }
 
-// protoFamily converts one MetricFamily.
-func (s *Scraper) protoFamily(mf *dto.MetricFamily, cb chunker, keep func(string, []Label) bool, emit func(Sample) error) (protoCounts, int, error) {
+// protoFamily converts one MetricFamily. baseSamples is the sample count
+// BEFORE this family (for the MaxSamples cap on the native path, which does
+// not go through emit); flushIfFull flushes a full batch between native
+// points.
+func (s *Scraper) protoFamily(mf *dto.MetricFamily, cb chunker, keep func(string, []Label) bool, emit func(Sample) error, baseSamples int, flushIfFull func() error) (protoCounts, int, error) {
 	var c protoCounts
 	malformed := 0
 	name := mf.GetName()
@@ -155,11 +168,19 @@ func (s *Scraper) protoFamily(mf *dto.MetricFamily, cb chunker, keep func(string
 			h := m.GetHistogram()
 			if isNative(h) {
 				c.samples++
+				// MaxSamples bounds native points too (they bypass emit).
+				if s.cfg.MaxSamples > 0 && baseSamples+c.samples > s.cfg.MaxSamples {
+					return c, malformed, ErrTooManySamples
+				}
 				if !keep(name, labels) {
 					continue
 				}
 				if !s.addNativeHistogram(cb, name, labels, h, ts) {
 					malformed++
+					continue
+				}
+				if err := flushIfFull(); err != nil {
+					return c, malformed, err
 				}
 				continue
 			}

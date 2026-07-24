@@ -21,6 +21,7 @@ import (
 
 	"github.com/JohanLindvall/kubescrape/internal/agent/attrs"
 	"github.com/JohanLindvall/kubescrape/internal/agent/logenrich"
+	"github.com/JohanLindvall/kubescrape/internal/agent/logscrub"
 	"github.com/JohanLindvall/kubescrape/internal/obs"
 	"github.com/JohanLindvall/kubescrape/pkg/kubemeta"
 )
@@ -64,6 +65,9 @@ type Config struct {
 	// severity, trace/span IDs and structured fields (as -logs-enrich does),
 	// filling only fields the sender left unset.
 	EnrichLines bool
+	// Scrub redacts sensitive values from pushed log bodies before enrichment
+	// copies from them (nil disables).
+	Scrub *logscrub.Scrubber
 	// PeerIPFallback resolves the sending pod by the connection's peer IP
 	// when the resource carries no container ID or pod UID, and merges its
 	// k8s attributes (never overwriting sender values). Opt-in: peer IPs can
@@ -135,7 +139,7 @@ func (e *Enricher) EnrichLogs(ctx context.Context, ld plog.Logs) {
 	for i := 0; i < rls.Len(); i++ {
 		rl := rls.At(i)
 		e.enrichResource(ctx, rl.Resource(), cache)
-		if !e.cfg.EnrichLines {
+		if !e.cfg.EnrichLines && e.cfg.Scrub == nil {
 			continue
 		}
 		sls := rl.ScopeLogs()
@@ -143,7 +147,18 @@ func (e *Enricher) EnrichLogs(ctx context.Context, ld plog.Logs) {
 			lrs := sls.At(j).LogRecords()
 			for k := 0; k < lrs.Len(); k++ {
 				lr := lrs.At(k)
-				logenrich.ApplyBody(lr)
+				if e.cfg.Scrub != nil {
+					// Scrub BEFORE ApplyBody: enrich copies body slices
+					// (exception attributes) that must not carry secrets.
+					if body := lr.Body(); body.Type() == pcommon.ValueTypeStr {
+						if scrubbed := e.cfg.Scrub.Scrub(body.Str()); scrubbed != body.Str() {
+							body.SetStr(scrubbed)
+						}
+					}
+				}
+				if e.cfg.EnrichLines {
+					logenrich.ApplyBody(lr)
+				}
 			}
 		}
 	}

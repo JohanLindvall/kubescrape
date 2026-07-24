@@ -57,6 +57,8 @@ var (
 		"Unterminated lines discarded for exceeding the per-entry size bound (no newline within MaxEntryBytes+4096).")
 	LogTornFinalLines = Registry.Counter("kubescrape_log_torn_final_lines_total",
 		"Unterminated final lines of rotated-away files (the fragment can never complete and is dropped).")
+	LogScrubbed = Registry.CounterVec("kubescrape_log_scrubbed_total",
+		"Log bodies redacted by a scrub pattern (one bump per pattern per record, not per match).", "pattern")
 	LogArchiveErrors = Registry.Counter("kubescrape_log_archive_errors_total",
 		"Compressed log files whose stream failed to decode mid-read (truncated gzip, trailing garbage). "+
 			"What decoded before the error is delivered; the remainder is unrecoverable and the archive settles.")

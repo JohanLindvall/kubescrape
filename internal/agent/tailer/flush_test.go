@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/JohanLindvall/kubescrape/internal/agent/logscrub"
 	"github.com/JohanLindvall/kubescrape/internal/logline"
 	"github.com/JohanLindvall/kubescrape/internal/metrics"
 	"github.com/JohanLindvall/kubescrape/internal/obs"
@@ -510,4 +511,33 @@ func TestWithheldCommitReleasedOnceGroupResolves(t *testing.T) {
 	f := tl.files[path]
 	t.Fatalf("checkpoint frozen below file size: committed=%d readPos=%d (withheld high never re-offered)",
 		f.committed, f.readPos)
+}
+
+// The scrubber runs before anything copies from the body: the exported
+// record must carry the redacted form.
+func TestScrubRedactsExportedBodies(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+	exp := &fakeExporter{}
+	tl := driveTailer(dir, exp)
+	scr, err := logscrub.New(logscrub.Config{Builtin: []string{"defaults"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tl.cfg.Scrub = scr
+
+	tl.scanDir(tl.loadCheckpoints(), true)
+	writeLog(t, dir,
+		"2026-07-05T10:00:00Z stdout F calling with Authorization: Bearer secret.token.here done",
+		"2026-07-05T10:00:01Z stdout F nothing sensitive")
+	tl.scanDir(nil, false)
+	driveUntil(t, ctx, tl, func() bool { return len(exp.get()) == 2 }, "records exported")
+
+	got := exp.get()
+	if !strings.Contains(got[0], "Bearer [REDACTED]") || strings.Contains(got[0], "secret.token.here") {
+		t.Fatalf("body not scrubbed: %q", got[0])
+	}
+	if got[1] != "nothing sensitive" {
+		t.Fatalf("innocuous body changed: %q", got[1])
+	}
 }

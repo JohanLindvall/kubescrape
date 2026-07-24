@@ -7,6 +7,7 @@ import (
 	"sigs.k8s.io/yaml"
 
 	"github.com/JohanLindvall/kubescrape/internal/agent/attrs"
+	"github.com/JohanLindvall/kubescrape/internal/agent/logscrub"
 	"github.com/JohanLindvall/kubescrape/internal/agent/promscrape"
 	"github.com/JohanLindvall/kubescrape/internal/agent/spanmetrics"
 	"github.com/JohanLindvall/kubescrape/internal/agent/tailer"
@@ -37,6 +38,10 @@ type agentConfig struct {
 	// (histogram buckets, extra dimensions, cardinality cap). Aggregation is
 	// gated by -ingest-span-metrics; this section only tunes it.
 	TraceMetrics *spanmetrics.Config `json:"traceMetrics,omitempty"`
+	// LogScrubbing redacts sensitive values (built-in + user patterns) from
+	// log bodies in the tailer, journald and OTLP-ingest paths, before any
+	// enrichment copies from them.
+	LogScrubbing *logscrub.Config `json:"logScrubbing,omitempty"`
 	// TraceSampling drops ingested spans before forwarding: consistent
 	// trace-ID probabilistic sampling with keep-errors/keep-slow guard rails
 	// and a spans/second cap. Span metrics still see 100% of spans (the

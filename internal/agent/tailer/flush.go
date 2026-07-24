@@ -167,6 +167,13 @@ func (t *Tailer) newRecordBuilder(ld plog.Logs) *recordBuilder {
 // buildRecord renders one batch entry as an OTLP record (attribute stamping,
 // enrichment, log-metrics, rules) into the right resource/scope group.
 func (t *Tailer) buildRecord(b *recordBuilder, e entry) {
+	// Scrub FIRST: everything downstream copies from the body — logattrs
+	// lifts fields into attributes, enrich slices exception.stacktrace out of
+	// it, log-metrics extract label values — and a secret must not survive
+	// into any of them.
+	if t.cfg.Scrub != nil {
+		e.body = t.cfg.Scrub.Scrub(e.body)
+	}
 	// Extract configured line attributes; resource/scope ones drive the
 	// grouping so records land under the right ResourceLogs/ScopeLogs.
 	var extracted logattrs.Result

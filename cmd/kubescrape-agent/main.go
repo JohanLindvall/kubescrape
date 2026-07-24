@@ -24,6 +24,7 @@ import (
 
 	"github.com/JohanLindvall/kubescrape/internal/agent/attrs"
 	"github.com/JohanLindvall/kubescrape/internal/agent/journald"
+	"github.com/JohanLindvall/kubescrape/internal/agent/logscrub"
 	"github.com/JohanLindvall/kubescrape/internal/agent/otlpbatch"
 	"github.com/JohanLindvall/kubescrape/internal/agent/otlpexport"
 	"github.com/JohanLindvall/kubescrape/internal/agent/otlpingest"
@@ -63,7 +64,7 @@ func agentSelfResource(node string) pcommon.Resource {
 // The agent's flag surface. Package-level so the per-pipeline start
 // functions can read them directly; main parses.
 var (
-	configFile           = flag.String("config", "", "unified YAML config file with resourceAttributes, logs, logAttributes, logMetrics, metrics, traceMetrics and traceSampling sections")
+	configFile           = flag.String("config", "", "unified YAML config file with resourceAttributes, logs, logAttributes, logMetrics, logScrubbing, metrics, traceMetrics and traceSampling sections")
 	nodeName             = flag.String("node-name", os.Getenv("NODE_NAME"), "name of the node this agent runs on (default $NODE_NAME)")
 	listen               = flag.String("listen", ":8081", "HTTP listen address for /healthz, /readyz, /debug/tailer and /debug/targets (empty disables)")
 	selfMetricsIntv      = flag.Duration("self-metrics-interval", time.Minute, "export the agent's own metrics over OTLP at this interval (0 disables)")
@@ -175,6 +176,7 @@ type pipelines struct {
 	fileCfg      agentConfig
 	posStore     *positions.Store
 	logAttrs     *logattrs.Extractor
+	scrub        *logscrub.Scrubber
 	logMetrics   *metrics.DynamicMetricSet
 	ingestMode   otlpingest.MetricsMode
 	filters      *promscrape.MetricFilters
@@ -253,6 +255,16 @@ func run() error {
 		if logAttrs, err = logattrs.New(fileCfg.LogAttributes); err != nil {
 			return fmt.Errorf("log attributes config: %w", err)
 		}
+	}
+
+	// Optional PII scrubbing, shared by every log path (tailer, journald,
+	// ingest). Compiled once; fail-fast on bad patterns.
+	var scrub *logscrub.Scrubber
+	if fileCfg.LogScrubbing != nil {
+		if scrub, err = logscrub.New(*fileCfg.LogScrubbing); err != nil {
+			return fmt.Errorf("log scrubbing config: %w", err)
+		}
+		log.Info("log scrubbing enabled", "patterns", len(fileCfg.LogScrubbing.Builtin)+len(fileCfg.LogScrubbing.Rules))
 	}
 
 	// The metadata client's HTTP timeout must exceed the server-side wait —
@@ -375,6 +387,7 @@ func run() error {
 		fileCfg:      fileCfg,
 		posStore:     posStore,
 		logAttrs:     logAttrs,
+		scrub:        scrub,
 		logMetrics:   logMetrics,
 		ingestMode:   ingestMode,
 		filters:      metricFilters,
@@ -435,6 +448,7 @@ func (p *pipelines) startLogs() (*tailer.Tailer, error) {
 		Sources:           logSources,
 		Positions:         p.posStore,
 		LogAttrs:          p.logAttrs,
+		Scrub:             p.scrub,
 		LogMetrics:        p.logMetrics,
 		Watch:             *logsWatch,
 		PollInterval:      *logsPoll,
@@ -485,6 +499,7 @@ func (p *pipelines) startJournald() {
 		MaxEntryBytes: *maxEntryBytes,
 		Enrich:        *journaldEnrich,
 		LogAttrs:      p.logAttrs,
+		Scrub:         p.scrub,
 		Attrs:         p.attrBuilders.Journal,
 		NodeInfo:      p.nodeInfo,
 		Exporter:      p.out,
@@ -512,6 +527,7 @@ func (p *pipelines) startIngest() error {
 		Wait:            *ingestWait,
 		MetricsMode:     p.ingestMode,
 		EnrichLines:     *ingestEnrich,
+		Scrub:           p.scrub,
 		PeerIPFallback:  *ingestPeerIP,
 		Attrs:           p.attrBuilders.Ingest,
 		NodeInfo:        p.nodeInfo,

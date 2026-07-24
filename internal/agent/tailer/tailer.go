@@ -39,6 +39,7 @@ import (
 	"go.opentelemetry.io/collector/pdata/plog"
 
 	"github.com/JohanLindvall/kubescrape/internal/agent/attrs"
+	"github.com/JohanLindvall/kubescrape/internal/agent/logscrub"
 	"github.com/JohanLindvall/kubescrape/internal/agent/positions"
 	"github.com/JohanLindvall/kubescrape/internal/logline"
 	"github.com/JohanLindvall/kubescrape/internal/metrics"
@@ -93,6 +94,9 @@ type Config struct {
 	// log.file.position (the record's START byte offset) on every emitted
 	// record, for any file source. Opt-in.
 	FileAttributes bool
+	// Scrub redacts sensitive values from log bodies before anything copies
+	// from them (nil disables).
+	Scrub *logscrub.Scrubber
 	// LogAttrs lifts configured keys out of structured lines onto the record
 	// as resource/scope/log attributes (nil = none).
 	LogAttrs *logattrs.Extractor

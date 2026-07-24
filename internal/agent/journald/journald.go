@@ -24,6 +24,7 @@ import (
 
 	"github.com/JohanLindvall/kubescrape/internal/agent/attrs"
 	"github.com/JohanLindvall/kubescrape/internal/agent/logenrich"
+	"github.com/JohanLindvall/kubescrape/internal/agent/logscrub"
 	"github.com/JohanLindvall/kubescrape/internal/agent/otlpexport"
 	"github.com/JohanLindvall/kubescrape/internal/agent/positions"
 	"github.com/JohanLindvall/kubescrape/internal/obs"
@@ -67,6 +68,9 @@ type Config struct {
 	// LogAttrs lifts configured keys out of structured messages onto the
 	// record as resource/scope/log attributes (nil = none).
 	LogAttrs *logattrs.Extractor
+	// Scrub redacts sensitive values from message bodies before anything
+	// copies from them (nil disables).
+	Scrub *logscrub.Scrubber
 
 	// Attrs builds the exported resource attributes (nil = defaults).
 	Attrs *attrs.Builder
@@ -287,6 +291,11 @@ func (r *Reader) stream(ctx context.Context) error {
 				}
 			}
 			body, origLen := r.sanitize(e.message)
+			if r.cfg.Scrub != nil {
+				// Scrub before anything copies from the body (logattrs
+				// lifting, enrich's exception attributes, batch accounting).
+				body = r.cfg.Scrub.Scrub(body)
+			}
 			// Flush BEFORE the entry that would push the batch over the byte
 			// cap. A single entry already over the cap still exports alone
 			// (entries are never split), so one payload can exceed it by up

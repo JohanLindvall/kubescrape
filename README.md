@@ -37,6 +37,22 @@ Full flag and config-file reference with examples:
   covers the gap between a container starting on a node and the kubelet
   posting its status to the API server.
 
+## Out of scope
+
+Three things are **deliberately** not kubescrape's job — use the standard
+component for each:
+
+* **Host/node system metrics** (`/proc`, node_exporter territory): run a
+  node_exporter DaemonSet and scrape it via `prometheus.io/*` annotations or a
+  PodMonitor.
+* **Kubernetes events export**: use the OpenTelemetry Collector's
+  `k8sobjects`/`k8s_events` receiver (or kube-events) if you need events as
+  logs.
+* **kube-state-metrics generation**: kubescrape does not produce KSM series —
+  deploy kube-state-metrics itself and scrape it. The agent's metrics
+  splitters then re-attribute its output into per-object resources; only the
+  generation is out of scope.
+
 ## API
 
 ### `GET /v1/containers/{id}[?wait=2s]`
@@ -185,7 +201,7 @@ is deliberately opt-in.
 Liveness is always `200`; readiness turns `200` once the initial informer
 cache sync has completed. The service's own metrics (`kubescrape_store_pods`,
 `kubescrape_store_containers`, `kubescrape_http_requests_total{pattern,code}`,
-`kubescrape_events_exported_total`, …) are produced through the same internal
+…) are produced through the same internal
 metrics machinery as everything else and **pushed over OTLP**
 (`-self-metrics-interval`, default 1m; 0 disables). `/metrics` serves only
 the Go runtime and process metrics (`go_*`, `process_*`) in Prometheus text
@@ -225,34 +241,21 @@ make build           # or: go build ./cmd/kubescrape
 | `-resync`       | `0`     | informer resync period (0 = watch stream only)                            |
 | `-servicemonitors` | `false` | serve targets for ServiceMonitor CRDs — plus PodMonitors and Probes when the cluster serves them (see above) |
 | `-scrape-auth-secrets` | `false` | serve monitor endpoints' `bearerTokenSecret` values on `/v1/scrape-auth` (requires `secrets get` RBAC) |
-| `-events`       | `false` | export Kubernetes events as OTLP log records                             |
-| `-leader-elect` | `false` | elect one replica (via a `coordination.k8s.io` Lease) as the events exporter — required when running more than one replica with `-events` |
-| `-leader-elect-namespace` | `monitoring` | namespace of the leader-election Lease                     |
-| `-leader-elect-name` | `kubescrape-events` | name of the leader-election Lease                       |
 
-With `-events` the service watches `corev1.Events` and exports them as OTLP
-log records (batched, at-most-once): the event message becomes the body,
-`reason`/`count`/`reportingComponent` become attributes, `type: Warning` maps
-to severity Warn, and events about pods get the full pod resource attributes
-(owners, labels) from the store — other objects get `k8s.object.*` plus the
-well-known workload attribute for their kind. Events already in the informer's
-initial list (history) are skipped. The OTLP connection shares the agent's
-exporter flags: `-otlp-endpoint`, `-otlp-protocol`, `-otlp-compression`,
-`-otlp-compression-level`, `-otlp-insecure`, `-otlp-tls-ca-file`,
-`-otlp-tls-insecure-skip-verify`, `-otlp-bearer-token-file`, `-otlp-timeout`.
+The service's own metrics are pushed over OTLP (`-self-metrics-interval`);
+the connection uses the agent's exporter flags: `-otlp-endpoint`,
+`-otlp-protocol`, `-otlp-compression`, `-otlp-compression-level`,
+`-otlp-insecure`, `-otlp-tls-ca-file`, `-otlp-tls-insecure-skip-verify`,
+`-otlp-bearer-token-file`, `-otlp-timeout`.
 
 The service can run **multiple replicas**: every replica serves reads from
-its own informer caches (no election needed there), and with `-leader-elect`
-a Lease gates the events exporter so exactly one replica exports.
-Non-leaders keep watching events (cheap), so failover needs no informer
-warmup — the successor picks up the live stream without replaying history.
+its own informer caches, so no coordination between replicas is needed.
 
 In-cluster it needs `get`/`list`/`watch` on `pods`, `services`, `namespaces`,
-`nodes`, `events`, `replicasets.apps`, `deployments.apps`, `jobs.batch`,
+`nodes`, `replicasets.apps`, `deployments.apps`, `jobs.batch`,
 `cronjobs.batch` and (optionally) `servicemonitors.monitoring.coreos.com`
 (plus `podmonitors`/`probes` when those CRDs should be discovered)
-cluster-wide, `get`/`create`/`update` on `leases.coordination.k8s.io` for
-`-leader-elect`, and `secrets get` for `-scrape-auth-secrets` (commented out
+cluster-wide, and `secrets get` for `-scrape-auth-secrets` (commented out
 in the manifests — enable deliberately) — see
 [deploy/kubernetes.yaml](deploy/kubernetes.yaml).
 

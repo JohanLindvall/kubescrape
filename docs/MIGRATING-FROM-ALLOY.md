@@ -9,7 +9,7 @@ flag or a config-file entry.
 
 | | Alloy | kubescrape |
 |---|---|---|
-| Topology | 3–5 clustered Deployment replicas | metadata service (Deployment, HA-capable — all replicas serve reads, `-leader-elect` gates the events exporter) + per-node agent (DaemonSet) |
+| Topology | 3–5 clustered Deployment replicas | metadata service (Deployment; every replica serves reads from its own informer caches, no coordination needed) + per-node agent (DaemonSet) |
 | Target distribution | Alloy clustering | node-local by construction (each agent scrapes its node's pods) |
 | Kubernetes access | every replica watches pods/nodes/services | only the metadata service watches; agents talk HTTP to it |
 | Logs | not collected | collected (CRI + multiline joining, at-least-once, drop/keep/sample rules, per-file rate limit) |
@@ -262,15 +262,6 @@ sample by the agent. Other relabel actions, other authentication schemes and
 per-endpoint interval overrides are still **not** interpreted — convert
 those monitors to annotated Services or metrics-config rules.
 
-### `loki.source.kubernetes_events`
-
-`service.events.enabled: true` in the chart (flag `-events` on the metadata
-service): Kubernetes events are exported as OTLP log records with
-`k8s.event.*` attributes, and events about pods carry the full pod resource
-attributes. Running more than one service replica? Add `-leader-elect` (via
-`service.extraArgs`) so a Lease elects exactly one replica as the events
-exporter — all replicas keep serving metadata reads.
-
 ### `loki.source.journal`
 
 `agent.journald.enabled: true` (flag `-journald`): the agent reads the systemd
@@ -352,6 +343,9 @@ the `-buffer-dir` durability.
 
 ## Not covered — keep a collector for these
 
+* **`loki.source.kubernetes_events`**: Kubernetes events export is out of
+  scope; use the OpenTelemetry Collector's `k8sobjects`/`k8s_events` receiver
+  (or kube-events) if you need events as logs.
 * **`input_pyroscope` / `output_pyroscope`**: profiles are out of scope;
   push them directly to the backend.
 

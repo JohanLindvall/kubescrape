@@ -35,12 +35,9 @@ import (
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/clientcmd"
-	"k8s.io/client-go/tools/leaderelection"
-	"k8s.io/client-go/tools/leaderelection/resourcelock"
 	"k8s.io/klog/v2"
 
 	"github.com/JohanLindvall/kubescrape/internal/agent/otlpexport"
-	"github.com/JohanLindvall/kubescrape/internal/events"
 	"github.com/JohanLindvall/kubescrape/internal/obs"
 	"github.com/JohanLindvall/kubescrape/internal/owners"
 	"github.com/JohanLindvall/kubescrape/internal/server"
@@ -173,20 +170,6 @@ func startServiceMonitors(ctx context.Context, cfg *rest.Config, disco discovery
 		}
 		log.Info("podmonitor discovery enabled")
 	}
-	if served[servicemonitors.ProbeGVR.Resource] {
-		prInformer := dynFactory.ForResource(servicemonitors.ProbeGVR).Informer()
-		if _, err := prInformer.AddEventHandler(typedHandler(
-			func(u *unstructured.Unstructured) {
-				if err := monitors.UpsertProbe(u); err != nil {
-					log.Warn("parsing probe", "error", err)
-				}
-			},
-			func(u *unstructured.Unstructured) { monitors.DeleteProbe(u.GetNamespace(), u.GetName()) },
-		)); err != nil {
-			return nil, nil, fmt.Errorf("registering probe handler: %w", err)
-		}
-		log.Info("probe discovery enabled")
-	}
 	dynFactory.Start(ctx.Done())
 	log.Info("servicemonitor discovery enabled")
 	return monitors, smInformer.HasSynced, nil
@@ -263,21 +246,13 @@ func run() error {
 		// ServiceMonitor CRDs (opt-in).
 		monitorsOn = flag.Bool("servicemonitors", false, "serve targets for monitoring.coreos.com ServiceMonitors selecting pod-backed Services (no per-endpoint auth or relabelings)")
 
-		// HA: with >1 replica, gate the events exporter behind a Lease so
-		// exactly one replica exports (reads are served by every replica from
-		// its own informer caches — no election needed there).
-		leaderElect = flag.Bool("leader-elect", false, "use a Lease to elect one replica as the events exporter (required when running >1 replica with -events)")
-		leaseNs     = flag.String("leader-elect-namespace", "monitoring", "namespace of the leader-election Lease")
-		leaseName   = flag.String("leader-elect-name", "kubescrape-events", "name of the leader-election Lease")
-
 		// Serve monitor endpoints' bearerTokenSecret values to agents (opt-in:
 		// needs secrets get RBAC; tokens travel the cluster-internal HTTP).
 		scrapeAuthOn = flag.Bool("scrape-auth-secrets", false, "serve ServiceMonitor/PodMonitor bearerTokenSecret values to agents on /v1/scrape-auth (requires secrets get RBAC)")
 
-		// Kubernetes events -> OTLP logs (opt-in).
-		eventsOn             = flag.Bool("events", false, "export Kubernetes events as OTLP log records")
+		// Self-metrics -> OTLP (the service's only OTLP producer).
 		selfMetricsIntv      = flag.Duration("self-metrics-interval", time.Minute, "export the service's own metrics over OTLP at this interval (0 disables)")
-		otlpEndpoint         = flag.String("otlp-endpoint", "otel-collector.monitoring:4317", "OTLP endpoint for the events exporter: host:port for grpc, base URL for http")
+		otlpEndpoint         = flag.String("otlp-endpoint", "otel-collector.monitoring:4317", "OTLP endpoint for self-metrics: host:port for grpc, base URL for http")
 		otlpProtocol         = flag.String("otlp-protocol", "grpc", "OTLP transport: grpc or http")
 		otlpCompression      = flag.String("otlp-compression", "gzip", "OTLP payload compression: gzip or none")
 		otlpCompressionLevel = flag.Int("otlp-compression-level", 0, "gzip level 1 (fastest, ~2-3x less CPU for ~10% larger payloads) to 9 (smallest); 0 = library default")
@@ -356,7 +331,7 @@ func run() error {
 	}
 
 	var exporter *otlpexport.Client
-	if *eventsOn || *selfMetricsIntv > 0 {
+	if *selfMetricsIntv > 0 {
 		var err error
 		exporter, err = otlpexport.New(otlpexport.Config{
 			Endpoint:           *otlpEndpoint,
@@ -374,9 +349,9 @@ func run() error {
 		}
 		defer func() { _ = exporter.Close() }()
 	}
-	// Exporting goroutines join this group; run waits for them (the events
-	// final flush, the self-metrics final export) before returning, so they
-	// finish before the deferred exporter.Close fires (mirrors the agent).
+	// The self-metrics goroutine joins this group; run waits for its final
+	// export before returning, so it finishes before the deferred
+	// exporter.Close fires (mirrors the agent).
 	var wg sync.WaitGroup
 	// Registered AFTER exporter.Close (LIFO): an early `return err` below must
 	// stop and drain the started goroutines BEFORE the exporter is closed under
@@ -399,53 +374,6 @@ func run() error {
 			obs.Registry.Run(ctx, exporter, *selfMetricsIntv, selfRes, log)
 		}()
 		log.Info("self-metrics export started", "interval", *selfMetricsIntv)
-	}
-
-	if *eventsOn {
-		ev := events.New(events.Config{Store: st, Exporter: exporter, Owners: resolver, Logger: log})
-		if *leaderElect {
-			// Only the leader exports; every replica still watches (cheap) so
-			// failover needs no informer warmup. Losing the lease deactivates
-			// immediately; the successor picks up the live stream (no replay,
-			// mirroring the skip-initial-history startup semantics).
-			ev.SetActive(false)
-			id, _ := os.Hostname()
-			lock := &resourcelock.LeaseLock{
-				LeaseMeta:  metav1.ObjectMeta{Name: *leaseName, Namespace: *leaseNs},
-				Client:     client.CoordinationV1(),
-				LockConfig: resourcelock.ResourceLockConfig{Identity: id},
-			}
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				leaderelection.RunOrDie(ctx, leaderelection.LeaderElectionConfig{
-					Lock:            lock,
-					LeaseDuration:   15 * time.Second,
-					RenewDeadline:   10 * time.Second,
-					RetryPeriod:     2 * time.Second,
-					ReleaseOnCancel: true,
-					Callbacks: leaderelection.LeaderCallbacks{
-						OnStartedLeading: func(context.Context) { ev.SetActive(true) },
-						OnStoppedLeading: func() { ev.SetActive(false) },
-					},
-				})
-			}()
-			log.Info("leader election enabled for events", "lease", *leaseNs+"/"+*leaseName, "id", id)
-		}
-		evInformer := factory.Core().V1().Events().Informer()
-		if _, err := evInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
-			AddFunc:    ev.OnAdd,
-			UpdateFunc: ev.OnUpdate,
-		}); err != nil {
-			return fmt.Errorf("registering event handler: %w", err)
-		}
-		synced = append(synced, evInformer.HasSynced)
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			ev.Run(ctx)
-		}()
-		log.Info("kubernetes events exporter started", "endpoint", *otlpEndpoint)
 	}
 
 	factory.Start(ctx.Done())

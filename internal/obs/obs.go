@@ -100,12 +100,6 @@ var (
 		"Journal messages truncated at MaxEntryBytes (the record carries log.truncated).")
 )
 
-// Events exporter (metadata service).
-var (
-	EventsExported = Registry.Counter("kubescrape_events_exported_total",
-		"Kubernetes events exported as OTLP logs.")
-)
-
 // OTLP ingest (agent).
 var (
 	Ingested = Registry.CounterVec("kubescrape_ingest_resources_total",
@@ -128,12 +122,6 @@ var (
 var (
 	JournalDropped = Registry.Counter("kubescrape_journal_dropped_batches_total",
 		"Journal batches dropped after a permanent collector rejection (the cursor advances past them).")
-)
-
-// Events drops (metadata service).
-var (
-	EventsDropped = Registry.Counter("kubescrape_events_dropped_total",
-		"Kubernetes events dropped: the export queue was full, or their export failed (delivery is best-effort — no retries, no spool).")
 )
 
 // HTTP server (metadata service).

@@ -181,8 +181,7 @@ func (s *Server) handleNodeTargets(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		podMonitors := s.podMonitorsFor(np.Pod)
-		probes := s.probesFor(np.Pod)
-		if !podAnnotated && !svcAnnotated && len(podMonitors) == 0 && len(probes) == 0 {
+		if !podAnnotated && !svcAnnotated && len(podMonitors) == 0 {
 			continue
 		}
 		s.enrich(&np.Pod, np.OwnerRefs)
@@ -198,9 +197,6 @@ func (s *Server) handleNodeTargets(w http.ResponseWriter, r *http.Request) {
 			for _, ep := range pm.Endpoints {
 				podTargets = append(podTargets, scrape.PodMonitorTargets(np.Pod, pm.Namespace+"/"+pm.Name, ep)...)
 			}
-		}
-		for _, pr := range probes {
-			podTargets = append(podTargets, scrape.ProbeTargets(np.Pod, pr.probe, pr.port)...)
 		}
 		// The same endpoint can be reachable via pod and service
 		// annotations; keep the first occurrence (pod source wins).
@@ -229,6 +225,17 @@ func (s *Server) handleScrapeAuth(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ns, name, key := r.PathValue("namespace"), r.PathValue("name"), r.PathValue("key")
+	// Scope to secrets a monitor endpoint actually references — the endpoint
+	// must not become a read-any-cluster-secret oracle for anything that can
+	// reach the (unauthenticated, cluster-internal) service.
+	if s.monitors == nil {
+		writeError(w, http.StatusNotFound, "no monitors indexed")
+		return
+	}
+	if _, ok := s.monitors.AuthSecretRefs()[ns+"/"+name+"/"+key]; !ok {
+		writeError(w, http.StatusForbidden, "secret is not referenced by any monitor endpoint")
+		return
+	}
 	val, err := s.secrets.Get(r.Context(), ns, name, key)
 	if err != nil {
 		writeError(w, http.StatusNotFound, fmt.Sprintf("secret %s/%s key %s: %v", ns, name, key, err))

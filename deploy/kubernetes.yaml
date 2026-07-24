@@ -15,7 +15,7 @@ metadata:
   name: kubescrape
 rules:
   - apiGroups: [""]
-    resources: ["pods", "namespaces", "services", "nodes", "events"]
+    resources: ["pods", "namespaces", "services", "nodes"]
     verbs: ["get", "list", "watch"]
   - apiGroups: ["apps"]
     resources: ["replicasets", "deployments"]
@@ -32,10 +32,6 @@ rules:
   # - apiGroups: [""]
   #   resources: ["secrets"]
   #   verbs: ["get"]
-  # Leader election (-leader-elect): one replica exports events.
-  - apiGroups: ["coordination.k8s.io"]
-    resources: ["leases"]
-    verbs: ["get", "create", "update"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding

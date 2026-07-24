@@ -4,7 +4,6 @@ package scrape
 
 import (
 	"net"
-	"net/url"
 	"strconv"
 	"strings"
 
@@ -163,30 +162,6 @@ func containerPortByName(pod kubemeta.Pod, name string) (int32, bool) {
 		}
 	}
 	return 0, false
-}
-
-// ProbeTargets derives the targets a Probe declares against ONE prober pod
-// (a backing pod of the prober Service, matched by the caller): one target
-// per static entry, scraping the prober with module/target params.
-func ProbeTargets(proberPod kubemeta.Pod, probe *servicemonitors.Probe, proberPort int32) []kubemeta.ScrapeTarget {
-	if !Scrapeable(proberPod) {
-		return nil
-	}
-	scheme, path := defaultSchemePath(probe.ProberScheme, probe.ProberPath)
-	var out []kubemeta.ScrapeTarget
-	for _, static := range probe.StaticTargets {
-		t := makeTarget(proberPod, scheme, path, proberPort)
-		q := url.Values{}
-		if probe.Module != "" {
-			q.Set("module", probe.Module)
-		}
-		q.Set("target", static)
-		t.URL += "?" + q.Encode()
-		t.Source = "probe"
-		t.Monitor = probe.Namespace + "/" + probe.Name
-		out = append(out, t)
-	}
-	return out
 }
 
 // MonitorPortNumber extracts a numeric targetPort, bounds-checked to the

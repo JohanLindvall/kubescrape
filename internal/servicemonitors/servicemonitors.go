@@ -167,7 +167,6 @@ type Index struct {
 	mu          sync.RWMutex
 	monitors    map[string]*Monitor
 	podMonitors map[string]*PodMonitor
-	probes      map[string]*Probe
 }
 
 // NewIndex creates an empty index.
@@ -175,7 +174,6 @@ func NewIndex() *Index {
 	return &Index{
 		monitors:    make(map[string]*Monitor),
 		podMonitors: make(map[string]*PodMonitor),
-		probes:      make(map[string]*Probe),
 	}
 }
 
@@ -218,5 +216,31 @@ func (ix *Index) All() []*Monitor {
 		}
 		return out[i].Name < out[j].Name
 	})
+	return out
+}
+
+// AuthSecretRefs returns the set of "namespace/name/key" bearerTokenSecret
+// references across all indexed ServiceMonitor and PodMonitor endpoints. The
+// scrape-auth endpoint serves ONLY these, so a direct HTTP caller cannot use
+// it to read arbitrary cluster secrets — only the tokens a monitor actually
+// references.
+func (x *Index) AuthSecretRefs() map[string]struct{} {
+	x.mu.RLock()
+	defer x.mu.RUnlock()
+	out := map[string]struct{}{}
+	for _, m := range x.monitors {
+		for _, e := range m.Endpoints {
+			if e.BearerSecret != "" {
+				out[e.BearerSecret] = struct{}{}
+			}
+		}
+	}
+	for _, m := range x.podMonitors {
+		for _, e := range m.Endpoints {
+			if e.BearerSecret != "" {
+				out[e.BearerSecret] = struct{}{}
+			}
+		}
+	}
 	return out
 }

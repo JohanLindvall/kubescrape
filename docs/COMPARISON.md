@@ -79,7 +79,6 @@ fully attributed — the cache-race gap that per-node watchers accept.
 | OTLP ingest (push) with k8s enrichment | ✔ logs/metrics/traces, peer-IP fallback, batching | ✔ | ✔ | ✔ | ✔ |
 | Traces | enrichment + RED span metrics + consistent probabilistic sampling (`traceSampling`); no cross-node tail sampling | ✔ full | ✔ | ✔ | ✔ full (tail sampling etc.) |
 | Multi-destination / tenant routing | ✔ per-namespace (`routing`: endpoints, `X-Scope-OrgID` headers; unbuffered by design) | ✔ | ✔ | ✔ | ✔ routing connector |
-| K8s events | ✔ (service-side, series-aware; HA via leader election) | ✔ | ✘ | ✔ | ✔ receiver |
 | Log delivery | **ack-gated at-least-once** + rewind; offsets never pass unacked data | positions synced on timer (loss/dup window) | ✔ e2e acks + disk buffers | offsets on read (not ack) | checkpoints on read (not ack) |
 | Disk buffering | ✔ both signals (fsync'd frames, checksummed cursor, poison-batch handling) | in-memory queue (WAL never GA) | ✔ mature | ✔ filesystem storage | ✔ file storage ext |
 | Compression | gzip (klauspost) | snappy/gzip | ✔ several | ✔ | ✔ several |
@@ -162,3 +161,17 @@ breadth; OTLP-only output; single-core log ingestion per node;
 Linux/containerd focus; and years less production soak time than any
 comparator — the invariants are tested (race-tested suite,
 crash/rotation/power-loss cases) but the field mileage is not.
+
+Three things are **deliberately out of scope** — kubescrape does not try to
+replace the standard component for each:
+
+- **Host/node system metrics** (`/proc`, node_exporter territory): run a
+  node_exporter DaemonSet and scrape it via `prometheus.io/*` annotations or a
+  PodMonitor.
+- **Kubernetes events export**: use the OpenTelemetry Collector's
+  `k8sobjects`/`k8s_events` receiver (or kube-events) if you need events as
+  logs.
+- **kube-state-metrics generation**: kubescrape does not produce KSM series —
+  deploy kube-state-metrics itself and scrape it. kubescrape's metrics
+  splitters then re-attribute its output into per-object resources; only the
+  generation is out of scope, the split/enrich capability stays.

@@ -11,7 +11,7 @@ service:
   replicas: 1
   listen: ":8080"
   # Export the service's own metrics over OTLP at this interval (0 disables);
-  # uses the events otlp settings below.
+  # uses the otlp settings below.
   selfMetricsInterval: 1m
   waitTimeout: 5s
   cacheTTL: 5m
@@ -23,29 +23,20 @@ service:
   # the bearer tokens to agents additionally needs -scrape-auth-secrets
   # (see extraArgs below).
   serviceMonitors: false
-  # Export Kubernetes events as OTLP log records.
-  events:
-    enabled: false
-    otlp:
-      endpoint: "otel-collector.monitoring:4317"
-      protocol: grpc          # grpc | http
-      compression: gzip       # gzip | none
-      compressionLevel: 0   # gzip level: 1 fastest .. 9 smallest, 0 = library default
-      insecure: true
-      tlsInsecureSkipVerify: false
-      caFile: ""
-      timeout: 15s
-      bearerTokenSecret:
-        name: ""
-        key: token
+  # OTLP endpoint for the service's own self-metrics push.
+  otlp:
+    endpoint: "otel-collector.monitoring:4317"
+    protocol: grpc          # grpc | http
+    compression: gzip       # gzip | none
+    compressionLevel: 0   # gzip level: 1 fastest .. 9 smallest, 0 = library default
+    insecure: true
+    tlsInsecureSkipVerify: false
+    caFile: ""
+    timeout: 15s
+    bearerTokenSecret:
+      name: ""
+      key: token
   # Less-common service flags go here, e.g.:
-  #   - "-leader-elect"          # REQUIRED with replicas > 1 and events
-  #                              # enabled: a coordination.k8s.io Lease elects
-  #                              # one replica as the events exporter (RBAC is
-  #                              # always granted); every replica serves
-  #                              # metadata reads regardless.
-  #   - "-leader-elect-namespace=monitoring"
-  #   - "-leader-elect-name=kubescrape-events"
   #   - "-scrape-auth-secrets"   # serve monitor endpoints' bearerTokenSecret
   #                              # values to agents on /v1/scrape-auth. Needs
   #                              # a secrets get RBAC rule, which the chart

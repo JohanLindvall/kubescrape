@@ -14,7 +14,6 @@ import (
 	"time"
 
 	"github.com/JohanLindvall/kubescrape/internal/obs"
-	"github.com/JohanLindvall/kubescrape/internal/scrape"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
@@ -244,58 +243,6 @@ func (s *Server) podMonitorsFor(pod kubemeta.Pod) []*servicemonitors.PodMonitor 
 		out = append(out, m)
 	}
 	return out
-}
-
-// proberTarget pairs a Probe with the prober port resolved on one pod.
-type proberTarget struct {
-	probe *servicemonitors.Probe
-	port  int32
-}
-
-// probesFor returns the Probes whose PROBER Service is backed by this pod:
-// probing stays node-local by scheduling each probe onto the agents running
-// a prober replica.
-func (s *Server) probesFor(pod kubemeta.Pod) []proberTarget {
-	if s.monitors == nil {
-		return nil
-	}
-	var out []proberTarget
-	for _, p := range s.monitors.Probes() {
-		if p.ProberNS != pod.Namespace {
-			continue
-		}
-		for _, svc := range s.services.Matching(pod.Namespace, pod.Labels) {
-			if svc.Name != p.ProberService {
-				continue
-			}
-			if port, ok := proberPodPort(pod, svc, p); ok {
-				out = append(out, proberTarget{probe: p, port: port})
-			}
-			break
-		}
-	}
-	return out
-}
-
-// proberPodPort resolves the pod port the prober listens on: an explicit
-// numeric port from prober.url, a named service port, or the service's only
-// port.
-func proberPodPort(pod kubemeta.Pod, svc *services.Service, p *servicemonitors.Probe) (int32, bool) {
-	if p.ProberPort != nil {
-		if n, ok := scrape.MonitorPortNumber(*p.ProberPort); ok {
-			return n, true
-		}
-		for _, sp := range svc.Ports {
-			if sp.Name == p.ProberPort.StrVal {
-				return scrape.TargetPodPort(pod, sp)
-			}
-		}
-		return 0, false
-	}
-	if len(svc.Ports) == 1 {
-		return scrape.TargetPodPort(pod, svc.Ports[0])
-	}
-	return 0, false
 }
 
 // enrich fills in owner-chain and namespace metadata on a pod.

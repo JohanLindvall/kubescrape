@@ -12,7 +12,7 @@ metadata:
   labels: {{ include "kubescrape.labels" . | nindent 4 }}
 rules:
   - apiGroups: [""]
-    resources: ["pods", "namespaces", "services", "nodes", "events"]
+    resources: ["pods", "namespaces", "services", "nodes"]
     verbs: ["get", "list", "watch"]
   - apiGroups: ["apps"]
     resources: ["replicasets", "deployments"]
@@ -20,10 +20,6 @@ rules:
   - apiGroups: ["batch"]
     resources: ["jobs", "cronjobs"]
     verbs: ["get", "list", "watch"]
-  # Leader election (-leader-elect): one replica exports events.
-  - apiGroups: ["coordination.k8s.io"]
-    resources: ["leases"]
-    verbs: ["get", "create", "update"]
   # Optional: ServiceMonitor discovery (-servicemonitors).
   - apiGroups: ["monitoring.coreos.com"]
     resources: ["servicemonitors", "podmonitors", "probes"]
@@ -76,30 +72,26 @@ spec:
             - -wait-timeout={{ .Values.service.waitTimeout }}
             - -cache-ttl={{ .Values.service.cacheTTL }}
             - -servicemonitors={{ .Values.service.serviceMonitors }}
-            {{- if .Values.service.events.enabled }}
-            - -events
-            {{- end }}
-            {{- /* The OTLP output serves both the events exporter and the
-                 service's own self-metrics push. */}}
-            - -otlp-endpoint={{ .Values.service.events.otlp.endpoint }}
-            - -otlp-protocol={{ .Values.service.events.otlp.protocol }}
-            - -otlp-compression={{ .Values.service.events.otlp.compression }}
-            - -otlp-compression-level={{ int64 .Values.service.events.otlp.compressionLevel }}
-            - -otlp-insecure={{ .Values.service.events.otlp.insecure }}
-            - -otlp-tls-insecure-skip-verify={{ .Values.service.events.otlp.tlsInsecureSkipVerify }}
-            {{- with .Values.service.events.otlp.caFile }}
+            {{- /* The OTLP output carries the service's own self-metrics push. */}}
+            - -otlp-endpoint={{ .Values.service.otlp.endpoint }}
+            - -otlp-protocol={{ .Values.service.otlp.protocol }}
+            - -otlp-compression={{ .Values.service.otlp.compression }}
+            - -otlp-compression-level={{ int64 .Values.service.otlp.compressionLevel }}
+            - -otlp-insecure={{ .Values.service.otlp.insecure }}
+            - -otlp-tls-insecure-skip-verify={{ .Values.service.otlp.tlsInsecureSkipVerify }}
+            {{- with .Values.service.otlp.caFile }}
             - -otlp-tls-ca-file={{ . }}
             {{- end }}
-            - -otlp-timeout={{ .Values.service.events.otlp.timeout }}
-            {{- if .Values.service.events.otlp.bearerTokenSecret.name }}
-            - -otlp-bearer-token-file=/etc/kubescrape/otlp-token/{{ .Values.service.events.otlp.bearerTokenSecret.key }}
+            - -otlp-timeout={{ .Values.service.otlp.timeout }}
+            {{- if .Values.service.otlp.bearerTokenSecret.name }}
+            - -otlp-bearer-token-file=/etc/kubescrape/otlp-token/{{ .Values.service.otlp.bearerTokenSecret.key }}
             {{- end }}
             - -log-level={{ .Values.logLevel }}
             - -log-format={{ .Values.logFormat }}
             {{- range .Values.service.extraArgs }}
             - {{ . }}
             {{- end }}
-          {{- if .Values.service.events.otlp.bearerTokenSecret.name }}
+          {{- if .Values.service.otlp.bearerTokenSecret.name }}
           volumeMounts:
             - name: otlp-token
               mountPath: /etc/kubescrape/otlp-token
@@ -113,14 +105,12 @@ spec:
           livenessProbe:
             httpGet: {path: /healthz, port: http}
           resources: {{ toYaml .Values.service.resources | nindent 12 }}
-      {{- /* Gated on the secret alone, matching the volumeMount above: the
-           OTLP output (and its token) also serves the self-metrics push when
-           events are disabled. */}}
-      {{- if .Values.service.events.otlp.bearerTokenSecret.name }}
+      {{- /* The OTLP output (and its token) serves the self-metrics push. */}}
+      {{- if .Values.service.otlp.bearerTokenSecret.name }}
       volumes:
         - name: otlp-token
           secret:
-            secretName: {{ .Values.service.events.otlp.bearerTokenSecret.name }}
+            secretName: {{ .Values.service.otlp.bearerTokenSecret.name }}
       {{- end }}
 ---
 apiVersion: v1

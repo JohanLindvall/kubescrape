@@ -47,32 +47,6 @@ func TestParsePodMonitor(t *testing.T) {
 	}
 }
 
-func TestParseProbe(t *testing.T) {
-	u := unstr("Probe", map[string]any{
-		"prober": map[string]any{"url": "blackbox.monitoring.svc:9115"},
-		"module": "http_2xx",
-		"targets": map[string]any{"staticConfig": map[string]any{
-			"static": []any{"https://example.com"},
-		}},
-	})
-	p, err := ParseProbe(u)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if p.ProberService != "blackbox" || p.ProberNS != "monitoring" ||
-		p.ProberPort == nil || p.ProberPort.IntValue() != 9115 || p.ProberPath != "/probe" {
-		t.Fatalf("prober: %+v", p)
-	}
-	// Ingress-only targets are rejected (unsupported), not silently empty.
-	u2 := unstr("Probe", map[string]any{
-		"prober":  map[string]any{"url": "blackbox:9115"},
-		"targets": map[string]any{"ingress": map[string]any{}},
-	})
-	if _, err := ParseProbe(u2); err == nil {
-		t.Fatal("ingress-only probe must fail parse")
-	}
-}
-
 func TestIndexPodMonitorLifecycle(t *testing.T) {
 	x := NewIndex()
 	u := unstr("PodMonitor", map[string]any{

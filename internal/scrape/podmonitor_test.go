@@ -1,7 +1,6 @@
 package scrape
 
 import (
-	"strings"
 	"testing"
 
 	"k8s.io/apimachinery/pkg/util/intstr"
@@ -42,26 +41,5 @@ func TestPodMonitorTargets(t *testing.T) {
 	if len(ts) != 1 || !ts[0].InsecureSkipVerify || ts[0].AuthSecret != "ns/tok/token" ||
 		len(ts[0].MetricRelabelings) != 1 || ts[0].Scheme != "https" {
 		t.Fatalf("endpoint stamping: %+v", ts)
-	}
-}
-
-func TestProbeTargets(t *testing.T) {
-	prober := basePod()
-	probe := &servicemonitors.Probe{
-		Namespace: "mon", Name: "site-check",
-		ProberPath: "/probe", Module: "http_2xx",
-		StaticTargets: []string{"https://example.com", "https://other.io"},
-	}
-	ts := ProbeTargets(prober, probe, 9115)
-	if len(ts) != 2 {
-		t.Fatalf("targets: %+v", ts)
-	}
-	if ts[0].Source != "probe" || ts[0].Monitor != "mon/site-check" {
-		t.Fatalf("identity: %+v", ts[0])
-	}
-	if !strings.Contains(ts[0].URL, ":9115/probe?") ||
-		!strings.Contains(ts[0].URL, "module=http_2xx") ||
-		!strings.Contains(ts[0].URL, "target=https%3A%2F%2Fexample.com") {
-		t.Fatalf("url: %s", ts[0].URL)
 	}
 }

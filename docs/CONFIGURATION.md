@@ -54,26 +54,21 @@ kubescrape -listen :8080 -wait-timeout 5s -cache-ttl 5m -log-format json
 | `-resync` | `0` | informer resync period (0 = watch stream only) |
 | `-servicemonitors` | `false` | serve targets for `monitoring.coreos.com/v1` ServiceMonitors selecting pod-backed Services — plus **PodMonitors** (endpoints name container ports) and **Probes** (`staticConfig` only, resolved through the prober Service's pods) when the cluster serves those CRDs. Endpoint `port`/`targetPort`/`path`/`scheme`, `tlsConfig.insecureSkipVerify`, `bearerTokenSecret` and the keep/drop subset of `metricRelabelings` are honored; other relabel actions and per-endpoint intervals are not. Self-disables with a warning when the CRD is absent |
 | `-scrape-auth-secrets` | `false` | serve monitor endpoints' `bearerTokenSecret` values to agents on `GET /v1/scrape-auth/{ns}/{name}/{key}`. Opt-in: requires `secrets get` RBAC (commented out in the manifests) and ships tokens over the cluster-internal HTTP channel |
-| `-events` | `false` | export Kubernetes events as OTLP log records (batched; history from the initial list is skipped; pod events carry full pod resource attributes) |
-| `-leader-elect` | `false` | gate the events exporter behind a `coordination.k8s.io` Lease so exactly one replica exports — required when running more than one replica with `-events`. Every replica serves reads from its own informer caches regardless; non-leaders keep watching events so failover needs no warmup |
-| `-leader-elect-namespace` | `monitoring` | namespace of the leader-election Lease |
-| `-leader-elect-name` | `kubescrape-events` | name of the leader-election Lease |
 | `-self-metrics-interval` | `1m` | export the service's own metrics over OTLP at this interval (0 disables) |
-| `-otlp-*` | as the agent | used by `-events` and the self-metrics push: `-otlp-endpoint`, `-otlp-protocol`, `-otlp-compression`, `-otlp-compression-level`, `-otlp-insecure`, `-otlp-tls-ca-file`, `-otlp-tls-insecure-skip-verify`, `-otlp-bearer-token-file`, `-otlp-timeout` |
+| `-otlp-*` | as the agent | used by the self-metrics push: `-otlp-endpoint`, `-otlp-protocol`, `-otlp-compression`, `-otlp-compression-level`, `-otlp-insecure`, `-otlp-tls-ca-file`, `-otlp-tls-insecure-skip-verify`, `-otlp-bearer-token-file`, `-otlp-timeout` |
 | `-log-level` | `info` | `debug`, `info`, `warn`, `error` |
 | `-log-format` | `text` | `text` or `json` (client-go's klog is routed through the same handler) |
 
-The service's own metrics (store sizes, HTTP requests per pattern/status,
-exported events) are pushed over OTLP on `-self-metrics-interval` (default
+The service's own metrics (store sizes, HTTP requests per pattern/status)
+are pushed over OTLP on `-self-metrics-interval` (default
 1m, 0 disables) using the `-otlp-*` flags. `GET /metrics` serves only the Go
 runtime and process metrics (`go_*`, `process_*`).
 
 RBAC (cluster-wide `get`/`list`/`watch`): `pods`, `services`, `namespaces`,
-`nodes`, `events`, `replicasets.apps`, `deployments.apps`, `jobs.batch`,
+`nodes`, `replicasets.apps`, `deployments.apps`, `jobs.batch`,
 `cronjobs.batch`, `servicemonitors.monitoring.coreos.com` (plus
-`podmonitors`/`probes` when those CRDs should be discovered). `-leader-elect`
-additionally needs `get`/`create`/`update` on `leases.coordination.k8s.io`,
-and `-scrape-auth-secrets` needs `secrets get` (commented out in the
+`podmonitors`/`probes` when those CRDs should be discovered).
+`-scrape-auth-secrets` needs `secrets get` (commented out in the
 manifests — enable deliberately) — see
 [deploy/kubernetes.yaml](../deploy/kubernetes.yaml).
 

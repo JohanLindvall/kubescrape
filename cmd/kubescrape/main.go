@@ -21,6 +21,7 @@ import (
 	"go.opentelemetry.io/collector/pdata/pcommon"
 
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -34,6 +35,8 @@ import (
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/clientcmd"
+	"k8s.io/client-go/tools/leaderelection"
+	"k8s.io/client-go/tools/leaderelection/resourcelock"
 	"k8s.io/klog/v2"
 
 	"github.com/JohanLindvall/kubescrape/internal/agent/otlpexport"
@@ -191,6 +194,13 @@ func run() error {
 		// ServiceMonitor CRDs (opt-in).
 		monitorsOn = flag.Bool("servicemonitors", false, "serve targets for monitoring.coreos.com ServiceMonitors selecting pod-backed Services (no per-endpoint auth or relabelings)")
 
+		// HA: with >1 replica, gate the events exporter behind a Lease so
+		// exactly one replica exports (reads are served by every replica from
+		// its own informer caches — no election needed there).
+		leaderElect = flag.Bool("leader-elect", false, "use a Lease to elect one replica as the events exporter (required when running >1 replica with -events)")
+		leaseNs     = flag.String("leader-elect-namespace", "monitoring", "namespace of the leader-election Lease")
+		leaseName   = flag.String("leader-elect-name", "kubescrape-events", "name of the leader-election Lease")
+
 		// Kubernetes events -> OTLP logs (opt-in).
 		eventsOn             = flag.Bool("events", false, "export Kubernetes events as OTLP log records")
 		selfMetricsIntv      = flag.Duration("self-metrics-interval", time.Minute, "export the service's own metrics over OTLP at this interval (0 disables)")
@@ -320,6 +330,35 @@ func run() error {
 
 	if *eventsOn {
 		ev := events.New(events.Config{Store: st, Exporter: exporter, Owners: resolver, Logger: log})
+		if *leaderElect {
+			// Only the leader exports; every replica still watches (cheap) so
+			// failover needs no informer warmup. Losing the lease deactivates
+			// immediately; the successor picks up the live stream (no replay,
+			// mirroring the skip-initial-history startup semantics).
+			ev.SetActive(false)
+			id, _ := os.Hostname()
+			lock := &resourcelock.LeaseLock{
+				LeaseMeta:  metav1.ObjectMeta{Name: *leaseName, Namespace: *leaseNs},
+				Client:     client.CoordinationV1(),
+				LockConfig: resourcelock.ResourceLockConfig{Identity: id},
+			}
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				leaderelection.RunOrDie(ctx, leaderelection.LeaderElectionConfig{
+					Lock:            lock,
+					LeaseDuration:   15 * time.Second,
+					RenewDeadline:   10 * time.Second,
+					RetryPeriod:     2 * time.Second,
+					ReleaseOnCancel: true,
+					Callbacks: leaderelection.LeaderCallbacks{
+						OnStartedLeading: func(context.Context) { ev.SetActive(true) },
+						OnStoppedLeading: func() { ev.SetActive(false) },
+					},
+				})
+			}()
+			log.Info("leader election enabled for events", "lease", *leaseNs+"/"+*leaseName, "id", id)
+		}
 		evInformer := factory.Core().V1().Events().Informer()
 		if _, err := evInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
 			AddFunc:    ev.OnAdd,

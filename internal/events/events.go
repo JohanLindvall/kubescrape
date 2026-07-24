@@ -56,6 +56,12 @@ type Exporter struct {
 	log   *slog.Logger
 	ch    chan *corev1.Event
 	start time.Time
+	// active gates enqueue for HA: with leader election, only the leader
+	// exports events (every replica's informer sees them all — exporting on
+	// each would duplicate every event). Enabled by default; SetActive is
+	// driven by the election callbacks. An inactive replica SKIPS events
+	// silently — they are the leader's to export, not drops.
+	active atomic.Bool
 	// lastDropWarn rate-limits the queue-full warning (unix nanos); every drop
 	// still counts into obs.EventsDropped.
 	lastDropWarn atomic.Int64
@@ -81,7 +87,7 @@ func New(cfg Config) *Exporter {
 	if log == nil {
 		log = slog.Default()
 	}
-	return &Exporter{
+	ex := &Exporter{
 		cfg: cfg,
 		log: log,
 		ch:  make(chan *corev1.Event, 4*cfg.BatchSize),
@@ -90,12 +96,30 @@ func New(cfg Config) *Exporter {
 		// being misclassified as pre-start history.
 		start: time.Now().Truncate(time.Second),
 	}
+	// Active by default: without leader election there is exactly one
+	// replica and it must export. Election flips this via SetActive.
+	ex.active.Store(true)
+	return ex
 }
 
 // OnAdd handles informer adds.
 func (e *Exporter) OnAdd(obj any) {
+	if !e.active.Load() {
+		return
+	}
 	if ev, ok := obj.(*corev1.Event); ok {
 		e.enqueue(ev)
+	}
+}
+
+// SetActive gates exporting (leader election). Gaining leadership after a
+// failover re-emits nothing retroactively: events that fired while the old
+// leader was dying are delivered by ITS shutdown flush or lost with a count
+// there — the successor starts from the live stream, mirroring the
+// skip-initial-history semantics at startup.
+func (e *Exporter) SetActive(active bool) {
+	if e.active.Swap(active) != active {
+		e.log.Info("events exporter leadership changed", "active", active)
 	}
 }
 
@@ -104,6 +128,9 @@ func (e *Exporter) OnAdd(obj any) {
 // events.k8s.io/v1 API (most modern controllers and the scheduler) — to
 // series.count/series.lastObservedTime, while the legacy fields stay zero.
 func (e *Exporter) OnUpdate(oldObj, newObj any) {
+	if !e.active.Load() {
+		return
+	}
 	oldEv, ok1 := oldObj.(*corev1.Event)
 	newEv, ok2 := newObj.(*corev1.Event)
 	if !ok1 || !ok2 {

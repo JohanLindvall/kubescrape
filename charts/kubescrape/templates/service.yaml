@@ -20,6 +20,10 @@ rules:
   - apiGroups: ["batch"]
     resources: ["jobs", "cronjobs"]
     verbs: ["get", "list", "watch"]
+  # Leader election (-leader-elect): one replica exports events.
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "create", "update"]
   # Optional: ServiceMonitor discovery (-servicemonitors).
   - apiGroups: ["monitoring.coreos.com"]
     resources: ["servicemonitors"]

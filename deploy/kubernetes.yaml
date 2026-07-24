@@ -27,6 +27,10 @@ rules:
   - apiGroups: ["monitoring.coreos.com"]
     resources: ["servicemonitors"]
     verbs: ["get", "list", "watch"]
+  # Leader election (-leader-elect): one replica exports events.
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "create", "update"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding

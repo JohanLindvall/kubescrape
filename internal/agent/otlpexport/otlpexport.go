@@ -47,6 +47,9 @@ type Config struct {
 	InsecureSkipVerify bool
 	// CAFile adds a PEM CA bundle for verifying the collector.
 	CAFile string
+	// Headers are static headers sent on every export (HTTP request headers /
+	// gRPC metadata) — e.g. a multi-tenant collector's X-Scope-OrgID.
+	Headers map[string]string
 	// BearerTokenFile is re-read every minute and sent as
 	// "Authorization: Bearer <token>". Empty disables.
 	BearerTokenFile string
@@ -378,6 +381,9 @@ func (c *Client) grpcAuth(ctx context.Context) (context.Context, error) {
 	if err != nil {
 		return nil, err
 	}
+	for k, v := range c.cfg.Headers {
+		ctx = metadata.AppendToOutgoingContext(ctx, k, v)
+	}
 	if token == "" {
 		return ctx, nil
 	}
@@ -418,6 +424,9 @@ func (c *Client) httpPost(ctx context.Context, url string, body []byte) error {
 	}
 	if token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	for k, v := range c.cfg.Headers {
+		req.Header.Set(k, v)
 	}
 	// Do closes the request body even on error, returning gz to its pool.
 	resp, err := c.httpClient.Do(req)

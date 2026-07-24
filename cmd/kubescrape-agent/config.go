@@ -9,6 +9,7 @@ import (
 	"github.com/JohanLindvall/kubescrape/internal/agent/attrs"
 	"github.com/JohanLindvall/kubescrape/internal/agent/logscrub"
 	"github.com/JohanLindvall/kubescrape/internal/agent/promscrape"
+	"github.com/JohanLindvall/kubescrape/internal/agent/route"
 	"github.com/JohanLindvall/kubescrape/internal/agent/spanmetrics"
 	"github.com/JohanLindvall/kubescrape/internal/agent/tailer"
 	"github.com/JohanLindvall/kubescrape/internal/agent/tracesample"
@@ -38,6 +39,9 @@ type agentConfig struct {
 	// (histogram buckets, extra dimensions, cardinality cap). Aggregation is
 	// gated by -ingest-span-metrics; this section only tunes it.
 	TraceMetrics *spanmetrics.Config `json:"traceMetrics,omitempty"`
+	// Routing fans exported payloads out by namespace to extra destinations
+	// or tenants (headers); unmatched resources use the default chain.
+	Routing *route.Config `json:"routing,omitempty"`
 	// LogScrubbing redacts sensitive values (built-in + user patterns) from
 	// log bodies in the tailer, journald and OTLP-ingest paths, before any
 	// enrichment copies from them.

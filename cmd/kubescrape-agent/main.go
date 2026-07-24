@@ -30,6 +30,7 @@ import (
 	"github.com/JohanLindvall/kubescrape/internal/agent/otlpingest"
 	"github.com/JohanLindvall/kubescrape/internal/agent/positions"
 	"github.com/JohanLindvall/kubescrape/internal/agent/promscrape"
+	"github.com/JohanLindvall/kubescrape/internal/agent/route"
 	"github.com/JohanLindvall/kubescrape/internal/agent/spanmetrics"
 	"github.com/JohanLindvall/kubescrape/internal/agent/tailer"
 	"github.com/JohanLindvall/kubescrape/internal/agent/tracesample"
@@ -65,7 +66,7 @@ func agentSelfResource(node string) pcommon.Resource {
 // The agent's flag surface. Package-level so the per-pipeline start
 // functions can read them directly; main parses.
 var (
-	configFile           = flag.String("config", "", "unified YAML config file with resourceAttributes, logs, logAttributes, logMetrics, logScrubbing, metrics, traceMetrics and traceSampling sections")
+	configFile           = flag.String("config", "", "unified YAML config file with resourceAttributes, logs, logAttributes, logMetrics, logScrubbing, metrics, routing, traceMetrics and traceSampling sections")
 	nodeName             = flag.String("node-name", os.Getenv("NODE_NAME"), "name of the node this agent runs on (default $NODE_NAME)")
 	listen               = flag.String("listen", ":8081", "HTTP listen address for /healthz, /readyz, /debug/tailer and /debug/targets (empty disables)")
 	selfMetricsIntv      = flag.Duration("self-metrics-interval", time.Minute, "export the agent's own metrics over OTLP at this interval (0 disables)")
@@ -336,6 +337,47 @@ func run() error {
 		}()
 		out = buffered
 		log.Info("disk buffer enabled", "dir", *bufferDir, "max-bytes-per-signal", *bufferMax)
+	}
+
+	// Routing sits between transforms and the default delivery chain:
+	// producers → transform → router → {default buffered chain | route
+	// clients}. Route clients inherit the main endpoint/TLS/compression
+	// settings unless the route overrides the endpoint; per-route
+	// destinations are direct (unbuffered) — the default keeps the full
+	// durability chain.
+	if fileCfg.Routing != nil && len(fileCfg.Routing.Routes) > 0 {
+		var dests []route.Destination
+		for i, rt := range fileCfg.Routing.Routes {
+			if rt.Name == "" || len(rt.Namespaces) == 0 {
+				return fmt.Errorf("routing route %d: name and namespaces are required", i)
+			}
+			rcfg := otlpexport.Config{
+				Endpoint:           *otlpEndpoint,
+				Protocol:           *otlpProtocol,
+				Compression:        *otlpCompression,
+				CompressionLevel:   *otlpCompressionLevel,
+				Insecure:           *otlpInsecure,
+				InsecureSkipVerify: *otlpSkipTLS,
+				CAFile:             *otlpCAFile,
+				BearerTokenFile:    *otlpBearer,
+				Timeout:            *otlpTimeout,
+				RetryAttempts:      *otlpRetries,
+				RetryBackoff:       *otlpBackoff,
+				MaxSendBytes:       *otlpMaxSendBytes,
+				Headers:            rt.Headers,
+			}
+			if rt.Endpoint != "" {
+				rcfg.Endpoint = rt.Endpoint
+			}
+			rc, err := otlpexport.New(rcfg)
+			if err != nil {
+				return fmt.Errorf("routing route %q: %w", rt.Name, err)
+			}
+			defer func() { _ = rc.Close() }()
+			dests = append(dests, route.Destination{Name: rt.Name, Namespaces: rt.Namespaces, Exporter: rc})
+		}
+		out = route.New(out, dests)
+		log.Info("routing enabled", "routes", len(dests))
 	}
 
 	// Transforms wrap the producer-facing exporter ABOVE the disk buffer:

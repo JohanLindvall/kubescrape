@@ -112,6 +112,8 @@ var (
 		"Distinct pushed identities (container id / pod uid, memoized per request) by enrichment outcome (enriched, unresolved, peer_ip).", "outcome")
 	IngestDropped = Registry.CounterVec("kubescrape_ingest_dropped_batches_total",
 		"Acknowledged ingest batches dropped: permanent collector rejection or the transient-retry limit exhausted.", "signal")
+	Routed = Registry.CounterVec("kubescrape_routed_payload_parts_total",
+		"Payload parts forwarded to a non-default routing destination.", "route", "signal")
 	TransformErrors = Registry.CounterVec("kubescrape_transform_errors_total",
 		"Transform program invocations that failed (the batch is NOT exported; the error propagates to the producer's retry path).", "signal")
 	TransformReloads = Registry.CounterVec("kubescrape_transform_reloads_total",

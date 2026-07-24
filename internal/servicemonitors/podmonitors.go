@@ -93,16 +93,16 @@ func ParsePodMonitor(u *unstructured.Unstructured) (*PodMonitor, error) {
 // not interpreted). ProberService/ProberPort locate the prober's backing
 // pods so probing stays node-local.
 type Probe struct {
-	Namespace      string
-	Name           string
-	ProberService  string // service name parsed from prober.url
-	ProberNS       string // service namespace (prober.url DNS form, default probe's own)
-	ProberPort     *intstr.IntOrString
-	ProberPath     string // default /probe
-	ProberScheme   string
-	Module         string
-	StaticTargets  []string
-	StaticLabels   map[string]string
+	Namespace     string
+	Name          string
+	ProberService string // service name parsed from prober.url
+	ProberNS      string // service namespace (prober.url DNS form, default probe's own)
+	ProberPort    *intstr.IntOrString
+	ProberPath    string // default /probe
+	ProberScheme  string
+	Module        string
+	StaticTargets []string
+	StaticLabels  map[string]string
 }
 
 // probeSpec mirrors the Probe spec fields we interpret.

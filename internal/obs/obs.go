@@ -112,6 +112,10 @@ var (
 		"Distinct pushed identities (container id / pod uid, memoized per request) by enrichment outcome (enriched, unresolved, peer_ip).", "outcome")
 	IngestDropped = Registry.CounterVec("kubescrape_ingest_dropped_batches_total",
 		"Acknowledged ingest batches dropped: permanent collector rejection or the transient-retry limit exhausted.", "signal")
+	TransformErrors = Registry.CounterVec("kubescrape_transform_errors_total",
+		"Transform program invocations that failed (the batch is NOT exported; the error propagates to the producer's retry path).", "signal")
+	TransformReloads = Registry.CounterVec("kubescrape_transform_reloads_total",
+		"Transforms-file reloads by outcome (applied, failed — a failed compile keeps the last good program).", "outcome")
 	TraceSpansDropped = Registry.CounterVec("kubescrape_trace_spans_dropped_total",
 		"Ingested spans dropped by the trace sampler (probability = the consistent trace-ID decision, rate = the spans/second cap).", "reason")
 	SpanMetricsDropped = Registry.Counter("kubescrape_span_metrics_dropped_total",

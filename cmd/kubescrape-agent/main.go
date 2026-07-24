@@ -33,6 +33,7 @@ import (
 	"github.com/JohanLindvall/kubescrape/internal/agent/spanmetrics"
 	"github.com/JohanLindvall/kubescrape/internal/agent/tailer"
 	"github.com/JohanLindvall/kubescrape/internal/agent/tracesample"
+	"github.com/JohanLindvall/kubescrape/internal/agent/transform"
 	"github.com/JohanLindvall/kubescrape/internal/logline"
 	"github.com/JohanLindvall/kubescrape/internal/metrics"
 	"github.com/JohanLindvall/kubescrape/internal/obs"
@@ -82,6 +83,8 @@ var (
 	otlpRetries          = flag.Int("otlp-retry-attempts", 3, "tries per metrics export (logs retry via the tailer's rewind)")
 	otlpBackoff          = flag.Duration("otlp-retry-backoff", time.Second, "initial backoff between metric export retries, doubled per attempt")
 	otlpMaxSendBytes     = flag.Int("otlp-max-send-bytes", 0, "cap on one exported payload's encoded protobuf size; a larger payload is split into parts before sending (0 = default ~3.75 MiB, under the 4 MiB gRPC limit; negative disables)")
+
+	transformsFile = flag.String("transforms-file", "", "Starlark transforms file applied to exported logs/metrics/traces at the exporter seam; hot-reloaded on change (mount its ConfigMap as a directory, not subPath). Empty disables")
 
 	logLevel  = flag.String("log-level", "info", "log level: debug, info, warn, error")
 	logFormat = flag.String("log-format", "text", "log format: text or json")
@@ -177,6 +180,7 @@ type pipelines struct {
 	posStore     *positions.Store
 	logAttrs     *logattrs.Extractor
 	scrub        *logscrub.Scrubber
+	transforms   *transform.Wrapper
 	logMetrics   *metrics.DynamicMetricSet
 	ingestMode   otlpingest.MetricsMode
 	filters      *promscrape.MetricFilters
@@ -334,6 +338,28 @@ func run() error {
 		log.Info("disk buffer enabled", "dir", *bufferDir, "max-bytes-per-signal", *bufferMax)
 	}
 
+	// Transforms wrap the producer-facing exporter ABOVE the disk buffer:
+	// producers → transform → buffer → client, so spooled bytes are final
+	// and a reload never re-interprets a durable backlog. Compile fails
+	// startup; reloads compile-then-commit (a broken edit keeps the last
+	// good program).
+	var transforms *transform.Wrapper
+	if *transformsFile != "" {
+		prog, err := transform.CompileFile(*transformsFile)
+		if err != nil {
+			return fmt.Errorf("transforms: %w", err)
+		}
+		traceNext, _ := out.(transform.TracesExporter)
+		transforms = transform.Wrap(out, traceNext, prog)
+		out = transforms
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			transform.Reload(ctx, transforms, *transformsFile, 0, log)
+		}()
+		log.Info("transforms enabled", "file", *transformsFile, "hash", prog.Hash)
+	}
+
 	// Registered AFTER the exporter/spool Close defers (LIFO): an early `return
 	// err` below must stop and drain every started goroutine BEFORE their
 	// exporter and spools are closed under them. The normal path's inline
@@ -388,6 +414,7 @@ func run() error {
 		posStore:     posStore,
 		logAttrs:     logAttrs,
 		scrub:        scrub,
+		transforms:   transforms,
 		logMetrics:   logMetrics,
 		ingestMode:   ingestMode,
 		filters:      metricFilters,
@@ -694,6 +721,14 @@ func (p *pipelines) startDebugServer(tl *tailer.Tailer, sc *promscrape.Scraper) 
 			enc := json.NewEncoder(w)
 			enc.SetIndent("", "  ")
 			_ = enc.Encode(sc.Status())
+		})
+	}
+	if p.transforms != nil {
+		// The active transform program's content hash: which nodes have
+		// converged after a reload.
+		mux.HandleFunc("GET /debug/transforms", func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]string{"hash": p.transforms.Active().Hash})
 		})
 	}
 	// Every handler here answers from an in-memory snapshot in

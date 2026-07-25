@@ -2,6 +2,7 @@ package tailer
 
 import (
 	"fmt"
+	"path"
 	"path/filepath"
 
 	"github.com/bmatcuk/doublestar/v4"
@@ -31,6 +32,21 @@ type Source struct {
 	// tailing — pre-existing ones ARE ingested; scope Include to avoid
 	// re-reading unwanted history.
 	Compressed bool `json:"compressed,omitempty"`
+	// Namespaces, when set, restricts a CONTAINERD source to pods in these
+	// namespaces (path.Match globs, e.g. "team-*"); ExcludeNamespaces removes
+	// matches. Both are read from the CRI FILENAME at discovery, so a
+	// non-matching file is never opened, tracked or read — unlike a
+	// logs.rules drop, which pays the read, parse and enrich first and only
+	// saves egress. Ignored for non-containerd sources, whose files carry no
+	// namespace.
+	Namespaces        []string `json:"namespaces,omitempty"`
+	ExcludeNamespaces []string `json:"excludeNamespaces,omitempty"`
+	// Selector, when set, restricts a containerd source to pods whose LABELS
+	// match every key=value here. Labels are only known once the metadata
+	// resolves, so unlike Namespaces this is applied at resolve time: the file
+	// is tracked but no data is ever read from it. "Collect logs only for pods
+	// labeled logging=true" is otherwise expressible only as a filename glob.
+	Selector map[string]string `json:"selector,omitempty"`
 	// Multiline overrides the tailer default for this source (nil = default).
 	Multiline *bool `json:"multiline,omitempty"`
 	// Attributes are static resource attributes stamped on records from
@@ -75,6 +91,42 @@ type compiledSource struct {
 	compressed bool
 	multiline  bool
 	attributes map[string]string
+	// namespaces/excludeNamespaces gate a containerd source by the namespace
+	// in the CRI filename (discovery time — the file is never opened);
+	// selector gates it by pod labels (resolve time — nothing is ever read).
+	namespaces        []string
+	excludeNamespaces []string
+	selector          map[string]string
+}
+
+// wantNamespace reports whether a containerd source accepts this namespace.
+// An empty allowlist accepts everything; the denylist wins.
+func (s *compiledSource) wantNamespace(ns string) bool {
+	for _, pat := range s.excludeNamespaces {
+		if ok, _ := path.Match(pat, ns); ok {
+			return false
+		}
+	}
+	if len(s.namespaces) == 0 {
+		return true
+	}
+	for _, pat := range s.namespaces {
+		if ok, _ := path.Match(pat, ns); ok {
+			return true
+		}
+	}
+	return false
+}
+
+// wantLabels reports whether a pod's labels satisfy the source's selector
+// (every key=value must match; an empty selector accepts everything).
+func (s *compiledSource) wantLabels(lbls map[string]string) bool {
+	for k, v := range s.selector {
+		if lbls[k] != v {
+			return false
+		}
+	}
+	return true
 }
 
 // compileSources resolves the per-source multiline default against the global
@@ -101,6 +153,10 @@ func compileSources(sources []Source, dir string, defaultMultiline bool) []*comp
 			compressed: s.Compressed,
 			multiline:  ml,
 			attributes: s.Attributes,
+
+			namespaces:        s.Namespaces,
+			excludeNamespaces: s.ExcludeNamespaces,
+			selector:          s.Selector,
 		})
 	}
 	return out

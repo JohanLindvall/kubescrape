@@ -211,12 +211,14 @@ func (t *Tailer) claimPath(src *compiledSource, path string, seen map[string]str
 	var id string
 	if src.containerd {
 		cid, namespace, ok := parseFileName(filepath.Base(path))
-		if !ok || slices.Contains(t.cfg.ExcludeNamespaces, namespace) {
+		if !ok || slices.Contains(t.cfg.ExcludeNamespaces, namespace) || !src.wantNamespace(namespace) {
 			// The file is CLAIMED by this source even though it is skipped:
 			// an excluded namespace (or an unparseable CRI name) must not
 			// fall through to a later catch-all source — ExcludeNamespaces is
 			// global tailer config (the observability feedback-loop guard),
 			// and a later source exporting the raw CRI lines would defeat it.
+			// A source's own namespaces/excludeNamespaces claim-and-skip for
+			// the same reason: the file is never opened, tracked or read.
 			seen[path] = struct{}{}
 			return false
 		}

@@ -46,6 +46,15 @@ func (t *Tailer) resolveMetadata(ctx context.Context, f *file) bool {
 	t.cfg.Attrs.Build(res, actx)
 	f.resource = res
 	f.resolved = true
+	if !f.source.wantLabels(md.Pod.Labels) {
+		// The source selects pods by label; this one does not match. Labels are
+		// only known now, so the file is tracked — but no data is ever read
+		// from it, unlike a logs.rules drop which pays read+parse+enrich first.
+		f.excluded = true
+		t.log.Debug("pod does not match the source selector; not collecting",
+			"path", f.path, "source", f.source.name)
+		return true
+	}
 	t.applyPodConfig(f, md.Pod.Annotations)
 	return true
 }

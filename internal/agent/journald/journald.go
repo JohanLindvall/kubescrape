@@ -27,6 +27,8 @@ import (
 	"github.com/JohanLindvall/kubescrape/internal/agent/logscrub"
 	"github.com/JohanLindvall/kubescrape/internal/agent/otlpexport"
 	"github.com/JohanLindvall/kubescrape/internal/agent/positions"
+	"github.com/JohanLindvall/kubescrape/internal/logline"
+	"github.com/JohanLindvall/kubescrape/internal/metrics"
 	"github.com/JohanLindvall/kubescrape/internal/obs"
 	"github.com/JohanLindvall/kubescrape/pkg/logattrs"
 )
@@ -71,6 +73,15 @@ type Config struct {
 	// Scrub redacts sensitive values from message bodies before anything
 	// copies from them (nil disables).
 	Scrub *logscrub.Scrubber
+	// Rules are ordered keep/drop/sample rules over journal entries, evaluated
+	// AFTER enrichment (so the synthetic __severity__ key sees the enriched
+	// severity) and AFTER LogMetrics (so metrics observe every entry, including
+	// dropped ones) — the same order and semantics as the tailer's logs.rules.
+	Rules *logline.LineFilter
+	// LogMetrics derives configured metrics from each journal entry, before the
+	// rules run. The journal is dominated by kubelet/containerd chatter, which
+	// is exactly the volume you want to count and then drop.
+	LogMetrics *metrics.DynamicMetricSet
 
 	// Attrs builds the exported resource attributes (nil = defaults).
 	Attrs *attrs.Builder
@@ -417,8 +428,22 @@ func (r *Reader) settleBatch() {
 // convert groups the batch into one resource per unit.
 func (r *Reader) convert() plog.Logs {
 	ld := plog.NewLogs()
-	scopes := make(map[string]plog.ScopeLogs, 4)
+	scopes := make(map[string]scopeEntry, 4)
 	observed := pcommon.NewTimestampFromTime(time.Now())
+	var (
+		scratch  plog.LogRecordSlice
+		resolver *entryResolver
+		bound    map[string]metrics.BoundResource
+	)
+	if r.cfg.Rules != nil || r.cfg.LogMetrics != nil {
+		resolver = newEntryResolver()
+	}
+	if r.cfg.Rules != nil {
+		scratch = plog.NewLogRecordSlice()
+	}
+	if r.cfg.LogMetrics != nil {
+		bound = make(map[string]metrics.BoundResource, 4)
+	}
 	for _, e := range r.batch {
 		var extracted logattrs.Result
 		unit := e.unit
@@ -439,7 +464,7 @@ func (r *Reader) convert() plog.Logs {
 			extracted = r.cfg.LogAttrs.Extract(e.body)
 			key = groupKey + "\x01" + logattrs.Key(extracted.Resource) + "\x01" + logattrs.Key(extracted.Scope)
 		}
-		sl, ok := scopes[key]
+		ent, ok := scopes[key]
 		if !ok {
 			rl := ld.ResourceLogs().AppendEmpty()
 			res := rl.Resource()
@@ -459,11 +484,22 @@ func (r *Reader) convert() plog.Logs {
 			}
 			r.cfg.Attrs.Build(res, actx)
 			logattrs.Put(res.Attributes(), extracted.Resource)
-			sl = rl.ScopeLogs().AppendEmpty()
+			sl := rl.ScopeLogs().AppendEmpty()
 			logattrs.Put(sl.Scope().Attributes(), extracted.Scope)
-			scopes[key] = sl
+			ent = scopeEntry{sl: sl, res: res.Attributes()}
+			scopes[key] = ent
 		}
-		lr := sl.LogRecords().AppendEmpty()
+		sl := ent.sl
+		// With rules configured, build into a one-record scratch and move it
+		// across only if kept (the tailer does the same).
+		var lr plog.LogRecord
+		scratched := r.cfg.Rules != nil
+		if scratched {
+			scratch.RemoveIf(func(plog.LogRecord) bool { return true })
+			lr = scratch.AppendEmpty()
+		} else {
+			lr = sl.LogRecords().AppendEmpty()
+		}
 		lr.SetTimestamp(pcommon.NewTimestampFromTime(e.ts))
 		lr.SetObservedTimestamp(observed)
 		lr.SetSeverityNumber(e.severity)
@@ -483,8 +519,42 @@ func (r *Reader) convert() plog.Logs {
 		if r.cfg.Enrich {
 			logenrich.Apply(lr, e.body)
 		}
+		if r.cfg.LogMetrics != nil {
+			bm, ok := bound[key]
+			if !ok {
+				// Metrics group by the RESOURCE, so bind the unit's.
+				bm = r.cfg.LogMetrics.Bind(ent.res)
+				bound[key] = bm
+			}
+			resolver.rec, resolver.res = lr.Attributes(), ent.res
+			bm.Add(resolver.valueFn, resolver.labelFn, e.body)
+		}
+		if scratched {
+			resolver.rec, resolver.res = lr.Attributes(), ent.res
+			resolver.sev = lowerSeverity(lr.SeverityText())
+			if r.cfg.Rules.Keep(resolver.ruleFn, e.body) {
+				scratch.MoveAndAppendTo(sl.LogRecords())
+			} else {
+				scratch.RemoveIf(func(plog.LogRecord) bool { return true })
+				obs.LogRulesDropped.Inc()
+			}
+		}
 	}
+	// An all-dropped unit leaves an empty group behind; prune so the payload
+	// carries no record-less ResourceLogs.
+	ld.ResourceLogs().RemoveIf(func(rl plog.ResourceLogs) bool {
+		rl.ScopeLogs().RemoveIf(func(sl plog.ScopeLogs) bool { return sl.LogRecords().Len() == 0 })
+		return rl.ScopeLogs().Len() == 0
+	})
 	return ld
+}
+
+// scopeEntry is one grouped unit's scope plus its resource attributes (the
+// rules and metrics resolvers read the resource, which plog does not expose
+// back from a ScopeLogs).
+type scopeEntry struct {
+	sl  plog.ScopeLogs
+	res pcommon.Map
 }
 
 // severity maps a syslog priority (0-7) to OTLP severity.

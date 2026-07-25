@@ -310,8 +310,12 @@ Rules run **after** enrichment (so severity is matchable) and **after**
 `logMetrics` (so metrics still count every line — e.g. count errors while
 dropping them). Dropped records advance offsets exactly like exported ones and
 are counted in `kubescrape_log_rules_dropped_total`. `sample` is only valid on
-keep rules; a matching line beyond the sampled fraction is dropped. journald
-records are not filtered.
+keep rules; a matching line beyond the sampled fraction is dropped.
+
+The same chain applies to **journald** entries (as does `logMetrics`), with the
+same ordering: metrics observe every entry, the rules run after enrichment so
+`__severity__` sees the enriched severity, and a dropped entry still advances
+the journal cursor.
 
 ### Per-workload log config (pod annotation)
 

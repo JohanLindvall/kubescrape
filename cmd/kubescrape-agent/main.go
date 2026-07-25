@@ -188,6 +188,9 @@ type pipelines struct {
 	scrub        *logscrub.Scrubber
 	transforms   *transform.Wrapper
 	logMetrics   *metrics.DynamicMetricSet
+	// journalRules is the compiled logs.rules chain, applied to journal entries
+	// as well as container logs (same section, same semantics).
+	journalRules *logline.LineFilter
 	// spanMetricsGen is published by startIngest so run() can export the last
 	// aggregation window after every producer has joined.
 	spanMetricsGen *spanmetrics.Generator
@@ -257,6 +260,16 @@ func run() error {
 	if *checkConfig {
 		printConfigSummary(fileCfg, log)
 		return nil
+	}
+
+	// The logs.rules chain is shared by the tailer AND journald, so it is
+	// compiled here rather than inside startLogs: journald must get it even
+	// with -logs=false.
+	var logRules *logline.LineFilter
+	if fileCfg.Logs != nil {
+		if logRules, err = logline.NewLineFilter(fileCfg.Logs.Rules); err != nil {
+			return fmt.Errorf("logs.rules: %w", err)
+		}
 	}
 
 	attrBuilders, err := buildAttrs(fileCfg.ResourceAttributes)
@@ -508,6 +521,7 @@ func run() error {
 		scrub:        scrub,
 		transforms:   transforms,
 		logMetrics:   logMetrics,
+		journalRules: logRules,
 		ingestMode:   ingestMode,
 		filters:      metricFilters,
 		splitters:    splitters,
@@ -576,12 +590,9 @@ func (p *pipelines) startLogs() (*tailer.Tailer, error) {
 	}
 	var err error
 	var logSources []tailer.Source
-	var logRules *logline.LineFilter
+	logRules := p.journalRules // the same compiled logs.rules chain
 	if p.fileCfg.Logs != nil {
 		if logSources, err = tailer.ValidateSources(p.fileCfg.Logs.Sources); err != nil {
-			return nil, fmt.Errorf("logs config: %w", err)
-		}
-		if logRules, err = logline.NewLineFilter(p.fileCfg.Logs.Rules); err != nil {
 			return nil, fmt.Errorf("logs config: %w", err)
 		}
 	}
@@ -642,6 +653,8 @@ func (p *pipelines) startJournald() {
 		Enrich:        *enrichOn,
 		LogAttrs:      p.logAttrs,
 		Scrub:         p.scrub,
+		Rules:         p.journalRules,
+		LogMetrics:    p.logMetrics,
 		Attrs:         p.attrBuilders.Journal,
 		NodeInfo:      p.nodeInfo,
 		Exporter:      p.out,

@@ -119,7 +119,6 @@ func (s *Server) Handler() http.Handler {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))
 	})
-	mux.Handle("GET /metrics", obs.RuntimeHandler())
 	mux.HandleFunc("GET /readyz", func(w http.ResponseWriter, _ *http.Request) {
 		if !s.isReady() {
 			http.Error(w, "informer caches not synced", http.StatusServiceUnavailable)

@@ -1,68 +1,92 @@
 package obs
 
 import (
-	"io"
-	"net/http"
-	"net/http/httptest"
-	"runtime"
-	"sync"
-	"sync/atomic"
+	"context"
+	"strings"
 	"testing"
+	"time"
+
+	"go.opentelemetry.io/collector/pdata/pcommon"
+	"go.opentelemetry.io/collector/pdata/pmetric"
 )
 
-// TestRuntimeHandlerConcurrentScrapes hammers /metrics from 32 goroutines
-// (the agent and service expose it to any in-cluster scraper): every response
-// must be a well-formed 200 and the heap must stay steady — a per-request
-// allocation blowup here would let a scrape loop balloon the process. Run
-// under -race for the concurrency guarantee.
-func TestRuntimeHandlerConcurrentScrapes(t *testing.T) {
-	srv := httptest.NewServer(RuntimeHandler())
-	defer srv.Close()
+type capExp struct{ md []pmetric.Metrics }
 
-	scrape := func() (int, int64) {
-		resp, err := http.Get(srv.URL)
-		if err != nil {
-			return -1, 0
-		}
-		n, _ := io.Copy(io.Discard, resp.Body)
-		_ = resp.Body.Close()
-		return resp.StatusCode, n
+func (c *capExp) ExportMetrics(_ context.Context, md pmetric.Metrics) error {
+	cp := pmetric.NewMetrics()
+	md.CopyTo(cp)
+	c.md = append(c.md, cp)
+	return nil
+}
+
+// The Go runtime and process series must reach an OTLP export, since the
+// Prometheus /metrics endpoint that used to carry them is gone.
+func TestRuntimeMetricsExportOverOTLP(t *testing.T) {
+	RegisterRuntimeMetrics()
+
+	// Burn a few CPU ticks so process.cpu.time is meaningfully non-zero:
+	// /proc/self/stat reports whole USER_HZ ticks (10ms), and a freshly
+	// started test process can legitimately be at 0.
+	spin := time.Now()
+	for time.Since(spin) < 60*time.Millisecond {
+		_ = strings.Repeat("x", 512)
 	}
 
-	// Warm up, then measure steady-state heap growth across the hammer.
-	if code, n := scrape(); code != http.StatusOK || n == 0 {
-		t.Fatalf("warmup scrape: status %d, %d bytes", code, n)
+	exp := &capExp{}
+	if err := Registry.Export(context.Background(), exp, pcommon.NewResource()); err != nil {
+		t.Fatal(err)
 	}
-	runtime.GC()
-	var before runtime.MemStats
-	runtime.ReadMemStats(&before)
-
-	const workers, perWorker = 32, 25
-	var bad atomic.Int64
-	var wg sync.WaitGroup
-	for range workers {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for range perWorker {
-				if code, n := scrape(); code != http.StatusOK || n == 0 {
-					bad.Add(1)
+	got := map[string]float64{}
+	for _, md := range exp.md {
+		rms := md.ResourceMetrics()
+		for i := 0; i < rms.Len(); i++ {
+			sms := rms.At(i).ScopeMetrics()
+			for j := 0; j < sms.Len(); j++ {
+				ms := sms.At(j).Metrics()
+				for k := 0; k < ms.Len(); k++ {
+					m := ms.At(k)
+					if !strings.HasPrefix(m.Name(), "process.") {
+						continue
+					}
+					switch m.Type() {
+					case pmetric.MetricTypeGauge:
+						if dps := m.Gauge().DataPoints(); dps.Len() > 0 {
+							got[m.Name()] = dps.At(0).DoubleValue()
+						}
+					case pmetric.MetricTypeSum:
+						// The LAST point: a counter's first export is preceded by
+						// two synthetic zero points that give rate() a baseline.
+						if dps := m.Sum().DataPoints(); dps.Len() > 0 {
+							got[m.Name()] = dps.At(dps.Len() - 1).DoubleValue()
+						}
+					}
 				}
 			}
-		}()
-	}
-	wg.Wait()
-	if bad.Load() != 0 {
-		t.Fatalf("%d scrapes failed", bad.Load())
+		}
 	}
 
-	runtime.GC()
-	var after runtime.MemStats
-	runtime.ReadMemStats(&after)
-	// 800 scrapes must not retain memory; allow generous slack for runtime
-	// noise (pooled buffers, GC timing — 17.6MB was observed once under full
-	// suite load with nothing retained; a real leak here is orders larger).
-	if growth := int64(after.HeapAlloc) - int64(before.HeapAlloc); growth > 32<<20 {
-		t.Fatalf("heap grew %d bytes across %d scrapes", growth, workers*perWorker)
+	// Series that must be present AND plausibly non-zero in any running process.
+	for _, name := range []string{
+		"process.runtime.go.goroutines",
+		"process.runtime.go.mem.heap_alloc",
+		"process.runtime.go.mem.total",
+		"process.memory.rss",
+		"process.open_file_descriptors",
+		"process.cpu.time",
+	} {
+		v, ok := got[name]
+		if !ok {
+			t.Errorf("%s missing from the OTLP export", name)
+			continue
+		}
+		if v <= 0 {
+			t.Errorf("%s = %v, want > 0", name, v)
+		}
+	}
+	// Registered but legitimately zero early in a process's life.
+	for _, name := range []string{"process.runtime.go.gc.count", "process.uptime"} {
+		if _, ok := got[name]; !ok {
+			t.Errorf("%s missing from the OTLP export", name)
+		}
 	}
 }

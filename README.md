@@ -202,15 +202,17 @@ runs with `-scrape-auth-secrets` (404 otherwise): it needs `secrets get`
 RBAC and ships secret material over the cluster-internal HTTP channel, so it
 is deliberately opt-in.
 
-### `GET /healthz`, `GET /readyz`, `GET /metrics`
+### `GET /healthz`, `GET /readyz`
 
 Liveness is always `200`; readiness turns `200` once the initial informer
 cache sync has completed. The service's own metrics (`kubescrape_store_pods`,
 `kubescrape_store_containers`, `kubescrape_http_requests_total{pattern,code}`,
 …) are produced through the same internal
 metrics machinery as everything else and **pushed over OTLP**
-(`-self-metrics-interval`, default 1m; 0 disables). `/metrics` serves only
-the Go runtime and process metrics (`go_*`, `process_*`) in Prometheus text
+(`-self-metrics-interval`, default 1m; 0 disables) — together with the Go
+runtime and process series (`process.runtime.go.*`, `process.cpu.time`,
+`process.memory.rss`, `process.open_file_descriptors`, …), which
+`-runtime-metrics=false` omits. There is no Prometheus
 format, for debugging the process itself.
 
 ## Reusable packages
@@ -705,9 +707,10 @@ resource identity (`service.name: kubescrape-agent`, `k8s.node.name`).
 `GET /debug/tailer` (per-file positions and lag), `GET /debug/targets` (the
 last scrape cycle's per-target outcomes — up/error/duration/samples,
 failures first), `GET /debug/transforms` (the active transform program's
-content hash, for checking per-node convergence after a reload), and
-`GET /metrics` with the Go runtime and process metrics (`go_*`,
-`process_*`) only.
+content hash, for checking per-node convergence after a reload), and — with
+`-debug-pprof` — the standard `net/http/pprof` profiles under
+`GET /debug/pprof/`. There is no Prometheus `/metrics` endpoint: the Go
+runtime and process series are pushed over OTLP with everything else.
 
 **Metric filtering and splitting** (`metrics` section). This section has two
 subsections. `pipelines` holds ordered keep/drop rules per pipeline

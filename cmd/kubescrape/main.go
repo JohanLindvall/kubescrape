@@ -252,6 +252,7 @@ func run() error {
 
 		// Self-metrics -> OTLP (the service's only OTLP producer).
 		selfMetricsIntv      = flag.Duration("self-metrics-interval", time.Minute, "export the service's own metrics over OTLP at this interval (0 disables)")
+		runtimeMetrics       = flag.Bool("runtime-metrics", true, "include Go runtime and process metrics (process.runtime.go.*, process.cpu.time, process.memory.rss, process.open_file_descriptors, ...) in the OTLP self-metrics export")
 		otlpEndpoint         = flag.String("otlp-endpoint", "otel-collector.monitoring:4317", "OTLP endpoint for self-metrics: host:port for grpc, base URL for http")
 		otlpProtocol         = flag.String("otlp-protocol", "grpc", "OTLP transport: grpc or http")
 		otlpCompression      = flag.String("otlp-compression", "gzip", "OTLP payload compression: gzip or none")
@@ -367,6 +368,12 @@ func run() error {
 		a.PutStr("service.name", "kubescrape")
 		if host, err := os.Hostname(); err == nil {
 			a.PutStr("service.instance.id", host)
+		}
+		// Go runtime and process series ride the same OTLP push as everything
+		// else; there is no Prometheus endpoint to scrape them from. Opt-out:
+		// ~15 extra series per process is a real cost on a large fleet.
+		if *runtimeMetrics {
+			obs.RegisterRuntimeMetrics()
 		}
 		wg.Add(1)
 		go func() {

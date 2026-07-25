@@ -662,6 +662,9 @@ func (p *pipelines) startIngest() error {
 	// only the sampled subset ships; decisions are per-trace-ID consistent,
 	// so a sender's retry re-samples identically.
 	if cfg := p.fileCfg.TraceSampling; cfg != nil && cfg.Enabled() {
+		if err := cfg.Validate(); err != nil {
+			return err
+		}
 		if ingestTraceOut == nil {
 			// Symmetric with the -ingest-span-metrics warnings: a configured
 			// section that silently does nothing is indistinguishable from one

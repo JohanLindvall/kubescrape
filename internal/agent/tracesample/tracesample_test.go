@@ -7,6 +7,7 @@ import (
 
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/ptrace"
+	"sigs.k8s.io/yaml"
 )
 
 type capExporter struct {
@@ -81,7 +82,7 @@ func TestProbabilisticConsistentAndProportional(t *testing.T) {
 
 func TestGuardRailsKeepErrorsAndSlowSpans(t *testing.T) {
 	next := &capExporter{}
-	s := New(Config{Probability: 0.0000001, KeepSlowerThan: time.Second}, next)
+	s := New(Config{Probability: 0.0000001, KeepSlowerThan: "1s"}, next)
 
 	td := payload(3, true, 2*time.Second) // span 0 is BOTH error and slow
 	if err := s.ExportTraces(context.Background(), td); err != nil {
@@ -158,5 +159,31 @@ func TestInputPayloadNotMutated(t *testing.T) {
 	}
 	if td2.SpanCount() != 10 || next2.spans() != 10 {
 		t.Fatalf("all-kept path: input=%d forwarded=%d", td2.SpanCount(), next2.spans())
+	}
+}
+
+// keepSlowerThan is documented as a Go duration string ("2s"). The config is
+// decoded through sigs.k8s.io/yaml -> encoding/json, which cannot unmarshal a
+// string into time.Duration — so a time.Duration-typed field made the
+// DOCUMENTED spelling a fatal startup error (the loader is strict).
+func TestKeepSlowerThanAcceptsDurationString(t *testing.T) {
+	var c Config
+	if err := yaml.UnmarshalStrict([]byte("keepSlowerThan: 2s\n"), &c); err != nil {
+		t.Fatalf("the documented spelling failed to decode: %v", err)
+	}
+	if err := c.Validate(); err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+	got, err := c.slowerThan()
+	if err != nil || got != 2*time.Second {
+		t.Fatalf("slowerThan = %v, %v; want 2s", got, err)
+	}
+	// A malformed value must fail startup, not silently disable the guard rail.
+	var bad Config
+	if err := yaml.UnmarshalStrict([]byte("keepSlowerThan: 2quarters\n"), &bad); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if err := bad.Validate(); err == nil {
+		t.Fatal("a malformed keepSlowerThan must be rejected at startup")
 	}
 }

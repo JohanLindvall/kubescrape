@@ -14,6 +14,7 @@ package tracesample
 
 import (
 	"context"
+	"fmt"
 	"math"
 	"sync"
 	"time"
@@ -33,8 +34,14 @@ type Config struct {
 	// decision (default true).
 	KeepErrors *bool `json:"keepErrors,omitempty"`
 	// KeepSlowerThan keeps spans at least this slow regardless of the
-	// probability decision (0 disables).
-	KeepSlowerThan time.Duration `json:"keepSlowerThan,omitempty"`
+	// probability decision (a Go duration such as "2s"; empty/0 disables).
+	//
+	// A STRING, not a time.Duration: the config is decoded through
+	// sigs.k8s.io/yaml -> encoding/json, which cannot unmarshal "2s" into a
+	// time.Duration and only accepts a raw nanosecond integer. Since the loader
+	// is strict and a decode error is fatal, the documented spelling made the
+	// agent refuse to start. Same treatment as logMetrics' maxAge.
+	KeepSlowerThan string `json:"keepSlowerThan,omitempty"`
 	// MaxSpansPerSecond caps forwarded spans after sampling; excess spans are
 	// dropped and counted (0 = uncapped). A hard safety valve, applied to
 	// guard-rail keeps too — a cap that can be exceeded is not a cap. NOTE:
@@ -48,6 +55,28 @@ type Config struct {
 // Enabled reports whether the config asks for any sampling at all.
 func (c Config) Enabled() bool {
 	return (c.Probability > 0 && c.Probability < 1) || c.MaxSpansPerSecond > 0
+}
+
+// slowerThan parses KeepSlowerThan. An empty value disables the guard rail.
+func (c Config) slowerThan() (time.Duration, error) {
+	if c.KeepSlowerThan == "" {
+		return 0, nil
+	}
+	d, err := time.ParseDuration(c.KeepSlowerThan)
+	if err != nil {
+		return 0, fmt.Errorf("traceSampling.keepSlowerThan %q: %w", c.KeepSlowerThan, err)
+	}
+	if d < 0 {
+		return 0, fmt.Errorf("traceSampling.keepSlowerThan must not be negative: %s", c.KeepSlowerThan)
+	}
+	return d, nil
+}
+
+// Validate reports a malformed config, so a bad value fails startup with a
+// clear message instead of silently disabling the guard rail.
+func (c Config) Validate() error {
+	_, err := c.slowerThan()
+	return err
 }
 
 // Exporter is the downstream trace exporter (otlpexport.Client and Buffered
@@ -75,6 +104,7 @@ type Sampler struct {
 
 // New builds a Sampler in front of next.
 func New(cfg Config, next Exporter) *Sampler {
+	slow, _ := cfg.slowerThan() // validated at startup via Validate
 	p := cfg.Probability
 	if p <= 0 || p > 1 {
 		p = 1
@@ -83,7 +113,7 @@ func New(cfg Config, next Exporter) *Sampler {
 	s := &Sampler{
 		next:    next,
 		keepErr: keepErr,
-		slow:    cfg.KeepSlowerThan,
+		slow:    slow,
 		rate:    cfg.MaxSpansPerSecond,
 		// One second of headroom, but never below a single span: allow()
 		// caps tokens at burst and requires a whole token, so a fractional

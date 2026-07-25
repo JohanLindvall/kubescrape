@@ -164,7 +164,14 @@ func (r *metricRule) observe(values func(string) (float64, bool), lookup func(st
 		// ValueRegexp both extracts and FILTERS ("a line that does not match is
 		// skipped"). inc/dec/count ignore the extracted value, but the filter
 		// still applies — otherwise they would tally lines the regex rejects.
-		if _, ok := r.readValue(values, line); !ok {
+		//
+		// Gate on the MATCH alone, not on readValue: readValue also demands the
+		// capture parse as a float, so a regex used as a pure content filter
+		// (`action: inc, valueRegexp: ERROR`) or one capturing a non-numeric
+		// group rejected every line it matched. The rule compiled without error
+		// (inc/dec/count need no value source) and then silently reported
+		// nothing forever.
+		if !r.valueRe.MatchString(line) {
 			return buf, rbuf
 		}
 	}

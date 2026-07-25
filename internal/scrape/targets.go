@@ -108,6 +108,14 @@ func stampEndpoint(t *kubemeta.ScrapeTarget, ep servicemonitors.Endpoint) {
 	t.AuthSecret = ep.BearerSecret
 	t.Interval = ep.Interval
 	t.ScrapeTimeout = ep.ScrapeTimeout
+	t.BasicAuthUser = ep.BasicAuthUser
+	t.BasicAuthPass = ep.BasicAuthPass
+	t.AuthType = ep.AuthType
+	t.AuthCredentials = ep.AuthCredentials
+	t.TLSCA = ep.TLSCA
+	t.TLSCert = ep.TLSCert
+	t.TLSKey = ep.TLSKey
+	t.TLSServerName = ep.TLSServerName
 	for _, r := range ep.MetricRelabelings {
 		t.MetricRelabelings = append(t.MetricRelabelings, kubemeta.RelabelRule{
 			Action: r.Action, SourceLabels: r.SourceLabels, Regex: r.Regex,

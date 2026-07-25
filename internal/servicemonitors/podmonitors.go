@@ -74,8 +74,16 @@ func ParsePodMonitor(u *unstructured.Unstructured) (*PodMonitor, error) {
 	}
 	for _, ep := range spec.PodMetricsEndpoints {
 		e := ep.toEndpoint()
-		if e.BearerSecret != "" {
-			e.BearerSecret = m.Namespace + "/" + e.BearerSecret
+		// Every secret reference is namespaced with the MONITOR's namespace: a
+		// monitor may only name secrets in its own namespace, which is what
+		// bounds what /v1/scrape-auth will serve.
+		for _, p := range []*string{
+			&e.BearerSecret, &e.BasicAuthUser, &e.BasicAuthPass,
+			&e.AuthCredentials, &e.TLSCA, &e.TLSCert, &e.TLSKey,
+		} {
+			if *p != "" {
+				*p = m.Namespace + "/" + *p
+			}
 		}
 		m.Endpoints = append(m.Endpoints, e)
 	}

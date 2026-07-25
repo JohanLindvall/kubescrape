@@ -47,6 +47,21 @@ type Endpoint struct {
 	// MetricRelabelings holds the keep/drop subset of the endpoint's
 	// metricRelabelings; other actions are ignored (documented).
 	MetricRelabelings []RelabelRule
+	// BasicAuthUser/Pass, AuthType/AuthCredentials and the TLS* refs carry the
+	// endpoint's remaining auth material as "namespace/name/key" secret
+	// references (namespace = the monitor's), resolved by agents through the
+	// same -scrape-auth-secrets channel as BearerSecret. kube-prometheus-stack's
+	// own control-plane monitors (etcd, scheduler, controller-manager) use
+	// client certificates, and anything behind a private CA was previously
+	// scrapeable only by turning verification off entirely.
+	BasicAuthUser   string
+	BasicAuthPass   string
+	AuthType        string // "authorization.type", default Bearer
+	AuthCredentials string
+	TLSCA           string
+	TLSCert         string
+	TLSKey          string
+	TLSServerName   string
 	// Interval and ScrapeTimeout are the endpoint's own cadence (Go duration
 	// strings, empty = the agent's -scrape-interval/-scrape-timeout). Honouring
 	// them matters on migration: a kube-prometheus-stack shop routinely has
@@ -81,15 +96,21 @@ type endpointSpec struct {
 	Interval      string              `json:"interval"`
 	ScrapeTimeout string              `json:"scrapeTimeout"`
 	TLSConfig     *struct {
-		InsecureSkipVerify bool            `json:"insecureSkipVerify"`
-		CA                 json.RawMessage `json:"ca"`
-		Cert               json.RawMessage `json:"cert"`
-		KeySecret          json.RawMessage `json:"keySecret"`
-		ServerName         string          `json:"serverName"`
+		InsecureSkipVerify bool        `json:"insecureSkipVerify"`
+		CA                 *secretOrCM `json:"ca"`
+		Cert               *secretOrCM `json:"cert"`
+		KeySecret          *secretRef  `json:"keySecret"`
+		ServerName         string      `json:"serverName"`
 	} `json:"tlsConfig"`
+	BasicAuth *struct {
+		Username *secretRef `json:"username"`
+		Password *secretRef `json:"password"`
+	} `json:"basicAuth"`
+	Authorization *struct {
+		Type        string     `json:"type"`
+		Credentials *secretRef `json:"credentials"`
+	} `json:"authorization"`
 	// Parsed only to be REPORTED as uninterpreted (see Endpoint.Ignored).
-	BasicAuth         json.RawMessage `json:"basicAuth"`
-	Authorization     json.RawMessage `json:"authorization"`
 	OAuth2            json.RawMessage `json:"oauth2"`
 	ProxyURL          string          `json:"proxyUrl"`
 	Params            json.RawMessage `json:"params"`
@@ -106,6 +127,45 @@ type endpointSpec struct {
 	} `json:"metricRelabelings"`
 }
 
+// secretRef is a SecretKeySelector.
+type secretRef struct {
+	Name string `json:"name"`
+	Key  string `json:"key"`
+}
+
+// ref renders "name/key" (the namespace is prefixed by the caller); empty when
+// incomplete.
+func (r *secretRef) ref() string {
+	if r == nil || r.Name == "" || r.Key == "" {
+		return ""
+	}
+	return r.Name + "/" + r.Key
+}
+
+// secretOrCM is prometheus-operator's SecretOrConfigMap. Only the secret arm is
+// resolvable: the agent reads secret keys through the metadata service's
+// -scrape-auth-secrets channel, and adding a parallel configMap channel is not
+// worth it while every CA can be stored in a secret.
+type secretOrCM struct {
+	Secret    *secretRef `json:"secret"`
+	ConfigMap *struct {
+		Name string `json:"name"`
+		Key  string `json:"key"`
+	} `json:"configMap"`
+}
+
+func (s *secretOrCM) ref() string {
+	if s == nil {
+		return ""
+	}
+	return s.Secret.ref()
+}
+
+// usesConfigMap reports the unsupported arm, so it is reported as ignored.
+func (s *secretOrCM) usesConfigMap() bool {
+	return s != nil && s.ConfigMap != nil && s.ConfigMap.Name != ""
+}
+
 // ignoredFields lists the endpoint fields that are set but not interpreted.
 func (ep endpointSpec) ignoredFields() []string {
 	var out []string
@@ -114,18 +174,16 @@ func (ep endpointSpec) ignoredFields() []string {
 			out = append(out, name)
 		}
 	}
-	add("basicAuth", len(ep.BasicAuth) > 0)
-	add("authorization", len(ep.Authorization) > 0)
 	add("oauth2", len(ep.OAuth2) > 0)
 	add("proxyUrl", ep.ProxyURL != "")
 	add("params", len(ep.Params) > 0)
 	add("honorLabels", ep.HonorLabels != nil)
 	add("relabelings", len(ep.Relabelings) > 0)
 	if ep.TLSConfig != nil {
-		add("tlsConfig.ca", len(ep.TLSConfig.CA) > 0)
-		add("tlsConfig.cert", len(ep.TLSConfig.Cert) > 0)
-		add("tlsConfig.keySecret", len(ep.TLSConfig.KeySecret) > 0)
-		add("tlsConfig.serverName", ep.TLSConfig.ServerName != "")
+		// Only the configMap arm is unsupported; secret-backed CA/cert are
+		// interpreted below.
+		add("tlsConfig.ca.configMap", ep.TLSConfig.CA.usesConfigMap())
+		add("tlsConfig.cert.configMap", ep.TLSConfig.Cert.usesConfigMap())
 	}
 	for _, r := range ep.MetricRelabelings {
 		if r.Action != "keep" && r.Action != "drop" {
@@ -145,6 +203,18 @@ func (ep endpointSpec) toEndpoint() Endpoint {
 	}
 	if ep.TLSConfig != nil {
 		out.InsecureSkipVerify = ep.TLSConfig.InsecureSkipVerify
+		out.TLSServerName = ep.TLSConfig.ServerName
+		out.TLSCA = ep.TLSConfig.CA.ref()
+		out.TLSCert = ep.TLSConfig.Cert.ref()
+		out.TLSKey = ep.TLSConfig.KeySecret.ref()
+	}
+	if ep.BasicAuth != nil {
+		out.BasicAuthUser = ep.BasicAuth.Username.ref()
+		out.BasicAuthPass = ep.BasicAuth.Password.ref()
+	}
+	if ep.Authorization != nil {
+		out.AuthType = ep.Authorization.Type
+		out.AuthCredentials = ep.Authorization.Credentials.ref()
 	}
 	if ep.BearerTokenSecret != nil && ep.BearerTokenSecret.Name != "" && ep.BearerTokenSecret.Key != "" {
 		out.BearerSecret = ep.BearerTokenSecret.Name + "/" + ep.BearerTokenSecret.Key
@@ -215,8 +285,16 @@ func Parse(u *unstructured.Unstructured) (*Monitor, error) {
 	}
 	for _, ep := range spec.Endpoints {
 		e := ep.toEndpoint()
-		if e.BearerSecret != "" {
-			e.BearerSecret = m.Namespace + "/" + e.BearerSecret
+		// Every secret reference is namespaced with the MONITOR's namespace: a
+		// monitor may only name secrets in its own namespace, which is what
+		// bounds what /v1/scrape-auth will serve.
+		for _, p := range []*string{
+			&e.BearerSecret, &e.BasicAuthUser, &e.BasicAuthPass,
+			&e.AuthCredentials, &e.TLSCA, &e.TLSCert, &e.TLSKey,
+		} {
+			if *p != "" {
+				*p = m.Namespace + "/" + *p
+			}
 		}
 		m.Endpoints = append(m.Endpoints, e)
 	}
@@ -289,19 +367,27 @@ func (x *Index) AuthSecretRefs() map[string]struct{} {
 	x.mu.RLock()
 	defer x.mu.RUnlock()
 	out := map[string]struct{}{}
-	for _, m := range x.monitors {
-		for _, e := range m.Endpoints {
-			if e.BearerSecret != "" {
-				out[e.BearerSecret] = struct{}{}
+	add := func(eps []Endpoint) {
+		for _, e := range eps {
+			// Every secret an endpoint references, so the metadata service
+			// serves exactly the keys some monitor actually names — the
+			// allowlist that keeps -scrape-auth-secrets from being a general
+			// secret-read API.
+			for _, ref := range []string{
+				e.BearerSecret, e.BasicAuthUser, e.BasicAuthPass,
+				e.AuthCredentials, e.TLSCA, e.TLSCert, e.TLSKey,
+			} {
+				if ref != "" {
+					out[ref] = struct{}{}
+				}
 			}
 		}
 	}
+	for _, m := range x.monitors {
+		add(m.Endpoints)
+	}
 	for _, m := range x.podMonitors {
-		for _, e := range m.Endpoints {
-			if e.BearerSecret != "" {
-				out[e.BearerSecret] = struct{}{}
-			}
-		}
+		add(m.Endpoints)
 	}
 	return out
 }

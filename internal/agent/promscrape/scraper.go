@@ -122,6 +122,11 @@ type Scraper struct {
 	// cycle so vanished targets drop out). warned dedupes per-target
 	// complaints. Written only by the cycle goroutine, but Run reads the
 	// intervals to size its ticker, so they are guarded.
+	// tlsClients caches per-target transports keyed by their resolved TLS
+	// material (see clientFor); targets sharing a CA share a connection pool.
+	tlsMu      sync.Mutex
+	tlsClients map[string]*http.Client
+
 	dueMu           sync.Mutex
 	due             map[string]time.Time
 	targetIntervals map[string]time.Duration
@@ -179,6 +184,7 @@ func New(cfg Config) *Scraper {
 				IdleConnTimeout:     90 * time.Second,
 			},
 		},
+		tlsClients:  map[string]*http.Client{},
 		log:         log,
 		kubeletHTTP: newKubeletHTTPClient(cfg.Kubelet, cfg.Timeout),
 		podCache:    make(map[string]podCacheEntry),
@@ -551,16 +557,12 @@ func (s *Scraper) scrapeTarget(ctx context.Context, t kubemeta.ScrapeTarget, tim
 	default:
 		req.Header.Set("Accept", "text/plain;version=0.0.4")
 	}
-	if t.AuthSecret != "" {
-		token, err := s.authToken(ctx, t.AuthSecret)
-		if err != nil {
-			return 0, fmt.Errorf("scrape auth %s: %w", t.AuthSecret, err)
-		}
-		req.Header.Set("Authorization", "Bearer "+token)
+	if err := s.applyAuth(ctx, req, t); err != nil {
+		return 0, err
 	}
-	client := s.http
-	if t.InsecureSkipVerify {
-		client = s.insecureHTTP
+	client, err := s.clientFor(ctx, t, timeout)
+	if err != nil {
+		return 0, err
 	}
 	resp, err := client.Do(req)
 	if err != nil {

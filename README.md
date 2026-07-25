@@ -121,7 +121,9 @@ from four sources:
   a Service backing the pod. Endpoint `port` (service port name),
   `targetPort` (pod port number or container-port name), `path` and `scheme`
   are honored, and so are `tlsConfig.insecureSkipVerify`,
-  `bearerTokenSecret` (see `/v1/scrape-auth` below) and the keep/drop subset
+  `basicAuth`/`authorization`/`bearerTokenSecret` and secret-backed
+  `tlsConfig` `ca`/`cert`/`keySecret`/`serverName` (see `/v1/scrape-auth`
+  below), per-endpoint `interval`/`scrapeTimeout`, and the keep/drop subset
   of `metricRelabelings` (applied per sample by the agent; other relabel
   actions and per-endpoint intervals are ignored). These targets carry
   `source: "servicemonitor"` and a `monitor: "<namespace>/<name>"` field. If
@@ -195,7 +197,7 @@ templates).
 
 ### `GET /v1/scrape-auth/{namespace}/{name}/{key}`
 
-One key of a bearer-token Secret referenced by a ServiceMonitor/PodMonitor
+One key of a Secret referenced by a ServiceMonitor/PodMonitor
 endpoint's `bearerTokenSecret` — agents resolve a target's `authSecret`
 reference through this before scraping. Served **only** when the service
 runs with `-scrape-auth-secrets` (404 otherwise): it needs `secrets get`
@@ -248,7 +250,7 @@ make build           # or: go build ./cmd/kubescrape
 | `-metadata-cache-ttl` | `10s` | `Cache-Control`/`ETag` max-age on metadata responses; agents cache lookups client-side (0 disables) |
 | `-resync`       | `0`     | informer resync period (0 = watch stream only)                            |
 | `-servicemonitors` | `false` | serve targets for ServiceMonitor CRDs — plus PodMonitors when the cluster serves them (see above) |
-| `-scrape-auth-secrets` | `false` | serve monitor endpoints' `bearerTokenSecret` values on `/v1/scrape-auth` (requires `secrets get` RBAC) |
+| `-scrape-auth-secrets` | `false` | serve the Secret keys monitor endpoints reference (`bearerTokenSecret`, `basicAuth`, `authorization.credentials`, `tlsConfig` ca/cert/keySecret) on `/v1/scrape-auth`; only keys some monitor actually names are served (requires `secrets get` RBAC) |
 
 The service's own metrics are pushed over OTLP (`-self-metrics-interval`);
 the connection uses the agent's exporter flags: `-otlp-endpoint`,

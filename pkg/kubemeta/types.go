@@ -127,6 +127,19 @@ type ScrapeTarget struct {
 	// agents resolve it via GET /v1/scrape-auth/{ns}/{name}/{key} (served
 	// only when the metadata service runs with -scrape-auth-secrets).
 	AuthSecret string `json:"authSecret,omitempty"`
+	// BasicAuthUser/Pass, AuthType/AuthCredentials and the TLS* fields carry the
+	// endpoint's remaining auth material as "namespace/name/key" secret
+	// references, resolved by agents through the same /v1/scrape-auth channel as
+	// AuthSecret (so they are served only when the service runs
+	// -scrape-auth-secrets). TLSServerName is a literal, not a reference.
+	BasicAuthUser   string `json:"basicAuthUser,omitempty"`
+	BasicAuthPass   string `json:"basicAuthPass,omitempty"`
+	AuthType        string `json:"authType,omitempty"`
+	AuthCredentials string `json:"authCredentials,omitempty"`
+	TLSCA           string `json:"tlsCA,omitempty"`
+	TLSCert         string `json:"tlsCert,omitempty"`
+	TLSKey          string `json:"tlsKey,omitempty"`
+	TLSServerName   string `json:"tlsServerName,omitempty"`
 	// Interval and ScrapeTimeout override the agent's -scrape-interval and
 	// -scrape-timeout for this target (Go duration strings; empty = the agent's
 	// default). Set from a ServiceMonitor/PodMonitor endpoint's own cadence.

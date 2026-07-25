@@ -24,6 +24,16 @@ rules:
   - apiGroups: ["monitoring.coreos.com"]
     resources: ["servicemonitors", "podmonitors"]
     verbs: ["get", "list", "watch"]
+  {{- if .Values.service.scrapeAuthSecrets }}
+  # Serving monitor endpoints' bearerTokenSecret to agents
+  # (service.extraArgs must also carry -scrape-auth-secrets).
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get"]
+  {{- end }}
+  {{- with .Values.service.extraRules }}
+  {{- toYaml . | nindent 2 }}
+  {{- end }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding

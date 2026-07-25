@@ -185,9 +185,13 @@ type pipelines struct {
 	scrub        *logscrub.Scrubber
 	transforms   *transform.Wrapper
 	logMetrics   *metrics.DynamicMetricSet
-	ingestMode   otlpingest.MetricsMode
-	filters      *promscrape.MetricFilters
-	splitters    []*promscrape.Splitter
+	// spanMetricsGen is published by startIngest so run() can export the last
+	// aggregation window after every producer has joined.
+	spanMetricsGen *spanmetrics.Generator
+	spanMetricsRes pcommon.Resource
+	ingestMode     otlpingest.MetricsMode
+	filters        *promscrape.MetricFilters
+	splitters      []*promscrape.Splitter
 	// fatalErr receives a pipeline's fatal failure (currently only the ingest
 	// listener); wg.Wait orders the write before run() reads it.
 	fatalErr *error
@@ -502,6 +506,18 @@ func run() error {
 			log.Warn("final log-metrics export failed", "error", err)
 		}
 	}
+	if p.spanMetricsGen != nil {
+		// Generator.Run does its final export when ctx is cancelled, but the
+		// ingest batcher's shutdown drain runs AFTER that (the server stops
+		// first, then the batcher drains acked payloads) and every trace it
+		// forwards passes through the tap, bumping the cumulative series. Those
+		// spans ship; without this their RED metrics would not.
+		fctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		if err := p.spanMetricsGen.Export(fctx, out, p.spanMetricsRes); err != nil {
+			log.Warn("final span-metrics export failed", "error", err)
+		}
+		cancel()
+	}
 	if *selfMetricsIntv > 0 {
 		// Registry.Run's own final export raced the final flushes inside
 		// wg.Wait; counters they bumped (last batches, shutdown drops) would
@@ -645,10 +661,17 @@ func (p *pipelines) startIngest() error {
 	// span-metrics tap, so RED metrics are derived from 100% of spans while
 	// only the sampled subset ships; decisions are per-trace-ID consistent,
 	// so a sender's retry re-samples identically.
-	if cfg := p.fileCfg.TraceSampling; cfg != nil && cfg.Enabled() && ingestTraceOut != nil {
-		ingestTraceOut = tracesample.New(*cfg, ingestTraceOut)
-		p.log.Info("trace sampling enabled", "probability", cfg.Probability,
-			"maxSpansPerSecond", cfg.MaxSpansPerSecond, "keepSlowerThan", cfg.KeepSlowerThan)
+	if cfg := p.fileCfg.TraceSampling; cfg != nil && cfg.Enabled() {
+		if ingestTraceOut == nil {
+			// Symmetric with the -ingest-span-metrics warnings: a configured
+			// section that silently does nothing is indistinguishable from one
+			// that is working.
+			p.log.Warn("traceSampling configured but ignored: the traces pipeline is off (-ingest and -ingest-traces)")
+		} else {
+			ingestTraceOut = tracesample.New(*cfg, ingestTraceOut)
+			p.log.Info("trace sampling enabled", "probability", cfg.Probability,
+				"maxSpansPerSecond", cfg.MaxSpansPerSecond, "keepSlowerThan", cfg.KeepSlowerThan)
+		}
 	}
 	// The span-metrics tap wraps the RAW trace exporter, BELOW the batcher:
 	// the tap aggregates only after a successful forward (a retried batch
@@ -663,6 +686,7 @@ func (p *pipelines) startIngest() error {
 		gen := spanmetrics.New(smCfg)
 		ingestTraceOut = gen.Tap(ingestTraceOut)
 		res := agentSelfResource(*nodeName)
+		p.spanMetricsGen, p.spanMetricsRes = gen, res
 		p.spawn(func() {
 			gen.Run(p.ctx, p.out, *spanMetricsIv, res, p.log)
 		})

@@ -38,6 +38,14 @@ service:
       key: token
   # Less-common service flags go here, e.g.:
   #   - "-scrape-auth-secrets"   # serve monitor endpoints' bearerTokenSecret
+  #                               (also set scrapeAuthSecrets: true below for RBAC)
+
+  # Grant the ClusterRole `secrets: get`, which -scrape-auth-secrets needs to
+  # serve monitor endpoints' bearerTokenSecret. Without it the flag yields
+  # runtime 403s on /v1/scrape-auth.
+  scrapeAuthSecrets: false
+  # Extra ClusterRole rules appended verbatim.
+  extraRules: []
   #                              # values to agents on /v1/scrape-auth. Needs
   #                              # a secrets get RBAC rule, which the chart
   #                              # does NOT grant — add it deliberately.

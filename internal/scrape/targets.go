@@ -106,6 +106,8 @@ func MonitorTargets(pod kubemeta.Pod, svc *services.Service, monitor string, ep 
 func stampEndpoint(t *kubemeta.ScrapeTarget, ep servicemonitors.Endpoint) {
 	t.InsecureSkipVerify = ep.InsecureSkipVerify
 	t.AuthSecret = ep.BearerSecret
+	t.Interval = ep.Interval
+	t.ScrapeTimeout = ep.ScrapeTimeout
 	for _, r := range ep.MetricRelabelings {
 		t.MetricRelabelings = append(t.MetricRelabelings, kubemeta.RelabelRule{
 			Action: r.Action, SourceLabels: r.SourceLabels, Regex: r.Regex,

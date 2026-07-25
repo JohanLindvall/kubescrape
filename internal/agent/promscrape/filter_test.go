@@ -162,7 +162,7 @@ func TestScrapeWithFilter(t *testing.T) {
 			"targets": {{Action: "drop", Metrics: `drop_me|hist_.+`}},
 		}}),
 	})
-	if _, err := s.scrapeTarget(context.Background(), testTarget(srv.URL)); err != nil {
+	if _, err := s.scrapeTarget(context.Background(), testTarget(srv.URL), s.cfg.Timeout); err != nil {
 		t.Fatal(err)
 	}
 	metrics := exp.batches[0].ResourceMetrics().At(0).ScopeMetrics().At(0).Metrics()

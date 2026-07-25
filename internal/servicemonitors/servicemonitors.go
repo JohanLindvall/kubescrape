@@ -7,6 +7,7 @@
 package servicemonitors
 
 import (
+	"encoding/json"
 	"fmt"
 	"sort"
 	"sync"
@@ -46,6 +47,19 @@ type Endpoint struct {
 	// MetricRelabelings holds the keep/drop subset of the endpoint's
 	// metricRelabelings; other actions are ignored (documented).
 	MetricRelabelings []RelabelRule
+	// Interval and ScrapeTimeout are the endpoint's own cadence (Go duration
+	// strings, empty = the agent's -scrape-interval/-scrape-timeout). Honouring
+	// them matters on migration: a kube-prometheus-stack shop routinely has
+	// monitors at 10s (ingress, mesh) and 5m (expensive exporters), and
+	// collapsing both onto one global interval silently coarsens the first and
+	// multiplies the sample bill of the second.
+	Interval      string
+	ScrapeTimeout string
+	// Ignored names the endpoint fields kubescrape parsed but does NOT
+	// interpret. They are reported once per monitor so a partially-applied CR
+	// is visible: "narrower than prometheus-operator" is a documented choice,
+	// "silently does something different" is not.
+	Ignored []string
 }
 
 // RelabelRule is the keep/drop subset of a Prometheus relabel_config,
@@ -60,13 +74,27 @@ type RelabelRule struct {
 // endpointSpec is the shared endpoint shape of ServiceMonitor endpoints and
 // PodMonitor podMetricsEndpoints.
 type endpointSpec struct {
-	Port       string              `json:"port"`
-	TargetPort *intstr.IntOrString `json:"targetPort"`
-	Path       string              `json:"path"`
-	Scheme     string              `json:"scheme"`
-	TLSConfig  *struct {
-		InsecureSkipVerify bool `json:"insecureSkipVerify"`
+	Port          string              `json:"port"`
+	TargetPort    *intstr.IntOrString `json:"targetPort"`
+	Path          string              `json:"path"`
+	Scheme        string              `json:"scheme"`
+	Interval      string              `json:"interval"`
+	ScrapeTimeout string              `json:"scrapeTimeout"`
+	TLSConfig     *struct {
+		InsecureSkipVerify bool            `json:"insecureSkipVerify"`
+		CA                 json.RawMessage `json:"ca"`
+		Cert               json.RawMessage `json:"cert"`
+		KeySecret          json.RawMessage `json:"keySecret"`
+		ServerName         string          `json:"serverName"`
 	} `json:"tlsConfig"`
+	// Parsed only to be REPORTED as uninterpreted (see Endpoint.Ignored).
+	BasicAuth         json.RawMessage `json:"basicAuth"`
+	Authorization     json.RawMessage `json:"authorization"`
+	OAuth2            json.RawMessage `json:"oauth2"`
+	ProxyURL          string          `json:"proxyUrl"`
+	Params            json.RawMessage `json:"params"`
+	HonorLabels       *bool           `json:"honorLabels"`
+	Relabelings       json.RawMessage `json:"relabelings"`
 	BearerTokenSecret *struct {
 		Name string `json:"name"`
 		Key  string `json:"key"`
@@ -78,10 +106,43 @@ type endpointSpec struct {
 	} `json:"metricRelabelings"`
 }
 
+// ignoredFields lists the endpoint fields that are set but not interpreted.
+func (ep endpointSpec) ignoredFields() []string {
+	var out []string
+	add := func(name string, set bool) {
+		if set {
+			out = append(out, name)
+		}
+	}
+	add("basicAuth", len(ep.BasicAuth) > 0)
+	add("authorization", len(ep.Authorization) > 0)
+	add("oauth2", len(ep.OAuth2) > 0)
+	add("proxyUrl", ep.ProxyURL != "")
+	add("params", len(ep.Params) > 0)
+	add("honorLabels", ep.HonorLabels != nil)
+	add("relabelings", len(ep.Relabelings) > 0)
+	if ep.TLSConfig != nil {
+		add("tlsConfig.ca", len(ep.TLSConfig.CA) > 0)
+		add("tlsConfig.cert", len(ep.TLSConfig.Cert) > 0)
+		add("tlsConfig.keySecret", len(ep.TLSConfig.KeySecret) > 0)
+		add("tlsConfig.serverName", ep.TLSConfig.ServerName != "")
+	}
+	for _, r := range ep.MetricRelabelings {
+		if r.Action != "keep" && r.Action != "drop" {
+			out = append(out, "metricRelabelings.action="+r.Action)
+		}
+	}
+	return out
+}
+
 // toEndpoint converts the spec shape (BearerSecret namespace filled by the
 // caller).
 func (ep endpointSpec) toEndpoint() Endpoint {
-	out := Endpoint{Port: ep.Port, TargetPort: ep.TargetPort, Path: ep.Path, Scheme: ep.Scheme}
+	out := Endpoint{
+		Port: ep.Port, TargetPort: ep.TargetPort, Path: ep.Path, Scheme: ep.Scheme,
+		Interval: ep.Interval, ScrapeTimeout: ep.ScrapeTimeout,
+		Ignored: ep.ignoredFields(),
+	}
 	if ep.TLSConfig != nil {
 		out.InsecureSkipVerify = ep.TLSConfig.InsecureSkipVerify
 	}
@@ -243,4 +304,47 @@ func (x *Index) AuthSecretRefs() map[string]struct{} {
 		}
 	}
 	return out
+}
+
+// IgnoredFields returns the distinct endpoint fields present on these
+// endpoints that kubescrape does not interpret, sorted.
+//
+// kubescrape deliberately implements a SUBSET of the ServiceMonitor and
+// PodMonitor spec, which is fine — but a partially-applied CR must not be
+// silent. An operator who applies a monitor with `relabelings` renaming a
+// label, or a `sampleLimit` guarding against a cardinality bomb, otherwise
+// sees targets appear and never learns those clauses did nothing.
+func IgnoredFields(eps []Endpoint) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, ep := range eps {
+		for _, f := range ep.Ignored {
+			if !seen[f] {
+				seen[f] = true
+				out = append(out, f)
+			}
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// Endpoints returns a stored ServiceMonitor's endpoints (nil when absent).
+func (ix *Index) Endpoints(namespace, name string) []Endpoint {
+	ix.mu.RLock()
+	defer ix.mu.RUnlock()
+	if m := ix.monitors[namespace+"/"+name]; m != nil {
+		return m.Endpoints
+	}
+	return nil
+}
+
+// PodEndpoints returns a stored PodMonitor's endpoints (nil when absent).
+func (ix *Index) PodEndpoints(namespace, name string) []Endpoint {
+	ix.mu.RLock()
+	defer ix.mu.RUnlock()
+	if m := ix.podMonitors[namespace+"/"+name]; m != nil {
+		return m.Endpoints
+	}
+	return nil
 }

@@ -117,6 +117,16 @@ type Scraper struct {
 	// agent's GET /debug/targets (see status.go).
 	status atomic.Pointer[CycleStatus]
 
+	// Per-target scheduling: due holds each target's next scrape time and
+	// targetIntervals its resolved period (both keyed by URL, rebuilt every
+	// cycle so vanished targets drop out). warned dedupes per-target
+	// complaints. Written only by the cycle goroutine, but Run reads the
+	// intervals to size its ticker, so they are guarded.
+	dueMu           sync.Mutex
+	due             map[string]time.Time
+	targetIntervals map[string]time.Duration
+	warned          map[string]bool
+
 	// insecureHTTP serves monitor endpoints with tlsConfig.insecureSkipVerify.
 	insecureHTTP *http.Client
 	// authCache holds monitor bearer tokens by "ns/name/key" ref (1-minute
@@ -223,18 +233,90 @@ func (s *Scraper) authToken(ctx context.Context, ref string) (string, error) {
 	return token, nil
 }
 
-// Run scrapes every Interval until ctx is done. The first cycle starts
-// immediately.
+// Run scrapes until ctx is done; the first cycle starts immediately.
+//
+// The loop ticks at the FINEST cadence any target asks for (never longer than
+// -scrape-interval): a monitor endpoint may set its own `interval`, and each
+// target is scraped only when its own period has elapsed (see cycle). With no
+// per-target intervals this is exactly a -scrape-interval ticker.
 func (s *Scraper) Run(ctx context.Context) {
-	ticker := time.NewTicker(s.cfg.Interval)
+	tick := s.cfg.Interval
+	ticker := time.NewTicker(tick)
 	defer ticker.Stop()
 	for {
 		s.cycle(ctx)
+		if want := s.tickInterval(); want != tick {
+			tick = want
+			ticker.Reset(tick)
+		}
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
 		}
+	}
+}
+
+// tickInterval is the loop period: the smallest interval any target requested,
+// floored at 1s so a nonsense CR cannot spin the scraper.
+func (s *Scraper) tickInterval() time.Duration {
+	s.dueMu.Lock()
+	defer s.dueMu.Unlock()
+	out := s.cfg.Interval
+	for _, iv := range s.targetIntervals {
+		if iv > 0 && iv < out {
+			out = iv
+		}
+	}
+	return max(out, time.Second)
+}
+
+// targetInterval resolves a target's effective scrape period: its own
+// `interval` when the monitor set a valid one, else the agent's default. An
+// unparseable value is reported once and falls back rather than failing the
+// target — the CR is the user's, and dropping their metrics over a typo in an
+// optional field is worse than scraping it at the default cadence.
+func (s *Scraper) targetInterval(t kubemeta.ScrapeTarget) time.Duration {
+	if t.Interval == "" {
+		return s.cfg.Interval
+	}
+	d, err := time.ParseDuration(t.Interval)
+	if err != nil || d <= 0 {
+		s.warnOnce("interval:"+t.URL, "ignoring invalid scrape interval on target",
+			"url", t.URL, "monitor", t.Monitor, "interval", t.Interval)
+		return s.cfg.Interval
+	}
+	return d
+}
+
+// targetTimeout resolves a target's per-scrape timeout, clamped to its own
+// interval: a scrape outliving its period would overlap the next one.
+func (s *Scraper) targetTimeout(t kubemeta.ScrapeTarget, interval time.Duration) time.Duration {
+	out := s.cfg.Timeout
+	if t.ScrapeTimeout != "" {
+		d, err := time.ParseDuration(t.ScrapeTimeout)
+		if err != nil || d <= 0 {
+			s.warnOnce("timeout:"+t.URL, "ignoring invalid scrape timeout on target",
+				"url", t.URL, "monitor", t.Monitor, "scrapeTimeout", t.ScrapeTimeout)
+		} else {
+			out = d
+		}
+	}
+	return min(out, interval)
+}
+
+// warnOnce logs a per-key message at most once per process, for per-target
+// complaints that would otherwise repeat every cycle forever.
+func (s *Scraper) warnOnce(key, msg string, args ...any) {
+	s.dueMu.Lock()
+	if s.warned == nil {
+		s.warned = map[string]bool{}
+	}
+	seen := s.warned[key]
+	s.warned[key] = true
+	s.dueMu.Unlock()
+	if !seen {
+		s.log.Warn(msg, args...)
 	}
 }
 
@@ -305,20 +387,59 @@ func (s *Scraper) cycle(ctx context.Context) {
 		}
 	}
 
+	// Per-target cadence. ONLY targets whose monitor set its own `interval` are
+	// scheduled; everything else is scraped every cycle exactly as before, so
+	// the default path keeps its old semantics and cannot be skipped by clock
+	// jitter between the ticker and a due time. The maps are rebuilt from the
+	// current target list each cycle, so a vanished target takes its schedule
+	// with it.
+	now := time.Now()
+	due := make(map[string]time.Time, len(targets))
+	intervals := make(map[string]time.Duration, len(targets))
 	for i := range targets {
 		t := targets[i]
+		iv := s.cfg.Interval
+		if t.Interval != "" {
+			iv = s.targetInterval(t)
+			intervals[t.URL] = iv
+			// Tolerance: the loop ticks at the finest requested cadence, so a
+			// tick landing a hair early must still scrape rather than defer a
+			// whole period.
+			if next, ok := s.dueAt(t.URL); ok && now.Add(iv/10).Before(next) {
+				due[t.URL] = next
+				continue
+			}
+			due[t.URL] = now.Add(iv)
+		}
+		timeout := s.targetTimeout(t, iv)
 		if !spawn(pipelineTargets, t.URL, &t, func(ctx context.Context) (int, error) {
-			return s.scrapeTarget(ctx, t)
+			return s.scrapeTarget(ctx, t, timeout)
 		}) {
 			break // ctx done; join what already started
 		}
 	}
+	s.setSchedule(due, intervals)
 	wg.Wait()
 
 	s.publishStatus(outcomes, time.Now())
 	if s.cfg.HealthMetrics && len(outcomes) > 0 && ctx.Err() == nil {
 		s.exportHealth(ctx, outcomes)
 	}
+}
+
+// dueAt returns a target's next scheduled scrape time.
+func (s *Scraper) dueAt(url string) (time.Time, bool) {
+	s.dueMu.Lock()
+	defer s.dueMu.Unlock()
+	t, ok := s.due[url]
+	return t, ok
+}
+
+// setSchedule replaces the per-target schedule with this cycle's.
+func (s *Scraper) setSchedule(due map[string]time.Time, intervals map[string]time.Duration) {
+	s.dueMu.Lock()
+	defer s.dueMu.Unlock()
+	s.due, s.targetIntervals = due, intervals
 }
 
 // scrapeOutcome is the health record of one scrape.
@@ -413,8 +534,8 @@ func (s *Scraper) resolveContext(ctx context.Context, containerID, namespace, po
 	return actx, false
 }
 
-func (s *Scraper) scrapeTarget(ctx context.Context, t kubemeta.ScrapeTarget) (int, error) {
-	ctx, cancel := context.WithTimeout(ctx, s.cfg.Timeout)
+func (s *Scraper) scrapeTarget(ctx context.Context, t kubemeta.ScrapeTarget, timeout time.Duration) (int, error) {
+	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, t.URL, nil)

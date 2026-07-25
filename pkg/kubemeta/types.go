@@ -127,6 +127,14 @@ type ScrapeTarget struct {
 	// agents resolve it via GET /v1/scrape-auth/{ns}/{name}/{key} (served
 	// only when the metadata service runs with -scrape-auth-secrets).
 	AuthSecret string `json:"authSecret,omitempty"`
+	// Interval and ScrapeTimeout override the agent's -scrape-interval and
+	// -scrape-timeout for this target (Go duration strings; empty = the agent's
+	// default). Set from a ServiceMonitor/PodMonitor endpoint's own cadence.
+	Interval string `json:"interval,omitempty"`
+	// ScrapeTimeout bounds one scrape of this target; it is clamped to the
+	// effective interval by the agent, since a scrape outliving its own period
+	// would overlap the next one.
+	ScrapeTimeout string `json:"scrapeTimeout,omitempty"`
 	// MetricRelabelings is the keep/drop subset of the endpoint's
 	// metricRelabelings, applied per sample by the agent.
 	MetricRelabelings []RelabelRule `json:"metricRelabelings,omitempty"`

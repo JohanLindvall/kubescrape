@@ -14,6 +14,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -147,7 +148,9 @@ func startServiceMonitors(ctx context.Context, cfg *rest.Config, disco discovery
 		func(u *unstructured.Unstructured) {
 			if err := monitors.Upsert(u); err != nil {
 				log.Warn("parsing servicemonitor", "error", err)
+				return
 			}
+			warnIgnored(log, "servicemonitor", u, monitors.Endpoints(u.GetNamespace(), u.GetName()))
 		},
 		func(u *unstructured.Unstructured) { monitors.Delete(u.GetNamespace(), u.GetName()) },
 	)); err != nil {
@@ -162,7 +165,9 @@ func startServiceMonitors(ctx context.Context, cfg *rest.Config, disco discovery
 			func(u *unstructured.Unstructured) {
 				if err := monitors.UpsertPodMonitor(u); err != nil {
 					log.Warn("parsing podmonitor", "error", err)
+					return
 				}
+				warnIgnored(log, "podmonitor", u, monitors.PodEndpoints(u.GetNamespace(), u.GetName()))
 			},
 			func(u *unstructured.Unstructured) { monitors.DeletePodMonitor(u.GetNamespace(), u.GetName()) },
 		)); err != nil {
@@ -495,4 +500,18 @@ func stripManagedFields(obj any) (any, error) {
 		acc.SetManagedFields(nil)
 	}
 	return obj, nil
+}
+
+// warnIgnored reports the endpoint fields of a monitor that kubescrape parsed
+// but does not interpret. Implementing a documented SUBSET of the CRD is a
+// deliberate choice; applying part of a user's CR without saying so is not —
+// they would see targets appear and never learn that their relabelings or
+// sampleLimit did nothing.
+func warnIgnored(log *slog.Logger, kind string, u *unstructured.Unstructured, eps []servicemonitors.Endpoint) {
+	if fields := servicemonitors.IgnoredFields(eps); len(fields) > 0 {
+		obs.MonitorFieldsIgnored.WithLabelValues(kind).Inc()
+		log.Warn("monitor uses fields kubescrape does not interpret; those clauses have no effect",
+			"kind", kind, "monitor", u.GetNamespace()+"/"+u.GetName(),
+			"fields", strings.Join(fields, ","))
+	}
 }

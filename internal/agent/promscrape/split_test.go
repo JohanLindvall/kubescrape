@@ -48,7 +48,7 @@ kube_b_metric{namespace="ns1",extra="e2",other="o2"} 2
 		Targets: staticTargets{target}, Exporter: exp, StartTime: time.Now(),
 		Splitters: sp, Kubelet: KubeletConfig{Meta: &fakeMetaSource{}},
 	})
-	if _, err := s.scrapeTarget(context.Background(), target); err != nil {
+	if _, err := s.scrapeTarget(context.Background(), target, s.cfg.Timeout); err != nil {
 		t.Fatal(err)
 	}
 	got := map[string]map[string]any{}
@@ -103,7 +103,7 @@ kube_namespace_labels{namespace="ns1",label_team="core"} 1
 			Splitters: ksmSplitters(t), Kubelet: KubeletConfig{Meta: &fakeMetaSource{}},
 			BatchPoints: batchPoints,
 		})
-		if _, err := s.scrapeTarget(context.Background(), target); err != nil {
+		if _, err := s.scrapeTarget(context.Background(), target, s.cfg.Timeout); err != nil {
 			t.Fatal(err)
 		}
 		return identitySeries(exp.batches)
@@ -200,7 +200,7 @@ func TestSplitChunkBytesRespectGRPCLimit(t *testing.T) {
 				Splitters: tc.splitters, Kubelet: KubeletConfig{Meta: tc.meta},
 				BatchPoints: tc.batchPoints,
 			})
-			if _, err := s.scrapeTarget(context.Background(), target); err != nil {
+			if _, err := s.scrapeTarget(context.Background(), target, s.cfg.Timeout); err != nil {
 				t.Fatal(err)
 			}
 			for i, md := range exp.batches {
@@ -288,7 +288,7 @@ func TestSplitterScrape(t *testing.T) {
 		Splitters: ksmSplitters(t),
 		Kubelet:   KubeletConfig{Meta: meta},
 	})
-	if _, err := s.scrapeTarget(context.Background(), target); err != nil {
+	if _, err := s.scrapeTarget(context.Background(), target, s.cfg.Timeout); err != nil {
 		t.Fatal(err)
 	}
 
@@ -403,7 +403,7 @@ func TestSplitterDatapointAttributesOverride(t *testing.T) {
 		Targets: staticTargets{target}, Exporter: exp, StartTime: time.Now(),
 		Splitters: sp, Kubelet: KubeletConfig{Meta: &fakeMetaSource{}},
 	})
-	if _, err := s.scrapeTarget(context.Background(), target); err != nil {
+	if _, err := s.scrapeTarget(context.Background(), target, s.cfg.Timeout); err != nil {
 		t.Fatal(err)
 	}
 	rms := exp.batches[0].ResourceMetrics()
@@ -436,7 +436,7 @@ func TestSplitterInstancePrefix(t *testing.T) {
 			Targets: staticTargets{target}, Exporter: exp, StartTime: time.Now(),
 			Splitters: sp, Kubelet: KubeletConfig{Meta: &fakeMetaSource{}},
 		})
-		if _, err := s.scrapeTarget(context.Background(), target); err != nil {
+		if _, err := s.scrapeTarget(context.Background(), target, s.cfg.Timeout); err != nil {
 			t.Fatal(err)
 		}
 		rms := exp.batches[0].ResourceMetrics()
@@ -521,7 +521,7 @@ kube_node_labels{node="node9",label_zone="eu-1"} 1
 		Targets: staticTargets{target}, Exporter: exp, StartTime: time.Now(),
 		Splitters: sp, Kubelet: KubeletConfig{Meta: &fakeMetaSource{}},
 	})
-	if _, err := s.scrapeTarget(context.Background(), target); err != nil {
+	if _, err := s.scrapeTarget(context.Background(), target, s.cfg.Timeout); err != nil {
 		t.Fatal(err)
 	}
 
@@ -580,7 +580,7 @@ func TestSplitterAttributesDontOverride(t *testing.T) {
 		Targets: staticTargets{target}, Exporter: exp, StartTime: time.Now(),
 		Splitters: sp, Kubelet: KubeletConfig{Meta: &fakeMetaSource{}},
 	})
-	if _, err := s.scrapeTarget(context.Background(), target); err != nil {
+	if _, err := s.scrapeTarget(context.Background(), target, s.cfg.Timeout); err != nil {
 		t.Fatal(err)
 	}
 	rms := exp.batches[0].ResourceMetrics()
@@ -635,7 +635,7 @@ kube_node_info{node="worker-1"} 1
 		Targets: staticTargets{target}, Exporter: exp, StartTime: time.Now(),
 		Splitters: sp, Kubelet: KubeletConfig{Meta: &fakeMetaSource{}},
 	})
-	if _, err := s.scrapeTarget(context.Background(), target); err != nil {
+	if _, err := s.scrapeTarget(context.Background(), target, s.cfg.Timeout); err != nil {
 		t.Fatal(err)
 	}
 
@@ -741,7 +741,7 @@ kube_pod_size_bytes_count{namespace="ns1",pod="pod1"} 8
 		Targets: staticTargets{target}, Exporter: exp, StartTime: time.Now(),
 		Splitters: sp, Kubelet: KubeletConfig{Meta: &fakeMetaSource{}},
 	})
-	if _, err := s.scrapeTarget(context.Background(), target); err != nil {
+	if _, err := s.scrapeTarget(context.Background(), target, s.cfg.Timeout); err != nil {
 		t.Fatal(err)
 	}
 

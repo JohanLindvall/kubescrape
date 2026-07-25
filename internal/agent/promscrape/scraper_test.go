@@ -212,7 +212,7 @@ func TestScrapeSampleLimit(t *testing.T) {
 		MaxSamples: 10, BatchPoints: 1000,
 		Targets: staticTargets{testTarget(srv.URL)}, Exporter: exp,
 	})
-	if _, err := s.scrapeTarget(context.Background(), testTarget(srv.URL)); err != ErrTooManySamples {
+	if _, err := s.scrapeTarget(context.Background(), testTarget(srv.URL), s.cfg.Timeout); err != ErrTooManySamples {
 		t.Fatalf("err = %v, want ErrTooManySamples", err)
 	}
 }
@@ -241,7 +241,7 @@ rpc_count 2000
 		Node: "node1", Interval: time.Hour, Timeout: 5 * time.Second,
 		Targets: staticTargets{testTarget(srv.URL)}, Exporter: exp, StartTime: time.Now(),
 	})
-	if _, err := s.scrapeTarget(context.Background(), testTarget(srv.URL)); err != nil {
+	if _, err := s.scrapeTarget(context.Background(), testTarget(srv.URL), s.cfg.Timeout); err != nil {
 		t.Fatal(err)
 	}
 	if len(exp.batches) != 1 {
@@ -354,7 +354,7 @@ func TestScrapeExemplars(t *testing.T) {
 		Node: "node1", Interval: time.Hour, Timeout: 5 * time.Second, Exemplars: true,
 		Targets: staticTargets{testTarget(srv.URL)}, Exporter: exp, StartTime: time.Now(),
 	})
-	if _, err := s.scrapeTarget(context.Background(), testTarget(srv.URL)); err != nil {
+	if _, err := s.scrapeTarget(context.Background(), testTarget(srv.URL), s.cfg.Timeout); err != nil {
 		t.Fatal(err)
 	}
 	if !strings.Contains(gotAccept, "openmetrics") {
@@ -403,7 +403,7 @@ func TestScrapeExemplarsDisabled(t *testing.T) {
 		Node: "node1", Interval: time.Hour, Timeout: 5 * time.Second,
 		Targets: staticTargets{testTarget(srv.URL)}, Exporter: exp, StartTime: time.Now(),
 	})
-	if _, err := s.scrapeTarget(context.Background(), testTarget(srv.URL)); err != nil {
+	if _, err := s.scrapeTarget(context.Background(), testTarget(srv.URL), s.cfg.Timeout); err != nil {
 		t.Fatal(err)
 	}
 	if strings.Contains(gotAccept, "openmetrics") {
@@ -438,7 +438,7 @@ func TestScrapeAttrFilter(t *testing.T) {
 		Targets: staticTargets{target}, Exporter: exp, StartTime: time.Now(),
 		Attrs: &attrs.Builders{Targets: builder},
 	})
-	if _, err := s.scrapeTarget(context.Background(), target); err != nil {
+	if _, err := s.scrapeTarget(context.Background(), target, s.cfg.Timeout); err != nil {
 		t.Fatal(err)
 	}
 	got := exp.batches[0].ResourceMetrics().At(0).Resource().Attributes()
@@ -470,7 +470,7 @@ func TestScrapeHTTPError(t *testing.T) {
 		Node: "node1", Interval: time.Hour, Timeout: 5 * time.Second,
 		Targets: staticTargets{testTarget(srv.URL)}, Exporter: exp,
 	})
-	if _, err := s.scrapeTarget(context.Background(), testTarget(srv.URL)); err == nil {
+	if _, err := s.scrapeTarget(context.Background(), testTarget(srv.URL), s.cfg.Timeout); err == nil {
 		t.Fatal("expected error for 503 response")
 	}
 	if len(exp.batches) != 0 {

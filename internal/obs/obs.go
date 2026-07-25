@@ -37,6 +37,13 @@ var (
 		"Per-file line rate limit hits: lines discarded (action=drop) or reads paused (action=pause).", "action")
 	LogRulesDropped = Registry.Counter("kubescrape_log_rules_dropped_total",
 		"Log records dropped by the logs rules (including sampled-away lines).")
+	// MonitorFieldsIgnored counts ServiceMonitor/PodMonitor upserts carrying
+	// endpoint fields kubescrape does not interpret — the metric form of the
+	// startup warning, so a partially-applied CR is alertable and not just
+	// visible in one pod's logs.
+	MonitorFieldsIgnored = Registry.CounterVec("kubescrape_monitor_fields_ignored_total",
+		"Monitor upserts whose endpoints set fields kubescrape does not interpret.", "kind")
+
 	BufferDropped = Registry.CounterVec("kubescrape_buffer_dropped_total",
 		"Buffered batches dropped after a permanent collector rejection (bad payload, auth, unimplemented).", "signal")
 	BufferRequeued = Registry.CounterVec("kubescrape_buffer_requeued_total",

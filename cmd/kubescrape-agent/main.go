@@ -95,6 +95,10 @@ var (
 	logLevel    = flag.String("log-level", "info", "log level: debug, info, warn, error")
 	logFormat   = flag.String("log-format", "text", "log format: text or json")
 
+	// One switch for all three log-producing paths. They were three separate
+	// flags (-logs-enrich/-journald-enrich/-ingest-logs-enrich) for one
+	// feature, all defaulting to true; nothing wanted them to disagree.
+	enrichOn          = flag.Bool("enrich", true, "parse per-line metadata (timestamp, severity, trace/span IDs, exception details) into the OTLP record fields via github.com/JohanLindvall/enrich, for container logs, journald and pushed OTLP log bodies alike")
 	logDir            = flag.String("log-dir", "/var/log/containers", "directory of containerd log symlinks (the default source when the config's logs section is unset)")
 	positionsFile     = flag.String("positions-file", "", "single file persisting BOTH log offsets and the journald cursor across restarts (empty disables persistence)")
 	logsBatch         = flag.Int("logs-batch-size", 1024, "flush logs after this many entries")
@@ -108,7 +112,6 @@ var (
 	logsRateDrop      = flag.Bool("logs-rate-drop", false, "discard lines over -logs-rate-limit instead of pausing the file")
 	logsIdleClose     = flag.Duration("logs-idle-close", 0, "close the fd of a fully-caught-up file after this much inactivity (0 = never, the default). The open fd is the only way to drain a rotated-away or deleted file, so enabling this trades the zero-loss guarantee for bounded fd usage")
 	logsUnknownFiles  = flag.String("logs-unknown-files", "auto", "where a file with no checkpoint entry starts at startup: end (skip as history), start (read whole), auto (start when the checkpoint store has entries — it appeared while the agent was down — else end)")
-	logsEnrich        = flag.Bool("logs-enrich", true, "parse per-line metadata (timestamp, severity, trace/span IDs, exception details) into the OTLP record fields via github.com/JohanLindvall/enrich")
 	logsFileAttrs     = flag.Bool("logs-file-attributes", false, "stamp log.file.name and log.file.position (byte offset) on every log record, for each file source")
 	bufferDir         = flag.String("buffer-dir", "", "directory for a disk-backed export buffer (logs and metrics); a collector outage spools here instead of pinning the tailer to old offsets or dropping metrics (empty disables)")
 	bufferMax         = flag.Int("buffer-max-bytes", 1<<30, "per-signal cap on the undelivered on-disk buffer; producers back-pressure (the tailer rewinds) when full")
@@ -119,13 +122,12 @@ var (
 	logsPoll          = flag.Duration("logs-poll-interval", 500*time.Millisecond, "fallback sweep interval for the log tailer")
 	logsFingerprint   = flag.Int("logs-fingerprint-bytes", 1024, "file-head hash length used with the inode as file identity (negative = inode only)")
 
-	journaldOn     = flag.Bool("journald", false, "read the systemd journal natively via libsystemd/sdjournal (the image must provide libsystemd)")
-	journaldDir    = flag.String("journald-dir", "", "read a specific journal directory; empty opens the default system journal")
-	journaldUnits  = flag.String("journald-units", "", "comma-separated systemd units to read (empty reads everything)")
-	journaldEnrich = flag.Bool("journald-enrich", true, "parse per-message metadata into the OTLP record fields (as -logs-enrich); an explicit level in the message wins over the journal priority")
-	journaldBatch  = flag.Int("journald-batch-size", 1024, "flush journal entries after this many")
-	journaldBytes  = flag.Int("journald-max-batch-bytes", 1<<20, "flush journal entries before a batch's summed message bytes exceed this")
-	journaldFlush  = flag.Duration("journald-flush-interval", 2*time.Second, "flush journal entries at least this often")
+	journaldOn    = flag.Bool("journald", false, "read the systemd journal natively via libsystemd/sdjournal (the image must provide libsystemd)")
+	journaldDir   = flag.String("journald-dir", "", "read a specific journal directory; empty opens the default system journal")
+	journaldUnits = flag.String("journald-units", "", "comma-separated systemd units to read (empty reads everything)")
+	journaldBatch = flag.Int("journald-batch-size", 1024, "flush journal entries after this many")
+	journaldBytes = flag.Int("journald-max-batch-bytes", 1<<20, "flush journal entries before a batch's summed message bytes exceed this")
+	journaldFlush = flag.Duration("journald-flush-interval", 2*time.Second, "flush journal entries at least this often")
 
 	scrapeInterval    = flag.Duration("scrape-interval", 30*time.Second, "Prometheus scrape interval")
 	scrapeTimeout     = flag.Duration("scrape-timeout", 15*time.Second, "per-target scrape timeout")
@@ -140,10 +142,7 @@ var (
 	kubeletToken    = flag.String("kubelet-token-file", "/var/run/secrets/kubernetes.io/serviceaccount/token", "bearer token file for the kubelet (re-read per scrape)")
 	kubeletInsecure = flag.Bool("kubelet-insecure-tls", true, "skip TLS verification for the kubelet (its serving certificate is typically self-signed)")
 
-	attrsEnable  = flag.String("resource-attrs-enable", "", "comma-separated anchored regexes; only matching resource attributes are exported (empty enables all)")
-	attrsDisable = flag.String("resource-attrs-disable", "", "comma-separated anchored regexes; matching resource attributes are dropped (empty disables none)")
-	attrsStatic  = flag.String("resource-attrs-static", "", "comma-separated key=value attributes added to every exported resource")
-	nodeRefresh  = flag.Duration("node-metadata-refresh", time.Minute, "refresh interval for the node's labels/annotations used in attribute templates (0 disables the lookup)")
+	nodeRefresh = flag.Duration("node-metadata-refresh", time.Minute, "refresh interval for the node's labels/annotations used in attribute templates (0 disables the lookup)")
 
 	// Pipeline toggles.
 	logsOn     = flag.Bool("logs", true, "tail container logs")
@@ -160,7 +159,6 @@ var (
 	ingestMetrics = flag.String("ingest-metrics-mode", "auto", "how pushed metrics resolve their object: resource (id on the resource), datapoint (id on each point, split into per-object resources), or auto")
 	ingestCidKeys = flag.String("ingest-container-id-keys", "container.id,k8s.container.id", "comma-separated attribute keys inspected for a container id")
 	ingestUIDKeys = flag.String("ingest-pod-uid-keys", "k8s.pod.uid", "comma-separated attribute keys inspected for a pod uid")
-	ingestEnrich  = flag.Bool("ingest-logs-enrich", true, "parse pushed log-record bodies for timestamp/severity/trace as -logs-enrich does, filling only fields the sender left unset")
 	ingestTraces  = flag.Bool("ingest-traces", true, "accept pushed traces (gRPC + /v1/traces), enrich their resources and pass them through")
 	spanMetrics   = flag.Bool("ingest-span-metrics", false, "derive RED (calls + duration histogram) metrics from ingested spans, dimensioned by service.name/span.name/span.kind/status.code; exported over OTLP (tune via the traceMetrics config section)")
 	spanMetricsIv = flag.Duration("ingest-span-metrics-interval", time.Minute, "export interval for span metrics")
@@ -249,7 +247,7 @@ func run() error {
 		fileCfg = *c
 	}
 
-	attrBuilders, err := buildAttrs(fileCfg.ResourceAttributes, *attrsStatic, *attrsEnable, *attrsDisable)
+	attrBuilders, err := buildAttrs(fileCfg.ResourceAttributes)
 	if err != nil {
 		return fmt.Errorf("resource attributes: %w", err)
 	}
@@ -585,7 +583,7 @@ func (p *pipelines) startLogs() (*tailer.Tailer, error) {
 		Rules:             logRules,
 		Multiline:         *multilineOn,
 		MultilineTimeout:  *multilineWait,
-		Enrich:            *logsEnrich,
+		Enrich:            *enrichOn,
 		FileAttributes:    *logsFileAttrs,
 		ExcludeNamespaces: splitList(*excludeNs),
 		Attrs:             p.attrBuilders.Logs,
@@ -618,7 +616,7 @@ func (p *pipelines) startJournald() {
 		MaxBatchBytes: *journaldBytes,
 		FlushInterval: *journaldFlush,
 		MaxEntryBytes: *maxEntryBytes,
-		Enrich:        *journaldEnrich,
+		Enrich:        *enrichOn,
 		LogAttrs:      p.logAttrs,
 		Scrub:         p.scrub,
 		Attrs:         p.attrBuilders.Journal,
@@ -647,7 +645,7 @@ func (p *pipelines) startIngest() error {
 		PodUIDKeys:      splitList(*ingestUIDKeys),
 		Wait:            *ingestWait,
 		MetricsMode:     p.ingestMode,
-		EnrichLines:     *ingestEnrich,
+		EnrichLines:     *enrichOn,
 		Scrub:           p.scrub,
 		PeerIPFallback:  *ingestPeerIP,
 		Attrs:           p.attrBuilders.Ingest,
@@ -909,25 +907,21 @@ func startNodeInfo(ctx context.Context, meta *metaclient.Client, nodeName string
 
 // buildAttrs assembles the per-pipeline resource-attribute builders from the
 // config file and the flags; flag statics override config statics.
-func buildAttrs(cfg *attrs.Config, static, enable, disable string) (*attrs.Builders, error) {
-	filter, err := attrs.NewFilter(enable, disable)
+// buildAttrs compiles the resource-attribute builders from the config's
+// resourceAttributes section. The former -resource-attrs-static/-enable/
+// -disable flags are gone: static duplicated resourceAttributes.static
+// verbatim (it was merged into the very same field), and enable/disable were
+// the only attribute knobs NOT in the config section, so they could not vary
+// with the rest of it and their comma-separated form could not express a
+// pattern containing a comma.
+func buildAttrs(cfg *attrs.Config) (*attrs.Builders, error) {
+	var enable, disable []string
+	if cfg != nil {
+		enable, disable = cfg.Enable, cfg.Disable
+	}
+	filter, err := attrs.NewFilterFromLists(enable, disable)
 	if err != nil {
 		return nil, err
-	}
-	flagStatic, err := attrs.ParseStatic(static)
-	if err != nil {
-		return nil, err
-	}
-	if flagStatic != nil {
-		if cfg == nil {
-			cfg = &attrs.Config{}
-		}
-		if cfg.Static == nil {
-			cfg.Static = map[string]string{}
-		}
-		for k, v := range flagStatic {
-			cfg.Static[k] = v
-		}
 	}
 	return attrs.NewBuilders(cfg, filter)
 }

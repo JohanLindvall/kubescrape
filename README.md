@@ -417,7 +417,8 @@ costs a few substring scans and zero allocations. Redactions count into
 regex fails startup (a scrubber that silently skips a pattern is a
 compliance bug).
 
-**Log enrichment** (`-logs-enrich`, default true). Each exported line is run
+**Log enrichment** (`-enrich`, default true — one switch covering container
+logs, journald and pushed OTLP log bodies). Each exported line is run
 through [JohanLindvall/enrich](https://github.com/JohanLindvall/enrich),
 which recognizes JSON (Serilog/Pino/Envoy/Azure envelopes and common key
 spellings), logfmt, and a table of plain-text formats (nginx, klog, redis,
@@ -634,8 +635,8 @@ at-least-once: the cursor of the newest exported entry is persisted (via
 `-positions-file`) only after a successful export, and on export failure or a
 reader error it restarts from the committed cursor with backoff.
 `-journald-units` restricts to specific units and `-journald-dir` reads a
-non-default journal directory (e.g. `/run/log/journal`). `-journald-enrich`
-(default true) applies the same per-line enrichment as `-logs-enrich`; an
+non-default journal directory (e.g. `/run/log/journal`). `-enrich`
+(default true) applies the same per-line enrichment here as to container logs; an
 explicit level found in the message wins over the journal priority.
 
 **OTLP ingest** (opt-in `-ingest`). Applications on the node can push their
@@ -653,7 +654,7 @@ For each pushed resource it finds a container ID (`container.id` /
 the metadata service (a container ID pins the exact incarnation), and merges
 the k8s resource attributes **without overwriting anything the sender already
 set**. Pushed log bodies additionally run the same line enrichment as the
-tailer (`-ingest-logs-enrich`, filling only fields the sender left unset).
+tailer (`-enrich`, filling only fields the sender left unset).
 Metrics resolve per `-ingest-metrics-mode`: `resource` (the ID is a resource
 attribute), `datapoint` (the ID is a per-point label; points are split into
 one resource per object, as a kube-state-metrics-style stream needs), or
@@ -743,7 +744,7 @@ derives, for Prometheus/Mimir, `service.namespace` = the k8s namespace and
 namespace/pod[/container], node) — so `job` = `service.namespace/service.name`
 and `instance` are unique. Both are omitted when a template sets them. Pods
 also carry `k8s.pod.ip` as a resource attribute (accessible in templates as
-`.Pod.PodIP`; drop it via `-resource-attrs-disable` if unwanted).
+`.Pod.PodIP`; drop it via `resourceAttributes.disable` if unwanted).
 
 An optional `instancePrefix` prepends `prefix-` to the derived
 `service.instance.id`. It defaults to `cadvisor` for the cadvisor pipeline (and
@@ -753,14 +754,20 @@ describing exporters — whose resources share the pod's `service.name`/namespac
 pipeline (or per splitter rule); `""` disables it. An explicit pipeline setting
 wins over the built-in default, which wins over a top-level `instancePrefix`.
 
-* `-resource-attrs-enable` / `-resource-attrs-disable` — comma-separated
-  regexes matched against the full attribute key (anchored). An attribute is
-  exported when it matches the enable set (empty = enable all) and does not
-  match the disable set (empty = disable none), e.g.
-  `-resource-attrs-disable='k8s\.pod\.label\..*,k8s\.namespace\.label\..*'`
-  drops all label attributes.
-* `-resource-attrs-static=cluster=prod,env=eu` — fixed attributes added to
-  every exported resource.
+* `resourceAttributes.enable` / `.disable` — anchored regex **lists** matched
+  against the full attribute key. An attribute is exported when it matches the
+  enable list (empty = enable all) and does not match the disable list (empty =
+  disable none). Because they are lists, a pattern may contain a comma. Both
+  are global (top level only): the filter is shared by every pipeline, so a
+  pipeline section setting them is rejected rather than silently ignored.
+
+  ```yaml
+  resourceAttributes:
+    static: {cluster: prod, env: eu}   # fixed attributes on every resource
+    disable:
+      - 'k8s\.pod\.label\..*'
+      - 'k8s\.namespace\.label\..*'
+  ```
 * `resourceAttributes` section of `-config` — full control, including template
   attributes built from the node/pod/container/service metadata and
   per-pipeline overrides:

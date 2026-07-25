@@ -1,3 +1,17 @@
+{{/*
+  agentConfig merges the staticAttrs convenience value into the unified config's
+  resourceAttributes.static. It used to render the -resource-attrs-static flag,
+  which the agent dropped: static attributes now live only in the config
+  section they were always merged into. An explicit config value wins over
+  staticAttrs.
+*/}}
+{{- $cfg := .Values.agent.config | default dict }}
+{{- if .Values.agent.staticAttrs }}
+{{-   $ra := (get $cfg "resourceAttributes") | default dict }}
+{{-   $static := merge (deepCopy ((get $ra "static") | default dict)) .Values.agent.staticAttrs }}
+{{-   $ra = merge (dict "static" $static) (deepCopy $ra) }}
+{{-   $cfg = merge (dict "resourceAttributes" $ra) (deepCopy $cfg) }}
+{{- end }}
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -29,7 +43,7 @@ subjects:
   - kind: ServiceAccount
     name: {{ .Release.Name }}-agent
     namespace: {{ .Release.Namespace }}
-{{- if .Values.agent.config }}
+{{- if $cfg }}
 ---
 apiVersion: v1
 kind: ConfigMap
@@ -39,7 +53,7 @@ metadata:
   labels: {{ include "kubescrape.labels" . | nindent 4 }}
 data:
   config.yaml: |
-    {{- toYaml .Values.agent.config | nindent 4 }}
+    {{- toYaml $cfg | nindent 4 }}
 {{- end }}
 ---
 apiVersion: apps/v1
@@ -59,7 +73,7 @@ spec:
       labels:
         app: {{ .Release.Name }}-agent
       annotations:
-        checksum/config: {{ .Values.agent.config | toYaml | sha256sum }}
+        checksum/config: {{ $cfg | toYaml | sha256sum }}
     spec:
       serviceAccountName: {{ .Release.Name }}-agent
       tolerations:
@@ -103,7 +117,7 @@ spec:
             {{- end }}
             - -kubelet-insecure-tls={{ .Values.agent.kubeletInsecureTLS }}
             - -positions-file={{ .Values.agent.positionsFile }}
-            - -logs-enrich={{ .Values.agent.logsEnrich }}
+            - -enrich={{ .Values.agent.enrich }}
             - -logs-file-attributes={{ .Values.agent.logsFileAttributes }}
             {{- if .Values.agent.logsRateLimit }}
             - -logs-rate-limit={{ .Values.agent.logsRateLimit }}
@@ -116,7 +130,7 @@ spec:
             - -buffer-dir={{ . }}
             - -buffer-max-bytes={{ int64 $.Values.agent.bufferMaxBytes }}
             {{- end }}
-            {{- if .Values.agent.config }}
+            {{- if $cfg }}
             - -config=/etc/kubescrape/config/config.yaml
             {{- end }}
             {{- with .Values.agent.logsMetrics.interval }}
@@ -147,14 +161,12 @@ spec:
             - -journald-batch-size={{ int64 .Values.agent.journald.batchSize }}
             - -journald-max-batch-bytes={{ int64 .Values.agent.journald.maxBatchBytes }}
             - -journald-flush-interval={{ .Values.agent.journald.flushInterval }}
-            - -journald-enrich={{ .Values.agent.journald.enrich }}
             {{- end }}
             {{- if .Values.agent.ingest.enabled }}
             - -ingest
             - -ingest-grpc-endpoint={{ .Values.agent.ingest.grpcEndpoint }}
             - -ingest-http-endpoint={{ .Values.agent.ingest.httpEndpoint }}
             - -ingest-metrics-mode={{ .Values.agent.ingest.metricsMode }}
-            - -ingest-logs-enrich={{ .Values.agent.ingest.logsEnrich }}
             - -ingest-traces={{ .Values.agent.ingest.traces }}
             {{- if .Values.agent.ingest.spanMetrics }}
             - -ingest-span-metrics
@@ -175,14 +187,6 @@ spec:
             {{- end }}
             - -log-level={{ .Values.logLevel }}
             - -log-format={{ .Values.logFormat }}
-            {{- if .Values.agent.staticAttrs }}
-            - -resource-attrs-static=
-              {{- $pairs := list }}
-              {{- range $k, $v := .Values.agent.staticAttrs }}
-              {{- $pairs = append $pairs (printf "%s=%s" $k $v) }}
-              {{- end }}
-              {{- join "," $pairs }}
-            {{- end }}
             {{- range .Values.agent.extraArgs }}
             - {{ . }}
             {{- end }}

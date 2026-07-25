@@ -82,8 +82,6 @@ agent:
     batchSize: 1024
     maxBatchBytes: 1048576  # flush before a batch's summed message bytes exceed this
     flushInterval: 2s
-    # As logsEnrich; a level in the message wins over the journal priority.
-    enrich: true
     # NOTE: journald cursor persistence requires agent.positionsFile to be set
     # (there is no standalone journald cursor file); without it, every restart
     # begins at the journal tail.
@@ -95,7 +93,6 @@ agent:
     grpcEndpoint: ":4317"       # empty disables gRPC
     httpEndpoint: ":4318"       # empty disables HTTP (/v1/logs, /v1/metrics, /v1/traces)
     metricsMode: auto           # resource | datapoint | auto
-    logsEnrich: true            # parse pushed log bodies (fills only unset fields)
     traces: true                # accept pushed traces, enrich resources, pass through
     # Derive RED metrics from ingested spans (calls counter, size counter,
     # duration histogram with trace-id exemplars), dimensioned by
@@ -150,8 +147,9 @@ agent:
   # restarts (empty disables persistence).
   positionsFile: /var/lib/kubescrape-agent/positions.json
   # Parse per-line metadata (timestamp, severity, trace/span IDs, exception
-  # details) into the OTLP record fields (JohanLindvall/enrich).
-  logsEnrich: true
+  # details) into the OTLP record fields (JohanLindvall/enrich). One switch for
+  # container logs, journald and pushed OTLP log bodies alike.
+  enrich: true
   # Per-file line rate limit (lines/second, 0 disables). Exhausted files
   # pause (no loss, backlog stays on disk) unless logsRateDrop discards.
   logsRateLimit: 0
@@ -226,7 +224,8 @@ agent:
   scrapeHealthMetrics: true
 
   # Static resource attributes (key: value), e.g. cluster: prod-eu. Merged into
-  # config.resourceAttributes.static via -resource-attrs-static.
+  # config.resourceAttributes.static (an explicit value there wins). Attribute
+  # keep/drop lists live in that same section as `enable:`/`disable:`.
   staticAttrs: {}
 
   # Less-common agent flags go here, e.g.:

@@ -353,19 +353,3 @@ func TestLoadConfigPipelineValidation(t *testing.T) {
 		t.Fatal("unknown pipeline name must error")
 	}
 }
-
-func TestParseStatic(t *testing.T) {
-	got, err := ParseStatic("a=1, b=x=y ,")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got["a"] != "1" || got["b"] != "x=y" {
-		t.Fatalf("got %v", got)
-	}
-	if m, err := ParseStatic(""); err != nil || m != nil {
-		t.Fatalf("empty input: %v %v", m, err)
-	}
-	if _, err := ParseStatic("novalue"); err == nil {
-		t.Fatal("missing '=' must error")
-	}
-}

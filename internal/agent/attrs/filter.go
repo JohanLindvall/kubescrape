@@ -41,16 +41,46 @@ func NewFilter(enable, disable string) (*Filter, error) {
 // compileSet turns a comma-separated pattern list into one fully anchored
 // alternation; nil for an empty list.
 func compileSet(patterns string) (*regexp.Regexp, error) {
+	parts := strings.Split(patterns, ",")
+	for _, p := range parts {
+		if p = strings.TrimSpace(p); p == "" {
+			continue
+		}
+		// A regex containing a comma (e.g. `.{1,3}`) splits into fragments that
+		// RE2 still compiles — as literal braces — so an enable filter would
+		// silently drop every intended attribute. Unbalanced brackets are the
+		// fragment fingerprint; reject them loudly. The LIST form has no such
+		// hazard and skips this check.
+		if err := checkBalanced(p); err != nil {
+			return nil, fmt.Errorf("pattern %q: %w (commas split this string — use the config's list form, which allows commas inside a pattern)", p, err)
+		}
+	}
+	return compileList(parts)
+}
+
+// NewFilterFromLists compiles a filter from regex LISTS — the config form.
+// Preferred over NewFilter: a YAML list needs no comma splitting, so a pattern
+// may itself contain a comma (`.{1,3}`), which the comma-separated flag form
+// could not express at all.
+func NewFilterFromLists(enable, disable []string) (*Filter, error) {
+	f := &Filter{}
+	var err error
+	if f.enable, err = compileList(enable); err != nil {
+		return nil, fmt.Errorf("enable patterns: %w", err)
+	}
+	if f.disable, err = compileList(disable); err != nil {
+		return nil, fmt.Errorf("disable patterns: %w", err)
+	}
+	if f.enable == nil && f.disable == nil {
+		return nil, nil // keep-everything filters stay nil (no-op fast path)
+	}
+	return f, nil
+}
+
+func compileList(patterns []string) (*regexp.Regexp, error) {
 	var parts []string
-	for _, p := range strings.Split(patterns, ",") {
+	for _, p := range patterns {
 		if p = strings.TrimSpace(p); p != "" {
-			// A regex containing a comma (e.g. `.{1,3}`) splits into fragments
-			// that RE2 still compiles — as literal braces — so an enable filter
-			// would silently drop every intended attribute. Unbalanced brackets
-			// are the fragment fingerprint; reject them loudly at startup.
-			if err := checkBalanced(p); err != nil {
-				return nil, fmt.Errorf("pattern %q: %w (commas split the list — a regex must not contain one; use `.{2}` forms without commas or multiple patterns)", p, err)
-			}
 			parts = append(parts, "(?:"+p+")")
 		}
 	}

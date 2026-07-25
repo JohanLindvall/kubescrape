@@ -169,7 +169,7 @@ cluster-name-prefix rule for shared tenants). Placement nuances:
   `set_otel_attrs` datapoint/resource split.
 * `k8s.pod.ip` is a **resource** attribute here (a deliberate deviation:
   cmb-alloy demotes it to a datapoint attribute); drop it with
-  `-resource-attrs-disable='k8s\.pod\.ip'` if your backend treats pod IPs
+  `resourceAttributes.disable: ['k8s\.pod\.ip']` if your backend treats pod IPs
   as identity-breaking.
 
 The `service.name` / `platform.product.name` label chains and
@@ -200,9 +200,9 @@ Namespace-based defaulting uses `regexMatch`:
           {{ with .Pod }}{{ if regexMatch "^tigera-operator$|-system$" .Namespace }}gp-infrastructure{{ end }}{{ end }}
 ```
 
-Unwanted attributes are removed with `-resource-attrs-disable` (the
+Unwanted attributes are removed with `resourceAttributes.disable` (the
 `delete_key` transforms), e.g. `agent.extraArgs:
-["-resource-attrs-disable=k8s\\.pod\\.label\\..*"]`. `net.host.name`/
+`resourceAttributes.disable: ['k8s\.pod\.label\..*']`. `net.host.name`/
 `net.host.port` never exist here, so their deletions have no equivalent.
 
 ### `output_otlp`

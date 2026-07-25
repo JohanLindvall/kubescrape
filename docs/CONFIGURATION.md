@@ -142,7 +142,7 @@ kubescrape-agent \
 | `-logs-max-entry-bytes` | `1MiB` | truncate assembled entries beyond this |
 | `-logs-multiline` | `true` | join stack traces (Go, Java, Python, .NET, Ruby, Rust, PHP) via [multiline](https://github.com/JohanLindvall/multiline) |
 | `-logs-multiline-timeout` | `1s` | flush incomplete multi-line groups after this long |
-| `-logs-enrich` | `true` | parse per-line metadata via [enrich](https://github.com/JohanLindvall/enrich): a timestamp in the line replaces the CRI time, an explicit level sets the severity, trace/span IDs fill the OTLP trace fields, exception/template/source-context details become record attributes. JSON, logfmt and common plain-text formats are recognized; the body is never modified, and plain-text stack traces are not duplicated into `exception.stacktrace`. Hit rates: `kubescrape_log_enriched_total{format}` in the self-metrics |
+| `-enrich` | `true` | parse per-line metadata via [enrich](https://github.com/JohanLindvall/enrich): a timestamp in the line replaces the CRI time, an explicit level sets the severity, trace/span IDs fill the OTLP trace fields, exception/template/source-context details become record attributes. JSON, logfmt and common plain-text formats are recognized; the body is never modified, and plain-text stack traces are not duplicated into `exception.stacktrace`. Hit rates: `kubescrape_log_enriched_total{format}` in the self-metrics |
 | `-logs-file-attributes` | `false` | stamp `log.file.name` (basename) and `log.file.position` (record start offset) on every record, for each file source |
 | `-buffer-dir` | — | directory for a disk-backed export buffer (logs **and** metrics); a collector outage spools here instead of pinning the tailer to old offsets / dropping metrics ([below](#disk-buffer)). Empty disables |
 | `-buffer-max-bytes` | `1GiB` | per-signal cap on the undelivered on-disk backlog; producers back-pressure (the tailer rewinds) when full |
@@ -206,7 +206,7 @@ pipeline; syslog priorities map to OTLP severities; `syslog.identifier` and
 | `-journald-batch-size` | `1024` | flush after this many entries |
 | `-journald-max-batch-bytes` | `1048576` | flush before a batch's summed message bytes exceed this |
 | `-journald-flush-interval` | `2s` | flush at least this often |
-| `-journald-enrich` | `true` | per-message enrichment as `-logs-enrich`; an explicit level in the message wins over the journal priority |
+| (`-enrich`) | `true` | per-message enrichment, same switch as container logs; an explicit level in the message wins over the journal priority |
 
 Delivery is at-least-once: the cursor is committed only after a successful
 export; on export failure or a reader error, it restarts from the committed
@@ -479,7 +479,7 @@ never overwrites an attribute the sender set.
 | `-ingest-grpc-endpoint` | `:4317` | OTLP/gRPC listen address; empty disables |
 | `-ingest-http-endpoint` | `:4318` | OTLP/HTTP protobuf listen address (`/v1/logs`, `/v1/metrics`); gzip `Content-Encoding` accepted; empty disables |
 | `-ingest-metrics-mode` | `auto` | `resource` (ID on the resource), `datapoint` (ID per point → split into per-object resources), or `auto` |
-| `-ingest-logs-enrich` | `true` | parse pushed log bodies as `-logs-enrich`, filling only fields the sender left unset |
+| (`-enrich`) | `true` | parse pushed log bodies with the same switch, filling only fields the sender left unset |
 | `-ingest-traces` | `true` | accept pushed traces (gRPC + `/v1/traces`), enrich their resources the same way, and pass them through (traces bypass the disk buffer — the pushing sender owns retry) |
 | `-ingest-span-metrics` | `false` | derive RED metrics from ingested spans (OTel spanmetrics conventions: `traces.span.metrics.calls`/`.size`/`.duration` with per-bucket trace-id exemplars), dimensioned by `service.name`/`span.name`/`span.kind`/`status.code` plus the `traceMetrics` config section's extra dimensions. Requires `-ingest-traces` |
 | `-ingest-span-metrics-interval` | `1m` | export interval for the span metrics (exported under the agent's own resource identity; the described service is a data-point label) |
@@ -658,11 +658,8 @@ the describing target's `service.name` for splitter rules; set `""` to disable.
 Precedence: explicit pipeline section > built-in default > top-level base. Quick
 knobs also exist as flags:
 
-* `-resource-attrs-static=cluster=prod,env=eu` — fixed attributes.
-* `-resource-attrs-enable=<regex,...>` / `-resource-attrs-disable=<regex,...>`
-  — anchored regexes on the attribute key; an attribute is exported when it
-  matches the enable set (empty = all) and not the disable set (empty =
-  none).
+* `resourceAttributes.static` — fixed attributes on every resource.
+* `resourceAttributes.enable` / `.disable` — anchored regex lists selecting which attribute keys are exported (global; a pipeline section setting them is rejected).
 
 The config section:
 

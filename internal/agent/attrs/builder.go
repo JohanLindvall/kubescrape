@@ -66,6 +66,16 @@ type Config struct {
 	// describing exporters do not collide with self-scraped metrics; set it to
 	// "" to disable, or to any string to override.
 	InstancePrefix *string `json:"instancePrefix,omitempty"`
+	// Enable keeps only resource attributes whose key matches one of these
+	// anchored regexes (empty keeps all); Disable drops matching keys. Both are
+	// applied last, after defaults, static values and templates.
+	//
+	// Lists, not comma-separated strings: a pattern may therefore contain a
+	// comma (`.{1,3}`), which the removed -resource-attrs-enable/-disable flags
+	// could not express. Top-level only — a pipeline section setting them is
+	// rejected, since the filter is shared by every pipeline.
+	Enable  []string `json:"enable,omitempty"`
+	Disable []string `json:"disable,omitempty"`
 	// Pipelines overrides/extends the top-level settings for one pipeline;
 	// static and attribute maps merge with the pipeline entry winning.
 	Pipelines map[string]*Config `json:"pipelines,omitempty"`
@@ -91,6 +101,11 @@ func (c *Config) validatePipelines() error {
 		}
 		if sub != nil && len(sub.Pipelines) > 0 {
 			return fmt.Errorf("pipeline %q must not nest pipelines", name)
+		}
+		// The attribute filter is shared by every pipeline, so honouring these
+		// per pipeline is not possible; rejecting beats silently ignoring them.
+		if sub != nil && (len(sub.Enable) > 0 || len(sub.Disable) > 0) {
+			return fmt.Errorf("pipeline %q must not set enable/disable: the attribute filter is global — set them at the top level of resourceAttributes", name)
 		}
 	}
 	return nil
@@ -328,24 +343,4 @@ func (b *Builder) Build(res pcommon.Resource, ctx Context) {
 	// Prefix the (possibly template-overridden) instance last, before filtering.
 	PrefixInstance(res, b.instancePrefix)
 	b.filter.Apply(res)
-}
-
-// ParseStatic parses a "key=value,key=value" flag into a static attribute
-// map (merged over any config-file statics by the caller).
-func ParseStatic(s string) (map[string]string, error) {
-	out := map[string]string{}
-	for _, part := range strings.Split(s, ",") {
-		if part = strings.TrimSpace(part); part == "" {
-			continue
-		}
-		key, value, ok := strings.Cut(part, "=")
-		if !ok || key == "" {
-			return nil, fmt.Errorf("static attribute %q: want key=value", part)
-		}
-		out[key] = value
-	}
-	if len(out) == 0 {
-		return nil, nil
-	}
-	return out, nil
 }

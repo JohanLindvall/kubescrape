@@ -42,9 +42,15 @@ type sink interface {
 // very limit the estimate exists to respect. Every resource and metric is
 // therefore charged where it is created.
 const (
-	pointOverheadBytes  = 32 // timestamps, value, framing of one data point
-	attrOverheadBytes   = 8  // per-attribute protobuf framing
-	bucketBytes         = 12 // one explicit bound + its count
+	pointOverheadBytes = 32 // timestamps, value, framing of one data point
+	attrOverheadBytes  = 8  // per-attribute protobuf framing
+	// One explicit bound + its count. BOTH are packed fixed64 in OTLP
+	// (HistogramDataPoint.explicit_bounds is a double, bucket_counts is
+	// fixed64 — NOT varint; only the EXPONENTIAL histogram's counts are
+	// varint), so a bucket costs a flat 8+8. Charging 12 made a bucket-heavy
+	// family encode ~33% over its estimate and flush past the 4 MiB gRPC
+	// limit the estimate exists to respect.
+	bucketBytes         = 16
 	histFixedBytes      = 16 // count + sum
 	quantileBytes       = 18 // quantile + value
 	exemplarBytes       = 48 // value, timestamp, trace/span ids (labels charged separately)
@@ -101,8 +107,12 @@ func numberBytes(s Sample) int {
 
 // histBytes estimates the encoded size of one histogram data point.
 func histBytes(acc *histAcc) int {
+	// +8 for the overflow count: OTLP always carries one more bucket_count
+	// than explicit_bound, and a family whose exposition omitted +Inf has no
+	// entry in acc.buckets to charge it against. Over-charging by one slot is
+	// safe; under-charging flushes past the collector's receive limit.
 	n := pointOverheadBytes + histFixedBytes + labelBytes(acc.labels) +
-		len(acc.buckets)*bucketBytes
+		len(acc.buckets)*bucketBytes + 8
 	for i := range acc.exemplars {
 		n += exemplarSize(&acc.exemplars[i])
 	}
@@ -364,12 +374,15 @@ func (c *converter) labelKey(labels []Label, except string) {
 		}
 		return strings.Compare(a.Value, b.Value)
 	})
+	// LENGTH-PREFIXED, like the split and cadvisor resource keys: the text
+	// format permits any byte but \, " and newline inside a quoted value, so
+	// a value containing the delimiters could forge another series' key and
+	// the two would merge into one data point (the duplicate-le dedupe then
+	// destroys one of the values outright).
 	c.keyBuf = c.keyBuf[:0]
 	for _, l := range c.keyLbl {
-		c.keyBuf = append(c.keyBuf, l.Name...)
-		c.keyBuf = append(c.keyBuf, 0)
-		c.keyBuf = append(c.keyBuf, l.Value...)
-		c.keyBuf = append(c.keyBuf, 1)
+		c.keyBuf = appendLP(c.keyBuf, l.Name)
+		c.keyBuf = appendLP(c.keyBuf, l.Value)
 	}
 }
 
@@ -631,6 +644,13 @@ func fillSummaryPoint(dp pmetric.SummaryDataPoint, acc *summAcc) {
 // none. Shared by all three batchers.
 func pointTS(tsMs int64, scrapeTS pcommon.Timestamp) pcommon.Timestamp {
 	if tsMs != 0 {
+		// A ms value beyond this wraps the int64 nanosecond product and would
+		// stamp the point with a wildly wrong time (a far-future timestamp
+		// silently became a 1970s one). Fall back to the scrape time, which is
+		// the same thing an absent timestamp gets.
+		if tsMs > math.MaxInt64/int64(time.Millisecond) || tsMs < math.MinInt64/int64(time.Millisecond) {
+			return scrapeTS
+		}
 		return pcommon.Timestamp(tsMs * int64(time.Millisecond))
 	}
 	return scrapeTS

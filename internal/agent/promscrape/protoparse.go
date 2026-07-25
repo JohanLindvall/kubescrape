@@ -13,6 +13,7 @@ package promscrape
 
 import (
 	"bufio"
+	"context"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -38,14 +39,39 @@ const maxExpBuckets = 4096
 // families flow through the same converter/filter machinery as text
 // samples; native histograms go straight to the batcher as exponential
 // histogram points.
-func (s *Scraper) parseProtoAndExport(body io.Reader, cb chunker, pipeline string, relabel *relabelFilter, export func() error, full func() bool) (samples, malformed int, err error) {
+func (s *Scraper) parseProtoAndExport(ctx context.Context, body io.Reader, cb chunker, pipeline string, relabel *relabelFilter, export func() error, full func() bool) (samples, malformed int, err error) {
 	filter := s.cfg.Filters.filterFor(pipeline).session()
+	exportFailed := false
+	exportChunk := func() error {
+		if eerr := export(); eerr != nil {
+			exportFailed = true
+			return eerr
+		}
+		return nil
+	}
 	conv := newConverter(cb, func() error {
 		if full() {
-			return export()
+			return exportChunk()
 		}
 		return nil
 	})
+	// Salvage the partially converted scrape on ANY abort (sample limit,
+	// truncated body, read timeout mid-body, over-cap message), exactly as the
+	// text path does. Every metric kind here is cumulative, so a partial scrape
+	// costs only the missing series — whereas discarding the whole conversion
+	// threw away everything parsed before the abort. Pointless when the failure
+	// WAS the export (the collector just rejected a chunk) or when the context
+	// is gone (the send cannot succeed either).
+	defer func() {
+		if err == nil || exportFailed || ctx.Err() != nil {
+			return
+		}
+		if ferr := conv.finish(); ferr == nil && cb.count() > 0 {
+			if eerr := export(); eerr != nil {
+				s.log.Warn("exporting partial proto scrape", "pipeline", pipeline, "error", eerr)
+			}
+		}
+	}()
 	keep := func(name string, labels []Label) bool {
 		if !filter.Keep(name, labels) {
 			return false
@@ -102,7 +128,7 @@ func (s *Scraper) parseProtoAndExport(body io.Reader, cb chunker, pipeline strin
 			if ferr := conv.finish(); ferr != nil {
 				return ferr
 			}
-			return export()
+			return exportChunk()
 		}
 		m, bad, ferr := s.protoFamily(&mf, cb, keep, emit, samples, flushIfFull)
 		samples += m.samples

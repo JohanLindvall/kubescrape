@@ -186,7 +186,7 @@ func (s *Scraper) scrapeProto(ctx context.Context, body io.Reader, cb chunker, r
 		return cb.count() >= s.cfg.BatchPoints ||
 			(s.cfg.BatchBytes > 0 && cb.size() >= s.cfg.BatchBytes)
 	}
-	samples, malformed, err := s.parseProtoAndExport(body, cb, pipelineTargets, relabel, export, full)
+	samples, malformed, err := s.parseProtoAndExport(ctx, body, cb, pipelineTargets, relabel, export, full)
 	if malformed > 0 {
 		obs.ScrapeMalformed.WithLabelValues(pipelineTargets).Add(float64(malformed))
 		s.log.Warn("scrape had malformed proto families", "target", what, "malformed", malformed, "samples", samples)

@@ -185,7 +185,11 @@ spec:
             - -ingest-pod-uid-keys={{ join "," . }}
             {{- end }}
             {{- end }}
+            {{- if .Values.agent.debugPprof }}
+            - -debug-pprof
+            {{- end }}
             - -log-level={{ .Values.logLevel }}
+            - -runtime-metrics={{ .Values.runtimeMetrics }}
             - -log-format={{ .Values.logFormat }}
             {{- range .Values.agent.extraArgs }}
             - {{ . }}

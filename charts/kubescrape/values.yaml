@@ -3,6 +3,11 @@ image:
   tag: ""            # defaults to .Chart.AppVersion
   pullPolicy: IfNotPresent
 
+# Include Go runtime and process metrics (process.runtime.go.*, process.cpu.time,
+# process.memory.rss, process.open_file_descriptors, ...) in the OTLP
+# self-metrics export. ~15 extra series per process.
+runtimeMetrics: true
+
 logLevel: info       # both components
 logFormat: text
 
@@ -222,6 +227,11 @@ agent:
   # Synthetic up / scrape_duration_seconds / scrape_samples_scraped gauges
   # per target.
   scrapeHealthMetrics: true
+
+  # Serve net/http/pprof under /debug/pprof on the agent's listen address.
+  # Off by default: the listener is unauthenticated and profiles expose
+  # goroutine stacks and heap contents.
+  debugPprof: false
 
   # Static resource attributes (key: value), e.g. cluster: prod-eu. Merged into
   # config.resourceAttributes.static (an explicit value there wins). Attribute

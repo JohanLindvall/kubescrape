@@ -269,7 +269,33 @@ overrides `-logs-multiline` for that source. A file is claimed by the first
 source that matches it. Container logs keep working because the default
 (no-config) behavior is exactly one containerd source over `-log-dir`.
 
-Per-source option:
+Per-source options:
+
+- `namespaces` / `excludeNamespaces` (containerd sources) restrict collection
+  by the pod's namespace, as `path.Match` globs; the denylist wins. They are
+  read from the **CRI filename at discovery**, so a non-matching file is never
+  opened, tracked or read:
+
+  ```yaml
+  logs:
+    sources:
+      - name: containers
+        include: ["/var/log/containers/*.log"]
+        containerd: true
+        namespaces: ["team-*", "prod"]      # empty = all
+        excludeNamespaces: ["team-scratch"]
+  ```
+
+- `selector` (containerd sources) restricts collection to pods whose **labels**
+  match every `key: value`. Labels are only known once metadata resolves, so
+  this is applied there — the file is tracked, but no data is ever read from it:
+
+  ```yaml
+        selector: {logging: "true"}
+  ```
+
+  Prefer both over a `logs.rules` drop for cost control: a rule saves egress
+  but only after paying the read, parse and enrich; these skip the work.
 
 - `compressed` reads matched files as gzip, decompressing on the fly (files
   ending in `.gz` are detected automatically). Compressed files are treated as

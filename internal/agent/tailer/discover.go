@@ -275,7 +275,16 @@ func (t *Tailer) initFile(f *file, checkpoints map[string]checkpoint, initial bo
 		// range, or counts obs.LogPrefixLost and retires it if the runtime
 		// already pruned the file). Previously this remainder was lost
 		// silently and uncounted.
-		if !f.compressed && f.inode != 0 && f.committed > 0 {
+		// There is deliberately no `f.committed > 0` guard: committed == 0
+		// means NOTHING was ever shipped from that incarnation — a checkpoint
+		// is persisted as soon as a file is discovered, so an export failing
+		// since startup leaves exactly this state — which is the MAXIMUM-loss
+		// case, not a no-op. (A file skipped as history under
+		// -logs-unknown-files=end checkpoints at its SIZE, not 0, so it is
+		// unaffected.) Identity is pinned by the exact inode in findRotated,
+		// so an empty fingerprint (a file discovered at size 0) cannot
+		// mismatch onto some other file.
+		if !f.compressed && f.inode != 0 {
 			if st, err := os.Stat(f.path); err == nil && inodeOf(st) != f.inode {
 				f.segSeq++
 				f.segments = append(f.segments, &segment{

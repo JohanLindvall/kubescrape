@@ -11,6 +11,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 
 	"github.com/JohanLindvall/kubescrape/internal/obs"
 )
@@ -231,7 +232,16 @@ func (t *Tailer) feedSegments(ctx context.Context, f *file) {
 		return
 	}
 	f.segmentsFed = true
-	for _, sg := range f.segments {
+	// Iterate a SNAPSHOT: replaySegment retires the segment it is replaying
+	// when the source is unrecoverable (openSegmentSource's findRotated miss,
+	// or nothing recoverable was fed), and retire compacts f.segments with
+	// slices.DeleteFunc — which NILS the vacated tail of the backing array.
+	// Ranging over the live slice would hand a nil *segment to a later
+	// iteration and panic on sg.id, killing the tailer's single sweep
+	// goroutine and with it log collection for the whole node. Only the
+	// segment being replayed is ever retired, so the snapshot needs no
+	// membership re-check.
+	for _, sg := range slices.Clone(f.segments) {
 		f.feeding = sg.id
 		t.replaySegment(ctx, f, sg)
 	}

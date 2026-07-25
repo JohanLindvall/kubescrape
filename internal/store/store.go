@@ -228,8 +228,9 @@ func (s *Store) claimPodIPLocked(rec *record, pod kubemeta.Pod, oldIP string) {
 		// that IP by the recycle race must be promoted — otherwise it is
 		// unresolvable by IP until its own next real upsert (a same-RV resync
 		// short-circuits before re-claiming). rec already carries its new
-		// (finished/hostNetwork/changed) state, so promote skips it.
-		s.promoteIPClaimantLocked(oldIP)
+		// (finished/hostNetwork/changed) state so it would self-exclude;
+		// passing it keeps that independent of field-assignment order.
+		s.promoteIPClaimantLocked(oldIP, rec)
 	}
 	if ip != "" {
 		cur := s.byPodIP[ip]
@@ -240,14 +241,28 @@ func (s *Store) claimPodIPLocked(rec *record, pod kubemeta.Pod, oldIP string) {
 }
 
 // promoteIPClaimantLocked re-points byPodIP[ip] at a surviving eligible pod
-// after the current claimant was deleted. Eligibility mirrors
+// after the current claimant released or lost the IP. Eligibility mirrors
 // claimPodIPLocked: live (not tombstoned), running-phase, non-hostNetwork,
 // status.podIP == ip. A non-terminating claimant is preferred over a
 // terminating one (same precedence the claim path applies); among equals the
 // pick is arbitrary — exactly like concurrent last-write-wins claims.
-func (s *Store) promoteIPClaimantLocked(ip string) {
+//
+// skip is the record that just gave the IP up and must never win it back. It
+// is REQUIRED for correctness on the delete path: DeletePod stamps expireAt
+// (the tombstone marker this scan filters on) only AFTER the promotion runs,
+// and with -cache-ttl 0 removes the record instead of stamping it at all — so
+// without an explicit exclusion the pod being deleted is still "live" here and
+// re-claims its own IP. That resurrects it in byPodIP with DeletedAt unset,
+// serving a DELETED pod from GET /v1/pod-ips forever (Sweep never revisits
+// byPodIP), leaking one entry per deleted pod, and — when a live pod holds the
+// recycled IP — stealing the mapping from the real owner at map-iteration
+// random.
+func (s *Store) promoteIPClaimantLocked(ip string, skip *record) {
 	var pick *record
 	for _, r := range s.pods {
+		if r == skip { // released the IP; never a candidate to re-take it
+			continue
+		}
 		if !r.expireAt.IsZero() { // tombstoned: not live
 			continue
 		}
@@ -308,7 +323,7 @@ func (s *Store) DeletePod(uid types.UID) {
 		// update (a same-RV resync short-circuits before re-claiming). The
 		// scan only runs when the deleted pod owned an IP mapping, and only
 		// walks the map once (deletes are informer-rate).
-		s.promoteIPClaimantLocked(rec.pod.PodIP)
+		s.promoteIPClaimantLocked(rec.pod.PodIP, rec)
 	}
 
 	if s.ttl <= 0 {

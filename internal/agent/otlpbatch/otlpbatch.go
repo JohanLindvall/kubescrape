@@ -256,18 +256,31 @@ func (s *sigBatch[T]) run(ctx context.Context) {
 	acc := s.fresh()
 	accN := 0
 	accBytes := 0
+	// accAny tracks whether ANYTHING has been merged into acc, which is not the
+	// same as accN > 0: count() counts records/data points, and a payload can
+	// carry real encoded bytes with zero of them (a ResourceLogs holding only
+	// resource attributes, a metric family with descriptors but no points).
+	// Gating the flush and cap decisions on accN made such payloads invisible:
+	// they merged in, grew accBytes, never tripped a cap, kept sliding the
+	// timeout, and flush() itself early-returned — so the accumulator grew
+	// without bound, the byte cap was bypassed entirely (an eventual flush
+	// could deliver far past the collector's recv limit, i.e. total rejection),
+	// and at shutdown the acked payloads were neither delivered nor counted
+	// dropped.
+	accAny := false
 	timer := time.NewTimer(s.timeout)
 	if !timer.Stop() {
 		<-timer.C
 	}
 	flush := func() {
-		if accN == 0 {
+		if !accAny {
 			return
 		}
 		s.deliver(ctx, acc, accN)
 		acc = s.fresh()
 		accN = 0
 		accBytes = 0
+		accAny = false
 	}
 	// drainAndReturn refuses new input, then delivers what was already acked to
 	// senders (bounded by drainTimeout) and flushes. Once closed is set under the
@@ -295,14 +308,15 @@ func (s *sigBatch[T]) run(ctx context.Context) {
 				// recv limit.
 				n := s.count(v)
 				sz := s.size(v)
-				if accN > 0 && (accN+n > s.items || accBytes+sz > s.maxBytes) {
+				if accAny && (accN+n > s.items || accBytes+sz > s.maxBytes) {
 					flush()
 				}
 				s.merge(acc, v)
 				accN += n
 				accBytes += sz
+				accAny = true
 			default:
-				if accN > 0 && time.Now().After(deadline) {
+				if accAny && time.Now().After(deadline) {
 					obs.IngestDropped.WithLabelValues(s.kind).Inc()
 					dropped += accN
 				} else {
@@ -335,7 +349,7 @@ func (s *sigBatch[T]) run(ctx context.Context) {
 			// merged parts (top-level repeated fields), so sizing the incoming
 			// payload alone keeps the running total accurate.
 			sz := s.size(v)
-			if accN > 0 && (accN+n > s.items || accBytes+sz > s.maxBytes) {
+			if accAny && (accN+n > s.items || accBytes+sz > s.maxBytes) {
 				flush()
 				if !timer.Stop() {
 					select {
@@ -344,17 +358,18 @@ func (s *sigBatch[T]) run(ctx context.Context) {
 					}
 				}
 			}
-			if accN == 0 && (n >= s.items || sz >= s.maxBytes) {
+			if !accAny && (n >= s.items || sz >= s.maxBytes) {
 				s.deliver(ctx, v, n)
 				continue
 			}
-			if accN == 0 {
+			if !accAny {
 				timer.Reset(s.timeout)
 			}
 			s.merge(acc, v)
 			accN += n
 			accBytes += sz
-			if accN >= s.items {
+			accAny = true
+			if accN >= s.items || accBytes >= s.maxBytes {
 				flush()
 				if !timer.Stop() {
 					select {

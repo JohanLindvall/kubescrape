@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -351,6 +352,16 @@ func run() error {
 		for i, rt := range fileCfg.Routing.Routes {
 			if rt.Name == "" || len(rt.Namespaces) == 0 {
 				return fmt.Errorf("routing route %d: name and namespaces are required", i)
+			}
+			// A malformed glob makes path.Match return ErrBadPattern for EVERY
+			// namespace, which the matcher reads as "no match": the route never
+			// fires and its tenant's telemetry goes silently to the default
+			// destination — indistinguishable from "no traffic yet", since the
+			// route's counter simply stays at zero. Fail startup instead.
+			for _, pat := range rt.Namespaces {
+				if _, err := path.Match(pat, ""); err != nil {
+					return fmt.Errorf("routing route %q: invalid namespace pattern %q: %w", rt.Name, pat, err)
+				}
 			}
 			rcfg := otlpexport.Config{
 				Endpoint:           *otlpEndpoint,

@@ -109,6 +109,19 @@ func New(cfg Config) (*Client, error) {
 	if cfg.RetryBackoff <= 0 {
 		cfg.RetryBackoff = time.Second
 	}
+	// A zero Timeout must NOT reach context.WithTimeout: it yields an
+	// already-expired context, so every send fails instantly with
+	// DeadlineExceeded. That error is transient AND not a collector response,
+	// so with -buffer-dir the poison budget can never arm — the spool retries
+	// forever, fills to its cap and back-pressures every producer: a total,
+	// permanent telemetry outage with no drop counted and nothing logged as a
+	// rejection. Defaulting matches every other field here (and the
+	// -otlp-timeout flag's own default); "no timeout at all" is deliberately
+	// not offered, since a hung send would stall the tailer's single sweep
+	// goroutine indefinitely.
+	if cfg.Timeout <= 0 {
+		cfg.Timeout = 15 * time.Second
+	}
 	if cfg.MaxSendBytes == 0 {
 		cfg.MaxSendBytes = otlpsplit.DefaultMaxBytes
 	}

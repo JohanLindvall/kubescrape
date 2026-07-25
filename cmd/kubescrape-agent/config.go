@@ -2,7 +2,12 @@ package main
 
 import (
 	"fmt"
+	"log/slog"
 	"os"
+	"path"
+	"sort"
+	"strings"
+	"sync"
 
 	"sigs.k8s.io/yaml"
 
@@ -13,6 +18,8 @@ import (
 	"github.com/JohanLindvall/kubescrape/internal/agent/spanmetrics"
 	"github.com/JohanLindvall/kubescrape/internal/agent/tailer"
 	"github.com/JohanLindvall/kubescrape/internal/agent/tracesample"
+	"github.com/JohanLindvall/kubescrape/internal/agent/transform"
+	"github.com/JohanLindvall/kubescrape/internal/logline"
 	"github.com/JohanLindvall/kubescrape/internal/metrics"
 	"github.com/JohanLindvall/kubescrape/pkg/logattrs"
 )
@@ -64,4 +71,170 @@ func loadAgentConfig(path string) (*agentConfig, error) {
 		return nil, fmt.Errorf("%s: %w", path, err)
 	}
 	return &cfg, nil
+}
+
+// validateConfig compiles every section of the unified config (and the
+// separate transforms file) without acquiring a single resource: no listeners,
+// no log files, no positions file, no spools, no network.
+//
+// run() always calls it before touching anything, so a bad config fails fast;
+// -check-config makes run() stop right after it. Keeping ONE function means the
+// dry-run cannot drift from what a real start accepts — adding a config surface
+// means adding it here as well as to agentConfig.
+func validateConfig(cfg agentConfig, transformsFile string) error {
+	if _, err := buildAttrs(cfg.ResourceAttributes); err != nil {
+		return fmt.Errorf("resourceAttributes: %w", err)
+	}
+	if _, err := logattrs.New(cfg.LogAttributes); err != nil {
+		return fmt.Errorf("logAttributes: %w", err)
+	}
+	if cfg.LogScrubbing != nil {
+		if _, err := logscrub.New(*cfg.LogScrubbing); err != nil {
+			return fmt.Errorf("logScrubbing: %w", err)
+		}
+	}
+	if cfg.LogMetrics != nil {
+		if _, err := metrics.NewDynamicMetricSet(cfg.LogMetrics.Metrics); err != nil {
+			return fmt.Errorf("logMetrics: %w", err)
+		}
+	}
+	if cfg.Metrics != nil {
+		if _, err := promscrape.NewMetricFilters(&promscrape.FilterConfig{Pipelines: cfg.Metrics.Pipelines}); err != nil {
+			return fmt.Errorf("metrics.pipelines: %w", err)
+		}
+		if _, err := promscrape.NewSplitters(cfg.Metrics.Splitters); err != nil {
+			return fmt.Errorf("metrics.splitters: %w", err)
+		}
+	}
+	if cfg.Logs != nil {
+		if _, err := tailer.ValidateSources(cfg.Logs.Sources); err != nil {
+			return fmt.Errorf("logs.sources: %w", err)
+		}
+		if _, err := logline.NewLineFilter(cfg.Logs.Rules); err != nil {
+			return fmt.Errorf("logs.rules: %w", err)
+		}
+	}
+	if cfg.TraceSampling != nil {
+		if err := cfg.TraceSampling.Validate(); err != nil {
+			return fmt.Errorf("traceSampling: %w", err)
+		}
+	}
+	if cfg.Routing != nil {
+		for i, rt := range cfg.Routing.Routes {
+			if rt.Name == "" || len(rt.Namespaces) == 0 {
+				return fmt.Errorf("routing route %d: name and namespaces are required", i)
+			}
+			for _, pat := range rt.Namespaces {
+				if _, err := path.Match(pat, ""); err != nil {
+					return fmt.Errorf("routing route %q: invalid namespace pattern %q: %w", rt.Name, pat, err)
+				}
+			}
+		}
+	}
+	if transformsFile != "" {
+		if _, err := transform.CompileFile(transformsFile); err != nil {
+			return fmt.Errorf("transforms: %w", err)
+		}
+	}
+	return nil
+}
+
+// printConfigSummary reports what a real start would enable, so -check-config
+// answers "is this valid?" and "is this what I meant?" in one run.
+func printConfigSummary(cfg agentConfig, log *slog.Logger) {
+	on := func(b bool) string {
+		if b {
+			return "on"
+		}
+		return "off"
+	}
+	sections := []string{}
+	add := func(name string, present bool) {
+		if present {
+			sections = append(sections, name)
+		}
+	}
+	add("resourceAttributes", cfg.ResourceAttributes != nil)
+	add("logs", cfg.Logs != nil)
+	add("logAttributes", cfg.LogAttributes != nil)
+	add("logMetrics", cfg.LogMetrics != nil)
+	add("logScrubbing", cfg.LogScrubbing != nil)
+	add("metrics", cfg.Metrics != nil)
+	add("traceMetrics", cfg.TraceMetrics != nil)
+	add("traceSampling", cfg.TraceSampling != nil)
+	add("routing", cfg.Routing != nil)
+	if len(sections) == 0 {
+		sections = append(sections, "(none)")
+	}
+
+	log.Info("config is valid",
+		"sections", strings.Join(sections, ","),
+		"pipelines", fmt.Sprintf("logs=%s metrics=%s cadvisor=%s node=%s journald=%s ingest=%s",
+			on(*logsOn), on(*metricsOn), on(*cadvisorOn), on(*nodeOn), on(*journaldOn), on(*ingestOn)),
+		"otlp-endpoint", *otlpEndpoint,
+		"otlp-protocol", *otlpProtocol,
+		"buffer-dir", *bufferDir,
+		"positions-file", *positionsFile,
+		"transforms-file", *transformsFile,
+		"enrich", *enrichOn,
+	)
+	if cfg.LogMetrics != nil {
+		log.Info("logMetrics", "rules", len(cfg.LogMetrics.Metrics))
+	}
+	if cfg.Routing != nil {
+		for _, rt := range cfg.Routing.Routes {
+			log.Info("routing route", "name", rt.Name, "namespaces", strings.Join(rt.Namespaces, ","), "endpoint", rt.Endpoint)
+		}
+	}
+}
+
+// readiness tracks the startup gates /readyz reports on.
+//
+// A DaemonSet rolling update advances only when the new pod reports ready, so
+// this endpoint decides whether a bad rollout stops at the first node or
+// marches across the fleet. It previously returned the same static "ok" as
+// /healthz — the agent was "ready" the instant the mux was built, even if it
+// could not reach the metadata service and could therefore attribute nothing.
+//
+// Gates are registered at startup and satisfied as each becomes true; /readyz
+// is 200 only when none are pending, and reports the pending ones so the
+// failure is diagnosable from the probe alone.
+// gateMetadata is satisfied by the first successful node-metadata fetch.
+const gateMetadata = "metadata-service"
+
+type readiness struct {
+	mu    sync.Mutex
+	gates map[string]bool
+}
+
+func newReadiness() *readiness { return &readiness{gates: map[string]bool{}} }
+
+// require registers a gate that must be satisfied before the agent is ready.
+func (r *readiness) require(name string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, ok := r.gates[name]; !ok {
+		r.gates[name] = false
+	}
+}
+
+// done marks a gate satisfied. Safe to call repeatedly and from any goroutine.
+func (r *readiness) done(name string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.gates[name] = true
+}
+
+// pending returns the unsatisfied gates, sorted for a stable probe body.
+func (r *readiness) pending() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var out []string
+	for name, ok := range r.gates {
+		if !ok {
+			out = append(out, name)
+		}
+	}
+	sort.Strings(out)
+	return out
 }

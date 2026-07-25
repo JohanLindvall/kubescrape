@@ -91,6 +91,7 @@ var (
 	transformsFile = flag.String("transforms-file", "", "Starlark transforms file applied to exported logs/metrics/traces at the exporter seam; hot-reloaded on change (mount its ConfigMap as a directory, not subPath). Empty disables")
 
 	nativeHists = flag.Bool("scrape-native-histograms", false, "offer the Prometheus protobuf exposition to scrape targets and convert native histograms to OTLP exponential histograms")
+	checkConfig = flag.Bool("check-config", false, "validate -config and -transforms-file (every section compiled: templates, regexes, selectors, globs) plus the flags, print a summary and exit — no listeners, log files, positions file, spools or network. For CI and pre-rollout checks: a DaemonSet's bad ConfigMap otherwise surfaces as a fleet-wide CrashLoop")
 	debugPprof  = flag.Bool("debug-pprof", false, "serve net/http/pprof profiles under /debug/pprof on -listen (off by default: the listener is unauthenticated and profiles expose process memory)")
 	logLevel    = flag.String("log-level", "info", "log level: debug, info, warn, error")
 	logFormat   = flag.String("log-format", "text", "log format: text or json")
@@ -182,6 +183,7 @@ type pipelines struct {
 	attrBuilders *attrs.Builders
 	fileCfg      agentConfig
 	posStore     *positions.Store
+	ready        *readiness
 	logAttrs     *logattrs.Extractor
 	scrub        *logscrub.Scrubber
 	transforms   *transform.Wrapper
@@ -247,6 +249,16 @@ func run() error {
 		fileCfg = *c
 	}
 
+	// Compile every config section before acquiring anything, so a bad config
+	// fails fast and identically whether or not -check-config was passed.
+	if err := validateConfig(fileCfg, *transformsFile); err != nil {
+		return err
+	}
+	if *checkConfig {
+		printConfigSummary(fileCfg, log)
+		return nil
+	}
+
 	attrBuilders, err := buildAttrs(fileCfg.ResourceAttributes)
 	if err != nil {
 		return fmt.Errorf("resource attributes: %w", err)
@@ -285,7 +297,14 @@ func run() error {
 	// The client is dependency-free by design; feed its outcomes to our metrics.
 	meta.Observe = func(outcome string) { obs.MetadataRequests.WithLabelValues(outcome).Inc() }
 
-	nodeInfo := startNodeInfo(ctx, meta, *nodeName, *nodeRefresh, log)
+	ready := newReadiness()
+	if *nodeRefresh > 0 {
+		// Reaching the metadata service is what separates a working new agent
+		// from one that will attribute nothing; with refresh disabled the agent
+		// never calls it, so there is nothing to gate on.
+		ready.require(gateMetadata)
+	}
+	nodeInfo := startNodeInfo(ctx, meta, *nodeName, *nodeRefresh, log, ready)
 
 	var metricFilters *promscrape.MetricFilters
 	var splitters []*promscrape.Splitter
@@ -481,6 +500,7 @@ func run() error {
 		attrBuilders: attrBuilders,
 		fileCfg:      fileCfg,
 		posStore:     posStore,
+		ready:        ready,
 		logAttrs:     logAttrs,
 		scrub:        scrub,
 		transforms:   transforms,
@@ -807,7 +827,18 @@ func (p *pipelines) startDebugServer(tl *tailer.Tailer, sc *promscrape.Scraper) 
 		_, _ = w.Write([]byte("ok"))
 	}
 	mux.HandleFunc("GET /healthz", ok)
-	mux.HandleFunc("GET /readyz", ok)
+	// Readiness is NOT liveness: a rolling update advances on this, so it
+	// reports whether the agent can actually do its job. The pending gates are
+	// in the body, so a stuck rollout is diagnosable from the probe alone.
+	mux.HandleFunc("GET /readyz", func(w http.ResponseWriter, _ *http.Request) {
+		if pending := p.ready.pending(); len(pending) > 0 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = fmt.Fprintf(w, "not ready: %s\n", strings.Join(pending, ", "))
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	})
 	if tl != nil {
 		// Per-file tail positions and lag (refreshed ~10s), largest lag first.
 		mux.HandleFunc("GET /debug/tailer", func(w http.ResponseWriter, _ *http.Request) {
@@ -874,7 +905,7 @@ func (p *pipelines) startDebugServer(tl *tailer.Tailer, sc *promscrape.Scraper) 
 
 // startNodeInfo provides the node's labels/annotations for attribute
 // templates, refreshed in the background from the metadata service.
-func startNodeInfo(ctx context.Context, meta *metaclient.Client, nodeName string, refresh time.Duration, log *slog.Logger) func() *attrs.NodeInfo {
+func startNodeInfo(ctx context.Context, meta *metaclient.Client, nodeName string, refresh time.Duration, log *slog.Logger, ready *readiness) func() *attrs.NodeInfo {
 	var current atomic.Pointer[attrs.NodeInfo]
 	current.Store(&attrs.NodeInfo{Name: nodeName})
 	if refresh > 0 {
@@ -887,6 +918,9 @@ func startNodeInfo(ctx context.Context, meta *metaclient.Client, nodeName string
 				return
 			}
 			current.Store(&attrs.NodeInfo{Name: nodeName, Labels: md.Labels, Annotations: md.Annotations})
+			// The agent can reach the metadata service, so it can attribute
+			// what it collects: the readiness gate a rolling update waits on.
+			ready.done(gateMetadata)
 		}
 		go func() {
 			fetch()

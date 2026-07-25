@@ -417,6 +417,20 @@ costs a few substring scans and zero allocations. Redactions count into
 regex fails startup (a scrubber that silently skips a pattern is a
 compliance bug).
 
+**Readiness** (`GET /readyz`). Liveness (`/healthz`) is always `200`;
+readiness reports whether the agent can actually do its job and lists the
+pending gates in the body (`not ready: metadata-service`). A DaemonSet rolling
+update advances on this, so a new pod that cannot reach the metadata service —
+and could therefore attribute nothing — halts the rollout instead of replacing
+every node.
+
+**Config validation** (`-check-config`). Compiles every section of `-config`
+and `-transforms-file` (templates, regexes, selectors, globs, durations) plus
+the flags, prints a summary and exits — without opening listeners, log files,
+the positions file, spools or the network. Run it in CI: a DaemonSet's bad
+ConfigMap otherwise surfaces as a fleet-wide CrashLoop. A real start runs the
+same validation, so the two cannot disagree.
+
 **Log enrichment** (`-enrich`, default true — one switch covering container
 logs, journald and pushed OTLP log bodies). Each exported line is run
 through [JohanLindvall/enrich](https://github.com/JohanLindvall/enrich),

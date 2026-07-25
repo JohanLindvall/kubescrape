@@ -85,8 +85,12 @@ func New(cfg Config, next Exporter) *Sampler {
 		keepErr: keepErr,
 		slow:    cfg.KeepSlowerThan,
 		rate:    cfg.MaxSpansPerSecond,
-		burst:   cfg.MaxSpansPerSecond, // one second of headroom
-		now:     time.Now,
+		// One second of headroom, but never below a single span: allow()
+		// caps tokens at burst and requires a whole token, so a fractional
+		// rate (0 < r < 1) could never accumulate one and dropped 100% of
+		// spans forever — a total trace outage rather than the configured cap.
+		burst: max(1, cfg.MaxSpansPerSecond),
+		now:   time.Now,
 	}
 	if p == 1 {
 		s.threshold = math.MaxUint64

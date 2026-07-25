@@ -37,7 +37,7 @@ func (e *Enricher) splitAndEnrich(ctx context.Context, md pmetric.Metrics) pmetr
 		// Points without their own ID fall back to the resource-level one, so
 		// a mixed batch (auto mode) does not lose enrichment for resources
 		// that carried the ID where it belongs.
-		g.resToken, _ = e.findID(rm.Resource().Attributes())
+		g.resToken = e.resolvableToken(ctx, rm.Resource().Attributes())
 		sms := rm.ScopeMetrics()
 		for j := 0; j < sms.Len(); j++ {
 			sm := sms.At(j)
@@ -148,7 +148,7 @@ func metricPointCount(m pmetric.Metric) int {
 // metricFor resolves one data point's ID (falling back to the resource-level
 // one) and returns its output metric.
 func (g *metricGrouper) metricFor(sm pmetric.ScopeMetrics, scopeIdx int, m pmetric.Metric, metricIdx int, dpAttrs pcommon.Map) pmetric.Metric {
-	token, _ := g.enricher.findID(dpAttrs)
+	token := g.enricher.resolvableToken(g.ctx, dpAttrs)
 	if token == "" {
 		token = g.resToken
 	}

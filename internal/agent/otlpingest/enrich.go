@@ -237,19 +237,24 @@ func (e *Enricher) applyMetadata(ctx context.Context, a pcommon.Map, cache map[s
 	}
 	// Try the container id first, then fall back to the pod uid: a stale
 	// container id the store no longer knows must not block a resolvable pod
-	// uid the sender also provided.
+	// uid the sender also provided. Probe with attrsFor (no counting) and count
+	// exactly ONCE below — kubescrape_ingest_resources_total counts RESOURCES,
+	// so a resource carrying two unresolvable ids must not tally two.
 	if cOK {
-		if built := e.builtAttrs(ctx, cache, cTok); built.Len() > 0 {
+		if built := e.attrsFor(ctx, cache, cTok); built.Len() > 0 {
+			obs.Ingested.WithLabelValues("enriched").Inc()
 			mergeAttrs(built, a)
 			return true
 		}
 	}
 	if uOK {
-		if built := e.builtAttrs(ctx, cache, uTok); built.Len() > 0 {
+		if built := e.attrsFor(ctx, cache, uTok); built.Len() > 0 {
+			obs.Ingested.WithLabelValues("enriched").Inc()
 			mergeAttrs(built, a)
 			return true
 		}
 	}
+	obs.Ingested.WithLabelValues("unresolved").Inc()
 	return false
 }
 
@@ -268,7 +273,46 @@ func (e *Enricher) tokenFrom(a pcommon.Map, keys []string, prefix string) (strin
 // metadata lookup and attribute build (and the enriched/unresolved counting)
 // once per distinct token per cache. An empty map means the ID did not
 // resolve.
-func (e *Enricher) builtAttrs(ctx context.Context, cache map[string]pcommon.Map, token string) pcommon.Map {
+// resolves reports whether token names an object the metadata service knows,
+// without building or caching its attributes. Used to choose between a
+// container id and a pod uid when a sender supplies both; the underlying
+// metaclient lookup is itself cached, so the probe is cheap.
+func (e *Enricher) resolves(ctx context.Context, token string) bool {
+	pod, _ := e.lookupByID(ctx, token)
+	return pod != nil
+}
+
+// resolvableToken picks the id token to attribute a resource (or data point)
+// by, preferring the container id — it names the exact incarnation — but
+// falling back to the pod uid when the container id does not resolve. A stale
+// container id (the container restarted, or its tombstone expired) must not
+// veto a pod uid the sender also supplied. The probe only runs when BOTH kinds
+// are present, so the common single-id case costs nothing extra.
+//
+// Split mode needs this as much as resource mode: without it an identical
+// payload was attributed differently by mode, and the split path additionally
+// reduced the resource to the bare unresolved id, discarding every attribute
+// the sender had set.
+func (e *Enricher) resolvableToken(ctx context.Context, a pcommon.Map) string {
+	cTok, cOK := e.tokenFrom(a, e.containerIDKeys, tokContainer)
+	uTok, uOK := e.tokenFrom(a, e.podUIDKeys, tokPodUID)
+	switch {
+	case cOK && uOK:
+		if e.resolves(ctx, cTok) {
+			return cTok
+		}
+		return uTok
+	case cOK:
+		return cTok
+	default:
+		return uTok // "" when neither is present
+	}
+}
+
+// attrsFor resolves and caches a token's k8s attributes WITHOUT counting the
+// outcome, for callers that probe more than one candidate token for a single
+// resource and must count exactly once themselves.
+func (e *Enricher) attrsFor(ctx context.Context, cache map[string]pcommon.Map, token string) pcommon.Map {
 	if built, ok := cache[token]; ok {
 		return built
 	}
@@ -281,11 +325,24 @@ func (e *Enricher) builtAttrs(ctx context.Context, cache map[string]pcommon.Map,
 		}
 		e.cfg.Attrs.Build(r, actx)
 		r.Attributes().CopyTo(built)
-		obs.Ingested.WithLabelValues("enriched").Inc()
-	} else {
-		obs.Ingested.WithLabelValues("unresolved").Inc()
 	}
 	cache[token] = built
+	return built
+}
+
+// builtAttrs is attrsFor plus the outcome counter, for single-token callers.
+// It counts only when the token is resolved for the first time, so the
+// per-resource counters stay per-resource (resource() is memoized by id).
+func (e *Enricher) builtAttrs(ctx context.Context, cache map[string]pcommon.Map, token string) pcommon.Map {
+	_, cached := cache[token]
+	built := e.attrsFor(ctx, cache, token)
+	if !cached {
+		if built.Len() > 0 {
+			obs.Ingested.WithLabelValues("enriched").Inc()
+		} else {
+			obs.Ingested.WithLabelValues("unresolved").Inc()
+		}
+	}
 	return built
 }
 

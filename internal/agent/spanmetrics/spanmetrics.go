@@ -130,7 +130,25 @@ func New(cfg Config) *Generator {
 	if cfg.Exemplars != nil {
 		ex = *cfg.Exemplars
 	}
-	names := append(append([]string(nil), builtinDims...), cfg.Dimensions...)
+	// Drop configured dimensions that repeat a built-in (or each other).
+	// putDims writes names in order and a later write wins, while an extra is
+	// resolved from span/resource ATTRIBUTES — and span.name/span.kind/
+	// status.code are span fields, not attributes, so they resolve to "".
+	// A `dimensions: ["span.name"]` therefore blanked the real built-in label,
+	// and since the series key still distinguished the series, two different
+	// spans rendered byte-identical attribute sets in one export.
+	seen := make(map[string]bool, len(builtinDims)+len(cfg.Dimensions))
+	for _, d := range builtinDims {
+		seen[d] = true
+	}
+	names := append([]string(nil), builtinDims...)
+	for _, d := range cfg.Dimensions {
+		if seen[d] {
+			continue
+		}
+		seen[d] = true
+		names = append(names, d)
+	}
 	return &Generator{
 		prefix:    prefix,
 		names:     names,

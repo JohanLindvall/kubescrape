@@ -40,7 +40,10 @@ func TestExtractJSON(t *testing.T) {
 	for _, a := range r.Log {
 		got[a.Key] = a.Val
 	}
-	if got["level"] != "warn" || got["status"] != float64(503) || got["cached"] != true || got["ratio"] != 0.5 {
+	// status is an INTEGRAL JSON number, so it decodes as int64 (float64 cannot
+	// hold a 64-bit id exactly); ratio keeps float64. Either way apply.Put
+	// stores a whole number with PutInt, so the exported attribute is the same.
+	if got["level"] != "warn" || got["status"] != int64(503) || got["cached"] != true || got["ratio"] != 0.5 {
 		t.Errorf("log = %+v", got)
 	}
 	if _, ok := got["absent"]; ok {

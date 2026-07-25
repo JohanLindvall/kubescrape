@@ -8,6 +8,7 @@ package logattrs
 import (
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"unsafe"
@@ -197,8 +198,8 @@ func (e *Extractor) Extract(line string) Result {
 
 // decodeScalar renders a raw JSON scalar token as its typed value; objects,
 // arrays and null are not attribute-worthy and report false. Numbers decode as
-// float64 (matching DecodeAny, which this replaces — apply.Put converts whole
-// floats to ints); escape-free strings alias the input line, which outlives
+// int64 when integral (float64 cannot hold a 64-bit id exactly) and float64
+// otherwise; escape-free strings alias the input line, which outlives
 // the extracted attributes (they are copied into pdata at flush).
 func decodeScalar(raw []byte) (any, bool) {
 	switch raw[0] {
@@ -218,12 +219,36 @@ func decodeScalar(raw []byte) (any, bool) {
 	case '{', '[', 'n':
 		return nil, false
 	default: // number
+		// Integral tokens parse as int64 first: float64 loses precision above
+		// 2^53, so a 64-bit id (snowflake, order/user id) lifted from a JSON log
+		// silently landed one or more off — and looked exact afterwards, since
+		// whole floats are stored with PutInt anyway.
+		if isIntegerToken(raw) {
+			if i, err := strconv.ParseInt(string(raw), 10, 64); err == nil {
+				return i, true
+			}
+		}
 		f, err := ljson.ParseFloat(raw)
 		if err != nil {
 			return nil, false
 		}
 		return f, true
 	}
+}
+
+// isIntegerToken reports whether raw is a JSON number with no fractional or
+// exponent part, i.e. one that int64 can represent exactly.
+func isIntegerToken(raw []byte) bool {
+	if len(raw) == 0 {
+		return false
+	}
+	for i := 0; i < len(raw); i++ {
+		switch raw[i] {
+		case '.', 'e', 'E':
+			return false
+		}
+	}
+	return true
 }
 
 // add appends the extracted value for rule i to the right target bucket.

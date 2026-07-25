@@ -50,13 +50,48 @@ type pattern struct {
 	prefilter func(string) bool
 }
 
+// asciiFold renders a literal keyword as a regex matching exactly its ASCII
+// case variants ("key" -> "[Kk][Ee][Yy]").
+//
+// The built-in patterns use this instead of (?i) because Go's (?i) folds via
+// unicode.SimpleFold: `(?i)password` also matches `paſsword` (U+017F LATIN
+// SMALL LETTER LONG S) and `(?i)token` matches `toKen` (U+212A KELVIN SIGN).
+// The literal prefilters that gate those regexes fold ASCII only, so such a
+// line was rejected by the prefilter, the pattern was skipped entirely, and
+// the secret shipped unredacted — a security control quietly narrower than the
+// regex it advertises. Constraining the regex to ASCII case makes the two
+// exactly equal, which is what the prefilter optimisation requires to be safe.
+func asciiFold(word string) string {
+	var b strings.Builder
+	for i := 0; i < len(word); i++ {
+		c := word[i]
+		switch {
+		case c >= 'a' && c <= 'z':
+			b.WriteByte('[')
+			b.WriteByte(c - 'a' + 'A')
+			b.WriteByte(c)
+			b.WriteByte(']')
+		case c >= 'A' && c <= 'Z':
+			b.WriteByte('[')
+			b.WriteByte(c)
+			b.WriteByte(c - 'A' + 'a')
+			b.WriteByte(']')
+		default:
+			b.WriteString(regexp.QuoteMeta(string(c)))
+		}
+	}
+	return b.String()
+}
+
 func containsFold(sub string) func(string) bool {
 	lower := strings.ToLower(sub)
 	return func(s string) bool {
-		// A TRUE ASCII case-insensitive scan: the guarded regexes are (?i), so
-		// the prefilter must not be narrower than them. The old three-casing
-		// (lower/UPPER/Title) check let a mixed-case keyword (`bEaReR`,
-		// `pAsSwOrD`) skip redaction — a real secret-leak gap. Zero-alloc.
+		// A TRUE ASCII case-insensitive scan, matching the ASCII-only case
+		// classes the guarded regexes use (see asciiFold): the prefilter must
+		// be neither narrower NOR wider than its regex. The original
+		// three-casing (lower/UPPER/Title) check let a mixed-case keyword
+		// (`bEaReR`, `pAsSwOrD`) skip redaction — a real secret-leak gap.
+		// Zero-alloc.
 		return asciiIndexFold(s, lower) >= 0
 	}
 }
@@ -126,19 +161,23 @@ var (
 var builtins = map[string]pattern{
 	"bearer": {
 		name:      "bearer",
-		re:        regexp.MustCompile(`(?i)\b(bearer\s+)[A-Za-z0-9\-._~+/]+=*`),
+		re:        regexp.MustCompile(`\b(` + asciiFold("bearer") + `\s+)[A-Za-z0-9\-._~+/]+=*`),
 		repl:      "${1}" + redacted,
 		prefilter: containsFold("bearer"),
 	},
 	"basic-auth": {
 		name:      "basic-auth",
-		re:        regexp.MustCompile(`(?i)\b(basic\s+)[A-Za-z0-9+/]{8,}=*`),
+		re:        regexp.MustCompile(`\b(` + asciiFold("basic") + `\s+)[A-Za-z0-9+/]{8,}=*`),
 		repl:      "${1}" + redacted,
 		prefilter: containsFold("basic"),
 	},
 	"secret-kv": {
 		name: "secret-kv",
-		re:   regexp.MustCompile(`(?i)\b((?:api[_-]?key|secret|password|passwd|pwd|token|access[_-]?key)["']?\s*[:=]\s*["']?)[^\s"'&,;]+`),
+		re: regexp.MustCompile(`\b((?:` + asciiFold("api") + `[_-]?` + asciiFold("key") +
+			`|` + asciiFold("secret") + `|` + asciiFold("password") + `|` + asciiFold("passwd") +
+			`|` + asciiFold("pwd") + `|` + asciiFold("token") +
+			`|` + asciiFold("access") + `[_-]?` + asciiFold("key") +
+			`)["']?\s*[:=]\s*["']?)[^\s"'&,;]+`),
 		repl: "${1}" + redacted,
 		prefilter: func(s string) bool {
 			return pfKey(s) || pfSecret(s) || pfPassw(s) || pfPwd(s) || pfToken(s)

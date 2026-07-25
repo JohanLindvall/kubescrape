@@ -198,21 +198,46 @@ func (s *Server) handleNodeTargets(w http.ResponseWriter, r *http.Request) {
 				podTargets = append(podTargets, scrape.PodMonitorTargets(np.Pod, pm.Namespace+"/"+pm.Name, ep)...)
 			}
 		}
-		// The same endpoint can be reachable via pod and service
-		// annotations; keep the first occurrence (pod source wins).
-		seen := make(map[string]struct{}, len(podTargets))
+		// The same endpoint can be reachable via pod and service annotations;
+		// keep the first occurrence (pod source wins).
+		//
+		// EXCEPT when a later duplicate carries monitor configuration the
+		// earlier one cannot: a ServiceMonitor/PodMonitor endpoint's
+		// bearerTokenSecret, insecureSkipVerify and metricRelabelings live only
+		// on the monitor-derived target, and monitors are appended last. An
+		// org-wide `prometheus.io/scrape: "true"` annotation coexisting with
+		// prometheus-operator CRDs is common, and dropping the monitor target
+		// meant scraping a token-protected endpoint unauthenticated (401 — total
+		// metric loss, visible only as up=0) and, worse, exporting the very
+		// series a drop rule asked to remove. The URL is identical either way,
+		// so keeping the configured variant scrapes the same endpoint, correctly.
+		seen := make(map[string]int, len(podTargets)) // URL -> index in targets
 		for _, t := range podTargets {
-			if _, dup := seen[t.URL]; dup {
+			i, dup := seen[t.URL]
+			if !dup {
+				seen[t.URL] = len(targets)
+				targets = append(targets, t)
 				continue
 			}
-			seen[t.URL] = struct{}{}
-			targets = append(targets, t)
+			if configuredTarget(t) && !configuredTarget(targets[i]) {
+				targets[i] = t
+			}
 		}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"node":    node,
 		"targets": targets,
 	})
+}
+
+// configuredTarget reports whether t carries endpoint configuration that only
+// a ServiceMonitor/PodMonitor can supply. Losing any of it to URL dedup changes
+// what is scraped or what is exported: without the bearer token the scrape 401s
+// (total metric loss for the target), without insecureSkipVerify an https
+// endpoint with a private CA fails, and without the metricRelabelings the
+// series a drop rule targets are exported anyway.
+func configuredTarget(t kubemeta.ScrapeTarget) bool {
+	return t.AuthSecret != "" || t.InsecureSkipVerify || len(t.MetricRelabelings) > 0
 }
 
 // handleScrapeAuth serves GET /v1/scrape-auth/{namespace}/{name}/{key}: the

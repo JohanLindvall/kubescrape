@@ -155,3 +155,49 @@ func RegisterStoreStats(stats func() (pods, containers int)) {
 		"Container IDs currently indexed (including tombstones).",
 		func() float64 { _, containers := stats(); return float64(containers) })
 }
+
+// RegisterBufferStats exposes the disk buffer's per-signal backlog as gauges
+// evaluated at export time.
+//
+// Every other buffer metric is a counter that only moves once data is ALREADY
+// being dropped or refused (dropped/full/read_errors): by then the collector
+// has been degrading for a while and the tailer is back-pressured. The backlog
+// against its cap is the leading indicator — "the spool is at 70% and
+// climbing" — and it was previously unobservable even though the spool had
+// tracked the number all along.
+func RegisterBufferStats(stats func() map[string]BufferStat) {
+	Registry.GaugeFuncVec("kubescrape_buffer_backlog_bytes",
+		"Undelivered bytes currently queued in the disk buffer, per signal (what -buffer-max-bytes caps).",
+		"signal", func() map[string]float64 {
+			out := map[string]float64{}
+			for sig, st := range stats() {
+				out[sig] = float64(st.Backlog)
+			}
+			return out
+		})
+	Registry.GaugeFuncVec("kubescrape_buffer_max_bytes",
+		"Configured disk-buffer cap per signal (0 = uncapped); backlog/max is the utilisation to alert on.",
+		"signal", func() map[string]float64 {
+			out := map[string]float64{}
+			for sig, st := range stats() {
+				out[sig] = float64(st.Cap)
+			}
+			return out
+		})
+	Registry.GaugeFuncVec("kubescrape_buffer_segments",
+		"Disk-buffer segment files on disk per signal. Physical footprint can exceed the backlog by up to one segment (a delivered but unreclaimed prefix).",
+		"signal", func() map[string]float64 {
+			out := map[string]float64{}
+			for sig, st := range stats() {
+				out[sig] = float64(st.Segments)
+			}
+			return out
+		})
+}
+
+// BufferStat is one signal's disk-buffer occupancy.
+type BufferStat struct {
+	Backlog  int64
+	Cap      int64
+	Segments int
+}

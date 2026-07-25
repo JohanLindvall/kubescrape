@@ -125,6 +125,19 @@ func (b *Buffered) Run(ctx context.Context) {
 	wg.Wait()
 }
 
+// Stats reports each signal's disk-buffer occupancy, for the gauges that make
+// a filling buffer visible BEFORE it starts refusing writes.
+func (b *Buffered) Stats() map[string]obs.BufferStat {
+	out := map[string]obs.BufferStat{}
+	for kind, sp := range map[string]*spool.Spool{"logs": b.logs.spoolOf(), "metrics": b.metrics.spoolOf()} {
+		if sp == nil {
+			continue
+		}
+		out[kind] = obs.BufferStat{Backlog: sp.Bytes(), Cap: sp.Cap(), Segments: sp.Segments()}
+	}
+	return out
+}
+
 // FinalDrain empties both spools, returning as soon as they run dry (or when
 // ctx expires). Run stops the instant its context is cancelled, so everything
 // exported after SIGTERM — the tailer's and journald's last flushes, the ingest
@@ -209,6 +222,14 @@ func (s *sink[T]) enqueue(v T) error {
 
 // drain sends queued batches to the exporter until ctx is done. A nil sink (its
 // signal unbuffered) returns immediately.
+// spoolOf returns the sink's spool, nil-safe (a signal can be disabled).
+func (s *sink[T]) spoolOf() *spool.Spool {
+	if s == nil {
+		return nil
+	}
+	return s.spool
+}
+
 func (s *sink[T]) drain(ctx context.Context) { s.drainLoop(ctx, false) }
 
 // drainUntilEmpty is drain that returns when the spool runs dry instead of

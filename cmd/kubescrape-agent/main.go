@@ -366,6 +366,9 @@ func run() error {
 		}()
 		out = buffered
 		finalDrain = buffered.FinalDrain
+		// Make a filling buffer visible BEFORE it starts refusing writes: every
+		// other buffer metric only moves once data is already being dropped.
+		obs.RegisterBufferStats(buffered.Stats)
 		log.Info("disk buffer enabled", "dir", *bufferDir, "max-bytes-per-signal", *bufferMax)
 	}
 

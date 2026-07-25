@@ -698,6 +698,21 @@ func (s *Spool) Bytes() int64 {
 	return s.backlog()
 }
 
+// Cap is the configured MaxBytes (0 = uncapped). Exposed so a monitor can
+// report utilisation rather than a bare byte count: "the buffer is at 70% and
+// climbing" is the signal that a collector is degrading, and it is only
+// expressible against the cap.
+func (s *Spool) Cap() int64 { return s.maxBytes }
+
+// Segments is the number of segment files currently on disk. Physical
+// footprint can exceed the backlog by up to one segment (a delivered but
+// unreclaimed prefix), so this is the number to watch for disk pressure.
+func (s *Spool) Segments() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.segs)
+}
+
 // Close releases the file handles. It does not delete queued data.
 func (s *Spool) Close() error {
 	s.mu.Lock()

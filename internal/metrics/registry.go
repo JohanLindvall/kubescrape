@@ -33,6 +33,11 @@ const registryExpiration = 200 * 365 * 24 * time.Hour
 type gaugeFunc struct {
 	s  *series
 	fn func() float64
+	// labelName/fnVec hold the LABELED form (GaugeFuncVec): fnVec returns one
+	// value per label value, and each becomes its own data point. Set together;
+	// when fnVec is non-nil, fn is unused.
+	labelName string
+	fnVec     func() map[string]float64
 	// mu serializes the fn()+delta+observe read-modify-write of `last`
 	// against concurrent Exports. The in-repo wiring is sequential (Run is
 	// one goroutine; FinalExport runs after Run has returned), but the
@@ -95,6 +100,18 @@ func (r *Registry) CounterFunc(name, desc string, fn func() float64) {
 	s := r.add(name, desc, kindCounter, actionSet, nil)
 	r.mu.Lock()
 	r.funcs = append(r.funcs, &gaugeFunc{s: s, fn: fn})
+	r.mu.Unlock()
+}
+
+// GaugeFuncVec registers a gauge with ONE label whose values are read at
+// export time: fn returns a value per label value, and each becomes a data
+// point. For quantities owned by another package that are naturally per-signal
+// or per-instance (the disk buffer's per-signal backlog, say) and would
+// otherwise need one differently-NAMED metric each.
+func (r *Registry) GaugeFuncVec(name, desc, labelName string, fn func() map[string]float64) {
+	s := r.add(name, desc, kindGauge, actionSet, nil)
+	r.mu.Lock()
+	r.funcs = append(r.funcs, &gaugeFunc{s: s, labelName: labelName, fnVec: fn})
 	r.mu.Unlock()
 }
 
@@ -246,6 +263,15 @@ func (r *Registry) Export(ctx context.Context, exp Exporter, res pcommon.Resourc
 
 	for _, gf := range funcs {
 		gf.mu.Lock()
+		if gf.fnVec != nil {
+			// Labeled gauges are always plain gauges (no counter-delta form),
+			// so each label value observes its own current value.
+			for lv, v := range gf.fnVec() {
+				gf.s.observe(labels{}.set(gf.labelName, lv), v, resKey{}, emptyResource, nil)
+			}
+			gf.mu.Unlock()
+			continue
+		}
 		v := gf.fn()
 		if gf.s.kind == kindCounter {
 			// Push the delta since the last export (see gaugeFunc.last). A

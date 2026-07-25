@@ -320,6 +320,9 @@ func run() error {
 	// to old file offsets or dropping scraped metrics. Otherwise it is the raw
 	// client.
 	var out otlpexport.Exporter = exporter
+	// Set when the disk buffer is enabled: the shutdown pass that empties the
+	// spools after every producer has stopped (Buffered.Run exits on cancel).
+	var finalDrain func(context.Context)
 	if *bufferDir != "" {
 		logSpool, err := spool.Open(filepath.Join(*bufferDir, "logs"), spool.Options{MaxBytes: int64(*bufferMax)})
 		if err != nil {
@@ -338,6 +341,7 @@ func run() error {
 			buffered.Run(ctx)
 		}()
 		out = buffered
+		finalDrain = buffered.FinalDrain
 		log.Info("disk buffer enabled", "dir", *bufferDir, "max-bytes-per-signal", *bufferMax)
 	}
 
@@ -503,6 +507,17 @@ func run() error {
 		// wg.Wait; counters they bumped (last batches, shutdown drops) would
 		// otherwise die unexported. One more export now that everything is done.
 		obs.Registry.FinalExport(out, selfRes, log)
+	}
+	if finalDrain != nil {
+		// Everything above only reached the SPOOL: Buffered.Run stopped when
+		// ctx was cancelled. Empty it now, before the deferred exporter and
+		// spool Closes, or this window waits for the next start of this pod on
+		// this node — and is lost outright if the pod never comes back or the
+		// buffer dir is not persistent. Bounded: a dead collector must not
+		// outlive the pod's termination grace.
+		dctx, dcancel := context.WithTimeout(context.Background(), 10*time.Second)
+		finalDrain(dctx)
+		dcancel()
 	}
 	return fatalErr
 }

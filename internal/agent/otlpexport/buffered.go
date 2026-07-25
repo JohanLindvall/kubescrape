@@ -125,6 +125,25 @@ func (b *Buffered) Run(ctx context.Context) {
 	wg.Wait()
 }
 
+// FinalDrain empties both spools, returning as soon as they run dry (or when
+// ctx expires). Run stops the instant its context is cancelled, so everything
+// exported after SIGTERM — the tailer's and journald's last flushes, the ingest
+// batcher's shutdown drain, and the final log-metrics and self-metrics windows,
+// which are exported only after those goroutines have joined — reaches the
+// spool and nothing carries it further. Without this pass that data waits for
+// the next start of this pod ON THIS NODE, and is lost outright when the pod
+// never returns (node drained or scaled away, release uninstalled) or the
+// buffer dir is not a persistent mount. Call it with a bounded fresh context
+// after all producers have stopped, before closing the exporter and spools.
+func (b *Buffered) FinalDrain(ctx context.Context) {
+	var wg sync.WaitGroup
+	for _, run := range []func(context.Context){b.logs.drainUntilEmpty, b.metrics.drainUntilEmpty} {
+		wg.Add(1)
+		go func(r func(context.Context)) { defer wg.Done(); r(ctx) }(run)
+	}
+	wg.Wait()
+}
+
 // sink is one signal's buffer: a spool plus the (un)marshal and send functions
 // for its pdata type.
 type sink[T any] struct {
@@ -190,7 +209,13 @@ func (s *sink[T]) enqueue(v T) error {
 
 // drain sends queued batches to the exporter until ctx is done. A nil sink (its
 // signal unbuffered) returns immediately.
-func (s *sink[T]) drain(ctx context.Context) {
+func (s *sink[T]) drain(ctx context.Context) { s.drainLoop(ctx, false) }
+
+// drainUntilEmpty is drain that returns when the spool runs dry instead of
+// waiting for more (the shutdown pass — see Buffered.FinalDrain).
+func (s *sink[T]) drainUntilEmpty(ctx context.Context) { s.drainLoop(ctx, true) }
+
+func (s *sink[T]) drainLoop(ctx context.Context, untilEmpty bool) {
 	if s == nil {
 		return
 	}
@@ -208,6 +233,9 @@ func (s *sink[T]) drain(ctx context.Context) {
 			s.log.Error("disk buffer read failed", "signal", s.kind, "data_lost", lost, "error", err)
 		}
 		if !ok {
+			if untilEmpty {
+				return // spool dry: the shutdown pass is done
+			}
 			select {
 			case <-ctx.Done():
 				return

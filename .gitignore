@@ -1,5 +1,5 @@
 /bin/
 /hack/bin/
 *.test
-kubescrape-agent
+/kubescrape-agent
 /kubescrape

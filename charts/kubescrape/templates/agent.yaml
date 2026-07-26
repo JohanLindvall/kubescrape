@@ -94,6 +94,12 @@ spec:
           command: ["/kubescrape-agent"]
           args:
             - -metadata-endpoint=http://{{ .Release.Name }}.{{ .Release.Namespace }}
+            {{- if .Values.service.scrapeAuthSecrets }}
+            # /v1/scrape-auth returns Secret values and is authenticated. The
+            # flag, the mount and the service's own token all key off this one
+            # value so the two sides cannot drift apart.
+            - -scrape-auth-token-file=/etc/kubescrape/scrape-auth/{{ .Values.service.scrapeAuthToken.key | default "token" }}
+            {{- end }}
             - -listen={{ .Values.agent.listen }}
             - -self-metrics-interval={{ .Values.agent.selfMetricsInterval }}
             - -otlp-endpoint={{ .Values.agent.otlp.endpoint }}
@@ -241,6 +247,11 @@ spec:
               mountPath: /etc/kubescrape/config
               readOnly: true
             {{- end }}
+            {{- if .Values.service.scrapeAuthSecrets }}
+            - name: scrape-auth
+              mountPath: /etc/kubescrape/scrape-auth
+              readOnly: true
+            {{- end }}
             - name: varlog
               mountPath: /var/log
               readOnly: true
@@ -274,6 +285,11 @@ spec:
         - name: config
           configMap:
             name: {{ .Release.Name }}-agent-config
+        {{- end }}
+        {{- if .Values.service.scrapeAuthSecrets }}
+        - name: scrape-auth
+          secret:
+            secretName: {{ .Values.service.scrapeAuthToken.existingSecret | default (printf "%s-scrape-auth" .Release.Name) }}
         {{- end }}
         {{- if .Values.agent.otlp.bearerTokenSecret.name }}
         - name: otlp-token

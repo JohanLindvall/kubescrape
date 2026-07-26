@@ -10,6 +10,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/JohanLindvall/kubescrape/pkg/kubemeta"
 )
 
 // cachingServer serves a pod body with Cache-Control + ETag and honors
@@ -91,7 +93,7 @@ func TestClient304DoesNotClobberNewerEntry(t *testing.T) {
 			key := cacheKey("http://" + r.Host + r.URL.Path)
 			c.mu.Lock()
 			c.cache[key] = cacheEntry{
-				body:    []byte(`{"name":"web-v2","uid":"u1"}`),
+				decoded: &kubemeta.Pod{Name: "web-v2", UID: "u1"},
 				etag:    `"v2"`,
 				expires: time.Now().Add(time.Hour), // fresh vs. the fake clock
 			}
@@ -801,5 +803,58 @@ func TestAudit_ContainerNormalizesID(t *testing.T) {
 	}
 	if paths[0] != "/v1/containers/abc" {
 		t.Fatalf("path = %q, want /v1/containers/abc", paths[0])
+	}
+}
+
+// The cache stores ONE decoded value per URL and no raw body beside it, so an
+// entry that cannot be copied into the caller's result type is dropped and
+// re-fetched (unconditionally — an If-None-Match would only earn another 304 it
+// could not decode). Unreachable in practice: every caller of an endpoint asks
+// for the same type.
+func TestCacheTypeMismatchRefetches(t *testing.T) {
+	s := newSrv(t)
+	s.etag, s.maxAge = `"v1"`, "3600"
+	s.body = `{"name":"web","namespace":"ns","uid":"u1"}`
+	c := New(s.URL, 5*time.Second)
+	ctx := context.Background()
+	u := c.base + "/v1/pods/ns/web"
+
+	var first kubemeta.Pod
+	if err := c.getJSON(ctx, u, &first); err != nil {
+		t.Fatal(err)
+	}
+	if n := s.hits.Load(); n != 1 {
+		t.Fatalf("hits = %d after populate, want 1", n)
+	}
+
+	// Same URL, different result type: the cached (fresh) entry cannot serve it.
+	var other struct {
+		Name string `json:"name"`
+	}
+	if err := c.getJSON(ctx, u, &other); err != nil {
+		t.Fatal(err)
+	}
+	if other.Name != "web" {
+		t.Fatalf("mismatched-type lookup returned %+v", other)
+	}
+	if n := s.hits.Load(); n != 2 {
+		t.Fatalf("hits = %d; a type-mismatched entry must be re-fetched, not served from a retained body", n)
+	}
+	s.mu.Lock()
+	cond := s.lastETag
+	s.mu.Unlock()
+	if cond != "" {
+		t.Fatalf("re-fetch sent If-None-Match %q; it must not revalidate an entry it cannot decode", cond)
+	}
+
+	// The re-fetch re-populated the cache under the new type: no more requests.
+	var again struct {
+		Name string `json:"name"`
+	}
+	if err := c.getJSON(ctx, u, &again); err != nil {
+		t.Fatal(err)
+	}
+	if n := s.hits.Load(); n != 2 || again.Name != "web" {
+		t.Fatalf("hits = %d, name = %q; the re-fetch should have cached the new type", n, again.Name)
 	}
 }

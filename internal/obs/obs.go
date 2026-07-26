@@ -130,6 +130,8 @@ var (
 		"Ingested spans dropped by the trace sampler (probability = the consistent trace-ID decision, rate = the spans/second cap).", "reason")
 	SpanMetricsDropped = Registry.Counter("kubescrape_span_metrics_dropped_total",
 		"Spans not aggregated into span metrics because the dimension-cardinality cap was reached.")
+	SpanMetricsEvicted = Registry.Counter("kubescrape_span_metrics_evicted_total",
+		"Span-metric series dropped at export because their dimensions went unobserved for traceMetrics.staleAfter (this is what frees cardinality-cap slots).")
 )
 
 // Journald drops (agent).

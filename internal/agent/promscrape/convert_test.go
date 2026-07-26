@@ -35,7 +35,7 @@ ok_total 1
 lat 42
 `
 	before := obs.ScrapeCollisions.Value()
-	bt := newBatcher(func(pcommon.Resource) {}, 1<<30, time.Unix(1, 0), time.Unix(2, 0))
+	bt := newBatcher(func(pcommon.Resource) {}, time.Unix(1, 0), time.Unix(2, 0))
 	conv := newConverter(bt, nil)
 	p := newParser(promparse.Options{MaxLineBytes: 1 << 20})
 	if _, err := p.Parse(strings.NewReader(body), func(s Sample) error {
@@ -81,7 +81,7 @@ inf_count +Inf
 huge_sum 1
 huge_count 1e300
 `
-	bt := newBatcher(func(pcommon.Resource) {}, 1<<30, time.Unix(1, 0), time.Unix(2, 0))
+	bt := newBatcher(func(pcommon.Resource) {}, time.Unix(1, 0), time.Unix(2, 0))
 	conv := newConverter(bt, nil)
 	p := newParser(promparse.Options{MaxLineBytes: 1 << 20})
 	if _, err := p.Parse(strings.NewReader(body), func(s Sample) error {
@@ -117,6 +117,172 @@ huge_count 1e300
 				}
 			}
 		}
+	}
+}
+
+// helpUnitBody exercises every family shape with a "# HELP"/"# UNIT" pair.
+const helpUnitBody = `# TYPE http_requests counter
+# HELP http_requests Total requests handled.
+# UNIT http_requests requests
+http_requests_total{code="200"} 5
+# TYPE rpc_latency_seconds histogram
+# HELP rpc_latency_seconds RPC latency.
+# UNIT rpc_latency_seconds seconds
+rpc_latency_seconds_bucket{le="0.5"} 1
+rpc_latency_seconds_bucket{le="+Inf"} 2
+rpc_latency_seconds_sum 0.4
+rpc_latency_seconds_count 2
+# TYPE rpc_size_bytes summary
+# HELP rpc_size_bytes Payload size.
+# UNIT rpc_size_bytes bytes
+rpc_size_bytes{quantile="0.5"} 3
+rpc_size_bytes_sum 6
+rpc_size_bytes_count 2
+# TYPE mem_bytes gauge
+# HELP mem_bytes Resident memory.
+mem_bytes 42
+# TYPE undocumented gauge
+undocumented 1
+# EOF
+`
+
+// descriptions collects name -> "description|unit" across every resource of a
+// payload.
+func descriptions(md pmetric.Metrics) map[string]string {
+	out := map[string]string{}
+	rms := md.ResourceMetrics()
+	for i := 0; i < rms.Len(); i++ {
+		sms := rms.At(i).ScopeMetrics()
+		for j := 0; j < sms.Len(); j++ {
+			ms := sms.At(j).Metrics()
+			for k := 0; k < ms.Len(); k++ {
+				m := ms.At(k)
+				out[m.Name()] = m.Description() + "|" + m.Unit()
+			}
+		}
+	}
+	return out
+}
+
+// convertBody runs an exposition through the converter into cb.
+func convertBody(t *testing.T, cb chunker, body string, openMetrics bool) {
+	t.Helper()
+	conv := newConverter(cb, nil)
+	p := newParser(promparse.Options{MaxLineBytes: 1 << 20, OpenMetrics: openMetrics})
+	if _, err := p.Parse(strings.NewReader(body), func(s Sample) error { return conv.add(s) }); err != nil {
+		t.Fatal(err)
+	}
+	if err := conv.finish(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// HELP and UNIT are the standard Prometheus -> OTLP mapping for a metric's
+// Description and Unit — what Grafana and every other OTLP consumer displays.
+// Every family shape must carry them, on every batcher.
+func TestHelpAndUnitOnExportedMetrics(t *testing.T) {
+	bt := newBatcher(func(pcommon.Resource) {}, time.Unix(1, 0), time.Unix(2, 0))
+	convertBody(t, bt, helpUnitBody, true)
+	got := descriptions(bt.take())
+	want := map[string]string{
+		"http_requests_total": "Total requests handled.|requests",
+		"rpc_latency_seconds": "RPC latency.|seconds",
+		"rpc_size_bytes":      "Payload size.|bytes",
+		"mem_bytes":           "Resident memory.|",
+		"undocumented":        "|",
+	}
+	for name, w := range want {
+		if got[name] != w {
+			t.Errorf("%s = %q, want %q", name, got[name], w)
+		}
+	}
+}
+
+// The split and cadvisor batchers emit one resource per DESCRIBED object, each
+// with its own copy of the descriptor — the description must be on all of them,
+// not only the first.
+func TestHelpAndUnitOnPerObjectResources(t *testing.T) {
+	s := New(Config{
+		Node: "node1", Interval: time.Hour, Timeout: time.Second,
+		Targets: staticTargets{}, Exporter: &captureExporter{},
+		Kubelet: KubeletConfig{Meta: &fakeMetaSource{}}, StartTime: time.Unix(1, 0),
+	})
+
+	t.Run("split", func(t *testing.T) {
+		sp, err := NewSplitters([]SplitterConfig{{
+			Match: SplitterMatch{PodName: "ksm-.+"},
+			Rules: []SplitRule{{Metrics: `kube_pod_.+`, GroupBy: map[string]string{
+				"namespace": "k8s.namespace.name", "pod": "k8s.pod.name",
+			}}},
+		}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		target := testTarget("http://ksm:8080/metrics")
+		target.Pod.Name = "ksm-abc"
+		cb := newSplitBatcher(s, context.Background(), target, sp[0], time.Unix(2, 0))
+		convertBody(t, cb, `# HELP kube_pod_info Information about pod.
+# TYPE kube_pod_info gauge
+kube_pod_info{namespace="ns1",pod="p1"} 1
+kube_pod_info{namespace="ns1",pod="p2"} 1
+`, false)
+		md := cb.take()
+		if n := md.ResourceMetrics().Len(); n != 2 {
+			t.Fatalf("resources = %d, want one per described pod", n)
+		}
+		for i := 0; i < md.ResourceMetrics().Len(); i++ {
+			m := md.ResourceMetrics().At(i).ScopeMetrics().At(0).Metrics().At(0)
+			if m.Description() != "Information about pod." {
+				t.Errorf("resource %d description = %q", i, m.Description())
+			}
+		}
+	})
+
+	t.Run("cadvisor", func(t *testing.T) {
+		cb := newCadvisorBatcher(s, time.Unix(2, 0), context.Background())
+		convertBody(t, cb, `# HELP container_cpu_usage_seconds_total Cumulative cpu time consumed.
+# TYPE container_cpu_usage_seconds_total counter
+container_cpu_usage_seconds_total{namespace="ns1",pod="pod1",container="app",id="/kubepods/burstable/pod`+uid1+`/`+appCID+`"} 12.5
+container_cpu_usage_seconds_total{id="/kubepods"} 100
+`, false)
+		md := cb.take()
+		if n := md.ResourceMetrics().Len(); n != 2 {
+			t.Fatalf("resources = %d, want the container and the rollup", n)
+		}
+		for i := 0; i < md.ResourceMetrics().Len(); i++ {
+			m := md.ResourceMetrics().At(i).ScopeMetrics().At(0).Metrics().At(0)
+			if m.Description() != "Cumulative cpu time consumed." {
+				t.Errorf("resource %d description = %q", i, m.Description())
+			}
+		}
+	})
+}
+
+// The chunk-size estimate gates every flush; a description it does not charge
+// for is a chunk that encodes past the collector's receive limit. The estimate
+// must grow by at least what the descriptions actually add to the payload.
+func TestDescriptionsChargedToSizeEstimate(t *testing.T) {
+	help := strings.Repeat("x", 300)
+	build := func(withHelp bool) (est, encoded int) {
+		var body strings.Builder
+		for i := 0; i < 20; i++ {
+			if withHelp {
+				fmt.Fprintf(&body, "# HELP fam%02d %s\n# UNIT fam%02d seconds\n", i, help, i)
+			}
+			fmt.Fprintf(&body, "# TYPE fam%02d counter\nfam%02d_total 1\n", i, i)
+		}
+		body.WriteString("# EOF\n")
+		bt := newBatcher(func(pcommon.Resource) {}, time.Unix(1, 0), time.Unix(2, 0))
+		convertBody(t, bt, body.String(), true)
+		est = bt.size()
+		var m pmetric.ProtoMarshaler
+		return est, m.MetricsSize(bt.take())
+	}
+	estWith, encWith := build(true)
+	estWithout, encWithout := build(false)
+	if estWith-estWithout < encWith-encWithout {
+		t.Fatalf("estimate grew by %d bytes but the payload grew by %d: an under-charged chunk flushes past the collector limit",
+			estWith-estWithout, encWith-encWithout)
 	}
 }
 
@@ -311,7 +477,7 @@ rpc{quantile="0.9"} 9
 rpc_sum 1
 rpc_count 4
 `
-	bt := newBatcher(func(pcommon.Resource) {}, 1<<30, time.Unix(1, 0), time.Unix(2, 0))
+	bt := newBatcher(func(pcommon.Resource) {}, time.Unix(1, 0), time.Unix(2, 0))
 	conv := newConverter(bt, nil)
 	p := newParser(promparse.Options{MaxLineBytes: 1 << 20})
 	if _, err := p.Parse(strings.NewReader(body), func(s Sample) error { return conv.add(s) }); err != nil {

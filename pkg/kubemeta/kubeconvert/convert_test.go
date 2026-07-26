@@ -104,6 +104,47 @@ func TestFromPodNoStatuses(t *testing.T) {
 	}
 }
 
+// Readiness and the deletion timestamp are carried on the model: the phase
+// says neither. A draining pod stays Running for its whole grace period (the
+// only signal it is going away), and a Running pod may be failing every
+// readiness probe.
+func TestFromPodReadyAndDeletionTimestamp(t *testing.T) {
+	deleted := time.Date(2026, 7, 26, 12, 0, 0, 0, time.UTC)
+	base := func(conds []corev1.PodCondition, deletionTS *metav1.Time) *corev1.Pod {
+		return &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Name: "p", Namespace: "ns", UID: "u", DeletionTimestamp: deletionTS},
+			Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "app"}}},
+			Status:     corev1.PodStatus{Phase: corev1.PodRunning, Conditions: conds},
+		}
+	}
+
+	ready := []corev1.PodCondition{
+		{Type: corev1.PodInitialized, Status: corev1.ConditionTrue},
+		{Type: corev1.PodReady, Status: corev1.ConditionTrue},
+	}
+	notReady := []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionFalse}}
+
+	if pod, _ := FromPod(base(ready, nil)); !pod.Ready || pod.DeletionTimestamp != nil {
+		t.Errorf("live ready pod: ready=%v deletionTimestamp=%v", pod.Ready, pod.DeletionTimestamp)
+	}
+	if pod, _ := FromPod(base(notReady, nil)); pod.Ready {
+		t.Error("PodReady=False must not report Ready")
+	}
+	// No conditions at all (freshly scheduled): not ready, not terminating.
+	if pod, _ := FromPod(base(nil, nil)); pod.Ready || pod.DeletionTimestamp != nil {
+		t.Errorf("condition-less pod = %+v", pod)
+	}
+
+	pod, _ := FromPod(base(ready, &metav1.Time{Time: deleted}))
+	if pod.DeletionTimestamp == nil || !pod.DeletionTimestamp.Equal(deleted) {
+		t.Fatalf("deletionTimestamp = %v, want %v", pod.DeletionTimestamp, deleted)
+	}
+	// Still Running and Ready — which is exactly why the timestamp is needed.
+	if pod.Phase != "Running" || !pod.Ready || pod.DeletedAt != nil {
+		t.Fatalf("terminating pod = %+v (DeletedAt is the tombstone marker, not this)", pod)
+	}
+}
+
 func testCorePod() *corev1.Pod {
 	created := time.Date(2026, 7, 1, 10, 0, 0, 0, time.UTC)
 	started := created.Add(5 * time.Second)

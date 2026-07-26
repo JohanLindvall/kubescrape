@@ -23,3 +23,24 @@ func BenchmarkConsume(b *testing.B) {
 		g.Consume(td)
 	}
 }
+
+// BenchmarkConsumeBatch pins the per-batch cost model: the staleness clock is
+// read once per Consume (per exported payload), not per span, so a realistic
+// multi-span batch pays it only once. Per-span work must stay 0 allocs.
+func BenchmarkConsumeBatch(b *testing.B) {
+	g := New(Config{})
+	specs := make([]spanSpec, 100)
+	for i := range specs {
+		specs[i] = spanSpec{
+			name: "GET /api/v1/orders", kind: ptrace.SpanKindServer, status: ptrace.StatusCodeOk,
+			dur: 0.012, traceID: tid1, spanID: sid1,
+		}
+	}
+	td := traces("checkout", specs...)
+	g.Consume(td) // warm the series
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		g.Consume(td)
+	}
+}

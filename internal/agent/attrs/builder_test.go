@@ -103,7 +103,7 @@ func TestBuilderDefaultsOff(t *testing.T) {
 }
 
 func TestBuilderFilterRunsLast(t *testing.T) {
-	filter, err := NewFilter("", "cluster")
+	filter, err := NewFilterFromLists(nil, []string{"cluster"})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -22,7 +22,7 @@ func TestAttrFilter(t *testing.T) {
 	dir := t.TempDir()
 	exp := &fakeExporter{}
 	tl := newTestTailer(dir, "", exp)
-	filter, err := attrs.NewFilter("", `k8s\.pod\.label\..*`)
+	filter, err := attrs.NewFilterFromLists(nil, []string{`k8s\.pod\.label\..*`})
 	if err != nil {
 		t.Fatal(err)
 	}

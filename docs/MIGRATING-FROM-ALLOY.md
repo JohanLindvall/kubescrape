@@ -255,7 +255,10 @@ under the same flag whenever the cluster serves that CRD — covering
 Per-endpoint `tlsConfig.insecureSkipVerify` and `bearerTokenSecret` **are**
 interpreted (run the metadata service with `-scrape-auth-secrets` so agents
 can fetch the tokens; it needs `secrets get` RBAC, commented in the
-manifests), and the keep/drop subset of `metricRelabelings` is applied per
+manifests, plus `-scrape-auth-token-file` — the bearer token agents present
+on `/v1/scrape-auth`, which the chart generates and mounts on both sides when
+`service.scrapeAuthSecrets` is set), and the keep/drop subset of
+`metricRelabelings` is applied per
 sample by the agent. Other relabel actions, other authentication schemes and
 per-endpoint interval overrides are still **not** interpreted — convert
 those monitors to annotated Services or metrics-config rules.

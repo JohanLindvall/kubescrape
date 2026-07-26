@@ -178,7 +178,7 @@ func BenchmarkConvertScrape(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		bt := newBatcher(func(pcommon.Resource) {}, 1<<30, time.Unix(1, 0), time.Unix(2, 0))
+		bt := newBatcher(func(pcommon.Resource) {}, time.Unix(1, 0), time.Unix(2, 0))
 		conv := newConverter(bt, nil)
 		fs := filter.session()
 		p := promparse.Get(promparse.Options{MaxLineBytes: 1 << 20}) // the production path: pooled parser + reader

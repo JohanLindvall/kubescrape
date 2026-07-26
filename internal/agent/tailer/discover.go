@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/JohanLindvall/kubescrape/internal/obs"
 	"github.com/fsnotify/fsnotify"
@@ -191,6 +192,25 @@ func (t *Tailer) scanDir(checkpoints map[string]checkpoint, initial bool) {
 	}
 }
 
+// tooOld reports whether a source's ignoreOlder cutoff excludes this file.
+//
+// It applies ONLY to files we have never read: one already tracked, or one
+// carrying a stored offset, is read however stale it looks. Ignoring those
+// would abandon the bytes between the committed offset and EOF, and — worse —
+// re-ingest the file from scratch if it were ever written to again, since
+// dropping it also drops its checkpoint. A cutoff is a discovery-time cost
+// lever ("don't start on last week's rotated logs"), not a retention policy.
+func (t *Tailer) tooOld(st os.FileInfo, path string, cutoff time.Duration, checkpoints map[string]checkpoint) bool {
+	if time.Since(st.ModTime()) <= cutoff {
+		return false
+	}
+	if _, known := t.files[path]; known {
+		return false
+	}
+	_, hasCheckpoint := checkpoints[path]
+	return !hasCheckpoint
+}
+
 // claimPath decides one globbed path's fate for its source: skip (non-regular
 // or transiently unstattable), claim-though-skipped (excluded namespace or
 // unparseable CRI name — a later catch-all source must not resurrect it),
@@ -209,6 +229,8 @@ func (t *Tailer) claimPath(src *compiledSource, path string, seen map[string]str
 		// Non-regular files (FIFOs, sockets, devices) are never tracked:
 		// open(2)/read(2) on a FIFO block indefinitely and would wedge the
 		// single sweep goroutine node-wide.
+		return false
+	} else if src.ignoreOlder > 0 && t.tooOld(st, path, src.ignoreOlder, checkpoints) {
 		return false
 	}
 	var id string

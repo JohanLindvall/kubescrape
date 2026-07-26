@@ -1,7 +1,6 @@
 package attrs
 
 import (
-	"errors"
 	"fmt"
 	"regexp"
 	"strings"
@@ -21,47 +20,11 @@ type Filter struct {
 	disable *regexp.Regexp
 }
 
-// NewFilter compiles a filter from comma-separated regex lists; empty
-// strings mean "enable all" and "disable none" respectively.
-func NewFilter(enable, disable string) (*Filter, error) {
-	f := &Filter{}
-	var err error
-	if f.enable, err = compileSet(enable); err != nil {
-		return nil, fmt.Errorf("enable patterns: %w", err)
-	}
-	if f.disable, err = compileSet(disable); err != nil {
-		return nil, fmt.Errorf("disable patterns: %w", err)
-	}
-	if f.enable == nil && f.disable == nil {
-		return nil, nil // keep-everything filters stay nil (no-op fast path)
-	}
-	return f, nil
-}
-
-// compileSet turns a comma-separated pattern list into one fully anchored
-// alternation; nil for an empty list.
-func compileSet(patterns string) (*regexp.Regexp, error) {
-	parts := strings.Split(patterns, ",")
-	for _, p := range parts {
-		if p = strings.TrimSpace(p); p == "" {
-			continue
-		}
-		// A regex containing a comma (e.g. `.{1,3}`) splits into fragments that
-		// RE2 still compiles — as literal braces — so an enable filter would
-		// silently drop every intended attribute. Unbalanced brackets are the
-		// fragment fingerprint; reject them loudly. The LIST form has no such
-		// hazard and skips this check.
-		if err := checkBalanced(p); err != nil {
-			return nil, fmt.Errorf("pattern %q: %w (commas split this string — use the config's list form, which allows commas inside a pattern)", p, err)
-		}
-	}
-	return compileList(parts)
-}
-
-// NewFilterFromLists compiles a filter from regex LISTS — the config form.
-// Preferred over NewFilter: a YAML list needs no comma splitting, so a pattern
-// may itself contain a comma (`.{1,3}`), which the comma-separated flag form
-// could not express at all.
+// NewFilterFromLists compiles a filter from regex LISTS — the only config
+// form. The comma-separated flag form it replaced could not express a pattern
+// containing a comma at all: `.{1,3}` split into two fragments that RE2 still
+// compiled, as literal braces, so the filter silently dropped every attribute
+// it was meant to keep.
 func NewFilterFromLists(enable, disable []string) (*Filter, error) {
 	f := &Filter{}
 	var err error
@@ -88,34 +51,6 @@ func compileList(patterns []string) (*regexp.Regexp, error) {
 		return nil, nil
 	}
 	return regexp.Compile("^(?:" + strings.Join(parts, "|") + ")$")
-}
-
-// checkBalanced rejects a pattern with unbalanced (), [] or {} — the signature
-// of a comma-split regex fragment (escaped brackets are skipped).
-func checkBalanced(p string) error {
-	var round, square, curly int
-	for i := 0; i < len(p); i++ {
-		switch p[i] {
-		case '\\':
-			i++ // skip the escaped character
-		case '(':
-			round++
-		case ')':
-			round--
-		case '[':
-			square++
-		case ']':
-			square--
-		case '{':
-			curly++
-		case '}':
-			curly--
-		}
-	}
-	if round != 0 || square != 0 || curly != 0 {
-		return errors.New("unbalanced brackets (regex fragment?)")
-	}
-	return nil
 }
 
 // Keep reports whether an attribute key survives the filter.

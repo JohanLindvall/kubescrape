@@ -86,9 +86,10 @@ type record struct {
 	// deleted it holds the tombstone expiry time.
 	expireAt time.Time
 	// terminating is true once the pod has a deletionTimestamp (graceful
-	// teardown in progress; phase stays Running). Such a pod's status still
-	// carries its now-recycled PodIP, so it must not steal the IP index from a
-	// live pod that legitimately holds it.
+	// teardown in progress; phase stays Running), mirroring
+	// pod.DeletionTimestamp. Such a pod's status still carries its
+	// now-recycled PodIP, so it must not steal the IP index from a live pod
+	// that legitimately holds it.
 	terminating bool
 	// ipSeq is the store sequence at which this record last ACQUIRED its
 	// current PodIP (see Store.ipSeq).
@@ -159,7 +160,11 @@ func (s *Store) UpsertPod(p *corev1.Pod) {
 	rec.ownerRefs = cloneOwnerRefs(p.OwnerReferences)
 	rec.resourceVersion = p.ResourceVersion
 	rec.expireAt = time.Time{} // resurrect if a late update follows a delete
-	rec.terminating = p.DeletionTimestamp != nil
+	// One source of truth for "this pod is draining": the converted model's
+	// DeletionTimestamp, which is also what the API serves and what
+	// scrape.Scrapeable filters on. Re-deriving it from p here would let the
+	// two drift.
+	rec.terminating = pod.DeletionTimestamp != nil
 
 	s.indexContainersLocked(rec, p.UID, containers, oldIDs)
 

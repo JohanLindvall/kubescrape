@@ -7,36 +7,6 @@ import (
 	"sort"
 )
 
-// FilterConfig declares which scraped series are exported. It is loaded from
-// YAML (-metrics-filter-config):
-//
-//	pipelines:
-//	  all:                    # prepended to every pipeline's rules
-//	    - action: keep        # exceptions go before the drop they punch through
-//	      metrics: 'envoy_cluster_upstream_rq_total|envoy_requests_total'
-//	    - action: drop
-//	      metrics: '(envoy_|otelcol_|prometheus_).+'
-//	  cadvisor:
-//	    - action: keep
-//	      metrics: 'container_network_(receive|transmit)_bytes_total'
-//	      labels:
-//	        interface: 'eth0'
-//	    - action: drop
-//	      metrics: 'container_network_.+'
-//
-// Rules are evaluated in order (the "all" list first, then the pipeline's
-// own list); the first matching rule decides. A series with no matching rule
-// is kept. Regexes are fully anchored; a rule matches when the series name
-// matches `metrics` (empty = any) and every `labels` entry matches the
-// series' label value (a missing label matches against "").
-//
-// Filtering happens on the scraped series names (e.g. `foo_bucket`), before
-// histogram/summary grouping — dropping only some component series of a
-// family yields a partial family, exactly as with Prometheus relabeling.
-type FilterConfig struct {
-	Pipelines map[string][]FilterRule `json:"pipelines,omitempty"`
-}
-
 // FilterRule is one keep/drop decision.
 type FilterRule struct {
 	// Action is "keep" or "drop".
@@ -61,17 +31,41 @@ type MetricFilters struct {
 
 // MetricsConfig is the `metrics` section of the agent config: per-pipeline
 // series filters plus target splitters.
+//
+// Pipelines declares which scraped series are exported:
+//
+//	pipelines:
+//	  all:                    # prepended to every pipeline's rules
+//	    - action: keep        # exceptions go before the drop they punch through
+//	      metrics: 'envoy_cluster_upstream_rq_total|envoy_requests_total'
+//	    - action: drop
+//	      metrics: '(envoy_|otelcol_|prometheus_).+'
+//	  cadvisor:
+//	    - action: keep
+//	      metrics: 'container_network_(receive|transmit)_bytes_total'
+//	      labels:
+//	        interface: 'eth0'
+//	    - action: drop
+//	      metrics: 'container_network_.+'
+//
+// Rules are evaluated in order (the "all" list first, then the pipeline's
+// own list); the first matching rule decides. A series with no matching rule
+// is kept. Regexes are fully anchored; a rule matches when the series name
+// matches `metrics` (empty = any) and every `labels` entry matches the
+// series' label value (a missing label matches against "").
+//
+// Filtering happens on the scraped series names (e.g. `foo_bucket`), before
+// histogram/summary grouping — dropping only some component series of a
+// family yields a partial family, exactly as with Prometheus relabeling.
 type MetricsConfig struct {
 	Pipelines map[string][]FilterRule `json:"pipelines,omitempty"`
 	Splitters []SplitterConfig        `json:"splitters,omitempty"`
 }
 
-// NewMetricFilters compiles a FilterConfig.
-func NewMetricFilters(cfg *FilterConfig) (*MetricFilters, error) {
-	if cfg == nil {
-		return nil, nil
-	}
-	for name := range cfg.Pipelines {
+// NewMetricFilters compiles the per-pipeline rules of a MetricsConfig (see
+// MetricsConfig.Pipelines). An empty map compiles to nil: keep everything.
+func NewMetricFilters(pipelines map[string][]FilterRule) (*MetricFilters, error) {
+	for name := range pipelines {
 		ok := false
 		for _, want := range filterPipelineNames {
 			if name == want {
@@ -83,7 +77,7 @@ func NewMetricFilters(cfg *FilterConfig) (*MetricFilters, error) {
 		}
 	}
 	compile := func(pipeline string) (*MetricFilter, error) {
-		rules := append(append([]FilterRule(nil), cfg.Pipelines["all"]...), cfg.Pipelines[pipeline]...)
+		rules := append(append([]FilterRule(nil), pipelines["all"]...), pipelines[pipeline]...)
 		return newMetricFilter(rules)
 	}
 	var out MetricFilters

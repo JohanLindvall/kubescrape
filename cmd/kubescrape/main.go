@@ -218,6 +218,34 @@ func (r *k8sSecretReader) Get(ctx context.Context, namespace, name, key string) 
 	return string(val), nil
 }
 
+// loadScrapeAuthToken reads the shared bearer token guarding
+// /v1/scrape-auth. Every failure mode is fatal by design: -scrape-auth-secrets
+// turns the service into a reader of every Secret key a monitor references, so
+// "no token file", "unreadable file" and "empty file" must all stop the
+// process rather than quietly leave the endpoint open to the whole cluster.
+//
+// The token is read ONCE, at startup: a rotated token needs a restart of the
+// service (and of the agents presenting it), which is a deliberate trade for
+// having no file I/O on the request path.
+func loadScrapeAuthToken(path string) (string, error) {
+	if path == "" {
+		return "", errors.New("-scrape-auth-secrets requires -scrape-auth-token-file: " +
+			"/v1/scrape-auth serves monitor Secret keys and must not be reachable unauthenticated")
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return "", fmt.Errorf("reading -scrape-auth-token-file: %w", err)
+	}
+	// Trim: a Secret-mounted token written with a trailing newline (or an
+	// `echo`-created file) must still work — every client sends the trimmed
+	// value in the header.
+	token := strings.TrimSpace(string(b))
+	if token == "" {
+		return "", fmt.Errorf("-scrape-auth-token-file %q is empty", path)
+	}
+	return token, nil
+}
+
 // newLogger builds the process logger (mirrors the agent's).
 func newLogger(level, format string) (*slog.Logger, error) {
 	var lvl slog.Level
@@ -255,7 +283,8 @@ func run() error {
 
 		// Serve monitor endpoints' bearerTokenSecret values to agents (opt-in:
 		// needs secrets get RBAC; tokens travel the cluster-internal HTTP).
-		scrapeAuthOn = flag.Bool("scrape-auth-secrets", false, "serve ServiceMonitor/PodMonitor bearerTokenSecret values to agents on /v1/scrape-auth (requires secrets get RBAC)")
+		scrapeAuthOn        = flag.Bool("scrape-auth-secrets", false, "serve ServiceMonitor/PodMonitor bearerTokenSecret values to agents on /v1/scrape-auth (requires secrets get RBAC)")
+		scrapeAuthTokenFile = flag.String("scrape-auth-token-file", "", "file holding the shared bearer token that clients must present on /v1/scrape-auth (Authorization: Bearer <token>); REQUIRED with -scrape-auth-secrets")
 
 		// Self-metrics -> OTLP (the service's only OTLP producer).
 		selfMetricsIntv      = flag.Duration("self-metrics-interval", time.Minute, "export the service's own metrics over OTLP at this interval (0 disables)")
@@ -400,21 +429,34 @@ func run() error {
 	// HTTPServer sets the full hardened timeout set (ReadHeaderTimeout,
 	// Read/WriteTimeout > MaxWait, IdleTimeout); see its doc comment.
 	var secretReader server.SecretReader
+	var scrapeAuthToken string
 	if *scrapeAuthOn {
+		// Read the token BEFORE anything starts serving: an unauthenticated
+		// /v1/scrape-auth is a cluster-wide secret leak, so a missing or empty
+		// token file is a startup failure, never a warning.
+		scrapeAuthToken, err = loadScrapeAuthToken(*scrapeAuthTokenFile)
+		if err != nil {
+			return err
+		}
 		secretReader = &k8sSecretReader{client: client}
-		log.Info("scrape auth secrets enabled")
+		log.Info("scrape auth secrets enabled", "tokenFile", *scrapeAuthTokenFile)
 	}
-	srv := server.New(server.Config{
-		Store:    st,
-		Services: svcIndex,
-		Monitors: monitors,
-		Resolver: resolver,
-		MaxWait:  *maxWait,
-		CacheTTL: *metaCacheTTL,
-		Ready:    ready,
-		Logger:   log,
-		Secrets:  secretReader,
-	}).HTTPServer(*listen)
+	serverCfg := server.Config{
+		Store:           st,
+		Services:        svcIndex,
+		Monitors:        monitors,
+		Resolver:        resolver,
+		MaxWait:         *maxWait,
+		CacheTTL:        *metaCacheTTL,
+		Ready:           ready,
+		Logger:          log,
+		Secrets:         secretReader,
+		ScrapeAuthToken: scrapeAuthToken,
+	}
+	if err := serverCfg.Validate(); err != nil {
+		return err
+	}
+	srv := server.New(serverCfg).HTTPServer(*listen)
 
 	stopMetrics := obs.ServeMetrics(ctx, *metricsListen, log)
 	defer stopMetrics()

@@ -62,6 +62,97 @@ untyped_metric{a="b"} 1
 	}
 }
 
+// HELP and UNIT reach every sample of their family — they become the OTLP
+// metric's Description and Unit, which is what an OTLP consumer displays. They
+// are keyed by FAMILY, so a histogram's component series and an OpenMetrics
+// counter's _total series (whose names differ from the family) carry them too.
+func TestParseHelpAndUnit(t *testing.T) {
+	samples := parseAllMode(t, `# HELP http_duration_seconds Latency of \\HTTP\\ requests.\nSecond line.
+# TYPE http_duration_seconds histogram
+# UNIT http_duration_seconds seconds
+http_duration_seconds_bucket{le="0.1"} 100
+http_duration_seconds_sum 53.4
+# HELP requests Total requests.
+# TYPE requests counter
+requests_total 7
+undeclared 1
+# EOF
+`, true, false)
+	if len(samples) != 4 {
+		t.Fatalf("got %d samples: %+v", len(samples), samples)
+	}
+	wantHelp := "Latency of \\HTTP\\ requests.\nSecond line."
+	for _, s := range samples[:2] {
+		if s.Help != wantHelp || s.Unit != "seconds" {
+			t.Fatalf("%s: help=%q unit=%q, want %q/%q", s.Name, s.Help, s.Unit, wantHelp, "seconds")
+		}
+	}
+	// The counter's series name is requests_total; its HELP is on the family.
+	if samples[2].Name != "requests_total" || samples[2].Help != "Total requests." || samples[2].Unit != "" {
+		t.Fatalf("counter = %+v", samples[2])
+	}
+	// A family that declared neither carries neither — no leakage from the
+	// previous family through the last-family memo.
+	if samples[3].Help != "" || samples[3].Unit != "" {
+		t.Fatalf("undeclared family = %+v", samples[3])
+	}
+}
+
+// The meta table is per-exposition, like the TYPE table: a reused parser (both
+// the plain and the pooled path) must not stamp the previous scrape's HELP on
+// this one's samples.
+func TestHelpIsPerExposition(t *testing.T) {
+	first := "# HELP a First.\na 1\n"
+	second := "a 2\n"
+	t.Run("New", func(t *testing.T) {
+		p := New(Options{})
+		var got []Sample
+		for _, body := range []string{first, second} {
+			got = got[:0]
+			if _, err := p.Parse(strings.NewReader(body), func(s Sample) error { got = append(got, s); return nil }); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if len(got) != 1 || got[0].Help != "" {
+			t.Fatalf("second parse = %+v, want no help", got)
+		}
+	})
+	t.Run("Pooled", func(t *testing.T) {
+		p := Get(Options{})
+		if _, err := p.Parse(strings.NewReader(first), func(Sample) error { return nil }); err != nil {
+			t.Fatal(err)
+		}
+		Put(p)
+		p = Get(Options{})
+		defer Put(p)
+		var got []Sample
+		if _, err := p.Parse(strings.NewReader(second), func(s Sample) error { got = append(got, s); return nil }); err != nil {
+			t.Fatal(err)
+		}
+		if len(got) != 1 || got[0].Help != "" {
+			t.Fatalf("pooled reuse = %+v, want no help", got)
+		}
+	})
+}
+
+// A HELP or UNIT line that declares nothing is ignored, not counted malformed:
+// it is a comment, and the parser must not desync on it.
+func TestMalformedMetaCommentsIgnored(t *testing.T) {
+	p := New(Options{OpenMetrics: true})
+	var got []Sample
+	malformed, err := p.Parse(strings.NewReader("# HELP\n# UNIT\n# UNIT a\n# UNIT a seconds trailing\na 1\n# EOF\n"),
+		func(s Sample) error { got = append(got, s); return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if malformed != 0 || len(got) != 1 || got[0].Value != 1 {
+		t.Fatalf("malformed=%d samples=%+v", malformed, got)
+	}
+	if got[0].Unit != "" {
+		t.Fatalf("unit = %q, want empty (the UNIT lines were malformed)", got[0].Unit)
+	}
+}
+
 func TestParseHistogramAndSummaryRoles(t *testing.T) {
 	samples := parseAll(t, `
 # TYPE http_duration histogram

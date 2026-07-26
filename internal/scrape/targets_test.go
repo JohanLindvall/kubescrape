@@ -106,8 +106,14 @@ func TestPodTargetsSkipped(t *testing.T) {
 		"no pod IP":                 func(p *kubemeta.Pod) { p.PodIP = "" },
 		"succeeded":                 func(p *kubemeta.Pod) { p.Phase = "Succeeded" },
 		"failed":                    func(p *kubemeta.Pod) { p.Phase = "Failed" },
-		"unknown named port":        func(p *kubemeta.Pod) { p.Annotations[AnnotationPort] = "nosuchport" },
-		"port out of range":         func(p *kubemeta.Pod) { p.Annotations[AnnotationPort] = "70000" },
+		// Draining: the phase stays Running and the IP is still reported, but
+		// the container is being torn down — scraping it only produces up=0.
+		"terminating": func(p *kubemeta.Pod) {
+			now := time.Now()
+			p.DeletionTimestamp = &now
+		},
+		"unknown named port": func(p *kubemeta.Pod) { p.Annotations[AnnotationPort] = "nosuchport" },
+		"port out of range":  func(p *kubemeta.Pod) { p.Annotations[AnnotationPort] = "70000" },
 		// 4294967376 == 2^32 + 80: int32 truncation would turn it into 80.
 		"port overflows int32": func(p *kubemeta.Pod) { p.Annotations[AnnotationPort] = "4294967376" },
 		"no ports declared": func(p *kubemeta.Pod) {

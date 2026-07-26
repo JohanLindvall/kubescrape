@@ -36,6 +36,20 @@ func FromPod(p *corev1.Pod) (kubemeta.Pod, map[string]kubemeta.Container) {
 		t := p.Status.StartTime.Time
 		pod.StartedAt = &t
 	}
+	if p.DeletionTimestamp != nil {
+		// The pod is draining. Its phase stays Running for the whole grace
+		// period, so this is the only signal that it is going away; the store
+		// derives record.terminating from it and scrape.Scrapeable drops it
+		// from targets.
+		t := p.DeletionTimestamp.Time
+		pod.DeletionTimestamp = &t
+	}
+	for _, c := range p.Status.Conditions {
+		if c.Type == corev1.PodReady {
+			pod.Ready = c.Status == corev1.ConditionTrue
+			break
+		}
+	}
 
 	statuses := make(map[string]*corev1.ContainerStatus)
 	collect := func(list []corev1.ContainerStatus) {

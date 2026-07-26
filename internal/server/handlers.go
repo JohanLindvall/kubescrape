@@ -250,9 +250,22 @@ func configuredTarget(t kubemeta.ScrapeTarget) bool {
 // bearer token a monitor endpoint's bearerTokenSecret references. Disabled
 // (404) unless the service runs with -scrape-auth-secrets. Responses are
 // never cacheable — a rotated token must not be re-served from a cache.
+//
+// This is the only AUTHENTICATED route: it is the only one serving Secret
+// material, and the service holds cluster-wide `secrets: get`. Clients send
+// the shared token from -scrape-auth-token-file as
+// `Authorization: Bearer <token>`; anything else is a 401 (see auth.go).
 func (s *Server) handleScrapeAuth(w http.ResponseWriter, r *http.Request) {
 	if s.secrets == nil {
+		// The feature is off, so there is nothing to protect; keep the
+		// pre-existing "not enabled" 404 rather than a misleading 401.
 		writeError(w, http.StatusNotFound, "scrape auth secrets are not enabled (-scrape-auth-secrets)")
+		return
+	}
+	// Authenticate BEFORE any lookup: an unauthenticated client must not be
+	// able to probe which secret refs a monitor names (403 vs 404) either.
+	if !s.authorizedForScrapeAuth(r) {
+		writeUnauthorized(w)
 		return
 	}
 	ns, name, key := r.PathValue("namespace"), r.PathValue("name"), r.PathValue("key")

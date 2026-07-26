@@ -1,7 +1,8 @@
 // Package owners resolves related-object metadata for pods from
 // metadata-only informer caches: the full ownership chain
-// (Pod -> ReplicaSet -> Deployment, Pod -> Job -> CronJob) including the
-// owners' labels and annotations, and the metadata of the pod's namespace.
+// (Pod -> ReplicaSet -> Deployment, Pod -> Job -> CronJob, and the
+// direct-owner kinds Pod -> StatefulSet / DaemonSet) including the owners'
+// labels and annotations, and the metadata of the pod's namespace.
 package owners
 
 import (
@@ -18,15 +19,18 @@ import (
 // GVRs whose metadata the resolver consumes. Main wires one metadata
 // informer per entry of AllGVRs.
 var (
-	ReplicaSetGVR = appsv1.SchemeGroupVersion.WithResource("replicasets")
-	DeploymentGVR = appsv1.SchemeGroupVersion.WithResource("deployments")
-	JobGVR        = batchv1.SchemeGroupVersion.WithResource("jobs")
-	CronJobGVR    = batchv1.SchemeGroupVersion.WithResource("cronjobs")
-	NamespaceGVR  = corev1.SchemeGroupVersion.WithResource("namespaces")
-	NodeGVR       = corev1.SchemeGroupVersion.WithResource("nodes")
+	ReplicaSetGVR  = appsv1.SchemeGroupVersion.WithResource("replicasets")
+	DeploymentGVR  = appsv1.SchemeGroupVersion.WithResource("deployments")
+	StatefulSetGVR = appsv1.SchemeGroupVersion.WithResource("statefulsets")
+	DaemonSetGVR   = appsv1.SchemeGroupVersion.WithResource("daemonsets")
+	JobGVR         = batchv1.SchemeGroupVersion.WithResource("jobs")
+	CronJobGVR     = batchv1.SchemeGroupVersion.WithResource("cronjobs")
+	NamespaceGVR   = corev1.SchemeGroupVersion.WithResource("namespaces")
+	NodeGVR        = corev1.SchemeGroupVersion.WithResource("nodes")
 
 	AllGVRs = []schema.GroupVersionResource{
-		ReplicaSetGVR, DeploymentGVR, JobGVR, CronJobGVR, NamespaceGVR, NodeGVR,
+		ReplicaSetGVR, DeploymentGVR, StatefulSetGVR, DaemonSetGVR,
+		JobGVR, CronJobGVR, NamespaceGVR, NodeGVR,
 	}
 )
 
@@ -68,7 +72,8 @@ func NewFromListers(listers map[schema.GroupVersionResource]cache.GenericLister)
 // Resolve returns the owner chain for an object in namespace with the given
 // direct owner references. Direct owners always appear; for ReplicaSets and
 // Jobs their own owners (Deployments, CronJobs) are appended when known.
-// Owners of kinds with a cached metadata informer carry their labels and
+// Owners of kinds with a cached metadata informer (ReplicaSets, Deployments,
+// StatefulSets, DaemonSets, Jobs, CronJobs) carry their labels and
 // annotations.
 func (r *Resolver) Resolve(namespace string, refs []metav1.OwnerReference) []kubemeta.Owner {
 	if len(refs) == 0 {
@@ -149,6 +154,14 @@ func kindGVR(ref metav1.OwnerReference) (schema.GroupVersionResource, bool) {
 		return ReplicaSetGVR, true
 	case gv.Group == appsv1.GroupName && ref.Kind == "Deployment":
 		return DeploymentGVR, true
+	// StatefulSets and DaemonSets own their pods DIRECTLY (no intermediate
+	// object), so without these the pods of every StatefulSet and DaemonSet in
+	// the cluster carried a bare owner reference while Deployment pods carried
+	// the workload's labels and annotations.
+	case gv.Group == appsv1.GroupName && ref.Kind == "StatefulSet":
+		return StatefulSetGVR, true
+	case gv.Group == appsv1.GroupName && ref.Kind == "DaemonSet":
+		return DaemonSetGVR, true
 	case gv.Group == batchv1.GroupName && ref.Kind == "Job":
 		return JobGVR, true
 	case gv.Group == batchv1.GroupName && ref.Kind == "CronJob":

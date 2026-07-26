@@ -384,3 +384,206 @@ func TestExemplarsDisabled(t *testing.T) {
 		t.Fatalf("exemplars with Exemplars=false = %d, want 0", n)
 	}
 }
+
+// span builds a one-span batch with the given span name.
+func span(name string) ptrace.Traces {
+	return traces("svc", spanSpec{name: name, kind: ptrace.SpanKindServer, status: ptrace.StatusCodeOk, dur: 0.004})
+}
+
+// seriesNames returns the span.name dimension of every exported calls point.
+func seriesNames(t *testing.T, exp *capExporter) map[string]bool {
+	t.Helper()
+	out := map[string]bool{}
+	calls, ok := exp.find("traces.span.metrics.calls")
+	if !ok {
+		return out
+	}
+	dps := dp(calls)
+	for i := 0; i < dps.Len(); i++ {
+		out[attr(dps.At(i).Attributes(), "span.name")] = true
+	}
+	return out
+}
+
+// A cardinality cap without eviction is a ONE-WAY LATCH: once a burst of
+// short-lived span names fills it, no new service on the node is ever measured
+// again. Stale series must be evicted at export and their slots reused.
+func TestStaleSeriesEvictedFreesCardinalitySlot(t *testing.T) {
+	ctx := context.Background()
+	res := pcommon.NewResource()
+	g := New(Config{MaxCardinality: 2, StaleAfter: "15m"})
+	now := time.Unix(1_700_000_000, 0)
+	g.now = func() time.Time { return now }
+
+	g.Consume(span("burst-a"))
+	g.Consume(span("burst-b"))
+	// The cap is full: a third tuple is refused.
+	before := obs.SpanMetricsDropped.Value()
+	g.Consume(span("newcomer"))
+	if got := obs.SpanMetricsDropped.Value() - before; got != 1 {
+		t.Fatalf("dropped delta = %v, want 1 (cap should hold before eviction)", got)
+	}
+
+	exp1 := &capExporter{}
+	if err := g.Export(ctx, exp1, res); err != nil {
+		t.Fatal(err)
+	}
+	if names := seriesNames(t, exp1); !names["burst-a"] || !names["burst-b"] || len(names) != 2 {
+		t.Fatalf("first export series = %v, want {burst-a,burst-b}", names)
+	}
+
+	// Nothing observed for longer than staleAfter: the next export evicts.
+	evictedBefore := obs.SpanMetricsEvicted.Value()
+	now = now.Add(16 * time.Minute)
+	exp2 := &capExporter{}
+	if err := g.Export(ctx, exp2, res); err != nil {
+		t.Fatal(err)
+	}
+	if exp2.exports() != 0 {
+		t.Fatalf("exported %d payloads after everything went stale, want 0", exp2.exports())
+	}
+	if n := len(g.series); n != 0 {
+		t.Fatalf("series after eviction = %d, want 0", n)
+	}
+	if got := obs.SpanMetricsEvicted.Value() - evictedBefore; got != 2 {
+		t.Fatalf("evicted counter delta = %v, want 2", got)
+	}
+
+	// The freed slots admit new tuples.
+	dropBefore := obs.SpanMetricsDropped.Value()
+	g.Consume(span("newcomer"))
+	if got := obs.SpanMetricsDropped.Value() - dropBefore; got != 0 {
+		t.Fatalf("dropped delta = %v after eviction, want 0 (slot must be reusable)", got)
+	}
+	exp3 := &capExporter{}
+	if err := g.Export(ctx, exp3, res); err != nil {
+		t.Fatal(err)
+	}
+	names := seriesNames(t, exp3)
+	if len(names) != 1 || !names["newcomer"] {
+		t.Fatalf("post-eviction export series = %v, want exactly {newcomer}", names)
+	}
+}
+
+// Eviction must never destroy observations no export has carried: an export
+// interval may legally exceed staleAfter.
+func TestStaleSeriesSurviveUntilExported(t *testing.T) {
+	ctx := context.Background()
+	res := pcommon.NewResource()
+	g := New(Config{StaleAfter: "1m"})
+	now := time.Unix(1_700_000_000, 0)
+	g.now = func() time.Time { return now }
+
+	g.Consume(span("rare"))
+	now = now.Add(10 * time.Minute) // stale, but never exported
+	exp := &capExporter{}
+	if err := g.Export(ctx, exp, res); err != nil {
+		t.Fatal(err)
+	}
+	if names := seriesNames(t, exp); !names["rare"] {
+		t.Fatalf("series evicted before any export carried it: %v", names)
+	}
+	// Reported now: the next stale export drops it.
+	now = now.Add(10 * time.Minute)
+	exp2 := &capExporter{}
+	if err := g.Export(ctx, exp2, res); err != nil {
+		t.Fatal(err)
+	}
+	if exp2.exports() != 0 || len(g.series) != 0 {
+		t.Fatalf("exports=%d series=%d after the reported series went stale, want 0/0", exp2.exports(), len(g.series))
+	}
+}
+
+// A re-created series restarts its cumulative counters, so it must carry a
+// FRESH start timestamp — otherwise the value looks like a counter jumping
+// backwards under an unchanged start.
+func TestReCreatedSeriesGetsFreshStartTimestamp(t *testing.T) {
+	ctx := context.Background()
+	res := pcommon.NewResource()
+	g := New(Config{StaleAfter: "5m"})
+	now := time.Unix(1_700_000_000, 0)
+	g.now = func() time.Time { return now }
+
+	g.Consume(span("op"))
+	exp1 := &capExporter{}
+	_ = g.Export(ctx, exp1, res)
+	calls1, _ := exp1.find("traces.span.metrics.calls")
+	first := dp(calls1).At(0).StartTimestamp()
+
+	now = now.Add(6 * time.Minute)
+	_ = g.Export(ctx, &capExporter{}, res) // evicts
+	g.Consume(span("op"))                  // same dimensions, new series
+	exp2 := &capExporter{}
+	_ = g.Export(ctx, exp2, res)
+	calls2, ok := exp2.find("traces.span.metrics.calls")
+	if !ok {
+		t.Fatal("re-created series not exported")
+	}
+	d := dp(calls2).At(0)
+	if v := numberVal(d); v != 1 {
+		t.Fatalf("re-created series calls = %v, want 1 (cumulative restarted)", v)
+	}
+	if d.StartTimestamp() <= first {
+		t.Fatalf("start timestamp %v not advanced past %v after re-creation", d.StartTimestamp(), first)
+	}
+}
+
+func TestStaleAfterConfig(t *testing.T) {
+	if got := New(Config{}).staleAfter; got != defaultStaleAfter {
+		t.Fatalf("default staleAfter = %v, want %v", got, defaultStaleAfter)
+	}
+	if got := New(Config{StaleAfter: "0"}).staleAfter; got != 0 {
+		t.Fatalf("explicit 0 staleAfter = %v, want 0 (eviction disabled)", got)
+	}
+	if err := (Config{StaleAfter: "fifteen minutes"}).Validate(); err == nil {
+		t.Fatal("Validate accepted an unparseable staleAfter")
+	}
+	// An unparseable value still aggregates, on the default.
+	if got := New(Config{StaleAfter: "fifteen minutes"}).staleAfter; got != defaultStaleAfter {
+		t.Fatalf("bad staleAfter fell back to %v, want %v", got, defaultStaleAfter)
+	}
+	// Eviction disabled: a long-idle series keeps reporting.
+	g := New(Config{StaleAfter: "0"})
+	now := time.Unix(1_700_000_000, 0)
+	g.now = func() time.Time { return now }
+	g.Consume(span("op"))
+	_ = g.Export(context.Background(), &capExporter{}, pcommon.NewResource())
+	now = now.Add(24 * time.Hour)
+	exp := &capExporter{}
+	_ = g.Export(context.Background(), exp, pcommon.NewResource())
+	if names := seriesNames(t, exp); !names["op"] {
+		t.Fatalf("series dropped with eviction disabled: %v", names)
+	}
+}
+
+// A rendered-but-NOT-delivered series must survive: eviction may only drop
+// values the collector actually acked.
+func TestStaleSeriesSurviveFailedExport(t *testing.T) {
+	ctx := context.Background()
+	res := pcommon.NewResource()
+	g := New(Config{StaleAfter: "1m"})
+	now := time.Unix(1_700_000_000, 0)
+	g.now = func() time.Time { return now }
+
+	g.Consume(span("rare"))
+	if err := g.Export(ctx, failExporter{}, res); err == nil {
+		t.Fatal("export should have failed")
+	}
+	now = now.Add(10 * time.Minute) // stale, but nothing was ever delivered
+	exp := &capExporter{}
+	if err := g.Export(ctx, exp, res); err != nil {
+		t.Fatal(err)
+	}
+	if names := seriesNames(t, exp); !names["rare"] {
+		t.Fatalf("series evicted although no export ever delivered it: %v", names)
+	}
+	// Delivered now: it becomes evictable.
+	now = now.Add(10 * time.Minute)
+	exp2 := &capExporter{}
+	if err := g.Export(ctx, exp2, res); err != nil {
+		t.Fatal(err)
+	}
+	if exp2.exports() != 0 || len(g.series) != 0 {
+		t.Fatalf("exports=%d series=%d after a delivered series went stale, want 0/0", exp2.exports(), len(g.series))
+	}
+}

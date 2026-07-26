@@ -17,8 +17,11 @@ rules:
   - apiGroups: [""]
     resources: ["pods", "namespaces", "services", "nodes"]
     verbs: ["get", "list", "watch"]
+  # Owner-chain metadata (metadata-only informers): statefulsets and
+  # daemonsets own their pods directly, so without them those workloads'
+  # labels and annotations never reach the API.
   - apiGroups: ["apps"]
-    resources: ["replicasets", "deployments"]
+    resources: ["replicasets", "deployments", "statefulsets", "daemonsets"]
     verbs: ["get", "list", "watch"]
   - apiGroups: ["batch"]
     resources: ["jobs", "cronjobs"]
@@ -28,7 +31,10 @@ rules:
     resources: ["servicemonitors", "podmonitors"]
     verbs: ["get", "list", "watch"]
   # Optional: monitor endpoints' bearerTokenSecret serving (-scrape-auth-secrets).
-  # Grants cluster-wide secret reads — enable deliberately.
+  # Grants cluster-wide secret reads — enable deliberately, and note that the
+  # flag also REQUIRES -scrape-auth-token-file (the service refuses to start
+  # without it): /v1/scrape-auth serves Secret material and is the one route
+  # that authenticates its callers, with `Authorization: Bearer <token>`.
   # - apiGroups: [""]
   #   resources: ["secrets"]
   #   verbs: ["get"]

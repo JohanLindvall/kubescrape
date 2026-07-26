@@ -501,7 +501,7 @@ func (b *splitBatcher) dropped(rule *compiledSplitRule, name string) bool {
 	return verdict
 }
 
-func (b *splitBatcher) metric(name string, labels []Label, shape func(pmetric.Metric)) (pmetric.Metric, *compiledSplitRule, []kv) {
+func (b *splitBatcher) metric(name string, meta metricMeta, labels []Label, shape func(pmetric.Metric)) (pmetric.Metric, *compiledSplitRule, []kv) {
 	sm, resKey, rule, dp := b.route(name, labels)
 	// Last-seen fast path: consecutive samples of the same object and family
 	// skip the key concatenation (an allocation) and the map probe.
@@ -515,14 +515,16 @@ func (b *splitBatcher) metric(name string, labels []Label, shape func(pmetric.Me
 		m.SetName(name)
 		shape(m)
 		b.byKey[key] = m
-		b.bytes += len(name) + metricOverheadBytes // one descriptor per resource
+		// One descriptor per resource — including its description and unit,
+		// which a split batch repeats for every described object.
+		b.bytes += len(name) + metricOverheadBytes + meta.apply(m)
 	}
 	b.lastMResKey, b.lastMName, b.lastM, b.lastMOK = resKey, name, m, true
 	return m, rule, dp
 }
 
 func (b *splitBatcher) addNumber(s Sample, monotonic bool) {
-	m, rule, dpa := b.metric(s.Name, s.Labels, func(m pmetric.Metric) {
+	m, rule, dpa := b.metric(s.Name, sampleMeta(s), s.Labels, func(m pmetric.Metric) {
 		if monotonic {
 			sum := m.SetEmptySum()
 			sum.SetIsMonotonic(true)
@@ -547,7 +549,7 @@ func (b *splitBatcher) addNumber(s Sample, monotonic bool) {
 }
 
 func (b *splitBatcher) addHistogram(family string, acc *histAcc) {
-	m, rule, dpa := b.metric(family, acc.labels, func(m pmetric.Metric) {
+	m, rule, dpa := b.metric(family, acc.meta, acc.labels, func(m pmetric.Metric) {
 		m.SetEmptyHistogram().SetAggregationTemporality(pmetric.AggregationTemporalityCumulative)
 	})
 	if m.Type() != pmetric.MetricTypeHistogram {
@@ -567,7 +569,7 @@ func (b *splitBatcher) addHistogram(family string, acc *histAcc) {
 }
 
 func (b *splitBatcher) addSummary(family string, acc *summAcc) {
-	m, rule, dpa := b.metric(family, acc.labels, func(m pmetric.Metric) {
+	m, rule, dpa := b.metric(family, acc.meta, acc.labels, func(m pmetric.Metric) {
 		m.SetEmptySummary()
 	})
 	if m.Type() != pmetric.MetricTypeSummary {

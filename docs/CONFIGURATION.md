@@ -27,6 +27,7 @@ manifests live in [deploy/](../deploy).
 - [Agent: log metrics](#agent-log-metrics)
 - [Agent: log scrubbing (PII)](#agent-log-scrubbing)
 - [Agent: OTLP ingest](#agent-otlp-ingest)
+- [Agent: span metrics](#agent-span-metrics)
 - [Agent: trace sampling](#agent-trace-sampling)
 - [Agent: metrics scraping](#agent-metrics-scraping)
 - [Agent: kubelet scrapes (cadvisor, node)](#agent-kubelet-scrapes)
@@ -53,7 +54,8 @@ kubescrape -listen :8080 -wait-timeout 5s -cache-ttl 5m -log-format json
 | `-metadata-cache-ttl` | `10s` | `max-age` stamped on metadata responses (`Cache-Control` + `ETag`) so the agent's client caches lookups and revalidates with `If-None-Match`/304; 0 disables cache headers |
 | `-resync` | `0` | informer resync period (0 = watch stream only) |
 | `-servicemonitors` | `false` | serve targets for `monitoring.coreos.com/v1` ServiceMonitors selecting pod-backed Services — plus **PodMonitors** (endpoints name container ports) when the cluster serves that CRD. Endpoint `port`/`targetPort`/`path`/`scheme`, `interval`/`scrapeTimeout`, `basicAuth`, `authorization`, `bearerTokenSecret`, `tlsConfig` (`insecureSkipVerify`, secret-backed `ca`/`cert`/`keySecret`, `serverName`) and the keep/drop subset of `metricRelabelings` are honored. Anything else (`oauth2`, `proxyUrl`, `params`, `honorLabels`, target `relabelings`, other relabel actions, configMap-backed `ca`/`cert`) is **reported**: logged once per monitor and counted in `kubescrape_monitor_fields_ignored_total{kind}`, so a partially-applied CR is never silent. Self-disables with a warning when the CRD is absent |
-| `-scrape-auth-secrets` | `false` | serve monitor endpoints' `bearerTokenSecret` values to agents on `GET /v1/scrape-auth/{ns}/{name}/{key}`. Opt-in: requires `secrets get` RBAC (commented out in the manifests) and ships tokens over the cluster-internal HTTP channel |
+| `-scrape-auth-secrets` | `false` | serve monitor endpoints' `bearerTokenSecret` values to agents on `GET /v1/scrape-auth/{ns}/{name}/{key}`. Opt-in: requires `secrets get` RBAC (commented out in the manifests), `-scrape-auth-token-file`, and ships tokens over the cluster-internal HTTP channel |
+| `-scrape-auth-token-file` | — | file with the shared bearer token callers must present on `/v1/scrape-auth` as `Authorization: Bearer <token>`. **Mandatory** with `-scrape-auth-secrets` — that endpoint is the only one serving Secret material, so starting without a token is refused rather than leaving it open to every pod in the cluster. Compared in constant time; read once at startup (rotation means restarting the service and the agents) |
 | `-self-metrics-interval` | `1m` | export the service's own metrics over OTLP at this interval (0 disables) |
 | `-otlp-*` | as the agent | used by the self-metrics push: `-otlp-endpoint`, `-otlp-protocol`, `-otlp-compression`, `-otlp-compression-level`, `-otlp-insecure`, `-otlp-tls-ca-file`, `-otlp-tls-insecure-skip-verify`, `-otlp-bearer-token-file`, `-otlp-timeout` |
 | `-log-level` | `info` | `debug`, `info`, `warn`, `error` |
@@ -71,7 +73,8 @@ default) serves `net/http/pprof` on a third port; profiles expose goroutine
 stacks and heap contents, so it is separate from both.
 
 RBAC (cluster-wide `get`/`list`/`watch`): `pods`, `services`, `namespaces`,
-`nodes`, `replicasets.apps`, `deployments.apps`, `jobs.batch`,
+`nodes`, `replicasets.apps`, `deployments.apps`, `statefulsets.apps`,
+`daemonsets.apps`, `jobs.batch`,
 `cronjobs.batch`, `servicemonitors.monitoring.coreos.com` (plus
 `podmonitors` when that CRD should be discovered).
 `-scrape-auth-secrets` needs `secrets get` (commented out in the
@@ -231,7 +234,7 @@ logAttributes: {rules: [...]}      # see Agent: log attributes
 logMetrics:    {metrics: [...]}    # see Agent: log metrics
 logScrubbing:  {builtin: [...], rules: [...]}         # see Agent: log scrubbing
 metrics:       {pipelines: {...}, splitters: [...]}   # see Metrics config
-traceMetrics:  {dimensions: [...], buckets: [...]}    # see -ingest-span-metrics
+traceMetrics:  {dimensions: [...], buckets: [...]}    # see Agent: span metrics
 traceSampling: {probability: 0.1, ...}                # see Agent: trace sampling
 routing:       {routes: [...]}                        # see Agent: routing
 ```
@@ -300,6 +303,19 @@ Per-source options:
 
   Prefer both over a `logs.rules` drop for cost control: a rule saves egress
   but only after paying the read, parse and enrich; these skip the work.
+
+- `ignoreOlder` skips files whose **mtime** is older than a Go duration, so a
+  source pointed at a directory of retained history reads only what is recent.
+  Like the namespace filters it applies at discovery — an ignored file is never
+  opened, tracked or read:
+
+  ```yaml
+        ignoreOlder: 24h                    # unset/0 = read every matched file
+  ```
+
+  A file already being tailed, or one carrying a stored offset, is **never**
+  ignored however stale it looks: dropping it would abandon the bytes it has
+  not shipped and re-ingest the whole file if it were appended to again.
 
 - `compressed` reads matched files as gzip, decompressing on the fly (files
   ending in `.gz` are detected automatically). Compressed files are treated as
@@ -420,7 +436,9 @@ logMetrics:
         - env=prod                  # literal value
       resourceLabels:               # → resource attributes (same DSL)
         - tenant=$tenant
-      maxCardinality: 5000          # cap on unique label sets (unset = default 10000, also the hard cap)
+      maxCardinality: 5000          # cap on unique label sets (unset = default 10000, also the hard cap).
+                                    # Counts LABEL SETS, not samples: a histogram costs one sample per
+                                    # bucket, and maxCardinality x buckets > 150000 is refused at startup.
       maxAge: 1h                    # expire idle series (default/cap 24h)
       labelPrefix: ""               # optional prefix on every label name
     - name: request_duration_seconds
@@ -528,6 +546,32 @@ A container ID resolves the exact container incarnation; a pod UID resolves
 the pod. Outcomes count into `kubescrape_ingest_resources_total{outcome}`
 (`enriched` / `unresolved` / `peer_ip`).
 
+## Agent: span metrics
+
+The `traceMetrics` section tunes the RED metrics `-ingest-span-metrics`
+derives from ingested spans:
+
+```yaml
+traceMetrics:
+  namePrefix: traces.span.metrics   # .calls / .size / .duration
+  buckets: [0.005, 0.05, 0.5, 5]    # duration histogram bounds, SECONDS
+  dimensions: [http.route]          # extra span-then-resource attribute labels
+  maxCardinality: 20000             # cap on distinct dimension tuples
+  exemplars: true                   # per-bucket trace-id exemplars
+  staleAfter: 15m                   # evict series unobserved for this long
+```
+
+`staleAfter` is what keeps `maxCardinality` from becoming a one-way latch: a
+burst of one-off span names would otherwise fill the cap permanently and no
+new service on the node would ever be measured again. Series whose dimensions
+go unobserved that long are dropped at export time — the standard staleness
+signal for a cumulative counter — and count into
+`kubescrape_span_metrics_evicted_total`; a series that comes back is
+re-created with a fresh start timestamp (the OTLP spelling of a counter
+reset). Eviction only ever drops values a **delivered** export already
+carried, so an export interval longer than `staleAfter`, or a failed export,
+never loses observations. `"0"` disables eviction.
+
 ## Agent: trace sampling
 
 The `traceSampling` section samples **ingested** spans before forwarding
@@ -616,6 +660,9 @@ metrics: |
       for m in batch:
           if m.name.startswith("go_"):
               m.drop()
+          elif m.type == "sum":
+              for p in m.datapoints:
+                  p.attributes["pod_name"] = None    # strip a high-cardinality label
 traces: |
   def transform(batch):
       for s in batch:
@@ -629,9 +676,17 @@ traces: |
 * **Host objects are lazy** views over the OTLP data: log records expose
   `body`, `severity_text`, `severity_number`, `attributes`, `resource`,
   `drop()`; spans expose `name`, `status_code`, `attributes`, `resource`,
-  `drop()`; metrics expose `name`, `resource`, `drop()`. Mutations are in
-  place; a script pays only for the fields it touches (~1µs per touched
-  record); dropped elements and emptied groups are pruned after the run.
+  `drop()`; metrics expose `name`, `type` (`gauge`/`sum`/`histogram`/
+  `exponential_histogram`/`summary`), `unit`, `description`, `resource`,
+  `datapoints` and `drop()`. Each data point exposes `attributes`, `value`
+  (`None` for the bucketed kinds, whose value is a distribution) and `drop()`
+  — that is where a metric's cardinality lives, so dropping one label or one
+  point does not cost the whole metric. Mutations are in place; a script pays
+  only for the fields it touches (~1µs per touched record); dropped elements
+  and emptied groups are pruned after the run (a metric whose points are all
+  dropped goes with them).
+* **Attributes** are a dict-like view: `attrs["k"]` reads (missing keys are
+  `None`), `attrs["k"] = v` writes, and `attrs["k"] = None` deletes.
 * **Hot reload**: the file is watched (fsnotify on its directory — mount the
   ConfigMap **as a directory, not `subPath`**, or updates never arrive) with
   a 30s poll fallback. Reloads compile-then-commit: a broken edit keeps the
@@ -864,6 +919,16 @@ the mount `-transforms-file` needs: its dedicated ConfigMap, mounted as a
 directory (not `subPath`). See
 [charts/kubescrape/values.yaml](../charts/kubescrape/values.yaml) for the
 full annotated list.
+
+`service.scrapeAuthSecrets: true` is one value that wires three things at
+once, because they must not drift apart: the `-scrape-auth-secrets` flag, the
+`secrets: get` ClusterRole rule, and the bearer token guarding
+`/v1/scrape-auth`. The token is generated into a `<release>-scrape-auth`
+Secret (re-read from the cluster on upgrade so it survives a `helm upgrade`),
+mounted into both the service Deployment and the agent DaemonSet, and passed
+as `-scrape-auth-token-file`. Point `service.scrapeAuthToken.existingSecret`
+at your own Secret to manage it yourself, or set
+`service.scrapeAuthToken.value` for a fixed token.
 
 ## Complete example
 

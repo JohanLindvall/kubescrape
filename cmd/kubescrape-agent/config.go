@@ -104,7 +104,7 @@ func validateConfig(cfg agentConfig, transformsFile string) error {
 		}
 	}
 	if cfg.Metrics != nil {
-		if _, err := promscrape.NewMetricFilters(&promscrape.FilterConfig{Pipelines: cfg.Metrics.Pipelines}); err != nil {
+		if _, err := promscrape.NewMetricFilters(cfg.Metrics.Pipelines); err != nil {
 			return fmt.Errorf("metrics.pipelines: %w", err)
 		}
 		if _, err := promscrape.NewSplitters(cfg.Metrics.Splitters); err != nil {
@@ -117,6 +117,11 @@ func validateConfig(cfg agentConfig, transformsFile string) error {
 		}
 		if _, err := logline.NewLineFilter(cfg.Logs.Rules); err != nil {
 			return fmt.Errorf("logs.rules: %w", err)
+		}
+	}
+	if cfg.TraceMetrics != nil {
+		if err := cfg.TraceMetrics.Validate(); err != nil {
+			return fmt.Errorf("traceMetrics: %w", err)
 		}
 	}
 	if cfg.TraceSampling != nil {

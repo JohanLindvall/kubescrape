@@ -12,6 +12,7 @@ import (
 	"encoding/hex"
 	"fmt"
 
+	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/plog"
 	"go.opentelemetry.io/collector/pdata/pmetric"
 	"go.opentelemetry.io/collector/pdata/ptrace"
@@ -121,13 +122,53 @@ func pruneMetrics(md pmetric.Metrics) {
 		sms := rm.ScopeMetrics()
 		sms.RemoveIf(func(sm pmetric.ScopeMetrics) bool {
 			sm.Metrics().RemoveIf(func(m pmetric.Metric) bool {
-				_, drop := m.Metadata().Get(dropMarker)
-				return drop
+				if _, drop := m.Metadata().Get(dropMarker); drop {
+					return true
+				}
+				// Points dropped individually. A metric emptied by them goes
+				// too: a point-less metric carries no data and would ship as
+				// pure descriptor overhead.
+				return pruneDataPoints(m)
 			})
 			return sm.Metrics().Len() == 0
 		})
 		return sms.Len() == 0
 	})
+}
+
+// pruneDataPoints removes points a script called drop() on and reports whether
+// the metric is left empty. The marker lives in the point's own attributes (as
+// for logs and spans); only dropped points ever carry it, and they are removed
+// here, so no survivor can ship it. A metric where only SOME points were
+// dropped keeps the rest.
+func pruneDataPoints(m pmetric.Metric) bool {
+	drop := func(attrs pcommon.Map) bool {
+		_, ok := attrs.Get(dropMarker)
+		return ok
+	}
+	switch m.Type() {
+	case pmetric.MetricTypeGauge:
+		pts := m.Gauge().DataPoints()
+		pts.RemoveIf(func(p pmetric.NumberDataPoint) bool { return drop(p.Attributes()) })
+		return pts.Len() == 0
+	case pmetric.MetricTypeSum:
+		pts := m.Sum().DataPoints()
+		pts.RemoveIf(func(p pmetric.NumberDataPoint) bool { return drop(p.Attributes()) })
+		return pts.Len() == 0
+	case pmetric.MetricTypeHistogram:
+		pts := m.Histogram().DataPoints()
+		pts.RemoveIf(func(p pmetric.HistogramDataPoint) bool { return drop(p.Attributes()) })
+		return pts.Len() == 0
+	case pmetric.MetricTypeExponentialHistogram:
+		pts := m.ExponentialHistogram().DataPoints()
+		pts.RemoveIf(func(p pmetric.ExponentialHistogramDataPoint) bool { return drop(p.Attributes()) })
+		return pts.Len() == 0
+	case pmetric.MetricTypeSummary:
+		pts := m.Summary().DataPoints()
+		pts.RemoveIf(func(p pmetric.SummaryDataPoint) bool { return drop(p.Attributes()) })
+		return pts.Len() == 0
+	}
+	return false
 }
 
 func pruneTraces(td ptrace.Traces) {

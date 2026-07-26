@@ -2,37 +2,85 @@
 package metrics
 
 import (
+	"strconv"
 	"strings"
 	"testing"
+
+	"go.opentelemetry.io/collector/pdata/pcommon"
 )
 
-// TestHistogramDefaultBucketsCardinalityGuard is the regression test for the
-// silent-data-loss bug: a histogram with no explicit buckets gets the 14 default
-// buckets (15 streams incl. +Inf), so a maxCardinality below that admits nothing
-// (all-or-nothing histogram admission). The compile guard checked the RAW bucket
-// count (1 when empty) and let such a config through, producing zero data with
-// no error. It must now reject at compile time against the EFFECTIVE count.
-func TestHistogramDefaultBucketsCardinalityGuard(t *testing.T) {
+// TestHistogramCardinalityCountsLabelSets pins the UNIT of maxCardinality: it
+// caps distinct label combinations, not live samples. The store keys samples
+// per bucket stream, so comparing the raw map size against the cap divided a
+// histogram's configured cap by its bucket count behind the user's back — a
+// default-bucket histogram at maxCardinality 10000 admitted 666 label sets
+// while the config, the README and the warning all said 10000.
+func TestHistogramCardinalityCountsLabelSets(t *testing.T) {
+	const want = 5
+	set, err := NewDynamicMetricSet([]Dynamic{{
+		Name: "h", Type: HistogramType, Value: "v", Labels: []string{"id"},
+		MaxCardinality: want,
+	}})
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	// Ten distinct label sets against a cap of five: exactly five must land,
+	// each with its full 15-stream distribution.
+	for i := range 10 {
+		id := strconv.Itoa(i)
+		set.Add(func(k string) (float64, bool) { return 1, k == "v" },
+			func(k string) string {
+				if k == "id" {
+					return id
+				}
+				return ""
+			}, pcommon.NewMap(), "")
+	}
+	streams := len(defaultBuckets) + 1
+	ser := set.rules[0].series
+	if got := len(ser.db) / streams; got != want {
+		t.Fatalf("admitted %d label combinations (%d samples / %d streams), want %d",
+			got, len(ser.db), streams, want)
+	}
+}
+
+// A histogram whose label-set cap times its bucket count would outgrow the
+// store's live-sample budget is rejected at compile time — loudly, rather than
+// by silently admitting fewer label sets than configured.
+func TestHistogramStreamBudgetGuard(t *testing.T) {
+	buckets := make([]float64, 200)
+	for i := range buckets {
+		buckets[i] = float64(i)
+	}
 	_, err := NewDynamicMetricSet([]Dynamic{{
-		Name: "h", Type: HistogramType, Value: "v", MaxCardinality: 5,
+		Name: "h", Type: HistogramType, Value: "v", Buckets: buckets, MaxCardinality: 10000,
 	}})
 	if err == nil {
-		t.Fatal("default-bucket histogram with maxCardinality 5 compiled — it would silently admit nothing")
+		t.Fatal("10000 label sets x 201 buckets compiled — that is 2M live samples")
 	}
-	if !strings.Contains(err.Error(), "bucket streams") {
+	if !strings.Contains(err.Error(), "live samples") {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	// An adequate cap (default buckets = 15 streams) compiles, and so does an
-	// explicit small bucket set within the cap.
+	// Lowering the cardinality to fit is accepted.
 	if _, err := NewDynamicMetricSet([]Dynamic{{
-		Name: "h", Type: HistogramType, Value: "v", MaxCardinality: 1500,
+		Name: "h", Type: HistogramType, Value: "v", Buckets: buckets, MaxCardinality: 500,
 	}}); err != nil {
-		t.Fatalf("adequate maxCardinality rejected: %v", err)
+		t.Fatalf("500 x 201 = 100500 samples rejected: %v", err)
 	}
+	// A small cap on a default-bucket histogram is fine — it means few label
+	// sets, not "nothing can ever be admitted".
 	if _, err := NewDynamicMetricSet([]Dynamic{{
-		Name: "h", Type: HistogramType, Value: "v", Buckets: []float64{1, 5}, MaxCardinality: 10,
+		Name: "h", Type: HistogramType, Value: "v", MaxCardinality: 5,
 	}}); err != nil {
-		t.Fatalf("explicit 3-stream histogram under a cap of 10 rejected: %v", err)
+		t.Fatalf("maxCardinality 5 rejected: %v", err)
+	}
+}
+
+// maxStreamCap is written as a literal because defaultBuckets is a slice; keep
+// the two in step.
+func TestStreamCapMatchesDefaultHistogram(t *testing.T) {
+	if got := maxCardinalityCap * (len(defaultBuckets) + 1); got != maxStreamCap {
+		t.Fatalf("maxStreamCap = %d, want %d (maxCardinalityCap x default streams)", maxStreamCap, got)
 	}
 }
 

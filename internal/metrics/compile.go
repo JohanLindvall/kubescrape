@@ -106,17 +106,20 @@ func compileRule(d *Dynamic, cfg *setConfig, shared map[string]*series) (*metric
 		return nil, fmt.Errorf("metric rule has no name")
 	}
 	if kind == kindHistogram {
-		// Guard against the EFFECTIVE bucket count: an empty Buckets is replaced by
-		// defaultBuckets in newSeries, so checking len(d.Buckets)+1 (==1 when empty)
-		// would pass a maxCardinality below the real stream count and then admit
-		// nothing at all (the all-or-nothing histogram pre-pass rejects every
-		// observation) — silent total data loss instead of this compile-time error.
+		// maxCardinality counts LABEL COMBINATIONS, and a histogram's label set
+		// costs one live sample per bucket — so the memory the cap is defending
+		// is the PRODUCT. Refuse a combination that could outgrow the store's
+		// stream budget rather than silently admitting fewer label sets than
+		// configured (which is exactly the bug this unit fix removed). The
+		// effective bucket count is what matters: an empty Buckets is replaced
+		// by defaultBuckets in newSeries.
 		streams := len(d.Buckets) + 1
 		if len(d.Buckets) == 0 {
 			streams = len(defaultBuckets) + 1
 		}
-		if cap := cardinalityCap(d.MaxCardinality); cap < streams {
-			return nil, fmt.Errorf("metric %q: maxCardinality %d is below the histogram's %d bucket streams — nothing could ever be admitted", d.Name, cap, streams)
+		if cap := cardinalityCap(d.MaxCardinality); cap*streams > maxStreamCap {
+			return nil, fmt.Errorf("metric %q: maxCardinality %d x %d buckets = %d live samples, above the %d-sample budget — lower maxCardinality or use fewer buckets",
+				d.Name, cap, streams, cap*streams, maxStreamCap)
 		}
 	}
 	if existing, ok := shared[name]; ok {

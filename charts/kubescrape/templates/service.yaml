@@ -1,9 +1,43 @@
+{{- /*
+  The bearer token guarding GET /v1/scrape-auth. That route serves Secret
+  material (the service holds cluster-wide `secrets: get`), so the binary
+  refuses to start with -scrape-auth-secrets and no token. Precedence:
+  an existing Secret the user manages > an explicit value > a generated
+  random token, which is read back from the live Secret on upgrade so
+  rolling the chart does not invalidate every agent's token.
+*/}}
+{{- $scrapeAuthKey := .Values.service.scrapeAuthToken.key | default "token" }}
+{{- $scrapeAuthSecret := .Values.service.scrapeAuthToken.existingSecret }}
+{{- $scrapeAuthToken := .Values.service.scrapeAuthToken.value }}
+{{- if and .Values.service.scrapeAuthSecrets (not $scrapeAuthSecret) }}
+{{- $scrapeAuthSecret = printf "%s-scrape-auth" .Release.Name }}
+{{- if not $scrapeAuthToken }}
+{{- $existing := (lookup "v1" "Secret" .Release.Namespace $scrapeAuthSecret) }}
+{{- if and $existing (index $existing.data $scrapeAuthKey) }}
+{{- $scrapeAuthToken = index $existing.data $scrapeAuthKey | b64dec }}
+{{- else }}
+{{- $scrapeAuthToken = randAlphaNum 48 }}
+{{- end }}
+{{- end }}
+{{- end }}
 apiVersion: v1
 kind: ServiceAccount
 metadata:
   name: {{ .Release.Name }}
   namespace: {{ .Release.Namespace }}
   labels: {{ include "kubescrape.labels" . | nindent 4 }}
+{{- if and .Values.service.scrapeAuthSecrets (not .Values.service.scrapeAuthToken.existingSecret) }}
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ $scrapeAuthSecret }}
+  namespace: {{ .Release.Namespace }}
+  labels: {{ include "kubescrape.labels" . | nindent 4 }}
+type: Opaque
+stringData:
+  {{ $scrapeAuthKey }}: {{ $scrapeAuthToken | quote }}
+{{- end }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
@@ -14,8 +48,11 @@ rules:
   - apiGroups: [""]
     resources: ["pods", "namespaces", "services", "nodes"]
     verbs: ["get", "list", "watch"]
+  # StatefulSets and DaemonSets own their pods directly (no ReplicaSet in
+  # between), so their metadata informers are what gives those workloads'
+  # pods owner labels and annotations at all.
   - apiGroups: ["apps"]
-    resources: ["replicasets", "deployments"]
+    resources: ["replicasets", "deployments", "statefulsets", "daemonsets"]
     verbs: ["get", "list", "watch"]
   - apiGroups: ["batch"]
     resources: ["jobs", "cronjobs"]
@@ -25,8 +62,9 @@ rules:
     resources: ["servicemonitors", "podmonitors"]
     verbs: ["get", "list", "watch"]
   {{- if .Values.service.scrapeAuthSecrets }}
-  # Serving monitor endpoints' bearerTokenSecret to agents
-  # (service.extraArgs must also carry -scrape-auth-secrets).
+  # Serving monitor endpoints' bearerTokenSecret to agents. The flag, this
+  # rule and both sides' token all key off service.scrapeAuthSecrets, so they
+  # cannot drift apart.
   - apiGroups: [""]
     resources: ["secrets"]
     verbs: ["get"]
@@ -90,6 +128,12 @@ spec:
             - -wait-timeout={{ .Values.service.waitTimeout }}
             - -cache-ttl={{ .Values.service.cacheTTL }}
             - -servicemonitors={{ .Values.service.serviceMonitors }}
+            {{- if .Values.service.scrapeAuthSecrets }}
+            {{- /* The token file is mandatory here: the binary refuses to
+                   serve Secret material on an unauthenticated endpoint. */}}
+            - -scrape-auth-secrets=true
+            - -scrape-auth-token-file=/etc/kubescrape/scrape-auth/{{ $scrapeAuthKey }}
+            {{- end }}
             {{- /* The OTLP output carries the service's own self-metrics push. */}}
             - -otlp-endpoint={{ .Values.service.otlp.endpoint }}
             - -otlp-protocol={{ .Values.service.otlp.protocol }}
@@ -113,11 +157,18 @@ spec:
             {{- range .Values.service.extraArgs }}
             - {{ . }}
             {{- end }}
-          {{- if .Values.service.otlp.bearerTokenSecret.name }}
+          {{- if or .Values.service.otlp.bearerTokenSecret.name .Values.service.scrapeAuthSecrets }}
           volumeMounts:
+            {{- if .Values.service.otlp.bearerTokenSecret.name }}
             - name: otlp-token
               mountPath: /etc/kubescrape/otlp-token
               readOnly: true
+            {{- end }}
+            {{- if .Values.service.scrapeAuthSecrets }}
+            - name: scrape-auth-token
+              mountPath: /etc/kubescrape/scrape-auth
+              readOnly: true
+            {{- end }}
           {{- end }}
           ports:
             - name: http
@@ -132,11 +183,20 @@ spec:
             httpGet: {path: /healthz, port: http}
           resources: {{ toYaml .Values.service.resources | nindent 12 }}
       {{- /* The OTLP output (and its token) serves the self-metrics push. */}}
-      {{- if .Values.service.otlp.bearerTokenSecret.name }}
+      {{- if or .Values.service.otlp.bearerTokenSecret.name .Values.service.scrapeAuthSecrets }}
       volumes:
+        {{- if .Values.service.otlp.bearerTokenSecret.name }}
         - name: otlp-token
           secret:
             secretName: {{ .Values.service.otlp.bearerTokenSecret.name }}
+        {{- end }}
+        {{- if .Values.service.scrapeAuthSecrets }}
+        {{- /* The SAME Secret is mounted into the agent DaemonSet, which
+               presents the token as `Authorization: Bearer <token>`. */}}
+        - name: scrape-auth-token
+          secret:
+            secretName: {{ $scrapeAuthSecret }}
+        {{- end }}
       {{- end }}
 ---
 apiVersion: v1

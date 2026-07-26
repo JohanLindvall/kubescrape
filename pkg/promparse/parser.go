@@ -99,6 +99,13 @@ type Sample struct {
 	// Exemplar is non-nil when the sample carries one and exemplar parsing
 	// is enabled; valid only during the callback.
 	Exemplar *Exemplar
+	// Help and Unit are the family's "# HELP" text and "# UNIT" (OpenMetrics)
+	// declarations, empty when the exposition carried none. They are stored
+	// once per family and repeated on every sample of it, so a consumer that
+	// only wants them when it first meets a family need not track state; they
+	// outlive the callback (unlike Labels and Exemplar).
+	Help string
+	Unit string
 }
 
 // MaxTrackedFamilies bounds the TYPE table so a pathological endpoint cannot
@@ -122,6 +129,15 @@ const (
 	maxInternedValueLen = 128
 )
 
+// maxMetaBytes bounds the "# HELP"/"# UNIT" text retained for one exposition.
+// The meta table is per-exposition like the TYPE table, but its VALUES are free
+// text (a whole line each), which MaxTrackedFamilies alone would not bound —
+// past the budget later families simply carry no description.
+const maxMetaBytes = 1 << 20
+
+// familyMeta is one family's HELP text and UNIT.
+type familyMeta struct{ help, unit string }
+
 // Parser parses one scrape body. Not safe for concurrent use; create one per
 // scrape.
 type Parser struct {
@@ -136,6 +152,18 @@ type Parser struct {
 	types  map[string]MetricType
 	names  map[string]string // interned metric/label names
 	values map[string]string // interned label values
+	// metas holds each family's HELP/UNIT, recorded once per family from its
+	// comment lines and stamped on every sample of it via lastClass below.
+	// metaBytes is the retained text budget; see maxMetaBytes.
+	metas     map[string]familyMeta
+	metaBytes int
+	// lastClass memoizes the previous line's classification (role, family and
+	// the family's HELP/UNIT) by metric name: consecutive lines share a name
+	// and names are interned, so the repeat check is normally a pointer
+	// comparison — it replaces classify's map probe and suffix walks as well as
+	// the meta lookup. Any TYPE/HELP/UNIT line invalidates it.
+	lastClass   classified
+	lastClassOK bool
 	// Consecutive lines of a family are near-identical: lastMetric and the
 	// per-position lastKV short-circuit the intern-map probes with a plain
 	// memcmp (string(b) == s does not allocate), which is ~5x cheaper.
@@ -227,6 +255,7 @@ func Get(opts Options) *Pooled {
 	p.lastMetric = ""
 	p.lastKV = p.lastKV[:0]
 	p.exLastKV = p.exLastKV[:0]
+	p.resetMeta()
 	clear(p.types) // family types are per-exposition
 	if len(p.names) >= maxInternedNames/2 {
 		clear(p.names)
@@ -314,7 +343,17 @@ func (p *Parser) Parse(r io.Reader, emit func(Sample) error) (malformed int, err
 	// public API and must not corrupt quietly.
 	p.eof = false
 	clear(p.types)
+	p.resetMeta()
 	return p.parseFrom(bufio.NewReaderSize(r, parseBufSize), emit)
+}
+
+// resetMeta drops the previous exposition's HELP/UNIT declarations (they are
+// per-exposition, exactly like the TYPE table) and the classification memo
+// built from them.
+func (p *Parser) resetMeta() {
+	clear(p.metas)
+	p.metaBytes = 0
+	p.lastClass, p.lastClassOK = classified{}, false
 }
 
 func (p *Parser) parseFrom(br *bufio.Reader, emit func(Sample) error) (malformed int, err error) {
@@ -397,7 +436,8 @@ func (p *Parser) parseLine(line []byte, emit func(Sample) error, emitErr *error)
 	if !ok {
 		return false
 	}
-	s.Role, s.Family = p.classify(s.Name)
+	c := p.classifyCached(s.Name)
+	s.Role, s.Family, s.Help, s.Unit = c.role, c.family, c.help, c.unit
 	if err := emit(s); err != nil {
 		*emitErr = err
 	}
@@ -415,12 +455,12 @@ func nextField(b []byte) (tok, rest []byte) {
 	return b[:i], b[i:]
 }
 
-// parseComment records # TYPE declarations and the OpenMetrics # EOF
-// terminator; HELP/UNIT and other comments are ignored. Only the leading
-// tokens are examined — a non-directive comment (HELP with its free text,
-// typically the bulk of the comment bytes) returns after the second token
-// instead of being tokenized whole. It reports false for a malformed TYPE
-// line (missing family/type, or trailing garbage) so the caller counts it.
+// parseComment records # TYPE, # HELP and # UNIT declarations and the
+// OpenMetrics # EOF terminator; other comments are ignored after their second
+// token rather than being tokenized whole. It reports false for a malformed
+// TYPE line (missing family/type, or trailing garbage) so the caller counts it;
+// a HELP/UNIT line without a family is ignored (it declares nothing, and
+// counting free-text comments malformed would be noise).
 func (p *Parser) parseComment(line []byte) bool {
 	_, rest := nextField(line) // the leading "#" token
 	directive, rest := nextField(rest)
@@ -428,6 +468,23 @@ func (p *Parser) parseComment(line []byte) bool {
 	case p.openMetrics && string(directive) == "EOF": // no alloc: memcmp
 		if len(skipSpaceTab(rest)) == 0 {
 			p.eof = true
+		}
+	case string(directive) == "HELP":
+		// The remainder of the line is free text (spaces included), escaped
+		// for backslash and newline.
+		family, rest := nextField(rest)
+		if len(family) > 0 {
+			p.setMeta(family, unescapeHelp(skipSpaceTab(rest)), "")
+		}
+	case string(directive) == "UNIT":
+		// OpenMetrics only, one token. Carried VERBATIM into the OTLP unit:
+		// the exposition is the only authority on what its values measure, and
+		// guessing a UCUM translation would be lossy in a way the raw string
+		// is not.
+		family, rest := nextField(rest)
+		unit, rest := nextField(rest)
+		if len(family) > 0 && len(unit) > 0 && len(skipSpaceTab(rest)) == 0 {
+			p.setMeta(family, "", string(unit))
 		}
 	case string(directive) == "TYPE":
 		family, rest := nextField(rest)
@@ -452,8 +509,97 @@ func (p *Parser) parseComment(line []byte) bool {
 			t = TypeUntyped
 		}
 		p.types[string(family)] = t
+		p.lastClassOK = false // the memo may hold the family just (re)declared
 	}
 	return true
+}
+
+// setMeta records a family's HELP text or UNIT (the empty string leaves the
+// other field alone). Called once per family — the per-sample path only reads
+// the table, through classifyCached — so the key and text allocations here are
+// per family, never per line.
+func (p *Parser) setMeta(family []byte, help, unit string) {
+	if help == "" && unit == "" {
+		return
+	}
+	// Bounded like the TYPE table, and by BYTES as well: these values are free
+	// text, which a count cap alone would not bound. The charge is monotonic —
+	// a family redeclaring its HELP pays twice — which only ever makes the
+	// bound conservative.
+	if len(p.metas) >= MaxTrackedFamilies || p.metaBytes >= maxMetaBytes {
+		return
+	}
+	p.metaBytes += len(family) + len(help) + len(unit)
+	if p.metas == nil {
+		p.metas = make(map[string]familyMeta, 16)
+	}
+	m := p.metas[string(family)] // keyed lookup: no allocation
+	if help != "" {
+		m.help = help
+	}
+	if unit != "" {
+		m.unit = unit
+	}
+	p.metas[string(family)] = m
+	p.lastClassOK = false // the memo may hold the family just redeclared
+}
+
+// unescapeHelp decodes the escapes the exposition formats allow in HELP text:
+// \\ and \n in both, plus \" which OpenMetrics adds (accepting it in classic
+// text too costs nothing — a literal backslash-quote in HELP is not a thing
+// either format can express otherwise). The escape-free case, which is nearly
+// all of them, is one allocation and no scan beyond IndexByte.
+func unescapeHelp(b []byte) string {
+	i := bytes.IndexByte(b, '\\')
+	if i < 0 {
+		return string(b)
+	}
+	var sb strings.Builder
+	sb.Grow(len(b))
+	sb.Write(b[:i])
+	for ; i < len(b); i++ {
+		if b[i] != '\\' || i+1 >= len(b) {
+			sb.WriteByte(b[i])
+			continue
+		}
+		i++
+		switch b[i] {
+		case 'n':
+			sb.WriteByte('\n')
+		case '\\', '"':
+			sb.WriteByte(b[i])
+		default:
+			// Unknown escape: kept verbatim, as parseQuotedSlow does.
+			sb.WriteByte('\\')
+			sb.WriteByte(b[i])
+		}
+	}
+	return sb.String()
+}
+
+// classified is one metric name's resolved role, family and family metadata.
+type classified struct {
+	name, family, help, unit string
+	role                     SampleRole
+}
+
+// classifyCached resolves a metric name through the last-line memo. Consecutive
+// lines of a family repeat the name and names are interned, so the hit is
+// normally a pointer comparison — it skips classify's TYPE probe and suffix
+// walks along with the HELP/UNIT lookup, both of which are per-FAMILY facts
+// that a per-sample path should not recompute. The returned pointer is the
+// parser's own memo: read it out before the next line.
+func (p *Parser) classifyCached(name string) *classified {
+	if !p.lastClassOK || name != p.lastClass.name {
+		c := classified{name: name}
+		c.role, c.family = p.classify(name)
+		if len(p.metas) > 0 { // an exposition without HELP/UNIT pays nothing
+			m := p.metas[c.family]
+			c.help, c.unit = m.help, m.unit
+		}
+		p.lastClass, p.lastClassOK = c, true
+	}
+	return &p.lastClass
 }
 
 // classify resolves the sample role and family from the TYPE table,

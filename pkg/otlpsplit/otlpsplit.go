@@ -149,9 +149,10 @@ func emptyRecordsRL(rl plog.ResourceLogs) plog.ResourceLogs {
 	return nrl
 }
 
-// Metrics partitions md so each part's encoded size is <= maxBytes,
-// splitting an over-large resource by metric (a single metric over the cap goes
-// alone). Producers that pre-chunk never reach the metric split.
+// Metrics partitions md so each part's encoded size is <= maxBytes, splitting
+// an over-large resource by metric and an over-large metric by DATA POINT (a
+// single data point over the cap goes alone). Producers that pre-chunk never
+// reach the metric split.
 func Metrics(md pmetric.Metrics, maxBytes int) []pmetric.Metrics {
 	if maxBytes <= 0 || metricMarshaler.MetricsSize(md) <= maxBytes {
 		return []pmetric.Metrics{md}
@@ -198,31 +199,45 @@ func Metrics(md pmetric.Metrics, maxBytes int) []pmetric.Metrics {
 
 func splitBigResourceMetrics(rm pmetric.ResourceMetrics, maxBytes int, out *[]pmetric.Metrics) {
 	base := metricMarshaler.ResourceMetricsSize(emptyMetricsRM(rm)) + elemOverhead
-	newChunk := func() (pmetric.Metrics, pmetric.MetricSlice, pmetric.ScopeMetrics) {
+	newChunk := func(sm pmetric.ScopeMetrics) (pmetric.Metrics, pmetric.MetricSlice) {
 		md := pmetric.NewMetrics()
 		nrm := md.ResourceMetrics().AppendEmpty()
 		rm.Resource().CopyTo(nrm.Resource())
 		nrm.SetSchemaUrl(rm.SchemaUrl())
 		nsm := nrm.ScopeMetrics().AppendEmpty()
-		return md, nsm.Metrics(), nsm
+		sm.Scope().CopyTo(nsm.Scope())
+		nsm.SetSchemaUrl(sm.SchemaUrl())
+		return md, nsm.Metrics()
 	}
 	sms := rm.ScopeMetrics()
 	for i := 0; i < sms.Len(); i++ {
 		sm := sms.At(i)
 		emptyScope := sm.Metrics().Len() == 0
-		md, ms, nsm := newChunk()
-		sm.Scope().CopyTo(nsm.Scope())
-		nsm.SetSchemaUrl(sm.SchemaUrl())
+		md, ms := newChunk(sm)
 		curBytes := base
 		metrics := sm.Metrics()
 		for j := 0; j < metrics.Len(); j++ {
 			m := metrics.At(j)
 			mBytes := metricMarshaler.MetricSize(m) + elemOverhead
+			// A metric that cannot fit in a chunk of its own is split by DATA
+			// POINT. Stopping at the family would emit a part the collector
+			// rejects wholesale — the exact loss this package exists to
+			// prevent — and a single family (a KSM-style split, a fat
+			// histogram) can be the whole payload.
+			if base+mBytes > maxBytes && dataPointCount(m) > 1 {
+				if ms.Len() > 0 {
+					*out = append(*out, md)
+					md, ms = newChunk(sm)
+					curBytes = base
+				}
+				splitBigMetric(m, base, maxBytes, func() (pmetric.Metrics, pmetric.MetricSlice) {
+					return newChunk(sm)
+				}, out)
+				continue
+			}
 			if ms.Len() > 0 && curBytes+mBytes > maxBytes {
 				*out = append(*out, md)
-				md, ms, nsm = newChunk()
-				sm.Scope().CopyTo(nsm.Scope())
-				nsm.SetSchemaUrl(sm.SchemaUrl())
+				md, ms = newChunk(sm)
 				curBytes = base
 			}
 			m.CopyTo(ms.AppendEmpty())
@@ -232,6 +247,124 @@ func splitBigResourceMetrics(rm pmetric.ResourceMetrics, maxBytes int, out *[]pm
 			*out = append(*out, md)
 		}
 	}
+}
+
+// splitBigMetric packs one over-large metric's data points into whole-Metrics
+// chunks, each carrying a copy of the resource, scope and the metric shell
+// (name/description/unit/metadata plus the type-level temporality and
+// monotonicity). Everything else — data-point attributes, timestamps,
+// exemplars, exponential-histogram scale/zero-count/offsets, summary quantiles
+// — rides on the data point and is preserved by its copy. A single data point
+// over the cap is emitted alone (nothing here can shrink it).
+//
+// base is the fixed per-chunk cost of the resource/scope framing; newChunk
+// yields an empty chunk carrying it.
+func splitBigMetric(m pmetric.Metric, base, maxBytes int, newChunk func() (pmetric.Metrics, pmetric.MetricSlice), out *[]pmetric.Metrics) {
+	shell := pmetric.NewMetric()
+	copyMetricShell(m, shell)
+	// Per-chunk fixed cost: resource + scope framing plus the point-less metric.
+	metricBase := base + metricMarshaler.MetricSize(shell) + elemOverhead
+	newMetricChunk := func() (pmetric.Metrics, pmetric.Metric) {
+		md, ms := newChunk()
+		nm := ms.AppendEmpty()
+		shell.CopyTo(nm)
+		return md, nm
+	}
+	n, sizeOf, appendTo := pointAccessors(m)
+	md, nm := newMetricChunk()
+	curBytes, held := metricBase, 0
+	for i := 0; i < n; i++ {
+		dpBytes := sizeOf(i) + elemOverhead
+		if held > 0 && curBytes+dpBytes > maxBytes {
+			*out = append(*out, md)
+			md, nm = newMetricChunk()
+			curBytes, held = metricBase, 0
+		}
+		appendTo(i, nm)
+		curBytes += dpBytes
+		held++
+	}
+	if held > 0 {
+		*out = append(*out, md)
+	}
+}
+
+// copyMetricShell copies m's identity and type-level fields into dst, leaving
+// dst without data points.
+func copyMetricShell(m, dst pmetric.Metric) {
+	dst.SetName(m.Name())
+	dst.SetDescription(m.Description())
+	dst.SetUnit(m.Unit())
+	m.Metadata().CopyTo(dst.Metadata())
+	switch m.Type() {
+	case pmetric.MetricTypeGauge:
+		dst.SetEmptyGauge()
+	case pmetric.MetricTypeSum:
+		s := dst.SetEmptySum()
+		s.SetIsMonotonic(m.Sum().IsMonotonic())
+		s.SetAggregationTemporality(m.Sum().AggregationTemporality())
+	case pmetric.MetricTypeHistogram:
+		dst.SetEmptyHistogram().SetAggregationTemporality(m.Histogram().AggregationTemporality())
+	case pmetric.MetricTypeExponentialHistogram:
+		dst.SetEmptyExponentialHistogram().SetAggregationTemporality(m.ExponentialHistogram().AggregationTemporality())
+	case pmetric.MetricTypeSummary:
+		dst.SetEmptySummary()
+	}
+}
+
+// dataPointCount is m's data-point count across all five metric types (0 for a
+// type-less metric, which is therefore never data-point split).
+func dataPointCount(m pmetric.Metric) int {
+	switch m.Type() {
+	case pmetric.MetricTypeGauge:
+		return m.Gauge().DataPoints().Len()
+	case pmetric.MetricTypeSum:
+		return m.Sum().DataPoints().Len()
+	case pmetric.MetricTypeHistogram:
+		return m.Histogram().DataPoints().Len()
+	case pmetric.MetricTypeExponentialHistogram:
+		return m.ExponentialHistogram().DataPoints().Len()
+	case pmetric.MetricTypeSummary:
+		return m.Summary().DataPoints().Len()
+	}
+	return 0
+}
+
+// pointAccessors returns m's data-point count plus per-index size and
+// copy-into-destination helpers, uniform across the five metric types. Cold
+// path (only a metric that alone exceeds the cap gets here), so the per-call
+// closures cost nothing in the common case.
+func pointAccessors(m pmetric.Metric) (n int, sizeOf func(int) int, appendTo func(int, pmetric.Metric)) {
+	switch m.Type() {
+	case pmetric.MetricTypeGauge:
+		dps := m.Gauge().DataPoints()
+		return dps.Len(),
+			func(i int) int { return metricMarshaler.NumberDataPointSize(dps.At(i)) },
+			func(i int, dst pmetric.Metric) { dps.At(i).CopyTo(dst.Gauge().DataPoints().AppendEmpty()) }
+	case pmetric.MetricTypeSum:
+		dps := m.Sum().DataPoints()
+		return dps.Len(),
+			func(i int) int { return metricMarshaler.NumberDataPointSize(dps.At(i)) },
+			func(i int, dst pmetric.Metric) { dps.At(i).CopyTo(dst.Sum().DataPoints().AppendEmpty()) }
+	case pmetric.MetricTypeHistogram:
+		dps := m.Histogram().DataPoints()
+		return dps.Len(),
+			func(i int) int { return metricMarshaler.HistogramDataPointSize(dps.At(i)) },
+			func(i int, dst pmetric.Metric) { dps.At(i).CopyTo(dst.Histogram().DataPoints().AppendEmpty()) }
+	case pmetric.MetricTypeExponentialHistogram:
+		dps := m.ExponentialHistogram().DataPoints()
+		return dps.Len(),
+			func(i int) int { return metricMarshaler.ExponentialHistogramDataPointSize(dps.At(i)) },
+			func(i int, dst pmetric.Metric) {
+				dps.At(i).CopyTo(dst.ExponentialHistogram().DataPoints().AppendEmpty())
+			}
+	case pmetric.MetricTypeSummary:
+		dps := m.Summary().DataPoints()
+		return dps.Len(),
+			func(i int) int { return metricMarshaler.SummaryDataPointSize(dps.At(i)) },
+			func(i int, dst pmetric.Metric) { dps.At(i).CopyTo(dst.Summary().DataPoints().AppendEmpty()) }
+	}
+	return 0, func(int) int { return 0 }, func(int, pmetric.Metric) {}
 }
 
 func emptyMetricsRM(rm pmetric.ResourceMetrics) pmetric.ResourceMetrics {

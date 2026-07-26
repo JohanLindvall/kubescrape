@@ -11,7 +11,7 @@ import (
 // TestAuditFilterOverlapDisableWins: when a key matches both the enable and the
 // disable set, disable wins (it is removed).
 func TestAuditFilterOverlapDisableWins(t *testing.T) {
-	f, err := NewFilter(`k8s\..*`, `k8s\.pod\.label\..*`)
+	f, err := NewFilterFromLists([]string{`k8s\..*`}, []string{`k8s\.pod\.label\..*`})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -31,7 +31,7 @@ func TestAuditFilterOverlapDisableWins(t *testing.T) {
 // service.* keys strips the derived Mimir job/instance identity. Not a bug (the
 // filter is applied to all keys by contract) but worth knowing.
 func TestAuditFilterCanStripIdentity(t *testing.T) {
-	f, err := NewFilter(`k8s\..*`, "") // only k8s.* survive
+	f, err := NewFilterFromLists([]string{`k8s\..*`}, nil) // only k8s.* survive
 	if err != nil {
 		t.Fatal(err)
 	}

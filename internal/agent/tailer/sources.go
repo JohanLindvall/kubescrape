@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"path"
 	"path/filepath"
+	"time"
 
 	"github.com/bmatcuk/doublestar/v4"
 
@@ -47,6 +48,14 @@ type Source struct {
 	// is tracked but no data is ever read from it. "Collect logs only for pods
 	// labeled logging=true" is otherwise expressible only as a filename glob.
 	Selector map[string]string `json:"selector,omitempty"`
+	// IgnoreOlder skips files whose mtime is older than this Go duration (e.g.
+	// "24h"), so a source pointed at a directory of retained history reads only
+	// what is recent. It applies at DISCOVERY: an ignored file is never opened,
+	// tracked or read. A file already being tailed, or one with a stored
+	// offset, is NEVER ignored however stale it looks — dropping those would
+	// abandon unshipped bytes and re-ingest the file whole if it were ever
+	// touched again. Unset (or 0) reads every matched file.
+	IgnoreOlder string `json:"ignoreOlder,omitempty"`
 	// Multiline overrides the tailer default for this source (nil = default).
 	Multiline *bool `json:"multiline,omitempty"`
 	// Attributes are static resource attributes stamped on records from
@@ -88,8 +97,27 @@ func ValidateSources(sources []Source) ([]Source, error) {
 				return nil, fmt.Errorf("source %d (%q): invalid namespace pattern %q: %w", i, s.Name, g, err)
 			}
 		}
+		if _, err := parseIgnoreOlder(s.IgnoreOlder); err != nil {
+			return nil, fmt.Errorf("source %d (%q): %w", i, s.Name, err)
+		}
 	}
 	return sources, nil
+}
+
+// parseIgnoreOlder resolves the source's mtime cutoff; empty means none. A
+// negative duration would ignore everything, which is never what anyone means.
+func parseIgnoreOlder(v string) (time.Duration, error) {
+	if v == "" {
+		return 0, nil
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil {
+		return 0, fmt.Errorf("invalid ignoreOlder %q: %w", v, err)
+	}
+	if d < 0 {
+		return 0, fmt.Errorf("invalid ignoreOlder %q: must not be negative", v)
+	}
+	return d, nil
 }
 
 // compiledSource is a Source with its per-source options resolved.
@@ -100,7 +128,9 @@ type compiledSource struct {
 	containerd bool
 	compressed bool
 	multiline  bool
-	attributes map[string]string
+	// ignoreOlder is the resolved mtime cutoff (0 = read everything).
+	ignoreOlder time.Duration
+	attributes  map[string]string
 	// namespaces/excludeNamespaces gate a containerd source by the namespace
 	// in the CRI filename (discovery time — the file is never opened);
 	// selector gates it by pod labels (resolve time — nothing is ever read).
@@ -155,14 +185,18 @@ func compileSources(sources []Source, dir string, defaultMultiline bool) []*comp
 		if s.Multiline != nil {
 			ml = *s.Multiline
 		}
+		// Validated by ValidateSources; a parse error here cannot happen and
+		// degrades to "no cutoff" rather than dropping the source.
+		ignoreOlder, _ := parseIgnoreOlder(s.IgnoreOlder)
 		out = append(out, &compiledSource{
-			name:       s.Name,
-			include:    s.Include,
-			exclude:    s.Exclude,
-			containerd: s.Containerd,
-			compressed: s.Compressed,
-			multiline:  ml,
-			attributes: s.Attributes,
+			name:        s.Name,
+			include:     s.Include,
+			exclude:     s.Exclude,
+			containerd:  s.Containerd,
+			compressed:  s.Compressed,
+			multiline:   ml,
+			ignoreOlder: ignoreOlder,
+			attributes:  s.Attributes,
 
 			namespaces:        s.Namespaces,
 			excludeNamespaces: s.ExcludeNamespaces,

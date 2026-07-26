@@ -240,9 +240,18 @@ func monitorPodPort(pod kubemeta.Pod, svc *services.Service, ep servicemonitors.
 }
 
 // Scrapeable reports whether a pod can yield scrape targets at all: it must
-// be live (not deleted, not Succeeded/Failed) and have a pod IP.
+// be live (not deleted, not terminating, not Succeeded/Failed) and have a pod
+// IP.
+//
+// TERMINATING pods (deletionTimestamp set) are excluded even though their
+// phase stays Running for the whole grace period: the container is already
+// being shut down while the pod still appears in the node's pod list, so
+// scraping it yields connection failures — an `up=0` churn spike on every
+// rollout, plus a scrape target that outlives the workload. Prometheus'
+// endpoints discovery drops terminating endpoints for the same reason. They
+// remain resolvable by container ID / UID / name; only TARGETS are affected.
 func Scrapeable(pod kubemeta.Pod) bool {
-	if pod.PodIP == "" || pod.DeletedAt != nil {
+	if pod.PodIP == "" || pod.DeletedAt != nil || pod.DeletionTimestamp != nil {
 		return false
 	}
 	return pod.Phase != "Succeeded" && pod.Phase != "Failed"

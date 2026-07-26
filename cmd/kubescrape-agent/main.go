@@ -74,6 +74,7 @@ var (
 	selfMetricsIntv      = flag.Duration("self-metrics-interval", time.Minute, "export the agent's own metrics over OTLP at this interval (0 disables)")
 	metadataURL          = flag.String("metadata-endpoint", "http://kubescrape.monitoring", "base URL of the kubescrape metadata service")
 	metadataWait         = flag.Duration("metadata-wait", 5*time.Second, "how long the metadata service may block waiting for a new container")
+	scrapeAuthToken      = flag.String("scrape-auth-token-file", "", "bearer token file for the metadata service's /v1/scrape-auth endpoint (re-read periodically); required when the service runs -scrape-auth-secrets")
 	otlpEndpoint         = flag.String("otlp-endpoint", "otel-collector.monitoring:4317", "OTLP endpoint: host:port for grpc, base URL for http")
 	otlpProtocol         = flag.String("otlp-protocol", "grpc", "OTLP transport: grpc or http")
 	otlpCompression      = flag.String("otlp-compression", "gzip", "OTLP payload compression: gzip or none")
@@ -308,6 +309,16 @@ func run() error {
 	meta := metaclient.New(*metadataURL, max(*metadataWait, *ingestWait)+10*time.Second)
 	// The client is dependency-free by design; feed its outcomes to our metrics.
 	meta.Observe = func(outcome string) { obs.MetadataRequests.WithLabelValues(outcome).Inc() }
+	if *scrapeAuthToken != "" {
+		// /v1/scrape-auth returns Secret VALUES and is the one authenticated
+		// endpoint. Read through a cache so the file is not hit per scrape, and
+		// re-read so a rotated Secret is picked up without a restart.
+		reader := newTokenFile(*scrapeAuthToken, log)
+		if _, err := reader.read(); err != nil {
+			return fmt.Errorf("reading -scrape-auth-token-file: %w", err)
+		}
+		meta.SetScrapeAuthToken(reader.get)
+	}
 
 	// The Prometheus scrape target for this process's own runtime metrics, on
 	// its own port (see -metrics-listen).
@@ -328,7 +339,7 @@ func run() error {
 	var metricFilters *promscrape.MetricFilters
 	var splitters []*promscrape.Splitter
 	if fileCfg.Metrics != nil {
-		if metricFilters, err = promscrape.NewMetricFilters(&promscrape.FilterConfig{Pipelines: fileCfg.Metrics.Pipelines}); err != nil {
+		if metricFilters, err = promscrape.NewMetricFilters(fileCfg.Metrics.Pipelines); err != nil {
 			return fmt.Errorf("metrics config: %w", err)
 		}
 		if splitters, err = promscrape.NewSplitters(fileCfg.Metrics.Splitters); err != nil {

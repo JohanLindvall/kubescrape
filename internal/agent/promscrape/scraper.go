@@ -627,7 +627,7 @@ func (s *Scraper) scrapeTarget(ctx context.Context, t kubemeta.ScrapeTarget, tim
 	} else {
 		cb = newBatcher(func(res pcommon.Resource) {
 			s.fillTargetResource(res, t.URL, &t.Pod, t.Service)
-		}, s.cfg.BatchPoints, s.cfg.StartTime, time.Now())
+		}, s.cfg.StartTime, time.Now())
 	}
 	relabel, err := s.relabels.session(t.MetricRelabelings)
 	if err != nil {
@@ -643,7 +643,6 @@ func (s *Scraper) scrapeTarget(ctx context.Context, t kubemeta.ScrapeTarget, tim
 // with a single resource, grouping data points by metric name.
 type batcher struct {
 	fillResource func(pcommon.Resource)
-	limit        int
 	startTS      pcommon.Timestamp
 	scrapeTS     pcommon.Timestamp
 	md           pmetric.Metrics
@@ -659,10 +658,9 @@ type batcher struct {
 	bytes      int
 }
 
-func newBatcher(fillResource func(pcommon.Resource), limit int, start, scrape time.Time) *batcher {
+func newBatcher(fillResource func(pcommon.Resource), start, scrape time.Time) *batcher {
 	b := &batcher{
 		fillResource: fillResource,
-		limit:        limit,
 		startTS:      pcommon.NewTimestampFromTime(start),
 		scrapeTS:     pcommon.NewTimestampFromTime(scrape),
 	}

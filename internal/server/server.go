@@ -3,6 +3,7 @@ package server
 
 import (
 	"context"
+	"errors"
 	"hash/fnv"
 	"log/slog"
 	"net/http"
@@ -54,6 +55,27 @@ type Config struct {
 	// -scrape-auth-secrets — it requires secrets RBAC and ships secret
 	// material over the cluster-internal HTTP channel.
 	Secrets SecretReader
+	// ScrapeAuthToken is the shared bearer token clients must present on
+	// GET /v1/scrape-auth (`Authorization: Bearer <token>`), read from
+	// -scrape-auth-token-file. It is REQUIRED whenever Secrets is set (see
+	// Validate) and guards that route only — the rest of the API carries no
+	// secret material and stays open.
+	ScrapeAuthToken string
+}
+
+// Validate reports a configuration that must not start the process.
+//
+// The one rule: a Server that can read Secrets must know the token guarding
+// them. Without it GET /v1/scrape-auth would serve every Secret key a monitor
+// endpoint references to anything that can reach the service — a silent,
+// cluster-wide secret leak, which is exactly the failure mode a "the flag was
+// not set" default must never produce.
+func (c Config) Validate() error {
+	if c.Secrets != nil && c.ScrapeAuthToken == "" {
+		return errors.New("-scrape-auth-secrets requires -scrape-auth-token-file: " +
+			"/v1/scrape-auth serves monitor Secret keys and must not be reachable unauthenticated")
+	}
+	return nil
 }
 
 // SecretReader resolves one Secret key's value.
@@ -63,16 +85,18 @@ type SecretReader interface {
 
 // Server serves container metadata and node scrape targets.
 type Server struct {
-	secrets  SecretReader
-	store    *store.Store
-	services *services.Index
-	monitors *servicemonitors.Index
-	resolver MetadataResolver
-	maxWait  time.Duration
-	cacheTTL time.Duration
-	ready    <-chan struct{}
-	log      *slog.Logger
-	now      func() time.Time
+	secrets SecretReader
+	// scrapeAuthToken guards the /v1/scrape-auth route only (see auth.go).
+	scrapeAuthToken string
+	store           *store.Store
+	services        *services.Index
+	monitors        *servicemonitors.Index
+	resolver        MetadataResolver
+	maxWait         time.Duration
+	cacheTTL        time.Duration
+	ready           <-chan struct{}
+	log             *slog.Logger
+	now             func() time.Time
 
 	// monMu guards the monitoredServices cache: the monitor→services match
 	// is O(monitors × services) and identical across the per-node target
@@ -92,16 +116,17 @@ func New(cfg Config) *Server {
 		log = slog.Default()
 	}
 	return &Server{
-		secrets:  cfg.Secrets,
-		store:    cfg.Store,
-		services: cfg.Services,
-		monitors: cfg.Monitors,
-		resolver: cfg.Resolver,
-		maxWait:  cfg.MaxWait,
-		cacheTTL: cfg.CacheTTL,
-		ready:    cfg.Ready,
-		log:      log,
-		now:      time.Now,
+		secrets:         cfg.Secrets,
+		scrapeAuthToken: cfg.ScrapeAuthToken,
+		store:           cfg.Store,
+		services:        cfg.Services,
+		monitors:        cfg.Monitors,
+		resolver:        cfg.Resolver,
+		maxWait:         cfg.MaxWait,
+		cacheTTL:        cfg.CacheTTL,
+		ready:           cfg.Ready,
+		log:             log,
+		now:             time.Now,
 	}
 }
 

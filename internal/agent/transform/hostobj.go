@@ -328,15 +328,40 @@ func (m *metricObj) Truth() starlark.Bool  { return true }
 func (m *metricObj) Hash() (uint32, error) { return 0, fmt.Errorf("unhashable") }
 
 func (m *metricObj) AttrNames() []string {
-	return []string{"drop", "name", "resource"}
+	return []string{"datapoints", "description", "drop", "name", "resource", "type", "unit"}
+}
+
+// metricType names the metric's data shape for scripts (`m.type == "sum"`).
+func metricType(m pmetric.Metric) string {
+	switch m.Type() {
+	case pmetric.MetricTypeGauge:
+		return "gauge"
+	case pmetric.MetricTypeSum:
+		return "sum"
+	case pmetric.MetricTypeHistogram:
+		return "histogram"
+	case pmetric.MetricTypeExponentialHistogram:
+		return "exponential_histogram"
+	case pmetric.MetricTypeSummary:
+		return "summary"
+	}
+	return "empty"
 }
 
 func (m *metricObj) Attr(name string) (starlark.Value, error) {
 	switch name {
 	case "name":
 		return starlark.String(m.m.Name()), nil
+	case "type":
+		return starlark.String(metricType(m.m)), nil
+	case "unit":
+		return starlark.String(m.m.Unit()), nil
+	case "description":
+		return starlark.String(m.m.Description()), nil
 	case "resource":
 		return attrsView{m.res.Attributes()}, nil
+	case "datapoints":
+		return &datapoints{m: m.m}, nil
 	case "drop":
 		// Mark in the pdata-internal Metadata map (never serialized to OTLP),
 		// NOT the name — a script doing `m.drop(); m.name = "x"` would
@@ -349,13 +374,145 @@ func (m *metricObj) Attr(name string) (starlark.Value, error) {
 }
 
 func (m *metricObj) SetField(name string, v starlark.Value) error {
-	if name == "name" {
-		s, ok := starlark.AsString(v)
-		if !ok {
-			return fmt.Errorf("name must be a string")
-		}
-		m.m.SetName(s)
-		return nil
+	s, ok := starlark.AsString(v)
+	if !ok {
+		return fmt.Errorf("%s must be a string", name)
 	}
-	return fmt.Errorf("cannot set %s", name)
+	switch name {
+	case "name":
+		m.m.SetName(s)
+	case "unit":
+		m.m.SetUnit(s)
+	case "description":
+		m.m.SetDescription(s)
+	default:
+		return fmt.Errorf("cannot set %s", name)
+	}
+	return nil
+}
+
+// datapoints is the iterable view of a metric's data points, across all five
+// pdata types. Without it a metrics script could only rename or drop a whole
+// metric: the labels that actually drive cost and cardinality live on the data
+// points, so "drop the pod_name label from this one noisy metric" — the common
+// reason to reach for a metrics transform at all — was inexpressible.
+type datapoints struct{ m pmetric.Metric }
+
+func (d *datapoints) String() string        { return "datapoints" }
+func (d *datapoints) Type() string          { return "datapoints" }
+func (d *datapoints) Freeze()               {}
+func (d *datapoints) Truth() starlark.Bool  { return d.Len() > 0 }
+func (d *datapoints) Hash() (uint32, error) { return 0, fmt.Errorf("unhashable") }
+
+// Len makes len(m.datapoints) work and lets a script skip empty metrics.
+func (d *datapoints) Len() int {
+	switch d.m.Type() {
+	case pmetric.MetricTypeGauge:
+		return d.m.Gauge().DataPoints().Len()
+	case pmetric.MetricTypeSum:
+		return d.m.Sum().DataPoints().Len()
+	case pmetric.MetricTypeHistogram:
+		return d.m.Histogram().DataPoints().Len()
+	case pmetric.MetricTypeExponentialHistogram:
+		return d.m.ExponentialHistogram().DataPoints().Len()
+	case pmetric.MetricTypeSummary:
+		return d.m.Summary().DataPoints().Len()
+	}
+	return 0
+}
+
+func (d *datapoints) Iterate() starlark.Iterator {
+	var dps []*dpObj
+	add := func(attrs pcommon.Map, num *pmetric.NumberDataPoint) {
+		dps = append(dps, &dpObj{attrs: attrs, num: num})
+	}
+	switch d.m.Type() {
+	case pmetric.MetricTypeGauge:
+		pts := d.m.Gauge().DataPoints()
+		for i := 0; i < pts.Len(); i++ {
+			p := pts.At(i)
+			add(p.Attributes(), &p)
+		}
+	case pmetric.MetricTypeSum:
+		pts := d.m.Sum().DataPoints()
+		for i := 0; i < pts.Len(); i++ {
+			p := pts.At(i)
+			add(p.Attributes(), &p)
+		}
+	case pmetric.MetricTypeHistogram:
+		pts := d.m.Histogram().DataPoints()
+		for i := 0; i < pts.Len(); i++ {
+			add(pts.At(i).Attributes(), nil)
+		}
+	case pmetric.MetricTypeExponentialHistogram:
+		pts := d.m.ExponentialHistogram().DataPoints()
+		for i := 0; i < pts.Len(); i++ {
+			add(pts.At(i).Attributes(), nil)
+		}
+	case pmetric.MetricTypeSummary:
+		pts := d.m.Summary().DataPoints()
+		for i := 0; i < pts.Len(); i++ {
+			add(pts.At(i).Attributes(), nil)
+		}
+	}
+	return &sliceIter[*dpObj]{items: dps}
+}
+
+// dpObj is one data point: its attributes, its value where that is a single
+// number, and drop(). num is nil for the bucketed kinds, whose "value" is a
+// distribution rather than a scalar.
+type dpObj struct {
+	attrs pcommon.Map
+	num   *pmetric.NumberDataPoint
+}
+
+func (p *dpObj) String() string        { return "datapoint" }
+func (p *dpObj) Type() string          { return "datapoint" }
+func (p *dpObj) Freeze()               {}
+func (p *dpObj) Truth() starlark.Bool  { return true }
+func (p *dpObj) Hash() (uint32, error) { return 0, fmt.Errorf("unhashable") }
+
+func (p *dpObj) AttrNames() []string { return []string{"attributes", "drop", "value"} }
+
+func (p *dpObj) Attr(name string) (starlark.Value, error) {
+	switch name {
+	case "attributes":
+		return attrsView{p.attrs}, nil
+	case "value":
+		if p.num == nil {
+			return starlark.None, nil // bucketed points have no scalar value
+		}
+		if p.num.ValueType() == pmetric.NumberDataPointValueTypeInt {
+			return starlark.MakeInt64(p.num.IntValue()), nil
+		}
+		return starlark.Float(p.num.DoubleValue()), nil
+	case "drop":
+		// Marked in the point's own attributes and swept after the run, like
+		// logs and spans. A metric left with no points at all is pruned too —
+		// an empty metric is not a valid OTLP payload element to ship.
+		return dropFn{mark: func() { p.attrs.PutBool(dropMarker, true) }}, nil
+	}
+	return nil, nil
+}
+
+func (p *dpObj) SetField(name string, v starlark.Value) error {
+	if name != "value" {
+		return fmt.Errorf("cannot set %s", name)
+	}
+	if p.num == nil {
+		return fmt.Errorf("cannot set value on a %s data point", "bucketed")
+	}
+	switch x := v.(type) {
+	case starlark.Int:
+		i, ok := x.Int64()
+		if !ok {
+			return fmt.Errorf("value out of int64 range")
+		}
+		p.num.SetIntValue(i)
+	case starlark.Float:
+		p.num.SetDoubleValue(float64(x))
+	default:
+		return fmt.Errorf("value must be a number")
+	}
+	return nil
 }

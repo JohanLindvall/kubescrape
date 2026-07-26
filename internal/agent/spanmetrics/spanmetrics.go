@@ -23,6 +23,7 @@ package spanmetrics
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"sort"
 	"strconv"
@@ -57,6 +58,11 @@ var defaultBuckets = []float64{0.002, 0.004, 0.006, 0.008, 0.01, 0.05, 0.1, 0.2,
 const (
 	defaultNamePrefix     = "traces.span.metrics"
 	defaultMaxCardinality = 20000
+	// defaultStaleAfter drops a series whose dimensions have not been seen for
+	// this long. Long enough that a slow-but-live endpoint keeps reporting,
+	// short enough that a burst of one-off span names releases its cardinality
+	// slots within one alerting window.
+	defaultStaleAfter = 15 * time.Minute
 )
 
 // Exporter sends one OTLP metrics payload; satisfied by otlpexport.Client.
@@ -81,21 +87,55 @@ type Config struct {
 	// Exemplars attaches a trace/span-id exemplar (one per latency bucket, reset
 	// each export) to the duration histogram. nil defaults to true.
 	Exemplars *bool `json:"exemplars,omitempty"`
+	// StaleAfter evicts a series whose dimensions have not been observed for
+	// this long (a Go duration such as "15m"; empty = 15m, "0" disables
+	// eviction and keeps every series for the process' life).
+	//
+	// A STRING, not a time.Duration, for the same reason as traceSampling's
+	// keepSlowerThan: the config is decoded through sigs.k8s.io/yaml ->
+	// encoding/json, which only accepts a raw nanosecond integer for a
+	// time.Duration, so the documented "15m" spelling would fail to decode.
+	StaleAfter string `json:"staleAfter,omitempty"`
+}
+
+// staleAfter parses StaleAfter. Empty means the default; an explicit
+// zero/negative disables eviction.
+func (c Config) staleAfter() (time.Duration, error) {
+	if c.StaleAfter == "" {
+		return defaultStaleAfter, nil
+	}
+	d, err := time.ParseDuration(c.StaleAfter)
+	if err != nil {
+		return defaultStaleAfter, fmt.Errorf("traceMetrics.staleAfter %q: %w", c.StaleAfter, err)
+	}
+	if d < 0 {
+		d = 0
+	}
+	return d, nil
+}
+
+// Validate reports a malformed config so a bad value can fail startup with a
+// clear message (New itself falls back to the default, never refusing to
+// aggregate).
+func (c Config) Validate() error {
+	_, err := c.staleAfter()
+	return err
 }
 
 // Generator aggregates spans into calls/size/duration metrics. Safe for
 // concurrent Consume from the ingest goroutines.
 type Generator struct {
-	prefix    string
-	names     []string // full dimension label names (built-ins + extras), in order
-	extra     []string
-	bounds    []float64 // histogram bucket bounds, ascending, seconds
-	maxCard   int
-	exemplars bool
+	prefix     string
+	names      []string // full dimension label names (built-ins + extras), in order
+	extra      []string
+	bounds     []float64 // histogram bucket bounds, ascending, seconds
+	maxCard    int
+	exemplars  bool
+	staleAfter time.Duration // 0 disables eviction
+	now        func() time.Time
 
 	mu     sync.Mutex
 	series map[string]*spanSeries
-	start  time.Time
 }
 
 type spanSeries struct {
@@ -106,7 +146,28 @@ type spanSeries struct {
 	sum     float64
 	buckets []uint64   // len(bounds)+1
 	ex      []exemplar // nil until an exemplar is recorded; one latest per bucket
+	// start is when this series was created: a series re-created after an
+	// eviction restarts its cumulative counters, and a fresh start timestamp is
+	// how OTLP spells that reset (an unchanged one would read as a counter
+	// jumping backwards).
+	start time.Time
+	// lastSeen is the last observation; state says whether the CURRENT values
+	// reached the collector. Eviction needs both: dropping a series whose last
+	// observations no DELIVERED export carried would destroy them unseen (an
+	// export interval may legally exceed staleAfter, and an export can fail).
+	lastSeen time.Time
+	state    reportState
 }
+
+// reportState tracks a series' values from observation to delivery, so
+// eviction only ever drops values the collector has acked.
+type reportState uint8
+
+const (
+	stateObserved  reportState = iota // new values since the last render
+	stateRendered                     // rendered into a payload; delivery unknown
+	stateDelivered                    // a payload carrying them was acked
+)
 
 type exemplar struct {
 	set     bool
@@ -149,15 +210,17 @@ func New(cfg Config) *Generator {
 		seen[d] = true
 		names = append(names, d)
 	}
+	stale, _ := cfg.staleAfter() // an unparseable value falls back to the default; Validate reports it
 	return &Generator{
-		prefix:    prefix,
-		names:     names,
-		extra:     names[len(builtinDims):], // the configured dimensions, aliased (never diverges from names)
-		bounds:    boundsOrDefault(cfg.Buckets),
-		maxCard:   maxCard,
-		exemplars: ex,
-		series:    make(map[string]*spanSeries),
-		start:     time.Now(),
+		prefix:     prefix,
+		names:      names,
+		extra:      names[len(builtinDims):], // the configured dimensions, aliased (never diverges from names)
+		bounds:     boundsOrDefault(cfg.Buckets),
+		maxCard:    maxCard,
+		exemplars:  ex,
+		staleAfter: stale,
+		now:        time.Now,
+		series:     make(map[string]*spanSeries),
 	}
 }
 
@@ -174,6 +237,10 @@ func boundsOrDefault(b []float64) []float64 {
 // Consume aggregates every span in td (called on the ingest goroutines, so it is
 // safe for concurrent use). It never mutates td.
 func (g *Generator) Consume(td ptrace.Traces) {
+	// One clock read per BATCH, not per span: last-seen only feeds staleness
+	// eviction (minutes), and the hot path must stay allocation- and
+	// syscall-free per span.
+	now := g.now()
 	rss := td.ResourceSpans()
 	for i := 0; i < rss.Len(); i++ {
 		rs := rss.At(i)
@@ -183,13 +250,13 @@ func (g *Generator) Consume(td ptrace.Traces) {
 		for j := 0; j < sss.Len(); j++ {
 			spans := sss.At(j).Spans()
 			for k := 0; k < spans.Len(); k++ {
-				g.observe(spans.At(k), resAttrs, svc)
+				g.observe(spans.At(k), resAttrs, svc, now)
 			}
 		}
 	}
 }
 
-func (g *Generator) observe(span ptrace.Span, resAttrs pcommon.Map, svc string) {
+func (g *Generator) observe(span ptrace.Span, resAttrs pcommon.Map, svc string, now time.Time) {
 	// Build the map key on the stack (does not escape → the map[string(key)]
 	// lookup allocates nothing for a warm series). A key over keyScratch bytes
 	// falls back to a one-off heap grow.
@@ -218,7 +285,7 @@ func (g *Generator) observe(span ptrace.Span, resAttrs pcommon.Map, svc string) 
 			obs.SpanMetricsDropped.Inc()
 			return
 		}
-		s = &spanSeries{dims: g.dims(span, resAttrs, svc), buckets: make([]uint64, len(g.bounds)+1)}
+		s = &spanSeries{dims: g.dims(span, resAttrs, svc), buckets: make([]uint64, len(g.bounds)+1), start: now}
 		g.series[string(key)] = s
 	}
 	s.calls++
@@ -226,6 +293,8 @@ func (g *Generator) observe(span ptrace.Span, resAttrs pcommon.Map, svc string) 
 	s.count++
 	s.sum += d
 	s.buckets[idx]++
+	s.lastSeen = now
+	s.state = stateObserved
 	if g.exemplars {
 		if tid := span.TraceID(); !tid.IsEmpty() {
 			if s.ex == nil {
@@ -284,24 +353,30 @@ func (g *Generator) Run(ctx context.Context, exp Exporter, interval time.Duratio
 // per delivered export): a failed send keeps them for the next attempt instead
 // of wiping them unseen.
 func (g *Generator) Export(ctx context.Context, exp Exporter, res pcommon.Resource) error {
-	md := g.render(res, time.Now())
+	md := g.render(res, g.now())
 	if md.ResourceMetrics().Len() == 0 {
 		return nil
 	}
 	if err := exp.ExportMetrics(ctx, md); err != nil {
 		return err
 	}
-	g.clearExemplars()
+	g.afterDelivered()
 	return nil
 }
 
-// clearExemplars resets every recorded exemplar after a delivered export. An
-// exemplar recorded between render and this clear is dropped unseen — the same
+// afterDelivered records that the rendered values reached the collector (only
+// those may later be evicted) and resets every recorded exemplar. A series
+// OBSERVED between render and this call is back in stateObserved, so it is not
+// marked delivered — its new values must still be exported before eviction may
+// touch them. An exemplar recorded in that same window is dropped unseen: the
 // one-interval recency window the reset has always had.
-func (g *Generator) clearExemplars() {
+func (g *Generator) afterDelivered() {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	for _, s := range g.series {
+		if s.state == stateRendered {
+			s.state = stateDelivered
+		}
 		for i := range s.ex {
 			s.ex[i].set = false
 		}
@@ -314,19 +389,40 @@ func (g *Generator) render(res pcommon.Resource, now time.Time) pmetric.Metrics 
 	res.CopyTo(rm.Resource())
 	sm := rm.ScopeMetrics().AppendEmpty()
 	sm.Scope().SetName(scopeName)
-	start := pcommon.NewTimestampFromTime(g.start)
 	ts := pcommon.NewTimestampFromTime(now)
 
-	g.renderRED(sm, start, ts)
+	g.renderRED(sm, now, ts)
 	if sm.Metrics().Len() == 0 {
 		return pmetric.NewMetrics() // nothing to send this cycle
 	}
 	return md
 }
 
-func (g *Generator) renderRED(sm pmetric.ScopeMetrics, start, ts pcommon.Timestamp) {
+// evictLocked drops series not observed within staleAfter. Without eviction the
+// map only ever grows: dead series render into every export forever and — worse
+// — the cardinality cap becomes a ONE-WAY LATCH, so one burst of high-
+// cardinality span names permanently blinds RED metrics for every service that
+// starts on the node afterwards. A cumulative counter that stops being reported
+// is the standard staleness signal downstream. Caller holds the mutex.
+func (g *Generator) evictLocked(now time.Time) {
+	if g.staleAfter <= 0 { // eviction disabled
+		return
+	}
+	for k, s := range g.series {
+		// Only a series whose current values a DELIVERED export carried may
+		// go: an export interval longer than staleAfter — or a failed export —
+		// must not destroy observations unseen.
+		if s.state == stateDelivered && now.Sub(s.lastSeen) > g.staleAfter {
+			delete(g.series, k)
+			obs.SpanMetricsEvicted.Inc()
+		}
+	}
+}
+
+func (g *Generator) renderRED(sm pmetric.ScopeMetrics, now time.Time, ts pcommon.Timestamp) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
+	g.evictLocked(now)
 	if len(g.series) == 0 {
 		return
 	}
@@ -334,6 +430,8 @@ func (g *Generator) renderRED(sm pmetric.ScopeMetrics, start, ts pcommon.Timesta
 	size := sumMetric(sm, g.prefix+".size", "Total size of spans observed, in bytes.", "By")
 	dur := histMetric(sm, g.prefix+".duration", "Span duration in seconds, by dimensions.")
 	for _, s := range g.series {
+		s.state = stateRendered
+		start := pcommon.NewTimestampFromTime(s.start)
 		cp := calls.AppendEmpty()
 		putDims(cp.Attributes(), g.names, s.dims)
 		cp.SetStartTimestamp(start)

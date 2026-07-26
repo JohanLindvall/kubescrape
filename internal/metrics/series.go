@@ -140,8 +140,16 @@ type series struct {
 	desc string
 	kind seriesKind
 
-	action     gaugeAction // gauge fold mode; ignored for other kinds
-	maxSize    int
+	action  gaugeAction // gauge fold mode; ignored for other kinds
+	maxSize int         // cap on distinct LABEL COMBINATIONS (config maxCardinality)
+	// maxStreams is maxSize expressed in db entries: db is keyed per BUCKET
+	// STREAM, so a histogram's label set costs len(buckets) entries. Comparing
+	// len(db) against maxSize directly divided the configured cap by the bucket
+	// count behind the user's back — `maxCardinality: 10000` on a default
+	// 15-stream histogram admitted 666 label combinations, and the config,
+	// README and warning all said 10000. Counters and gauges have one stream,
+	// so for them the two are equal and nothing changes.
+	maxStreams int
 	expiration int64 // seconds of inactivity before a combination expires
 	lastWarn   int64 // epoch seconds of the last cardinality warning
 	log        *slog.Logger
@@ -196,6 +204,7 @@ func newSeries(spec seriesSpec) *series {
 		s.buckets = []float64{math.Inf(1)}
 		s.bucketStr = []string{""}
 	}
+	s.maxStreams = spec.maxSize * len(s.buckets)
 	return s
 }
 
@@ -271,7 +280,7 @@ func (s *series) observe(lbls labels, value float64, resAccum resKey, res pcommo
 				return
 			}
 		}
-		if s.maxSize > 0 && missing > 0 && len(s.db)+missing > s.maxSize {
+		if s.maxStreams > 0 && missing > 0 && len(s.db)+missing > s.maxStreams {
 			s.warnCapped(lbls, now)
 			return
 		}
@@ -386,7 +395,7 @@ func (s *series) admit(hash, check uint64, lbls labels, bucket int, now int64, r
 	if s.kind == kindHistogram {
 		full = lbls.without(leLabel).set(leLabel, s.bucketStr[bucket])
 	}
-	if s.maxSize > 0 && len(s.db) >= s.maxSize {
+	if s.maxStreams > 0 && len(s.db) >= s.maxStreams {
 		s.warnCapped(full, now)
 		return nil
 	}

@@ -4,7 +4,7 @@ Two cooperating services:
 
 * **kubescrape** — an HTTP service serving Kubernetes pod and container
   metadata — including the full ownership chain (ReplicaSet → Deployment,
-  Job → CronJob, …) and namespace metadata — and deriving Prometheus scrape
+  Job → CronJob, StatefulSet, DaemonSet, …) and namespace metadata — and deriving Prometheus scrape
   targets for pods from the conventional `prometheus.io/*` annotations (on
   pods or on Services selecting them).
 * **kubescrape-agent** — a per-node DaemonSet that tails containerd container
@@ -22,8 +22,8 @@ Full flag and config-file reference with examples:
   There is no polling and no per-request API traffic.
 * Owner chains, owner labels/annotations and namespace metadata are resolved
   from **metadata-only informers** (`PartialObjectMetadata`) for ReplicaSets,
-  Deployments, Jobs, CronJobs and Namespaces, so full specs of those objects
-  are never fetched or cached. `managedFields` are stripped before objects
+  Deployments, StatefulSets, DaemonSets, Jobs, CronJobs and Namespaces, so
+  full specs of those objects are never fetched or cached. `managedFields` are stripped before objects
   enter any cache.
 * Services are watched so pods can also be discovered for scraping through
   the annotations of a Service that selects them.
@@ -101,15 +101,25 @@ Metadata for a container by runtime ID. The ID may be bare
 ```
 
 Owners carry their own labels and annotations for the kinds the service
-watches (ReplicaSets, Deployments, Jobs, CronJobs); `namespaceMetadata` holds
-the labels and annotations of the pod's namespace.
+watches (ReplicaSets, Deployments, StatefulSets, DaemonSets, Jobs, CronJobs);
+`namespaceMetadata` holds the labels and annotations of the pod's namespace.
+StatefulSets and DaemonSets own their pods directly, so their labels land on
+the pod's single owner entry.
 
-Pods served from the tombstone cache additionally carry `pod.deletedAt`.
+`pod.ready` mirrors the PodReady condition (a Running pod may be failing
+every probe). Pods marked for deletion carry `pod.deletionTimestamp` while
+they drain — their phase stays `Running` for the whole grace period — and
+pods served from the tombstone cache additionally carry `pod.deletedAt`.
 
 ### `GET /v1/nodes/{node}/targets`
 
-Prometheus scrape targets for all live pods scheduled on `node`. Targets come
-from four sources:
+Prometheus scrape targets for all live pods scheduled on `node`. Pods that
+are finished (`Succeeded`/`Failed`), deleted, or **terminating**
+(`deletionTimestamp` set — draining, but still `Running` and still listed by
+the API for the whole grace period) never appear, exactly as Prometheus'
+endpoints discovery drops terminating endpoints; they do stay resolvable
+through the metadata endpoints, so their last logs remain attributable.
+Targets come from four sources:
 
 * **pod annotations** — the conventional annotations on the pod itself,
 * **service annotations** — the same annotations on any Service whose
@@ -204,6 +214,24 @@ runs with `-scrape-auth-secrets` (404 otherwise): it needs `secrets get`
 RBAC and ships secret material over the cluster-internal HTTP channel, so it
 is deliberately opt-in.
 
+This is the **one authenticated route**. Callers must present the shared
+token from `-scrape-auth-token-file`:
+
+```
+GET /v1/scrape-auth/monitoring/prom-token/token
+Authorization: Bearer <token>
+```
+
+Anything else is a `401` (`WWW-Authenticate: Bearer`), before the request
+can even probe which secrets a monitor references. The token is compared in
+constant time, and `-scrape-auth-secrets` **without** `-scrape-auth-token-file`
+is a startup error — the service holds cluster-wide `secrets: get`, so an
+unauthenticated endpoint here would hand every referenced Secret key to
+anything that can open a connection to the service. The token is read once at
+startup (rotation = update the Secret, restart the service and the agents);
+every replica just reads the same file. The rest of the API stays
+unauthenticated: it carries no secret material and agents poll it constantly.
+
 ### `GET /healthz`, `GET /readyz`
 
 Liveness is always `200`; readiness turns `200` once the initial informer
@@ -250,7 +278,8 @@ make build           # or: go build ./cmd/kubescrape
 | `-metadata-cache-ttl` | `10s` | `Cache-Control`/`ETag` max-age on metadata responses; agents cache lookups client-side (0 disables) |
 | `-resync`       | `0`     | informer resync period (0 = watch stream only)                            |
 | `-servicemonitors` | `false` | serve targets for ServiceMonitor CRDs — plus PodMonitors when the cluster serves them (see above) |
-| `-scrape-auth-secrets` | `false` | serve the Secret keys monitor endpoints reference (`bearerTokenSecret`, `basicAuth`, `authorization.credentials`, `tlsConfig` ca/cert/keySecret) on `/v1/scrape-auth`; only keys some monitor actually names are served (requires `secrets get` RBAC) |
+| `-scrape-auth-secrets` | `false` | serve the Secret keys monitor endpoints reference (`bearerTokenSecret`, `basicAuth`, `authorization.credentials`, `tlsConfig` ca/cert/keySecret) on `/v1/scrape-auth`; only keys some monitor actually names are served (requires `secrets get` RBAC **and** `-scrape-auth-token-file`) |
+| `-scrape-auth-token-file` | — | file holding the shared bearer token callers must present on `/v1/scrape-auth` (`Authorization: Bearer <token>`); mandatory with `-scrape-auth-secrets`, read once at startup |
 
 The service's own metrics are pushed over OTLP (`-self-metrics-interval`);
 the connection uses the agent's exporter flags: `-otlp-endpoint`,
@@ -262,12 +291,19 @@ The service can run **multiple replicas**: every replica serves reads from
 its own informer caches, so no coordination between replicas is needed.
 
 In-cluster it needs `get`/`list`/`watch` on `pods`, `services`, `namespaces`,
-`nodes`, `replicasets.apps`, `deployments.apps`, `jobs.batch`,
+`nodes`, `replicasets.apps`, `deployments.apps`, `statefulsets.apps`,
+`daemonsets.apps`, `jobs.batch`,
 `cronjobs.batch` and (optionally) `servicemonitors.monitoring.coreos.com`
 (plus `podmonitors` when that CRD should be discovered)
 cluster-wide, and `secrets get` for `-scrape-auth-secrets` (commented out
 in the manifests — enable deliberately) — see
 [deploy/kubernetes.yaml](deploy/kubernetes.yaml).
+
+Every listed resource is watched at startup and readiness waits for all of
+those caches to sync, so a hand-maintained ClusterRole must be updated
+**with** (or before) the image: a missing rule leaves `/readyz` failing
+rather than degrading quietly. `statefulsets.apps` and `daemonsets.apps`
+are the most recent additions.
 
 `make image` builds a container image from the [Dockerfile](Dockerfile);
 `make test` and `make vet` run the test suite and static checks.
@@ -322,7 +358,7 @@ logAttributes: {rules: [...]}     # lift line keys onto attributes
 logMetrics:    {metrics: [...]}   # metrics derived from log lines
 logScrubbing:  {builtin: [...], rules: [...]}   # redact secrets/PII from bodies
 metrics:       {pipelines: {...}, splitters: [...]}   # scraped-series rules
-traceMetrics:  {dimensions: [...], buckets: [...]}    # span-derived RED metrics
+traceMetrics:  {dimensions: [...], buckets: [...], staleAfter: 15m}  # span-derived RED metrics
 traceSampling: {probability: 0.1, ...}          # sample ingested spans
 routing:       {routes: [...]}    # per-namespace fan-out / tenancy
 ```
@@ -486,7 +522,11 @@ record's enriched attributes and resource attributes (k8s metadata) first, then
 **straight from the log line's own JSON or logfmt fields** (dotted keys descend
 into nested JSON) — so a metric can read any field of the line with no separate
 `logAttributes` config. Series expire after `maxAge` of inactivity and are
-capped at `maxCardinality` unique label combinations (hard cap 10000).
+capped at `maxCardinality` unique label combinations (hard cap 10000). The cap
+counts label combinations, not stored samples: a histogram's label set costs one
+sample per bucket, and a configuration whose `maxCardinality` x buckets would
+exceed 150000 live samples is rejected at startup rather than quietly admitting
+fewer label sets than asked for.
 
 **Resource attributes.** The log line's own resource attributes (the pod's k8s
 identity: namespace, pod, container, node, `service.name`, owners, and the

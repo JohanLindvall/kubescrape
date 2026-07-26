@@ -217,7 +217,7 @@ func (s *Scraper) scrapeNodeMetrics(ctx context.Context) (int, error) {
 		a.PutStr("service.name", "kubelet")
 		a.PutStr("url.full", url)
 		s.attrsFor(pipelineNode).Build(res, attrs.Context{Node: s.nodeInfo()})
-	}, s.cfg.BatchPoints, s.cfg.StartTime, time.Now())
+	}, s.cfg.StartTime, time.Now())
 	return s.parseAndExport(ctx, resp.Body, false, false, b, pipelineNode, url)
 }
 

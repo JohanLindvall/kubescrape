@@ -26,6 +26,32 @@ type sink interface {
 	addSummary(family string, acc *summAcc)
 }
 
+// metricMeta is a family's exposition "# HELP"/"# UNIT", carried to whichever
+// batcher creates the OTLP metric. It is a per-FAMILY fact: the parser resolves
+// it once per family and the batchers stamp it once per metric, never per
+// sample.
+type metricMeta struct{ help, unit string }
+
+func sampleMeta(s Sample) metricMeta { return metricMeta{help: s.Help, unit: s.Unit} }
+
+// apply stamps the description and unit on a newly created metric and returns
+// the bytes they add to the chunk-size estimate. The charge is not optional:
+// the estimate is what keeps a chunk under the collector's 4 MiB receive limit,
+// and a resource-per-object batcher (split, cadvisor) carries its own copy of
+// every descriptor — uncharged HELP text would flush past the limit.
+func (mm metricMeta) apply(m pmetric.Metric) int {
+	n := 0
+	if mm.help != "" {
+		m.SetDescription(mm.help)
+		n += len(mm.help) + metaFieldBytes
+	}
+	if mm.unit != "" {
+		m.SetUnit(mm.unit)
+		n += len(mm.unit) + metaFieldBytes
+	}
+	return n
+}
+
 // Size estimation for byte-bounded chunking. A collector's default gRPC
 // receive limit is 4 MiB and applies to the DECOMPRESSED message, so a batch
 // bounded only by a data-point count can be rejected wholesale (10k points of
@@ -56,6 +82,10 @@ const (
 	exemplarBytes       = 48 // value, timestamp, trace/span ids (labels charged separately)
 	resOverheadBytes    = 24 // ResourceMetrics + Resource + ScopeMetrics framing
 	metricOverheadBytes = 16 // one Metric: descriptor framing, type wrapper, temporality
+	// metaFieldBytes is one description/unit string field's protobuf framing
+	// (tag + length varint), charged on top of the text so the estimate cannot
+	// come in UNDER the encoded size of a description-heavy batch.
+	metaFieldBytes = 3
 )
 
 // The instrumentation scope names stamped on every emitted ScopeMetrics.
@@ -158,6 +188,7 @@ type converter struct {
 
 type histAcc struct {
 	labels    []Label // without le
+	meta      metricMeta
 	ts        int64
 	buckets   []cumBucket
 	sum       float64
@@ -174,6 +205,7 @@ type cumBucket struct {
 
 type summAcc struct {
 	labels    []Label // without quantile
+	meta      metricMeta
 	ts        int64
 	quantiles []quantileValue
 	sum       float64
@@ -325,6 +357,7 @@ func (c *converter) hist(s Sample) *histAcc {
 			acc = &histAcc{}
 		}
 		acc.labels = appendLabelsExcept(acc.labels[:0], s.Labels, "le")
+		acc.meta = sampleMeta(s) // per family: any component series carries it
 		c.hists[key] = acc
 		c.order = append(c.order, key)
 	}
@@ -346,6 +379,7 @@ func (c *converter) summ(s Sample) *summAcc {
 			acc = &summAcc{}
 		}
 		acc.labels = appendLabelsExcept(acc.labels[:0], s.Labels, "quantile")
+		acc.meta = sampleMeta(s)
 		c.summs[key] = acc
 		c.order = append(c.order, key)
 	}
@@ -442,9 +476,13 @@ func expHistBytes(p *expPoint) int {
 	// bucket count needs 4-5 bytes and can reach 9 near 2^63, so a
 	// dense-bucket point must not be under-charged into an over-cap batch —
 	// the byte bound is the ONE guard against wholesale collector rejection.
-	return pointOverheadBytes + histFixedBytes + labelBytes(p.labels) +
+	n := pointOverheadBytes + histFixedBytes + labelBytes(p.labels) +
 		16 + // zero threshold + zero count
 		(len(p.pos)+len(p.neg))*9 + 16 // varint bucket counts + span framing
+	for i := range p.exemplars {
+		n += exemplarSize(&p.exemplars[i])
+	}
+	return n
 }
 
 // addExponential appends one native-histogram point as an OTLP exponential
@@ -454,10 +492,10 @@ func (b *batcher) addExponential(family string, p expPoint) {
 	if !ok {
 		m = b.sm.Metrics().AppendEmpty()
 		m.SetName(family)
+		b.bytes += p.meta.apply(m)
 		eh := m.SetEmptyExponentialHistogram()
 		eh.SetAggregationTemporality(pmetric.AggregationTemporalityCumulative)
 		b.remember(family, m)
-		b.bytes += metricOverheadBytes + len(family)
 	}
 	if m.Type() != pmetric.MetricTypeExponentialHistogram {
 		obs.ScrapeCollisions.Inc()
@@ -478,6 +516,9 @@ func (b *batcher) addExponential(family string, p expPoint) {
 	dp.Negative().SetOffset(p.negOffset)
 	dp.Negative().BucketCounts().FromRaw(p.neg)
 	putLabels(dp.Attributes(), p.labels)
+	for _, e := range p.exemplars {
+		setExemplar(dp.Exemplars().AppendEmpty(), e, b.scrapeTS)
+	}
 	b.points++
 	b.bytes += expHistBytes(&p)
 }
@@ -487,6 +528,7 @@ func (b *batcher) addNumber(s Sample, monotonic bool) {
 	if !ok {
 		m = b.sm.Metrics().AppendEmpty()
 		m.SetName(s.Name)
+		b.bytes += sampleMeta(s).apply(m)
 		if monotonic {
 			sum := m.SetEmptySum()
 			sum.SetIsMonotonic(true)
@@ -519,6 +561,7 @@ func (b *batcher) addHistogram(family string, acc *histAcc) {
 	if !ok {
 		m = b.sm.Metrics().AppendEmpty()
 		m.SetName(family)
+		b.bytes += acc.meta.apply(m)
 		h := m.SetEmptyHistogram()
 		h.SetAggregationTemporality(pmetric.AggregationTemporalityCumulative)
 		b.remember(family, m)
@@ -600,6 +643,7 @@ func (b *batcher) addSummary(family string, acc *summAcc) {
 	if !ok {
 		m = b.sm.Metrics().AppendEmpty()
 		m.SetName(family)
+		b.bytes += acc.meta.apply(m)
 		m.SetEmptySummary()
 		b.remember(family, m)
 	}

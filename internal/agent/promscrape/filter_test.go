@@ -25,7 +25,7 @@ func LoadMetricsConfig(path string) (*MetricFilters, []*Splitter, error) {
 	if err := yaml.UnmarshalStrict(data, &cfg); err != nil {
 		return nil, nil, fmt.Errorf("%s: %w", path, err)
 	}
-	filters, err := NewMetricFilters(&FilterConfig{Pipelines: cfg.Pipelines})
+	filters, err := NewMetricFilters(cfg.Pipelines)
 	if err != nil {
 		return nil, nil, fmt.Errorf("%s: %w", path, err)
 	}
@@ -36,9 +36,9 @@ func LoadMetricsConfig(path string) (*MetricFilters, []*Splitter, error) {
 	return filters, splitters, nil
 }
 
-func mustFilters(t *testing.T, cfg *FilterConfig) *MetricFilters {
+func mustFilters(t *testing.T, pipelines map[string][]FilterRule) *MetricFilters {
 	t.Helper()
-	f, err := NewMetricFilters(cfg)
+	f, err := NewMetricFilters(pipelines)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -46,7 +46,7 @@ func mustFilters(t *testing.T, cfg *FilterConfig) *MetricFilters {
 }
 
 func TestMetricFilterRules(t *testing.T) {
-	f := mustFilters(t, &FilterConfig{Pipelines: map[string][]FilterRule{
+	f := mustFilters(t, map[string][]FilterRule{
 		"all": {
 			{Action: "keep", Metrics: `envoy_requests_total`},
 			{Action: "drop", Metrics: `(envoy_|otelcol_).+`},
@@ -55,7 +55,7 @@ func TestMetricFilterRules(t *testing.T) {
 			{Action: "keep", Metrics: `container_network_.+`, Labels: map[string]string{"interface": "eth0"}},
 			{Action: "drop", Metrics: `container_network_.+`},
 		},
-	}})
+	})
 
 	targets := f.filterFor(pipelineTargets)
 	cases := []struct {
@@ -93,19 +93,19 @@ func TestMetricFilterRules(t *testing.T) {
 }
 
 func TestMetricFilterValidation(t *testing.T) {
-	if _, err := NewMetricFilters(&FilterConfig{Pipelines: map[string][]FilterRule{
+	if _, err := NewMetricFilters(map[string][]FilterRule{
 		"bogus": {{Action: "drop"}},
-	}}); err == nil {
+	}); err == nil {
 		t.Fatal("unknown pipeline must error")
 	}
-	if _, err := NewMetricFilters(&FilterConfig{Pipelines: map[string][]FilterRule{
+	if _, err := NewMetricFilters(map[string][]FilterRule{
 		"all": {{Action: "nuke"}},
-	}}); err == nil {
+	}); err == nil {
 		t.Fatal("unknown action must error")
 	}
-	if _, err := NewMetricFilters(&FilterConfig{Pipelines: map[string][]FilterRule{
+	if _, err := NewMetricFilters(map[string][]FilterRule{
 		"all": {{Action: "drop", Metrics: "("}},
-	}}); err == nil {
+	}); err == nil {
 		t.Fatal("invalid regex must error")
 	}
 	if f := mustFilters(t, nil); f != nil {
@@ -158,9 +158,9 @@ func TestScrapeWithFilter(t *testing.T) {
 	s := New(Config{
 		Node: "node1", Interval: time.Hour, Timeout: 5 * time.Second,
 		Targets: staticTargets{testTarget(srv.URL)}, Exporter: exp, StartTime: time.Now(),
-		Filters: mustFilters(t, &FilterConfig{Pipelines: map[string][]FilterRule{
+		Filters: mustFilters(t, map[string][]FilterRule{
 			"targets": {{Action: "drop", Metrics: `drop_me|hist_.+`}},
-		}}),
+		}),
 	})
 	if _, err := s.scrapeTarget(context.Background(), testTarget(srv.URL), s.cfg.Timeout); err != nil {
 		t.Fatal(err)

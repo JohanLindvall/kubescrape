@@ -59,19 +59,32 @@ service:
     bearerTokenSecret:
       name: ""
       key: token
-  # Less-common service flags go here, e.g.:
-  #   - "-scrape-auth-secrets"   # serve monitor endpoints' bearerTokenSecret
-  #                               (also set scrapeAuthSecrets: true below for RBAC)
+  # Less-common service flags go here (scrapeAuthSecrets below already passes
+  # -scrape-auth-secrets and -scrape-auth-token-file; do not repeat them).
 
-  # Grant the ClusterRole `secrets: get`, which -scrape-auth-secrets needs to
-  # serve monitor endpoints' bearerTokenSecret. Without it the flag yields
-  # runtime 403s on /v1/scrape-auth.
+  # Serve monitor endpoints' bearerTokenSecret (and the other secret-backed
+  # auth/TLS material) to agents on GET /v1/scrape-auth. Setting this to true
+  # passes -scrape-auth-secrets, grants the ClusterRole `secrets: get`, and
+  # wires the bearer token below into both the Deployment and the agent
+  # DaemonSet — the flag, the RBAC and the token cannot drift apart.
   scrapeAuthSecrets: false
+  # The shared bearer token guarding /v1/scrape-auth. That route is the ONLY
+  # authenticated one, because it is the only one serving Secret material:
+  # without a token any pod that can reach the service could read every Secret
+  # key a monitor references, so the binary refuses to start with
+  # -scrape-auth-secrets and no -scrape-auth-token-file.
+  #
+  # Leave everything empty and the chart generates a random 48-character token
+  # into a Secret named <release>-scrape-auth, re-reading the live Secret on
+  # upgrade so the token survives `helm upgrade` (rotating it means deleting
+  # that Secret and restarting the service and the agents; the service reads
+  # the file once, at startup).
+  scrapeAuthToken:
+    existingSecret: ""   # use a Secret you manage instead of the generated one
+    key: token           # key within the Secret (mounted at /etc/kubescrape/scrape-auth/<key>)
+    value: ""            # literal token to put in the generated Secret
   # Extra ClusterRole rules appended verbatim.
   extraRules: []
-  #                              # values to agents on /v1/scrape-auth. Needs
-  #                              # a secrets get RBAC rule, which the chart
-  #                              # does NOT grant — add it deliberately.
   extraArgs: []
   resources:
     requests:
@@ -121,7 +134,7 @@ agent:
     # duration histogram with trace-id exemplars), dimensioned by
     # service.name/span.name/span.kind/status.code, and export them over OTLP.
     # Tune via the agent.config traceMetrics section (namePrefix / buckets /
-    # dimensions / maxCardinality / exemplars).
+    # dimensions / maxCardinality / exemplars / staleAfter).
     spanMetrics: false
     spanMetricsInterval: 1m
     # Attribute telemetry with no container id / pod uid to the pod owning the

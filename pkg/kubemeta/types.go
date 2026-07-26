@@ -68,18 +68,31 @@ type Container struct {
 
 // Pod is the full metadata set for one pod.
 type Pod struct {
-	Name        string            `json:"name"`
-	Namespace   string            `json:"namespace"`
-	UID         string            `json:"uid"`
-	NodeName    string            `json:"nodeName,omitempty"`
-	PodIP       string            `json:"podIP,omitempty"`
-	HostIP      string            `json:"hostIP,omitempty"`
-	HostNetwork bool              `json:"hostNetwork,omitempty"`
-	Phase       string            `json:"phase,omitempty"`
+	Name        string `json:"name"`
+	Namespace   string `json:"namespace"`
+	UID         string `json:"uid"`
+	NodeName    string `json:"nodeName,omitempty"`
+	PodIP       string `json:"podIP,omitempty"`
+	HostIP      string `json:"hostIP,omitempty"`
+	HostNetwork bool   `json:"hostNetwork,omitempty"`
+	Phase       string `json:"phase,omitempty"`
+	// Ready mirrors the pod's PodReady status condition: the pod passes its
+	// readiness probes and its Service endpoints are serving traffic. The
+	// phase alone does not say this — a Running pod may be failing every
+	// probe.
+	Ready       bool              `json:"ready"`
 	Labels      map[string]string `json:"labels,omitempty"`
 	Annotations map[string]string `json:"annotations,omitempty"`
 	CreatedAt   time.Time         `json:"createdAt"`
 	StartedAt   *time.Time        `json:"startedAt,omitempty"`
+	// DeletionTimestamp is set once the pod has been marked for deletion and
+	// is draining. The phase stays Running for the whole termination grace
+	// period, so this is the ONLY signal that a pod is on its way out —
+	// terminating pods are excluded from scrape targets (as Prometheus'
+	// endpoints discovery excludes terminating endpoints) but stay fully
+	// resolvable by container ID, UID and name so their last logs and
+	// telemetry remain attributable.
+	DeletionTimestamp *time.Time `json:"deletionTimestamp,omitempty"`
 	// DeletedAt is set when the pod has been deleted from the cluster and
 	// this metadata is served from the tombstone cache.
 	DeletedAt *time.Time `json:"deletedAt,omitempty"`

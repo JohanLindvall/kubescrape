@@ -63,7 +63,19 @@ type Client struct {
 
 	mu    sync.Mutex
 	cache map[string]cacheEntry
+
+	// token, when set, authenticates requests to /v1/scrape-auth (the only
+	// authenticated endpoint: it returns Secret VALUES, while the metadata
+	// endpoints return object metadata the node's kubelet already has). It is
+	// re-read per use so a rotated Secret is picked up without a restart.
+	token func() string
 }
+
+// SetScrapeAuthToken installs the bearer token sent with /v1/scrape-auth
+// requests. fn is called per request so a rotated token file takes effect
+// without a restart; a nil fn (or one returning "") sends no Authorization
+// header, which the service rejects when the endpoint is enabled.
+func (c *Client) SetScrapeAuthToken(fn func() string) { c.token = fn }
 
 // observe reports an outcome when a hook is installed.
 func (c *Client) observe(outcome string) {
@@ -73,11 +85,14 @@ func (c *Client) observe(outcome string) {
 }
 
 type cacheEntry struct {
-	body []byte
-	// decoded is the body unmarshaled once into the caller's result type
-	// (a pointer), stored so cache hits and 304s skip the JSON decode. It is
-	// never mutated after storing; hits receive a SHALLOW copy — maps/slices
+	// decoded is the response body unmarshaled once into the caller's result
+	// type (a pointer), stored so cache hits and 304s skip the JSON decode. It
+	// is never mutated after storing; hits receive a SHALLOW copy — maps/slices
 	// are shared under the same treat-as-immutable contract the store uses.
+	// The raw body is NOT retained: every caller of a given URL asks for the
+	// same result type, so the decoded value serves every hit and a body kept
+	// beside it was ~18% of the cache's footprint for nothing (an entry that
+	// cannot be copied out is dropped and re-fetched — see lookupEntry).
 	decoded any
 	etag    string
 	expires time.Time
@@ -195,33 +210,32 @@ func (c *Client) getJSON(ctx context.Context, u string, v any) error {
 
 	// Fresh cache entry: serve without a request (and without re-decoding —
 	// the decoded value is stored once and shallow-copied out).
-	entry, cached, fresh := c.lookupEntry(key)
+	entry, cached, fresh := c.lookupEntry(key, v)
 	if fresh {
 		c.observe(OutcomeCached)
-		return entry.serve(v)
+		copyDecoded(v, entry.decoded)
+		return nil
 	}
 	return c.fetch(ctx, u, key, entry, cached, v)
 }
 
 // lookupEntry reads the cache under the lock, classifying the entry as fresh
 // (serve locally), stale-but-present (revalidate with If-None-Match), or
-// absent.
-func (c *Client) lookupEntry(key string) (entry cacheEntry, cached, fresh bool) {
+// absent. An entry whose decoded value is not v's type is dropped and reported
+// absent, so this call re-fetches it from scratch: the cache holds one decoded
+// value per URL and every caller of an endpoint asks for the same type, making
+// that unreachable in practice — but a value that cannot be copied out must
+// never be served, and dropping it also re-populates the entry usefully.
+func (c *Client) lookupEntry(key string, v any) (entry cacheEntry, cached, fresh bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	entry, cached = c.cache[key]
+	if cached && !sameType(v, entry.decoded) {
+		delete(c.cache, key)
+		return cacheEntry{}, false, false
+	}
 	fresh = cached && c.now().Before(entry.expires)
 	return entry, cached, fresh
-}
-
-// serve copies the entry's decoded value into v (shallow — maps/slices are
-// shared under the treat-as-immutable contract), falling back to re-decoding
-// the stored body for a type mismatch.
-func (e cacheEntry) serve(v any) error {
-	if shallowCopy(v, e.decoded) {
-		return nil
-	}
-	return json.Unmarshal(e.body, v)
 }
 
 // fetch performs the HTTP request (revalidating with the entry's ETag when
@@ -234,6 +248,13 @@ func (c *Client) fetch(ctx context.Context, u, key string, entry cacheEntry, cac
 	// Revalidate a stale-but-present entry cheaply.
 	if cached && entry.etag != "" {
 		req.Header.Set("If-None-Match", entry.etag)
+	}
+	// Only the secret-bearing endpoint is authenticated; sending the token to
+	// every metadata URL would spread it further than it needs to go.
+	if c.token != nil && strings.Contains(u, "/v1/scrape-auth/") {
+		if tok := c.token(); tok != "" {
+			req.Header.Set("Authorization", "Bearer "+tok)
+		}
 	}
 	resp, err := c.http.Do(req)
 	if err != nil {
@@ -260,10 +281,9 @@ func (c *Client) fetch(ctx context.Context, u, key string, entry cacheEntry, cac
 		}
 		c.mu.Unlock()
 		c.observe(OutcomeNotModified)
-		if shallowCopy(v, entry.decoded) {
-			return nil
-		}
-		return json.Unmarshal(entry.body, v)
+		// lookupEntry only reports cached for an entry of v's type.
+		copyDecoded(v, entry.decoded)
+		return nil
 	case resp.StatusCode == http.StatusOK:
 		body, err := io.ReadAll(resp.Body)
 		if err != nil {
@@ -280,7 +300,7 @@ func (c *Client) fetch(ctx context.Context, u, key string, entry cacheEntry, cac
 				return err
 			}
 			c.mu.Lock()
-			c.cache[key] = cacheEntry{body: body, decoded: dec.Interface(), etag: resp.Header.Get("ETag"), expires: c.now().Add(ttl)}
+			c.cache[key] = cacheEntry{decoded: dec.Interface(), etag: resp.Header.Get("ETag"), expires: c.now().Add(ttl)}
 			c.evictLocked()
 			c.mu.Unlock()
 			c.observe(OutcomeOK)
@@ -338,19 +358,21 @@ func (c *Client) evictLocked() {
 	}
 }
 
-// shallowCopy sets *dst = *src when both are pointers to the same type,
-// reporting success. The copy is shallow: maps and slices stay shared with the
-// cached value, which is never mutated (the store's shallow-copy contract).
-func shallowCopy(dst, src any) bool {
+// sameType reports whether a cached decoded value can be copied into dst: both
+// must be pointers to the same type.
+func sameType(dst, src any) bool {
 	if src == nil {
 		return false
 	}
 	dv, sv := reflect.ValueOf(dst), reflect.ValueOf(src)
-	if dv.Kind() != reflect.Pointer || dv.Type() != sv.Type() {
-		return false
-	}
-	dv.Elem().Set(sv.Elem())
-	return true
+	return dv.Kind() == reflect.Pointer && dv.Type() == sv.Type()
+}
+
+// copyDecoded sets *dst = *src. The copy is shallow: maps and slices stay
+// shared with the cached value, which is never mutated (the store's
+// shallow-copy contract). Types are checked by lookupEntry.
+func copyDecoded(dst, src any) {
+	reflect.ValueOf(dst).Elem().Set(reflect.ValueOf(src).Elem())
 }
 
 // cacheKey identifies the resource independent of transient request params

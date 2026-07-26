@@ -156,12 +156,21 @@ func (s *Scraper) protoFamily(mf *dto.MetricFamily, cb chunker, keep func(string
 	var c protoCounts
 	malformed := 0
 	name := mf.GetName()
+	// The family's HELP/UNIT ride on every sample, exactly as the text path
+	// carries them from the "# HELP"/"# UNIT" comments.
+	help, unit := mf.GetHelp(), mf.GetUnit()
+	// One reusable exemplar per family: a Sample only borrows it for the emit
+	// call (the converter deep-copies the ones it keeps).
+	var ex Exemplar
 	for _, m := range mf.GetMetric() {
 		labels := protoLabels(m)
 		ts := m.GetTimestampMs()
 		switch mf.GetType() {
 		case dto.MetricType_COUNTER:
-			if err := emit(Sample{Name: name, Family: name, Role: RoleCounter, Labels: labels, Value: m.GetCounter().GetValue(), TimestampMs: ts}); err != nil {
+			cnt := m.GetCounter()
+			smp := Sample{Name: name, Family: name, Role: RoleCounter, Labels: labels, Value: cnt.GetValue(), TimestampMs: ts, Help: help, Unit: unit}
+			smp.Exemplar = s.protoExemplar(cnt.GetExemplar(), &ex)
+			if err := emit(smp); err != nil {
 				return c, malformed, err
 			}
 		case dto.MetricType_GAUGE, dto.MetricType_UNTYPED:
@@ -169,21 +178,21 @@ func (s *Scraper) protoFamily(mf *dto.MetricFamily, cb chunker, keep func(string
 			if mf.GetType() == dto.MetricType_UNTYPED {
 				v = m.GetUntyped().GetValue()
 			}
-			if err := emit(Sample{Name: name, Family: name, Role: RoleGauge, Labels: labels, Value: v, TimestampMs: ts}); err != nil {
+			if err := emit(Sample{Name: name, Family: name, Role: RoleGauge, Labels: labels, Value: v, TimestampMs: ts, Help: help, Unit: unit}); err != nil {
 				return c, malformed, err
 			}
 		case dto.MetricType_SUMMARY:
 			sum := m.GetSummary()
 			for _, q := range sum.GetQuantile() {
 				ql := append(labels[:len(labels):len(labels)], Label{Name: "quantile", Value: formatFloat(q.GetQuantile())})
-				if err := emit(Sample{Name: name, Family: name, Role: RoleSummaryQuantile, Labels: ql, Value: q.GetValue(), TimestampMs: ts}); err != nil {
+				if err := emit(Sample{Name: name, Family: name, Role: RoleSummaryQuantile, Labels: ql, Value: q.GetValue(), TimestampMs: ts, Help: help, Unit: unit}); err != nil {
 					return c, malformed, err
 				}
 			}
-			if err := emit(Sample{Name: name + "_sum", Family: name, Role: RoleSummarySum, Labels: labels, Value: sum.GetSampleSum(), TimestampMs: ts}); err != nil {
+			if err := emit(Sample{Name: name + "_sum", Family: name, Role: RoleSummarySum, Labels: labels, Value: sum.GetSampleSum(), TimestampMs: ts, Help: help, Unit: unit}); err != nil {
 				return c, malformed, err
 			}
-			if err := emit(Sample{Name: name + "_count", Family: name, Role: RoleSummaryCount, Labels: labels, Value: float64(sum.GetSampleCount()), TimestampMs: ts}); err != nil {
+			if err := emit(Sample{Name: name + "_count", Family: name, Role: RoleSummaryCount, Labels: labels, Value: float64(sum.GetSampleCount()), TimestampMs: ts, Help: help, Unit: unit}); err != nil {
 				return c, malformed, err
 			}
 		case dto.MetricType_HISTOGRAM, dto.MetricType_GAUGE_HISTOGRAM:
@@ -197,7 +206,7 @@ func (s *Scraper) protoFamily(mf *dto.MetricFamily, cb chunker, keep func(string
 				if !keep(name, labels) {
 					continue
 				}
-				if !s.addNativeHistogram(cb, name, labels, h, ts) {
+				if !s.addNativeHistogram(cb, name, metricMeta{help: help, unit: unit}, labels, h, ts) {
 					malformed++
 					continue
 				}
@@ -208,14 +217,16 @@ func (s *Scraper) protoFamily(mf *dto.MetricFamily, cb chunker, keep func(string
 			}
 			for _, b := range h.GetBucket() {
 				bl := append(labels[:len(labels):len(labels)], Label{Name: "le", Value: formatFloat(b.GetUpperBound())})
-				if err := emit(Sample{Name: name + "_bucket", Family: name, Role: RoleHistogramBucket, Labels: bl, Value: float64(b.GetCumulativeCount()), TimestampMs: ts}); err != nil {
+				smp := Sample{Name: name + "_bucket", Family: name, Role: RoleHistogramBucket, Labels: bl, Value: float64(b.GetCumulativeCount()), TimestampMs: ts, Help: help, Unit: unit}
+				smp.Exemplar = s.protoExemplar(b.GetExemplar(), &ex)
+				if err := emit(smp); err != nil {
 					return c, malformed, err
 				}
 			}
-			if err := emit(Sample{Name: name + "_sum", Family: name, Role: RoleHistogramSum, Labels: labels, Value: h.GetSampleSum(), TimestampMs: ts}); err != nil {
+			if err := emit(Sample{Name: name + "_sum", Family: name, Role: RoleHistogramSum, Labels: labels, Value: h.GetSampleSum(), TimestampMs: ts, Help: help, Unit: unit}); err != nil {
 				return c, malformed, err
 			}
-			if err := emit(Sample{Name: name + "_count", Family: name, Role: RoleHistogramCount, Labels: labels, Value: float64(h.GetSampleCount()), TimestampMs: ts}); err != nil {
+			if err := emit(Sample{Name: name + "_count", Family: name, Role: RoleHistogramCount, Labels: labels, Value: float64(h.GetSampleCount()), TimestampMs: ts, Help: help, Unit: unit}); err != nil {
 				return c, malformed, err
 			}
 		default:
@@ -223,6 +234,27 @@ func (s *Scraper) protoFamily(mf *dto.MetricFamily, cb chunker, keep func(string
 		}
 	}
 	return c, malformed, nil
+}
+
+// protoExemplar converts a protobuf exemplar into the shape the text path
+// produces, reusing the caller's scratch (a Sample only borrows its exemplar
+// for the emit call). nil when the target sent none or -scrape-exemplars is
+// off — the SAME gate the OpenMetrics text path uses, so the two formats agree
+// on what the flag means.
+func (s *Scraper) protoExemplar(pe *dto.Exemplar, scratch *Exemplar) *Exemplar {
+	if pe == nil || !s.cfg.Exemplars {
+		return nil
+	}
+	scratch.Labels = scratch.Labels[:0]
+	for _, lp := range pe.GetLabel() {
+		scratch.Labels = append(scratch.Labels, Label{Name: lp.GetName(), Value: lp.GetValue()})
+	}
+	scratch.Value = pe.GetValue()
+	scratch.TimestampMs = 0
+	if t := pe.GetTimestamp(); t.IsValid() {
+		scratch.TimestampMs = t.AsTime().UnixMilli()
+	}
+	return scratch
 }
 
 // isNative reports whether a histogram carries native (exponential) data:
@@ -238,7 +270,7 @@ func isNative(h *dto.Histogram) bool {
 
 // addNativeHistogram appends one exponential histogram point to the
 // batcher; false = undecodable (counted malformed by the caller).
-func (s *Scraper) addNativeHistogram(cb chunker, name string, labels []Label, h *dto.Histogram, ts int64) bool {
+func (s *Scraper) addNativeHistogram(cb chunker, name string, meta metricMeta, labels []Label, h *dto.Histogram, ts int64) bool {
 	eb, ok := cb.(expSink)
 	if !ok {
 		return false // batcher variant without exponential support
@@ -251,8 +283,24 @@ func (s *Scraper) addNativeHistogram(cb chunker, name string, labels []Label, h 
 	if !ok {
 		return false
 	}
+	// A native histogram carries its exemplars on the family message rather
+	// than per bucket; they are point-scoped either way.
+	var exemplars []Exemplar
+	if s.cfg.Exemplars {
+		var scratch Exemplar
+		for _, pe := range h.GetExemplars() {
+			if len(exemplars) >= maxExemplarsPerPoint {
+				break
+			}
+			if e := s.protoExemplar(pe, &scratch); e != nil {
+				exemplars = append(exemplars, copyExemplar(*e))
+			}
+		}
+	}
 	eb.addExponential(name, expPoint{
 		labels:    labels,
+		meta:      meta,
+		exemplars: exemplars,
 		ts:        ts,
 		schema:    h.GetSchema(),
 		zeroCount: h.GetZeroCount(),
@@ -269,6 +317,8 @@ func (s *Scraper) addNativeHistogram(cb chunker, name string, labels []Label, h 
 // expPoint is one decoded native histogram.
 type expPoint struct {
 	labels    []Label
+	meta      metricMeta
+	exemplars []Exemplar
 	ts        int64
 	schema    int32
 	zeroCount uint64

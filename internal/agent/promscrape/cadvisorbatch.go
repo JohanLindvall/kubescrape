@@ -295,7 +295,7 @@ func (cb *cadvisorBatcher) fillResource(res pcommon.Resource, ident cadvisorIden
 // metric returns the (per-resource) metric for one sample's identity, plus
 // whether the sample's row is pod/container-scoped (its id/name/image labels
 // are then redundant with the resource and elided from the data points).
-func (cb *cadvisorBatcher) metric(ident cadvisorIdentity, name string, shape func(pmetric.Metric)) (pmetric.Metric, bool) {
+func (cb *cadvisorBatcher) metric(ident cadvisorIdentity, name string, meta metricMeta, shape func(pmetric.Metric)) (pmetric.Metric, bool) {
 	// Last-seen fast path: consecutive samples of the same resource and family
 	// skip the key building and the map probe entirely.
 	if cb.lastOK && name == cb.lastName && ident == cb.lastMetIdent {
@@ -312,7 +312,9 @@ func (cb *cadvisorBatcher) metric(ident cadvisorIdentity, name string, shape fun
 		m.SetName(name)
 		shape(m)
 		cb.byKey[key] = m
-		cb.bytes += len(name) + metricOverheadBytes // one descriptor per resource
+		// One descriptor per resource — including its description and unit,
+		// which a per-pod/container batch repeats for every resource.
+		cb.bytes += len(name) + metricOverheadBytes + meta.apply(m)
 	}
 	cb.lastMetIdent, cb.lastName, cb.lastMetric, cb.lastPodScope, cb.lastOK = ident, name, m, ident.podScoped(), true
 	return m, cb.lastPodScope
@@ -348,7 +350,7 @@ func (cb *cadvisorBatcher) addNumber(s Sample, monotonic bool) {
 	if cb.drop(s.Name, ident) {
 		return
 	}
-	m, podScoped := cb.metric(ident, s.Name, func(m pmetric.Metric) {
+	m, podScoped := cb.metric(ident, s.Name, sampleMeta(s), func(m pmetric.Metric) {
 		if monotonic {
 			sum := m.SetEmptySum()
 			sum.SetIsMonotonic(true)
@@ -374,7 +376,7 @@ func (cb *cadvisorBatcher) addHistogram(family string, acc *histAcc) {
 	if cb.drop(family, ident) {
 		return
 	}
-	m, podScoped := cb.metric(ident, family, func(m pmetric.Metric) {
+	m, podScoped := cb.metric(ident, family, acc.meta, func(m pmetric.Metric) {
 		m.SetEmptyHistogram().SetAggregationTemporality(pmetric.AggregationTemporalityCumulative)
 	})
 	if m.Type() != pmetric.MetricTypeHistogram {
@@ -395,7 +397,7 @@ func (cb *cadvisorBatcher) addSummary(family string, acc *summAcc) {
 	if cb.drop(family, ident) {
 		return
 	}
-	m, podScoped := cb.metric(ident, family, func(m pmetric.Metric) {
+	m, podScoped := cb.metric(ident, family, acc.meta, func(m pmetric.Metric) {
 		m.SetEmptySummary()
 	})
 	if m.Type() != pmetric.MetricTypeSummary {

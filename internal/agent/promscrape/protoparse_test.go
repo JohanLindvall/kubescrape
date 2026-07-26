@@ -3,6 +3,7 @@ package promscrape
 import (
 	"context"
 	"encoding/binary"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -13,6 +14,7 @@ import (
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/pmetric"
 	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 func protoBody(t *testing.T, families ...*dto.MetricFamily) []byte {
@@ -128,6 +130,179 @@ func TestNativeHistogramScrape(t *testing.T) {
 	}
 }
 
+// The protobuf path must carry exemplars exactly as the OpenMetrics text path
+// does, under the SAME -scrape-exemplars gate: -scrape-native-histograms makes
+// the Accept header prefer protobuf, so a target honouring it would otherwise
+// lose every exemplar and the two flags would be mutually exclusive in
+// practice. HELP/UNIT ride along on the same messages.
+func TestProtoExemplarsAndDescriptions(t *testing.T) {
+	const traceID = "4bf92f3577b34da6a3ce929d0e0e4736"
+	const spanID = "00f067aa0ba902b7"
+	exTime := time.Unix(1700000000, 0).UTC()
+	counter := &dto.MetricFamily{
+		Name: ptr("http_requests_total"), Help: ptr("Total requests."), Unit: ptr("requests"),
+		Type: dto.MetricType_COUNTER.Enum(),
+		Metric: []*dto.Metric{{
+			Counter: &dto.Counter{Value: ptr(7.0), Exemplar: &dto.Exemplar{
+				Label: []*dto.LabelPair{
+					{Name: ptr("trace_id"), Value: ptr(traceID)},
+					{Name: ptr("span_id"), Value: ptr(spanID)},
+					{Name: ptr("shard"), Value: ptr("b")},
+				},
+				Value:     ptr(1.0),
+				Timestamp: timestamppb.New(exTime),
+			}},
+		}},
+	}
+	hist := &dto.MetricFamily{
+		Name: ptr("rpc_latency_seconds"), Help: ptr("RPC latency."), Unit: ptr("seconds"),
+		Type: dto.MetricType_HISTOGRAM.Enum(),
+		Metric: []*dto.Metric{{
+			Histogram: &dto.Histogram{
+				SampleCount: ptr(uint64(3)), SampleSum: ptr(0.6),
+				Bucket: []*dto.Bucket{
+					{UpperBound: ptr(0.5), CumulativeCount: ptr(uint64(2)), Exemplar: &dto.Exemplar{
+						Label: []*dto.LabelPair{{Name: ptr("trace_id"), Value: ptr(traceID)}},
+						Value: ptr(0.3),
+					}},
+					{UpperBound: ptr(math.Inf(1)), CumulativeCount: ptr(uint64(3))},
+				},
+			},
+		}},
+	}
+	body := protoBody(t, counter, hist)
+
+	run := func(t *testing.T, exemplars bool) map[string]pmetric.Metric {
+		t.Helper()
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/vnd.google.protobuf; encoding=delimited")
+			_, _ = w.Write(body)
+		}))
+		t.Cleanup(srv.Close)
+		exp := &captureExporter{}
+		s := New(Config{
+			Node: "n1", Interval: time.Hour, Timeout: 5 * time.Second,
+			NativeHistograms: true, Exemplars: exemplars,
+			Targets:  staticTargets{testTarget(srv.URL)},
+			Exporter: exp, StartTime: time.Now(),
+		})
+		s.cycle(context.Background())
+		out := map[string]pmetric.Metric{}
+		for _, md := range exp.batches {
+			rms := md.ResourceMetrics()
+			for i := 0; i < rms.Len(); i++ {
+				ms := rms.At(i).ScopeMetrics().At(0).Metrics()
+				for j := 0; j < ms.Len(); j++ {
+					out[ms.At(j).Name()] = ms.At(j)
+				}
+			}
+		}
+		return out
+	}
+
+	got := run(t, true)
+	c, ok := got["http_requests_total"]
+	if !ok {
+		t.Fatalf("counter missing: %v", got)
+	}
+	if c.Description() != "Total requests." || c.Unit() != "requests" {
+		t.Errorf("counter description/unit = %q/%q", c.Description(), c.Unit())
+	}
+	cex := c.Sum().DataPoints().At(0).Exemplars()
+	if cex.Len() != 1 {
+		t.Fatalf("counter exemplars = %d, want 1", cex.Len())
+	}
+	e := cex.At(0)
+	if e.TraceID().String() != traceID || e.SpanID().String() != spanID {
+		t.Errorf("exemplar ids = %s/%s, want %s/%s", e.TraceID(), e.SpanID(), traceID, spanID)
+	}
+	if e.DoubleValue() != 1 {
+		t.Errorf("exemplar value = %v, want 1", e.DoubleValue())
+	}
+	if e.Timestamp().AsTime().UTC() != exTime {
+		t.Errorf("exemplar timestamp = %v, want %v", e.Timestamp().AsTime().UTC(), exTime)
+	}
+	if v, ok := e.FilteredAttributes().Get("shard"); !ok || v.Str() != "b" {
+		t.Errorf("exemplar labels beyond trace/span must become filtered attributes: %v", e.FilteredAttributes().AsRaw())
+	}
+
+	h, ok := got["rpc_latency_seconds"]
+	if !ok {
+		t.Fatalf("histogram missing: %v", got)
+	}
+	if h.Description() != "RPC latency." || h.Unit() != "seconds" {
+		t.Errorf("histogram description/unit = %q/%q", h.Description(), h.Unit())
+	}
+	hex := h.Histogram().DataPoints().At(0).Exemplars()
+	if hex.Len() != 1 {
+		t.Fatalf("histogram bucket exemplars = %d, want 1", hex.Len())
+	}
+	if hex.At(0).DoubleValue() != 0.3 || hex.At(0).TraceID().String() != traceID {
+		t.Errorf("bucket exemplar = %v/%s", hex.At(0).DoubleValue(), hex.At(0).TraceID())
+	}
+	// A bucket exemplar with no timestamp falls back to the scrape time, never 0.
+	if hex.At(0).Timestamp() == 0 {
+		t.Error("timestamp-less exemplar must fall back to the scrape time")
+	}
+
+	// The gate: with -scrape-exemplars off, nothing is attached.
+	off := run(t, false)
+	if n := off["http_requests_total"].Sum().DataPoints().At(0).Exemplars().Len(); n != 0 {
+		t.Errorf("counter exemplars with the flag off = %d", n)
+	}
+	if n := off["rpc_latency_seconds"].Histogram().DataPoints().At(0).Exemplars().Len(); n != 0 {
+		t.Errorf("histogram exemplars with the flag off = %d", n)
+	}
+}
+
+// A native histogram's exemplars live on the Histogram message rather than on
+// buckets; the exponential point must carry them too.
+func TestProtoNativeHistogramExemplars(t *testing.T) {
+	const traceID = "4bf92f3577b34da6a3ce929d0e0e4736"
+	nh := &dto.MetricFamily{
+		Name: ptr("rpc_latency_seconds"), Help: ptr("RPC latency."), Unit: ptr("seconds"),
+		Type: dto.MetricType_HISTOGRAM.Enum(),
+		Metric: []*dto.Metric{{
+			Histogram: &dto.Histogram{
+				SampleCount: ptr(uint64(4)), SampleSum: ptr(1.5),
+				Schema: ptr(int32(2)), ZeroThreshold: ptr(1e-9), ZeroCount: ptr(uint64(1)),
+				PositiveSpan:  []*dto.BucketSpan{{Offset: ptr(int32(1)), Length: ptr(uint32(1))}},
+				PositiveDelta: []int64{3},
+				Exemplars: []*dto.Exemplar{{
+					Label: []*dto.LabelPair{{Name: ptr("trace_id"), Value: ptr(traceID)}},
+					Value: ptr(0.25),
+				}},
+			},
+		}},
+	}
+	body := protoBody(t, nh)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/vnd.google.protobuf; encoding=delimited")
+		_, _ = w.Write(body)
+	}))
+	t.Cleanup(srv.Close)
+	exp := &captureExporter{}
+	s := New(Config{
+		Node: "n1", Interval: time.Hour, Timeout: 5 * time.Second,
+		NativeHistograms: true, Exemplars: true,
+		Targets:  staticTargets{testTarget(srv.URL)},
+		Exporter: exp, StartTime: time.Now(),
+	})
+	s.cycle(context.Background())
+
+	m := exp.batches[0].ResourceMetrics().At(0).ScopeMetrics().At(0).Metrics().At(0)
+	if m.Type() != pmetric.MetricTypeExponentialHistogram {
+		t.Fatalf("type = %v", m.Type())
+	}
+	if m.Description() != "RPC latency." || m.Unit() != "seconds" {
+		t.Errorf("description/unit = %q/%q", m.Description(), m.Unit())
+	}
+	ex := m.ExponentialHistogram().DataPoints().At(0).Exemplars()
+	if ex.Len() != 1 || ex.At(0).TraceID().String() != traceID || ex.At(0).DoubleValue() != 0.25 {
+		t.Fatalf("native histogram exemplars = %d", ex.Len())
+	}
+}
+
 // Span decoding rejects hostile shapes instead of allocating unbounded
 // buckets or wrapping counts.
 func TestDecodeSpansGuards(t *testing.T) {
@@ -173,7 +348,7 @@ func TestProtoClassicSampleCountAccurate(t *testing.T) {
 		NativeHistograms: true, Targets: staticTargets{testTarget(srv.URL)}, Exporter: exp, StartTime: time.Now()})
 
 	// 3 real samples (1 counter + 2 gauges); scrapeProto reports the count.
-	got, err := s.scrapeProto(context.Background(), strings.NewReader(string(body)), newBatcher(func(pcommon.Resource) {}, 1<<30, time.Now(), time.Now()), nil, "t")
+	got, err := s.scrapeProto(context.Background(), strings.NewReader(string(body)), newBatcher(func(pcommon.Resource) {}, time.Now(), time.Now()), nil, "t")
 	if err != nil {
 		t.Fatal(err)
 	}

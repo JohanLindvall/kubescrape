@@ -145,7 +145,6 @@ func (s *Sampler) ExportTraces(ctx context.Context, td ptrace.Traces) error {
 	}
 	out := ptrace.NewTraces()
 	td.CopyTo(out)
-	dropped := 0
 	rss := out.ResourceSpans()
 	rss.RemoveIf(func(rs ptrace.ResourceSpans) bool {
 		sss := rs.ScopeSpans()
@@ -153,12 +152,10 @@ func (s *Sampler) ExportTraces(ctx context.Context, td ptrace.Traces) error {
 			spans := ss.Spans()
 			spans.RemoveIf(func(sp ptrace.Span) bool {
 				if !s.keep(sp) {
-					dropped++
 					obs.TraceSpansDropped.WithLabelValues("probability").Inc()
 					return true
 				}
 				if s.rate > 0 && !s.allow() {
-					dropped++
 					obs.TraceSpansDropped.WithLabelValues("rate").Inc()
 					return true
 				}

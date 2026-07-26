@@ -212,9 +212,9 @@ cache sync has completed. The service's own metrics (`kubescrape_store_pods`,
 …) are produced through the same internal
 metrics machinery as everything else and **pushed over OTLP**
 (`-self-metrics-interval`, default 1m; 0 disables) — together with the Go
-runtime and process series (`process.runtime.go.*`, `process.cpu.time`,
-`process.memory.rss`, `process.open_file_descriptors`, …), which
-`-runtime-metrics=false` omits. There is no Prometheus
+cluster telemetry. The process's own Go runtime and process metrics
+(`go_*`, `process_*`) are served as Prometheus text on the dedicated
+`-metrics-listen` port instead. There is no other Prometheus
 format, for debugging the process itself.
 
 ## Reusable packages
@@ -724,10 +724,16 @@ resource identity (`service.name: kubescrape-agent`, `k8s.node.name`).
 `GET /debug/tailer` (per-file positions and lag), `GET /debug/targets` (the
 last scrape cycle's per-target outcomes — up/error/duration/samples,
 failures first), `GET /debug/transforms` (the active transform program's
-content hash, for checking per-node convergence after a reload), and — with
-`-debug-pprof` — the standard `net/http/pprof` profiles under
-`GET /debug/pprof/`. There is no Prometheus `/metrics` endpoint: the Go
-runtime and process series are pushed over OTLP with everything else.
+content hash, for checking per-node convergence after a reload), and `GET /debug/transforms`.
+
+**Three separate listeners.** `-listen` carries health and the `/debug`
+surface; `-metrics-listen` (default `:9090`) serves the Prometheus
+`GET /metrics` endpoint with this process's Go runtime and process metrics
+(`go_*`, `process_*`); `-pprof-listen` (empty by default) serves
+`net/http/pprof`. Profiles expose goroutine stacks and heap contents, so the
+port carrying them is the one to firewall or bind to localhost — which is why
+it is a port of its own. kubescrape's own `kubescrape_*` metrics stay on the
+OTLP push: they are telemetry about the cluster, not process diagnostics.
 
 **Metric filtering and splitting** (`metrics` section). This section has two
 subsections. `pipelines` holds ordered keep/drop rules per pipeline

@@ -61,10 +61,14 @@ kubescrape -listen :8080 -wait-timeout 5s -cache-ttl 5m -log-format json
 
 The service's own metrics (store sizes, HTTP requests per pattern/status)
 are pushed over OTLP on `-self-metrics-interval` (default
-1m, 0 disables) using the `-otlp-*` flags — as are the Go runtime and process
-series (`process.runtime.go.*`, `process.cpu.time`, `process.memory.rss`,
-`process.open_file_descriptors`, …) unless `-runtime-metrics=false`. There is
-no Prometheus exposition endpoint; OTLP is the only egress.
+1m, 0 disables) using the `-otlp-*` flags.
+
+The process's own Go runtime and process metrics (`go_*`, `process_*`) are
+served instead as Prometheus text on a DEDICATED port, `-metrics-listen`
+(default `:9090`, empty disables) — they are operator-facing process
+diagnostics, consumed by a scrape rather than pushed. `-pprof-listen` (empty by
+default) serves `net/http/pprof` on a third port; profiles expose goroutine
+stacks and heap contents, so it is separate from both.
 
 RBAC (cluster-wide `get`/`list`/`watch`): `pods`, `services`, `namespaces`,
 `nodes`, `replicasets.apps`, `deployments.apps`, `jobs.batch`,

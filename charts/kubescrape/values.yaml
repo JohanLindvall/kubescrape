@@ -8,6 +8,24 @@ image:
 # self-metrics export. ~15 extra series per process.
 runtimeMetrics: true
 
+# Prometheus /metrics endpoint on a DEDICATED port, serving this process's Go
+# runtime and process metrics (go_*, process_*). Separate from the health/debug
+# listener so the scrape target can be exposed independently. kubescrape's own
+# kubescrape_* metrics are NOT here: they are pushed over OTLP with the
+# telemetry the service produces about the cluster.
+metrics:
+  enabled: true
+  listen: ":9090"
+  # Stamp prometheus.io/* annotations on the pods, which kubescrape's own
+  # discovery (and a stock Prometheus) picks up — so the agents scrape their
+  # own runtime metrics with no extra configuration.
+  scrapeAnnotations: true
+
+# net/http/pprof on its OWN port (empty disables, the default). Profiles expose
+# goroutine stacks and heap contents, so this is the port to firewall or bind
+# to localhost — hence a separate listener from metrics and health.
+pprofListen: ""
+
 logLevel: info       # both components
 logFormat: text
 
@@ -227,11 +245,6 @@ agent:
   # Synthetic up / scrape_duration_seconds / scrape_samples_scraped gauges
   # per target.
   scrapeHealthMetrics: true
-
-  # Serve net/http/pprof under /debug/pprof on the agent's listen address.
-  # Off by default: the listener is unauthenticated and profiles expose
-  # goroutine stacks and heap contents.
-  debugPprof: false
 
   # Static resource attributes (key: value), e.g. cluster: prod-eu. Merged into
   # config.resourceAttributes.static (an explicit value there wins). Attribute

@@ -239,14 +239,16 @@ func newLogger(level, format string) (*slog.Logger, error) {
 
 func run() error {
 	var (
-		listen       = flag.String("listen", ":8080", "HTTP listen address")
-		kubeconfig   = flag.String("kubeconfig", "", "path to a kubeconfig; defaults to in-cluster config, then $KUBECONFIG/~/.kube/config")
-		maxWait      = flag.Duration("wait-timeout", 5*time.Second, "default and maximum time a container lookup blocks waiting for metadata to appear (shorten per request with ?wait=)")
-		cacheTTL     = flag.Duration("cache-ttl", 5*time.Minute, "how long metadata of deleted pods and replaced container IDs stays resolvable")
-		metaCacheTTL = flag.Duration("metadata-cache-ttl", 10*time.Second, "max-age sent on metadata responses (Cache-Control + ETag) so agents cache lookups client-side; 0 disables")
-		resync       = flag.Duration("resync", 0, "informer resync period (0 disables periodic resync; the watch stream keeps the cache current)")
-		logLevel     = flag.String("log-level", "info", "log level: debug, info, warn, error")
-		logFormat    = flag.String("log-format", "text", "log format: text or json")
+		listen        = flag.String("listen", ":8080", "HTTP listen address")
+		pprofListen   = flag.String("pprof-listen", "", "listen address for net/http/pprof under /debug/pprof, on its own port (empty disables); profiles expose goroutine stacks and heap contents")
+		metricsListen = flag.String("metrics-listen", ":9090", "listen address for the Prometheus /metrics endpoint (Go runtime and process metrics; empty disables). Separate from -listen so the API and the scrape target can be exposed independently")
+		kubeconfig    = flag.String("kubeconfig", "", "path to a kubeconfig; defaults to in-cluster config, then $KUBECONFIG/~/.kube/config")
+		maxWait       = flag.Duration("wait-timeout", 5*time.Second, "default and maximum time a container lookup blocks waiting for metadata to appear (shorten per request with ?wait=)")
+		cacheTTL      = flag.Duration("cache-ttl", 5*time.Minute, "how long metadata of deleted pods and replaced container IDs stays resolvable")
+		metaCacheTTL  = flag.Duration("metadata-cache-ttl", 10*time.Second, "max-age sent on metadata responses (Cache-Control + ETag) so agents cache lookups client-side; 0 disables")
+		resync        = flag.Duration("resync", 0, "informer resync period (0 disables periodic resync; the watch stream keeps the cache current)")
+		logLevel      = flag.String("log-level", "info", "log level: debug, info, warn, error")
+		logFormat     = flag.String("log-format", "text", "log format: text or json")
 
 		// ServiceMonitor CRDs (opt-in).
 		monitorsOn = flag.Bool("servicemonitors", false, "serve targets for monitoring.coreos.com ServiceMonitors selecting pod-backed Services (no per-endpoint auth or relabelings)")
@@ -257,7 +259,6 @@ func run() error {
 
 		// Self-metrics -> OTLP (the service's only OTLP producer).
 		selfMetricsIntv      = flag.Duration("self-metrics-interval", time.Minute, "export the service's own metrics over OTLP at this interval (0 disables)")
-		runtimeMetrics       = flag.Bool("runtime-metrics", true, "include Go runtime and process metrics (process.runtime.go.*, process.cpu.time, process.memory.rss, process.open_file_descriptors, ...) in the OTLP self-metrics export")
 		otlpEndpoint         = flag.String("otlp-endpoint", "otel-collector.monitoring:4317", "OTLP endpoint for self-metrics: host:port for grpc, base URL for http")
 		otlpProtocol         = flag.String("otlp-protocol", "grpc", "OTLP transport: grpc or http")
 		otlpCompression      = flag.String("otlp-compression", "gzip", "OTLP payload compression: gzip or none")
@@ -374,12 +375,6 @@ func run() error {
 		if host, err := os.Hostname(); err == nil {
 			a.PutStr("service.instance.id", host)
 		}
-		// Go runtime and process series ride the same OTLP push as everything
-		// else; there is no Prometheus endpoint to scrape them from. Opt-out:
-		// ~15 extra series per process is a real cost on a large fleet.
-		if *runtimeMetrics {
-			obs.RegisterRuntimeMetrics()
-		}
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -420,6 +415,11 @@ func run() error {
 		Logger:   log,
 		Secrets:  secretReader,
 	}).HTTPServer(*listen)
+
+	stopMetrics := obs.ServeMetrics(ctx, *metricsListen, log)
+	defer stopMetrics()
+	stopPprof := obs.ServePprof(ctx, *pprofListen, log)
+	defer stopPprof()
 
 	errCh := make(chan error, 1)
 	go func() {

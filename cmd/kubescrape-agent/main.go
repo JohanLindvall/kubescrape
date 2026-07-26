@@ -13,7 +13,6 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
-	"net/http/pprof"
 	"os"
 	"os/signal"
 	"path"
@@ -70,8 +69,8 @@ func agentSelfResource(node string) pcommon.Resource {
 var (
 	configFile           = flag.String("config", "", "unified YAML config file with resourceAttributes, logs, logAttributes, logMetrics, logScrubbing, metrics, routing, traceMetrics and traceSampling sections")
 	nodeName             = flag.String("node-name", os.Getenv("NODE_NAME"), "name of the node this agent runs on (default $NODE_NAME)")
+	metricsListen        = flag.String("metrics-listen", ":9090", "listen address for the Prometheus /metrics endpoint (Go runtime and process metrics; empty disables). Separate from -listen so the debug/health surface and the scrape target can be exposed independently")
 	listen               = flag.String("listen", ":8081", "HTTP listen address for /healthz, /readyz, /debug/tailer and /debug/targets (empty disables)")
-	runtimeMetrics       = flag.Bool("runtime-metrics", true, "include Go runtime and process metrics (process.runtime.go.*, process.cpu.time, process.memory.rss, process.open_file_descriptors, ...) in the OTLP self-metrics export")
 	selfMetricsIntv      = flag.Duration("self-metrics-interval", time.Minute, "export the agent's own metrics over OTLP at this interval (0 disables)")
 	metadataURL          = flag.String("metadata-endpoint", "http://kubescrape.monitoring", "base URL of the kubescrape metadata service")
 	metadataWait         = flag.Duration("metadata-wait", 5*time.Second, "how long the metadata service may block waiting for a new container")
@@ -92,7 +91,7 @@ var (
 
 	nativeHists = flag.Bool("scrape-native-histograms", false, "offer the Prometheus protobuf exposition to scrape targets and convert native histograms to OTLP exponential histograms")
 	checkConfig = flag.Bool("check-config", false, "validate -config and -transforms-file (every section compiled: templates, regexes, selectors, globs) plus the flags, print a summary and exit — no listeners, log files, positions file, spools or network. For CI and pre-rollout checks: a DaemonSet's bad ConfigMap otherwise surfaces as a fleet-wide CrashLoop")
-	debugPprof  = flag.Bool("debug-pprof", false, "serve net/http/pprof profiles under /debug/pprof on -listen (off by default: the listener is unauthenticated and profiles expose process memory)")
+	pprofListen = flag.String("pprof-listen", "", "listen address for net/http/pprof under /debug/pprof, on its own port (empty disables). Off by default and separate from -listen and -metrics-listen: profiles expose goroutine stacks and heap contents, so this is the port to firewall or bind to localhost")
 	logLevel    = flag.String("log-level", "info", "log level: debug, info, warn, error")
 	logFormat   = flag.String("log-format", "text", "log format: text or json")
 
@@ -310,6 +309,13 @@ func run() error {
 	// The client is dependency-free by design; feed its outcomes to our metrics.
 	meta.Observe = func(outcome string) { obs.MetadataRequests.WithLabelValues(outcome).Inc() }
 
+	// The Prometheus scrape target for this process's own runtime metrics, on
+	// its own port (see -metrics-listen).
+	stopMetrics := obs.ServeMetrics(ctx, *metricsListen, log)
+	defer stopMetrics()
+	stopPprof := obs.ServePprof(ctx, *pprofListen, log)
+	defer stopPprof()
+
 	ready := newReadiness()
 	if *nodeRefresh > 0 {
 		// Reaching the metadata service is what separates a working new agent
@@ -470,12 +476,6 @@ func run() error {
 	var selfRes pcommon.Resource
 	if *selfMetricsIntv > 0 {
 		selfRes = agentSelfResource(*nodeName)
-		// Go runtime and process series ride the same OTLP push as everything
-		// else; there is no Prometheus endpoint to scrape them from. Opt-out:
-		// ~15 extra series per agent is a real cost on a large fleet.
-		if *runtimeMetrics {
-			obs.RegisterRuntimeMetrics()
-		}
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -877,17 +877,6 @@ func (p *pipelines) startDebugServer(tl *tailer.Tailer, sc *promscrape.Scraper) 
 	if p.transforms != nil {
 		// The active transform program's content hash: which nodes have
 		// converged after a reload.
-		if *debugPprof {
-			// Opt-in: -listen is unauthenticated, and the profiles expose goroutine
-			// stacks and heap contents. Worth having at all because this agent is
-			// built to allocation budgets — without pprof a regression can only be
-			// chased by redeploying a custom build.
-			mux.HandleFunc("GET /debug/pprof/", pprof.Index)
-			mux.HandleFunc("GET /debug/pprof/cmdline", pprof.Cmdline)
-			mux.HandleFunc("GET /debug/pprof/profile", pprof.Profile)
-			mux.HandleFunc("GET /debug/pprof/symbol", pprof.Symbol)
-			mux.HandleFunc("GET /debug/pprof/trace", pprof.Trace)
-		}
 		mux.HandleFunc("GET /debug/transforms", func(w http.ResponseWriter, _ *http.Request) {
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(map[string]string{"hash": p.transforms.Active().Hash})

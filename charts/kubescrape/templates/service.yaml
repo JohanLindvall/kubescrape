@@ -66,6 +66,14 @@ spec:
     metadata:
       labels:
         app: {{ .Release.Name }}
+      {{- if and .Values.metrics.enabled .Values.metrics.scrapeAnnotations }}
+      annotations:
+        # kubescrape's own agents discover prometheus.io/* annotations, so the
+        # service's runtime metrics are scraped like any other pod's.
+        prometheus.io/scrape: "true"
+        prometheus.io/port: {{ (split ":" .Values.metrics.listen)._1 | quote }}
+        prometheus.io/path: /metrics
+      {{- end }}
     spec:
       serviceAccountName: {{ .Release.Name }}
       containers:
@@ -97,6 +105,10 @@ spec:
             - -otlp-bearer-token-file=/etc/kubescrape/otlp-token/{{ .Values.service.otlp.bearerTokenSecret.key }}
             {{- end }}
             - -log-level={{ .Values.logLevel }}
+            - -metrics-listen={{ if .Values.metrics.enabled }}{{ .Values.metrics.listen }}{{ end }}
+            {{- with .Values.pprofListen }}
+            - -pprof-listen={{ . }}
+            {{- end }}
             - -log-format={{ .Values.logFormat }}
             {{- range .Values.service.extraArgs }}
             - {{ . }}
@@ -110,6 +122,10 @@ spec:
           ports:
             - name: http
               containerPort: {{ (split ":" .Values.service.listen)._1 | int }}
+            {{- if .Values.metrics.enabled }}
+            - name: metrics
+              containerPort: {{ (split ":" .Values.metrics.listen)._1 | int }}
+            {{- end }}
           readinessProbe:
             httpGet: {path: /readyz, port: http}
           livenessProbe:

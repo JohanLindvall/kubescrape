@@ -74,6 +74,13 @@ spec:
         app: {{ .Release.Name }}-agent
       annotations:
         checksum/config: {{ $cfg | toYaml | sha256sum }}
+        {{- if and .Values.metrics.enabled .Values.metrics.scrapeAnnotations }}
+        # kubescrape discovers prometheus.io/* annotations itself, so the agent
+        # scrapes its own runtime metrics like any other pod.
+        prometheus.io/scrape: "true"
+        prometheus.io/port: {{ (split ":" .Values.metrics.listen)._1 | quote }}
+        prometheus.io/path: /metrics
+        {{- end }}
     spec:
       serviceAccountName: {{ .Release.Name }}-agent
       tolerations:
@@ -185,11 +192,12 @@ spec:
             - -ingest-pod-uid-keys={{ join "," . }}
             {{- end }}
             {{- end }}
-            {{- if .Values.agent.debugPprof }}
-            - -debug-pprof
-            {{- end }}
             - -log-level={{ .Values.logLevel }}
             - -runtime-metrics={{ .Values.runtimeMetrics }}
+            - -metrics-listen={{ if .Values.metrics.enabled }}{{ .Values.metrics.listen }}{{ end }}
+            {{- with .Values.pprofListen }}
+            - -pprof-listen={{ . }}
+            {{- end }}
             - -log-format={{ .Values.logFormat }}
             {{- range .Values.agent.extraArgs }}
             - {{ . }}
@@ -209,6 +217,10 @@ spec:
           ports:
             - name: http
               containerPort: {{ (split ":" .Values.agent.listen)._1 | int }}
+            {{- if .Values.metrics.enabled }}
+            - name: metrics
+              containerPort: {{ (split ":" .Values.metrics.listen)._1 | int }}
+            {{- end }}
             {{- if .Values.agent.ingest.enabled }}
             {{- with .Values.agent.ingest.grpcEndpoint }}
             - name: otlp-grpc

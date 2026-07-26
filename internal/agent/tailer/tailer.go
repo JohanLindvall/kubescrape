@@ -162,14 +162,18 @@ type Config struct {
 // Tailer tails all container logs in a directory. All methods run on the
 // single Run goroutine.
 type Tailer struct {
-	cfg            Config
-	log            *slog.Logger
-	sources        []*compiledSource
-	scanDirs       map[string]struct{} // fixed base dirs of all include globs, watched for new files
-	files          map[string]*file    // by path
-	batch          []entry
-	readBuf        []byte // reusable read scratch (single sweep goroutine)
-	warnedListing  bool   // a glob-failure warning was already emitted
+	cfg           Config
+	log           *slog.Logger
+	sources       []*compiledSource
+	scanDirs      map[string]struct{} // fixed base dirs of all include globs, watched for new files
+	files         map[string]*file    // by path
+	batch         []entry
+	readBuf       []byte // reusable read scratch (single sweep goroutine)
+	warnedListing bool   // a glob-failure warning was already emitted
+	// lastListingOK reports whether the most recent scan actually listed the
+	// sources. Checkpoint pruning is gated on it: a failed glob must never let
+	// a save destroy the offsets of files it simply could not see.
+	lastListingOK  bool
 	lastIdleScan   time.Time
 	lastFlush      time.Time
 	lastCheckpoint time.Time
@@ -240,13 +244,17 @@ func New(cfg Config) *Tailer {
 		}
 	}
 	return &Tailer{
-		cfg:          cfg,
-		log:          log,
-		sources:      sources,
-		scanDirs:     scanDirs,
-		files:        make(map[string]*file),
-		retryBackoff: time.Second,
-		statusEvery:  10 * time.Second,
+		cfg: cfg,
+		log: log,
+		// Until a scan runs, treat the listing as good: a save before any
+		// discovery has nothing to prune anyway, and starting false would make
+		// the very first save copy the whole stored map back.
+		lastListingOK: true,
+		sources:       sources,
+		scanDirs:      scanDirs,
+		files:         make(map[string]*file),
+		retryBackoff:  time.Second,
+		statusEvery:   10 * time.Second,
 	}
 }
 
@@ -404,6 +412,13 @@ func (t *Tailer) sweep(ctx context.Context, all bool) {
 				// rediscovery; clear the flag and let readFile's rotation
 				// detection handle the identity change instead.
 				f.gone = false
+				// goneEnd pinned the PREVIOUS incarnation's EOF; the file is
+				// alive again and readFile's rotation detection now owns it.
+				// Left set, settledGone() compares a fresh (shorter) incarnation's
+				// committed offset against a stale, larger one and never settles —
+				// the fd, the t.files entry and its checkpoint entry are pinned
+				// forever, and drainGone+flush re-run every sweep.
+				f.goneEnd = 0
 			} else {
 				// The file is gone from disk; its remaining bytes live only
 				// behind our fd. Drain, export, and only let the inode go once

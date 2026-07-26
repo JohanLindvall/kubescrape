@@ -153,6 +153,9 @@ func (t *Tailer) scanDir(checkpoints map[string]checkpoint, initial bool) {
 		if listingOK {
 			t.warnedListing = false
 		}
+		// Checkpoint pruning is only safe after a listing that actually saw the
+		// files; see saveCheckpoints.
+		t.lastListingOK = listingOK
 	}()
 	for _, src := range t.sources {
 		paths, ok := src.glob()
@@ -321,7 +324,13 @@ func (t *Tailer) initFile(f *file, checkpoints map[string]checkpoint, initial bo
 		// unshipped, not history. Compressed archives are always read whole.
 		mode := t.cfg.UnknownFiles
 		if mode == "" || mode == "auto" {
-			if len(checkpoints) > 0 {
+			// A CORRUPT positions file decodes to nothing, so len(checkpoints)
+			// is 0 and looks exactly like a first run — which would skip every
+			// existing file to its end and lose the whole unshipped window.
+			// Prefer re-reading: at-least-once already tolerates duplicates,
+			// and losing data to a bad byte in a state file does not.
+			corrupt := t.cfg.Positions != nil && t.cfg.Positions.Corrupt()
+			if len(checkpoints) > 0 || corrupt {
 				mode = "start"
 			} else {
 				mode = "end"

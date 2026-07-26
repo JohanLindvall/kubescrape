@@ -29,7 +29,19 @@ func (t *Tailer) saveCheckpoints() {
 	if !t.checkpointing() {
 		return
 	}
+	// Entries for files we no longer track are dropped by rebuilding the map
+	// from t.files. That is only safe when the last listing SUCCEEDED: a failed
+	// glob (a log dir not yet mounted, a transient EIO, a mistyped include)
+	// leaves t.files empty or short, and this save would then destroy every
+	// persisted offset — after which the next start treats those files as
+	// history and skips them to the end. Keep the stored entries we cannot
+	// currently see, and let a successful listing prune them.
 	cps := make(map[string]checkpoint, len(t.files))
+	if !t.lastListingOK {
+		for path, cp := range t.cfg.Positions.Logs() {
+			cps[path] = checkpoint(cp)
+		}
+	}
 	for path, f := range t.files {
 		t.extendFingerprint(f)
 		cp := checkpoint{

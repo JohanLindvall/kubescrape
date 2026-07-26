@@ -200,6 +200,9 @@ func (t *Tailer) reopen(ctx context.Context, f *file, renamed bool) {
 	// would duplicate every one of those records on a plain truncation.
 	f.segmentsFed = wasFed
 	f.newTail()
+	// A new incarnation: any goneEnd from an earlier one no longer describes
+	// this file (see the resurrect path in sweep).
+	f.goneEnd = 0
 	f.inode = 0
 	f.fp = fingerprint{}
 	f.committed = 0

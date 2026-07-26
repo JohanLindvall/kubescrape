@@ -182,6 +182,17 @@ func (t *Tailer) handleRotation(ctx context.Context, f *file, st os.FileInfo, re
 			return false
 		}
 		t.reopen(ctx, f, true)
+		// Open the NEW incarnation now, not on the next sweep. reopen clears
+		// f.f/f.inode/f.fp, so until the file is opened again it has no fd and
+		// no identity: a SECOND rotation inside that window finds nothing to
+		// drain and records no segment, and the whole inode is unreachable
+		// forever — silently and uncounted. The window is a full sweep, and it
+		// widens to seconds whenever the sweep goroutine is blocked in a
+		// failing export, which is exactly when rotations pile up. The
+		// copytruncate branch above already re-opens for the same reason.
+		if err := t.ensureOpen(f); err != nil {
+			t.log.Debug("opening rotated-in file", "path", f.path, "error", err)
+		}
 	case st.Size() < f.readPos:
 		// In-place truncation: the unread tail is gone; restart at zero.
 		// (Draining would read the replacement content mid-stream.)

@@ -52,6 +52,9 @@ type Store struct {
 	mu   sync.Mutex
 	path string
 	doc  doc
+	// corrupt records that the file existed but decoded to nothing, so an
+	// empty store must not be mistaken for a first run (see Corrupt).
+	corrupt bool
 }
 
 // Open loads the store at path, tolerating a missing or corrupt file (it
@@ -68,17 +71,31 @@ func Open(path string) (*Store, error) {
 		}
 		return nil, err
 	}
-	// A corrupt file must not wedge startup: whatever fields decoded before
-	// the error stay (harmless — re-read is the worst case) and the next
-	// save overwrites the whole doc atomically. It must not be SILENT
-	// either — recurring corruption across restarts is a failing disk, and
-	// without the count it looks like ordinary restarts with odd re-reads.
+	// A corrupt file must not wedge startup, but it must not look like a FIRST
+	// RUN either. json.Unmarshal decodes NOTHING on a syntax error (the old
+	// comment here claimed a decodable prefix survives — it does not), so the
+	// store comes up empty, which -logs-unknown-files=auto reads as "no store,
+	// treat existing files as history" and skips every file to its end: the
+	// whole unshipped window is lost, silently and indistinguishably from a
+	// clean first start. Record that a store EXISTED so `auto` can choose
+	// re-reading (duplicates, which at-least-once already tolerates) over
+	// losing data.
 	if err := json.Unmarshal(data, &s.doc); err != nil {
 		obs.PositionsCorrupt.Inc()
-		slog.Warn("positions file corrupt; keeping decodable prefix, affected inputs re-read",
+		s.corrupt = true
+		slog.Warn("positions file corrupt; it decoded to nothing, so tracked inputs are re-read from the start rather than skipped as history",
 			"path", path, "error", err)
 	}
 	return s, nil
+}
+
+// Corrupt reports that the positions file existed but failed to decode, so the
+// store is empty for a reason that is NOT "first run". Callers deciding where an
+// unknown file starts must prefer re-reading over skipping to the end.
+func (s *Store) Corrupt() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.corrupt
 }
 
 // Logs returns a copy of the stored log positions.

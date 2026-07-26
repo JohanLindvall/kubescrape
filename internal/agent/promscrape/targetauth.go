@@ -18,6 +18,7 @@ import (
 	"encoding/base64"
 	"fmt"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/JohanLindvall/kubescrape/pkg/kubemeta"
@@ -67,8 +68,18 @@ func (s *Scraper) applyAuth(ctx context.Context, req *http.Request, t kubemeta.S
 // needsTLSClient reports whether the target needs its own transport rather than
 // the shared default or skip-verify clients.
 func needsTLSClient(t kubemeta.ScrapeTarget) bool {
-	return t.TLSCA != "" || t.TLSCert != "" || t.TLSServerName != ""
+	return t.TLSCA != "" || t.TLSCert != "" || t.TLSKey != "" || t.TLSServerName != ""
 }
+
+// noRedirect refuses to follow redirects on a scrape.
+//
+// Credentials and client certificates are attached per request; Go's stdlib
+// strips the Authorization header only across a HOSTNAME change, so a same-host
+// https->http redirect would put a bearer token on the wire in cleartext, and a
+// per-target client presents its CLIENT CERTIFICATE to whatever host a redirect
+// names. A metrics endpoint has no legitimate reason to redirect. The OTLP
+// exporter already refuses redirects for the same reason.
+func noRedirect(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 
 // clientFor returns the HTTP client for a target: the shared default, the
 // shared skip-verify one, or a per-target client built from its CA, client
@@ -103,8 +114,11 @@ func (s *Scraper) clientFor(ctx context.Context, t kubemeta.ScrapeTarget, timeou
 	}
 	// Keyed by the resolved material, so a rotated secret yields a new client
 	// rather than silently reusing the old credentials.
-	key := t.TLSServerName + "\x00" + caPEM + "\x00" + certPEM + "\x00" + keyPEM +
-		"\x00" + fmt.Sprint(t.InsecureSkipVerify)
+	// Length-prefixed, and including the timeout: the client bakes the timeout
+	// in, so omitting it made the effective timeout depend on which target
+	// happened to build the cached client first.
+	key := lp(t.TLSServerName) + lp(caPEM) + lp(certPEM) + lp(keyPEM) +
+		lp(fmt.Sprint(t.InsecureSkipVerify)) + lp(timeout.String())
 
 	s.tlsMu.Lock()
 	if c, ok := s.tlsClients[key]; ok {
@@ -116,6 +130,12 @@ func (s *Scraper) clientFor(ctx context.Context, t kubemeta.ScrapeTarget, timeou
 	cfg := &tls.Config{
 		InsecureSkipVerify: t.InsecureSkipVerify, //nolint:gosec // explicit per-endpoint opt-in
 		ServerName:         t.TLSServerName,
+	}
+	if t.TLSCA != "" && caPEM == "" {
+		// A resolvable-but-EMPTY ca.crt (mid-rotation, or a secret an init
+		// container has not populated yet) must not silently degrade to the
+		// system trust store: the endpoint asked to be pinned to a private CA.
+		return nil, fmt.Errorf("scrape tls ca %s: empty", t.TLSCA)
 	}
 	if caPEM != "" {
 		pool := x509.NewCertPool()
@@ -132,7 +152,8 @@ func (s *Scraper) clientFor(ctx context.Context, t kubemeta.ScrapeTarget, timeou
 		cfg.Certificates = []tls.Certificate{pair}
 	}
 	client := &http.Client{
-		Timeout: timeout,
+		Timeout:       timeout,
+		CheckRedirect: noRedirect,
 		Transport: &http.Transport{
 			TLSClientConfig:     cfg,
 			MaxIdleConnsPerHost: 2,
@@ -142,9 +163,19 @@ func (s *Scraper) clientFor(ctx context.Context, t kubemeta.ScrapeTarget, timeou
 
 	s.tlsMu.Lock()
 	// Bound the cache: the key includes the secret bytes, so a rotating
-	// credential would otherwise accumulate a transport per rotation.
+	// credential would otherwise accumulate a transport per rotation. Evict ONE
+	// entry (and close its idle connections) rather than clearing the map: a
+	// steady population above the cap would otherwise rebuild every transport
+	// each cycle, paying a fresh TCP+TLS handshake per target while the orphans
+	// held their pooled connections open for the full idle timeout.
 	if len(s.tlsClients) >= maxTLSClients {
-		s.tlsClients = map[string]*http.Client{}
+		for k, victim := range s.tlsClients {
+			if tr, ok := victim.Transport.(*http.Transport); ok {
+				tr.CloseIdleConnections()
+			}
+			delete(s.tlsClients, k)
+			break
+		}
 	}
 	s.tlsClients[key] = client
 	s.tlsMu.Unlock()
@@ -153,3 +184,7 @@ func (s *Scraper) clientFor(ctx context.Context, t kubemeta.ScrapeTarget, timeou
 
 // maxTLSClients bounds the per-target transport cache.
 const maxTLSClients = 64
+
+// lp length-prefixes a key component so two different configurations cannot
+// serialise to the same cache key.
+func lp(s string) string { return strconv.Itoa(len(s)) + ":" + s }

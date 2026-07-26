@@ -385,6 +385,14 @@ func (r *Reader) flush(ctx context.Context) error {
 		return nil
 	}
 	ld := r.convert()
+	if ld.LogRecordCount() == 0 {
+		// Every entry was dropped by the rules. Committing without exporting is
+		// the tailer's behaviour too: an empty payload still costs a wire RPC
+		// per flush interval — and, with -buffer-dir, an fsync'd spool frame —
+		// on exactly the heavily-sampled journal this feature exists for.
+		r.settleBatch()
+		return nil
+	}
 	if err := r.cfg.Exporter.ExportLogs(ctx, ld); err != nil {
 		if otlpexport.IsPermanent(err) {
 			obs.JournalDropped.Inc()
@@ -395,7 +403,9 @@ func (r *Reader) flush(ctx context.Context) error {
 		obs.LogExportFailures.Inc()
 		return fmt.Errorf("exporting journal batch: %w", err)
 	}
-	obs.JournalEntries.Add(float64(len(r.batch)))
+	// Delivered records, not ingested entries: the rules may have dropped some,
+	// and the metric documents itself as entries EXPORTED.
+	obs.JournalEntries.Add(float64(ld.LogRecordCount()))
 	// Count truncations here, not at read time: a batch whose export fails is
 	// re-read from the committed cursor and re-sanitized, so a per-read counter
 	// would double-count. Like JournalEntries, this reflects delivered records.

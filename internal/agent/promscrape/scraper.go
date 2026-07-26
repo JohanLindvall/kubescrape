@@ -168,7 +168,10 @@ func New(cfg Config) *Scraper {
 	return &Scraper{
 		cfg: cfg,
 		http: &http.Client{
-			Timeout: cfg.Timeout,
+			// No client Timeout: the per-request context carries the effective
+			// (possibly per-target) budget, and a fixed client timeout silently
+			// capped every target that asked for longer.
+			CheckRedirect: noRedirect,
 			Transport: &http.Transport{
 				MaxIdleConnsPerHost: 2,
 				IdleConnTimeout:     90 * time.Second,
@@ -177,7 +180,10 @@ func New(cfg Config) *Scraper {
 		// For monitor endpoints declaring tlsConfig.insecureSkipVerify:
 		// scoped to those targets only, never the default.
 		insecureHTTP: &http.Client{
-			Timeout: cfg.Timeout,
+			// No client Timeout: the per-request context carries the effective
+			// (possibly per-target) budget, and a fixed client timeout silently
+			// capped every target that asked for longer.
+			CheckRedirect: noRedirect,
 			Transport: &http.Transport{
 				TLSClientConfig:     &tls.Config{InsecureSkipVerify: true},
 				MaxIdleConnsPerHost: 2,
@@ -308,7 +314,10 @@ func (s *Scraper) targetTimeout(t kubemeta.ScrapeTarget, interval time.Duration)
 			out = d
 		}
 	}
-	return min(out, interval)
+	// Clamped to the target's interval AND the agent's own: cycle() waits for
+	// every scrape it started, and Run only ticks after cycle returns, so one
+	// target's long timeout stalls the whole node's scrape loop.
+	return min(out, interval, s.cfg.Interval)
 }
 
 // warnOnce logs a per-key message at most once per process, for per-target
@@ -328,9 +337,11 @@ func (s *Scraper) warnOnce(key, msg string, args ...any) {
 
 func (s *Scraper) cycle(ctx context.Context) {
 	var targets []kubemeta.ScrapeTarget
+	targetsOK := s.cfg.DisableTargets // nothing to schedule when targets are off
 	if !s.cfg.DisableTargets {
 		var err error
 		targets, err = s.cfg.Targets.NodeTargets(ctx, s.cfg.Node)
+		targetsOK = err == nil
 		if err != nil {
 			s.log.Error("fetching scrape targets", "node", s.cfg.Node, "error", err)
 			// The kubelet scrapes below do not depend on the target list.
@@ -411,11 +422,24 @@ func (s *Scraper) cycle(ctx context.Context) {
 			// Tolerance: the loop ticks at the finest requested cadence, so a
 			// tick landing a hair early must still scrape rather than defer a
 			// whole period.
-			if next, ok := s.dueAt(t.URL); ok && now.Add(iv/10).Before(next) {
+			next, scheduled := s.dueAt(t.URL)
+			if scheduled && now.Add(iv/10).Before(next) {
 				due[t.URL] = next
 				continue
 			}
-			due[t.URL] = now.Add(iv)
+			if scheduled {
+				// Advance from the DUE time, not from now: the tick is allowed
+				// to land slightly early (iv/10), and computing the next due
+				// from `now` folded that slack in every round — a 5m target on
+				// a fleet whose finest cadence is 10s drifted to ~4m30s and
+				// stayed there, 11% more samples than asked for.
+				due[t.URL] = next.Add(iv)
+				if !due[t.URL].After(now) {
+					due[t.URL] = now.Add(iv) // fell far behind: resynchronise
+				}
+			} else {
+				due[t.URL] = now.Add(iv)
+			}
 		}
 		timeout := s.targetTimeout(t, iv)
 		if !spawn(pipelineTargets, t.URL, &t, func(ctx context.Context) (int, error) {
@@ -424,7 +448,12 @@ func (s *Scraper) cycle(ctx context.Context) {
 			break // ctx done; join what already started
 		}
 	}
-	s.setSchedule(due, intervals)
+	if targetsOK {
+		// A failed target fetch leaves `targets` empty; committing that as the
+		// schedule would discard every due time and re-scrape everything next
+		// cycle, ignoring the intervals entirely.
+		s.setSchedule(due, intervals)
+	}
 	wg.Wait()
 
 	s.publishStatus(outcomes, time.Now())

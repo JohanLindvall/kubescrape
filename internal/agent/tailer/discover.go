@@ -211,7 +211,17 @@ func (t *Tailer) claimPath(src *compiledSource, path string, seen map[string]str
 	var id string
 	if src.containerd {
 		cid, namespace, ok := parseFileName(filepath.Base(path))
-		if !ok || slices.Contains(t.cfg.ExcludeNamespaces, namespace) || !src.wantNamespace(namespace) {
+		if ok && src.containerd && !src.wantNamespace(namespace) {
+			// This SOURCE does not want the namespace — but a later source may.
+			// Deliberately NOT claimed: the claim-and-skip below exists for the
+			// GLOBAL exclude list (the observability feedback-loop guard), where
+			// resurrection by a catch-all would defeat the point. A per-source
+			// allowlist is the opposite: "prod through source A, the rest
+			// through source B" is its most obvious use, and claiming here made
+			// source B collect nothing.
+			return false
+		}
+		if !ok || slices.Contains(t.cfg.ExcludeNamespaces, namespace) {
 			// The file is CLAIMED by this source even though it is skipped:
 			// an excluded namespace (or an unparseable CRI name) must not
 			// fall through to a later catch-all source — ExcludeNamespaces is

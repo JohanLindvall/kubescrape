@@ -62,3 +62,25 @@ func TestSourceLabelSelector(t *testing.T) {
 		t.Error("an empty selector must accept every pod")
 	}
 }
+
+// A malformed namespace pattern must fail startup. path.Match returns
+// ErrBadPattern for EVERY input when the pattern is bad, and wantNamespace
+// reads that as "no match" — so an unvalidated typo silently collects NOTHING
+// for the source, with no warning, no metric and -check-config green.
+func TestInvalidNamespacePatternRejected(t *testing.T) {
+	for _, s := range []Source{
+		{Name: "a", Include: []string{"/var/log/containers/*.log"}, Containerd: true, Namespaces: []string{"prod["}},
+		{Name: "b", Include: []string{"/var/log/containers/*.log"}, Containerd: true, ExcludeNamespaces: []string{"kube-["}},
+	} {
+		if _, err := ValidateSources([]Source{s}); err == nil {
+			t.Errorf("source %q: an invalid namespace pattern must be rejected at startup", s.Name)
+		}
+	}
+	// A valid one still passes.
+	if _, err := ValidateSources([]Source{{
+		Name: "ok", Include: []string{"/var/log/containers/*.log"}, Containerd: true,
+		Namespaces: []string{"team-*", "prod"},
+	}}); err != nil {
+		t.Errorf("valid patterns rejected: %v", err)
+	}
+}

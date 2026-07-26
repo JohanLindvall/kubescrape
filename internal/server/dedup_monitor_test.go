@@ -122,3 +122,38 @@ func TestDedupKeepsMonitorAuthSecret(t *testing.T) {
 		t.Fatalf("target lost the monitor's bearerTokenSecret to URL dedup: %+v", out.Targets[0])
 	}
 }
+
+// The dedup predicate must not enumerate config fields: every time an endpoint
+// field became interpreted (basicAuth, authorization, tlsConfig, interval) the
+// enumeration went stale and that config was silently dropped again.
+func TestDedupKeepsEveryKindOfMonitorConfig(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		endpoint map[string]any
+	}{
+		{"basicAuth", map[string]any{"port": "metrics", "basicAuth": map[string]any{
+			"username": map[string]any{"name": "c", "key": "u"},
+		}}},
+		{"authorization", map[string]any{"port": "metrics", "authorization": map[string]any{
+			"credentials": map[string]any{"name": "c", "key": "t"},
+		}}},
+		{"tlsConfig", map[string]any{"port": "metrics", "tlsConfig": map[string]any{
+			"ca": map[string]any{"secret": map[string]any{"name": "ca", "key": "ca.crt"}},
+		}}},
+		{"interval", map[string]any{"port": "metrics", "interval": "10s"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := annotatedPodAndMonitor(t, tc.endpoint)
+			var out struct {
+				Targets []dedupTarget `json:"targets"`
+			}
+			getJSON(t, srv.URL+"/v1/nodes/node1/targets", http.StatusOK, &out)
+			if len(out.Targets) != 1 {
+				t.Fatalf("want one deduped target, got %+v", out.Targets)
+			}
+			if out.Targets[0].Monitor == "" {
+				t.Fatalf("the monitor target lost to dedup, taking its %s with it: %+v", tc.name, out.Targets[0])
+			}
+		})
+	}
+}

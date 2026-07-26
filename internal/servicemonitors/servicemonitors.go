@@ -111,12 +111,18 @@ type endpointSpec struct {
 		Credentials *secretRef `json:"credentials"`
 	} `json:"authorization"`
 	// Parsed only to be REPORTED as uninterpreted (see Endpoint.Ignored).
-	OAuth2            json.RawMessage `json:"oauth2"`
-	ProxyURL          string          `json:"proxyUrl"`
-	Params            json.RawMessage `json:"params"`
-	HonorLabels       *bool           `json:"honorLabels"`
-	Relabelings       json.RawMessage `json:"relabelings"`
-	BearerTokenSecret *struct {
+	OAuth2   json.RawMessage `json:"oauth2"`
+	ProxyURL string          `json:"proxyUrl"`
+	// Parsed only to be REPORTED as uninterpreted.
+	BearerTokenFile          string          `json:"bearerTokenFile"`
+	FollowRedirects          *bool           `json:"followRedirects"`
+	EnableHTTP2              *bool           `json:"enableHttp2"`
+	HonorTimestamps          *bool           `json:"honorTimestamps"`
+	TrackTimestampsStaleness *bool           `json:"trackTimestampsStaleness"`
+	Params                   json.RawMessage `json:"params"`
+	HonorLabels              *bool           `json:"honorLabels"`
+	Relabelings              json.RawMessage `json:"relabelings"`
+	BearerTokenSecret        *struct {
 		Name string `json:"name"`
 		Key  string `json:"key"`
 	} `json:"bearerTokenSecret"`
@@ -175,9 +181,14 @@ func (ep endpointSpec) ignoredFields() []string {
 		}
 	}
 	add("oauth2", len(ep.OAuth2) > 0)
+	add("bearerTokenFile", ep.BearerTokenFile != "")
+	add("followRedirects", ep.FollowRedirects != nil)
+	add("enableHttp2", ep.EnableHTTP2 != nil)
+	add("honorTimestamps", ep.HonorTimestamps != nil)
+	add("trackTimestampsStaleness", ep.TrackTimestampsStaleness != nil)
 	add("proxyUrl", ep.ProxyURL != "")
 	add("params", len(ep.Params) > 0)
-	add("honorLabels", ep.HonorLabels != nil)
+	add("honorLabels", ep.HonorLabels != nil && *ep.HonorLabels)
 	add("relabelings", len(ep.Relabelings) > 0)
 	if ep.TLSConfig != nil {
 		// Only the configMap arm is unsupported; secret-backed CA/cert are

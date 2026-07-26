@@ -237,7 +237,13 @@ func (s *Server) handleNodeTargets(w http.ResponseWriter, r *http.Request) {
 // endpoint with a private CA fails, and without the metricRelabelings the
 // series a drop rule targets are exported anyway.
 func configuredTarget(t kubemeta.ScrapeTarget) bool {
-	return t.AuthSecret != "" || t.InsecureSkipVerify || len(t.MetricRelabelings) > 0
+	// Monitor != "" is the test, NOT a list of the config fields that happen to
+	// exist today: an enumeration silently goes stale every time an endpoint
+	// field is interpreted (it already had, for basicAuth, authorization, the
+	// tlsConfig material and interval/scrapeTimeout — each of which was being
+	// dropped by the dedup this function exists to prevent). Only monitor-derived
+	// targets carry endpoint configuration at all, so the source IS the signal.
+	return t.Monitor != ""
 }
 
 // handleScrapeAuth serves GET /v1/scrape-auth/{namespace}/{name}/{key}: the

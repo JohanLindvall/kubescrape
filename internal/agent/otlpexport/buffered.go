@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"net/http"
 	"os"
 	"sync"
 	"time"
@@ -65,6 +66,18 @@ func NewBuffered(inner Exporter, logSpool, metricSpool *spool.Spool, backoff tim
 	sendLogs, sendMetrics := inner.ExportLogs, inner.ExportMetrics
 	if c, ok := inner.(*Client); ok {
 		sendLogs, sendMetrics = c.exportLogsCounted, c.exportMetricsCounted
+	}
+	// Report what a damaged tail cost at open: the spool cannot (it must not
+	// import internal/obs), and nothing else ever sees those bytes.
+	for kind, sp := range map[string]*spool.Spool{"logs": logSpool, "metrics": metricSpool} {
+		if sp == nil {
+			continue
+		}
+		if lost := sp.Discarded(); lost > 0 {
+			obs.BufferTruncated.WithLabelValues(kind).Add(float64(lost))
+			log.Error("disk buffer segment tail truncated at open; buffered records were destroyed",
+				"signal", kind, "bytes_discarded", lost)
+		}
 	}
 	if logSpool != nil {
 		lm := plog.ProtoMarshaler{}
@@ -389,6 +402,18 @@ func (s *sink[T]) stuckTooLong(data []byte) bool {
 func respondedError(err error) bool {
 	var he *HTTPStatusError
 	if errors.As(err, &he) {
+		// Throttling and server-side outages are the HTTP counterparts of the
+		// gRPC codes excluded below, and OTLP defines them as RETRYABLE: a
+		// collector answering 429/503 while it accepts other batches is
+		// back-pressuring, not rejecting this payload. Counting them as poison
+		// evidence dropped perfectly good data during exactly the outage the
+		// disk buffer exists to survive.
+		switch {
+		case he.Code == http.StatusRequestTimeout, // 408
+			he.Code == http.StatusTooManyRequests, // 429
+			he.Code >= 500:                        // 502/503/504 and friends
+			return false
+		}
 		return true
 	}
 	if st, ok := status.FromError(err); ok {

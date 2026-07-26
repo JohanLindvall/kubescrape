@@ -173,11 +173,24 @@ var builtins = map[string]pattern{
 	},
 	"secret-kv": {
 		name: "secret-kv",
-		re: regexp.MustCompile(`\b((?:` + asciiFold("api") + `[_-]?` + asciiFold("key") +
+		// The keyword may be a SUFFIX of a compound key: `\b` treats `_` as a
+		// word character, so `\baccess_token` could never match — and
+		// access_token, refresh_token, client_secret, AWS_SECRET_ACCESS_KEY,
+		// DB_PASSWORD and every other snake_case / SCREAMING_SNAKE / camelCase
+		// spelling shipped in CLEAR. Those are the common forms; the pattern
+		// was catching only the rarest ones. The prefilters already accept
+		// these lines (they scan for the bare keyword anywhere), so this only
+		// widens the regex to the reach its guard always had.
+		//
+		// The value charset also excludes closing brackets: without them an
+		// unquoted JSON value swallowed the closing brace, corrupting the line
+		// for logattrs, enrich and log-metrics — which all run AFTER scrubbing.
+		re: regexp.MustCompile(`((?:^|[^0-9A-Za-z_.-])[0-9A-Za-z_.-]*?(?:` +
+			asciiFold("api") + `[_-]?` + asciiFold("key") +
 			`|` + asciiFold("secret") + `|` + asciiFold("password") + `|` + asciiFold("passwd") +
 			`|` + asciiFold("pwd") + `|` + asciiFold("token") +
 			`|` + asciiFold("access") + `[_-]?` + asciiFold("key") +
-			`)["']?\s*[:=]\s*["']?)[^\s"'&,;]+`),
+			`)["\']?\s*[:=]\s*["\']?)[^\s"\'&,;}\])]+`),
 		repl: "${1}" + redacted,
 		prefilter: func(s string) bool {
 			return pfKey(s) || pfSecret(s) || pfPassw(s) || pfPwd(s) || pfToken(s)

@@ -27,8 +27,10 @@ func TestPerTargetIntervalRespected(t *testing.T) {
 		t.Fatalf("points = %d, want 1: a target with interval=1h must not be re-scraped in the next cycle", got)
 	}
 
-	// A target with NO interval keeps the old every-cycle behaviour, so clock
-	// jitter can never defer it.
+	// A target with NO interval follows the AGENT's interval — it is scheduled
+	// like every other target. Leaving such targets unscheduled meant a single
+	// monitor asking for 10s re-clocked the whole node, because Run ticks at
+	// the finest requested cadence.
 	exp2 := &captureExporter{}
 	s2 := New(Config{
 		Node: "n1", Interval: time.Minute, Timeout: 5 * time.Second,
@@ -36,8 +38,8 @@ func TestPerTargetIntervalRespected(t *testing.T) {
 	})
 	s2.cycle(context.Background())
 	s2.cycle(context.Background())
-	if got := exp2.points(); got != 2 {
-		t.Fatalf("points = %d, want 2: a target without its own interval is scraped every cycle", got)
+	if got := exp2.points(); got != 1 {
+		t.Fatalf("points = %d, want 1: a target with no interval follows -scrape-interval, not the tick rate", got)
 	}
 	_ = fast
 }

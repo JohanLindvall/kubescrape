@@ -394,12 +394,41 @@ func (s *Scraper) cycle(ctx context.Context) {
 		}()
 		return true
 	}
+	now := time.Now()
+	due := make(map[string]time.Time, len(targets)+2)
+	intervals := make(map[string]time.Duration, len(targets))
+	// dueNow reports whether a scheduled key is due, and records its next time.
+	// The kubelet scrapes go through it too: they are the most expensive on the
+	// node, and Run's tick is set by whatever target asks for the finest
+	// cadence, so leaving them unscheduled made one 10s monitor re-clock
+	// /metrics/cadvisor for the whole fleet.
+	dueNow := func(key string, iv time.Duration) bool {
+		next, scheduled := s.dueAt(key)
+		if scheduled && now.Add(iv/10).Before(next) {
+			due[key] = next
+			return false
+		}
+		if scheduled {
+			// Advance from the DUE time, not from now: the tick may land
+			// slightly early (iv/10), and folding that slack in every round
+			// drifted long-interval targets ~10% faster, permanently.
+			if n := next.Add(iv); n.After(now) {
+				due[key] = n
+			} else {
+				due[key] = now.Add(iv) // fell far behind: resynchronise
+			}
+		} else {
+			due[key] = now.Add(iv)
+		}
+		return true
+	}
+
 	if s.cfg.Kubelet.Endpoint != "" {
 		base := strings.TrimRight(s.cfg.Kubelet.Endpoint, "/")
-		if s.cfg.Kubelet.Cadvisor {
+		if s.cfg.Kubelet.Cadvisor && dueNow("\x00cadvisor", s.cfg.Interval) {
 			spawn(pipelineCadvisor, base+"/metrics/cadvisor", nil, s.scrapeCadvisor)
 		}
-		if s.cfg.Kubelet.NodeMetrics {
+		if s.cfg.Kubelet.NodeMetrics && dueNow("\x00node", s.cfg.Interval) {
 			spawn(pipelineNode, base+"/metrics", nil, s.scrapeNodeMetrics)
 		}
 	}
@@ -410,36 +439,22 @@ func (s *Scraper) cycle(ctx context.Context) {
 	// jitter between the ticker and a due time. The maps are rebuilt from the
 	// current target list each cycle, so a vanished target takes its schedule
 	// with it.
-	now := time.Now()
-	due := make(map[string]time.Time, len(targets))
-	intervals := make(map[string]time.Duration, len(targets))
 	for i := range targets {
 		t := targets[i]
-		iv := s.cfg.Interval
+		// EVERY target is scheduled, defaulting to the agent's interval. Only
+		// scheduling the ones with an explicit interval was a mistake: Run ticks
+		// at the finest cadence any target asks for, so a single monitor with
+		// `interval: 10s` made every unscheduled target — and both kubelet
+		// scrapes, the most expensive on the node — run at 10s instead of
+		// -scrape-interval. kube-prometheus-stack ships exactly such monitors,
+		// so this tripled a default fleet's scrape rate silently.
+		iv := s.targetInterval(t)
 		if t.Interval != "" {
-			iv = s.targetInterval(t)
+			// Only an EXPLICIT interval may speed the loop's tick up.
 			intervals[t.URL] = iv
-			// Tolerance: the loop ticks at the finest requested cadence, so a
-			// tick landing a hair early must still scrape rather than defer a
-			// whole period.
-			next, scheduled := s.dueAt(t.URL)
-			if scheduled && now.Add(iv/10).Before(next) {
-				due[t.URL] = next
-				continue
-			}
-			if scheduled {
-				// Advance from the DUE time, not from now: the tick is allowed
-				// to land slightly early (iv/10), and computing the next due
-				// from `now` folded that slack in every round — a 5m target on
-				// a fleet whose finest cadence is 10s drifted to ~4m30s and
-				// stayed there, 11% more samples than asked for.
-				due[t.URL] = next.Add(iv)
-				if !due[t.URL].After(now) {
-					due[t.URL] = now.Add(iv) // fell far behind: resynchronise
-				}
-			} else {
-				due[t.URL] = now.Add(iv)
-			}
+		}
+		if !dueNow(t.URL, iv) {
+			continue
 		}
 		timeout := s.targetTimeout(t, iv)
 		if !spawn(pipelineTargets, t.URL, &t, func(ctx context.Context) (int, error) {

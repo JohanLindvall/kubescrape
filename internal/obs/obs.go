@@ -44,6 +44,13 @@ var (
 	MonitorFieldsIgnored = Registry.CounterVec("kubescrape_monitor_fields_ignored_total",
 		"Monitor upserts whose endpoints set fields kubescrape does not interpret.", "kind")
 
+	// BufferTruncated counts bytes destroyed when a damaged or torn segment
+	// tail was truncated at open. A crash mid-append costs one incomplete frame;
+	// anything larger means corruption cost fsynced records — the one loss path
+	// in the spool that no Pop can report.
+	BufferTruncated = Registry.CounterVec("kubescrape_buffer_truncated_bytes_total",
+		"Bytes discarded by truncating a damaged or torn disk-buffer segment tail at open.", "signal")
+
 	BufferDropped = Registry.CounterVec("kubescrape_buffer_dropped_total",
 		"Buffered batches dropped after a permanent collector rejection (bad payload, auth, unimplemented).", "signal")
 	BufferRequeued = Registry.CounterVec("kubescrape_buffer_requeued_total",

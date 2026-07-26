@@ -145,6 +145,7 @@ type Spool struct {
 	dir         string
 	segmentSize int64
 	maxBytes    int64
+	discarded   int64 // bytes a damaged/torn tail cost at Open (see Discarded)
 
 	mu      sync.Mutex
 	segs    []segment // ascending by seq; segs[0] is the read head, last is the write tail
@@ -311,6 +312,16 @@ func (s *Spool) openTail() error {
 	if info, err := os.Stat(tail.path); err != nil {
 		return err
 	} else if info.Size() != good {
+		// A torn tail is one incomplete frame (a crash mid-append) and costs
+		// nothing. Anything larger means damage cost us fsynced records, and
+		// that must never be invisible — this is the one loss path in the spool
+		// with no Pop to count it.
+		// Record what the truncate destroys. A torn tail is ONE incomplete
+		// frame (a crash mid-append) and costs nothing; anything larger means
+		// damage cost us fsynced records — the one loss path in the spool with
+		// no Pop to count it, so the caller reports it (this package must not
+		// import internal/obs).
+		s.discarded += info.Size() - good
 		if err := os.Truncate(tail.path, good); err != nil {
 			return err
 		}
@@ -380,6 +391,7 @@ func lastCompleteOffset(sg segment) (int64, error) {
 	fh := sg.frameHdr()
 	off := int64(segHeaderLen)
 	hdr := make([]byte, fh)
+	var buf []byte
 	for off+fh <= sg.size {
 		if _, err := f.ReadAt(hdr, off); err != nil {
 			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
@@ -389,9 +401,36 @@ func lastCompleteOffset(sg segment) (int64, error) {
 			// would silently discard valid fsynced frames after it.
 			return 0, err
 		}
-		end := off + fh + int64(binary.BigEndian.Uint32(hdr[:4]))
+		n := int64(binary.BigEndian.Uint32(hdr[:4]))
+		end := off + fh + n
 		if end > sg.size {
-			break // torn frame
+			break // torn frame (or a length damaged upward — same recovery)
+		}
+		// VERIFY the frame, do not just trust its length. The checksum covers
+		// the length bytes precisely so a damaged length is detectable: without
+		// this check a length corrupted DOWNWARD still lands in bounds, and the
+		// walk then reads the middle of a payload as the next header and
+		// mis-frames the whole remainder — truncating away valid fsynced frames
+		// with no error and no counter. A frame that fails here is left in
+		// place and skipped: Pop drops exactly it and reports ErrCorrupt, which
+		// is the documented "one bad byte costs one record" behaviour.
+		if int64(cap(buf)) < n {
+			buf = make([]byte, n)
+		}
+		p := buf[:n]
+		if _, err := f.ReadAt(p, off+fh); err != nil {
+			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+				break
+			}
+			return 0, err
+		}
+		if frameSum(hdr[:4], p) != binary.BigEndian.Uint64(hdr[4:fh]) {
+			// Damaged, but structurally whole under its own length: keep it and
+			// keep walking. If the length itself was the damage the next header
+			// read is garbage and the loop stops at the bounds check above,
+			// which the caller now reports rather than truncating silently.
+			off = end
+			continue
 		}
 		off = end
 	}
@@ -689,6 +728,16 @@ func (s *Spool) notify() {
 	case s.signal <- struct{}{}:
 	default:
 	}
+}
+
+// Discarded is the number of bytes a damaged or torn tail cost at Open, so the
+// caller can log and count it. A crash mid-append leaves one incomplete frame
+// (small and expected); anything larger means fsynced records were destroyed by
+// corruption, which must never be invisible.
+func (s *Spool) Discarded() int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.discarded
 }
 
 // Bytes is the current undelivered backlog in bytes (what MaxBytes caps).

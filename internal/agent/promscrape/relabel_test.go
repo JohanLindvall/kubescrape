@@ -71,6 +71,10 @@ func TestScrapeTargetBearerAuth(t *testing.T) {
 		Exporter: exp, StartTime: time.Now(),
 	})
 	s.cycle(context.Background())
+	// Every target is scheduled now, so clear the schedule to stand in for an
+	// interval elapsing; the point of the test is that two SCRAPES resolve the
+	// token once.
+	s.setSchedule(nil, nil)
 	s.cycle(context.Background())
 	if got, _ := gotAuth.Load().(string); got != "Bearer tok-ns/tok/token" {
 		t.Fatalf("Authorization = %q", got)

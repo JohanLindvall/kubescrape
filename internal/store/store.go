@@ -70,6 +70,10 @@ type Store struct {
 	// keys (bounded by maxWaiters).
 	waiters  map[string][]chan struct{}
 	nWaiters int
+	// ipSeq orders genuine pod-IP ACQUISITIONS so a later acquirer beats an
+	// earlier one; a record merely re-asserting an address it already holds
+	// keeps its old sequence and cannot displace the live owner.
+	ipSeq uint64
 }
 
 type record struct {
@@ -86,6 +90,9 @@ type record struct {
 	// carries its now-recycled PodIP, so it must not steal the IP index from a
 	// live pod that legitimately holds it.
 	terminating bool
+	// ipSeq is the store sequence at which this record last ACQUIRED its
+	// current PodIP (see Store.ipSeq).
+	ipSeq uint64
 }
 
 type containerEntry struct {
@@ -233,9 +240,31 @@ func (s *Store) claimPodIPLocked(rec *record, pod kubemeta.Pod, oldIP string) {
 		s.promoteIPClaimantLocked(oldIP, rec)
 	}
 	if ip != "" {
+		if oldIP != ip {
+			// This pod ACQUIRED the address now. The sequence orders genuine
+			// acquisitions so a later one beats an earlier one below.
+			s.ipSeq++
+			rec.ipSeq = s.ipSeq
+		}
 		cur := s.byPodIP[ip]
-		if cur == nil || cur == rec || !rec.terminating || cur.terminating {
+		switch {
+		case cur == nil || cur == rec:
 			s.byPodIP[ip] = rec
+		case rec.terminating && !cur.terminating:
+			// A draining pod keeps reporting its now-recycled IP; it yields.
+		case !rec.terminating && cur.terminating:
+			s.byPodIP[ip] = rec
+		case rec.ipSeq > cur.ipSeq:
+			// Last acquisition wins — including a late-scheduled older pod
+			// legitimately taking a freed address.
+			s.byPodIP[ip] = rec
+		default:
+			// rec is merely RE-ASSERTING an address it already held while a
+			// later pod legitimately took it. Plain last-write-wins let any
+			// unrelated update to a stale pod (a node-lifecycle condition on a
+			// NotReady node, a resurrect after DeletePod, a transient podIP
+			// blip) steal the mapping from the live owner and mis-attribute
+			// every peer-IP lookup until that pod finally went away.
 		}
 	}
 }

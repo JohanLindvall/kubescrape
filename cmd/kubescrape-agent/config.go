@@ -93,8 +93,13 @@ func validateConfig(cfg agentConfig, transformsFile string) error {
 			return fmt.Errorf("logScrubbing: %w", err)
 		}
 	}
-	if cfg.LogMetrics != nil {
-		if _, err := metrics.NewDynamicMetricSet(cfg.LogMetrics.Metrics); err != nil {
+	if cfg.LogMetrics != nil && len(cfg.LogMetrics.Metrics) > 0 {
+		// The SAME options a real start uses: the name prefix participates in
+		// validation (an empty rule name is legal only because the prefix makes
+		// the result non-empty), so validating without it would reject configs
+		// that actually run.
+		opts := []metrics.Option{metrics.WithNamePrefix(*logsMetricsPrefix)}
+		if _, err := metrics.NewDynamicMetricSet(cfg.LogMetrics.Metrics, opts...); err != nil {
 			return fmt.Errorf("logMetrics: %w", err)
 		}
 	}

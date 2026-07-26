@@ -7,6 +7,7 @@ import (
 	"github.com/JohanLindvall/kubescrape/internal/agent/logscrub"
 	"github.com/JohanLindvall/kubescrape/internal/agent/route"
 	"github.com/JohanLindvall/kubescrape/internal/agent/tracesample"
+	"github.com/JohanLindvall/kubescrape/internal/metrics"
 )
 
 // -check-config is only useful if it rejects everything a real start rejects.
@@ -56,5 +57,29 @@ func TestValidateConfigRejectsBadSections(t *testing.T) {
 func TestValidateConfigAcceptsEmpty(t *testing.T) {
 	if err := validateConfig(agentConfig{}, ""); err != nil {
 		t.Fatalf("an empty config must be valid: %v", err)
+	}
+}
+
+// -check-config is only trustworthy if it accepts EXACTLY what a real start
+// accepts. The log-metric name prefix participates in validation (an empty rule
+// name is legal precisely because the prefix makes the result non-empty), so
+// validating without the same options rejected configs that actually run.
+func TestValidateConfigUsesTheSameOptionsAsAStart(t *testing.T) {
+	cfg := agentConfig{LogMetrics: &metrics.DynamicConfig{Metrics: []metrics.Dynamic{{
+		Name: "", Type: metrics.CounterType, Value: "1",
+		MatchRegexp: []string{"__line__=ERROR"},
+	}}}}
+
+	old := *logsMetricsPrefix
+	defer func() { *logsMetricsPrefix = old }()
+
+	*logsMetricsPrefix = "app_"
+	if err := validateConfig(cfg, ""); err != nil {
+		t.Fatalf("rejected a config a real start accepts (the prefix makes the name non-empty): %v", err)
+	}
+
+	*logsMetricsPrefix = ""
+	if err := validateConfig(cfg, ""); err == nil {
+		t.Fatal("accepted a nameless metric with no prefix; a real start rejects it")
 	}
 }

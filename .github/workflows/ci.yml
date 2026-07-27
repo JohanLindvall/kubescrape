@@ -12,8 +12,8 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
           cache: true
@@ -50,21 +50,24 @@ jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
           cache: true
       - run: sudo apt-get update && sudo apt-get install -y libsystemd-dev
-      - uses: golangci/golangci-lint-action@v6
-        with:
-          version: v2.6.0
+      # `make lint` rather than golangci-lint-action: the Makefile already
+      # pins GOLANGCI_LINT_VERSION and installs it, so this keeps ONE source
+      # of truth for the linter version. Carrying it in the workflow too is
+      # what broke the first run — CI asked for a version the action could not
+      # run, and it would have drifted from the Makefile regardless.
+      - run: make lint
 
   helm:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: azure/setup-helm@v4
+      - uses: actions/checkout@v7
+      - uses: azure/setup-helm@v5
       - run: helm lint charts/kubescrape
       # Render the value combinations that have broken before: staticAttrs
       # alone once rendered -config plus its ConfigMap but neither the volume

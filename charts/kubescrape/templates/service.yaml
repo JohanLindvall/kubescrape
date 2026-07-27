@@ -226,3 +226,27 @@ spec:
     matchLabels:
       app: {{ .Release.Name }}
 {{- end }}
+{{- if .Values.networkPolicy.enabled }}
+---
+# Metadata-service ingress. The agent fleet polls the API port and, when
+# metrics.scrapeAnnotations is on, a scraper reaches the metrics port — so both
+# belong here. The pprof port is deliberately NOT opened: it exposes goroutine
+# stacks and heap contents, and is the one listener the chart wants firewalled.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ .Release.Name }}
+  namespace: {{ .Release.Namespace }}
+  labels: {{ include "kubescrape.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app: {{ .Release.Name }}
+  policyTypes: [Ingress]
+  ingress:
+    - ports:
+        - port: {{ (split ":" .Values.service.listen)._1 | int }}
+        {{- if .Values.metrics.enabled }}
+        - port: {{ (split ":" .Values.metrics.listen)._1 | int }}
+        {{- end }}
+{{- end }}

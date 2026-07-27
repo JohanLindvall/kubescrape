@@ -68,4 +68,4 @@ echo "  node=\$(kubectl --context kind-$CLUSTER_NAME -n kubescrape-demo get pods
 echo "  curl -s \"localhost:8080/v1/nodes/\$node/targets\" | jq ."
 echo
 echo "  cid=\$(kubectl --context kind-$CLUSTER_NAME -n kubescrape-demo get pods -o jsonpath='{.items[0].status.containerStatuses[0].containerID}')"
-echo "  curl -s \"localhost:8080/v1/containers/\$cid\" | jq ."
+echo "  curl -s \"localhost:8080/v1/containers/\${cid#containerd://}\" | jq ."

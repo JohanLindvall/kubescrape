@@ -29,7 +29,7 @@ func FromPod(p *corev1.Pod) (kubemeta.Pod, map[string]kubemeta.Container) {
 		HostNetwork: p.Spec.HostNetwork,
 		Phase:       string(p.Status.Phase),
 		Labels:      cloneMap(p.Labels),
-		Annotations: cloneMap(p.Annotations),
+		Annotations: kubemeta.FilterAnnotations(p.Annotations),
 		CreatedAt:   p.CreationTimestamp.Time,
 	}
 	if p.Status.StartTime != nil {

@@ -242,7 +242,11 @@ spec:
           livenessProbe:
             httpGet: {path: /healthz, port: http}
           volumeMounts:
-            {{- if .Values.agent.config }}
+            {{- /* $cfg, NOT .Values.agent.config: staticAttrs merges into $cfg
+                   and renders both the ConfigMap and -config, so guarding the
+                   mount on the raw value handed the agent a -config path that
+                   nothing mounted and CrashLoopBackOff-ed every node. */}}
+            {{- if $cfg }}
             - name: config
               mountPath: /etc/kubescrape/config
               readOnly: true
@@ -281,7 +285,7 @@ spec:
           hostPath:
             path: /var/lib/kubescrape-agent
             type: DirectoryOrCreate
-        {{- if .Values.agent.config }}
+        {{- if $cfg }}
         - name: config
           configMap:
             name: {{ .Release.Name }}-agent-config
@@ -307,18 +311,35 @@ spec:
         {{- end }}
 {{- if .Values.networkPolicy.enabled }}
 ---
+# Agent ingress. The selector must be the AGENT's label: this policy used to
+# select `app: <release>` — the metadata SERVICE's pods — so enabling it left
+# the DaemonSet with no policy at all while silently narrowing the service to a
+# single port. Every port declared on the container belongs here, or the chart
+# would firewall off an endpoint it opened in the same file; the metrics port in
+# particular is the one metrics.scrapeAnnotations tells Prometheus to scrape.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
-  name: {{ .Release.Name }}
+  name: {{ .Release.Name }}-agent
   namespace: {{ .Release.Namespace }}
   labels: {{ include "kubescrape.labels" . | nindent 4 }}
 spec:
   podSelector:
     matchLabels:
-      app: {{ .Release.Name }}
+      app: {{ .Release.Name }}-agent
   policyTypes: [Ingress]
   ingress:
     - ports:
-        - port: {{ (split ":" .Values.service.listen)._1 | int }}
+        - port: {{ (split ":" .Values.agent.listen)._1 | int }}
+        {{- if .Values.metrics.enabled }}
+        - port: {{ (split ":" .Values.metrics.listen)._1 | int }}
+        {{- end }}
+        {{- if .Values.agent.ingest.enabled }}
+        {{- with .Values.agent.ingest.grpcEndpoint }}
+        - port: {{ (split ":" .)._1 | int }}
+        {{- end }}
+        {{- with .Values.agent.ingest.httpEndpoint }}
+        - port: {{ (split ":" .)._1 | int }}
+        {{- end }}
+        {{- end }}
 {{- end }}

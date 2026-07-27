@@ -85,7 +85,6 @@ type scratch struct {
 }
 
 type compiledRule struct {
-	path []string // Key split on '.'
 	attr string
 	tgt  Target
 }
@@ -126,7 +125,7 @@ func New(cfg *Config) (*Extractor, error) {
 			attr = r.Key
 		}
 		path := strings.Split(r.Key, ".")
-		e.rules = append(e.rules, compiledRule{path: path, attr: attr, tgt: tgt})
+		e.rules = append(e.rules, compiledRule{attr: attr, tgt: tgt})
 		e.paths = append(e.paths, path)
 		e.want[r.Key] = append(e.want[r.Key], i)
 	}

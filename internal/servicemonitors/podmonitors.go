@@ -49,6 +49,7 @@ type pmSpec struct {
 		MatchNames []string `json:"matchNames"`
 	} `json:"namespaceSelector"`
 	PodMetricsEndpoints []endpointSpec `json:"podMetricsEndpoints"`
+	specLimits          `json:",inline"`
 }
 
 // ParsePodMonitor converts an unstructured PodMonitor.
@@ -72,8 +73,12 @@ func ParsePodMonitor(u *unstructured.Unstructured) (*PodMonitor, error) {
 		NamespaceAny: spec.NamespaceSelector.Any,
 		Namespaces:   spec.NamespaceSelector.MatchNames,
 	}
+	specIgnored := spec.ignored()
 	for _, ep := range spec.PodMetricsEndpoints {
 		e := ep.toEndpoint()
+		// See Parse: monitor-level ignored fields ride on every endpoint and
+		// IgnoredFields dedupes them to one report.
+		e.Ignored = append(e.Ignored, specIgnored...)
 		// Every secret reference is namespaced with the MONITOR's namespace: a
 		// monitor may only name secrets in its own namespace, which is what
 		// bounds what /v1/scrape-auth will serve.

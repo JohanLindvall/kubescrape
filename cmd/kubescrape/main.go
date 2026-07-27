@@ -22,6 +22,7 @@ import (
 	"go.opentelemetry.io/collector/pdata/pcommon"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -82,25 +83,37 @@ func typedHandler[T any](upsert, del func(T)) cache.ResourceEventHandlerFuncs {
 
 // registerCoreInformers wires the pod and service informers into the store
 // and the service index, returning their HasSynced funcs.
+//
+// These are the HANDLER REGISTRATIONS' HasSynced, never the informer's. The
+// informer's flips as soon as its DeltaFIFO has drained the initial LIST,
+// which says nothing about whether OUR handlers have run: the shared
+// processor delivers to each listener asynchronously through a pending-
+// notification ring, and everything a request actually reads — the store's
+// indexes, the service index — is filled from inside those handlers. Gating
+// readiness on the informer therefore lets /readyz report 200 while the store
+// is still filling, and an agent that polls in that window gets a 200 with a
+// half-built (or empty) target list instead of a 503 telling it to come back.
 func registerCoreInformers(factory informers.SharedInformerFactory, st *store.Store, svcIndex *services.Index) ([]cache.InformerSynced, error) {
 	podInformer := factory.Core().V1().Pods().Informer()
-	if _, err := podInformer.AddEventHandler(typedHandler(
+	podReg, err := podInformer.AddEventHandler(typedHandler(
 		func(pod *corev1.Pod) { st.UpsertPod(pod) },
 		func(pod *corev1.Pod) { st.DeletePod(pod.UID) },
-	)); err != nil {
+	))
+	if err != nil {
 		return nil, fmt.Errorf("registering pod event handler: %w", err)
 	}
 
 	// Services are matched against pods for service-annotation based scrape
 	// discovery; their specs are small, so the full objects are cached.
 	svcInformer := factory.Core().V1().Services().Informer()
-	if _, err := svcInformer.AddEventHandler(typedHandler(
+	svcReg, err := svcInformer.AddEventHandler(typedHandler(
 		func(svc *corev1.Service) { svcIndex.Upsert(svc) },
 		func(svc *corev1.Service) { svcIndex.Delete(svc.Namespace, svc.UID) },
-	)); err != nil {
+	))
+	if err != nil {
 		return nil, fmt.Errorf("registering service event handler: %w", err)
 	}
-	return []cache.InformerSynced{podInformer.HasSynced, svcInformer.HasSynced}, nil
+	return []cache.InformerSynced{podReg.HasSynced, svcReg.HasSynced}, nil
 }
 
 // registerOwnerInformers wires a metadata-only informer per owner GVR,
@@ -122,9 +135,21 @@ func registerOwnerInformers(metaFactory metadatainformer.SharedInformerFactory) 
 // startServiceMonitors sets up and starts the dynamic ServiceMonitor informer.
 // When the CRD is unavailable the feature is disabled with a warning and a nil
 // Index is returned (not an error).
-func startServiceMonitors(ctx context.Context, cfg *rest.Config, disco discovery.DiscoveryInterface, resync time.Duration, log *slog.Logger) (*servicemonitors.Index, cache.InformerSynced, error) {
-	if err := checkServiceMonitorCRD(disco); err != nil {
-		log.Warn("servicemonitors requested but the CRD is unavailable; disabling", "error", err)
+func startServiceMonitors(ctx context.Context, cfg *rest.Config, disco discovery.DiscoveryInterface, resync time.Duration, allowNS map[string]bool, log *slog.Logger) (*servicemonitors.Index, cache.InformerSynced, error) {
+	// Distinguish "the CRD is genuinely absent" from "we could not ask". The
+	// pre-check exists so an unused feature does not wedge readiness behind an
+	// informer that can never sync — it is NOT licence to treat a 503 from a
+	// rolling API server, a throttled request or a dropped connection as an
+	// answer. Doing so silently disabled an EXPLICITLY requested feature for
+	// the whole process lifetime: every monitor-derived target in the cluster
+	// vanished and /v1/scrape-auth 404'd every credential, with one log line
+	// at startup as the only trace. An operator who asked for -servicemonitors
+	// gets a hard failure instead, and can retry.
+	switch present, err := serviceMonitorCRDPresent(disco); {
+	case err != nil:
+		return nil, nil, fmt.Errorf("checking for the servicemonitor CRD: %w", err)
+	case !present:
+		log.Warn("servicemonitors requested but the CRD is unavailable; disabling")
 		return nil, nil, nil
 	}
 	dynClient, err := dynamic.NewForConfig(cfg)
@@ -144,40 +169,77 @@ func startServiceMonitors(ctx context.Context, cfg *rest.Config, disco discovery
 		return nil, nil, fmt.Errorf("servicemonitor informer transform: %w", err)
 	}
 	monitors := servicemonitors.NewIndex()
-	if _, err := smInformer.AddEventHandler(typedHandler(
+	smReg, err := smInformer.AddEventHandler(typedHandler(
 		func(u *unstructured.Unstructured) {
+			if !monitorAllowed(allowNS, u) {
+				return
+			}
 			if err := monitors.Upsert(u); err != nil {
-				log.Warn("parsing servicemonitor", "error", err)
+				// Counted, not just logged: an unparseable monitor DELETES it
+				// from the index, dropping every target it contributed. That
+				// is strictly more severe than the "some endpoint fields were
+				// ignored" case, which does get a metric — so the severe one
+				// must not be the unalertable one.
+				obs.MonitorParseErrors.WithLabelValues("servicemonitor").Inc()
+				log.Warn("parsing servicemonitor", "error", err,
+					"namespace", u.GetNamespace(), "name", u.GetName())
 				return
 			}
 			warnIgnored(log, "servicemonitor", u, monitors.Endpoints(u.GetNamespace(), u.GetName()))
 		},
 		func(u *unstructured.Unstructured) { monitors.Delete(u.GetNamespace(), u.GetName()) },
-	)); err != nil {
+	))
+	if err != nil {
 		return nil, nil, fmt.Errorf("registering servicemonitor handler: %w", err)
 	}
+	// Readiness must cover every cache a request can read, so collect the
+	// handler registrations rather than returning the ServiceMonitor's alone:
+	// /v1/nodes/{node}/targets reads the PodMonitor index too, and leaving it
+	// out let /readyz report 200 — advancing a rollout — while that index was
+	// empty, or permanently so when podmonitors RBAC is missing and its LIST
+	// 403-loops forever.
+	synced := []cache.InformerSynced{smReg.HasSynced}
+
 	// PodMonitors and Probes are optional siblings — watch whichever the
-	// cluster serves.
-	served, _ := monitoringResources(disco)
+	// cluster serves. This is the same idempotent discovery GET as the
+	// pre-check above, so an error here is as fatal as one there.
+	served, err := monitoringResources(disco)
+	if err != nil {
+		return nil, nil, fmt.Errorf("listing monitoring.coreos.com resources: %w", err)
+	}
 	if served[servicemonitors.PodGVR.Resource] {
 		pmInformer := dynFactory.ForResource(servicemonitors.PodGVR).Informer()
-		if _, err := pmInformer.AddEventHandler(typedHandler(
+		pmReg, err := pmInformer.AddEventHandler(typedHandler(
 			func(u *unstructured.Unstructured) {
+				if !monitorAllowed(allowNS, u) {
+					return
+				}
 				if err := monitors.UpsertPodMonitor(u); err != nil {
-					log.Warn("parsing podmonitor", "error", err)
+					obs.MonitorParseErrors.WithLabelValues("podmonitor").Inc()
+					log.Warn("parsing podmonitor", "error", err,
+						"namespace", u.GetNamespace(), "name", u.GetName())
 					return
 				}
 				warnIgnored(log, "podmonitor", u, monitors.PodEndpoints(u.GetNamespace(), u.GetName()))
 			},
 			func(u *unstructured.Unstructured) { monitors.DeletePodMonitor(u.GetNamespace(), u.GetName()) },
-		)); err != nil {
+		))
+		if err != nil {
 			return nil, nil, fmt.Errorf("registering podmonitor handler: %w", err)
 		}
+		synced = append(synced, pmReg.HasSynced)
 		log.Info("podmonitor discovery enabled")
 	}
 	dynFactory.Start(ctx.Done())
 	log.Info("servicemonitor discovery enabled")
-	return monitors, smInformer.HasSynced, nil
+	return monitors, func() bool {
+		for _, s := range synced {
+			if !s() {
+				return false
+			}
+		}
+		return true
+	}, nil
 }
 
 // k8sSecretReader resolves Secret keys on demand with a short cache (tokens
@@ -193,13 +255,23 @@ type secretCacheEntry struct {
 	fetched time.Time
 }
 
+// secretCacheTTL bounds how long a resolved Secret value is reused. Entries
+// past it are not merely re-fetched but DROPPED (see evictExpiredLocked): this
+// process holds cluster-wide `secrets: get`, so every value it has ever
+// resolved — bearer tokens, CA bundles, client private keys — was otherwise
+// pinned in its heap for the lifetime of the pod, growing by one permanent
+// entry per distinct ns/name/key ever seen. Monitor churn alone (GitOps
+// renames, per-release secret names) makes that unbounded.
+const secretCacheTTL = time.Minute
+
 func (r *k8sSecretReader) Get(ctx context.Context, namespace, name, key string) (string, error) {
 	ck := namespace + "/" + name + "/" + key
 	r.mu.Lock()
-	if e, ok := r.cache[ck]; ok && time.Since(e.fetched) < time.Minute {
+	if e, ok := r.cache[ck]; ok && time.Since(e.fetched) < secretCacheTTL {
 		r.mu.Unlock()
 		return e.value, nil
 	}
+	r.evictExpiredLocked()
 	r.mu.Unlock()
 	sec, err := r.client.CoreV1().Secrets(namespace).Get(ctx, name, metav1.GetOptions{})
 	if err != nil {
@@ -216,6 +288,19 @@ func (r *k8sSecretReader) Get(ctx context.Context, namespace, name, key string) 
 	r.cache[ck] = secretCacheEntry{value: string(val), fetched: time.Now()}
 	r.mu.Unlock()
 	return string(val), nil
+}
+
+// evictExpiredLocked drops every entry past the TTL. It runs on the miss path
+// only: a hit is the hot path and an expired entry is about to be replaced
+// anyway, so the cost lands where an API round-trip is already being paid. The
+// map is bounded by the AuthSecretRefs allowlist at any instant, and this is
+// what keeps it bounded over TIME as monitors come and go.
+func (r *k8sSecretReader) evictExpiredLocked() {
+	for k, e := range r.cache {
+		if time.Since(e.fetched) >= secretCacheTTL {
+			delete(r.cache, k)
+		}
+	}
 }
 
 // loadScrapeAuthToken reads the shared bearer token guarding
@@ -281,6 +366,20 @@ func run() error {
 		// ServiceMonitor CRDs (opt-in).
 		monitorsOn = flag.Bool("servicemonitors", false, "serve targets for monitoring.coreos.com ServiceMonitors selecting pod-backed Services (no per-endpoint auth or relabelings)")
 
+		// Which namespaces' monitors are HONOURED. Empty keeps every monitor
+		// in the cluster, which is the historical behaviour and stays the
+		// default so an upgrade cannot silently stop scraping.
+		//
+		// It is worth setting. A ServiceMonitor is an instruction to every
+		// node agent to issue a GET, and kubescrape has no equivalent of
+		// prometheus-operator's admin-owned serviceMonitorSelector — so
+		// without this, anyone who can create a ServiceMonitor in a namespace
+		// they own can point `selector: {}` + `namespaceSelector.any: true` at
+		// an arbitrary path across the whole cluster, at whatever interval
+		// they choose. Restricting it to the namespaces that legitimately
+		// declare monitoring turns that back into an admin decision.
+		monitorNamespaces = flag.String("monitor-namespaces", "", "comma-separated namespaces whose ServiceMonitors/PodMonitors are honoured (empty = all; a monitor is an instruction to every agent to scrape, so restricting this to admin-owned namespaces is recommended on multi-tenant clusters)")
+
 		// Serve monitor endpoints' bearerTokenSecret values to agents (opt-in:
 		// needs secrets get RBAC; tokens travel the cluster-internal HTTP).
 		scrapeAuthOn        = flag.Bool("scrape-auth-secrets", false, "serve ServiceMonitor/PodMonitor bearerTokenSecret values to agents on /v1/scrape-auth (requires secrets get RBAC)")
@@ -310,6 +409,9 @@ func run() error {
 	slog.SetDefault(log)
 	// client-go logs through klog; route it into the same slog handler.
 	klog.SetSlogLogger(log)
+	// First line of every run: without a build identity a panic trace, a
+	// metric anomaly or a half-finished rollout cannot be tied to a commit.
+	log.Info("kubescrape starting", "version", obs.BuildVersion(), "built", obs.BuildTime())
 
 	cfg, err := buildConfig(*kubeconfig)
 	if err != nil {
@@ -356,7 +458,7 @@ func run() error {
 
 	var monitors *servicemonitors.Index
 	if *monitorsOn {
-		idx, smSynced, err := startServiceMonitors(ctx, cfg, client.Discovery(), *resync, log)
+		idx, smSynced, err := startServiceMonitors(ctx, cfg, client.Discovery(), *resync, parseNamespaceSet(*monitorNamespaces), log)
 		if err != nil {
 			return err
 		}
@@ -401,6 +503,7 @@ func run() error {
 		selfRes = pcommon.NewResource()
 		a := selfRes.Attributes()
 		a.PutStr("service.name", "kubescrape")
+		a.PutStr("service.version", obs.BuildVersion())
 		if host, err := os.Hostname(); err == nil {
 			a.PutStr("service.instance.id", host)
 		}
@@ -449,7 +552,6 @@ func run() error {
 		MaxWait:         *maxWait,
 		CacheTTL:        *metaCacheTTL,
 		Ready:           ready,
-		Logger:          log,
 		Secrets:         secretReader,
 		ScrapeAuthToken: scrapeAuthToken,
 	}
@@ -507,30 +609,67 @@ func buildConfig(kubeconfig string) (*rest.Config, error) {
 	return clientcmd.NewNonInteractiveDeferredLoadingClientConfig(rules, nil).ClientConfig()
 }
 
-// checkServiceMonitorCRD verifies the ServiceMonitor CRD is actually served.
-// The group/version existing is not enough: another monitoring.coreos.com/v1
-// CRD (e.g. PrometheusRule alone) registers the group while servicemonitor
-// LISTs would fail forever, wedging readiness behind an informer that can
-// never sync.
-func checkServiceMonitorCRD(d discovery.DiscoveryInterface) error {
-	_, err := monitoringResources(d)
-	return err
+// parseNamespaceSet turns a comma-separated flag value into a lookup set. An
+// empty or whitespace-only value yields nil, meaning "no restriction".
+func parseNamespaceSet(s string) map[string]bool {
+	out := map[string]bool{}
+	for _, ns := range strings.Split(s, ",") {
+		if ns = strings.TrimSpace(ns); ns != "" {
+			out[ns] = true
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// monitorAllowed reports whether a monitor's namespace is one the operator
+// permits to drive scrapes. A nil set allows everything (the default).
+//
+// This is applied at INDEXING time rather than at target-derivation time so a
+// disallowed monitor never occupies memory, and — more importantly — never
+// contributes to AuthSecretRefs, which is the allowlist bounding what
+// /v1/scrape-auth will read. A gate that let the monitor into the index and
+// only filtered its targets would still widen the set of Secrets this process
+// is willing to fetch.
+func monitorAllowed(allowNS map[string]bool, u *unstructured.Unstructured) bool {
+	return allowNS == nil || allowNS[u.GetNamespace()]
+}
+
+// serviceMonitorCRDPresent reports whether the ServiceMonitor CRD is actually
+// served. The group/version existing is not enough: another
+// monitoring.coreos.com/v1 CRD (e.g. PrometheusRule alone) registers the group
+// while servicemonitor LISTs would fail forever, wedging readiness behind an
+// informer that can never sync.
+//
+// A false return means the cluster answered and does not serve the resource.
+// An error means the cluster could not be ASKED, which is not the same thing
+// and must not silently disable the feature — see the caller.
+func serviceMonitorCRDPresent(d discovery.DiscoveryInterface) (bool, error) {
+	served, err := monitoringResources(d)
+	if err != nil {
+		return false, err
+	}
+	return served[servicemonitors.GVR.Resource], nil
 }
 
 // monitoringResources lists which monitoring.coreos.com resources the
 // cluster serves (servicemonitors, podmonitors, probes may be installed
-// independently).
+// independently). A missing group/version is reported as an empty set and no
+// error — that is an answer ("nothing is installed"), not a failure to reach
+// the API server, and only the latter should be fatal to the caller.
 func monitoringResources(d discovery.DiscoveryInterface) (map[string]bool, error) {
 	list, err := d.ServerResourcesForGroupVersion(servicemonitors.GVR.GroupVersion().String())
 	if err != nil {
+		if apierrors.IsNotFound(err) || apimeta.IsNoMatchError(err) {
+			return map[string]bool{}, nil
+		}
 		return nil, err
 	}
 	out := map[string]bool{}
 	for _, r := range list.APIResources {
 		out[r.Name] = true
-	}
-	if !out[servicemonitors.GVR.Resource] {
-		return nil, fmt.Errorf("resource %q not served by %s", servicemonitors.GVR.Resource, servicemonitors.GVR.GroupVersion())
 	}
 	return out, nil
 }

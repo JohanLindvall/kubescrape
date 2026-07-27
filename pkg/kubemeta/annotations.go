@@ -1,0 +1,43 @@
+package kubemeta
+
+// droppedAnnotations are annotation keys stripped from every object this API
+// serves — pods, owners and namespaces alike.
+//
+// The metadata routes are unauthenticated by design ("it carries no secret
+// material and agents poll it constantly"), and that claim only holds if the
+// annotations riding along carry none either. kubectl's last-applied
+// configuration breaks it outright: it is a verbatim copy of the whole applied
+// object, so anything a user inlined into a spec — an env var with a token, a
+// connection string, a webhook URL — is served to any caller that can reach
+// the port, and lands in every log record's resource attributes downstream.
+//
+// It is also pure bloat as telemetry metadata: it duplicates the spec the rest
+// of the response already models, and on a CronJob or Deployment it is
+// routinely the largest field in the payload.
+var droppedAnnotations = map[string]bool{
+	"kubectl.kubernetes.io/last-applied-configuration": true,
+}
+
+// FilterAnnotations copies m without the annotations this API refuses to
+// serve. It returns nil for an empty result so the field stays omitempty.
+//
+// The filter is deliberately a fixed, tiny denylist rather than a config knob:
+// the one entry is a Kubernetes-wide convention that no consumer of this API
+// wants, and a per-deployment allowlist would make "is this endpoint safe to
+// expose" depend on configuration nobody reviews.
+func FilterAnnotations(m map[string]string) map[string]string {
+	if len(m) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(m))
+	for k, v := range m {
+		if droppedAnnotations[k] {
+			continue
+		}
+		out[k] = v
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}

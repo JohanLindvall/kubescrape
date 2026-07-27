@@ -5,7 +5,6 @@ import (
 	"context"
 	"errors"
 	"hash/fnv"
-	"log/slog"
 	"net/http"
 	"slices"
 	"strconv"
@@ -48,8 +47,7 @@ type Config struct {
 	// cache headers.
 	CacheTTL time.Duration
 	// Ready is closed once the informer caches have synced.
-	Ready  <-chan struct{}
-	Logger *slog.Logger
+	Ready <-chan struct{}
 	// Secrets serves monitor endpoints' bearer-token Secrets to agents
 	// (GET /v1/scrape-auth/...); nil disables the endpoint (404). Opt-in via
 	// -scrape-auth-secrets — it requires secrets RBAC and ships secret
@@ -95,7 +93,6 @@ type Server struct {
 	maxWait         time.Duration
 	cacheTTL        time.Duration
 	ready           <-chan struct{}
-	log             *slog.Logger
 	now             func() time.Time
 
 	// monMu guards the monitoredServices cache: the monitor→services match
@@ -111,10 +108,6 @@ type Server struct {
 
 // New creates a Server.
 func New(cfg Config) *Server {
-	log := cfg.Logger
-	if log == nil {
-		log = slog.Default()
-	}
 	return &Server{
 		secrets:         cfg.Secrets,
 		scrapeAuthToken: cfg.ScrapeAuthToken,
@@ -125,7 +118,6 @@ func New(cfg Config) *Server {
 		maxWait:         cfg.MaxWait,
 		cacheTTL:        cfg.CacheTTL,
 		ready:           cfg.Ready,
-		log:             log,
 		now:             time.Now,
 	}
 }

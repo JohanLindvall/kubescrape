@@ -59,6 +59,7 @@ func agentSelfResource(node string) pcommon.Resource {
 	res := pcommon.NewResource()
 	a := res.Attributes()
 	a.PutStr("service.name", "kubescrape-agent")
+	a.PutStr("service.version", obs.BuildVersion())
 	a.PutStr("k8s.node.name", node)
 	attrs.Identity(res)
 	return res
@@ -241,6 +242,9 @@ func run() error {
 		return err
 	}
 	slog.SetDefault(log)
+	// First line of every run: without a build identity a panic trace, a
+	// metric anomaly or a half-finished rollout cannot be tied to a commit.
+	log.Info("kubescrape-agent starting", "version", obs.BuildVersion(), "built", obs.BuildTime())
 
 	// All YAML config lives in one file; each section is optional.
 	var fileCfg agentConfig

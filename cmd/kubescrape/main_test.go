@@ -1,12 +1,16 @@
 package main
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/client-go/discovery"
 	discoveryfake "k8s.io/client-go/discovery/fake"
 	coretesting "k8s.io/client-go/testing"
 )
@@ -15,7 +19,13 @@ import (
 // itself, not just the group/version: a cluster with only other
 // monitoring.coreos.com/v1 CRDs (e.g. PrometheusRule) serves the group, but a
 // servicemonitor informer there can never sync and would wedge readiness.
-func TestCheckServiceMonitorCRD(t *testing.T) {
+//
+// It must ALSO tell "the cluster says no" apart from "the cluster could not be
+// asked". Collapsing the two let one 503 from a rolling API server, or one
+// throttled request, permanently disable an explicitly requested feature: every
+// monitor-derived target vanished for the life of the process behind a single
+// startup log line.
+func TestServiceMonitorCRDPresent(t *testing.T) {
 	disc := func(resources ...metav1.APIResource) *discoveryfake.FakeDiscovery {
 		fake := &coretesting.Fake{}
 		if resources != nil {
@@ -27,15 +37,39 @@ func TestCheckServiceMonitorCRD(t *testing.T) {
 		return &discoveryfake.FakeDiscovery{Fake: fake}
 	}
 
-	if err := checkServiceMonitorCRD(disc(metav1.APIResource{Name: "servicemonitors"})); err != nil {
-		t.Errorf("CRD present: %v", err)
+	for _, tc := range []struct {
+		name        string
+		d           discovery.DiscoveryInterface
+		wantPresent bool
+		wantErr     bool
+	}{
+		{"CRD served", disc(metav1.APIResource{Name: "servicemonitors"}), true, false},
+		{"group served without servicemonitors", disc(metav1.APIResource{Name: "prometheusrules"}), false, false},
+		{"group absent", disc(), false, false},
+		{"api server unreachable", errDiscovery{err: errors.New("connection refused")}, false, true},
+		{"api server 503", errDiscovery{err: apierrors.NewServiceUnavailable("rolling")}, false, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			present, err := serviceMonitorCRDPresent(tc.d)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("err = %v, wantErr %v", err, tc.wantErr)
+			}
+			if present != tc.wantPresent {
+				t.Errorf("present = %v, want %v", present, tc.wantPresent)
+			}
+		})
 	}
-	if err := checkServiceMonitorCRD(disc(metav1.APIResource{Name: "prometheusrules"})); err == nil {
-		t.Error("group present without servicemonitors must error")
-	}
-	if err := checkServiceMonitorCRD(disc()); err == nil {
-		t.Error("absent group must error")
-	}
+}
+
+// errDiscovery fails every discovery call. Only ServerResourcesForGroupVersion
+// is exercised, so the embedded nil interface is never dereferenced.
+type errDiscovery struct {
+	discovery.DiscoveryInterface
+	err error
+}
+
+func (e errDiscovery) ServerResourcesForGroupVersion(string) (*metav1.APIResourceList, error) {
+	return nil, e.err
 }
 
 // -scrape-auth-secrets serves Secret keys to anything that can reach the
@@ -71,5 +105,38 @@ func TestLoadScrapeAuthToken(t *testing.T) {
 	got, err := loadScrapeAuthToken(write("token", "s3cr3t\n"))
 	if err != nil || got != "s3cr3t" {
 		t.Fatalf("token = %q, err = %v", got, err)
+	}
+}
+
+// A ServiceMonitor is an instruction to every node agent to issue a GET, and
+// there is no equivalent of prometheus-operator's admin-owned
+// serviceMonitorSelector — so -monitor-namespaces is what stops a tenant who
+// can create a CR in their own namespace from pointing `selector: {}` +
+// `namespaceSelector.any: true` at an arbitrary path cluster-wide.
+func TestMonitorNamespaceGate(t *testing.T) {
+	if got := parseNamespaceSet(""); got != nil {
+		t.Errorf("empty flag = %v, want nil (no restriction)", got)
+	}
+	if got := parseNamespaceSet("  ,  "); got != nil {
+		t.Errorf("blank-only flag = %v, want nil", got)
+	}
+	set := parseNamespaceSet(" monitoring , platform ")
+	if !set["monitoring"] || !set["platform"] || len(set) != 2 {
+		t.Fatalf("parseNamespaceSet = %v", set)
+	}
+
+	mon := func(ns string) *unstructured.Unstructured {
+		return &unstructured.Unstructured{Object: map[string]any{
+			"metadata": map[string]any{"namespace": ns, "name": "m"},
+		}}
+	}
+	if !monitorAllowed(nil, mon("team-a")) {
+		t.Error("nil set must allow everything (backward compatible default)")
+	}
+	if !monitorAllowed(set, mon("monitoring")) {
+		t.Error("listed namespace must be allowed")
+	}
+	if monitorAllowed(set, mon("team-a")) {
+		t.Error("unlisted namespace must be refused")
 	}
 }

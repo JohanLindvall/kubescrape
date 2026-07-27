@@ -86,7 +86,7 @@ manifests — enable deliberately) — see
 | Flag | Default | Description |
 |---|---|---|
 | `-node-name` | `$NODE_NAME` | the node this agent runs on (set via the downward API) |
-| `-listen` | `:8081` | serves `/healthz`, `/readyz`, `/debug/tailer` (per-file positions/lag), `/debug/targets` (last scrape cycle's per-target outcomes, failures first), `/debug/transforms` (active transform program hash) and `/metrics` (Go runtime/process metrics only — `kubescrape_*` metrics are OTLP-pushed); empty disables |
+| `-listen` | `:8081` | serves `/healthz`, `/readyz`, `/debug/tailer` (per-file positions/lag), `/debug/targets` (last scrape cycle's per-target outcomes, failures first), `/debug/transforms` (active transform program hash); empty disables. NOT `/metrics` — the Prometheus endpoint lives on its own `-metrics-listen` port |
 | `-self-metrics-interval` | `1m` | export the agent's own metrics over OTLP at this interval (0 disables); both binaries have this flag |
 | `-metadata-endpoint` | `http://kubescrape.monitoring` | base URL of the metadata service |
 | `-metadata-wait` | `5s` | server-side wait for not-yet-known containers (covers the gap between container start and the kubelet posting its status) |

@@ -13,7 +13,8 @@ Two cooperating services:
   enriched with resource attributes fetched from the metadata service.
 
 Full flag and config-file reference with examples:
-[docs/CONFIGURATION.md](docs/CONFIGURATION.md).
+[docs/CONFIGURATION.md](docs/CONFIGURATION.md). Every `kubescrape_*` metric,
+with its labels: [docs/METRICS.md](docs/METRICS.md).
 
 ## How it works
 
@@ -70,6 +71,12 @@ equivalent cost.
 Metadata for a container by runtime ID. The ID may be bare
 (`4fa6c3d0be…`) or prefixed (`containerd://4fa6c3d0be…`, `docker://…`,
 `cri-o://…`), URL-escaped or not.
+
+> An **unescaped** prefixed ID contains `//`, which Go's `http.ServeMux`
+> collapses — the request is answered with a `307` to the cleaned path rather
+> than directly. Redirect-following clients (and `metaclient`, which escapes
+> the ID) never notice; `curl` needs `-L`, or strip the prefix
+> (`${cid#containerd://}`) / escape it (`containerd%3A%2F%2F…`).
 
 * Blocks up to the wait budget if the ID is unknown; `wait` (a Go duration or
   plain seconds) shortens the server default (`-wait-timeout`), and `wait=0`
@@ -884,7 +891,7 @@ logs: |
 The file is **hot-reloaded** (fsnotify on the directory — mount its
 ConfigMap as a directory, not `subPath`, or updates never arrive — with a
 30s poll fallback): reloads compile-then-commit, so a broken edit keeps the
-last good program running (`kubescrape_transform_reloads_total{result}`),
+last good program running (`kubescrape_transform_reloads_total{outcome}`),
 while a compile failure at startup is fatal. Starlark is hermetic (no I/O,
 no imports) and each run is step-limited, so a pathological script errors
 out instead of wedging an export goroutine

@@ -101,6 +101,17 @@ type endpointSpec struct {
 		Cert               *secretOrCM `json:"cert"`
 		KeySecret          *secretRef  `json:"keySecret"`
 		ServerName         string      `json:"serverName"`
+		// Parsed only to be REPORTED as uninterpreted. These are the
+		// file-path arms of prometheus-operator's TLSConfig, used by every
+		// kube-prometheus-stack control-plane monitor (etcd, kube-scheduler,
+		// kube-controller-manager). The agent reads credentials through the
+		// service's /v1/scrape-auth channel and has no access to files on the
+		// Prometheus pod, so they cannot be honoured — but leaving them
+		// unparsed made an https target silently fall back to the system
+		// trust store and fail every scrape with up=0 as the only signal.
+		CAFile   string `json:"caFile"`
+		CertFile string `json:"certFile"`
+		KeyFile  string `json:"keyFile"`
 	} `json:"tlsConfig"`
 	BasicAuth *struct {
 		Username *secretRef `json:"username"`
@@ -130,6 +141,13 @@ type endpointSpec struct {
 		Action       string   `json:"action"`
 		SourceLabels []string `json:"sourceLabels"`
 		Regex        string   `json:"regex"`
+		// Parsed to be REPORTED, and to SUPPRESS the rule rather than apply
+		// it wrongly: the agent joins sourceLabels with a hardcoded ';', so
+		// honouring a rule that asked for a different separator would build a
+		// different string than the user's regex was written against. For a
+		// keep rule that inverts the intent — it matches nothing and drops
+		// everything the user meant to keep.
+		Separator string `json:"separator"`
 	} `json:"metricRelabelings"`
 }
 
@@ -195,10 +213,21 @@ func (ep endpointSpec) ignoredFields() []string {
 		// interpreted below.
 		add("tlsConfig.ca.configMap", ep.TLSConfig.CA.usesConfigMap())
 		add("tlsConfig.cert.configMap", ep.TLSConfig.Cert.usesConfigMap())
+		// The file-path arms cannot be honoured (the agent has no access to
+		// the Prometheus pod's filesystem) and their absence is not benign:
+		// the target falls back to the system trust store and every scrape
+		// fails verification. Say so.
+		add("tlsConfig.caFile", ep.TLSConfig.CAFile != "")
+		add("tlsConfig.certFile", ep.TLSConfig.CertFile != "")
+		add("tlsConfig.keyFile", ep.TLSConfig.KeyFile != "")
 	}
 	for _, r := range ep.MetricRelabelings {
 		if r.Action != "keep" && r.Action != "drop" {
 			out = append(out, "metricRelabelings.action="+r.Action)
+			continue
+		}
+		if r.Separator != "" && r.Separator != ";" {
+			out = append(out, "metricRelabelings.separator="+r.Separator)
 		}
 	}
 	return out
@@ -231,9 +260,21 @@ func (ep endpointSpec) toEndpoint() Endpoint {
 		out.BearerSecret = ep.BearerTokenSecret.Name + "/" + ep.BearerTokenSecret.Key
 	}
 	for _, r := range ep.MetricRelabelings {
-		if r.Action == "keep" || r.Action == "drop" {
-			out.MetricRelabelings = append(out.MetricRelabelings, RelabelRule(r))
+		if r.Action != "keep" && r.Action != "drop" {
+			continue
 		}
+		// A custom separator is reported (below) and the rule SKIPPED: the
+		// agent joins sourceLabels with ';', so applying the rule anyway
+		// would test the user's regex against a string it was never written
+		// for — silently inverting a keep into a drop-everything.
+		if r.Separator != "" && r.Separator != ";" {
+			continue
+		}
+		out.MetricRelabelings = append(out.MetricRelabelings, RelabelRule{
+			Action:       r.Action,
+			SourceLabels: r.SourceLabels,
+			Regex:        r.Regex,
+		})
 	}
 	return out
 }
@@ -263,6 +304,43 @@ func (m *Monitor) ServiceNamespaces() []string {
 	return []string{m.Namespace}
 }
 
+// specLimits are the monitor-LEVEL guard rails, shared by ServiceMonitor and
+// PodMonitor. They are parsed only to be REPORTED as uninterpreted: they were
+// dropped at parse time, so a user who set sampleLimit specifically to fence
+// off a cardinality bomb got no protection and no warning — and sampleLimit is
+// the very example IgnoredFields' own doc comment cites.
+type specLimits struct {
+	SampleLimit           *uint64  `json:"sampleLimit"`
+	TargetLimit           *uint64  `json:"targetLimit"`
+	LabelLimit            *uint64  `json:"labelLimit"`
+	LabelNameLengthLimit  *uint64  `json:"labelNameLengthLimit"`
+	LabelValueLengthLimit *uint64  `json:"labelValueLengthLimit"`
+	KeepDroppedTargets    *uint64  `json:"keepDroppedTargets"`
+	JobLabel              string   `json:"jobLabel"`
+	TargetLabels          []string `json:"targetLabels"`
+	PodTargetLabels       []string `json:"podTargetLabels"`
+}
+
+// ignored lists the monitor-level fields that are set but not interpreted.
+func (s specLimits) ignored() []string {
+	var out []string
+	add := func(name string, set bool) {
+		if set {
+			out = append(out, name)
+		}
+	}
+	add("sampleLimit", s.SampleLimit != nil)
+	add("targetLimit", s.TargetLimit != nil)
+	add("labelLimit", s.LabelLimit != nil)
+	add("labelNameLengthLimit", s.LabelNameLengthLimit != nil)
+	add("labelValueLengthLimit", s.LabelValueLengthLimit != nil)
+	add("keepDroppedTargets", s.KeepDroppedTargets != nil)
+	add("jobLabel", s.JobLabel != "")
+	add("targetLabels", len(s.TargetLabels) > 0)
+	add("podTargetLabels", len(s.PodTargetLabels) > 0)
+	return out
+}
+
 // smSpec mirrors the ServiceMonitor spec fields we interpret.
 type smSpec struct {
 	Selector          metav1.LabelSelector `json:"selector"`
@@ -270,7 +348,8 @@ type smSpec struct {
 		Any        bool     `json:"any"`
 		MatchNames []string `json:"matchNames"`
 	} `json:"namespaceSelector"`
-	Endpoints []endpointSpec `json:"endpoints"`
+	Endpoints  []endpointSpec `json:"endpoints"`
+	specLimits `json:",inline"`
 }
 
 // Parse converts an unstructured ServiceMonitor.
@@ -294,8 +373,12 @@ func Parse(u *unstructured.Unstructured) (*Monitor, error) {
 		NamespaceAny: spec.NamespaceSelector.Any,
 		Namespaces:   spec.NamespaceSelector.MatchNames,
 	}
+	specIgnored := spec.ignored()
 	for _, ep := range spec.Endpoints {
 		e := ep.toEndpoint()
+		// Monitor-level ignored fields ride on every endpoint; IgnoredFields
+		// dedupes across endpoints, so they are reported exactly once.
+		e.Ignored = append(e.Ignored, specIgnored...)
 		// Every secret reference is namespaced with the MONITOR's namespace: a
 		// monitor may only name secrets in its own namespace, which is what
 		// bounds what /v1/scrape-auth will serve.

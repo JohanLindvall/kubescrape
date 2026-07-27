@@ -43,6 +43,13 @@ var (
 	// visible in one pod's logs.
 	MonitorFieldsIgnored = Registry.CounterVec("kubescrape_monitor_fields_ignored_total",
 		"Monitor upserts whose endpoints set fields kubescrape does not interpret.", "kind")
+	// MonitorParseErrors counts ServiceMonitor/PodMonitor upserts that failed
+	// to parse. This is the SEVERE sibling of MonitorFieldsIgnored: a parse
+	// failure removes the monitor from the index, so every target it
+	// contributed disappears. It had only a log line until now, which left
+	// the worse outcome unalertable while the milder one was counted.
+	MonitorParseErrors = Registry.CounterVec("kubescrape_monitor_parse_errors_total",
+		"Monitor upserts that failed to parse and were dropped from the index.", "kind")
 
 	// BufferTruncated counts bytes destroyed when a damaged or torn segment
 	// tail was truncated at open. A crash mid-append costs one incomplete frame;

@@ -179,7 +179,21 @@ func (s *Store) UpsertPod(p *corev1.Pod) {
 		}
 		m[p.UID] = rec
 	}
-	s.byPodName[pod.Namespace+"/"+pod.Name] = rec
+	// A pod arriving under a name a DIFFERENT live UID still holds means the
+	// old one is gone — its name has been reused, which for a StatefulSet
+	// (stable names, fresh UID per recreation) is routine. Normally its own
+	// Delete event handles that, and client-go synthesizes one from a
+	// DeletedFinalStateUnknown tombstone even across a relist gap. But the
+	// name index is the only place the collision is VISIBLE, and everything
+	// else is keyed by UID: if that delete is ever missed, the old record
+	// keeps its byNode entry and goes on being served as a live scrape target
+	// forever, for a pod that no longer exists. Tombstone it here — the same
+	// path a delete would take, so its containers stay resolvable for the TTL.
+	nameKey := pod.Namespace + "/" + pod.Name
+	if prev := s.byPodName[nameKey]; prev != nil && prev != rec && prev.expireAt.IsZero() {
+		s.deletePodLocked(types.UID(prev.pod.UID))
+	}
+	s.byPodName[nameKey] = rec
 
 	s.claimPodIPLocked(rec, pod, oldIP)
 }
@@ -341,7 +355,10 @@ func cloneOwnerRefs(refs []metav1.OwnerReference) []metav1.OwnerReference {
 func (s *Store) DeletePod(uid types.UID) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.deletePodLocked(uid)
+}
 
+func (s *Store) deletePodLocked(uid types.UID) {
 	rec := s.pods[uid]
 	if rec == nil {
 		return

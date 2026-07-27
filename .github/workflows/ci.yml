@@ -1,0 +1,88 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # The agent links libsystemd (journald is read natively, not via a
+      # journalctl subprocess), so it is the one binary that needs cgo and the
+      # headers. The metadata service stays CGO_ENABLED=0 static.
+      - name: Install libsystemd headers
+        run: sudo apt-get update && sudo apt-get install -y libsystemd-dev
+
+      - run: go build ./...
+      - run: go vet ./...
+
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l . | grep -v '^hack/' || true)
+          if [ -n "$unformatted" ]; then
+            echo "not gofmt'd:"; echo "$unformatted"; exit 1
+          fi
+
+      - run: go test ./...
+
+      # docs/METRICS.md is generated from the registrations; this fails if a
+      # metric was added or renamed without regenerating it.
+      - name: metrics doc is current
+        run: go test ./internal/obs/ -run 'TestMetricsDocIsCurrent|TestDocumentedMetricsExist'
+
+      # Concurrency-touching code (store, metaclient cache, otlpingest) has
+      # targeted race exercises; CLAUDE.md asks for this pass, so run it here
+      # rather than relying on it being remembered locally.
+      - name: go test -race
+        run: CGO_ENABLED=1 go test -race ./internal/store/ ./pkg/metaclient/ ./internal/agent/otlpingest/ ./internal/metrics/ ./internal/logline/ ./pkg/logattrs/
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - run: sudo apt-get update && sudo apt-get install -y libsystemd-dev
+      - uses: golangci/golangci-lint-action@v6
+        with:
+          version: v2.6.0
+
+  helm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4
+      - run: helm lint charts/kubescrape
+      # Render the value combinations that have broken before: staticAttrs
+      # alone once rendered -config plus its ConfigMap but neither the volume
+      # nor the mount, CrashLoopBackOff-ing every node.
+      - name: helm template (value matrix)
+        run: |
+          set -eu
+          for args in \
+            "" \
+            "--set agent.staticAttrs.foo=bar" \
+            "--set networkPolicy.enabled=true" \
+            "--set agent.ingest.enabled=true --set networkPolicy.enabled=true" \
+            "--set service.scrapeAuthSecrets=true --set service.scrapeAuthTokenSecret=tok"; do
+            echo "== helm template $args"
+            out=$(helm template t charts/kubescrape $args)
+            flag=$(printf '%s' "$out" | grep -c 'config=/etc/kubescrape/config/config.yaml' || true)
+            mount=$(printf '%s' "$out" | grep -c 'mountPath: /etc/kubescrape/config' || true)
+            if [ "$flag" != "$mount" ]; then
+              echo "-config flag ($flag) and its volumeMount ($mount) disagree"; exit 1
+            fi
+          done

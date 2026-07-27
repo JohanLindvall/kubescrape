@@ -7,6 +7,8 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -292,7 +294,7 @@ func (s *Scraper) targetInterval(t kubemeta.ScrapeTarget) time.Duration {
 	if t.Interval == "" {
 		return s.cfg.Interval
 	}
-	d, err := time.ParseDuration(t.Interval)
+	d, err := parsePromDuration(t.Interval)
 	if err != nil || d <= 0 {
 		s.warnOnce("interval:"+t.URL, "ignoring invalid scrape interval on target",
 			"url", t.URL, "monitor", t.Monitor, "interval", t.Interval)
@@ -305,20 +307,80 @@ func (s *Scraper) targetInterval(t kubemeta.ScrapeTarget) time.Duration {
 // interval: a scrape outliving its period would overlap the next one.
 func (s *Scraper) targetTimeout(t kubemeta.ScrapeTarget, interval time.Duration) time.Duration {
 	out := s.cfg.Timeout
+	asked := time.Duration(0)
 	if t.ScrapeTimeout != "" {
-		d, err := time.ParseDuration(t.ScrapeTimeout)
+		d, err := parsePromDuration(t.ScrapeTimeout)
 		if err != nil || d <= 0 {
 			s.warnOnce("timeout:"+t.URL, "ignoring invalid scrape timeout on target",
 				"url", t.URL, "monitor", t.Monitor, "scrapeTimeout", t.ScrapeTimeout)
 		} else {
-			out = d
+			out, asked = d, d
 		}
 	}
 	// Clamped to the target's interval AND the agent's own: cycle() waits for
 	// every scrape it started, and Run only ticks after cycle returns, so one
 	// target's long timeout stalls the whole node's scrape loop.
-	return min(out, interval, s.cfg.Interval)
+	//
+	// The agent's own interval is the constraint a user cannot see from their
+	// CR: a monitor at `interval: 5m, scrapeTimeout: 2m` is entirely
+	// self-consistent, yet the timeout still collapses to -scrape-interval
+	// (30s by default) and a slow exporter is cut off. That is a real
+	// limitation of the synchronous cycle, not a misconfiguration — so say so
+	// once instead of quietly handing back a fifth of what was asked for.
+	got := min(out, interval, s.cfg.Interval)
+	if asked > 0 && got < asked {
+		s.warnOnce("timeoutclamp:"+t.URL, "scrape timeout clamped below the monitor's scrapeTimeout; raise -scrape-interval to allow a longer one",
+			"url", t.URL, "monitor", t.Monitor,
+			"scrapeTimeout", asked, "effective", got, "scrapeInterval", s.cfg.Interval)
+	}
+	return got
 }
+
+// parsePromDuration accepts the duration syntax prometheus-operator's CRD
+// validates (`y`, `w`, `d`, `h`, `m`, `s`, `ms`, largest unit first, e.g.
+// "1d12h"), falling back to Go's parser for anything it does not recognise so
+// plain "30s"/"1m30s" keep working.
+//
+// Go's time.ParseDuration rejects y/w/d outright, so an `interval: 1d` — which
+// the API server ACCEPTS, because the CRD's own pattern allows it — used to
+// parse-fail and silently drop the target back to the default cadence.
+func parsePromDuration(s string) (time.Duration, error) {
+	if s == "0" {
+		return 0, nil
+	}
+	m := promDurationRE.FindStringSubmatch(s)
+	if m == nil {
+		// Not the Prometheus shape; let Go try (it also accepts "1h30m",
+		// "500ms" and the fractional forms Prometheus does not).
+		return time.ParseDuration(s)
+	}
+	units := []time.Duration{
+		365 * 24 * time.Hour, // y, as prometheus/common/model defines it
+		7 * 24 * time.Hour,   // w
+		24 * time.Hour,       // d
+		time.Hour,            // h
+		time.Minute,          // m
+		time.Second,          // s
+		time.Millisecond,     // ms
+	}
+	var out time.Duration
+	for i, u := range units {
+		g := m[i+1]
+		if g == "" {
+			continue
+		}
+		n, err := strconv.ParseInt(g, 10, 64)
+		if err != nil {
+			return 0, fmt.Errorf("duration %q: %w", s, err)
+		}
+		out += time.Duration(n) * u
+	}
+	return out, nil
+}
+
+// promDurationRE mirrors prometheus-operator's Duration validation pattern, so
+// exactly the values the API server admits are the values we accept.
+var promDurationRE = regexp.MustCompile(`^(?:([0-9]+)y)?(?:([0-9]+)w)?(?:([0-9]+)d)?(?:([0-9]+)h)?(?:([0-9]+)m)?(?:([0-9]+)s)?(?:([0-9]+)ms)?$`)
 
 // warnOnce logs a per-key message at most once per process, for per-target
 // complaints that would otherwise repeat every cycle forever.

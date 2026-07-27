@@ -108,7 +108,7 @@ func (ki KeyIndex) Parse(lf *Fields) {
 			// or mint label values differently depending on the line format.
 			// The fast path (no escapes) costs one byte scan, no copy.
 			if logfmt.NeedsUnescape(val) {
-				lf.values[string(key)] = string(logfmt.Unescape(nil, val))
+				lf.values[string(key)] = string(logfmt.AppendUnescape(nil, val))
 			} else {
 				lf.values[string(key)] = string(val)
 			}

@@ -4,9 +4,9 @@ go 1.26.3
 
 require (
 	github.com/JohanLindvall/bufpool v0.1.0
-	github.com/JohanLindvall/enrich v0.1.3
-	github.com/JohanLindvall/lightning v0.0.55
-	github.com/JohanLindvall/logfmt v0.0.5
+	github.com/JohanLindvall/enrich v0.1.5
+	github.com/JohanLindvall/lightning v0.0.59
+	github.com/JohanLindvall/logfmt v0.0.12
 	github.com/JohanLindvall/multiline v0.0.10
 	github.com/bmatcuk/doublestar/v4 v4.10.0
 	github.com/cespare/xxhash/v2 v2.3.0
@@ -50,7 +50,6 @@ require (
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/hashicorp/go-version v1.9.0 // indirect
 	github.com/json-iterator/go v1.1.12 // indirect
-	github.com/kr/text v0.2.0 // indirect
 	github.com/modern-go/concurrent v0.0.0-20180306012644-bacd9c7ef1dd // indirect
 	github.com/modern-go/reflect2 v1.0.3-0.20250322232337-35a7c28c31ee // indirect
 	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect
@@ -62,7 +61,7 @@ require (
 	go.opentelemetry.io/collector/featuregate v1.63.0 // indirect
 	go.uber.org/multierr v1.11.0 // indirect
 	go.yaml.in/yaml/v2 v2.4.4 // indirect
-	go.yaml.in/yaml/v3 v3.0.4 // indirect
+	go.yaml.in/yaml/v3 v3.0.5 // indirect
 	golang.org/x/net v0.57.0 // indirect
 	golang.org/x/oauth2 v0.36.0 // indirect
 	golang.org/x/sys v0.47.0 // indirect

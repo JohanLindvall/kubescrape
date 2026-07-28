@@ -503,8 +503,9 @@ Exit status is non-zero on any failure, so a too-greedy drop or scrub regex
 is caught in CI instead of by missing production logs. Like `-check-config`,
 nothing is acquired.
 
-**Log enrichment** (`-enrich`, default true — one switch covering container
-logs, journald and pushed OTLP log bodies). Each exported line is run
+**Log enrichment** (`-enrich`, default true — one switch covering every
+log-producing pipeline: container logs, journald, Kubernetes events, Azure
+diagnostics and pushed OTLP log bodies). Each exported line is run
 through [JohanLindvall/enrich](https://github.com/JohanLindvall/enrich),
 which recognizes JSON (Serilog/Pino/Envoy/Azure envelopes and common key
 spellings), logfmt, and a table of plain-text formats (nginx, klog, redis,

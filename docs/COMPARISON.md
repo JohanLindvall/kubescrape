@@ -70,6 +70,15 @@ fully attributed — the cache-race gap that per-node watchers accept.
 † Cells describe Alloy; Promtail differences are noted inline. Promtail
 itself is EOL — see [Migrating off Promtail](#migrating-off-promtail).
 
+One property of the table that no comparator matches uniformly: the whole
+processing chain — scrubbing, enrichment, attribute lifting, log-derived
+metrics, drop/keep/sample rules, Starlark transforms, routing, disk buffer —
+applies identically to **every log source**: container files, plain host
+files, gzip archives, journald, Kubernetes events and Azure Event Hubs
+diagnostics. Comparators typically wire parsing and enrichment per source
+type, so a rule that works on file tails has to be rebuilt (or is
+unavailable) for their journald or events inputs.
+
 ### Metrics
 
 | | kubescrape | Alloy/Prometheus/vmagent | OTel prometheus receiver |
@@ -151,6 +160,16 @@ alone: 552 MB/s, 21 allocs per 10k-series scrape, constant memory.
 
 **Log-derived metrics**: 229–270 ns/line, ≤1 alloc — µs-scale in the
 comparators (Promtail metrics stage, Vector log_to_metric).
+
+**Cluster-scoped pipelines** (the events/Azure singleton, same committed
+benchmarks): an Azure Event Hubs diagnostics record decodes in ~1.4 µs at
+~1 alloc (the envelope walk itself is 36 ns/record and 0 allocs, via
+lightning's SIMD-backed `ArrayEach`) and runs the FULL log chain — scrub +
+logAttributes + enrich + log-metrics + rules — in ~9.7 µs/record: ≈100k
+records/s on the consumer goroutine, an order of magnitude above realistic
+hub rates; metric records convert to OTLP gauge points at ~1.8 µs/record.
+A Kubernetes event costs ~4 µs end-to-end — invisible at cluster event
+rates (tens per second).
 
 ## Delivery semantics in one paragraph
 

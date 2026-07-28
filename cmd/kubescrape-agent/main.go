@@ -106,7 +106,7 @@ var (
 	// One switch for all three log-producing paths. They were three separate
 	// flags (-logs-enrich/-journald-enrich/-ingest-logs-enrich) for one
 	// feature, all defaulting to true; nothing wanted them to disagree.
-	enrichOn          = flag.Bool("enrich", true, "parse per-line metadata (timestamp, severity, trace/span IDs, exception details) into the OTLP record fields via github.com/JohanLindvall/enrich, for container logs, journald and pushed OTLP log bodies alike")
+	enrichOn          = flag.Bool("enrich", true, "parse per-line metadata (timestamp, severity, trace/span IDs, exception details) into the OTLP record fields via github.com/JohanLindvall/enrich, for container logs, journald, Kubernetes events, Azure diagnostics and pushed OTLP log bodies alike")
 	logDir            = flag.String("log-dir", "/var/log/containers", "directory of containerd log symlinks (the default source when the config's logs section is unset)")
 	positionsFile     = flag.String("positions-file", "", "single file persisting BOTH log offsets and the journald cursor across restarts (empty disables persistence)")
 	logsBatch         = flag.Int("logs-batch-size", 1024, "flush logs after this many entries")

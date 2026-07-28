@@ -163,6 +163,24 @@ var (
 		"Failures reading or writing the event position ConfigMap, by operation (load, save).", "operation")
 )
 
+// Azure diagnostics (the Event Hubs consumer in the cluster-singleton deployment).
+var (
+	AzureRecords = Registry.CounterVec("kubescrape_azure_records_total",
+		"Azure diagnostic records decoded from Event Hubs messages, by kind (log, metric).", "kind")
+	AzureDecodeErrors = Registry.Counter("kubescrape_azure_decode_errors_total",
+		"Event Hubs messages or records that could not be decoded as Azure diagnostics JSON (skipped, committed past).")
+	AzureExported = Registry.CounterVec("kubescrape_azure_exported_total",
+		"Azure diagnostic records exported, by signal (logs, metrics).", "signal")
+	AzureDropped = Registry.Counter("kubescrape_azure_dropped_total",
+		"Azure diagnostic payloads dropped after a permanent collector rejection (the offsets advance past them).")
+	AzureFetchErrors = Registry.Counter("kubescrape_azure_fetch_errors_total",
+		"Kafka fetch errors from the Event Hubs consumer (retried; partial fetches are still processed).")
+	AzureCommitErrors = Registry.Counter("kubescrape_azure_commit_errors_total",
+		"Offset commit failures (the records were delivered; a redelivery produces at-least-once duplicates).")
+	AzureTokenRefreshes = Registry.CounterVec("kubescrape_azure_token_refreshes_total",
+		"Microsoft Entra token refreshes for the Event Hubs connection, by outcome (ok, error).", "outcome")
+)
+
 // HTTP server (metadata service).
 var (
 	HTTPRequests = Registry.CounterVec("kubescrape_http_requests_total",

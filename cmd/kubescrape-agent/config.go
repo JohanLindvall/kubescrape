@@ -192,8 +192,8 @@ func printConfigSummary(cfg agentConfig, log *slog.Logger) {
 
 	log.Info("config is valid",
 		"sections", strings.Join(sections, ","),
-		"pipelines", fmt.Sprintf("logs=%s metrics=%s cadvisor=%s node=%s journald=%s ingest=%s events=%s",
-			on(*logsOn), on(*metricsOn), on(*cadvisorOn), on(*nodeOn), on(*journaldOn), on(*ingestOn), on(*eventsOn)),
+		"pipelines", fmt.Sprintf("logs=%s metrics=%s cadvisor=%s node=%s journald=%s ingest=%s events=%s azure=%s",
+			on(*logsOn), on(*metricsOn), on(*cadvisorOn), on(*nodeOn), on(*journaldOn), on(*ingestOn), on(*eventsOn), on(*azureOn)),
 		"otlp-endpoint", *otlpEndpoint,
 		"otlp-protocol", *otlpProtocol,
 		"buffer-dir", *bufferDir,

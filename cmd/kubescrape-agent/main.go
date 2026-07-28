@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"github.com/JohanLindvall/kubescrape/internal/agent/attrs"
+	"github.com/JohanLindvall/kubescrape/internal/agent/azurediag"
 	"github.com/JohanLindvall/kubescrape/internal/agent/events"
 	"github.com/JohanLindvall/kubescrape/internal/agent/journald"
 	"github.com/JohanLindvall/kubescrape/internal/agent/logscrub"
@@ -151,6 +152,20 @@ var (
 	eventsLeaseNS   = flag.String("events-lease-namespace", "", "namespace for the Lease and position ConfigMap (default: this pod's own, via $POD_NAMESPACE or the ServiceAccount projection)")
 	kubeconfig      = flag.String("kubeconfig", "", "path to a kubeconfig for the events watch; defaults to in-cluster config (only used with -events)")
 
+	// Azure diagnostics: another cluster-scoped pipeline for the singleton
+	// Deployment — but unlike -events it needs NO leader election, because
+	// the Kafka consumer-group protocol is its coordination (each Event Hubs
+	// partition is owned by exactly one group member).
+	azureOn        = flag.Bool("azure-diagnostics", false, "consume Azure diagnostic-settings output (resource logs AND platform metrics) from an Event Hubs namespace over its Kafka endpoint and export it as OTLP. Cluster-scoped: run it in the same singleton Deployment as -events, not in the DaemonSet")
+	azureNamespace = flag.String("azure-eventhub-namespace", "", "Event Hubs namespace host (myns.servicebus.windows.net); derived from the connection string's Endpoint when -azure-eventhub-connection-string-file is set")
+	azureTopics    = flag.String("azure-eventhub-topics", "", "comma-separated event hubs to consume; empty consumes every hub matching ^insights-. (the names diagnostic settings create by default)")
+	azureGroup     = flag.String("azure-eventhub-group", "$Default", "Kafka consumer group; its committed offsets ARE the resume position, shared across restarts and replicas")
+	azureConnFile  = flag.String("azure-eventhub-connection-string-file", "", "file holding an Event Hubs connection string (SASL PLAIN; re-read per connection, so rotation needs no restart); empty authenticates with managed identity (OAUTHBEARER via AKS workload identity when its env is present, else IMDS)")
+	azureClientID  = flag.String("azure-client-id", "", "user-assigned managed identity / workload identity client id (default $AZURE_CLIENT_ID)")
+	azureTenantID  = flag.String("azure-tenant-id", "", "Microsoft Entra tenant for workload identity (default $AZURE_TENANT_ID)")
+	azureStart     = flag.String("azure-start", "end", "where a consumer group with NO committed offsets starts: end (skip the backlog) or start (replay everything the hubs retain)")
+	azurePrefix    = flag.String("azure-metric-prefix", "azure.", "prefix for converted Azure metric names (<prefix><metricname>.<aggregation>)")
+
 	scrapeInterval    = flag.Duration("scrape-interval", 30*time.Second, "Prometheus scrape interval")
 	scrapeTimeout     = flag.Duration("scrape-timeout", 15*time.Second, "per-target scrape timeout")
 	scrapeConcurrency = flag.Int("scrape-concurrency", 4, "concurrent target scrapes")
@@ -252,6 +267,12 @@ func run() error {
 	}
 	if err := events.ValidateStartMode(*eventsStart); err != nil {
 		return err
+	}
+	if err := azurediag.ValidateStartMode(*azureStart); err != nil {
+		return err
+	}
+	if *azureOn && *azureNamespace == "" && *azureConnFile == "" {
+		return fmt.Errorf("-azure-diagnostics is set but neither -azure-eventhub-namespace nor -azure-eventhub-connection-string-file is")
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -583,6 +604,9 @@ func run() error {
 	if err := p.startEvents(); err != nil {
 		return err
 	}
+	if err := p.startAzure(); err != nil {
+		return err
+	}
 	sc := p.startScraper()
 	p.startDebugServer(tl, sc)
 
@@ -780,6 +804,56 @@ func (p *pipelines) startEvents() error {
 	})
 	p.log.Info("kubernetes events enabled", "lease", *eventsLease, "namespace", ns,
 		"positionConfigMap", *eventsConfigMap, "start", *eventsStart)
+	return nil
+}
+
+// gateAzure is satisfied by the first successful Event Hubs poll (the group
+// is joined and the namespace reachable).
+const gateAzure = "azure-eventhub"
+
+// startAzure starts the Azure diagnostics consumer. Cluster-scoped like
+// -events (run it in the same singleton Deployment), but with NO leader
+// election: the Kafka consumer group is its coordination, so replicas > 1
+// simply share partitions.
+func (p *pipelines) startAzure() error {
+	if !*azureOn {
+		return nil
+	}
+	kafka := azurediag.KafkaConfig{
+		Namespace:            *azureNamespace,
+		Group:                *azureGroup,
+		Start:                *azureStart,
+		ConnectionStringFile: *azureConnFile,
+		ClientID:             *azureClientID,
+		TenantID:             *azureTenantID,
+	}
+	if *azureTopics != "" {
+		for _, t := range strings.Split(*azureTopics, ",") {
+			if t = strings.TrimSpace(t); t != "" {
+				kafka.Topics = append(kafka.Topics, t)
+			}
+		}
+	}
+	if err := kafka.Resolve(); err != nil {
+		return fmt.Errorf("azure diagnostics: %w", err)
+	}
+	p.ready.require(gateAzure)
+	reader := azurediag.New(azurediag.Config{
+		Kafka:        kafka,
+		MetricPrefix: *azurePrefix,
+		Enrich:       *enrichOn,
+		Scrub:        p.scrub,
+		LogAttrs:     p.logAttrs,
+		Rules:        p.journalRules, // the same logs.rules chain
+		LogMetrics:   p.logMetrics,
+		Attrs:        p.attrBuilders.Ingest,
+		Exporter:     p.out,
+		Logger:       p.log,
+		Ready:        func() { p.ready.done(gateAzure) },
+	})
+	p.spawn(func() { reader.Run(p.ctx) })
+	p.log.Info("azure diagnostics enabled", "brokers", kafka.Brokers,
+		"topics", kafka.Topics, "group", kafka.Group, "start", kafka.Start)
 	return nil
 }
 

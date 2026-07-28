@@ -61,6 +61,7 @@ fully attributed — the cache-race gap that per-node watchers accept.
 | Arbitrary host files / gzip archives | ✔ / ✔ gzip, **resumable** mid-archive across restarts | ✔ / ✔ gz, bz2, z (since Loki 2.8; whole-file, no resume) | ✔ / ✘ | ✔ / ✘ | ✔ / ✔ |
 | journald | ✔ native (libsystemd) | ✔ | ✔ | ✔ | ✔ |
 | Kubernetes events as logs | ✔ cluster-singleton (leader election), **checkpointed** resume, events land on the involved pod's own resource | ✔ `loki.source.kubernetes_events` | ✘ | ✔ `in_kubernetes_events` | ✔ `k8s_events`/`k8sobjects` (no checkpoint) |
+| Azure diagnostics from Event Hubs | ✔ logs **and metrics→real OTLP gauges**, ARM-resource identity, group-offset resume, connection-string + managed-identity auth | ~ `loki.source.azure_event_hubs` (logs only) | ~ generic `kafka` source | ~ generic `kafka` input | ✔ `azureeventhub` receiver (logs + metrics) |
 | Secret/PII scrubbing | ✔ `logScrubbing` (curated built-ins + custom regexes, pre-enrichment) | ~ `loki.secretfilter` (curated Gitleaks rules + entropy detection; experimental) / config stages | VRL | config | ✔ redaction processor |
 | Per-workload (annotation) log config | ✔ `kubescrape.io/logs` (exclude, multiline, rules, attributes) | ~ PodLogs CRD (GA: per-workload selection/relabeling; no multiline/rule overrides) | ~ `vector.dev/exclude` label + exclude-containers annotation | ~ `fluentbit.io/exclude`, parser annotations | ✘ |
 | Body rewriting / templating | ✔ opt-in (Starlark transforms; the built-in pipeline never modifies bodies) | ✔ | ✔ VRL | ✔ | ✔ OTTL |

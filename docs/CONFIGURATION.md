@@ -24,6 +24,7 @@ manifests live in [deploy/](../deploy).
 - [Agent: log sources](#agent-log-sources)
 - [Agent: journald](#agent-journald)
 - [Agent: Kubernetes events](#agent-kubernetes-events)
+- [Agent: Azure diagnostics](#agent-azure-diagnostics)
 - [Agent: log attributes](#agent-log-attributes)
 - [Agent: log metrics](#agent-log-metrics)
 - [Agent: log scrubbing (PII)](#agent-log-scrubbing)
@@ -102,7 +103,7 @@ manifests — enable deliberately) — see
 | `-log-level` / `-log-format` | `info` / `text` | as for the service |
 
 Pipeline toggles (all default `true` except the opt-in `-journald`,
-`-ingest` and `-events`):
+`-ingest`, `-events` and `-azure-diagnostics`):
 
 | Flag | Enables |
 |---|---|
@@ -112,6 +113,7 @@ Pipeline toggles (all default `true` except the opt-in `-journald`,
 | `-node-metrics` | `<kubelet-endpoint>/metrics` (needs `-kubelet-endpoint`) |
 | `-journald` | systemd journal tailing (default `false`, [below](#agent-journald)) |
 | `-events` | Kubernetes events as OTLP logs (default `false`; **cluster-singleton** — its own Deployment, not the DaemonSet, [below](#agent-kubernetes-events)) |
+| `-azure-diagnostics` | Azure diagnostic-settings logs + metrics from Event Hubs (default `false`; **cluster-scoped** — same singleton Deployment as `-events`, [below](#agent-azure-diagnostics)) |
 
 ## Agent: OTLP export
 
@@ -342,6 +344,74 @@ protection is the watermark.
 
 The whole agent chain applies: `logScrubbing`, `logAttributes`, `-enrich`,
 `logMetrics` (which observe every event, including dropped ones),
+`logs.rules`, Starlark transforms, `routing` and the disk buffer.
+
+## Agent: Azure diagnostics
+
+Opt-in with `-azure-diagnostics`. Azure resources stream their **diagnostic
+settings** output — resource logs and platform metrics — to an Event Hubs
+namespace; the agent consumes it over the namespace's **Kafka endpoint**
+(franz-go, port 9093) and exports OTLP. Like `-events` it is cluster-scoped
+and belongs in the singleton Deployment (`azure.enabled=true` in the chart
+renders it there), not the DaemonSet — but it needs **no leader election**:
+the Kafka consumer group is the coordination (each partition is owned by
+exactly one member), and its **committed offsets are the resume position**,
+shared across restarts and replicas with no ConfigMap. `replicas > 1` simply
+share partitions.
+
+| Flag | Default | Description |
+|---|---|---|
+| `-azure-diagnostics` | `false` | enable the consumer |
+| `-azure-eventhub-namespace` | — | namespace host (`myns.servicebus.windows.net`); may be omitted when the connection string supplies it |
+| `-azure-eventhub-topics` | — | comma-separated hubs; empty consumes every hub matching `^insights-` (the names diagnostic settings create by default) |
+| `-azure-eventhub-group` | `$Default` | consumer group holding the committed offsets |
+| `-azure-eventhub-connection-string-file` | — | file with an Event Hubs connection string → **SASL PLAIN** (re-read per connection, so rotation needs no restart); empty → **managed identity** |
+| `-azure-client-id` | `$AZURE_CLIENT_ID` | user-assigned managed identity / workload identity client id |
+| `-azure-tenant-id` | `$AZURE_TENANT_ID` | Entra tenant for workload identity |
+| `-azure-start` | `end` | where a group with **no committed offsets** starts: `end` (skip the backlog) or `start` (replay everything the hubs retain) |
+| `-azure-metric-prefix` | `azure.` | prefix for converted metric names |
+
+**Auth.** Two paths. A **connection string** authenticates as SASL PLAIN
+(user `$ConnectionString`, the string as the password). **Managed identity**
+authenticates as SASL OAUTHBEARER with a Microsoft Entra token scoped to the
+namespace: AKS **workload identity** when its environment is present (the
+webhook-injected federated token file + `$AZURE_CLIENT_ID`/`$AZURE_TENANT_ID`
+— in the chart, setting `azure.clientId` annotates the ServiceAccount and
+labels the pod so the webhook injects them), else **IMDS** (system-assigned,
+or user-assigned via `-azure-client-id`). Tokens are cached and refreshed
+ahead of expiry; a token-endpoint blip serves the still-valid cached token.
+Both protocols are implemented directly (two small HTTP exchanges) — no
+Azure SDK dependency.
+
+**Records.** Each Event Hubs message is the `{"records":[...]}` envelope;
+every record is classified individually, so logs and metrics may share a
+hub. A **log** record exports with the record's verbatim JSON as the body,
+severity from `level`, and `azure.category`, `azure.operation.name`,
+`azure.result.type`/`.description` (scrubbed), `azure.correlation.id` and
+`azure.tenant.id` as record attributes. A **metric** record — Azure's
+pre-aggregated window statistics — becomes **real OTLP gauge data points**,
+one per present aggregation: `azure.<metricname>.count`/`.total`/`.minimum`/
+`.maximum`/`.average`, with `azure.metric.timegrain` on the data point
+(gauges because each value describes one closed timeGrain window — the shape
+the widely-deployed Prometheus Azure exporters use; `sum_over_time` and
+friends recover longer windows).
+
+**Resource identity.** The ARM resource the record describes becomes the
+OTLP resource: `cloud.provider=azure`, `cloud.resource_id` (verbatim),
+`cloud.account.id` (subscription), `azure.resource_group.name`,
+`azure.resource.type`, `azure.resource.name`, `cloud.region` — with
+`service.name` = the resource name, `service.namespace` = the resource
+group and `service.instance.id` = the lowercased resource ID, so Mimir
+job/instance identity works out of the box and two same-named resources in
+different groups never merge.
+
+**Delivery** is at-least-once: offsets are committed only after the
+collector (or the disk buffer) acknowledges **both** signals of a poll. A
+crash or rebalance before the commit replays the poll (duplicates, never
+loss); a payload the collector permanently rejects — and any undecodable
+message — is counted and committed past, so one poison batch cannot wedge a
+partition. The log path runs the whole shared chain: `logScrubbing` (before
+anything copies from the body), `logAttributes`, `-enrich`, `logMetrics`,
 `logs.rules`, Starlark transforms, `routing` and the disk buffer.
 
 ## Unified config file
@@ -1042,6 +1112,12 @@ the mount `-transforms-file` needs: its dedicated ConfigMap, mounted as a
 directory (not `subPath`). See
 [charts/kubescrape/values.yaml](../charts/kubescrape/values.yaml) for the
 full annotated list.
+
+`azure.enabled: true` rides in the same singleton Deployment as
+`events.enabled` (either renders it): `azure.eventhub.*` maps to the
+`-azure-eventhub-*` flags, `azure.eventhub.connectionStringSecret` mounts
+the secret and passes the file flag, and `azure.clientId` wires workload
+identity (ServiceAccount annotation + pod label).
 
 `events.enabled: true` is the other value that wires more than a flag: it
 renders a separate single-replica Deployment of the agent binary with its own

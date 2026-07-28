@@ -19,6 +19,13 @@ names a metric or a label that is not registered.
 
 | Metric | Labels | Description |
 |---|---|---|
+| `kubescrape_azure_commit_errors_total` | — | Offset commit failures (the records were delivered; a redelivery produces at-least-once duplicates). |
+| `kubescrape_azure_decode_errors_total` | — | Event Hubs messages or records that could not be decoded as Azure diagnostics JSON (skipped, committed past). |
+| `kubescrape_azure_dropped_total` | — | Azure diagnostic payloads dropped after a permanent collector rejection (the offsets advance past them). |
+| `kubescrape_azure_exported_total` | `signal` | Azure diagnostic records exported, by signal (logs, metrics). |
+| `kubescrape_azure_fetch_errors_total` | — | Kafka fetch errors from the Event Hubs consumer (retried; partial fetches are still processed). |
+| `kubescrape_azure_records_total` | `kind` | Azure diagnostic records decoded from Event Hubs messages, by kind (log, metric). |
+| `kubescrape_azure_token_refreshes_total` | `outcome` | Microsoft Entra token refreshes for the Event Hubs connection, by outcome (ok, error). |
 | `kubescrape_buffer_backlog_bytes` | `signal` | Undelivered bytes currently queued in the disk buffer, per signal (what -buffer-max-bytes caps). |
 | `kubescrape_buffer_dropped_total` | `signal` | Buffered batches dropped after a permanent collector rejection (bad payload, auth, unimplemented). |
 | `kubescrape_buffer_full_total` | `signal` | Batches the disk buffer refused because the undelivered backlog is at its cap: back-pressure for logs (the tailer rewinds and re-reads), a lost batch for producers that cannot rewind (scrape, self-metrics, log-metrics). |
@@ -79,4 +86,4 @@ names a metric or a label that is not registered.
 | `kubescrape_transform_errors_total` | `signal` | Transform program invocations that failed (the batch is NOT exported; the error propagates to the producer's retry path). |
 | `kubescrape_transform_reloads_total` | `outcome` | Transforms-file reloads by outcome (applied, failed — a failed compile keeps the last good program). |
 
-59 metrics.
+66 metrics.

@@ -345,5 +345,39 @@ events:
     limits:
       memory: 256Mi
 
+# Azure diagnostic-settings ingestion (resource logs + platform metrics) from
+# an Event Hubs namespace over its Kafka endpoint. Cluster-scoped like
+# events, so it runs in the SAME singleton Deployment (either section's
+# `enabled` renders it) — but it needs no leader election: the Kafka consumer
+# group is the coordination, and its committed offsets are the resume
+# position.
+azure:
+  enabled: false
+  eventhub:
+    # Namespace host (myns.servicebus.windows.net). May be left empty when a
+    # connection string is given — its Endpoint names the namespace.
+    namespace: ""
+    # Hubs to consume; empty consumes every hub matching ^insights-. (the
+    # names diagnostic settings create by default).
+    topics: []
+    # Consumer group holding the committed offsets.
+    group: "$Default"
+    # Secret with an Event Hubs connection string (SASL PLAIN). Leave name
+    # empty to authenticate with managed identity instead (OAUTHBEARER via
+    # AKS workload identity — see clientId below — or IMDS).
+    connectionStringSecret:
+      name: ""
+      key: connection-string
+  # Workload-identity / user-assigned managed identity client id. When set,
+  # the ServiceAccount is annotated azure.workload.identity/client-id and the
+  # pod labelled azure.workload.identity/use=true, so the AKS webhook injects
+  # the federated token the agent exchanges.
+  clientId: ""
+  tenantId: ""
+  # Where a consumer group with NO committed offsets starts: end | start.
+  start: end
+  # Prefix for converted Azure metric names (<prefix><metricname>.<agg>).
+  metricPrefix: "azure."
+
 networkPolicy:
   enabled: true

@@ -1,4 +1,4 @@
-{{- if .Values.events.enabled }}
+{{- if or .Values.events.enabled .Values.azure.enabled }}
 {{- /*
   Kubernetes events are a CLUSTER-SINGLETON pipeline, so they run as their own
   single-replica Deployment of the agent binary with every per-node pipeline
@@ -14,6 +14,11 @@
   Deployed this way the reader still gets the agent's whole delivery chain
   (disk buffer, logs.rules, scrubbing, log-metrics, transforms, routing) and
   enriches through the metadata service exactly as agents do.
+
+  Azure diagnostics (azure.enabled) ride in the SAME Deployment — also a
+  cluster-scoped stream — but need none of the events RBAC and no leader
+  election: the Event Hubs consumer group is the coordination, and its
+  committed offsets are the position.
 */}}
 {{- $cfg := .Values.agent.config | default dict }}
 apiVersion: v1
@@ -22,6 +27,13 @@ metadata:
   name: {{ .Release.Name }}-events
   namespace: {{ .Release.Namespace }}
   labels: {{ include "kubescrape.labels" . | nindent 4 }}
+  {{- if and .Values.azure.enabled .Values.azure.clientId }}
+  annotations:
+    # The AKS workload-identity webhook keys the federated credential off
+    # this annotation (plus the pod label below).
+    azure.workload.identity/client-id: {{ .Values.azure.clientId }}
+  {{- end }}
+{{- if .Values.events.enabled }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
@@ -84,6 +96,7 @@ subjects:
   - kind: ServiceAccount
     name: {{ .Release.Name }}-events
     namespace: {{ .Release.Namespace }}
+{{- end }}
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -106,6 +119,9 @@ spec:
     metadata:
       labels:
         app: {{ .Release.Name }}-events
+        {{- if and .Values.azure.enabled .Values.azure.clientId }}
+        azure.workload.identity/use: "true"
+        {{- end }}
       annotations:
         {{- if $cfg }}
         checksum/config: {{ $cfg | toYaml | sha256sum }}
@@ -134,8 +150,8 @@ spec:
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           command: ["/kubescrape-agent"]
           args:
-            - -events
-            # Every per-node pipeline off: this replica only watches events.
+            # Every per-node pipeline off: this replica only runs the
+            # cluster-scoped ones.
             - -logs=false
             - -metrics=false
             - -cadvisor=false
@@ -145,6 +161,8 @@ spec:
             - -metadata-endpoint=http://{{ .Release.Name }}.{{ .Release.Namespace }}
             - -listen={{ .Values.agent.listen }}
             - -self-metrics-interval={{ .Values.agent.selfMetricsInterval }}
+            {{- if .Values.events.enabled }}
+            - -events
             - -events-lease={{ .Values.events.leaseName }}
             - -events-position-configmap={{ .Values.events.positionConfigMap }}
             - -events-start={{ .Values.events.start }}
@@ -153,6 +171,28 @@ spec:
             - -events-position-interval={{ .Values.events.positionInterval }}
             {{- with .Values.events.namespace }}
             - -events-namespace={{ . }}
+            {{- end }}
+            {{- end }}
+            {{- if .Values.azure.enabled }}
+            - -azure-diagnostics
+            {{- with .Values.azure.eventhub.namespace }}
+            - -azure-eventhub-namespace={{ . }}
+            {{- end }}
+            {{- with .Values.azure.eventhub.topics }}
+            - -azure-eventhub-topics={{ join "," . }}
+            {{- end }}
+            - -azure-eventhub-group={{ .Values.azure.eventhub.group }}
+            {{- if .Values.azure.eventhub.connectionStringSecret.name }}
+            - -azure-eventhub-connection-string-file=/etc/kubescrape/azure-eventhub/{{ .Values.azure.eventhub.connectionStringSecret.key }}
+            {{- end }}
+            {{- with .Values.azure.clientId }}
+            - -azure-client-id={{ . }}
+            {{- end }}
+            {{- with .Values.azure.tenantId }}
+            - -azure-tenant-id={{ . }}
+            {{- end }}
+            - -azure-start={{ .Values.azure.start }}
+            - -azure-metric-prefix={{ .Values.azure.metricPrefix }}
             {{- end }}
             - -otlp-endpoint={{ .Values.agent.otlp.endpoint }}
             - -otlp-protocol={{ .Values.agent.otlp.protocol }}
@@ -207,27 +247,43 @@ spec:
             httpGet: {path: /readyz, port: http}
           livenessProbe:
             httpGet: {path: /healthz, port: http}
-          {{- if $cfg }}
+          {{- $azureSecret := and .Values.azure.enabled .Values.azure.eventhub.connectionStringSecret.name }}
+          {{- $anyVolume := or $cfg .Values.agent.otlp.bearerTokenSecret.name $azureSecret }}
+          {{- if $anyVolume }}
           volumeMounts:
+            {{- if $cfg }}
             - name: config
               mountPath: /etc/kubescrape/config
               readOnly: true
+            {{- end }}
             {{- if .Values.agent.otlp.bearerTokenSecret.name }}
             - name: otlp-token
               mountPath: /etc/kubescrape/otlp-token
               readOnly: true
             {{- end }}
+            {{- if $azureSecret }}
+            - name: azure-eventhub
+              mountPath: /etc/kubescrape/azure-eventhub
+              readOnly: true
+            {{- end }}
           {{- end }}
           resources: {{ toYaml .Values.events.resources | nindent 12 }}
-      {{- if $cfg }}
+      {{- if $anyVolume }}
       volumes:
+        {{- if $cfg }}
         - name: config
           configMap:
             name: {{ .Release.Name }}-agent-config
+        {{- end }}
         {{- if .Values.agent.otlp.bearerTokenSecret.name }}
         - name: otlp-token
           secret:
             secretName: {{ .Values.agent.otlp.bearerTokenSecret.name }}
+        {{- end }}
+        {{- if $azureSecret }}
+        - name: azure-eventhub
+          secret:
+            secretName: {{ .Values.azure.eventhub.connectionStringSecret.name }}
         {{- end }}
       {{- end }}
 {{- if .Values.networkPolicy.enabled }}

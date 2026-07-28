@@ -1,4 +1,7 @@
-# Kubernetes events as OTLP logs — a CLUSTER-SINGLETON pipeline.
+# Kubernetes events as OTLP logs — a CLUSTER-SINGLETON pipeline. Azure
+# diagnostics (-azure-diagnostics, see the commented args below) belong in
+# this same Deployment: also cluster-scoped, but coordinated by its Kafka
+# consumer group rather than the leader election.
 #
 # This is the agent BINARY run as its own single-replica Deployment with every
 # per-node pipeline off, deliberately NOT part of the DaemonSet: putting it
@@ -106,6 +109,14 @@ spec:
             - -metadata-endpoint=http://kubescrape.monitoring
             - -otlp-endpoint=otel-collector.monitoring:4317
             - -listen=:8081
+            # Azure diagnostics from Event Hubs (logs + metrics). Uncomment,
+            # and either mount a connection-string secret …
+            #- -azure-diagnostics
+            #- -azure-eventhub-connection-string-file=/etc/kubescrape/azure-eventhub/connection-string
+            # … or use managed identity (AKS workload identity: annotate this
+            # ServiceAccount with azure.workload.identity/client-id and label
+            # the pod azure.workload.identity/use: "true"):
+            #- -azure-eventhub-namespace=myns.servicebus.windows.net
           env:
             # Required by the agent for its own self-metrics identity; events
             # never carry this reader's node.

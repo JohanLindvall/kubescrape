@@ -352,6 +352,17 @@ namespace: per route a distinct endpoint and/or extra headers (e.g.
 chain. Route destinations are direct (unbuffered) — the default chain keeps
 the `-buffer-dir` durability.
 
+### Azure Event Hubs (`loki.source.azure_event_hubs`)
+
+`loki.source.azure_event_hubs` maps to `-azure-diagnostics` in the same
+singleton Deployment — with two differences in kubescrape's favour: metric
+records are converted to **real OTLP gauge data points** rather than shipped
+as log lines, and both signals land on the **ARM resource's own identity**
+(`cloud.resource_id`, subscription, resource group, `service.name`). Auth
+covers the same connection-string path plus managed identity (workload
+identity/IMDS). See
+[Agent: Azure diagnostics](CONFIGURATION.md#agent-azure-diagnostics).
+
 ### Kubernetes events (`loki.source.kubernetes_events`)
 
 `loki.source.kubernetes_events` maps to `-events` — but note the shape

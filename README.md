@@ -765,6 +765,28 @@ chooses the cold-start behaviour when no position exists at all
 `logAttributes`, `-enrich`, `logMetrics`, `logs.rules`, Starlark transforms,
 routing and the disk buffer.
 
+**Azure diagnostics** (opt-in `-azure-diagnostics`). Azure resources stream
+their diagnostic-settings output — resource **logs** and platform **metrics**
+— to an Event Hubs namespace; the agent consumes it over the namespace's
+Kafka endpoint (franz-go) and exports OTLP. It is cluster-scoped like
+`-events` and runs in the **same singleton Deployment** (`azure.enabled` in
+the chart), but needs no leader election: the Kafka **consumer group** is the
+coordination, and its committed offsets are the resume position — shared
+across restarts and replicas, committed only after the collector acks
+(at-least-once; poison payloads are counted and skipped). Auth is either an
+Event Hubs **connection string** (SASL PLAIN, mounted secret, re-read per
+connection) or **managed identity** (SASL OAUTHBEARER — AKS workload
+identity when its environment is present, else IMDS; no Azure SDK, the two
+token exchanges are implemented directly). Log records keep the diagnostic
+record's verbatim JSON as the body — the full chain applies (scrubbing,
+`logAttributes`, `-enrich`, `logMetrics`, `logs.rules`, transforms, routing,
+disk buffer) — while metric records become **real OTLP gauges**
+(`azure.<metricname>.count/.total/.minimum/.maximum/.average` per timeGrain
+window). Both land on the **ARM resource's own identity**:
+`cloud.resource_id`, subscription, resource group, type and name, with
+`service.name`/`service.namespace`/`service.instance.id` derived so Azure
+resources sit beside Kubernetes workloads in the same backend.
+
 **OTLP ingest** (opt-in `-ingest`). Applications on the node can push their
 own OTLP to the local agent, which enriches it with Kubernetes attributes and
 forwards it — closing the gap that otherwise needs a separate collector with
@@ -821,7 +843,8 @@ traceSampling:
 **Pipeline toggles.** Each pipeline is individually switchable: `-logs`,
 `-metrics` (annotation-discovered targets), `-cadvisor` and `-node-metrics`
 (all default true; the kubelet scrapes additionally require
-`-kubelet-endpoint`), plus the opt-in `-journald`, `-ingest` and `-events`.
+`-kubelet-endpoint`), plus the opt-in `-journald`, `-ingest`, `-events` and
+`-azure-diagnostics`.
 
 **Self-observability.** The agent's own metrics — log entries/bytes/rotations
 and export failures, enrichment hit rates per format, scrapes and scrape

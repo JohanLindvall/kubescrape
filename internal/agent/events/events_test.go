@@ -333,24 +333,24 @@ func TestColdStartModes(t *testing.T) {
 		return true, &corev1.EventList{ListMeta: metav1.ListMeta{ResourceVersion: "424242"}}, nil
 	})
 	r := New(Config{Client: client, StartMode: StartEnd})
-	rv, err := r.startResourceVersion(context.Background())
+	rv, redelivers, err := r.startResourceVersion(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if rv != "424242" {
-		t.Fatalf("end mode must start at the current revision, got %q", rv)
+	if rv != "424242" || redelivers {
+		t.Fatalf("end mode must start at the current revision without redelivery, got %q/%v", rv, redelivers)
 	}
 
 	r = New(Config{Client: client, StartMode: StartBeginning})
-	if rv, err = r.startResourceVersion(context.Background()); err != nil || rv != "" {
-		t.Fatalf("start mode must replay from the oldest available (rv=%q, err=%v)", rv, err)
+	if rv, redelivers, err = r.startResourceVersion(context.Background()); err != nil || rv != "" || !redelivers {
+		t.Fatalf("start mode must replay from the oldest available (rv=%q, redelivers=%v, err=%v)", rv, redelivers, err)
 	}
 
 	// A stored position always wins over the start mode.
 	r = New(Config{Client: client, StartMode: StartEnd})
 	r.committed.ResourceVersion = "77"
-	if rv, err = r.startResourceVersion(context.Background()); err != nil || rv != "77" {
-		t.Fatalf("a stored position must win (rv=%q, err=%v)", rv, err)
+	if rv, redelivers, err = r.startResourceVersion(context.Background()); err != nil || rv != "77" || !redelivers {
+		t.Fatalf("a stored position must win and redeliver (rv=%q, redelivers=%v, err=%v)", rv, redelivers, err)
 	}
 }
 
@@ -368,13 +368,22 @@ func TestExpiryRelistsRatherThanSkippingAhead(t *testing.T) {
 	r.committed.Watermark = time.Now().Add(-time.Minute) // something was exported
 
 	r.expire("watch")
-	rv, err := r.startResourceVersion(context.Background())
+	rv, _, err := r.startResourceVersion(context.Background())
 	if err != nil || rv != "" {
 		t.Fatalf("after Gone the reader must relist from the oldest available (rv=%q, err=%v)", rv, err)
 	}
-	// Only once. A later cold expiry falls back to the start policy.
-	if rv, err = r.startResourceVersion(context.Background()); err != nil || rv != "999" {
-		t.Fatalf("the relist is one-shot (rv=%q, err=%v)", rv, err)
+	// The relist SURVIVES a failed attempt: a watch that dies before anything
+	// commits must relist again, or the gap is lost after all.
+	if rv, _, err = r.startResourceVersion(context.Background()); err != nil || rv != "" {
+		t.Fatalf("an uncommitted relist must persist (rv=%q, err=%v)", rv, err)
+	}
+	// A commit secures the replay and disarms it.
+	r.settle(entry{rv: "1001", when: time.Now()})
+	if rv, _, err = r.startResourceVersion(context.Background()); err != nil || rv != "1001" {
+		t.Fatalf("after a commit the reader resumes from it (rv=%q, err=%v)", rv, err)
+	}
+	if r.relist {
+		t.Fatal("a commit must disarm the relist")
 	}
 
 	// Nothing exported yet: with a zero watermark a replay is unfiltered, so
@@ -382,7 +391,48 @@ func TestExpiryRelistsRatherThanSkippingAhead(t *testing.T) {
 	r = New(Config{Client: client, StartMode: StartEnd})
 	r.committed.ResourceVersion = "77"
 	r.expire("watch")
-	if rv, err = r.startResourceVersion(context.Background()); err != nil || rv != "999" {
+	if rv, _, err = r.startResourceVersion(context.Background()); err != nil || rv != "999" {
 		t.Fatalf("a watermark-less expiry must honour the start mode (rv=%q, err=%v)", rv, err)
+	}
+}
+
+// A restarted stream that resumes from the committed position re-delivers
+// everything already buffered — retaining the batch would export the whole
+// backlog once per restart and grow memory without bound while the collector
+// is down. Only the cold skip-the-backlog start, whose revision is past the
+// buffered entries, may keep them.
+func TestRestartDropsRedeliveredBatch(t *testing.T) {
+	newStopped := func() *fake.Clientset {
+		client := fake.NewSimpleClientset()
+		client.PrependReactor("list", "events", func(k8stesting.Action) (bool, runtime.Object, error) {
+			return true, &corev1.EventList{ListMeta: metav1.ListMeta{ResourceVersion: "500"}}, nil
+		})
+		w := watch.NewFake()
+		w.Stop() // the stream sees a closed channel and returns right away
+		client.PrependWatchReactor("events", k8stesting.DefaultWatchReactor(w, nil))
+		return client
+	}
+
+	// Redelivering restart (a committed position): batch and stale bookmark go.
+	r := New(Config{Client: newStopped(), Exporter: &captureExporter{}})
+	r.committed.ResourceVersion = "77"
+	r.batch = []entry{{rv: "80"}, {rv: "81"}}
+	r.pendingRV = "99"
+	if err := r.stream(context.Background()); err == nil {
+		t.Fatal("the pre-stopped watch must end the stream")
+	}
+	if len(r.batch) != 0 || r.pendingRV != "" {
+		t.Fatalf("batch=%d pendingRV=%q, want the redelivered backlog dropped", len(r.batch), r.pendingRV)
+	}
+
+	// Cold skip-the-backlog restart: the new revision is PAST the buffered
+	// entries — they are not re-delivered and must be retained.
+	r = New(Config{Client: newStopped(), Exporter: &captureExporter{}, StartMode: StartEnd})
+	r.batch = []entry{{rv: "80"}}
+	if err := r.stream(context.Background()); err == nil {
+		t.Fatal("the pre-stopped watch must end the stream")
+	}
+	if len(r.batch) != 1 {
+		t.Fatalf("batch=%d, want the un-redelivered entry retained", len(r.batch))
 	}
 }

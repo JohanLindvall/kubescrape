@@ -158,7 +158,7 @@ var (
 	// partition is owned by exactly one group member).
 	azureOn        = flag.Bool("azure-diagnostics", false, "consume Azure diagnostic-settings output (resource logs AND platform metrics) from an Event Hubs namespace over its Kafka endpoint and export it as OTLP. Cluster-scoped: run it in the same singleton Deployment as -events, not in the DaemonSet")
 	azureNamespace = flag.String("azure-eventhub-namespace", "", "Event Hubs namespace host (myns.servicebus.windows.net); derived from the connection string's Endpoint when -azure-eventhub-connection-string-file is set")
-	azureTopics    = flag.String("azure-eventhub-topics", "", "comma-separated event hubs to consume; empty consumes every hub matching ^insights-. (the names diagnostic settings create by default)")
+	azureTopics    = flag.String("azure-eventhub-topics", "", "comma-separated event hubs to consume; empty consumes every hub matching ^insights-.* (the names diagnostic settings create by default)")
 	azureGroup     = flag.String("azure-eventhub-group", "$Default", "Kafka consumer group; its committed offsets ARE the resume position, shared across restarts and replicas")
 	azureConnFile  = flag.String("azure-eventhub-connection-string-file", "", "file holding an Event Hubs connection string (SASL PLAIN; re-read per connection, so rotation needs no restart); empty authenticates with managed identity (OAUTHBEARER via AKS workload identity when its env is present, else IMDS)")
 	azureClientID  = flag.String("azure-client-id", "", "user-assigned managed identity / workload identity client id (default $AZURE_CLIENT_ID)")

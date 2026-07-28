@@ -129,10 +129,14 @@ func (r *Reader) Run(ctx context.Context) {
 			backoff = r.sleep(ctx, backoff)
 			continue
 		}
+		started := time.Now()
 		err = r.consume(ctx, src)
 		src.close()
 		if ctx.Err() != nil {
 			return
+		}
+		if time.Since(started) >= 30*time.Second {
+			backoff = r.cfg.RetryBackoff // a healthy consumer resets the backoff
 		}
 		r.log.Warn("event hubs consumer stopped; reopening", "error", err, "backoff", backoff)
 		backoff = r.sleep(ctx, backoff)
@@ -241,7 +245,12 @@ func (r *Reader) export(ctx context.Context, signal string, count int, send func
 		return true
 	default:
 		if ctx.Err() == nil {
-			obs.LogExportFailures.Inc()
+			if signal == "logs" {
+				// The metrics signal is already counted by the client layer's
+				// obs.Exports{metrics,error}; kubescrape_log_export_failures
+				// must not absorb it.
+				obs.LogExportFailures.Inc()
+			}
 			r.log.Warn("exporting azure diagnostics", "signal", signal, "error", err)
 		}
 		return false

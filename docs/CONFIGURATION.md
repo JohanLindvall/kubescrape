@@ -363,7 +363,7 @@ share partitions.
 |---|---|---|
 | `-azure-diagnostics` | `false` | enable the consumer |
 | `-azure-eventhub-namespace` | — | namespace host (`myns.servicebus.windows.net`); may be omitted when the connection string supplies it |
-| `-azure-eventhub-topics` | — | comma-separated hubs; empty consumes every hub matching `^insights-` (the names diagnostic settings create by default) |
+| `-azure-eventhub-topics` | — | comma-separated hubs; empty consumes every hub matching `^insights-.*` (the names diagnostic settings create by default) |
 | `-azure-eventhub-group` | `$Default` | consumer group holding the committed offsets |
 | `-azure-eventhub-connection-string-file` | — | file with an Event Hubs connection string → **SASL PLAIN** (re-read per connection, so rotation needs no restart); empty → **managed identity** |
 | `-azure-client-id` | `$AZURE_CLIENT_ID` | user-assigned managed identity / workload identity client id |
@@ -381,7 +381,9 @@ labels the pod so the webhook injects them), else **IMDS** (system-assigned,
 or user-assigned via `-azure-client-id`). Tokens are cached and refreshed
 ahead of expiry; a token-endpoint blip serves the still-valid cached token.
 Both protocols are implemented directly (two small HTTP exchanges) — no
-Azure SDK dependency.
+Azure SDK dependency. On the Azure side the identity needs the **Azure Event
+Hubs Data Receiver** role on the namespace (or hub); a connection string
+needs a policy with the **Listen** claim.
 
 **Records.** Each Event Hubs message is the `{"records":[...]}` envelope;
 every record is classified individually, so logs and metrics may share a

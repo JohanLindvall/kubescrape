@@ -348,16 +348,16 @@ events:
 # Azure diagnostic-settings ingestion (resource logs + platform metrics) from
 # an Event Hubs namespace over its Kafka endpoint. Cluster-scoped like
 # events, so it runs in the SAME singleton Deployment (either section's
-# `enabled` renders it) — but it needs no leader election: the Kafka consumer
-# group is the coordination, and its committed offsets are the resume
-# position.
+# `enabled` renders it; replica count and scheduling come from `events.*`) —
+# but it needs no leader election: the Kafka consumer group is the
+# coordination, and its committed offsets are the resume position.
 azure:
   enabled: false
   eventhub:
     # Namespace host (myns.servicebus.windows.net). May be left empty when a
     # connection string is given — its Endpoint names the namespace.
     namespace: ""
-    # Hubs to consume; empty consumes every hub matching ^insights-. (the
+    # Hubs to consume; empty consumes every hub matching ^insights-.* (the
     # names diagnostic settings create by default).
     topics: []
     # Consumer group holding the committed offsets.

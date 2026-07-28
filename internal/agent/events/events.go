@@ -226,9 +226,22 @@ func (r *Reader) loadPosition(ctx context.Context) {
 
 // stream establishes one watch and consumes it until it ends.
 func (r *Reader) stream(ctx context.Context) error {
-	rv, err := r.startResourceVersion(ctx)
+	rv, redelivers, err := r.startResourceVersion(ctx)
 	if err != nil {
 		return err
+	}
+	if redelivers && len(r.batch) > 0 {
+		// Everything buffered is AFTER rv (entries only outlive a flush that
+		// failed, and the position never advanced past them), so this watch
+		// re-sends every one of them. Keeping the batch would duplicate the
+		// whole backlog once per restart and grow memory without bound across
+		// a long collector outage; dropping it loses nothing — the entries
+		// are re-ingested from the re-delivery. Only the cold skip-backlog
+		// path (redelivers=false) starts past the buffered entries and must
+		// retain them.
+		clear(r.batch)
+		r.batch = r.batch[:0]
+		r.pendingRV = "" // a bookmark from the dead stream vouches only for its own deliveries
 	}
 	w, err := r.cfg.Client.CoreV1().Events(r.cfg.Namespace).Watch(ctx, metav1.ListOptions{
 		ResourceVersion: rv,
@@ -273,10 +286,13 @@ func (r *Reader) stream(ctx context.Context) error {
 }
 
 // startResourceVersion resolves where this watch begins: the committed
-// position, or the start policy on a cold start.
-func (r *Reader) startResourceVersion(ctx context.Context) (string, error) {
+// position, or the start policy on a cold start. redelivers reports whether
+// the new watch re-sends everything the reader has already buffered — true
+// for every path except the cold skip-the-backlog List, whose revision is
+// AFTER anything currently batched.
+func (r *Reader) startResourceVersion(ctx context.Context) (rv string, redelivers bool, err error) {
 	if r.committed.ResourceVersion != "" {
-		return r.committed.ResourceVersion, nil
+		return r.committed.ResourceVersion, true, nil
 	}
 	if r.relist {
 		// Recovering from a Gone, not starting cold: replay everything the API
@@ -284,22 +300,24 @@ func (r *Reader) startResourceVersion(ctx context.Context) (string, error) {
 		// exported. Taking the CURRENT revision instead (what the cold-start
 		// policy does) would silently lose every event between the expired
 		// version and now — precisely the window a relist exists to cover.
-		r.relist = false
-		return "", nil
+		// The flag is NOT consumed here: a watch attempt that fails before
+		// anything commits must relist again, or the gap is lost after all —
+		// it clears only when a commit secures the replay (settle/bookmark).
+		return "", true, nil
 	}
 	if r.cfg.StartMode == StartBeginning {
 		// "" replays everything the API server still holds (the event TTL).
-		return "", nil
+		return "", true, nil
 	}
 	// Skip the backlog: take a resourceVersion without the items. Persisting
 	// this later is legitimate — everything after it is either exported or
 	// replayed — but nothing before it was ever consumed.
 	list, err := r.cfg.Client.CoreV1().Events(r.cfg.Namespace).List(ctx, metav1.ListOptions{Limit: 1})
 	if err != nil {
-		return "", err
+		return "", false, err
 	}
 	r.log.Info("starting events at the current revision", "resourceVersion", list.ResourceVersion)
-	return list.ResourceVersion, nil
+	return list.ResourceVersion, false, nil
 }
 
 // expire drops the committed resourceVersion so the next stream relists,
@@ -331,6 +349,7 @@ func (r *Reader) handle(ctx context.Context, ev watch.Event) error {
 			r.pendingRV = o.ResourceVersion
 			if len(r.batch) == 0 {
 				r.committed.ResourceVersion = o.ResourceVersion
+				r.relist = false // a bookmark covers everything before it
 			}
 		}
 		return nil
@@ -414,6 +433,11 @@ func (r *Reader) settle(newest entry) {
 	}
 	if newest.when.After(r.committed.Watermark) {
 		r.committed.Watermark = newest.when
+	}
+	if r.committed.ResourceVersion != "" {
+		// The replay (if one was pending) is secured up to this position: a
+		// restart resumes from it instead of relisting the full TTL again.
+		r.relist = false
 	}
 }
 

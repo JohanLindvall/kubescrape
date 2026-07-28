@@ -144,16 +144,18 @@ func New(cfg Config) (*Client, error) {
 	if cfg.CompressionLevel != 0 {
 		setGzipLevel(cfg.CompressionLevel)
 	}
-	// A client certificate on a plaintext connection is a security control
-	// that silently does nothing: gRPC with Insecure discards the whole TLS
-	// config, and an http:// endpoint never handshakes. Refuse loudly — the
-	// operator who mounted a cert wants mTLS, not a no-op.
-	if cfg.ClientCertFile != "" {
+	// TLS material on a plaintext connection is a security control that
+	// silently does nothing: gRPC with Insecure discards the whole TLS config,
+	// and an http:// endpoint never handshakes. Refuse loudly — an operator who
+	// mounted a CA bundle or a client certificate wants TLS, not a no-op, and
+	// the failure they would otherwise get is "telemetry shipped in cleartext",
+	// which nothing surfaces.
+	if material := tlsMaterial(cfg); material != "" {
 		if cfg.Protocol == "grpc" && cfg.Insecure {
-			return nil, fmt.Errorf("clientCertFile is set but the gRPC connection is plaintext; set insecure=false (-otlp-insecure=false) for this destination")
+			return nil, fmt.Errorf("%s is set but the gRPC connection is plaintext; set insecure=false (-otlp-insecure=false) for this destination", material)
 		}
 		if cfg.Protocol == "http" && strings.HasPrefix(cfg.Endpoint, "http://") {
-			return nil, fmt.Errorf("clientCertFile is set but endpoint %q is plain http; use https://", cfg.Endpoint)
+			return nil, fmt.Errorf("%s is set but endpoint %q is plain http; use https://", material, cfg.Endpoint)
 		}
 	}
 	c := &Client{cfg: cfg}
@@ -216,6 +218,20 @@ func New(cfg Config) (*Client, error) {
 		return nil, fmt.Errorf("protocol %q (want grpc or http)", cfg.Protocol)
 	}
 	return c, nil
+}
+
+// tlsMaterial names the TLS setting a destination carries, or "" when it
+// carries none. Only material that is USED for the handshake counts:
+// InsecureSkipVerify is a relaxation, not a control, so a plaintext
+// connection carrying it is not a misconfiguration worth refusing.
+func tlsMaterial(cfg Config) string {
+	switch {
+	case cfg.ClientCertFile != "":
+		return "clientCertFile"
+	case cfg.CAFile != "":
+		return "caFile"
+	}
+	return ""
 }
 
 func buildTLS(cfg Config) (*tls.Config, error) {

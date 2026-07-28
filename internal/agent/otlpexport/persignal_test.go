@@ -3,8 +3,15 @@ package otlpexport
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
+	"math/big"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -106,5 +113,82 @@ func TestClientCertOnPlaintextRefused(t *testing.T) {
 	// Validate (shape-only) catches a scheme-less http override endpoint.
 	if err := (&ExportConfig{Logs: &ExportOverride{Protocol: "http", Endpoint: "loki:3100"}}).Validate(); err == nil {
 		t.Fatal("http override endpoint without a scheme must fail Validate")
+	}
+}
+
+// The collectorless shape — a client certificate plus an override for EVERY
+// signal — must start under the default flags (-otlp-protocol=grpc,
+// -otlp-insecure=true). The base is then unreachable, so building it (and
+// refusing it for carrying a cert on a plaintext connection) would reject the
+// documented config for a destination nothing can ever send to.
+func TestAllSignalsOverriddenSkipsUnreachableDefault(t *testing.T) {
+	cert, key := writeKeyPair(t)
+	base := Config{Endpoint: "otel-collector.monitoring:4317", Protocol: "grpc", Insecure: true}
+	no := false
+	ps, err := BuildExporter(base, &ExportConfig{
+		ClientCertFile: cert, ClientKeyFile: key,
+		Logs:    &ExportOverride{Endpoint: "https://loki.example.com/otlp", Protocol: "http"},
+		Metrics: &ExportOverride{Endpoint: "https://mimir.example.com/otlp", Protocol: "http"},
+		Traces:  &ExportOverride{Endpoint: "tempo.example.com:4317", Insecure: &no},
+	})
+	if err != nil {
+		t.Fatalf("fully-overridden config must start: %v", err)
+	}
+	defer func() { _ = ps.Close() }()
+	if ps.Default != nil {
+		t.Fatal("no signal can reach the default; it must not be built")
+	}
+	// Every signal still resolves to a non-nil client.
+	if ps.logsClient() == nil || ps.metricsClient() == nil || ps.tracesClient() == nil {
+		t.Fatal("a signal resolved to a nil client")
+	}
+
+	// But leave ONE signal on the base and the cert genuinely would be unused
+	// there — that must still be refused rather than silently ignored.
+	if _, err := BuildExporter(base, &ExportConfig{
+		ClientCertFile: cert, ClientKeyFile: key,
+		Logs:    &ExportOverride{Endpoint: "https://loki.example.com/otlp", Protocol: "http"},
+		Metrics: &ExportOverride{Endpoint: "https://mimir.example.com/otlp", Protocol: "http"},
+	}); err == nil {
+		t.Fatal("a reachable plaintext default carrying a client cert must be refused")
+	}
+}
+
+// writeKeyPair writes a throwaway self-signed certificate and key, for the
+// TLS-carrying destinations that actually load the pair.
+func writeKeyPair(t *testing.T) (certFile, keyFile string) {
+	t.Helper()
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject:      pkix.Name{CommonName: "kubescrape-test"},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(time.Hour),
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	certFile, keyFile = dir+"/c.crt", dir+"/c.key"
+	writePEM(t, certFile, &pem.Block{Type: "CERTIFICATE", Bytes: der})
+	writePEM(t, keyFile, &pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)})
+	return certFile, keyFile
+}
+
+func writePEM(t *testing.T, path string, b *pem.Block) {
+	t.Helper()
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := pem.Encode(f, b); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
 	}
 }

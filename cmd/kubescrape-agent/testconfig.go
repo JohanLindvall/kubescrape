@@ -147,6 +147,10 @@ func runConfigCase(cfg agentConfig, scrubber *logscrub.Scrubber, extractor *loga
 	}
 
 	// Build the record the way flush.go does: line attrs, then enrichment.
+	// Not modelled: the tailer's per-ENTRY facts (log.iostream, log.truncated,
+	// log.multiline.match, log.file.*) and pod-annotation rules. Those are
+	// runtime data rather than config, so a case cannot produce them — a rule
+	// keyed on one of them is outside what this harness can prove.
 	extracted := extractor.Extract(body)
 	ld := plog.NewLogs()
 	rl := ld.ResourceLogs().AppendEmpty()

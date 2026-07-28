@@ -2,10 +2,12 @@ package main
 
 import (
 	"errors"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -138,5 +140,70 @@ func TestMonitorNamespaceGate(t *testing.T) {
 	}
 	if monitorAllowed(set, mon("team-a")) {
 		t.Error("unlisted namespace must be refused")
+	}
+}
+
+// rotatingToken: a changed file promotes the old token to a grace-window
+// second value, and the window expires. Without the grace, agents (which
+// re-read on their own cadence) would 401 until they happened to reload.
+func TestRotatingTokenGraceWindow(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "token")
+	if err := os.WriteFile(path, []byte("old-token\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	rt := &rotatingToken{path: path, log: slog.Default(), cur: "old-token", fetched: time.Now()}
+
+	if got := rt.tokens(); len(got) != 1 || got[0] != "old-token" {
+		t.Fatalf("fresh: %v, want [old-token]", got)
+	}
+
+	// Rotate the file; the cached value is still fresh, so nothing changes yet.
+	if err := os.WriteFile(path, []byte("new-token\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got := rt.tokens(); len(got) != 1 || got[0] != "old-token" {
+		t.Fatalf("within the read interval: %v, want the cached [old-token]", got)
+	}
+
+	// Past the read interval: both are accepted.
+	rt.mu.Lock()
+	rt.fetched = time.Now().Add(-2 * scrapeAuthReadInterval)
+	rt.mu.Unlock()
+	got := rt.tokens()
+	if len(got) != 2 || got[0] != "new-token" || got[1] != "old-token" {
+		t.Fatalf("during the grace window: %v, want [new-token old-token]", got)
+	}
+
+	// A re-read that finds no change must not re-arm the window.
+	rt.mu.Lock()
+	rt.fetched = time.Now().Add(-2 * scrapeAuthReadInterval)
+	until := rt.prevUntil
+	rt.mu.Unlock()
+	rt.tokens()
+	rt.mu.Lock()
+	reArmed := rt.prevUntil.After(until)
+	rt.mu.Unlock()
+	if reArmed {
+		t.Fatal("an unchanged re-read must not extend the grace window")
+	}
+
+	// Past the window: only the current token.
+	rt.mu.Lock()
+	rt.prevUntil = time.Now().Add(-time.Second)
+	rt.mu.Unlock()
+	if got := rt.tokens(); len(got) != 1 || got[0] != "new-token" {
+		t.Fatalf("after the grace window: %v, want [new-token]", got)
+	}
+
+	// An unreadable file keeps the last good token rather than 401ing the fleet.
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	rt.mu.Lock()
+	rt.fetched = time.Now().Add(-2 * scrapeAuthReadInterval)
+	rt.mu.Unlock()
+	if got := rt.tokens(); len(got) != 1 || got[0] != "new-token" {
+		t.Fatalf("unreadable file: %v, want the last good [new-token]", got)
 	}
 }

@@ -706,7 +706,7 @@ func (p *Parser) parseSample(line []byte) (Sample, bool) {
 		}
 	}
 	s.Labels = p.labels
-	return p.finishSample(s, rest)
+	return s, p.finishSample(&s, rest)
 }
 
 // parseQuotedNameSample parses the Prometheus 3 quoted-name sample form,
@@ -745,16 +745,18 @@ func (p *Parser) parseQuotedNameSample(line []byte) (Sample, bool) {
 		return s, false
 	}
 	s.Labels = p.labels
-	return p.finishSample(s, rem)
+	return s, p.finishSample(&s, rem)
 }
 
 // finishSample parses the value, optional timestamp and optional exemplar
-// after the name/labels — shared by the classic and quoted-name forms.
-func (p *Parser) finishSample(s Sample, rest []byte) (Sample, bool) {
+// after the name/labels — shared by the classic and quoted-name forms. It
+// takes s by POINTER: Sample is a wide struct and this runs once per sample,
+// so passing it (and returning it) by value cost ~9% of parse throughput.
+func (p *Parser) finishSample(s *Sample, rest []byte) bool {
 	var ok bool
 	s.Value, rest, ok = p.parseFloatToken(rest)
 	if !ok {
-		return s, false
+		return false
 	}
 
 	// Optional timestamp.
@@ -762,7 +764,7 @@ func (p *Parser) finishSample(s Sample, rest []byte) (Sample, bool) {
 	if len(rest) > 0 && rest[0] != '#' {
 		s.TimestampMs, rest, ok = p.parseTimestampToken(rest)
 		if !ok {
-			return s, false
+			return false
 		}
 		rest = skipSpaceTab(rest)
 	}
@@ -770,18 +772,18 @@ func (p *Parser) finishSample(s Sample, rest []byte) (Sample, bool) {
 	// Optional exemplar (OpenMetrics).
 	if len(rest) > 0 {
 		if rest[0] != '#' || !p.openMetrics {
-			return s, false
+			return false
 		}
 		if !p.exemplars {
-			return s, true // valid line; exemplar intentionally ignored
+			return true // valid line; exemplar intentionally ignored
 		}
 		ex, ok := p.parseExemplar(rest[1:])
 		if !ok {
-			return s, false
+			return false
 		}
 		s.Exemplar = ex
 	}
-	return s, true
+	return true
 }
 
 // parseExemplar parses "{labels} value [timestamp]" into the parser's

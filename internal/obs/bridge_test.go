@@ -43,3 +43,37 @@ func TestRuntimeHandlerInternalToggle(t *testing.T) {
 		t.Fatal("internal=false body must stay runtime-only")
 	}
 }
+
+// End-to-end shape of a bridged histogram: the exposition must carry
+// cumulative le buckets plus _sum/_count, matching what the observations
+// actually were. A regrouping slip here would ship a plausible-looking but
+// wrong distribution.
+func TestBridgeHistogramExposition(t *testing.T) {
+	for _, v := range []float64{0.003, 0.02, 2} {
+		ScrapeDuration.WithLabelValues("bridge-test").Observe(v)
+	}
+	body := scrapeBody(t, true)
+	var got []string
+	for _, ln := range strings.Split(body, "\n") {
+		if strings.Contains(ln, `pipeline="bridge-test"`) {
+			got = append(got, strings.TrimSpace(ln))
+		}
+	}
+	if len(got) == 0 {
+		t.Fatalf("no bridged histogram series:\n%.600s", body)
+	}
+	joined := strings.Join(got, "\n")
+	// Default buckets are prometheus.DefBuckets: 0.005 catches the first
+	// observation, 0.025 the first two, +Inf all three.
+	for _, want := range []string{
+		`kubescrape_scrape_duration_seconds_bucket{pipeline="bridge-test",le="0.005"} 1`,
+		`kubescrape_scrape_duration_seconds_bucket{pipeline="bridge-test",le="0.025"} 2`,
+		`kubescrape_scrape_duration_seconds_bucket{pipeline="bridge-test",le="+Inf"} 3`,
+		`kubescrape_scrape_duration_seconds_sum{pipeline="bridge-test"} 2.023`,
+		`kubescrape_scrape_duration_seconds_count{pipeline="bridge-test"} 3`,
+	} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("missing %q in:\n%s", want, joined)
+		}
+	}
+}

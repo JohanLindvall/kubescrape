@@ -177,14 +177,8 @@ func BuildExporter(base Config, cfg *ExportConfig) (*PerSignal, error) {
 		return nil, err
 	}
 	base = cfg.ApplyBase(base)
-	def, err := New(base)
-	if err != nil {
-		return nil, err
-	}
-	ps := &PerSignal{Default: def}
-	if cfg == nil {
-		return ps, nil
-	}
+	ps := &PerSignal{}
+	var err error
 	build := func(name string, o *ExportOverride) (*Client, error) {
 		if o == nil {
 			return nil, nil
@@ -195,16 +189,40 @@ func BuildExporter(base Config, cfg *ExportConfig) (*PerSignal, error) {
 		}
 		return c, nil
 	}
-	if ps.Logs, err = build("logs", cfg.Logs); err != nil {
-		return nil, err
+	if cfg != nil {
+		if ps.Logs, err = build("logs", cfg.Logs); err != nil {
+			return nil, err
+		}
+		if ps.Metrics, err = build("metrics", cfg.Metrics); err != nil {
+			ps.closeBuilt()
+			return nil, err
+		}
+		if ps.Traces, err = build("traces", cfg.Traces); err != nil {
+			ps.closeBuilt()
+			return nil, err
+		}
 	}
-	if ps.Metrics, err = build("metrics", cfg.Metrics); err != nil {
-		return nil, err
-	}
-	if ps.Traces, err = build("traces", cfg.Traces); err != nil {
-		return nil, err
+	// The default is the FALLBACK destination, so build it only when a signal
+	// can actually reach it. With all three overridden it is unreachable, and
+	// constructing it anyway would dial (and validate) a collector endpoint the
+	// deployment deliberately does not use — which is exactly the collectorless
+	// case, where the flag default still points at the stock collector address
+	// and the base may legitimately be plaintext while every real destination
+	// is TLS.
+	if ps.Logs == nil || ps.Metrics == nil || ps.Traces == nil {
+		if ps.Default, err = New(base); err != nil {
+			ps.closeBuilt()
+			return nil, err
+		}
 	}
 	return ps, nil
+}
+
+// closeBuilt releases the clients constructed so far, for the error paths
+// where BuildExporter gives up midway (the caller never sees the PerSignal
+// and would otherwise leak their gRPC connections).
+func (p *PerSignal) closeBuilt() {
+	_ = p.Close()
 }
 
 // logsClient/metricsClient/tracesClient resolve the signal's destination.

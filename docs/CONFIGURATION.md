@@ -120,7 +120,7 @@ Pipeline toggles (all default `true` except the opt-in `-journald`):
 | `-otlp-compression-level` | `0` | gzip level `1` (fastest, ~2-3x less CPU for ~10% larger payloads) to `9` (smallest); `0` = library default |
 | `-otlp-insecure` | `true` | plaintext gRPC (for HTTP, choose via the URL scheme) |
 | `-otlp-bearer-token-file` | — | sends `Authorization: Bearer <token>` on either transport; re-read every minute, so rotated tokens work |
-| `-otlp-tls-ca-file` | — | PEM CA bundle for verifying the collector |
+| `-otlp-tls-ca-file` | — | PEM CA bundle for verifying the collector. TLS material on a plaintext destination (gRPC with `-otlp-insecure`, or an `http://` endpoint) is refused at startup rather than silently ignored — the failure it otherwise produces is telemetry shipped in cleartext, which nothing surfaces |
 | `-otlp-tls-insecure-skip-verify` | `false` | skip certificate verification |
 | `-otlp-timeout` | `15s` | per export attempt |
 | `-otlp-retry-attempts` | `3` | tries per **metrics** export (logs retry via the tailer's rewind, see below) |
@@ -173,6 +173,12 @@ export:
 Empty/omitted fields inherit the flag base (`endpoint`, `protocol`,
 `headers`, `bearerTokenFile`, `caFile`, `insecure`, `insecureSkipVerify`,
 `compression`, `clientCertFile`/`clientKeyFile` are overridable per signal).
+The flag endpoint remains the **fallback** for any signal without an
+override; when all three are overridden it is unreachable and no client is
+built for it, so a collectorless deployment need not point `-otlp-endpoint`
+at anything real. TLS material (a CA bundle or client certificate) on a
+destination that turns out to be plaintext is a startup error, never a
+silent no-op.
 `-check-config` validates the section's shape without touching any files.
 OAuth2 and AWS SigV4 export auth are deliberately not implemented — each
 drags a heavyweight SDK dependency; front such endpoints with a collector

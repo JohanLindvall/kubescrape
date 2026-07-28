@@ -73,3 +73,10 @@ func TestSplitBatcherExponential(t *testing.T) {
 		t.Fatalf("point = scale %d count %d sum %v", found.Scale(), found.Count(), found.Sum())
 	}
 }
+
+// The protobuf path reaches the batcher through an expSink type assertion
+// (addNativeHistogram), so the interface must actually be satisfied — a
+// direct-call test would still pass if the assertion silently failed and
+// counted every native family malformed.
+var _ expSink = (*splitBatcher)(nil)
+var _ expSink = (*batcher)(nil)

@@ -3,8 +3,13 @@
 package metrics
 
 import (
+	"context"
 	"reflect"
+	"sync"
 	"testing"
+
+	"go.opentelemetry.io/collector/pdata/pcommon"
+	"go.opentelemetry.io/collector/pdata/pmetric"
 )
 
 // Dump must leave every piece of interval state the OTLP push path depends on
@@ -90,3 +95,60 @@ func TestDumpGaugeFuncVec(t *testing.T) {
 		t.Fatalf("point 0 = %+v", d[0].Points[0])
 	}
 }
+
+// The /metrics bridge makes Dump a SECOND concurrent reader of the registry,
+// alongside the push path's Export and the producers' observations. Nothing
+// may race, and no lock ordering between the registry, series and func mutexes
+// may deadlock.
+func TestDumpConcurrentWithObserveAndExport(t *testing.T) {
+	r := NewRegistry()
+	c := r.CounterVec("kubescrape_x_total", "d", "k")
+	h := r.HistogramVec("kubescrape_h_seconds", "d", nil, "k")
+	r.GaugeFunc("kubescrape_g", "d", func() float64 { return 1 })
+	r.CounterFunc("kubescrape_cf_total", "d", func() float64 { return 2 })
+	r.GaugeFuncVec("kubescrape_gv", "d", "signal", func() map[string]float64 {
+		return map[string]float64{"logs": 1, "metrics": 2}
+	})
+
+	var producers sync.WaitGroup
+	stop := make(chan struct{})
+	for i := 0; i < 4; i++ {
+		producers.Add(1)
+		go func() {
+			defer producers.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+					c.WithLabelValues("a").Inc()
+					h.WithLabelValues("a").Observe(0.3)
+				}
+			}
+		}()
+	}
+	var readers sync.WaitGroup
+	for i := 0; i < 2; i++ {
+		readers.Add(1)
+		go func() {
+			defer readers.Done()
+			for j := 0; j < 200; j++ {
+				_ = r.Dump()
+			}
+		}()
+	}
+	readers.Add(1)
+	go func() {
+		defer readers.Done()
+		for j := 0; j < 200; j++ {
+			_ = r.Export(context.Background(), nopDumpExporter{}, pcommon.NewResource())
+		}
+	}()
+	readers.Wait()
+	close(stop)
+	producers.Wait()
+}
+
+type nopDumpExporter struct{}
+
+func (nopDumpExporter) ExportMetrics(context.Context, pmetric.Metrics) error { return nil }

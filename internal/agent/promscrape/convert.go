@@ -685,7 +685,7 @@ func fillSummaryPoint(dp pmetric.SummaryDataPoint, acc *summAcc) {
 }
 
 // pointTS is the sample's own timestamp (ms) or the scrape time when it carried
-// none. Shared by all three batchers.
+// none. Shared by all three batchers and setExemplar.
 func pointTS(tsMs int64, scrapeTS pcommon.Timestamp) pcommon.Timestamp {
 	if tsMs != 0 {
 		// A ms value beyond this wraps the int64 nanosecond product and would
@@ -729,11 +729,11 @@ func putLabels(attrs pcommon.Map, labels []Label) {
 // filtered attributes.
 func setExemplar(ex pmetric.Exemplar, e Exemplar, fallbackTS pcommon.Timestamp) {
 	ex.SetDoubleValue(e.Value)
-	if e.TimestampMs != 0 {
-		ex.SetTimestamp(pcommon.Timestamp(e.TimestampMs * int64(time.Millisecond)))
-	} else {
-		ex.SetTimestamp(fallbackTS)
-	}
+	// Through pointTS, never a bare ms→ns multiplication: the parser bounds
+	// timestamps to int64 MILLISECONDS, so a far-future exemplar timestamp
+	// would wrap the nanosecond product exactly as a sample's would — same
+	// guard, same scrape-time fallback.
+	ex.SetTimestamp(pointTS(e.TimestampMs, fallbackTS))
 	for _, l := range e.Labels {
 		switch l.Name {
 		case "trace_id":

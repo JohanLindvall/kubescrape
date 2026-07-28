@@ -5,6 +5,7 @@ package promscrape
 import (
 	"context"
 	"fmt"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -493,5 +494,36 @@ rpc_count 4
 	}
 	if q := dp.QuantileValues().At(0); q.Quantile() != 0.5 || q.Value() != 3 {
 		t.Fatalf("q0 = %v/%v, want 0.5/3 (last occurrence wins)", q.Quantile(), q.Value())
+	}
+}
+
+// An exemplar timestamp can be parseable yet beyond the ms→ns int64 range (the
+// parser bounds timestamps to int64 MILLISECONDS): the bare multiplication
+// wrapped and stamped garbage on the exemplar, while the identical sample-path
+// conversion (pointTS) fell back to the scrape time. The two paths must agree.
+func TestExemplarTimestampOverflowFallsBack(t *testing.T) {
+	fallback := pcommon.NewTimestampFromTime(time.Unix(1700000000, 0))
+	dp := pmetric.NewMetrics().ResourceMetrics().AppendEmpty().ScopeMetrics().AppendEmpty().
+		Metrics().AppendEmpty().SetEmptySum().DataPoints().AppendEmpty()
+
+	overflowMs := math.MaxInt64/int64(time.Millisecond) + 1
+	for _, tsMs := range []int64{overflowMs, -overflowMs} {
+		ex := dp.Exemplars().AppendEmpty()
+		setExemplar(ex, Exemplar{Value: 1, TimestampMs: tsMs}, fallback)
+		if ex.Timestamp() != fallback {
+			t.Fatalf("timestamp %d ms: got %d, want the fallback %d", tsMs, ex.Timestamp(), fallback)
+		}
+	}
+
+	// An in-range timestamp still converts exactly; an absent one falls back.
+	ex := dp.Exemplars().AppendEmpty()
+	setExemplar(ex, Exemplar{Value: 1, TimestampMs: 1_700_000_000_123}, fallback)
+	if want := pcommon.Timestamp(1_700_000_000_123 * int64(time.Millisecond)); ex.Timestamp() != want {
+		t.Fatalf("in-range: got %d, want %d", ex.Timestamp(), want)
+	}
+	ex = dp.Exemplars().AppendEmpty()
+	setExemplar(ex, Exemplar{Value: 1}, fallback)
+	if ex.Timestamp() != fallback {
+		t.Fatalf("absent: got %d, want the fallback %d", ex.Timestamp(), fallback)
 	}
 }

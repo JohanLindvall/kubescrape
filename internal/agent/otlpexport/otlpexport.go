@@ -448,7 +448,7 @@ func (c *Client) httpPost(ctx context.Context, url string, body []byte) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bodyReader)
 	if err != nil {
 		if gz != nil {
-			gz.Recycle()
+			gz.Release()
 		}
 		return err
 	}
@@ -456,7 +456,7 @@ func (c *Client) httpPost(ctx context.Context, url string, body []byte) error {
 		// NewRequest doesn't recognize the pooled buffer type, so set the
 		// length explicitly (the body would go out chunked otherwise). Do NOT
 		// set req.GetBody: a transport-level replay after the first attempt
-		// closes (recycles) the buffer would read reused memory.
+		// closes (releases) the buffer would read reused memory.
 		req.ContentLength = int64(gz.Len())
 	}
 	req.Header.Set("Content-Type", "application/x-protobuf")

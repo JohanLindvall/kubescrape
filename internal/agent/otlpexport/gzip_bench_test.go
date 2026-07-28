@@ -27,6 +27,6 @@ func BenchmarkGzipBody(b *testing.B) {
 		if err != nil {
 			b.Fatal(err)
 		}
-		buf.Recycle()
+		buf.Release()
 	}
 }

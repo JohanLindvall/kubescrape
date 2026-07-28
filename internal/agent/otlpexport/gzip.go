@@ -87,19 +87,20 @@ func (p *pooledGzipWriter) Close() error {
 // long an oversized, under-utilized backing array stays pooled).
 var (
 	httpGzipWriters = sync.Pool{New: func() any { return newGzipWriter() }}
-	httpGzipBufs    = bufpool.New()
+	// bufpool.Pool's zero value is ready to use (and must not be copied).
+	httpGzipBufs bufpool.Pool
 )
 
 // gzipBody compresses an OTLP/HTTP request body into a pooled buffer. The
 // buffer returns to its pool on Close, so it can be handed to the HTTP
 // transport as the request body (the transport always closes the body, even
-// on errors); a caller that never reaches the transport must Recycle it.
+// on errors); a caller that never reaches the transport must Release it.
 func gzipBody(body []byte) (*bufpool.Buffer, error) {
 	buf := httpGzipBufs.Get()
 	z := httpGzipWriters.Get().(*gzip.Writer)
 	z.Reset(buf)
 	if _, err := z.Write(body); err != nil {
-		buf.Recycle()
+		buf.Release()
 		// A Reset writer is safe to reuse after a Write/Close error (the next
 		// Reset clears its state); returning it avoids leaking the pooled
 		// writer on the (rare) error path.
@@ -107,7 +108,7 @@ func gzipBody(body []byte) (*bufpool.Buffer, error) {
 		return nil, err
 	}
 	if err := z.Close(); err != nil {
-		buf.Recycle()
+		buf.Release()
 		httpGzipWriters.Put(z)
 		return nil, err
 	}

@@ -2,8 +2,8 @@ github.com/JohanLindvall/bufpool v0.2.1 h1:0kd6sTt+ch6lQtbqEyNNpr5gKNeysV6fMp5cb
 github.com/JohanLindvall/bufpool v0.2.1/go.mod h1:W7ZBmQQd7vuO5e5rCtvF8ORIVksJT7kF/+W9ZvnSQaQ=
 github.com/JohanLindvall/enrich v0.1.5 h1:8zAFg2nI1dl/lzzIUW8uiIuw78nh0e/+YR79+BMH77Q=
 github.com/JohanLindvall/enrich v0.1.5/go.mod h1:Pn92m7DnbPoP2oLi+gsrZidP1R+T2z8tuWf9lzyLZkM=
-github.com/JohanLindvall/lightning v0.0.59 h1:kXQLfVE+C3pZBN9T1gN3eDbN80AUYYnB/f/sQEUj24Y=
-github.com/JohanLindvall/lightning v0.0.59/go.mod h1:uGs5O1o/2myfnC3XsItHKPCIKDpVae66exbxNpSq430=
+github.com/JohanLindvall/lightning v0.0.62 h1:lg/gG5wzgdWOsnuzK8kiQGt9W6kniT6b1FgphzJdotg=
+github.com/JohanLindvall/lightning v0.0.62/go.mod h1:uGs5O1o/2myfnC3XsItHKPCIKDpVae66exbxNpSq430=
 github.com/JohanLindvall/logfmt v0.0.12 h1:McSo+mPFtePJCCDMc6mFNJ0iv5OaNLOKjH3zfV8lc98=
 github.com/JohanLindvall/logfmt v0.0.12/go.mod h1:Iq1eVC2DqVa+LwlXdW0bW38v2nL9F/HE4tCT5XUqDO8=
 github.com/JohanLindvall/multiline v0.0.10 h1:OCBKPD091zrvc/canva/QApzcXuJNmUqUxrvlr604Jw=

@@ -12,10 +12,12 @@ package azurediag
 // as the body (so logAttributes/enrich/logMetrics see exactly what Azure
 // emitted), and only the handful of envelope fields needed for routing and
 // attributes are extracted — via lightning's single-pass GetPaths, the same
-// discipline as internal/logline.
+// discipline as internal/logline. The array walk is lightning's ArrayEach
+// (>= v0.0.62; extracted from the hand-rolled splitter that used to live
+// here): strict syntax, so a malformed envelope is ONE decode error at the
+// split, never elements silently fused or dropped.
 
 import (
-	"bytes"
 	"errors"
 	"time"
 
@@ -96,86 +98,29 @@ const (
 
 var errNotJSON = errors.New("message is not a JSON object or array")
 
-// splitEnvelope returns the raw records inside one Event Hubs message:
-// {"records":[...]} (the diagnostic-settings shape), a bare array, or a bare
-// single record object.
-func splitEnvelope(msg []byte) ([][]byte, error) {
+// splitEnvelope invokes fn with each raw record inside one Event Hubs
+// message: {"records":[...]} (the diagnostic-settings shape), a bare array,
+// or a bare single record object. The callback form skips materializing a
+// [][]byte per poll; slices alias msg.
+func splitEnvelope(msg []byte, fn func(raw []byte) error) error {
 	i := skipWS(msg, 0)
 	if i >= len(msg) {
-		return nil, errNotJSON
+		return errNotJSON
 	}
 	switch msg[i] {
 	case '{':
-		recs, err := ljson.Lookup(msg[i:], "records")
-		if err == nil && len(recs) > 0 && recs[0] == '[' {
-			return splitArray(recs)
+		err := ljson.ArrayEach(msg[i:], fn, "records")
+		if errors.Is(err, ljson.ErrKeyNotFound) || errors.Is(err, ljson.ErrExpectArray) {
+			// No records array: the object IS the record. Both errors are
+			// pre-iteration (the descent fails before fn ever runs), so this
+			// cannot double-emit.
+			return fn(msg[i:])
 		}
-		// No records array: treat the object as a single record.
-		return [][]byte{msg[i:]}, nil
+		return err
 	case '[':
-		return splitArray(msg[i:])
+		return ljson.ArrayEach(msg[i:], fn)
 	}
-	return nil, errNotJSON
-}
-
-// splitArray splits a raw JSON array into its top-level elements (verbatim
-// slices of arr). Strings — with escapes — and nesting are respected.
-func splitArray(arr []byte) ([][]byte, error) {
-	var out [][]byte
-	depth, start := 0, -1
-	inStr, esc := false, false
-	flush := func(end int) {
-		if el := bytes.TrimSpace(arr[start:end]); len(el) > 0 {
-			out = append(out, el)
-		}
-		start = -1
-	}
-	for i := 1; i < len(arr); i++ {
-		c := arr[i]
-		if inStr {
-			switch {
-			case esc:
-				esc = false
-			case c == '\\':
-				esc = true
-			case c == '"':
-				inStr = false
-			}
-			continue
-		}
-		switch c {
-		case '"':
-			inStr = true
-			if start < 0 {
-				start = i
-			}
-		case '{', '[':
-			if start < 0 {
-				start = i
-			}
-			depth++
-		case '}':
-			depth--
-		case ']':
-			if depth == 0 {
-				if start >= 0 {
-					flush(i)
-				}
-				return out, nil
-			}
-			depth--
-		case ',':
-			if depth == 0 && start >= 0 {
-				flush(i)
-			}
-		case ' ', '\t', '\n', '\r':
-		default:
-			if start < 0 {
-				start = i
-			}
-		}
-	}
-	return nil, errors.New("unterminated JSON array")
+	return errNotJSON
 }
 
 func skipWS(b []byte, i int) int {

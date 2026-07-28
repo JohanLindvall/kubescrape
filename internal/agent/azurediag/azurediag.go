@@ -176,28 +176,28 @@ func (r *Reader) consume(ctx context.Context, src source) error {
 
 // decode splits every message into records. Undecodable messages or records
 // are counted and skipped — they will be committed past, as one malformed
-// producer must not stall the hub.
+// producer must not stall the hub. A syntax error mid-array keeps the
+// records already decoded and drops the rest of that message as one error.
 func (r *Reader) decode(msgs [][]byte) []record {
 	var recs []record
-	for _, msg := range msgs {
-		raws, err := splitEnvelope(msg)
+	each := func(raw []byte) error {
+		rec, scratch, err := decodeRecord(raw, r.scratch)
+		r.scratch = scratch
 		if err != nil {
 			obs.AzureDecodeErrors.Inc()
-			continue
+			return nil // skip the record, keep the rest of the envelope
 		}
-		for _, raw := range raws {
-			rec, scratch, err := decodeRecord(raw, r.scratch)
-			r.scratch = scratch
-			if err != nil {
-				obs.AzureDecodeErrors.Inc()
-				continue
-			}
-			if rec.metric {
-				obs.AzureRecords.WithLabelValues("metric").Inc()
-			} else {
-				obs.AzureRecords.WithLabelValues("log").Inc()
-			}
-			recs = append(recs, rec)
+		if rec.metric {
+			obs.AzureRecords.WithLabelValues("metric").Inc()
+		} else {
+			obs.AzureRecords.WithLabelValues("log").Inc()
+		}
+		recs = append(recs, rec)
+		return nil
+	}
+	for _, msg := range msgs {
+		if err := splitEnvelope(msg, each); err != nil {
+			obs.AzureDecodeErrors.Inc()
 		}
 	}
 	return recs

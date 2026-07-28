@@ -136,6 +136,16 @@ const metricEnvelope = `{"records":[
   {"count":2,"total":6,"minimum":2,"maximum":4,"average":3,"resourceId":"` + armID + `","time":"2026-07-28T10:02:00Z","metricName":"cpu_percent","timeGrain":"PT1M"}
 ]}`
 
+// collectEnvelope adapts the callback form for tests.
+func collectEnvelope(msg []byte) ([][]byte, error) {
+	var out [][]byte
+	err := splitEnvelope(msg, func(raw []byte) error {
+		out = append(out, raw)
+		return nil
+	})
+	return out, err
+}
+
 func TestSplitEnvelope(t *testing.T) {
 	for _, tc := range []struct {
 		in   string
@@ -144,11 +154,12 @@ func TestSplitEnvelope(t *testing.T) {
 		{`{"records":[{"a":1},{"b":2}]}`, 2},
 		{`[{"a":1},{"b":2},{"c":3}]`, 3},
 		{`{"time":"x","category":"y"}`, 1}, // bare single record
+		{`{"records":null}`, 1},            // no records ARRAY: the object is the record
 		{`{"records":[]}`, 0},
 		{`{"records":[{"s":"tricky \" ]} string","n":[1,[2,3]]},{"b":2}]}`, 2},
 		{"  \n[ {\"a\":1} , {\"b\":2} ]", 2},
 	} {
-		got, err := splitEnvelope([]byte(tc.in))
+		got, err := collectEnvelope([]byte(tc.in))
 		if err != nil {
 			t.Fatalf("%s: %v", tc.in, err)
 		}
@@ -156,15 +167,18 @@ func TestSplitEnvelope(t *testing.T) {
 			t.Fatalf("%s: records = %d, want %d (%q)", tc.in, len(got), tc.want, got)
 		}
 	}
-	for _, bad := range []string{``, `garbage`, `[{"a":1}`} {
-		if _, err := splitEnvelope([]byte(bad)); err == nil {
+	// Strict since the move to lightning's ArrayEach: malformed syntax is an
+	// error, never elements silently fused (the old splitter accepted a
+	// missing comma and yielded two objects as one garbage element).
+	for _, bad := range []string{``, `garbage`, `[{"a":1}`, `[{"a":1} {"b":2}]`, `{"records":[1,]}`} {
+		if _, err := collectEnvelope([]byte(bad)); err == nil {
 			t.Fatalf("%q: want an error", bad)
 		}
 	}
 }
 
 func TestDecodeClassifiesRecords(t *testing.T) {
-	raws, err := splitEnvelope([]byte(metricEnvelope))
+	raws, err := collectEnvelope([]byte(metricEnvelope))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -182,7 +196,7 @@ func TestDecodeClassifiesRecords(t *testing.T) {
 		t.Fatalf("time misdecoded: %v", rec.ts)
 	}
 
-	raws, _ = splitEnvelope([]byte(logEnvelope))
+	raws, _ = collectEnvelope([]byte(logEnvelope))
 	rec, _, err = decodeRecord(raws[0], nil)
 	if err != nil {
 		t.Fatal(err)

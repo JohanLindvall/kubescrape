@@ -568,6 +568,41 @@ func (b *splitBatcher) addHistogram(family string, acc *histAcc) {
 	b.bytes += histBytes(acc)
 }
 
+// addExponential routes one native-histogram point exactly like the other
+// kinds: the rule's groupBy labels move onto the (possibly enriched) split
+// resource, the rest stay on the data point, and the byte estimate is charged
+// with expHistBytes. This is what lets splitter-backed targets accept the
+// protobuf exposition instead of being pinned to text.
+func (b *splitBatcher) addExponential(family string, p expPoint) {
+	m, rule, dpa := b.metric(family, p.meta, p.labels, func(m pmetric.Metric) {
+		m.SetEmptyExponentialHistogram().SetAggregationTemporality(pmetric.AggregationTemporalityCumulative)
+	})
+	if m.Type() != pmetric.MetricTypeExponentialHistogram {
+		obs.ScrapeCollisions.Inc()
+		return
+	}
+	dp := m.ExponentialHistogram().DataPoints().AppendEmpty()
+	dp.SetStartTimestamp(b.startTS)
+	dp.SetTimestamp(pointTS(p.ts, b.scrapeTS))
+	dp.SetScale(p.schema)
+	dp.SetZeroCount(p.zeroCount)
+	dp.SetZeroThreshold(p.zeroTh)
+	dp.SetCount(p.count)
+	if p.hasSum {
+		dp.SetSum(p.sum)
+	}
+	dp.Positive().SetOffset(p.posOffset)
+	dp.Positive().BucketCounts().FromRaw(p.pos)
+	dp.Negative().SetOffset(p.negOffset)
+	dp.Negative().BucketCounts().FromRaw(p.neg)
+	b.putSplitLabels(dp.Attributes(), rule, p.labels, dpa)
+	for _, e := range p.exemplars {
+		setExemplar(dp.Exemplars().AppendEmpty(), e, b.scrapeTS)
+	}
+	b.points++
+	b.bytes += expHistBytes(&p)
+}
+
 func (b *splitBatcher) addSummary(family string, acc *summAcc) {
 	m, rule, dpa := b.metric(family, acc.meta, acc.labels, func(m pmetric.Metric) {
 		m.SetEmptySummary()

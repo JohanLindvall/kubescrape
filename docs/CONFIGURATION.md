@@ -10,9 +10,9 @@ kubescrape consists of two binaries built from one image:
 
 Everything is configured through flags plus one optional unified YAML file on
 the agent (`-config`, with `resourceAttributes`, `logs`, `logAttributes`,
-`logMetrics`, `logScrubbing`, `metrics`, `traceMetrics`, `traceSampling` and
-`routing` sections) — plus, optionally, a separate hot-reloaded Starlark
-transforms file (`-transforms-file`). The
+`logMetrics`, `logScrubbing`, `metrics`, `traceMetrics`, `traceSampling`,
+`routing` and `export` sections) — plus, optionally, a separate hot-reloaded
+Starlark transforms file (`-transforms-file`). The
 [Helm chart](../charts/kubescrape) exposes all of it as values; the raw
 manifests live in [deploy/](../deploy).
 
@@ -55,9 +55,10 @@ kubescrape -listen :8080 -wait-timeout 5s -cache-ttl 5m -log-format json
 | `-resync` | `0` | informer resync period (0 = watch stream only) |
 | `-servicemonitors` | `false` | serve targets for `monitoring.coreos.com/v1` ServiceMonitors selecting pod-backed Services — plus **PodMonitors** (endpoints name container ports) when the cluster serves that CRD. Endpoint `port`/`targetPort`/`path`/`scheme`, `interval`/`scrapeTimeout`, `basicAuth`, `authorization`, `bearerTokenSecret`, `tlsConfig` (`insecureSkipVerify`, secret-backed `ca`/`cert`/`keySecret`, `serverName`) and the keep/drop subset of `metricRelabelings` are honored. Anything else (`oauth2`, `proxyUrl`, `params`, `honorLabels`, target `relabelings`, other relabel actions, configMap-backed `ca`/`cert`) is **reported**: logged once per monitor and counted in `kubescrape_monitor_fields_ignored_total{kind}`, so a partially-applied CR is never silent. Self-disables with a warning when the CRD is absent |
 | `-scrape-auth-secrets` | `false` | serve monitor endpoints' `bearerTokenSecret` values to agents on `GET /v1/scrape-auth/{ns}/{name}/{key}`. Opt-in: requires `secrets get` RBAC (commented out in the manifests), `-scrape-auth-token-file`, and ships tokens over the cluster-internal HTTP channel |
-| `-scrape-auth-token-file` | — | file with the shared bearer token callers must present on `/v1/scrape-auth` as `Authorization: Bearer <token>`. **Mandatory** with `-scrape-auth-secrets` — that endpoint is the only one serving Secret material, so starting without a token is refused rather than leaving it open to every pod in the cluster. Compared in constant time; read once at startup (rotation means restarting the service and the agents) |
+| `-scrape-auth-token-file` | — | file with the shared bearer token callers must present on `/v1/scrape-auth` as `Authorization: Bearer <token>`. **Mandatory** with `-scrape-auth-secrets` — that endpoint is the only one serving Secret material, so starting without a token is refused rather than leaving it open to every pod in the cluster. Compared in constant time. The file is re-read about once a minute, and after a change the PREVIOUS token stays accepted for a 5-minute grace window — so rotating the Secret is a non-event: agents (which re-read their copy on the same cadence) and the service converge with no restarts and no 401 storm |
 | `-self-metrics-interval` | `1m` | export the service's own metrics over OTLP at this interval (0 disables) |
 | `-otlp-*` | as the agent | used by the self-metrics push: `-otlp-endpoint`, `-otlp-protocol`, `-otlp-compression`, `-otlp-compression-level`, `-otlp-insecure`, `-otlp-tls-ca-file`, `-otlp-tls-insecure-skip-verify`, `-otlp-bearer-token-file`, `-otlp-timeout` |
+| `-otlp-header` | — | static `key=value` header sent on every self-metrics export (HTTP header / gRPC metadata, e.g. `X-Scope-OrgID=tenant`); repeatable — repeatable rather than comma-separated so a value may contain commas |
 | `-log-level` | `info` | `debug`, `info`, `warn`, `error` |
 | `-log-format` | `text` | `text` or `json` (client-go's klog is routed through the same handler) |
 
@@ -68,7 +69,11 @@ are pushed over OTLP on `-self-metrics-interval` (default
 The process's own Go runtime and process metrics (`go_*`, `process_*`) are
 served instead as Prometheus text on a DEDICATED port, `-metrics-listen`
 (default `:9090`, empty disables) — they are operator-facing process
-diagnostics, consumed by a scrape rather than pushed. `-pprof-listen` (empty by
+diagnostics, consumed by a scrape rather than pushed. With
+`-self-metrics-interval=0` that port additionally serves the `kubescrape_*`
+internal metrics, replacing the OTLP push with a scrape: one knob selects the
+delivery modality, so the same series never ship over both paths.
+`-pprof-listen` (empty by
 default) serves `net/http/pprof` on a third port; profiles expose goroutine
 stacks and heap contents, so it is separate from both.
 
@@ -91,6 +96,8 @@ manifests — enable deliberately) — see
 | `-metadata-endpoint` | `http://kubescrape.monitoring` | base URL of the metadata service |
 | `-metadata-wait` | `5s` | server-side wait for not-yet-known containers (covers the gap between container start and the kubelet posting its status) |
 | `-node-metadata-refresh` | `1m` | refresh interval for the node's labels/annotations used in attribute templates (0 disables) |
+| `-check-config` | `false` | compile every config section plus the flags, print a summary and exit — nothing acquired (CI / pre-rollout) |
+| `-test-config` | — | run the YAML test cases in this file through the compiled log pipeline (scrub → logAttributes → enrich → logMetrics → `logs.rules` → transforms) and exit non-zero on failure; like `-check-config`, nothing is acquired. See the README's "Config unit tests" for the file shape |
 | `-log-level` / `-log-format` | `info` / `text` | as for the service |
 
 Pipeline toggles (all default `true` except the opt-in `-journald`):
@@ -134,11 +141,48 @@ kubescrape-agent \
   -otlp-bearer-token-file=/etc/kubescrape/otlp-token/token
 ```
 
+### Per-signal destinations (`export` section)
+
+The flags configure ONE endpoint for every signal. The config file's `export`
+section overlays per-signal destinations onto that base — which is what makes
+**collectorless** deployment expressible: Mimir, Loki and Tempo all ingest
+OTLP natively, but on three different hosts/paths. Each override rides the
+existing per-signal disk-buffer spool, so durability is unchanged; the base
+part adds what the flags cannot express — static headers (tenancy) on the
+default **buffered** chain (the `routing` section's headers are deliberately
+unbuffered) and an mTLS client certificate:
+
+```yaml
+export:
+  headers: {X-Scope-OrgID: platform}      # every signal, buffered chain included
+  clientCertFile: /etc/certs/client.crt   # mTLS towards the backends (both or neither)
+  clientKeyFile: /etc/certs/client.key
+  logs:
+    endpoint: https://loki.example.com/otlp
+    protocol: http
+  metrics:
+    endpoint: https://mimir.example.com/otlp
+    protocol: http
+    headers: {X-Scope-OrgID: metrics-tenant}  # merges over the base, override wins
+  traces:
+    endpoint: tempo.example.com:4317
+    insecure: false   # gRPC TLS — required here: a client cert on a plaintext
+                      # connection is refused at startup rather than silently unused
+```
+
+Empty/omitted fields inherit the flag base (`endpoint`, `protocol`,
+`headers`, `bearerTokenFile`, `caFile`, `insecure`, `insecureSkipVerify`,
+`compression`, `clientCertFile`/`clientKeyFile` are overridable per signal).
+`-check-config` validates the section's shape without touching any files.
+OAuth2 and AWS SigV4 export auth are deliberately not implemented — each
+drags a heavyweight SDK dependency; front such endpoints with a collector
+hop or an authenticating proxy.
+
 ## Agent: log collection
 
 | Flag | Default | Description |
 |---|---|---|
-| `-config` | — | single YAML file holding all sections: `resourceAttributes`, `logs`, `logAttributes`, `logMetrics`, `logScrubbing`, `metrics`, `traceMetrics`, `traceSampling`, `routing` ([below](#unified-config-file)) |
+| `-config` | — | single YAML file holding all sections: `resourceAttributes`, `logs`, `logAttributes`, `logMetrics`, `logScrubbing`, `metrics`, `traceMetrics`, `traceSampling`, `routing`, `export` ([below](#unified-config-file)) |
 | `-log-dir` | `/var/log/containers` | containerd log directory; the default source when the `logs` section is unset |
 | `-positions-file` | — | single JSON file persisting BOTH log offsets and the journald cursor across restarts (mount a hostPath); empty disables persistence |
 | `-logs-watch` | `true` | fsnotify events trigger reads and discovery; polling remains the fallback |
@@ -237,6 +281,7 @@ metrics:       {pipelines: {...}, splitters: [...]}   # see Metrics config
 traceMetrics:  {dimensions: [...], buckets: [...]}    # see Agent: span metrics
 traceSampling: {probability: 0.1, ...}                # see Agent: trace sampling
 routing:       {routes: [...]}                        # see Agent: routing
+export:        {headers: {...}, logs: {...}, ...}     # see Per-signal destinations
 ```
 
 The sections below document each in turn. (Starlark transforms deliberately
@@ -456,7 +501,7 @@ logMetrics:
       matchRegexp: ["__line__=slow request"]
     - name: open_connections
       type: gauge
-      action: inc                   # set (default) | inc | dec | add | sub | min | max | avg | first | sum | count | stddev | range | delta
+      action: inc                   # set (default) | inc | dec | add | sub | min | max | avg | sum | count
       match: ["event=connect"]
 ```
 
@@ -479,11 +524,12 @@ any field of the line without a separate `logAttributes` rule. Additional knobs:
 - **`action`** (gauge only): `set` (default, last value wins), `inc`/`dec`
   (±1 per matching line, no value needed), `add`/`sub` (±the observed value),
   or a windowed aggregation over the values seen in a window: `min`, `max`,
-  `avg`, `first`, `sum`, `count` (matching lines, no value needed), `stddev`
-  (population standard deviation), `range` (max−min), `delta` (last−first). An
+  `avg`, `sum`, `count` (matching lines, no value needed). An
   aggregation emits its value on every export and keeps emitting it while no new
   value arrives; the first value after an export starts a fresh window (so `avg`
-  is a per-window mean).
+  is a per-window mean). The action set is deliberately closed: statistics
+  derivable from these (stddev, range, …) belong in backend recording rules,
+  which re-aggregate freely across windows.
 
 `histogram` exports cumulative OTLP histograms; `summary` carries a running
 count and sum (no quantiles); `counter` emits a monotonic sum (with synthetic
@@ -536,8 +582,6 @@ never overwrites an attribute the sender set.
 | `-ingest-span-metrics` | `false` | derive RED metrics from ingested spans (OTel spanmetrics conventions: `traces.span.metrics.calls`/`.size`/`.duration` with per-bucket trace-id exemplars), dimensioned by `service.name`/`span.name`/`span.kind`/`status.code` plus the `traceMetrics` config section's extra dimensions. Requires `-ingest-traces` |
 | `-ingest-span-metrics-interval` | `1m` | export interval for the span metrics (exported under the agent's own resource identity; the described service is a data-point label) |
 | `-ingest-peer-ip-fallback` | `false` | attribute telemetry whose resource carries **no** container id / pod uid to the pod owning the connection's peer IP (`GET /v1/pod-ips/{ip}`, live non-hostNetwork pods only). Opt-in: NAT can rewrite peer addresses, and hostNetwork senders share the node IP and never resolve. Counted as `kubescrape_ingest_resources_total{outcome="peer_ip"}` |
-| `-ingest-batch-items` | `0` | coalesce pushed payloads per signal to this many items (log records / data points / spans) before forwarding, flushing partial batches after `-ingest-batch-timeout` (200ms) or before the encoded payload exceeds `-ingest-batch-bytes` (3 MiB). `0` forwards each request as received. Enqueueing acknowledges the sender (collector batch-processor semantics) — pair with `-buffer-dir` for at-least-once delivery of coalesced batches (note: traces are never disk-buffered, so batching trades the sender's own retry for best-effort delivery of acked spans); a full queue back-pressures senders with a retryable error |
-| `-ingest-batch-bytes` | `3145728` | flush a coalescing batch before its encoded size would exceed this (keeps merged payloads under the collector's 4 MiB gRPC recv default) |
 | `-ingest-container-id-keys` | `container.id,k8s.container.id` | attribute keys inspected for a container ID |
 | `-ingest-pod-uid-keys` | `k8s.pod.uid` | attribute keys inspected for a pod UID |
 | `-ingest-metadata-wait` | `0` | how long a lookup may block for a not-yet-known object |
@@ -608,7 +652,7 @@ derived ahead of sampling while only the sampled subset ships.
 | `-scrape-max-samples` | `0` | abort a single scrape beyond this many samples (0 = unlimited) |
 | `-scrape-exemplars` | `false` | negotiate OpenMetrics and attach exemplars to counter and histogram points (`trace_id`/`span_id` map to OTLP trace/span fields) |
 | `-scrape-health-metrics` | `true` | export synthetic `up`, `scrape_duration_seconds` and `scrape_samples_scraped` gauges per target after each cycle |
-| `-scrape-native-histograms` | `false` | offer the Prometheus **protobuf exposition** to annotation/monitor targets and convert native histograms to OTLP **exponential histogram** points. A family carrying both native and classic data uses the native representation; custom-bucket histograms (schema −53) fall back to classic buckets; targets that ignore the Accept header keep serving text (the parse mode follows the response Content-Type), and splitter-backed targets stay on the text path |
+| `-scrape-native-histograms` | `false` | offer the Prometheus **protobuf exposition** to annotation/monitor targets — splitter-backed ones included — and convert native histograms to OTLP **exponential histogram** points (a split rule routes native points through the same groupBy/enrichment machinery as every other kind). A family carrying both native and classic data uses the native representation; custom-bucket histograms (schema −53) fall back to classic buckets; targets that ignore the Accept header keep serving text (the parse mode follows the response Content-Type) |
 
 Series filters and target splitters live in the `metrics` section of `-config`
 ([below](#metrics-config)).

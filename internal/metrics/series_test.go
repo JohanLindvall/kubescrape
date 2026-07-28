@@ -4,8 +4,8 @@ package metrics
 
 import (
 	"context"
-	"log/slog"
 	"math"
+	"strings"
 	"testing"
 	"time"
 
@@ -237,12 +237,8 @@ func TestAggregationsAcrossThreeExports(t *testing.T) {
 		{actionMin, 5, 2},
 		{actionMax, 20, 4},
 		{actionAvg, 35.0 / 3.0, 3},
-		{actionFirst, 10, 2},
 		{actionSum, 35, 6},
 		{actionCount, 3, 2},
-		{actionStddev, 6.236095644623236, 1}, // population stddev {10,5,20}; {2,4}
-		{actionRange, 15, 2},
-		{actionDelta, 10, 2}, // 20-10; 4-2
 	}
 	for _, c := range actions {
 		t0 := int64(1_700_600_000)
@@ -277,28 +273,17 @@ func TestAggregationsAcrossThreeExports(t *testing.T) {
 	testEpoch.Store(0)
 }
 
-// TestDeltaSingleValueWindowAndReset: delta of a single-value window is 0, and
-// a "counter reset" (smaller value in the next window) yields that window's
-// last-first, not leakage from the previous window.
-func TestDeltaSingleValueWindowAndReset(t *testing.T) {
-	setTimeForTest(time.Unix(1_700_610_000, 0))
-	defer testEpoch.Store(0)
-	s := newSeries(seriesSpec{name: "g", kind: kindGauge, action: actionDelta, expiration: time.Hour})
-	lbls := labels{}.set("m", "1")
-
-	s.observe(lbls, 100, resKey{}, emptyResource, nil)
-	s.observe(lbls, 150, resKey{}, emptyResource, nil)
-	if out := s.snapshot(); out[0].value != 50 {
-		t.Fatalf("delta w1 = %v, want 50", out[0].value)
-	}
-	s.observe(lbls, 3, resKey{}, emptyResource, nil) // process restarted: counter reset
-	if out := s.snapshot(); out[0].value != 0 {
-		t.Fatalf("delta single-value w2 = %v, want 0", out[0].value)
-	}
-	s.observe(lbls, 5, resKey{}, emptyResource, nil)
-	s.observe(lbls, 9, resKey{}, emptyResource, nil)
-	if out := s.snapshot(); out[0].value != 4 {
-		t.Fatalf("delta w3 = %v, want 4 (9-5, no leakage)", out[0].value)
+// TestUnknownAggregationActionsRejected: the action set is deliberately
+// closed (derivable aggregations belong in backend recording rules); an
+// unknown action must fail startup, never silently mean something else.
+func TestUnknownAggregationActionsRejected(t *testing.T) {
+	for _, action := range []string{"stddev", "range", "p99"} {
+		_, err := NewDynamicMetricSet([]Dynamic{{
+			Name: "g", Type: GaugeType, Action: action, Value: "v", Match: []string{"m=1"},
+		}})
+		if err == nil || !strings.Contains(err.Error(), "invalid gauge action") {
+			t.Fatalf("action %q: err = %v, want an invalid-action error", action, err)
+		}
 	}
 }
 
@@ -661,13 +646,9 @@ func TestGaugeAggregations(t *testing.T) {
 	}{
 		{"min", 5},
 		{"max", 20},
-		{"avg", 35.0 / 3.0},   // (10+5+20)/3
-		{"first", 10},         // first value
-		{"sum", 35},           // 10+5+20
-		{"count", 3},          // three matching lines
-		{"stddev", 6.2360956}, // population stddev of {10,5,20}
-		{"range", 15},         // 20 − 5
-		{"delta", 10},         // 20 (last) − 10 (first)
+		{"avg", 35.0 / 3.0}, // (10+5+20)/3
+		{"sum", 35},         // 10+5+20
+		{"count", 3},        // three matching lines
 	}
 	for _, c := range cases {
 		t.Run(c.action, func(t *testing.T) {
@@ -720,24 +701,5 @@ func TestGaugeAggregationWindow(t *testing.T) {
 	add("9") // folds into the current (post-export) window
 	if got, _ := gaugeValue(t, set, "g", "", ""); got != 9 {
 		t.Fatalf("window max after fold = %v, want 9", got)
-	}
-}
-
-// TestStddevLargeMagnitude pins Welford's numerical stability: the naive
-// E[x²]−E[x]² form catastrophically cancelled for large values with small
-// spread and reported 0.
-func TestStddevLargeMagnitude(t *testing.T) {
-	s := newSeries(seriesSpec{name: "m", kind: kindGauge, action: actionStddev, log: slog.Default()})
-	for _, v := range []float64{1e9, 1e9 + 1, 1e9 + 2} {
-		s.observe(labels{{"k", "v"}}, v, resKey{}, emptyResource, nil)
-	}
-	samps := s.snapshot()
-	if len(samps) != 1 {
-		t.Fatalf("samples: %d", len(samps))
-	}
-	got := samps[0].value     // snapshot already aggregated the window
-	want := 0.816496580927726 // population stddev of {0,1,2}
-	if math.Abs(got-want) > 1e-9 {
-		t.Fatalf("stddev = %v, want %v", got, want)
 	}
 }

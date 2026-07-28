@@ -70,6 +70,9 @@ spec:
         app: kubescrape
     spec:
       serviceAccountName: kubescrape
+      # Cluster-critical: an evicted metadata service stalls attribution
+      # cluster-wide (agents block on lookups).
+      priorityClassName: system-cluster-critical
       containers:
         - name: kubescrape
           image: ghcr.io/johanlindvall/kubescrape:latest

@@ -60,17 +60,16 @@ const (
 	// The following aggregate values over a window: the aggregate is emitted on
 	// every export and kept while no new value arrives; the next value after an
 	// export starts a fresh window. actionMin must stay first of this group
-	// (aggregating() tests action >= actionMin). value/value2/count hold the
+	// (aggregating() tests action >= actionMin). value/count hold the
 	// per-action running state (see record); snapshot renders the aggregate.
-	actionMin    // window minimum (value)
-	actionMax    // window maximum (value)
-	actionAvg    // window mean (value = running sum, count = n)
-	actionFirst  // first value of the window (value)
-	actionSum    // window total (value = running sum)
-	actionCount  // number of matching lines in the window (count; value ignored)
-	actionStddev // window std deviation (value = running mean, value2 = M2; Welford)
-	actionRange  // window max − min (value = min, value2 = max)
-	actionDelta  // window last − first (value = first, value2 = last)
+	// This set is deliberately closed: anything derivable from these (stddev,
+	// range, delta, first, ...) belongs in backend recording rules, which
+	// re-aggregate freely — not as more per-sample state here.
+	actionMin   // window minimum (value)
+	actionMax   // window maximum (value)
+	actionAvg   // window mean (value = running sum, count = n)
+	actionSum   // window total (value = running sum)
+	actionCount // number of matching lines in the window (count; value ignored)
 )
 
 // aggregating reports whether the series is a windowed-aggregation gauge.
@@ -87,14 +86,7 @@ func (s *series) aggregateValue(samp *sample) float64 {
 		return 0
 	case actionCount:
 		return n
-	case actionStddev:
-		if samp.count == 0 {
-			return 0
-		}
-		return math.Sqrt(samp.value2 / n)
-	case actionRange, actionDelta:
-		return samp.value2 - samp.value // max−min / last−first
-	default: // min, max, first, sum
+	default: // min, max, sum
 		return samp.value
 	}
 }
@@ -105,7 +97,6 @@ func (s *series) aggregateValue(samp *sample) float64 {
 // histograms.
 type sample struct {
 	value    float64
-	value2   float64 // aggregation-specific second accumulator (see gaugeAction)
 	labels   string
 	resource string
 	bucket   int
@@ -424,15 +415,10 @@ func (s *series) record(samp *expiringSample, value float64) {
 	samp.exported = false // a new value: an export must carry it before it may be reset
 	if s.aggregating() {
 		// A brand-new sample, or the first value after an emit, starts a fresh
-		// window; the rest fold in. value2 seeds to value (correct for range's
-		// max and delta's last); stddev needs value² instead.
+		// window; the rest fold in.
 		if samp.sealed || samp.count == 0 {
 			samp.sealed = false
 			samp.value = value
-			samp.value2 = value
-			if s.action == actionStddev {
-				samp.value2 = 0 // M2 of a single-value window
-			}
 			samp.count = 1
 			return
 		}
@@ -447,25 +433,8 @@ func (s *series) record(samp *expiringSample, value float64) {
 			}
 		case actionAvg, actionSum:
 			samp.value += value // running sum
-		case actionStddev:
-			// Welford's update: the naive E[x²]−E[x]² form cancels
-			// catastrophically for large values with small spread (values
-			// ~1e9 reported stddev 0).
-			n := float64(samp.count + 1)
-			delta := value - samp.value
-			samp.value += delta / n
-			samp.value2 += delta * (value - samp.value)
-		case actionRange:
-			if value < samp.value {
-				samp.value = value
-			}
-			if value > samp.value2 {
-				samp.value2 = value
-			}
-		case actionDelta:
-			samp.value2 = value // last (first stays in value)
-		case actionFirst, actionCount:
-			// first: keep the window's first value; count: only the tally matters
+		case actionCount:
+			// only the tally matters
 		}
 		samp.count++
 		return

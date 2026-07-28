@@ -47,6 +47,12 @@ type Config struct {
 	InsecureSkipVerify bool
 	// CAFile adds a PEM CA bundle for verifying the collector.
 	CAFile string
+	// ClientCertFile/ClientKeyFile present a client certificate (mTLS) to the
+	// collector. Both or neither; loaded once at startup (rotation needs a
+	// restart — acceptable for certs, whose lifetimes are months not minutes,
+	// where the bearer token deliberately re-reads).
+	ClientCertFile string
+	ClientKeyFile  string
 	// Headers are static headers sent on every export (HTTP request headers /
 	// gRPC metadata) — e.g. a multi-tenant collector's X-Scope-OrgID.
 	Headers map[string]string
@@ -138,6 +144,18 @@ func New(cfg Config) (*Client, error) {
 	if cfg.CompressionLevel != 0 {
 		setGzipLevel(cfg.CompressionLevel)
 	}
+	// A client certificate on a plaintext connection is a security control
+	// that silently does nothing: gRPC with Insecure discards the whole TLS
+	// config, and an http:// endpoint never handshakes. Refuse loudly — the
+	// operator who mounted a cert wants mTLS, not a no-op.
+	if cfg.ClientCertFile != "" {
+		if cfg.Protocol == "grpc" && cfg.Insecure {
+			return nil, fmt.Errorf("clientCertFile is set but the gRPC connection is plaintext; set insecure=false (-otlp-insecure=false) for this destination")
+		}
+		if cfg.Protocol == "http" && strings.HasPrefix(cfg.Endpoint, "http://") {
+			return nil, fmt.Errorf("clientCertFile is set but endpoint %q is plain http; use https://", cfg.Endpoint)
+		}
+	}
 	c := &Client{cfg: cfg}
 
 	tlsCfg, err := buildTLS(cfg)
@@ -212,6 +230,16 @@ func buildTLS(cfg Config) (*tls.Config, error) {
 			return nil, fmt.Errorf("no certificates in %s", cfg.CAFile)
 		}
 		tlsCfg.RootCAs = pool
+	}
+	if cfg.ClientCertFile != "" || cfg.ClientKeyFile != "" {
+		if cfg.ClientCertFile == "" || cfg.ClientKeyFile == "" {
+			return nil, fmt.Errorf("client certificate needs BOTH clientCertFile and clientKeyFile")
+		}
+		pair, err := tls.LoadX509KeyPair(cfg.ClientCertFile, cfg.ClientKeyFile)
+		if err != nil {
+			return nil, fmt.Errorf("loading client certificate: %w", err)
+		}
+		tlsCfg.Certificates = []tls.Certificate{pair}
 	}
 	return tlsCfg, nil
 }

@@ -48,7 +48,7 @@ type Dynamic struct {
 	Type string `json:"type,omitempty"`
 	// Action, for a gauge, selects how each observation folds: set (default,
 	// last value wins), inc (+1), dec (-1), add (+value), sub (-value), or a
-	// windowed aggregation min/max/avg/first/sum/count/stddev/range/delta.
+	// windowed aggregation min/max/avg/sum/count.
 	// Aggregations emit the aggregate on every export and keep it while no new
 	// value arrives; the first value after an export starts a fresh window.
 	// count only tallies matching lines (no value). Ignored for other types,
@@ -222,20 +222,12 @@ func (d *Dynamic) gaugeAction(kind seriesKind) (gaugeAction, error) {
 		return actionMax, nil
 	case "avg":
 		return actionAvg, nil
-	case "first":
-		return actionFirst, nil
 	case "sum":
 		return actionSum, nil
 	case "count":
 		return actionCount, nil
-	case "stddev":
-		return actionStddev, nil
-	case "range":
-		return actionRange, nil
-	case "delta":
-		return actionDelta, nil
 	default:
-		return 0, fmt.Errorf("invalid gauge action: %s", d.Action)
+		return 0, fmt.Errorf("invalid gauge action %q (want set, inc, dec, add, sub, min, max, avg, sum or count)", d.Action)
 	}
 }
 

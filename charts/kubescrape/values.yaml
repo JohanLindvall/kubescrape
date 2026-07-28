@@ -32,6 +32,13 @@ logFormat: text
 # The metadata service (Deployment).
 service:
   replicas: 1
+  # An evicted metadata service stalls attribution cluster-wide (agents block
+  # on lookups), so it schedules at cluster-critical priority. Set "" to omit.
+  priorityClassName: system-cluster-critical
+  # Spread replicas across nodes/zones when replicas > 1 (replicas are
+  # coordination-free by design, so scaling out is safe). Standard
+  # topologySpreadConstraints entries, rendered verbatim.
+  topologySpreadConstraints: []
   listen: ":8080"
   # Export the service's own metrics over OTLP at this interval (0 disables);
   # uses the otlp settings below.
@@ -96,6 +103,25 @@ service:
 
 # The per-node agent (DaemonSet).
 agent:
+  # An observability DaemonSet without node-critical priority is evicted
+  # precisely when the node is in trouble — the moment its logs matter most.
+  # Set "" to omit.
+  priorityClassName: system-node-critical
+  # DaemonSet rollout pacing; /readyz is a real readiness check, so the
+  # rollout stops at the first broken node instead of marching on.
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+  # Scheduling knobs, rendered verbatim. The default toleration keeps agents
+  # on control-plane nodes (their logs matter); tainted pools (GPU, spot)
+  # need their taints added here or they silently get NO agent.
+  tolerations:
+    - key: node-role.kubernetes.io/control-plane
+      operator: Exists
+      effect: NoSchedule
+  nodeSelector: {}
+  affinity: {}
   # HTTP listen address for /healthz, /readyz and the /debug routes. The
   # Prometheus /metrics endpoint is NOT here — it has its own port, see the
   # top-level `metrics:` section.
@@ -141,15 +167,6 @@ agent:
     # Attribute telemetry with no container id / pod uid to the pod owning the
     # connection's peer IP (opt-in; hostNetwork senders never resolve).
     peerIpFallback: false
-    # Coalesce pushed payloads per signal to this many items before forwarding
-    # (0 forwards each request as received). Pair with the disk buffer for
-    # at-least-once delivery of coalesced batches.
-    batchItems: 0
-    batchTimeout: 200ms
-    # Flush a coalescing batch before its encoded size would exceed this many
-    # bytes (keeps merged payloads under the collector's 4 MiB gRPC recv
-    # default).
-    batchBytes: 3145728 # 3 MiB
     containerIdKeys: []         # default: [container.id, k8s.container.id]
     podUidKeys: []              # default: [k8s.pod.uid]
 
@@ -289,5 +306,10 @@ agent:
     limits:
       memory: 512Mi
 
+# Ingress NetworkPolicies for both components, restricting each pod to the
+# ports the chart itself declares (the pprof port stays closed). Enabled BY
+# DEFAULT: the metadata API is unauthenticated by design, which makes network
+# policy the load-bearing compensating control — on a CNI without policy
+# enforcement the objects are inert, so the default costs nothing there.
 networkPolicy:
-  enabled: false
+  enabled: true

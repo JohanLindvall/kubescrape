@@ -211,10 +211,38 @@ func TestScrapeAuthUsesConstantTimeCompare(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(src), "subtle.ConstantTimeCompare([]byte(got), []byte(s.scrapeAuthToken))") {
-		t.Fatal("the scrape-auth token must be compared with crypto/subtle.ConstantTimeCompare")
+	if !strings.Contains(string(src), "subtle.ConstantTimeCompare([]byte(got), []byte(tok))") {
+		t.Fatal("the scrape-auth tokens must be compared with crypto/subtle.ConstantTimeCompare")
 	}
-	if strings.Contains(string(src), "got == s.scrapeAuthToken") {
-		t.Fatal("string equality on the scrape-auth token leaks it to a timing attack")
+	if strings.Contains(string(src), "got == tok") {
+		t.Fatal("string equality on a scrape-auth token leaks it to a timing attack")
+	}
+}
+
+// During a rotation grace window BOTH the current and previous token
+// authorize; anything else still fails. This is what lets the token file
+// rotate without agents and the service flipping in lockstep.
+func TestScrapeAuthAcceptsRotationSet(t *testing.T) {
+	tokens := []string{"new-token", "old-token"}
+	s := New(Config{
+		Secrets:          stubSecrets{},
+		ScrapeAuthTokens: func() []string { return tokens },
+	})
+	req := func(tok string) bool {
+		r := httptest.NewRequest("GET", "/v1/scrape-auth/ns/n/k", nil)
+		if tok != "" {
+			r.Header.Set("Authorization", "Bearer "+tok)
+		}
+		return s.authorizedForScrapeAuth(r)
+	}
+	if !req("new-token") || !req("old-token") {
+		t.Fatal("both rotation-window tokens must authorize")
+	}
+	if req("wrong") || req("") {
+		t.Fatal("non-window tokens must not authorize")
+	}
+	tokens = []string{"new-token"} // grace expired
+	if req("old-token") {
+		t.Fatal("the previous token must stop authorizing after the grace window")
 	}
 }

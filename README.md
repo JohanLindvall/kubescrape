@@ -234,9 +234,11 @@ can even probe which secrets a monitor references. The token is compared in
 constant time, and `-scrape-auth-secrets` **without** `-scrape-auth-token-file`
 is a startup error — the service holds cluster-wide `secrets: get`, so an
 unauthenticated endpoint here would hand every referenced Secret key to
-anything that can open a connection to the service. The token is read once at
-startup (rotation = update the Secret, restart the service and the agents);
-every replica just reads the same file. The rest of the API stays
+anything that can open a connection to the service. The token file is re-read
+about once a minute, and after a change the previous token stays accepted for
+a 5-minute grace window — rotation is just updating the Secret; the service
+and the agents (which re-read on the same cadence) converge with no restarts.
+Every replica just reads the same file. The rest of the API stays
 unauthenticated: it carries no secret material and agents poll it constantly.
 
 ### `GET /healthz`, `GET /readyz`
@@ -249,7 +251,10 @@ metrics machinery as everything else and **pushed over OTLP**
 (`-self-metrics-interval`, default 1m; 0 disables) — together with the Go
 cluster telemetry. The process's own Go runtime and process metrics
 (`go_*`, `process_*`) are served as Prometheus text on the dedicated
-`-metrics-listen` port instead. There is no other Prometheus
+`-metrics-listen` port instead — and with `-self-metrics-interval=0` that
+port also serves the `kubescrape_*` internal metrics, replacing the OTLP
+push with a scrape (one knob selects the modality, so the same series never
+ship twice). There is no other Prometheus
 format, for debugging the process itself.
 
 ## Reusable packages
@@ -286,7 +291,7 @@ make build           # or: go build ./cmd/kubescrape
 | `-resync`       | `0`     | informer resync period (0 = watch stream only)                            |
 | `-servicemonitors` | `false` | serve targets for ServiceMonitor CRDs — plus PodMonitors when the cluster serves them (see above) |
 | `-scrape-auth-secrets` | `false` | serve the Secret keys monitor endpoints reference (`bearerTokenSecret`, `basicAuth`, `authorization.credentials`, `tlsConfig` ca/cert/keySecret) on `/v1/scrape-auth`; only keys some monitor actually names are served (requires `secrets get` RBAC **and** `-scrape-auth-token-file`) |
-| `-scrape-auth-token-file` | — | file holding the shared bearer token callers must present on `/v1/scrape-auth` (`Authorization: Bearer <token>`); mandatory with `-scrape-auth-secrets`, read once at startup |
+| `-scrape-auth-token-file` | — | file holding the shared bearer token callers must present on `/v1/scrape-auth` (`Authorization: Bearer <token>`); mandatory with `-scrape-auth-secrets`; re-read per minute with a 5-minute grace for the previous token, so rotation needs no restarts |
 
 The service's own metrics are pushed over OTLP (`-self-metrics-interval`);
 the connection uses the agent's exporter flags: `-otlp-endpoint`,
@@ -368,6 +373,7 @@ metrics:       {pipelines: {...}, splitters: [...]}   # scraped-series rules
 traceMetrics:  {dimensions: [...], buckets: [...], staleAfter: 15m}  # span-derived RED metrics
 traceSampling: {probability: 0.1, ...}          # sample ingested spans
 routing:       {routes: [...]}    # per-namespace fan-out / tenancy
+export:        {headers: {...}, logs: {...}, metrics: {...}, traces: {...}}  # per-signal OTLP destinations, buffered-chain headers, mTLS
 ```
 
 (Starlark transforms are the one exception: they live in their **own** file,
@@ -476,6 +482,30 @@ the positions file, spools or the network. Run it in CI: a DaemonSet's bad
 ConfigMap otherwise surfaces as a fleet-wide CrashLoop. A real start runs the
 same validation, so the two cannot disagree.
 
+**Config unit tests** (`-test-config tests.yaml`). Goes one step further than
+`-check-config`: named sample lines run through the compiled pipeline in the
+tailer's order (scrub → logAttributes → enrich → logMetrics → `logs.rules` →
+transforms) and assertions check the outcome — kept/dropped, the post-scrub
+body, the enriched severity, lifted attributes, and which log-metrics
+observed the line:
+
+```yaml
+tests:
+  - name: health checks dropped
+    line: 'GET /healthz 200 OK'
+    expect: {kept: false}
+  - name: secrets scrubbed, errors counted
+    line: 'level=error auth="Bearer abc123"'
+    expect:
+      severity: error
+      body: 'level=error auth="Bearer [REDACTED]"'
+      metrics: [errors_total]
+```
+
+Exit status is non-zero on any failure, so a too-greedy drop or scrub regex
+is caught in CI instead of by missing production logs. Like `-check-config`,
+nothing is acquired.
+
 **Log enrichment** (`-enrich`, default true — one switch covering container
 logs, journald and pushed OTLP log bodies). Each exported line is run
 through [JohanLindvall/enrich](https://github.com/JohanLindvall/enrich),
@@ -571,7 +601,7 @@ logMetrics:
       matchRegexp: ["__line__=slow request"]
     - name: connections
       type: gauge
-      action: inc                     # set (default)|inc|dec|add|sub|min|max|avg|first|sum|count|stddev|range|delta
+      action: inc                     # set (default)|inc|dec|add|sub|min|max|avg|sum|count
       match: ["event=connect"]
 ```
 
@@ -586,11 +616,11 @@ Extras beyond the basics:
   regex capture group (mutually exclusive with `value`).
 - **Gauge `action`** — `set` (default, last value wins), `inc`/`dec` (±1 per
   line), `add`/`sub` (±the value), or a windowed aggregation over the values seen
-  in a window: `min`, `max`, `avg`, `first`, `sum`, `count` (matching lines),
-  `stddev` (population), `range` (max−min), `delta` (last−first). An aggregation
+  in a window: `min`, `max`, `avg`, `sum`, `count` (matching lines). An aggregation
   emits its value on every export and keeps emitting it while no new value
   arrives; the first value after an export starts a fresh window (so `avg` is a
-  per-scrape-window mean, like the old avg-gauge).
+  per-scrape-window mean, like the old avg-gauge). Derived statistics (stddev,
+  range, …) are backend recording-rule territory.
 
 Only these configured metrics are exported (no internal bookkeeping series).
 The export interval, chunk size and an optional name prefix are runtime flags:
@@ -656,8 +686,9 @@ histogram** points; classic series in a protobuf response convert exactly
 as in text. A family carrying both native and classic data uses the native
 representation; custom-bucket histograms (schema −53) fall back to classic
 buckets. Targets that ignore the Accept header keep serving text (the parse
-mode always follows the response Content-Type), and splitter-backed targets
-(kube-state-metrics style) stay on the text path.
+mode always follows the response Content-Type). Splitter-backed targets
+(kube-state-metrics style) take the protobuf path too — native points route
+through the same groupBy/enrichment machinery as every other kind.
 
 **Kubelet metrics.** With `-kubelet-endpoint` (e.g.
 `https://$(NODE_IP):10250`) the agent also scrapes, authenticated with its
@@ -725,9 +756,9 @@ one resource per object, as a kube-state-metrics-style stream needs), or
 `-ingest-peer-ip-fallback` (opt-in), a resource carrying **no** ID at all is
 attributed to the pod owning the connection's peer IP (live, non-hostNetwork
 pods only, via `GET /v1/pod-ips/{ip}`) — so unmodified SDKs get k8s
-attribution with zero sender configuration. `-ingest-batch-items` coalesces
-pushed payloads per signal before forwarding (collector batch-processor
-semantics; pair with `-buffer-dir` for at-least-once). Enrichment
+attribution with zero sender configuration. Payloads are forwarded as
+received (batch in the sender's SDK or the downstream collector); every
+forward keeps the sender's own retry semantics. Enrichment
 outcomes count into `kubescrape_ingest_resources_total{outcome}` (including
 `peer_ip`).
 
@@ -776,11 +807,12 @@ content hash, for checking per-node convergence after a reload), and `GET /debug
 **Three separate listeners.** `-listen` carries health and the `/debug`
 surface; `-metrics-listen` (default `:9090`) serves the Prometheus
 `GET /metrics` endpoint with this process's Go runtime and process metrics
-(`go_*`, `process_*`); `-pprof-listen` (empty by default) serves
+(`go_*`, `process_*`) — plus the `kubescrape_*` internal metrics when
+`-self-metrics-interval=0` disables the OTLP push; `-pprof-listen` (empty by
+default) serves
 `net/http/pprof`. Profiles expose goroutine stacks and heap contents, so the
 port carrying them is the one to firewall or bind to localhost — which is why
-it is a port of its own. kubescrape's own `kubescrape_*` metrics stay on the
-OTLP push: they are telemetry about the cluster, not process diagnostics.
+it is a port of its own.
 
 **Metric filtering and splitting** (`metrics` section). This section has two
 subsections. `pipelines` holds ordered keep/drop rules per pipeline

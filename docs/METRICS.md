@@ -1,17 +1,16 @@
 # Metrics
 
-kubescrape's own metrics (`kubescrape_*`) are **pushed over OTLP**, not
-scraped. They are exported on `-self-metrics-interval` (default 1m, 0
-disables) under the exporting process's own resource identity:
-`service.name=kubescrape` plus hostname for the metadata service,
-`service.name=kubescrape-agent` plus `k8s.node.name` for the agent, both
-stamped with `service.version`.
+kubescrape's own metrics (`kubescrape_*`) are **pushed over OTLP** by
+default: exported on `-self-metrics-interval` (default 1m) under the
+exporting process's own resource identity — `service.name=kubescrape` plus
+hostname for the metadata service, `service.name=kubescrape-agent` plus
+`k8s.node.name` for the agent, both stamped with `service.version`.
 
-They are deliberately **not** served on `/metrics`. That endpoint carries only
-the Go runtime and process collectors (`go_*`, `process_*`) on its own
-`-metrics-listen` port, because `Registry.snapshot()` consumes the interval
-state the push path depends on — a scrape would steal samples from the
-exporter.
+With `-self-metrics-interval=0` the push is off and the same metrics are
+served on the `-metrics-listen` port's `/metrics` instead, beside the Go
+runtime and process collectors (`go_*`, `process_*`) that always live
+there. One knob selects the delivery modality, so the same series never
+ship over both paths.
 
 This file is generated from `internal/obs/obs.go`. Regenerate with
 `go test ./internal/obs/ -run TestMetricsDocIsCurrent -update-metrics-doc`;
@@ -30,7 +29,6 @@ names a metric or a label that is not registered.
 | `kubescrape_buffer_truncated_bytes_total` | `signal` | Bytes discarded by truncating a damaged or torn disk-buffer segment tail at open. |
 | `kubescrape_export_requests_total` | `signal`, `outcome` | OTLP export attempts by signal and outcome. |
 | `kubescrape_http_requests_total` | `pattern`, `code` | Metadata API requests by pattern and status code. |
-| `kubescrape_ingest_dropped_batches_total` | `signal` | Acknowledged ingest batches dropped: permanent collector rejection or the transient-retry limit exhausted. |
 | `kubescrape_ingest_resources_total` | `outcome` | Distinct pushed identities (container id / pod uid, memoized per request) by enrichment outcome (enriched, unresolved, peer_ip). |
 | `kubescrape_journal_dropped_batches_total` | — | Journal batches dropped after a permanent collector rejection (the cursor advances past them). |
 | `kubescrape_journal_entries_total` | — | Journal entries exported. |
@@ -74,4 +72,4 @@ names a metric or a label that is not registered.
 | `kubescrape_transform_errors_total` | `signal` | Transform program invocations that failed (the batch is NOT exported; the error propagates to the producer's retry path). |
 | `kubescrape_transform_reloads_total` | `outcome` | Transforms-file reloads by outcome (applied, failed — a failed compile keeps the last good program). |
 
-53 metrics.
+52 metrics.

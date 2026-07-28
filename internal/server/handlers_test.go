@@ -231,3 +231,32 @@ func TestPodByIPUncached(t *testing.T) {
 		t.Fatal("pod-uids lost its cache headers")
 	}
 }
+
+// The node-targets route carries the writeCached treatment like the other
+// metadata 200s: a stable ETag across identical requests (the target order
+// must be deterministic — PodsOnNode iterates a map) and a 304 on
+// If-None-Match, so agents stop re-downloading every pod document on the
+// node each scrape cycle when nothing changed.
+func TestNodeTargetsCachedWithStableETag(t *testing.T) {
+	st := store.New(time.Minute)
+	addPod(st)
+	srv := cachingServer(t, st, 10*time.Second)
+
+	url := srv.URL + "/v1/nodes/node1/targets"
+	etag := condGet(t, url, "", http.StatusOK)
+	if etag == "" {
+		t.Fatal("no ETag on the targets response")
+	}
+	for i := 0; i < 5; i++ { // deterministic body → stable tag
+		if e := condGet(t, url, "", http.StatusOK); e != etag {
+			t.Fatalf("ETag changed across identical requests: %q vs %q", e, etag)
+		}
+	}
+	condGet(t, url, etag, http.StatusNotModified)
+
+	// With caching disabled (TTL 0) the route stays a plain 200, no ETag.
+	plain := cachingServer(t, st, 0)
+	if e := condGet(t, plain.URL+"/v1/nodes/node1/targets", "", http.StatusOK); e != "" {
+		t.Fatalf("TTL 0 must not stamp an ETag, got %q", e)
+	}
+}

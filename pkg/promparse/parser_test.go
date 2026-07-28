@@ -469,3 +469,73 @@ func TestParserSequentialReuse(t *testing.T) {
 		t.Fatalf("fourth exposition: %d samples, want 1", got)
 	}
 }
+
+// Prometheus 3 quoted UTF-8 names: the metric name as the first brace entry,
+// quoted label names, quoted families in TYPE/HELP/UNIT — all resolving to
+// the same unescaped strings so classification and metadata line up.
+func TestQuotedUTF8Names(t *testing.T) {
+	body := `# TYPE "my.requests" counter
+# HELP "my.requests" Dotted requests.
+{"my.requests",code="200","status class"="2xx"} 5
+# TYPE "lat.seconds" histogram
+{"lat.seconds_bucket",le="1"} 3
+{"lat.seconds_bucket",le="+Inf"} 4
+{"lat.seconds_sum"} 2.5
+{"lat.seconds_count"} 4
+plain{"dotted.label"="v"} 1
+`
+	var got []Sample
+	p := New(Options{})
+	malformed, err := p.Parse(strings.NewReader(body), func(s Sample) error {
+		s.Labels = append([]Label(nil), s.Labels...)
+		got = append(got, s)
+		return nil
+	})
+	if err != nil || malformed != 0 {
+		t.Fatalf("err=%v malformed=%d", err, malformed)
+	}
+	if len(got) != 6 {
+		t.Fatalf("samples = %d, want 6", len(got))
+	}
+	c := got[0]
+	if c.Name != "my.requests" || c.Role != RoleCounter || c.Help != "Dotted requests." {
+		t.Fatalf("counter = %+v", c)
+	}
+	if len(c.Labels) != 2 || c.Labels[0] != (Label{"code", "200"}) || c.Labels[1] != (Label{"status class", "2xx"}) {
+		t.Fatalf("counter labels = %v", c.Labels)
+	}
+	if b := got[1]; b.Role != RoleHistogramBucket || b.Family != "lat.seconds" {
+		t.Fatalf("bucket = %+v", b)
+	}
+	if s := got[3]; s.Role != RoleHistogramSum || s.Family != "lat.seconds" {
+		t.Fatalf("sum = %+v", s)
+	}
+	if pl := got[5]; pl.Name != "plain" || len(pl.Labels) != 1 || pl.Labels[0] != (Label{"dotted.label", "v"}) {
+		t.Fatalf("plain-with-quoted-label = %+v", pl)
+	}
+}
+
+// Escapes inside quoted names unescape to the real name; degenerate quoted
+// forms stay malformed.
+func TestQuotedNameEdgeCases(t *testing.T) {
+	var names []string
+	body := "{\"esc\\\"aped\"} 1\n" + // name with an escaped quote
+		"{} 1\n" + // no name at all
+		"{\"\"} 1\n" + // empty name
+		"{\"lbl\"=\"v\"} 1\n" + // quoted first entry is a LABEL: still nameless
+		"{\"broken} 1\n" // unterminated quote
+	p := New(Options{})
+	malformed, err := p.Parse(strings.NewReader(body), func(s Sample) error {
+		names = append(names, s.Name)
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(names) != 1 || names[0] != `esc"aped` {
+		t.Fatalf("names = %q", names)
+	}
+	if malformed != 4 {
+		t.Fatalf("malformed = %d, want 4", malformed)
+	}
+}

@@ -1,5 +1,7 @@
 // Package promparse is a streaming parser for the Prometheus text exposition
-// format, classic and OpenMetrics.
+// format, classic and OpenMetrics, including the Prometheus 3 quoted UTF-8
+// name syntax ({"my.metric",code="200"} 1, quoted label names, and quoted
+// families on # TYPE/# HELP/# UNIT).
 //
 // It never buffers more than one line, so memory stays independent of the
 // scrape size — a 100k-series endpoint parses in constant memory, which is why
@@ -472,8 +474,8 @@ func (p *Parser) parseComment(line []byte) bool {
 	case string(directive) == "HELP":
 		// The remainder of the line is free text (spaces included), escaped
 		// for backslash and newline.
-		family, rest := nextField(rest)
-		if len(family) > 0 {
+		family, rest, ok := familyToken(rest)
+		if ok {
 			p.setMeta(family, unescapeHelp(skipSpaceTab(rest)), "")
 		}
 	case string(directive) == "UNIT":
@@ -481,15 +483,15 @@ func (p *Parser) parseComment(line []byte) bool {
 		// the exposition is the only authority on what its values measure, and
 		// guessing a UCUM translation would be lossy in a way the raw string
 		// is not.
-		family, rest := nextField(rest)
+		family, rest, ok := familyToken(rest)
 		unit, rest := nextField(rest)
-		if len(family) > 0 && len(unit) > 0 && len(skipSpaceTab(rest)) == 0 {
+		if ok && len(unit) > 0 && len(skipSpaceTab(rest)) == 0 {
 			p.setMeta(family, "", string(unit))
 		}
 	case string(directive) == "TYPE":
-		family, rest := nextField(rest)
+		family, rest, ok := familyToken(rest)
 		typ, rest := nextField(rest)
-		if len(family) == 0 || len(typ) == 0 || len(skipSpaceTab(rest)) != 0 {
+		if !ok || len(typ) == 0 || len(skipSpaceTab(rest)) != 0 {
 			return false // malformed TYPE: counted, not silently ignored
 		}
 		if len(p.types) >= MaxTrackedFamilies {
@@ -508,17 +510,32 @@ func (p *Parser) parseComment(line []byte) bool {
 		default:
 			t = TypeUntyped
 		}
-		p.types[string(family)] = t
+		p.types[family] = t
 		p.lastClassOK = false // the memo may hold the family just (re)declared
 	}
 	return true
+}
+
+// familyToken reads a family-name token after a TYPE/HELP/UNIT directive: the
+// Prometheus 3 quoted form ("my.metric" — escaped, may contain any UTF-8
+// including spaces) or a bare field. The UNESCAPED name is the table key, so
+// it matches the names quoted sample lines produce. Cold path (one call per
+// comment line), so the string materialization costs nothing that matters.
+func familyToken(rest []byte) (string, []byte, bool) {
+	rest = skipSpaceTab(rest)
+	if len(rest) > 0 && rest[0] == '"' {
+		fam, rem, ok := parseQuotedSlow(rest[1:])
+		return fam, rem, ok && fam != ""
+	}
+	tok, rem := nextField(rest)
+	return string(tok), rem, len(tok) > 0
 }
 
 // setMeta records a family's HELP text or UNIT (the empty string leaves the
 // other field alone). Called once per family — the per-sample path only reads
 // the table, through classifyCached — so the key and text allocations here are
 // per family, never per line.
-func (p *Parser) setMeta(family []byte, help, unit string) {
+func (p *Parser) setMeta(family string, help, unit string) {
 	if help == "" && unit == "" {
 		return
 	}
@@ -533,14 +550,14 @@ func (p *Parser) setMeta(family []byte, help, unit string) {
 	if p.metas == nil {
 		p.metas = make(map[string]familyMeta, 16)
 	}
-	m := p.metas[string(family)] // keyed lookup: no allocation
+	m := p.metas[family]
 	if help != "" {
 		m.help = help
 	}
 	if unit != "" {
 		m.unit = unit
 	}
-	p.metas[string(family)] = m
+	p.metas[family] = m
 	p.lastClassOK = false // the memo may hold the family just redeclared
 }
 
@@ -666,7 +683,9 @@ func (p *Parser) parseSample(line []byte) (Sample, bool) {
 		for i = 0; i < len(line) && line[i] != '{' && line[i] != ' ' && line[i] != '\t'; i++ {
 		}
 		if i == 0 {
-			return s, false
+			// No bare name. The Prometheus 3 quoted form carries the name as
+			// the first brace entry instead: {"my.metric",label="v"} 1
+			return p.parseQuotedNameSample(line)
 		}
 		if string(line[:i]) == p.lastMetric { // memcmp fast path, no alloc
 			s.Name = p.lastMetric
@@ -687,8 +706,51 @@ func (p *Parser) parseSample(line []byte) (Sample, bool) {
 		}
 	}
 	s.Labels = p.labels
+	return p.finishSample(s, rest)
+}
 
-	// Value.
+// parseQuotedNameSample parses the Prometheus 3 quoted-name sample form,
+// where the metric name is the first (bare, quoted) entry of the brace block:
+//
+//	{"my.metric",code="200","my.label"="v"} 1 [ts]
+//
+// A quoted first entry FOLLOWED by '=' is a label, not the name, and a brace
+// block without a name entry names nothing — both stay malformed, exactly as
+// prometheus/common's parser treats them. Cold path: dotted-name targets are
+// the exception, not the rule, so no last-seen caches participate here.
+func (p *Parser) parseQuotedNameSample(line []byte) (Sample, bool) {
+	var s Sample
+	if len(line) < 2 || line[0] != '{' {
+		return s, false
+	}
+	rest := skipSpaceTab(line[1:])
+	if len(rest) == 0 || rest[0] != '"' {
+		return s, false
+	}
+	name, rem, ok := p.parseQuoted(rest[1:], nil)
+	if !ok || name == "" {
+		return s, false
+	}
+	rem = skipSpaceTab(rem)
+	if len(rem) > 0 && rem[0] == '=' {
+		return s, false // the quoted entry was a label; the block has no name
+	}
+	s.Name = name
+	if len(rem) > 0 && rem[0] == ',' {
+		rem = rem[1:]
+	}
+	p.labels = p.labels[:0]
+	rem, ok = p.parseLabels(rem, &p.labels, &p.lastKV)
+	if !ok {
+		return s, false
+	}
+	s.Labels = p.labels
+	return p.finishSample(s, rem)
+}
+
+// finishSample parses the value, optional timestamp and optional exemplar
+// after the name/labels — shared by the classic and quoted-name forms.
+func (p *Parser) finishSample(s Sample, rest []byte) (Sample, bool) {
 	var ok bool
 	s.Value, rest, ok = p.parseFloatToken(rest)
 	if !ok {
@@ -815,26 +877,37 @@ func (p *Parser) parseLabels(rest []byte, dst *[]Label, cache *[]lastKV) ([]byte
 		last := &(*cache)[pos]
 		// Label name. Consecutive lines of a family repeat names positionally,
 		// so matching the previous line's name plus its '=' terminator in one
-		// memcmp skips the byte scan.
+		// memcmp skips the byte scan. A quoted name (the Prometheus 3 UTF-8
+		// form, "my.label"="v") takes its own cold branch — rare enough that it
+		// deliberately skips the positional cache.
 		var name string
-		i := 0
-		if n := len(last.name); n > 0 && n < len(rest) && rest[n] == '=' && string(rest[:n]) == last.name {
-			name = last.name
-			i = n
-		} else {
-			for i = 0; i < len(rest) && rest[i] != '=' && rest[i] != ' ' && rest[i] != '\t'; i++ {
-			}
-			if i == 0 {
+		if rest[0] == '"' {
+			v, rem, qok := p.parseQuoted(rest[1:], nil)
+			if !qok || v == "" {
 				return nil, false
 			}
-			if string(rest[:i]) == last.name { // memcmp fast path, no alloc
+			name = v
+			rest = skipSpaceTab(rem)
+		} else {
+			i := 0
+			if n := len(last.name); n > 0 && n < len(rest) && rest[n] == '=' && string(rest[:n]) == last.name {
 				name = last.name
+				i = n
 			} else {
-				name = p.internName(rest[:i])
-				last.name = name
+				for i = 0; i < len(rest) && rest[i] != '=' && rest[i] != ' ' && rest[i] != '\t'; i++ {
+				}
+				if i == 0 {
+					return nil, false
+				}
+				if string(rest[:i]) == last.name { // memcmp fast path, no alloc
+					name = last.name
+				} else {
+					name = p.internName(rest[:i])
+					last.name = name
+				}
 			}
+			rest = skipSpaceTab(rest[i:])
 		}
-		rest = skipSpaceTab(rest[i:])
 		if len(rest) == 0 || rest[0] != '=' {
 			return nil, false
 		}

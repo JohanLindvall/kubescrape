@@ -60,12 +60,16 @@ func NewBuffered(inner Exporter, logSpool, metricSpool *spool.Spool, backoff tim
 		log = slog.Default()
 	}
 	b := &Buffered{inner: inner}
-	// The drain owns retry policy; when the inner exporter is the raw client,
-	// bypass its own bounded retries so attempts do not multiply (drain x
-	// client = up to 15 wire sends per cycle otherwise).
+	// The drain owns retry policy; when the inner exporter is the raw client
+	// (or the per-signal mux over raw clients), bypass its own bounded retries
+	// so attempts do not multiply (drain x client = up to 15 wire sends per
+	// cycle otherwise).
 	sendLogs, sendMetrics := inner.ExportLogs, inner.ExportMetrics
-	if c, ok := inner.(*Client); ok {
+	switch c := inner.(type) {
+	case *Client:
 		sendLogs, sendMetrics = c.exportLogsCounted, c.exportMetricsCounted
+	case *PerSignal:
+		sendLogs, sendMetrics = c.logsClient().exportLogsCounted, c.metricsClient().exportMetricsCounted
 	}
 	// Report what a damaged tail cost at open: the spool cannot (it must not
 	// import internal/obs), and nothing else ever sees those bytes.
@@ -153,10 +157,10 @@ func (b *Buffered) Stats() map[string]obs.BufferStat {
 
 // FinalDrain empties both spools, returning as soon as they run dry (or when
 // ctx expires). Run stops the instant its context is cancelled, so everything
-// exported after SIGTERM — the tailer's and journald's last flushes, the ingest
-// batcher's shutdown drain, and the final log-metrics and self-metrics windows,
-// which are exported only after those goroutines have joined — reaches the
-// spool and nothing carries it further. Without this pass that data waits for
+// exported after SIGTERM — the tailer's and journald's last flushes, the
+// ingest server's in-flight forwards, and the final log-metrics and
+// self-metrics windows, which are exported only after those goroutines have
+// joined — reaches the spool and nothing carries it further. Without this pass that data waits for
 // the next start of this pod ON THIS NODE, and is lost outright when the pod
 // never returns (node drained or scaled away, release uninstalled) or the
 // buffer dir is not a persistent mount. Call it with a bounded fresh context

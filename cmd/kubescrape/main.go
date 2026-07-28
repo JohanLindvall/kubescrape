@@ -308,10 +308,6 @@ func (r *k8sSecretReader) evictExpiredLocked() {
 // turns the service into a reader of every Secret key a monitor references, so
 // "no token file", "unreadable file" and "empty file" must all stop the
 // process rather than quietly leave the endpoint open to the whole cluster.
-//
-// The token is read ONCE, at startup: a rotated token needs a restart of the
-// service (and of the agents presenting it), which is a deliberate trade for
-// having no file I/O on the request path.
 func loadScrapeAuthToken(path string) (string, error) {
 	if path == "" {
 		return "", errors.New("-scrape-auth-secrets requires -scrape-auth-token-file: " +
@@ -329,6 +325,52 @@ func loadScrapeAuthToken(path string) (string, error) {
 		return "", fmt.Errorf("-scrape-auth-token-file %q is empty", path)
 	}
 	return token, nil
+}
+
+// scrapeAuthReadInterval bounds how often the token file is re-read on the
+// request path (Kubernetes projects rotated Secret contents into the mounted
+// file); scrapeAuthGrace keeps the PREVIOUS token accepted after a rotation,
+// so agents — which re-read their copy on their own per-minute cadence — never
+// have to flip in lockstep with the service. Rotation is thereby a non-event:
+// update the Secret, and both sides converge within the grace window with no
+// restarts and no 401 storm.
+const (
+	scrapeAuthReadInterval = time.Minute
+	scrapeAuthGrace        = 5 * time.Minute
+)
+
+// rotatingToken serves the current scrape-auth token plus, for the grace
+// window after a change, the previous one. A failed or empty re-read keeps the
+// last good value (a transient error during a Secret swap must not 401 the
+// fleet); the INITIAL read stays fatal in run().
+type rotatingToken struct {
+	path string
+	log  *slog.Logger
+
+	mu        sync.Mutex
+	cur, prev string
+	prevUntil time.Time
+	fetched   time.Time
+}
+
+// tokens returns the accepted token set, re-reading the file when stale.
+func (r *rotatingToken) tokens() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if time.Since(r.fetched) >= scrapeAuthReadInterval {
+		r.fetched = time.Now()
+		if next, err := loadScrapeAuthToken(r.path); err != nil {
+			r.log.Warn("re-reading -scrape-auth-token-file; keeping the last good token", "error", err)
+		} else if next != r.cur {
+			r.prev, r.prevUntil = r.cur, time.Now().Add(scrapeAuthGrace)
+			r.cur = next
+			r.log.Info("scrape-auth token rotated; previous token accepted for the grace window", "grace", scrapeAuthGrace)
+		}
+	}
+	if r.prev != "" && time.Now().Before(r.prevUntil) {
+		return []string{r.cur, r.prev}
+	}
+	return []string{r.cur}
 }
 
 // newLogger builds the process logger (mirrors the agent's).
@@ -354,7 +396,7 @@ func run() error {
 	var (
 		listen        = flag.String("listen", ":8080", "HTTP listen address")
 		pprofListen   = flag.String("pprof-listen", "", "listen address for net/http/pprof under /debug/pprof, on its own port (empty disables); profiles expose goroutine stacks and heap contents")
-		metricsListen = flag.String("metrics-listen", ":9090", "listen address for the Prometheus /metrics endpoint (Go runtime and process metrics; empty disables). Separate from -listen so the API and the scrape target can be exposed independently")
+		metricsListen = flag.String("metrics-listen", ":9090", "listen address for the Prometheus /metrics endpoint (Go runtime and process metrics; with -self-metrics-interval=0 also the kubescrape_* internal metrics, replacing the OTLP push with a scrape; empty disables). Separate from -listen so the API and the scrape target can be exposed independently")
 		kubeconfig    = flag.String("kubeconfig", "", "path to a kubeconfig; defaults to in-cluster config, then $KUBECONFIG/~/.kube/config")
 		maxWait       = flag.Duration("wait-timeout", 5*time.Second, "default and maximum time a container lookup blocks waiting for metadata to appear (shorten per request with ?wait=)")
 		cacheTTL      = flag.Duration("cache-ttl", 5*time.Minute, "how long metadata of deleted pods and replaced container IDs stays resolvable")
@@ -397,6 +439,8 @@ func run() error {
 		otlpBearer           = flag.String("otlp-bearer-token-file", "", "file with a bearer token sent on every export (re-read periodically)")
 		otlpTimeout          = flag.Duration("otlp-timeout", 15*time.Second, "per-export timeout")
 	)
+	var otlpHeaders headerFlags
+	flag.Var(&otlpHeaders, "otlp-header", "static key=value header sent on every self-metrics export (HTTP header / gRPC metadata, e.g. X-Scope-OrgID=tenant); repeatable")
 	flag.Parse()
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -481,6 +525,7 @@ func run() error {
 			CAFile:             *otlpCAFile,
 			BearerTokenFile:    *otlpBearer,
 			Timeout:            *otlpTimeout,
+			Headers:            otlpHeaders.m,
 		})
 		if err != nil {
 			return fmt.Errorf("creating OTLP exporter: %w", err)
@@ -532,35 +577,61 @@ func run() error {
 	// HTTPServer sets the full hardened timeout set (ReadHeaderTimeout,
 	// Read/WriteTimeout > MaxWait, IdleTimeout); see its doc comment.
 	var secretReader server.SecretReader
-	var scrapeAuthToken string
+	var scrapeAuthTokens func() []string
 	if *scrapeAuthOn {
 		// Read the token BEFORE anything starts serving: an unauthenticated
 		// /v1/scrape-auth is a cluster-wide secret leak, so a missing or empty
-		// token file is a startup failure, never a warning.
-		scrapeAuthToken, err = loadScrapeAuthToken(*scrapeAuthTokenFile)
+		// token file is a startup failure, never a warning. After startup the
+		// file is re-read periodically and a rotated token keeps its
+		// predecessor valid for a grace window (see rotatingToken).
+		token, err := loadScrapeAuthToken(*scrapeAuthTokenFile)
 		if err != nil {
 			return err
 		}
+		rt := &rotatingToken{path: *scrapeAuthTokenFile, log: log, cur: token, fetched: time.Now()}
+		scrapeAuthTokens = rt.tokens
+		// Detection runs on a CLOCK, not only on request traffic: lazily-only,
+		// a rotation on a quiet endpoint would be noticed by the first request
+		// AFTER it — anchoring the previous (revoked) token's grace window at
+		// that request instead of within a minute of the file change, and
+		// stretching its acceptance far past the documented 5 minutes.
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			ticker := time.NewTicker(scrapeAuthReadInterval)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					rt.tokens()
+				}
+			}
+		}()
 		secretReader = &k8sSecretReader{client: client}
 		log.Info("scrape auth secrets enabled", "tokenFile", *scrapeAuthTokenFile)
 	}
 	serverCfg := server.Config{
-		Store:           st,
-		Services:        svcIndex,
-		Monitors:        monitors,
-		Resolver:        resolver,
-		MaxWait:         *maxWait,
-		CacheTTL:        *metaCacheTTL,
-		Ready:           ready,
-		Secrets:         secretReader,
-		ScrapeAuthToken: scrapeAuthToken,
+		Store:            st,
+		Services:         svcIndex,
+		Monitors:         monitors,
+		Resolver:         resolver,
+		MaxWait:          *maxWait,
+		CacheTTL:         *metaCacheTTL,
+		Ready:            ready,
+		Secrets:          secretReader,
+		ScrapeAuthTokens: scrapeAuthTokens,
 	}
 	if err := serverCfg.Validate(); err != nil {
 		return err
 	}
 	srv := server.New(serverCfg).HTTPServer(*listen)
 
-	stopMetrics := obs.ServeMetrics(ctx, *metricsListen, log)
+	// With the OTLP self-metrics push disabled (-self-metrics-interval=0) the
+	// kubescrape_* metrics ride the /metrics scrape instead — the service then
+	// needs no OTLP endpoint at all.
+	stopMetrics := obs.ServeMetrics(ctx, *metricsListen, *selfMetricsIntv <= 0, log)
 	defer stopMetrics()
 	stopPprof := obs.ServePprof(ctx, *pprofListen, log)
 	defer stopPprof()
@@ -607,6 +678,25 @@ func buildConfig(kubeconfig string) (*rest.Config, error) {
 	rules := clientcmd.NewDefaultClientConfigLoadingRules()
 	rules.ExplicitPath = kubeconfig
 	return clientcmd.NewNonInteractiveDeferredLoadingClientConfig(rules, nil).ClientConfig()
+}
+
+// headerFlags collects repeatable -otlp-header key=value flags. Repeatable
+// rather than comma-separated so a header VALUE may contain commas.
+type headerFlags struct{ m map[string]string }
+
+func (h *headerFlags) String() string { return fmt.Sprint(h.m) }
+
+func (h *headerFlags) Set(v string) error {
+	key, value, ok := strings.Cut(v, "=")
+	key = strings.TrimSpace(key)
+	if !ok || key == "" {
+		return fmt.Errorf("want key=value, got %q", v)
+	}
+	if h.m == nil {
+		h.m = map[string]string{}
+	}
+	h.m[key] = value
+	return nil
 }
 
 // parseNamespaceSet turns a comma-separated flag value into a lookup set. An

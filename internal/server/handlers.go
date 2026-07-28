@@ -224,7 +224,34 @@ func (s *Server) handleNodeTargets(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
+	// Deterministic order: PodsOnNode iterates a map, and writeCached's ETag is
+	// a body hash — an order that shuffled per request would mint a fresh ETag
+	// every time and defeat the 304 revalidation entirely. URL first, then
+	// monitor/source, then the embedded pod's UID: the UID tiebreak is what
+	// makes the order TOTAL in the one case URL+monitor+source cannot separate
+	// (two hostNetwork pods sharing the node IP with the same annotated port —
+	// identical URL, empty Monitor, Source "pod", but different pod documents).
+	sort.Slice(targets, func(i, j int) bool {
+		if targets[i].URL != targets[j].URL {
+			return targets[i].URL < targets[j].URL
+		}
+		if targets[i].Monitor != targets[j].Monitor {
+			return targets[i].Monitor < targets[j].Monitor
+		}
+		if targets[i].Source != targets[j].Source {
+			return targets[i].Source < targets[j].Source
+		}
+		return targets[i].Pod.UID < targets[j].Pod.UID
+	})
+	// Cached like the other metadata 200s (Cache-Control max-age + ETag): every
+	// agent re-fetches its target list every cycle, and the response embeds the
+	// COMPLETE pod document per target — without revalidation that is the whole
+	// node's pod set re-sent 30x/min regardless of change, the one metadata
+	// route that had no 304 path. Staleness is bounded by the TTL (default 10s,
+	// under the default scrape interval and additive to the agent's own polling
+	// lag); the server-side list itself still drops deleted/finished/terminating
+	// pods immediately (the invariant is about what a fresh response contains).
+	s.writeCached(w, r, map[string]any{
 		"node":    node,
 		"targets": targets,
 	})

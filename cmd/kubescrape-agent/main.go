@@ -26,7 +26,6 @@ import (
 	"github.com/JohanLindvall/kubescrape/internal/agent/attrs"
 	"github.com/JohanLindvall/kubescrape/internal/agent/journald"
 	"github.com/JohanLindvall/kubescrape/internal/agent/logscrub"
-	"github.com/JohanLindvall/kubescrape/internal/agent/otlpbatch"
 	"github.com/JohanLindvall/kubescrape/internal/agent/otlpexport"
 	"github.com/JohanLindvall/kubescrape/internal/agent/otlpingest"
 	"github.com/JohanLindvall/kubescrape/internal/agent/positions"
@@ -68,9 +67,9 @@ func agentSelfResource(node string) pcommon.Resource {
 // The agent's flag surface. Package-level so the per-pipeline start
 // functions can read them directly; main parses.
 var (
-	configFile           = flag.String("config", "", "unified YAML config file with resourceAttributes, logs, logAttributes, logMetrics, logScrubbing, metrics, routing, traceMetrics and traceSampling sections")
+	configFile           = flag.String("config", "", "unified YAML config file with resourceAttributes, logs, logAttributes, logMetrics, logScrubbing, metrics, routing, traceMetrics, traceSampling and export sections")
 	nodeName             = flag.String("node-name", os.Getenv("NODE_NAME"), "name of the node this agent runs on (default $NODE_NAME)")
-	metricsListen        = flag.String("metrics-listen", ":9090", "listen address for the Prometheus /metrics endpoint (Go runtime and process metrics; empty disables). Separate from -listen so the debug/health surface and the scrape target can be exposed independently")
+	metricsListen        = flag.String("metrics-listen", ":9090", "listen address for the Prometheus /metrics endpoint (Go runtime and process metrics; with -self-metrics-interval=0 also the kubescrape_* internal metrics, replacing the OTLP push with a scrape; empty disables). Separate from -listen so the debug/health surface and the scrape target can be exposed independently")
 	listen               = flag.String("listen", ":8081", "HTTP listen address for /healthz, /readyz, /debug/tailer and /debug/targets (empty disables)")
 	selfMetricsIntv      = flag.Duration("self-metrics-interval", time.Minute, "export the agent's own metrics over OTLP at this interval (0 disables)")
 	metadataURL          = flag.String("metadata-endpoint", "http://kubescrape.monitoring", "base URL of the kubescrape metadata service")
@@ -93,6 +92,7 @@ var (
 
 	nativeHists = flag.Bool("scrape-native-histograms", false, "offer the Prometheus protobuf exposition to scrape targets and convert native histograms to OTLP exponential histograms")
 	checkConfig = flag.Bool("check-config", false, "validate -config and -transforms-file (every section compiled: templates, regexes, selectors, globs) plus the flags, print a summary and exit — no listeners, log files, positions file, spools or network. For CI and pre-rollout checks: a DaemonSet's bad ConfigMap otherwise surfaces as a fleet-wide CrashLoop")
+	testConfig  = flag.String("test-config", "", "run the YAML test cases in this file through the compiled log pipeline (scrub → logAttributes → enrich → logMetrics → logs.rules → transforms) and exit non-zero on failure — CI proof of what a rule/scrub/transform edit does to sample lines, with nothing acquired (like -check-config)")
 	pprofListen = flag.String("pprof-listen", "", "listen address for net/http/pprof under /debug/pprof, on its own port (empty disables). Off by default and separate from -listen and -metrics-listen: profiles expose goroutine stacks and heap contents, so this is the port to firewall or bind to localhost")
 	logLevel    = flag.String("log-level", "info", "log level: debug, info, warn, error")
 	logFormat   = flag.String("log-format", "text", "log format: text or json")
@@ -165,9 +165,6 @@ var (
 	spanMetrics   = flag.Bool("ingest-span-metrics", false, "derive RED (calls + duration histogram) metrics from ingested spans, dimensioned by service.name/span.name/span.kind/status.code; exported over OTLP (tune via the traceMetrics config section)")
 	spanMetricsIv = flag.Duration("ingest-span-metrics-interval", time.Minute, "export interval for span metrics")
 	ingestPeerIP  = flag.Bool("ingest-peer-ip-fallback", false, "attribute pushed telemetry whose resource carries no container id / pod uid to the pod owning the connection's peer IP (hostNetwork senders never resolve)")
-	ingestBatch   = flag.Int("ingest-batch-items", 0, "coalesce pushed payloads per signal to this many items (log records / data points / spans) before forwarding; 0 forwards each request as received")
-	ingestBatchTO = flag.Duration("ingest-batch-timeout", 200*time.Millisecond, "max time a partial ingest batch waits before flushing")
-	ingestBatchB  = flag.Int("ingest-batch-bytes", 3<<20, "flush a coalescing ingest batch before its encoded size would exceed this many bytes (keeps merged payloads under the collector's 4 MiB gRPC recv default)")
 )
 
 // pipelines bundles what the per-pipeline start functions share: the
@@ -265,6 +262,10 @@ func run() error {
 		printConfigSummary(fileCfg, log)
 		return nil
 	}
+	if *testConfig != "" {
+		// Like -check-config: run and exit without acquiring anything.
+		return runConfigTests(fileCfg, *transformsFile, *testConfig, log)
+	}
 
 	// The logs.rules chain is shared by the tailer AND journald, so it is
 	// compiled here rather than inside startLogs: journald must get it even
@@ -324,9 +325,12 @@ func run() error {
 		meta.SetScrapeAuthToken(reader.get)
 	}
 
-	// The Prometheus scrape target for this process's own runtime metrics, on
-	// its own port (see -metrics-listen).
-	stopMetrics := obs.ServeMetrics(ctx, *metricsListen, log)
+	// The Prometheus scrape target for this process's own metrics, on its own
+	// port (see -metrics-listen). With the OTLP self-metrics push disabled
+	// (-self-metrics-interval=0) the kubescrape_* metrics ride the scrape
+	// instead — one knob selects the modality, so the two paths never
+	// double-deliver.
+	stopMetrics := obs.ServeMetrics(ctx, *metricsListen, *selfMetricsIntv <= 0, log)
 	defer stopMetrics()
 	stopPprof := obs.ServePprof(ctx, *pprofListen, log)
 	defer stopPprof()
@@ -351,7 +355,7 @@ func run() error {
 		}
 	}
 
-	exporter, err := otlpexport.New(otlpexport.Config{
+	baseExport := otlpexport.Config{
 		Endpoint:           *otlpEndpoint,
 		Protocol:           *otlpProtocol,
 		Compression:        *otlpCompression,
@@ -364,7 +368,11 @@ func run() error {
 		RetryAttempts:      *otlpRetries,
 		RetryBackoff:       *otlpBackoff,
 		MaxSendBytes:       *otlpMaxSendBytes,
-	})
+	}
+	// The flag base plus the config's export section: per-signal destinations
+	// ride the existing per-signal spools, and the default chain gains static
+	// headers / an mTLS client certificate.
+	exporter, err := otlpexport.BuildExporter(baseExport, fileCfg.Export)
 	if err != nil {
 		return fmt.Errorf("creating OTLP exporter: %w", err)
 	}
@@ -428,20 +436,19 @@ func run() error {
 					return fmt.Errorf("routing route %q: invalid namespace pattern %q: %w", rt.Name, pat, err)
 				}
 			}
-			rcfg := otlpexport.Config{
-				Endpoint:           *otlpEndpoint,
-				Protocol:           *otlpProtocol,
-				Compression:        *otlpCompression,
-				CompressionLevel:   *otlpCompressionLevel,
-				Insecure:           *otlpInsecure,
-				InsecureSkipVerify: *otlpSkipTLS,
-				CAFile:             *otlpCAFile,
-				BearerTokenFile:    *otlpBearer,
-				Timeout:            *otlpTimeout,
-				RetryAttempts:      *otlpRetries,
-				RetryBackoff:       *otlpBackoff,
-				MaxSendBytes:       *otlpMaxSendBytes,
-				Headers:            rt.Headers,
+			// Route clients inherit the flag base PLUS the export section's
+			// base additions (headers, client cert); the route's own headers
+			// win per key.
+			rcfg := fileCfg.Export.ApplyBase(baseExport)
+			if len(rt.Headers) > 0 {
+				merged := make(map[string]string, len(rcfg.Headers)+len(rt.Headers))
+				for k, v := range rcfg.Headers {
+					merged[k] = v
+				}
+				for k, v := range rt.Headers {
+					merged[k] = v
+				}
+				rcfg.Headers = merged
 			}
 			if rt.Endpoint != "" {
 				rcfg.Endpoint = rt.Endpoint
@@ -567,10 +574,10 @@ func run() error {
 	}
 	if p.spanMetricsGen != nil {
 		// Generator.Run does its final export when ctx is cancelled, but the
-		// ingest batcher's shutdown drain runs AFTER that (the server stops
-		// first, then the batcher drains acked payloads) and every trace it
-		// forwards passes through the tap, bumping the cumulative series. Those
-		// spans ship; without this their RED metrics would not.
+		// ingest server's GracefulStop completes in-flight RPCs AFTER that,
+		// and every trace they forward passes through the tap, bumping the
+		// cumulative series. Those spans ship; without this their RED metrics
+		// would not.
 		fctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		if err := p.spanMetricsGen.Export(fctx, out, p.spanMetricsRes); err != nil {
 			log.Warn("final span-metrics export failed", "error", err)
@@ -681,9 +688,9 @@ func (p *pipelines) startJournald() {
 	p.log.Info("journald reader started", "dir", *journaldDir, "units", *journaldUnits, "positions", *positionsFile)
 }
 
-// startIngest starts the OTLP ingest receiver plus its optional batcher and
-// span-metrics tap. A fatal listener failure is reported through p.fatalErr
-// and p.stop so the agent exits non-zero.
+// startIngest starts the OTLP ingest receiver plus its optional trace
+// sampler and span-metrics tap. A fatal listener failure is reported through
+// p.fatalErr and p.stop so the agent exits non-zero.
 func (p *pipelines) startIngest() error {
 	if !*ingestOn {
 		if *spanMetrics {
@@ -734,11 +741,11 @@ func (p *pipelines) startIngest() error {
 				"maxSpansPerSecond", cfg.MaxSpansPerSecond, "keepSlowerThan", cfg.KeepSlowerThan)
 		}
 	}
-	// The span-metrics tap wraps the RAW trace exporter, BELOW the batcher:
-	// the tap aggregates only after a successful forward (a retried batch
-	// must not double-count), and under the batcher it runs on the batcher's
-	// own goroutine against a payload nothing else mutates — wrapping above
-	// the batcher would race Consume against the batcher's merge.
+	// The span-metrics tap wraps the RAW trace exporter: it forwards FIRST
+	// and aggregates only on success (a transient failure surfaces retryable
+	// to the sender, whose re-push must not double-count). Consume runs on
+	// the concurrent ingest handler goroutines; the generator's series map is
+	// mutex-guarded for exactly that.
 	if *spanMetrics && ingestTraceOut != nil {
 		var smCfg spanmetrics.Config
 		if p.fileCfg.TraceMetrics != nil {
@@ -755,25 +762,6 @@ func (p *pipelines) startIngest() error {
 	} else if *spanMetrics {
 		p.log.Warn("-ingest-span-metrics ignored: traces are disabled (-ingest-traces=false)")
 	}
-	// The batcher stops on its own context, cancelled only after the
-	// ingest server has fully returned: a GracefulStop completing in-flight
-	// RPCs may still enqueue (and ack) payloads, which the batcher's final
-	// drain must see.
-	batchStop := func() {}
-	if *ingestBatch > 0 {
-		batcher := otlpbatch.NewBatcher(ingestOut, ingestTraceOut,
-			otlpbatch.BatchConfig{Items: *ingestBatch, MaxBatchBytes: *ingestBatchB, Timeout: *ingestBatchTO}, p.log)
-		batchCtx, cancel := context.WithCancel(context.Background())
-		batchStop = cancel
-		p.spawn(func() {
-			batcher.Run(batchCtx)
-		})
-		ingestOut = batcher
-		if ingestTraceOut != nil {
-			ingestTraceOut = batcher
-		}
-		p.log.Info("otlp ingest batching enabled", "items", *ingestBatch, "maxBytes", *ingestBatchB, "timeout", *ingestBatchTO)
-	}
 	srv := otlpingest.NewServer(otlpingest.ServerConfig{
 		GRPCAddr: *ingestGRPC,
 		HTTPAddr: *ingestHTTP,
@@ -783,7 +771,6 @@ func (p *pipelines) startIngest() error {
 		Logger:   p.log,
 	})
 	p.spawn(func() {
-		defer batchStop() // server fully stopped: no more enqueues
 		if err := srv.Run(p.ctx); err != nil {
 			// A dead ingest listener (e.g. the port already bound) must not
 			// leave the agent looking healthy while apps push into a void:

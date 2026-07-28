@@ -85,9 +85,9 @@ type Config struct {
 	// nil = targets carrying AuthSecret fail their scrape with an error).
 	Auth AuthSource
 	// NativeHistograms offers the protobuf exposition format to annotation/
-	// monitor targets (the only format carrying native histograms, which
-	// convert to OTLP exponential histograms). Targets with a splitter keep
-	// the text format (the split batcher has no exponential path).
+	// monitor targets — splitter-backed ones included — the only format
+	// carrying native histograms, which convert to OTLP exponential
+	// histograms.
 	NativeHistograms bool
 	Exporter         MetricExporter
 	StartTime        time.Time // cumulative-sum start timestamp (agent start)
@@ -654,7 +654,7 @@ func (s *Scraper) scrapeTarget(ctx context.Context, t kubemeta.ScrapeTarget, tim
 	if err != nil {
 		return 0, err
 	}
-	useProto := s.cfg.NativeHistograms && s.splitterFor(t.Pod) == nil
+	useProto := s.cfg.NativeHistograms
 	switch {
 	case useProto:
 		req.Header.Set("Accept", acceptProto)

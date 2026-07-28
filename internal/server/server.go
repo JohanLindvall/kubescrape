@@ -55,10 +55,16 @@ type Config struct {
 	Secrets SecretReader
 	// ScrapeAuthToken is the shared bearer token clients must present on
 	// GET /v1/scrape-auth (`Authorization: Bearer <token>`), read from
-	// -scrape-auth-token-file. It is REQUIRED whenever Secrets is set (see
-	// Validate) and guards that route only — the rest of the API carries no
-	// secret material and stays open.
+	// -scrape-auth-token-file. One of it or ScrapeAuthTokens is REQUIRED
+	// whenever Secrets is set (see Validate); both guard that route only — the
+	// rest of the API carries no secret material and stays open.
 	ScrapeAuthToken string
+	// ScrapeAuthTokens, when set, supersedes ScrapeAuthToken: it is evaluated
+	// per request and every returned token is accepted. This is what makes
+	// ROTATION a non-event — the caller returns the current token plus the
+	// previous one for a grace window, so re-reading agents and the re-read
+	// service file never have to flip in lockstep.
+	ScrapeAuthTokens func() []string
 }
 
 // Validate reports a configuration that must not start the process.
@@ -69,7 +75,7 @@ type Config struct {
 // cluster-wide secret leak, which is exactly the failure mode a "the flag was
 // not set" default must never produce.
 func (c Config) Validate() error {
-	if c.Secrets != nil && c.ScrapeAuthToken == "" {
+	if c.Secrets != nil && c.ScrapeAuthToken == "" && c.ScrapeAuthTokens == nil {
 		return errors.New("-scrape-auth-secrets requires -scrape-auth-token-file: " +
 			"/v1/scrape-auth serves monitor Secret keys and must not be reachable unauthenticated")
 	}
@@ -84,16 +90,17 @@ type SecretReader interface {
 // Server serves container metadata and node scrape targets.
 type Server struct {
 	secrets SecretReader
-	// scrapeAuthToken guards the /v1/scrape-auth route only (see auth.go).
-	scrapeAuthToken string
-	store           *store.Store
-	services        *services.Index
-	monitors        *servicemonitors.Index
-	resolver        MetadataResolver
-	maxWait         time.Duration
-	cacheTTL        time.Duration
-	ready           <-chan struct{}
-	now             func() time.Time
+	// scrapeAuthTokens yields the tokens accepted on /v1/scrape-auth (see
+	// auth.go); more than one only during a rotation grace window.
+	scrapeAuthTokens func() []string
+	store            *store.Store
+	services         *services.Index
+	monitors         *servicemonitors.Index
+	resolver         MetadataResolver
+	maxWait          time.Duration
+	cacheTTL         time.Duration
+	ready            <-chan struct{}
+	now              func() time.Time
 
 	// monMu guards the monitoredServices cache: the monitor→services match
 	// is O(monitors × services) and identical across the per-node target
@@ -108,17 +115,22 @@ type Server struct {
 
 // New creates a Server.
 func New(cfg Config) *Server {
+	tokens := cfg.ScrapeAuthTokens
+	if tokens == nil && cfg.ScrapeAuthToken != "" {
+		token := cfg.ScrapeAuthToken
+		tokens = func() []string { return []string{token} }
+	}
 	return &Server{
-		secrets:         cfg.Secrets,
-		scrapeAuthToken: cfg.ScrapeAuthToken,
-		store:           cfg.Store,
-		services:        cfg.Services,
-		monitors:        cfg.Monitors,
-		resolver:        cfg.Resolver,
-		maxWait:         cfg.MaxWait,
-		cacheTTL:        cfg.CacheTTL,
-		ready:           cfg.Ready,
-		now:             time.Now,
+		secrets:          cfg.Secrets,
+		scrapeAuthTokens: tokens,
+		store:            cfg.Store,
+		services:         cfg.Services,
+		monitors:         cfg.Monitors,
+		resolver:         cfg.Resolver,
+		maxWait:          cfg.MaxWait,
+		cacheTTL:         cfg.CacheTTL,
+		ready:            cfg.Ready,
+		now:              time.Now,
 	}
 }
 

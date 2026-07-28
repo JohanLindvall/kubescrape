@@ -227,6 +227,15 @@ at-least-once via checkpointed offsets. For Alloy's disk-buffered WAL, set
 `agent.bufferDir` (flag `-buffer-dir`) to spool both logs and metrics to a
 disk-backed buffer during a collector outage, bounded by `-buffer-max-bytes`.
 
+An Alloy pipeline shipping different signals to different backends (a
+`loki.write` + `prometheus.remote_write` + `otelcol.exporter` fan-out) maps
+onto the config file's `export` section: per-signal OTLP endpoint/protocol/
+headers/auth overrides riding the same per-signal disk buffer, plus static
+tenancy headers and an mTLS client certificate on the default chain — see
+CONFIGURATION.md's "Per-signal destinations". Loki, Mimir and Tempo all
+ingest OTLP natively, so no push-protocol or remote-write translation is
+involved.
+
 ### `output_debug_otlp` / the `debug_otlp_output` pod label
 
 Expose the label as an attribute and filter in the collector:
@@ -281,9 +290,10 @@ collector-with-k8sattributes-processor you'd otherwise keep as the OTLP
 endpoint.
 
 Traces are accepted and passed through with the same resource enrichment
-(`-ingest-traces`), and `-ingest-batch-items` plays the role of
-`otelcol.processor.batch` on the pushed path (coalesce per signal, timeout
-flush).
+(`-ingest-traces`). Pushed payloads are forwarded as received — the role of
+`otelcol.processor.batch` stays with your SDK's batch span/log processor or
+the downstream collector, and every forward keeps the sender's own retry
+semantics (nothing is acknowledged before it is handed on).
 
 Two association differences from `otelcol.processor.k8sattributes`:
 

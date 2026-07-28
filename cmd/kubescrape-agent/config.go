@@ -13,6 +13,7 @@ import (
 
 	"github.com/JohanLindvall/kubescrape/internal/agent/attrs"
 	"github.com/JohanLindvall/kubescrape/internal/agent/logscrub"
+	"github.com/JohanLindvall/kubescrape/internal/agent/otlpexport"
 	"github.com/JohanLindvall/kubescrape/internal/agent/promscrape"
 	"github.com/JohanLindvall/kubescrape/internal/agent/route"
 	"github.com/JohanLindvall/kubescrape/internal/agent/spanmetrics"
@@ -58,6 +59,12 @@ type agentConfig struct {
 	// and a spans/second cap. Span metrics still see 100% of spans (the
 	// sampler sits below the spanmetrics tap).
 	TraceSampling *tracesample.Config `json:"traceSampling,omitempty"`
+	// Export overlays per-signal OTLP destinations (endpoint/protocol/headers/
+	// auth/TLS per signal) and default-chain additions (static headers, an mTLS
+	// client certificate) onto the -otlp-* flag base — what makes collectorless
+	// delivery to Mimir/Loki/Tempo's distinct OTLP endpoints expressible, with
+	// the disk buffer intact per signal.
+	Export *otlpexport.ExportConfig `json:"export,omitempty"`
 }
 
 // loadAgentConfig reads and strictly parses the unified config file.
@@ -129,6 +136,11 @@ func validateConfig(cfg agentConfig, transformsFile string) error {
 			return fmt.Errorf("traceSampling: %w", err)
 		}
 	}
+	// Shape-only (no filesystem, no network): file errors surface at the real
+	// start, where the clients are built.
+	if err := cfg.Export.Validate(); err != nil {
+		return fmt.Errorf("export: %w", err)
+	}
 	if cfg.Routing != nil {
 		for i, rt := range cfg.Routing.Routes {
 			if rt.Name == "" || len(rt.Namespaces) == 0 {
@@ -173,6 +185,7 @@ func printConfigSummary(cfg agentConfig, log *slog.Logger) {
 	add("traceMetrics", cfg.TraceMetrics != nil)
 	add("traceSampling", cfg.TraceSampling != nil)
 	add("routing", cfg.Routing != nil)
+	add("export", cfg.Export != nil)
 	if len(sections) == 0 {
 		sections = append(sections, "(none)")
 	}

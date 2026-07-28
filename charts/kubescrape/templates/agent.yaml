@@ -65,6 +65,10 @@ metadata:
     app: {{ .Release.Name }}-agent
     {{- include "kubescrape.labels" . | nindent 4 }}
 spec:
+  {{- with .Values.agent.updateStrategy }}
+  updateStrategy:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
   selector:
     matchLabels:
       app: {{ .Release.Name }}-agent
@@ -83,10 +87,21 @@ spec:
         {{- end }}
     spec:
       serviceAccountName: {{ .Release.Name }}-agent
+      {{- with .Values.agent.priorityClassName }}
+      priorityClassName: {{ . }}
+      {{- end }}
+      {{- with .Values.agent.tolerations }}
       tolerations:
-        - key: node-role.kubernetes.io/control-plane
-          operator: Exists
-          effect: NoSchedule
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.agent.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.agent.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       containers:
         - name: agent
           image: {{ include "kubescrape.image" . }}
@@ -186,11 +201,6 @@ spec:
             - -ingest-span-metrics-interval={{ .Values.agent.ingest.spanMetricsInterval }}
             {{- end }}
             - -ingest-peer-ip-fallback={{ .Values.agent.ingest.peerIpFallback }}
-            {{- if .Values.agent.ingest.batchItems }}
-            - -ingest-batch-items={{ int64 .Values.agent.ingest.batchItems }}
-            - -ingest-batch-timeout={{ .Values.agent.ingest.batchTimeout }}
-            - -ingest-batch-bytes={{ int64 .Values.agent.ingest.batchBytes }}
-            {{- end }}
             {{- with .Values.agent.ingest.containerIdKeys }}
             - -ingest-container-id-keys={{ join "," . }}
             {{- end }}

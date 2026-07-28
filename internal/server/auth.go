@@ -22,29 +22,40 @@ import (
 // from "wrong URL".
 const scrapeAuthRealm = `Bearer realm="kubescrape scrape-auth"`
 
-// authorizedForScrapeAuth reports whether r carries the configured
-// scrape-auth bearer token.
+// authorizedForScrapeAuth reports whether r carries one of the configured
+// scrape-auth bearer tokens (more than one only during a rotation grace
+// window — the file's previous value stays valid briefly so agents and the
+// service never have to flip in lockstep).
 //
-// Fail-closed: with no token configured NOTHING is authorized. The startup
-// path (Config.Validate) refuses that combination outright, so this is the
-// second line of defense for an embedder building a Server directly — an
-// endpoint that serves Secrets must never be reachable because a flag was
+// Fail-closed: with no token source configured NOTHING is authorized. The
+// startup path (Config.Validate) refuses that combination outright, so this
+// is the second line of defense for an embedder building a Server directly —
+// an endpoint that serves Secrets must never be reachable because a flag was
 // forgotten.
 //
 // The comparison is constant time (crypto/subtle): a byte-at-a-time compare
 // leaks the shared token to anyone who can time responses, and this endpoint
 // is reachable from every pod in the cluster. subtle.ConstantTimeCompare also
 // returns 0 for differing lengths, which leaks only the token's length —
-// unavoidable without hashing and not worth the extra machinery here.
+// unavoidable without hashing and not worth the extra machinery here. Every
+// candidate is compared (no early exit), so timing does not reveal WHICH
+// token matched either.
 func (s *Server) authorizedForScrapeAuth(r *http.Request) bool {
-	if s.scrapeAuthToken == "" {
+	if s.scrapeAuthTokens == nil {
 		return false
 	}
 	got, ok := bearerToken(r.Header.Get("Authorization"))
 	if !ok {
 		return false
 	}
-	return subtle.ConstantTimeCompare([]byte(got), []byte(s.scrapeAuthToken)) == 1
+	matched := 0
+	for _, tok := range s.scrapeAuthTokens() {
+		if tok == "" {
+			continue // an empty candidate must never authorize (bearerToken already rejects empty headers; belt and braces)
+		}
+		matched |= subtle.ConstantTimeCompare([]byte(got), []byte(tok))
+	}
+	return matched == 1
 }
 
 // bearerToken extracts the credentials of an `Authorization: Bearer <token>`

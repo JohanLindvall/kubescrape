@@ -114,6 +114,13 @@ spec:
       {{- end }}
     spec:
       serviceAccountName: {{ .Release.Name }}
+      {{- with .Values.service.priorityClassName }}
+      priorityClassName: {{ . }}
+      {{- end }}
+      {{- with .Values.service.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       containers:
         - name: kubescrape
           image: {{ include "kubescrape.image" . }}

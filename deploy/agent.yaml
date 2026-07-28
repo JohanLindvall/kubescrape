@@ -39,6 +39,10 @@ metadata:
   labels:
     app: kubescrape-agent
 spec:
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
   selector:
     matchLabels:
       app: kubescrape-agent
@@ -48,6 +52,9 @@ spec:
         app: kubescrape-agent
     spec:
       serviceAccountName: kubescrape-agent
+      # Node-critical: an observability agent evicted under node pressure goes
+      # missing exactly when its logs matter most.
+      priorityClassName: system-node-critical
       tolerations:
         - key: node-role.kubernetes.io/control-plane
           operator: Exists

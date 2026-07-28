@@ -331,8 +331,9 @@ type expPoint struct {
 	negOffset int32
 }
 
-// expSink is a chunker that can take exponential histogram points (the
-// plain batcher; the split/cadvisor batchers do not).
+// expSink is a chunker that can take exponential histogram points (the plain
+// and split batchers; the cadvisor batcher does not — the kubelet scrape
+// stays on the text exposition).
 type expSink interface {
 	addExponential(family string, p expPoint)
 }

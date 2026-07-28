@@ -145,6 +145,24 @@ var (
 		"Journal batches dropped after a permanent collector rejection (the cursor advances past them).")
 )
 
+// Kubernetes events (the cluster-singleton events collector).
+var (
+	Leader = Registry.Gauge("kubescrape_leader",
+		"1 while this replica holds the cluster-singleton lease, 0 otherwise; sum != 1 means split brain or nobody leading.")
+	EventsObserved = Registry.CounterVec("kubescrape_events_observed_total",
+		"Kubernetes events received from the watch, by event type (normal, warning).", "type")
+	EventsExported = Registry.Counter("kubescrape_events_exported_total",
+		"Kubernetes event records exported (after the rules).")
+	EventsDropped = Registry.Counter("kubescrape_events_dropped_total",
+		"Kubernetes event batches dropped after a permanent collector rejection (the position advances past them).")
+	EventWatchRestarts = Registry.Counter("kubescrape_event_watch_restarts_total",
+		"Event watch restarts (a closed stream, an error, or an expired resourceVersion).")
+	EventRelists = Registry.CounterVec("kubescrape_event_relists_total",
+		"Event watches that fell back to a relist because the stored resourceVersion had aged out of the API server's watch window.", "stage")
+	EventPositionErrors = Registry.CounterVec("kubescrape_event_position_errors_total",
+		"Failures reading or writing the event position ConfigMap, by operation (load, save).", "operation")
+)
+
 // HTTP server (metadata service).
 var (
 	HTTPRequests = Registry.CounterVec("kubescrape_http_requests_total",

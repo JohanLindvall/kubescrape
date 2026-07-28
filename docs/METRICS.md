@@ -27,6 +27,12 @@ names a metric or a label that is not registered.
 | `kubescrape_buffer_requeued_total` | `signal` | Buffered batches moved to the back of the queue after repeated transient failures (keeps one stuck batch from blocking the signal). |
 | `kubescrape_buffer_segments` | `signal` | Disk-buffer segment files on disk per signal. Physical footprint can exceed the backlog by up to one segment (a delivered but unreclaimed prefix). |
 | `kubescrape_buffer_truncated_bytes_total` | `signal` | Bytes discarded by truncating a damaged or torn disk-buffer segment tail at open. |
+| `kubescrape_event_position_errors_total` | `operation` | Failures reading or writing the event position ConfigMap, by operation (load, save). |
+| `kubescrape_event_relists_total` | `stage` | Event watches that fell back to a relist because the stored resourceVersion had aged out of the API server's watch window. |
+| `kubescrape_event_watch_restarts_total` | — | Event watch restarts (a closed stream, an error, or an expired resourceVersion). |
+| `kubescrape_events_dropped_total` | — | Kubernetes event batches dropped after a permanent collector rejection (the position advances past them). |
+| `kubescrape_events_exported_total` | — | Kubernetes event records exported (after the rules). |
+| `kubescrape_events_observed_total` | `type` | Kubernetes events received from the watch, by event type (normal, warning). |
 | `kubescrape_export_requests_total` | `signal`, `outcome` | OTLP export attempts by signal and outcome. |
 | `kubescrape_http_requests_total` | `pattern`, `code` | Metadata API requests by pattern and status code. |
 | `kubescrape_ingest_resources_total` | `outcome` | Distinct pushed identities (container id / pod uid, memoized per request) by enrichment outcome (enriched, unresolved, peer_ip). |
@@ -34,6 +40,7 @@ names a metric or a label that is not registered.
 | `kubescrape_journal_entries_total` | — | Journal entries exported. |
 | `kubescrape_journal_restarts_total` | — | Journal reader restarts. |
 | `kubescrape_journal_truncated_total` | — | Journal messages truncated at MaxEntryBytes (the record carries log.truncated). |
+| `kubescrape_leader` | — | 1 while this replica holds the cluster-singleton lease, 0 otherwise; sum != 1 means split brain or nobody leading. |
 | `kubescrape_log_archive_errors_total` | — |  |
 | `kubescrape_log_bytes_total` | — | Raw log bytes read. |
 | `kubescrape_log_enriched_total` | `format` | Log records by the enrichment strategy that matched (json, logfmt, pattern, none). |
@@ -72,4 +79,4 @@ names a metric or a label that is not registered.
 | `kubescrape_transform_errors_total` | `signal` | Transform program invocations that failed (the batch is NOT exported; the error propagates to the producer's retry path). |
 | `kubescrape_transform_reloads_total` | `outcome` | Transforms-file reloads by outcome (applied, failed — a failed compile keeps the last good program). |
 
-52 metrics.
+59 metrics.

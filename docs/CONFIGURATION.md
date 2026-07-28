@@ -23,6 +23,7 @@ manifests live in [deploy/](../deploy).
 - [Unified config file (`-config`)](#unified-config-file)
 - [Agent: log sources](#agent-log-sources)
 - [Agent: journald](#agent-journald)
+- [Agent: Kubernetes events](#agent-kubernetes-events)
 - [Agent: log attributes](#agent-log-attributes)
 - [Agent: log metrics](#agent-log-metrics)
 - [Agent: log scrubbing (PII)](#agent-log-scrubbing)
@@ -100,7 +101,8 @@ manifests — enable deliberately) — see
 | `-test-config` | — | run the YAML test cases in this file through the compiled log pipeline (scrub → logAttributes → enrich → logMetrics → `logs.rules` → transforms) and exit non-zero on failure; like `-check-config`, nothing is acquired. See the README's "Config unit tests" for the file shape |
 | `-log-level` / `-log-format` | `info` / `text` | as for the service |
 
-Pipeline toggles (all default `true` except the opt-in `-journald`):
+Pipeline toggles (all default `true` except the opt-in `-journald`,
+`-ingest` and `-events`):
 
 | Flag | Enables |
 |---|---|
@@ -109,6 +111,7 @@ Pipeline toggles (all default `true` except the opt-in `-journald`):
 | `-cadvisor` | `<kubelet-endpoint>/metrics/cadvisor` (needs `-kubelet-endpoint`) |
 | `-node-metrics` | `<kubelet-endpoint>/metrics` (needs `-kubelet-endpoint`) |
 | `-journald` | systemd journal tailing (default `false`, [below](#agent-journald)) |
+| `-events` | Kubernetes events as OTLP logs (default `false`; **cluster-singleton** — its own Deployment, not the DaemonSet, [below](#agent-kubernetes-events)) |
 
 ## Agent: OTLP export
 
@@ -270,6 +273,76 @@ export; on export failure or a reader error, it restarts from the committed
 cursor with backoff (re-reading anything in flight). The cursor is
 persisted only through `-positions-file` (there is no standalone journald
 cursor file); without it, every start begins at the journal tail.
+
+## Agent: Kubernetes events
+
+Opt-in with `-events`. Kubernetes events are a **cluster-wide** stream, not a
+per-node one, so this pipeline runs the agent binary as its own single-replica
+Deployment with every per-node pipeline off — see
+[deploy/events.yaml](../deploy/events.yaml) or `events.enabled=true` in the
+chart:
+
+```sh
+kubescrape-agent -events \
+  -logs=false -metrics=false -cadvisor=false -node-metrics=false \
+  -metadata-endpoint=http://kubescrape.monitoring \
+  -otlp-endpoint=otel-collector.monitoring:4317
+```
+
+It is deliberately **not** part of the DaemonSet: that would put cluster-wide
+`events` read plus lease/ConfigMap write credentials on every node (the
+DaemonSet's ServiceAccount holds only `nodes/metrics: get`), and every
+non-leader would poll the election Lease once per retry period — an
+API-server fan-out that grows with the node count. Exactly one replica reads
+at a time (a `coordination.k8s.io` **Lease**), so a rolling update's overlap,
+or `replicas > 1`, never double-ships.
+
+| Flag | Default | Description |
+|---|---|---|
+| `-events` | `false` | enable the events reader |
+| `-events-namespace` | — | watch one namespace; empty is cluster-wide |
+| `-events-start` | `auto` | where a **cold** start begins (no stored position): `end` skips the backlog, `start` replays everything still within the API server's event TTL (typically 1h), `auto` resumes the stored position and otherwise behaves as `end` |
+| `-events-batch-size` | `512` | flush after this many events |
+| `-events-flush-interval` | `2s` | flush at least this often |
+| `-events-position-interval` | `10s` | how often the position is written to its ConfigMap. A write per event would be an API-server write per event, so this bounds how much is **replayed** after a hard kill (bounded duplicates, never loss); a graceful stop always writes a final position |
+| `-events-position-configmap` | `kubescrape-events-position` | ConfigMap holding the resume position |
+| `-events-lease` | `kubescrape-cluster-leader` | Lease coordinating the singleton |
+| `-events-lease-namespace` | — | namespace for the Lease and the ConfigMap; empty uses this pod's own (`$POD_NAMESPACE` via the downward API, else the ServiceAccount projection) |
+| `-kubeconfig` | — | kubeconfig for the watch; empty uses the in-cluster config (only read with `-events`) |
+
+RBAC: `get`/`list`/`watch` on `events` (both `""` and `events.k8s.io`)
+cluster-wide, plus `get`/`create`/`update` on `leases` and `configmaps` in
+the reader's own namespace.
+
+**Records.** The body is the event message, with `k8s.event.reason`,
+`k8s.event.action`, `k8s.event.type`, `k8s.event.count`, `k8s.event.name`,
+`k8s.event.uid`, `k8s.event.involved_object.*` and
+`k8s.event.reporting_component`/`_instance` as record attributes; severity
+comes from the event type (`Warning` → WARN, else INFO). The **resource is
+the involved object's own**: an event about a pod is resolved through the
+metadata service (`GET /v1/pods/{ns}/{name}`, with the UID cross-checked so a
+recreated pod of the same name cannot lend its identity to an event about its
+predecessor) and carries the same `k8s.*`/`service.*` attributes as that pod's
+container logs, so events and logs line up in one query. Other kinds get
+`k8s.namespace.name` plus the kind's own name attribute. Aggregated events
+(the API server's `count`/`lastTimestamp` rollup) arrive as MODIFIED and are
+exported as fresh occurrences. This reader's own node is never stamped on a
+record — the node an event is about is the involved object's property.
+
+**Delivery** is at-least-once, as everywhere else: the position (the watch
+`resourceVersion` plus a timestamp watermark) is persisted only *after* the
+collector acks, and it lives in a ConfigMap rather than a node-local file
+because the leader moves — the successor of a killed pod resumes where its
+predecessor stopped. A written position is only ever a *lower bound* on what
+was delivered, so even a zombie writer can at worst cause a replay, never a
+gap. When the API server's watch window has passed (`410 Gone`) the reader
+re-lists and the watermark suppresses what it already shipped; resumption is
+therefore exact only within that window (minutes) — beyond it, the replay
+protection is the watermark.
+
+The whole agent chain applies: `logScrubbing`, `logAttributes`, `-enrich`,
+`logMetrics` (which observe every event, including dropped ones),
+`logs.rules`, Starlark transforms, `routing` and the disk buffer.
 
 ## Unified config file
 
@@ -969,6 +1042,15 @@ the mount `-transforms-file` needs: its dedicated ConfigMap, mounted as a
 directory (not `subPath`). See
 [charts/kubescrape/values.yaml](../charts/kubescrape/values.yaml) for the
 full annotated list.
+
+`events.enabled: true` is the other value that wires more than a flag: it
+renders a separate single-replica Deployment of the agent binary with its own
+ServiceAccount and the events/lease/ConfigMap RBAC, rather than widening the
+DaemonSet's. `events.replicas`, `events.start`, `events.leaseName`,
+`events.positionConfigMap`, the batch/flush/position intervals, scheduling
+(`nodeSelector`/`tolerations`/`priorityClassName`), `resources` and
+`extraArgs` are values; the export, enrichment and `agent.config` settings
+are shared with the DaemonSet.
 
 `service.scrapeAuthSecrets: true` is one value that wires three things at
 once, because they must not drift apart: the `-scrape-auth-secrets` flag, the

@@ -1,0 +1,138 @@
+# Kubernetes events as OTLP logs — a CLUSTER-SINGLETON pipeline.
+#
+# This is the agent BINARY run as its own single-replica Deployment with every
+# per-node pipeline off, deliberately NOT part of the DaemonSet: putting it
+# there would grant every node cluster-wide `events` read plus lease/configmap
+# writes (the DaemonSet holds only `nodes/metrics: get`), and each non-leader
+# would poll the election Lease once per retry period — an API-server fan-out
+# that scales with node count.
+#
+# Apply after deploy/kubernetes.yaml (the metadata service, used for
+# enrichment) — kubectl apply -f deploy/events.yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: kubescrape-events
+  namespace: monitoring
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kubescrape-events
+rules:
+  # The only cluster-wide grant, and it lands on this ServiceAccount alone.
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["events.k8s.io"]
+    resources: ["events"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: kubescrape-events
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: kubescrape-events
+subjects:
+  - kind: ServiceAccount
+    name: kubescrape-events
+    namespace: monitoring
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: kubescrape-events
+  namespace: monitoring
+rules:
+  # Leader election: exactly one replica may watch, or every event ships twice.
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "create", "update"]
+  # The resume position. Not a node-local file: the leader moves, and the
+  # successor after a kill must be able to read where the last one got to.
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "create", "update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: kubescrape-events
+  namespace: monitoring
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: kubescrape-events
+subjects:
+  - kind: ServiceAccount
+    name: kubescrape-events
+    namespace: monitoring
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kubescrape-events
+  namespace: monitoring
+  labels:
+    app: kubescrape-events
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: kubescrape-events
+  template:
+    metadata:
+      labels:
+        app: kubescrape-events
+    spec:
+      serviceAccountName: kubescrape-events
+      containers:
+        - name: events
+          image: ghcr.io/johanlindvall/kubescrape:latest
+          imagePullPolicy: IfNotPresent
+          command: ["/kubescrape-agent"]
+          args:
+            - -events
+            # Every per-node pipeline off: this replica only watches events.
+            - -logs=false
+            - -metrics=false
+            - -cadvisor=false
+            - -node-metrics=false
+            - -metadata-endpoint=http://kubescrape.monitoring
+            - -otlp-endpoint=otel-collector.monitoring:4317
+            - -listen=:8081
+          env:
+            # Required by the agent for its own self-metrics identity; events
+            # never carry this reader's node.
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef: {fieldPath: spec.nodeName}
+            # The Lease and position ConfigMap live in this pod's namespace.
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef: {fieldPath: metadata.namespace}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 65532
+            capabilities:
+              drop: ["ALL"]
+          ports:
+            - name: http
+              containerPort: 8081
+          readinessProbe:
+            httpGet: {path: /readyz, port: http}
+          livenessProbe:
+            httpGet: {path: /healthz, port: http}
+          resources:
+            requests:
+              cpu: 20m
+              memory: 64Mi
+            limits:
+              memory: 256Mi

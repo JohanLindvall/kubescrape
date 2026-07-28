@@ -352,11 +352,17 @@ namespace: per route a distinct endpoint and/or extra headers (e.g.
 chain. Route destinations are direct (unbuffered) — the default chain keeps
 the `-buffer-dir` durability.
 
+### Kubernetes events (`loki.source.kubernetes_events`)
+
+`loki.source.kubernetes_events` maps to `-events` — but note the shape
+difference: it is a **cluster-singleton** (its own single-replica Deployment
+of the agent binary, leader-elected), not part of the DaemonSet, and each
+event lands on the *involved object's* resource attributes rather than as a
+flat stream. See
+[Agent: Kubernetes events](CONFIGURATION.md#agent-kubernetes-events).
+
 ## Not covered — keep a collector for these
 
-* **`loki.source.kubernetes_events`**: Kubernetes events export is out of
-  scope; use the OpenTelemetry Collector's `k8sobjects`/`k8s_events` receiver
-  (or kube-events) if you need events as logs.
 * **`input_pyroscope` / `output_pyroscope`**: profiles are out of scope;
   push them directly to the backend.
 * **`prometheus.operator.probes`**: blackbox probing has no node affinity and

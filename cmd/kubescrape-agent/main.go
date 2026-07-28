@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"github.com/JohanLindvall/kubescrape/internal/agent/attrs"
+	"github.com/JohanLindvall/kubescrape/internal/agent/events"
 	"github.com/JohanLindvall/kubescrape/internal/agent/journald"
 	"github.com/JohanLindvall/kubescrape/internal/agent/logscrub"
 	"github.com/JohanLindvall/kubescrape/internal/agent/otlpexport"
@@ -35,6 +36,7 @@ import (
 	"github.com/JohanLindvall/kubescrape/internal/agent/tailer"
 	"github.com/JohanLindvall/kubescrape/internal/agent/tracesample"
 	"github.com/JohanLindvall/kubescrape/internal/agent/transform"
+	"github.com/JohanLindvall/kubescrape/internal/leader"
 	"github.com/JohanLindvall/kubescrape/internal/logline"
 	"github.com/JohanLindvall/kubescrape/internal/metrics"
 	"github.com/JohanLindvall/kubescrape/internal/obs"
@@ -42,6 +44,9 @@ import (
 	"github.com/JohanLindvall/kubescrape/pkg/metaclient"
 	"github.com/JohanLindvall/kubescrape/pkg/spool"
 	"go.opentelemetry.io/collector/pdata/pcommon"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/clientcmd"
 )
 
 func main() {
@@ -130,6 +135,21 @@ var (
 	journaldBatch = flag.Int("journald-batch-size", 1024, "flush journal entries after this many")
 	journaldBytes = flag.Int("journald-max-batch-bytes", 1<<20, "flush journal entries before a batch's summed message bytes exceed this")
 	journaldFlush = flag.Duration("journald-flush-interval", 2*time.Second, "flush journal entries at least this often")
+
+	// Kubernetes events. A CLUSTER-SINGLETON pipeline: deploy it as its own
+	// single-replica Deployment with the other pipelines off, never as part of
+	// the DaemonSet — N agents would each need cluster-wide API credentials and
+	// would poll the election Lease N times per RetryPeriod.
+	eventsOn        = flag.Bool("events", false, "watch Kubernetes Events and export them as OTLP logs, enriched with the involved object's identity. Cluster-singleton: exactly one replica runs it (leader election), so deploy it as its own Deployment with -logs=false -metrics=false -cadvisor=false -node-metrics=false, NOT in the DaemonSet")
+	eventsNamespace = flag.String("events-namespace", "", "namespace to watch (empty = cluster-wide)")
+	eventsStart     = flag.String("events-start", "auto", "where a cold start begins: end (skip the backlog), start (replay everything still within the API server's event TTL), auto (resume the stored position, else end)")
+	eventsBatch     = flag.Int("events-batch-size", 512, "flush events after this many")
+	eventsFlush     = flag.Duration("events-flush-interval", 2*time.Second, "flush events at least this often")
+	eventsPersist   = flag.Duration("events-position-interval", 10*time.Second, "how often the position is written to its ConfigMap. A write per event would be an API-server write per event, so this is the bound on how much is REPLAYED after a hard kill (bounded duplicates, never loss); a graceful stop always writes a final position")
+	eventsConfigMap = flag.String("events-position-configmap", "kubescrape-events-position", "ConfigMap holding the resume position. NOT a node-local file: the leader moves, so the successor must be able to read it")
+	eventsLease     = flag.String("events-lease", "kubescrape-cluster-leader", "Lease coordinating the cluster-singleton pipelines")
+	eventsLeaseNS   = flag.String("events-lease-namespace", "", "namespace for the Lease and position ConfigMap (default: this pod's own, via $POD_NAMESPACE or the ServiceAccount projection)")
+	kubeconfig      = flag.String("kubeconfig", "", "path to a kubeconfig for the events watch; defaults to in-cluster config (only used with -events)")
 
 	scrapeInterval    = flag.Duration("scrape-interval", 30*time.Second, "Prometheus scrape interval")
 	scrapeTimeout     = flag.Duration("scrape-timeout", 15*time.Second, "per-target scrape timeout")
@@ -229,6 +249,9 @@ func run() error {
 	}
 	if *ingestOn && *ingestGRPC == "" && *ingestHTTP == "" {
 		return fmt.Errorf("-ingest is set but both -ingest-grpc-endpoint and -ingest-http-endpoint are empty")
+	}
+	if err := events.ValidateStartMode(*eventsStart); err != nil {
+		return err
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -557,6 +580,9 @@ func run() error {
 	if err := p.startIngest(); err != nil {
 		return err
 	}
+	if err := p.startEvents(); err != nil {
+		return err
+	}
 	sc := p.startScraper()
 	p.startDebugServer(tl, sc)
 
@@ -688,6 +714,88 @@ func (p *pipelines) startJournald() {
 	p.log.Info("journald reader started", "dir", *journaldDir, "units", *journaldUnits, "positions", *positionsFile)
 }
 
+// startEvents starts the cluster-singleton Kubernetes events reader under a
+// leader election, so exactly one replica watches (N watchers would emit N
+// copies of every event).
+func (p *pipelines) startEvents() error {
+	if !*eventsOn {
+		return nil
+	}
+	cfg, err := kubeConfig(*kubeconfig)
+	if err != nil {
+		return fmt.Errorf("events: building the kubernetes client config: %w", err)
+	}
+	cfg.UserAgent = "kubescrape-agent"
+	client, err := kubernetes.NewForConfig(cfg)
+	if err != nil {
+		return fmt.Errorf("events: creating the kubernetes client: %w", err)
+	}
+	ns := *eventsLeaseNS
+	if ns == "" {
+		ns = leader.Namespace()
+	}
+	if ns == "" {
+		return fmt.Errorf("events: no namespace for the lease and position ConfigMap; set -events-lease-namespace or $POD_NAMESPACE (downward API)")
+	}
+	reader := events.New(events.Config{
+		Client:          client,
+		Positions:       &events.ConfigMapStore{Client: client, Namespace: ns, Name: *eventsConfigMap},
+		StartMode:       *eventsStart,
+		Namespace:       *eventsNamespace,
+		BatchSize:       *eventsBatch,
+		FlushInterval:   *eventsFlush,
+		PersistInterval: *eventsPersist,
+		Meta:            p.meta,
+		Enrich:          *enrichOn,
+		Scrub:           p.scrub,
+		LogAttrs:        p.logAttrs,
+		Rules:           p.journalRules, // the same logs.rules chain
+		LogMetrics:      p.logMetrics,
+		Attrs:           p.attrBuilders.Ingest,
+		Exporter:        p.out,
+		Logger:          p.log,
+	})
+	p.spawn(func() {
+		// The election goroutine must be inside the WaitGroup: ReleaseOnCancel
+		// only hands the lease back if Run returns before the process exits.
+		err := leader.Run(p.ctx, leader.Config{
+			Client:    client,
+			Namespace: ns,
+			Name:      *eventsLease,
+			OnStarted: reader.Run,
+			OnLeading: func(leading bool) {
+				if leading {
+					obs.Leader.Set(1)
+				} else {
+					obs.Leader.Set(0)
+				}
+			},
+			Log: p.log,
+		})
+		if err != nil {
+			p.log.Error("leader election failed; shutting down", "error", err)
+			*p.fatalErr = fmt.Errorf("events leader election: %w", err)
+			p.stop()
+		}
+	})
+	p.log.Info("kubernetes events enabled", "lease", *eventsLease, "namespace", ns,
+		"positionConfigMap", *eventsConfigMap, "start", *eventsStart)
+	return nil
+}
+
+// kubeConfig prefers an explicit kubeconfig, then in-cluster config, then the
+// default loading rules (mirrors the metadata service).
+func kubeConfig(path string) (*rest.Config, error) {
+	if path == "" {
+		if cfg, err := rest.InClusterConfig(); err == nil {
+			return cfg, nil
+		}
+	}
+	rules := clientcmd.NewDefaultClientConfigLoadingRules()
+	rules.ExplicitPath = path
+	return clientcmd.NewNonInteractiveDeferredLoadingClientConfig(rules, nil).ClientConfig()
+}
+
 // startIngest starts the OTLP ingest receiver plus its optional trace
 // sampler and span-metrics tap. A fatal listener failure is reported through
 // p.fatalErr and p.stop so the agent exits non-zero.
@@ -707,7 +815,6 @@ func (p *pipelines) startIngest() error {
 		Scrub:           p.scrub,
 		PeerIPFallback:  *ingestPeerIP,
 		Attrs:           p.attrBuilders.Ingest,
-		NodeInfo:        p.nodeInfo,
 		Meta:            p.meta,
 		Logger:          p.log,
 	})

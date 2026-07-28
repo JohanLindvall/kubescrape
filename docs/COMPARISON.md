@@ -60,6 +60,7 @@ fully attributed — the cache-race gap that per-node watchers accept.
 | Log-derived metrics | ✔ counter/gauge/histogram/summary, windowed aggregations, **pushed OTLP with per-pod resources** | ✔ metrics stage (local exposition) | ✔ log_to_metric | ✔ | ✔ count + sum connectors |
 | Arbitrary host files / gzip archives | ✔ / ✔ gzip, **resumable** mid-archive across restarts | ✔ / ✔ gz, bz2, z (since Loki 2.8; whole-file, no resume) | ✔ / ✘ | ✔ / ✘ | ✔ / ✔ |
 | journald | ✔ native (libsystemd) | ✔ | ✔ | ✔ | ✔ |
+| Kubernetes events as logs | ✔ cluster-singleton (leader election), **checkpointed** resume, events land on the involved pod's own resource | ✔ `loki.source.kubernetes_events` | ✘ | ✔ `in_kubernetes_events` | ✔ `k8s_events`/`k8sobjects` (no checkpoint) |
 | Secret/PII scrubbing | ✔ `logScrubbing` (curated built-ins + custom regexes, pre-enrichment) | ~ `loki.secretfilter` (curated Gitleaks rules + entropy detection; experimental) / config stages | VRL | config | ✔ redaction processor |
 | Per-workload (annotation) log config | ✔ `kubescrape.io/logs` (exclude, multiline, rules, attributes) | ~ PodLogs CRD (GA: per-workload selection/relabeling; no multiline/rule overrides) | ~ `vector.dev/exclude` label + exclude-containers annotation | ~ `fluentbit.io/exclude`, parser annotations | ✘ |
 | Body rewriting / templating | ✔ opt-in (Starlark transforms; the built-in pipeline never modifies bodies) | ✔ | ✔ VRL | ✔ | ✔ OTTL |
@@ -218,15 +219,12 @@ production soak time than any comparator — the invariants are tested
 (race-tested suite, crash/rotation/power-loss cases) but the field mileage
 is not.
 
-Three things are **deliberately out of scope** — kubescrape does not try to
+Two things are **deliberately out of scope** — kubescrape does not try to
 replace the standard component for each:
 
 - **Host/node system metrics** (`/proc`, node_exporter territory): run a
   node_exporter DaemonSet and scrape it via `prometheus.io/*` annotations or a
   PodMonitor.
-- **Kubernetes events export**: use the OpenTelemetry Collector's
-  `k8sobjects`/`k8s_events` receiver (or kube-events) if you need events as
-  logs.
 - **kube-state-metrics generation**: kubescrape does not produce KSM series —
   deploy kube-state-metrics itself and scrape it. kubescrape's metrics
   splitters then re-attribute its output into per-object resources; only the

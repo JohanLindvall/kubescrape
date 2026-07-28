@@ -40,15 +40,12 @@ with its labels: [docs/METRICS.md](docs/METRICS.md).
 
 ## Out of scope
 
-Three things are **deliberately** not kubescrape's job — use the standard
+Two things are **deliberately** not kubescrape's job — use the standard
 component for each:
 
 * **Host/node system metrics** (`/proc`, node_exporter territory): run a
   node_exporter DaemonSet and scrape it via `prometheus.io/*` annotations or a
   PodMonitor.
-* **Kubernetes events export**: use the OpenTelemetry Collector's
-  `k8sobjects`/`k8s_events` receiver (or kube-events) if you need events as
-  logs.
 * **kube-state-metrics generation**: kubescrape does not produce KSM series —
   deploy kube-state-metrics itself and scrape it. The agent's metrics
   splitters then re-attribute its output into per-object resources; only the
@@ -733,6 +730,41 @@ non-default journal directory (e.g. `/run/log/journal`). `-enrich`
 (default true) applies the same per-line enrichment here as to container logs; an
 explicit level found in the message wins over the journal priority.
 
+**Kubernetes events** (opt-in `-events`). Events are a **cluster-wide**
+stream, not a per-node one, so this pipeline runs the agent binary as its own
+single-replica Deployment ([deploy/events.yaml](deploy/events.yaml), or
+`events.enabled=true` in the chart) with every per-node pipeline switched off
+— deliberately **not** in the DaemonSet, which would put cluster-wide `events`
+read plus lease/configmap write credentials on every node and cost one lease
+poll per node per retry period. Exactly one replica reads at a time
+(`coordination.k8s.io` **Lease** election, `-events-lease`), so a rolling
+update or a `>1` replica count never double-ships. Each event becomes an OTLP
+log record whose body is the message, with `k8s.event.reason`,
+`k8s.event.action`, `k8s.event.type`, `k8s.event.count`, `k8s.event.name`,
+`k8s.event.involved_object.*` and `k8s.event.reporting_component`/`_instance`
+as record attributes, and whose **resource is the
+involved object's own** — an event about a pod is resolved through the
+metadata service (`GET /v1/pods/{ns}/{name}`, UID cross-checked so a recycled
+name cannot mis-attribute) and carries the same `k8s.*`/`service.*` attributes
+as that pod's container logs, which is what makes events and logs line up in a
+query. Other kinds get `k8s.namespace.name` plus the kind's own name
+attribute. Aggregated events (the API server's `count`/`lastTimestamp`
+rollup) arrive as MODIFIED and are exported as fresh occurrences.
+
+Delivery is at-least-once, with the same discipline as every other pipeline:
+the position (the watch `resourceVersion` plus a timestamp watermark) is
+persisted only **after** the collector acks, and it lives in a **ConfigMap**
+(`-events-position-configmap`) rather than a node-local file, because the
+leader moves — the successor of a killed pod resumes exactly where its
+predecessor stopped. A written position is only ever a *lower bound* on what
+was delivered, so a zombie writer can at worst cause a replay, never a gap. If
+the API server's watch window has passed (`410 Gone`), the reader re-lists and
+the watermark suppresses the events it already shipped. `-events-start`
+chooses the cold-start behaviour when no position exists at all
+(`auto`/`end`/`start`). The full agent chain applies: `logScrubbing`,
+`logAttributes`, `-enrich`, `logMetrics`, `logs.rules`, Starlark transforms,
+routing and the disk buffer.
+
 **OTLP ingest** (opt-in `-ingest`). Applications on the node can push their
 own OTLP to the local agent, which enriches it with Kubernetes attributes and
 forwards it — closing the gap that otherwise needs a separate collector with
@@ -789,12 +821,13 @@ traceSampling:
 **Pipeline toggles.** Each pipeline is individually switchable: `-logs`,
 `-metrics` (annotation-discovered targets), `-cadvisor` and `-node-metrics`
 (all default true; the kubelet scrapes additionally require
-`-kubelet-endpoint`), plus the opt-in `-journald`, `-ingest` and.
+`-kubelet-endpoint`), plus the opt-in `-journald`, `-ingest` and `-events`.
 
 **Self-observability.** The agent's own metrics — log entries/bytes/rotations
 and export failures, enrichment hit rates per format, scrapes and scrape
 duration/samples per pipeline, exports per signal and outcome, metadata
-lookups, journal entries and reader restarts — are produced through the same
+lookups, journal entries and reader restarts, events observed/exported and
+watch restarts — are produced through the same
 internal metrics machinery as everything else and **pushed over OTLP** on
 `-self-metrics-interval` (default 1m, 0 disables) with the agent's own
 resource identity (`service.name: kubescrape-agent`, `k8s.node.name`).
@@ -802,7 +835,7 @@ resource identity (`service.name: kubescrape-agent`, `k8s.node.name`).
 `GET /debug/tailer` (per-file positions and lag), `GET /debug/targets` (the
 last scrape cycle's per-target outcomes — up/error/duration/samples,
 failures first), `GET /debug/transforms` (the active transform program's
-content hash, for checking per-node convergence after a reload), and `GET /debug/transforms`.
+content hash, for checking per-node convergence after a reload).
 
 **Three separate listeners.** `-listen` carries health and the `/debug`
 surface; `-metrics-listen` (default `:9090`) serves the Prometheus

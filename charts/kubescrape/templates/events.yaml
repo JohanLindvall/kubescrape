@@ -1,0 +1,255 @@
+{{- if .Values.events.enabled }}
+{{- /*
+  Kubernetes events are a CLUSTER-SINGLETON pipeline, so they run as their own
+  single-replica Deployment of the agent binary with every per-node pipeline
+  off — deliberately NOT in the DaemonSet:
+
+    * every agent would need cluster-wide `events` read plus lease/configmap
+      write, putting those credentials on every node in the cluster, where the
+      DaemonSet today holds only `nodes/metrics: get`;
+    * each non-leader polls the election Lease once per RetryPeriod, so the
+      election alone would cost ~N/2 API reads per second — the fan-out this
+      project exists to avoid.
+
+  Deployed this way the reader still gets the agent's whole delivery chain
+  (disk buffer, logs.rules, scrubbing, log-metrics, transforms, routing) and
+  enriches through the metadata service exactly as agents do.
+*/}}
+{{- $cfg := .Values.agent.config | default dict }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ .Release.Name }}-events
+  namespace: {{ .Release.Namespace }}
+  labels: {{ include "kubescrape.labels" . | nindent 4 }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ .Release.Name }}-events
+  labels: {{ include "kubescrape.labels" . | nindent 4 }}
+rules:
+  # The only cluster-wide grant: reading events. It lands on THIS
+  # ServiceAccount, never on the DaemonSet's.
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["events.k8s.io"]
+    resources: ["events"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ .Release.Name }}-events
+  labels: {{ include "kubescrape.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ .Release.Name }}-events
+subjects:
+  - kind: ServiceAccount
+    name: {{ .Release.Name }}-events
+    namespace: {{ .Release.Namespace }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ .Release.Name }}-events
+  namespace: {{ .Release.Namespace }}
+  labels: {{ include "kubescrape.labels" . | nindent 4 }}
+rules:
+  # Leader election: exactly one replica may watch, or every event ships twice.
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "create", "update"]
+  # The resume position. It cannot be a node-local file like the tailer's
+  # positions store: the leader moves, and the successor after a kill is a
+  # different pod that must be able to read where the previous one got to.
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "create", "update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ .Release.Name }}-events
+  namespace: {{ .Release.Namespace }}
+  labels: {{ include "kubescrape.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ .Release.Name }}-events
+subjects:
+  - kind: ServiceAccount
+    name: {{ .Release.Name }}-events
+    namespace: {{ .Release.Namespace }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}-events
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: {{ .Release.Name }}-events
+    {{- include "kubescrape.labels" . | nindent 4 }}
+spec:
+  # One replica is the norm; leader election makes >1 safe (and makes a
+  # rolling update's overlap safe even at 1).
+  replicas: {{ .Values.events.replicas }}
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: {{ .Release.Name }}-events
+  template:
+    metadata:
+      labels:
+        app: {{ .Release.Name }}-events
+      annotations:
+        {{- if $cfg }}
+        checksum/config: {{ $cfg | toYaml | sha256sum }}
+        {{- end }}
+        {{- if and .Values.metrics.enabled .Values.metrics.scrapeAnnotations }}
+        prometheus.io/scrape: "true"
+        prometheus.io/port: {{ (split ":" .Values.metrics.listen)._1 | quote }}
+        prometheus.io/path: /metrics
+        {{- end }}
+    spec:
+      serviceAccountName: {{ .Release.Name }}-events
+      {{- with .Values.events.priorityClassName }}
+      priorityClassName: {{ . }}
+      {{- end }}
+      {{- with .Values.events.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.events.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: events
+          image: {{ include "kubescrape.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["/kubescrape-agent"]
+          args:
+            - -events
+            # Every per-node pipeline off: this replica only watches events.
+            - -logs=false
+            - -metrics=false
+            - -cadvisor=false
+            - -node-metrics=false
+            - -journald=false
+            - -ingest=false
+            - -metadata-endpoint=http://{{ .Release.Name }}.{{ .Release.Namespace }}
+            - -listen={{ .Values.agent.listen }}
+            - -self-metrics-interval={{ .Values.agent.selfMetricsInterval }}
+            - -events-lease={{ .Values.events.leaseName }}
+            - -events-position-configmap={{ .Values.events.positionConfigMap }}
+            - -events-start={{ .Values.events.start }}
+            - -events-batch-size={{ int64 .Values.events.batchSize }}
+            - -events-flush-interval={{ .Values.events.flushInterval }}
+            - -events-position-interval={{ .Values.events.positionInterval }}
+            {{- with .Values.events.namespace }}
+            - -events-namespace={{ . }}
+            {{- end }}
+            - -otlp-endpoint={{ .Values.agent.otlp.endpoint }}
+            - -otlp-protocol={{ .Values.agent.otlp.protocol }}
+            - -otlp-compression={{ .Values.agent.otlp.compression }}
+            - -otlp-compression-level={{ int64 .Values.agent.otlp.compressionLevel }}
+            - -otlp-insecure={{ .Values.agent.otlp.insecure }}
+            - -otlp-tls-insecure-skip-verify={{ .Values.agent.otlp.tlsInsecureSkipVerify }}
+            {{- with .Values.agent.otlp.caFile }}
+            - -otlp-tls-ca-file={{ . }}
+            {{- end }}
+            - -otlp-timeout={{ .Values.agent.otlp.timeout }}
+            {{- if .Values.agent.otlp.bearerTokenSecret.name }}
+            - -otlp-bearer-token-file=/etc/kubescrape/otlp-token/{{ .Values.agent.otlp.bearerTokenSecret.key }}
+            {{- end }}
+            - -enrich={{ .Values.agent.enrich }}
+            {{- if $cfg }}
+            - -config=/etc/kubescrape/config/config.yaml
+            {{- end }}
+            - -metrics-listen={{ .Values.metrics.listen }}
+            - -log-level={{ .Values.logLevel }}
+            - -log-format={{ .Values.logFormat }}
+            {{- with .Values.events.extraArgs }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          env:
+            # The agent requires a node name (its own self-metrics identity);
+            # events themselves never carry it — a described object's node is
+            # the object's property, not this reader's.
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef: {fieldPath: spec.nodeName}
+            # The Lease and the position ConfigMap live in this pod's own
+            # namespace; without it the reader cannot tell where to put them.
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef: {fieldPath: metadata.namespace}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 65532
+            capabilities:
+              drop: ["ALL"]
+          ports:
+            - name: http
+              containerPort: {{ (split ":" .Values.agent.listen)._1 | int }}
+            {{- if .Values.metrics.enabled }}
+            - name: metrics
+              containerPort: {{ (split ":" .Values.metrics.listen)._1 | int }}
+            {{- end }}
+          readinessProbe:
+            httpGet: {path: /readyz, port: http}
+          livenessProbe:
+            httpGet: {path: /healthz, port: http}
+          {{- if $cfg }}
+          volumeMounts:
+            - name: config
+              mountPath: /etc/kubescrape/config
+              readOnly: true
+            {{- if .Values.agent.otlp.bearerTokenSecret.name }}
+            - name: otlp-token
+              mountPath: /etc/kubescrape/otlp-token
+              readOnly: true
+            {{- end }}
+          {{- end }}
+          resources: {{ toYaml .Values.events.resources | nindent 12 }}
+      {{- if $cfg }}
+      volumes:
+        - name: config
+          configMap:
+            name: {{ .Release.Name }}-agent-config
+        {{- if .Values.agent.otlp.bearerTokenSecret.name }}
+        - name: otlp-token
+          secret:
+            secretName: {{ .Values.agent.otlp.bearerTokenSecret.name }}
+        {{- end }}
+      {{- end }}
+{{- if .Values.networkPolicy.enabled }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ .Release.Name }}-events
+  namespace: {{ .Release.Namespace }}
+  labels: {{ include "kubescrape.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app: {{ .Release.Name }}-events
+  policyTypes: [Ingress]
+  ingress:
+    - ports:
+        # Health/readiness (the kubelet probes these) and, when enabled, the
+        # scrape port. Nothing else is served.
+        - port: {{ (split ":" .Values.agent.listen)._1 | int }}
+        {{- if .Values.metrics.enabled }}
+        - port: {{ (split ":" .Values.metrics.listen)._1 | int }}
+        {{- end }}
+{{- end }}
+{{- end }}

@@ -24,8 +24,14 @@
 // in.
 //
 // Appends fsync the frame before returning, so a producer that has observed a
-// successful Append may safely advance its own checkpoint. A separate `cursor`
-// file records the read position ({segment seq, offset}) and is rewritten in
+// successful Append may safely advance its own checkpoint. Producers with many
+// SMALL records can group-commit instead: AppendNoSync enqueues without
+// forcing durability and Sync makes everything since the last durable point
+// safe with ONE fsync — the checkpoint rule moves to Sync ("advance only after
+// Sync returns"), it never silently weakens. On a Sync failure the whole
+// unsynced group is rolled back and must be re-appended (duplicates are
+// possible if some frames were popped meanwhile — within at-least-once).
+// A separate `cursor` file records the read position ({segment seq, offset}) and is rewritten in
 // place after each commit; a torn cursor fails its checksum on the next load
 // and redelivers from the oldest segment (duplicates, within at-least-once). On
 // restart the newest segment's torn tail — a frame the crash left incomplete —
@@ -151,11 +157,20 @@ type Spool struct {
 	segs    []segment // ascending by seq; segs[0] is the read head, last is the write tail
 	w       *os.File  // append handle for the newest segment
 	cursorF *os.File
-	readF   *os.File // cached read handle for the head segment
-	readSeq int64    // segment seq readF is open on
-	readOff int64    // offset within segs[0] of the next unread frame
-	signal  chan struct{}
-	closed  bool
+	// Group-commit state (AppendNoSync/Sync). syncedTailSize is the write
+	// tail's durable size — everything past it was accepted by AppendNoSync
+	// but not yet covered by an fsync. syncErr records an unsynced group that
+	// was invalidated (rolled back, or lost with its segment) before a Sync
+	// could cover it: the next Sync returns it instead of falsely acking, so
+	// the producer re-appends the group.
+	syncedTailSize int64
+	pendingSync    bool
+	syncErr        error
+	readF          *os.File // cached read handle for the head segment
+	readSeq        int64    // segment seq readF is open on
+	readOff        int64    // offset within segs[0] of the next unread frame
+	signal         chan struct{}
+	closed         bool
 	// pendingCorrupt counts corrupt segments whose records were lost and must be
 	// surfaced: a bad/damaged header dropped at load, or a header-only middle
 	// segment (truncation damage) retired in retireConsumedLocked. Pop surfaces
@@ -269,6 +284,9 @@ func (s *Spool) load() error {
 	if s.segs[0].seq == cursorSeq && cursorOff <= s.segs[0].size {
 		s.readOff = max(cursorOff, segHeaderLen)
 	}
+	// Whatever survived to disk is the durable baseline of the tail.
+	s.syncedTailSize = s.segs[len(s.segs)-1].size
+	s.pendingSync = false
 	return nil
 }
 
@@ -327,6 +345,7 @@ func (s *Spool) openTail() error {
 		}
 	}
 	tail.size = good
+	s.syncedTailSize = good // on-disk content is the durable baseline
 	if tail.version != formatVersion {
 		return s.appendSegment(tail.seq + 1)
 	}
@@ -362,6 +381,7 @@ func (s *Spool) appendSegment(seq int64) error {
 	}
 	s.w = f
 	s.segs = append(s.segs, segment{seq: seq, size: segHeaderLen, path: path, version: formatVersion})
+	s.syncedTailSize = segHeaderLen
 	s.syncDir()
 	return nil
 }
@@ -453,7 +473,18 @@ func (s *Spool) backlog() int64 {
 // would be exceeded, leaving the queue unchanged so the caller can apply
 // backpressure.
 func (s *Spool) Append(data []byte) error {
-	return s.append(data, false)
+	return s.append(data, false, true)
+}
+
+// AppendNoSync enqueues one record WITHOUT forcing it to disk. The record is
+// readable immediately (same-process visibility) but not durable — a crash may
+// lose it — until a Sync (or a later synced Append on the same tail) returns.
+// The group-commit half of the durability contract: producers with many small
+// records call AppendNoSync per record and Sync once per group, paying one
+// fsync per group instead of per record, and advance their checkpoint only
+// after Sync.
+func (s *Spool) AppendNoSync(data []byte) error {
+	return s.append(data, false, false)
 }
 
 // AppendForce enqueues one record IGNORING the size cap. It exists solely for
@@ -464,10 +495,10 @@ func (s *Spool) Append(data []byte) error {
 // frame, within the documented "physical disk may exceed the cap by up to one
 // segment" tolerance. Do NOT use it for ordinary enqueues.
 func (s *Spool) AppendForce(data []byte) error {
-	return s.append(data, true)
+	return s.append(data, true, true)
 }
 
-func (s *Spool) append(data []byte, force bool) error {
+func (s *Spool) append(data []byte, force, sync bool) error {
 	frame := int64(frameHeaderV1 + len(data))
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -486,8 +517,13 @@ func (s *Spool) append(data []byte, force bool) error {
 	}
 	tail := &s.segs[len(s.segs)-1]
 	// Rotate only once the tail holds a frame, so an oversized record cannot
-	// leave an empty segment behind.
+	// leave an empty segment behind. An unsynced group on the old tail is
+	// flushed FIRST: appendSegment closes its handle, after which its frames
+	// could never be fsynced again.
 	if tail.size > segHeaderLen && tail.size+frame > s.segmentSize {
+		if err := s.flushPendingLocked(); err != nil {
+			return err
+		}
 		if err := s.appendSegment(tail.seq + 1); err != nil {
 			return err
 		}
@@ -504,23 +540,84 @@ func (s *Spool) append(data []byte, force bool) error {
 		s.rollbackTail(tail)
 		return err
 	}
+	if !sync {
+		tail.size += frame
+		s.pendingSync = true
+		s.notify()
+		return nil
+	}
 	if err := s.w.Sync(); err != nil {
 		s.rollbackTail(tail)
 		return err
 	}
 	tail.size += frame
+	// This fsync covered any unsynced group frames on the same tail too: the
+	// whole file is durable up to here.
+	s.syncedTailSize = tail.size
+	s.pendingSync = false
 	s.notify()
 	return nil
 }
 
-// rollbackTail restores the write tail to its last known-good size after a
-// failed append (e.g. ENOSPC mid-frame — the condition a disk spool exists
-// for). O_APPEND writes land at the physical end, so leaving partial bytes
-// would desynchronize the frame stream from the size accounting and could be
-// misparsed as frames after a restart. If the truncate itself fails the
-// handle is closed and the next Append reopens and re-verifies the tail.
+// Sync makes every record accepted by AppendNoSync durable — the group-commit
+// barrier. A producer using AppendNoSync may advance its checkpoint only after
+// Sync returns nil; on error the whole unsynced group was rolled back (or was
+// already lost with a damaged tail) and must be re-appended. Duplicates are
+// possible when frames of the group were popped before the failure — within
+// at-least-once, exactly like the synced-append failure paths.
+func (s *Spool) Sync() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return errors.New("spool: closed")
+	}
+	if err := s.syncErr; err != nil {
+		// The group was invalidated before this barrier (rollback after a
+		// failed write, or its tail segment was lost). Reporting nil would
+		// let the producer checkpoint records that never became durable.
+		s.syncErr = nil
+		return err
+	}
+	return s.flushPendingLocked()
+}
+
+// flushPendingLocked fsyncs the tail when unsynced frames are outstanding;
+// on failure the unsynced region is rolled back (caller holds the lock).
+func (s *Spool) flushPendingLocked() error {
+	if !s.pendingSync {
+		return nil
+	}
+	if s.w == nil {
+		if err := s.openTail(); err != nil {
+			return err
+		}
+	}
+	if err := s.w.Sync(); err != nil {
+		s.rollbackTail(&s.segs[len(s.segs)-1])
+		return err
+	}
+	s.syncedTailSize = s.segs[len(s.segs)-1].size
+	s.pendingSync = false
+	return nil
+}
+
+// rollbackTail restores the write tail to its last DURABLE size after a
+// failed write or fsync (e.g. ENOSPC mid-frame — the condition a disk spool
+// exists for). O_APPEND writes land at the physical end, so leaving partial
+// bytes would desynchronize the frame stream from the size accounting and
+// could be misparsed as frames after a restart. Rolling back to the durable
+// size (not just the pre-frame size) also discards any unsynced group: after
+// a failed fsync the fate of those pages is unknown, and a retried fsync on
+// the same descriptor is not trustworthy — the group's producer is told via
+// syncErr and re-appends. If the truncate itself fails the handle is closed
+// and the next Append reopens and re-verifies the tail.
 func (s *Spool) rollbackTail(tail *segment) {
-	if err := s.w.Truncate(tail.size); err == nil {
+	if s.pendingSync {
+		s.pendingSync = false
+		s.syncErr = errors.New("spool: unsynced records rolled back; re-append the group")
+	}
+	if err := s.w.Truncate(s.syncedTailSize); err == nil {
+		tail.size = s.syncedTailSize
 		return
 	}
 	_ = s.w.Close()
@@ -581,9 +678,10 @@ func (s *Spool) Pop() (data []byte, commit func(), ok bool, err error) {
 	if s.readOff+fh+n > head.size {
 		// An overshooting length is corruption on any segment: a middle
 		// segment's size is final, and the write tail's size only ever covers
-		// whole fsynced frames (Append advances it after Sync, under the lock;
-		// openTail truncates torn tails at load) — so this is never a torn
-		// append in progress. The frame boundaries from here on are lost:
+		// whole WRITTEN frames (Append advances it under the lock only after
+		// both writes land — unsynced group frames included, whose in-process
+		// reads are consistent; openTail truncates torn tails at load) — so
+		// this is never a torn append in progress. The frame boundaries from here on are lost:
 		// waiting would wedge the queue forever, and on the tail a future
 		// append could grow the segment past the bogus length and deliver
 		// bytes spanning unrelated frames. Skip the segment; the tail is
@@ -701,6 +799,11 @@ func (s *Spool) skipLostHead() {
 	// leaving segs empty would panic every segs[0]/segs[len-1] access (Pop,
 	// Append's openTail, stale commits).
 	seq := s.segs[0].seq + 1
+	if s.pendingSync {
+		// An unsynced group died with the tail; Sync must not falsely ack it.
+		s.pendingSync = false
+		s.syncErr = errors.New("spool: unsynced records lost with a damaged tail segment; re-append the group")
+	}
 	if s.w != nil {
 		_ = s.w.Close()
 		s.w = nil
@@ -762,10 +865,18 @@ func (s *Spool) Segments() int {
 	return len(s.segs)
 }
 
-// Close releases the file handles. It does not delete queued data.
+// Close flushes any unsynced group (a clean shutdown must not lose records
+// AppendNoSync accepted) and releases the file handles. It does not delete
+// queued data; a flush failure is returned so the producer knows the group
+// never became durable.
 func (s *Spool) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	err := s.flushPendingLocked()
+	if s.syncErr != nil {
+		err = errors.Join(err, s.syncErr)
+		s.syncErr = nil
+	}
 	s.closed = true
 	s.dropReadHandle()
 	if s.w != nil {
@@ -776,7 +887,7 @@ func (s *Spool) Close() error {
 		_ = s.cursorF.Close()
 		s.cursorF = nil
 	}
-	return nil
+	return err
 }
 
 // loadCursor reads the persisted {seq, offset}; a missing, short or torn cursor

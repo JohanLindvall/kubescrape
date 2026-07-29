@@ -2,6 +2,7 @@ package spool
 
 import (
 	"encoding/binary"
+	"fmt"
 	"testing"
 )
 
@@ -68,6 +69,37 @@ func BenchmarkAppend(b *testing.B) {
 					b.Fatal(err)
 				}
 			}
+		})
+	}
+}
+
+// BenchmarkGroupCommit measures the group-commit amortization: N small
+// records per fsync (AppendNoSync xN + one Sync). Compare the ns/record
+// metric against BenchmarkAppend/256B — the whole point of the API is that
+// the ~ms fsync is paid once per group instead of once per record.
+func BenchmarkGroupCommit(b *testing.B) {
+	data := benchPayload(256)
+	for _, group := range []int{10, 100, 1000} {
+		b.Run(fmt.Sprintf("group-%d", group), func(b *testing.B) {
+			s, err := Open(b.TempDir(), Options{})
+			if err != nil {
+				b.Fatal(err)
+			}
+			defer func() { _ = s.Close() }()
+			b.SetBytes(int64(group * len(data)))
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				for j := 0; j < group; j++ {
+					if err := s.AppendNoSync(data); err != nil {
+						b.Fatal(err)
+					}
+				}
+				if err := s.Sync(); err != nil {
+					b.Fatal(err)
+				}
+			}
+			b.ReportMetric(float64(b.Elapsed().Nanoseconds())/float64(b.N)/float64(group), "ns/record")
 		})
 	}
 }

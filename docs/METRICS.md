@@ -49,7 +49,7 @@ names a metric or a label that is not registered.
 | `kubescrape_journal_truncated_total` | — | Journal messages truncated at MaxEntryBytes (the record carries log.truncated). |
 | `kubescrape_leader` | — | 1 while this replica holds the cluster-singleton lease, 0 otherwise; sum != 1 means split brain or nobody leading. |
 | `kubescrape_log_archive_errors_total` | — |  |
-| `kubescrape_log_bytes_total` | — | Raw log bytes read. |
+| `kubescrape_log_bytes_total` | — | Raw log bytes read from live files and archives. Segment replays (re-reading a rotated file's owed range after a restart or rewind) are not re-counted. |
 | `kubescrape_log_enriched_total` | `format` | Log records by the enrichment strategy that matched (json, logfmt, pattern, none). |
 | `kubescrape_log_entries_total` | — | Log entries exported. |
 | `kubescrape_log_export_failures_total` | — | Log batch exports that failed after retries (files rewound). |
@@ -66,7 +66,7 @@ names a metric or a label that is not registered.
 | `kubescrape_log_rotations_total` | — | Log file rotations and truncations handled. |
 | `kubescrape_log_rules_dropped_total` | — | Log records dropped by the logs rules (including sampled-away lines). |
 | `kubescrape_log_scrubbed_total` | `pattern` | Log bodies redacted by a scrub pattern (one bump per pattern per record, not per match). |
-| `kubescrape_log_torn_final_lines_total` | — | Unterminated final lines of rotated-away files (the fragment can never complete and is dropped). |
+| `kubescrape_log_torn_final_lines_total` | — | Unterminated final lines of RENAMED-away files (the fragment can never complete and is dropped). In-place truncation destroys its unread tail unmeasurably — there is nothing left to count — so truncation losses do not appear here or anywhere. |
 | `kubescrape_log_unresolved_lost_total` | — |  |
 | `kubescrape_metadata_requests_total` | `outcome` | Requests to the metadata service by outcome. |
 | `kubescrape_monitor_fields_ignored_total` | `kind` | Monitor upserts whose endpoints set fields kubescrape does not interpret. |

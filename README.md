@@ -341,7 +341,10 @@ carried across each inode switch, and — for zero loss across a crash
 mid-rotation — the rotated-away files are recorded in the checkpoint and
 re-read in order on restart to reconstruct the group. (This spans only
 rotations the agent observed; a rotation so fast the intermediate file is
-never read loses that segment, as with any tailer.) It exports
+never read loses that segment, as with any tailer. In-place truncation is
+different in kind: the writer destroys the unread tail, so that loss is
+inherently unmeasurable — unlike every loss the agent itself decides on,
+which is counted in a metric.) It exports
 OTLP log records with resource attributes (`k8s.pod.name`,
 `k8s.deployment.name`, `container.id`, pod/namespace labels, …) resolved via
 `GET /v1/containers/{id}` — the blocking wait covers containers whose

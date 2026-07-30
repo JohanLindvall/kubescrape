@@ -17,7 +17,7 @@ var (
 	LogEntries = Registry.Counter("kubescrape_log_entries_total",
 		"Log entries exported.")
 	LogBytes = Registry.Counter("kubescrape_log_bytes_total",
-		"Raw log bytes read.")
+		"Raw log bytes read from live files and archives. Segment replays (re-reading a rotated file's owed range after a restart or rewind) are not re-counted.")
 	LogExportFailures = Registry.Counter("kubescrape_log_export_failures_total",
 		"Log batch exports that failed after retries (files rewound).")
 	LogFiles = Registry.Gauge("kubescrape_log_files",
@@ -77,7 +77,7 @@ var (
 	LogOversizedDropped = Registry.Counter("kubescrape_log_oversized_dropped_total",
 		"Unterminated lines discarded for exceeding the per-entry size bound (no newline within MaxEntryBytes+4096).")
 	LogTornFinalLines = Registry.Counter("kubescrape_log_torn_final_lines_total",
-		"Unterminated final lines of rotated-away files (the fragment can never complete and is dropped).")
+		"Unterminated final lines of RENAMED-away files (the fragment can never complete and is dropped). In-place truncation destroys its unread tail unmeasurably — there is nothing left to count — so truncation losses do not appear here or anywhere.")
 	LogScrubbed = Registry.CounterVec("kubescrape_log_scrubbed_total",
 		"Log bodies redacted by a scrub pattern (one bump per pattern per record, not per match).", "pattern")
 	LogArchiveErrors = Registry.Counter("kubescrape_log_archive_errors_total",

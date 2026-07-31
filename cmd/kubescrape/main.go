@@ -42,6 +42,7 @@ import (
 	"github.com/JohanLindvall/kubescrape/internal/agent/otlpexport"
 	"github.com/JohanLindvall/kubescrape/internal/obs"
 	"github.com/JohanLindvall/kubescrape/internal/owners"
+	"github.com/JohanLindvall/kubescrape/internal/selfmeta"
 	"github.com/JohanLindvall/kubescrape/internal/server"
 	"github.com/JohanLindvall/kubescrape/internal/servicemonitors"
 	"github.com/JohanLindvall/kubescrape/internal/services"
@@ -429,6 +430,7 @@ func run() error {
 
 		// Self-metrics -> OTLP (the service's only OTLP producer).
 		selfMetricsIntv      = flag.Duration("self-metrics-interval", time.Minute, "export the service's own metrics over OTLP at this interval (0 disables)")
+		selfAttrs            = flag.Bool("self-attributes", true, "add THIS pod's Kubernetes resource attributes (namespace, pod, uid, owners, labels) to the service's own exported metrics. Resolved from the service's OWN store — its pod name is the hostname, its namespace comes from $POD_NAMESPACE or the ServiceAccount projection — so it needs no API traffic and no extra manifest wiring. Attributes already set (service.name, service.instance.id) are never overwritten; a process that is not a pod of that name simply gets none")
 		otlpEndpoint         = flag.String("otlp-endpoint", "otel-collector.monitoring:4317", "OTLP endpoint for self-metrics: host:port for grpc, base URL for http")
 		otlpProtocol         = flag.String("otlp-protocol", "grpc", "OTLP transport: grpc or http")
 		otlpCompression      = flag.String("otlp-compression", "gzip", "OTLP payload compression: gzip or none")
@@ -544,6 +546,11 @@ func run() error {
 		wg.Wait()
 	}()
 	var selfRes pcommon.Resource
+	// selfOut is the exporter plus this pod's own Kubernetes attributes,
+	// filled in where the identity above left a key unset. Used by BOTH the
+	// periodic run and the final export below — the last data point of a
+	// series must not carry a different resource than the rest.
+	var selfOut selfmeta.Exporter = exporter
 	if *selfMetricsIntv > 0 {
 		selfRes = pcommon.NewResource()
 		a := selfRes.Attributes()
@@ -552,10 +559,18 @@ func run() error {
 		if host, err := os.Hostname(); err == nil {
 			a.PutStr("service.instance.id", host)
 		}
+		if *selfAttrs {
+			// This process's own pod, out of its own store — no HTTP hop, no
+			// downward API. Re-read once a minute (the agent's default
+			// cadence) so a relabelled pod is picked up; the first lookups
+			// retry faster, since the informers fill in after this point.
+			selfOut = selfmeta.Wrap(selfOut,
+				selfmeta.Start(ctx, selfResolver(st, resolver), time.Minute, log), selfBuild)
+		}
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			obs.Registry.Run(ctx, exporter, *selfMetricsIntv, selfRes, log)
+			obs.Registry.Run(ctx, selfOut, *selfMetricsIntv, selfRes, log)
 		}()
 		log.Info("self-metrics export started", "interval", *selfMetricsIntv)
 	}
@@ -662,7 +677,7 @@ func run() error {
 		// Registry.Run's own final export raced the final flushes inside
 		// wg.Wait (the events drain, the last batches); counters they bumped
 		// would otherwise die unexported. One more export now that all are done.
-		obs.Registry.FinalExport(exporter, selfRes, log)
+		obs.Registry.FinalExport(selfOut, selfRes, log)
 	}
 	return runErr
 }

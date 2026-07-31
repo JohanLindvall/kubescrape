@@ -59,6 +59,7 @@ kubescrape -listen :8080 -wait-timeout 5s -cache-ttl 5m -log-format json
 | `-scrape-auth-secrets` | `false` | serve monitor endpoints' `bearerTokenSecret` values to agents on `GET /v1/scrape-auth/{ns}/{name}/{key}`. Opt-in: requires `secrets get` RBAC (commented out in the manifests), `-scrape-auth-token-file`, and ships tokens over the cluster-internal HTTP channel |
 | `-scrape-auth-token-file` | — | file with the shared bearer token callers must present on `/v1/scrape-auth` as `Authorization: Bearer <token>`. **Mandatory** with `-scrape-auth-secrets` — that endpoint is the only one serving Secret material, so starting without a token is refused rather than leaving it open to every pod in the cluster. Compared in constant time. The file is re-read about once a minute, and after a change the PREVIOUS token stays accepted for a 5-minute grace window — so rotating the Secret is a non-event: agents (which re-read their copy on the same cadence) and the service converge with no restarts and no 401 storm |
 | `-self-metrics-interval` | `1m` | export the service's own metrics over OTLP at this interval (0 disables) |
+| `-self-attributes` | `true` | add THIS pod's Kubernetes resource attributes (namespace, pod, uid, owners, labels) to those exported metrics. No API traffic and no manifest wiring: the service reads its own store, its pod name is the hostname and its namespace comes from `$POD_NAMESPACE` or the ServiceAccount projection it already mounts. Fill-if-absent — `service.name` stays `kubescrape` and `service.instance.id` stays the hostname, but `service.namespace` becomes the pod's namespace, so the job reads `<namespace>/kubescrape`. A process that is not a pod of that name simply gets none. The agent has the same flag (resolved differently — see its section) |
 | `-otlp-*` | as the agent | used by the self-metrics push: `-otlp-endpoint`, `-otlp-protocol`, `-otlp-compression`, `-otlp-compression-level`, `-otlp-insecure`, `-otlp-tls-ca-file`, `-otlp-tls-insecure-skip-verify`, `-otlp-bearer-token-file`, `-otlp-timeout` |
 | `-otlp-header` | — | static `key=value` header sent on every self-metrics export (HTTP header / gRPC metadata, e.g. `X-Scope-OrgID=tenant`); repeatable — repeatable rather than comma-separated so a value may contain commas |
 | `-log-level` | `info` | `debug`, `info`, `warn`, `error` |
@@ -98,6 +99,7 @@ manifests — enable deliberately) — see
 | `-metadata-endpoint` | `http://kubescrape.monitoring` | base URL of the metadata service |
 | `-metadata-wait` | `5s` | server-side wait for not-yet-known containers (covers the gap between container start and the kubelet posting its status) |
 | `-node-metadata-refresh` | `1m` | refresh interval for the node's labels/annotations used in attribute templates (0 disables) |
+| `-self-attributes` | `true` | add THIS pod's Kubernetes resource attributes (namespace, pod, uid, pod IP, owners, labels, plus the `resourceAttributes` section's `self` pipeline) to the metrics the agent generates about itself — its self-metrics and span metrics. Resolved from the metadata service's `GET /v1/self`, which attributes the request by its connection's source address, and refreshed on `-node-metadata-refresh` (1m when that lookup is off). Fill-if-absent: `service.name` stays `kubescrape-agent` and `service.instance.id` stays the node, but `service.namespace` becomes the pod's namespace — so the agent's own job reads `<namespace>/kubescrape-agent`. A caller the service cannot attribute to a live pod (hostNetwork, an address-rewriting hop, no Kubernetes) simply gets no extra attributes; nothing waits on the lookup |
 | `-check-config` | `false` | compile every config section plus the flags, print a summary and exit — nothing acquired (CI / pre-rollout) |
 | `-test-config` | — | run the YAML test cases in this file through the compiled log pipeline (scrub → logAttributes → enrich → logMetrics → `logs.rules` → transforms) and exit non-zero on failure; like `-check-config`, nothing is acquired. See the README's "Config unit tests" for the file shape |
 | `-log-level` / `-log-format` | `info` / `text` | as for the service |
@@ -976,7 +978,7 @@ resourceAttributes:
       (index .Labels "app.kubernetes.io/name") .Name }}{{ end }}
     infra: '{{ with .Pod }}{{ if regexMatch "-system$" .Namespace }}yes{{ end }}{{ end }}'
 
-  # Per-pipeline overrides (logs | targets | cadvisor | node | journal | ingest);
+  # Per-pipeline overrides (logs | targets | cadvisor | node | journal | ingest | self);
   # maps merge with the pipeline entry winning.
   pipelines:
     node:
@@ -1001,6 +1003,13 @@ Template context and functions:
 | `regexReplace` | `{{ regexReplace ":.*$" "" .Container.Image }}` |
 
 Order of application: defaults → static → templates → enable/disable filter.
+
+On the `self` pipeline — the metrics the agent generates about ITSELF
+(self-metrics, span metrics), see `-self-attributes` — `.Pod` is the pod the
+AGENT runs in and `.Container` is nil: which of the pod's containers this
+process is cannot be known, and guessing would mislabel every self-metric.
+What that pipeline produces is applied fill-if-absent, so it extends the
+agent's own identity rather than replacing it.
 
 ## Metrics config
 

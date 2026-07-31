@@ -182,6 +182,20 @@ func (c *Client) PodByIP(ctx context.Context, ip string) (*kubemeta.Pod, error) 
 	return &pod, nil
 }
 
+// Self fetches metadata for the pod the CALLER runs in: the service attributes
+// the request by its connection's source address (GET /v1/self), so no
+// downward-API identity has to be wired into the caller's deployment. It fails
+// with a 404 error when the caller is not a live, non-hostNetwork pod — the
+// caller runs outside Kubernetes, on hostNetwork, or behind a hop that
+// rewrites the source address. Never cached: the response depends on who asked.
+func (c *Client) Self(ctx context.Context) (*kubemeta.Pod, error) {
+	var pod kubemeta.Pod
+	if err := c.getJSON(ctx, c.base+"/v1/self", &pod); err != nil {
+		return nil, err
+	}
+	return &pod, nil
+}
+
 // Node fetches the labels and annotations of a node.
 func (c *Client) Node(ctx context.Context, name string) (*kubemeta.NodeMetadata, error) {
 	u := fmt.Sprintf("%s/v1/nodes/%s/metadata", c.base, url.PathEscape(name))

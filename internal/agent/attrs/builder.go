@@ -32,8 +32,10 @@ type Context struct {
 	Service   *kubemeta.Service
 }
 
-// Pipeline names accepted under Config.Pipelines.
-var pipelineNames = []string{"logs", "targets", "cadvisor", "node", "journal", "ingest"}
+// Pipeline names accepted under Config.Pipelines. "self" is the agent's own
+// generated metrics (self-metrics and span metrics), whose Pod context is the
+// pod the agent itself runs in.
+var pipelineNames = []string{"logs", "targets", "cadvisor", "node", "journal", "ingest", "self"}
 
 // Config declares how resource attributes are built. It is the
 // `resourceAttributes` section of the agent config:
@@ -45,7 +47,7 @@ var pipelineNames = []string{"logs", "targets", "cadvisor", "node", "journal", "
 //	  team: '{{ index .Pod.Labels "team" }}'
 //	  service.name: '{{ coalesce (index .Pod.Labels "gp/service-name") (index .Pod.Labels "app.kubernetes.io/name") .Pod.Name }}'
 //	  k8s.node.zone: '{{ with .Node }}{{ index .Labels "topology.kubernetes.io/zone" }}{{ end }}'
-//	pipelines:                # per-pipeline overrides (logs|targets|cadvisor|node|journal)
+//	pipelines:                # per-pipeline overrides (logs|targets|cadvisor|node|journal|ingest|self)
 //	  node:
 //	    attributes:
 //	      service.name: aks-node
@@ -120,6 +122,7 @@ type Builders struct {
 	Node     *Builder
 	Journal  *Builder
 	Ingest   *Builder
+	Self     *Builder
 }
 
 // NewBuilders compiles one builder per pipeline from cfg (nil = defaults
@@ -133,6 +136,7 @@ func NewBuilders(cfg *Config, filter *Filter) (*Builders, error) {
 	assign := map[string]**Builder{
 		"logs": &b.Logs, "targets": &b.Targets, "cadvisor": &b.Cadvisor,
 		"node": &b.Node, "journal": &b.Journal, "ingest": &b.Ingest,
+		"self": &b.Self,
 	}
 	for _, name := range pipelineNames {
 		var sub *Config

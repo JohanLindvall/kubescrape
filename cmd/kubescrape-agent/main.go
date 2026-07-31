@@ -41,6 +41,8 @@ import (
 	"github.com/JohanLindvall/kubescrape/internal/logline"
 	"github.com/JohanLindvall/kubescrape/internal/metrics"
 	"github.com/JohanLindvall/kubescrape/internal/obs"
+	"github.com/JohanLindvall/kubescrape/internal/selfmeta"
+	"github.com/JohanLindvall/kubescrape/pkg/kubemeta"
 	"github.com/JohanLindvall/kubescrape/pkg/logattrs"
 	"github.com/JohanLindvall/kubescrape/pkg/metaclient"
 	"go.opentelemetry.io/collector/pdata/pcommon"
@@ -179,6 +181,7 @@ var (
 	kubeletInsecure = flag.Bool("kubelet-insecure-tls", true, "skip TLS verification for the kubelet (its serving certificate is typically self-signed)")
 
 	nodeRefresh = flag.Duration("node-metadata-refresh", time.Minute, "refresh interval for the node's labels/annotations used in attribute templates (0 disables the lookup)")
+	selfAttrsOn = flag.Bool("self-attributes", true, "add THIS pod's Kubernetes resource attributes (namespace, pod, uid, owners, labels, plus the resourceAttributes section's static/template attributes for the `self` pipeline) to the metrics the agent generates about itself — its self-metrics and span metrics. Resolved from the metadata service's GET /v1/self, which attributes the request by its source address, and refreshed with -node-metadata-refresh. Attributes the agent already set (service.name, service.instance.id, ...) are never overwritten; a caller the service cannot attribute to a live pod (hostNetwork, an address-rewriting hop) simply gets none")
 
 	// Pipeline toggles.
 	logsOn     = flag.Bool("logs", true, "tail container logs")
@@ -205,11 +208,14 @@ var (
 // lifecycle primitives (ctx/wg/stop), the common sinks and sources, and the
 // parsed config. All flag reads stay in the start functions themselves.
 type pipelines struct {
-	ctx          context.Context
-	wg           *sync.WaitGroup
-	stop         context.CancelFunc
-	log          *slog.Logger
-	out          otlpexport.Exporter
+	ctx  context.Context
+	wg   *sync.WaitGroup
+	stop context.CancelFunc
+	log  *slog.Logger
+	out  otlpexport.Exporter
+	// selfOut is `out` for metrics the agent generates about ITSELF: it fills
+	// in this pod's own Kubernetes resource attributes (see selfattrs.go).
+	selfOut      selfmeta.Exporter
 	meta         *metaclient.Client
 	nodeInfo     func() *attrs.NodeInfo
 	attrBuilders *attrs.Builders
@@ -387,6 +393,18 @@ func run() error {
 	}
 	nodeInfo := startNodeInfo(ctx, meta, *nodeName, *nodeRefresh, log, ready)
 
+	// The pod THIS process runs in, for the resource attributes of the metrics
+	// it generates about itself. Refreshed on the node-metadata cadence (both
+	// are "what surrounds me", and one knob is enough); a minute when that
+	// lookup is off, since this one is enabled independently. Skipped outright
+	// when nothing self-describing is exported — an agent that generates no
+	// such metrics has no reason to poll the service about itself.
+	var selfPod func() *kubemeta.Pod
+	selfDescribing := *selfMetricsIntv > 0 || (*spanMetrics && *ingestOn && *ingestTraces)
+	if *selfAttrsOn && selfDescribing {
+		selfPod = selfmeta.Start(ctx, selfResolver(meta), *nodeRefresh, log)
+	}
+
 	var metricFilters *promscrape.MetricFilters
 	var splitters []*promscrape.Splitter
 	if fileCfg.Metrics != nil {
@@ -546,13 +564,21 @@ func run() error {
 		wg.Wait()
 	}()
 
+	// The sink for the metrics the agent generates ABOUT ITSELF: `out` plus
+	// this pod's own Kubernetes attributes, filled in where the agent's own
+	// identity left a key unset. Built once here (after routing and transforms
+	// have finished composing `out`) and used by every self-describing export,
+	// including the final ones below — the last data point of a series must
+	// not carry a different resource than the rest.
+	selfOut := selfmeta.Wrap(out, selfPod, selfBuild(attrBuilders.Self, nodeInfo))
+
 	var selfRes pcommon.Resource
 	if *selfMetricsIntv > 0 {
 		selfRes = agentSelfResource(*nodeName)
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			obs.Registry.Run(ctx, out, *selfMetricsIntv, selfRes, log)
+			obs.Registry.Run(ctx, selfOut, *selfMetricsIntv, selfRes, log)
 		}()
 		log.Info("self-metrics export started", "interval", *selfMetricsIntv)
 	}
@@ -584,6 +610,7 @@ func run() error {
 		stop:         stop,
 		log:          log,
 		out:          out,
+		selfOut:      selfOut,
 		meta:         meta,
 		nodeInfo:     nodeInfo,
 		attrBuilders: attrBuilders,
@@ -636,7 +663,7 @@ func run() error {
 		// cumulative series. Those spans ship; without this their RED metrics
 		// would not.
 		fctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		if err := p.spanMetricsGen.Export(fctx, out, p.spanMetricsRes); err != nil {
+		if err := p.spanMetricsGen.Export(fctx, p.selfOut, p.spanMetricsRes); err != nil {
 			log.Warn("final span-metrics export failed", "error", err)
 		}
 		cancel()
@@ -645,7 +672,7 @@ func run() error {
 		// Registry.Run's own final export raced the final flushes inside
 		// wg.Wait; counters they bumped (last batches, shutdown drops) would
 		// otherwise die unexported. One more export now that everything is done.
-		obs.Registry.FinalExport(out, selfRes, log)
+		obs.Registry.FinalExport(selfOut, selfRes, log)
 	}
 	if finalDrain != nil {
 		// Everything above only reached the SPOOL: Buffered.Run stopped when
@@ -944,7 +971,7 @@ func (p *pipelines) startIngest() error {
 		res := agentSelfResource(*nodeName)
 		p.spanMetricsGen, p.spanMetricsRes = gen, res
 		p.spawn(func() {
-			gen.Run(p.ctx, p.out, *spanMetricsIv, res, p.log)
+			gen.Run(p.ctx, p.selfOut, *spanMetricsIv, res, p.log)
 		})
 		p.log.Info("span metrics from traces enabled", "interval", *spanMetricsIv)
 	} else if *spanMetrics {

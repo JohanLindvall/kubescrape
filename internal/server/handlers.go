@@ -9,9 +9,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"net"
 	"net/http"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/JohanLindvall/kubescrape/internal/scrape"
@@ -126,6 +128,50 @@ func (s *Server) handlePodByIP(w http.ResponseWriter, r *http.Request) {
 	s.servePod(w, r, false, // never cached: see servePod
 		func() (store.NodePod, bool) { return s.store.GetPodByIP(ip) },
 		func() string { return fmt.Sprintf("no live pod with IP %q", ip) })
+}
+
+// handleSelf serves GET /v1/self: full metadata for the pod the CALLER runs
+// in, attributed by the connection's source address. It exists so an agent can
+// stamp its own pod's Kubernetes attributes onto the telemetry it generates
+// about ITSELF (self-metrics, span metrics) without a downward-API env var
+// wired into every deployment that runs the binary.
+//
+// The address comes from the connection (r.RemoteAddr) and NEVER from a
+// header: X-Forwarded-For is caller-controlled, and this endpoint hands out
+// whatever pod owns the address it is given. It resolves through the same
+// live-only pod-IP index as /v1/pod-ips, so a caller behind an address-
+// rewriting hop — or one on hostNetwork, sharing the node IP — gets a 404
+// rather than someone else's identity.
+func (s *Server) handleSelf(w http.ResponseWriter, r *http.Request) {
+	ip := peerIP(r.RemoteAddr)
+	if ip == "" {
+		writeError(w, http.StatusBadRequest, fmt.Sprintf("unparseable peer address %q", r.RemoteAddr))
+		return
+	}
+	// no-store: the response depends on WHO asked, so a shared cache (or a
+	// heuristically caching proxy, which a 200 with no cache headers invites)
+	// must never hand one caller's identity to the next.
+	w.Header().Set("Cache-Control", "no-store")
+	s.servePod(w, r, false, // uncached: see /v1/pod-ips on recycled IPs
+		func() (store.NodePod, bool) { return s.store.GetPodByIP(ip) },
+		func() string { return fmt.Sprintf("no live pod with peer IP %q", ip) })
+}
+
+// peerIP extracts the bare IP from an http.Request RemoteAddr
+// ("10.0.0.1:34512", "[fe80::1%eth0]:34512"), returning "" when it does not
+// hold one. The zone is stripped because the store keys bare IPs.
+func peerIP(remoteAddr string) string {
+	host, _, err := net.SplitHostPort(remoteAddr)
+	if err != nil {
+		host = remoteAddr // no port (net/http always sets one, but be exact)
+	}
+	if i := strings.IndexByte(host, '%'); i >= 0 {
+		host = host[:i]
+	}
+	if net.ParseIP(host) == nil {
+		return ""
+	}
+	return host
 }
 
 // handleNodeMetadata serves GET /v1/nodes/{node}/metadata: the node's

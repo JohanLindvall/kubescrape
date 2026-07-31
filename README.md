@@ -203,6 +203,22 @@ pod must never resolve — and hostNetwork pods (which share the node IP) are
 not indexed. When the claiming pod is deleted while another live pod reports
 the same IP, the survivor is promoted immediately.
 
+### `GET /v1/self`
+
+Full metadata for the pod the **caller** runs in, attributed by the
+connection's source address — the agent uses it to stamp its own pod's
+Kubernetes attributes on the metrics it generates about itself (see
+`-self-attributes`), without a downward-API env var wired into every
+deployment that runs the binary.
+
+The address is taken from the connection and **never** from a header
+(`X-Forwarded-For` is caller-controlled, and this endpoint hands out whatever
+pod owns the address it is given). Resolution goes through the same live-only
+pod-IP index as `/v1/pod-ips`, so a caller on hostNetwork — sharing the node
+IP — or behind an address-rewriting hop gets a `404` rather than someone
+else's identity. Responses are `Cache-Control: no-store`: the answer depends
+on who asked.
+
 ### `GET /v1/nodes/{node}/metadata`
 
 The node's labels and annotations (the agent's `startNodeInfo` provider
@@ -245,7 +261,13 @@ cache sync has completed. The service's own metrics (`kubescrape_store_pods`,
 `kubescrape_store_containers`, `kubescrape_http_requests_total{pattern,code}`,
 …) are produced through the same internal
 metrics machinery as everything else and **pushed over OTLP**
-(`-self-metrics-interval`, default 1m; 0 disables) — together with the Go
+(`-self-metrics-interval`, default 1m; 0 disables) under a resource carrying
+this pod's own Kubernetes attributes (`-self-attributes`, default on:
+namespace, pod, uid, owner chain, labels — read straight out of its own store,
+since the pod name is the hostname and the namespace comes from the
+ServiceAccount projection it already mounts, so no API call and no downward-API
+env var is involved; `service.name`/`service.instance.id` are never
+overwritten, `service.namespace` is newly derived) — together with the Go
 cluster telemetry. The process's own Go runtime and process metrics
 (`go_*`, `process_*`) are served as Prometheus text on the dedicated
 `-metrics-listen` port instead — and with `-self-metrics-interval=0` that
@@ -861,6 +883,22 @@ watch restarts — are produced through the same
 internal metrics machinery as everything else and **pushed over OTLP** on
 `-self-metrics-interval` (default 1m, 0 disables) with the agent's own
 resource identity (`service.name: kubescrape-agent`, `k8s.node.name`).
+
+That identity is completed with the agent's **own pod's** Kubernetes
+attributes (`-self-attributes`, default on): namespace, pod name and UID, pod
+IP, the owner chain, pod and namespace labels, plus whatever the
+`resourceAttributes` section's `self` pipeline adds (a `static` cluster name,
+for instance) — resolved from the metadata service's `GET /v1/self` and
+refreshed on `-node-metadata-refresh`. The same applies to the span metrics
+derived from ingested traces, which carry the same identity. Attributes the
+agent already set win, so `service.name` stays `kubescrape-agent` and
+`service.instance.id` stays the node (stable across restarts, unlike a pod
+UID); `service.namespace` is newly derived from the pod's namespace, which
+makes the agent's own job in a Prometheus backend
+`<namespace>/kubescrape-agent`. Until the first lookup succeeds — or forever,
+for a caller the service cannot attribute — the metrics ship with the bare
+identity: they are how a metadata-service outage is diagnosed, so nothing
+waits on it.
 `-listen` (default `:8081`) serves `GET /healthz`, `GET /readyz`,
 `GET /debug/tailer` (per-file positions and lag), `GET /debug/targets` (the
 last scrape cycle's per-target outcomes — up/error/duration/samples,
@@ -946,7 +984,7 @@ wins over the built-in default, which wins over a top-level `instancePrefix`.
       container.image: '{{ with .Container }}{{ .Image }}{{ end }}'
       k8s.node.zone: '{{ with .Node }}{{ index .Labels "topology.kubernetes.io/zone" }}{{ end }}'
       service.name: '{{ with .Pod }}{{ coalesce (index .Labels "gp/service-name") (index .Labels "app.kubernetes.io/name") .Name }}{{ end }}'
-    pipelines:                # overrides for logs|targets|cadvisor|node|journal|ingest
+    pipelines:                # overrides for logs|targets|cadvisor|node|journal|ingest|self
       node:
         attributes:
           service.name: kubelet

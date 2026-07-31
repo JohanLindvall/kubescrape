@@ -547,10 +547,12 @@ func run() error {
 	}()
 	var selfRes pcommon.Resource
 	// selfOut is the exporter plus this pod's own Kubernetes attributes,
-	// filled in where the identity above left a key unset. Used by BOTH the
-	// periodic run and the final export below — the last data point of a
-	// series must not carry a different resource than the rest.
-	var selfOut selfmeta.Exporter = exporter
+	// filled in where the identity below left a key unset. Used by BOTH the
+	// periodic run and the final export — the last data point of a series must
+	// not carry a different resource than the rest. It stays nil while
+	// self-metrics are off, so a future use outside that guard fails loudly
+	// rather than exporting through a nil client.
+	var selfOut selfmeta.Exporter
 	if *selfMetricsIntv > 0 {
 		selfRes = pcommon.NewResource()
 		a := selfRes.Attributes()
@@ -559,13 +561,15 @@ func run() error {
 		if host, err := os.Hostname(); err == nil {
 			a.PutStr("service.instance.id", host)
 		}
+		selfOut = exporter
 		if *selfAttrs {
 			// This process's own pod, out of its own store — no HTTP hop, no
-			// downward API. Re-read once a minute (the agent's default
-			// cadence) so a relabelled pod is picked up; the first lookups
-			// retry faster, since the informers fill in after this point.
-			selfOut = selfmeta.Wrap(selfOut,
-				selfmeta.Start(ctx, selfResolver(st, resolver), time.Minute, log), selfBuild)
+			// downward API. The first lookups retry from 5s, since the
+			// informers only fill in after this point; the slow refresh past
+			// that picks up relabelling.
+			selfPod := selfmeta.StartPod(ctx, selfResolver(st, resolver), selfmeta.DefaultRefresh, log)
+			obs.RegisterSelfMetadata(func() bool { return selfPod() != nil })
+			selfOut = selfmeta.Wrap(selfOut, selfPod, selfBuild)
 		}
 		wg.Add(1)
 		go func() {

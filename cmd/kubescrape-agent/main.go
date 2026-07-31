@@ -19,7 +19,6 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -180,8 +179,9 @@ var (
 	kubeletToken    = flag.String("kubelet-token-file", "/var/run/secrets/kubernetes.io/serviceaccount/token", "bearer token file for the kubelet (re-read per scrape)")
 	kubeletInsecure = flag.Bool("kubelet-insecure-tls", true, "skip TLS verification for the kubelet (its serving certificate is typically self-signed)")
 
-	nodeRefresh = flag.Duration("node-metadata-refresh", time.Minute, "refresh interval for the node's labels/annotations used in attribute templates (0 disables the lookup)")
-	selfAttrsOn = flag.Bool("self-attributes", true, "add THIS pod's Kubernetes resource attributes (namespace, pod, uid, owners, labels, plus the resourceAttributes section's static/template attributes for the `self` pipeline) to the metrics the agent generates about itself — its self-metrics and span metrics. Resolved from the metadata service's GET /v1/self, which attributes the request by its source address, and refreshed with -node-metadata-refresh. Attributes the agent already set (service.name, service.instance.id, ...) are never overwritten; a caller the service cannot attribute to a live pod (hostNetwork, an address-rewriting hop) simply gets none")
+	nodeRefresh      = flag.Duration("node-metadata-refresh", time.Minute, "refresh interval for the node's labels/annotations used in attribute templates (0 disables the lookup)")
+	selfAttrsOn      = flag.Bool("self-attributes", true, "add THIS pod's Kubernetes resource attributes (namespace, pod, uid, owners, labels, plus the resourceAttributes section's static/template attributes for the `self` pipeline) to the metrics the agent generates about itself — its self-metrics and span metrics. Resolved from the metadata service's GET /v1/self, which attributes the request by its source address. Attributes the agent already set (service.name, service.instance.id, ...) are never overwritten; a caller the service cannot attribute to a live pod (hostNetwork, an address-rewriting hop) simply gets none. kubescrape_self_metadata_resolved reports whether it resolved")
+	selfAttrsRefresh = flag.Duration("self-attributes-refresh", selfmeta.DefaultRefresh, "how often to re-read this pod's own metadata, so an edited pod or namespace label reaches the metrics it stamps (0 disables the lookup entirely, as -node-metadata-refresh=0 does for the node's). Cheap by construction: GET /v1/self carries `private, max-age` + ETag, so the client serves a fresh entry locally and revalidates a stale one as a conditional GET — a 304 whenever nothing changed. Retries before the first success start at 5s and back off to this")
 
 	// Pipeline toggles.
 	logsOn     = flag.Bool("logs", true, "tail container logs")
@@ -402,7 +402,8 @@ func run() error {
 	var selfPod func() *kubemeta.Pod
 	selfDescribing := *selfMetricsIntv > 0 || (*spanMetrics && *ingestOn && *ingestTraces)
 	if *selfAttrsOn && selfDescribing {
-		selfPod = selfmeta.Start(ctx, selfResolver(meta), *nodeRefresh, log)
+		selfPod = selfmeta.StartPod(ctx, meta.Self, *selfAttrsRefresh, log)
+		obs.RegisterSelfMetadata(func() bool { return selfPod() != nil })
 	}
 
 	var metricFilters *promscrape.MetricFilters
@@ -1126,39 +1127,34 @@ func (p *pipelines) startDebugServer(tl *tailer.Tailer, sc *promscrape.Scraper) 
 }
 
 // startNodeInfo provides the node's labels/annotations for attribute
-// templates, refreshed in the background from the metadata service.
+// templates, refreshed in the background from the metadata service. The name
+// is known without the lookup, so the provider never yields nil; a refresh of
+// 0 disables the lookup and leaves it at the bare name.
+//
+// It shares selfmeta.Poll with the self-pod lookup (same shape: resolve in the
+// background, retry until the first success, then refresh, keep the last good
+// value on a failure). The retries are why the readiness gate below clears
+// seconds after the metadata service becomes reachable rather than up to a
+// -node-metadata-refresh later — a rolling update advances on that gate.
 func startNodeInfo(ctx context.Context, meta *metaclient.Client, nodeName string, refresh time.Duration, log *slog.Logger, ready *readiness) func() *attrs.NodeInfo {
-	var current atomic.Pointer[attrs.NodeInfo]
-	current.Store(&attrs.NodeInfo{Name: nodeName})
-	if refresh > 0 {
-		fetch := func() {
-			fctx, cancel := context.WithTimeout(ctx, 10*time.Second)
-			defer cancel()
-			md, err := meta.Node(fctx, nodeName)
-			if err != nil {
-				log.Debug("fetching node metadata", "node", nodeName, "error", err)
-				return
-			}
-			current.Store(&attrs.NodeInfo{Name: nodeName, Labels: md.Labels, Annotations: md.Annotations})
-			// The agent can reach the metadata service, so it can attribute
-			// what it collects: the readiness gate a rolling update waits on.
-			ready.done(gateMetadata)
+	resolve := func(ctx context.Context) (*attrs.NodeInfo, error) {
+		md, err := meta.Node(ctx, nodeName)
+		if err != nil {
+			return nil, err
 		}
-		go func() {
-			fetch()
-			ticker := time.NewTicker(refresh)
-			defer ticker.Stop()
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				case <-ticker.C:
-					fetch()
-				}
-			}
-		}()
+		return &attrs.NodeInfo{Name: nodeName, Labels: md.Labels, Annotations: md.Annotations}, nil
 	}
-	return current.Load
+	return selfmeta.Poll(ctx, resolve, selfmeta.PollConfig[attrs.NodeInfo]{
+		Refresh: refresh,
+		Initial: &attrs.NodeInfo{Name: nodeName},
+		// The agent can reach the metadata service, so it can attribute what
+		// it collects: the readiness gate a rolling update waits on.
+		OnFirst: func(*attrs.NodeInfo) { ready.done(gateMetadata) },
+		// No Final: unlike a pod's own identity, node labels are edited on a
+		// live node (cordons, pool migrations, topology relabelling) and
+		// attribute templates read them.
+		Log: log,
+	})
 }
 
 // buildAttrs assembles the per-pipeline resource-attribute builders from the

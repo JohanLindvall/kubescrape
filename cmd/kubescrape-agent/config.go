@@ -200,6 +200,7 @@ func printConfigSummary(cfg agentConfig, log *slog.Logger) {
 		"positions-file", *positionsFile,
 		"transforms-file", *transformsFile,
 		"enrich", *enrichOn,
+		"self-attributes", *selfAttrsOn,
 	)
 	if cfg.LogMetrics != nil {
 		log.Info("logMetrics", "rules", len(cfg.LogMetrics.Metrics))

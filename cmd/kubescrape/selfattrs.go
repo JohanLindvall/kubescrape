@@ -19,7 +19,6 @@ import (
 	"go.opentelemetry.io/collector/pdata/pcommon"
 
 	"github.com/JohanLindvall/kubescrape/internal/agent/attrs"
-	"github.com/JohanLindvall/kubescrape/internal/leader"
 	"github.com/JohanLindvall/kubescrape/internal/selfmeta"
 	"github.com/JohanLindvall/kubescrape/internal/server"
 	"github.com/JohanLindvall/kubescrape/internal/store"
@@ -31,9 +30,9 @@ import (
 // It fails until the pod informer has delivered this pod (the lookup retries),
 // and keeps failing — harmlessly, leaving the bare identity in place — when
 // the process is not a pod whose name is its hostname.
-func selfResolver(st *store.Store, resolver server.MetadataResolver) selfmeta.Resolve {
+func selfResolver(st *store.Store, resolver server.MetadataResolver) func(context.Context) (*kubemeta.Pod, error) {
 	return func(context.Context) (*kubemeta.Pod, error) {
-		ns := leader.Namespace()
+		ns := selfmeta.Namespace()
 		if ns == "" {
 			return nil, fmt.Errorf("no namespace ($POD_NAMESPACE or the ServiceAccount projection)")
 		}

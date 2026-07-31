@@ -5,6 +5,7 @@ package server
 
 import (
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
@@ -56,13 +57,15 @@ func TestSelfEndpointResolvesTheCaller(t *testing.T) {
 	}
 }
 
-// The response depends on WHO asked, so it must never be cached — neither by
-// the metaclient (which caches on Cache-Control/ETag) nor by a proxy that
-// caches a header-less 200 heuristically.
-func TestSelfEndpointIsNeverCached(t *testing.T) {
+// The response identifies the CALLER, so it is cached PRIVATE: a per-client
+// cache (metaclient, one per process, always asking about the same pod) may
+// hold it, a shared cache must not — that marker is the only thing standing
+// between "cheap re-reads" and one caller being handed another's identity.
+// The ETag is what makes a re-read a 304.
+func TestSelfEndpointIsPrivatelyCached(t *testing.T) {
 	st := store.New(time.Minute)
 	addAgentPod(st, "127.0.0.1", false)
-	srv := cachingServer(t, st, 10*time.Second) // metadata cache ON
+	srv := cachingServer(t, st, 10*time.Second)
 
 	resp, err := http.Get(srv.URL + "/v1/self")
 	if err != nil {
@@ -72,11 +75,32 @@ func TestSelfEndpointIsNeverCached(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status %d", resp.StatusCode)
 	}
-	if cc := resp.Header.Get("Cache-Control"); cc != "no-store" {
-		t.Fatalf("Cache-Control = %q; want no-store", cc)
+	cc := resp.Header.Get("Cache-Control")
+	if !strings.HasPrefix(cc, "private,") || !strings.Contains(cc, "max-age=10") {
+		t.Fatalf("Cache-Control = %q; want private + max-age", cc)
 	}
-	if etag := resp.Header.Get("ETag"); etag != "" {
-		t.Fatalf("ETag = %q; want none on a caller-dependent response", etag)
+	etag := resp.Header.Get("ETag")
+	if etag == "" {
+		t.Fatal("no ETag; a re-read could not be answered 304")
+	}
+	// The conditional re-read a poll makes: 304, no body.
+	condGet(t, srv.URL+"/v1/self", etag, http.StatusNotModified)
+}
+
+// The metadata TTL governs it like every other metadata response: with caching
+// off, no cache headers are sent at all.
+func TestSelfEndpointUncachedWithZeroTTL(t *testing.T) {
+	st := store.New(time.Minute)
+	addAgentPod(st, "127.0.0.1", false)
+	srv := testServer(t, st, closedChan()) // CacheTTL unset
+
+	resp, err := http.Get(srv.URL + "/v1/self")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if cc := resp.Header.Get("Cache-Control"); cc != "" {
+		t.Fatalf("Cache-Control = %q; want none with the metadata cache off", cc)
 	}
 }
 
@@ -121,8 +145,10 @@ func TestPeerIP(t *testing.T) {
 	for _, tc := range []struct{ addr, want string }{
 		{"10.0.0.1:34512", "10.0.0.1"},
 		{"[fd00::1]:34512", "fd00::1"},
-		{"[fe80::1%eth0]:34512", "fe80::1"}, // zone stripped: the store keys bare IPs
-		{"10.0.0.1", "10.0.0.1"},            // no port
+		{"[fe80::1%eth0]:34512", "fe80::1"},       // zone stripped: the store keys bare IPs
+		{"[::ffff:10.1.2.3]:34512", "10.1.2.3"},   // 4-in-6 unmapped to the form status.podIP reports
+		{"[2001:0db8::0:1]:34512", "2001:db8::1"}, // canonicalised, as the API server reports it
+		{"10.0.0.1", "10.0.0.1"},                  // no port
 		{"", ""},
 		{"not-an-ip:80", ""},
 		{"kubescrape.monitoring:80", ""},

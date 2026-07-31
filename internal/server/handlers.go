@@ -11,6 +11,7 @@ import (
 	"math"
 	"net"
 	"net/http"
+	"net/netip"
 	"sort"
 	"strconv"
 	"strings"
@@ -73,39 +74,56 @@ func (s *Server) handleContainer(w http.ResponseWriter, r *http.Request) {
 		ContainerID: res.Container.ID,
 		Container:   res.Container,
 		Pod:         res.Pod,
-	})
+	}, false)
 }
 
-// handlePod serves GET /v1/pods/{namespace}/{name}: full metadata for one
-// pod looked up by name (used by the agent to attribute cadvisor series).
-// Deleted pods stay resolvable until their tombstone expires.
-// servePod is the shared body of the three pod endpoints: readiness gate,
-// lookup, 404, owner/namespace enrichment, then a cached write. notFound is
-// evaluated lazily so the success path never formats it.
-func (s *Server) servePod(w http.ResponseWriter, r *http.Request, cached bool, lookup func() (store.NodePod, bool), notFound func() string) {
+// cachePolicy selects the cache headers a pod response carries.
+type cachePolicy int
+
+const (
+	// cacheNone sends none: the pod-IP index exists for IMMEDIACY (IPs
+	// recycle; deleted pods drop out at once) and a cached 200 would let
+	// metaclient re-serve the OLD owner of a recycled IP for up to the TTL.
+	cacheNone cachePolicy = iota
+	// cacheShared is the standard metadata caching: max-age + ETag, so repeat
+	// lookups are served locally and revalidate as 304s.
+	cacheShared
+	// cachePrivate is cacheShared plus `private`, for a response that
+	// identifies the CALLER (/v1/self). A per-client cache — metaclient, one
+	// per process, always asking about the same pod — may hold it; a SHARED
+	// cache must not, or one caller's identity would be handed to the next.
+	cachePrivate
+)
+
+// servePod is the shared body of the pod endpoints: readiness gate, lookup,
+// 404, owner/namespace enrichment, then the write its policy calls for.
+// notFound is evaluated lazily so the success path never formats it.
+func (s *Server) servePod(w http.ResponseWriter, r *http.Request, policy cachePolicy, lookup func() (store.NodePod, bool), notFound func() string) {
 	if !s.isReady() {
 		writeError(w, http.StatusServiceUnavailable, "informer caches not synced")
 		return
 	}
 	np, ok := lookup()
 	if !ok {
+		// Errors are never cached: a 404 means "not attributable yet", and
+		// holding onto it would delay the recovery it is waiting for.
 		writeError(w, http.StatusNotFound, notFound())
 		return
 	}
 	s.enrich(&np.Pod, np.OwnerRefs)
-	if !cached {
-		// The pod-IP index exists for IMMEDIACY (IPs recycle; deleted pods drop
-		// out at once) — a cached 200 would let metaclient re-serve the OLD
-		// owner of a recycled IP for up to the metadata TTL.
+	if policy == cacheNone {
 		writeJSON(w, http.StatusOK, np.Pod)
 		return
 	}
-	s.writeCached(w, r, np.Pod)
+	s.writeCached(w, r, np.Pod, policy == cachePrivate)
 }
 
+// handlePod serves GET /v1/pods/{namespace}/{name}: full metadata for one
+// pod looked up by name (used by the agent to attribute cadvisor series).
+// Deleted pods stay resolvable until their tombstone expires.
 func (s *Server) handlePod(w http.ResponseWriter, r *http.Request) {
 	namespace, name := r.PathValue("namespace"), r.PathValue("name")
-	s.servePod(w, r, true,
+	s.servePod(w, r, cacheShared,
 		func() (store.NodePod, bool) { return s.store.GetPodByName(namespace, name) },
 		func() string { return fmt.Sprintf("pod %s/%s not found", namespace, name) })
 }
@@ -115,7 +133,7 @@ func (s *Server) handlePod(w http.ResponseWriter, r *http.Request) {
 // telemetry). Deleted pods stay resolvable until their tombstone expires.
 func (s *Server) handlePodByUID(w http.ResponseWriter, r *http.Request) {
 	uid := r.PathValue("uid")
-	s.servePod(w, r, true,
+	s.servePod(w, r, cacheShared,
 		func() (store.NodePod, bool) { return s.store.GetPodByUID(uid) },
 		func() string { return fmt.Sprintf("pod uid %q not found", uid) })
 }
@@ -125,7 +143,7 @@ func (s *Server) handlePodByUID(w http.ResponseWriter, r *http.Request) {
 // hostNetwork pods never resolve.
 func (s *Server) handlePodByIP(w http.ResponseWriter, r *http.Request) {
 	ip := r.PathValue("ip")
-	s.servePod(w, r, false, // never cached: see servePod
+	s.servePod(w, r, cacheNone, // see cacheNone: recycled IPs need immediacy
 		func() (store.NodePod, bool) { return s.store.GetPodByIP(ip) },
 		func() string { return fmt.Sprintf("no live pod with IP %q", ip) })
 }
@@ -142,24 +160,31 @@ func (s *Server) handlePodByIP(w http.ResponseWriter, r *http.Request) {
 // live-only pod-IP index as /v1/pod-ips, so a caller behind an address-
 // rewriting hop — or one on hostNetwork, sharing the node IP — gets a 404
 // rather than someone else's identity.
+//
+// The response is cached like any other metadata 200, but PRIVATE: it names
+// the caller, so only a per-client cache may hold it. That is what lets a
+// caller re-read its own pod cheaply — the poll becomes a conditional GET, and
+// a 304 says "your labels and namespace metadata are unchanged" — instead of
+// choosing between stale attributes and a full document every interval.
 func (s *Server) handleSelf(w http.ResponseWriter, r *http.Request) {
 	ip := peerIP(r.RemoteAddr)
 	if ip == "" {
 		writeError(w, http.StatusBadRequest, fmt.Sprintf("unparseable peer address %q", r.RemoteAddr))
 		return
 	}
-	// no-store: the response depends on WHO asked, so a shared cache (or a
-	// heuristically caching proxy, which a 200 with no cache headers invites)
-	// must never hand one caller's identity to the next.
-	w.Header().Set("Cache-Control", "no-store")
-	s.servePod(w, r, false, // uncached: see /v1/pod-ips on recycled IPs
+	s.servePod(w, r, cachePrivate,
 		func() (store.NodePod, bool) { return s.store.GetPodByIP(ip) },
 		func() string { return fmt.Sprintf("no live pod with peer IP %q", ip) })
 }
 
 // peerIP extracts the bare IP from an http.Request RemoteAddr
 // ("10.0.0.1:34512", "[fe80::1%eth0]:34512"), returning "" when it does not
-// hold one. The zone is stripped because the store keys bare IPs.
+// hold one.
+//
+// The result is CANONICAL: the zone is dropped and an IPv4-mapped IPv6 address
+// is unmapped, because the store keys the bare form Kubernetes reports in
+// status.podIP. net/http renders a 4-in-6 peer as dotted-quad on its own, but
+// an address that reached us any other way must not silently fail to match.
 func peerIP(remoteAddr string) string {
 	host, _, err := net.SplitHostPort(remoteAddr)
 	if err != nil {
@@ -168,10 +193,11 @@ func peerIP(remoteAddr string) string {
 	if i := strings.IndexByte(host, '%'); i >= 0 {
 		host = host[:i]
 	}
-	if net.ParseIP(host) == nil {
+	addr, err := netip.ParseAddr(host)
+	if err != nil {
 		return ""
 	}
-	return host
+	return addr.Unmap().String()
 }
 
 // handleNodeMetadata serves GET /v1/nodes/{node}/metadata: the node's
@@ -187,7 +213,7 @@ func (s *Server) handleNodeMetadata(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, fmt.Sprintf("node %q not found", node))
 		return
 	}
-	s.writeCached(w, r, kubemeta.NodeMetadata{Name: node, ObjectMeta: *meta})
+	s.writeCached(w, r, kubemeta.NodeMetadata{Name: node, ObjectMeta: *meta}, false)
 }
 
 // handleNodeTargets serves GET /v1/nodes/{node}/targets.
@@ -300,7 +326,7 @@ func (s *Server) handleNodeTargets(w http.ResponseWriter, r *http.Request) {
 	s.writeCached(w, r, map[string]any{
 		"node":    node,
 		"targets": targets,
-	})
+	}, false)
 }
 
 // configuredTarget reports whether t carries endpoint configuration that only
@@ -410,7 +436,10 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 // (Cache-Control max-age + ETag), so the agent's client can serve repeat
 // lookups locally and revalidate cheaply with If-None-Match (304). With a zero
 // TTL it falls back to a plain uncached JSON write.
-func (s *Server) writeCached(w http.ResponseWriter, r *http.Request, v any) {
+//
+// private marks a response that identifies the CALLER (/v1/self): per-client
+// caches may store it, shared ones must not.
+func (s *Server) writeCached(w http.ResponseWriter, r *http.Request, v any, private bool) {
 	if s.cacheTTL <= 0 {
 		writeJSON(w, http.StatusOK, v)
 		return
@@ -430,9 +459,13 @@ func (s *Server) writeCached(w http.ResponseWriter, r *http.Request, v any) {
 	if maxAge < 1 {
 		maxAge = 1
 	}
+	cc := "max-age=" + strconv.Itoa(maxAge)
+	if private {
+		cc = "private, " + cc
+	}
 	h := w.Header()
 	h.Set("Content-Type", "application/json")
-	h.Set("Cache-Control", "max-age="+strconv.Itoa(maxAge))
+	h.Set("Cache-Control", cc)
 	h.Set("ETag", etag)
 	if match := r.Header.Get("If-None-Match"); match != "" && etagMatches(match, etag) {
 		w.WriteHeader(http.StatusNotModified)

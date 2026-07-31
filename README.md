@@ -216,8 +216,9 @@ The address is taken from the connection and **never** from a header
 pod owns the address it is given). Resolution goes through the same live-only
 pod-IP index as `/v1/pod-ips`, so a caller on hostNetwork — sharing the node
 IP — or behind an address-rewriting hop gets a `404` rather than someone
-else's identity. Responses are `Cache-Control: no-store`: the answer depends
-on who asked.
+else's identity. Responses carry `Cache-Control: private, max-age=<TTL>` +
+`ETag`: the answer names its caller, so a per-client cache may keep it (and
+revalidate with `If-None-Match`) while a shared one must not store it at all.
 
 ### `GET /v1/nodes/{node}/metadata`
 
@@ -263,7 +264,7 @@ cache sync has completed. The service's own metrics (`kubescrape_store_pods`,
 metrics machinery as everything else and **pushed over OTLP**
 (`-self-metrics-interval`, default 1m; 0 disables) under a resource carrying
 this pod's own Kubernetes attributes (`-self-attributes`, default on:
-namespace, pod, uid, owner chain, labels — read straight out of its own store,
+namespace, pod, uid, owner chain, labels — re-read from its own store,
 since the pod name is the hostname and the namespace comes from the
 ServiceAccount projection it already mounts, so no API call and no downward-API
 env var is involved; `service.name`/`service.instance.id` are never
@@ -888,17 +889,27 @@ That identity is completed with the agent's **own pod's** Kubernetes
 attributes (`-self-attributes`, default on): namespace, pod name and UID, pod
 IP, the owner chain, pod and namespace labels, plus whatever the
 `resourceAttributes` section's `self` pipeline adds (a `static` cluster name,
-for instance) — resolved from the metadata service's `GET /v1/self` and
-refreshed on `-node-metadata-refresh`. The same applies to the span metrics
-derived from ingested traces, which carry the same identity. Attributes the
-agent already set win, so `service.name` stays `kubescrape-agent` and
-`service.instance.id` stays the node (stable across restarts, unlike a pod
-UID); `service.namespace` is newly derived from the pod's namespace, which
-makes the agent's own job in a Prometheus backend
-`<namespace>/kubescrape-agent`. Until the first lookup succeeds — or forever,
-for a caller the service cannot attribute — the metrics ship with the bare
-identity: they are how a metadata-service outage is diagnosed, so nothing
-waits on it.
+for instance) — resolved from the metadata service's `GET /v1/self`. The same
+applies to the span metrics derived from ingested traces, which carry the same
+identity. Attributes the agent already set win, so `service.name` stays
+`kubescrape-agent` and `service.instance.id` stays the node (stable across
+restarts, unlike a pod UID); `service.namespace` is newly derived from the
+pod's namespace, which makes the agent's own job in a Prometheus backend
+`<namespace>/kubescrape-agent`. The `self` pipeline can therefore only ADD
+attributes — a template setting `service.name` there is deliberately
+ineffective.
+
+The pod is re-read on `-self-attributes-refresh` (default 1m), so a pod or
+namespace **relabelled after startup** reaches the metrics that stamp it. That
+poll is nearly free: `/v1/self` answers with `private, max-age` + `ETag`, so
+the client serves a fresh entry locally and revalidates a stale one with
+`If-None-Match` — a 304 whenever nothing changed. `private` is what makes
+caching a caller-dependent response safe: one client belongs to one process,
+which is the one pod the answer describes, and a shared cache is told not to
+store it at all. Until the lookup first succeeds — or forever, for a caller the
+service cannot attribute — the metrics ship with the bare identity: they are
+how a metadata-service outage is diagnosed, so nothing waits on it.
+`kubescrape_self_metadata_resolved` reports which of those you are in.
 `-listen` (default `:8081`) serves `GET /healthz`, `GET /readyz`,
 `GET /debug/tailer` (per-file positions and lag), `GET /debug/targets` (the
 last scrape cycle's per-target outcomes — up/error/duration/samples,

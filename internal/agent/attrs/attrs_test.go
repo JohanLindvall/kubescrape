@@ -115,3 +115,25 @@ func TestServiceAttrs(t *testing.T) {
 		t.Error("nil service must not set attributes")
 	}
 }
+
+// FillAbsent is the shared "someone else knows more about this resource" merge
+// (ingest enrichment, self-metadata stamping): it adds, never overwrites, and
+// carries non-string values across intact.
+func TestFillAbsent(t *testing.T) {
+	src, dst := pcommon.NewMap(), pcommon.NewMap()
+	src.PutStr("a", "from-src")
+	src.PutStr("b", "added")
+	src.PutInt("n", 7)
+	dst.PutStr("a", "kept")
+
+	FillAbsent(src, dst)
+	if v, _ := dst.Get("a"); v.AsString() != "kept" {
+		t.Errorf("a = %q; an existing key must not be overwritten", v.AsString())
+	}
+	if v, _ := dst.Get("b"); v.AsString() != "added" {
+		t.Errorf("b = %q; want added", v.AsString())
+	}
+	if v, ok := dst.Get("n"); !ok || v.Int() != 7 {
+		t.Errorf("n = %v; non-string values must survive the copy", v)
+	}
+}

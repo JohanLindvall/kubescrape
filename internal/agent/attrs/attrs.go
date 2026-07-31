@@ -150,6 +150,20 @@ func Identity(res pcommon.Resource) {
 	}
 }
 
+// FillAbsent adds src's attributes to dst, never overwriting a key dst already
+// has. It is how every "someone else knows more about this resource" merge in
+// the agent is applied — the ingest enricher over a sender's resource, the
+// self-metadata stamping over a process's own identity — because in both the
+// existing value is the authoritative one.
+func FillAbsent(src, dst pcommon.Map) {
+	src.Range(func(k string, v pcommon.Value) bool {
+		if _, exists := dst.Get(k); !exists {
+			v.CopyTo(dst.PutEmpty(k))
+		}
+		return true
+	})
+}
+
 // PrefixInstance prepends prefix (+ "-") to service.instance.id so resources
 // produced by an exporter that DESCRIBES other objects — cadvisor, or a
 // kube-state-metrics splitter — get an instance distinct from those objects'

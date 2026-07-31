@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"os"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -14,6 +15,8 @@ import (
 
 	"github.com/JohanLindvall/kubescrape/pkg/kubemeta"
 )
+
+func discardLog() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)) }
 
 type captureExporter struct {
 	md    pmetric.Metrics
@@ -69,7 +72,8 @@ func attrOf(t *testing.T, md pmetric.Metrics, key string) string {
 
 // The pod's attributes are added; the identity the process set for itself is
 // left alone — service.instance.id in particular, which must stay stable
-// across restarts rather than follow a recreated pod's UID.
+// across restarts rather than follow a recreated pod's UID. A `self` attribute
+// pipeline can therefore only ADD, never override.
 func TestWrapFillsOnlyAbsentKeys(t *testing.T) {
 	next := &captureExporter{}
 	pod := testPod()
@@ -142,9 +146,11 @@ func TestWrapFollowsTheProvider(t *testing.T) {
 	}
 }
 
-// Start yields nil until the first success, then the pod — and it retries: the
-// metadata a process needs and the process itself come up together.
-func TestStartRetriesUntilResolved(t *testing.T) {
+// StartPod yields nil until the first success, then the pod — and it retries:
+// the metadata a process needs and the process itself come up together. The
+// retry interval backs off, so a lookup that can never succeed settles at the
+// refresh cadence instead of polling forever.
+func TestPollRetriesUntilResolved(t *testing.T) {
 	var calls atomic.Int32
 	resolve := func(context.Context) (*kubemeta.Pod, error) {
 		if calls.Add(1) < 3 {
@@ -154,15 +160,18 @@ func TestStartRetriesUntilResolved(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	defer func(d time.Duration) { retryEvery = d }(retryEvery)
-	retryEvery = time.Millisecond
-	pod := Start(ctx, resolve, time.Minute, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	// Retries would otherwise start at 5s; keep the test on outcomes, not
+	// clocks (the tailer's retryBackoff pattern).
+	defer func(d time.Duration) { firstRetry = d }(firstRetry)
+	firstRetry = time.Millisecond
+
+	pod := StartPod(ctx, resolve, time.Minute, discardLog())
 	if p := pod(); p != nil {
 		t.Fatalf("provider returned %+v before any lookup succeeded", p)
 	}
 	deadline := time.Now().Add(30 * time.Second)
 	for pod() == nil && time.Now().Before(deadline) {
-		time.Sleep(20 * time.Millisecond)
+		time.Sleep(time.Millisecond)
 	}
 	p := pod()
 	if p == nil {
@@ -175,32 +184,128 @@ func TestStartRetriesUntilResolved(t *testing.T) {
 
 // A resolve that returns (nil, nil) is a failure, not a success: stamping a
 // zero pod would put empty attributes on every metric.
-func TestStartTreatsNilPodAsFailure(t *testing.T) {
+func TestPollTreatsNilValueAsFailure(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	pod := Start(ctx, func(context.Context) (*kubemeta.Pod, error) { return nil, nil },
-		time.Minute, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	pod := StartPod(ctx, func(context.Context) (*kubemeta.Pod, error) { return nil, nil },
+		time.Minute, discardLog())
 	time.Sleep(50 * time.Millisecond)
 	if p := pod(); p != nil {
 		t.Fatalf("provider returned %+v for a nil resolve", p)
 	}
 }
 
-func TestFillAbsent(t *testing.T) {
-	src, dst := pcommon.NewMap(), pcommon.NewMap()
-	src.PutStr("a", "from-src")
-	src.PutStr("b", "added")
-	src.PutInt("n", 7)
-	dst.PutStr("a", "kept")
+// A refresh of zero disables the lookup: no goroutine, the provider serves the
+// caller's initial value forever (how -node-metadata-refresh=0 keeps the bare
+// node name).
+func TestPollZeroRefreshNeverResolves(t *testing.T) {
+	var calls atomic.Int32
+	initial := &kubemeta.Pod{Name: "seed"}
+	get := Poll(context.Background(), func(context.Context) (*kubemeta.Pod, error) {
+		calls.Add(1)
+		return testPod(), nil
+	}, PollConfig[kubemeta.Pod]{Initial: initial, Log: discardLog()})
 
-	FillAbsent(src, dst)
-	if v, _ := dst.Get("a"); v.AsString() != "kept" {
-		t.Errorf("a = %q; an existing key must not be overwritten", v.AsString())
+	time.Sleep(20 * time.Millisecond)
+	if p := get(); p != initial {
+		t.Fatalf("provider returned %+v; want the initial value", p)
 	}
-	if v, _ := dst.Get("b"); v.AsString() != "added" {
-		t.Errorf("b = %q; want added", v.AsString())
+	if n := calls.Load(); n != 0 {
+		t.Fatalf("resolve called %d times with the lookup disabled", n)
 	}
-	if v, ok := dst.Get("n"); !ok || v.Int() != 7 {
-		t.Errorf("n = %v; non-string values must survive the copy", v)
+}
+
+// A failed REFRESH keeps the last good value: a blip must not strip the
+// attributes off a process's metrics.
+func TestPollKeepsLastGoodValue(t *testing.T) {
+	var calls atomic.Int32
+	resolve := func(context.Context) (*kubemeta.Pod, error) {
+		if calls.Add(1) == 1 {
+			return testPod(), nil
+		}
+		return nil, errors.New("gone")
 	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	get := Poll(ctx, resolve, PollConfig[kubemeta.Pod]{Refresh: 5 * time.Millisecond, Log: discardLog()})
+
+	deadline := time.Now().Add(30 * time.Second)
+	for calls.Load() < 3 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if p := get(); p == nil || p.Name != "kubescrape-agent-xyz" {
+		t.Fatalf("provider returned %+v after failed refreshes; want the last good pod", p)
+	}
+}
+
+// onFirst runs exactly once, after the first success (the agent hangs its
+// readiness gate on it).
+func TestPollOnFirstRunsOnceWithTheValue(t *testing.T) {
+	var fired atomic.Int32
+	var got atomic.Pointer[kubemeta.Pod]
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	Poll(ctx, func(context.Context) (*kubemeta.Pod, error) { return testPod(), nil },
+		PollConfig[kubemeta.Pod]{
+			Refresh: 5 * time.Millisecond,
+			OnFirst: func(p *kubemeta.Pod) { fired.Add(1); got.Store(p) },
+			Log:     discardLog(),
+		})
+
+	deadline := time.Now().Add(30 * time.Second)
+	for fired.Load() == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	time.Sleep(30 * time.Millisecond) // several refreshes
+	if n := fired.Load(); n != 1 {
+		t.Fatalf("onFirst fired %d times; want 1", n)
+	}
+	if p := got.Load(); p == nil || p.Name != "kubescrape-agent-xyz" {
+		t.Fatalf("onFirst got %+v", p)
+	}
+}
+
+func TestNamespace(t *testing.T) {
+	t.Setenv("POD_NAMESPACE", "  monitoring  ")
+	if ns := Namespace(); ns != "monitoring" {
+		t.Fatalf("Namespace() = %q; want the trimmed env value", ns)
+	}
+	// No env: falls back to the ServiceAccount projection, and reports empty
+	// when that is absent too (the caller must not guess a namespace).
+	t.Setenv("POD_NAMESPACE", "")
+	if _, err := os.Stat("/var/run/secrets/kubernetes.io/serviceaccount/namespace"); os.IsNotExist(err) {
+		if ns := Namespace(); ns != "" {
+			t.Fatalf("Namespace() = %q with no env and no projection", ns)
+		}
+	}
+}
+
+// The pod is RE-READ on the refresh cadence, so an edited pod or namespace
+// label reaches the metrics it stamps. (The cost of that poll is a conditional
+// GET; see the metaclient's own tests.)
+func TestStartPodPicksUpChangedMetadata(t *testing.T) {
+	var calls atomic.Int32
+	resolve := func(context.Context) (*kubemeta.Pod, error) {
+		p := testPod()
+		if calls.Add(1) > 1 {
+			p.Labels = map[string]string{"app": "kubescrape-agent", "team": "platform"}
+			p.NamespaceMetadata = &kubemeta.ObjectMeta{Labels: map[string]string{"tier": "prod"}}
+		}
+		return p, nil
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	get := StartPod(ctx, resolve, 5*time.Millisecond, discardLog())
+
+	deadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) {
+		if p := get(); p != nil && p.NamespaceMetadata != nil {
+			if p.Labels["team"] != "platform" || p.NamespaceMetadata.Labels["tier"] != "prod" {
+				t.Fatalf("pod = %+v; want the relabelled one", p)
+			}
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("changed metadata never picked up after %d lookups", calls.Load())
 }

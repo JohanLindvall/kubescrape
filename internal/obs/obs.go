@@ -111,6 +111,26 @@ var (
 		"Requests to the metadata service by outcome.", "outcome")
 )
 
+// RegisterSelfMetadata exposes whether this process has resolved the pod it
+// runs in, whose attributes it stamps on the metrics it generates about itself
+// (-self-attributes). Both binaries register it.
+//
+// Without it an unattributed process is invisible: the agent's failed lookups
+// are indistinguishable from any other in kubescrape_metadata_requests_total,
+// and the metadata service's own lookup touches no counter at all — so "my
+// agents' own metrics carry no pod" is unalertable, and the symptom (a missing
+// label on one job) is easy to read as a dashboard problem.
+func RegisterSelfMetadata(resolved func() bool) {
+	Registry.GaugeFunc("kubescrape_self_metadata_resolved",
+		"1 when this process has resolved its own pod's metadata for -self-attributes, 0 while it has not.",
+		func() float64 {
+			if resolved() {
+				return 1
+			}
+			return 0
+		})
+}
+
 // Journald input (agent).
 var (
 	JournalEntries = Registry.Counter("kubescrape_journal_entries_total",

@@ -14,7 +14,6 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
-	"strings"
 	"sync/atomic"
 	"time"
 
@@ -22,6 +21,8 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/leaderelection"
 	"k8s.io/client-go/tools/leaderelection/resourcelock"
+
+	"github.com/JohanLindvall/kubescrape/internal/selfmeta"
 )
 
 // Default timings, matching the ecosystem convention. The invariant
@@ -72,16 +73,11 @@ func DefaultIdentity() string {
 // first, then the ServiceAccount projection. Empty means neither was
 // available, which the caller must treat as a configuration error — a Lease
 // in the wrong namespace silently elects a separate leader per namespace.
-func Namespace() string {
-	if ns := strings.TrimSpace(os.Getenv("POD_NAMESPACE")); ns != "" {
-		return ns
-	}
-	b, err := os.ReadFile("/var/run/secrets/kubernetes.io/serviceaccount/namespace")
-	if err != nil {
-		return ""
-	}
-	return strings.TrimSpace(string(b))
-}
+//
+// The lookup itself lives in selfmeta ("which pod am I"), so a caller that
+// wants only its own namespace — the metadata service, for its self-metrics —
+// need not depend on leader election to get it.
+func Namespace() string { return selfmeta.Namespace() }
 
 func (c *Config) defaults() error {
 	if c.Client == nil {

@@ -187,7 +187,12 @@ func (c *Client) PodByIP(ctx context.Context, ip string) (*kubemeta.Pod, error) 
 // downward-API identity has to be wired into the caller's deployment. It fails
 // with a 404 error when the caller is not a live, non-hostNetwork pod — the
 // caller runs outside Kubernetes, on hostNetwork, or behind a hop that
-// rewrites the source address. Never cached: the response depends on who asked.
+// rewrites the source address.
+//
+// The response is cached like the other metadata lookups, and may be: it is
+// marked `private` — one Client belongs to one process, which is the one pod
+// the answer describes — so re-reading it to pick up a relabelled pod or
+// namespace costs a conditional GET, usually answered 304.
 func (c *Client) Self(ctx context.Context) (*kubemeta.Pod, error) {
 	var pod kubemeta.Pod
 	if err := c.getJSON(ctx, c.base+"/v1/self", &pod); err != nil {

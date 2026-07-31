@@ -347,15 +347,9 @@ func (e *Enricher) builtAttrs(ctx context.Context, cache map[string]pcommon.Map,
 }
 
 // mergeAttrs adds src's attributes to dst, never overwriting keys the sender
-// already set.
-func mergeAttrs(src, dst pcommon.Map) {
-	src.Range(func(k string, v pcommon.Value) bool {
-		if _, exists := dst.Get(k); !exists {
-			v.CopyTo(dst.PutEmpty(k))
-		}
-		return true
-	})
-}
+// already set. The sender is authoritative about ITSELF, which is the same
+// rule the self-metadata stamping applies — hence the shared implementation.
+func mergeAttrs(src, dst pcommon.Map) { attrs.FillAbsent(src, dst) }
 
 // overwriteAttrs sets src's attributes on dst, replacing what the sender set.
 // Used only where the resource describes an object OTHER than the sender (the

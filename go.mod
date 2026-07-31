@@ -4,6 +4,7 @@ go 1.26.3
 
 require (
 	github.com/JohanLindvall/bufpool v0.2.1
+	github.com/JohanLindvall/diskqueue v0.0.4
 	github.com/JohanLindvall/enrich v0.1.5
 	github.com/JohanLindvall/lightning v0.0.62
 	github.com/JohanLindvall/logfmt v0.0.12

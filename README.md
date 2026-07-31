@@ -262,7 +262,6 @@ importable:
 | Package | What it is |
 |---|---|
 | [`pkg/promparse`](pkg/promparse) | Streaming parser for the Prometheus text exposition format (classic + OpenMetrics). Never buffers more than a line, so a 100k-series endpoint parses in constant memory; pooled parsers keep the intern tables warm (a large scrape costs a handful of allocations). |
-| [`pkg/spool`](pkg/spool) | Durable on-disk FIFO queue: length-prefixed, xxhash-checksummed frames in rotating segments, `fsync` per append — or group commit (`AppendNoSync`+`Sync`, one fsync per group, ~3.7 µs/record at 1000-record groups) for small-record producers — at-least-once across restarts, size-capped with back-pressure. |
 | [`pkg/kubemeta`](pkg/kubemeta) | The metadata model the service serves — the wire contract for its API — plus `NormalizeContainerID`. Pure stdlib; the Kubernetes-object conversion lives in [`pkg/kubemeta/kubeconvert`](pkg/kubemeta/kubeconvert) so clients don't compile `k8s.io/api`. |
 | [`pkg/metaclient`](pkg/metaclient) | HTTP client for that API: blocking container-ID lookups, ETag/Cache-Control caching, no metrics dependency (set `Observe` to feed your own). |
 | [`pkg/logattrs`](pkg/logattrs) | Lifts configured keys out of a JSON or logfmt log line onto an OTLP record, as resource, scope or log attributes. |
@@ -638,16 +637,20 @@ checkpoint-and-rewind: on a collector outage the tailer stops advancing and the
 source files *are* the buffer — simple, but a long outage risks loss if those
 files rotate away, and scraped metrics are just dropped and re-scraped. Point
 `-buffer-dir` at a (node-local, persistent) directory and every export instead
-goes through a **disk-backed write-ahead buffer** — separate on-disk FIFO
-spools for logs and metrics (`pkg/spool`). A batch is serialized,
-`fsync`'d to disk, and acknowledged to the producer immediately (so the tailer
-commits its offsets and the source logs may rotate away), then a background
-sender drains the spool to the collector with retries; a batch is removed only
-after the collector accepts it. Delivery stays at-least-once and **survives
-agent restarts** (a torn tail from a crash is truncated on reopen). The
-undelivered backlog is bounded per signal by `-buffer-max-bytes` (default 1
-GiB); when full, `Append` fails and the tailer back-pressures by rewinding, so
-disk use stays capped. This is the Fluent-Bit-style `filesystem` buffer: it
+goes through a **disk-backed write-ahead buffer** — one durable FIFO queue per
+signal, backed by
+[JohanLindvall/diskqueue](https://github.com/JohanLindvall/diskqueue). A batch
+is serialized, `fsync`'d to disk, and acknowledged to the producer immediately
+(so the tailer commits its offsets and the source logs may rotate away), then
+a background sender drains the queue to the collector with retries; a batch is
+removed only after the collector accepts it. Delivery stays at-least-once and
+**survives agent restarts** (per-record checksums; a crash-torn tail costs at
+most the torn record, and every corruption loss is reported, never silent).
+The undelivered backlog is bounded per signal by `-buffer-max-bytes` (default
+1 GiB); when full, enqueues fail and the tailer back-pressures by rewinding,
+so disk use stays capped. A latched I/O failure (a failed fsync is not
+retriable) is recovered by an automatic close-and-reopen; the affected batch
+redelivers. This is the Fluent-Bit-style `filesystem` buffer: it
 absorbs outages up to the cap instead of pinning to source files.
 
 **Metrics.** Each `-scrape-interval` the agent fetches

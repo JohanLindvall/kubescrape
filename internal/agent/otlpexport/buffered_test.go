@@ -2,14 +2,15 @@ package otlpexport
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/JohanLindvall/diskqueue"
+
 	"go.opentelemetry.io/collector/pdata/plog"
 	"go.opentelemetry.io/collector/pdata/pmetric"
-
-	"github.com/JohanLindvall/kubescrape/pkg/spool"
 )
 
 type fakeSender struct {
@@ -94,13 +95,13 @@ func waitFor(t *testing.T, cond func() bool, what string) {
 	t.Fatalf("timed out waiting for %s", what)
 }
 
-func openBuffer(t *testing.T, dir string, send *fakeSender, max int64) (*Buffered, *spool.Spool, *spool.Spool) {
+func openBuffer(t *testing.T, dir string, send *fakeSender, max int64) (*Buffered, *Buffer, *Buffer) {
 	t.Helper()
-	ls, err := spool.Open(dir+"/logs", spool.Options{MaxBytes: max})
+	ls, err := OpenBuffer(dir+"/logs", max)
 	if err != nil {
 		t.Fatal(err)
 	}
-	ms, err := spool.Open(dir+"/metrics", spool.Options{MaxBytes: max})
+	ms, err := OpenBuffer(dir+"/metrics", max)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -166,9 +167,12 @@ func TestBufferedFullPropagates(t *testing.T) {
 	b, ls, ms := openBuffer(t, t.TempDir(), &fakeSender{}, 8)
 	defer func() { _ = ls.Close() }()
 	defer func() { _ = ms.Close() }()
-	// A marshaled batch is well over the 8-byte cap.
-	if err := b.ExportLogs(context.Background(), logsWith("too big for the cap")); err != spool.ErrFull {
-		t.Fatalf("ExportLogs err = %v, want ErrFull", err)
+	// A marshaled batch well over the 8-byte cap can NEVER fit: diskqueue
+	// distinguishes that (ErrRecordTooLarge, retrying is futile) from a
+	// backlog that is merely full right now (ErrFull). The producer-facing
+	// handling is the same refusal either way.
+	if err := b.ExportLogs(context.Background(), logsWith("too big for the cap")); !errors.Is(err, diskqueue.ErrRecordTooLarge) {
+		t.Fatalf("ExportLogs err = %v, want ErrRecordTooLarge", err)
 	}
 }
 
@@ -267,7 +271,7 @@ func TestBufferedRequeuesStuckBatch(t *testing.T) {
 // of panicking (the documented nil-spool contract).
 func TestBufferedNilSpoolExportsDirectly(t *testing.T) {
 	send := &fakeSender{}
-	ls, err := spool.Open(t.TempDir(), spool.Options{})
+	ls, err := OpenBuffer(t.TempDir(), 0)
 	if err != nil {
 		t.Fatal(err)
 	}

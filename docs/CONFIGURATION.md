@@ -152,7 +152,7 @@ The flags configure ONE endpoint for every signal. The config file's `export`
 section overlays per-signal destinations onto that base — which is what makes
 **collectorless** deployment expressible: Mimir, Loki and Tempo all ingest
 OTLP natively, but on three different hosts/paths. Each override rides the
-existing per-signal disk-buffer spool, so durability is unchanged; the base
+existing per-signal disk-buffer queue, so durability is unchanged; the base
 part adds what the flags cannot express — static headers (tenancy) on the
 default **buffered** chain (the `routing` section's headers are deliberately
 unbuffered) and an mTLS client certificate:
@@ -237,14 +237,19 @@ metrics are dropped and re-scraped. A long outage can lose logs if the source
 files rotate away first.
 
 With `-buffer-dir` set, every export goes through a disk-backed write-ahead
-buffer instead — separate on-disk FIFO spools for logs and metrics. A batch is
-serialized, `fsync`'d, and acknowledged to the producer immediately (so the
+buffer instead — one durable FIFO queue per signal, backed by
+[JohanLindvall/diskqueue](https://github.com/JohanLindvall/diskqueue). A batch
+is serialized, `fsync`'d, and acknowledged to the producer immediately (so the
 tailer commits its offsets and source logs may rotate away), then a background
 sender drains it to the collector with retries; a batch is removed only after
 the collector accepts it. Delivery stays at-least-once and survives agent
-restarts (a crash-torn tail is truncated on reopen). The undelivered backlog is
-capped per signal by `-buffer-max-bytes`; when full, appends fail and the tailer
-back-pressures (rewinds), so disk stays bounded.
+restarts (per-record checksums; corruption degrades to reported loss, never a
+wedged queue). The undelivered backlog is capped per signal by
+`-buffer-max-bytes`; when full, enqueues fail and the tailer back-pressures
+(rewinds), so disk stays bounded — a single batch larger than the whole cap is
+refused outright. A latched I/O failure (diskqueue treats a failed fsync as
+non-retriable) recovers by automatic close-and-reopen, at the cost of
+redelivering the affected batch.
 
 Point `-buffer-dir` at a node-local persistent path (e.g. under the agent's
 state hostPath) so the buffer survives pod restarts. Note that delivered-but-

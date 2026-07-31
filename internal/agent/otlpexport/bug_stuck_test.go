@@ -12,7 +12,6 @@ import (
 	"google.golang.org/grpc/status"
 
 	"github.com/JohanLindvall/kubescrape/internal/obs"
-	"github.com/JohanLindvall/kubescrape/pkg/spool"
 )
 
 // TestBankedRecoveryDeliveriesDoNotDropGoodBatch is the regression test for the
@@ -69,12 +68,12 @@ func TestStuckEntryForgottenOnPermanentRejection(t *testing.T) {
 	// created), permanent thereafter (→ sendRejected on the next drain cycle).
 	send := &flakyThenPermSender{permFrom: stuckAfterAttempts + 1}
 	dir := t.TempDir()
-	ls, err := spool.Open(dir+"/logs", spool.Options{})
+	ls, err := OpenBuffer(dir+"/logs", 0)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer func() { _ = ls.Close() }()
-	ms, err := spool.Open(dir+"/metrics", spool.Options{})
+	ms, err := OpenBuffer(dir+"/metrics", 0)
 	if err != nil {
 		t.Fatal(err)
 	}

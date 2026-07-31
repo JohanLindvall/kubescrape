@@ -198,7 +198,7 @@ func grpcForwardStatus(err error) error {
 	}
 	// Permanence is classified by otlpexport.IsPermanent (the single source of
 	// truth): only definitive upstream rejections become InvalidArgument (do
-	// not retry). Everything else — spool.ErrFull back-pressure, upstream 5xx,
+	// not retry). Everything else — diskqueue.ErrFull back-pressure, upstream 5xx,
 	// 401/403/404 windows, timeouts, unclassified failures — is Unavailable:
 	// the receiver is a proxy, and the sender retrying is the safe default.
 	if otlpexport.IsPermanent(err) {
@@ -289,7 +289,7 @@ func (s *Server) handleHTTPTraces(w http.ResponseWriter, r *http.Request) {
 // httpForwardStatus maps a forwarding failure onto the HTTP status the sender
 // retries correctly (the HTTP counterpart of grpcForwardStatus): a permanent
 // upstream rejection is 400 (the sender must not retry the batch), everything
-// else — spool.ErrFull back-pressure, upstream 5xx, timeouts — is 503
+// else — diskqueue.ErrFull back-pressure, upstream 5xx, timeouts — is 503
 // (retryable).
 func httpForwardStatus(err error) int {
 	if otlpexport.IsPermanent(err) {

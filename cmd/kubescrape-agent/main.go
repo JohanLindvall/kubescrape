@@ -43,7 +43,6 @@ import (
 	"github.com/JohanLindvall/kubescrape/internal/obs"
 	"github.com/JohanLindvall/kubescrape/pkg/logattrs"
 	"github.com/JohanLindvall/kubescrape/pkg/metaclient"
-	"github.com/JohanLindvall/kubescrape/pkg/spool"
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
@@ -434,17 +433,25 @@ func run() error {
 	// spools after every producer has stopped (Buffered.Run exits on cancel).
 	var finalDrain func(context.Context)
 	if *bufferDir != "" {
-		logSpool, err := spool.Open(filepath.Join(*bufferDir, "logs"), spool.Options{MaxBytes: int64(*bufferMax)})
+		logBuf, err := otlpexport.OpenBuffer(filepath.Join(*bufferDir, "logs"), int64(*bufferMax))
 		if err != nil {
 			return fmt.Errorf("log buffer: %w", err)
 		}
-		defer func() { _ = logSpool.Close() }()
-		metricSpool, err := spool.Open(filepath.Join(*bufferDir, "metrics"), spool.Options{MaxBytes: int64(*bufferMax)})
+		defer func() {
+			if err := logBuf.Close(); err != nil {
+				log.Warn("closing the log buffer", "error", err)
+			}
+		}()
+		metricBuf, err := otlpexport.OpenBuffer(filepath.Join(*bufferDir, "metrics"), int64(*bufferMax))
 		if err != nil {
 			return fmt.Errorf("metric buffer: %w", err)
 		}
-		defer func() { _ = metricSpool.Close() }()
-		buffered := otlpexport.NewBuffered(exporter, logSpool, metricSpool, *otlpBackoff, log)
+		defer func() {
+			if err := metricBuf.Close(); err != nil {
+				log.Warn("closing the metric buffer", "error", err)
+			}
+		}()
+		buffered := otlpexport.NewBuffered(exporter, logBuf, metricBuf, *otlpBackoff, log)
 		wg.Add(1)
 		go func() {
 			defer wg.Done()

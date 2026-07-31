@@ -87,9 +87,12 @@ func TestSelfEndpointIsPrivatelyCached(t *testing.T) {
 	condGet(t, srv.URL+"/v1/self", etag, http.StatusNotModified)
 }
 
-// The metadata TTL governs it like every other metadata response: with caching
-// off, no cache headers are sent at all.
-func TestSelfEndpointUncachedWithZeroTTL(t *testing.T) {
+// Turning the metadata cache off (-metadata-cache-ttl=0) removes the freshness
+// lifetime — but NOT the private marker. A 200 with no freshness information is
+// heuristically cacheable by a shared cache (RFC 9111 4.2.2), and this is the
+// one response that names its caller, so at a zero TTL it must say so
+// explicitly rather than fall silent.
+func TestSelfEndpointStaysPrivateWithZeroTTL(t *testing.T) {
 	st := store.New(time.Minute)
 	addAgentPod(st, "127.0.0.1", false)
 	srv := testServer(t, st, closedChan()) // CacheTTL unset
@@ -99,8 +102,17 @@ func TestSelfEndpointUncachedWithZeroTTL(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = resp.Body.Close() }()
-	if cc := resp.Header.Get("Cache-Control"); cc != "" {
-		t.Fatalf("Cache-Control = %q; want none with the metadata cache off", cc)
+	if cc := resp.Header.Get("Cache-Control"); cc != "private, no-store" {
+		t.Fatalf("Cache-Control = %q; want private, no-store with the metadata cache off", cc)
+	}
+	// The shared-cache routes keep their existing behaviour: no headers at all.
+	pod, err := http.Get(srv.URL + "/v1/pods/monitoring/kubescrape-agent-xyz")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = pod.Body.Close() }()
+	if cc := pod.Header.Get("Cache-Control"); cc != "" {
+		t.Fatalf("shared-cache route Cache-Control = %q; want none at a zero TTL", cc)
 	}
 }
 
@@ -141,7 +153,7 @@ func TestSelfEndpointUnknownCaller(t *testing.T) {
 	getJSON(t, srv2.URL+"/v1/self", http.StatusNotFound, nil)
 }
 
-func TestPeerIP(t *testing.T) {
+func TestPeerIPCanonicalises(t *testing.T) {
 	for _, tc := range []struct{ addr, want string }{
 		{"10.0.0.1:34512", "10.0.0.1"},
 		{"[fd00::1]:34512", "fd00::1"},
@@ -153,8 +165,8 @@ func TestPeerIP(t *testing.T) {
 		{"not-an-ip:80", ""},
 		{"kubescrape.monitoring:80", ""},
 	} {
-		if got := peerIP(tc.addr); got != tc.want {
-			t.Errorf("peerIP(%q) = %q, want %q", tc.addr, got, tc.want)
+		if got := kubemeta.PeerIP(tc.addr); got != tc.want {
+			t.Errorf("kubemeta.PeerIP(%q) = %q, want %q", tc.addr, got, tc.want)
 		}
 	}
 }

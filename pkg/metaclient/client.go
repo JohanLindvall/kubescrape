@@ -106,7 +106,13 @@ func New(base string, timeout time.Duration) *Client {
 	// forces most connections to close under the highly concurrent ingest
 	// enrichment load (everything goes to the one metadata-service host).
 	transport := &http.Transport{
-		Proxy: http.ProxyFromEnvironment,
+		// No proxy, deliberately. The metadata service is always cluster-local,
+		// and a proxy hop REPLACES the source address /v1/self attributes the
+		// caller by — a cluster-wide HTTP_PROXY (which the conventional
+		// NO_PROXY=.svc,.cluster.local does not exclude for a bare
+		// "kubescrape.monitoring") would silently stamp the PROXY's pod onto
+		// every agent's own metrics, with the resolved gauge reading 1.
+		Proxy: nil,
 		DialContext: (&net.Dialer{
 			Timeout:   10 * time.Second,
 			KeepAlive: 30 * time.Second,

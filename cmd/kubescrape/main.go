@@ -561,6 +561,13 @@ func run() error {
 		if host, err := os.Hostname(); err == nil {
 			a.PutStr("service.instance.id", host)
 		}
+		// Known without any lookup, and set here rather than left to the
+		// self-metadata stamp: attrs.Identity derives service.namespace from
+		// it, and that is half the Prometheus job. Learning it later would
+		// rename the job of already-running cumulative series mid-flight.
+		if ns := selfmeta.Namespace(); ns != "" {
+			a.PutStr("k8s.namespace.name", ns)
+		}
 		selfOut = exporter
 		if *selfAttrs {
 			// This process's own pod, out of its own store — no HTTP hop, no

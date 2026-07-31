@@ -81,6 +81,7 @@ func Poll[T any](ctx context.Context, resolve func(context.Context) (*T, error),
 		log = slog.Default()
 	}
 	var current atomic.Pointer[T]
+	var failures atomic.Int64
 	if cfg.Initial != nil {
 		current.Store(cfg.Initial)
 	}
@@ -92,7 +93,15 @@ func Poll[T any](ctx context.Context, resolve func(context.Context) (*T, error),
 		defer cancel()
 		v, err := resolve(fctx)
 		if err != nil || v == nil {
-			log.Debug("resolving own metadata", "error", err)
+			// First failure at Warn, the rest at Debug: a lookup that never
+			// succeeds was previously silent at the default log level, which
+			// left "my metrics carry no pod" with no trace anywhere. Repeats
+			// stay quiet so a long outage cannot flood the log.
+			if failures.Add(1) == 1 {
+				log.Warn("resolving own metadata failed; retrying", "error", err)
+			} else {
+				log.Debug("resolving own metadata", "error", err)
+			}
 			return nil
 		}
 		current.Store(v)
@@ -145,8 +154,16 @@ func StartPod(ctx context.Context, resolve func(context.Context) (*kubemeta.Pod,
 		Refresh: refresh,
 		Log:     log,
 		OnFirst: func(p *kubemeta.Pod) {
-			log.Info("resolved this pod's own metadata",
-				"namespace", p.Namespace, "pod", p.Name, "confirmed", verified(p))
+			if !verified(p) {
+				// Not provably ours: legitimate under a custom spec.hostname,
+				// but also what a proxy or NAT hop in front of the metadata
+				// service looks like — and that one silently attributes this
+				// process to somebody else's pod.
+				log.Warn("resolved a pod that is not provably this one; check for a proxy or NAT hop to the metadata service",
+					"namespace", p.Namespace, "pod", p.Name, "hostname", hostname())
+				return
+			}
+			log.Info("resolved this pod's own metadata", "namespace", p.Namespace, "pod", p.Name, "confirmed", true)
 		},
 	})
 }
@@ -156,8 +173,16 @@ func StartPod(ctx context.Context, resolve func(context.Context) (*kubemeta.Pod,
 // unless a spec.hostname overrides it. Reported at resolution time, so an
 // answer that is not ours is visible rather than merely suspected.
 func verified(pod *kubemeta.Pod) bool {
+	h := hostname()
+	return h != "" && pod.Name == h
+}
+
+func hostname() string {
 	h, err := os.Hostname()
-	return err == nil && h != "" && pod.Name == h
+	if err != nil {
+		return ""
+	}
+	return h
 }
 
 // Namespace resolves the pod's own namespace: $POD_NAMESPACE (downward API)
@@ -171,11 +196,27 @@ func Namespace() string {
 	if ns := strings.TrimSpace(os.Getenv("POD_NAMESPACE")); ns != "" {
 		return ns
 	}
-	b, err := os.ReadFile("/var/run/secrets/kubernetes.io/serviceaccount/namespace")
+	b, err := os.ReadFile(namespaceProjection)
 	if err != nil {
 		return ""
 	}
 	return strings.TrimSpace(string(b))
+}
+
+// namespaceProjection is the ServiceAccount namespace file. A var so a test
+// can point it at a path that definitely does not exist: the "neither source
+// available" branch is otherwise unreachable — and silently skipped — whenever
+// the suite itself runs inside a pod.
+var namespaceProjection = "/var/run/secrets/kubernetes.io/serviceaccount/namespace"
+
+// SetNamespaceProjectionForTest points Namespace at a different projection path
+// and returns the previous one. Tests in OTHER packages need it for the same
+// reason this package does: inside a pod the real projection exists, so the
+// "no namespace available" branch would silently not run.
+func SetNamespaceProjectionForTest(path string) string {
+	prev := namespaceProjection
+	namespaceProjection = path
+	return prev
 }
 
 // Exporter is the metrics half of an export chain — what the self-metrics and
@@ -184,9 +225,12 @@ type Exporter interface {
 	ExportMetrics(ctx context.Context, md pmetric.Metrics) error
 }
 
-// Build fills res with the attributes derived from pod. Callers supply their
-// own: the agent runs its configured `self` attribute pipeline, the metadata
-// service the built-in k8s mapping.
+// Build fills res with the attributes derived from pod, which is NIL until the
+// lookup succeeds (and forever where it cannot): a Build must still emit what
+// it knows without one — the agent's configured static and Node-template
+// attributes — since those are what an alert on an unattributed process
+// selects by. Callers supply their own: the agent runs its configured `self`
+// attribute pipeline, the metadata service the built-in k8s mapping.
 type Build func(res pcommon.Resource, pod *kubemeta.Pod)
 
 // exporter stamps the resolved pod's attributes onto every resource of every
@@ -221,13 +265,19 @@ func Wrap(next Exporter, pod func() *kubemeta.Pod, build Build) Exporter {
 }
 
 func (e *exporter) ExportMetrics(ctx context.Context, md pmetric.Metrics) error {
-	if pod := e.pod(); pod != nil {
-		built := pcommon.NewResource()
-		e.build(built, pod)
-		rms := md.ResourceMetrics()
-		for i := 0; i < rms.Len(); i++ {
-			attrs.FillAbsent(built.Attributes(), rms.At(i).Resource().Attributes())
-		}
+	// Built even when the pod is UNRESOLVED (a nil Pod is a valid build
+	// context): the operator's static attributes — a cluster name, typically —
+	// are the labels an alert on kubescrape_self_metadata_resolved == 0 selects
+	// by, and gating them on a successful lookup would strip them from exactly
+	// the payload that reports the lookup failing.
+	built := pcommon.NewResource()
+	e.build(built, e.pod())
+	if built.Attributes().Len() == 0 {
+		return e.next.ExportMetrics(ctx, md)
+	}
+	rms := md.ResourceMetrics()
+	for i := 0; i < rms.Len(); i++ {
+		attrs.FillAbsent(built.Attributes(), rms.At(i).Resource().Attributes())
 	}
 	return e.next.ExportMetrics(ctx, md)
 }

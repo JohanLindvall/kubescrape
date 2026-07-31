@@ -1,26 +1,81 @@
 package main
 
-// The agent's half of the self-metadata feature (internal/selfmeta): the
-// attribute build applied to the metrics it generates about itself — its
-// self-metrics and the span metrics derived from ingested traces. Both are
-// built from agentSelfResource, which knows only what the process itself can
-// see (service.name, version, node). The pod comes from the metadata service's
-// GET /v1/self, which attributes the request by its connection's source
-// address; metaclient.Self is already a selfmeta resolve func, so there is no
-// adapter here.
+// The agent's half of the self-metadata feature (internal/selfmeta): how it
+// finds the pod it runs in, and the attribute build applied to the metrics it
+// generates about itself — its self-metrics and the span metrics derived from
+// ingested traces. Both are built from agentSelfResource, which knows only
+// what the process itself can see (service.name, version, node, namespace).
 
 import (
+	"context"
+	"fmt"
+	"os"
+	"strings"
+
 	"go.opentelemetry.io/collector/pdata/pcommon"
 
 	"github.com/JohanLindvall/kubescrape/internal/agent/attrs"
+	"github.com/JohanLindvall/kubescrape/internal/obs"
 	"github.com/JohanLindvall/kubescrape/internal/selfmeta"
 	"github.com/JohanLindvall/kubescrape/pkg/kubemeta"
+	"github.com/JohanLindvall/kubescrape/pkg/metaclient"
 )
+
+// selfResolve resolves the pod THIS agent runs in.
+//
+// GET /v1/self first: the service attributes the caller by its connection's
+// source address, so nothing has to be wired into the deployment. That address
+// is not always the pod's own, though — a hostNetwork agent shares the node
+// IP, a NAT hop or proxy replaces it, and on a dual-stack cluster the
+// connection may use the family status.podIP does not carry — so a failure
+// falls back to a lookup BY NAME, the way the metadata service resolves
+// itself. The name comes from $POD_NAME or the hostname (Kubernetes sets it
+// from the pod name), the namespace from $POD_NAMESPACE or the ServiceAccount
+// projection; with neither available the original error stands.
+func selfResolve(meta *metaclient.Client) func(context.Context) (*kubemeta.Pod, error) {
+	return func(ctx context.Context) (*kubemeta.Pod, error) {
+		pod, err := meta.Self(ctx)
+		if err == nil {
+			obs.SelfMetadataLookups.WithLabelValues("self").Inc()
+			return pod, nil
+		}
+		ns, name := selfmeta.Namespace(), selfPodName()
+		if ns == "" || name == "" {
+			obs.SelfMetadataLookups.WithLabelValues("error").Inc()
+			return nil, err
+		}
+		byName, nameErr := meta.PodByName(ctx, ns, name)
+		if nameErr != nil {
+			obs.SelfMetadataLookups.WithLabelValues("error").Inc()
+			return nil, fmt.Errorf("peer-address lookup: %w; by name %s/%s: %w", err, ns, name, nameErr)
+		}
+		obs.SelfMetadataLookups.WithLabelValues("by_name").Inc()
+		return byName, nil
+	}
+}
+
+// selfPodName is this pod's name: $POD_NAME when the deployment wires it, else
+// the hostname, which Kubernetes sets from the pod name unless a spec.hostname
+// overrides it.
+func selfPodName() string {
+	if n := strings.TrimSpace(os.Getenv("POD_NAME")); n != "" {
+		return n
+	}
+	h, err := os.Hostname()
+	if err != nil {
+		return ""
+	}
+	return h
+}
 
 // selfBuild runs the configured `self` attribute pipeline over the agent's own
 // pod. What it produces is applied fill-if-absent, so the pipeline can only
 // ADD attributes — a template setting service.name or service.instance.id for
 // these metrics is deliberately ineffective (see selfmeta.Wrap).
+//
+// pod is NIL until the lookup succeeds, and stays nil where it cannot: the
+// build still runs, because the section's static attributes (a cluster name)
+// are how an operator selects the very metrics that report the failure.
 //
 // Container is left nil: the pod's containers are known, but which of them is
 // this process is not (a sidecar injector makes "the only one" a guess), and

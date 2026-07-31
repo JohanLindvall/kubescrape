@@ -909,7 +909,24 @@ which is the one pod the answer describes, and a shared cache is told not to
 store it at all. Until the lookup first succeeds — or forever, for a caller the
 service cannot attribute — the metrics ship with the bare identity: they are
 how a metadata-service outage is diagnosed, so nothing waits on it.
-`kubescrape_self_metadata_resolved` reports which of those you are in.
+`kubescrape_self_metadata_resolved` reports which of those you are in (it is
+published exactly when the lookup runs, so `0` always means unresolved), and
+`kubescrape_self_metadata_lookups_total{outcome}` counts the attempts —
+`self` for the peer-address answer, `by_name` for the fallback below.
+
+Where the peer address cannot identify the caller — a **hostNetwork** agent
+shares the node IP, a NAT hop or proxy replaces the address, a dual-stack pod
+may connect from the family `status.podIP` does not carry — the agent falls
+back to a lookup by name (`$POD_NAME` or the hostname, in `$POD_NAMESPACE` or
+the ServiceAccount projection's namespace), the same way the metadata service
+resolves itself.
+
+Two identity attributes are deliberately NOT left to the lookup:
+`service.namespace` is derived at startup from the namespace the process
+already knows, so the Prometheus job cannot change mid-series when the lookup
+lands; and the agent's own metrics bypass the namespace router, so a route glob
+covering the agent's namespace cannot move the fleet's own health signal off
+the durable buffered chain (transforms still apply to them).
 `-listen` (default `:8081`) serves `GET /healthz`, `GET /readyz`,
 `GET /debug/tailer` (per-file positions and lag), `GET /debug/targets` (the
 last scrape cycle's per-target outcomes — up/error/duration/samples,

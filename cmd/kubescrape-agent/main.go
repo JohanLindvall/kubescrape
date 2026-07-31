@@ -66,6 +66,25 @@ func agentSelfResource(node string) pcommon.Resource {
 	a.PutStr("service.name", "kubescrape-agent")
 	a.PutStr("service.version", obs.BuildVersion())
 	a.PutStr("k8s.node.name", node)
+	// The namespace is known WITHOUT any lookup ($POD_NAMESPACE or the
+	// ServiceAccount projection), and it has to be set here rather than left to
+	// the self-metadata stamp: attrs.Identity derives service.namespace from
+	// it, and that is half the Prometheus job. Learning it later — when
+	// /v1/self first answers, if it ever does — would rename the job of
+	// already-running CUMULATIVE series mid-flight, and leave it renamed on
+	// some nodes and not others.
+	if ns := selfmeta.Namespace(); ns != "" {
+		a.PutStr("k8s.namespace.name", ns)
+	}
+	// A cluster-singleton (-events / -azure-diagnostics) runs this same binary
+	// under this same service.name, and would otherwise take the identity of
+	// the node it happens to sit on — the same (job, instance) as that node's
+	// DaemonSet agent. Two processes on one series: their counters interleave,
+	// and now that each stamps its own pod, their target_info flaps between two
+	// identities. A singleton's instance is its POD.
+	if *eventsOn || *azureOn {
+		a.PutStr("service.instance.id", selfPodName())
+	}
 	attrs.Identity(res)
 	return res
 }
@@ -394,15 +413,15 @@ func run() error {
 	nodeInfo := startNodeInfo(ctx, meta, *nodeName, *nodeRefresh, log, ready)
 
 	// The pod THIS process runs in, for the resource attributes of the metrics
-	// it generates about itself. Refreshed on the node-metadata cadence (both
-	// are "what surrounds me", and one knob is enough); a minute when that
-	// lookup is off, since this one is enabled independently. Skipped outright
-	// when nothing self-describing is exported — an agent that generates no
-	// such metrics has no reason to poll the service about itself.
+	// it generates about itself, re-read on -self-attributes-refresh so a
+	// relabelled pod or namespace reaches them. Skipped outright when nothing
+	// self-describing is exported — an agent that generates no such metrics has
+	// no reason to poll the service about itself — and when the refresh is 0,
+	// which disables the lookup (the gauge is registered exactly when the
+	// lookup RUNS, so a published 0 always means unresolved, never "off").
 	var selfPod func() *kubemeta.Pod
-	selfDescribing := *selfMetricsIntv > 0 || (*spanMetrics && *ingestOn && *ingestTraces)
-	if *selfAttrsOn && selfDescribing {
-		selfPod = selfmeta.StartPod(ctx, meta.Self, *selfAttrsRefresh, log)
+	if *selfAttrsOn && selfDescribing() && *selfAttrsRefresh > 0 {
+		selfPod = selfmeta.StartPod(ctx, selfResolve(meta), *selfAttrsRefresh, log)
 		obs.RegisterSelfMetadata(func() bool { return selfPod() != nil })
 	}
 
@@ -490,6 +509,10 @@ func run() error {
 	// settings unless the route overrides the endpoint; per-route
 	// destinations are direct (unbuffered) — the default keeps the full
 	// durability chain.
+	// Captured before the router so the agent's own metrics can keep the
+	// default (buffered) chain — see selfSink below.
+	preRoute := out
+	routed := false
 	if fileCfg.Routing != nil && len(fileCfg.Routing.Routes) > 0 {
 		var dests []route.Destination
 		for i, rt := range fileCfg.Routing.Routes {
@@ -531,6 +554,7 @@ func run() error {
 			dests = append(dests, route.Destination{Name: rt.Name, Namespaces: rt.Namespaces, Exporter: rc})
 		}
 		out = route.New(out, dests)
+		routed = true
 		log.Info("routing enabled", "routes", len(dests))
 	}
 
@@ -565,13 +589,11 @@ func run() error {
 		wg.Wait()
 	}()
 
-	// The sink for the metrics the agent generates ABOUT ITSELF: `out` plus
-	// this pod's own Kubernetes attributes, filled in where the agent's own
-	// identity left a key unset. Built once here (after routing and transforms
-	// have finished composing `out`) and used by every self-describing export,
-	// including the final ones below — the last data point of a series must
-	// not carry a different resource than the rest.
-	selfOut := selfmeta.Wrap(out, selfPod, selfBuild(attrBuilders.Self, nodeInfo))
+	// The sink for the metrics the agent generates ABOUT ITSELF: this pod's own
+	// Kubernetes attributes filled in where the agent's identity left a key
+	// unset, over the chain selfSink picks.
+	selfOut := selfmeta.Wrap(selfSink(out, preRoute, routed, transforms), selfPod,
+		selfBuild(attrBuilders.Self, nodeInfo))
 
 	var selfRes pcommon.Resource
 	if *selfMetricsIntv > 0 {
@@ -1150,15 +1172,40 @@ func startNodeInfo(ctx context.Context, meta *metaclient.Client, nodeName string
 		// The agent can reach the metadata service, so it can attribute what
 		// it collects: the readiness gate a rolling update waits on.
 		OnFirst: func(*attrs.NodeInfo) { ready.done(gateMetadata) },
-		// No Final: unlike a pod's own identity, node labels are edited on a
-		// live node (cordons, pool migrations, topology relabelling) and
-		// attribute templates read them.
-		Log: log,
+		Log:     log,
 	})
 }
 
 // buildAttrs assembles the per-pipeline resource-attribute builders from the
 // config file and the flags; flag statics override config statics.
+// selfSink picks the export chain for the metrics the agent generates about
+// ITSELF: `out` normally, and the PRE-ROUTING chain when routing is enabled.
+//
+// The router fans out by the k8s.namespace.name on the resource, and these
+// resources only acquired one when self-attributes started stamping it — so a
+// route globbing the agent's own namespace would silently move the fleet's own
+// health signal off the durable buffered chain onto an unbuffered per-tenant
+// destination, and would do it only from the moment the lookup resolved.
+// Transforms still apply: the fork shares the reloaded program, so the two
+// chains can never run different scripts.
+func selfSink(out, preRoute otlpexport.Exporter, routed bool, transforms *transform.Wrapper) selfmeta.Exporter {
+	if !routed {
+		return out
+	}
+	if transforms != nil {
+		return transforms.Fork(preRoute, nil)
+	}
+	return preRoute
+}
+
+// selfDescribing reports whether this process exports metrics ABOUT ITSELF, so
+// there is a resource worth resolving its own pod for. Self-metrics and span
+// metrics are the two producers that carry agentSelfResource; everything else
+// describes some other object.
+func selfDescribing() bool {
+	return *selfMetricsIntv > 0 || (*spanMetrics && *ingestOn && *ingestTraces)
+}
+
 // buildAttrs compiles the resource-attribute builders from the config's
 // resourceAttributes section. The former -resource-attrs-static/-enable/
 // -disable flags are gone: static duplicated resourceAttributes.static

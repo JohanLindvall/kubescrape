@@ -111,12 +111,25 @@ var (
 		"Requests to the metadata service by outcome.", "outcome")
 )
 
+// SelfMetadataLookups counts the agent's own-pod lookups by outcome, SEPARATELY
+// from kubescrape_metadata_requests_total.
+//
+// That counter is documented as the container-attribution health signal, and
+// the self lookup retries forever: a fleet where /v1/self cannot resolve
+// (hostNetwork, a NAT hop) would otherwise contribute a permanent stream of
+// not_found to it and fire an alert about an attribution problem that does not
+// exist.
+var SelfMetadataLookups = Registry.CounterVec("kubescrape_self_metadata_lookups_total",
+	"Own-pod metadata lookups for -self-attributes, by outcome.", "outcome")
+
 // RegisterSelfMetadata exposes whether this process has resolved the pod it
 // runs in, whose attributes it stamps on the metrics it generates about itself
-// (-self-attributes). Both binaries register it.
+// (-self-attributes). Both binaries register it whenever the lookup RUNS, and
+// only then: a registered gauge means "this process is trying", so a 0 always
+// means unresolved and never "the feature is off".
 //
 // Without it an unattributed process is invisible: the agent's failed lookups
-// are indistinguishable from any other in kubescrape_metadata_requests_total,
+// were indistinguishable from any other in kubescrape_metadata_requests_total,
 // and the metadata service's own lookup touches no counter at all — so "my
 // agents' own metrics carry no pod" is unalertable, and the symptom (a missing
 // label on one job) is easy to read as a dashboard problem.

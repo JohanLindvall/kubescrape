@@ -78,6 +78,7 @@ names a metric or a label that is not registered.
 | `kubescrape_scrape_name_collisions_total` | — | Data points dropped because their family name was already claimed by a metric of another shape in the same batch (a target redeclaring a family's TYPE mid-exposition). |
 | `kubescrape_scrape_samples_total` | `pipeline` | Samples parsed by pipeline (before filtering). |
 | `kubescrape_scrapes_total` | `pipeline`, `outcome` | Scrapes by pipeline and outcome. |
+| `kubescrape_self_metadata_lookups_total` | `outcome` | Own-pod metadata lookups for -self-attributes, by outcome. |
 | `kubescrape_self_metadata_resolved` | — | 1 when this process has resolved its own pod's metadata for -self-attributes, 0 while it has not. |
 | `kubescrape_span_metrics_dropped_total` | — | Spans not aggregated into span metrics because the dimension-cardinality cap was reached. |
 | `kubescrape_span_metrics_evicted_total` | — | Span-metric series dropped at export because their dimensions went unobserved for traceMetrics.staleAfter (this is what frees cardinality-cap slots). |
@@ -87,4 +88,4 @@ names a metric or a label that is not registered.
 | `kubescrape_transform_errors_total` | `signal` | Transform program invocations that failed (the batch is NOT exported; the error propagates to the producer's retry path). |
 | `kubescrape_transform_reloads_total` | `outcome` | Transforms-file reloads by outcome (applied, failed — a failed compile keeps the last good program). |
 
-67 metrics.
+68 metrics.

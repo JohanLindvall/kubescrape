@@ -108,15 +108,27 @@ type TracesExporter interface {
 type Wrapper struct {
 	next       Exporter
 	nextTraces TracesExporter
-	program    atomic.Pointer[Program]
+	// program is a POINTER so forks can share one reloaded program (see Fork):
+	// a second wrapper over a different downstream must not need a second
+	// reloader, or a broken edit could leave the two chains on different
+	// programs.
+	program *atomic.Pointer[Program]
 }
 
 // Wrap builds a Wrapper forwarding to next (nextTraces may be nil when the
 // exporter cannot ship traces).
 func Wrap(next Exporter, nextTraces TracesExporter, initial *Program) *Wrapper {
-	w := &Wrapper{next: next, nextTraces: nextTraces}
+	w := &Wrapper{next: next, nextTraces: nextTraces, program: &atomic.Pointer[Program]{}}
 	w.program.Store(initial)
 	return w
+}
+
+// Fork returns a wrapper over a DIFFERENT downstream that shares this one's
+// program: one reloader keeps both current, and they can never diverge. The
+// agent uses it for the chain carrying its own metrics, which skips the
+// namespace router but must still see the operator's transforms.
+func (w *Wrapper) Fork(next Exporter, nextTraces TracesExporter) *Wrapper {
+	return &Wrapper{next: next, nextTraces: nextTraces, program: w.program}
 }
 
 // Swap installs a new program (compile-then-commit: callers only pass

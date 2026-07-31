@@ -9,12 +9,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
-	"net"
 	"net/http"
-	"net/netip"
 	"sort"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/JohanLindvall/kubescrape/internal/scrape"
@@ -167,7 +164,7 @@ func (s *Server) handlePodByIP(w http.ResponseWriter, r *http.Request) {
 // a 304 says "your labels and namespace metadata are unchanged" — instead of
 // choosing between stale attributes and a full document every interval.
 func (s *Server) handleSelf(w http.ResponseWriter, r *http.Request) {
-	ip := peerIP(r.RemoteAddr)
+	ip := kubemeta.PeerIP(r.RemoteAddr)
 	if ip == "" {
 		writeError(w, http.StatusBadRequest, fmt.Sprintf("unparseable peer address %q", r.RemoteAddr))
 		return
@@ -175,29 +172,6 @@ func (s *Server) handleSelf(w http.ResponseWriter, r *http.Request) {
 	s.servePod(w, r, cachePrivate,
 		func() (store.NodePod, bool) { return s.store.GetPodByIP(ip) },
 		func() string { return fmt.Sprintf("no live pod with peer IP %q", ip) })
-}
-
-// peerIP extracts the bare IP from an http.Request RemoteAddr
-// ("10.0.0.1:34512", "[fe80::1%eth0]:34512"), returning "" when it does not
-// hold one.
-//
-// The result is CANONICAL: the zone is dropped and an IPv4-mapped IPv6 address
-// is unmapped, because the store keys the bare form Kubernetes reports in
-// status.podIP. net/http renders a 4-in-6 peer as dotted-quad on its own, but
-// an address that reached us any other way must not silently fail to match.
-func peerIP(remoteAddr string) string {
-	host, _, err := net.SplitHostPort(remoteAddr)
-	if err != nil {
-		host = remoteAddr // no port (net/http always sets one, but be exact)
-	}
-	if i := strings.IndexByte(host, '%'); i >= 0 {
-		host = host[:i]
-	}
-	addr, err := netip.ParseAddr(host)
-	if err != nil {
-		return ""
-	}
-	return addr.Unmap().String()
 }
 
 // handleNodeMetadata serves GET /v1/nodes/{node}/metadata: the node's
@@ -441,6 +415,13 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 // caches may store it, shared ones must not.
 func (s *Server) writeCached(w http.ResponseWriter, r *http.Request, v any, private bool) {
 	if s.cacheTTL <= 0 {
+		if private {
+			// The caching knob is off, but the response still names its caller:
+			// without a freshness lifetime a shared cache MAY store a 200
+			// heuristically (RFC 9111 4.2.2), which is exactly the response
+			// that must never be handed to the next caller.
+			w.Header().Set("Cache-Control", "private, no-store")
+		}
 		writeJSON(w, http.StatusOK, v)
 		return
 	}

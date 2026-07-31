@@ -19,6 +19,7 @@ import (
 	"go.opentelemetry.io/collector/pdata/pcommon"
 
 	"github.com/JohanLindvall/kubescrape/internal/agent/attrs"
+	"github.com/JohanLindvall/kubescrape/internal/obs"
 	"github.com/JohanLindvall/kubescrape/internal/selfmeta"
 	"github.com/JohanLindvall/kubescrape/internal/server"
 	"github.com/JohanLindvall/kubescrape/internal/store"
@@ -42,8 +43,10 @@ func selfResolver(st *store.Store, resolver server.MetadataResolver) func(contex
 		}
 		np, ok := st.GetPodByName(ns, host)
 		if !ok {
+			obs.SelfMetadataLookups.WithLabelValues("error").Inc()
 			return nil, fmt.Errorf("pod %s/%s not in the store", ns, host)
 		}
+		obs.SelfMetadataLookups.WithLabelValues("by_name").Inc()
 		pod := np.Pod
 		pod.Owners = resolver.Resolve(pod.Namespace, np.OwnerRefs)
 		pod.NamespaceMetadata = resolver.Namespace(pod.Namespace)
@@ -57,6 +60,10 @@ func selfResolver(st *store.Store, resolver server.MetadataResolver) func(contex
 // so service.name stays "kubescrape" and service.instance.id stays the
 // hostname.
 func selfBuild(res pcommon.Resource, pod *kubemeta.Pod) {
-	attrs.Pod(res, *pod)
+	// pod is nil until the store has this process's own pod (and forever if it
+	// never does): the build must still run, and must not dereference it.
+	if pod != nil {
+		attrs.Pod(res, *pod)
+	}
 	attrs.Identity(res)
 }

@@ -339,3 +339,49 @@ func TestLogsOnlyTransformForwardsTraces(t *testing.T) {
 		t.Fatal("trace not forwarded")
 	}
 }
+
+// A fork shares the parent's program: the agent runs one chain through the
+// namespace router and a second — carrying its own metrics — around it, and a
+// reload must reach both. Two independently reloaded wrappers could otherwise
+// run different scripts on the same signal.
+func TestForkSharesTheReloadedProgram(t *testing.T) {
+	renamer, err := Compile([]byte(`
+metrics: |
+  def transform(batch):
+      for m in batch:
+          m.name = "renamed"
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	mainNext, forkNext := &capExp{}, &capExp{}
+	w := Wrap(mainNext, nil, nil) // no program yet
+	f := w.Fork(forkNext, nil)
+
+	one := func() pmetric.Metrics {
+		md := pmetric.NewMetrics()
+		md.ResourceMetrics().AppendEmpty().ScopeMetrics().AppendEmpty().Metrics().AppendEmpty().SetName("original")
+		return md
+	}
+	if err := f.ExportMetrics(context.Background(), one()); err != nil {
+		t.Fatal(err)
+	}
+	if got := forkNext.metrics[0].ResourceMetrics().At(0).ScopeMetrics().At(0).Metrics().At(0).Name(); got != "original" {
+		t.Fatalf("fork applied a program before any was installed: name=%q", got)
+	}
+
+	// Swapping on the PARENT (what the reloader holds) must apply to the fork.
+	w.Swap(renamer)
+	if f.Active() != w.Active() {
+		t.Fatal("fork and parent report different active programs")
+	}
+	if err := f.ExportMetrics(context.Background(), one()); err != nil {
+		t.Fatal(err)
+	}
+	if got := forkNext.metrics[1].ResourceMetrics().At(0).ScopeMetrics().At(0).Metrics().At(0).Name(); got != "renamed" {
+		t.Fatalf("fork metric name = %q; the parent's swapped program must apply to it", got)
+	}
+	if len(mainNext.metrics) != 0 {
+		t.Fatalf("main chain received %d payloads; the fork must forward to its OWN downstream", len(mainNext.metrics))
+	}
+}

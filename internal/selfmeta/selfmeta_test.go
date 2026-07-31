@@ -6,6 +6,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -51,9 +52,15 @@ func testPod() *kubemeta.Pod {
 	}
 }
 
-// build is a stand-in for a caller's attribute mapping.
+// build is a stand-in for a caller's attribute mapping. Like the real ones it
+// must tolerate a nil pod and still emit what it knows without one — here the
+// stand-in for an operator's static attributes.
 func build(res pcommon.Resource, pod *kubemeta.Pod) {
 	a := res.Attributes()
+	a.PutStr("k8s.cluster.name", "prod-eu") // static: never depends on the pod
+	if pod == nil {
+		return
+	}
 	a.PutStr("k8s.namespace.name", pod.Namespace)
 	a.PutStr("k8s.pod.name", pod.Name)
 	a.PutStr("k8s.pod.uid", pod.UID)
@@ -96,10 +103,13 @@ func TestWrapFillsOnlyAbsentKeys(t *testing.T) {
 	}
 }
 
-// Until the lookup succeeds the payload passes through untouched — a
-// process's own metrics must keep flowing, since they are how the failure to
-// resolve is diagnosed.
-func TestWrapPassesThroughUnresolved(t *testing.T) {
+// Until the lookup succeeds the payload still ships — a process's own metrics
+// must keep flowing, since they are how the failure to resolve is diagnosed —
+// and it ships WITH whatever the build knows without a pod. The operator's
+// static attributes are how an alert on kubescrape_self_metadata_resolved == 0
+// selects the broken agents, so they cannot be conditional on nothing being
+// broken.
+func TestWrapStampsStaticAttrsWhenUnresolved(t *testing.T) {
 	next := &captureExporter{}
 	exp := Wrap(next, func() *kubemeta.Pod { return nil }, build)
 	if err := exp.ExportMetrics(context.Background(), selfMetrics()); err != nil {
@@ -108,8 +118,14 @@ func TestWrapPassesThroughUnresolved(t *testing.T) {
 	if next.calls != 1 {
 		t.Fatalf("calls = %d; want the payload forwarded", next.calls)
 	}
-	if n := next.md.ResourceMetrics().At(0).Resource().Attributes().Len(); n != 4 {
-		t.Fatalf("resource has %d attributes; want the original 4", n)
+	if got := attrOf(t, next.md, "k8s.cluster.name"); got != "prod-eu" {
+		t.Errorf("k8s.cluster.name = %q with no pod resolved; want the static attribute", got)
+	}
+	if got := attrOf(t, next.md, "k8s.pod.name"); got != "" {
+		t.Errorf("k8s.pod.name = %q with no pod resolved", got)
+	}
+	if got := attrOf(t, next.md, "service.name"); got != "kubescrape-agent" {
+		t.Errorf("service.name = %q; the process's own identity must survive", got)
 	}
 }
 
@@ -270,14 +286,6 @@ func TestNamespace(t *testing.T) {
 	if ns := Namespace(); ns != "monitoring" {
 		t.Fatalf("Namespace() = %q; want the trimmed env value", ns)
 	}
-	// No env: falls back to the ServiceAccount projection, and reports empty
-	// when that is absent too (the caller must not guess a namespace).
-	t.Setenv("POD_NAMESPACE", "")
-	if _, err := os.Stat("/var/run/secrets/kubernetes.io/serviceaccount/namespace"); os.IsNotExist(err) {
-		if ns := Namespace(); ns != "" {
-			t.Fatalf("Namespace() = %q with no env and no projection", ns)
-		}
-	}
 }
 
 // The pod is RE-READ on the refresh cadence, so an edited pod or namespace
@@ -308,4 +316,87 @@ func TestStartPodPicksUpChangedMetadata(t *testing.T) {
 		time.Sleep(time.Millisecond)
 	}
 	t.Fatalf("changed metadata never picked up after %d lookups", calls.Load())
+}
+
+type errExporter struct{ calls int }
+
+func (e *errExporter) ExportMetrics(context.Context, pmetric.Metrics) error {
+	e.calls++
+	return errors.New("collector down")
+}
+
+// Wrap must be TRANSPARENT to export errors, resolved or not. The span-metrics
+// generator marks its series delivered — evicting stale ones and clearing
+// exemplars — only when Export returns nil, so a wrapper that swallowed a
+// failure would destroy observations no backend ever received.
+func TestWrapPropagatesExportErrors(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		pod  func() *kubemeta.Pod
+	}{
+		{"resolved", func() *kubemeta.Pod { return testPod() }},
+		{"unresolved", func() *kubemeta.Pod { return nil }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			next := &errExporter{}
+			if err := Wrap(next, tc.pod, build).ExportMetrics(context.Background(), selfMetrics()); err == nil {
+				t.Fatal("export error swallowed")
+			}
+			if next.calls != 1 {
+				t.Fatalf("downstream called %d times", next.calls)
+			}
+		})
+	}
+}
+
+// The (nil, nil) guard has to hold on the REFRESH path too: a resolve that
+// starts returning nothing must leave the last good pod in place rather than
+// stamping an empty one. (Deleting the guard in fetch used to leave the whole
+// package green.)
+func TestPollNilRefreshKeepsLastGoodValue(t *testing.T) {
+	var calls atomic.Int32
+	resolve := func(context.Context) (*kubemeta.Pod, error) {
+		if calls.Add(1) == 1 {
+			return testPod(), nil
+		}
+		return nil, nil // no error, no value: not a successful resolution
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	get := Poll(ctx, resolve, PollConfig[kubemeta.Pod]{Refresh: 2 * time.Millisecond, Log: discardLog()})
+
+	deadline := time.Now().Add(30 * time.Second)
+	for calls.Load() < 4 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if p := get(); p == nil || p.Name != "kubescrape-agent-xyz" {
+		t.Fatalf("provider = %+v after nil refreshes; want the last good pod", p)
+	}
+}
+
+// The "neither namespace source available" branch runs deterministically —
+// including inside a pod, where the ServiceAccount projection exists and the
+// assertion would otherwise silently pass without executing.
+func TestNamespaceWithoutAnySource(t *testing.T) {
+	t.Setenv("POD_NAMESPACE", "")
+	defer func(p string) { namespaceProjection = p }(namespaceProjection)
+	namespaceProjection = filepath.Join(t.TempDir(), "does-not-exist")
+	if ns := Namespace(); ns != "" {
+		t.Fatalf("Namespace() = %q with no env and no projection; a guessed namespace is worse than none", ns)
+	}
+}
+
+// The projection is read when the env is unset (the metadata service's only
+// source, since its Deployment wires no downward API).
+func TestNamespaceFromProjection(t *testing.T) {
+	t.Setenv("POD_NAMESPACE", "")
+	defer func(p string) { namespaceProjection = p }(namespaceProjection)
+	path := filepath.Join(t.TempDir(), "namespace")
+	if err := os.WriteFile(path, []byte("monitoring\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	namespaceProjection = path
+	if ns := Namespace(); ns != "monitoring" {
+		t.Fatalf("Namespace() = %q; want the trimmed projection value", ns)
+	}
 }

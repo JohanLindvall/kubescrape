@@ -28,12 +28,12 @@ names a metric or a label that is not registered.
 | `kubescrape_azure_token_refreshes_total` | `outcome` | Microsoft Entra token refreshes for the Event Hubs connection, by outcome (ok, error). |
 | `kubescrape_buffer_backlog_bytes` | `signal` | Undelivered bytes currently queued in the disk buffer, per signal (what -buffer-max-bytes caps). |
 | `kubescrape_buffer_dropped_total` | `signal` | Buffered batches dropped after a permanent collector rejection (bad payload, auth, unimplemented). |
-| `kubescrape_buffer_full_total` | `signal` | Batches the disk buffer refused because the undelivered backlog is at its cap: back-pressure for logs (the tailer rewinds and re-reads), a lost batch for producers that cannot rewind (scrape, self-metrics, log-metrics). |
+| `kubescrape_buffer_full_total` | `signal` | Batches the disk buffer refused: the undelivered backlog is at its cap, or one batch exceeds the whole cap. Back-pressure for logs (the tailer rewinds and re-reads), a lost batch for producers that cannot rewind (scrape, self-metrics, log-metrics). |
 | `kubescrape_buffer_max_bytes` | `signal` | Configured disk-buffer cap per signal (0 = uncapped); backlog/max is the utilisation to alert on. |
-| `kubescrape_buffer_read_errors_total` | `signal`, `lost` | Disk-buffer read failures while draining (the head frame could not be read; lost=true means the segment was gone and its frames were skipped). |
+| `kubescrape_buffer_read_errors_total` | `signal`, `lost` | Disk-buffer read failures while draining. lost=true is reported corruption the queue advanced past (its Stats carry the magnitude); lost=false left the queue in place for a retry. |
 | `kubescrape_buffer_requeued_total` | `signal` | Buffered batches moved to the back of the queue after repeated transient failures (keeps one stuck batch from blocking the signal). |
 | `kubescrape_buffer_segments` | `signal` | Disk-buffer segment files on disk per signal. Physical footprint can exceed the backlog by up to one segment (a delivered but unreclaimed prefix). |
-| `kubescrape_buffer_truncated_bytes_total` | `signal` | Bytes discarded by truncating a damaged or torn disk-buffer segment tail at open. |
+| `kubescrape_buffer_truncated_bytes_total` | `signal` | Bytes the disk buffer lost to damage discovered at open (truncated, dropped or foreign segments). |
 | `kubescrape_event_position_errors_total` | `operation` | Failures reading or writing the event position ConfigMap, by operation (load, save). |
 | `kubescrape_event_relists_total` | `stage` | Event watches that fell back to a relist because the stored resourceVersion had aged out of the API server's watch window. |
 | `kubescrape_event_watch_restarts_total` | — | Event watch restarts (a closed stream, an error, or an expired resourceVersion). |

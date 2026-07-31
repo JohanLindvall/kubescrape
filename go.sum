@@ -1,5 +1,7 @@
 github.com/JohanLindvall/bufpool v0.2.1 h1:0kd6sTt+ch6lQtbqEyNNpr5gKNeysV6fMp5cbRFRsL8=
 github.com/JohanLindvall/bufpool v0.2.1/go.mod h1:W7ZBmQQd7vuO5e5rCtvF8ORIVksJT7kF/+W9ZvnSQaQ=
+github.com/JohanLindvall/diskqueue v0.0.4 h1:Fk04H/9av2KBxTVt/rgDhVoVixOWPMFso3DNyMssmII=
+github.com/JohanLindvall/diskqueue v0.0.4/go.mod h1:eeiOq7kMcqGWbbx/qsZplndd7Nnd7dRX+/BD/2pSGVQ=
 github.com/JohanLindvall/enrich v0.1.5 h1:8zAFg2nI1dl/lzzIUW8uiIuw78nh0e/+YR79+BMH77Q=
 github.com/JohanLindvall/enrich v0.1.5/go.mod h1:Pn92m7DnbPoP2oLi+gsrZidP1R+T2z8tuWf9lzyLZkM=
 github.com/JohanLindvall/lightning v0.0.62 h1:lg/gG5wzgdWOsnuzK8kiQGt9W6kniT6b1FgphzJdotg=

@@ -5,7 +5,6 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
-	"os"
 	"sync"
 	"time"
 
@@ -16,8 +15,9 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
+	"github.com/JohanLindvall/diskqueue"
+
 	"github.com/JohanLindvall/kubescrape/internal/obs"
-	"github.com/JohanLindvall/kubescrape/pkg/spool"
 )
 
 // Exporter exports logs and metrics; implemented by *Client and *Buffered, so
@@ -37,22 +37,133 @@ type TracesExporter interface {
 
 // Buffered is a disk-backed write-ahead buffer in front of an exporter, for
 // both logs and metrics. Export{Logs,Metrics} serialize the batch and append it
-// to a durable on-disk spool (one per signal), returning as soon as it is
-// persisted — so producers can commit their progress and source logs may rotate
-// away while their data waits on the node. Run drains each spool to the real
-// exporter with retries; a batch is removed only after the collector
-// acknowledges it (at-least-once, surviving restarts). A full spool makes
-// Export return spool.ErrFull, which the tailer treats as a failure and rewinds
-// — bounding disk use and back-pressuring to the source.
+// to a durable on-disk queue (github.com/JohanLindvall/diskqueue, one per
+// signal), returning as soon as it is persisted — so producers can commit
+// their progress and source logs may rotate away while their data waits on the
+// node. Run drains each queue to the real exporter with retries; a batch is
+// removed only after the collector acknowledges it (at-least-once, surviving
+// restarts). A full queue makes Export return diskqueue.ErrFull, which the
+// tailer treats as a failure and rewinds — bounding disk use and
+// back-pressuring to the source.
 type Buffered struct {
-	inner   Exporter // direct path for a signal with no spool
+	inner   Exporter // direct path for a signal with no buffer
 	logs    *sink[plog.Logs]
 	metrics *sink[pmetric.Metrics]
 }
 
-// NewBuffered wraps inner. logSpool and metricSpool back the two signals;
-// either may be nil to leave that signal unbuffered (exported directly).
-func NewBuffered(inner Exporter, logSpool, metricSpool *spool.Spool, backoff time.Duration, log *slog.Logger) *Buffered {
+// Buffer is one signal's durable queue plus what recovering from a latched
+// I/O failure needs. diskqueue latches a failed fsync (every later Add,
+// commit and Sync returns ErrIO — a retried fsync can report success over
+// pages the kernel already dropped) and its documented recovery is
+// close-and-reopen; recover does exactly that, guarded so the enqueue side
+// (producer goroutines) and the drain side never race the swap.
+type Buffer struct {
+	mu   sync.RWMutex
+	q    *diskqueue.Queue[[]byte]
+	rd   *diskqueue.Reader[[]byte]
+	dir  string
+	opts diskqueue.Options
+}
+
+// marshalBytes/unmarshalBytes are the identity codec: the sink owns the pdata
+// (un)marshaling, the queue stores opaque bytes. unmarshalBytes ALIASES the
+// reader's buffer — valid until that reader's next read — which the single
+// drain goroutine respects: every use of a reserved payload (pdata unmarshal,
+// stuck-tracking hash) happens before it touches the queue again.
+func marshalBytes(dst []byte, v []byte) ([]byte, error) { return append(dst, v...), nil }
+func unmarshalBytes(data []byte) ([]byte, error)        { return data, nil }
+
+// OpenBuffer opens (or creates) one signal's queue directory. maxBytes caps
+// the undelivered backlog (0 = uncapped); the segment-count cap is disabled —
+// MaxBytes is the one knob operators size, and a count cap would bind behind
+// its back at 32 x 8 MiB — with open descriptors bounded instead.
+func OpenBuffer(dir string, maxBytes int64) (*Buffer, error) {
+	opts := diskqueue.Options{
+		MaxBytes:     maxBytes,
+		MaxSegments:  -1, // unbounded: MaxBytes is the budget
+		MaxOpenFiles: 8,  // a deep backlog must not hold an fd per segment
+	}
+	q, err := diskqueue.New[[]byte](dir, marshalBytes, unmarshalBytes, opts)
+	if err != nil {
+		return nil, err
+	}
+	return &Buffer{q: q, rd: q.NewReader(), dir: dir, opts: opts}, nil
+}
+
+// handles returns the current queue/reader pair; recover swaps them.
+func (b *Buffer) handles() (*diskqueue.Queue[[]byte], *diskqueue.Reader[[]byte]) {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	return b.q, b.rd
+}
+
+// add durably enqueues one payload.
+func (b *Buffer) add(data []byte) error {
+	q, _ := b.handles()
+	err := q.Add(data)
+	if errors.Is(err, diskqueue.ErrIO) {
+		b.recover(q)
+	}
+	return err
+}
+
+// Bytes is the undelivered backlog in bytes (in-flight reservations
+// included — they are uncommitted until the collector acks).
+func (b *Buffer) Bytes() int64 { return b.stats().BacklogBytes }
+
+// stats snapshots the queue's occupancy.
+func (b *Buffer) stats() diskqueue.Stats {
+	q, _ := b.handles()
+	return q.Stats()
+}
+
+// rewindQ returns in-flight (reserved, uncommitted) records to the queue — the
+// bulk nack used when a send is cancelled or a stuck head goes back for
+// rotation.
+func (b *Buffer) rewindQ() {
+	q, _ := b.handles()
+	if _, err := q.Rewind(); err != nil && queueDead(err) {
+		b.recover(q)
+	}
+}
+
+// Close flushes and closes the queue; the error is worth logging — a latched
+// I/O failure surfaces here.
+func (b *Buffer) Close() error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.q.Close()
+}
+
+// recover replaces a queue whose durability failed (latched ErrIO) or that was
+// closed under the caller, per diskqueue's close-and-reopen contract. prev
+// guards the swap: whichever caller loses the race sees b.q already replaced
+// and does nothing. On a reopen failure the closed queue stays in place — its
+// ErrClosed sends the next caller back here, so the reopen retries at the
+// callers' own cadence rather than hot-looping.
+func (b *Buffer) recover(prev *diskqueue.Queue[[]byte]) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.q != prev {
+		return
+	}
+	_ = b.q.Close()
+	q, err := diskqueue.New[[]byte](b.dir, marshalBytes, unmarshalBytes, b.opts)
+	if err != nil {
+		return
+	}
+	b.q = q
+	b.rd = q.NewReader()
+}
+
+// queueDead reports an error that poisons the queue handle (recover applies).
+func queueDead(err error) bool {
+	return errors.Is(err, diskqueue.ErrIO) || errors.Is(err, diskqueue.ErrClosed)
+}
+
+// NewBuffered wraps inner. logBuf and metricBuf back the two signals; either
+// may be nil to leave that signal unbuffered (exported directly).
+func NewBuffered(inner Exporter, logBuf, metricBuf *Buffer, backoff time.Duration, log *slog.Logger) *Buffered {
 	if backoff <= 0 {
 		backoff = time.Second
 	}
@@ -71,33 +182,34 @@ func NewBuffered(inner Exporter, logSpool, metricSpool *spool.Spool, backoff tim
 	case *PerSignal:
 		sendLogs, sendMetrics = c.logsClient().exportLogsCounted, c.metricsClient().exportMetricsCounted
 	}
-	// Report what a damaged tail cost at open: the spool cannot (it must not
-	// import internal/obs), and nothing else ever sees those bytes.
-	for kind, sp := range map[string]*spool.Spool{"logs": logSpool, "metrics": metricSpool} {
-		if sp == nil {
+	// Report what corruption cost at open: everything the recovery scan
+	// dropped or truncated away is data no drain will ever see.
+	for kind, buf := range map[string]*Buffer{"logs": logBuf, "metrics": metricBuf} {
+		if buf == nil {
 			continue
 		}
-		if lost := sp.Discarded(); lost > 0 {
+		st := buf.stats()
+		if lost := st.LostBytes + st.ForeignBytes + st.DiscardedBytes; lost > 0 {
 			obs.BufferTruncated.WithLabelValues(kind).Add(float64(lost))
-			log.Error("disk buffer segment tail truncated at open; buffered records were destroyed",
-				"signal", kind, "bytes_discarded", lost)
+			log.Error("disk buffer lost data to damage discovered at open",
+				"signal", kind, "bytes_lost", lost)
 		}
 	}
-	if logSpool != nil {
+	if logBuf != nil {
 		lm := plog.ProtoMarshaler{}
 		lu := plog.ProtoUnmarshaler{}
 		b.logs = &sink[plog.Logs]{
-			spool: logSpool, backoff: backoff, log: log, kind: "logs",
+			buf: logBuf, backoff: backoff, log: log, kind: "logs",
 			marshal:   lm.MarshalLogs,
 			unmarshal: lu.UnmarshalLogs,
 			send:      sendLogs,
 		}
 	}
-	if metricSpool != nil {
+	if metricBuf != nil {
 		mm := pmetric.ProtoMarshaler{}
 		mu := pmetric.ProtoUnmarshaler{}
 		b.metrics = &sink[pmetric.Metrics]{
-			spool: metricSpool, backoff: backoff, log: log, kind: "metrics",
+			buf: metricBuf, backoff: backoff, log: log, kind: "metrics",
 			marshal:   mm.MarshalMetrics,
 			unmarshal: mu.UnmarshalMetrics,
 			send:      sendMetrics,
@@ -146,11 +258,12 @@ func (b *Buffered) Run(ctx context.Context) {
 // a filling buffer visible BEFORE it starts refusing writes.
 func (b *Buffered) Stats() map[string]obs.BufferStat {
 	out := map[string]obs.BufferStat{}
-	for kind, sp := range map[string]*spool.Spool{"logs": b.logs.spoolOf(), "metrics": b.metrics.spoolOf()} {
-		if sp == nil {
+	for kind, buf := range map[string]*Buffer{"logs": b.logs.bufOf(), "metrics": b.metrics.bufOf()} {
+		if buf == nil {
 			continue
 		}
-		out[kind] = obs.BufferStat{Backlog: sp.Bytes(), Cap: sp.Cap(), Segments: sp.Segments()}
+		st := buf.stats()
+		out[kind] = obs.BufferStat{Backlog: st.BacklogBytes, Cap: st.MaxBytes, Segments: st.Segments}
 	}
 	return out
 }
@@ -174,10 +287,10 @@ func (b *Buffered) FinalDrain(ctx context.Context) {
 	wg.Wait()
 }
 
-// sink is one signal's buffer: a spool plus the (un)marshal and send functions
+// sink is one signal's buffer: a queue plus the (un)marshal and send functions
 // for its pdata type.
 type sink[T any] struct {
-	spool     *spool.Spool
+	buf       *Buffer
 	marshal   func(T) ([]byte, error)
 	unmarshal func([]byte) (T, error)
 	send      func(context.Context, T) error
@@ -226,25 +339,25 @@ func (s *sink[T]) enqueue(v T) error {
 	if err != nil {
 		return err
 	}
-	err = s.spool.Append(data)
-	if errors.Is(err, spool.ErrFull) {
+	err = s.buf.add(data)
+	if errors.Is(err, diskqueue.ErrFull) || errors.Is(err, diskqueue.ErrRecordTooLarge) {
 		// Back-pressure for logs (the tailer rewinds and re-reads), but a lost
 		// batch for every producer that cannot rewind — the scraper, the
 		// self-metrics registry, the log-metric exporter. Count it: an
 		// undelivered metric batch must never disappear silently.
+		// ErrRecordTooLarge is one batch larger than the whole cap — a config
+		// problem, but the producer-facing handling is the same refusal.
 		obs.BufferFull.WithLabelValues(s.kind).Inc()
 	}
 	return err
 }
 
-// drain sends queued batches to the exporter until ctx is done. A nil sink (its
-// signal unbuffered) returns immediately.
-// spoolOf returns the sink's spool, nil-safe (a signal can be disabled).
-func (s *sink[T]) spoolOf() *spool.Spool {
+// bufOf returns the sink's buffer, nil-safe (a signal can be disabled).
+func (s *sink[T]) bufOf() *Buffer {
 	if s == nil {
 		return nil
 	}
-	return s.spool
+	return s.buf
 }
 
 func (s *sink[T]) drain(ctx context.Context) { s.drainLoop(ctx, false) }
@@ -258,29 +371,52 @@ func (s *sink[T]) drainLoop(ctx context.Context, untilEmpty bool) {
 		return
 	}
 	for {
-		data, commit, ok, err := s.spool.Pop()
+		q, rd := s.buf.handles()
+		var (
+			data []byte
+			ok   bool
+			off  int64
+			err  error
+		)
+		if untilEmpty {
+			data, ok, off, err = rd.TryReserve()
+		} else {
+			// Reserve blocks until a record arrives (or ctx ends) — the
+			// queue's own wakeup replaces the old signal-channel machinery.
+			data, ok, off, err = rd.Reserve(ctx)
+		}
 		if err != nil {
-			// Both classes drop data and advance: a vanished head segment, and
-			// a frame (or segment) the integrity check rejected. Anything else
-			// is a transient read error that leaves the queue where it was.
-			lost := "false"
-			if errors.Is(err, os.ErrNotExist) || errors.Is(err, spool.ErrCorrupt) {
-				lost = "true"
+			if ctx.Err() != nil {
+				return
 			}
-			obs.BufferReadErrors.WithLabelValues(s.kind, lost).Inc()
+			// ErrCorrupt is REPORTED loss: the queue already advanced past the
+			// damage (its Stats carry the magnitude), so the drain just counts
+			// and keeps going. Anything else leaves the queue where it was; a
+			// dead handle (latched I/O failure, or a close under us) is
+			// replaced per diskqueue's close-and-reopen contract.
+			lost := errors.Is(err, diskqueue.ErrCorrupt)
+			obs.BufferReadErrors.WithLabelValues(s.kind, boolLabel(lost)).Inc()
 			s.log.Error("disk buffer read failed", "signal", s.kind, "data_lost", lost, "error", err)
+			if queueDead(err) {
+				s.buf.recover(q)
+			}
+			if !lost {
+				if untilEmpty {
+					return // a dead disk must not spin the bounded shutdown pass
+				}
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(time.Second):
+				}
+			}
+			continue
 		}
 		if !ok {
 			if untilEmpty {
-				return // spool dry: the shutdown pass is done
+				return // queue dry: the shutdown pass is done
 			}
-			select {
-			case <-ctx.Done():
-				return
-			case <-s.spool.Signal():
-			case <-time.After(time.Second):
-			}
-			continue
+			continue // blocking Reserve yields !ok only on ctx/close; re-check both
 		}
 		v, err := s.unmarshal(data)
 		if err != nil {
@@ -288,51 +424,73 @@ func (s *sink[T]) drainLoop(ctx context.Context, untilEmpty bool) {
 			// must be counted like every other one.
 			obs.BufferDropped.WithLabelValues(s.kind).Inc()
 			s.log.Warn("dropping corrupt buffered batch", "signal", s.kind, "error", err)
-			commit()
+			s.commit(rd, off)
 			continue
 		}
 		switch s.trySend(ctx, v) {
 		case sendOK:
-			commit()
-			s.delivered++  // proof the collector is alive: see stuckTooLong
-			s.forget(data) // a previously-stuck payload that recovered
+			s.forget(data) // a previously-stuck payload that recovered; hash before the next queue op
+			s.commit(rd, off)
+			s.delivered++ // proof the collector is alive: see stuckTooLong
 		case sendCancelled:
-			return // ctx cancelled mid-send; leave it queued
+			// ctx cancelled mid-send: nack the reservation so the batch is
+			// queued for the next run (or the final drain).
+			s.buf.rewindQ()
+			return
 		case sendRejected:
 			// A definitive rejection (bad payload, auth, unimplemented):
 			// retrying cannot fix it and keeping it would block the queue.
 			s.log.Error("dropping buffered batch permanently rejected by the collector", "signal", s.kind)
 			obs.BufferDropped.WithLabelValues(s.kind).Inc()
-			commit()
 			s.forget(data) // a batch that got stuck then turned permanent must not leak its entry
+			s.commit(rd, off)
 		case sendStuck:
-			// Repeated transient failures: rotate the batch to the back of the
-			// queue so one undeliverable batch cannot block the signal —
-			// delivery keeps being attempted every cycle. Requeueing is
-			// pointless churn (a full rewrite + fsync) when this is the only
-			// queued batch, so it stays at the head then. If the spool is full
-			// the batch also stays put and the next loop retries in place.
+			// Repeated transient failures. Commits are a cursor — nothing
+			// behind the head can retire first — so the batch goes back to the
+			// head (Rewind) and, when anything is queued behind it, rotates to
+			// the back (Requeue, exempt from the caps since diskqueue v0.0.4:
+			// a full queue must not pin a poison head, or nothing ever drains,
+			// sawProgress never arms, and the signal wedges across restarts).
+			// Rotating an only batch is pointless churn; it retries at the
+			// head. NOTE the hash in stuckTooLong happens before Requeue —
+			// Requeue clobbers the reader buffer data aliases.
 			if s.stuckTooLong(data) {
 				s.log.Error("dropping buffered batch the collector never accepted",
 					"signal", s.kind, "cycles", maxDrainCycles, "bytes", len(data))
 				obs.BufferDropped.WithLabelValues(s.kind).Inc()
-				commit()
+				s.commit(rd, off)
 				continue
 			}
-			if s.spool.Bytes() > int64(len(data))+spool.FrameOverhead {
-				// AppendForce, not Append: the rotate is size-neutral (commit
-				// removes the head frame right after), so a FULL spool must not
-				// make it fail with ErrFull — that would leave the head
-				// uncommitted, so nothing behind it ever drains, s.delivered
-				// never advances, sawProgress never arms, and a poison head at
-				// the cap wedges the whole signal permanently across restarts.
-				if err := s.spool.AppendForce(data); err == nil {
+			s.buf.rewindQ()
+			if s.buf.stats().Backlog > 1 {
+				if requeued, rerr := rd.Requeue(); rerr == nil && requeued {
 					obs.BufferRequeued.WithLabelValues(s.kind).Inc()
-					commit()
+				} else if rerr != nil && queueDead(rerr) {
+					s.buf.recover(q)
 				}
 			}
 		}
 	}
+}
+
+// commit retires one delivered (or dropped) record; a dead queue handle is
+// replaced, and the record simply redelivers after the reopen — at-least-once
+// duplicates, never loss.
+func (s *sink[T]) commit(rd *diskqueue.Reader[[]byte], off int64) {
+	if err := rd.Commit(off); err != nil {
+		s.log.Warn("disk buffer commit failed; the batch will redeliver", "signal", s.kind, "error", err)
+		if queueDead(err) {
+			q, _ := s.buf.handles()
+			s.buf.recover(q)
+		}
+	}
+}
+
+func boolLabel(b bool) string {
+	if b {
+		return "true"
+	}
+	return "false"
 }
 
 // stuckTooLong records another failed drain cycle for this payload and reports

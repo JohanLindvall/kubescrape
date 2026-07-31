@@ -9,13 +9,14 @@ import (
 	"testing"
 	"time"
 
+	"github.com/JohanLindvall/diskqueue"
+
 	"go.opentelemetry.io/collector/pdata/plog"
 	"go.opentelemetry.io/collector/pdata/pmetric"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
 	"github.com/JohanLindvall/kubescrape/internal/obs"
-	"github.com/JohanLindvall/kubescrape/pkg/spool"
 )
 
 // audit_test.go: targeted tests from the 2026-07 audit.
@@ -73,7 +74,7 @@ func TestIsPermanentClassification(t *testing.T) {
 		{"grpc Unauthenticated", status.Error(codes.Unauthenticated, "token"), false},
 		{"grpc DeadlineExceeded", status.Error(codes.DeadlineExceeded, "timeout"), false},
 		{"plain error", errors.New("dial tcp: connection refused"), false},
-		{"spool full", spool.ErrFull, false},
+		{"spool full", diskqueue.ErrFull, false},
 	}
 	for _, tc := range cases {
 		if got := IsPermanent(tc.err); got != tc.want {
@@ -91,12 +92,12 @@ func TestIsPermanentClassification(t *testing.T) {
 func TestPoisonBatchIsDroppedOnceCollectorTakesOthers(t *testing.T) {
 	send := &selectiveSender{reject: "huge", err: status.Error(codes.ResourceExhausted, "grpc: received message larger than max")}
 	dir := t.TempDir()
-	ls, err := spool.Open(dir+"/logs", spool.Options{})
+	ls, err := OpenBuffer(dir+"/logs", 0)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer func() { _ = ls.Close() }()
-	ms, err := spool.Open(dir+"/metrics", spool.Options{})
+	ms, err := OpenBuffer(dir+"/metrics", 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -134,12 +135,12 @@ func TestPoisonBatchIsDroppedOnceCollectorTakesOthers(t *testing.T) {
 func TestOutageNeverDropsBufferedData(t *testing.T) {
 	send := &failSender{err: status.Error(codes.Unavailable, "collector down")}
 	dir := t.TempDir()
-	ls, err := spool.Open(dir+"/logs", spool.Options{})
+	ls, err := OpenBuffer(dir+"/logs", 0)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer func() { _ = ls.Close() }()
-	ms, err := spool.Open(dir+"/metrics", spool.Options{})
+	ms, err := OpenBuffer(dir+"/metrics", 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -213,7 +214,7 @@ func TestPermanentRejectionDoesNotBlockQueue(t *testing.T) {
 	defer func() { _ = ls.Close() }()
 	defer func() { _ = ms.Close() }()
 	_ = b
-	if err := ms.Append([]byte("not protobuf")); err != nil {
+	if err := ms.add([]byte("not protobuf")); err != nil {
 		t.Fatal(err)
 	}
 	if err := b.ExportMetrics(context.Background(), metricsWith("cpu")); err != nil {

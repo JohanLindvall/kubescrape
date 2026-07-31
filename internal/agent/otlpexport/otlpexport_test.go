@@ -16,7 +16,6 @@ import (
 
 	"github.com/klauspost/compress/gzip"
 
-	"github.com/JohanLindvall/kubescrape/pkg/spool"
 	"go.opentelemetry.io/collector/pdata/plog"
 	"go.opentelemetry.io/collector/pdata/plog/plogotlp"
 	"go.opentelemetry.io/collector/pdata/pmetric"
@@ -296,7 +295,7 @@ func TestHTTPTracesExport(t *testing.T) {
 // Buffered passes traces through to the inner exporter unbuffered, and
 // reports a clear error when the inner exporter cannot handle traces.
 func TestBufferedTracesPassthrough(t *testing.T) {
-	ls, err := spool.Open(t.TempDir(), spool.Options{})
+	ls, err := OpenBuffer(t.TempDir(), 0)
 	if err != nil {
 		t.Fatal(err)
 	}

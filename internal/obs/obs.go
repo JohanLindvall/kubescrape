@@ -51,21 +51,21 @@ var (
 	MonitorParseErrors = Registry.CounterVec("kubescrape_monitor_parse_errors_total",
 		"Monitor upserts that failed to parse and were dropped from the index.", "kind")
 
-	// BufferTruncated counts bytes destroyed when a damaged or torn segment
-	// tail was truncated at open. A crash mid-append costs one incomplete frame;
-	// anything larger means corruption cost fsynced records — the one loss path
-	// in the spool that no Pop can report.
+	// BufferTruncated counts bytes the disk buffer lost to damage discovered
+	// at OPEN (truncated tails, dropped or foreign segments — diskqueue's
+	// open-time loss counters). A crash mid-append costs one torn record;
+	// anything larger means corruption cost fsynced records.
 	BufferTruncated = Registry.CounterVec("kubescrape_buffer_truncated_bytes_total",
-		"Bytes discarded by truncating a damaged or torn disk-buffer segment tail at open.", "signal")
+		"Bytes the disk buffer lost to damage discovered at open (truncated, dropped or foreign segments).", "signal")
 
 	BufferDropped = Registry.CounterVec("kubescrape_buffer_dropped_total",
 		"Buffered batches dropped after a permanent collector rejection (bad payload, auth, unimplemented).", "signal")
 	BufferRequeued = Registry.CounterVec("kubescrape_buffer_requeued_total",
 		"Buffered batches moved to the back of the queue after repeated transient failures (keeps one stuck batch from blocking the signal).", "signal")
 	BufferFull = Registry.CounterVec("kubescrape_buffer_full_total",
-		"Batches the disk buffer refused because the undelivered backlog is at its cap: back-pressure for logs (the tailer rewinds and re-reads), a lost batch for producers that cannot rewind (scrape, self-metrics, log-metrics).", "signal")
+		"Batches the disk buffer refused: the undelivered backlog is at its cap, or one batch exceeds the whole cap. Back-pressure for logs (the tailer rewinds and re-reads), a lost batch for producers that cannot rewind (scrape, self-metrics, log-metrics).", "signal")
 	BufferReadErrors = Registry.CounterVec("kubescrape_buffer_read_errors_total",
-		"Disk-buffer read failures while draining (the head frame could not be read; lost=true means the segment was gone and its frames were skipped).", "signal", "lost")
+		"Disk-buffer read failures while draining. lost=true is reported corruption the queue advanced past (its Stats carry the magnitude); lost=false left the queue in place for a retry.", "signal", "lost")
 	LogFifoDropped = Registry.Counter("kubescrape_log_fifo_orphans_total",
 		"Stale per-line offset entries discarded because the multiline stage dropped over-limit lines it never emitted.")
 	PositionsCorrupt = Registry.Counter("kubescrape_positions_corrupt_total",

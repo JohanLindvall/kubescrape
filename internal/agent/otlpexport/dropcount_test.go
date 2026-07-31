@@ -5,8 +5,9 @@ import (
 	"errors"
 	"testing"
 
+	"github.com/JohanLindvall/diskqueue"
+
 	"github.com/JohanLindvall/kubescrape/internal/obs"
-	"github.com/JohanLindvall/kubescrape/pkg/spool"
 )
 
 // TestFullSpoolCountsMetricDrop: a producer that cannot rewind (the scraper,
@@ -21,8 +22,11 @@ func TestFullSpoolCountsMetricDrop(t *testing.T) {
 
 	before := obs.BufferFull.WithLabelValues("metrics").Value()
 	err := b.ExportMetrics(context.Background(), metricsWith("cpu"))
-	if !errors.Is(err, spool.ErrFull) {
-		t.Fatalf("ExportMetrics err = %v, want ErrFull", err)
+	// The batch exceeds the whole 1-byte cap, which diskqueue reports as the
+	// permanent ErrRecordTooLarge rather than the transient ErrFull; both are
+	// refusals the producer sees and both count into BufferFull.
+	if !errors.Is(err, diskqueue.ErrRecordTooLarge) {
+		t.Fatalf("ExportMetrics err = %v, want ErrRecordTooLarge", err)
 	}
 	if got := obs.BufferFull.WithLabelValues("metrics").Value() - before; got != 1 {
 		t.Fatalf("BufferFull{metrics} rose by %v, want 1: a dropped metric batch must be counted", got)
@@ -39,7 +43,7 @@ func TestCorruptBatchDropIsCounted(t *testing.T) {
 	defer func() { _ = ms.Close() }()
 
 	// Append a frame the pmetric unmarshaler cannot decode.
-	if err := ms.Append([]byte("definitely not a protobuf payload")); err != nil {
+	if err := ms.add([]byte("definitely not a protobuf payload")); err != nil {
 		t.Fatal(err)
 	}
 	if err := b.ExportMetrics(context.Background(), metricsWith("cpu")); err != nil {

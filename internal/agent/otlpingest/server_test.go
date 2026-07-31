@@ -10,8 +10,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/JohanLindvall/diskqueue"
+
 	"github.com/JohanLindvall/kubescrape/internal/agent/otlpexport"
-	"github.com/JohanLindvall/kubescrape/pkg/spool"
 	"github.com/klauspost/compress/gzip"
 	"go.opentelemetry.io/collector/pdata/plog"
 	"go.opentelemetry.io/collector/pdata/plog/plogotlp"
@@ -174,7 +175,7 @@ func TestHTTPExportPermanentRejection(t *testing.T) {
 	}
 
 	// A retryable upstream condition (spool back-pressure) stays 503.
-	srv2 := httpTestServer(t, &errExporter{err: spool.ErrFull})
+	srv2 := httpTestServer(t, &errExporter{err: diskqueue.ErrFull})
 	resp2, err := http.Post(srv2.URL+"/v1/logs", "application/x-protobuf", bytes.NewReader(body))
 	if err != nil {
 		t.Fatal(err)
@@ -353,7 +354,7 @@ func TestGRPCForwardStatus(t *testing.T) {
 		err  error
 		want codes.Code
 	}{
-		{spool.ErrFull, codes.Unavailable},
+		{diskqueue.ErrFull, codes.Unavailable},
 		{&otlpexport.HTTPStatusError{Code: 503, Body: "overloaded"}, codes.Unavailable},
 		{&otlpexport.HTTPStatusError{Code: 429, Body: "slow down"}, codes.Unavailable},
 		{&otlpexport.HTTPStatusError{Code: 400, Body: "bad"}, codes.InvalidArgument},

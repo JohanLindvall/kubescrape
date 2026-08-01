@@ -187,3 +187,36 @@ func TestKeepSlowerThanAcceptsDurationString(t *testing.T) {
 		t.Fatal("a malformed keepSlowerThan must be rejected at startup")
 	}
 }
+
+// The all-kept fast path must PAY for what it forwards. It used to peek the
+// bucket without consuming, so every payload smaller than the current fill
+// bypassed the cap and the bucket refilled to full before the next one — a
+// 10/s cap forwarding 100 spans/s with reason="rate" at 0. The cap only bound
+// payloads that were ALSO losing spans to probability.
+func TestRateCapBindsWhenNothingIsSampledAway(t *testing.T) {
+	next := &capExporter{}
+	s := New(Config{MaxSpansPerSecond: 10}, next) // probability defaults to keep-all
+	now := time.Unix(0, 0)
+	s.now = func() time.Time { return now }
+
+	// Twenty payloads of five spans each, all within one second: 100 spans
+	// offered against a 10/s cap with a 10-span burst.
+	for i := 0; i < 20; i++ {
+		if err := s.ExportTraces(context.Background(), payload(5, false, 0)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := next.spans(); got > 10 {
+		t.Errorf("forwarded %d spans under a 10/s cap with a 10-span burst; the fast path never debited the bucket", got)
+	}
+
+	// And the cap still refills: a second later the next payload goes through.
+	now = now.Add(time.Second)
+	before := next.spans()
+	if err := s.ExportTraces(context.Background(), payload(5, false, 0)); err != nil {
+		t.Fatal(err)
+	}
+	if next.spans() == before {
+		t.Error("nothing forwarded after a full second of refill; the cap is now stuck shut")
+	}
+}

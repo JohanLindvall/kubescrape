@@ -182,21 +182,15 @@ func (s *Sampler) ExportTraces(ctx context.Context, td ptrace.Traces) error {
 }
 
 // wouldDrop reports whether any span in td would be dropped — the decision
-// pass that lets the common all-kept case skip the payload copy. It consumes
-// NO rate tokens (allow() mutates the bucket; the real pass does that), so
-// with a rate cap configured it conservatively reports true whenever tokens
-// might run out.
+// pass that lets the common all-kept case skip the payload copy.
+//
+// The probability scan comes FIRST and touches no state. Only when every span
+// survives it does the rate cap get consulted, and there it CONSUMES the whole
+// payload's tokens: taking the fast path means these spans ship, so they must
+// be paid for. Charging before the probability scan would over-charge for
+// spans that never ship — the per-span path in ExportTraces bills those one at
+// a time, after their own probability check, which is the same accounting.
 func (s *Sampler) wouldDrop(td ptrace.Traces) bool {
-	if s.rate > 0 {
-		// A rate cap does not mean this payload loses anything: when the bucket
-		// holds enough tokens for every span, the copy is pure waste — and this
-		// runs on the ingest path, where the payload can be megabytes. Peek
-		// WITHOUT consuming (the real pass does the accounting); if the bucket
-		// might run out, fall back to the copying path.
-		if float64(td.SpanCount()) > s.availableTokens() {
-			return true
-		}
-	}
 	rss := td.ResourceSpans()
 	for i := 0; i < rss.Len(); i++ {
 		sss := rss.At(i).ScopeSpans()
@@ -208,6 +202,11 @@ func (s *Sampler) wouldDrop(td ptrace.Traces) bool {
 				}
 			}
 		}
+	}
+	if s.rate > 0 && !s.consume(float64(td.SpanCount())) {
+		// Not enough tokens for the whole payload: the copying path bills and
+		// drops span by span, which is where a partial cap hit belongs.
+		return true
 	}
 	return false
 }
@@ -230,29 +229,37 @@ func (s *Sampler) keep(sp ptrace.Span) bool {
 	return xxhash.Sum64(id[:]) < s.threshold
 }
 
-// allow consumes one rate-cap token.
-// availableTokens reports the bucket's current fill without consuming any.
-func (s *Sampler) availableTokens() float64 {
+// consume takes n tokens if the bucket holds them, and reports whether it
+// did. All-or-nothing, so the fast path either pays for the whole payload or
+// hands it to the per-span path.
+//
+// The fast path MUST pay. It used to peek an availableTokens() that consumed
+// nothing and then forward the payload untouched, so any batch smaller than
+// the current bucket bypassed the cap entirely and the bucket refilled to
+// full before the next one: 100 spans/s sailed through a 10/s cap with
+// TraceSpansDropped{reason="rate"} sitting at 0. The cap only ever bound
+// payloads that were ALSO losing spans to probability.
+func (s *Sampler) consume(n float64) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	now := time.Now()
-	if !s.last.IsZero() {
-		return min(s.burst, s.tokens+s.rate*now.Sub(s.last).Seconds())
+	s.refillLocked()
+	if s.tokens < n {
+		return false
 	}
-	return s.tokens
+	s.tokens -= n
+	return true
 }
 
-func (s *Sampler) allow() bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+// refillLocked adds the tokens accrued since the last operation. It reads
+// s.now (the injectable clock), not time.Now: the two disagreed, so a test
+// driving the clock forward saw the bucket refill from wall time instead.
+func (s *Sampler) refillLocked() {
 	now := s.now()
 	if !s.last.IsZero() {
 		s.tokens = min(s.burst, s.tokens+s.rate*now.Sub(s.last).Seconds())
 	}
 	s.last = now
-	if s.tokens < 1 {
-		return false
-	}
-	s.tokens--
-	return true
 }
+
+// allow consumes one rate-cap token.
+func (s *Sampler) allow() bool { return s.consume(1) }

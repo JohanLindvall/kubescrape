@@ -49,6 +49,25 @@ type Buffered struct {
 	inner   Exporter // direct path for a signal with no buffer
 	logs    *sink[plog.Logs]
 	metrics *sink[pmetric.Metrics]
+	log     *slog.Logger
+	// drainGate holds ONE token, taken for the whole of Run and for the whole
+	// of FinalDrain. Both drive the same diskqueue Readers and the same
+	// per-sink bookkeeping (cur backoff, delivered, the stuck map), none of
+	// which is synchronised — it never needed to be while a single drain
+	// goroutine per signal owned it.
+	//
+	// FinalDrain is documented to run "once the producers have stopped", but
+	// the agent joins them on a BOUNDED budget and Run is one of them: a Run
+	// still inside a send cycle when the budget expires overlaps the FinalDrain
+	// that follows, so the two share that state with no happens-before between
+	// them. The token restores the one-drain-at-a-time invariant.
+	//
+	// A channel rather than a Mutex because the acquire must be CANCELLABLE:
+	// FinalDrain has to honour its own deadline instead of blocking behind a
+	// drain wedged against a dead collector, and giving up there is safe —
+	// nothing is committed until the collector acks, so whatever is still
+	// spooled redelivers on the next start of this pod on this node.
+	drainGate chan struct{}
 }
 
 // Buffer is one signal's durable queue plus what recovering from a latched
@@ -170,7 +189,8 @@ func NewBuffered(inner Exporter, logBuf, metricBuf *Buffer, backoff time.Duratio
 	if log == nil {
 		log = slog.Default()
 	}
-	b := &Buffered{inner: inner}
+	b := &Buffered{inner: inner, log: log, drainGate: make(chan struct{}, 1)}
+	b.drainGate <- struct{}{} // the token starts free: FinalDrain without a Run must not wait
 	// The drain owns retry policy; when the inner exporter is the raw client
 	// (or the per-signal mux over raw clients), bypass its own bounded retries
 	// so attempts do not multiply (drain x client = up to 15 wire sends per
@@ -244,8 +264,25 @@ func (b *Buffered) ExportMetrics(ctx context.Context, md pmetric.Metrics) error 
 	return b.metrics.enqueue(md)
 }
 
+// acquireDrain takes the single drain token, or reports false when ctx ends
+// first. See Buffered.drainGate.
+func (b *Buffered) acquireDrain(ctx context.Context) bool {
+	select {
+	case <-b.drainGate:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
+func (b *Buffered) releaseDrain() { b.drainGate <- struct{}{} }
+
 // Run drains both spools until ctx is done.
 func (b *Buffered) Run(ctx context.Context) {
+	if !b.acquireDrain(ctx) {
+		return // already cancelled, or another drain pass owns the queues
+	}
+	defer b.releaseDrain()
 	var wg sync.WaitGroup
 	for _, run := range []func(context.Context){b.logs.drain, b.metrics.drain} {
 		wg.Add(1)
@@ -286,7 +323,21 @@ func (b *Buffered) Stats() map[string]obs.BufferStat {
 // is committed, so the next start of this pod on this node redelivers it —
 // but it is not the same as "nothing is left behind", and the drain does not
 // wait for a straggler it cannot bound.
+//
+// Run is one of the goroutines joined on that budget, and it drives the same
+// queue readers and per-sink bookkeeping this pass does, so this first takes
+// the drain token (Buffered.drainGate) — waiting for a Run that has not
+// finished its cycle, WITHIN ctx. If the token does not come free in time this
+// returns having drained nothing rather than racing the running drain: the
+// spool is durable and redelivers, which is the better of the two outcomes a
+// spent shutdown budget leaves.
 func (b *Buffered) FinalDrain(ctx context.Context) {
+	if !b.acquireDrain(ctx) {
+		b.log.Warn("skipping the final disk-buffer drain: the background drain did not stop within the shutdown budget; " +
+			"the spool is durable and redelivers on the next start")
+		return
+	}
+	defer b.releaseDrain()
 	var wg sync.WaitGroup
 	for _, run := range []func(context.Context){b.logs.drainUntilEmpty, b.metrics.drainUntilEmpty} {
 		wg.Add(1)

@@ -12,6 +12,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"go.opentelemetry.io/collector/pdata/plog"
@@ -490,6 +491,51 @@ func (c *Client) grpcAuth(ctx context.Context) (context.Context, error) {
 	return metadata.AppendToOutgoingContext(ctx, "authorization", "Bearer "+token), nil
 }
 
+// pooledBody hands a pooled buffer to net/http without letting net/http
+// decide when it goes back to the pool.
+//
+// net/http closes a request body TWICE on a 301/302/303: the transport closes
+// it when it finishes writing, and Client.do closes it again at the bottom of
+// its redirect loop — BEFORE CheckRedirect is consulted, so refusing to follow
+// redirects (which this client does) cannot prevent it. bufpool's Close IS
+// Release, and while a second Release on the same handle is a no-op (it
+// detaches), the second CLOSE is not harmless: a redirect is answered before
+// the body has been read, so do()'s close can land while the transport's
+// writeLoop is still Reading — and Release resets the handle and hands the
+// storage back to a PACKAGE-LEVEL pool, under that read. The pool is shared
+// by every client in the process, so the buffer another export then gets is
+// one this one is still streaming.
+//
+// So Close is a no-op here and the release is ours. It happens only once the
+// buffer has been read to EOF — the transport is the sole reader and never
+// reads again after that — which is also what proves the writeLoop is done
+// with it. If the exchange ended before the body was fully written, the
+// buffer is simply left to the GC: one allocation, on a path that is already
+// failing, in exchange for never handing out live memory.
+type pooledBody struct {
+	buf      *bufpool.Buffer
+	consumed atomic.Bool
+}
+
+func (p *pooledBody) Read(b []byte) (int, error) {
+	n, err := p.buf.Read(b)
+	if err != nil { // io.EOF: nobody will read this buffer again
+		p.consumed.Store(true)
+	}
+	return n, err
+}
+
+// Close is what net/http calls — possibly twice. It must not release.
+func (p *pooledBody) Close() error { return nil }
+
+// release pools the buffer if the transport provably finished with it. The
+// CompareAndSwap makes it idempotent.
+func (p *pooledBody) release() {
+	if p.consumed.CompareAndSwap(true, false) {
+		p.buf.Release()
+	}
+}
+
 func (c *Client) httpPost(ctx context.Context, url string, body []byte) error {
 	token, err := c.bearer()
 	if err != nil {
@@ -497,26 +543,30 @@ func (c *Client) httpPost(ctx context.Context, url string, body []byte) error {
 	}
 	var bodyReader io.Reader = bytes.NewReader(body)
 	compressed := c.cfg.Compression == "gzip"
-	var gz *bufpool.Buffer
+	var pb *pooledBody
 	if compressed {
-		if gz, err = gzipBody(body); err != nil {
-			return err
+		gz, gerr := gzipBody(body)
+		if gerr != nil {
+			return gerr
 		}
-		bodyReader = gz
+		pb = &pooledBody{buf: gz}
+		bodyReader = pb
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bodyReader)
 	if err != nil {
-		if gz != nil {
-			gz.Release()
+		if pb != nil {
+			pb.buf.Release() // nothing has read it; safe to pool immediately
 		}
 		return err
 	}
-	if gz != nil {
+	if pb != nil {
 		// NewRequest doesn't recognize the pooled buffer type, so set the
 		// length explicitly (the body would go out chunked otherwise). Do NOT
 		// set req.GetBody: a transport-level replay after the first attempt
 		// closes (releases) the buffer would read reused memory.
-		req.ContentLength = int64(gz.Len())
+		req.ContentLength = int64(pb.buf.Len())
+		// Released HERE, never by net/http: see pooledBody.
+		defer pb.release()
 	}
 	req.Header.Set("Content-Type", "application/x-protobuf")
 	if compressed {
@@ -528,7 +578,6 @@ func (c *Client) httpPost(ctx context.Context, url string, body []byte) error {
 	for k, v := range c.cfg.Headers {
 		req.Header.Set(k, v)
 	}
-	// Do closes the request body even on error, returning gz to its pool.
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return err

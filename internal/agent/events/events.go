@@ -138,6 +138,19 @@ type Reader struct {
 	// lookup. The next stream is positioned by the committed resourceVersion
 	// and starts false on its own.
 	replaying bool
+	// replayFrom is the watermark the CURRENT replay filters against, frozen
+	// when the stream started.
+	//
+	// It cannot be committed.Watermark, which every flush advances to its
+	// batch maximum: a relist delivers the backlog in STORE order, not time
+	// order, so the first acked batch raised the live watermark past events
+	// still to come and wanted() dropped them as "already exported" when they
+	// never were. That destroyed exactly the gap the relist exists to recover,
+	// silently and uncounted, and settle's committed max meant a restart could
+	// not reach it either. Frozen at stream start, the filter answers the only
+	// question it should: was this event already exported BEFORE this replay
+	// began?
+	replayFrom time.Time
 	// relist forces the next stream to start from "" (the full TTL backlog)
 	// after the API server dropped our resourceVersion. See expire.
 	relist bool
@@ -290,6 +303,8 @@ func (r *Reader) stream(ctx context.Context) error {
 	// cold start-from-beginning); anything else is positioned exactly by the
 	// API server and delivers only what follows.
 	r.replaying = rv == ""
+	// Snapshot, not a live read: see replayFrom.
+	r.replayFrom = r.committed.Watermark
 	if redelivers && len(r.batch) > 0 {
 		// Everything buffered is AFTER rv (entries only outlive a flush that
 		// failed, and the position never advanced past them), so this watch
@@ -451,11 +466,11 @@ func (r *Reader) handle(ctx context.Context, ev watch.Event) error {
 // the position ConfigMap: the blackout then survived restarts and leader
 // handover.
 func (r *Reader) wanted(e *corev1.Event) bool {
-	if !r.replaying || r.committed.Watermark.IsZero() {
+	if !r.replaying || r.replayFrom.IsZero() {
 		return true
 	}
 	when := eventTime(e)
-	return when.IsZero() || !when.Before(r.committed.Watermark)
+	return when.IsZero() || !when.Before(r.replayFrom)
 }
 
 // flush exports the batch; the position advances only after the collector

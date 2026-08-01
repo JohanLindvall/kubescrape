@@ -207,7 +207,8 @@ func TestWatermarkFiltersReplay(t *testing.T) {
 	r, _, _ := newReader(t, Config{})
 	base := time.Now()
 	r.committed.Watermark = base
-	r.replaying = true // the state a relist establishes (stream started from "")
+	r.replaying = true  // the state a relist establishes (stream started from "")
+	r.replayFrom = base // frozen by stream() from the committed watermark
 
 	if r.wanted(event("old", "R", "m", "Normal", "1", 1, base.Add(-time.Minute))) {
 		t.Fatal("an event older than the watermark must be filtered")
@@ -696,5 +697,34 @@ func TestReplayingSurvivesCommitsAndBookmarks(t *testing.T) {
 	}
 	if r.committed.ResourceVersion != "120" {
 		t.Fatalf("idle bookmark not applied, got %q", r.committed.ResourceVersion)
+	}
+}
+
+// A relist delivers the backlog in STORE order, not time order, so a batch
+// committed mid-replay routinely carries a timestamp NEWER than events still
+// to come. Filtering against the live committed watermark therefore dropped
+// those as "already exported" when they never were — destroying exactly the
+// gap the relist exists to recover, silently, and unrecoverably (settle
+// commits the batch maximum, so a restart cannot reach back either).
+func TestReplayFilterIsFrozenAtStreamStart(t *testing.T) {
+	r, _, _ := newReader(t, Config{})
+	base := time.Now()
+	r.committed.Watermark = base.Add(-time.Hour) // everything since is unexported
+	r.replaying = true
+	r.replayFrom = r.committed.Watermark
+
+	// A batch commits mid-replay carrying the newest event in the backlog.
+	r.committed.Watermark = base
+
+	// An event OLDER than that commit but newer than where the replay started
+	// is still owed: it must survive the filter.
+	owed := event("owed", "R", "m", "Normal", "7", 1, base.Add(-30*time.Minute))
+	if !r.wanted(owed) {
+		t.Fatal("an unexported event was dropped because a mid-replay commit advanced the live watermark past it")
+	}
+
+	// The frozen boundary still filters what really was exported before.
+	if r.wanted(event("done", "R", "m", "Normal", "8", 1, base.Add(-2*time.Hour))) {
+		t.Fatal("an event exported before this replay began was re-emitted")
 	}
 }

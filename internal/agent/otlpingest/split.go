@@ -234,11 +234,11 @@ func (g *metricGrouper) resource(id string) pmetric.ResourceMetrics {
 			return rm
 		}
 		mergeAttrs(g.enricher.builtAttrs(g.ctx, g.enrichCache, id), rm.Resource().Attributes())
-	} else if pod := g.enricher.peerPod(g.ctx); pod != nil {
+	} else if built := g.enricher.peerAttrs(g.ctx, g.enrichCache); built.Len() > 0 {
 		// No ID anywhere for these points: the opt-in peer-IP fallback still
-		// attributes them to the pushing pod.
+		// attributes them to the pushing pod (resolved once per request).
 		obs.Ingested.WithLabelValues("peer_ip").Inc()
-		g.enricher.build(pod, nil, rm.Resource().Attributes())
+		mergeAttrs(built, rm.Resource().Attributes())
 	} else {
 		// Nothing identified these points. They are still forwarded (under the
 		// unenriched source resource), but the outcome must show up in the

@@ -322,7 +322,12 @@ agent:
 # Ingress NetworkPolicies for both components, restricting each pod to the
 # ports the chart itself declares (the pprof port stays closed). Enabled BY
 # DEFAULT: the metadata API is unauthenticated by design, which makes network
-# policy the load-bearing compensating control — on a CNI without policy
+# Network policy. NOTE what these actually enforce: the ingress rules declare
+# which PORTS are reachable (so undeclared ones — pprof — are closed), but they
+# carry no `from` selector, so they do NOT restrict who may reach the declared
+# ones. The metadata API is unauthenticated by design and its documents are
+# object metadata the node's kubelet already has; if your threat model needs
+# the API restricted to the agents, add a `from` selector here.
 # enforcement the objects are inert, so the default costs nothing there.
 # Kubernetes events as OTLP logs. A CLUSTER-SINGLETON: this renders its own
 # single-replica Deployment of the agent binary with every per-node pipeline

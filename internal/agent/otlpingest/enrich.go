@@ -355,9 +355,9 @@ func (e *Enricher) applyMetadata(ctx context.Context, a pcommon.Map, cache map[s
 	cTok, cOK := e.tokenFrom(a, e.containerIDKeys, tokContainer)
 	uTok, uOK := e.tokenFrom(a, e.podUIDKeys, tokPodUID)
 	if !cOK && !uOK {
-		if pod := e.peerPod(ctx); pod != nil {
+		if built := e.peerAttrs(ctx, cache); built.Len() > 0 {
 			obs.Ingested.WithLabelValues("peer_ip").Inc()
-			e.build(pod, nil, a)
+			mergeAttrs(built, a)
 			return true
 		}
 		obs.Ingested.WithLabelValues("unresolved").Inc()
@@ -494,33 +494,48 @@ func overwriteAttrs(src, dst pcommon.Map) {
 	})
 }
 
-// build merges the k8s attributes for pod/container into a, never overwriting
-// keys the sender already set.
-func (e *Enricher) build(pod *kubemeta.Pod, container *kubemeta.Container, a pcommon.Map) {
-	built := pcommon.NewResource()
-	actx := attrs.Context{Pod: pod, Container: container}
-	if e.cfg.NodeInfo != nil {
-		actx.Node = e.cfg.NodeInfo()
-	}
-	e.cfg.Attrs.Build(built, actx)
-	mergeAttrs(built.Attributes(), a)
-}
+// peerCacheKey is the reserved key under which the peer-IP attribution is
+// memoised in a request's attribute cache. A real token is "c:"/"u:" prefixed,
+// so this cannot collide.
+const peerCacheKey = "\x00peer"
 
-// peerPod resolves the pushing pod from the connection's peer IP (nil when
-// the fallback is disabled, the peer is unknown, or no live pod owns the IP).
-func (e *Enricher) peerPod(ctx context.Context) *kubemeta.Pod {
+// peerAttrs returns the k8s attributes of the pod owning the connection's peer
+// IP, resolved at most ONCE per request.
+//
+// The peer is a property of the connection, so every resource in a payload has
+// the same one — yet this ran per resource, and /v1/pod-ips is deliberately
+// uncacheable (recycled IPs need immediacy), so 500 ID-less resources meant 500
+// serial round trips inside the handler. Worse, two resources of one payload
+// could be attributed differently if the index changed mid-request. The cache
+// is per request (the enricher itself is shared by concurrent handlers, so
+// nothing may be memoised on it).
+func (e *Enricher) peerAttrs(ctx context.Context, cache map[string]pcommon.Map) pcommon.Map {
 	if !e.cfg.PeerIPFallback {
-		return nil
+		return pcommon.NewMap()
 	}
 	ip := peerIP(ctx)
 	if ip == "" {
-		return nil
+		return pcommon.NewMap()
 	}
-	pod, err := e.cfg.Meta.PodByIP(ctx, ip)
-	if err != nil {
-		return nil
+	if cache != nil {
+		if m, ok := cache[peerCacheKey]; ok {
+			return m
+		}
 	}
-	return pod
+	built := pcommon.NewMap()
+	if pod, err := e.cfg.Meta.PodByIP(ctx, ip); err == nil && pod != nil {
+		res := pcommon.NewResource()
+		actx := attrs.Context{Pod: pod}
+		if e.cfg.NodeInfo != nil {
+			actx.Node = e.cfg.NodeInfo()
+		}
+		e.cfg.Attrs.Build(res, actx)
+		res.Attributes().CopyTo(built)
+	}
+	if cache != nil {
+		cache[peerCacheKey] = built
+	}
+	return built
 }
 
 // idToken tags an ID value with its kind so a later lookup knows which

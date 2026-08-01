@@ -478,6 +478,25 @@ func labelValue(labels []Label, name string) string {
 	return ""
 }
 
+// dpaBytes estimates the encoded size of the attributes moved off a split
+// resource onto EVERY one of its data points.
+//
+// route() charges the resource AFTER removing them and the per-point
+// estimators only measure the sample's own labels, so #attrs × #points bytes
+// were encoded and counted nowhere. The default config hid it: the same
+// estimate over-charges the groupBy and dropLabels labels it strips, and the
+// two happened to cancel. A rule demoting several attributes while grouping by
+// one under-counts by ~1 MB at BatchPoints=10000 — enough to push a 3 MiB
+// estimate past the 4 MiB gRPC limit the estimate exists to respect, at which
+// point the collector rejects every export of that target.
+func dpaBytes(dpa []kv) int {
+	n := 0
+	for _, a := range dpa {
+		n += len(a.key) + len(a.value) + attrOverheadBytes
+	}
+	return n
+}
+
 // putSplitLabels writes the non-grouped labels onto a data point (minus the
 // rule's dropLabels), plus the attributes moved off the split resource (dp).
 func (b *splitBatcher) putSplitLabels(attrsMap pcommon.Map, rule *compiledSplitRule, labels []Label, dp []kv) {
@@ -560,7 +579,7 @@ func (b *splitBatcher) addNumber(s Sample, monotonic bool) {
 		setExemplar(dp.Exemplars().AppendEmpty(), *s.Exemplar, b.scrapeTS)
 	}
 	b.points++
-	b.bytes += numberBytes(s)
+	b.bytes += numberBytes(s) + dpaBytes(dpa)
 }
 
 func (b *splitBatcher) addHistogram(family string, acc *histAcc) {
@@ -580,7 +599,7 @@ func (b *splitBatcher) addHistogram(family string, acc *histAcc) {
 		setExemplar(dp.Exemplars().AppendEmpty(), e, b.scrapeTS)
 	}
 	b.points++
-	b.bytes += histBytes(acc)
+	b.bytes += histBytes(acc) + dpaBytes(dpa)
 }
 
 // addExponential routes one native-histogram point exactly like the other
@@ -615,7 +634,7 @@ func (b *splitBatcher) addExponential(family string, p expPoint) {
 		setExemplar(dp.Exemplars().AppendEmpty(), e, b.scrapeTS)
 	}
 	b.points++
-	b.bytes += expHistBytes(&p)
+	b.bytes += expHistBytes(&p) + dpaBytes(dpa)
 }
 
 func (b *splitBatcher) addSummary(family string, acc *summAcc) {
@@ -632,5 +651,5 @@ func (b *splitBatcher) addSummary(family string, acc *summAcc) {
 	fillSummaryPoint(dp, acc)
 	b.putSplitLabels(dp.Attributes(), rule, acc.labels, dpa)
 	b.points++
-	b.bytes += summBytes(acc)
+	b.bytes += summBytes(acc) + dpaBytes(dpa)
 }

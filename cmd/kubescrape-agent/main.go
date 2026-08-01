@@ -441,20 +441,7 @@ func run() error {
 		}
 	}
 
-	baseExport := otlpexport.Config{
-		Endpoint:           *otlpEndpoint,
-		Protocol:           *otlpProtocol,
-		Compression:        *otlpCompression,
-		CompressionLevel:   *otlpCompressionLevel,
-		Insecure:           *otlpInsecure,
-		InsecureSkipVerify: *otlpSkipTLS,
-		CAFile:             *otlpCAFile,
-		BearerTokenFile:    *otlpBearer,
-		Timeout:            *otlpTimeout,
-		RetryAttempts:      *otlpRetries,
-		RetryBackoff:       *otlpBackoff,
-		MaxSendBytes:       *otlpMaxSendBytes,
-	}
+	baseExport := baseExportConfig()
 	// The flag base plus the config's export section: per-signal destinations
 	// ride the existing per-signal spools, and the default chain gains static
 	// headers / an mTLS client certificate.
@@ -1209,6 +1196,28 @@ func waitFor(wg *sync.WaitGroup, budget time.Duration) bool {
 		return true
 	case <-time.After(budget):
 		return false
+	}
+}
+
+// baseExportConfig is the exporter configuration the OTLP flags describe. It
+// is a function so -check-config can validate it without building anything:
+// the dry run returns long before the exporter is assembled, so every one of
+// these flags used to be unchecked by a run whose whole purpose is catching a
+// bad ConfigMap before it becomes a fleet-wide CrashLoop.
+func baseExportConfig() otlpexport.Config {
+	return otlpexport.Config{
+		Endpoint:           *otlpEndpoint,
+		Protocol:           *otlpProtocol,
+		Compression:        *otlpCompression,
+		CompressionLevel:   *otlpCompressionLevel,
+		Insecure:           *otlpInsecure,
+		InsecureSkipVerify: *otlpSkipTLS,
+		CAFile:             *otlpCAFile,
+		BearerTokenFile:    *otlpBearer,
+		Timeout:            *otlpTimeout,
+		RetryAttempts:      *otlpRetries,
+		RetryBackoff:       *otlpBackoff,
+		MaxSendBytes:       *otlpMaxSendBytes,
 	}
 }
 

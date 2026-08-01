@@ -89,6 +89,13 @@ func loadAgentConfig(path string) (*agentConfig, error) {
 // dry-run cannot drift from what a real start accepts — adding a config surface
 // means adding it here as well as to agentConfig.
 func validateConfig(cfg agentConfig, transformsFile string) error {
+	// The OTLP transport flags. Shape-only (no dial, no file reads), but they
+	// are the ones that abort a real start: a bad protocol, compression,
+	// compression level or scheme-less endpoint, or TLS material on a
+	// plaintext connection.
+	if err := baseExportConfig().Validate(); err != nil {
+		return fmt.Errorf("otlp flags: %w", err)
+	}
 	if _, err := buildAttrs(cfg.ResourceAttributes); err != nil {
 		return fmt.Errorf("resourceAttributes: %w", err)
 	}

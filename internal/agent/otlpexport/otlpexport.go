@@ -105,6 +105,49 @@ type Client struct {
 }
 
 // New creates a Client for cfg.
+// Validate checks everything about a Config that can be judged WITHOUT
+// touching the filesystem, the network or a TLS keypair — the same checks New
+// makes before it builds anything.
+//
+// It exists so -check-config can cover the OTLP transport flags. That dry run
+// returns before the exporter is assembled, so it used to accept
+// -otlp-protocol=htttp, -otlp-compression=zstd, an out-of-range compression
+// level and TLS material on a plaintext connection: every one of them aborts a
+// real start, which is precisely what the dry run promises to catch.
+func (cfg Config) Validate() error {
+	if cfg.Protocol == "" {
+		cfg.Protocol = "grpc"
+	}
+	switch cfg.Protocol {
+	case "grpc", "http":
+	default:
+		return fmt.Errorf("protocol %q (want grpc or http)", cfg.Protocol)
+	}
+	switch cfg.Compression {
+	case "", "gzip", "none":
+	default:
+		return fmt.Errorf("compression %q (want gzip or none)", cfg.Compression)
+	}
+	if cfg.CompressionLevel < 0 || cfg.CompressionLevel > 9 {
+		return fmt.Errorf("compression level %d (want 0-9)", cfg.CompressionLevel)
+	}
+	if cfg.Endpoint == "" {
+		return fmt.Errorf("no endpoint")
+	}
+	if cfg.Protocol == "http" && !strings.HasPrefix(cfg.Endpoint, "http://") && !strings.HasPrefix(cfg.Endpoint, "https://") {
+		return fmt.Errorf("endpoint %q needs an http:// or https:// scheme for the http protocol", cfg.Endpoint)
+	}
+	if material := tlsMaterial(cfg); material != "" {
+		if cfg.Protocol == "grpc" && cfg.Insecure {
+			return fmt.Errorf("%s is set but the gRPC connection is plaintext; set insecure=false (-otlp-insecure=false) for this destination", material)
+		}
+		if cfg.Protocol == "http" && strings.HasPrefix(cfg.Endpoint, "http://") {
+			return fmt.Errorf("%s is set but endpoint %q is plain http; use https://", material, cfg.Endpoint)
+		}
+	}
+	return nil
+}
+
 func New(cfg Config) (*Client, error) {
 	if cfg.Protocol == "" {
 		cfg.Protocol = "grpc"

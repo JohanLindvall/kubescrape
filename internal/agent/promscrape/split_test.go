@@ -184,6 +184,12 @@ func TestSplitChunkBytesRespectGRPCLimit(t *testing.T) {
 		// the 10k-point bound flushes chunks that still encode past 4 MiB, and the
 		// byte guard never fires because its estimate ignores the resources.
 		{"defaults-enriched", body("kube_pod_info"), richMeta{}, enrichSplitters(t), 0},
+		// Several attributes DEMOTED onto every data point. They are removed
+		// from the resource before it is charged and the per-point estimators
+		// only measure the sample's own labels, so #attrs x #points bytes were
+		// encoded and counted nowhere — the one case where the estimate's
+		// habitual over-charging of stripped labels does not cancel it out.
+		{"datapoint-attributes", body("kube_pod_info"), richMeta{}, demotingSplitters(t), 0},
 	}
 	var m pmetric.ProtoMarshaler
 	const grpcLimit = 4 << 20
@@ -247,6 +253,28 @@ kube_namespace_labels{namespace="ns1",label_team="core"} 1
 # TYPE ksm_own_metric gauge
 ksm_own_metric 42
 `
+
+// demotingSplitters moves several attributes off the resource onto every data
+// point, which is what datapointAttributes is for.
+func demotingSplitters(t *testing.T) []*Splitter {
+	t.Helper()
+	sp, err := NewSplitters([]SplitterConfig{{
+		Match: SplitterMatch{PodLabels: map[string]string{"app.kubernetes.io/name": "kube-state-metrics"}},
+		Rules: []SplitRule{{
+			Metrics: `kube_pod_.+`,
+			GroupBy: map[string]string{
+				"namespace": "k8s.namespace.name", "pod": "k8s.pod.name",
+				"uid": "k8s.pod.uid", "node": "k8s.node.name", "phase": "k8s.pod.phase",
+			},
+			DatapointAttributes: &[]string{"k8s.node.name", "k8s.pod.phase", "k8s.pod.uid", "k8s.namespace.name"},
+			Enrich:              true,
+		}},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return sp
+}
 
 func ksmSplitters(t *testing.T) []*Splitter {
 	t.Helper()

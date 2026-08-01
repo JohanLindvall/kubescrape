@@ -89,6 +89,27 @@ func (a attrsView) Get(k starlark.Value) (starlark.Value, bool, error) {
 	return toStarlark(v), true, nil
 }
 
+// Has implements `"k" in attrs`.
+//
+// It MUST exist. Starlark's IN operator tries Container.Has FIRST and only
+// falls back to Mapping.Get — and Get deliberately reports found=true for a
+// missing key so scripts can write `attrs["k"] != None`. Without Has, every
+// membership test answered True, so a script like
+//
+//	if "debug" in record.attributes: record.drop()
+//
+// dropped EVERY record. The export then had nothing to send, returned nil,
+// and the producer committed its offsets: a node's logs gone with no error
+// logged and no counter moved.
+func (a attrsView) Has(k starlark.Value) (bool, error) {
+	key, ok := starlark.AsString(k)
+	if !ok {
+		return false, fmt.Errorf("attribute key must be a string")
+	}
+	_, found := a.m.Get(key)
+	return found, nil
+}
+
 // SetKey implements attrs["k"] = v; None deletes.
 func (a attrsView) SetKey(k, v starlark.Value) error {
 	key, ok := starlark.AsString(k)

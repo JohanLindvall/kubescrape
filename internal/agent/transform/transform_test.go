@@ -385,3 +385,41 @@ metrics: |
 		t.Fatalf("main chain received %d payloads; the fork must forward to its OWN downstream", len(mainNext.metrics))
 	}
 }
+
+// `"k" in attrs` must answer honestly. Starlark's IN tries Container.Has
+// before Mapping.Get, and Get reports found=true for a MISSING key so scripts
+// can write `attrs["k"] != None` — so without Has every membership test
+// answered True. A script keying a drop on one is then a total outage for
+// whatever it filters: everything drops, the export forwards nothing, returns
+// nil, and the producer commits its offsets.
+func TestAttributeMembershipIsNotAlwaysTrue(t *testing.T) {
+	prog, err := Compile([]byte("logs: |\n" +
+		"  def transform(batch):\n" +
+		"      for r in batch:\n" +
+		"          if \"debug\" in r.attributes:\n" +
+		"              r.drop()\n" +
+		"          if \"k8s.namespace.name\" not in r.resource:\n" +
+		"              r.drop()\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	next := &capExp{}
+	w := Wrap(next, next, prog)
+
+	ld := logsPayload("keep-me", "drop-me")
+	ld.ResourceLogs().At(0).ScopeLogs().At(0).LogRecords().At(1).Attributes().PutStr("debug", "1")
+
+	if err := w.ExportLogs(context.Background(), ld); err != nil {
+		t.Fatal(err)
+	}
+	if len(next.logs) != 1 {
+		t.Fatalf("payloads forwarded = %d; want 1 — every record matched a membership test that is always True", len(next.logs))
+	}
+	lrs := next.logs[0].ResourceLogs().At(0).ScopeLogs().At(0).LogRecords()
+	if lrs.Len() != 1 {
+		t.Fatalf("records forwarded = %d; want 1 (only the one carrying `debug` drops)", lrs.Len())
+	}
+	if got := lrs.At(0).Body().Str(); got != "keep-me" {
+		t.Errorf("forwarded %q; want keep-me", got)
+	}
+}

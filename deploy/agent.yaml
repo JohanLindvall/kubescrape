@@ -85,6 +85,16 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: spec.nodeName
+            # The by-name self-metadata fallback needs this: under
+            # hostNetwork the hostname is the NODE's, not the pod's.
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
             - name: NODE_IP
               valueFrom:
                 fieldRef:

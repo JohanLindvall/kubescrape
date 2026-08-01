@@ -173,11 +173,23 @@ spec:
             - -logs-poll-interval={{ .Values.agent.logsPollInterval }}
             - -logs-fingerprint-bytes={{ int64 .Values.agent.logsFingerprintBytes }}
             - -logs-multiline={{ .Values.agent.multiline }}
-            {{- /* Default to THIS release's namespace: the agent and the
-                   collector run there, and tailing it feeds the collector its
-                   own output — a loop that amplifies precisely when the
-                   collector is already slow. */}}
-            - -logs-exclude-namespaces={{ join "," (.Values.agent.logsExcludeNamespaces | default (list .Release.Namespace)) }}
+            {{- /* Default: this release's namespace AND the namespace the
+                   OTLP endpoint names — tailing either feeds the collector its
+                   own output, a loop that amplifies precisely when the
+                   collector is already slow. The two are NOT the same: the
+                   endpoint defaults to otel-collector.monitoring, so a release
+                   installed anywhere else used to tail the collector's own
+                   namespace. `null` (the default) picks these; an explicit []
+                   excludes nothing, which `default` could not express. */}}
+            {{- $excl := .Values.agent.logsExcludeNamespaces }}
+            {{- if kindIs "invalid" $excl }}
+            {{-   $excl = list .Release.Namespace }}
+            {{-   $host := first (splitList ":" (trimPrefix "https://" (trimPrefix "http://" (.Values.agent.otlp.endpoint | default "")))) }}
+            {{-   $parts := splitList "." $host }}
+            {{-   if ge (len $parts) 2 }}{{- $excl = append $excl (index $parts 1) }}{{- end }}
+            {{-   $excl = uniq $excl }}
+            {{- end }}
+            - -logs-exclude-namespaces={{ join "," $excl }}
             - -scrape-interval={{ .Values.agent.scrapeInterval }}
             - -scrape-exemplars={{ .Values.agent.scrapeExemplars }}
             - -scrape-health-metrics={{ .Values.agent.scrapeHealthMetrics }}
@@ -225,6 +237,16 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: spec.nodeName
+            # The by-name self-metadata fallback needs this: under
+            # hostNetwork the hostname is the NODE's, not the pod's.
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
             - name: NODE_IP
               valueFrom:
                 fieldRef:

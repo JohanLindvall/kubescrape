@@ -236,6 +236,11 @@ spec:
             - name: POD_NAMESPACE
               valueFrom:
                 fieldRef: {fieldPath: metadata.namespace}
+            # Identity for the self-metadata by-name fallback (the hostname
+            # is not the pod's name when the pod shares the host's namespaces).
+            - name: POD_NAME
+              valueFrom:
+                fieldRef: {fieldPath: metadata.name}
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true

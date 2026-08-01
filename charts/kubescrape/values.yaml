@@ -205,11 +205,13 @@ agent:
       name: ""
       key: token
 
-  # Empty means "this release's namespace" (see the template): tailing the
-  # namespace the agent and the collector run in is a feedback loop that
-  # amplifies exactly when the collector is already struggling. A literal
-  # default was wrong for every install that does not use `monitoring`.
-  logsExcludeNamespaces: []
+  # null means "this release's namespace plus the one agent.otlp.endpoint
+  # names" (see the template): tailing the namespace the agent or the collector
+  # runs in is a feedback loop that amplifies exactly when the collector is
+  # already struggling, and the two namespaces differ whenever the endpoint
+  # default (otel-collector.monitoring) is kept in a release installed
+  # elsewhere. Set [] to exclude nothing.
+  logsExcludeNamespaces: null
   # A single file persisting BOTH log offsets and the journald cursor across
   # restarts (empty disables persistence).
   positionsFile: /var/lib/kubescrape-agent/positions.json

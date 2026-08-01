@@ -238,13 +238,37 @@ func (t *Tailer) stopPipeline(ctx context.Context, f *file) {
 	}
 }
 
+// maxIdlePendingBytes caps the carry buffer a file keeps between reads. One
+// oversized line grows it to MaxEntryBytes+4096 plus a chunk; pinning that per
+// file forever (a node tracks thousands) costs more than re-growing it the one
+// time another such line shows up. Two 64 KiB read chunks is the steady-state
+// working set, so normal files never hit this path.
+const maxIdlePendingBytes = 128 * 1024
+
+// appendPending appends one read chunk to the file's carry-over buffer,
+// reusing ONE array per file: the unconsumed remainder is moved back to the
+// front of pendingBase (a memmove — the two slices alias) so the chunk lands
+// in the capacity that frees up, rather than in a freshly allocated array.
+func (f *file) appendPending(chunk []byte) {
+	buf := append(f.pendingBase[:0], f.pending...) // in-place when it aliases
+	buf = append(buf, chunk...)
+	f.pendingBase = buf[:0:cap(buf)]
+	f.pending = buf
+}
+
 // ingestChunk accounts one read chunk (byte counter, pending buffer, read
 // position) and consumes it — the shared body of every read/drain loop.
 func (t *Tailer) ingestChunk(ctx context.Context, f *file, chunk []byte, unlimited bool) {
 	obs.LogBytes.Add(float64(len(chunk)))
-	f.pending = append(f.pending, chunk...)
+	f.appendPending(chunk)
 	f.readPos += int64(len(chunk))
 	t.consume(ctx, f, unlimited)
+	if len(f.pending) == 0 && cap(f.pendingBase) > maxIdlePendingBytes {
+		// Everything read has been consumed and the buffer is oversized (an
+		// over-long line grew it): give it back instead of holding it for the
+		// life of the file.
+		f.pending, f.pendingBase = nil, nil
+	}
 }
 
 // consume splits pending bytes into physical lines and feeds the pipeline.
@@ -267,6 +291,18 @@ func (t *Tailer) consume(ctx context.Context, f *file, unlimited bool) {
 			}
 			return
 		}
+		if f.discarding {
+			// The tail of an oversized discarded line: its newline ends the
+			// discard window. Handled BEFORE the rate limiter, because this is
+			// not a line — it must neither spend a token nor be deferred by a
+			// pause, and in DROP mode the limiter's branch below consumed it
+			// while leaving f.discarding set, so the next GOOD line was
+			// swallowed by the discard window instead.
+			f.pending = f.pending[i+1:]
+			f.lineStart += int64(i + 1)
+			f.discarding = false
+			continue
+		}
 		if !unlimited && !t.allowLine(f) {
 			if !t.cfg.RateDrop {
 				// Pause: keep pending, stop reading until tokens refill.
@@ -288,12 +324,6 @@ func (t *Tailer) consume(ctx context.Context, f *file, unlimited bool) {
 		f.pending = f.pending[i+1:]
 		f.lineStart += int64(i + 1)
 
-		if f.discarding {
-			// The tail of an oversized discarded line; its newline ends the
-			// discard window. Offsets advanced above, nothing is fed.
-			f.discarding = false
-			continue
-		}
 		if len(line) == 0 {
 			continue
 		}

@@ -316,6 +316,69 @@ func TestExcludedNamespaceNotResurrectedByLaterSource(t *testing.T) {
 	}
 }
 
+// A SOURCE's own excludeNamespaces is a prohibition, not a routing selector:
+// the file it denies is claimed-and-skipped, so a later catch-all source can
+// never resurrect it. Testing wantNamespace (which merges the deny and allow
+// halves) instead of the deny alone lost this guard, and the consequence is
+// the observability feedback loop — the agent tails the collector's namespace
+// and amplifies exactly when the collector is struggling.
+func TestSourceExcludedNamespaceNotResurrectedByLaterSource(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+	exp := &fakeExporter{}
+	tl := newSourceTailer(exp, []Source{
+		{
+			Name:              "containers",
+			Include:           []string{filepath.Join(dir, "*.log")},
+			Containerd:        true,
+			ExcludeNamespaces: []string{"ns*"}, // logName is pod1_ns1_app-<id>.log
+		},
+		{Name: "catchall", Include: []string{filepath.Join(dir, "*.log")}},
+	}, false)
+
+	tl.scanDir(tl.loadCheckpoints(), true)
+	writeLog(t, dir, "2026-07-05T10:00:00Z stdout F feedback-loop")
+	tl.scanDir(nil, false)
+	tl.sweep(ctx, true)
+	tl.flush(ctx)
+
+	if f, tracked := tl.files[filepath.Join(dir, logName)]; tracked {
+		t.Fatalf("source-excluded file tracked by source %q", f.source.name)
+	}
+	if got := exp.get(); len(got) != 0 {
+		t.Fatalf("source-excluded namespace exported via catch-all: %v", got)
+	}
+}
+
+// The mirror image: an allowlist MISS is routing, not prohibition, so the file
+// is deliberately left UNCLAIMED for a later source ("prod through source A,
+// the rest through source B"). The deny fix above must not take this with it.
+func TestSourceAllowlistMissFallsThroughToLaterSource(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+	exp := &fakeExporter{}
+	tl := newSourceTailer(exp, []Source{
+		{
+			Name:       "prod-only",
+			Include:    []string{filepath.Join(dir, "*.log")},
+			Containerd: true,
+			Namespaces: []string{"prod"}, // logName's namespace is ns1
+		},
+		{Name: "catchall", Include: []string{filepath.Join(dir, "*.log")}, Containerd: true},
+	}, false)
+
+	tl.scanDir(tl.loadCheckpoints(), true)
+	writeLog(t, dir, "2026-07-05T10:00:00Z stdout F routed")
+	tl.scanDir(nil, false)
+	driveUntil(t, ctx, tl, func() bool { return slices.Contains(exp.get(), "routed") },
+		"the allowlist-missed file collected by the later source")
+
+	f := tl.files[filepath.Join(dir, logName)]
+	if f == nil || f.source.name != "catchall" {
+		t.Fatalf("file claimed by %v, want the later catchall source", f)
+	}
+}
+
 // A file matched by two sources is claimed by the FIRST (config order), and
 // keeps that source's attributes.
 func TestFirstMatchingSourceClaimsFile(t *testing.T) {

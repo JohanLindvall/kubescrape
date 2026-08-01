@@ -92,6 +92,36 @@ func BenchmarkIngestLine(b *testing.B) {
 	}
 }
 
+// benchChunk builds one read-sized (>= 64 KiB, the tailer's scratch buffer)
+// chunk of whole CRI lines, and reports how many lines it holds.
+func benchChunk() ([]byte, int) {
+	var buf []byte
+	n := 0
+	for len(buf) < 64*1024 {
+		for _, l := range benchLines(64) {
+			buf = append(buf, l...)
+			buf = append(buf, '\n')
+			n++
+		}
+	}
+	return buf, n
+}
+
+// BenchmarkIngestChunk measures the per-CHUNK cost: the carry buffer plus the
+// per-line pipeline. The only per-line allocation is consume's string(line);
+// anything above that is the pending buffer being reallocated per read.
+func BenchmarkIngestChunk(b *testing.B) {
+	tl, f := benchTailer(b, Config{Multiline: true})
+	chunk, lines := benchChunk()
+	ctx := context.Background()
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i += lines {
+		tl.ingestChunk(ctx, f, chunk, false)
+		tl.batch = tl.batch[:0] // discard without flushing
+	}
+}
+
 // BenchmarkIngestFlush measures the full ingestion path per line: pipeline +
 // record building + export (null), with enrichment on — the production shape.
 func BenchmarkIngestFlush(b *testing.B) {

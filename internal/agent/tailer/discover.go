@@ -6,6 +6,7 @@ package tailer
 
 import (
 	"os"
+	"path"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -211,6 +212,21 @@ func (t *Tailer) tooOld(st os.FileInfo, path string, cutoff time.Duration, check
 	return !hasCheckpoint
 }
 
+// deniesNamespace is the DENY half of compiledSource.wantNamespace (sources.go)
+// on its own: the source's excludeNamespaces globs, without the allowlist.
+// claimPath needs the two apart because they have opposite claim semantics — a
+// deny claims the file so no later source can resurrect it, an allowlist miss
+// leaves it for one. Patterns are validated at startup (ValidateSources), so a
+// path.Match error here cannot happen and reads as "no match".
+func (s *compiledSource) deniesNamespace(ns string) bool {
+	for _, pat := range s.excludeNamespaces {
+		if ok, _ := path.Match(pat, ns); ok {
+			return true
+		}
+	}
+	return false
+}
+
 // claimPath decides one globbed path's fate for its source: skip (non-regular
 // or transiently unstattable), claim-though-skipped (excluded namespace or
 // unparseable CRI name — a later catch-all source must not resurrect it),
@@ -236,14 +252,25 @@ func (t *Tailer) claimPath(src *compiledSource, path string, seen map[string]str
 	var id string
 	if src.containerd {
 		cid, namespace, ok := parseFileName(filepath.Base(path))
-		if ok && src.containerd && !src.wantNamespace(namespace) {
-			// This SOURCE does not want the namespace — but a later source may.
-			// Deliberately NOT claimed: the claim-and-skip below exists for the
-			// GLOBAL exclude list (the observability feedback-loop guard), where
-			// resurrection by a catch-all would defeat the point. A per-source
-			// allowlist is the opposite: "prod through source A, the rest
-			// through source B" is its most obvious use, and claiming here made
-			// source B collect nothing.
+		if ok && src.deniesNamespace(namespace) {
+			// A source's OWN excludeNamespaces is a PROHIBITION, exactly like
+			// the global list below — so it claims-and-skips: without the claim
+			// a later catch-all source resurrects the file the operator just
+			// said not to tail, and the case that matters is the observability
+			// feedback loop (the agent tails the collector's namespace and
+			// amplifies precisely when the collector is struggling).
+			seen[path] = struct{}{}
+			return false
+		}
+		if ok && !src.wantNamespace(namespace) {
+			// An allowlist MISS is the opposite of a prohibition: this SOURCE
+			// does not want the namespace, but a later one may. Deliberately
+			// NOT claimed — "prod through source A, the rest through source B"
+			// is the allowlist's most obvious use, and claiming here made
+			// source B collect nothing. (Routing is what `namespaces` is for;
+			// `excludeNamespaces` denies, and denying cannot be undone by a
+			// later source. wantNamespace merges both, so testing it alone
+			// silently took the deny half along and lost the guard above.)
 			return false
 		}
 		if !ok || slices.Contains(t.cfg.ExcludeNamespaces, namespace) {
@@ -252,8 +279,8 @@ func (t *Tailer) claimPath(src *compiledSource, path string, seen map[string]str
 			// fall through to a later catch-all source — ExcludeNamespaces is
 			// global tailer config (the observability feedback-loop guard),
 			// and a later source exporting the raw CRI lines would defeat it.
-			// A source's own namespaces/excludeNamespaces claim-and-skip for
-			// the same reason: the file is never opened, tracked or read.
+			// A source's own excludeNamespaces claims-and-skips above for the
+			// same reason. Either way the file is never opened, tracked or read.
 			seen[path] = struct{}{}
 			return false
 		}

@@ -356,6 +356,99 @@ func TestOversizedUnterminatedLineKeepsOffsetsExact(t *testing.T) {
 	}
 }
 
+// consume advances f.pending by RE-SLICING, so its spare capacity drains to
+// zero and the next chunk's append allocates a fresh >= 64 KiB array — garbage
+// proportional to the log volume read. One buffer per file: the only per-chunk
+// allocations left are consume's per-line string(line).
+func TestPendingBufferIsReusedAcrossChunks(t *testing.T) {
+	ctx := context.Background()
+	tl, f := benchTailer(t, Config{Multiline: true})
+	chunk, lines := benchChunk()
+
+	allocs := testing.AllocsPerRun(20, func() {
+		tl.ingestChunk(ctx, f, chunk, false)
+		tl.batch = tl.batch[:0]
+	})
+	if allocs > float64(lines) {
+		t.Fatalf("ingestChunk allocated %v times for %d lines: the carry buffer is "+
+			"being reallocated per chunk (want <= one string(line) per line)", allocs, lines)
+	}
+	if cap(f.pendingBase) < len(chunk) {
+		t.Fatalf("carry buffer cap = %d, want >= the chunk size %d (it must be REUSED, not regrown)",
+			cap(f.pendingBase), len(chunk))
+	}
+}
+
+// One over-long line must not pin a huge carry buffer on the file for good: a
+// node tracks thousands of files. It is released once the file drains.
+func TestOversizedPendingBufferIsReleasedWhenIdle(t *testing.T) {
+	ctx := context.Background()
+	tl, f := benchTailer(t, Config{MaxEntryBytes: 1 << 20})
+
+	// A line just under the discard bound, delivered whole: the buffer has to
+	// grow past maxIdlePendingBytes to hold it.
+	big := make([]byte, tl.cfg.MaxEntryBytes)
+	for i := range big {
+		big[i] = 'y'
+	}
+	tl.ingestChunk(ctx, f, append(big, '\n'), false)
+	if cap(f.pendingBase) != 0 {
+		t.Fatalf("carry buffer of %d bytes kept after the oversized line drained", cap(f.pendingBase))
+	}
+
+	// Still usable, and the ordinary steady-state buffer is NOT thrown away.
+	chunk, _ := benchChunk()
+	tl.ingestChunk(ctx, f, chunk, false)
+	if cap(f.pendingBase) == 0 || cap(f.pendingBase) > maxIdlePendingBytes {
+		t.Fatalf("carry buffer cap = %d after a normal chunk, want (0, %d]",
+			cap(f.pendingBase), maxIdlePendingBytes)
+	}
+	if !emitted(tl, "handled request") && len(bodies(tl)) == 0 {
+		t.Fatal("no records produced after the buffer was released")
+	}
+}
+
+// The newline TERMINATING an oversized discarded line is not a line: in DROP
+// mode the rate limiter used to consume it (dropping "a line" that was never
+// one) while leaving f.discarding set, so the discard window stayed open over
+// the next GOOD line and swallowed it. Pause mode was unaffected — it returns
+// with the fragment still pending and re-evaluates it once tokens refill.
+func TestOversizedLineTailNotSwallowedInRateDropMode(t *testing.T) {
+	ctx := context.Background()
+	tl, f := benchTailer(t, Config{
+		MaxEntryBytes: 1024,
+		RateLimit:     1, // 1/s: the bucket does not refill within the test
+		RateBurst:     1,
+		RateDrop:      true,
+	})
+
+	// An oversized unterminated line: its prefix is discarded, opening the
+	// discard window.
+	tl.ingestChunk(ctx, f, []byte(strings.Repeat("y", tl.cfg.MaxEntryBytes+4097)), false)
+	if !f.discarding {
+		t.Fatal("precondition: oversized prefix was not discarded")
+	}
+
+	// Empty the bucket, then deliver the discarded line's terminating fragment:
+	// it must close the window without consulting the limiter.
+	f.tokens, f.lastRefill = 0, time.Now()
+	tl.ingestChunk(ctx, f, []byte("suffix-of-oversized-line\n"), false)
+	if f.discarding {
+		t.Fatal("the oversized line's terminator did not close the discard window")
+	}
+
+	// One token back: the next good line must be exported, not swallowed.
+	f.tokens, f.lastRefill = 1, time.Now()
+	tl.ingestChunk(ctx, f, []byte(timeNowCRI()+" stdout F survivor\n"), false)
+
+	if emitted(tl, "suffix-of-oversized-line") {
+		t.Fatalf("mid-line suffix exported as a record: %v", bodies(tl))
+	}
+	if !emitted(tl, "survivor") {
+		t.Fatalf("the line after the oversized one was swallowed: %v", bodies(tl))
+	}
+}
+
 // An entry truncated by the multiline byte cap carries log.truncated.
 func TestTruncatedEntryCarriesAttribute(t *testing.T) {
 	dir := t.TempDir()

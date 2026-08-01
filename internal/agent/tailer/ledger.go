@@ -89,6 +89,13 @@ type file struct {
 	lineStart int64  // offset of the first byte not yet consumed as a line
 	committed int64  // offset covered by successful exports / checkpoint
 	pending   []byte // incomplete physical line carried between sweeps
+	// pendingBase pins the ONE backing array behind pending. consume advances
+	// pending by RE-SLICING, so its base pointer walks forward and its spare
+	// capacity drains to zero; appendPending moves the remainder back to the
+	// front of this array before the next chunk is appended. Without it every
+	// read allocated a fresh chunk-sized (64 KiB) array — garbage proportional
+	// to the log volume read.
+	pendingBase []byte
 
 	// Two-stage pipeline: criStage rejoins CRI fragments into logical lines
 	// (stage-1 data is the physical start offset), traces joins stack traces
@@ -501,7 +508,9 @@ type entry struct {
 func (f *file) restartAt(off int64) {
 	f.readPos = off
 	f.lineStart = off
-	f.pending = f.pending[:0]
+	// Rewind to the front of the carry buffer, not to the current (re-sliced)
+	// window: the whole array is free again.
+	f.pending = f.pendingBase[:0]
 	f.limited = false
 	f.discarding = false
 }

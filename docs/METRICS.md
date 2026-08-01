@@ -40,7 +40,7 @@ names a metric or a label that is not registered.
 | `kubescrape_event_watch_restarts_total` | — | Event watch restarts (a closed stream, an error, or an expired resourceVersion). |
 | `kubescrape_events_dropped_total` | — | Kubernetes event batches dropped after a permanent collector rejection (the position advances past them). |
 | `kubescrape_events_exported_total` | — | Kubernetes event records exported (after the rules). |
-| `kubescrape_events_observed_total` | `type` | Kubernetes events received from the watch, by event type (normal, warning). |
+| `kubescrape_events_observed_total` | `type` | Kubernetes events received from the watch, by event type (normal, warning, other — anything else the API server reports). |
 | `kubescrape_export_requests_total` | `signal`, `outcome` | OTLP export attempts by signal and outcome. |
 | `kubescrape_http_requests_total` | `pattern`, `code` | Metadata API requests by pattern and status code. |
 | `kubescrape_ingest_rejected_total` | — | Pushed OTLP requests refused because the concurrent in-flight bound was reached (retryable: 429 / ResourceExhausted). |
@@ -50,7 +50,7 @@ names a metric or a label that is not registered.
 | `kubescrape_journal_restarts_total` | — | Journal reader restarts. |
 | `kubescrape_journal_truncated_total` | — | Journal messages truncated at MaxEntryBytes (the record carries log.truncated). |
 | `kubescrape_leader` | — | 1 while this replica holds the cluster-singleton lease, 0 otherwise; sum != 1 means split brain or nobody leading. |
-| `kubescrape_log_archive_errors_total` | — |  |
+| `kubescrape_log_archive_errors_total` | — | Compressed log files whose stream failed to decode mid-read (truncated gzip, trailing garbage). What decoded before the error is delivered; the remainder is unrecoverable and the archive settles. |
 | `kubescrape_log_bytes_total` | — | Raw log bytes read from live files and archives. Segment replays (re-reading a rotated file's owed range after a restart or rewind) are not re-counted. |
 | `kubescrape_log_enriched_total` | `format` | Log records by the enrichment strategy that matched (json, logfmt, pattern, none). |
 | `kubescrape_log_entries_total` | — | Log entries exported. |
@@ -59,23 +59,23 @@ names a metric or a label that is not registered.
 | `kubescrape_log_files` | — | Log files currently tracked. |
 | `kubescrape_log_lag_bytes` | — | Largest per-file backlog: bytes on disk not yet exported and committed (per-file breakdown on /debug/tailer). |
 | `kubescrape_log_lag_total_bytes` | — | Total backlog across tracked files: bytes on disk not yet exported and committed. |
-| `kubescrape_log_metrics_dropped_capped_by_metric` | `metric` | Log-metric observations dropped since start because that metric's cardinality cap was reached, by metric name. |
+| `kubescrape_log_metrics_dropped_capped_by_metric` | `metric` | Log-metric observations dropped since start because that metric's cardinality cap was reached, by metric name. A gauge carrying a since-start total (not a counter): it does not mark restarts, so use kubescrape_log_metrics_dropped_capped_total for rates and this one to name the metric. |
 | `kubescrape_log_metrics_dropped_capped_total` | — | Log-metric observations dropped since start because the metric's label-set cardinality cap was reached. |
 | `kubescrape_log_metrics_dropped_collision_total` | — | Log-metric observations dropped since start because of a series hash collision. |
-| `kubescrape_log_metrics_dropped_nan_total` | — | Log-metric observations dropped since start because the extracted value was NaN. |
+| `kubescrape_log_metrics_dropped_nan_total` | — | Log-metric observations dropped since start because the extracted value was NaN or +/-Inf (neither is representable as a sample). |
 | `kubescrape_log_oversized_dropped_total` | — | Unterminated lines discarded for exceeding the per-entry size bound (no newline within MaxEntryBytes+4096). |
 | `kubescrape_log_permanent_dropped_total` | — | Log records dropped after a definitive collector rejection (retrying could not succeed; offsets advanced so the pipeline survives). |
-| `kubescrape_log_prefix_lost_total` | — |  |
+| `kubescrape_log_prefix_lost_total` | — | Rotated-away log segments that could not be re-read (the file was deleted or compressed before its lines were exported, and no open fd survived a restart). These lines are lost. |
 | `kubescrape_log_rate_limited_total` | `action` | Per-file line rate limit hits: lines discarded (action=drop) or reads paused (action=pause). |
 | `kubescrape_log_rotations_total` | — | Log file rotations and truncations handled. |
 | `kubescrape_log_rules_dropped_total` | — | Log records dropped by the logs rules (including sampled-away lines). |
 | `kubescrape_log_scrubbed_total` | `pattern` | Log bodies redacted by a scrub pattern (one bump per pattern per record, not per match). |
 | `kubescrape_log_torn_final_lines_total` | — | Unterminated final lines of RENAMED-away files (the fragment can never complete and is dropped). In-place truncation destroys its unread tail unmeasurably — there is nothing left to count — so truncation losses do not appear here or anywhere. |
-| `kubescrape_log_unresolved_lost_total` | — |  |
+| `kubescrape_log_unresolved_lost_total` | — | Log files deleted before their metadata ever resolved (the metadata service was unreachable or the container unknown for the file's whole life). Their content was never read and is lost. |
 | `kubescrape_metadata_requests_total` | `outcome` | Requests to the metadata service by outcome. |
 | `kubescrape_monitor_fields_ignored_total` | `kind` | Monitor upserts whose endpoints set fields kubescrape does not interpret. |
 | `kubescrape_monitor_parse_errors_total` | `kind` | Monitor upserts that failed to parse and were dropped from the index. |
-| `kubescrape_positions_corrupt_total` | — |  |
+| `kubescrape_positions_corrupt_total` | — | Positions files that failed to parse at startup (whatever decoded is kept; the affected inputs re-read their window). Recurring bumps across restarts point at a failing disk, not a one-off crash. |
 | `kubescrape_routed_payload_parts_total` | `route`, `signal` | Payload parts forwarded to a non-default routing destination. |
 | `kubescrape_scrape_duration_seconds` | `pipeline` | Scrape duration by pipeline. |
 | `kubescrape_scrape_malformed_total` | `pipeline` | Exposition samples dropped as malformed by pipeline (unparseable lines, histogram buckets without le, summary rows without quantile). |

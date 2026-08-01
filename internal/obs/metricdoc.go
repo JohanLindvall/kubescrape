@@ -71,14 +71,41 @@ func ParseMetricDocs(filename string) ([]MetricDoc, error) {
 	return out, nil
 }
 
+// stringLit evaluates a constant string expression: a literal, or literals
+// joined with `+`.
+//
+// The concatenated form is what a help string longer than one line looks like
+// after gofmt, and reading only the BasicLit silently produced an EMPTY help —
+// four metrics (log_archive_errors, log_prefix_lost, log_unresolved_lost,
+// positions_corrupt) shipped a blank cell in docs/METRICS.md, and
+// TestMetricsDocIsCurrent could not see it because it compares the generated
+// doc against the same generator.
 func stringLit(e ast.Expr) (string, bool) {
-	bl, ok := e.(*ast.BasicLit)
-	if !ok || bl.Kind != token.STRING {
-		return "", false
+	switch v := e.(type) {
+	case *ast.BasicLit:
+		if v.Kind != token.STRING {
+			return "", false
+		}
+		s, err := strconv.Unquote(v.Value)
+		if err != nil {
+			return "", false
+		}
+		return s, true
+	case *ast.BinaryExpr:
+		if v.Op != token.ADD {
+			return "", false
+		}
+		l, ok := stringLit(v.X)
+		if !ok {
+			return "", false
+		}
+		r, ok := stringLit(v.Y)
+		if !ok {
+			return "", false
+		}
+		return l + r, true
+	case *ast.ParenExpr:
+		return stringLit(v.X)
 	}
-	v, err := strconv.Unquote(bl.Value)
-	if err != nil {
-		return "", false
-	}
-	return v, true
+	return "", false
 }

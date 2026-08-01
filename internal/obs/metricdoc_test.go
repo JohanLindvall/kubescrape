@@ -82,3 +82,23 @@ func renderMetricsDoc(docs []MetricDoc) string {
 	fmt.Fprintf(&b, "\n%d metrics.\n", len(docs))
 	return b.String()
 }
+
+// Every registered metric must document itself. A help string too long for one
+// line is written as `"a" + "b"`, and the parser used to read only the first
+// BasicLit — yielding an EMPTY help that docs/METRICS.md dutifully published as
+// a blank cell, invisible to TestMetricsDocIsCurrent (which compares the
+// generated doc against the same generator).
+func TestEveryMetricHasHelp(t *testing.T) {
+	docs, err := ParseMetricDocs("obs.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(docs) == 0 {
+		t.Fatal("no metrics parsed")
+	}
+	for _, d := range docs {
+		if strings.TrimSpace(d.Help) == "" {
+			t.Errorf("%s has no help text; docs/METRICS.md publishes a blank cell for it", d.Name)
+		}
+	}
+}

@@ -55,7 +55,10 @@ func DroppedCappedByMetric() map[string]float64 {
 // corrupt both).
 func DroppedCollision() uint64 { return droppedCollision.Load() }
 
-// DroppedNaN counts observations rejected because the extracted value was NaN.
+// DroppedNaN counts observations rejected because the extracted value was not
+// finite — NaN or +/-Inf alike. (The name predates the Inf arm; both take this
+// path, since neither is representable as a sample and both would poison every
+// aggregation the series feeds.)
 func DroppedNaN() uint64 { return droppedNaN.Load() }
 
 // seriesKind selects how observations accumulate and how the series exports.

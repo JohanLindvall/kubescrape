@@ -370,15 +370,31 @@ which is counted in a metric.) It exports
 OTLP log records with resource attributes (`k8s.pod.name`,
 `k8s.deployment.name`, `container.id`, pod/namespace labels, …) resolved via
 `GET /v1/containers/{id}` — the blocking wait covers containers whose
-metadata has not reached the API server yet. Delivery is at-least-once:
+metadata has not reached the API server yet. (A file whose metadata will not
+resolve is retried with an exponential, jittered backoff — 2s doubling to 1m —
+so one unresolvable file cannot monopolise the single sweep goroutine and a
+metadata-service rollout does not recover into a synchronised fleet-wide
+burst.) Delivery is at-least-once:
 batches (`-logs-batch-size` / `-logs-flush-interval`) are retried, file
 offsets are committed only after a successful export, and committed offsets
 are checkpointed to disk (`-positions-file`) so restarts resume where they
-left off. Per-file backlog is visible as `kubescrape_log_lag_bytes` and
+left off. The one exception is a batch the collector rejects **definitively**
+(a malformed payload, an unimplemented endpoint, a body over the receiver's
+limit): retrying that cannot succeed, and because one goroutine sweeps every
+file on the node, retrying it forever would stop all log shipping there — so
+the batch is dropped and the offsets advance. That is real loss, and it is
+counted in `kubescrape_log_permanent_dropped_total` (plus an `ERROR` log line):
+**alert on any nonzero rate of it.** With `-buffer-dir` the tailer sees the
+enqueue verdict rather than the collector's, so there the same loss surfaces as
+`kubescrape_buffer_dropped_total{signal="logs"}` instead.
+Per-file backlog is visible as `kubescrape_log_lag_bytes` and
 on `GET /debug/tailer`; a per-file line **rate limit** (`-logs-rate-limit`,
 pause or drop) keeps one runaway pod from consuming the pipeline. Set
 `-logs-exclude-namespaces` to the observability namespace to avoid feeding
-the collector its own output.
+the collector its own output. (The Helm chart does this for you: with
+`agent.logsExcludeNamespaces` left at its `null` default it excludes the
+release's own namespace plus the one `agent.otlp.endpoint` names. An explicit
+`[]` means exclude nothing.)
 
 **Unified config file** (`-config`). All of the agent's YAML configuration
 lives in one file, passed with `-config`. Every section is optional, each
@@ -749,7 +765,12 @@ ServiceAccount token (`nodes/metrics` RBAC, see
 natively through libsystemd (`coreos/go-systemd/sdjournal`) and exports the
 entries as OTLP log records, one resource per unit (`service.name` = unit
 without `.service`, `systemd.unit`, plus the configured node attributes; syslog
-priorities map to OTLP severities). Because it links libsystemd, the **agent
+priorities map to OTLP severities). Records carry the instrumentation scope
+`github.com/JohanLindvall/kubescrape/agent/journald` — earlier releases shipped
+journal records with an empty scope name, so backends that label by it
+(`otel_scope_name` in Loki/Elasticsearch) split every journal stream at the
+upgrade boundary; group on the unit instead if you need continuity across it.
+Because it links libsystemd, the **agent
 binary is built with cgo** (the metadata service stays fully static) and the
 image ships libsystemd — no `journalctl` binary or subprocess. Delivery is
 at-least-once: the cursor of the newest exported entry is persisted (via
@@ -844,7 +865,14 @@ attribution with zero sender configuration. Payloads are forwarded as
 received (batch in the sender's SDK or the downstream collector); every
 forward keeps the sender's own retry semantics. Enrichment
 outcomes count into `kubescrape_ingest_resources_total{outcome}` (including
-`peer_ip`).
+`peer_ip`). Concurrently-processed pushes are bounded across both transports by
+`-ingest-max-in-flight` (default 32) — the listeners are unauthenticated and
+node-local, and each in-flight request holds its body plus the inflated pdata on
+the process that also tails the node's logs. Over the bound a sender is refused
+**retryably**, never dropped: HTTP `429` with `Retry-After: 1`, gRPC
+`ResourceExhausted` **with a `RetryInfo` detail** (without it, conformant
+senders read the code as permanent and discard the batch). Refusals count into
+`kubescrape_ingest_rejected_total`.
 
 **Trace sampling** (`traceSampling` section). Ingested spans can be sampled
 before forwarding: `probability` keeps that fraction of **traces** (the

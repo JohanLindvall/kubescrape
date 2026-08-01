@@ -224,9 +224,34 @@ hop or an authenticating proxy.
 
 Delivery is at-least-once: offsets are committed only after the collector
 acknowledged the batch and never past lines still buffered in the multiline
-pipeline; on export failure the files rewind to the committed offset.
-Rotation handling (rename, copytruncate — including same-size rewrites —
-deletion) is automatic.
+pipeline; on a transient export failure the files rewind to the committed
+offset. Rotation handling (rename, copytruncate — including same-size rewrites
+— deletion) is automatic.
+
+There is exactly one path where the tailer gives up on data. A batch the
+collector rejects **definitively** — a malformed payload, an unimplemented
+endpoint, a body over the receiver's limit — cannot be fixed by retrying, and
+one sweep goroutine serves every file on the node, so retrying it forever would
+freeze all log shipping there, pin the file descriptor against logrotate, and
+lose the whole backlog when the file eventually rotates away. Instead the batch
+is dropped, the offsets advance, and the loss is counted in
+`kubescrape_log_permanent_dropped_total` alongside an `ERROR` log line.
+**Any nonzero rate on that counter is dropped logs and is worth an alert**; it
+is the only loss the tailer decides on itself (`kubescrape_log_export_failures_total`
+counts rewinds, which lose nothing). With `-buffer-dir` set the tailer's export
+returns the *enqueue* verdict rather than the collector's, so this counter then
+moves only for a batch larger than the whole buffer cap and the collector's own
+permanent rejections land on `kubescrape_buffer_dropped_total{signal="logs"}`
+instead — alert on that one for the buffered chain.
+
+A file whose container metadata cannot be resolved is retried on an
+exponential backoff (2s doubling to a 1m cap, each delay jittered up to +25%)
+rather than on a flat interval: the lookup blocks server-side for the whole
+`-metadata-wait` on the single sweep goroutine, so a short flat retry lets a
+handful of unresolvable files starve every other file on the node, and an
+unjittered one puts every agent in the fleet on the same schedule — turning a
+metadata-service rollout into a synchronised recovery burst. Nothing is read
+from a file until it resolves, so nothing is lost meanwhile.
 
 Backlog is observable per node — `kubescrape_log_lag_bytes` (largest per-file
 backlog) and `kubescrape_log_lag_total_bytes` in the self-metrics — and per file on
@@ -269,6 +294,16 @@ OTLP log records, one resource per systemd unit (`service.name` = the unit
 without `.service`, `systemd.unit`, plus node attributes via the `journal` attrs
 pipeline; syslog priorities map to OTLP severities; `syslog.identifier` and
 `process.pid` become record attributes).
+
+> **Upgrade note.** Journal records now carry an instrumentation-scope name —
+> `otel_scope_name=github.com/JohanLindvall/kubescrape/agent/journald` — where
+> earlier releases shipped an empty one. Every other producer named its scope;
+> journald was the outlier. This is **wire-visible**: backends that turn the
+> scope into a label (Loki, Elasticsearch) see a new label value, so every
+> journal stream splits at the upgrade boundary. Expect a discontinuity in
+> dashboards and alerts that group on labels including `otel_scope_name`, and
+> match on the unit (`service.name` / `systemd.unit`) instead if you need
+> continuity across the upgrade.
 
 | Flag | Default | Description |
 |---|---|---|
@@ -745,10 +780,30 @@ never overwrites an attribute the sender set.
 | `-ingest-container-id-keys` | `container.id,k8s.container.id` | attribute keys inspected for a container ID |
 | `-ingest-pod-uid-keys` | `k8s.pod.uid` | attribute keys inspected for a pod UID |
 | `-ingest-metadata-wait` | `0` | how long a lookup may block for a not-yet-known object |
+| `-ingest-max-in-flight` | `0` (= 32) | bound on pushes processed concurrently **across both transports**. Over it, senders are refused *retryably* rather than admitted into memory the node does not have |
 
 A container ID resolves the exact container incarnation; a pod UID resolves
 the pod. Outcomes count into `kubescrape_ingest_resources_total{outcome}`
 (`enriched` / `unresolved` / `peer_ip`).
+
+Both listeners are unauthenticated and node-local, and every in-flight request
+holds its body plus the inflated pdata — on the same process that tails the
+node's logs — so the count is bounded. A push arriving over the bound is not
+queued (that would turn back-pressure into latency the sender cannot see) and
+not dropped: it is refused with an answer the sender can act on, keeping the
+payload where the retry logic lives.
+
+* **HTTP**: `429 Too Many Requests` with `Retry-After: 1`.
+* **gRPC**: `ResourceExhausted` **with a `RetryInfo` detail** (`retry_delay: 1s`).
+  The status code alone reads as permanent to conformant senders — OTLP makes
+  `ResourceExhausted` retryable only when `RetryInfo` is attached, and both the
+  OTel SDK and the Collector drop the batch without it. `grpc.MaxConcurrentStreams`
+  is set to the same value.
+
+Refusals count into `kubescrape_ingest_rejected_total`. A persistently non-zero
+rate means the node cannot keep up with what is being pushed at it — raise the
+bound (memory permitting), speed up the collector's acks (a slow collector holds
+every slot for `-otlp-timeout`), or push less at this node.
 
 ## Agent: span metrics
 
@@ -931,6 +986,19 @@ OTLP consumers must tolerate anyway). Per-route destinations are **direct
 durability; routes are for tenancy/fan-out, not for doubling the durability
 machinery. Routed parts count into
 `kubescrape_routed_payload_parts_total{route,signal}`.
+
+**The agent's own self-metrics and span metrics BYPASS the router** and always
+go to the default (buffered) chain. `-self-attributes` stamps this pod's
+`k8s.namespace.name` on those resources, so without the bypass a route globbing
+the namespace the agent runs in would silently move the fleet's own health
+signal onto an unbuffered per-tenant destination — filed under whatever
+`X-Scope-OrgID` that route sets, or rejected by it outright, and dropped either
+way (a failed self-metrics export is logged and discarded, not retried and not
+spooled), and only from the moment the self-lookup resolved. Transforms still
+apply to the bypassed chain
+(it forks the same reloaded program), so the two chains can never run different
+scripts. Nothing needs configuring for this; it just means a route matching your
+`monitoring` namespace does not capture `kubescrape_*`.
 
 ## Resource attributes
 
@@ -1130,6 +1198,17 @@ the mount `-transforms-file` needs: its dedicated ConfigMap, mounted as a
 directory (not `subPath`). See
 [charts/kubescrape/values.yaml](../charts/kubescrape/values.yaml) for the
 full annotated list.
+
+`agent.logsExcludeNamespaces` is **null by default, and null is not empty**.
+Left unset, the chart excludes this release's own namespace *plus* the
+namespace named by `agent.otlp.endpoint` (the second dot-separated label of its
+host, e.g. `monitoring` for the default `otel-collector.monitoring:4317`).
+Tailing either is a feedback loop that amplifies exactly when the collector is
+already struggling, and the two are not the same namespace whenever the default
+endpoint is kept in a release installed somewhere else. Set the value to a list
+to name the namespaces yourself, or to an explicit `[]` to exclude nothing —
+which is the one thing the old `[]` default could not express, since it was
+indistinguishable from "unset".
 
 `azure.enabled: true` rides in the same singleton Deployment as
 `events.enabled` (either renders it): `azure.eventhub.*` maps to the

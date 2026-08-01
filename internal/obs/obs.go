@@ -26,6 +26,13 @@ var (
 	// retrying it forever stops ALL log shipping there — so the batch is
 	// dropped and the offsets advance. That is real data loss and must be
 	// alertable.
+	//
+	// With -buffer-dir the tailer's Export returns the ENQUEUE verdict, not
+	// the collector's, so on that (documented, durable) configuration this
+	// counter moves only for a batch larger than the whole buffer cap; the
+	// collector's own permanent rejections land on
+	// kubescrape_buffer_dropped_total{signal="logs"} instead, which is where
+	// an alert for the buffered chain belongs.
 	LogPermanentDropped = Registry.Counter("kubescrape_log_permanent_dropped_total",
 		"Log records dropped after a definitive collector rejection (retrying could not succeed; offsets advanced so the pipeline survives).")
 	LogFiles = Registry.Gauge("kubescrape_log_files",
@@ -143,7 +150,11 @@ var (
 // the self lookup retries forever: a fleet where /v1/self cannot resolve
 // (hostNetwork, a NAT hop) would otherwise contribute a permanent stream of
 // not_found to it and fire an alert about an attribution problem that does not
-// exist.
+// exist. Separation is not achieved by this counter alone — the agent gives
+// the self lookup its OWN metaclient.Client, without the Observe hook, since
+// the hook is per-client and fires inside every fetch (main.go). Counting
+// here and observing there would have double-counted the outcome into the
+// very metric the split exists to keep clean.
 var SelfMetadataLookups = Registry.CounterVec("kubescrape_self_metadata_lookups_total",
 	"Own-pod metadata lookups for -self-attributes, by outcome.", "outcome")
 
@@ -208,7 +219,7 @@ var (
 	Leader = Registry.Gauge("kubescrape_leader",
 		"1 while this replica holds the cluster-singleton lease, 0 otherwise; sum != 1 means split brain or nobody leading.")
 	EventsObserved = Registry.CounterVec("kubescrape_events_observed_total",
-		"Kubernetes events received from the watch, by event type (normal, warning).", "type")
+		"Kubernetes events received from the watch, by event type (normal, warning, other — anything else the API server reports).", "type")
 	EventsExported = Registry.Counter("kubescrape_events_exported_total",
 		"Kubernetes event records exported (after the rules).")
 	EventsDropped = Registry.Counter("kubescrape_events_dropped_total",
@@ -256,14 +267,22 @@ func init() {
 	// Per metric as well: the cap frees slots only through idleness, so a burst
 	// blinds ONE metric for up to maxAge + grace (24h by default) and an alert
 	// has to be able to name it.
+	//
+	// It is a GAUGE carrying a since-start total, not a counter — the per-metric
+	// label set is data-driven (a metric name appears only once it has dropped
+	// something), which the func-gauge vec is what can express. The value is
+	// still monotonic within a process, so `increase()`/`rate()` over it do NOT
+	// see the reset at a restart the way they do for the aggregate counter
+	// sibling: compare it against itself over a window, or alert on `> 0`, and
+	// use kubescrape_log_metrics_dropped_capped_total for rates.
 	Registry.GaugeFuncVec("kubescrape_log_metrics_dropped_capped_by_metric",
-		"Log-metric observations dropped since start because that metric's cardinality cap was reached, by metric name.",
+		"Log-metric observations dropped since start because that metric's cardinality cap was reached, by metric name. A gauge carrying a since-start total (not a counter): it does not mark restarts, so use kubescrape_log_metrics_dropped_capped_total for rates and this one to name the metric.",
 		"metric", metrics.DroppedCappedByMetric)
 	Registry.CounterFunc("kubescrape_log_metrics_dropped_collision_total",
 		"Log-metric observations dropped since start because of a series hash collision.",
 		func() float64 { return float64(metrics.DroppedCollision()) })
 	Registry.CounterFunc("kubescrape_log_metrics_dropped_nan_total",
-		"Log-metric observations dropped since start because the extracted value was NaN.",
+		"Log-metric observations dropped since start because the extracted value was NaN or +/-Inf (neither is representable as a sample).",
 		func() float64 { return float64(metrics.DroppedNaN()) })
 }
 

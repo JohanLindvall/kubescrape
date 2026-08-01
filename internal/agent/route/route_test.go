@@ -8,6 +8,8 @@ import (
 	"go.opentelemetry.io/collector/pdata/plog"
 	"go.opentelemetry.io/collector/pdata/pmetric"
 	"go.opentelemetry.io/collector/pdata/ptrace"
+
+	"github.com/JohanLindvall/kubescrape/internal/agent/otlpexport"
 )
 
 type capDest struct {
@@ -132,5 +134,29 @@ func TestRouterDoesNotMutateInput(t *testing.T) {
 	}
 	if len(bodies(teamA2.logs)) != 1 || len(bodies(def2.logs)) != 1 {
 		t.Fatalf("retry re-split lost data: teamA=%v def=%v", bodies(teamA2.logs), bodies(def2.logs))
+	}
+}
+
+// One route's permanent rejection must not condemn the whole payload: the
+// tailer DROPS a permanently rejected batch and advances, so classifying a
+// mixed failure permanent discarded the default-destined records a retry
+// would have delivered.
+func TestMixedFailureIsNotPermanent(t *testing.T) {
+	def := &capDest{err: errors.New("connection refused")} // transient
+	bad := &capDest{err: &otlpexport.HTTPStatusError{Code: 400}}
+	r := New(def, []Destination{{Name: "team-a", Namespaces: []string{"team-a-*"}, Exporter: bad}})
+
+	err := r.ExportLogs(context.Background(), nsLogs("default", "team-a-web"))
+	if err == nil {
+		t.Fatal("a failed destination must fail the export")
+	}
+	if otlpexport.IsPermanent(err) {
+		t.Error("a mixed failure classified permanent; the default chain's records would be dropped unsent")
+	}
+
+	// Every destination permanent: the verdict IS the payload's.
+	def.err = &otlpexport.HTTPStatusError{Code: 413}
+	if err := r.ExportLogs(context.Background(), nsLogs("default", "team-a-web")); !otlpexport.IsPermanent(err) {
+		t.Error("an all-permanent failure classified transient; the batch would retry forever")
 	}
 }

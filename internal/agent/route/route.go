@@ -32,8 +32,47 @@ import (
 	"go.opentelemetry.io/collector/pdata/pmetric"
 	"go.opentelemetry.io/collector/pdata/ptrace"
 
+	"github.com/JohanLindvall/kubescrape/internal/agent/otlpexport"
 	"github.com/JohanLindvall/kubescrape/internal/obs"
 )
+
+// joinExportErrs combines the per-destination results of one split export.
+//
+// Permanence is carried through only when EVERY failed destination rejected
+// permanently. otlpexport.IsPermanent classifies through errors.As/
+// status.FromError, and both traverse a joined error's LEAVES — so a single
+// route answering 400 made the whole payload look permanently rejected, and
+// the tailer (which drops such a batch and advances, by design) discarded the
+// default-destined records a retry would have delivered. A mixed failure is
+// returned opaquely instead: same message, no Unwrap, hence transient.
+func joinExportErrs(errs []error) error {
+	var failed []error
+	for _, err := range errs {
+		if err != nil {
+			failed = append(failed, err)
+		}
+	}
+	switch len(failed) {
+	case 0:
+		return nil
+	case 1:
+		return failed[0] // single destination: classify it exactly as it is
+	}
+	joined := errors.Join(failed...)
+	for _, err := range failed {
+		if !otlpexport.IsPermanent(err) {
+			return partialFailure{joined.Error()}
+		}
+	}
+	return joined
+}
+
+// partialFailure reports a mixed multi-destination failure without exposing
+// its leaves, so no classifier can read one destination's permanent rejection
+// as a verdict on the payload.
+type partialFailure struct{ msg string }
+
+func (e partialFailure) Error() string { return e.msg }
 
 // Config is the agent config's routing section.
 type Config struct {
@@ -141,7 +180,7 @@ func (r *Router) ExportLogs(ctx context.Context, ld plog.Logs) error {
 			errs = append(errs, err)
 		}
 	}
-	return errors.Join(errs...)
+	return joinExportErrs(errs)
 }
 
 // ExportMetrics splits by resource namespace and forwards each group.
@@ -175,7 +214,7 @@ func (r *Router) ExportMetrics(ctx context.Context, md pmetric.Metrics) error {
 			errs = append(errs, err)
 		}
 	}
-	return errors.Join(errs...)
+	return joinExportErrs(errs)
 }
 
 // ExportTraces splits by resource namespace and forwards each group. Route
@@ -225,7 +264,7 @@ func (r *Router) ExportTraces(ctx context.Context, td ptrace.Traces) error {
 			errs = append(errs, err)
 		}
 	}
-	return errors.Join(errs...)
+	return joinExportErrs(errs)
 }
 
 // split computes per-resource destinations; nil means "all default" (the

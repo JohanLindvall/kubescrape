@@ -175,6 +175,19 @@ type converter struct {
 	order  []string // first-seen emit order of label sets in the family
 	keyBuf []byte   // reused fingerprint buffer (labelKey)
 	keyLbl []Label  // reused sort scratch (labelKey)
+	// Last-seen memo for labelKey, mirroring the parser's lastMetric/lastKV.
+	// Every component series of a histogram/summary point carries the SAME
+	// labels bar le/quantile — a 12-bucket family is 13 consecutive samples
+	// resolving to one accumulator — yet each re-sorted and re-fingerprinted
+	// the set and re-probed the map. lastLbl holds the previous call's filtered
+	// labels AS FED (pre-sort, so the comparison matches the next call's own
+	// pre-sort state) and lastAcc* the accumulator it resolved to; lastExcept
+	// discriminates the histogram calls from the summary ones. Invalidated
+	// whenever the accumulators go away (flushFamily).
+	lastLbl     []Label
+	lastExcept  string
+	lastHistAcc *histAcc
+	lastSummAcc *summAcc
 	// Freed accumulators are recycled across families (their slices keep
 	// their capacity), so histogram-heavy scrapes stop generating one
 	// accumulator + bucket slice per label set per family.
@@ -309,6 +322,9 @@ func (c *converter) finish() error {
 
 func (c *converter) flushFamily() error {
 	var err error
+	// The accumulators below are emitted and pushed onto the freelists, so the
+	// labelKey memo must not survive them.
+	c.forgetLabelKey()
 	for _, key := range c.order {
 		// Delete as we emit: order can hold a key twice when a family is
 		// TYPE-redeclared mid-exposition (hist() and summ() each append on
@@ -346,7 +362,15 @@ func (c *converter) flushFamily() error {
 }
 
 func (c *converter) hist(s Sample) *histAcc {
-	c.labelKey(s.Labels, "le")
+	if c.labelKey(s.Labels, "le") && c.lastHistAcc != nil {
+		// Same label set as the previous component sample: keyBuf still holds
+		// its fingerprint and the accumulator is already in hand.
+		acc := c.lastHistAcc
+		if s.TimestampMs > acc.ts {
+			acc.ts = s.TimestampMs
+		}
+		return acc
+	}
 	acc, ok := c.hists[string(c.keyBuf)] // keyed lookup: no allocation
 	if !ok {
 		key := string(c.keyBuf)
@@ -361,6 +385,7 @@ func (c *converter) hist(s Sample) *histAcc {
 		c.hists[key] = acc
 		c.order = append(c.order, key)
 	}
+	c.lastHistAcc, c.lastSummAcc = acc, nil
 	if s.TimestampMs > acc.ts {
 		acc.ts = s.TimestampMs
 	}
@@ -368,7 +393,13 @@ func (c *converter) hist(s Sample) *histAcc {
 }
 
 func (c *converter) summ(s Sample) *summAcc {
-	c.labelKey(s.Labels, "quantile")
+	if c.labelKey(s.Labels, "quantile") && c.lastSummAcc != nil {
+		acc := c.lastSummAcc
+		if s.TimestampMs > acc.ts {
+			acc.ts = s.TimestampMs
+		}
+		return acc
+	}
 	acc, ok := c.summs[string(c.keyBuf)] // keyed lookup: no allocation
 	if !ok {
 		key := string(c.keyBuf)
@@ -383,6 +414,7 @@ func (c *converter) summ(s Sample) *summAcc {
 		c.summs[key] = acc
 		c.order = append(c.order, key)
 	}
+	c.lastSummAcc, c.lastHistAcc = acc, nil
 	if s.TimestampMs > acc.ts {
 		acc.ts = s.TimestampMs
 	}
@@ -393,13 +425,27 @@ func (c *converter) summ(s Sample) *summAcc {
 // into c.keyBuf, reusing c.keyLbl as sort scratch so the hot path does not
 // allocate. Exposition label order is stable within a family in practice; the
 // key is order-insensitive anyway to be safe.
-func (c *converter) labelKey(labels []Label, except string) {
+//
+// It returns true when the fingerprint is UNCHANGED from the previous call —
+// same excluded name and same remaining labels in the same order — in which
+// case keyBuf already holds it and the caller may reuse its cached accumulator
+// instead of re-probing the map. A miss is always safe: it just does the full
+// work, so a reordered label set costs correctness nothing.
+func (c *converter) labelKey(labels []Label, except string) bool {
 	c.keyLbl = c.keyLbl[:0]
 	for _, l := range labels {
 		if l.Name != except {
 			c.keyLbl = append(c.keyLbl, l)
 		}
 	}
+	if except == c.lastExcept && labelsEqual(c.keyLbl, c.lastLbl) {
+		return true // keyBuf still fingerprints exactly this set
+	}
+	// Remember the set AS FED: the next call compares its own pre-sort filtered
+	// list, so a memo saved post-sort would miss whenever the exposition's own
+	// order is not already sorted.
+	c.lastExcept = except
+	c.lastLbl = append(c.lastLbl[:0], c.keyLbl...)
 	// Sorting by (name, value) matches sorting the joined "name\x00value"
 	// strings byte-wise, so the fingerprint is order-insensitive.
 	slices.SortFunc(c.keyLbl, func(a, b Label) int {
@@ -418,6 +464,32 @@ func (c *converter) labelKey(labels []Label, except string) {
 		c.keyBuf = appendLP(c.keyBuf, l.Name)
 		c.keyBuf = appendLP(c.keyBuf, l.Value)
 	}
+	return false
+}
+
+// labelsEqual reports whether two label lists are identical element-wise. The
+// parser interns names and values per scrape, so the string comparisons are
+// overwhelmingly pointer-equal.
+func labelsEqual(a, b []Label) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i].Name != b[i].Name || a[i].Value != b[i].Value {
+			return false
+		}
+	}
+	return true
+}
+
+// forgetLabelKey invalidates the labelKey memo. It MUST run wherever the cached
+// accumulators stop being the right answer — the accumulators are recycled
+// through the freelists, so a stale pointer would fold one label set's
+// components into another's point.
+func (c *converter) forgetLabelKey() {
+	c.lastExcept = ""         // never a real except-name (only "le"/"quantile"), so it can never match
+	c.lastLbl = c.lastLbl[:0] // drop the interned string refs too
+	c.lastHistAcc, c.lastSummAcc = nil, nil
 }
 
 func appendLabelsExcept(dst []Label, labels []Label, except string) []Label {

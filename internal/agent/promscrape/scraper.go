@@ -122,8 +122,9 @@ type Scraper struct {
 	// Per-target scheduling: due holds each target's next scrape time and
 	// targetIntervals its resolved period (both keyed by URL, rebuilt every
 	// cycle so vanished targets drop out). warned dedupes per-target
-	// complaints. Written only by the cycle goroutine, but Run reads the
-	// intervals to size its ticker, so they are guarded.
+	// complaints — keyed by CONFIGURATION origin, never by URL, and bounded
+	// (see warnOnce/warnTarget). Written only by the cycle goroutine, but Run
+	// reads the intervals to size its ticker, so they are guarded.
 	// tlsClients caches per-target transports keyed by their resolved TLS
 	// material (see clientFor); targets sharing a CA share a connection pool.
 	tlsMu      sync.Mutex
@@ -307,7 +308,10 @@ func (s *Scraper) targetInterval(t kubemeta.ScrapeTarget) time.Duration {
 	}
 	d, err := parsePromDuration(t.Interval)
 	if err != nil || d <= 0 {
-		s.warnOnce("interval:"+t.URL, "ignoring invalid scrape interval on target",
+		// The offending VALUE is part of the key, so correcting a typo and
+		// re-introducing a different one still warns, while the same bad value
+		// on the same monitor never warns twice.
+		s.warnOnce("interval:"+warnTarget(t)+":"+t.Interval, "ignoring invalid scrape interval on target",
 			"url", t.URL, "monitor", t.Monitor, "interval", t.Interval)
 		return s.cfg.Interval
 	}
@@ -322,7 +326,7 @@ func (s *Scraper) targetTimeout(t kubemeta.ScrapeTarget, interval time.Duration)
 	if t.ScrapeTimeout != "" {
 		d, err := parsePromDuration(t.ScrapeTimeout)
 		if err != nil || d <= 0 {
-			s.warnOnce("timeout:"+t.URL, "ignoring invalid scrape timeout on target",
+			s.warnOnce("timeout:"+warnTarget(t)+":"+t.ScrapeTimeout, "ignoring invalid scrape timeout on target",
 				"url", t.URL, "monitor", t.Monitor, "scrapeTimeout", t.ScrapeTimeout)
 		} else {
 			out, asked = d, d
@@ -340,7 +344,7 @@ func (s *Scraper) targetTimeout(t kubemeta.ScrapeTarget, interval time.Duration)
 	// once instead of quietly handing back a fifth of what was asked for.
 	got := min(out, interval, s.cfg.Interval)
 	if asked > 0 && got < asked {
-		s.warnOnce("timeoutclamp:"+t.URL, "scrape timeout clamped below the monitor's scrapeTimeout; raise -scrape-interval to allow a longer one",
+		s.warnOnce("timeoutclamp:"+warnTarget(t)+":"+t.ScrapeTimeout, "scrape timeout clamped below the monitor's scrapeTimeout; raise -scrape-interval to allow a longer one",
 			"url", t.URL, "monitor", t.Monitor,
 			"scrapeTimeout", asked, "effective", got, "scrapeInterval", s.cfg.Interval)
 	}
@@ -393,6 +397,15 @@ func parsePromDuration(s string) (time.Duration, error) {
 // exactly the values the API server admits are the values we accept.
 var promDurationRE = regexp.MustCompile(`^(?:([0-9]+)y)?(?:([0-9]+)w)?(?:([0-9]+)d)?(?:([0-9]+)h)?(?:([0-9]+)m)?(?:([0-9]+)s)?(?:([0-9]+)ms)?$`)
 
+// maxWarnKeys bounds the dedupe table. The keys are configuration-derived, so a
+// healthy cluster holds a handful of them; the cap only catches a pathological
+// generator (thousands of monitors, each with its own typo). Reaching it CLEARS
+// the table rather than refusing further keys: a cleared table re-warns at most
+// once per cap refill, whereas refusing would blind the operator to every
+// genuinely new problem from that point on — and a warning nobody can ever see
+// again is worse than one repeated at a bounded rate.
+const maxWarnKeys = 1024
+
 // warnOnce logs a per-key message at most once per process, for per-target
 // complaints that would otherwise repeat every cycle forever.
 func (s *Scraper) warnOnce(key, msg string, args ...any) {
@@ -401,11 +414,43 @@ func (s *Scraper) warnOnce(key, msg string, args ...any) {
 		s.warned = map[string]bool{}
 	}
 	seen := s.warned[key]
-	s.warned[key] = true
+	if !seen {
+		if len(s.warned) >= maxWarnKeys {
+			clear(s.warned)
+		}
+		s.warned[key] = true
+	}
 	s.dueMu.Unlock()
 	if !seen {
 		s.log.Warn(msg, args...)
 	}
+}
+
+// warnTarget identifies a target for warnOnce by the CONFIGURATION that
+// produced it, never by its URL.
+//
+// The URL embeds the pod IP, so keying on it was wrong twice over: the table
+// grew one entry per pod incarnation for the process' whole life, and the
+// warning re-fired on every pod restart — defeating the "once" it exists for,
+// with the noisiest clusters (frequent restarts) getting the most noise. What
+// the operator actually has to fix is a field on a monitor CR, a Service
+// annotation or a workload's pod annotation, and all three outlive the pods
+// they produce targets for.
+func warnTarget(t kubemeta.ScrapeTarget) string {
+	if t.Monitor != "" {
+		return t.Source + ":" + t.Monitor // "ns/name" of the ServiceMonitor/PodMonitor
+	}
+	if t.Service != nil {
+		return t.Source + ":" + t.Service.Namespace + "/" + t.Service.Name
+	}
+	// Pod annotations. The chain is direct-owner-first, so the LAST owner is
+	// the workload root: a Deployment rather than its per-revision ReplicaSet,
+	// so a rollout does not mint a new key. A bare pod falls back to its name.
+	if n := len(t.Pod.Owners); n > 0 {
+		o := t.Pod.Owners[n-1]
+		return t.Source + ":" + t.Pod.Namespace + "/" + o.Kind + "/" + o.Name
+	}
+	return t.Source + ":" + t.Pod.Namespace + "/" + t.Pod.Name
 }
 
 func (s *Scraper) cycle(ctx context.Context) {

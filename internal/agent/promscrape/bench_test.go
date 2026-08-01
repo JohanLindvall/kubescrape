@@ -162,6 +162,61 @@ func BenchmarkCadvisorConvert(b *testing.B) {
 	}
 }
 
+// histSummBody synthesizes a histogram/summary-only exposition: the component
+// series of one point (12 _bucket rows plus _sum and _count) all carry the same
+// labels bar le, which is what the converter's per-family grouping keys on.
+func histSummBody(sets int) string {
+	var sb strings.Builder
+	bounds := []string{"0.005", "0.01", "0.025", "0.05", "0.1", "0.25", "0.5", "1", "2.5", "5", "10", "+Inf"}
+	sb.WriteString("# TYPE http_request_duration_seconds histogram\n")
+	for i := 0; i < sets; i++ {
+		for bi, le := range bounds {
+			fmt.Fprintf(&sb, "http_request_duration_seconds_bucket{namespace=\"prod-payments\",pod=\"payments-6f7b9c%03d\",container=\"app\",handler=\"/api/v1/orders\",method=\"GET\",le=\"%s\"} %d\n", i, le, (bi+1)*10)
+		}
+		fmt.Fprintf(&sb, "http_request_duration_seconds_sum{namespace=\"prod-payments\",pod=\"payments-6f7b9c%03d\",container=\"app\",handler=\"/api/v1/orders\",method=\"GET\"} 42.5\n", i)
+		fmt.Fprintf(&sb, "http_request_duration_seconds_count{namespace=\"prod-payments\",pod=\"payments-6f7b9c%03d\",container=\"app\",handler=\"/api/v1/orders\",method=\"GET\"} 120\n", i)
+	}
+	sb.WriteString("# TYPE rpc_latency_seconds summary\n")
+	for i := 0; i < sets; i++ {
+		for _, q := range []string{"0.5", "0.9", "0.99"} {
+			fmt.Fprintf(&sb, "rpc_latency_seconds{namespace=\"prod-payments\",pod=\"payments-6f7b9c%03d\",service=\"orders\",quantile=\"%s\"} 0.25\n", i, q)
+		}
+		fmt.Fprintf(&sb, "rpc_latency_seconds_sum{namespace=\"prod-payments\",pod=\"payments-6f7b9c%03d\",service=\"orders\"} 12.5\n", i)
+		fmt.Fprintf(&sb, "rpc_latency_seconds_count{namespace=\"prod-payments\",pod=\"payments-6f7b9c%03d\",service=\"orders\"} 60\n", i)
+	}
+	return sb.String()
+}
+
+// BenchmarkHistogramConvert isolates the component-grouping path: every sample
+// here routes through converter.hist/summ, i.e. through labelKey. The mixed
+// BenchmarkConvertScrape dilutes it with counters and gauges, which never touch
+// it.
+func BenchmarkHistogramConvert(b *testing.B) {
+	input := histSummBody(400)
+	var points int
+	b.SetBytes(int64(len(input)))
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		bt := newBatcher(func(pcommon.Resource) {}, time.Unix(1, 0), time.Unix(2, 0))
+		conv := newConverter(bt, nil)
+		p := promparse.Get(promparse.Options{MaxLineBytes: 1 << 20})
+		_, err := p.Parse(strings.NewReader(input), func(s Sample) error {
+			_ = conv.add(s)
+			return nil
+		})
+		promparse.Put(p)
+		if err != nil {
+			b.Fatal(err)
+		}
+		_ = conv.finish()
+		points = bt.count()
+	}
+	if points == 0 {
+		b.Fatal("no points")
+	}
+}
+
 // BenchmarkConvertScrape measures the full parse -> filter -> convert -> OTLP
 // pipeline for a typical Kubernetes exposition.
 func BenchmarkConvertScrape(b *testing.B) {

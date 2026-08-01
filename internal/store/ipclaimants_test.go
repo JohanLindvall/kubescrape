@@ -86,14 +86,67 @@ func TestDualStackAddressesResolve(t *testing.T) {
 		}
 	}
 
-	// Deleting it releases both, leaving nothing behind.
+	// Deleting it releases both, leaving nothing behind. GetPodByIP alone does
+	// NOT prove that: with a tombstone TTL the record keeps a DeletedAt stamp
+	// and the lookup's tombstone guard rejects it whether or not the index
+	// entry is still there. The INDEX is what has to be empty — Sweep never
+	// revisits byPodIP, so an entry left behind pins the whole kubemeta.Pod for
+	// the process lifetime and blocks the live pod that later takes the
+	// address from ever being promoted onto it.
 	s.DeletePod(types.UID("ds"))
 	for _, ip := range []string{"10.0.0.7", "fd00::7"} {
 		if _, ok := s.GetPodByIP(ip); ok {
 			t.Errorf("%s still resolves after the pod was deleted", ip)
 		}
+		if rec, present := s.byPodIP[ip]; present {
+			t.Errorf("byPodIP still maps %s to %q after its only claimant was deleted; the tombstone guard hides it from GetPodByIP but the entry never expires",
+				ip, rec.pod.Name)
+		}
 	}
 	if len(s.ipClaimants) != 0 {
 		t.Errorf("claimants left behind: %v", s.ipClaimants)
+	}
+}
+
+// Deleting a dual-stack pod must release EVERY address from byPodIP, not just
+// the primary. Sweep never revisits byPodIP, so a leftover entry serves a
+// deleted pod for the process lifetime — and with -cache-ttl 0 the record is
+// removed without a DeletedAt stamp, so even the tombstone guard cannot catch
+// it.
+func TestDeleteReleasesEveryAddressWithoutTTL(t *testing.T) {
+	s := New(0) // no tombstones: the record is removed outright
+	p := ipPod("ds", "p-ds", "10.0.0.7")
+	p.Status.PodIPs = []corev1.PodIP{{IP: "10.0.0.7"}, {IP: "fd00::7"}}
+	s.UpsertPod(p)
+	s.DeletePod(types.UID("ds"))
+
+	for _, ip := range []string{"10.0.0.7", "fd00::7"} {
+		if np, ok := s.GetPodByIP(ip); ok {
+			t.Errorf("%s still resolves to %q after deletion", ip, np.Pod.Name)
+		}
+	}
+	if len(s.byPodIP) != 0 {
+		t.Errorf("byPodIP retained %d entries: %v", len(s.byPodIP), s.byPodIP)
+	}
+}
+
+// And the live pod that takes a released address is promoted onto BOTH
+// families, not only the primary.
+func TestPromotionCoversEveryAddress(t *testing.T) {
+	s := New(time.Minute)
+	old := ipPod("old", "p-old", "10.0.0.8")
+	old.Status.PodIPs = []corev1.PodIP{{IP: "10.0.0.8"}, {IP: "fd00::8"}}
+	s.UpsertPod(old)
+	newer := ipPod("new", "p-new", "10.0.0.8")
+	newer.Status.PodIPs = []corev1.PodIP{{IP: "10.0.0.8"}, {IP: "fd00::8"}}
+	s.UpsertPod(newer)
+
+	s.DeletePod(types.UID("new"))
+	for _, ip := range []string{"10.0.0.8", "fd00::8"} {
+		np, ok := s.GetPodByIP(ip)
+		if !ok || np.Pod.Name != "p-old" {
+			t.Errorf("GetPodByIP(%s) = %q ok=%v; the surviving claimant must be promoted on every address",
+				ip, np.Pod.Name, ok)
+		}
 	}
 }

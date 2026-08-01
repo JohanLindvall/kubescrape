@@ -101,8 +101,15 @@ type record struct {
 	// now-recycled PodIP, so it must not steal the IP index from a live pod
 	// that legitimately holds it.
 	terminating bool
-	// ipSeq is the store sequence at which this record last ACQUIRED its
-	// current PodIP (see Store.ipSeq).
+	// ipSeq is the store sequence at which this record last ACQUIRED an
+	// address it did not already hold (see Store.ipSeq).
+	//
+	// Per-RECORD, not per-address: a dual-stack pod gaining a second address
+	// also raises its precedence on the first. Observable only if a pod's
+	// status gains an address while RETAINING a contested one — the kubelet
+	// writes podIPs whole at sandbox start and does not emit that transition
+	// — and making it exact costs a per-record map on the path every pod
+	// upsert runs, so it is documented rather than paid for.
 	ipSeq uint64
 }
 
@@ -354,8 +361,9 @@ func (s *Store) claimOneIPLocked(rec *record, pod kubemeta.Pod, ip string, oldIP
 
 // promoteIPClaimantLocked re-points byPodIP[ip] at a surviving eligible pod
 // after the current claimant released or lost the IP. Eligibility mirrors
-// claimPodIPLocked: live (not tombstoned), running-phase, non-hostNetwork,
-// status.podIP == ip. A non-terminating claimant is preferred over a
+// claimPodIPLocked, through the same podAddresses helper: live (not
+// tombstoned), running-phase, non-hostNetwork, and holding ip among
+// status.podIPs — the SECONDARY address of a dual-stack pod included. A non-terminating claimant is preferred over a
 // terminating one (same precedence the claim path applies); among equals the
 // pick is arbitrary — exactly like concurrent last-write-wins claims.
 //
@@ -378,8 +386,13 @@ func (s *Store) promoteIPClaimantLocked(ip string, skip *record) {
 		if !r.expireAt.IsZero() { // tombstoned: not live
 			continue
 		}
-		p := r.pod
-		if p.PodIP != ip || p.HostNetwork || ip == p.HostIP || finishedPhase(p.Phase) {
+		// Eligibility through the SAME helper the claim path uses: it returns
+		// the addresses a pod may legitimately hold and nothing for a
+		// hostNetwork or finished one, so this subsumes the four separate
+		// checks that stood here. They compared the single p.PodIP, which
+		// meant a dual-stack claimant could never be promoted onto its
+		// SECONDARY address — the address then resolved to nothing at all.
+		if !containsStr(podAddresses(r.pod), ip) {
 			continue
 		}
 		if pick == nil || beatsClaimant(pick, r) {
@@ -467,22 +480,23 @@ func (s *Store) deletePodLocked(uid types.UID) {
 	}
 	now := s.now()
 	s.removeFromNodeLocked(rec.pod.NodeName, uid)
+	// EVERY address, through the one helper that drops the claim, deletes the
+	// mapping under an identity check and promotes a survivor.
+	//
+	// Releasing only rec.pod.PodIP from byPodIP left a dual-stack pod's
+	// SECONDARY entry pointing at the deleted record for the process lifetime
+	// (Sweep never revisits byPodIP): the whole kubemeta.Pod stayed reachable,
+	// and with -cache-ttl 0 — where deletePodLocked returns below WITHOUT
+	// stamping DeletedAt — GetPodByIP's tombstone guard never fired, so a
+	// deleted pod answered /v1/pod-ips and /v1/self on that address forever.
+	// A live pod that legitimately took the address stayed unresolvable, since
+	// nothing promoted it either.
+	//
+	// The promotion matters for the same reason it always did: the deleted
+	// claimant may have been STALE (a force-deleted or node-lost pod, never
+	// marked terminating) whose last-write-wins claim shadowed the live holder.
 	for _, ip := range recordAddresses(rec) {
-		// Stop claiming the address even when this record was not the winner:
-		// a shadowed claimant left behind would keep the address's claimant
-		// set (and its promotion candidates) growing across pod churn.
-		s.dropClaimantLocked(ip, rec)
-	}
-	if rec.pod.PodIP != "" && s.byPodIP[rec.pod.PodIP] == rec {
-		delete(s.byPodIP, rec.pod.PodIP)
-		// The deleted claimant may have been STALE: a force-deleted or
-		// node-lost pod (never marked terminating) whose last-write-wins
-		// claim shadowed the live holder. Promote a surviving eligible pod —
-		// without this the live owner stays unresolvable until its next real
-		// update (a same-RV resync short-circuits before re-claiming). The
-		// scan only runs when the deleted pod owned an IP mapping, and only
-		// walks the map once (deletes are informer-rate).
-		s.promoteIPClaimantLocked(rec.pod.PodIP, rec)
+		s.releaseIPLocked(rec, ip)
 	}
 
 	if s.ttl <= 0 {

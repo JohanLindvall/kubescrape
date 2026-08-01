@@ -2,6 +2,7 @@ package spanmetrics
 
 import (
 	"context"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -585,5 +586,56 @@ func TestStaleSeriesSurviveFailedExport(t *testing.T) {
 	}
 	if exp2.exports() != 0 || len(g.series) != 0 {
 		t.Fatalf("exports=%d series=%d after a delivered series went stale, want 0/0", exp2.exports(), len(g.series))
+	}
+}
+
+// The series key must be built from the SAME truncated values the data points
+// render. Keyed on the raw ones, two spans differing only past maxDimBytes
+// occupied two series that rendered byte-identical attribute sets — duplicate
+// points in one export, which downstream reads as a conflict rather than as
+// extra detail — and the key retained in the map was as long as the sender
+// cared to make span.name, leaking past the bound truncation exists to impose.
+func TestSeriesKeyTruncatesLikeTheRenderedDimensions(t *testing.T) {
+	prefix := strings.Repeat("a", maxDimBytes)
+	exp := &capExporter{}
+	g := New(Config{Dimensions: []string{"db.statement"}})
+
+	// Same span name and same extra-dimension value up to the cut; different
+	// only in the bytes no data point will ever carry.
+	g.Consume(traces("svc",
+		spanSpec{name: prefix + "-one", dur: 0.01, attrs: map[string]string{"db.statement": prefix + "-x"}},
+		spanSpec{name: prefix + "-two", dur: 0.02, attrs: map[string]string{"db.statement": prefix + "-y"}},
+	))
+
+	if n := len(g.series); n != 1 {
+		t.Fatalf("series = %d, want 1: spans that render identically must share one series", n)
+	}
+	for k := range g.series {
+		// 6 parts at most maxDimBytes each, plus the length prefixes; the
+		// untruncated key grew with whatever the sender sent.
+		if max := len(g.names) * (maxDimBytes + 8); len(k) > max {
+			t.Errorf("series key is %d bytes, want <= %d: untruncated values are retained in the map", len(k), max)
+		}
+	}
+
+	if err := g.Export(context.Background(), exp, pcommon.NewResource()); err != nil {
+		t.Fatal(err)
+	}
+	m, ok := exp.find("traces.span.metrics.calls")
+	if !ok {
+		t.Fatal("calls metric missing")
+	}
+	dps := dp(m)
+	if dps.Len() != 1 {
+		t.Fatalf("exported %d data points, want 1 (a duplicate series renders the identical attribute set twice)", dps.Len())
+	}
+	if got := dps.At(0).IntValue(); got != 2 {
+		t.Errorf("calls = %d, want 2: both spans belong to the one rendered series", got)
+	}
+	if got := attr(dps.At(0).Attributes(), "span.name"); got != prefix {
+		t.Errorf("span.name = %q (%d bytes), want the %d-byte truncation", got, len(got), maxDimBytes)
+	}
+	if got := attr(dps.At(0).Attributes(), "db.statement"); got != prefix {
+		t.Errorf("db.statement = %q (%d bytes), want the %d-byte truncation", got, len(got), maxDimBytes)
 	}
 }

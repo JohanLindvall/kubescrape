@@ -260,10 +260,21 @@ func (g *Generator) observe(span ptrace.Span, resAttrs pcommon.Map, svc string, 
 	// Build the map key on the stack (does not escape → the map[string(key)]
 	// lookup allocates nothing for a warm series). A key over keyScratch bytes
 	// falls back to a one-off heap grow.
+	//
+	// Every part is truncDim'd exactly as dims() truncates the values it
+	// RENDERS. Keying on the untruncated values instead made the key finer than
+	// the data points it identifies: two spans differing only past maxDimBytes
+	// held two series that rendered byte-identical attribute sets — a duplicate
+	// series in one export, which is a conflict downstream, not extra detail —
+	// and the retained key was unbounded in size, so the truncation's other job
+	// (bounding what a sender can pin in memory for staleAfter) leaked through
+	// the map. Truncating a Go string is a reslice: the warm path stays
+	// allocation-free. Kind and status are closed enum spellings, truncated
+	// nowhere.
 	var keyScratch [256]byte
 	key := keyScratch[:0]
-	key = appendKeyPart(key, svc)
-	key = appendKeyPart(key, span.Name())
+	key = appendKeyPart(key, truncDim(svc))
+	key = appendKeyPart(key, truncDim(span.Name()))
 	key = appendKeyPart(key, span.Kind().String())
 	key = appendKeyPart(key, span.Status().Code().String())
 	for _, k := range g.extra {
@@ -271,7 +282,7 @@ func (g *Generator) observe(span ptrace.Span, resAttrs pcommon.Map, svc string, 
 		if v == "" {
 			v = attrStr(resAttrs, k) // fall back to the resource
 		}
-		key = appendKeyPart(key, v)
+		key = appendKeyPart(key, truncDim(v))
 	}
 	d := durationSeconds(span)
 	sz := spanSize(span)

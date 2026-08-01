@@ -658,6 +658,13 @@ func TestReplayingIsDerivedPerStream(t *testing.T) {
 			if r.replaying != tc.want {
 				t.Fatalf("replaying = %v after stream(), want %v", r.replaying, tc.want)
 			}
+			// The filter's boundary is snapshotted by the SAME call. Without
+			// this assertion the only production writer of replayFrom could be
+			// deleted with the suite still green — and a zero boundary
+			// disables the filter, re-exporting a whole TTL window.
+			if !r.replayFrom.Equal(r.committed.Watermark) {
+				t.Fatalf("replayFrom = %v after stream(), want the committed watermark %v", r.replayFrom, r.committed.Watermark)
+			}
 		})
 	}
 }

@@ -509,9 +509,16 @@ func (c *Client) grpcAuth(ctx context.Context) (context.Context, error) {
 // So Close is a no-op here and the release is ours. It happens only once the
 // buffer has been read to EOF — the transport is the sole reader and never
 // reads again after that — which is also what proves the writeLoop is done
-// with it. If the exchange ended before the body was fully written, the
-// buffer is simply left to the GC: one allocation, on a path that is already
-// failing, in exchange for never handing out live memory.
+// with it.
+//
+// A body that never reached EOF is left to the GC rather than pooled. That
+// covers a redirect answered early, but ALSO every export that fails before
+// the body is written — a refused dial, a TLS error, a cancelled context —
+// so with an unreachable collector on the HTTP protocol the gzip pool goes
+// cold and each attempt allocates its buffer afresh. That is the price of
+// never handing out memory a writeLoop may still be reading: the alternative
+// needs proof that no goroutine holds the body, which the net/http API does
+// not offer.
 type pooledBody struct {
 	buf      *bufpool.Buffer
 	consumed atomic.Bool

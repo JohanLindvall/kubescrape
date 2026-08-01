@@ -168,6 +168,19 @@ func validateConfig(cfg agentConfig, transformsFile string) error {
 					return fmt.Errorf("routing route %q: invalid namespace pattern %q: %w", rt.Name, pat, err)
 				}
 			}
+			// Through the SAME derivation a real start uses, then validated
+			// like any other destination. The dry run used to check the name,
+			// the namespaces and the patterns and stop — so a scheme-less
+			// route endpoint, or TLS material inherited onto a plaintext
+			// route, passed -check-config and CrashLooped the agent on start,
+			// which is the one outcome this check exists to prevent.
+			rcfg, err := routeExportConfig(cfg.Export, rt)
+			if err != nil {
+				return err
+			}
+			if err := rcfg.Validate(); err != nil {
+				return fmt.Errorf("routing route %q: %w", rt.Name, err)
+			}
 		}
 	}
 	if transformsFile != "" {
@@ -176,6 +189,42 @@ func validateConfig(cfg agentConfig, transformsFile string) error {
 		}
 	}
 	return nil
+}
+
+// routeExportConfig derives one route destination's client config: the flag
+// base, plus the export section's base additions (headers, client cert), plus
+// the route's own endpoint and headers (which win per key).
+//
+// ONE derivation, shared by validateConfig and the real start, for the same
+// reason validateConfig itself is shared — a dry run that builds something
+// else proves nothing about what will start.
+//
+// A route with no endpoint of its own inherits the flag base, and that is an
+// ERROR when the base is not a destination this deployment uses: with all
+// three signals overridden in export:, BuildExporter never constructs the
+// default chain, so the flag endpoint is whatever it happened to default to
+// (the stock otel-collector.monitoring address). Inheriting it silently sent
+// a tenant's telemetry to a collector nobody configured.
+func routeExportConfig(exp *otlpexport.ExportConfig, rt route.Route) (otlpexport.Config, error) {
+	rcfg := exp.ApplyBase(baseExportConfig())
+	if len(rt.Headers) > 0 {
+		merged := make(map[string]string, len(rcfg.Headers)+len(rt.Headers))
+		for k, v := range rcfg.Headers {
+			merged[k] = v
+		}
+		for k, v := range rt.Headers {
+			merged[k] = v
+		}
+		rcfg.Headers = merged
+	}
+	if rt.Endpoint != "" {
+		rcfg.Endpoint = rt.Endpoint
+		return rcfg, nil
+	}
+	if exp != nil && exp.Logs != nil && exp.Metrics != nil && exp.Traces != nil {
+		return otlpexport.Config{}, fmt.Errorf("routing route %q: no endpoint, and the flag base is not a destination here (export: overrides every signal, so the default chain is never built) — give the route its own endpoint", rt.Name)
+	}
+	return rcfg, nil
 }
 
 // printConfigSummary reports what a real start would enable, so -check-config

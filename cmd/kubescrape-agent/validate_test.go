@@ -110,3 +110,55 @@ func TestValidateConfigSkipsAnUnbuiltBase(t *testing.T) {
 		t.Fatal("accepted an endpoint-less base that the default chain would be built from")
 	}
 }
+
+// -check-config must reject exactly what a real start rejects. It used to
+// check a route's name, namespaces and patterns and stop, so a scheme-less
+// route endpoint passed the dry run and CrashLooped the agent on start — the
+// one outcome the check exists to prevent.
+func TestValidateConfigChecksRouteDestinations(t *testing.T) {
+	bad := agentConfig{Routing: &route.Config{Routes: []route.Route{{
+		Name: "tenant-a", Namespaces: []string{"a-*"},
+		Endpoint: "collector.example.com:4318", // no scheme
+	}}}}
+	oldProto, oldEP := *otlpProtocol, *otlpEndpoint
+	defer func() { *otlpProtocol, *otlpEndpoint = oldProto, oldEP }()
+	// A valid base, so the ROUTE endpoint is the only thing under test.
+	*otlpProtocol, *otlpEndpoint = "http", "https://collector.example.com:4318"
+
+	if err := validateConfig(bad, ""); err == nil {
+		t.Fatal("accepted a scheme-less route endpoint that otlpexport.New rejects at startup")
+	}
+
+	good := agentConfig{Routing: &route.Config{Routes: []route.Route{{
+		Name: "tenant-a", Namespaces: []string{"a-*"},
+		Endpoint: "https://collector.example.com:4318",
+	}}}}
+	if err := validateConfig(good, ""); err != nil {
+		t.Fatalf("rejected a route a real start accepts: %v", err)
+	}
+}
+
+// A route with no endpoint inherits the flag base — which is not a
+// destination at all when every signal is overridden in export:, since
+// BuildExporter never builds the default chain. Inheriting it there sent a
+// tenant's telemetry to whatever the endpoint flag happened to default to.
+func TestRouteWithoutEndpointRejectedWhenTheBaseIsUnused(t *testing.T) {
+	full := &otlpexport.ExportConfig{
+		Logs:    &otlpexport.ExportOverride{Endpoint: "https://loki:443", Protocol: "http"},
+		Metrics: &otlpexport.ExportOverride{Endpoint: "https://mimir:443", Protocol: "http"},
+		Traces:  &otlpexport.ExportOverride{Endpoint: "https://tempo:443", Protocol: "http"},
+	}
+	headerOnly := []route.Route{{Name: "tenant-a", Namespaces: []string{"a-*"}, Headers: map[string]string{"X-Scope-OrgID": "a"}}}
+
+	cfg := agentConfig{Export: full, Routing: &route.Config{Routes: headerOnly}}
+	if err := validateConfig(cfg, ""); err == nil {
+		t.Fatal("accepted a header-only route inheriting a base the deployment never dials")
+	}
+
+	// With the default chain in play, inheriting the base is the point.
+	partial := &otlpexport.ExportConfig{Logs: full.Logs}
+	cfg = agentConfig{Export: partial, Routing: &route.Config{Routes: headerOnly}}
+	if err := validateConfig(cfg, ""); err != nil {
+		t.Fatalf("rejected a header-only route where the base IS the fallback destination: %v", err)
+	}
+}

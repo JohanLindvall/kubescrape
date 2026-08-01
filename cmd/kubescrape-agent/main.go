@@ -560,22 +560,11 @@ func run() error {
 					return fmt.Errorf("routing route %q: invalid namespace pattern %q: %w", rt.Name, pat, err)
 				}
 			}
-			// Route clients inherit the flag base PLUS the export section's
-			// base additions (headers, client cert); the route's own headers
-			// win per key.
-			rcfg := fileCfg.Export.ApplyBase(baseExport)
-			if len(rt.Headers) > 0 {
-				merged := make(map[string]string, len(rcfg.Headers)+len(rt.Headers))
-				for k, v := range rcfg.Headers {
-					merged[k] = v
-				}
-				for k, v := range rt.Headers {
-					merged[k] = v
-				}
-				rcfg.Headers = merged
-			}
-			if rt.Endpoint != "" {
-				rcfg.Endpoint = rt.Endpoint
+			// The SAME derivation -check-config validates (routeExportConfig),
+			// so a config the dry run accepts is a config that starts.
+			rcfg, err := routeExportConfig(fileCfg.Export, rt)
+			if err != nil {
+				return err
 			}
 			rc, err := otlpexport.New(rcfg)
 			if err != nil {

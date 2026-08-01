@@ -166,7 +166,9 @@ func (t *Tailer) reopen(ctx context.Context, f *file, renamed bool) {
 		// only copy, and the segment record is what lets feedSegments re-read
 		// it. It retires in commitBatch once its whole range commits.
 		f.segments = append(f.segments, keep(&segment{
-			id: f.tail, inode: f.inode, fp: f.fp, committed: f.committed, to: fedEnd,
+			// fed: `to` IS the last fed line boundary, so this segment's whole
+			// owed range is already in the pipeline or the batch.
+			id: f.tail, inode: f.inode, fp: f.fp, committed: f.committed, to: fedEnd, fed: true,
 		}))
 		hopAdded = true
 	}
@@ -199,6 +201,13 @@ func (t *Tailer) reopen(ctx context.Context, f *file, renamed bool) {
 	// from fed segments are still in the unflushed batch, and re-feeding them
 	// would duplicate every one of those records on a plain truncation.
 	f.segmentsFed = wasFed
+	if wasFed {
+		// Same restoration, per segment: a rotation purges nothing, so the
+		// lines that were live before it still are.
+		for _, sg := range f.segments {
+			sg.fed = true
+		}
+	}
 	f.newTail()
 	// A new incarnation: any goneEnd from an earlier one no longer describes
 	// this file (see the resurrect path in sweep).
@@ -431,6 +440,7 @@ func (t *Tailer) replaySegment(ctx context.Context, f *file, p *segment) bool {
 		// entry).
 		if fed > p.committed {
 			p.to = fed
+			p.fed = true // the whole pinned range is now live
 		} else {
 			f.retire(p) // nothing recoverable was fed
 		}
@@ -461,6 +471,9 @@ func (t *Tailer) replaySegment(ctx context.Context, f *file, p *segment) bool {
 			f.retire(p) // nothing recoverable at all
 		}
 	}
+	// The owed range is covered: its lines are live, so an entry traversing
+	// this segment genuinely reaches `to` and may claim it (see segment.fed).
+	p.fed = true
 	return true
 }
 

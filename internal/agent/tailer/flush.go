@@ -218,9 +218,13 @@ func (t *Tailer) buildRecord(b *recordBuilder, e entry) {
 // spans a segment whose remainder was never fed. Proposing its recorded `to`
 // then committed and RETIRED it (fd closed, checkpoint entry gone) over lines
 // nobody had read: silent loss, in the recovery path that exists because
-// nothing else can recover those bytes. With segments unfed, only the entry's
-// own end offset commits; the remainder advances on its own entries once the
-// replay finishes.
+// nothing else can recover those bytes.
+//
+// The test is PER-SEGMENT (segment.fed), not the file-level segmentsFed: that
+// one only turns true after the whole replay pass, so every mid-pass flush saw
+// it false — and since this runs once per entry at flush time, gating on it
+// DROPPED the claim rather than deferring it, leaving the segment unretirable
+// for the process lifetime.
 func proposeCandidates(cands map[*file]map[int]int64, e entry) {
 	c := cands[e.file]
 	if c == nil {
@@ -230,9 +234,9 @@ func proposeCandidates(cands map[*file]map[int]int64, e entry) {
 	if e.end.off > c[e.end.seg] {
 		c[e.end.seg] = e.end.off
 	}
-	if e.start.seg != e.end.seg && e.file.segmentsFed {
+	if e.start.seg != e.end.seg {
 		for _, sg := range e.file.segments {
-			if sg.id >= e.start.seg && sg.id < e.end.seg && sg.to > c[sg.id] {
+			if sg.id >= e.start.seg && sg.id < e.end.seg && sg.fed && sg.to > c[sg.id] {
 				c[sg.id] = sg.to
 			}
 		}

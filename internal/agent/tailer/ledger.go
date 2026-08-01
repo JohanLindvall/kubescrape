@@ -342,6 +342,12 @@ func (l *ledger) state(key string) *streamState {
 // the new inode. Callers must re-derive any cached state pointers afterwards.
 func (l *ledger) reset() {
 	l.segmentsFed = false
+	// The purge takes the segments' lines with it: whatever was live is not
+	// any more, so no traversal claim over them is sound until they are
+	// re-fed. reopen restores this for a rotation, which purges nothing.
+	for _, sg := range l.segments {
+		sg.fed = false
+	}
 	l.streams = nil
 }
 
@@ -370,6 +376,25 @@ type segment struct {
 	id    int
 	inode uint64
 	fp    fingerprint
+	// fed reports whether this segment's owed range is LIVE — its lines are in
+	// the pipeline or the unflushed batch, so an entry that traverses the
+	// segment genuinely covers it through `to`.
+	//
+	// Per-SEGMENT, because the file-level segmentsFed is only true after the
+	// WHOLE replay pass finishes: every flushDuringDrain inside the pass sees
+	// it false, and proposeCandidates is evaluated once per entry at flush
+	// time, so gating on it DROPPED the traversal claim instead of deferring
+	// it — and after the pass f.feeding is 0, so no later entry can start in
+	// that segment and re-offer it. The segment then never retired: its
+	// checkpoint entry was rewritten forever, settledGone never fired (a
+	// deleted file's fd and map entry pinned for the process lifetime), and a
+	// restart replayed the prefix without its continuation, freezing the
+	// commit frontier.
+	//
+	// A rotation-recorded segment is fed at birth: `to` is the last FED line
+	// boundary at rotation time, so its bytes are already in the pipeline. A
+	// checkpoint-restored one is not, until feedSegments re-reads its range.
+	fed bool
 	// committed is the commit progress within the segment: [committed, to) is
 	// the range still owed (re-read on restart or after a rewind). It starts
 	// at the tail's committed offset when the rotation closes the segment and

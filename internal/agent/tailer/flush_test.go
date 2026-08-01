@@ -596,11 +596,11 @@ func TestPermanentRejectionDropsAndKeepsShipping(t *testing.T) {
 // checkpoint entry gone — over lines nobody had fed: silent loss in the one
 // path that exists because nothing else can recover those bytes.
 func TestTraversedSegmentsAreNotClaimedWhileUnfed(t *testing.T) {
-	f := &file{ledger: ledger{segments: []*segment{{id: 1, committed: 100, to: 5000}}, tail: 2}}
+	sg := &segment{id: 1, committed: 100, to: 5000}
+	f := &file{ledger: ledger{segments: []*segment{sg}, tail: 2}}
 	e := entry{file: f, start: pos{seg: 1, off: 4000}, end: pos{seg: 2, off: 80}}
 
 	// Interrupted replay: segment 1 still owes [committed, to).
-	f.segmentsFed = false
 	cands := map[*file]map[int]int64{}
 	proposeCandidates(cands, e)
 	if off, ok := cands[f][1]; ok {
@@ -610,12 +610,23 @@ func TestTraversedSegmentsAreNotClaimedWhileUnfed(t *testing.T) {
 		t.Errorf("the entry's own end must still commit, got %d", cands[f][2])
 	}
 
-	// Fully fed: every owed line is live, so the traversal genuinely covers
-	// the segment and its completion is proposed as before.
-	f.segmentsFed = true
+	// Fed: every owed line is live, so the traversal genuinely covers the
+	// segment and its completion is proposed.
+	sg.fed = true
 	cands = map[*file]map[int]int64{}
 	proposeCandidates(cands, e)
 	if cands[f][1] != 5000 {
-		t.Errorf("a fully-fed traversed segment must be proposed complete, got %d", cands[f][1])
+		t.Errorf("a fed traversed segment must be proposed complete, got %d", cands[f][1])
+	}
+
+	// The gate must be PER-SEGMENT: the file-level segmentsFed is false for
+	// the whole of a replay pass, and proposeCandidates is evaluated once at
+	// flush time — so gating on it dropped this claim permanently, leaving a
+	// segment nothing could ever retire.
+	f.segmentsFed = false
+	cands = map[*file]map[int]int64{}
+	proposeCandidates(cands, e)
+	if cands[f][1] != 5000 {
+		t.Errorf("a fed segment was not claimed during a replay pass (segmentsFed false), got %d; nothing re-offers it, so the segment can never retire", cands[f][1])
 	}
 }

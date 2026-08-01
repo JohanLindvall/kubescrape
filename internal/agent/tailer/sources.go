@@ -228,10 +228,22 @@ func (s *compiledSource) glob() ([]string, bool) {
 	var out []string
 	ok := true
 	for _, g := range s.include {
-		m, err := doublestar.FilepathGlob(g)
+		// WithFailOnIOErrors is the whole point of the bool. By default
+		// FilepathGlob documents itself as IGNORING filesystem errors — its
+		// only error is ErrBadPattern, which compileSources already rejected
+		// at startup — so this never once reported false, and the two guards
+		// it gates (gone-detection and checkpoint pruning) were dead code. An
+		// unreadable or vanished include base then listed as EMPTY: every
+		// tracked file marked gone, and saveCheckpoints pruned the persisted
+		// offsets of files it merely could not see. A node-wide re-ingest on
+		// the next successful listing, or outright loss if a restart landed in
+		// between.
+		m, err := doublestar.FilepathGlob(g, doublestar.WithFailOnIOErrors())
 		if err != nil {
-			// An errored pattern proves nothing about which files are gone;
-			// the caller must not treat absence from this listing as removal.
+			// Proves nothing about which files are gone; the caller must not
+			// treat absence from this listing as removal. A base directory
+			// that does not exist yet lands here too, which is the same
+			// conservative answer: nothing to prune, nothing to declare gone.
 			ok = false
 			continue
 		}

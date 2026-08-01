@@ -589,3 +589,33 @@ func TestPermanentRejectionDropsAndKeepsShipping(t *testing.T) {
 		t.Errorf("kubescrape_log_export_failures_total moved by %v; want 0 — nothing was rewound", got)
 	}
 }
+
+// A multi-line group can join across a replay that the per-sweep byte budget
+// interrupted, so the entry spans a segment whose remainder was never read.
+// Proposing that segment's recorded `to` committed and retired it — fd closed,
+// checkpoint entry gone — over lines nobody had fed: silent loss in the one
+// path that exists because nothing else can recover those bytes.
+func TestTraversedSegmentsAreNotClaimedWhileUnfed(t *testing.T) {
+	f := &file{ledger: ledger{segments: []*segment{{id: 1, committed: 100, to: 5000}}, tail: 2}}
+	e := entry{file: f, start: pos{seg: 1, off: 4000}, end: pos{seg: 2, off: 80}}
+
+	// Interrupted replay: segment 1 still owes [committed, to).
+	f.segmentsFed = false
+	cands := map[*file]map[int]int64{}
+	proposeCandidates(cands, e)
+	if off, ok := cands[f][1]; ok {
+		t.Errorf("claimed segment 1 through %d while its range was still unfed; committing it retires the segment over unread lines", off)
+	}
+	if cands[f][2] != 80 {
+		t.Errorf("the entry's own end must still commit, got %d", cands[f][2])
+	}
+
+	// Fully fed: every owed line is live, so the traversal genuinely covers
+	// the segment and its completion is proposed as before.
+	f.segmentsFed = true
+	cands = map[*file]map[int]int64{}
+	proposeCandidates(cands, e)
+	if cands[f][1] != 5000 {
+		t.Errorf("a fully-fed traversed segment must be proposed complete, got %d", cands[f][1])
+	}
+}

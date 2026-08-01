@@ -231,3 +231,38 @@ func ptrStr(b *bool) string {
 	}
 	return "false"
 }
+
+// The listing-OK bool exists so an unreadable include base is never mistaken
+// for "every file was removed" — gone-detection and checkpoint pruning both
+// gate on it. doublestar's FilepathGlob IGNORES filesystem errors by default,
+// so without WithFailOnIOErrors it reported success on a directory it could
+// not read, the listing came back empty, and saveCheckpoints pruned the
+// offsets of files it merely could not see.
+func TestGlobReportsUnreadableBaseDirectories(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores directory permissions")
+	}
+	dir := t.TempDir()
+	logs := filepath.Join(dir, "logs")
+	if err := os.Mkdir(logs, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(logs, "a.log"), []byte("x\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	srcs := compileSources([]Source{{Name: "s", Include: []string{filepath.Join(logs, "*.log")}}}, logs, false)
+	if paths, ok := srcs[0].glob(); !ok || len(paths) != 1 {
+		t.Fatalf("baseline listing: paths=%v ok=%v; want one file and ok", paths, ok)
+	}
+
+	if err := os.Chmod(logs, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = os.Chmod(logs, 0o755) }()
+
+	paths, ok := srcs[0].glob()
+	if ok {
+		t.Errorf("an unreadable include base listed as OK with %d paths; the tailer would mark every file gone and prune its offsets", len(paths))
+	}
+}

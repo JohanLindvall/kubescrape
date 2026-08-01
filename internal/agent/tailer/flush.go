@@ -179,10 +179,16 @@ func (t *Tailer) buildRecord(b *recordBuilder, e entry) {
 			b.bound[e.file] = bm
 		}
 		b.resolver.Set(lr.Attributes(), e.file.resource.Attributes(), b.resolver.Severity)
+		b.resolver.SetLifted(extracted.Resource) // see the rules path below
 		bm.Add(b.resolver.ValueFn(), b.resolver.LabelFn(), e.body)
 	}
 	if t.cfg.Rules != nil || e.file.podRules != nil {
 		b.resolver.Set(lr.Attributes(), e.file.resource.Attributes(), logchain.LowerSeverity(lr.SeverityText()))
+		// This line's lifted resource attributes rank between the two. Every
+		// other producer hands its rules and metrics the MERGED resource, so
+		// without this the same logAttributes + logs.rules config selected
+		// differently depending on which pipeline carried the line.
+		b.resolver.SetLifted(extracted.Resource)
 		// Pod-annotation rules first, then the global chain: each is
 		// first-match-wins on its own, a pod drop is final, a pod keep still
 		// passes through the global rules.
@@ -205,6 +211,16 @@ func (t *Tailer) buildRecord(b *recordBuilder, e entry) {
 // (start.seg up to but excluding end.seg) are fully covered through their
 // recorded end, so their completion is proposed too. A dead segment id
 // resolves to nothing at commit.
+//
+// "Fully covered" holds only while segmentsFed does. A replay stopped by the
+// per-sweep byte budget leaves part of a segment UNREAD, and a multi-line
+// group can still join across that interruption into the tail — so the entry
+// spans a segment whose remainder was never fed. Proposing its recorded `to`
+// then committed and RETIRED it (fd closed, checkpoint entry gone) over lines
+// nobody had read: silent loss, in the recovery path that exists because
+// nothing else can recover those bytes. With segments unfed, only the entry's
+// own end offset commits; the remainder advances on its own entries once the
+// replay finishes.
 func proposeCandidates(cands map[*file]map[int]int64, e entry) {
 	c := cands[e.file]
 	if c == nil {
@@ -214,7 +230,7 @@ func proposeCandidates(cands map[*file]map[int]int64, e entry) {
 	if e.end.off > c[e.end.seg] {
 		c[e.end.seg] = e.end.off
 	}
-	if e.start.seg != e.end.seg {
+	if e.start.seg != e.end.seg && e.file.segmentsFed {
 		for _, sg := range e.file.segments {
 			if sg.id >= e.start.seg && sg.id < e.end.seg && sg.to > c[sg.id] {
 				c[sg.id] = sg.to

@@ -858,3 +858,42 @@ func TestCacheTypeMismatchRefetches(t *testing.T) {
 		t.Fatalf("hits = %d, name = %q; the re-fetch should have cached the new type", n, again.Name)
 	}
 }
+
+// A slow poller must keep its ETag. The sweep used to delete on EXPIRY —
+// which is precisely the stale-but-revalidatable state If-None-Match exists
+// for — so every URL read less often than the 1m sweep (the 1m self and
+// node-metadata refreshes against a 10s TTL) re-fetched a full body forever.
+func TestSweepKeepsStaleEntriesForRevalidation(t *testing.T) {
+	srv, hits := cachingServer(t, `"v1"`, `{"name":"web","uid":"u1"}`)
+	c := New(srv.URL, 5*time.Second)
+	now := time.Now()
+	c.now = func() time.Time { return now }
+
+	ctx := context.Background()
+	_, _ = c.PodByUID(ctx, "u1") // populate (hit 1)
+
+	// Three reads at a 1m cadence: each is stale (10s TTL), so each is a
+	// conditional GET the server answers 304 — never a full re-fetch.
+	for i := 0; i < 3; i++ {
+		now = now.Add(time.Minute)
+		if p, err := c.PodByUID(ctx, "u1"); err != nil || p.Name != "web" {
+			t.Fatalf("read %d: pod=%v err=%v", i, p, err)
+		}
+	}
+	if n := atomic.LoadInt32(hits); n != 4 {
+		t.Fatalf("server hits = %d; want 4 (one populate + three revalidations)", n)
+	}
+	if got := len(c.cache); got != 1 {
+		t.Fatalf("cache entries = %d; want 1 — the entry the slow poller keeps revalidating", got)
+	}
+
+	// Left alone past the idle window, it IS swept: a dead container's pod
+	// document must not be held forever.
+	now = now.Add(cacheMaxIdle + time.Minute)
+	c.mu.Lock()
+	c.evictLocked()
+	c.mu.Unlock()
+	if got := len(c.cache); got != 0 {
+		t.Fatalf("cache entries = %d; want 0 — an idle entry is never asked for again", got)
+	}
+}

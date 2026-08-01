@@ -98,6 +98,15 @@ type cacheEntry struct {
 	decoded any
 	etag    string
 	expires time.Time
+	// used is when this entry was last READ or written. Eviction sweeps on
+	// it, not on expires: an EXPIRED entry is exactly the state If-None-Match
+	// is built on — it still carries the ETag that turns the next read into a
+	// 304 — so sweeping by expiry threw away the revalidation state for every
+	// URL polled slower than the sweep (the 1m self and node-metadata reads
+	// against a 10s TTL), and each of those re-fetched a full body forever.
+	// What the sweep is actually for is the dead container nobody asks about
+	// again, and that is idleness.
+	used time.Time
 }
 
 // New creates a client for the service at base (e.g.
@@ -261,7 +270,12 @@ func (c *Client) lookupEntry(key string, v any) (entry cacheEntry, cached, fresh
 		delete(c.cache, key)
 		return cacheEntry{}, false, false
 	}
-	fresh = cached && c.now().Before(entry.expires)
+	now := c.now()
+	if cached {
+		entry.used = now
+		c.cache[key] = entry // keeps a revalidated-but-stale entry alive
+	}
+	fresh = cached && now.Before(entry.expires)
 	return entry, cached, fresh
 }
 
@@ -304,6 +318,7 @@ func (c *Client) fetch(ctx context.Context, u, key string, entry cacheEntry, cac
 		c.mu.Lock()
 		if cur, ok := c.cache[key]; ok && cur.etag == entry.etag {
 			cur.expires = expires
+			cur.used = c.now()
 			c.cache[key] = cur
 		}
 		c.mu.Unlock()
@@ -333,7 +348,7 @@ func (c *Client) fetch(ctx context.Context, u, key string, entry cacheEntry, cac
 				return err
 			}
 			c.mu.Lock()
-			c.cache[key] = cacheEntry{decoded: dec.Interface(), etag: resp.Header.Get("ETag"), expires: c.now().Add(ttl)}
+			c.cache[key] = cacheEntry{decoded: dec.Interface(), etag: resp.Header.Get("ETag"), expires: c.now().Add(ttl), used: c.now()}
 			c.evictLocked()
 			c.mu.Unlock()
 			c.observe(OutcomeOK)
@@ -363,8 +378,15 @@ func (c *Client) fetch(ctx context.Context, u, key string, entry cacheEntry, cac
 // endpoint, and an unbounded read of it is an OOM on every node at once.
 const maxResponseBytes = 64 << 20
 
-// cacheSweepEvery is how often expired entries are swept below the cap.
+// cacheSweepEvery is how often IDLE entries are swept below the cap.
 const cacheSweepEvery = time.Minute
+
+// cacheMaxIdle is how long an unread entry is kept. Comfortably above the
+// slowest poll any caller makes (the 1m self-attributes and node-metadata
+// refreshes), so a periodic reader always still finds its ETag and gets a
+// 304 instead of a full body; a container nobody looks up again is gone
+// within two sweeps of it.
+const cacheMaxIdle = 5 * time.Minute
 
 // maxCacheEntries bounds the response cache. Without a cap the map grows by
 // one entry per distinct container/pod URL ever fetched — a steady leak on
@@ -378,12 +400,12 @@ const maxCacheEntries = 4096
 // cadvisor lookups.
 const evictLowWater = maxCacheEntries * 3 / 4
 
-// evictLocked trims the cache when it exceeds the cap: expired entries first,
+// evictLocked trims the cache when it exceeds the cap: IDLE entries first,
 // then arbitrary ones (they re-fetch cheaply via ETag revalidation). Caller
 // holds the mutex.
 func (c *Client) evictLocked() {
 	now := c.now()
-	// Sweep expired entries periodically even below the cap. The cap alone
+	// Sweep idle entries periodically even below the cap. The cap alone
 	// only ran at 4096 entries, so on a node with pod churn the cache held
 	// thousands of dead containers' FULL pod documents — tens of MB of heap
 	// that nothing would ever ask for again — until the next insert crossed the
@@ -394,14 +416,14 @@ func (c *Client) evictLocked() {
 		}
 		c.lastSweep = now
 		for k, e := range c.cache {
-			if now.After(e.expires) {
+			if now.Sub(e.used) > cacheMaxIdle {
 				delete(c.cache, k)
 			}
 		}
 		return
 	}
 	for k, e := range c.cache {
-		if now.After(e.expires) {
+		if now.Sub(e.used) > cacheMaxIdle {
 			delete(c.cache, k)
 		}
 	}

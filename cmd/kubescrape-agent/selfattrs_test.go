@@ -130,7 +130,10 @@ func TestSelfDescribing(t *testing.T) {
 // under the same service.name as the per-node DaemonSet: taking the node as
 // its instance would put two processes on one (job, instance).
 func TestAgentSelfResourceSingletonInstance(t *testing.T) {
-	defer func(e, a bool) { *eventsOn, *azureOn = e, a }(*eventsOn, *azureOn)
+	defer func(e, a, l, m, c, n, j, i bool) {
+		*eventsOn, *azureOn = e, a
+		*logsOn, *metricsOn, *cadvisorOn, *nodeOn, *journaldOn, *ingestOn = l, m, c, n, j, i
+	}(*eventsOn, *azureOn, *logsOn, *metricsOn, *cadvisorOn, *nodeOn, *journaldOn, *ingestOn)
 
 	*eventsOn, *azureOn = false, false
 	res := agentSelfResource("node1")
@@ -138,7 +141,19 @@ func TestAgentSelfResourceSingletonInstance(t *testing.T) {
 		t.Errorf("per-node agent instance = %q; want the node", v.AsString())
 	}
 
+	// -events on the DAEMONSET (agent.extraArgs, a supported escape hatch) is
+	// not the singleton: keying on the flag alone flipped every node's
+	// instance from the stable node name to a per-restart pod name.
 	*eventsOn = true
+	*logsOn = true
+	res = agentSelfResource("node1")
+	if v, _ := res.Attributes().Get("service.instance.id"); v.AsString() != "node1" {
+		t.Errorf("node agent with -events instance = %q; want the node", v.AsString())
+	}
+
+	// The real singleton: a cluster-scoped pipeline with every per-node one
+	// off, exactly what the events Deployment renders.
+	*logsOn, *metricsOn, *cadvisorOn, *nodeOn, *journaldOn, *ingestOn = false, false, false, false, false, false
 	res = agentSelfResource("node1")
 	v, _ := res.Attributes().Get("service.instance.id")
 	if v.AsString() == "node1" || v.AsString() == "" {

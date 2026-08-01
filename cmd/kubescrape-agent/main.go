@@ -19,6 +19,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -82,11 +83,28 @@ func agentSelfResource(node string) pcommon.Resource {
 	// DaemonSet agent. Two processes on one series: their counters interleave,
 	// and now that each stamps its own pod, their target_info flaps between two
 	// identities. A singleton's instance is its POD.
-	if *eventsOn || *azureOn {
+	//
+	// Keyed on actually BEING the singleton — the per-node pipelines all off —
+	// not merely on the flag: -events added to the DaemonSet's extraArgs (a
+	// supported way to run it, and the chart's own escape hatch) flipped every
+	// agent in the fleet from the stable node name to a pod name that changes
+	// on every restart, resetting each node's whole cumulative history.
+	if singletonRole() {
 		a.PutStr("service.instance.id", selfPodName())
 	}
 	attrs.Identity(res)
 	return res
+}
+
+// singletonRole reports whether this process is the cluster-singleton
+// deployment (the events / Azure-diagnostics reader) rather than a node agent:
+// a cluster-scoped pipeline is on and every per-node one is off, which is
+// exactly what charts/kubescrape/templates/events.yaml renders.
+func singletonRole() bool {
+	if !*eventsOn && !*azureOn {
+		return false
+	}
+	return !*logsOn && !*metricsOn && !*cadvisorOn && !*nodeOn && !*journaldOn && !*ingestOn
 }
 
 // The agent's flag surface. Package-level so the per-pipeline start
@@ -221,6 +239,13 @@ var (
 	spanMetrics   = flag.Bool("ingest-span-metrics", false, "derive RED (calls + duration histogram) metrics from ingested spans, dimensioned by service.name/span.name/span.kind/status.code; exported over OTLP (tune via the traceMetrics config section)")
 	spanMetricsIv = flag.Duration("ingest-span-metrics-interval", time.Minute, "export interval for span metrics")
 	ingestPeerIP  = flag.Bool("ingest-peer-ip-fallback", false, "attribute pushed telemetry whose resource carries no container id / pod uid to the pod owning the connection's peer IP (hostNetwork senders never resolve)")
+	// The shed is the only defence the receiver has against senders it does
+	// not authenticate, and it interacts directly with -otlp-timeout: a
+	// collector taking the full timeout to answer holds every slot for that
+	// long, so a node with many pushers needs a higher bound and a node with
+	// a slow collector needs the pressure surfaced rather than buffered.
+	// Hard-coded, it was tunable only by rebuilding.
+	ingestMaxInFlight = flag.Int("ingest-max-in-flight", 0, "bound on concurrently-processed pushes across both ingest transports; over it senders get a retryable refusal (429 / ResourceExhausted with RetryInfo). 0 uses the built-in default (32)")
 )
 
 // pipelines bundles what the per-pipeline start functions share: the
@@ -255,9 +280,13 @@ type pipelines struct {
 	ingestMode     otlpingest.MetricsMode
 	filters        *promscrape.MetricFilters
 	splitters      []*promscrape.Splitter
-	// fatalErr receives a pipeline's fatal failure (currently only the ingest
-	// listener); wg.Wait orders the write before run() reads it.
-	fatalErr *error
+	// fatalErr receives a pipeline's fatal failure (currently the ingest
+	// listener and events leader election). ATOMIC: shutdown joins the
+	// producers on a BUDGET (waitFor), not an unbounded wg.Wait, so a
+	// straggler writing past the deadline would race run()'s read — a plain
+	// variable's happens-before died with the budget. First writer wins; the
+	// agent exits non-zero on whichever failure came first.
+	fatalErr *atomic.Pointer[error]
 }
 
 // spawn runs fn on the shared WaitGroup.
@@ -426,7 +455,17 @@ func run() error {
 	// lookup RUNS, so a published 0 always means unresolved, never "off").
 	var selfPod func() *kubemeta.Pod
 	if *selfAttrsOn && selfDescribing() && *selfAttrsRefresh > 0 {
-		selfPod = selfmeta.StartPod(ctx, selfResolve(meta), *selfAttrsRefresh, log)
+		// Its OWN client, deliberately without the Observe hook. This lookup
+		// retries on the refresh period forever when it cannot resolve — a
+		// hostNetwork pod, a NAT hop, an address family status.podIP does not
+		// carry — and errors are never cached, so through the shared client it
+		// added a permanent per-node not_found floor to
+		// kubescrape_metadata_requests_total, burying the container-attribution
+		// failures the alert on that metric exists to catch. Its outcomes are
+		// counted by kubescrape_self_metadata_lookups_total instead, which is
+		// what that counter was added for.
+		selfMeta := metaclient.New(*metadataURL, max(*metadataWait, *ingestWait)+10*time.Second)
+		selfPod = selfmeta.StartPod(ctx, selfResolve(selfMeta), *selfAttrsRefresh, log)
 		obs.RegisterSelfMetadata(func() bool { return selfPod() != nil })
 	}
 
@@ -614,10 +653,10 @@ func run() error {
 		log.Info("log-derived metrics started", "metrics", logMetrics.Count, "interval", *logsMetricsEvery)
 	}
 
-	// A fatal pipeline failure (currently only the ingest listener) is stored
-	// here and returned after shutdown so the agent exits non-zero; wg.Wait
-	// orders the write before the read.
-	var fatalErr error
+	// A fatal pipeline failure (the ingest listener, events leader election)
+	// is stored here and returned after shutdown so the agent exits non-zero.
+	// Atomic because the shutdown join is BUDGETED: see pipelines.fatalErr.
+	var fatalErr atomic.Pointer[error]
 
 	p := &pipelines{
 		ctx:          ctx,
@@ -711,7 +750,10 @@ func run() error {
 		finalDrain(dctx)
 		dcancel()
 	}
-	return fatalErr
+	if ferr := fatalErr.Load(); ferr != nil {
+		return *ferr
+	}
+	return nil
 }
 
 // startLogs starts the container/plain-file log tailer. The returned Tailer
@@ -858,7 +900,8 @@ func (p *pipelines) startEvents() error {
 		})
 		if err != nil {
 			p.log.Error("leader election failed; shutting down", "error", err)
-			*p.fatalErr = fmt.Errorf("events leader election: %w", err)
+			ferr := fmt.Errorf("events leader election: %w", err)
+			p.fatalErr.CompareAndSwap(nil, &ferr) // first fatal wins
 			p.stop()
 		}
 	})
@@ -1005,12 +1048,13 @@ func (p *pipelines) startIngest() error {
 		p.log.Warn("-ingest-span-metrics ignored: traces are disabled (-ingest-traces=false)")
 	}
 	srv := otlpingest.NewServer(otlpingest.ServerConfig{
-		GRPCAddr: *ingestGRPC,
-		HTTPAddr: *ingestHTTP,
-		Enricher: enr,
-		Exporter: ingestOut,
-		Traces:   ingestTraceOut,
-		Logger:   p.log,
+		GRPCAddr:    *ingestGRPC,
+		HTTPAddr:    *ingestHTTP,
+		MaxInFlight: *ingestMaxInFlight,
+		Enricher:    enr,
+		Exporter:    ingestOut,
+		Traces:      ingestTraceOut,
+		Logger:      p.log,
 	})
 	p.spawn(func() {
 		if err := srv.Run(p.ctx); err != nil {
@@ -1019,7 +1063,8 @@ func (p *pipelines) startIngest() error {
 			// shut the agent down and exit non-zero so the failure is
 			// visible (CrashLoop).
 			p.log.Error("otlp ingest server failed; shutting down", "error", err)
-			*p.fatalErr = fmt.Errorf("otlp ingest server: %w", err)
+			ferr := fmt.Errorf("otlp ingest server: %w", err)
+			p.fatalErr.CompareAndSwap(nil, &ferr) // first fatal wins
 			p.stop()
 		}
 	})

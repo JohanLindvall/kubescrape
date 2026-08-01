@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/JohanLindvall/kubescrape/internal/agent/logscrub"
+	"github.com/JohanLindvall/kubescrape/internal/agent/otlpexport"
 	"github.com/JohanLindvall/kubescrape/internal/agent/route"
 	"github.com/JohanLindvall/kubescrape/internal/agent/tracesample"
 	"github.com/JohanLindvall/kubescrape/internal/metrics"
@@ -81,5 +82,31 @@ func TestValidateConfigUsesTheSameOptionsAsAStart(t *testing.T) {
 	*logsMetricsPrefix = ""
 	if err := validateConfig(cfg, ""); err == nil {
 		t.Fatal("accepted a nameless metric with no prefix; a real start rejects it")
+	}
+}
+
+// With all three signals overridden, BuildExporter never constructs the
+// default chain — the collectorless case, where -otlp-endpoint still holds
+// the stock collector address nothing dials. Validating that base anyway made
+// -check-config (and, since run() calls it too, every real start) reject a
+// config the exporter accepts, CrashLooping the DaemonSet fleet-wide.
+func TestValidateConfigSkipsAnUnbuiltBase(t *testing.T) {
+	old := *otlpEndpoint
+	defer func() { *otlpEndpoint = old }()
+	*otlpEndpoint = "" // no default destination at all
+
+	full := &otlpexport.ExportConfig{
+		Logs:    &otlpexport.ExportOverride{Endpoint: "https://loki:443", Protocol: "http"},
+		Metrics: &otlpexport.ExportOverride{Endpoint: "https://mimir:443", Protocol: "http"},
+		Traces:  &otlpexport.ExportOverride{Endpoint: "https://tempo:443", Protocol: "http"},
+	}
+	if err := validateConfig(agentConfig{Export: full}, ""); err != nil {
+		t.Fatalf("rejected a fully-overridden export config a real start accepts: %v", err)
+	}
+
+	// One signal short: the default IS built, so its base must still validate.
+	partial := &otlpexport.ExportConfig{Logs: full.Logs, Metrics: full.Metrics}
+	if err := validateConfig(agentConfig{Export: partial}, ""); err == nil {
+		t.Fatal("accepted an endpoint-less base that the default chain would be built from")
 	}
 }

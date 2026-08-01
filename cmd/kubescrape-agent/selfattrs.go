@@ -55,17 +55,44 @@ func selfResolve(meta *metaclient.Client) func(context.Context) (*kubemeta.Pod, 
 }
 
 // selfPodName is this pod's name: $POD_NAME when the deployment wires it, else
-// the hostname, which Kubernetes sets from the pod name unless a spec.hostname
-// overrides it.
+// the hostname.
+//
+// The hostname is only a usable fallback for a pod with its OWN UTS namespace,
+// where Kubernetes sets it from the pod name. A hostNetwork pod shares the
+// host's, so os.Hostname() is the NODE's name — and hostNetwork is precisely
+// the case this by-name path exists to cover, since such a pod can never be
+// attributed by peer address. $POD_NAME is therefore wired into the shipped
+// manifests, and looking up a pod named after the node simply 404s (the
+// resolver reports the failure rather than attributing anything).
 func selfPodName() string {
 	if n := strings.TrimSpace(os.Getenv("POD_NAME")); n != "" {
 		return n
+	}
+	if hostNetworkSelf() {
+		return "" // the node's hostname is not this pod's name
 	}
 	h, err := os.Hostname()
 	if err != nil {
 		return ""
 	}
 	return h
+}
+
+// hostNetworkSelf reports whether this process shares the host's network
+// namespace, in which case the hostname names the node rather than the pod.
+// /proc/self/ns/net is compared with the host's PID-1 namespace: identical
+// means hostNetwork (or a non-Kubernetes run, where the fallback is equally
+// meaningless).
+func hostNetworkSelf() bool {
+	self, err := os.Readlink("/proc/self/ns/net")
+	if err != nil {
+		return false
+	}
+	host, err := os.Readlink("/proc/1/ns/net")
+	if err != nil {
+		return false // cannot tell; keep the hostname fallback
+	}
+	return self == host
 }
 
 // selfBuild runs the configured `self` attribute pipeline over the agent's own

@@ -93,8 +93,18 @@ func validateConfig(cfg agentConfig, transformsFile string) error {
 	// are the ones that abort a real start: a bad protocol, compression,
 	// compression level or scheme-less endpoint, or TLS material on a
 	// plaintext connection.
-	if err := baseExportConfig().Validate(); err != nil {
-		return fmt.Errorf("otlp flags: %w", err)
+	//
+	// Only when the default chain is actually BUILT, and against the base the
+	// export section merges into. BuildExporter skips the default entirely
+	// once all three signals are overridden (persignal.go) — the collectorless
+	// case, where the flag endpoint still points at the stock collector
+	// address nothing dials — so validating it unconditionally CrashLooped
+	// the whole DaemonSet on a config a real start accepts, from the check
+	// whose purpose is preventing exactly that.
+	if e := cfg.Export; e == nil || e.Logs == nil || e.Metrics == nil || e.Traces == nil {
+		if err := cfg.Export.ApplyBase(baseExportConfig()).Validate(); err != nil {
+			return fmt.Errorf("otlp flags: %w", err)
+		}
 	}
 	if _, err := buildAttrs(cfg.ResourceAttributes); err != nil {
 		return fmt.Errorf("resourceAttributes: %w", err)

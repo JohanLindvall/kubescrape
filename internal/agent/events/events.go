@@ -130,6 +130,13 @@ type Reader struct {
 	// started from ""), which is the ONLY situation in which the watermark
 	// filter belongs: a replay re-sends events already exported, a positioned
 	// or live stream never does. See wanted.
+	//
+	// It is per-STREAM and is NOT cleared by a commit. Clearing it there
+	// disarmed the filter after the first acked batch — a couple of seconds
+	// into a replay that delivers the whole event TTL — so the rest of the
+	// backlog re-exported as duplicates, each Pod event costing a PodByName
+	// lookup. The next stream is positioned by the committed resourceVersion
+	// and starts false on its own.
 	replaying bool
 	// relist forces the next stream to start from "" (the full TTL backlog)
 	// after the API server dropped our resourceVersion. See expire.
@@ -403,7 +410,6 @@ func (r *Reader) handle(ctx context.Context, ev watch.Event) error {
 			if len(r.batch) == 0 {
 				r.committed.ResourceVersion = o.ResourceVersion
 				r.relist = false // a bookmark covers everything before it
-				r.replaying = false
 			}
 		}
 		return nil
@@ -460,7 +466,23 @@ func (r *Reader) flush(ctx context.Context) error {
 		return nil
 	}
 	ld := r.convert()
-	newest := r.batch[len(r.batch)-1]
+	// The batch's HIGH-WATER entry, not its last one. A relist delivers the
+	// backlog in store order and each object carries its own resourceVersion,
+	// so the last entry is routinely older than one earlier in the batch —
+	// committing it walked the position BACKWARDS (redelivery on restart), and
+	// in the other order committed a high RV while lower-RV entries of the
+	// same backlog were still undelivered (outright loss on a kill right
+	// after). The whole batch has exported by the time settle runs, so the
+	// maximum is exactly what is safe to commit.
+	newest := r.batch[0]
+	for _, e := range r.batch[1:] {
+		if newerRV(e.rv, newest.rv) {
+			newest.rv = e.rv
+		}
+		if e.when.After(newest.when) {
+			newest.when = e.when
+		}
+	}
 	count := ld.LogRecordCount()
 	if count > 0 {
 		if err := r.cfg.Exporter.ExportLogs(ctx, ld); err != nil {
@@ -486,7 +508,7 @@ func (r *Reader) flush(ctx context.Context) error {
 func (r *Reader) settle(newest entry) {
 	clear(r.batch)
 	r.batch = r.batch[:0]
-	if newest.rv != "" {
+	if newest.rv != "" && newerRV(newest.rv, r.committed.ResourceVersion) {
 		r.committed.ResourceVersion = newest.rv
 	}
 	// A bookmark seen while the batch was pending is now covered too — but only
@@ -509,7 +531,6 @@ func (r *Reader) settle(newest entry) {
 		// restart resumes from it instead of relisting the full TTL again, and
 		// what the stream delivers from here on is new rather than replayed.
 		r.relist = false
-		r.replaying = false
 	}
 }
 

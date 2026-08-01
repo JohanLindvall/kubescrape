@@ -365,6 +365,77 @@ events:
     limits:
       memory: 256Mi
 
+# Service-graph EDGE metrics (Grafana-Tempo-compatible) derived by pairing each
+# request's CLIENT span with its SERVER span. Those two spans are produced by
+# two pods that usually run on two different NODES, so a DaemonSet agent holds
+# half of every edge and can never pair anything — unlike agent.ingest.
+# spanMetrics, where each span is aggregated independently and the per-node
+# counters just sum. Pairing therefore gets its own StatefulSet: agents hash
+# each span by trace id onto a ring and forward a trimmed copy to the shard
+# that owns that trace (Tempo's distributor -> metrics-generator split).
+#
+# It costs a workload, one extra network hop per ingested span, and a new
+# metric family — which is why it is off by default. It needs
+# agent.ingest.enabled AND agent.ingest.traces: the spans it pairs are the ones
+# apps push to the node's agent.
+serviceGraph:
+  enabled: false
+  # Shard count. This number is part of the RING: the agents are given the
+  # same count and derive shard names from it, so change it here (helm
+  # upgrade), never with `kubectl scale` — a count larger than the running tier
+  # addresses pods that do not exist and their traces are never paired. Scaling
+  # moves ~1/N of the traces to a different shard and loses only the half-edges
+  # in flight at that moment. Two shards is a starting point: one is enough for
+  # correctness (the ring is not a quorum), more spreads CPU and the pairing
+  # store's memory.
+  replicas: 2
+  # The port the shards receive forwarded spans on. Both sides read this one
+  # value — the shard's listener and the agents' endpoint — so they cannot
+  # drift. Deliberately NOT 4317: that is the agents' own OTLP ingest port, and
+  # pointing this tier at it would loop spans back through the fan-out.
+  port: 4319
+  # Shared bearer token for the forward hop. The shard's receiver is reachable
+  # from every pod in the cluster, so it MUST be authenticated: create a Secret
+  # with a random token and name it here; it is mounted on the shards and on
+  # every agent, and the file is re-read periodically so rotating it needs no
+  # restart. Leaving `name` empty renders no token flag on either side and the
+  # shard REFUSES TO START its listener — an unauthenticated cluster-wide span
+  # receiver is not a state this chart will produce.
+  #   kubectl -n monitoring create secret generic kubescrape-service-graph \
+  #     --from-literal=token="$(openssl rand -hex 24)"
+  tokenSecret:
+    name: ""
+    key: token
+  # Tuning lives in the agent.config `serviceGraph` section (rendered into the
+  # same ConfigMap this tier mounts), because the same file also carries the
+  # agents' matching `serviceGraphShards.dimensions` — one file, no drift:
+  #   config:
+  #     serviceGraph:
+  #       wait: 10s            # how long a half-edge waits for its partner:
+  #                            # longer pairs more slow requests but holds more
+  #                            # memory; a rising expired counter means it is
+  #                            # shorter than the real client->server gap
+  #       maxItems: 10000      # half-edges held at once; over it spans are
+  #                            # dropped (counted, never silent)
+  #       maxCardinality: 20000  # distinct EDGE series
+  #       staleAfter: 15m      # evict unobserved edges — without it
+  #                            # maxCardinality is a one-way latch
+  #       dimensions: [http.route]   # extra client_/server_ labels
+  # Anything else goes here as raw flags, in the DaemonSet's style.
+  extraArgs: []
+  priorityClassName: ""
+  nodeSelector: {}
+  tolerations: []
+  # Memory scales with maxItems (half-edges awaiting a partner) and
+  # maxCardinality (edge series), not with the cluster's span rate; CPU scales
+  # with the forwarded span rate divided by the shard count.
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+    limits:
+      memory: 512Mi
+
 # Azure diagnostic-settings ingestion (resource logs + platform metrics) from
 # an Event Hubs namespace over its Kafka endpoint. Cluster-scoped like
 # events, so it runs in the SAME singleton Deployment (either section's

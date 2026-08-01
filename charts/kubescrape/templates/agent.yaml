@@ -223,6 +223,26 @@ spec:
             - -ingest-pod-uid-keys={{ join "," . }}
             {{- end }}
             {{- end }}
+            {{- if .Values.serviceGraph.enabled }}
+            {{- /* Service-graph edges are paired on the separate shard tier
+                   (templates/servicegraph.yaml): a request's client and server
+                   spans reach two different agents, so this agent only hashes
+                   each span by trace id and forwards a trimmed copy to the
+                   owning shard. The endpoint is the GOVERNING HEADLESS
+                   Service, from which the agent derives each shard's stable
+                   per-pod name (<sts>-<ordinal>.<service>.<ns>.svc:<port>) —
+                   naming the Service itself as a destination would round-robin
+                   and split a trace's two halves across shards. The shard
+                   count must equal the StatefulSet's replicas, which is why
+                   both read the one value. */}}
+            - -service-graph-shards={{ int64 .Values.serviceGraph.replicas }}
+            - -service-graph-endpoint={{ .Release.Name }}-servicegraph.{{ .Release.Namespace }}.svc:{{ int .Values.serviceGraph.port }}
+            {{- if .Values.serviceGraph.tokenSecret.name }}
+            # The same shared token the shards' receiver checks; re-read
+            # periodically, so rotating the Secret needs no lockstep restart.
+            - -service-graph-token-file=/etc/kubescrape/service-graph/{{ .Values.serviceGraph.tokenSecret.key | default "token" }}
+            {{- end }}
+            {{- end }}
             - -log-level={{ .Values.logLevel }}
             - -metrics-listen={{ if .Values.metrics.enabled }}{{ .Values.metrics.listen }}{{ end }}
             {{- with .Values.pprofListen }}
@@ -300,6 +320,11 @@ spec:
               mountPath: /etc/kubescrape/otlp-token
               readOnly: true
             {{- end }}
+            {{- if and .Values.serviceGraph.enabled .Values.serviceGraph.tokenSecret.name }}
+            - name: service-graph-token
+              mountPath: /etc/kubescrape/service-graph
+              readOnly: true
+            {{- end }}
             {{- if .Values.agent.journald.enabled }}
             # Volatile journals; persistent ones live under the /var/log
             # mount above.
@@ -333,6 +358,11 @@ spec:
         - name: otlp-token
           secret:
             secretName: {{ .Values.agent.otlp.bearerTokenSecret.name }}
+        {{- end }}
+        {{- if and .Values.serviceGraph.enabled .Values.serviceGraph.tokenSecret.name }}
+        - name: service-graph-token
+          secret:
+            secretName: {{ .Values.serviceGraph.tokenSecret.name }}
         {{- end }}
         {{- if .Values.agent.journald.enabled }}
         - name: runlogjournal

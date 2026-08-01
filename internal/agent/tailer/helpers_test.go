@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/JohanLindvall/kubescrape/internal/agent/attrs"
+	"github.com/JohanLindvall/kubescrape/internal/agent/otlpexport"
 	"github.com/JohanLindvall/kubescrape/internal/agent/positions"
 	"github.com/JohanLindvall/kubescrape/pkg/kubemeta"
 	"go.opentelemetry.io/collector/pdata/plog"
@@ -35,19 +36,24 @@ func (fakeMeta) Container(_ context.Context, id string, _ time.Duration) (*kubem
 }
 
 type fakeExporter struct {
-	mu       sync.Mutex
-	fail     int // fail this many exports before succeeding
-	records  []string
-	full     []plog.Logs    // deep copies of the exported batches
-	resAttrs map[string]any // resource attributes of the last batch
-	batches  int
-	attempts int // every ExportLogs call, including failed ones
+	mu         sync.Mutex
+	permanentN int // reject this many exports definitively (never retryable)
+	fail       int // fail this many exports before succeeding
+	records    []string
+	full       []plog.Logs    // deep copies of the exported batches
+	resAttrs   map[string]any // resource attributes of the last batch
+	batches    int
+	attempts   int // every ExportLogs call, including failed ones
 }
 
 func (f *fakeExporter) ExportLogs(_ context.Context, ld plog.Logs) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.attempts++
+	if f.permanentN > 0 {
+		f.permanentN--
+		return &otlpexport.HTTPStatusError{Code: 413}
+	}
 	if f.fail > 0 {
 		f.fail--
 		return errors.New("collector down")

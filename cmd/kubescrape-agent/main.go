@@ -669,7 +669,18 @@ func run() error {
 
 	<-ctx.Done()
 	log.Info("shutting down")
-	wg.Wait()
+	// BOUNDED. Everything that salvages in-memory state runs after this: the
+	// final log-metrics window (DynamicMetricSet.Run deliberately does not
+	// export on cancel, so this is its only chance), the final span-metrics
+	// export, the self-metrics FinalExport and the disk-buffer drain. A
+	// producer stuck retrying against a dead collector would otherwise hold
+	// the whole sequence past the kubelet's grace period and lose all of it to
+	// SIGKILL. Producers that miss the deadline lose nothing they own: log
+	// offsets, the journal cursor and the events position all re-read.
+	if !waitFor(&wg, shutdownDrain) {
+		log.Warn("producers did not stop within the shutdown budget; continuing with the final exports",
+			"budget", shutdownDrain)
+	}
 	if logMetrics != nil {
 		// The tailer's final flush (inside wg.Wait) fed the set; export the
 		// last window before the deferred exporter/buffer close.
@@ -1178,6 +1189,23 @@ func startNodeInfo(ctx context.Context, meta *metaclient.Client, nodeName string
 
 // buildAttrs assembles the per-pipeline resource-attribute builders from the
 // config file and the flags; flag statics override config statics.
+// shutdownDrain bounds the wait for the producers to stop. It plus the
+// tailer's own budget and the final exports has to fit inside the pod's
+// terminationGracePeriodSeconds, which the manifests set explicitly.
+const shutdownDrain = 15 * time.Second
+
+// waitFor waits for wg with a deadline, reporting whether it finished in time.
+func waitFor(wg *sync.WaitGroup, budget time.Duration) bool {
+	done := make(chan struct{})
+	go func() { wg.Wait(); close(done) }()
+	select {
+	case <-done:
+		return true
+	case <-time.After(budget):
+		return false
+	}
+}
+
 // selfSink picks the export chain for the metrics the agent generates about
 // ITSELF: `out` normally, and the PRE-ROUTING chain when routing is enabled.
 //

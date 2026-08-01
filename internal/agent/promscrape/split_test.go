@@ -776,3 +776,57 @@ kube_pod_size_bytes_count{namespace="ns1",pod="pod1"} 8
 		t.Fatalf("summary dp = count %d sum %v quantiles %d", sdp.Count(), sdp.Sum(), sdp.QuantileValues().Len())
 	}
 }
+
+// Every groupBy label must reach the resource as its mapped attribute, whether
+// or not the pod lookup resolved. putSplitLabels strips them from the data
+// points unconditionally, so writing them only on the enrichment-failed path
+// destroyed any groupBy attribute the k8s attribute build does not itself
+// produce: the rows then collapse onto one identical resource as
+// indistinguishable duplicate points, and only one survives downstream.
+func TestSplitterGroupByAttrsSurviveEnrichment(t *testing.T) {
+	body := `# TYPE kube_pod_container_resource_requests gauge
+kube_pod_container_resource_requests{namespace="ns1",pod="pod1",resource="cpu"} 0.5
+kube_pod_container_resource_requests{namespace="ns1",pod="pod1",resource="memory"} 1024
+`
+	srv := serveBody(t, body)
+	target := testTarget(srv.URL)
+	target.Pod.Name = "ksm-abc"
+	target.Pod.Labels = map[string]string{"app.kubernetes.io/name": "kube-state-metrics"}
+
+	sp, err := NewSplitters([]SplitterConfig{{
+		Match: SplitterMatch{PodLabels: map[string]string{"app.kubernetes.io/name": "kube-state-metrics"}},
+		Rules: []SplitRule{{
+			Metrics: `kube_pod_container_resource_.+`,
+			// namespace/pod resolve through the metadata service; `resource` is
+			// a groupBy attribute nothing else can supply.
+			GroupBy: map[string]string{"namespace": "k8s.namespace.name", "pod": "k8s.pod.name", "resource": "k8s.resource_name"},
+			Enrich:  true,
+		}},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	exp := &captureExporter{}
+	s := New(Config{
+		Node: "node1", Interval: time.Hour, Timeout: 5 * time.Second,
+		Targets: staticTargets{target}, Exporter: exp, StartTime: time.Now(),
+		Splitters: sp, Kubelet: KubeletConfig{Meta: &fakeMetaSource{}},
+	})
+	if _, err := s.scrapeTarget(context.Background(), target, s.cfg.Timeout); err != nil {
+		t.Fatal(err)
+	}
+
+	seen := map[string]bool{}
+	rms := exp.batches[0].ResourceMetrics()
+	for i := 0; i < rms.Len(); i++ {
+		rm := rms.At(i)
+		if v := attrStr(rm.Resource(), "k8s.resource_name"); v != "" {
+			seen[v] = true
+		}
+	}
+	for _, want := range []string{"cpu", "memory"} {
+		if !seen[want] {
+			t.Errorf("no resource carries k8s.resource_name=%s; the groupBy attribute was stripped from the points and never written (got %v)", want, seen)
+		}
+	}
+}

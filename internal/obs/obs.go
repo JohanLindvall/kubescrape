@@ -20,6 +20,14 @@ var (
 		"Raw log bytes read from live files and archives. Segment replays (re-reading a rotated file's owed range after a restart or rewind) are not re-counted.")
 	LogExportFailures = Registry.Counter("kubescrape_log_export_failures_total",
 		"Log batch exports that failed after retries (files rewound).")
+	// LogPermanentDropped is the tailer's counterpart to the other producers'
+	// permanent-rejection drops. Retrying a definitive rejection cannot
+	// succeed, and because one sweep goroutine serves every file on the node,
+	// retrying it forever stops ALL log shipping there — so the batch is
+	// dropped and the offsets advance. That is real data loss and must be
+	// alertable.
+	LogPermanentDropped = Registry.Counter("kubescrape_log_permanent_dropped_total",
+		"Log records dropped after a definitive collector rejection (retrying could not succeed; offsets advanced so the pipeline survives).")
 	LogFiles = Registry.Gauge("kubescrape_log_files",
 		"Log files currently tracked.")
 	LogRotations = Registry.Counter("kubescrape_log_rotations_total",
@@ -64,6 +72,13 @@ var (
 		"Buffered batches moved to the back of the queue after repeated transient failures (keeps one stuck batch from blocking the signal).", "signal")
 	BufferFull = Registry.CounterVec("kubescrape_buffer_full_total",
 		"Batches the disk buffer refused: the undelivered backlog is at its cap, or one batch exceeds the whole cap. Back-pressure for logs (the tailer rewinds and re-reads), a lost batch for producers that cannot rewind (scrape, self-metrics, log-metrics).", "signal")
+	// BufferEnqueueErrors counts write-side refusals that are NOT capacity:
+	// a latched fsync failure, a closed queue, ENOSPC from segment
+	// preallocation. For a producer that cannot rewind (scrape, self-metrics,
+	// log-metrics) the batch is gone, and every other buffer metric stays flat
+	// while it happens.
+	BufferEnqueueErrors = Registry.CounterVec("kubescrape_buffer_enqueue_errors_total",
+		"Batches the disk buffer refused for a reason other than capacity (I/O error, closed queue, no space left on device).", "signal")
 	BufferReadErrors = Registry.CounterVec("kubescrape_buffer_read_errors_total",
 		"Disk-buffer read failures while draining. lost=true is reported corruption the queue advanced past (its Stats carry the magnitude); lost=false left the queue in place for a retry.", "signal", "lost")
 	LogFifoDropped = Registry.Counter("kubescrape_log_fifo_orphans_total",

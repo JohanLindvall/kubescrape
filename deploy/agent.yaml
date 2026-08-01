@@ -52,6 +52,11 @@ spec:
         app: kubescrape-agent
     spec:
       serviceAccountName: kubescrape-agent
+      # The shutdown sequence is bounded but not instant: the tailer gets a
+      # final sweep+flush budget, then the final log-metrics, span-metrics
+      # and self-metrics exports run, then the disk buffer drains. The
+      # kubelet default of 30s cuts that short during a collector outage.
+      terminationGracePeriodSeconds: 60
       # Node-critical: an observability agent evicted under node pressure goes
       # missing exactly when its logs matter most.
       priorityClassName: system-node-critical

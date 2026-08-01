@@ -424,17 +424,32 @@ func (b *splitBatcher) fillSplitResource(res pcommon.Resource, rule *compiledSpl
 	if rule.enrich {
 		ctx, resolved = b.s.resolveContext(b.ctx, containerID, namespace, pod, uid, container, res)
 	}
-	if !resolved {
-		// Identity from the labels, under the mapped attribute names.
-		for _, g := range rule.groupBy {
-			value := labelValue(labels, g.label)
-			if g.attr == "container.id" {
-				value = kubemeta.NormalizeContainerID(value)
-			}
-			if value != "" {
-				res.Attributes().PutStr(g.attr, value)
+	// The groupBy labels move onto the resource under their mapped attribute
+	// names — ALWAYS, not only when enrichment failed. putSplitLabels strips
+	// every groupBy label from the data points unconditionally, so writing them
+	// here only in the !resolved branch DESTROYED any groupBy attribute outside
+	// the fixed set attrs.Build produces: a rule grouping by, say, `resource`
+	// (cpu/memory/ephemeral-storage) collapsed those rows onto one identical
+	// resource, leaving indistinguishable duplicate points of which only one
+	// survives downstream — the whole requests/limits breakdown, gone silently.
+	// It also made a series' resource shape change during a metadata outage.
+	//
+	// When enrichment DID resolve, the looked-up identity is authoritative, so
+	// the label-derived value only fills what the resolve left unset.
+	for _, g := range rule.groupBy {
+		value := labelValue(labels, g.label)
+		if g.attr == "container.id" {
+			value = kubemeta.NormalizeContainerID(value)
+		}
+		if value == "" {
+			continue
+		}
+		if resolved {
+			if _, exists := res.Attributes().Get(g.attr); exists {
+				continue
 			}
 		}
+		res.Attributes().PutStr(g.attr, value)
 	}
 	b.s.attrsFor(pipelineTargets).Build(res, ctx)
 	// Distinguish this described object's instance from its own self-scraped

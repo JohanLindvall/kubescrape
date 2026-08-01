@@ -7,6 +7,11 @@ image:
 # below — see `metrics.enabled`. The former `runtimeMetrics` value configured a
 # flag that no longer exists and made every agent refuse to start.)
 
+# Grace period for the agent and the events/Azure singleton. It has to cover
+# the bounded shutdown sequence: producers stop, the final log-metrics,
+# span-metrics and self-metrics exports run, then the disk buffer drains.
+terminationGracePeriodSeconds: 60
+
 # Prometheus /metrics endpoint on a DEDICATED port, serving this process's Go
 # runtime and process metrics (go_*, process_*). Separate from the health/debug
 # listener so the scrape target can be exposed independently. kubescrape's own

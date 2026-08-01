@@ -133,11 +133,41 @@ func TestPoisonRespondedLapsDrop(t *testing.T) {
 	if s.stuckTooLong(data) {
 		t.Fatal("dropped on first sighting")
 	}
-	s.delivered++ // the collector accepts another batch while this one is stuck
+	// Every lap must show the collector delivering something ELSE while this
+	// batch keeps failing — that is the evidence, and it expires.
+	for lap := 1; lap < maxDrainCycles; lap++ {
+		s.delivered++
+		if s.stuckTooLong(data) {
+			t.Fatalf("dropped on lap %d, before the budget was spent", lap)
+		}
+	}
+	s.delivered++
+	if !s.stuckTooLong(data) {
+		t.Fatal("poison batch not dropped after maxDrainCycles responded laps with concurrent deliveries")
+	}
+}
+
+// The bug this rule exists to prevent: ONE early delivery must not licence
+// every later responded lap to spend budget. A collector under memory pressure
+// that answers ResourceExhausted to everything is back-pressuring, not
+// rejecting this payload — and dropping then destroys good data during exactly
+// the outage the disk buffer exists to survive.
+func TestPoisonBudgetNotSpentWithoutConcurrentProgress(t *testing.T) {
+	s := &sink[plog.Logs]{kind: "logs", stuckResponded: true}
+	data := []byte("a batch stuck behind back-pressure")
+
+	if s.stuckTooLong(data) {
+		t.Fatal("dropped on first sighting")
+	}
+	s.delivered++ // one delivery, early
 	if s.stuckTooLong(data) {
 		t.Fatal("dropped one lap too early")
 	}
-	if !s.stuckTooLong(data) {
-		t.Fatal("poison batch not dropped after maxDrainCycles responded laps")
+	// From here nothing else gets through. However many laps this takes, the
+	// batch must survive: there is no evidence the collector would accept it.
+	for lap := 0; lap < 10*maxDrainCycles; lap++ {
+		if s.stuckTooLong(data) {
+			t.Fatalf("dropped on lap %d with no concurrent delivery: that is a back-pressure outage, not poison", lap)
+		}
 	}
 }

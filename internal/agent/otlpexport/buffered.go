@@ -312,7 +312,6 @@ type sink[T any] struct {
 type stuckBatch struct {
 	cycles        int
 	lastDelivered uint64 // s.delivered at this payload's previous failed cycle
-	sawProgress   bool   // the collector delivered another batch while this one was stuck
 }
 
 // maxDrainCycles bounds how many drain cycles a batch may fail — while the
@@ -340,7 +339,9 @@ func (s *sink[T]) enqueue(v T) error {
 		return err
 	}
 	err = s.buf.add(data)
-	if errors.Is(err, diskqueue.ErrFull) || errors.Is(err, diskqueue.ErrRecordTooLarge) {
+	switch {
+	case err == nil:
+	case errors.Is(err, diskqueue.ErrFull) || errors.Is(err, diskqueue.ErrRecordTooLarge):
 		// Back-pressure for logs (the tailer rewinds and re-reads), but a lost
 		// batch for every producer that cannot rewind — the scraper, the
 		// self-metrics registry, the log-metric exporter. Count it: an
@@ -348,6 +349,14 @@ func (s *sink[T]) enqueue(v T) error {
 		// ErrRecordTooLarge is one batch larger than the whole cap — a config
 		// problem, but the producer-facing handling is the same refusal.
 		obs.BufferFull.WithLabelValues(s.kind).Inc()
+	default:
+		// EVERY other refusal is counted too, and separately: a latched I/O
+		// error, a closed queue, or the raw *os.PathError diskqueue returns when
+		// segment preallocation hits ENOSPC. These were returned bare, so a full
+		// disk made a node go dark with every buffer metric flat — _full_total
+		// is the wrong class, _dropped_total is drain-side, and obs.Exports sits
+		// BELOW the buffer and is never reached.
+		obs.BufferEnqueueErrors.WithLabelValues(s.kind).Inc()
 	}
 	return err
 }
@@ -523,28 +532,26 @@ func (s *sink[T]) stuckTooLong(data []byte) bool {
 	if !seen && len(s.stuck) >= maxStuckTracked {
 		return false
 	}
-	if seen && !st.sawProgress && s.delivered > st.lastDelivered {
-		// First proof the collector is alive WHILE this batch is stuck: some other
-		// batch got through since our previous failure. Deliveries banked before
-		// we got stuck, or during a recovery we merely sat behind in the queue,
-		// advance s.delivered without any stuck cycle of ours spanning them, so
-		// this never fires for them. When this arming lap itself was RESPONDED,
-		// retro-credit the previous lap too (the batch was already failing while
-		// the delivery went through) so a genuine poison payload drops on the
-		// same cycle as before.
-		st.sawProgress = true
-		if s.stuckResponded {
-			st.cycles++
-		}
-	}
-	// A lap counts toward the poison budget only when the collector is alive
-	// (sawProgress) AND actually RESPONDED to this lap's send (a rejection, not
-	// a transport failure): after a blip delivery mid-outage, the resumed
-	// outage's connection failures must not spend the budget — only a live
-	// collector repeatedly refusing THIS payload while accepting others is
-	// poison evidence. (A collector rejecting EVERYTHING — a memory-limiter
-	// overload — never arms sawProgress, so nothing drops then either.)
-	if st.sawProgress && s.stuckResponded {
+	// Did the collector deliver some OTHER batch since THIS lap's predecessor?
+	// That is the whole evidence, and it must be re-established every lap.
+	// Latching it once — "it delivered something at some point, so every later
+	// responded lap counts" — spent the poison budget during a pure
+	// back-pressure event, destroying good data in exactly the outage the disk
+	// buffer exists to survive: one delivery early on armed the latch, and a
+	// collector that then started refusing everything (ResourceExhausted, which
+	// respondedError treats as a response) burned a cycle per lap until the
+	// head was dropped.
+	//
+	// Deliveries banked before this batch got stuck, or while it merely sat
+	// behind in the queue during a recovery, advance s.delivered without any
+	// failed lap of ours spanning them — the comparison is against the delivery
+	// count at our own previous failure, so they cannot count either.
+	progressed := seen && s.delivered > st.lastDelivered
+	// A lap counts only when the collector is alive (progressed) AND actually
+	// RESPONDED to this lap's send (a rejection, not a transport failure): only
+	// a live collector repeatedly refusing THIS payload while accepting others
+	// is poison evidence.
+	if progressed && s.stuckResponded {
 		st.cycles++
 	}
 	st.lastDelivered = s.delivered

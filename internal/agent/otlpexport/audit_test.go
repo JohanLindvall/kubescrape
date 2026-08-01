@@ -107,24 +107,36 @@ func TestPoisonBatchIsDroppedOnceCollectorTakesOthers(t *testing.T) {
 	if err := b.ExportMetrics(context.Background(), metricsWith("huge")); err != nil {
 		t.Fatal(err)
 	}
-	// Good data behind it: the collector takes these, proving it is alive.
-	for i := 0; i < 3; i++ {
-		if err := b.ExportMetrics(context.Background(), metricsWith("good")); err != nil {
-			t.Fatal(err)
-		}
-	}
 	before := obs.BufferDropped.WithLabelValues("metrics").Value()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go b.Run(ctx)
 
+	// Good data behind it, produced CONTINUOUSLY as a live agent does. The
+	// evidence that the collector is alive has to be re-established on every
+	// lap the poison batch fails: a single early delivery is not licence to
+	// keep spending the budget while nothing else is getting through, which is
+	// what turned a pure back-pressure event into data loss.
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		for {
+			select {
+			case <-done:
+				return
+			default:
+			}
+			_ = b.ExportMetrics(context.Background(), metricsWith("good"))
+			time.Sleep(2 * time.Millisecond)
+		}
+	}()
+
 	waitFor(t, func() bool {
 		return obs.BufferDropped.WithLabelValues("metrics").Value()-before == 1
 	}, "poison batch dropped and counted")
-	waitFor(t, func() bool { return ms.Bytes() == 0 }, "spool fully drained")
 	if got := send.delivered(); got < 3 {
-		t.Errorf("delivered %d good batches, want the 3 queued behind the poison one", got)
+		t.Errorf("delivered %d good batches, want the collector to have kept accepting them", got)
 	}
 }
 

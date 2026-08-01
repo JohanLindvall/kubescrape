@@ -119,6 +119,11 @@ type Reader struct {
 	pendingRV   string
 	lastPersist time.Time
 	lastFlush   time.Time
+	// replaying is set while the current stream is a full-backlog replay (it
+	// started from ""), which is the ONLY situation in which the watermark
+	// filter belongs: a replay re-sends events already exported, a positioned
+	// or live stream never does. See wanted.
+	replaying bool
 	// relist forces the next stream to start from "" (the full TTL backlog)
 	// after the API server dropped our resourceVersion. See expire.
 	relist bool
@@ -230,6 +235,10 @@ func (r *Reader) stream(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	// An empty resourceVersion replays the whole TTL backlog (a relist, or a
+	// cold start-from-beginning); anything else is positioned exactly by the
+	// API server and delivers only what follows.
+	r.replaying = rv == ""
 	if redelivers && len(r.batch) > 0 {
 		// Everything buffered is AFTER rv (entries only outlive a flush that
 		// failed, and the position never advanced past them), so this watch
@@ -350,6 +359,7 @@ func (r *Reader) handle(ctx context.Context, ev watch.Event) error {
 			if len(r.batch) == 0 {
 				r.committed.ResourceVersion = o.ResourceVersion
 				r.relist = false // a bookmark covers everything before it
+				r.replaying = false
 			}
 		}
 		return nil
@@ -377,12 +387,21 @@ func (r *Reader) handle(ctx context.Context, ev watch.Event) error {
 	return nil
 }
 
-// wanted filters a replayed event against the watermark. After a relist we
+// wanted filters a REPLAYED event against the watermark. After a relist we
 // re-receive everything still within the TTL; the watermark drops what was
 // already exported. Timestamps come from the REPORTING component's clock, so
 // the comparison is biased toward re-emitting (at-least-once).
+//
+// It applies ONLY while replaying. Event timestamps come from whichever
+// component reported the event, and a watch carries several — kubelet events
+// are second-truncated metav1.Time, scheduler and controller-manager events are
+// microsecond MicroTime — so on a live stream this dropped any event whose
+// reporter's clock trailed the watermark, permanently and silently. Worse, one
+// component with a fast clock latched a FUTURE watermark, which is persisted in
+// the position ConfigMap: the blackout then survived restarts and leader
+// handover.
 func (r *Reader) wanted(e *corev1.Event) bool {
-	if r.committed.Watermark.IsZero() {
+	if !r.replaying || r.committed.Watermark.IsZero() {
 		return true
 	}
 	when := eventTime(e)
@@ -436,8 +455,10 @@ func (r *Reader) settle(newest entry) {
 	}
 	if r.committed.ResourceVersion != "" {
 		// The replay (if one was pending) is secured up to this position: a
-		// restart resumes from it instead of relisting the full TTL again.
+		// restart resumes from it instead of relisting the full TTL again, and
+		// what the stream delivers from here on is new rather than replayed.
 		r.relist = false
+		r.replaying = false
 	}
 }
 

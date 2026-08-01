@@ -238,7 +238,7 @@ func (e *Enricher) EnrichMetrics(ctx context.Context, md pmetric.Metrics) pmetri
 		e.enrichMetricResources(ctx, md)
 		return md
 	default: // auto
-		if e.allResourcesHaveID(md) {
+		if e.resourceModeSuffices(md) {
 			e.enrichMetricResources(ctx, md)
 			return md
 		}
@@ -256,16 +256,90 @@ func (e *Enricher) enrichMetricResources(ctx context.Context, md pmetric.Metrics
 	}
 }
 
-// allResourcesHaveID reports whether every ResourceMetrics carries an ID
-// attribute at the resource level (so no data-point splitting is needed).
-func (e *Enricher) allResourcesHaveID(md pmetric.Metrics) bool {
+// resourceModeSuffices reports whether enriching each ResourceMetrics from its
+// own resource attributes attributes everything correctly — i.e. every resource
+// carries an ID and NO data point carries one of its own.
+//
+// The data-point half is not optional. A resource-level container.id is set
+// automatically by every SDK container detector (Go's resource.WithContainerID,
+// Java's ContainerResource, the collector's resourcedetection/container), and it
+// is in the default -ingest-container-id-keys. An exporter that DESCRIBES other
+// objects — the kube-state-metrics shape this mode exists for — therefore has a
+// resource ID naming ITSELF while each data point names a different pod. Asking
+// only about resources sent that straight down the resource branch and stamped
+// every point with the exporter's own pod and service.name, silently, with
+// kubescrape_ingest_resources_total{enriched} reading healthy. The same payload
+// in explicit datapoint mode split correctly, which is what
+// TestSplitResourceUsesDescribedObjectIdentity pins.
+func (e *Enricher) resourceModeSuffices(md pmetric.Metrics) bool {
 	rms := md.ResourceMetrics()
 	for i := 0; i < rms.Len(); i++ {
-		if _, ok := e.findID(rms.At(i).Resource().Attributes()); !ok {
+		rm := rms.At(i)
+		if _, ok := e.findID(rm.Resource().Attributes()); !ok {
+			return false
+		}
+		if e.anyDataPointHasID(rm) {
 			return false
 		}
 	}
 	return true
+}
+
+// anyDataPointHasID reports whether any data point in rm carries an ID
+// attribute of its own (one pass, stopping at the first hit).
+func (e *Enricher) anyDataPointHasID(rm pmetric.ResourceMetrics) bool {
+	sms := rm.ScopeMetrics()
+	for i := 0; i < sms.Len(); i++ {
+		ms := sms.At(i).Metrics()
+		for j := 0; j < ms.Len(); j++ {
+			if e.metricPointsHaveID(ms.At(j)) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func (e *Enricher) metricPointsHaveID(m pmetric.Metric) bool {
+	has := func(a pcommon.Map) bool { _, ok := e.findID(a); return ok }
+	switch m.Type() {
+	case pmetric.MetricTypeGauge:
+		dps := m.Gauge().DataPoints()
+		for i := 0; i < dps.Len(); i++ {
+			if has(dps.At(i).Attributes()) {
+				return true
+			}
+		}
+	case pmetric.MetricTypeSum:
+		dps := m.Sum().DataPoints()
+		for i := 0; i < dps.Len(); i++ {
+			if has(dps.At(i).Attributes()) {
+				return true
+			}
+		}
+	case pmetric.MetricTypeHistogram:
+		dps := m.Histogram().DataPoints()
+		for i := 0; i < dps.Len(); i++ {
+			if has(dps.At(i).Attributes()) {
+				return true
+			}
+		}
+	case pmetric.MetricTypeExponentialHistogram:
+		dps := m.ExponentialHistogram().DataPoints()
+		for i := 0; i < dps.Len(); i++ {
+			if has(dps.At(i).Attributes()) {
+				return true
+			}
+		}
+	case pmetric.MetricTypeSummary:
+		dps := m.Summary().DataPoints()
+		for i := 0; i < dps.Len(); i++ {
+			if has(dps.At(i).Attributes()) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // enrichResource resolves the ID on res and merges the k8s attributes it maps

@@ -178,6 +178,7 @@ type Tailer struct {
 	lastFlush      time.Time
 	lastCheckpoint time.Time
 	retryBackoff   time.Duration // initial export retry backoff
+	shutdownBudget time.Duration // ceiling on the final sweep+drain+flush
 
 	// status is the published per-file snapshot for /debug/tailer (written by
 	// the sweep goroutine in publishStatus, read from HTTP handlers).
@@ -203,6 +204,12 @@ func (t *Tailer) scratch() []byte {
 	}
 	return t.readBuf
 }
+
+// defaultShutdownBudget bounds the tailer's final sweep, drain and flush. It
+// has to leave room inside the pod's termination grace period for everything
+// that runs after the tailer stops: the final log-metrics window, span metrics,
+// self-metrics and the disk-buffer drain.
+const defaultShutdownBudget = 10 * time.Second
 
 // New creates a Tailer.
 func New(cfg Config) *Tailer {
@@ -249,12 +256,13 @@ func New(cfg Config) *Tailer {
 		// Until a scan runs, treat the listing as good: a save before any
 		// discovery has nothing to prune anyway, and starting false would make
 		// the very first save copy the whole stored map back.
-		lastListingOK: true,
-		sources:       sources,
-		scanDirs:      scanDirs,
-		files:         make(map[string]*file),
-		retryBackoff:  time.Second,
-		statusEvery:   10 * time.Second,
+		lastListingOK:  true,
+		sources:        sources,
+		scanDirs:       scanDirs,
+		files:          make(map[string]*file),
+		retryBackoff:   time.Second,
+		shutdownBudget: defaultShutdownBudget,
+		statusEvery:    10 * time.Second,
 	}
 }
 
@@ -313,14 +321,24 @@ func (t *Tailer) Run(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
-			t.sweep(context.Background(), true)
+			// The shutdown work is BOUNDED. context.Background() here meant a
+			// collector outage could hold the final sweep for as long as the
+			// export retries take (three attempts at -otlp-timeout each), while
+			// the kubelet's 30s grace runs out — and everything that salvages
+			// in-memory state (the final log-metrics window, span metrics,
+			// self-metrics, the buffer drain) runs AFTER this returns. A
+			// deadline is what makes those reachable; work that does not fit is
+			// re-read after the restart, which the offsets already guarantee.
+			sctx, scancel := context.WithTimeout(context.WithoutCancel(ctx), t.shutdownBudget)
+			t.sweep(sctx, true)
 			// Drain the pipelines; the emitted entries' offsets commit with
 			// the final flush, so nothing is re-read after a restart.
 			for _, f := range t.files {
-				t.stopPipeline(context.Background(), f)
+				t.stopPipeline(sctx, f)
 			}
-			t.flush(context.Background())
+			t.flush(sctx)
 			t.saveCheckpoints()
+			scancel()
 			return
 		case <-dirTicker.C:
 			t.scanDir(nil, false)

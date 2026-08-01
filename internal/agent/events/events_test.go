@@ -206,6 +206,7 @@ func TestWatermarkFiltersReplay(t *testing.T) {
 	r, _, _ := newReader(t, Config{})
 	base := time.Now()
 	r.committed.Watermark = base
+	r.replaying = true // the state a relist establishes (stream started from "")
 
 	if r.wanted(event("old", "R", "m", "Normal", "1", 1, base.Add(-time.Minute))) {
 		t.Fatal("an event older than the watermark must be filtered")
@@ -434,5 +435,46 @@ func TestRestartDropsRedeliveredBatch(t *testing.T) {
 	}
 	if len(r.batch) != 1 {
 		t.Fatalf("batch=%d, want the un-redelivered entry retained", len(r.batch))
+	}
+}
+
+// The watermark must NOT filter a live or position-resumed stream. Event
+// timestamps come from whichever component reported the event — kubelet events
+// are second-truncated metav1.Time, scheduler and controller-manager events are
+// microsecond MicroTime — so filtering there dropped every event whose
+// reporter's clock trailed the watermark. One fast clock latched a future
+// watermark, and since the watermark is persisted in the position ConfigMap,
+// the blackout survived restarts and leader handover.
+func TestWatermarkDoesNotFilterLiveStream(t *testing.T) {
+	r, _, _ := newReader(t, Config{})
+	base := time.Now()
+	r.committed.Watermark = base
+	r.replaying = false // positioned by a committed resourceVersion, or live
+
+	for _, when := range []time.Time{
+		base.Add(-time.Minute),    // a lagging reporter's clock
+		base.Add(-time.Second),    // second-truncated kubelet timestamp
+		base.Add(-24 * time.Hour), // a badly skewed node
+	} {
+		if !r.wanted(event("live", "R", "m", "Normal", "9", 1, when)) {
+			t.Fatalf("a live event at %v was dropped: the watermark only applies to a replay", when)
+		}
+	}
+}
+
+// A secured commit ends the replay, so the filter stops applying to what the
+// same stream delivers afterwards.
+func TestReplayEndsAtFirstCommit(t *testing.T) {
+	r, _, _ := newReader(t, Config{Exporter: &captureExporter{}, BatchSize: 1})
+	r.replaying = true
+	base := time.Now()
+	r.committed.Watermark = base
+
+	ctx := context.Background()
+	if err := r.handle(ctx, watch.Event{Type: watch.Added, Object: event("new", "R", "m", "Normal", "11", 1, base.Add(time.Second))}); err != nil {
+		t.Fatal(err)
+	}
+	if r.replaying {
+		t.Fatal("replay still armed after a committed flush; later events would be watermark-filtered")
 	}
 }

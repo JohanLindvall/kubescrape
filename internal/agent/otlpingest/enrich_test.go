@@ -524,3 +524,53 @@ func TestScrubStructuredLogBody(t *testing.T) {
 		t.Errorf("msg = %q; an ordinary field must survive", msg.Str())
 	}
 }
+
+// auto mode must not be fooled by a resource-level container.id. Every SDK
+// container detector sets one, and it is in the default container-id keys, so
+// an exporter that DESCRIBES other objects has a resource ID naming itself
+// while each data point names a different pod. Enriching from the resource
+// there stamps every described object with the exporter's own identity.
+func TestAutoModeSplitsWhenDataPointsCarryIdentity(t *testing.T) {
+	meta := &fakeMeta{
+		pods: map[string]*kubemeta.Pod{
+			"pod-a": {Name: "web-a", Namespace: "apps", UID: "pod-a"},
+			"pod-b": {Name: "web-b", Namespace: "apps", UID: "pod-b"},
+		},
+		containers: map[string]*kubemeta.ContainerMetadata{
+			"exporter-cid": {ContainerID: "exporter-cid", Pod: kubemeta.Pod{Name: "ksm-0", Namespace: "monitoring", UID: "ksm-uid"}},
+		},
+	}
+	e := NewEnricher(Config{Meta: meta}) // mode unset => auto
+
+	md := pmetric.NewMetrics()
+	rm := md.ResourceMetrics().AppendEmpty()
+	rm.Resource().Attributes().PutStr("container.id", "exporter-cid") // the SENDER
+	g := rm.ScopeMetrics().AppendEmpty().Metrics().AppendEmpty()
+	g.SetName("kube_pod_status_ready")
+	gauge := g.SetEmptyGauge() // once: SetEmptyGauge resets the points
+	for _, uid := range []string{"pod-a", "pod-b"} {
+		dp := gauge.DataPoints().AppendEmpty()
+		dp.Attributes().PutStr("k8s.pod.uid", uid)
+		dp.SetDoubleValue(1)
+	}
+
+	out := e.EnrichMetrics(context.Background(), md)
+	if out.ResourceMetrics().Len() < 2 {
+		t.Fatalf("auto produced %d resources; the described pods must not be collapsed onto the sender's",
+			out.ResourceMetrics().Len())
+	}
+	names := map[string]bool{}
+	for i := 0; i < out.ResourceMetrics().Len(); i++ {
+		if v, ok := out.ResourceMetrics().At(i).Resource().Attributes().Get("k8s.pod.name"); ok {
+			names[v.Str()] = true
+		}
+	}
+	for _, want := range []string{"web-a", "web-b"} {
+		if !names[want] {
+			t.Errorf("no resource for described pod %s; got %v", want, names)
+		}
+	}
+	if names["ksm-0"] && len(names) == 1 {
+		t.Error("every point was attributed to the exporter's own pod")
+	}
+}

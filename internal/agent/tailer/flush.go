@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/JohanLindvall/kubescrape/internal/agent/logenrich"
+	"github.com/JohanLindvall/kubescrape/internal/agent/otlpexport"
 	"github.com/JohanLindvall/kubescrape/internal/metrics"
 	"github.com/JohanLindvall/kubescrape/internal/obs"
 	"github.com/JohanLindvall/kubescrape/pkg/logattrs"
@@ -337,10 +338,27 @@ func (t *Tailer) flush(ctx context.Context) {
 	if kept > 0 {
 		err = t.exportWithRetry(ctx, ld)
 	}
-	if err != nil {
-		t.failBatch(inf, err)
-	} else {
+	switch {
+	case err == nil:
 		t.commitBatch(inf)
+	case otlpexport.IsPermanent(err):
+		// A definitive rejection (bad payload, unimplemented, over a receiver's
+		// body limit) is not survivable by retrying: rebuilding the identical
+		// batch next sweep wedges the file at its committed offset FOREVER, and
+		// with it every other file on the node — there is one sweep goroutine.
+		// Lag then grows unbounded, the fd is pinned against logrotate, and the
+		// backlog is lost outright when the file finally rotates away. Every
+		// other producer (journald, events, azurediag, ingest, the disk buffer)
+		// classifies; the tailer was the one that did not. Drop it and advance,
+		// the way journald.flush does, so the pipeline survives the poison
+		// record — counted and logged, never silent.
+		t.log.Error("dropping a permanently rejected log batch and advancing",
+			"records", inf.kept, "error", err)
+		obs.LogExportFailures.Inc()
+		obs.LogPermanentDropped.Add(float64(inf.kept))
+		t.commitBatch(inf)
+	default:
+		t.failBatch(inf, err)
 	}
 }
 
@@ -350,6 +368,12 @@ func (t *Tailer) exportWithRetry(ctx context.Context, ld plog.Logs) error {
 	for attempt := 0; attempt < 3; attempt++ {
 		if err = t.cfg.Exporter.ExportLogs(ctx, ld); err == nil {
 			return nil
+		}
+		if otlpexport.IsPermanent(err) {
+			// Retrying a definitive rejection cannot succeed; spending the
+			// budget on it only delays the sweep that serves every other file
+			// on this node. The caller drops the batch and advances.
+			return err
 		}
 		select {
 		case <-ctx.Done():

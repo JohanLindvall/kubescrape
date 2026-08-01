@@ -541,3 +541,39 @@ func TestScrubRedactsExportedBodies(t *testing.T) {
 		t.Fatalf("innocuous body changed: %q", got[1])
 	}
 }
+
+// A definitive rejection must not be retried forever. One sweep goroutine
+// serves every file on the node, so a batch the collector will never accept
+// (over a receiver's body limit, unimplemented, malformed) would otherwise pin
+// the file at its committed offset and stop ALL log shipping on that node —
+// until the file rotates away and the backlog is lost outright. The poisoned
+// batch is dropped, counted, and everything after it still ships.
+func TestPermanentRejectionDropsAndKeepsShipping(t *testing.T) {
+	before := obs.LogPermanentDropped.Value()
+	dir := t.TempDir()
+	exp := &fakeExporter{permanentN: 1} // the first batch is rejected for good
+	tl := newTestTailer(dir, "", exp)
+	stop := startTailer(t, tl)
+	defer stop()
+
+	writeLog(t, dir, `2026-07-05T10:00:00Z stdout F poison`)
+	waitFor(t, func() bool { return obs.LogPermanentDropped.Value() > before },
+		"the permanently rejected batch to be dropped and counted")
+
+	writeLines(t, filepath.Join(dir, logName), `2026-07-05T10:00:01Z stdout F after`)
+	waitFor(t, func() bool {
+		for _, r := range exp.get() {
+			if r == "after" {
+				return true
+			}
+		}
+		return false
+	}, "later lines to ship after the drop")
+
+	// The dropped batch must not have been re-sent: its offsets advanced.
+	for _, r := range exp.get() {
+		if r == "poison" {
+			t.Fatal("the permanently rejected record was re-exported; its offsets did not advance")
+		}
+	}
+}

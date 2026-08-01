@@ -87,6 +87,11 @@ spec:
         {{- end }}
     spec:
       serviceAccountName: {{ .Release.Name }}-agent
+      # The shutdown sequence is bounded but not instant: producers stop
+      # under a budget, then the final log-metrics, span-metrics and
+      # self-metrics exports run, then the disk buffer drains. The kubelet
+      # default of 30s cuts that short during a collector outage.
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
       {{- with .Values.agent.priorityClassName }}
       priorityClassName: {{ . }}
       {{- end }}

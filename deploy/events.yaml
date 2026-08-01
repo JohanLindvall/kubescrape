@@ -94,6 +94,8 @@ spec:
         app: kubescrape-events
     spec:
       serviceAccountName: kubescrape-events
+      # Room for the final events flush and position write (see the agent).
+      terminationGracePeriodSeconds: 60
       containers:
         - name: events
           image: ghcr.io/johanlindvall/kubescrape:latest

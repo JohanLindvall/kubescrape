@@ -4,6 +4,8 @@ import (
 	"testing"
 
 	"go.opentelemetry.io/collector/pdata/pcommon"
+
+	"github.com/JohanLindvall/kubescrape/pkg/logattrs"
 )
 
 // maps builds a record/resource attribute pair from literal string maps.
@@ -243,5 +245,58 @@ func TestResolverIsAllocationFree(t *testing.T) {
 		_ = rule("k8s.pod.name")
 	}); allocs != 0 {
 		t.Fatalf("resolving a record allocates %v times; the closures are bound once precisely to avoid that", allocs)
+	}
+}
+
+// A logAttributes rule that lifts a line field onto the RESOURCE must be
+// visible to rules and metric labels. Every producer but the tailer builds
+// its exported resource before running the chain, so it sees them; the tailer
+// resolves against the file's base resource with the lifted attributes still
+// pending. Without them ranking between record and resource, one config
+// selected differently depending on which pipeline carried the line.
+func TestLiftedResourceAttributesRankBetweenRecordAndResource(t *testing.T) {
+	rec := pcommon.NewMap()
+	rec.PutStr("only.record", "r")
+	rec.PutStr("both", "from-record")
+	res := pcommon.NewMap()
+	res.PutStr("only.resource", "R")
+	res.PutStr("both", "from-resource")
+	res.PutStr("tenant", "base")
+
+	r := New()
+	r.Set(rec, res, "info")
+	r.SetLifted([]logattrs.Attr{
+		{Key: "tenant", Val: "lifted"},
+		{Key: "both", Val: "from-lifted"},
+		{Key: "count", Val: int64(7)},
+		{Key: "ratio", Val: 1.5},
+		{Key: "on", Val: true},
+	})
+
+	label := r.LabelFn()
+	for _, tc := range []struct{ key, want string }{
+		{"only.record", "r"},
+		{"only.resource", "R"},
+		{"both", "from-record"}, // the record still wins
+		{"tenant", "lifted"},    // lifted beats the base resource
+		{"count", "7"},          // typed values render like pcommon
+		{"ratio", "1.5"},
+		{"on", "true"},
+		{"absent", ""},
+	} {
+		if got := label(tc.key); got != tc.want {
+			t.Errorf("label(%q) = %q; want %q", tc.key, got, tc.want)
+		}
+	}
+
+	if v, ok := r.ValueFn()("count"); !ok || v != 7 {
+		t.Errorf("value(count) = %v, %v; want 7, true", v, ok)
+	}
+
+	// Set clears them: a resolver re-pointed at the next record must not carry
+	// the previous line's lifted attributes.
+	r.Set(rec, res, "info")
+	if got := label("tenant"); got != "base" {
+		t.Errorf("after Set, label(tenant) = %q; the previous line's lifted attributes leaked", got)
 	}
 }

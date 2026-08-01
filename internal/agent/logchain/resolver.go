@@ -11,9 +11,12 @@
 package logchain
 
 import (
+	"fmt"
 	"strconv"
 
 	"go.opentelemetry.io/collector/pdata/pcommon"
+
+	"github.com/JohanLindvall/kubescrape/pkg/logattrs"
 )
 
 // SeverityKey is the synthetic key exposing a record's enriched severity to
@@ -31,6 +34,20 @@ const SeverityKey = "__severity__"
 type Resolver struct {
 	// Record and Resource are the attribute maps consulted, in that order.
 	Record, Resource pcommon.Map
+	// Lifted are resource attributes extracted from THIS line by
+	// logAttributes, consulted between the two.
+	//
+	// They are a separate slice only because of where the tailer sits: every
+	// other producer builds its exported resource first and hands the merged
+	// map over as Resource, so their rules and metric labels see line-lifted
+	// keys. The tailer resolves against the FILE's base resource while the
+	// lifted attributes are still a pending []Attr driving the flush grouping
+	// — so the identical logAttributes + logs.rules config selected
+	// differently depending on which producer carried the line, which is
+	// exactly what "one chain, one order" is supposed to rule out. A slice
+	// scan, not a map: rules number in the handful and the scan runs only for
+	// keys a rule or label actually asks for.
+	Lifted []logattrs.Attr
 	// Severity is the lowercased severity text SeverityKey resolves to.
 	Severity string
 
@@ -52,7 +69,12 @@ func New() *Resolver {
 // per record, which is the point of keeping the closures bound.
 func (r *Resolver) Set(rec, res pcommon.Map, severity string) {
 	r.Record, r.Resource, r.Severity = rec, res, severity
+	r.Lifted = nil
 }
+
+// SetLifted adds this line's logAttributes-lifted RESOURCE attributes, which
+// rank between the record's and the resource's. Call after Set.
+func (r *Resolver) SetLifted(lifted []logattrs.Attr) { r.Lifted = lifted }
 
 // LabelFn resolves a metric LABEL key (no synthetic keys).
 func (r *Resolver) LabelFn() func(string) string { return r.labelFn }
@@ -70,11 +92,46 @@ func (r *Resolver) lookup(k string) (pcommon.Value, bool) {
 	return r.Resource.Get(k)
 }
 
+// liftedValue returns the last lifted attribute for k (last wins, matching
+// how Put applies them to a resource).
+func (r *Resolver) liftedValue(k string) (any, bool) {
+	for i := len(r.Lifted) - 1; i >= 0; i-- {
+		if r.Lifted[i].Key == k {
+			return r.Lifted[i].Val, true
+		}
+	}
+	return nil, false
+}
+
 func (r *Resolver) label(k string) string {
-	if v, ok := r.lookup(k); ok {
+	if v, ok := r.Record.Get(k); ok {
+		return v.AsString()
+	}
+	if v, ok := r.liftedValue(k); ok {
+		return attrString(v)
+	}
+	if v, ok := r.Resource.Get(k); ok {
 		return v.AsString()
 	}
 	return ""
+}
+
+// attrString renders a lifted value the way pcommon.Value.AsString would.
+func attrString(v any) string {
+	switch x := v.(type) {
+	case string:
+		return x
+	case bool:
+		return strconv.FormatBool(x)
+	case int64:
+		return strconv.FormatInt(x, 10)
+	case float64:
+		return strconv.FormatFloat(x, 'f', -1, 64)
+	case nil:
+		return ""
+	default:
+		return fmt.Sprint(x)
+	}
 }
 
 func (r *Resolver) ruleKey(k string) string {
@@ -85,6 +142,19 @@ func (r *Resolver) ruleKey(k string) string {
 }
 
 func (r *Resolver) value(k string) (float64, bool) {
+	if lv, ok := r.liftedValue(k); ok {
+		switch x := lv.(type) {
+		case float64:
+			return x, true
+		case int64:
+			return float64(x), true
+		case string:
+			f, err := strconv.ParseFloat(x, 64)
+			return f, err == nil
+		default:
+			return 0, false
+		}
+	}
 	v, ok := r.lookup(k)
 	if !ok {
 		return 0, false

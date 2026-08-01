@@ -5,6 +5,7 @@ package tailer
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
@@ -424,5 +425,176 @@ func TestMetadataBackoffGrows(t *testing.T) {
 	}
 	if got := seen[len(seen)-1]; got != maxMetaBackoff {
 		t.Errorf("backoff capped at %v, want %v", got, maxMetaBackoff)
+	}
+}
+
+// countingMeta fails every lookup until succeed is set, counting the calls and
+// optionally taking `delay` per call — the lookup blocks server-side for the
+// whole -metadata-wait, which is what the backoff and the sweep budget both
+// exist to bound.
+type countingMeta struct {
+	calls   int
+	delay   time.Duration
+	succeed bool
+}
+
+func (m *countingMeta) Container(_ context.Context, id string, _ time.Duration) (*kubemeta.ContainerMetadata, error) {
+	m.calls++
+	if m.delay > 0 {
+		time.Sleep(m.delay)
+	}
+	if !m.succeed {
+		return nil, errors.New("container not found")
+	}
+	return &kubemeta.ContainerMetadata{
+		ContainerID: id,
+		Container:   kubemeta.Container{Name: "app", ID: id},
+		Pod:         kubemeta.Pod{Name: "pod1", Namespace: "ns1", UID: "uid1", NodeName: "node1"},
+	}, nil
+}
+
+// trackedFile discovers one CRI log file and returns its (unresolved) record.
+func trackedFile(t *testing.T, tl *Tailer, dir string) *file {
+	t.Helper()
+	writeLines(t, filepath.Join(dir, logName), "2026-07-05T10:00:00Z stdout F hello")
+	tl.scanDir(nil, false)
+	f := tl.files[filepath.Join(dir, logName)]
+	if f == nil {
+		t.Fatal("setup: file not tracked")
+	}
+	if f.resolved {
+		t.Fatal("setup: file resolved before any lookup")
+	}
+	return f
+}
+
+// nextMetaBackoff computing a delay is worth nothing unless resolveMetadata
+// HONOURS it. Every lookup can block server-side for the whole -metadata-wait
+// and they all run on the single sweep goroutine that serves every file on the
+// node, so retrying an unresolvable file on every sweep is what lets a handful
+// of them monopolise the tailer: nothing is read, no rotation is noticed, and a
+// file rotating twice inside that window loses the middle incarnation.
+func TestResolveMetadataAppliesAndResetsTheBackoff(t *testing.T) {
+	dir := t.TempDir()
+	meta := &countingMeta{}
+	tl := driveTailer(dir, &fakeExporter{})
+	tl.cfg.Metadata = meta
+	ctx := context.Background()
+	f := trackedFile(t, tl, dir)
+
+	// First attempt: the lookup runs and arms the backoff.
+	before := time.Now()
+	if tl.resolveMetadata(ctx, f) {
+		t.Fatal("resolve reported success with a failing metadata source")
+	}
+	if meta.calls != 1 {
+		t.Fatalf("lookups = %d, want 1", meta.calls)
+	}
+	if f.metaBackoff != minMetaBackoff {
+		t.Errorf("metaBackoff = %v after one failure, want %v", f.metaBackoff, minMetaBackoff)
+	}
+	// The retry is jittered over [d, 1.25d) so a metadata-service rollout does
+	// not put every file on the node — and every node in the fleet — on the
+	// same schedule.
+	assertRetryWindow(t, before, f.nextMetaTry, minMetaBackoff)
+
+	// Second attempt inside the window: no lookup at all.
+	if tl.resolveMetadata(ctx, f) {
+		t.Fatal("resolve reported success")
+	}
+	if meta.calls != 1 {
+		t.Fatalf("lookups = %d; a retry inside the backoff window must not touch the metadata service — that is the whole point of computing a delay", meta.calls)
+	}
+
+	// Once the window elapses the lookup runs again and the backoff DOUBLES.
+	f.nextMetaTry = time.Now().Add(-time.Millisecond)
+	before = time.Now()
+	if tl.resolveMetadata(ctx, f) {
+		t.Fatal("resolve reported success")
+	}
+	if meta.calls != 2 {
+		t.Fatalf("lookups = %d, want 2 once the backoff window elapsed", meta.calls)
+	}
+	if f.metaBackoff != 2*minMetaBackoff {
+		t.Errorf("metaBackoff = %v after two failures, want %v", f.metaBackoff, 2*minMetaBackoff)
+	}
+	assertRetryWindow(t, before, f.nextMetaTry, 2*minMetaBackoff)
+
+	// A success RESETS it: a container that was merely racing the API server
+	// must not carry a minute-long penalty into its next rotation.
+	meta.succeed = true
+	f.nextMetaTry = time.Now().Add(-time.Millisecond)
+	if !tl.resolveMetadata(ctx, f) {
+		t.Fatal("resolve failed with a working metadata source")
+	}
+	if f.metaBackoff != 0 {
+		t.Errorf("metaBackoff = %v after a successful resolve, want 0 — a stale penalty delays the NEXT file that reuses this record", f.metaBackoff)
+	}
+	if !f.resolved {
+		t.Error("file not marked resolved")
+	}
+}
+
+// assertRetryWindow checks that next lands in [base+d, base+1.25d), the range
+// jitterMetaBackoff spreads a retry over.
+func assertRetryWindow(t *testing.T, base, next time.Time, d time.Duration) {
+	t.Helper()
+	lo, hi := base.Add(d), base.Add(d+d/4)
+	if next.Before(lo) {
+		t.Errorf("next retry at +%v, before the backoff of %v: the file is retried early and the backoff bounds nothing",
+			next.Sub(base), d)
+	}
+	// The upper bound is the jitter cap plus whatever the call itself took.
+	if next.After(hi.Add(time.Second)) {
+		t.Errorf("next retry at +%v, past the jitter cap of %v: the retry is delayed well beyond what was computed",
+			next.Sub(base), d+d/4)
+	}
+}
+
+// The sweep's resolve budget is a SEPARATE bound from the per-file backoff: on
+// a node where many files are newly discovered at once (a rollout), every one
+// of them is due a lookup, each can block for -metadata-wait, and they all run
+// on the goroutine that also does every file's reading. Without a ceiling on
+// the sweep's total resolve time a burst of unresolvable files decides how
+// often every OTHER file on the node is read.
+func TestSweepResolveBudgetBoundsLookups(t *testing.T) {
+	const files = 6
+	setup := func(budget time.Duration) (*Tailer, *countingMeta) {
+		dir := t.TempDir()
+		meta := &countingMeta{delay: 20 * time.Millisecond}
+		tl := driveTailer(dir, &fakeExporter{})
+		tl.cfg.Metadata = meta
+		tl.resolveBudget = budget
+		for i := 0; i < files; i++ {
+			name := fmt.Sprintf("pod%d_ns1_app-0123456789abcde%d.log", i, i)
+			writeLines(t, filepath.Join(dir, name), "2026-07-05T10:00:00Z stdout F hello")
+		}
+		tl.scanDir(nil, false)
+		if len(tl.files) != files {
+			t.Fatalf("setup: tracked %d files, want %d", len(tl.files), files)
+		}
+		return tl, meta
+	}
+
+	// A budget shorter than a single lookup: the sweep stops resolving after
+	// the first one and gets on with the rest of its work. The unreached files
+	// are retried next sweep — nothing is lost, the data waits on disk.
+	tl, meta := setup(5 * time.Millisecond)
+	tl.sweep(context.Background(), true)
+	if meta.calls >= files {
+		t.Errorf("the sweep issued %d of %d lookups under a %v budget; with no ceiling a burst of unresolvable files decides how often every other file on the node is read",
+			meta.calls, files, tl.resolveBudget)
+	}
+	if meta.calls == 0 {
+		t.Error("the sweep issued no lookup at all: the budget must allow progress, or no file ever resolves")
+	}
+
+	// ...and with a budget that comfortably covers them, every file IS
+	// attempted in one sweep — so the bound above is the budget, not the
+	// per-file backoff.
+	tl, meta = setup(10 * time.Second)
+	tl.sweep(context.Background(), true)
+	if meta.calls != files {
+		t.Errorf("lookups = %d, want %d: a generous budget must not hold files back", meta.calls, files)
 	}
 }

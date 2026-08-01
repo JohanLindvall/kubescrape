@@ -298,9 +298,14 @@ func (t *Tailer) flush(ctx context.Context) {
 		// record — counted and logged, never silent.
 		t.log.Error("dropping a permanently rejected log batch and advancing",
 			"records", inf.kept, "error", err)
-		obs.LogExportFailures.Inc()
 		obs.LogPermanentDropped.Add(float64(inf.kept))
-		t.commitBatch(inf)
+		// advanceBatch, not commitBatch: these records were NEVER delivered,
+		// so they must not land in kubescrape_log_entries_total ("entries
+		// exported"), and nothing was rewound here, so
+		// kubescrape_log_export_failures_total ("files rewound") must not move
+		// either — journald's permanent arm, the stated model, counts only its
+		// drop. LogPermanentDropped plus the Error log carry the loss exactly.
+		t.advanceBatch(inf)
 	default:
 		t.failBatch(inf, err)
 	}
@@ -329,10 +334,6 @@ func (t *Tailer) exportWithRetry(ctx context.Context, ld plog.Logs) error {
 	return err
 }
 
-// lowerSeverity lowercases a severity string without allocating for the
-// values enrichment actually produces (ToLower allocates whenever any byte
-// is uppercase — i.e. for nearly every record on the rules path).
-
 // batchInfo carries a flushed batch's commit information from build to apply:
 // per-file, per-segment committed-offset candidates (already clamped to the
 // build-time watermark) and the unclamped high position behind them.
@@ -355,6 +356,13 @@ type batchInfo struct {
 // now committed retires (fd closed, checkpoint entry gone).
 func (t *Tailer) commitBatch(inf *batchInfo) {
 	obs.LogEntries.Add(float64(inf.kept))
+	t.advanceBatch(inf)
+}
+
+// advanceBatch moves the offsets a batch's delivery earned, WITHOUT counting
+// its records as exported. Split out for the permanent-rejection path, which
+// advances past records that were dropped rather than delivered.
+func (t *Tailer) advanceBatch(inf *batchInfo) {
 	for f, c := range inf.cands {
 		for seg, off := range c {
 			if seg == f.tail {
@@ -365,7 +373,15 @@ func (t *Tailer) commitBatch(inf *batchInfo) {
 			}
 			if s := f.segmentByID(seg); s != nil && off > s.committed {
 				s.committed = off
-				if s.committed >= s.to {
+				// `to` < 0 means OPEN-ENDED: a rotation that happened while
+				// the agent was down, whose end replaySegment pins only after
+				// it has read to EOF. Every positive offset satisfies
+				// `>= -1`, so retiring on this comparison alone closed the
+				// segment on its FIRST commit — dropping its fd, its
+				// checkpoint entry and its remaining owed range, silently and
+				// uncounted. Nothing could commit mid-replay until the replay
+				// loop learned to flush, which is what exposed this.
+				if s.to >= 0 && s.committed >= s.to {
 					f.retire(s)
 				}
 			}

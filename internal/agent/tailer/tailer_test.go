@@ -109,7 +109,7 @@ func TestIdleCloseReleasesAndReopens(t *testing.T) {
 // (test helper; production uses drainGone/release so the fd outlives a failed
 // export).
 func (t *Tailer) drop(f *file) {
-	t.drainGone(f)
+	t.drainGone(context.Background(), f)
 	t.release(f)
 }
 

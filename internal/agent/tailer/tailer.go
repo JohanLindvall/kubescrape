@@ -452,7 +452,7 @@ func (t *Tailer) sweep(ctx context.Context, all bool) {
 				// the offsets commit — a failed export must be able to re-read
 				// it (rewind seeks the still-open fd back), or a pod deleted
 				// during a collector outage would lose its final lines.
-				t.drainGone(f)
+				t.drainGone(ctx, f)
 				t.flush(ctx)
 				if t.settledGone(f) {
 					t.release(f)

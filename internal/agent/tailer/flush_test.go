@@ -146,7 +146,7 @@ func TestLogAttrsGrouping(t *testing.T) {
 	}
 }
 
-// The tailer's metricResolver must resolve metric values/labels and rule keys
+// The tailer's logchain.Resolver must resolve metric values/labels and rule keys
 // against RECORD attributes (line-derived, via logattrs) first and RESOURCE
 // attributes (k8s metadata) second — the pooled resolver's per-record binding.
 // The metrics package tests these semantics with fake closures; this pins the
@@ -176,7 +176,7 @@ func TestMetricResolverRecordAndResourceAttrs(t *testing.T) {
 	}
 	tl.cfg.LogMetrics = set
 
-	// A drop rule keyed on the RECORD attribute (metricResolver.ruleLookup's
+	// A drop rule keyed on the RECORD attribute (logchain.Resolver.RuleFn's
 	// attribute arm): lines with req.ms=13 are dropped from export.
 	tl.cfg.Rules = mustLineFilter(t, []logline.LineRule{
 		{Action: "drop", Match: []string{"req.ms=13"}},
@@ -550,6 +550,8 @@ func TestScrubRedactsExportedBodies(t *testing.T) {
 // batch is dropped, counted, and everything after it still ships.
 func TestPermanentRejectionDropsAndKeepsShipping(t *testing.T) {
 	before := obs.LogPermanentDropped.Value()
+	beforeEntries := obs.LogEntries.Value()
+	beforeFailures := obs.LogExportFailures.Value()
 	dir := t.TempDir()
 	exp := &fakeExporter{permanentN: 1} // the first batch is rejected for good
 	tl := newTestTailer(dir, "", exp)
@@ -575,5 +577,15 @@ func TestPermanentRejectionDropsAndKeepsShipping(t *testing.T) {
 		if r == "poison" {
 			t.Fatal("the permanently rejected record was re-exported; its offsets did not advance")
 		}
+	}
+
+	// The drop is counted as a DROP, not as an export and not as a rewind:
+	// "poison" never reached the collector and no file was rewound. Exactly
+	// one record shipped after it ("after"), which is what LogEntries counts.
+	if got := obs.LogEntries.Value() - beforeEntries; got != 1 {
+		t.Errorf("kubescrape_log_entries_total moved by %v; want 1 — the dropped record was counted as exported", got)
+	}
+	if got := obs.LogExportFailures.Value() - beforeFailures; got != 0 {
+		t.Errorf("kubescrape_log_export_failures_total moved by %v; want 0 — nothing was rewound", got)
 	}
 }

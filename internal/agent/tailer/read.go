@@ -8,6 +8,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"math/rand/v2"
 	"os"
 	"time"
 
@@ -39,6 +40,21 @@ func nextMetaBackoff(cur time.Duration) time.Duration {
 	return min(cur*2, maxMetaBackoff)
 }
 
+// jitterMetaBackoff spreads the retry over [d, 1.25d).
+//
+// Every file on a node is resolved by one goroutine against one service, so a
+// metadata-service rollout puts every file on the SAME schedule: they all
+// fail together, double together and hit the recovered service together — a
+// synchronised burst from every node in the fleet at once, which is how a
+// rollout turns into a second outage. The skew is small (the cap stays ~1m)
+// but it is enough to decorrelate.
+func jitterMetaBackoff(d time.Duration) time.Duration {
+	if d <= 0 {
+		return d
+	}
+	return d + time.Duration(rand.Int64N(int64(d/4)+1))
+}
+
 func (t *Tailer) resolveMetadata(ctx context.Context, f *file) bool {
 	if !f.source.containerd {
 		return t.resolvePlain(f)
@@ -57,7 +73,7 @@ func (t *Tailer) resolveMetadata(ctx context.Context, f *file) bool {
 		// noticed, and a file rotating twice inside that window loses the
 		// middle incarnation.
 		f.metaBackoff = nextMetaBackoff(f.metaBackoff)
-		f.nextMetaTry = time.Now().Add(f.metaBackoff)
+		f.nextMetaTry = time.Now().Add(jitterMetaBackoff(f.metaBackoff))
 		if metaclient.IsNotFound(err) {
 			t.log.Debug("container metadata not found yet", "id", f.containerID)
 		} else {

@@ -270,9 +270,12 @@ func (t *Tailer) feedSegments(ctx context.Context, f *file) {
 // retired — an unrecoverable segment kept on the list can never reach its
 // `to` and would wedge retirement (fd budget, settledGone, the checkpoint)
 // forever.
-func (t *Tailer) openSegmentSource(f *file, p *segment) (fh *os.File, path string, closeFh func(), ok bool) {
+// retired reports whether the failure was PERMANENT (the segment was given up
+// on and removed); false means transient and the segment stays on the list for
+// another sweep.
+func (t *Tailer) openSegmentSource(f *file, p *segment) (fh *os.File, path string, closeFh func(), ok, retired bool) {
 	if p.fd != nil {
-		return p.fd, f.path, func() {}, true
+		return p.fd, f.path, func() {}, true, false
 	}
 	path, found := t.findRotated(f, p)
 	if !found {
@@ -280,18 +283,25 @@ func (t *Tailer) openSegmentSource(f *file, p *segment) (fh *os.File, path strin
 		t.log.Warn("rotated segment source not found; its lines are lost",
 			"path", f.path, "inode", p.inode)
 		f.retire(p)
-		return nil, "", nil, false
+		return nil, "", nil, false, true // retired: nothing to open, nothing owed
 	}
 	opened, err := os.Open(path)
 	if err != nil {
 		if os.IsNotExist(err) { // pruned between findRotated and open
 			obs.LogPrefixLost.Inc()
 			f.retire(p)
+			t.log.Warn("opening rotated segment", "path", path, "error", err)
+			return nil, "", nil, false, true
 		}
+		// EACCES, EMFILE, EIO: the file is still there and may open next
+		// sweep. The segment stays on the list — and the caller must report
+		// the pass UNFINISHED, or segmentsFed strands it until an unrelated
+		// rewind or a restart re-arms the replay, pinning an fd and a
+		// checkpoint Pending entry that never clears.
 		t.log.Warn("opening rotated segment", "path", path, "error", err)
-		return nil, "", nil, false
+		return nil, "", nil, false, false
 	}
-	return opened, path, func() { _ = opened.Close() }, true
+	return opened, path, func() { _ = opened.Close() }, true, false
 }
 
 // replaySegment re-reads one segment's owed [committed,to) range and feeds
@@ -299,14 +309,16 @@ func (t *Tailer) openSegmentSource(f *file, p *segment) (fh *os.File, path strin
 // replaySegment re-reads a segment's owed range. It reports whether the range
 // was finished this sweep; an unfinished one must be revisited.
 func (t *Tailer) replaySegment(ctx context.Context, f *file, p *segment) bool {
-	fh, path, closeFh, ok := t.openSegmentSource(f, p)
+	fh, path, closeFh, ok, retired := t.openSegmentSource(f, p)
 	if !ok {
-		return true
+		// Finished only when the segment was given up on for good; a
+		// transient open failure has to be retried.
+		return retired
 	}
 	defer closeFh()
 	if _, err := fh.Seek(p.committed, 0); err != nil {
 		t.log.Warn("seeking rotated segment", "path", path, "error", err)
-		return true
+		return false // transient: retry next sweep
 	}
 
 	remaining := p.to - p.committed
@@ -330,8 +342,21 @@ func (t *Tailer) replaySegment(ctx context.Context, f *file, p *segment) bool {
 	// for its whole duration. The budget stops the pass; the segment keeps its
 	// committed progress and resumes on the next sweep.
 	budget := int64(t.cfg.MaxBytesPerSweep)
-	for remaining > 0 && budget > 0 {
-		n, rerr := fh.Read(buf[:min(int64(len(buf)), min(remaining, budget))])
+	// A pass never stops MID-LINE. `carry` is a per-pass local, and the
+	// oversize escape fires at MaxEntryBytes+4096 — 1 MiB + 4 KiB against a
+	// 1 MiB default budget — so a single line at or above the budget could
+	// never reach either the escape or a newline within one pass: nothing was
+	// fed, `committed` could not advance, segmentsFed stayed false, and the
+	// same megabyte was re-read every sweep forever, pinning an fd and
+	// starving the sweep goroutine. Once the budget is spent the loop keeps
+	// reading to the next newline, so at least one line always progresses.
+	overrun := false
+	for remaining > 0 && (budget > 0 || overrun) {
+		want := remaining
+		if !overrun {
+			want = min(want, budget)
+		}
+		n, rerr := fh.Read(buf[:min(int64(len(buf)), want)])
 		if n > 0 {
 			remaining -= int64(n)
 			budget -= int64(n)
@@ -372,7 +397,22 @@ func (t *Tailer) replaySegment(ctx context.Context, f *file, p *segment) bool {
 		}
 		// Ship what has accumulated rather than holding a whole rotated file
 		// in one payload (which the collector would likely reject anyway).
+		// Spent the budget mid-line: keep going to the next newline, then stop.
+		overrun = budget <= 0 && len(carry) > 0
+		gen := f.rewindGen
 		t.flushDuringDrain(ctx)
+		if f.rewindGen != gen {
+			// The flush FAILED and rewound the file: the pipeline was purged,
+			// so every line this pass already fed is gone unemitted. Reading
+			// on from the unrewound fd would leave that prefix owed while the
+			// later lines' commits advanced `committed` past it — commitBatch
+			// takes a max, not a contiguous frontier — and the segment would
+			// eventually retire with the prefix never exported. Abandon the
+			// pass; reporting it unfinished leaves segmentsFed false, so the
+			// next sweep replays from what actually committed. drainReader has
+			// carried the same guard all along.
+			return false
+		}
 	}
 	if budget <= 0 && remaining > 0 {
 		// Out of budget with the range unfinished. p.committed is NOT advanced
@@ -395,6 +435,13 @@ func (t *Tailer) replaySegment(ctx context.Context, f *file, p *segment) bool {
 			f.retire(p) // nothing recoverable was fed
 		}
 		return true
+	}
+	if lastErr != nil && !errors.Is(lastErr, io.EOF) {
+		// A transient read error (EIO on a failing disk, a truncated NFS
+		// handle): the range is still owed, so report the pass unfinished
+		// rather than letting segmentsFed strand it.
+		t.log.Warn("reading rotated segment", "path", path, "error", lastErr)
+		return false
 	}
 	if remaining > 0 && errors.Is(lastErr, io.EOF) {
 		// The source ended before the owed range did: the rotated file was
@@ -455,7 +502,11 @@ func (t *Tailer) findRotated(f *file, p *segment) (string, bool) {
 // drainGone reads whatever the vanished file still holds into the batch. The
 // fd stays OPEN: it is the only handle to the now-unlinked inode, so it must
 // outlive a failed export — release only once the offsets commit.
-func (t *Tailer) drainGone(f *file) {
+//
+// It takes the sweep's ctx: exports here used context.Background(), so the
+// shutdown budget did not cover the final sweep's gone-file drain — a stuck
+// collector could hold shutdown past it and cost the final saveCheckpoints.
+func (t *Tailer) drainGone(ctx context.Context, f *file) {
 	if !f.resolved {
 		// Nothing was ever read (nothing is read before it can be attributed),
 		// and with the file gone nothing can be: the content is lost. Make the
@@ -487,16 +538,16 @@ func (t *Tailer) drainGone(f *file) {
 	// file is never read again — without this, the prefixes' unexported lines
 	// would be closed forever by release() once everything else settles (a pod
 	// deleted during a collector outage after a rotation).
-	t.feedSegments(context.Background(), f)
+	t.feedSegments(ctx, f)
 	if f.compressed {
 		// A large archive is read incrementally across sweeps; a deletion
 		// mid-read leaves the rest readable from the open fd.
-		t.drainArchive(context.Background(), f)
+		t.drainArchive(ctx, f)
 	} else {
 		// An aborted drain (mid-drain flush failure) is fine here: drainGone
 		// runs every sweep until settledGone, which stays false while the
 		// rewound range is uncommitted.
-		_ = t.drainFile(context.Background(), f)
+		_ = t.drainFile(ctx, f)
 	}
 	if len(f.pending) > 0 {
 		// An unterminated final line (a process killed mid-write) can never be
@@ -506,9 +557,9 @@ func (t *Tailer) drainGone(f *file) {
 		// readPos with it so the commit reaches goneEnd.
 		f.pending = append(f.pending, '\n')
 		f.readPos++
-		t.consume(context.Background(), f, true)
+		t.consume(ctx, f, true)
 	}
-	t.stopPipeline(context.Background(), f)
+	t.stopPipeline(ctx, f)
 	// The settle target is the FED boundary, not readPos: trailing consumed-
 	// but-never-fed bytes (a blank final line, a rate-DROPPED or oversized-
 	// discarded tail) can never produce a committing entry, and a goneEnd
@@ -553,6 +604,9 @@ func (t *Tailer) settledGone(f *file) bool {
 // read again. Pipeline state is discarded without emitting: the buffered
 // lines sit after the committed offset and will be re-read and re-fed.
 func (t *Tailer) rewind(f *file) {
+	// Bump BEFORE any state changes so a loop that flushed mid-pass can see
+	// that its own read position was purged under it (see replaySegment).
+	f.rewindGen++
 	if f.compressed {
 		// gzip is not seekable: drop the reader so openArchive re-decompresses
 		// from the committed offset next sweep. The fd is RETAINED (the archive

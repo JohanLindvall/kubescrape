@@ -123,6 +123,10 @@ type file struct {
 	tokens     float64
 	lastRefill time.Time
 	limited    bool
+	// rewindGen counts rewinds of this file. A loop that flushes mid-pass
+	// snapshots it and stops if it moved: a failed flush purges the pipeline
+	// under the loop, so everything fed since the snapshot is gone unemitted.
+	rewindGen int
 	// exportedHigh is the highest exported-entry end position whose COMMIT was
 	// withheld by the build-time watermark clamp — another stream's group was
 	// still buffered. The next flush touching the file re-offers it: the bytes

@@ -253,7 +253,10 @@ func (t *Tailer) ensureOpen(f *file) error {
 	}
 	inode := inodeOf(st)
 	start := f.committed
-	if f.inode != 0 && (f.inode != inode || !f.fp.matches(fh)) {
+	// A DIFFERENT file now lives at this path: -logs-idle-close released the
+	// fd and the runtime rotated a replacement in while we held none.
+	replaced := f.inode != 0 && (f.inode != inode || !f.fp.matches(fh))
+	if replaced {
 		start = 0
 	}
 	if start > st.Size() {
@@ -271,10 +274,21 @@ func (t *Tailer) ensureOpen(f *file) error {
 	f.f = fh
 	f.inode = inode
 	f.fp = fp
-	f.readPos = start
-	f.lineStart = start
+	if replaced {
+		// A new incarnation, so take the canonical path rather than resetting
+		// byte positions inline. Keeping the OLD tail id attributed the new
+		// inode's bytes to the previous incarnation's segment, and a withheld
+		// exportedHigh from that incarnation was later re-offered and applied
+		// here — advancing `committed` past bytes this file never read. The
+		// inline reset also skipped restartAt, so a rate-limit pause or an
+		// oversized-line discard window survived into a file that has nothing
+		// to do with them.
+		f.exportedHigh = pos{}
+		f.newTail()
+		t.newPipeline(f) // fresh stages; reset() re-arms the segment replay
+	}
+	f.restartAt(start)
 	f.committed = start
-	f.pending = f.pending[:0]
 	t.watchTarget(f)
 	return nil
 }

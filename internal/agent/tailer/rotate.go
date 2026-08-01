@@ -243,18 +243,23 @@ func (t *Tailer) feedSegments(ctx context.Context, f *file) {
 	// goroutine and with it log collection for the whole node. Only the
 	// segment being replayed is ever retired, so the snapshot needs no
 	// membership re-check.
+	allDone := true
 	for _, sg := range slices.Clone(f.segments) {
 		f.feeding = sg.id
-		t.replaySegment(ctx, f, sg)
+		if !t.replaySegment(ctx, f, sg) {
+			allDone = false
+		}
 	}
 	f.feeding = 0
-	// Marked fed only AFTER the pass. Setting it up front stranded a segment
-	// permanently on any transient failure — a non-ENOENT open error, a Seek
-	// failure, a read error — because nothing would replay it again, which is
-	// the opposite of replaySegment's own "left untouched for a retry": the fd
-	// stayed pinned, settledGone never fired, and the lines were never counted
-	// lost either.
-	f.segmentsFed = true
+	// Marked fed only AFTER the pass, and only when every segment finished.
+	// Setting it up front stranded a segment permanently on any transient
+	// failure — a non-ENOENT open error, a Seek failure, a read error —
+	// because nothing would replay it again, which is the opposite of
+	// replaySegment's own "left untouched for a retry": the fd stayed pinned,
+	// settledGone never fired, and the lines were never counted lost either.
+	// A replay that ran out of its per-sweep byte budget is unfinished for the
+	// same reason, and resumes next sweep from wherever its commits reached.
+	f.segmentsFed = allDone
 }
 
 // openSegmentSource resolves the readable handle for a segment's replay: the
@@ -291,15 +296,17 @@ func (t *Tailer) openSegmentSource(f *file, p *segment) (fh *os.File, path strin
 
 // replaySegment re-reads one segment's owed [committed,to) range and feeds
 // its lines into the pipeline under the segment's own id.
-func (t *Tailer) replaySegment(ctx context.Context, f *file, p *segment) {
+// replaySegment re-reads a segment's owed range. It reports whether the range
+// was finished this sweep; an unfinished one must be revisited.
+func (t *Tailer) replaySegment(ctx context.Context, f *file, p *segment) bool {
 	fh, path, closeFh, ok := t.openSegmentSource(f, p)
 	if !ok {
-		return
+		return true
 	}
 	defer closeFh()
 	if _, err := fh.Seek(p.committed, 0); err != nil {
 		t.log.Warn("seeking rotated segment", "path", path, "error", err)
-		return
+		return true
 	}
 
 	remaining := p.to - p.committed
@@ -316,10 +323,18 @@ func (t *Tailer) replaySegment(ctx context.Context, f *file, p *segment) {
 	var lastErr error
 	discarding := false // an over-cap line's remainder, dropped to its newline
 	buf := t.scratch()
-	for remaining > 0 {
-		n, rerr := fh.Read(buf[:min(int64(len(buf)), remaining)])
+	// Bounded like every other read loop. The open-ended case (a rotation that
+	// happened while the agent was down) reads to EOF, so a large rotated
+	// remainder built one enormous batch — ~100k entries against a BatchSize of
+	// 1024 before the first size check — and starved the single sweep goroutine
+	// for its whole duration. The budget stops the pass; the segment keeps its
+	// committed progress and resumes on the next sweep.
+	budget := int64(t.cfg.MaxBytesPerSweep)
+	for remaining > 0 && budget > 0 {
+		n, rerr := fh.Read(buf[:min(int64(len(buf)), min(remaining, budget))])
 		if n > 0 {
 			remaining -= int64(n)
+			budget -= int64(n)
 			carry = append(carry, buf[:n]...)
 			for {
 				i := bytes.IndexByte(carry, '\n')
@@ -355,6 +370,19 @@ func (t *Tailer) replaySegment(ctx context.Context, f *file, p *segment) {
 			lastErr = rerr
 			break
 		}
+		// Ship what has accumulated rather than holding a whole rotated file
+		// in one payload (which the collector would likely reject anyway).
+		t.flushDuringDrain(ctx)
+	}
+	if budget <= 0 && remaining > 0 {
+		// Out of budget with the range unfinished. p.committed is NOT advanced
+		// here — it is commit progress, moved by commitBatch once the entries
+		// actually export, so that a failed export still re-reads them. The
+		// caller leaves segmentsFed false and the next sweep continues from
+		// wherever the commits reached (re-feeding at most the uncommitted
+		// prefix, which is the same at-least-once trade every other path
+		// makes).
+		return false
 	}
 	if p.to < 0 {
 		// The open-ended replay reached EOF: pin the range so entry commits
@@ -366,7 +394,7 @@ func (t *Tailer) replaySegment(ctx context.Context, f *file, p *segment) {
 		} else {
 			f.retire(p) // nothing recoverable was fed
 		}
-		return
+		return true
 	}
 	if remaining > 0 && errors.Is(lastErr, io.EOF) {
 		// The source ended before the owed range did: the rotated file was
@@ -386,6 +414,7 @@ func (t *Tailer) replaySegment(ctx context.Context, f *file, p *segment) {
 			f.retire(p) // nothing recoverable at all
 		}
 	}
+	return true
 }
 
 // findRotated locates the rotated-away file matching p's identity in the log's

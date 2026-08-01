@@ -14,6 +14,8 @@ import (
 
 	"github.com/klauspost/compress/gzip"
 
+	"github.com/JohanLindvall/kubescrape/internal/obs"
+
 	"go.opentelemetry.io/collector/pdata/plog"
 	"go.opentelemetry.io/collector/pdata/plog/plogotlp"
 	"go.opentelemetry.io/collector/pdata/pmetric"
@@ -50,14 +52,30 @@ type ServerConfig struct {
 	// Traces accepts pushed traces on /v1/traces and the gRPC trace service,
 	// enriching resources and passing them through. nil disables traces.
 	Traces TracesExporter
-	Logger *slog.Logger
+	// MaxInFlight bounds concurrently-processed pushes across both transports
+	// (0 = defaultMaxInFlight). Over the bound, senders are refused with a
+	// RETRYABLE answer rather than accepted into memory the node does not have.
+	MaxInFlight int
+	Logger      *slog.Logger
 }
+
+// defaultMaxInFlight bounds concurrently-processed pushes across BOTH
+// transports. The listeners are unauthenticated and node-local, and every
+// in-flight request holds its body plus the inflated pdata, so an unbounded
+// count is an OOM the agent cannot defend against — on the process that also
+// tails the node's logs.
+const defaultMaxInFlight = 32
 
 // Server receives pushed OTLP over gRPC and/or HTTP, enriches it, and
 // forwards it through the exporter.
 type Server struct {
 	cfg ServerConfig
 	log *slog.Logger
+	// inFlight admits a bounded number of concurrently-processed pushes across
+	// both transports; maxInFlight is its capacity (kept for
+	// grpc.MaxConcurrentStreams).
+	inFlight    chan struct{}
+	maxInFlight int
 }
 
 // NewServer creates an ingest Server.
@@ -66,7 +84,37 @@ func NewServer(cfg ServerConfig) *Server {
 	if log == nil {
 		log = slog.Default()
 	}
-	return &Server{cfg: cfg, log: log}
+	n := cfg.MaxInFlight
+	if n <= 0 {
+		n = defaultMaxInFlight
+	}
+	return &Server{cfg: cfg, log: log, inFlight: make(chan struct{}, n), maxInFlight: n}
+}
+
+// acquire takes an in-flight slot without waiting. A sender that is refused
+// gets a RETRYABLE answer (429 / ResourceExhausted): the payload is intact and
+// the sender owns the retry — far better than accepting it and running the
+// node out of memory, or queueing it and turning back-pressure into latency
+// the sender cannot see.
+func (s *Server) acquire() bool {
+	select {
+	case s.inFlight <- struct{}{}:
+		return true
+	default:
+		obs.IngestRejected.Inc()
+		return false
+	}
+}
+
+func (s *Server) release() { <-s.inFlight }
+
+// limitUnary applies the same bound to gRPC pushes.
+func (s *Server) limitUnary(ctx context.Context, req any, _ *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
+	if !s.acquire() {
+		return nil, status.Error(codes.ResourceExhausted, "too many concurrent pushes; retry")
+	}
+	defer s.release()
+	return handler(ctx, req)
 }
 
 // Run serves until ctx is cancelled, then shuts both listeners down.
@@ -84,9 +132,17 @@ func (s *Server) Run(ctx context.Context) error {
 		// Mirror the HTTP server's IdleTimeout: reap connections apps opened
 		// and abandoned (default gRPC keeps them forever). Message size stays
 		// at the 4 MiB gRPC default — the bound on pushed payloads.
-		grpcSrv = grpc.NewServer(grpc.KeepaliveParams(keepalive.ServerParameters{
-			MaxConnectionIdle: 120 * time.Second,
-		}))
+		grpcSrv = grpc.NewServer(
+			grpc.KeepaliveParams(keepalive.ServerParameters{
+				MaxConnectionIdle: 120 * time.Second,
+			}),
+			// Bound concurrent RPCs per connection, and the whole server below
+			// via the shared semaphore: each in-flight push holds its body PLUS
+			// the inflated pdata, so N simultaneous 16 MiB pushes is N x
+			// several times that in heap on a node that also has to tail logs.
+			grpc.MaxConcurrentStreams(uint32(s.maxInFlight)),
+			grpc.UnaryInterceptor(s.limitUnary),
+		)
 		plogotlp.RegisterGRPCServer(grpcSrv, &logsGRPC{s: s})
 		pmetricotlp.RegisterGRPCServer(grpcSrv, &metricsGRPC{s: s})
 		if s.cfg.Traces != nil {
@@ -225,6 +281,13 @@ func (g *tracesGRPC) Export(ctx context.Context, req ptraceotlp.ExportRequest) (
 // --- HTTP (OTLP/HTTP protobuf) ---
 
 func (s *Server) handleHTTPLogs(w http.ResponseWriter, r *http.Request) {
+	if !s.acquire() {
+		// Retryable by design: the sender still holds the payload.
+		w.Header().Set("Retry-After", "1")
+		http.Error(w, "too many concurrent pushes", http.StatusTooManyRequests)
+		return
+	}
+	defer s.release()
 	body, err := readBody(r)
 	if err != nil {
 		http.Error(w, err.Error(), bodyErrorStatus(err))
@@ -246,6 +309,13 @@ func (s *Server) handleHTTPLogs(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleHTTPMetrics(w http.ResponseWriter, r *http.Request) {
+	if !s.acquire() {
+		// Retryable by design: the sender still holds the payload.
+		w.Header().Set("Retry-After", "1")
+		http.Error(w, "too many concurrent pushes", http.StatusTooManyRequests)
+		return
+	}
+	defer s.release()
 	body, err := readBody(r)
 	if err != nil {
 		http.Error(w, err.Error(), bodyErrorStatus(err))
@@ -266,6 +336,13 @@ func (s *Server) handleHTTPMetrics(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleHTTPTraces(w http.ResponseWriter, r *http.Request) {
+	if !s.acquire() {
+		// Retryable by design: the sender still holds the payload.
+		w.Header().Set("Retry-After", "1")
+		http.Error(w, "too many concurrent pushes", http.StatusTooManyRequests)
+		return
+	}
+	defer s.release()
 	body, err := readBody(r)
 	if err != nil {
 		http.Error(w, err.Error(), bodyErrorStatus(err))

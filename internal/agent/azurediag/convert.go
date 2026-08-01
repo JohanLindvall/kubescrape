@@ -25,6 +25,7 @@ import (
 	"go.opentelemetry.io/collector/pdata/pmetric"
 
 	"github.com/JohanLindvall/kubescrape/internal/agent/attrs"
+	"github.com/JohanLindvall/kubescrape/internal/agent/logchain"
 	"github.com/JohanLindvall/kubescrape/internal/agent/logenrich"
 	"github.com/JohanLindvall/kubescrape/internal/agent/logscrub"
 	"github.com/JohanLindvall/kubescrape/internal/metrics"
@@ -107,11 +108,11 @@ func (r *Reader) convertLogs(recs []record) plog.Logs {
 
 	var (
 		scratch  plog.LogRecordSlice
-		resolver *entryResolver
+		resolver *logchain.Resolver
 		bound    map[string]metrics.BoundResource
 	)
 	if r.cfg.Rules != nil || r.cfg.LogMetrics != nil {
-		resolver = newEntryResolver()
+		resolver = logchain.New()
 	}
 	if r.cfg.Rules != nil {
 		scratch = plog.NewLogRecordSlice()
@@ -178,13 +179,12 @@ func (r *Reader) convertLogs(recs []record) plog.Logs {
 				bm = r.cfg.LogMetrics.Bind(resAttrs[key])
 				bound[key] = bm
 			}
-			resolver.rec, resolver.res = lr.Attributes(), resAttrs[key]
-			bm.Add(resolver.valueFn, resolver.labelFn, body)
+			resolver.Set(lr.Attributes(), resAttrs[key], resolver.Severity)
+			bm.Add(resolver.ValueFn(), resolver.LabelFn(), body)
 		}
 		if scratched {
-			resolver.rec, resolver.res = lr.Attributes(), resAttrs[key]
-			resolver.sev = strings.ToLower(lr.SeverityText())
-			if r.cfg.Rules.Keep(resolver.ruleFn, body) {
+			resolver.Set(lr.Attributes(), resAttrs[key], logchain.LowerSeverity(lr.SeverityText()))
+			if r.cfg.Rules.Keep(resolver.RuleFn(), body) {
 				scratch.MoveAndAppendTo(sl.LogRecords())
 			} else {
 				scratch.RemoveIf(func(plog.LogRecord) bool { return true })

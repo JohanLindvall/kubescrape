@@ -7,10 +7,9 @@ package tailer
 import (
 	"context"
 	"path/filepath"
-	"strconv"
-	"strings"
 	"time"
 
+	"github.com/JohanLindvall/kubescrape/internal/agent/logchain"
 	"github.com/JohanLindvall/kubescrape/internal/agent/logenrich"
 	"github.com/JohanLindvall/kubescrape/internal/agent/otlpexport"
 	"github.com/JohanLindvall/kubescrape/internal/metrics"
@@ -67,67 +66,6 @@ func (g *logGrouper) newScope(f *file, resAttrs, scopeAttrs []logattrs.Attr) plo
 	return sl
 }
 
-// metricResolver resolves metric label/value keys for one record: the record's
-// attributes (line-derived + enriched) first, then the file's resource
-// attributes (k8s metadata). The two closures are bound once per flush; per
-// record only the rec/res fields change, so record evaluation allocates no
-// closures.
-type metricResolver struct {
-	rec, res pcommon.Map
-	sev      string // lowercased severity text, for __severity__
-	labelFn  func(string) string
-	valueFn  func(string) (float64, bool)
-	ruleFn   func(string) string
-}
-
-func newMetricResolver() *metricResolver {
-	r := &metricResolver{}
-	r.labelFn = r.label
-	r.valueFn = r.value
-	r.ruleFn = r.ruleLookup
-	return r
-}
-
-// ruleLookup is the label resolver for log rules: the synthetic __severity__
-// key (the enriched severity text, lowercased) plus the usual record/resource
-// attribute chain.
-func (r *metricResolver) ruleLookup(k string) string {
-	if k == "__severity__" {
-		return r.sev
-	}
-	return r.label(k)
-}
-
-func (r *metricResolver) lookup(k string) (pcommon.Value, bool) {
-	if v, ok := r.rec.Get(k); ok {
-		return v, true
-	}
-	return r.res.Get(k)
-}
-
-func (r *metricResolver) label(k string) string {
-	if v, ok := r.lookup(k); ok {
-		return v.AsString()
-	}
-	return ""
-}
-
-func (r *metricResolver) value(k string) (float64, bool) {
-	v, ok := r.lookup(k)
-	if !ok {
-		return 0, false
-	}
-	switch v.Type() {
-	case pcommon.ValueTypeDouble:
-		return v.Double(), true
-	case pcommon.ValueTypeInt:
-		return float64(v.Int()), true
-	default:
-		f, err := strconv.ParseFloat(v.AsString(), 64)
-		return f, err == nil
-	}
-}
-
 // flush exports the batch. On success offsets are committed; on failure the
 // files are rewound to the committed offsets so the data is re-read.
 // recordBuilder bundles the per-flush state for turning batch entries into
@@ -138,7 +76,7 @@ type recordBuilder struct {
 	g        *logGrouper
 	now      pcommon.Timestamp
 	bound    map[*file]metrics.BoundResource
-	resolver *metricResolver
+	resolver *logchain.Resolver
 	scratch  plog.LogRecordSlice
 	kept     int
 }
@@ -153,7 +91,7 @@ func (t *Tailer) newRecordBuilder(ld plog.Logs) *recordBuilder {
 	// so evaluate it once (short-circuited when a global rule set exists).
 	rulesActive := t.cfg.Rules != nil || t.anyPodRules()
 	if t.cfg.LogMetrics != nil || rulesActive {
-		b.resolver = newMetricResolver()
+		b.resolver = logchain.New()
 	}
 	if t.cfg.LogMetrics != nil {
 		b.bound = make(map[*file]metrics.BoundResource) // read only on the LogMetrics path
@@ -240,18 +178,17 @@ func (t *Tailer) buildRecord(b *recordBuilder, e entry) {
 			bm = t.cfg.LogMetrics.Bind(e.file.resource.Attributes())
 			b.bound[e.file] = bm
 		}
-		b.resolver.rec, b.resolver.res = lr.Attributes(), e.file.resource.Attributes()
-		bm.Add(b.resolver.valueFn, b.resolver.labelFn, e.body)
+		b.resolver.Set(lr.Attributes(), e.file.resource.Attributes(), b.resolver.Severity)
+		bm.Add(b.resolver.ValueFn(), b.resolver.LabelFn(), e.body)
 	}
 	if t.cfg.Rules != nil || e.file.podRules != nil {
-		b.resolver.rec, b.resolver.res = lr.Attributes(), e.file.resource.Attributes()
-		b.resolver.sev = lowerSeverity(lr.SeverityText())
+		b.resolver.Set(lr.Attributes(), e.file.resource.Attributes(), logchain.LowerSeverity(lr.SeverityText()))
 		// Pod-annotation rules first, then the global chain: each is
 		// first-match-wins on its own, a pod drop is final, a pod keep still
 		// passes through the global rules.
-		keep := e.file.podRules == nil || e.file.podRules.Keep(b.resolver.ruleFn, e.body)
+		keep := e.file.podRules == nil || e.file.podRules.Keep(b.resolver.RuleFn(), e.body)
 		if keep && t.cfg.Rules != nil {
-			keep = t.cfg.Rules.Keep(b.resolver.ruleFn, e.body)
+			keep = t.cfg.Rules.Keep(b.resolver.RuleFn(), e.body)
 		}
 		if keep {
 			b.scratch.MoveAndAppendTo(b.g.scope(e.file, extracted.Resource, extracted.Scope).LogRecords())
@@ -395,27 +332,6 @@ func (t *Tailer) exportWithRetry(ctx context.Context, ld plog.Logs) error {
 // lowerSeverity lowercases a severity string without allocating for the
 // values enrichment actually produces (ToLower allocates whenever any byte
 // is uppercase — i.e. for nearly every record on the rules path).
-func lowerSeverity(s string) string {
-	switch s {
-	case "":
-		return ""
-	case "TRACE", "trace":
-		return "trace"
-	case "DEBUG", "debug":
-		return "debug"
-	case "INFO", "info":
-		return "info"
-	case "WARN", "warn":
-		return "warn"
-	case "WARNING", "warning":
-		return "warning"
-	case "ERROR", "error":
-		return "error"
-	case "FATAL", "fatal":
-		return "fatal"
-	}
-	return strings.ToLower(s)
-}
 
 // batchInfo carries a flushed batch's commit information from build to apply:
 // per-file, per-segment committed-offset candidates (already clamped to the

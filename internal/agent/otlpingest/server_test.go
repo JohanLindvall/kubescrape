@@ -656,3 +656,61 @@ func TestServerGRPCTraces(t *testing.T) {
 		t.Fatalf("trace resource not enriched over gRPC: %v", a.AsRaw())
 	}
 }
+
+// The listeners are unauthenticated and node-local, and every in-flight push
+// holds its body plus the inflated pdata. Over the bound a sender is REFUSED
+// retryably (429) rather than accepted into memory the node does not have —
+// the payload is intact and the sender owns the retry.
+func TestHTTPShedsOverInFlightBound(t *testing.T) {
+	release := make(chan struct{})
+	inFlight := make(chan struct{}, 1)
+	blocking := blockingExporter(func() error {
+		inFlight <- struct{}{}
+		<-release
+		return nil
+	})
+	s := NewServer(ServerConfig{
+		Enricher:    newEnricher(newMeta(), MetricsAuto),
+		Exporter:    blocking,
+		MaxInFlight: 1,
+	})
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/logs", s.handleHTTPLogs)
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	ld := plog.NewLogs()
+	ld.ResourceLogs().AppendEmpty().ScopeLogs().AppendEmpty().LogRecords().AppendEmpty().Body().SetStr("hi")
+	body, err := plogotlp.NewExportRequestFromLogs(ld).MarshalProto()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	go func() {
+		resp, err := http.Post(srv.URL+"/v1/logs", "application/x-protobuf", bytes.NewReader(body))
+		if err == nil {
+			_ = resp.Body.Close()
+		}
+	}()
+	<-inFlight // the one slot is taken
+
+	resp, err := http.Post(srv.URL+"/v1/logs", "application/x-protobuf", bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("status %d over the in-flight bound; want 429 (retryable, sender keeps the payload)", resp.StatusCode)
+	}
+	if resp.Header.Get("Retry-After") == "" {
+		t.Error("no Retry-After on the shed response")
+	}
+	close(release)
+}
+
+// blockingExporter holds every export until released, so a test can occupy an
+// in-flight slot.
+type blockingExporter func() error
+
+func (f blockingExporter) ExportLogs(context.Context, plog.Logs) error          { return f() }
+func (f blockingExporter) ExportMetrics(context.Context, pmetric.Metrics) error { return f() }

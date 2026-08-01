@@ -120,6 +120,16 @@ var (
 		"OTLP export attempts by signal and outcome.", "signal", "outcome")
 )
 
+// OTLP ingest (agent).
+var (
+	// IngestRejected counts pushes refused for exceeding the in-flight bound.
+	// They are retryable and the sender still holds the payload, but a
+	// persistently non-zero rate means the node cannot keep up with what is
+	// being pushed at it.
+	IngestRejected = Registry.Counter("kubescrape_ingest_rejected_total",
+		"Pushed OTLP requests refused because the concurrent in-flight bound was reached (retryable: 429 / ResourceExhausted).")
+)
+
 // Metadata client (agent).
 var (
 	MetadataRequests = Registry.CounterVec("kubescrape_metadata_requests_total",

@@ -14,7 +14,6 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
-	"strconv"
 	"strings"
 	"time"
 
@@ -23,6 +22,7 @@ import (
 	"go.opentelemetry.io/collector/pdata/pmetric"
 	"sigs.k8s.io/yaml"
 
+	"github.com/JohanLindvall/kubescrape/internal/agent/logchain"
 	"github.com/JohanLindvall/kubescrape/internal/agent/logenrich"
 	"github.com/JohanLindvall/kubescrape/internal/agent/logscrub"
 	"github.com/JohanLindvall/kubescrape/internal/agent/transform"
@@ -177,48 +177,16 @@ func runConfigCase(cfg agentConfig, scrubber *logscrub.Scrubber, extractor *loga
 		}
 	}
 
-	// Resolution mirrors the tailer's metricResolver EXACTLY (flush.go), or the
-	// harness proves the wrong thing: record attributes first, then the CASE's
-	// resource map — the production resolver reads the file's BASE resource,
-	// never the exported copy that logattrs resource-target attrs land on, so
-	// those are deliberately invisible here too. __severity__ exists only for
-	// the RULES chain (production's metric labelFn has no such key), and values
-	// parse with the same typed switch + strict ParseFloat as production —
-	// Sscanf-style prefix parsing would pass a case whose value key points at
-	// "250ms" while production records nothing.
-	lookupVal := func(k string) (pcommon.Value, bool) {
-		if v, ok := lr.Attributes().Get(k); ok {
-			return v, true
-		}
-		return res.Get(k)
-	}
-	labelFn := func(k string) string {
-		if v, ok := lookupVal(k); ok {
-			return v.AsString()
-		}
-		return ""
-	}
-	valueFn := func(k string) (float64, bool) {
-		v, ok := lookupVal(k)
-		if !ok {
-			return 0, false
-		}
-		switch v.Type() {
-		case pcommon.ValueTypeDouble:
-			return v.Double(), true
-		case pcommon.ValueTypeInt:
-			return float64(v.Int()), true
-		default:
-			f, err := strconv.ParseFloat(v.AsString(), 64)
-			return f, err == nil
-		}
-	}
-	ruleFn := func(k string) string {
-		if k == "__severity__" {
-			return strings.ToLower(lr.SeverityText())
-		}
-		return labelFn(k)
-	}
+	// Resolution is the PRODUCTION resolver itself (internal/agent/logchain),
+	// not a mirror of it: this harness exists to prove what a rule or metric
+	// edit does to real lines, and a re-implementation can only prove what the
+	// re-implementation does. It reads the CASE's resource map — the production
+	// resolver reads the file's BASE resource, never the exported copy that
+	// logattrs resource-target attributes land on, so those are deliberately
+	// invisible here too.
+	resolver := logchain.New()
+	resolver.Set(lr.Attributes(), res, logchain.LowerSeverity(lr.SeverityText()))
+	labelFn, valueFn, ruleFn := resolver.LabelFn(), resolver.ValueFn(), resolver.RuleFn()
 
 	// Metrics observe EVERY line (before rules), exactly as in production; a
 	// fresh set per case keeps cases independent.

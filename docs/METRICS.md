@@ -43,6 +43,7 @@ names a metric or a label that is not registered.
 | `kubescrape_events_observed_total` | `type` | Kubernetes events received from the watch, by event type (normal, warning). |
 | `kubescrape_export_requests_total` | `signal`, `outcome` | OTLP export attempts by signal and outcome. |
 | `kubescrape_http_requests_total` | `pattern`, `code` | Metadata API requests by pattern and status code. |
+| `kubescrape_ingest_rejected_total` | — | Pushed OTLP requests refused because the concurrent in-flight bound was reached (retryable: 429 / ResourceExhausted). |
 | `kubescrape_ingest_resources_total` | `outcome` | Distinct pushed identities (container id / pod uid, memoized per request) by enrichment outcome (enriched, unresolved, peer_ip). |
 | `kubescrape_journal_dropped_batches_total` | — | Journal batches dropped after a permanent collector rejection (the cursor advances past them). |
 | `kubescrape_journal_entries_total` | — | Journal entries exported. |
@@ -91,4 +92,4 @@ names a metric or a label that is not registered.
 | `kubescrape_transform_errors_total` | `signal` | Transform program invocations that failed (the batch is NOT exported; the error propagates to the producer's retry path). |
 | `kubescrape_transform_reloads_total` | `outcome` | Transforms-file reloads by outcome (applied, failed — a failed compile keeps the last good program). |
 
-71 metrics.
+72 metrics.

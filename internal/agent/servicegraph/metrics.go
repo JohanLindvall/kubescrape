@@ -134,6 +134,7 @@ type Registry struct {
 	bounds     []float64 // histogram bounds, ascending, seconds
 	maxCard    int
 	staleAfter time.Duration // 0 disables eviction
+	exemplars  bool
 	now        func() time.Time
 
 	mu     sync.Mutex
@@ -171,15 +172,50 @@ type histAgg struct {
 	count   uint64
 	sum     float64
 	buckets []uint64 // len(bounds)+1 once observed
+	// ex holds at most one exemplar per bucket — the latest observed since the
+	// last DELIVERED export — and stays nil until one is recorded (exemplars
+	// off, or an edge whose spans carried no trace id).
+	ex []exemplar
 }
 
-func (h *histAgg) observe(bounds []float64, v float64) {
+// exemplar is the evidence kept for one latency bucket: a request that landed
+// in it, so the histogram links to the trace that explains it.
+type exemplar struct {
+	set     bool
+	value   float64
+	ts      pcommon.Timestamp
+	traceID pcommon.TraceID
+	spanID  pcommon.SpanID
+}
+
+// observe folds one measurement in and returns its bucket, so the caller can
+// attach an exemplar to that same bucket without walking the bounds twice.
+func (h *histAgg) observe(bounds []float64, v float64) int {
 	if h.buckets == nil {
 		h.buckets = make([]uint64, len(bounds)+1)
 	}
 	h.count++
 	h.sum += v
-	h.buckets[bucketIndex(bounds, v)]++
+	idx := bucketIndex(bounds, v)
+	h.buckets[idx]++
+	return idx
+}
+
+// setExemplar keeps this sample as the bucket's exemplar, replacing whatever
+// was there: the newest is the one an operator looking at a live graph wants,
+// and one per bucket bounds the cost at len(bounds)+1 per side per edge.
+//
+// A span with no trace id is skipped rather than emitted with a zero one: an
+// exemplar whose trace cannot be looked up is a dead link in the UI, and the
+// spanmetrics generator skips the same case for the same reason.
+func (h *histAgg) setExemplar(idx, nbuckets int, v float64, ts pcommon.Timestamp, tid pcommon.TraceID, sid pcommon.SpanID) {
+	if tid.IsEmpty() {
+		return
+	}
+	if h.ex == nil {
+		h.ex = make([]exemplar, nbuckets)
+	}
+	h.ex[idx] = exemplar{set: true, value: v, ts: ts, traceID: tid, spanID: sid}
 }
 
 // seriesState tracks a series' values from observation to delivery, so eviction
@@ -199,10 +235,15 @@ func NewRegistry(cfg Config) *Registry {
 	cfg = cfg.withDefaults()
 	bounds := slices.Clone(cfg.HistogramBuckets)
 	slices.Sort(bounds) // Validate demands ascending; New never refuses to aggregate over it
+	ex := true          // see Config.Exemplars
+	if cfg.Exemplars != nil {
+		ex = *cfg.Exemplars
+	}
 	return &Registry{
 		bounds:     bounds,
 		maxCard:    cfg.MaxCardinality,
 		staleAfter: cfg.StaleAfter,
+		exemplars:  ex,
 		now:        time.Now,
 		series:     make(map[string]*edgeSeries),
 	}
@@ -213,25 +254,13 @@ func NewRegistry(cfg Config) *Registry {
 func (r *Registry) Record(e Edge) {
 	now := r.now()
 
-	// The dimension keys are sorted so the series key and the rendered label
-	// order are a function of the SET, not of Go's map iteration order — an
-	// unsorted key would mint a new series per permutation.
+	// e.Dimensions arrives in an order that is already a function of the SET
+	// (see joinDims), so the key is built by walking it — no scratch, no sort.
+	// It used to iterate a map into a stack array and sort that on EVERY
+	// completed request, because a map has no order and an unsorted key mints a
+	// new series per permutation; the ordering now falls out of where the pairs
+	// are built.
 	//
-	// The scratch arrays keep the warm path allocation-free: neither escapes
-	// (slices.Sort is generic, so unlike sort.Strings it does not box the slice
-	// into an interface), and `map[string(key)]` does not copy the key for a
-	// lookup. An edge with more dimensions than the scratch holds simply grows
-	// onto the heap.
-	var dimScratch [16]string
-	dims := dimScratch[:0]
-	for k := range e.Dimensions {
-		if builtinLabels[k] {
-			continue // see builtinLabels
-		}
-		dims = append(dims, k)
-	}
-	slices.Sort(dims)
-
 	// truncDimValue (processor.go) is applied again HERE, on the values that go
 	// into the key and into the rendered labels alike, even though the processor
 	// already truncates what it puts on an Edge. It is a reslice, so the warm
@@ -250,9 +279,12 @@ func (r *Registry) Record(e Edge) {
 	key = appendEdgeKeyPart(key, server)
 	key = appendEdgeKeyPart(key, string(e.Connection))
 	key = appendEdgeKeyPart(key, e.VirtualNode)
-	for _, k := range dims {
-		key = appendEdgeKeyPart(key, k)
-		key = appendEdgeKeyPart(key, truncDimValue(e.Dimensions[k]))
+	for _, d := range e.Dimensions {
+		if builtinLabels[d.Name] {
+			continue // see builtinLabels
+		}
+		key = appendEdgeKeyPart(key, d.Name)
+		key = appendEdgeKeyPart(key, truncDimValue(d.Value))
 	}
 
 	r.mu.Lock()
@@ -265,7 +297,7 @@ func (r *Registry) Record(e Edge) {
 			obs.ServiceGraphDropped.Inc()
 			return
 		}
-		s = &edgeSeries{labels: edgeLabels(client, server, e, dims), start: now}
+		s = &edgeSeries{labels: edgeLabels(client, server, e), start: now}
 		r.series[string(key)] = s
 	}
 	s.requests++
@@ -274,11 +306,26 @@ func (r *Registry) Record(e Edge) {
 	}
 	// A side that never arrived is not observed — its absence is the point of a
 	// virtual-node edge, and a zero would read as a zero-latency call.
+	//
+	// The exemplar's timestamp is the SHARD's clock at pairing time, not either
+	// span's end: the two spans are measured by processes whose clocks are not
+	// synchronised (the very reason the two sides are separate histograms), so
+	// one local reading places both sides' evidence consistently on the time
+	// axis. Tempo stamps its exemplars the same way, and pairing is at most one
+	// Wait behind the request.
+	nb := len(r.bounds) + 1
+	ts := pcommon.NewTimestampFromTime(now)
 	if e.HaveClient {
-		s.client.observe(r.bounds, e.ClientSeconds)
+		i := s.client.observe(r.bounds, e.ClientSeconds)
+		if r.exemplars {
+			s.client.setExemplar(i, nb, e.ClientSeconds, ts, e.TraceID, e.ClientSpanID)
+		}
 	}
 	if e.HaveServer {
-		s.server.observe(r.bounds, e.ServerSeconds)
+		i := s.server.observe(r.bounds, e.ServerSeconds)
+		if r.exemplars {
+			s.server.setExemplar(i, nb, e.ServerSeconds, ts, e.TraceID, e.ServerSpanID)
+		}
 	}
 	s.lastSeen = now
 	s.state = seriesObserved
@@ -286,9 +333,11 @@ func (r *Registry) Record(e Edge) {
 }
 
 // edgeLabels materializes the attribute set for a newly admitted series (cold
-// path). dims is read only, so the caller's stack scratch does not escape.
-func edgeLabels(client, server string, e Edge, dims []string) []edgeLabel {
-	out := make([]edgeLabel, 0, 4+len(dims))
+// path). It COPIES every string out of e, which is what lets the Edge borrow
+// its dimension slice from the pairing store: nothing of the Edge outlives this
+// call.
+func edgeLabels(client, server string, e Edge) []edgeLabel {
+	out := make([]edgeLabel, 0, 4+len(e.Dimensions))
 	out = append(out,
 		edgeLabel{labelClient, client},
 		edgeLabel{labelServer, server},
@@ -296,8 +345,11 @@ func edgeLabels(client, server string, e Edge, dims []string) []edgeLabel {
 	if e.VirtualNode != "" {
 		out = append(out, edgeLabel{labelVirtualNode, e.VirtualNode})
 	}
-	for _, k := range dims {
-		out = append(out, edgeLabel{k, truncDimValue(e.Dimensions[k])})
+	for _, d := range e.Dimensions {
+		if builtinLabels[d.Name] {
+			continue // see builtinLabels
+		}
+		out = append(out, edgeLabel{d.Name, truncDimValue(d.Value)})
 	}
 	return out
 }
@@ -346,16 +398,29 @@ func (r *Registry) Export(ctx context.Context, exp Exporter, res pcommon.Resourc
 	return nil
 }
 
-// afterDelivered records that the rendered values reached the collector — only
-// those may later be evicted. A series OBSERVED between render and this call is
-// back in seriesObserved and is deliberately not marked: its new values must
-// still be exported before eviction may touch them.
+// afterDelivered records that the rendered values reached the collector (only
+// those may later be evicted) and clears every recorded exemplar. A series
+// OBSERVED between render and this call is back in seriesObserved and is
+// deliberately not marked: its new values must still be exported before
+// eviction may touch them.
+//
+// The exemplar reset is keyed on DELIVERY, not on rendering: a failed send
+// keeps the exemplars for the retry rather than wiping evidence no collector
+// ever saw. (One recorded between render and this call is dropped unseen —
+// the one-interval recency window an exemplar has by nature, and the same
+// trade agent/spanmetrics makes.)
 func (r *Registry) afterDelivered() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	for _, s := range r.series {
 		if s.state == seriesRendered {
 			s.state = seriesDelivered
+		}
+		for i := range s.client.ex {
+			s.client.ex[i].set = false
+		}
+		for i := range s.server.ex {
+			s.server.ex[i].set = false
 		}
 	}
 }
@@ -475,9 +540,19 @@ func putHist(p pmetric.HistogramDataPoint, labels []edgeLabel, h *histAgg, bound
 	p.SetSum(h.sum)
 	p.ExplicitBounds().FromRaw(bounds)
 	p.BucketCounts().FromRaw(h.buckets)
-	// No exemplars: an Edge is a PAIR of spans and carries no trace id by the
-	// time it reaches here, and picking one half's id would attach an exemplar
-	// that explains only that half of the latency.
+	// One exemplar per occupied bucket. The id is THIS side's own span (see
+	// Edge.ClientSpanID), so the evidence attached to a latency explains the
+	// latency it is attached to rather than the other half of the request.
+	for i := range h.ex {
+		if !h.ex[i].set {
+			continue
+		}
+		e := p.Exemplars().AppendEmpty()
+		e.SetDoubleValue(h.ex[i].value)
+		e.SetTimestamp(h.ex[i].ts)
+		e.SetTraceID(h.ex[i].traceID)
+		e.SetSpanID(h.ex[i].spanID)
+	}
 }
 
 // sumMetric appends a monotonic cumulative Sum shell. No unit is set: these are

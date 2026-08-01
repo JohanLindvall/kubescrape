@@ -5,12 +5,14 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"slices"
 	"sync"
 	"testing"
 	"time"
 
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/pmetric"
+	"go.opentelemetry.io/collector/pdata/ptrace"
 
 	"github.com/JohanLindvall/kubescrape/internal/obs"
 )
@@ -95,7 +97,36 @@ func edge(client, server string) Edge {
 		ClientService: client, ServerService: server,
 		ClientSeconds: 0.15, ServerSeconds: 0.05,
 		HaveClient: true, HaveServer: true,
+		// Every edge the processor produces carries these (they are what an
+		// exemplar needs), so the default test edge does too.
+		TraceID: traceID(1), ClientSpanID: spanID(1), ServerSpanID: spanID(2),
 	}
+}
+
+// exemplarsOf renders a histogram point's exemplars as (value, trace, span)
+// triples, in order.
+func exemplarsOf(p pmetric.HistogramDataPoint) []exemplar {
+	out := make([]exemplar, 0, p.Exemplars().Len())
+	for i := 0; i < p.Exemplars().Len(); i++ {
+		e := p.Exemplars().At(i)
+		out = append(out, exemplar{set: true, value: e.DoubleValue(), ts: e.Timestamp(),
+			traceID: e.TraceID(), spanID: e.SpanID()})
+	}
+	return out
+}
+
+// firstHist returns the single data point of the named duration histogram.
+func firstHist(t *testing.T, got map[string]pmetric.Metric, name string) pmetric.HistogramDataPoint {
+	t.Helper()
+	m, ok := got[name]
+	if !ok {
+		t.Fatalf("no %s in the payload (have %v)", name, keysOf(got))
+	}
+	dps := m.Histogram().DataPoints()
+	if dps.Len() != 1 {
+		t.Fatalf("%s points = %d, want 1", name, dps.Len())
+	}
+	return dps.At(0)
 }
 
 // The four names and their label set are Grafana Tempo's, and Grafana's Service
@@ -217,9 +248,9 @@ func TestDimensionAndVirtualNodeLabels(t *testing.T) {
 	e.Connection = ConnectionDatabase
 	e.HaveServer = false // an uninstrumented database has no server half
 	e.VirtualNode = virtualNodeServer
-	e.Dimensions = map[string]string{
-		"client_http.method": "GET",
-		"server_db.system":   "postgresql",
+	e.Dimensions = []EdgeDimension{
+		{"client_http.method", "GET"},
+		{"server_db.system", "postgresql"},
 	}
 	r.Record(e)
 	// A second edge with no dimensions and no virtual node, to pin the negative:
@@ -263,13 +294,51 @@ func TestDimensionAndVirtualNodeLabels(t *testing.T) {
 	}
 }
 
+// Two identical calls whose halves arrived in OPPOSITE orders are one series,
+// end to end through the processor. The registry keys a series on the
+// dimension SEQUENCE (there is no sort here any more), so this is what the
+// store's canonical client-then-server ordering buys: an arrival-ordered
+// sequence would key the second call differently and render a byte-identical
+// label set twice in one payload.
+func TestArrivalOrderDoesNotSplitSeries(t *testing.T) {
+	r := NewRegistry(Config{})
+	p := NewProcessor(Config{Dimensions: []string{"http.method", "http.route"}}, nil)
+	p.SetSink(r)
+	attrs := map[string]string{"http.method": "GET", "http.route": "/orders"}
+	half := func(tid byte, kind ptrace.SpanKind) ptrace.Traces {
+		s := sgSpan{kind: kind, dur: 0.1, traceID: traceID(tid), spanID: spanID(1), attrs: attrs}
+		if kind == ptrace.SpanKindServer {
+			s.spanID, s.parentID = spanID(2), spanID(1)
+		}
+		return sgTraces("checkout", s)
+	}
+	p.Consume(half(1, ptrace.SpanKindClient)) // request 1: client half first
+	p.Consume(half(1, ptrace.SpanKindServer))
+	p.Consume(half(2, ptrace.SpanKindServer)) // request 2: server half first
+	p.Consume(half(2, ptrace.SpanKindClient))
+
+	exp := &capExporter{}
+	export(t, r, exp)
+	dps := exp.last(t)["traces_service_graph_request_total"].Sum().DataPoints()
+	if dps.Len() != 1 {
+		var got []map[string]string
+		for i := 0; i < dps.Len(); i++ {
+			got = append(got, attrsOf(dps.At(i).Attributes()))
+		}
+		t.Fatalf("points = %d (%v), want the two arrival orders to share one series", dps.Len(), got)
+	}
+	if v := dps.At(0).IntValue(); v != 2 {
+		t.Fatalf("requests = %d, want both calls on the one series", v)
+	}
+}
+
 // A dimension whose name collides with a built-in label is dropped rather than
 // rendered: the attributes share one map, so it would overwrite the real client
 // or server and two distinct series would render one identical label set.
 func TestCollidingDimensionIsDropped(t *testing.T) {
 	r := NewRegistry(Config{})
 	e := edge("frontend", "checkout")
-	e.Dimensions = map[string]string{"client": "impostor", "connection_type": "nonsense", "keep": "yes"}
+	e.Dimensions = []EdgeDimension{{"client", "impostor"}, {"connection_type", "nonsense"}, {"keep", "yes"}}
 	r.Record(e)
 
 	exp := &capExporter{}
@@ -312,6 +381,118 @@ func TestHistogramBucketsAndPerSideValues(t *testing.T) {
 	}
 	if n := len(server.BucketCounts().AsRaw()); n != len(wantBounds)+1 {
 		t.Errorf("server bucket count length = %d, want %d (bounds + overflow)", n, len(wantBounds)+1)
+	}
+}
+
+// Each side's latency histogram carries an exemplar pointing at the span that
+// MEASURED that side — the shared trace id (the two halves cannot pair without
+// it) plus that half's own span id. A single id on both would explain only one
+// half of what it was attached to.
+func TestDurationHistogramExemplars(t *testing.T) {
+	r := NewRegistry(Config{})
+	now := t0
+	fixedClock(r, &now)
+	r.Record(edge("frontend", "checkout"))
+
+	exp := &capExporter{}
+	export(t, r, exp)
+	got := exp.last(t)
+
+	wantTS := pcommon.NewTimestampFromTime(t0)
+	client := exemplarsOf(firstHist(t, got, "traces_service_graph_request_client_seconds"))
+	wantClient := []exemplar{{set: true, value: 0.15, ts: wantTS, traceID: traceID(1), spanID: spanID(1)}}
+	if !slices.Equal(client, wantClient) {
+		t.Errorf("client exemplars = %+v, want %+v", client, wantClient)
+	}
+	server := exemplarsOf(firstHist(t, got, "traces_service_graph_request_server_seconds"))
+	wantServer := []exemplar{{set: true, value: 0.05, ts: wantTS, traceID: traceID(1), spanID: spanID(2)}}
+	if !slices.Equal(server, wantServer) {
+		t.Errorf("server exemplars = %+v, want %+v", server, wantServer)
+	}
+}
+
+// One per BUCKET, latest wins: a busy edge must not accumulate an exemplar per
+// request, and the newest is the one an operator watching a live graph wants.
+func TestExemplarsAreOnePerBucketLatestWins(t *testing.T) {
+	r := NewRegistry(Config{})
+	now := t0
+	fixedClock(r, &now)
+	for _, secs := range []float64{0.15, 0.19, 0.5} { // two in (0.1,0.2], one in (0.4,0.8]
+		e := edge("frontend", "checkout")
+		e.ClientSeconds, e.HaveServer = secs, false
+		e.ClientSpanID = spanID(byte(secs * 100))
+		r.Record(e)
+	}
+
+	exp := &capExporter{}
+	export(t, r, exp)
+	ex := exemplarsOf(firstHist(t, exp.last(t), "traces_service_graph_request_client_seconds"))
+	if len(ex) != 2 {
+		t.Fatalf("exemplars = %+v, want one per occupied bucket", ex)
+	}
+	if ex[0].value != 0.19 || ex[0].spanID != spanID(19) {
+		t.Errorf("first bucket's exemplar = %+v, want the LATEST of the two samples in it", ex[0])
+	}
+	if ex[1].value != 0.5 {
+		t.Errorf("second exemplar = %+v, want the 0.5s sample", ex[1])
+	}
+}
+
+// Exemplars are cleared by DELIVERY, never by rendering: a failed send keeps
+// them for the retry rather than wiping evidence no collector ever saw.
+func TestExemplarsResetOnlyAfterDelivery(t *testing.T) {
+	r := NewRegistry(Config{})
+	now := t0
+	fixedClock(r, &now)
+	r.Record(edge("frontend", "checkout"))
+
+	failing := &capExporter{err: errors.New("collector down")}
+	if err := r.Export(context.Background(), failing, pcommon.NewResource()); err == nil {
+		t.Fatal("Export succeeded, want the injected failure")
+	}
+	exp := &capExporter{}
+	export(t, r, exp) // the retry
+	if ex := exemplarsOf(firstHist(t, exp.last(t), "traces_service_graph_request_client_seconds")); len(ex) != 1 {
+		t.Fatalf("exemplars after a failed send = %+v, want them kept for the retry", ex)
+	}
+	// Delivered now: the next export carries none, since nothing new was seen.
+	export(t, r, exp)
+	if ex := exemplarsOf(firstHist(t, exp.last(t), "traces_service_graph_request_client_seconds")); len(ex) != 0 {
+		t.Fatalf("exemplars after delivery = %+v, want them cleared", ex)
+	}
+}
+
+// No trace id, no exemplar: a link that resolves to nothing in Tempo is worse
+// than no link. (The processor refuses to key such spans at all, so this is the
+// belt to that braces.)
+func TestExemplarsSkippedWithoutTraceID(t *testing.T) {
+	r := NewRegistry(Config{})
+	e := edge("frontend", "checkout")
+	e.TraceID = pcommon.TraceID{}
+	r.Record(e)
+
+	exp := &capExporter{}
+	export(t, r, exp)
+	if ex := exemplarsOf(firstHist(t, exp.last(t), "traces_service_graph_request_client_seconds")); len(ex) != 0 {
+		t.Fatalf("exemplars = %+v, want none without a trace id", ex)
+	}
+}
+
+// The toggle, and the negative it guards: with exemplars off the histograms are
+// otherwise unchanged (counts and buckets still land).
+func TestExemplarsCanBeDisabled(t *testing.T) {
+	off := false
+	r := NewRegistry(Config{Exemplars: &off})
+	r.Record(edge("frontend", "checkout"))
+
+	exp := &capExporter{}
+	export(t, r, exp)
+	p := firstHist(t, exp.last(t), "traces_service_graph_request_client_seconds")
+	if ex := exemplarsOf(p); len(ex) != 0 {
+		t.Fatalf("exemplars = %+v, want none with exemplars: false", ex)
+	}
+	if p.Count() != 1 {
+		t.Fatalf("count = %d, want the histogram itself unaffected", p.Count())
 	}
 }
 
@@ -494,7 +675,7 @@ func BenchmarkRecord(b *testing.B) {
 	r := NewRegistry(Config{})
 	e := edge("frontend", "checkout")
 	e.Connection = ConnectionDatabase
-	e.Dimensions = map[string]string{"client_http.method": "GET", "server_db.system": "postgresql"}
+	e.Dimensions = []EdgeDimension{{"client_http.method", "GET"}, {"server_db.system", "postgresql"}}
 	r.Record(e) // admit the series; the benchmark measures the warm path
 	b.ReportAllocs()
 	b.ResetTimer()
@@ -511,7 +692,7 @@ func BenchmarkRecord(b *testing.B) {
 func TestRecordIsAllocationFree(t *testing.T) {
 	r := NewRegistry(Config{})
 	e := edge("frontend", "checkout")
-	e.Dimensions = map[string]string{"client_http.method": "GET", "server_db.system": "postgresql"}
+	e.Dimensions = []EdgeDimension{{"client_http.method", "GET"}, {"server_db.system", "postgresql"}}
 	r.Record(e) // admit the series: only the warm path is budgeted
 	if n := testing.AllocsPerRun(200, func() { r.Record(e) }); n != 0 {
 		t.Errorf("Record allocates %v times per call, want 0", n)

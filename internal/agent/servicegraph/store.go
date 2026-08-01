@@ -84,9 +84,13 @@ type halfSpan struct {
 	// attributes in precedence order. It matters only if this half expires
 	// unpaired, when it becomes the synthesized virtual node.
 	peer string
+	// traceID and spanID are what an exemplar needs, and nothing else is
+	// carried for one: the trace id is the same on both halves by construction
+	// (see Edge.TraceID) and the span id is this half's own, so each side's
+	// histogram can point at the span that measured it.
+	traceID pcommon.TraceID
+	spanID  pcommon.SpanID
 }
-
-type dimKV struct{ name, value string }
 
 // pendingEdge is a half-edge awaiting its partner. It accumulates both sides
 // because either may arrive first — the client half is the common case, but a
@@ -100,7 +104,13 @@ type pendingEdge struct {
 	failed                       bool
 	connection                   ConnectionType
 	peer                         string
-	dims                         []dimKV
+	traceID                      pcommon.TraceID
+	clientSpanID, serverSpanID   pcommon.SpanID
+	// dims holds the dimensions of the ONE side recorded so far. An entry never
+	// holds both: the arrival that completes the pair emits and retires the
+	// entry on the spot, so the second side's dimensions are joined straight
+	// onto the outgoing Edge (see joinDims) and never stored.
+	dims []EdgeDimension
 	// expiresAt is stamped at INSERT and never refreshed by the second half:
 	// every entry gets the same Wait, so insertion order IS expiry order and
 	// the expiry pass needs no ordering work. (Refreshing it on the second
@@ -146,6 +156,11 @@ type edgeStore struct {
 	head, tail *pendingEdge // expiry FIFO, oldest first
 	free       *pendingEdge // retired entries, reused by newEntry
 	counts     Stats
+	// dimBuf is the scratch a completing pair's two halves are joined into (see
+	// joinDims). One per store rather than one per entry: only the edge being
+	// handed to the sink right now needs it, and the mutex that makes the sink
+	// call safe is the same one that makes this buffer safe.
+	dimBuf []EdgeDimension
 }
 
 // newEdgeStore builds the store from an already-defaulted config.
@@ -166,7 +181,7 @@ func newEdgeStore(cfg Config, onEdge func(Edge)) *edgeStore {
 // two locks to do its bookkeeping (spanmetrics unlocks before its drop counter
 // for the same reason). The Stats fields, which callers read as a consistent
 // snapshot, are maintained inside.
-func (s *edgeStore) upsert(now time.Time, k edgeKey, side edgeSide, h halfSpan, dims []dimKV) {
+func (s *edgeStore) upsert(now time.Time, k edgeKey, side edgeSide, h halfSpan, dims []EdgeDimension) {
 	if s.insert(now, k, side, h, dims) {
 		obs.ServiceGraphStoreFull.Inc()
 	}
@@ -174,7 +189,7 @@ func (s *edgeStore) upsert(now time.Time, k edgeKey, side edgeSide, h halfSpan, 
 
 // insert is upsert under the mutex; it reports whether the span was refused
 // because the store is full.
-func (s *edgeStore) insert(now time.Time, k edgeKey, side edgeSide, h halfSpan, dims []dimKV) (refused bool) {
+func (s *edgeStore) insert(now time.Time, k edgeKey, side edgeSide, h halfSpan, dims []EdgeDimension) (refused bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -197,15 +212,24 @@ func (s *edgeStore) insert(now time.Time, k edgeKey, side edgeSide, h halfSpan, 
 		s.items[k] = e
 		s.pushBack(e)
 	}
-	e.merge(side, h, dims)
+	e.merge(side, h)
 	if e.haveClient && e.haveServer {
-		// Build the Edge BEFORE retiring: retirement clears the entry and puts
-		// it on the free list, so reading it afterwards would read the next
-		// request's half.
-		edge := e.edge()
+		// The completing half's dimensions are joined onto the held half's and
+		// never stored — the entry is about to go.
+		edge := e.edge(s.joinDims(side, e.dims, dims))
 		s.counts.Completed++
-		s.retire(e)
+		// The sink runs BEFORE retirement, not after: the Edge's Dimensions
+		// alias buffers that retirement clears (and hands to the next request),
+		// so reading them afterwards would read the next half-edge's. Nothing
+		// else on the Edge aliases the entry — the strings are values — but the
+		// slice does, which is the whole reason a sink must not retain an Edge.
 		s.onEdge(edge)
+		s.dimBuf = clearDims(s.dimBuf)
+		s.retire(e)
+	} else {
+		// Not complete: this side is the one the entry holds until its partner
+		// arrives.
+		e.setDims(dims)
 	}
 	return false
 }
@@ -245,13 +269,13 @@ func (s *edgeStore) sweep(now time.Time, budget int) int {
 		edge, promoted := e.promote()
 		if promoted {
 			s.counts.VirtualNode++
+			// Before retirement, for the same reason as in insert: the Edge's
+			// Dimensions alias the entry's buffer.
+			s.onEdge(edge)
 		} else {
 			s.counts.Unpaired++
 		}
 		s.retire(e)
-		if promoted {
-			s.onEdge(edge)
-		}
 		n++
 	}
 	return n
@@ -272,8 +296,10 @@ func (s *edgeStore) stats() Stats {
 	return st
 }
 
-// merge folds one arriving half into the entry.
-func (e *pendingEdge) merge(side edgeSide, h halfSpan, dims []dimKV) {
+// merge folds one arriving half into the entry. The half's dimensions are NOT
+// merged here — see setDims and joinDims, which decide between storing and
+// emitting them.
+func (e *pendingEdge) merge(side edgeSide, h halfSpan) {
 	// The first non-empty classification sticks. A later half can only ever
 	// supply the same one (both spans of a messaging hop are producer/consumer)
 	// or none, and letting a plain SERVER span clear the database/messaging
@@ -286,23 +312,95 @@ func (e *pendingEdge) merge(side edgeSide, h halfSpan, dims []dimKV) {
 	if e.peer == "" {
 		e.peer = h.peer
 	}
+	// The first half to arrive sets the trace id; the second carries the same
+	// one (it is half the key both were looked up under), so there is nothing
+	// to reconcile — and a promoted half-edge has only the one anyway.
+	if e.traceID.IsEmpty() {
+		e.traceID = h.traceID
+	}
 	switch side {
 	case sideClient:
 		e.clientService, e.clientSeconds, e.haveClient = h.service, h.seconds, true
+		e.clientSpanID = h.spanID
 	default:
 		e.serverService, e.serverSeconds, e.haveServer = h.service, h.seconds, true
+		e.serverSpanID = h.spanID
 	}
-	// Both sides' dimensions accumulate: the names are already client_/server_
-	// prefixed, so a dimension carried by whichever side had it lands on the
-	// edge exactly once (Tempo's rule).
-	e.dims = append(e.dims, dims...)
 }
 
-// edge materializes the Edge handed across the sink seam. The Dimensions map is
-// built here and only here — once per completed request rather than per span —
-// so the map allocation is a cold-path cost, and the Edge never aliases the
-// entry, which is about to be recycled.
-func (e *pendingEdge) edge() Edge {
+// setDims records the dimensions of the one side this entry holds.
+//
+// It REPLACES rather than appends. An entry only ever holds one side (the other
+// completes the edge and retires it), so the only way here twice is the same
+// half arriving twice — a duplicate push, which this repo's at-least-once
+// export paths make ordinary. Appending would then carry every dimension twice,
+// and since the metric layer keys a series on the dimension SEQUENCE that would
+// mint a second series rendering a byte-identical label set: a duplicate series
+// in one payload, which is a conflict downstream rather than extra detail. The
+// rest of merge is last-wins for the same arrival; this matches it.
+func (e *pendingEdge) setDims(in []EdgeDimension) {
+	if len(in) == 0 && len(e.dims) == 0 {
+		return
+	}
+	was := len(e.dims)
+	// Copied, never aliased: `in` is the caller's stack scratch (see halfSpan on
+	// why the dimensions travel as their own parameter), and retaining it would
+	// both dangle and force that scratch onto the heap once per span.
+	e.dims = append(e.dims[:0], in...)
+	if was > len(e.dims) {
+		// A shorter replacement leaves the tail's strings reachable from the
+		// entry, which may now sit here for a whole Wait pinning an OTLP batch.
+		clear(e.dims[len(e.dims):was])
+	}
+}
+
+// joinDims lays a completing request's two halves' dimensions out in ONE
+// deterministically ordered slice: the client half's (in the processor's
+// configured order) followed by the server half's.
+//
+// The order is the point. The metric layer keys a series on this sequence, so
+// it has to be a function of the dimension SET and not of which half happened
+// to arrive first — an arrival-ordered sequence would give the same edge two
+// keys, and the two would render byte-identical label sets into one payload.
+// Both halves' own order is already fixed (the processor walks its configured
+// dimensions in order and prefixes them at construction), so client-then-server
+// is canonical without a sort: that is the sort the metric layer used to pay
+// per completed request, deleted rather than moved.
+//
+// The result is the store's scratch, valid until the sink returns (insert
+// clears it immediately after). `arriving` is COPIED rather than returned
+// as-is even when it would do: it is the caller's stack scratch, and letting it
+// reach the sink through the Edge would make escape analysis heap-allocate it
+// once per span — the cost this whole path is shaped to avoid.
+func (s *edgeStore) joinDims(side edgeSide, held, arriving []EdgeDimension) []EdgeDimension {
+	if len(held) == 0 && len(arriving) == 0 {
+		return nil
+	}
+	out := s.dimBuf[:0]
+	if side == sideClient { // the arriving half is the client's
+		out = append(out, arriving...)
+		out = append(out, held...)
+	} else {
+		out = append(out, held...)
+		out = append(out, arriving...)
+	}
+	s.dimBuf = out
+	return out
+}
+
+// clearDims drops a dimension scratch's string references — they point into an
+// OTLP payload that is otherwise free to be collected — and empties it for
+// reuse. Truncating alone would keep the strings reachable from the backing
+// array.
+func clearDims(d []EdgeDimension) []EdgeDimension {
+	clear(d)
+	return d[:0]
+}
+
+// edge materializes the Edge handed across the sink seam, over the dimension
+// slice the caller decided on (the joined pair, or the single held half's for a
+// promotion). The Edge BORROWS that slice; see Edge.Dimensions.
+func (e *pendingEdge) edge(dims []EdgeDimension) Edge {
 	out := Edge{
 		ClientService: e.clientService,
 		ServerService: e.serverService,
@@ -312,12 +410,10 @@ func (e *pendingEdge) edge() Edge {
 		HaveClient:    e.haveClient,
 		HaveServer:    e.haveServer,
 		Failed:        e.failed,
-	}
-	if len(e.dims) > 0 {
-		out.Dimensions = make(map[string]string, len(e.dims))
-		for _, d := range e.dims {
-			out.Dimensions[d.name] = d.value
-		}
+		Dimensions:    dims,
+		TraceID:       e.traceID,
+		ClientSpanID:  e.clientSpanID,
+		ServerSpanID:  e.serverSpanID,
 	}
 	return out
 }
@@ -334,7 +430,9 @@ func (e *pendingEdge) promote() (Edge, bool) {
 	if e.peer == "" || e.haveClient == e.haveServer {
 		return Edge{}, false
 	}
-	out := e.edge()
+	// One side only, so the held half's dimensions are already in their
+	// configured order and need no joining.
+	out := e.edge(e.dims)
 	if e.haveClient {
 		out.ServerService = e.peer
 		out.VirtualNode = virtualNodeServer
@@ -398,15 +496,11 @@ func (s *edgeStore) retire(e *pendingEdge) {
 	delete(s.items, e.key)
 
 	// Clear the dimension slice ELEMENT BY ELEMENT before reusing its backing
-	// array: the values are strings pointing into the sender's span payload,
-	// and keeping them reachable from the free list would pin whole OTLP
-	// batches long after they were forwarded. Truncating alone does not drop
-	// the references.
-	dims := e.dims
-	for i := range dims {
-		dims[i] = dimKV{}
-	}
-	*e = pendingEdge{dims: dims[:0]}
+	// array (clearDims): the values are strings pointing into the sender's span
+	// payload, and keeping them reachable from the free list would pin whole
+	// OTLP batches long after they were forwarded. Truncating alone does not
+	// drop the references.
+	*e = pendingEdge{dims: clearDims(e.dims)}
 	e.next = s.free
 	s.free = e
 }

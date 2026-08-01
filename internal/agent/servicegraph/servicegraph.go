@@ -47,6 +47,8 @@ package servicegraph
 import (
 	"fmt"
 	"time"
+
+	"go.opentelemetry.io/collector/pdata/pcommon"
 )
 
 // Defaults mirror Tempo's service-graphs processor, so an operator moving from
@@ -91,6 +93,16 @@ type Config struct {
 	// HistogramBuckets are the latency buckets, in SECONDS, for both the
 	// client and server duration histograms. Empty uses Tempo's default.
 	HistogramBuckets []float64 `json:"histogramBuckets,omitempty"`
+	// Exemplars attaches a trace/span-id exemplar (one per latency bucket,
+	// reset after each DELIVERED export) to both duration histograms. nil
+	// defaults to true — spelled as agent/spanmetrics spells it, since the two
+	// generators' exemplars have identical semantics and an operator turning
+	// one off is usually turning both off for the same reason.
+	//
+	// On by default because an edge's exemplar is the only link from "this
+	// call between two services is slow" to a trace showing WHY, and it costs
+	// one data point per occupied bucket per edge per export.
+	Exemplars *bool `json:"exemplars,omitempty"`
 	// Dimensions are extra span/resource attribute keys lifted onto the edge
 	// series. Tempo's rule applies: a dimension resolves from whichever side
 	// carried it, exposed as client_<dim> and server_<dim>.
@@ -205,8 +217,50 @@ type Edge struct {
 	Failed bool
 	// Dimensions are the configured extra labels, already prefixed client_ /
 	// server_ and truncated.
-	Dimensions map[string]string
+	//
+	// An ORDERED slice rather than a map, for two reasons that pull the same
+	// way. The metric layer keys a series on this sequence, and a map has no
+	// sequence — it had to iterate the keys into a scratch and SORT them on
+	// every completed request to get one. And a map is two allocations per
+	// dimensioned edge, on the shard's per-request path. The store hands the
+	// pairs in an order that is already a function of the SET (the client
+	// half's dimensions in the processor's configured order, then the server
+	// half's), so the sort disappears rather than moving.
+	//
+	// The slice is BORROWED: it aliases a buffer the pairing store recycles the
+	// instant the sink returns (see edgeStore.retire and joinDims), so a sink
+	// that keeps the Edge past its Record call must copy the pairs out. Every
+	// production sink already does — Registry.Record copies what it needs into
+	// the series' own label set the one time the series is admitted.
+	Dimensions []EdgeDimension
 	// VirtualNode is "client" or "server" when one side was synthesized, else
 	// empty. Tempo exposes this as the `virtual_node` dimension.
 	VirtualNode string
+
+	// TraceID is the trace both halves belong to, and is what an exemplar on
+	// the duration histograms points at.
+	//
+	// There is no "which side" to decide: the trace id IS half the pairing key
+	// (see edgeKey), so the two halves carry the same one by construction —
+	// they cannot pair otherwise. Whichever half arrived first therefore sets
+	// it, which is also the only half a promoted virtual-node edge has. Trace
+	// sampling cannot split them either: it is consistent per trace id, so both
+	// halves are sampled or neither is, and an exemplar either resolves in
+	// Tempo or the trace was never stored to begin with.
+	//
+	// Zero when the edge came from spans with no trace id — impossible today
+	// (the processor refuses to key those), but an exemplar is skipped rather
+	// than emitted as a dead link either way.
+	TraceID pcommon.TraceID
+	// ClientSpanID and ServerSpanID are each half's OWN span id, and each one
+	// rides on ITS OWN histogram's exemplar: the client-latency exemplar points
+	// at the span that measured the client latency, the server's at the server's.
+	// Attaching one id to both would explain only half of what it is attached
+	// to. Zero for a side that never arrived.
+	ClientSpanID, ServerSpanID pcommon.SpanID
 }
+
+// EdgeDimension is one configured extra label: the name is already prefixed
+// client_ / server_, and both strings point into the OTLP payload the span
+// arrived in (which is why they are truncated — see truncDimValue).
+type EdgeDimension struct{ Name, Value string }

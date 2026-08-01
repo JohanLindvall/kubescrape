@@ -66,6 +66,10 @@ type Processor struct {
 	peerAttrs []string
 	peerIsDB  []bool
 
+	// mismatch compares each forwarding agent's declared trim lists against
+	// the two lists above (see mismatch.go).
+	mismatch *mismatchWatch
+
 	// now is injectable for tests; production reads the wall clock once per
 	// Consume batch, never per span.
 	now func() time.Time
@@ -103,6 +107,11 @@ func NewProcessor(cfg Config, log *slog.Logger) *Processor {
 		p.peerAttrs = append(p.peerAttrs, a)
 		p.peerIsDB = append(p.peerIsDB, strings.HasPrefix(a, "db."))
 	}
+	// The watch compares against the EFFECTIVE lists — deduplicated and with
+	// the defaults filled in — because that is what pairing actually reads;
+	// comparing the raw config would report drift an operator cannot see and
+	// miss drift they can.
+	p.mismatch = newMismatchWatch(p.dims, p.peerAttrs, log)
 	p.store = newEdgeStore(cfg, p.emit)
 	log.Debug("service-graph pairing configured",
 		"wait", cfg.Wait, "maxItems", cfg.MaxItems,
@@ -146,6 +155,10 @@ func (p *Processor) Consume(td ptrace.Traces) {
 	for i := 0; i < rss.Len(); i++ {
 		rs := rss.At(i)
 		resAttrs := rs.Resource().Attributes()
+		// Once per RESOURCE, never per span: the forwarding agent stamps its
+		// effective trim lists here, and a disagreement with ours silently
+		// empties every dimension label it covers (see mismatch.go).
+		p.mismatch.check(resAttrs)
 		// Truncated once per resource: it becomes a label value on every edge
 		// this resource's spans produce.
 		svc := truncDimValue(spanAttrStr(resAttrs, attrServiceName))
@@ -211,6 +224,11 @@ func (p *Processor) observe(span ptrace.Span, resAttrs pcommon.Map, svc string, 
 		seconds:    spanSeconds(span),
 		failed:     span.Status().Code() == ptrace.StatusCodeError,
 		connection: conn,
+		traceID:    tid,
+		// This half's OWN span id — NOT sid, which for a server half is its
+		// parent's. The exemplar on a side's latency histogram must point at
+		// the span that measured that latency.
+		spanID: span.SpanID(),
 	}
 
 	// Peer attributes, in the configured precedence order: the FIRST one
@@ -250,23 +268,26 @@ func (p *Processor) observe(span ptrace.Span, resAttrs pcommon.Map, svc string, 
 
 	// dims is the borrowed scratch handed to upsert; nil when nothing is
 	// configured, which is the default.
-	var dims []dimKV
+	var dims []EdgeDimension
 	if len(p.dims) > 0 {
 		// Stack scratch: upsert COPIES the dimensions and never retains the
 		// slice, so for the usual handful of configured dimensions this never
 		// reaches the heap (BenchmarkConsumePairWithDimensions is the alarm —
-		// the only allocations it may show are the completed edge's map).
-		var scratch [8]dimKV
-		var ds []dimKV
+		// it must show zero allocations, the store's join buffer and free list
+		// having absorbed the per-edge cost too).
+		var scratch [8]EdgeDimension
+		var ds []EdgeDimension
 		if len(p.dims) <= len(scratch) {
 			ds = scratch[:0]
 		} else {
-			ds = make([]dimKV, 0, len(p.dims))
+			ds = make([]EdgeDimension, 0, len(p.dims))
 		}
 		names := p.clientDims
 		if side == sideServer {
 			names = p.serverDims
 		}
+		// Walked in the CONFIGURED order, which is what makes the edge's
+		// dimension sequence canonical without anyone sorting it: see joinDims.
 		for i, d := range p.dims {
 			v := spanAttrStr(spanAttrs, d)
 			if v == "" {
@@ -278,7 +299,7 @@ func (p *Processor) observe(span ptrace.Span, resAttrs pcommon.Map, svc string, 
 				// "" here would only cost a map entry per edge.
 				continue
 			}
-			ds = append(ds, dimKV{name: names[i], value: truncDimValue(v)})
+			ds = append(ds, EdgeDimension{Name: names[i], Value: truncDimValue(v)})
 		}
 		dims = ds
 	}

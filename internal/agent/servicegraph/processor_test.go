@@ -1,6 +1,7 @@
 package servicegraph
 
 import (
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -51,7 +52,9 @@ func sgTraces(service string, spans ...sgSpan) ptrace.Traces {
 // pairSink collects the edges a processor produces.
 type pairSink struct{ edges []Edge }
 
-func (s *pairSink) Record(e Edge) { s.edges = append(s.edges, e) }
+// The sink RETAINS every edge, so it must clone: the Edge's dimension slice
+// belongs to the pairing store, which recycles it as soon as Record returns.
+func (s *pairSink) Record(e Edge) { s.edges = append(s.edges, cloneEdge(e)) }
 
 func (s *pairSink) only(t *testing.T) Edge {
 	t.Helper()
@@ -343,18 +346,56 @@ func TestConsumeDimensions(t *testing.T) {
 	p.Consume(sgTraces("orders", serverSpan(0.05, map[string]string{"http.method": "GET"})))
 
 	e := sink.only(t)
-	want := map[string]string{
-		"client_http.method":      "GET",
-		"client_k8s.cluster.name": "prod",
-		"server_http.method":      "GET",
+	// The ORDER is the contract, not just the set: the client half's
+	// dimensions in the configured order, then the server half's (see
+	// joinDims — the metric layer keys a series on this sequence).
+	want := []EdgeDimension{
+		{"client_http.method", "GET"},
+		{"client_k8s.cluster.name", "prod"},
+		{"server_http.method", "GET"},
 	}
-	if len(e.Dimensions) != len(want) {
+	if !slices.Equal(e.Dimensions, want) {
 		t.Fatalf("dimensions = %v, want %v", e.Dimensions, want)
 	}
-	for k, v := range want {
-		if e.Dimensions[k] != v {
-			t.Fatalf("dimensions[%q] = %q, want %q (all: %v)", k, e.Dimensions[k], v, e.Dimensions)
-		}
+}
+
+// The ids an exemplar needs reach the Edge: the trace id both halves share
+// (they cannot pair without it) and each half's OWN span id. The server half's
+// is emphatically NOT the id it paired on — that is its PARENT's, the client's
+// span — or the exemplar on the server-latency histogram would point at the
+// span that measured the other side.
+func TestConsumeCarriesExemplarIDs(t *testing.T) {
+	p, sink, _ := newTestProcessor(t, Config{})
+	p.Consume(sgTraces("checkout", clientSpan(0.30, nil)))
+	p.Consume(sgTraces("orders", serverSpan(0.25, nil)))
+
+	e := sink.only(t)
+	if e.TraceID != traceID(1) {
+		t.Errorf("TraceID = %v, want the trace both halves carry", e.TraceID)
+	}
+	if e.ClientSpanID != spanID(1) {
+		t.Errorf("ClientSpanID = %v, want the client span's own id", e.ClientSpanID)
+	}
+	if e.ServerSpanID != spanID(2) {
+		t.Errorf("ServerSpanID = %v, want the server span's OWN id, not its parent's (%v)", e.ServerSpanID, spanID(1))
+	}
+}
+
+// A promoted virtual-node edge keeps the surviving half's ids — the one side
+// that was measured is the one an exemplar can point at, and the missing side
+// contributes no histogram observation to attach one to.
+func TestConsumeVirtualNodeCarriesTheObservedHalfsIDs(t *testing.T) {
+	p, sink, clock := newTestProcessor(t, Config{Wait: time.Second})
+	p.Consume(sgTraces("checkout", clientSpan(0.30, map[string]string{"peer.service": "orders-db"})))
+	*clock = t0.Add(time.Second)
+	p.Sweep()
+
+	e := sink.only(t)
+	if e.TraceID != traceID(1) || e.ClientSpanID != spanID(1) {
+		t.Errorf("ids = %v/%v, want the client half's", e.TraceID, e.ClientSpanID)
+	}
+	if (e.ServerSpanID != pcommon.SpanID{}) {
+		t.Errorf("ServerSpanID = %v, want zero: no server span was ever seen", e.ServerSpanID)
 	}
 }
 
@@ -375,8 +416,8 @@ func TestConsumeTruncatesLabelValues(t *testing.T) {
 	if len(e.ServerService) != maxDimensionValueBytes {
 		t.Fatalf("peer len = %d, want %d", len(e.ServerService), maxDimensionValueBytes)
 	}
-	if len(e.Dimensions["client_http.route"]) != maxDimensionValueBytes {
-		t.Fatalf("dimension len = %d, want %d", len(e.Dimensions["client_http.route"]), maxDimensionValueBytes)
+	if v := dimsOf(e)["client_http.route"]; len(v) != maxDimensionValueBytes {
+		t.Fatalf("dimension len = %d, want %d", len(v), maxDimensionValueBytes)
 	}
 }
 
@@ -569,6 +610,22 @@ func BenchmarkConsumePairWithDimensions(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		p.Consume(td)
+	}
+}
+
+// The benchmark REPORTS the budget; this fails when it is broken. A completed
+// request used to pay a map for its dimensions (two allocations per edge, on
+// the shard's per-request path); an ordered slice built in the store's own
+// recycled buffers pays none. A closure, a sort or a per-edge slice in this
+// path would silently put it back.
+func TestConsumeWithDimensionsIsAllocationFree(t *testing.T) {
+	p := NewProcessor(Config{Dimensions: []string{"http.method", "http.route"}}, nil)
+	p.SetSink(&countSink{})
+	attrs := map[string]string{"http.method": "GET", "http.route": "/api/v1/orders"}
+	td := sgTraces("checkout", clientSpan(0.30, attrs), serverSpan(0.25, attrs))
+	p.Consume(td) // warm the map, the free list and the join scratch
+	if n := testing.AllocsPerRun(200, func() { p.Consume(td) }); n != 0 {
+		t.Errorf("Consume allocates %v times per paired request, want 0", n)
 	}
 }
 

@@ -1,6 +1,8 @@
 package servicegraph
 
 import (
+	"maps"
+	"slices"
 	"testing"
 	"time"
 
@@ -30,8 +32,32 @@ func spanID(n byte) pcommon.SpanID {
 func newTestStore(t *testing.T, cfg Config) (*edgeStore, *[]Edge) {
 	t.Helper()
 	var got []Edge
-	st := newEdgeStore(cfg.withDefaults(), func(e Edge) { got = append(got, e) })
+	st := newEdgeStore(cfg.withDefaults(), func(e Edge) { got = append(got, cloneEdge(e)) })
 	return st, &got
+}
+
+// cloneEdge copies the borrowed dimension slice out of an Edge so a test sink
+// may RETAIN it — which no production sink does (see Edge.Dimensions: the store
+// recycles the buffer the moment Record returns). Without this every retained
+// edge would read back with its dimensions zeroed, which is exactly the bug the
+// contract exists to make impossible to hit by accident.
+func cloneEdge(e Edge) Edge {
+	e.Dimensions = append([]EdgeDimension(nil), e.Dimensions...)
+	return e
+}
+
+// dimsOf is the assertion view: order is pinned separately (see
+// TestStoreDimensionOrderIsArrivalIndependent), and every other test cares only
+// about which pairs are present.
+func dimsOf(e Edge) map[string]string {
+	if len(e.Dimensions) == 0 {
+		return nil
+	}
+	m := make(map[string]string, len(e.Dimensions))
+	for _, d := range e.Dimensions {
+		m[d.Name] = d.Value
+	}
+	return m
 }
 
 func TestStoreKeyIsTraceAndSpan(t *testing.T) {
@@ -175,24 +201,128 @@ func TestStoreConnectionTypeSticks(t *testing.T) {
 func TestStoreDimensionsMergeFromBothSides(t *testing.T) {
 	st, got := newTestStore(t, Config{})
 	k := makeEdgeKey(traceID(1), spanID(1))
-	st.upsert(t0, k, sideClient, halfSpan{service: "a"}, []dimKV{{"client_http.method", "GET"}})
-	st.upsert(t0, k, sideServer, halfSpan{service: "b"}, []dimKV{{"server_http.route", "/orders"}})
+	st.upsert(t0, k, sideClient, halfSpan{service: "a"}, []EdgeDimension{{"client_http.method", "GET"}})
+	st.upsert(t0, k, sideServer, halfSpan{service: "b"}, []EdgeDimension{{"server_http.route", "/orders"}})
 	e := (*got)[0]
-	if len(e.Dimensions) != 2 || e.Dimensions["client_http.method"] != "GET" || e.Dimensions["server_http.route"] != "/orders" {
-		t.Fatalf("dimensions = %v", e.Dimensions)
+	want := map[string]string{"client_http.method": "GET", "server_http.route": "/orders"}
+	if d := dimsOf(e); !maps.Equal(d, want) {
+		t.Fatalf("dimensions = %v, want %v", d, want)
 	}
 }
 
-func TestStoreDimensionlessEdgeHasNoMap(t *testing.T) {
+// The dimension SEQUENCE handed to the sink must depend on the dimension set
+// alone, never on which half arrived first: the metric layer keys a series on
+// it, so an arrival-ordered sequence gives one edge two keys — two series
+// rendering byte-identical label sets into one payload.
+func TestStoreDimensionOrderIsArrivalIndependent(t *testing.T) {
+	client := []EdgeDimension{{"client_http.method", "GET"}, {"client_http.route", "/orders"}}
+	server := []EdgeDimension{{"server_http.method", "GET"}}
+
+	var orders [][]EdgeDimension
+	for _, serverFirst := range []bool{false, true} {
+		st, got := newTestStore(t, Config{})
+		k := makeEdgeKey(traceID(1), spanID(1))
+		if serverFirst {
+			st.upsert(t0, k, sideServer, halfSpan{service: "b"}, server)
+			st.upsert(t0, k, sideClient, halfSpan{service: "a"}, client)
+		} else {
+			st.upsert(t0, k, sideClient, halfSpan{service: "a"}, client)
+			st.upsert(t0, k, sideServer, halfSpan{service: "b"}, server)
+		}
+		if len(*got) != 1 {
+			t.Fatalf("edges = %d, want 1", len(*got))
+		}
+		orders = append(orders, (*got)[0].Dimensions)
+	}
+	if !slices.Equal(orders[0], orders[1]) {
+		t.Fatalf("client-first order %v != server-first order %v", orders[0], orders[1])
+	}
+	// And the canonical order is the documented one: the client half's
+	// dimensions in their configured order, then the server half's.
+	want := []EdgeDimension{{"client_http.method", "GET"}, {"client_http.route", "/orders"}, {"server_http.method", "GET"}}
+	if !slices.Equal(orders[0], want) {
+		t.Fatalf("order = %v, want %v", orders[0], want)
+	}
+}
+
+// The same half arriving twice REPLACES its dimensions. Appending would carry
+// each one twice and — the sequence being the series key — mint a second series
+// rendering the very same labels.
+func TestStoreDuplicateHalfReplacesDimensions(t *testing.T) {
+	st, got := newTestStore(t, Config{})
+	k := makeEdgeKey(traceID(1), spanID(1))
+	dims := []EdgeDimension{{"client_http.method", "GET"}, {"client_http.route", "/orders"}}
+	st.upsert(t0, k, sideClient, halfSpan{service: "a"}, dims)
+	st.upsert(t0, k, sideClient, halfSpan{service: "a"}, dims) // a re-pushed batch
+	st.upsert(t0, k, sideServer, halfSpan{service: "b"}, nil)
+
+	e := (*got)[0]
+	if !slices.Equal(e.Dimensions, dims) {
+		t.Fatalf("dimensions = %v, want %v (the repeat replaced, not appended)", e.Dimensions, dims)
+	}
+	// A SHORTER replacement must not leave the dropped pairs' strings reachable
+	// from the entry: they point into an OTLP payload the entry could otherwise
+	// pin for a whole Wait.
+	st2, _ := newTestStore(t, Config{})
+	st2.upsert(t0, k, sideClient, halfSpan{service: "a"}, dims)
+	st2.upsert(t0, k, sideClient, halfSpan{service: "a"}, dims[:1])
+	held := st2.items[k].dims
+	if tail := held[:cap(held)][1]; tail != (EdgeDimension{}) {
+		t.Fatalf("dropped dimension still referenced: %v", tail)
+	}
+}
+
+func TestStoreDimensionlessEdgeCarriesNoSlice(t *testing.T) {
 	st, got := newTestStore(t, Config{})
 	k := makeEdgeKey(traceID(1), spanID(1))
 	st.upsert(t0, k, sideClient, halfSpan{service: "a"}, nil)
 	st.upsert(t0, k, sideServer, halfSpan{service: "b"}, nil)
-	// Not merely cosmetic: the default config configures no dimensions, and a
-	// map per completed request is the one allocation the pairing path would
-	// otherwise pay per edge.
+	// Not merely cosmetic: the default config configures no dimensions, so the
+	// join must not even touch its scratch on the path every edge takes.
 	if (*got)[0].Dimensions != nil {
 		t.Fatalf("Dimensions = %v, want nil when no dimensions were carried", (*got)[0].Dimensions)
+	}
+}
+
+// The Edge's dimensions BORROW the store's buffers, so the sink must see them
+// intact — the retirement that clears them runs after Record returns, not
+// before. (The test sinks clone for that reason; this one deliberately does
+// not.)
+func TestStoreDimensionsAreLiveDuringRecord(t *testing.T) {
+	var seen []EdgeDimension
+	st := newEdgeStore(Config{Wait: time.Second}.withDefaults(), func(e Edge) {
+		seen = append(seen, e.Dimensions...) // copies during the call, as a sink must
+	})
+	k := makeEdgeKey(traceID(1), spanID(1))
+	st.upsert(t0, k, sideClient, halfSpan{service: "a"}, []EdgeDimension{{"client_http.method", "GET"}})
+	st.upsert(t0, k, sideServer, halfSpan{service: "b"}, []EdgeDimension{{"server_http.route", "/orders"}})
+
+	// And the promotion path, whose Edge borrows the ENTRY's own buffer.
+	k2 := makeEdgeKey(traceID(2), spanID(2))
+	st.upsert(t0, k2, sideClient, halfSpan{service: "a", peer: "db"}, []EdgeDimension{{"client_db.system", "postgresql"}})
+	st.expire(t0.Add(time.Second), 10)
+
+	want := []EdgeDimension{{"client_http.method", "GET"}, {"server_http.route", "/orders"}, {"client_db.system", "postgresql"}}
+	if !slices.Equal(seen, want) {
+		t.Fatalf("sink saw %v, want %v", seen, want)
+	}
+}
+
+// The scratch the completing pair is joined into must not keep the payload's
+// strings alive after the sink has copied what it wants.
+func TestStoreJoinScratchIsCleared(t *testing.T) {
+	st, _ := newTestStore(t, Config{})
+	k := makeEdgeKey(traceID(1), spanID(1))
+	st.upsert(t0, k, sideClient, halfSpan{service: "a"}, []EdgeDimension{{"client_http.method", "GET"}})
+	st.upsert(t0, k, sideServer, halfSpan{service: "b"}, []EdgeDimension{{"server_http.route", "/orders"}})
+	buf := st.dimBuf
+	if len(buf) != 0 {
+		t.Fatalf("join scratch len = %d, want it emptied after the sink returned", len(buf))
+	}
+	for i, d := range buf[:cap(buf)] {
+		if d != (EdgeDimension{}) {
+			t.Fatalf("join scratch still references %v at %d", d, i)
+		}
 	}
 }
 
@@ -378,7 +508,7 @@ func TestStoreRecyclesEntries(t *testing.T) {
 	k2 := makeEdgeKey(traceID(1), spanID(2))
 
 	st.upsert(t0, k1, sideClient, halfSpan{service: "a", failed: true, peer: "p",
-		connection: ConnectionDatabase}, []dimKV{{"client_x", "1"}})
+		connection: ConnectionDatabase}, []EdgeDimension{{"client_x", "1"}})
 	first := st.items[k1]
 	st.upsert(t0, k1, sideServer, halfSpan{service: "b"}, nil)
 	if st.free != first {
@@ -386,7 +516,7 @@ func TestStoreRecyclesEntries(t *testing.T) {
 	}
 	// The recycled entry must not pin the strings it carried: they point into
 	// an OTLP payload that is otherwise free to be collected.
-	if cap(first.dims) > 0 && first.dims[:1][0] != (dimKV{}) {
+	if cap(first.dims) > 0 && first.dims[:1][0] != (EdgeDimension{}) {
 		t.Fatalf("recycled entry still references %v", first.dims[:1][0])
 	}
 

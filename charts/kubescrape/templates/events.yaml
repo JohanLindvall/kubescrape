@@ -218,7 +218,7 @@ spec:
             {{- if $cfg }}
             - -config=/etc/kubescrape/config/config.yaml
             {{- end }}
-            - -metrics-listen={{ .Values.metrics.listen }}
+            - -metrics-listen={{ if .Values.metrics.enabled }}{{ .Values.metrics.listen }}{{ end }}
             - -log-level={{ .Values.logLevel }}
             - -log-format={{ .Values.logFormat }}
             {{- with .Values.events.extraArgs }}

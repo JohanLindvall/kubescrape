@@ -277,7 +277,15 @@ func (b *Buffered) Stats() map[string]obs.BufferStat {
 // the next start of this pod ON THIS NODE, and is lost outright when the pod
 // never returns (node drained or scaled away, release uninstalled) or the
 // buffer dir is not a persistent mount. Call it with a bounded fresh context
-// after all producers have stopped, before closing the exporter and spools.
+// once the producers have stopped, before closing the exporter and spools.
+//
+// "Once the producers have stopped" is best-effort at the caller: the agent
+// joins them on a shutdown BUDGET, so a producer stuck against a dead
+// collector can still enqueue while this runs, and whatever it enqueues after
+// the drain runs dry stays spooled. That is durability-preserving — the spool
+// is committed, so the next start of this pod on this node redelivers it —
+// but it is not the same as "nothing is left behind", and the drain does not
+// wait for a straggler it cannot bound.
 func (b *Buffered) FinalDrain(ctx context.Context) {
 	var wg sync.WaitGroup
 	for _, run := range []func(context.Context){b.logs.drainUntilEmpty, b.metrics.drainUntilEmpty} {
@@ -299,8 +307,9 @@ type sink[T any] struct {
 	log       *slog.Logger
 	kind      string
 	// delivered counts batches this sink has successfully exported; stuck
-	// tracks, per stuck payload, its accountable failed cycles and whether the
-	// collector has delivered another batch while it was stuck (see stuckTooLong).
+	// tracks, per stuck payload (keyed by content hash), its accountable failed
+	// cycles and the value of delivered at its own previous failed cycle — the
+	// two together are the poison evidence (see stuckTooLong).
 	delivered uint64
 	stuck     map[uint64]stuckBatch
 	// stuckResponded records whether the latest sendStuck's final error carried
@@ -459,7 +468,8 @@ func (s *sink[T]) drainLoop(ctx context.Context, untilEmpty bool) {
 			// head (Rewind) and, when anything is queued behind it, rotates to
 			// the back (Requeue, exempt from the caps since diskqueue v0.0.4:
 			// a full queue must not pin a poison head, or nothing ever drains,
-			// sawProgress never arms, and the signal wedges across restarts).
+			// no other batch can ever prove the collector alive, and the
+			// signal wedges across restarts).
 			// Rotating an only batch is pointless churn; it retries at the
 			// head. NOTE the hash in stuckTooLong happens before Requeue —
 			// Requeue clobbers the reader buffer data aliases.
@@ -508,16 +518,17 @@ func boolLabel(b bool) string {
 // alive and still rejecting THIS payload (otherwise this is an outage, not a
 // poison payload, and the batch is retried indefinitely rather than lost).
 //
-// The evidence is sawProgress: s.delivered advancing between two of this
-// payload's own failed cycles means some OTHER batch got through while this one
-// was circling the queue failing — the collector singling this payload out. A
-// batch that fails only during a pure outage (nothing else delivering) never
-// sets it, so it is never dropped. Crucially, deliveries banked BEFORE this
-// payload got stuck, or during a recovery it merely sat behind in the queue
-// without being attempted, do not count: those advance s.delivered without any
-// stuck cycle of ours spanning them, so sawProgress stays false and a single
-// later failure cannot spend the poison budget. (The earlier cumulative
-// "deliveries since first stuck" test dropped good batches on exactly that.)
+// The evidence is s.delivered advancing between two of this payload's own
+// failed cycles: some OTHER batch got through while this one was circling the
+// queue failing — the collector singling this payload out. A batch that fails
+// only during a pure outage (nothing else delivering) never shows it, so it is
+// never dropped. Crucially, deliveries banked BEFORE this payload got stuck, or
+// during a recovery it merely sat behind in the queue without being attempted,
+// do not count: those advance s.delivered without any stuck cycle of ours
+// spanning them, so the comparison against stuckBatch.lastDelivered — the
+// delivery count at OUR previous failure — stays false and a single later
+// failure cannot spend the poison budget. (The earlier cumulative "deliveries
+// since first stuck" test dropped good batches on exactly that.)
 //
 // Keying by content hash (rather than threading a counter through the spool
 // format) means the count resets on restart — which is what we want: a fresh
@@ -663,7 +674,19 @@ func (s *sink[T]) trySend(ctx context.Context, v T) sendResult {
 // windows the disk buffer exists to survive; the bounded requeue path caps
 // their cost, whereas classifying them permanent drains the whole backlog
 // into drops. OutOfRange is retryable per the OTLP failure table.
+//
+// ErrRecordTooLarge is the one NON-collector error classified permanent:
+// with -buffer-dir the producer's Export returns the enqueue error rather
+// than any collector verdict, and a batch larger than the whole buffer cap
+// can never fit however often it is retried. Left transient, the tailer
+// rewound and rebuilt the identical batch every sweep - wedging its single
+// sweep goroutine, and with it log shipping for every file on the node -
+// while the counter added for exactly this class stayed at 0. ErrFull is
+// deliberately NOT here: that one drains.
 func IsPermanent(err error) bool {
+	if errors.Is(err, diskqueue.ErrRecordTooLarge) {
+		return true
+	}
 	var he *HTTPStatusError
 	if errors.As(err, &he) {
 		switch he.Code {

@@ -324,3 +324,19 @@ func TestBufferedFullSpoolDoesNotWedgeOnPoisonHead(t *testing.T) {
 		return false
 	}, "good batch delivered despite a poison head at a full spool")
 }
+
+// With -buffer-dir a producer's Export returns the ENQUEUE error, so a batch
+// over the whole buffer cap must classify permanent: left transient, the
+// tailer rebuilt the identical batch every sweep and its single sweep
+// goroutine never made progress again.
+func TestIsPermanentRecordTooLarge(t *testing.T) {
+	if !IsPermanent(diskqueue.ErrRecordTooLarge) {
+		t.Error("ErrRecordTooLarge is transient; the producer re-enqueues a batch that can never fit")
+	}
+	if !IsPermanent(errors.Join(errors.New("enqueue logs"), diskqueue.ErrRecordTooLarge)) {
+		t.Error("wrapped ErrRecordTooLarge is transient")
+	}
+	if IsPermanent(diskqueue.ErrFull) {
+		t.Error("ErrFull is permanent; a full queue drains and the batch must be retried")
+	}
+}

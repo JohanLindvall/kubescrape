@@ -89,6 +89,20 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: status.hostIP
+          ports:
+            - name: http
+              containerPort: 8081
+          # Without these the agent's whole readiness machinery is inert on
+          # this path: pods are Ready the moment the container starts, so a
+          # rolling update marches across every node regardless of whether the
+          # new agent can reach the metadata service — which is precisely what
+          # /readyz's gates were written to prevent. The chart has them; the
+          # raw manifests, which the docs tell you to `kubectl apply -f`, did
+          # not.
+          readinessProbe:
+            httpGet: {path: /readyz, port: http}
+          livenessProbe:
+            httpGet: {path: /healthz, port: http}
           securityContext:
             # Container log files under /var/log/pods are root-readable only.
             runAsUser: 0

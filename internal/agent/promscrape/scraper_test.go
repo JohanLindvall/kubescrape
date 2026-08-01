@@ -2,6 +2,7 @@ package promscrape
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -561,4 +562,37 @@ func TestScrapeStatusSnapshot(t *testing.T) {
 	if st.Targets[1].Pod == "" || st.Targets[1].Pipeline != "targets" {
 		t.Fatalf("target identity missing: %+v", st.Targets[1])
 	}
+}
+
+// The kubelet due times must survive a cycle whose target list could not be
+// fetched. They are not derived from that list — they ride in the same map for
+// convenience — and discarding them left both kubelet scrapes permanently past
+// due while targetIntervals stayed frozen at whatever fine cadence a monitor
+// had requested. A metadata-service rollout then re-clocked /metrics/cadvisor
+// and /metrics to that cadence on every node in the cluster.
+func TestKubeletScheduleSurvivesTargetFetchFailure(t *testing.T) {
+	kubelet := serveBody(t, "# TYPE up gauge\nup 1\n")
+	s := New(Config{
+		Node: "node1", Interval: time.Hour, Timeout: time.Second,
+		Targets:   failingTargets{},
+		Exporter:  &captureExporter{},
+		StartTime: time.Now(),
+		Kubelet: KubeletConfig{
+			Endpoint: kubelet.URL, Cadvisor: true, NodeMetrics: true,
+			Meta: &fakeMetaSource{},
+		},
+	})
+	s.cycle(context.Background())
+	for _, k := range kubeletDueKeys {
+		if _, ok := s.dueAt(k); !ok {
+			t.Errorf("kubelet due time %q discarded because the target fetch failed", k)
+		}
+	}
+}
+
+// failingTargets always fails, as a metadata service being rolled does.
+type failingTargets struct{}
+
+func (failingTargets) NodeTargets(context.Context, string) ([]kubemeta.ScrapeTarget, error) {
+	return nil, errors.New("metadata service unavailable")
 }

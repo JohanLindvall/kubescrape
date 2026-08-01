@@ -487,10 +487,10 @@ func (s *Scraper) cycle(ctx context.Context) {
 
 	if s.cfg.Kubelet.Endpoint != "" {
 		base := strings.TrimRight(s.cfg.Kubelet.Endpoint, "/")
-		if s.cfg.Kubelet.Cadvisor && dueNow("\x00cadvisor", s.cfg.Interval) {
+		if s.cfg.Kubelet.Cadvisor && dueNow(kubeletDueKeys[0], s.cfg.Interval) {
 			spawn(pipelineCadvisor, base+"/metrics/cadvisor", nil, s.scrapeCadvisor)
 		}
-		if s.cfg.Kubelet.NodeMetrics && dueNow("\x00node", s.cfg.Interval) {
+		if s.cfg.Kubelet.NodeMetrics && dueNow(kubeletDueKeys[1], s.cfg.Interval) {
 			spawn(pipelineNode, base+"/metrics", nil, s.scrapeNodeMetrics)
 		}
 	}
@@ -530,6 +530,16 @@ func (s *Scraper) cycle(ctx context.Context) {
 		// schedule would discard every due time and re-scrape everything next
 		// cycle, ignoring the intervals entirely.
 		s.setSchedule(due, intervals)
+	} else {
+		// The KUBELET due times are not derived from the target list and must
+		// be committed regardless — they ride in the same map only for
+		// convenience. Discarding them left both kubelet scrapes permanently
+		// past due while targetIntervals stayed frozen at whatever fine cadence
+		// a monitor had asked for, so a metadata-service rollout re-clocked
+		// /metrics/cadvisor and /metrics to (say) 10s on every node in the
+		// cluster — a load spike on every kubelet exactly while the control
+		// plane is already degraded.
+		s.setKubeletSchedule(due)
 	}
 	wg.Wait()
 
@@ -553,6 +563,29 @@ func (s *Scraper) setSchedule(due map[string]time.Time, intervals map[string]tim
 	defer s.dueMu.Unlock()
 	s.due, s.targetIntervals = due, intervals
 }
+
+// setKubeletSchedule commits only the kubelet entries of a cycle whose target
+// list could not be fetched, leaving the target schedule (and the intervals
+// derived from it) untouched for the next successful cycle.
+func (s *Scraper) setKubeletSchedule(due map[string]time.Time) {
+	s.dueMu.Lock()
+	defer s.dueMu.Unlock()
+	if s.due == nil {
+		// The very first cycle can be a failing one — an agent normally starts
+		// before the metadata service is reachable — so the schedule map may
+		// not exist yet.
+		s.due = make(map[string]time.Time, len(kubeletDueKeys))
+	}
+	for _, k := range kubeletDueKeys {
+		if when, ok := due[k]; ok {
+			s.due[k] = when
+		}
+	}
+}
+
+// kubeletDueKeys are the schedule keys of the two kubelet scrapes. They are
+// NUL-prefixed so they cannot collide with a target URL.
+var kubeletDueKeys = []string{"\x00cadvisor", "\x00node"}
 
 // scrapeOutcome is the health record of one scrape.
 type scrapeOutcome struct {

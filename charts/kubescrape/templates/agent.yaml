@@ -5,13 +5,7 @@
   section they were always merged into. An explicit config value wins over
   staticAttrs.
 */}}
-{{- $cfg := .Values.agent.config | default dict }}
-{{- if .Values.agent.staticAttrs }}
-{{-   $ra := (get $cfg "resourceAttributes") | default dict }}
-{{-   $static := merge (deepCopy ((get $ra "static") | default dict)) .Values.agent.staticAttrs }}
-{{-   $ra = merge (dict "static" $static) (deepCopy $ra) }}
-{{-   $cfg = merge (dict "resourceAttributes" $ra) (deepCopy $cfg) }}
-{{- end }}
+{{- $cfg := fromYaml (include "kubescrape.agentConfig" .) }}
 apiVersion: v1
 kind: ServiceAccount
 metadata:

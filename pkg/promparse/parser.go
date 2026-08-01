@@ -388,7 +388,13 @@ func (p *Parser) readLine(br *bufio.Reader) (line []byte, tooLong bool, err erro
 	p.scratch = p.scratch[:0]
 	for {
 		chunk, rerr := br.ReadSlice('\n')
-		if len(p.scratch) == 0 && rerr == nil {
+		// !tooLong is load-bearing: an over-long FIRST chunk that did not end
+		// in a newline leaves scratch empty (nothing is appended once the
+		// budget is blown), so without it this early-out returned the line's
+		// short trailing chunk as a complete, in-budget line — emitting a
+		// SAMPLE that does not exist in the exposition, with malformed=0 and
+		// no error. The flag has to survive the whole physical line.
+		if !tooLong && len(p.scratch) == 0 && rerr == nil {
 			if len(chunk) > p.maxLineBytes {
 				return nil, true, nil
 			}

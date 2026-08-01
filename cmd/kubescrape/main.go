@@ -664,7 +664,12 @@ func run() error {
 	// With the OTLP self-metrics push disabled (-self-metrics-interval=0) the
 	// kubescrape_* metrics ride the /metrics scrape instead — the service then
 	// needs no OTLP endpoint at all.
-	stopMetrics := obs.ServeMetrics(ctx, *metricsListen, *selfMetricsIntv <= 0, log)
+	stopMetrics, err := obs.ServeMetrics(ctx, *metricsListen, *selfMetricsIntv <= 0, log)
+	if err != nil {
+		// Fatal, like the ingest listener: with the OTLP push off this port is
+		// the only path every kubescrape_* metric has.
+		return err
+	}
 	defer stopMetrics()
 	stopPprof := obs.ServePprof(ctx, *pprofListen, log)
 	defer stopPprof()

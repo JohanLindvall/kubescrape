@@ -224,3 +224,31 @@ func TestKeyDistinguishesInt64Values(t *testing.T) {
 		t.Fatalf("int64 aliases another type: i=%q f=%q s=%q", a, f, s)
 	}
 }
+
+// A logfmt value's escapes must be decoded, exactly as the JSON arm decodes
+// them: the same logical value has to read the same whichever format the line
+// used. In the tailer a record attribute lifted here is consulted BEFORE the
+// raw line, so a divergence here silently changes what a logMetrics label or a
+// logs.rules selector matches.
+func TestLogfmtValuesAreUnescaped(t *testing.T) {
+	e, err := New(&Config{Rules: []Rule{{Key: "msg", Attribute: "msg"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct{ line, want string }{
+		{`level=error msg="connect failed: \"db-1\" retrying"`, `connect failed: "db-1" retrying`},
+		{`msg="a\tb"`, "a\tb"},
+		{`msg="plain"`, "plain"}, // the no-escape fast path
+	} {
+		got := e.Extract(tc.line)
+		var have string
+		for _, a := range got.Log {
+			if a.Key == "msg" {
+				have, _ = a.Val.(string)
+			}
+		}
+		if have != tc.want {
+			t.Errorf("%s\n  got  %q\n  want %q", tc.line, have, tc.want)
+		}
+	}
+}

@@ -41,6 +41,7 @@ import (
 	"github.com/JohanLindvall/kubescrape/internal/agent/attrs"
 	"github.com/JohanLindvall/kubescrape/internal/agent/logscrub"
 	"github.com/JohanLindvall/kubescrape/internal/agent/otlpexport"
+	"github.com/JohanLindvall/kubescrape/internal/leader"
 	"github.com/JohanLindvall/kubescrape/internal/logline"
 	"github.com/JohanLindvall/kubescrape/internal/metrics"
 	"github.com/JohanLindvall/kubescrape/internal/obs"
@@ -78,6 +79,11 @@ type Config struct {
 	StartMode string
 	// Namespace restricts the watch (empty = cluster-wide).
 	Namespace string
+	// StopBudget bounds the final flush and position write after ctx is
+	// cancelled. It MUST stay below the lease renew deadline the caller allows
+	// this work to stop within, or a slow shutdown is reported as "did not
+	// stop" and fails the process. Zero uses half the leader default.
+	StopBudget time.Duration
 
 	BatchSize     int
 	FlushInterval time.Duration
@@ -203,12 +209,33 @@ func (r *Reader) Run(ctx context.Context) {
 	// Final flush on a DETACHED context: ctx is already cancelled, and the
 	// last batch must still reach the collector before the position is
 	// written (the tailer's shutdown flush does the same).
-	fctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	//
+	// The budget must stay BELOW the lease renew deadline the caller allows
+	// this work to stop within. It was 15s against leader.DefaultRenewDeadline
+	// of 10s — deterministically too long — so a slow final flush or a
+	// ConfigMap write against the same unavailable API server that cost us the
+	// lease made leader.Run report "leader work did not stop", which
+	// startEvents treats as fatal: the process exited non-zero and took the
+	// co-located -azure-diagnostics consumer with it, contradicting the leader
+	// package's own contract that losing the lease must not take the process
+	// down.
+	fctx, cancel := context.WithTimeout(context.Background(), r.shutdownBudget())
 	defer cancel()
 	if err := r.flush(fctx); err != nil {
 		r.log.Warn("final event flush failed", "error", err)
 	}
 	r.persist(fctx, true)
+}
+
+// shutdownBudget is the ceiling on the final flush and position write. It is
+// derived from the lease renew deadline the caller stops this work within, so
+// the two cannot drift apart.
+func (r *Reader) shutdownBudget() time.Duration {
+	d := r.cfg.StopBudget
+	if d <= 0 {
+		d = leader.DefaultRenewDeadline / 2
+	}
+	return d
 }
 
 // loadPosition reads the stored resume point and applies the start policy.

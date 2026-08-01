@@ -20,7 +20,7 @@
   election: the Event Hubs consumer group is the coordination, and its
   committed offsets are the position.
 */}}
-{{- $cfg := .Values.agent.config | default dict }}
+{{- $cfg := fromYaml (include "kubescrape.agentConfig" .) }}
 apiVersion: v1
 kind: ServiceAccount
 metadata:

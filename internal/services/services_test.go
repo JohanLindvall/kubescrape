@@ -136,3 +136,29 @@ func TestSelectorRequiresKeyPresence(t *testing.T) {
 		t.Error("exact match failed")
 	}
 }
+
+// A Service's annotations reach the UNAUTHENTICATED targets route on every
+// service- and monitor-derived target, so they go through the same filter as
+// pods, owners and namespaces. last-applied-configuration is a verbatim copy of
+// the whole applied object — including anything a user inlined into it.
+func TestServiceAnnotationsAreFiltered(t *testing.T) {
+	idx := NewIndex()
+	idx.Upsert(&corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "web", Namespace: "ns1", UID: "svc-uid",
+			Annotations: map[string]string{
+				"kubectl.kubernetes.io/last-applied-configuration": `{"spec":{"template":{"spec":{"containers":[{"env":[{"name":"DB_PASSWORD","value":"hunter2"}]}]}}}}`,
+				"prometheus.io/scrape":                             "true",
+			},
+		},
+		Spec: corev1.ServiceSpec{Selector: map[string]string{"app": "web"}},
+	})
+	for _, svc := range idx.All(nil) {
+		if _, ok := svc.Annotations["kubectl.kubernetes.io/last-applied-configuration"]; ok {
+			t.Error("last-applied-configuration served on a Service; it is a verbatim copy of the applied object")
+		}
+		if svc.Annotations["prometheus.io/scrape"] != "true" {
+			t.Errorf("the scrape annotation must survive: %v", svc.Annotations)
+		}
+	}
+}

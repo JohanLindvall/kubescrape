@@ -539,3 +539,36 @@ func TestQuotedNameEdgeCases(t *testing.T) {
 		t.Fatalf("malformed = %d, want 4", malformed)
 	}
 }
+
+// An over-long line must be consumed and counted malformed in its ENTIRETY.
+// The tail of such a line is not a line: emitting it invents a series that
+// does not appear in the exposition — a silent data-integrity break for any
+// caller of this package that sets a small MaxLineBytes, not merely a dropped
+// sample. The sizing matters: the physical line has to end with a SHORT final
+// chunk (total = whole read buffers + a remainder under MaxLineBytes), because
+// nothing is appended to the scratch once the budget is blown, so that
+// remainder looked like a complete, in-budget line of its own.
+func TestOverLongLineDoesNotEmitItsTail(t *testing.T) {
+	const evil = `evil_metric{b="c"} 99` + "\n"
+	for _, tail := range []int{len(evil), len(evil) + 8, 99} {
+		body := strings.Repeat("x", parseBufSize*2) +
+			strings.Repeat("y", tail-len(evil)) + evil
+		p := New(Options{MaxLineBytes: 100})
+		var samples []Sample
+		malformed, err := p.Parse(strings.NewReader(body), func(s Sample) error {
+			samples = append(samples, s)
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("tail=%d: parse: %v", tail, err)
+		}
+		for _, s := range samples {
+			if s.Name == "evil_metric" {
+				t.Errorf("tail=%d: emitted %q from the tail of an over-long line", tail, s.Name)
+			}
+		}
+		if malformed == 0 {
+			t.Errorf("tail=%d: over-long line not counted malformed", tail)
+		}
+	}
+}

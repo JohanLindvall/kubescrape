@@ -9,6 +9,8 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
+
+	"github.com/JohanLindvall/kubescrape/pkg/kubemeta"
 )
 
 // Service is the subset of a Kubernetes Service needed for scrape discovery.
@@ -48,11 +50,18 @@ func NewIndex() *Index {
 // Upsert records the current state of a service.
 func (ix *Index) Upsert(svc *corev1.Service) {
 	rec := &Service{
-		Name:        svc.Name,
-		Namespace:   svc.Namespace,
-		UID:         string(svc.UID),
-		Labels:      copyMap(svc.Labels),
-		Annotations: copyMap(svc.Annotations),
+		Name:      svc.Name,
+		Namespace: svc.Namespace,
+		UID:       string(svc.UID),
+		Labels:    copyMap(svc.Labels),
+		// FilterAnnotations, like pods, owners and namespaces: a Service is the
+		// fourth annotation-bearing object this API serves and was the one
+		// missed. Its annotations ride on every service- and monitor-derived
+		// target on the UNAUTHENTICATED /v1/nodes/{node}/targets route, and the
+		// Services that get there are exactly the hand-annotated ones most
+		// likely to carry a kubectl last-applied-configuration — a verbatim
+		// copy of the whole applied object, including anything inlined into it.
+		Annotations: kubemeta.FilterAnnotations(svc.Annotations),
 		Selector:    copyMap(svc.Spec.Selector),
 	}
 	for _, p := range svc.Spec.Ports {

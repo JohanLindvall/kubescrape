@@ -180,8 +180,20 @@ func (e *Extractor) Extract(line string) Result {
 	buf := unsafe.Slice(unsafe.StringData(line), len(line))
 	_ = logfmt.Iterate(buf, func(key, val []byte) bool {
 		if idxs, ok := e.want[string(key)]; ok { // string(key) lookup: no alloc
+			// Iterate yields RAW values (quotes stripped, escapes intact).
+			// Decode them, as the JSON arm below and the twin extractor in
+			// internal/logline both do: the same logical value must not read
+			// differently depending on the line format, and in the tailer a
+			// record attribute lifted here is consulted BEFORE the line, so an
+			// unrelated logAttributes rule would otherwise change what a
+			// logMetrics label or a logs.rules selector matches.
+			// The no-escape path (the common one) costs one byte scan, no copy.
+			decoded := val
+			if logfmt.NeedsUnescape(val) {
+				decoded = logfmt.AppendUnescape(nil, val)
+			}
 			for _, i := range idxs {
-				vals[i] = string(val)
+				vals[i] = string(decoded)
 				found[i] = true
 			}
 		}

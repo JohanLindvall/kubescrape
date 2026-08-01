@@ -3,7 +3,9 @@ package obs
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/pprof"
 	"time"
@@ -86,16 +88,26 @@ func (registryCollector) Collect(ch chan<- prometheus.Metric) {
 // target is what a Prometheus/ServiceMonitor setup points at, while /debug and
 // /readyz are operator-facing and often reachable only inside the cluster. An
 // empty addr disables it.
-func ServeMetrics(ctx context.Context, addr string, internal bool, log *slog.Logger) func() {
+func ServeMetrics(ctx context.Context, addr string, internal bool, log *slog.Logger) (func(), error) {
 	if addr == "" {
-		return func() {}
+		return func() {}, nil
 	}
 	mux := http.NewServeMux()
 	mux.Handle("GET /metrics", RuntimeHandler(internal))
 	srv := &http.Server{Addr: addr, Handler: mux, ReadHeaderTimeout: 10 * time.Second}
+	// Bind SYNCHRONOUSLY so a failure reaches the caller. It used to be logged
+	// from inside the goroutine and dropped: with -self-metrics-interval=0 —
+	// the documented way to choose the scrape modality over the OTLP push —
+	// this port is the ONLY delivery path for every kubescrape_* metric, and
+	// the chart's prometheus.io annotations keep pointing at a port that never
+	// opened. A dead ingest listener is fatal for exactly this reason.
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return func() {}, fmt.Errorf("metrics endpoint %s: %w", addr, err)
+	}
 	go func() {
 		log.Info("metrics endpoint started", "addr", addr, "path", "/metrics")
-		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Error("metrics endpoint failed", "addr", addr, "error", err)
 		}
 	}()
@@ -103,7 +115,7 @@ func ServeMetrics(ctx context.Context, addr string, internal bool, log *slog.Log
 		sctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		_ = srv.Shutdown(sctx)
-	}
+	}, nil
 }
 
 // ServePprof starts a dedicated HTTP listener serving net/http/pprof under

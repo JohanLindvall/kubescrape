@@ -408,10 +408,31 @@ func (e *Enricher) tokenFrom(a pcommon.Map, keys []string, prefix string) (strin
 // NOT cached for the case it exists to serve: metaclient caches 200s, and a
 // stale container id — the reason to fall back to the pod uid — answers 404,
 // which is never cached. Each such probe is a live GET.
-func (e *Enricher) resolves(ctx context.Context, token string) bool {
+func (e *Enricher) resolves(ctx context.Context, cache map[string]pcommon.Map, token string) bool {
+	// Memoised per request, INCLUDING the negative answer. metaclient caches
+	// 200s, but the case this probe exists for — a stale container id — answers
+	// 404, which is never cached, so on the split path (one call per DATA
+	// POINT) a payload of 500 points issued 500 live GETs from inside the
+	// handler for the same dead id.
+	if cache != nil {
+		if m, ok := cache[probeKey(token)]; ok {
+			return m.Len() > 0
+		}
+	}
 	pod, _ := e.lookupByID(ctx, token)
+	if cache != nil {
+		m := pcommon.NewMap()
+		if pod != nil {
+			m.PutBool("resolved", true) // non-empty marks the positive answer
+		}
+		cache[probeKey(token)] = m
+	}
 	return pod != nil
 }
+
+// probeKey namespaces a resolvability answer so it cannot collide with the
+// built-attribute entry for the same token.
+func probeKey(token string) string { return "\x00probe:" + token }
 
 // resolvableToken picks the id token to attribute a resource (or data point)
 // by, preferring the container id — it names the exact incarnation — but
@@ -424,12 +445,12 @@ func (e *Enricher) resolves(ctx context.Context, token string) bool {
 // payload was attributed differently by mode, and the split path additionally
 // reduced the resource to the bare unresolved id, discarding every attribute
 // the sender had set.
-func (e *Enricher) resolvableToken(ctx context.Context, a pcommon.Map) string {
+func (e *Enricher) resolvableToken(ctx context.Context, cache map[string]pcommon.Map, a pcommon.Map) string {
 	cTok, cOK := e.tokenFrom(a, e.containerIDKeys, tokContainer)
 	uTok, uOK := e.tokenFrom(a, e.podUIDKeys, tokPodUID)
 	switch {
 	case cOK && uOK:
-		if e.resolves(ctx, cTok) {
+		if e.resolves(ctx, cache, cTok) {
 			return cTok
 		}
 		return uTok

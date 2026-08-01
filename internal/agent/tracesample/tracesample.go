@@ -188,7 +188,14 @@ func (s *Sampler) ExportTraces(ctx context.Context, td ptrace.Traces) error {
 // might run out.
 func (s *Sampler) wouldDrop(td ptrace.Traces) bool {
 	if s.rate > 0 {
-		return true // token accounting happens in the real pass
+		// A rate cap does not mean this payload loses anything: when the bucket
+		// holds enough tokens for every span, the copy is pure waste — and this
+		// runs on the ingest path, where the payload can be megabytes. Peek
+		// WITHOUT consuming (the real pass does the accounting); if the bucket
+		// might run out, fall back to the copying path.
+		if float64(td.SpanCount()) > s.availableTokens() {
+			return true
+		}
 	}
 	rss := td.ResourceSpans()
 	for i := 0; i < rss.Len(); i++ {
@@ -224,6 +231,17 @@ func (s *Sampler) keep(sp ptrace.Span) bool {
 }
 
 // allow consumes one rate-cap token.
+// availableTokens reports the bucket's current fill without consuming any.
+func (s *Sampler) availableTokens() float64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := time.Now()
+	if !s.last.IsZero() {
+		return min(s.burst, s.tokens+s.rate*now.Sub(s.last).Seconds())
+	}
+	return s.tokens
+}
+
 func (s *Sampler) allow() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()

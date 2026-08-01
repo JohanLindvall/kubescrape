@@ -180,12 +180,14 @@ func runConfigCase(cfg agentConfig, scrubber *logscrub.Scrubber, extractor *loga
 	// Resolution is the PRODUCTION resolver itself (internal/agent/logchain),
 	// not a mirror of it: this harness exists to prove what a rule or metric
 	// edit does to real lines, and a re-implementation can only prove what the
-	// re-implementation does. It reads the CASE's resource map — the production
-	// resolver reads the file's BASE resource, never the exported copy that
-	// logattrs resource-target attributes land on, so those are deliberately
-	// invisible here too.
+	// re-implementation does. It reads the CASE's resource map plus THIS
+	// line's lifted resource attributes, which is what every producer now
+	// resolves against — without SetLifted the harness agreed with no
+	// pipeline at all, and its own comment about resource-target attributes
+	// being invisible described behaviour the chain no longer has.
 	resolver := logchain.New()
 	resolver.Set(lr.Attributes(), res, logchain.LowerSeverity(lr.SeverityText()))
+	resolver.SetLifted(extracted.Resource)
 	labelFn, valueFn, ruleFn := resolver.LabelFn(), resolver.ValueFn(), resolver.RuleFn()
 
 	// Metrics observe EVERY line (before rules), exactly as in production; a

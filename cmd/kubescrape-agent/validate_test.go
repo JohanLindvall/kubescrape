@@ -161,4 +161,18 @@ func TestRouteWithoutEndpointRejectedWhenTheBaseIsUnused(t *testing.T) {
 	if err := validateConfig(cfg, ""); err != nil {
 		t.Fatalf("rejected a header-only route where the base IS the fallback destination: %v", err)
 	}
+
+	// All three signals overridden, but one override sets only HEADERS — it
+	// inherits the base endpoint through merged(), so the base is still a
+	// destination and an endpoint-less route is legitimate. Testing struct
+	// presence instead of endpoints failed this config at startup.
+	inherits := &otlpexport.ExportConfig{
+		Logs:    full.Logs,
+		Metrics: full.Metrics,
+		Traces:  &otlpexport.ExportOverride{Headers: map[string]string{"X-Scope-OrgID": "traces"}},
+	}
+	cfg = agentConfig{Export: inherits, Routing: &route.Config{Routes: headerOnly}}
+	if err := validateConfig(cfg, ""); err != nil {
+		t.Fatalf("rejected a route inheriting a base that a header-only override still dials: %v", err)
+	}
 }

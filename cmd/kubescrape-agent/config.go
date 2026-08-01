@@ -221,10 +221,30 @@ func routeExportConfig(exp *otlpexport.ExportConfig, rt route.Route) (otlpexport
 		rcfg.Endpoint = rt.Endpoint
 		return rcfg, nil
 	}
-	if exp != nil && exp.Logs != nil && exp.Metrics != nil && exp.Traces != nil {
-		return otlpexport.Config{}, fmt.Errorf("routing route %q: no endpoint, and the flag base is not a destination here (export: overrides every signal, so the default chain is never built) — give the route its own endpoint", rt.Name)
+	if baseEndpointUnused(exp) {
+		return otlpexport.Config{}, fmt.Errorf("routing route %q: no endpoint, and the flag base is not a destination here (export: gives every signal its own endpoint, so nothing dials -otlp-endpoint) — give the route its own endpoint", rt.Name)
 	}
 	return rcfg, nil
+}
+
+// baseEndpointUnused reports whether NOTHING dials the flag base endpoint:
+// every signal is overridden AND every override names its own endpoint.
+//
+// Struct presence is not the test. An override that sets only headers (or a
+// bearer file, or TLS) inherits the base ENDPOINT through merged(), so the
+// base is still the address that signal reaches — and rejecting an
+// endpoint-less route there would fail a config the exporter builds happily,
+// which is the CrashLoop the shared derivation exists to prevent.
+func baseEndpointUnused(exp *otlpexport.ExportConfig) bool {
+	if exp == nil {
+		return false
+	}
+	for _, o := range []*otlpexport.ExportOverride{exp.Logs, exp.Metrics, exp.Traces} {
+		if o == nil || o.Endpoint == "" {
+			return false
+		}
+	}
+	return true
 }
 
 // printConfigSummary reports what a real start would enable, so -check-config

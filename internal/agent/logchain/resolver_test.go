@@ -1,0 +1,247 @@
+package logchain
+
+import (
+	"testing"
+
+	"go.opentelemetry.io/collector/pdata/pcommon"
+)
+
+// maps builds a record/resource attribute pair from literal string maps.
+func maps(rec, res map[string]string) (pcommon.Map, pcommon.Map) {
+	r, s := pcommon.NewMap(), pcommon.NewMap()
+	for k, v := range rec {
+		r.PutStr(k, v)
+	}
+	for k, v := range res {
+		s.PutStr(k, v)
+	}
+	return r, s
+}
+
+// SeverityKey is available to RULES only. It is synthesized from a field that
+// carries the CURRENT record's severity, so folding the check down into
+// Resolver.label — where it would be shared by labels, values and rules — makes
+// every log-derived metric configured with `__severity__` mint a label out of
+// whichever record the resolver happens to be pointed at, with no key of that
+// name existing anywhere in production and the whole suite still green.
+func TestSeverityKeyIsRuleOnly(t *testing.T) {
+	rec, res := maps(map[string]string{"http.status": "500"}, map[string]string{"k8s.pod.name": "web-abc"})
+	r := New()
+	r.Set(rec, res, "error")
+
+	if got := r.RuleFn()(SeverityKey); got != "error" {
+		t.Errorf("RuleFn(%s) = %q, want %q: keep/drop rules select on the enriched severity",
+			SeverityKey, got, "error")
+	}
+	if got := r.LabelFn()(SeverityKey); got != "" {
+		t.Errorf("LabelFn(%s) = %q, want empty: no such attribute exists in production, so a label built from it is the previous record's severity leaking into metric cardinality",
+			SeverityKey, got)
+	}
+	if v, ok := r.ValueFn()(SeverityKey); ok {
+		t.Errorf("ValueFn(%s) = %v (ok=%v), want no value: severity is not a number and must not resolve as one",
+			SeverityKey, v, ok)
+	}
+	// The synthetic key must not shadow ordinary lookups either.
+	if got := r.RuleFn()("http.status"); got != "500" {
+		t.Errorf("RuleFn(http.status) = %q, want 500", got)
+	}
+	if got := r.RuleFn()("k8s.pod.name"); got != "web-abc" {
+		t.Errorf("RuleFn falls through to the resource: got %q, want web-abc", got)
+	}
+}
+
+// A real attribute literally named __severity__ (a log line that happens to
+// carry the key) still resolves for labels: the ban is on SYNTHESIZING one,
+// not on a key the record genuinely has.
+func TestSeverityKeyFromARealAttributeStillResolves(t *testing.T) {
+	rec, res := maps(map[string]string{SeverityKey: "from-the-line"}, nil)
+	r := New()
+	r.Set(rec, res, "error")
+	if got := r.LabelFn()(SeverityKey); got != "from-the-line" {
+		t.Errorf("LabelFn = %q, want the record's own attribute value", got)
+	}
+	// ...and the synthetic value wins for rules, which is what `__severity__`
+	// means there.
+	if got := r.RuleFn()(SeverityKey); got != "error" {
+		t.Errorf("RuleFn = %q, want the enriched severity %q", got, "error")
+	}
+}
+
+// Record attributes shadow resource attributes: the line's own field is more
+// specific than the pod/unit/ARM-resource identity it was collected under.
+func TestRecordAttributesWinOverResource(t *testing.T) {
+	rec, res := maps(
+		map[string]string{"service.name": "from-the-line", "only.record": "r"},
+		map[string]string{"service.name": "from-the-pod", "only.resource": "s"},
+	)
+	r := New()
+	r.Set(rec, res, "")
+
+	for _, tc := range []struct{ key, want string }{
+		{"service.name", "from-the-line"},
+		{"only.record", "r"},
+		{"only.resource", "s"},
+		{"absent", ""},
+	} {
+		if got := r.LabelFn()(tc.key); got != tc.want {
+			t.Errorf("LabelFn(%s) = %q, want %q", tc.key, got, tc.want)
+		}
+		if got := r.RuleFn()(tc.key); got != tc.want {
+			t.Errorf("RuleFn(%s) = %q, want %q", tc.key, got, tc.want)
+		}
+	}
+}
+
+// Set re-points the resolver at the next record. One Resolver is kept per
+// flush/convert and reused for every record in it, so anything remembered from
+// the previous record is a cross-record attribute leak: record N's severity or
+// pod name landing on record N+1's metric labels and rule decisions.
+func TestSetRepointsWithoutStaleState(t *testing.T) {
+	r := New()
+	label, rule := r.LabelFn(), r.RuleFn() // bound ONCE, as the callers do
+
+	rec1, res1 := maps(map[string]string{"tenant": "a"}, map[string]string{"k8s.pod.name": "pod-a"})
+	r.Set(rec1, res1, "error")
+	if got := label("tenant"); got != "a" {
+		t.Fatalf("first record: tenant = %q", got)
+	}
+
+	// The next record has neither key.
+	rec2, res2 := maps(nil, map[string]string{"k8s.pod.name": "pod-b"})
+	r.Set(rec2, res2, "info")
+	if got := label("tenant"); got != "" {
+		t.Errorf("tenant = %q after Set; the previous record's attribute leaked into this one's labels", got)
+	}
+	if got := label("k8s.pod.name"); got != "pod-b" {
+		t.Errorf("k8s.pod.name = %q, want pod-b; the closures must read the CURRENT record", got)
+	}
+	if got := rule(SeverityKey); got != "info" {
+		t.Errorf("rule severity = %q, want info; the previous record's severity survived Set", got)
+	}
+
+	// Closures captured before the first Set must see the same state — they
+	// are bound at construction precisely so no closure is allocated per
+	// record.
+	if label("k8s.pod.name") != r.LabelFn()("k8s.pod.name") {
+		t.Error("a closure taken before Set disagrees with one taken after: the resolver is not re-pointed in place")
+	}
+}
+
+// Metric VALUES are numeric. A log line's field arrives as a JSON number (Int
+// or Double after logattrs' typing) or as a plain string when it came from
+// logfmt or a regex capture, and all three have to work — while a non-numeric
+// field must be REJECTED rather than silently observed as 0, which would drag
+// every histogram/summary it feeds toward zero.
+func TestValueFnParsesNumbersAndRejectsTheRest(t *testing.T) {
+	rec := pcommon.NewMap()
+	rec.PutInt("bytes", 4096)
+	rec.PutDouble("duration", 1.25)
+	rec.PutStr("count_str", "42")
+	rec.PutStr("float_str", "0.5")
+	rec.PutStr("negative", "-3")
+	rec.PutStr("msg", "handled request")
+	rec.PutStr("empty", "")
+	rec.PutBool("ok", true)
+	res := pcommon.NewMap()
+	res.PutStr("k8s.pod.name", "web-abc")
+
+	r := New()
+	r.Set(rec, res, "")
+	value := r.ValueFn()
+
+	for _, tc := range []struct {
+		key  string
+		want float64
+	}{
+		{"bytes", 4096}, {"duration", 1.25}, {"count_str", 42},
+		{"float_str", 0.5}, {"negative", -3},
+	} {
+		got, ok := value(tc.key)
+		if !ok || got != tc.want {
+			t.Errorf("ValueFn(%s) = %v (ok=%v), want %v", tc.key, got, ok, tc.want)
+		}
+	}
+	for _, key := range []string{"msg", "empty", "k8s.pod.name", "absent"} {
+		if got, ok := value(key); ok {
+			t.Errorf("ValueFn(%s) = %v (ok=true); a non-numeric field must not be observed as a number", key, got)
+		}
+	}
+	// A bool is not a number: pcommon renders it "true", which ParseFloat
+	// rejects.
+	if got, ok := value("ok"); ok {
+		t.Errorf("ValueFn(ok) = %v (ok=true), want rejected", got)
+	}
+}
+
+// LowerSeverity is the ONE normalisation for SeverityKey selectors. There were
+// five copies and only the tailer's handled WARNING, so `drop __severity__=warn`
+// matched a container log and not the journal entry beside it. The constant
+// fast paths exist to keep the hot path allocation-free, so they must agree
+// with the general fallback rather than diverging from it.
+func TestLowerSeverity(t *testing.T) {
+	for _, tc := range []struct{ in, want string }{
+		{"", ""},
+		// Fast paths, both spellings.
+		{"TRACE", "trace"}, {"trace", "trace"},
+		{"DEBUG", "debug"}, {"debug", "debug"},
+		{"INFO", "info"}, {"info", "info"},
+		{"WARN", "warn"}, {"warn", "warn"},
+		// WARNING is NOT WARN: the copy that lacked this case lowered it via a
+		// path that never ran, so the same line selected differently depending
+		// on which pipeline carried it.
+		{"WARNING", "warning"}, {"warning", "warning"},
+		{"ERROR", "error"}, {"error", "error"},
+		{"FATAL", "fatal"}, {"fatal", "fatal"},
+		// General fallback: mixed case, unknown words, non-letters untouched.
+		{"Warning", "warning"}, {"WaRn", "warn"}, {"Error", "error"},
+		{"CRITICAL", "critical"}, {"Notice", "notice"},
+		{"EMERG-1", "emerg-1"}, {"Level 5", "level 5"},
+		{"lowercase-unknown", "lowercase-unknown"},
+	} {
+		if got := LowerSeverity(tc.in); got != tc.want {
+			t.Errorf("LowerSeverity(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+
+	// WARN and WARNING must stay DISTINCT: collapsing them would silently
+	// widen every `__severity__=warn` drop rule to cover WARNING too.
+	if LowerSeverity("WARNING") == LowerSeverity("WARN") {
+		t.Error("WARNING and WARN normalised to the same value; a rule selecting one would select both")
+	}
+
+	// Every constant fast path must produce exactly what the general fallback
+	// would, or the two disagree for the inputs that take the fast path.
+	for _, in := range []string{"TRACE", "DEBUG", "INFO", "WARN", "WARNING", "ERROR", "FATAL"} {
+		want := asciiLowerReference(in)
+		if got := LowerSeverity(in); got != want {
+			t.Errorf("fast path for %q returned %q; the general lowering gives %q", in, got, want)
+		}
+	}
+}
+
+func asciiLowerReference(s string) string {
+	out := []byte(s)
+	for i := range out {
+		if 'A' <= out[i] && out[i] <= 'Z' {
+			out[i] += 'a' - 'A'
+		}
+	}
+	return string(out)
+}
+
+// The closures are bound at construction so evaluating a record allocates
+// nothing: the tailer's per-line budget (BenchmarkIngestLine, 0 allocs/op)
+// depends on it.
+func TestResolverIsAllocationFree(t *testing.T) {
+	rec, res := maps(map[string]string{"tenant": "a"}, map[string]string{"k8s.pod.name": "web-abc"})
+	r := New()
+	label, rule := r.LabelFn(), r.RuleFn()
+	if allocs := testing.AllocsPerRun(200, func() {
+		r.Set(rec, res, "info")
+		_ = label("tenant")
+		_ = rule(SeverityKey)
+		_ = rule("k8s.pod.name")
+	}); allocs != 0 {
+		t.Fatalf("resolving a record allocates %v times; the closures are bound once precisely to avoid that", allocs)
+	}
+}

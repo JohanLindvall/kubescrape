@@ -147,15 +147,21 @@ func (richMeta) Container(_ context.Context, _ string, _ time.Duration) (*kubeme
 	return nil, errors.New("not found")
 }
 
-// TestSplitChunkBytesRespectGRPCLimit: the BatchBytes guard (added to stop a
-// collector rejecting an oversized DECOMPRESSED message, which loses a target's
-// metrics entirely) estimates a chunk's size from its DATA POINTS only —
-// numberBytes/histBytes/summBytes in convert.go. For the split
-// (kube-state-metrics) and cadvisor batchers a chunk holds one ResourceMetrics
-// PER DESCRIBED OBJECT, each carrying a full resource attribute set plus a
-// per-resource copy of every metric's name/descriptor. None of that is counted,
-// so the encoded message runs ~1.7-2.5x the estimate and exceeds the 4 MiB gRPC
-// default the guard exists to stay under.
+// TestSplitChunkBytesRespectGRPCLimit: the BatchBytes guard exists to stop a
+// collector rejecting an oversized DECOMPRESSED message, which loses a
+// target's metrics entirely — so the ESTIMATE it flushes on has to cover
+// everything the chunk encodes, not just the data points.
+//
+// For the split (kube-state-metrics) and cadvisor batchers a chunk holds one
+// ResourceMetrics PER DESCRIBED OBJECT, each with a full resource attribute
+// set plus its own copy of every metric descriptor; a rule demoting resource
+// attributes onto the points repeats those on every point. Each of those was
+// once uncounted, and each on its own put the encoded message 1.7-2.5x over
+// its estimate and past the 4 MiB gRPC default.
+//
+// Each case below isolates ONE of those omissions, with the guard that would
+// otherwise mask it taken out of the way — a case where two estimate errors
+// cancel proves nothing, which is what the last two cases are about.
 func TestSplitChunkBytesRespectGRPCLimit(t *testing.T) {
 	const objects = 12000
 	body := func(fams ...string) string {
@@ -169,6 +175,20 @@ func TestSplitChunkBytesRespectGRPCLimit(t *testing.T) {
 		return sb.String()
 	}
 
+	// leanBody carries ONE label per series, so the estimate's habitual
+	// over-charging of stripped groupBy labels is nearly absent and cannot
+	// silently make up for an uncharged data-point attribute.
+	leanBody := func() string {
+		var sb strings.Builder
+		for _, f := range []string{"kube_pod_status_ready", "kube_pod_status_phase"} {
+			fmt.Fprintf(&sb, "# TYPE %s gauge\n", f)
+			for i := 0; i < objects; i++ {
+				fmt.Fprintf(&sb, "%s{pod=\"workload-deployment-%d-abcde\"} 1\n", f, i)
+			}
+		}
+		return sb.String()
+	}()
+
 	cases := []struct {
 		name        string
 		body        string
@@ -180,9 +200,12 @@ func TestSplitChunkBytesRespectGRPCLimit(t *testing.T) {
 		// chunks flush at the 3 MiB estimate and encode to > 5 MiB.
 		{"byte-bound-only", body("kube_pod_info", "kube_pod_status_phase", "kube_pod_owner"),
 			&fakeMetaSource{}, ksmSplitters(t), 1 << 20},
-		// Stock defaults, but the split resources enriched as in a real cluster:
-		// the 10k-point bound flushes chunks that still encode past 4 MiB, and the
-		// byte guard never fires because its estimate ignores the resources.
+		// Stock defaults, with the split resources enriched as in a real
+		// cluster (~12 attributes each). The BYTE bound is what fires here —
+		// at ~4k points, well short of the 10k cap — precisely BECAUSE
+		// resourceBytes is charged; while it was not, the point cap was the
+		// only thing stopping the chunk and 10k enriched per-object resources
+		// encoded past 4 MiB.
 		{"defaults-enriched", body("kube_pod_info"), richMeta{}, enrichSplitters(t), 0},
 		// Several attributes DEMOTED onto every data point. They are removed
 		// from the resource before it is charged and the per-point estimators
@@ -190,6 +213,20 @@ func TestSplitChunkBytesRespectGRPCLimit(t *testing.T) {
 		// encoded and counted nowhere — the one case where the estimate's
 		// habitual over-charging of stripped labels does not cancel it out.
 		{"datapoint-attributes", body("kube_pod_info"), richMeta{}, demotingSplitters(t), 0},
+		// The case that actually CROSSES the limit when the demoted attributes
+		// go uncharged, and the reason the one above does not: there, every
+		// demoted attribute came from a groupBy LABEL, and the estimate
+		// over-charges stripped labels by almost exactly what it was missing —
+		// the two cancelled, leaving the chunk under the limit either way.
+		//
+		// Here the demoted attributes are rule `attributes` (properties of the
+		// described object, the cmb-alloy placement) with no label behind them
+		// to over-charge, the series carry one label instead of five, and the
+		// point cap is out of the way — so the byte bound is the only thing
+		// deciding chunk size and it is deciding it on numbers that are ~60%
+		// wrong. The chunk grows past 4 MiB and every export of the target is
+		// rejected.
+		{"demoted-object-attributes", leanBody, &fakeMetaSource{}, objectAttrSplitters(t), 1 << 20},
 	}
 	var m pmetric.ProtoMarshaler
 	const grpcLimit = 4 << 20
@@ -268,6 +305,39 @@ func demotingSplitters(t *testing.T) []*Splitter {
 			},
 			DatapointAttributes: &[]string{"k8s.node.name", "k8s.pod.phase", "k8s.pod.uid", "k8s.namespace.name"},
 			Enrich:              true,
+		}},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return sp
+}
+
+// objectAttrSplitters demotes attributes that came from the rule's own
+// `attributes` fallbacks rather than from a groupBy label — the described
+// object's cluster/zone/node, which is exactly what datapointAttributes is
+// for. Nothing in the series over-charges for them, so if dpaBytes stops
+// counting them the estimate is simply missing them.
+func objectAttrSplitters(t *testing.T) []*Splitter {
+	t.Helper()
+	demoted := []string{
+		"k8s.node.name", "k8s.cluster.name", "cloud.availability_zone",
+		"cloud.region", "cloud.account.id", "k8s.node.instance_type",
+	}
+	sp, err := NewSplitters([]SplitterConfig{{
+		Match: SplitterMatch{PodLabels: map[string]string{"app.kubernetes.io/name": "kube-state-metrics"}},
+		Rules: []SplitRule{{
+			Metrics: `kube_pod_.+`,
+			GroupBy: map[string]string{"pod": "k8s.pod.name"},
+			Attributes: map[string]string{
+				"k8s.node.name":           "ip-10-0-13-244.eu-west-1.compute.internal",
+				"k8s.cluster.name":        "prod-eu-west-1-blue",
+				"cloud.availability_zone": "eu-west-1a",
+				"cloud.region":            "eu-west-1",
+				"cloud.account.id":        "123456789012",
+				"k8s.node.instance_type":  "m6i.4xlarge",
+			},
+			DatapointAttributes: &demoted,
 		}},
 	}})
 	if err != nil {

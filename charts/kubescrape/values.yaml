@@ -3,10 +3,9 @@ image:
   tag: ""            # defaults to .Chart.AppVersion
   pullPolicy: IfNotPresent
 
-# Include Go runtime and process metrics (process.runtime.go.*, process.cpu.time,
-# process.memory.rss, process.open_file_descriptors, ...) in the OTLP
-# self-metrics export. ~15 extra series per process.
-runtimeMetrics: true
+# (Go runtime and process metrics are always served on the -metrics-listen port
+# below — see `metrics.enabled`. The former `runtimeMetrics` value configured a
+# flag that no longer exists and made every agent refuse to start.)
 
 # Prometheus /metrics endpoint on a DEDICATED port, serving this process's Go
 # runtime and process metrics (go_*, process_*). Separate from the health/debug

@@ -50,6 +50,17 @@ type pattern struct {
 	prefilter func(string) bool
 }
 
+// keySuffix lets a keyword be a PREFIX of the key as well as a suffix, but only
+// across a compound-word boundary: an explicit separator (SECRET_KEY,
+// secret-key) or a camelCase hump followed by lowercase (secretKey,
+// secretValue). That distinction is the whole point — an unbounded suffix would
+// redact `tokenizer=bert-base` and `keyboard=us`, which
+// TestCompoundKeyNoOverRedaction exists to prevent. The hump requires a
+// following lowercase so an all-caps word like TOKENIZER is not mistaken for a
+// compound; the rarer all-caps SECRETKEY spelling is the accepted cost, since
+// SECRET_KEY is the form that actually occurs.
+const keySuffix = `(?:[_-][0-9A-Za-z_.-]*|[A-Z][a-z][0-9A-Za-z_.-]*)?`
+
 // asciiFold renders a literal keyword as a regex matching exactly its ASCII
 // case variants ("key" -> "[Kk][Ee][Yy]").
 //
@@ -185,12 +196,17 @@ var builtins = map[string]pattern{
 		// The value charset also excludes closing brackets: without them an
 		// unquoted JSON value swallowed the closing brace, corrupting the line
 		// for logattrs, enrich and log-metrics — which all run AFTER scrubbing.
+		//
+		// The keyword may equally be a PREFIX of the key — SECRET_KEY,
+		// secret_key, secretKey, secretValue, TOKEN_VALUE — which the
+		// suffix-only form above missed entirely, shipping the whole Django /
+		// AWS-SDK / camelCase-JSON family in clear (see keySuffix).
 		re: regexp.MustCompile(`((?:^|[^0-9A-Za-z_.-])[0-9A-Za-z_.-]*?(?:` +
 			asciiFold("api") + `[_-]?` + asciiFold("key") +
 			`|` + asciiFold("secret") + `|` + asciiFold("password") + `|` + asciiFold("passwd") +
 			`|` + asciiFold("pwd") + `|` + asciiFold("token") +
 			`|` + asciiFold("access") + `[_-]?` + asciiFold("key") +
-			`)["\']?\s*[:=]\s*["\']?)[^\s"\'&,;}\])]+`),
+			`)` + keySuffix + `["\']?\s*[:=]\s*["\']?)[^\s"\'&,;}\])]+`),
 		repl: "${1}" + redacted,
 		prefilter: func(s string) bool {
 			return pfKey(s) || pfSecret(s) || pfPassw(s) || pfPwd(s) || pfToken(s)

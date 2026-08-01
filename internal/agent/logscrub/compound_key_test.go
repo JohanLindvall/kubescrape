@@ -23,6 +23,15 @@ func TestCompoundKeySecretsRedacted(t *testing.T) {
 		"accessToken: abc123",
 		"clientSecret: abc123",
 		"id_token=abc123",
+		// The keyword as a PREFIX of the key. Django's settings dump, the AWS
+		// SDK's camelCase JSON and every `secret_key:` YAML shipped in clear
+		// while the pattern only allowed the keyword as a suffix.
+		"SECRET_KEY=django-insecure-8f2b",
+		"secret_key: hunter2",
+		`{"secretKey":"wJalrXUtnFEMIK7MDENG"}`,
+		"secretValue=abc123",
+		"TOKEN_VALUE=abc123",
+		"api_key_id=AKIAIOSFODNN7",
 		// Forms that already worked must keep working.
 		"api_key=sk-12345",
 		"password=hunter2",
@@ -44,6 +53,10 @@ func TestCompoundKeyNoOverRedaction(t *testing.T) {
 		"monkey=banana",
 		"a perfectly innocuous log line",
 		"keys=3 processed",
+		// A suffix is only a suffix across a compound-word boundary: no
+		// separator and no camelCase hump means this is one ordinary word.
+		"TOKENIZER=bert-base",
+		"passwords_checked=3",
 	} {
 		if got := s.Scrub(in); strings.Contains(got, redacted) {
 			t.Errorf("over-redacted an ordinary line: %q -> %q", in, got)

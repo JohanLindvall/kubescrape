@@ -12,6 +12,7 @@ package otlpingest
 import (
 	"context"
 	"log/slog"
+	"strings"
 	"time"
 
 	"go.opentelemetry.io/collector/pdata/pcommon"
@@ -150,16 +151,69 @@ func (e *Enricher) EnrichLogs(ctx context.Context, ld plog.Logs) {
 				if e.cfg.Scrub != nil {
 					// Scrub BEFORE ApplyBody: enrich copies body slices
 					// (exception attributes) that must not carry secrets.
-					if body := lr.Body(); body.Type() == pcommon.ValueTypeStr {
-						if scrubbed := e.cfg.Scrub.Scrub(body.Str()); scrubbed != body.Str() {
-							body.SetStr(scrubbed)
-						}
-					}
+					e.scrubBody(lr.Body(), 0)
 				}
 				if e.cfg.EnrichLines {
 					logenrich.ApplyBody(lr)
 				}
 			}
+		}
+	}
+}
+
+// maxBodyScrubDepth bounds the walk over a structured body. Bodies come from
+// unauthenticated senders, so the recursion needs a ceiling; real structured
+// logs nest a handful of levels at most.
+const maxBodyScrubDepth = 8
+
+// scrubBody redacts every string leaf of a log body, whatever shape it has.
+//
+// The OTel logging SDKs and the collector's json_parser/transform emit
+// STRUCTURED bodies — a map or a slice — for exactly the records most likely to
+// carry credentials as a field. Scrubbing only ValueTypeStr meant the same
+// message redacted on the tailer path (where it is a raw line) and shipped in
+// clear when an SDK sent it as a kvlist, with nothing counted and the choice
+// invisible to the operator.
+func (e *Enricher) scrubBody(v pcommon.Value, depth int) { e.scrubValue("", v, depth) }
+
+// scrubValue redacts v, using key for context when v is a map entry.
+//
+// The key matters: the patterns are written for LINES, where a secret appears
+// as `password=hunter2`. Split across a map entry the value alone is an opaque
+// string no pattern can judge, so a keyed entry is probed as "key=value" and
+// only the value replaced. Self-contained secrets (bearer tokens, AWS keys, PEM
+// blocks) still match the value on its own, which is tried first.
+func (e *Enricher) scrubValue(key string, v pcommon.Value, depth int) {
+	if depth > maxBodyScrubDepth {
+		return
+	}
+	switch v.Type() {
+	case pcommon.ValueTypeStr:
+		if scrubbed := e.cfg.Scrub.Scrub(v.Str()); scrubbed != v.Str() {
+			v.SetStr(scrubbed)
+			return
+		}
+		if key == "" {
+			return
+		}
+		probe := key + "=" + v.Str()
+		if scrubbed := e.cfg.Scrub.Scrub(probe); scrubbed != probe {
+			if _, tail, ok := strings.Cut(scrubbed, "="); ok {
+				v.SetStr(tail)
+			}
+		}
+	case pcommon.ValueTypeMap:
+		m := v.Map()
+		m.Range(func(k string, mv pcommon.Value) bool {
+			e.scrubValue(k, mv, depth+1)
+			return true
+		})
+	case pcommon.ValueTypeSlice:
+		sl := v.Slice()
+		for i := 0; i < sl.Len(); i++ {
+			// A slice element has no key of its own; it inherits the key of the
+			// entry holding the slice ("args": ["api_key=sk-1"]).
+			e.scrubValue(key, sl.At(i), depth+1)
 		}
 	}
 }

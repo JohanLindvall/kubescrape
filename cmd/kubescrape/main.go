@@ -393,55 +393,62 @@ func newLogger(level, format string) (*slog.Logger, error) {
 	return slog.New(handler), nil
 }
 
+// The metadata service's flag surface. Package-level like the agent's, so the
+// flag set exists at init: a test can then check that every flag the shipped
+// manifests pass is actually defined (see internal/manifestcheck), which is
+// impossible while the declarations live inside run().
+var (
+	listen        = flag.String("listen", ":8080", "HTTP listen address")
+	pprofListen   = flag.String("pprof-listen", "", "listen address for net/http/pprof under /debug/pprof, on its own port (empty disables); profiles expose goroutine stacks and heap contents")
+	metricsListen = flag.String("metrics-listen", ":9090", "listen address for the Prometheus /metrics endpoint (Go runtime and process metrics; with -self-metrics-interval=0 also the kubescrape_* internal metrics, replacing the OTLP push with a scrape; empty disables). Separate from -listen so the API and the scrape target can be exposed independently")
+	kubeconfig    = flag.String("kubeconfig", "", "path to a kubeconfig; defaults to in-cluster config, then $KUBECONFIG/~/.kube/config")
+	maxWait       = flag.Duration("wait-timeout", 5*time.Second, "default and maximum time a container lookup blocks waiting for metadata to appear (shorten per request with ?wait=)")
+	cacheTTL      = flag.Duration("cache-ttl", 5*time.Minute, "how long metadata of deleted pods and replaced container IDs stays resolvable")
+	metaCacheTTL  = flag.Duration("metadata-cache-ttl", 10*time.Second, "max-age sent on metadata responses (Cache-Control + ETag) so agents cache lookups client-side; 0 disables")
+	resync        = flag.Duration("resync", 0, "informer resync period (0 disables periodic resync; the watch stream keeps the cache current)")
+	logLevel      = flag.String("log-level", "info", "log level: debug, info, warn, error")
+	logFormat     = flag.String("log-format", "text", "log format: text or json")
+
+	// ServiceMonitor CRDs (opt-in).
+	monitorsOn = flag.Bool("servicemonitors", false, "serve targets for monitoring.coreos.com ServiceMonitors selecting pod-backed Services (no per-endpoint auth or relabelings)")
+
+	// Which namespaces' monitors are HONOURED. Empty keeps every monitor
+	// in the cluster, which is the historical behaviour and stays the
+	// default so an upgrade cannot silently stop scraping.
+	//
+	// It is worth setting. A ServiceMonitor is an instruction to every
+	// node agent to issue a GET, and kubescrape has no equivalent of
+	// prometheus-operator's admin-owned serviceMonitorSelector — so
+	// without this, anyone who can create a ServiceMonitor in a namespace
+	// they own can point `selector: {}` + `namespaceSelector.any: true` at
+	// an arbitrary path across the whole cluster, at whatever interval
+	// they choose. Restricting it to the namespaces that legitimately
+	// declare monitoring turns that back into an admin decision.
+	monitorNamespaces = flag.String("monitor-namespaces", "", "comma-separated namespaces whose ServiceMonitors/PodMonitors are honoured (empty = all; a monitor is an instruction to every agent to scrape, so restricting this to admin-owned namespaces is recommended on multi-tenant clusters)")
+
+	// Serve monitor endpoints' bearerTokenSecret values to agents (opt-in:
+	// needs secrets get RBAC; tokens travel the cluster-internal HTTP).
+	scrapeAuthOn        = flag.Bool("scrape-auth-secrets", false, "serve ServiceMonitor/PodMonitor bearerTokenSecret values to agents on /v1/scrape-auth (requires secrets get RBAC)")
+	scrapeAuthTokenFile = flag.String("scrape-auth-token-file", "", "file holding the shared bearer token that clients must present on /v1/scrape-auth (Authorization: Bearer <token>); REQUIRED with -scrape-auth-secrets")
+
+	// Self-metrics -> OTLP (the service's only OTLP producer).
+	selfMetricsIntv      = flag.Duration("self-metrics-interval", time.Minute, "export the service's own metrics over OTLP at this interval (0 disables)")
+	selfAttrs            = flag.Bool("self-attributes", true, "add THIS pod's Kubernetes resource attributes (namespace, pod, uid, owners, labels) to the service's own exported metrics. Resolved from the service's OWN store — its pod name is the hostname, its namespace comes from $POD_NAMESPACE or the ServiceAccount projection — so it needs no API traffic and no extra manifest wiring. Attributes already set (service.name, service.instance.id) are never overwritten; a process that is not a pod of that name simply gets none")
+	otlpEndpoint         = flag.String("otlp-endpoint", "otel-collector.monitoring:4317", "OTLP endpoint for self-metrics: host:port for grpc, base URL for http")
+	otlpProtocol         = flag.String("otlp-protocol", "grpc", "OTLP transport: grpc or http")
+	otlpCompression      = flag.String("otlp-compression", "gzip", "OTLP payload compression: gzip or none")
+	otlpCompressionLevel = flag.Int("otlp-compression-level", 0, "gzip level 1 (fastest, ~2-3x less CPU for ~10% larger payloads) to 9 (smallest); 0 = library default")
+	otlpInsecure         = flag.Bool("otlp-insecure", true, "use a plaintext gRPC connection")
+	otlpSkipTLS          = flag.Bool("otlp-tls-insecure-skip-verify", false, "skip TLS certificate verification towards the collector")
+	otlpCAFile           = flag.String("otlp-tls-ca-file", "", "PEM CA bundle for verifying the collector")
+	otlpBearer           = flag.String("otlp-bearer-token-file", "", "file with a bearer token sent on every export (re-read periodically)")
+	otlpTimeout          = flag.Duration("otlp-timeout", 15*time.Second, "per-export timeout")
+)
+
+// otlpHeaders is registered in run(): flag.Var needs the value to exist first.
+var otlpHeaders headerFlags
+
 func run() error {
-	var (
-		listen        = flag.String("listen", ":8080", "HTTP listen address")
-		pprofListen   = flag.String("pprof-listen", "", "listen address for net/http/pprof under /debug/pprof, on its own port (empty disables); profiles expose goroutine stacks and heap contents")
-		metricsListen = flag.String("metrics-listen", ":9090", "listen address for the Prometheus /metrics endpoint (Go runtime and process metrics; with -self-metrics-interval=0 also the kubescrape_* internal metrics, replacing the OTLP push with a scrape; empty disables). Separate from -listen so the API and the scrape target can be exposed independently")
-		kubeconfig    = flag.String("kubeconfig", "", "path to a kubeconfig; defaults to in-cluster config, then $KUBECONFIG/~/.kube/config")
-		maxWait       = flag.Duration("wait-timeout", 5*time.Second, "default and maximum time a container lookup blocks waiting for metadata to appear (shorten per request with ?wait=)")
-		cacheTTL      = flag.Duration("cache-ttl", 5*time.Minute, "how long metadata of deleted pods and replaced container IDs stays resolvable")
-		metaCacheTTL  = flag.Duration("metadata-cache-ttl", 10*time.Second, "max-age sent on metadata responses (Cache-Control + ETag) so agents cache lookups client-side; 0 disables")
-		resync        = flag.Duration("resync", 0, "informer resync period (0 disables periodic resync; the watch stream keeps the cache current)")
-		logLevel      = flag.String("log-level", "info", "log level: debug, info, warn, error")
-		logFormat     = flag.String("log-format", "text", "log format: text or json")
-
-		// ServiceMonitor CRDs (opt-in).
-		monitorsOn = flag.Bool("servicemonitors", false, "serve targets for monitoring.coreos.com ServiceMonitors selecting pod-backed Services (no per-endpoint auth or relabelings)")
-
-		// Which namespaces' monitors are HONOURED. Empty keeps every monitor
-		// in the cluster, which is the historical behaviour and stays the
-		// default so an upgrade cannot silently stop scraping.
-		//
-		// It is worth setting. A ServiceMonitor is an instruction to every
-		// node agent to issue a GET, and kubescrape has no equivalent of
-		// prometheus-operator's admin-owned serviceMonitorSelector — so
-		// without this, anyone who can create a ServiceMonitor in a namespace
-		// they own can point `selector: {}` + `namespaceSelector.any: true` at
-		// an arbitrary path across the whole cluster, at whatever interval
-		// they choose. Restricting it to the namespaces that legitimately
-		// declare monitoring turns that back into an admin decision.
-		monitorNamespaces = flag.String("monitor-namespaces", "", "comma-separated namespaces whose ServiceMonitors/PodMonitors are honoured (empty = all; a monitor is an instruction to every agent to scrape, so restricting this to admin-owned namespaces is recommended on multi-tenant clusters)")
-
-		// Serve monitor endpoints' bearerTokenSecret values to agents (opt-in:
-		// needs secrets get RBAC; tokens travel the cluster-internal HTTP).
-		scrapeAuthOn        = flag.Bool("scrape-auth-secrets", false, "serve ServiceMonitor/PodMonitor bearerTokenSecret values to agents on /v1/scrape-auth (requires secrets get RBAC)")
-		scrapeAuthTokenFile = flag.String("scrape-auth-token-file", "", "file holding the shared bearer token that clients must present on /v1/scrape-auth (Authorization: Bearer <token>); REQUIRED with -scrape-auth-secrets")
-
-		// Self-metrics -> OTLP (the service's only OTLP producer).
-		selfMetricsIntv      = flag.Duration("self-metrics-interval", time.Minute, "export the service's own metrics over OTLP at this interval (0 disables)")
-		selfAttrs            = flag.Bool("self-attributes", true, "add THIS pod's Kubernetes resource attributes (namespace, pod, uid, owners, labels) to the service's own exported metrics. Resolved from the service's OWN store — its pod name is the hostname, its namespace comes from $POD_NAMESPACE or the ServiceAccount projection — so it needs no API traffic and no extra manifest wiring. Attributes already set (service.name, service.instance.id) are never overwritten; a process that is not a pod of that name simply gets none")
-		otlpEndpoint         = flag.String("otlp-endpoint", "otel-collector.monitoring:4317", "OTLP endpoint for self-metrics: host:port for grpc, base URL for http")
-		otlpProtocol         = flag.String("otlp-protocol", "grpc", "OTLP transport: grpc or http")
-		otlpCompression      = flag.String("otlp-compression", "gzip", "OTLP payload compression: gzip or none")
-		otlpCompressionLevel = flag.Int("otlp-compression-level", 0, "gzip level 1 (fastest, ~2-3x less CPU for ~10% larger payloads) to 9 (smallest); 0 = library default")
-		otlpInsecure         = flag.Bool("otlp-insecure", true, "use a plaintext gRPC connection")
-		otlpSkipTLS          = flag.Bool("otlp-tls-insecure-skip-verify", false, "skip TLS certificate verification towards the collector")
-		otlpCAFile           = flag.String("otlp-tls-ca-file", "", "PEM CA bundle for verifying the collector")
-		otlpBearer           = flag.String("otlp-bearer-token-file", "", "file with a bearer token sent on every export (re-read periodically)")
-		otlpTimeout          = flag.Duration("otlp-timeout", 15*time.Second, "per-export timeout")
-	)
-	var otlpHeaders headerFlags
 	flag.Var(&otlpHeaders, "otlp-header", "static key=value header sent on every self-metrics export (HTTP header / gRPC metadata, e.g. X-Scope-OrgID=tenant); repeatable")
 	flag.Parse()
 

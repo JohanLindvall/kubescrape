@@ -209,7 +209,6 @@ spec:
             {{- end }}
             {{- end }}
             - -log-level={{ .Values.logLevel }}
-            - -runtime-metrics={{ .Values.runtimeMetrics }}
             - -metrics-listen={{ if .Values.metrics.enabled }}{{ .Values.metrics.listen }}{{ end }}
             {{- with .Values.pprofListen }}
             - -pprof-listen={{ . }}

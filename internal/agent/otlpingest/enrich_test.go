@@ -3,6 +3,7 @@ package otlpingest
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -10,6 +11,7 @@ import (
 	"go.opentelemetry.io/collector/pdata/plog"
 	"go.opentelemetry.io/collector/pdata/pmetric"
 
+	"github.com/JohanLindvall/kubescrape/internal/agent/logscrub"
 	"github.com/JohanLindvall/kubescrape/internal/obs"
 	"github.com/JohanLindvall/kubescrape/pkg/kubemeta"
 )
@@ -474,5 +476,51 @@ func TestSplitCountsUnresolved(t *testing.T) {
 	}
 	if got := obs.Ingested.WithLabelValues("unresolved").Value() - before; got != 1 {
 		t.Fatalf("kubescrape_ingest_resources_total{unresolved} delta = %v, want 1", got)
+	}
+}
+
+// A structured body — what the OTel logging SDKs and the collector's
+// json_parser emit — must be redacted like a raw line. Scrubbing only string
+// bodies meant the identical message was scrubbed on the tailer path and
+// shipped in clear when an SDK sent it as a kvlist.
+func TestScrubStructuredLogBody(t *testing.T) {
+	scrub, err := logscrub.New(logscrub.Config{Builtin: []string{"defaults"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	e := NewEnricher(Config{Scrub: scrub, Meta: &fakeMeta{}})
+
+	ld := plog.NewLogs()
+	lr := ld.ResourceLogs().AppendEmpty().ScopeLogs().AppendEmpty().LogRecords().AppendEmpty()
+	body := lr.Body().SetEmptyMap()
+	body.PutStr("msg", "auth failed")
+	body.PutStr("authorization", "Bearer eyJhbGciOiJIUzI1NiJ9.SECRETPAYLOAD")
+	nested := body.PutEmptyMap("ctx")
+	nested.PutStr("password", "hunter2")
+	list := body.PutEmptySlice("args")
+	list.AppendEmpty().SetStr("api_key=sk-12345")
+
+	e.EnrichLogs(context.Background(), ld)
+
+	got := lr.Body().Map()
+	for _, tc := range []struct{ path, want string }{
+		{"authorization", "[REDACTED]"},
+	} {
+		v, _ := got.Get(tc.path)
+		if !strings.Contains(v.Str(), tc.want) {
+			t.Errorf("body[%s] = %q; want it redacted", tc.path, v.Str())
+		}
+	}
+	ctx, _ := got.Get("ctx")
+	pw, _ := ctx.Map().Get("password")
+	if !strings.Contains(pw.Str(), "[REDACTED]") {
+		t.Errorf("nested password = %q; want it redacted", pw.Str())
+	}
+	args, _ := got.Get("args")
+	if !strings.Contains(args.Slice().At(0).Str(), "[REDACTED]") {
+		t.Errorf("slice element = %q; want it redacted", args.Slice().At(0).Str())
+	}
+	if msg, _ := got.Get("msg"); msg.Str() != "auth failed" {
+		t.Errorf("msg = %q; an ordinary field must survive", msg.Str())
 	}
 }

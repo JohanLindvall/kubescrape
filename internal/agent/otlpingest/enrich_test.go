@@ -497,8 +497,19 @@ func TestScrubStructuredLogBody(t *testing.T) {
 	body.PutStr("authorization", "Bearer eyJhbGciOiJIUzI1NiJ9.SECRETPAYLOAD")
 	nested := body.PutEmptyMap("ctx")
 	nested.PutStr("password", "hunter2")
+	// A slice element has no key of its own, so it INHERITS the key of the
+	// entry holding it — the only thing that can make a bare value judgable.
+	// The elements here match nothing standalone (they are opaque strings, not
+	// bearer tokens or AWS key ids): they redact solely because the enclosing
+	// key is probed with them, which is the behaviour under test. An element
+	// spelled `api_key=sk-1` would match the secret-kv pattern on its own and
+	// pass with the inheritance removed entirely.
+	keys := body.PutEmptySlice("api_key")
+	keys.AppendEmpty().SetStr("sk-live-abc123")
+	keys.AppendEmpty().SetStr("sk-live-def456")
+	// ...while an ordinary list under an ordinary key must survive intact.
 	list := body.PutEmptySlice("args")
-	list.AppendEmpty().SetStr("api_key=sk-12345")
+	list.AppendEmpty().SetStr("--verbose")
 
 	e.EnrichLogs(context.Background(), ld)
 
@@ -516,9 +527,15 @@ func TestScrubStructuredLogBody(t *testing.T) {
 	if !strings.Contains(pw.Str(), "[REDACTED]") {
 		t.Errorf("nested password = %q; want it redacted", pw.Str())
 	}
-	args, _ := got.Get("args")
-	if !strings.Contains(args.Slice().At(0).Str(), "[REDACTED]") {
-		t.Errorf("slice element = %q; want it redacted", args.Slice().At(0).Str())
+	keyList, _ := got.Get("api_key")
+	for i := 0; i < keyList.Slice().Len(); i++ {
+		if el := keyList.Slice().At(i).Str(); !strings.Contains(el, "[REDACTED]") {
+			t.Errorf("api_key[%d] = %q; a slice element must be probed under the key of the entry holding it, or every credential sent as a list ships in clear", i, el)
+		}
+	}
+	argList, _ := got.Get("args")
+	if el := argList.Slice().At(0).Str(); el != "--verbose" {
+		t.Errorf("args[0] = %q; an ordinary list element must survive intact", el)
 	}
 	if msg, _ := got.Get("msg"); msg.Str() != "auth failed" {
 		t.Errorf("msg = %q; an ordinary field must survive", msg.Str())
@@ -572,5 +589,35 @@ func TestAutoModeSplitsWhenDataPointsCarryIdentity(t *testing.T) {
 	}
 	if names["ksm-0"] && len(names) == 1 {
 		t.Error("every point was attributed to the exporter's own pod")
+	}
+}
+
+// A user rule whose replacement carries no '=' (the default [REDACTED] does
+// not) must still redact a structured body's value. The first version wrote
+// back only when it could split the scrubbed probe on '=', so these fell
+// through untouched — after Scrub had already counted the redaction.
+func TestScrubStructuredBodyWithPlainReplacement(t *testing.T) {
+	scrub, err := logscrub.New(logscrub.Config{
+		Rules: []logscrub.Rule{{Name: "ssn", Regexp: `[0-9]{3}-[0-9]{2}-[0-9]{4}`}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	e := NewEnricher(Config{Scrub: scrub, Meta: &fakeMeta{}})
+
+	ld := plog.NewLogs()
+	lr := ld.ResourceLogs().AppendEmpty().ScopeLogs().AppendEmpty().LogRecords().AppendEmpty()
+	body := lr.Body().SetEmptyMap()
+	body.PutStr("ssn", "123-45-6789")
+	body.PutStr("note", "no secret here")
+
+	e.EnrichLogs(context.Background(), ld)
+
+	got, _ := lr.Body().Map().Get("ssn")
+	if strings.Contains(got.Str(), "123-45-6789") {
+		t.Errorf("secret shipped in clear: %q", got.Str())
+	}
+	if note, _ := lr.Body().Map().Get("note"); note.Str() != "no secret here" {
+		t.Errorf("ordinary field rewritten: %q", note.Str())
 	}
 }

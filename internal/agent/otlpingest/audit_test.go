@@ -129,3 +129,33 @@ func TestSplitResourceUsesDescribedObjectIdentity(t *testing.T) {
 		t.Fatal("no resource for the described pod")
 	}
 }
+
+// An ordinary sender that labels its own data points with its own container id
+// must stay on the resource path in auto mode: the split path overwrites the
+// sender's resource attributes with the derived ones, so demoting it changed
+// service.name — the Prometheus job — for every app that adds such a label.
+func TestAutoModeKeepsSelfLabelledSenderOnResourcePath(t *testing.T) {
+	md := pmetric.NewMetrics()
+	rm := md.ResourceMetrics().AppendEmpty()
+	ra := rm.Resource().Attributes()
+	ra.PutStr("service.name", "checkout")
+	ra.PutStr("container.id", "cafe01")
+	g := rm.ScopeMetrics().AppendEmpty().Metrics().AppendEmpty()
+	g.SetName("http_requests")
+	dp := g.SetEmptyGauge().DataPoints().AppendEmpty()
+	dp.SetIntValue(1)
+	dp.Attributes().PutStr("container.id", "cafe01") // its OWN id, not a foreign object's
+
+	out := newEnricher(newMeta(), MetricsAuto).EnrichMetrics(context.Background(), md)
+
+	if n := out.ResourceMetrics().Len(); n != 1 {
+		t.Fatalf("ResourceMetrics = %d; want 1 — the sender was regrouped by the splitter", n)
+	}
+	a := out.ResourceMetrics().At(0).Resource().Attributes()
+	if v, _ := a.Get("service.name"); v.Str() != "checkout" {
+		t.Errorf("service.name = %q; want checkout — the sender is authoritative about itself", v.Str())
+	}
+	if v, _ := a.Get("k8s.pod.name"); v.Str() != "web-1" {
+		t.Errorf("k8s.pod.name = %q; want web-1 — the resource path still enriches", v.Str())
+	}
+}

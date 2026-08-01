@@ -22,10 +22,12 @@ import (
 	"go.opentelemetry.io/collector/pdata/pmetric/pmetricotlp"
 	"go.opentelemetry.io/collector/pdata/ptrace"
 	"go.opentelemetry.io/collector/pdata/ptrace/ptraceotlp"
+	"google.golang.org/genproto/googleapis/rpc/errdetails"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/durationpb"
 
 	"github.com/JohanLindvall/kubescrape/internal/agent/otlpexport"
 )
@@ -63,7 +65,9 @@ type ServerConfig struct {
 // transports. The listeners are unauthenticated and node-local, and every
 // in-flight request holds its body plus the inflated pdata, so an unbounded
 // count is an OOM the agent cannot defend against — on the process that also
-// tails the node's logs.
+// tails the node's logs. Tune with -ingest-max-in-flight: the right value
+// depends on how long the collector takes to ack (a slow one holds every slot
+// for -otlp-timeout) and on how many pods push to this node.
 const defaultMaxInFlight = 32
 
 // Server receives pushed OTLP over gRPC and/or HTTP, enriches it, and
@@ -111,7 +115,17 @@ func (s *Server) release() { <-s.inFlight }
 // limitUnary applies the same bound to gRPC pushes.
 func (s *Server) limitUnary(ctx context.Context, req any, _ *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
 	if !s.acquire() {
-		return nil, status.Error(codes.ResourceExhausted, "too many concurrent pushes; retry")
+		// ResourceExhausted alone reads as PERMANENT to conformant senders —
+		// the OTLP spec makes it retryable only with RetryInfo attached, and
+		// both the OTel SDK and the Collector drop the batch without it. A
+		// shed that loses the data is worse than the OOM it prevents, so the
+		// hint rides along, mirroring the HTTP arm's Retry-After: 1.
+		st, err := status.New(codes.ResourceExhausted, "too many concurrent pushes; retry").
+			WithDetails(&errdetails.RetryInfo{RetryDelay: durationpb.New(time.Second)})
+		if err != nil {
+			return nil, status.Error(codes.ResourceExhausted, "too many concurrent pushes; retry")
+		}
+		return nil, st.Err()
 	}
 	defer s.release()
 	return handler(ctx, req)
@@ -130,16 +144,28 @@ func (s *Server) Run(ctx context.Context) error {
 			return fmt.Errorf("ingest gRPC listen %s: %w", s.cfg.GRPCAddr, err)
 		}
 		// Mirror the HTTP server's IdleTimeout: reap connections apps opened
-		// and abandoned (default gRPC keeps them forever). Message size stays
-		// at the 4 MiB gRPC default — the bound on pushed payloads.
+		// and abandoned (default gRPC keeps them forever).
 		grpcSrv = grpc.NewServer(
 			grpc.KeepaliveParams(keepalive.ServerParameters{
 				MaxConnectionIdle: 120 * time.Second,
 			}),
-			// Bound concurrent RPCs per connection, and the whole server below
-			// via the shared semaphore: each in-flight push holds its body PLUS
-			// the inflated pdata, so N simultaneous 16 MiB pushes is N x
-			// several times that in heap on a node that also has to tail logs.
+			// What each of these actually bounds, since they are easy to
+			// over-credit:
+			//
+			//   - MaxRecvMsgSize caps ONE decoded message (the gRPC default,
+			//     stated explicitly because it is the only hard cap on how
+			//     much a single push can allocate).
+			//   - MaxConcurrentStreams caps concurrent RPCs PER CONNECTION.
+			//     Connections themselves are not capped, so this is not a
+			//     server-wide bound.
+			//   - The semaphore (limitUnary) caps concurrent PROCESSING —
+			//     enrichment, the inflated pdata and the forward — across both
+			//     transports. It runs in the unary interceptor, i.e. AFTER
+			//     grpc-go has decoded the message, so it does not bound the
+			//     decode itself; a shed request has already paid for its
+			//     buffer once. Bounding earlier means a tap handler, which
+			//     cannot carry the RetryInfo that keeps a shed retryable.
+			grpc.MaxRecvMsgSize(4<<20),
 			grpc.MaxConcurrentStreams(uint32(s.maxInFlight)),
 			grpc.UnaryInterceptor(s.limitUnary),
 		)
@@ -281,6 +307,17 @@ func (g *tracesGRPC) Export(ctx context.Context, req ptraceotlp.ExportRequest) (
 // --- HTTP (OTLP/HTTP protobuf) ---
 
 func (s *Server) handleHTTPLogs(w http.ResponseWriter, r *http.Request) {
+	body, err := readBody(r)
+	if err != nil {
+		http.Error(w, err.Error(), bodyErrorStatus(err))
+		return
+	}
+	// Acquired AFTER the read: holding a slot across the upload let 32
+	// trickled 16 MiB bodies shed every other sender on the node for a
+	// ReadTimeout (60s) — no credentials required, on an unauthenticated
+	// listener, which is the threat the bound exists for. The read itself is
+	// already bounded by the 16 MiB body cap. The gRPC arm is naturally on
+	// this side of the decode.
 	if !s.acquire() {
 		// Retryable by design: the sender still holds the payload.
 		w.Header().Set("Retry-After", "1")
@@ -288,11 +325,6 @@ func (s *Server) handleHTTPLogs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer s.release()
-	body, err := readBody(r)
-	if err != nil {
-		http.Error(w, err.Error(), bodyErrorStatus(err))
-		return
-	}
 	req := plogotlp.NewExportRequest()
 	if err := req.UnmarshalProto(body); err != nil {
 		http.Error(w, "malformed OTLP logs payload", http.StatusBadRequest)
@@ -309,6 +341,12 @@ func (s *Server) handleHTTPLogs(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleHTTPMetrics(w http.ResponseWriter, r *http.Request) {
+	body, err := readBody(r)
+	if err != nil {
+		http.Error(w, err.Error(), bodyErrorStatus(err))
+		return
+	}
+	// Acquired AFTER the read (see handleHTTPLogs).
 	if !s.acquire() {
 		// Retryable by design: the sender still holds the payload.
 		w.Header().Set("Retry-After", "1")
@@ -316,11 +354,6 @@ func (s *Server) handleHTTPMetrics(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer s.release()
-	body, err := readBody(r)
-	if err != nil {
-		http.Error(w, err.Error(), bodyErrorStatus(err))
-		return
-	}
 	req := pmetricotlp.NewExportRequest()
 	if err := req.UnmarshalProto(body); err != nil {
 		http.Error(w, "malformed OTLP metrics payload", http.StatusBadRequest)
@@ -336,6 +369,12 @@ func (s *Server) handleHTTPMetrics(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleHTTPTraces(w http.ResponseWriter, r *http.Request) {
+	body, err := readBody(r)
+	if err != nil {
+		http.Error(w, err.Error(), bodyErrorStatus(err))
+		return
+	}
+	// Acquired AFTER the read (see handleHTTPLogs).
 	if !s.acquire() {
 		// Retryable by design: the sender still holds the payload.
 		w.Header().Set("Retry-After", "1")
@@ -343,11 +382,6 @@ func (s *Server) handleHTTPTraces(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer s.release()
-	body, err := readBody(r)
-	if err != nil {
-		http.Error(w, err.Error(), bodyErrorStatus(err))
-		return
-	}
 	req := ptraceotlp.NewExportRequest()
 	if err := req.UnmarshalProto(body); err != nil {
 		http.Error(w, "malformed OTLP traces payload", http.StatusBadRequest)

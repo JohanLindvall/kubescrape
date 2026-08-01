@@ -197,11 +197,23 @@ func (e *Enricher) scrubValue(key string, v pcommon.Value, depth int) {
 			return
 		}
 		probe := key + "=" + v.Str()
-		if scrubbed := e.cfg.Scrub.Scrub(probe); scrubbed != probe {
-			if _, tail, ok := strings.Cut(scrubbed, "="); ok {
-				v.SetStr(tail)
-			}
+		scrubbed := e.cfg.Scrub.Scrub(probe)
+		if scrubbed == probe {
+			return
 		}
+		// Take the tail after the key we prefixed — NOT after the first '='
+		// anywhere, which for a key like "auth=token" yielded a value of
+		// "token=[REDACTED]". And when the pattern consumed the key too (a
+		// user rule whose replacement carries no '=', which the default
+		// [REDACTED] does not), fall back to redacting the whole value: the
+		// old code left it UNTOUCHED while Scrub had already counted a
+		// redaction, so the metric reported a redaction that never happened
+		// and the secret shipped in clear.
+		if tail, ok := strings.CutPrefix(scrubbed, key+"="); ok {
+			v.SetStr(tail)
+			return
+		}
+		v.SetStr(scrubbed)
 	case pcommon.ValueTypeMap:
 		m := v.Map()
 		m.Range(func(k string, mv pcommon.Value) bool {
@@ -275,24 +287,33 @@ func (e *Enricher) resourceModeSuffices(md pmetric.Metrics) bool {
 	rms := md.ResourceMetrics()
 	for i := 0; i < rms.Len(); i++ {
 		rm := rms.At(i)
-		if _, ok := e.findID(rm.Resource().Attributes()); !ok {
+		resID, ok := e.findID(rm.Resource().Attributes())
+		if !ok {
 			return false
 		}
-		if e.anyDataPointHasID(rm) {
+		// FOREIGN, not merely present. A point ID equal to the resource's own
+		// describes the sender itself — an app labelling its metrics with its
+		// container id, which SDK metric views do — and the resource branch
+		// attributes it identically while leaving the sender authoritative
+		// about itself. Demoting it to the split path instead regrouped its
+		// points and OVERWROTE its service.name/k8s.* with the derived ones
+		// (overwriteAttrs, correct only for a describing exporter), so an
+		// ordinary sender silently changed job identity by adding a label.
+		if e.anyForeignDataPointID(rm, resID) {
 			return false
 		}
 	}
 	return true
 }
 
-// anyDataPointHasID reports whether any data point in rm carries an ID
-// attribute of its own (one pass, stopping at the first hit).
-func (e *Enricher) anyDataPointHasID(rm pmetric.ResourceMetrics) bool {
+// anyForeignDataPointID reports whether any data point in rm carries an ID
+// attribute naming a DIFFERENT object than resID (one pass, first hit wins).
+func (e *Enricher) anyForeignDataPointID(rm pmetric.ResourceMetrics, resID string) bool {
 	sms := rm.ScopeMetrics()
 	for i := 0; i < sms.Len(); i++ {
 		ms := sms.At(i).Metrics()
 		for j := 0; j < ms.Len(); j++ {
-			if e.metricPointsHaveID(ms.At(j)) {
+			if e.metricPointsHaveForeignID(ms.At(j), resID) {
 				return true
 			}
 		}
@@ -300,8 +321,11 @@ func (e *Enricher) anyDataPointHasID(rm pmetric.ResourceMetrics) bool {
 	return false
 }
 
-func (e *Enricher) metricPointsHaveID(m pmetric.Metric) bool {
-	has := func(a pcommon.Map) bool { _, ok := e.findID(a); return ok }
+func (e *Enricher) metricPointsHaveForeignID(m pmetric.Metric, resID string) bool {
+	has := func(a pcommon.Map) bool {
+		tok, ok := e.findID(a)
+		return ok && tok != resID
+	}
 	switch m.Type() {
 	case pmetric.MetricTypeGauge:
 		dps := m.Gauge().DataPoints()

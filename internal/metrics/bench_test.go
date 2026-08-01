@@ -92,6 +92,64 @@ func BenchmarkDynamicAddJSONLine(b *testing.B) {
 	}
 }
 
+// BenchmarkDynamicAddLogfmtLine measures Add when keys resolve from a logfmt
+// line (the other line-fields format; the JSON sibling above shares the
+// KeyIndex/Fields machinery but not its per-key storage path).
+func BenchmarkDynamicAddLogfmtLine(b *testing.B) {
+	setTimeForTest(time.Unix(1_700_400_100, 0))
+	defer testEpoch.Store(0)
+	set := benchRules(b)
+	res := benchResource()
+	line := `level=info http_status=200 method=GET latency_ms=42.5 msg="handled request" path=/api/v1/orders`
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		set.Add(nil, nil, res, line)
+	}
+}
+
+// benchHistogramRules is a histogram log-metric with the default 14 bounds, so
+// one matched line touches 15 bucket streams.
+func benchHistogramRules(b *testing.B) *DynamicMetricSet {
+	b.Helper()
+	set, err := NewDynamicMetricSet([]Dynamic{{
+		Name:   "request_duration_seconds",
+		Type:   HistogramType,
+		Value:  "latency_s",
+		Match:  []string{"level=info"},
+		Labels: []string{"method=$method", "status=$http_status"},
+	}})
+	if err != nil {
+		b.Fatal(err)
+	}
+	return set
+}
+
+// BenchmarkDynamicAddHistogram measures a matched line against a histogram
+// metric: observe walks every bucket stream, which is the hottest multiplier in
+// the store (one line = len(buckets)+1 map probes at best).
+func BenchmarkDynamicAddHistogram(b *testing.B) {
+	setTimeForTest(time.Unix(1_700_400_400, 0))
+	defer testEpoch.Store(0)
+	set := benchHistogramRules(b)
+	res := benchResource()
+	attrs := map[string]string{"level": "info", "http_status": "200", "method": "GET"}
+	lookup := func(k string) string { return attrs[k] }
+	values := func(k string) (float64, bool) {
+		if k == "latency_s" {
+			return 0.42, true
+		}
+		return 0, false
+	}
+	line := `GET /api/v1/orders 200 0.42s`
+	bound := set.Bind(res)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		bound.Add(values, lookup, line)
+	}
+}
+
 // BenchmarkDynamicAddNoMatch measures the fast path: a line matching no rule.
 func BenchmarkDynamicAddNoMatch(b *testing.B) {
 	setTimeForTest(time.Unix(1_700_400_200, 0))

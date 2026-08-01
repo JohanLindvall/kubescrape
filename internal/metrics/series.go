@@ -181,6 +181,19 @@ type series struct {
 	// lastWarn rate-limits the cardinality-cap notice; lastCollision the
 	// hash-collision warn — separate so neither suppresses the other.
 	lastCollision int64
+
+	// probe is observe's per-observation histogram scratch, reused under s.mu:
+	// the admission pre-pass and the record loop walk the same bucket streams,
+	// so the pre-pass memoises each stream's hash and looked-up sample here and
+	// the record loop reads them back. Without it every matched line hashed and
+	// probed the map twice per bucket. Non-nil only for histograms.
+	probe []bucketProbe
+}
+
+// bucketProbe is one bucket stream's memoised lookup (see series.probe).
+type bucketProbe struct {
+	hash uint64
+	samp *expiringSample
 }
 
 // seriesSpec configures a new series.
@@ -281,10 +294,22 @@ func (s *series) observe(lbls labels, value float64, resAccum resKey, res pcommo
 	// (a partial set of streams exports underflowed cumulative counts), and a
 	// check-hash mismatch anywhere drops the WHOLE observation for the same
 	// reason — a mid-loop skip would leave sibling buckets recording.
+	//
+	// The record loop below needs the very same per-bucket hash and map entry,
+	// so the pre-pass memoises both into s.probe: the cap check still sees
+	// every stream before anything is admitted (the semantics the two passes
+	// exist for), but a matched line now pays ONE hash and ONE map probe per
+	// bucket instead of two.
+	if cap(s.probe) < len(s.buckets) {
+		s.probe = make([]bucketProbe, len(s.buckets))
+	}
+	probe := s.probe[:len(s.buckets)]
 	{
 		missing := 0
 		for i := range s.buckets {
-			samp := s.db[s.streamHash(base, i)]
+			h := s.streamHash(base, i)
+			samp := s.db[h]
+			probe[i] = bucketProbe{hash: h, samp: samp}
 			if samp == nil {
 				missing++
 				continue
@@ -306,12 +331,14 @@ func (s *series) observe(lbls labels, value float64, resAccum resKey, res pcommo
 		}
 	}
 	for i, bound := range s.buckets {
-		hash := s.streamHash(base, i)
-		samp := s.db[hash]
+		samp := probe[i].samp
 		if samp == nil {
-			samp = s.admit(hash, s.streamCheck(check, i), lbls, i, now, res, resLabels)
+			// The pre-pass proved there is room for every missing stream, so
+			// admit cannot refuse here; it re-checks anyway (it is shared with
+			// the single-stream path) and a nil is still handled.
+			samp = s.admit(probe[i].hash, s.streamCheck(check, i), lbls, i, now, res, resLabels)
 			if samp == nil {
-				continue // capped (single-bucket kinds only; histograms pre-checked)
+				continue
 			}
 		}
 		if value <= bound {

@@ -92,3 +92,81 @@ func TestIntegerFieldsKeepFullPrecision(t *testing.T) {
 		}
 	}
 }
+
+// Extracted values live in a slot slice parallel to the KeyIndex's keys, not a
+// map keyed by the line's own bytes (which cost an allocation per key per
+// line). The slots are per-Fields state reused across lines, so a key present
+// on one line must not survive into the next, and a key no rule registered must
+// not resolve at all.
+func TestFieldsSlotsResetBetweenLines(t *testing.T) {
+	ki := NewKeyIndex()
+	ki.Add("a")
+	ki.Add("b")
+	var f Fields
+
+	f.Reset(`a=1 b=2`)
+	if got := ki.Get(&f, "a"); got != "1" {
+		t.Fatalf("a = %q, want 1", got)
+	}
+	if got := ki.Get(&f, "b"); got != "2" {
+		t.Fatalf("b = %q, want 2", got)
+	}
+
+	// b is absent from the second line: its slot must be cleared, not stale.
+	f.Reset(`a=9`)
+	if got := ki.Get(&f, "a"); got != "9" {
+		t.Errorf("a = %q, want 9", got)
+	}
+	if got := ki.Get(&f, "b"); got != "" {
+		t.Errorf("b = %q; the previous line's value leaked through the slot", got)
+	}
+
+	// Same across a format switch, where a different arm of Parse fills them.
+	f.Reset(`{"a":"json"}`)
+	if got := ki.Get(&f, "a"); got != "json" {
+		t.Errorf("a = %q, want json", got)
+	}
+	if got := ki.Get(&f, "b"); got != "" {
+		t.Errorf("b = %q, want empty", got)
+	}
+
+	// A key nothing registered resolves empty rather than indexing a slot.
+	if got := ki.Get(&f, "never-registered"); got != "" {
+		t.Errorf("unregistered key = %q, want empty", got)
+	}
+}
+
+// An empty logfmt value must read as empty and must not trip the zero-length
+// aliasing of the line.
+func TestEmptyLogfmtValue(t *testing.T) {
+	ki := NewKeyIndex()
+	ki.Add("a")
+	ki.Add("b")
+	var f Fields
+	f.Reset(`a= b=x`)
+	if got := ki.Get(&f, "a"); got != "" {
+		t.Errorf("a = %q, want empty", got)
+	}
+	if got := ki.Get(&f, "b"); got != "x" {
+		t.Errorf("b = %q, want x", got)
+	}
+}
+
+// Values now alias the line rather than copying it. A value read out before the
+// Fields is reused must keep reading the line it came from — Go strings are
+// immutable and the header pins the old backing array, so the reuse cannot
+// rewrite it under the caller.
+func TestLogfmtValueSurvivesReset(t *testing.T) {
+	ki := NewKeyIndex()
+	ki.Add("msg")
+	var f Fields
+	f.Reset(`msg=hello`)
+	got := ki.Get(&f, "msg")
+	f.Reset(`msg=goodbye`)
+	if got != "hello" {
+		t.Errorf("retained value = %q, want hello", got)
+	}
+	if now := ki.Get(&f, "msg"); now != "goodbye" {
+		t.Errorf("msg = %q, want goodbye", now)
+	}
+}

@@ -75,6 +75,16 @@ func (c Config) slowerThan() (time.Duration, error) {
 // Validate reports a malformed config, so a bad value fails startup with a
 // clear message instead of silently disabling the guard rail.
 func (c Config) Validate() error {
+	// `probability: 50` is the percent-vs-fraction typo, and it does not fail
+	// loudly: Enabled() reads it as out of the (0,1) sampling range, so the
+	// whole sampler switches OFF — no "trace sampling enabled" line, a clean
+	// -check-config, and 100% of spans shipped by a config asking for 50%.
+	if c.Probability < 0 || c.Probability > 1 {
+		return fmt.Errorf("probability %v is not a fraction in [0,1] (50%% is 0.5, not 50)", c.Probability)
+	}
+	if c.MaxSpansPerSecond < 0 {
+		return fmt.Errorf("maxSpansPerSecond %v is negative", c.MaxSpansPerSecond)
+	}
 	_, err := c.slowerThan()
 	return err
 }

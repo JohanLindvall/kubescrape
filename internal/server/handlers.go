@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/JohanLindvall/kubescrape/internal/scrape"
+	"github.com/JohanLindvall/kubescrape/internal/servicemonitors"
 	"github.com/JohanLindvall/kubescrape/internal/store"
 	"github.com/JohanLindvall/kubescrape/pkg/kubemeta"
 )
@@ -200,8 +201,16 @@ func (s *Server) handleNodeTargets(w http.ResponseWriter, r *http.Request) {
 	pods := s.store.PodsOnNode(node)
 	targets := make([]kubemeta.ScrapeTarget, 0)
 	var monitored map[string][]monitorEndpoint
+	// Hoisted out of the per-pod loop: PodMonitors() copies and SORTS the whole
+	// monitor list on every call, so a node with 110 pods and 200 monitors did
+	// 110 sorts and 22k selector evaluations per request, per agent, per scrape
+	// cycle. The sibling ServiceMonitor match is memoised for the same reason.
+	var allPodMonitors []*servicemonitors.PodMonitor
 	if len(pods) > 0 { // an empty node cannot match any monitored service
 		monitored = s.monitoredServices()
+		if s.monitors != nil {
+			allPodMonitors = s.monitors.PodMonitors()
+		}
 	}
 	for _, np := range pods {
 		if !scrape.Scrapeable(np.Pod) {
@@ -226,7 +235,7 @@ func (s *Server) handleNodeTargets(w http.ResponseWriter, r *http.Request) {
 				break
 			}
 		}
-		podMonitors := s.podMonitorsFor(np.Pod)
+		podMonitors := s.podMonitorsFor(np.Pod, allPodMonitors)
 		if !podAnnotated && !svcAnnotated && len(podMonitors) == 0 {
 			continue
 		}

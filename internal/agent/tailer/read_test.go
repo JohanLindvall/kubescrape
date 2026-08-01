@@ -402,3 +402,27 @@ func TestCheckpointBeyondSizeWithMatchingHeadRestarts(t *testing.T) {
 		t.Fatalf("readPos = %d beyond file size 16: Seek past EOF", f.readPos)
 	}
 }
+
+// A file whose metadata never resolves must not monopolise the sweep. Each
+// lookup can block server-side for the whole -metadata-wait, and they all run
+// on the single goroutine that serves every file on the node, so the retry
+// interval has to grow past the cost of the sweep it is spacing out.
+func TestMetadataBackoffGrows(t *testing.T) {
+	var d time.Duration
+	seen := []time.Duration{}
+	for i := 0; i < 8; i++ {
+		d = nextMetaBackoff(d)
+		seen = append(seen, d)
+	}
+	if seen[0] != minMetaBackoff {
+		t.Errorf("first retry = %v, want %v", seen[0], minMetaBackoff)
+	}
+	for i := 1; i < len(seen); i++ {
+		if seen[i] < seen[i-1] {
+			t.Fatalf("backoff shrank: %v", seen)
+		}
+	}
+	if got := seen[len(seen)-1]; got != maxMetaBackoff {
+		t.Errorf("backoff capped at %v, want %v", got, maxMetaBackoff)
+	}
+}

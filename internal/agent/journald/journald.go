@@ -495,6 +495,9 @@ func (r *Reader) convert() plog.Logs {
 			r.cfg.Attrs.Build(res, actx)
 			logattrs.Put(res.Attributes(), extracted.Resource)
 			sl := rl.ScopeLogs().AppendEmpty()
+			// Every other log producer names its scope (tailer, events); the
+			// journal's records shipped with an empty otel_scope_name.
+			sl.Scope().SetName("github.com/JohanLindvall/kubescrape/agent/journald")
 			logattrs.Put(sl.Scope().Attributes(), extracted.Scope)
 			ent = scopeEntry{sl: sl, res: res.Attributes()}
 			scopes[key] = ent

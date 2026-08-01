@@ -257,12 +257,12 @@ func (s *Server) buildMonitoredServices() map[string][]monitorEndpoint {
 
 // podMonitorsFor returns the PodMonitors selecting a pod (namespace +
 // label selector).
-func (s *Server) podMonitorsFor(pod kubemeta.Pod) []*servicemonitors.PodMonitor {
+func (s *Server) podMonitorsFor(pod kubemeta.Pod, all []*servicemonitors.PodMonitor) []*servicemonitors.PodMonitor {
 	if s.monitors == nil {
 		return nil
 	}
 	var out []*servicemonitors.PodMonitor
-	for _, m := range s.monitors.PodMonitors() {
+	for _, m := range all {
 		if nss := m.PodNamespaces(); nss != nil && !slices.Contains(nss, pod.Namespace) {
 			continue
 		}

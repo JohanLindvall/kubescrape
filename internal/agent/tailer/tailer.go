@@ -178,6 +178,7 @@ type Tailer struct {
 	lastFlush      time.Time
 	lastCheckpoint time.Time
 	retryBackoff   time.Duration // initial export retry backoff
+	resolveBudget  time.Duration // ceiling on one sweep's metadata resolutions
 	shutdownBudget time.Duration // ceiling on the final sweep+drain+flush
 
 	// status is the published per-file snapshot for /debug/tailer (written by
@@ -204,6 +205,10 @@ func (t *Tailer) scratch() []byte {
 	}
 	return t.readBuf
 }
+
+// defaultResolveBudget caps how long one sweep may spend resolving metadata
+// before it gets on with reading the files it already knows about.
+const defaultResolveBudget = 5 * time.Second
 
 // defaultShutdownBudget bounds the tailer's final sweep, drain and flush. It
 // has to leave room inside the pod's termination grace period for everything
@@ -261,6 +266,7 @@ func New(cfg Config) *Tailer {
 		scanDirs:       scanDirs,
 		files:          make(map[string]*file),
 		retryBackoff:   time.Second,
+		resolveBudget:  defaultResolveBudget,
 		shutdownBudget: defaultShutdownBudget,
 		statusEvery:    10 * time.Second,
 	}
@@ -419,6 +425,9 @@ func (t *Tailer) closeIdleFiles() {
 // sweep reads newly appended data; all sweeps every file (polling
 // fallback), otherwise only files marked dirty by events are read.
 func (t *Tailer) sweep(ctx context.Context, all bool) {
+	// Set lazily on the first unresolved file, so a sweep with nothing to
+	// resolve pays nothing.
+	var resolveDeadline time.Time
 	cutoff := time.Now().Add(-t.cfg.MultilineTimeout)
 	for path, f := range t.files {
 		if f.gone {
@@ -455,8 +464,22 @@ func (t *Tailer) sweep(ctx context.Context, all bool) {
 		if !all && !f.dirty {
 			continue
 		}
-		if !f.resolved && !t.resolveMetadata(ctx, f) {
-			continue
+		if !f.resolved {
+			// One shared budget for the whole sweep's resolutions. Each one can
+			// block server-side for -metadata-wait, and they all run on this
+			// single goroutine ahead of any reading, so without a ceiling a
+			// handful of unresolvable files decides how often every OTHER file
+			// on the node is read. Files not reached this sweep are retried on
+			// the next one — nothing is lost, the data waits on disk.
+			if resolveDeadline.IsZero() {
+				resolveDeadline = time.Now().Add(t.resolveBudget)
+			}
+			if time.Now().After(resolveDeadline) {
+				continue
+			}
+			if !t.resolveMetadata(ctx, f) {
+				continue
+			}
 		}
 		if f.excluded {
 			// The pod opted out via its annotation; nothing is read, the

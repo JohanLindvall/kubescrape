@@ -200,7 +200,11 @@ agent:
       name: ""
       key: token
 
-  logsExcludeNamespaces: [monitoring]
+  # Empty means "this release's namespace" (see the template): tailing the
+  # namespace the agent and the collector run in is a feedback loop that
+  # amplifies exactly when the collector is already struggling. A literal
+  # default was wrong for every install that does not use `monitoring`.
+  logsExcludeNamespaces: []
   # A single file persisting BOTH log offsets and the journald cursor across
   # restarts (empty disables persistence).
   positionsFile: /var/lib/kubescrape-agent/positions.json

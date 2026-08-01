@@ -117,6 +117,27 @@ func (ki KeyIndex) Parse(lf *Fields) {
 	})
 }
 
+// isIntegerToken reports whether a JSON number token is a plain integer (no
+// fraction, no exponent), so its text can be used verbatim.
+func isIntegerToken(raw []byte) bool {
+	if len(raw) == 0 {
+		return false
+	}
+	i := 0
+	if raw[0] == '-' {
+		i = 1
+	}
+	if i == len(raw) {
+		return false
+	}
+	for ; i < len(raw); i++ {
+		if raw[i] < '0' || raw[i] > '9' {
+			return false // '.', 'e', 'E' — not integral
+		}
+	}
+	return true
+}
+
 // RawScalarString renders a raw JSON scalar token as a string; objects, arrays
 // and null are rejected. It matches what DecodeAny + a type switch produced
 // (numbers round-trip through float64) without boxing the value in an any.
@@ -141,6 +162,15 @@ func RawScalarString(raw []byte) (string, bool) {
 	case '{', '[', 'n':
 		return "", false
 	default: // number
+		// Integral numbers render EXACTLY. float64 cannot hold a 64-bit id, so
+		// routing every number through it collapsed adjacent snowflake ids into
+		// one logMetrics series while the record attribute lifted from the same
+		// field (pkg/logattrs.decodeScalar, fixed for this) stayed exact. A
+		// number token is already the decimal text: if it has no fraction or
+		// exponent, it IS the value.
+		if isIntegerToken(raw) {
+			return string(raw), true
+		}
 		f, err := ljson.ParseFloat(raw)
 		if err != nil {
 			return "", false

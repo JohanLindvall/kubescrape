@@ -228,9 +228,14 @@ func (s *series) initBuckets(buckets []float64) {
 // a histogram the value is counted into every bucket whose bound it does not
 // exceed.
 func (s *series) observe(lbls labels, value float64, resAccum resKey, res pcommon.Map, resLabels labels) {
-	if math.IsNaN(value) {
+	if math.IsNaN(value) || math.IsInf(value, 0) {
+		// Inf too, and for the same reason: ParseFloat accepts "inf"/"Infinity"
+		// from a log line, and Inf is ABSORBING under every accumulate path —
+		// one such observation pins a counter, summary or histogram sum at Inf
+		// for the whole maxAge (24h by default), which no later real value can
+		// undo. Counted, never admitted.
 		droppedNaN.Add(1)
-		return // NaN records into nothing; admitting it would emit fabricated zeros
+		return
 	}
 	now := loadEpoch()
 	base, check := s.baseAccum(lbls)
@@ -316,7 +321,7 @@ func (s *series) streamCheck(check uint64, bucket int) uint64 {
 // label sets, so the accumulators AND the finalized hash are precomputed at
 // construction; a bump pays neither the label rehash nor the avalanche.
 func (s *series) observePreHashed(lbls labels, hash, check uint64, value float64, res pcommon.Map) {
-	if math.IsNaN(value) {
+	if math.IsNaN(value) || math.IsInf(value, 0) {
 		droppedNaN.Add(1)
 		return
 	}

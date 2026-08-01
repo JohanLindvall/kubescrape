@@ -52,3 +52,21 @@ func TestLogfmtValuesUnescaped(t *testing.T) {
 		t.Fatalf("plain = %q", got)
 	}
 }
+
+// A 64-bit id used as a logMetrics label must not lose precision: float64
+// cannot hold one, so adjacent ids collapsed into a single series while the
+// record attribute lifted from the same field stayed exact.
+func TestIntegerFieldsKeepFullPrecision(t *testing.T) {
+	for _, tc := range []struct{ in, want string }{
+		{`9007199254740993`, `9007199254740993`}, // 2^53+1: unrepresentable as float64
+		{`1234567890123456789`, `1234567890123456789`},
+		{`-42`, `-42`},
+		{`3.5`, `3.5`},  // fractions still go through the float path
+		{`1e3`, `1000`}, // as do exponents
+	} {
+		got, ok := RawScalarString([]byte(tc.in))
+		if !ok || got != tc.want {
+			t.Errorf("RawScalarString(%s) = %q (ok=%v), want %q", tc.in, got, ok, tc.want)
+		}
+	}
+}

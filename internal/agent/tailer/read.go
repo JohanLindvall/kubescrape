@@ -21,6 +21,24 @@ import (
 // containerd files fetch pod metadata from the service (backing off between
 // attempts), and are not consumed until it is available — the data waits on
 // disk, nothing is lost.
+// metadata resolution backoff bounds: the first retry is quick (a container
+// genuinely racing the API server resolves within a second or two), the cap
+// keeps a permanently unresolvable file down to one blocking call a minute.
+const (
+	minMetaBackoff = 2 * time.Second
+	maxMetaBackoff = time.Minute
+)
+
+func nextMetaBackoff(cur time.Duration) time.Duration {
+	if cur <= 0 {
+		return minMetaBackoff
+	}
+	if cur >= maxMetaBackoff {
+		return maxMetaBackoff
+	}
+	return min(cur*2, maxMetaBackoff)
+}
+
 func (t *Tailer) resolveMetadata(ctx context.Context, f *file) bool {
 	if !f.source.containerd {
 		return t.resolvePlain(f)
@@ -30,7 +48,16 @@ func (t *Tailer) resolveMetadata(ctx context.Context, f *file) bool {
 	}
 	md, err := t.cfg.Metadata.Container(ctx, f.containerID, t.cfg.MetadataWait)
 	if err != nil {
-		f.nextMetaTry = time.Now().Add(10 * time.Second)
+		// EXPONENTIAL backoff. The lookup deliberately BLOCKS server-side for
+		// the whole -metadata-wait when the container is unknown, and it runs
+		// on the single sweep goroutine that serves every file on the node, so
+		// a flat retry shorter than the cost of the sweep it spaces out lets a
+		// few permanently unresolvable files (a deleted pod whose tombstone has
+		// expired) monopolise the tailer: nothing is read, no rotation is
+		// noticed, and a file rotating twice inside that window loses the
+		// middle incarnation.
+		f.metaBackoff = nextMetaBackoff(f.metaBackoff)
+		f.nextMetaTry = time.Now().Add(f.metaBackoff)
 		if metaclient.IsNotFound(err) {
 			t.log.Debug("container metadata not found yet", "id", f.containerID)
 		} else {
@@ -38,6 +65,7 @@ func (t *Tailer) resolveMetadata(ctx context.Context, f *file) bool {
 		}
 		return false
 	}
+	f.metaBackoff = 0
 	res := pcommon.NewResource()
 	actx := attrs.Context{Pod: &md.Pod, Container: &md.Container}
 	if t.cfg.NodeInfo != nil {

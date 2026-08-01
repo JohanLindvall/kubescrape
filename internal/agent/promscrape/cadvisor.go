@@ -232,6 +232,11 @@ func (s *Scraper) metaSource() MetaSource {
 func newKubeletHTTPClient(cfg KubeletConfig, timeout time.Duration) *http.Client {
 	return &http.Client{
 		Timeout: timeout,
+		// The rationale is written out at targetauth.go's noRedirect: Go does
+		// not strip Authorization across a same-host https->http redirect. This
+		// is the ONE scrape client that was not updated — and the one that
+		// attaches the node's ServiceAccount token.
+		CheckRedirect: noRedirect,
 		Transport: &http.Transport{
 			TLSClientConfig:     &tls.Config{InsecureSkipVerify: cfg.InsecureTLS},
 			MaxIdleConnsPerHost: 1,

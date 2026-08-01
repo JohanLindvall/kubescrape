@@ -495,12 +495,12 @@ func (s *Scraper) cycle(ctx context.Context) {
 		}
 	}
 
-	// Per-target cadence. ONLY targets whose monitor set its own `interval` are
-	// scheduled; everything else is scraped every cycle exactly as before, so
-	// the default path keeps its old semantics and cannot be skipped by clock
-	// jitter between the ticker and a due time. The maps are rebuilt from the
-	// current target list each cycle, so a vanished target takes its schedule
-	// with it.
+	// Per-target cadence. EVERY target is scheduled, defaulting to the agent's
+	// interval; only a target whose monitor set an explicit `interval` may
+	// speed the loop's tick up. Clock jitter between the ticker and a due time
+	// is absorbed by the slack in dueNow rather than by leaving targets
+	// unscheduled. The maps are rebuilt from the current target list each
+	// cycle, so a vanished target takes its schedule with it.
 	for i := range targets {
 		t := targets[i]
 		// EVERY target is scheduled, defaulting to the agent's interval. Only

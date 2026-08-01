@@ -46,7 +46,23 @@ func (r *Reader) ingest(ctx context.Context, e *corev1.Event) {
 		ent.ts = e.CreationTimestamp.Time
 	}
 	r.batch = append(r.batch, ent)
-	obs.EventsObserved.WithLabelValues(strings.ToLower(e.Type)).Inc()
+	obs.EventsObserved.WithLabelValues(eventTypeLabel(e.Type)).Inc()
+}
+
+// eventTypeLabel collapses Event.Type to the two documented values plus
+// "other". It is the only obs label populated from cluster data, and the
+// core/v1 create path does not enforce the Normal/Warning validation — while
+// the Registry has neither expiry nor a cardinality cap, so an unbounded value
+// here is an unbounded series count in the agent's own metrics.
+func eventTypeLabel(t string) string {
+	switch strings.ToLower(t) {
+	case "normal":
+		return "normal"
+	case "warning":
+		return "warning"
+	default:
+		return "other"
+	}
 }
 
 // eventAttrs are the record-level attributes describing the event itself.

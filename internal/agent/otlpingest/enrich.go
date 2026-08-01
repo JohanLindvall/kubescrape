@@ -387,7 +387,7 @@ func (e *Enricher) applyMetadata(ctx context.Context, a pcommon.Map, cache map[s
 }
 
 // tokenFrom returns the first non-empty value under keys as a kind-tagged
-// token. Zero-alloc.
+// token. The concatenation allocates; the loop over keys does not.
 func (e *Enricher) tokenFrom(a pcommon.Map, keys []string, prefix string) (string, bool) {
 	for _, k := range keys {
 		if v, ok := a.Get(k); ok && v.Str() != "" {
@@ -403,8 +403,11 @@ func (e *Enricher) tokenFrom(a pcommon.Map, keys []string, prefix string) (strin
 // resolve.
 // resolves reports whether token names an object the metadata service knows,
 // without building or caching its attributes. Used to choose between a
-// container id and a pod uid when a sender supplies both; the underlying
-// metaclient lookup is itself cached, so the probe is cheap.
+// container id and a pod uid when a sender supplies both.
+//
+// NOT cached for the case it exists to serve: metaclient caches 200s, and a
+// stale container id — the reason to fall back to the pod uid — answers 404,
+// which is never cached. Each such probe is a live GET.
 func (e *Enricher) resolves(ctx context.Context, token string) bool {
 	pod, _ := e.lookupByID(ctx, token)
 	return pod != nil

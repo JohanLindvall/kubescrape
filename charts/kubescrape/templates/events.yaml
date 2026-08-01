@@ -11,9 +11,11 @@
       election alone would cost ~N/2 API reads per second — the fan-out this
       project exists to avoid.
 
-  Deployed this way the reader still gets the agent's whole delivery chain
-  (disk buffer, logs.rules, scrubbing, log-metrics, transforms, routing) and
-  enriches through the metadata service exactly as agents do.
+  Deployed this way the reader gets the agent's processing chain (logs.rules,
+  scrubbing, log-metrics, transforms, routing) and enriches through the
+  metadata service exactly as agents do. NOT the disk buffer: this template
+  renders no -buffer-dir, and the pod has a read-only root filesystem with no
+  writable volume to spool into.
 
   Azure diagnostics (azure.enabled) ride in the SAME Deployment — also a
   cluster-scoped stream — but need none of the events RBAC and no leader

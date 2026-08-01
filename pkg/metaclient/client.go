@@ -310,7 +310,13 @@ func (c *Client) fetch(ctx context.Context, u, key string, entry cacheEntry, cac
 		copyDecoded(v, entry.decoded)
 		return nil
 	case resp.StatusCode == http.StatusOK:
-		body, err := io.ReadAll(resp.Body)
+		// BOUNDED. The error path already caps its read; the success path did
+		// not, so an endpoint pointed at something that streams (a log tail, a
+		// proxy error page, another service entirely) could grow the agent's
+		// heap without limit — on the concurrent ingest path, on every node.
+		// A pod document is kilobytes; the whole node-targets response is the
+		// largest legitimate body and stays far under this.
+		body, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes))
 		if err != nil {
 			c.observe(OutcomeError)
 			return err
@@ -349,6 +355,11 @@ func (c *Client) fetch(ctx context.Context, u, key string, entry cacheEntry, cac
 		return &StatusError{Code: resp.StatusCode, Body: strings.TrimSpace(string(body))}
 	}
 }
+
+// maxResponseBytes caps a metadata response body. The biggest legitimate one
+// is a node's full target list; anything approaching this is a misdirected
+// endpoint, and an unbounded read of it is an OOM on every node at once.
+const maxResponseBytes = 64 << 20
 
 // maxCacheEntries bounds the response cache. Without a cap the map grows by
 // one entry per distinct container/pod URL ever fetched — a steady leak on

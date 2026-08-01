@@ -102,6 +102,9 @@ type file struct {
 	resource    pcommon.Resource // resolved metadata, valid when resolved
 	resolved    bool
 	nextMetaTry time.Time
+	// metaBackoff is the current retry interval for this file's metadata
+	// lookup; it doubles per failure and resets on success.
+	metaBackoff time.Duration
 	gone        bool
 	// unresolvedLost: the gone-before-resolve loss was already counted and
 	// its checkpointed segments retired — drainGone must not re-count on the

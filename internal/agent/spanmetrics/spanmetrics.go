@@ -309,15 +309,30 @@ func (g *Generator) observe(span ptrace.Span, resAttrs pcommon.Map, svc string, 
 // dims materializes the dimension values for a new series (cold path).
 func (g *Generator) dims(span ptrace.Span, resAttrs pcommon.Map, svc string) []string {
 	vals := make([]string, 0, len(g.names))
-	vals = append(vals, svc, span.Name(), span.Kind().String(), span.Status().Code().String())
+	vals = append(vals, truncDim(svc), truncDim(span.Name()),
+		span.Kind().String(), span.Status().Code().String())
 	for _, k := range g.extra {
 		v := attrStr(span.Attributes(), k)
 		if v == "" {
 			v = attrStr(resAttrs, k)
 		}
-		vals = append(vals, v)
+		vals = append(vals, truncDim(v))
 	}
 	return vals
+}
+
+// maxDimBytes bounds one dimension value. The cardinality cap counts SERIES,
+// not bytes, and these values come from an unauthenticated local listener: a
+// sender controlling span.name could otherwise pin maxCardinality x arbitrary
+// length in memory for staleAfter and re-render it into every export. The
+// OTel Collector's connector and Tempo truncate for the same reason.
+const maxDimBytes = 256
+
+func truncDim(v string) string {
+	if len(v) <= maxDimBytes {
+		return v
+	}
+	return v[:maxDimBytes]
 }
 
 // Run exports every interval until ctx is done, then once more. A non-positive

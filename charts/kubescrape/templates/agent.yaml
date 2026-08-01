@@ -173,7 +173,11 @@ spec:
             - -logs-poll-interval={{ .Values.agent.logsPollInterval }}
             - -logs-fingerprint-bytes={{ int64 .Values.agent.logsFingerprintBytes }}
             - -logs-multiline={{ .Values.agent.multiline }}
-            - -logs-exclude-namespaces={{ join "," .Values.agent.logsExcludeNamespaces }}
+            {{- /* Default to THIS release's namespace: the agent and the
+                   collector run there, and tailing it feeds the collector its
+                   own output — a loop that amplifies precisely when the
+                   collector is already slow. */}}
+            - -logs-exclude-namespaces={{ join "," (.Values.agent.logsExcludeNamespaces | default (list .Release.Namespace)) }}
             - -scrape-interval={{ .Values.agent.scrapeInterval }}
             - -scrape-exemplars={{ .Values.agent.scrapeExemplars }}
             - -scrape-health-metrics={{ .Values.agent.scrapeHealthMetrics }}

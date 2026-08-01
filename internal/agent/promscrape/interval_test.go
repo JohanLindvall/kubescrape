@@ -167,3 +167,25 @@ func TestWarnOnceTableIsBounded(t *testing.T) {
 		t.Error("dedupe table emptied itself: every warning would re-fire every cycle")
 	}
 }
+
+// The bound must not turn into a warning STORM. Clearing the table at the cap
+// looks bounded ("re-warns once per refill") but is not: with cap+1 distinct
+// keys the table re-fills, overflows and clears on every scrape cycle, so all
+// of them print every cycle forever — worse than the unbounded map. Reaching
+// the cap suppresses instead, and says so once.
+func TestWarnOnceDoesNotStormAtTheCap(t *testing.T) {
+	h := &countingHandler{}
+	s := &Scraper{cfg: Config{Interval: time.Minute}, log: slog.New(h)}
+
+	// Fill past the cap, then replay the same key set over several "cycles".
+	for cycle := 0; cycle < 4; cycle++ {
+		for i := 0; i < maxWarnKeys+1; i++ {
+			s.warnOnce(fmt.Sprintf("k%d", i), "msg")
+		}
+	}
+	// At most the cap's worth of distinct warnings plus the one saturation
+	// notice; a clearing table emits (maxWarnKeys+1) * 4.
+	if h.n > maxWarnKeys+1 {
+		t.Errorf("logged %d warnings for %d distinct keys over 4 cycles; the table is re-warning every cycle", h.n, maxWarnKeys+1)
+	}
+}

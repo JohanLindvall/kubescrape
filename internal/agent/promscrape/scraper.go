@@ -134,6 +134,9 @@ type Scraper struct {
 	due             map[string]time.Time
 	targetIntervals map[string]time.Duration
 	warned          map[string]bool
+	// warnSaturated records that maxWarnKeys was reached, so the notice is
+	// logged once rather than per suppressed warning.
+	warnSaturated bool
 
 	// insecureHTTP serves monitor endpoints with tlsConfig.insecureSkipVerify.
 	insecureHTTP *http.Client
@@ -399,11 +402,15 @@ var promDurationRE = regexp.MustCompile(`^(?:([0-9]+)y)?(?:([0-9]+)w)?(?:([0-9]+
 
 // maxWarnKeys bounds the dedupe table. The keys are configuration-derived, so a
 // healthy cluster holds a handful of them; the cap only catches a pathological
-// generator (thousands of monitors, each with its own typo). Reaching it CLEARS
-// the table rather than refusing further keys: a cleared table re-warns at most
-// once per cap refill, whereas refusing would blind the operator to every
-// genuinely new problem from that point on — and a warning nobody can ever see
-// again is worse than one repeated at a bounded rate.
+// generator (thousands of monitors, each with its own typo).
+//
+// Reaching it SUPPRESSES further keys and says so once. Clearing the table
+// instead — the intuitive choice, on the grounds that a cleared table re-warns
+// at a bounded rate — is not bounded at all: at cap+1 distinct keys every
+// cycle re-fills, overflows and clears again, so all 1025 warnings print on
+// EVERY scrape cycle, forever. That is worse than the unbounded map it
+// replaced. An operator holding 1024 distinct configuration warnings has
+// plenty to act on, and the saturation line tells them the list is truncated.
 const maxWarnKeys = 1024
 
 // warnOnce logs a per-key message at most once per process, for per-target
@@ -414,13 +421,21 @@ func (s *Scraper) warnOnce(key, msg string, args ...any) {
 		s.warned = map[string]bool{}
 	}
 	seen := s.warned[key]
+	saturated := false
 	if !seen {
 		if len(s.warned) >= maxWarnKeys {
-			clear(s.warned)
+			seen = true // suppress: the table is full
+			saturated = !s.warnSaturated
+			s.warnSaturated = true
+		} else {
+			s.warned[key] = true
 		}
-		s.warned[key] = true
 	}
 	s.dueMu.Unlock()
+	if saturated {
+		s.log.Warn("scrape warning dedupe table is full; further distinct warnings are suppressed",
+			"keys", maxWarnKeys)
+	}
 	if !seen {
 		s.log.Warn(msg, args...)
 	}

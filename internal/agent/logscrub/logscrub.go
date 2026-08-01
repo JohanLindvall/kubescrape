@@ -50,16 +50,23 @@ type pattern struct {
 	prefilter func(string) bool
 }
 
-// keySuffix lets a keyword be a PREFIX of the key as well as a suffix, but only
-// across a compound-word boundary: an explicit separator (SECRET_KEY,
-// secret-key) or a camelCase hump followed by lowercase (secretKey,
-// secretValue). That distinction is the whole point — an unbounded suffix would
-// redact `tokenizer=bert-base` and `keyboard=us`, which
-// TestCompoundKeyNoOverRedaction exists to prevent. The hump requires a
-// following lowercase so an all-caps word like TOKENIZER is not mistaken for a
-// compound; the rarer all-caps SECRETKEY spelling is the accepted cost, since
-// SECRET_KEY is the form that actually occurs.
-const keySuffix = `(?:[_-][0-9A-Za-z_.-]*|[A-Z][a-z][0-9A-Za-z_.-]*)?`
+// keySuffix lets a keyword be a PREFIX of the key, but only where the suffix
+// is itself a secret word: SECRET_KEY, secretKey, secretValue, TOKEN_VALUE.
+//
+// The first attempt allowed ANY compound suffix, which redacted everyday
+// Kubernetes vocabulary — `secretName=my-tls-cert` (a Secret's NAME),
+// `secretRef: registry-creds`, `token_count=42`, `passwordPolicy=strict`,
+// `tokenBucket=full` — destroying ordinary log content, and destroying it
+// BEFORE logAttributes, enrich, logMetrics and the rules run on the line. A
+// scrubber that eats real fields is not a safer scrubber: it makes operators
+// turn the defaults off.
+//
+// RE2 has no negative lookahead, so the safe suffixes are excluded by
+// construction: only these words may follow the keyword.
+var keySuffix = `(?:[_-]?(?:` +
+	asciiFold("key") + `|` + asciiFold("value") + `|` + asciiFold("token") +
+	`|` + asciiFold("secret") + `|` + asciiFold("password") + `|` +
+	asciiFold("passwd") + `|` + asciiFold("pwd") + `))?`
 
 // asciiFold renders a literal keyword as a regex matching exactly its ASCII
 // case variants ("key" -> "[Kk][Ee][Yy]").
@@ -217,7 +224,21 @@ var builtins = map[string]pattern{
 		// scheme://user:PASSWORD@host — the credential is the password half.
 		// Connection strings reach logs through dial-failure messages and
 		// config dumps, where no key=value shape exists for secret-kv to match.
-		re:   regexp.MustCompile(`([a-zA-Z][a-zA-Z0-9+.-]*://[^\s:/@]+:)[^\s/@]+(@)`),
+		// The password charset excludes the same delimiters secret-kv's does
+		// (quotes, comma, semicolon, closing brackets) plus '/'. Bounding it
+		// by whitespace and '@' alone let it walk THROUGH a JSON value's
+		// closing quote, past intervening fields, to any later '@' — so
+		// `{"dsn":"redis://cache:6379","user":"admin@corp.com"}` lost its port,
+		// its `user` field and its well-formedness, with no credential present
+		// anywhere. Scrubbing runs BEFORE logAttributes, enrich, logMetrics
+		// and the rules, so a corrupted line silently kills every field
+		// extraction downstream of it — the very mistake secret-kv's value
+		// charset records fixing.
+		//
+		// The user half is `*`, not `+`: `redis://:hunter2@host` is the
+		// standard Redis/Sentinel spelling and was the one credential form
+		// this pattern MISSED.
+		re:   regexp.MustCompile(`([a-zA-Z][a-zA-Z0-9+.-]*://[^\s:/@]*:)[^\s"'&,;}\])/@]+(@)`),
 		repl: "${1}" + redacted + "${2}",
 		prefilter: func(s string) bool {
 			return strings.Contains(s, "://")

@@ -122,4 +122,48 @@ func TestURLUserinfoRedacted(t *testing.T) {
 	if got := s.Scrub(plain); got != plain {
 		t.Errorf("over-redacted a plain URL: %q -> %q", plain, got)
 	}
+
+	// ONLY the password half goes. The scheme, the user, the host and the path
+	// are what make a dial-failure line diagnosable at all, and they are also
+	// what logAttributes/enrich parse out of it afterwards — a pattern that
+	// eats them turns one redaction into a destroyed record.
+	const dsn = "connect failed: https://user:hunter2@host/path?retry=1"
+	if got := s.Scrub(dsn); got != "connect failed: https://user:[REDACTED]@host/path?retry=1" {
+		t.Errorf("userinfo redaction must replace the password and nothing else:\n  in:  %s\n  out: %s", dsn, got)
+	}
+}
+
+// The userinfo pattern must not walk past the credential into ordinary
+// content. Scrubbing runs BEFORE logAttributes, enrich, logMetrics and the
+// rules, so a corrupted line kills every field extraction downstream of it.
+func TestURLUserinfoDoesNotEatSurroundingContent(t *testing.T) {
+	s := mustNew(t, Config{Builtin: []string{"defaults"}})
+	for _, in := range []string{
+		`{"msg":"connecting","dsn":"redis://cache:6379","user":"admin@corp.com"}`,
+		`endpoint=amqp://rabbit:5672,owner=ops@corp.com`,
+		`see http://docs.example.com:8080/guide and mail ops@corp.com`,
+		// The two shapes ordinary application logs are actually written in: a
+		// structured line whose `url` field is a plain request URL, and a
+		// logfmt access line. Neither carries a credential; both contain
+		// `://`, so both reach the regex.
+		`{"level":"info","url":"https://api.example.com/v1/items?since=2026-01-01","status":200}`,
+		`time="2026-07-30T10:00:00Z" msg="GET https://svc/health 200"`,
+		// The same request logged with an explicit PORT and an ordinary
+		// address later in the line. `host:port` is exactly the shape the
+		// pattern reads as `user:password`, and an unbounded password charset
+		// then ran from the port through the JSON quote and every field after
+		// it to whatever '@' came next — here destroying the `url` field that
+		// logAttributes and enrich key on, on a line with no credential in it.
+		`{"level":"info","upstream":"https://api.example.com:443","actor":"alice@corp.com","url":"https://api.example.com/v1/items?since=2026-01-01"}`,
+	} {
+		if got := s.Scrub(in); got != in {
+			t.Errorf("no credential present, but the line was rewritten:\n  in:  %s\n  out: %s", in, got)
+		}
+	}
+	// ...while the empty-user spelling, the standard Redis one, IS redacted.
+	const redis = `redis://:hunter2@cache:6379`
+	got := s.Scrub(redis)
+	if !strings.Contains(got, redacted) || strings.Contains(got, "hunter2") {
+		t.Errorf("empty-user credential not redacted: %q -> %q", redis, got)
+	}
 }

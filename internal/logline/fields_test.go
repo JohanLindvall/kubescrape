@@ -53,6 +53,28 @@ func TestLogfmtValuesUnescaped(t *testing.T) {
 	}
 }
 
+// UNQUOTED values hold no escapes — go-kit/logrus/slog quote only for a
+// space, quote or '='. Unescaping them anyway deleted the backslashes of a
+// Windows path or a regex, and for a recognised letter minted a label value
+// with a real control character in it.
+func TestUnquotedLogfmtValuesAreVerbatim(t *testing.T) {
+	ki := NewKeyIndex()
+	ki.Add("path")
+	ki.Add("re")
+	ki.Add("arg")
+	var f Fields
+	f.Reset(`path=C:\logs\app.log re=\d+\s+ok arg=a\nb`)
+	for key, want := range map[string]string{
+		"path": `C:\logs\app.log`,
+		"re":   `\d+\s+ok`,
+		"arg":  `a\nb`,
+	} {
+		if got := ki.Get(&f, key); got != want {
+			t.Errorf("%s = %q; want %q verbatim", key, got, want)
+		}
+	}
+}
+
 // A 64-bit id used as a logMetrics label must not lose precision: float64
 // cannot hold one, so adjacent ids collapsed into a single series while the
 // record attribute lifted from the same field stayed exact.

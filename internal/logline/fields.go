@@ -7,6 +7,8 @@ import (
 
 	ljson "github.com/JohanLindvall/lightning/pkg/json"
 	"github.com/JohanLindvall/logfmt"
+
+	"github.com/JohanLindvall/kubescrape/pkg/logattrs"
 )
 
 // LineKey is the synthetic label key that resolves to the whole raw line, so
@@ -106,12 +108,12 @@ func (ki KeyIndex) Parse(lf *Fields) {
 			// Decode them so `msg="a \"b\""` reads as `a "b"` — the JSON path
 			// unescapes, and the same logical value must not match selectors
 			// or mint label values differently depending on the line format.
+			// QUOTED values only: an unquoted `path=C:\logs\app.log` holds no
+			// escapes, and decoding it deleted the backslashes — or, for a
+			// recognised letter, minted a label value with a real newline in
+			// it. logattrs.DecodeLogfmtValue is the shared decision.
 			// The fast path (no escapes) costs one byte scan, no copy.
-			if logfmt.NeedsUnescape(val) {
-				lf.values[string(key)] = string(logfmt.AppendUnescape(nil, val))
-			} else {
-				lf.values[string(key)] = string(val)
-			}
+			lf.values[string(key)] = logattrs.DecodeLogfmtValue(buf, val)
 		}
 		return true
 	})

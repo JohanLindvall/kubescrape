@@ -186,14 +186,12 @@ func (e *Extractor) Extract(line string) Result {
 			// differently depending on the line format, and in the tailer a
 			// record attribute lifted here is consulted BEFORE the line, so an
 			// unrelated logAttributes rule would otherwise change what a
-			// logMetrics label or a logs.rules selector matches.
+			// logMetrics label or a logs.rules selector matches. QUOTED values
+			// only — see DecodeLogfmtValue.
 			// The no-escape path (the common one) costs one byte scan, no copy.
-			decoded := val
-			if logfmt.NeedsUnescape(val) {
-				decoded = logfmt.AppendUnescape(nil, val)
-			}
+			decoded := DecodeLogfmtValue(buf, val)
 			for _, i := range idxs {
-				vals[i] = string(decoded)
+				vals[i] = decoded
 				found[i] = true
 			}
 		}

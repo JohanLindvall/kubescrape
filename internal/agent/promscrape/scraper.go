@@ -242,7 +242,18 @@ func (s *Scraper) authToken(ctx context.Context, ref string) (string, error) {
 		return "", err
 	}
 	s.authMu.Lock()
-	s.authCache[ref] = authCacheEntry{token: token, fetched: time.Now()}
+	now := time.Now()
+	// Drop what has aged out. These entries hold bearer tokens, CA bundles and
+	// client private keys; keeping them resident for the process lifetime past
+	// their 1-minute usefulness is secret material sitting in heap for nothing
+	// (the service side evicts, and the sibling TLS-client cache in this
+	// package is bounded).
+	for k, e := range s.authCache {
+		if now.Sub(e.fetched) >= time.Minute {
+			delete(s.authCache, k)
+		}
+	}
+	s.authCache[ref] = authCacheEntry{token: token, fetched: now}
 	s.authMu.Unlock()
 	return token, nil
 }

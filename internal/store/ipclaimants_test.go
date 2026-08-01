@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
 )
 
@@ -65,5 +66,34 @@ func TestPromotionPrefersTheLaterAcquirer(t *testing.T) {
 	}
 	if np.Pod.Name != "p-older" {
 		t.Fatalf("promoted %s; want the later of the remaining acquirers (p-older)", np.Pod.Name)
+	}
+}
+
+// A dual-stack pod is reachable at every address in status.podIPs, and a
+// connection can arrive from the family status.podIP does not carry. Indexing
+// only the primary made /v1/self and /v1/pod-ips 404 for the other one, which
+// silently disabled agent self-attribution and the ingest peer-IP fallback.
+func TestDualStackAddressesResolve(t *testing.T) {
+	s := New(time.Minute)
+	p := ipPod("ds", "p-ds", "10.0.0.7")
+	p.Status.PodIPs = []corev1.PodIP{{IP: "10.0.0.7"}, {IP: "fd00::7"}}
+	s.UpsertPod(p)
+
+	for _, ip := range []string{"10.0.0.7", "fd00::7"} {
+		np, ok := s.GetPodByIP(ip)
+		if !ok || np.Pod.Name != "p-ds" {
+			t.Errorf("GetPodByIP(%s) = %+v, ok=%v; both families must resolve", ip, np.Pod.Name, ok)
+		}
+	}
+
+	// Deleting it releases both, leaving nothing behind.
+	s.DeletePod(types.UID("ds"))
+	for _, ip := range []string{"10.0.0.7", "fd00::7"} {
+		if _, ok := s.GetPodByIP(ip); ok {
+			t.Errorf("%s still resolves after the pod was deleted", ip)
+		}
+	}
+	if len(s.ipClaimants) != 0 {
+		t.Errorf("claimants left behind: %v", s.ipClaimants)
 	}
 }

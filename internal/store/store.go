@@ -156,14 +156,17 @@ func (s *Store) UpsertPod(p *corev1.Pod) {
 	if rec != nil && rec.expireAt.IsZero() && rec.resourceVersion == p.ResourceVersion {
 		return // periodic resync, nothing changed
 	}
-	var oldNode, oldIP string
+	var oldNode string
+	var oldIPs []string
 	var oldIDs map[string]struct{}
 	if rec == nil {
 		rec = &record{}
 		s.pods[p.UID] = rec
 	} else {
 		oldNode = rec.pod.NodeName
-		oldIP = rec.pod.PodIP
+		// Every address the record previously claimed, so the ones this upsert
+		// drops are released (a dual-stack pod has more than one).
+		oldIPs = podAddresses(rec.pod)
 		oldIDs = rec.containerIDs
 	}
 
@@ -206,7 +209,7 @@ func (s *Store) UpsertPod(p *corev1.Pod) {
 	}
 	s.byPodName[nameKey] = rec
 
-	s.claimPodIPLocked(rec, pod, oldIP)
+	s.claimPodIPLocked(rec, pod, oldIPs)
 }
 
 // indexContainersLocked replaces the record's container-ID index: new IDs are
@@ -244,39 +247,83 @@ func (s *Store) indexContainersLocked(rec *record, uid types.UID, containers map
 // recycle, and a drained pod's routine status updates still carry the IP the
 // CNI already handed to someone else. Every live pod claims (last-write-wins),
 // including a late-scheduled OLDER pod legitimately taking a freed IP.
-func (s *Store) claimPodIPLocked(rec *record, pod kubemeta.Pod, oldIP string) {
-	ip := pod.PodIP
+func (s *Store) claimPodIPLocked(rec *record, pod kubemeta.Pod, oldIPs []string) {
+	// EVERY address the pod reports. On a dual-stack cluster a connection can
+	// arrive from the family status.podIP does not carry, and indexing only
+	// that one left /v1/self and /v1/pod-ips unresolvable for it — the agent's
+	// self-attribution and the ingest peer-IP fallback silently off, with a 404
+	// indistinguishable from any other.
+	for _, ip := range podAddresses(pod) {
+		s.claimOneIPLocked(rec, pod, ip, oldIPs)
+	}
+	// Addresses the pod no longer reports are released.
+	for _, old := range oldIPs {
+		if old == "" || containsStr(podAddresses(pod), old) {
+			continue
+		}
+		s.releaseIPLocked(rec, old)
+	}
+}
+
+// podAddresses returns the addresses a pod may legitimately be reached at, or
+// nil when it claims none (hostNetwork, finished).
+func podAddresses(pod kubemeta.Pod) []string {
 	// The spec flag is the authoritative signal; the IP comparison stays as a
-	// backstop for records converted before the field existed. Value equality
-	// alone has a hole: an upsert carrying status.podIP before status.hostIP
-	// is populated would let a hostNetwork pod claim the node IP.
-	if pod.HostNetwork || ip == pod.HostIP {
-		ip = "" // hostNetwork: the node IP is shared, not an identity
+	// backstop for records converted before the field existed.
+	if pod.HostNetwork || finishedPhase(pod.Phase) {
+		return nil
 	}
-	if finishedPhase(pod.Phase) {
-		// A finished pod's status may retain a podIP the CNI has already
-		// recycled; it must never claim (or keep) the IP mapping.
-		ip = ""
+	ips := pod.PodIPs
+	if len(ips) == 0 && pod.PodIP != "" {
+		ips = []string{pod.PodIP}
 	}
-	if oldIP != ip && oldIP != "" {
-		s.dropClaimantLocked(oldIP, rec)
+	out := ips[:0:0]
+	for _, ip := range ips {
+		// A hostNetwork pod whose status.hostIP has not been populated yet
+		// would otherwise claim the node address.
+		if ip != "" && ip != pod.HostIP {
+			out = append(out, ip)
+		}
 	}
-	if ip != "" {
-		s.addClaimantLocked(ip, rec)
+	return out
+}
+
+// recordAddresses returns every address a record ever claimed, including for a
+// pod that has since gone finished or hostNetwork (podAddresses returns none
+// for those, but their claims still have to be cleaned up).
+func recordAddresses(rec *record) []string {
+	ips := rec.pod.PodIPs
+	if len(ips) == 0 && rec.pod.PodIP != "" {
+		ips = []string{rec.pod.PodIP}
 	}
-	if oldIP != ip && oldIP != "" && s.byPodIP[oldIP] == rec {
-		delete(s.byPodIP, oldIP)
-		// Symmetric with DeletePod: this pod is releasing oldIP (its IP
-		// changed, or it went finished/hostNetwork), so a live pod shadowed on
-		// that IP by the recycle race must be promoted — otherwise it is
-		// unresolvable by IP until its own next real upsert (a same-RV resync
-		// short-circuits before re-claiming). rec already carries its new
-		// (finished/hostNetwork/changed) state so it would self-exclude;
-		// passing it keeps that independent of field-assignment order.
-		s.promoteIPClaimantLocked(oldIP, rec)
+	return ips
+}
+
+func containsStr(xs []string, v string) bool {
+	for _, x := range xs {
+		if x == v {
+			return true
+		}
 	}
-	if ip != "" {
-		if oldIP != ip {
+	return false
+}
+
+// releaseIPLocked drops rec's claim on one address and promotes a survivor.
+func (s *Store) releaseIPLocked(rec *record, ip string) {
+	s.dropClaimantLocked(ip, rec)
+	if s.byPodIP[ip] == rec {
+		delete(s.byPodIP, ip)
+		// A live pod shadowed on that address by the recycle race must be
+		// promoted, or it stays unresolvable until its own next real upsert.
+		s.promoteIPClaimantLocked(ip, rec)
+	}
+}
+
+// claimOneIPLocked applies the claim rules for ONE of a pod's addresses.
+func (s *Store) claimOneIPLocked(rec *record, pod kubemeta.Pod, ip string, oldIPs []string) {
+	s.addClaimantLocked(ip, rec)
+	{
+		if !containsStr(oldIPs, ip) {
 			// This pod ACQUIRED the address now. The sequence orders genuine
 			// acquisitions so a later one beats an earlier one below.
 			s.ipSeq++
@@ -420,11 +467,11 @@ func (s *Store) deletePodLocked(uid types.UID) {
 	}
 	now := s.now()
 	s.removeFromNodeLocked(rec.pod.NodeName, uid)
-	if rec.pod.PodIP != "" {
+	for _, ip := range recordAddresses(rec) {
 		// Stop claiming the address even when this record was not the winner:
 		// a shadowed claimant left behind would keep the address's claimant
 		// set (and its promotion candidates) growing across pod churn.
-		s.dropClaimantLocked(rec.pod.PodIP, rec)
+		s.dropClaimantLocked(ip, rec)
 	}
 	if rec.pod.PodIP != "" && s.byPodIP[rec.pod.PodIP] == rec {
 		delete(s.byPodIP, rec.pod.PodIP)
@@ -493,8 +540,8 @@ func (s *Store) Sweep() {
 	for uid, rec := range s.pods {
 		if !rec.expireAt.IsZero() && now.After(rec.expireAt) {
 			s.dropNameIndexLocked(rec)
-			if rec.pod.PodIP != "" {
-				s.dropClaimantLocked(rec.pod.PodIP, rec)
+			for _, ip := range recordAddresses(rec) {
+				s.dropClaimantLocked(ip, rec)
 			}
 			delete(s.pods, uid)
 			removed = true

@@ -68,14 +68,22 @@ type Container struct {
 
 // Pod is the full metadata set for one pod.
 type Pod struct {
-	Name        string `json:"name"`
-	Namespace   string `json:"namespace"`
-	UID         string `json:"uid"`
-	NodeName    string `json:"nodeName,omitempty"`
-	PodIP       string `json:"podIP,omitempty"`
-	HostIP      string `json:"hostIP,omitempty"`
-	HostNetwork bool   `json:"hostNetwork,omitempty"`
-	Phase       string `json:"phase,omitempty"`
+	Name      string `json:"name"`
+	Namespace string `json:"namespace"`
+	UID       string `json:"uid"`
+	NodeName  string `json:"nodeName,omitempty"`
+	PodIP     string `json:"podIP,omitempty"`
+	// PodIPs are ALL addresses assigned to the pod — the same list Kubernetes
+	// reports in status.podIPs, with PodIP as its first element. On a
+	// dual-stack cluster a connection can arrive from the family that is not
+	// status.podIP, so indexing only that one made /v1/self and /v1/pod-ips
+	// (and with them agent self-attribution and the ingest peer-IP fallback)
+	// silently unresolvable, with no signal distinguishing it from any other
+	// 404.
+	PodIPs      []string `json:"podIPs,omitempty"`
+	HostIP      string   `json:"hostIP,omitempty"`
+	HostNetwork bool     `json:"hostNetwork,omitempty"`
+	Phase       string   `json:"phase,omitempty"`
 	// Ready mirrors the pod's PodReady status condition: the pod passes its
 	// readiness probes and its Service endpoints are serving traffic. The
 	// phase alone does not say this — a Running pod may be failing every

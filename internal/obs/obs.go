@@ -243,6 +243,12 @@ func init() {
 	Registry.CounterFunc("kubescrape_log_metrics_dropped_capped_total",
 		"Log-metric observations dropped since start because the metric's label-set cardinality cap was reached.",
 		func() float64 { return float64(metrics.DroppedCapped()) })
+	// Per metric as well: the cap frees slots only through idleness, so a burst
+	// blinds ONE metric for up to maxAge + grace (24h by default) and an alert
+	// has to be able to name it.
+	Registry.GaugeFuncVec("kubescrape_log_metrics_dropped_capped_by_metric",
+		"Log-metric observations dropped since start because that metric's cardinality cap was reached, by metric name.",
+		"metric", metrics.DroppedCappedByMetric)
 	Registry.CounterFunc("kubescrape_log_metrics_dropped_collision_total",
 		"Log-metric observations dropped since start because of a series hash collision.",
 		func() float64 { return float64(metrics.DroppedCollision()) })

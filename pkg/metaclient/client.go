@@ -63,6 +63,8 @@ type Client struct {
 
 	mu    sync.Mutex
 	cache map[string]cacheEntry
+	// lastSweep is when expired entries were last swept (see evictLocked).
+	lastSweep time.Time
 
 	// token, when set, authenticates requests to /v1/scrape-auth (the only
 	// authenticated endpoint: it returns Secret VALUES, while the metadata
@@ -361,6 +363,9 @@ func (c *Client) fetch(ctx context.Context, u, key string, entry cacheEntry, cac
 // endpoint, and an unbounded read of it is an OOM on every node at once.
 const maxResponseBytes = 64 << 20
 
+// cacheSweepEvery is how often expired entries are swept below the cap.
+const cacheSweepEvery = time.Minute
+
 // maxCacheEntries bounds the response cache. Without a cap the map grows by
 // one entry per distinct container/pod URL ever fetched — a steady leak on
 // nodes with pod churn (dead containers are never requested again).
@@ -377,10 +382,24 @@ const evictLowWater = maxCacheEntries * 3 / 4
 // then arbitrary ones (they re-fetch cheaply via ETag revalidation). Caller
 // holds the mutex.
 func (c *Client) evictLocked() {
+	now := c.now()
+	// Sweep expired entries periodically even below the cap. The cap alone
+	// only ran at 4096 entries, so on a node with pod churn the cache held
+	// thousands of dead containers' FULL pod documents — tens of MB of heap
+	// that nothing would ever ask for again — until the next insert crossed the
+	// threshold.
 	if len(c.cache) <= maxCacheEntries {
+		if now.Sub(c.lastSweep) < cacheSweepEvery {
+			return
+		}
+		c.lastSweep = now
+		for k, e := range c.cache {
+			if now.After(e.expires) {
+				delete(c.cache, k)
+			}
+		}
 		return
 	}
-	now := c.now()
 	for k, e := range c.cache {
 		if now.After(e.expires) {
 			delete(c.cache, k)

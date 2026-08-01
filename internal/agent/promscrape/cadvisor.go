@@ -130,6 +130,17 @@ func (s *Scraper) parseAndExportFiltered(ctx context.Context, body io.Reader, op
 				}
 			}
 		}
+		// Report what the parser DID reject before the abort. Returning without
+		// this made a scrape that tripped the sample limit, was truncated, or
+		// timed out mid-body report zero malformed lines even when the body was
+		// garbage — so the one metric that identifies the cause never moved,
+		// and the protobuf path (which does report it) disagreed with the text
+		// path on identical input.
+		malformed += conv.malformed
+		if malformed > 0 {
+			obs.ScrapeMalformed.WithLabelValues(pipeline).Add(float64(malformed))
+			s.log.Warn("aborted scrape had malformed lines", "target", what, "malformed", malformed, "samples", samples, "error", err)
+		}
 		return samples, err
 	}
 	if err := conv.finish(); err != nil {

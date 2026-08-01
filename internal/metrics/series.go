@@ -29,6 +29,27 @@ var (
 // cardinality cap was reached (a new label combination could not be admitted).
 func DroppedCapped() uint64 { return droppedCapped.Load() }
 
+var (
+	cappedMu       sync.Mutex
+	cappedByMetric map[string]uint64
+)
+
+// DroppedCappedByMetric reports cap-refused observations per metric name.
+//
+// The cap frees slots only through idleness, so one burst of high-cardinality
+// labels blinds a metric for maxAge + the grace window — 24h by default. An
+// aggregate counter says that happened; it does not say to WHICH metric, which
+// is the only thing an operator can act on.
+func DroppedCappedByMetric() map[string]float64 {
+	cappedMu.Lock()
+	defer cappedMu.Unlock()
+	out := make(map[string]float64, len(cappedByMetric))
+	for k, v := range cappedByMetric {
+		out[k] = float64(v)
+	}
+	return out
+}
+
 // DroppedCollision counts observations rejected because their hash matched an
 // existing sample of a DIFFERENT series (a 64-bit collision; merging them would
 // corrupt both).
@@ -407,6 +428,12 @@ func (s *series) admit(hash, check uint64, lbls labels, bucket int, now int64, r
 // most hourly (caller holds the lock).
 func (s *series) warnCapped(lbls labels, now int64) {
 	droppedCapped.Add(1)
+	cappedMu.Lock()
+	if cappedByMetric == nil {
+		cappedByMetric = map[string]uint64{}
+	}
+	cappedByMetric[s.name]++
+	cappedMu.Unlock()
 	if now-s.lastWarn >= 3600 {
 		s.lastWarn = now
 		s.log.Info("max label count reached for log metric",

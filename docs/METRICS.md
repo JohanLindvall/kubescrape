@@ -58,6 +58,7 @@ names a metric or a label that is not registered.
 | `kubescrape_log_files` | — | Log files currently tracked. |
 | `kubescrape_log_lag_bytes` | — | Largest per-file backlog: bytes on disk not yet exported and committed (per-file breakdown on /debug/tailer). |
 | `kubescrape_log_lag_total_bytes` | — | Total backlog across tracked files: bytes on disk not yet exported and committed. |
+| `kubescrape_log_metrics_dropped_capped_by_metric` | `metric` | Log-metric observations dropped since start because that metric's cardinality cap was reached, by metric name. |
 | `kubescrape_log_metrics_dropped_capped_total` | — | Log-metric observations dropped since start because the metric's label-set cardinality cap was reached. |
 | `kubescrape_log_metrics_dropped_collision_total` | — | Log-metric observations dropped since start because of a series hash collision. |
 | `kubescrape_log_metrics_dropped_nan_total` | — | Log-metric observations dropped since start because the extracted value was NaN. |
@@ -90,4 +91,4 @@ names a metric or a label that is not registered.
 | `kubescrape_transform_errors_total` | `signal` | Transform program invocations that failed (the batch is NOT exported; the error propagates to the producer's retry path). |
 | `kubescrape_transform_reloads_total` | `outcome` | Transforms-file reloads by outcome (applied, failed — a failed compile keeps the last good program). |
 
-70 metrics.
+71 metrics.

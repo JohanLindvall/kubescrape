@@ -18,6 +18,24 @@ import (
 //
 // The returned kubemeta.Pod shares no memory with the input object; informer cache
 // objects must not be retained or mutated.
+// podIPs copies status.podIPs, falling back to the single status.podIP for
+// clusters (and fakes) that only populate that one.
+func podIPs(p *corev1.Pod) []string {
+	if len(p.Status.PodIPs) == 0 {
+		if p.Status.PodIP == "" {
+			return nil
+		}
+		return []string{p.Status.PodIP}
+	}
+	out := make([]string, 0, len(p.Status.PodIPs))
+	for _, ip := range p.Status.PodIPs {
+		if ip.IP != "" {
+			out = append(out, ip.IP)
+		}
+	}
+	return out
+}
+
 func FromPod(p *corev1.Pod) (kubemeta.Pod, map[string]kubemeta.Container) {
 	pod := kubemeta.Pod{
 		Name:        p.Name,
@@ -25,6 +43,7 @@ func FromPod(p *corev1.Pod) (kubemeta.Pod, map[string]kubemeta.Container) {
 		UID:         string(p.UID),
 		NodeName:    p.Spec.NodeName,
 		PodIP:       p.Status.PodIP,
+		PodIPs:      podIPs(p),
 		HostIP:      p.Status.HostIP,
 		HostNetwork: p.Spec.HostNetwork,
 		Phase:       string(p.Status.Phase),

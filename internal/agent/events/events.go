@@ -26,6 +26,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -236,6 +237,22 @@ func (r *Reader) shutdownBudget() time.Duration {
 		d = leader.DefaultRenewDeadline / 2
 	}
 	return d
+}
+
+// newerRV reports whether a is a later resourceVersion than b. Kubernetes
+// treats these as opaque, but etcd's are decimal integers, so compare
+// numerically where both parse and fall back to keeping what we have (the
+// conservative direction: never move the position backwards on a guess).
+func newerRV(a, b string) bool {
+	if b == "" {
+		return true
+	}
+	ai, aerr := strconv.ParseUint(a, 10, 64)
+	bi, berr := strconv.ParseUint(b, 10, 64)
+	if aerr != nil || berr != nil {
+		return false
+	}
+	return ai > bi
 }
 
 // loadPosition reads the stored resume point and applies the start policy.
@@ -472,9 +489,16 @@ func (r *Reader) settle(newest entry) {
 	if newest.rv != "" {
 		r.committed.ResourceVersion = newest.rv
 	}
-	// A bookmark seen while the batch was pending is now covered too.
+	// A bookmark seen while the batch was pending is now covered too — but only
+	// if it is NEWER than what this flush just committed. Bookmarks arrive
+	// interleaved with events, so one seen before the last few entries carries
+	// an OLDER revision, and applying it unconditionally walked the committed
+	// position backwards by up to a flush window: a restart or leader handover
+	// then redelivered everything in between.
 	if r.pendingRV != "" {
-		r.committed.ResourceVersion = r.pendingRV
+		if newerRV(r.pendingRV, r.committed.ResourceVersion) {
+			r.committed.ResourceVersion = r.pendingRV
+		}
 		r.pendingRV = ""
 	}
 	if newest.when.After(r.committed.Watermark) {

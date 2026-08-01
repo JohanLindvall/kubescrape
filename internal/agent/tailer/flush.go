@@ -203,7 +203,14 @@ func (t *Tailer) buildRecord(b *recordBuilder, e entry) {
 		lr = b.g.scope(e.file, extracted.Resource, extracted.Scope).LogRecords().AppendEmpty()
 		b.kept++
 	}
-	lr.SetTimestamp(pcommon.NewTimestampFromTime(e.time))
+	if !e.time.IsZero() {
+		// A zero time means the line carried none (a non-CRI line reaching the
+		// containerd path). Stamping it produces an absurd absolute timestamp
+		// rather than "unknown", which a backend either misfiles or rejects;
+		// leaving it unset is exactly what OTLP defines for the case, and
+		// ObservedTimestamp still carries when we read it.
+		lr.SetTimestamp(pcommon.NewTimestampFromTime(e.time))
+	}
 	lr.SetObservedTimestamp(b.now)
 	lr.Body().SetStr(e.body)
 	if e.stream != "" {

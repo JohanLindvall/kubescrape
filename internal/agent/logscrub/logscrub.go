@@ -212,6 +212,17 @@ var builtins = map[string]pattern{
 			return pfKey(s) || pfSecret(s) || pfPassw(s) || pfPwd(s) || pfToken(s)
 		},
 	},
+	"url-userinfo": {
+		name: "url-userinfo",
+		// scheme://user:PASSWORD@host — the credential is the password half.
+		// Connection strings reach logs through dial-failure messages and
+		// config dumps, where no key=value shape exists for secret-kv to match.
+		re:   regexp.MustCompile(`([a-zA-Z][a-zA-Z0-9+.-]*://[^\s:/@]+:)[^\s/@]+(@)`),
+		repl: "${1}" + redacted + "${2}",
+		prefilter: func(s string) bool {
+			return strings.Contains(s, "://")
+		},
+	},
 	"aws-key": {
 		name:      "aws-key",
 		re:        regexp.MustCompile(`\b(?:AKIA|ASIA)[0-9A-Z]{16}\b`),
@@ -247,7 +258,7 @@ var builtins = map[string]pattern{
 }
 
 // defaultSet is the low-false-positive selection "defaults" expands to.
-var defaultSet = []string{"bearer", "basic-auth", "secret-kv", "aws-key", "private-key"}
+var defaultSet = []string{"bearer", "basic-auth", "secret-kv", "aws-key", "private-key", "url-userinfo"}
 
 // Scrubber applies the configured redactions.
 type Scrubber struct {

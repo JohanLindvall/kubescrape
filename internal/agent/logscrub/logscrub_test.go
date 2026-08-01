@@ -98,3 +98,28 @@ func TestScrubMixedCaseKeywords(t *testing.T) {
 		}
 	}
 }
+
+// A connection string's password is a credential with no key=value shape for
+// secret-kv to match, and it reaches logs through dial-failure messages and
+// config dumps.
+func TestURLUserinfoRedacted(t *testing.T) {
+	s := mustNew(t, Config{Builtin: []string{"defaults"}})
+	for _, tc := range []struct{ in, wantNot string }{
+		{`dial failed: postgres://svc:s3cr3t@db-1:5432/app`, "s3cr3t"},
+		{`DATABASE_URL=mysql://root:hunter2@10.0.0.5/db`, "hunter2"},
+		{`amqp://guest:guest@rabbit:5672/`, "guest:guest@"},
+	} {
+		got := s.Scrub(tc.in)
+		if strings.Contains(got, tc.wantNot) {
+			t.Errorf("credential survived: %q -> %q", tc.in, got)
+		}
+		if !strings.Contains(got, redacted) {
+			t.Errorf("nothing redacted in %q -> %q", tc.in, got)
+		}
+	}
+	// A URL without userinfo must be untouched.
+	plain := "GET https://api.example.com/v1/things?page=2"
+	if got := s.Scrub(plain); got != plain {
+		t.Errorf("over-redacted a plain URL: %q -> %q", plain, got)
+	}
+}

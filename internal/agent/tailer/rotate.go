@@ -234,7 +234,6 @@ func (t *Tailer) feedSegments(ctx context.Context, f *file) {
 	if len(f.segments) == 0 || f.segmentsFed {
 		return
 	}
-	f.segmentsFed = true
 	// Iterate a SNAPSHOT: replaySegment retires the segment it is replaying
 	// when the source is unrecoverable (openSegmentSource's findRotated miss,
 	// or nothing recoverable was fed), and retire compacts f.segments with
@@ -249,6 +248,13 @@ func (t *Tailer) feedSegments(ctx context.Context, f *file) {
 		t.replaySegment(ctx, f, sg)
 	}
 	f.feeding = 0
+	// Marked fed only AFTER the pass. Setting it up front stranded a segment
+	// permanently on any transient failure — a non-ENOENT open error, a Seek
+	// failure, a read error — because nothing would replay it again, which is
+	// the opposite of replaySegment's own "left untouched for a retry": the fd
+	// stayed pinned, settledGone never fired, and the lines were never counted
+	// lost either.
+	f.segmentsFed = true
 }
 
 // openSegmentSource resolves the readable handle for a segment's replay: the

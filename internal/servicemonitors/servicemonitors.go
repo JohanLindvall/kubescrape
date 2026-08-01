@@ -319,6 +319,16 @@ type specLimits struct {
 	JobLabel              string   `json:"jobLabel"`
 	TargetLabels          []string `json:"targetLabels"`
 	PodTargetLabels       []string `json:"podTargetLabels"`
+	// Set but not interpreted, and previously not even PARSED — so they
+	// produced no warning and no MonitorFieldsIgnored bump, breaching the
+	// no-silent-partial-application contract the Ignored machinery exists for.
+	// filterRunning is the sharpest: its default is true and kubescrape's
+	// Scrapeable already excludes finished pods, so `filterRunning: false` asks
+	// for the OPPOSITE of what happens.
+	BodySizeLimit  string          `json:"bodySizeLimit"`
+	FilterRunning  *bool           `json:"filterRunning"`
+	AttachMetadata *map[string]any `json:"attachMetadata"`
+	ScrapeClass    string          `json:"scrapeClass"`
 }
 
 // ignored lists the monitor-level fields that are set but not interpreted.
@@ -338,6 +348,13 @@ func (s specLimits) ignored() []string {
 	add("jobLabel", s.JobLabel != "")
 	add("targetLabels", len(s.TargetLabels) > 0)
 	add("podTargetLabels", len(s.PodTargetLabels) > 0)
+	add("bodySizeLimit", s.BodySizeLimit != "")
+	// Only a FALSE value differs from what kubescrape does: scrape.Scrapeable
+	// already excludes finished and terminating pods, which is filterRunning's
+	// default behaviour.
+	add("filterRunning", s.FilterRunning != nil && !*s.FilterRunning)
+	add("attachMetadata", s.AttachMetadata != nil)
+	add("scrapeClass", s.ScrapeClass != "")
 	return out
 }
 

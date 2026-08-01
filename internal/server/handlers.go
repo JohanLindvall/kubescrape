@@ -79,9 +79,13 @@ func (s *Server) handleContainer(w http.ResponseWriter, r *http.Request) {
 type cachePolicy int
 
 const (
-	// cacheNone sends none: the pod-IP index exists for IMMEDIACY (IPs
-	// recycle; deleted pods drop out at once) and a cached 200 would let
-	// metaclient re-serve the OLD owner of a recycled IP for up to the TTL.
+	// cacheNone sends no freshness lifetime: the pod-IP index exists for
+	// IMMEDIACY (IPs recycle; deleted pods drop out at once) and a cached 200
+	// would let metaclient re-serve the OLD owner of a recycled IP for up to
+	// the TTL. It says so EXPLICITLY (`no-store`) rather than by omission:
+	// a response carrying no freshness information may still be stored and
+	// heuristically freshened by a shared cache (RFC 9111 4.2.2), which is
+	// precisely the staleness this route exists to avoid.
 	cacheNone cachePolicy = iota
 	// cacheShared is the standard metadata caching: max-age + ETag, so repeat
 	// lookups are served locally and revalidate as 304s.
@@ -92,6 +96,27 @@ const (
 	// cache must not, or one caller's identity would be handed to the next.
 	cachePrivate
 )
+
+// noStore is the Cache-Control this policy needs on a response that carries no
+// freshness lifetime — the cacheNone 200s and every 404. 404 is one of the
+// statuses a cache may store and heuristically freshen when nothing says
+// otherwise (RFC 9111 4.2.2 over RFC 9110 15.1), so silence is not the same as
+// "do not store": a cached "no live pod with IP x" outlives the pod that took
+// the recycled address, and a cached /v1/self answer names whoever asked
+// first. cacheShared keeps its historical silence — those 404s are the
+// container/pod/uid/node lookups, whose 200s are cached on purpose and whose
+// misses are cheap to re-ask.
+func (p cachePolicy) noStore() string {
+	switch p {
+	case cacheNone:
+		return "no-store"
+	case cachePrivate:
+		// The answer identifies the CALLER; a shared cache must not hold it
+		// even for the time a heuristic would grant.
+		return "private, no-store"
+	}
+	return ""
+}
 
 // servePod is the shared body of the pod endpoints: readiness gate, lookup,
 // 404, owner/namespace enrichment, then the write its policy calls for.
@@ -104,12 +129,17 @@ func (s *Server) servePod(w http.ResponseWriter, r *http.Request, policy cachePo
 	np, ok := lookup()
 	if !ok {
 		// Errors are never cached: a 404 means "not attributable yet", and
-		// holding onto it would delay the recovery it is waiting for.
+		// holding onto it would delay the recovery it is waiting for. Said
+		// explicitly where a heuristic could store it anyway — see noStore.
+		if cc := policy.noStore(); cc != "" {
+			w.Header().Set("Cache-Control", cc)
+		}
 		writeError(w, http.StatusNotFound, notFound())
 		return
 	}
 	s.enrich(&np.Pod, np.OwnerRefs)
 	if policy == cacheNone {
+		w.Header().Set("Cache-Control", policy.noStore())
 		writeJSON(w, http.StatusOK, np.Pod)
 		return
 	}

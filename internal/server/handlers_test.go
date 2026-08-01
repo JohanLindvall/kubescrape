@@ -204,9 +204,11 @@ func TestWaitBudgetSubSecondMaxWait(t *testing.T) {
 	}
 }
 
-// /v1/pod-ips 200s must carry NO cache headers even with a CacheTTL configured:
-// the IP index exists for immediacy (IPs recycle), and a cached entry would let
-// metaclient re-serve the OLD owner of a recycled IP for up to the TTL. The
+// /v1/pod-ips 200s must carry NO freshness lifetime even with a CacheTTL
+// configured: the IP index exists for immediacy (IPs recycle), and a cached
+// entry would let metaclient re-serve the OLD owner of a recycled IP for up to
+// the TTL. It is spelled `no-store` rather than left blank — silence lets a
+// shared cache store and heuristically freshen the response anyway. The
 // pod-name/uid endpoints keep their cache headers.
 func TestPodByIPUncached(t *testing.T) {
 	st := store.New(time.Minute)
@@ -224,11 +226,52 @@ func TestPodByIPUncached(t *testing.T) {
 		}
 		return resp.Header
 	}
-	if h := get("/v1/pod-ips/10.1.2.3"); h.Get("Cache-Control") != "" || h.Get("ETag") != "" {
-		t.Fatalf("pod-ips carried cache headers: %q / %q", h.Get("Cache-Control"), h.Get("ETag"))
+	if h := get("/v1/pod-ips/10.1.2.3"); h.Get("Cache-Control") != "no-store" || h.Get("ETag") != "" {
+		t.Fatalf("pod-ips cache headers = %q / %q; want no-store and no ETag",
+			h.Get("Cache-Control"), h.Get("ETag"))
 	}
 	if h := get("/v1/pod-uids/pod-uid"); h.Get("Cache-Control") == "" {
 		t.Fatal("pod-uids lost its cache headers")
+	}
+}
+
+// The two routes whose answers must never be stored say so EXPLICITLY, on
+// misses as well as hits. A response with no explicit freshness information is
+// storable and heuristically freshenable by a shared cache (RFC 9111 4.2.2),
+// and 404 is one of the statuses that applies to (RFC 9110 15.1) — so "we sent
+// no Cache-Control" was never the same as "do not store this". What that cost:
+// a cached /v1/pod-ips answer outlives the pod that took the recycled address,
+// and a cached /v1/self answer — the one response that names its CALLER —
+// hands the first asker's identity to the next.
+func TestNoStoreOnCallerAndPodIPRoutes(t *testing.T) {
+	st := store.New(time.Minute)
+	addPod(st) // owns 10.1.2.3; nothing owns the loopback address the test client calls from
+	srv := cachingServer(t, st, 10*time.Second)
+
+	for _, tc := range []struct {
+		path, want string
+		status     int
+	}{
+		{"/v1/pod-ips/10.1.2.3", "no-store", http.StatusOK},
+		{"/v1/pod-ips/10.9.9.9", "no-store", http.StatusNotFound},
+		// The /v1/self 200 stays privately CACHEABLE on purpose (private +
+		// max-age + ETag makes a self-attributes re-read a 304); only its 404,
+		// which carries no lifetime at all, needs the explicit refusal.
+		{"/v1/self", "private, no-store", http.StatusNotFound},
+	} {
+		resp, err := http.Get(srv.URL + tc.path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		cc := resp.Header.Get("Cache-Control")
+		code := resp.StatusCode
+		_ = resp.Body.Close()
+		if code != tc.status {
+			t.Fatalf("%s: status = %d, want %d", tc.path, code, tc.status)
+		}
+		if cc != tc.want {
+			t.Errorf("%s: Cache-Control = %q, want %q", tc.path, cc, tc.want)
+		}
 	}
 }
 

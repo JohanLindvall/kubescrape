@@ -51,6 +51,12 @@ type gaugeFunc struct {
 	// total re-added the whole count every export, inflating a one-time burst
 	// into a permanent per-interval rate.
 	last float64
+	// lastVec is last, per label value, for a LABELED counter func
+	// (CounterFuncVec). The label set is data-driven — a value appears only
+	// once it has something to report — so entries are created on demand and
+	// an absent one means the stream starts at zero, which is exactly the
+	// delta to push.
+	lastVec map[string]float64
 }
 
 // NewRegistry creates an empty registry.
@@ -110,6 +116,23 @@ func (r *Registry) CounterFunc(name, desc string, fn func() float64) {
 // otherwise need one differently-NAMED metric each.
 func (r *Registry) GaugeFuncVec(name, desc, labelName string, fn func() map[string]float64) {
 	s := r.add(name, desc, kindGauge, actionSet, nil)
+	r.mu.Lock()
+	r.funcs = append(r.funcs, &gaugeFunc{s: s, labelName: labelName, fnVec: fn})
+	r.mu.Unlock()
+}
+
+// CounterFuncVec registers a MONOTONIC counter with ONE label whose values are
+// read at export time: fn returns a running total per label value, and each
+// becomes its own cumulative data point.
+//
+// GaugeFuncVec's shape with a counter's semantics. A since-start total carried
+// by a gauge does not mark process restarts, so rate()/increase() over it
+// silently swallow a restart's step down to zero — and a quantity that only
+// ever grows is a counter whatever it is registered as. Each label value keeps
+// its own delta bookkeeping (gaugeFunc.lastVec), for the reason CounterFunc
+// keeps one: the series ACCUMULATES what is observed into it.
+func (r *Registry) CounterFuncVec(name, desc, labelName string, fn func() map[string]float64) {
+	s := r.add(name, desc, kindCounter, actionSet, nil)
 	r.mu.Lock()
 	r.funcs = append(r.funcs, &gaugeFunc{s: s, labelName: labelName, fnVec: fn})
 	r.mu.Unlock()
@@ -264,10 +287,25 @@ func (r *Registry) Export(ctx context.Context, exp Exporter, res pcommon.Resourc
 	for _, gf := range funcs {
 		gf.mu.Lock()
 		if gf.fnVec != nil {
-			// Labeled gauges are always plain gauges (no counter-delta form),
-			// so each label value observes its own current value.
+			counter := gf.s.kind == kindCounter
 			for lv, v := range gf.fnVec() {
-				gf.s.observe(labels{}.set(gf.labelName, lv), v, resKey{}, emptyResource, nil)
+				obsV := v
+				if counter {
+					// Per label value, the same delta bookkeeping CounterFunc
+					// does (see gaugeFunc.last): the series accumulates, so
+					// pushing the running total would re-add it every export.
+					// A value that shrank means the underlying total reset.
+					d := v - gf.lastVec[lv]
+					if d < 0 {
+						d = v
+					}
+					if gf.lastVec == nil {
+						gf.lastVec = map[string]float64{}
+					}
+					gf.lastVec[lv] = v
+					obsV = d
+				}
+				gf.s.observe(labels{}.set(gf.labelName, lv), obsV, resKey{}, emptyResource, nil)
 			}
 			gf.mu.Unlock()
 			continue
@@ -294,7 +332,7 @@ func (r *Registry) Export(ctx context.Context, exp Exporter, res pcommon.Resourc
 	rm := md.ResourceMetrics().AppendEmpty()
 	res.CopyTo(rm.Resource())
 	scope := rm.ScopeMetrics().AppendEmpty()
-	scope.Scope().SetName("github.com/JohanLindvall/kubescrape/internal/obs")
+	setScope(scope, RegistryScopeName)
 	ts := time.Now()
 	for _, s := range series {
 		samples := s.snapshot()

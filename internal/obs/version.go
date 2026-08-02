@@ -58,6 +58,20 @@ func BuildVersion() string {
 	return "unknown"
 }
 
+// ScopeVersion is BuildVersion() resolved once, for stamping on the
+// instrumentation scope of exported payloads (Scope().SetVersion). Every
+// producer already NAMES its scope; none of them versioned it, though the
+// version was sitting right here and is already stamped as service.version.
+//
+// A var rather than a call per site because the scope is named where a
+// ScopeLogs/ScopeMetrics is CREATED, and the split and cadvisor batchers create
+// one per described object — thousands per scrape on a KSM target.
+//
+// Wire-visible, and worth knowing before an upgrade: a translation that emits
+// scope labels (otel_scope_name / otel_scope_version) will split every stream
+// at each release boundary, because that is what a version label is for.
+var ScopeVersion = BuildVersion()
+
 // BuildTime reports the VCS commit time, empty when unavailable.
 func BuildTime() string {
 	readBuildInfo()

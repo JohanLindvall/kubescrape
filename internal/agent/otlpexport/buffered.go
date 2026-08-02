@@ -238,6 +238,7 @@ func NewBuffered(inner Exporter, logBuf, metricBuf, traceBuf *Buffer, backoff ti
 			buf: logBuf, backoff: backoff, log: log, kind: "logs",
 			marshal:   lm.MarshalLogs,
 			unmarshal: lu.UnmarshalLogs,
+			count:     plog.Logs.LogRecordCount,
 			send:      sendLogs,
 		}
 	}
@@ -248,6 +249,7 @@ func NewBuffered(inner Exporter, logBuf, metricBuf, traceBuf *Buffer, backoff ti
 			buf: metricBuf, backoff: backoff, log: log, kind: "metrics",
 			marshal:   mm.MarshalMetrics,
 			unmarshal: mu.UnmarshalMetrics,
+			count:     pmetric.Metrics.DataPointCount,
 			send:      sendMetrics,
 		}
 	}
@@ -258,6 +260,7 @@ func NewBuffered(inner Exporter, logBuf, metricBuf, traceBuf *Buffer, backoff ti
 			buf: traceBuf, backoff: backoff, log: log, kind: "traces",
 			marshal:   tm.MarshalTraces,
 			unmarshal: tu.UnmarshalTraces,
+			count:     ptrace.Traces.SpanCount,
 			// No counted-unwrap twin here (as sendLogs/sendMetrics have):
 			// Client.ExportTraces is ALREADY a single counted attempt — the
 			// pushing sender's retry has always been the trace path's retry —
@@ -396,11 +399,17 @@ type sink[T any] struct {
 	buf       *Buffer
 	marshal   func(T) ([]byte, error)
 	unmarshal func([]byte) (T, error)
-	send      func(context.Context, T) error
-	backoff   time.Duration
-	cur       time.Duration // current backoff, persisted across trySend cycles of a failing head
-	log       *slog.Logger
-	kind      string
+	// count reports how many records a decoded payload carries (log records,
+	// metric data points, spans). A drop here is data loss, and a batch is
+	// 1..1024 records — without this the magnitude of the loss on the durable
+	// configuration, which is the one an operator is told to alert on, was
+	// simply not knowable.
+	count   func(T) int
+	send    func(context.Context, T) error
+	backoff time.Duration
+	cur     time.Duration // current backoff, persisted across trySend cycles of a failing head
+	log     *slog.Logger
+	kind    string
 	// delivered counts batches this sink has successfully exported; stuck
 	// tracks, per stuck payload (keyed by content hash), its accountable failed
 	// cycles and the value of delivered at its own previous failed cycle — the
@@ -466,6 +475,23 @@ func (s *sink[T]) enqueue(v T) error {
 }
 
 // bufOf returns the sink's buffer, nil-safe (a signal can be disabled).
+// records is count(v), defensively tolerating a sink built without one (only
+// the package's own tests can construct such a thing).
+func (s *sink[T]) records(v T) int {
+	if s.count == nil {
+		return 0
+	}
+	return s.count(v)
+}
+
+// countDropped counts one dropped batch and the records it took with it.
+func (s *sink[T]) countDropped(v T) {
+	obs.BufferDroppedBatches.WithLabelValues(s.kind).Inc()
+	if n := s.records(v); n > 0 {
+		obs.BufferDroppedRecords.WithLabelValues(s.kind).Add(float64(n))
+	}
+}
+
 func (s *sink[T]) bufOf() *Buffer {
 	if s == nil {
 		return nil
@@ -534,8 +560,11 @@ func (s *sink[T]) drainLoop(ctx context.Context, untilEmpty bool) {
 		v, err := s.unmarshal(data)
 		if err != nil {
 			// Undecodable payload: the data is gone either way, but the drop
-			// must be counted like every other one.
-			obs.BufferDropped.WithLabelValues(s.kind).Inc()
+			// must be counted like every other one. The RECORD count is the
+			// one thing that cannot be counted here — it lives in the bytes
+			// that failed to decode — so this is the sole drop path that moves
+			// the batch counter alone.
+			obs.BufferDroppedBatches.WithLabelValues(s.kind).Inc()
 			s.log.Warn("dropping corrupt buffered batch", "signal", s.kind, "error", err)
 			s.commit(rd, off)
 			continue
@@ -553,8 +582,9 @@ func (s *sink[T]) drainLoop(ctx context.Context, untilEmpty bool) {
 		case sendRejected:
 			// A definitive rejection (bad payload, auth, unimplemented):
 			// retrying cannot fix it and keeping it would block the queue.
-			s.log.Error("dropping buffered batch permanently rejected by the collector", "signal", s.kind)
-			obs.BufferDropped.WithLabelValues(s.kind).Inc()
+			s.log.Error("dropping buffered batch permanently rejected by the collector",
+				"signal", s.kind, "records", s.records(v))
+			s.countDropped(v)
 			s.forget(data) // a batch that got stuck then turned permanent must not leak its entry
 			s.commit(rd, off)
 		case sendStuck:
@@ -570,8 +600,8 @@ func (s *sink[T]) drainLoop(ctx context.Context, untilEmpty bool) {
 			// Requeue clobbers the reader buffer data aliases.
 			if s.stuckTooLong(data) {
 				s.log.Error("dropping buffered batch the collector never accepted",
-					"signal", s.kind, "cycles", maxDrainCycles, "bytes", len(data))
-				obs.BufferDropped.WithLabelValues(s.kind).Inc()
+					"signal", s.kind, "cycles", maxDrainCycles, "bytes", len(data), "records", s.records(v))
+				s.countDropped(v)
 				s.commit(rd, off)
 				continue
 			}

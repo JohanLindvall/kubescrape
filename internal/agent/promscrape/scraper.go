@@ -687,6 +687,7 @@ func (s *Scraper) exportHealth(ctx context.Context, outcomes []scrapeOutcome) {
 		}
 		sm := rm.ScopeMetrics().AppendEmpty()
 		sm.Scope().SetName(scopeName)
+		sm.Scope().SetVersion(obs.ScopeVersion)
 		gauge := func(name string, v float64) {
 			m := sm.Metrics().AppendEmpty()
 			m.SetName(name)
@@ -840,6 +841,7 @@ func (b *batcher) reset() {
 	b.fillResource(rm.Resource())
 	sm := rm.ScopeMetrics().AppendEmpty()
 	sm.Scope().SetName(scopeName)
+	sm.Scope().SetVersion(obs.ScopeVersion)
 	b.sm = sm
 	if b.byName == nil {
 		b.byName = make(map[string]pmetric.Metric)

@@ -384,10 +384,15 @@ limit): retrying that cannot succeed, and because one goroutine sweeps every
 file on the node, retrying it forever would stop all log shipping there — so
 the batch is dropped and the offsets advance. That is real loss, and it is
 counted in `kubescrape_log_permanent_dropped_total` (plus an `ERROR` log line):
-**alert on any nonzero rate of it.** With `-buffer-dir` the tailer sees the
-enqueue verdict rather than the collector's, so there the same loss surfaces as
-`kubescrape_buffer_dropped_total{signal="logs"}` instead.
-Per-file backlog is visible as `kubescrape_log_lag_bytes` and
+**alert on any nonzero rate of it.** That counter counts RECORDS, so it also
+says how much was lost. With `-buffer-dir` the tailer sees the enqueue verdict
+rather than the collector's, so there the same loss surfaces as
+`kubescrape_buffer_dropped_batches_total{signal="logs"}` — alert on that one —
+with `kubescrape_buffer_dropped_records_total{signal="logs"}` beside it for the
+magnitude (a batch is 1..1024 records; only the batch counter existed before,
+so the size of the loss on the recommended durable path was unknowable).
+Total backlog is visible as `kubescrape_log_lag_bytes`, the largest single
+file's as `kubescrape_log_lag_max_bytes`, and per file
 on `GET /debug/tailer`; a per-file line **rate limit** (`-logs-rate-limit`,
 pause or drop) keeps one runaway pod from consuming the pipeline. Set
 `-logs-exclude-namespaces` to the observability namespace to avoid feeding
@@ -501,8 +506,12 @@ logScrubbing:
 ```
 
 It applies to the tailer, journald and OTLP-ingest log paths alike. Every
-built-in pattern carries a cheap literal prefilter, so the no-match hot path
-costs a few substring scans and zero allocations. Redactions count into
+built-in pattern carries a cheap prefilter, so the no-match hot path costs a
+scan or two and zero allocations. The key-value pattern's prefilter checks the
+whole `keyword[suffix]["]:=` SHAPE rather than the bare keyword: admitting a
+line the regex cannot match costs a full regex pass over the record, which for
+a 1 MiB line was 100 ms of the single goroutine that tails every file on the
+node. Redactions count into
 `kubescrape_log_scrubbed_total{pattern}`; an unknown builtin name or invalid
 regex fails startup (a scrubber that silently skips a pattern is a
 compliance bug).
@@ -884,8 +893,10 @@ node-local, and each in-flight request holds its body plus the inflated pdata on
 the process that also tails the node's logs. Over the bound a sender is refused
 **retryably**, never dropped: HTTP `429` with `Retry-After: 1`, gRPC
 `ResourceExhausted` **with a `RetryInfo` detail** (without it, conformant
-senders read the code as permanent and discard the batch). Refusals count into
-`kubescrape_ingest_rejected_total`.
+senders read the code as permanent and discard the batch). Because a body is
+read (and a gRPC message decoded) *before* a slot is taken, a second fixed bound
+of 64 MiB caps the raw payload bytes both transports may buffer at once, refused
+the same retryable way. Refusals count into `kubescrape_ingest_rejected_total`.
 
 **Trace sampling** (`traceSampling` section, on the trace tier). Received spans
 can be sampled before export: `probability` keeps that fraction of **traces**

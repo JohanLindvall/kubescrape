@@ -399,3 +399,86 @@ func TestRegistryCounterFunc(t *testing.T) {
 		t.Fatalf("post-reset export = %v, want 12 (9 + fresh 3)", got)
 	}
 }
+
+// CounterFuncVec is GaugeFuncVec's shape with a counter's semantics: a running
+// total per label value, rendered as a cumulative monotonic Sum with per-label
+// delta bookkeeping.
+//
+// It exists because kubescrape_log_metrics_dropped_capped_by_metric was a
+// GAUGE carrying a monotonic since-start total (and spelled its label name
+// inside the metric name). A gauge does not mark the reset at a restart, so
+// rate()/increase() over it silently swallowed one — the counter it should
+// always have been could not be registered because this constructor was the
+// one shape the Registry lacked.
+func TestRegistryCounterFuncVec(t *testing.T) {
+	r := NewRegistry()
+	totals := map[string]float64{}
+	r.CounterFuncVec("test_capped_total", "per-metric drops", "metric",
+		func() map[string]float64 { return totals })
+
+	// Data-driven label set: nothing to report yet, nothing exported.
+	exp0 := &capExporter{}
+	if err := r.Export(context.Background(), exp0, pcommon.NewResource()); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := exp0.find("test_capped_total"); ok {
+		t.Fatal("exported a point before any label value had a value")
+	}
+
+	// Sum over the label, per label value: the LAST point of each stream is
+	// the live cumulative value (a fresh counter backfills two zeros first).
+	live := func(e *capExporter, label string) (float64, bool) {
+		m, ok := e.find("test_capped_total")
+		if !ok {
+			return 0, false
+		}
+		if m.Type() != pmetric.MetricTypeSum || !m.Sum().IsMonotonic() {
+			t.Fatalf("rendered as %v (monotonic=%v), want monotonic Sum", m.Type(), m.Sum().IsMonotonic())
+		}
+		var v float64
+		found := false
+		dps := m.Sum().DataPoints()
+		for i := 0; i < dps.Len(); i++ {
+			dp := dps.At(i)
+			lv, ok := dp.Attributes().Get("metric")
+			if !ok || lv.Str() != label {
+				continue
+			}
+			v, found = dp.DoubleValue(), true
+		}
+		return v, found
+	}
+
+	totals["requests"] = 4
+	exp1 := &capExporter{}
+	if err := r.Export(context.Background(), exp1, pcommon.NewResource()); err != nil {
+		t.Fatal(err)
+	}
+	if v, ok := live(exp1, "requests"); !ok || v != 4 {
+		t.Fatalf("requests = %v (found %v), want 4", v, ok)
+	}
+
+	// The fn returns a CUMULATIVE total per label; an unchanged one must not
+	// re-add into the accumulating series.
+	exp2 := &capExporter{}
+	if err := r.Export(context.Background(), exp2, pcommon.NewResource()); err != nil {
+		t.Fatal(err)
+	}
+	if v, ok := live(exp2, "requests"); !ok || v != 4 {
+		t.Fatalf("unchanged total re-added: %v, want 4", v)
+	}
+
+	// A second label value keeps its OWN delta state.
+	totals["requests"] = 6
+	totals["latency"] = 10
+	exp3 := &capExporter{}
+	if err := r.Export(context.Background(), exp3, pcommon.NewResource()); err != nil {
+		t.Fatal(err)
+	}
+	if v, _ := live(exp3, "requests"); v != 6 {
+		t.Fatalf("requests = %v, want 6", v)
+	}
+	if v, _ := live(exp3, "latency"); v != 10 {
+		t.Fatalf("latency = %v, want 10 — per-label delta state leaked between label values", v)
+	}
+}

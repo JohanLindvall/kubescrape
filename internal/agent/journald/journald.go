@@ -397,7 +397,12 @@ func (r *Reader) flush(ctx context.Context) error {
 	if err := r.cfg.Exporter.ExportLogs(ctx, ld); err != nil {
 		if otlpexport.IsPermanent(err) {
 			obs.JournalDropped.Inc()
-			r.log.Warn("journal batch permanently rejected, skipping past it", "entries", len(r.batch), "error", err)
+			// The records, not just the batch: a batch is up to BatchSize
+			// entries, so the batch counter alone cannot say how much was lost.
+			// Delivered records are counted the same way below.
+			obs.JournalDroppedRecords.Add(float64(ld.LogRecordCount()))
+			r.log.Warn("journal batch permanently rejected, skipping past it",
+				"entries", len(r.batch), "records", ld.LogRecordCount(), "error", err)
 			r.settleBatch()
 			return nil
 		}
@@ -499,6 +504,7 @@ func (r *Reader) convert() plog.Logs {
 			// Every other log producer names its scope (tailer, events); the
 			// journal's records shipped with an empty otel_scope_name.
 			sl.Scope().SetName("github.com/JohanLindvall/kubescrape/agent/journald")
+			sl.Scope().SetVersion(obs.ScopeVersion)
 			logattrs.Put(sl.Scope().Attributes(), extracted.Scope)
 			ent = scopeEntry{sl: sl, res: res.Attributes()}
 			scopes[key] = ent
@@ -570,15 +576,32 @@ type scopeEntry struct {
 	res pcommon.Map
 }
 
-// severity maps a syslog priority (0-7) to OTLP severity.
+// severity maps a syslog priority (0-7) to OTLP severity, following the
+// mapping in the OpenTelemetry logs data model.
+//
+// The top three syslog severities are FATAL, not ERROR: emergency is FATAL3
+// (23), alert FATAL2 (22), critical FATAL (21). This used to map them onto
+// FATAL/ERROR3/ERROR2 — one grade too low across the board, and contradicted
+// one line away by the enrich package's own syslogSeverity table, which
+// logenrich.Apply then OVERWROTE the number with whenever it managed to parse
+// the message. The same journal entry therefore reported a different severity
+// depending on whether its body happened to look like a log line to a parser,
+// which is the one thing a severity must not depend on.
+//
+// The text stays the source's own syslog word (the data model asks SeverityText
+// to carry the original), lowercase — which is now the casing every producer in
+// the repo uses, and the casing enrich writes when it overwrites. The grading
+// the six canonical level names flatten away survives in the NUMBER: emerg,
+// alert and crit are all "fatal" to enrich but 23/22/21 here, and notice is
+// INFO2 rather than INFO.
 func severity(priority string) (plog.SeverityNumber, string) {
 	switch priority {
 	case "0":
-		return plog.SeverityNumberFatal, "emerg"
+		return plog.SeverityNumberFatal3, "emerg"
 	case "1":
-		return plog.SeverityNumberError3, "alert"
+		return plog.SeverityNumberFatal2, "alert"
 	case "2":
-		return plog.SeverityNumberError2, "crit"
+		return plog.SeverityNumberFatal, "crit"
 	case "3":
 		return plog.SeverityNumberError, "err"
 	case "4":

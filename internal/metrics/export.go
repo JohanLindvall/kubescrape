@@ -2,6 +2,7 @@ package metrics
 
 import (
 	"context"
+	"sync/atomic"
 	"time"
 
 	"go.opentelemetry.io/collector/pdata/pcommon"
@@ -14,6 +15,37 @@ type Exporter interface {
 }
 
 var metricsMarshaler pmetric.ProtoMarshaler
+
+// ScopeName is the instrumentation scope of log-derived metrics. Every other
+// producer in the repo names its scope; this one shipped an empty one, so its
+// series were the only ones a consumer could not attribute to the code that
+// made them.
+const ScopeName = "github.com/JohanLindvall/kubescrape/internal/metrics"
+
+// RegistryScopeName is the instrumentation scope of the self-metrics Registry
+// (the metrics internal/obs registers).
+const RegistryScopeName = "github.com/JohanLindvall/kubescrape/internal/obs"
+
+// scopeVersion is the build version stamped on every scope this package emits.
+// internal/obs owns BuildVersion but IMPORTS this package, so it pushes the
+// value down at init rather than being imported back — that would be a cycle.
+// Empty (a test binary, or any importer that is not a kubescrape binary) means
+// no version is set at all, which is what an unknown version must look like on
+// the wire.
+var scopeVersion atomic.Pointer[string]
+
+// SetScopeVersion records the build version to stamp on exported scopes. Called
+// once, from obs's init.
+func SetScopeVersion(v string) { scopeVersion.Store(&v) }
+
+// setScope names and versions one ScopeMetrics.
+func setScope(sm pmetric.ScopeMetrics, name string) {
+	sc := sm.Scope()
+	sc.SetName(name)
+	if v := scopeVersion.Load(); v != nil && *v != "" {
+		sc.SetVersion(*v)
+	}
+}
 
 // Run exports the set's metrics to exp every interval until ctx is done. The
 // caller should Export once more after every producer has stopped (the
@@ -80,6 +112,7 @@ func (s *DynamicMetricSet) Export(ctx context.Context, exp Exporter, maxBytes in
 		rm := scratch.ResourceMetrics().AppendEmpty()
 		putLabels(rm.Resource().Attributes(), resStr)
 		scope := rm.ScopeMetrics().AppendEmpty()
+		setScope(scope, ScopeName)
 		for _, ss := range byResource[resStr] {
 			renderSeries(scope, ss.series, ss.samples, ts)
 		}
@@ -141,26 +174,49 @@ func renderSeries(scope pmetric.ScopeMetrics, s *series, samples []sample, ts ti
 	}
 }
 
+// startOf renders a sample's start-of-accumulation stamp (sample.start, epoch
+// seconds) as an OTLP timestamp. A sample that somehow never went through
+// admit falls back to ts, which is the old always-a-reset behaviour — wrong,
+// but never AHEAD of the point's own timestamp, which some backends reject
+// outright.
+func startOf(s sample, ts time.Time) pcommon.Timestamp {
+	if s.start <= 0 {
+		return pcommon.Timestamp(ts.UnixNano())
+	}
+	return pcommon.Timestamp(time.Unix(s.start, 0).UnixNano())
+}
+
 // renderNumber writes gauge or counter samples as number data points. Counters
 // additionally emit two synthetic zero points before a series' first real
 // point so downstream rate() has a baseline (one minute is too short given
 // timestamp normalization — Mimir takes the max value for a counter).
+//
+// A correct StartTimeUnixNano does NOT replace those zeros. It is advisory
+// metadata that the Prometheus-lineage backends this ships into discard unless
+// created-timestamp injection is explicitly enabled, and rate()/increase()
+// need two real SAMPLES either way — a start timestamp cannot be the second
+// one. What it does fix is the zeros themselves: they used to stamp their own
+// timestamp as their start, i.e. announce a reset one and two minutes back, so
+// the whole baseline they exist to provide was the thing a delta consumer
+// threw away. All three points now carry the stream's single start, which
+// counterBaselineSeconds keeps strictly below the earliest of them.
 func renderNumber(dps pmetric.NumberDataPointSlice, samples []sample, ts time.Time, counter bool) {
 	now := pcommon.Timestamp(ts.UnixNano())
 	for _, s := range samples {
+		start := startOf(s, ts)
 		if counter && s.initial {
 			for back := 2; back >= 1; back-- {
 				prev := pcommon.Timestamp(ts.Add(time.Duration(-back) * time.Minute).UnixNano())
 				zero := dps.AppendEmpty()
 				zero.SetDoubleValue(0)
-				zero.SetStartTimestamp(prev)
+				zero.SetStartTimestamp(start)
 				zero.SetTimestamp(prev)
 				putLabels(zero.Attributes(), s.labels)
 			}
 		}
 		dp := dps.AppendEmpty()
 		dp.SetDoubleValue(s.value)
-		dp.SetStartTimestamp(now)
+		dp.SetStartTimestamp(start)
 		dp.SetTimestamp(now)
 		putLabels(dp.Attributes(), s.labels)
 	}
@@ -173,7 +229,7 @@ func renderSummary(m pmetric.Metric, samples []sample, ts time.Time) {
 	dps := m.SetEmptySummary().DataPoints()
 	for _, s := range samples {
 		dp := dps.AppendEmpty()
-		dp.SetStartTimestamp(now)
+		dp.SetStartTimestamp(startOf(s, ts))
 		dp.SetTimestamp(now)
 		dp.SetCount(s.count)
 		dp.SetSum(s.value)
@@ -205,7 +261,10 @@ func renderHistogram(m pmetric.Metric, s *series, samples []sample, ts time.Time
 		dp, ok := points[key]
 		if !ok {
 			dp = hist.DataPoints().AppendEmpty()
-			dp.SetStartTimestamp(now)
+			// Every bucket stream of one label set is admitted together
+			// (observe's admission is all-or-nothing), so whichever arrives
+			// first here carries the point's start.
+			dp.SetStartTimestamp(startOf(sample, ts))
 			dp.SetTimestamp(now)
 			putLabels(dp.Attributes(), key)
 			dp.ExplicitBounds().FromRaw(bounds)

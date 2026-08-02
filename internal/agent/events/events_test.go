@@ -17,8 +17,10 @@ import (
 
 	"go.opentelemetry.io/collector/pdata/plog"
 
+	"github.com/JohanLindvall/kubescrape/internal/agent/otlpexport"
 	"github.com/JohanLindvall/kubescrape/internal/leader"
 	"github.com/JohanLindvall/kubescrape/internal/logline"
+	"github.com/JohanLindvall/kubescrape/internal/obs"
 	"github.com/JohanLindvall/kubescrape/pkg/kubemeta"
 )
 
@@ -733,5 +735,48 @@ func TestReplayFilterIsFrozenAtStreamStart(t *testing.T) {
 	// The frozen boundary still filters what really was exported before.
 	if r.wanted(event("done", "R", "m", "Normal", "8", 1, base.Add(-2*time.Hour))) {
 		t.Fatal("an event exported before this replay began was re-emitted")
+	}
+}
+
+// Severity TEXT casing is a cross-producer contract, not a local style choice:
+// convert runs logenrich.Apply with overwrite semantics over every record, and
+// enrich writes its six level names in lowercase. Uppercase here meant one
+// event shipped "WARN" and the next shipped "warn" purely because the second
+// message happened to parse. journald and azurediag carry the same assertion.
+func TestSeverityTextIsLowercase(t *testing.T) {
+	for _, typ := range []string{"Warning", "Normal", "", "Something"} {
+		_, text := severityOf(typ)
+		if text == "" || text != strings.ToLower(text) {
+			t.Errorf("severityOf(%q) text = %q, want a lowercase level name", typ, text)
+		}
+	}
+}
+
+// A permanently rejected batch is skipped past — real, deliberate loss. Count
+// the RECORDS, not just the batch: an events batch is up to BatchSize entries,
+// so the batch counter answers whether a loss happened and never how big it
+// was.
+func TestPermanentRejectionCountsRecords(t *testing.T) {
+	exp := &captureExporter{failN: 1, err: &otlpexport.HTTPStatusError{Code: 400, Body: "bad payload"}}
+	r, _, _ := newReader(t, Config{Exporter: exp, BatchSize: 1000})
+	ctx := context.Background()
+	now := time.Now()
+	for _, rv := range []string{"1", "2", "3", "4"} {
+		if err := r.handle(ctx, watch.Event{Type: watch.Added,
+			Object: event("e"+rv, "R", "m", "Normal", rv, 1, now)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	beforeBatches := obs.EventsDropped.Value()
+	beforeRecords := obs.EventsDroppedRecords.Value()
+	if err := r.flush(ctx); err != nil {
+		t.Fatalf("a permanent rejection must be skipped past, not returned: %v", err)
+	}
+	if got := obs.EventsDropped.Value() - beforeBatches; got != 1 {
+		t.Fatalf("dropped batches = %v, want 1", got)
+	}
+	if got := obs.EventsDroppedRecords.Value() - beforeRecords; got != 4 {
+		t.Fatalf("dropped records = %v, want 4 — the batch counter alone cannot size the loss", got)
 	}
 }

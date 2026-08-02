@@ -107,7 +107,7 @@ func TestPoisonBatchIsDroppedOnceCollectorTakesOthers(t *testing.T) {
 	if err := b.ExportMetrics(context.Background(), metricsWith("huge")); err != nil {
 		t.Fatal(err)
 	}
-	before := obs.BufferDropped.WithLabelValues("metrics").Value()
+	before := obs.BufferDroppedBatches.WithLabelValues("metrics").Value()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -133,7 +133,7 @@ func TestPoisonBatchIsDroppedOnceCollectorTakesOthers(t *testing.T) {
 	}()
 
 	waitFor(t, func() bool {
-		return obs.BufferDropped.WithLabelValues("metrics").Value()-before == 1
+		return obs.BufferDroppedBatches.WithLabelValues("metrics").Value()-before == 1
 	}, "poison batch dropped and counted")
 	if got := send.delivered(); got < 3 {
 		t.Errorf("delivered %d good batches, want the collector to have kept accepting them", got)
@@ -164,7 +164,7 @@ func TestOutageNeverDropsBufferedData(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	before := obs.BufferDropped.WithLabelValues("metrics").Value()
+	before := obs.BufferDroppedBatches.WithLabelValues("metrics").Value()
 	queued := ms.Bytes()
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -181,7 +181,7 @@ func TestOutageNeverDropsBufferedData(t *testing.T) {
 	if got := send.attempts.Load(); got < past {
 		t.Fatalf("only %d attempts; test did not exercise the retry loop past the budget (%d)", got, past)
 	}
-	if got := obs.BufferDropped.WithLabelValues("metrics").Value() - before; got != 0 {
+	if got := obs.BufferDroppedBatches.WithLabelValues("metrics").Value() - before; got != 0 {
 		t.Errorf("dropped %v batches during an outage; buffered data must never be given up on "+
 			"while the collector is accepting nothing", got)
 	}

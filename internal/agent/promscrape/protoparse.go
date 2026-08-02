@@ -21,6 +21,8 @@ import (
 
 	dto "github.com/prometheus/client_model/go"
 	"google.golang.org/protobuf/proto"
+
+	"github.com/JohanLindvall/kubescrape/internal/obs"
 )
 
 // acceptProto is the Accept header offering protobuf exposition first.
@@ -72,11 +74,28 @@ func (s *Scraper) parseProtoAndExport(ctx context.Context, body io.Reader, cb ch
 			}
 		}
 	}()
+	// Counted in locals and reported once, for the reason the text path does
+	// it (see parseAndExportFiltered): keep runs per sample. The deferred
+	// report covers the abort paths too.
+	var droppedFilter, droppedRelabel int
+	defer func() {
+		if droppedFilter > 0 {
+			obs.ScrapeSamplesDropped.WithLabelValues(pipeline, "filter").Add(float64(droppedFilter))
+		}
+		if droppedRelabel > 0 {
+			obs.ScrapeSamplesDropped.WithLabelValues(pipeline, "relabel").Add(float64(droppedRelabel))
+		}
+	}()
 	keep := func(name string, labels []Label) bool {
 		if !filter.Keep(name, labels) {
+			droppedFilter++
 			return false
 		}
-		return relabel == nil || relabel.Keep(name, labels)
+		if relabel != nil && !relabel.Keep(name, labels) {
+			droppedRelabel++
+			return false
+		}
+		return true
 	}
 	emit := func(sample Sample) error {
 		samples++

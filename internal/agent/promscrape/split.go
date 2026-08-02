@@ -385,6 +385,7 @@ func (b *splitBatcher) route(name string, labels []Label) (pmetric.ScopeMetrics,
 		}
 		sm = rm.ScopeMetrics().AppendEmpty()
 		sm.Scope().SetName(scopeName)
+		sm.Scope().SetVersion(obs.ScopeVersion)
 		b.scopes[ks] = sm
 		// One resource per described object: its attributes are a real part of
 		// the encoded batch, not rounding error (see convert.go).

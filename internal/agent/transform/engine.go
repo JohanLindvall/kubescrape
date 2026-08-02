@@ -77,7 +77,7 @@ func (p *starlarkProgram) runLogs(ld plog.Logs) error {
 	if err := p.run(&logBatch{ld: ld}); err != nil {
 		return err
 	}
-	pruneLogs(ld)
+	p.countDropped(pruneLogs(ld))
 	return nil
 }
 
@@ -85,7 +85,7 @@ func (p *starlarkProgram) runMetrics(md pmetric.Metrics) error {
 	if err := p.run(&metricBatch{md: md}); err != nil {
 		return err
 	}
-	pruneMetrics(md)
+	p.countDropped(pruneMetrics(md))
 	return nil
 }
 
@@ -93,12 +93,28 @@ func (p *starlarkProgram) runTraces(td ptrace.Traces) error {
 	if err := p.run(&traceBatch{td: td}); err != nil {
 		return err
 	}
-	pruneTraces(td)
+	p.countDropped(pruneTraces(td))
 	return nil
 }
 
-// prune* remove records marked dropped and any groups left empty.
-func pruneLogs(ld plog.Logs) {
+// countDropped records what this invocation's drop() calls discarded.
+//
+// A transform drop is INTENDED loss, which is exactly why it has to be
+// counted: the intent lives in an operator-edited file that HOT-RELOADS, so
+// nothing about the deploy marks the moment a predicate started matching
+// everything. Until now the prune below was silent — a node's logs could go
+// with no error logged and no counter moved (see hostobj.go), leaving the
+// export path indistinguishable from an idle one.
+func (p *starlarkProgram) countDropped(n int) {
+	if n > 0 {
+		obs.TransformDropped.WithLabelValues(p.signal).Add(float64(n))
+	}
+}
+
+// prune* remove records marked dropped and any groups left empty, returning
+// how many records/points/spans went.
+func pruneLogs(ld plog.Logs) int {
+	dropped := 0
 	rls := ld.ResourceLogs()
 	rls.RemoveIf(func(rl plog.ResourceLogs) bool {
 		sls := rl.ScopeLogs()
@@ -107,6 +123,7 @@ func pruneLogs(ld plog.Logs) {
 				_, drop := lr.Attributes().Get(dropMarker)
 				if drop {
 					lr.Attributes().Remove(dropMarker)
+					dropped++
 				}
 				return drop
 			})
@@ -114,64 +131,94 @@ func pruneLogs(ld plog.Logs) {
 		})
 		return sls.Len() == 0
 	})
+	return dropped
 }
 
-func pruneMetrics(md pmetric.Metrics) {
+func pruneMetrics(md pmetric.Metrics) int {
+	dropped := 0
 	rms := md.ResourceMetrics()
 	rms.RemoveIf(func(rm pmetric.ResourceMetrics) bool {
 		sms := rm.ScopeMetrics()
 		sms.RemoveIf(func(sm pmetric.ScopeMetrics) bool {
 			sm.Metrics().RemoveIf(func(m pmetric.Metric) bool {
 				if _, drop := m.Metadata().Get(dropMarker); drop {
+					// A whole metric costs every point it carried: the unit
+					// this counter reports is data points, so that a metrics
+					// drop is comparable with a logs one.
+					dropped += dataPointCount(m)
 					return true
 				}
 				// Points dropped individually. A metric emptied by them goes
 				// too: a point-less metric carries no data and would ship as
 				// pure descriptor overhead.
-				return pruneDataPoints(m)
+				n, empty := pruneDataPoints(m)
+				dropped += n
+				return empty
 			})
 			return sm.Metrics().Len() == 0
 		})
 		return sms.Len() == 0
 	})
+	return dropped
 }
 
-// pruneDataPoints removes points a script called drop() on and reports whether
-// the metric is left empty. The marker lives in the point's own attributes (as
-// for logs and spans); only dropped points ever carry it, and they are removed
-// here, so no survivor can ship it. A metric where only SOME points were
-// dropped keeps the rest.
-func pruneDataPoints(m pmetric.Metric) bool {
+// dataPointCount is one metric's point count across every kind.
+func dataPointCount(m pmetric.Metric) int {
+	switch m.Type() {
+	case pmetric.MetricTypeGauge:
+		return m.Gauge().DataPoints().Len()
+	case pmetric.MetricTypeSum:
+		return m.Sum().DataPoints().Len()
+	case pmetric.MetricTypeHistogram:
+		return m.Histogram().DataPoints().Len()
+	case pmetric.MetricTypeExponentialHistogram:
+		return m.ExponentialHistogram().DataPoints().Len()
+	case pmetric.MetricTypeSummary:
+		return m.Summary().DataPoints().Len()
+	}
+	return 0
+}
+
+// pruneDataPoints removes points a script called drop() on and reports how
+// many went and whether the metric is left empty. The marker lives in the
+// point's own attributes (as for logs and spans); only dropped points ever
+// carry it, and they are removed here, so no survivor can ship it. A metric
+// where only SOME points were dropped keeps the rest.
+func pruneDataPoints(m pmetric.Metric) (dropped int, empty bool) {
 	drop := func(attrs pcommon.Map) bool {
-		_, ok := attrs.Get(dropMarker)
-		return ok
+		if _, ok := attrs.Get(dropMarker); ok {
+			dropped++
+			return true
+		}
+		return false
 	}
 	switch m.Type() {
 	case pmetric.MetricTypeGauge:
 		pts := m.Gauge().DataPoints()
 		pts.RemoveIf(func(p pmetric.NumberDataPoint) bool { return drop(p.Attributes()) })
-		return pts.Len() == 0
+		return dropped, pts.Len() == 0
 	case pmetric.MetricTypeSum:
 		pts := m.Sum().DataPoints()
 		pts.RemoveIf(func(p pmetric.NumberDataPoint) bool { return drop(p.Attributes()) })
-		return pts.Len() == 0
+		return dropped, pts.Len() == 0
 	case pmetric.MetricTypeHistogram:
 		pts := m.Histogram().DataPoints()
 		pts.RemoveIf(func(p pmetric.HistogramDataPoint) bool { return drop(p.Attributes()) })
-		return pts.Len() == 0
+		return dropped, pts.Len() == 0
 	case pmetric.MetricTypeExponentialHistogram:
 		pts := m.ExponentialHistogram().DataPoints()
 		pts.RemoveIf(func(p pmetric.ExponentialHistogramDataPoint) bool { return drop(p.Attributes()) })
-		return pts.Len() == 0
+		return dropped, pts.Len() == 0
 	case pmetric.MetricTypeSummary:
 		pts := m.Summary().DataPoints()
 		pts.RemoveIf(func(p pmetric.SummaryDataPoint) bool { return drop(p.Attributes()) })
-		return pts.Len() == 0
+		return dropped, pts.Len() == 0
 	}
-	return false
+	return 0, false
 }
 
-func pruneTraces(td ptrace.Traces) {
+func pruneTraces(td ptrace.Traces) int {
+	dropped := 0
 	rss := td.ResourceSpans()
 	rss.RemoveIf(func(rs ptrace.ResourceSpans) bool {
 		sss := rs.ScopeSpans()
@@ -180,6 +227,7 @@ func pruneTraces(td ptrace.Traces) {
 				_, drop := sp.Attributes().Get(dropMarker)
 				if drop {
 					sp.Attributes().Remove(dropMarker)
+					dropped++
 				}
 				return drop
 			})
@@ -187,4 +235,5 @@ func pruneTraces(td ptrace.Traces) {
 		})
 		return sss.Len() == 0
 	})
+	return dropped
 }

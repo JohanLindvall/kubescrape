@@ -505,7 +505,11 @@ func (r *Reader) flush(ctx context.Context) error {
 				// Skipping past a poison batch, as journald does: re-reading it
 				// forever would wedge the reader on one bad payload.
 				obs.EventsDropped.Inc()
-				r.log.Warn("event batch permanently rejected, skipping past it", "events", len(r.batch), "error", err)
+				// And the records, so the loss has a magnitude and not just an
+				// occurrence — the rules may have dropped some of the batch,
+				// so this is the exported count, matching EventsExported.
+				obs.EventsDroppedRecords.Add(float64(count))
+				r.log.Warn("event batch permanently rejected, skipping past it", "events", len(r.batch), "records", count, "error", err)
 			} else {
 				obs.LogExportFailures.Inc()
 				return fmt.Errorf("exporting events: %w", err)
@@ -600,9 +604,17 @@ var osHostname = func() (string, error) {
 }
 
 // severityOf maps the event type onto OTLP severity.
+//
+// Lowercase, like every other producer in this repo: it is what the enrich
+// package writes (its level constants are "info"/"warn"/...), and
+// logenrich.Apply OVERWRITES the severity here whenever it parses a level out
+// of the message — so any other casing was contradicted one line later, on a
+// subset of records that depends on their content. logchain.LowerSeverity
+// lowercases before the rules see it, so the config surface reads lowercase
+// too.
 func severityOf(eventType string) (plog.SeverityNumber, string) {
 	if strings.EqualFold(eventType, string(corev1.EventTypeWarning)) {
-		return plog.SeverityNumberWarn, "WARN"
+		return plog.SeverityNumberWarn, "warn"
 	}
-	return plog.SeverityNumberInfo, "INFO"
+	return plog.SeverityNumberInfo, "info"
 }

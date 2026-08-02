@@ -13,6 +13,7 @@ import (
 
 	"github.com/JohanLindvall/kubescrape/internal/agent/otlpexport"
 	"github.com/JohanLindvall/kubescrape/internal/logline"
+	"github.com/JohanLindvall/kubescrape/internal/obs"
 )
 
 // captureExporter records exported payloads; failN fails the first N sends
@@ -440,5 +441,52 @@ func TestNamespaceFromConnectionString(t *testing.T) {
 	}
 	if got := namespaceFromConnectionString("SharedAccessKey=abc"); got != "" {
 		t.Fatalf("namespace = %q, want empty", got)
+	}
+}
+
+// Severity TEXT casing is a cross-producer contract, not a local style
+// choice: convert runs logenrich.Apply with overwrite semantics over every
+// record, and enrich writes its six level names in lowercase. Uppercase here
+// meant one Azure record shipped "ERROR" and the next shipped "error" purely
+// because the second body happened to parse — a difference a consumer sees as
+// two distinct severity values on one stream. journald and the events reader
+// carry the same assertion.
+func TestSeverityTextIsLowercase(t *testing.T) {
+	for _, level := range []string{"Informational", "Warning", "Error", "Critical", "Verbose", "Fatal", "Warn", "Debug", "", "4"} {
+		_, text := severityOf(level)
+		if text == "" || text != strings.ToLower(text) {
+			t.Errorf("severityOf(%q) text = %q, want a lowercase level name", level, text)
+		}
+	}
+}
+
+// AzureRecords is dimensioned signal/plural like AzureExported and like every
+// other producer's counter; it used to spell the same dimension "kind" with
+// singular values, so the decoded and exported counts of one pipeline shared
+// no label to join on.
+func TestRecordsCounterUsesSignalLabel(t *testing.T) {
+	beforeLogs := obs.AzureRecords.WithLabelValues("logs").Value()
+	beforeMetrics := obs.AzureRecords.WithLabelValues("metrics").Value()
+
+	r := newTestReader(Config{Exporter: &captureExporter{}}, newFakeSource(nil))
+	recs := r.decode([][]byte{
+		[]byte(`{"records":[{"time":"2026-01-01T00:00:00Z","resourceId":"/SUBSCRIPTIONS/S/RESOURCEGROUPS/RG/PROVIDERS/P/T/N","category":"c"}]}`),
+		[]byte(`{"records":[{"time":"2026-01-01T00:00:00Z","resourceId":"/SUBSCRIPTIONS/S/RESOURCEGROUPS/RG/PROVIDERS/P/T/N","metricName":"m","total":1}]}`),
+	})
+	if len(recs) != 2 {
+		t.Fatalf("decoded %d records, want 2", len(recs))
+	}
+	if got := obs.AzureRecords.WithLabelValues("logs").Value() - beforeLogs; got != 1 {
+		t.Errorf("signal=\"logs\" = %v, want 1", got)
+	}
+	if got := obs.AzureRecords.WithLabelValues("metrics").Value() - beforeMetrics; got != 1 {
+		t.Errorf("signal=\"metrics\" = %v, want 1", got)
+	}
+	// The old singular values must be gone, not merely joined by new ones.
+	if got := obs.AzureRecords.WithLabelValues("log").Value(); got != 0 {
+		t.Errorf("the singular kind value \"log\" is still being emitted: %v", got)
+	}
+	if got := obs.AzureRecords.WithLabelValues("metric").Value(); got != 0 {
+		t.Errorf("the singular kind value \"metric\" is still being emitted: %v", got)
 	}
 }

@@ -83,14 +83,14 @@ func TestStuckEntryForgottenOnPermanentRejection(t *testing.T) {
 	if err := b.ExportMetrics(context.Background(), metricsWith("x")); err != nil {
 		t.Fatal(err)
 	}
-	before := obs.BufferDropped.WithLabelValues("metrics").Value()
+	before := obs.BufferDroppedBatches.WithLabelValues("metrics").Value()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() { b.Run(ctx); close(done) }()
 
 	waitFor(t, func() bool {
-		return obs.BufferDropped.WithLabelValues("metrics").Value()-before == 1
+		return obs.BufferDroppedBatches.WithLabelValues("metrics").Value()-before == 1
 	}, "batch permanently rejected and dropped")
 	waitFor(t, func() bool { return ms.Bytes() == 0 }, "spool drained")
 

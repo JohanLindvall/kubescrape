@@ -31,7 +31,8 @@ var (
 	// the collector's, so on that (documented, durable) configuration this
 	// counter moves only for a batch larger than the whole buffer cap; the
 	// collector's own permanent rejections land on
-	// kubescrape_buffer_dropped_total{signal="logs"} instead, which is where
+	// kubescrape_buffer_dropped_batches_total{signal="logs"} (with
+	// ..._records_total beside it for the magnitude) instead, which is where
 	// an alert for the buffered chain belongs.
 	LogPermanentDropped = Registry.Counter("kubescrape_log_permanent_dropped_total",
 		"Log records dropped after a definitive collector rejection (retrying could not succeed; offsets advanced so the pipeline survives).")
@@ -44,9 +45,14 @@ var (
 			"before its lines were exported, and no open fd survived a restart). These lines are lost.")
 	LogEnriched = Registry.CounterVec("kubescrape_log_enriched_total",
 		"Log records by the enrichment strategy that matched (json, logfmt, pattern, none).", "format")
-	LogLagBytes = Registry.Gauge("kubescrape_log_lag_bytes",
+	// The two lag gauges were named the other way round: the unqualified
+	// kubescrape_log_lag_bytes was the per-file MAXIMUM and the _total_bytes
+	// suffix carried the sum. Both are gauges, and _total is reserved for
+	// counters — so the name promised a counter, and the name WITHOUT the
+	// qualifier was the one that was not the total.
+	LogLagMaxBytes = Registry.Gauge("kubescrape_log_lag_max_bytes",
 		"Largest per-file backlog: bytes on disk not yet exported and committed (per-file breakdown on /debug/tailer).")
-	LogLagBytesTotal = Registry.Gauge("kubescrape_log_lag_total_bytes",
+	LogLagTotalBytes = Registry.Gauge("kubescrape_log_lag_bytes",
 		"Total backlog across tracked files: bytes on disk not yet exported and committed.")
 	LogRateLimited = Registry.CounterVec("kubescrape_log_rate_limited_total",
 		"Per-file line rate limit hits: lines discarded (action=drop) or reads paused (action=pause).", "action")
@@ -73,8 +79,19 @@ var (
 	BufferTruncated = Registry.CounterVec("kubescrape_buffer_truncated_bytes_total",
 		"Bytes the disk buffer lost to damage discovered at open (truncated, dropped or foreign segments).", "signal")
 
-	BufferDropped = Registry.CounterVec("kubescrape_buffer_dropped_total",
+	// Data loss is counted TWICE over: once per batch and once per record.
+	//
+	// A batch here is 1..1024 records, so a batch counter alone answers "did we
+	// lose anything" and cannot answer "how much" — and this pair is the alert
+	// the documented durable configuration points at (with -buffer-dir the
+	// tailer sees the ENQUEUE verdict, so the collector's permanent rejections
+	// surface here rather than on kubescrape_log_permanent_dropped_total, which
+	// has always counted records). Every other producer's drop counter gets the
+	// same treatment, and the ones that count batches now say so in the name.
+	BufferDroppedBatches = Registry.CounterVec("kubescrape_buffer_dropped_batches_total",
 		"Buffered batches dropped after a permanent collector rejection (bad payload, auth, unimplemented).", "signal")
+	BufferDroppedRecords = Registry.CounterVec("kubescrape_buffer_dropped_records_total",
+		"Records lost with those batches: log records, metric data points or spans, by signal. A batch whose payload no longer DECODES is counted in kubescrape_buffer_dropped_batches_total only — its record count is not recoverable — so this is a lower bound whenever kubescrape_buffer_read_errors_total is also moving.", "signal")
 	BufferRequeued = Registry.CounterVec("kubescrape_buffer_requeued_total",
 		"Buffered batches moved to the back of the queue after repeated transient failures (keeps one stuck batch from blocking the signal).", "signal")
 	BufferFull = Registry.CounterVec("kubescrape_buffer_full_total",
@@ -115,6 +132,15 @@ var (
 		"Scrape duration by pipeline.", nil, "pipeline")
 	ScrapeSamples = Registry.CounterVec("kubescrape_scrape_samples_total",
 		"Samples parsed by pipeline (before filtering).", "pipeline")
+	// The counterpart to that "before filtering". Filtering happens between
+	// the parse and the conversion, so a keep rule that matches nothing — or a
+	// ServiceMonitor metricRelabeling that drops everything — empties a
+	// pipeline while kubescrape_scrapes_total reports success and
+	// kubescrape_scrape_samples_total keeps climbing. Nothing moved when that
+	// happened; scraped minus dropped is now the number that reaches the
+	// collector.
+	ScrapeSamplesDropped = Registry.CounterVec("kubescrape_scrape_samples_dropped_total",
+		"Parsed samples discarded before conversion, by pipeline and by what discarded them: filter = the config's metrics keep/drop rules, relabel = a monitor's metricRelabelings.", "pipeline", "reason")
 	ScrapeMalformed = Registry.CounterVec("kubescrape_scrape_malformed_total",
 		"Exposition samples dropped as malformed by pipeline (unparseable lines, histogram buckets without le, summary rows without quantile).", "pipeline")
 	ScrapeCollisions = Registry.Counter("kubescrape_scrape_name_collisions_total",
@@ -129,12 +155,14 @@ var (
 
 // OTLP ingest (agent).
 var (
-	// IngestRejected counts pushes refused for exceeding the in-flight bound.
-	// They are retryable and the sender still holds the payload, but a
-	// persistently non-zero rate means the node cannot keep up with what is
-	// being pushed at it.
+	// IngestRejected counts pushes refused for exceeding one of the receiver's
+	// admission bounds: the concurrently-processed count, or the raw payload
+	// bytes both transports may buffer while reading and decoding. They are
+	// retryable and the sender still holds the payload, but a persistently
+	// non-zero rate means the node cannot keep up with what is being pushed at
+	// it.
 	IngestRejected = Registry.Counter("kubescrape_ingest_rejected_total",
-		"Pushed OTLP requests refused because the concurrent in-flight bound was reached (retryable: 429 / ResourceExhausted).")
+		"Pushed OTLP requests refused because a receiver admission bound was reached — concurrent in-flight pushes or buffered payload bytes (retryable: 429 / ResourceExhausted).")
 )
 
 // Metadata client (agent).
@@ -198,6 +226,13 @@ var (
 		"Payload parts forwarded to a non-default routing destination.", "route", "signal")
 	TransformErrors = Registry.CounterVec("kubescrape_transform_errors_total",
 		"Transform program invocations that failed (the batch is NOT exported; the error propagates to the producer's retry path).", "signal")
+	// A transform drop is INTENDED loss, which is exactly why it needs a
+	// counter: the intent lives in an operator-edited Starlark file that hot-
+	// reloads, so a one-character edit can silently discard a node's whole log
+	// stream with no error logged and every other metric green. That has
+	// already happened once (see transform/hostobj.go).
+	TransformDropped = Registry.CounterVec("kubescrape_transform_dropped_total",
+		"Records a transform script called drop() on, by signal: log records, metric data points (a dropped metric counts all of its points) and spans.", "signal")
 	TransformReloads = Registry.CounterVec("kubescrape_transform_reloads_total",
 		"Transforms-file reloads by outcome (applied, failed — a failed compile keeps the last good program).", "outcome")
 	TraceSpansDropped = Registry.CounterVec("kubescrape_trace_spans_dropped_total",
@@ -365,6 +400,8 @@ type TailSamplingStat struct {
 var (
 	JournalDropped = Registry.Counter("kubescrape_journal_dropped_batches_total",
 		"Journal batches dropped after a permanent collector rejection (the cursor advances past them).")
+	JournalDroppedRecords = Registry.Counter("kubescrape_journal_dropped_records_total",
+		"Journal records lost with those batches. The magnitude of the loss: a batch is up to Config.BatchSize entries.")
 )
 
 // Kubernetes events (the cluster-singleton events collector).
@@ -375,8 +412,10 @@ var (
 		"Kubernetes events received from the watch, by event type (normal, warning, other — anything else the API server reports).", "type")
 	EventsExported = Registry.Counter("kubescrape_events_exported_total",
 		"Kubernetes event records exported (after the rules).")
-	EventsDropped = Registry.Counter("kubescrape_events_dropped_total",
+	EventsDropped = Registry.Counter("kubescrape_events_dropped_batches_total",
 		"Kubernetes event batches dropped after a permanent collector rejection (the position advances past them).")
+	EventsDroppedRecords = Registry.Counter("kubescrape_events_dropped_records_total",
+		"Kubernetes event records lost with those batches (the magnitude of the loss the batch counter only signals).")
 	EventWatchRestarts = Registry.Counter("kubescrape_event_watch_restarts_total",
 		"Event watch restarts (a closed stream, an error, or an expired resourceVersion).")
 	EventRelists = Registry.CounterVec("kubescrape_event_relists_total",
@@ -387,14 +426,20 @@ var (
 
 // Azure diagnostics (the Event Hubs consumer in the cluster-singleton deployment).
 var (
+	// signal/plural, matching AzureExported and every other producer. This
+	// counter used to spell the same dimension "kind" with singular values, so
+	// the decoded and exported counts of one pipeline could not be joined or
+	// even reliably grepped for.
 	AzureRecords = Registry.CounterVec("kubescrape_azure_records_total",
-		"Azure diagnostic records decoded from Event Hubs messages, by kind (log, metric).", "kind")
+		"Azure diagnostic records decoded from Event Hubs messages, by signal (logs, metrics).", "signal")
 	AzureDecodeErrors = Registry.Counter("kubescrape_azure_decode_errors_total",
 		"Event Hubs messages or records that could not be decoded as Azure diagnostics JSON (skipped, committed past).")
 	AzureExported = Registry.CounterVec("kubescrape_azure_exported_total",
 		"Azure diagnostic records exported, by signal (logs, metrics).", "signal")
-	AzureDropped = Registry.Counter("kubescrape_azure_dropped_total",
+	AzureDropped = Registry.Counter("kubescrape_azure_dropped_batches_total",
 		"Azure diagnostic payloads dropped after a permanent collector rejection (the offsets advance past them).")
+	AzureDroppedRecords = Registry.CounterVec("kubescrape_azure_dropped_records_total",
+		"Azure diagnostic records (log records or metric data points) lost with those payloads, by signal.", "signal")
 	AzureFetchErrors = Registry.Counter("kubescrape_azure_fetch_errors_total",
 		"Kafka fetch errors from the Event Hubs consumer (retried; partial fetches are still processed).")
 	AzureCommitErrors = Registry.Counter("kubescrape_azure_commit_errors_total",
@@ -414,22 +459,28 @@ var (
 // declared here) and are surfaced as export-time gauges — cumulative since
 // process start.
 func init() {
-	Registry.CounterFunc("kubescrape_log_metrics_dropped_capped_total",
-		"Log-metric observations dropped since start because the metric's label-set cardinality cap was reached.",
-		func() float64 { return float64(metrics.DroppedCapped()) })
-	// Per metric as well: the cap frees slots only through idleness, so a burst
-	// blinds ONE metric for up to maxAge + grace (24h by default) and an alert
-	// has to be able to name it.
+	// The build version reaches internal/metrics' own exported scopes through
+	// here: it owns BuildVersion and imports that package, so the value is
+	// pushed down rather than imported back.
+	metrics.SetScopeVersion(BuildVersion())
+
+	// One family, labeled by metric name — sum() over the label is the
+	// aggregate. There used to be two: an unlabeled
+	// kubescrape_log_metrics_dropped_capped_total counter beside a
+	// kubescrape_log_metrics_dropped_capped_by_metric GAUGE that carried a
+	// monotonic since-start total and spelled its label name inside the metric
+	// name. Both halves were wrong: a gauge does not mark the reset at a
+	// restart, so rate()/increase() over it silently swallowed one, and the cap
+	// frees slots only through idleness — a burst blinds ONE metric for up to
+	// maxAge + grace (24h by default) and an alert has to be able to name it,
+	// which the aggregate could not. A counter vec is both.
 	//
-	// It is a GAUGE carrying a since-start total, not a counter — the per-metric
-	// label set is data-driven (a metric name appears only once it has dropped
-	// something), which the func-gauge vec is what can express. The value is
-	// still monotonic within a process, so `increase()`/`rate()` over it do NOT
-	// see the reset at a restart the way they do for the aggregate counter
-	// sibling: compare it against itself over a window, or alert on `> 0`, and
-	// use kubescrape_log_metrics_dropped_capped_total for rates.
-	Registry.GaugeFuncVec("kubescrape_log_metrics_dropped_capped_by_metric",
-		"Log-metric observations dropped since start because that metric's cardinality cap was reached, by metric name. A gauge carrying a since-start total (not a counter): it does not mark restarts, so use kubescrape_log_metrics_dropped_capped_total for rates and this one to name the metric.",
+	// The cost of the merge, stated plainly: the label set is data-driven (a
+	// metric name appears only once it has dropped something), so with nothing
+	// dropped the family is ABSENT rather than reading 0, where the old
+	// unlabeled counter always published a zero.
+	Registry.CounterFuncVec("kubescrape_log_metrics_dropped_capped_total",
+		"Log-metric observations dropped because that metric's label-set cardinality cap was reached, by metric name. sum() over the label is the total. Absent until something is dropped: the label set is data-driven.",
 		"metric", metrics.DroppedCappedByMetric)
 	Registry.CounterFunc("kubescrape_log_metrics_dropped_collision_total",
 		"Log-metric observations dropped since start because of a series hash collision.",

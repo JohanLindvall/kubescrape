@@ -28,6 +28,7 @@ import (
 	"github.com/JohanLindvall/kubescrape/internal/agent/transform"
 	"github.com/JohanLindvall/kubescrape/internal/logline"
 	"github.com/JohanLindvall/kubescrape/internal/metrics"
+	"github.com/JohanLindvall/kubescrape/internal/obs"
 	"github.com/JohanLindvall/kubescrape/pkg/logattrs"
 )
 
@@ -157,6 +158,10 @@ func runConfigCase(cfg agentConfig, scrubber *logscrub.Scrubber, extractor *loga
 	res.CopyTo(rl.Resource().Attributes())
 	logattrs.Put(rl.Resource().Attributes(), extracted.Resource)
 	sl := rl.ScopeLogs().AppendEmpty()
+	// Named and versioned like the tailer's, so the harness models what
+	// production ships rather than a nameless scope of its own.
+	sl.Scope().SetName("github.com/JohanLindvall/kubescrape/agent/tailer")
+	sl.Scope().SetVersion(obs.ScopeVersion)
 	logattrs.Put(sl.Scope().Attributes(), extracted.Scope)
 	lr := sl.LogRecords().AppendEmpty()
 	lr.Body().SetStr(body)

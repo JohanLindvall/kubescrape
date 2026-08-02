@@ -12,22 +12,65 @@ runtime and process collectors (`go_*`, `process_*`) that always live
 there. One knob selects the delivery modality, so the same series never
 ship over both paths.
 
+Every ScopeMetrics/ScopeLogs kubescrape emits now carries an
+instrumentation-scope NAME and VERSION (the build version, the same string
+as `service.version`). Log-derived metrics — the `logMetrics` section's
+output — shipped with an empty scope name until now; every other producer
+already named one. **Wire-visible**: a translation that turns the scope into
+labels (`otel_scope_name`, `otel_scope_version`) sees new label values, so
+those streams split at this upgrade — and, because the version is part of
+it, at every release boundary thereafter. Group on the metric name and its
+own labels if you need continuity.
+
+Cumulative points (every counter, summary and histogram here) now carry a
+real `StartTimeUnixNano`: the moment that stream began accumulating, not the
+export time. `StartTimeUnixNano == TimeUnixNano` is the OTLP encoding for a
+point that just RESET, and stamping it on every push made cumulative-to-delta
+consumers (Datadog, Dynatrace, AWS EMF) report the whole running total as
+each interval's delta, while Google Cloud rejected the points outright.
+Prometheus/Mimir ignore the field by default and are unaffected.
+
 This file is generated from `internal/obs/obs.go`. Regenerate with
 `go test ./internal/obs/ -run TestMetricsDocIsCurrent -update-metrics-doc`;
 `TestDocumentedMetricsExist` additionally fails if prose anywhere in the repo
 names a metric or a label that is not registered.
 
+## Renamed in this release
+
+All of these are **wire-visible**: dashboards and alert rules selecting the
+old names match nothing, silently. Names here are written WITHOUT their
+`kubescrape_` prefix, so that the doc-check which fails on prose naming an
+unregistered metric stays strict; the table below carries the full names.
+
+| Was | Is | Why |
+|---|---|---|
+| `log_lag_bytes` (per-file max) | `log_lag_max_bytes` | `_total` is reserved for counters and both are gauges, so the name promised a counter — and the name WITHOUT the qualifier was the one that was not the total. |
+| `log_lag_total_bytes` (sum) | `log_lag_bytes` | see above |
+| `buffer_dropped_total` | `buffer_dropped_batches_total` + `buffer_dropped_records_total` | a batch is 1..1024 records, so the counter operators are told to alert on could not size the loss |
+| `events_dropped_total` | `events_dropped_batches_total` + `events_dropped_records_total` | same |
+| `azure_dropped_total` | `azure_dropped_batches_total` + `azure_dropped_records_total` | same |
+| (new) | `journal_dropped_records_total` | beside the existing `journal_dropped_batches_total` |
+| `azure_records_total{kind="log"/"metric"}` | `azure_records_total{signal="logs"/"metrics"}` | every other producer dimensions by `signal` with plural values; the decoded and exported counts of one pipeline shared no label to join on |
+| `log_metrics_dropped_capped_by_metric` (gauge) and the unlabeled `log_metrics_dropped_capped_total` (counter) | `log_metrics_dropped_capped_total{metric}` | the label name belonged in a label, not inside the metric name, and a gauge carrying a monotonic since-start total hides the reset at a restart. `sum()` over the label is the old aggregate — but the family is now ABSENT rather than 0 until something is dropped, the label set being data-driven. |
+
+`log_permanent_dropped_total` is unchanged: it already counts RECORDS, and it
+is the documented alert for the non-buffered tailer.
+
+## All metrics
+
 | Metric | Labels | Description |
 |---|---|---|
 | `kubescrape_azure_commit_errors_total` | — | Offset commit failures (the records were delivered; a redelivery produces at-least-once duplicates). |
 | `kubescrape_azure_decode_errors_total` | — | Event Hubs messages or records that could not be decoded as Azure diagnostics JSON (skipped, committed past). |
-| `kubescrape_azure_dropped_total` | — | Azure diagnostic payloads dropped after a permanent collector rejection (the offsets advance past them). |
+| `kubescrape_azure_dropped_batches_total` | — | Azure diagnostic payloads dropped after a permanent collector rejection (the offsets advance past them). |
+| `kubescrape_azure_dropped_records_total` | `signal` | Azure diagnostic records (log records or metric data points) lost with those payloads, by signal. |
 | `kubescrape_azure_exported_total` | `signal` | Azure diagnostic records exported, by signal (logs, metrics). |
 | `kubescrape_azure_fetch_errors_total` | — | Kafka fetch errors from the Event Hubs consumer (retried; partial fetches are still processed). |
-| `kubescrape_azure_records_total` | `kind` | Azure diagnostic records decoded from Event Hubs messages, by kind (log, metric). |
+| `kubescrape_azure_records_total` | `signal` | Azure diagnostic records decoded from Event Hubs messages, by signal (logs, metrics). |
 | `kubescrape_azure_token_refreshes_total` | `outcome` | Microsoft Entra token refreshes for the Event Hubs connection, by outcome (ok, error). |
 | `kubescrape_buffer_backlog_bytes` | `signal` | Undelivered bytes currently queued in the disk buffer, per signal (what -buffer-max-bytes caps). signal="traces" exists only on the trace tier with tail sampling on — the one trace payload this agent owns rather than forwards. |
-| `kubescrape_buffer_dropped_total` | `signal` | Buffered batches dropped after a permanent collector rejection (bad payload, auth, unimplemented). |
+| `kubescrape_buffer_dropped_batches_total` | `signal` | Buffered batches dropped after a permanent collector rejection (bad payload, auth, unimplemented). |
+| `kubescrape_buffer_dropped_records_total` | `signal` | Records lost with those batches: log records, metric data points or spans, by signal. A batch whose payload no longer DECODES is counted in kubescrape_buffer_dropped_batches_total only — its record count is not recoverable — so this is a lower bound whenever kubescrape_buffer_read_errors_total is also moving. |
 | `kubescrape_buffer_enqueue_errors_total` | `signal` | Batches the disk buffer refused for a reason other than capacity (I/O error, closed queue, no space left on device). |
 | `kubescrape_buffer_full_total` | `signal` | Batches the disk buffer refused: the undelivered backlog is at its cap, or one batch exceeds the whole cap. Back-pressure for logs (the tailer rewinds and re-reads), a lost batch for producers that cannot rewind (scrape, self-metrics, log-metrics). |
 | `kubescrape_buffer_max_bytes` | `signal` | Configured disk-buffer cap per signal (0 = uncapped); backlog/max is the utilisation to alert on. |
@@ -38,14 +81,16 @@ names a metric or a label that is not registered.
 | `kubescrape_event_position_errors_total` | `operation` | Failures reading or writing the event position ConfigMap, by operation (load, save). |
 | `kubescrape_event_relists_total` | `stage` | Event watches that fell back to a relist because the stored resourceVersion had aged out of the API server's watch window. |
 | `kubescrape_event_watch_restarts_total` | — | Event watch restarts (a closed stream, an error, or an expired resourceVersion). |
-| `kubescrape_events_dropped_total` | — | Kubernetes event batches dropped after a permanent collector rejection (the position advances past them). |
+| `kubescrape_events_dropped_batches_total` | — | Kubernetes event batches dropped after a permanent collector rejection (the position advances past them). |
+| `kubescrape_events_dropped_records_total` | — | Kubernetes event records lost with those batches (the magnitude of the loss the batch counter only signals). |
 | `kubescrape_events_exported_total` | — | Kubernetes event records exported (after the rules). |
 | `kubescrape_events_observed_total` | `type` | Kubernetes events received from the watch, by event type (normal, warning, other — anything else the API server reports). |
 | `kubescrape_export_requests_total` | `signal`, `outcome` | OTLP export attempts by signal and outcome. |
 | `kubescrape_http_requests_total` | `pattern`, `code` | Metadata API requests by pattern and status code. |
-| `kubescrape_ingest_rejected_total` | — | Pushed OTLP requests refused because the concurrent in-flight bound was reached (retryable: 429 / ResourceExhausted). |
+| `kubescrape_ingest_rejected_total` | — | Pushed OTLP requests refused because a receiver admission bound was reached — concurrent in-flight pushes or buffered payload bytes (retryable: 429 / ResourceExhausted). |
 | `kubescrape_ingest_resources_total` | `outcome` | Distinct pushed identities (container id / pod uid, memoized per request) by enrichment outcome. enriched = an id resolved; peer_ip = no id, attributed by the connection's source address; peer_ip_rejected = that address resolved to the RECEIVER's own workload, so it was rewritten in flight (a proxy, a mesh sidecar, or an internal hop addressed to the application port) and nothing was attributed — anything above zero means peer-IP attribution cannot work on that path; unresolved = nothing identified the sender. |
 | `kubescrape_journal_dropped_batches_total` | — | Journal batches dropped after a permanent collector rejection (the cursor advances past them). |
+| `kubescrape_journal_dropped_records_total` | — | Journal records lost with those batches. The magnitude of the loss: a batch is up to Config.BatchSize entries. |
 | `kubescrape_journal_entries_total` | — | Journal entries exported. |
 | `kubescrape_journal_restarts_total` | — | Journal reader restarts. |
 | `kubescrape_journal_truncated_total` | — | Journal messages truncated at MaxEntryBytes (the record carries log.truncated). |
@@ -57,10 +102,9 @@ names a metric or a label that is not registered.
 | `kubescrape_log_export_failures_total` | — | Log batch exports that failed after retries (files rewound). |
 | `kubescrape_log_fifo_orphans_total` | — | Stale per-line offset entries discarded because the multiline stage dropped over-limit lines it never emitted. |
 | `kubescrape_log_files` | — | Log files currently tracked. |
-| `kubescrape_log_lag_bytes` | — | Largest per-file backlog: bytes on disk not yet exported and committed (per-file breakdown on /debug/tailer). |
-| `kubescrape_log_lag_total_bytes` | — | Total backlog across tracked files: bytes on disk not yet exported and committed. |
-| `kubescrape_log_metrics_dropped_capped_by_metric` | `metric` | Log-metric observations dropped since start because that metric's cardinality cap was reached, by metric name. A gauge carrying a since-start total (not a counter): it does not mark restarts, so use kubescrape_log_metrics_dropped_capped_total for rates and this one to name the metric. |
-| `kubescrape_log_metrics_dropped_capped_total` | — | Log-metric observations dropped since start because the metric's label-set cardinality cap was reached. |
+| `kubescrape_log_lag_bytes` | — | Total backlog across tracked files: bytes on disk not yet exported and committed. |
+| `kubescrape_log_lag_max_bytes` | — | Largest per-file backlog: bytes on disk not yet exported and committed (per-file breakdown on /debug/tailer). |
+| `kubescrape_log_metrics_dropped_capped_total` | `metric` | Log-metric observations dropped because that metric's label-set cardinality cap was reached, by metric name. sum() over the label is the total. Absent until something is dropped: the label set is data-driven. |
 | `kubescrape_log_metrics_dropped_collision_total` | — | Log-metric observations dropped since start because of a series hash collision. |
 | `kubescrape_log_metrics_dropped_nan_total` | — | Log-metric observations dropped since start because the extracted value was NaN or +/-Inf (neither is representable as a sample). |
 | `kubescrape_log_oversized_dropped_total` | — | Unterminated lines discarded for exceeding the per-entry size bound (no newline within MaxEntryBytes+4096). |
@@ -80,6 +124,7 @@ names a metric or a label that is not registered.
 | `kubescrape_scrape_duration_seconds` | `pipeline` | Scrape duration by pipeline. |
 | `kubescrape_scrape_malformed_total` | `pipeline` | Exposition samples dropped as malformed by pipeline (unparseable lines, histogram buckets without le, summary rows without quantile). |
 | `kubescrape_scrape_name_collisions_total` | — | Data points dropped because their family name was already claimed by a metric of another shape in the same batch (a target redeclaring a family's TYPE mid-exposition). |
+| `kubescrape_scrape_samples_dropped_total` | `pipeline`, `reason` | Parsed samples discarded before conversion, by pipeline and by what discarded them: filter = the config's metrics keep/drop rules, relabel = a monitor's metricRelabelings. |
 | `kubescrape_scrape_samples_total` | `pipeline` | Samples parsed by pipeline (before filtering). |
 | `kubescrape_scrapes_total` | `pipeline`, `outcome` | Scrapes by pipeline and outcome. |
 | `kubescrape_self_metadata_lookups_total` | `outcome` | Own-pod metadata lookups for -self-attributes, by outcome. |
@@ -109,7 +154,8 @@ names a metric or a label that is not registered.
 | `kubescrape_tail_sampling_spans_total` | `outcome` | Spans leaving the tail-sampling buffer, by fate: kept = the trace was sampled and the export was acked (with -buffer-dir, acked means SPOOLED — a decided keep is durable and a collector outage becomes a backlog); dropped = the trace was not sampled; lost = the trace was sampled but neither the collector nor the disk buffer took it, and nothing else holds a copy (the sender was acked when the spans were buffered). A moving lost rate is data loss, not back-pressure; without -buffer-dir a collector outage produces it directly, with one it means the spool itself refused the payload. |
 | `kubescrape_tail_sampling_traces_total` | `decision`, `policy` | Traces decided by the tail sampler, by verdict (keep, drop) and by the policy that decided. policy="none" is the default drop — no policy had an opinion — which is what a policy list matching nothing looks like. Every configured policy gets its series at startup, so a policy that has never fired reads as zero rather than as absent. This counts DECISIONS: whether the kept trace then reached the collector is kubescrape_tail_sampling_spans_total. |
 | `kubescrape_trace_spans_dropped_total` | `reason` | Ingested spans dropped by the trace sampler (probability = the consistent trace-ID decision, rate = the spans/second cap). |
+| `kubescrape_transform_dropped_total` | `signal` | Records a transform script called drop() on, by signal: log records, metric data points (a dropped metric counts all of its points) and spans. |
 | `kubescrape_transform_errors_total` | `signal` | Transform program invocations that failed (the batch is NOT exported; the error propagates to the producer's retry path). |
 | `kubescrape_transform_reloads_total` | `outcome` | Transforms-file reloads by outcome (applied, failed — a failed compile keeps the last good program). |
 
-92 metrics.
+97 metrics.

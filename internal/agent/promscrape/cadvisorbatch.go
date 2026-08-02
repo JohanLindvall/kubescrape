@@ -243,6 +243,7 @@ func (cb *cadvisorBatcher) scope(ident cadvisorIdentity) pmetric.ScopeMetrics {
 		cb.fillResource(rm.Resource(), ident)
 		sm = rm.ScopeMetrics().AppendEmpty()
 		sm.Scope().SetName(scopeNameCadvisor)
+		sm.Scope().SetVersion(obs.ScopeVersion)
 		cb.scopes[key] = sm
 		// One resource per pod/container: its attributes count toward the chunk
 		// size (see convert.go).

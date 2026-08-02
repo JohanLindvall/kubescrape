@@ -106,15 +106,31 @@ func (s *Scraper) parseAndExportFiltered(ctx context.Context, body io.Reader, op
 	parser := promparse.Get(promparse.Options{MaxLineBytes: s.cfg.MaxLineBytes, OpenMetrics: openMetrics, Exemplars: withExemplars})
 	defer promparse.Put(parser)
 	samples := 0
+	// Filtered-away samples are counted in locals and reported once per scrape:
+	// this closure runs per sample and a WithLabelValues probe there would be
+	// on the hot path the whole package's allocation discipline is about. They
+	// are reported on the abort path too — a scrape that tripped the sample
+	// limit still filtered everything it parsed.
+	var droppedFilter, droppedRelabel int
+	defer func() {
+		if droppedFilter > 0 {
+			obs.ScrapeSamplesDropped.WithLabelValues(pipeline, "filter").Add(float64(droppedFilter))
+		}
+		if droppedRelabel > 0 {
+			obs.ScrapeSamplesDropped.WithLabelValues(pipeline, "relabel").Add(float64(droppedRelabel))
+		}
+	}()
 	malformed, err := parser.Parse(body, func(sample Sample) error {
 		samples++
 		if s.cfg.MaxSamples > 0 && samples > s.cfg.MaxSamples {
 			return ErrTooManySamples
 		}
 		if !filter.Keep(sample.Name, sample.Labels) {
+			droppedFilter++
 			return nil
 		}
 		if relabel != nil && !relabel.Keep(sample.Name, sample.Labels) {
+			droppedRelabel++
 			return nil
 		}
 		return conv.add(sample)

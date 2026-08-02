@@ -11,6 +11,8 @@ import (
 	"time"
 
 	"sigs.k8s.io/yaml"
+
+	"github.com/JohanLindvall/kubescrape/internal/obs"
 )
 
 // LoadMetricsConfig loads a standalone config file. Production config arrives solely
@@ -227,5 +229,61 @@ func TestFilterSession(t *testing.T) {
 	}
 	if bs.Keep("rule7_x", nil) || !bs.Keep("other", nil) {
 		t.Error(">64-rule fallback verdicts wrong")
+	}
+}
+
+// Filtering happens between the parse and the conversion, and used to be
+// entirely unmeasured: kubescrape_scrape_samples_total documents itself as the
+// count BEFORE filtering, kubescrape_scrapes_total reports success, and the
+// converter simply never sees what the filter refused. A keep rule whose regex
+// stopped matching — or a monitor's metricRelabelings dropping everything —
+// therefore emptied a whole pipeline with every metric on the dashboard green.
+func TestScrapeFilterDropsAreCounted(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = fmt.Fprint(w, "keep_me 1\ndrop_me 2\ndrop_me_too 3\n")
+	}))
+	defer srv.Close()
+
+	exp := &captureExporter{}
+	s := New(Config{
+		Node: "node1", Interval: time.Hour, Timeout: 5 * time.Second,
+		Targets: staticTargets{testTarget(srv.URL)}, Exporter: exp, StartTime: time.Now(),
+		Filters: mustFilters(t, map[string][]FilterRule{
+			"targets": {{Action: "drop", Metrics: `drop_me.*`}},
+		}),
+	})
+
+	before := obs.ScrapeSamplesDropped.WithLabelValues("targets", "filter").Value()
+	beforeRelabel := obs.ScrapeSamplesDropped.WithLabelValues("targets", "relabel").Value()
+	if _, err := s.scrapeTarget(context.Background(), testTarget(srv.URL), s.cfg.Timeout); err != nil {
+		t.Fatal(err)
+	}
+	if got := obs.ScrapeSamplesDropped.WithLabelValues("targets", "filter").Value() - before; got != 2 {
+		t.Fatalf("filter-dropped samples = %v, want 2 — scraped minus dropped is what reaches the collector", got)
+	}
+	if got := obs.ScrapeSamplesDropped.WithLabelValues("targets", "relabel").Value() - beforeRelabel; got != 0 {
+		t.Fatalf("relabel reason moved by %v with no relabelings configured", got)
+	}
+}
+
+// A scrape whose filter keeps everything must leave the counter alone, or the
+// rate is unreadable in the healthy case.
+func TestScrapeNoFilterDropsNoCount(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = fmt.Fprint(w, "keep_me 1\nkeep_me_too 2\n")
+	}))
+	defer srv.Close()
+
+	exp := &captureExporter{}
+	s := New(Config{
+		Node: "node1", Interval: time.Hour, Timeout: 5 * time.Second,
+		Targets: staticTargets{testTarget(srv.URL)}, Exporter: exp, StartTime: time.Now(),
+	})
+	before := obs.ScrapeSamplesDropped.WithLabelValues("targets", "filter").Value()
+	if _, err := s.scrapeTarget(context.Background(), testTarget(srv.URL), s.cfg.Timeout); err != nil {
+		t.Fatal(err)
+	}
+	if got := obs.ScrapeSamplesDropped.WithLabelValues("targets", "filter").Value() - before; got != 0 {
+		t.Fatalf("counter moved by %v with nothing filtered", got)
 	}
 }

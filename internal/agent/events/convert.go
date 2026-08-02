@@ -203,6 +203,7 @@ func (r *Reader) convert() plog.Logs {
 			logattrs.Put(rl.Resource().Attributes(), extracted.Resource)
 			sl = rl.ScopeLogs().AppendEmpty()
 			sl.Scope().SetName("github.com/JohanLindvall/kubescrape/agent/events")
+			sl.Scope().SetVersion(obs.ScopeVersion)
 			logattrs.Put(sl.Scope().Attributes(), extracted.Scope)
 			scopes[key] = sl
 			resAttrs[key] = rl.Resource().Attributes()

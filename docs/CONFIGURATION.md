@@ -242,8 +242,12 @@ is the only loss the tailer decides on itself (`kubescrape_log_export_failures_t
 counts rewinds, which lose nothing). With `-buffer-dir` set the tailer's export
 returns the *enqueue* verdict rather than the collector's, so this counter then
 moves only for a batch larger than the whole buffer cap and the collector's own
-permanent rejections land on `kubescrape_buffer_dropped_total{signal="logs"}`
-instead — alert on that one for the buffered chain.
+permanent rejections land on `kubescrape_buffer_dropped_batches_total{signal="logs"}`
+instead — alert on that one for the buffered chain, and read
+`kubescrape_buffer_dropped_records_total{signal="logs"}` beside it for the size
+of the loss. Every drop counter in the agent now comes in that pair: the batch
+counter says a loss happened, the records counter says how much, and a batch is
+anywhere from one record to a thousand.
 
 A file whose container metadata cannot be resolved is retried on an
 exponential backoff (2s doubling to a 1m cap, each delay jittered up to +25%)
@@ -254,8 +258,9 @@ unjittered one puts every agent in the fleet on the same schedule — turning a
 metadata-service rollout into a synchronised recovery burst. Nothing is read
 from a file until it resolves, so nothing is lost meanwhile.
 
-Backlog is observable per node — `kubescrape_log_lag_bytes` (largest per-file
-backlog) and `kubescrape_log_lag_total_bytes` in the self-metrics — and per file on
+Backlog is observable per node — `kubescrape_log_lag_bytes` (the total across
+tracked files) and `kubescrape_log_lag_max_bytes` (the largest single file's) in
+the self-metrics — and per file on
 `GET /debug/tailer` (path, container, read/committed offsets, lag,
 rate-limited flag; refreshed ~10s, largest lag first).
 
@@ -317,6 +322,24 @@ pipeline; syslog priorities map to OTLP severities; `syslog.identifier` and
 > dashboards and alerts that group on labels including `otel_scope_name`, and
 > match on the unit (`service.name` / `systemd.unit`) instead if you need
 > continuity across the upgrade.
+
+> **Upgrade note.** Journal severities were one grade too low at the top of the
+> syslog range: priority 0/1/2 (emerg/alert/crit) mapped to FATAL/ERROR3/ERROR2
+> where the OpenTelemetry logs data model says FATAL3 (23) / FATAL2 (22) /
+> FATAL (21). They now use the data model's numbers, which is also what the
+> enrichment step (`-enrich`) has always applied — and since enrichment
+> OVERWRITES the severity whenever it parses a level out of the message, the
+> same journal entry previously reported a different severity number depending
+> on whether its text happened to look like a log line to a parser. **Wire-
+> visible**: alerts selecting `severity_number >= 21` (or 18/19) on journal
+> streams need re-checking.
+>
+> Severity **text** is now lowercase across every log producer — journald,
+> Kubernetes events and Azure diagnostics — matching what enrichment writes and
+> what `logs.rules` already matched on (the rules lowercase before comparing, so
+> no rule changes). Events and Azure diagnostics previously emitted `WARN` /
+> `INFO` / `ERROR` / `FATAL` / `DEBUG`. **Wire-visible** for anything comparing
+> `severity_text` case-sensitively.
 
 | Flag | Default | Description |
 |---|---|---|
@@ -768,8 +791,10 @@ password / token / access_key key-value pairs — the key and separator are
 kept so the line stays readable), `aws-key`, `private-key` (all five =
 `defaults`), plus the opt-in-by-name `email` and `credit-card` (they redact
 legitimate content too often to be defaults). Every built-in carries a cheap
-literal prefilter, so the no-match hot path is a few substring scans and
-zero allocations. Redactions count into
+prefilter, so the no-match hot path is a scan or two and zero allocations —
+and `secret-kv`'s checks the assignment SHAPE, not just the keyword, because a
+line admitted to the regex pays for the whole record (100 ms for a 1 MiB line,
+on the single goroutine that tails every file on the node). Redactions count into
 `kubescrape_log_scrubbed_total{pattern}`. An unknown builtin name, an
 invalid regex, or a config with no patterns at all fails startup — a
 scrubber that silently skips a pattern is a compliance bug.
@@ -817,6 +842,18 @@ payload where the retry logic lives.
   `ResourceExhausted` retryable only when `RetryInfo` is attached, and both the
   OTel SDK and the Collector drop the batch without it. `grpc.MaxConcurrentStreams`
   is set to the same value.
+
+The count bounds *processing*, not *buffering*: the HTTP handlers read the whole
+body before taking a slot (holding one across a trickled 16 MiB upload would let
+a few senders shed everyone else for a `ReadTimeout`), and gRPC decodes the
+message before the interceptor runs. A second, fixed bound — 64 MiB of raw
+payload across both transports — covers that window, refused the same retryable
+way: an HTTP body is charged as it is read (a declared `Content-Length` is
+reserved before the first byte), and a gRPC push reserves `MaxRecvMsgSize` from
+the moment its headers arrive until its message is decoded. It is not a flag:
+the operator knob is the count above, which bounds the far more expensive
+resource, while this one only has to keep an unauthenticated listener from
+buffering without limit.
 
 Refusals count into `kubescrape_ingest_rejected_total`. A persistently non-zero
 rate means the node cannot keep up with what is being pushed at it — raise the

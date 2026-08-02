@@ -40,18 +40,23 @@ const scopeName = "github.com/JohanLindvall/kubescrape/agent/azurediag"
 // (Application Insights counts up with severity, others down), so a number
 // falls through to the default and -enrich may still find an explicit level
 // in the body.
+//
+// Lowercase, like every other producer in this repo: it is what the enrich
+// package writes, and logenrich.Apply OVERWRITES the severity here whenever it
+// parses a level out of the record — so any other casing was contradicted one
+// line later, on whichever subset of records happened to parse.
 func severityOf(level string) (plog.SeverityNumber, string) {
 	switch {
 	case strings.EqualFold(level, "Verbose") || strings.EqualFold(level, "Debug"):
-		return plog.SeverityNumberDebug, "DEBUG"
+		return plog.SeverityNumberDebug, "debug"
 	case strings.EqualFold(level, "Warning") || strings.EqualFold(level, "Warn"):
-		return plog.SeverityNumberWarn, "WARN"
+		return plog.SeverityNumberWarn, "warn"
 	case strings.EqualFold(level, "Error"):
-		return plog.SeverityNumberError, "ERROR"
+		return plog.SeverityNumberError, "error"
 	case strings.EqualFold(level, "Critical") || strings.EqualFold(level, "Fatal"):
-		return plog.SeverityNumberFatal, "FATAL"
+		return plog.SeverityNumberFatal, "fatal"
 	}
-	return plog.SeverityNumberInfo, "INFO"
+	return plog.SeverityNumberInfo, "info"
 }
 
 // resKey groups records by the ARM resource they describe.
@@ -145,6 +150,7 @@ func (r *Reader) convertLogs(recs []record) plog.Logs {
 			logattrs.Put(rl.Resource().Attributes(), extracted.Resource)
 			sl = rl.ScopeLogs().AppendEmpty()
 			sl.Scope().SetName(scopeName)
+			sl.Scope().SetVersion(obs.ScopeVersion)
 			logattrs.Put(sl.Scope().Attributes(), extracted.Scope)
 			scopes[key] = sl
 			resAttrs[key] = rl.Resource().Attributes()
@@ -253,6 +259,7 @@ func (r *Reader) convertMetrics(recs []record) pmetric.Metrics {
 			r.resource(rec).CopyTo(rm.Resource())
 			sm := rm.ScopeMetrics().AppendEmpty()
 			sm.Scope().SetName(scopeName)
+			sm.Scope().SetVersion(obs.ScopeVersion)
 			g = &group{sm: sm, byName: make(map[string]pmetric.NumberDataPointSlice, 8)}
 			groups[key] = g
 		}

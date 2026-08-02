@@ -10,10 +10,12 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/JohanLindvall/enrich"
 	"go.opentelemetry.io/collector/pdata/plog"
 
 	"github.com/JohanLindvall/kubescrape/internal/agent/otlpexport"
 	"github.com/JohanLindvall/kubescrape/internal/agent/positions"
+	"github.com/JohanLindvall/kubescrape/internal/obs"
 	"github.com/JohanLindvall/kubescrape/pkg/logattrs"
 )
 
@@ -324,6 +326,49 @@ func TestJournalPermanentRejectionSkips(t *testing.T) {
 	}
 }
 
+// The drop counts RECORDS, not just the batch it was in.
+//
+// A journal batch is up to Config.BatchSize (1024) entries, so
+// kubescrape_journal_dropped_batches_total answers "did a permanent rejection
+// happen" and cannot answer "how much was lost" — which is the question an
+// operator has when a poison batch is skipped past. The reader holds the
+// decoded payload at that point, so the count is free.
+func TestJournalPermanentRejectionCountsRecords(t *testing.T) {
+	entries := []rawEntry{
+		mkEntry("c00", "a.service", "poison one", "6"),
+		mkEntry("c01", "a.service", "poison two", "6"),
+		mkEntry("c02", "a.service", "poison three", "6"),
+	}
+	posPath := filepath.Join(t.TempDir(), "positions.json")
+	pos, _ := positions.Open(posPath)
+
+	beforeBatches := obs.JournalDropped.Value()
+	beforeRecords := obs.JournalDroppedRecords.Value()
+
+	exp := &permanentExporter{rejections: 1}
+	cfg := Config{
+		Positions: pos, Exporter: exp,
+		BatchSize:     3, // all three entries in one rejected batch
+		FlushInterval: 20 * time.Millisecond, RestartBackoff: 10 * time.Millisecond,
+	}
+	r := New(cfg)
+	r.open = fakeOpener(entries, false)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { defer close(done); r.Run(ctx) }()
+	t.Cleanup(func() { cancel(); <-done })
+
+	waitFor(t, "cursor committed past the poison batch", func() bool { return pos.JournalCursor() == "c02" })
+
+	if got := obs.JournalDropped.Value() - beforeBatches; got != 1 {
+		t.Fatalf("dropped batches = %v, want 1", got)
+	}
+	if got := obs.JournalDroppedRecords.Value() - beforeRecords; got != 3 {
+		t.Fatalf("dropped records = %v, want 3 — the batch counter alone cannot "+
+			"tell an operator whether one entry or a thousand was lost", got)
+	}
+}
+
 // Batches flush before their summed bodies exceed MaxBatchBytes, so one
 // exported payload never blows the collector's request cap.
 func TestJournalBatchByteCap(t *testing.T) {
@@ -392,9 +437,14 @@ func TestSeverityMapping(t *testing.T) {
 		num      plog.SeverityNumber
 		text     string
 	}{
-		{"0", plog.SeverityNumberFatal, "emerg"},
-		{"1", plog.SeverityNumberError3, "alert"},
-		{"2", plog.SeverityNumberError2, "crit"},
+		// The top three syslog severities are FATAL in the OTel logs data
+		// model, not ERROR. These read Fatal/Error3/Error2 — one grade low
+		// across the board, and one grade off the enrich package's own
+		// syslogSeverity table, which logenrich.Apply overwrites this number
+		// with whenever it parses the body.
+		{"0", plog.SeverityNumberFatal3, "emerg"},
+		{"1", plog.SeverityNumberFatal2, "alert"},
+		{"2", plog.SeverityNumberFatal, "crit"},
 		{"3", plog.SeverityNumberError, "err"},
 		{"4", plog.SeverityNumberWarn, "warning"},
 		{"5", plog.SeverityNumberInfo2, "notice"},
@@ -408,6 +458,51 @@ func TestSeverityMapping(t *testing.T) {
 		num, text := severity(c.priority)
 		if num != c.num || text != c.text {
 			t.Errorf("severity(%q) = %v,%q want %v,%q", c.priority, num, text, c.num, c.text)
+		}
+	}
+}
+
+// TestSeverityAgreesWithEnrich pins the journal's syslog mapping against the
+// enrich package's, which implements the same OTel table and which this reader
+// runs over every message.
+//
+// The two disagreeing is not a cosmetic inconsistency: convert calls
+// logenrich.Apply with overwrite semantics, so whenever enrich manages to parse
+// a level out of the body, ITS number replaces the one severity() derived from
+// the journal priority. With the two tables apart, one journal entry's exported
+// severity depended on whether its text happened to look like a log line to a
+// parser — the same crit entry landing on 18 or on 21 for no reason a consumer
+// could see.
+func TestSeverityAgreesWithEnrich(t *testing.T) {
+	// enrich's syslogSeverity is unexported, so go through its public parse of
+	// a syslog-shaped priority; the numbers are the exported constants.
+	want := map[string]int{
+		"0": enrich.Fatal3LevelNo,
+		"1": enrich.Fatal2LevelNo,
+		"2": enrich.FatalLevelNo,
+		"3": enrich.ErrorLevelNo,
+		"4": enrich.WarnLevelNo,
+		"5": enrich.Info2LevelNo,
+		"6": enrich.InfoLevelNo,
+		"7": enrich.DebugLevelNo,
+	}
+	for prio, w := range want {
+		if got, _ := severity(prio); int(got) != w {
+			t.Errorf("severity(%q) = %d, but enrich maps that syslog severity to %d — "+
+				"logenrich.Apply overwrites ours with theirs whenever the body parses", prio, got, w)
+		}
+	}
+}
+
+// TestSeverityTextIsLowercase pins the casing every log producer in the repo
+// now shares. enrich writes lowercase level names and Apply overwrites the
+// text along with the number, so anything else is contradicted one line later
+// on whichever subset of records happens to parse.
+func TestSeverityTextIsLowercase(t *testing.T) {
+	for _, prio := range []string{"0", "1", "2", "3", "4", "5", "6", "7"} {
+		_, text := severity(prio)
+		if text != strings.ToLower(text) {
+			t.Errorf("severity(%q) text = %q, want lowercase", prio, text)
 		}
 	}
 }

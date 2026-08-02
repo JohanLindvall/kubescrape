@@ -187,10 +187,12 @@ func (r *Reader) decode(msgs [][]byte) []record {
 			obs.AzureDecodeErrors.Inc()
 			return nil // skip the record, keep the rest of the envelope
 		}
+		// signal/plural, the dimension name and values every other producer
+		// uses (and the ones AzureExported already used one counter over).
 		if rec.metric {
-			obs.AzureRecords.WithLabelValues("metric").Inc()
+			obs.AzureRecords.WithLabelValues("metrics").Inc()
 		} else {
-			obs.AzureRecords.WithLabelValues("log").Inc()
+			obs.AzureRecords.WithLabelValues("logs").Inc()
 		}
 		recs = append(recs, rec)
 		return nil
@@ -241,6 +243,9 @@ func (r *Reader) export(ctx context.Context, signal string, count int, send func
 		// Retrying a payload the collector definitively refuses would wedge
 		// the partition on one bad batch, as everywhere else.
 		obs.AzureDropped.Inc()
+		// One payload is a whole poll's worth of records, so the payload
+		// counter alone says nothing about the size of the loss.
+		obs.AzureDroppedRecords.WithLabelValues(signal).Add(float64(count))
 		r.log.Warn("azure payload permanently rejected, skipping past it", "signal", signal, "records", count, "error", err)
 		return true
 	default:

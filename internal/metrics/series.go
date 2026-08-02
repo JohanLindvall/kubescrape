@@ -125,6 +125,19 @@ type sample struct {
 	resource string
 	bucket   int
 	count    uint64
+	// start is the epoch second this cumulative stream began accumulating: the
+	// admission of the sample, or the last idle reset that genuinely zeroed it.
+	// It becomes StartTimeUnixNano on every exported point.
+	//
+	// It is NOT the export time. StartTimeUnixNano == TimeUnixNano is the OTLP
+	// encoding for a point that RESET at that instant, and snapshot does not
+	// reset counters — the values are cumulative since the sample was admitted.
+	// Stamping the export time made every self-metric and every log-derived
+	// counter declare itself a reset on every push: a cumulative-to-delta
+	// consumer (Datadog, Dynatrace, AWS EMF) then reports the whole running
+	// total as that interval's delta, and Google Cloud rejects a point whose
+	// start is not strictly before its end.
+	start int64
 	// check is the independent second hash of the sample's identity; a lookup
 	// whose primary hash matches but whose check differs is a 64-bit
 	// collision between distinct series and is rejected instead of merged.
@@ -447,11 +460,30 @@ func (s *series) admit(hash, check uint64, lbls labels, bucket int, now int64, r
 		return nil
 	}
 	samp := &expiringSample{
-		sample: sample{labels: full.String(), resource: resourceString(res, resLabels), bucket: bucket, check: check, initial: true},
+		sample: sample{labels: full.String(), resource: resourceString(res, resLabels), bucket: bucket, check: check, initial: true, start: s.streamStart(now)},
 		when:   now,
 	}
 	s.db[hash] = samp
 	return samp
+}
+
+// counterBaselineSeconds backdates a COUNTER stream's declared start so that
+// the two synthetic zero points renderNumber emits ahead of a series' first
+// real value (one and two minutes before it — see there) both fall strictly
+// after it. A point whose start equals its own timestamp encodes a reset, so
+// stamping the zeros with their own timestamp would put the very defect this
+// field exists to remove back on the one point that is easiest to get wrong.
+// Three minutes is the two-minute backdate plus one more step of headroom; a
+// counter was zero before its first observation, so the claim is true.
+const counterBaselineSeconds = 3 * 60
+
+// streamStart is the start-of-accumulation stamp a stream admitted (or reset)
+// at now should carry.
+func (s *series) streamStart(now int64) int64 {
+	if s.kind == kindCounter {
+		return now - counterBaselineSeconds
+	}
+	return now
 }
 
 // warnCapped counts the refused observation and logs the cardinality cap at
@@ -576,6 +608,14 @@ func (s *series) snapshot() []sample {
 			samp.initial = false
 			samp.count = 0
 			samp.value = 0
+			// The ONE place a live sample's accumulation genuinely restarts, so
+			// the one place start moves. The emit above copied the pre-reset
+			// sample, so it keeps the old start; everything after this carries
+			// the new one, which is what tells a consumer the drop to zero was a
+			// reset and not a counter running backwards. (The grace-DELETE
+			// branch above needs no equivalent: the sample is gone, and a later
+			// re-appearance is a fresh admit.)
+			samp.start = s.streamStart(now)
 			samp.exported = true // the zero needs no further emission
 			continue
 		}

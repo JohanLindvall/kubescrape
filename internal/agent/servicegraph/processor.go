@@ -18,19 +18,40 @@ type edgeSink interface{ Record(Edge) }
 const (
 	attrServiceName = "service.name"
 
-	// sweepPerBatch is the incremental expiry one Consume call pays. Expiry has
-	// to be driven by SOMETHING on a shard that is only being pushed spans, and
-	// paying it here keeps the store from growing to MaxItems while a caller's
-	// Sweep ticker is between ticks. It is cheap: the expiry list is ordered,
-	// so a batch with nothing due pays one time comparison.
-	sweepPerBatch = 32
+	// Expiry has to be driven by SOMETHING on a shard that is only being pushed
+	// spans, so Consume pays an incremental pass on the way in — which is what
+	// keeps the store from growing to MaxItems between a caller's Sweep ticks.
+	//
+	// Its budget SCALES WITH THE BATCH, and that is the whole point: a fixed
+	// per-call budget is a per-BATCH rate, and the batch size is the SENDER's
+	// choice, not this shard's. The same 1000 unpairable half-edges per second
+	// drained comfortably at 20-span pushes and fell far behind at 200-span
+	// ones, filling the store and dropping spans — a memory bound that moved
+	// when someone tuned an SDK's batch processor.
+	//
+	// A span creates AT MOST one half-edge, so retiring up to one entry per span
+	// can always keep pace with insertion however the spans are batched;
+	// sweepFloorPerBatch is the extra headroom that lets a backlog DRAIN rather
+	// than merely hold, and covers a small batch arriving after a quiet spell.
+	// It stays cheap because the expiry list is expiry-ordered: a batch with
+	// nothing due pays one time comparison whatever the budget says.
+	sweepFloorPerBatch = 32
+	// maxSweepPerBatch caps that pass. It holds the mutex every concurrent
+	// Consume needs, so one huge push must not stall the shard's ingest for the
+	// length of its own span count; the ticker below picks up any remainder.
+	maxSweepPerBatch = 1024
 
-	// sweepBudget bounds one Sweep call. Bounded rather than draining, because
-	// the sweep holds the mutex every concurrent Consume needs: a full drain of
-	// a 10k-entry store would stall the shard's ingest for its duration. At a
-	// one-second Sweep cadence this retires 1024 half-edges per second — far
-	// past what a shard can accumulate in a Wait window without also hitting
-	// MaxItems, whose counter is the signal to look at.
+	// sweepBudget bounds one TICKER Sweep call — cmd/kubescrape-agent's
+	// sweepServiceGraph, whose cadence is wait/2 clamped to [1s, 30s], i.e. 5s
+	// at the default 10s wait. Bounded for the same mutex reason.
+	//
+	// This loop is NOT what keeps up with ingest; the per-batch pass above is.
+	// It exists for the shard that has gone QUIET, where nothing is arriving to
+	// drive expiry and a client half that could still become a virtual-node edge
+	// would otherwise sit until the next busy batch — or, on a tier that
+	// quiesces overnight, until morning. At the default cadence it retires 1024
+	// half-edges every 5s, which drains a full 10k store in under a minute of
+	// silence.
 	sweepBudget = 1024
 )
 
@@ -47,7 +68,10 @@ var databaseAttrs = []string{"db.system", "db.name", "db.system.name", "db.names
 // derives leaves through the sink.
 type Processor struct {
 	cfg Config
-	log *slog.Logger
+	// wait is the RESOLVED pairing window: Config.Wait is a string (it has to
+	// be, to decode from YAML — see Config.Wait), parsed once here.
+	wait time.Duration
+	log  *slog.Logger
 
 	store *edgeStore
 	sink  edgeSink
@@ -84,7 +108,14 @@ func NewProcessor(cfg Config, log *slog.Logger) *Processor {
 		log = slog.Default()
 	}
 	cfg = cfg.withDefaults()
-	p := &Processor{cfg: cfg, log: log, now: time.Now}
+	// An unparseable wait falls back to the default rather than refusing to
+	// pair; Config.Validate is what reports it, and -check-config runs that on
+	// every start (spanmetrics' New makes the same trade for staleAfter).
+	wait, err := cfg.wait()
+	if err != nil {
+		log.Warn("service-graph wait is unparseable; using the default", "error", err, "wait", wait)
+	}
+	p := &Processor{cfg: cfg, wait: wait, log: log, now: time.Now}
 
 	// Deduplicate the configured dimensions. A repeat would resolve twice and
 	// write the same map key twice — harmless but pure waste on the hot path
@@ -112,9 +143,9 @@ func NewProcessor(cfg Config, log *slog.Logger) *Processor {
 	// comparing the raw config would report drift an operator cannot see and
 	// miss drift they can.
 	p.mismatch = newMismatchWatch(p.dims, p.peerAttrs, log)
-	p.store = newEdgeStore(cfg, p.emit)
+	p.store = newEdgeStore(cfg, wait, p.emit)
 	log.Debug("service-graph pairing configured",
-		"wait", cfg.Wait, "maxItems", cfg.MaxItems,
+		"wait", wait, "maxItems", cfg.MaxItems,
 		"dimensions", len(p.dims), "peerAttributes", len(p.peerAttrs))
 	return p
 }
@@ -122,7 +153,7 @@ func NewProcessor(cfg Config, log *slog.Logger) *Processor {
 // Wait reports the effective pairing window (Tempo's default when unset). The
 // caller driving Sweep sizes its cadence from this rather than re-deriving the
 // defaults, so a configured Wait and the sweep that enforces it cannot drift.
-func (p *Processor) Wait() time.Duration { return p.cfg.Wait }
+func (p *Processor) Wait() time.Duration { return p.wait }
 
 // SetSink wires the metric writer. Call it before the first Consume: the sink
 // is read on the pairing path under the store's mutex, and swapping it under a
@@ -148,8 +179,10 @@ func (p *Processor) Consume(td ptrace.Traces) {
 	// the clock feeds a Wait-scale (seconds) expiry decision, and a syscall per
 	// span would dominate the per-span cost.
 	now := p.now()
-	// Incremental expiry on the way in — see sweepPerBatch.
-	p.store.expire(now, sweepPerBatch)
+	// Incremental expiry on the way in, budgeted by THIS batch's span count —
+	// see sweepFloorPerBatch. SpanCount walks the scopes, not the spans, so it
+	// costs nothing next to the per-span work below.
+	p.store.expire(now, min(td.SpanCount()+sweepFloorPerBatch, maxSweepPerBatch))
 
 	rss := td.ResourceSpans()
 	for i := 0; i < rss.Len(); i++ {
@@ -216,6 +249,19 @@ func (p *Processor) observe(span ptrace.Span, resAttrs pcommon.Map, svc string, 
 	sid := span.SpanID()
 	if side == sideServer {
 		sid = span.ParentSpanID()
+	}
+	// A CLIENT half with no span id of its own is refused, and that is what
+	// keeps the paragraph above safe. Its key would be (trace, zero) — the very
+	// key every ROOT SERVER span of that trace uses — so a malformed SDK's
+	// zero-id client span would pair with an unrelated ingress hop and invent an
+	// edge between two services that never called each other. (A zero-id CLIENT
+	// span is unusable anyway: its span id is what a server half looks itself up
+	// by, so nothing could ever legitimately pair with it.) Counted, not
+	// silent — a whole SDK emitting these would otherwise look like a quiet
+	// graph rather than a broken one.
+	if side == sideClient && sid.IsEmpty() {
+		p.store.countUnkeyable()
+		return
 	}
 
 	spanAttrs := span.Attributes()

@@ -1128,10 +1128,11 @@ func (p *pipelines) startIngest() error {
 	//
 	// Relative to the span-metrics tap the order is free: both forward to their
 	// inner exporter FIRST and act only on success, so neither changes what the
-	// other sees. Outermost is chosen so the shard fan-out — the only step here
-	// that touches the network — happens after the whole local chain has
-	// succeeded, rather than inside another tap's forward path where a slow
-	// shard would sit between a span and its own RED metrics.
+	// other sees. Outermost is chosen so the graph hop is decided after the
+	// whole local chain has succeeded. The shard SEND itself is not in this
+	// path at all — Forward hands each shard's share to a bounded queue and
+	// returns, precisely so a shard that is not answering cannot park one of
+	// the ingest receiver's in-flight slots (see servicegraph.Forward).
 	//
 	// Forwarding on success only, for the tap's own reason: a failed export is
 	// retried by the sender, and the shard's edge counters are cumulative and
@@ -1153,6 +1154,7 @@ func (p *pipelines) startIngest() error {
 				return obs.ServiceGraphForwardStat{
 					SpansForwarded: st.SpansForwarded,
 					SpansLost:      st.SpansLost,
+					SpansQueueFull: st.SpansQueueFull,
 					SendsFailed:    st.SendsFailed,
 					LoopsBlocked:   st.LoopsBlocked,
 				}

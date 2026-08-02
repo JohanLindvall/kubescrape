@@ -163,10 +163,12 @@ type edgeStore struct {
 	dimBuf []EdgeDimension
 }
 
-// newEdgeStore builds the store from an already-defaulted config.
-func newEdgeStore(cfg Config, onEdge func(Edge)) *edgeStore {
+// newEdgeStore builds the store from an already-defaulted config plus the
+// RESOLVED pairing window (Config.Wait is a string — see Config.wait — so the
+// caller parses it once at construction rather than per store method).
+func newEdgeStore(cfg Config, wait time.Duration, onEdge func(Edge)) *edgeStore {
 	return &edgeStore{
-		wait:     cfg.Wait,
+		wait:     wait,
 		maxItems: cfg.MaxItems,
 		onEdge:   onEdge,
 		items:    make(map[edgeKey]*pendingEdge),

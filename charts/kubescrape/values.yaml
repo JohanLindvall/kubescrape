@@ -420,12 +420,13 @@ serviceGraph:
   #       wait: 10s            # how long a half-edge waits for its partner:
   #                            # longer pairs more slow requests but holds more
   #                            # memory; a rising expired counter means it is
-  #                            # shorter than the real client->server gap
+  #                            # shorter than the real client->server gap.
+  #                            # A Go duration STRING, like traceMetrics.staleAfter
   #       maxItems: 10000      # half-edges held at once; over it spans are
   #                            # dropped (counted, never silent)
   #       maxCardinality: 20000  # distinct EDGE series
   #       staleAfter: 15m      # evict unobserved edges — without it
-  #                            # maxCardinality is a one-way latch
+  #                            # maxCardinality is a one-way latch. "0" disables
   #       dimensions: [http.route]   # extra client_/server_ labels
   # Anything else goes here as raw flags, in the DaemonSet's style.
   extraArgs: []

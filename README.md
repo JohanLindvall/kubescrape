@@ -931,10 +931,15 @@ one per latency bucket, pointing at the trace and at the span that measured
 *that* side — `serviceGraph.exemplars: false` turns them off). Labels are `client`, `server`,
 `connection_type` (empty, `messaging_system`, `database` or `virtual_node`),
 `virtual_node` when a side was synthesized, plus any configured `dimensions`
-as `client_<dim>`/`server_<dim>`. `wait`, `maxItems`, `maxCardinality` and
-`staleAfter` (config section `serviceGraph`) are the bounds that trade
+as `client_<dim>`/`server_<dim>`. `wait` and `staleAfter` (Go durations —
+`10s`, `15m`; `staleAfter: "0"` disables eviction), `maxItems` and
+`maxCardinality` (config section `serviceGraph`) are the bounds that trade
 completeness for memory; each has a counter that moves when it binds, because
-a missing edge looks exactly like a call that never happened. **The limitation
+a missing edge looks exactly like a call that never happened. The forward hop
+is **asynchronous**: each agent hands a shard's share to a bounded queue and
+returns, so a shard that stops answering sheds edges
+(`kubescrape_service_graph_spans_queue_full_total`) rather than parking an OTLP
+ingest slot — losing an edge must never cost a span. **The limitation
 is structural**: an uninstrumented callee emits no server span, so its calls
 appear only as **virtual nodes** named from the client span's `peer.service` /
 `db.name` / `db.system` — and a client naming none of those yields no edge at

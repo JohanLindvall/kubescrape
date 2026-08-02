@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -179,6 +180,28 @@ func fakeShards(t testing.TB, n int) (map[string]TracesExporter, []*captureExpor
 	return m, caps
 }
 
+// testForwarder builds a forwarder over fake shard clients and closes it when
+// the test ends: the fan-out owns one goroutine per shard (see Forward), and a
+// test that leaked them would leak one per case.
+func testForwarder(t testing.TB, clients map[string]TracesExporter, tokensPerShard int, dims, peers []string) *Forwarder {
+	t.Helper()
+	f := NewForwarderWithClients(clients, tokensPerShard, dims, peers, discardLog())
+	t.Cleanup(func() { _ = f.Close() })
+	return f
+}
+
+// waitForwarded blocks until every queued payload has been delivered (or has
+// failed). The shard fan-out is ASYNCHRONOUS by design — Forward hands each
+// shard's share to a bounded queue and returns, so the ingest handler is never
+// parked behind a shard — which means a test reading counters or the shards'
+// captures straight after Forward would be racing the workers.
+func waitForwarded(t testing.TB, f *Forwarder) {
+	t.Helper()
+	if !f.awaitIdle(10 * time.Second) {
+		t.Fatalf("the forwarder did not drain within 10s (%d payloads still queued)", f.queued.Load())
+	}
+}
+
 func discardLog() *slog.Logger { return slog.New(slog.DiscardHandler) }
 
 func marshal(t testing.TB, td ptrace.Traces) []byte {
@@ -201,11 +224,12 @@ func TestTapForwardsOriginalUntouched(t *testing.T) {
 	before := marshal(t, td)
 
 	clients, caps := fakeShards(t, 4)
-	f := NewForwarderWithClients(clients, 0, nil, nil, discardLog())
+	f := testForwarder(t, clients, 0, nil, nil)
 	inner := &captureExporter{}
 	if err := f.Tap(inner).ExportTraces(context.Background(), td); err != nil {
 		t.Fatalf("ExportTraces: %v", err)
 	}
+	waitForwarded(t, f)
 
 	if got := len(inner.got); got != 1 {
 		t.Fatalf("inner got %d payloads, want 1", got)
@@ -234,7 +258,7 @@ func TestTapForwardsOriginalUntouched(t *testing.T) {
 // cumulative edge counters dedupe nothing.
 func TestTapDoesNotForwardOnFailure(t *testing.T) {
 	clients, caps := fakeShards(t, 4)
-	f := NewForwarderWithClients(clients, 0, nil, nil, discardLog())
+	f := testForwarder(t, clients, 0, nil, nil)
 	boom := errors.New("collector unavailable")
 	inner := &captureExporter{err: boom}
 
@@ -242,6 +266,7 @@ func TestTapDoesNotForwardOnFailure(t *testing.T) {
 	if !errors.Is(err, boom) {
 		t.Fatalf("ExportTraces error = %v, want %v", err, boom)
 	}
+	waitForwarded(t, f)
 	for i, c := range caps {
 		if c.calls() != 0 {
 			t.Errorf("shard %d was sent %d payloads after a failed inner export", i, c.calls())
@@ -269,13 +294,14 @@ func TestFailingShardDoesNotFailExport(t *testing.T) {
 	for _, c := range caps {
 		c.err = errors.New("shard down")
 	}
-	f := NewForwarderWithClients(clients, 0, nil, nil, discardLog())
+	f := testForwarder(t, clients, 0, nil, nil)
 	inner := &captureExporter{}
 	td := realisticBatch(20, 1)
 
 	if err := f.Tap(inner).ExportTraces(context.Background(), td); err != nil {
 		t.Fatalf("a failing shard failed the caller's export: %v", err)
 	}
+	waitForwarded(t, f)
 	if len(inner.got) != 1 {
 		t.Fatalf("inner got %d payloads, want 1", len(inner.got))
 	}
@@ -339,6 +365,145 @@ func TestSpansWithNoTraceIDAreDropped(t *testing.T) {
 	realisticSpan(ss.Spans().AppendEmpty(), ptrace.SpanKindClient, pcommon.TraceID{}, fwdSpanID(1), pcommon.SpanID{})
 	if n := Trim(td).SpanCount(); n != 0 {
 		t.Errorf("trimmed span count = %d, want 0", n)
+	}
+}
+
+// --- the fan-out must never block the ingest handler ---
+
+// blockingExporter parks every send until release is closed — a shard that
+// accepts the connection and answers nothing, which is the EXPECTED failure
+// here: the chart's headless Service publishes not-ready addresses (the ring
+// needs stable names before a pod is ready), so DNS resolves to shards that are
+// still starting.
+type blockingExporter struct {
+	release chan struct{}
+	calls   atomic.Int64
+}
+
+func (b *blockingExporter) ExportTraces(_ context.Context, _ ptrace.Traces) error {
+	b.calls.Add(1)
+	<-b.release
+	return nil
+}
+
+// TestForwardNeverBlocksTheCaller is the whole reason the fan-out is
+// asynchronous. Forward runs inside the OTLP ingest handler, which holds one of
+// only -ingest-max-in-flight slots (32); a synchronous fan-out parks that slot
+// for as long as a shard takes to answer, so a black-holing shard sheds the
+// node's UNRELATED pushed logs and metrics with 429. Losing an edge must never
+// cost a span — that is this package's stated contract, and it is exactly what
+// a blocking send breaks.
+func TestForwardNeverBlocksTheCaller(t *testing.T) {
+	release := make(chan struct{})
+	blocked := &blockingExporter{release: release}
+	healthy := &captureExporter{}
+	f := testForwarder(t, map[string]TracesExporter{"shard-0": blocked, "shard-1": healthy}, 0, nil, nil)
+	// Registered AFTER the forwarder's own cleanup, so it runs BEFORE it (LIFO):
+	// Close would otherwise spend its whole drain budget waiting on this shard.
+	t.Cleanup(func() { close(release) })
+
+	inner := &captureExporter{}
+	tap := f.Tap(inner)
+	td := realisticBatch(200, 0) // 400 edge spans, spread over both shards
+
+	done := make(chan error, 1)
+	go func() { done <- tap.ExportTraces(context.Background(), td) }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("ExportTraces: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the shard fan-out blocked the caller: an ingest slot is parked behind a shard that is not answering")
+	}
+	if len(inner.got) != 1 {
+		t.Fatalf("inner got %d payloads, want 1", len(inner.got))
+	}
+
+	// And the healthy shard is unaffected — a stuck shard costs its own arc of
+	// the ring, not the whole graph.
+	deadline := time.Now().Add(5 * time.Second)
+	for healthy.spans() == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("the healthy shard received nothing while another shard was stuck")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if blocked.calls.Load() == 0 {
+		t.Error("the stuck shard was never even attempted")
+	}
+}
+
+// TestFullForwardQueueShedsAndCounts: the queue is a shock absorber for a
+// briefly slow shard, not a buffer for a dead one. Over its bounds it drops and
+// COUNTS — silence here would look exactly like a graph with no traffic.
+func TestFullForwardQueueShedsAndCounts(t *testing.T) {
+	release := make(chan struct{})
+	blocked := &blockingExporter{release: release}
+	f := testForwarder(t, map[string]TracesExporter{"shard-0": blocked}, 0, nil, nil)
+	t.Cleanup(func() { close(release) })
+
+	const batches, perBatch = 400, 50 // 100 edge spans each
+	for i := 0; i < batches; i++ {
+		f.Forward(context.Background(), realisticBatch(perBatch, 0))
+	}
+
+	st := f.Stats()
+	if st.SpansQueueFull == 0 {
+		t.Fatalf("stats = %+v: nothing was counted as shed, so the queue grew without bound", st)
+	}
+	// Bounded memory, which is the other half of the claim: neither the item cap
+	// nor the span budget may be exceeded.
+	q := f.queues["shard-0"]
+	if got := len(q.ch); got > forwardQueueItems {
+		t.Errorf("queue holds %d items, cap is %d", got, forwardQueueItems)
+	}
+	// One payload may be in flight past the budget (reserve admits a batch into
+	// an EMPTY queue whatever its size, so a single oversized push can never
+	// wedge a shard); everything else is inside it.
+	if got := q.spans.Load(); got > forwardQueueSpans+perBatch*2 {
+		t.Errorf("queue holds %d spans, budget is %d", got, forwardQueueSpans)
+	}
+	// Every span is accounted for: forwarded, shed, or still queued.
+	if total := st.SpansForwarded + st.SpansQueueFull; total > batches*perBatch*2 {
+		t.Errorf("accounted for %d spans, only %d were offered", total, batches*perBatch*2)
+	}
+}
+
+// TestCloseDrainsThenAbandons pins both halves of the shutdown contract: what is
+// already queued is given a chance to land, and a shard that is not answering
+// cannot hold the process — the agent's other final exports run after this and
+// would be lost to SIGKILL.
+func TestCloseDrainsThenAbandons(t *testing.T) {
+	// Drains what is queued.
+	slow := &captureExporter{}
+	f := NewForwarderWithClients(map[string]TracesExporter{"shard-0": slow}, 0, nil, nil, discardLog())
+	f.Forward(context.Background(), realisticBatch(10, 0))
+	if err := f.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if got := slow.spans(); got != 20 {
+		t.Errorf("Close delivered %d spans, want 20: queued forwards were abandoned rather than drained", got)
+	}
+	// Close is idempotent — main defers it beside an explicit path.
+	if err := f.Close(); err != nil {
+		t.Fatalf("second Close: %v", err)
+	}
+
+	// And is bounded when the shard never answers.
+	defer func(d time.Duration) { forwardDrainTimeout = d }(forwardDrainTimeout)
+	forwardDrainTimeout = 50 * time.Millisecond
+	release := make(chan struct{})
+	defer close(release)
+	blocked := &blockingExporter{release: release}
+	f2 := NewForwarderWithClients(map[string]TracesExporter{"shard-0": blocked}, 0, nil, nil, discardLog())
+	f2.Forward(context.Background(), realisticBatch(10, 0))
+	done := make(chan struct{})
+	go func() { defer close(done); _ = f2.Close() }()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Close did not return while a shard send was stuck: the shutdown budget is unbounded")
 	}
 }
 
@@ -460,6 +625,58 @@ func TestTrimKeepsConfiguredDimensions(t *testing.T) {
 	}
 }
 
+// TestTrimKeepsSemconvDatabaseAttributes: the shard's namesDatabase reads the
+// post-semconv-1.30 spellings (db.system.name / db.namespace) beside Tempo's
+// older db.system / db.name, and an SDK on today's conventions emits ONLY the
+// new pair. The trim's fixed floor has to carry them, or that support is dead
+// code in the only production topology there is — the agent trims, the shard
+// reads — and every modern database client renders as a plain
+// service-to-service call. mismatchWatch cannot catch this either: it compares
+// the two sides' CONFIGURED lists, and the floor is in neither.
+func TestTrimKeepsSemconvDatabaseAttributes(t *testing.T) {
+	// A realistic 1.30 client span: the far side named by peer.service, the
+	// callee identified only by the new db keys.
+	td := sgTraces("checkout", sgSpan{
+		kind: ptrace.SpanKindClient, dur: 0.02,
+		traceID: traceID(1), spanID: spanID(1),
+		attrs: map[string]string{
+			"db.system.name":  "postgresql",
+			"db.namespace":    "orders",
+			"db.query.text":   "SELECT 1", // not a classifier: must still be trimmed
+			"peer.service":    "orders-db",
+			"server.address":  "orders-db.shop.svc.cluster.local",
+			"db.operation.na": "SELECT",
+		},
+	})
+
+	// The DEFAULT trim — an agent with no serviceGraphShards.peerAttributes,
+	// which is exactly what the chart renders.
+	out := Trim(td)
+	got := out.ResourceSpans().At(0).ScopeSpans().At(0).Spans().At(0).Attributes()
+	for _, k := range []string{"db.system.name", "db.namespace", "peer.service"} {
+		if _, ok := got.Get(k); !ok {
+			t.Errorf("span attribute %s was trimmed away, so the shard can never see it", k)
+		}
+	}
+	if _, ok := got.Get("db.query.text"); ok {
+		t.Error("db.query.text survived the trim: the floor is the classifiers, not the whole db namespace")
+	}
+
+	// End to end: the shard classifies the edge as a database call and names the
+	// uninstrumented far side from peer.service.
+	p, sink, clock := newTestProcessor(t, Config{Wait: "1s"})
+	p.Consume(out)
+	*clock = t0.Add(time.Second)
+	p.Sweep()
+	e := sink.only(t)
+	if e.Connection != ConnectionDatabase {
+		t.Errorf("connection = %q, want %q", e.Connection, ConnectionDatabase)
+	}
+	if e.ServerService != "orders-db" || e.VirtualNode != virtualNodeServer {
+		t.Errorf("edge = %+v, want a virtual server node named orders-db", e)
+	}
+}
+
 // TestTrimByteCost reports the wire cost of the feature. Not an assertion
 // about a particular number — a printed measurement, plus a floor under the
 // saving so a future "just keep the attributes, it is easier" change has to
@@ -500,8 +717,8 @@ func TestBothHalvesOfATraceLandOnOneShard(t *testing.T) {
 	const shards, traces = 8, 2000
 	clientsA, capsA := fakeShards(t, shards)
 	clientsB, capsB := fakeShards(t, shards)
-	agentA := NewForwarderWithClients(clientsA, 0, nil, nil, discardLog())
-	agentB := NewForwarderWithClients(clientsB, 0, nil, nil, discardLog())
+	agentA := testForwarder(t, clientsA, 0, nil, nil)
+	agentB := testForwarder(t, clientsB, 0, nil, nil)
 
 	// Agent A ships the client halves, agent B the server halves.
 	mk := func(kind ptrace.SpanKind, svc string) ptrace.Traces {
@@ -516,6 +733,8 @@ func TestBothHalvesOfATraceLandOnOneShard(t *testing.T) {
 	}
 	agentA.Forward(context.Background(), mk(ptrace.SpanKindClient, "checkout"))
 	agentB.Forward(context.Background(), mk(ptrace.SpanKindServer, "orders"))
+	waitForwarded(t, agentA)
+	waitForwarded(t, agentB)
 
 	// Collect, per shard index, the set of trace ids each side delivered.
 	collect := func(caps []*captureExporter) []map[pcommon.TraceID]bool {
@@ -577,8 +796,9 @@ func TestBothHalvesOfATraceLandOnOneShard(t *testing.T) {
 // source resource's attributes are copied once per shard rather than per span.
 func TestForwardGroupsPerShardResource(t *testing.T) {
 	clients, caps := fakeShards(t, 4)
-	f := NewForwarderWithClients(clients, 0, nil, nil, discardLog())
+	f := testForwarder(t, clients, 0, nil, nil)
 	f.Forward(context.Background(), realisticBatch(200, 0))
+	waitForwarded(t, f)
 
 	total := 0
 	for _, c := range caps {
@@ -607,10 +827,11 @@ func TestForwardGroupsPerShardResource(t *testing.T) {
 // itself must stop at one hop, not amplify.
 func TestLoopMarkerBlocksReforwarding(t *testing.T) {
 	clients, caps := fakeShards(t, 4)
-	f := NewForwarderWithClients(clients, 0, nil, nil, discardLog())
+	f := testForwarder(t, clients, 0, nil, nil)
 	// A payload as it arrives at a shard: already trimmed and marked.
 	already := Trim(realisticBatch(10, 0))
 	f.Forward(context.Background(), already)
+	waitForwarded(t, f)
 
 	for i, c := range caps {
 		if c.calls() != 0 {
@@ -631,10 +852,17 @@ func TestShardTargetsFromTemplate(t *testing.T) {
 	if err != nil {
 		t.Fatalf("shardTargets: %v", err)
 	}
+	// 4319, not 4317: the default MUST be the port the shard receiver listens on
+	// by default (-service-graph-listen). 4317 is the AGENTS' own ingest port,
+	// which the shard pods do not serve at all, so a config relying on the
+	// default forwarded into a black hole.
+	if DefaultShardPort != 4319 {
+		t.Fatalf("DefaultShardPort = %d, want 4319 (the shard receiver's own default)", DefaultShardPort)
+	}
 	want := []shardTarget{
-		{name: "kubescrape-servicegraph-0", endpoint: "kubescrape-servicegraph-0.kubescrape-servicegraph.monitoring.svc:4317"},
-		{name: "kubescrape-servicegraph-1", endpoint: "kubescrape-servicegraph-1.kubescrape-servicegraph.monitoring.svc:4317"},
-		{name: "kubescrape-servicegraph-2", endpoint: "kubescrape-servicegraph-2.kubescrape-servicegraph.monitoring.svc:4317"},
+		{name: "kubescrape-servicegraph-0", endpoint: "kubescrape-servicegraph-0.kubescrape-servicegraph.monitoring.svc:4319"},
+		{name: "kubescrape-servicegraph-1", endpoint: "kubescrape-servicegraph-1.kubescrape-servicegraph.monitoring.svc:4319"},
+		{name: "kubescrape-servicegraph-2", endpoint: "kubescrape-servicegraph-2.kubescrape-servicegraph.monitoring.svc:4319"},
 	}
 	if len(got) != len(want) {
 		t.Fatalf("got %d targets, want %d", len(got), len(want))
@@ -645,17 +873,47 @@ func TestShardTargetsFromTemplate(t *testing.T) {
 		}
 	}
 
-	// The HTTP protocol needs a scheme, and a CA implies https.
+	// The HTTP protocol needs a scheme, and every way of asking for TLS must
+	// produce https — otlpexport ignores Insecure for HTTP, so here the scheme
+	// IS the TLS decision, and a request for TLS that fell through to plaintext
+	// would put the shard bearer token on the wire in the clear.
+	base := ForwardConfig{StatefulSet: "kubescrape-servicegraph", Replicas: 1,
+		Namespace: "monitoring", Protocol: "http", Port: 4318}
+	const plain = "http://kubescrape-servicegraph-0.kubescrape-servicegraph.monitoring.svc:4318"
+	const secure = "https://kubescrape-servicegraph-0.kubescrape-servicegraph.monitoring.svc:4318"
+	yes, no := true, false
+	for _, tc := range []struct {
+		name string
+		mut  func(*ForwardConfig)
+		want string
+	}{
+		{"nothing configured", func(*ForwardConfig) {}, plain},
+		{"caFile", func(c *ForwardConfig) { c.CAFile = "/etc/ca.pem" }, secure},
+		{"insecureSkipVerify", func(c *ForwardConfig) { c.InsecureSkipVerify = &yes }, secure},
+		{"insecure: false", func(c *ForwardConfig) { c.Insecure = &no }, secure},
+		// An explicit insecure wins, so caFile beside it is a contradiction —
+		// which otlpexport.New then refuses loudly rather than quietly
+		// handshaking or quietly not.
+		{"insecure: true beats a caFile", func(c *ForwardConfig) { c.Insecure, c.CAFile = &yes, "/etc/ca.pem" }, plain},
+	} {
+		t.Run("http/"+tc.name, func(t *testing.T) {
+			c := base
+			tc.mut(&c)
+			got, err := c.shardTargets()
+			if err != nil {
+				t.Fatalf("shardTargets: %v", err)
+			}
+			if got[0].endpoint != tc.want {
+				t.Errorf("endpoint = %q, want %q", got[0].endpoint, tc.want)
+			}
+			// And the exporter config agrees with the scheme it just derived.
+			cc := c.clientConfig(got[0], otlpexportConfigForTest())
+			if wantInsecure := tc.want == plain; cc.Insecure != wantInsecure {
+				t.Errorf("clientConfig Insecure = %v, want %v (it must match the scheme)", cc.Insecure, wantInsecure)
+			}
+		})
+	}
 	cfg.Protocol, cfg.Port = "http", 4318
-	got, _ = cfg.shardTargets()
-	if got[0].endpoint != "http://kubescrape-servicegraph-0.kubescrape-servicegraph.monitoring.svc:4318" {
-		t.Errorf("http endpoint = %q", got[0].endpoint)
-	}
-	cfg.CAFile = "/etc/ca.pem"
-	got, _ = cfg.shardTargets()
-	if got[0].endpoint != "https://kubescrape-servicegraph-0.kubescrape-servicegraph.monitoring.svc:4318" {
-		t.Errorf("https endpoint = %q", got[0].endpoint)
-	}
 
 	// Explicit endpoints win, and the name IS the endpoint.
 	cfg.Endpoints = []string{"sg-a:4317", " sg-b:4317 "}
@@ -755,15 +1013,17 @@ func TestNewForwarderBuildsRing(t *testing.T) {
 
 // --- benchmark ---
 
-// BenchmarkTap measures the whole tap on a realistic batch: a no-op inner
-// export plus trim, hash and per-shard grouping for 20 traces (40 edge spans)
-// with 3 INTERNAL spans each.
+// BenchmarkTap measures what the CALLER pays on a realistic batch: a no-op
+// inner export plus trim, hash, per-shard grouping and the queue hand-off, for
+// 20 traces (40 edge spans) with 3 INTERNAL spans each. The shard SEND is not
+// in this number by design — it happens on the fan-out workers, off the ingest
+// handler's goroutine (see Forward).
 func BenchmarkTap(b *testing.B) {
 	clients := map[string]TracesExporter{}
 	for i := 0; i < 8; i++ {
 		clients[fmt.Sprintf("shard-%d", i)] = nopExporter{}
 	}
-	f := NewForwarderWithClients(clients, 0, nil, nil, discardLog())
+	f := testForwarder(b, clients, 0, nil, nil)
 	tap := f.Tap(nopExporter{})
 	td := realisticBatch(20, 3)
 	ctx := context.Background()

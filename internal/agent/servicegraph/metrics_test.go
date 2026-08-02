@@ -562,7 +562,7 @@ func TestCardinalityCapDropsOnlyNewSeries(t *testing.T) {
 // observations nobody has seen.
 func TestStaleEvictionOnlyAfterDelivery(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0)
-	r := NewRegistry(Config{StaleAfter: 15 * time.Minute})
+	r := NewRegistry(Config{StaleAfter: "15m"})
 	fixedClock(r, &now)
 	r.Record(edge("frontend", "checkout"))
 
@@ -606,7 +606,7 @@ func TestStaleEvictionOnlyAfterDelivery(t *testing.T) {
 // backwards.
 func TestReCreatedSeriesGetsFreshStartTimestamp(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0)
-	r := NewRegistry(Config{StaleAfter: time.Minute})
+	r := NewRegistry(Config{StaleAfter: "1m"})
 	fixedClock(r, &now)
 
 	r.Record(edge("frontend", "checkout"))

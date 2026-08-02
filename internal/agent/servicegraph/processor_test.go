@@ -153,7 +153,7 @@ func TestConsumeProducerConsumerIsMessaging(t *testing.T) {
 // A consumer whose producer never arrives still pairs with a virtual node, and
 // keeps the messaging classification (the deviation documented in promote).
 func TestConsumeConsumerOnlyKeepsMessaging(t *testing.T) {
-	p, sink, clock := newTestProcessor(t, Config{Wait: time.Second})
+	p, sink, clock := newTestProcessor(t, Config{Wait: "1s"})
 	p.Consume(sgTraces("shipping", sgSpan{kind: ptrace.SpanKindConsumer, dur: 0.02,
 		traceID: traceID(1), spanID: spanID(2), parentID: spanID(1),
 		attrs: map[string]string{"peer.service": "orders-queue"}}))
@@ -236,7 +236,7 @@ func TestConsumeVirtualNodePeerPrecedence(t *testing.T) {
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			p, sink, clock := newTestProcessor(t, Config{Wait: time.Second})
+			p, sink, clock := newTestProcessor(t, Config{Wait: "1s"})
 			p.Consume(sgTraces("checkout", clientSpan(0.1, tc.attrs)))
 			*clock = t0.Add(time.Second)
 			p.Sweep()
@@ -261,7 +261,7 @@ func TestConsumeVirtualNodePeerPrecedence(t *testing.T) {
 func TestConsumeVirtualNodesDisabled(t *testing.T) {
 	// An empty (non-nil) list disables promotion entirely, per the Config
 	// contract: nil takes the default, []string{} means "no virtual nodes".
-	p, sink, clock := newTestProcessor(t, Config{Wait: time.Second, VirtualNodePeerAttributes: []string{}})
+	p, sink, clock := newTestProcessor(t, Config{Wait: "1s", VirtualNodePeerAttributes: []string{}})
 	p.Consume(sgTraces("checkout", clientSpan(0.1, map[string]string{"peer.service": "stripe-api"})))
 	*clock = t0.Add(time.Second)
 	p.Sweep()
@@ -274,7 +274,7 @@ func TestConsumeVirtualNodesDisabled(t *testing.T) {
 }
 
 func TestConsumeExpiryUnpaired(t *testing.T) {
-	p, sink, clock := newTestProcessor(t, Config{Wait: 10 * time.Second})
+	p, sink, clock := newTestProcessor(t, Config{Wait: "10s"})
 	p.Consume(sgTraces("checkout", clientSpan(0.1, nil)))
 
 	*clock = t0.Add(9 * time.Second)
@@ -295,7 +295,7 @@ func TestConsumeExpiryUnpaired(t *testing.T) {
 // Consume itself expires incrementally, so a shard that is only being pushed
 // spans never grows to MaxItems between a caller's Sweep ticks.
 func TestConsumeExpiresIncrementally(t *testing.T) {
-	p, _, clock := newTestProcessor(t, Config{Wait: time.Second})
+	p, _, clock := newTestProcessor(t, Config{Wait: "1s"})
 	p.Consume(sgTraces("checkout", clientSpan(0.1, nil)))
 	*clock = t0.Add(time.Second)
 	p.Consume(sgTraces("other", sgSpan{kind: ptrace.SpanKindClient, dur: 0.1,
@@ -385,7 +385,7 @@ func TestConsumeCarriesExemplarIDs(t *testing.T) {
 // that was measured is the one an exemplar can point at, and the missing side
 // contributes no histogram observation to attach one to.
 func TestConsumeVirtualNodeCarriesTheObservedHalfsIDs(t *testing.T) {
-	p, sink, clock := newTestProcessor(t, Config{Wait: time.Second})
+	p, sink, clock := newTestProcessor(t, Config{Wait: "1s"})
 	p.Consume(sgTraces("checkout", clientSpan(0.30, map[string]string{"peer.service": "orders-db"})))
 	*clock = t0.Add(time.Second)
 	p.Sweep()
@@ -401,7 +401,7 @@ func TestConsumeVirtualNodeCarriesTheObservedHalfsIDs(t *testing.T) {
 
 func TestConsumeTruncatesLabelValues(t *testing.T) {
 	long := strings.Repeat("x", maxDimensionValueBytes+10)
-	p, sink, clock := newTestProcessor(t, Config{Wait: time.Second, Dimensions: []string{"http.route"}})
+	p, sink, clock := newTestProcessor(t, Config{Wait: "1s", Dimensions: []string{"http.route"}})
 	p.Consume(sgTraces(long, clientSpan(0.1, map[string]string{
 		"peer.service": long,
 		"http.route":   long,
@@ -451,7 +451,7 @@ func TestConsumeIgnoresUnpairableSpans(t *testing.T) {
 // can ever arrive, so it must promote against its peer attribute — that is the
 // graph's entry edge from outside the mesh.
 func TestConsumeRootServerSpanBecomesEntryEdge(t *testing.T) {
-	p, sink, clock := newTestProcessor(t, Config{Wait: time.Second})
+	p, sink, clock := newTestProcessor(t, Config{Wait: "1s"})
 	p.Consume(sgTraces("frontend", sgSpan{kind: ptrace.SpanKindServer, dur: 0.2,
 		traceID: traceID(1), spanID: spanID(1),
 		attrs: map[string]string{"peer.service": "user"}}))
@@ -479,14 +479,15 @@ func TestConsumeMaxItemsDrops(t *testing.T) {
 // Sweep is bounded per call: it holds the mutex every concurrent Consume needs,
 // so it may never drain an arbitrarily deep store in one go.
 func TestSweepIsBounded(t *testing.T) {
-	p, _, clock := newTestProcessor(t, Config{Wait: time.Second, MaxItems: sweepBudget * 2})
+	p, _, clock := newTestProcessor(t, Config{Wait: "1s", MaxItems: sweepBudget * 2})
 	total := sweepBudget + 100
 	spans := make([]sgSpan, total)
 	for i := range spans {
-		// Trace ids start at 1: a zero trace id is unkeyable by design and
-		// would be skipped rather than stored.
+		// Both ids start at 1: a zero trace id is unkeyable by design, and so is
+		// a zero SPAN id on a client half (it would key where every root server
+		// span of its trace keys). Either would be skipped rather than stored.
 		spans[i] = sgSpan{kind: ptrace.SpanKindClient, dur: 0.1,
-			traceID: traceID(byte(i/200) + 1), spanID: spanID(byte(i % 200))}
+			traceID: traceID(byte(i/200) + 1), spanID: spanID(byte(i%200) + 1)}
 	}
 	// Distinct keys: 200 span ids x ceil(total/200) trace ids.
 	p.Consume(sgTraces("checkout", spans...))
@@ -501,6 +502,98 @@ func TestSweepIsBounded(t *testing.T) {
 	p.Sweep()
 	if s := p.Stats(); s.Items != 0 {
 		t.Fatalf("items = %d after the second Sweep, want 0", s.Items)
+	}
+}
+
+// TestExpiryKeepsUpAtRealisticRates: incremental expiry must keep pace with the
+// SPAN rate, not with the BATCH rate.
+//
+// A fixed per-Consume budget is a per-BATCH bound, and the batch size is the
+// SENDER's choice, not this shard's: at 1000 unpairable half-edges/s a fixed 32
+// drained comfortably when senders pushed 20 spans at a time and fell far
+// behind at 200, filling the store to maxItems and dropping spans — a memory
+// bound that moved when someone tuned an SDK's batch processor. Since a span
+// creates at most one half-edge, a budget that scales with the batch's span
+// count can always keep pace whatever the batching.
+//
+// Sweep is deliberately never called here: the ticker covers a QUIET shard, and
+// what is under test is that a BUSY one needs no help.
+func TestExpiryKeepsUpAtRealisticRates(t *testing.T) {
+	const (
+		spansPerBatch = 200                    // a large but ordinary OTLP push
+		batchPeriod   = 200 * time.Millisecond // => 1000 spans/s
+		batches       = 300                    // 60 simulated seconds, 60k spans
+		wait          = 5 * time.Second
+		maxItems      = 10000 // 2x the steady-state window (wait x rate = 5000)
+	)
+	p, _, clock := newTestProcessor(t, Config{Wait: "5s", MaxItems: maxItems})
+
+	n := uint64(0)
+	for b := 0; b < batches; b++ {
+		spans := make([]sgSpan, spansPerBatch)
+		for i := range spans {
+			// Every span its own trace: unpairable, so every one becomes a
+			// half-edge that only expiry can retire — the worst case, and the
+			// ordinary one for a service calling anything uninstrumented.
+			spans[i] = sgSpan{kind: ptrace.SpanKindClient, dur: 0.01,
+				traceID: fwdTraceID(n), spanID: spanID(1)}
+			n++
+		}
+		p.Consume(sgTraces("checkout", spans...))
+		*clock = clock.Add(batchPeriod)
+	}
+
+	st := p.Stats()
+	if st.Dropped != 0 {
+		t.Fatalf("dropped %d spans at %d spans/s in %d-span batches: expiry is bounded by the batch COUNT, not the span rate (stats %+v)",
+			st.Dropped, int(time.Second/batchPeriod)*spansPerBatch, spansPerBatch, st)
+	}
+	// The live set must sit near the pairing window (wait x rate = 5000), not
+	// creep toward the cap.
+	if want := int(wait/batchPeriod) * spansPerBatch; st.Items > want*3/2 {
+		t.Fatalf("items = %d after %d spans, want about %d (one wait window): the store is growing",
+			st.Items, batches*spansPerBatch, want)
+	}
+	if st.Unpaired == 0 {
+		t.Fatalf("nothing expired at all: stats = %+v", st)
+	}
+}
+
+// TestZeroClientSpanIDCannotCrossPair: a CLIENT half with no span id of its own
+// would key under (trace, zero) — exactly where every ROOT SERVER span of that
+// trace keys, since a root has no parent. One malformed SDK would then pair its
+// zero-id client spans with unrelated ingress hops and INVENT edges between
+// services that never called each other, which is the worst failure this
+// package has: a wrong graph is worse than a missing one, and nothing about the
+// resulting edge looks wrong.
+func TestZeroClientSpanIDCannotCrossPair(t *testing.T) {
+	for _, kind := range []ptrace.SpanKind{ptrace.SpanKindClient, ptrace.SpanKindProducer} {
+		t.Run(kind.String(), func(t *testing.T) {
+			p, sink, clock := newTestProcessor(t, Config{Wait: "1s"})
+			// Malformed: a real trace id, a ZERO span id.
+			p.Consume(sgTraces("checkout", sgSpan{kind: kind, dur: 0.1,
+				traceID: traceID(1), spanID: spanID(0)}))
+			// A legitimate ROOT server span in the SAME trace — an ingress hop,
+			// which is the graph's entry edge and must keep working.
+			p.Consume(sgTraces("orders", sgSpan{kind: ptrace.SpanKindServer, dur: 0.2,
+				traceID: traceID(1), spanID: spanID(9),
+				attrs: map[string]string{"peer.service": "browser"}}))
+
+			if len(sink.edges) != 0 {
+				t.Fatalf("cross-paired into an invented edge: %+v", sink.edges)
+			}
+			if s := p.Stats(); s.Unkeyable != 1 {
+				t.Errorf("stats = %+v, want the zero-id half counted unkeyable", s)
+			}
+			// The root server span is untouched: it still expires into the
+			// entry edge its peer attribute names.
+			*clock = t0.Add(time.Second)
+			p.Sweep()
+			e := sink.only(t)
+			if e.ClientService != "browser" || e.ServerService != "orders" || e.VirtualNode != virtualNodeClient {
+				t.Errorf("entry edge = %+v, want browser -> orders as a virtual client node", e)
+			}
+		})
 	}
 }
 

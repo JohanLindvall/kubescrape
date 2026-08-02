@@ -184,6 +184,15 @@ func validateConfig(cfg agentConfig, transformsFile string) error {
 	if *serviceGraphOn && strings.TrimSpace(*serviceGraphToken) == "" {
 		return fmt.Errorf("-service-graph requires -service-graph-token-file: the shard's span receiver is reachable from every pod in the cluster and must not be unauthenticated")
 	}
+	// A shard with no listener at all receives nothing, pairs nothing, and
+	// reports READY forever (the gate is satisfied by the receiver binding, and
+	// with neither address there is nothing to bind). sgReceiver.Run refuses it,
+	// but only at the real start — so -check-config used to pass a config that
+	// CrashLoops the StatefulSet, from the check whose whole purpose is catching
+	// exactly that. Same wording as the runtime refusal.
+	if *serviceGraphOn && *serviceGraphListen == "" && *serviceGraphHTTPListen == "" {
+		return fmt.Errorf("-service-graph is set but -service-graph-listen (and -service-graph-http-listen) are empty: the shard would receive nothing")
+	}
 	// The SAME merge of flags and section a real start uses, so the dry run
 	// cannot accept a shard set the start rejects (the flags participate: the
 	// chart configures this feature entirely through them).

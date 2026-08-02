@@ -6,6 +6,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -41,6 +42,19 @@ func TestServiceGraphIsOffByDefault(t *testing.T) {
 	if *serviceGraphIv != time.Minute {
 		t.Errorf("-service-graph-interval defaults to %v, want 1m", *serviceGraphIv)
 	}
+	// The two sides' defaults must be the SAME port. They are configured
+	// independently — the shard from -service-graph-listen, the agents from the
+	// serviceGraphShards section's `port` — so a config that names neither has
+	// the agents dialling wherever servicegraph.DefaultShardPort points. It
+	// pointed at 4317, the agents' OWN ingest port, which the shard pods do not
+	// serve (-ingest=false): every forward failed into a counter and the graph
+	// stayed empty.
+	if _, port, err := net.SplitHostPort(*serviceGraphListen); err != nil {
+		t.Errorf("-service-graph-listen %q is not host:port: %v", *serviceGraphListen, err)
+	} else if port != strconv.Itoa(servicegraph.DefaultShardPort) {
+		t.Errorf("the shard listens on %s by default but the agents dial %d: a config naming neither port talks to the wrong one",
+			port, servicegraph.DefaultShardPort)
+	}
 
 	p := testPipelines(t)
 	if err := p.startServiceGraph(); err != nil {
@@ -64,8 +78,8 @@ func TestServiceGraphIsOffByDefault(t *testing.T) {
 func TestValidateConfigAcceptsServiceGraphSections(t *testing.T) {
 	cfg := agentConfig{
 		ServiceGraph: &servicegraph.Config{
-			Wait: 5 * time.Second, MaxItems: 1000, MaxCardinality: 5000,
-			StaleAfter:       10 * time.Minute,
+			Wait: "5s", MaxItems: 1000, MaxCardinality: 5000,
+			StaleAfter:       "10m",
 			HistogramBuckets: []float64{0.1, 0.25, 1, 5},
 			Dimensions:       []string{"http.route"},
 		},
@@ -77,6 +91,53 @@ func TestValidateConfigAcceptsServiceGraphSections(t *testing.T) {
 	}
 	if err := validateConfig(cfg, ""); err != nil {
 		t.Fatalf("rejected a config a real start accepts: %v", err)
+	}
+}
+
+// The documented YAML must decode through the REAL path — loadAgentConfig's
+// sigs.k8s.io/yaml UnmarshalStrict — not merely through a Go struct literal.
+// That decode is YAML -> JSON -> encoding/json, which accepts only a raw
+// nanosecond integer for a time.Duration, and because the whole file is strict
+// a single undecodable field rejects EVERY section: the DaemonSet and the shard
+// StatefulSet both fail to start on a config the docs, the chart's values
+// comments and README all show verbatim.
+func TestServiceGraphDocumentedYAMLDecodes(t *testing.T) {
+	// Copied from docs/CONFIGURATION.md and charts/kubescrape/values.yaml.
+	const doc = `
+serviceGraph:
+  wait: 10s
+  maxItems: 10000
+  maxCardinality: 20000
+  staleAfter: 15m
+  histogramBuckets: [0.1, 0.2, 0.4, 0.8, 1.6, 3.2, 6.4, 12.8]
+  exemplars: true
+  dimensions: [http.route]
+  virtualNodePeerAttributes: [peer.service, db.name, db.system]
+serviceGraphShards:
+  statefulSet: kubescrape-servicegraph
+  replicas: 2
+  namespace: monitoring
+  port: 4319
+  dimensions: [http.route]
+  peerAttributes: [peer.service, db.name, db.system]
+`
+	path := filepath.Join(t.TempDir(), "agent.yaml")
+	if err := os.WriteFile(path, []byte(doc), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := loadAgentConfig(path)
+	if err != nil {
+		t.Fatalf("the documented service-graph YAML does not load: %v", err)
+	}
+	if cfg.ServiceGraph == nil || cfg.ServiceGraph.Wait != "10s" || cfg.ServiceGraph.StaleAfter != "15m" {
+		t.Fatalf("serviceGraph decoded as %+v", cfg.ServiceGraph)
+	}
+	if err := validateConfig(*cfg, ""); err != nil {
+		t.Fatalf("validateConfig rejected the documented config: %v", err)
+	}
+	// And the values reach the objects a real start builds.
+	if got := servicegraph.NewProcessor(*cfg.ServiceGraph, slog.New(slog.DiscardHandler)).Wait(); got != 10*time.Second {
+		t.Errorf("pairing window = %v, want 10s", got)
 	}
 }
 
@@ -102,8 +163,18 @@ func TestValidateConfigRejectsBadServiceGraph(t *testing.T) {
 		},
 		{
 			"negative wait",
-			agentConfig{ServiceGraph: &servicegraph.Config{Wait: -time.Second}},
-			"wait must not be negative",
+			agentConfig{ServiceGraph: &servicegraph.Config{Wait: "-1s"}},
+			"wait",
+		},
+		{
+			"unparseable wait",
+			agentConfig{ServiceGraph: &servicegraph.Config{Wait: "ten seconds"}},
+			`serviceGraph.wait "ten seconds"`,
+		},
+		{
+			"unparseable staleAfter",
+			agentConfig{ServiceGraph: &servicegraph.Config{StaleAfter: "quarter of an hour"}},
+			`serviceGraph.staleAfter "quarter of an hour"`,
 		},
 		{
 			"negative cardinality cap",
@@ -168,6 +239,29 @@ func TestServiceGraphShardRequiresATokenFile(t *testing.T) {
 	*serviceGraphToken = "/etc/kubescrape/service-graph/token"
 	if err := validateConfig(agentConfig{}, ""); err != nil {
 		t.Fatalf("rejected a shard config a real start accepts: %v", err)
+	}
+
+	// A shard with NO listener receives nothing, pairs nothing, and reports
+	// ready forever — the gate clears when the receiver binds, and there is
+	// nothing to bind. sgReceiver.Run refuses it, but only at the real start, so
+	// -check-config has to refuse it too or it passes a config that CrashLoops
+	// the StatefulSet.
+	*serviceGraphListen, *serviceGraphHTTPListen = "", ""
+	err = validateConfig(agentConfig{}, "")
+	if err == nil {
+		t.Fatal("-service-graph with neither listen address was accepted: the shard would receive nothing")
+	}
+	if !strings.Contains(err.Error(), "-service-graph-listen") {
+		t.Fatalf("error %q does not name the missing flag", err)
+	}
+	// Either listener alone is enough.
+	*serviceGraphHTTPListen = ":4320"
+	if err := validateConfig(agentConfig{}, ""); err != nil {
+		t.Fatalf("the HTTP receiver alone was rejected: %v", err)
+	}
+	*serviceGraphListen, *serviceGraphHTTPListen = ":4319", ""
+	if err := validateConfig(agentConfig{}, ""); err != nil {
+		t.Fatalf("the gRPC receiver alone was rejected: %v", err)
 	}
 
 	// And the start is where an unreadable or empty file is fatal — the dry run

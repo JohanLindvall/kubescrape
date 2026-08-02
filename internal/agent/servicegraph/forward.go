@@ -89,14 +89,27 @@ const (
 	ForwardedPeerAttributes = "kubescrape.service_graph.peer_attributes"
 )
 
+// DefaultShardPort is the port a shard target takes when the config names none.
+//
+// It MUST equal the shard receiver's own default listen address
+// (cmd/kubescrape-agent's -service-graph-listen, :4319), and the two are pinned
+// against each other by a test there. It was 4317 — the AGENTS' OWN ingest port
+// — so a config that relied on the default addressed a port the shard pods do
+// not serve at all (they run with -ingest=false), and every forward failed into
+// a counter while the graph stayed empty. On any deployment that DID run ingest
+// on those pods it would have been worse: spans looping back through the
+// fan-out, which is the failure ForwardedMarker exists to stop.
+const DefaultShardPort = 4319
+
+const defaultShardProtocol = "grpc"
+
 const (
-	defaultShardPort     = 4317
-	defaultShardProtocol = "grpc"
-	// forwardWarnEvery throttles the "a shard send failed" log. The failure is
-	// per INGEST RPC, so a shard that is down would otherwise write one line
-	// per pushed batch — thousands a second on a busy node, drowning the log
-	// the operator needs to diagnose it. The counters are the real signal; the
-	// line exists to name the endpoint and the error once in a while.
+	// forwardWarnEvery throttles the forwarder's warnings — a failed shard send
+	// and a shed batch alike, which share one throttle because they share one
+	// cause. Both are per INGEST RPC, so a shard that is down would otherwise
+	// write one line per pushed batch — thousands a second on a busy node,
+	// drowning the log the operator needs to diagnose it. The counters are the
+	// real signal; the line exists to name the shard and the error now and then.
 	forwardWarnEvery = 30 * time.Second
 )
 
@@ -130,13 +143,24 @@ var keepResourceAttrs = map[string]bool{
 // virtual node was the only thing naming the far side. That disagreement is
 // now DETECTED — the agent declares its effective lists on every forwarded
 // resource (ForwardedDimensions) and the shard compares them with its own —
-// but detection is after the fact, and these four keys stop the most damaging
-// half of the mistake from happening at all. A wrong graph is worse than a
-// missing one, and four attribute keys are a cheap floor.
+// but detection is after the fact, and these keys stop the most damaging half
+// of the mistake from happening at all. A wrong graph is worse than a missing
+// one, and a handful of attribute keys are a cheap floor.
+//
+// The floor MUST cover every key the pairing side classifies on, which is why
+// the post-semconv-1.30 database spellings are here beside Tempo's older pair:
+// the shard's namesDatabase reads all four (processor.go, databaseAttrs), and an
+// SDK on today's conventions emits ONLY db.system.name/db.namespace. Keeping
+// just the old pair made that support dead code in the one topology that exists
+// — the agent trims, the shard reads — so every modern database client rendered
+// as a plain service-to-service call. mismatchWatch cannot notice: it compares
+// the two sides' CONFIGURED lists, and the floor is in neither.
 var keepSpanAttrs = map[string]bool{
 	"messaging.system": true,
 	"db.system":        true,
 	"db.name":          true,
+	"db.system.name":   true, // semconv 1.30 rename of db.system
+	"db.namespace":     true, // semconv 1.30 rename of db.name
 	"peer.service":     true,
 }
 
@@ -176,9 +200,13 @@ type ForwardConfig struct {
 	// Namespace holds the shard tier. Empty resolves to the agent's own
 	// namespace ($POD_NAMESPACE or the ServiceAccount projection).
 	Namespace string `json:"namespace,omitempty"`
-	// Port is the shards' OTLP port (default 4317).
+	// Port is the shards' OTLP port (default DefaultShardPort, which is the
+	// shard receiver's own default listen port).
 	Port int `json:"port,omitempty"`
-	// Endpoints names the shards explicitly, bypassing the template.
+	// Endpoints names the shards explicitly, bypassing the template. With
+	// protocol: http these must carry their own http:// or https:// scheme —
+	// the template form derives one (see httpTLS), an explicit endpoint is
+	// taken verbatim.
 	Endpoints []string `json:"endpoints,omitempty"`
 
 	// TokensPerShard is the ring's virtual tokens per shard (0 =
@@ -195,12 +223,16 @@ type ForwardConfig struct {
 	BearerTokenFile string `json:"bearerTokenFile,omitempty"`
 	// Protocol is "grpc" (default) or "http".
 	Protocol string `json:"protocol,omitempty"`
-	// Insecure sends gRPC in plaintext. nil defaults to "plaintext unless a CA
-	// is configured": pod-to-pod inside the cluster, where the bearer token is
-	// the authenticator. Set caFile (or run the hop through a mesh) when the
-	// pod network is not trusted — otherwise the token crosses it in the clear.
+	// Insecure sends gRPC in plaintext. nil defaults to "plaintext unless TLS is
+	// asked for" — a caFile or insecureSkipVerify: pod-to-pod inside the
+	// cluster, where the bearer token is the authenticator. Set caFile (or run
+	// the hop through a mesh) when the pod network is not trusted — otherwise
+	// the token crosses it in the clear. With protocol: http this decides the
+	// derived endpoint's SCHEME instead (see httpTLS).
 	Insecure *bool `json:"insecure,omitempty"`
-	// InsecureSkipVerify disables certificate verification on the shard hop.
+	// InsecureSkipVerify disables certificate verification on the shard hop —
+	// and, like CAFile, implies TLS: without that the http protocol would take
+	// the plaintext scheme and never handshake at all.
 	InsecureSkipVerify *bool `json:"insecureSkipVerify,omitempty"`
 	// CAFile verifies the shard receiver's certificate.
 	CAFile string `json:"caFile,omitempty"`
@@ -288,7 +320,7 @@ func (c *ForwardConfig) shardTargets() ([]shardTarget, error) {
 	}
 	port := c.Port
 	if port == 0 {
-		port = defaultShardPort
+		port = DefaultShardPort
 	}
 	out := make([]shardTarget, 0, c.Replicas)
 	for i := 0; i < c.Replicas; i++ {
@@ -300,7 +332,7 @@ func (c *ForwardConfig) shardTargets() ([]shardTarget, error) {
 		host := fmt.Sprintf("%s.%s.%s.svc:%d", name, svc, ns, port)
 		if c.protocol() == "http" {
 			scheme := "http://"
-			if c.CAFile != "" {
+			if c.httpTLS() {
 				scheme = "https://"
 			}
 			host = scheme + host
@@ -317,6 +349,26 @@ func (c *ForwardConfig) protocol() string {
 	return c.Protocol
 }
 
+// httpTLS decides the SCHEME of a template-derived http-protocol endpoint.
+//
+// otlpexport ignores Config.Insecure for HTTP — there the scheme IS the
+// decision — so the TLS intent expressed in this section has to be translated
+// into one. All three ways of expressing it count: an explicit `insecure`
+// (which wins, so `insecure: true` beside a caFile produces http:// and
+// otlpexport then refuses the contradiction loudly rather than quietly
+// handshaking), a caFile, and `insecureSkipVerify` — the last being the case
+// that used to fall through: an operator pointing `protocol: http` at a shard
+// with a self-signed certificate and no CA got PLAINTEXT, silently, with the
+// bearer token on the wire in the clear.
+//
+// Explicit `endpoints` are exempt: there the operator writes the scheme.
+func (c *ForwardConfig) httpTLS() bool {
+	if c.Insecure != nil {
+		return !*c.Insecure
+	}
+	return c.CAFile != "" || (c.InsecureSkipVerify != nil && *c.InsecureSkipVerify)
+}
+
 type shardTarget struct {
 	name     string // the ring key
 	endpoint string
@@ -331,10 +383,9 @@ type shardTarget struct {
 // trust boundary caused by leaving a field empty. Everything the shard hop
 // authenticates with is named in ForwardConfig, explicitly.
 func (c *ForwardConfig) clientConfig(t shardTarget, base otlpexport.Config) otlpexport.Config {
-	insecure := c.CAFile == "" // TLS material plus plaintext is refused by otlpexport.New
-	if c.Insecure != nil {
-		insecure = *c.Insecure
-	}
+	// The same TLS intent the http scheme is derived from, so the two transports
+	// cannot disagree (TLS material plus plaintext is refused by otlpexport.New).
+	insecure := !c.httpTLS()
 	skip := false
 	if c.InsecureSkipVerify != nil {
 		skip = *c.InsecureSkipVerify
@@ -350,12 +401,13 @@ func (c *ForwardConfig) clientConfig(t shardTarget, base otlpexport.Config) otlp
 		Compression:        base.Compression,
 		CompressionLevel:   base.CompressionLevel,
 		Timeout:            base.Timeout,
-		// One attempt, never a retry: a retried graph hop costs latency on the
-		// ingest handler for a payload the graph is explicitly allowed to lose,
-		// and a duplicate delivery would double-count the edge (the shard
-		// aggregates, it does not dedupe). Traces exports do not retry in
-		// otlpexport anyway; setting it makes that a decision rather than a
-		// coincidence.
+		// One attempt, never a retry. A duplicate delivery would double-count
+		// the edge (the shard aggregates cumulatively and dedupes nothing), and
+		// a retry occupies the shard's single worker for a payload the graph is
+		// explicitly allowed to lose — holding up every batch queued behind it
+		// for one that a healthy shard would already have taken. Traces exports
+		// do not retry in otlpexport anyway; setting it makes that a decision
+		// rather than a coincidence.
 		RetryAttempts: 1,
 		MaxSendBytes:  base.MaxSendBytes,
 	}
@@ -369,6 +421,15 @@ type Forwarder struct {
 	trim    *trimmer
 	log     *slog.Logger
 
+	// queues holds one bounded queue and one worker goroutine per shard; see
+	// Forward for why the fan-out is asynchronous and shardQueue for the bounds.
+	queues    map[string]*shardQueue
+	workers   sync.WaitGroup
+	stop      chan struct{} // closed by Close: workers exit
+	closing   atomic.Bool   // set by Close: enqueue refuses
+	closeOnce sync.Once     // Close is idempotent (a defer plus an explicit call)
+	queued    atomic.Int64  // items enqueued and not yet delivered
+
 	lastWarn atomic.Int64
 	counters forwardCounters
 }
@@ -377,9 +438,61 @@ type forwardCounters struct {
 	spansForwarded atomic.Uint64
 	spansSkipped   atomic.Uint64
 	spansLost      atomic.Uint64
+	spansQueueFull atomic.Uint64
 	sendsFailed    atomic.Uint64
 	loopsBlocked   atomic.Uint64
 }
+
+// Queue bounds. Two of them, because one item's size is not knowable in
+// advance: an ingest push may be one span or a few thousand.
+const (
+	// forwardQueueItems caps a shard's pending payload COUNT. It bounds the
+	// channel itself; the span budget below is what actually bounds memory.
+	forwardQueueItems = 64
+	// forwardQueueSpans caps a shard's pending SPANS. Trimmed spans are ~107
+	// bytes on the wire and a few hundred in pdata, so 8k is single-digit MiB
+	// per shard — with the usual handful of shards, a bound an operator can hold
+	// in their head next to the ingest receiver's own 4 MiB message cap. It is
+	// deliberately small: this queue is a shock absorber for a shard that is
+	// briefly slow, NOT a buffer for one that is down. Durability for a failed
+	// destination is -buffer-dir's job, and the graph does not want it — a
+	// replayed forward would double-count an edge (the shard aggregates
+	// cumulatively and dedupes nothing).
+	forwardQueueSpans = 8192
+)
+
+// forwardDrainTimeout bounds Close: what is queued gets this long to land, and
+// is then abandoned. Bounded because Close runs inside the agent's own shutdown
+// budget, and a shard tier that is down (the reason the queue is deep at all)
+// must not hold the process past the kubelet's grace period. A var only so the
+// shutdown tests need not spend two real seconds proving the bound exists.
+var forwardDrainTimeout = 2 * time.Second
+
+// shardQueue is one shard's pending work: a bounded channel plus the span
+// budget that bounds the memory it can hold. PER SHARD rather than shared, so a
+// single black-holing shard cannot consume the whole budget and starve the
+// healthy ones — its arc of the ring degrades, the rest of the graph does not.
+type shardQueue struct {
+	ch    chan ptrace.Traces
+	spans atomic.Int64
+}
+
+// reserve claims budget for n spans, or reports that the queue is full. A batch
+// larger than the whole budget is admitted when the queue is EMPTY: refusing it
+// outright would wedge that shard forever the moment one oversized push arrived.
+func (q *shardQueue) reserve(n int64) bool {
+	for {
+		cur := q.spans.Load()
+		if cur > 0 && cur+n > forwardQueueSpans {
+			return false
+		}
+		if q.spans.CompareAndSwap(cur, cur+n) {
+			return true
+		}
+	}
+}
+
+func (q *shardQueue) release(n int64) { q.spans.Add(-n) }
 
 // ForwardStats is a snapshot of the forwarder's counters. The wire-level
 // outcome of each shard send is already counted by otlpexport
@@ -398,6 +511,12 @@ type ForwardStats struct {
 	// SpansLost is spans in a shard send that failed. They are gone: the graph
 	// is best-effort and the caller's export already succeeded.
 	SpansLost uint64
+	// SpansQueueFull is spans dropped WITHOUT being sent, because the owning
+	// shard's forward queue was full. Distinct from SpansLost, which is a send
+	// the collector refused: this one means the shard is not draining (down,
+	// black-holing, or slower than this node's span rate) and the fan-out is
+	// shedding rather than blocking the ingest handler. See Forward.
+	SpansQueueFull uint64
 	// SendsFailed is failed shard sends.
 	SendsFailed uint64
 	// LoopsBlocked is payloads refused because they already carried
@@ -442,6 +561,7 @@ func NewForwarder(cfg ForwardConfig, base otlpexport.Config, log *slog.Logger) (
 		names = append(names, t.name)
 	}
 	f.ring = NewRing(names, cfg.TokensPerShard)
+	f.startWorkers()
 	return f, nil
 }
 
@@ -457,11 +577,27 @@ func NewForwarderWithClients(clients map[string]TracesExporter, tokensPerShard i
 	for name := range clients {
 		names = append(names, name)
 	}
-	return &Forwarder{
+	f := &Forwarder{
 		ring:    NewRing(names, tokensPerShard),
 		clients: clients,
 		trim:    newTrimmer(dims, peers),
 		log:     log,
+	}
+	f.startWorkers()
+	return f
+}
+
+// startWorkers gives every shard its queue and its draining goroutine. Called
+// once, from both constructors: a Forwarder is useless without them, and
+// starting them lazily on the first Forward would need a lock on the hot path.
+func (f *Forwarder) startWorkers() {
+	f.stop = make(chan struct{})
+	f.queues = make(map[string]*shardQueue, len(f.clients))
+	for name := range f.clients {
+		q := &shardQueue{ch: make(chan ptrace.Traces, forwardQueueItems)}
+		f.queues[name] = q
+		f.workers.Add(1)
+		go f.work(name, q)
 	}
 }
 
@@ -474,13 +610,46 @@ func (f *Forwarder) Stats() ForwardStats {
 		SpansForwarded: f.counters.spansForwarded.Load(),
 		SpansSkipped:   f.counters.spansSkipped.Load(),
 		SpansLost:      f.counters.spansLost.Load(),
+		SpansQueueFull: f.counters.spansQueueFull.Load(),
 		SendsFailed:    f.counters.sendsFailed.Load(),
 		LoopsBlocked:   f.counters.loopsBlocked.Load(),
 	}
 }
 
-// Close shuts every shard client down.
+// Close stops the fan-out and shuts every shard client down.
+//
+// BOUNDED, in the agent's own style: enqueueing stops immediately, whatever is
+// already queued gets forwardDrainTimeout to land, and then the workers are
+// told to stop whether or not it did. A shard tier that is down is exactly the
+// state in which the queue is deep, so an unbounded drain here would hold the
+// process past the kubelet's grace period and lose the shutdown's other final
+// exports to SIGKILL — for edges that are best-effort by design.
 func (f *Forwarder) Close() error {
+	f.closeOnce.Do(func() {
+		if f.stop == nil {
+			return // built but never started: NewForwarder's own failure path
+		}
+		f.closing.Store(true) // enqueue refuses from here on
+		if !f.awaitIdle(forwardDrainTimeout) {
+			f.log.Warn("service-graph forwards were still queued at shutdown; abandoning them",
+				"budget", forwardDrainTimeout, "pending", f.queued.Load())
+		}
+		close(f.stop)
+		// The workers exit between items, but one already INSIDE a send only
+		// returns when the exporter's own Timeout does — which may be far longer
+		// than the budget above. So this wait is bounded too: past it we fall
+		// through and close the clients, which aborts the in-flight send and
+		// lets the worker exit on its own. Nothing leaks either way; the total
+		// is at most two drain windows.
+		done := make(chan struct{})
+		go func() { defer close(done); f.workers.Wait() }()
+		select {
+		case <-done:
+		case <-time.After(forwardDrainTimeout):
+			f.log.Warn("a service-graph shard send was still in flight at shutdown; closing under it",
+				"budget", forwardDrainTimeout)
+		}
+	})
 	var first error
 	for _, c := range f.closers {
 		if err := c(); err != nil && first == nil {
@@ -529,53 +698,135 @@ func (t *forwardTap) ExportTraces(ctx context.Context, td ptrace.Traces) error {
 	return nil
 }
 
-// Forward trims td and sends each shard's share. It never returns an error:
-// losing an edge must never cost a span, and by this point the caller's export
-// has already succeeded, so there is nothing left to fail. Failures are
-// counted (ForwardStats.SendsFailed / SpansLost) and logged, throttled.
-func (f *Forwarder) Forward(ctx context.Context, td ptrace.Traces) {
+// Forward trims td, hashes each span onto the ring and HANDS each shard's share
+// to that shard's queue. It never returns an error and — since the queue hand-off
+// is non-blocking — never blocks: losing an edge must never cost a span, and by
+// this point the caller's export has already succeeded, so there is nothing left
+// to fail. Failures are counted (ForwardStats.SendsFailed / SpansLost /
+// SpansQueueFull) and logged, throttled.
+//
+// # Why the send is asynchronous
+//
+// This runs inside the OTLP ingest handler, which holds one of only
+// -ingest-max-in-flight slots (32 by default). A synchronous fan-out — what
+// this used to be — parks that slot for as long as a shard takes to answer, up
+// to the exporter's whole timeout. A shard that black-holes traffic is the
+// EXPECTED failure, not an exotic one: the chart's headless Service sets
+// publishNotReadyAddresses: true (the ring needs stable names before a pod is
+// ready), so DNS resolves to shards that are still starting, and a rolling
+// update of the tier points every agent at a pod that accepts the connection
+// and answers nothing. The whole node's pushed LOGS and METRICS would then shed
+// with 429 because the GRAPH's destination is slow — the exact opposite of this
+// package's stated contract, that losing an edge must never cost a span.
+//
+// It is safe to be asynchronous because the graph is best-effort by
+// construction: the payload here is a trimmed COPY (Trim never aliases or
+// mutates the caller's), the shard's edge counters are cumulative and
+// at-least-once-tolerant, and nothing downstream waits on the result — the
+// caller's own export already succeeded and its ack does not depend on this.
+//
+// What it costs: the queue is bounded, so a shard that stops draining sheds
+// spans (counted, SpansQueueFull) instead of applying back-pressure — which is
+// what we want, an edge is worth less than an ingest slot — and a payload still
+// in a queue when the process exits is lost if Close's drain window elapses
+// first. Both are edges missing from the graph, which is what every other bound
+// in this feature also trades away, and both are counted rather than silent.
+func (f *Forwarder) Forward(_ context.Context, td ptrace.Traces) {
 	if f == nil || len(f.clients) == 0 {
 		return
 	}
+	// The trim itself stays on the caller's goroutine: it is pure CPU, it is
+	// what makes the queued payload small (~107 bytes/span), and doing it here
+	// means the queue holds trimmed copies rather than references into the
+	// sender's whole batch.
 	groups := f.trim.split(td, f.ring, &f.counters)
-	if len(groups) == 0 {
-		return
-	}
-	if len(groups) == 1 {
-		for name, g := range groups {
-			f.sendOne(ctx, name, g)
-		}
-		return
-	}
-	// Fan out concurrently. The bound is the shard count (single digits), and
-	// the alternative — sequential sends — would add every shard's round trip
-	// to the ingest handler's latency in series, which is what a sender
-	// notices. Nothing is shared between the goroutines: each group is its own
-	// payload and each counter is atomic.
-	var wg sync.WaitGroup
 	for name, g := range groups {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			f.sendOne(ctx, name, g)
-		}()
+		f.enqueue(name, g)
 	}
-	wg.Wait()
 }
 
-func (f *Forwarder) sendOne(ctx context.Context, shard string, td ptrace.Traces) {
+// enqueue hands one shard's share to its worker, or drops it. Never blocks.
+//
+// The context is deliberately NOT the caller's: an ingest RPC's context is
+// cancelled the moment the handler returns, which is now BEFORE the send runs,
+// so passing it down would cancel every forward. The send's own bound is the
+// exporter's Timeout (inherited from the flag-built base in clientConfig).
+func (f *Forwarder) enqueue(shard string, td ptrace.Traces) {
+	n := int64(td.SpanCount())
+	q, ok := f.queues[shard]
+	if !ok { // unreachable: the ring is built from the client map's keys
+		f.counters.spansLost.Add(uint64(n))
+		return
+	}
+	if f.closing.Load() || !q.reserve(n) {
+		f.dropQueued(shard, n, "the shard's forward queue is full")
+		return
+	}
+	f.queued.Add(1)
+	select {
+	case q.ch <- td:
+	default:
+		// The item bound rather than the span bound: release the reservation and
+		// account for it identically.
+		q.release(n)
+		f.queued.Add(-1)
+		f.dropQueued(shard, n, "the shard's forward queue is full")
+	}
+}
+
+func (f *Forwarder) dropQueued(shard string, n int64, why string) {
+	f.counters.spansQueueFull.Add(uint64(n))
+	f.warn("dropping spans bound for a service-graph shard: "+why,
+		"shard", shard, "spans", n)
+}
+
+// work drains one shard's queue. One goroutine per shard, started at
+// construction and stopped by Close — never one per batch, which is what makes
+// the memory bound above a bound rather than a hope.
+func (f *Forwarder) work(shard string, q *shardQueue) {
+	defer f.workers.Done()
+	for {
+		select {
+		case <-f.stop:
+			return
+		case td := <-q.ch:
+			f.sendOne(shard, q, td)
+		}
+	}
+}
+
+func (f *Forwarder) sendOne(shard string, q *shardQueue, td ptrace.Traces) {
 	n := uint64(td.SpanCount())
+	defer func() {
+		q.release(int64(n))
+		f.queued.Add(-1)
+	}()
 	client, ok := f.clients[shard]
 	if !ok { // unreachable: the ring is built from the client map's keys
 		f.counters.spansLost.Add(n)
 		return
 	}
 	f.counters.spansForwarded.Add(n)
-	if err := client.ExportTraces(ctx, td); err != nil {
+	// A detached context (see enqueue): the exporter applies its own Timeout.
+	if err := client.ExportTraces(context.Background(), td); err != nil {
 		f.counters.sendsFailed.Add(1)
 		f.counters.spansLost.Add(n)
 		f.warn("forwarding spans to a service-graph shard failed", "shard", shard, "spans", n, "error", err)
 	}
+}
+
+// awaitIdle waits for every queued payload to be delivered (or fail), up to d.
+// It is the drain in Close and the synchronisation point the tests use; nothing
+// on the hot path calls it.
+func (f *Forwarder) awaitIdle(d time.Duration) bool {
+	deadline := time.Now().Add(d)
+	for f.queued.Load() > 0 {
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(time.Millisecond)
+	}
+	return true
 }
 
 // warn logs at most once per forwardWarnEvery across all shards.

@@ -74,11 +74,20 @@ const (
 // MaxCardinality bounds the emitted series. Each has a counter that moves when
 // it binds, so a too-small value is visible rather than silent.
 type Config struct {
-	// Wait is how long a half-edge waits for its partner before it expires.
-	// An expired CLIENT half can still become an edge against a virtual node
-	// (see VirtualNodePeerAttributes); an expired server half cannot, and is
-	// counted as unpaired.
-	Wait time.Duration `json:"wait,omitempty"`
+	// Wait is how long a half-edge waits for its partner before it expires (a
+	// Go duration such as "10s"; empty = 10s). An expired CLIENT half can still
+	// become an edge against a virtual node (see VirtualNodePeerAttributes); an
+	// expired server half cannot, and is counted as unpaired.
+	//
+	// A STRING, not a time.Duration, and this is not a style choice: the agent
+	// config is decoded through sigs.k8s.io/yaml -> encoding/json, which accepts
+	// only a raw nanosecond integer for a time.Duration, so the documented "10s"
+	// spelling would fail to decode — and since the whole file is
+	// UnmarshalStrict'ed, that one field rejects the ENTIRE config and neither
+	// the DaemonSet nor the shard StatefulSet starts. agent/spanmetrics'
+	// staleAfter and traceSampling's keepSlowerThan are strings for the same
+	// reason.
+	Wait string `json:"wait,omitempty"`
 	// MaxItems bounds the pairing store (half-edges awaiting a partner). Over
 	// it, spans are dropped and counted — never silently.
 	MaxItems int `json:"maxItems,omitempty"`
@@ -86,10 +95,14 @@ type Config struct {
 	// over the cap is dropped and counted; existing edges keep reporting,
 	// because these are cumulative series.
 	MaxCardinality int `json:"maxCardinality,omitempty"`
-	// StaleAfter evicts an edge series that has not been observed for this
-	// long (0 disables). Without it the cardinality cap is a one-way latch:
-	// one burst of short-lived services permanently blinds the graph.
-	StaleAfter time.Duration `json:"staleAfter,omitempty"`
+	// StaleAfter evicts an edge series that has not been observed for this long
+	// (a Go duration such as "15m"; empty = 15m, "0" disables eviction and keeps
+	// every series for the process' life). Without it the cardinality cap is a
+	// one-way latch: one burst of short-lived services permanently blinds the
+	// graph.
+	//
+	// A STRING for the same reason as Wait above.
+	StaleAfter string `json:"staleAfter,omitempty"`
 	// HistogramBuckets are the latency buckets, in SECONDS, for both the
 	// client and server duration histograms. Empty uses Tempo's default.
 	HistogramBuckets []float64 `json:"histogramBuckets,omitempty"`
@@ -115,20 +128,57 @@ type Config struct {
 	VirtualNodePeerAttributes []string `json:"virtualNodePeerAttributes,omitempty"`
 }
 
+// wait parses Wait. Empty — and an explicit zero, which is not a pairing window
+// at all (every half-edge would expire before its partner could arrive) — mean
+// the default.
+func (c Config) wait() (time.Duration, error) {
+	if c.Wait == "" {
+		return DefaultWait, nil
+	}
+	d, err := time.ParseDuration(c.Wait)
+	if err != nil {
+		return DefaultWait, fmt.Errorf("serviceGraph.wait %q: %w", c.Wait, err)
+	}
+	if d < 0 {
+		return DefaultWait, fmt.Errorf("serviceGraph.wait %q must not be negative", c.Wait)
+	}
+	if d == 0 {
+		return DefaultWait, nil
+	}
+	return d, nil
+}
+
+// staleAfter parses StaleAfter. Empty means the default; an explicit zero
+// DISABLES eviction (Registry.evictLocked's <= 0 branch) and keeps every series
+// for the process' life.
+func (c Config) staleAfter() (time.Duration, error) {
+	if c.StaleAfter == "" {
+		return DefaultStaleAfter, nil
+	}
+	d, err := time.ParseDuration(c.StaleAfter)
+	if err != nil {
+		return DefaultStaleAfter, fmt.Errorf("serviceGraph.staleAfter %q: %w", c.StaleAfter, err)
+	}
+	if d < 0 {
+		return DefaultStaleAfter, fmt.Errorf("serviceGraph.staleAfter %q must not be negative (use \"0\" to disable eviction)", c.StaleAfter)
+	}
+	return d, nil
+}
+
 // Validate checks the section without acquiring anything, so -check-config can
 // run it. It is shape-only by design (see cmd/kubescrape-agent/config.go).
 func (c *Config) Validate() error {
 	if c == nil {
 		return nil
 	}
-	if c.Wait < 0 {
-		return fmt.Errorf("wait must not be negative")
+	if _, err := c.wait(); err != nil {
+		return err
+	}
+	if _, err := c.staleAfter(); err != nil {
+		return err
 	}
 	if c.MaxItems < 0 || c.MaxCardinality < 0 {
 		return fmt.Errorf("maxItems and maxCardinality must not be negative")
-	}
-	if c.StaleAfter < 0 {
-		return fmt.Errorf("staleAfter must not be negative")
 	}
 	var prev float64
 	for i, b := range c.HistogramBuckets {
@@ -143,19 +193,17 @@ func (c *Config) Validate() error {
 	return nil
 }
 
-// withDefaults returns the config with Tempo's defaults filled in.
+// withDefaults returns the config with Tempo's defaults filled in. The two
+// DURATION fields are deliberately left alone: they are strings, and wait() /
+// staleAfter() are where their defaults (and their "0 disables" reading) live —
+// filling them in here would have to re-render a duration as text and would
+// give "0" two meanings depending on which side of this call it was read.
 func (c Config) withDefaults() Config {
-	if c.Wait == 0 {
-		c.Wait = DefaultWait
-	}
 	if c.MaxItems == 0 {
 		c.MaxItems = DefaultMaxItems
 	}
 	if c.MaxCardinality == 0 {
 		c.MaxCardinality = DefaultMaxCardinality
-	}
-	if c.StaleAfter == 0 {
-		c.StaleAfter = DefaultStaleAfter
 	}
 	if len(c.HistogramBuckets) == 0 {
 		c.HistogramBuckets = defaultBuckets()

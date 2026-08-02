@@ -896,12 +896,18 @@ serviceGraph:
   wait: 10s              # how long a half-edge waits for its partner
   maxItems: 10000        # half-edges held at once
   maxCardinality: 20000  # distinct edge series
-  staleAfter: 15m        # evict edges unobserved for this long (0 disables)
+  staleAfter: 15m        # evict edges unobserved for this long ("0" disables)
   histogramBuckets: [0.1, 0.2, 0.4, 0.8, 1.6, 3.2, 6.4, 12.8]   # SECONDS
   exemplars: true        # default: trace-id exemplars on both histograms
   dimensions: [http.route]
   virtualNodePeerAttributes: [peer.service, db.name, db.system]  # default
 ```
+
+`wait` and `staleAfter` are Go durations written as **strings** (`10s`, `15m`,
+`"0"`), like `traceMetrics.staleAfter` and `traceSampling.keepSlowerThan`.
+Empty takes the default; `staleAfter: "0"` disables eviction outright. A value
+that does not parse is refused by `-check-config` with the field and the value
+named, rather than silently taken as a default.
 
 Every one of the three bounds trades completeness for memory, and each has a
 counter that moves when it binds — an edge missing from the graph looks exactly
@@ -920,7 +926,24 @@ like a call that never happened, so none of them fails silently:
   because these are cumulative series.
 * `staleAfter` — what keeps `maxCardinality` from being a one-way latch: without
   it one burst of short-lived services blinds the graph permanently. Evicted
-  series count into `kubescrape_service_graph_evicted_total`.
+  series count into `kubescrape_service_graph_evicted_total`. `"0"` turns
+  eviction off and keeps every edge for the process' life.
+
+The forward hop from agent to shard is **asynchronous and bounded**. Forward
+runs inside the OTLP ingest handler, which holds one of only
+`-ingest-max-in-flight` slots, so a synchronous send would park that slot behind
+whatever a shard takes to answer — and a shard that is starting or rolling is
+reachable through the headless Service (`publishNotReadyAddresses: true`) while
+answering nothing, so the node's unrelated pushed logs and metrics would shed
+with 429 because the *graph's* destination was slow. Instead each shard has a
+small queue (64 payloads / 8192 spans) and its own worker; over that the spans
+are dropped and counted in `kubescrape_service_graph_spans_queue_full_total`,
+distinct from `..._spans_lost_total` (a send the shard actually refused). The
+queue is a shock absorber for a briefly slow shard, not a buffer for a dead one:
+durability is deliberately absent here, because a replayed forward would
+double-count an edge. On shutdown what is queued gets a bounded window to land
+and is then abandoned, so a dead shard tier cannot hold the agent past the
+kubelet's grace period.
 
 `exemplars` (default on) attaches one exemplar per latency bucket to each
 duration histogram — the link from "this call is slow" to the trace showing
@@ -936,7 +959,12 @@ what the flags do not cover: `dimensions`/`peerAttributes` (they must MATCH the
 shard's — a dimension the agent trims away is a label the shard can only render
 empty), `protocol`, `headers`, `caFile`/`insecureSkipVerify` for the hop, and
 `tokensPerShard` (part of the ring's definition — identical on every agent or
-nothing pairs).
+nothing pairs). `port` defaults to **4319**, the shard receiver's own default
+listen port (`-service-graph-listen`) — never 4317, which is the agents' own
+ingest port. With `protocol: http` the derived per-shard URL takes the `https://`
+scheme when TLS is asked for in any form — `caFile`, `insecureSkipVerify: true`
+or an explicit `insecure: false` — because for HTTP the scheme *is* the TLS
+decision; explicit `endpoints` carry their own scheme instead.
 
 **A mismatch is DETECTED, not merely documented.** Each agent stamps its
 effective lists on every forwarded resource (`kubescrape.service_graph.dimensions`

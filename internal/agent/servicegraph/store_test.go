@@ -32,7 +32,11 @@ func spanID(n byte) pcommon.SpanID {
 func newTestStore(t *testing.T, cfg Config) (*edgeStore, *[]Edge) {
 	t.Helper()
 	var got []Edge
-	st := newEdgeStore(cfg.withDefaults(), func(e Edge) { got = append(got, cloneEdge(e)) })
+	wait, err := cfg.wait()
+	if err != nil {
+		t.Fatalf("wait: %v", err)
+	}
+	st := newEdgeStore(cfg.withDefaults(), wait, func(e Edge) { got = append(got, cloneEdge(e)) })
 	return st, &got
 }
 
@@ -290,7 +294,7 @@ func TestStoreDimensionlessEdgeCarriesNoSlice(t *testing.T) {
 // not.)
 func TestStoreDimensionsAreLiveDuringRecord(t *testing.T) {
 	var seen []EdgeDimension
-	st := newEdgeStore(Config{Wait: time.Second}.withDefaults(), func(e Edge) {
+	st := newEdgeStore(Config{}.withDefaults(), time.Second, func(e Edge) {
 		seen = append(seen, e.Dimensions...) // copies during the call, as a sink must
 	})
 	k := makeEdgeKey(traceID(1), spanID(1))
@@ -327,7 +331,7 @@ func TestStoreJoinScratchIsCleared(t *testing.T) {
 }
 
 func TestStoreExpiryUnpaired(t *testing.T) {
-	st, got := newTestStore(t, Config{Wait: 10 * time.Second})
+	st, got := newTestStore(t, Config{Wait: "10s"})
 	k := makeEdgeKey(traceID(1), spanID(1))
 	st.upsert(t0, k, sideClient, halfSpan{service: "checkout"}, nil)
 
@@ -384,7 +388,7 @@ func TestStoreExpiryPromotesVirtualNode(t *testing.T) {
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			st, got := newTestStore(t, Config{Wait: time.Second})
+			st, got := newTestStore(t, Config{Wait: "1s"})
 			k := makeEdgeKey(traceID(1), spanID(1))
 			svc := "checkout"
 			if tc.side == sideServer {
@@ -429,7 +433,7 @@ func TestStoreExpiryPromotesVirtualNode(t *testing.T) {
 // Expiry order is insertion order (one Wait for all), so an entry inserted
 // later must not retire before an earlier one.
 func TestStoreExpiresInInsertionOrder(t *testing.T) {
-	st, got := newTestStore(t, Config{Wait: 10 * time.Second})
+	st, got := newTestStore(t, Config{Wait: "10s"})
 	for i := byte(1); i <= 3; i++ {
 		st.upsert(t0.Add(time.Duration(i)*time.Second), makeEdgeKey(traceID(1), spanID(i)),
 			sideClient, halfSpan{service: "a", peer: string(rune('a' + i - 1))}, nil)
@@ -448,7 +452,7 @@ func TestStoreExpiresInInsertionOrder(t *testing.T) {
 
 // The sweep must be bounded: it holds the mutex every concurrent Consume needs.
 func TestStoreExpireIsBounded(t *testing.T) {
-	st, got := newTestStore(t, Config{Wait: time.Second, MaxItems: 1000})
+	st, got := newTestStore(t, Config{Wait: "1s", MaxItems: 1000})
 	for i := 0; i < 100; i++ {
 		st.upsert(t0, makeEdgeKey(traceID(byte(i/10)), spanID(byte(i%10))), sideClient, halfSpan{service: "a"}, nil)
 	}
@@ -539,7 +543,7 @@ func TestStoreCountersReachObs(t *testing.T) {
 	fullBefore := obs.ServiceGraphStoreFull.Value()
 	expiredBefore := obs.ServiceGraphExpired.Value()
 
-	st, _ := newTestStore(t, Config{Wait: time.Second, MaxItems: 1})
+	st, _ := newTestStore(t, Config{Wait: "1s", MaxItems: 1})
 	st.upsert(t0, makeEdgeKey(traceID(1), spanID(1)), sideClient, halfSpan{service: "a"}, nil)
 	st.upsert(t0, makeEdgeKey(traceID(1), spanID(2)), sideClient, halfSpan{service: "b"}, nil)
 	if got := obs.ServiceGraphStoreFull.Value() - fullBefore; got != 1 {

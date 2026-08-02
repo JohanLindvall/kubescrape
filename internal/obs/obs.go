@@ -273,7 +273,7 @@ func RegisterServiceGraphStats(stats func() ServiceGraphStat) {
 		"Half-edges that expired unpaired but named their far side through serviceGraph.virtualNodePeerAttributes, and so still reached the graph (as a virtual-node edge). The remainder of kubescrape_service_graph_expired_total is the genuinely lost part — nothing named the missing side, so that request is on no edge at all.",
 		func() float64 { return float64(stats().VirtualNode) })
 	Registry.CounterFunc("kubescrape_service_graph_unkeyable_total",
-		"Spans that could not be keyed for pairing because they carried no trace id (never stored: every zero id shares one key space and would cross-pair unrelated requests into invented edges). A moving rate means an SDK is emitting malformed spans.",
+		"Spans that could not be keyed for pairing: no trace id, or a client/producer span with no span id of its own. Never stored — every zero id shares one key space, so they would cross-pair unrelated requests into invented edges (a zero-id client span keys exactly where every ROOT SERVER span of its trace does). A moving rate means an SDK is emitting malformed spans.",
 		func() float64 { return float64(stats().Unkeyable) })
 }
 
@@ -302,6 +302,9 @@ func RegisterServiceGraphForwarder(stats func() ServiceGraphForwardStat) {
 	Registry.CounterFunc("kubescrape_service_graph_spans_lost_total",
 		"Spans in a shard send that failed. They are gone — the graph is best-effort and the sender's own export already succeeded — so the edges they would have formed are missing from the graph, indistinguishable there from calls that never happened.",
 		func() float64 { return float64(stats().SpansLost) })
+	Registry.CounterFunc("kubescrape_service_graph_spans_queue_full_total",
+		"Spans dropped WITHOUT being sent because the owning shard's forward queue was full. The fan-out is asynchronous precisely so a shard that stops draining sheds edges instead of parking an OTLP ingest slot (losing an edge must never cost a span), and this is that shedding made visible: a moving rate means one shard is slower than this node's edge-forming span rate, or is not answering at all. Distinct from kubescrape_service_graph_spans_lost_total, which is a send the shard actually refused.",
+		func() float64 { return float64(stats().SpansQueueFull) })
 	Registry.CounterFunc("kubescrape_service_graph_sends_failed_total",
 		"Failed sends to a service-graph shard (one per shard per batch). A rate that tracks one shard's outage means only that shard's arc of the ring is missing from the graph; a rate across all of them means the tier or the token is wrong.",
 		func() float64 { return float64(stats().SendsFailed) })
@@ -316,6 +319,7 @@ func RegisterServiceGraphForwarder(stats func() ServiceGraphForwardStat) {
 type ServiceGraphForwardStat struct {
 	SpansForwarded uint64
 	SpansLost      uint64
+	SpansQueueFull uint64
 	SendsFailed    uint64
 	LoopsBlocked   uint64
 }

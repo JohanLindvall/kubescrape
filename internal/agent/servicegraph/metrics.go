@@ -239,10 +239,15 @@ func NewRegistry(cfg Config) *Registry {
 	if cfg.Exemplars != nil {
 		ex = *cfg.Exemplars
 	}
+	// An unparseable staleAfter falls back to the default; Config.Validate is
+	// what reports it (and -check-config runs that), so New never refuses to
+	// aggregate. "0" resolves to 0 here, which is the disable branch in
+	// evictLocked.
+	stale, _ := cfg.staleAfter()
 	return &Registry{
 		bounds:     bounds,
 		maxCard:    cfg.MaxCardinality,
-		staleAfter: cfg.StaleAfter,
+		staleAfter: stale,
 		exemplars:  ex,
 		now:        time.Now,
 		series:     make(map[string]*edgeSeries),

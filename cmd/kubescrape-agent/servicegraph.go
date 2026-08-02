@@ -57,6 +57,7 @@ import (
 	"github.com/JohanLindvall/kubescrape/internal/agent/otlpingest"
 	"github.com/JohanLindvall/kubescrape/internal/agent/servicegraph"
 	"github.com/JohanLindvall/kubescrape/internal/agent/spanmetrics"
+	"github.com/JohanLindvall/kubescrape/internal/agent/tailbuffer"
 	"github.com/JohanLindvall/kubescrape/internal/agent/tracesample"
 	"github.com/JohanLindvall/kubescrape/internal/obs"
 	"github.com/JohanLindvall/kubescrape/pkg/kubemeta"
@@ -89,6 +90,9 @@ func (p *pipelines) startServiceGraph() error {
 		}
 		if cfg := p.fileCfg.TraceSampling; cfg != nil && cfg.Enabled() {
 			p.log.Warn("traceSampling configured but ignored: traces are received by the trace tier (-service-graph), and this process is not it")
+		}
+		if p.fileCfg.TailSampling.Enabled() { // nil-receiver safe
+			p.log.Warn("tailSampling configured but ignored: a trace can only be judged where all of its spans are, which is the trace tier (-service-graph), and this process is not it")
 		}
 		if *spanMetrics {
 			p.log.Warn("-ingest-span-metrics ignored: span metrics are derived from received traces, and traces are received by the trace tier (-service-graph), which this process is not")
@@ -185,7 +189,7 @@ func ownerReceive(owner servicegraph.TracesExporter) func(context.Context, ptrac
 // buildOwnerChain assembles what happens to a span once it is on the shard that
 // OWNS its trace, from the bottom up:
 //
-//	pair the edge -> derive RED metrics -> head sample -> export to the collector
+//	pair the edge -> derive RED metrics -> head sample -> tail sample -> export
 //
 // The two taps forward to their inner exporter FIRST and act only on success, as
 // spanmetrics has always done, and here that is load-bearing rather than tidy: a
@@ -198,6 +202,15 @@ func ownerReceive(owner servicegraph.TracesExporter) func(context.Context, ptrac
 // pair correctly (the sampler keeps whole traces — the decision is per trace id)
 // and would simply report 10% of the traffic as if that were the traffic, on
 // series whose entire purpose is saying how much there is.
+//
+// The two samplers are ordered head-then-tail, and they NEST rather than
+// compound: both hash the trace id with the same unsalted hash against the same
+// threshold arithmetic, so a tail policy at 50% keeps exactly the traces a head
+// probability of 0.5 already passed (agent/tailbuffer's package doc, and the
+// cross-package tests in both). Head first is also the cheap order — a trace the
+// head drops is never buffered for five seconds — with one caveat worth knowing:
+// the head sampler's guard rails are per SPAN, so keepErrors delivers a
+// fragment of a trace to a layer that judges whole traces.
 func (p *pipelines) buildOwnerChain(proc *servicegraph.Processor) (servicegraph.TracesExporter, error) {
 	// Both Client and Buffered export traces (Buffered passes them through
 	// unbuffered — the pushing sender owns the retry, and a disk-buffered span
@@ -207,6 +220,24 @@ func (p *pipelines) buildOwnerChain(proc *servicegraph.Processor) (servicegraph.
 		return nil, fmt.Errorf("exporter does not support traces")
 	}
 	chain := out
+	if cfg := p.fileCfg.TailSampling; cfg.Enabled() { // nil-receiver safe
+		tb, err := tailbuffer.New(*cfg, chain, p.log)
+		if err != nil {
+			return nil, fmt.Errorf("tailSampling: %w", err)
+		}
+		p.tailBuffer = tb
+		obs.RegisterTailSamplingStats(func() obs.TailSamplingStat {
+			st := tb.Stats()
+			return obs.TailSamplingStat{Traces: st.Traces, Spans: st.Spans}
+		})
+		p.spawn(func() { tb.Run(p.ctx) })
+		chain = tb
+		// Loud, once, because this is the one pipeline in the agent that acks a
+		// payload it has not delivered: an operator reading the startup log
+		// should not have to find that out from the package doc.
+		p.log.Info("tail sampling enabled", "policies", len(cfg.Policies), "decisionWait", tb.Wait(),
+			"note", "buffered spans are acked to their senders before they are decided; a hard kill of this pod loses them (kubescrape_tail_sampling_buffered_spans)")
+	}
 	if cfg := p.fileCfg.TraceSampling; cfg != nil && cfg.Enabled() {
 		if err := cfg.Validate(); err != nil {
 			return nil, err

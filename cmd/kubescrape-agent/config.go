@@ -18,6 +18,7 @@ import (
 	"github.com/JohanLindvall/kubescrape/internal/agent/route"
 	"github.com/JohanLindvall/kubescrape/internal/agent/servicegraph"
 	"github.com/JohanLindvall/kubescrape/internal/agent/spanmetrics"
+	"github.com/JohanLindvall/kubescrape/internal/agent/tailbuffer"
 	"github.com/JohanLindvall/kubescrape/internal/agent/tailer"
 	"github.com/JohanLindvall/kubescrape/internal/agent/tracesample"
 	"github.com/JohanLindvall/kubescrape/internal/agent/transform"
@@ -73,6 +74,14 @@ type agentConfig struct {
 	// spans/second cap. It runs on the trace tier, below the spanmetrics tap, so
 	// RED metrics still see 100% of spans.
 	TraceSampling *tracesample.Config `json:"traceSampling,omitempty"`
+	// TailSampling decides each trace AS A WHOLE, after buffering its spans for
+	// a decision window: a policy list (errors, latency, attributes, rate) plus
+	// the buffer's memory bounds. It runs on the trace tier, below traceSampling
+	// and below both taps, so the graph and the RED metrics still see 100% of
+	// spans. Off unless it has policies — and note that buffered spans are ACKED
+	// before they are decided, which is the one place in this agent where a hard
+	// kill loses data (agent/tailbuffer's package doc).
+	TailSampling *tailbuffer.Config `json:"tailSampling,omitempty"`
 	// Export overlays per-signal OTLP destinations (endpoint/protocol/headers/
 	// auth/TLS per signal) and default-chain additions (static headers, an mTLS
 	// client certificate) onto the -otlp-* flag base — what makes collectorless
@@ -166,6 +175,11 @@ func validateConfig(cfg agentConfig, transformsFile string) error {
 		if err := cfg.TraceSampling.Validate(); err != nil {
 			return fmt.Errorf("traceSampling: %w", err)
 		}
+	}
+	// Shape-only, and it validates the policy list by COMPILING it (regexes,
+	// budgets, durations), so -check-config accepts exactly what a start does.
+	if err := cfg.TailSampling.Validate(); err != nil { // nil-receiver safe
+		return fmt.Errorf("tailSampling: %w", err)
 	}
 	// Both service-graph sections are shape-only (no DNS, no filesystem, no
 	// namespace resolution), so the dry run runs exactly what a start does.
@@ -318,6 +332,7 @@ func printConfigSummary(cfg agentConfig, log *slog.Logger) {
 	add("metrics", cfg.Metrics != nil)
 	add("traceMetrics", cfg.TraceMetrics != nil)
 	add("traceSampling", cfg.TraceSampling != nil)
+	add("tailSampling", cfg.TailSampling != nil)
 	add("serviceGraph", cfg.ServiceGraph != nil)
 	add("serviceGraphShards", cfg.ServiceGraphShards != nil)
 	add("routing", cfg.Routing != nil)

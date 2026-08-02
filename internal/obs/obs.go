@@ -318,6 +318,49 @@ type ServiceGraphReshardStat struct {
 	LoopsBlocked   uint64
 }
 
+// Tail sampling (the -service-graph shard's buffering layer). Two things need
+// counting here that no other layer knows: WHICH rule decided a trace — the
+// policy engine returns it precisely so the answer is not "some subset of the
+// list" — and what the memory bounds cost when they bind, since every bound
+// trades trace completeness for a smaller buffer.
+var (
+	TailSampleTraces = Registry.CounterVec("kubescrape_tail_sampling_traces_total",
+		"Traces decided by the tail sampler, by verdict (keep, drop) and by the policy that decided. policy=\"none\" is the default drop — no policy had an opinion — which is what a policy list matching nothing looks like. Every configured policy gets its series at startup, so a policy that has never fired reads as zero rather than as absent. This counts DECISIONS: whether the kept trace then reached the collector is kubescrape_tail_sampling_spans_total.", "decision", "policy")
+	TailSampleSpans = Registry.CounterVec("kubescrape_tail_sampling_spans_total",
+		"Spans leaving the tail-sampling buffer, by fate: kept = the trace was sampled and the export was acked; dropped = the trace was not sampled; lost = the trace was sampled but the export failed after its retries, and nothing else holds a copy (the sender was acked when the spans were buffered). A moving lost rate is data loss, not back-pressure.", "outcome")
+	TailSampleEarly = Registry.CounterVec("kubescrape_tail_sampling_early_decisions_total",
+		"Traces decided BEFORE their decisionWait elapsed, by the bound that forced it (spans_per_trace, max_traces, max_spans) or shutdown (a graceful stop flushing the buffer). An early decision judges the spans present, so it degrades gracefully — a slow trace can be missed, a fast one is never invented — but a sustained rate against a bound means that bound is sized below the shard's span rate.", "reason")
+	TailSampleLate = Registry.CounterVec("kubescrape_tail_sampling_late_spans_total",
+		"Spans that arrived after their trace was decided and followed the cached verdict, by outcome (kept = forwarded immediately, dropped). A large kept+dropped share means decisionWait is shorter than the spread of a trace's arrival.", "outcome")
+	TailSampleCacheEvicted = Registry.Counter("kubescrape_tail_sampling_cache_evictions_total",
+		"Verdicts evicted from the decision cache by its SIZE cap before their TTL. A span arriving for an evicted trace starts a fresh window and may decide it a second time, which re-charges the rateLimiting and composite budgets; raise tailSampling.decisionCacheSize if this moves.")
+)
+
+// RegisterTailSamplingStats publishes what the tail-sampling buffer is holding.
+//
+// This is the one number the counters above cannot give and the one an operator
+// most needs: buffered spans are ACKED but not durable (see agent/tailbuffer's
+// package doc), so this gauge is exactly what a hard kill of the shard would
+// lose at that instant. It is also the leading indicator for the memory bounds,
+// the same reason RegisterBufferStats exists beside the disk buffer's drop
+// counters — the early-decision counter only moves once a bound has ALREADY
+// bound.
+func RegisterTailSamplingStats(stats func() TailSamplingStat) {
+	Registry.GaugeFunc("kubescrape_tail_sampling_buffered_traces",
+		"Traces currently assembling in the tail-sampling buffer, awaiting their decision. tailSampling.maxTraces caps it; at the cap the oldest is decided early (kubescrape_tail_sampling_early_decisions_total).",
+		func() float64 { return float64(stats().Traces) })
+	Registry.GaugeFunc("kubescrape_tail_sampling_buffered_spans",
+		"Spans currently held in the tail-sampling buffer. These are acked to their senders but not yet decided and not durable anywhere: this is what a hard kill of this pod would lose. tailSampling.maxSpans caps it.",
+		func() float64 { return float64(stats().Spans) })
+}
+
+// TailSamplingStat is the buffer's occupancy (tailbuffer.Stats' shape; see
+// RegisterServiceGraphStats on why obs declares its own).
+type TailSamplingStat struct {
+	Traces int
+	Spans  int
+}
+
 // Journald drops (agent).
 var (
 	JournalDropped = Registry.Counter("kubescrape_journal_dropped_batches_total",

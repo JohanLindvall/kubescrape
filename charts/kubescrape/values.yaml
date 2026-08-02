@@ -259,6 +259,8 @@ agent:
   #   traceMetrics:       span-derived RED metrics (see serviceGraph.spanMetrics)
   #   traceSampling:      sample received spans on the trace tier (probability /
   #                       keepErrors / keepSlowerThan / maxSpansPerSecond)
+  #   tailSampling:       decide WHOLE traces on the trace tier after a decision
+  #                       window (policies / decisionWait / memory bounds)
   #   serviceGraph:       edge pairing on the trace tier (see serviceGraph below)
   #   routing:            per-namespace fan-out to extra OTLP destinations or
   #                       tenants (endpoint / headers, e.g. X-Scope-OrgID)
@@ -445,6 +447,31 @@ serviceGraph:
   # (namePrefix / buckets / dimensions / maxCardinality / exemplars / staleAfter).
   spanMetrics: false
   spanMetricsInterval: 1m
+  # TAIL SAMPLING — decide each trace as a WHOLE, after buffering its spans for a
+  # decision window, instead of (or under) the per-span traceSampling above. Also
+  # agent.config, also mounted here; off unless it has policies.
+  #
+  # READ THIS BEFORE ENABLING IT: a pushed span is ACKED to its sender before its
+  # trace is decided — it has to be, or the push would hold one of the receiver's
+  # in-flight slots for the whole window and stall every sender in the cluster —
+  # so buffered spans are LOST if the pod is hard-killed (SIGKILL, OOM, node
+  # failure). A graceful stop decides and exports them, so a rolling update loses
+  # nothing; kubescrape_tail_sampling_buffered_spans is what a hard kill would
+  # lose at that instant. Memory is ~1 KiB per buffered span, and a shard holds
+  # (its span rate x decisionWait) of them: 50k spans/s over 5s is 250k spans,
+  # ~250 MiB, so size maxSpans and the pod's memory limit together — or add
+  # replicas, which divides the rate.
+  #   config:
+  #     tailSampling:
+  #       decisionWait: 5s      # hold a trace this long from its FIRST span
+  #       maxSpans: 200000      # TOTAL buffered spans; at the bound the OLDEST
+  #                             # trace is decided EARLY, never dropped unjudged
+  #       policies:             # ORDERED, first match wins (the matching policy
+  #                             # is a metric label, so "why was this kept" has
+  #                             # exactly one answer)
+  #         - {name: errors, type: statusCode, statusCode: {statusCodes: [ERROR]}}
+  #         - {name: slow, type: latency, latency: {threshold: 500ms}}
+  #         - {name: baseline, type: probabilistic, probabilistic: {samplingPercentage: 5}}
   # Tuning lives in the agent.config `serviceGraph` section (rendered into the
   # same ConfigMap this tier mounts).
   #   config:

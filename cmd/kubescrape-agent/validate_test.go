@@ -7,6 +7,8 @@ import (
 	"github.com/JohanLindvall/kubescrape/internal/agent/logscrub"
 	"github.com/JohanLindvall/kubescrape/internal/agent/otlpexport"
 	"github.com/JohanLindvall/kubescrape/internal/agent/route"
+	"github.com/JohanLindvall/kubescrape/internal/agent/tailbuffer"
+	"github.com/JohanLindvall/kubescrape/internal/agent/tailsample"
 	"github.com/JohanLindvall/kubescrape/internal/agent/tracesample"
 	"github.com/JohanLindvall/kubescrape/internal/metrics"
 )
@@ -40,6 +42,22 @@ func TestValidateConfigRejectsBadSections(t *testing.T) {
 			"malformed trace-sampling duration",
 			agentConfig{TraceSampling: &tracesample.Config{Probability: 0.5, KeepSlowerThan: "2quarters"}},
 			"traceSampling",
+		},
+		{
+			// The policy list is COMPILED by the dry run, so a bad regex, an
+			// impossible rate allocation or (here) an unknown policy type fails
+			// -check-config rather than the first trace.
+			"unknown tail-sampling policy type",
+			agentConfig{TailSampling: &tailbuffer.Config{Config: tailsample.Config{
+				Policies: []tailsample.PolicyConfig{{Name: "x", Type: "sometimes"}}}}},
+			"tailSampling",
+		},
+		{
+			"malformed tail-sampling duration",
+			agentConfig{TailSampling: &tailbuffer.Config{
+				Config:       tailsample.Config{Policies: []tailsample.PolicyConfig{{Name: "all", Type: tailsample.TypeAlwaysSample}}},
+				DecisionWait: "five seconds"}},
+			"decisionWait",
 		},
 	}
 	for _, tc := range cases {

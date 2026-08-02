@@ -11,7 +11,7 @@ kubescrape consists of two binaries built from one image:
 Everything is configured through flags plus one optional unified YAML file on
 the agent (`-config`, with `resourceAttributes`, `logs`, `logAttributes`,
 `logMetrics`, `logScrubbing`, `metrics`, `traceMetrics`, `traceSampling`,
-`routing` and `export` sections) — plus, optionally, a separate hot-reloaded
+`tailSampling`, `routing` and `export` sections) — plus, optionally, a separate hot-reloaded
 Starlark transforms file (`-transforms-file`). The
 [Helm chart](../charts/kubescrape) exposes all of it as values; the raw
 manifests live in [deploy/](../deploy).
@@ -31,6 +31,7 @@ manifests live in [deploy/](../deploy).
 - [Agent: OTLP ingest](#agent-otlp-ingest)
 - [Agent: span metrics](#agent-span-metrics)
 - [Agent: trace sampling](#agent-trace-sampling)
+- [Agent: tail sampling](#agent-tail-sampling)
 - [Agent: metrics scraping](#agent-metrics-scraping)
 - [Agent: kubelet scrapes (cadvisor, node)](#agent-kubelet-scrapes)
 - [Agent: transforms (Starlark)](#agent-transforms-starlark)
@@ -197,7 +198,7 @@ hop or an authenticating proxy.
 
 | Flag | Default | Description |
 |---|---|---|
-| `-config` | — | single YAML file holding all sections: `resourceAttributes`, `logs`, `logAttributes`, `logMetrics`, `logScrubbing`, `metrics`, `traceMetrics`, `traceSampling`, `routing`, `export` ([below](#unified-config-file)) |
+| `-config` | — | single YAML file holding all sections: `resourceAttributes`, `logs`, `logAttributes`, `logMetrics`, `logScrubbing`, `metrics`, `traceMetrics`, `traceSampling`, `tailSampling`, `routing`, `export` ([below](#unified-config-file)) |
 | `-log-dir` | `/var/log/containers` | containerd log directory; the default source when the `logs` section is unset |
 | `-positions-file` | — | single JSON file persisting BOTH log offsets and the journald cursor across restarts (mount a hostPath); empty disables persistence |
 | `-logs-watch` | `true` | fsnotify events trigger reads and discovery; polling remains the fallback |
@@ -475,6 +476,7 @@ logScrubbing:  {builtin: [...], rules: [...]}         # see Agent: log scrubbing
 metrics:       {pipelines: {...}, splitters: [...]}   # see Metrics config
 traceMetrics:  {dimensions: [...], buckets: [...]}    # see Agent: span metrics
 traceSampling: {probability: 0.1, ...}                # see Agent: trace sampling
+tailSampling:  {policies: [...], decisionWait: 5s}    # see Agent: tail sampling
 routing:       {routes: [...]}                        # see Agent: routing
 export:        {headers: {...}, logs: {...}, ...}     # see Per-signal destinations
 ```
@@ -1086,6 +1088,146 @@ payload sampled down to nothing is acked without a send. The sampler sits below
 both the span-metrics tap and edge pairing, so the `-ingest-span-metrics` RED
 metrics and the service graph are derived from 100% of spans while only the
 sampled subset ships.
+
+## Agent: tail sampling
+
+`traceSampling` above decides each span as it arrives, from the span alone.
+`tailSampling` decides each **trace as a whole**, after holding its spans long
+enough for them to arrive — which is what makes "keep every trace that contains
+an error", "keep every trace slower than 500 ms" and "keep 5% of the rest"
+expressible. It runs on the trace tier, where re-sharding by trace id has already
+put every span of a trace in one process; it is off unless it has policies.
+
+```yaml
+tailSampling:
+  decisionWait: 5s          # hold a trace this long from its FIRST span
+  maxTraces: 100000         # traces held at once
+  maxSpansPerTrace: 1000    # spans held for one trace
+  maxSpans: 200000          # TOTAL spans held — the bound that sets the memory
+  decisionCacheSize: 100000 # verdicts remembered for late spans
+  decisionCacheTTL: 1m      # for how long
+  policies:                 # ORDERED, first match wins
+    - name: exclude-health-checks
+      type: stringAttribute
+      stringAttribute: {key: http.route, values: ["^/healthz$"], enabledRegexMatching: true, invertMatch: true}
+    - name: errors
+      type: statusCode
+      statusCode: {statusCodes: [ERROR]}
+    - name: slow
+      type: latency
+      latency: {threshold: 500ms, upper: 30s}
+    - name: baseline
+      type: probabilistic
+      probabilistic: {samplingPercentage: 5}
+```
+
+Every duration is a Go duration **string** (`5s`, `1m`, `500ms`), like
+`serviceGraph.wait` and `traceSampling.keepSlowerThan`.
+
+### Policies
+
+The policy set and semantics are the OpenTelemetry Collector's
+`tailsamplingprocessor` — `alwaysSample`, `latency`, `statusCode`,
+`stringAttribute`, `numericAttribute`, `booleanAttribute`, `probabilistic`,
+`rateLimiting`, `and`, `composite` — spelled in this repo's camelCase, so a
+Collector policy list is *transcribed* key for key rather than pasted
+(`string_attribute` → `stringAttribute`, `threshold_ms: 500` →
+`threshold: "500ms"`). A leftover snake_case key is a strict-decode failure, not
+a silently ignored field.
+
+Two deliberate differences from the Collector:
+
+* **First match wins, in configured order** — rather than evaluating everything
+  and OR-ing it. An OR has no attribution, and the deciding policy is a metric
+  label (`kubescrape_tail_sampling_traces_total{policy}`): under an OR the answer
+  to "why was this trace kept" is "some subset of them".
+* **`invertMatch` vetoes on a match and abstains otherwise** — rather than
+  sampling everything it does not match, which in the Collector makes an
+  exclusion rule silently enable 100% sampling for everything else. Write
+  exclusions first, sampling rules after. The Collector's reading is one line
+  away: append a final `type: alwaysSample` policy.
+
+A policy never errors: anything that can fail (regexes, durations, rate
+allocations) fails at `-check-config`, and a policy that cannot form an opinion
+at decision time (a missing attribute, a trace with no timestamps) abstains and
+the next one decides.
+
+### What it costs, and what a restart costs
+
+**Spans are acked to their sender before their trace is decided.** They must be:
+holding the push open for the decision window would pin one of the receiver's
+in-flight slots for five seconds and stall every application in the cluster. The
+consequence is the one departure in kubescrape from ack-after-delivery — buffered
+spans are **lost if the shard is hard-killed** (SIGKILL, OOM, node failure).
+Nothing is spooled and no sender still holds them.
+
+The exposure is bounded and visible:
+
+* by **time** — at most `decisionWait` of received spans;
+* by **size** — at most `maxSpans`, whatever the rate;
+* by **shutdown** — a graceful stop (SIGTERM, a rolling update, a drain) decides
+  every buffered trace immediately and exports the keeps before the exporter
+  closes, so a normal restart loses nothing;
+* and it is **observable before it is spent**:
+  `kubescrape_tail_sampling_buffered_spans` and
+  `kubescrape_tail_sampling_buffered_traces` are exactly what a hard kill would
+  lose at that instant.
+
+A decided trace whose export fails is retried a few times and then dropped and
+counted (`kubescrape_tail_sampling_spans_total{outcome="lost"}`) — by then nobody
+else holds it either. The exception is a span arriving for an already-decided
+trace: it is forwarded on the receiving goroutine, and a failure there *fails the
+push*, so the sender's retry recovers it (at the price of the still-buffering
+spans in that payload being buffered twice — the same at-least-once trade the
+re-shard hop makes).
+
+### Memory
+
+Budget **~1 KiB per buffered span** (a minimal two-attribute span measures
+~365 B; add ~470 B once per pushed payload per trace for the resource copy). The
+default `maxSpans: 200000` is therefore roughly 100–300 MiB.
+
+The arithmetic to do before enabling it: a shard receiving *R* spans/second holds
+`R × decisionWait` spans. At **50 000 spans/s** with a 5 s window that is
+**250 000 spans (~250 MiB)** — above the default, so the ceiling would bind and
+the oldest traces would be decided about a second early. Either raise `maxSpans`
+(memory scales linearly) or add shards (the ring divides *R* by the shard count).
+
+At every bound the **oldest** trace is *decided early* rather than evicted
+unjudged — the policy engine treats a partial trace as a lower bound, so an early
+decision degrades gracefully (a slow trace can be missed, a fast one is never
+invented) where a blind eviction loses the trace including whatever it was about
+to reveal. Each is counted separately with the bound that caused it:
+`kubescrape_tail_sampling_early_decisions_total{reason}` —
+`spans_per_trace`, `max_traces`, `max_spans` or `shutdown`.
+
+### Late spans
+
+A span whose trace has already been decided follows that verdict from the
+decision cache — forwarded immediately on a keep, dropped on a drop
+(`kubescrape_tail_sampling_late_spans_total{outcome}`). Past the cache's size cap
+or TTL the trace is unknown again and the span starts a **fresh window**, which
+may decide that trace a second time; every policy but `rateLimiting` and
+`composite` answers identically, and those two are charged twice.
+`kubescrape_tail_sampling_cache_evictions_total` moving means
+`decisionCacheSize` is too small for the arrival pattern.
+
+### Composition
+
+Tail sampling is the **last** stage above the exporter:
+
+```
+pair the edge -> RED metrics -> head sample (traceSampling) -> tail sample -> export
+```
+
+Edge pairing and the span metrics count *requests*, so they see 100% of spans;
+only the sampled subset ships. The two samplers **nest** rather than compound:
+both hash the trace id with the same unsalted hash against the same threshold
+arithmetic, so `probabilistic: {samplingPercentage: 50}` keeps exactly the traces
+`traceSampling: {probability: 0.5}` already passed, instead of halving them
+again. One caveat: `traceSampling`'s guard rails (`keepErrors`,
+`keepSlowerThan`) are per **span**, so with them on a trace can reach the buffer
+as a fragment — which the policies then judge as a fragment.
 
 ## Agent: metrics scraping
 

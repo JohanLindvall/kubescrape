@@ -409,7 +409,8 @@ logMetrics:    {metrics: [...]}   # metrics derived from log lines
 logScrubbing:  {builtin: [...], rules: [...]}   # redact secrets/PII from bodies
 metrics:       {pipelines: {...}, splitters: [...]}   # scraped-series rules
 traceMetrics:  {dimensions: [...], buckets: [...], staleAfter: 15m}  # span-derived RED metrics (trace tier)
-traceSampling: {probability: 0.1, ...}          # sample traces (trace tier)
+traceSampling: {probability: 0.1, ...}          # sample spans by trace ID (trace tier)
+tailSampling:  {policies: [...], decisionWait: 5s}   # decide whole traces (trace tier)
 routing:       {routes: [...]}    # per-namespace fan-out / tenancy
 export:        {headers: {...}, logs: {...}, metrics: {...}, traces: {...}}  # per-signal OTLP destinations, buffered-chain headers, mTLS
 ```
@@ -900,6 +901,45 @@ traceSampling:
   keepSlowerThan: 2s
   maxSpansPerSecond: 500
 ```
+
+**Tail sampling** (`tailSampling` section, on the trace tier). Where
+`traceSampling` judges each span from the span alone, this holds a trace's spans
+for a **decision window** (`decisionWait`, 5s) and then judges the *whole trace*
+against an ordered policy list — the OpenTelemetry Collector's
+`tailsamplingprocessor` vocabulary (`statusCode`, `latency`, `stringAttribute`,
+`numericAttribute`, `booleanAttribute`, `probabilistic`, `rateLimiting`, `and`,
+`composite`) in this repo's camelCase, **first match wins**, so the policy that
+kept a trace is a metric label rather than "some subset of the list". It runs
+below the head sampler and below both taps, so the graph and the RED metrics
+still see 100% of spans; the two samplers **nest** rather than compound (both
+hash the trace ID unsalted against the same threshold, so a 50% tail policy keeps
+exactly what a head probability of 0.5 passed).
+
+```yaml
+tailSampling:
+  decisionWait: 5s
+  maxSpans: 200000          # the bound that sets the memory (~1 KiB/span)
+  policies:
+    - {name: errors, type: statusCode, statusCode: {statusCodes: [ERROR]}}
+    - {name: slow, type: latency, latency: {threshold: 500ms}}
+    - {name: baseline, type: probabilistic, probabilistic: {samplingPercentage: 5}}
+```
+
+**It is the one place in kubescrape that acks data it has not delivered**, and
+that is worth reading twice: a pushed span must be acked *before* its trace is
+decided, or the push would hold one of the receiver's in-flight slots for the
+whole window and stall every sender. Buffered-but-undecided spans are therefore
+**lost if the shard is hard-killed** (SIGKILL, OOM, node failure) — nothing is
+spooled and no sender still holds them. The exposure is bounded by
+`decisionWait`, by `maxSpans`, and by the graceful-shutdown flush (a SIGTERM or a
+rolling update decides everything buffered and exports the keeps, so a normal
+restart loses nothing); and it is visible before it is spent —
+`kubescrape_tail_sampling_buffered_spans` is exactly what a hard kill would lose
+at that instant. At each memory bound the oldest trace is **decided early**
+rather than evicted unjudged, counted in
+`kubescrape_tail_sampling_early_decisions_total`. See
+[docs/CONFIGURATION.md](docs/CONFIGURATION.md#agent-tail-sampling) for the memory
+arithmetic (50k spans/s × 5s = 250k buffered spans) and the late-span cache.
 
 ### Traces: the trace tier
 

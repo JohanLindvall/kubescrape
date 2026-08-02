@@ -35,6 +35,7 @@ import (
 	"github.com/JohanLindvall/kubescrape/internal/agent/route"
 	"github.com/JohanLindvall/kubescrape/internal/agent/servicegraph"
 	"github.com/JohanLindvall/kubescrape/internal/agent/spanmetrics"
+	"github.com/JohanLindvall/kubescrape/internal/agent/tailbuffer"
 	"github.com/JohanLindvall/kubescrape/internal/agent/tailer"
 	"github.com/JohanLindvall/kubescrape/internal/agent/transform"
 	"github.com/JohanLindvall/kubescrape/internal/leader"
@@ -328,9 +329,14 @@ type pipelines struct {
 	// sgResharder is the tier's internal hop (nil on a single-shard tier);
 	// run() closes its per-shard clients.
 	sgResharder *servicegraph.Resharder
-	ingestMode  otlpingest.MetricsMode
-	filters     *promscrape.MetricFilters
-	splitters   []*promscrape.Splitter
+	// tailBuffer holds spans whose trace has not been decided yet (nil unless
+	// tailSampling is configured). run() flushes it once the receivers have
+	// stopped: those spans were acked to their senders and nothing else holds
+	// them, so the graceful path is what keeps the loss to a hard kill.
+	tailBuffer *tailbuffer.Buffer
+	ingestMode otlpingest.MetricsMode
+	filters    *promscrape.MetricFilters
+	splitters  []*promscrape.Splitter
 	// fatalErr receives a pipeline's fatal failure (currently the ingest
 	// listener and events leader election). ATOMIC: shutdown joins the
 	// producers on a BUDGET (waitFor), not an unbounded wg.Wait, so a
@@ -759,6 +765,18 @@ func run() error {
 	if !waitFor(&wg, shutdownDrain) {
 		log.Warn("producers did not stop within the shutdown budget; continuing with the final exports",
 			"budget", shutdownDrain)
+	}
+	if p.tailBuffer != nil {
+		// The one shutdown step that salvages ACKED data rather than a last
+		// aggregation window: the tail-sampling buffer holds spans whose senders
+		// were told they had landed, and nothing else holds a copy. The receivers
+		// have stopped (wg above), so nothing is arriving; decide everything now
+		// and let the keeps reach the exporter (and, with -buffer-dir, the final
+		// drain below). Budgeted like the rest — a dead collector must not outlive
+		// the pod's termination grace, and what it costs is counted as lost.
+		fctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		p.tailBuffer.Flush(fctx)
+		cancel()
 	}
 	if logMetrics != nil {
 		// The tailer's final flush (inside wg.Wait) fed the set; export the

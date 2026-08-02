@@ -1,0 +1,215 @@
+package tailbuffer
+
+import (
+	"context"
+	"testing"
+	"time"
+
+	"go.opentelemetry.io/collector/pdata/pcommon"
+	"go.opentelemetry.io/collector/pdata/ptrace"
+)
+
+// The receive path runs on the tier's handler goroutines, once per pushed span,
+// under one mutex — so its allocation budget is the thing to watch. The floor is
+// not zero: a buffered span is COPIED out of the request (the request's memory
+// goes back to the transport when the handler returns, and the trace has to
+// outlive it by the whole decision window), and pdata's CopyTo is where those
+// allocations are. What must stay flat is everything else — no per-call maps, no
+// per-span slices, no label lookups, no payload allocated for a push that is
+// purely buffered.
+//
+// Numbers from the machine this was written on (Go 1.25, amd64, Ryzen 7 8840HS),
+// per SPAN — the receive benchmarks push 20 spans each, so divide their op
+// figures by 20:
+//
+//	BenchmarkReceiveNewTraces      666 ns   14 allocs   841 B   (a trace per span: every span pays for its own entry, ResourceSpans and resource copy — the worst case)
+//	BenchmarkReceiveExistingTrace  266 ns    4 allocs   365 B   (the steady state: a span joining a group that exists)
+//	BenchmarkReceiveLateDrop        58 ns    0 allocs     0 B   (decided drop: a cache probe and a counter)
+//	BenchmarkReceiveLateKeep       385 ns   10 allocs   568 B   (decided keep: copied into an outgoing payload and forwarded)
+//
+// The 365 B is the memory bound's unit of account: a minimal two-attribute span.
+// Budget ~1 KiB for a realistic one, plus ~470 B once per (pushed payload,
+// trace) group for the ResourceSpans/ScopeSpans wrapper and its copy of the
+// resource attributes.
+//
+// The zero on the late-drop line is the one that is asserted below, because it
+// is the only one this package fully controls: it is the path a heavily-sampling
+// shard spends most of its time on, and it must not allocate.
+
+// discard is a no-op exporter: the benchmarks measure this package, not OTLP.
+type discard struct{}
+
+func (discard) ExportTraces(context.Context, ptrace.Traces) error { return nil }
+
+// reset empties the buffer without deciding anything, so a benchmark can run for
+// millions of iterations without its memory growing into the measurement. Only
+// the benchmarks use it — production frees a trace by deciding it.
+func (b *Buffer) reset() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.trace = make(map[pcommon.TraceID]*bufTrace, 1024)
+	b.order = b.order[:0]
+	b.head = 0
+	b.spans = 0
+	b.cache = newDecisionCache(b.set.cacheSize, b.set.cacheTTL)
+}
+
+func benchBuffer(b *testing.B, spansPerTrace int) *Buffer {
+	b.Helper()
+	buf, err := New(Config{
+		Config:           alwaysCfg(),
+		DecisionWait:     "1m",
+		MaxTraces:        1 << 20,
+		MaxSpans:         1 << 22,
+		MaxSpansPerTrace: spansPerTrace,
+	}, discard{}, nil)
+	if err != nil {
+		b.Fatal(err)
+	}
+	return buf
+}
+
+// A push of 20 spans belonging to 20 different traces, none of them seen before:
+// the shape a shard sees when applications push batches of unrelated requests.
+func BenchmarkReceiveNewTraces(b *testing.B) {
+	const batches, spans = 64, 20
+	payloads := make([]ptrace.Traces, batches)
+	for p := range payloads {
+		specs := make([]spanSpec, spans)
+		for i := range specs {
+			id := uint64(p*spans + i)
+			specs[i] = spanSpec{trace: id, span: id, end: 10, attrs: map[string]any{
+				"http.route": "/api/v1/orders", "http.status_code": 200,
+			}}
+		}
+		payloads[p] = payload("checkout", specs...)
+	}
+	buf := benchBuffer(b, 1<<20)
+	ctx := context.Background()
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if i%batches == 0 {
+			buf.reset() // amortized over batches*spans spans: below the reporting floor
+		}
+		if err := buf.ExportTraces(ctx, payloads[i%batches]); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// The steady state: spans joining a trace that is already assembling.
+func BenchmarkReceiveExistingTrace(b *testing.B) {
+	const spans = 20
+	specs := make([]spanSpec, spans)
+	for i := range specs {
+		specs[i] = spanSpec{trace: 1, span: uint64(i), end: 10, attrs: map[string]any{
+			"http.route": "/api/v1/orders", "http.status_code": 200,
+		}}
+	}
+	td := payload("checkout", specs...)
+	buf := benchBuffer(b, 1<<20)
+	ctx := context.Background()
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if i%512 == 0 {
+			buf.reset()
+		}
+		if err := buf.ExportTraces(ctx, td); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// A span whose trace was decided DROP: a cache probe and a counter, nothing
+// else. This is where a sampling shard spends its time, and it is asserted to
+// allocate nothing.
+func BenchmarkReceiveLateDrop(b *testing.B) {
+	td := payload("checkout", spanSpec{trace: 5, span: 1, end: 10})
+	buf, err := New(Config{Config: errorsCfg(), DecisionWait: "1ms"}, discard{}, nil)
+	if err != nil {
+		b.Fatal(err)
+	}
+	clk := newClock()
+	buf.now = clk.now
+	ctx := context.Background()
+	if err := buf.ExportTraces(ctx, td); err != nil {
+		b.Fatal(err)
+	}
+	clk.advance(time.Second)
+	buf.Sweep(ctx) // decides DROP (no error span) and caches the verdict
+	clk.advance(-time.Second)
+
+	if allocs := testing.AllocsPerRun(100, func() {
+		if err := buf.ExportTraces(ctx, td); err != nil {
+			b.Fatal(err)
+		}
+	}); allocs != 0 {
+		b.Fatalf("the decided-drop receive path allocates %v times per push, want 0", allocs)
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if err := buf.ExportTraces(ctx, td); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// A span whose trace was decided KEEP: copied into an outgoing payload and
+// forwarded on this goroutine.
+func BenchmarkReceiveLateKeep(b *testing.B) {
+	td := payload("checkout", spanSpec{trace: 5, span: 1, end: 10})
+	buf, err := New(Config{Config: alwaysCfg(), DecisionWait: "1ms"}, discard{}, nil)
+	if err != nil {
+		b.Fatal(err)
+	}
+	clk := newClock()
+	buf.now = clk.now
+	ctx := context.Background()
+	if err := buf.ExportTraces(ctx, td); err != nil {
+		b.Fatal(err)
+	}
+	clk.advance(time.Second)
+	buf.Sweep(ctx)
+	clk.advance(-time.Second)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if err := buf.ExportTraces(ctx, td); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// The whole cycle: 1000 spans pushed (100 traces of 10), then judged and
+// exported in one pass. It is dominated by the receive path above — the decision
+// itself is a policy evaluation per trace (agent/tailsample's benchmarks: tens
+// of nanoseconds, 0 allocs) plus one payload move.
+func BenchmarkDecide(b *testing.B) {
+	const traces, spans = 100, 10
+	specs := make([]spanSpec, 0, traces*spans)
+	for t := 0; t < traces; t++ {
+		for s := 0; s < spans; s++ {
+			specs = append(specs, spanSpec{trace: uint64(t), span: uint64(t*spans + s), end: 10,
+				attrs: map[string]any{"http.route": "/api/v1/orders"}})
+		}
+	}
+	td := payload("checkout", specs...)
+	buf := benchBuffer(b, 1<<20)
+	clk := newClock()
+	buf.now = clk.now
+	ctx := context.Background()
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if err := buf.ExportTraces(ctx, td); err != nil {
+			b.Fatal(err)
+		}
+		clk.advance(2 * time.Minute)
+		buf.Sweep(ctx)
+	}
+}

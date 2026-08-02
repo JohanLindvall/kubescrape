@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"os"
 	"strings"
 	"time"
 
@@ -37,8 +36,12 @@ type KubeletConfig struct {
 	// NodeMetrics scrapes <Endpoint>/metrics: the kubelet's own metrics,
 	// exported under a node-level resource.
 	NodeMetrics bool
-	// TokenFile is read per scrape for the bearer token (the mounted
-	// ServiceAccount token; it rotates). Empty sends no Authorization.
+	// TokenFile supplies the bearer token (the mounted ServiceAccount token;
+	// it rotates). Empty sends no Authorization. Re-read at most once per
+	// minute through internal/bearer, with the last good value kept across a
+	// failed re-read — this used to be an os.ReadFile on EVERY kubelet
+	// request, so the swap window kubelet opens when it rotates the projection
+	// failed the scrape outright.
 	TokenFile string
 	// InsecureTLS skips certificate verification; kubelet serving
 	// certificates are typically self-signed.
@@ -183,12 +186,15 @@ func (s *Scraper) kubeletGet(ctx context.Context, url string) (*http.Response, e
 		return nil, err
 	}
 	req.Header.Set("Accept", "text/plain;version=0.0.4")
-	if s.cfg.Kubelet.TokenFile != "" {
-		token, err := os.ReadFile(s.cfg.Kubelet.TokenFile)
+	if s.kubeletToken != nil {
+		// A read error here fails only a scrape whose credential has NEVER been
+		// readable; a transient failure mid-rotation serves the last good token
+		// (internal/bearer).
+		token, err := s.kubeletToken.Token()
 		if err != nil {
 			return nil, fmt.Errorf("reading token: %w", err)
 		}
-		req.Header.Set("Authorization", "Bearer "+strings.TrimSpace(string(token)))
+		req.Header.Set("Authorization", "Bearer "+token)
 	}
 	resp, err := s.kubeletHTTP.Do(req)
 	if err != nil {

@@ -40,6 +40,7 @@ import (
 	"k8s.io/klog/v2"
 
 	"github.com/JohanLindvall/kubescrape/internal/agent/otlpexport"
+	"github.com/JohanLindvall/kubescrape/internal/bearer"
 	"github.com/JohanLindvall/kubescrape/internal/obs"
 	"github.com/JohanLindvall/kubescrape/internal/owners"
 	"github.com/JohanLindvall/kubescrape/internal/selfmeta"
@@ -304,74 +305,29 @@ func (r *k8sSecretReader) evictExpiredLocked() {
 	}
 }
 
-// loadScrapeAuthToken reads the shared bearer token guarding
-// /v1/scrape-auth. Every failure mode is fatal by design: -scrape-auth-secrets
-// turns the service into a reader of every Secret key a monitor references, so
-// "no token file", "unreadable file" and "empty file" must all stop the
-// process rather than quietly leave the endpoint open to the whole cluster.
-func loadScrapeAuthToken(path string) (string, error) {
-	if path == "" {
-		return "", errors.New("-scrape-auth-secrets requires -scrape-auth-token-file: " +
+// newScrapeAuthTokens opens the shared bearer token guarding /v1/scrape-auth.
+//
+// Every failure mode is fatal by design: -scrape-auth-secrets turns the service
+// into a reader of every Secret key a monitor references, so "no token file",
+// "unreadable file" and "empty file" must all stop the process rather than
+// quietly leave the endpoint open to the whole cluster. That is exactly
+// bearer.NewRotating's contract; only the messages are ours, because they name
+// the flag the operator set.
+//
+// Past startup the file is re-read on bearer.DefaultReadInterval and a rotated
+// token keeps its predecessor accepted for bearer.DefaultGrace, so agents —
+// which re-read their copy on their own cadence — never have to flip in
+// lockstep with the service.
+func newScrapeAuthTokens(path string, log *slog.Logger) (*bearer.Rotating, error) {
+	rt, err := bearer.NewRotating(path, log)
+	switch {
+	case errors.Is(err, bearer.ErrNoPath):
+		return nil, errors.New("-scrape-auth-secrets requires -scrape-auth-token-file: " +
 			"/v1/scrape-auth serves monitor Secret keys and must not be reachable unauthenticated")
+	case err != nil:
+		return nil, fmt.Errorf("reading -scrape-auth-token-file: %w", err)
 	}
-	b, err := os.ReadFile(path)
-	if err != nil {
-		return "", fmt.Errorf("reading -scrape-auth-token-file: %w", err)
-	}
-	// Trim: a Secret-mounted token written with a trailing newline (or an
-	// `echo`-created file) must still work — every client sends the trimmed
-	// value in the header.
-	token := strings.TrimSpace(string(b))
-	if token == "" {
-		return "", fmt.Errorf("-scrape-auth-token-file %q is empty", path)
-	}
-	return token, nil
-}
-
-// scrapeAuthReadInterval bounds how often the token file is re-read on the
-// request path (Kubernetes projects rotated Secret contents into the mounted
-// file); scrapeAuthGrace keeps the PREVIOUS token accepted after a rotation,
-// so agents — which re-read their copy on their own per-minute cadence — never
-// have to flip in lockstep with the service. Rotation is thereby a non-event:
-// update the Secret, and both sides converge within the grace window with no
-// restarts and no 401 storm.
-const (
-	scrapeAuthReadInterval = time.Minute
-	scrapeAuthGrace        = 5 * time.Minute
-)
-
-// rotatingToken serves the current scrape-auth token plus, for the grace
-// window after a change, the previous one. A failed or empty re-read keeps the
-// last good value (a transient error during a Secret swap must not 401 the
-// fleet); the INITIAL read stays fatal in run().
-type rotatingToken struct {
-	path string
-	log  *slog.Logger
-
-	mu        sync.Mutex
-	cur, prev string
-	prevUntil time.Time
-	fetched   time.Time
-}
-
-// tokens returns the accepted token set, re-reading the file when stale.
-func (r *rotatingToken) tokens() []string {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if time.Since(r.fetched) >= scrapeAuthReadInterval {
-		r.fetched = time.Now()
-		if next, err := loadScrapeAuthToken(r.path); err != nil {
-			r.log.Warn("re-reading -scrape-auth-token-file; keeping the last good token", "error", err)
-		} else if next != r.cur {
-			r.prev, r.prevUntil = r.cur, time.Now().Add(scrapeAuthGrace)
-			r.cur = next
-			r.log.Info("scrape-auth token rotated; previous token accepted for the grace window", "grace", scrapeAuthGrace)
-		}
-	}
-	if r.prev != "" && time.Now().Before(r.prevUntil) {
-		return []string{r.cur, r.prev}
-	}
-	return []string{r.cur}
+	return rt, nil
 }
 
 // newLogger builds the process logger (mirrors the agent's).
@@ -616,13 +572,12 @@ func run() error {
 		// /v1/scrape-auth is a cluster-wide secret leak, so a missing or empty
 		// token file is a startup failure, never a warning. After startup the
 		// file is re-read periodically and a rotated token keeps its
-		// predecessor valid for a grace window (see rotatingToken).
-		token, err := loadScrapeAuthToken(*scrapeAuthTokenFile)
+		// predecessor valid for a grace window (see newScrapeAuthTokens).
+		rt, err := newScrapeAuthTokens(*scrapeAuthTokenFile, log)
 		if err != nil {
 			return err
 		}
-		rt := &rotatingToken{path: *scrapeAuthTokenFile, log: log, cur: token, fetched: time.Now()}
-		scrapeAuthTokens = rt.tokens
+		scrapeAuthTokens = rt.Tokens
 		// Detection runs on a CLOCK, not only on request traffic: lazily-only,
 		// a rotation on a quiet endpoint would be noticed by the first request
 		// AFTER it — anchoring the previous (revoked) token's grace window at
@@ -631,14 +586,14 @@ func run() error {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			ticker := time.NewTicker(scrapeAuthReadInterval)
+			ticker := time.NewTicker(bearer.DefaultReadInterval)
 			defer ticker.Stop()
 			for {
 				select {
 				case <-ctx.Done():
 					return
 				case <-ticker.C:
-					rt.tokens()
+					rt.Tokens()
 				}
 			}
 		}()

@@ -77,6 +77,51 @@ type Endpoint struct {
 	Ignored []string
 }
 
+// secretRefs returns POINTERS to every field of this endpoint that carries a
+// secret reference. It is the ONE list of them, and it is a security boundary:
+//
+//   - Both parsers namespace these fields with the MONITOR's namespace, which
+//     is what confines a monitor to secrets in its own namespace.
+//   - AuthSecretRefs harvests the same fields into the allowlist
+//     /v1/scrape-auth will serve, which is what keeps -scrape-auth-secrets from
+//     being a general secret-read API.
+//
+// Those three loops used to be written out by hand — twice for namespacing
+// (ServiceMonitor and PodMonitor, verbatim copies) and once for harvesting.
+// They agreed, but adding an eighth secret-bearing field and updating two of
+// three fails only at RUNTIME and only for the targets that use it: a ref
+// namespaced but not allowlisted 404s, a ref allowlisted but not namespaced can
+// never match, and either way the target scrapes unauthenticated and reports
+// up=0. Returning pointers from one method makes a new field a COMPILE-VISIBLE
+// omission at exactly one site.
+//
+// Deliberately NOT here: non-secret fields (TLSServerName, AuthType — no
+// material, no allowlist entry) and tlsConfig's configMap arm, which is
+// reported as ignored rather than resolved because the agent reads secret keys
+// through one channel only.
+func (e *Endpoint) secretRefs() []*string {
+	return []*string{
+		&e.BearerSecret,
+		&e.BasicAuthUser,
+		&e.BasicAuthPass,
+		&e.AuthCredentials,
+		&e.TLSCA,
+		&e.TLSCert,
+		&e.TLSKey,
+	}
+}
+
+// namespaceSecretRefs prefixes every set secret reference with ns, turning the
+// endpoint's "name/key" refs into the "namespace/name/key" form the rest of the
+// system uses. Both parsers call it; nothing else may.
+func (e *Endpoint) namespaceSecretRefs(ns string) {
+	for _, p := range e.secretRefs() {
+		if *p != "" {
+			*p = ns + "/" + *p
+		}
+	}
+}
+
 // RelabelRule is the keep/drop subset of a Prometheus relabel_config,
 // evaluated per sample against sourceLabels joined by ";" (Prometheus
 // semantics; "__name__" refers to the metric name).
@@ -398,15 +443,10 @@ func Parse(u *unstructured.Unstructured) (*Monitor, error) {
 		e.Ignored = append(e.Ignored, specIgnored...)
 		// Every secret reference is namespaced with the MONITOR's namespace: a
 		// monitor may only name secrets in its own namespace, which is what
-		// bounds what /v1/scrape-auth will serve.
-		for _, p := range []*string{
-			&e.BearerSecret, &e.BasicAuthUser, &e.BasicAuthPass,
-			&e.AuthCredentials, &e.TLSCA, &e.TLSCert, &e.TLSKey,
-		} {
-			if *p != "" {
-				*p = m.Namespace + "/" + *p
-			}
-		}
+		// bounds what /v1/scrape-auth will serve. The FIELD LIST lives on
+		// Endpoint (secretRefs), shared with the PodMonitor parser and with
+		// AuthSecretRefs — see its doc for why it must be exactly one list.
+		e.namespaceSecretRefs(m.Namespace)
 		m.Endpoints = append(m.Endpoints, e)
 	}
 	return m, nil
@@ -479,17 +519,20 @@ func (x *Index) AuthSecretRefs() map[string]struct{} {
 	defer x.mu.RUnlock()
 	out := map[string]struct{}{}
 	add := func(eps []Endpoint) {
-		for _, e := range eps {
+		for i := range eps {
 			// Every secret an endpoint references, so the metadata service
 			// serves exactly the keys some monitor actually names — the
 			// allowlist that keeps -scrape-auth-secrets from being a general
-			// secret-read API.
-			for _, ref := range []string{
-				e.BearerSecret, e.BasicAuthUser, e.BasicAuthPass,
-				e.AuthCredentials, e.TLSCA, e.TLSCert, e.TLSKey,
-			} {
-				if ref != "" {
-					out[ref] = struct{}{}
+			// secret-read API. The FIELD LIST is Endpoint.secretRefs, the same
+			// one both parsers namespace with: an allowlist that could disagree
+			// with the namespacing is a 404 on one side or an unmatchable ref on
+			// the other, and both scrape unauthenticated.
+			//
+			// Indexed, not ranged by value: secretRefs takes the address of the
+			// endpoint's fields, and a loop copy's addresses are the copy's.
+			for _, ref := range eps[i].secretRefs() {
+				if *ref != "" {
+					out[*ref] = struct{}{}
 				}
 			}
 		}

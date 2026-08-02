@@ -11,7 +11,6 @@ import (
 	"net/http"
 	"os"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -28,6 +27,7 @@ import (
 
 	"github.com/JohanLindvall/bufpool"
 
+	"github.com/JohanLindvall/kubescrape/internal/bearer"
 	"github.com/JohanLindvall/kubescrape/internal/obs"
 
 	"github.com/JohanLindvall/kubescrape/pkg/otlpsplit"
@@ -100,9 +100,12 @@ type Client struct {
 	metricsURL string
 	tracesURL  string
 
-	tokenMu      sync.Mutex
-	token        string
-	tokenFetched time.Time
+	// token is the bearer credential this client PRESENTS (nil when
+	// BearerTokenFile is unset). Re-read per minute with the last good value
+	// kept across a failed re-read: this used to fail the whole export on a
+	// transient read error, so a ServiceAccount/Secret projection swap could
+	// drop a batch for a credential the process still held.
+	token *bearer.File
 }
 
 // New creates a Client for cfg.
@@ -203,6 +206,12 @@ func New(cfg Config) (*Client, error) {
 		}
 	}
 	c := &Client{cfg: cfg}
+	if cfg.BearerTokenFile != "" {
+		// Not read here: a collector credential that is not yet projected must
+		// not stop the agent from starting, and every export path already
+		// surfaces the read error.
+		c.token = bearer.NewFile(cfg.BearerTokenFile, nil)
+	}
 
 	tlsCfg, err := buildTLS(cfg)
 	if err != nil {
@@ -314,22 +323,20 @@ func (c *Client) Close() error {
 
 // bearer returns the current token, re-reading the file at most once per
 // minute (ServiceAccount tokens rotate).
+//
+// The re-read semantics are internal/bearer's: a failure with a last good value
+// keeps that value, so a Secret swap costs a warning rather than a dropped
+// batch; a failure with nothing cached is still an error, because there is no
+// credential to present.
 func (c *Client) bearer() (string, error) {
-	if c.cfg.BearerTokenFile == "" {
+	if c.token == nil {
 		return "", nil
 	}
-	c.tokenMu.Lock()
-	defer c.tokenMu.Unlock()
-	if time.Since(c.tokenFetched) < time.Minute && c.token != "" {
-		return c.token, nil
-	}
-	data, err := os.ReadFile(c.cfg.BearerTokenFile)
+	tok, err := c.token.Token()
 	if err != nil {
 		return "", fmt.Errorf("reading bearer token: %w", err)
 	}
-	c.token = strings.TrimSpace(string(data))
-	c.tokenFetched = time.Now()
-	return c.token, nil
+	return tok, nil
 }
 
 // ExportLogs sends one logs payload (single attempt; the tailer retries and

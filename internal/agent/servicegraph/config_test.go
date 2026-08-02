@@ -96,7 +96,7 @@ func TestConfigDurationSemantics(t *testing.T) {
 	if got := NewProcessor(Config{Wait: "nonsense"}, discardLog()).Wait(); got != DefaultWait {
 		t.Errorf("a bad wait fell back to %v, want %v", got, DefaultWait)
 	}
-	if got := NewRegistry(Config{StaleAfter: "nonsense"}).staleAfter; got != DefaultStaleAfter {
+	if got := NewRegistry(Config{StaleAfter: "nonsense"}).store.StaleAfter(); got != DefaultStaleAfter {
 		t.Errorf("a bad staleAfter fell back to %v, want %v", got, DefaultStaleAfter)
 	}
 }
@@ -106,8 +106,8 @@ func TestConfigDurationSemantics(t *testing.T) {
 // time.Duration field mapped 0 to the 15m default in withDefaults.
 func TestStaleAfterZeroDisablesEviction(t *testing.T) {
 	r := NewRegistry(Config{StaleAfter: "0"})
-	if r.staleAfter != 0 {
-		t.Fatalf("staleAfter = %v, want 0", r.staleAfter)
+	if got := r.store.StaleAfter(); got != 0 {
+		t.Fatalf("staleAfter = %v, want 0", got)
 	}
 	now := t0
 	fixedClock(r, &now)
@@ -119,7 +119,7 @@ func TestStaleAfterZeroDisablesEviction(t *testing.T) {
 	// would fire here if it were enabled.
 	now = now.Add(24 * time.Hour)
 	export(t, r, exp)
-	if len(r.series) != 1 {
-		t.Fatalf("series = %d after 24h with staleAfter disabled, want 1", len(r.series))
+	if r.store.Len() != 1 {
+		t.Fatalf("series = %d after 24h with staleAfter disabled, want 1", r.store.Len())
 	}
 }

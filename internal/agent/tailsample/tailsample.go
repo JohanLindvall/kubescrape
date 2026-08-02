@@ -126,6 +126,8 @@ import (
 
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/ptrace"
+
+	"github.com/JohanLindvall/kubescrape/internal/config"
 )
 
 // Policy type names: the Collector's vocabulary in this repo's camelCase (see
@@ -225,29 +227,13 @@ type LatencyConfig struct {
 
 // threshold parses Threshold; empty is zero (no lower bound).
 func (c *LatencyConfig) threshold() (time.Duration, error) {
-	return parseBound("latency.threshold", c.Threshold)
+	return config.Duration("latency.threshold", c.Threshold, 0, config.ZeroDisables())
 }
 
 // upper parses Upper; empty — and an explicit zero — is unbounded, which
 // compileLatency spells as the type's maximum.
 func (c *LatencyConfig) upper() (time.Duration, error) {
-	return parseBound("latency.upper", c.Upper)
-}
-
-// parseBound reads one duration field, naming the field and the offending value
-// in every error: a -check-config failure has to point at a line, not a feature.
-func parseBound(field, s string) (time.Duration, error) {
-	if s == "" {
-		return 0, nil
-	}
-	d, err := time.ParseDuration(s)
-	if err != nil {
-		return 0, fmt.Errorf("%s %q: %w", field, s, err)
-	}
-	if d < 0 {
-		return 0, fmt.Errorf("%s %q is negative", field, s)
-	}
-	return d, nil
+	return config.Duration("latency.upper", c.Upper, 0, config.ZeroDisables())
 }
 
 // StatusCodeConfig keeps traces where ANY span carries one of the listed codes.

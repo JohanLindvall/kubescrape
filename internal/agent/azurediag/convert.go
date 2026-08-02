@@ -26,9 +26,7 @@ import (
 
 	"github.com/JohanLindvall/kubescrape/internal/agent/attrs"
 	"github.com/JohanLindvall/kubescrape/internal/agent/logchain"
-	"github.com/JohanLindvall/kubescrape/internal/agent/logenrich"
 	"github.com/JohanLindvall/kubescrape/internal/agent/logscrub"
-	"github.com/JohanLindvall/kubescrape/internal/metrics"
 	"github.com/JohanLindvall/kubescrape/internal/obs"
 	"github.com/JohanLindvall/kubescrape/pkg/logattrs"
 )
@@ -104,43 +102,35 @@ func (r *Reader) resource(rec *record) pcommon.Resource {
 }
 
 // convertLogs turns the batch's log records into one plog.Logs, grouped per
-// ARM resource, applying the shared chain in the tailer's order.
+// ARM resource. The per-record half — scrubbing, line attributes, enrichment,
+// log-metrics (which see EVERY record) and the keep/drop rules — is the shared
+// chain every log producer in this repo runs, in the same order
+// (internal/agent/logchain); what stays here is the ARM RESOURCE and the
+// grouping.
 func (r *Reader) convertLogs(recs []record) plog.Logs {
 	ld := plog.NewLogs()
 	scopes := make(map[string]plog.ScopeLogs, 8)
 	resAttrs := make(map[string]pcommon.Map, 8)
 	observed := pcommon.NewTimestampFromTime(time.Now())
-
-	var (
-		scratch  plog.LogRecordSlice
-		resolver *logchain.Resolver
-		bound    map[string]metrics.BoundResource
-	)
-	if r.cfg.Rules != nil || r.cfg.LogMetrics != nil {
-		resolver = logchain.New()
-	}
-	if r.cfg.Rules != nil {
-		scratch = plog.NewLogRecordSlice()
-	}
-	if r.cfg.LogMetrics != nil {
-		bound = make(map[string]metrics.BoundResource, 8)
-	}
+	sink := &recordSink{observed: observed, scrub: r.cfg.Scrub}
+	chain := logchain.NewChain[string](logchain.Config{
+		Scrub:      r.cfg.Scrub,
+		LogAttrs:   r.cfg.LogAttrs,
+		Enrich:     r.cfg.Enrich,
+		LogMetrics: r.cfg.LogMetrics,
+		Rules:      r.cfg.Rules,
+	}, false)
 
 	for i := range recs {
 		rec := &recs[i]
 		if rec.metric {
 			continue
 		}
-		body := string(rec.raw)
-		if r.cfg.Scrub != nil {
-			// Scrub before anything copies from the body, as everywhere else.
-			body = r.cfg.Scrub.Scrub(body)
-		}
+		// Scrub runs first, before anything copies from the body.
+		body, extracted := chain.Line(string(rec.raw))
 
-		var extracted logattrs.Result
 		key := resKey(rec)
 		if r.cfg.LogAttrs != nil {
-			extracted = r.cfg.LogAttrs.Extract(body)
 			key = key + "\x01" + logattrs.Key(extracted.Resource) + "\x01" + logattrs.Key(extracted.Scope)
 		}
 		sl, ok := scopes[key]
@@ -155,55 +145,43 @@ func (r *Reader) convertLogs(recs []record) plog.Logs {
 			scopes[key] = sl
 			resAttrs[key] = rl.Resource().Attributes()
 		}
-
-		var lr plog.LogRecord
-		scratched := r.cfg.Rules != nil
-		if scratched {
-			scratch.RemoveIf(func(plog.LogRecord) bool { return true })
-			lr = scratch.AppendEmpty()
-		} else {
-			lr = sl.LogRecords().AppendEmpty()
-		}
-		ts := rec.ts
-		if ts.IsZero() {
-			ts = observed.AsTime()
-		}
-		lr.SetTimestamp(pcommon.NewTimestampFromTime(ts))
-		lr.SetObservedTimestamp(observed)
-		sev, sevText := severityOf(rec.level)
-		lr.SetSeverityNumber(sev)
-		lr.SetSeverityText(sevText)
-		lr.Body().SetStr(body)
-		putLogAttrs(lr.Attributes(), rec, r.cfg.Scrub)
-		logattrs.Put(lr.Attributes(), extracted.Log)
-		if r.cfg.Enrich {
-			logenrich.Apply(lr, body)
-		}
-		if r.cfg.LogMetrics != nil {
-			bm, ok := bound[key]
-			if !ok {
-				bm = r.cfg.LogMetrics.Bind(resAttrs[key])
-				bound[key] = bm
-			}
-			resolver.Set(lr.Attributes(), resAttrs[key], resolver.Severity)
-			bm.Add(resolver.ValueFn(), resolver.LabelFn(), body)
-		}
-		if scratched {
-			resolver.Set(lr.Attributes(), resAttrs[key], logchain.LowerSeverity(lr.SeverityText()))
-			if r.cfg.Rules.Keep(resolver.RuleFn(), body) {
-				scratch.MoveAndAppendTo(sl.LogRecords())
-			} else {
-				scratch.RemoveIf(func(plog.LogRecord) bool { return true })
-				obs.LogRulesDropped.Inc()
-			}
-		}
+		// The group is built BEFORE the record because metric and rule
+		// resolution reads the group's own resource; a group the rules empty is
+		// pruned below.
+		sink.sl, sink.rec, sink.body = sl, rec, body
+		chain.Emit(sink, logchain.Input[string]{
+			Body: body, Lifted: extracted, Resource: resAttrs[key], BoundKey: key,
+		})
 	}
 	// An all-dropped group leaves an empty ResourceLogs behind.
-	ld.ResourceLogs().RemoveIf(func(rl plog.ResourceLogs) bool {
-		rl.ScopeLogs().RemoveIf(func(sl plog.ScopeLogs) bool { return sl.LogRecords().Len() == 0 })
-		return rl.ScopeLogs().Len() == 0
-	})
+	logchain.Prune(ld)
 	return ld
+}
+
+// recordSink is the chain's Producer for diagnostic records: the group a kept
+// record lands in, and what the Azure reader knows about the record.
+type recordSink struct {
+	sl       plog.ScopeLogs
+	rec      *record
+	body     string
+	observed pcommon.Timestamp
+	scrub    *logscrub.Scrubber
+}
+
+func (s *recordSink) Dest() plog.LogRecordSlice { return s.sl.LogRecords() }
+
+func (s *recordSink) Stamp(lr plog.LogRecord) {
+	ts := s.rec.ts
+	if ts.IsZero() {
+		ts = s.observed.AsTime()
+	}
+	lr.SetTimestamp(pcommon.NewTimestampFromTime(ts))
+	lr.SetObservedTimestamp(s.observed)
+	sev, sevText := severityOf(s.rec.level)
+	lr.SetSeverityNumber(sev)
+	lr.SetSeverityText(sevText)
+	lr.Body().SetStr(s.body)
+	putLogAttrs(lr.Attributes(), s.rec, s.scrub)
 }
 
 // putLogAttrs stamps the record-level attributes describing the diagnostic

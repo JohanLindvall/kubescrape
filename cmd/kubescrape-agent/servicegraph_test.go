@@ -1,10 +1,13 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"log/slog"
+	mathrand "math/rand"
 	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -14,11 +17,14 @@ import (
 	"testing"
 	"time"
 
+	"github.com/klauspost/compress/gzip"
+
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/ptrace"
 
 	"github.com/JohanLindvall/kubescrape/internal/agent/otlpexport"
 	"github.com/JohanLindvall/kubescrape/internal/agent/servicegraph"
+	"github.com/JohanLindvall/kubescrape/internal/bearer"
 	"github.com/JohanLindvall/kubescrape/pkg/kubemeta"
 )
 
@@ -427,7 +433,7 @@ func TestServiceGraphReceiverAuthenticatesAndPairs(t *testing.T) {
 		t.Fatal(err)
 	}
 	log := slog.New(slog.DiscardHandler)
-	tok, err := newRotatingToken(tokenPath, log)
+	tok, err := bearer.NewRotating(tokenPath, log)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -438,7 +444,7 @@ func TestServiceGraphReceiverAuthenticatesAndPairs(t *testing.T) {
 	rcv := &sgReceiver{
 		grpcAddr: grpcAddr,
 		httpAddr: httpAddr,
-		tokens:   tok.tokens,
+		tokens:   tok.Tokens,
 		consume: func(_ context.Context, td ptrace.Traces) error {
 			spans.Add(int64(td.SpanCount()))
 			return nil
@@ -832,4 +838,99 @@ func (s *siblingShard) ExportTraces(ctx context.Context, td ptrace.Traces) error
 		return errors.New("an internal hop arrived without the forwarded marker")
 	}
 	return ownerReceive(s.owner)(ctx, td)
+}
+
+// THE DRIFT the shared body reader resolves: this receiver had its own copy of
+// the OTLP/HTTP body reader, and the fix that makes an over-cap GZIP report 413
+// landed only in otlpingest's. The copy wrapped the compressed body in an
+// io.LimitReader — the exact shape that fix replaced — so truncating an
+// oversized gzip at the cap produced `unexpected EOF` from the decompressor and
+// answered 400 "malformed OTLP traces payload" for a payload that was merely
+// too big.
+//
+// 400 is not a cosmetic difference on THIS hop. The sender is another
+// kubescrape: otlpexport.IsPermanent reads 400 as a definitive rejection, so
+// the sending shard drops the batch (and the application's spans with it)
+// instead of surfacing something its own retry or split could act on. 413 is
+// the honest answer, and it is what both receivers give now.
+func TestServiceGraphHTTPOversizedGzipIs413(t *testing.T) {
+	rcv := &sgReceiver{
+		httpAddr: freeAddr(t),
+		tokens:   func() []string { return []string{"s3cr3t"} },
+		consume:  func(context.Context, ptrace.Traces) error { return nil },
+		log:      slog.New(slog.DiscardHandler),
+	}
+	ready := make(chan struct{})
+	rcv.ready = sync.OnceFunc(func() { close(ready) })
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	errc := make(chan error, 1)
+	go func() { errc <- rcv.Run(ctx) }()
+	select {
+	case <-ready:
+	case err := <-errc:
+		t.Fatalf("receiver stopped before it was ready: %v", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("the receiver never became ready")
+	}
+
+	post := func(body []byte) int {
+		t.Helper()
+		req, err := http.NewRequest(http.MethodPost, "http://"+rcv.httpAddr+"/v1/traces", bytes.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Content-Type", "application/x-protobuf")
+		req.Header.Set("Content-Encoding", "gzip")
+		req.Header.Set("Authorization", "Bearer s3cr3t")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("post: %v", err)
+		}
+		defer func() { _ = resp.Body.Close() }()
+		return resp.StatusCode
+	}
+
+	// Incompressible data: the COMPRESSED body itself exceeds the cap, so the
+	// reader's own truncation is what the decompressor trips over.
+	raw := make([]byte, sgMaxRecvBytes+(1<<20))
+	rnd := mathrand.New(mathrand.NewSource(1))
+	_, _ = rnd.Read(raw)
+	var buf bytes.Buffer
+	zw := gzip.NewWriter(&buf)
+	_, _ = zw.Write(raw)
+	_ = zw.Close()
+	if buf.Len() <= sgMaxRecvBytes {
+		t.Fatalf("test payload compressed to %d bytes, below the cap", buf.Len())
+	}
+	if code := post(buf.Bytes()); code != http.StatusRequestEntityTooLarge {
+		t.Errorf("oversized compressed body status = %d, want 413 (400 tells a kubescrape sender to drop the batch)", code)
+	}
+
+	// Zip bomb: tiny compressed, decompresses beyond the cap. This one was
+	// already 413 and must stay so.
+	var bomb bytes.Buffer
+	zw = gzip.NewWriter(&bomb)
+	_, _ = zw.Write(make([]byte, sgMaxRecvBytes+2))
+	_ = zw.Close()
+	if code := post(bomb.Bytes()); code != http.StatusRequestEntityTooLarge {
+		t.Errorf("zip-bomb status = %d, want 413", code)
+	}
+
+	// An unsupported media type stays 415, and a genuinely malformed payload
+	// stays 400: the fix must not turn every read failure into 413.
+	req, _ := http.NewRequest(http.MethodPost, "http://"+rcv.httpAddr+"/v1/traces", bytes.NewReader([]byte("x")))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer s3cr3t")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusUnsupportedMediaType {
+		t.Errorf("wrong Content-Type status = %d, want 415", resp.StatusCode)
+	}
+
+	cancel()
+	<-errc
 }

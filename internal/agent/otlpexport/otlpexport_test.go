@@ -24,6 +24,8 @@ import (
 	"go.opentelemetry.io/collector/pdata/ptrace/ptraceotlp"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/metadata"
+
+	"github.com/JohanLindvall/kubescrape/internal/bearer"
 )
 
 func testMetrics() pmetric.Metrics {
@@ -433,5 +435,68 @@ func TestHTTPRedirectNotFollowed(t *testing.T) {
 	}
 	if redirectedGET {
 		t.Fatal("client followed the redirect (POST converted to GET)")
+	}
+}
+
+// THE DRIFT internal/bearer resolves, from this side of it: a token file that
+// momentarily fails to re-read (the window in which kubelet swaps a projected
+// ServiceAccount token, or an operator replaces a Secret) used to fail the
+// WHOLE EXPORT. The agent's own client-side cache and the metadata service's
+// accept set both kept the last good value through exactly that window; this
+// exporter returned an error, so the batch was retried or — past the retry
+// budget — rewound or spooled, for a credential the process still held and the
+// collector would still have accepted.
+func TestBearerTokenSurvivesAFailedReread(t *testing.T) {
+	var gotAuth atomic.Value
+	gotAuth.Store("")
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth.Store(r.Header.Get("Authorization"))
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	tokenFile := filepath.Join(t.TempDir(), "token")
+	if err := os.WriteFile(tokenFile, []byte("tok42\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c, err := New(Config{Endpoint: srv.URL, Protocol: "http", Timeout: 5 * time.Second,
+		BearerTokenFile: tokenFile})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = c.Close() }()
+	// Re-read on every call so the swap window below is reached without waiting
+	// out the production interval.
+	c.token = bearer.NewFile(tokenFile, nil, bearer.WithInterval(time.Nanosecond))
+
+	if err := c.ExportMetrics(context.Background(), testMetrics()); err != nil {
+		t.Fatal(err)
+	}
+	if got := gotAuth.Load().(string); got != "Bearer tok42" {
+		t.Fatalf("Authorization = %q, want Bearer tok42", got)
+	}
+
+	// The swap window: the file is briefly absent.
+	if err := os.Remove(tokenFile); err != nil {
+		t.Fatal(err)
+	}
+	gotAuth.Store("")
+	if err := c.ExportMetrics(context.Background(), testMetrics()); err != nil {
+		t.Fatalf("export failed during a token-file swap window: %v; the last good token must be presented instead", err)
+	}
+	if got := gotAuth.Load().(string); got != "Bearer tok42" {
+		t.Fatalf("Authorization = %q, want the last good Bearer tok42", got)
+	}
+
+	// With NO good value ever read, the export still fails: there is nothing to
+	// present, and silently exporting unauthenticated would be worse.
+	c2, err := New(Config{Endpoint: srv.URL, Protocol: "http", Timeout: 5 * time.Second,
+		BearerTokenFile: filepath.Join(t.TempDir(), "never-existed")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = c2.Close() }()
+	if err := c2.ExportMetrics(context.Background(), testMetrics()); err == nil {
+		t.Fatal("an unreadable token file with nothing cached must fail the export")
 	}
 }

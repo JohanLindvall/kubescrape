@@ -19,8 +19,6 @@ import (
 
 	"github.com/JohanLindvall/kubescrape/internal/agent/attrs"
 	"github.com/JohanLindvall/kubescrape/internal/agent/logchain"
-	"github.com/JohanLindvall/kubescrape/internal/agent/logenrich"
-	"github.com/JohanLindvall/kubescrape/internal/metrics"
 	"github.com/JohanLindvall/kubescrape/internal/obs"
 	"github.com/JohanLindvall/kubescrape/pkg/logattrs"
 )
@@ -164,36 +162,30 @@ func (r *Reader) resource(ctx context.Context, e *corev1.Event) (string, pcommon
 	return key.String(), res
 }
 
-// convert groups the batch into one ResourceLogs per involved object,
-// applying the same chain the tailer and journald apply in the same order:
-// line attributes, enrichment, log-metrics (which see EVERY record), then the
-// rules (which may drop it).
+// convert groups the batch into one ResourceLogs per involved object. The
+// per-record half — line attributes, enrichment, log-metrics (which see EVERY
+// record) and the keep/drop rules — is the shared chain every log producer in
+// this repo runs, in the same order (internal/agent/logchain); what stays here
+// is the involved object's RESOURCE and the grouping.
+//
+// Bodies are already scrubbed: ingest redacts where it builds the batch entry,
+// before the record exists, so the chain's Scrub is nil.
 func (r *Reader) convert() plog.Logs {
 	ld := plog.NewLogs()
 	scopes := make(map[string]plog.ScopeLogs, 8)
-	observed := pcommon.NewTimestampFromTime(time.Now())
-
-	var (
-		scratch  plog.LogRecordSlice
-		resolver *logchain.Resolver
-		bound    map[string]metrics.BoundResource
-		resAttrs = make(map[string]pcommon.Map, 8)
-	)
-	if r.cfg.Rules != nil || r.cfg.LogMetrics != nil {
-		resolver = logchain.New()
-	}
-	if r.cfg.Rules != nil {
-		scratch = plog.NewLogRecordSlice()
-	}
-	if r.cfg.LogMetrics != nil {
-		bound = make(map[string]metrics.BoundResource, 8)
-	}
+	resAttrs := make(map[string]pcommon.Map, 8)
+	sink := &recordSink{observed: pcommon.NewTimestampFromTime(time.Now())}
+	chain := logchain.NewChain[string](logchain.Config{
+		LogAttrs:   r.cfg.LogAttrs,
+		Enrich:     r.cfg.Enrich,
+		LogMetrics: r.cfg.LogMetrics,
+		Rules:      r.cfg.Rules,
+	}, false)
 
 	for _, e := range r.batch {
-		var extracted logattrs.Result
+		body, extracted := chain.Line(e.body)
 		key := e.resKey
 		if r.cfg.LogAttrs != nil {
-			extracted = r.cfg.LogAttrs.Extract(e.body)
 			key = e.resKey + "\x01" + logattrs.Key(extracted.Resource) + "\x01" + logattrs.Key(extracted.Scope)
 		}
 		sl, ok := scopes[key]
@@ -208,50 +200,38 @@ func (r *Reader) convert() plog.Logs {
 			scopes[key] = sl
 			resAttrs[key] = rl.Resource().Attributes()
 		}
-
-		var lr plog.LogRecord
-		scratched := r.cfg.Rules != nil
-		if scratched {
-			scratch.RemoveIf(func(plog.LogRecord) bool { return true })
-			lr = scratch.AppendEmpty()
-		} else {
-			lr = sl.LogRecords().AppendEmpty()
-		}
-		lr.SetTimestamp(pcommon.NewTimestampFromTime(e.ts))
-		lr.SetObservedTimestamp(observed)
-		lr.SetSeverityNumber(e.severity)
-		lr.SetSeverityText(e.sevText)
-		lr.Body().SetStr(e.body)
-		putAttrs(lr.Attributes(), e.attrs)
-		logattrs.Put(lr.Attributes(), extracted.Log)
-		if r.cfg.Enrich {
-			logenrich.Apply(lr, e.body)
-		}
-		if r.cfg.LogMetrics != nil {
-			bm, ok := bound[key]
-			if !ok {
-				bm = r.cfg.LogMetrics.Bind(resAttrs[key])
-				bound[key] = bm
-			}
-			resolver.Set(lr.Attributes(), resAttrs[key], resolver.Severity)
-			bm.Add(resolver.ValueFn(), resolver.LabelFn(), e.body)
-		}
-		if scratched {
-			resolver.Set(lr.Attributes(), resAttrs[key], logchain.LowerSeverity(lr.SeverityText()))
-			if r.cfg.Rules.Keep(resolver.RuleFn(), e.body) {
-				scratch.MoveAndAppendTo(sl.LogRecords())
-			} else {
-				scratch.RemoveIf(func(plog.LogRecord) bool { return true })
-				obs.LogRulesDropped.Inc()
-			}
-		}
+		// The group is built BEFORE the record because metric and rule
+		// resolution reads the group's own resource; a group the rules empty is
+		// pruned below.
+		sink.sl, sink.e = sl, e
+		sink.e.body = body
+		chain.Emit(sink, logchain.Input[string]{
+			Body: body, Lifted: extracted, Resource: resAttrs[key], BoundKey: key,
+		})
 	}
 	// An all-dropped group leaves an empty ResourceLogs behind.
-	ld.ResourceLogs().RemoveIf(func(rl plog.ResourceLogs) bool {
-		rl.ScopeLogs().RemoveIf(func(sl plog.ScopeLogs) bool { return sl.LogRecords().Len() == 0 })
-		return rl.ScopeLogs().Len() == 0
-	})
+	logchain.Prune(ld)
 	return ld
+}
+
+// recordSink is the chain's Producer for events: the group a kept record lands
+// in, and what the events reader knows about the record.
+type recordSink struct {
+	sl       plog.ScopeLogs
+	e        entry
+	observed pcommon.Timestamp
+}
+
+func (s *recordSink) Dest() plog.LogRecordSlice { return s.sl.LogRecords() }
+
+func (s *recordSink) Stamp(lr plog.LogRecord) {
+	e := s.e
+	lr.SetTimestamp(pcommon.NewTimestampFromTime(e.ts))
+	lr.SetObservedTimestamp(s.observed)
+	lr.SetSeverityNumber(e.severity)
+	lr.SetSeverityText(e.sevText)
+	lr.Body().SetStr(e.body)
+	putAttrs(lr.Attributes(), e.attrs)
 }
 
 func putAttrs(dst pcommon.Map, src map[string]any) {

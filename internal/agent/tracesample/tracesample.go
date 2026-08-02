@@ -22,6 +22,7 @@ import (
 	"github.com/cespare/xxhash/v2"
 	"go.opentelemetry.io/collector/pdata/ptrace"
 
+	"github.com/JohanLindvall/kubescrape/internal/config"
 	"github.com/JohanLindvall/kubescrape/internal/obs"
 )
 
@@ -57,19 +58,10 @@ func (c Config) Enabled() bool {
 	return (c.Probability > 0 && c.Probability < 1) || c.MaxSpansPerSecond > 0
 }
 
-// slowerThan parses KeepSlowerThan. An empty value disables the guard rail.
+// slowerThan parses KeepSlowerThan. An empty value — and an explicit zero —
+// disables the guard rail.
 func (c Config) slowerThan() (time.Duration, error) {
-	if c.KeepSlowerThan == "" {
-		return 0, nil
-	}
-	d, err := time.ParseDuration(c.KeepSlowerThan)
-	if err != nil {
-		return 0, fmt.Errorf("traceSampling.keepSlowerThan %q: %w", c.KeepSlowerThan, err)
-	}
-	if d < 0 {
-		return 0, fmt.Errorf("traceSampling.keepSlowerThan must not be negative: %s", c.KeepSlowerThan)
-	}
-	return d, nil
+	return config.Duration("traceSampling.keepSlowerThan", c.KeepSlowerThan, 0, config.ZeroDisables())
 }
 
 // Validate reports a malformed config, so a bad value fails startup with a

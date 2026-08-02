@@ -131,6 +131,7 @@ import (
 
 	"github.com/JohanLindvall/kubescrape/internal/agent/otlpexport"
 	"github.com/JohanLindvall/kubescrape/internal/agent/tailsample"
+	"github.com/JohanLindvall/kubescrape/internal/config"
 	"github.com/JohanLindvall/kubescrape/internal/metrics"
 	"github.com/JohanLindvall/kubescrape/internal/obs"
 )
@@ -292,17 +293,18 @@ func (c *Config) settings() (settings, error) {
 		cacheTTL:         defaultCacheTTL,
 	}
 	var err error
-	if s.wait, err = parseDur("tailSampling.decisionWait", c.DecisionWait, defaultDecisionWait); err != nil {
+	// config.Duration is the one optional-duration reader (empty takes the
+	// default, a negative value is an error naming the field and the value);
+	// Positive folds in the bound check these two fields need, so the
+	// explanation stays attached to the error rather than living in a separate
+	// if below it.
+	if s.wait, err = config.Duration("tailSampling.decisionWait", c.DecisionWait, defaultDecisionWait,
+		config.Positive("a zero window decides every trace on its first span")); err != nil {
 		return s, err
 	}
-	if s.wait <= 0 {
-		return s, errors.New("tailSampling.decisionWait must be > 0 (a zero window decides every trace on its first span)")
-	}
-	if s.cacheTTL, err = parseDur("tailSampling.decisionCacheTTL", c.DecisionCacheTTL, defaultCacheTTL); err != nil {
+	if s.cacheTTL, err = config.Duration("tailSampling.decisionCacheTTL", c.DecisionCacheTTL, defaultCacheTTL,
+		config.Positive("with no cache every late span re-decides its trace")); err != nil {
 		return s, err
-	}
-	if s.cacheTTL <= 0 {
-		return s, errors.New("tailSampling.decisionCacheTTL must be > 0 (with no cache every late span re-decides its trace)")
 	}
 	for _, b := range []struct {
 		field string
@@ -332,20 +334,6 @@ type settings struct {
 	maxSpans         int
 	cacheSize        int
 	cacheTTL         time.Duration
-}
-
-// parseDur reads one duration field; empty takes def. The field and the
-// offending value are in every error, because a -check-config failure has to
-// point at a line rather than at a feature.
-func parseDur(field, s string, def time.Duration) (time.Duration, error) {
-	if s == "" {
-		return def, nil
-	}
-	d, err := time.ParseDuration(s)
-	if err != nil {
-		return 0, fmt.Errorf("%s %q: %w", field, s, err)
-	}
-	return d, nil
 }
 
 // TracesExporter is the downstream exporter (otlpexport.Client, Buffered and the

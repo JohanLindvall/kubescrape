@@ -24,7 +24,6 @@ import (
 
 	"github.com/JohanLindvall/kubescrape/internal/agent/attrs"
 	"github.com/JohanLindvall/kubescrape/internal/agent/logchain"
-	"github.com/JohanLindvall/kubescrape/internal/agent/logenrich"
 	"github.com/JohanLindvall/kubescrape/internal/agent/logscrub"
 	"github.com/JohanLindvall/kubescrape/internal/agent/otlpexport"
 	"github.com/JohanLindvall/kubescrape/internal/agent/positions"
@@ -442,26 +441,27 @@ func (r *Reader) settleBatch() {
 }
 
 // convert groups the batch into one resource per unit.
+//
+// The per-record half — line attributes, enrichment, log-metrics (which see
+// EVERY entry) and the keep/drop rules (which run after enrichment, so
+// __severity__ selects on the ENRICHED severity) — is the chain every log
+// producer in this repo runs (internal/agent/logchain). What stays here is the
+// unit's RESOURCE and the grouping.
+//
+// Bodies are already scrubbed: journald redacts where it builds the batch
+// entry, before the record exists, so the chain's Scrub is nil.
 func (r *Reader) convert() plog.Logs {
 	ld := plog.NewLogs()
 	scopes := make(map[string]scopeEntry, 4)
-	observed := pcommon.NewTimestampFromTime(time.Now())
-	var (
-		scratch  plog.LogRecordSlice
-		resolver *logchain.Resolver
-		bound    map[string]metrics.BoundResource
-	)
-	if r.cfg.Rules != nil || r.cfg.LogMetrics != nil {
-		resolver = logchain.New()
-	}
-	if r.cfg.Rules != nil {
-		scratch = plog.NewLogRecordSlice()
-	}
-	if r.cfg.LogMetrics != nil {
-		bound = make(map[string]metrics.BoundResource, 4)
-	}
+	sink := &recordSink{observed: pcommon.NewTimestampFromTime(time.Now())}
+	chain := logchain.NewChain[string](logchain.Config{
+		LogAttrs:   r.cfg.LogAttrs,
+		Enrich:     r.cfg.Enrich,
+		LogMetrics: r.cfg.LogMetrics,
+		Rules:      r.cfg.Rules,
+	}, false)
 	for _, e := range r.batch {
-		var extracted logattrs.Result
+		body, extracted := chain.Line(e.body)
 		unit := e.unit
 		groupKey := unit
 		if unit == "" {
@@ -477,7 +477,6 @@ func (r *Reader) convert() plog.Logs {
 		// extractor the unit alone is the key (no per-entry concatenation).
 		key := groupKey
 		if r.cfg.LogAttrs != nil {
-			extracted = r.cfg.LogAttrs.Extract(e.body)
 			key = groupKey + "\x01" + logattrs.Key(extracted.Resource) + "\x01" + logattrs.Key(extracted.Scope)
 		}
 		ent, ok := scopes[key]
@@ -509,63 +508,49 @@ func (r *Reader) convert() plog.Logs {
 			ent = scopeEntry{sl: sl, res: res.Attributes()}
 			scopes[key] = ent
 		}
-		sl := ent.sl
-		// With rules configured, build into a one-record scratch and move it
-		// across only if kept (the tailer does the same).
-		var lr plog.LogRecord
-		scratched := r.cfg.Rules != nil
-		if scratched {
-			scratch.RemoveIf(func(plog.LogRecord) bool { return true })
-			lr = scratch.AppendEmpty()
-		} else {
-			lr = sl.LogRecords().AppendEmpty()
-		}
-		lr.SetTimestamp(pcommon.NewTimestampFromTime(e.ts))
-		lr.SetObservedTimestamp(observed)
-		lr.SetSeverityNumber(e.severity)
-		lr.SetSeverityText(e.sevText)
-		lr.Body().SetStr(e.body)
-		if e.origLen > 0 {
-			lr.Attributes().PutBool("log.truncated", true)
-			lr.Attributes().PutInt("log.original_length", int64(e.origLen))
-		}
-		if e.ident != "" {
-			lr.Attributes().PutStr("syslog.identifier", e.ident)
-		}
-		if e.pid != 0 {
-			lr.Attributes().PutInt("process.pid", e.pid)
-		}
-		logattrs.Put(lr.Attributes(), extracted.Log)
-		if r.cfg.Enrich {
-			logenrich.Apply(lr, e.body)
-		}
-		if r.cfg.LogMetrics != nil {
-			bm, ok := bound[key]
-			if !ok {
-				// Metrics group by the RESOURCE, so bind the unit's.
-				bm = r.cfg.LogMetrics.Bind(ent.res)
-				bound[key] = bm
-			}
-			resolver.Set(lr.Attributes(), ent.res, resolver.Severity)
-			bm.Add(resolver.ValueFn(), resolver.LabelFn(), e.body)
-		}
-		if scratched {
-			resolver.Set(lr.Attributes(), ent.res, logchain.LowerSeverity(lr.SeverityText()))
-			if r.cfg.Rules.Keep(resolver.RuleFn(), e.body) {
-				scratch.MoveAndAppendTo(sl.LogRecords())
-			} else {
-				scratch.RemoveIf(func(plog.LogRecord) bool { return true })
-				obs.LogRulesDropped.Inc()
-			}
-		}
+		// The group is built BEFORE the record because metric and rule
+		// resolution reads the group's own resource; a group the rules empty is
+		// pruned below rather than never created (the tailer, whose resolution
+		// uses the FILE's resource, can be lazy instead — same payload).
+		sink.sl, sink.e = ent.sl, e
+		sink.e.body = body // identical while Scrub is nil; not a fact to rely on
+		chain.Emit(sink, logchain.Input[string]{
+			Body: body, Lifted: extracted, Resource: ent.res, BoundKey: key,
+		})
 	}
 	// An all-dropped unit leaves an empty group behind; prune so the payload
 	// carries no record-less ResourceLogs.
-	ld.ResourceLogs().RemoveIf(func(rl plog.ResourceLogs) bool {
-		rl.ScopeLogs().RemoveIf(func(sl plog.ScopeLogs) bool { return sl.LogRecords().Len() == 0 })
-		return rl.ScopeLogs().Len() == 0
-	})
+	logchain.Prune(ld)
 	return ld
+}
+
+// recordSink is the chain's Producer for journal entries: the group a kept
+// record lands in, and what the journal knows about the record.
+type recordSink struct {
+	sl       plog.ScopeLogs
+	e        entry
+	observed pcommon.Timestamp
+}
+
+func (s *recordSink) Dest() plog.LogRecordSlice { return s.sl.LogRecords() }
+
+func (s *recordSink) Stamp(lr plog.LogRecord) {
+	e := s.e
+	lr.SetTimestamp(pcommon.NewTimestampFromTime(e.ts))
+	lr.SetObservedTimestamp(s.observed)
+	lr.SetSeverityNumber(e.severity)
+	lr.SetSeverityText(e.sevText)
+	lr.Body().SetStr(e.body)
+	if e.origLen > 0 {
+		lr.Attributes().PutBool("log.truncated", true)
+		lr.Attributes().PutInt("log.original_length", int64(e.origLen))
+	}
+	if e.ident != "" {
+		lr.Attributes().PutStr("syslog.identifier", e.ident)
+	}
+	if e.pid != 0 {
+		lr.Attributes().PutInt("process.pid", e.pid)
+	}
 }
 
 // scopeEntry is one grouped unit's scope plus its resource attributes (the

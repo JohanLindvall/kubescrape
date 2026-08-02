@@ -7,7 +7,6 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-	"time"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -15,6 +14,8 @@ import (
 	"k8s.io/client-go/discovery"
 	discoveryfake "k8s.io/client-go/discovery/fake"
 	coretesting "k8s.io/client-go/testing"
+
+	"github.com/JohanLindvall/kubescrape/internal/server"
 )
 
 // The -servicemonitors pre-check must verify the servicemonitors resource
@@ -78,6 +79,9 @@ func (e errDiscovery) ServerResourcesForGroupVersion(string) (*metav1.APIResourc
 // service, so the bearer token guarding that endpoint is mandatory: no flag,
 // an unreadable file or a blank file must all fail startup rather than leave
 // /v1/scrape-auth open.
+// (The read/rotate/grace mechanics themselves live in internal/bearer and are
+// tested there with an injectable clock; what is local to this binary is that
+// every failure mode stays FATAL and that the message names the flag.)
 func TestLoadScrapeAuthToken(t *testing.T) {
 	dir := t.TempDir()
 	write := func(name, content string) string {
@@ -88,25 +92,31 @@ func TestLoadScrapeAuthToken(t *testing.T) {
 		}
 		return p
 	}
+	log := slog.New(slog.DiscardHandler)
 
-	if _, err := loadScrapeAuthToken(""); err == nil {
+	if _, err := newScrapeAuthTokens("", log); err == nil {
 		t.Error("no -scrape-auth-token-file must be a startup error")
 	} else if !strings.Contains(err.Error(), "-scrape-auth-token-file") {
 		t.Errorf("error should name the flag: %v", err)
 	}
-	if _, err := loadScrapeAuthToken(filepath.Join(dir, "missing")); err == nil {
+	if _, err := newScrapeAuthTokens(filepath.Join(dir, "missing"), log); err == nil {
 		t.Error("unreadable token file must be a startup error")
+	} else if !strings.Contains(err.Error(), "-scrape-auth-token-file") {
+		t.Errorf("error should name the flag: %v", err)
 	}
 	for _, blank := range []string{"", "\n", "   \n\t"} {
-		if _, err := loadScrapeAuthToken(write("blank", blank)); err == nil {
+		if _, err := newScrapeAuthTokens(write("blank", blank), log); err == nil {
 			t.Errorf("blank token file %q must be a startup error", blank)
 		}
 	}
 	// A Secret-mounted token keeps its trailing newline; the header carries
 	// the trimmed value, so the file is trimmed too.
-	got, err := loadScrapeAuthToken(write("token", "s3cr3t\n"))
-	if err != nil || got != "s3cr3t" {
-		t.Fatalf("token = %q, err = %v", got, err)
+	rt, err := newScrapeAuthTokens(write("token", "s3cr3t\n"), log)
+	if err != nil {
+		t.Fatalf("err = %v", err)
+	}
+	if got := rt.Tokens(); len(got) != 1 || got[0] != "s3cr3t" {
+		t.Fatalf("tokens = %v, want [s3cr3t]", got)
 	}
 }
 
@@ -143,67 +153,26 @@ func TestMonitorNamespaceGate(t *testing.T) {
 	}
 }
 
-// rotatingToken: a changed file promotes the old token to a grace-window
-// second value, and the window expires. Without the grace, agents (which
-// re-read on their own cadence) would 401 until they happened to reload.
-func TestRotatingTokenGraceWindow(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "token")
+// The grace window's mechanics — rotation promoting the old value, the window
+// expiring, an unchanged re-read not re-arming it, an unreadable file keeping
+// the last good token — now live in internal/bearer, tested there against an
+// injectable clock instead of by poking at struct fields. What this binary must
+// keep proving is that it USES the rotating form: a plain single-value read
+// would 401 every agent that had not re-read yet at the moment of a rotation.
+func TestScrapeAuthTokensRotate(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "token")
 	if err := os.WriteFile(path, []byte("old-token\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	rt := &rotatingToken{path: path, log: slog.Default(), cur: "old-token", fetched: time.Now()}
-
-	if got := rt.tokens(); len(got) != 1 || got[0] != "old-token" {
-		t.Fatalf("fresh: %v, want [old-token]", got)
-	}
-
-	// Rotate the file; the cached value is still fresh, so nothing changes yet.
-	if err := os.WriteFile(path, []byte("new-token\n"), 0o600); err != nil {
+	rt, err := newScrapeAuthTokens(path, slog.New(slog.DiscardHandler))
+	if err != nil {
 		t.Fatal(err)
 	}
-	if got := rt.tokens(); len(got) != 1 || got[0] != "old-token" {
-		t.Fatalf("within the read interval: %v, want the cached [old-token]", got)
-	}
-
-	// Past the read interval: both are accepted.
-	rt.mu.Lock()
-	rt.fetched = time.Now().Add(-2 * scrapeAuthReadInterval)
-	rt.mu.Unlock()
-	got := rt.tokens()
-	if len(got) != 2 || got[0] != "new-token" || got[1] != "old-token" {
-		t.Fatalf("during the grace window: %v, want [new-token old-token]", got)
-	}
-
-	// A re-read that finds no change must not re-arm the window.
-	rt.mu.Lock()
-	rt.fetched = time.Now().Add(-2 * scrapeAuthReadInterval)
-	until := rt.prevUntil
-	rt.mu.Unlock()
-	rt.tokens()
-	rt.mu.Lock()
-	reArmed := rt.prevUntil.After(until)
-	rt.mu.Unlock()
-	if reArmed {
-		t.Fatal("an unchanged re-read must not extend the grace window")
-	}
-
-	// Past the window: only the current token.
-	rt.mu.Lock()
-	rt.prevUntil = time.Now().Add(-time.Second)
-	rt.mu.Unlock()
-	if got := rt.tokens(); len(got) != 1 || got[0] != "new-token" {
-		t.Fatalf("after the grace window: %v, want [new-token]", got)
-	}
-
-	// An unreadable file keeps the last good token rather than 401ing the fleet.
-	if err := os.Remove(path); err != nil {
-		t.Fatal(err)
-	}
-	rt.mu.Lock()
-	rt.fetched = time.Now().Add(-2 * scrapeAuthReadInterval)
-	rt.mu.Unlock()
-	if got := rt.tokens(); len(got) != 1 || got[0] != "new-token" {
-		t.Fatalf("unreadable file: %v, want the last good [new-token]", got)
+	// bearer.Rotating's accept set is what the server is handed, not a string:
+	// a func() []string is the only shape that can carry two tokens at once,
+	// which is what server.Config.ScrapeAuthTokens takes.
+	accept := server.Config{ScrapeAuthTokens: rt.Tokens}.ScrapeAuthTokens
+	if got := accept(); len(got) != 1 || got[0] != "old-token" {
+		t.Fatalf("tokens = %v, want [old-token]", got)
 	}
 }

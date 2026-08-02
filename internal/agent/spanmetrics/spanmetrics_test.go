@@ -13,6 +13,7 @@ import (
 	"go.opentelemetry.io/collector/pdata/pmetric"
 	"go.opentelemetry.io/collector/pdata/ptrace"
 
+	"github.com/JohanLindvall/kubescrape/internal/agent/cumagg"
 	"github.com/JohanLindvall/kubescrape/internal/obs"
 )
 
@@ -194,8 +195,8 @@ func TestCardinalityCap(t *testing.T) {
 	if got := obs.SpanMetricsDropped.Value() - before; got != 2 { // "c" dropped twice
 		t.Fatalf("dropped delta = %v, want 2", got)
 	}
-	if len(g.series) != 2 {
-		t.Fatalf("admitted tuples = %d, want 2 (cap held)", len(g.series))
+	if g.store.Len() != 2 {
+		t.Fatalf("admitted tuples = %d, want 2 (cap held)", g.store.Len())
 	}
 	exp := &capExporter{}
 	_ = g.Export(context.Background(), exp, pcommon.NewResource())
@@ -283,7 +284,7 @@ func TestDurationSkewClamped(t *testing.T) {
 	s := td.ResourceSpans().AppendEmpty().ScopeSpans().AppendEmpty().Spans().AppendEmpty()
 	s.SetStartTimestamp(pcommon.Timestamp(100))
 	s.SetEndTimestamp(pcommon.Timestamp(50)) // end before start
-	if d := durationSeconds(s); d != 0 {
+	if d := cumagg.SpanSeconds(s); d != 0 {
 		t.Fatalf("skewed duration = %v, want 0", d)
 	}
 }
@@ -445,7 +446,7 @@ func TestStaleSeriesEvictedFreesCardinalitySlot(t *testing.T) {
 	if exp2.exports() != 0 {
 		t.Fatalf("exported %d payloads after everything went stale, want 0", exp2.exports())
 	}
-	if n := len(g.series); n != 0 {
+	if n := g.store.Len(); n != 0 {
 		t.Fatalf("series after eviction = %d, want 0", n)
 	}
 	if got := obs.SpanMetricsEvicted.Value() - evictedBefore; got != 2 {
@@ -492,8 +493,8 @@ func TestStaleSeriesSurviveUntilExported(t *testing.T) {
 	if err := g.Export(ctx, exp2, res); err != nil {
 		t.Fatal(err)
 	}
-	if exp2.exports() != 0 || len(g.series) != 0 {
-		t.Fatalf("exports=%d series=%d after the reported series went stale, want 0/0", exp2.exports(), len(g.series))
+	if exp2.exports() != 0 || g.store.Len() != 0 {
+		t.Fatalf("exports=%d series=%d after the reported series went stale, want 0/0", exp2.exports(), g.store.Len())
 	}
 }
 
@@ -532,18 +533,29 @@ func TestReCreatedSeriesGetsFreshStartTimestamp(t *testing.T) {
 }
 
 func TestStaleAfterConfig(t *testing.T) {
-	if got := New(Config{}).staleAfter; got != defaultStaleAfter {
+	if got := New(Config{}).store.StaleAfter(); got != defaultStaleAfter {
 		t.Fatalf("default staleAfter = %v, want %v", got, defaultStaleAfter)
 	}
-	if got := New(Config{StaleAfter: "0"}).staleAfter; got != 0 {
+	if got := New(Config{StaleAfter: "0"}).store.StaleAfter(); got != 0 {
 		t.Fatalf("explicit 0 staleAfter = %v, want 0 (eviction disabled)", got)
 	}
 	if err := (Config{StaleAfter: "fifteen minutes"}).Validate(); err == nil {
 		t.Fatal("Validate accepted an unparseable staleAfter")
 	}
 	// An unparseable value still aggregates, on the default.
-	if got := New(Config{StaleAfter: "fifteen minutes"}).staleAfter; got != defaultStaleAfter {
+	if got := New(Config{StaleAfter: "fifteen minutes"}).store.StaleAfter(); got != defaultStaleAfter {
 		t.Fatalf("bad staleAfter fell back to %v, want %v", got, defaultStaleAfter)
+	}
+	// A NEGATIVE value is REFUSED, not clamped. 0 means "eviction disabled"
+	// here, so clamping a negative to it silently turned the cardinality cap
+	// into the one-way latch this field exists to prevent — and the sibling
+	// serviceGraph.staleAfter had always refused the same input (see
+	// cumagg.ParseStaleAfter and the cross-package test beside it).
+	if err := (Config{StaleAfter: "-15m"}).Validate(); err == nil {
+		t.Fatal("Validate accepted a negative staleAfter")
+	}
+	if got := New(Config{StaleAfter: "-15m"}).store.StaleAfter(); got != defaultStaleAfter {
+		t.Fatalf("negative staleAfter resolved to %v, want the default %v (0 would DISABLE eviction)", got, defaultStaleAfter)
 	}
 	// Eviction disabled: a long-idle series keeps reporting.
 	g := New(Config{StaleAfter: "0"})
@@ -586,8 +598,8 @@ func TestStaleSeriesSurviveFailedExport(t *testing.T) {
 	if err := g.Export(ctx, exp2, res); err != nil {
 		t.Fatal(err)
 	}
-	if exp2.exports() != 0 || len(g.series) != 0 {
-		t.Fatalf("exports=%d series=%d after a delivered series went stale, want 0/0", exp2.exports(), len(g.series))
+	if exp2.exports() != 0 || g.store.Len() != 0 {
+		t.Fatalf("exports=%d series=%d after a delivered series went stale, want 0/0", exp2.exports(), g.store.Len())
 	}
 }
 
@@ -609,16 +621,17 @@ func TestSeriesKeyTruncatesLikeTheRenderedDimensions(t *testing.T) {
 		spanSpec{name: prefix + "-two", dur: 0.02, attrs: map[string]string{"db.statement": prefix + "-y"}},
 	))
 
-	if n := len(g.series); n != 1 {
+	if n := g.store.Len(); n != 1 {
 		t.Fatalf("series = %d, want 1: spans that render identically must share one series", n)
 	}
-	for k := range g.series {
+	g.store.Range(func(k string, _ *spanSeries) bool {
 		// 6 parts at most maxDimBytes each, plus the length prefixes; the
 		// untruncated key grew with whatever the sender sent.
 		if max := len(g.names) * (maxDimBytes + 8); len(k) > max {
 			t.Errorf("series key is %d bytes, want <= %d: untruncated values are retained in the map", len(k), max)
 		}
-	}
+		return true
+	})
 
 	if err := g.Export(context.Background(), exp, pcommon.NewResource()); err != nil {
 		t.Fatal(err)
@@ -657,10 +670,10 @@ func TestTruncatedDimensionDoesNotRetainTheSenderString(t *testing.T) {
 		dur: 0.01, traceID: tid1, spanID: sid1,
 	}))
 
-	if len(g.series) != 1 {
-		t.Fatalf("series = %d, want 1", len(g.series))
+	if g.store.Len() != 1 {
+		t.Fatalf("series = %d, want 1", g.store.Len())
 	}
-	for _, s := range g.series {
+	g.store.Range(func(_ string, s *spanSeries) bool {
 		got := s.dims[1] // span.name
 		if len(got) != maxDimBytes {
 			t.Fatalf("retained span.name is %d bytes, want %d", len(got), maxDimBytes)
@@ -669,7 +682,8 @@ func TestTruncatedDimensionDoesNotRetainTheSenderString(t *testing.T) {
 			t.Fatalf("the retained %d-byte label still points into the %d-byte span name: "+
 				"the whole string stays alive for staleAfter", len(got), huge)
 		}
-	}
+		return true
+	})
 }
 
 // The allocator's view of the same thing: a burst of over-long span names must
@@ -695,8 +709,8 @@ func TestTruncatedDimensionsDoNotAccumulateHeap(t *testing.T) {
 	retained := int64(after.HeapAlloc) - int64(before.HeapAlloc)
 	t.Logf("heap retained by %d series cut from %d MiB span names: %d bytes",
 		series, huge>>20, retained)
-	if len(g.series) != series {
-		t.Fatalf("series = %d, want %d", len(g.series), series)
+	if g.store.Len() != series {
+		t.Fatalf("series = %d, want %d", g.store.Len(), series)
 	}
 	if max := int64(huge); retained > max {
 		t.Errorf("retained %d bytes, want well under one span name (%d): the truncation pins its source",

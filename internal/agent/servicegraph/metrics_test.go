@@ -17,6 +17,7 @@ import (
 	"go.opentelemetry.io/collector/pdata/pmetric"
 	"go.opentelemetry.io/collector/pdata/ptrace"
 
+	"github.com/JohanLindvall/kubescrape/internal/agent/cumagg"
 	"github.com/JohanLindvall/kubescrape/internal/obs"
 )
 
@@ -108,12 +109,12 @@ func edge(client, server string) Edge {
 
 // exemplarsOf renders a histogram point's exemplars as (value, trace, span)
 // triples, in order.
-func exemplarsOf(p pmetric.HistogramDataPoint) []exemplar {
-	out := make([]exemplar, 0, p.Exemplars().Len())
+func exemplarsOf(p pmetric.HistogramDataPoint) []cumagg.Exemplar {
+	out := make([]cumagg.Exemplar, 0, p.Exemplars().Len())
 	for i := 0; i < p.Exemplars().Len(); i++ {
 		e := p.Exemplars().At(i)
-		out = append(out, exemplar{set: true, value: e.DoubleValue(), ts: e.Timestamp(),
-			traceID: e.TraceID(), spanID: e.SpanID()})
+		out = append(out, cumagg.Exemplar{Set: true, Value: e.DoubleValue(), TS: e.Timestamp(),
+			TraceID: e.TraceID(), SpanID: e.SpanID()})
 	}
 	return out
 }
@@ -403,12 +404,12 @@ func TestDurationHistogramExemplars(t *testing.T) {
 
 	wantTS := pcommon.NewTimestampFromTime(t0)
 	client := exemplarsOf(firstHist(t, got, "traces_service_graph_request_client_seconds"))
-	wantClient := []exemplar{{set: true, value: 0.15, ts: wantTS, traceID: traceID(1), spanID: spanID(1)}}
+	wantClient := []cumagg.Exemplar{{Set: true, Value: 0.15, TS: wantTS, TraceID: traceID(1), SpanID: spanID(1)}}
 	if !slices.Equal(client, wantClient) {
 		t.Errorf("client exemplars = %+v, want %+v", client, wantClient)
 	}
 	server := exemplarsOf(firstHist(t, got, "traces_service_graph_request_server_seconds"))
-	wantServer := []exemplar{{set: true, value: 0.05, ts: wantTS, traceID: traceID(1), spanID: spanID(2)}}
+	wantServer := []cumagg.Exemplar{{Set: true, Value: 0.05, TS: wantTS, TraceID: traceID(1), SpanID: spanID(2)}}
 	if !slices.Equal(server, wantServer) {
 		t.Errorf("server exemplars = %+v, want %+v", server, wantServer)
 	}
@@ -433,10 +434,10 @@ func TestExemplarsAreOnePerBucketLatestWins(t *testing.T) {
 	if len(ex) != 2 {
 		t.Fatalf("exemplars = %+v, want one per occupied bucket", ex)
 	}
-	if ex[0].value != 0.19 || ex[0].spanID != spanID(19) {
+	if ex[0].Value != 0.19 || ex[0].SpanID != spanID(19) {
 		t.Errorf("first bucket's exemplar = %+v, want the LATEST of the two samples in it", ex[0])
 	}
-	if ex[1].value != 0.5 {
+	if ex[1].Value != 0.5 {
 		t.Errorf("second exemplar = %+v, want the 0.5s sample", ex[1])
 	}
 }
@@ -598,7 +599,7 @@ func TestStaleEvictionOnlyAfterDelivery(t *testing.T) {
 	if got := obs.ServiceGraphEvicted.Value() - evictedBefore; got != 1 {
 		t.Errorf("evicted delta = %v, want 1", got)
 	}
-	if n := len(r.series); n != 0 {
+	if n := r.store.Len(); n != 0 {
 		t.Errorf("series after eviction = %d, want 0", n)
 	}
 }
@@ -624,7 +625,7 @@ func TestReCreatedSeriesGetsFreshStartTimestamp(t *testing.T) {
 
 	now = now.Add(2 * time.Minute) // delivered above, so this evicts
 	export(t, r, exp)
-	if n := len(r.series); n != 0 {
+	if n := r.store.Len(); n != 0 {
 		t.Fatalf("series after eviction = %d, want 0", n)
 	}
 
@@ -804,10 +805,10 @@ func TestTruncatedLabelsDoNotRetainTheSenderStrings(t *testing.T) {
 	p.now = func() time.Time { return time.Now().Add(time.Hour) }
 	p.Sweep()
 
-	if len(reg.series) != 1 {
-		t.Fatalf("series = %d, want 1", len(reg.series))
+	if reg.store.Len() != 1 {
+		t.Fatalf("series = %d, want 1", reg.store.Len())
 	}
-	for _, s := range reg.series {
+	reg.store.Range(func(_ string, s *edgeSeries) bool {
 		for _, l := range s.labels {
 			var src string
 			switch l.name {
@@ -828,14 +829,15 @@ func TestTruncatedLabelsDoNotRetainTheSenderStrings(t *testing.T) {
 					l.name, huge)
 			}
 		}
-	}
+		return true
+	})
 }
 
 // Rendering must not stall the receive path. Record is called by the pairing
 // store from INSIDE its own mutex (upsert -> emit -> Record), so a render that
-// held r.mu across the payload build put the WHOLE build — tens of milliseconds
-// at the cardinality cap — in front of every Consume on the shard, once per
-// export interval. The lock is now held only for the value snapshot.
+// held the series lock across the payload build put the WHOLE build — tens of
+// milliseconds at the cardinality cap — in front of every Consume on the shard,
+// once per export interval. The lock is now held only for the value snapshot.
 func TestRenderDoesNotStallRecord(t *testing.T) {
 	const series = 20000
 	r := NewRegistry(Config{MaxCardinality: series + 1})

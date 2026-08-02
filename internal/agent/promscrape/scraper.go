@@ -18,6 +18,7 @@ import (
 	"go.opentelemetry.io/collector/pdata/pmetric"
 
 	"github.com/JohanLindvall/kubescrape/internal/agent/attrs"
+	"github.com/JohanLindvall/kubescrape/internal/bearer"
 	"github.com/JohanLindvall/kubescrape/internal/obs"
 	"github.com/JohanLindvall/kubescrape/pkg/kubemeta"
 )
@@ -110,6 +111,9 @@ type Scraper struct {
 	log  *slog.Logger
 
 	kubeletHTTP *http.Client
+	// kubeletToken is the mounted ServiceAccount token presented to the kubelet
+	// (nil when Kubelet.TokenFile is unset).
+	kubeletToken *bearer.File
 	// podCache backs the metadata lookups of the cadvisor batcher and the
 	// splitters; splitters run on concurrent scrape goroutines.
 	cacheMu  sync.Mutex
@@ -171,7 +175,7 @@ func New(cfg Config) *Scraper {
 	if log == nil {
 		log = slog.Default()
 	}
-	return &Scraper{
+	sc := &Scraper{
 		cfg: cfg,
 		http: &http.Client{
 			// No client Timeout: the per-request context carries the effective
@@ -202,6 +206,12 @@ func New(cfg Config) *Scraper {
 		podCache:    make(map[string]podCacheEntry),
 		authCache:   make(map[string]authCacheEntry),
 	}
+	if cfg.Kubelet.TokenFile != "" {
+		// Not read here: a projection that is not yet mounted must not stop the
+		// agent, and kubeletGet surfaces the error on the scrape it belongs to.
+		sc.kubeletToken = bearer.NewFile(cfg.Kubelet.TokenFile, log)
+	}
+	return sc
 }
 
 // scrapeProto runs the protobuf exposition path with the same export/full

@@ -8,6 +8,7 @@ import (
 
 	"github.com/bmatcuk/doublestar/v4"
 
+	"github.com/JohanLindvall/kubescrape/internal/config"
 	"github.com/JohanLindvall/kubescrape/internal/logline"
 )
 
@@ -104,20 +105,11 @@ func ValidateSources(sources []Source) ([]Source, error) {
 	return sources, nil
 }
 
-// parseIgnoreOlder resolves the source's mtime cutoff; empty means none. A
-// negative duration would ignore everything, which is never what anyone means.
+// parseIgnoreOlder resolves the source's mtime cutoff; empty — and an explicit
+// zero — means none. A negative duration would ignore everything, which is
+// never what anyone means; config.Duration is where that policy lives now.
 func parseIgnoreOlder(v string) (time.Duration, error) {
-	if v == "" {
-		return 0, nil
-	}
-	d, err := time.ParseDuration(v)
-	if err != nil {
-		return 0, fmt.Errorf("invalid ignoreOlder %q: %w", v, err)
-	}
-	if d < 0 {
-		return 0, fmt.Errorf("invalid ignoreOlder %q: must not be negative", v)
-	}
-	return d, nil
+	return config.Duration("ignoreOlder", v, 0, config.ZeroDisables())
 }
 
 // compiledSource is a Source with its per-source options resolved.

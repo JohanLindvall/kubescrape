@@ -206,16 +206,31 @@ func TestOnlyScrapeAuthIsAuthenticated(t *testing.T) {
 // every pod in the cluster, so a byte-at-a-time compare is a remotely timeable
 // oracle for the shared token. Pinned by source inspection — a timing test
 // would be flaky, and the property is a property of the code.
+//
+// The comparison itself now lives in internal/bearer, shared with the trace
+// tier's internal listener (which had a byte-identical copy). This test follows
+// it there: auth.go must delegate rather than open-code a compare, and the
+// shared routine must still be the constant-time one.
 func TestScrapeAuthUsesConstantTimeCompare(t *testing.T) {
 	src, err := os.ReadFile("auth.go")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(src), "subtle.ConstantTimeCompare([]byte(got), []byte(tok))") {
-		t.Fatal("the scrape-auth tokens must be compared with crypto/subtle.ConstantTimeCompare")
+	if !strings.Contains(string(src), "bearer.Authorized(") {
+		t.Fatal("the scrape-auth handler must compare tokens through internal/bearer.Authorized")
 	}
 	if strings.Contains(string(src), "got == tok") {
 		t.Fatal("string equality on a scrape-auth token leaks it to a timing attack")
+	}
+	shared, err := os.ReadFile("../bearer/bearer.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(shared), "subtle.ConstantTimeCompare([]byte(got), []byte(tok))") {
+		t.Fatal("bearer.Authorized must compare with crypto/subtle.ConstantTimeCompare")
+	}
+	if strings.Contains(string(shared), "got == tok") {
+		t.Fatal("string equality on a bearer token leaks it to a timing attack")
 	}
 }
 

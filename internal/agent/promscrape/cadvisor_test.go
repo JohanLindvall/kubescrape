@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/JohanLindvall/kubescrape/internal/bearer"
 	"github.com/JohanLindvall/kubescrape/pkg/kubemeta"
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/pmetric"
@@ -527,5 +528,65 @@ container_size_bytes_count{namespace="ns1",pod="pod1",container="app",id="/kubep
 	sdp := summ.Summary().DataPoints().At(0)
 	if sdp.Count() != 3 || sdp.Sum() != 100 || sdp.QuantileValues().Len() != 1 {
 		t.Fatalf("summary dp = count %d sum %v quantiles %d", sdp.Count(), sdp.Sum(), sdp.QuantileValues().Len())
+	}
+}
+
+// THE DRIFT internal/bearer resolves, from the kubelet side of it: this path
+// had no cache at all and did an os.ReadFile on EVERY kubelet request, so the
+// brief window in which kubelet replaces a projected ServiceAccount token —
+// the very rotation the "read per scrape" was written for — failed the scrape
+// outright. The agent's own token cache and the metadata service's accept set
+// both survived that window; two of the five copies did not.
+func TestKubeletTokenSurvivesAFailedReread(t *testing.T) {
+	var gotAuth atomic.Value
+	gotAuth.Store("")
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth.Store(r.Header.Get("Authorization"))
+		w.Header().Set("Content-Type", "text/plain")
+		_, _ = w.Write([]byte("# TYPE up gauge\nup 1\n"))
+	}))
+	defer srv.Close()
+
+	tokenFile := filepath.Join(t.TempDir(), "token")
+	if err := os.WriteFile(tokenFile, []byte("tok123\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s := New(Config{
+		Node: "node1", Interval: time.Hour, Timeout: 5 * time.Second,
+		Targets: staticTargets{}, Exporter: &captureExporter{}, StartTime: time.Now(),
+		Kubelet: KubeletConfig{Endpoint: srv.URL, NodeMetrics: true, TokenFile: tokenFile},
+	})
+	// Re-read on every request so the swap window below is reached without
+	// waiting out the production interval.
+	s.kubeletToken = bearer.NewFile(tokenFile, nil, bearer.WithInterval(time.Nanosecond))
+
+	resp, err := s.kubeletGet(context.Background(), srv.URL+"/metrics")
+	if err != nil {
+		t.Fatal(err)
+	}
+	drainClose(resp.Body)
+	if got := gotAuth.Load().(string); got != "Bearer tok123" {
+		t.Fatalf("Authorization = %q, want Bearer tok123", got)
+	}
+
+	// The rotation window: the projection is briefly absent.
+	if err := os.Remove(tokenFile); err != nil {
+		t.Fatal(err)
+	}
+	gotAuth.Store("")
+	resp, err = s.kubeletGet(context.Background(), srv.URL+"/metrics")
+	if err != nil {
+		t.Fatalf("kubelet scrape failed during a token rotation window: %v; the last good token must be presented instead", err)
+	}
+	drainClose(resp.Body)
+	if got := gotAuth.Load().(string); got != "Bearer tok123" {
+		t.Fatalf("Authorization = %q, want the last good Bearer tok123", got)
+	}
+
+	// With nothing ever read, the scrape still fails: an unauthenticated
+	// kubelet request would 401 anyway, and the error names the real cause.
+	s.kubeletToken = bearer.NewFile(filepath.Join(t.TempDir(), "never-existed"), nil)
+	if _, err := s.kubeletGet(context.Background(), srv.URL+"/metrics"); err == nil {
+		t.Fatal("an unreadable token file with nothing cached must fail the scrape")
 	}
 }

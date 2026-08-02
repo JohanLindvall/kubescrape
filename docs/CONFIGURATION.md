@@ -887,7 +887,10 @@ signal for a cumulative counter — and count into
 re-created with a fresh start timestamp (the OTLP spelling of a counter
 reset). Eviction only ever drops values a **delivered** export already
 carried, so an export interval longer than `staleAfter`, or a failed export,
-never loses observations. `"0"` disables eviction.
+never loses observations. `"0"` disables eviction; a NEGATIVE value is refused
+by `-check-config` rather than clamped, because clamping it would land on that
+same `"0"` and disable the eviction the field was being set to configure. It is
+parsed by the same code as `serviceGraph.staleAfter`, so the two agree.
 
 ## Agent: service graph
 

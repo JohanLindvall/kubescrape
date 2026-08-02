@@ -17,24 +17,25 @@
 // The generator is a self-contained cumulative aggregator (not the shared
 // metrics.Registry): exemplars are a histogram-data-point feature the Registry
 // cannot express, and owning the aggregation also gives the size counter and
-// units a single coherent home. A cardinality cap bounds the data-driven label
-// sets.
+// units a single coherent home. The state machine underneath — admission under
+// a cardinality cap, the observed/rendered/delivered gate, stale eviction and
+// the export loop — is agent/cumagg, shared with agent/servicegraph, which
+// needs exactly the same decisions and once made two of them differently. What
+// stays here is what is this aggregator's own: the metric names, the dimension
+// set and the per-span aggregate.
 package spanmetrics
 
 import (
 	"context"
-	"fmt"
 	"log/slog"
 	"sort"
-	"strconv"
-	"strings"
-	"sync"
 	"time"
 
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/pmetric"
 	"go.opentelemetry.io/collector/pdata/ptrace"
 
+	"github.com/JohanLindvall/kubescrape/internal/agent/cumagg"
 	"github.com/JohanLindvall/kubescrape/internal/obs"
 )
 
@@ -53,6 +54,10 @@ const (
 // them (extra configured dimensions follow).
 var builtinDims = []string{dimService, dimSpan, dimKind, dimStatus}
 
+// builtins is the collision guard for configured dimensions; see cumagg.Builtins
+// for what a colliding name does and why the check runs at construction here.
+var builtins = cumagg.NewBuiltins(builtinDims...)
+
 // defaultBuckets are the classic spanmetrics latency boundaries in SECONDS.
 var defaultBuckets = []float64{0.002, 0.004, 0.006, 0.008, 0.01, 0.05, 0.1, 0.2, 0.4, 0.8, 1, 1.4, 2, 5, 10, 15}
 
@@ -66,10 +71,11 @@ const (
 	defaultStaleAfter = 15 * time.Minute
 )
 
+// maxDimBytes bounds one dimension value; see cumagg.MaxLabelBytes for why.
+const maxDimBytes = cumagg.MaxLabelBytes
+
 // Exporter sends one OTLP metrics payload; satisfied by otlpexport.Client.
-type Exporter interface {
-	ExportMetrics(ctx context.Context, md pmetric.Metrics) error
-}
+type Exporter = cumagg.Exporter
 
 // Config tunes the generator. The zero value is valid and uses the defaults.
 type Config struct {
@@ -90,7 +96,8 @@ type Config struct {
 	Exemplars *bool `json:"exemplars,omitempty"`
 	// StaleAfter evicts a series whose dimensions have not been observed for
 	// this long (a Go duration such as "15m"; empty = 15m, "0" disables
-	// eviction and keeps every series for the process' life).
+	// eviction and keeps every series for the process' life). A negative value
+	// is refused — see cumagg.ParseStaleAfter.
 	//
 	// A STRING, not a time.Duration, for the same reason as traceSampling's
 	// keepSlowerThan: the config is decoded through sigs.k8s.io/yaml ->
@@ -99,20 +106,10 @@ type Config struct {
 	StaleAfter string `json:"staleAfter,omitempty"`
 }
 
-// staleAfter parses StaleAfter. Empty means the default; an explicit
-// zero/negative disables eviction.
+// staleAfter parses StaleAfter (empty = the default, "0" disables eviction, a
+// negative value is an error).
 func (c Config) staleAfter() (time.Duration, error) {
-	if c.StaleAfter == "" {
-		return defaultStaleAfter, nil
-	}
-	d, err := time.ParseDuration(c.StaleAfter)
-	if err != nil {
-		return defaultStaleAfter, fmt.Errorf("traceMetrics.staleAfter %q: %w", c.StaleAfter, err)
-	}
-	if d < 0 {
-		d = 0
-	}
-	return d, nil
+	return cumagg.ParseStaleAfter("traceMetrics.staleAfter", c.StaleAfter, defaultStaleAfter)
 }
 
 // Validate reports a malformed config so a bad value can fail startup with a
@@ -126,57 +123,36 @@ func (c Config) Validate() error {
 // Generator aggregates spans into calls/size/duration metrics. Safe for
 // concurrent Consume from the ingest goroutines.
 type Generator struct {
-	prefix     string
-	names      []string // full dimension label names (built-ins + extras), in order
-	extra      []string
-	bounds     []float64 // histogram bucket bounds, ascending, seconds
-	maxCard    int
-	exemplars  bool
-	staleAfter time.Duration // 0 disables eviction
-	now        func() time.Time
+	prefix    string
+	names     []string // full dimension label names (built-ins + extras), in order
+	extra     []string
+	bounds    []float64 // histogram bucket bounds, ascending, seconds
+	exemplars bool
+	now       func() time.Time
 
-	mu     sync.Mutex
-	series map[string]*spanSeries
+	store *cumagg.Store[*spanSeries]
 }
 
 type spanSeries struct {
+	// Meta is the shared bookkeeping: creation time (the cumulative start
+	// timestamp), last observation and the observed/rendered/delivered state
+	// eviction is gated on.
+	cumagg.Meta
 	dims    []string // dimension values, aligned with Generator.names
 	calls   uint64
 	size    int64
 	count   uint64
 	sum     float64
-	buckets []uint64   // len(bounds)+1
-	ex      []exemplar // nil until an exemplar is recorded; one latest per bucket
-	// start is when this series was created: a series re-created after an
-	// eviction restarts its cumulative counters, and a fresh start timestamp is
-	// how OTLP spells that reset (an unchanged one would read as a counter
-	// jumping backwards).
-	start time.Time
-	// lastSeen is the last observation; state says whether the CURRENT values
-	// reached the collector. Eviction needs both: dropping a series whose last
-	// observations no DELIVERED export carried would destroy them unseen (an
-	// export interval may legally exceed staleAfter, and an export can fail).
-	lastSeen time.Time
-	state    reportState
+	buckets []uint64          // len(bounds)+1
+	ex      []cumagg.Exemplar // nil until an exemplar is recorded; one latest per bucket
 }
 
-// reportState tracks a series' values from observation to delivery, so
-// eviction only ever drops values the collector has acked.
-type reportState uint8
+// resetExemplars is the store's after-delivery hook (a failed send keeps them).
+func (s *spanSeries) resetExemplars() { cumagg.ClearExemplars(s.ex) }
 
-const (
-	stateObserved  reportState = iota // new values since the last render
-	stateRendered                     // rendered into a payload; delivery unknown
-	stateDelivered                    // a payload carrying them was acked
-)
-
-type exemplar struct {
-	set     bool
-	value   float64
-	ts      pcommon.Timestamp
-	traceID pcommon.TraceID
-	spanID  pcommon.SpanID
-}
+// clock reads the injectable now through the Generator, so a test that replaces
+// g.now after New is also replacing the clock the store exports on.
+func (g *Generator) clock() time.Time { return g.now() }
 
 // New builds a generator from cfg.
 func New(cfg Config) *Generator {
@@ -192,37 +168,33 @@ func New(cfg Config) *Generator {
 	if cfg.Exemplars != nil {
 		ex = *cfg.Exemplars
 	}
-	// Drop configured dimensions that repeat a built-in (or each other).
-	// putDims writes names in order and a later write wins, while an extra is
-	// resolved from span/resource ATTRIBUTES — and span.name/span.kind/
-	// status.code are span fields, not attributes, so they resolve to "".
-	// A `dimensions: ["span.name"]` therefore blanked the real built-in label,
-	// and since the series key still distinguished the series, two different
-	// spans rendered byte-identical attribute sets in one export.
-	seen := make(map[string]bool, len(builtinDims)+len(cfg.Dimensions))
-	for _, d := range builtinDims {
-		seen[d] = true
-	}
+	// Drop configured dimensions that repeat a built-in (or each other). This is
+	// the ONE place this generator's label names are decided, which is why the
+	// guard runs here; cumagg.Builtins holds the rule and the bug it prevents.
 	names := append([]string(nil), builtinDims...)
-	for _, d := range cfg.Dimensions {
-		if seen[d] {
-			continue
-		}
-		seen[d] = true
-		names = append(names, d)
-	}
+	names = append(names, builtins.Filter(cfg.Dimensions)...)
 	stale, _ := cfg.staleAfter() // an unparseable value falls back to the default; Validate reports it
-	return &Generator{
-		prefix:     prefix,
-		names:      names,
-		extra:      names[len(builtinDims):], // the configured dimensions, aliased (never diverges from names)
-		bounds:     boundsOrDefault(cfg.Buckets),
-		maxCard:    maxCard,
-		exemplars:  ex,
-		staleAfter: stale,
-		now:        time.Now,
-		series:     make(map[string]*spanSeries),
+	g := &Generator{
+		prefix:    prefix,
+		names:     names,
+		extra:     names[len(builtinDims):], // the configured dimensions, aliased (never diverges from names)
+		bounds:    boundsOrDefault(cfg.Buckets),
+		exemplars: ex,
+		now:       time.Now,
 	}
+	g.store = cumagg.NewStore(cumagg.Options[*spanSeries]{
+		Scope:          scopeName,
+		Name:           "span metrics",
+		MaxCardinality: maxCard,
+		StaleAfter:     stale,
+		Dropped:        obs.SpanMetricsDropped,
+		Evicted:        obs.SpanMetricsEvicted,
+		Now:            g.clock,
+		NewSeries:      func() *spanSeries { return &spanSeries{} },
+		Render:         g.renderRED,
+		ResetExemplars: (*spanSeries).resetExemplars,
+	})
+	return g
 }
 
 // boundsOrDefault returns a sorted copy of b, or the default buckets when empty.
@@ -246,7 +218,7 @@ func (g *Generator) Consume(td ptrace.Traces) {
 	for i := 0; i < rss.Len(); i++ {
 		rs := rss.At(i)
 		resAttrs := rs.Resource().Attributes()
-		svc := attrStr(resAttrs, dimService)
+		svc := cumagg.AttrStr(resAttrs, dimService)
 		sss := rs.ScopeSpans()
 		for j := 0; j < sss.Len(); j++ {
 			spans := sss.At(j).Spans()
@@ -258,141 +230,75 @@ func (g *Generator) Consume(td ptrace.Traces) {
 }
 
 func (g *Generator) observe(span ptrace.Span, resAttrs pcommon.Map, svc string, now time.Time) {
-	// Build the map key on the stack (does not escape → the map[string(key)]
-	// lookup allocates nothing for a warm series). A key over keyScratch bytes
-	// falls back to a one-off heap grow.
+	// Build the map key on the stack (it does not escape → the lookup inside
+	// AdmitLocked allocates nothing for a warm series). A key over keyScratch
+	// bytes falls back to a one-off heap grow.
 	//
-	// Every part is truncDim'd at exactly the length dims() cuts the values it
-	// RENDERS to (retainDim, which differs only in cloning what it keeps).
-	// Keying on the untruncated values instead made the key finer than
-	// the data points it identifies: two spans differing only past maxDimBytes
-	// held two series that rendered byte-identical attribute sets — a duplicate
-	// series in one export, which is a conflict downstream, not extra detail —
-	// and the retained key was unbounded in size, so the truncation's other job
-	// (bounding what a sender can pin in memory for staleAfter) leaked through
-	// the map. Truncating a Go string is a reslice: the warm path stays
-	// allocation-free. Kind and status are closed enum spellings, truncated
-	// nowhere.
+	// Every part is cut at exactly the length dims() cuts the values it RENDERS
+	// to (cumagg.Retain, which differs only in cloning what it keeps); see
+	// cumagg.Trunc for why keying on the untruncated value is a duplicate
+	// series. Kind and status are closed enum spellings, truncated nowhere.
 	var keyScratch [256]byte
 	key := keyScratch[:0]
-	key = appendKeyPart(key, truncDim(svc))
-	key = appendKeyPart(key, truncDim(span.Name()))
-	key = appendKeyPart(key, span.Kind().String())
-	key = appendKeyPart(key, span.Status().Code().String())
+	key = cumagg.AppendKeyPart(key, cumagg.Trunc(svc))
+	key = cumagg.AppendKeyPart(key, cumagg.Trunc(span.Name()))
+	key = cumagg.AppendKeyPart(key, span.Kind().String())
+	key = cumagg.AppendKeyPart(key, span.Status().Code().String())
 	for _, k := range g.extra {
-		v := attrStr(span.Attributes(), k)
+		v := cumagg.AttrStr(span.Attributes(), k)
 		if v == "" {
-			v = attrStr(resAttrs, k) // fall back to the resource
+			v = cumagg.AttrStr(resAttrs, k) // fall back to the resource
 		}
-		key = appendKeyPart(key, truncDim(v))
+		key = cumagg.AppendKeyPart(key, cumagg.Trunc(v))
 	}
-	d := durationSeconds(span)
+	d := cumagg.SpanSeconds(span)
 	sz := spanSize(span)
-	idx := bucketIndex(g.bounds, d)
+	idx := cumagg.BucketIndex(g.bounds, d)
 
-	g.mu.Lock()
-	s, ok := g.series[string(key)]
+	g.store.Lock()
+	s, fresh, ok := g.store.AdmitLocked(key, now)
 	if !ok {
-		if len(g.series) >= g.maxCard {
-			g.mu.Unlock()
-			obs.SpanMetricsDropped.Inc()
-			return
-		}
-		s = &spanSeries{dims: g.dims(span, resAttrs, svc), buckets: make([]uint64, len(g.bounds)+1), start: now}
-		g.series[string(key)] = s
+		g.store.Unlock() // over the cardinality cap; AdmitLocked counted it
+		return
+	}
+	if fresh {
+		s.dims = g.dims(span, resAttrs, svc)
+		s.buckets = make([]uint64, len(g.bounds)+1)
 	}
 	s.calls++
 	s.size += sz
 	s.count++
 	s.sum += d
 	s.buckets[idx]++
-	s.lastSeen = now
-	s.state = stateObserved
 	if g.exemplars {
-		if tid := span.TraceID(); !tid.IsEmpty() {
-			if s.ex == nil {
-				s.ex = make([]exemplar, len(g.bounds)+1)
-			}
-			s.ex[idx] = exemplar{set: true, value: d, ts: span.EndTimestamp(), traceID: tid, spanID: span.SpanID()}
-		}
+		s.ex = cumagg.RecordExemplar(s.ex, len(g.bounds)+1, idx, d,
+			span.EndTimestamp(), span.TraceID(), span.SpanID())
 	}
-	g.mu.Unlock()
+	g.store.ObservedLocked(s, now)
+	g.store.Unlock()
 }
 
 // dims materializes the dimension values for a new series (cold path). Values
 // are retained for the series' life, so they are cloned where they were cut
-// (retainDim) rather than left pointing into the sender's payload.
+// (cumagg.Retain) rather than left pointing into the sender's payload.
 func (g *Generator) dims(span ptrace.Span, resAttrs pcommon.Map, svc string) []string {
 	vals := make([]string, 0, len(g.names))
-	vals = append(vals, retainDim(svc), retainDim(span.Name()),
+	vals = append(vals, cumagg.Retain(svc), cumagg.Retain(span.Name()),
 		span.Kind().String(), span.Status().Code().String())
 	for _, k := range g.extra {
-		v := attrStr(span.Attributes(), k)
+		v := cumagg.AttrStr(span.Attributes(), k)
 		if v == "" {
-			v = attrStr(resAttrs, k)
+			v = cumagg.AttrStr(resAttrs, k)
 		}
-		vals = append(vals, retainDim(v))
+		vals = append(vals, cumagg.Retain(v))
 	}
 	return vals
 }
 
-// maxDimBytes bounds one dimension value. The cardinality cap counts SERIES,
-// not bytes, and these values come from an unauthenticated local listener: a
-// sender controlling span.name could otherwise pin maxCardinality x arbitrary
-// length in memory for staleAfter and re-render it into every export. The
-// OTel Collector's connector and Tempo truncate for the same reason.
-const maxDimBytes = 256
-
-// truncDim bounds a value that is about to be CONSUMED and dropped — the map
-// key observe builds on the stack, which map[string(key)] copies on insert.
-// Slicing a Go string allocates nothing but keeps the WHOLE original alive, so
-// it is only safe where the result does not outlive the span.
-func truncDim(v string) string {
-	if len(v) <= maxDimBytes {
-		return v
-	}
-	return v[:maxDimBytes]
-}
-
-// retainDim is truncDim for a value the generator KEEPS (spanSeries.dims). The
-// slice truncDim returns still points into the sender's string, so retaining it
-// pins the whole thing — a 4 MiB span.name held for staleAfter by a 256-byte
-// label, which is precisely the bound maxDimBytes claims to provide and did
-// not. Cloning only on the truncating branch leaves the ordinary short value
-// allocation-free, and this runs once per ADMITTED series, never per span.
-func retainDim(v string) string {
-	if len(v) <= maxDimBytes {
-		return v
-	}
-	return strings.Clone(v[:maxDimBytes])
-}
-
-// Run exports every interval until ctx is done, then once more. A non-positive
-// interval falls back to one minute (NewTicker would panic).
+// Run exports every interval until ctx is done, then once more on a detached
+// context (cumagg.Store.Run).
 func (g *Generator) Run(ctx context.Context, exp Exporter, interval time.Duration, res pcommon.Resource, log *slog.Logger) {
-	if log == nil {
-		log = slog.Default()
-	}
-	if interval <= 0 {
-		interval = time.Minute
-	}
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			fctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-			if err := g.Export(fctx, exp, res); err != nil {
-				log.Warn("final span-metrics export failed", "error", err)
-			}
-			cancel()
-			return
-		case <-ticker.C:
-			if err := g.Export(ctx, exp, res); err != nil {
-				log.Warn("exporting span metrics failed", "error", err)
-			}
-		}
-	}
+	g.store.Run(ctx, exp, interval, res, log)
 }
 
 // Export renders the current cumulative aggregate under res and sends it once.
@@ -400,85 +306,30 @@ func (g *Generator) Run(ctx context.Context, exp Exporter, interval time.Duratio
 // per delivered export): a failed send keeps them for the next attempt instead
 // of wiping them unseen.
 func (g *Generator) Export(ctx context.Context, exp Exporter, res pcommon.Resource) error {
-	md := g.render(res, g.now())
-	if md.ResourceMetrics().Len() == 0 {
-		return nil
-	}
-	if err := exp.ExportMetrics(ctx, md); err != nil {
-		return err
-	}
-	g.afterDelivered()
-	return nil
+	return g.store.Export(ctx, exp, res)
 }
 
-// afterDelivered records that the rendered values reached the collector (only
-// those may later be evicted) and resets every recorded exemplar. A series
-// OBSERVED between render and this call is back in stateObserved, so it is not
-// marked delivered — its new values must still be exported before eviction may
-// touch them. An exemplar recorded in that same window is dropped unseen: the
-// one-interval recency window the reset has always had.
-func (g *Generator) afterDelivered() {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	for _, s := range g.series {
-		if s.state == stateRendered {
-			s.state = stateDelivered
-		}
-		for i := range s.ex {
-			s.ex[i].set = false
-		}
+// renderRED writes the three RED metrics for every live series. It is the
+// store's Render callback.
+//
+// Unlike agent/servicegraph's, it builds the payload UNDER the series lock: the
+// two aggregators' receive paths differ in what a stall costs (there, Record is
+// called from inside the pairing store's own mutex, so a long hold stops every
+// shard goroutine), and the lock strategy is deliberately the caller's to pick.
+func (g *Generator) renderRED(sm pmetric.ScopeMetrics, now time.Time) {
+	g.store.Lock()
+	defer g.store.Unlock()
+	g.store.EvictLocked(now)
+	if g.store.CountLocked() == 0 {
+		return
 	}
-}
-
-func (g *Generator) render(res pcommon.Resource, now time.Time) pmetric.Metrics {
-	md := pmetric.NewMetrics()
-	rm := md.ResourceMetrics().AppendEmpty()
-	res.CopyTo(rm.Resource())
-	sm := rm.ScopeMetrics().AppendEmpty()
-	sm.Scope().SetName(scopeName)
 	ts := pcommon.NewTimestampFromTime(now)
-
-	g.renderRED(sm, now, ts)
-	if sm.Metrics().Len() == 0 {
-		return pmetric.NewMetrics() // nothing to send this cycle
-	}
-	return md
-}
-
-// evictLocked drops series not observed within staleAfter. Without eviction the
-// map only ever grows: dead series render into every export forever and — worse
-// — the cardinality cap becomes a ONE-WAY LATCH, so one burst of high-
-// cardinality span names permanently blinds RED metrics for every service that
-// starts on the node afterwards. A cumulative counter that stops being reported
-// is the standard staleness signal downstream. Caller holds the mutex.
-func (g *Generator) evictLocked(now time.Time) {
-	if g.staleAfter <= 0 { // eviction disabled
-		return
-	}
-	for k, s := range g.series {
-		// Only a series whose current values a DELIVERED export carried may
-		// go: an export interval longer than staleAfter — or a failed export —
-		// must not destroy observations unseen.
-		if s.state == stateDelivered && now.Sub(s.lastSeen) > g.staleAfter {
-			delete(g.series, k)
-			obs.SpanMetricsEvicted.Inc()
-		}
-	}
-}
-
-func (g *Generator) renderRED(sm pmetric.ScopeMetrics, now time.Time, ts pcommon.Timestamp) {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	g.evictLocked(now)
-	if len(g.series) == 0 {
-		return
-	}
-	calls := sumMetric(sm, g.prefix+".calls", "Count of spans observed, by dimensions.", "")
-	size := sumMetric(sm, g.prefix+".size", "Total size of spans observed, in bytes.", "By")
-	dur := histMetric(sm, g.prefix+".duration", "Span duration in seconds, by dimensions.")
-	for _, s := range g.series {
-		s.state = stateRendered
-		start := pcommon.NewTimestampFromTime(s.start)
+	calls := cumagg.SumMetric(sm, g.prefix+".calls", "Count of spans observed, by dimensions.", "")
+	size := cumagg.SumMetric(sm, g.prefix+".size", "Total size of spans observed, in bytes.", "By")
+	dur := cumagg.HistMetric(sm, g.prefix+".duration", "Span duration in seconds, by dimensions.")
+	g.store.EachLocked(func(s *spanSeries) {
+		g.store.MarkRenderedLocked(s)
+		start := pcommon.NewTimestampFromTime(s.Start)
 		cp := calls.AppendEmpty()
 		putDims(cp.Attributes(), g.names, s.dims)
 		cp.SetStartTimestamp(start)
@@ -500,16 +351,11 @@ func (g *Generator) renderRED(sm pmetric.ScopeMetrics, now time.Time, ts pcommon
 		hp.ExplicitBounds().FromRaw(g.bounds)
 		hp.BucketCounts().FromRaw(s.buckets)
 		for i := range s.ex {
-			if !s.ex[i].set {
-				continue
+			if s.ex[i].Set {
+				cumagg.PutExemplar(hp.Exemplars(), s.ex[i])
 			}
-			e := hp.Exemplars().AppendEmpty()
-			e.SetDoubleValue(s.ex[i].value)
-			e.SetTimestamp(s.ex[i].ts)
-			e.SetTraceID(s.ex[i].traceID)
-			e.SetSpanID(s.ex[i].spanID)
 		}
-	}
+	})
 }
 
 // Tap returns a TracesExporter that feeds each batch through Consume and then
@@ -543,32 +389,7 @@ func (t *tap) ExportTraces(ctx context.Context, td ptrace.Traces) error {
 	return nil
 }
 
-// --- shared helpers ---
-
-func attrStr(m pcommon.Map, key string) string {
-	if v, ok := m.Get(key); ok {
-		return v.AsString()
-	}
-	return ""
-}
-
-func durationSeconds(span ptrace.Span) float64 {
-	end, start := span.EndTimestamp(), span.StartTimestamp()
-	if end <= start {
-		return 0 // unset or clock-skewed end: a negative duration is meaningless
-	}
-	return float64(end-start) / float64(time.Second)
-}
-
-// bucketIndex is the index of the first bound >= v, or the +Inf overflow bucket.
-func bucketIndex(bounds []float64, v float64) int {
-	for i, b := range bounds {
-		if v <= b {
-			return i
-		}
-	}
-	return len(bounds)
-}
+// --- span sizing ---
 
 // spanSize approximates the span's OTLP encoded byte size (name + ids +
 // attributes + events + links) — a cheap, allocation-free size signal for the
@@ -618,40 +439,4 @@ func putDims(a pcommon.Map, names, dims []string) {
 			a.PutStr(name, dims[i])
 		}
 	}
-}
-
-// sumMetric appends a monotonic cumulative Sum metric shell and returns its data
-// point slice.
-func sumMetric(sm pmetric.ScopeMetrics, name, desc, unit string) pmetric.NumberDataPointSlice {
-	m := sm.Metrics().AppendEmpty()
-	m.SetName(name)
-	m.SetDescription(desc)
-	if unit != "" {
-		m.SetUnit(unit)
-	}
-	s := m.SetEmptySum()
-	s.SetIsMonotonic(true)
-	s.SetAggregationTemporality(pmetric.AggregationTemporalityCumulative)
-	return s.DataPoints()
-}
-
-// histMetric appends a cumulative Histogram metric shell (seconds) and returns
-// its data point slice.
-func histMetric(sm pmetric.ScopeMetrics, name, desc string) pmetric.HistogramDataPointSlice {
-	m := sm.Metrics().AppendEmpty()
-	m.SetName(name)
-	m.SetDescription(desc)
-	m.SetUnit("s")
-	h := m.SetEmptyHistogram()
-	h.SetAggregationTemporality(pmetric.AggregationTemporalityCumulative)
-	return h.DataPoints()
-}
-
-// appendKeyPart appends one length-prefixed value to a map key so distinct tuples
-// never collide (("a","bc") vs ("ab","c")). Building the key on a stack buffer and
-// looking up via map[string(key)] keeps a warm series allocation-free.
-func appendKeyPart(dst []byte, v string) []byte {
-	dst = strconv.AppendInt(dst, int64(len(v)), 10)
-	dst = append(dst, ':')
-	return append(dst, v...)
 }

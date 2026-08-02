@@ -53,20 +53,24 @@ import (
 	"time"
 
 	"go.opentelemetry.io/collector/pdata/pcommon"
+
+	"github.com/JohanLindvall/kubescrape/internal/agent/cumagg"
 )
 
 // Defaults mirror Tempo's service-graphs processor, so an operator moving from
 // Tempo gets the same behaviour without re-tuning. Tempo: wait 10s, max_items
 // 10_000, buckets ExponentialBuckets(0.1, 2, 8).
 const (
-	DefaultWait            = 10 * time.Second
-	DefaultMaxItems        = 10_000
-	DefaultMaxCardinality  = 20_000
-	DefaultStaleAfter      = 15 * time.Minute
-	defaultBucketStart     = 0.1
-	defaultBucketFactor    = 2
-	defaultBucketCount     = 8
-	maxDimensionValueBytes = 256
+	DefaultWait           = 10 * time.Second
+	DefaultMaxItems       = 10_000
+	DefaultMaxCardinality = 20_000
+	DefaultStaleAfter     = 15 * time.Minute
+	defaultBucketStart    = 0.1
+	defaultBucketFactor   = 2
+	defaultBucketCount    = 8
+	// maxDimensionValueBytes bounds one retained label value; see
+	// cumagg.MaxLabelBytes for what it is protecting against.
+	maxDimensionValueBytes = cumagg.MaxLabelBytes
 )
 
 // Config is the `serviceGraph` section of the agent config file.
@@ -158,20 +162,13 @@ func (c Config) wait() (time.Duration, error) {
 }
 
 // staleAfter parses StaleAfter. Empty means the default; an explicit zero
-// DISABLES eviction (Registry.evictLocked's <= 0 branch) and keeps every series
-// for the process' life.
+// DISABLES eviction (cumagg's <= 0 branch) and keeps every series for the
+// process' life; a negative value is an error. The reading is
+// cumagg.ParseStaleAfter's, shared with agent/spanmetrics' identical field —
+// that one used to clamp a negative to zero, which silently DISABLED eviction
+// instead of refusing the config.
 func (c Config) staleAfter() (time.Duration, error) {
-	if c.StaleAfter == "" {
-		return DefaultStaleAfter, nil
-	}
-	d, err := time.ParseDuration(c.StaleAfter)
-	if err != nil {
-		return DefaultStaleAfter, fmt.Errorf("serviceGraph.staleAfter %q: %w", c.StaleAfter, err)
-	}
-	if d < 0 {
-		return DefaultStaleAfter, fmt.Errorf("serviceGraph.staleAfter %q must not be negative (use \"0\" to disable eviction)", c.StaleAfter)
-	}
-	return d, nil
+	return cumagg.ParseStaleAfter("serviceGraph.staleAfter", c.StaleAfter, DefaultStaleAfter)
 }
 
 // Validate checks the section without acquiring anything, so -check-config can
@@ -320,6 +317,6 @@ type Edge struct {
 // EdgeDimension is one configured extra label: the name is already prefixed
 // client_ / server_, and the value points into the OTLP payload the span
 // arrived in unless it was over-long, in which case it is a truncated COPY
-// (retainDimValue) — the store holds it for a whole Wait, and a slice of the
+// (cumagg.Retain) — the store holds it for a whole Wait, and a slice of the
 // payload would hold the payload's string with it.
 type EdgeDimension struct{ Name, Value string }

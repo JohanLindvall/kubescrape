@@ -33,17 +33,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
-	"mime"
 	"net"
 	"net/http"
 	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
-
-	"github.com/klauspost/compress/gzip"
 
 	"go.opentelemetry.io/collector/pdata/ptrace"
 	"go.opentelemetry.io/collector/pdata/ptrace/ptraceotlp"
@@ -53,12 +49,12 @@ import (
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 
-	"github.com/JohanLindvall/kubescrape/internal/agent/otlpexport"
 	"github.com/JohanLindvall/kubescrape/internal/agent/otlpingest"
 	"github.com/JohanLindvall/kubescrape/internal/agent/servicegraph"
 	"github.com/JohanLindvall/kubescrape/internal/agent/spanmetrics"
 	"github.com/JohanLindvall/kubescrape/internal/agent/tailbuffer"
 	"github.com/JohanLindvall/kubescrape/internal/agent/tracesample"
+	"github.com/JohanLindvall/kubescrape/internal/bearer"
 	"github.com/JohanLindvall/kubescrape/internal/obs"
 	"github.com/JohanLindvall/kubescrape/pkg/kubemeta"
 )
@@ -107,10 +103,12 @@ func (p *pipelines) startServiceGraph() error {
 	// The internal receiver accepts spans from anything that can reach the pod,
 	// so the hop is authenticated — validateConfig already refused an empty
 	// -service-graph-token-file (fatal there so -check-config catches it too);
-	// the READ is fatal here for the metadata service's reason: an unreadable or
-	// empty token file must stop the process, never open the listener with
-	// nothing to check against.
-	tok, err := newRotatingToken(*serviceGraphToken, p.log)
+	// the READ is fatal here for the metadata service's reason, which is
+	// bearer.NewRotating's contract: an unreadable or empty token file must stop
+	// the process, never open the listener with nothing to check against. Same
+	// package, same per-minute re-read and same rotation grace as the metadata
+	// service's /v1/scrape-auth — one auth model in this repo rather than two.
+	tok, err := bearer.NewRotating(*serviceGraphToken, p.log)
 	if err != nil {
 		return fmt.Errorf("-service-graph-token-file: %w", err)
 	}
@@ -148,7 +146,7 @@ func (p *pipelines) startServiceGraph() error {
 	rcv := &sgReceiver{
 		grpcAddr: *serviceGraphListen,
 		httpAddr: *serviceGraphHTTPListen,
-		tokens:   tok.tokens,
+		tokens:   tok.Tokens,
 		consume:  ownerReceive(owner),
 		ready:    func() { p.ready.done(gateServiceGraph) },
 		log:      p.log,
@@ -509,6 +507,13 @@ func sweepInterval(wait time.Duration) time.Duration {
 // would have meant bolting an auth mode and a skip-enrichment mode onto the
 // ingest path so neither could be changed without re-reasoning about the other.
 //
+// The SERVER is separate; the HTTP request seam is NOT. Reading a body, mapping
+// a read failure to a status and mapping a forward failure to one are the same
+// decisions on both ports and are shared (otlpingest.BodyReader,
+// WriteBodyError, GRPCForwardStatus, HTTPForwardStatus) — this file's copies of
+// them had already drifted: an over-cap gzip answered 400 "malformed" here and
+// 413 there, and 400 tells a kubescrape sender to DROP the batch.
+//
 // No in-flight shed here, for the reason the application listener needs one:
 // that one holds a slot for as long as the whole owner chain takes (a
 // re-shard hop plus the collector's ack, up to -otlp-timeout), from senders it
@@ -528,6 +533,10 @@ type sgReceiver struct {
 	consume func(context.Context, ptrace.Traces) error
 	ready   func()
 	log     *slog.Logger
+
+	// body reads one OTLP/HTTP body under sgMaxRecvBytes. Lazily built by Run
+	// so a zero-value sgReceiver (tests construct one directly) still works.
+	body *otlpingest.BodyReader
 
 	// lastWarn throttles the rejected-push log; see warn.
 	lastWarn atomic.Int64
@@ -551,6 +560,9 @@ const sgWarnEvery = 30 * time.Second
 // Run serves until ctx is cancelled. A runtime listener failure propagates to
 // the caller (fatal there); a cancelled shutdown returns nil.
 func (r *sgReceiver) Run(ctx context.Context) error {
+	if r.body == nil {
+		r.body = otlpingest.NewBodyReader(sgMaxRecvBytes)
+	}
 	if r.grpcAddr == "" && r.httpAddr == "" {
 		// A shard with no listener pairs nothing, and would report ready and
 		// idle forever. Refuse instead — indistinguishable-from-working is the
@@ -647,7 +659,7 @@ func (r *sgReceiver) authUnary(ctx context.Context, req any, _ *grpc.UnaryServer
 	md, _ := metadata.FromIncomingContext(ctx)
 	tokens := r.tokens()
 	for _, v := range md.Get("authorization") {
-		if authorizedBearer(v, tokens) {
+		if bearer.Authorized(v, tokens) {
 			return handler(ctx, req)
 		}
 	}
@@ -694,29 +706,33 @@ func (g *sgTraces) Export(ctx context.Context, req ptraceotlp.ExportRequest) (pt
 // which otlpexport reads as NON-permanent — fine — but a genuinely permanent
 // upstream rejection has to stay permanent, or the sending shard's application
 // retries a payload nothing will ever accept.
-func sgForwardStatus(err error) error {
-	if _, ok := status.FromError(err); ok {
-		return err
-	}
-	if otlpexport.IsPermanent(err) {
-		return status.Error(codes.InvalidArgument, err.Error())
-	}
-	return status.Error(codes.Unavailable, err.Error())
-}
+//
+// It is the ingest receiver's classification verbatim, so it IS it now: the two
+// receivers must answer the same way, or the same collector failure reads as
+// retryable on one port and permanent on the other.
+func sgForwardStatus(err error) error { return otlpingest.GRPCForwardStatus(err) }
 
 func (r *sgReceiver) handleHTTPTraces(w http.ResponseWriter, req *http.Request) {
-	if !authorizedBearer(req.Header.Get("Authorization"), r.tokens()) {
+	if !bearer.Authorized(req.Header.Get("Authorization"), r.tokens()) {
 		r.warnUnauthorized("http")
 		w.Header().Set("WWW-Authenticate", sgAuthRealm)
 		w.Header().Set("Cache-Control", "no-store")
 		http.Error(w, "missing or invalid bearer token (-service-graph-token-file)", http.StatusUnauthorized)
 		return
 	}
-	body, err := sgReadBody(req)
+	// otlpingest owns the body reader for BOTH receivers. This one used to
+	// have its own copy, and the fix that makes an over-cap GZIP report 413
+	// instead of 400 "malformed" landed only in the other — on the one hop
+	// whose sender is another kubescrape, whose exporter reads 400 as PERMANENT
+	// and drops the batch. The CAP is the parameter (4 MiB here, 16 MiB for
+	// application pushes); the byte budget is deliberately absent, as is the
+	// in-flight semaphore — see the type doc.
+	body, charged, err := r.body.Read(req)
 	if err != nil {
-		http.Error(w, err.Error(), sgBodyStatus(err))
+		otlpingest.WriteBodyError(w, err)
 		return
 	}
+	defer r.body.Release(charged)
 	er := ptraceotlp.NewExportRequest()
 	if err := er.UnmarshalProto(body); err != nil {
 		http.Error(w, "malformed OTLP traces payload", http.StatusBadRequest)
@@ -726,74 +742,10 @@ func (r *sgReceiver) handleHTTPTraces(w http.ResponseWriter, req *http.Request) 
 		// The HTTP counterpart of sgForwardStatus: a permanent upstream rejection
 		// is 400 (do not retry this batch), everything else 503 (retryable). The
 		// sending shard's exporter reads both correctly.
-		code := http.StatusServiceUnavailable
-		if otlpexport.IsPermanent(err) {
-			code = http.StatusBadRequest
-		}
-		http.Error(w, err.Error(), code)
+		http.Error(w, err.Error(), otlpingest.HTTPForwardStatus(err))
 		return
 	}
-	b, err := ptraceotlp.NewExportResponse().MarshalProto()
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	w.Header().Set("Content-Type", "application/x-protobuf")
-	_, _ = w.Write(b)
-}
-
-var (
-	// errSGBodyTooLarge maps to 413: truncating silently would ack a payload
-	// whose tail was dropped.
-	errSGBodyTooLarge = fmt.Errorf("request body exceeds %d bytes", sgMaxRecvBytes)
-	// errSGUnsupportedType maps to 415 (wrong media type, not a bad request).
-	errSGUnsupportedType = errors.New("unsupported Content-Type")
-)
-
-func sgBodyStatus(err error) int {
-	switch {
-	case errors.Is(err, errSGBodyTooLarge):
-		return http.StatusRequestEntityTooLarge
-	case errors.Is(err, errSGUnsupportedType):
-		return http.StatusUnsupportedMediaType
-	}
-	return http.StatusBadRequest
-}
-
-// sgReadBody reads one OTLP/HTTP protobuf body, gzip included (otlpexport
-// compresses by default), under the same cap the gRPC arm enforces — the two
-// transports must not offer different limits for the same payload.
-func sgReadBody(req *http.Request) ([]byte, error) {
-	if ct := req.Header.Get("Content-Type"); ct != "" {
-		// Parameterized types ("application/x-protobuf; charset=...") are fine;
-		// only the media type itself must match.
-		if mt, _, err := mime.ParseMediaType(ct); err != nil || mt != "application/x-protobuf" {
-			return nil, fmt.Errorf("%w %q (want application/x-protobuf)", errSGUnsupportedType, ct)
-		}
-	}
-	var src io.Reader = req.Body
-	switch enc := req.Header.Get("Content-Encoding"); enc {
-	case "", "identity":
-	case "gzip":
-		zr, err := gzip.NewReader(io.LimitReader(req.Body, sgMaxRecvBytes+1))
-		if err != nil {
-			return nil, fmt.Errorf("gzip body: %w", err)
-		}
-		defer func() { _ = zr.Close() }()
-		src = zr
-	default:
-		return nil, fmt.Errorf("unsupported Content-Encoding %q (want gzip or identity)", enc)
-	}
-	// The cap applies to the DECOMPRESSED size too (zip-bomb guard); one byte
-	// past it distinguishes at-cap from over-cap.
-	body, err := io.ReadAll(io.LimitReader(src, sgMaxRecvBytes+1))
-	if err != nil {
-		return nil, err
-	}
-	if len(body) > sgMaxRecvBytes {
-		return nil, errSGBodyTooLarge
-	}
-	return body, nil
+	otlpingest.WriteProto(w, ptraceotlp.NewExportResponse())
 }
 
 // --- the internal hop's configuration ---

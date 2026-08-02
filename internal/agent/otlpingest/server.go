@@ -4,15 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
-	"mime"
 
 	"log/slog"
 	"net"
 	"net/http"
 	"time"
-
-	"github.com/klauspost/compress/gzip"
 
 	"github.com/JohanLindvall/kubescrape/internal/obs"
 
@@ -100,6 +96,10 @@ type Server struct {
 	// reading and decoding, which the count above deliberately does not (see
 	// admit.go). Tests lower its limit to exercise the refusal.
 	buffer *byteBudget
+	// body reads one HTTP request body against that budget and this receiver's
+	// cap. The same reader serves the trace tier's internal listener with a
+	// different cap and no budget (httpbody.go).
+	body *BodyReader
 }
 
 // NewServer creates an ingest Server.
@@ -112,12 +112,14 @@ func NewServer(cfg ServerConfig) *Server {
 	if n <= 0 {
 		n = defaultMaxInFlight
 	}
-	return &Server{
+	s := &Server{
 		cfg: cfg, log: log,
 		inFlight:    make(chan struct{}, n),
 		maxInFlight: n,
 		buffer:      &byteBudget{limit: maxBufferBytes},
 	}
+	s.body = &BodyReader{max: maxIngestBody, budget: s.buffer}
+	return s
 }
 
 // acquire takes an in-flight slot without waiting. A sender that is refused
@@ -363,15 +365,15 @@ func (g *tracesGRPC) Export(ctx context.Context, req ptraceotlp.ExportRequest) (
 // --- HTTP (OTLP/HTTP protobuf) ---
 
 func (s *Server) handleHTTPLogs(w http.ResponseWriter, r *http.Request) {
-	body, charged, err := s.readBody(r)
+	body, charged, err := s.body.Read(r)
 	if err != nil {
-		writeBodyError(w, err)
+		WriteBodyError(w, err)
 		return
 	}
 	// The body stays alive for the whole handler, so its budget charge does
 	// too: releasing it at the end of the read would leave the bytes resident
 	// and unaccounted through enrichment and the forward.
-	defer s.buffer.release(charged)
+	defer s.body.Release(charged)
 	// Acquired AFTER the read: holding a slot across the upload let 32
 	// trickled 16 MiB bodies shed every other sender on the node for a
 	// ReadTimeout (60s) — no credentials required, on an unauthenticated
@@ -394,19 +396,19 @@ func (s *Server) handleHTTPLogs(w http.ResponseWriter, r *http.Request) {
 	ld := req.Logs()
 	s.cfg.Enricher.EnrichLogs(ctx, ld)
 	if err := s.cfg.Exporter.ExportLogs(ctx, ld); err != nil {
-		http.Error(w, err.Error(), httpForwardStatus(err))
+		http.Error(w, err.Error(), HTTPForwardStatus(err))
 		return
 	}
-	writeProto(w, plogotlp.NewExportResponse())
+	WriteProto(w, plogotlp.NewExportResponse())
 }
 
 func (s *Server) handleHTTPMetrics(w http.ResponseWriter, r *http.Request) {
-	body, charged, err := s.readBody(r)
+	body, charged, err := s.body.Read(r)
 	if err != nil {
-		writeBodyError(w, err)
+		WriteBodyError(w, err)
 		return
 	}
-	defer s.buffer.release(charged)
+	defer s.body.Release(charged)
 	// Acquired AFTER the read (see handleHTTPLogs).
 	if !s.acquire() {
 		// Retryable by design: the sender still holds the payload.
@@ -423,19 +425,19 @@ func (s *Server) handleHTTPMetrics(w http.ResponseWriter, r *http.Request) {
 	ctx := withPeerIP(r.Context(), r.RemoteAddr)
 	md := s.cfg.Enricher.EnrichMetrics(ctx, req.Metrics())
 	if err := s.cfg.Exporter.ExportMetrics(ctx, md); err != nil {
-		http.Error(w, err.Error(), httpForwardStatus(err))
+		http.Error(w, err.Error(), HTTPForwardStatus(err))
 		return
 	}
-	writeProto(w, pmetricotlp.NewExportResponse())
+	WriteProto(w, pmetricotlp.NewExportResponse())
 }
 
 func (s *Server) handleHTTPTraces(w http.ResponseWriter, r *http.Request) {
-	body, charged, err := s.readBody(r)
+	body, charged, err := s.body.Read(r)
 	if err != nil {
-		writeBodyError(w, err)
+		WriteBodyError(w, err)
 		return
 	}
-	defer s.buffer.release(charged)
+	defer s.body.Release(charged)
 	// Acquired AFTER the read (see handleHTTPLogs).
 	if !s.acquire() {
 		// Retryable by design: the sender still holds the payload.
@@ -453,45 +455,10 @@ func (s *Server) handleHTTPTraces(w http.ResponseWriter, r *http.Request) {
 	td := req.Traces()
 	s.cfg.Enricher.EnrichTraces(ctx, td)
 	if err := s.cfg.Traces.ExportTraces(ctx, td); err != nil {
-		http.Error(w, err.Error(), httpForwardStatus(err))
+		http.Error(w, err.Error(), HTTPForwardStatus(err))
 		return
 	}
-	writeProto(w, ptraceotlp.NewExportResponse())
-}
-
-// httpForwardStatus maps a forwarding failure onto the HTTP status the sender
-// retries correctly (the HTTP counterpart of grpcForwardStatus): a permanent
-// upstream rejection is 400 (the sender must not retry the batch), everything
-// else — diskqueue.ErrFull back-pressure, upstream 5xx, timeouts — is 503
-// (retryable).
-func httpForwardStatus(err error) int {
-	if otlpexport.IsPermanent(err) {
-		return http.StatusBadRequest
-	}
-	return http.StatusServiceUnavailable
-}
-
-// bodyErrorStatus maps a readBody failure to its HTTP status.
-func bodyErrorStatus(err error) int {
-	switch {
-	case errors.Is(err, errBodyTooLarge):
-		return http.StatusRequestEntityTooLarge
-	case errors.Is(err, errUnsupportedType):
-		return http.StatusUnsupportedMediaType
-	case errors.Is(err, errBufferBudget):
-		return http.StatusTooManyRequests
-	}
-	return http.StatusBadRequest
-}
-
-// writeBodyError answers a failed read. A budget refusal is the one case that
-// must stay RETRYABLE — the sender still holds an intact payload — so it
-// carries Retry-After exactly like the in-flight shed does.
-func writeBodyError(w http.ResponseWriter, err error) {
-	if errors.Is(err, errBufferBudget) {
-		w.Header().Set("Retry-After", "1")
-	}
-	http.Error(w, err.Error(), bodyErrorStatus(err))
+	WriteProto(w, ptraceotlp.NewExportResponse())
 }
 
 const maxIngestBody = 16 << 20 // 16 MiB per request
@@ -499,122 +466,3 @@ const maxIngestBody = 16 << 20 // 16 MiB per request
 // maxIngestGRPCMessage caps ONE decoded gRPC message (grpc-go's own default,
 // stated here because the tap reserves exactly this much per push).
 const maxIngestGRPCMessage = 4 << 20
-
-// errBodyTooLarge maps to 413; truncating silently could ACK a payload whose
-// tail was dropped.
-var errBodyTooLarge = fmt.Errorf("request body exceeds %d bytes", maxIngestBody)
-
-// errUnsupportedType maps to 415 (wrong media type, not a malformed request).
-var errUnsupportedType = errors.New("unsupported Content-Type")
-
-// cappedReader bounds the compressed request body. Reads past the cap fail
-// with errBodyTooLarge so an oversized upload surfaces as 413 rather than as
-// the gzip parse error its truncation would otherwise produce.
-type cappedReader struct {
-	r      io.Reader
-	remain int64
-}
-
-func (c *cappedReader) Read(p []byte) (int, error) {
-	if c.remain <= 0 {
-		return 0, errBodyTooLarge
-	}
-	if int64(len(p)) > c.remain {
-		p = p[:c.remain]
-	}
-	n, err := c.r.Read(p)
-	c.remain -= int64(n)
-	return n, err
-}
-
-// readBody reads and decompresses one request body, charging the server's
-// buffer budget for what it accumulates. It returns the bytes charged, which
-// the CALLER releases once the body is no longer referenced; on any error it
-// releases them itself and returns 0.
-func (s *Server) readBody(r *http.Request) ([]byte, int64, error) {
-	if ct := r.Header.Get("Content-Type"); ct != "" {
-		// Parameterized types ("application/x-protobuf; charset=...") are fine;
-		// only the media type itself must match.
-		if mt, _, err := mime.ParseMediaType(ct); err != nil || mt != "application/x-protobuf" {
-			return nil, 0, fmt.Errorf("%w %q (want application/x-protobuf)", errUnsupportedType, ct)
-		}
-	}
-	// A declared Content-Length is reserved BEFORE the first byte is read, so a
-	// sender announcing 16 MiB is refused while the receiver is full rather
-	// than after it has buffered them. It is only a hint (absent on chunked
-	// uploads, and short of the decompressed size for a gzip body), which is
-	// why budgetReader keeps charging as it goes.
-	br := &budgetReader{b: s.buffer}
-	if n := r.ContentLength; n > 0 {
-		if n > maxIngestBody+1 {
-			n = maxIngestBody + 1
-		}
-		if !s.buffer.reserve(n) {
-			obs.IngestRejected.Inc()
-			return nil, 0, errBufferBudget
-		}
-		br.held = n
-	}
-	fail := func(err error) ([]byte, int64, error) {
-		s.buffer.release(br.held)
-		if errors.Is(err, errBufferBudget) {
-			obs.IngestRejected.Inc()
-		}
-		return nil, 0, err
-	}
-	var src io.Reader = r.Body
-	var capped *cappedReader
-	switch enc := r.Header.Get("Content-Encoding"); enc {
-	case "", "identity":
-	case "gzip": // OTel SDKs commonly gzip OTLP/HTTP
-		// Allow one byte over the cap so an exactly-at-cap compressed body is
-		// not misreported as oversized; the decompressed cap below still holds.
-		capped = &cappedReader{r: r.Body, remain: maxIngestBody + 1}
-		zr, err := gzip.NewReader(capped)
-		if err != nil {
-			return fail(fmt.Errorf("gzip body: %w", err))
-		}
-		defer func() { _ = zr.Close() }()
-		src = zr
-	default:
-		return fail(fmt.Errorf("unsupported Content-Encoding %q (want gzip or identity)", enc))
-	}
-	// The cap applies to the decompressed size too (zip-bomb guard). Read one
-	// byte beyond it to distinguish at-cap from over-cap and reject the latter.
-	br.r = io.LimitReader(src, maxIngestBody+1)
-	// Pre-size the destination from Content-Length where it is meaningful (an
-	// identity-encoded body), so the read does not pay io.ReadAll's
-	// grow-and-copy doubling — which would put twice the CHARGED bytes on the
-	// heap and make the budget mean half what it says. A gzip body's declared
-	// length is the compressed one, so it is no hint at all and that case still
-	// doubles.
-	hint := int64(0)
-	if capped == nil {
-		hint = r.ContentLength
-	}
-	body, err := readAllCapped(br, hint)
-	if err != nil {
-		if capped != nil && capped.remain <= 0 {
-			// The compressed body hit the cap: the "gzip" failure is our own
-			// truncation, not the sender's payload — report 413, not 400.
-			return fail(errBodyTooLarge)
-		}
-		return fail(err)
-	}
-	if len(body) > maxIngestBody {
-		return fail(errBodyTooLarge)
-	}
-	return body, br.held, nil
-}
-
-type protoMarshaler interface{ MarshalProto() ([]byte, error) }
-
-func writeProto(w http.ResponseWriter, m protoMarshaler) {
-	b, err := m.MarshalProto()
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	w.Header().Set("Content-Type", "application/x-protobuf")
-	_, _ = w.Write(b)
-}

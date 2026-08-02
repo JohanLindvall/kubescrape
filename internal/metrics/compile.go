@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/JohanLindvall/kubescrape/internal/config"
 	"github.com/JohanLindvall/kubescrape/internal/logline"
 )
 
@@ -30,19 +31,15 @@ func (d *Dynamic) kind() (seriesKind, error) {
 	}
 }
 
-// maxAge parses and clamps the expiration duration.
+// maxAge parses and clamps the expiration duration. A zero or negative
+// expiration would mark every sample idle on every export, silently turning
+// counters into per-interval deltas — so this is one of the fields where zero
+// is NOT a legal value, which config.Positive says in the error itself.
 func (d *Dynamic) maxAge() (time.Duration, error) {
-	if d.MaxAge == "" {
-		return defaultMaxAge, nil
-	}
-	age, err := time.ParseDuration(d.MaxAge)
+	age, err := config.Duration("maxAge", d.MaxAge, defaultMaxAge,
+		config.Positive("every sample would be idle on every export, turning counters into per-interval deltas"))
 	if err != nil {
 		return 0, err
-	}
-	if age <= 0 {
-		// A zero/negative expiration would mark every sample idle on every
-		// export, silently turning counters into per-interval deltas.
-		return 0, fmt.Errorf("maxAge must be positive: %s", d.MaxAge)
 	}
 	return min(age, maxMaxAge), nil
 }

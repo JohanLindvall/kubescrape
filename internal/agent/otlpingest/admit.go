@@ -101,6 +101,11 @@ func (b *byteBudget) release(n int64) {
 // necessary. Charging as-you-read (rather than reserving the 16 MiB cap up
 // front) is what keeps a hundred small senders from being refused on behalf of
 // bytes they were never going to send.
+//
+// A NIL budget passes bytes through uncharged: the trace tier's internal
+// receiver bounds its senders by authentication and a 4 MiB message cap and has
+// no budget at all (see httpbody.go), and a receiver without one must read, not
+// panic.
 type budgetReader struct {
 	r    io.Reader
 	b    *byteBudget
@@ -110,7 +115,7 @@ type budgetReader struct {
 
 func (br *budgetReader) Read(p []byte) (int, error) {
 	n, err := br.r.Read(p)
-	if n > 0 {
+	if n > 0 && br.b != nil {
 		br.used += int64(n)
 		if br.used > br.held {
 			want := br.used - br.held
@@ -133,16 +138,20 @@ func (br *budgetReader) Read(p []byte) (int, error) {
 // io.ReadAll performs, halving the peak heap a charged payload occupies. The
 // hint is grown by one byte because the loop needs a final short read to see
 // EOF, and an exactly-sized buffer would double for it.
-func readAllCapped(r io.Reader, hint int64) ([]byte, error) {
+//
+// max is the reader's own cap (16 MiB for application pushes, 4 MiB on the
+// trace tier's internal hop) rather than a constant: the two receivers offer
+// different limits deliberately.
+func readAllCapped(r io.Reader, hint, max int64) ([]byte, error) {
 	switch {
 	case hint <= 0:
 		hint = 511 // unknown length: start where io.ReadAll does
-	case hint > maxIngestBody:
+	case hint > max:
 		// An over-cap declaration is rejected once the read confirms it, but
 		// the read still happens: cap the buffer at what the LimitReader will
 		// hand over so the rejection costs one allocation rather than a
 		// doubling sequence up to it.
-		hint = maxIngestBody
+		hint = max
 	}
 	buf := make([]byte, 0, hint+1)
 	for {

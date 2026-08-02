@@ -7,6 +7,8 @@ import (
 
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/ptrace"
+
+	"github.com/JohanLindvall/kubescrape/internal/agent/cumagg"
 )
 
 // edgeSink receives every edge the store finishes with: completed pairs and
@@ -181,7 +183,7 @@ func (p *Processor) Consume(td ptrace.Traces) {
 		resAttrs := rs.Resource().Attributes()
 		// Truncated once per resource: it becomes a label value on every edge
 		// this resource's spans produce.
-		svc := retainDimValue(spanAttrStr(resAttrs, attrServiceName))
+		svc := cumagg.Retain(cumagg.AttrStr(resAttrs, attrServiceName))
 		sss := rs.ScopeSpans()
 		for j := 0; j < sss.Len(); j++ {
 			spans := sss.At(j).Spans()
@@ -254,7 +256,7 @@ func (p *Processor) observe(span ptrace.Span, resAttrs pcommon.Map, svc string, 
 	spanAttrs := span.Attributes()
 	h := halfSpan{
 		service:    svc,
-		seconds:    spanSeconds(span),
+		seconds:    cumagg.SpanSeconds(span),
 		failed:     span.Status().Code() == ptrace.StatusCodeError,
 		connection: conn,
 		traceID:    tid,
@@ -279,11 +281,11 @@ func (p *Processor) observe(span ptrace.Span, resAttrs pcommon.Map, svc string, 
 		if p.peerIsDB[i] && side == sideServer {
 			continue
 		}
-		v := spanAttrStr(spanAttrs, a)
+		v := cumagg.AttrStr(spanAttrs, a)
 		if v == "" {
 			continue
 		}
-		h.peer = retainDimValue(v)
+		h.peer = cumagg.Retain(v)
 		if p.peerIsDB[i] {
 			h.connection = ConnectionDatabase
 		}
@@ -322,9 +324,9 @@ func (p *Processor) observe(span ptrace.Span, resAttrs pcommon.Map, svc string, 
 		// Walked in the CONFIGURED order, which is what makes the edge's
 		// dimension sequence canonical without anyone sorting it: see joinDims.
 		for i, d := range p.dims {
-			v := spanAttrStr(spanAttrs, d)
+			v := cumagg.AttrStr(spanAttrs, d)
 			if v == "" {
-				v = spanAttrStr(resAttrs, d) // fall back to the resource
+				v = cumagg.AttrStr(resAttrs, d) // fall back to the resource
 			}
 			if v == "" {
 				// Absent dimensions are simply not carried; the metric layer
@@ -332,7 +334,7 @@ func (p *Processor) observe(span ptrace.Span, resAttrs pcommon.Map, svc string, 
 				// "" here would only cost a map entry per edge.
 				continue
 			}
-			ds = append(ds, EdgeDimension{Name: names[i], Value: retainDimValue(v)})
+			ds = append(ds, EdgeDimension{Name: names[i], Value: cumagg.Retain(v)})
 		}
 		dims = ds
 	}
@@ -353,53 +355,11 @@ func namesDatabase(attrs pcommon.Map) bool {
 
 // --- helpers ---
 //
-// spanAttrStr, spanSeconds and truncDimValue duplicate spanmetrics' attrStr,
-// durationSeconds and truncDim: those are unexported there, and exporting them
-// to share three lines would couple two packages that otherwise share nothing.
-// The names differ from spanmetrics' deliberately — this package's other files
-// (metrics.go, ring.go, forward.go) are written independently, and short
-// generic names are how two of them collide.
-
-func spanAttrStr(m pcommon.Map, key string) string {
-	if v, ok := m.Get(key); ok {
-		return v.AsString()
-	}
-	return ""
-}
-
-// spanSeconds is the span's own measured duration. An unset or clock-skewed end
-// yields 0 rather than a negative duration, which no histogram can hold.
-func spanSeconds(span ptrace.Span) float64 {
-	end, start := span.EndTimestamp(), span.StartTimestamp()
-	if end <= start {
-		return 0
-	}
-	return float64(end-start) / float64(time.Second)
-}
-
-// truncDimValue bounds one label value that is about to be CONSUMED and
-// dropped — the map key Record builds on the stack, which map[string(key)]
-// copies on insert. Slicing a Go string allocates nothing but keeps the WHOLE
-// original alive, so it is only safe where the result does not outlive the
-// span.
-func truncDimValue(v string) string {
-	if len(v) <= maxDimensionValueBytes {
-		return v
-	}
-	return v[:maxDimensionValueBytes]
-}
-
-// retainDimValue is truncDimValue for a value something KEEPS: a half-edge in
-// the pairing store (for a whole Wait) or a series' label set (for as long as
-// the series lives). These come from an unauthenticated listener — the shard
-// receives whatever the agents forward, which is whatever a sender pushed — so
-// the bound has to be on the BYTES RETAINED, and a reslice retains all of them:
-// a 4 MiB peer.service pinned by a 256-byte label is the bound not existing.
-// Cloning only on the truncating branch leaves the ordinary short value
-// allocation-free (TestConsumeWithDimensionsIsAllocationFree).
-func retainDimValue(v string) string {
-	if len(v) <= maxDimensionValueBytes {
-		return v
-	}
-	return strings.Clone(v[:maxDimensionValueBytes])
-}
+// The three that used to live here are gone: spanAttrStr, spanSeconds and
+// retainDimValue are cumagg.AttrStr, cumagg.SpanSeconds and cumagg.Retain,
+// called by their shared names above. Each existed twice — here and in
+// agent/spanmetrics, under a different name — behind a comment arguing that
+// sharing three lines would couple two packages that otherwise shared nothing.
+// They share a state machine now, and the truncation one had by then had the
+// same retention bug (a reslice pinning the sender's whole string) found and
+// fixed in each copy separately.

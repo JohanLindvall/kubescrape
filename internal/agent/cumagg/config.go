@@ -1,0 +1,105 @@
+package cumagg
+
+import (
+	"fmt"
+	"time"
+)
+
+// ParseStaleAfter reads an operator's staleAfter spelling. field names the
+// config path for the error message ("serviceGraph.staleAfter"), def is what an
+// unset value means.
+//
+// The three readings, in one place because they were once two:
+//
+//   - empty takes the default;
+//   - "0" (or "0s") DISABLES eviction and keeps every series for the process'
+//     life — an explicit choice, spelled explicitly;
+//   - anything unparseable, and anything NEGATIVE, is an error naming the field
+//     and the value.
+//
+// A negative value used to be clamped to zero by agent/spanmetrics, which meant
+// `staleAfter: "-15m"` passed -check-config, passed the constructor, and
+// silently turned the cardinality cap into the one-way latch that this field
+// exists to prevent — the failure mode is invisible until a burst of label
+// values has already blinded the aggregate. Refusing it costs a startup error;
+// accepting it costs the feature.
+//
+// The default is returned alongside every error, so a constructor can fall back
+// and keep aggregating: reporting a bad value is Validate's job (and
+// -check-config runs it), and refusing to aggregate over it would take the
+// telemetry down for a typo.
+func ParseStaleAfter(field, value string, def time.Duration) (time.Duration, error) {
+	if value == "" {
+		return def, nil
+	}
+	d, err := time.ParseDuration(value)
+	if err != nil {
+		return def, fmt.Errorf("%s %q: %w", field, value, err)
+	}
+	if d < 0 {
+		return def, fmt.Errorf("%s %q must not be negative (use \"0\" to disable eviction)", field, value)
+	}
+	return d, nil
+}
+
+// Builtins is the set of label names an aggregator owns itself. A configured
+// dimension that collides with one of them is DROPPED rather than rendered: the
+// attributes go into one pcommon.Map, so a colliding key would overwrite the
+// real label and two different series would render byte-identical label sets
+// while their keys still held them apart — a duplicate series in one payload,
+// which is a conflict downstream, not extra detail.
+//
+// agent/spanmetrics shipped exactly that through `dimensions: ["span.name"]`:
+// an extra dimension resolves from span/resource ATTRIBUTES, and span.name is a
+// span FIELD, so the duplicate resolved to "" and blanked the real label.
+//
+// # Where the guard runs
+//
+// One rule, one implementation, and it is applied at the single point where
+// each aggregator's label NAMES become known — which is the earliest point at
+// which it CAN run, and the only one that covers both the series key and the
+// rendered attributes:
+//
+//   - spanmetrics' names are configured, so Filter runs once in its
+//     constructor. Re-testing them per span would buy nothing (the set cannot
+//     change after that) and cost a lookup per span per dimension.
+//   - servicegraph's names arrive on each Edge, already prefixed client_ /
+//     server_ by the processor, so Has runs where the key and the label set are
+//     built. Deciding in its constructor is not possible: the names are not
+//     there yet, and a hand-built Edge would walk straight past a guard that
+//     only ever looked at the config.
+//
+// The timing differs because the two name sources differ; the RULE does not,
+// and that is what drifted.
+type Builtins map[string]bool
+
+// NewBuiltins is the set of names.
+func NewBuiltins(names ...string) Builtins {
+	b := make(Builtins, len(names))
+	for _, n := range names {
+		b[n] = true
+	}
+	return b
+}
+
+// Has reports whether name is one the aggregator owns.
+func (b Builtins) Has(name string) bool { return b[name] }
+
+// Filter returns the configured names with the built-ins — and any repeats —
+// removed, preserving order. The repeat check is the same defect read twice: a
+// name listed twice would also render one attribute for two key positions.
+func (b Builtins) Filter(names []string) []string {
+	if len(names) == 0 {
+		return nil
+	}
+	seen := make(map[string]bool, len(names))
+	out := make([]string, 0, len(names))
+	for _, n := range names {
+		if b.Has(n) || seen[n] {
+			continue
+		}
+		seen[n] = true
+		out = append(out, n)
+	}
+	return out
+}

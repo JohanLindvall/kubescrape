@@ -10,9 +10,7 @@ import (
 	"time"
 
 	"github.com/JohanLindvall/kubescrape/internal/agent/logchain"
-	"github.com/JohanLindvall/kubescrape/internal/agent/logenrich"
 	"github.com/JohanLindvall/kubescrape/internal/agent/otlpexport"
-	"github.com/JohanLindvall/kubescrape/internal/metrics"
 	"github.com/JohanLindvall/kubescrape/internal/obs"
 	"github.com/JohanLindvall/kubescrape/pkg/logattrs"
 	"go.opentelemetry.io/collector/pdata/pcommon"
@@ -67,81 +65,56 @@ func (g *logGrouper) newScope(f *file, resAttrs, scopeAttrs []logattrs.Attr) plo
 	return sl
 }
 
-// flush exports the batch. On success offsets are committed; on failure the
-// files are rewound to the committed offsets so the data is re-read.
 // recordBuilder bundles the per-flush state for turning batch entries into
-// grouped OTLP records: the grouper, the shared key resolver, the per-file
-// bound metric handles, and the one-record scratch slice used when rules may
-// drop a record before it materializes a resource/scope.
+// grouped OTLP records: the grouper, and the shared per-record chain
+// (internal/agent/logchain) that every log producer in this repo runs — line
+// attributes, enrichment, log-metrics, keep/drop rules, in that order.
+//
+// It is also the chain's Producer: Dest and Stamp are the two things that stay
+// with the tailer (where a kept record lands, and what the tailer knows about
+// it). They are METHODS on this struct with the current entry in a field —
+// deliberately, not closures: the flush path is allocation-pinned and a closure
+// per record would be two allocations.
 type recordBuilder struct {
-	g        *logGrouper
-	now      pcommon.Timestamp
-	bound    map[*file]metrics.BoundResource
-	resolver *logchain.Resolver
-	scratch  plog.LogRecordSlice
-	kept     int
+	t     *Tailer
+	g     *logGrouper
+	now   pcommon.Timestamp
+	chain *logchain.Chain[*file]
+	kept  int
+
+	// e and ext are the entry currently being emitted, re-pointed before each
+	// Emit the way logchain.Resolver.Set re-points the resolver.
+	e   entry
+	ext logattrs.Result
 }
 
 func (t *Tailer) newRecordBuilder(ld plog.Logs) *recordBuilder {
-	b := &recordBuilder{
+	// anyPodRules is O(files), so evaluate it once (short-circuited when a
+	// global rule set already forces the scratch path).
+	return &recordBuilder{
+		t:   t,
 		g:   &logGrouper{ld: ld, plain: map[*file]plog.ScopeLogs{}, scopes: map[scopeKey]plog.ScopeLogs{}},
 		now: pcommon.NewTimestampFromTime(time.Now()),
+		chain: logchain.NewChain[*file](logchain.Config{
+			Scrub:      t.cfg.Scrub,
+			LogAttrs:   t.cfg.LogAttrs,
+			Enrich:     t.cfg.Enrich,
+			LogMetrics: t.cfg.LogMetrics,
+			Rules:      t.cfg.Rules,
+		}, t.cfg.Rules == nil && t.anyPodRules()),
 	}
-	// Per-file bound metric state (resource hash computed once per file) and
-	// one reusable key resolver for the whole flush. anyPodRules is O(files)
-	// so evaluate it once (short-circuited when a global rule set exists).
-	rulesActive := t.cfg.Rules != nil || t.anyPodRules()
-	if t.cfg.LogMetrics != nil || rulesActive {
-		b.resolver = logchain.New()
-	}
-	if t.cfg.LogMetrics != nil {
-		b.bound = make(map[*file]metrics.BoundResource) // read only on the LogMetrics path
-	}
-	// With rules active, records are built in a one-record scratch slice and
-	// only MOVED into the batch when kept, so drops never materialize a
-	// resource/scope. Without rules they are built in place, as before.
-	if rulesActive {
-		b.scratch = plog.NewLogs().ResourceLogs().AppendEmpty().ScopeLogs().AppendEmpty().LogRecords()
-	}
-	return b
 }
 
-// anyPodRules reports whether any tracked file carries annotation rules —
-// the flush then needs the scratch slice and resolver even with no global
-// rules configured. O(files) once per flush, only reached when the global
-// pieces would otherwise be skipped.
-func (t *Tailer) anyPodRules() bool {
-	for _, f := range t.files {
-		if f.podRules != nil {
-			return true
-		}
-	}
-	return false
+// Dest is the chain's lazy landing site: the ResourceLogs/ScopeLogs group for
+// this record's file plus its line-derived resource/scope attributes. Called
+// only for a KEPT record, so a rules drop never materialises a group.
+func (b *recordBuilder) Dest() plog.LogRecordSlice {
+	return b.g.scope(b.e.file, b.ext.Resource, b.ext.Scope).LogRecords()
 }
 
-// buildRecord renders one batch entry as an OTLP record (attribute stamping,
-// enrichment, log-metrics, rules) into the right resource/scope group.
-func (t *Tailer) buildRecord(b *recordBuilder, e entry) {
-	// Scrub FIRST: everything downstream copies from the body — logattrs
-	// lifts fields into attributes, enrich slices exception.stacktrace out of
-	// it, log-metrics extract label values — and a secret must not survive
-	// into any of them.
-	if t.cfg.Scrub != nil {
-		e.body = t.cfg.Scrub.Scrub(e.body)
-	}
-	// Extract configured line attributes; resource/scope ones drive the
-	// grouping so records land under the right ResourceLogs/ScopeLogs.
-	var extracted logattrs.Result
-	if t.cfg.LogAttrs != nil {
-		extracted = t.cfg.LogAttrs.Extract(e.body)
-	}
-	var lr plog.LogRecord
-	if t.cfg.Rules != nil || e.file.podRules != nil {
-		lr = b.scratch.AppendEmpty()
-	} else {
-		lr = b.g.scope(e.file, extracted.Resource, extracted.Scope).LogRecords().AppendEmpty()
-		b.kept++
-	}
+// Stamp fills in what the tailer knows about a record.
+func (b *recordBuilder) Stamp(lr plog.LogRecord) {
+	e := b.e
 	if !e.time.IsZero() {
 		// A zero time means the line carried none (a non-CRI line reaching the
 		// containerd path). Stamping it produces an absurd absolute timestamp
@@ -161,49 +134,51 @@ func (t *Tailer) buildRecord(b *recordBuilder, e entry) {
 	if e.match != "" {
 		lr.Attributes().PutStr("log.multiline.match", e.match)
 	}
-	if t.cfg.FileAttributes {
+	if b.t.cfg.FileAttributes {
 		lr.Attributes().PutStr("log.file.name", filepath.Base(e.file.path))
 		lr.Attributes().PutInt("log.file.position", e.start.off)
 	}
-	logattrs.Put(lr.Attributes(), extracted.Log)
-	if t.cfg.Enrich {
-		logenrich.Apply(lr, e.body)
+}
+
+// anyPodRules reports whether any tracked file carries annotation rules —
+// the flush then needs the scratch slice and resolver even with no global
+// rules configured. O(files) once per flush, only reached when the global
+// pieces would otherwise be skipped.
+func (t *Tailer) anyPodRules() bool {
+	for _, f := range t.files {
+		if f.podRules != nil {
+			return true
+		}
 	}
-	if t.cfg.LogMetrics != nil {
-		// Metric label/value keys resolve against the record's attributes
-		// (line-derived + enriched) first, then the file's resource
-		// attributes (k8s metadata); the file's resource attributes become
-		// the metric's OTLP resource (hashed once per file via Bind).
-		bm, ok := b.bound[e.file]
-		if !ok {
-			bm = t.cfg.LogMetrics.Bind(e.file.resource.Attributes())
-			b.bound[e.file] = bm
-		}
-		b.resolver.Set(lr.Attributes(), e.file.resource.Attributes(), b.resolver.Severity)
-		b.resolver.SetLifted(extracted.Resource) // see the rules path below
-		bm.Add(b.resolver.ValueFn(), b.resolver.LabelFn(), e.body)
-	}
-	if t.cfg.Rules != nil || e.file.podRules != nil {
-		b.resolver.Set(lr.Attributes(), e.file.resource.Attributes(), logchain.LowerSeverity(lr.SeverityText()))
-		// This line's lifted resource attributes rank between the two. Every
-		// other producer hands its rules and metrics the MERGED resource, so
-		// without this the same logAttributes + logs.rules config selected
-		// differently depending on which pipeline carried the line.
-		b.resolver.SetLifted(extracted.Resource)
-		// Pod-annotation rules first, then the global chain: each is
-		// first-match-wins on its own, a pod drop is final, a pod keep still
-		// passes through the global rules.
-		keep := e.file.podRules == nil || e.file.podRules.Keep(b.resolver.RuleFn(), e.body)
-		if keep && t.cfg.Rules != nil {
-			keep = t.cfg.Rules.Keep(b.resolver.RuleFn(), e.body)
-		}
-		if keep {
-			b.scratch.MoveAndAppendTo(b.g.scope(e.file, extracted.Resource, extracted.Scope).LogRecords())
-			b.kept++
-		} else {
-			b.scratch.RemoveIf(func(plog.LogRecord) bool { return true })
-			obs.LogRulesDropped.Inc()
-		}
+	return false
+}
+
+// buildRecord renders one batch entry as an OTLP record, through the shared
+// chain every log producer in this repo runs (internal/agent/logchain): scrub,
+// lift line attributes, stamp, enrich, log-metrics, keep/drop rules.
+//
+// What is the tailer's alone stays here: the resource (the file's, built once
+// at resolve time), the grouping, and the offset bookkeeping the caller does
+// around this.
+func (t *Tailer) buildRecord(b *recordBuilder, e entry) {
+	// Scrub + extract must precede GROUPING: the extraction's resource/scope
+	// halves decide which ResourceLogs/ScopeLogs the record lands in.
+	body, ext := b.chain.Line(e.body)
+	e.body = body
+	b.e, b.ext = e, ext
+	// Metric labels and rule keys resolve against the record's attributes
+	// first, then this line's lifted resource attributes, then the FILE's
+	// resource — which is also the metric's OTLP resource and the bind key.
+	if b.chain.Emit(b, logchain.Input[*file]{
+		Body:     body,
+		Lifted:   ext,
+		Resource: e.file.resource.Attributes(),
+		BoundKey: e.file,
+		// Pod-annotation rules run before the global chain: a pod drop is
+		// final, a pod keep still passes the global rules.
+		PodRules: e.file.podRules,
+	}) {
+		b.kept++
 	}
 }
 

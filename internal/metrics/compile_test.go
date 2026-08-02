@@ -199,11 +199,24 @@ func TestBucketsOnlyForHistogram(t *testing.T) {
 
 // A zero or negative maxAge would mark every sample idle on every export,
 // silently turning counters into per-interval deltas; reject at load.
+//
+// A MALFORMED one must also name the field: this was the one duration parser
+// in the repo that returned time.ParseDuration's bare error, so
+// `maxAge: 5 minutes` failed startup with `time: unknown unit " " in duration
+// "5 minutes"` and nothing pointing at which of a config's metrics carried it.
+// config.Duration names the field and the value in every error.
 func TestNonPositiveMaxAgeRejected(t *testing.T) {
 	for _, age := range []string{"0s", "-1h"} {
 		if _, err := NewDynamicMetricSet([]Dynamic{{Name: "x", Type: CounterType, Value: "1", MaxAge: age}}); err == nil {
 			t.Errorf("maxAge %q: want error", age)
 		}
+	}
+	_, err := NewDynamicMetricSet([]Dynamic{{Name: "x", Type: CounterType, Value: "1", MaxAge: "5 minutes"}})
+	if err == nil {
+		t.Fatal("a malformed maxAge must be rejected")
+	}
+	if !strings.Contains(err.Error(), "maxAge") || !strings.Contains(err.Error(), "5 minutes") {
+		t.Errorf("error must name the field and the value: %v", err)
 	}
 }
 

@@ -38,6 +38,7 @@ import (
 	"github.com/JohanLindvall/kubescrape/internal/agent/tailbuffer"
 	"github.com/JohanLindvall/kubescrape/internal/agent/tailer"
 	"github.com/JohanLindvall/kubescrape/internal/agent/transform"
+	"github.com/JohanLindvall/kubescrape/internal/bearer"
 	"github.com/JohanLindvall/kubescrape/internal/leader"
 	"github.com/JohanLindvall/kubescrape/internal/logline"
 	"github.com/JohanLindvall/kubescrape/internal/metrics"
@@ -475,11 +476,15 @@ func run() error {
 		// /v1/scrape-auth returns Secret VALUES and is the one authenticated
 		// endpoint. Read through a cache so the file is not hit per scrape, and
 		// re-read so a rotated Secret is picked up without a restart.
-		reader := newTokenFile(*scrapeAuthToken, log)
-		if _, err := reader.read(); err != nil {
+		reader := bearer.NewFile(*scrapeAuthToken, log)
+		// The initial read is fatal HERE and nowhere else in the client half: a
+		// configured -scrape-auth-token-file that cannot be read is an operator
+		// error worth failing on, while a re-read that fails mid-rotation keeps
+		// serving the last good value (bearer.File).
+		if _, err := reader.Read(); err != nil {
 			return fmt.Errorf("reading -scrape-auth-token-file: %w", err)
 		}
-		meta.SetScrapeAuthToken(reader.get)
+		meta.SetScrapeAuthToken(reader.Get)
 	}
 
 	// The Prometheus scrape target for this process's own metrics, on its own

@@ -81,15 +81,10 @@ func ParsePodMonitor(u *unstructured.Unstructured) (*PodMonitor, error) {
 		e.Ignored = append(e.Ignored, specIgnored...)
 		// Every secret reference is namespaced with the MONITOR's namespace: a
 		// monitor may only name secrets in its own namespace, which is what
-		// bounds what /v1/scrape-auth will serve.
-		for _, p := range []*string{
-			&e.BearerSecret, &e.BasicAuthUser, &e.BasicAuthPass,
-			&e.AuthCredentials, &e.TLSCA, &e.TLSCert, &e.TLSKey,
-		} {
-			if *p != "" {
-				*p = m.Namespace + "/" + *p
-			}
-		}
+		// bounds what /v1/scrape-auth will serve. The FIELD LIST lives on
+		// Endpoint (secretRefs), shared with the PodMonitor parser and with
+		// AuthSecretRefs — see its doc for why it must be exactly one list.
+		e.namespaceSecretRefs(m.Namespace)
 		m.Endpoints = append(m.Endpoints, e)
 	}
 	return m, nil

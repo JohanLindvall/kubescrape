@@ -13,9 +13,9 @@ package server
 // mTLS or a NetworkPolicy being in place.
 
 import (
-	"crypto/subtle"
 	"net/http"
-	"strings"
+
+	"github.com/JohanLindvall/kubescrape/internal/bearer"
 )
 
 // scrapeAuthRealm is sent on 401s so a client can tell "wrong credentials"
@@ -33,44 +33,15 @@ const scrapeAuthRealm = `Bearer realm="kubescrape scrape-auth"`
 // an endpoint that serves Secrets must never be reachable because a flag was
 // forgotten.
 //
-// The comparison is constant time (crypto/subtle): a byte-at-a-time compare
-// leaks the shared token to anyone who can time responses, and this endpoint
-// is reachable from every pod in the cluster. subtle.ConstantTimeCompare also
-// returns 0 for differing lengths, which leaks only the token's length —
-// unavoidable without hashing and not worth the extra machinery here. Every
-// candidate is compared (no early exit), so timing does not reveal WHICH
-// token matched either.
+// The comparison itself lives in internal/bearer (constant time, every
+// candidate compared with no early exit, an empty candidate never authorizing)
+// — the same routine the trace tier's internal listener uses, so this repo has
+// one bearer-auth model rather than two byte-identical ones that can drift.
 func (s *Server) authorizedForScrapeAuth(r *http.Request) bool {
 	if s.scrapeAuthTokens == nil {
 		return false
 	}
-	got, ok := bearerToken(r.Header.Get("Authorization"))
-	if !ok {
-		return false
-	}
-	matched := 0
-	for _, tok := range s.scrapeAuthTokens() {
-		if tok == "" {
-			continue // an empty candidate must never authorize (bearerToken already rejects empty headers; belt and braces)
-		}
-		matched |= subtle.ConstantTimeCompare([]byte(got), []byte(tok))
-	}
-	return matched == 1
-}
-
-// bearerToken extracts the credentials of an `Authorization: Bearer <token>`
-// header. The scheme is matched case-insensitively (RFC 9110 §11.1); the
-// token itself is returned verbatim.
-func bearerToken(header string) (string, bool) {
-	scheme, token, found := strings.Cut(header, " ")
-	if !found || !strings.EqualFold(scheme, "bearer") {
-		return "", false
-	}
-	token = strings.TrimSpace(token)
-	if token == "" {
-		return "", false
-	}
-	return token, true
+	return bearer.Authorized(r.Header.Get("Authorization"), s.scrapeAuthTokens())
 }
 
 // writeUnauthorized rejects an unauthenticated scrape-auth request. The body

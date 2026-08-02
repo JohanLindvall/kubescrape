@@ -776,7 +776,8 @@ func TestConfigValidation(t *testing.T) {
 		want string
 	}{
 		{"bad wait", Config{Config: alwaysCfg(), DecisionWait: "5 seconds"}, "decisionWait"},
-		{"zero wait", Config{Config: alwaysCfg(), DecisionWait: "0s"}, "must be > 0"},
+		{"zero wait", Config{Config: alwaysCfg(), DecisionWait: "0s"}, "must be greater than zero"},
+		{"negative wait", Config{Config: alwaysCfg(), DecisionWait: "-5s"}, "is negative"},
 		{"negative bound", Config{Config: alwaysCfg(), MaxTraces: -1}, "negative"},
 		{"per-trace above the ceiling", Config{Config: alwaysCfg(), MaxSpans: 10, MaxSpansPerTrace: 100}, "could never fit"},
 		{"bad cache ttl", Config{Config: alwaysCfg(), DecisionCacheTTL: "always"}, "decisionCacheTTL"},

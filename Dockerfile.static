@@ -1,0 +1,39 @@
+# Static image variant: the agent WITHOUT the journald pipeline.
+#
+# journald is the sole reason the default image exists in the shape it does —
+# the agent links libsystemd through coreos/go-systemd/sdjournal, so it needs
+# cgo, glibc, distroless/BASE and seven copied .so files. Built without the
+# `journald` build tag both binaries are CGO-free and fully static, so this
+# image is distroless/STATIC with nothing but the two binaries in it.
+#
+# `make image-static` (TAGS_STATIC defaults to `azure`: everything except
+# journald). The default image is untouched — see Dockerfile.
+#
+# The trade this image makes is exactly the one CLAUDE.md and the README name:
+# no systemd-unit logs (kubelet, containerd), which on many distros are the
+# only place a node's Kubernetes plane can be debugged. Take it when the node's
+# journal is collected some other way, or not at all.
+FROM golang:1.26-bookworm AS build
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+ARG TAGS=azure
+# Fail loudly rather than emit a broken image: a journald build needs cgo and a
+# libsystemd the static base does not have.
+RUN case "$TAGS" in *journald*) \
+	echo "Dockerfile.static cannot build the journald pipeline: it needs cgo and libsystemd. Use the default Dockerfile (make image)." >&2; \
+	exit 1 ;; \
+	esac
+# Both binaries static. -ldflags="-s -w" as in the default image (panic traces
+# are unaffected; the runtime reads pclntab).
+RUN CGO_ENABLED=0 go build -trimpath -tags "$TAGS" -ldflags="-s -w" -o /kubescrape ./cmd/kubescrape \
+	&& CGO_ENABLED=0 go build -trimpath -tags "$TAGS" -ldflags="-s -w" -o /kubescrape-agent ./cmd/kubescrape-agent
+
+# No glibc, no shared libraries, no shell. The agent still needs root to read
+# container logs, so this is the root variant (not :nonroot); the metadata
+# service drops privileges through its securityContext as before.
+FROM gcr.io/distroless/static-debian12
+COPY --from=build /kubescrape /kubescrape
+COPY --from=build /kubescrape-agent /kubescrape-agent
+ENTRYPOINT ["/kubescrape"]

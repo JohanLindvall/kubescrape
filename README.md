@@ -59,7 +59,10 @@ logs are where you look, and on many distros they live only in the journal
 (not as container logs). It costs the agent a cgo dependency on libsystemd
 (hence a non-static binary on `distroless/base`), which is accepted for that
 payoff; host metrics, well served by node_exporter, are not worth an
-equivalent cost.
+equivalent cost. That cost is also **opt-out**: the reader sits behind the
+`journald` [build tag](#build-variants-optional-pipelines), which the default
+build sets — drop it and the agent is cgo-free and static, at the price of the
+node's unit logs.
 
 ## API
 
@@ -338,6 +341,42 @@ are the most recent additions.
 
 `make image` builds a container image from the [Dockerfile](Dockerfile);
 `make test` and `make vet` run the test suite and static checks.
+
+### Build variants (optional pipelines)
+
+Two **agent** pipelines are behind Go build tags, and the Makefile carries the
+default set — so `make build`, `make test` and `make image` produce exactly the
+binaries and image they always have:
+
+```sh
+TAGS ?= journald,azure
+```
+
+| Build | Contains | Costs / saves |
+|-------|----------|---------------|
+| `make build` | both | today's binaries: agent is `CGO_ENABLED=1`, dynamically linked |
+| `make build TAGS=azure` | Azure only | **no journald ⇒ no cgo**: the agent links statically and needs no libsystemd |
+| `make build TAGS=journald` | journald only | **no franz-go**: 11 packages, ≈5 MB off the stripped binary |
+| `make build TAGS=` | neither | both of the above |
+
+`journald` is the only reason the agent needs cgo (it links libsystemd through
+`coreos/go-systemd/sdjournal`); without that tag both binaries are static, which
+is what [Dockerfile.static](Dockerfile.static) / `make image-static` uses to put
+them on `distroless/static` instead of `distroless/base` plus seven copied `.so`
+files. `azure` is the Event Hubs (Kafka) consumer, which only ever runs in the
+single-replica Deployment yet ships in every DaemonSet image. `make verify-tags`
+asserts both exclusions actually happen.
+
+> **A bare `go build ./cmd/kubescrape-agent/` passes no tags and therefore
+> builds an agent with NEITHER pipeline.** That is the price of a default that
+> lives in the Makefile rather than in the source; build through `make`, or pass
+> `-tags` yourself. Such a binary still *defines* `-journald` and
+> `-azure-diagnostics` — the manifests pass them, and a missing flag would be
+> `flag provided but not defined` + exit 2 — but enabling one is a startup error
+> naming the tag, which `-check-config` reports too. Every build says which one
+> it is on its first log line (`optionalPipelines=journald,azure`, or `(none)`).
+> The `-config` file is unaffected: no section belongs to either pipeline, so one
+> ConfigMap stays valid for every variant.
 
 ## The node agent
 
@@ -791,7 +830,12 @@ journal records with an empty scope name, so backends that label by it
 upgrade boundary; group on the unit instead if you need continuity across it.
 Because it links libsystemd, the **agent
 binary is built with cgo** (the metadata service stays fully static) and the
-image ships libsystemd — no `journalctl` binary or subprocess. Delivery is
+image ships libsystemd — no `journalctl` binary or subprocess. This pipeline is
+the *only* reason for either, so it is behind the `journald`
+[build tag](#build-variants-optional-pipelines): `make build TAGS=azure` (or
+`make image-static`) leaves it out and gives you a fully static agent on
+`distroless/static`, and `-journald` on such a binary then refuses to start
+rather than silently collecting nothing. Delivery is
 at-least-once: the cursor of the newest exported entry is persisted (via
 `-positions-file`) only after a successful export, and on export failure or a
 reader error it restarts from the committed cursor with backoff.
@@ -855,7 +899,12 @@ disk buffer) — while metric records become **real OTLP gauges**
 window). Both land on the **ARM resource's own identity**:
 `cloud.resource_id`, subscription, resource group, type and name, with
 `service.name`/`service.namespace`/`service.instance.id` derived so Azure
-resources sit beside Kubernetes workloads in the same backend.
+resources sit beside Kubernetes workloads in the same backend. Because its
+Kafka client (11 franz-go packages, ≈5 MB) would otherwise ride in every
+DaemonSet image for a pipeline that only ever runs in that one Deployment, it
+is behind the `azure` [build tag](#build-variants-optional-pipelines):
+`make build TAGS=journald` leaves it out, and `-azure-diagnostics` on such a
+binary refuses to start rather than doing nothing.
 
 **OTLP ingest** (opt-in `-ingest`). Applications on the node can push their
 own OTLP **logs and metrics** to the local agent, which enriches them with

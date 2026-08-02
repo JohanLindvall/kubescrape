@@ -111,8 +111,12 @@ spec:
             - -metadata-endpoint=http://kubescrape.monitoring
             - -otlp-endpoint=otel-collector.monitoring:4317
             - -listen=:8081
-            # Azure diagnostics from Event Hubs (logs + metrics). Uncomment,
-            # and either mount a connection-string secret …
+            # Azure diagnostics from Event Hubs (logs + metrics). Needs an
+            # image built with the `azure` build tag — the default one is; a
+            # custom `make build TAGS=journald` binary refuses to start with
+            # this set, naming the tag (docs/CONFIGURATION.md, "Build
+            # variants"). Uncomment, and either mount a connection-string
+            # secret …
             #- -azure-diagnostics
             #- -azure-eventhub-connection-string-file=/etc/kubescrape/azure-eventhub/connection-string
             # … or use managed identity (AKS workload identity: annotate this

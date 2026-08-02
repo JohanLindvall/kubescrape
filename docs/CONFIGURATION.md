@@ -16,6 +16,7 @@ Starlark transforms file (`-transforms-file`). The
 [Helm chart](../charts/kubescrape) exposes all of it as values; the raw
 manifests live in [deploy/](../deploy).
 
+- [Build variants (optional pipelines)](#build-variants-optional-pipelines)
 - [Metadata service](#metadata-service)
 - [Agent: general](#agent-general)
 - [Agent: OTLP export](#agent-otlp-export)
@@ -41,6 +42,62 @@ manifests live in [deploy/](../deploy).
 - [Scrape annotations](#scrape-annotations)
 - [Helm values](#helm-values)
 - [Complete example](#complete-example)
+
+## Build variants (optional pipelines)
+
+Two agent pipelines are compiled in through Go **build tags**, and the default
+set lives in the Makefile — so a stock `make build` / `make image` contains both
+and nothing about the shipped artifacts has changed:
+
+```sh
+TAGS ?= journald,azure          # Makefile; passed to build, test, vet, lint and image
+```
+
+| Build | journald | azure | Effect |
+|---|---|---|---|
+| `make build` | ✔ | ✔ | the default: agent is `CGO_ENABLED=1`, dynamically linked |
+| `make build TAGS=azure` | — | ✔ | agent is **cgo-free and static**; no libsystemd needed |
+| `make build TAGS=journald` | ✔ | — | **11 franz-go packages** (≈5 MB) gone |
+| `make build TAGS=` | — | — | both |
+
+* **`journald`** compiles in [the systemd journal reader](#agent-journald). It
+  is the *only* reason the agent needs cgo — it links libsystemd through
+  `coreos/go-systemd/sdjournal`, which is why the default image is
+  `distroless/base` plus seven copied `.so` files. Without the tag the agent
+  links statically, which is what `make image-static`
+  ([Dockerfile.static](../Dockerfile.static)) puts on `distroless/static`.
+* **`azure`** compiles in [the Azure diagnostics consumer](#agent-azure-diagnostics).
+  Its Kafka client rides in every DaemonSet image for a pipeline that only ever
+  runs in the one-replica singleton Deployment.
+
+`make verify-tags` asserts the exclusions really happen (no cgo without
+`journald`, no franz-go without `azure`).
+
+> **A bare `go build ./cmd/kubescrape-agent/` passes no tags and builds an agent
+> with NEITHER pipeline.** `make` is the supported path; otherwise pass `-tags`
+> yourself. The same applies to `go test` and `go vet` — `make test` passes
+> `$(TAGS)` so the real code, not the stubs, is what gets tested.
+
+**The flags never disappear.** `-journald` and `-azure-diagnostics` are defined
+in every build (the shipped manifests pass them, and a missing flag would make
+the process exit 2 with `flag provided but not defined`). Enabling a pipeline
+the binary does not contain is instead a **startup error naming the tag**:
+
+```
+-journald is set, but this kubescrape-agent was built WITHOUT the "journald"
+build tag, so the systemd journal reader is not compiled into it: either drop
+-journald, or use an agent built with the tag (`make build` / `make image`
+default to TAGS=journald,azure and contain every pipeline; a bare `go build`
+contains neither)
+```
+
+`-check-config` raises the same error, so a rollout fails the dry run rather
+than the DaemonSet. Every start (and `-check-config`) also reports which binary
+it is — `optionalPipelines=journald,azure`, or `(none)`.
+
+**The `-config` file is not affected by any of this.** No section belongs to
+either pipeline, so one ConfigMap stays decodable by every variant; only
+*enabling* an absent pipeline fails.
 
 ## Metadata service
 
@@ -116,9 +173,9 @@ Pipeline toggles (all default `true` except the opt-in `-journald`,
 | `-metrics` | annotation-discovered pod/service targets |
 | `-cadvisor` | `<kubelet-endpoint>/metrics/cadvisor` (needs `-kubelet-endpoint`) |
 | `-node-metrics` | `<kubelet-endpoint>/metrics` (needs `-kubelet-endpoint`) |
-| `-journald` | systemd journal tailing (default `false`, [below](#agent-journald)) |
+| `-journald` | systemd journal tailing (default `false`, [below](#agent-journald); needs the `journald` [build tag](#build-variants-optional-pipelines), which the default build sets) |
 | `-events` | Kubernetes events as OTLP logs (default `false`; **cluster-singleton** — its own Deployment, not the DaemonSet, [below](#agent-kubernetes-events)) |
-| `-azure-diagnostics` | Azure diagnostic-settings logs + metrics from Event Hubs (default `false`; **cluster-scoped** — same singleton Deployment as `-events`, [below](#agent-azure-diagnostics)) |
+| `-azure-diagnostics` | Azure diagnostic-settings logs + metrics from Event Hubs (default `false`; **cluster-scoped** — same singleton Deployment as `-events`, [below](#agent-azure-diagnostics); needs the `azure` [build tag](#build-variants-optional-pipelines), which the default build sets) |
 
 ## Agent: OTLP export
 
@@ -305,7 +362,11 @@ alongside the `_max_bytes` and `_segments` gauges the other signals publish.
 
 ## Agent: journald
 
-Opt-in with `-journald`. The agent reads the systemd journal natively through
+Opt-in with `-journald`, and **behind the `journald`
+[build tag](#build-variants-optional-pipelines)** (set by default): this is the
+only pipeline that makes the agent need cgo, so an agent built without the tag
+is fully static and refuses `-journald` at startup rather than collecting
+nothing. The agent reads the systemd journal natively through
 libsystemd (`github.com/coreos/go-systemd/v22/sdjournal`, cgo — the agent binary
 is built with cgo and the image ships libsystemd) and exports the entries as
 OTLP log records, one resource per systemd unit (`service.name` = the unit
@@ -438,6 +499,12 @@ the Kafka consumer group is the coordination (each partition is owned by
 exactly one member), and its **committed offsets are the resume position**,
 shared across restarts and replicas with no ConfigMap. `replicas > 1` simply
 share partitions.
+
+It is **behind the `azure` [build tag](#build-variants-optional-pipelines)**
+(set by default): its Kafka client is 11 franz-go packages (≈5 MB) shipped in
+every DaemonSet image for a pipeline only the singleton Deployment ever runs, so
+`make build TAGS=journald` drops it — and `-azure-diagnostics` on such a binary
+is a startup error, caught by `-check-config`.
 
 | Flag | Default | Description |
 |---|---|---|

@@ -24,9 +24,7 @@ import (
 	"time"
 
 	"github.com/JohanLindvall/kubescrape/internal/agent/attrs"
-	"github.com/JohanLindvall/kubescrape/internal/agent/azurediag"
 	"github.com/JohanLindvall/kubescrape/internal/agent/events"
-	"github.com/JohanLindvall/kubescrape/internal/agent/journald"
 	"github.com/JohanLindvall/kubescrape/internal/agent/logscrub"
 	"github.com/JohanLindvall/kubescrape/internal/agent/otlpexport"
 	"github.com/JohanLindvall/kubescrape/internal/agent/otlpingest"
@@ -381,11 +379,11 @@ func run() error {
 	if err := events.ValidateStartMode(*eventsStart); err != nil {
 		return err
 	}
-	if err := azurediag.ValidateStartMode(*azureStart); err != nil {
+	// The -azure-* flag surface, from the tagged file pair: a build without the
+	// `azure` tag does not link the package that defines what the values mean
+	// (see buildtags.go).
+	if err := validateAzureFlags(); err != nil {
 		return err
-	}
-	if *azureOn && *azureNamespace == "" && *azureConnFile == "" {
-		return fmt.Errorf("-azure-diagnostics is set but neither -azure-eventhub-namespace nor -azure-eventhub-connection-string-file is")
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -398,7 +396,13 @@ func run() error {
 	slog.SetDefault(log)
 	// First line of every run: without a build identity a panic trace, a
 	// metric anomaly or a half-finished rollout cannot be tied to a commit.
-	log.Info("kubescrape-agent starting", "version", obs.BuildVersion(), "built", obs.BuildTime())
+	// The optional pipelines ride build tags (buildtags.go), and the Makefile —
+	// not the constraint — carries the default that compiles both in. So the
+	// binary itself has to say which one it is: a bare `go build` produces an
+	// agent with neither, and "the flag is set and nothing happens" must not be
+	// a thing anyone has to discover.
+	log.Info("kubescrape-agent starting", "version", obs.BuildVersion(), "built", obs.BuildTime(),
+		"optionalPipelines", builtPipelines())
 
 	// All YAML config lives in one file; each section is optional.
 	var fileCfg agentConfig
@@ -771,7 +775,9 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	p.startJournald(ctx)
+	if err := p.startJournald(ctx); err != nil {
+		return err
+	}
 	if err := p.startIngest(ctx); err != nil {
 		return err
 	}
@@ -939,34 +945,10 @@ func (p *pipelines) startLogs(ctx context.Context) (*tailer.Tailer, error) {
 	return tl, nil
 }
 
-// startJournald starts the systemd journal reader.
-func (p *pipelines) startJournald(ctx context.Context) {
-	if !*journaldOn {
-		return
-	}
-	jr := journald.New(journald.Config{
-		Dir:           *journaldDir,
-		Units:         splitList(*journaldUnits),
-		Positions:     p.posStore,
-		BatchSize:     *journaldBatch,
-		MaxBatchBytes: *journaldBytes,
-		FlushInterval: *journaldFlush,
-		MaxEntryBytes: *maxEntryBytes,
-		Enrich:        *enrichOn,
-		LogAttrs:      p.logAttrs,
-		Scrub:         p.scrub,
-		Rules:         p.journalRules,
-		LogMetrics:    p.logMetrics,
-		Attrs:         p.attrBuilders.Journal,
-		NodeInfo:      p.nodeInfo,
-		Exporter:      p.out,
-		Logger:        p.log,
-	})
-	p.spawn(func() {
-		jr.Run(ctx)
-	})
-	p.log.Info("journald reader started", "dir", *journaldDir, "units", *journaldUnits, "positions", *positionsFile)
-}
+// startJournald and startAzure live in build-tag-gated file pairs
+// (journald_enabled.go / journald_disabled.go, azure_enabled.go /
+// azure_disabled.go): each pipeline is compiled in by the POSITIVE tag of its
+// name, which the Makefile's TAGS sets by default. See buildtags.go.
 
 // startEvents starts the cluster-singleton Kubernetes events reader under a
 // leader election, so exactly one replica watches (N watchers would emit N
@@ -1035,56 +1017,6 @@ func (p *pipelines) startEvents(ctx context.Context) error {
 	})
 	p.log.Info("kubernetes events enabled", "lease", *eventsLease, "namespace", ns,
 		"positionConfigMap", *eventsConfigMap, "start", *eventsStart)
-	return nil
-}
-
-// gateAzure is satisfied by the first successful Event Hubs poll (the group
-// is joined and the namespace reachable).
-const gateAzure = "azure-eventhub"
-
-// startAzure starts the Azure diagnostics consumer. Cluster-scoped like
-// -events (run it in the same singleton Deployment), but with NO leader
-// election: the Kafka consumer group is its coordination, so replicas > 1
-// simply share partitions.
-func (p *pipelines) startAzure(ctx context.Context) error {
-	if !*azureOn {
-		return nil
-	}
-	kafka := azurediag.KafkaConfig{
-		Namespace:            *azureNamespace,
-		Group:                *azureGroup,
-		Start:                *azureStart,
-		ConnectionStringFile: *azureConnFile,
-		ClientID:             *azureClientID,
-		TenantID:             *azureTenantID,
-	}
-	if *azureTopics != "" {
-		for _, t := range strings.Split(*azureTopics, ",") {
-			if t = strings.TrimSpace(t); t != "" {
-				kafka.Topics = append(kafka.Topics, t)
-			}
-		}
-	}
-	if err := kafka.Resolve(); err != nil {
-		return fmt.Errorf("azure diagnostics: %w", err)
-	}
-	p.ready.require(gateAzure)
-	reader := azurediag.New(azurediag.Config{
-		Kafka:        kafka,
-		MetricPrefix: *azurePrefix,
-		Enrich:       *enrichOn,
-		Scrub:        p.scrub,
-		LogAttrs:     p.logAttrs,
-		Rules:        p.journalRules, // the same logs.rules chain
-		LogMetrics:   p.logMetrics,
-		Attrs:        p.attrBuilders.Ingest,
-		Exporter:     p.out,
-		Logger:       p.log,
-		Ready:        func() { p.ready.done(gateAzure) },
-	})
-	p.spawn(func() { reader.Run(ctx) })
-	p.log.Info("azure diagnostics enabled", "brokers", kafka.Brokers,
-		"topics", kafka.Topics, "group", kafka.Group, "start", kafka.Start)
 	return nil
 }
 

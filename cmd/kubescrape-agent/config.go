@@ -113,6 +113,14 @@ func loadAgentConfig(path string) (*agentConfig, error) {
 // dry-run cannot drift from what a real start accepts — adding a config surface
 // means adding it here as well as to agentConfig.
 func validateConfig(cfg agentConfig, transformsFile string) error {
+	// A pipeline this binary was not built with (buildtags.go). FIRST, because
+	// no amount of valid config makes an absent pipeline run, and because
+	// -check-config is where that has to surface: the alternative is a rollout
+	// where the flag is accepted, nothing is collected, and the only clue is a
+	// missing signal.
+	if err := checkExcludedPipelines(); err != nil {
+		return err
+	}
 	// The OTLP transport flags. Shape-only (no dial, no file reads), but they
 	// are the ones that abort a real start: a bad protocol, compression,
 	// compression level or scheme-less endpoint, or TLS material on a
@@ -403,6 +411,9 @@ func printConfigSummary(cfg agentConfig, log *slog.Logger) {
 
 	log.Info("config is valid",
 		"sections", strings.Join(sections, ","),
+		// Which binary this is, not just whether the config parses: the
+		// optional pipelines are build-tag-gated (buildtags.go).
+		"optionalPipelines", builtPipelines(),
 		"pipelines", fmt.Sprintf("logs=%s metrics=%s cadvisor=%s node=%s journald=%s ingest=%s events=%s azure=%s serviceGraph=%s",
 			on(*logsOn), on(*metricsOn), on(*cadvisorOn), on(*nodeOn), on(*journaldOn), on(*ingestOn), on(*eventsOn), on(*azureOn), on(*serviceGraphOn)),
 		"otlp-endpoint", *otlpEndpoint,

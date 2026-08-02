@@ -60,6 +60,35 @@ type TracesExporter interface {
 // derives; it is a transport detail, not a property of the described service.
 const ForwardedMarker = "kubescrape.service_graph.forwarded"
 
+// ForwardedDimensions and ForwardedPeerAttributes declare, on every forwarded
+// resource, WHICH attribute keys this agent kept — the effective
+// serviceGraphShards.dimensions and .peerAttributes, canonically encoded (see
+// encodeAttrList).
+//
+// # Why the agent has to say
+//
+// The two sides' lists must agree. Trim keeps the configured keys and drops
+// everything else, so a dimension the shard reads but the agent does not
+// forward can only ever render as an empty label, and a peer attribute it does
+// not forward disables the virtual node that was the only thing naming an
+// uninstrumented dependency. Both failures produce a graph that looks fine and
+// is wrong, which is worse than one that is missing.
+//
+// Nothing else can notice. The shard cannot read the agents' config and the
+// agents cannot read the shard's; the chart renders both from one values block,
+// but the chart is not the only way either binary is run (deploy/*.yaml, a
+// hand-written ConfigMap, a partially-rolled upgrade). So the claim rides on
+// the payload that already crosses between them, and the shard compares it
+// against its own (see mismatchWatch).
+//
+// One attribute pair per RESOURCE, not per span, and both strings are built
+// once at construction: the cost is two map writes on a path that already
+// copies a resource's attributes.
+const (
+	ForwardedDimensions     = "kubescrape.service_graph.dimensions"
+	ForwardedPeerAttributes = "kubescrape.service_graph.peer_attributes"
+)
+
 const (
 	defaultShardPort     = 4317
 	defaultShardProtocol = "grpc"
@@ -94,13 +123,16 @@ var keepResourceAttrs = map[string]bool{
 // Dimensions and PeerAttributes are unioned in on top, and with the DEFAULT
 // peer list this set is redundant — it is a floor under the one config mistake
 // this design makes easy. The agent's PeerAttributes must match the shard's
-// virtualNodePeerAttributes (there is no channel between them), and an
-// operator who tunes the shard's list and forgets the agent's would otherwise
-// trim away exactly the attributes the shard is looking for: every database
-// and messaging call would silently render as a plain service-to-service edge,
-// or as no edge at all where a virtual node was the only thing naming the far
-// side. A wrong graph is worse than a missing one, and four attribute keys are
-// a cheap floor.
+// virtualNodePeerAttributes, and an operator who tunes the shard's list and
+// forgets the agent's would otherwise trim away exactly the attributes the
+// shard is looking for: every database and messaging call would silently
+// render as a plain service-to-service edge, or as no edge at all where a
+// virtual node was the only thing naming the far side. That disagreement is
+// now DETECTED — the agent declares its effective lists on every forwarded
+// resource (ForwardedDimensions) and the shard compares them with its own —
+// but detection is after the fact, and these four keys stop the most damaging
+// half of the mistake from happening at all. A wrong graph is worse than a
+// missing one, and four attribute keys are a cheap floor.
 var keepSpanAttrs = map[string]bool{
 	"messaging.system": true,
 	"db.system":        true,
@@ -177,9 +209,11 @@ type ForwardConfig struct {
 
 	// Dimensions must MATCH the shard's serviceGraph.dimensions: a dimension
 	// the agent trims away is a label the shard can only ever render empty.
-	// Kept here (rather than read from the shard) because the agent has no
-	// channel to the shard's config, and guessing would mean shipping every
-	// attribute — the thing Trim exists to avoid.
+	// Configured here rather than read from the shard because there is no
+	// config channel between the two, and guessing would mean shipping every
+	// attribute — the thing Trim exists to avoid. A DISAGREEMENT is detected
+	// though: both lists ride on every forwarded resource and the shard
+	// compares them (ForwardedDimensions, mismatch.go).
 	Dimensions []string `json:"dimensions,omitempty"`
 	// PeerAttributes must likewise match the shard's
 	// serviceGraph.virtualNodePeerAttributes. nil takes Tempo's defaults.
@@ -560,6 +594,10 @@ func (f *Forwarder) warn(msg string, args ...any) {
 type trimmer struct {
 	res  map[string]bool
 	span map[string]bool
+	// dimsClaim and peersClaim are the encoded lists stamped on every forwarded
+	// resource (see ForwardedDimensions), built once here so the per-resource
+	// cost is a map write rather than a sort and a join.
+	dimsClaim, peersClaim string
 }
 
 func newTrimmer(dims, peers []string) *trimmer {
@@ -567,8 +605,10 @@ func newTrimmer(dims, peers []string) *trimmer {
 		peers = DefaultPeerAttributes()
 	}
 	t := &trimmer{
-		res:  make(map[string]bool, len(keepResourceAttrs)+len(dims)),
-		span: make(map[string]bool, len(keepSpanAttrs)+len(dims)+len(peers)),
+		res:        make(map[string]bool, len(keepResourceAttrs)+len(dims)),
+		span:       make(map[string]bool, len(keepSpanAttrs)+len(dims)+len(peers)),
+		dimsClaim:  encodeAttrList(dims),
+		peersClaim: encodeAttrList(peers),
 	}
 	for k := range keepResourceAttrs {
 		t.res[k] = true
@@ -704,7 +744,7 @@ func (t *trimmer) copyResource(src pcommon.Resource, dst pcommon.Resource) {
 	attrs := dst.Attributes()
 	// Size the map once instead of letting it double its way up: the allow-list
 	// length is a tight upper bound, and this runs per resource per shard.
-	attrs.EnsureCapacity(min(len(t.res), src.Attributes().Len()) + 1)
+	attrs.EnsureCapacity(min(len(t.res), src.Attributes().Len()) + 3)
 	src.Attributes().Range(func(k string, v pcommon.Value) bool {
 		if t.res[k] {
 			v.CopyTo(attrs.PutEmpty(k))
@@ -712,6 +752,10 @@ func (t *trimmer) copyResource(src pcommon.Resource, dst pcommon.Resource) {
 		return true
 	})
 	attrs.PutBool(ForwardedMarker, true)
+	// What this agent kept, so the shard can tell whether it matches what it
+	// reads — see ForwardedDimensions.
+	attrs.PutStr(ForwardedDimensions, t.dimsClaim)
+	attrs.PutStr(ForwardedPeerAttributes, t.peersClaim)
 }
 
 // copySpan copies exactly the fields pairing reads.

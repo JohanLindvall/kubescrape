@@ -926,7 +926,9 @@ nothing: `traces_service_graph_request_total`,
 `traces_service_graph_request_failed_total` and the two separate histograms
 `traces_service_graph_request_server_seconds` /
 `_request_client_seconds` (separate because the two sides are measured by
-different processes with unsynchronised clocks). Labels are `client`, `server`,
+different processes with unsynchronised clocks; each carries **exemplars**,
+one per latency bucket, pointing at the trace and at the span that measured
+*that* side — `serviceGraph.exemplars: false` turns them off). Labels are `client`, `server`,
 `connection_type` (empty, `messaging_system`, `database` or `virtual_node`),
 `virtual_node` when a side was synthesized, plus any configured `dimensions`
 as `client_<dim>`/`server_<dim>`. `wait`, `maxItems`, `maxCardinality` and
@@ -936,7 +938,12 @@ a missing edge looks exactly like a call that never happened. **The limitation
 is structural**: an uninstrumented callee emits no server span, so its calls
 appear only as **virtual nodes** named from the client span's `peer.service` /
 `db.name` / `db.system` — and a client naming none of those yields no edge at
-all. See [docs/CONFIGURATION.md](docs/CONFIGURATION.md#agent-service-graph).
+all. The agents trim forwarded spans to their own configured `dimensions` /
+`peerAttributes`, which must match the shard's; a disagreement no longer fails
+silently — each agent declares its lists on every forwarded payload, and the
+shard logs it once per distinct mismatch (naming what will be lost) and counts
+`kubescrape_service_graph_config_mismatch_total`. See
+[docs/CONFIGURATION.md](docs/CONFIGURATION.md#agent-service-graph).
 
 **Pipeline toggles.** Each pipeline is individually switchable: `-logs`,
 `-metrics` (annotation-discovered targets), `-cadvisor` and `-node-metrics`

@@ -408,7 +408,13 @@ serviceGraph:
     key: token
   # Tuning lives in the agent.config `serviceGraph` section (rendered into the
   # same ConfigMap this tier mounts), because the same file also carries the
-  # agents' matching `serviceGraphShards.dimensions` — one file, no drift:
+  # agents' matching `serviceGraphShards.dimensions` — one file, no drift. If
+  # the two ever do disagree (a hand-written ConfigMap, a half-finished
+  # rollout) the shard NOTICES: agents declare their effective dimension and
+  # peer-attribute lists on every forwarded payload, and a mismatch is logged
+  # once per distinct shape and counted in
+  # kubescrape_service_graph_config_mismatch_total — the labels the shard would
+  # otherwise render empty are named in that log line.
   #   config:
   #     serviceGraph:
   #       wait: 10s            # how long a half-edge waits for its partner:

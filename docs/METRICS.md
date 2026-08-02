@@ -85,6 +85,7 @@ names a metric or a label that is not registered.
 | `kubescrape_self_metadata_lookups_total` | `outcome` | Own-pod metadata lookups for -self-attributes, by outcome. |
 | `kubescrape_self_metadata_resolved` | — | 1 when this process has resolved its own pod's metadata for -self-attributes, 0 while it has not. |
 | `kubescrape_service_graph_completed_total` | — | Edges completed by BOTH halves arriving within serviceGraph.wait. The denominator for the loss counters: an expiry or drop rate only means something against the rate of pairings that worked. |
+| `kubescrape_service_graph_config_mismatch_total` | — | Forwarded resources whose agent-side serviceGraphShards.dimensions/peerAttributes disagree with this shard's serviceGraph.dimensions/virtualNodePeerAttributes. The agent trims away what the shard reads, so those dimensions render as EMPTY labels and those peer attributes synthesize no virtual node. Always zero when both sides are configured from the same values; anything else is a config error to fix now (the shard logs both lists once per distinct mismatch). |
 | `kubescrape_service_graph_dropped_total` | — | Edges not aggregated because the serviceGraph.maxCardinality series cap was reached (existing edges keep reporting; a new one is lost until eviction frees a slot). |
 | `kubescrape_service_graph_evicted_total` | — | Edge series dropped at export because they went unobserved for serviceGraph.staleAfter (this is what frees cardinality-cap slots). |
 | `kubescrape_service_graph_expired_total` | — | Half-edges that expired after serviceGraph.wait without their partner arriving. |
@@ -104,4 +105,4 @@ names a metric or a label that is not registered.
 | `kubescrape_transform_errors_total` | `signal` | Transform program invocations that failed (the batch is NOT exported; the error propagates to the producer's retry path). |
 | `kubescrape_transform_reloads_total` | `outcome` | Transforms-file reloads by outcome (applied, failed — a failed compile keeps the last good program). |
 
-84 metrics.
+85 metrics.

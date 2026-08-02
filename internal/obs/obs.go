@@ -230,6 +230,16 @@ var (
 	// delivery gap, or the two halves are landing on different shards.
 	ServiceGraphExpired = Registry.Counter("kubescrape_service_graph_expired_total",
 		"Half-edges that expired after serviceGraph.wait without their partner arriving.")
+	// ServiceGraphConfigMismatch is the one counter here that names a CONFIG
+	// error rather than a bound. The agents trim forwarded spans to their own
+	// dimension/peer-attribute lists, so a shard configured to read anything
+	// else reads attributes that were never sent: the graph still renders, with
+	// empty dimension labels and no virtual nodes. It is counted per forwarded
+	// RESOURCE (the unit the agent's declaration rides on), so the rate says how
+	// much of the graph's input is affected; the shard log names both sides
+	// once per distinct disagreement.
+	ServiceGraphConfigMismatch = Registry.Counter("kubescrape_service_graph_config_mismatch_total",
+		"Forwarded resources whose agent-side serviceGraphShards.dimensions/peerAttributes disagree with this shard's serviceGraph.dimensions/virtualNodePeerAttributes. The agent trims away what the shard reads, so those dimensions render as EMPTY labels and those peer attributes synthesize no virtual node. Always zero when both sides are configured from the same values; anything else is a config error to fix now (the shard logs both lists once per distinct mismatch).")
 )
 
 // RegisterServiceGraphStats publishes the pairing store's own numbers on the

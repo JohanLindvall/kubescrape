@@ -898,6 +898,7 @@ serviceGraph:
   maxCardinality: 20000  # distinct edge series
   staleAfter: 15m        # evict edges unobserved for this long (0 disables)
   histogramBuckets: [0.1, 0.2, 0.4, 0.8, 1.6, 3.2, 6.4, 12.8]   # SECONDS
+  exemplars: true        # default: trace-id exemplars on both histograms
   dimensions: [http.route]
   virtualNodePeerAttributes: [peer.service, db.name, db.system]  # default
 ```
@@ -921,12 +922,36 @@ like a call that never happened, so none of them fails silently:
   it one burst of short-lived services blinds the graph permanently. Evicted
   series count into `kubescrape_service_graph_evicted_total`.
 
+`exemplars` (default on) attaches one exemplar per latency bucket to each
+duration histogram — the link from "this call is slow" to the trace showing
+why. The trace id is the same on both halves by construction (it is half the
+pairing key), so there is nothing to choose there; the **span** id is each
+half's own, so the client-latency exemplar points at the span that measured the
+client latency and the server's at the server's. Exemplars are cleared only
+after a DELIVERED export, so a failed send keeps them for the retry, and a span
+with no trace id gets none rather than a link that resolves to nothing.
+
 The agents' matching half is the config's `serviceGraphShards` section, for
 what the flags do not cover: `dimensions`/`peerAttributes` (they must MATCH the
 shard's — a dimension the agent trims away is a label the shard can only render
 empty), `protocol`, `headers`, `caFile`/`insecureSkipVerify` for the hop, and
 `tokensPerShard` (part of the ring's definition — identical on every agent or
 nothing pairs).
+
+**A mismatch is DETECTED, not merely documented.** Each agent stamps its
+effective lists on every forwarded resource (`kubescrape.service_graph.dimensions`
+and `.peer_attributes`, sorted and joined), and the shard compares them against
+its own `dimensions`/`virtualNodePeerAttributes`. A disagreement counts into
+`kubescrape_service_graph_config_mismatch_total` — per forwarded resource, so
+the rate says how much of the graph's input is affected — and the shard logs
+one warning per distinct disagreement (never per span, and the remembered
+shapes are bounded) naming both sides' lists and, specifically, the keys the
+shard reads that the agent does not forward: those dimensions render as EMPTY
+labels and those peer attributes synthesize no virtual node. Spans that declare
+nothing — pushed straight to the shard, or forwarded by an agent from before
+this existed — are not a mismatch and are silent, so a rolling upgrade does not
+warn. The chart renders both sides from one values block, so this counter
+should read zero; anything else is a config error to fix now.
 
 **The honest limitation: an edge needs BOTH halves.** A callee that is not
 instrumented produces no server span, so no true edge can form. Those calls
@@ -1345,7 +1370,10 @@ both; leaving it empty renders neither flag, and the shard then refuses to open
 its cluster-reachable receiver. `serviceGraph.port` (default 4319) is read by
 both sides. Tuning lives in `agent.config.serviceGraph` — the shards mount the
 same rendered ConfigMap as the DaemonSet, so the shard's `dimensions` and the
-agents' `serviceGraphShards.dimensions` cannot drift apart. It requires
+agents' `serviceGraphShards.dimensions` cannot drift apart; if they ever do (a
+hand-written ConfigMap, `deploy/*.yaml`, a half-finished rollout) the shard
+detects it and moves
+`kubescrape_service_graph_config_mismatch_total`. It requires
 `agent.ingest.enabled` with `agent.ingest.traces`: the spans it pairs are the
 ones apps push to their node's agent.
 

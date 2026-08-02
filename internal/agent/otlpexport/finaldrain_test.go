@@ -115,7 +115,7 @@ func TestFinalDrainOverlapsRunSafely(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = ms.Close() }()
-	b := NewBuffered(send, ls, ms, 10*time.Millisecond, nil)
+	b := NewBuffered(send, ls, ms, nil, 10*time.Millisecond, nil)
 
 	want := []string{"first", "second", "third"}
 	for _, name := range want {

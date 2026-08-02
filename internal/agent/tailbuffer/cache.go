@@ -9,16 +9,31 @@ package tailbuffer
 // it, or drop it blind. The first is the only one that keeps a trace whole, so
 // the verdict is remembered for a while.
 //
-// It is bounded in BOTH dimensions, because trace ids come off the wire and a
-// map keyed by them is a map keyed by whatever the cluster emits: by ENTRY COUNT
-// (decisionCacheSize) and by AGE (decisionCacheTTL). Past either, the trace is
-// unknown again and a span for it starts a fresh window — which may decide the
-// trace a SECOND time, and a second decision re-charges rateLimiting and
-// composite (tailsample.Decide documents that; every other policy is a pure
-// function of the trace and answers identically). That is the cost of the bound,
-// and it is why an eviction under the size cap is counted while a TTL expiry is
-// not: the first says the cap is too small for the arrival pattern, the second
-// is the cache working as configured.
+// # Two lifetimes, one entry
+//
+// An entry answers two different questions, and they expire differently:
+//
+//   - "what was the verdict?" — bounded by AGE (decisionCacheTTL). Past it, a
+//     straggler is indistinguishable from a new trace and gets a fresh window,
+//     which is the semantic this knob buys.
+//   - "have we decided this trace before?" — bounded by the CAPACITY
+//     (decisionCacheSize) alone. It outlives the verdict, because it is what
+//     stops the re-decision from CHARGING the rateLimiting and composite budgets
+//     a second time (tailsample.Trace.Charged). The re-decision still happens
+//     and may answer differently — the bucket may have emptied meanwhile — but a
+//     trace's late spans no longer shrink the budget available to genuinely new
+//     traces.
+//
+// The map is therefore bounded by decisionCacheSize and nothing else: it fills
+// to the cap and evicts the oldest, where before a quiet shard's entries also
+// aged out. That is the knob meaning what it says rather than sometimes less
+// (~100 B an entry, so the 100000 default is ~10 MB at full occupancy), and it
+// is why an eviction is counted only when it takes a verdict that was still
+// LIVE: evicting an expired tombstone is the cache reclaiming space, evicting a
+// live verdict is the cap being too small for the arrival pattern. Past the
+// capacity the trace is unknown again in both senses, and a span for it starts a
+// fresh window that DOES re-charge — the residual cost of a bounded memory, and
+// exactly what the eviction counter is for.
 
 import (
 	"time"
@@ -34,10 +49,10 @@ type decisionCache struct {
 	max int
 	ttl time.Duration
 	m   map[pcommon.TraceID]*decision
-	// fifo is insertion order, for TTL expiry and for capacity eviction. Entries
-	// are POINTERS and a superseded one is marked stale rather than removed from
-	// the middle, so a trace decided twice cannot have its second verdict evicted
-	// by its first slot reaching the front.
+	// fifo is insertion order, for capacity eviction. Entries are POINTERS and a
+	// superseded one is marked stale rather than removed from the middle, so a
+	// trace decided twice cannot have its second verdict evicted by its first
+	// slot reaching the front.
 	fifo []*decision
 	head int
 }
@@ -53,31 +68,33 @@ func newDecisionCache(max int, ttl time.Duration) *decisionCache {
 	return &decisionCache{max: max, ttl: ttl, m: make(map[pcommon.TraceID]*decision, min(max, 1024))}
 }
 
-// get returns the remembered verdict, if there is a live one.
+// get returns the remembered verdict, if there is a live one. An entry past the
+// TTL answers no — its trace is a new trace as far as the window goes — but it
+// STAYS, because seen still needs it.
 func (c *decisionCache) get(id pcommon.TraceID, now time.Time) (keep, ok bool) {
 	d, ok := c.m[id]
-	if !ok {
-		return false, false
-	}
-	if now.Sub(d.at) >= c.ttl {
-		// Expired: drop it here rather than waiting for the FIFO to reach it, so
-		// a lookup never answers from a verdict older than the TTL.
-		delete(c.m, id)
-		d.stale = true
+	if !ok || now.Sub(d.at) >= c.ttl {
 		return false, false
 	}
 	return d.keep, true
 }
 
-// put remembers a verdict, expiring what has aged out and evicting the oldest
-// live entry if the cache is full.
+// seen reports whether this trace has been decided before, at any age. It is
+// what a re-decision passes to the evaluator as Trace.Charged, so the rate
+// budgets are not billed twice for one trace.
+func (c *decisionCache) seen(id pcommon.TraceID) bool {
+	_, ok := c.m[id]
+	return ok
+}
+
+// put remembers a verdict, evicting the oldest entry if the cache is full.
 func (c *decisionCache) put(id pcommon.TraceID, keep bool, now time.Time) {
 	if old, ok := c.m[id]; ok {
 		old.stale = true // its FIFO slot must not evict the new entry
+		delete(c.m, id)
 	}
-	c.expire(now)
 	if len(c.m) >= c.max {
-		c.evict()
+		c.evict(now)
 	}
 	d := &decision{id: id, keep: keep, at: now}
 	c.m[id] = d
@@ -85,36 +102,22 @@ func (c *decisionCache) put(id pcommon.TraceID, keep bool, now time.Time) {
 	c.compact()
 }
 
-// expire drops entries older than the TTL from the front. It stops at the first
-// live one: the FIFO is insertion-ordered and every entry has the same TTL.
-func (c *decisionCache) expire(now time.Time) {
+// evict drops the oldest entry to make room. It counts only when the verdict it
+// takes was still LIVE: that is the cap being too small for the arrival pattern
+// — a late span for that trace now starts a fresh window AND re-charges the rate
+// budgets — whereas reclaiming an expired tombstone is the cache working.
+func (c *decisionCache) evict(now time.Time) {
 	for c.head < len(c.fifo) {
 		d := c.fifo[c.head]
+		c.head++
 		if d.stale {
-			c.head++
 			continue
 		}
+		delete(c.m, d.id)
+		d.stale = true
 		if now.Sub(d.at) < c.ttl {
-			return
+			obs.TailSampleCacheEvicted.Inc()
 		}
-		delete(c.m, d.id)
-		d.stale = true
-		c.head++
-	}
-}
-
-// evict drops the oldest live entry to make room, and counts it: a late span for
-// that trace will now start a fresh window instead of following its decision.
-func (c *decisionCache) evict() {
-	for c.head < len(c.fifo) {
-		d := c.fifo[c.head]
-		c.head++
-		if d.stale {
-			continue
-		}
-		delete(c.m, d.id)
-		d.stale = true
-		obs.TailSampleCacheEvicted.Inc()
 		return
 	}
 }
@@ -131,5 +134,5 @@ func (c *decisionCache) compact() {
 	c.head = 0
 }
 
-// len reports the live entry count (for tests).
+// len reports the entry count (for tests).
 func (c *decisionCache) len() int { return len(c.m) }

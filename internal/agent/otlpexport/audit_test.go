@@ -102,7 +102,7 @@ func TestPoisonBatchIsDroppedOnceCollectorTakesOthers(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = ms.Close() }()
-	b := NewBuffered(send, ls, ms, time.Millisecond, nil)
+	b := NewBuffered(send, ls, ms, nil, time.Millisecond, nil)
 
 	if err := b.ExportMetrics(context.Background(), metricsWith("huge")); err != nil {
 		t.Fatal(err)
@@ -157,7 +157,7 @@ func TestOutageNeverDropsBufferedData(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = ms.Close() }()
-	b := NewBuffered(send, ls, ms, time.Millisecond, nil)
+	b := NewBuffered(send, ls, ms, nil, time.Millisecond, nil)
 
 	for i := 0; i < 3; i++ {
 		if err := b.ExportMetrics(context.Background(), metricsWith("data")); err != nil {

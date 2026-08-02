@@ -87,8 +87,11 @@
 //     stringAttribute can fail to see the span that would have vetoed, so an
 //     exclusion leaks.
 //   - rateLimiting and composite charge the SPANS PRESENT, so a partial trace
-//     under-charges the budget, and a trace decided twice (late spans, a
-//     re-assembly, a restart) charges twice.
+//     under-charges the budget. A trace decided twice (late spans, a
+//     re-assembly, a restart) would charge twice, which is what Trace.Charged
+//     exists to prevent — an assembler that knows it has decided this trace
+//     before sets it, and the second decision checks the budget instead of
+//     spending it.
 //   - probabilistic and alwaysSample are the two that do not care: they are a
 //     function of the trace id alone.
 //
@@ -396,6 +399,25 @@ type Trace struct {
 	// Spans may be empty: a trace with no spans abstains from every span-based
 	// policy and can still be sampled by probabilistic or alwaysSample.
 	Spans []Span
+
+	// Charged says this trace has ALREADY been charged to the budgets by an
+	// earlier decision, so the two policies that spend one (rateLimiting,
+	// composite) must CHECK their bucket instead of spending it again.
+	//
+	// It exists because assembly is not a single event. An assembler that
+	// remembers a trace was decided but no longer remembers the verdict — a
+	// straggler arriving past the assembler's verdict TTL is the canonical case
+	// — re-decides it, and without this the same trace pays the spans/second
+	// budget twice, so late spans quietly shrink the budget available to
+	// genuinely new traces.
+	//
+	// It changes nothing else: the same policy list is evaluated in the same
+	// order, the same policy is named in the Decision, and every other policy is
+	// a pure function of the trace and answers identically either way. What it
+	// cannot do is guarantee the SAME verdict as the first decision — the bucket
+	// may have emptied since — which is inherent to a bounded memory of past
+	// decisions, not something this flag makes worse.
+	Charged bool
 }
 
 // Decision is the verdict plus its author.
@@ -447,8 +469,10 @@ func New(cfg Config) (*Evaluator, error) {
 // doc for both semantics and why they are what they are).
 //
 // The result is a function of t and — for rateLimiting and composite only — of
-// the budget already spent. Deciding the same trace twice therefore charges
-// twice and may answer differently; every other policy is idempotent.
+// the budget already spent. Deciding the same trace twice may therefore answer
+// differently; every other policy is idempotent. It does not charge twice as
+// long as the caller sets Trace.Charged on the re-decision, which is what an
+// assembler that remembers having decided the trace should do.
 //
 // What Decide CANNOT tell you is whether t is the whole trace. It answers about
 // the spans it was handed.

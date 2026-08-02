@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"sigs.k8s.io/yaml"
 
@@ -251,6 +252,65 @@ func validateConfig(cfg agentConfig, transformsFile string) error {
 		}
 	}
 	return nil
+}
+
+// configWarnings reports combinations that are LEGAL but do something other than
+// what they read like. They are warnings rather than errors, and each one has to
+// justify being a warning rather than a refusal: an error is right when the
+// config can only be a mistake, and wrong when it is a supported arrangement
+// with a sharp edge.
+//
+// Emitted by -check-config and by every real start, from the same list, so a dry
+// run says exactly what a start would.
+func configWarnings(cfg agentConfig) []string {
+	var out []string
+
+	// traceSampling (per-SPAN) above tailSampling (per-TRACE). The two nest
+	// correctly for the PROBABILITY — both hash the trace id the same way, so a
+	// tail probabilistic policy at 50% keeps exactly the traces a head
+	// probability of 0.5 already passed — and maxSpansPerSecond is an overload
+	// valve that only truncates when the shard is over budget. The GUARD RAILS
+	// are the problem: they are decided per span, so they rescue the error (or
+	// slow) spans of traces the probability dropped, and hand the tail sampler a
+	// trace that is only its error spans. It judges that fragment as if it were
+	// the trace — latency reads a lower bound, an inverted attribute exclusion
+	// can miss the span that would have vetoed — and can then EXPORT it, which
+	// is a trace that never existed rather than merely an incomplete one.
+	//
+	// Not a refusal, for one concrete reason: keepErrors DEFAULTS to true, so
+	// refusing would reject `traceSampling: {probability: 0.1}` next to any
+	// tailSampling section — the most natural composition there is — and would
+	// make the same effective config legal or illegal depending on whether the
+	// operator spelled the default out. The degradation is also well-defined and
+	// documented (agent/tailsample on partial traces), which is the line: a
+	// sharp edge gets named, an impossibility gets refused.
+	if *serviceGraphOn && cfg.TailSampling.Enabled() && cfg.TraceSampling != nil && cfg.TraceSampling.Enabled() {
+		var rails []string
+		if cfg.TraceSampling.KeepErrors == nil || *cfg.TraceSampling.KeepErrors {
+			rails = append(rails, "keepErrors")
+			if cfg.TraceSampling.KeepErrors == nil {
+				rails[len(rails)-1] = "keepErrors (defaulted on)"
+			}
+		}
+		if d, err := time.ParseDuration(cfg.TraceSampling.KeepSlowerThan); err == nil && d > 0 {
+			rails = append(rails, "keepSlowerThan")
+		}
+		if len(rails) > 0 {
+			out = append(out, fmt.Sprintf(
+				"traceSampling %s runs ABOVE tailSampling and decides PER SPAN: it rescues individual spans of traces the probability dropped, so the tail sampler is handed trace fragments and may export a trace that never existed. "+
+					"Set traceSampling.keepErrors: false (and drop keepSlowerThan), and express the same intent as tail policies — statusCode: [ERROR] and latency — which judge whole traces. "+
+					"traceSampling.probability is safe below a tail sampler (the two nest: a tail probabilistic policy at the same fraction keeps exactly what the head kept) and so is maxSpansPerSecond, which is an overload valve.",
+				strings.Join(rails, " and ")))
+		}
+	}
+	return out
+}
+
+// logConfigWarnings emits configWarnings.
+func logConfigWarnings(cfg agentConfig, log *slog.Logger) {
+	for _, w := range configWarnings(cfg) {
+		log.Warn(w)
+	}
 }
 
 // routeExportConfig derives one route destination's client config: the flag

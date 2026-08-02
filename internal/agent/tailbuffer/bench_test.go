@@ -5,7 +5,6 @@ import (
 	"testing"
 	"time"
 
-	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/ptrace"
 )
 
@@ -28,9 +27,12 @@ import (
 //	BenchmarkReceiveLateKeep       385 ns   10 allocs   568 B   (decided keep: copied into an outgoing payload and forwarded)
 //
 // The 365 B is the memory bound's unit of account: a minimal two-attribute span.
-// Budget ~1 KiB for a realistic one, plus ~470 B once per (pushed payload,
-// trace) group for the ResourceSpans/ScopeSpans wrapper and its copy of the
-// resource attributes.
+// Budget ~1 KiB for a realistic one (memory.go sizes maxSpans on that figure),
+// plus one ResourceSpans/ScopeSpans wrapper and its copy of the resource
+// attributes per (pushed payload, trace) group — ~320 B with a bare
+// service.name, ~1040 B with the attribute set the tier's enricher stamps.
+// resource_bench_test.go measures the group cost across push sizes and records
+// why those groups are not interned.
 //
 // The zero on the late-drop line is the one that is asserted below, because it
 // is the only one this package fully controls: it is the path a heavily-sampling
@@ -47,11 +49,15 @@ func (discard) ExportTraces(context.Context, ptrace.Traces) error { return nil }
 func (b *Buffer) reset() {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	b.trace = make(map[pcommon.TraceID]*bufTrace, 1024)
+	// clear() rather than fresh maps: a benchmark that measures per-trace memory
+	// must not have two 1024-bucket map allocations per iteration in its number.
+	clear(b.trace)
 	b.order = b.order[:0]
 	b.head = 0
 	b.spans = 0
-	b.cache = newDecisionCache(b.set.cacheSize, b.set.cacheTTL)
+	clear(b.cache.m)
+	b.cache.fifo = b.cache.fifo[:0]
+	b.cache.head = 0
 }
 
 func benchBuffer(b *testing.B, spansPerTrace int) *Buffer {

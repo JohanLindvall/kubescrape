@@ -212,9 +212,11 @@ func ownerReceive(owner servicegraph.TracesExporter) func(context.Context, ptrac
 // the head sampler's guard rails are per SPAN, so keepErrors delivers a
 // fragment of a trace to a layer that judges whole traces.
 func (p *pipelines) buildOwnerChain(proc *servicegraph.Processor) (servicegraph.TracesExporter, error) {
-	// Both Client and Buffered export traces (Buffered passes them through
-	// unbuffered — the pushing sender owns the retry, and a disk-buffered span
-	// would be acked to a sender that then stops holding it).
+	// Both Client and Buffered export traces. Buffered passes a plain forwarded
+	// trace through unbuffered — the pushing sender owns the retry, and
+	// spooling would ack a sender that then stops holding it — but SPOOLS a
+	// payload the tail sampler marks otlpexport.Own, whose senders were acked
+	// when their spans were buffered and hold nothing (otlpexport/owned.go).
 	out, ok := p.out.(servicegraph.TracesExporter)
 	if !ok {
 		return nil, fmt.Errorf("exporter does not support traces")

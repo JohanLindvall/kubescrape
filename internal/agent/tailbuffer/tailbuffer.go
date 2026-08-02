@@ -38,17 +38,48 @@
 //     the keeps before the exporter closes. Only a hard kill — SIGKILL, an OOM,
 //     a node failure — loses anything.
 //
+// The likeliest hard kill is the OOM this buffer's own bounds cause, which is
+// why maxSpans is sized against the container's memory limit rather than left to
+// a number in a values file (see applyMemoryBudget).
+//
 // kubescrape_tail_sampling_buffered_spans and _buffered_traces are exactly the
 // number a hard kill would lose at that instant, which is why they are gauges
 // rather than a footnote.
 //
-// A trace that is DECIDED but whose export fails is a different case: it is
-// retried a few times and then dropped and counted
-// (kubescrape_tail_sampling_spans_total{outcome="lost"}), because at that point
-// nobody else holds it either. The one place the sender can still help is a span
-// arriving for an already-decided trace (see the decision cache below): those
-// ride out on the receiving goroutine, and a failed send there DOES fail the
-// push, so the sender's retry recovers them.
+// A trace that is DECIDED is a different case, and the answer depends on
+// whether the workload runs a disk buffer:
+//
+//   - With -buffer-dir, a decided keep is SPOOLED. The payload is marked
+//     otlpexport.Own — the seam's way of saying "this one is ours now" — and
+//     otlpexport.Buffered appends it to a durable traces queue instead of
+//     passing it through to the collector, exactly as it does for logs and
+//     metrics. A collector outage is then a backlog that survives a restart,
+//     not loss, and {outcome="lost"} moves only when the SPOOL itself refuses
+//     the payload (full, or a failed fsync).
+//   - Without one, it is retried a few times and then dropped and counted
+//     (kubescrape_tail_sampling_spans_total{outcome="lost"}), because at that
+//     point nobody else holds it either.
+//
+// Ownership is per PAYLOAD rather than a switch on the traces signal, because
+// the same exporter carries plain forwarded traces from the tier's application
+// listener — there the pushing SDK still holds the spans and its retry is the
+// durability, so spooling would ack a sender for data that has not shipped and
+// remove the only other copy. otlpexport/owned.go argues the whole distinction.
+//
+// The one place the sender can still help is a span arriving for an
+// already-decided trace (see the decision cache below): those ride out on the
+// receiving goroutine, and a failed send there DOES fail the push, so the
+// sender's retry recovers them.
+//
+// Spooling at BUFFER time rather than at decision time — writing every span to
+// disk as it arrives, so a hard kill lost nothing at all — was considered and
+// rejected. It would put an fsync in the ack path the ack-first design exists to
+// keep out (the in-flight-slot argument comes straight back, in a slower form),
+// it writes 100% of received spans to disk to protect the ~1-10% a sampler
+// keeps, and the queue is a FIFO with an in-order cursor: a payload could not
+// retire until every trace in it was decided, and a restart would replay the
+// undecided prefix and re-buffer traces that had already been exported. The
+// bounded exposure below buys more than that costs.
 //
 // # Composition: tail sampling sits at the BOTTOM
 //
@@ -111,12 +142,20 @@ import (
 // attributes — the part that surprises people. maxSpans 200k is therefore
 // ~100-300 MiB of spans.
 //
-// The arithmetic an operator has to do: a shard receiving R spans/second holds
-// R * decisionWait spans in the steady state. At 50k spans/s and a 5s window
-// that is 250k — above the default, so the maxSpans bound would bind and decide
-// the oldest traces about a second early. Either raise maxSpans (memory scales
-// linearly) or add shards (the ring divides R by the shard count); the early
-// counter says which is happening.
+// It is not left at that number blindly: memory.go checks it against the
+// container's actual memory limit at startup, lowers the DEFAULT when the limit
+// cannot afford it, and refuses an explicit setting that could only end in an
+// OOM. The sizing rule in one line is
+//
+//	maxSpans x 1 KiB must fit in a quarter of the pod's memory limit.
+//
+// The arithmetic an operator has to do on top of that: a shard receiving R
+// spans/second holds R * decisionWait spans in the steady state. At 50k spans/s
+// and a 5s window that is 250k — above the default, so the maxSpans bound would
+// bind and decide the oldest traces about a second early. Raising maxSpans costs
+// memory LINEARLY and raises the odds of the OOM that loses the whole buffer, so
+// the answer above a pod's budget is more shards (the ring divides R by the
+// shard count), not a bigger number; the early counter says which is happening.
 const (
 	defaultDecisionWait     = 5 * time.Second
 	defaultMaxTraces        = 100_000
@@ -184,6 +223,14 @@ type Config struct {
 	MaxSpansPerTrace int `json:"maxSpansPerTrace,omitempty"`
 	// MaxSpans caps the buffer's TOTAL spans (200000 default) — the bound that
 	// actually determines the process's memory, since the other two multiply.
+	//
+	// Budget ~1 KiB per span and keep the product under a QUARTER of the pod's
+	// memory limit (memory.go explains the share). Left unset, the default is
+	// lowered at startup to whatever the limit affords; set explicitly it is
+	// honoured, warned about above that budget, and refused outright when the
+	// spans alone would need the whole limit — an OOM here loses every buffered
+	// span at once, which is strictly worse than the early decisions a smaller
+	// ceiling causes.
 	MaxSpans int `json:"maxSpans,omitempty"`
 
 	// DecisionCacheSize bounds the verdict cache used for spans arriving after
@@ -396,6 +443,14 @@ func New(cfg Config, next TracesExporter, log *slog.Logger) (*Buffer, error) {
 	if log == nil {
 		log = slog.Default()
 	}
+	// The span ceiling against memory that exists, not against a number in a
+	// values file (memory.go). This is deliberately NOT in Config.Validate,
+	// which is shape-only so -check-config touches no filesystem — but it IS at
+	// startup, which is where a config implying an OOM has to be caught.
+	limit, source := memLimit()
+	if err := applyMemoryBudget(&set, cfg.MaxSpans > 0, limit, source, log); err != nil {
+		return nil, err
+	}
 	b := &Buffer{
 		ev:         ev,
 		next:       next,
@@ -488,8 +543,9 @@ func (b *Buffer) Stats() Stats {
 // holds, so its retry recovers them, and the retry costs only duplicates (the
 // re-pushed spans of a still-buffering trace are buffered twice, which is the
 // same at-least-once trade the re-shard hop makes). Spans that came out of the
-// BUFFER in the same send — an early decision forced by a bound — are ours, and
-// a failure loses them; they are counted as lost rather than left to a retry
+// BUFFER in the same send — an early decision forced by a bound — are ours, so
+// the payload is marked otlpexport.Own and a disk buffer takes it; without one,
+// a failure loses them and they are counted as lost rather than left to a retry
 // that will not re-send them. (A few of those may in fact be recoverable: an
 // early-decided trace can include spans from THIS push, which the retry will
 // re-deliver against the cached verdict. Counting them lost over-reports a rare
@@ -502,6 +558,15 @@ func (b *Buffer) ExportTraces(ctx context.Context, td ptrace.Traces) error {
 	out, late, mine := b.take(td)
 	if out.spans == 0 {
 		return nil
+	}
+	if mine > 0 {
+		// This payload carries spans that came out of the BUFFER (an early
+		// decision forced by a bound), whose senders were acked seconds ago.
+		// Marking it hands it to the disk buffer when one is open — see
+		// otlpexport/owned.go. The late spans riding along are spooled too,
+		// which is right: the sender is acked either way, so the spool has to
+		// be the thing that carries them.
+		ctx = otlpexport.Own(ctx)
 	}
 	if err := b.next.ExportTraces(ctx, out.td); err != nil {
 		if mine > 0 {
@@ -575,8 +640,9 @@ func (b *Buffer) take(td ptrace.Traces) (out outbound, late, mine int) {
 				}
 				// Not decided (or the verdict aged out of the cache, in which
 				// case this starts a FRESH window and the trace may be decided a
-				// second time — which re-charges rateLimiting and composite, as
-				// tailsample.Decide documents; every other policy is idempotent).
+				// second time — which does NOT re-charge rateLimiting or
+				// composite while the cache still remembers the trace at all;
+				// see decide and cache.go's two lifetimes).
 				e := b.add(id, sp, rs, ss, now)
 				mine += b.enforce(&out, e, now)
 			}
@@ -594,9 +660,16 @@ func (b *Buffer) take(td ptrace.Traces) (out outbound, late, mine int) {
 // Grouping is per (source resource, source scope, trace), so a trace collects
 // one ResourceSpans per pushed payload that carried spans for it — the scope
 // identity and the resource attributes the sender set are preserved exactly, at
-// the cost of one resource copy per group. Merging groups across payloads would
-// mean comparing attribute maps on the receive path, which is not a trade worth
-// making for spans that mostly leave again within five seconds.
+// the cost of one resource copy per group (~320 B minimal, ~1040 B for the
+// attribute set the tier's enricher stamps).
+//
+// Merging groups across payloads would mean hashing AND comparing attribute maps
+// on the receive path, under the mutex that serialises every sender on the
+// shard. BenchmarkAssembleByPushSize prices exactly that trade and argues it
+// down: the resources of one trace are mostly distinct (different services), and
+// how often ONE sender splits one trace across pushes is bounded by decisionWait
+// against the SDK's batch interval — about +13% on a realistically enriched
+// trace, for a comparison on every group of every push.
 func (b *Buffer) add(id pcommon.TraceID, sp ptrace.Span, rs ptrace.ResourceSpans, ss ptrace.ScopeSpans, now time.Time) *bufTrace {
 	e := b.trace[id]
 	if e == nil {
@@ -691,7 +764,11 @@ func (b *Buffer) decide(out *outbound, e *bufTrace, now time.Time, reason string
 			}
 		}
 	}
-	d := b.ev.Decide(tailsample.Trace{TraceID: e.id, Spans: b.scratch})
+	// Charged: this trace was decided before (its verdict has since aged out, or
+	// it was decided early and its remainder started a fresh window). The
+	// evaluator then CHECKS the rateLimiting/composite budgets instead of
+	// spending them again — see the cache's two lifetimes in cache.go.
+	d := b.ev.Decide(tailsample.Trace{TraceID: e.id, Spans: b.scratch, Charged: b.cache.seen(e.id)})
 
 	c, ok := b.byPolicy[d.Policy]
 	if !ok { // unreachable: Names() covers every name a Decision can carry
@@ -827,10 +904,14 @@ func (b *Buffer) drain(ctx context.Context, all bool) {
 	if out.spans == 0 {
 		return
 	}
-	if err := b.sendRetry(ctx, out.td); err != nil {
-		// Nobody else holds these: the sender was acked when they were buffered.
+	// Every span here came out of the buffer, so nobody else holds a copy: the
+	// payload is OURS (otlpexport/owned.go). With -buffer-dir open on this
+	// workload the send below is an append to the traces spool and a collector
+	// outage becomes a backlog; without one it is a direct send and a spent
+	// retry budget is loss.
+	if err := b.sendRetry(otlpexport.Own(ctx), out.td); err != nil {
 		b.spansLost.Add(float64(out.spans))
-		b.warn("exporting tail-sampled traces failed; the spans are dropped (they were acked to their sender when they were buffered)",
+		b.warn("exporting tail-sampled traces failed; the spans are dropped (they were acked to their sender when they were buffered, and no disk buffer took them)",
 			"spans", out.spans, "error", err)
 		return
 	}

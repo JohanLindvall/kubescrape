@@ -112,10 +112,10 @@ logs+metrics over OTLP is kubescrape's.
 | | kubescrape | Alloy | Vector | Fluent Bit | OTel Collector |
 |---|---|---|---|---|---|
 | OTLP ingest (push) with k8s enrichment | ✔ logs/metrics on the node agent, traces on the trace tier, peer-IP fallback (payloads forwarded as received — batch in the SDK or downstream) | ✔ | ~ OTLP source decodes, but no k8s enrichment of pushed data | ✔ | ✔ |
-| Traces | a dedicated sharded tier: enrichment + re-sharding by trace id + RED span metrics + consistent probabilistic sampling (`traceSampling`) + Grafana-Tempo-compatible service-graph edges (opt-in); no tail sampling | ✔ full | ~ pass-through (practical since v0.50); OSS has no sampling or span metrics | ✔ head **and** conditional tail sampling (v4 sampling processor: latency/status/attribute policies) | ✔ full (tail sampling etc.) |
+| Traces | a dedicated sharded tier: enrichment + re-sharding by trace id + RED span metrics + consistent probabilistic sampling (`traceSampling`) + **whole-trace tail sampling** (`tailSampling`, the Collector's policy vocabulary, first-match-wins attribution) + Grafana-Tempo-compatible service-graph edges (opt-in) | ✔ full | ~ pass-through (practical since v0.50); OSS has no sampling or span metrics | ✔ head **and** conditional tail sampling (v4 sampling processor: latency/status/attribute policies) | ✔ full (tail sampling etc.) |
 | Multi-destination / tenant routing | ✔ per-signal destinations + tenant headers on the buffered default chain (`export` section: Mimir/Loki/Tempo's distinct OTLP endpoints, collectorless); plus per-namespace fan-out (`routing`; unbuffered by design) | ✔ | ✔ | ✔ | ✔ routing connector |
 | Log delivery | **ack-gated at-least-once** + rewind; offsets never pass unacked data | positions synced on timer (loss/dup window) | ✔ e2e acks + disk buffers | offsets on read; `storage.type filesystem` persists read-but-undelivered chunks across restarts | checkpoints when the downstream consumer accepts (not backend ack); persistent sending queue bounds outage loss |
-| Disk buffering | ✔ both signals (fsync'd frames, checksummed cursor, poison-batch handling) | ✔ metrics WAL (GA, agent-mode); otelcol file-storage queues since v1.9; the *log* WAL never went GA | ✔ mature | ✔ filesystem storage | ✔ file storage ext |
+| Disk buffering | ✔ logs, metrics and tail-sampled traces (fsync'd frames, checksummed cursor, poison-batch handling); a *forwarded* trace passes through by design, since its sender still holds it | ✔ metrics WAL (GA, agent-mode); otelcol file-storage queues since v1.9; the *log* WAL never went GA | ✔ mature | ✔ filesystem storage | ✔ file storage ext |
 | Compression | gzip (klauspost) | snappy/gzip | ✔ several | ✔ | ✔ several |
 | Backpressure to source | ✔ rewind = files wait on disk | partial | ✔ | ✔ | partial |
 | Inputs beyond k8s/journal (syslog, kafka, statsd, cloud…) | ✘ | ✔ | ✔✔ | ✔✔ | ✔✔ |
@@ -239,8 +239,10 @@ sharded tier, which is then a hard cluster-wide dependency for them (no
 per-node fallback, and each span crosses the network twice at full fidelity),
 its edges miss what is uninstrumented (an uninstrumented callee appears only as
 a virtual node) and its ring membership is what config says rather than what is
-alive — and there is no tail sampling, which needs a whole trace buffered until
-it is complete; the
+alive; tail sampling exists on that tier but is the one place in kubescrape that
+acks a span before delivering it, so a hard kill of a shard loses whatever is
+buffered-but-undecided (a decided keep is spooled when the tier runs a disk
+buffer); the
 ServiceMonitor/PodMonitor subset interprets neither target `relabelings`
 nor the Probe/ScrapeConfig CRDs; no input breadth; OTLP-only output;
 single-core log ingestion per node; Linux/containerd focus; and years less

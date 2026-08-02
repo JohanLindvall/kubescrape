@@ -297,7 +297,7 @@ spec:
             httpGet: {path: /readyz, port: http}
           livenessProbe:
             httpGet: {path: /healthz, port: http}
-          {{- $anyVolume := or $cfg .Values.agent.otlp.bearerTokenSecret.name $sg.tokenSecret.name }}
+          {{- $anyVolume := or $cfg .Values.agent.otlp.bearerTokenSecret.name $sg.tokenSecret.name $sg.extraVolumes }}
           {{- if $anyVolume }}
           volumeMounts:
             {{- if $cfg }}
@@ -314,6 +314,9 @@ spec:
             - name: service-graph-token
               mountPath: /etc/kubescrape/service-graph
               readOnly: true
+            {{- end }}
+            {{- with $sg.extraVolumeMounts }}
+            {{- toYaml . | nindent 12 }}
             {{- end }}
           {{- end }}
           resources: {{ toYaml $sg.resources | nindent 12 }}
@@ -333,6 +336,9 @@ spec:
         - name: service-graph-token
           secret:
             secretName: {{ $sg.tokenSecret.name }}
+        {{- end }}
+        {{- with $sg.extraVolumes }}
+        {{- toYaml . | nindent 8 }}
         {{- end }}
       {{- end }}
 {{- if .Values.networkPolicy.enabled }}

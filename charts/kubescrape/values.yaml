@@ -454,13 +454,27 @@ serviceGraph:
   # READ THIS BEFORE ENABLING IT: a pushed span is ACKED to its sender before its
   # trace is decided — it has to be, or the push would hold one of the receiver's
   # in-flight slots for the whole window and stall every sender in the cluster —
-  # so buffered spans are LOST if the pod is hard-killed (SIGKILL, OOM, node
-  # failure). A graceful stop decides and exports them, so a rolling update loses
-  # nothing; kubescrape_tail_sampling_buffered_spans is what a hard kill would
-  # lose at that instant. Memory is ~1 KiB per buffered span, and a shard holds
-  # (its span rate x decisionWait) of them: 50k spans/s over 5s is 250k spans,
-  # ~250 MiB, so size maxSpans and the pod's memory limit together — or add
-  # replicas, which divides the rate.
+  # so spans that are buffered but NOT YET DECIDED are lost if the pod is
+  # hard-killed (SIGKILL, OOM, node failure). A graceful stop decides and exports
+  # them, so a rolling update loses nothing; kubescrape_tail_sampling_buffered_spans
+  # is what a hard kill would lose at that instant. A trace that HAS been decided
+  # can be made durable: with -buffer-dir set on THIS tier (see extraVolumes
+  # below — agent.bufferDir is the DaemonSet's and is not rendered here) the keep
+  # is spooled to disk like logs and metrics, the one trace payload this agent
+  # owns rather than forwards, so a collector outage becomes a backlog rather
+  # than loss.
+  #
+  # Sizing rule: maxSpans x 1 KiB must fit a QUARTER of this pod's memory limit
+  # (1 GiB limit -> ~262k spans). It is CHECKED at startup — an unset maxSpans is
+  # lowered to fit, an explicit one that could only OOM is refused — because the
+  # likeliest hard kill here is the OOM this buffer itself causes. A shard holds
+  # (its span rate x decisionWait) spans: 50k spans/s over 5s is 250k, ~250 MiB.
+  # Above the pod's budget, add replicas (which divides the rate) rather than
+  # raising the ceiling.
+  #
+  # If traceSampling above is also set, keep only its probability and
+  # maxSpansPerSecond: keepErrors/keepSlowerThan are decided PER SPAN and hand
+  # this layer trace fragments (the agent warns at startup naming them).
   #   config:
   #     tailSampling:
   #       decisionWait: 5s      # hold a trace this long from its FIRST span
@@ -489,6 +503,23 @@ serviceGraph:
   #       dimensions: [http.route]   # extra client_/server_ labels
   # Anything else goes here as raw flags, in the DaemonSet's style.
   extraArgs: []
+  # The tier's root filesystem is read-only and this template creates no
+  # writable volume, so -buffer-dir (which is what makes a TAIL-SAMPLING
+  # decision durable across a collector outage — see tailSampling above) needs
+  # one mounted here. A PVC or an emptyDir both work; an emptyDir survives a
+  # container restart and the outage itself, not a reschedule:
+  #   extraVolumes:
+  #     - name: buffer
+  #       emptyDir: {sizeLimit: 2Gi}
+  #   extraVolumeMounts:
+  #     - name: buffer
+  #       mountPath: /var/lib/kubescrape/buffer
+  #   extraArgs:
+  #     - -buffer-dir=/var/lib/kubescrape/buffer
+  #     - -buffer-max-bytes=1073741824
+  # Note that agent.bufferDir is the DaemonSet's knob and is NOT rendered here.
+  extraVolumes: []
+  extraVolumeMounts: []
   priorityClassName: ""
   nodeSelector: {}
   tolerations: []

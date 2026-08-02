@@ -292,8 +292,9 @@ func TestHTTPTracesExport(t *testing.T) {
 	}
 }
 
-// Buffered passes traces through to the inner exporter unbuffered, and
-// reports a clear error when the inner exporter cannot handle traces.
+// An UNMARKED traces payload passes through to the inner exporter unbuffered
+// (owned_test.go covers the marked one), and Buffered reports a clear error when
+// the inner exporter cannot handle traces at all.
 func TestBufferedTracesPassthrough(t *testing.T) {
 	ls, err := OpenBuffer(t.TempDir(), 0)
 	if err != nil {
@@ -302,7 +303,7 @@ func TestBufferedTracesPassthrough(t *testing.T) {
 	defer func() { _ = ls.Close() }()
 
 	inner := &tracesFakeSender{}
-	b := NewBuffered(inner, ls, nil, 10*time.Millisecond, nil)
+	b := NewBuffered(inner, ls, nil, nil, 10*time.Millisecond, nil)
 	if err := b.ExportTraces(context.Background(), testTraces()); err != nil {
 		t.Fatal(err)
 	}
@@ -311,7 +312,7 @@ func TestBufferedTracesPassthrough(t *testing.T) {
 	}
 
 	// An inner exporter without trace support yields an error, not a panic.
-	b2 := NewBuffered(&fakeSender{}, ls, nil, 10*time.Millisecond, nil)
+	b2 := NewBuffered(&fakeSender{}, ls, nil, nil, 10*time.Millisecond, nil)
 	if err := b2.ExportTraces(context.Background(), testTraces()); err == nil {
 		t.Fatal("expected error for non-traces inner exporter")
 	}

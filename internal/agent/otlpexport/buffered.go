@@ -29,26 +29,39 @@ type Exporter interface {
 }
 
 // TracesExporter exports traces. *Client implements it natively; *Buffered
-// passes traces through to the inner exporter unbuffered (traces are a
-// passthrough signal — the pushing sender owns retry).
+// passes traces through to the inner exporter unbuffered UNLESS the payload is
+// marked Own(ctx) — see owned.go: a trace is normally a forwarded push whose
+// sender owns the retry, and the one exception is a tail-sampling decision,
+// which acked its senders seconds earlier.
 type TracesExporter interface {
 	ExportTraces(ctx context.Context, td ptrace.Traces) error
 }
 
 // Buffered is a disk-backed write-ahead buffer in front of an exporter, for
-// both logs and metrics. Export{Logs,Metrics} serialize the batch and append it
-// to a durable on-disk queue (github.com/JohanLindvall/diskqueue, one per
-// signal), returning as soon as it is persisted — so producers can commit
+// logs, metrics and OWNED traces. Export{Logs,Metrics} serialize the batch and
+// append it to a durable on-disk queue (github.com/JohanLindvall/diskqueue, one
+// per signal), returning as soon as it is persisted — so producers can commit
 // their progress and source logs may rotate away while their data waits on the
 // node. Run drains each queue to the real exporter with retries; a batch is
 // removed only after the collector acknowledges it (at-least-once, surviving
 // restarts). A full queue makes Export return diskqueue.ErrFull, which the
 // tailer treats as a failure and rewinds — bounding disk use and
 // back-pressuring to the source.
+//
+// ExportTraces is the exception, and it is a PER-PAYLOAD one: a plain forwarded
+// trace passes straight through (the pushing application still holds it and its
+// SDK retries — spooling would ack a sender for data that has not shipped),
+// while a payload marked Own(ctx) is spooled like the other two signals. The
+// only marker in this repo is agent/tailbuffer, whose senders were acked when
+// their spans were BUFFERED and hold nothing by the time a decision ships. See
+// owned.go for the whole argument. With no traces spool open, an owned payload
+// passes through as before — the marker asks for durability, it does not
+// require it.
 type Buffered struct {
 	inner   Exporter // direct path for a signal with no buffer
 	logs    *sink[plog.Logs]
 	metrics *sink[pmetric.Metrics]
+	traces  *sink[ptrace.Traces] // nil unless a traces spool was opened
 	log     *slog.Logger
 	// drainGate holds ONE token, taken for the whole of Run and for the whole
 	// of FinalDrain. Both drive the same diskqueue Readers and the same
@@ -180,9 +193,12 @@ func queueDead(err error) bool {
 	return errors.Is(err, diskqueue.ErrIO) || errors.Is(err, diskqueue.ErrClosed)
 }
 
-// NewBuffered wraps inner. logBuf and metricBuf back the two signals; either
-// may be nil to leave that signal unbuffered (exported directly).
-func NewBuffered(inner Exporter, logBuf, metricBuf *Buffer, backoff time.Duration, log *slog.Logger) *Buffered {
+// NewBuffered wraps inner. logBuf, metricBuf and traceBuf back the three
+// signals; any of them may be nil to leave that signal unbuffered (exported
+// directly). traceBuf is only ever consulted for a payload marked Own(ctx) —
+// pass nil unless something in the chain marks one, or the queue is a directory
+// and a segment file that never receive a record.
+func NewBuffered(inner Exporter, logBuf, metricBuf, traceBuf *Buffer, backoff time.Duration, log *slog.Logger) *Buffered {
 	if backoff <= 0 {
 		backoff = time.Second
 	}
@@ -204,7 +220,7 @@ func NewBuffered(inner Exporter, logBuf, metricBuf *Buffer, backoff time.Duratio
 	}
 	// Report what corruption cost at open: everything the recovery scan
 	// dropped or truncated away is data no drain will ever see.
-	for kind, buf := range map[string]*Buffer{"logs": logBuf, "metrics": metricBuf} {
+	for kind, buf := range map[string]*Buffer{"logs": logBuf, "metrics": metricBuf, "traces": traceBuf} {
 		if buf == nil {
 			continue
 		}
@@ -235,11 +251,39 @@ func NewBuffered(inner Exporter, logBuf, metricBuf *Buffer, backoff time.Duratio
 			send:      sendMetrics,
 		}
 	}
+	if te, ok := inner.(TracesExporter); ok && traceBuf != nil {
+		tm := ptrace.ProtoMarshaler{}
+		tu := ptrace.ProtoUnmarshaler{}
+		b.traces = &sink[ptrace.Traces]{
+			buf: traceBuf, backoff: backoff, log: log, kind: "traces",
+			marshal:   tm.MarshalTraces,
+			unmarshal: tu.UnmarshalTraces,
+			// No counted-unwrap twin here (as sendLogs/sendMetrics have):
+			// Client.ExportTraces is ALREADY a single counted attempt — the
+			// pushing sender's retry has always been the trace path's retry —
+			// so there is no client-side loop for the drain's own retries to
+			// multiply with.
+			send: te.ExportTraces,
+		}
+	} else if traceBuf != nil {
+		log.Error("a traces disk buffer was opened but the exporter does not support traces; owned trace payloads will be refused")
+	}
 	return b
 }
 
-// ExportTraces passes traces to the inner exporter unbuffered.
+// ExportTraces spools an OWNED payload (see Own) and passes every other one
+// straight to the inner exporter.
+//
+// The asymmetry with logs and metrics is the point: a forwarded trace is still
+// held by the application that pushed it, and its SDK's retry is a better
+// durability story than this spool — acking that sender to put its data in a
+// queue would REMOVE the only other copy. A tail-sampling decision is the
+// opposite case (its senders were acked when the spans were buffered, and are
+// long gone), and it says so by marking the context.
 func (b *Buffered) ExportTraces(ctx context.Context, td ptrace.Traces) error {
+	if b.traces != nil && Owned(ctx) {
+		return b.traces.enqueue(td)
+	}
 	if te, ok := b.inner.(TracesExporter); ok {
 		return te.ExportTraces(ctx, td)
 	}
@@ -284,7 +328,7 @@ func (b *Buffered) Run(ctx context.Context) {
 	}
 	defer b.releaseDrain()
 	var wg sync.WaitGroup
-	for _, run := range []func(context.Context){b.logs.drain, b.metrics.drain} {
+	for _, run := range []func(context.Context){b.logs.drain, b.metrics.drain, b.traces.drain} {
 		wg.Add(1)
 		go func(r func(context.Context)) { defer wg.Done(); r(ctx) }(run)
 	}
@@ -295,7 +339,7 @@ func (b *Buffered) Run(ctx context.Context) {
 // a filling buffer visible BEFORE it starts refusing writes.
 func (b *Buffered) Stats() map[string]obs.BufferStat {
 	out := map[string]obs.BufferStat{}
-	for kind, buf := range map[string]*Buffer{"logs": b.logs.bufOf(), "metrics": b.metrics.bufOf()} {
+	for kind, buf := range map[string]*Buffer{"logs": b.logs.bufOf(), "metrics": b.metrics.bufOf(), "traces": b.traces.bufOf()} {
 		if buf == nil {
 			continue
 		}
@@ -339,7 +383,7 @@ func (b *Buffered) FinalDrain(ctx context.Context) {
 	}
 	defer b.releaseDrain()
 	var wg sync.WaitGroup
-	for _, run := range []func(context.Context){b.logs.drainUntilEmpty, b.metrics.drainUntilEmpty} {
+	for _, run := range []func(context.Context){b.logs.drainUntilEmpty, b.metrics.drainUntilEmpty, b.traces.drainUntilEmpty} {
 		wg.Add(1)
 		go func(r func(context.Context)) { defer wg.Done(); r(ctx) }(run)
 	}

@@ -105,7 +105,7 @@ func openBuffer(t *testing.T, dir string, send *fakeSender, max int64) (*Buffere
 	if err != nil {
 		t.Fatal(err)
 	}
-	return NewBuffered(send, ls, ms, 10*time.Millisecond, nil), ls, ms
+	return NewBuffered(send, ls, ms, nil, 10*time.Millisecond, nil), ls, ms
 }
 
 func TestBufferedDrainsBothSignals(t *testing.T) {
@@ -276,7 +276,7 @@ func TestBufferedNilSpoolExportsDirectly(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = ls.Close() }()
-	b := NewBuffered(send, ls, nil, 10*time.Millisecond, nil)
+	b := NewBuffered(send, ls, nil, nil, 10*time.Millisecond, nil)
 
 	if err := b.ExportMetrics(context.Background(), metricsWith("direct_metric")); err != nil {
 		t.Fatal(err)

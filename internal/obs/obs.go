@@ -327,13 +327,13 @@ var (
 	TailSampleTraces = Registry.CounterVec("kubescrape_tail_sampling_traces_total",
 		"Traces decided by the tail sampler, by verdict (keep, drop) and by the policy that decided. policy=\"none\" is the default drop — no policy had an opinion — which is what a policy list matching nothing looks like. Every configured policy gets its series at startup, so a policy that has never fired reads as zero rather than as absent. This counts DECISIONS: whether the kept trace then reached the collector is kubescrape_tail_sampling_spans_total.", "decision", "policy")
 	TailSampleSpans = Registry.CounterVec("kubescrape_tail_sampling_spans_total",
-		"Spans leaving the tail-sampling buffer, by fate: kept = the trace was sampled and the export was acked; dropped = the trace was not sampled; lost = the trace was sampled but the export failed after its retries, and nothing else holds a copy (the sender was acked when the spans were buffered). A moving lost rate is data loss, not back-pressure.", "outcome")
+		"Spans leaving the tail-sampling buffer, by fate: kept = the trace was sampled and the export was acked (with -buffer-dir, acked means SPOOLED — a decided keep is durable and a collector outage becomes a backlog); dropped = the trace was not sampled; lost = the trace was sampled but neither the collector nor the disk buffer took it, and nothing else holds a copy (the sender was acked when the spans were buffered). A moving lost rate is data loss, not back-pressure; without -buffer-dir a collector outage produces it directly, with one it means the spool itself refused the payload.", "outcome")
 	TailSampleEarly = Registry.CounterVec("kubescrape_tail_sampling_early_decisions_total",
 		"Traces decided BEFORE their decisionWait elapsed, by the bound that forced it (spans_per_trace, max_traces, max_spans) or shutdown (a graceful stop flushing the buffer). An early decision judges the spans present, so it degrades gracefully — a slow trace can be missed, a fast one is never invented — but a sustained rate against a bound means that bound is sized below the shard's span rate.", "reason")
 	TailSampleLate = Registry.CounterVec("kubescrape_tail_sampling_late_spans_total",
 		"Spans that arrived after their trace was decided and followed the cached verdict, by outcome (kept = forwarded immediately, dropped). A large kept+dropped share means decisionWait is shorter than the spread of a trace's arrival.", "outcome")
 	TailSampleCacheEvicted = Registry.Counter("kubescrape_tail_sampling_cache_evictions_total",
-		"Verdicts evicted from the decision cache by its SIZE cap before their TTL. A span arriving for an evicted trace starts a fresh window and may decide it a second time, which re-charges the rateLimiting and composite budgets; raise tailSampling.decisionCacheSize if this moves.")
+		"Verdicts evicted from the decision cache by its SIZE cap while still LIVE (evicting an entry already past its TTL is the cache reclaiming space, not a signal, and is not counted). A span arriving for an evicted trace starts a fresh window AND re-charges the rateLimiting and composite budgets — the cache remembers a trace was charged for as long as it holds the entry at all, so eviction is the only thing that still double-charges. Raise tailSampling.decisionCacheSize if this moves.")
 )
 
 // RegisterTailSamplingStats publishes what the tail-sampling buffer is holding.
@@ -350,7 +350,7 @@ func RegisterTailSamplingStats(stats func() TailSamplingStat) {
 		"Traces currently assembling in the tail-sampling buffer, awaiting their decision. tailSampling.maxTraces caps it; at the cap the oldest is decided early (kubescrape_tail_sampling_early_decisions_total).",
 		func() float64 { return float64(stats().Traces) })
 	Registry.GaugeFunc("kubescrape_tail_sampling_buffered_spans",
-		"Spans currently held in the tail-sampling buffer. These are acked to their senders but not yet decided and not durable anywhere: this is what a hard kill of this pod would lose. tailSampling.maxSpans caps it.",
+		"Spans currently held in the tail-sampling buffer. These are acked to their senders but not yet decided and not durable anywhere (a DECIDED keep is spooled when -buffer-dir is set; an undecided one is not): this is what a hard kill of this pod would lose. tailSampling.maxSpans caps it, and is itself checked against the pod's memory limit at startup — the likeliest hard kill here is the OOM this buffer causes.",
 		func() float64 { return float64(stats().Spans) })
 }
 
@@ -460,7 +460,7 @@ func RegisterStoreStats(stats func() (pods, containers int)) {
 // tracked the number all along.
 func RegisterBufferStats(stats func() map[string]BufferStat) {
 	Registry.GaugeFuncVec("kubescrape_buffer_backlog_bytes",
-		"Undelivered bytes currently queued in the disk buffer, per signal (what -buffer-max-bytes caps).",
+		"Undelivered bytes currently queued in the disk buffer, per signal (what -buffer-max-bytes caps). signal=\"traces\" exists only on the trace tier with tail sampling on — the one trace payload this agent owns rather than forwards.",
 		"signal", func() map[string]float64 {
 			out := map[string]float64{}
 			for sig, st := range stats() {

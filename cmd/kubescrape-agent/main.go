@@ -177,7 +177,7 @@ var (
 	logsIdleClose     = flag.Duration("logs-idle-close", 0, "close the fd of a fully-caught-up file after this much inactivity (0 = never, the default). The open fd is the only way to drain a rotated-away or deleted file, so enabling this trades the zero-loss guarantee for bounded fd usage")
 	logsUnknownFiles  = flag.String("logs-unknown-files", "auto", "where a file with no checkpoint entry starts at startup: end (skip as history), start (read whole), auto (start when the checkpoint store has entries — it appeared while the agent was down — else end)")
 	logsFileAttrs     = flag.Bool("logs-file-attributes", false, "stamp log.file.name and log.file.position (byte offset) on every log record, for each file source")
-	bufferDir         = flag.String("buffer-dir", "", "directory for a disk-backed export buffer (logs and metrics); a collector outage spools here instead of pinning the tailer to old offsets or dropping metrics (empty disables)")
+	bufferDir         = flag.String("buffer-dir", "", "directory for a disk-backed export buffer (logs, metrics, and tail-sampled traces on the -service-graph tier); a collector outage spools here instead of pinning the tailer to old offsets or dropping metrics (empty disables)")
 	bufferMax         = flag.Int("buffer-max-bytes", 1<<30, "per-signal cap on the undelivered on-disk buffer; producers back-pressure (the tailer rewinds) when full")
 	logsMetricsEvery  = flag.Duration("logs-metrics-interval", 30*time.Second, "export interval for log-derived metrics")
 	logsMetricsBytes  = flag.Int("logs-metrics-max-bytes", 3<<20, "export log-derived metrics in chunks below this many bytes (0 = one payload)")
@@ -412,6 +412,9 @@ func run() error {
 	if err := validateConfig(fileCfg, *transformsFile); err != nil {
 		return err
 	}
+	// Legal combinations that do not mean what they read like. Emitted here, so
+	// -check-config and a real start report the same list.
+	logConfigWarnings(fileCfg, log)
 	if *checkConfig {
 		printConfigSummary(fileCfg, log)
 		return nil
@@ -577,7 +580,24 @@ func run() error {
 				log.Warn("closing the metric buffer", "error", err)
 			}
 		}()
-		buffered := otlpexport.NewBuffered(exporter, logBuf, metricBuf, *otlpBackoff, log)
+		// A THIRD spool, opened only where something marks its payloads as
+		// owned (otlpexport/owned.go): the tail sampler on the trace tier. A
+		// forwarded trace must stay pass-through — its sender holds it and
+		// retries — so on every other workload this stays nil rather than
+		// preallocating a segment file that never takes a record.
+		var traceBuf *otlpexport.Buffer
+		if *serviceGraphOn && fileCfg.TailSampling.Enabled() { // nil-receiver safe
+			traceBuf, err = otlpexport.OpenBuffer(filepath.Join(*bufferDir, "traces"), int64(*bufferMax))
+			if err != nil {
+				return fmt.Errorf("trace buffer: %w", err)
+			}
+			defer func() {
+				if err := traceBuf.Close(); err != nil {
+					log.Warn("closing the trace buffer", "error", err)
+				}
+			}()
+		}
+		buffered := otlpexport.NewBuffered(exporter, logBuf, metricBuf, traceBuf, *otlpBackoff, log)
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -588,7 +608,8 @@ func run() error {
 		// Make a filling buffer visible BEFORE it starts refusing writes: every
 		// other buffer metric only moves once data is already being dropped.
 		obs.RegisterBufferStats(buffered.Stats)
-		log.Info("disk buffer enabled", "dir", *bufferDir, "max-bytes-per-signal", *bufferMax)
+		log.Info("disk buffer enabled", "dir", *bufferDir, "max-bytes-per-signal", *bufferMax,
+			"traces", traceBuf != nil)
 	}
 
 	// Routing sits between transforms and the default delivery chain:

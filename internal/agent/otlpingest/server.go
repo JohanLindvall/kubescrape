@@ -39,7 +39,9 @@ type Exporter interface {
 }
 
 // TracesExporter forwards traces; implemented by otlpexport.Client (and
-// Buffered, which passes traces through unbuffered).
+// Buffered, which passes a forwarded trace through unbuffered — the pushing
+// sender owns the retry; only a tail-sampling decision is spooled, and nothing
+// on this path marks one).
 type TracesExporter interface {
 	ExportTraces(ctx context.Context, td ptrace.Traces) error
 }

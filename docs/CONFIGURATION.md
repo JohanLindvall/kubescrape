@@ -211,7 +211,7 @@ hop or an authenticating proxy.
 | `-logs-multiline-timeout` | `1s` | flush incomplete multi-line groups after this long |
 | `-enrich` | `true` | one switch for every log-producing pipeline (container logs, journald, Kubernetes events, Azure diagnostics, pushed OTLP log bodies): parse per-line metadata via [enrich](https://github.com/JohanLindvall/enrich): a timestamp in the line replaces the CRI time, an explicit level sets the severity, trace/span IDs fill the OTLP trace fields, exception/template/source-context details become record attributes. JSON, logfmt and common plain-text formats are recognized; the body is never modified, and plain-text stack traces are not duplicated into `exception.stacktrace`. Hit rates: `kubescrape_log_enriched_total{format}` in the self-metrics |
 | `-logs-file-attributes` | `false` | stamp `log.file.name` (basename) and `log.file.position` (record start offset) on every record, for each file source |
-| `-buffer-dir` | — | directory for a disk-backed export buffer (logs **and** metrics); a collector outage spools here instead of pinning the tailer to old offsets / dropping metrics ([below](#disk-buffer)). Empty disables |
+| `-buffer-dir` | — | directory for a disk-backed export buffer (logs, metrics, and tail-sampled traces on the `-service-graph` tier); a collector outage spools here instead of pinning the tailer to old offsets / dropping metrics ([below](#disk-buffer)). Empty disables |
 | `-buffer-max-bytes` | `1GiB` | per-signal cap on the undelivered on-disk backlog; producers back-pressure (the tailer rewinds) when full |
 | `-logs-exclude-namespaces` | — | comma-separated namespaces not tailed — **always exclude the namespace of your collector** to avoid feedback loops |
 | `-logs-rate-limit` | `0` | per-file line rate limit (lines/second, token bucket; 0 disables). An exhausted file is **paused** — reading stops until tokens refill, the backlog stays on disk, nothing is lost (rotation drains bypass the limiter) |
@@ -285,6 +285,18 @@ Point `-buffer-dir` at a node-local persistent path (e.g. under the agent's
 state hostPath) so the buffer survives pod restarts. Note that delivered-but-
 not-yet-reclaimed records linger until their whole segment is retired, so
 physical disk use can exceed the backlog cap by up to one segment (8 MiB).
+
+**Traces are not buffered — with one exception.** A forwarded trace is still
+held by the application that pushed it, and its SDK's retry is a better
+durability story than a queue that would ack that sender and remove the only
+other copy; so `ExportTraces` passes straight through. The exception is a
+**tail-sampling decision** on the trace tier
+([below](#agent-tail-sampling)): those spans were acked when they were buffered
+for the decision window, so nothing else holds them by the time a verdict ships.
+Such a payload marks itself as owned and is spooled like any log batch, into a
+third queue (`traces/`) that is opened only where tail sampling runs. Its
+occupancy shows up as `kubescrape_buffer_backlog_bytes{signal="traces"}`,
+alongside the `_max_bytes` and `_segments` gauges the other signals publish.
 
 ## Agent: journald
 
@@ -1157,9 +1169,9 @@ the next one decides.
 **Spans are acked to their sender before their trace is decided.** They must be:
 holding the push open for the decision window would pin one of the receiver's
 in-flight slots for five seconds and stall every application in the cluster. The
-consequence is the one departure in kubescrape from ack-after-delivery — buffered
-spans are **lost if the shard is hard-killed** (SIGKILL, OOM, node failure).
-Nothing is spooled and no sender still holds them.
+consequence is the one departure in kubescrape from ack-after-delivery — spans
+that are buffered but **not yet decided** are lost if the shard is hard-killed
+(SIGKILL, OOM, node failure). No sender still holds them.
 
 The exposure is bounded and visible:
 
@@ -1173,25 +1185,70 @@ The exposure is bounded and visible:
   `kubescrape_tail_sampling_buffered_traces` are exactly what a hard kill would
   lose at that instant.
 
-A decided trace whose export fails is retried a few times and then dropped and
-counted (`kubescrape_tail_sampling_spans_total{outcome="lost"}`) — by then nobody
-else holds it either. The exception is a span arriving for an already-decided
-trace: it is forwarded on the receiving goroutine, and a failure there *fails the
-push*, so the sender's retry recovers it (at the price of the still-buffering
-spans in that payload being buffered twice — the same at-least-once trade the
-re-shard hop makes).
+### Decided traces are durable with `-buffer-dir`
+
+Once a trace has been **decided**, the ack-first argument no longer applies: its
+sender was told the spans had landed seconds ago and holds nothing. So a decided
+keep is **spooled to disk** when the tier runs with `-buffer-dir`, exactly like a
+log or metric batch — a collector outage becomes a backlog that survives a
+restart, not `{outcome="lost"}`.
+
+This is a deliberate exception to the rule that the disk buffer passes traces
+through unbuffered, and it is made per payload rather than per signal. The same
+exporter also carries plain forwarded traces from the tier's application
+listener, and those must keep passing through: the pushing SDK still holds them
+and retries, and spooling would ack that sender for data that has not shipped.
+A third spool directory (`traces/`) is opened only on a workload where tail
+sampling actually runs; everywhere else nothing marks a trace payload and the
+behaviour is unchanged.
+
+Without `-buffer-dir`, a decided trace whose export fails is retried a few times
+and then dropped and counted
+(`kubescrape_tail_sampling_spans_total{outcome="lost"}`) — by then nobody else
+holds it either. With it, that counter moves only if the spool itself refuses the
+payload (full, or a failed fsync).
+
+Either way there is one further exception: a span arriving for an
+already-decided trace is forwarded on the receiving goroutine, and a failure
+there *fails the push*, so the sender's retry recovers it (at the price of the
+still-buffering spans in that payload being buffered twice — the same
+at-least-once trade the re-shard hop makes).
 
 ### Memory
 
-Budget **~1 KiB per buffered span** (a minimal two-attribute span measures
-~365 B; add ~470 B once per pushed payload per trace for the resource copy). The
-default `maxSpans: 200000` is therefore roughly 100–300 MiB.
+The sizing rule, in one line:
+
+> **`maxSpans` × 1 KiB must fit in a quarter of the pod's memory limit.**
+
+At a 1 GiB limit that is ~262 000 spans; the default `maxSpans: 200000` is about
+200 MiB of spans. The per-span figure is measured: a minimal two-attribute span
+is ~365 B, a realistic one ~1 KiB, plus one resource copy per pushed payload per
+trace (~320 B with a bare `service.name`, ~1040 B with the attribute set the
+tier's enricher stamps). The quarter leaves room for the pairing store, the span
+metrics, the exporter and Go's heap slack.
+
+**It is checked at startup**, against the container's cgroup memory limit (or the
+host's RAM when the pod is uncapped):
+
+* an unset `maxSpans` is **lowered** to what the limit affords, with a warning
+  naming the arithmetic;
+* an explicit `maxSpans` above the budget share is honoured with a warning;
+* an explicit `maxSpans` whose spans alone would need the **whole** limit is
+  **refused** — that config reaches its own ceiling only by being OOM-killed
+  first, and an OOM loses every buffered span at once.
+
+That refusal exists because the loss mode here is self-correlated: the likeliest
+hard kill of this workload is the OOM its own buffer causes, so raising
+`maxSpans` to avoid early decisions raises the odds of the event that loses
+everything buffered. Early decisions are the relief valve; the OOM is the
+failure.
 
 The arithmetic to do before enabling it: a shard receiving *R* spans/second holds
 `R × decisionWait` spans. At **50 000 spans/s** with a 5 s window that is
 **250 000 spans (~250 MiB)** — above the default, so the ceiling would bind and
-the oldest traces would be decided about a second early. Either raise `maxSpans`
-(memory scales linearly) or add shards (the ring divides *R* by the shard count).
+the oldest traces would be decided about a second early. If that exceeds the
+pod's budget, the answer is **more shards** (the ring divides *R* by the shard
+count), not a bigger number.
 
 At every bound the **oldest** trace is *decided early* rather than evicted
 unjudged — the policy engine treats a partial trace as a lower bound, so an early
@@ -1205,12 +1262,26 @@ to reveal. Each is counted separately with the bound that caused it:
 
 A span whose trace has already been decided follows that verdict from the
 decision cache — forwarded immediately on a keep, dropped on a drop
-(`kubescrape_tail_sampling_late_spans_total{outcome}`). Past the cache's size cap
-or TTL the trace is unknown again and the span starts a **fresh window**, which
-may decide that trace a second time; every policy but `rateLimiting` and
-`composite` answers identically, and those two are charged twice.
-`kubescrape_tail_sampling_cache_evictions_total` moving means
-`decisionCacheSize` is too small for the arrival pattern.
+(`kubescrape_tail_sampling_late_spans_total{outcome}`). Past `decisionCacheTTL`
+the verdict no longer applies and the span starts a **fresh window**, which may
+decide that trace a second time; every policy but `rateLimiting` and `composite`
+answers identically.
+
+Those two spend a spans/second budget, and a re-decision must not spend it twice
+— a trace's own stragglers would otherwise shrink the budget available to
+genuinely new traces. So the cache entry has **two lifetimes**: the *verdict*
+expires at `decisionCacheTTL` (a straggler later than that really is a new
+trace), while the record that this trace was decided **at all** lives until the
+entry is evicted by `decisionCacheSize`. A re-decision within that window checks
+the budget instead of charging it.
+
+Eviction under the size cap is therefore the one thing that still double-charges,
+and it is exactly what `kubescrape_tail_sampling_cache_evictions_total` counts —
+only for entries whose verdict was still live, since reclaiming an expired
+tombstone is the cache working. If it moves, `decisionCacheSize` is too small for
+the arrival pattern. Note that the cache now fills to its cap and stays there
+(~100 B an entry, so the 100000 default is ~10 MB at full occupancy) rather than
+also draining by age.
 
 ### Composition
 
@@ -1225,9 +1296,33 @@ only the sampled subset ships. The two samplers **nest** rather than compound:
 both hash the trace id with the same unsalted hash against the same threshold
 arithmetic, so `probabilistic: {samplingPercentage: 50}` keeps exactly the traces
 `traceSampling: {probability: 0.5}` already passed, instead of halving them
-again. One caveat: `traceSampling`'s guard rails (`keepErrors`,
-`keepSlowerThan`) are per **span**, so with them on a trace can reach the buffer
-as a fragment — which the policies then judge as a fragment.
+again.
+
+**The supported combination**, spelled out, because only part of `traceSampling`
+is safe below a tail sampler:
+
+| `traceSampling` field | Below `tailSampling` |
+|---|---|
+| `probability` | **safe** — the two nest exactly (same unsalted trace-id hash, same threshold) |
+| `maxSpansPerSecond` | **safe enough** — an overload valve; when it bites it truncates traces, and the tail sampler judges the truncation |
+| `keepErrors` | **unsafe** — per **span** |
+| `keepSlowerThan` | **unsafe** — per **span** |
+
+The guard rails rescue individual spans of traces the probability already
+dropped, so the tail sampler is handed a trace that is only its error (or slow)
+spans and judges *that* as if it were the trace — latency reads a lower bound, an
+inverted attribute exclusion can miss the span that would have vetoed — and may
+then export it, which is a trace that never existed.
+
+Setting both sections therefore emits a **startup warning** (and a
+`-check-config` one) naming the offending fields. It is a warning rather than a
+refusal because `keepErrors` defaults to *on*: refusing would reject
+`traceSampling: {probability: 0.1}` next to any `tailSampling` section — the most
+natural composition there is — and would make the same effective config legal or
+illegal depending on whether the operator spelled the default out. The fix is one
+line: set `keepErrors: false`, drop `keepSlowerThan`, and express the same intent
+as tail policies (`statusCode: {statusCodes: [ERROR]}`, `latency`), which judge
+whole traces and are strictly better at it.
 
 ## Agent: metrics scraping
 

@@ -693,6 +693,15 @@ retriable) is recovered by an automatic close-and-reopen; the affected batch
 redelivers. This is the Fluent-Bit-style `filesystem` buffer: it
 absorbs outages up to the cap instead of pinning to source files.
 
+It buffers logs and metrics. **Traces pass through it**, deliberately: a
+forwarded trace is still held by the application that pushed it, and its SDK's
+retry is a better durability story than a queue that would ack that sender and
+remove the only other copy. The single exception is a **tail-sampling decision**
+on the trace tier — those spans were acked when they were *buffered* for the
+decision window, so by the time the verdict ships nobody else holds them. Such a
+payload marks itself as owned and is spooled like any log batch; a third queue
+(`traces/`) is opened for it, and only where tail sampling actually runs.
+
 **Metrics.** Each `-scrape-interval` the agent fetches
 `GET /v1/nodes/$NODE/targets` and scrapes every target concurrently
 (bounded by `-scrape-concurrency`). The exposition body is **stream-parsed**
@@ -929,17 +938,26 @@ tailSampling:
 that is worth reading twice: a pushed span must be acked *before* its trace is
 decided, or the push would hold one of the receiver's in-flight slots for the
 whole window and stall every sender. Buffered-but-undecided spans are therefore
-**lost if the shard is hard-killed** (SIGKILL, OOM, node failure) — nothing is
-spooled and no sender still holds them. The exposure is bounded by
-`decisionWait`, by `maxSpans`, and by the graceful-shutdown flush (a SIGTERM or a
-rolling update decides everything buffered and exports the keeps, so a normal
-restart loses nothing); and it is visible before it is spent —
-`kubescrape_tail_sampling_buffered_spans` is exactly what a hard kill would lose
-at that instant. At each memory bound the oldest trace is **decided early**
-rather than evicted unjudged, counted in
-`kubescrape_tail_sampling_early_decisions_total`. See
-[docs/CONFIGURATION.md](docs/CONFIGURATION.md#agent-tail-sampling) for the memory
-arithmetic (50k spans/s × 5s = 250k buffered spans) and the late-span cache.
+**lost if the shard is hard-killed** (SIGKILL, OOM, node failure) — no sender
+still holds them. The exposure is bounded by `decisionWait`, by `maxSpans`, and
+by the graceful-shutdown flush (a SIGTERM or a rolling update decides everything
+buffered and exports the keeps, so a normal restart loses nothing); and it is
+visible before it is spent — `kubescrape_tail_sampling_buffered_spans` is exactly
+what a hard kill would lose at that instant. At each memory bound the oldest
+trace is **decided early** rather than evicted unjudged, counted in
+`kubescrape_tail_sampling_early_decisions_total`.
+
+Once a trace *is* decided, `-buffer-dir` makes the keep **durable**: a decided
+trace is spooled to disk like logs and metrics, so a collector outage becomes a
+backlog rather than `{outcome="lost"}`. That is an exception to the rule that
+traces pass through the disk buffer unbuffered, and only this path gets it — a
+plain forwarded trace is still held by the application that pushed it, and
+spooling would ack a sender whose retry was the durability. Because a hard kill
+here is most likely the OOM this buffer itself causes, `maxSpans` is checked
+against the pod's memory limit at startup: an unset ceiling is lowered to fit,
+and one that could only OOM is refused. See
+[docs/CONFIGURATION.md](docs/CONFIGURATION.md#agent-tail-sampling) for the sizing
+rule and the late-span cache.
 
 ### Traces: the trace tier
 

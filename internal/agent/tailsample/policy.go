@@ -586,10 +586,21 @@ func compileRateLimiting(where string, cfg *RateLimitingConfig) (policy, error) 
 // that samples spends nothing here — which is what makes "keep all errors, then
 // rate-limit the rest" mean what it reads like.
 func (p *ratePolicy) eval(t Trace, now time.Time) (verdict, string) {
-	if p.b.admit(float64(len(t.Spans)), now) {
+	if charge(p.b, float64(len(t.Spans)), now, t.Charged) {
 		return verdictSample, ""
 	}
 	return verdictAbstain, ""
+}
+
+// charge spends n against b — or, when the trace was already charged by an
+// earlier decision (Trace.Charged), merely checks that it would fit. A
+// re-decision must not bill the same trace twice: the budget is a rate of spans
+// leaving, and these spans were counted the first time.
+func charge(b *bucket, n float64, now time.Time, already bool) bool {
+	if already {
+		return b.peek(n, now)
+	}
+	return b.admit(n, now)
 }
 
 // bucket is a token bucket over spans/second, shared by rateLimiting and by
@@ -634,6 +645,20 @@ func (b *bucket) admit(n float64, now time.Time) bool {
 	}
 	b.tokens -= n
 	return true
+}
+
+// peek answers admit's question WITHOUT spending anything, for a trace that was
+// already charged (see charge). It does not even bank the refill: leaving the
+// bucket's state entirely untouched is what makes a re-decision invisible to
+// every trace being decided for the first time.
+func (b *bucket) peek(n float64, now time.Time) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	tokens := b.tokens
+	if !b.last.IsZero() {
+		tokens = min(b.burst, tokens+b.rate*now.Sub(b.last).Seconds())
+	}
+	return tokens >= min(n, b.burst)
 }
 
 // --- and --------------------------------------------------------------------
@@ -831,7 +856,7 @@ func (p *compositePolicy) eval(t Trace, now time.Time) (verdict, string) {
 		case verdictVeto:
 			return verdictVeto, sub.name
 		case verdictSample:
-			if sub.b.admit(n, now) {
+			if charge(sub.b, n, now, t.Charged) {
 				return verdictSample, sub.name
 			}
 		}

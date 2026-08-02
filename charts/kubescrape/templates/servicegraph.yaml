@@ -1,0 +1,272 @@
+{{- if .Values.serviceGraph.enabled }}
+{{- /*
+  Service-graph EDGE metrics need BOTH halves of a request — the caller's
+  CLIENT span and the callee's SERVER span — and those two spans are produced
+  by two pods that usually run on two different nodes. A DaemonSet agent holds
+  half of every edge by construction, and no amount of per-node aggregation
+  completes it. (This is exactly the opposite of -ingest-span-metrics, where
+  every span is aggregated INDEPENDENTLY, so the per-node cumulative counters
+  simply sum cluster-wide and no extra tier is needed.)
+
+  Pairing therefore runs on its own tier: each agent hashes a span by TRACE ID
+  onto a ring and forwards a TRIMMED copy to the shard that owns that trace,
+  which sees both halves and emits the edge. That is Grafana Tempo's
+  distributor -> metrics-generator split, with Tempo's hash (FNV-1 32-bit over
+  the trace id) and Tempo's metric names, because Grafana's Service Graph view
+  queries those names and labels verbatim.
+
+  A StatefulSet, not a Deployment: the ring addresses each shard by its STABLE
+  ORDINAL DNS NAME (<sts>-<i>.<svc>.<ns>.svc), and every agent must derive the
+  IDENTICAL ring — two agents disagreeing about the shard set send a request's
+  two halves to two different shards and the edge silently never forms. A
+  Deployment's pods have neither stable names nor individually addressable DNS,
+  so there would be nothing to derive the ring from. There is no
+  volumeClaimTemplate: the pairing state is in-memory by design (a half-edge is
+  worth no more than the `wait` window that bounds it), so the StatefulSet is
+  bought for NAMES, not for storage.
+
+  The tier needs no ServiceAccount of its own and no RBAC: it talks to the
+  metadata service over HTTP like any agent, and to the collector over OTLP.
+  Nothing here reads the Kubernetes API.
+*/}}
+{{- $cfg := fromYaml (include "kubescrape.agentConfig" .) }}
+{{- $sg := .Values.serviceGraph }}
+{{- $port := int $sg.port }}
+{{- $tokenPath := printf "/etc/kubescrape/service-graph/%s" ($sg.tokenSecret.key | default "token") }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Release.Name }}-servicegraph
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: {{ .Release.Name }}-servicegraph
+    {{- include "kubescrape.labels" . | nindent 4 }}
+spec:
+  # HEADLESS (clusterIP: None). This Service exists for the per-pod DNS names
+  # it publishes — <release>-servicegraph-0.<release>-servicegraph.<ns>.svc —
+  # which are what the agents' ring addresses. A normal ClusterIP would
+  # round-robin, i.e. send a trace's client half to one shard and its server
+  # half to another: the one failure mode the ring exists to prevent.
+  clusterIP: None
+  # Shards must be addressable while they are still filling their pairing
+  # window (and during a rolling restart), or the agents' forwards fail for
+  # the whole readiness delay and those edges are lost rather than delayed.
+  publishNotReadyAddresses: true
+  selector:
+    app: {{ .Release.Name }}-servicegraph
+  ports:
+    # Only the receiver port: the pods' own health and metrics ports are
+    # reached directly (kubelet probes, prometheus.io/* discovery), not
+    # through this Service.
+    - name: service-graph
+      port: {{ $port }}
+      targetPort: service-graph
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ .Release.Name }}-servicegraph
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: {{ .Release.Name }}-servicegraph
+    {{- include "kubescrape.labels" . | nindent 4 }}
+spec:
+  # The governing headless Service above. Without it the pods get no stable
+  # DNS names and the ring addresses nothing.
+  serviceName: {{ .Release.Name }}-servicegraph
+  # This number IS part of the ring definition: the agents are told the same
+  # count (-service-graph-shards) and derive shard names from it. Scaling the
+  # tier means a `helm upgrade`, not a `kubectl scale` — an agent addressing
+  # the old width keeps working (it simply never uses the new shards), but a
+  # count LARGER than the StatefulSet's addresses pods that do not exist and
+  # their traces are never paired.
+  replicas: {{ int64 $sg.replicas }}
+  # Shards are independent — nothing about pairing is ordered — and ordered
+  # startup would delay the last shard's traces for no benefit.
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      app: {{ .Release.Name }}-servicegraph
+  template:
+    metadata:
+      labels:
+        app: {{ .Release.Name }}-servicegraph
+      annotations:
+        {{- if $cfg }}
+        checksum/config: {{ $cfg | toYaml | sha256sum }}
+        {{- end }}
+        {{- if and .Values.metrics.enabled .Values.metrics.scrapeAnnotations }}
+        prometheus.io/scrape: "true"
+        prometheus.io/port: {{ (split ":" .Values.metrics.listen)._1 | quote }}
+        prometheus.io/path: /metrics
+        {{- end }}
+    spec:
+      # A shard restart drops whatever half-edges it was holding, so the
+      # shutdown budget matters here for the same reason it does elsewhere:
+      # the final service-graph and self-metrics exports run before exit.
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      {{- with $sg.priorityClassName }}
+      priorityClassName: {{ . }}
+      {{- end }}
+      {{- with $sg.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $sg.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: servicegraph
+          image: {{ include "kubescrape.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["/kubescrape-agent"]
+          args:
+            # Every per-node pipeline off: this tier only pairs forwarded
+            # spans. -ingest in particular stays off — the shard's receiver is
+            # -service-graph-listen below, a separate port that accepts only
+            # forwarded trace payloads.
+            - -logs=false
+            - -metrics=false
+            - -cadvisor=false
+            - -node-metrics=false
+            - -journald=false
+            - -ingest=false
+            - -metadata-endpoint=http://{{ .Release.Name }}.{{ .Release.Namespace }}
+            - -listen={{ .Values.agent.listen }}
+            - -self-metrics-interval={{ .Values.agent.selfMetricsInterval }}
+            - -service-graph
+            - -service-graph-listen=:{{ $port }}
+            {{- if $sg.tokenSecret.name }}
+            # The receiver is reachable from every pod in the cluster, so the
+            # hop is authenticated. Same token file on both sides (see the
+            # DaemonSet), re-read periodically so rotating the Secret needs no
+            # restart. Without it the binary refuses to open the listener.
+            - -service-graph-token-file={{ $tokenPath }}
+            {{- end }}
+            - -otlp-endpoint={{ .Values.agent.otlp.endpoint }}
+            - -otlp-protocol={{ .Values.agent.otlp.protocol }}
+            - -otlp-compression={{ .Values.agent.otlp.compression }}
+            - -otlp-compression-level={{ int64 .Values.agent.otlp.compressionLevel }}
+            - -otlp-insecure={{ .Values.agent.otlp.insecure }}
+            - -otlp-tls-insecure-skip-verify={{ .Values.agent.otlp.tlsInsecureSkipVerify }}
+            {{- with .Values.agent.otlp.caFile }}
+            - -otlp-tls-ca-file={{ . }}
+            {{- end }}
+            - -otlp-timeout={{ .Values.agent.otlp.timeout }}
+            {{- if .Values.agent.otlp.bearerTokenSecret.name }}
+            - -otlp-bearer-token-file=/etc/kubescrape/otlp-token/{{ .Values.agent.otlp.bearerTokenSecret.key }}
+            {{- end }}
+            {{- if $cfg }}
+            # The same rendered agent config as the DaemonSet: its
+            # `serviceGraph` section (wait / maxItems / maxCardinality /
+            # staleAfter / histogramBuckets / dimensions) is this tier's
+            # tuning, and its `serviceGraphShards.dimensions` is the agents'
+            # matching half — one file keeps the two from drifting.
+            - -config=/etc/kubescrape/config/config.yaml
+            {{- end }}
+            - -metrics-listen={{ if .Values.metrics.enabled }}{{ .Values.metrics.listen }}{{ end }}
+            - -log-level={{ .Values.logLevel }}
+            - -log-format={{ .Values.logFormat }}
+            {{- with $sg.extraArgs }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          env:
+            # The agent binary wants a node name for its own self-metrics
+            # identity; the edges it emits never carry it (an edge is a
+            # property of the two services, not of the shard that paired it).
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef: {fieldPath: spec.nodeName}
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef: {fieldPath: metadata.namespace}
+            # Identity for the self-metadata by-name fallback (the hostname is
+            # not the pod's name when the pod shares the host's namespaces).
+            - name: POD_NAME
+              valueFrom:
+                fieldRef: {fieldPath: metadata.name}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 65532
+            capabilities:
+              drop: ["ALL"]
+          ports:
+            - name: http
+              containerPort: {{ (split ":" .Values.agent.listen)._1 | int }}
+            {{- if .Values.metrics.enabled }}
+            - name: metrics
+              containerPort: {{ (split ":" .Values.metrics.listen)._1 | int }}
+            {{- end }}
+            - name: service-graph
+              containerPort: {{ $port }}
+          readinessProbe:
+            httpGet: {path: /readyz, port: http}
+          livenessProbe:
+            httpGet: {path: /healthz, port: http}
+          {{- $anyVolume := or $cfg .Values.agent.otlp.bearerTokenSecret.name $sg.tokenSecret.name }}
+          {{- if $anyVolume }}
+          volumeMounts:
+            {{- if $cfg }}
+            - name: config
+              mountPath: /etc/kubescrape/config
+              readOnly: true
+            {{- end }}
+            {{- if .Values.agent.otlp.bearerTokenSecret.name }}
+            - name: otlp-token
+              mountPath: /etc/kubescrape/otlp-token
+              readOnly: true
+            {{- end }}
+            {{- if $sg.tokenSecret.name }}
+            - name: service-graph-token
+              mountPath: /etc/kubescrape/service-graph
+              readOnly: true
+            {{- end }}
+          {{- end }}
+          resources: {{ toYaml $sg.resources | nindent 12 }}
+      {{- if $anyVolume }}
+      volumes:
+        {{- if $cfg }}
+        - name: config
+          configMap:
+            name: {{ .Release.Name }}-agent-config
+        {{- end }}
+        {{- if .Values.agent.otlp.bearerTokenSecret.name }}
+        - name: otlp-token
+          secret:
+            secretName: {{ .Values.agent.otlp.bearerTokenSecret.name }}
+        {{- end }}
+        {{- if $sg.tokenSecret.name }}
+        - name: service-graph-token
+          secret:
+            secretName: {{ $sg.tokenSecret.name }}
+        {{- end }}
+      {{- end }}
+{{- if .Values.networkPolicy.enabled }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ .Release.Name }}-servicegraph
+  namespace: {{ .Release.Namespace }}
+  labels: {{ include "kubescrape.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app: {{ .Release.Name }}-servicegraph
+  policyTypes: [Ingress]
+  ingress:
+    - ports:
+        # Health/readiness (the kubelet probes these), the scrape port when
+        # enabled, and the span receiver — which every agent must reach, so it
+        # carries no `from` selector; the bearer token, not the network, is
+        # what authenticates that hop. Undeclared ports (pprof) stay closed.
+        - port: {{ (split ":" .Values.agent.listen)._1 | int }}
+        {{- if .Values.metrics.enabled }}
+        - port: {{ (split ":" .Values.metrics.listen)._1 | int }}
+        {{- end }}
+        - port: {{ $port }}
+{{- end }}
+{{- end }}

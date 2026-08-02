@@ -208,6 +208,118 @@ var (
 		"Span-metric series dropped at export because their dimensions went unobserved for traceMetrics.staleAfter (this is what frees cardinality-cap slots).")
 )
 
+// Service-graph edges (the -service-graph shard). Every one of these counts a
+// place where the graph is INCOMPLETE, and each names the config bound that
+// caused it, because all three bounds trade completeness for memory and an
+// operator has to be able to see which one is binding: an edge missing from
+// Grafana's Service Graph view looks exactly like a call that never happened.
+var (
+	ServiceGraphDropped = Registry.Counter("kubescrape_service_graph_dropped_total",
+		"Edges not aggregated because the serviceGraph.maxCardinality series cap was reached (existing edges keep reporting; a new one is lost until eviction frees a slot).")
+	ServiceGraphEvicted = Registry.Counter("kubescrape_service_graph_evicted_total",
+		"Edge series dropped at export because they went unobserved for serviceGraph.staleAfter (this is what frees cardinality-cap slots).")
+	// ServiceGraphStoreFull is the pairing store's back-pressure. It is bumped
+	// per SPAN, not per edge: the span is never stored, so its partner will
+	// later expire unpaired too, and both counters move for one lost request.
+	ServiceGraphStoreFull = Registry.Counter("kubescrape_service_graph_store_full_total",
+		"Spans dropped because the pairing store held serviceGraph.maxItems half-edges (the request cannot become an edge).")
+	// ServiceGraphExpired is the OTHER shape of an incomplete graph, and a
+	// non-zero baseline is normal: a client half whose server is uninstrumented
+	// expires by design (and may then become a virtual-node edge). A RISING rate
+	// means serviceGraph.wait is shorter than the real client-to-server span
+	// delivery gap, or the two halves are landing on different shards.
+	ServiceGraphExpired = Registry.Counter("kubescrape_service_graph_expired_total",
+		"Half-edges that expired after serviceGraph.wait without their partner arriving.")
+	// ServiceGraphConfigMismatch is the one counter here that names a CONFIG
+	// error rather than a bound. The agents trim forwarded spans to their own
+	// dimension/peer-attribute lists, so a shard configured to read anything
+	// else reads attributes that were never sent: the graph still renders, with
+	// empty dimension labels and no virtual nodes. It is counted per forwarded
+	// RESOURCE (the unit the agent's declaration rides on), so the rate says how
+	// much of the graph's input is affected; the shard log names both sides
+	// once per distinct disagreement.
+	ServiceGraphConfigMismatch = Registry.Counter("kubescrape_service_graph_config_mismatch_total",
+		"Forwarded resources whose agent-side serviceGraphShards.dimensions/peerAttributes disagree with this shard's serviceGraph.dimensions/virtualNodePeerAttributes. The agent trims away what the shard reads, so those dimensions render as EMPTY labels and those peer attributes synthesize no virtual node. Always zero when both sides are configured from the same values; anything else is a config error to fix now (the shard logs both lists once per distinct mismatch).")
+)
+
+// RegisterServiceGraphStats publishes the pairing store's own numbers on the
+// shard (-service-graph): what pairing ACHIEVED, plus the one leading
+// indicator the counters above cannot give.
+//
+// The counters above all move only once the graph has already lost something.
+// The pending gauge is the backlog against serviceGraph.maxItems — "the store
+// is at 80% and climbing" — the same reason RegisterBufferStats exists beside
+// the disk buffer's drop counters. Completed is what makes the rest readable:
+// an expiry rate means nothing without the pairing rate it is a fraction of.
+//
+// Published through a registration function because the values are owned by
+// servicegraph's store, which obs cannot reach — that package imports obs, so
+// the dependency runs one way only. ServiceGraphStat mirrors
+// servicegraph.Stats for exactly that reason.
+//
+// Stats.Dropped and Stats.Unpaired are deliberately NOT published here: the
+// first is already kubescrape_service_graph_store_full_total, and the second is
+// kubescrape_service_graph_expired_total minus the virtual-node counter below
+// (every expiry goes exactly one of those two ways). A second series carrying a
+// number two others already determine is one more thing to keep consistent.
+func RegisterServiceGraphStats(stats func() ServiceGraphStat) {
+	Registry.GaugeFunc("kubescrape_service_graph_pending_edges",
+		"Half-edges currently awaiting their partner. serviceGraph.maxItems caps this; at the cap spans are refused (see kubescrape_service_graph_store_full_total), so the ratio against the cap is the leading indicator.",
+		func() float64 { return float64(stats().Pending) })
+	Registry.CounterFunc("kubescrape_service_graph_completed_total",
+		"Edges completed by BOTH halves arriving within serviceGraph.wait. The denominator for the loss counters: an expiry or drop rate only means something against the rate of pairings that worked.",
+		func() float64 { return float64(stats().Completed) })
+	Registry.CounterFunc("kubescrape_service_graph_virtual_node_total",
+		"Half-edges that expired unpaired but named their far side through serviceGraph.virtualNodePeerAttributes, and so still reached the graph (as a virtual-node edge). The remainder of kubescrape_service_graph_expired_total is the genuinely lost part — nothing named the missing side, so that request is on no edge at all.",
+		func() float64 { return float64(stats().VirtualNode) })
+	Registry.CounterFunc("kubescrape_service_graph_unkeyable_total",
+		"Spans that could not be keyed for pairing because they carried no trace id (never stored: every zero id shares one key space and would cross-pair unrelated requests into invented edges). A moving rate means an SDK is emitting malformed spans.",
+		func() float64 { return float64(stats().Unkeyable) })
+}
+
+// ServiceGraphStat is the pairing store's snapshot (servicegraph.Stats' shape).
+type ServiceGraphStat struct {
+	Pending     int
+	Completed   uint64
+	VirtualNode uint64
+	Unkeyable   uint64
+}
+
+// RegisterServiceGraphForwarder publishes the AGENT side of the service graph:
+// what this node handed to the shard tier, and what it failed to.
+//
+// Nothing else counts this hop. The wire outcome of each shard send lands in
+// kubescrape_export_requests_total{signal="traces"} together with the ordinary
+// collector exports, which is exactly where a broken graph hop hides — the
+// forward is best-effort by design (Forward never returns an error, because
+// losing an edge must never cost a span), so a shard tier that is down or
+// unreachable produces NO other symptom on the agent: the sender's push
+// succeeds, the collector gets its spans, and only the graph is quietly empty.
+func RegisterServiceGraphForwarder(stats func() ServiceGraphForwardStat) {
+	Registry.CounterFunc("kubescrape_service_graph_spans_forwarded_total",
+		"Spans handed to a service-graph shard (delivered or not). Far below the ingested span count by design: INTERNAL spans and spans with no trace id can never form an edge and are dropped before the hop.",
+		func() float64 { return float64(stats().SpansForwarded) })
+	Registry.CounterFunc("kubescrape_service_graph_spans_lost_total",
+		"Spans in a shard send that failed. They are gone — the graph is best-effort and the sender's own export already succeeded — so the edges they would have formed are missing from the graph, indistinguishable there from calls that never happened.",
+		func() float64 { return float64(stats().SpansLost) })
+	Registry.CounterFunc("kubescrape_service_graph_sends_failed_total",
+		"Failed sends to a service-graph shard (one per shard per batch). A rate that tracks one shard's outage means only that shard's arc of the ring is missing from the graph; a rate across all of them means the tier or the token is wrong.",
+		func() float64 { return float64(stats().SendsFailed) })
+	Registry.CounterFunc("kubescrape_service_graph_loops_blocked_total",
+		"Payloads refused because they already carried the forwarded marker: a shard tier pointed at itself or at the agents' own ingest port, which would multiply every span by the fan-out on every hop. Always zero in a correct deployment; anything else is a config error to fix now.",
+		func() float64 { return float64(stats().LoopsBlocked) })
+}
+
+// ServiceGraphForwardStat is the forwarder's snapshot
+// (servicegraph.ForwardStats' shape; see RegisterServiceGraphStats on why obs
+// declares its own).
+type ServiceGraphForwardStat struct {
+	SpansForwarded uint64
+	SpansLost      uint64
+	SendsFailed    uint64
+	LoopsBlocked   uint64
+}
+
 // Journald drops (agent).
 var (
 	JournalDropped = Registry.Counter("kubescrape_journal_dropped_batches_total",

@@ -16,6 +16,7 @@ import (
 	"github.com/JohanLindvall/kubescrape/internal/agent/otlpexport"
 	"github.com/JohanLindvall/kubescrape/internal/agent/promscrape"
 	"github.com/JohanLindvall/kubescrape/internal/agent/route"
+	"github.com/JohanLindvall/kubescrape/internal/agent/servicegraph"
 	"github.com/JohanLindvall/kubescrape/internal/agent/spanmetrics"
 	"github.com/JohanLindvall/kubescrape/internal/agent/tailer"
 	"github.com/JohanLindvall/kubescrape/internal/agent/tracesample"
@@ -54,6 +55,21 @@ type agentConfig struct {
 	// log bodies in the tailer, journald and OTLP-ingest paths, before any
 	// enrichment copies from them.
 	LogScrubbing *logscrub.Config `json:"logScrubbing,omitempty"`
+	// ServiceGraph tunes the pairing SHARD (-service-graph): the wait window,
+	// the store and series caps, the latency buckets and the extra dimensions.
+	// It is read only by that role; the chart mounts the same rendered config
+	// on both workloads, which is what keeps it from drifting apart from the
+	// agents' matching serviceGraphShards.dimensions below.
+	ServiceGraph *servicegraph.Config `json:"serviceGraph,omitempty"`
+	// ServiceGraphShards is the agents' half: where the shard tier is and how
+	// to reach it. The flags (-service-graph-shards/-service-graph-endpoint/
+	// -service-graph-token-file) express the shape the chart renders; this
+	// section is the richer form — explicit endpoints for a tier outside
+	// Kubernetes, TLS material, headers, tokensPerShard — plus the
+	// dimensions/peerAttributes that MUST match the shard's, since a dimension
+	// the agent trims away is a label the shard can only render empty. It wins
+	// field by field where both are set (see serviceGraphShardConfig).
+	ServiceGraphShards *servicegraph.ForwardConfig `json:"serviceGraphShards,omitempty"`
 	// TraceSampling drops ingested spans before forwarding: consistent
 	// trace-ID probabilistic sampling with keep-errors/keep-slow guard rails
 	// and a spans/second cap. Span metrics still see 100% of spans (the
@@ -152,6 +168,31 @@ func validateConfig(cfg agentConfig, transformsFile string) error {
 		if err := cfg.TraceSampling.Validate(); err != nil {
 			return fmt.Errorf("traceSampling: %w", err)
 		}
+	}
+	// Both service-graph sections are shape-only (no DNS, no filesystem, no
+	// namespace resolution), so the dry run runs exactly what a start does.
+	if err := cfg.ServiceGraph.Validate(); err != nil { // nil-receiver safe
+		return fmt.Errorf("serviceGraph: %w", err)
+	}
+	// The shard's receiver takes forwarded spans from every pod in the cluster,
+	// so it is refused unauthenticated — HERE rather than at the listener, so
+	// -check-config catches it before the StatefulSet CrashLoops. (The chart
+	// renders -service-graph with no token flag when no Secret is configured,
+	// precisely so this refusal is what an operator sees.) Shape only: whether
+	// the file is readable and non-empty is checked at the real start, where
+	// it is equally fatal.
+	if *serviceGraphOn && strings.TrimSpace(*serviceGraphToken) == "" {
+		return fmt.Errorf("-service-graph requires -service-graph-token-file: the shard's span receiver is reachable from every pod in the cluster and must not be unauthenticated")
+	}
+	// The SAME merge of flags and section a real start uses, so the dry run
+	// cannot accept a shard set the start rejects (the flags participate: the
+	// chart configures this feature entirely through them).
+	shards, err := serviceGraphShardConfig(cfg.ServiceGraphShards)
+	if err != nil {
+		return err
+	}
+	if err := shards.Validate(); err != nil { // its messages already name the section
+		return err
 	}
 	// Shape-only (no filesystem, no network): file errors surface at the real
 	// start, where the clients are built.
@@ -270,6 +311,8 @@ func printConfigSummary(cfg agentConfig, log *slog.Logger) {
 	add("metrics", cfg.Metrics != nil)
 	add("traceMetrics", cfg.TraceMetrics != nil)
 	add("traceSampling", cfg.TraceSampling != nil)
+	add("serviceGraph", cfg.ServiceGraph != nil)
+	add("serviceGraphShards", cfg.ServiceGraphShards != nil)
 	add("routing", cfg.Routing != nil)
 	add("export", cfg.Export != nil)
 	if len(sections) == 0 {
@@ -278,8 +321,8 @@ func printConfigSummary(cfg agentConfig, log *slog.Logger) {
 
 	log.Info("config is valid",
 		"sections", strings.Join(sections, ","),
-		"pipelines", fmt.Sprintf("logs=%s metrics=%s cadvisor=%s node=%s journald=%s ingest=%s events=%s azure=%s",
-			on(*logsOn), on(*metricsOn), on(*cadvisorOn), on(*nodeOn), on(*journaldOn), on(*ingestOn), on(*eventsOn), on(*azureOn)),
+		"pipelines", fmt.Sprintf("logs=%s metrics=%s cadvisor=%s node=%s journald=%s ingest=%s events=%s azure=%s serviceGraph=%s",
+			on(*logsOn), on(*metricsOn), on(*cadvisorOn), on(*nodeOn), on(*journaldOn), on(*ingestOn), on(*eventsOn), on(*azureOn), on(*serviceGraphOn)),
 		"otlp-endpoint", *otlpEndpoint,
 		"otlp-protocol", *otlpProtocol,
 		"buffer-dir", *bufferDir,
@@ -295,6 +338,20 @@ func printConfigSummary(cfg agentConfig, log *slog.Logger) {
 		for _, rt := range cfg.Routing.Routes {
 			log.Info("routing route", "name", rt.Name, "namespaces", strings.Join(rt.Namespaces, ","), "endpoint", rt.Endpoint)
 		}
+	}
+	// The MERGED shard set, not the section: the chart configures this feature
+	// through flags alone, so printing the section would report "(none)" for
+	// the deployment the dry run most needs to describe. The shard count and
+	// the tier's name are the two things an operator gets wrong (a count that
+	// does not match the StatefulSet leaves traces unpaired, silently), so they
+	// are what the summary names.
+	if shards, err := serviceGraphShardConfig(cfg.ServiceGraphShards); err == nil && shards.Enabled() {
+		log.Info("service-graph forwarding", "shards", shards.Replicas, "statefulSet", shards.StatefulSet,
+			"namespace", shards.Namespace, "port", shards.Port, "endpoints", strings.Join(shards.Endpoints, ","))
+	}
+	if *serviceGraphOn {
+		log.Info("service-graph shard role", "listen", *serviceGraphListen, "httpListen", *serviceGraphHTTPListen,
+			"interval", *serviceGraphIv, "tokenFile", *serviceGraphToken)
 	}
 }
 

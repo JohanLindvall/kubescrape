@@ -898,11 +898,59 @@ traceSampling:
   maxSpansPerSecond: 500
 ```
 
+**Service-graph edges** (opt-in, and the one pipeline that needs a **workload
+of its own**). An edge — one series per caller→callee pair — needs *both*
+halves of a request: the caller's CLIENT span and the callee's SERVER span.
+Those are emitted by two pods that usually run on two different nodes, so the
+agent holding one half never sees the other, and no per-node aggregation can
+complete it. (Span metrics are the opposite case: each span is aggregated
+independently, so the per-node cumulative counters just sum — which is why
+`-ingest-span-metrics` needs no extra tier.) So the agents act as
+*distributors*: each hashes an ingested span by **trace ID** onto a ring and
+forwards a trimmed copy to the shard owning that trace, which sees both halves
+and emits the edge. That is Grafana Tempo's distributor → metrics-generator
+split, with Tempo's hash. The shard tier is a **StatefulSet**
+([charts/kubescrape/templates/servicegraph.yaml](charts/kubescrape/templates/servicegraph.yaml),
+`serviceGraph.enabled=true`, or
+[deploy/servicegraph.yaml](deploy/servicegraph.yaml)) because the ring
+addresses shards by their stable ordinal DNS names behind a headless Service —
+a load-balanced destination would round-robin a trace's two halves onto two
+shards, the exact failure the ring prevents. The forward hop is
+**authenticated** with a shared bearer token (`-service-graph-token-file` on
+both sides, re-read periodically): the receiver is reachable from every pod in
+the cluster, so the shard refuses to open it without one.
+
+The emitted series are Grafana **Service Graph** compatible on purpose — that
+view queries these exact names, so a better-reading name would render in
+nothing: `traces_service_graph_request_total`,
+`traces_service_graph_request_failed_total` and the two separate histograms
+`traces_service_graph_request_server_seconds` /
+`_request_client_seconds` (separate because the two sides are measured by
+different processes with unsynchronised clocks; each carries **exemplars**,
+one per latency bucket, pointing at the trace and at the span that measured
+*that* side — `serviceGraph.exemplars: false` turns them off). Labels are `client`, `server`,
+`connection_type` (empty, `messaging_system`, `database` or `virtual_node`),
+`virtual_node` when a side was synthesized, plus any configured `dimensions`
+as `client_<dim>`/`server_<dim>`. `wait`, `maxItems`, `maxCardinality` and
+`staleAfter` (config section `serviceGraph`) are the bounds that trade
+completeness for memory; each has a counter that moves when it binds, because
+a missing edge looks exactly like a call that never happened. **The limitation
+is structural**: an uninstrumented callee emits no server span, so its calls
+appear only as **virtual nodes** named from the client span's `peer.service` /
+`db.name` / `db.system` — and a client naming none of those yields no edge at
+all. The agents trim forwarded spans to their own configured `dimensions` /
+`peerAttributes`, which must match the shard's; a disagreement no longer fails
+silently — each agent declares its lists on every forwarded payload, and the
+shard logs it once per distinct mismatch (naming what will be lost) and counts
+`kubescrape_service_graph_config_mismatch_total`. See
+[docs/CONFIGURATION.md](docs/CONFIGURATION.md#agent-service-graph).
+
 **Pipeline toggles.** Each pipeline is individually switchable: `-logs`,
 `-metrics` (annotation-discovered targets), `-cadvisor` and `-node-metrics`
 (all default true; the kubelet scrapes additionally require
-`-kubelet-endpoint`), plus the opt-in `-journald`, `-ingest`, `-events` and
-`-azure-diagnostics`.
+`-kubelet-endpoint`), plus the opt-in `-journald`, `-ingest`, `-events`,
+`-azure-diagnostics` and `-service-graph` (the last on its own shard tier, not
+in the DaemonSet).
 
 **Self-observability.** The agent's own metrics — log entries/bytes/rotations
 and export failures, enrichment hit rates per format, scrapes and scrape

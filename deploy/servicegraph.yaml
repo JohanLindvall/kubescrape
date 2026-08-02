@@ -1,0 +1,174 @@
+# kubescrape service-graph shards: Grafana-Tempo-compatible EDGE metrics
+# (traces_service_graph_request_total and friends) derived by pairing each
+# request's CLIENT span with its SERVER span.
+#
+# Why this is a separate tier and not part of the DaemonSet: the two halves of
+# one request are emitted by two pods that usually run on two different NODES,
+# so the agent that receives the client span never sees the server span. No
+# per-node aggregation can complete an edge. (The RED metrics of
+# -ingest-span-metrics are the opposite case — each span is aggregated
+# independently, so the per-node cumulative counters sum cluster-wide.)
+#
+# Instead each agent hashes every ingested span by TRACE ID onto a ring and
+# forwards a trimmed copy to the shard owning that trace, which sees both
+# halves and emits the edge — Grafana Tempo's distributor -> metrics-generator
+# split, with Tempo's hash and Tempo's metric names.
+#
+# A StatefulSet, not a Deployment: the ring addresses shards by their stable
+# ordinal DNS names (kubescrape-servicegraph-0.kubescrape-servicegraph.
+# monitoring.svc), and every agent must derive the identical ring or a trace's
+# two halves land on two shards and the edge silently never forms. There is no
+# volumeClaimTemplate — the pairing state is in memory by design, so the
+# StatefulSet buys names, not storage. No ServiceAccount and no RBAC: this tier
+# reads the Kubernetes API not at all.
+#
+# Apply after deploy/kubernetes.yaml (the metadata service) and deploy/agent.yaml
+# (the DaemonSet that forwards the spans):
+#
+#   kubectl -n monitoring create secret generic kubescrape-service-graph \
+#     --from-literal=token="$(openssl rand -hex 24)"
+#   kubectl apply -f deploy/servicegraph.yaml
+#
+# and add to the DaemonSet in deploy/agent.yaml (it must already run -ingest
+# with -ingest-traces; those pushed spans are what gets forwarded):
+#
+#   - -service-graph-shards=2
+#   - -service-graph-endpoint=kubescrape-servicegraph.monitoring.svc:4319
+#   - -service-graph-token-file=/etc/kubescrape/service-graph/token
+#
+# with the same Secret mounted at /etc/kubescrape/service-graph. The shard
+# count must match .spec.replicas below: a larger count addresses pods that do
+# not exist and their traces are never paired.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: kubescrape-service-graph
+  namespace: monitoring
+type: Opaque
+stringData:
+  # PLACEHOLDER — replace it, or create the Secret with the command above
+  # instead of applying this object. The shard's receiver is reachable from
+  # every pod in the cluster, so the hop is authenticated by this shared token;
+  # without -service-graph-token-file the binary refuses to open the listener.
+  # Both sides re-read the file periodically, so rotation needs no restart.
+  token: "replace-me-with-a-random-token"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kubescrape-servicegraph
+  namespace: monitoring
+  labels:
+    app: kubescrape-servicegraph
+spec:
+  # Headless: this Service exists for the per-pod DNS names it publishes, which
+  # are what the ring addresses. A ClusterIP would round-robin — sending a
+  # trace's client half to one shard and its server half to another, the exact
+  # failure the ring exists to prevent.
+  clusterIP: None
+  # Shards stay addressable while they fill their first pairing window and
+  # during a rolling restart; otherwise those forwards fail outright rather
+  # than being delayed.
+  publishNotReadyAddresses: true
+  selector:
+    app: kubescrape-servicegraph
+  ports:
+    - name: service-graph
+      port: 4319
+      targetPort: service-graph
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: kubescrape-servicegraph
+  namespace: monitoring
+  labels:
+    app: kubescrape-servicegraph
+spec:
+  serviceName: kubescrape-servicegraph
+  # Must equal the agents' -service-graph-shards (see the header).
+  replicas: 2
+  # Shards are independent; ordered startup would delay the last one's traces
+  # for no benefit.
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      app: kubescrape-servicegraph
+  template:
+    metadata:
+      labels:
+        app: kubescrape-servicegraph
+    spec:
+      # Room for the final service-graph and self-metrics exports.
+      terminationGracePeriodSeconds: 60
+      containers:
+        - name: servicegraph
+          image: ghcr.io/johanlindvall/kubescrape:latest
+          imagePullPolicy: IfNotPresent
+          command: ["/kubescrape-agent"]
+          args:
+            - -service-graph
+            # The receiver for forwarded spans. Deliberately not 4317: that is
+            # the agents' own ingest port, and pointing the tier at it would
+            # loop spans back through the fan-out.
+            - -service-graph-listen=:4319
+            - -service-graph-token-file=/etc/kubescrape/service-graph/token
+            # Every per-node pipeline off: this tier only pairs forwarded
+            # spans. -ingest included — the span receiver above is its own
+            # port and its own path.
+            - -logs=false
+            - -metrics=false
+            - -cadvisor=false
+            - -node-metrics=false
+            - -ingest=false
+            - -metadata-endpoint=http://kubescrape.monitoring
+            - -otlp-endpoint=otel-collector.monitoring:4317
+            - -listen=:8081
+          env:
+            # The agent binary wants a node name for its own self-metrics
+            # identity; an edge never carries it (an edge is a property of the
+            # two services, not of the shard that paired them).
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef: {fieldPath: spec.nodeName}
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef: {fieldPath: metadata.namespace}
+            # Identity for the self-metadata by-name fallback (the hostname is
+            # not the pod's name when the pod shares the host's namespaces).
+            - name: POD_NAME
+              valueFrom:
+                fieldRef: {fieldPath: metadata.name}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 65532
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: service-graph-token
+              mountPath: /etc/kubescrape/service-graph
+              readOnly: true
+          ports:
+            - name: http
+              containerPort: 8081
+            - name: service-graph
+              containerPort: 4319
+          readinessProbe:
+            httpGet: {path: /readyz, port: http}
+          livenessProbe:
+            httpGet: {path: /healthz, port: http}
+          resources:
+            # Memory scales with the pairing store (maxItems) and the edge
+            # series count (maxCardinality), not with the cluster's span rate;
+            # CPU scales with the forwarded span rate over the shard count.
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              memory: 512Mi
+      volumes:
+        - name: service-graph-token
+          secret:
+            secretName: kubescrape-service-graph

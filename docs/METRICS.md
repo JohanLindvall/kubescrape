@@ -84,6 +84,19 @@ names a metric or a label that is not registered.
 | `kubescrape_scrapes_total` | `pipeline`, `outcome` | Scrapes by pipeline and outcome. |
 | `kubescrape_self_metadata_lookups_total` | `outcome` | Own-pod metadata lookups for -self-attributes, by outcome. |
 | `kubescrape_self_metadata_resolved` | — | 1 when this process has resolved its own pod's metadata for -self-attributes, 0 while it has not. |
+| `kubescrape_service_graph_completed_total` | — | Edges completed by BOTH halves arriving within serviceGraph.wait. The denominator for the loss counters: an expiry or drop rate only means something against the rate of pairings that worked. |
+| `kubescrape_service_graph_config_mismatch_total` | — | Forwarded resources whose agent-side serviceGraphShards.dimensions/peerAttributes disagree with this shard's serviceGraph.dimensions/virtualNodePeerAttributes. The agent trims away what the shard reads, so those dimensions render as EMPTY labels and those peer attributes synthesize no virtual node. Always zero when both sides are configured from the same values; anything else is a config error to fix now (the shard logs both lists once per distinct mismatch). |
+| `kubescrape_service_graph_dropped_total` | — | Edges not aggregated because the serviceGraph.maxCardinality series cap was reached (existing edges keep reporting; a new one is lost until eviction frees a slot). |
+| `kubescrape_service_graph_evicted_total` | — | Edge series dropped at export because they went unobserved for serviceGraph.staleAfter (this is what frees cardinality-cap slots). |
+| `kubescrape_service_graph_expired_total` | — | Half-edges that expired after serviceGraph.wait without their partner arriving. |
+| `kubescrape_service_graph_loops_blocked_total` | — | Payloads refused because they already carried the forwarded marker: a shard tier pointed at itself or at the agents' own ingest port, which would multiply every span by the fan-out on every hop. Always zero in a correct deployment; anything else is a config error to fix now. |
+| `kubescrape_service_graph_pending_edges` | — | Half-edges currently awaiting their partner. serviceGraph.maxItems caps this; at the cap spans are refused (see kubescrape_service_graph_store_full_total), so the ratio against the cap is the leading indicator. |
+| `kubescrape_service_graph_sends_failed_total` | — | Failed sends to a service-graph shard (one per shard per batch). A rate that tracks one shard's outage means only that shard's arc of the ring is missing from the graph; a rate across all of them means the tier or the token is wrong. |
+| `kubescrape_service_graph_spans_forwarded_total` | — | Spans handed to a service-graph shard (delivered or not). Far below the ingested span count by design: INTERNAL spans and spans with no trace id can never form an edge and are dropped before the hop. |
+| `kubescrape_service_graph_spans_lost_total` | — | Spans in a shard send that failed. They are gone — the graph is best-effort and the sender's own export already succeeded — so the edges they would have formed are missing from the graph, indistinguishable there from calls that never happened. |
+| `kubescrape_service_graph_store_full_total` | — | Spans dropped because the pairing store held serviceGraph.maxItems half-edges (the request cannot become an edge). |
+| `kubescrape_service_graph_unkeyable_total` | — | Spans that could not be keyed for pairing because they carried no trace id (never stored: every zero id shares one key space and would cross-pair unrelated requests into invented edges). A moving rate means an SDK is emitting malformed spans. |
+| `kubescrape_service_graph_virtual_node_total` | — | Half-edges that expired unpaired but named their far side through serviceGraph.virtualNodePeerAttributes, and so still reached the graph (as a virtual-node edge). The remainder of kubescrape_service_graph_expired_total is the genuinely lost part — nothing named the missing side, so that request is on no edge at all. |
 | `kubescrape_span_metrics_dropped_total` | — | Spans not aggregated into span metrics because the dimension-cardinality cap was reached. |
 | `kubescrape_span_metrics_evicted_total` | — | Span-metric series dropped at export because their dimensions went unobserved for traceMetrics.staleAfter (this is what frees cardinality-cap slots). |
 | `kubescrape_store_containers` | — | Container IDs currently indexed (including tombstones). |
@@ -92,4 +105,4 @@ names a metric or a label that is not registered.
 | `kubescrape_transform_errors_total` | `signal` | Transform program invocations that failed (the batch is NOT exported; the error propagates to the producer's retry path). |
 | `kubescrape_transform_reloads_total` | `outcome` | Transforms-file reloads by outcome (applied, failed — a failed compile keeps the last good program). |
 
-72 metrics.
+85 metrics.

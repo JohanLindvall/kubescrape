@@ -831,6 +831,139 @@ reset). Eviction only ever drops values a **delivered** export already
 carried, so an export interval longer than `staleAfter`, or a failed export,
 never loses observations. `"0"` disables eviction.
 
+## Agent: service graph
+
+Service-graph **edge** metrics — one series per caller→callee pair, with both
+sides' latency and the error count — derived by pairing each request's CLIENT
+span with its SERVER span. Opt-in, and unlike every other agent pipeline it
+needs **its own workload**.
+
+**Why a separate tier.** The two halves of one request are emitted by two pods
+that usually run on two different nodes, so the agent that receives the client
+span never sees the server span: an edge cannot be completed by per-node
+aggregation, no matter how the numbers are added up afterwards. (Span metrics
+are the opposite case — each span is aggregated independently, so the per-node
+cumulative counters simply sum, which is why `-ingest-span-metrics` needs no
+tier of its own.) The agents therefore act as *distributors*: each hashes an
+ingested span by **trace ID** onto a ring and forwards a trimmed copy (service
+identity, k8s identity, timing, status, the few attributes pairing reads) to
+the shard that owns that trace, which sees both halves and emits the edge. This
+is Grafana Tempo's distributor → metrics-generator split, with Tempo's hash
+(FNV-1 32-bit over the trace id).
+
+| Flag | Side | Description |
+|---|---|---|
+| `-service-graph` | shard | run the pairing processor and the span receiver |
+| `-service-graph-listen` | shard | receiver address for forwarded spans (the chart uses `:4319`; **not** `:4317`, which is the agents' own ingest port) |
+| `-service-graph-token-file` | both | shared bearer token authenticating the forward hop; re-read periodically, so rotating the Secret needs no restart. **Without it the shard refuses to open the listener** |
+| `-service-graph-shards` | agent | number of shards; must equal the StatefulSet's replicas |
+| `-service-graph-endpoint` | agent | the shard tier's governing **headless** Service (`<sts>.<ns>.svc:<port>`), from which each shard's stable per-pod name `<sts>-<ordinal>.<service>.<ns>.svc:<port>` is derived |
+
+The endpoint names the headless Service, never a ClusterIP: a load-balanced
+destination round-robins, which sends a trace's client half to one shard and
+its server half to another — the exact failure the ring exists to prevent. For
+the same reason the shard count is part of the ring's *definition* rather than
+a local tuning knob: two agents disagreeing about it split traces silently,
+with both reporting success. Scaling the tier moves ~1/N of the traces to a
+different shard and loses only the half-edges in flight at that moment.
+
+The emitted series are **Grafana-Service-Graph-compatible on purpose** —
+Grafana's Service Graph view queries these exact names and labels, so a
+better-reading name would render in nothing:
+
+| Metric | Type | Description |
+|---|---|---|
+| `traces_service_graph_request_total` | counter | requests on the edge |
+| `traces_service_graph_request_failed_total` | counter | the subset where either side reported an error (emitted at zero too, so the error ratio is defined before the first failure) |
+| `traces_service_graph_request_server_seconds` | histogram | duration as the **server** measured it |
+| `traces_service_graph_request_client_seconds` | histogram | duration as the **client** measured it |
+
+Labels: `client` and `server` (the two `service.name`s), `connection_type`
+(empty for a plain service-to-service call, else `messaging_system`,
+`database` or `virtual_node`), `virtual_node` (`client`/`server`, only when
+that side was synthesized) and any configured `dimensions`, which appear
+twice — `client_<dim>` and `server_<dim>` — resolved from whichever side
+carried the attribute. The two durations are separate histograms, not one:
+they are measured by different processes with unsynchronised clocks, and their
+difference (network plus queue time) is the operator's to take, not ours to
+assert.
+
+Tuning is the `serviceGraph` section of the agent config, mounted on the shards
+(the chart renders one ConfigMap for both workloads):
+
+```yaml
+serviceGraph:
+  wait: 10s              # how long a half-edge waits for its partner
+  maxItems: 10000        # half-edges held at once
+  maxCardinality: 20000  # distinct edge series
+  staleAfter: 15m        # evict edges unobserved for this long (0 disables)
+  histogramBuckets: [0.1, 0.2, 0.4, 0.8, 1.6, 3.2, 6.4, 12.8]   # SECONDS
+  exemplars: true        # default: trace-id exemplars on both histograms
+  dimensions: [http.route]
+  virtualNodePeerAttributes: [peer.service, db.name, db.system]  # default
+```
+
+Every one of the three bounds trades completeness for memory, and each has a
+counter that moves when it binds — an edge missing from the graph looks exactly
+like a call that never happened, so none of them fails silently:
+
+* `wait` — longer pairs more slow requests but holds more half-edges. A rising
+  `kubescrape_service_graph_expired_total` means it is shorter than the real
+  client-to-server delivery gap (or that the two halves are reaching different
+  shards). A non-zero baseline is normal: an uninstrumented callee's client
+  half expires by design.
+* `maxItems` — the pairing store's cap. Over it, spans are dropped
+  (`kubescrape_service_graph_store_full_total`, counted per span: the partner
+  will expire unpaired too, so one lost request moves both counters).
+* `maxCardinality` — the emitted-series cap. A new edge over it is dropped
+  (`kubescrape_service_graph_dropped_total`); existing edges keep reporting,
+  because these are cumulative series.
+* `staleAfter` — what keeps `maxCardinality` from being a one-way latch: without
+  it one burst of short-lived services blinds the graph permanently. Evicted
+  series count into `kubescrape_service_graph_evicted_total`.
+
+`exemplars` (default on) attaches one exemplar per latency bucket to each
+duration histogram — the link from "this call is slow" to the trace showing
+why. The trace id is the same on both halves by construction (it is half the
+pairing key), so there is nothing to choose there; the **span** id is each
+half's own, so the client-latency exemplar points at the span that measured the
+client latency and the server's at the server's. Exemplars are cleared only
+after a DELIVERED export, so a failed send keeps them for the retry, and a span
+with no trace id gets none rather than a link that resolves to nothing.
+
+The agents' matching half is the config's `serviceGraphShards` section, for
+what the flags do not cover: `dimensions`/`peerAttributes` (they must MATCH the
+shard's — a dimension the agent trims away is a label the shard can only render
+empty), `protocol`, `headers`, `caFile`/`insecureSkipVerify` for the hop, and
+`tokensPerShard` (part of the ring's definition — identical on every agent or
+nothing pairs).
+
+**A mismatch is DETECTED, not merely documented.** Each agent stamps its
+effective lists on every forwarded resource (`kubescrape.service_graph.dimensions`
+and `.peer_attributes`, sorted and joined), and the shard compares them against
+its own `dimensions`/`virtualNodePeerAttributes`. A disagreement counts into
+`kubescrape_service_graph_config_mismatch_total` — per forwarded resource, so
+the rate says how much of the graph's input is affected — and the shard logs
+one warning per distinct disagreement (never per span, and the remembered
+shapes are bounded) naming both sides' lists and, specifically, the keys the
+shard reads that the agent does not forward: those dimensions render as EMPTY
+labels and those peer attributes synthesize no virtual node. Spans that declare
+nothing — pushed straight to the shard, or forwarded by an agent from before
+this existed — are not a mismatch and are silent, so a rolling upgrade does not
+warn. The chart renders both sides from one values block, so this counter
+should read zero; anything else is a config error to fix now.
+
+**The honest limitation: an edge needs BOTH halves.** A callee that is not
+instrumented produces no server span, so no true edge can form. Those calls
+appear as **virtual nodes** instead — the far side is named from the first
+matching `virtualNodePeerAttributes` key on the client span (`peer.service`,
+`db.name`, `db.system` by default), the edge carries
+`connection_type="virtual_node"` and only the client-side duration. A client
+that names nothing at all produces no edge whatsoever. The graph is therefore a
+map of what is instrumented, not of what the cluster does; and spans that never
+reach an agent (traces pushed straight past `-ingest` to a collector) are
+outside it entirely.
+
 ## Agent: trace sampling
 
 The `traceSampling` section samples **ingested** spans before forwarding
@@ -1224,6 +1357,25 @@ DaemonSet's. `events.replicas`, `events.start`, `events.leaseName`,
 (`nodeSelector`/`tolerations`/`priorityClassName`), `resources` and
 `extraArgs` are values; the export, enrichment and `agent.config` settings
 are shared with the DaemonSet.
+
+`serviceGraph.enabled: true` renders the shard tier: a **StatefulSet** (stable
+ordinal DNS names are what the ring addresses; a Deployment's pods have none)
+plus its governing **headless** Service, running the agent binary with every
+per-node pipeline off. `serviceGraph.replicas` is both the StatefulSet's size
+and the agents' `-service-graph-shards`, from the one value — scale it with
+`helm upgrade`, not `kubectl scale`, or the agents address a width the tier
+does not have. `serviceGraph.tokenSecret.name` mounts the shared bearer token
+on both the shards and the DaemonSet and passes `-service-graph-token-file` to
+both; leaving it empty renders neither flag, and the shard then refuses to open
+its cluster-reachable receiver. `serviceGraph.port` (default 4319) is read by
+both sides. Tuning lives in `agent.config.serviceGraph` — the shards mount the
+same rendered ConfigMap as the DaemonSet, so the shard's `dimensions` and the
+agents' `serviceGraphShards.dimensions` cannot drift apart; if they ever do (a
+hand-written ConfigMap, `deploy/*.yaml`, a half-finished rollout) the shard
+detects it and moves
+`kubescrape_service_graph_config_mismatch_total`. It requires
+`agent.ingest.enabled` with `agent.ingest.traces`: the spans it pairs are the
+ones apps push to their node's agent.
 
 `service.scrapeAuthSecrets: true` is one value that wires three things at
 once, because they must not drift apart: the `-scrape-auth-secrets` flag, the

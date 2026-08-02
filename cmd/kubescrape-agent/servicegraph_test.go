@@ -70,8 +70,8 @@ func TestServiceGraphIsOffByDefault(t *testing.T) {
 		}
 	}
 
-	p := testPipelines(t)
-	if err := p.startServiceGraph(); err != nil {
+	ctx, p := testPipelines(t)
+	if err := p.startServiceGraph(ctx); err != nil {
 		t.Fatalf("startServiceGraph with the feature off: %v", err)
 	}
 	if p.serviceGraphProc != nil || p.serviceGraphReg != nil {
@@ -298,8 +298,8 @@ func TestServiceGraphShardRequiresATokenFile(t *testing.T) {
 	// cannot see the filesystem, so the listener must refuse to open rather
 	// than come up with an empty accept set.
 	*serviceGraphToken = filepath.Join(t.TempDir(), "not-there")
-	p := testPipelines(t)
-	if err := p.startServiceGraph(); err == nil {
+	ctx, p := testPipelines(t)
+	if err := p.startServiceGraph(ctx); err == nil {
 		t.Fatal("the shard started with an unreadable token file")
 	}
 	if p.serviceGraphReg != nil {
@@ -710,7 +710,7 @@ func TestPeerIsOurOwnWorkload(t *testing.T) {
 
 // testPipelines is the minimum a start function needs: lifecycle, logger,
 // readiness and the fatal slot. Nothing here acquires anything.
-func testPipelines(t *testing.T) *pipelines {
+func testPipelines(t *testing.T) (context.Context, *pipelines) {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	var wg sync.WaitGroup
@@ -719,8 +719,8 @@ func testPipelines(t *testing.T) *pipelines {
 		cancel()
 		wg.Wait()
 	})
-	return &pipelines{
-		ctx: ctx, wg: &wg, stop: cancel, ready: newReadiness(),
+	return ctx, &pipelines{
+		wg: &wg, stop: cancel, ready: newReadiness(),
 		log: slog.New(slog.DiscardHandler), fatalErr: &fatal,
 	}
 }

@@ -17,7 +17,7 @@ func TestEmptyResourceExport(t *testing.T) {
 	setTimeForTest(time.Unix(1_700_700_000, 0))
 	defer testEpoch.Store(0)
 
-	set, err := NewDynamicMetricSet([]Dynamic{{
+	set, err := newTestSet([]Dynamic{{
 		Name: "lines_total", Type: CounterType, Value: "1", Match: []string{"m=1"},
 	}})
 	if err != nil {
@@ -76,7 +76,7 @@ func (f *flakyExporter) ExportMetrics(_ context.Context, md pmetric.Metrics) err
 // discard observations that no longer exist in the store. The export must keep
 // going and report the first error.
 func TestExportContinuesPastFailedChunk(t *testing.T) {
-	set, err := NewDynamicMetricSet([]Dynamic{{
+	set, err := newTestSet([]Dynamic{{
 		Name:  "test_lines_total",
 		Type:  CounterType,
 		Value: "1",
@@ -130,7 +130,7 @@ func TestLogResourceBecomesResourceAttrs(t *testing.T) {
 
 	// The log line's resource attributes become the metric's OTLP resource; the
 	// metric's own DSL labels stay on the data points. Two pods → two resources.
-	set, err := NewDynamicMetricSet([]Dynamic{{
+	set, err := newTestSet([]Dynamic{{
 		Name:   "http_requests_total",
 		Type:   CounterType,
 		Value:  "1",
@@ -189,7 +189,7 @@ func TestResourceLabelsLiftedToResource(t *testing.T) {
 
 	// resourceLabels move a log-derived label onto the resource; labels stay on
 	// the data point.
-	set, err := NewDynamicMetricSet([]Dynamic{{
+	set, err := newTestSet([]Dynamic{{
 		Name:           "reqs_total",
 		Type:           CounterType,
 		Value:          "1",
@@ -295,7 +295,7 @@ func TestDynamicCounter(t *testing.T) {
 	setTimeForTest(time.Unix(1_700_000_000, 0))
 	defer testEpoch.Store(0)
 
-	set, err := NewDynamicMetricSet([]Dynamic{{
+	set, err := newTestSet([]Dynamic{{
 		Name:   "test_http_requests_total",
 		Type:   CounterType,
 		Value:  "1",
@@ -334,7 +334,7 @@ func TestDynamicSummary(t *testing.T) {
 	setTimeForTest(time.Unix(1_700_000_200, 0))
 	defer testEpoch.Store(0)
 
-	set, err := NewDynamicMetricSet([]Dynamic{{
+	set, err := newTestSet([]Dynamic{{
 		Name:   "test_bytes_summary",
 		Type:   SummaryType,
 		Value:  "bytes",
@@ -370,7 +370,7 @@ func TestDynamicHistogram(t *testing.T) {
 	setTimeForTest(time.Unix(1_700_000_100, 0))
 	defer testEpoch.Store(0)
 
-	set, err := NewDynamicMetricSet([]Dynamic{{
+	set, err := newTestSet([]Dynamic{{
 		Name:    "test_latency_seconds",
 		Type:    HistogramType,
 		Value:   "duration",
@@ -415,7 +415,7 @@ func TestSharedSeriesByName(t *testing.T) {
 
 	// Two rules feeding the same metric name must share one series and export
 	// once.
-	set, err := NewDynamicMetricSet([]Dynamic{
+	set, err := newTestSet([]Dynamic{
 		{Name: "events_total", Type: CounterType, Value: "1", Match: []string{"kind=a"}, Labels: []string{"kind"}},
 		{Name: "events_total", Type: CounterType, Value: "1", Match: []string{"kind=b"}, Labels: []string{"kind"}},
 	})

@@ -207,8 +207,9 @@ func BenchmarkOwner(b *testing.B) {
 	r := NewRing(shardNames(8), 0)
 	ids := randTraceIDs(1024)
 	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	i := 0
+	for b.Loop() {
 		_ = r.Owner(ids[i&1023])
+		i++
 	}
 }

@@ -235,6 +235,10 @@ func (d *Dynamic) gaugeAction(kind seriesKind) (gaugeAction, error) {
 type setConfig struct {
 	namePrefix string
 	log        *slog.Logger
+	// drops is the set's refusal counters, shared by every series it compiles.
+	drops *drops
+	// now overrides the coarse clock (tests only; see withClock).
+	now func() int64
 }
 
 // Option configures a DynamicMetricSet.
@@ -243,6 +247,14 @@ type Option func(*setConfig)
 // WithNamePrefix prepends prefix to every metric name.
 func WithNamePrefix(prefix string) Option {
 	return func(c *setConfig) { c.namePrefix = prefix }
+}
+
+// withClock overrides the coarse ten-second clock every series reads. Test-only
+// (it is unexported): production always takes the package clock, which is what
+// keeps the observe path free of the per-observation atomic load a
+// process-global test override used to cost it.
+func withClock(now func() int64) Option {
+	return func(c *setConfig) { c.now = now }
 }
 
 // WithLogger sets the logger used for cardinality warnings.
@@ -260,9 +272,32 @@ type DynamicMetricSet struct {
 	keys  logline.KeyIndex
 	pool  sync.Pool
 	log   *slog.Logger
+	// drops counts the observations this set REFUSED. Per set, not per
+	// process: obs registers getters over it (RegisterLogMetricsDrops), the
+	// way it does for the disk buffer's stats and the self-metadata gauge.
+	drops drops
 	// Count is the number of configured rules.
 	Count int
 }
+
+// DroppedCapped counts observations this set rejected because a metric's
+// label-set cardinality cap was reached.
+func (s *DynamicMetricSet) DroppedCapped() uint64 { return s.drops.Capped() }
+
+// DroppedCappedByMetric reports this set's cap-refused observations per metric
+// name — the only form an operator can act on, since the cap frees slots only
+// through idleness.
+func (s *DynamicMetricSet) DroppedCappedByMetric() map[string]float64 {
+	return s.drops.CappedByMetric()
+}
+
+// DroppedCollision counts observations this set rejected because their hash
+// matched an existing sample of a DIFFERENT series.
+func (s *DynamicMetricSet) DroppedCollision() uint64 { return s.drops.Collision() }
+
+// DroppedNaN counts observations this set rejected because the extracted value
+// was not finite (NaN or +/-Inf).
+func (s *DynamicMetricSet) DroppedNaN() uint64 { return s.drops.NaN() }
 
 // addContext is the per-line scratch state pooled across Add calls. labelFn
 // and valueFn are bound once at construction (closing over the context) so a
@@ -321,6 +356,7 @@ func NewDynamicMetricSet(metrics []Dynamic, opts ...Option) (*DynamicMetricSet, 
 	}
 
 	set := &DynamicMetricSet{log: cfg.log}
+	cfg.drops = &set.drops
 	set.pool = sync.Pool{New: func() any {
 		ac := &addContext{buf: make(labels, 0, 16), rbuf: make(labels, 0, 8), set: set}
 		// Bind the lookup closures once; per-line state flows through fields.

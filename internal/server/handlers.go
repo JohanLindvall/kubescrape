@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/JohanLindvall/kubescrape/internal/peerip"
 	"github.com/JohanLindvall/kubescrape/internal/scrape"
 	"github.com/JohanLindvall/kubescrape/internal/servicemonitors"
 	"github.com/JohanLindvall/kubescrape/internal/store"
@@ -195,7 +196,7 @@ func (s *Server) handlePodByIP(w http.ResponseWriter, r *http.Request) {
 // a 304 says "your labels and namespace metadata are unchanged" — instead of
 // choosing between stale attributes and a full document every interval.
 func (s *Server) handleSelf(w http.ResponseWriter, r *http.Request) {
-	ip := kubemeta.PeerIP(r.RemoteAddr)
+	ip := peerip.From(r.RemoteAddr)
 	if ip == "" {
 		writeError(w, http.StatusBadRequest, fmt.Sprintf("unparseable peer address %q", r.RemoteAddr))
 		return

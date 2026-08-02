@@ -93,14 +93,15 @@ func BenchmarkReceiveNewTraces(b *testing.B) {
 	buf := benchBuffer(b, 1<<20)
 	ctx := context.Background()
 	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	i := 0
+	for b.Loop() {
 		if i%batches == 0 {
 			buf.reset() // amortized over batches*spans spans: below the reporting floor
 		}
 		if err := buf.ExportTraces(ctx, payloads[i%batches]); err != nil {
 			b.Fatal(err)
 		}
+		i++
 	}
 }
 
@@ -117,50 +118,68 @@ func BenchmarkReceiveExistingTrace(b *testing.B) {
 	buf := benchBuffer(b, 1<<20)
 	ctx := context.Background()
 	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	i := 0
+	for b.Loop() {
 		if i%512 == 0 {
 			buf.reset()
 		}
 		if err := buf.ExportTraces(ctx, td); err != nil {
 			b.Fatal(err)
 		}
+		i++
 	}
+}
+
+// decidedDropBuffer returns a buffer that has already decided trace 5 DROP, so
+// a further push of td takes the late path: a cache probe and a counter.
+func decidedDropBuffer(t testing.TB) (*Buffer, ptrace.Traces, context.Context) {
+	t.Helper()
+	td := payload("checkout", spanSpec{trace: 5, span: 1, end: 10})
+	buf, err := New(Config{Config: errorsCfg(), DecisionWait: "1ms"}, discard{}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	clk := newClock()
+	buf.now = clk.now
+	ctx := context.Background()
+	if err := buf.ExportTraces(ctx, td); err != nil {
+		t.Fatal(err)
+	}
+	clk.advance(time.Second)
+	buf.Sweep(ctx) // decides DROP (no error span) and caches the verdict
+	clk.advance(-time.Second)
+	return buf, td, ctx
 }
 
 // A span whose trace was decided DROP: a cache probe and a counter, nothing
 // else. This is where a sampling shard spends its time, and it is asserted to
 // allocate nothing.
 func BenchmarkReceiveLateDrop(b *testing.B) {
-	td := payload("checkout", spanSpec{trace: 5, span: 1, end: 10})
-	buf, err := New(Config{Config: errorsCfg(), DecisionWait: "1ms"}, discard{}, nil)
-	if err != nil {
-		b.Fatal(err)
+	buf, td, ctx := decidedDropBuffer(b)
+	b.ReportAllocs()
+	for b.Loop() {
+		if err := buf.ExportTraces(ctx, td); err != nil {
+			b.Fatal(err)
+		}
 	}
-	clk := newClock()
-	buf.now = clk.now
-	ctx := context.Background()
-	if err := buf.ExportTraces(ctx, td); err != nil {
-		b.Fatal(err)
-	}
-	clk.advance(time.Second)
-	buf.Sweep(ctx) // decides DROP (no error span) and caches the verdict
-	clk.advance(-time.Second)
+}
 
+// The benchmark REPORTS the budget; a benchmark cannot fail a build, so this is
+// what holds it. This assertion used to live inside BenchmarkReceiveLateDrop,
+// where `go test` never reached it. A sampling shard spends most of its receive
+// path here — every span of every already-dropped trace — so a per-push map, a
+// slice or a closure is a per-span cost on the busiest goroutines the tier has.
+func TestReceiveLateDropAllocationBudget(t *testing.T) {
+	buf, td, ctx := decidedDropBuffer(t)
+	if err := buf.ExportTraces(ctx, td); err != nil { // warm the grouping scratch
+		t.Fatal(err)
+	}
 	if allocs := testing.AllocsPerRun(100, func() {
 		if err := buf.ExportTraces(ctx, td); err != nil {
-			b.Fatal(err)
+			t.Fatal(err)
 		}
 	}); allocs != 0 {
-		b.Fatalf("the decided-drop receive path allocates %v times per push, want 0", allocs)
-	}
-
-	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		if err := buf.ExportTraces(ctx, td); err != nil {
-			b.Fatal(err)
-		}
+		t.Fatalf("the decided-drop receive path allocates %v times per push, want 0", allocs)
 	}
 }
 
@@ -183,8 +202,7 @@ func BenchmarkReceiveLateKeep(b *testing.B) {
 	clk.advance(-time.Second)
 
 	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		if err := buf.ExportTraces(ctx, td); err != nil {
 			b.Fatal(err)
 		}
@@ -210,8 +228,7 @@ func BenchmarkDecide(b *testing.B) {
 	buf.now = clk.now
 	ctx := context.Background()
 	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		if err := buf.ExportTraces(ctx, td); err != nil {
 			b.Fatal(err)
 		}

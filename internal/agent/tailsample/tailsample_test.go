@@ -93,6 +93,7 @@ policies:
 // documented "10s"), and it is why the duration fields here are STRINGS: the
 // `threshold: 500ms` below has to survive the round trip.
 func TestConfigDecodesFromDocumentedYAML(t *testing.T) {
+	t.Parallel()
 	var cfg Config
 	if err := yaml.UnmarshalStrict([]byte(documentedYAML), &cfg); err != nil {
 		t.Fatalf("the documented policy YAML does not decode: %v", err)
@@ -151,6 +152,7 @@ func TestConfigDecodesFromDocumentedYAML(t *testing.T) {
 // for a mis-cased body key and a mis-cased type value — a policy that decodes
 // but never fires is the failure mode this pins shut.
 func TestUnknownPolicyFieldIsRejected(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name string
 		yaml string
@@ -203,6 +205,7 @@ policies:
 }
 
 func TestValidateRejectsBadShapes(t *testing.T) {
+	t.Parallel()
 	strAttr := func(cfg StringAttributeConfig) PolicyConfig {
 		p := pol("attr", TypeStringAttribute)
 		p.StringAttribute = &cfg
@@ -344,6 +347,7 @@ func TestValidateRejectsBadShapes(t *testing.T) {
 // building an evaluator out of it is a caller bug, because such an evaluator
 // drops every trace it is handed.
 func TestEmptyConfigIsDisabledNotInvalid(t *testing.T) {
+	t.Parallel()
 	var nilCfg *Config
 	if err := nilCfg.Validate(); err != nil {
 		t.Fatalf("a nil section must validate: %v", err)
@@ -367,6 +371,7 @@ func TestEmptyConfigIsDisabledNotInvalid(t *testing.T) {
 // won — that name is the metric label an operator answers "why was this trace
 // kept" with, so it has to be the one rule, not a set.
 func TestFirstMatchWinsInOrder(t *testing.T) {
+	t.Parallel()
 	errs := pol("errors", TypeStatusCode)
 	errs.StatusCode = &StatusCodeConfig{StatusCodes: []string{"ERROR"}}
 	slow := pol("slow", TypeLatency)
@@ -397,6 +402,7 @@ func TestFirstMatchWinsInOrder(t *testing.T) {
 // and the later policies still decide. The Collector would sample everything the
 // rule does not name, which makes an exclusion silently switch on 100% sampling.
 func TestInvertedPolicyAbstainsAndLetsLaterPoliciesDecide(t *testing.T) {
+	t.Parallel()
 	excl := pol("exclude-healthz", TypeStringAttribute)
 	excl.StringAttribute = &StringAttributeConfig{Key: "http.route", Values: []string{"/healthz"}, InvertMatch: true}
 	errs := pol("errors", TypeStatusCode)
@@ -425,6 +431,7 @@ func TestInvertedPolicyAbstainsAndLetsLaterPoliciesDecide(t *testing.T) {
 // rateLimiting policy's budget — that is what makes "keep every error, then
 // rate-limit the rest" mean what it reads like.
 func TestEarlierMatchDoesNotSpendTheRateBudget(t *testing.T) {
+	t.Parallel()
 	errs := pol("errors", TypeStatusCode)
 	errs.StatusCode = &StatusCodeConfig{StatusCodes: []string{"ERROR"}}
 	e := mustNew(t, errs, ratePol(4))
@@ -454,6 +461,7 @@ func TestEarlierMatchDoesNotSpendTheRateBudget(t *testing.T) {
 // policy first fires makes "kept nothing" indistinguishable from "does not
 // exist".
 func TestNamesCoversEveryDecisionLabel(t *testing.T) {
+	t.Parallel()
 	errs := pol("errors", TypeStatusCode)
 	errs.StatusCode = &StatusCodeConfig{StatusCodes: []string{"ERROR"}}
 	e := mustNew(t,
@@ -469,6 +477,7 @@ func TestNamesCoversEveryDecisionLabel(t *testing.T) {
 // An assembler that has no resource for a span must lose attribute matching,
 // not the process: pdata panics on a zero-initialised Map.
 func TestZeroResourceMapIsTolerated(t *testing.T) {
+	t.Parallel()
 	td := ptrace.NewTraces()
 	sp := td.ResourceSpans().AppendEmpty().ScopeSpans().AppendEmpty().Spans().AppendEmpty()
 	sp.Attributes().PutStr("k", "v")
@@ -491,6 +500,7 @@ func TestZeroResourceMapIsTolerated(t *testing.T) {
 // so the two pieces of mutable state (regex caches, token buckets) have to hold
 // up. Run with -race; the budget assertion is the non-race half.
 func TestDecideIsSafeForConcurrentUse(t *testing.T) {
+	t.Parallel()
 	attr := pol("attr", TypeStringAttribute)
 	attr.StringAttribute = &StringAttributeConfig{
 		Key: "http.route", Values: []string{"^/checkout"}, EnabledRegexMatching: true, CacheMaxSize: 8,
@@ -535,6 +545,7 @@ func TestDecideIsSafeForConcurrentUse(t *testing.T) {
 // If either side ever changes its hash, salts it, or rounds its threshold
 // differently, this fails.
 func TestProbabilisticNestsWithTheHeadSampler(t *testing.T) {
+	t.Parallel()
 	const n = 2000
 	td := ptrace.NewTraces()
 	ss := td.ResourceSpans().AppendEmpty().ScopeSpans().AppendEmpty()

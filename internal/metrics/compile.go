@@ -140,6 +140,8 @@ func compileRule(d *Dynamic, cfg *setConfig, shared map[string]*series) (*metric
 			expiration: age,
 			buckets:    d.Buckets,
 			log:        cfg.log,
+			drops:      cfg.drops,
+			now:        cfg.now,
 		})
 		shared[name] = rule.series
 	}

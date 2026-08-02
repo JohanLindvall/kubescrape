@@ -208,7 +208,7 @@ func TestSelfResolveFallsBackToPodByName(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	pod, err := selfResolve(metaclient.New(srv.URL, time.Second))(context.Background())
+	pod, err := selfResolve(metaclient.New(metaclient.Config{Base: srv.URL, Timeout: time.Second}))(context.Background())
 	if err != nil {
 		t.Fatalf("resolve failed despite a resolvable name: %v", err)
 	}
@@ -230,7 +230,7 @@ func TestSelfResolveWithoutIdentity(t *testing.T) {
 	defer srv.Close()
 	defer func(p string) { selfmeta.SetNamespaceProjectionForTest(p) }(selfmeta.SetNamespaceProjectionForTest(filepath.Join(t.TempDir(), "nope")))
 
-	if pod, err := selfResolve(metaclient.New(srv.URL, time.Second))(context.Background()); err == nil {
+	if pod, err := selfResolve(metaclient.New(metaclient.Config{Base: srv.URL, Timeout: time.Second}))(context.Background()); err == nil {
 		t.Fatalf("resolved %+v with no peer match and no name", pod)
 	}
 }

@@ -9,10 +9,13 @@ import (
 )
 
 func Example() {
-	c := metaclient.New("http://kubescrape.monitoring", 15*time.Second)
-	// Optional: feed lookup outcomes into your own metrics. Set before the
-	// client is shared between goroutines.
-	c.Observe = func(outcome string) { fmt.Println("lookup:", outcome) }
+	c := metaclient.New(metaclient.Config{
+		Base:    "http://kubescrape.monitoring",
+		Timeout: 15 * time.Second,
+		// Optional: feed lookup outcomes into your own metrics. The package
+		// itself has no metrics dependency.
+		Observe: func(outcome string) { fmt.Println("lookup:", outcome) },
+	})
 
 	// A container ID may reach the agent before the kubelet has posted it to
 	// the API server; the service holds the request up to the wait.

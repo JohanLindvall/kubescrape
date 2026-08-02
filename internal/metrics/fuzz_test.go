@@ -16,7 +16,7 @@ import (
 // KeyIndex/Fields,
 // the JSON GetPaths/unsafe-string path and the logfmt scanner.
 func fuzzMetricSet(t testing.TB) *DynamicMetricSet {
-	set, err := NewDynamicMetricSet([]Dynamic{
+	set, err := newTestSet([]Dynamic{
 		{
 			Name: "lines_total", Type: CounterType, Value: "1",
 			Labels: []string{"level=$level", "status=$http_status(_xx)", "nested=$a.b.c", "path=$path/\\/api\\/v[0-9]+/api/"},

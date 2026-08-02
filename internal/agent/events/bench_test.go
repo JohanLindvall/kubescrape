@@ -81,8 +81,7 @@ func BenchmarkIngest(b *testing.B) {
 	e := benchEvent()
 	r.ingest(ctx, e) // warm the batch's capacity
 	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		r.batch = r.batch[:0]
 		r.ingest(ctx, e)
 	}
@@ -105,8 +104,7 @@ func BenchmarkConvert(b *testing.B) {
 			b.Fatalf("records = %d, want %d", ld.LogRecordCount(), nEvents)
 		}
 		b.ReportAllocs()
-		b.ResetTimer()
-		for i := 0; i < b.N; i++ {
+		for b.Loop() {
 			r.convert()
 		}
 		b.ReportMetric(float64(b.Elapsed().Nanoseconds())/float64(b.N)/nEvents, "ns/event")
@@ -133,8 +131,7 @@ func BenchmarkConvert(b *testing.B) {
 func BenchmarkEventAttrs(b *testing.B) {
 	e := benchEvent()
 	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		benchSink = eventAttrs(e)
 	}
 }

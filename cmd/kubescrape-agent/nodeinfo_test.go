@@ -36,7 +36,7 @@ func nodeMetaServer(t *testing.T, labels map[string]string) (*metaclient.Client,
 		})
 	}))
 	t.Cleanup(srv.Close)
-	return metaclient.New(srv.URL, 5*time.Second), func() int { return hits }
+	return metaclient.New(metaclient.Config{Base: srv.URL, Timeout: 5 * time.Second}), func() int { return hits }
 }
 
 // The provider never yields nil — the node's NAME is known without the lookup,

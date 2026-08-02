@@ -236,11 +236,11 @@ type latencyPolicy struct{ min, max time.Duration }
 func compileLatency(where string, cfg *LatencyConfig) (policy, error) {
 	lower, err := cfg.threshold()
 	if err != nil {
-		return nil, errPolicy(where, "%v", err)
+		return nil, errPolicy(where, "%w", err)
 	}
 	upper, err := cfg.upper()
 	if err != nil {
-		return nil, errPolicy(where, "%v", err)
+		return nil, errPolicy(where, "%w", err)
 	}
 	if upper > 0 && upper < lower {
 		return nil, errPolicy(where, "latency.upper %q is below threshold %q (the window is empty)", cfg.Upper, cfg.Threshold)
@@ -282,7 +282,7 @@ func compileStatusCode(where string, cfg *StatusCodeConfig) (policy, error) {
 	for _, s := range cfg.StatusCodes {
 		code, err := parseStatusCode(s)
 		if err != nil {
-			return nil, errPolicy(where, "statusCode.statusCodes: %v", err)
+			return nil, errPolicy(where, "statusCode.statusCodes: %w", err)
 		}
 		mask |= 1 << uint(code)
 	}
@@ -347,7 +347,7 @@ func compileStringAttribute(where string, cfg *StringAttributeConfig) (policy, e
 		for i, v := range cfg.Values {
 			re, err := regexp.Compile(v)
 			if err != nil {
-				return nil, errPolicy(where, "stringAttribute.values[%d] %q: %v", i, v, err)
+				return nil, errPolicy(where, "stringAttribute.values[%d] %q: %w", i, v, err)
 			}
 			p.res = append(p.res, re)
 		}

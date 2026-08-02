@@ -17,7 +17,7 @@ import (
 // while the config, the README and the warning all said 10000.
 func TestHistogramCardinalityCountsLabelSets(t *testing.T) {
 	const want = 5
-	set, err := NewDynamicMetricSet([]Dynamic{{
+	set, err := newTestSet([]Dynamic{{
 		Name: "h", Type: HistogramType, Value: "v", Labels: []string{"id"},
 		MaxCardinality: want,
 	}})
@@ -52,7 +52,7 @@ func TestHistogramStreamBudgetGuard(t *testing.T) {
 	for i := range buckets {
 		buckets[i] = float64(i)
 	}
-	_, err := NewDynamicMetricSet([]Dynamic{{
+	_, err := newTestSet([]Dynamic{{
 		Name: "h", Type: HistogramType, Value: "v", Buckets: buckets, MaxCardinality: 10000,
 	}})
 	if err == nil {
@@ -62,14 +62,14 @@ func TestHistogramStreamBudgetGuard(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	// Lowering the cardinality to fit is accepted.
-	if _, err := NewDynamicMetricSet([]Dynamic{{
+	if _, err := newTestSet([]Dynamic{{
 		Name: "h", Type: HistogramType, Value: "v", Buckets: buckets, MaxCardinality: 500,
 	}}); err != nil {
 		t.Fatalf("500 x 201 = 100500 samples rejected: %v", err)
 	}
 	// A small cap on a default-bucket histogram is fine — it means few label
 	// sets, not "nothing can ever be admitted".
-	if _, err := NewDynamicMetricSet([]Dynamic{{
+	if _, err := newTestSet([]Dynamic{{
 		Name: "h", Type: HistogramType, Value: "v", MaxCardinality: 5,
 	}}); err != nil {
 		t.Fatalf("maxCardinality 5 rejected: %v", err)
@@ -94,7 +94,7 @@ func TestRuleRequiresValueSource(t *testing.T) {
 		{Name: "s", Type: SummaryType},
 		{Name: "g", Type: GaugeType, Action: "add"},
 	} {
-		if _, err := NewDynamicMetricSet([]Dynamic{d}); err == nil {
+		if _, err := newTestSet([]Dynamic{d}); err == nil {
 			t.Fatalf("%s %q with no value source compiled — it would record nothing", d.Type, d.Action)
 		}
 	}
@@ -105,7 +105,7 @@ func TestRuleRequiresValueSource(t *testing.T) {
 		{Name: "cv", Type: CounterType, Value: "v"},
 		{Name: "cr", Type: CounterType, ValueRegexp: `took (\d+)ms`},
 	} {
-		if _, err := NewDynamicMetricSet([]Dynamic{d}); err != nil {
+		if _, err := newTestSet([]Dynamic{d}); err != nil {
 			t.Fatalf("%s %q wrongly rejected: %v", d.Type, d.Action, err)
 		}
 	}
@@ -115,7 +115,7 @@ func TestRuleRequiresValueSource(t *testing.T) {
 // rule's buckets would otherwise be silently ignored (the first rule's series
 // wins), observing into bounds the config never declared.
 func TestSharedNameConflictingBucketsRejected(t *testing.T) {
-	_, err := NewDynamicMetricSet([]Dynamic{
+	_, err := newTestSet([]Dynamic{
 		{Name: "h", Type: HistogramType, Value: "v", Buckets: []float64{1, 2, 3}},
 		{Name: "h", Type: HistogramType, Value: "v", Buckets: []float64{10, 20}},
 	})
@@ -123,7 +123,7 @@ func TestSharedNameConflictingBucketsRejected(t *testing.T) {
 		t.Fatal("conflicting buckets on a shared metric name compiled")
 	}
 	// Agreeing (or unset) buckets still share the series.
-	if _, err := NewDynamicMetricSet([]Dynamic{
+	if _, err := newTestSet([]Dynamic{
 		{Name: "h", Type: HistogramType, Value: "v", Buckets: []float64{1, 2, 3}},
 		{Name: "h", Type: HistogramType, Value: "w", Buckets: []float64{1, 2, 3}},
 		{Name: "h", Type: HistogramType, Value: "x"},
@@ -133,13 +133,13 @@ func TestSharedNameConflictingBucketsRejected(t *testing.T) {
 }
 
 func TestActionOnNonGaugeErrors(t *testing.T) {
-	if _, err := NewDynamicMetricSet([]Dynamic{{Name: "c", Type: CounterType, Action: "inc"}}); err == nil {
+	if _, err := newTestSet([]Dynamic{{Name: "c", Type: CounterType, Action: "inc"}}); err == nil {
 		t.Error("action on a counter: want error")
 	}
 }
 
 func TestValueAndValueRegexpConflict(t *testing.T) {
-	_, err := NewDynamicMetricSet([]Dynamic{{
+	_, err := newTestSet([]Dynamic{{
 		Name: "x", Type: CounterType, Value: "a", ValueRegexp: "b",
 	}})
 	if err == nil {
@@ -186,13 +186,13 @@ func TestLabelPrefix(t *testing.T) {
 }
 
 func TestInvalidType(t *testing.T) {
-	if _, err := NewDynamicMetricSet([]Dynamic{{Name: "x", Type: "bogus"}}); err == nil {
+	if _, err := newTestSet([]Dynamic{{Name: "x", Type: "bogus"}}); err == nil {
 		t.Error("invalid type: want error")
 	}
 }
 
 func TestBucketsOnlyForHistogram(t *testing.T) {
-	if _, err := NewDynamicMetricSet([]Dynamic{{Name: "x", Type: CounterType, Buckets: []float64{1}}}); err == nil {
+	if _, err := newTestSet([]Dynamic{{Name: "x", Type: CounterType, Buckets: []float64{1}}}); err == nil {
 		t.Error("buckets on a counter: want error")
 	}
 }
@@ -207,11 +207,11 @@ func TestBucketsOnlyForHistogram(t *testing.T) {
 // config.Duration names the field and the value in every error.
 func TestNonPositiveMaxAgeRejected(t *testing.T) {
 	for _, age := range []string{"0s", "-1h"} {
-		if _, err := NewDynamicMetricSet([]Dynamic{{Name: "x", Type: CounterType, Value: "1", MaxAge: age}}); err == nil {
+		if _, err := newTestSet([]Dynamic{{Name: "x", Type: CounterType, Value: "1", MaxAge: age}}); err == nil {
 			t.Errorf("maxAge %q: want error", age)
 		}
 	}
-	_, err := NewDynamicMetricSet([]Dynamic{{Name: "x", Type: CounterType, Value: "1", MaxAge: "5 minutes"}})
+	_, err := newTestSet([]Dynamic{{Name: "x", Type: CounterType, Value: "1", MaxAge: "5 minutes"}})
 	if err == nil {
 		t.Fatal("a malformed maxAge must be rejected")
 	}

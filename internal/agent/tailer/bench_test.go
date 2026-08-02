@@ -68,15 +68,19 @@ func benchLines(n int) []string {
 
 // feedAll pushes lines through feedLine, as consume does.
 func feedAll(tl *Tailer, f *file, lines []string) {
-	ctx := context.Background()
-	off := f.lineStart
 	for _, l := range lines {
-		start := off
-		off += int64(len(l)) + 1
-		tl.feedLine(ctx, f, l, start, off)
+		feedOne(tl, f, l)
 	}
-	f.lineStart = off
-	f.readPos = off
+}
+
+// feedOne pushes a single line through feedLine, advancing the file's offsets
+// exactly as consume does.
+func feedOne(tl *Tailer, f *file, l string) {
+	start := f.lineStart
+	end := start + int64(len(l)) + 1
+	tl.feedLine(context.Background(), f, l, start, end)
+	f.lineStart = end
+	f.readPos = end
 }
 
 // BenchmarkIngestLine measures the per-line pipeline cost (CRI parse, offset
@@ -85,10 +89,13 @@ func BenchmarkIngestLine(b *testing.B) {
 	tl, f := benchTailer(b, Config{Multiline: true})
 	lines := benchLines(1024)
 	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i += len(lines) {
-		feedAll(tl, f, lines)
-		tl.batch = tl.batch[:0] // discard without flushing
+	i := 0
+	for b.Loop() {
+		feedOne(tl, f, lines[i])
+		if i++; i == len(lines) {
+			i = 0
+			tl.batch = tl.batch[:0] // discard without flushing
+		}
 	}
 }
 
@@ -109,17 +116,19 @@ func benchChunk() ([]byte, int) {
 
 // BenchmarkIngestChunk measures the per-CHUNK cost: the carry buffer plus the
 // per-line pipeline. The only per-line allocation is consume's string(line);
-// anything above that is the pending buffer being reallocated per read.
+// anything above that is the pending buffer being reallocated per read. One
+// iteration is one 64 KiB read, so ns/op and B/op are per CHUNK — divide by the
+// reported ns/line's line count for the per-line figure.
 func BenchmarkIngestChunk(b *testing.B) {
 	tl, f := benchTailer(b, Config{Multiline: true})
 	chunk, lines := benchChunk()
 	ctx := context.Background()
 	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i += lines {
+	for b.Loop() {
 		tl.ingestChunk(ctx, f, chunk, false)
 		tl.batch = tl.batch[:0] // discard without flushing
 	}
+	b.ReportMetric(float64(b.Elapsed().Nanoseconds())/float64(b.N)/float64(lines), "ns/line")
 }
 
 // BenchmarkIngestFlush measures the full ingestion path per line: pipeline +
@@ -157,12 +166,16 @@ func BenchmarkIngestFlush(b *testing.B) {
 			lines := benchLines(1024)
 			ctx := context.Background()
 			b.ReportAllocs()
-			b.ResetTimer()
-			for i := 0; i < b.N; i += len(lines) {
-				feedAll(tl, f, lines)
-				tl.flush(ctx)
+			i := 0
+			for b.Loop() {
+				feedOne(tl, f, lines[i])
+				if i++; i == len(lines) {
+					i = 0
+					tl.flush(ctx)
+				}
 			}
 			b.StopTimer()
+			tl.flush(ctx)
 			if got := fmt.Sprint(len(tl.batch)); got != "0" {
 				b.Fatalf("batch not flushed: %s", got)
 			}

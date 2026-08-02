@@ -19,14 +19,13 @@ func TestValueRegexpWholeMatchAndBadCapture(t *testing.T) {
 	defer testEpoch.Store(0)
 
 	// No capture group: the whole match is the value.
-	set, err := NewDynamicMetricSet([]Dynamic{
+	set, err := newTestSet([]Dynamic{
 		{Name: "whole_total", Type: CounterType, ValueRegexp: `[0-9]+\.[0-9]+`},
 		{Name: "bad_total", Type: CounterType, ValueRegexp: `id=([a-z]+)`},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	beforeNaN := DroppedNaN()
 	set.Add(nil, nil, noRes(), "latency 12.5 seconds")
 	set.Add(nil, nil, noRes(), "id=abc done") // matches, capture non-numeric -> skipped
 
@@ -46,8 +45,8 @@ func TestValueRegexpWholeMatchAndBadCapture(t *testing.T) {
 	if _, ok := exp.find("bad_total"); ok {
 		t.Error("non-numeric capture produced a series; the line must be skipped")
 	}
-	if got := DroppedNaN() - beforeNaN; got != 0 {
-		t.Errorf("droppedNaN delta = %d, want 0 (skip, not NaN admission)", got)
+	if got := set.DroppedNaN(); got != 0 {
+		t.Errorf("NaN drops = %d, want 0 (skip, not NaN admission)", got)
 	}
 }
 
@@ -58,7 +57,7 @@ func TestLineKeyMultilineBody(t *testing.T) {
 	setTimeForTest(time.Unix(1_700_800_100, 0))
 	defer testEpoch.Store(0)
 
-	set, err := NewDynamicMetricSet([]Dynamic{{
+	set, err := newTestSet([]Dynamic{{
 		Name:        "panic_lines",
 		Type:        GaugeType,
 		Action:      "count",
@@ -85,7 +84,7 @@ func TestLineKeyMultilineBody(t *testing.T) {
 	}
 
 	// And a raw newline INSIDE a label value survives serialize/parse/export.
-	set2, err := NewDynamicMetricSet([]Dynamic{{
+	set2, err := newTestSet([]Dynamic{{
 		Name: "nl_total", Type: CounterType, Value: "1", Labels: []string{"tail=$t"},
 	}})
 	if err != nil {
@@ -119,7 +118,7 @@ func TestNoAliasRetentionAfterLineBufferReuse(t *testing.T) {
 	setTimeForTest(time.Unix(1_700_900_000, 0))
 	defer testEpoch.Store(0)
 
-	set, err := NewDynamicMetricSet([]Dynamic{{
+	set, err := newTestSet([]Dynamic{{
 		Name:           "aliased_total",
 		Type:           CounterType,
 		Value:          "1",
@@ -185,7 +184,7 @@ func TestValueRegexpFiltersCountingActions(t *testing.T) {
 	setTimeForTest(time.Unix(1_701_000_000, 0))
 	defer testEpoch.Store(0)
 
-	set, err := NewDynamicMetricSet([]Dynamic{
+	set, err := newTestSet([]Dynamic{
 		{Name: "errs_inc", Type: GaugeType, Action: "inc", ValueRegexp: `code=(\d+)`},
 		{Name: "errs_count", Type: GaugeType, Action: "count", ValueRegexp: `code=(\d+)`},
 	})
@@ -213,7 +212,7 @@ func TestLineFieldsJSON(t *testing.T) {
 	setTimeForTest(time.Unix(1_700_100_000, 0))
 	defer testEpoch.Store(0)
 
-	set, err := NewDynamicMetricSet([]Dynamic{{
+	set, err := newTestSet([]Dynamic{{
 		Name:   "bytes_written_total",
 		Type:   SummaryType,
 		Value:  "bytes",
@@ -246,7 +245,7 @@ func TestLineFieldsLogfmt(t *testing.T) {
 	setTimeForTest(time.Unix(1_700_100_100, 0))
 	defer testEpoch.Store(0)
 
-	set, err := NewDynamicMetricSet([]Dynamic{{
+	set, err := newTestSet([]Dynamic{{
 		Name:   "requests_total",
 		Type:   CounterType,
 		Value:  "1",
@@ -280,7 +279,7 @@ func TestCallerLookupWinsOverLine(t *testing.T) {
 	setTimeForTest(time.Unix(1_700_100_200, 0))
 	defer testEpoch.Store(0)
 
-	set, err := NewDynamicMetricSet([]Dynamic{{
+	set, err := newTestSet([]Dynamic{{
 		Name:   "hits_total",
 		Type:   CounterType,
 		Value:  "1",
@@ -321,7 +320,7 @@ func TestAddConcurrent(t *testing.T) {
 	// between goroutines.
 	setTimeForTest(time.Unix(1_700_100_300, 0))
 	defer testEpoch.Store(0)
-	set, err := NewDynamicMetricSet([]Dynamic{{
+	set, err := newTestSet([]Dynamic{{
 		Name:   "reqs_total",
 		Type:   CounterType,
 		Value:  "1",
@@ -382,7 +381,7 @@ func TestValueRegexp(t *testing.T) {
 	defer testEpoch.Store(0)
 
 	// Pull a number out of an unstructured line.
-	set, err := NewDynamicMetricSet([]Dynamic{{
+	set, err := newTestSet([]Dynamic{{
 		Name:        "latency_seconds_total",
 		Type:        CounterType,
 		ValueRegexp: `latency=([0-9.]+)s`,
@@ -410,7 +409,7 @@ func TestLineSelector(t *testing.T) {
 	setTimeForTest(time.Unix(1_700_200_200, 0))
 	defer testEpoch.Store(0)
 
-	set, err := NewDynamicMetricSet([]Dynamic{{
+	set, err := newTestSet([]Dynamic{{
 		Name:        "panics_total",
 		Type:        CounterType,
 		Value:       "1",
@@ -489,7 +488,7 @@ func TestLoadDynamicMetrics(t *testing.T) {
 	if len(d.Match) != 1 || len(d.MatchRegexp) != 1 || len(d.Labels) != 2 {
 		t.Errorf("selectors/labels = %+v", d)
 	}
-	if _, err := NewDynamicMetricSet(dyn); err != nil {
+	if _, err := newTestSet(dyn); err != nil {
 		t.Fatalf("building set: %v", err)
 	}
 

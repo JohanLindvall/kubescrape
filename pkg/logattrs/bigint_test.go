@@ -7,6 +7,7 @@ import "testing"
 // result still looked like an exact integer downstream, because whole floats
 // are stored with PutInt.
 func TestLargeJSONIntegerKeepsPrecision(t *testing.T) {
+	t.Parallel()
 	e, err := New(&Config{Rules: []Rule{
 		{Key: "big"}, {Key: "neg"}, {Key: "small"}, {Key: "frac"}, {Key: "exp"},
 	}})

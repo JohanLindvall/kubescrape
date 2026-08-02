@@ -24,9 +24,9 @@ func TestScrapeAuthSendsBearerTokenOnlyThere(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := New(srv.URL, 5*time.Second)
 	rotated := "tok-1"
-	c.SetScrapeAuthToken(func() string { return rotated })
+	c := New(Config{Base: srv.URL, Timeout: 5 * time.Second,
+		ScrapeAuthToken: func() string { return rotated }})
 
 	if v, err := c.ScrapeAuth(context.Background(), "ns/name/key"); err != nil || v != "s3cret" {
 		t.Fatalf("ScrapeAuth = %q, %v", v, err)

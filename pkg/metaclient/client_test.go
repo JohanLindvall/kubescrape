@@ -2,10 +2,13 @@ package metaclient
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -36,7 +39,7 @@ func cachingServer(t *testing.T, etag, body string) (*httptest.Server, *int32) {
 
 func TestClientServesFromCacheWithinTTL(t *testing.T) {
 	srv, hits := cachingServer(t, `"v1"`, `{"name":"web","uid":"u1"}`)
-	c := New(srv.URL, 5*time.Second)
+	c := New(Config{Base: srv.URL, Timeout: 5 * time.Second})
 
 	ctx := context.Background()
 	if p, err := c.PodByUID(ctx, "u1"); err != nil || p.Name != "web" {
@@ -52,7 +55,7 @@ func TestClientServesFromCacheWithinTTL(t *testing.T) {
 
 func TestClientRevalidatesAfterTTL(t *testing.T) {
 	srv, hits := cachingServer(t, `"v1"`, `{"name":"web","uid":"u1"}`)
-	c := New(srv.URL, 5*time.Second)
+	c := New(Config{Base: srv.URL, Timeout: 5 * time.Second})
 	now := time.Now()
 	c.now = func() time.Time { return now }
 
@@ -141,7 +144,7 @@ func TestClientCacheIgnoresWaitParam(t *testing.T) {
 		_, _ = w.Write([]byte(`{"containerId":"cafe01","pod":{"name":"web"}}`))
 	}))
 	t.Cleanup(srv.Close)
-	c := New(srv.URL, 5*time.Second)
+	c := New(Config{Base: srv.URL, Timeout: 5 * time.Second})
 
 	ctx := context.Background()
 	// Different wait values must resolve to the same cache entry.
@@ -164,7 +167,7 @@ func TestClientDoesNotCacheWithoutHeaders(t *testing.T) {
 		_, _ = w.Write([]byte(`{"name":"web"}`))
 	}))
 	t.Cleanup(srv.Close)
-	c := New(srv.URL, 5*time.Second)
+	c := New(Config{Base: srv.URL, Timeout: 5 * time.Second})
 
 	ctx := context.Background()
 	_, _ = c.PodByUID(ctx, "u1")
@@ -189,7 +192,7 @@ func TestClientEndpoints(t *testing.T) {
 		}
 	}))
 	defer srv.Close()
-	c := New(srv.URL, time.Second)
+	c := New(Config{Base: srv.URL, Timeout: time.Second})
 
 	pod, err := c.PodByName(context.Background(), "ns1", "pod1")
 	if err != nil || pod.Name != "pod1" || pod.UID != "u1" {
@@ -231,7 +234,7 @@ func TestCacheEviction(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := New(srv.URL, time.Second)
+	c := New(Config{Base: srv.URL, Timeout: time.Second})
 	for i := 0; i < maxCacheEntries+100; i++ {
 		if _, err := c.PodByUID(context.Background(), fmt.Sprintf("uid-%d", i)); err != nil {
 			t.Fatal(err)
@@ -258,7 +261,7 @@ func TestPodByIP(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := New(srv.URL, time.Second)
+	c := New(Config{Base: srv.URL, Timeout: time.Second})
 	pod, err := c.PodByIP(context.Background(), "10.0.0.9")
 	if err != nil || pod.Name != "web-9" {
 		t.Fatalf("pod=%+v err=%v", pod, err)
@@ -276,14 +279,13 @@ func BenchmarkCacheHitPod(b *testing.B) {
 		`"createdAt":"2026-07-01T10:00:00Z","phase":"Running","containers":[` +
 		`{"name":"app","image":"img:1","id":"c1","ports":[{"name":"http","port":8080}]},` +
 		`{"name":"sidecar","image":"img2:1","id":"c2"}]}`
-	c := New(s.URL, 5*time.Second)
+	c := New(Config{Base: s.URL, Timeout: 5 * time.Second})
 	ctx := context.Background()
 	if _, err := c.PodByUID(ctx, "u1"); err != nil { // populate
 		b.Fatal(err)
 	}
 	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		p, err := c.PodByUID(ctx, "u1")
 		if err != nil || p.Name != "web-abc" {
 			b.Fatal(err)
@@ -299,7 +301,7 @@ func TestCacheHitShallowCopyIsolation(t *testing.T) {
 	s := newSrv(t)
 	s.maxAge = "3600"
 	s.body = `{"name":"web","uid":"u1","labels":{"app":"web"}}`
-	c := New(s.URL, 5*time.Second)
+	c := New(Config{Base: s.URL, Timeout: 5 * time.Second})
 	ctx := context.Background()
 
 	p1, err := c.PodByUID(ctx, "u1")
@@ -320,7 +322,7 @@ func TestCacheHitShallowCopyIsolation(t *testing.T) {
 
 func BenchmarkCacheKeyWait(b *testing.B) {
 	b.ReportAllocs()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		if cacheKey("http://x/v1/containers/abcdef0123?wait=2s") != "http://x/v1/containers/abcdef0123" {
 			b.Fatal("bad key")
 		}
@@ -357,7 +359,7 @@ func TestConcurrentRevalidationNoSingleFlight(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	c := New(srv.URL, 5*time.Second)
+	c := New(Config{Base: srv.URL, Timeout: 5 * time.Second})
 	base := time.Now()
 	now := base
 	var mu sync.Mutex
@@ -400,8 +402,7 @@ func TestObserveNilSafe(t *testing.T) {
 		http.Error(w, "nope", http.StatusNotFound)
 	}))
 	t.Cleanup(srv.Close)
-	c := New(srv.URL, time.Second)
-	c.Observe = nil
+	c := New(Config{Base: srv.URL, Timeout: time.Second, Observe: nil})
 	if _, err := c.PodByUID(context.Background(), "u1"); !IsNotFound(err) {
 		t.Fatalf("err = %v; want 404", err)
 	}
@@ -419,7 +420,7 @@ func TestNotFoundIsNotCached(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	c := New(srv.URL, time.Second)
+	c := New(Config{Base: srv.URL, Timeout: time.Second})
 	for i := 0; i < 3; i++ {
 		if _, err := c.PodByIP(context.Background(), "10.0.0.9"); !IsNotFound(err) {
 			t.Fatalf("err = %v; want 404", err)
@@ -497,11 +498,11 @@ func newSrv(t testing.TB) *srv {
 func TestAudit_ETagRevalidation(t *testing.T) {
 	s := newSrv(t)
 	s.etag, s.maxAge = `"v1"`, "10"
-	c := New(s.URL, 5*time.Second)
+	var outcomes []string
+	c := New(Config{Base: s.URL, Timeout: 5 * time.Second,
+		Observe: func(o string) { outcomes = append(outcomes, o) }})
 	now := time.Now()
 	c.now = func() time.Time { return now }
-	var outcomes []string
-	c.Observe = func(o string) { outcomes = append(outcomes, o) }
 
 	ctx := context.Background()
 	if _, err := c.PodByName(ctx, "ns", "p"); err != nil {
@@ -539,7 +540,7 @@ func TestAudit_ETagRevalidation(t *testing.T) {
 func TestAudit_ETagWithoutMaxAge(t *testing.T) {
 	s := newSrv(t)
 	s.etag, s.maxAge = `"v1"`, "" // ETag but no max-age
-	c := New(s.URL, 5*time.Second)
+	c := New(Config{Base: s.URL, Timeout: 5 * time.Second})
 	ctx := context.Background()
 	for i := 0; i < 3; i++ {
 		if _, err := c.PodByName(ctx, "ns", "p"); err != nil {
@@ -561,7 +562,7 @@ func TestAudit_ETagWithoutMaxAge(t *testing.T) {
 func TestAudit_MaxAgeWithoutETag(t *testing.T) {
 	s := newSrv(t)
 	s.etag, s.maxAge = "", "10"
-	c := New(s.URL, 5*time.Second)
+	c := New(Config{Base: s.URL, Timeout: 5 * time.Second})
 	now := time.Now()
 	c.now = func() time.Time { return now }
 	ctx := context.Background()
@@ -585,9 +586,9 @@ func TestAudit_MaxAgeWithoutETag(t *testing.T) {
 func TestAudit_UnsolicitedNotModified(t *testing.T) {
 	s := newSrv(t)
 	s.code = 304
-	c := New(s.URL, 5*time.Second)
 	var outcome string
-	c.Observe = func(o string) { outcome = o }
+	c := New(Config{Base: s.URL, Timeout: 5 * time.Second,
+		Observe: func(o string) { outcome = o }})
 	pod, err := c.PodByName(context.Background(), "ns", "p")
 	if err == nil {
 		t.Fatalf("BUG: an unsolicited 304 with no cached entry returned pod %+v and no error", pod)
@@ -614,7 +615,7 @@ func as(err error, target **StatusError) bool {
 func TestAudit_ETagChangeRefetches(t *testing.T) {
 	s := newSrv(t)
 	s.etag, s.maxAge = `"v1"`, "10"
-	c := New(s.URL, 5*time.Second)
+	c := New(Config{Base: s.URL, Timeout: 5 * time.Second})
 	now := time.Now()
 	c.now = func() time.Time { return now }
 	ctx := context.Background()
@@ -648,9 +649,9 @@ func TestAudit_ETagChangeRefetches(t *testing.T) {
 func TestAudit_ConcurrentSameURL(t *testing.T) {
 	s := newSrv(t)
 	s.etag, s.maxAge = `"v1"`, "60"
-	c := New(s.URL, 5*time.Second)
 	var observed atomic.Int64
-	c.Observe = func(string) { observed.Add(1) }
+	c := New(Config{Base: s.URL, Timeout: 5 * time.Second,
+		Observe: func(string) { observed.Add(1) }})
 
 	const n = 64
 	var wg sync.WaitGroup
@@ -682,7 +683,7 @@ func TestAudit_ConcurrentSameURL(t *testing.T) {
 func TestAudit_ConcurrentMixedURLsRace(t *testing.T) {
 	s := newSrv(t)
 	s.etag, s.maxAge = `"v1"`, "1"
-	c := New(s.URL, 5*time.Second)
+	c := New(Config{Base: s.URL, Timeout: 5 * time.Second})
 	var wg sync.WaitGroup
 	for i := 0; i < 32; i++ {
 		wg.Add(1)
@@ -712,9 +713,9 @@ func TestAudit_ConcurrentMixedURLsRace(t *testing.T) {
 
 func TestAudit_ObserveOutcomes(t *testing.T) {
 	s := newSrv(t)
-	c := New(s.URL, 5*time.Second)
 	var got []string
-	c.Observe = func(o string) { got = append(got, o) }
+	c := New(Config{Base: s.URL, Timeout: 5 * time.Second,
+		Observe: func(o string) { got = append(got, o) }})
 	ctx := context.Background()
 
 	s.mu.Lock()
@@ -733,8 +734,8 @@ func TestAudit_ObserveOutcomes(t *testing.T) {
 	}
 
 	// Transport failure.
-	dead := New("http://127.0.0.1:1", 200*time.Millisecond)
-	dead.Observe = func(o string) { got = append(got, o) }
+	dead := New(Config{Base: "http://127.0.0.1:1", Timeout: 200 * time.Millisecond,
+		Observe: func(o string) { got = append(got, o) }})
 	if _, err := dead.PodByName(ctx, "ns", "x"); err == nil {
 		t.Fatal("dead server returned nil error")
 	}
@@ -751,9 +752,9 @@ func TestAudit_MalformedJSONObservedNotCached(t *testing.T) {
 	s := newSrv(t)
 	s.maxAge = "10"
 	s.body = `{"name": ` // truncated JSON
-	c := New(s.URL, 5*time.Second)
 	var got []string
-	c.Observe = func(o string) { got = append(got, o) }
+	c := New(Config{Base: s.URL, Timeout: 5 * time.Second,
+		Observe: func(o string) { got = append(got, o) }})
 	if _, err := c.PodByName(context.Background(), "ns", "p"); err == nil {
 		t.Fatal("truncated JSON decoded without error")
 	}
@@ -788,7 +789,7 @@ func TestAudit_ContainerNormalizesID(t *testing.T) {
 		w.Header().Set("Cache-Control", "max-age=60")
 		_, _ = w.Write([]byte(s.body))
 	})
-	c := New(s.URL, 5*time.Second)
+	c := New(Config{Base: s.URL, Timeout: 5 * time.Second})
 	ctx := context.Background()
 	if _, err := c.Container(ctx, "containerd://abc", time.Second); err != nil {
 		t.Fatal(err)
@@ -815,7 +816,7 @@ func TestCacheTypeMismatchRefetches(t *testing.T) {
 	s := newSrv(t)
 	s.etag, s.maxAge = `"v1"`, "3600"
 	s.body = `{"name":"web","namespace":"ns","uid":"u1"}`
-	c := New(s.URL, 5*time.Second)
+	c := New(Config{Base: s.URL, Timeout: 5 * time.Second})
 	ctx := context.Background()
 	u := c.base + "/v1/pods/ns/web"
 
@@ -865,7 +866,7 @@ func TestCacheTypeMismatchRefetches(t *testing.T) {
 // node-metadata refreshes against a 10s TTL) re-fetched a full body forever.
 func TestSweepKeepsStaleEntriesForRevalidation(t *testing.T) {
 	srv, hits := cachingServer(t, `"v1"`, `{"name":"web","uid":"u1"}`)
-	c := New(srv.URL, 5*time.Second)
+	c := New(Config{Base: srv.URL, Timeout: 5 * time.Second})
 	now := time.Now()
 	c.now = func() time.Time { return now }
 
@@ -895,5 +896,49 @@ func TestSweepKeepsStaleEntriesForRevalidation(t *testing.T) {
 	c.mu.Unlock()
 	if got := len(c.cache); got != 0 {
 		t.Fatalf("cache entries = %d; want 0 — an idle entry is never asked for again", got)
+	}
+}
+
+// A decode failure used to leave this package bare: the consumer saw
+// encoding/json's `invalid character 'x' ...` with nothing naming metaclient,
+// the endpoint or the URL, while every sibling failure path returned a typed
+// error. Both cache arms (a cacheable 200 and a no-store one) go through the
+// same wrapper.
+func TestDecodeErrorNamesThePackageAndTheURL(t *testing.T) {
+	for _, maxAge := range []string{"10", ""} {
+		name := "cacheable"
+		if maxAge == "" {
+			name = "no-store"
+		}
+		t.Run(name, func(t *testing.T) {
+			s := newSrv(t)
+			s.maxAge = maxAge
+			s.body = `{"name": ` // truncated JSON
+			c := New(Config{Base: s.URL, Timeout: 5 * time.Second})
+
+			_, err := c.PodByName(context.Background(), "ns", "p")
+			if err == nil {
+				t.Fatal("truncated JSON decoded without error")
+			}
+			var de *DecodeError
+			if !errors.As(err, &de) {
+				t.Fatalf("err = %v (%T), want a *DecodeError", err, err)
+			}
+			if !strings.Contains(de.URL, "/v1/pods/ns/p") {
+				t.Errorf("DecodeError.URL = %q, want the requested endpoint", de.URL)
+			}
+			msg := err.Error()
+			if !strings.Contains(msg, "metaclient") {
+				t.Errorf("the error does not name this package: %q", msg)
+			}
+			if !strings.Contains(msg, de.URL) {
+				t.Errorf("the error does not name the URL: %q", msg)
+			}
+			// The json error itself must stay reachable.
+			var se *json.SyntaxError
+			if !errors.As(err, &se) && !errors.Is(err, io.ErrUnexpectedEOF) && de.Unwrap() == nil {
+				t.Errorf("the wrapped encoding/json error is unreachable: %v", err)
+			}
+		})
 	}
 }

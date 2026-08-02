@@ -548,6 +548,12 @@ func lookup(s Span, key string) (pcommon.Value, bool) {
 
 // errPolicy formats a config error that names the offending policy, so a
 // -check-config failure points at a line rather than at a feature.
+//
+// The prefix is PREPENDED TO THE FORMAT STRING rather than rendered separately,
+// so a %w in format reaches the outer Errorf and the wrapped error stays
+// reachable by errors.Is/errors.As. Rendering the args with an inner Sprintf
+// (which this used to do) flattens them to text first, which makes %w
+// structurally impossible here and silently degrades every caller to %v.
 func errPolicy(where, format string, args ...any) error {
-	return fmt.Errorf("%s: %s", where, fmt.Sprintf(format, args...))
+	return fmt.Errorf("%s: "+format, append([]any{where}, args...)...)
 }

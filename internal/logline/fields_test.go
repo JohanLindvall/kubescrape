@@ -3,6 +3,7 @@ package logline
 import "testing"
 
 func TestRawScalarString(t *testing.T) {
+	t.Parallel()
 	// The raw-token renderer must match what DecodeAny + a type switch
 	// produced: strings unescaped, bools as literals, numbers round-tripped
 	// through float64; objects/arrays/null/malformed rejected.
@@ -40,6 +41,7 @@ func TestRawScalarString(t *testing.T) {
 // logical value must not match selectors or mint label values differently
 // depending on the line format (raw `a \"b\" c` vs decoded `a "b" c`).
 func TestLogfmtValuesUnescaped(t *testing.T) {
+	t.Parallel()
 	ki := NewKeyIndex()
 	ki.Add("msg")
 	ki.Add("plain")
@@ -58,6 +60,7 @@ func TestLogfmtValuesUnescaped(t *testing.T) {
 // Windows path or a regex, and for a recognised letter minted a label value
 // with a real control character in it.
 func TestUnquotedLogfmtValuesAreVerbatim(t *testing.T) {
+	t.Parallel()
 	ki := NewKeyIndex()
 	ki.Add("path")
 	ki.Add("re")
@@ -79,6 +82,7 @@ func TestUnquotedLogfmtValuesAreVerbatim(t *testing.T) {
 // cannot hold one, so adjacent ids collapsed into a single series while the
 // record attribute lifted from the same field stayed exact.
 func TestIntegerFieldsKeepFullPrecision(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct{ in, want string }{
 		{`9007199254740993`, `9007199254740993`}, // 2^53+1: unrepresentable as float64
 		{`1234567890123456789`, `1234567890123456789`},
@@ -99,6 +103,7 @@ func TestIntegerFieldsKeepFullPrecision(t *testing.T) {
 // on one line must not survive into the next, and a key no rule registered must
 // not resolve at all.
 func TestFieldsSlotsResetBetweenLines(t *testing.T) {
+	t.Parallel()
 	ki := NewKeyIndex()
 	ki.Add("a")
 	ki.Add("b")
@@ -139,6 +144,7 @@ func TestFieldsSlotsResetBetweenLines(t *testing.T) {
 // An empty logfmt value must read as empty and must not trip the zero-length
 // aliasing of the line.
 func TestEmptyLogfmtValue(t *testing.T) {
+	t.Parallel()
 	ki := NewKeyIndex()
 	ki.Add("a")
 	ki.Add("b")
@@ -157,6 +163,7 @@ func TestEmptyLogfmtValue(t *testing.T) {
 // immutable and the header pins the old backing array, so the reuse cannot
 // rewrite it under the caller.
 func TestLogfmtValueSurvivesReset(t *testing.T) {
+	t.Parallel()
 	ki := NewKeyIndex()
 	ki.Add("msg")
 	var f Fields

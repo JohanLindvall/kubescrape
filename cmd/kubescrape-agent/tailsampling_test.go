@@ -41,10 +41,10 @@ func tailChain(t *testing.T, proc *servicegraph.Processor) (*pipelines, serviceg
 	ctx, cancel := context.WithCancel(context.Background())
 	var wg sync.WaitGroup
 	p := &pipelines{
-		ctx: ctx, wg: &wg, log: slog.New(slog.DiscardHandler), out: out,
+		wg: &wg, log: slog.New(slog.DiscardHandler), out: out,
 		fileCfg: agentConfig{TailSampling: tailCfg()},
 	}
-	chain, err := p.buildOwnerChain(proc)
+	chain, err := p.buildOwnerChain(ctx, proc)
 	if err != nil {
 		cancel()
 		t.Fatalf("buildOwnerChain: %v", err)
@@ -114,8 +114,8 @@ func TestTailSamplingIsOffWithoutPolicies(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	var wg sync.WaitGroup
-	p := &pipelines{ctx: ctx, wg: &wg, log: slog.New(slog.DiscardHandler), out: out}
-	chain, err := p.buildOwnerChain(proc)
+	p := &pipelines{wg: &wg, log: slog.New(slog.DiscardHandler), out: out}
+	chain, err := p.buildOwnerChain(ctx, proc)
 	if err != nil {
 		t.Fatalf("buildOwnerChain: %v", err)
 	}

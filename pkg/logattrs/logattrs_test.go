@@ -1,11 +1,13 @@
 package logattrs
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
 
 	"go.opentelemetry.io/collector/pdata/pcommon"
+	"sigs.k8s.io/yaml"
 )
 
 func mustExtractor(t *testing.T, rules ...Rule) *Extractor {
@@ -18,6 +20,7 @@ func mustExtractor(t *testing.T, rules ...Rule) *Extractor {
 }
 
 func TestExtractJSON(t *testing.T) {
+	t.Parallel()
 	e := mustExtractor(t,
 		Rule{Key: "user.id", Attribute: "enduser.id", Target: TargetResource},
 		Rule{Key: "region", Target: TargetScope},
@@ -55,6 +58,7 @@ func TestExtractJSON(t *testing.T) {
 }
 
 func TestExtractLogfmt(t *testing.T) {
+	t.Parallel()
 	e := mustExtractor(t,
 		Rule{Key: "level", Target: TargetLog},
 		Rule{Key: "tenant", Target: TargetResource},
@@ -76,6 +80,7 @@ func TestExtractLogfmt(t *testing.T) {
 }
 
 func TestExtractNonStructured(t *testing.T) {
+	t.Parallel()
 	e := mustExtractor(t, Rule{Key: "level"})
 	if r := e.Extract("a plain line with no = or json"); !r.Empty() {
 		t.Errorf("plain line extracted %+v", r)
@@ -86,6 +91,7 @@ func TestExtractNonStructured(t *testing.T) {
 }
 
 func TestNilExtractor(t *testing.T) {
+	t.Parallel()
 	var e *Extractor
 	if r := e.Extract(`{"level":"warn"}`); !r.Empty() {
 		t.Errorf("nil extractor returned %+v", r)
@@ -96,6 +102,7 @@ func TestNilExtractor(t *testing.T) {
 }
 
 func TestNewErrors(t *testing.T) {
+	t.Parallel()
 	if _, err := New(&Config{Rules: []Rule{{Key: ""}}}); err == nil {
 		t.Error("empty key: want error")
 	}
@@ -105,6 +112,7 @@ func TestNewErrors(t *testing.T) {
 }
 
 func TestPutTypes(t *testing.T) {
+	t.Parallel()
 	m := pcommon.NewMap()
 	Put(m, []Attr{
 		{Key: "s", Val: "str"},
@@ -127,6 +135,7 @@ func TestPutTypes(t *testing.T) {
 }
 
 func TestKeyStability(t *testing.T) {
+	t.Parallel()
 	a := []Attr{{Key: "x", Val: "1"}, {Key: "y", Val: float64(2)}}
 	b := []Attr{{Key: "x", Val: "1"}, {Key: "y", Val: float64(2)}}
 	if Key(a) != Key(b) {
@@ -140,7 +149,26 @@ func TestKeyStability(t *testing.T) {
 	}
 }
 
+// LoadConfig loads a standalone config file. Production config arrives solely
+// through the unified agent config (cmd/kubescrape-agent -config, the
+// logAttributes section); this loader survives only for the strict-YAML
+// parse tests here — it has no place in a public package, where it dragged os
+// and sigs.k8s.io/yaml into every consumer's dependency graph for a function
+// only this file called.
+func LoadConfig(path string) (*Config, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var cfg Config
+	if err := yaml.UnmarshalStrict(data, &cfg); err != nil {
+		return nil, fmt.Errorf("%s: %w", path, err)
+	}
+	return &cfg, nil
+}
+
 func TestLoadConfig(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	path := filepath.Join(dir, "la.yaml")
 	_ = os.WriteFile(path, []byte("rules:\n  - key: user.id\n    attribute: enduser.id\n    target: resource\n  - key: level\n"), 0o644)
@@ -167,7 +195,7 @@ func BenchmarkExtractJSON(b *testing.B) {
 	}
 	line := `{"level":"info","tenant":"acme","component":"api","trace_id":"abc123","msg":"served request","dur_ms":12.5}`
 	b.ReportAllocs()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		r := e.Extract(line)
 		if len(r.Log) != 1 || len(r.Resource) != 1 || len(r.Scope) != 1 {
 			b.Fatal("bad extract")
@@ -185,7 +213,7 @@ func BenchmarkExtractLogfmt(b *testing.B) {
 	}
 	line := `level=info tenant=acme trace_id=abc123 msg="served request" dur_ms=12.5`
 	b.ReportAllocs()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		r := e.Extract(line)
 		if len(r.Log) != 1 || len(r.Resource) != 1 {
 			b.Fatal("bad extract")
@@ -200,7 +228,7 @@ func BenchmarkExtractNoMatchJSON(b *testing.B) {
 	}
 	line := `{"level":"info","msg":"served request","dur_ms":12.5}`
 	b.ReportAllocs()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		if r := e.Extract(line); len(r.Log) != 0 {
 			b.Fatal("bad extract")
 		}
@@ -212,6 +240,7 @@ func BenchmarkExtractNoMatchJSON(b *testing.B) {
 // grouping key (two sets differing only in an int64 value would merge into
 // one mis-attributed resource/scope).
 func TestKeyDistinguishesInt64Values(t *testing.T) {
+	t.Parallel()
 	a := Key([]Attr{{Key: "pid", Val: int64(1)}})
 	b := Key([]Attr{{Key: "pid", Val: int64(2)}})
 	if a == b {
@@ -231,6 +260,7 @@ func TestKeyDistinguishesInt64Values(t *testing.T) {
 // raw line, so a divergence here silently changes what a logMetrics label or a
 // logs.rules selector matches.
 func TestLogfmtValuesAreUnescaped(t *testing.T) {
+	t.Parallel()
 	e, err := New(&Config{Rules: []Rule{{Key: "msg", Attribute: "msg"}}})
 	if err != nil {
 		t.Fatal(err)

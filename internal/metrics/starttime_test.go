@@ -59,7 +59,7 @@ func TestCumulativeStartIsNotTheExportTime(t *testing.T) {
 	setTimeForTest(time.Unix(1_700_700_000, 0))
 	defer testEpoch.Store(0)
 
-	set, err := NewDynamicMetricSet([]Dynamic{{
+	set, err := newTestSet([]Dynamic{{
 		Name: "lines_total", Type: CounterType, Value: "1", Match: []string{"m=1"},
 	}})
 	if err != nil {
@@ -96,7 +96,7 @@ func TestCumulativeStartIsStableAcrossExports(t *testing.T) {
 	setTimeForTest(time.Unix(1_700_700_000, 0))
 	defer testEpoch.Store(0)
 
-	set, err := NewDynamicMetricSet([]Dynamic{{
+	set, err := newTestSet([]Dynamic{{
 		Name: "lines_total", Type: CounterType, Value: "1", Match: []string{"m=1"},
 	}})
 	if err != nil {
@@ -134,7 +134,7 @@ func TestIdleResetMovesTheStart(t *testing.T) {
 	setTimeForTest(time.Unix(base, 0))
 	defer testEpoch.Store(0)
 
-	set, err := NewDynamicMetricSet([]Dynamic{{
+	set, err := newTestSet([]Dynamic{{
 		Name: "lines_total", Type: CounterType, Value: "1", Match: []string{"m=1"},
 		MaxAge: "10s",
 	}})
@@ -191,7 +191,7 @@ func TestSyntheticBaselineZerosCarryTheStreamStart(t *testing.T) {
 	setTimeForTest(time.Unix(1_700_700_000, 0))
 	defer testEpoch.Store(0)
 
-	set, err := NewDynamicMetricSet([]Dynamic{{
+	set, err := newTestSet([]Dynamic{{
 		Name: "lines_total", Type: CounterType, Value: "1", Match: []string{"m=1"},
 	}})
 	if err != nil {
@@ -236,7 +236,7 @@ func TestExportedScopeIsNamed(t *testing.T) {
 	SetScopeVersion("v9.9.9-test")
 	defer SetScopeVersion("")
 
-	set, err := NewDynamicMetricSet([]Dynamic{{
+	set, err := newTestSet([]Dynamic{{
 		Name: "lines_total", Type: CounterType, Value: "1", Match: []string{"m=1"},
 	}})
 	if err != nil {

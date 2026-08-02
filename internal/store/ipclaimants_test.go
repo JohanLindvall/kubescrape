@@ -20,11 +20,12 @@ func BenchmarkDeletePodWithManyPods(b *testing.B) {
 			for i := 0; i < n; i++ {
 				s.UpsertPod(ipPod(fmt.Sprint(i), "p-"+fmt.Sprint(i), fmt.Sprintf("10.%d.%d.%d", i/65536, (i/256)%256, i%256)))
 			}
-			b.ResetTimer()
-			for i := 0; i < b.N; i++ {
+			i := 0
+			for b.Loop() {
 				uid := fmt.Sprint(i % n)
 				s.DeletePod(types.UID(uid))
 				s.UpsertPod(ipPod(uid, "p-"+uid, fmt.Sprintf("10.%d.%d.%d", (i%n)/65536, ((i%n)/256)%256, (i%n)%256)))
+				i++
 			}
 		})
 	}

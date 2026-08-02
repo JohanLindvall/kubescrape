@@ -3,6 +3,7 @@ package route
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
 	"go.opentelemetry.io/collector/pdata/plog"
@@ -57,6 +58,7 @@ func bodies(lds []plog.Logs) []string {
 }
 
 func TestRoutesSplitByNamespaceGlob(t *testing.T) {
+	t.Parallel()
 	def, teamA := &capDest{}, &capDest{}
 	r := New(def, []Destination{{Name: "team-a", Namespaces: []string{"team-a-*"}, Exporter: teamA}})
 
@@ -72,6 +74,7 @@ func TestRoutesSplitByNamespaceGlob(t *testing.T) {
 }
 
 func TestAllDefaultForwardsUntouched(t *testing.T) {
+	t.Parallel()
 	def := &capDest{}
 	r := New(def, []Destination{{Name: "x", Namespaces: []string{"nomatch-*"}, Exporter: &capDest{}}})
 	ld := nsLogs("a", "b")
@@ -84,6 +87,7 @@ func TestAllDefaultForwardsUntouched(t *testing.T) {
 }
 
 func TestRouteFailureFailsExport(t *testing.T) {
+	t.Parallel()
 	def := &capDest{}
 	bad := &capDest{err: errors.New("route down")}
 	r := New(def, []Destination{{Name: "bad", Namespaces: []string{"team-*"}, Exporter: bad}})
@@ -97,6 +101,7 @@ func TestRouteFailureFailsExport(t *testing.T) {
 }
 
 func TestTracesRouting(t *testing.T) {
+	t.Parallel()
 	def, teamA := &capDest{}, &capDest{}
 	r := New(def, []Destination{{Name: "team-a", Namespaces: []string{"team-a"}, Exporter: teamA}})
 	td := ptrace.NewTraces()
@@ -115,6 +120,7 @@ func TestTracesRouting(t *testing.T) {
 // payload object in place, and the spanmetrics tap Consumes it after the
 // forward — an in-place split loses the retried batch and blinds the tap.
 func TestRouterDoesNotMutateInput(t *testing.T) {
+	t.Parallel()
 	def, teamA := &capDest{}, &capDest{}
 	r := New(def, []Destination{{Name: "team-a", Namespaces: []string{"team-a-*"}, Exporter: teamA}})
 
@@ -142,6 +148,7 @@ func TestRouterDoesNotMutateInput(t *testing.T) {
 // mixed failure permanent discarded the default-destined records a retry
 // would have delivered.
 func TestMixedFailureIsNotPermanent(t *testing.T) {
+	t.Parallel()
 	def := &capDest{err: errors.New("connection refused")} // transient
 	bad := &capDest{err: &otlpexport.HTTPStatusError{Code: 400}}
 	r := New(def, []Destination{{Name: "team-a", Namespaces: []string{"team-a-*"}, Exporter: bad}})
@@ -158,5 +165,84 @@ func TestMixedFailureIsNotPermanent(t *testing.T) {
 	def.err = &otlpexport.HTTPStatusError{Code: 413}
 	if err := r.ExportLogs(context.Background(), nsLogs("default", "team-a-web")); !otlpexport.IsPermanent(err) {
 		t.Error("an all-permanent failure classified transient; the batch would retry forever")
+	}
+}
+
+// Opacity is the absence of Unwrap, not the destruction of the leaves. The
+// mixed-failure error used to keep only errors.Join's rendered string, which
+// bought the same opacity and threw away everything a caller could log or act
+// on. Both properties are asserted here because they pull in opposite
+// directions and it is easy to "fix" one by breaking the other.
+func TestPartialFailureKeepsItsLeavesButNotItsUnwrap(t *testing.T) {
+	t.Parallel()
+	def := &capDest{err: errors.New("connection refused")} // transient
+	bad := &capDest{err: &otlpexport.HTTPStatusError{Code: 400}}
+	r := New(def, []Destination{{Name: "team-a", Namespaces: []string{"team-a-*"}, Exporter: bad}})
+
+	err := r.ExportLogs(context.Background(), nsLogs("default", "team-a-web"))
+	pf, ok := err.(*partialFailure)
+	if !ok {
+		t.Fatalf("a mixed failure is %T, want *partialFailure", err)
+	}
+
+	// No classifier may reach the 400 through it.
+	var hse *otlpexport.HTTPStatusError
+	if errors.As(err, &hse) {
+		t.Error("errors.As reached a leaf: one destination's 400 is again the payload's verdict")
+	}
+	if errors.Is(err, def.err) {
+		t.Error("errors.Is reached a leaf")
+	}
+	if u := errors.Unwrap(err); u != nil {
+		t.Errorf("partialFailure implements Unwrap (%v); that is what makes it transparent to classifiers", u)
+	}
+
+	// But the leaves are still there for logging.
+	leaves := pf.Errors()
+	if len(leaves) != 2 {
+		t.Fatalf("Errors() = %d leaves, want 2", len(leaves))
+	}
+	if !errors.As(leaves[0], &hse) && !errors.As(leaves[1], &hse) {
+		t.Error("neither leaf carries the typed HTTPStatusError; the structure was destroyed after all")
+	}
+
+	// Errors() must not alias the internal slice.
+	leaves[0] = nil
+	if pf.Errors()[0] == nil {
+		t.Error("Errors() aliases the internal slice; a caller can blank the leaves")
+	}
+}
+
+// The message reaches http.Error and status.Error verbatim. errors.Join
+// separates with newlines, which is a malformed HTTP header value and an
+// unreadable gRPC status message.
+func TestPartialFailureMessageIsSingleLine(t *testing.T) {
+	t.Parallel()
+	def := &capDest{err: errors.New("connection refused")}
+	bad := &capDest{err: &otlpexport.HTTPStatusError{Code: 400}}
+	r := New(def, []Destination{{Name: "team-a", Namespaces: []string{"team-a-*"}, Exporter: bad}})
+
+	err := r.ExportLogs(context.Background(), nsLogs("default", "team-a-web"))
+	msg := err.Error()
+	if strings.ContainsAny(msg, "\n\r") {
+		t.Errorf("the multi-destination error is multi-line, and it is written to an HTTP body and a gRPC status: %q", msg)
+	}
+	// Both causes must still be readable in it.
+	if !strings.Contains(msg, "connection refused") || !strings.Contains(msg, "400") {
+		t.Errorf("the flattened message lost a cause: %q", msg)
+	}
+}
+
+// A newline INSIDE one destination's own error must be flattened too — a
+// joined error from a nested router, or an upstream body echoed back.
+func TestPartialFailureFlattensNestedNewlines(t *testing.T) {
+	t.Parallel()
+	def := &capDest{err: errors.New("first line\nsecond line")}
+	bad := &capDest{err: &otlpexport.HTTPStatusError{Code: 400}}
+	r := New(def, []Destination{{Name: "team-a", Namespaces: []string{"team-a-*"}, Exporter: bad}})
+
+	err := r.ExportLogs(context.Background(), nsLogs("default", "team-a-web"))
+	if msg := err.Error(); strings.ContainsAny(msg, "\n\r") {
+		t.Errorf("a newline inside one destination's error survived: %q", msg)
 	}
 }

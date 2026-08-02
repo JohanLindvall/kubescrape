@@ -8,7 +8,7 @@
 //
 // Responses carrying Cache-Control/ETag are cached, so repeat lookups are
 // served locally or revalidated with a conditional GET. The client has no
-// metrics dependency; set Client.Observe to feed lookup outcomes into whatever
+// metrics dependency; set Config.Observe to feed lookup outcomes into whatever
 // metrics library the caller uses.
 package metaclient
 
@@ -53,13 +53,10 @@ type Client struct {
 	http *http.Client
 	now  func() time.Time
 
-	// Observe, if set, is called once per lookup with the outcome (one of the
-	// Outcome* constants). It is the hook callers use to feed their own
-	// metrics without this package depending on a metrics library. Set it
-	// before the client is shared between goroutines — it is read without
-	// synchronization — and keep it cheap and non-blocking (it runs on the
-	// caller's goroutine).
-	Observe func(outcome string)
+	// observeFn is Config.Observe. Set once at construction and never after,
+	// so it needs no synchronization and no "set it before sharing" contract
+	// for a caller to get wrong.
+	observeFn func(outcome string)
 
 	mu    sync.Mutex
 	cache map[string]cacheEntry
@@ -73,16 +70,10 @@ type Client struct {
 	token func() string
 }
 
-// SetScrapeAuthToken installs the bearer token sent with /v1/scrape-auth
-// requests. fn is called per request so a rotated token file takes effect
-// without a restart; a nil fn (or one returning "") sends no Authorization
-// header, which the service rejects when the endpoint is enabled.
-func (c *Client) SetScrapeAuthToken(fn func() string) { c.token = fn }
-
 // observe reports an outcome when a hook is installed.
 func (c *Client) observe(outcome string) {
-	if c.Observe != nil {
-		c.Observe(outcome)
+	if c.observeFn != nil {
+		c.observeFn(outcome)
 	}
 }
 
@@ -109,14 +100,49 @@ type cacheEntry struct {
 	used time.Time
 }
 
-// New creates a client for the service at base (e.g.
-// "http://kubescrape.monitoring"). The overall request timeout must exceed
-// the wait passed to Container.
-func New(base string, timeout time.Duration) *Client {
+// Config configures a Client. Everything a caller can influence lives here, so
+// nothing has to be assigned to a Client after construction — the hooks below
+// used to be a public field and a setter, both carrying an unwritten
+// "install it before you share the client" contract that no compiler enforces.
+type Config struct {
+	// Base is the metadata service's URL, e.g. "http://kubescrape.monitoring".
+	// A trailing slash is trimmed.
+	Base string
+
+	// Timeout is the overall per-request timeout. It MUST exceed the wait
+	// passed to Container, or a blocking container lookup can never succeed.
+	Timeout time.Duration
+
+	// Observe, if set, is called once per lookup with the outcome (one of the
+	// Outcome* constants). It is the hook callers use to feed their own metrics
+	// without this package depending on a metrics library. Keep it cheap and
+	// non-blocking: it runs on the caller's goroutine, inside the lookup.
+	Observe func(outcome string)
+
+	// ScrapeAuthToken supplies the bearer token sent with /v1/scrape-auth
+	// requests (the only authenticated endpoint: it returns Secret VALUES,
+	// while the metadata endpoints return object metadata the node's kubelet
+	// already has). It is called PER REQUEST, so a rotated token file takes
+	// effect without a restart; nil — or a func returning "" — sends no
+	// Authorization header, which the service rejects when the endpoint is on.
+	ScrapeAuthToken func() string
+
+	// Transport overrides the HTTP transport. nil takes NewTransport()'s, which
+	// is tuned for this client's load and, deliberately, sets no proxy — see
+	// there before supplying your own.
+	Transport http.RoundTripper
+}
+
+// NewTransport returns the transport New uses when Config.Transport is nil. It
+// is exported so a caller that needs to change one field (a TLS config, a
+// dialer) can start from these settings rather than from
+// http.DefaultTransport's, which are wrong for this client in two ways the
+// comments below explain.
+func NewTransport() *http.Transport {
 	// A dedicated transport: DefaultTransport's MaxIdleConnsPerHost of 2
 	// forces most connections to close under the highly concurrent ingest
 	// enrichment load (everything goes to the one metadata-service host).
-	transport := &http.Transport{
+	return &http.Transport{
 		// No proxy, deliberately. The metadata service is always cluster-local,
 		// and a proxy hop REPLACES the source address /v1/self attributes the
 		// caller by — a cluster-wide HTTP_PROXY (which the conventional
@@ -135,11 +161,21 @@ func New(base string, timeout time.Duration) *Client {
 		TLSHandshakeTimeout:   10 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
 	}
+}
+
+// New creates a client for the service at cfg.Base.
+func New(cfg Config) *Client {
+	rt := cfg.Transport
+	if rt == nil {
+		rt = NewTransport()
+	}
 	return &Client{
-		base:  strings.TrimRight(base, "/"),
-		http:  &http.Client{Timeout: timeout, Transport: transport},
-		now:   time.Now,
-		cache: make(map[string]cacheEntry),
+		base:      strings.TrimRight(cfg.Base, "/"),
+		http:      &http.Client{Timeout: cfg.Timeout, Transport: rt},
+		now:       time.Now,
+		cache:     make(map[string]cacheEntry),
+		observeFn: cfg.Observe,
+		token:     cfg.ScrapeAuthToken,
 	}
 }
 
@@ -336,7 +372,7 @@ func (c *Client) fetch(ctx context.Context, u, key string, entry cacheEntry, cac
 		body, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes))
 		if err != nil {
 			c.observe(OutcomeError)
-			return err
+			return fmt.Errorf("metaclient: reading %s: %w", u, err)
 		}
 		if ttl := maxAge(resp); ttl > 0 {
 			// Decode into a value the CACHE owns, not into v: the caller may
@@ -345,7 +381,7 @@ func (c *Client) fetch(ctx context.Context, u, key string, entry cacheEntry, cac
 			dec := reflect.New(reflect.TypeOf(v).Elem())
 			if err := json.Unmarshal(body, dec.Interface()); err != nil {
 				c.observe(OutcomeError)
-				return err
+				return decodeError(u, err)
 			}
 			c.mu.Lock()
 			c.cache[key] = cacheEntry{decoded: dec.Interface(), etag: resp.Header.Get("ETag"), expires: c.now().Add(ttl), used: c.now()}
@@ -358,7 +394,7 @@ func (c *Client) fetch(ctx context.Context, u, key string, entry cacheEntry, cac
 		if err := json.Unmarshal(body, v); err != nil {
 			// Match the TTL path: an undecodable 200 is an error, not "ok".
 			c.observe(OutcomeError)
-			return err
+			return decodeError(u, err)
 		}
 		c.observe(OutcomeOK)
 		return nil
@@ -500,6 +536,28 @@ type StatusError struct {
 func (e *StatusError) Error() string {
 	return fmt.Sprintf("metadata service returned %d: %s", e.Code, e.Body)
 }
+
+// DecodeError reports a metadata-service response this client could not decode.
+// The wrapped error is encoding/json's, which on its own says only `invalid
+// character 'x' ...` — nothing about this package, the endpoint or the URL, so a
+// consumer had no way to tell a kubescrape response apart from any other JSON
+// its process decodes. The sibling failure paths return typed errors; this one
+// used to leave the package bare.
+type DecodeError struct {
+	// URL is the request whose body could not be decoded.
+	URL string
+	// Err is encoding/json's error.
+	Err error
+}
+
+func (e *DecodeError) Error() string {
+	return fmt.Sprintf("metaclient: decoding the metadata service's response from %s: %v", e.URL, e.Err)
+}
+
+func (e *DecodeError) Unwrap() error { return e.Err }
+
+// decodeError wraps a JSON decode failure with the URL that produced it.
+func decodeError(u string, err error) error { return &DecodeError{URL: u, Err: err} }
 
 // IsNotFound reports whether err is (or wraps) a 404 from the metadata
 // service.

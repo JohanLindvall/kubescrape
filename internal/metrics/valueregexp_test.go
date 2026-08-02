@@ -17,7 +17,7 @@ func TestValueRegexpFiltersWithoutRequiringANumber(t *testing.T) {
 	setTimeForTest(time.Unix(1_700_500_000, 0))
 	defer testEpoch.Store(0)
 
-	set, err := NewDynamicMetricSet([]Dynamic{
+	set, err := newTestSet([]Dynamic{
 		// Numeric capture: extracts AND filters (2 of 4 lines match).
 		{Name: "n_count", Type: GaugeType, Action: "count", ValueRegexp: `latency=(\d+)`, Match: []string{"m=1"}},
 		// Pure content filter, no capture group at all.

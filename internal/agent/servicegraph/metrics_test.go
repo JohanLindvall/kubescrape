@@ -682,8 +682,7 @@ func BenchmarkRecord(b *testing.B) {
 	e.Dimensions = []EdgeDimension{{"client_http.method", "GET"}, {"server_db.system", "postgresql"}}
 	r.Record(e) // admit the series; the benchmark measures the warm path
 	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		r.Record(e)
 	}
 }

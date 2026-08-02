@@ -22,7 +22,7 @@ func BenchmarkGzipBody(b *testing.B) {
 	body := benchBody()
 	b.SetBytes(int64(len(body)))
 	b.ReportAllocs()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		buf, err := gzipBody(body)
 		if err != nil {
 			b.Fatal(err)

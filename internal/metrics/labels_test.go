@@ -96,7 +96,7 @@ func TestResourceLabelOverrideKeysMergedIdentity(t *testing.T) {
 	resBar := pcommon.NewMap()
 	resBar.PutStr("svc", "bar")
 
-	s := newSeries(seriesSpec{name: "m", kind: kindCounter, action: actionSet, log: slog.Default()})
+	s := newTestSeries(seriesSpec{name: "m", kind: kindCounter, action: actionSet, log: slog.Default()})
 	s.observe(nil, 1, resourceAccum(resFoo), resFoo, labels{{"svc", "bar"}})
 	s.observe(nil, 1, resourceAccum(resBar), resBar, nil)
 

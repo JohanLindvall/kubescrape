@@ -3,6 +3,7 @@ package logline
 import "testing"
 
 func TestParseSelectors(t *testing.T) {
+	t.Parallel()
 	lookup := func(m map[string]string) func(string) string {
 		return func(k string) string { return m[k] }
 	}
@@ -37,6 +38,7 @@ func TestParseSelectors(t *testing.T) {
 }
 
 func TestEmptySelectorsMatchAll(t *testing.T) {
+	t.Parallel()
 	set, err := ParseSelectors(nil, nil)
 	if err != nil {
 		t.Fatal(err)

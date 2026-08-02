@@ -26,6 +26,9 @@ import (
 	"context"
 	"errors"
 	"path"
+	"slices"
+	"strconv"
+	"strings"
 
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/plog"
@@ -58,21 +61,48 @@ func joinExportErrs(errs []error) error {
 	case 1:
 		return failed[0] // single destination: classify it exactly as it is
 	}
-	joined := errors.Join(failed...)
 	for _, err := range failed {
 		if !otlpexport.IsPermanent(err) {
-			return partialFailure{joined.Error()}
+			return &partialFailure{errs: failed}
 		}
 	}
-	return joined
+	return errors.Join(failed...)
 }
 
-// partialFailure reports a mixed multi-destination failure without exposing
-// its leaves, so no classifier can read one destination's permanent rejection
-// as a verdict on the payload.
-type partialFailure struct{ msg string }
+// partialFailure reports a mixed multi-destination failure without exposing its
+// leaves to a CLASSIFIER, so no one destination's permanent rejection is read as
+// a verdict on the payload.
+//
+// Opacity here is the ABSENCE of Unwrap, not the absence of the errors:
+// errors.Is/As traverse only what Unwrap gives them, so keeping the leaves in an
+// unexported field costs nothing and leaves them available for logging and for a
+// future accessor. Destroying them to a string (which this used to do) bought
+// exactly the same opacity and threw the structure away with it.
+//
+// Error() FLATTENS: errors.Join separates with newlines, and this string is
+// handed to http.Error and status.Error, where a multi-line body is a
+// malformed header value or an unreadable gRPC status message.
+type partialFailure struct{ errs []error }
 
-func (e partialFailure) Error() string { return e.msg }
+func (e *partialFailure) Error() string {
+	var sb strings.Builder
+	sb.WriteString("export failed for ")
+	sb.WriteString(strconv.Itoa(len(e.errs)))
+	sb.WriteString(" of the payload's destinations: ")
+	for i, err := range e.errs {
+		if i > 0 {
+			sb.WriteString("; ")
+		}
+		sb.WriteString(strings.ReplaceAll(err.Error(), "\n", " "))
+	}
+	return sb.String()
+}
+
+// Errors returns the per-destination failures. It is deliberately NOT Unwrap:
+// callers that want to log or inspect the leaves may, while errors.Is/As still
+// cannot reach past this error and mistake one destination's permanent
+// rejection for the payload's verdict.
+func (e *partialFailure) Errors() []error { return slices.Clone(e.errs) }
 
 // Config is the agent config's routing section.
 type Config struct {

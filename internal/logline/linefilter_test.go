@@ -3,6 +3,7 @@ package logline
 import "testing"
 
 func TestLineFilter(t *testing.T) {
+	t.Parallel()
 	f, err := NewLineFilter([]LineRule{
 		{Action: "keep", MatchRegexp: []string{"__line__=KEEPME"}},
 		{Action: "drop", Match: []string{"__severity__=debug"}},
@@ -43,6 +44,7 @@ func TestLineFilter(t *testing.T) {
 }
 
 func TestLineFilterSample(t *testing.T) {
+	t.Parallel()
 	f, err := NewLineFilter([]LineRule{
 		{Action: "keep", MatchRegexp: []string{"__line__=noisy"}, Sample: 0.25},
 	})
@@ -65,6 +67,7 @@ func TestLineFilterSample(t *testing.T) {
 }
 
 func TestLineFilterValidation(t *testing.T) {
+	t.Parallel()
 	if _, err := NewLineFilter([]LineRule{{Action: "nope", Match: []string{"a=b"}}}); err == nil {
 		t.Error("bad action must error")
 	}

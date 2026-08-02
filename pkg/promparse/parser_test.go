@@ -390,8 +390,7 @@ func BenchmarkParseLargeScrape(b *testing.B) {
 	input := sb.String()
 	b.SetBytes(int64(len(input)))
 	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		p := Get(Options{MaxLineBytes: 1 << 20}) // the production path: pooled parser + reader
 		n := 0
 		if _, err := p.Parse(strings.NewReader(input), func(s Sample) error { n++; return nil }); err != nil {
@@ -570,5 +569,50 @@ func TestOverLongLineDoesNotEmitItsTail(t *testing.T) {
 		if malformed == 0 {
 			t.Errorf("tail=%d: over-long line not counted malformed", tail)
 		}
+	}
+}
+
+// BenchmarkParseLargeScrape REPORTS the budget; a benchmark cannot fail a
+// build, so this is what holds it. The parser exists because expfmt buffers
+// whole metric families and this has to survive 100k series: the interning
+// tables, the last-seen memcmp caches, skipSpaceTab and the keyed
+// map[string(b)] lookups all keep the per-SAMPLE cost at zero allocations, so
+// a whole scrape costs a handful (the pooled reader's growth, nothing else).
+// A fmt call, a per-line []byte->string conversion or a bytes.TrimLeft in the
+// sample path would cost one allocation PER SAMPLE and nothing else would
+// notice.
+func TestParseAllocationBudget(t *testing.T) {
+	const samples = 10_000
+	var sb strings.Builder
+	sb.WriteString("# TYPE bench_metric counter\n")
+	sb.WriteString("# HELP bench_metric a counter\n")
+	for i := 0; i < samples; i++ {
+		sb.WriteString("bench_metric_total{pod=\"pod-")
+		sb.WriteString(strings.Repeat("x", 20))
+		sb.WriteString("\",idx=\"")
+		sb.WriteByte(byte('0' + i%10))
+		sb.WriteString("\"} 12345.678\n")
+	}
+	input := sb.String()
+
+	n := 0
+	parse := func() {
+		p := Get(Options{MaxLineBytes: 1 << 20}) // the production path: pooled parser + reader
+		n = 0
+		if _, err := p.Parse(strings.NewReader(input), func(Sample) error { n++; return nil }); err != nil {
+			t.Fatal(err)
+		}
+		Put(p)
+	}
+	parse() // warm the pool and the intern tables
+	if n != samples {
+		t.Fatalf("parsed %d samples, want %d", n, samples)
+	}
+	// Whole-scrape ceiling, so a per-sample regression is 10_000x over it and
+	// cannot hide in the noise of the pooled reader's growth.
+	const ceiling = 32
+	if allocs := testing.AllocsPerRun(20, parse); allocs > ceiling {
+		t.Fatalf("parsing %d samples allocates %v times, want <= %d (a per-sample "+
+			"allocation would put this at ~%d)", samples, allocs, ceiling, samples)
 	}
 }

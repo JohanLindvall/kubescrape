@@ -5,7 +5,7 @@ import (
 
 	grpcpeer "google.golang.org/grpc/peer"
 
-	"github.com/JohanLindvall/kubescrape/pkg/kubemeta"
+	"github.com/JohanLindvall/kubescrape/internal/peerip"
 )
 
 // The connection's peer IP travels on the context from the transport handlers
@@ -13,10 +13,10 @@ import (
 type peerIPCtxKey struct{}
 
 func withPeerIP(ctx context.Context, hostport string) context.Context {
-	// kubemeta.PeerIP is shared with the metadata service's /v1/self
+	// peerip.From is shared with the metadata service's /v1/self
 	// attribution: both look the result up in the same pod-IP index, so both
 	// must canonicalise it the same way (zone stripped, 4-in-6 unmapped).
-	host := kubemeta.PeerIP(hostport)
+	host := peerip.From(hostport)
 	if host == "" {
 		return ctx
 	}

@@ -77,7 +77,7 @@ const gateServiceGraphIngest = "service-graph-ingest"
 // startServiceGraph starts the trace tier: the two receivers, the pairing
 // processor and sweeper, the span-metrics generator, the sampler and the edge
 // metric export loop. Off unless -service-graph.
-func (p *pipelines) startServiceGraph() error {
+func (p *pipelines) startServiceGraph(ctx context.Context) error {
 	if !*serviceGraphOn {
 		// A configured section that silently does nothing is indistinguishable
 		// from one that is working, so each of them says so once.
@@ -134,10 +134,10 @@ func (p *pipelines) startServiceGraph() error {
 	// not one of them.
 	res := agentSelfResource(*nodeName)
 	p.serviceGraphProc, p.serviceGraphReg, p.serviceGraphRes = proc, reg, res
-	p.spawn(func() { reg.Run(p.ctx, p.selfOut, *serviceGraphIv, res, p.log) })
-	p.spawn(func() { sweepServiceGraph(p.ctx, proc) })
+	p.spawn(func() { reg.Run(ctx, p.selfOut, *serviceGraphIv, res, p.log) })
+	p.spawn(func() { sweepServiceGraph(ctx, proc) })
 
-	owner, err := p.buildOwnerChain(proc)
+	owner, err := p.buildOwnerChain(ctx, proc)
 	if err != nil {
 		return err
 	}
@@ -152,7 +152,7 @@ func (p *pipelines) startServiceGraph() error {
 		log:      p.log,
 	}
 	p.spawn(func() {
-		if err := rcv.Run(p.ctx); err != nil {
+		if err := rcv.Run(ctx); err != nil {
 			// Fatal like the ingest listener: a shard whose internal receiver is
 			// dead accepts no re-sharded spans, and it would otherwise sit there
 			// looking healthy while its siblings' pushes fail.
@@ -162,7 +162,7 @@ func (p *pipelines) startServiceGraph() error {
 			p.stop()
 		}
 	})
-	if err := p.startServiceGraphIngest(owner); err != nil {
+	if err := p.startServiceGraphIngest(ctx, owner); err != nil {
 		return err
 	}
 	p.log.Info("trace tier started", "internalGRPC", *serviceGraphListen, "internalHTTP", *serviceGraphHTTPListen,
@@ -209,7 +209,7 @@ func ownerReceive(owner servicegraph.TracesExporter) func(context.Context, ptrac
 // head drops is never buffered for five seconds — with one caveat worth knowing:
 // the head sampler's guard rails are per SPAN, so keepErrors delivers a
 // fragment of a trace to a layer that judges whole traces.
-func (p *pipelines) buildOwnerChain(proc *servicegraph.Processor) (servicegraph.TracesExporter, error) {
+func (p *pipelines) buildOwnerChain(ctx context.Context, proc *servicegraph.Processor) (servicegraph.TracesExporter, error) {
 	// Both Client and Buffered export traces. Buffered passes a plain forwarded
 	// trace through unbuffered — the pushing sender owns the retry, and
 	// spooling would ack a sender that then stops holding it — but SPOOLS a
@@ -230,7 +230,7 @@ func (p *pipelines) buildOwnerChain(proc *servicegraph.Processor) (servicegraph.
 			st := tb.Stats()
 			return obs.TailSamplingStat{Traces: st.Traces, Spans: st.Spans}
 		})
-		p.spawn(func() { tb.Run(p.ctx) })
+		p.spawn(func() { tb.Run(ctx) })
 		chain = tb
 		// Loud, once, because this is the one pipeline in the agent that acks a
 		// payload it has not delivered: an operator reading the startup log
@@ -255,7 +255,7 @@ func (p *pipelines) buildOwnerChain(proc *servicegraph.Processor) (servicegraph.
 		chain = gen.Tap(chain)
 		smRes := agentSelfResource(*nodeName)
 		p.spanMetricsGen, p.spanMetricsRes = gen, smRes
-		p.spawn(func() { gen.Run(p.ctx, p.selfOut, *spanMetricsIv, smRes, p.log) })
+		p.spawn(func() { gen.Run(ctx, p.selfOut, *spanMetricsIv, smRes, p.log) })
 		p.log.Info("span metrics from traces enabled", "interval", *spanMetricsIv)
 	}
 	return &sgPairTap{proc: proc, inner: chain}, nil
@@ -282,7 +282,7 @@ func (t *sgPairTap) ExportTraces(ctx context.Context, td ptrace.Traces) error {
 // startServiceGraphIngest starts the tier's OTLP trace receiver for
 // applications: enrich, re-shard, and hand this shard's own share to the owner
 // chain.
-func (p *pipelines) startServiceGraphIngest(owner servicegraph.TracesExporter) error {
+func (p *pipelines) startServiceGraphIngest(ctx context.Context, owner servicegraph.TracesExporter) error {
 	if !*serviceGraphIngest || (*serviceGraphIngestGRPC == "" && *serviceGraphIngestHTTP == "") {
 		p.log.Warn("the trace tier accepts no application pushes (-service-graph-ingest=false, or both -service-graph-ingest-grpc and -service-graph-ingest-http are empty); it will only receive spans re-sharded by sibling shards")
 		return nil
@@ -335,7 +335,7 @@ func (p *pipelines) startServiceGraphIngest(owner servicegraph.TracesExporter) e
 		Logger: p.log,
 	})
 	p.spawn(func() {
-		if err := srv.Run(p.ctx); err != nil {
+		if err := srv.Run(ctx); err != nil {
 			p.log.Error("service-graph trace ingest failed; shutting down", "error", err)
 			ferr := fmt.Errorf("service-graph trace ingest: %w", err)
 			p.fatalErr.CompareAndSwap(nil, &ferr) // first fatal wins

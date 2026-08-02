@@ -454,16 +454,29 @@ var (
 		"Metadata API requests by pattern and status code.", "pattern", "code")
 )
 
-// Log-derived metrics (agent): observations the series store refused. The
-// counters live in internal/metrics (which obs imports, so they cannot be
-// declared here) and are surfaced as export-time gauges — cumulative since
-// process start.
 func init() {
 	// The build version reaches internal/metrics' own exported scopes through
 	// here: it owns BuildVersion and imports that package, so the value is
 	// pushed down rather than imported back.
 	metrics.SetScopeVersion(BuildVersion())
+}
 
+// RegisterLogMetricsDrops exposes one log-metrics set's refused observations as
+// export-time counters — cumulative since process start.
+//
+// The counts used to be PROCESS-GLOBAL atomics in internal/metrics, registered
+// unconditionally here, purely because obs imports that package and the
+// counters therefore could not be declared in obs. Registering a getter over
+// the set is what dissolves that, and it is the pattern the store stats, the
+// buffer stats and the self-metadata gauge already use. It also makes the
+// family mean what it says: registered exactly when a log-metrics set EXISTS,
+// so a published 0 is "configured and dropping nothing" rather than "the
+// feature is off", and two sets in one process no longer merge their counts
+// into one number.
+func RegisterLogMetricsDrops(set *metrics.DynamicMetricSet) {
+	if set == nil {
+		return
+	}
 	// One family, labeled by metric name — sum() over the label is the
 	// aggregate. There used to be two: an unlabeled
 	// kubescrape_log_metrics_dropped_capped_total counter beside a
@@ -481,13 +494,13 @@ func init() {
 	// unlabeled counter always published a zero.
 	Registry.CounterFuncVec("kubescrape_log_metrics_dropped_capped_total",
 		"Log-metric observations dropped because that metric's label-set cardinality cap was reached, by metric name. sum() over the label is the total. Absent until something is dropped: the label set is data-driven.",
-		"metric", metrics.DroppedCappedByMetric)
+		"metric", set.DroppedCappedByMetric)
 	Registry.CounterFunc("kubescrape_log_metrics_dropped_collision_total",
 		"Log-metric observations dropped since start because of a series hash collision.",
-		func() float64 { return float64(metrics.DroppedCollision()) })
+		func() float64 { return float64(set.DroppedCollision()) })
 	Registry.CounterFunc("kubescrape_log_metrics_dropped_nan_total",
 		"Log-metric observations dropped since start because the extracted value was NaN or +/-Inf (neither is representable as a sample).",
-		func() float64 { return float64(metrics.DroppedNaN()) })
+		func() float64 { return float64(set.DroppedNaN()) })
 }
 
 // RegisterStoreStats exposes store sizes as gauges evaluated at export time.

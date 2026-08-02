@@ -361,6 +361,9 @@ func TestOversizedUnterminatedLineKeepsOffsetsExact(t *testing.T) {
 // proportional to the log volume read. One buffer per file: the only per-chunk
 // allocations left are consume's per-line string(line).
 func TestPendingBufferIsReusedAcrossChunks(t *testing.T) {
+	if raceEnabled {
+		t.Skip("-race perturbs allocation counts")
+	}
 	ctx := context.Background()
 	tl, f := benchTailer(t, Config{Multiline: true})
 	chunk, lines := benchChunk()
@@ -376,6 +379,64 @@ func TestPendingBufferIsReusedAcrossChunks(t *testing.T) {
 	if cap(f.pendingBase) < len(chunk) {
 		t.Fatalf("carry buffer cap = %d, want >= the chunk size %d (it must be REUSED, not regrown)",
 			cap(f.pendingBase), len(chunk))
+	}
+}
+
+// BenchmarkIngestLine REPORTS the per-line budget; a benchmark cannot fail a
+// build, so this is what holds it. The line path (CRI parse, offset ledger,
+// both multiline stages, batch append) is walked once per log line on every
+// node in the fleet: a per-line closure, a fmt call, a map operation on a
+// non-string key or a re-sliced scratch buffer all cost an allocation here and
+// nothing else would notice. The only allocation the path is allowed is the
+// batch slice growing, which amortizes to well under one per line.
+func TestIngestLineAllocationBudget(t *testing.T) {
+	if raceEnabled {
+		t.Skip("-race perturbs allocation counts")
+	}
+	tl, f := benchTailer(t, Config{Multiline: true})
+	lines := benchLines(1024)
+	feedAll(tl, f, lines) // grow the batch and warm every intern cache
+	tl.batch = tl.batch[:0]
+
+	i := 0
+	allocs := testing.AllocsPerRun(len(lines), func() {
+		feedOne(tl, f, lines[i])
+		if i++; i == len(lines) {
+			i = 0
+			tl.batch = tl.batch[:0]
+		}
+	})
+	if allocs > 0.5 {
+		t.Fatalf("the per-line path allocates %v times per line, want ~0 "+
+			"(BenchmarkIngestLine reports 0 allocs/op and the design depends on it)", allocs)
+	}
+}
+
+// The flush path is the production shape: pipeline + record building + enrich +
+// export. It is NOT allocation-free — every record is a pdata log record — but
+// its budget is a small constant per line, not a function of the line's
+// content. A regression here is a per-line map or closure in the flush loop.
+func TestIngestFlushAllocationBudget(t *testing.T) {
+	if raceEnabled {
+		t.Skip("-race perturbs allocation counts")
+	}
+	ctx := context.Background()
+	tl, f := benchTailer(t, Config{Multiline: true, Enrich: true})
+	lines := benchLines(1024)
+	feedAll(tl, f, lines)
+	tl.flush(ctx)
+
+	i := 0
+	allocs := testing.AllocsPerRun(len(lines), func() {
+		feedOne(tl, f, lines[i])
+		if i++; i == len(lines) {
+			i = 0
+			tl.flush(ctx)
+		}
+	})
+	if allocs > 4 {
+		t.Fatalf("the flush path allocates %v times per line, want <= 4 "+
+			"(BenchmarkIngestFlush/enrich reports 2 allocs/op)", allocs)
 	}
 }
 

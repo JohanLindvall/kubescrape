@@ -685,8 +685,7 @@ func BenchmarkConsumePair(b *testing.B) {
 	td := sgTraces("checkout", clientSpan(0.30, nil), serverSpan(0.25, nil))
 	p.Consume(td) // warm the map and the free list
 	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		p.Consume(td)
 	}
 }
@@ -700,8 +699,7 @@ func BenchmarkConsumePairWithDimensions(b *testing.B) {
 	td := sgTraces("checkout", clientSpan(0.30, attrs), serverSpan(0.25, attrs))
 	p.Consume(td)
 	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		p.Consume(td)
 	}
 }
@@ -737,8 +735,26 @@ func BenchmarkConsumeUnpaired(b *testing.B) {
 	td := sgTraces("checkout", spans...)
 	p.Consume(td)
 	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		p.Consume(td)
+	}
+}
+
+// TestConsumeWithDimensionsIsAllocationFree covers the completed edge; this
+// covers the OTHER half of the shard's steady state — a span whose partner has
+// not arrived, which is what every span costs until it pairs. A per-span map,
+// a fmt call or a slice built per lookup would each land here.
+func TestConsumeUnpairedIsAllocationFree(t *testing.T) {
+	p := NewProcessor(Config{MaxItems: 1 << 20}, nil)
+	p.SetSink(&countSink{})
+	spans := make([]sgSpan, 100)
+	for i := range spans {
+		spans[i] = sgSpan{kind: ptrace.SpanKindClient, dur: 0.1,
+			traceID: traceID(byte(i/10) + 1), spanID: spanID(byte(i % 10))}
+	}
+	td := sgTraces("checkout", spans...)
+	p.Consume(td) // admit the half-edges: only the warm path is budgeted
+	if n := testing.AllocsPerRun(200, func() { p.Consume(td) }); n != 0 {
+		t.Errorf("Consume allocates %v times per 100-span unpaired batch, want 0", n)
 	}
 }

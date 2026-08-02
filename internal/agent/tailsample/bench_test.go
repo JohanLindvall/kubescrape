@@ -37,8 +37,7 @@ func benchDecide(b *testing.B, tr Trace, policies ...PolicyConfig) {
 	e := mustNew(b, policies...)
 	e.Decide(tr) // warm anything cacheable (the regex cache)
 	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		e.Decide(tr)
 	}
 }
@@ -81,8 +80,7 @@ func BenchmarkDecideStringAttributeRegexUncached(b *testing.B) {
 	sp := e.policies[0].p.(*stringAttrPolicy)
 	tr := benchTrace(10)
 	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		sp.cache.mu.Lock()
 		clear(sp.cache.m)
 		sp.cache.mu.Unlock()
@@ -168,4 +166,51 @@ func BenchmarkDecideManySpans(b *testing.B) {
 	p := pol("errors", TypeStatusCode)
 	p.StatusCode = &StatusCodeConfig{StatusCodes: []string{"OK"}} // never matches: full walk
 	benchDecide(b, benchTrace(200), p)
+}
+
+// The benchmarks above REPORT the budget; a benchmark cannot fail a build, so
+// this is what holds it. Decide runs once per assembled trace on the buffering
+// layer's decision goroutine, and the package's whole shape — no per-trace
+// scratch, precomputed composite names, a regex cache keyed by value — exists
+// to keep it at zero. A slice, a map, a fmt call or a closure per trace would
+// each cost one allocation and nothing else would notice.
+func TestDecideAllocationBudget(t *testing.T) {
+	excl := pol("exclude-healthz", TypeStringAttribute)
+	excl.StringAttribute = &StringAttributeConfig{Key: "http.route", Values: []string{"/healthz"}, InvertMatch: true}
+	errs := pol("errors", TypeStatusCode)
+	errs.StatusCode = &StatusCodeConfig{StatusCodes: []string{"ERROR"}}
+	slow := pol("slow", TypeLatency)
+	slow.Latency = &LatencyConfig{Threshold: "10s"}
+	num := pol("server-errors", TypeNumericAttribute)
+	num.NumericAttribute = &NumericAttributeConfig{Key: "http.status_code", MinValue: i64p(500), MaxValue: i64p(599)}
+	bl := pol("debug", TypeBooleanAttribute)
+	bl.BooleanAttribute = &BooleanAttributeConfig{Key: "sampling.debug", Value: boolp2(true)}
+	rx := pol("route-regex", TypeStringAttribute)
+	rx.StringAttribute = &StringAttributeConfig{Key: "http.route", Values: []string{"/api/v[0-9]+/.*"}, EnabledRegexMatching: true}
+
+	for _, tc := range []struct {
+		name     string
+		policies []PolicyConfig
+		trace    Trace
+	}{
+		// The single-policy shapes: one leaf of each kind that walks spans.
+		{"status-code", []PolicyConfig{errs}, benchTrace(10)},
+		{"latency", []PolicyConfig{slow}, benchTrace(10)},
+		{"string-attribute-regex", []PolicyConfig{rx}, benchTrace(10)},
+		{"probabilistic", []PolicyConfig{probPol(0.5)}, benchTrace(10)},
+		// The worst case an operator actually writes: a list where nothing
+		// matches, so every policy runs and every span is walked by each.
+		{"no-match-list", []PolicyConfig{excl, errs, slow, num, bl, probPol(0.0001)}, benchTrace(10)},
+		// A deep trace: the per-span walk must not allocate per span either.
+		{"many-spans", []PolicyConfig{errs}, benchTrace(200)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e := mustNew(t, tc.policies...)
+			tr := tc.trace
+			e.Decide(tr) // warm the regex cache
+			if allocs := testing.AllocsPerRun(200, func() { e.Decide(tr) }); allocs != 0 {
+				t.Fatalf("Decide allocates %v times per trace, want 0", allocs)
+			}
+		})
+	}
 }

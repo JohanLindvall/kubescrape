@@ -2,6 +2,8 @@ package tailsample
 
 import (
 	"encoding/binary"
+	"errors"
+	"regexp/syntax"
 	"strings"
 	"testing"
 	"time"
@@ -114,6 +116,7 @@ func latCfg(threshold, upper string) PolicyConfig {
 // --- alwaysSample -----------------------------------------------------------
 
 func TestAlwaysSample(t *testing.T) {
+	t.Parallel()
 	e := mustNew(t, pol("all", TypeAlwaysSample))
 	// Including a trace with no spans at all: alwaysSample and probabilistic
 	// are the two policies that do not depend on the assembled span set.
@@ -127,6 +130,7 @@ func TestAlwaysSample(t *testing.T) {
 // --- latency ----------------------------------------------------------------
 
 func TestLatencyPolicy(t *testing.T) {
+	t.Parallel()
 	lat := latCfg
 	for _, tc := range []struct {
 		name string
@@ -183,6 +187,7 @@ func TestLatencyPolicy(t *testing.T) {
 // --- statusCode -------------------------------------------------------------
 
 func TestStatusCodePolicy(t *testing.T) {
+	t.Parallel()
 	sc := func(codes ...string) PolicyConfig {
 		p := pol("status", TypeStatusCode)
 		p.StatusCode = &StatusCodeConfig{StatusCodes: codes}
@@ -217,6 +222,7 @@ func TestStatusCodePolicy(t *testing.T) {
 // --- stringAttribute --------------------------------------------------------
 
 func TestStringAttributePolicy(t *testing.T) {
+	t.Parallel()
 	sa := func(cfg StringAttributeConfig) PolicyConfig {
 		p := pol("attr", TypeStringAttribute)
 		p.StringAttribute = &cfg
@@ -300,6 +306,7 @@ func TestStringAttributePolicy(t *testing.T) {
 // bounded, and it must keep answering correctly while it is being bounded —
 // this repo has fixed two unbounded-map bugs this week.
 func TestStringAttributeRegexCacheIsBounded(t *testing.T) {
+	t.Parallel()
 	p := pol("attr", TypeStringAttribute)
 	p.StringAttribute = &StringAttributeConfig{
 		Key: "k", Values: []string{"^/api/"}, EnabledRegexMatching: true, CacheMaxSize: 16,
@@ -339,6 +346,7 @@ func TestStringAttributeRegexCacheIsBounded(t *testing.T) {
 // --- numericAttribute -------------------------------------------------------
 
 func TestNumericAttributePolicy(t *testing.T) {
+	t.Parallel()
 	na := func(cfg NumericAttributeConfig) PolicyConfig {
 		p := pol("num", TypeNumericAttribute)
 		p.NumericAttribute = &cfg
@@ -386,6 +394,7 @@ func TestNumericAttributePolicy(t *testing.T) {
 // --- booleanAttribute -------------------------------------------------------
 
 func TestBooleanAttributePolicy(t *testing.T) {
+	t.Parallel()
 	ba := func(key string, want bool) PolicyConfig {
 		p := pol("bool", TypeBooleanAttribute)
 		p.BooleanAttribute = &BooleanAttributeConfig{Key: key, Value: boolp(want)}
@@ -430,6 +439,7 @@ func probPol(pct float64) PolicyConfig {
 // different evaluator, which is what makes a decision taken on one node (or
 // after a restart, or on a re-assembled trace) agree with every other.
 func TestProbabilisticIsProportionalAndConsistent(t *testing.T) {
+	t.Parallel()
 	const n = 100_000
 	for _, pct := range []float64{0, 1, 10, 50, 99, 100} {
 		a := mustNew(t, probPol(pct))
@@ -461,6 +471,7 @@ func TestProbabilisticIsProportionalAndConsistent(t *testing.T) {
 // and their contents cannot change the answer. That is what lets a partially
 // assembled trace be judged the same as a complete one.
 func TestProbabilisticIgnoresTheSpanSet(t *testing.T) {
+	t.Parallel()
 	e := mustNew(t, probPol(50))
 	for i := uint64(0); i < 1000; i++ {
 		id := traceID(i)
@@ -484,6 +495,7 @@ func ratePol(sps float64) PolicyConfig {
 }
 
 func TestRateLimitingBoundsAndRefills(t *testing.T) {
+	t.Parallel()
 	e := mustNew(t, ratePol(10))
 	now := time.Unix(0, 0)
 	fixedClock(e, &now)
@@ -514,6 +526,7 @@ func TestRateLimitingBoundsAndRefills(t *testing.T) {
 // forever: it is admitted from a full bucket and the overspend is carried as
 // debt, so the long-run rate is still what was configured.
 func TestRateLimitingAdmitsOversizedTracesAndCarriesTheDebt(t *testing.T) {
+	t.Parallel()
 	e := mustNew(t, ratePol(10))
 	now := time.Unix(0, 0)
 	fixedClock(e, &now)
@@ -540,6 +553,7 @@ func TestRateLimitingAdmitsOversizedTracesAndCarriesTheDebt(t *testing.T) {
 // --- and --------------------------------------------------------------------
 
 func TestAndPolicy(t *testing.T) {
+	t.Parallel()
 	and := func(subs ...PolicyConfig) PolicyConfig {
 		p := pol("and", TypeAnd)
 		p.And = &AndConfig{SubPolicies: subs}
@@ -586,6 +600,7 @@ func TestAndPolicy(t *testing.T) {
 
 // A veto from inside an AND must stop the whole list, not just the AND.
 func TestAndVetoStopsTheOuterList(t *testing.T) {
+	t.Parallel()
 	nested := pol("exclude-globex", TypeStringAttribute)
 	nested.StringAttribute = &StringAttributeConfig{Key: "tenant", Values: []string{"globex"}, InvertMatch: true}
 	andCfg := pol("and", TypeAnd)
@@ -615,6 +630,7 @@ func compositeCfg(total float64, order []string, alloc []RateAllocationConfig, s
 // the budget, and a sub-policy that is over budget yields to the next one
 // instead of blocking it.
 func TestCompositeAllocatesPerSubPolicyBudgets(t *testing.T) {
+	t.Parallel()
 	errs := pol("errors", TypeStatusCode)
 	errs.StatusCode = &StatusCodeConfig{StatusCodes: []string{"ERROR"}}
 	rest := pol("rest", TypeAlwaysSample)
@@ -655,6 +671,7 @@ func TestCompositeAllocatesPerSubPolicyBudgets(t *testing.T) {
 // names the sub-policy rather than the composite — "why was this kept" has to
 // resolve to a rule, and a composite is a container.
 func TestCompositeOrderAndAttribution(t *testing.T) {
+	t.Parallel()
 	a := pol("a", TypeAlwaysSample)
 	b := pol("b", TypeAlwaysSample)
 	tr := mkTrace(1, nil, spanDef{start: 0, end: 1})
@@ -677,6 +694,7 @@ func TestCompositeOrderAndAttribution(t *testing.T) {
 }
 
 func TestCompositeVetoPropagates(t *testing.T) {
+	t.Parallel()
 	excl := pol("exclude", TypeStringAttribute)
 	excl.StringAttribute = &StringAttributeConfig{Key: "tenant", Values: []string{"globex"}, InvertMatch: true}
 	all := pol("rest", TypeAlwaysSample)
@@ -688,4 +706,72 @@ func TestCompositeVetoPropagates(t *testing.T) {
 	if got := e.Decide(tr); got.Sampled || got.Policy != "composite/exclude" {
 		t.Fatalf("Decide = %+v, want a veto named composite/exclude", got)
 	}
+}
+
+// errPolicy used to render its args with an inner Sprintf before the outer
+// Errorf saw them, which made %w structurally impossible: every call site that
+// carried a real error had to spell it %v, and the leaf — a regexp syntax
+// error, a duration parse error — was flattened to text at the package
+// boundary. Nothing outside could inspect it, and no linter could see the
+// problem because the %v was on a local helper.
+//
+// These assert the chain, not the message: a caller must be able to reach the
+// wrapped error with errors.As/errors.Unwrap while the rendered text still
+// names the offending policy.
+func TestCompileErrorsWrapTheirCause(t *testing.T) {
+	t.Parallel()
+	t.Run("regexp", func(t *testing.T) {
+		p := pol("route", TypeStringAttribute)
+		p.StringAttribute = &StringAttributeConfig{
+			Key: "http.route", Values: []string{"(unclosed"}, EnabledRegexMatching: true,
+		}
+		_, err := New(Config{Policies: []PolicyConfig{p}})
+		if err == nil {
+			t.Fatal("an unparseable regex compiled")
+		}
+		var se *syntax.Error
+		if !errors.As(err, &se) {
+			t.Fatalf("errors.As cannot reach regexp's *syntax.Error through the policy compiler: %v", err)
+		}
+		if !strings.Contains(err.Error(), `"route"`) {
+			t.Errorf("the error no longer names the offending policy: %v", err)
+		}
+	})
+
+	t.Run("duration", func(t *testing.T) {
+		p := pol("slow", TypeLatency)
+		p.Latency = &LatencyConfig{Threshold: "10 seconds"} // not a Go duration
+		_, err := New(Config{Policies: []PolicyConfig{p}})
+		if err == nil {
+			t.Fatal("an unparseable duration compiled")
+		}
+		// errPolicy -> config.Duration -> time.ParseDuration.
+		inner := errors.Unwrap(err)
+		if inner == nil {
+			t.Fatalf("errPolicy did not wrap its cause: %v", err)
+		}
+		leaf := errors.Unwrap(inner)
+		if leaf == nil {
+			t.Fatalf("the duration error did not wrap time.ParseDuration's: %v", inner)
+		}
+		_, want := time.ParseDuration("10 seconds")
+		if leaf.Error() != want.Error() {
+			t.Errorf("leaf = %v, want time.ParseDuration's %v", leaf, want)
+		}
+		if !strings.Contains(err.Error(), `"slow"`) {
+			t.Errorf("the error no longer names the offending policy: %v", err)
+		}
+	})
+
+	t.Run("status-code", func(t *testing.T) {
+		p := pol("errors", TypeStatusCode)
+		p.StatusCode = &StatusCodeConfig{StatusCodes: []string{"BOOM"}}
+		_, err := New(Config{Policies: []PolicyConfig{p}})
+		if err == nil {
+			t.Fatal("an unknown status code compiled")
+		}
+		if errors.Unwrap(err) == nil {
+			t.Fatalf("errPolicy did not wrap its cause: %v", err)
+		}
+	})
 }

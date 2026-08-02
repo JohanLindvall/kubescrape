@@ -798,8 +798,7 @@ func BenchmarkReshard(b *testing.B) {
 	td := realisticBatch(20, 3)
 	ctx := context.Background()
 	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		if _, err := r.Reshard(ctx, td); err != nil {
 			b.Fatal(err)
 		}
@@ -815,8 +814,7 @@ func BenchmarkReshardSingleOwner(b *testing.B) {
 	td := realisticBatch(20, 3)
 	ctx := context.Background()
 	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		if _, err := r.Reshard(ctx, td); err != nil {
 			b.Fatal(err)
 		}

@@ -7,7 +7,6 @@ package logattrs
 
 import (
 	"fmt"
-	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -15,7 +14,6 @@ import (
 
 	ljson "github.com/JohanLindvall/lightning/pkg/json"
 	"github.com/JohanLindvall/logfmt"
-	"sigs.k8s.io/yaml"
 )
 
 // Target selects where an extracted attribute lands.
@@ -87,19 +85,6 @@ type scratch struct {
 type compiledRule struct {
 	attr string
 	tgt  Target
-}
-
-// LoadConfig reads a Config from a YAML file.
-func LoadConfig(path string) (*Config, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, err
-	}
-	var cfg Config
-	if err := yaml.UnmarshalStrict(data, &cfg); err != nil {
-		return nil, fmt.Errorf("%s: %w", path, err)
-	}
-	return &cfg, nil
 }
 
 // New compiles an Extractor from cfg (nil or empty = a nil Extractor, which

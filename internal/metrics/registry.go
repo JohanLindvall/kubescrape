@@ -24,6 +24,12 @@ type Registry struct {
 	mu     sync.Mutex
 	series []*series
 	funcs  []*gaugeFunc
+	// drops are this registry's own refusal counters. They are not published:
+	// a registry has no cardinality cap and its label sets come from code, so
+	// only a 64-bit hash collision between two code-defined label sets can move
+	// them. They used to land on kubescrape_log_metrics_dropped_*, a metric
+	// documented as the LOG-derived store's.
+	drops drops
 }
 
 // registryExpiration keeps snapshot's idle handling permanently inactive —
@@ -65,7 +71,7 @@ func NewRegistry() *Registry { return &Registry{} }
 func (r *Registry) add(name, desc string, kind seriesKind, action gaugeAction, buckets []float64) *series {
 	s := newSeries(seriesSpec{
 		name: name, desc: desc, kind: kind, action: action,
-		expiration: registryExpiration, buckets: buckets,
+		expiration: registryExpiration, buckets: buckets, drops: &r.drops,
 	})
 	r.mu.Lock()
 	r.series = append(r.series, s)
@@ -357,7 +363,13 @@ func (r *Registry) Run(ctx context.Context, exp Exporter, interval time.Duration
 	for {
 		select {
 		case <-ctx.Done():
-			r.FinalExport(exp, res, log)
+			// WithoutCancel, not Background: the shutdown export needs a live
+			// deadline of its own, but it must keep whatever the caller put on
+			// the context (otlpexport's ownership marker rides there, and a
+			// bare Background would silently strip it).
+			fctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), FinalExportTimeout)
+			r.FinalExport(fctx, exp, res, log)
+			cancel()
 			return
 		case <-ticker.C:
 			if err := r.Export(ctx, exp, res); err != nil {
@@ -367,16 +379,24 @@ func (r *Registry) Run(ctx context.Context, exp Exporter, interval time.Duration
 	}
 }
 
-// FinalExport pushes one last snapshot on a fresh, bounded context — used by
-// Run's shutdown branch and by both mains AFTER wg.Wait, so counters bumped by
-// the final flushes (last batches, shutdown drops) that raced Run's own
-// shutdown export are not lost.
-func (r *Registry) FinalExport(exp Exporter, res pcommon.Resource, log *slog.Logger) {
+// FinalExportTimeout is the budget Run's own shutdown branch gives the last
+// export. Callers that pass their own context choose their own; this is only
+// for the branch that has nothing but an already-cancelled ctx to work from.
+const FinalExportTimeout = 10 * time.Second
+
+// FinalExport pushes one last snapshot — used by Run's shutdown branch and by
+// both mains AFTER wg.Wait, so counters bumped by the final flushes (last
+// batches, shutdown drops) that raced Run's own shutdown export are not lost.
+//
+// ctx is the CALLER's shutdown budget. It used to manufacture its own
+// context.Background() with a hard-coded 10s, which meant neither main could
+// fit this export inside the termination grace it was already budgeting every
+// other final export against — and a Background context also drops whatever the
+// caller put on it (otlpexport's ownership marker rides on the context).
+func (r *Registry) FinalExport(ctx context.Context, exp Exporter, res pcommon.Resource, log *slog.Logger) {
 	if log == nil {
 		log = slog.Default()
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
 	if err := r.Export(ctx, exp, res); err != nil {
 		log.Warn("final self-metrics export failed", "error", err)
 	}

@@ -78,7 +78,7 @@ func BenchmarkScrubNoMatch(b *testing.B) {
 	s, _ := New(Config{Builtin: []string{"defaults"}})
 	line := `2026-07-24T10:00:00Z INFO handled request path=/api/v1/resource status=200 duration=12ms`
 	b.ReportAllocs()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		_ = s.Scrub(line)
 	}
 }
@@ -182,7 +182,7 @@ func BenchmarkScrubHostileLongLine(b *testing.B) {
 	line := hostileLine()
 	b.SetBytes(int64(len(line)))
 	b.ReportAllocs()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		if got := s.Scrub(line); len(got) != len(line) {
 			b.Fatal("the hostile line must not be redacted")
 		}

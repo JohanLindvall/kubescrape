@@ -79,8 +79,7 @@ func BenchmarkSplitConvert(b *testing.B) {
 	var points int
 	b.SetBytes(int64(len(input)))
 	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		cb := newSplitBatcher(s, context.Background(), target, sp[0], time.Unix(2, 0))
 		conv := newConverter(cb, nil)
 		p := promparse.Get(promparse.Options{MaxLineBytes: 1 << 20})
@@ -139,8 +138,7 @@ func BenchmarkCadvisorConvert(b *testing.B) {
 			var points int
 			b.SetBytes(int64(len(input)))
 			b.ReportAllocs()
-			b.ResetTimer()
-			for i := 0; i < b.N; i++ {
+			for b.Loop() {
 				cb := newCadvisorBatcher(s, time.Unix(2, 0), context.Background())
 				conv := newConverter(cb, nil)
 				p := promparse.Get(promparse.Options{MaxLineBytes: 1 << 20})
@@ -196,8 +194,7 @@ func BenchmarkHistogramConvert(b *testing.B) {
 	var points int
 	b.SetBytes(int64(len(input)))
 	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		bt := newBatcher(func(pcommon.Resource) {}, time.Unix(1, 0), time.Unix(2, 0))
 		conv := newConverter(bt, nil)
 		p := promparse.Get(promparse.Options{MaxLineBytes: 1 << 20})
@@ -231,8 +228,7 @@ func BenchmarkConvertScrape(b *testing.B) {
 	var points int
 	b.SetBytes(int64(len(input)))
 	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		bt := newBatcher(func(pcommon.Resource) {}, time.Unix(1, 0), time.Unix(2, 0))
 		conv := newConverter(bt, nil)
 		fs := filter.session()
@@ -253,5 +249,34 @@ func BenchmarkConvertScrape(b *testing.B) {
 	}
 	if points == 0 {
 		b.Fatal("no points")
+	}
+}
+
+// The scrape loop calls fs.Keep once per SAMPLE — 100k times for the target
+// size this package exists to survive. The per-scrape name->rule-bitmask memo
+// and the per-(matcher,value) label-regex memo are what make that free after
+// the first sample of a family; a regexp.MatchString on a converted string, or
+// a map keyed by a struct built per call, would put an allocation back on every
+// sample and only a benchmark would notice.
+func TestFilterSessionAllocationBudget(t *testing.T) {
+	filter, err := newMetricFilter([]FilterRule{
+		{Action: "keep", Metrics: "http_request_duration_seconds_bucket", Labels: map[string]string{"handler": "/api"}},
+		{Action: "drop", Metrics: "(go_|promhttp_|process_start_).+"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	labels := []Label{
+		{Name: "namespace", Value: "prod-payments"},
+		{Name: "pod", Value: "payments-6f7b9c001"},
+		{Name: "handler", Value: "/api"},
+		{Name: "le", Value: "0.05"},
+	}
+	fs := filter.session()
+	fs.Keep("http_request_duration_seconds_bucket", labels) // warm both memos
+	if allocs := testing.AllocsPerRun(200, func() {
+		fs.Keep("http_request_duration_seconds_bucket", labels)
+	}); allocs != 0 {
+		t.Fatalf("the per-sample filter path allocates %v times, want 0", allocs)
 	}
 }

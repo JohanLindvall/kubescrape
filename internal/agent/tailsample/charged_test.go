@@ -33,6 +33,7 @@ func rateEvaluator(t *testing.T, perSecond float64) *Evaluator {
 // Trace.Charged the re-decision spends the bucket a second time, and the next
 // genuinely new trace is dropped for budget its predecessor's stragglers ate.
 func TestChargedReDecisionDoesNotSpendTheBudget(t *testing.T) {
+	t.Parallel()
 	ev := rateEvaluator(t, 20) // burst 20
 
 	first := ev.Decide(nSpans(1, 10))
@@ -56,6 +57,7 @@ func TestChargedReDecisionDoesNotSpendTheBudget(t *testing.T) {
 // the remaining budget still abstains, so the flag cannot be used to smuggle a
 // trace past the cap.
 func TestChargedStillRespectsTheBudget(t *testing.T) {
+	t.Parallel()
 	ev := rateEvaluator(t, 10) // burst 10
 	if d := ev.Decide(nSpans(1, 10)); !d.Sampled {
 		t.Fatal("first trace should fit the whole burst")
@@ -69,6 +71,7 @@ func TestChargedStillRespectsTheBudget(t *testing.T) {
 // Composite allocates its budget per sub-policy through the same buckets, so it
 // gets the same treatment.
 func TestChargedReDecisionDoesNotSpendACompositeBudget(t *testing.T) {
+	t.Parallel()
 	ev, err := New(Config{Policies: []PolicyConfig{{
 		Name: "comp", Type: TypeComposite,
 		Composite: &CompositeConfig{

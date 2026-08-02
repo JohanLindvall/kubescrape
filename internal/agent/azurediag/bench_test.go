@@ -78,7 +78,7 @@ func BenchmarkSplitEnvelope(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	var n int
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		n = 0
 		if err := splitEnvelope(env, func([]byte) error { n++; return nil }); err != nil {
 			b.Fatal(err)
@@ -107,8 +107,7 @@ func BenchmarkDecodeRecord(b *testing.B) {
 		var scratch [][]byte
 		b.SetBytes(int64(len(raw)))
 		b.ReportAllocs()
-		b.ResetTimer()
-		for i := 0; i < b.N; i++ {
+		for b.Loop() {
 			rec, s, err := decodeRecord(raw, scratch)
 			scratch = s
 			if err != nil || rec.metric {
@@ -121,8 +120,7 @@ func BenchmarkDecodeRecord(b *testing.B) {
 		var scratch [][]byte
 		b.SetBytes(int64(len(raw)))
 		b.ReportAllocs()
-		b.ResetTimer()
-		for i := 0; i < b.N; i++ {
+		for b.Loop() {
 			rec, s, err := decodeRecord(raw, scratch)
 			scratch = s
 			if err != nil || !rec.metric {
@@ -147,7 +145,7 @@ func BenchmarkConvertLogs(b *testing.B) {
 		b.ReportAllocs()
 		b.ResetTimer()
 		var n int
-		for i := 0; i < b.N; i++ {
+		for b.Loop() {
 			n = r.convertLogs(recs).LogRecordCount()
 		}
 		if n != 100 {
@@ -192,7 +190,7 @@ func BenchmarkConvertMetrics(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	var n int
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		n = r.convertMetrics(recs).DataPointCount()
 	}
 	if n != 500 {
@@ -220,7 +218,7 @@ func BenchmarkDecodeAll(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	var n int
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		n = len(r.decode(msgs))
 	}
 	if n != 100 {

@@ -224,11 +224,30 @@ func (r *Reader) Run(ctx context.Context) {
 		r.log.Warn("journal reader stopped; restarting", "error", err, "backoff", backoff)
 		backoff = sleepBackoff(ctx, backoff)
 	}
-	// Final flush of whatever is buffered.
-	if err := r.flush(context.Background()); err != nil {
+	// Final flush of whatever is buffered, on a DETACHED but BOUNDED context.
+	// ctx is already cancelled, so the flush needs a deadline of its own — and
+	// this was the only one of the four shutdown flushes (tailer, events,
+	// azurediag, here) that had none: an unreachable collector held it for as
+	// long as the export's own retries took, while the agent's remaining
+	// shutdown work (the final log-metrics window, span metrics, self-metrics,
+	// the disk-buffer drain) waited behind it inside a wg the main budgets at
+	// shutdownDrain. Missing the deadline loses nothing this reader owns: the
+	// cursor is committed only on a successful export, so a dropped final batch
+	// is re-read from the journal after the restart.
+	//
+	// WithoutCancel, not Background: the values the caller put on ctx (the
+	// otlpexport ownership marker rides there) must survive.
+	fctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), shutdownFlushBudget)
+	defer cancel()
+	if err := r.flush(fctx); err != nil {
 		r.log.Warn("final journal flush failed", "error", err)
 	}
 }
+
+// shutdownFlushBudget bounds the final flush above. It matches the tailer's
+// defaultShutdownBudget and the agent's other final exports; the sum has to fit
+// inside the pod's terminationGracePeriodSeconds.
+const shutdownFlushBudget = 10 * time.Second
 
 // stream opens one journal source and reads until it ends or an export fails.
 // On export failure the buffered entries are dropped; the caller restarts from

@@ -41,6 +41,7 @@ import (
 
 	"github.com/JohanLindvall/kubescrape/internal/agent/otlpexport"
 	"github.com/JohanLindvall/kubescrape/internal/bearer"
+	"github.com/JohanLindvall/kubescrape/internal/metrics"
 	"github.com/JohanLindvall/kubescrape/internal/obs"
 	"github.com/JohanLindvall/kubescrape/internal/owners"
 	"github.com/JohanLindvall/kubescrape/internal/selfmeta"
@@ -655,7 +656,11 @@ func run() error {
 		// Registry.Run's own final export raced the final flushes inside
 		// wg.Wait (the events drain, the last batches); counters they bumped
 		// would otherwise die unexported. One more export now that all are done.
-		obs.Registry.FinalExport(selfOut, selfRes, log)
+		// Bounded here, by us: ctx is cancelled by this point, and a dead
+		// collector must not hold the process past its termination grace.
+		fctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), metrics.FinalExportTimeout)
+		obs.Registry.FinalExport(fctx, selfOut, selfRes, log)
+		cancel()
 	}
 	return runErr
 }

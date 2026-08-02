@@ -14,52 +14,68 @@ import (
 
 const leLabel = "le"
 
-// Process-wide counts of observations the series store REFUSED. They are
-// exported through obs (which imports this package, so the counters cannot live
-// there) as kubescrape_log_metrics_dropped_*. Every rejection path must bump
-// one of them: a dropped observation that is only logged (at most hourly, per
-// series) is invisible loss.
-var (
-	droppedCapped    atomic.Uint64
-	droppedCollision atomic.Uint64
-	droppedNaN       atomic.Uint64
-)
+// drops counts observations the series store REFUSED, for the store that owns
+// them. Every rejection path must bump one: a dropped observation that is only
+// logged (at most hourly, per series) is invisible loss.
+//
+// These used to be PROCESS-GLOBAL atomics, purely to dodge an import cycle with
+// obs (which imports this package, so the counters could not live there). The
+// cycle dissolves the moment obs registers a getter over the instance, which is
+// the pattern six other subsystems here already use — and the globals were not
+// free: two DynamicMetricSets in one process silently merged their counts, the
+// Registry's (essentially impossible) refusals landed on a metric documented as
+// the log-metrics one, and six tests had to do before/after arithmetic to
+// isolate themselves from every other test in the package.
+type drops struct {
+	capped    atomic.Uint64
+	collision atomic.Uint64
+	nan       atomic.Uint64
 
-// DroppedCapped counts observations rejected because the series' label-set
+	mu       sync.Mutex
+	byMetric map[string]uint64
+}
+
+// Capped counts observations rejected because the series' label-set
 // cardinality cap was reached (a new label combination could not be admitted).
-func DroppedCapped() uint64 { return droppedCapped.Load() }
+func (d *drops) Capped() uint64 { return d.capped.Load() }
 
-var (
-	cappedMu       sync.Mutex
-	cappedByMetric map[string]uint64
-)
-
-// DroppedCappedByMetric reports cap-refused observations per metric name.
+// CappedByMetric reports cap-refused observations per metric name.
 //
 // The cap frees slots only through idleness, so one burst of high-cardinality
 // labels blinds a metric for maxAge + the grace window — 24h by default. An
 // aggregate counter says that happened; it does not say to WHICH metric, which
 // is the only thing an operator can act on.
-func DroppedCappedByMetric() map[string]float64 {
-	cappedMu.Lock()
-	defer cappedMu.Unlock()
-	out := make(map[string]float64, len(cappedByMetric))
-	for k, v := range cappedByMetric {
+func (d *drops) CappedByMetric() map[string]float64 {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	out := make(map[string]float64, len(d.byMetric))
+	for k, v := range d.byMetric {
 		out[k] = float64(v)
 	}
 	return out
 }
 
-// DroppedCollision counts observations rejected because their hash matched an
+// Collision counts observations rejected because their hash matched an
 // existing sample of a DIFFERENT series (a 64-bit collision; merging them would
 // corrupt both).
-func DroppedCollision() uint64 { return droppedCollision.Load() }
+func (d *drops) Collision() uint64 { return d.collision.Load() }
 
-// DroppedNaN counts observations rejected because the extracted value was not
+// NaN counts observations rejected because the extracted value was not
 // finite — NaN or +/-Inf alike. (The name predates the Inf arm; both take this
 // path, since neither is representable as a sample and both would poison every
 // aggregation the series feeds.)
-func DroppedNaN() uint64 { return droppedNaN.Load() }
+func (d *drops) NaN() uint64 { return d.nan.Load() }
+
+// recordCapped counts one cap-refused observation for metric.
+func (d *drops) recordCapped(metric string) {
+	d.capped.Add(1)
+	d.mu.Lock()
+	if d.byMetric == nil {
+		d.byMetric = map[string]uint64{}
+	}
+	d.byMetric[metric]++
+	d.mu.Unlock()
+}
 
 // seriesKind selects how observations accumulate and how the series exports.
 type seriesKind int
@@ -168,6 +184,15 @@ type series struct {
 	desc string
 	kind seriesKind
 
+	// drops is the OWNING store's refusal counters (never nil; newSeries fills
+	// it in). Per store, not per process: see the type's doc.
+	drops *drops
+	// now is the clock, in epoch seconds. nil takes the package's coarse clock,
+	// which is what production always does; a test injects its own the way
+	// store.now does, so there is no process-global override and hence no
+	// atomic load per observation paying for one.
+	now func() int64
+
 	action  gaugeAction // gauge fold mode; ignored for other kinds
 	maxSize int         // cap on distinct LABEL COMBINATIONS (config maxCardinality)
 	// maxStreams is maxSize expressed in db entries: db is keyed per BUCKET
@@ -218,6 +243,11 @@ type seriesSpec struct {
 	expiration time.Duration
 	buckets    []float64
 	log        *slog.Logger
+	// drops is the owning store's refusal counters; nil gets a private set,
+	// which is what a bare newSeries in a test wants.
+	drops *drops
+	// now overrides the coarse clock (tests).
+	now func() int64
 }
 
 var defaultBuckets = []float64{0.005, 0.01, 0.025, 0.05, 0.075, 0.1, 0.25, 0.5, 0.75, 1, 2.5, 5, 7.5, 10}
@@ -227,8 +257,18 @@ func newSeries(spec seriesSpec) *series {
 	if log == nil {
 		log = slog.Default()
 	}
+	dr := spec.drops
+	if dr == nil {
+		dr = &drops{}
+	}
+	if spec.now == nil {
+		// Only a series that will actually read the coarse clock starts it.
+		startEpochClock()
+	}
 	s := &series{
 		db:         make(map[uint64]*expiringSample),
+		drops:      dr,
+		now:        spec.now,
 		name:       spec.name,
 		desc:       spec.desc,
 		kind:       spec.kind,
@@ -247,6 +287,15 @@ func newSeries(spec seriesSpec) *series {
 	}
 	s.maxStreams = spec.maxSize * len(s.buckets)
 	return s
+}
+
+// epoch reads the series' clock: the injected one in tests, the process's
+// coarse ten-second clock otherwise.
+func (s *series) epoch() int64 {
+	if s.now != nil {
+		return s.now()
+	}
+	return coarseEpoch()
 }
 
 // initBuckets sorts out the histogram bucket bounds and precomputes the "le"
@@ -284,10 +333,10 @@ func (s *series) observe(lbls labels, value float64, resAccum resKey, res pcommo
 		// one such observation pins a counter, summary or histogram sum at Inf
 		// for the whole maxAge (24h by default), which no later real value can
 		// undo. Counted, never admitted.
-		droppedNaN.Add(1)
+		s.drops.nan.Add(1)
 		return
 	}
-	now := loadEpoch()
+	now := s.epoch()
 	base, check := s.baseAccum(lbls)
 	rl := resLabelsAccum(res, resLabels)
 	base += resAccum.accum + rl.accum
@@ -330,7 +379,7 @@ func (s *series) observe(lbls labels, value float64, resAccum resKey, res pcommo
 			if samp.check != s.streamCheck(check, i) {
 				// 64-bit collision between distinct series (~2^-64 per
 				// pair): refuse to merge.
-				droppedCollision.Add(1)
+				s.drops.collision.Add(1)
 				if now-s.lastCollision >= 3600 {
 					s.lastCollision = now
 					s.log.Warn("series hash collision, dropping observation", "metric", s.name)
@@ -386,7 +435,7 @@ func (s *series) streamCheck(check uint64, bucket int) uint64 {
 // construction; a bump pays neither the label rehash nor the avalanche.
 func (s *series) observePreHashed(lbls labels, hash, check uint64, value float64, res pcommon.Map) {
 	if math.IsNaN(value) || math.IsInf(value, 0) {
-		droppedNaN.Add(1)
+		s.drops.nan.Add(1)
 		return
 	}
 	if s.kind == kindHistogram {
@@ -394,7 +443,7 @@ func (s *series) observePreHashed(lbls labels, hash, check uint64, value float64
 		s.observe(lbls, value, resKey{}, res, nil)
 		return
 	}
-	now := loadEpoch()
+	now := s.epoch()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.recordSingle(hash, check, value, lbls, now, res, nil)
@@ -412,7 +461,7 @@ func (s *series) recordSingle(hash, check uint64, value float64, lbls labels, no
 			return
 		}
 	} else if samp.check != check {
-		droppedCollision.Add(1)
+		s.drops.collision.Add(1)
 		if now-s.lastCollision >= 3600 {
 			s.lastCollision = now
 			s.log.Warn("series hash collision, dropping observation", "metric", s.name)
@@ -489,13 +538,7 @@ func (s *series) streamStart(now int64) int64 {
 // warnCapped counts the refused observation and logs the cardinality cap at
 // most hourly (caller holds the lock).
 func (s *series) warnCapped(lbls labels, now int64) {
-	droppedCapped.Add(1)
-	cappedMu.Lock()
-	if cappedByMetric == nil {
-		cappedByMetric = map[string]uint64{}
-	}
-	cappedByMetric[s.name]++
-	cappedMu.Unlock()
+	s.drops.recordCapped(s.name)
 	if now-s.lastWarn >= 3600 {
 		s.lastWarn = now
 		s.log.Info("max label count reached for log metric",
@@ -557,7 +600,7 @@ func (s *series) record(samp *expiringSample, value float64) {
 // are reset, and deleted after a further four-minute grace period, so stale
 // series stop being exported.
 func (s *series) snapshot() []sample {
-	now := loadEpoch()
+	now := s.epoch()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	out := make([]sample, 0, len(s.db))

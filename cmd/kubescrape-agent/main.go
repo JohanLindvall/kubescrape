@@ -291,7 +291,9 @@ var (
 // lifecycle primitives (ctx/wg/stop), the common sinks and sources, and the
 // parsed config. All flag reads stay in the start functions themselves.
 type pipelines struct {
-	ctx  context.Context
+	// No ctx field: the process lifetime is a PARAMETER of every start
+	// function below, not a property of this bundle. stop stays because it is
+	// state — the one handle a pipeline uses to end the process.
 	wg   *sync.WaitGroup
 	stop context.CancelFunc
 	log  *slog.Logger
@@ -467,11 +469,7 @@ func run() error {
 		log.Info("log scrubbing enabled", "patterns", len(fileCfg.LogScrubbing.Builtin)+len(fileCfg.LogScrubbing.Rules))
 	}
 
-	// The metadata client's HTTP timeout must exceed the server-side wait —
-	// including the ingest lookups' own wait, which may be longer.
-	meta := metaclient.New(*metadataURL, max(*metadataWait, *ingestWait)+10*time.Second)
-	// The client is dependency-free by design; feed its outcomes to our metrics.
-	meta.Observe = func(outcome string) { obs.MetadataRequests.WithLabelValues(outcome).Inc() }
+	var scrapeAuthTok func() string
 	if *scrapeAuthToken != "" {
 		// /v1/scrape-auth returns Secret VALUES and is the one authenticated
 		// endpoint. Read through a cache so the file is not hit per scrape, and
@@ -484,8 +482,18 @@ func run() error {
 		if _, err := reader.Read(); err != nil {
 			return fmt.Errorf("reading -scrape-auth-token-file: %w", err)
 		}
-		meta.SetScrapeAuthToken(reader.Get)
+		scrapeAuthTok = reader.Get
 	}
+	// The metadata client's HTTP timeout must exceed the server-side wait —
+	// including the ingest lookups' own wait, which may be longer.
+	meta := metaclient.New(metaclient.Config{
+		Base:    *metadataURL,
+		Timeout: max(*metadataWait, *ingestWait) + 10*time.Second,
+		// The client is dependency-free by design; feed its outcomes to our
+		// metrics.
+		Observe:         func(outcome string) { obs.MetadataRequests.WithLabelValues(outcome).Inc() },
+		ScrapeAuthToken: scrapeAuthTok,
+	})
 
 	// The Prometheus scrape target for this process's own metrics, on its own
 	// port (see -metrics-listen). With the OTLP self-metrics push disabled
@@ -529,7 +537,10 @@ func run() error {
 		// failures the alert on that metric exists to catch. Its outcomes are
 		// counted by kubescrape_self_metadata_lookups_total instead, which is
 		// what that counter was added for.
-		selfMeta := metaclient.New(*metadataURL, max(*metadataWait, *ingestWait)+10*time.Second)
+		selfMeta := metaclient.New(metaclient.Config{
+			Base:    *metadataURL,
+			Timeout: max(*metadataWait, *ingestWait) + 10*time.Second,
+		})
 		selfPod = selfmeta.StartPod(ctx, selfResolve(selfMeta), *selfAttrsRefresh, log)
 		obs.RegisterSelfMetadata(func() bool { return selfPod() != nil })
 	}
@@ -717,6 +728,9 @@ func run() error {
 		if logMetrics, err = metrics.NewDynamicMetricSet(fileCfg.LogMetrics.Metrics, opts...); err != nil {
 			return fmt.Errorf("logs metrics config: %w", err)
 		}
+		// The refused-observation counters belong to THIS set (they used to be
+		// process globals); publish them now that one exists.
+		obs.RegisterLogMetricsDrops(logMetrics)
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -731,7 +745,6 @@ func run() error {
 	var fatalErr atomic.Pointer[error]
 
 	p := &pipelines{
-		ctx:          ctx,
 		wg:           &wg,
 		stop:         stop,
 		log:          log,
@@ -754,29 +767,29 @@ func run() error {
 		splitters:    splitters,
 		fatalErr:     &fatalErr,
 	}
-	tl, err := p.startLogs()
+	tl, err := p.startLogs(ctx)
 	if err != nil {
 		return err
 	}
-	p.startJournald()
-	if err := p.startIngest(); err != nil {
+	p.startJournald(ctx)
+	if err := p.startIngest(ctx); err != nil {
 		return err
 	}
 	// The sibling-shard clients are unrelated to the collector exporter;
 	// registered here (LIFO, so they close before it) once startServiceGraph has
 	// built them.
 	defer func() { _ = p.sgResharder.Close() }() // nil-receiver safe
-	if err := p.startServiceGraph(); err != nil {
+	if err := p.startServiceGraph(ctx); err != nil {
 		return err
 	}
-	if err := p.startEvents(); err != nil {
+	if err := p.startEvents(ctx); err != nil {
 		return err
 	}
-	if err := p.startAzure(); err != nil {
+	if err := p.startAzure(ctx); err != nil {
 		return err
 	}
-	sc := p.startScraper()
-	p.startDebugServer(tl, sc)
+	sc := p.startScraper(ctx)
+	p.startDebugServer(ctx, tl, sc)
 
 	<-ctx.Done()
 	log.Info("shutting down")
@@ -848,7 +861,11 @@ func run() error {
 		// Registry.Run's own final export raced the final flushes inside
 		// wg.Wait; counters they bumped (last batches, shutdown drops) would
 		// otherwise die unexported. One more export now that everything is done.
-		obs.Registry.FinalExport(selfOut, selfRes, log)
+		// Budgeted here, like every other final export above: ctx is cancelled
+		// by this point, and a dead collector must not outlive the pod's grace.
+		fctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), metrics.FinalExportTimeout)
+		obs.Registry.FinalExport(fctx, selfOut, selfRes, log)
+		cancel()
 	}
 	if finalDrain != nil {
 		// Everything above only reached the SPOOL: Buffered.Run stopped when
@@ -869,7 +886,7 @@ func run() error {
 
 // startLogs starts the container/plain-file log tailer. The returned Tailer
 // (nil when -logs is off) is exposed on /debug/tailer.
-func (p *pipelines) startLogs() (*tailer.Tailer, error) {
+func (p *pipelines) startLogs(ctx context.Context) (*tailer.Tailer, error) {
 	if !*logsOn {
 		return nil, nil
 	}
@@ -913,7 +930,7 @@ func (p *pipelines) startLogs() (*tailer.Tailer, error) {
 		Logger:            p.log,
 	})
 	p.spawn(func() {
-		tl.Run(p.ctx)
+		tl.Run(ctx)
 	})
 	if *positionsFile == "" {
 		p.log.Warn("no -positions-file: offsets are not persisted (a restart re-reads per -logs-unknown-files; journald starts at the tail)")
@@ -923,7 +940,7 @@ func (p *pipelines) startLogs() (*tailer.Tailer, error) {
 }
 
 // startJournald starts the systemd journal reader.
-func (p *pipelines) startJournald() {
+func (p *pipelines) startJournald(ctx context.Context) {
 	if !*journaldOn {
 		return
 	}
@@ -946,7 +963,7 @@ func (p *pipelines) startJournald() {
 		Logger:        p.log,
 	})
 	p.spawn(func() {
-		jr.Run(p.ctx)
+		jr.Run(ctx)
 	})
 	p.log.Info("journald reader started", "dir", *journaldDir, "units", *journaldUnits, "positions", *positionsFile)
 }
@@ -954,7 +971,7 @@ func (p *pipelines) startJournald() {
 // startEvents starts the cluster-singleton Kubernetes events reader under a
 // leader election, so exactly one replica watches (N watchers would emit N
 // copies of every event).
-func (p *pipelines) startEvents() error {
+func (p *pipelines) startEvents(ctx context.Context) error {
 	if !*eventsOn {
 		return nil
 	}
@@ -995,7 +1012,7 @@ func (p *pipelines) startEvents() error {
 	p.spawn(func() {
 		// The election goroutine must be inside the WaitGroup: ReleaseOnCancel
 		// only hands the lease back if Run returns before the process exits.
-		err := leader.Run(p.ctx, leader.Config{
+		err := leader.Run(ctx, leader.Config{
 			Client:    client,
 			Namespace: ns,
 			Name:      *eventsLease,
@@ -1029,7 +1046,7 @@ const gateAzure = "azure-eventhub"
 // -events (run it in the same singleton Deployment), but with NO leader
 // election: the Kafka consumer group is its coordination, so replicas > 1
 // simply share partitions.
-func (p *pipelines) startAzure() error {
+func (p *pipelines) startAzure(ctx context.Context) error {
 	if !*azureOn {
 		return nil
 	}
@@ -1065,7 +1082,7 @@ func (p *pipelines) startAzure() error {
 		Logger:       p.log,
 		Ready:        func() { p.ready.done(gateAzure) },
 	})
-	p.spawn(func() { reader.Run(p.ctx) })
+	p.spawn(func() { reader.Run(ctx) })
 	p.log.Info("azure diagnostics enabled", "brokers", kafka.Brokers,
 		"topics", kafka.Topics, "group", kafka.Group, "start", kafka.Start)
 	return nil
@@ -1094,7 +1111,7 @@ func kubeConfig(path string) (*rest.Config, error) {
 // per-node receiver holds an arbitrary subset of them by construction. So the
 // trace receiver lives on the -service-graph tier, which re-shards by trace id
 // until one process does hold the whole thing (startServiceGraph).
-func (p *pipelines) startIngest() error {
+func (p *pipelines) startIngest(ctx context.Context) error {
 	if !*ingestOn {
 		return nil
 	}
@@ -1124,7 +1141,7 @@ func (p *pipelines) startIngest() error {
 		Logger:      p.log,
 	})
 	p.spawn(func() {
-		if err := srv.Run(p.ctx); err != nil {
+		if err := srv.Run(ctx); err != nil {
 			// A dead ingest listener (e.g. the port already bound) must not
 			// leave the agent looking healthy while apps push into a void:
 			// shut the agent down and exit non-zero so the failure is
@@ -1142,7 +1159,7 @@ func (p *pipelines) startIngest() error {
 // startScraper starts the Prometheus scraper (annotation/ServiceMonitor
 // targets and/or kubelet cadvisor+node scrapes). The returned Scraper (nil
 // when scraping is off) is exposed on /debug/targets.
-func (p *pipelines) startScraper() *promscrape.Scraper {
+func (p *pipelines) startScraper(ctx context.Context) *promscrape.Scraper {
 	kubeletScrapes := *kubeletEndpoint != "" && (*cadvisorOn || *nodeOn)
 	var sc0 *promscrape.Scraper
 	if *metricsOn || kubeletScrapes {
@@ -1178,7 +1195,7 @@ func (p *pipelines) startScraper() *promscrape.Scraper {
 			StartTime:        time.Now(),
 		})
 		p.spawn(func() {
-			sc.Run(p.ctx)
+			sc.Run(ctx)
 		})
 		p.log.Info("prometheus scraper started", "node", *nodeName, "interval", *scrapeInterval,
 			"targets", *metricsOn, "cadvisor", kubeletScrapes && *cadvisorOn, "nodeMetrics", kubeletScrapes && *nodeOn)
@@ -1189,7 +1206,7 @@ func (p *pipelines) startScraper() *promscrape.Scraper {
 
 // startDebugServer serves /healthz, /readyz and the /debug endpoints on
 // -listen, shutting down on ctx cancel.
-func (p *pipelines) startDebugServer(tl *tailer.Tailer, sc *promscrape.Scraper) {
+func (p *pipelines) startDebugServer(ctx context.Context, tl *tailer.Tailer, sc *promscrape.Scraper) {
 	if *listen == "" {
 		return
 	}
@@ -1256,7 +1273,7 @@ func (p *pipelines) startDebugServer(tl *tailer.Tailer, sc *promscrape.Scraper) 
 		}
 	}()
 	go func() {
-		<-p.ctx.Done()
+		<-ctx.Done()
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		_ = srv.Shutdown(shutdownCtx)

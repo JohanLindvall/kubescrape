@@ -70,8 +70,7 @@ func BenchmarkAssembleByPushSize(b *testing.B) {
 				buf := benchBuffer(b, 1<<20)
 				ctx := context.Background()
 				b.ReportAllocs()
-				b.ResetTimer()
-				for i := 0; i < b.N; i++ {
+				for b.Loop() {
 					for _, p := range payloads {
 						if err := buf.ExportTraces(ctx, p); err != nil {
 							b.Fatal(err)

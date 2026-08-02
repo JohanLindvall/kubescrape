@@ -18,7 +18,7 @@ import (
 // accumulators of the merged label set that admit() serializes. With the new
 // linear-projection combineHash this must stay exact (wrapping sum fold).
 func TestHistogramLeFoldExact(t *testing.T) {
-	s := newSeries(seriesSpec{name: "h", kind: kindHistogram, buckets: []float64{0.1, 0.5, 1}})
+	s := newTestSeries(seriesSpec{name: "h", kind: kindHistogram, buckets: []float64{0.1, 0.5, 1}})
 
 	for _, lbls := range []labels{
 		labels{}.set("handler", "/api"),
@@ -60,17 +60,16 @@ func TestCollisionDropObserve(t *testing.T) {
 	setTimeForTest(time.Unix(1_700_400_000, 0))
 	defer testEpoch.Store(0)
 
-	s := newSeries(seriesSpec{name: "c", kind: kindCounter})
+	s := newTestSeries(seriesSpec{name: "c", kind: kindCounter})
 	lbls := labels{}.set("u", "alice")
 	s.observe(lbls, 1, resKey{}, emptyResource, nil)
 
 	for _, samp := range s.db {
 		samp.check++ // simulate: existing sample belongs to a colliding series
 	}
-	before := DroppedCollision()
 	s.observe(lbls, 5, resKey{}, emptyResource, nil)
-	if got := DroppedCollision() - before; got != 1 {
-		t.Fatalf("droppedCollision delta = %d, want 1", got)
+	if got := s.drops.Collision(); got != 1 {
+		t.Fatalf("collision drops = %d, want 1", got)
 	}
 	for _, samp := range s.db {
 		if samp.value != 1 {
@@ -79,16 +78,15 @@ func TestCollisionDropObserve(t *testing.T) {
 	}
 
 	// observePreHashed path (registry counters).
-	s2 := newSeries(seriesSpec{name: "c2", kind: kindCounter, expiration: registryExpiration})
+	s2 := newTestSeries(seriesSpec{name: "c2", kind: kindCounter, expiration: registryExpiration})
 	b := newBound(s2, labels{}.set("k", "v"))
 	b.observe(1)
 	for _, samp := range s2.db {
 		samp.check++
 	}
-	before = DroppedCollision()
 	b.observe(1)
-	if got := DroppedCollision() - before; got != 1 {
-		t.Fatalf("observePreHashed droppedCollision delta = %d, want 1", got)
+	if got := s2.drops.Collision(); got != 1 {
+		t.Fatalf("observePreHashed collision drops = %d, want 1", got)
 	}
 }
 
@@ -99,7 +97,7 @@ func TestHistogramCollisionAllOrNothing(t *testing.T) {
 	setTimeForTest(time.Unix(1_700_400_100, 0))
 	defer testEpoch.Store(0)
 
-	s := newSeries(seriesSpec{name: "h", kind: kindHistogram, buckets: []float64{1, 10}})
+	s := newTestSeries(seriesSpec{name: "h", kind: kindHistogram, buckets: []float64{1, 10}})
 	lbls := labels{}.set("k", "v")
 	s.observe(lbls, 0.5, resKey{}, emptyResource, nil) // all 3 streams admitted, count 1 each
 
@@ -111,10 +109,9 @@ func TestHistogramCollisionAllOrNothing(t *testing.T) {
 			done = true
 		}
 	}
-	before := DroppedCollision()
 	s.observe(lbls, 0.5, resKey{}, emptyResource, nil)
-	if got := DroppedCollision() - before; got != 1 {
-		t.Fatalf("droppedCollision delta = %d, want 1", got)
+	if got := s.drops.Collision(); got != 1 {
+		t.Fatalf("collision drops = %d, want 1", got)
 	}
 	for _, samp := range s.db {
 		if samp.count != 1 {
@@ -130,16 +127,15 @@ func TestResourceAccumCollisionCaught(t *testing.T) {
 	setTimeForTest(time.Unix(1_700_400_200, 0))
 	defer testEpoch.Store(0)
 
-	s := newSeries(seriesSpec{name: "c", kind: kindCounter})
+	s := newTestSeries(seriesSpec{name: "c", kind: kindCounter})
 	lbls := labels{}.set("k", "v")
 	resA := res(map[string]string{"k8s.pod.name": "pod-a"})
 	resB := res(map[string]string{"k8s.pod.name": "pod-b"})
 
 	s.observe(lbls, 1, resKey{accum: 12345, check: 1}, resA, nil)
-	before := DroppedCollision()
 	s.observe(lbls, 1, resKey{accum: 12345, check: 2}, resB, nil)
-	if got := DroppedCollision() - before; got != 1 {
-		t.Fatalf("droppedCollision delta = %d, want 1", got)
+	if got := s.drops.Collision(); got != 1 {
+		t.Fatalf("collision drops = %d, want 1", got)
 	}
 	if len(s.db) != 1 {
 		t.Fatalf("samples = %d, want 1 (collision must not admit)", len(s.db))
@@ -160,13 +156,15 @@ func TestEvictThenReadmitAtCap(t *testing.T) {
 	setTimeForTest(time.Unix(t0, 0))
 	defer testEpoch.Store(0)
 
-	s := newSeries(seriesSpec{name: "c", kind: kindCounter, maxSize: 1, expiration: 60 * time.Second})
+	s := newTestSeries(seriesSpec{name: "c", kind: kindCounter, maxSize: 1, expiration: 60 * time.Second})
 	s.observe(labels{}.set("u", "a"), 1, resKey{}, emptyResource, nil)
 
-	beforeCap := DroppedCapped()
 	s.observe(labels{}.set("u", "b"), 1, resKey{}, emptyResource, nil)
-	if got := DroppedCapped() - beforeCap; got != 1 {
-		t.Fatalf("droppedCapped delta = %d, want 1", got)
+	if got := s.drops.Capped(); got != 1 {
+		t.Fatalf("cap drops = %d, want 1", got)
+	}
+	if got := s.drops.CappedByMetric()["c"]; got != 1 {
+		t.Fatalf("cap drops for metric c = %v, want 1", got)
 	}
 
 	// Past expiration + 4 min grace: the sweep deletes u=a. Its single
@@ -204,7 +202,7 @@ func TestExpiryEmitsBeforeDiscarding(t *testing.T) {
 	defer testEpoch.Store(0)
 
 	// maxAge 10s, export gap 30s — a legal configuration (maxAge: 10s).
-	s := newSeries(seriesSpec{name: "c", kind: kindCounter, expiration: 10 * time.Second})
+	s := newTestSeries(seriesSpec{name: "c", kind: kindCounter, expiration: 10 * time.Second})
 	s.observe(labels{}.set("k", "v"), 1, resKey{}, emptyResource, nil)
 
 	setTimeForTest(time.Unix(t0+30, 0)) // first export 30s later
@@ -243,7 +241,7 @@ func TestAggregationsAcrossThreeExports(t *testing.T) {
 	for _, c := range actions {
 		t0 := int64(1_700_600_000)
 		setTimeForTest(time.Unix(t0, 0))
-		s := newSeries(seriesSpec{name: "g", kind: kindGauge, action: c.action, expiration: time.Hour})
+		s := newTestSeries(seriesSpec{name: "g", kind: kindGauge, action: c.action, expiration: time.Hour})
 		lbls := labels{}.set("m", "1")
 		for _, v := range []float64{10, 5, 20} {
 			s.observe(lbls, v, resKey{}, emptyResource, nil)
@@ -278,7 +276,7 @@ func TestAggregationsAcrossThreeExports(t *testing.T) {
 // unknown action must fail startup, never silently mean something else.
 func TestUnknownAggregationActionsRejected(t *testing.T) {
 	for _, action := range []string{"stddev", "range", "p99"} {
-		_, err := NewDynamicMetricSet([]Dynamic{{
+		_, err := newTestSet([]Dynamic{{
 			Name: "g", Type: GaugeType, Action: action, Value: "v", Match: []string{"m=1"},
 		}})
 		if err == nil || !strings.Contains(err.Error(), "invalid gauge action") {
@@ -309,7 +307,7 @@ func TestResourceAndDataPointLabelsHaveSeparateHashDomains(t *testing.T) {
 	setTimeForTest(time.Unix(1_701_100_000, 0))
 	defer testEpoch.Store(0)
 
-	set, err := NewDynamicMetricSet([]Dynamic{
+	set, err := newTestSet([]Dynamic{
 		{Name: "shared_total", Type: CounterType, Value: "1", Match: []string{"kind=dp"},
 			Labels: []string{"tenant=$tenant"}},
 		{Name: "shared_total", Type: CounterType, Value: "1", Match: []string{"kind=res"},
@@ -371,7 +369,7 @@ func TestResourceValueSwapDoesNotCollide(t *testing.T) {
 	setTimeForTest(time.Unix(1_701_200_000, 0))
 	defer testEpoch.Store(0)
 
-	set, err := NewDynamicMetricSet([]Dynamic{{
+	set, err := newTestSet([]Dynamic{{
 		Name: "peer_total", Type: CounterType, Value: "1",
 		Labels: []string{"k8s.pod.name=$peer"}, // a line field named like a resource attr
 	}})
@@ -410,7 +408,7 @@ func TestDeleteEmitsNeverExportedSample(t *testing.T) {
 
 	// maxAge 30s, export interval 5m: both legal, and their combination means
 	// idle == 300-30 == 270 >= 240 at the very first export.
-	s := newSeries(seriesSpec{name: "c", kind: kindCounter, expiration: 30 * time.Second})
+	s := newTestSeries(seriesSpec{name: "c", kind: kindCounter, expiration: 30 * time.Second})
 	s.observe(labels{}.set("k", "v"), 7, resKey{}, emptyResource, nil)
 
 	setTimeForTest(time.Unix(t0+300, 0)) // the first export after the observation
@@ -430,7 +428,7 @@ func TestAggregatingGaugeEmittedBeforeDelete(t *testing.T) {
 	defer testEpoch.Store(0)
 
 	// action=avg is an aggregating gauge; expiration 30s, export interval 5m.
-	s := newSeries(seriesSpec{name: "g", kind: kindGauge, action: actionAvg, expiration: 30 * time.Second})
+	s := newTestSeries(seriesSpec{name: "g", kind: kindGauge, action: actionAvg, expiration: 30 * time.Second})
 	s.observe(labels{}.set("k", "v"), 5, resKey{}, emptyResource, nil)
 
 	setTimeForTest(time.Unix(t0+300, 0)) // first export after the observation
@@ -455,7 +453,7 @@ func TestAggregatingGaugeNotReEmittedAtDelete(t *testing.T) {
 	setTimeForTest(time.Unix(t0, 0))
 	defer testEpoch.Store(0)
 
-	s := newSeries(seriesSpec{name: "g", kind: kindGauge, action: actionAvg, expiration: 30 * time.Second})
+	s := newTestSeries(seriesSpec{name: "g", kind: kindGauge, action: actionAvg, expiration: 30 * time.Second})
 	s.observe(labels{}.set("k", "v"), 5, resKey{}, emptyResource, nil)
 
 	// First snapshot within the grace window: the aggregating branch emits the
@@ -484,7 +482,7 @@ func TestHistogramIdleEmitThroughExport(t *testing.T) {
 	setTimeForTest(time.Unix(t0, 0))
 	defer testEpoch.Store(0)
 
-	set, err := NewDynamicMetricSet([]Dynamic{{
+	set, err := newTestSet([]Dynamic{{
 		Name:    "lat_seconds",
 		Type:    HistogramType,
 		Value:   "d",
@@ -547,7 +545,7 @@ func TestHistogramIdleEmitKeepsAllBuckets(t *testing.T) {
 	defer testEpoch.Store(0)
 
 	// maxAge 30s, export gap 60s — a legal configuration.
-	s := newSeries(seriesSpec{name: "h", kind: kindHistogram,
+	s := newTestSeries(seriesSpec{name: "h", kind: kindHistogram,
 		buckets: []float64{1, 5, 7.5, 10}, expiration: 30 * time.Second})
 	lbls := labels{}.set("route", "/x")
 
@@ -615,7 +613,7 @@ func TestGaugeActions(t *testing.T) {
 			setTimeForTest(time.Unix(1_700_200_000, 0))
 			defer testEpoch.Store(0)
 
-			set, err := NewDynamicMetricSet([]Dynamic{{
+			set, err := newTestSet([]Dynamic{{
 				Name:   "g",
 				Type:   GaugeType,
 				Action: c.action,
@@ -654,7 +652,7 @@ func TestGaugeAggregations(t *testing.T) {
 		t.Run(c.action, func(t *testing.T) {
 			setTimeForTest(time.Unix(1_700_300_000, 0))
 			defer testEpoch.Store(0)
-			set, err := NewDynamicMetricSet([]Dynamic{{
+			set, err := newTestSet([]Dynamic{{
 				Name: "g", Type: GaugeType, Action: c.action, Value: "v", Match: []string{"m=1"},
 			}})
 			if err != nil {
@@ -674,7 +672,7 @@ func TestGaugeAggregations(t *testing.T) {
 func TestGaugeAggregationWindow(t *testing.T) {
 	setTimeForTest(time.Unix(1_700_300_100, 0))
 	defer testEpoch.Store(0)
-	set, err := NewDynamicMetricSet([]Dynamic{{
+	set, err := newTestSet([]Dynamic{{
 		Name: "g", Type: GaugeType, Action: "max", Value: "v", Match: []string{"m=1"},
 	}})
 	if err != nil {

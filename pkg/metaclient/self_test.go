@@ -47,7 +47,7 @@ func selfServer(t *testing.T, body string) (*httptest.Server, *int32, func() []s
 // costs nothing at all.
 func TestSelfServedFromCacheWithinTTL(t *testing.T) {
 	srv, hits, _ := selfServer(t, `{"name":"kubescrape-agent-xyz","namespace":"monitoring","uid":"agent-uid"}`)
-	c := New(srv.URL, 5*time.Second)
+	c := New(Config{Base: srv.URL, Timeout: 5 * time.Second})
 
 	ctx := context.Background()
 	pod, err := c.Self(ctx)
@@ -70,7 +70,7 @@ func TestSelfServedFromCacheWithinTTL(t *testing.T) {
 // when nothing changed.
 func TestSelfRevalidatesAfterTTL(t *testing.T) {
 	srv, hits, conds := selfServer(t, `{"name":"kubescrape-agent-xyz","namespace":"monitoring","uid":"agent-uid"}`)
-	c := New(srv.URL, 5*time.Second)
+	c := New(Config{Base: srv.URL, Timeout: 5 * time.Second})
 	now := time.Now()
 	c.now = func() time.Time { return now }
 
@@ -105,7 +105,7 @@ func TestSelfUnresolved(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := New(srv.URL, time.Second)
+	c := New(Config{Base: srv.URL, Timeout: time.Second})
 	for i := range 2 {
 		if pod, err := c.Self(context.Background()); err == nil {
 			t.Fatalf("attempt %d: Self returned %+v; want an error for an unattributable caller", i, pod)

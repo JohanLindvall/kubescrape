@@ -19,6 +19,12 @@ import (
 	"github.com/JohanLindvall/kubescrape/internal/obs"
 )
 
+// debounce is how long a fsnotify burst is coalesced before the file is
+// re-read: a ConfigMap update replaces several directory entries around the
+// ..data symlink swap, and re-reading on the first of them can catch the
+// half-swapped state.
+const debounce = 100 * time.Millisecond
+
 // Reload watches path and swaps recompiled programs into w until ctx ends.
 // The poll interval is a fallback for filesystems without inotify (and for
 // missed events); 0 defaults to 30s.
@@ -76,8 +82,17 @@ func Reload(ctx context.Context, w *Wrapper, path string, poll time.Duration, lo
 				events = nil
 				continue
 			}
-			// Debounce the symlink-swap event burst.
-			time.Sleep(100 * time.Millisecond)
+			// Debounce the symlink-swap event burst. Selectable, not a bare
+			// Sleep: this loop holds a live ctx, and a shutdown arriving inside
+			// the window would otherwise wait it out and then reload the file
+			// on the way to returning.
+			t := time.NewTimer(debounce)
+			select {
+			case <-ctx.Done():
+				t.Stop()
+				return
+			case <-t.C:
+			}
 			drainEvents(events)
 			apply()
 		}

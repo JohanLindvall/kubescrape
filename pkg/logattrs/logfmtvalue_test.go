@@ -10,6 +10,7 @@ import (
 // the shapes go-kit/logrus/slog emit unquoted — Windows paths, regexes — and
 // for the recognised letters injected control characters into attributes.
 func TestDecodeLogfmtValueOnlyUnescapesQuoted(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name, line, want string
 	}{

@@ -408,8 +408,8 @@ logAttributes: {rules: [...]}     # lift line keys onto attributes
 logMetrics:    {metrics: [...]}   # metrics derived from log lines
 logScrubbing:  {builtin: [...], rules: [...]}   # redact secrets/PII from bodies
 metrics:       {pipelines: {...}, splitters: [...]}   # scraped-series rules
-traceMetrics:  {dimensions: [...], buckets: [...], staleAfter: 15m}  # span-derived RED metrics
-traceSampling: {probability: 0.1, ...}          # sample ingested spans
+traceMetrics:  {dimensions: [...], buckets: [...], staleAfter: 15m}  # span-derived RED metrics (trace tier)
+traceSampling: {probability: 0.1, ...}          # sample traces (trace tier)
 routing:       {routes: [...]}    # per-namespace fan-out / tenancy
 export:        {headers: {...}, logs: {...}, metrics: {...}, traces: {...}}  # per-signal OTLP destinations, buffered-chain headers, mTLS
 ```
@@ -839,15 +839,16 @@ window). Both land on the **ARM resource's own identity**:
 resources sit beside Kubernetes workloads in the same backend.
 
 **OTLP ingest** (opt-in `-ingest`). Applications on the node can push their
-own OTLP to the local agent, which enriches it with Kubernetes attributes and
-forwards it — closing the gap that otherwise needs a separate collector with
-the k8sattributes processor. The agent listens for OTLP/gRPC
-(`-ingest-grpc-endpoint`, default `:4317`) and OTLP/HTTP protobuf (gzip
-bodies accepted)
-(`-ingest-http-endpoint`, default `:4318`, on `/v1/logs`, `/v1/metrics` and
-`/v1/traces`). Traces are enriched the same way and passed through
-(`-ingest-traces`; they bypass the disk buffer — the pushing sender owns
-retry).
+own OTLP **logs and metrics** to the local agent, which enriches them with
+Kubernetes attributes and forwards them — closing the gap that otherwise needs a
+separate collector with the k8sattributes processor. The agent listens for
+OTLP/gRPC (`-ingest-grpc-endpoint`, default `:4317`) and OTLP/HTTP protobuf
+(gzip bodies accepted) (`-ingest-http-endpoint`, default `:4318`, on `/v1/logs`
+and `/v1/metrics`). **Traces go to the trace tier instead** (below): pairing a
+service-graph edge and sampling a trace as a unit both need every span of that
+trace in one process, which a per-node receiver never has, so a sender pointed
+here for traces gets an immediate Unimplemented / 404 rather than an ack for
+spans that could never have become an edge.
 For each pushed resource it finds a container ID (`container.id` /
 `k8s.container.id`, keys configurable) or a pod UID (`k8s.pod.uid`), resolves
 the metadata service (a container ID pins the exact incarnation), and merges
@@ -859,9 +860,11 @@ attribute), `datapoint` (the ID is a per-point label; points are split into
 one resource per object, as a kube-state-metrics-style stream needs), or
 `auto` (resource when every resource carries an ID, else split). With
 `-ingest-peer-ip-fallback` (opt-in), a resource carrying **no** ID at all is
-attributed to the pod owning the connection's peer IP (live, non-hostNetwork
-pods only, via `GET /v1/pod-ips/{ip}`) — so unmodified SDKs get k8s
-attribution with zero sender configuration. Payloads are forwarded as
+attributed to the pod owning the connection's source address (live,
+non-hostNetwork pods only, via `GET /v1/pod-ips/{ip}`) — so unmodified SDKs get
+k8s attribution with zero sender configuration. It is only correct while that
+address still names the sender, which on this node-local listener it does; the
+trace tier, whose senders are cluster-wide, adds a guard (below). Payloads are forwarded as
 received (batch in the sender's SDK or the downstream collector); every
 forward keeps the sender's own retry semantics. Enrichment
 outcomes count into `kubescrape_ingest_resources_total{outcome}` (including
@@ -874,11 +877,11 @@ the process that also tails the node's logs. Over the bound a sender is refused
 senders read the code as permanent and discard the batch). Refusals count into
 `kubescrape_ingest_rejected_total`.
 
-**Trace sampling** (`traceSampling` section). Ingested spans can be sampled
-before forwarding: `probability` keeps that fraction of **traces** (the
-decision is a hash of the trace ID against a threshold, so it is
+**Trace sampling** (`traceSampling` section, on the trace tier). Received spans
+can be sampled before export: `probability` keeps that fraction of **traces**
+(the decision is a hash of the trace ID against a threshold, so it is
 deterministic per trace — all spans of a trace sample identically on every
-node running the same config, and a sender's retry re-samples identically);
+shard running the same config, and a sender's retry re-samples identically);
 `keepErrors` (default true) always keeps status-ERROR spans and
 `keepSlowerThan` always keeps spans at least that slow, regardless of the
 probability decision; `maxSpansPerSecond` is a hard cap applied after
@@ -886,9 +889,9 @@ sampling (guard-rail keeps included — a cap that can be exceeded is not a
 cap). Dropped spans count into
 `kubescrape_trace_spans_dropped_total{reason="probability"|"rate"}`, and a
 payload sampled down to nothing is acked without a send. The sampler sits
-below the span-metrics tap in the trace path, so span-derived RED metrics
-(`-ingest-span-metrics`) are computed ahead of sampling while only the
-sampled subset ships.
+below the span-metrics tap and below edge pairing, so RED metrics
+(`-ingest-span-metrics`) and the service graph are computed from 100% of spans
+while only the sampled subset ships.
 
 ```yaml
 traceSampling:
@@ -898,27 +901,78 @@ traceSampling:
   maxSpansPerSecond: 500
 ```
 
-**Service-graph edges** (opt-in, and the one pipeline that needs a **workload
-of its own**). An edge — one series per caller→callee pair — needs *both*
-halves of a request: the caller's CLIENT span and the callee's SERVER span.
-Those are emitted by two pods that usually run on two different nodes, so the
-agent holding one half never sees the other, and no per-node aggregation can
-complete it. (Span metrics are the opposite case: each span is aggregated
-independently, so the per-node cumulative counters just sum — which is why
-`-ingest-span-metrics` needs no extra tier.) So the agents act as
-*distributors*: each hashes an ingested span by **trace ID** onto a ring and
-forwards a trimmed copy to the shard owning that trace, which sees both halves
-and emits the edge. That is Grafana Tempo's distributor → metrics-generator
-split, with Tempo's hash. The shard tier is a **StatefulSet**
+### Traces: the trace tier
+
+**Applications send their OTLP traces to the trace tier's Service**, not to
+their node's agent:
+
+```sh
+OTEL_EXPORTER_OTLP_ENDPOINT=http://kubescrape-traces.monitoring.svc:4318
+OTEL_EXPORTER_OTLP_TRACES_PROTOCOL=http/protobuf
+# or :4317 with the default grpc protocol
+```
+
+The tier is opt-in and is the one pipeline that needs a **workload of its own**
 ([charts/kubescrape/templates/servicegraph.yaml](charts/kubescrape/templates/servicegraph.yaml),
 `serviceGraph.enabled=true`, or
-[deploy/servicegraph.yaml](deploy/servicegraph.yaml)) because the ring
-addresses shards by their stable ordinal DNS names behind a headless Service —
-a load-balanced destination would round-robin a trace's two halves onto two
-shards, the exact failure the ring prevents. The forward hop is
-**authenticated** with a shared bearer token (`-service-graph-token-file` on
-both sides, re-read periodically): the receiver is reachable from every pod in
-the cluster, so the shard refuses to open it without one.
+[deploy/servicegraph.yaml](deploy/servicegraph.yaml)). It exists because of one
+fact: a service-graph edge — one series per caller→callee pair — needs *both*
+halves of a request, the caller's CLIENT span and the callee's SERVER span, and
+those are emitted by two pods that usually run on two different nodes. A
+per-node aggregator holds half of every edge by construction and no amount of
+aggregation completes it. Sampling a trace as a unit has the same shape.
+
+So a push lands on an arbitrary shard (the Service round-robins), and that shard:
+
+1. **enriches** it with Kubernetes attributes — the one moment the connection's
+   source address still names the sender;
+2. **re-shards** each span by **trace ID** onto a ring and hands it to the shard
+   that owns that trace (Grafana Tempo's hash, FNV-1 32-bit);
+3. and on the **owning** shard pairs the edge, derives the RED metrics, applies
+   head sampling and exports.
+
+Every span is therefore enriched once, counted once and exported once, on one
+shard. The tier is a **StatefulSet** because the ring addresses shards by their
+stable ordinal DNS names behind a *headless* Service — a load-balanced
+destination for the internal hop would round-robin a trace's two halves onto two
+owners, the exact failure the ring prevents.
+
+**Two listeners, and the difference matters.** The application ports
+(`-service-graph-ingest-grpc`/`-http`, `:4317`/`:4318`, behind the ClusterIP
+Service) are **unauthenticated**: every instrumented pod in the cluster is a
+sender, and requiring a credential from each of them is not a bargain most
+fleets can make — scope them with a NetworkPolicy
+(`serviceGraph.ingest.allowFrom`) instead. The internal port
+(`-service-graph-listen`, `:4319`, behind the headless Service) is
+**authenticated** with a shared bearer token (`-service-graph-token-file`,
+re-read periodically; the binary refuses to open it without one), because what
+arrives there is treated as final — already enriched, already routed — and an
+unauthenticated one would let anything that can reach the pod put unattributed
+spans straight into the collector. Which port a payload arrived on is what
+decides its treatment, not anything the payload claims, so loop-freedom is
+structural: application pushes are re-sharded exactly once, internal hops never.
+An internal hop misaddressed to an application port is refused outright
+(permanently, counted in
+`kubescrape_service_graph_loops_blocked_total`) rather than re-enriched and
+re-sharded on every pass.
+
+**Peer-IP attribution has a guard here.** `-ingest-peer-ip-fallback` attributes a
+resource with no `container.id`/`k8s.pod.uid` by the connection's source address.
+A ClusterIP normally preserves it, but a mesh that terminates the connection, an
+ingress, or any NAT hop replaces it — and on this tier the replacement usually
+belongs to *kubescrape*. A resolution naming this tier's own workload is
+therefore **refused and counted**
+(`kubescrape_ingest_resources_total{outcome="peer_ip_rejected"}`) rather than
+applied: an application's traces labelled with a kubescrape pod would render
+perfectly and be wrong on every span. Senders that set a resource-level
+`container.id` (every SDK's container detector does) are unaffected.
+
+**The internal hop cannot shed.** The shard that received a push holds the only
+copy of those spans, so a failed hop **fails the application's push** and the
+sender's retry is the recovery. A partial fan-out that fails part-way delivers
+at-least-once: the split is a pure function of the trace ID, so the retry
+re-splits identically and the owners that already accepted see a duplicate — safe
+because both taps count only after a *successful* export.
 
 The emitted series are Grafana **Service Graph** compatible on purpose — that
 view queries these exact names, so a better-reading name would render in
@@ -935,27 +989,28 @@ as `client_<dim>`/`server_<dim>`. `wait` and `staleAfter` (Go durations —
 `10s`, `15m`; `staleAfter: "0"` disables eviction), `maxItems` and
 `maxCardinality` (config section `serviceGraph`) are the bounds that trade
 completeness for memory; each has a counter that moves when it binds, because
-a missing edge looks exactly like a call that never happened. The forward hop
-is **asynchronous**: each agent hands a shard's share to a bounded queue and
-returns, so a shard that stops answering sheds edges
-(`kubescrape_service_graph_spans_queue_full_total`) rather than parking an OTLP
-ingest slot — losing an edge must never cost a span. **The limitation
+a missing edge looks exactly like a call that never happened. **The limitation
 is structural**: an uninstrumented callee emits no server span, so its calls
 appear only as **virtual nodes** named from the client span's `peer.service` /
 `db.name` / `db.system` — and a client naming none of those yields no edge at
-all. The agents trim forwarded spans to their own configured `dimensions` /
-`peerAttributes`, which must match the shard's; a disagreement no longer fails
-silently — each agent declares its lists on every forwarded payload, and the
-shard logs it once per distinct mismatch (naming what will be lost) and counts
-`kubescrape_service_graph_config_mismatch_total`. See
+all. See
 [docs/CONFIGURATION.md](docs/CONFIGURATION.md#agent-service-graph).
+
+**What this topology costs.** The tier is a hard, cluster-wide dependency for
+traces: while it is down or unreachable every application's trace export fails,
+and there is no per-node fallback. Each span crosses the network twice at full
+fidelity — application → entry shard, then entry → owner for (N−1)/N of them —
+which is real intra-cluster bandwidth. And the tier is shared: one noisy
+service's spans occupy the same shards as everyone else's, bounded only by
+`-ingest-max-in-flight` per pod. Those are the price of holding a whole trace in
+one process, which is what an edge and a sampled trace both require.
 
 **Pipeline toggles.** Each pipeline is individually switchable: `-logs`,
 `-metrics` (annotation-discovered targets), `-cadvisor` and `-node-metrics`
 (all default true; the kubelet scrapes additionally require
 `-kubelet-endpoint`), plus the opt-in `-journald`, `-ingest`, `-events`,
-`-azure-diagnostics` and `-service-graph` (the last on its own shard tier, not
-in the DaemonSet).
+`-azure-diagnostics` and `-service-graph` (the last is the trace tier's own
+StatefulSet, not the DaemonSet).
 
 **Self-observability.** The agent's own metrics — log entries/bytes/rotations
 and export failures, enrichment hit rates per format, scrapes and scrape
@@ -971,7 +1026,7 @@ attributes (`-self-attributes`, default on): namespace, pod name and UID, pod
 IP, the owner chain, pod and namespace labels, plus whatever the
 `resourceAttributes` section's `self` pipeline adds (a `static` cluster name,
 for instance) — resolved from the metadata service's `GET /v1/self`. The same
-applies to the span metrics derived from ingested traces, which carry the same
+applies to the trace tier's span metrics and service-graph edges, which carry the same
 identity. Attributes the agent already set win, so `service.name` stays
 `kubescrape-agent` and `service.instance.id` stays the node (stable across
 restarts, unlike a pod UID); `service.namespace` is newly derived from the

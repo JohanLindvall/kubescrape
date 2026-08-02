@@ -234,15 +234,16 @@ func (g *metricGrouper) resource(id string) pmetric.ResourceMetrics {
 			return rm
 		}
 		mergeAttrs(g.enricher.builtAttrs(g.ctx, g.enrichCache, id), rm.Resource().Attributes())
-	} else if built := g.enricher.peerAttrs(g.ctx, g.enrichCache); built.Len() > 0 {
+	} else if built, rejected := g.enricher.peerAttrs(g.ctx, g.enrichCache); built.Len() > 0 {
 		// No ID anywhere for these points: the opt-in peer-IP fallback still
 		// attributes them to the pushing pod (resolved once per request).
 		obs.Ingested.WithLabelValues("peer_ip").Inc()
 		mergeAttrs(built, rm.Resource().Attributes())
-	} else {
+	} else if !rejected {
 		// Nothing identified these points. They are still forwarded (under the
 		// unenriched source resource), but the outcome must show up in the
-		// counters exactly as the resource-mode path's does.
+		// counters exactly as the resource-mode path's does. A REJECTED peer has
+		// already been counted under its own outcome and must not tally twice.
 		obs.Ingested.WithLabelValues("unresolved").Inc()
 	}
 	g.rmByID[id] = rm

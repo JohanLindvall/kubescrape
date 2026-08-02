@@ -90,10 +90,6 @@ type Processor struct {
 	peerAttrs []string
 	peerIsDB  []bool
 
-	// mismatch compares each forwarding agent's declared trim lists against
-	// the two lists above (see mismatch.go).
-	mismatch *mismatchWatch
-
 	// now is injectable for tests; production reads the wall clock once per
 	// Consume batch, never per span.
 	now func() time.Time
@@ -138,11 +134,6 @@ func NewProcessor(cfg Config, log *slog.Logger) *Processor {
 		p.peerAttrs = append(p.peerAttrs, a)
 		p.peerIsDB = append(p.peerIsDB, strings.HasPrefix(a, "db."))
 	}
-	// The watch compares against the EFFECTIVE lists — deduplicated and with
-	// the defaults filled in — because that is what pairing actually reads;
-	// comparing the raw config would report drift an operator cannot see and
-	// miss drift they can.
-	p.mismatch = newMismatchWatch(p.dims, p.peerAttrs, log)
 	p.store = newEdgeStore(cfg, wait, p.emit)
 	log.Debug("service-graph pairing configured",
 		"wait", wait, "maxItems", cfg.MaxItems,
@@ -188,10 +179,6 @@ func (p *Processor) Consume(td ptrace.Traces) {
 	for i := 0; i < rss.Len(); i++ {
 		rs := rss.At(i)
 		resAttrs := rs.Resource().Attributes()
-		// Once per RESOURCE, never per span: the forwarding agent stamps its
-		// effective trim lists here, and a disagreement with ours silently
-		// empties every dimension label it covers (see mismatch.go).
-		p.mismatch.check(resAttrs)
 		// Truncated once per resource: it becomes a label value on every edge
 		// this resource's spans produce.
 		svc := truncDimValue(spanAttrStr(resAttrs, attrServiceName))

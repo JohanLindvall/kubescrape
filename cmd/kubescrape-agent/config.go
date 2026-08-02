@@ -44,9 +44,10 @@ type agentConfig struct {
 	// Metrics holds per-pipeline keep/drop rules for scraped series and target
 	// splitters.
 	Metrics *promscrape.MetricsConfig `json:"metrics,omitempty"`
-	// TraceMetrics tunes the RED metrics derived from ingested trace spans
-	// (histogram buckets, extra dimensions, cardinality cap). Aggregation is
-	// gated by -ingest-span-metrics; this section only tunes it.
+	// TraceMetrics tunes the RED metrics derived from trace spans (histogram
+	// buckets, extra dimensions, cardinality cap). Aggregation runs on the
+	// service-graph tier, gated by -ingest-span-metrics; this section only
+	// tunes it.
 	TraceMetrics *spanmetrics.Config `json:"traceMetrics,omitempty"`
 	// Routing fans exported payloads out by namespace to extra destinations
 	// or tenants (headers); unmatched resources use the default chain.
@@ -55,25 +56,22 @@ type agentConfig struct {
 	// log bodies in the tailer, journald and OTLP-ingest paths, before any
 	// enrichment copies from them.
 	LogScrubbing *logscrub.Config `json:"logScrubbing,omitempty"`
-	// ServiceGraph tunes the pairing SHARD (-service-graph): the wait window,
-	// the store and series caps, the latency buckets and the extra dimensions.
-	// It is read only by that role; the chart mounts the same rendered config
-	// on both workloads, which is what keeps it from drifting apart from the
-	// agents' matching serviceGraphShards.dimensions below.
+	// ServiceGraph tunes edge pairing on the trace tier (-service-graph): the
+	// wait window, the store and series caps, the latency buckets and the extra
+	// dimensions. It is read only by that role.
 	ServiceGraph *servicegraph.Config `json:"serviceGraph,omitempty"`
-	// ServiceGraphShards is the agents' half: where the shard tier is and how
-	// to reach it. The flags (-service-graph-shards/-service-graph-endpoint/
-	// -service-graph-token-file) express the shape the chart renders; this
-	// section is the richer form — explicit endpoints for a tier outside
-	// Kubernetes, TLS material, headers, tokensPerShard — plus the
-	// dimensions/peerAttributes that MUST match the shard's, since a dimension
-	// the agent trims away is a label the shard can only render empty. It wins
-	// field by field where both are set (see serviceGraphShardConfig).
-	ServiceGraphShards *servicegraph.ForwardConfig `json:"serviceGraphShards,omitempty"`
-	// TraceSampling drops ingested spans before forwarding: consistent
-	// trace-ID probabilistic sampling with keep-errors/keep-slow guard rails
-	// and a spans/second cap. Span metrics still see 100% of spans (the
-	// sampler sits below the spanmetrics tap).
+	// ServiceGraphShards tells a tier pod about the tier: which shards exist,
+	// which one it is, and how to reach the others for the internal re-shard
+	// hop. The flags (-service-graph-shards / -service-graph-endpoint /
+	// -service-graph-shard-name / -service-graph-token-file) express the shape
+	// the chart renders; this section is the richer form — explicit endpoints
+	// for a tier outside Kubernetes, TLS material, headers, tokensPerShard — and
+	// wins field by field where both are set (see serviceGraphShardConfig).
+	ServiceGraphShards *servicegraph.ReshardConfig `json:"serviceGraphShards,omitempty"`
+	// TraceSampling drops spans before export: consistent trace-ID
+	// probabilistic sampling with keep-errors/keep-slow guard rails and a
+	// spans/second cap. It runs on the trace tier, below the spanmetrics tap, so
+	// RED metrics still see 100% of spans.
 	TraceSampling *tracesample.Config `json:"traceSampling,omitempty"`
 	// Export overlays per-signal OTLP destinations (endpoint/protocol/headers/
 	// auth/TLS per signal) and default-chain additions (static headers, an mTLS

@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
 	"time"
 
@@ -714,3 +715,107 @@ type blockingExporter func() error
 
 func (f blockingExporter) ExportLogs(context.Context, plog.Logs) error          { return f() }
 func (f blockingExporter) ExportMetrics(context.Context, pmetric.Metrics) error { return f() }
+
+// A TRACES-ONLY server (Exporter nil) is a real deployment, not a degenerate
+// one: the service-graph tier takes traces and nothing else, and logs and
+// metrics belong on the node-local DaemonSet where the sender is a pod on the
+// same node. The listener must answer Unimplemented / 404 for the signals it
+// does not serve — a NAMED error a sender can act on — rather than panicking on
+// a nil Exporter or, worse, acking telemetry it drops.
+func TestTracesOnlyServerDoesNotServeLogsOrMetrics(t *testing.T) {
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := lis.Addr().String()
+	_ = lis.Close()
+
+	traces := &captureTraces{}
+	ready := make(chan struct{})
+	srv := NewServer(ServerConfig{
+		GRPCAddr: addr,
+		HTTPAddr: "127.0.0.1:0",
+		Enricher: newEnricher(newMeta(), MetricsAuto),
+		Traces:   traces,
+		Ready:    sync.OnceFunc(func() { close(ready) }),
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { _ = srv.Run(ctx); close(done) }()
+	defer func() { cancel(); <-done }()
+
+	// Ready fires only once every listener is BOUND: a probe that went green on
+	// a port nobody bound would march a broken rollout across the tier.
+	select {
+	case <-ready:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the server never reported ready")
+	}
+
+	conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	td := ptrace.NewTraces()
+	rs := td.ResourceSpans().AppendEmpty()
+	rs.Resource().Attributes().PutStr("container.id", "cafe01")
+	rs.ScopeSpans().AppendEmpty().Spans().AppendEmpty().SetName("GET /")
+	tc := ptraceotlp.NewGRPCClient(conn)
+	var lastErr error
+	for i := 0; i < 100; i++ {
+		if _, lastErr = tc.Export(context.Background(), ptraceotlp.NewExportRequestFromTraces(td)); lastErr == nil {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if lastErr != nil {
+		t.Fatalf("traces were refused by a traces-only server: %v", lastErr)
+	}
+	if len(traces.traces) != 1 {
+		t.Fatalf("exported %d trace batches, want 1", len(traces.traces))
+	}
+
+	// Logs and metrics: the services are not registered at all.
+	ld := plog.NewLogs()
+	ld.ResourceLogs().AppendEmpty().ScopeLogs().AppendEmpty().LogRecords().AppendEmpty().Body().SetStr("hi")
+	if _, err := plogotlp.NewGRPCClient(conn).Export(context.Background(), plogotlp.NewExportRequestFromLogs(ld)); err == nil {
+		t.Error("a traces-only server accepted a logs push")
+	} else if status.Code(err) != codes.Unimplemented {
+		t.Errorf("logs push failed with %v, want Unimplemented (a named destination error)", status.Code(err))
+	}
+	if _, err := pmetricotlp.NewGRPCClient(conn).Export(context.Background(),
+		pmetricotlp.NewExportRequestFromMetrics(pushedMetrics("cafe01"))); err == nil {
+		t.Error("a traces-only server accepted a metrics push")
+	} else if status.Code(err) != codes.Unimplemented {
+		t.Errorf("metrics push failed with %v, want Unimplemented", status.Code(err))
+	}
+}
+
+// The HTTP arm of the same: /v1/logs and /v1/metrics are not routed.
+func TestTracesOnlyServerHTTPRoutes(t *testing.T) {
+	mux := http.NewServeMux()
+	s := NewServer(ServerConfig{
+		Enricher: newEnricher(newMeta(), MetricsAuto),
+		Traces:   &captureTraces{},
+	})
+	// Mirror Run's registration rules.
+	if s.cfg.Exporter != nil {
+		t.Fatal("the fixture is not traces-only")
+	}
+	mux.HandleFunc("POST /v1/traces", s.handleHTTPTraces)
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	for _, path := range []string{"/v1/logs", "/v1/metrics"} {
+		resp, err := http.Post(srv.URL+path, "application/x-protobuf", bytes.NewReader(nil))
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusNotFound {
+			t.Errorf("POST %s on a traces-only server = %d, want 404", path, resp.StatusCode)
+		}
+	}
+}

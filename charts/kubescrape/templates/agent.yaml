@@ -206,41 +206,22 @@ spec:
             - -journald-flush-interval={{ .Values.agent.journald.flushInterval }}
             {{- end }}
             {{- if .Values.agent.ingest.enabled }}
+            {{- /* LOGS AND METRICS. Traces are pushed to the trace tier
+                   (templates/servicegraph.yaml) instead: both things worth
+                   doing to a trace — pairing its two halves into a
+                   service-graph edge, and sampling it as a whole — need every
+                   span of that trace in one process, and a per-node receiver
+                   holds an arbitrary subset by construction. */}}
             - -ingest
             - -ingest-grpc-endpoint={{ .Values.agent.ingest.grpcEndpoint }}
             - -ingest-http-endpoint={{ .Values.agent.ingest.httpEndpoint }}
             - -ingest-metrics-mode={{ .Values.agent.ingest.metricsMode }}
-            - -ingest-traces={{ .Values.agent.ingest.traces }}
-            {{- if .Values.agent.ingest.spanMetrics }}
-            - -ingest-span-metrics
-            - -ingest-span-metrics-interval={{ .Values.agent.ingest.spanMetricsInterval }}
-            {{- end }}
             - -ingest-peer-ip-fallback={{ .Values.agent.ingest.peerIpFallback }}
             {{- with .Values.agent.ingest.containerIdKeys }}
             - -ingest-container-id-keys={{ join "," . }}
             {{- end }}
             {{- with .Values.agent.ingest.podUidKeys }}
             - -ingest-pod-uid-keys={{ join "," . }}
-            {{- end }}
-            {{- end }}
-            {{- if .Values.serviceGraph.enabled }}
-            {{- /* Service-graph edges are paired on the separate shard tier
-                   (templates/servicegraph.yaml): a request's client and server
-                   spans reach two different agents, so this agent only hashes
-                   each span by trace id and forwards a trimmed copy to the
-                   owning shard. The endpoint is the GOVERNING HEADLESS
-                   Service, from which the agent derives each shard's stable
-                   per-pod name (<sts>-<ordinal>.<service>.<ns>.svc:<port>) —
-                   naming the Service itself as a destination would round-robin
-                   and split a trace's two halves across shards. The shard
-                   count must equal the StatefulSet's replicas, which is why
-                   both read the one value. */}}
-            - -service-graph-shards={{ int64 .Values.serviceGraph.replicas }}
-            - -service-graph-endpoint={{ .Release.Name }}-servicegraph.{{ .Release.Namespace }}.svc:{{ int .Values.serviceGraph.port }}
-            {{- if .Values.serviceGraph.tokenSecret.name }}
-            # The same shared token the shards' receiver checks; re-read
-            # periodically, so rotating the Secret needs no lockstep restart.
-            - -service-graph-token-file=/etc/kubescrape/service-graph/{{ .Values.serviceGraph.tokenSecret.key | default "token" }}
             {{- end }}
             {{- end }}
             - -log-level={{ .Values.logLevel }}
@@ -320,11 +301,6 @@ spec:
               mountPath: /etc/kubescrape/otlp-token
               readOnly: true
             {{- end }}
-            {{- if and .Values.serviceGraph.enabled .Values.serviceGraph.tokenSecret.name }}
-            - name: service-graph-token
-              mountPath: /etc/kubescrape/service-graph
-              readOnly: true
-            {{- end }}
             {{- if .Values.agent.journald.enabled }}
             # Volatile journals; persistent ones live under the /var/log
             # mount above.
@@ -358,11 +334,6 @@ spec:
         - name: otlp-token
           secret:
             secretName: {{ .Values.agent.otlp.bearerTokenSecret.name }}
-        {{- end }}
-        {{- if and .Values.serviceGraph.enabled .Values.serviceGraph.tokenSecret.name }}
-        - name: service-graph-token
-          secret:
-            secretName: {{ .Values.serviceGraph.tokenSecret.name }}
         {{- end }}
         {{- if .Values.agent.journald.enabled }}
         - name: runlogjournal

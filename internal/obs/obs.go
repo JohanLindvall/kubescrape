@@ -193,7 +193,7 @@ var (
 // OTLP ingest (agent).
 var (
 	Ingested = Registry.CounterVec("kubescrape_ingest_resources_total",
-		"Distinct pushed identities (container id / pod uid, memoized per request) by enrichment outcome (enriched, unresolved, peer_ip).", "outcome")
+		"Distinct pushed identities (container id / pod uid, memoized per request) by enrichment outcome. enriched = an id resolved; peer_ip = no id, attributed by the connection's source address; peer_ip_rejected = that address resolved to the RECEIVER's own workload, so it was rewritten in flight (a proxy, a mesh sidecar, or an internal hop addressed to the application port) and nothing was attributed — anything above zero means peer-IP attribution cannot work on that path; unresolved = nothing identified the sender.", "outcome")
 	Routed = Registry.CounterVec("kubescrape_routed_payload_parts_total",
 		"Payload parts forwarded to a non-default routing destination.", "route", "signal")
 	TransformErrors = Registry.CounterVec("kubescrape_transform_errors_total",
@@ -230,16 +230,6 @@ var (
 	// delivery gap, or the two halves are landing on different shards.
 	ServiceGraphExpired = Registry.Counter("kubescrape_service_graph_expired_total",
 		"Half-edges that expired after serviceGraph.wait without their partner arriving.")
-	// ServiceGraphConfigMismatch is the one counter here that names a CONFIG
-	// error rather than a bound. The agents trim forwarded spans to their own
-	// dimension/peer-attribute lists, so a shard configured to read anything
-	// else reads attributes that were never sent: the graph still renders, with
-	// empty dimension labels and no virtual nodes. It is counted per forwarded
-	// RESOURCE (the unit the agent's declaration rides on), so the rate says how
-	// much of the graph's input is affected; the shard log names both sides
-	// once per distinct disagreement.
-	ServiceGraphConfigMismatch = Registry.Counter("kubescrape_service_graph_config_mismatch_total",
-		"Forwarded resources whose agent-side serviceGraphShards.dimensions/peerAttributes disagree with this shard's serviceGraph.dimensions/virtualNodePeerAttributes. The agent trims away what the shard reads, so those dimensions render as EMPTY labels and those peer attributes synthesize no virtual node. Always zero when both sides are configured from the same values; anything else is a config error to fix now (the shard logs both lists once per distinct mismatch).")
 )
 
 // RegisterServiceGraphStats publishes the pairing store's own numbers on the
@@ -285,41 +275,45 @@ type ServiceGraphStat struct {
 	Unkeyable   uint64
 }
 
-// RegisterServiceGraphForwarder publishes the AGENT side of the service graph:
-// what this node handed to the shard tier, and what it failed to.
+// RegisterServiceGraphResharder publishes the tier's INTERNAL hop: how a shard
+// that received an application push distributed those spans to the shards that
+// own their traces.
 //
-// Nothing else counts this hop. The wire outcome of each shard send lands in
-// kubescrape_export_requests_total{signal="traces"} together with the ordinary
-// collector exports, which is exactly where a broken graph hop hides — the
-// forward is best-effort by design (Forward never returns an error, because
-// losing an edge must never cost a span), so a shard tier that is down or
-// unreachable produces NO other symptom on the agent: the sender's push
-// succeeds, the collector gets its spans, and only the graph is quietly empty.
-func RegisterServiceGraphForwarder(stats func() ServiceGraphForwardStat) {
+// These are the numbers only the resharder knows. The wire outcome of each hop
+// lands in kubescrape_export_requests_total{signal="traces"} together with the
+// ordinary collector exports, where a hop failure is indistinguishable from a
+// collector failure — and the two mean very different things: one is a shard
+// that cannot be reached, the other is a destination outside the cluster.
+//
+// A failed hop is NOT silent, unlike the best-effort side channel this replaced:
+// the entry shard holds the only copy of a pushed span, so it refuses the
+// application's push and the sender retries. SendsFailed therefore moves in step
+// with the senders' own error rate.
+func RegisterServiceGraphResharder(stats func() ServiceGraphReshardStat) {
 	Registry.CounterFunc("kubescrape_service_graph_spans_forwarded_total",
-		"Spans handed to a service-graph shard (delivered or not). Far below the ingested span count by design: INTERNAL spans and spans with no trace id can never form an edge and are dropped before the hop.",
+		"Spans this shard handed to ANOTHER shard because that shard owns their trace, and which it accepted. Roughly (N-1)/N of everything pushed to this pod on an N-shard tier: the remainder is kubescrape_service_graph_spans_local_total. This is the tier's internal bandwidth.",
 		func() float64 { return float64(stats().SpansForwarded) })
-	Registry.CounterFunc("kubescrape_service_graph_spans_lost_total",
-		"Spans in a shard send that failed. They are gone — the graph is best-effort and the sender's own export already succeeded — so the edges they would have formed are missing from the graph, indistinguishable there from calls that never happened.",
-		func() float64 { return float64(stats().SpansLost) })
-	Registry.CounterFunc("kubescrape_service_graph_spans_queue_full_total",
-		"Spans dropped WITHOUT being sent because the owning shard's forward queue was full. The fan-out is asynchronous precisely so a shard that stops draining sheds edges instead of parking an OTLP ingest slot (losing an edge must never cost a span), and this is that shedding made visible: a moving rate means one shard is slower than this node's edge-forming span rate, or is not answering at all. Distinct from kubescrape_service_graph_spans_lost_total, which is a send the shard actually refused.",
-		func() float64 { return float64(stats().SpansQueueFull) })
+	Registry.CounterFunc("kubescrape_service_graph_spans_local_total",
+		"Spans this shard already owned and kept in-process, taking no second hop. Its ratio against the forwarded count should track 1/N for an N-shard tier; a persistent skew means the ring is unbalanced or one shard is receiving most of the pushes.",
+		func() float64 { return float64(stats().SpansLocal) })
+	Registry.CounterFunc("kubescrape_service_graph_spans_unkeyed_total",
+		"Pushed spans with no trace id. They cannot be hashed onto the ring, so they are kept locally and exported from here; they can never pair into an edge. A moving rate means an SDK is emitting malformed spans.",
+		func() float64 { return float64(stats().SpansUnkeyed) })
 	Registry.CounterFunc("kubescrape_service_graph_sends_failed_total",
-		"Failed sends to a service-graph shard (one per shard per batch). A rate that tracks one shard's outage means only that shard's arc of the ring is missing from the graph; a rate across all of them means the tier or the token is wrong.",
+		"Failed internal hops (one per owning shard per batch). Every one of them FAILS the application's push — the entry shard holds the only copy of those spans — so this moves together with the senders' export errors, and a rate that tracks one shard means that shard is down or its token is wrong.",
 		func() float64 { return float64(stats().SendsFailed) })
 	Registry.CounterFunc("kubescrape_service_graph_loops_blocked_total",
-		"Payloads refused because they already carried the forwarded marker: a shard tier pointed at itself or at the agents' own ingest port, which would multiply every span by the fan-out on every hop. Always zero in a correct deployment; anything else is a config error to fix now.",
+		"Spans in application pushes refused for carrying the internal forwarded marker: an internal hop addressed to the tier's APPLICATION port instead of its authenticated receiver, which without the refusal would re-enrich and re-shard every span on every hop until the network is the incident. Always zero in a correct deployment; anything else is a config error to fix now.",
 		func() float64 { return float64(stats().LoopsBlocked) })
 }
 
-// ServiceGraphForwardStat is the forwarder's snapshot
-// (servicegraph.ForwardStats' shape; see RegisterServiceGraphStats on why obs
+// ServiceGraphReshardStat is the resharder's snapshot
+// (servicegraph.ReshardStats' shape; see RegisterServiceGraphStats on why obs
 // declares its own).
-type ServiceGraphForwardStat struct {
+type ServiceGraphReshardStat struct {
 	SpansForwarded uint64
-	SpansLost      uint64
-	SpansQueueFull uint64
+	SpansLocal     uint64
+	SpansUnkeyed   uint64
 	SendsFailed    uint64
 	LoopsBlocked   uint64
 }

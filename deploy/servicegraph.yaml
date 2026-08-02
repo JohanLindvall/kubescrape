@@ -1,44 +1,37 @@
-# kubescrape service-graph shards: Grafana-Tempo-compatible EDGE metrics
-# (traces_service_graph_request_total and friends) derived by pairing each
-# request's CLIENT span with its SERVER span.
+# The kubescrape TRACE TIER: where applications send their OTLP traces.
 #
-# Why this is a separate tier and not part of the DaemonSet: the two halves of
-# one request are emitted by two pods that usually run on two different NODES,
-# so the agent that receives the client span never sees the server span. No
-# per-node aggregation can complete an edge. (The RED metrics of
-# -ingest-span-metrics are the opposite case — each span is aggregated
-# independently, so the per-node cumulative counters sum cluster-wide.)
+#   OTEL_EXPORTER_OTLP_ENDPOINT=http://kubescrape-traces.monitoring.svc:4318
+#   OTEL_EXPORTER_OTLP_TRACES_PROTOCOL=http/protobuf
 #
-# Instead each agent hashes every ingested span by TRACE ID onto a ring and
-# forwards a trimmed copy to the shard owning that trace, which sees both
-# halves and emits the edge — Grafana Tempo's distributor -> metrics-generator
-# split, with Tempo's hash and Tempo's metric names.
+# (or :4317 with the default grpc protocol). The tier enriches each push with
+# Kubernetes metadata, re-shards every span by TRACE ID so one process holds the
+# whole trace, and from there emits Grafana-Tempo-compatible EDGE metrics
+# (traces_service_graph_request_total and friends), derives RED metrics, applies
+# head sampling and exports to the collector.
+#
+# Why a tier and not the DaemonSet: an EDGE needs both halves of one request, and
+# those two spans are emitted by two pods that usually run on two different
+# NODES, so a per-node aggregator holds half of every edge and can never pair
+# anything. Re-sharding by trace id is what puts both halves in one process.
 #
 # A StatefulSet, not a Deployment: the ring addresses shards by their stable
 # ordinal DNS names (kubescrape-servicegraph-0.kubescrape-servicegraph.
-# monitoring.svc), and every agent must derive the identical ring or a trace's
-# two halves land on two shards and the edge silently never forms. There is no
+# monitoring.svc), and every shard must derive the identical ring or a trace's
+# two halves land on two owners and the edge silently never forms. There is no
 # volumeClaimTemplate — the pairing state is in memory by design, so the
 # StatefulSet buys names, not storage. No ServiceAccount and no RBAC: this tier
 # reads the Kubernetes API not at all.
 #
-# Apply after deploy/kubernetes.yaml (the metadata service) and deploy/agent.yaml
-# (the DaemonSet that forwards the spans):
+# Apply after deploy/kubernetes.yaml (the metadata service):
 #
 #   kubectl -n monitoring create secret generic kubescrape-service-graph \
 #     --from-literal=token="$(openssl rand -hex 24)"
 #   kubectl apply -f deploy/servicegraph.yaml
 #
-# and add to the DaemonSet in deploy/agent.yaml (it must already run -ingest
-# with -ingest-traces; those pushed spans are what gets forwarded):
-#
-#   - -service-graph-shards=2
-#   - -service-graph-endpoint=kubescrape-servicegraph.monitoring.svc:4319
-#   - -service-graph-token-file=/etc/kubescrape/service-graph/token
-#
-# with the same Secret mounted at /etc/kubescrape/service-graph. The shard
-# count must match .spec.replicas below: a larger count addresses pods that do
-# not exist and their traces are never paired.
+# -service-graph-shards must match .spec.replicas below: a larger count
+# addresses pods that do not exist, and a push whose trace hashes there FAILS
+# (the sender retries — the receiving shard holds the only copy of those spans,
+# so it must not pretend otherwise).
 apiVersion: v1
 kind: Secret
 metadata:
@@ -47,10 +40,11 @@ metadata:
 type: Opaque
 stringData:
   # PLACEHOLDER — replace it, or create the Secret with the command above
-  # instead of applying this object. The shard's receiver is reachable from
-  # every pod in the cluster, so the hop is authenticated by this shared token;
-  # without -service-graph-token-file the binary refuses to open the listener.
-  # Both sides re-read the file periodically, so rotation needs no restart.
+  # instead of applying this object. It authenticates the tier's INTERNAL hop,
+  # whose receiver is reachable from every pod in the cluster and whose payloads
+  # are treated as final (never re-enriched, never re-routed); without
+  # -service-graph-token-file the binary refuses to open that listener. Both
+  # sides re-read the file periodically, so rotation needs no restart.
   token: "replace-me-with-a-random-token"
 ---
 apiVersion: v1
@@ -62,13 +56,13 @@ metadata:
     app: kubescrape-servicegraph
 spec:
   # Headless: this Service exists for the per-pod DNS names it publishes, which
-  # are what the ring addresses. A ClusterIP would round-robin — sending a
-  # trace's client half to one shard and its server half to another, the exact
-  # failure the ring exists to prevent.
+  # are what the ring addresses for the INTERNAL hop. A ClusterIP would
+  # round-robin, which is exactly what that hop exists to undo. Applications do
+  # not use this Service; they use kubescrape-traces below.
   clusterIP: None
-  # Shards stay addressable while they fill their first pairing window and
-  # during a rolling restart; otherwise those forwards fail outright rather
-  # than being delayed.
+  # Shards stay addressable while they start and during a rolling restart;
+  # otherwise the internal hops that hash there fail outright rather than being
+  # delayed.
   publishNotReadyAddresses: true
   selector:
     app: kubescrape-servicegraph
@@ -76,6 +70,35 @@ spec:
     - name: service-graph
       port: 4319
       targetPort: service-graph
+---
+# The APPLICATION-facing Service. A normal ClusterIP, deliberately: round-robin
+# is fine here, because the shard that receives a push is not the shard that has
+# to own the trace — the internal hop fixes that.
+#
+# UNAUTHENTICATED. Any pod that can reach it may push arbitrary OTLP spans, with
+# no credential; enrichment stamps the SENDER's Kubernetes identity where it can
+# resolve one, but a sender can still name any service.name it likes and the
+# volume it pushes costs this tier and the collector. That is the same bargain
+# every unauthenticated in-cluster OTLP collector makes. Add a NetworkPolicy if
+# the pod network is not trusted.
+apiVersion: v1
+kind: Service
+metadata:
+  name: kubescrape-traces
+  namespace: monitoring
+  labels:
+    app: kubescrape-servicegraph
+spec:
+  type: ClusterIP
+  selector:
+    app: kubescrape-servicegraph
+  ports:
+    - name: otlp-grpc
+      port: 4317
+      targetPort: otlp-grpc
+    - name: otlp-http
+      port: 4318
+      targetPort: otlp-http
 ---
 apiVersion: apps/v1
 kind: StatefulSet
@@ -86,7 +109,8 @@ metadata:
     app: kubescrape-servicegraph
 spec:
   serviceName: kubescrape-servicegraph
-  # Must equal the agents' -service-graph-shards (see the header).
+  # Must equal -service-graph-shards below: the count IS part of the ring's
+  # definition.
   replicas: 2
   # Shards are independent; ordered startup would delay the last one's traces
   # for no benefit.
@@ -108,14 +132,26 @@ spec:
           command: ["/kubescrape-agent"]
           args:
             - -service-graph
-            # The receiver for forwarded spans. Deliberately not 4317: that is
-            # the agents' own ingest port, and pointing the tier at it would
-            # loop spans back through the fan-out.
+            # The INTERNAL receiver: spans a sibling shard re-sharded to us.
+            # Deliberately not 4317/4318 — those are this same workload's
+            # APPLICATION ports, and an internal hop addressed there would be
+            # re-enriched (against a peer that is now a kubescrape pod) and
+            # re-sharded on every pass.
             - -service-graph-listen=:4319
             - -service-graph-token-file=/etc/kubescrape/service-graph/token
-            # Every per-node pipeline off: this tier only pairs forwarded
-            # spans. -ingest included — the span receiver above is its own
-            # port and its own path.
+            # The application-facing trace listeners, behind the ClusterIP
+            # Service above.
+            - -service-graph-ingest
+            - -service-graph-ingest-grpc=:4317
+            - -service-graph-ingest-http=:4318
+            # The ring, for the internal hop. The endpoint is the GOVERNING
+            # HEADLESS Service, from which each shard's stable per-pod name is
+            # derived; $POD_NAME below tells this pod which of them it is, so
+            # the traces it already owns take no hop at all.
+            - -service-graph-shards=2
+            - -service-graph-endpoint=kubescrape-servicegraph.monitoring.svc:4319
+            # Every per-node pipeline off: this tier does traces and nothing
+            # else. -ingest is the DaemonSet's LOGS-AND-METRICS receiver.
             - -logs=false
             - -metrics=false
             - -cadvisor=false
@@ -134,8 +170,10 @@ spec:
             - name: POD_NAMESPACE
               valueFrom:
                 fieldRef: {fieldPath: metadata.namespace}
-            # Identity for the self-metadata by-name fallback (the hostname is
-            # not the pod's name when the pod shares the host's namespaces).
+            # THIS SHARD'S NAME IN THE RING (-service-graph-shard-name defaults
+            # to it): a StatefulSet pod's name is <sts>-<ordinal>, which is what
+            # the ring derives its tokens from. It is also the identity for the
+            # self-metadata by-name fallback.
             - name: POD_NAME
               valueFrom:
                 fieldRef: {fieldPath: metadata.name}
@@ -155,6 +193,10 @@ spec:
               containerPort: 8081
             - name: service-graph
               containerPort: 4319
+            - name: otlp-grpc
+              containerPort: 4317
+            - name: otlp-http
+              containerPort: 4318
           readinessProbe:
             httpGet: {path: /readyz, port: http}
           livenessProbe:
@@ -162,7 +204,7 @@ spec:
           resources:
             # Memory scales with the pairing store (maxItems) and the edge
             # series count (maxCardinality), not with the cluster's span rate;
-            # CPU scales with the forwarded span rate over the shard count.
+            # CPU scales with the received span rate over the shard count.
             requests:
               cpu: 50m
               memory: 128Mi

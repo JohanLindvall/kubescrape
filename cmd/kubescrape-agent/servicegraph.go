@@ -1,23 +1,33 @@
 package main
 
-// The service-graph feature's wiring, both halves of it.
+// The trace tier's wiring (-service-graph).
 //
-//   - The SHARD role (-service-graph): a receiver for spans other agents
-//     forwarded, the pairing processor they feed, and the edge-metric registry
-//     that exports what pairs.
-//   - The AGENT half (-service-graph-shards / -service-graph-endpoint, or the
-//     config's serviceGraphShards section): the ring, and the tap that ships a
-//     trimmed copy of each ingested span to the shard owning its trace.
+// One workload, two listeners, and the difference between them is the whole
+// design:
 //
-// Everything about pairing, ring placement, trimming and the emitted series
-// lives in internal/agent/servicegraph; this file is only the seam between
-// that package and the process — flags, listeners, readiness, shutdown.
+//   - The APPLICATION listeners (-service-graph-ingest-grpc / -http, 4317/4318)
+//     take OTLP traces pushed by instrumented pods. Unauthenticated, because
+//     every pod in the cluster is a sender. A payload arriving here is enriched
+//     with Kubernetes metadata — this is the ONE place the connection's source
+//     address still names the sender — and then re-sharded by trace id.
+//   - The INTERNAL listener (-service-graph-listen, 4319) takes spans a sibling
+//     shard re-sharded to us. Authenticated with the shared bearer token,
+//     because it is reachable from every pod too and what it accepts is treated
+//     as final: already enriched, already routed. It is TERMINAL — nothing
+//     arriving here is enriched again or re-sharded again.
 //
-// Why two roles in one binary: the shard tier IS the agent binary with every
-// per-node pipeline off (charts/kubescrape/templates/servicegraph.yaml), the
-// same way the events/Azure singleton is. It needs the same exporter, the same
-// self-metrics identity and the same config file, and a second binary would
-// duplicate all of it to save one flag.
+// Both funnel into one owner chain: pair the edge, derive the RED metrics, head
+// sample, export. That chain runs exactly once per span, on the shard that owns
+// its trace.
+//
+// Everything about pairing, ring placement, re-sharding and the emitted series
+// lives in internal/agent/servicegraph; this file is the seam between that
+// package and the process — flags, listeners, readiness, shutdown.
+//
+// Why this is the agent binary with a flag rather than its own: the tier needs
+// the same exporter, the same self-metrics identity, the same enricher and the
+// same config file, exactly as the events/Azure singleton does. A second binary
+// would duplicate all of it to save one flag.
 
 import (
 	"context"
@@ -43,31 +53,45 @@ import (
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 
+	"github.com/JohanLindvall/kubescrape/internal/agent/otlpexport"
+	"github.com/JohanLindvall/kubescrape/internal/agent/otlpingest"
 	"github.com/JohanLindvall/kubescrape/internal/agent/servicegraph"
+	"github.com/JohanLindvall/kubescrape/internal/agent/spanmetrics"
+	"github.com/JohanLindvall/kubescrape/internal/agent/tracesample"
 	"github.com/JohanLindvall/kubescrape/internal/obs"
+	"github.com/JohanLindvall/kubescrape/pkg/kubemeta"
 )
 
-// gateServiceGraph is satisfied once the shard's receiver is BOUND — not once
-// it has received something.
+// gateServiceGraph is satisfied once the tier's INTERNAL receiver is BOUND —
+// not once it has received something.
 //
-// A shard that has been forwarded nothing yet is working; gating on the first
-// payload would leave a freshly-scaled tier permanently not-ready in a cluster
-// whose agents are still rolling out, and a StatefulSet rollout advances on
-// this probe. Bound is the honest claim: the port answers, and an agent's
-// forward will land.
+// A shard that has been sent nothing yet is working; gating on the first payload
+// would leave a freshly-scaled tier permanently not-ready, and a StatefulSet
+// rollout advances on this probe. Bound is the honest claim: the port answers,
+// and a sibling's hop will land.
 const gateServiceGraph = "service-graph-receiver"
 
-// --- the shard role ---
+// gateServiceGraphIngest is the same claim for the application-facing listeners.
+// It is separate because they can fail independently (a port already bound is
+// the usual way), and a rollout that advanced while nothing could push traces to
+// the new pod would march that state across the tier.
+const gateServiceGraphIngest = "service-graph-ingest"
 
-// startServiceGraph starts the pairing shard: receiver, sweeper and the edge
+// startServiceGraph starts the trace tier: the two receivers, the pairing
+// processor and sweeper, the span-metrics generator, the sampler and the edge
 // metric export loop. Off unless -service-graph.
 func (p *pipelines) startServiceGraph() error {
 	if !*serviceGraphOn {
+		// A configured section that silently does nothing is indistinguishable
+		// from one that is working, so each of them says so once.
 		if p.fileCfg.ServiceGraph != nil {
-			// Symmetric with the traceSampling/-ingest-span-metrics warnings: a
-			// configured section that silently does nothing is indistinguishable
-			// from one that is working.
-			p.log.Warn("serviceGraph configured but ignored: the pairing role is off (-service-graph=false); this section belongs on the shard tier")
+			p.log.Warn("serviceGraph configured but ignored: this process is not the trace tier (-service-graph=false)")
+		}
+		if cfg := p.fileCfg.TraceSampling; cfg != nil && cfg.Enabled() {
+			p.log.Warn("traceSampling configured but ignored: traces are received by the trace tier (-service-graph), and this process is not it")
+		}
+		if *spanMetrics {
+			p.log.Warn("-ingest-span-metrics ignored: span metrics are derived from received traces, and traces are received by the trace tier (-service-graph), which this process is not")
 		}
 		return nil
 	}
@@ -76,12 +100,12 @@ func (p *pipelines) startServiceGraph() error {
 		cfg = *p.fileCfg.ServiceGraph
 	}
 
-	// The receiver accepts spans from every agent in the cluster, so the hop is
-	// authenticated — validateConfig already refused an empty -service-graph-
-	// token-file (fatal there so -check-config catches it too); the READ is
-	// fatal here for the metadata service's reason: an unreadable or empty
-	// token file must stop the process, never open the listener with nothing to
-	// check against.
+	// The internal receiver accepts spans from anything that can reach the pod,
+	// so the hop is authenticated — validateConfig already refused an empty
+	// -service-graph-token-file (fatal there so -check-config catches it too);
+	// the READ is fatal here for the metadata service's reason: an unreadable or
+	// empty token file must stop the process, never open the listener with
+	// nothing to check against.
 	tok, err := newRotatingToken(*serviceGraphToken, p.log)
 	if err != nil {
 		return fmt.Errorf("-service-graph-token-file: %w", err)
@@ -102,38 +126,291 @@ func (p *pipelines) startServiceGraph() error {
 		}
 	})
 
-	// The shard's own resource identity, like the span-metrics generator's: the
+	// The tier's own resource identity, like the span-metrics generator's: the
 	// edge's two services are DATA-POINT labels (client/server), never the
-	// emitting process's identity — a shard describes other objects, it is not
-	// one of them.
+	// emitting process's identity — this workload describes other objects, it is
+	// not one of them.
 	res := agentSelfResource(*nodeName)
 	p.serviceGraphProc, p.serviceGraphReg, p.serviceGraphRes = proc, reg, res
 	p.spawn(func() { reg.Run(p.ctx, p.selfOut, *serviceGraphIv, res, p.log) })
 	p.spawn(func() { sweepServiceGraph(p.ctx, proc) })
+
+	owner, err := p.buildOwnerChain(proc)
+	if err != nil {
+		return err
+	}
 
 	p.ready.require(gateServiceGraph)
 	rcv := &sgReceiver{
 		grpcAddr: *serviceGraphListen,
 		httpAddr: *serviceGraphHTTPListen,
 		tokens:   tok.tokens,
-		consume:  proc.Consume,
+		consume:  ownerReceive(owner),
 		ready:    func() { p.ready.done(gateServiceGraph) },
 		log:      p.log,
 	}
 	p.spawn(func() {
 		if err := rcv.Run(p.ctx); err != nil {
-			// Fatal like the ingest listener: a shard whose receiver is dead
-			// pairs nothing, and it would otherwise sit there looking healthy
-			// while the whole cluster's graph is empty.
+			// Fatal like the ingest listener: a shard whose internal receiver is
+			// dead accepts no re-sharded spans, and it would otherwise sit there
+			// looking healthy while its siblings' pushes fail.
 			p.log.Error("service-graph receiver failed; shutting down", "error", err)
 			ferr := fmt.Errorf("service-graph receiver: %w", err)
 			p.fatalErr.CompareAndSwap(nil, &ferr) // first fatal wins
 			p.stop()
 		}
 	})
-	p.log.Info("service-graph shard started", "grpc", *serviceGraphListen, "http", *serviceGraphHTTPListen,
+	if err := p.startServiceGraphIngest(owner); err != nil {
+		return err
+	}
+	p.log.Info("trace tier started", "internalGRPC", *serviceGraphListen, "internalHTTP", *serviceGraphHTTPListen,
 		"wait", proc.Wait(), "interval", *serviceGraphIv)
 	return nil
+}
+
+// ownerReceive turns the owner chain into the internal receiver's consume
+// callback: strip the transport marker, then run the chain.
+//
+// Stripping FIRST and unconditionally is the point. The marker exists to let the
+// application listener refuse a hop addressed to the wrong port; past that it is
+// kubescrape's internal plumbing, and letting it ride to the collector would put
+// a kubescrape.* resource attribute on every application span in the cluster.
+func ownerReceive(owner servicegraph.TracesExporter) func(context.Context, ptrace.Traces) error {
+	return func(ctx context.Context, td ptrace.Traces) error {
+		servicegraph.StripForwarded(td)
+		return owner.ExportTraces(ctx, td)
+	}
+}
+
+// buildOwnerChain assembles what happens to a span once it is on the shard that
+// OWNS its trace, from the bottom up:
+//
+//	pair the edge -> derive RED metrics -> head sample -> export to the collector
+//
+// The two taps forward to their inner exporter FIRST and act only on success, as
+// spanmetrics has always done, and here that is load-bearing rather than tidy: a
+// failed export propagates all the way back to the pushing application, whose
+// retry re-pushes the identical batch. Counting before the export would inflate
+// both the graph and the RED metrics by one copy per back-pressure window.
+//
+// Sampling sits BELOW both, non-negotiably. An edge is one request and the graph
+// counts requests; RED metrics are the request rate. A sampled chain would still
+// pair correctly (the sampler keeps whole traces — the decision is per trace id)
+// and would simply report 10% of the traffic as if that were the traffic, on
+// series whose entire purpose is saying how much there is.
+func (p *pipelines) buildOwnerChain(proc *servicegraph.Processor) (servicegraph.TracesExporter, error) {
+	// Both Client and Buffered export traces (Buffered passes them through
+	// unbuffered — the pushing sender owns the retry, and a disk-buffered span
+	// would be acked to a sender that then stops holding it).
+	out, ok := p.out.(servicegraph.TracesExporter)
+	if !ok {
+		return nil, fmt.Errorf("exporter does not support traces")
+	}
+	chain := out
+	if cfg := p.fileCfg.TraceSampling; cfg != nil && cfg.Enabled() {
+		if err := cfg.Validate(); err != nil {
+			return nil, err
+		}
+		chain = tracesample.New(*cfg, chain)
+		p.log.Info("trace sampling enabled", "probability", cfg.Probability,
+			"maxSpansPerSecond", cfg.MaxSpansPerSecond, "keepSlowerThan", cfg.KeepSlowerThan)
+	}
+	if *spanMetrics {
+		var smCfg spanmetrics.Config
+		if p.fileCfg.TraceMetrics != nil {
+			smCfg = *p.fileCfg.TraceMetrics
+		}
+		gen := spanmetrics.New(smCfg)
+		chain = gen.Tap(chain)
+		smRes := agentSelfResource(*nodeName)
+		p.spanMetricsGen, p.spanMetricsRes = gen, smRes
+		p.spawn(func() { gen.Run(p.ctx, p.selfOut, *spanMetricsIv, smRes, p.log) })
+		p.log.Info("span metrics from traces enabled", "interval", *spanMetricsIv)
+	}
+	return &sgPairTap{proc: proc, inner: chain}, nil
+}
+
+// sgPairTap feeds the pairing store after a successful export. Consume runs on
+// the concurrent receiver goroutines; the pairing store is mutex-guarded for
+// exactly that.
+type sgPairTap struct {
+	proc  *servicegraph.Processor
+	inner servicegraph.TracesExporter
+}
+
+func (t *sgPairTap) ExportTraces(ctx context.Context, td ptrace.Traces) error {
+	if err := t.inner.ExportTraces(ctx, td); err != nil {
+		return err
+	}
+	t.proc.Consume(td)
+	return nil
+}
+
+// --- the application-facing listeners ---
+
+// startServiceGraphIngest starts the tier's OTLP trace receiver for
+// applications: enrich, re-shard, and hand this shard's own share to the owner
+// chain.
+func (p *pipelines) startServiceGraphIngest(owner servicegraph.TracesExporter) error {
+	if !*serviceGraphIngest || (*serviceGraphIngestGRPC == "" && *serviceGraphIngestHTTP == "") {
+		p.log.Warn("the trace tier accepts no application pushes (-service-graph-ingest=false, or both -service-graph-ingest-grpc and -service-graph-ingest-http are empty); it will only receive spans re-sharded by sibling shards")
+		return nil
+	}
+	resharder, err := serviceGraphResharder(p.fileCfg.ServiceGraphShards, p.log)
+	if err != nil {
+		return fmt.Errorf("service-graph shards: %w", err)
+	}
+	p.sgResharder = resharder
+	obs.RegisterServiceGraphResharder(func() obs.ServiceGraphReshardStat {
+		st := resharder.Stats() // nil-receiver safe
+		return obs.ServiceGraphReshardStat{
+			SpansForwarded: st.SpansForwarded,
+			SpansLocal:     st.SpansLocal,
+			SpansUnkeyed:   st.SpansUnkeyed,
+			SendsFailed:    st.SendsFailed,
+			LoopsBlocked:   st.LoopsBlocked,
+		}
+	})
+	if resharder != nil {
+		shards := resharder.Ring().Shards()
+		p.log.Info("trace re-sharding enabled", "shards", len(shards), "self", *serviceGraphSelf, "ring", strings.Join(shards, ","))
+	} else {
+		p.log.Info("trace re-sharding is off: a single-shard tier owns every trace locally")
+	}
+
+	enr := otlpingest.NewEnricher(otlpingest.Config{
+		ContainerIDKeys: splitList(*ingestCidKeys),
+		PodUIDKeys:      splitList(*ingestUIDKeys),
+		Wait:            *ingestWait,
+		EnrichLines:     *enrichOn,
+		PeerIPFallback:  *ingestPeerIP,
+		PeerReject:      p.peerIsOurOwnWorkload,
+		Attrs:           p.attrBuilders.Ingest,
+		NodeInfo:        p.nodeInfo,
+		Meta:            p.meta,
+		Logger:          p.log,
+	})
+	p.ready.require(gateServiceGraphIngest)
+	srv := otlpingest.NewServer(otlpingest.ServerConfig{
+		GRPCAddr:    *serviceGraphIngestGRPC,
+		HTTPAddr:    *serviceGraphIngestHTTP,
+		MaxInFlight: *ingestMaxInFlight,
+		Enricher:    enr,
+		// Exporter nil: this listener serves TRACES only. Logs and metrics belong
+		// on the node-local DaemonSet, where the sender is a pod on the same node
+		// and the payload crosses no network to be attributed.
+		Traces: &sgEntry{resharder: resharder, owner: owner},
+		Ready:  func() { p.ready.done(gateServiceGraphIngest) },
+		Logger: p.log,
+	})
+	p.spawn(func() {
+		if err := srv.Run(p.ctx); err != nil {
+			p.log.Error("service-graph trace ingest failed; shutting down", "error", err)
+			ferr := fmt.Errorf("service-graph trace ingest: %w", err)
+			p.fatalErr.CompareAndSwap(nil, &ferr) // first fatal wins
+			p.stop()
+		}
+	})
+	p.log.Info("trace ingest listening", "grpc", *serviceGraphIngestGRPC, "http", *serviceGraphIngestHTTP,
+		"peerIPFallback", *ingestPeerIP)
+	return nil
+}
+
+// sgEntry is the terminal exporter of the APPLICATION listener: it runs after
+// otlpingest.Server has enriched the payload, refuses anything that has already
+// been through the tier, re-shards the rest, and runs the owner chain over
+// whatever this shard owns.
+//
+// Ordering is fixed by what each step needs. Enrichment happens above (inside
+// the server) because it needs the connection's source address, which only
+// exists on the hop the application itself opened. Re-sharding happens after
+// enrichment because the payload that crosses to a sibling must be the finished
+// one — the sibling has no way to attribute it. And the owner chain happens
+// after both because it is the thing that must run exactly once per span, on one
+// shard.
+type sgEntry struct {
+	resharder *servicegraph.Resharder // nil on a single-shard tier
+	owner     servicegraph.TracesExporter
+}
+
+func (e *sgEntry) ExportTraces(ctx context.Context, td ptrace.Traces) error {
+	if servicegraph.IsForwarded(td) {
+		// An internal hop addressed to the application port. Refusing it
+		// PERMANENTLY (InvalidArgument, which otlpexport.IsPermanent classifies as
+		// do-not-retry) is what turns that misconfiguration into a bounded,
+		// counted failure instead of an amplification loop: enriching this
+		// payload would attribute it to the sending SHARD, and re-sharding it
+		// would send it round again, on every hop, forever.
+		e.resharder.CountLoopBlocked(td.SpanCount())
+		return status.Error(codes.InvalidArgument,
+			"this payload carries "+servicegraph.ForwardedMarker+": it was re-sharded by another shard and addressed to the tier's APPLICATION port instead of its internal receiver (-service-graph-listen). Point serviceGraphShards at the internal port")
+	}
+	local, err := e.resharder.Reshard(ctx, td) // nil-receiver safe: everything stays local
+	if err != nil {
+		return err
+	}
+	if local.SpanCount() == 0 {
+		return nil
+	}
+	return e.owner.ExportTraces(ctx, local)
+}
+
+// peerIsOurOwnWorkload vetoes a peer-IP attribution that resolved to a pod of
+// THIS process's own workload.
+//
+// The peer address is only the sender's on the hop the sender opened. Everything
+// that can rewrite it in flight — a mesh sidecar that terminates the connection,
+// an ingress or proxy in front of the tier, an internal hop addressed to the
+// wrong port — leaves an address belonging to some infrastructure pod, and on
+// this tier the infrastructure pod is usually one of US. Attributing an
+// application's traces to a kubescrape shard is the worst available outcome:
+// every span in the cluster labelled with the same wrong pod, service.name and
+// namespace, rendering perfectly, alerting on nothing.
+//
+// Identity comes from the self-metadata lookup the process already runs for
+// -self-attributes, so there is no new dependency.
+//
+// It returns false when we do not know our own pod yet. That is the honest
+// answer during the first seconds after start: the check exists to prevent a
+// confident lie, and inventing one from a lookup that has not landed would be
+// the same mistake in the other direction.
+func (p *pipelines) peerIsOurOwnWorkload(pod *kubemeta.Pod) bool {
+	if p.selfPod == nil {
+		return false
+	}
+	return sameWorkload(p.selfPod(), pod)
+}
+
+// sameWorkload reports whether two pods are the same pod or two replicas of one
+// workload.
+//
+// The WORKLOAD comparison is what catches the sibling case: shard 3's address is
+// not shard 0's pod, but it is the same StatefulSet, and no application ever is.
+// It walks to the TOP of each owner chain (pod -> ReplicaSet -> Deployment) and
+// compares uids, so a ReplicaSet rollout does not make two generations of one
+// Deployment look like different workloads.
+func sameWorkload(a, b *kubemeta.Pod) bool {
+	if a == nil || b == nil {
+		return false
+	}
+	if a.UID != "" && a.UID == b.UID {
+		return true
+	}
+	if a.Namespace != b.Namespace || a.Namespace == "" {
+		return false
+	}
+	ao, bo := topOwner(a), topOwner(b)
+	return ao != nil && bo != nil && ao.UID != "" && ao.UID == bo.UID
+}
+
+// topOwner is the last link of a pod's ownership chain — the workload object
+// (Deployment, StatefulSet, DaemonSet, CronJob), which is what the metadata
+// service resolves the chain up to.
+func topOwner(p *kubemeta.Pod) *kubemeta.Owner {
+	if len(p.Owners) == 0 {
+		return nil
+	}
+	return &p.Owners[len(p.Owners)-1]
 }
 
 // sweepServiceGraph runs the pairing store's expiry on a ticker.
@@ -176,41 +453,46 @@ func sweepInterval(wait time.Duration) time.Duration {
 	return d
 }
 
-// --- the shard's span receiver ---
+// --- the tier's INTERNAL receiver ---
 
-// sgReceiver is the shard's intake: a TRACES-ONLY OTLP receiver, gRPC on
+// sgReceiver is the tier's internal intake: a TRACES-ONLY OTLP receiver, gRPC on
 // -service-graph-listen plus optional OTLP/HTTP protobuf on
 // -service-graph-http-listen, both behind the shared bearer token.
 //
+// It is the port that says "this payload is final". What arrives here has
+// already been enriched and routed by the shard that received it from an
+// application, so this path never enriches (the peer is a sibling shard, not the
+// sender) and never re-shards (we are the owner). Both are structural: there is
+// no Enricher and no Resharder in this path at all.
+//
 // # Why not internal/agent/otlpingest
 //
-// That receiver is the -ingest feature, and the shard is its opposite on every
-// axis that matters. It requires an Enricher and a logs+metrics Exporter and
-// registers all three OTLP services; the shard runs with -ingest=false, accepts
-// only traces and forwards nothing anywhere. It is deliberately
-// UNAUTHENTICATED because it is node-local — its only defence is the in-flight
-// shed — while this listener is reachable from every pod in the cluster and
-// must authenticate. Reusing it would have meant bolting an auth mode and a
-// consume-instead-of-forward mode onto the ingest path for a listener that
-// shares none of its concerns (and neither role could then be changed without
-// re-reasoning about the other). What is actually worth sharing — the pdata
-// OTLP services, the body handling, the token-file contract — is shared by
-// following the same shapes, not by widening an existing type.
+// That receiver is what the APPLICATION listeners use, and this one is its
+// opposite on the two axes that matter. It is unauthenticated, because its
+// senders are every instrumented pod in the cluster; this one must
+// authenticate, because what it accepts skips enrichment and routing and a
+// forged payload would be exported unattributed. And it enriches by peer
+// address, which is exactly the thing that is meaningless here. Reusing it
+// would have meant bolting an auth mode and a skip-enrichment mode onto the
+// ingest path so neither could be changed without re-reasoning about the other.
 //
-// No in-flight shed here, for the same reason otlpingest needs one: that
-// receiver holds a slot for as long as the COLLECTOR takes to ack a forwarded
-// payload (up to -otlp-timeout), from senders it cannot identify. This one is
-// authenticated and terminal — Consume is an in-memory upsert bounded by
-// maxItems and returns immediately — so a request occupies memory for its own
-// decode and nothing longer. The gRPC message cap below bounds that.
+// No in-flight shed here, for the reason the application listener needs one:
+// that one holds a slot for as long as the whole owner chain takes (a
+// re-shard hop plus the collector's ack, up to -otlp-timeout), from senders it
+// cannot identify. This one is authenticated and shorter — it runs the owner
+// chain, whose one blocking step is the collector export — and the gRPC message
+// cap below bounds what a single request can allocate.
 type sgReceiver struct {
 	grpcAddr string
 	httpAddr string
 	// tokens is the accepted set, re-read and rotation-aware.
 	tokens func() []string
-	// consume is servicegraph.Processor.Consume: safe to call from the
-	// concurrent handler goroutines (the pairing store is mutex-guarded).
-	consume func(ptrace.Traces)
+	// consume runs the owner chain (strip the marker, pair, RED metrics, sample,
+	// export). Safe to call from the concurrent handler goroutines. It RETURNS AN
+	// ERROR, and that error becomes the sending shard's — which becomes the
+	// application's, whose retry is the only thing standing between a failed
+	// export and a lost span.
+	consume func(context.Context, ptrace.Traces) error
 	ready   func()
 	log     *slog.Logger
 
@@ -363,12 +645,30 @@ type sgTraces struct {
 }
 
 func (g *sgTraces) Export(ctx context.Context, req ptraceotlp.ExportRequest) (ptraceotlp.ExportResponse, error) {
-	// Consume is terminal and cannot fail: pairing either stores the span,
-	// completes an edge or counts a refusal (obs.ServiceGraphStoreFull). The
-	// ack is therefore honest — nothing downstream can still reject it, and a
-	// sender retry would double-count the edge.
-	g.r.consume(req.Traces())
+	// The ack is honest only if the whole owner chain succeeded: the sending
+	// shard holds no copy after we answer, and its own sender is the only thing
+	// that can produce these spans again. An error travels back to the
+	// application, whose retry re-pushes the identical batch — which is safe
+	// because the taps count only after a successful export.
+	if err := g.r.consume(ctx, req.Traces()); err != nil {
+		return ptraceotlp.ExportResponse{}, sgForwardStatus(err)
+	}
 	return ptraceotlp.NewExportResponse(), nil
+}
+
+// sgForwardStatus maps an owner-chain failure onto a gRPC status the sending
+// shard's exporter classifies correctly. A bare error surfaces as codes.Unknown,
+// which otlpexport reads as NON-permanent — fine — but a genuinely permanent
+// upstream rejection has to stay permanent, or the sending shard's application
+// retries a payload nothing will ever accept.
+func sgForwardStatus(err error) error {
+	if _, ok := status.FromError(err); ok {
+		return err
+	}
+	if otlpexport.IsPermanent(err) {
+		return status.Error(codes.InvalidArgument, err.Error())
+	}
+	return status.Error(codes.Unavailable, err.Error())
 }
 
 func (r *sgReceiver) handleHTTPTraces(w http.ResponseWriter, req *http.Request) {
@@ -389,7 +689,17 @@ func (r *sgReceiver) handleHTTPTraces(w http.ResponseWriter, req *http.Request) 
 		http.Error(w, "malformed OTLP traces payload", http.StatusBadRequest)
 		return
 	}
-	r.consume(er.Traces())
+	if err := r.consume(req.Context(), er.Traces()); err != nil {
+		// The HTTP counterpart of sgForwardStatus: a permanent upstream rejection
+		// is 400 (do not retry this batch), everything else 503 (retryable). The
+		// sending shard's exporter reads both correctly.
+		code := http.StatusServiceUnavailable
+		if otlpexport.IsPermanent(err) {
+			code = http.StatusBadRequest
+		}
+		http.Error(w, err.Error(), code)
+		return
+	}
 	b, err := ptraceotlp.NewExportResponse().MarshalProto()
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -453,33 +763,33 @@ func sgReadBody(req *http.Request) ([]byte, error) {
 	return body, nil
 }
 
-// --- the agent half: forwarding to the shards ---
+// --- the internal hop's configuration ---
 
-// serviceGraphForwarder builds the shard forwarder from the flags and the
-// config section, or (nil, nil) when the feature is off — so the caller can
-// wire it unconditionally.
-func serviceGraphForwarder(sec *servicegraph.ForwardConfig, log *slog.Logger) (*servicegraph.Forwarder, error) {
+// serviceGraphResharder builds the tier's internal resharder from the flags and
+// the config section, or (nil, nil) when there is nothing to re-shard (a
+// single-shard tier) — so the caller can wire it unconditionally.
+func serviceGraphResharder(sec *servicegraph.ReshardConfig, log *slog.Logger) (*servicegraph.Resharder, error) {
 	cfg, err := serviceGraphShardConfig(sec)
 	if err != nil {
 		return nil, err
 	}
-	return servicegraph.NewForwarder(cfg, baseExportConfig(), log)
+	return servicegraph.NewResharder(cfg, baseExportConfig(), log)
 }
 
 // serviceGraphShardConfig merges the flag surface into the config's
 // serviceGraphShards section.
 //
-// PRECEDENCE: the config section wins, field by field; the flags fill in what
-// it leaves unset. The chart renders the flags and nothing else, so they have
-// to work alone — but an operator who reaches for the section is asking for
+// PRECEDENCE: the config section wins, field by field; the flags fill in what it
+// leaves unset. The chart renders the flags and nothing else, so they have to
+// work alone — but an operator who reaches for the section is asking for
 // something the flags cannot express (explicit endpoints outside Kubernetes, a
 // TLS'd hop, tokensPerShard), and having the flags override it would make the
 // richer form unusable in exactly the deployment that renders them.
 //
 // It touches nothing: no DNS, no filesystem, no namespace resolution (that
 // happens in shardTargets at start), so -check-config runs it as-is.
-func serviceGraphShardConfig(sec *servicegraph.ForwardConfig) (servicegraph.ForwardConfig, error) {
-	var cfg servicegraph.ForwardConfig
+func serviceGraphShardConfig(sec *servicegraph.ReshardConfig) (servicegraph.ReshardConfig, error) {
+	var cfg servicegraph.ReshardConfig
 	if sec != nil {
 		cfg = *sec
 	}
@@ -502,29 +812,32 @@ func serviceGraphShardConfig(sec *servicegraph.ForwardConfig) (servicegraph.Forw
 	if cfg.Replicas == 0 {
 		cfg.Replicas = *serviceGraphShards
 	}
+	if cfg.Self == "" {
+		cfg.Self = strings.TrimSpace(*serviceGraphSelf)
+	}
 	if cfg.BearerTokenFile == "" {
-		// The SAME flag as the shard's listener credential: one Secret, mounted
-		// on both workloads, so the two sides cannot be given different tokens
-		// by a config that looks complete.
+		// The SAME flag as the internal listener's credential: one Secret, one
+		// token, so a shard cannot be given a token its siblings do not accept by
+		// a config that looks complete.
 		cfg.BearerTokenFile = *serviceGraphToken
 	}
 	// Half a template is the one "disabled" state worth refusing: it reads as
-	// configured and forwards nothing, which is indistinguishable from the
-	// feature being off. ForwardConfig.Validate refuses the same shapes, but in
-	// the section's spelling — these messages name the FLAG the operator
-	// actually set.
+	// configured and re-shards nothing, which is indistinguishable from a
+	// deliberately single-shard tier. ReshardConfig.Validate refuses the same
+	// shapes, but in the section's spelling — these messages name the FLAG the
+	// operator actually set.
 	switch {
-	case *serviceGraphShards > 0 && cfg.StatefulSet == "" && len(cfg.Endpoints) == 0:
-		return cfg, fmt.Errorf("-service-graph-shards=%d has nothing to address: set -service-graph-endpoint to the shard tier's governing headless Service, or name the shards in the config's serviceGraphShards section", *serviceGraphShards)
+	case *serviceGraphShards > 1 && cfg.StatefulSet == "" && len(cfg.Endpoints) == 0:
+		return cfg, fmt.Errorf("-service-graph-shards=%d has nothing to address: set -service-graph-endpoint to the tier's governing headless Service, or name the shards in the config's serviceGraphShards section", *serviceGraphShards)
 	case *serviceGraphEndpoint != "" && cfg.Replicas <= 0:
-		return cfg, fmt.Errorf("-service-graph-endpoint %q has no shard count: set -service-graph-shards to the StatefulSet's replica count (it is part of the ring's definition, so every agent must be given the same number)", *serviceGraphEndpoint)
+		return cfg, fmt.Errorf("-service-graph-endpoint %q has no shard count: set -service-graph-shards to the StatefulSet's replica count (it is part of the ring's definition, so every shard must be given the same number)", *serviceGraphEndpoint)
 	}
 	return cfg, nil
 }
 
 // parseShardEndpoint reads the shard tier's GOVERNING HEADLESS SERVICE address
 // — `<statefulset>.<namespace>.svc[.cluster.local][:port]`, which is what the
-// chart renders — into the template ForwardConfig expands to each shard's
+// chart renders — into the template ReshardConfig expands to each shard's
 // stable per-pod name, `<sts>-<ordinal>.<service>.<ns>.svc:<port>`.
 //
 // The Service is named but never DIALLED: a load-balanced destination

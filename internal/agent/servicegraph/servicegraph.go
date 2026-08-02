@@ -29,19 +29,23 @@
 //
 // # Topology
 //
-// The DaemonSet agents do NOT pair among themselves. Every agent is sharded
-// by node — the one key guaranteed to split a request's two halves — and an
-// agent-to-agent mesh would need peer discovery the DaemonSet has no RBAC for,
-// would rebuild its ring on every node drain (discarding in-flight pairing
-// state cluster-wide), and would need every agent reachable from every other.
-// Instead a small, separately-scaled tier owns the ring, exactly as Tempo
-// splits distributors from metrics-generators: agents forward TRIMMED spans
-// (see Trim) to the owning shard over the ordinary OTLP export path, and the
-// shards run this package.
+// A small, separately-scaled tier owns the ring and the whole trace pipeline.
+// Applications push their OTLP traces to that tier's Service; the shard that
+// receives a push enriches it with Kubernetes metadata (while the connection's
+// peer address still names the sender — that is the one thing only the entry
+// shard can do), then re-shards each span by trace id and hands it to the shard
+// owning that trace (reshard.go). The owner holds every span of the trace, so it
+// can pair edges here, derive per-span RED metrics, apply head sampling and
+// export to the collector.
 //
-// Everything here is OPT-IN (-service-graph on the shard, -service-graph-shards
-// on the agent): it costs a workload, a network hop per span and a new metric
-// family, none of which an operator should pay for without asking.
+// Pairing cannot happen in the per-node DaemonSet at all: a request's client and
+// server spans are emitted by two pods that usually run on two different nodes,
+// so a node-local aggregator holds half of every edge by construction. That is
+// exactly the opposite of agent/spanmetrics, where each span is aggregated
+// INDEPENDENTLY and cumulative counters simply sum cluster-wide.
+//
+// The tier is OPT-IN (-service-graph): it costs a workload, and a cluster that
+// does not push traces has no use for it.
 package servicegraph
 
 import (
@@ -119,6 +123,11 @@ type Config struct {
 	// Dimensions are extra span/resource attribute keys lifted onto the edge
 	// series. Tempo's rule applies: a dimension resolves from whichever side
 	// carried it, exposed as client_<dim> and server_<dim>.
+	//
+	// Nothing has to agree with anything for these to work: the spans reaching
+	// the pairing store are the ones the sender pushed, whole, so a key added
+	// here starts resolving on the next export with no second list to keep in
+	// step.
 	Dimensions []string `json:"dimensions,omitempty"`
 	// VirtualNodePeerAttributes name the far side of an UNPAIRED client span,
 	// in precedence order, so calls to uninstrumented dependencies (managed

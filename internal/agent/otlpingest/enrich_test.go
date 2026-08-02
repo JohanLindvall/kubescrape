@@ -621,3 +621,92 @@ func TestScrubStructuredBodyWithPlainReplacement(t *testing.T) {
 		t.Errorf("ordinary field rewritten: %q", note.Str())
 	}
 }
+
+// PeerReject is the guard on the one attribution that can be confidently wrong.
+//
+// The connection's source address names the SENDER exactly once — on the hop the
+// sender itself opened. A proxy, a service mesh that terminates the connection,
+// or an internal hop addressed to the wrong port all present their own address,
+// and on a receiver deployed as its own workload that address usually belongs to
+// that workload. Attributing an application's telemetry to the receiver's own
+// pod would be wrong on every resource, plausible-looking, and invisible.
+//
+// So a vetoed resolution must (a) enrich nothing, (b) count under its OWN
+// outcome, and (c) NOT also count as `unresolved` — that counter is per
+// resource, and double-tallying it would hide the rejection inside a number
+// operators already read as ordinary.
+func TestPeerRejectRefusesAndCountsSeparately(t *testing.T) {
+	var asked []string
+	enr := NewEnricher(Config{
+		Meta:           newMeta(),
+		PeerIPFallback: true,
+		PeerReject: func(pod *kubemeta.Pod) bool {
+			asked = append(asked, pod.Name)
+			return pod.Name == "web-3"
+		},
+	})
+	ld := plog.NewLogs()
+	ld.ResourceLogs().AppendEmpty().ScopeLogs().AppendEmpty().LogRecords().AppendEmpty().Body().SetStr("hi")
+
+	rejected := obs.Ingested.WithLabelValues("peer_ip_rejected").Value()
+	unresolved := obs.Ingested.WithLabelValues("unresolved").Value()
+	accepted := obs.Ingested.WithLabelValues("peer_ip").Value()
+
+	enr.EnrichLogs(withPeerIP(context.Background(), "10.1.2.3:41234"), ld)
+
+	if n := ld.ResourceLogs().At(0).Resource().Attributes().Len(); n != 0 {
+		t.Fatalf("a vetoed peer still enriched the resource (%d attrs): an application's telemetry would carry the receiver's own identity",
+			n)
+	}
+	if len(asked) != 1 || asked[0] != "web-3" {
+		t.Errorf("PeerReject was consulted with %v, want exactly the resolved pod", asked)
+	}
+	if got := obs.Ingested.WithLabelValues("peer_ip_rejected").Value() - rejected; got != 1 {
+		t.Errorf("peer_ip_rejected moved by %v, want 1", got)
+	}
+	if got := obs.Ingested.WithLabelValues("unresolved").Value() - unresolved; got != 0 {
+		t.Errorf("unresolved also moved by %v: a rejection must not be counted twice", got)
+	}
+	if got := obs.Ingested.WithLabelValues("peer_ip").Value() - accepted; got != 0 {
+		t.Errorf("peer_ip moved by %v on a rejected attribution", got)
+	}
+}
+
+// The veto is memoised with the rest of the per-request cache: the peer is a
+// property of the CONNECTION, so a 500-resource payload must consult it once,
+// not 500 times (and /v1/pod-ips is deliberately uncacheable).
+func TestPeerRejectIsResolvedOncePerRequest(t *testing.T) {
+	calls := 0
+	enr := NewEnricher(Config{
+		Meta:           newMeta(),
+		PeerIPFallback: true,
+		PeerReject:     func(*kubemeta.Pod) bool { calls++; return true },
+	})
+	ld := plog.NewLogs()
+	for i := 0; i < 50; i++ {
+		ld.ResourceLogs().AppendEmpty().ScopeLogs().AppendEmpty().LogRecords().AppendEmpty().Body().SetStr("hi")
+	}
+	enr.EnrichLogs(withPeerIP(context.Background(), "10.1.2.3:41234"), ld)
+	if calls != 1 {
+		t.Errorf("PeerReject consulted %d times for one request", calls)
+	}
+	rls := ld.ResourceLogs()
+	for i := 0; i < rls.Len(); i++ {
+		if n := rls.At(i).Resource().Attributes().Len(); n != 0 {
+			t.Fatalf("resource %d was enriched despite the veto", i)
+		}
+	}
+}
+
+// A nil PeerReject accepts everything — the node-local case, where the peer is a
+// pod on this node by construction.
+func TestPeerRejectNilAcceptsEverything(t *testing.T) {
+	enr := NewEnricher(Config{Meta: newMeta(), PeerIPFallback: true})
+	ld := plog.NewLogs()
+	ld.ResourceLogs().AppendEmpty().ScopeLogs().AppendEmpty().LogRecords().AppendEmpty().Body().SetStr("hi")
+	enr.EnrichLogs(withPeerIP(context.Background(), "10.1.2.3:41234"), ld)
+	if v, ok := ld.ResourceLogs().At(0).Resource().Attributes().Get("k8s.pod.name"); !ok || v.Str() != "web-3" {
+		t.Fatalf("a nil PeerReject blocked an ordinary attribution: %v",
+			ld.ResourceLogs().At(0).Resource().Attributes().AsRaw())
+	}
+}

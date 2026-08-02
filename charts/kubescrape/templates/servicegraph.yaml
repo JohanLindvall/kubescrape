@@ -1,24 +1,29 @@
 {{- if .Values.serviceGraph.enabled }}
 {{- /*
-  Service-graph EDGE metrics need BOTH halves of a request — the caller's
-  CLIENT span and the callee's SERVER span — and those two spans are produced
-  by two pods that usually run on two different nodes. A DaemonSet agent holds
-  half of every edge by construction, and no amount of per-node aggregation
-  completes it. (This is exactly the opposite of -ingest-span-metrics, where
-  every span is aggregated INDEPENDENTLY, so the per-node cumulative counters
-  simply sum cluster-wide and no extra tier is needed.)
+  The TRACE TIER. Applications push their OTLP traces here (the ClusterIP
+  Service below), not to their node's agent, because everything worth doing to
+  a trace needs the WHOLE trace in one process:
 
-  Pairing therefore runs on its own tier: each agent hashes a span by TRACE ID
-  onto a ring and forwards a TRIMMED copy to the shard that owns that trace,
-  which sees both halves and emits the edge. That is Grafana Tempo's
-  distributor -> metrics-generator split, with Tempo's hash (FNV-1 32-bit over
-  the trace id) and Tempo's metric names, because Grafana's Service Graph view
-  queries those names and labels verbatim.
+    - A service-graph EDGE needs both halves of a request — the caller's CLIENT
+      span and the callee's SERVER span — and those two spans are produced by
+      two pods that usually run on two different nodes. A per-node aggregator
+      holds half of every edge by construction and no amount of aggregation
+      completes it.
+    - Sampling a trace as a unit needs the same thing.
+
+  So a push lands on an arbitrary shard (the Service round-robins), that shard
+  enriches it with Kubernetes metadata — the one moment the connection's source
+  address still names the sender — and then re-shards each span by TRACE ID onto
+  a ring, handing it to the shard that owns that trace. The owner pairs, derives
+  RED metrics, samples and exports. That is Grafana Tempo's distributor ->
+  metrics-generator split collapsed into one workload, with Tempo's hash (FNV-1
+  32-bit over the trace id) and Tempo's metric names, because Grafana's Service
+  Graph view queries those names and labels verbatim.
 
   A StatefulSet, not a Deployment: the ring addresses each shard by its STABLE
-  ORDINAL DNS NAME (<sts>-<i>.<svc>.<ns>.svc), and every agent must derive the
-  IDENTICAL ring — two agents disagreeing about the shard set send a request's
-  two halves to two different shards and the edge silently never forms. A
+  ORDINAL DNS NAME (<sts>-<i>.<svc>.<ns>.svc), and every shard must derive the
+  IDENTICAL ring — two shards disagreeing about the set route a request's two
+  halves to two different owners and the edge silently never forms. A
   Deployment's pods have neither stable names nor individually addressable DNS,
   so there would be nothing to derive the ring from. There is no
   volumeClaimTemplate: the pairing state is in-memory by design (a half-edge is
@@ -44,23 +49,62 @@ metadata:
 spec:
   # HEADLESS (clusterIP: None). This Service exists for the per-pod DNS names
   # it publishes — <release>-servicegraph-0.<release>-servicegraph.<ns>.svc —
-  # which are what the agents' ring addresses. A normal ClusterIP would
+  # which are what the ring addresses for the INTERNAL hop. A ClusterIP would
   # round-robin, i.e. send a trace's client half to one shard and its server
   # half to another: the one failure mode the ring exists to prevent.
+  #
+  # Applications do NOT use this Service; they use the ClusterIP one below,
+  # whose round-robin is exactly what the internal hop then undoes.
   clusterIP: None
-  # Shards must be addressable while they are still filling their pairing
-  # window (and during a rolling restart), or the agents' forwards fail for
-  # the whole readiness delay and those edges are lost rather than delayed.
+  # Shards must be addressable while they are still starting (and during a
+  # rolling restart), or the internal hop fails for the whole readiness delay
+  # and the pushes that hash there are refused rather than delayed.
   publishNotReadyAddresses: true
   selector:
     app: {{ .Release.Name }}-servicegraph
   ports:
-    # Only the receiver port: the pods' own health and metrics ports are
-    # reached directly (kubelet probes, prometheus.io/* discovery), not
+    # Only the internal receiver port: the pods' own health and metrics ports
+    # are reached directly (kubelet probes, prometheus.io/* discovery), not
     # through this Service.
     - name: service-graph
       port: {{ $port }}
       targetPort: service-graph
+{{- if $sg.ingest.enabled }}
+---
+{{- /*
+  The APPLICATION-facing Service: where instrumented pods point their OTLP
+  exporters (OTEL_EXPORTER_OTLP_ENDPOINT). A normal ClusterIP, deliberately —
+  round-robin is fine and wanted here, because the shard that receives a push is
+  not the shard that has to own the trace; the internal hop fixes that.
+
+  It is UNAUTHENTICATED. Every instrumented pod in the cluster is a sender, and
+  requiring a credential from each of them is not a bargain most fleets can
+  make; the NetworkPolicy below is the lever that scopes who may reach it.
+*/}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Release.Name }}-traces
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: {{ .Release.Name }}-servicegraph
+    {{- include "kubescrape.labels" . | nindent 4 }}
+spec:
+  type: ClusterIP
+  selector:
+    app: {{ .Release.Name }}-servicegraph
+  ports:
+    {{- with $sg.ingest.grpcEndpoint }}
+    - name: otlp-grpc
+      port: {{ int (split ":" .)._1 }}
+      targetPort: otlp-grpc
+    {{- end }}
+    {{- with $sg.ingest.httpEndpoint }}
+    - name: otlp-http
+      port: {{ int (split ":" .)._1 }}
+      targetPort: otlp-http
+    {{- end }}
+{{- end }}
 ---
 apiVersion: apps/v1
 kind: StatefulSet
@@ -122,10 +166,10 @@ spec:
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           command: ["/kubescrape-agent"]
           args:
-            # Every per-node pipeline off: this tier only pairs forwarded
-            # spans. -ingest in particular stays off — the shard's receiver is
-            # -service-graph-listen below, a separate port that accepts only
-            # forwarded trace payloads.
+            # Every per-node pipeline off: this tier does traces and nothing
+            # else. -ingest in particular stays off — that flag is the
+            # DaemonSet's LOGS-AND-METRICS receiver, and this workload's trace
+            # listeners are -service-graph-ingest-* below.
             - -logs=false
             - -metrics=false
             - -cadvisor=false
@@ -138,11 +182,44 @@ spec:
             - -service-graph
             - -service-graph-listen=:{{ $port }}
             {{- if $sg.tokenSecret.name }}
-            # The receiver is reachable from every pod in the cluster, so the
-            # hop is authenticated. Same token file on both sides (see the
-            # DaemonSet), re-read periodically so rotating the Secret needs no
-            # restart. Without it the binary refuses to open the listener.
+            # The INTERNAL receiver is reachable from every pod in the cluster,
+            # and what it accepts is treated as final — already enriched,
+            # already routed — so the hop is authenticated. Re-read
+            # periodically, so rotating the Secret needs no restart. Without it
+            # the binary refuses to open the listener.
             - -service-graph-token-file={{ $tokenPath }}
+            {{- end }}
+            {{- if $sg.ingest.enabled }}
+            # The APPLICATION-facing listeners, behind the ClusterIP Service
+            # above. Unauthenticated by design; scope them with the
+            # NetworkPolicy at the bottom of this file.
+            - -service-graph-ingest
+            - -service-graph-ingest-grpc={{ $sg.ingest.grpcEndpoint }}
+            - -service-graph-ingest-http={{ $sg.ingest.httpEndpoint }}
+            - -ingest-peer-ip-fallback={{ $sg.ingest.peerIpFallback }}
+            {{- with .Values.agent.ingest.containerIdKeys }}
+            - -ingest-container-id-keys={{ join "," . }}
+            {{- end }}
+            {{- with .Values.agent.ingest.podUidKeys }}
+            - -ingest-pod-uid-keys={{ join "," . }}
+            {{- end }}
+            {{- else }}
+            - -service-graph-ingest=false
+            {{- end }}
+            {{- /* The ring, for the internal hop. The shard count IS part of
+                   the ring's definition, so it renders from the same value as
+                   the StatefulSet's replicas; the endpoint is the GOVERNING
+                   HEADLESS Service, from which each shard's stable per-pod
+                   name (<sts>-<ordinal>.<service>.<ns>.svc:<port>) is derived.
+                   Naming the ClusterIP Service here would round-robin, which
+                   is precisely what this hop exists to undo. */}}
+            - -service-graph-shards={{ int64 $sg.replicas }}
+            - -service-graph-endpoint={{ .Release.Name }}-servicegraph.{{ .Release.Namespace }}.svc:{{ $port }}
+            {{- if $sg.spanMetrics }}
+            # RED metrics from the spans this tier receives. Derived on the
+            # OWNING shard, so each span is counted exactly once.
+            - -ingest-span-metrics
+            - -ingest-span-metrics-interval={{ $sg.spanMetricsInterval }}
             {{- end }}
             - -otlp-endpoint={{ .Values.agent.otlp.endpoint }}
             - -otlp-protocol={{ .Values.agent.otlp.protocol }}
@@ -158,11 +235,11 @@ spec:
             - -otlp-bearer-token-file=/etc/kubescrape/otlp-token/{{ .Values.agent.otlp.bearerTokenSecret.key }}
             {{- end }}
             {{- if $cfg }}
-            # The same rendered agent config as the DaemonSet: its
-            # `serviceGraph` section (wait / maxItems / maxCardinality /
-            # staleAfter / histogramBuckets / dimensions) is this tier's
-            # tuning, and its `serviceGraphShards.dimensions` is the agents'
-            # matching half — one file keeps the two from drifting.
+            # The same rendered agent config as the DaemonSet. Its
+            # `serviceGraph` (wait / maxItems / maxCardinality / staleAfter /
+            # histogramBuckets / dimensions), `traceMetrics` and
+            # `traceSampling` sections are this tier's tuning; the rest of the
+            # file is the DaemonSet's and is simply unread here.
             - -config=/etc/kubescrape/config/config.yaml
             {{- end }}
             - -metrics-listen={{ if .Values.metrics.enabled }}{{ .Values.metrics.listen }}{{ end }}
@@ -181,8 +258,12 @@ spec:
             - name: POD_NAMESPACE
               valueFrom:
                 fieldRef: {fieldPath: metadata.namespace}
-            # Identity for the self-metadata by-name fallback (the hostname is
-            # not the pod's name when the pod shares the host's namespaces).
+            # THIS SHARD'S NAME IN THE RING (-service-graph-shard-name defaults
+            # to it): a StatefulSet pod's name is <sts>-<ordinal>, which is
+            # exactly what the ring derives its tokens from. Without it every
+            # span this pod already owns would take a needless network hop back
+            # to this pod. It is also the identity for the self-metadata
+            # by-name fallback.
             - name: POD_NAME
               valueFrom:
                 fieldRef: {fieldPath: metadata.name}
@@ -202,6 +283,16 @@ spec:
             {{- end }}
             - name: service-graph
               containerPort: {{ $port }}
+            {{- if $sg.ingest.enabled }}
+            {{- with $sg.ingest.grpcEndpoint }}
+            - name: otlp-grpc
+              containerPort: {{ int (split ":" .)._1 }}
+            {{- end }}
+            {{- with $sg.ingest.httpEndpoint }}
+            - name: otlp-http
+              containerPort: {{ int (split ":" .)._1 }}
+            {{- end }}
+            {{- end }}
           readinessProbe:
             httpGet: {path: /readyz, port: http}
           livenessProbe:
@@ -260,13 +351,42 @@ spec:
   ingress:
     - ports:
         # Health/readiness (the kubelet probes these), the scrape port when
-        # enabled, and the span receiver — which every agent must reach, so it
-        # carries no `from` selector; the bearer token, not the network, is
-        # what authenticates that hop. Undeclared ports (pprof) stay closed.
+        # enabled, the INTERNAL receiver (reachable from the sibling shards,
+        # authenticated by the shared bearer token rather than by the network)
+        # and — when application ingest is on — the OTLP trace ports.
+        #
+        # WHAT THE TRACE PORTS EXPOSE, stated plainly: any pod that can reach
+        # them can push arbitrary OTLP spans into this cluster's traces, with no
+        # credential. Enrichment stamps the SENDER's Kubernetes identity where it
+        # can resolve one, so a forged span is attributable to the pod that sent
+        # it rather than to whatever it claims — but a sender can still emit
+        # spans naming any service.name it likes, and the cost of the volume it
+        # pushes is the tier's and the collector's. That is the same bargain
+        # every unauthenticated OTLP collector in a cluster makes; narrow it with
+        # a `from` selector below if the pod network is not trusted.
+        #
+        # Undeclared ports (pprof) stay closed.
         - port: {{ (split ":" .Values.agent.listen)._1 | int }}
         {{- if .Values.metrics.enabled }}
         - port: {{ (split ":" .Values.metrics.listen)._1 | int }}
         {{- end }}
         - port: {{ $port }}
+        {{- if $sg.ingest.enabled }}
+        {{- with $sg.ingest.grpcEndpoint }}
+        - port: {{ int (split ":" .)._1 }}
+        {{- end }}
+        {{- with $sg.ingest.httpEndpoint }}
+        - port: {{ int (split ":" .)._1 }}
+        {{- end }}
+        {{- end }}
+      {{- with $sg.ingest.allowFrom }}
+      # Scope who may push traces. With this set the health, metrics and
+      # internal ports are scoped too — a NetworkPolicy rule's `from` and `ports`
+      # apply together — which is usually what an operator wants but is worth
+      # knowing: the kubelet's probes come from the node, so include a
+      # namespaceSelector/ipBlock that covers it.
+      from:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
 {{- end }}
 {{- end }}

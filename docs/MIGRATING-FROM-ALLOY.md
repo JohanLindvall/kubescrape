@@ -283,14 +283,17 @@ service stays static).
 ### `input_otlp` (apps pushing OTLP)
 
 Built in — `agent.ingest.enabled: true` (flag `-ingest`) receives OTLP/gRPC
-(`:4317`) and OTLP/HTTP (`:4318`) that apps push to the node, enriches each
+(`:4317`) and OTLP/HTTP (`:4318`) LOGS AND METRICS that apps push to the node, enriches each
 resource with k8s attributes from a `container.id`/`k8s.pod.uid` on the data
 (without overwriting sender-set values), and forwards it — replacing the
 collector-with-k8sattributes-processor you'd otherwise keep as the OTLP
 endpoint.
 
-Traces are accepted and passed through with the same resource enrichment
-(`-ingest-traces`). Pushed payloads are forwarded as received — the role of
+Traces go to the separate trace tier (`serviceGraph.enabled: true`, flag
+`-service-graph`) rather than to the node's agent: applications point their
+exporters at `http://<release>-traces.<ns>.svc:4318`, and that tier enriches,
+re-shards by trace id and derives service-graph edges and RED metrics from spans
+it can see whole. Pushed payloads are forwarded as received — the role of
 `otelcol.processor.batch` stays with your SDK's batch span/log processor or
 the downstream collector, and every forward keeps the sender's own retry
 semantics (nothing is acknowledged before it is handed on).

@@ -36,7 +36,6 @@ import (
 	"github.com/JohanLindvall/kubescrape/internal/agent/servicegraph"
 	"github.com/JohanLindvall/kubescrape/internal/agent/spanmetrics"
 	"github.com/JohanLindvall/kubescrape/internal/agent/tailer"
-	"github.com/JohanLindvall/kubescrape/internal/agent/tracesample"
 	"github.com/JohanLindvall/kubescrape/internal/agent/transform"
 	"github.com/JohanLindvall/kubescrape/internal/leader"
 	"github.com/JohanLindvall/kubescrape/internal/logline"
@@ -247,17 +246,18 @@ var (
 	nodeOn     = flag.Bool("node-metrics", true, "scrape <kubelet-endpoint>/metrics (kubelet/node metrics)")
 
 	// OTLP ingest (apps push telemetry to the local agent for enrichment).
-	ingestOn      = flag.Bool("ingest", false, "receive pushed OTLP logs/metrics/traces and enrich them with k8s attributes before forwarding")
+	// LOGS AND METRICS ONLY: traces are received by the -service-graph tier,
+	// which is the only place that can hold a whole trace (see startServiceGraph).
+	ingestOn      = flag.Bool("ingest", false, "receive pushed OTLP logs and metrics and enrich them with k8s attributes before forwarding. Traces go to the -service-graph tier instead: pairing an edge and (later) sampling a trace need every span of that trace in one process, which a per-node receiver can never have")
 	ingestGRPC    = flag.String("ingest-grpc-endpoint", ":4317", "listen address for pushed OTLP/gRPC (empty disables)")
-	ingestHTTP    = flag.String("ingest-http-endpoint", ":4318", "listen address for pushed OTLP/HTTP protobuf on /v1/logs, /v1/metrics and /v1/traces (empty disables)")
+	ingestHTTP    = flag.String("ingest-http-endpoint", ":4318", "listen address for pushed OTLP/HTTP protobuf on /v1/logs and /v1/metrics (empty disables)")
 	ingestWait    = flag.Duration("ingest-metadata-wait", 0, "how long an ingest metadata lookup may block for not-yet-known objects")
 	ingestMetrics = flag.String("ingest-metrics-mode", "auto", "how pushed metrics resolve their object: resource (id on the resource), datapoint (id on each point, split into per-object resources), or auto")
 	ingestCidKeys = flag.String("ingest-container-id-keys", "container.id,k8s.container.id", "comma-separated attribute keys inspected for a container id")
 	ingestUIDKeys = flag.String("ingest-pod-uid-keys", "k8s.pod.uid", "comma-separated attribute keys inspected for a pod uid")
-	ingestTraces  = flag.Bool("ingest-traces", true, "accept pushed traces (gRPC + /v1/traces), enrich their resources and pass them through")
-	spanMetrics   = flag.Bool("ingest-span-metrics", false, "derive RED (calls + duration histogram) metrics from ingested spans, dimensioned by service.name/span.name/span.kind/status.code; exported over OTLP (tune via the traceMetrics config section)")
+	spanMetrics   = flag.Bool("ingest-span-metrics", false, "derive RED (calls + duration histogram) metrics from received spans, dimensioned by service.name/span.name/span.kind/status.code; exported over OTLP (tune via the traceMetrics config section). Traces are received by the -service-graph tier, so this belongs on that workload")
 	spanMetricsIv = flag.Duration("ingest-span-metrics-interval", time.Minute, "export interval for span metrics")
-	ingestPeerIP  = flag.Bool("ingest-peer-ip-fallback", false, "attribute pushed telemetry whose resource carries no container id / pod uid to the pod owning the connection's peer IP (hostNetwork senders never resolve)")
+	ingestPeerIP  = flag.Bool("ingest-peer-ip-fallback", false, "attribute pushed telemetry whose resource carries no container id / pod uid to the pod owning the connection's SOURCE address (hostNetwork senders never resolve). Only correct where that address still names the sender: a proxy, a mesh sidecar that terminates, or any NAT hop replaces it, and on the -service-graph tier a source address belonging to the tier's own workload is refused and counted (kubescrape_ingest_resources_total{outcome=\"peer_ip_rejected\"}) rather than attributed")
 	// The shed is the only defence the receiver has against senders it does
 	// not authenticate, and it interacts directly with -otlp-timeout: a
 	// collector taking the full timeout to answer holds every slot for that
@@ -266,21 +266,23 @@ var (
 	// Hard-coded, it was tunable only by rebuilding.
 	ingestMaxInFlight = flag.Int("ingest-max-in-flight", 0, "bound on concurrently-processed pushes across both ingest transports; over it senders get a retryable refusal (429 / ResourceExhausted with RetryInfo). 0 uses the built-in default (32)")
 
-	// Service graph. TWO ROLES, both opt-in and both off by default: the SHARD
-	// (-service-graph, its own StatefulSet with every per-node pipeline off)
-	// pairs forwarded spans into edges, and the AGENT (-service-graph-shards +
-	// -service-graph-endpoint, or the config's serviceGraphShards section)
-	// hashes each ingested span by trace id and ships a trimmed copy to the
-	// shard owning that trace. Neither is useful without the other, and the
-	// feature costs a workload, a network hop per edge-forming span and a new
-	// metric family — none of which an operator should pay for silently.
-	serviceGraphOn         = flag.Bool("service-graph", false, "run the service-graph SHARD role: receive spans forwarded by the agents, pair each request's client and server halves into Grafana-Tempo-compatible edge metrics and export them. Deploy it as its own StatefulSet (stable per-pod DNS names are what the agents' ring addresses) with -logs=false -metrics=false -cadvisor=false -node-metrics=false -ingest=false, NOT in the DaemonSet: a request's two halves reach two different nodes, so per-node pairing cannot complete an edge. Tuned by the config's serviceGraph section; REQUIRES -service-graph-token-file")
-	serviceGraphListen     = flag.String("service-graph-listen", ":4319", "listen address for the shard's OTLP/gRPC span receiver (empty disables it; deliberately not :4317, which is the agents' own ingest port — pointing the tier at that would loop spans back through the fan-out)")
-	serviceGraphHTTPListen = flag.String("service-graph-http-listen", "", "listen address for the shard's OTLP/HTTP protobuf receiver on /v1/traces (empty disables). Only needed when the agents forward with serviceGraphShards.protocol: http; the default hop is gRPC")
-	serviceGraphToken      = flag.String("service-graph-token-file", "", "shared bearer token file for the forward hop, on BOTH roles: the shard's receiver accepts it (and refuses to start without it — that listener takes spans from every pod in the cluster and must not be reachable unauthenticated), the agent presents it. Re-read periodically, with the previous value accepted for a grace window, so rotating the Secret needs no restart and no lockstep flip")
-	serviceGraphIv         = flag.Duration("service-graph-interval", time.Minute, "export interval for the shard's service-graph edge metrics")
-	serviceGraphShards     = flag.Int("service-graph-shards", 0, "number of service-graph shards (0 = the agent forwards nothing). It MUST equal the shard StatefulSet's replica count and be identical on every agent: the count defines the ring, and two agents disagreeing about it send a request's two halves to two different shards, where the edge silently never forms")
-	serviceGraphEndpoint   = flag.String("service-graph-endpoint", "", "the shard tier's governing HEADLESS Service, <statefulset>.<namespace>.svc:<port>; each shard's stable per-pod address <sts>-<ordinal>.<service>.<ns>.svc:<port> is derived from it. Never a ClusterIP: a load-balanced destination round-robins, which splits a trace's two halves across shards. The config's serviceGraphShards section is the richer form (explicit endpoints, TLS, tokensPerShard, the dimensions that must match the shard's) and WINS field by field where both are set")
+	// The trace tier (-service-graph). Opt-in, off by default, and its own
+	// StatefulSet with every per-node pipeline off: it receives the cluster's
+	// OTLP traces, enriches them, re-shards them by trace id so one process
+	// holds a whole trace, and from there pairs edges, derives RED metrics,
+	// samples and exports. It costs a workload, one internal hop per span and a
+	// new metric family — none of which an operator should pay for silently.
+	serviceGraphOn         = flag.Bool("service-graph", false, "run the TRACE TIER: receive application OTLP traces, enrich them, re-shard each span by trace id onto the tier's ring, and on the owning shard pair each request's client and server halves into Grafana-Tempo-compatible edge metrics. Deploy it as its own StatefulSet (stable per-pod DNS names are what the ring addresses) with -logs=false -metrics=false -cadvisor=false -node-metrics=false -ingest=false, NOT in the DaemonSet: a request's two halves are emitted by pods on two different nodes, so per-node pairing cannot complete an edge. Tuned by the config's serviceGraph section; REQUIRES -service-graph-token-file")
+	serviceGraphListen     = flag.String("service-graph-listen", ":4319", "listen address for the tier's INTERNAL OTLP/gRPC receiver: spans re-sharded by a sibling shard, behind the shared bearer token. Deliberately not the application ports below — an internal hop addressed to those would re-enrich and re-shard on every pass (empty disables)")
+	serviceGraphHTTPListen = flag.String("service-graph-http-listen", "", "listen address for the tier's internal OTLP/HTTP protobuf receiver on /v1/traces (empty disables). Only needed with serviceGraphShards.protocol: http; the default internal hop is gRPC")
+	serviceGraphToken      = flag.String("service-graph-token-file", "", "shared bearer token file for the tier's INTERNAL hop: the receiver accepts it (and refuses to start without it — that listener takes spans from every pod in the cluster and must not be reachable unauthenticated), the sending shard presents it. Re-read periodically, with the previous value accepted for a grace window, so rotating the Secret needs no restart and no lockstep flip. It does NOT gate the application-facing listeners, which are open by design")
+	serviceGraphIv         = flag.Duration("service-graph-interval", time.Minute, "export interval for the tier's service-graph edge metrics")
+	serviceGraphIngest     = flag.Bool("service-graph-ingest", true, "accept application OTLP traces on the tier (the addresses below). Off leaves only the internal receiver, which is a tier nothing can push to")
+	serviceGraphIngestGRPC = flag.String("service-graph-ingest-grpc", ":4317", "listen address for application OTLP/gRPC traces on the tier (empty disables). UNAUTHENTICATED by design: every instrumented pod in the cluster is a sender, and requiring a credential from each of them is not a bargain most fleets can make. Restrict it with a NetworkPolicy if the pod network is not trusted")
+	serviceGraphIngestHTTP = flag.String("service-graph-ingest-http", ":4318", "listen address for application OTLP/HTTP protobuf traces on the tier, /v1/traces (empty disables)")
+	serviceGraphShards     = flag.Int("service-graph-shards", 0, "number of shards in the tier (0 or 1 = no internal hop, everything is owned locally). It MUST equal the StatefulSet's replica count and be identical on every shard: the count defines the ring, and two shards disagreeing about it route a request's two halves to two different owners, where the edge silently never forms")
+	serviceGraphEndpoint   = flag.String("service-graph-endpoint", "", "the tier's governing HEADLESS Service, <statefulset>.<namespace>.svc:<port>; each shard's stable per-pod address <sts>-<ordinal>.<service>.<ns>.svc:<port> is derived from it for the internal hop. Never a ClusterIP: a load-balanced destination round-robins, which is exactly what the re-shard exists to undo. The config's serviceGraphShards section is the richer form (explicit endpoints, TLS, tokensPerShard) and WINS field by field where both are set")
+	serviceGraphSelf       = flag.String("service-graph-shard-name", os.Getenv("POD_NAME"), "this shard's own name in the ring (default $POD_NAME, which for a StatefulSet pod is <sts>-<ordinal>). Spans this shard already owns are then handled in-process instead of being sent over the network to itself; a name that is not in the ring still works but doubles the tier's internal traffic, and is warned about at startup")
 )
 
 // pipelines bundles what the per-pipeline start functions share: the
@@ -294,7 +296,12 @@ type pipelines struct {
 	out  otlpexport.Exporter
 	// selfOut is `out` for metrics the agent generates about ITSELF: it fills
 	// in this pod's own Kubernetes resource attributes (see selfattrs.go).
-	selfOut      selfmeta.Exporter
+	selfOut selfmeta.Exporter
+	// selfPod is the pod THIS process runs in, or nil until the lookup lands
+	// (and nil for good with -self-attributes off). The trace tier compares it
+	// against a peer-IP attribution to refuse one that resolved to its own
+	// workload — see peerIsOurOwnWorkload.
+	selfPod      func() *kubemeta.Pod
 	meta         *metaclient.Client
 	nodeInfo     func() *attrs.NodeInfo
 	attrBuilders *attrs.Builders
@@ -318,9 +325,9 @@ type pipelines struct {
 	serviceGraphProc *servicegraph.Processor
 	serviceGraphReg  *servicegraph.Registry
 	serviceGraphRes  pcommon.Resource
-	// sgForwarder is the agent half (nil unless shards are configured); run()
-	// closes its per-shard clients.
-	sgForwarder *servicegraph.Forwarder
+	// sgResharder is the tier's internal hop (nil on a single-shard tier);
+	// run() closes its per-shard clients.
+	sgResharder *servicegraph.Resharder
 	ingestMode  otlpingest.MetricsMode
 	filters     *promscrape.MetricFilters
 	splitters   []*promscrape.Splitter
@@ -698,6 +705,7 @@ func run() error {
 		log:          log,
 		out:          out,
 		selfOut:      selfOut,
+		selfPod:      selfPod,
 		meta:         meta,
 		nodeInfo:     nodeInfo,
 		attrBuilders: attrBuilders,
@@ -722,14 +730,10 @@ func run() error {
 	if err := p.startIngest(); err != nil {
 		return err
 	}
-	// The shard clients are this agent's only connections to the shard tier and
-	// are unrelated to the collector exporter; registered here (LIFO, so they
-	// close before it) once startIngest has built them.
-	defer func() {
-		if p.sgForwarder != nil {
-			_ = p.sgForwarder.Close()
-		}
-	}()
+	// The sibling-shard clients are unrelated to the collector exporter;
+	// registered here (LIFO, so they close before it) once startServiceGraph has
+	// built them.
+	defer func() { _ = p.sgResharder.Close() }() // nil-receiver safe
 	if err := p.startServiceGraph(); err != nil {
 		return err
 	}
@@ -1036,20 +1040,18 @@ func kubeConfig(path string) (*rest.Config, error) {
 	return clientcmd.NewNonInteractiveDeferredLoadingClientConfig(rules, nil).ClientConfig()
 }
 
-// startIngest starts the OTLP ingest receiver plus its optional trace
-// sampler and span-metrics tap. A fatal listener failure is reported through
-// p.fatalErr and p.stop so the agent exits non-zero.
+// startIngest starts the node-local OTLP ingest receiver: LOGS AND METRICS.
+// A fatal listener failure is reported through p.fatalErr and p.stop so the
+// agent exits non-zero.
+//
+// Traces are deliberately not here. Both things worth doing to a trace — pairing
+// its two halves into a service-graph edge, and (in time) deciding whether to
+// keep the whole trace — need every span of that trace in one process, and a
+// per-node receiver holds an arbitrary subset of them by construction. So the
+// trace receiver lives on the -service-graph tier, which re-shards by trace id
+// until one process does hold the whole thing (startServiceGraph).
 func (p *pipelines) startIngest() error {
 	if !*ingestOn {
-		if *spanMetrics {
-			p.log.Warn("-ingest-span-metrics ignored: the OTLP ingest receiver is disabled (-ingest=false)")
-		}
-		// Not warned on the shard tier: it runs with -ingest off by design, and
-		// it mounts the SAME config file as the DaemonSet, so it sees the
-		// agents' serviceGraphShards section without it meaning anything there.
-		if !*serviceGraphOn && (p.fileCfg.ServiceGraphShards.Enabled() || *serviceGraphShards > 0) {
-			p.log.Warn("service-graph forwarding ignored: the OTLP ingest receiver is disabled (-ingest=false), so this agent receives no spans to forward")
-		}
 		return nil
 	}
 	enr := otlpingest.NewEnricher(otlpingest.Config{
@@ -1065,120 +1067,16 @@ func (p *pipelines) startIngest() error {
 		Meta:            p.meta,
 		Logger:          p.log,
 	})
-	var ingestOut otlpingest.Exporter = p.out
-	var ingestTraceOut otlpingest.TracesExporter
-	if *ingestTraces {
-		// Both Client and Buffered export traces (Buffered passes them
-		// through unbuffered).
-		te, ok := p.out.(otlpingest.TracesExporter)
-		if !ok {
-			return fmt.Errorf("exporter does not support traces")
-		}
-		ingestTraceOut = te
-	}
-	// The sampler sits at the very bottom of the trace path — below the
-	// span-metrics tap, so RED metrics are derived from 100% of spans while
-	// only the sampled subset ships; decisions are per-trace-ID consistent,
-	// so a sender's retry re-samples identically.
-	if cfg := p.fileCfg.TraceSampling; cfg != nil && cfg.Enabled() {
-		if err := cfg.Validate(); err != nil {
-			return err
-		}
-		if ingestTraceOut == nil {
-			// Symmetric with the -ingest-span-metrics warnings: a configured
-			// section that silently does nothing is indistinguishable from one
-			// that is working.
-			p.log.Warn("traceSampling configured but ignored: the traces pipeline is off (-ingest and -ingest-traces)")
-		} else {
-			ingestTraceOut = tracesample.New(*cfg, ingestTraceOut)
-			p.log.Info("trace sampling enabled", "probability", cfg.Probability,
-				"maxSpansPerSecond", cfg.MaxSpansPerSecond, "keepSlowerThan", cfg.KeepSlowerThan)
-		}
-	}
-	// The span-metrics tap wraps the RAW trace exporter: it forwards FIRST
-	// and aggregates only on success (a transient failure surfaces retryable
-	// to the sender, whose re-push must not double-count). Consume runs on
-	// the concurrent ingest handler goroutines; the generator's series map is
-	// mutex-guarded for exactly that.
-	if *spanMetrics && ingestTraceOut != nil {
-		var smCfg spanmetrics.Config
-		if p.fileCfg.TraceMetrics != nil {
-			smCfg = *p.fileCfg.TraceMetrics
-		}
-		gen := spanmetrics.New(smCfg)
-		ingestTraceOut = gen.Tap(ingestTraceOut)
-		res := agentSelfResource(*nodeName)
-		p.spanMetricsGen, p.spanMetricsRes = gen, res
-		p.spawn(func() {
-			gen.Run(p.ctx, p.selfOut, *spanMetricsIv, res, p.log)
-		})
-		p.log.Info("span metrics from traces enabled", "interval", *spanMetricsIv)
-	} else if *spanMetrics {
-		p.log.Warn("-ingest-span-metrics ignored: traces are disabled (-ingest-traces=false)")
-	}
-	// The service-graph forwarder is the OUTERMOST tap on the trace path:
-	//
-	//   sender -> [service-graph tap] -> [span-metrics tap] -> [sampler] -> exporter
-	//
-	// ABOVE the sampler, non-negotiably: an edge is one request, and the graph
-	// counts requests. Sampling keeps whole traces (the decision is per trace
-	// id), so a sampled hop would still pair correctly — it would simply report
-	// 10% of the calls as if that were the traffic, on a series whose entire
-	// purpose is showing how much flows between two services.
-	//
-	// Relative to the span-metrics tap the order is free: both forward to their
-	// inner exporter FIRST and act only on success, so neither changes what the
-	// other sees. Outermost is chosen so the graph hop is decided after the
-	// whole local chain has succeeded. The shard SEND itself is not in this
-	// path at all — Forward hands each shard's share to a bounded queue and
-	// returns, precisely so a shard that is not answering cannot park one of
-	// the ingest receiver's in-flight slots (see servicegraph.Forward).
-	//
-	// Forwarding on success only, for the tap's own reason: a failed export is
-	// retried by the sender, and the shard's edge counters are cumulative and
-	// dedupe nothing, so a graph hop that already happened would inflate the
-	// graph on every back-pressure window.
-	if ingestTraceOut != nil {
-		fwd, err := serviceGraphForwarder(p.fileCfg.ServiceGraphShards, p.log)
-		if err != nil {
-			return fmt.Errorf("service-graph shards: %w", err)
-		}
-		if fwd != nil {
-			ingestTraceOut = fwd.Tap(ingestTraceOut)
-			p.sgForwarder = fwd
-			// Nothing else counts this hop: Forward never fails an export (an
-			// edge must never cost a span), so a dead shard tier is otherwise
-			// invisible on the agent.
-			obs.RegisterServiceGraphForwarder(func() obs.ServiceGraphForwardStat {
-				st := fwd.Stats()
-				return obs.ServiceGraphForwardStat{
-					SpansForwarded: st.SpansForwarded,
-					SpansLost:      st.SpansLost,
-					SpansQueueFull: st.SpansQueueFull,
-					SendsFailed:    st.SendsFailed,
-					LoopsBlocked:   st.LoopsBlocked,
-				}
-			})
-			shards := fwd.Ring().Shards()
-			p.log.Info("service-graph forwarding enabled", "shards", len(shards), "ring", strings.Join(shards, ","))
-			if *serviceGraphOn {
-				// Legal-looking and almost certainly wrong: a process that both
-				// pairs and forwards. The marker attribute keeps it from
-				// amplifying (kubescrape_service_graph_loops_blocked_total
-				// moves), but the shard tier is meant to run with -ingest off.
-				p.log.Warn("this process both pairs (-service-graph) and forwards service-graph spans; forwarded payloads carry a loop marker the pairing side refuses, but one of the two roles is probably not meant to be on here")
-			}
-		}
-	} else if p.fileCfg.ServiceGraphShards.Enabled() || *serviceGraphShards > 0 {
-		p.log.Warn("service-graph forwarding ignored: the traces pipeline is off (-ingest and -ingest-traces)")
-	}
+	// Traces: nil, so neither the gRPC trace service nor POST /v1/traces is
+	// served here. A sender pointed at the agent for traces gets Unimplemented /
+	// 404 — a loud, immediate error naming the wrong destination — rather than an
+	// ack for spans that could never have become an edge.
 	srv := otlpingest.NewServer(otlpingest.ServerConfig{
 		GRPCAddr:    *ingestGRPC,
 		HTTPAddr:    *ingestHTTP,
 		MaxInFlight: *ingestMaxInFlight,
 		Enricher:    enr,
-		Exporter:    ingestOut,
-		Traces:      ingestTraceOut,
+		Exporter:    p.out,
 		Logger:      p.log,
 	})
 	p.spawn(func() {
@@ -1421,7 +1319,7 @@ func selfSink(out, preRoute otlpexport.Exporter, routed bool, transforms *transf
 // data-point labels), so the shard pod's own attributes are what tells an
 // operator which shard produced them.
 func selfDescribing() bool {
-	return *selfMetricsIntv > 0 || (*spanMetrics && *ingestOn && *ingestTraces) || *serviceGraphOn
+	return *selfMetricsIntv > 0 || *serviceGraphOn
 }
 
 // buildAttrs compiles the resource-attribute builders from the config's

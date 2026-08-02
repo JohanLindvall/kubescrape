@@ -50,6 +50,15 @@ type ServerConfig struct {
 	GRPCAddr string // default ":4317" when enabled
 	HTTPAddr string // default ":4318" when enabled
 	Enricher *Enricher
+	// Exporter accepts pushed logs and metrics on /v1/logs, /v1/metrics and the
+	// matching gRPC services. nil disables BOTH signals — the services are not
+	// registered and the routes are not served, so a sender gets Unimplemented /
+	// 404 rather than a nil-pointer panic.
+	//
+	// A receiver for one signal is a real deployment, not a degenerate one: the
+	// service-graph tier takes traces and nothing else (logs and metrics belong
+	// on the node-local DaemonSet, where the peer address is a pod on the same
+	// node and the payload never crosses a network to be enriched).
 	Exporter Exporter
 	// Traces accepts pushed traces on /v1/traces and the gRPC trace service,
 	// enriching resources and passing them through. nil disables traces.
@@ -58,7 +67,12 @@ type ServerConfig struct {
 	// (0 = defaultMaxInFlight). Over the bound, senders are refused with a
 	// RETRYABLE answer rather than accepted into memory the node does not have.
 	MaxInFlight int
-	Logger      *slog.Logger
+	// Ready is called once every configured listener is BOUND (not once
+	// something has been received). It is what a readiness gate hangs on: a
+	// rollout that advanced on a probe answering before the port existed would
+	// march a broken listener across the fleet.
+	Ready  func()
+	Logger *slog.Logger
 }
 
 // defaultMaxInFlight bounds concurrently-processed pushes across BOTH
@@ -169,8 +183,10 @@ func (s *Server) Run(ctx context.Context) error {
 			grpc.MaxConcurrentStreams(uint32(s.maxInFlight)),
 			grpc.UnaryInterceptor(s.limitUnary),
 		)
-		plogotlp.RegisterGRPCServer(grpcSrv, &logsGRPC{s: s})
-		pmetricotlp.RegisterGRPCServer(grpcSrv, &metricsGRPC{s: s})
+		if s.cfg.Exporter != nil {
+			plogotlp.RegisterGRPCServer(grpcSrv, &logsGRPC{s: s})
+			pmetricotlp.RegisterGRPCServer(grpcSrv, &metricsGRPC{s: s})
+		}
 		if s.cfg.Traces != nil {
 			ptraceotlp.RegisterGRPCServer(grpcSrv, &tracesGRPC{s: s})
 		}
@@ -181,8 +197,10 @@ func (s *Server) Run(ctx context.Context) error {
 
 	if s.cfg.HTTPAddr != "" {
 		mux := http.NewServeMux()
-		mux.HandleFunc("POST /v1/logs", s.handleHTTPLogs)
-		mux.HandleFunc("POST /v1/metrics", s.handleHTTPMetrics)
+		if s.cfg.Exporter != nil {
+			mux.HandleFunc("POST /v1/logs", s.handleHTTPLogs)
+			mux.HandleFunc("POST /v1/metrics", s.handleHTTPMetrics)
+		}
 		if s.cfg.Traces != nil {
 			mux.HandleFunc("POST /v1/traces", s.handleHTTPTraces)
 		}
@@ -201,9 +219,19 @@ func (s *Server) Run(ctx context.Context) error {
 			ReadTimeout:       60 * time.Second,
 			IdleTimeout:       120 * time.Second,
 		}
+		// Listened explicitly rather than through ListenAndServe so the BIND
+		// failure is known before Ready fires below: a readiness probe that goes
+		// green on a port nobody bound is worse than no probe.
+		lis, err := net.Listen("tcp", s.cfg.HTTPAddr)
+		if err != nil {
+			if grpcSrv != nil {
+				grpcSrv.Stop()
+			}
+			return fmt.Errorf("ingest HTTP listen %s: %w", s.cfg.HTTPAddr, err)
+		}
 		started++
 		go func() {
-			if err := httpSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			if err := httpSrv.Serve(lis); err != nil && !errors.Is(err, http.ErrServerClosed) {
 				errc <- err
 				return
 			}
@@ -214,6 +242,9 @@ func (s *Server) Run(ctx context.Context) error {
 
 	if started == 0 {
 		return nil
+	}
+	if s.cfg.Ready != nil {
+		s.cfg.Ready()
 	}
 
 	// A runtime listener failure must propagate to the caller (main treats it

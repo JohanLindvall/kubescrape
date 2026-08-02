@@ -101,24 +101,26 @@ func TestSelfBuildAppliesConfiguredPipeline(t *testing.T) {
 // is the gate on a background lookup and a published gauge, and used to be an
 // inline boolean in a 600-line run() where a wrong edit was untestable.
 func TestSelfDescribing(t *testing.T) {
-	set := func(selfMetrics time.Duration, span, ingest, traces bool) {
-		*selfMetricsIntv, *spanMetrics, *ingestOn, *ingestTraces = selfMetrics, span, ingest, traces
+	set := func(selfMetrics time.Duration, tier, ingest bool) {
+		*selfMetricsIntv, *serviceGraphOn, *ingestOn = selfMetrics, tier, ingest
 	}
-	defer set(*selfMetricsIntv, *spanMetrics, *ingestOn, *ingestTraces)
+	defer set(*selfMetricsIntv, *serviceGraphOn, *ingestOn)
 
 	for _, tc := range []struct {
-		name                       string
-		selfMetrics                time.Duration
-		span, ingest, traces, want bool
+		name               string
+		selfMetrics        time.Duration
+		tier, ingest, want bool
 	}{
-		{"self-metrics on", time.Minute, false, false, false, true},
-		{"span metrics only", 0, true, true, true, true},
-		{"span metrics without ingest", 0, true, false, true, false},
-		{"span metrics without traces", 0, true, true, false, false},
-		{"nothing self-describing", 0, false, true, true, false},
+		{"self-metrics on", time.Minute, false, false, true},
+		// The trace tier emits span metrics and edge metrics under its OWN
+		// identity (the described services are data-point labels), so it always
+		// describes itself even with the self-metrics push off.
+		{"the trace tier", 0, true, false, true},
+		{"a plain agent with logs/metrics ingest", 0, false, true, false},
+		{"nothing self-describing", 0, false, false, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			set(tc.selfMetrics, tc.span, tc.ingest, tc.traces)
+			set(tc.selfMetrics, tc.tier, tc.ingest)
 			if got := selfDescribing(); got != tc.want {
 				t.Fatalf("selfDescribing() = %v, want %v", got, tc.want)
 			}

@@ -13,6 +13,7 @@ import (
 	"context"
 	"log/slog"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"go.opentelemetry.io/collector/pdata/pcommon"
@@ -74,7 +75,27 @@ type Config struct {
 	// k8s attributes (never overwriting sender values). Opt-in: peer IPs can
 	// be rewritten by NAT, and hostNetwork senders share the node IP (those
 	// never resolve — the metadata service only indexes pod-IP-owning pods).
+	//
+	// It is only ever correct at FIRST RECEIPT. The peer address names the
+	// process at the other end of THIS connection, so it means the sender
+	// exactly once: on the hop the sender itself opened. Any relay of the same
+	// payload — an internal re-shard hop, a proxy, a mesh sidecar that
+	// terminates — presents its own address, and attributing an application's
+	// telemetry to a relay's pod is silent, plausible-looking, wrong data. That
+	// is why the enricher runs on the tier's application-facing listener and on
+	// nothing else, and why PeerReject exists as the backstop.
 	PeerIPFallback bool
+	// PeerReject vetoes a peer-IP attribution after the lookup resolves. It is
+	// the explicit failure mode for an address that was rewritten in flight: the
+	// receiver knows which pods are its OWN workload's, and a connection whose
+	// source is one of those did not come from an application. Rejecting is
+	// counted (kubescrape_ingest_resources_total{outcome="peer_ip_rejected"}) and
+	// leaves the resource unenriched, which is a visible gap rather than a
+	// confident lie.
+	//
+	// nil accepts every resolution (the node-local case, where the peer is a pod
+	// on this node by construction).
+	PeerReject func(pod *kubemeta.Pod) bool
 	// Attrs builds the k8s resource attributes (nil = built-in defaults).
 	Attrs *attrs.Builder
 	// NodeInfo supplies the agent node's metadata for attribute templates.
@@ -112,6 +133,10 @@ type Enricher struct {
 	podUIDKeys      []string
 	mode            MetricsMode
 	log             *slog.Logger
+
+	// lastPeerWarn throttles the rejected-peer warning; the enricher is shared
+	// by concurrent handlers, so it is atomic.
+	lastPeerWarn atomic.Int64
 }
 
 // NewEnricher creates an Enricher.
@@ -379,12 +404,17 @@ func (e *Enricher) applyMetadata(ctx context.Context, a pcommon.Map, cache map[s
 	cTok, cOK := e.tokenFrom(a, e.containerIDKeys, tokContainer)
 	uTok, uOK := e.tokenFrom(a, e.podUIDKeys, tokPodUID)
 	if !cOK && !uOK {
-		if built := e.peerAttrs(ctx, cache); built.Len() > 0 {
+		built, rejected := e.peerAttrs(ctx, cache)
+		if built.Len() > 0 {
 			obs.Ingested.WithLabelValues("peer_ip").Inc()
 			mergeAttrs(built, a)
 			return true
 		}
-		obs.Ingested.WithLabelValues("unresolved").Inc()
+		// A rejected peer has already been counted under its own outcome; it must
+		// not tally a second time here (this counter is per RESOURCE).
+		if !rejected {
+			obs.Ingested.WithLabelValues("unresolved").Inc()
+		}
 		return false
 	}
 	// Try the container id first, then fall back to the pod uid: a stale
@@ -541,11 +571,21 @@ func overwriteAttrs(src, dst pcommon.Map) {
 
 // peerCacheKey is the reserved key under which the peer-IP attribution is
 // memoised in a request's attribute cache. A real token is "c:"/"u:" prefixed,
-// so this cannot collide.
-const peerCacheKey = "\x00peer"
+// so this cannot collide. peerRejectKey records that the same lookup was
+// REJECTED, so the outcome is memoised as precisely as the success is.
+const (
+	peerCacheKey  = "\x00peer"
+	peerRejectKey = "\x00peer-rejected"
+)
+
+// peerRejectWarnEvery throttles the rejected-peer warning. A relay in front of
+// the listener rewrites EVERY connection, so the condition is either absent or
+// universal; one line per push would bury the diagnosis in its own symptom.
+const peerRejectWarnEvery = time.Minute
 
 // peerAttrs returns the k8s attributes of the pod owning the connection's peer
-// IP, resolved at most ONCE per request.
+// IP, resolved at most ONCE per request, and reports whether the resolution was
+// REJECTED (see Config.PeerReject) as opposed to simply not resolving.
 //
 // The peer is a property of the connection, so every resource in a payload has
 // the same one — yet this ran per resource, and /v1/pod-ips is deliberately
@@ -554,33 +594,59 @@ const peerCacheKey = "\x00peer"
 // could be attributed differently if the index changed mid-request. The cache
 // is per request (the enricher itself is shared by concurrent handlers, so
 // nothing may be memoised on it).
-func (e *Enricher) peerAttrs(ctx context.Context, cache map[string]pcommon.Map) pcommon.Map {
+func (e *Enricher) peerAttrs(ctx context.Context, cache map[string]pcommon.Map) (pcommon.Map, bool) {
 	if !e.cfg.PeerIPFallback {
-		return pcommon.NewMap()
+		return pcommon.NewMap(), false
 	}
 	ip := peerIP(ctx)
 	if ip == "" {
-		return pcommon.NewMap()
+		return pcommon.NewMap(), false
 	}
 	if cache != nil {
 		if m, ok := cache[peerCacheKey]; ok {
-			return m
+			_, rejected := cache[peerRejectKey]
+			return m, rejected
 		}
 	}
 	built := pcommon.NewMap()
+	rejected := false
 	if pod, err := e.cfg.Meta.PodByIP(ctx, ip); err == nil && pod != nil {
-		res := pcommon.NewResource()
-		actx := attrs.Context{Pod: pod}
-		if e.cfg.NodeInfo != nil {
-			actx.Node = e.cfg.NodeInfo()
+		if e.cfg.PeerReject != nil && e.cfg.PeerReject(pod) {
+			// The address did not come from an application: something between
+			// the sender and this listener replaced it, and the pod it now names
+			// is one of ours. Attributing the sender's telemetry to that pod
+			// would be wrong in the worst way — confident, plausible, and
+			// wrong on every resource — so nothing is merged.
+			rejected = true
+			obs.Ingested.WithLabelValues("peer_ip_rejected").Inc()
+			e.warnPeerRejected(ip, pod)
+		} else {
+			res := pcommon.NewResource()
+			actx := attrs.Context{Pod: pod}
+			if e.cfg.NodeInfo != nil {
+				actx.Node = e.cfg.NodeInfo()
+			}
+			e.cfg.Attrs.Build(res, actx)
+			res.Attributes().CopyTo(built)
 		}
-		e.cfg.Attrs.Build(res, actx)
-		res.Attributes().CopyTo(built)
 	}
 	if cache != nil {
 		cache[peerCacheKey] = built
+		if rejected {
+			cache[peerRejectKey] = pcommon.NewMap()
+		}
 	}
-	return built
+	return built, rejected
+}
+
+func (e *Enricher) warnPeerRejected(ip string, pod *kubemeta.Pod) {
+	now := time.Now().UnixNano()
+	last := e.lastPeerWarn.Load()
+	if now-last < int64(peerRejectWarnEvery) || !e.lastPeerWarn.CompareAndSwap(last, now) {
+		return
+	}
+	e.log.Warn("refusing to attribute pushed telemetry by peer IP: the connection's source address belongs to this receiver's own workload, so it was rewritten in flight (a proxy, a mesh sidecar, or an internal hop addressed to the application port). Those resources stay unenriched; give senders a resource-level container.id or k8s.pod.uid, or make the path preserve the client address",
+		"peerIP", ip, "resolvedPod", pod.Namespace+"/"+pod.Name)
 }
 
 // idToken tags an ID value with its kind so a later lookup knows which

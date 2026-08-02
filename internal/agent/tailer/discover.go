@@ -142,8 +142,19 @@ func parseFileName(name string) (containerID, namespace string, ok bool) {
 }
 
 // scanDir discovers new and removed log files across all sources by globbing
-// their include patterns. checkpoints is non-nil only on the initial scan.
+// their include patterns. initial marks the startup scan, which seeds the
+// stored positions (checkpoints) every later scan also consults — see
+// Tailer.checkpoints and Tailer.startingUp for why the seeding and the
+// startup-only -logs-unknown-files policy outlive this one call.
 func (t *Tailer) scanDir(checkpoints map[string]checkpoint, initial bool) {
+	if initial {
+		t.checkpoints = checkpoints
+		t.hadStoredCheckpoints = len(checkpoints) > 0
+		// Startup is not over until a listing SUCCEEDS: with the very first
+		// glob failing, nothing is discovered, and the files a later pass finds
+		// are the startup set arriving late — not new files.
+		t.startingUp = true
+	}
 	seen := make(map[string]struct{})
 	discovered := false
 	listingOK := true
@@ -154,6 +165,9 @@ func (t *Tailer) scanDir(checkpoints map[string]checkpoint, initial bool) {
 		}
 		if listingOK {
 			t.warnedListing = false
+			// A successful listing ends startup: from here a newly appearing
+			// file is genuinely new.
+			t.startingUp = false
 		}
 		// Checkpoint pruning is only safe after a listing that actually saw the
 		// files; see saveCheckpoints.
@@ -171,7 +185,7 @@ func (t *Tailer) scanDir(checkpoints map[string]checkpoint, initial bool) {
 			if src.excluded(path) {
 				continue // the include match is implied: path came from src.glob()
 			}
-			if t.claimPath(src, path, seen, checkpoints, initial) {
+			if t.claimPath(src, path, seen) {
 				discovered = true
 			}
 		}
@@ -180,6 +194,17 @@ func (t *Tailer) scanDir(checkpoints map[string]checkpoint, initial bool) {
 		for path, f := range t.files {
 			if _, ok := seen[path]; !ok {
 				f.gone = true
+			}
+		}
+		// The same proof that lets saveCheckpoints prune the STORE applies to
+		// the pending map: a listing that saw the sources and did not see this
+		// path means the file is gone, so its stored offset must not later be
+		// applied to a recreated path — that would skip its first bytes as
+		// though they had shipped. (Keeping the two in lockstep is what makes a
+		// scan-then-save sequence idempotent.)
+		for path := range t.checkpoints {
+			if _, ok := seen[path]; !ok {
+				delete(t.checkpoints, path)
 			}
 		}
 	}
@@ -201,14 +226,14 @@ func (t *Tailer) scanDir(checkpoints map[string]checkpoint, initial bool) {
 // re-ingest the file from scratch if it were ever written to again, since
 // dropping it also drops its checkpoint. A cutoff is a discovery-time cost
 // lever ("don't start on last week's rotated logs"), not a retention policy.
-func (t *Tailer) tooOld(st os.FileInfo, path string, cutoff time.Duration, checkpoints map[string]checkpoint) bool {
+func (t *Tailer) tooOld(st os.FileInfo, path string, cutoff time.Duration) bool {
 	if time.Since(st.ModTime()) <= cutoff {
 		return false
 	}
 	if _, known := t.files[path]; known {
 		return false
 	}
-	_, hasCheckpoint := checkpoints[path]
+	_, hasCheckpoint := t.checkpoints[path]
 	return !hasCheckpoint
 }
 
@@ -232,7 +257,7 @@ func (s *compiledSource) deniesNamespace(ns string) bool {
 // unparseable CRI name — a later catch-all source must not resurrect it),
 // already tracked (unmark a raced gone flag), or newly discovered. It reports
 // whether a NEW file was tracked.
-func (t *Tailer) claimPath(src *compiledSource, path string, seen map[string]struct{}, checkpoints map[string]checkpoint, initial bool) bool {
+func (t *Tailer) claimPath(src *compiledSource, path string, seen map[string]struct{}) bool {
 	if st, err := os.Stat(path); err != nil || !st.Mode().IsRegular() {
 		// A transient stat failure on a file we already track must not mark
 		// it gone (drop would delete its checkpoint and a rediscovery would
@@ -246,7 +271,7 @@ func (t *Tailer) claimPath(src *compiledSource, path string, seen map[string]str
 		// open(2)/read(2) on a FIFO block indefinitely and would wedge the
 		// single sweep goroutine node-wide.
 		return false
-	} else if src.ignoreOlder > 0 && t.tooOld(st, path, src.ignoreOlder, checkpoints) {
+	} else if src.ignoreOlder > 0 && t.tooOld(st, path, src.ignoreOlder) {
 		return false
 	}
 	var id string
@@ -303,17 +328,27 @@ func (t *Tailer) claimPath(src *compiledSource, path string, seen map[string]str
 		dirty:       true, // read on the first (event-driven) sweep
 	}
 	t.newPipeline(f)
-	t.initFile(f, checkpoints, initial)
+	t.initFile(f)
 	t.files[path] = f
 	return true
 }
 
 // initFile seeds a newly discovered file's checkpoint/starting offset.
-func (t *Tailer) initFile(f *file, checkpoints map[string]checkpoint, initial bool) {
-	if !initial {
-		return
-	}
-	if cp, ok := checkpoints[f.path]; ok {
+//
+// The stored position is applied on WHATEVER pass discovers the file, not only
+// the first: a startup glob that fails discovers nothing, and the files the 2s
+// dirTicker then finds would each have started at byte 0 — a node-wide
+// re-ingest with every Pending prefix destroyed, and no counter moving. Where a
+// file with NO stored position starts still depends on the pass:
+// -logs-unknown-files governs the startup set (t.startingUp, which lasts until
+// a listing succeeds), while a file appearing after that is new and is read
+// whole.
+func (t *Tailer) initFile(f *file) {
+	if cp, ok := t.checkpoints[f.path]; ok {
+		// Consumed: the tailer's own offset is authoritative from here, and a
+		// re-application after the file is dropped and its path recreated would
+		// skip the new file's first bytes.
+		delete(t.checkpoints, f.path)
 		f.committed = cp.Offset
 		f.inode = cp.Inode
 		f.fp = fingerprint{Len: cp.FingerprintLen, Hash: cp.FingerprintHash}
@@ -364,22 +399,28 @@ func (t *Tailer) initFile(f *file, checkpoints map[string]checkpoint, initial bo
 			}
 		}
 		f.newTail()
-	} else if !f.compressed {
+	} else if t.startingUp && !f.compressed {
 		// Present at startup with no checkpoint entry. Where to start is
 		// configurable (Config.UnknownFiles): "end" skips it as pre-existing
 		// history; "start" reads it whole; "auto" (default) reads from the
 		// start when the checkpoint store already has entries — the agent ran
 		// before, so this file appeared while it was down and its content is
 		// unshipped, not history. Compressed archives are always read whole.
+		//
+		// Only while STARTING UP: a file that appears once a listing has
+		// succeeded was created under our eyes, so it is read from the
+		// beginning whatever this setting says — "end" is a history policy for
+		// the backlog present before the agent, never a licence to skip a
+		// container's first lines.
 		mode := t.cfg.UnknownFiles
 		if mode == "" || mode == "auto" {
-			// A CORRUPT positions file decodes to nothing, so len(checkpoints)
-			// is 0 and looks exactly like a first run — which would skip every
+			// A CORRUPT positions file decodes to nothing, so the store looks
+			// empty and exactly like a first run — which would skip every
 			// existing file to its end and lose the whole unshipped window.
 			// Prefer re-reading: at-least-once already tolerates duplicates,
 			// and losing data to a bad byte in a state file does not.
 			corrupt := t.cfg.Positions != nil && t.cfg.Positions.Corrupt()
-			if len(checkpoints) > 0 || corrupt {
+			if t.hadStoredCheckpoints || corrupt {
 				mode = "start"
 			} else {
 				mode = "end"

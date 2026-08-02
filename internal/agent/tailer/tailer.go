@@ -173,7 +173,32 @@ type Tailer struct {
 	// lastListingOK reports whether the most recent scan actually listed the
 	// sources. Checkpoint pruning is gated on it: a failed glob must never let
 	// a save destroy the offsets of files it simply could not see.
-	lastListingOK  bool
+	lastListingOK bool
+	// checkpoints holds the STORED positions that have not yet been matched to
+	// a discovered file. It is seeded from the positions store before the first
+	// scan and consulted by EVERY scan, not just that one: a startup glob that
+	// fails (an unreadable include base, a transient EIO — see
+	// compiledSource.glob) discovers nothing, and the files the 2s dirTicker
+	// then finds must still resume at their stored offsets, or the node
+	// re-ingests every log file from byte 0 with every Pending prefix thrown
+	// away and no counter moving. Applying an entry consumes it, and a listing that
+	// SUCCEEDED without seeing a path drops it — the same proof, and the same
+	// gate, that lets saveCheckpoints prune the store (a stale entry re-applied
+	// to a recreated path would skip its first bytes as if they had shipped).
+	checkpoints map[string]checkpoint
+	// startingUp reports that no listing has SUCCEEDED yet, so discovery is
+	// still the startup scan: -logs-unknown-files decides where a
+	// checkpoint-less file starts. Once a listing succeeds, a newly appearing
+	// file is genuinely new and is read from the beginning whatever that
+	// setting says.
+	startingUp bool
+	// hadStoredCheckpoints records whether the store held ANY entry at startup,
+	// which is what -logs-unknown-files=auto keys off ("the agent ran before").
+	// It is captured once rather than read from t.checkpoints, whose entries are
+	// consumed as files are discovered — mid-scan the map can already be empty
+	// while the run is plainly not a first one.
+	hadStoredCheckpoints bool
+
 	lastIdleScan   time.Time
 	lastFlush      time.Time
 	lastCheckpoint time.Time

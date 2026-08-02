@@ -80,8 +80,8 @@ func (t *Tailer) publishStatus() {
 		out = append(out, fs)
 	}
 	slices.SortFunc(out, func(a, b FileStatus) int { return cmp.Compare(b.Lag, a.Lag) })
-	obs.LogLagBytes.Set(float64(maxLag))
-	obs.LogLagBytesTotal.Set(float64(totalLag))
+	obs.LogLagMaxBytes.Set(float64(maxLag))
+	obs.LogLagTotalBytes.Set(float64(totalLag))
 	t.status.Store(&out)
 	t.lastStatus = time.Now()
 }

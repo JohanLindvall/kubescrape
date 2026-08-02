@@ -96,6 +96,10 @@ type Server struct {
 	// grpc.MaxConcurrentStreams).
 	inFlight    chan struct{}
 	maxInFlight int
+	// buffer bounds the RAW payload bytes both transports may hold while
+	// reading and decoding, which the count above deliberately does not (see
+	// admit.go). Tests lower its limit to exercise the refusal.
+	buffer *byteBudget
 }
 
 // NewServer creates an ingest Server.
@@ -108,7 +112,12 @@ func NewServer(cfg ServerConfig) *Server {
 	if n <= 0 {
 		n = defaultMaxInFlight
 	}
-	return &Server{cfg: cfg, log: log, inFlight: make(chan struct{}, n), maxInFlight: n}
+	return &Server{
+		cfg: cfg, log: log,
+		inFlight:    make(chan struct{}, n),
+		maxInFlight: n,
+		buffer:      &byteBudget{limit: maxBufferBytes},
+	}
 }
 
 // acquire takes an in-flight slot without waiting. A sender that is refused
@@ -130,21 +139,29 @@ func (s *Server) release() { <-s.inFlight }
 
 // limitUnary applies the same bound to gRPC pushes.
 func (s *Server) limitUnary(ctx context.Context, req any, _ *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
+	// The message is decoded by the time we get here, so the buffer
+	// reservation tapAdmit took for the read has done its job: release it and
+	// let the count bound account for the inflated pdata from here on.
+	releaseReservation(ctx)
 	if !s.acquire() {
-		// ResourceExhausted alone reads as PERMANENT to conformant senders —
-		// the OTLP spec makes it retryable only with RetryInfo attached, and
-		// both the OTel SDK and the Collector drop the batch without it. A
-		// shed that loses the data is worse than the OOM it prevents, so the
-		// hint rides along, mirroring the HTTP arm's Retry-After: 1.
-		st, err := status.New(codes.ResourceExhausted, "too many concurrent pushes; retry").
-			WithDetails(&errdetails.RetryInfo{RetryDelay: durationpb.New(time.Second)})
-		if err != nil {
-			return nil, status.Error(codes.ResourceExhausted, "too many concurrent pushes; retry")
-		}
-		return nil, st.Err()
+		return nil, exhaustedStatus("too many concurrent pushes; retry")
 	}
 	defer s.release()
 	return handler(ctx, req)
+}
+
+// exhaustedStatus builds the gRPC refusal. ResourceExhausted ALONE reads as
+// PERMANENT to conformant senders — the OTLP spec makes it retryable only with
+// RetryInfo attached, and both the OTel SDK and the Collector drop the batch
+// without it. A shed that loses the data is worse than the OOM it prevents, so
+// the hint rides along, mirroring the HTTP arm's Retry-After: 1.
+func exhaustedStatus(msg string) error {
+	st, err := status.New(codes.ResourceExhausted, msg).
+		WithDetails(&errdetails.RetryInfo{RetryDelay: durationpb.New(time.Second)})
+	if err != nil {
+		return status.Error(codes.ResourceExhausted, msg)
+	}
+	return st.Err()
 }
 
 // Run serves until ctx is cancelled, then shuts both listeners down.
@@ -173,16 +190,22 @@ func (s *Server) Run(ctx context.Context) error {
 			//     much a single push can allocate).
 			//   - MaxConcurrentStreams caps concurrent RPCs PER CONNECTION.
 			//     Connections themselves are not capped, so this is not a
-			//     server-wide bound.
+			//     server-wide bound: N connections may decode N x this many
+			//     messages at once.
 			//   - The semaphore (limitUnary) caps concurrent PROCESSING —
 			//     enrichment, the inflated pdata and the forward — across both
 			//     transports. It runs in the unary interceptor, i.e. AFTER
 			//     grpc-go has decoded the message, so it does not bound the
-			//     decode itself; a shed request has already paid for its
-			//     buffer once. Bounding earlier means a tap handler, which
-			//     cannot carry the RetryInfo that keeps a shed retryable.
-			grpc.MaxRecvMsgSize(4<<20),
+			//     decode itself.
+			//   - The tap (tapAdmit, admit.go) is what bounds the decode: it
+			//     runs on the HEADERS frame, before grpc-go reads the message,
+			//     and reserves MaxRecvMsgSize from the server-wide byte budget.
+			//     That closes the gap the previous three left — unbounded
+			//     concurrent BUFFERING — and it can carry the RetryInfo a shed
+			//     needs, because writeEarlyAbort forwards a status' details.
+			grpc.MaxRecvMsgSize(maxIngestGRPCMessage),
 			grpc.MaxConcurrentStreams(uint32(s.maxInFlight)),
+			grpc.InTapHandle(s.tapAdmit),
 			grpc.UnaryInterceptor(s.limitUnary),
 		)
 		if s.cfg.Exporter != nil {
@@ -340,17 +363,21 @@ func (g *tracesGRPC) Export(ctx context.Context, req ptraceotlp.ExportRequest) (
 // --- HTTP (OTLP/HTTP protobuf) ---
 
 func (s *Server) handleHTTPLogs(w http.ResponseWriter, r *http.Request) {
-	body, err := readBody(r)
+	body, charged, err := s.readBody(r)
 	if err != nil {
-		http.Error(w, err.Error(), bodyErrorStatus(err))
+		writeBodyError(w, err)
 		return
 	}
+	// The body stays alive for the whole handler, so its budget charge does
+	// too: releasing it at the end of the read would leave the bytes resident
+	// and unaccounted through enrichment and the forward.
+	defer s.buffer.release(charged)
 	// Acquired AFTER the read: holding a slot across the upload let 32
 	// trickled 16 MiB bodies shed every other sender on the node for a
 	// ReadTimeout (60s) — no credentials required, on an unauthenticated
-	// listener, which is the threat the bound exists for. The read itself is
-	// already bounded by the 16 MiB body cap. The gRPC arm is naturally on
-	// this side of the decode.
+	// listener, which is the threat the bound exists for. What bounds the read
+	// itself is the byte budget the body was charged against (admit.go), not
+	// this slot. The gRPC arm is naturally on this side of the decode.
 	if !s.acquire() {
 		// Retryable by design: the sender still holds the payload.
 		w.Header().Set("Retry-After", "1")
@@ -374,11 +401,12 @@ func (s *Server) handleHTTPLogs(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleHTTPMetrics(w http.ResponseWriter, r *http.Request) {
-	body, err := readBody(r)
+	body, charged, err := s.readBody(r)
 	if err != nil {
-		http.Error(w, err.Error(), bodyErrorStatus(err))
+		writeBodyError(w, err)
 		return
 	}
+	defer s.buffer.release(charged)
 	// Acquired AFTER the read (see handleHTTPLogs).
 	if !s.acquire() {
 		// Retryable by design: the sender still holds the payload.
@@ -402,11 +430,12 @@ func (s *Server) handleHTTPMetrics(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleHTTPTraces(w http.ResponseWriter, r *http.Request) {
-	body, err := readBody(r)
+	body, charged, err := s.readBody(r)
 	if err != nil {
-		http.Error(w, err.Error(), bodyErrorStatus(err))
+		writeBodyError(w, err)
 		return
 	}
+	defer s.buffer.release(charged)
 	// Acquired AFTER the read (see handleHTTPLogs).
 	if !s.acquire() {
 		// Retryable by design: the sender still holds the payload.
@@ -449,11 +478,27 @@ func bodyErrorStatus(err error) int {
 		return http.StatusRequestEntityTooLarge
 	case errors.Is(err, errUnsupportedType):
 		return http.StatusUnsupportedMediaType
+	case errors.Is(err, errBufferBudget):
+		return http.StatusTooManyRequests
 	}
 	return http.StatusBadRequest
 }
 
+// writeBodyError answers a failed read. A budget refusal is the one case that
+// must stay RETRYABLE — the sender still holds an intact payload — so it
+// carries Retry-After exactly like the in-flight shed does.
+func writeBodyError(w http.ResponseWriter, err error) {
+	if errors.Is(err, errBufferBudget) {
+		w.Header().Set("Retry-After", "1")
+	}
+	http.Error(w, err.Error(), bodyErrorStatus(err))
+}
+
 const maxIngestBody = 16 << 20 // 16 MiB per request
+
+// maxIngestGRPCMessage caps ONE decoded gRPC message (grpc-go's own default,
+// stated here because the tap reserves exactly this much per push).
+const maxIngestGRPCMessage = 4 << 20
 
 // errBodyTooLarge maps to 413; truncating silently could ACK a payload whose
 // tail was dropped.
@@ -482,13 +527,40 @@ func (c *cappedReader) Read(p []byte) (int, error) {
 	return n, err
 }
 
-func readBody(r *http.Request) ([]byte, error) {
+// readBody reads and decompresses one request body, charging the server's
+// buffer budget for what it accumulates. It returns the bytes charged, which
+// the CALLER releases once the body is no longer referenced; on any error it
+// releases them itself and returns 0.
+func (s *Server) readBody(r *http.Request) ([]byte, int64, error) {
 	if ct := r.Header.Get("Content-Type"); ct != "" {
 		// Parameterized types ("application/x-protobuf; charset=...") are fine;
 		// only the media type itself must match.
 		if mt, _, err := mime.ParseMediaType(ct); err != nil || mt != "application/x-protobuf" {
-			return nil, fmt.Errorf("%w %q (want application/x-protobuf)", errUnsupportedType, ct)
+			return nil, 0, fmt.Errorf("%w %q (want application/x-protobuf)", errUnsupportedType, ct)
 		}
+	}
+	// A declared Content-Length is reserved BEFORE the first byte is read, so a
+	// sender announcing 16 MiB is refused while the receiver is full rather
+	// than after it has buffered them. It is only a hint (absent on chunked
+	// uploads, and short of the decompressed size for a gzip body), which is
+	// why budgetReader keeps charging as it goes.
+	br := &budgetReader{b: s.buffer}
+	if n := r.ContentLength; n > 0 {
+		if n > maxIngestBody+1 {
+			n = maxIngestBody + 1
+		}
+		if !s.buffer.reserve(n) {
+			obs.IngestRejected.Inc()
+			return nil, 0, errBufferBudget
+		}
+		br.held = n
+	}
+	fail := func(err error) ([]byte, int64, error) {
+		s.buffer.release(br.held)
+		if errors.Is(err, errBufferBudget) {
+			obs.IngestRejected.Inc()
+		}
+		return nil, 0, err
 	}
 	var src io.Reader = r.Body
 	var capped *cappedReader
@@ -500,28 +572,39 @@ func readBody(r *http.Request) ([]byte, error) {
 		capped = &cappedReader{r: r.Body, remain: maxIngestBody + 1}
 		zr, err := gzip.NewReader(capped)
 		if err != nil {
-			return nil, fmt.Errorf("gzip body: %w", err)
+			return fail(fmt.Errorf("gzip body: %w", err))
 		}
 		defer func() { _ = zr.Close() }()
 		src = zr
 	default:
-		return nil, fmt.Errorf("unsupported Content-Encoding %q (want gzip or identity)", enc)
+		return fail(fmt.Errorf("unsupported Content-Encoding %q (want gzip or identity)", enc))
 	}
 	// The cap applies to the decompressed size too (zip-bomb guard). Read one
 	// byte beyond it to distinguish at-cap from over-cap and reject the latter.
-	body, err := io.ReadAll(io.LimitReader(src, maxIngestBody+1))
+	br.r = io.LimitReader(src, maxIngestBody+1)
+	// Pre-size the destination from Content-Length where it is meaningful (an
+	// identity-encoded body), so the read does not pay io.ReadAll's
+	// grow-and-copy doubling — which would put twice the CHARGED bytes on the
+	// heap and make the budget mean half what it says. A gzip body's declared
+	// length is the compressed one, so it is no hint at all and that case still
+	// doubles.
+	hint := int64(0)
+	if capped == nil {
+		hint = r.ContentLength
+	}
+	body, err := readAllCapped(br, hint)
 	if err != nil {
 		if capped != nil && capped.remain <= 0 {
 			// The compressed body hit the cap: the "gzip" failure is our own
 			// truncation, not the sender's payload — report 413, not 400.
-			return nil, errBodyTooLarge
+			return fail(errBodyTooLarge)
 		}
-		return nil, err
+		return fail(err)
 	}
 	if len(body) > maxIngestBody {
-		return nil, errBodyTooLarge
+		return fail(errBodyTooLarge)
 	}
-	return body, nil
+	return body, br.held, nil
 }
 
 type protoMarshaler interface{ MarshalProto() ([]byte, error) }

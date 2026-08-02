@@ -139,6 +139,66 @@ type Registry struct {
 
 	mu     sync.Mutex
 	series map[string]*edgeSeries
+
+	// renderMu serializes renders so snap can be REUSED across them. Renders
+	// come from one goroutine in production (Run's loop, then its final export),
+	// but Export is exported and tests call it directly, and two renders sharing
+	// one scratch buffer would be a data race on it. Lock order is renderMu
+	// before mu; nothing ever takes renderMu while holding mu.
+	renderMu sync.Mutex
+	// snap is the render scratch: the series' values copied out under mu so the
+	// pdata payload can be built WITHOUT it. Reused because it is otherwise tens
+	// of megabytes of garbage per export at the cardinality cap. snapPtrs is the
+	// series order that copy walks, taken in one cheap pass so the copy itself
+	// can release and retake the mutex between chunks.
+	snap     []edgeSnapshot
+	snapPtrs []*edgeSeries
+}
+
+// snapChunk is how many series one snapshot lock-hold copies. It trades the
+// number of acquisitions (cheap, uncontended most of the time) against the
+// length of one stall on the receive path, which is what actually hurts: at the
+// 20k cardinality cap the whole copy is ~5 ms, and this makes the longest hold
+// about a fortieth of that.
+const snapChunk = 512
+
+// edgeSnapshot is one series' state as of the instant the render read it. The
+// label slice is ALIASED (it is built once at admission and never mutated); the
+// bucket and exemplar slices are COPIES, because Record writes them under the
+// mutex the render has just let go of.
+type edgeSnapshot struct {
+	labels         []edgeLabel
+	requests       uint64
+	failed         uint64
+	start          time.Time
+	client, server histSnapshot
+}
+
+type histSnapshot struct {
+	present bool // the side was observed at all (buckets != nil)
+	count   uint64
+	sum     float64
+	buckets []uint64
+	// ex holds only the exemplars that are SET, in bucket order — which is
+	// exactly what putHist renders, and typically one or two per side per
+	// interval rather than one slot per bucket. Copying the full per-bucket
+	// array instead put ~34 MB of memcpy under the series mutex at the
+	// cardinality cap, which is the stall this snapshot exists to remove.
+	ex []exemplar
+}
+
+// copyFrom copies one side's aggregate, reusing this snapshot's slices. The
+// caller holds r.mu: everything read here is written by Record under it.
+func (h *histSnapshot) copyFrom(src *histAgg) {
+	h.present = src.buckets != nil
+	h.count, h.sum = src.count, src.sum
+	h.buckets = append(h.buckets[:0], src.buckets...)
+	h.ex = h.ex[:0]
+	for i := range src.ex {
+		if src.ex[i].set {
+			h.ex = append(h.ex, src.ex[i])
+		}
+	}
 }
 
 // edgeSeries is one (client, server, connection_type, dimensions...) tuple's
@@ -267,14 +327,15 @@ func (r *Registry) Record(e Edge) {
 	// are built.
 	//
 	// truncDimValue (processor.go) is applied again HERE, on the values that go
-	// into the key and into the rendered labels alike, even though the processor
-	// already truncates what it puts on an Edge. It is a reslice, so the warm
-	// path pays nothing, and it removes a class of bug rather than a cost: a
-	// promoted virtual-node edge takes its far-side name from a peer attribute
-	// after truncation, and truncating the value but not the key is what let
-	// spanmetrics hold two series that rendered one byte-identical attribute set
-	// (a duplicate series in a single payload — a conflict downstream, not extra
-	// detail).
+	// into the key, even though the processor already truncates what it puts on
+	// an Edge. It is a reslice, so the warm path pays nothing, and it removes a
+	// class of bug rather than a cost: a promoted virtual-node edge takes its
+	// far-side name from a peer attribute after truncation, and truncating the
+	// value but not the key is what let spanmetrics hold two series that
+	// rendered one byte-identical attribute set (a duplicate series in a single
+	// payload — a conflict downstream, not extra detail). The RETAINED copies
+	// are cut by retainDimValue instead (see edgeLabels): the key is consumed by
+	// the map lookup, a label is held for the series' life.
 	client := truncDimValue(e.ClientService)
 	server := truncDimValue(e.ServerService)
 
@@ -302,7 +363,7 @@ func (r *Registry) Record(e Edge) {
 			obs.ServiceGraphDropped.Inc()
 			return
 		}
-		s = &edgeSeries{labels: edgeLabels(client, server, e), start: now}
+		s = &edgeSeries{labels: edgeLabels(e), start: now}
 		r.series[string(key)] = s
 	}
 	s.requests++
@@ -340,12 +401,14 @@ func (r *Registry) Record(e Edge) {
 // edgeLabels materializes the attribute set for a newly admitted series (cold
 // path). It COPIES every string out of e, which is what lets the Edge borrow
 // its dimension slice from the pairing store: nothing of the Edge outlives this
-// call.
-func edgeLabels(client, server string, e Edge) []edgeLabel {
+// call. It cuts the values itself, from the ORIGINALS rather than from Record's
+// key-side truncations — those are reslices, and re-truncating one is a no-op
+// that would leave the whole sender-controlled string pinned by the series.
+func edgeLabels(e Edge) []edgeLabel {
 	out := make([]edgeLabel, 0, 4+len(e.Dimensions))
 	out = append(out,
-		edgeLabel{labelClient, client},
-		edgeLabel{labelServer, server},
+		edgeLabel{labelClient, retainDimValue(e.ClientService)},
+		edgeLabel{labelServer, retainDimValue(e.ServerService)},
 		edgeLabel{labelConnectionType, string(e.Connection)})
 	if e.VirtualNode != "" {
 		out = append(out, edgeLabel{labelVirtualNode, e.VirtualNode})
@@ -354,7 +417,7 @@ func edgeLabels(client, server string, e Edge) []edgeLabel {
 		if builtinLabels[d.Name] {
 			continue // see builtinLabels
 		}
-		out = append(out, edgeLabel{d.Name, truncDimValue(d.Value)})
+		out = append(out, edgeLabel{d.Name, retainDimValue(d.Value)})
 	}
 	return out
 }
@@ -431,6 +494,8 @@ func (r *Registry) afterDelivered() {
 }
 
 func (r *Registry) render(res pcommon.Resource, now time.Time) pmetric.Metrics {
+	r.renderMu.Lock()
+	defer r.renderMu.Unlock()
 	md := pmetric.NewMetrics()
 	rm := md.ResourceMetrics().AppendEmpty()
 	res.CopyTo(rm.Resource())
@@ -444,11 +509,90 @@ func (r *Registry) render(res pcommon.Resource, now time.Time) pmetric.Metrics {
 	return md
 }
 
-func (r *Registry) renderEdges(sm pmetric.ScopeMetrics, now time.Time) {
+// growSnap makes the render scratch big enough for n series, with each entry's
+// bucket and exemplar slices already allocated, so the copy under the mutex is
+// pure memmove. Called without the mutex; the scratch belongs to renderMu.
+func (r *Registry) growSnap(n int) {
+	if cap(r.snap) < n {
+		grown := make([]edgeSnapshot, n)
+		copy(grown, r.snap)
+		r.snap = grown
+	} else {
+		r.snap = r.snap[:n]
+	}
+	nb := len(r.bounds) + 1
+	for i := range r.snap {
+		e := &r.snap[i]
+		if cap(e.client.buckets) < nb {
+			e.client.buckets = make([]uint64, 0, nb)
+			e.client.ex = make([]exemplar, 0, nb)
+		}
+		if cap(e.server.buckets) < nb {
+			e.server.buckets = make([]uint64, 0, nb)
+			e.server.ex = make([]exemplar, 0, nb)
+		}
+	}
+}
+
+// snapshot copies every series' current values out under the mutex and marks
+// them rendered. It is the ONLY part of a render that holds r.mu.
+//
+// The build below used to run under it, and that is a receive-path stall, not
+// just a slow export: Record is called by the pairing store from INSIDE its own
+// mutex (store.upsert -> emit -> sink.Record), so every millisecond this lock is
+// held is a millisecond in which no shard goroutine can Consume a span. At the
+// cardinality cap the payload build is tens of milliseconds, once per export
+// interval, and the whole of it used to land on the ingest path: a 46.7 ms
+// Record stall inside a 46.7 ms render, now 1.6 ms
+// (TestRenderDoesNotStallRecord).
+func (r *Registry) snapshot(now time.Time) []edgeSnapshot {
+	// Hold 1: evict, then take the series POINTERS. One pointer write each, so
+	// this is the cheapest pass that can exist over a map — and it is what lets
+	// the expensive part be chunked, because a slice can be walked across lock
+	// releases and a map cannot.
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	r.evictLocked(now)
-	if len(r.series) == 0 {
+	ptrs := r.snapPtrs[:0]
+	for _, s := range r.series {
+		ptrs = append(ptrs, s)
+	}
+	r.snapPtrs = ptrs
+	r.mu.Unlock()
+
+	// Sizing (and, on the first render, two slice allocations per series) stays
+	// outside the lock; later renders reuse the whole scratch.
+	r.growSnap(len(ptrs))
+	snap := r.snap
+
+	// Holds 2..n: the values, in chunks. A series' fields are written by Record
+	// under the mutex, so the copy has to hold it — but only for a chunk at a
+	// time, which bounds one stall at a few hundred microseconds instead of the
+	// whole cardinality cap. A Record landing between chunks is free to run and
+	// puts that series back in seriesObserved, exactly as one landing between
+	// the render and afterDelivered always could.
+	for start := 0; start < len(ptrs); start += snapChunk {
+		end := min(start+snapChunk, len(ptrs))
+		r.mu.Lock()
+		for i := start; i < end; i++ {
+			s := ptrs[i]
+			s.state = seriesRendered
+			e := &snap[i]
+			e.labels = s.labels
+			e.requests, e.failed, e.start = s.requests, s.failed, s.start
+			e.client.copyFrom(&s.client)
+			e.server.copyFrom(&s.server)
+		}
+		r.mu.Unlock()
+	}
+	// Series ADMITTED during the walk are simply not in this payload; their
+	// cumulative values ride the next one.
+	clear(ptrs) // do not pin evicted series until the next render
+	return snap[:len(ptrs)]
+}
+
+func (r *Registry) renderEdges(sm pmetric.ScopeMetrics, now time.Time) {
+	snap := r.snapshot(now)
+	if len(snap) == 0 {
 		return
 	}
 
@@ -456,9 +600,9 @@ func (r *Registry) renderEdges(sm pmetric.ScopeMetrics, now time.Time) {
 	// payload's metric order is fixed rather than a function of which series the
 	// map happened to yield first.
 	var anyClient, anyServer bool
-	for _, s := range r.series {
-		anyClient = anyClient || s.client.buckets != nil
-		anyServer = anyServer || s.server.buckets != nil
+	for i := range snap {
+		anyClient = anyClient || snap[i].client.present
+		anyServer = anyServer || snap[i].server.present
 		if anyClient && anyServer {
 			break
 		}
@@ -475,8 +619,8 @@ func (r *Registry) renderEdges(sm pmetric.ScopeMetrics, now time.Time) {
 		client = histMetric(sm, metricClientSeconds, "Time for a request between two nodes as seen from the client.")
 	}
 
-	for _, s := range r.series {
-		s.state = seriesRendered
+	for i := range snap {
+		s := &snap[i]
 		start := pcommon.NewTimestampFromTime(s.start)
 
 		rp := requests.AppendEmpty()
@@ -496,10 +640,10 @@ func (r *Registry) renderEdges(sm pmetric.ScopeMetrics, now time.Time) {
 		fp.SetTimestamp(ts)
 		fp.SetIntValue(int64(s.failed))
 
-		if s.server.buckets != nil {
+		if s.server.present {
 			putHist(server.AppendEmpty(), s.labels, &s.server, r.bounds, start, ts)
 		}
-		if s.client.buckets != nil {
+		if s.client.present {
 			putHist(client.AppendEmpty(), s.labels, &s.client, r.bounds, start, ts)
 		}
 	}
@@ -537,7 +681,7 @@ func putLabels(a pcommon.Map, labels []edgeLabel) {
 	}
 }
 
-func putHist(p pmetric.HistogramDataPoint, labels []edgeLabel, h *histAgg, bounds []float64, start, ts pcommon.Timestamp) {
+func putHist(p pmetric.HistogramDataPoint, labels []edgeLabel, h *histSnapshot, bounds []float64, start, ts pcommon.Timestamp) {
 	putLabels(p.Attributes(), labels)
 	p.SetStartTimestamp(start)
 	p.SetTimestamp(ts)
@@ -545,13 +689,11 @@ func putHist(p pmetric.HistogramDataPoint, labels []edgeLabel, h *histAgg, bound
 	p.SetSum(h.sum)
 	p.ExplicitBounds().FromRaw(bounds)
 	p.BucketCounts().FromRaw(h.buckets)
-	// One exemplar per occupied bucket. The id is THIS side's own span (see
+	// One exemplar per occupied bucket, in bucket order — the snapshot already
+	// dropped the unset slots. The id is THIS side's own span (see
 	// Edge.ClientSpanID), so the evidence attached to a latency explains the
 	// latency it is attached to rather than the other half of the request.
 	for i := range h.ex {
-		if !h.ex[i].set {
-			continue
-		}
 		e := p.Exemplars().AppendEmpty()
 		e.SetDoubleValue(h.ex[i].value)
 		e.SetTimestamp(h.ex[i].ts)

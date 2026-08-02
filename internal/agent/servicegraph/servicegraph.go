@@ -318,6 +318,8 @@ type Edge struct {
 }
 
 // EdgeDimension is one configured extra label: the name is already prefixed
-// client_ / server_, and both strings point into the OTLP payload the span
-// arrived in (which is why they are truncated — see truncDimValue).
+// client_ / server_, and the value points into the OTLP payload the span
+// arrived in unless it was over-long, in which case it is a truncated COPY
+// (retainDimValue) — the store holds it for a whole Wait, and a slice of the
+// payload would hold the payload's string with it.
 type EdgeDimension struct{ Name, Value string }

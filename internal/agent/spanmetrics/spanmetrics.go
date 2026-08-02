@@ -27,6 +27,7 @@ import (
 	"log/slog"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -261,8 +262,9 @@ func (g *Generator) observe(span ptrace.Span, resAttrs pcommon.Map, svc string, 
 	// lookup allocates nothing for a warm series). A key over keyScratch bytes
 	// falls back to a one-off heap grow.
 	//
-	// Every part is truncDim'd exactly as dims() truncates the values it
-	// RENDERS. Keying on the untruncated values instead made the key finer than
+	// Every part is truncDim'd at exactly the length dims() cuts the values it
+	// RENDERS to (retainDim, which differs only in cloning what it keeps).
+	// Keying on the untruncated values instead made the key finer than
 	// the data points it identifies: two spans differing only past maxDimBytes
 	// held two series that rendered byte-identical attribute sets — a duplicate
 	// series in one export, which is a conflict downstream, not extra detail —
@@ -317,17 +319,19 @@ func (g *Generator) observe(span ptrace.Span, resAttrs pcommon.Map, svc string, 
 	g.mu.Unlock()
 }
 
-// dims materializes the dimension values for a new series (cold path).
+// dims materializes the dimension values for a new series (cold path). Values
+// are retained for the series' life, so they are cloned where they were cut
+// (retainDim) rather than left pointing into the sender's payload.
 func (g *Generator) dims(span ptrace.Span, resAttrs pcommon.Map, svc string) []string {
 	vals := make([]string, 0, len(g.names))
-	vals = append(vals, truncDim(svc), truncDim(span.Name()),
+	vals = append(vals, retainDim(svc), retainDim(span.Name()),
 		span.Kind().String(), span.Status().Code().String())
 	for _, k := range g.extra {
 		v := attrStr(span.Attributes(), k)
 		if v == "" {
 			v = attrStr(resAttrs, k)
 		}
-		vals = append(vals, truncDim(v))
+		vals = append(vals, retainDim(v))
 	}
 	return vals
 }
@@ -339,11 +343,28 @@ func (g *Generator) dims(span ptrace.Span, resAttrs pcommon.Map, svc string) []s
 // OTel Collector's connector and Tempo truncate for the same reason.
 const maxDimBytes = 256
 
+// truncDim bounds a value that is about to be CONSUMED and dropped — the map
+// key observe builds on the stack, which map[string(key)] copies on insert.
+// Slicing a Go string allocates nothing but keeps the WHOLE original alive, so
+// it is only safe where the result does not outlive the span.
 func truncDim(v string) string {
 	if len(v) <= maxDimBytes {
 		return v
 	}
 	return v[:maxDimBytes]
+}
+
+// retainDim is truncDim for a value the generator KEEPS (spanSeries.dims). The
+// slice truncDim returns still points into the sender's string, so retaining it
+// pins the whole thing — a 4 MiB span.name held for staleAfter by a 256-byte
+// label, which is precisely the bound maxDimBytes claims to provide and did
+// not. Cloning only on the truncating branch leaves the ordinary short value
+// allocation-free, and this runs once per ADMITTED series, never per span.
+func retainDim(v string) string {
+	if len(v) <= maxDimBytes {
+		return v
+	}
+	return strings.Clone(v[:maxDimBytes])
 }
 
 // Run exports every interval until ctx is done, then once more. A non-positive

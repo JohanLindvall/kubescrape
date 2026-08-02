@@ -62,6 +62,7 @@ func (g *logGrouper) newScope(f *file, resAttrs, scopeAttrs []logattrs.Attr) plo
 	logattrs.Put(rl.Resource().Attributes(), resAttrs)
 	sl := rl.ScopeLogs().AppendEmpty()
 	sl.Scope().SetName("github.com/JohanLindvall/kubescrape/agent/tailer")
+	sl.Scope().SetVersion(obs.ScopeVersion)
 	logattrs.Put(sl.Scope().Attributes(), scopeAttrs)
 	return sl
 }

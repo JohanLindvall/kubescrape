@@ -6,9 +6,12 @@ import (
 	"fmt"
 	"maps"
 	"slices"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
+	"unsafe"
 
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/pmetric"
@@ -775,4 +778,115 @@ func equalCT(a, b []ConnectionType) bool {
 		}
 	}
 	return true
+}
+
+// The same defect the sibling spanmetrics generator had: truncating a Go string
+// is a RESLICE, so a series' 256-byte label kept the whole sender-controlled
+// string alive — here for the series' life AND, one layer earlier, for a whole
+// Wait in the pairing store. Both retention points must cut with a copy; the
+// key Record builds may still reslice (the map copies it on insert).
+func TestTruncatedLabelsDoNotRetainTheSenderStrings(t *testing.T) {
+	const huge = 4 << 20
+	name := strings.Repeat("x", huge)
+	peer := strings.Repeat("y", huge)
+	dim := strings.Repeat("z", huge)
+
+	p := NewProcessor(Config{Dimensions: []string{"http.route"}}, nil)
+	reg := NewRegistry(Config{})
+	p.SetSink(reg)
+	p.Consume(sgTraces(name, sgSpan{
+		name: "GET /orders", kind: ptrace.SpanKindClient, dur: 0.1,
+		traceID: traceID(1), spanID: spanID(1),
+		attrs: map[string]string{"peer.service": peer, "http.route": dim},
+	}))
+	// Expire the unpaired client half so it is promoted to a virtual-node edge
+	// and reaches the registry.
+	p.now = func() time.Time { return time.Now().Add(time.Hour) }
+	p.Sweep()
+
+	if len(reg.series) != 1 {
+		t.Fatalf("series = %d, want 1", len(reg.series))
+	}
+	for _, s := range reg.series {
+		for _, l := range s.labels {
+			var src string
+			switch l.name {
+			case labelClient:
+				src = name
+			case labelServer:
+				src = peer
+			case "client_http.route":
+				src = dim
+			default:
+				continue
+			}
+			if len(l.value) != maxDimensionValueBytes {
+				t.Errorf("label %s is %d bytes, want %d", l.name, len(l.value), maxDimensionValueBytes)
+			}
+			if unsafe.StringData(l.value) == unsafe.StringData(src) {
+				t.Errorf("label %s still points into its %d-byte source: the whole string stays alive for as long as the series does",
+					l.name, huge)
+			}
+		}
+	}
+}
+
+// Rendering must not stall the receive path. Record is called by the pairing
+// store from INSIDE its own mutex (upsert -> emit -> Record), so a render that
+// held r.mu across the payload build put the WHOLE build — tens of milliseconds
+// at the cardinality cap — in front of every Consume on the shard, once per
+// export interval. The lock is now held only for the value snapshot.
+func TestRenderDoesNotStallRecord(t *testing.T) {
+	const series = 20000
+	r := NewRegistry(Config{MaxCardinality: series + 1})
+	for i := 0; i < series; i++ {
+		e := edge(fmt.Sprintf("client-%05d", i), "checkout")
+		e.Dimensions = []EdgeDimension{{"client_http.route", "/api/v1/orders"}}
+		r.Record(e)
+	}
+
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	var maxStall atomic.Int64
+	var calls atomic.Int64
+	go func() {
+		defer close(done)
+		e := edge("client-00000", "checkout") // an admitted series: the warm path
+		e.Dimensions = []EdgeDimension{{"client_http.route", "/api/v1/orders"}}
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			t0 := time.Now()
+			r.Record(e)
+			if d := int64(time.Since(t0)); d > maxStall.Load() {
+				maxStall.Store(d)
+			}
+			calls.Add(1)
+		}
+	}()
+	// Let the recorder get going before the render starts.
+	for calls.Load() < 1000 {
+		time.Sleep(time.Millisecond)
+	}
+
+	start := time.Now()
+	md := r.render(pcommon.NewResource(), time.Now())
+	render := time.Since(start)
+	close(stop)
+	<-done
+
+	stall := time.Duration(maxStall.Load())
+	t.Logf("render of %d series took %v; worst concurrent Record took %v", series, render, stall)
+	if md.ResourceMetrics().Len() == 0 {
+		t.Fatal("nothing rendered")
+	}
+	// Relative, so a slow machine moves both numbers together; the absolute
+	// floor keeps an unlucky GC pause from failing a fast render.
+	if stall > render/2 && stall > 2*time.Millisecond {
+		t.Errorf("a concurrent Record blocked for %v during a %v render: the payload build is holding the series lock, and the pairing store holds ITS mutex across Record",
+			stall, render)
+	}
 }

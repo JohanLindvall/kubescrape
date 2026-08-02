@@ -181,7 +181,7 @@ func (p *Processor) Consume(td ptrace.Traces) {
 		resAttrs := rs.Resource().Attributes()
 		// Truncated once per resource: it becomes a label value on every edge
 		// this resource's spans produce.
-		svc := truncDimValue(spanAttrStr(resAttrs, attrServiceName))
+		svc := retainDimValue(spanAttrStr(resAttrs, attrServiceName))
 		sss := rs.ScopeSpans()
 		for j := 0; j < sss.Len(); j++ {
 			spans := sss.At(j).Spans()
@@ -283,7 +283,7 @@ func (p *Processor) observe(span ptrace.Span, resAttrs pcommon.Map, svc string, 
 		if v == "" {
 			continue
 		}
-		h.peer = truncDimValue(v)
+		h.peer = retainDimValue(v)
 		if p.peerIsDB[i] {
 			h.connection = ConnectionDatabase
 		}
@@ -332,7 +332,7 @@ func (p *Processor) observe(span ptrace.Span, resAttrs pcommon.Map, svc string, 
 				// "" here would only cost a map entry per edge.
 				continue
 			}
-			ds = append(ds, EdgeDimension{Name: names[i], Value: truncDimValue(v)})
+			ds = append(ds, EdgeDimension{Name: names[i], Value: retainDimValue(v)})
 		}
 		dims = ds
 	}
@@ -377,14 +377,29 @@ func spanSeconds(span ptrace.Span) float64 {
 	return float64(end-start) / float64(time.Second)
 }
 
-// truncDimValue bounds one label value. These come from an unauthenticated
-// listener (the shard receives whatever the agents forward, which is whatever a
-// sender pushed): an untruncated service or peer name would be retained for a
-// whole Wait per in-flight request, and then per SERIES for as long as the
-// series lives. Truncating a Go string is a reslice, so this is free.
+// truncDimValue bounds one label value that is about to be CONSUMED and
+// dropped — the map key Record builds on the stack, which map[string(key)]
+// copies on insert. Slicing a Go string allocates nothing but keeps the WHOLE
+// original alive, so it is only safe where the result does not outlive the
+// span.
 func truncDimValue(v string) string {
 	if len(v) <= maxDimensionValueBytes {
 		return v
 	}
 	return v[:maxDimensionValueBytes]
+}
+
+// retainDimValue is truncDimValue for a value something KEEPS: a half-edge in
+// the pairing store (for a whole Wait) or a series' label set (for as long as
+// the series lives). These come from an unauthenticated listener — the shard
+// receives whatever the agents forward, which is whatever a sender pushed — so
+// the bound has to be on the BYTES RETAINED, and a reslice retains all of them:
+// a 4 MiB peer.service pinned by a 256-byte label is the bound not existing.
+// Cloning only on the truncating branch leaves the ordinary short value
+// allocation-free (TestConsumeWithDimensionsIsAllocationFree).
+func retainDimValue(v string) string {
+	if len(v) <= maxDimensionValueBytes {
+		return v
+	}
+	return strings.Clone(v[:maxDimensionValueBytes])
 }

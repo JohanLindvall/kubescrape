@@ -76,8 +76,13 @@ func waitGoroutines(t *testing.T, want int) {
 	t.Fatalf("goroutines did not settle: %d > %d", runtime.NumGoroutine(), want)
 }
 
-// Concurrent near-cap gzip bodies must all be handled consistently (200 for
-// under-cap, 413 for over-cap), with no goroutine left behind afterwards.
+// Concurrent near-cap gzip bodies must all be handled consistently — accepted,
+// or refused RETRYABLY once they no longer fit the buffer budget, never
+// accepted-and-lost and never 400 — with no goroutine left behind afterwards.
+// Eight 16 MiB bodies at once is 128 MiB the receiver must not hold, so the
+// budget legitimately sheds most of this wave; what matters is that every
+// answer is one a sender can act on and that the accepted ones are the ones
+// that were exported.
 func TestConcurrentGzipBodiesAtCap(t *testing.T) {
 	var exported atomic.Int64
 	srv := httpTestServer(t, exporterFunc(func(ld plog.Logs) error {
@@ -123,20 +128,47 @@ func TestConcurrentGzipBodiesAtCap(t *testing.T) {
 	}
 	wg.Wait()
 
+	accepted := int64(0)
 	for w, st := range statuses {
-		want := http.StatusOK
-		if w == workers-1 {
-			want = http.StatusRequestEntityTooLarge
-		}
-		if st != want {
-			t.Errorf("worker %d: status %d, want %d", w, st, want)
+		switch {
+		case w == workers-1:
+			// The over-cap body is 413 unless the budget refused it first —
+			// both are correct answers, and the deterministic 413 is asserted
+			// on its own below.
+			if st != http.StatusRequestEntityTooLarge && st != http.StatusTooManyRequests {
+				t.Errorf("over-cap worker: status %d, want 413 (or a 429 shed)", st)
+			}
+		case st == http.StatusOK:
+			accepted++
+		case st != http.StatusTooManyRequests:
+			t.Errorf("worker %d: status %d, want 200 or a retryable 429", w, st)
 		}
 	}
-	if got := exported.Load(); got != workers-1 {
-		t.Errorf("exported %d batches, want %d", got, workers-1)
+	if accepted == 0 {
+		t.Error("every under-cap body was shed; the budget must admit at least one")
+	}
+	if got := exported.Load(); got != accepted {
+		t.Errorf("exported %d batches, want %d (one per 200)", got, accepted)
 	}
 	http.DefaultClient.CloseIdleConnections()
 	waitGoroutines(t, before+3)
+
+	// Alone, with the budget free, the over-cap body is unambiguously 413.
+	req, err := http.NewRequest(http.MethodPost, srv.URL+"/v1/logs", bytes.NewReader(overGz))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/x-protobuf")
+	req.Header.Set("Content-Encoding", "gzip")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusRequestEntityTooLarge {
+		t.Errorf("over-cap body alone: status %d, want 413", resp.StatusCode)
+	}
 }
 
 // An abrupt client disconnect mid-body must fail the read, never wedge the

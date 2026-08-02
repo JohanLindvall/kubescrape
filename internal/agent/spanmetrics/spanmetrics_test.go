@@ -2,10 +2,12 @@ package spanmetrics
 
 import (
 	"context"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+	"unsafe"
 
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/pmetric"
@@ -637,5 +639,67 @@ func TestSeriesKeyTruncatesLikeTheRenderedDimensions(t *testing.T) {
 	}
 	if got := attr(dps.At(0).Attributes(), "db.statement"); got != prefix {
 		t.Errorf("db.statement = %q (%d bytes), want the %d-byte truncation", got, len(got), maxDimBytes)
+	}
+}
+
+// Truncating a Go string is a RESLICE: it keeps the whole original alive. The
+// dimension values a series retains therefore have to be cut with a copy, or
+// maxDimBytes bounds nothing — a sender controlling span.name pins its full
+// length per series for staleAfter, which is the exact scenario the constant's
+// comment says it prevents. (The key observe builds may still reslice: the map
+// copies it on insert.)
+func TestTruncatedDimensionDoesNotRetainTheSenderString(t *testing.T) {
+	const huge = 4 << 20
+	name := strings.Repeat("x", huge)
+	g := New(Config{})
+	g.Consume(traces("checkout", spanSpec{
+		name: name, kind: ptrace.SpanKindServer, status: ptrace.StatusCodeOk,
+		dur: 0.01, traceID: tid1, spanID: sid1,
+	}))
+
+	if len(g.series) != 1 {
+		t.Fatalf("series = %d, want 1", len(g.series))
+	}
+	for _, s := range g.series {
+		got := s.dims[1] // span.name
+		if len(got) != maxDimBytes {
+			t.Fatalf("retained span.name is %d bytes, want %d", len(got), maxDimBytes)
+		}
+		if unsafe.StringData(got) == unsafe.StringData(name) {
+			t.Fatalf("the retained %d-byte label still points into the %d-byte span name: "+
+				"the whole string stays alive for staleAfter", len(got), huge)
+		}
+	}
+}
+
+// The allocator's view of the same thing: a burst of over-long span names must
+// not leave their bytes resident once the payloads are gone.
+func TestTruncatedDimensionsDoNotAccumulateHeap(t *testing.T) {
+	const (
+		huge   = 4 << 20
+		series = 8
+	)
+	g := New(Config{})
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	for i := 0; i < series; i++ {
+		name := strings.Repeat(string(rune('a'+i)), huge)
+		g.Consume(traces("checkout", spanSpec{
+			name: name, kind: ptrace.SpanKindServer, status: ptrace.StatusCodeOk,
+			dur: 0.01, traceID: tid1, spanID: sid1,
+		}))
+	}
+	runtime.GC()
+	runtime.ReadMemStats(&after)
+	retained := int64(after.HeapAlloc) - int64(before.HeapAlloc)
+	t.Logf("heap retained by %d series cut from %d MiB span names: %d bytes",
+		series, huge>>20, retained)
+	if len(g.series) != series {
+		t.Fatalf("series = %d, want %d", len(g.series), series)
+	}
+	if max := int64(huge); retained > max {
+		t.Errorf("retained %d bytes, want well under one span name (%d): the truncation pins its source",
+			retained, max)
 	}
 }

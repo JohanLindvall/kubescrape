@@ -167,3 +167,103 @@ func TestURLUserinfoDoesNotEatSurroundingContent(t *testing.T) {
 		t.Errorf("empty-user credential not redacted: %q -> %q", redis, got)
 	}
 }
+
+// hostileLine is a 1 MiB record containing the secret-kv keywords but no
+// assignment anywhere — the shape the old word-anywhere prefilter admitted,
+// after which the regex walked the whole megabyte to find nothing. It runs on
+// the SINGLE sweep goroutine that serves every log file on the node, so this
+// benchmark is a latency budget, not a curiosity.
+func hostileLine() string {
+	return strings.Repeat("token secret password key ", (1<<20)/26)
+}
+
+func BenchmarkScrubHostileLongLine(b *testing.B) {
+	s, _ := New(Config{Builtin: []string{"defaults"}})
+	line := hostileLine()
+	b.SetBytes(int64(len(line)))
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		if got := s.Scrub(line); len(got) != len(line) {
+			b.Fatal("the hostile line must not be redacted")
+		}
+	}
+}
+
+// The performance fix is a CORRECTNESS property of the prefilter: a line whose
+// keywords are not followed by an assignment cannot match, so it must never
+// reach the regex. (The regex answer is unchanged either way; what changes is
+// whether a megabyte of log costs 100 ms of the node's only sweep goroutine.)
+func TestSecretKVPrefilterRejectsUnmatchableLines(t *testing.T) {
+	p := builtins["secret-kv"]
+	for _, in := range []string{
+		"token",
+		"a bare key in prose",
+		"the secret of success",
+		"password", // keyword with no value
+		"token_count 42",
+		"secretName my-tls-cert",
+		"tokenizer bert-base",
+		"idempotency key was reused",
+		"apikey",
+		"password=", // separator but no value
+		"password=  ",
+		`{"secret": }`,
+	} {
+		if p.prefilter(in) {
+			t.Errorf("prefilter admitted an unmatchable line (the regex then pays for the whole record): %q", in)
+		}
+		if p.re.MatchString(in) {
+			t.Errorf("setup: %q was supposed to be unmatchable", in)
+		}
+	}
+}
+
+// The prefilter may only ever be WIDER than its regex. This walks the cross
+// product of the keyword spellings, separators, quoting and suffixes rather
+// than a handful of probes: a shape the regex matches and the prefilter rejects
+// is a secret shipped in clear.
+func TestSecretKVPrefilterCoversEveryMatchingShape(t *testing.T) {
+	p := builtins["secret-kv"]
+	keywords := []string{"api_key", "apikey", "API-KEY", "secret", "SECRET", "sEcReT",
+		"password", "PASSWD", "pwd", "token", "access_key", "ACCESSKEY"}
+	prefixes := []string{"", "x_", "MY.", "aws-", "{\"", "  "}
+	suffixes := []string{"", "_key", "-VALUE", "token", "_secret", "Password", "_passwd", "PWD"}
+	seps := []string{":", "=", " : ", "\t=\t", "\": \"", "'='"}
+	// "\vraw" is deliberate: \v is not in Go regexp's \s, so it is a legal
+	// first byte of the value class — a prefilter treating it as whitespace
+	// would reject a line the regex matches.
+	values := []string{"hunter2", "0", `"quoted"`, "sk-12345", "\vraw"}
+	for _, kw := range keywords {
+		for _, pre := range prefixes {
+			for _, suf := range suffixes {
+				for _, sep := range seps {
+					for _, val := range values {
+						line := pre + kw + suf + sep + val
+						if p.re.MatchString(line) && !p.prefilter(line) {
+							t.Fatalf("regex matches %q but the prefilter rejects it: the pattern is skipped and the secret ships unredacted", line)
+						}
+					}
+				}
+			}
+		}
+	}
+}
+
+// The same property, fuzzed: the seed corpus runs on every `go test`, and
+// `-fuzz` explores from there. Any input where the regex matches and the
+// prefilter does not is a redaction the scrubber silently skips.
+func FuzzSecretKVPrefilterNotNarrower(f *testing.F) {
+	for _, s := range []string{
+		"password=hunter2", "token_count=42", "SECRET_KEY=abc", `{"secretKey":"x"}`,
+		"a perfectly innocuous log line", "pwd:'x'", "api-key\t=\tv", "accessToken: abc",
+		"secret_key_ref: db-creds", "AWS_SECRET_ACCESS_KEY=abc", "toKen=abcdef",
+	} {
+		f.Add(s)
+	}
+	p := builtins["secret-kv"]
+	f.Fuzz(func(t *testing.T, line string) {
+		if p.re.MatchString(line) && !p.prefilter(line) {
+			t.Fatalf("regex matches %q but the prefilter rejects it", line)
+		}
+	})
+}

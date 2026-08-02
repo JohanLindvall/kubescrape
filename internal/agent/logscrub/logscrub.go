@@ -3,10 +3,14 @@
 // user-defined regexes, applied in the tailer, journald and OTLP-ingest log
 // paths. Redaction happens on the agent so secrets never leave the node.
 //
-// Per-line cost discipline: every built-in pattern carries a cheap literal
-// prefilter — the regex only runs on lines that contain a telltale substring,
-// so the no-match hot path is a handful of strings.Contains calls and zero
-// allocations. A scrubbed line allocates (it must — the body changes).
+// Per-line cost discipline: every built-in pattern carries a cheap prefilter,
+// so the no-match hot path is a scan or two and zero allocations. A prefilter
+// must admit everything its regex can match (narrower means a secret ships
+// unredacted) and as little else as possible — running the regex is the
+// expensive part, and a pattern admitted on a bare keyword cost 100 ms on a
+// 1 MiB record. Most are literal scans; secret-kv's checks the assignment
+// SHAPE (see secretKVCandidate). A scrubbed line allocates (it must — the body
+// changes).
 package logscrub
 
 import (
@@ -162,16 +166,142 @@ func digitRun(n int) func(string) bool {
 	}
 }
 
-// Prefilter closures are built ONCE — containsFold allocates its case
-// variants at construction, so building them per line would put ~20 allocs
-// on the no-match hot path.
+// secret-kv's prefilter.
+//
+// The first version scanned for the bare words "key", "secret", "passw", "pwd"
+// and "token" anywhere on the line. Those admit far more than the regex can
+// match — a bare `key` or `token` with no credential-ish continuation can never
+// match the alternation at all — and the regex is the expensive part: a 1 MiB
+// record containing the word "token" cost 100 ms of the SINGLE sweep goroutine
+// that serves every log file on the node. Admitting a line the pattern cannot
+// match is not a small waste; it is the whole cost.
+//
+// So the prefilter checks the SHAPE, not a word: a keyword, optionally one of
+// the curated suffixes, then the `["']?\s*[:=]` assignment and a value byte.
+// That is the regex's own tail, minus the leading `[0-9A-Za-z_.-]*?` walk-back,
+// which can never fail (walking back from a keyword over word characters always
+// reaches either the line start or a non-word character). Being a strict
+// SUPERSET of the regex is what makes it safe to skip on a miss — a prefilter
+// narrower than its pattern ships secrets unredacted, which
+// TestPrefilterIsNotNarrowerThanItsRegex exists to catch.
+//
+// It is one pass with a first-byte dispatch rather than a scan per keyword: the
+// keywords start with a, s, p or t, so an ordinary line pays one lowercase and
+// one switch per byte.
 var (
-	pfKey    = containsFold("key")
-	pfSecret = containsFold("secret")
-	pfPassw  = containsFold("passw")
-	pfPwd    = containsFold("pwd")
-	pfToken  = containsFold("token")
+	kvWordsA = []string{"apikey", "api_key", "api-key", "accesskey", "access_key", "access-key"}
+	kvWordsS = []string{"secret"}
+	kvWordsP = []string{"password", "passwd", "pwd"}
+	kvWordsT = []string{"token"}
+	// kvSuffixWords mirrors keySuffix's alternation, in the same order.
+	kvSuffixWords = []string{"key", "value", "token", "secret", "password", "passwd", "pwd"}
 )
+
+// secretKVCandidate reports whether the line can match the secret-kv regex.
+func secretKVCandidate(s string) bool {
+	for i := 0; i < len(s); i++ {
+		var words []string
+		switch lowerASCII(s[i]) {
+		case 'a':
+			words = kvWordsA
+		case 's':
+			words = kvWordsS
+		case 'p':
+			words = kvWordsP
+		case 't':
+			words = kvWordsT
+		default:
+			continue
+		}
+		for _, w := range words {
+			if hasPrefixFold(s[i:], w) && kvTail(s, i+len(w)) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// kvTail reports whether the keyword ending at j is followed by an assignment,
+// with or without one of the curated suffixes in between (keySuffix).
+func kvTail(s string, j int) bool {
+	if kvAssign(s, j) {
+		return true
+	}
+	k := j
+	if k < len(s) && (s[k] == '_' || s[k] == '-') {
+		k++
+	}
+	for _, w := range kvSuffixWords {
+		if hasPrefixFold(s[k:], w) && kvAssign(s, k+len(w)) {
+			return true
+		}
+	}
+	return false
+}
+
+// kvAssign matches the regex's `["\']?\s*[:=]\s*["\']?` plus the first byte of
+// its value class — a keyword with no value after the separator is not a
+// credential and must not cost a regex pass.
+func kvAssign(s string, j int) bool {
+	if j < len(s) && (s[j] == '"' || s[j] == '\'') {
+		j++
+	}
+	for j < len(s) && isRegexpSpace(s[j]) {
+		j++
+	}
+	if j >= len(s) || (s[j] != ':' && s[j] != '=') {
+		return false
+	}
+	j++
+	for j < len(s) && isRegexpSpace(s[j]) {
+		j++
+	}
+	if j < len(s) && (s[j] == '"' || s[j] == '\'') {
+		j++
+	}
+	return j < len(s) && !isValueDelim(s[j])
+}
+
+func lowerASCII(c byte) byte {
+	if 'A' <= c && c <= 'Z' {
+		c += 'a' - 'A'
+	}
+	return c
+}
+
+// hasPrefixFold reports whether s starts with the (already lowercase) word,
+// ASCII-case-insensitively — the same folding asciiFold gives the regexes.
+func hasPrefixFold(s, lowerWord string) bool {
+	if len(s) < len(lowerWord) {
+		return false
+	}
+	for i := 0; i < len(lowerWord); i++ {
+		if lowerASCII(s[i]) != lowerWord[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// isRegexpSpace is Go regexp's \s class, EXACTLY: [\t\n\f\r ], with no \v.
+// Both halves of that matter. A wider class would skip a byte the regex stops
+// at (harmless over-admission), but it is also what isValueDelim negates — and
+// there a wider class REJECTS a line whose value begins with \v, which the
+// regex matches, making the prefilter narrower than its pattern and the secret
+// unredacted.
+func isRegexpSpace(c byte) bool {
+	return c == ' ' || c == '\t' || c == '\n' || c == '\f' || c == '\r'
+}
+
+// isValueDelim is the secret-kv value class' exclusion set, `[\s"'&,;}\])]`.
+func isValueDelim(c byte) bool {
+	switch c {
+	case '"', '\'', '&', ',', ';', '}', ']', ')':
+		return true
+	}
+	return isRegexpSpace(c)
+}
 
 // builtins is the catalog. Every pattern replaces the whole match unless it
 // captures a prefix group to keep (the kv patterns keep the key and the
@@ -214,10 +344,8 @@ var builtins = map[string]pattern{
 			`|` + asciiFold("pwd") + `|` + asciiFold("token") +
 			`|` + asciiFold("access") + `[_-]?` + asciiFold("key") +
 			`)` + keySuffix + `["\']?\s*[:=]\s*["\']?)[^\s"\'&,;}\])]+`),
-		repl: "${1}" + redacted,
-		prefilter: func(s string) bool {
-			return pfKey(s) || pfSecret(s) || pfPassw(s) || pfPwd(s) || pfToken(s)
-		},
+		repl:      "${1}" + redacted,
+		prefilter: secretKVCandidate,
 	},
 	"url-userinfo": {
 		name: "url-userinfo",

@@ -11,6 +11,8 @@ import (
 	"go.opentelemetry.io/collector/pdata/plog"
 	"go.opentelemetry.io/collector/pdata/pmetric"
 	"go.opentelemetry.io/collector/pdata/ptrace"
+
+	"github.com/JohanLindvall/kubescrape/internal/obs"
 )
 
 type capExp struct {
@@ -175,13 +177,63 @@ func TestRuntimeErrorFailsExport(t *testing.T) {
 	}
 }
 
+// writeAtomic replaces path the way Kubernetes does: a ConfigMap update
+// populates a new directory and swaps the ..data symlink with rename(2), so a
+// reader resolving the path gets either the whole old file or the whole new
+// one. os.WriteFile does NOT model that — it truncates and then writes, and a
+// reader sampling the gap sees a ZERO-LENGTH file, which is valid YAML and
+// compiles to a valid program with no transforms. Compile-then-commit cannot
+// reject it (nothing failed), so the reloader swapped it in and the test below
+// blamed the broken edit for a displacement the truncation caused: ~0.5% of
+// runs on a loaded machine, always via the poll tick, which unlike the event
+// path has no debounce to wait the writer out.
+func writeAtomic(t *testing.T, path, content string) {
+	t.Helper()
+	tmp := path + ".new"
+	if err := os.WriteFile(tmp, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// waitFor polls cond to a deadline. The reloader is a goroutine woken by
+// fsnotify and a ticker, so a test can assert that a state is REACHED but
+// never how long reaching it takes; every wait here is on an observable the
+// reloader publishes, never on an elapsed duration.
+func waitFor(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %s", what)
+}
+
+// A good edit swaps the active program; a broken one keeps the last good.
+//
+// Both halves wait on a happens-after, not a clock. The swap is awaited by the
+// EXACT hash v2 must produce — "any hash but v1" would also accept a state the
+// reloader merely passes through, and then pin the second half to it. The
+// rejection is awaited by the reloads{failed} counter, bumped on the one
+// branch that also declines to swap: once it moves past the baseline taken
+// before the write, the reloader has read the broken file, rejected it and
+// returned without touching the program, so the assertion is about a settled
+// state instead of a guess at how long a compile takes. (That counter is a
+// process-global, which is sound here because only Reload writes it and the
+// check is baseline-relative — but it is why this test must not go parallel
+// with another that reloads.)
 func TestReloadSwapsAndKeepsLastGoodOnFailure(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "transforms.yaml")
 	v1 := "logs: |\n  def transform(batch):\n      for r in batch:\n          r.attributes[\"v\"] = \"1\"\n"
-	if err := os.WriteFile(path, []byte(v1), 0o644); err != nil {
-		t.Fatal(err)
-	}
+	v2 := "logs: |\n  def transform(batch):\n      for r in batch:\n          r.attributes[\"v\"] = \"2\"\n"
+	broken := "logs: |\n  broken ===\n"
+	writeAtomic(t, path, v1)
 	prog, err := CompileFile(path)
 	if err != nil {
 		t.Fatal(err)
@@ -191,39 +243,38 @@ func TestReloadSwapsAndKeepsLastGoodOnFailure(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	done := make(chan struct{})
+	// A short poll so the fsnotify fallback is exercised too; nothing below
+	// depends on which of the two paths gets there first.
 	go func() { defer close(done); Reload(ctx, w, path, 20*time.Millisecond, testLogger()) }()
 
-	waitHash := func(want bool, hash string) {
+	h1, h2 := contentHash([]byte(v1)), contentHash([]byte(v2))
+	if got := w.Active().Hash; got != h1 {
+		t.Fatalf("initial program hash %s, want v1 %s", got, h1)
+	}
+
+	// Good edit: swaps, and to exactly v2.
+	writeAtomic(t, path, v2)
+	waitFor(t, "the v2 program to go active", func() bool { return w.Active().Hash == h2 })
+
+	// Broken edit: compiles to nothing, so v2 must survive it.
+	mustBeV2 := func(when string) {
 		t.Helper()
-		deadline := time.Now().Add(5 * time.Second)
-		for time.Now().Before(deadline) {
-			if (w.Active().Hash == hash) == want {
-				return
-			}
-			time.Sleep(10 * time.Millisecond)
+		if got := w.Active().Hash; got != h2 {
+			t.Fatalf("broken edit displaced the last good program %s: active %s, want v2 %s", when, got, h2)
 		}
-		t.Fatalf("hash never converged (want change=%v from %s, have %s)", want, hash, w.Active().Hash)
 	}
-
-	// Good edit: swaps.
-	v2 := "logs: |\n  def transform(batch):\n      for r in batch:\n          r.attributes[\"v\"] = \"2\"\n"
-	h1 := w.Active().Hash
-	if err := os.WriteFile(path, []byte(v2), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	waitHash(false, h1)
-	h2 := w.Active().Hash
-
-	// Broken edit: keeps v2.
-	if err := os.WriteFile(path, []byte("logs: |\n  broken ===\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	time.Sleep(200 * time.Millisecond)
-	if w.Active().Hash != h2 {
-		t.Fatal("broken edit displaced the last good program")
-	}
+	failed := obs.TransformReloads.WithLabelValues("failed")
+	before := failed.Value()
+	writeAtomic(t, path, broken)
+	waitFor(t, "the broken file to be read and rejected", func() bool { return failed.Value() > before })
+	mustBeV2("at the moment the reload was rejected")
+	// And still after the reloader has exited: joining it is what makes the
+	// negative airtight, since no goroutine is left that could swap anything
+	// in. Checking only above would leave a reloader that swaps AFTER counting
+	// its failure indistinguishable from one that never swaps.
 	cancel()
 	<-done
+	mustBeV2("after the reloader stopped")
 }
 
 func testLogger() *slog.Logger { return slog.Default() }

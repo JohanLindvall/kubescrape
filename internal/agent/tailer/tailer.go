@@ -186,12 +186,10 @@ type Tailer struct {
 	// gate, that lets saveCheckpoints prune the store (a stale entry re-applied
 	// to a recreated path would skip its first bytes as if they had shipped).
 	checkpoints map[string]checkpoint
-	// startingUp reports that no listing has SUCCEEDED yet, so discovery is
-	// still the startup scan: -logs-unknown-files decides where a
-	// checkpoint-less file starts. Once a listing succeeds, a newly appearing
-	// file is genuinely new and is read from the beginning whatever that
-	// setting says.
-	startingUp bool
+	// Whether discovery is still the STARTUP scan is per SOURCE
+	// (compiledSource.startingUp), not per tailer: one source's failing glob
+	// must not keep another's genuinely new files being skipped as history.
+
 	// hadStoredCheckpoints records whether the store held ANY entry at startup,
 	// which is what -logs-unknown-files=auto keys off ("the agent ran before").
 	// It is captured once rather than read from t.checkpoints, whose entries are

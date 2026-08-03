@@ -96,6 +96,10 @@ type Server struct {
 	// reading and decoding, which the count above deliberately does not (see
 	// admit.go). Tests lower its limit to exercise the refusal.
 	buffer *byteBudget
+	// reserveWindow bounds how long ONE gRPC reservation may live, i.e. how long
+	// a peer may sit between its HEADERS frame and a decoded message
+	// (grpcReserveWindow). Tests shorten it to exercise the reclaim.
+	reserveWindow time.Duration
 	// body reads one HTTP request body against that budget and this receiver's
 	// cap. The same reader serves the trace tier's internal listener with a
 	// different cap and no budget (httpbody.go).
@@ -114,9 +118,10 @@ func NewServer(cfg ServerConfig) *Server {
 	}
 	s := &Server{
 		cfg: cfg, log: log,
-		inFlight:    make(chan struct{}, n),
-		maxInFlight: n,
-		buffer:      &byteBudget{limit: maxBufferBytes},
+		inFlight:      make(chan struct{}, n),
+		maxInFlight:   n,
+		buffer:        &byteBudget{limit: maxBufferBytes},
+		reserveWindow: grpcReserveWindow,
 	}
 	s.body = &BodyReader{max: maxIngestBody, budget: s.buffer}
 	return s
@@ -179,10 +184,20 @@ func (s *Server) Run(ctx context.Context) error {
 			return fmt.Errorf("ingest gRPC listen %s: %w", s.cfg.GRPCAddr, err)
 		}
 		// Mirror the HTTP server's IdleTimeout: reap connections apps opened
-		// and abandoned (default gRPC keeps them forever).
+		// and abandoned (default gRPC keeps them forever). MaxConnectionIdle
+		// alone does NOT cover the abandoned-STREAM case — a connection carrying
+		// an open stream is not idle, which is why the reservation carries its
+		// own window (grpcReserveWindow). The age bounds are the coarse
+		// complement: whatever a peer accumulates on one socket (stream ids,
+		// HPACK state, half-open RPCs), it gets a GOAWAY after the age and loses
+		// the socket after the grace. Conformant senders reconnect
+		// transparently, and the grace is far longer than any RPC here — those
+		// are bounded by the pre-decode window plus the exporter's own timeout.
 		grpcSrv = grpc.NewServer(
 			grpc.KeepaliveParams(keepalive.ServerParameters{
-				MaxConnectionIdle: 120 * time.Second,
+				MaxConnectionIdle:     120 * time.Second,
+				MaxConnectionAge:      30 * time.Minute,
+				MaxConnectionAgeGrace: 30 * time.Second,
 			}),
 			// What each of these actually bounds, since they are easy to
 			// over-credit:
@@ -201,7 +216,9 @@ func (s *Server) Run(ctx context.Context) error {
 			//     decode itself.
 			//   - The tap (tapAdmit, admit.go) is what bounds the decode: it
 			//     runs on the HEADERS frame, before grpc-go reads the message,
-			//     and reserves MaxRecvMsgSize from the server-wide byte budget.
+			//     and reserves MaxRecvMsgSize from the server-wide byte budget
+			//     for at most grpcReserveWindow — a peer that sends no message
+			//     loses the reservation and the stream with it.
 			//     That closes the gap the previous three left — unbounded
 			//     concurrent BUFFERING — and it can carry the RetryInfo a shed
 			//     needs, because writeEarlyAbort forwards a status' details.

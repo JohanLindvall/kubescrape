@@ -549,11 +549,24 @@ func lookup(s Span, key string) (pcommon.Value, bool) {
 // errPolicy formats a config error that names the offending policy, so a
 // -check-config failure points at a line rather than at a feature.
 //
-// The prefix is PREPENDED TO THE FORMAT STRING rather than rendered separately,
-// so a %w in format reaches the outer Errorf and the wrapped error stays
-// reachable by errors.Is/errors.As. Rendering the args with an inner Sprintf
-// (which this used to do) flattens them to text first, which makes %w
-// structurally impossible here and silently degrades every caller to %v.
+// Two properties have to hold at once, and each has already been lost once:
+//
+//   - The cause must stay WRAPPED. Rendering the args with an inner Sprintf
+//     (the original) flattens them to text first, which makes %w structurally
+//     impossible and silently degrades every caller to %v.
+//   - go vet must still CHECK the format at all ~37 call sites. Concatenating
+//     the prefix onto the format (%s: "+format, the fix for the first defect)
+//     makes the format non-constant at the fmt.Errorf call, and the printf
+//     analyser then gives up on the whole function — verbs stopped being
+//     checked everywhere, silently.
+//
+// Formatting in two steps satisfies both. The inner call forwards `format` and
+// `args...` VERBATIM, which is the shape vet's printf analyser recognises as a
+// printf wrapper (it will not infer one through a concatenation or a rebuilt
+// arg slice), so every call site is checked against `format` again; the outer
+// %w keeps the inner error — including whatever the caller's own %w wrapped —
+// reachable by errors.Is/errors.As. The rendered text is byte-identical to the
+// concatenating version: "<where>: <formatted>".
 func errPolicy(where, format string, args ...any) error {
-	return fmt.Errorf("%s: "+format, append([]any{where}, args...)...)
+	return fmt.Errorf("%s: %w", where, fmt.Errorf(format, args...))
 }

@@ -144,16 +144,18 @@ func parseFileName(name string) (containerID, namespace string, ok bool) {
 // scanDir discovers new and removed log files across all sources by globbing
 // their include patterns. initial marks the startup scan, which seeds the
 // stored positions (checkpoints) every later scan also consults — see
-// Tailer.checkpoints and Tailer.startingUp for why the seeding and the
+// Tailer.checkpoints and compiledSource.startingUp for why the seeding and the
 // startup-only -logs-unknown-files policy outlive this one call.
 func (t *Tailer) scanDir(checkpoints map[string]checkpoint, initial bool) {
 	if initial {
 		t.checkpoints = checkpoints
 		t.hadStoredCheckpoints = len(checkpoints) > 0
-		// Startup is not over until a listing SUCCEEDS: with the very first
-		// glob failing, nothing is discovered, and the files a later pass finds
-		// are the startup set arriving late — not new files.
-		t.startingUp = true
+		// A source's startup is not over until ITS listing SUCCEEDS: with the
+		// very first glob failing, nothing is discovered, and the files a later
+		// pass finds are that source's startup set arriving late — not new files.
+		for _, src := range t.sources {
+			src.startingUp = true
+		}
 	}
 	seen := make(map[string]struct{})
 	discovered := false
@@ -165,9 +167,6 @@ func (t *Tailer) scanDir(checkpoints map[string]checkpoint, initial bool) {
 		}
 		if listingOK {
 			t.warnedListing = false
-			// A successful listing ends startup: from here a newly appearing
-			// file is genuinely new.
-			t.startingUp = false
 		}
 		// Checkpoint pruning is only safe after a listing that actually saw the
 		// files; see saveCheckpoints.
@@ -189,7 +188,20 @@ func (t *Tailer) scanDir(checkpoints map[string]checkpoint, initial bool) {
 				discovered = true
 			}
 		}
+		if ok {
+			// This source's startup ends here — AFTER its own paths were claimed,
+			// so the files this very pass discovered are still governed by
+			// -logs-unknown-files, and anything appearing under it later is
+			// genuinely new. Per source: a sibling stuck on a failing glob must
+			// not keep this one's new files being skipped as history.
+			src.startingUp = false
+		}
 	}
+	// listingOK is the conjunction over EVERY source, deliberately unlike the
+	// per-source startup flag above: what follows rests on "absence is proven",
+	// and a path is not attributable to a source before some source globs it —
+	// so only a scan in which every source listed may declare a file gone or
+	// drop its stored offset.
 	if listingOK {
 		for path, f := range t.files {
 			if _, ok := seen[path]; !ok {
@@ -340,9 +352,9 @@ func (t *Tailer) claimPath(src *compiledSource, path string, seen map[string]str
 // dirTicker then finds would each have started at byte 0 — a node-wide
 // re-ingest with every Pending prefix destroyed, and no counter moving. Where a
 // file with NO stored position starts still depends on the pass:
-// -logs-unknown-files governs the startup set (t.startingUp, which lasts until
-// a listing succeeds), while a file appearing after that is new and is read
-// whole.
+// -logs-unknown-files governs the startup set (f.source.startingUp, which lasts
+// until THAT SOURCE's listing succeeds), while a file appearing after that is
+// new and is read whole.
 func (t *Tailer) initFile(f *file) {
 	if cp, ok := t.checkpoints[f.path]; ok {
 		// Consumed: the tailer's own offset is authoritative from here, and a
@@ -399,7 +411,7 @@ func (t *Tailer) initFile(f *file) {
 			}
 		}
 		f.newTail()
-	} else if t.startingUp && !f.compressed {
+	} else if f.source.startingUp && !f.compressed {
 		// Present at startup with no checkpoint entry. Where to start is
 		// configurable (Config.UnknownFiles): "end" skips it as pre-existing
 		// history; "start" reads it whole; "auto" (default) reads from the
@@ -407,11 +419,13 @@ func (t *Tailer) initFile(f *file) {
 		// before, so this file appeared while it was down and its content is
 		// unshipped, not history. Compressed archives are always read whole.
 		//
-		// Only while STARTING UP: a file that appears once a listing has
-		// succeeded was created under our eyes, so it is read from the
-		// beginning whatever this setting says — "end" is a history policy for
-		// the backlog present before the agent, never a licence to skip a
-		// container's first lines.
+		// Only while ITS SOURCE IS STARTING UP: a file that appears once that
+		// source's listing has succeeded was created under our eyes, so it is
+		// read from the beginning whatever this setting says — "end" is a
+		// history policy for the backlog present before the agent, never a
+		// licence to skip a container's first lines. Another source's glob
+		// still failing says nothing about this one (see
+		// compiledSource.startingUp).
 		mode := t.cfg.UnknownFiles
 		if mode == "" || mode == "auto" {
 			// A CORRUPT positions file decodes to nothing, so the store looks

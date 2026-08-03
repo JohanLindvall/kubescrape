@@ -745,14 +745,16 @@ func TestCompileErrorsWrapTheirCause(t *testing.T) {
 		if err == nil {
 			t.Fatal("an unparseable duration compiled")
 		}
-		// errPolicy -> config.Duration -> time.ParseDuration.
-		inner := errors.Unwrap(err)
-		if inner == nil {
+		// errPolicy -> config.Duration -> time.ParseDuration. Unwrap to the
+		// LEAF rather than counting hops: how many wrappers the helper adds is
+		// its own business (it formats in two steps so go vet keeps checking
+		// the call sites), while reaching the cause is the guarantee.
+		if errors.Unwrap(err) == nil {
 			t.Fatalf("errPolicy did not wrap its cause: %v", err)
 		}
-		leaf := errors.Unwrap(inner)
-		if leaf == nil {
-			t.Fatalf("the duration error did not wrap time.ParseDuration's: %v", inner)
+		leaf := err
+		for next := errors.Unwrap(leaf); next != nil; next = errors.Unwrap(leaf) {
+			leaf = next
 		}
 		_, want := time.ParseDuration("10 seconds")
 		if leaf.Error() != want.Error() {

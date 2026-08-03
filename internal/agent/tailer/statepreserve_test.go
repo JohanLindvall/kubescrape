@@ -195,6 +195,130 @@ func TestUnknownFilesPolicySurvivesAFailedStartupListing(t *testing.T) {
 	}
 }
 
+// twoSourceTailer builds a tailer over two plain sources, one per directory,
+// with -logs-unknown-files=end (the policy that makes a startup file history).
+func twoSourceTailer(t *testing.T, pos *positions.Store, healthy, broken string) *Tailer {
+	t.Helper()
+	return New(Config{
+		Sources: []Source{
+			{Name: "healthy", Include: []string{filepath.Join(healthy, "*.log")}},
+			{Name: "broken", Include: []string{filepath.Join(broken, "*.log")}},
+		},
+		Positions:     pos,
+		PollInterval:  time.Hour,
+		FlushInterval: time.Hour,
+		UnknownFiles:  "end",
+		MetadataWait:  time.Second,
+		Metadata:      fakeMeta{},
+		Exporter:      &fakeExporter{},
+	})
+}
+
+// Startup is per SOURCE. A source whose glob keeps failing must not hold every
+// OTHER source in startup: a file created under a healthy source after its
+// listing succeeded was created under our eyes, so -logs-unknown-files=end must
+// not skip it as pre-existing history (which would lose the container's first
+// lines outright, silently, for as long as the sibling glob stays broken).
+func TestHealthySourceLeavesStartupWhileSiblingGlobFails(t *testing.T) {
+	base := t.TempDir()
+	healthy := filepath.Join(base, "healthy")
+	broken := filepath.Join(base, "broken")
+	for _, d := range []string{healthy, broken} {
+		if err := os.Mkdir(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	unreadable(t, broken)
+
+	tl := twoSourceTailer(t, nil, healthy, broken)
+	tl.scanDir(tl.loadCheckpoints(), true)
+	if tl.lastListingOK {
+		t.Fatal("setup: the broken source's glob was expected to fail")
+	}
+
+	// Created after the healthy source's listing succeeded: genuinely new.
+	fresh := filepath.Join(healthy, "app.log")
+	writeLines(t, fresh, "first line")
+	tl.scanDir(nil, false) // the dirTicker pass, broken source still failing
+	if tl.lastListingOK {
+		t.Fatal("setup: the broken source's glob recovered unexpectedly")
+	}
+
+	f := tl.files[fresh]
+	if f == nil {
+		t.Fatal("newly created file not discovered")
+	}
+	if f.committed != 0 {
+		t.Fatalf("committed = %d, want 0: a file created while running was treated as startup history because a SIBLING source's glob is failing", f.committed)
+	}
+}
+
+// The other direction, and the guard on the obvious wrong fix (ending startup
+// as soon as ANY source lists): the source that could not list is still in its
+// own startup when it recovers, so the files it then discovers are the startup
+// set arriving late — a stored offset resumes there, and a checkpoint-less one
+// obeys -logs-unknown-files.
+func TestFailedSourceKeepsItsOwnStartupPolicy(t *testing.T) {
+	base := t.TempDir()
+	healthy := filepath.Join(base, "healthy")
+	broken := filepath.Join(base, "broken")
+	for _, d := range []string{healthy, broken} {
+		if err := os.Mkdir(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Two files under the broken source: one with a stored offset, one without.
+	resumed := filepath.Join(broken, "resumed.log")
+	history := filepath.Join(broken, "history.log")
+	writeLines(t, resumed, "shipped", "unshipped")
+	writeLines(t, history, "pre-existing")
+	st, err := os.Stat(resumed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	shipped := int64(len("shipped") + 1)
+	histSize := func() int64 {
+		hs, err := os.Stat(history)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return hs.Size()
+	}()
+
+	pos := mustOpenPositions(t, filepath.Join(base, "pos.json"))
+	if err := pos.SetLogs(map[string]positions.LogPos{
+		resumed: {Offset: shipped, Inode: inodeOf(st)},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	unreadable(t, broken)
+
+	tl := twoSourceTailer(t, pos, healthy, broken)
+	tl.scanDir(tl.loadCheckpoints(), true)
+	if tl.lastListingOK {
+		t.Fatal("setup: the broken source's glob was expected to fail")
+	}
+	if len(tl.files) != 0 {
+		t.Fatalf("setup: %d files tracked while the only populated source could not list", len(tl.files))
+	}
+	// The healthy source lists fine from the first scan and leaves startup.
+	tl.scanDir(nil, false)
+
+	readable(t, broken)
+	tl.scanDir(nil, false) // the pass that finally sees the broken source's files
+
+	if f := tl.files[resumed]; f == nil {
+		t.Fatal("checkpointed file not discovered by the recovered listing")
+	} else if f.committed != shipped {
+		t.Fatalf("committed = %d, want %d: a stored offset was not applied after the source's listing recovered", f.committed, shipped)
+	}
+	if f := tl.files[history]; f == nil {
+		t.Fatal("checkpoint-less file not discovered by the recovered listing")
+	} else if f.committed != histSize {
+		t.Fatalf("committed = %d, want %d: the failed source's startup set was re-read instead of skipped by -logs-unknown-files=end", f.committed, histSize)
+	}
+}
+
 // unreadable makes dir's listing fail with EACCES, which is what doublestar's
 // WithFailOnIOErrors reports as a failed glob. (A merely ABSENT base directory
 // is not an I/O error and lists as empty; only a real read failure — the

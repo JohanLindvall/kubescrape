@@ -85,22 +85,17 @@ func (br *BodyReader) Read(r *http.Request) ([]byte, int64, error) {
 			return nil, 0, fmt.Errorf("%w %q (want application/x-protobuf)", ErrUnsupportedType, ct)
 		}
 	}
-	// A declared Content-Length is reserved BEFORE the first byte is read, so a
-	// sender announcing 16 MiB is refused while the receiver is full rather
-	// than after it has buffered them. It is only a hint (absent on chunked
-	// uploads, and short of the decompressed size for a gzip body), which is
-	// why budgetReader keeps charging as it goes.
+	// Nothing is charged for a declared Content-Length. It is the sender's
+	// unverified claim, and crediting it made the budget spendable by a peer
+	// that sends no bytes at all: four sockets announcing 16 MiB each took the
+	// whole budget and locked out every honest push, which is a cheaper denial
+	// of service than the memory exhaustion the budget exists to prevent. The
+	// budget is charged AS THE BODY IS READ (budgetReader, in 64 KiB granules),
+	// which is what admit.go's comment always claimed the design does, so a
+	// sender is refused for bytes it has actually produced. The refusal simply
+	// lands mid-read instead of before it — still retryable, still with the
+	// payload in the sender's hands.
 	bd := &budgetReader{b: br.budget}
-	if n := r.ContentLength; n > 0 && br.budget != nil {
-		if n > br.max+1 {
-			n = br.max + 1
-		}
-		if !br.budget.reserve(n) {
-			obs.IngestRejected.Inc()
-			return nil, 0, errBufferBudget
-		}
-		bd.held = n
-	}
 	fail := func(err error) ([]byte, int64, error) {
 		br.Release(bd.held)
 		if errors.Is(err, errBufferBudget) {
@@ -132,12 +127,14 @@ func (br *BodyReader) Read(r *http.Request) ([]byte, int64, error) {
 	// The cap applies to the decompressed size too (zip-bomb guard). Read one
 	// byte beyond it to distinguish at-cap from over-cap and reject the latter.
 	bd.r = io.LimitReader(src, br.max+1)
-	// Pre-size the destination from Content-Length where it is meaningful (an
-	// identity-encoded body), so the read does not pay io.ReadAll's
-	// grow-and-copy doubling — which would put twice the CHARGED bytes on the
-	// heap and make the budget mean half what it says. A gzip body's declared
-	// length is the compressed one, so it is no hint at all and that case still
-	// doubles.
+	// Offer Content-Length as a size HINT where it is meaningful (an
+	// identity-encoded body), so a read that gets that far does not pay
+	// io.ReadAll's grow-and-copy doubling — which would put twice the CHARGED
+	// bytes on the heap and make the budget mean half what it says. It is only a
+	// hint: readAllCapped allocates at most maxPresizeBytes on the strength of
+	// it, then doubles from there and lets the declaration trim the final step
+	// to an exact fit. A gzip body's declared length is the compressed one, so
+	// it is no hint at all and that case doubles throughout.
 	hint := int64(0)
 	if capped == nil {
 		hint = r.ContentLength

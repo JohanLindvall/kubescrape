@@ -129,6 +129,23 @@ type compiledSource struct {
 	namespaces        []string
 	excludeNamespaces []string
 	selector          map[string]string
+	// startingUp reports that THIS source's listing has not yet succeeded, so
+	// the files it discovers are still its startup set and
+	// -logs-unknown-files decides where a checkpoint-less one starts. It is
+	// per source, not per tailer: a source stuck on a failing glob (an
+	// unreadable mount, a not-yet-created include base) would otherwise keep
+	// every HEALTHY source in startup forever, and each genuinely new file
+	// they discover would be skipped to its end as "history" — losing a
+	// container's first lines silently. What a failed glob proves is only
+	// about ITS OWN source; the checks that need "absence is proven"
+	// (gone-detection, checkpoint pruning) still need every source's listing,
+	// because a path is not attributable to one source before it is globbed.
+	//
+	// It is raised by the INITIAL scan (scanDir) and not here, so the zero value
+	// is the fail-safe one: a discovery pass that never declared itself the
+	// startup scan reads what it finds whole (at-least-once tolerates the
+	// duplicates) rather than skipping a file's backlog as history.
+	startingUp bool
 }
 
 // wantNamespace reports whether a containerd source accepts this namespace.

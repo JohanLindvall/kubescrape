@@ -2,6 +2,10 @@ package tailsample
 
 import (
 	"context"
+	"errors"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"strings"
 	"sync"
 	"testing"
@@ -591,4 +595,101 @@ type headCapture struct{ batches []ptrace.Traces }
 func (c *headCapture) ExportTraces(_ context.Context, td ptrace.Traces) error {
 	c.batches = append(c.batches, td)
 	return nil
+}
+
+// go vet's printf analyser checks errPolicy's ~37 call sites only while it can
+// INFER that errPolicy is a printf wrapper, and it infers that from exactly one
+// shape: a call forwarding the trailing `format string, args ...any` parameters
+// VERBATIM to a printf function. Building the format by concatenation, or the
+// args by append, is enough to lose the inference — and losing it is silent:
+// every call site simply stops being checked, `go vet` still exits 0, and a %d
+// on a string ships. (That is precisely how this regressed once; see errPolicy.)
+//
+// This pins the shape so the next edit to errPolicy either keeps it or fails
+// here, rather than quietly disabling a whole package's format checking.
+func TestErrPolicyKeepsThePrintfWrapperShape(t *testing.T) {
+	t.Parallel()
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, "tailsample.go", nil, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fn *ast.FuncDecl
+	for _, d := range file.Decls {
+		if fd, ok := d.(*ast.FuncDecl); ok && fd.Name.Name == "errPolicy" && fd.Recv == nil {
+			fn = fd
+			break
+		}
+	}
+	if fn == nil {
+		t.Fatal("errPolicy not found in tailsample.go")
+	}
+
+	// The last two parameters must be `format string` and `args ...T` (grouped
+	// declarations flattened): the analyser looks for that signature before it
+	// looks at the body at all.
+	type param struct {
+		name string
+		typ  ast.Expr
+	}
+	var params []param
+	for _, group := range fn.Type.Params.List {
+		for _, n := range group.Names {
+			params = append(params, param{name: n.Name, typ: group.Type})
+		}
+	}
+	if len(params) < 2 {
+		t.Fatalf("errPolicy takes %d parameters, want a trailing (format string, args ...any)", len(params))
+	}
+	fmtParam, argsParam := params[len(params)-2], params[len(params)-1]
+	if id, ok := fmtParam.typ.(*ast.Ident); !ok || id.Name != "string" {
+		t.Fatalf("second-to-last parameter %q is not a string: %#v", fmtParam.name, fmtParam.typ)
+	}
+	if _, ok := argsParam.typ.(*ast.Ellipsis); !ok {
+		t.Fatalf("last parameter %q is not variadic: %#v", argsParam.name, argsParam.typ)
+	}
+	formatName, argsName := fmtParam.name, argsParam.name
+
+	forwarded := false
+	ast.Inspect(fn.Body, func(n ast.Node) bool {
+		call, ok := n.(*ast.CallExpr)
+		if !ok || !call.Ellipsis.IsValid() || len(call.Args) < 2 {
+			return true
+		}
+		sel, ok := call.Fun.(*ast.SelectorExpr)
+		if !ok {
+			return true
+		}
+		if pkg, ok := sel.X.(*ast.Ident); !ok || pkg.Name != "fmt" || !strings.HasSuffix(sel.Sel.Name, "f") {
+			return true
+		}
+		gotFormat, ok := call.Args[len(call.Args)-2].(*ast.Ident)
+		if !ok || gotFormat.Name != formatName {
+			return true // a built format string: the inference is lost
+		}
+		gotArgs, ok := call.Args[len(call.Args)-1].(*ast.Ident)
+		if !ok || gotArgs.Name != argsName {
+			return true // a rebuilt arg slice: same
+		}
+		forwarded = true
+		return false
+	})
+	if !forwarded {
+		t.Fatalf("errPolicy no longer forwards (%s, %s...) verbatim to a fmt printf function, so go vet has silently stopped checking every call site's format", formatName, argsName)
+	}
+}
+
+// The two properties the shape above exists to protect, asserted on the helper
+// itself: the rendered text still names the policy, and the cause stays
+// reachable however many wrappers the formatting takes.
+func TestErrPolicyPrefixesAndWraps(t *testing.T) {
+	t.Parallel()
+	leaf := errors.New("boom")
+	err := errPolicy(`policy "slow"`, "latency.threshold %q: %w", "10 seconds", leaf)
+	if want := `policy "slow": latency.threshold "10 seconds": boom`; err.Error() != want {
+		t.Errorf("errPolicy = %q, want %q", err, want)
+	}
+	if !errors.Is(err, leaf) {
+		t.Errorf("errors.Is cannot reach the wrapped cause through errPolicy: %v", err)
+	}
 }

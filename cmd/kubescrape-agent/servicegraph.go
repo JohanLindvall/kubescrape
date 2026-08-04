@@ -87,6 +87,9 @@ func (p *pipelines) startServiceGraph(ctx context.Context) error {
 		if cfg := p.fileCfg.TraceSampling; cfg != nil && cfg.Enabled() {
 			p.log.Warn("traceSampling configured but ignored: traces are received by the trace tier (-service-graph), and this process is not it")
 		}
+		if p.fileCfg.ServiceGraphShards != nil {
+			p.log.Warn("serviceGraphShards configured but ignored: the shard ring is read only by the trace tier (-service-graph), and this process is not it")
+		}
 		if p.fileCfg.TailSampling.Enabled() { // nil-receiver safe
 			p.log.Warn("tailSampling configured but ignored: a trace can only be judged where all of its spans are, which is the trace tier (-service-graph), and this process is not it")
 		}

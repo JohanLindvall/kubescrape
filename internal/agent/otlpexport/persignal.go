@@ -144,6 +144,50 @@ type PerSignal struct {
 	Logs, Metrics, Traces *Client
 }
 
+// ValidateAgainst checks the section's shape AND every merged per-signal
+// destination — exactly the Configs BuildExporter hands to New.
+//
+// Validate alone is not enough for a dry run. Every rule that only becomes
+// checkable AFTER the merge was invisible to -check-config: TLS material on a
+// destination that inherits plaintext gRPC from the flags, and the http://
+// scheme requirement when the protocol is inherited from -otlp-protocol rather
+// than declared on the override (Validate deliberately skips that case because
+// it cannot see the flags). So -check-config exited 0 and the same ConfigMap
+// CrashLooped the fleet at `creating OTLP exporter`, from the check whose whole
+// purpose is preventing that.
+//
+// Still shape-only in the sense that matters: Config.Validate touches neither
+// the filesystem nor the network.
+func (c *ExportConfig) ValidateAgainst(base Config) error {
+	if err := c.Validate(); err != nil {
+		return err
+	}
+	merged := c.ApplyBase(base)
+	if c != nil {
+		for _, s := range []struct {
+			name string
+			o    *ExportOverride
+		}{{"logs", c.Logs}, {"metrics", c.Metrics}, {"traces", c.Traces}} {
+			if s.o == nil {
+				continue
+			}
+			if err := s.o.merged(merged).Validate(); err != nil {
+				return fmt.Errorf("export.%s: %w", s.name, err)
+			}
+		}
+	}
+	// The default chain is only BUILT when a signal falls through to it, so it
+	// is only validated then — BuildExporter skips it entirely once all three
+	// are overridden (the collectorless case, where the flag endpoint still
+	// points at the stock collector address nothing dials).
+	if c == nil || c.Logs == nil || c.Metrics == nil || c.Traces == nil {
+		if err := merged.Validate(); err != nil {
+			return fmt.Errorf("otlp flags: %w", err)
+		}
+	}
+	return nil
+}
+
 // ApplyBase overlays the section's BASE additions (headers, client cert) onto
 // a flag-derived config — shared by BuildExporter and the routing clients, so
 // a tenancy header set once in `export.headers` reaches route destinations

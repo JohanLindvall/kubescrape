@@ -1,6 +1,7 @@
 package servicegraph
 
 import (
+	"encoding/binary"
 	"slices"
 	"strings"
 	"sync"
@@ -757,4 +758,77 @@ func TestConsumeUnpairedIsAllocationFree(t *testing.T) {
 	if n := testing.AllocsPerRun(200, func() { p.Consume(td) }); n != 0 {
 		t.Errorf("Consume allocates %v times per 100-span unpaired batch, want 0", n)
 	}
+}
+
+// maxSweepPerBatch is a PER-LOCK-HOLD ceiling, not a total budget. Spending
+// only that much of a larger batch-scaled budget made the scaling a lie: a
+// batch carrying more unpairable half-edges than the ceiling expired fewer than
+// it added, so occupancy climbed past the honest rate x wait working set and
+// pinned at MaxItems — after which the store refuses arriving spans.
+func TestConsumeSweepsItsWholeBatchBudget(t *testing.T) {
+	const n = maxSweepPerBatch * 3
+	p := NewProcessor(Config{Wait: "1s", MaxItems: n * 4}, discardLog())
+	base := t0
+	p.now = func() time.Time { return base }
+
+	// n unpairable half-edges (client spans whose server half never arrives).
+	p.Consume(unpairableClientSpans(0, n))
+	if got := p.Stats().Items; got != n {
+		t.Fatalf("setup: store holds %d, want %d", got, n)
+	}
+
+	// Everything is now due. One more batch of the same size must be able to
+	// expire all of it: its budget is its own span count.
+	p.now = func() time.Time { return base.Add(time.Hour) }
+	p.Consume(unpairableClientSpans(n, n)) // a DISJOINT set of traces
+
+	// The n new half-edges remain (they are not due yet at this clock); the n
+	// old ones must all be gone. A per-hold-capped sweep leaves ~n-1024.
+	if got := p.Stats().Items; got != n {
+		t.Errorf("store holds %d after a batch whose budget covers the backlog, want %d — "+
+			"the batch-scaled budget is being truncated to one lock-hold ceiling", got, n)
+	}
+}
+
+// The SHUTDOWN sweep is the last chance to promote half-edges whose wait
+// elapsed, and the shutdown path claims to emit them. A bounded pass silently
+// discarded the remainder on a busy tier.
+func TestSweepAllDrainsEverythingDue(t *testing.T) {
+	const n = sweepBudget * 3
+	p := NewProcessor(Config{Wait: "1s", MaxItems: n * 2}, discardLog())
+	base := t0
+	p.now = func() time.Time { return base }
+	p.Consume(unpairableClientSpans(0, n))
+
+	p.now = func() time.Time { return base.Add(time.Hour) }
+	p.SweepAll()
+	if got := p.Stats().Items; got != 0 {
+		t.Errorf("SweepAll left %d due half-edges behind; the shutdown path claims to emit them", got)
+	}
+}
+
+// unpairableClientSpans builds n client spans on DISTINCT traces starting at
+// `from`, so none of them can ever pair and each becomes one expiring
+// half-edge. The offset matters: reusing ids UPSERTS the existing half-edges
+// instead of adding new ones, which silently makes an occupancy test vacuous.
+func unpairableClientSpans(from, n int) ptrace.Traces {
+	td := ptrace.NewTraces()
+	rs := td.ResourceSpans().AppendEmpty()
+	rs.Resource().Attributes().PutStr("service.name", "checkout")
+	spans := rs.ScopeSpans().AppendEmpty().Spans()
+	for i := range n {
+		var tid pcommon.TraceID
+		var sid pcommon.SpanID
+		binary.BigEndian.PutUint64(tid[8:], uint64(from+i+1))
+		binary.BigEndian.PutUint64(sid[:], uint64(from+i+1))
+		sp := spans.AppendEmpty()
+		sp.SetName("GET /orders")
+		sp.SetKind(ptrace.SpanKindClient)
+		sp.SetTraceID(tid)
+		sp.SetSpanID(sid)
+		sp.SetStartTimestamp(0)
+		sp.SetEndTimestamp(1)
+		sp.Attributes().PutStr("peer.service", "orders")
+	}
+	return td
 }

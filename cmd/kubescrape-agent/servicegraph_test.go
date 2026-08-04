@@ -236,6 +236,14 @@ func TestValidateConfigRejectsBadServiceGraph(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
+			// The shard ring is read ONLY by the trace tier, so that is where
+			// its section is validated: off the tier the flags are empty and a
+			// half-filled template would otherwise be fatal on a workload that
+			// never reads it (one ConfigMap serves the DaemonSet, the
+			// singleton and the tier alike). See TestShardSectionIsIgnoredOffTheTier.
+			if tc.cfg.ServiceGraphShards != nil {
+				tierOn(t)
+			}
 			err := validateConfig(tc.cfg, "")
 			if err == nil {
 				t.Fatal("validateConfig accepted an invalid service-graph config")
@@ -933,4 +941,47 @@ func TestServiceGraphHTTPOversizedGzipIs413(t *testing.T) {
 
 	cancel()
 	<-errc
+}
+
+// One ConfigMap is shared by the DaemonSet, the events/Azure singleton and the
+// trace tier. A `serviceGraphShards:` section is read ONLY by the tier, so a
+// section that is valid where it is read must not be fatal where it is not:
+// off the tier the shard FLAGS are empty, and a section supplying one half of
+// the template (replicas without statefulSet, or the reverse) tripped the
+// half-filled-template refusal on every workload that never reads it —
+// CrashLoopBackOff for logs, scraped metrics and cadvisor across the fleet.
+func TestShardSectionIsIgnoredOffTheTier(t *testing.T) {
+	old := *serviceGraphOn
+	*serviceGraphOn = false
+	t.Cleanup(func() { *serviceGraphOn = old })
+
+	for _, tc := range []struct {
+		name  string
+		shard *servicegraph.ReshardConfig
+	}{
+		{"template naming no shards", &servicegraph.ReshardConfig{StatefulSet: "sg"}},
+		{"count addressing nothing", &servicegraph.ReshardConfig{Replicas: 3}},
+		{"unknown protocol", &servicegraph.ReshardConfig{StatefulSet: "sg", Replicas: 1, Protocol: "quic"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := validateConfig(agentConfig{ServiceGraphShards: tc.shard}, ""); err != nil {
+				t.Fatalf("a tier-only section was fatal on a workload that never reads it: %v", err)
+			}
+		})
+	}
+
+	// ...and it is still refused ON the tier, where it IS read.
+	tierOn(t)
+	if err := validateConfig(agentConfig{ServiceGraphShards: &servicegraph.ReshardConfig{StatefulSet: "sg"}}, ""); err == nil {
+		t.Error("the tier must still refuse a half-filled shard template")
+	}
+}
+
+// tierOn puts the process in trace-tier shape for the duration of the test:
+// the flag plus the two things the tier refuses to start without.
+func tierOn(t *testing.T) {
+	t.Helper()
+	on, tok := *serviceGraphOn, *serviceGraphToken
+	*serviceGraphOn, *serviceGraphToken = true, "/flag/token"
+	t.Cleanup(func() { *serviceGraphOn, *serviceGraphToken = on, tok })
 }

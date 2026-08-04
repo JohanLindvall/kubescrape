@@ -133,10 +133,16 @@ func validateConfig(cfg agentConfig, transformsFile string) error {
 	// address nothing dials — so validating it unconditionally CrashLooped
 	// the whole DaemonSet on a config a real start accepts, from the check
 	// whose purpose is preventing exactly that.
-	if e := cfg.Export; e == nil || e.Logs == nil || e.Metrics == nil || e.Traces == nil {
-		if err := cfg.Export.ApplyBase(baseExportConfig()).Validate(); err != nil {
-			return fmt.Errorf("otlp flags: %w", err)
-		}
+	// The shape AND every merged per-signal destination — exactly the Configs
+	// BuildExporter hands to otlpexport.New. Validating only the shape and the
+	// base left every check that exists ONLY after the merge out of the dry
+	// run (TLS material on a plaintext gRPC destination; the http:// scheme
+	// requirement when the protocol is inherited from -otlp-protocol rather
+	// than declared on the override), so `-check-config` exited 0 in CI and the
+	// same ConfigMap then CrashLooped the fleet at `creating OTLP exporter` —
+	// produced by the check whose whole purpose is preventing that.
+	if err := cfg.Export.ValidateAgainst(baseExportConfig()); err != nil {
+		return err
 	}
 	if _, err := buildAttrs(cfg.ResourceAttributes); err != nil {
 		return fmt.Errorf("resourceAttributes: %w", err)
@@ -217,17 +223,22 @@ func validateConfig(cfg agentConfig, transformsFile string) error {
 	// The SAME merge of flags and section a real start uses, so the dry run
 	// cannot accept a shard set the start rejects (the flags participate: the
 	// chart configures this feature entirely through them).
-	shards, err := serviceGraphShardConfig(cfg.ServiceGraphShards)
-	if err != nil {
-		return err
-	}
-	if err := shards.Validate(); err != nil { // its messages already name the section
-		return err
-	}
-	// Shape-only (no filesystem, no network): file errors surface at the real
-	// start, where the clients are built.
-	if err := cfg.Export.Validate(); err != nil {
-		return fmt.Errorf("export: %w", err)
+	//
+	// Only ON THE TIER, like every other tier-only section. Off it the flags
+	// are empty, so a section supplying one half of the template (replicas
+	// without statefulSet, or the reverse) tripped the half-filled-template
+	// refusal on a workload that never reads the section at all — and one
+	// ConfigMap is shared by the DaemonSet, the events/Azure singleton and the
+	// tier, so a shard set that is valid where it is READ made every other
+	// workload exit 1 at startup. startServiceGraph warns where it is ignored.
+	if *serviceGraphOn {
+		shards, err := serviceGraphShardConfig(cfg.ServiceGraphShards)
+		if err != nil {
+			return err
+		}
+		if err := shards.Validate(); err != nil { // its messages already name the section
+			return err
+		}
 	}
 	if cfg.Routing != nil {
 		for i, rt := range cfg.Routing.Routes {

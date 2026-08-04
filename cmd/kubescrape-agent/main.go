@@ -860,7 +860,12 @@ func run() error {
 		// the pairing state is in-memory and worth no more than the wait window
 		// that bounds it.
 		if p.serviceGraphProc != nil {
-			p.serviceGraphProc.Sweep()
+			// SweepAll, not Sweep: the bounded per-pass budget is sized for the
+			// ingest path, where it protects a mutex every concurrent Consume
+			// needs. Here the receivers have joined and this is the last chance
+			// to promote what is due, so a capped pass silently discarded the
+			// remainder on a busy tier — edges the shutdown path claims to emit.
+			p.serviceGraphProc.SweepAll()
 		}
 		fctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		if err := p.serviceGraphReg.Export(fctx, p.selfOut, p.serviceGraphRes); err != nil {

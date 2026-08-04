@@ -779,6 +779,19 @@ func (b *Buffer) decide(out *outbound, e *bufTrace, now time.Time, reason string
 	b.cache.put(e.id, d.Sampled, now)
 	if !d.Sampled {
 		b.spansDrop.Add(float64(e.spans))
+		// Release the payload. remove() deliberately leaves this entry's
+		// POINTER in its b.order slot to be skipped when it reaches the front,
+		// and compact() only overwrites that prefix once the head passes
+		// halfway — so without this the dropped trace's whole ptrace.Traces
+		// stays reachable from the live slice for roughly one FIFO length of
+		// subsequent decisions. Dropping is the NORMAL mode of a tail sampler,
+		// so that is the steady state: the live heap was up to ~2x what
+		// maxSpans and memory.go's sizing arithmetic promise, which is the
+		// bound that decides whether the buffer OOMs the process it protects.
+		//
+		// The keep branch below gets this for free — MoveAndAppendTo nils the
+		// source slice. This branch has to say it.
+		e.td = ptrace.NewTraces()
 		return 0
 	}
 	n := e.spans

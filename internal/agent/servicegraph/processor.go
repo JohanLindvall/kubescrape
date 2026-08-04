@@ -42,6 +42,12 @@ const (
 	// Consume needs, so one huge push must not stall the shard's ingest for the
 	// length of its own span count; the ticker below picks up any remainder.
 	maxSweepPerBatch = 1024
+	// maxSweepBudgetPerBatch bounds the TOTAL a single Consume may spend across
+	// those passes. Without any cap a pathological batch could sweep for as
+	// long as its span count; with the per-hold ceiling as the only bound the
+	// backlog never drains. This is the compromise: many short holds, bounded
+	// in aggregate.
+	maxSweepBudgetPerBatch = 16384
 
 	// sweepBudget bounds one TICKER Sweep call — cmd/kubescrape-agent's
 	// sweepServiceGraph, whose cadence is wait/2 clamped to [1s, 30s], i.e. 5s
@@ -175,7 +181,19 @@ func (p *Processor) Consume(td ptrace.Traces) {
 	// Incremental expiry on the way in, budgeted by THIS batch's span count —
 	// see sweepFloorPerBatch. SpanCount walks the scopes, not the spans, so it
 	// costs nothing next to the per-span work below.
-	p.store.expire(now, min(td.SpanCount()+sweepFloorPerBatch, maxSweepPerBatch))
+	// maxSweepPerBatch is a PER-LOCK-HOLD ceiling, not a total budget: it exists
+	// so one huge push cannot stall every concurrent Consume for the length of
+	// its own span count. Spending only that much of a larger budget made the
+	// batch scaling a lie — the budget IS the batch's span count, and a batch
+	// carrying more than 1024 unpairable half-edges then expired fewer than it
+	// added, so occupancy climbed past the honest rate x wait working set,
+	// pinned at MaxItems, and the store started refusing arriving spans.
+	// Spend it in ceiling-sized passes, releasing the mutex between them.
+	for budget := min(td.SpanCount()+sweepFloorPerBatch, maxSweepBudgetPerBatch); budget > 0; {
+		n := min(budget, maxSweepPerBatch)
+		p.store.expire(now, n)
+		budget -= n
+	}
 
 	rss := td.ResourceSpans()
 	for i := 0; i < rss.Len(); i++ {
@@ -197,6 +215,23 @@ func (p *Processor) Consume(td ptrace.Traces) {
 // Sweep runs one bounded expiry pass. Safe to call periodically (and cheap when
 // nothing is due); the caller owns the cadence.
 func (p *Processor) Sweep() { p.store.expire(p.now(), sweepBudget) }
+
+// SweepAll expires everything DUE, in bounded passes, releasing the mutex
+// between them.
+//
+// For the SHUTDOWN sweep: that one is not keeping up with ingest, it is the
+// last chance to promote half-edges whose wait elapsed, and a bounded pass
+// silently discarded the remainder on a busy tier — the shutdown path claims
+// to emit them. Nothing is contending the mutex by then (the receivers have
+// joined), but the passes stay bounded so a pathological store cannot hold it
+// for an unbounded stretch inside the shutdown budget.
+func (p *Processor) SweepAll() {
+	now := p.now()
+	// expire returns how many it took; a short pass means nothing more is due
+	// at `now`, so the loop cannot spin.
+	for p.store.expire(now, sweepBudget) == sweepBudget {
+	}
+}
 
 func (p *Processor) observe(span ptrace.Span, resAttrs pcommon.Map, svc string, now time.Time) {
 	var side edgeSide

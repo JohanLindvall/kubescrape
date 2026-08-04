@@ -136,6 +136,13 @@ type Reader struct {
 	lastFlush   time.Time
 	cursor      string // last successfully exported cursor
 	batchCursor string // cursor of the newest buffered entry
+	// pending is the batch converted to OTLP, held across export retries.
+	// converted says whether it is current: an all-dropped batch legitimately
+	// converts to zero records, so the count cannot stand in for the flag.
+	// Converting per ATTEMPT re-ran the log-metrics observation and inflated
+	// user-configured counters by the retry count (see flush).
+	pending   plog.Logs
+	converted bool
 }
 
 type entry struct {
@@ -403,7 +410,18 @@ func (r *Reader) flush(ctx context.Context) error {
 	if len(r.batch) == 0 {
 		return nil
 	}
-	ld := r.convert()
+	// Convert ONCE per batch, not once per export ATTEMPT. convert() runs the
+	// log-metrics observation (and the scrub/enrich/rules chain), so a
+	// transient export failure — a collector rollout, a 503, a deadline — used
+	// to re-observe every record on each retry: configured counters and
+	// histograms over-counted by the number of failed attempts spanning the
+	// batch, permanently biasing cumulative series upward and showing a spike
+	// in rate() during exactly the outage an operator is investigating.
+	if !r.converted {
+		r.pending = r.convert()
+		r.converted = true
+	}
+	ld := r.pending
 	if ld.LogRecordCount() == 0 {
 		// Every entry was dropped by the rules. Committing without exporting is
 		// the tailer's behaviour too: an empty payload still costs a wire RPC
@@ -452,6 +470,9 @@ func (r *Reader) settleBatch() {
 	clear(r.batch)
 	r.batch = r.batch[:0]
 	r.batchBytes = 0
+	// The converted payload belongs to the batch that is now gone.
+	r.pending = plog.NewLogs()
+	r.converted = false
 	r.lastFlush = time.Now()
 	if r.batchCursor != "" {
 		r.cursor = r.batchCursor

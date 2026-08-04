@@ -121,3 +121,41 @@ func (c *metricCapture) sum(name string) float64 {
 	}
 	return total
 }
+
+// convert() runs the log-metrics observation, and flush() used to call it on
+// every export ATTEMPT. So a transient failure — a collector rollout, a 503, a
+// deadline — re-observed every record on each retry: configured counters and
+// histograms over-counted by the number of failed attempts spanning the batch,
+// biasing cumulative series permanently upward and showing a spike in rate()
+// during exactly the outage an operator is investigating.
+//
+// Delivery is at-least-once; OBSERVATION must be exactly-once per record.
+func TestJournaldLogMetricsCountOncePerRecordNotPerAttempt(t *testing.T) {
+	set, err := metrics.NewDynamicMetricSet([]metrics.Dynamic{{
+		Name: "journal_lines_total", Type: metrics.CounterType, Value: "1",
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	entries := []rawEntry{mkEntry("c1", "kubelet.service", "one real line", "6")}
+
+	exp := &captureExporter{failures: 2} // two transient failures, then success
+	r := New(Config{Exporter: exp, FlushInterval: 20 * time.Millisecond, LogMetrics: set})
+	r.open = fakeOpener(entries, false)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { defer close(done); r.Run(ctx) }()
+	t.Cleanup(func() { cancel(); <-done })
+
+	waitFor(t, "the entry exported after the retries", func() bool { return len(exp.records()) == 1 })
+	time.Sleep(60 * time.Millisecond)
+
+	mexp := &metricCapture{}
+	if err := set.Export(context.Background(), mexp, 0); err != nil {
+		t.Fatal(err)
+	}
+	if got := mexp.sum("journal_lines_total"); got != 1 {
+		t.Errorf("journal_lines_total = %v after 2 failed attempts and 1 delivery, want 1 — "+
+			"the record is observed once per export ATTEMPT", got)
+	}
+}

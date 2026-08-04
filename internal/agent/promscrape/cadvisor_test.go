@@ -590,3 +590,58 @@ func TestKubeletTokenSurvivesAFailedReread(t *testing.T) {
 		t.Fatal("an unreadable token file with nothing cached must fail the scrape")
 	}
 }
+
+// A pod whose exposition carries BOTH the pod-cgroup row and the sandbox
+// (container="POD") row of the SAME family produced two data points with
+// identical attribute sets in one metric — which is one series downstream, so
+// the two values (the pod total and the pause container's) collide.
+//
+// The two identities are byte-identical by construction: appendKey's podUID
+// branch omits namespace/pod, and the sandbox's containerID and image are
+// deliberately cleared so the pause row folds into the pod's resource. That
+// fold is intended; what was missing is anything left on the DATA POINT to tell
+// the two apart, because the redundant-label elision removed `id` from both.
+func TestCadvisorSandboxRowIsDistinctFromThePodCgroupRow(t *testing.T) {
+	body := strings.NewReplacer("UID1", uid1, "PAUSECID", pauseCID).Replace(
+		`# TYPE container_memory_working_set_bytes gauge
+container_memory_working_set_bytes{namespace="ns1",pod="pod1",container="",id="/kubepods/burstable/podUID1"} 5.0e+07
+container_memory_working_set_bytes{namespace="ns1",pod="pod1",container="POD",id="/kubepods/burstable/podUID1/PAUSECID"} 5.0e+05
+`)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/cadvisor") {
+			_, _ = w.Write([]byte(body))
+			return
+		}
+		_, _ = w.Write([]byte(""))
+	}))
+	defer srv.Close()
+
+	exp := &captureExporter{}
+	s := newKubeletScraper(t, srv.URL, &fakeMetaSource{}, exp, false)
+	s.cycle(context.Background())
+
+	var points []map[string]any
+	for _, md := range exp.batches {
+		rms := md.ResourceMetrics()
+		for i := range rms.Len() {
+			ms := rms.At(i).ScopeMetrics().At(0).Metrics()
+			for j := range ms.Len() {
+				m := ms.At(j)
+				if m.Name() != "container_memory_working_set_bytes" {
+					continue
+				}
+				dps := m.Gauge().DataPoints()
+				for k := range dps.Len() {
+					points = append(points, dps.At(k).Attributes().AsRaw())
+				}
+			}
+		}
+	}
+	if len(points) != 2 {
+		t.Fatalf("want the pod-cgroup point and the sandbox point, got %d: %v", len(points), points)
+	}
+	if fmt.Sprint(points[0]) == fmt.Sprint(points[1]) {
+		t.Errorf("the two points carry identical attributes %v — they are one series downstream, "+
+			"so the pod total and the pause container's value collide", points[0])
+	}
+}

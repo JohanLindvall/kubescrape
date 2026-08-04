@@ -120,6 +120,16 @@ type cadvisorIdentity struct {
 	podUID, containerID       string
 	image                     string // "image" label, container rows only
 	hasCgroup                 bool   // an "id" label was present
+	// sandbox marks a container="POD" row. It is deliberately NOT part of
+	// appendKey — the pause row still folds into the pod's resource, which is
+	// the intended behaviour — but it must survive to putFilteredLabels: with
+	// the pod-cgroup row of the same family the two identities are otherwise
+	// byte-identical (the podUID key branch omits namespace/pod, and the
+	// sandbox's containerID and image are cleared just below), so both land on
+	// one metric and the redundant-label elision then removes the only labels
+	// that told them apart — two data points with identical attribute sets in
+	// one metric, which is one series downstream.
+	sandbox bool
 }
 
 func (cb *cadvisorBatcher) identityOf(labels []Label) cadvisorIdentity {
@@ -158,6 +168,7 @@ func (cb *cadvisorBatcher) identityOf(labels []Label) cadvisorIdentity {
 	if sandbox {
 		ident.containerID = ""
 		ident.image = ""
+		ident.sandbox = true
 	}
 	return ident
 }
@@ -367,7 +378,7 @@ func (cb *cadvisorBatcher) addNumber(s Sample, monotonic bool) {
 	}
 	dp.SetDoubleValue(s.Value)
 	dp.SetTimestamp(pointTS(s.TimestampMs, cb.scrapeTS))
-	cb.putFilteredLabels(dp.Attributes(), s.Labels, podScoped)
+	cb.putFilteredLabels(dp.Attributes(), s.Labels, podScoped, ident.sandbox)
 	cb.points++
 	cb.bytes += numberBytes(s)
 }
@@ -388,7 +399,7 @@ func (cb *cadvisorBatcher) addHistogram(family string, acc *histAcc) {
 	dp.SetStartTimestamp(cb.startTS)
 	dp.SetTimestamp(pointTS(acc.ts, cb.scrapeTS))
 	fillHistogramPoint(dp, acc)
-	cb.putFilteredLabels(dp.Attributes(), acc.labels, podScoped)
+	cb.putFilteredLabels(dp.Attributes(), acc.labels, podScoped, ident.sandbox)
 	cb.points++
 	cb.bytes += histBytes(acc)
 }
@@ -409,14 +420,19 @@ func (cb *cadvisorBatcher) addSummary(family string, acc *summAcc) {
 	dp.SetStartTimestamp(cb.startTS)
 	dp.SetTimestamp(pointTS(acc.ts, cb.scrapeTS))
 	fillSummaryPoint(dp, acc)
-	cb.putFilteredLabels(dp.Attributes(), acc.labels, podScoped)
+	cb.putFilteredLabels(dp.Attributes(), acc.labels, podScoped, ident.sandbox)
 	cb.points++
 	cb.bytes += summBytes(acc)
 }
 
-func (cb *cadvisorBatcher) putFilteredLabels(attrs pcommon.Map, labels []Label, podScoped bool) {
+func (cb *cadvisorBatcher) putFilteredLabels(attrs pcommon.Map, labels []Label, podScoped, sandbox bool) {
 	for _, l := range labels {
-		if isIdentityLabel(l.Name) || (podScoped && redundantOnPodRow(l.Name)) {
+		// `id` is kept on a SANDBOX row: it is the one label distinguishing the
+		// pause point from the pod-cgroup point of the same family, which share
+		// a resource by design. Eliding it left two data points with identical
+		// attributes in one metric.
+		keepSandboxID := sandbox && l.Name == "id"
+		if isIdentityLabel(l.Name) || (podScoped && redundantOnPodRow(l.Name) && !keepSandboxID) {
 			continue
 		}
 		attrs.PutStr(l.Name, l.Value)

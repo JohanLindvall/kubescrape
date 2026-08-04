@@ -112,6 +112,13 @@ func (p *pipelines) startServiceGraph(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("-service-graph-token-file: %w", err)
 	}
+	// The clock-driven half of that parity, which this call site did NOT have:
+	// Tokens() re-reads only when called, so on a listener between pushes a
+	// rotation went unnoticed until the next request, which armed the revoked
+	// token's grace window at THAT moment — accepting it far past the five
+	// minutes the model documents, indefinitely while the listener stayed
+	// quiet. The comment above claimed the parity; only Run delivers it.
+	go tok.Run(ctx)
 
 	proc := servicegraph.NewProcessor(cfg, p.log)
 	reg := servicegraph.NewRegistry(cfg)

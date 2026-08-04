@@ -161,6 +161,13 @@ func PodMonitorTargets(pod kubemeta.Pod, monitor string, ep servicemonitors.Endp
 
 // containerPortByName finds a declared container port by name.
 func containerPortByName(pod kubemeta.Pod, name string) (int32, bool) {
+	// The empty-name check is NOT a redundant nil-guard, and must not be
+	// removed as one: it is the phantom-target guard PodMonitorTargets depends
+	// on. That path passes a degenerate string targetPort straight here, so
+	// without it an endpoint with `targetPort: ""` would match the first
+	// UNNAMED container port and mint a scrape target the user never declared.
+	// MonitorTargets states the same precondition explicitly at its own call
+	// site; this is where the PodMonitor half of it lives.
 	if name == "" {
 		return 0, false
 	}

@@ -90,7 +90,15 @@ func ParsePodMonitor(u *unstructured.Unstructured) (*PodMonitor, error) {
 	return m, nil
 }
 
-// UpsertPodMonitor parses and stores a PodMonitor.
+// UpsertPodMonitor parses and stores a PodMonitor. Like Upsert, a monitor
+// UPDATED to an unparseable spec is REMOVED rather than kept: silently serving
+// the previous version forever would diverge from what the manifest declares
+// (prometheus-operator likewise generates no config for an invalid monitor).
+//
+// That matters more here than the symmetry suggests — the endpoints being
+// dropped carry the bearerTokenSecret refs AuthSecretRefs allowlists, so a
+// stale one would keep /v1/scrape-auth willing to serve a Secret the live spec
+// no longer names. The rule was documented on Upsert and only implied here.
 func (x *Index) UpsertPodMonitor(u *unstructured.Unstructured) error {
 	m, err := ParsePodMonitor(u)
 	x.mu.Lock()

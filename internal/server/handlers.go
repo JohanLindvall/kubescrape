@@ -438,11 +438,11 @@ func (s *Server) handleScrapeAuth(w http.ResponseWriter, r *http.Request) {
 			// and each one would log a line, forever. The counter is the
 			// alerting signal; the log only has to say it once in a while, and
 			// per REF so a second broken credential is not masked by the first.
-			if s.shouldWarnScrapeAuth(ns + "/" + name + "/" + key) {
+			s.warnScrapeAuth("read:"+ns+"/"+name+"/"+key, func() {
 				s.log().Warn("resolving scrape-auth secret",
 					"namespace", ns, "name", name, "key", key, "error", err,
 					"note", "further failures for this ref are suppressed for "+scrapeAuthWarnEvery.String())
-			}
+			})
 			w.Header().Set("Retry-After", "5")
 		}
 		obs.ScrapeAuthFailures.WithLabelValues(reason).Inc()
@@ -458,8 +458,15 @@ func (s *Server) handleScrapeAuth(w http.ResponseWriter, r *http.Request) {
 	// agent would have to learn in lockstep.
 	if !utf8.ValidString(val) {
 		obs.ScrapeAuthFailures.WithLabelValues("not_utf8").Inc()
-		s.log().Warn("scrape-auth secret value is not valid UTF-8 and cannot be served as JSON",
-			"namespace", ns, "name", name, "key", key)
+		// Throttled through the same table as the failure above, but under its
+		// OWN key prefix: sharing the bare ref let a class transition (an RBAC
+		// gap fixed, revealing a non-UTF-8 value) be swallowed for the whole
+		// window, reporting neither condition.
+		s.warnScrapeAuth("utf8:"+ns+"/"+name+"/"+key, func() {
+			s.log().Warn("scrape-auth secret value is not valid UTF-8 and cannot be served as JSON",
+				"namespace", ns, "name", name, "key", key,
+				"note", "further failures for this ref are suppressed for "+scrapeAuthWarnEvery.String())
+		})
 		writeError(w, http.StatusUnprocessableEntity, fmt.Sprintf(
 			"secret %s/%s key %s is not valid UTF-8; kubescrape serves credentials as JSON strings",
 			ns, name, key))

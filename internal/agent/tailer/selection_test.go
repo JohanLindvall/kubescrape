@@ -63,6 +63,48 @@ func TestSourceLabelSelector(t *testing.T) {
 	}
 }
 
+// Kubernetes selector semantics: the key must be PRESENT, not merely compare
+// equal. A bare `lbls[k] != v` reads a MISSING key as "", so a selector entry
+// with an empty value matched every pod lacking the label entirely — the
+// opposite of the intent, and indistinguishable from a pod that genuinely
+// carries `key: ""`.
+//
+// This is the case the suite above did not cover, which is why the matcher
+// carried the bug while the metadata service's twin (services.selects) had the
+// presence check and a comment explaining it from the start.
+func TestSourceSelectorEmptyValueRequiresThePresentLabel(t *testing.T) {
+	cs := compileSources([]Source{{
+		Containerd: true,
+		Selector:   map[string]string{"tenant": ""},
+	}}, "/var/log/containers", true)[0]
+
+	if cs.wantLabels(nil) {
+		t.Error("a pod with NO labels must not match selector {tenant: \"\"}")
+	}
+	if cs.wantLabels(map[string]string{"other": "x"}) {
+		t.Error("a pod lacking the selector key must not match selector {tenant: \"\"}")
+	}
+	if !cs.wantLabels(map[string]string{"tenant": ""}) {
+		t.Error("a pod that genuinely carries tenant=\"\" must match")
+	}
+	if cs.wantLabels(map[string]string{"tenant": "acme"}) {
+		t.Error("a pod with a different value must not match")
+	}
+
+	// The same distinction inside a multi-key selector, where the empty-valued
+	// entry is the one that must still be checked for presence.
+	both := compileSources([]Source{{
+		Containerd: true,
+		Selector:   map[string]string{"app": "api", "tenant": ""},
+	}}, "/var/log/containers", true)[0]
+	if both.wantLabels(map[string]string{"app": "api"}) {
+		t.Error("the empty-valued selector key must still require presence")
+	}
+	if !both.wantLabels(map[string]string{"app": "api", "tenant": ""}) {
+		t.Error("both keys present and equal must match")
+	}
+}
+
 // A malformed namespace pattern must fail startup. path.Match returns
 // ErrBadPattern for EVERY input when the pattern is bad, and wantNamespace
 // reads that as "no match" — so an unvalidated typo silently collects NOTHING

@@ -59,3 +59,41 @@ func TestMonitorPortWinsOverTargetPort(t *testing.T) {
 		t.Fatalf("unresolvable port fell back to targetPort: %+v", ts)
 	}
 }
+
+// The same degenerate targetPort values through the POD MONITOR path, which
+// reaches containerPortByName directly instead of through monitorPodPort's
+// explicit Type/StrVal precondition. Only the ServiceMonitor arm was covered,
+// so deleting containerPortByName's empty-name guard passed the whole suite
+// while making this path fabricate targets against an unnamed container port.
+func TestPodMonitorDegenerateTargetPortNoPhantom(t *testing.T) {
+	pod := basePod()
+	pod.Containers[0].Ports = append(pod.Containers[0].Ports,
+		kubemeta.ContainerPort{Name: "", Port: 6666})
+
+	for name, tp := range map[string]intstr.IntOrString{
+		"int-zero":     intstr.FromInt32(0),
+		"int-negative": intstr.FromInt32(-1),
+		"int-overflow": {Type: intstr.Int, IntVal: 70000},
+		"string-empty": intstr.FromString(""),
+	} {
+		if ts := PodMonitorTargets(pod, "ns/pm", servicemonitors.Endpoint{TargetPort: &tp}); ts != nil {
+			t.Fatalf("%s targetPort fabricated a target: %+v", name, ts)
+		}
+	}
+	// Neither port nor targetPort: caught by PodMonitorTargets' OWN early
+	// guard, before containerPortByName is reached. Kept here to bracket the
+	// degenerate set, not because it exercises the empty-name guard above.
+	if ts := PodMonitorTargets(pod, "ns/pm", servicemonitors.Endpoint{}); ts != nil {
+		t.Fatalf("empty endpoint fabricated a target: %+v", ts)
+	}
+
+	// A real name still resolves, and a real number still resolves.
+	named := intstr.FromString("web")
+	if ts := PodMonitorTargets(pod, "ns/pm", servicemonitors.Endpoint{TargetPort: &named}); len(ts) != 1 {
+		t.Fatalf("named targetPort broke: %+v", ts)
+	}
+	num := intstr.FromInt32(9090)
+	if ts := PodMonitorTargets(pod, "ns/pm", servicemonitors.Endpoint{TargetPort: &num}); len(ts) != 1 || ts[0].Port != 9090 {
+		t.Fatalf("numeric targetPort broke: %+v", ts)
+	}
+}

@@ -10,9 +10,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -177,5 +179,75 @@ func TestScrapeAuthServesValidValues(t *testing.T) {
 	n, _ := res.Body.Read(buf)
 	if body := string(buf[:n]); !strings.Contains(body, token) {
 		t.Errorf("body %q does not carry the token", body)
+	}
+}
+
+// countingHandler counts emitted records.
+type countingHandler struct {
+	mu sync.Mutex
+	n  int
+}
+
+func (h *countingHandler) Enabled(context.Context, slog.Level) bool { return true }
+func (h *countingHandler) Handle(context.Context, slog.Record) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.n++
+	return nil
+}
+func (h *countingHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
+func (h *countingHandler) WithGroup(string) slog.Handler      { return h }
+func (h *countingHandler) count() int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.n
+}
+
+// The scrape-auth failure log is throttled because an RBAC grant that was never
+// added is a STEADY state: every agent on every node re-asks each cycle.
+//
+// The bound must not turn into a storm. Clearing the table when it fills looks
+// bounded ("re-warns once per refill") and is not: at cap+1 distinct refs it
+// re-fills, overflows and clears on every cycle, so all of them print every
+// cycle forever — worse than the unbounded map. The agent's twin had already
+// established that and written it down; this side had the clearing version.
+func TestScrapeAuthWarnDoesNotStormAtTheCap(t *testing.T) {
+	h := &countingHandler{}
+	s := New(Config{Log: slog.New(h)})
+
+	for cycle := range 4 {
+		_ = cycle
+		for i := range maxScrapeAuthWarnRefs + 1 {
+			s.warnScrapeAuth(fmt.Sprintf("ns/name/key%d", i), func() {
+				s.log().Warn("resolving scrape-auth secret")
+			})
+		}
+	}
+	// At most one line per distinct ref plus the single saturation notice. A
+	// clearing table emits (cap+1) x 4.
+	if got, max := h.count(), maxScrapeAuthWarnRefs+1; got > max {
+		t.Errorf("logged %d lines for %d distinct refs over 4 cycles (max %d); the table is re-warning every cycle",
+			got, maxScrapeAuthWarnRefs+1, max)
+	}
+	// And it must not have gone silent either.
+	if h.count() == 0 {
+		t.Error("no warning was logged at all")
+	}
+}
+
+// One ref logs once per window, not once per request.
+func TestScrapeAuthWarnThrottlesPerRef(t *testing.T) {
+	h := &countingHandler{}
+	s := New(Config{Log: slog.New(h)})
+	for range 50 {
+		s.warnScrapeAuth("ns/tok/token", func() { s.log().Warn("x") })
+	}
+	if h.count() != 1 {
+		t.Errorf("logged %d times for one ref, want 1", h.count())
+	}
+	// A DIFFERENT ref is not masked by the first.
+	s.warnScrapeAuth("ns/other/key", func() { s.log().Warn("x") })
+	if h.count() != 2 {
+		t.Errorf("a second ref did not log: count=%d, want 2", h.count())
 	}
 }

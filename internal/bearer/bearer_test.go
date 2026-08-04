@@ -1,6 +1,7 @@
 package bearer
 
 import (
+	"context"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -252,5 +253,78 @@ func TestAuthorized(t *testing.T) {
 	// reject, and "" would otherwise match an empty presented token.
 	if Authorized("Bearer  ", []string{""}) {
 		t.Error("an empty candidate must never authorize")
+	}
+}
+
+// Run is what makes the rotation contract hold on a listener with NO traffic.
+// Tokens() re-reads only when called, and it arms the grace window at that
+// moment — so without a clock, a rotation on a quiet receiver is noticed by the
+// first request AFTER it and the revoked token stays accepted far past the
+// documented grace. That is not hypothetical: the ticker was hand-rolled at one
+// call site and simply absent at another (the trace tier's authenticated hop),
+// which is why the loop now belongs to the type rather than to whoever
+// remembers.
+func TestRotatingRunPicksUpRotationWithoutTraffic(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "token")
+	if err := os.WriteFile(path, []byte("first"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	r, err := NewRotating(path, discard(), WithInterval(5*time.Millisecond), WithGrace(time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Observe the state WITHOUT calling Tokens(). Tokens() re-reads when stale
+	// itself, so a test that polls through it passes with Run doing nothing at
+	// all — which is exactly what the first version of this test did. Reading
+	// the fields under the mutex is what makes the ticker the only thing that
+	// can move them.
+	state := func() (cur, prev string) {
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		return r.cur, r.prev
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go r.Run(ctx)
+
+	if err := os.WriteFile(path, []byte("second"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if cur, prev := state(); cur == "second" {
+			// The predecessor must still be accepted for the grace window, or
+			// the two ends would have to flip in lockstep.
+			if prev != "first" {
+				t.Fatalf("the previous token was not retained (prev=%q); the grace window did not arm", prev)
+			}
+			return
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	t.Fatal("Run did not pick up the rotated token without request traffic")
+}
+
+// Run must stop with its context, or every receiver leaks a ticker goroutine.
+func TestRotatingRunStopsWithContext(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "token")
+	if err := os.WriteFile(path, []byte("tok"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	r, err := NewRotating(path, discard(), WithInterval(time.Millisecond))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { r.Run(ctx); close(done) }()
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run did not return when its context was cancelled")
 	}
 }

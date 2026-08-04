@@ -19,6 +19,7 @@ import (
 
 	"github.com/JohanLindvall/kubescrape/internal/agent/attrs"
 	"github.com/JohanLindvall/kubescrape/internal/bearer"
+	"github.com/JohanLindvall/kubescrape/internal/logdedupe"
 	"github.com/JohanLindvall/kubescrape/internal/obs"
 	"github.com/JohanLindvall/kubescrape/pkg/kubemeta"
 )
@@ -137,10 +138,11 @@ type Scraper struct {
 	dueMu           sync.Mutex
 	due             map[string]time.Time
 	targetIntervals map[string]time.Duration
-	warned          map[string]bool
-	// warnSaturated records that maxWarnKeys was reached, so the notice is
-	// logged once rather than per suppressed warning.
-	warnSaturated bool
+	// warned dedupes per-target complaints. The table (and its
+	// suppress-never-clear saturation policy) is internal/logdedupe, shared
+	// with the metadata service's scrape-auth throttle — the two were written
+	// separately and disagreed on exactly that policy.
+	warned *logdedupe.Table
 
 	// insecureHTTP serves monitor endpoints with tlsConfig.insecureSkipVerify.
 	insecureHTTP *http.Client
@@ -414,39 +416,28 @@ var promDurationRE = regexp.MustCompile(`^(?:([0-9]+)y)?(?:([0-9]+)w)?(?:([0-9]+
 // healthy cluster holds a handful of them; the cap only catches a pathological
 // generator (thousands of monitors, each with its own typo).
 //
-// Reaching it SUPPRESSES further keys and says so once. Clearing the table
-// instead — the intuitive choice, on the grounds that a cleared table re-warns
-// at a bounded rate — is not bounded at all: at cap+1 distinct keys every
-// cycle re-fills, overflows and clears again, so all 1025 warnings print on
-// EVERY scrape cycle, forever. That is worse than the unbounded map it
-// replaced. An operator holding 1024 distinct configuration warnings has
-// plenty to act on, and the saturation line tells them the list is truncated.
+// Reaching it SUPPRESSES further keys and says so once — see internal/logdedupe
+// for why clearing instead is worse than the unbounded map it replaced.
 const maxWarnKeys = 1024
 
 // warnOnce logs a per-key message at most once per process, for per-target
-// complaints that would otherwise repeat every cycle forever.
+// complaints that would otherwise repeat every cycle forever. A zero re-warn
+// window is what makes it "once": the operator has to edit a CR, and until they
+// do there is nothing new to say.
 func (s *Scraper) warnOnce(key, msg string, args ...any) {
 	s.dueMu.Lock()
 	if s.warned == nil {
-		s.warned = map[string]bool{}
+		s.warned = logdedupe.New(maxWarnKeys, 0)
 	}
-	seen := s.warned[key]
-	saturated := false
-	if !seen {
-		if len(s.warned) >= maxWarnKeys {
-			seen = true // suppress: the table is full
-			saturated = !s.warnSaturated
-			s.warnSaturated = true
-		} else {
-			s.warned[key] = true
-		}
-	}
+	tab := s.warned
 	s.dueMu.Unlock()
+
+	allow, saturated := tab.Allow(key)
 	if saturated {
 		s.log.Warn("scrape warning dedupe table is full; further distinct warnings are suppressed",
 			"keys", maxWarnKeys)
 	}
-	if !seen {
+	if allow {
 		s.log.Warn(msg, args...)
 	}
 }

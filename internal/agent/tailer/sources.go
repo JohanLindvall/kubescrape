@@ -169,9 +169,25 @@ func (s *compiledSource) wantNamespace(ns string) bool {
 
 // wantLabels reports whether a pod's labels satisfy the source's selector
 // (every key=value must match; an empty selector accepts everything).
+//
+// Kubernetes selector semantics: the key must be PRESENT and equal. A bare
+// `lbls[k] != v` — which this was — reads a MISSING key as "", so a selector
+// entry with an empty value matched every pod lacking the label entirely, i.e.
+// the opposite of the intent, and indistinguishably from a pod that genuinely
+// carries `key: ""`.
+//
+// The metadata service's services.selects was born with the SAME bare form and
+// was corrected later; this copy was not, because nothing connected the two.
+// That is the whole drift story in one function: a bug fixed once in a codebase
+// that contained it twice, with no compile error, no failing test and no
+// grep-able link to say the other copy existed.
+//
+// Fixed in place rather than shared: two call sites in two binaries for four
+// lines does not earn a package, and the semantic is now written down at both.
 func (s *compiledSource) wantLabels(lbls map[string]string) bool {
 	for k, v := range s.selector {
-		if lbls[k] != v {
+		got, ok := lbls[k]
+		if !ok || got != v {
 			return false
 		}
 	}

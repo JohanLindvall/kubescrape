@@ -36,6 +36,7 @@
 package bearer
 
 import (
+	"context"
 	"crypto/subtle"
 	"errors"
 	"fmt"
@@ -248,15 +249,41 @@ func NewRotating(path string, log *slog.Logger, opts ...Option) (*Rotating, erro
 	return r, nil
 }
 
+// Run drives the re-read from a CLOCK until ctx is done. Every receiver that
+// holds a Rotating should run it.
+//
+// It lives here rather than at the call sites because it is not optional and it
+// is invisible when missing. Tokens() re-reads only when CALLED, and the grace
+// window is armed at that moment — so on a listener with no traffic, a rotation
+// is noticed by the first request AFTER it, which anchors the revoked token's
+// grace window at that request instead of within one interval of the file
+// change and stretches its acceptance far past the documented window. A
+// receiver that simply never got the ticker therefore keeps accepting a revoked
+// token indefinitely, with nothing to show for it.
+//
+// That is not hypothetical: it was written as a goroutine at one call site and
+// forgotten at another, and the forgotten one was the authenticated internal
+// hop of the trace tier. Making it a method of the type that owns the rotation
+// contract is what stops the next receiver from having to remember.
+func (r *Rotating) Run(ctx context.Context) {
+	ticker := time.NewTicker(r.set.interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			r.Tokens()
+		}
+	}
+}
+
 // Tokens returns the accepted set, re-reading the file when stale. A failed or
 // empty re-read keeps the last good value: a transient error during a Secret
 // swap must not 401 the whole fleet.
 //
-// Callers also drive this from a ticker rather than only from request traffic.
-// Lazily-only, a rotation on a quiet endpoint would be noticed by the first
-// request AFTER it — anchoring the revoked token's grace window at that request
-// instead of within one interval of the file change, and stretching its
-// acceptance far past the documented window.
+// Run drives this from a ticker so a quiet listener still notices a rotation
+// within one interval; request traffic re-reads it too.
 func (r *Rotating) Tokens() []string {
 	r.mu.Lock()
 	defer r.mu.Unlock()

@@ -123,10 +123,16 @@ func TestParseErrors(t *testing.T) {
 func TestIndex(t *testing.T) {
 	ix := NewIndex()
 	if err := ix.Upsert(monitorObj("ns", "a", map[string]any{
-		"selector":  map[string]any{"matchLabels": map[string]any{"app": "a"}},
-		"endpoints": []any{map[string]any{"port": "http"}},
+		"selector": map[string]any{"matchLabels": map[string]any{"app": "a"}},
+		"endpoints": []any{map[string]any{
+			"port":              "http",
+			"bearerTokenSecret": map[string]any{"name": "tok", "key": "token"},
+		}},
 	})); err != nil {
 		t.Fatal(err)
+	}
+	if _, ok := ix.AuthSecretRefs()["ns/tok/token"]; !ok {
+		t.Fatal("setup: the endpoint's secret ref should be allowlisted")
 	}
 	if err := ix.Upsert(monitorObj("ns", "b", map[string]any{
 		"selector":  map[string]any{"matchLabels": map[string]any{"app": "b"}},
@@ -176,6 +182,13 @@ func TestIndexUnparseableUpdateRemoves(t *testing.T) {
 	}
 	if got := ix.All(); len(got) != 0 {
 		t.Fatalf("stale monitor still served after unparseable update: %d", len(got))
+	}
+	// And the allowlist shrinks with it: the refused spec must not keep a
+	// Secret reachable through /v1/scrape-auth. The PodMonitor mirror asserts
+	// the same thing, and it is the assertion that survives a mutation which
+	// merely memoizes AuthSecretRefs without invalidating it here.
+	if n := len(ix.AuthSecretRefs()); n != 0 {
+		t.Errorf("the removed monitor's secret refs are still allowlisted: %d", n)
 	}
 }
 

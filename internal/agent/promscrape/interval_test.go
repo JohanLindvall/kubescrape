@@ -112,8 +112,8 @@ func TestWarnOnceSurvivesPodRestarts(t *testing.T) {
 	if h.n != 1 {
 		t.Errorf("logged %d warnings across 500 pod incarnations of one monitor, want 1", h.n)
 	}
-	if len(s.warned) != 1 {
-		t.Errorf("dedupe table holds %d keys, want 1: it grows per pod incarnation", len(s.warned))
+	if s.warned.Len() != 1 {
+		t.Errorf("dedupe table holds %d keys, want 1: it grows per pod incarnation", s.warned.Len())
 	}
 
 	// A genuinely different problem still gets through: another monitor, and
@@ -160,10 +160,10 @@ func TestWarnOnceTableIsBounded(t *testing.T) {
 	for i := 0; i < maxWarnKeys*3; i++ {
 		s.warnOnce(fmt.Sprintf("k%d", i), "msg")
 	}
-	if len(s.warned) > maxWarnKeys {
-		t.Errorf("dedupe table holds %d keys, want <= %d", len(s.warned), maxWarnKeys)
+	if s.warned.Len() > maxWarnKeys {
+		t.Errorf("dedupe table holds %d keys, want <= %d", s.warned.Len(), maxWarnKeys)
 	}
-	if len(s.warned) == 0 {
+	if s.warned.Len() == 0 {
 		t.Error("dedupe table emptied itself: every warning would re-fire every cycle")
 	}
 }

@@ -667,24 +667,14 @@ func run() error {
 			return err
 		}
 		scrapeAuthTokens = rt.Tokens
-		// Detection runs on a CLOCK, not only on request traffic: lazily-only,
-		// a rotation on a quiet endpoint would be noticed by the first request
-		// AFTER it — anchoring the previous (revoked) token's grace window at
-		// that request instead of within a minute of the file change, and
-		// stretching its acceptance far past the documented 5 minutes.
+		// Detection runs on a CLOCK, not only on request traffic — see
+		// bearer.Rotating.Run, which owns that decision now. It was a goroutine
+		// here and nowhere else, and the receiver that did not copy it (the
+		// trace tier's authenticated hop) accepted a revoked token indefinitely.
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			ticker := time.NewTicker(bearer.DefaultReadInterval)
-			defer ticker.Stop()
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				case <-ticker.C:
-					rt.Tokens()
-				}
-			}
+			rt.Run(ctx)
 		}()
 		secretReader = &k8sSecretReader{client: client}
 		log.Info("scrape auth secrets enabled", "tokenFile", *scrapeAuthTokenFile)

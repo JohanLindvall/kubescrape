@@ -15,6 +15,7 @@ import (
 
 	"github.com/cespare/xxhash/v2"
 
+	"github.com/JohanLindvall/kubescrape/internal/logdedupe"
 	"github.com/JohanLindvall/kubescrape/internal/obs"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -127,11 +128,9 @@ type Server struct {
 	monBuiltAt time.Time
 	monBuilds  atomic.Int64
 
-	// warnedAt throttles the per-ref scrape-auth failure log (see
-	// shouldWarnScrapeAuth); the requests it serves are concurrent, so it has
-	// its own mutex rather than sharing monMu.
-	warnMu   sync.Mutex
-	warnedAt map[string]time.Time
+	// warnRefs throttles the per-ref scrape-auth failure log. It is
+	// concurrency-safe on its own, so it needs no mutex here.
+	warnRefs *logdedupe.Table
 }
 
 // New creates a Server.
@@ -153,6 +152,7 @@ func New(cfg Config) *Server {
 		ready:            cfg.Ready,
 		now:              time.Now,
 		logger:           cfg.Log,
+		warnRefs:         logdedupe.New(maxScrapeAuthWarnRefs, scrapeAuthWarnEvery),
 	}
 }
 
@@ -171,38 +171,29 @@ func (s *Server) log() *slog.Logger {
 // the log only has to name the ref often enough to be found.
 const scrapeAuthWarnEvery = 5 * time.Minute
 
-// maxScrapeAuthWarnRefs bounds the throttle map. Keys come from the
+// maxScrapeAuthWarnRefs bounds the throttle table. Keys come from the
 // AuthSecretRefs allowlist, so they are already bounded by the indexed monitors
 // — this is belt and braces against a monitor set that churns.
 const maxScrapeAuthWarnRefs = 1024
 
-// shouldWarnScrapeAuth reports whether this ref may log now, and records that
-// it did.
-func (s *Server) shouldWarnScrapeAuth(ref string) bool {
-	now := s.now()
-	s.warnMu.Lock()
-	defer s.warnMu.Unlock()
-	if last, ok := s.warnedAt[ref]; ok && now.Sub(last) < scrapeAuthWarnEvery {
-		return false
+// warnScrapeAuth throttles the per-ref scrape-auth failure log, emitting the
+// one-time saturation notice when the table fills.
+//
+// The saturation POLICY — suppress further keys, never clear the table — lives
+// in internal/logdedupe, along with the reason. This file had its own copy that
+// cleared when full, which at cap+1 distinct refs re-fills, overflows and
+// clears on every cycle: the flood the throttle exists to prevent, re-armed,
+// and silently. The agent had already reached the opposite conclusion and
+// written it down; now there is one table type and one answer.
+func (s *Server) warnScrapeAuth(ref string, emit func()) {
+	allow, saturated := s.warnRefs.Allow(ref)
+	if saturated {
+		s.log().Warn("scrape-auth warning dedupe table is full; further distinct refs are suppressed",
+			"refs", maxScrapeAuthWarnRefs)
 	}
-	if s.warnedAt == nil {
-		s.warnedAt = make(map[string]time.Time)
+	if allow {
+		emit()
 	}
-	if len(s.warnedAt) >= maxScrapeAuthWarnRefs {
-		// Drop whatever has aged out rather than growing without bound; if
-		// nothing has, clear it — a map this size means churn, and losing the
-		// suppression state costs one extra line per ref.
-		for k, t := range s.warnedAt {
-			if now.Sub(t) >= scrapeAuthWarnEvery {
-				delete(s.warnedAt, k)
-			}
-		}
-		if len(s.warnedAt) >= maxScrapeAuthWarnRefs {
-			clear(s.warnedAt)
-		}
-	}
-	s.warnedAt[ref] = now
-	return true
 }
 
 // Handler returns the HTTP routes.

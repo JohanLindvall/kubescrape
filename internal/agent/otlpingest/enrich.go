@@ -275,8 +275,11 @@ func (e *Enricher) EnrichMetrics(ctx context.Context, md pmetric.Metrics) pmetri
 		e.enrichMetricResources(ctx, md)
 		return md
 	default: // auto
-		if e.resourceModeSuffices(md) {
-			e.enrichMetricResources(ctx, md)
+		// One cache for the decision AND the enrichment that follows, so the
+		// resolvability probes the decision makes are not paid for twice.
+		cache := map[string]pcommon.Map{}
+		if e.resourceModeSuffices(ctx, cache, md) {
+			e.enrichMetricResourcesWith(ctx, cache, md)
 			return md
 		}
 		return e.splitAndEnrich(ctx, md)
@@ -286,7 +289,12 @@ func (e *Enricher) EnrichMetrics(ctx context.Context, md pmetric.Metrics) pmetri
 // enrichMetricResources enriches each ResourceMetrics from its own resource
 // attributes.
 func (e *Enricher) enrichMetricResources(ctx context.Context, md pmetric.Metrics) {
-	cache := map[string]pcommon.Map{}
+	e.enrichMetricResourcesWith(ctx, map[string]pcommon.Map{}, md)
+}
+
+// enrichMetricResourcesWith is enrichMetricResources against a caller-supplied
+// cache, so the auto-mode decision's lookups are reused.
+func (e *Enricher) enrichMetricResourcesWith(ctx context.Context, cache map[string]pcommon.Map, md pmetric.Metrics) {
 	rms := md.ResourceMetrics()
 	for i := 0; i < rms.Len(); i++ {
 		e.enrichResource(ctx, rms.At(i).Resource(), cache)
@@ -308,7 +316,7 @@ func (e *Enricher) enrichMetricResources(ctx context.Context, md pmetric.Metrics
 // kubescrape_ingest_resources_total{enriched} reading healthy. The same payload
 // in explicit datapoint mode split correctly, which is what
 // TestSplitResourceUsesDescribedObjectIdentity pins.
-func (e *Enricher) resourceModeSuffices(md pmetric.Metrics) bool {
+func (e *Enricher) resourceModeSuffices(ctx context.Context, cache map[string]pcommon.Map, md pmetric.Metrics) bool {
 	rms := md.ResourceMetrics()
 	for i := 0; i < rms.Len(); i++ {
 		rm := rms.At(i)
@@ -324,7 +332,7 @@ func (e *Enricher) resourceModeSuffices(md pmetric.Metrics) bool {
 		// points and OVERWROTE its service.name/k8s.* with the derived ones
 		// (overwriteAttrs, correct only for a describing exporter), so an
 		// ordinary sender silently changed job identity by adding a label.
-		if e.anyForeignDataPointID(rm, resID) {
+		if e.anyForeignDataPointID(ctx, cache, rm, resID) {
 			return false
 		}
 	}
@@ -333,12 +341,12 @@ func (e *Enricher) resourceModeSuffices(md pmetric.Metrics) bool {
 
 // anyForeignDataPointID reports whether any data point in rm carries an ID
 // attribute naming a DIFFERENT object than resID (one pass, first hit wins).
-func (e *Enricher) anyForeignDataPointID(rm pmetric.ResourceMetrics, resID string) bool {
+func (e *Enricher) anyForeignDataPointID(ctx context.Context, cache map[string]pcommon.Map, rm pmetric.ResourceMetrics, resID string) bool {
 	sms := rm.ScopeMetrics()
 	for i := 0; i < sms.Len(); i++ {
 		ms := sms.At(i).Metrics()
 		for j := 0; j < ms.Len(); j++ {
-			if e.metricPointsHaveForeignID(ms.At(j), resID) {
+			if e.metricPointsHaveForeignID(ctx, cache, ms.At(j), resID) {
 				return true
 			}
 		}
@@ -346,10 +354,10 @@ func (e *Enricher) anyForeignDataPointID(rm pmetric.ResourceMetrics, resID strin
 	return false
 }
 
-func (e *Enricher) metricPointsHaveForeignID(m pmetric.Metric, resID string) bool {
+func (e *Enricher) metricPointsHaveForeignID(ctx context.Context, cache map[string]pcommon.Map, m pmetric.Metric, resID string) bool {
 	has := func(a pcommon.Map) bool {
 		tok, ok := e.findID(a)
-		return ok && tok != resID
+		return ok && e.foreignID(ctx, cache, tok, resID)
 	}
 	switch m.Type() {
 	case pmetric.MetricTypeGauge:
@@ -410,9 +418,10 @@ func (e *Enricher) applyMetadata(ctx context.Context, a pcommon.Map, cache map[s
 			mergeAttrs(built, a)
 			return true
 		}
-		// A rejected peer has already been counted under its own outcome; it must
-		// not tally a second time here (this counter is per RESOURCE).
-		if !rejected {
+		// Per RESOURCE, like every other outcome of this counter.
+		if rejected {
+			obs.Ingested.WithLabelValues("peer_ip_rejected").Inc()
+		} else {
 			obs.Ingested.WithLabelValues("unresolved").Inc()
 		}
 		return false
@@ -618,7 +627,13 @@ func (e *Enricher) peerAttrs(ctx context.Context, cache map[string]pcommon.Map) 
 			// would be wrong in the worst way — confident, plausible, and
 			// wrong on every resource — so nothing is merged.
 			rejected = true
-			obs.Ingested.WithLabelValues("peer_ip_rejected").Inc()
+			// NOT counted here: peerAttrs memoises per REQUEST, and every
+			// sibling outcome (enriched, unresolved, peer_ip) is counted per
+			// RESOURCE. Counting it here made one label of one metric mean a
+			// different denominator from the rest, so the ratios an operator
+			// builds from them were wrong on any multi-resource push. The
+			// caller tallies it; the warn stays here, where its once-per-request
+			// throttle is what is wanted.
 			e.warnPeerRejected(ip, pod)
 		} else {
 			res := pcommon.NewResource()
@@ -658,6 +673,41 @@ const (
 
 // findID reports the first container ID or pod UID found in a, as a kind-
 // tagged token.
+// foreignID reports whether a data-point token names a DIFFERENT OBJECT than
+// the resource's token — the question the auto-mode decision actually needs.
+//
+// Comparing the tokens themselves answered it wrongly twice:
+//
+//   - An UNRESOLVABLE point token is not evidence of a foreign object. It
+//     demoted the payload from the resource path (which would have enriched the
+//     sender correctly) to the split path, where a group whose id resolves to
+//     nothing has its copied resource CLEARED — deleting every attribute the
+//     sender set, so service.name vanished and the Prometheus job became
+//     unknown_service.
+//   - Tokens are KIND-TAGGED, so container.id on the resource and k8s.pod.uid
+//     on a data point name one pod and still differ as strings. That demoted a
+//     self-describing sender to the split path too, where the resolved identity
+//     OVERWRITES the sender's — replacing the service.name it chose with the
+//     derived workload name.
+//
+// Both lookups are memoised per request through the same cache the enrichment
+// uses, so a KSM-shaped payload costs no extra round trips.
+func (e *Enricher) foreignID(ctx context.Context, cache map[string]pcommon.Map, tok, resID string) bool {
+	if tok == resID {
+		return false
+	}
+	if !e.resolves(ctx, cache, tok) {
+		return false // unresolvable: not evidence of anything
+	}
+	if resID == "" {
+		return true
+	}
+	// Same object under two id kinds is the sender describing ITSELF.
+	pa, _ := e.lookupByID(ctx, tok)
+	pb, _ := e.lookupByID(ctx, resID)
+	return pa == nil || pb == nil || pa.UID != pb.UID
+}
+
 func (e *Enricher) findID(a pcommon.Map) (token string, ok bool) {
 	for _, k := range e.containerIDKeys {
 		if v, ok := a.Get(k); ok && v.Str() != "" {

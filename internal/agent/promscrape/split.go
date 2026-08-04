@@ -197,7 +197,13 @@ func (sp *Splitter) matches(pod kubemeta.Pod) bool {
 		return false
 	}
 	for k, v := range sp.podLabels {
-		if pod.Labels[k] != v {
+		// Kubernetes selector semantics: the key must be PRESENT and equal. A
+		// bare map index reads a MISSING key as "", so a podLabels entry with an
+		// empty value matched every pod LACKING the label — the opposite of the
+		// intent. Third site of the same bug; services.selects and
+		// tailer.wantLabels are the other two.
+		got, ok := pod.Labels[k]
+		if !ok || got != v {
 			return false
 		}
 	}

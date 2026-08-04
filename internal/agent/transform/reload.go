@@ -68,8 +68,14 @@ func Reload(ctx context.Context, w *Wrapper, path string, poll time.Duration, lo
 		log.Info("transforms reloaded", "path", path, "hash", p.Hash)
 	}
 	var events chan fsnotify.Event
+	// errs must be drained too. fsnotify's reader goroutine SENDS on Errors,
+	// so an undrained channel wedges it and file events stop arriving
+	// altogether — silently, because the poll fallback keeps reloading and
+	// nothing distinguishes "watch is dead" from "nothing changed". The tailer
+	// already drains its watcher's errors for the same reason.
+	var errs chan error
 	if watcher != nil {
-		events = watcher.Events
+		events, errs = watcher.Events, watcher.Errors
 	}
 	for {
 		select {
@@ -77,6 +83,14 @@ func Reload(ctx context.Context, w *Wrapper, path string, poll time.Duration, lo
 			return
 		case <-ticker.C:
 			apply()
+		case err, ok := <-errs:
+			if !ok {
+				errs = nil
+				continue
+			}
+			// The poll ticker is the fallback, so a watch error degrades the
+			// reload latency rather than stopping reloads.
+			log.Warn("transforms watch error; falling back to polling", "path", path, "error", err)
 		case _, ok := <-events:
 			if !ok {
 				events = nil

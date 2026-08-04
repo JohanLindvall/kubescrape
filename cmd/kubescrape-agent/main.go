@@ -356,6 +356,15 @@ func (p *pipelines) spawn(fn func()) {
 	}()
 }
 
+// shutdownTotal bounds the WHOLE shutdown sequence and shutdownStep any single
+// step of it. The total is set under the chart's terminationGracePeriodSeconds
+// (60s) with room for the kubelet's own overhead: the point is that the summed
+// per-step budgets can no longer exceed the grace and get SIGKILLed mid-drain.
+const (
+	shutdownTotal = 45 * time.Second
+	shutdownStep  = 10 * time.Second
+)
+
 func run() error {
 	flag.Parse()
 
@@ -816,6 +825,17 @@ func run() error {
 		log.Warn("producers did not stop within the shutdown budget; continuing with the final exports",
 			"budget", shutdownDrain)
 	}
+	// One DEADLINE for the whole shutdown sequence, rather than a fixed budget
+	// per step. Summed literals could exceed the pod's termination grace on a
+	// fully-configured trace tier — each step is individually reasonable and
+	// the total is not — after which the kubelet SIGKILLs mid-drain and the
+	// steps that had not run yet lose their data anyway. Sharing a deadline
+	// means a slow step spends the budget the later ones would have had, and
+	// nothing overruns.
+	shutdownBy := time.Now().Add(shutdownTotal)
+	stepBudget := func() time.Duration {
+		return max(0, min(shutdownStep, time.Until(shutdownBy)))
+	}
 	if p.tailBuffer != nil {
 		// The one shutdown step that salvages ACKED data rather than a last
 		// aggregation window: the tail-sampling buffer holds spans whose senders
@@ -824,14 +844,14 @@ func run() error {
 		// and let the keeps reach the exporter (and, with -buffer-dir, the final
 		// drain below). Budgeted like the rest — a dead collector must not outlive
 		// the pod's termination grace, and what it costs is counted as lost.
-		fctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		fctx, cancel := context.WithTimeout(context.Background(), stepBudget())
 		p.tailBuffer.Flush(fctx)
 		cancel()
 	}
 	if logMetrics != nil {
 		// The tailer's final flush (inside wg.Wait) fed the set; export the
 		// last window before the deferred exporter/buffer close.
-		fctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		fctx, cancel := context.WithTimeout(context.Background(), stepBudget())
 		defer cancel()
 		if err := logMetrics.Export(fctx, out, *logsMetricsBytes); err != nil {
 			log.Warn("final log-metrics export failed", "error", err)
@@ -843,7 +863,7 @@ func run() error {
 		// and every trace they forward passes through the tap, bumping the
 		// cumulative series. Those spans ship; without this their RED metrics
 		// would not.
-		fctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		fctx, cancel := context.WithTimeout(context.Background(), stepBudget())
 		if err := p.spanMetricsGen.Export(fctx, p.selfOut, p.spanMetricsRes); err != nil {
 			log.Warn("final span-metrics export failed", "error", err)
 		}
@@ -867,7 +887,7 @@ func run() error {
 			// remainder on a busy tier — edges the shutdown path claims to emit.
 			p.serviceGraphProc.SweepAll()
 		}
-		fctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		fctx, cancel := context.WithTimeout(context.Background(), stepBudget())
 		if err := p.serviceGraphReg.Export(fctx, p.selfOut, p.serviceGraphRes); err != nil {
 			log.Warn("final service-graph export failed", "error", err)
 		}
@@ -879,7 +899,7 @@ func run() error {
 		// otherwise die unexported. One more export now that everything is done.
 		// Budgeted here, like every other final export above: ctx is cancelled
 		// by this point, and a dead collector must not outlive the pod's grace.
-		fctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), metrics.FinalExportTimeout)
+		fctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), min(metrics.FinalExportTimeout, stepBudget()))
 		obs.Registry.FinalExport(fctx, selfOut, selfRes, log)
 		cancel()
 	}
@@ -890,7 +910,7 @@ func run() error {
 		// this node — and is lost outright if the pod never comes back or the
 		// buffer dir is not persistent. Bounded: a dead collector must not
 		// outlive the pod's termination grace.
-		dctx, dcancel := context.WithTimeout(context.Background(), 10*time.Second)
+		dctx, dcancel := context.WithTimeout(context.Background(), stepBudget())
 		finalDrain(dctx)
 		dcancel()
 	}

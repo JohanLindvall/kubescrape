@@ -133,7 +133,10 @@ func (b *Buffer) handles() (*diskqueue.Queue[[]byte], *diskqueue.Reader[[]byte])
 func (b *Buffer) add(data []byte) error {
 	q, _ := b.handles()
 	err := q.Add(data)
-	if errors.Is(err, diskqueue.ErrIO) {
+	// queueDead, not ErrIO alone: a handle CLOSED under a concurrent enqueue
+	// (the recover path swaps it) is just as dead, and refusing forever without
+	// attempting the reopen was a buffer that silently stopped accepting.
+	if queueDead(err) {
 		b.recover(q)
 	}
 	return err
@@ -566,13 +569,13 @@ func (s *sink[T]) drainLoop(ctx context.Context, untilEmpty bool) {
 			// the batch counter alone.
 			obs.BufferDroppedBatches.WithLabelValues(s.kind).Inc()
 			s.log.Warn("dropping corrupt buffered batch", "signal", s.kind, "error", err)
-			s.commit(rd, off)
+			s.commit(q, rd, off)
 			continue
 		}
 		switch s.trySend(ctx, v) {
 		case sendOK:
 			s.forget(data) // a previously-stuck payload that recovered; hash before the next queue op
-			s.commit(rd, off)
+			s.commit(q, rd, off)
 			s.delivered++ // proof the collector is alive: see stuckTooLong
 		case sendCancelled:
 			// ctx cancelled mid-send: nack the reservation so the batch is
@@ -586,7 +589,7 @@ func (s *sink[T]) drainLoop(ctx context.Context, untilEmpty bool) {
 				"signal", s.kind, "records", s.records(v))
 			s.countDropped(v)
 			s.forget(data) // a batch that got stuck then turned permanent must not leak its entry
-			s.commit(rd, off)
+			s.commit(q, rd, off)
 		case sendStuck:
 			// Repeated transient failures. Commits are a cursor — nothing
 			// behind the head can retire first — so the batch goes back to the
@@ -602,7 +605,7 @@ func (s *sink[T]) drainLoop(ctx context.Context, untilEmpty bool) {
 				s.log.Error("dropping buffered batch the collector never accepted",
 					"signal", s.kind, "cycles", maxDrainCycles, "bytes", len(data), "records", s.records(v))
 				s.countDropped(v)
-				s.commit(rd, off)
+				s.commit(q, rd, off)
 				continue
 			}
 			s.buf.rewindQ()
@@ -620,11 +623,14 @@ func (s *sink[T]) drainLoop(ctx context.Context, untilEmpty bool) {
 // commit retires one delivered (or dropped) record; a dead queue handle is
 // replaced, and the record simply redelivers after the reopen — at-least-once
 // duplicates, never loss.
-func (s *sink[T]) commit(rd *diskqueue.Reader[[]byte], off int64) {
+// commit takes the queue handle the CALLER observed. recover's guard compares
+// against it to decide whether someone else already replaced the handle, so
+// re-reading the current one here defeated that guard and let a commit failure
+// racing another recover reopen the queue twice.
+func (s *sink[T]) commit(q *diskqueue.Queue[[]byte], rd *diskqueue.Reader[[]byte], off int64) {
 	if err := rd.Commit(off); err != nil {
 		s.log.Warn("disk buffer commit failed; the batch will redeliver", "signal", s.kind, "error", err)
 		if queueDead(err) {
-			q, _ := s.buf.handles()
 			s.buf.recover(q)
 		}
 	}

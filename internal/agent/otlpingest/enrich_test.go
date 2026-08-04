@@ -710,3 +710,87 @@ func TestPeerRejectNilAcceptsEverything(t *testing.T) {
 			ld.ResourceLogs().At(0).Resource().Attributes().AsRaw())
 	}
 }
+
+// gaugeWith builds one ResourceMetrics with the given resource attrs and one
+// gauge point carrying the given point attrs.
+func gaugeWith(resAttrs, pointAttrs map[string]string) pmetric.Metrics {
+	md := pmetric.NewMetrics()
+	rm := md.ResourceMetrics().AppendEmpty()
+	for k, v := range resAttrs {
+		rm.Resource().Attributes().PutStr(k, v)
+	}
+	dp := rm.ScopeMetrics().AppendEmpty().Metrics().AppendEmpty().SetEmptyGauge().DataPoints().AppendEmpty()
+	dp.SetDoubleValue(1)
+	for k, v := range pointAttrs {
+		dp.Attributes().PutStr(k, v)
+	}
+	return md
+}
+
+func resAttrsOf(md pmetric.Metrics) map[string]any {
+	return md.ResourceMetrics().At(0).Resource().Attributes().AsRaw()
+}
+
+// auto mode decides between the resource path and the split path by asking
+// whether any data point names a FOREIGN object. That question was answered by
+// comparing id TOKENS, which got it wrong twice — and both ways destroy the
+// sender's own identity, because the split path either clears the copied
+// resource (unresolvable group) or overwrites it with the derived identity.
+func TestAutoModeKeepsTheSendersOwnIdentity(t *testing.T) {
+	meta := &fakeMeta{
+		containers: map[string]*kubemeta.ContainerMetadata{
+			"cafe01": {Container: kubemeta.Container{Name: "app", ID: "containerd://cafe01"},
+				Pod: kubemeta.Pod{Name: "web-1", Namespace: "default", UID: "pod-uid-1", NodeName: "node1"}},
+		},
+		pods: map[string]*kubemeta.Pod{
+			// The SAME pod the container id above resolves to.
+			"pod-uid-1": {Name: "web-1", Namespace: "default", UID: "pod-uid-1", NodeName: "node1"},
+		},
+	}
+
+	for _, tc := range []struct {
+		name  string
+		point map[string]string
+		why   string
+	}{
+		{
+			name:  "unresolvable point id",
+			point: map[string]string{"container.id": "deadbeef"},
+			why:   "an id that resolves to nothing is not evidence of a foreign object",
+		},
+		{
+			name:  "the sender's own pod under a different id kind",
+			point: map[string]string{"k8s.pod.uid": "pod-uid-1"},
+			why:   "container.id and k8s.pod.uid naming ONE pod are not two objects",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e := newEnricher(meta, MetricsAuto)
+			md := gaugeWith(map[string]string{
+				"container.id": "cafe01",
+				"service.name": "my-chosen-name",
+			}, tc.point)
+
+			got := resAttrsOf(e.EnrichMetrics(context.Background(), md))
+			if got["service.name"] != "my-chosen-name" {
+				t.Errorf("the sender's service.name was destroyed (%v): %s", got["service.name"], tc.why)
+			}
+			if got["k8s.pod.name"] != "web-1" {
+				t.Errorf("the sender was not enriched: k8s.pod.name = %v", got["k8s.pod.name"])
+			}
+		})
+	}
+
+	// ...and a genuinely foreign, RESOLVABLE object still splits.
+	meta.pods["pod-uid-2"] = &kubemeta.Pod{Name: "other", Namespace: "default", UID: "pod-uid-2", NodeName: "node1"}
+	e := newEnricher(meta, MetricsAuto)
+	md := gaugeWith(map[string]string{"container.id": "cafe01", "service.name": "ksm"},
+		map[string]string{"k8s.pod.uid": "pod-uid-2"})
+	out := e.EnrichMetrics(context.Background(), md)
+	if n := out.ResourceMetrics().Len(); n != 1 {
+		t.Fatalf("want one split resource, got %d", n)
+	}
+	if got := resAttrsOf(out)["k8s.pod.name"]; got != "other" {
+		t.Errorf("a genuinely foreign object must still be split out: k8s.pod.name = %v", got)
+	}
+}

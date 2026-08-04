@@ -271,13 +271,17 @@ func (s *compiledSource) deniesNamespace(ns string) bool {
 // whether a NEW file was tracked.
 func (t *Tailer) claimPath(src *compiledSource, path string, seen map[string]struct{}) bool {
 	if st, err := os.Stat(path); err != nil || !st.Mode().IsRegular() {
-		// A transient stat failure on a file we already track must not mark
-		// it gone (drop would delete its checkpoint and a rediscovery would
-		// re-ingest the whole file); only genuine absence may.
+		// A transient stat failure must not mark the path gone: drop would
+		// delete its stored offset, and a rediscovery would then re-ingest the
+		// whole file from zero. Only genuine absence may.
+		//
+		// Whether the file is currently TRACKED is beside the point — the
+		// checkpoint store is pruned against this same `seen` set, so an
+		// untracked path with a stored offset (one not yet re-opened after a
+		// restart) lost that offset to a single EIO or EACCES. A non-ENOENT
+		// error proves nothing about absence either way.
 		if err != nil && !os.IsNotExist(err) {
-			if _, known := t.files[path]; known {
-				seen[path] = struct{}{}
-			}
+			seen[path] = struct{}{}
 		}
 		// Non-regular files (FIFOs, sockets, devices) are never tracked:
 		// open(2)/read(2) on a FIFO block indefinitely and would wedge the

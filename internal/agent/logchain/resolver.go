@@ -85,13 +85,6 @@ func (r *Resolver) ValueFn() func(string) (float64, bool) { return r.valueFn }
 // RuleFn resolves a RULE key, including the synthetic SeverityKey.
 func (r *Resolver) RuleFn() func(string) string { return r.ruleFn }
 
-func (r *Resolver) lookup(k string) (pcommon.Value, bool) {
-	if v, ok := r.Record.Get(k); ok {
-		return v, true
-	}
-	return r.Resource.Get(k)
-}
-
 // liftedValue returns the last lifted attribute for k (last wins, matching
 // how Put applies them to a resource).
 func (r *Resolver) liftedValue(k string) (any, bool) {
@@ -141,7 +134,18 @@ func (r *Resolver) ruleKey(k string) string {
 	return r.label(k)
 }
 
+// value resolves a numeric key in the SAME order label() resolves a string
+// one: the record's own attributes, then the line-lifted ones, then the
+// resource. It ranked lifted attributes above the record's, so one key could
+// take its label from the record and its VALUE from the resource — the two
+// halves of a log-derived metric disagreeing about which attribute they mean.
+//
+// Ranking is by PRESENCE, not by convertibility: a present-but-non-numeric
+// value is a miss for this key, not a reason to fall through to a lower rank.
 func (r *Resolver) value(k string) (float64, bool) {
+	if v, ok := r.Record.Get(k); ok {
+		return numeric(v)
+	}
 	if lv, ok := r.liftedValue(k); ok {
 		switch x := lv.(type) {
 		case float64:
@@ -155,10 +159,15 @@ func (r *Resolver) value(k string) (float64, bool) {
 			return 0, false
 		}
 	}
-	v, ok := r.lookup(k)
+	v, ok := r.Resource.Get(k)
 	if !ok {
 		return 0, false
 	}
+	return numeric(v)
+}
+
+// numeric converts a pcommon.Value the way value() needs it.
+func numeric(v pcommon.Value) (float64, bool) {
 	switch v.Type() {
 	case pcommon.ValueTypeDouble:
 		return v.Double(), true

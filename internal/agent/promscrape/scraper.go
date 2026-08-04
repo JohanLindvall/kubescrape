@@ -282,6 +282,14 @@ func (s *Scraper) authToken(ctx context.Context, ref string) (string, error) {
 // per-target intervals this is exactly a -scrape-interval ticker.
 func (s *Scraper) Run(ctx context.Context) {
 	tick := s.cfg.Interval
+	if tick <= 0 {
+		// Same hazard as the log-metrics loop: time.NewTicker panics on a
+		// non-positive duration and this comes straight from -scrape-interval.
+		// A zero scrape interval means "never", not "crash".
+		s.log.Warn("scrape interval is not positive; the scrape loop will not run", "interval", tick)
+		<-ctx.Done()
+		return
+	}
 	ticker := time.NewTicker(tick)
 	defer ticker.Stop()
 	for {

@@ -52,6 +52,15 @@ func setScope(sm pmetric.ScopeMetrics, name string) {
 // tailer's shutdown flush feeds the set after Run returns), or the last
 // window's samples are lost — series state is not persisted.
 func (s *DynamicMetricSet) Run(ctx context.Context, exp Exporter, interval time.Duration, maxBytes int) {
+	if interval <= 0 {
+		// time.NewTicker PANICS on a non-positive duration, and this interval
+		// comes from a flag with no lower bound — so -logs-metrics-interval=0
+		// killed the process with a runtime panic instead of doing the obvious
+		// thing. Nothing to export on a zero interval; the caller's shutdown
+		// flush still runs.
+		<-ctx.Done()
+		return
+	}
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {

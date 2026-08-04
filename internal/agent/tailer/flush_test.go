@@ -672,3 +672,64 @@ func TestWithheldCommitsAreRememberedPerSegment(t *testing.T) {
 		t.Errorf("the newer segment's withheld high was forgotten: exportedHighs[%d] = %d, want 50", newSeg, got)
 	}
 }
+
+// A log-derived metric must land on the SAME OTLP resource as the records it
+// counts. When a line lifts a RESOURCE attribute the records go under a
+// resource carrying it, and the metric has to agree — every other producer in
+// this repo passes the group's resource; the tailer passed the file's, which
+// omits the lifted half.
+//
+// Two lines lifting DIFFERENT values must also produce two distinct bound
+// resources, or the second silently inherits the first's.
+func TestLogMetricResourceCarriesLiftedResourceAttrs(t *testing.T) {
+	dir := t.TempDir()
+	exp := &fakeExporter{}
+	tl := driveTailer(dir, exp)
+
+	ex, err := logattrs.New(&logattrs.Config{Rules: []logattrs.Rule{
+		{Key: "tenant", Attribute: "tenant.id", Target: "resource"},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tl.cfg.LogAttrs = ex
+
+	set, err := metrics.NewDynamicMetricSet([]metrics.Dynamic{{
+		Name: "lines_total", Type: metrics.CounterType, Value: "1",
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tl.cfg.LogMetrics = set
+
+	stop := startTailer(t, tl)
+	defer stop()
+	writeLog(t, dir,
+		timeNowCRI()+` stdout F {"tenant": "acme", "msg": "a"}`,
+		timeNowCRI()+` stdout F {"tenant": "globex", "msg": "b"}`,
+	)
+	waitFor(t, func() bool { return len(exp.get()) == 2 }, "both records exported")
+	waitFor(t, func() bool { return countMetric(t, set, "lines_total") == 2 }, "both lines counted")
+
+	expm := &capMetricsExporter{}
+	if err := set.Export(t.Context(), expm, 0); err != nil {
+		t.Fatal(err)
+	}
+	// The metric's resources must carry the lifted attribute, and carry BOTH
+	// values — one bound resource per group, not one per file.
+	got := map[string]bool{}
+	for _, md := range expm.md {
+		rms := md.ResourceMetrics()
+		for i := range rms.Len() {
+			if v, ok := rms.At(i).Resource().Attributes().Get("tenant.id"); ok {
+				got[v.Str()] = true
+			}
+		}
+	}
+	for _, want := range []string{"acme", "globex"} {
+		if !got[want] {
+			t.Errorf("no log-metric resource carries tenant.id=%q; the metric's resource omits the "+
+				"line-lifted attributes its records were grouped by (got %v)", want, got)
+		}
+	}
+}

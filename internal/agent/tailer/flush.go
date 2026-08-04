@@ -25,8 +25,27 @@ import (
 // per-record key formatting), matching the previous behavior.
 type logGrouper struct {
 	ld     plog.Logs
-	plain  map[*file]plog.ScopeLogs
-	scopes map[scopeKey]plog.ScopeLogs
+	plain  map[*file]group
+	scopes map[scopeKey]group
+}
+
+// group is one destination: the records slice a kept record is appended to,
+// and the RESOURCE that slice hangs under. The resource is carried because a
+// log-derived metric must land on the same resource as the records it counts —
+// file.resource alone omits the line-lifted resource attributes this group was
+// split on.
+type group struct {
+	sl  plog.ScopeLogs
+	res pcommon.Map
+}
+
+// bindKey identifies one bound RESOURCE for the log-metrics cache: the file
+// plus the line-lifted resource attributes, which are exactly what distinguish
+// two groups' resources. Scope attrs are deliberately absent — they land on the
+// scope, never the resource, so they cannot split a metric's identity.
+type bindKey struct {
+	f   *file
+	res string
 }
 
 // scopeKey identifies one (file, line-derived resource attrs, scope attrs)
@@ -37,25 +56,25 @@ type scopeKey struct {
 	res, scope string
 }
 
-func (g *logGrouper) scope(f *file, resAttrs, scopeAttrs []logattrs.Attr) plog.ScopeLogs {
+func (g *logGrouper) scope(f *file, resAttrs, scopeAttrs []logattrs.Attr) group {
 	if len(resAttrs) == 0 && len(scopeAttrs) == 0 {
-		if sl, ok := g.plain[f]; ok {
-			return sl
+		if gr, ok := g.plain[f]; ok {
+			return gr
 		}
-		sl := g.newScope(f, nil, nil)
-		g.plain[f] = sl
-		return sl
+		gr := g.newScope(f, nil, nil)
+		g.plain[f] = gr
+		return gr
 	}
 	key := scopeKey{f: f, res: logattrs.Key(resAttrs), scope: logattrs.Key(scopeAttrs)}
-	if sl, ok := g.scopes[key]; ok {
-		return sl
+	if gr, ok := g.scopes[key]; ok {
+		return gr
 	}
-	sl := g.newScope(f, resAttrs, scopeAttrs)
-	g.scopes[key] = sl
-	return sl
+	gr := g.newScope(f, resAttrs, scopeAttrs)
+	g.scopes[key] = gr
+	return gr
 }
 
-func (g *logGrouper) newScope(f *file, resAttrs, scopeAttrs []logattrs.Attr) plog.ScopeLogs {
+func (g *logGrouper) newScope(f *file, resAttrs, scopeAttrs []logattrs.Attr) group {
 	rl := g.ld.ResourceLogs().AppendEmpty()
 	f.resource.CopyTo(rl.Resource())
 	logattrs.Put(rl.Resource().Attributes(), resAttrs)
@@ -63,7 +82,7 @@ func (g *logGrouper) newScope(f *file, resAttrs, scopeAttrs []logattrs.Attr) plo
 	sl.Scope().SetName("github.com/JohanLindvall/kubescrape/agent/tailer")
 	sl.Scope().SetVersion(obs.ScopeVersion)
 	logattrs.Put(sl.Scope().Attributes(), scopeAttrs)
-	return sl
+	return group{sl: sl, res: rl.Resource().Attributes()}
 }
 
 // recordBuilder bundles the per-flush state for turning batch entries into
@@ -80,13 +99,16 @@ type recordBuilder struct {
 	t     *Tailer
 	g     *logGrouper
 	now   pcommon.Timestamp
-	chain *logchain.Chain[*file]
+	chain *logchain.Chain[bindKey]
 	kept  int
 
 	// e and ext are the entry currently being emitted, re-pointed before each
 	// Emit the way logchain.Resolver.Set re-points the resolver.
 	e   entry
 	ext logattrs.Result
+	// materialised records that a group was created before the rules ran, so
+	// the flush knows it may need pruning.
+	materialised bool
 }
 
 func (t *Tailer) newRecordBuilder(ld plog.Logs) *recordBuilder {
@@ -94,9 +116,9 @@ func (t *Tailer) newRecordBuilder(ld plog.Logs) *recordBuilder {
 	// global rule set already forces the scratch path).
 	return &recordBuilder{
 		t:   t,
-		g:   &logGrouper{ld: ld, plain: map[*file]plog.ScopeLogs{}, scopes: map[scopeKey]plog.ScopeLogs{}},
+		g:   &logGrouper{ld: ld, plain: map[*file]group{}, scopes: map[scopeKey]group{}},
 		now: pcommon.NewTimestampFromTime(time.Now()),
-		chain: logchain.NewChain[*file](logchain.Config{
+		chain: logchain.NewChain[bindKey](logchain.Config{
 			Scrub:      t.cfg.Scrub,
 			LogAttrs:   t.cfg.LogAttrs,
 			Enrich:     t.cfg.Enrich,
@@ -110,7 +132,7 @@ func (t *Tailer) newRecordBuilder(ld plog.Logs) *recordBuilder {
 // this record's file plus its line-derived resource/scope attributes. Called
 // only for a KEPT record, so a rules drop never materialises a group.
 func (b *recordBuilder) Dest() plog.LogRecordSlice {
-	return b.g.scope(b.e.file, b.ext.Resource, b.ext.Scope).LogRecords()
+	return b.g.scope(b.e.file, b.ext.Resource, b.ext.Scope).sl.LogRecords()
 }
 
 // Stamp fills in what the tailer knows about a record.
@@ -170,11 +192,27 @@ func (t *Tailer) buildRecord(b *recordBuilder, e entry) {
 	// Metric labels and rule keys resolve against the record's attributes
 	// first, then this line's lifted resource attributes, then the FILE's
 	// resource — which is also the metric's OTLP resource and the bind key.
-	if b.chain.Emit(b, logchain.Input[*file]{
+	// The metric's OTLP resource must be the GROUP's, not the file's: a line
+	// that lifts a resource attribute lands under a resource carrying it, and
+	// the metric counting that line has to agree — every other producer in this
+	// repo passes the group's resource here. The bind key has to distinguish
+	// those groups for the same reason, or two lifted variants of one file
+	// would share one bound resource.
+	//
+	// Only the lifted-RESOURCE case pays for it. With none (the overwhelmingly
+	// common line, and the one BenchmarkIngestLine pins at zero allocations)
+	// the group's resource IS file.resource and the key is the bare file.
+	res, key := e.file.resource.Attributes(), bindKey{f: e.file}
+	if len(ext.Resource) > 0 {
+		gr := b.g.scope(e.file, ext.Resource, ext.Scope)
+		res, key = gr.res, bindKey{f: e.file, res: logattrs.Key(ext.Resource)}
+		b.materialised = true
+	}
+	if b.chain.Emit(b, logchain.Input[bindKey]{
 		Body:     body,
 		Lifted:   ext,
-		Resource: e.file.resource.Attributes(),
-		BoundKey: e.file,
+		Resource: res,
+		BoundKey: key,
 		// Pod-annotation rules run before the global chain: a pod drop is
 		// final, a pod keep still passes the global rules.
 		PodRules: e.file.podRules,
@@ -233,6 +271,15 @@ func (t *Tailer) flush(ctx context.Context) {
 	for _, e := range t.batch {
 		t.buildRecord(b, e)
 		proposeCandidates(cands, e)
+	}
+	if b.materialised {
+		// buildRecord materialises a group UP FRONT for a line that lifts
+		// resource attributes — the metric bound to it needs the group's
+		// resource before the rules have decided whether the record survives.
+		// If every such record was then dropped, that group is empty. The other
+		// producers prune for the same reason; the tailer only has to when it
+		// took this path, so the common flush is untouched.
+		logchain.Prune(ld)
 	}
 	kept := b.kept
 

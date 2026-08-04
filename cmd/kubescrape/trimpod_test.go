@@ -51,6 +51,8 @@ func fatPod() *corev1.Pod {
 				Limits:   corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("500m")},
 			},
 			VolumeMounts:   []corev1.VolumeMount{{Name: "data", MountPath: "/data"}},
+			VolumeDevices:  []corev1.VolumeDevice{{Name: "blk", DevicePath: "/dev/xvda"}},
+			ResizePolicy:   []corev1.ContainerResizePolicy{{ResourceName: corev1.ResourceCPU, RestartPolicy: corev1.NotRequired}},
 			LivenessProbe:  probe,
 			ReadinessProbe: probe,
 			StartupProbe:   probe,
@@ -91,6 +93,15 @@ func fatPod() *corev1.Pod {
 			TopologySpreadConstraints: []corev1.TopologySpreadConstraint{{TopologyKey: "zone"}},
 			Affinity:                  &corev1.Affinity{PodAntiAffinity: &corev1.PodAntiAffinity{}},
 			HostAliases:               []corev1.HostAlias{{IP: "10.0.0.1"}},
+			// Every remaining field trimPod nils. Leaving any of them unset here
+			// makes the equivalence assertion below compare nil to nil for it —
+			// the guarantee would hold vacuously for exactly the field that was
+			// forgotten.
+			ReadinessGates:  []corev1.PodReadinessGate{{ConditionType: "example.com/ready"}},
+			SchedulingGates: []corev1.PodSchedulingGate{{Name: "example.com/gate"}},
+			ResourceClaims:  []corev1.PodResourceClaim{{Name: "claim"}},
+			Overhead:        corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("64Mi")},
+			DNSConfig:       &corev1.PodDNSConfig{Nameservers: []string{"10.0.0.10"}},
 		},
 		Status: corev1.PodStatus{
 			Phase: corev1.PodRunning, PodIP: "10.1.2.3",
@@ -153,9 +164,18 @@ func TestTrimPodActuallyDropsTheHeavyFields(t *testing.T) {
 		{"Spec.ImagePullSecrets", p.Spec.ImagePullSecrets},
 		{"Spec.TopologySpreadConstraints", p.Spec.TopologySpreadConstraints},
 		{"Spec.HostAliases", p.Spec.HostAliases},
+		{"Spec.ReadinessGates", p.Spec.ReadinessGates},
+		{"Spec.SchedulingGates", p.Spec.SchedulingGates},
+		{"Spec.ResourceClaims", p.Spec.ResourceClaims},
+		{"Spec.Overhead", p.Spec.Overhead},
+		{"Spec.DNSConfig", p.Spec.DNSConfig},
 		{"container Env", p.Spec.Containers[0].Env},
 		{"container EnvFrom", p.Spec.Containers[0].EnvFrom},
+		{"container Args", p.Spec.Containers[0].Args},
+		{"container WorkingDir", p.Spec.Containers[0].WorkingDir},
 		{"container VolumeMounts", p.Spec.Containers[0].VolumeMounts},
+		{"container VolumeDevices", p.Spec.Containers[0].VolumeDevices},
+		{"container ResizePolicy", p.Spec.Containers[0].ResizePolicy},
 		{"container LivenessProbe", p.Spec.Containers[0].LivenessProbe},
 		{"container ReadinessProbe", p.Spec.Containers[0].ReadinessProbe},
 		{"container StartupProbe", p.Spec.Containers[0].StartupProbe},
@@ -210,16 +230,23 @@ func TestTrimPodLeavesServicesIntact(t *testing.T) {
 }
 
 // client-go may apply a transform more than once to the same object.
+//
+// The comparison must be against a SNAPSHOT taken before the second call.
+// trimPod mutates in place and returns its argument, so comparing its two
+// return values compares a pointer with itself — reflect.DeepEqual
+// short-circuits on pointer equality and the assertion can never fail, whatever
+// the second application does.
 func TestTrimPodIsIdempotent(t *testing.T) {
-	once, err := trimPod(fatPod())
+	first, err := trimPod(fatPod())
 	if err != nil {
 		t.Fatal(err)
 	}
-	twice, err := trimPod(once)
-	if err != nil {
+	p := first.(*corev1.Pod)
+	before := p.DeepCopy()
+	if _, err := trimPod(p); err != nil {
 		t.Fatal(err)
 	}
-	if !reflect.DeepEqual(once, twice) {
-		t.Error("trimPod is not idempotent")
+	if !reflect.DeepEqual(before, p) {
+		t.Error("trimPod is not idempotent: a second application changed the object")
 	}
 }

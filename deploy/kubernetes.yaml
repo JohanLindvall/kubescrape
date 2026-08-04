@@ -68,11 +68,12 @@ spec:
     metadata:
       labels:
         app: kubescrape
-      # The chart stamps these (metrics.scrapeAnnotations) and these manifests
-      # did not, so a raw `kubectl apply -f deploy/` install opened :9090 and
+      # The chart stamps these (metrics.scrapeAnnotations); these manifests did
+      # not, so a raw `kubectl apply -f deploy/` install opened :9090 and
       # nothing ever scraped it — no go_*/process_* runtime metrics at all, and
       # with -self-metrics-interval=0 no kubescrape_* either. kubescrape's own
-      # annotation discovery picks these up, so the agents scrape the service.
+      # annotation discovery picks them up, so the agents scrape the service.
+      # The sibling manifests (agent, events, servicegraph) carry the same set.
       annotations:
         prometheus.io/scrape: "true"
         prometheus.io/port: "9090"

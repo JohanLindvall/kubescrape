@@ -504,14 +504,14 @@ func run() error {
 	// (-self-metrics-interval=0) the kubescrape_* metrics ride the scrape
 	// instead — one knob selects the modality, so the two paths never
 	// double-deliver.
-	stopMetrics, err := obs.ServeMetrics(ctx, *metricsListen, *selfMetricsIntv <= 0, log)
+	stopMetrics, err := obs.ServeMetrics(*metricsListen, *selfMetricsIntv <= 0, log)
 	if err != nil {
 		// Fatal, like the ingest listener: with the OTLP push off this port is
 		// the only path every kubescrape_* metric has.
 		return err
 	}
 	defer stopMetrics()
-	stopPprof, err := obs.ServePprof(ctx, *pprofListen, log)
+	stopPprof, err := obs.ServePprof(*pprofListen, log)
 	if err != nil {
 		// An operator who asked for a profiling port and did not get one should
 		// not have to find that out in the log.

@@ -313,7 +313,16 @@ func (r *k8sSecretReader) Get(ctx context.Context, namespace, name, key string) 
 	r.mu.Unlock()
 	sec, err := r.client.CoreV1().Secrets(namespace).Get(ctx, name, metav1.GetOptions{})
 	if err != nil {
-		r.remember(ck, secretCacheEntry{err: err, fetched: time.Now()})
+		// Cache the failure — but only when it says something about the
+		// CLUSTER. ctx here is the inbound REQUEST's context, so a caller that
+		// disconnects mid-flight (an agent restart, a rolling update, a client
+		// timeout) produces context.Canceled/DeadlineExceeded that describes
+		// that one caller and nothing else. Remembering it would let a single
+		// agent going away make its credential unresolvable — a 502 — for
+		// every OTHER agent in the fleet for the whole failure TTL.
+		if ctx.Err() == nil {
+			r.remember(ck, secretCacheEntry{err: err, fetched: time.Now()})
+		}
 		return "", err
 	}
 	val, ok := sec.Data[key]
@@ -700,14 +709,14 @@ func run() error {
 	// With the OTLP self-metrics push disabled (-self-metrics-interval=0) the
 	// kubescrape_* metrics ride the /metrics scrape instead — the service then
 	// needs no OTLP endpoint at all.
-	stopMetrics, err := obs.ServeMetrics(ctx, *metricsListen, *selfMetricsIntv <= 0, log)
+	stopMetrics, err := obs.ServeMetrics(*metricsListen, *selfMetricsIntv <= 0, log)
 	if err != nil {
 		// Fatal, like the ingest listener: with the OTLP push off this port is
 		// the only path every kubescrape_* metric has.
 		return err
 	}
 	defer stopMetrics()
-	stopPprof, err := obs.ServePprof(ctx, *pprofListen, log)
+	stopPprof, err := obs.ServePprof(*pprofListen, log)
 	if err != nil {
 		// An operator who asked for a profiling port and did not get one should
 		// not have to find that out in the log.
@@ -881,12 +890,16 @@ func stripManagedFields(obj any) (any, error) {
 // verbatim for the process lifetime and never read: on a large cluster that is
 // tens of megabytes of resident heap against a 128Mi request.
 //
-// It runs as a TYPE SWITCH rather than as the factory-wide transform because
-// the Service informer shares that factory and services.Index genuinely reads
+// It runs as a TYPE SWITCH rather than trimming unconditionally because the
+// Service informer shares this factory and services.Index genuinely reads
 // Service specs (selector and ports) — trimming those would break scrape
-// discovery. Anything that is not a *corev1.Pod (Services, and the
-// DeletedFinalStateUnknown tombstones that also flow through here) falls
-// through to the managedFields strip alone.
+// discovery. Anything that is not a *corev1.Pod — Services — falls through to
+// the managedFields strip alone.
+//
+// Tombstones do NOT reach here: both FIFO implementations skip the transformer
+// for DeletedFinalStateUnknown (delta_fifo.go and the_real_fifo.go in client-go
+// v0.36.3), and the tombstone's inner object was already transformed on its way
+// into the store.
 //
 // Trimming is idempotent, which matters: client-go may apply a transform to an
 // object more than once.
@@ -900,7 +913,11 @@ func trimPod(obj any) (any, error) {
 	trimContainers(pod.Spec.Containers)
 	trimContainers(pod.Spec.InitContainers)
 	for i := range pod.Spec.EphemeralContainers {
-		trimContainer(&pod.Spec.EphemeralContainers[i].EphemeralContainerCommon)
+		// EphemeralContainerCommon is field-identical to Container by
+		// construction (upstream keeps them in lockstep), so ONE trim serves
+		// both. It was written out twice, and the copy was exercised for a
+		// single field — exactly the shape that drifts.
+		trimContainer((*corev1.Container)(&pod.Spec.EphemeralContainers[i].EphemeralContainerCommon))
 	}
 
 	// Pod-level spec fields, none of which reach kubemeta.Pod.
@@ -922,27 +939,13 @@ func trimPod(obj any) (any, error) {
 
 func trimContainers(cs []corev1.Container) {
 	for i := range cs {
-		c := &cs[i]
-		c.Command = nil
-		c.Args = nil
-		c.WorkingDir = ""
-		c.Env = nil
-		c.EnvFrom = nil
-		c.Resources = corev1.ResourceRequirements{}
-		c.ResizePolicy = nil
-		c.VolumeMounts = nil
-		c.VolumeDevices = nil
-		c.LivenessProbe = nil
-		c.ReadinessProbe = nil
-		c.StartupProbe = nil
-		c.Lifecycle = nil
-		c.SecurityContext = nil
+		trimContainer(&cs[i])
 	}
 }
 
-// trimContainer is the EphemeralContainerCommon arm of trimContainers; the two
-// structs are field-identical but distinct types.
-func trimContainer(c *corev1.EphemeralContainerCommon) {
+// trimContainer drops the fields of one container that never reach
+// kubemeta.Container (which takes Name, Image and Ports, and nothing else).
+func trimContainer(c *corev1.Container) {
 	c.Command = nil
 	c.Args = nil
 	c.WorkingDir = ""

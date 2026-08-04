@@ -77,7 +77,7 @@ var (
 	// cluster makes an admin's deliberate refusal look exactly like a selector
 	// typo, a missing CRD, or a monitor that matches nothing.
 	MonitorNamespaceRefused = Registry.CounterVec("kubescrape_monitor_namespace_refused_total",
-		"Monitors ignored because their namespace is not permitted by -monitor-namespaces.", "kind")
+		"Monitor upserts ignored because their namespace is not permitted by -monitor-namespaces (an informer re-delivery re-counts the same monitor, exactly like the sibling monitor_* counters).", "kind")
 	// ScrapeAuthFailures counts /v1/scrape-auth requests that reached the
 	// Secret read and failed there, by CAUSE. The route is the only one that
 	// hard-fails on external state, and every cause used to answer 404: an
@@ -86,8 +86,12 @@ var (
 	// monitor's secret ref, and both landed in metadata_requests_total's
 	// not_found stream, which is documented as the container-attribution
 	// signal. `upstream` is the one to alert on.
+	// The label is `reason`, NOT `kind`: `kind` is the monitor-kind dimension
+	// on the three sibling monitor_* metrics (values servicemonitor/podmonitor),
+	// and reusing the name for a failure cause would make one label mean two
+	// unrelated things across metrics an operator reads together.
 	ScrapeAuthFailures = Registry.CounterVec("kubescrape_scrape_auth_failures_total",
-		"Failed /v1/scrape-auth Secret resolutions by cause (not_found = no such Secret or key; upstream = forbidden, timeout or unreachable API server; not_utf8 = value cannot be served as a JSON string).", "kind")
+		"Failed /v1/scrape-auth Secret resolutions by cause (not_found = no such Secret or key; upstream = forbidden, timeout or unreachable API server; not_utf8 = value cannot be served as a JSON string).", "reason")
 	// InformerWatchErrors counts list/watch failures reported by the shared
 	// informers' error handler. Readiness latches once the initial sync
 	// completes and is never re-evaluated, so a watch that breaks AFTER that

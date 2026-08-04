@@ -423,19 +423,29 @@ func (s *Server) handleScrapeAuth(w http.ResponseWriter, r *http.Request) {
 		// A missing key or a genuinely absent Secret is the client's 404;
 		// anything else (forbidden, timeout, apiserver down) is ours, and is
 		// retryable.
-		status, kind := http.StatusBadGateway, "upstream"
+		status, reason := http.StatusBadGateway, "upstream"
 		if apierrors.IsNotFound(err) || errors.Is(err, ErrSecretKeyNotFound) {
-			status, kind = http.StatusNotFound, "not_found"
+			status, reason = http.StatusNotFound, "not_found"
 		}
 		if status != http.StatusNotFound {
 			// The service is uniquely positioned to explain this one: the agent
 			// sees only the status code. Log it, and count it apart from the
 			// client-caused misses.
-			s.log().Warn("resolving scrape-auth secret",
-				"namespace", ns, "name", name, "key", key, "error", err)
+			//
+			// THROTTLED, because this is the steady state of the failure the
+			// route's own doc calls the likeliest: an RBAC grant that was never
+			// added means every agent on every node re-asks each scrape cycle
+			// and each one would log a line, forever. The counter is the
+			// alerting signal; the log only has to say it once in a while, and
+			// per REF so a second broken credential is not masked by the first.
+			if s.shouldWarnScrapeAuth(ns + "/" + name + "/" + key) {
+				s.log().Warn("resolving scrape-auth secret",
+					"namespace", ns, "name", name, "key", key, "error", err,
+					"note", "further failures for this ref are suppressed for "+scrapeAuthWarnEvery.String())
+			}
 			w.Header().Set("Retry-After", "5")
 		}
-		obs.ScrapeAuthFailures.WithLabelValues(kind).Inc()
+		obs.ScrapeAuthFailures.WithLabelValues(reason).Inc()
 		writeError(w, status, fmt.Sprintf("secret %s/%s key %s: %v", ns, name, key, err))
 		return
 	}

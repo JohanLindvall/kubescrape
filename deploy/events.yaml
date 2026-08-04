@@ -92,6 +92,14 @@ spec:
     metadata:
       labels:
         app: kubescrape-events
+      # The chart stamps these (metrics.scrapeAnnotations); these manifests did
+      # not, so a raw `kubectl apply -f deploy/` install opened :9090 and
+      # nothing ever scraped it. kubescrape's own annotation discovery picks
+      # them up, so the agents scrape this workload's runtime metrics.
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9090"
+        prometheus.io/path: /metrics
     spec:
       serviceAccountName: kubescrape-events
       # Room for the final events flush and position write (see the agent).

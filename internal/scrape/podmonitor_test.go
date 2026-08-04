@@ -64,9 +64,17 @@ var notStampedVerbatim = map[string]bool{
 // namespacing, correct allowlisting — and a target that silently carries no
 // credential, scraping unauthenticated with up=0 as the only signal.
 //
-// So assert it structurally rather than field by field: every string field of
+// So assert it structurally rather than field by field: every STRING field of
 // Endpoint gets a distinct sentinel, and each one must resurface somewhere on
-// the produced target. A new field that stampEndpoint forgets fails HERE.
+// the produced target. A new string field that stampEndpoint forgets fails HERE.
+//
+// LIMIT, stated because the guard is only as good as its scope: this covers
+// string-kind fields only. A secret-bearing field of another shape — a
+// *string, a []string, a nested struct — is NOT caught by the sweep and must be
+// asserted by hand below, next to InsecureSkipVerify and MetricRelabelings
+// (both non-string, both hand-asserted in TestPodMonitorTargets). Every secret
+// ref in Endpoint.secretRefs is a plain string today, which is what makes the
+// sweep worth having; if that stops being true, widen it.
 func TestEveryEndpointFieldReachesTheTarget(t *testing.T) {
 	ep := servicemonitors.Endpoint{Port: "metrics"}
 	v := reflect.ValueOf(&ep).Elem()

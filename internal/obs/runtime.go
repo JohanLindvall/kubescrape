@@ -83,13 +83,14 @@ func (registryCollector) Collect(ch chan<- prometheus.Metric) {
 }
 
 // ServeMetrics starts a dedicated HTTP listener serving RuntimeHandler on
-// /metrics, shutting down when ctx is done. internal additionally serves the
+// /metrics, shut down by the returned func, which the caller must call.
+// It takes no context deliberately — see stopper. internal additionally serves the
 // kubescrape_* Registry metrics (callers pass "the OTLP self-metrics push is
 // disabled"). A separate port from the health and debug surface: the scrape
 // target is what a Prometheus/ServiceMonitor setup points at, while /debug and
 // /readyz are operator-facing and often reachable only inside the cluster. An
 // empty addr disables it.
-func ServeMetrics(ctx context.Context, addr string, internal bool, log *slog.Logger) (func(), error) {
+func ServeMetrics(addr string, internal bool, log *slog.Logger) (func(), error) {
 	if addr == "" {
 		return func() {}, nil
 	}
@@ -112,34 +113,40 @@ func ServeMetrics(ctx context.Context, addr string, internal bool, log *slog.Log
 			log.Error("metrics endpoint failed", "addr", addr, "error", err)
 		}
 	}()
-	return stopOnContext(ctx, srv), nil
+	return stopper(srv), nil
 }
 
-// stopOnContext returns an idempotent stop func for srv AND arms the same
-// shutdown on ctx.
+// stopper returns an idempotent shutdown func for srv.
 //
-// Both listeners here documented "shutting down when ctx is done" while
-// ignoring ctx entirely, so a caller that cancelled the context and dropped
-// the returned func — which the signature invites, since the ctx is right
-// there — leaked the listener and its goroutine for the process lifetime. Make
-// the documented contract the real one, and keep the returned func working for
-// callers that defer it.
-func stopOnContext(ctx context.Context, srv *http.Server) func() {
+// It deliberately does NOT arm the shutdown on ctx. Doing that is the obvious
+// reading of the doc comments these two listeners have always carried
+// ("shutting down when ctx is done"), and it is wrong: ctx is the PROCESS
+// signal context, so a context.AfterFunc fires at the SIGTERM instant — t=0 of
+// shutdown — and both diagnostic listeners would go dark for the whole
+// termination grace, which is 60s on the agent. That is precisely the window in
+// which an operator is scraping /metrics to watch the buffer drain, or
+// attaching to pprof to find out why shutdown is hanging. The listeners must
+// outlive the sequence they exist to observe.
+//
+// So the returned func is the ONLY shutdown, and both callers defer it — which
+// is what actually keeps the listener from leaking. The doc comments say that
+// now instead of promising ctx.
+func stopper(srv *http.Server) func() {
 	var once sync.Once
-	stop := func() {
+	return func() {
 		once.Do(func() {
-			sctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+			sctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
 			_ = srv.Shutdown(sctx)
 		})
 	}
-	context.AfterFunc(ctx, stop)
-	return stop
 }
 
 // ServePprof starts a dedicated HTTP listener serving net/http/pprof under
-// /debug/pprof, shutting down when ctx is done or when the returned func is
-// called. Its own port, separate from both the metrics endpoint and the
+// /debug/pprof, shut down by the returned func, which the caller must call.
+// It takes no context deliberately — see stopper.
+//
+// Its own port, separate from both the metrics endpoint and the
 // health/debug surface: profiles expose goroutine stacks and heap contents, so
 // the port that carries them is the one you firewall, bind to localhost, or
 // leave unset. Empty addr disables it.
@@ -149,7 +156,7 @@ func stopOnContext(ctx context.Context, srv *http.Server) func() {
 // produces no log line at all while a bind failure produces exactly one Error,
 // so the two states were already distinguishable — but a caller that asked for
 // a port and did not get one should not have to read the log to find out.
-func ServePprof(ctx context.Context, addr string, log *slog.Logger) (func(), error) {
+func ServePprof(addr string, log *slog.Logger) (func(), error) {
 	if addr == "" {
 		return func() {}, nil
 	}
@@ -173,5 +180,5 @@ func ServePprof(ctx context.Context, addr string, log *slog.Logger) (func(), err
 			log.Error("pprof endpoint failed", "addr", addr, "error", err)
 		}
 	}()
-	return stopOnContext(ctx, srv), nil
+	return stopper(srv), nil
 }

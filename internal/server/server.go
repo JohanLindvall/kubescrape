@@ -126,6 +126,12 @@ type Server struct {
 	monCache   map[string][]monitorEndpoint
 	monBuiltAt time.Time
 	monBuilds  atomic.Int64
+
+	// warnedAt throttles the per-ref scrape-auth failure log (see
+	// shouldWarnScrapeAuth); the requests it serves are concurrent, so it has
+	// its own mutex rather than sharing monMu.
+	warnMu   sync.Mutex
+	warnedAt map[string]time.Time
 }
 
 // New creates a Server.
@@ -156,6 +162,47 @@ func (s *Server) log() *slog.Logger {
 		return s.logger
 	}
 	return slog.Default()
+}
+
+// scrapeAuthWarnEvery bounds how often one secret ref may log a resolution
+// failure. An RBAC grant that was never added is a STEADY state, not an event:
+// every agent on every node re-asks each scrape cycle, so an unthrottled line
+// is a permanent flood proportional to fleet size. The counter carries the rate;
+// the log only has to name the ref often enough to be found.
+const scrapeAuthWarnEvery = 5 * time.Minute
+
+// maxScrapeAuthWarnRefs bounds the throttle map. Keys come from the
+// AuthSecretRefs allowlist, so they are already bounded by the indexed monitors
+// — this is belt and braces against a monitor set that churns.
+const maxScrapeAuthWarnRefs = 1024
+
+// shouldWarnScrapeAuth reports whether this ref may log now, and records that
+// it did.
+func (s *Server) shouldWarnScrapeAuth(ref string) bool {
+	now := s.now()
+	s.warnMu.Lock()
+	defer s.warnMu.Unlock()
+	if last, ok := s.warnedAt[ref]; ok && now.Sub(last) < scrapeAuthWarnEvery {
+		return false
+	}
+	if s.warnedAt == nil {
+		s.warnedAt = make(map[string]time.Time)
+	}
+	if len(s.warnedAt) >= maxScrapeAuthWarnRefs {
+		// Drop whatever has aged out rather than growing without bound; if
+		// nothing has, clear it — a map this size means churn, and losing the
+		// suppression state costs one extra line per ref.
+		for k, t := range s.warnedAt {
+			if now.Sub(t) >= scrapeAuthWarnEvery {
+				delete(s.warnedAt, k)
+			}
+		}
+		if len(s.warnedAt) >= maxScrapeAuthWarnRefs {
+			clear(s.warnedAt)
+		}
+	}
+	s.warnedAt[ref] = now
+	return true
 }
 
 // Handler returns the HTTP routes.

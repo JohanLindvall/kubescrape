@@ -70,6 +70,70 @@ func TestLateDeleteOfPredecessorKeepsSuccessor(t *testing.T) {
 	}
 }
 
+// The DELETE side of the guard has to clean the name index, or byName grows by
+// one permanently-stale entry per deleted Service — and the next Service to
+// take that name is then treated as a replacement of a record that no longer
+// exists. Nothing else in the suite reads byName after a delete, so removing
+// the cleanup entirely left every test green.
+func TestDeleteClearsTheNameIndex(t *testing.T) {
+	ix := NewIndex()
+	ix.Upsert(svcNamed("uid-a", "web", nil))
+	ix.Upsert(svcNamed("uid-b", "api", nil))
+	ix.Delete("ns", "uid-a")
+
+	ix.mu.RLock()
+	n, stillThere := len(ix.byName), ix.byName["ns/web"]
+	ix.mu.RUnlock()
+	if stillThere != "" {
+		t.Errorf("byName still maps ns/web to %q after its Service was deleted", stillThere)
+	}
+	if n != 1 {
+		t.Errorf("byName holds %d entries, want 1 (only the live Service)", n)
+	}
+
+	// And deleting the last Service in the namespace must leave nothing behind
+	// at all — that path also removes the namespace map, and an early return
+	// there would skip the name cleanup.
+	ix.Delete("ns", "uid-b")
+	ix.mu.RLock()
+	n, nsGone := len(ix.byName), ix.byNamespace["ns"] == nil
+	ix.mu.RUnlock()
+	if n != 0 || !nsGone {
+		t.Errorf("after deleting every Service: byName=%d entries, namespace map gone=%v; want 0, true", n, nsGone)
+	}
+}
+
+// The name key is namespaced. Without the namespace component, two Services
+// sharing a name in DIFFERENT namespaces would evict each other — and no test
+// in the package put the same name in two namespaces.
+func TestSameNameInDifferentNamespacesCoexist(t *testing.T) {
+	ix := NewIndex()
+	a := svcNamed("a1", "web", nil)
+	a.Namespace = "a"
+	b := svcNamed("b1", "web", nil)
+	b.Namespace = "b"
+	ix.Upsert(a)
+	ix.Upsert(b)
+
+	for _, tc := range []struct{ ns, uid string }{{"a", "a1"}, {"b", "b1"}} {
+		got := ix.Matching(tc.ns, map[string]string{"app": "web"})
+		if len(got) != 1 || got[0].UID != tc.uid {
+			t.Fatalf("namespace %q: %+v, want exactly uid %s", tc.ns, got, tc.uid)
+		}
+	}
+
+	// Replacing the one in namespace "a" must not disturb namespace "b".
+	a2 := svcNamed("a2", "web", nil)
+	a2.Namespace = "a"
+	ix.Upsert(a2)
+	if got := ix.Matching("a", map[string]string{"app": "web"}); len(got) != 1 || got[0].UID != "a2" {
+		t.Errorf("namespace a: %+v, want exactly uid a2", got)
+	}
+	if got := ix.Matching("b", map[string]string{"app": "web"}); len(got) != 1 || got[0].UID != "b1" {
+		t.Errorf("namespace b was disturbed by a replacement in namespace a: %+v", got)
+	}
+}
+
 // Distinct names in one namespace must be unaffected by the name guard.
 func TestDistinctNamesCoexist(t *testing.T) {
 	ix := NewIndex()

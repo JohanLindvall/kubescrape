@@ -105,4 +105,46 @@ func TestFilterRunningIsReportedFromTheEndpoint(t *testing.T) {
 	if got := IgnoredFields(m.Endpoints); strings.Contains(strings.Join(got, ","), "filterRunning") {
 		t.Errorf("spec-level filterRunning is not a CRD field; got %q", got)
 	}
+
+	// filterRunning is an endpoint field on the ServiceMonitor CRD too, and
+	// endpointSpec is shared, so the ServiceMonitor arm must report it
+	// identically. Nothing exercised that side.
+	sm := &unstructured.Unstructured{Object: map[string]any{
+		"metadata": map[string]any{"namespace": "ns", "name": "sm"},
+		"spec": map[string]any{
+			"selector":  map[string]any{},
+			"endpoints": []any{map[string]any{"port": "http", "filterRunning": false}},
+		},
+	}}
+	smm, err := Parse(sm)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if got := IgnoredFields(smm.Endpoints); !strings.Contains(strings.Join(got, ","), "filterRunning") {
+		t.Errorf("ServiceMonitor endpoint filterRunning: false must be reported; got %q", got)
+	}
+}
+
+// portNumber is a PodMonitor endpoint field (container port as a NUMBER). It is
+// not honoured, so an endpoint naming ONLY portNumber resolves to no targets —
+// which must not be silent.
+func TestPodMonitorPortNumberIsReported(t *testing.T) {
+	u := &unstructured.Unstructured{Object: map[string]any{
+		"metadata": map[string]any{"namespace": "ns", "name": "pm"},
+		"spec": map[string]any{
+			"selector":            map[string]any{},
+			"podMetricsEndpoints": []any{map[string]any{"portNumber": int64(9090)}},
+		},
+	}}
+	m, err := ParsePodMonitor(u)
+	if err != nil {
+		t.Fatalf("ParsePodMonitor: %v", err)
+	}
+	if got := IgnoredFields(m.Endpoints); !strings.Contains(strings.Join(got, ","), "portNumber") {
+		t.Errorf("portNumber must be reported as uninterpreted; got %q", got)
+	}
+	// And it still yields no targets — the phantom-target guard is unchanged.
+	if len(m.Endpoints) != 1 || m.Endpoints[0].Port != "" || m.Endpoints[0].TargetPort != nil {
+		t.Errorf("portNumber must not be interpreted as a port: %+v", m.Endpoints[0])
+	}
 }

@@ -146,12 +146,19 @@ type RelabelRule struct {
 // endpointSpec is the shared endpoint shape of ServiceMonitor endpoints and
 // PodMonitor podMetricsEndpoints.
 type endpointSpec struct {
-	Port          string              `json:"port"`
-	TargetPort    *intstr.IntOrString `json:"targetPort"`
-	Path          string              `json:"path"`
-	Scheme        string              `json:"scheme"`
-	Interval      string              `json:"interval"`
-	ScrapeTimeout string              `json:"scrapeTimeout"`
+	Port       string              `json:"port"`
+	TargetPort *intstr.IntOrString `json:"targetPort"`
+	// PortNumber is a PodMonitor-only endpoint field: a container port given as
+	// a NUMBER, alongside `port` (a name) and the deprecated `targetPort`.
+	// Reported as uninterpreted rather than honoured — an endpoint naming only
+	// portNumber otherwise resolves to no targets at all, with no warning and
+	// no kubescrape_monitor_fields_ignored_total bump, which is the silent
+	// partial application the Ignored machinery exists to prevent.
+	PortNumber    *int32 `json:"portNumber"`
+	Path          string `json:"path"`
+	Scheme        string `json:"scheme"`
+	Interval      string `json:"interval"`
+	ScrapeTimeout string `json:"scrapeTimeout"`
 	TLSConfig     *struct {
 		InsecureSkipVerify bool        `json:"insecureSkipVerify"`
 		CA                 *secretOrCM `json:"ca"`
@@ -183,11 +190,15 @@ type endpointSpec struct {
 	ProxyURL string          `json:"proxyUrl"`
 	// Parsed only to be REPORTED as uninterpreted.
 	BearerTokenFile string `json:"bearerTokenFile"`
-	// filterRunning is an ENDPOINT field (PodMetricsEndpoint), not a spec one
-	// — it lived in specLimits, where it could never decode, so the branch
-	// reporting it was unreachable and the one field singled out below as most
-	// likely to surprise was the one silently dropped. ServiceMonitor
-	// endpoints have no such field, so it simply never sets there.
+	// filterRunning is an ENDPOINT field on BOTH kinds — ServiceMonitor
+	// `Endpoint` and PodMonitor `PodMetricsEndpoint` (verified against the
+	// shipped CRDs, v0.68 through v0.84) — which is exactly why it belongs on
+	// the shared endpointSpec. It lived in specLimits, which the CRD has no
+	// filterRunning on at all, so the branch reporting it was unreachable: not
+	// because inline embedding fails to decode (it decodes fine), but because
+	// the API server PRUNES an unknown spec-level property, so the value never
+	// arrives. The one field singled out below as most likely to surprise was
+	// therefore the one silently dropped.
 	//
 	// Only a FALSE value differs from what kubescrape does: scrape.Scrapeable
 	// already excludes finished and terminating pods, which is filterRunning's
@@ -276,6 +287,7 @@ func (ep endpointSpec) ignoredFields() []string {
 	add("honorLabels", ep.HonorLabels != nil && *ep.HonorLabels)
 	add("relabelings", len(ep.Relabelings) > 0)
 	add("filterRunning", ep.FilterRunning != nil && !*ep.FilterRunning)
+	add("portNumber", ep.PortNumber != nil)
 	if ep.TLSConfig != nil {
 		// Only the configMap arm is unsupported; secret-backed CA/cert are
 		// interpreted below.
@@ -391,9 +403,10 @@ type specLimits struct {
 	// produced no warning and no MonitorFieldsIgnored bump, breaching the
 	// no-silent-partial-application contract the Ignored machinery exists for.
 	//
-	// filterRunning is NOT here: the CRD puts it on the ENDPOINT
-	// (PodMetricsEndpoint), so it lives on endpointSpec. It sat in this struct
-	// for a while, where it could never decode.
+	// filterRunning is NOT here: the CRD puts it on the ENDPOINT (on both
+	// kinds), so it lives on endpointSpec. It sat in this struct for a while,
+	// where the API server's pruning of unknown spec properties meant it never
+	// arrived.
 	BodySizeLimit  string          `json:"bodySizeLimit"`
 	AttachMetadata *map[string]any `json:"attachMetadata"`
 	ScrapeClass    string          `json:"scrapeClass"`

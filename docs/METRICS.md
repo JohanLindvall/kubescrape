@@ -121,11 +121,11 @@ is the documented alert for the non-buffered tailer.
 | `kubescrape_log_unresolved_lost_total` | — | Log files deleted before their metadata ever resolved (the metadata service was unreachable or the container unknown for the file's whole life). Their content was never read and is lost. |
 | `kubescrape_metadata_requests_total` | `outcome` | Requests to the metadata service by outcome. |
 | `kubescrape_monitor_fields_ignored_total` | `kind` | Monitor upserts whose endpoints set fields kubescrape does not interpret. |
-| `kubescrape_monitor_namespace_refused_total` | `kind` | Monitors ignored because their namespace is not permitted by -monitor-namespaces. |
+| `kubescrape_monitor_namespace_refused_total` | `kind` | Monitor upserts ignored because their namespace is not permitted by -monitor-namespaces (an informer re-delivery re-counts the same monitor, exactly like the sibling monitor_* counters). |
 | `kubescrape_monitor_parse_errors_total` | `kind` | Monitor upserts that failed to parse and were dropped from the index. |
 | `kubescrape_positions_corrupt_total` | — | Positions files that failed to parse at startup (whatever decoded is kept; the affected inputs re-read their window). Recurring bumps across restarts point at a failing disk, not a one-off crash. |
 | `kubescrape_routed_payload_parts_total` | `route`, `signal` | Payload parts forwarded to a non-default routing destination. |
-| `kubescrape_scrape_auth_failures_total` | `kind` | Failed /v1/scrape-auth Secret resolutions by cause (not_found = no such Secret or key; upstream = forbidden, timeout or unreachable API server; not_utf8 = value cannot be served as a JSON string). |
+| `kubescrape_scrape_auth_failures_total` | `reason` | Failed /v1/scrape-auth Secret resolutions by cause (not_found = no such Secret or key; upstream = forbidden, timeout or unreachable API server; not_utf8 = value cannot be served as a JSON string). |
 | `kubescrape_scrape_duration_seconds` | `pipeline` | Scrape duration by pipeline. |
 | `kubescrape_scrape_malformed_total` | `pipeline` | Exposition samples dropped as malformed by pipeline (unparseable lines, histogram buckets without le, summary rows without quantile). |
 | `kubescrape_scrape_name_collisions_total` | — | Data points dropped because their family name was already claimed by a metric of another shape in the same batch (a target redeclaring a family's TYPE mid-exposition). |

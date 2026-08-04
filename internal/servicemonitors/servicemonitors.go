@@ -1,9 +1,21 @@
-// Package servicemonitors indexes Prometheus-Operator ServiceMonitor custom
-// resources so their targets can be served alongside annotation-discovered
-// ones. Only pod-backed Services are supported: targets resolve through the
-// selected Services' pod selectors, which keeps scraping node-local.
-// Per-endpoint authentication, relabelings and interval overrides are not
-// interpreted.
+// Package servicemonitors indexes Prometheus-Operator ServiceMonitor and
+// PodMonitor custom resources so their targets can be served alongside
+// annotation-discovered ones. Only pod-backed Services are supported: targets
+// resolve through the selected Services' pod selectors, which keeps scraping
+// node-local.
+//
+// A documented SUBSET of the CRD is interpreted: endpoint port/targetPort/
+// path/scheme, per-endpoint interval/scrapeTimeout, basicAuth, authorization,
+// bearerTokenSecret, secret-backed tlsConfig (ca/cert/keySecret/serverName and
+// insecureSkipVerify), and the keep/drop subset of metricRelabelings.
+// Everything else parsed here exists to be REPORTED as uninterpreted through
+// Endpoint.Ignored — see IgnoredFields — because a narrower implementation is
+// a choice and a silently partially-applied CR is not.
+//
+// This file also owns Endpoint.secretRefs, which is a security boundary: it is
+// the ONE list of the endpoint fields carrying secret references, and both the
+// monitor-namespacing and the /v1/scrape-auth allowlist derive from it. Adding
+// a secret-bearing field means adding it there.
 package servicemonitors
 
 import (
@@ -170,7 +182,17 @@ type endpointSpec struct {
 	OAuth2   json.RawMessage `json:"oauth2"`
 	ProxyURL string          `json:"proxyUrl"`
 	// Parsed only to be REPORTED as uninterpreted.
-	BearerTokenFile          string          `json:"bearerTokenFile"`
+	BearerTokenFile string `json:"bearerTokenFile"`
+	// filterRunning is an ENDPOINT field (PodMetricsEndpoint), not a spec one
+	// — it lived in specLimits, where it could never decode, so the branch
+	// reporting it was unreachable and the one field singled out below as most
+	// likely to surprise was the one silently dropped. ServiceMonitor
+	// endpoints have no such field, so it simply never sets there.
+	//
+	// Only a FALSE value differs from what kubescrape does: scrape.Scrapeable
+	// already excludes finished and terminating pods, which is filterRunning's
+	// default behaviour. `filterRunning: false` asks for the OPPOSITE.
+	FilterRunning            *bool           `json:"filterRunning"`
 	FollowRedirects          *bool           `json:"followRedirects"`
 	EnableHTTP2              *bool           `json:"enableHttp2"`
 	HonorTimestamps          *bool           `json:"honorTimestamps"`
@@ -253,6 +275,7 @@ func (ep endpointSpec) ignoredFields() []string {
 	add("params", len(ep.Params) > 0)
 	add("honorLabels", ep.HonorLabels != nil && *ep.HonorLabels)
 	add("relabelings", len(ep.Relabelings) > 0)
+	add("filterRunning", ep.FilterRunning != nil && !*ep.FilterRunning)
 	if ep.TLSConfig != nil {
 		// Only the configMap arm is unsupported; secret-backed CA/cert are
 		// interpreted below.
@@ -367,11 +390,11 @@ type specLimits struct {
 	// Set but not interpreted, and previously not even PARSED — so they
 	// produced no warning and no MonitorFieldsIgnored bump, breaching the
 	// no-silent-partial-application contract the Ignored machinery exists for.
-	// filterRunning is the sharpest: its default is true and kubescrape's
-	// Scrapeable already excludes finished pods, so `filterRunning: false` asks
-	// for the OPPOSITE of what happens.
+	//
+	// filterRunning is NOT here: the CRD puts it on the ENDPOINT
+	// (PodMetricsEndpoint), so it lives on endpointSpec. It sat in this struct
+	// for a while, where it could never decode.
 	BodySizeLimit  string          `json:"bodySizeLimit"`
-	FilterRunning  *bool           `json:"filterRunning"`
 	AttachMetadata *map[string]any `json:"attachMetadata"`
 	ScrapeClass    string          `json:"scrapeClass"`
 }
@@ -394,10 +417,6 @@ func (s specLimits) ignored() []string {
 	add("targetLabels", len(s.TargetLabels) > 0)
 	add("podTargetLabels", len(s.PodTargetLabels) > 0)
 	add("bodySizeLimit", s.BodySizeLimit != "")
-	// Only a FALSE value differs from what kubescrape does: scrape.Scrapeable
-	// already excludes finished and terminating pods, which is filterRunning's
-	// default behaviour.
-	add("filterRunning", s.FilterRunning != nil && !*s.FilterRunning)
 	add("attachMetadata", s.AttachMetadata != nil)
 	add("scrapeClass", s.ScrapeClass != "")
 	return out

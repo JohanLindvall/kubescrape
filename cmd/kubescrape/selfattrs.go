@@ -33,12 +33,23 @@ import (
 // the process is not a pod whose name is its hostname.
 func selfResolver(st *store.Store, resolver server.MetadataResolver) func(context.Context) (*kubemeta.Pod, error) {
 	return func(context.Context) (*kubemeta.Pod, error) {
+		// Every failure branch counts, not just the store miss. The two
+		// pre-lookup errors are reachable in ordinary use — `go run
+		// ./cmd/kubescrape` against a kubeconfig finds neither $POD_NAMESPACE
+		// nor the ServiceAccount projection, and so does an
+		// automountServiceAccountToken:false overlay — and leaving them
+		// uncounted meant kubescrape_self_metadata_lookups_total carried NO
+		// series at all on a process failing to resolve every minute, so the
+		// drill-down from kubescrape_self_metadata_resolved=0 dead-ended and
+		// "still starting" could not be told from "will never resolve".
 		ns := selfmeta.Namespace()
 		if ns == "" {
+			obs.SelfMetadataLookups.WithLabelValues("error").Inc()
 			return nil, fmt.Errorf("no namespace ($POD_NAMESPACE or the ServiceAccount projection)")
 		}
 		host, err := os.Hostname()
 		if err != nil {
+			obs.SelfMetadataLookups.WithLabelValues("error").Inc()
 			return nil, fmt.Errorf("hostname: %w", err)
 		}
 		np, ok := st.GetPodByName(ns, host)

@@ -67,6 +67,7 @@ func (s *Store) GetContainer(ctx context.Context, id string) (ContainerResult, b
 			// goroutine + map entry for the full wait budget. Fail fast and
 			// retryable rather than degrading everyone.
 			s.mu.Unlock()
+			s.shed.Add(1)
 			return ContainerResult{}, false, ErrTooManyWaiters
 		}
 		ch := make(chan struct{})
@@ -111,12 +112,21 @@ func (s *Store) removeWaiter(id string, ch chan struct{}) {
 	}
 }
 
-// waiterCount reports the blocked-lookup count (tests).
-func (s *Store) waiterCount() int {
+// BlockedLookups reports how many container lookups are blocked right now.
+// Published as a gauge (see obs.RegisterWaiterStats): it is what shows waiter
+// pressure building BEFORE the cap starts shedding.
+func (s *Store) BlockedLookups() int {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.nWaiters
 }
+
+// ShedLookups reports how many blocking lookups the waiter cap has refused
+// since startup.
+func (s *Store) ShedLookups() int64 { return s.shed.Load() }
+
+// waiterCount reports the blocked-lookup count (tests).
+func (s *Store) waiterCount() int { return s.BlockedLookups() }
 
 // lookupLocked resolves a normalized container ID. gone reports an expired
 // (present-but-unswept) entry — a deleted pod's tombstone or a

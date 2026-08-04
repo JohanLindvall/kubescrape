@@ -7,13 +7,18 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"net/http"
 	"sort"
 	"strconv"
 	"time"
+	"unicode/utf8"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+
+	"github.com/JohanLindvall/kubescrape/internal/obs"
 	"github.com/JohanLindvall/kubescrape/internal/peerip"
 	"github.com/JohanLindvall/kubescrape/internal/scrape"
 	"github.com/JohanLindvall/kubescrape/internal/servicemonitors"
@@ -251,13 +256,18 @@ func (s *Server) handleNodeTargets(w http.ResponseWriter, r *http.Request) {
 		// or any service selecting it opt into scraping?
 		matched := s.services.Matching(np.Pod.Namespace, np.Pod.Labels)
 		// Map iteration order in the services index must not decide which
-		// Service a URL-deduped target is attributed to.
-		sort.Slice(matched, func(i, j int) bool {
-			if matched[i].Namespace != matched[j].Namespace {
-				return matched[i].Namespace < matched[j].Namespace
-			}
-			return matched[i].Name < matched[j].Name
-		})
+		// Service a URL-deduped target is attributed to. Guarded because the
+		// overwhelmingly common case is 0 or 1 matching Service, where
+		// sort.Slice still allocates the reflect swapper and the comparison
+		// closure — per pod, per node, per scrape cycle — to sort nothing.
+		if len(matched) > 1 {
+			sort.Slice(matched, func(i, j int) bool {
+				if matched[i].Namespace != matched[j].Namespace {
+					return matched[i].Namespace < matched[j].Namespace
+				}
+				return matched[i].Name < matched[j].Name
+			})
+		}
 		podAnnotated := np.Pod.Annotations[scrape.AnnotationScrape] == "true"
 		svcAnnotated := false
 		for _, svc := range matched {
@@ -369,6 +379,14 @@ func configuredTarget(t kubemeta.ScrapeTarget) bool {
 // the shared token from -scrape-auth-token-file as
 // `Authorization: Bearer <token>`; anything else is a 401 (see auth.go).
 func (s *Server) handleScrapeAuth(w http.ResponseWriter, r *http.Request) {
+	// Set once, at the top, so EVERY exit inherits it. The 404s here are
+	// heuristically storable (RFC 9111 4.2.2 over RFC 9110 15.1), and this
+	// route's whole point is that a rotated or newly-granted credential takes
+	// effect now — a cached "secret not found" from the startup window, or from
+	// before an RBAC fix, outlives the condition that caused it and shows up
+	// only as up=0. cachePolicy.noStore says the same thing for the pod routes;
+	// this one was the exception.
+	w.Header().Set("Cache-Control", "no-store")
 	if s.secrets == nil {
 		// The feature is off, so there is nothing to protect; keep the
 		// pre-existing "not enabled" 404 rather than a misleading 401.
@@ -395,10 +413,48 @@ func (s *Server) handleScrapeAuth(w http.ResponseWriter, r *http.Request) {
 	}
 	val, err := s.secrets.Get(r.Context(), ns, name, key)
 	if err != nil {
-		writeError(w, http.StatusNotFound, fmt.Sprintf("secret %s/%s key %s: %v", ns, name, key, err))
+		// Classify. This is the one route that hard-fails on EXTERNAL state, so
+		// collapsing every cause into 404 made an RBAC denial — the likeliest
+		// real failure, since -scrape-auth-secrets needs a `secrets get` grant
+		// the operator adds by hand — read as "no such secret", and put a
+		// permissions bug into the metadata_requests_total{outcome="not_found"}
+		// stream that obs.go documents as the container-attribution signal.
+		//
+		// A missing key or a genuinely absent Secret is the client's 404;
+		// anything else (forbidden, timeout, apiserver down) is ours, and is
+		// retryable.
+		status, kind := http.StatusBadGateway, "upstream"
+		if apierrors.IsNotFound(err) || errors.Is(err, ErrSecretKeyNotFound) {
+			status, kind = http.StatusNotFound, "not_found"
+		}
+		if status != http.StatusNotFound {
+			// The service is uniquely positioned to explain this one: the agent
+			// sees only the status code. Log it, and count it apart from the
+			// client-caused misses.
+			s.log().Warn("resolving scrape-auth secret",
+				"namespace", ns, "name", name, "key", key, "error", err)
+			w.Header().Set("Retry-After", "5")
+		}
+		obs.ScrapeAuthFailures.WithLabelValues(kind).Inc()
+		writeError(w, status, fmt.Sprintf("secret %s/%s key %s: %v", ns, name, key, err))
 		return
 	}
-	w.Header().Set("Cache-Control", "no-store")
+	// The value is about to be marshalled into a JSON string. encoding/json
+	// replaces every invalid UTF-8 byte with U+FFFD and reports no error, so a
+	// credential created from raw bytes (kubectl create secret
+	// --from-file=password=<binary>) would reach the agent silently corrupted,
+	// with a 200 and up=0 as the only evidence. Refuse loudly instead: the
+	// alternative — base64 on the wire — is a format change every deployed
+	// agent would have to learn in lockstep.
+	if !utf8.ValidString(val) {
+		obs.ScrapeAuthFailures.WithLabelValues("not_utf8").Inc()
+		s.log().Warn("scrape-auth secret value is not valid UTF-8 and cannot be served as JSON",
+			"namespace", ns, "name", name, "key", key)
+		writeError(w, http.StatusUnprocessableEntity, fmt.Sprintf(
+			"secret %s/%s key %s is not valid UTF-8; kubescrape serves credentials as JSON strings",
+			ns, name, key))
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]string{"value": val})
 }
 
@@ -470,7 +526,7 @@ func (s *Server) writeCached(w http.ResponseWriter, r *http.Request, v any, priv
 		writeError(w, http.StatusInternalServerError, "encoding response")
 		return
 	}
-	etag := `"` + strconv.FormatUint(fnvHash(body), 16) + `"`
+	etag := `"` + strconv.FormatUint(bodyHash(body), 16) + `"`
 	// max-age has second granularity: a sub-second TTL truncates to 0, which
 	// tells the client not to cache AT ALL — the opposite of a short cache, and
 	// silently (the ETag is still computed on every response). Round up so any

@@ -142,13 +142,13 @@ func TestMonitorNamespaceGate(t *testing.T) {
 			"metadata": map[string]any{"namespace": ns, "name": "m"},
 		}}
 	}
-	if !monitorAllowed(nil, mon("team-a")) {
+	if !monitorAllowed(nil, "servicemonitor", mon("team-a"), slog.New(slog.DiscardHandler)) {
 		t.Error("nil set must allow everything (backward compatible default)")
 	}
-	if !monitorAllowed(set, mon("monitoring")) {
+	if !monitorAllowed(set, "servicemonitor", mon("monitoring"), slog.New(slog.DiscardHandler)) {
 		t.Error("listed namespace must be allowed")
 	}
-	if monitorAllowed(set, mon("team-a")) {
+	if monitorAllowed(set, "servicemonitor", mon("team-a"), slog.New(slog.DiscardHandler)) {
 		t.Error("unlisted namespace must be refused")
 	}
 }

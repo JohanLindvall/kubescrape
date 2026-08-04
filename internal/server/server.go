@@ -4,7 +4,7 @@ package server
 import (
 	"context"
 	"errors"
-	"hash/fnv"
+	"log/slog"
 	"net/http"
 	"slices"
 	"strconv"
@@ -12,6 +12,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/cespare/xxhash/v2"
 
 	"github.com/JohanLindvall/kubescrape/internal/obs"
 
@@ -65,6 +67,10 @@ type Config struct {
 	// previous one for a grace window, so re-reading agents and the re-read
 	// service file never have to flip in lockstep.
 	ScrapeAuthTokens func() []string
+	// Log receives the handful of server-side events an agent cannot diagnose
+	// from a status code alone (a Secret read that failed for a reason other
+	// than "no such key"). nil uses slog.Default().
+	Log *slog.Logger
 }
 
 // Validate reports a configuration that must not start the process.
@@ -81,6 +87,14 @@ func (c Config) Validate() error {
 	}
 	return nil
 }
+
+// ErrSecretKeyNotFound reports that the Secret exists but does not carry the
+// requested key. SecretReader implementations must wrap it (%w) for that case,
+// so handleScrapeAuth can answer 404 — a client-caused miss — and reserve the
+// retryable 502 for failures that are the CLUSTER's: a forbidden read, a
+// timeout, an unreachable API server. Collapsing the two made an RBAC denial
+// indistinguishable from a typo in a monitor's secret ref.
+var ErrSecretKeyNotFound = errors.New("key not in secret")
 
 // SecretReader resolves one Secret key's value.
 type SecretReader interface {
@@ -101,6 +115,7 @@ type Server struct {
 	cacheTTL         time.Duration
 	ready            <-chan struct{}
 	now              func() time.Time
+	logger           *slog.Logger
 
 	// monMu guards the monitoredServices cache: the monitor→services match
 	// is O(monitors × services) and identical across the per-node target
@@ -131,7 +146,16 @@ func New(cfg Config) *Server {
 		cacheTTL:         cfg.CacheTTL,
 		ready:            cfg.Ready,
 		now:              time.Now,
+		logger:           cfg.Log,
 	}
+}
+
+// log returns the configured logger, or the process default.
+func (s *Server) log() *slog.Logger {
+	if s.logger != nil {
+		return s.logger
+	}
+	return slog.Default()
 }
 
 // Handler returns the HTTP routes.
@@ -321,11 +345,15 @@ func etagMatches(header, etag string) bool {
 	return false
 }
 
-func fnvHash(b []byte) uint64 {
-	h := fnv.New64a()
-	_, _ = h.Write(b)
-	return h.Sum64()
-}
+// bodyHash is the ETag digest. xxhash rather than hash/fnv: FNV-1a is a
+// byte-at-a-time loop (~1.2 GB/s) and this runs over the FULL body of every
+// cached response, including every 304 revalidation — most visibly on
+// /v1/nodes/{node}/targets, which re-serializes every pod document on the node
+// each scrape cycle. ETags are opaque to clients (etagMatches only string-
+// compares, W/ prefix stripped), so the digest function is a free choice; the
+// only visible effect is one full 200 per cached client at the upgrade
+// boundary, exactly as any other ETag change would produce.
+func bodyHash(b []byte) uint64 { return xxhash.Sum64(b) }
 
 func writeError(w http.ResponseWriter, status int, msg string) {
 	writeJSON(w, status, map[string]string{"error": msg})

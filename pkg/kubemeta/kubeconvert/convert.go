@@ -11,13 +11,6 @@ import (
 	"github.com/JohanLindvall/kubescrape/pkg/kubemeta"
 )
 
-// FromPod converts an API pod into the served metadata model. It returns the
-// pod plus an index of all known container runtime IDs (normalized) to their
-// container metadata, including the previous incarnation of restarted
-// containers when the kubelet still reports it in lastState.
-//
-// The returned kubemeta.Pod shares no memory with the input object; informer cache
-// objects must not be retained or mutated.
 // podIPs copies status.podIPs, falling back to the single status.podIP for
 // clusters (and fakes) that only populate that one.
 func podIPs(p *corev1.Pod) []string {
@@ -36,6 +29,17 @@ func podIPs(p *corev1.Pod) []string {
 	return out
 }
 
+// FromPod converts an API pod into the served metadata model. It returns the
+// pod plus an index of all known container runtime IDs (normalized) to their
+// container metadata, including the previous incarnation of restarted
+// containers when the kubelet still reports it in lastState.
+//
+// The returned kubemeta.Pod shares no memory with the input object; informer
+// cache objects must not be retained or mutated. That deep-copy guarantee is
+// what the store's treat-as-immutable contract rests on, so it belongs here,
+// on the exported function — it spent a while attached to the unexported
+// podIPs below, where `go doc` and pkg.go.dev showed this function as a bare
+// signature.
 func FromPod(p *corev1.Pod) (kubemeta.Pod, map[string]kubemeta.Container) {
 	pod := kubemeta.Pod{
 		Name:        p.Name,

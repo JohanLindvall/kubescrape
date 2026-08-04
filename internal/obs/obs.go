@@ -71,6 +71,32 @@ var (
 	// the worse outcome unalertable while the milder one was counted.
 	MonitorParseErrors = Registry.CounterVec("kubescrape_monitor_parse_errors_total",
 		"Monitor upserts that failed to parse and were dropped from the index.", "kind")
+	// MonitorNamespaceRefused counts monitors dropped because their namespace
+	// is not in -monitor-namespaces. It is the ONE outcome on that code path
+	// that had neither a metric nor a log line, which on a multi-tenant
+	// cluster makes an admin's deliberate refusal look exactly like a selector
+	// typo, a missing CRD, or a monitor that matches nothing.
+	MonitorNamespaceRefused = Registry.CounterVec("kubescrape_monitor_namespace_refused_total",
+		"Monitors ignored because their namespace is not permitted by -monitor-namespaces.", "kind")
+	// ScrapeAuthFailures counts /v1/scrape-auth requests that reached the
+	// Secret read and failed there, by CAUSE. The route is the only one that
+	// hard-fails on external state, and every cause used to answer 404: an
+	// RBAC denial (the likeliest real failure, since -scrape-auth-secrets
+	// needs a grant added by hand) was indistinguishable from a typo in a
+	// monitor's secret ref, and both landed in metadata_requests_total's
+	// not_found stream, which is documented as the container-attribution
+	// signal. `upstream` is the one to alert on.
+	ScrapeAuthFailures = Registry.CounterVec("kubescrape_scrape_auth_failures_total",
+		"Failed /v1/scrape-auth Secret resolutions by cause (not_found = no such Secret or key; upstream = forbidden, timeout or unreachable API server; not_utf8 = value cannot be served as a JSON string).", "kind")
+	// InformerWatchErrors counts list/watch failures reported by the shared
+	// informers' error handler. Readiness latches once the initial sync
+	// completes and is never re-evaluated, so a watch that breaks AFTER that
+	// (revoked RBAC, a deleted CRD, an apiserver rejecting the watch) leaves
+	// the reflector retrying forever while /readyz stays 200, the store gauges
+	// freeze at plausible values, and every response is served from a cache
+	// that has stopped advancing. This is the signal that says so.
+	InformerWatchErrors = Registry.CounterVec("kubescrape_informer_watch_errors_total",
+		"List/watch failures reported by the informers, by resource.", "resource")
 
 	// BufferTruncated counts bytes the disk buffer lost to damage discovered
 	// at OPEN (truncated tails, dropped or foreign segments — diskqueue's
@@ -511,6 +537,28 @@ func RegisterStoreStats(stats func() (pods, containers int)) {
 	Registry.GaugeFunc("kubescrape_store_containers",
 		"Container IDs currently indexed (including tombstones).",
 		func() float64 { _, containers := stats(); return float64(containers) })
+}
+
+// RegisterWaiterStats exposes the container-lookup waiter state: how many
+// lookups are blocked right now, and how many have been SHED by the cap.
+//
+// The shed is a load-shedding 503, and without its own series it is
+// indistinguishable from the not-ready 503 in
+// kubescrape_http_requests_total{pattern="/v1/containers",code="503"}. The cap
+// binding means abuse or an extreme anomaly rather than ordinary fleet load —
+// exactly the moment the operator needs the two told apart — and the gauge is
+// what shows the pressure building before the cap is reached.
+//
+// A hook rather than a counter the store bumps directly: internal/store has no
+// obs dependency, the same way the buffer stats and the self-metadata gauge
+// are wired.
+func RegisterWaiterStats(blocked func() int, shed func() int64) {
+	Registry.GaugeFunc("kubescrape_container_lookups_blocked",
+		"Container lookups currently blocked waiting for a container ID to appear.",
+		func() float64 { return float64(blocked()) })
+	Registry.CounterFunc("kubescrape_container_lookups_shed_total",
+		"Blocking container lookups refused because the store's concurrent-waiter cap was reached.",
+		func() float64 { return float64(shed()) })
 }
 
 // RegisterBufferStats exposes the disk buffer's per-signal backlog as gauges

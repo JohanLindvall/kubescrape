@@ -12,6 +12,7 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -84,6 +85,12 @@ type Store struct {
 	// earlier one; a record merely re-asserting an address it already holds
 	// keeps its old sequence and cannot displace the live owner.
 	ipSeq uint64
+
+	// shed counts lookups refused by the waiter cap. Instance state published
+	// through obs.RegisterWaiterStats rather than a counter this package bumps
+	// itself — internal/store has no obs dependency, like the buffer stats and
+	// the self-metadata gauge. Atomic because it is read outside the lock.
+	shed atomic.Int64
 }
 
 type record struct {
@@ -261,7 +268,7 @@ func (s *Store) claimPodIPLocked(rec *record, pod kubemeta.Pod, oldIPs []string)
 	// self-attribution and the ingest peer-IP fallback silently off, with a 404
 	// indistinguishable from any other.
 	for _, ip := range podAddresses(pod) {
-		s.claimOneIPLocked(rec, pod, ip, oldIPs)
+		s.claimOneIPLocked(rec, ip, oldIPs)
 	}
 	// Addresses the pod no longer reports are released.
 	for _, old := range oldIPs {
@@ -327,7 +334,12 @@ func (s *Store) releaseIPLocked(rec *record, ip string) {
 }
 
 // claimOneIPLocked applies the claim rules for ONE of a pod's addresses.
-func (s *Store) claimOneIPLocked(rec *record, pod kubemeta.Pod, ip string, oldIPs []string) {
+//
+// It deliberately takes no kubemeta.Pod: eligibility and precedence come from
+// RECORD state the caller has already established (rec.terminating, rec.ipSeq),
+// not from the pod value. Passing the pod invited a later edit to re-derive
+// them here and bypass the ipSeq ordering.
+func (s *Store) claimOneIPLocked(rec *record, ip string, oldIPs []string) {
 	s.addClaimantLocked(ip, rec)
 	{
 		if !containsStr(oldIPs, ip) {

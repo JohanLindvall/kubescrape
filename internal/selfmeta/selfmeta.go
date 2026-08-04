@@ -105,6 +105,13 @@ func Poll[T any](ctx context.Context, resolve func(context.Context) (*T, error),
 			return nil
 		}
 		current.Store(v)
+		// Reset, so the FIRST failure of each NEW outage is a Warn again.
+		// Latched, this counter made every outage after the first Debug-only:
+		// a process that resolved once at startup and then could not
+		// re-resolve — a recycled pod IP, a store that dropped the record, an
+		// RBAC change — went on reporting resolved=1 and stamping stale pod
+		// labels with nothing above Debug to say so.
+		failures.Store(0)
 		return v
 	}
 	go func() {

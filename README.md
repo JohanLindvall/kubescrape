@@ -142,7 +142,7 @@ Targets come from four sources:
   `tlsConfig` `ca`/`cert`/`keySecret`/`serverName` (see `/v1/scrape-auth`
   below), per-endpoint `interval`/`scrapeTimeout`, and the keep/drop subset
   of `metricRelabelings` (applied per sample by the agent; other relabel
-  actions and per-endpoint intervals are ignored). These targets carry
+  actions are ignored). These targets carry
   `source: "servicemonitor"` and a `monitor: "<namespace>/<name>"` field. If
   the CRD is absent at startup the feature disables itself with a warning,
   and
@@ -1349,9 +1349,11 @@ client-go's klog output through the same handler.
 
 ## Helm chart
 
-[charts/kubescrape](charts/kubescrape) deploys both components with every
-flag exposed as a value, and renders the `agent.config` value verbatim into
-the single mounted `-config` file:
+[charts/kubescrape](charts/kubescrape) deploys both components, exposing the
+commonly-tuned flags as values (everything else via `service.extraArgs` /
+`agent.extraArgs` — `-monitor-namespaces`, for instance, has no value of its
+own), and renders the `agent.config` value verbatim into the single mounted
+`-config` file:
 
 ```sh
 helm install kubescrape charts/kubescrape -n monitoring -f my-values.yaml

@@ -126,9 +126,12 @@ spec:
           image: {{ include "kubescrape.image" . }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
             runAsNonRoot: true
             runAsUser: 65532
-            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
           args:
             - -listen={{ .Values.service.listen }}
             - -self-metrics-interval={{ .Values.service.selfMetricsInterval }}

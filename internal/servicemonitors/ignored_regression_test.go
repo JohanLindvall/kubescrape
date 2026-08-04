@@ -55,3 +55,54 @@ func TestIgnoredFieldsCoverUninterpreted(t *testing.T) {
 		t.Errorf("custom-separator rule was kept (%d rules); it must be skipped", n)
 	}
 }
+
+// filterRunning lives on the ENDPOINT (PodMetricsEndpoint), not on the spec.
+// It was decoded at the spec level for a while, where it could never bind — so
+// the one field the Ignored machinery singles out as most likely to surprise
+// (its default is true, and `false` asks for the OPPOSITE of what
+// scrape.Scrapeable does) was the one silently dropped. Pin the placement.
+func TestFilterRunningIsReportedFromTheEndpoint(t *testing.T) {
+	pm := func(ep map[string]any) *unstructured.Unstructured {
+		return &unstructured.Unstructured{Object: map[string]any{
+			"metadata": map[string]any{"namespace": "ns", "name": "pm"},
+			"spec": map[string]any{
+				"selector":            map[string]any{},
+				"podMetricsEndpoints": []any{ep},
+			},
+		}}
+	}
+	m, err := ParsePodMonitor(pm(map[string]any{"port": "metrics", "filterRunning": false}))
+	if err != nil {
+		t.Fatalf("ParsePodMonitor: %v", err)
+	}
+	if got := IgnoredFields(m.Endpoints); !strings.Contains(strings.Join(got, ","), "filterRunning") {
+		t.Errorf("filterRunning: false must be reported as ignored; got %q", got)
+	}
+	// The default (true) matches what kubescrape already does, so it is not a
+	// partial application and must stay quiet.
+	m, err = ParsePodMonitor(pm(map[string]any{"port": "metrics", "filterRunning": true}))
+	if err != nil {
+		t.Fatalf("ParsePodMonitor: %v", err)
+	}
+	if got := IgnoredFields(m.Endpoints); strings.Contains(strings.Join(got, ","), "filterRunning") {
+		t.Errorf("filterRunning: true agrees with Scrapeable and must not be reported; got %q", got)
+	}
+	// Placed on the SPEC (where it does not belong) it must not be reported —
+	// that spelling is not what the CRD accepts, so claiming we ignored it
+	// would be as wrong as silently dropping the endpoint one.
+	u := &unstructured.Unstructured{Object: map[string]any{
+		"metadata": map[string]any{"namespace": "ns", "name": "pm"},
+		"spec": map[string]any{
+			"selector":            map[string]any{},
+			"filterRunning":       false,
+			"podMetricsEndpoints": []any{map[string]any{"port": "metrics"}},
+		},
+	}}
+	m, err = ParsePodMonitor(u)
+	if err != nil {
+		t.Fatalf("ParsePodMonitor: %v", err)
+	}
+	if got := IgnoredFields(m.Endpoints); strings.Contains(strings.Join(got, ","), "filterRunning") {
+		t.Errorf("spec-level filterRunning is not a CRD field; got %q", got)
+	}
+}

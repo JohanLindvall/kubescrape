@@ -68,6 +68,15 @@ spec:
     metadata:
       labels:
         app: kubescrape
+      # The chart stamps these (metrics.scrapeAnnotations) and these manifests
+      # did not, so a raw `kubectl apply -f deploy/` install opened :9090 and
+      # nothing ever scraped it — no go_*/process_* runtime metrics at all, and
+      # with -self-metrics-interval=0 no kubescrape_* either. kubescrape's own
+      # annotation discovery picks these up, so the agents scrape the service.
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9090"
+        prometheus.io/path: /metrics
     spec:
       serviceAccountName: kubescrape
       # Cluster-critical: an evicted metadata service stalls attribution
@@ -78,9 +87,12 @@ spec:
           image: ghcr.io/johanlindvall/kubescrape:latest
           imagePullPolicy: IfNotPresent
           securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
             runAsNonRoot: true
             runAsUser: 65532
-            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
           args:
             - -listen=:8080
             - -wait-timeout=5s

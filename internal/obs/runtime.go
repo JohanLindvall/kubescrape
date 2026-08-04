@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/pprof"
+	"sync"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -111,21 +112,46 @@ func ServeMetrics(ctx context.Context, addr string, internal bool, log *slog.Log
 			log.Error("metrics endpoint failed", "addr", addr, "error", err)
 		}
 	}()
-	return func() {
-		sctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		_ = srv.Shutdown(sctx)
-	}, nil
+	return stopOnContext(ctx, srv), nil
+}
+
+// stopOnContext returns an idempotent stop func for srv AND arms the same
+// shutdown on ctx.
+//
+// Both listeners here documented "shutting down when ctx is done" while
+// ignoring ctx entirely, so a caller that cancelled the context and dropped
+// the returned func — which the signature invites, since the ctx is right
+// there — leaked the listener and its goroutine for the process lifetime. Make
+// the documented contract the real one, and keep the returned func working for
+// callers that defer it.
+func stopOnContext(ctx context.Context, srv *http.Server) func() {
+	var once sync.Once
+	stop := func() {
+		once.Do(func() {
+			sctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+			defer cancel()
+			_ = srv.Shutdown(sctx)
+		})
+	}
+	context.AfterFunc(ctx, stop)
+	return stop
 }
 
 // ServePprof starts a dedicated HTTP listener serving net/http/pprof under
-// /debug/pprof, shutting down when ctx is done. Its own port, separate from
-// both the metrics endpoint and the health/debug surface: profiles expose
-// goroutine stacks and heap contents, so the port that carries them is the one
-// you firewall, bind to localhost, or leave unset. Empty addr disables it.
-func ServePprof(ctx context.Context, addr string, log *slog.Logger) func() {
+// /debug/pprof, shutting down when ctx is done or when the returned func is
+// called. Its own port, separate from both the metrics endpoint and the
+// health/debug surface: profiles expose goroutine stacks and heap contents, so
+// the port that carries them is the one you firewall, bind to localhost, or
+// leave unset. Empty addr disables it.
+//
+// The bind is synchronous and its failure returned, like ServeMetrics. The
+// consequence is milder here — this listener is opt-in, and an unset flag
+// produces no log line at all while a bind failure produces exactly one Error,
+// so the two states were already distinguishable — but a caller that asked for
+// a port and did not get one should not have to read the log to find out.
+func ServePprof(ctx context.Context, addr string, log *slog.Logger) (func(), error) {
 	if addr == "" {
-		return func() {}
+		return func() {}, nil
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /debug/pprof/", pprof.Index)
@@ -133,18 +159,19 @@ func ServePprof(ctx context.Context, addr string, log *slog.Logger) func() {
 	mux.HandleFunc("GET /debug/pprof/profile", pprof.Profile)
 	mux.HandleFunc("GET /debug/pprof/symbol", pprof.Symbol)
 	mux.HandleFunc("GET /debug/pprof/trace", pprof.Trace)
-	// No ReadHeaderTimeout bound on the profile handlers: /debug/pprof/profile
-	// legitimately streams for its full ?seconds= duration.
+	// ReadHeaderTimeout only: no whole-request Read/WriteTimeout, because
+	// /debug/pprof/profile legitimately streams for its full ?seconds=
+	// duration and either bound would cut a long profile off mid-body.
 	srv := &http.Server{Addr: addr, Handler: mux, ReadHeaderTimeout: 10 * time.Second}
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return func() {}, fmt.Errorf("pprof endpoint %s: %w", addr, err)
+	}
 	go func() {
 		log.Info("pprof endpoint started", "addr", addr, "path", "/debug/pprof/")
-		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Error("pprof endpoint failed", "addr", addr, "error", err)
 		}
 	}()
-	return func() {
-		sctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		_ = srv.Shutdown(sctx)
-	}
+	return stopOnContext(ctx, srv), nil
 }

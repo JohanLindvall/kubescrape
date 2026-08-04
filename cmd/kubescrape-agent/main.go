@@ -511,7 +511,12 @@ func run() error {
 		return err
 	}
 	defer stopMetrics()
-	stopPprof := obs.ServePprof(ctx, *pprofListen, log)
+	stopPprof, err := obs.ServePprof(ctx, *pprofListen, log)
+	if err != nil {
+		// An operator who asked for a profiling port and did not get one should
+		// not have to find that out in the log.
+		return err
+	}
 	defer stopPprof()
 
 	ready := newReadiness()

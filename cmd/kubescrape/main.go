@@ -98,6 +98,9 @@ func typedHandler[T any](upsert, del func(T)) cache.ResourceEventHandlerFuncs {
 // half-built (or empty) target list instead of a 503 telling it to come back.
 func registerCoreInformers(factory informers.SharedInformerFactory, st *store.Store, svcIndex *services.Index) ([]cache.InformerSynced, error) {
 	podInformer := factory.Core().V1().Pods().Informer()
+	if err := watchErrors(podInformer, "pods"); err != nil {
+		return nil, fmt.Errorf("pod watch error handler: %w", err)
+	}
 	podReg, err := podInformer.AddEventHandler(typedHandler(
 		func(pod *corev1.Pod) { st.UpsertPod(pod) },
 		func(pod *corev1.Pod) { st.DeletePod(pod.UID) },
@@ -109,6 +112,9 @@ func registerCoreInformers(factory informers.SharedInformerFactory, st *store.St
 	// Services are matched against pods for service-annotation based scrape
 	// discovery; their specs are small, so the full objects are cached.
 	svcInformer := factory.Core().V1().Services().Informer()
+	if err := watchErrors(svcInformer, "services"); err != nil {
+		return nil, fmt.Errorf("service watch error handler: %w", err)
+	}
 	svcReg, err := svcInformer.AddEventHandler(typedHandler(
 		func(svc *corev1.Service) { svcIndex.Upsert(svc) },
 		func(svc *corev1.Service) { svcIndex.Delete(svc.Namespace, svc.UID) },
@@ -128,6 +134,9 @@ func registerOwnerInformers(metaFactory metadatainformer.SharedInformerFactory) 
 		inf := metaFactory.ForResource(gvr)
 		if err := inf.Informer().SetTransform(stripManagedFields); err != nil {
 			return nil, nil, fmt.Errorf("setting %s informer transform: %w", gvr.Resource, err)
+		}
+		if err := watchErrors(inf.Informer(), gvr.Resource); err != nil {
+			return nil, nil, fmt.Errorf("%s watch error handler: %w", gvr.Resource, err)
 		}
 		listers[gvr] = inf.Lister()
 		synced = append(synced, inf.Informer().HasSynced)
@@ -161,20 +170,22 @@ func startServiceMonitors(ctx context.Context, cfg *rest.Config, disco discovery
 	}
 	dynFactory := dynamicinformer.NewDynamicSharedInformerFactory(dynClient, resync)
 	smInformer := dynFactory.ForResource(servicemonitors.GVR).Informer()
-	// Unstructured objects retain managedFields unless stripped, like
-	// the typed informers' transform does.
-	if err := smInformer.SetTransform(func(obj any) (any, error) {
-		if u, ok := obj.(*unstructured.Unstructured); ok {
-			unstructured.RemoveNestedField(u.Object, "metadata", "managedFields")
-		}
-		return obj, nil
-	}); err != nil {
+	// Unstructured objects retain managedFields unless stripped, like the
+	// typed informers' transform does. stripManagedFields goes through
+	// apimeta.Accessor, which handles *unstructured.Unstructured, so ONE
+	// transform serves every informer here — this used to be a bespoke
+	// closure, and its PodMonitor sibling was a copy that simply never got
+	// written, leaving that one cache carrying full managedFields trees.
+	if err := smInformer.SetTransform(stripManagedFields); err != nil {
 		return nil, nil, fmt.Errorf("servicemonitor informer transform: %w", err)
+	}
+	if err := watchErrors(smInformer, "servicemonitors"); err != nil {
+		return nil, nil, fmt.Errorf("servicemonitor watch error handler: %w", err)
 	}
 	monitors := servicemonitors.NewIndex()
 	smReg, err := smInformer.AddEventHandler(typedHandler(
 		func(u *unstructured.Unstructured) {
-			if !monitorAllowed(allowNS, u) {
+			if !monitorAllowed(allowNS, "servicemonitor", u, log) {
 				return
 			}
 			if err := monitors.Upsert(u); err != nil {
@@ -203,18 +214,28 @@ func startServiceMonitors(ctx context.Context, cfg *rest.Config, disco discovery
 	// 403-loops forever.
 	synced := []cache.InformerSynced{smReg.HasSynced}
 
-	// PodMonitors and Probes are optional siblings — watch whichever the
-	// cluster serves. This is the same idempotent discovery GET as the
-	// pre-check above, so an error here is as fatal as one there.
+	// PodMonitors are an optional sibling — watch it when the cluster serves
+	// it. This is the same idempotent discovery GET as the pre-check above, so
+	// an error here is as fatal as one there. (Probes are deliberately not
+	// supported at all: blackbox probing has no node affinity and does not fit
+	// the node-local model.)
 	served, err := monitoringResources(disco)
 	if err != nil {
 		return nil, nil, fmt.Errorf("listing monitoring.coreos.com resources: %w", err)
 	}
 	if served[servicemonitors.PodGVR.Resource] {
 		pmInformer := dynFactory.ForResource(servicemonitors.PodGVR).Informer()
+		// The same transform as every other informer — see the ServiceMonitor
+		// one above.
+		if err := pmInformer.SetTransform(stripManagedFields); err != nil {
+			return nil, nil, fmt.Errorf("podmonitor informer transform: %w", err)
+		}
+		if err := watchErrors(pmInformer, "podmonitors"); err != nil {
+			return nil, nil, fmt.Errorf("podmonitor watch error handler: %w", err)
+		}
 		pmReg, err := pmInformer.AddEventHandler(typedHandler(
 			func(u *unstructured.Unstructured) {
-				if !monitorAllowed(allowNS, u) {
+				if !monitorAllowed(allowNS, "podmonitor", u, log) {
 					return
 				}
 				if err := monitors.UpsertPodMonitor(u); err != nil {
@@ -255,6 +276,7 @@ type k8sSecretReader struct {
 
 type secretCacheEntry struct {
 	value   string
+	err     error
 	fetched time.Time
 }
 
@@ -267,30 +289,63 @@ type secretCacheEntry struct {
 // renames, per-release secret names) makes that unbounded.
 const secretCacheTTL = time.Minute
 
+// secretFailureTTL bounds how long a FAILED resolution is remembered. Failures
+// were not cached at all, so a single monitor referencing a key that does not
+// exist — allowlisted by AuthSecretRefs, so it passes the handler's check and
+// reaches the API server — turned into one `secrets get` per agent per scrape
+// cycle, indefinitely, against the client's QPS=50 budget and one audit entry
+// apiece. The reader's own doc comment ("per-scrape-cycle lookups must not
+// hammer the API server") was true only on the success path.
+//
+// Much shorter than secretCacheTTL, deliberately: a cached failure DELAYS
+// recovery after the operator fixes the RBAC grant or creates the key, and
+// that repair is the moment responsiveness matters most.
+const secretFailureTTL = 10 * time.Second
+
 func (r *k8sSecretReader) Get(ctx context.Context, namespace, name, key string) (string, error) {
 	ck := namespace + "/" + name + "/" + key
 	r.mu.Lock()
-	if e, ok := r.cache[ck]; ok && time.Since(e.fetched) < secretCacheTTL {
+	if e, ok := r.cache[ck]; ok && time.Since(e.fetched) < e.ttl() {
 		r.mu.Unlock()
-		return e.value, nil
+		return e.value, e.err
 	}
 	r.evictExpiredLocked()
 	r.mu.Unlock()
 	sec, err := r.client.CoreV1().Secrets(namespace).Get(ctx, name, metav1.GetOptions{})
 	if err != nil {
+		r.remember(ck, secretCacheEntry{err: err, fetched: time.Now()})
 		return "", err
 	}
 	val, ok := sec.Data[key]
 	if !ok {
-		return "", fmt.Errorf("key %q not in secret", key)
+		// Wrapped, not bare: handleScrapeAuth distinguishes this client-caused
+		// miss (404) from a cluster-caused failure like a forbidden read (502,
+		// retryable). See server.ErrSecretKeyNotFound.
+		err := fmt.Errorf("%w: %q", server.ErrSecretKeyNotFound, key)
+		r.remember(ck, secretCacheEntry{err: err, fetched: time.Now()})
+		return "", err
 	}
+	r.remember(ck, secretCacheEntry{value: string(val), fetched: time.Now()})
+	return string(val), nil
+}
+
+// ttl is how long this entry stays usable: failures are held far more briefly
+// than successes, so a fixed RBAC grant or a created key takes effect within
+// seconds rather than a minute.
+func (e secretCacheEntry) ttl() time.Duration {
+	if e.err != nil {
+		return secretFailureTTL
+	}
+	return secretCacheTTL
+}
+
+func (r *k8sSecretReader) remember(ck string, e secretCacheEntry) {
 	r.mu.Lock()
+	defer r.mu.Unlock()
 	if r.cache == nil {
 		r.cache = map[string]secretCacheEntry{}
 	}
-	r.cache[ck] = secretCacheEntry{value: string(val), fetched: time.Now()}
-	r.mu.Unlock()
-	return string(val), nil
+	r.cache[ck] = e
 }
 
 // evictExpiredLocked drops every entry past the TTL. It runs on the miss path
@@ -300,7 +355,7 @@ func (r *k8sSecretReader) Get(ctx context.Context, namespace, name, key string) 
 // what keeps it bounded over TIME as monitors come and go.
 func (r *k8sSecretReader) evictExpiredLocked() {
 	for k, e := range r.cache {
-		if time.Since(e.fetched) >= secretCacheTTL {
+		if time.Since(e.fetched) >= e.ttl() {
 			delete(r.cache, k)
 		}
 	}
@@ -361,13 +416,13 @@ var (
 	kubeconfig    = flag.String("kubeconfig", "", "path to a kubeconfig; defaults to in-cluster config, then $KUBECONFIG/~/.kube/config")
 	maxWait       = flag.Duration("wait-timeout", 5*time.Second, "default and maximum time a container lookup blocks waiting for metadata to appear (shorten per request with ?wait=)")
 	cacheTTL      = flag.Duration("cache-ttl", 5*time.Minute, "how long metadata of deleted pods and replaced container IDs stays resolvable")
-	metaCacheTTL  = flag.Duration("metadata-cache-ttl", 10*time.Second, "max-age sent on metadata responses (Cache-Control + ETag) so agents cache lookups client-side; 0 disables")
+	metaCacheTTL  = flag.Duration("metadata-cache-ttl", 10*time.Second, "max-age sent on metadata responses (Cache-Control + ETag) so agents cache lookups client-side. 0 disables the cache headers AND the server-side ServiceMonitor->Service memo, making every /v1/nodes/{node}/targets request rebuild the full monitor x service cross product")
 	resync        = flag.Duration("resync", 0, "informer resync period (0 disables periodic resync; the watch stream keeps the cache current)")
 	logLevel      = flag.String("log-level", "info", "log level: debug, info, warn, error")
 	logFormat     = flag.String("log-format", "text", "log format: text or json")
 
 	// ServiceMonitor CRDs (opt-in).
-	monitorsOn = flag.Bool("servicemonitors", false, "serve targets for monitoring.coreos.com ServiceMonitors selecting pod-backed Services (no per-endpoint auth or relabelings)")
+	monitorsOn = flag.Bool("servicemonitors", false, "serve targets for monitoring.coreos.com ServiceMonitors (pod-backed Services) and PodMonitors. Endpoint port/targetPort/path/scheme, per-endpoint interval/scrapeTimeout, basicAuth/authorization/bearerTokenSecret and secret-backed tlsConfig (needs -scrape-auth-secrets), and the keep/drop subset of metricRelabelings are interpreted; everything else is reported through kubescrape_monitor_fields_ignored_total and a startup warning")
 
 	// Which namespaces' monitors are HONOURED. Empty keeps every monitor
 	// in the cluster, which is the historical behaviour and stays the
@@ -385,7 +440,7 @@ var (
 
 	// Serve monitor endpoints' bearerTokenSecret values to agents (opt-in:
 	// needs secrets get RBAC; tokens travel the cluster-internal HTTP).
-	scrapeAuthOn        = flag.Bool("scrape-auth-secrets", false, "serve ServiceMonitor/PodMonitor bearerTokenSecret values to agents on /v1/scrape-auth (requires secrets get RBAC)")
+	scrapeAuthOn        = flag.Bool("scrape-auth-secrets", false, "serve the Secret keys ServiceMonitor/PodMonitor endpoints reference — bearerTokenSecret, basicAuth username/password, authorization credentials and tlsConfig ca/cert/keySecret (a CLIENT PRIVATE KEY) — to agents on /v1/scrape-auth. Only keys some indexed monitor actually names are served. Requires cluster-wide `secrets get` RBAC and -scrape-auth-token-file")
 	scrapeAuthTokenFile = flag.String("scrape-auth-token-file", "", "file holding the shared bearer token that clients must present on /v1/scrape-auth (Authorization: Bearer <token>); REQUIRED with -scrape-auth-secrets")
 
 	// Self-metrics -> OTLP (the service's only OTLP producer).
@@ -423,6 +478,27 @@ func run() error {
 	// metric anomaly or a half-finished rollout cannot be tied to a commit.
 	log.Info("kubescrape starting", "version", obs.BuildVersion(), "built", obs.BuildTime())
 
+	// A negative resync is not a mode, it is a typo: client-go treats the
+	// period as a deadline that is always in the past, so every informer
+	// resyncs continuously — replaying UpsertPod for every pod in the cluster
+	// under the store's write lock, in a loop, with no flag named anywhere in
+	// the symptoms. 0 legitimately means "no periodic resync".
+	if *resync < 0 {
+		return fmt.Errorf("-resync %v: must not be negative (0 disables periodic resync)", *resync)
+	}
+	// -scrape-auth-secrets derives its allowlist from INDEXED monitors, so
+	// without -servicemonitors nothing is ever indexed and every request to
+	// /v1/scrape-auth 404s ("no monitors indexed") — while the deployment
+	// still carries the cluster-wide `secrets: get` grant the flag requires.
+	// Warned rather than refused: -servicemonitors with the CRD absent
+	// legitimately leaves the index nil too, and that degradation is
+	// deliberate, so a hard failure here would refuse a legal configuration.
+	if *scrapeAuthOn && !*monitorsOn {
+		log.Warn("-scrape-auth-secrets has no effect without -servicemonitors: " +
+			"the served allowlist is derived from indexed monitors, so every request will 404 — " +
+			"the cluster-wide `secrets: get` grant it requires is unused")
+	}
+
 	cfg, err := buildConfig(*kubeconfig)
 	if err != nil {
 		return fmt.Errorf("building kubernetes client config: %w", err)
@@ -444,11 +520,14 @@ func run() error {
 
 	st := store.New(*cacheTTL)
 	obs.RegisterStoreStats(st.Stats)
+	obs.RegisterWaiterStats(st.BlockedLookups, st.ShedLookups)
 
-	// Full pods (spec+status are needed); managedFields are dropped before
-	// the objects enter the informer cache.
+	// Full objects (spec+status are both read), minus what nothing reads:
+	// trimPod drops managedFields from everything and, for PODS ONLY, the bulk
+	// of the spec that never reaches kubemeta.Pod. Service specs are left
+	// intact — services.Index reads them.
 	factory := informers.NewSharedInformerFactoryWithOptions(client, *resync,
-		informers.WithTransform(stripManagedFields))
+		informers.WithTransform(trimPod))
 	svcIndex := services.NewIndex()
 	synced, err := registerCoreInformers(factory, st, svcIndex)
 	if err != nil {
@@ -611,6 +690,7 @@ func run() error {
 		Ready:            ready,
 		Secrets:          secretReader,
 		ScrapeAuthTokens: scrapeAuthTokens,
+		Log:              log,
 	}
 	if err := serverCfg.Validate(); err != nil {
 		return err
@@ -627,7 +707,12 @@ func run() error {
 		return err
 	}
 	defer stopMetrics()
-	stopPprof := obs.ServePprof(ctx, *pprofListen, log)
+	stopPprof, err := obs.ServePprof(ctx, *pprofListen, log)
+	if err != nil {
+		// An operator who asked for a profiling port and did not get one should
+		// not have to find that out in the log.
+		return err
+	}
 	defer stopPprof()
 
 	errCh := make(chan error, 1)
@@ -721,8 +806,20 @@ func parseNamespaceSet(s string) map[string]bool {
 // /v1/scrape-auth will read. A gate that let the monitor into the index and
 // only filtered its targets would still widen the set of Secrets this process
 // is willing to fetch.
-func monitorAllowed(allowNS map[string]bool, u *unstructured.Unstructured) bool {
-	return allowNS == nil || allowNS[u.GetNamespace()]
+// It is also the one outcome on this code path that used to be entirely
+// silent — no metric, no log — which on a multi-tenant cluster makes an
+// admin's deliberate refusal indistinguishable from a selector typo, a missing
+// CRD, or a monitor that simply matches nothing. Counted per kind, and logged
+// at Debug (an informer resync re-delivers every object, so Info would repeat
+// the same line for every refused monitor on every resync).
+func monitorAllowed(allowNS map[string]bool, kind string, u *unstructured.Unstructured, log *slog.Logger) bool {
+	if allowNS == nil || allowNS[u.GetNamespace()] {
+		return true
+	}
+	obs.MonitorNamespaceRefused.WithLabelValues(kind).Inc()
+	log.Debug("monitor ignored: its namespace is not permitted by -monitor-namespaces",
+		"kind", kind, "monitor", u.GetNamespace()+"/"+u.GetName())
+	return false
 }
 
 // serviceMonitorCRDPresent reports whether the ServiceMonitor CRD is actually
@@ -743,7 +840,7 @@ func serviceMonitorCRDPresent(d discovery.DiscoveryInterface) (bool, error) {
 }
 
 // monitoringResources lists which monitoring.coreos.com resources the
-// cluster serves (servicemonitors, podmonitors, probes may be installed
+// cluster serves (servicemonitors and podmonitors may be installed
 // independently). A missing group/version is reported as an empty set and no
 // error — that is an answer ("nothing is installed"), not a failure to reach
 // the API server, and only the latter should be fatal to the caller.
@@ -763,12 +860,124 @@ func monitoringResources(d discovery.DiscoveryInterface) (map[string]bool, error
 }
 
 // stripManagedFields drops managedFields before objects are stored in the
-// informer caches; they are large and unused here.
+// informer caches; they are large and unused here. It goes through
+// apimeta.Accessor, so it serves the typed, metadata-only AND unstructured
+// informers alike — every one of them must call it.
 func stripManagedFields(obj any) (any, error) {
 	if acc, err := apimeta.Accessor(obj); err == nil {
 		acc.SetManagedFields(nil)
 	}
 	return obj, nil
+}
+
+// trimPod is the pod informer's transform: strip managedFields like every
+// other informer, then drop the parts of the SPEC nothing here reads.
+//
+// The pod cache is the service's dominant memory cost, and kubeconvert.FromPod
+// consumes a thin slice of the spec — NodeName, HostNetwork, and each
+// container's Name/Image/Ports. Everything else the API server sends (env
+// vars, volumes and their mounts, resource requirements, the three probes,
+// lifecycle hooks, affinity, tolerations, scheduling gates) is retained
+// verbatim for the process lifetime and never read: on a large cluster that is
+// tens of megabytes of resident heap against a 128Mi request.
+//
+// It runs as a TYPE SWITCH rather than as the factory-wide transform because
+// the Service informer shares that factory and services.Index genuinely reads
+// Service specs (selector and ports) — trimming those would break scrape
+// discovery. Anything that is not a *corev1.Pod (Services, and the
+// DeletedFinalStateUnknown tombstones that also flow through here) falls
+// through to the managedFields strip alone.
+//
+// Trimming is idempotent, which matters: client-go may apply a transform to an
+// object more than once.
+func trimPod(obj any) (any, error) {
+	pod, ok := obj.(*corev1.Pod)
+	if !ok {
+		return stripManagedFields(obj)
+	}
+	pod.ManagedFields = nil
+
+	trimContainers(pod.Spec.Containers)
+	trimContainers(pod.Spec.InitContainers)
+	for i := range pod.Spec.EphemeralContainers {
+		trimContainer(&pod.Spec.EphemeralContainers[i].EphemeralContainerCommon)
+	}
+
+	// Pod-level spec fields, none of which reach kubemeta.Pod.
+	pod.Spec.Volumes = nil
+	pod.Spec.Tolerations = nil
+	pod.Spec.Affinity = nil
+	pod.Spec.NodeSelector = nil
+	pod.Spec.SecurityContext = nil
+	pod.Spec.ImagePullSecrets = nil
+	pod.Spec.TopologySpreadConstraints = nil
+	pod.Spec.ReadinessGates = nil
+	pod.Spec.SchedulingGates = nil
+	pod.Spec.ResourceClaims = nil
+	pod.Spec.Overhead = nil
+	pod.Spec.DNSConfig = nil
+	pod.Spec.HostAliases = nil
+	return pod, nil
+}
+
+func trimContainers(cs []corev1.Container) {
+	for i := range cs {
+		c := &cs[i]
+		c.Command = nil
+		c.Args = nil
+		c.WorkingDir = ""
+		c.Env = nil
+		c.EnvFrom = nil
+		c.Resources = corev1.ResourceRequirements{}
+		c.ResizePolicy = nil
+		c.VolumeMounts = nil
+		c.VolumeDevices = nil
+		c.LivenessProbe = nil
+		c.ReadinessProbe = nil
+		c.StartupProbe = nil
+		c.Lifecycle = nil
+		c.SecurityContext = nil
+	}
+}
+
+// trimContainer is the EphemeralContainerCommon arm of trimContainers; the two
+// structs are field-identical but distinct types.
+func trimContainer(c *corev1.EphemeralContainerCommon) {
+	c.Command = nil
+	c.Args = nil
+	c.WorkingDir = ""
+	c.Env = nil
+	c.EnvFrom = nil
+	c.Resources = corev1.ResourceRequirements{}
+	c.ResizePolicy = nil
+	c.VolumeMounts = nil
+	c.VolumeDevices = nil
+	c.LivenessProbe = nil
+	c.ReadinessProbe = nil
+	c.StartupProbe = nil
+	c.Lifecycle = nil
+	c.SecurityContext = nil
+}
+
+// watchErrors installs a watch-error handler that counts before delegating to
+// client-go's default (which keeps the standard logging and the
+// expired-resourceVersion handling).
+//
+// Readiness LATCHES: /readyz gates on the initial sync and is never
+// re-evaluated. So a list/watch that breaks AFTER that — revoked RBAC, a
+// deleted CRD, an apiserver rejecting the watch — leaves the reflector
+// retrying forever while /readyz stays 200, the store gauges freeze at
+// plausible values, and every response is served from a cache that has quietly
+// stopped advancing. Without this the only trace is a klog line, which is not
+// alertable; the startup half of exactly this failure was already found and
+// fixed once (the PodMonitor informer that 403-looped behind a green /readyz).
+//
+// Must be called before the informer is started.
+func watchErrors(inf cache.SharedInformer, resource string) error {
+	return inf.SetWatchErrorHandlerWithContext(func(ctx context.Context, r *cache.Reflector, err error) {
+		obs.InformerWatchErrors.WithLabelValues(resource).Inc()
+		cache.DefaultWatchErrorHandler(ctx, r, err)
+	})
 }
 
 // warnIgnored reports the endpoint fields of a monitor that kubescrape parsed

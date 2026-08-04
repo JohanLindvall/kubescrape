@@ -40,11 +40,18 @@ type Port struct {
 type Index struct {
 	mu          sync.RWMutex
 	byNamespace map[string]map[types.UID]*Service
+	// byName maps "namespace/name" to the UID currently holding it. Services
+	// are keyed by UID, so a name reused by a RECREATED Service is the one
+	// collision the UID map cannot see — see Upsert.
+	byName map[string]types.UID
 }
 
 // NewIndex creates an empty index.
 func NewIndex() *Index {
-	return &Index{byNamespace: make(map[string]map[types.UID]*Service)}
+	return &Index{
+		byNamespace: make(map[string]map[types.UID]*Service),
+		byName:      make(map[string]types.UID),
+	}
 }
 
 // Upsert records the current state of a service.
@@ -82,6 +89,27 @@ func (ix *Index) Upsert(svc *corev1.Service) {
 		m = make(map[types.UID]*Service)
 		ix.byNamespace[svc.Namespace] = m
 	}
+	// A Service arriving under a name a DIFFERENT UID still holds means the old
+	// one is gone: its name has been reused. Normally its own Delete event
+	// handles that, and client-go synthesizes one from a
+	// DeletedFinalStateUnknown tombstone. But DeltaFIFO.Replace keys by
+	// ns/name and synthesizes Deleted only for keys ABSENT from the relist, so
+	// a Service deleted and recreated under the same name INSIDE a relist gap
+	// (apiserver restart, etcd compaction, an expired resourceVersion) arrives
+	// as an Update carrying a new UID — and nothing ever deletes the old one.
+	//
+	// Everything here is keyed by UID, so the name index is the only place the
+	// collision is visible. Left alone, the stale record keeps matching pods in
+	// Matching() and keeps yielding targets derived from a Service
+	// configuration that no longer exists — a removed annotation still
+	// scraped, or a changed port scraped forever at up=0 — until the process
+	// restarts. This is the same guard, for the same reason, that
+	// store.UpsertPod applies to pod names.
+	nameKey := svc.Namespace + "/" + svc.Name
+	if prev, ok := ix.byName[nameKey]; ok && prev != svc.UID {
+		delete(m, prev)
+	}
+	ix.byName[nameKey] = svc.UID
 	m[svc.UID] = rec
 }
 
@@ -92,6 +120,15 @@ func (ix *Index) Delete(namespace string, uid types.UID) {
 	m := ix.byNamespace[namespace]
 	if m == nil {
 		return
+	}
+	if svc, ok := m[uid]; ok {
+		// Only if this UID still holds the name: a recreation may already have
+		// claimed it above, and a late Delete for the predecessor must not
+		// unindex the live successor.
+		nameKey := namespace + "/" + svc.Name
+		if cur, ok := ix.byName[nameKey]; ok && cur == uid {
+			delete(ix.byName, nameKey)
+		}
 	}
 	delete(m, uid)
 	if len(m) == 0 {

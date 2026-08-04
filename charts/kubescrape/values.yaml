@@ -92,9 +92,13 @@ service:
   #
   # Leave everything empty and the chart generates a random 48-character token
   # into a Secret named <release>-scrape-auth, re-reading the live Secret on
-  # upgrade so the token survives `helm upgrade` (rotating it means deleting
-  # that Secret and restarting the service and the agents; the service reads
-  # the file once, at startup).
+  # upgrade so the token survives `helm upgrade`.
+  #
+  # Rotation needs NO restart, of the service or of the agents: updating the
+  # Secret is sufficient. The service re-reads the file about once a minute and
+  # keeps accepting the PREVIOUS token for a 5-minute grace window, and the
+  # agents re-read their copy on the same cadence — so neither side has to flip
+  # in lockstep with the other.
   scrapeAuthToken:
     existingSecret: ""   # use a Secret you manage instead of the generated one
     key: token           # key within the Secret (mounted at /etc/kubescrape/scrape-auth/<key>)
@@ -330,16 +334,6 @@ agent:
     limits:
       memory: 512Mi
 
-# Ingress NetworkPolicies for both components, restricting each pod to the
-# ports the chart itself declares (the pprof port stays closed). Enabled BY
-# DEFAULT: the metadata API is unauthenticated by design, which makes network
-# Network policy. NOTE what these actually enforce: the ingress rules declare
-# which PORTS are reachable (so undeclared ones — pprof — are closed), but they
-# carry no `from` selector, so they do NOT restrict who may reach the declared
-# ones. The metadata API is unauthenticated by design and its documents are
-# object metadata the node's kubelet already has; if your threat model needs
-# the API restricted to the agents, add a `from` selector here.
-# enforcement the objects are inert, so the default costs nothing there.
 # Kubernetes events as OTLP logs. A CLUSTER-SINGLETON: this renders its own
 # single-replica Deployment of the agent binary with every per-node pipeline
 # off, plus its OWN ServiceAccount — the cluster-wide `events` read and the
@@ -577,5 +571,17 @@ azure:
   # Prefix for converted Azure metric names (<prefix><metricname>.<agg>).
   metricPrefix: "azure."
 
+# Ingress NetworkPolicies for both components, restricting each pod to the
+# ports the chart itself declares (the pprof port stays closed). Enabled BY
+# DEFAULT: the metadata API is unauthenticated by design, which makes network
+# enforcement worth having, and on a cluster with no NetworkPolicy controller
+# the objects are inert, so the default costs nothing there.
+#
+# NOTE what these actually enforce: the ingress rules declare which PORTS are
+# reachable (so undeclared ones — pprof — are closed), but they carry no `from`
+# selector, so they do NOT restrict WHO may reach the declared ones. The
+# metadata API's documents are object metadata the node's kubelet already has;
+# if your threat model needs the API restricted to the agents, add a `from`
+# selector here.
 networkPolicy:
   enabled: true

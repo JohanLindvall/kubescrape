@@ -138,7 +138,7 @@ type ScrapeTarget struct {
 	Source  string `json:"source"`
 	// Service is set when Source is "service" or "servicemonitor".
 	Service *Service `json:"service,omitempty"`
-	// Monitor names the ServiceMonitor/PodMonitor/Probe that produced the
+	// Monitor names the ServiceMonitor/PodMonitor that produced the
 	// target ("ns/name").
 	Monitor string `json:"monitor,omitempty"`
 	// InsecureSkipVerify scrapes an https target without verifying its

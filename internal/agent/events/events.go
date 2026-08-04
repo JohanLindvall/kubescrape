@@ -122,8 +122,16 @@ type Reader struct {
 	batch []entry
 	// committed is the position every exported batch has reached; pending is
 	// the newest position SEEN (bookmarks included) but not yet exported.
-	committed   Position
-	pendingRV   string
+	committed Position
+	pendingRV string
+	// seenRV is the highest revision this PROCESS has observed, whether or not
+	// anything has been acked. It is the resume point for a cold stream restart
+	// before the first commit — see startResourceVersion — and is deliberately
+	// never persisted, so the ConfigMap position stays strictly ack-gated.
+	seenRV string
+	// now is the wall clock, injectable for tests (the store.now pattern). It
+	// exists so the watermark clamp below is testable without sleeping.
+	now         func() time.Time
 	lastPersist time.Time
 	lastFlush   time.Time
 	// replaying is set while the current stream is a full-backlog replay (it
@@ -191,7 +199,7 @@ func New(cfg Config) *Reader {
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
 	}
-	return &Reader{cfg: cfg, log: cfg.Logger}
+	return &Reader{cfg: cfg, log: cfg.Logger, now: time.Now}
 }
 
 // ValidateStartMode reports an unknown start mode.
@@ -263,6 +271,22 @@ func (r *Reader) shutdownBudget() time.Duration {
 // treats these as opaque, but etcd's are decimal integers, so compare
 // numerically where both parse and fall back to keeping what we have (the
 // conservative direction: never move the position backwards on a guess).
+// noteSeen advances the in-process resume point. Unlike committed.ResourceVersion
+// this is NOT ack-gated: it only decides where a cold restart of the watch
+// resumes within one process lifetime, and resuming too early costs duplicates
+// while resuming too late loses events outright.
+// replaySlack widens the relist replay boundary. It absorbs the second
+// truncation of metav1.Time plus modest node clock skew; anything it lets
+// through a second time is a duplicate, which the pipeline already tolerates,
+// while anything it excludes is lost outright.
+const replaySlack = time.Minute
+
+func (r *Reader) noteSeen(rv string) {
+	if rv != "" && newerRV(rv, r.seenRV) {
+		r.seenRV = rv
+	}
+}
+
 func newerRV(a, b string) bool {
 	if b == "" {
 		return true
@@ -304,7 +328,20 @@ func (r *Reader) stream(ctx context.Context) error {
 	// API server and delivers only what follows.
 	r.replaying = rv == ""
 	// Snapshot, not a live read: see replayFrom.
+	//
+	// With SLACK, because the boundary is a maximum over timestamps written by
+	// different components with unsynchronised clocks and two different
+	// precisions (metav1.Time is second-truncated, MicroTime is not). A strict
+	// comparison against that maximum drops never-exported events on the one
+	// path whose purpose is recovering them — an event stamped 10:00:00Z by a
+	// reporter whose clock lags, arriving after one stamped 10:00:00.9, is
+	// below the boundary and is silently discarded. The documented bias is
+	// toward duplicates over loss, and duplicates are what at-least-once
+	// already tolerates.
 	r.replayFrom = r.committed.Watermark
+	if !r.replayFrom.IsZero() {
+		r.replayFrom = r.replayFrom.Add(-replaySlack)
+	}
 	if redelivers && len(r.batch) > 0 {
 		// Everything buffered is AFTER rv (entries only outlive a flush that
 		// failed, and the position never advanced past them), so this watch
@@ -384,6 +421,24 @@ func (r *Reader) startResourceVersion(ctx context.Context) (rv string, redeliver
 		// "" replays everything the API server still holds (the event TTL).
 		return "", true, nil
 	}
+	if r.seenRV != "" {
+		// A stream that already ran in this process resumes where it stopped.
+		//
+		// Re-Listing here instead loses everything between the dead watch and
+		// the new List: the List revision is the CURRENT store revision and was
+		// never retained, so each restart began after whatever happened since.
+		// The window is the whole interval before the first ACKED export —
+		// which is exactly a collector outage on a fresh install, since any
+		// export failure tears the stream down and Run backs off and re-Lists,
+		// repeating for the length of the outage. Nothing counted it.
+		//
+		// Everything still buffered is OLDER than this revision, so it is not
+		// re-delivered and must be retained — the same contract as the List
+		// branch below. seenRV is deliberately NOT persisted: the ConfigMap
+		// position stays strictly ack-gated, and this only closes the
+		// in-process gap.
+		return r.seenRV, false, nil
+	}
 	// Skip the backlog: take a resourceVersion without the items. Persisting
 	// this later is legitimate — everything after it is either exported or
 	// replayed — but nothing before it was ever consumed.
@@ -392,6 +447,7 @@ func (r *Reader) startResourceVersion(ctx context.Context) (rv string, redeliver
 		return "", false, err
 	}
 	r.log.Info("starting events at the current revision", "resourceVersion", list.ResourceVersion)
+	r.seenRV = list.ResourceVersion
 	return list.ResourceVersion, false, nil
 }
 
@@ -401,6 +457,9 @@ func (r *Reader) expire(stage string) {
 	obs.EventRelists.WithLabelValues(stage).Inc()
 	r.committed.ResourceVersion = ""
 	r.pendingRV = ""
+	// The revision aged out of the API server's watch window, so the
+	// in-process memory of it is dead too and must not be resumed from.
+	r.seenRV = ""
 	// Only once something has been exported: with a zero watermark nothing
 	// would filter the replay, and a cold -events-start=end would turn its
 	// first expiry into the full backlog the operator asked to skip.
@@ -422,6 +481,7 @@ func (r *Reader) handle(ctx context.Context, ev watch.Event) error {
 		// flush that covers them (the tailer's watermark discipline).
 		if o, ok := ev.Object.(*corev1.Event); ok && o.ResourceVersion != "" {
 			r.pendingRV = o.ResourceVersion
+			r.noteSeen(o.ResourceVersion)
 			if len(r.batch) == 0 {
 				r.committed.ResourceVersion = o.ResourceVersion
 				r.relist = false // a bookmark covers everything before it
@@ -442,6 +502,10 @@ func (r *Reader) handle(ctx context.Context, ev watch.Event) error {
 	if !ok {
 		return nil
 	}
+	// Before the wanted() filter: seenRV records where the STREAM is, which is
+	// true of a replayed event the watermark drops just as much as of one we
+	// keep. Recording it only for kept events would resume behind the filter.
+	r.noteSeen(e.ResourceVersion)
 	if !r.wanted(e) {
 		return nil
 	}
@@ -543,7 +607,18 @@ func (r *Reader) settle(newest entry) {
 		r.pendingRV = ""
 	}
 	if newest.when.After(r.committed.Watermark) {
-		r.committed.Watermark = newest.when
+		// Clamp to wall clock first. The watermark is a running MAXIMUM over
+		// event timestamps written by whichever component reported each event,
+		// so one reporter with a fast clock would otherwise latch a boundary in
+		// the future and make the relay filter discard everything until real
+		// time caught up — on the one path whose whole purpose is recovering
+		// events that were never delivered.
+		if now := r.now(); newest.when.After(now) {
+			newest.when = now
+		}
+		if newest.when.After(r.committed.Watermark) {
+			r.committed.Watermark = newest.when
+		}
 	}
 	if r.committed.ResourceVersion != "" {
 		// The replay (if one was pending) is secured up to this position: a

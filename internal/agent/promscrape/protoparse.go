@@ -279,7 +279,21 @@ func (s *Scraper) protoExemplar(pe *dto.Exemplar, scratch *Exemplar) *Exemplar {
 // isNative reports whether a histogram carries native (exponential) data:
 // a schema plus span-encoded buckets or a zero bucket. NHCB (custom bounds,
 // schema -53) is NOT native-exponential and falls back to classic buckets.
+//
+// A NIL histogram is not native. That case is reachable from the wire: a
+// HISTOGRAM (or GAUGE_HISTOGRAM) family whose Metric omits the histogram
+// submessage yields nil from GetHistogram(), and the raw field reads below
+// (h.Schema, h.ZeroThreshold, h.ZeroCount) would dereference it — the generated
+// GetSchema() above is nil-safe and hides that. Nothing in the agent recovers a
+// panic, so a scraped target could crash the process with a few bytes of
+// malformed protobuf and hold the node's DaemonSet in CrashLoopBackOff, since
+// the same target is re-scraped every cycle. The classic fallback below is all
+// nil-safe getters and degrades to an empty histogram, which is what a family
+// carrying no data should produce.
 func isNative(h *dto.Histogram) bool {
+	if h == nil {
+		return false
+	}
 	if h.GetSchema() == -53 {
 		return false
 	}

@@ -153,7 +153,7 @@ func (t *Tailer) readFile(ctx context.Context, f *file) error {
 		if st, err := os.Stat(f.path); err == nil &&
 			inodeOf(st) == f.inode && st.Size() >= f.readPos &&
 			!st.ModTime().Equal(f.lastMod) && !f.fp.matches(f.f) {
-			t.reopen(ctx, f, false)
+			t.reopen(ctx, f, false, true)
 			f.lastMod = st.ModTime()
 			if err := t.ensureOpen(f); err != nil {
 				return err
@@ -217,15 +217,19 @@ func (t *Tailer) handleRotation(ctx context.Context, f *file, st os.FileInfo, re
 		// Rename rotation: the path names a new file. Drain what the old
 		// writer appended after our last read, then switch — carrying a
 		// straddling multi-line group across the boundary. An aborted drain
-		// (mid-drain flush failure rewound this fd) must NOT proceed to
-		// reopen — the old inode is not fully consumed and the segment would
-		// exclude its unread tail; stay on the old inode and retry the whole
-		// rotation next sweep, with the sweep cadence as the backoff.
-		if !t.drainFile(ctx, f) {
-			f.dirty = true
-			return false
-		}
-		t.reopen(ctx, f, true)
+		// (mid-drain flush failure rewound this fd) does NOT abandon the
+		// rotation: reopen records the un-drained inode as an OPEN-ENDED
+		// segment so feedSegments replays its remainder later, and the new
+		// incarnation is opened below either way.
+		//
+		// Staying on the old inode instead — no fd, no segment, no record of
+		// the file now at the path — lost the NEXT incarnation whole whenever a
+		// second rotation landed inside the window, silently and uncounted. The
+		// window is not one sweep: the abort only clears once an export
+		// succeeds, so it is the entire export outage, which is exactly when
+		// rotations pile up.
+		drained := t.drainFile(ctx, f)
+		t.reopen(ctx, f, true, drained)
 		// Open the NEW incarnation now, not on the next sweep. reopen clears
 		// f.f/f.inode/f.fp, so until the file is opened again it has no fd and
 		// no identity: a SECOND rotation inside that window finds nothing to
@@ -240,12 +244,12 @@ func (t *Tailer) handleRotation(ctx context.Context, f *file, st os.FileInfo, re
 	case st.Size() < f.readPos:
 		// In-place truncation: the unread tail is gone; restart at zero.
 		// (Draining would read the replacement content mid-stream.)
-		t.reopen(ctx, f, false)
+		t.reopen(ctx, f, false, true)
 	case read == 0 && !st.ModTime().Equal(f.lastMod) && !f.fp.matches(f.f):
 		// The file changed without yielding new bytes past our offset and
 		// its head no longer matches: truncated and rewritten to a size at
 		// or beyond our position (same-size copytruncate). Restart.
-		t.reopen(ctx, f, false)
+		t.reopen(ctx, f, false, true)
 	}
 	return true
 }
@@ -299,7 +303,7 @@ func (t *Tailer) ensureOpen(f *file) error {
 		// inline reset also skipped restartAt, so a rate-limit pause or an
 		// oversized-line discard window survived into a file that has nothing
 		// to do with them.
-		f.exportedHigh = pos{}
+		f.exportedHighs = nil
 		f.newTail()
 		t.newPipeline(f) // fresh stages; reset() re-arms the segment replay
 	}

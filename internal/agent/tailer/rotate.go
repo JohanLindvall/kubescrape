@@ -97,7 +97,10 @@ func (t *Tailer) flushDuringDrain(ctx context.Context) {
 // Otherwise (truncation, copytruncate, or a rename with nothing buffered) the
 // pipeline is flushed and reset as before — carrying makes no sense when the
 // content was replaced.
-func (t *Tailer) reopen(ctx context.Context, f *file, renamed bool) {
+// drained reports whether the pre-rotation drain of the old inode completed.
+// A rename rotation whose drain ABORTED (mid-drain flush failure) is still
+// completed rather than abandoned — see the aborted branch below.
+func (t *Tailer) reopen(ctx context.Context, f *file, renamed, drained bool) {
 	obs.LogRotations.Inc()
 	// Complete lines sitting in pending (a rate-limit PAUSE leaves them there)
 	// were read from the pre-rotation content and are deliverable regardless of
@@ -155,9 +158,37 @@ func (t *Tailer) reopen(ctx context.Context, f *file, renamed bool) {
 	// batch) — captured before this rotation appends its own hop. With no
 	// prior segments the answer is vacuously yes (segmentsFed is only
 	// meaningful while segments exist).
-	wasFed := f.segmentsFed || len(f.segments) == 0
+	//
+	// An ABORTED drain (mid-drain flush failure) breaks that: failBatch rewound
+	// the fd and discarded the pipeline, so the old inode's owed lines are NOT
+	// live and feedSegments must replay them. Forcing wasFed false is what
+	// arms that replay.
+	aborted := renamed && !drained
+	wasFed := (f.segmentsFed || len(f.segments) == 0) && !aborted
 	hopAdded := false
-	if renamed && fedEnd > f.committed {
+	if aborted {
+		// Record the un-drained inode as an OPEN-ENDED segment (to = -1) and
+		// carry on with the rotation.
+		//
+		// Abandoning it instead — staying on the old inode with no fd, no
+		// segment and no record of the new file at the path — looked safe
+		// because the rotation would be retried next sweep. It is not: the
+		// abort can only clear once an export succeeds, so the window is the
+		// whole export outage, not one sweep. A SECOND rotation inside it finds
+		// nothing to drain, records no segment, and the entire intermediate
+		// incarnation becomes unreachable — up to the runtime's rotation size
+		// per rotation, silently, with every loss counter flat.
+		//
+		// `to = -1` is the shape discover.go already synthesises for a
+		// rotation-while-down: saveCheckpoints persists it, and replaySegment
+		// reads to EOF under its own budget and pins `to` then. The normal
+		// fedEnd > committed test cannot be used here because the rewind purged
+		// the pipeline, so nothing would be recorded at all.
+		f.segments = append(f.segments, keep(&segment{
+			id: f.tail, inode: f.inode, fp: f.fp, committed: f.committed, to: -1, fed: false,
+		}))
+		hopAdded = true
+	} else if renamed && fedEnd > f.committed {
 		// Close the tail into a segment: its uncommitted range [committed,
 		// fedEnd) is owed. If a group is still buffered the pipeline is
 		// carried below and the segment's items keep their (old-segment)
@@ -460,7 +491,7 @@ func (t *Tailer) replaySegment(ctx context.Context, f *file, p *segment) bool {
 		// unrecoverable — count it and clamp `to` to the fed boundary so the
 		// segment retires through the normal commit path instead of wedging
 		// forever below an offset no commit can ever reach (fd, checkpoint
-		// Pending entry and committedPos all pinned). A transient read error
+		// Pending entry and the commit frontier all pinned). A transient read error
 		// (lastErr not EOF) leaves the segment untouched for a retry.
 		obs.LogPrefixLost.Inc()
 		t.log.Warn("rotated segment shorter than its checkpointed range; missing tail lost",

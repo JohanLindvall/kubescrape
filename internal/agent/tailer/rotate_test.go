@@ -1293,3 +1293,65 @@ func TestSegmentShorterThanRangeRetires(t *testing.T) {
 		t.Fatalf("fed prefix must still deliver: %v", got)
 	}
 }
+
+// A SECOND rename rotation arriving while a first rotation's drain is aborted
+// must not lose the intermediate incarnation.
+//
+// The abort used to abandon the whole rotation: the tailer stayed on the old
+// inode with no fd, no segment and no record of the file now at the path. That
+// looked safe because the rotation retries next sweep — but the abort only
+// clears once an export succeeds, so the window is the entire export outage.
+// A second rotation inside it found nothing to drain and recorded no segment,
+// and the middle incarnation became unreachable: up to the runtime's rotation
+// size, lost silently with every loss counter flat.
+func TestSecondRotationDuringAbortedDrainKeepsTheMiddleIncarnation(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+	exp := &fakeExporter{}
+	tl := driveTailer(dir, exp)
+	tl.cfg.BatchSize = 2
+	tl.cfg.MaxBytesPerSweep = 40
+
+	tl.scanDir(tl.loadCheckpoints(), true)
+	writeLog(t, dir,
+		"2026-07-05T10:00:00Z stdout F a-1",
+		"2026-07-05T10:00:01Z stdout F a-2",
+		"2026-07-05T10:00:02Z stdout F a-3",
+		"2026-07-05T10:00:03Z stdout F a-4",
+	)
+	tl.scanDir(nil, false)
+	exp.mu.Lock()
+	exp.fail = 1 << 30 // the collector is down for the whole window
+	exp.mu.Unlock()
+
+	tl.sweep(ctx, true) // budget-reads part of A
+
+	// First rotation: A moves aside, B appears. The drain of A aborts because
+	// the mid-drain flush fails.
+	rotateAway(t, dir, 1)
+	writeLog(t, dir, "2026-07-05T10:00:04Z stdout F b-1", "2026-07-05T10:00:05Z stdout F b-2")
+	tl.sweep(ctx, true)
+
+	// Second rotation INSIDE the abort window: B moves aside, C appears. B is
+	// the incarnation that used to vanish.
+	rotateAway(t, dir, 1)
+	writeLog(t, dir, "2026-07-05T10:00:06Z stdout F c-1")
+	tl.sweep(ctx, true)
+
+	// The collector recovers; everything owed must arrive.
+	exp.mu.Lock()
+	exp.fail = 0
+	exp.mu.Unlock()
+	driveUntil(t, ctx, tl, func() bool {
+		got := exp.get()
+		return slices.Contains(got, "a-4") && slices.Contains(got, "b-1") &&
+			slices.Contains(got, "b-2") && slices.Contains(got, "c-1")
+	}, "every incarnation is delivered after the aborted rotation recovers")
+
+	got := exp.get()
+	for _, want := range []string{"a-1", "a-2", "a-3", "a-4", "b-1", "b-2", "c-1"} {
+		if !slices.Contains(got, want) {
+			t.Errorf("%q never arrived: an incarnation was lost across the aborted rotation", want)
+		}
+	}
+}

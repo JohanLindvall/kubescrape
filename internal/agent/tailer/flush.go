@@ -6,6 +6,7 @@ package tailer
 
 import (
 	"context"
+	"maps"
 	"path/filepath"
 	"time"
 
@@ -240,20 +241,19 @@ func (t *Tailer) flush(ctx context.Context) {
 	// the watermark's commits nothing yet, one in the SAME segment clamps to
 	// the watermark offset, and OLDER segments are unconstrained — their
 	// bytes precede everything still buffered.
-	highs := make(map[*file]pos, len(cands))
+	highs := make(map[*file]map[int]int64, len(cands))
 	for f, c := range cands {
-		// Re-offer an earlier batch's exported-but-withheld high position:
-		// its bytes are already delivered, only the commit was clamped.
-		if hp := f.exportedHigh; hp.off > 0 && hp.off > c[hp.seg] {
-			c[hp.seg] = hp.off
-		}
-		var high pos
-		for seg, off := range c {
-			if p := (pos{seg, off}); high.less(p) {
-				high = p
+		// Re-offer every earlier batch's exported-but-withheld high position:
+		// their bytes are already delivered, only the commit was clamped.
+		for seg, off := range f.exportedHighs {
+			if off > c[seg] {
+				c[seg] = off
 			}
 		}
-		highs[f] = high
+		// Snapshot the UNCLAMPED candidates per segment, before the watermark
+		// clamp below rewrites c in place. One max per file is not enough:
+		// each segment is withheld independently.
+		highs[f] = maps.Clone(c)
 		if wm, buffered := f.watermark(); buffered {
 			for seg, off := range c {
 				switch {
@@ -340,10 +340,10 @@ type batchInfo struct {
 	// segment that completed earlier) commits nothing — the segment-qualified
 	// position IS the staleness check.
 	cands map[*file]map[int]int64
-	// highs is the per-file UNCLAMPED max end position: what could commit
-	// once nothing is buffered. Recorded as file.exportedHigh on successful
+	// highs is the per-file, PER-SEGMENT unclamped end position: what could
+	// commit once nothing is buffered. Recorded as file.exportedHighs on successful
 	// commit where the watermark clamp withheld it.
-	highs map[*file]pos
+	highs map[*file]map[int]int64
 }
 
 // commitBatch advances the committed offsets of a successfully exported
@@ -385,24 +385,27 @@ func (t *Tailer) advanceBatch(inf *batchInfo) {
 		// Entries past the committed positions were DELIVERED but their
 		// commit was withheld by the build-time watermark clamp; remember the
 		// high so a later flush can re-offer it once nothing is buffered.
-		if hi := inf.highs[f]; f.committedPos().less(hi) {
-			f.exportedHigh = hi
-		} else if !f.committedPos().less(f.exportedHigh) {
-			// The commit frontier reached the remembered high: the re-offer
-			// is spent; clear it so later flushes stop proposing it.
-			f.exportedHigh = pos{}
+		f.exportedHighs = nil
+		for seg, off := range inf.highs[f] {
+			// Keep only what is still AHEAD of that segment's commit frontier,
+			// and only ids that still resolve — a retired or truncated-away
+			// segment must not be re-offered forever.
+			var committed int64
+			if seg == f.tail {
+				committed = f.committed
+			} else if sg := f.segmentByID(seg); sg != nil {
+				committed = sg.committed
+			} else {
+				continue // dead id: nothing to commit against
+			}
+			if off > committed {
+				if f.exportedHighs == nil {
+					f.exportedHighs = make(map[int]int64, 1)
+				}
+				f.exportedHighs[seg] = off
+			}
 		}
 	}
-}
-
-// committedPos is the file's overall commit frontier: the oldest incomplete
-// segment's progress, or the tail's committed offset when none remain.
-func (f *file) committedPos() pos {
-	if len(f.segments) > 0 {
-		s := f.segments[0]
-		return pos{s.id, s.committed}
-	}
-	return pos{f.tail, f.committed}
 }
 
 // failBatch rewinds a failed batch's files to their committed offsets; their

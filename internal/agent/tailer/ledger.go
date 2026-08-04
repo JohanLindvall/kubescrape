@@ -134,14 +134,22 @@ type file struct {
 	// snapshots it and stops if it moved: a failed flush purges the pipeline
 	// under the loop, so everything fed since the snapshot is gone unemitted.
 	rewindGen int
-	// exportedHigh is the highest exported-entry end position whose COMMIT was
+	// exportedHighs are the exported-entry end positions whose COMMIT was
 	// withheld by the build-time watermark clamp — another stream's group was
-	// still buffered. The next flush touching the file re-offers it: the bytes
-	// are delivered, only the checkpoint lags, and without the re-offer
+	// still buffered. The next flush touching the file re-offers them: the
+	// bytes are delivered, only the checkpoint lags, and without the re-offer
 	// `committed` freezes below readPos forever (the high entry belongs to an
-	// earlier batch that no later candidate set sees). A dead segment id here
-	// (truncated away) resolves to nothing and is dropped harmlessly.
-	exportedHigh pos
+	// earlier batch that no later candidate set sees). Dead segment ids
+	// (truncated away) resolve to nothing and are dropped harmlessly.
+	//
+	// Keyed BY SEGMENT, because withholding is per segment: the clamp deletes
+	// or lowers each segment's candidate independently. Collapsing them to one
+	// max discarded every older segment's delivered-but-withheld high the
+	// moment a newer segment had one — pos.less orders by segment id first —
+	// so that segment's `committed` stuck below its `to` for good and it could
+	// never retire: its fd stayed held and its checkpoint Prefix entry was
+	// rewritten on every save, forever.
+	exportedHighs map[int]int64
 	// discarding marks the remainder of an oversized unterminated line: the
 	// accumulated prefix was dropped (see consume), and everything up to the
 	// line's eventual newline is part of the same line, not a record.

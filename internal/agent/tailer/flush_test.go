@@ -452,7 +452,7 @@ func TestDeadSegmentCandidateCommitsNothing(t *testing.T) {
 
 	inf := &batchInfo{
 		cands: map[*file]map[int]int64{f: {deadSeg: 100}},
-		highs: map[*file]pos{f: {seg: deadSeg, off: 100}},
+		highs: map[*file]map[int]int64{f: {deadSeg: 100}},
 	}
 	tl.commitBatch(inf)
 	if f.committed != 7 {
@@ -477,7 +477,7 @@ func TestDeadSegmentCandidateCommitsNothing(t *testing.T) {
 
 // A record exported while ANOTHER stream's multi-line group is still buffered
 // has its commit withheld by the build-time watermark clamp. Once the group
-// resolves, the withheld high offset must be re-offered (file.exportedHigh) —
+// resolves, the withheld high offset must be re-offered (file.exportedHighs) —
 // without it, committed freezes below readPos FOREVER: the high entry belongs
 // to an earlier batch no later maxOffsets ever sees, so a restart re-reads
 // the tail (duplicates), idle-close can never release the fd, and the lag
@@ -628,5 +628,47 @@ func TestTraversedSegmentsAreNotClaimedWhileUnfed(t *testing.T) {
 	proposeCandidates(cands, e)
 	if cands[f][1] != 5000 {
 		t.Errorf("a fed segment was not claimed during a replay pass (segmentsFed false), got %d; nothing re-offers it, so the segment can never retire", cands[f][1])
+	}
+}
+
+// Withholding is per SEGMENT: the watermark clamp lowers or deletes each
+// segment's candidate independently. The memory of what was withheld must be
+// per segment too.
+//
+// Collapsing it to one max per file discarded an OLDER segment's
+// delivered-but-withheld high the moment a newer segment had one, because
+// pos.less orders by segment id first. That segment's `committed` then stuck
+// below its `to` for good, and retirement is the only thing that closes its fd
+// and drops its checkpoint Prefix entry — so a rotated inode was pinned and
+// re-persisted on every save, forever.
+func TestWithheldCommitsAreRememberedPerSegment(t *testing.T) {
+	dir := t.TempDir()
+	exp := &fakeExporter{}
+	tl := driveTailer(dir, exp)
+
+	f := &file{path: filepath.Join(dir, logName), committed: 0,
+		source: &compiledSource{name: "containers", containerd: true}}
+	tl.newPipeline(f)
+	oldSeg := f.tail
+	// An older segment with an owed range, then a fresh tail.
+	f.segments = append(f.segments, &segment{id: oldSeg, committed: 10, to: 100, fed: true})
+	f.newTail()
+	newSeg := f.tail
+
+	// Both segments have delivered-but-withheld highs in the same batch: the
+	// clamp lowered the CANDIDATES (what commits now) below the unclamped
+	// highs (what was actually delivered).
+	inf := &batchInfo{
+		cands: map[*file]map[int]int64{f: {oldSeg: 10, newSeg: 0}},
+		highs: map[*file]map[int]int64{f: {oldSeg: 100, newSeg: 50}},
+	}
+	tl.advanceBatch(inf)
+
+	if got := f.exportedHighs[oldSeg]; got != 100 {
+		t.Errorf("the OLDER segment's withheld high was forgotten: exportedHighs[%d] = %d, want 100 "+
+			"(it can never retire, so its fd and checkpoint entry leak)", oldSeg, got)
+	}
+	if got := f.exportedHighs[newSeg]; got != 50 {
+		t.Errorf("the newer segment's withheld high was forgotten: exportedHighs[%d] = %d, want 50", newSeg, got)
 	}
 }

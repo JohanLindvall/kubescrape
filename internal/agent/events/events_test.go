@@ -664,8 +664,19 @@ func TestReplayingIsDerivedPerStream(t *testing.T) {
 			// this assertion the only production writer of replayFrom could be
 			// deleted with the suite still green — and a zero boundary
 			// disables the filter, re-exporting a whole TTL window.
-			if !r.replayFrom.Equal(r.committed.Watermark) {
-				t.Fatalf("replayFrom = %v after stream(), want the committed watermark %v", r.replayFrom, r.committed.Watermark)
+			//
+			// It is the watermark MINUS replaySlack: the watermark is a maximum
+			// over timestamps from unsynchronised clocks at two precisions, so a
+			// strict boundary drops never-exported events on the one path that
+			// exists to recover them. A zero watermark stays zero (the filter is
+			// off, which the replaying flag above governs).
+			want := r.committed.Watermark
+			if !want.IsZero() {
+				want = want.Add(-replaySlack)
+			}
+			if !r.replayFrom.Equal(want) {
+				t.Fatalf("replayFrom = %v after stream(), want %v (watermark %v less the replay slack)",
+					r.replayFrom, want, r.committed.Watermark)
 			}
 		})
 	}
@@ -778,5 +789,93 @@ func TestPermanentRejectionCountsRecords(t *testing.T) {
 	}
 	if got := obs.EventsDroppedRecords.Value() - beforeRecords; got != 4 {
 		t.Fatalf("dropped records = %v, want 4 — the batch counter alone cannot size the loss", got)
+	}
+}
+
+// Before the first ACKED export there is no committed resourceVersion, and the
+// cold-start branch took a fresh List — whose revision is the CURRENT store
+// revision. So every stream restart in that window began AFTER everything that
+// had happened since the previous watch died, losing it silently.
+//
+// The window is not narrow: any export failure tears the stream down, Run backs
+// off and restarts, and nothing commits while the collector is down — so on a
+// fresh install with an unreachable collector the gap is the whole outage. Only
+// restart and failure counters moved; no drop counter existed.
+//
+// A stream that has already run in this process must resume from the highest
+// revision it observed instead.
+func TestColdRestartResumesFromTheHighestSeenRevision(t *testing.T) {
+	var lists int
+	client := fake.NewSimpleClientset()
+	client.PrependReactor("list", "events", func(k8stesting.Action) (bool, runtime.Object, error) {
+		lists++
+		return true, &corev1.EventList{ListMeta: metav1.ListMeta{ResourceVersion: "500"}}, nil
+	})
+	r := New(Config{Client: client, Exporter: &captureExporter{}, StartMode: StartEnd})
+
+	// First stream: no committed position and nothing seen -> List.
+	rv, redelivers, err := r.startResourceVersion(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rv != "500" || redelivers {
+		t.Fatalf("first start: rv=%q redelivers=%v, want 500/false", rv, redelivers)
+	}
+	if lists != 1 {
+		t.Fatalf("first start issued %d Lists, want 1", lists)
+	}
+
+	// The stream observes events but NOTHING is acked (the collector is down).
+	r.noteSeen("501")
+	r.noteSeen("507")
+	r.noteSeen("503") // out of order: the highest must win
+	if r.committed.ResourceVersion != "" {
+		t.Fatal("setup: nothing should be committed")
+	}
+
+	// The stream dies and restarts. It must resume at 507, not re-List at 500
+	// (or at whatever the store has advanced to since).
+	rv, redelivers, err = r.startResourceVersion(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rv != "507" {
+		t.Errorf("cold restart resumed at %q, want 507 — the events between the dead watch "+
+			"and the restart are lost", rv)
+	}
+	if redelivers {
+		t.Error("resuming past the seen revision does not redeliver, so the batch must be retained")
+	}
+	if lists != 1 {
+		t.Errorf("cold restart issued another List (%d total): that is the gap", lists)
+	}
+
+	// A Gone revision is dead: the in-process memory of it must go too, or the
+	// restart resumes from a revision the API server has dropped.
+	r.expire("watch")
+	if r.seenRV != "" {
+		t.Error("expire() must clear seenRV; a Gone revision cannot be resumed from")
+	}
+}
+
+// The watermark is a running MAXIMUM over timestamps written by whichever
+// component reported each event, so one reporter with a fast clock would latch
+// a boundary in the FUTURE and make the relist filter discard everything until
+// real time caught up.
+func TestWatermarkIsClampedToWallClock(t *testing.T) {
+	now := time.Now()
+	r := New(Config{Client: fake.NewSimpleClientset(), Exporter: &captureExporter{}})
+	r.now = func() time.Time { return now }
+
+	future := now.Add(2 * time.Hour)
+	r.batch = []entry{{when: future}}
+	r.settle(entry{when: future})
+
+	if r.committed.Watermark.After(now) {
+		t.Errorf("watermark = %v, later than wall clock %v: a fast reporter clock latched the boundary",
+			r.committed.Watermark, now)
+	}
+	if r.committed.Watermark.IsZero() {
+		t.Error("the clamp must not discard the watermark entirely")
 	}
 }

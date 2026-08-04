@@ -356,3 +356,66 @@ func TestProtoClassicSampleCountAccurate(t *testing.T) {
 		t.Fatalf("proto sample count = %d, want 3 (double-counted?)", got)
 	}
 }
+
+// A HISTOGRAM family whose Metric omits the histogram submessage yields nil
+// from GetHistogram(). isNative's raw field reads (h.Schema, h.ZeroThreshold,
+// h.ZeroCount) dereferenced it — the generated GetSchema() above them is
+// nil-safe and hid the hazard.
+//
+// This is reachable from the WIRE by any target the agent scrapes, and nothing
+// in the agent recovers a panic, so the whole process died and the same target
+// was re-scraped every cycle: a permanent CrashLoopBackOff for the node's
+// DaemonSet, triggerable by an ordinary annotated workload serving a few bytes
+// of malformed protobuf.
+//
+// The family must degrade to the classic path (all nil-safe getters), which for
+// an absent histogram means _sum 0 / _count 0 and no buckets — and the rest of
+// the exposition must still convert.
+func TestProtoHistogramWithNoHistogramSubmessage(t *testing.T) {
+	for _, mt := range []dto.MetricType{dto.MetricType_HISTOGRAM, dto.MetricType_GAUGE_HISTOGRAM} {
+		t.Run(mt.String(), func(t *testing.T) {
+			bad := &dto.MetricFamily{
+				Name:   ptr("broken_histogram_seconds"),
+				Type:   mt.Enum(),
+				Metric: []*dto.Metric{{Label: []*dto.LabelPair{{Name: ptr("a"), Value: ptr("b")}}}}, // no Histogram
+			}
+			// A well-formed family after it: the exposition must keep parsing.
+			good := &dto.MetricFamily{
+				Name:   ptr("http_requests_total"),
+				Type:   dto.MetricType_COUNTER.Enum(),
+				Metric: []*dto.Metric{{Counter: &dto.Counter{Value: ptr(7.0)}}},
+			}
+			body := protoBody(t, bad, good)
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/vnd.google.protobuf; proto=io.prometheus.client.MetricFamily; encoding=delimited")
+				_, _ = w.Write(body)
+			}))
+			t.Cleanup(srv.Close)
+
+			exp := &captureExporter{}
+			s := New(Config{
+				Node: "n1", Interval: time.Hour, Timeout: 5 * time.Second,
+				NativeHistograms: true,
+				Targets:          staticTargets{testTarget(srv.URL)},
+				Exporter:         exp, StartTime: time.Now(),
+			})
+			s.cycle(context.Background()) // must not panic
+
+			var sawCounter bool
+			for _, md := range exp.batches {
+				rms := md.ResourceMetrics()
+				for i := range rms.Len() {
+					ms := rms.At(i).ScopeMetrics().At(0).Metrics()
+					for j := range ms.Len() {
+						if ms.At(j).Name() == "http_requests_total" {
+							sawCounter = true
+						}
+					}
+				}
+			}
+			if !sawCounter {
+				t.Error("the family after the malformed one was not converted: the exposition aborted")
+			}
+		})
+	}
+}

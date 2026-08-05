@@ -203,13 +203,17 @@ func escapeValue(v string) string {
 }
 
 // escapeKey escapes a label key: the value escapes plus the key-terminating
-// '=' and the pair-separating ','. Data-point keys are DSL-restricted
-// identifiers and never need it, but RESOURCE keys are arbitrary pcommon map
-// keys from config (attrs templates, logattrs) — an unescaped '=' in one made
-// parseLabels cut the pair at the wrong place, silently renaming the exported
-// attribute and mangling its value.
+// '=', the pair-separating ',' and an EDGE space. Data-point keys are
+// DSL-restricted identifiers and never need it, but RESOURCE keys are arbitrary
+// pcommon map keys from config (attrs templates, logattrs) — an unescaped '='
+// in one made parseLabels cut the pair at the wrong place, silently renaming
+// the exported attribute and mangling its value, and an unescaped edge space
+// was eaten by the separator (String writes ", " between pairs, so parseLabels
+// has to skip it). The hashed identity is the key as given while the rendered
+// one had the space gone, so " env" and "env" were two series exporting
+// byte-identical attributes.
 func escapeKey(k string) string {
-	if !strings.ContainsAny(k, "=,\"\\\n") {
+	if !strings.ContainsAny(k, "=,\"\\\n") && !hasEdgeSpace(k) {
 		return k
 	}
 	var sb strings.Builder
@@ -221,11 +225,23 @@ func escapeKey(k string) string {
 			sb.WriteByte(k[i])
 		case '\n':
 			sb.WriteString(`\n`)
+		case ' ':
+			// Only at the edges: an interior space is unambiguous, and the
+			// escape exists solely to keep the separator skip off the key.
+			if i == 0 || i == len(k)-1 {
+				sb.WriteByte('\\')
+			}
+			sb.WriteByte(' ')
 		default:
 			sb.WriteByte(k[i])
 		}
 	}
 	return sb.String()
+}
+
+// hasEdgeSpace reports whether k starts or ends with the separator byte.
+func hasEdgeSpace(k string) bool {
+	return k != "" && (k[0] == ' ' || k[len(k)-1] == ' ')
 }
 
 // unescapeKey reverses escapeKey. Keys without a backslash return unchanged.
@@ -274,11 +290,16 @@ func parseLabels(in string) (labels, error) {
 	var out labels
 	s := in[1 : len(in)-1]
 	for s != "" {
+		// Skip exactly the separator String writes (", "), not every leading
+		// space: TrimSpace here ate a key's own leading space — and its trailing
+		// one, leaving a dangling backslash when the key was escaped — so the
+		// parsed key no longer equalled the key that was hashed.
+		s = strings.TrimPrefix(s, " ")
 		eq := indexUnescapedEq(s)
 		if eq < 0 {
 			return nil, errBadLabelString
 		}
-		key, rest := unescapeKey(strings.TrimSpace(s[:eq])), s[eq+1:]
+		key, rest := unescapeKey(s[:eq]), s[eq+1:]
 		if key == "" {
 			return nil, errBadLabelString
 		}

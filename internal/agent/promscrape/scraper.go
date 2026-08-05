@@ -44,11 +44,17 @@ type AuthSource interface {
 
 // Config configures the scraper.
 type Config struct {
-	Node        string
-	Interval    time.Duration
-	Timeout     time.Duration // per-target scrape timeout
-	Concurrency int           // concurrent target scrapes
-	BatchPoints int           // flush to the exporter after this many data points
+	Node     string
+	Interval time.Duration
+	// Timeout is the per-target scrape budget (0 or negative = the default,
+	// defaultScrapeTimeout). It is NOT read as "no timeout": targetTimeout
+	// takes the MINIMUM of it and the intervals, so a non-positive value is an
+	// already-expired context — every target and both kubelet scrapes then fail
+	// with "context deadline exceeded" on every cycle, i.e. total metric loss
+	// from a flag an operator can plausibly set to 0 meaning "unlimited".
+	Timeout     time.Duration
+	Concurrency int // concurrent target scrapes
+	BatchPoints int // flush to the exporter after this many data points
 	// BatchBytes flushes a chunk once its estimated OTLP size reaches this
 	// many bytes, whichever limit BatchPoints or BatchBytes hits first (0 =
 	// the default; negative disables the byte bound). A collector's default
@@ -127,8 +133,8 @@ type Scraper struct {
 	status atomic.Pointer[CycleStatus]
 
 	// Per-target scheduling: due holds each target's next scrape time and
-	// targetIntervals its resolved period (both keyed by URL, rebuilt every
-	// cycle so vanished targets drop out). warned dedupes per-target
+	// targetIntervals its resolved period (both keyed by scheduleKey, rebuilt
+	// every cycle so vanished targets drop out). warned dedupes per-target
 	// complaints — keyed by CONFIGURATION origin, never by URL, and bounded
 	// (see warnOnce/warnTarget). Written only by the cycle goroutine, but Run
 	// reads the intervals to size its ticker, so they are guarded.
@@ -161,10 +167,23 @@ type authCacheEntry struct {
 	fetched time.Time
 }
 
+// defaultScrapeTimeout is the per-scrape budget for a Config that supplies no
+// usable one. It matches the agent's own -scrape-timeout default, so a config
+// that zeroed the field behaves exactly like one that never set it.
+const defaultScrapeTimeout = 15 * time.Second
+
 // New creates a Scraper.
 func New(cfg Config) *Scraper {
 	if cfg.Concurrency <= 0 {
 		cfg.Concurrency = 4
+	}
+	if cfg.Timeout <= 0 {
+		// Defaulted like every other bound rather than passed through: see the
+		// field's comment for why a non-positive value cannot mean "no timeout"
+		// here. Run's `Interval <= 0` guard is the same philosophy — a nonsense
+		// duration gets a defined, non-destructive meaning instead of a
+		// fleet-wide failure mode with no metric naming it.
+		cfg.Timeout = defaultScrapeTimeout
 	}
 	if cfg.BatchPoints <= 0 {
 		cfg.BatchPoints = 10_000
@@ -562,6 +581,16 @@ func (s *Scraper) cycle(ctx context.Context) {
 	dueNow := func(key string, iv time.Duration) bool {
 		next, scheduled := s.dueAt(key)
 		if scheduled && now.Add(iv/10).Before(next) {
+			// The carried time was computed from the interval in force when it
+			// was set, so a SHORTENED one must pull it in: an endpoint edited
+			// from `interval: 2h` to 30s — or a deleted monitor whose target
+			// falls back to -scrape-interval — keeps the same schedule key, and
+			// nothing else clamps the stored time, so the target went unscraped
+			// for the residual 2h while every cycle re-committed it. Lengthening
+			// needs no counterpart: it applies at the next due time.
+			if n := now.Add(iv); next.After(n) {
+				next = n
+			}
 			due[key] = next
 			return false
 		}
@@ -606,11 +635,12 @@ func (s *Scraper) cycle(ctx context.Context) {
 		// -scrape-interval. kube-prometheus-stack ships exactly such monitors,
 		// so this tripled a default fleet's scrape rate silently.
 		iv := s.targetInterval(t)
+		key := scheduleKey(t)
 		if t.Interval != "" {
 			// Only an EXPLICIT interval may speed the loop's tick up.
-			intervals[t.URL] = iv
+			intervals[key] = iv
 		}
-		if !dueNow(t.URL, iv) {
+		if !dueNow(key, iv) {
 			continue
 		}
 		timeout := s.targetTimeout(t, iv)
@@ -681,6 +711,20 @@ func (s *Scraper) setKubeletSchedule(due map[string]time.Time) {
 // kubeletDueKeys are the schedule keys of the two kubelet scrapes. They are
 // NUL-prefixed so they cannot collide with a target URL.
 var kubeletDueKeys = []string{"\x00cadvisor", "\x00node"}
+
+// scheduleKey identifies one target's schedule slot. The URL alone does NOT:
+// the metadata service dedupes same-URL targets only WITHIN a pod, so two
+// hostNetwork pods sharing the node's IP with the same annotated port yield
+// identical URLs with different pod documents (the case its own sort comment
+// names). Sharing a slot let the cycle's last-processed duplicate overwrite the
+// other's due time and interval — a 10s endpoint on one collapsed the other
+// onto its cadence, or was itself coarsened to the default.
+//
+// The key always carries all three separators, so it cannot collide with the
+// NUL-prefixed kubelet keys even for a target with an empty URL.
+func scheduleKey(t kubemeta.ScrapeTarget) string {
+	return t.URL + "\x00" + t.Pod.UID + "\x00" + t.Source + "\x00" + t.Monitor
+}
 
 // scrapeOutcome is the health record of one scrape.
 type scrapeOutcome struct {

@@ -98,8 +98,8 @@ func (t *Tailer) traceEmitFunc(f *file) func(context.Context, multiline.Entry[ti
 // resolves the emitted line's byte range from the per-stream run bookkeeping
 // (deferred F-closed runs included) and either emits directly or hands the
 // line to the trace stage with its offsets pushed onto the FIFO.
-func (t *Tailer) criEmitFunc(f *file) func(context.Context, string, string, time.Time, int64) error {
-	return func(ctx context.Context, key, line string, when time.Time, rawStart int64) error {
+func (t *Tailer) criEmitFunc(f *file) func(context.Context, string, string, time.Time, pos) error {
+	return func(ctx context.Context, key, line string, when time.Time, rawStart pos) error {
 		st := f.stateFor(key)
 		var start, end pos
 		if st.closed {
@@ -122,7 +122,16 @@ func (t *Tailer) criEmitFunc(f *file) func(context.Context, string, string, time
 			if st.hasRun {
 				start = st.runStart
 			} else {
-				start = pos{seg: f.curSeg(), off: rawStart} // defensive; hasRun is set before AddParsed
+				// A never-F-closed P-run flushes its retained lines one by
+				// one, and the first of those emissions spends hasRun — the
+				// rest resolve from the line's own feed-time position, which
+				// the stage carried as the payload. The position must be the
+				// one captured WHEN THE LINE WAS FED: a rotation carried
+				// since then has moved the tail id, and stamping the current
+				// tail here put the fragment in a segment newer than its
+				// bytes — the watermark clamp then read the old segment as
+				// unconstrained and retired it with lines still buffered.
+				start = rawStart
 			}
 			st.hasRun = false
 			end = st.lastEnd
@@ -132,11 +141,6 @@ func (t *Tailer) criEmitFunc(f *file) func(context.Context, string, string, time
 			return nil
 		}
 		st.push(logItem{start: start, end: end, when: when})
-		// The clocks the multi-line age-out needs: the newest LOG timestamp
-		// handed to the trace stage, and the wall-clock instant we handed it
-		// over. sweep compares its cutoff against the former while lines are
-		// still arriving, and falls back to the latter once they stop.
-		f.lastLineTime, f.lastFed = when, time.Now()
 		return f.traces.AddAt(ctx, key, line, when, when)
 	}
 }
@@ -181,6 +185,15 @@ func (t *Tailer) feedLine(ctx context.Context, f *file, raw string, start, end i
 		default:
 			st = f.state(f.containerID + "/" + l.Stream)
 		}
+		// The clocks the multi-line age-out needs: the newest LOG timestamp
+		// this file fed, and the wall-clock instant it was fed at. sweep
+		// compares its cutoff against the former while lines are arriving and
+		// falls back to the latter once they stop. Stamped at FEED time, for
+		// every CRI line: a buffered P fragment reaches no emission callback,
+		// and either stage may hold lines with Multiline on or off — a
+		// wall-clock cutoff against the lines' own timestamps tears any run
+		// buffered across a sweep boundary during a backlog catch-up.
+		f.lastLineTime, f.lastFed = l.Time, time.Now()
 	}
 	seg := f.curSeg()
 	startPos, endPos := pos{seg, start}, pos{seg, end}
@@ -202,7 +215,9 @@ func (t *Tailer) feedLine(ctx context.Context, f *file, raw string, start, end i
 		st.closed, st.closedStart, st.closedEnd = true, st.runStart, endPos
 	}
 	// AddParsed reuses this parse — the only one on the whole line's path.
-	if err := f.criStage.AddParsed(ctx, f.containerID, raw, l, ok, start); err != nil {
+	// The payload is the SEGMENT-QUALIFIED start position: the stage may hold
+	// this line across a carried rotation and emit it under a newer tail id.
+	if err := f.criStage.AddParsed(ctx, f.containerID, raw, l, ok, startPos); err != nil {
 		t.log.Warn("log pipeline", "path", f.path, "error", err)
 	}
 }
@@ -244,6 +259,49 @@ func (t *Tailer) stopPipeline(ctx context.Context, f *file) {
 	}
 	if f.traces != nil {
 		_ = f.traces.Stop(ctx)
+	}
+	t.reconcileFifos(f)
+}
+
+// reconcileFifos drops offset-FIFO items no future emission can ever pop.
+//
+// The trace stage's line/byte caps consume lines they drop from retention, so
+// lines consumed AFTER a group's last accepted prefix that fell to the caps
+// are never emitted at all — a capped trace ending on a non-accepting
+// continuation line leaves their items in the FIFO with no emission left to
+// run the head-drop against. Those items pin the watermark forever: a gone
+// file never settles (fd, files-map entry and checkpoint held for the process
+// life) and a live file's committed freezes below what was delivered.
+//
+// When BOTH stages report empty, every remaining item is such an orphan by
+// definition: emission is synchronous inside Add/Flush*, so an empty stage
+// owes no callbacks. The items' end positions are folded into exportedHighs
+// first — the bytes are cap-DROPPED, and dropped lines advance offsets like
+// exported ones, but only through the commit path's watermark clamp (a
+// rewind may put those bytes back into play, and the clamp is what defers
+// the advance until they are delivered or re-dropped).
+func (t *Tailer) reconcileFifos(f *file) {
+	if f.criStage != nil && f.criStage.Len() > 0 {
+		return
+	}
+	if f.traces != nil && f.traces.Len() > 0 {
+		return
+	}
+	for _, st := range f.streams {
+		live := st.live()
+		if len(live) == 0 {
+			continue
+		}
+		for _, it := range live {
+			if f.exportedHighs == nil {
+				f.exportedHighs = make(map[int]int64, 1)
+			}
+			if it.end.off > f.exportedHighs[it.end.seg] {
+				f.exportedHighs[it.end.seg] = it.end.off
+			}
+		}
+		obs.LogFifoDropped.Add(float64(len(live)))
+		st.pop(len(live))
 	}
 }
 

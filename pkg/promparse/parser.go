@@ -331,6 +331,18 @@ func skipSpaceTab(b []byte) []byte {
 	return b
 }
 
+// trimSeparator drops the single blank that ends a directive's family token.
+// One separator is all that belongs to the syntax: HELP text is free text, so
+// trimming every leading blank swallows indentation the exposition put in a
+// description on purpose (the reference parser keeps everything past that one
+// byte, and the text becomes the OTLP Description verbatim).
+func trimSeparator(b []byte) []byte {
+	if len(b) > 0 && (b[0] == ' ' || b[0] == '\t') {
+		return b[1:]
+	}
+	return b
+}
+
 // Parse reads the exposition text from r, invoking emit for every sample.
 // The Sample (including Labels and Exemplar) is only valid during the
 // callback. A non-nil error from emit aborts the parse. Malformed lines are
@@ -361,7 +373,15 @@ func (p *Parser) resetMeta() {
 func (p *Parser) parseFrom(br *bufio.Reader, emit func(Sample) error) (malformed int, err error) {
 	for {
 		line, tooLong, rerr := p.readLine(br)
-		if len(line) > 0 && !tooLong {
+		// A read error other than io.EOF cut the body mid-line, so what came
+		// back is a PREFIX and not a line: a value token severed mid-number
+		// parses as a smaller, entirely plausible number, and a caller that
+		// keeps what was converted before an abort then ships it as real. Only
+		// a clean EOF completes an unterminated final line.
+		truncated := rerr != nil && rerr != io.EOF
+		if tooLong || (truncated && len(line) > 0) {
+			malformed++
+		} else if len(line) > 0 {
 			if ok := p.parseLine(line, emit, &err); err != nil {
 				return malformed, err
 			} else if !ok {
@@ -370,8 +390,6 @@ func (p *Parser) parseFrom(br *bufio.Reader, emit func(Sample) error) (malformed
 			if p.eof {
 				return malformed, nil
 			}
-		} else if tooLong {
-			malformed++
 		}
 		if rerr != nil {
 			if rerr == io.EOF {
@@ -482,7 +500,7 @@ func (p *Parser) parseComment(line []byte) bool {
 		// for backslash and newline.
 		family, rest, ok := familyToken(rest)
 		if ok {
-			p.setMeta(family, unescapeHelp(skipSpaceTab(rest)), "")
+			p.setMeta(family, unescapeHelp(trimSeparator(rest)), "")
 		}
 	case string(directive) == "UNIT":
 		// OpenMetrics only, one token. Carried VERBATIM into the OTLP unit:
@@ -701,6 +719,14 @@ func (p *Parser) parseSample(line []byte) (Sample, bool) {
 		}
 	}
 	rest := line[i:]
+	// Classic exposition allows blanks between the name and the label block —
+	// both reference parsers skip them — and rejecting the line loses every
+	// series of a target that writes it. OpenMetrics forbids the blank, so
+	// there it stays a parse error. Consuming it costs the value path nothing:
+	// parseFloatToken skips leading blanks itself.
+	if !p.openMetrics && len(rest) > 0 && rest[0] != '{' {
+		rest = skipSpaceTab(rest)
+	}
 
 	// Labels.
 	p.labels = p.labels[:0]
@@ -780,14 +806,17 @@ func (p *Parser) finishSample(s *Sample, rest []byte) bool {
 		if rest[0] != '#' || !p.openMetrics {
 			return false
 		}
-		if !p.exemplars {
-			return true // valid line; exemplar intentionally ignored
+		// Options.Exemplars decides whether an exemplar ATTACHES, never whether
+		// the line is VALID: a sample's value is the primary datum and its
+		// optional annotation is not worth dropping it for. Gating validity on
+		// the flag would make enabling exemplars drop samples from a target
+		// whose trailing "#" text the same parser had always tolerated, with
+		// the malformed counter as the only signal.
+		if p.exemplars {
+			if ex, ok := p.parseExemplar(rest[1:]); ok {
+				s.Exemplar = ex
+			}
 		}
-		ex, ok := p.parseExemplar(rest[1:])
-		if !ok {
-			return false
-		}
-		s.Exemplar = ex
 	}
 	return true
 }

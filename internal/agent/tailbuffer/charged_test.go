@@ -72,12 +72,12 @@ func TestReDecisionDoesNotRechargeTheRateBudget(t *testing.T) {
 
 // The cache's two lifetimes, directly: the VERDICT expires at the TTL (a
 // straggler past it gets a fresh window, which is what the knob buys) while the
-// record that the trace was decided at all outlives it (which is what stops the
+// record of what the decision BILLED outlives it (which is what stops the
 // re-charge).
 func TestDecisionCacheRemembersTheChargePastTheVerdict(t *testing.T) {
 	now := time.Unix(1700000000, 0)
 	c := newDecisionCache(10, time.Minute)
-	c.put(traceID(1), true, now)
+	c.put(traceID(1), true, true, now)
 
 	if keep, ok := c.get(traceID(1), now); !ok || !keep {
 		t.Fatal("the verdict should be live immediately after the put")
@@ -86,11 +86,11 @@ func TestDecisionCacheRemembersTheChargePastTheVerdict(t *testing.T) {
 	if _, ok := c.get(traceID(1), later); ok {
 		t.Fatal("an expired verdict must not be applied: past the TTL a straggler is a new trace")
 	}
-	if !c.seen(traceID(1)) {
-		t.Fatal("the cache forgot it had decided this trace, so the re-decision will charge the rate budget a second time")
+	if !c.charged(traceID(1)) {
+		t.Fatal("the cache forgot this trace had paid, so the re-decision will charge the rate budget a second time")
 	}
-	if c.seen(traceID(2)) {
-		t.Fatal("a trace never decided reads as seen")
+	if c.charged(traceID(2)) {
+		t.Fatal("a trace never decided reads as charged")
 	}
 }
 
@@ -104,13 +104,13 @@ func TestOnlyLiveVerdictEvictionsAreCounted(t *testing.T) {
 	c := newDecisionCache(2, time.Minute)
 
 	before := obs.TailSampleCacheEvicted.Value()
-	c.put(traceID(1), true, now)
-	c.put(traceID(2), true, now)
-	c.put(traceID(3), true, now) // evicts trace 1, whose verdict is still live
+	c.put(traceID(1), true, true, now)
+	c.put(traceID(2), true, true, now)
+	c.put(traceID(3), true, true, now) // evicts trace 1, whose verdict is still live
 	if got := obs.TailSampleCacheEvicted.Value() - before; got != 1 {
 		t.Fatalf("evicting a live verdict counted %v times, want 1", got)
 	}
-	if c.seen(traceID(1)) {
+	if _, ok := c.m[traceID(1)]; ok {
 		t.Fatal("the evicted trace is still remembered")
 	}
 
@@ -118,8 +118,8 @@ func TestOnlyLiveVerdictEvictionsAreCounted(t *testing.T) {
 	// a signal.
 	old := now.Add(2 * time.Minute)
 	before = obs.TailSampleCacheEvicted.Value()
-	c.put(traceID(4), true, old)
-	c.put(traceID(5), true, old)
+	c.put(traceID(4), true, true, old)
+	c.put(traceID(5), true, true, old)
 	if got := obs.TailSampleCacheEvicted.Value() - before; got != 0 {
 		t.Fatalf("reclaiming expired tombstones counted %v evictions, want 0", got)
 	}
@@ -131,7 +131,7 @@ func TestDecisionCacheStaysBounded(t *testing.T) {
 	now := time.Unix(1700000000, 0)
 	c := newDecisionCache(8, time.Minute)
 	for i := 0; i < 1000; i++ {
-		c.put(traceID(uint64(i)), i%2 == 0, now.Add(time.Duration(i)*time.Millisecond))
+		c.put(traceID(uint64(i)), i%2 == 0, true, now.Add(time.Duration(i)*time.Millisecond))
 	}
 	if c.len() > 8 {
 		t.Fatalf("cache holds %d entries, above its cap of 8", c.len())
@@ -154,12 +154,68 @@ func TestDecisionCacheFIFODoesNotGrowUnbounded(t *testing.T) {
 	// stays tiny and evict never runs.
 	for i := 0; i < 100000; i++ {
 		id[1] = byte(i % 8)
-		c.put(id, true, now)
+		c.put(id, true, true, now)
 	}
 	if got := c.len(); got > 8 {
 		t.Fatalf("map holds %d entries, want <= 8", got)
 	}
 	if got := len(c.fifo); got > 2*c.len()+compactFloor+8 {
 		t.Errorf("fifo holds %d slots for %d live entries — it is not being compacted", got, c.len())
+	}
+}
+
+// A decision the rate policy REFUSED spent nothing, so the trace must not be
+// remembered as charged: the fresh window a straggler opens once the verdict has
+// expired would then PEEK a budget the trace never paid, and every span it
+// admits leaves without being billed — repeatedly, once per cache TTL, for as
+// long as the entry lives.
+//
+// The observable end of that is the trace after it: the re-decision must SPEND
+// what it admits, so a genuinely new trace finds the bucket where the spending
+// left it.
+func TestARefusedDecisionIsNotRememberedAsCharged(t *testing.T) {
+	c := &capture{}
+	// Burst 10 (tracehash.NewBucket floors it at the rate), and the whole test
+	// runs in well under a millisecond of REAL time — the evaluator's bucket is
+	// the one clock a test cannot inject — so refill is under a thousandth of a
+	// token and every margin below is a whole one.
+	b, clk := newTestBuffer(t, Config{
+		Config: rateCfg(10), DecisionWait: "5s", DecisionCacheTTL: "10s",
+	}, c)
+	ctx := context.Background()
+	decide := func(specs ...spanSpec) {
+		t.Helper()
+		if err := b.ExportTraces(ctx, payload("checkout", specs...)); err != nil {
+			t.Fatal(err)
+		}
+		clk.advance(6 * time.Second)
+		b.Sweep(ctx)
+	}
+
+	decide(manySpans(1, 8)...) // spends 8 of the 10
+	if !b.cache.charged(traceID(1)) {
+		t.Fatal("the decision that billed the budget is not remembered as charged")
+	}
+
+	decide(manySpans(2, 6)...) // refused: 6 > the 2 tokens left, and nothing is spent
+	if got := c.traces()[traceID(2)]; got != 0 {
+		t.Fatalf("the over-budget trace exported %d spans", got)
+	}
+	if b.cache.charged(traceID(2)) {
+		t.Fatal("a trace the rate policy REFUSED is remembered as charged, so its next window admits spans nothing ever billed")
+	}
+
+	// Past the TTL a straggler opens a fresh window for trace 2. It fits the two
+	// remaining tokens, and it must SPEND one.
+	clk.advance(11 * time.Second)
+	decide(spanSpec{trace: 2, span: 99, end: 10})
+	if got := c.traces()[traceID(2)]; got != 1 {
+		t.Fatalf("the straggler exported %d spans, want 1", got)
+	}
+
+	// One token left, so a two-span trace no longer fits.
+	decide(manySpans(3, 2)...)
+	if got := c.traces()[traceID(3)]; got != 0 {
+		t.Fatalf("a new trace exported %d spans on a budget the re-decision was supposed to have spent", got)
 	}
 }

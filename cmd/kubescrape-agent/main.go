@@ -144,7 +144,7 @@ func singletonRole() bool {
 // The agent's flag surface. Package-level so the per-pipeline start
 // functions can read them directly; main parses.
 var (
-	configFile           = flag.String("config", "", "unified YAML config file with resourceAttributes, logs, logAttributes, logMetrics, logScrubbing, metrics, routing, traceMetrics, traceSampling and export sections")
+	configFile           = flag.String("config", "", "unified YAML config file; sections: "+configSections()+" (docs/CONFIGURATION.md)")
 	nodeName             = flag.String("node-name", os.Getenv("NODE_NAME"), "name of the node this agent runs on (default $NODE_NAME)")
 	metricsListen        = flag.String("metrics-listen", ":9090", "listen address for the Prometheus /metrics endpoint (Go runtime and process metrics; with -self-metrics-interval=0 also the kubescrape_* internal metrics, replacing the OTLP push with a scrape; empty disables). Separate from -listen so the debug/health surface and the scrape target can be exposed independently")
 	listen               = flag.String("listen", ":8081", "HTTP listen address for /healthz, /readyz, /debug/tailer and /debug/targets (empty disables)")
@@ -1099,6 +1099,11 @@ func (p *pipelines) startEvents(ctx context.Context) error {
 	return nil
 }
 
+// gateIngest is satisfied when the ingest listeners are BOUND. Apps on the node
+// push into them, so a rolling update that advanced before they bound moved
+// across the fleet while every node's receiver was still a void.
+const gateIngest = "otlp-ingest"
+
 // startIngest starts the node-local OTLP ingest receiver: LOGS AND METRICS.
 // A fatal listener failure is reported through p.fatalErr and p.stop so the
 // agent exits non-zero.
@@ -1126,14 +1131,21 @@ func (p *pipelines) startIngest(ctx context.Context) error {
 	// served here. A sender pointed at the agent for traces gets Unimplemented /
 	// 404 — a loud, immediate error naming the wrong destination — rather than an
 	// ack for spans that could never have become an edge.
-	srv := otlpingest.NewServer(otlpingest.ServerConfig{
+	scfg := otlpingest.ServerConfig{
 		GRPCAddr:    *ingestGRPC,
 		HTTPAddr:    *ingestHTTP,
 		MaxInFlight: *ingestMaxInFlight,
 		Enricher:    enr,
 		Exporter:    p.out,
 		Logger:      p.log,
-	})
+	}
+	// The gate only where something binds: with neither address configured the
+	// listeners are a no-op and Ready never fires, so registering it anyway
+	// would hold /readyz down for the process lifetime.
+	if *ingestGRPC != "" || *ingestHTTP != "" {
+		scfg.Ready = p.ready.gate(gateIngest)
+	}
+	srv := otlpingest.NewServer(scfg)
 	p.spawn(func() {
 		if err := srv.Run(ctx); err != nil {
 			// A dead ingest listener (e.g. the port already bound) must not

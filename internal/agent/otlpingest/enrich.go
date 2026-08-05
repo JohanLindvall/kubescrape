@@ -134,9 +134,92 @@ type Enricher struct {
 	mode            MetricsMode
 	log             *slog.Logger
 
-	// peerWarnGate throttles the rejected-peer warning; the enricher is shared
-	// by concurrent handlers, which is the throttle's contract.
-	peerWarnGate logdedupe.Throttle
+	// peerWarnGate/lookupWarnGate throttle their warnings; the enricher is
+	// shared by concurrent handlers, which is the throttles' contract.
+	peerWarnGate   logdedupe.Throttle
+	lookupWarnGate logdedupe.Throttle
+}
+
+// reqCache is the state one push's enrichment shares across every decision it
+// makes: memoised lookups (N resources naming one id cost one round trip) and
+// the budgets bounding what a single request may cost. One per request — the
+// Enricher itself is shared by concurrent handlers and memoises nothing.
+type reqCache struct {
+	// ids memoises attribution lookups (issued with the full Config.Wait) per
+	// kind-tagged token.
+	ids map[string]idResult
+	// probes memoises wait-free resolvability answers, negatives included:
+	// metaclient never caches a 404, so without the negative entry the split
+	// path issued one live GET per DATA POINT for the same dead id.
+	probes map[string]bool
+	// counted marks tokens whose enriched/unresolved outcome has been tallied.
+	// It decouples COUNTING from CACHING: sameObject resolves its candidate
+	// tokens through attrsFor, which fills ids WITHOUT counting, so a "was the
+	// token already cached?" gate tallied nothing for a token sameObject had
+	// already resolved.
+	counted map[string]struct{}
+	// lookups counts the live metadata lookups issued — probes and attribution
+	// builds alike — bounded by maxLookupsPerRequest.
+	lookups int
+
+	// peer memoises the peer-IP attribution: the peer is a property of the
+	// CONNECTION, so every resource in a payload has the same one (and
+	// /v1/pod-ips is deliberately uncacheable — recycled IPs need immediacy).
+	peer         pcommon.Map
+	peerResolved bool
+	peerRejected bool
+	peerDone     bool
+
+	// splitGroups/splitCopied are the splitter's per-payload budgets: the group
+	// count and the estimated bytes of minted copies (split.go). They live here
+	// because both must span every input ResourceMetrics of one push.
+	splitGroups int
+	splitCopied int
+}
+
+func newReqCache() *reqCache {
+	return &reqCache{
+		ids:     map[string]idResult{},
+		probes:  map[string]bool{},
+		counted: map[string]struct{}{},
+	}
+}
+
+// idResult is one kind-tagged token's lookup outcome. resolved and the
+// identity fields come from the LOOKUP RESULT, never from built: built is the
+// operator-FILTERED attribute rendering (enable/disable lists, defaults:
+// false can empty it), so an empty built does not mean the object is unknown —
+// reading it that way let a resourceAttributes filter change attribution
+// decisions (sameObject, the auto-mode demotion, which resource a split point
+// lands on) and count resolved lookups as unresolved.
+type idResult struct {
+	built     pcommon.Map // rendered k8s attributes; may be empty for a resolved object
+	resolved  bool
+	podUID    string
+	container string // container name; "" when the token names a whole pod
+}
+
+// maxLookupsPerRequest bounds the live metadata lookups one push may trigger.
+// The listeners are unauthenticated and lookups run serially inside the
+// handler, so without a bound a payload naming tens of thousands of DISTINCT
+// bogus ids (each a memo miss by construction) held its in-flight slot for the
+// whole walk and the metadata service for one GET each. Twice maxSplitGroups
+// because one attributable object may legitimately cost two lookups — the
+// wait-free resolvability probe and the attribution build. Past the budget an
+// id is treated as unresolvable.
+const maxLookupsPerRequest = 2 * maxSplitGroups
+
+// lookupBudgetWarnEvery throttles the over-budget warning: past the budget
+// EVERY further distinct id takes that path, and the diagnosis is per push,
+// not per id.
+const lookupBudgetWarnEvery = time.Minute
+
+func (e *Enricher) warnLookupBudget() {
+	if !e.lookupWarnGate.Allow(lookupBudgetWarnEvery) {
+		return
+	}
+	e.log.Warn("ingest: a push named more distinct ids than one request may look up; the remainder is treated as unresolvable",
+		"budget", maxLookupsPerRequest)
 }
 
 // NewEnricher creates an Enricher.
@@ -160,7 +243,7 @@ func NewEnricher(cfg Config) *Enricher {
 // without overwriting values the sender already set.
 func (e *Enricher) EnrichLogs(ctx context.Context, ld plog.Logs) {
 	// One lookup + attribute build per distinct ID across the request.
-	cache := map[string]pcommon.Map{}
+	cache := newReqCache()
 	rls := ld.ResourceLogs()
 	for i := 0; i < rls.Len(); i++ {
 		rl := rls.At(i)
@@ -258,7 +341,7 @@ func (e *Enricher) scrubValue(key string, v pcommon.Value, depth int) {
 // EnrichTraces enriches every resource in td in place (traces are otherwise a
 // passthrough signal).
 func (e *Enricher) EnrichTraces(ctx context.Context, td ptrace.Traces) {
-	cache := map[string]pcommon.Map{}
+	cache := newReqCache()
 	rss := td.ResourceSpans()
 	for i := 0; i < rss.Len(); i++ {
 		e.enrichResource(ctx, rss.At(i).Resource(), cache)
@@ -270,31 +353,33 @@ func (e *Enricher) EnrichTraces(ctx context.Context, td ptrace.Traces) {
 func (e *Enricher) EnrichMetrics(ctx context.Context, md pmetric.Metrics) pmetric.Metrics {
 	switch e.mode {
 	case MetricsDatapoint:
-		return e.splitAndEnrich(ctx, md)
+		return e.splitAndEnrich(ctx, newReqCache(), md)
 	case MetricsResource:
 		e.enrichMetricResources(ctx, md)
 		return md
 	default: // auto
-		// One cache for the decision AND the enrichment that follows, so the
-		// resolvability probes the decision makes are not paid for twice.
-		cache := map[string]pcommon.Map{}
+		// One cache for the decision AND the enrichment that follows — on BOTH
+		// branches, so the resolvability probes the decision makes are not paid
+		// for twice (a demoted payload's groupers reuse them) and the lookup
+		// budget spans the whole push rather than re-arming at the demotion.
+		cache := newReqCache()
 		if e.resourceModeSuffices(ctx, cache, md) {
 			e.enrichMetricResourcesWith(ctx, cache, md)
 			return md
 		}
-		return e.splitAndEnrich(ctx, md)
+		return e.splitAndEnrich(ctx, cache, md)
 	}
 }
 
 // enrichMetricResources enriches each ResourceMetrics from its own resource
 // attributes.
 func (e *Enricher) enrichMetricResources(ctx context.Context, md pmetric.Metrics) {
-	e.enrichMetricResourcesWith(ctx, map[string]pcommon.Map{}, md)
+	e.enrichMetricResourcesWith(ctx, newReqCache(), md)
 }
 
 // enrichMetricResourcesWith is enrichMetricResources against a caller-supplied
 // cache, so the auto-mode decision's lookups are reused.
-func (e *Enricher) enrichMetricResourcesWith(ctx context.Context, cache map[string]pcommon.Map, md pmetric.Metrics) {
+func (e *Enricher) enrichMetricResourcesWith(ctx context.Context, cache *reqCache, md pmetric.Metrics) {
 	rms := md.ResourceMetrics()
 	for i := 0; i < rms.Len(); i++ {
 		e.enrichResource(ctx, rms.At(i).Resource(), cache)
@@ -316,7 +401,7 @@ func (e *Enricher) enrichMetricResourcesWith(ctx context.Context, cache map[stri
 // kubescrape_ingest_resources_total{enriched} reading healthy. The same payload
 // in explicit datapoint mode split correctly, which is what
 // TestSplitResourceUsesDescribedObjectIdentity pins.
-func (e *Enricher) resourceModeSuffices(ctx context.Context, cache map[string]pcommon.Map, md pmetric.Metrics) bool {
+func (e *Enricher) resourceModeSuffices(ctx context.Context, cache *reqCache, md pmetric.Metrics) bool {
 	rms := md.ResourceMetrics()
 	for i := 0; i < rms.Len(); i++ {
 		rm := rms.At(i)
@@ -341,7 +426,7 @@ func (e *Enricher) resourceModeSuffices(ctx context.Context, cache map[string]pc
 
 // anyForeignDataPointID reports whether any data point in rm carries an ID
 // attribute naming a DIFFERENT object than resID (one pass, first hit wins).
-func (e *Enricher) anyForeignDataPointID(ctx context.Context, cache map[string]pcommon.Map, rm pmetric.ResourceMetrics, resID string) bool {
+func (e *Enricher) anyForeignDataPointID(ctx context.Context, cache *reqCache, rm pmetric.ResourceMetrics, resID string) bool {
 	sms := rm.ScopeMetrics()
 	for i := 0; i < sms.Len(); i++ {
 		ms := sms.At(i).Metrics()
@@ -354,7 +439,7 @@ func (e *Enricher) anyForeignDataPointID(ctx context.Context, cache map[string]p
 	return false
 }
 
-func (e *Enricher) metricPointsHaveForeignID(ctx context.Context, cache map[string]pcommon.Map, m pmetric.Metric, resID string) bool {
+func (e *Enricher) metricPointsHaveForeignID(ctx context.Context, cache *reqCache, m pmetric.Metric, resID string) bool {
 	has := func(a pcommon.Map) bool {
 		tok, ok := e.findID(a)
 		return ok && e.foreignID(ctx, cache, tok, resID)
@@ -402,18 +487,18 @@ func (e *Enricher) metricPointsHaveForeignID(ctx context.Context, cache map[stri
 // enrichResource resolves the ID on res and merges the k8s attributes it maps
 // to, without overwriting attributes the sender already set. cache memoizes
 // the built attributes per ID token for the duration of one request.
-func (e *Enricher) enrichResource(ctx context.Context, res pcommon.Resource, cache map[string]pcommon.Map) {
+func (e *Enricher) enrichResource(ctx context.Context, res pcommon.Resource, cache *reqCache) {
 	e.applyMetadata(ctx, res.Attributes(), cache)
 }
 
 // applyMetadata looks up the ID in a and merges the derived k8s attributes
 // into a, leaving existing keys untouched. It reports whether an ID resolved.
-func (e *Enricher) applyMetadata(ctx context.Context, a pcommon.Map, cache map[string]pcommon.Map) bool {
+func (e *Enricher) applyMetadata(ctx context.Context, a pcommon.Map, cache *reqCache) bool {
 	cTok, cOK := e.tokenFrom(a, e.containerIDKeys, tokContainer)
 	uTok, uOK := e.tokenFrom(a, e.podUIDKeys, tokPodUID)
 	if !cOK && !uOK {
-		built := e.peerFallback(ctx, cache)
-		if built.Len() > 0 {
+		built, resolved := e.peerFallback(ctx, cache)
+		if resolved {
 			mergeAttrs(built, a)
 			return true
 		}
@@ -423,18 +508,21 @@ func (e *Enricher) applyMetadata(ctx context.Context, a pcommon.Map, cache map[s
 	// container id the store no longer knows must not block a resolvable pod
 	// uid the sender also provided. Probe with attrsFor (no counting) and count
 	// exactly ONCE below — kubescrape_ingest_resources_total counts RESOURCES,
-	// so a resource carrying two unresolvable ids must not tally two.
+	// so a resource carrying two unresolvable ids must not tally two. enriched
+	// keys on RESOLVED, not on a non-empty rendering: the operator's attribute
+	// filter can empty the build for an object the lookup found, and that must
+	// not read as unresolved.
 	if cOK {
-		if built := e.attrsFor(ctx, cache, cTok); built.Len() > 0 {
+		if r := e.attrsFor(ctx, cache, cTok); r.resolved {
 			obs.Ingested.WithLabelValues("enriched").Inc()
-			mergeAttrs(built, a)
+			mergeAttrs(r.built, a)
 			return true
 		}
 	}
 	if uOK {
-		if built := e.attrsFor(ctx, cache, uTok); built.Len() > 0 {
+		if r := e.attrsFor(ctx, cache, uTok); r.resolved {
 			obs.Ingested.WithLabelValues("enriched").Inc()
-			mergeAttrs(built, a)
+			mergeAttrs(r.built, a)
 			return true
 		}
 	}
@@ -455,32 +543,30 @@ func (e *Enricher) tokenFrom(a pcommon.Map, keys []string, prefix string) (strin
 
 // resolves reports whether token names an object the metadata service knows,
 // without building or caching its attributes. Used to choose between a
-// container id and a pod uid when a sender supplies both.
-func (e *Enricher) resolves(ctx context.Context, cache map[string]pcommon.Map, token string) bool {
+// container id and a pod uid when a sender supplies both, and by the auto-mode
+// foreign-point walk.
+//
+// It is a PROBE — it asks "does this resolve", never "attribute this record" —
+// so it never passes Config.Wait: the server-side wait exists to hold an
+// ATTRIBUTION until a not-yet-posted id appears, and each waited request is
+// parked in the metadata service's waiter map for the full wait — a hold an
+// unauthenticated sender controls, one per distinct id it invents.
+func (e *Enricher) resolves(ctx context.Context, cache *reqCache, token string) bool {
+	if r, ok := cache.ids[token]; ok {
+		return r.resolved // already attributed: the full lookup answers the probe
+	}
 	// Memoised per request, INCLUDING the negative answer. metaclient caches
 	// 200s, but the case this probe exists for — a stale container id — answers
 	// 404, which is never cached, so on the split path (one call per DATA
 	// POINT) a payload of 500 points issued 500 live GETs from inside the
 	// handler for the same dead id.
-	if cache != nil {
-		if m, ok := cache[probeKey(token)]; ok {
-			return m.Len() > 0
-		}
+	if v, ok := cache.probes[token]; ok {
+		return v
 	}
-	pod, _ := e.lookupByID(ctx, token)
-	if cache != nil {
-		m := pcommon.NewMap()
-		if pod != nil {
-			m.PutBool("resolved", true) // non-empty marks the positive answer
-		}
-		cache[probeKey(token)] = m
-	}
+	pod, _ := e.lookupByID(ctx, cache, token, 0)
+	cache.probes[token] = pod != nil
 	return pod != nil
 }
-
-// probeKey namespaces a resolvability answer so it cannot collide with the
-// built-attribute entry for the same token.
-func probeKey(token string) string { return "\x00probe:" + token }
 
 // resolvableToken picks the id token to attribute a resource (or data point)
 // by, preferring the container id — it names the exact incarnation — but
@@ -493,7 +579,7 @@ func probeKey(token string) string { return "\x00probe:" + token }
 // payload was attributed differently by mode, and the split path additionally
 // reduced the resource to the bare unresolved id, discarding every attribute
 // the sender had set.
-func (e *Enricher) resolvableToken(ctx context.Context, cache map[string]pcommon.Map, a pcommon.Map) string {
+func (e *Enricher) resolvableToken(ctx context.Context, cache *reqCache, a pcommon.Map) string {
 	cTok, cOK := e.tokenFrom(a, e.containerIDKeys, tokContainer)
 	uTok, uOK := e.tokenFrom(a, e.podUIDKeys, tokPodUID)
 	switch {
@@ -509,19 +595,26 @@ func (e *Enricher) resolvableToken(ctx context.Context, cache map[string]pcommon
 	}
 }
 
-// attrsFor resolves and caches a token's k8s attributes WITHOUT counting the
-// outcome, for callers that probe more than one candidate token for a single
-// resource and must count exactly once themselves.
-func (e *Enricher) attrsFor(ctx context.Context, cache map[string]pcommon.Map, token string) pcommon.Map {
-	if built, ok := cache[token]; ok {
-		return built
+// attrsFor resolves and caches a token's lookup outcome WITHOUT counting it,
+// for callers that probe more than one candidate token for a single resource
+// and must count exactly once themselves. The attribution lookup carries the
+// configured wait — a not-yet-posted id the sender is about to be attributed
+// by may legitimately appear within it.
+func (e *Enricher) attrsFor(ctx context.Context, cache *reqCache, token string) idResult {
+	if r, ok := cache.ids[token]; ok {
+		return r
 	}
-	built := pcommon.NewMap()
-	if pod, container := e.lookupByID(ctx, token); pod != nil {
-		built = e.buildFor(pod, container)
+	r := idResult{built: pcommon.NewMap()}
+	if pod, container := e.lookupByID(ctx, cache, token, e.cfg.Wait); pod != nil {
+		r.resolved = true
+		r.podUID = pod.UID
+		if container != nil {
+			r.container = container.Name
+		}
+		r.built = e.buildFor(pod, container)
 	}
-	cache[token] = built
-	return built
+	cache.ids[token] = r
+	return r
 }
 
 // buildFor renders the configured k8s resource attributes for a resolved pod
@@ -539,21 +632,13 @@ func (e *Enricher) buildFor(pod *kubemeta.Pod, container *kubemeta.Container) pc
 	return built
 }
 
-// countedKey namespaces the "this token's outcome has been tallied" marker so
-// it cannot collide with the token's built-attribute entry nor the resolvability
-// probe. It is what decouples COUNTING from CACHING: the shared sameObject
-// resolves its candidate tokens through attrsFor, which populates cache[token]
-// WITHOUT counting, so a "was cache[token] present?" test tallied nothing for a
-// token sameObject had already resolved.
-func countedKey(token string) string { return "\x00counted:" + token }
-
-// builtAttrs returns the k8s attributes for a kind-tagged ID token — attrsFor
+// builtAttrs returns the lookup outcome for a kind-tagged ID token — attrsFor
 // plus the outcome counting, for single-token callers: the metadata lookup,
 // the attribute build and the enriched/unresolved tally each happen once per
 // distinct token per cache (so the per-resource counters stay per-resource;
-// resource() is memoized by id). An empty map means the ID did not resolve.
+// resource() is memoized by id).
 //
-// The tally is gated on a SEPARATE counted-marker, NOT on whether attrsFor had
+// The tally is gated on the cache's counted set, NOT on whether attrsFor had
 // to build the attributes. The split path calls sameObject (merge-vs-overwrite)
 // BEFORE builtAttrs for the same id, and sameObject resolves both tokens through
 // attrsFor — so by the time builtAttrs runs the id is already in the cache. The
@@ -564,18 +649,17 @@ func countedKey(token string) string { return "\x00counted:" + token }
 // request and never again, so it stays once-per-object and cannot double-count
 // when both sameObject and builtAttrs — or two groupers sharing the cache — run
 // for the same id.
-func (e *Enricher) builtAttrs(ctx context.Context, cache map[string]pcommon.Map, token string) pcommon.Map {
-	built := e.attrsFor(ctx, cache, token)
-	ck := countedKey(token)
-	if _, counted := cache[ck]; !counted {
-		cache[ck] = pcommon.NewMap() // presence marks the outcome as tallied
-		if built.Len() > 0 {
+func (e *Enricher) builtAttrs(ctx context.Context, cache *reqCache, token string) idResult {
+	r := e.attrsFor(ctx, cache, token)
+	if _, counted := cache.counted[token]; !counted {
+		cache.counted[token] = struct{}{}
+		if r.resolved {
 			obs.Ingested.WithLabelValues("enriched").Inc()
 		} else {
 			obs.Ingested.WithLabelValues("unresolved").Inc()
 		}
 	}
-	return built
+	return r
 }
 
 // mergeAttrs adds src's attributes to dst, never overwriting keys the sender
@@ -595,23 +679,17 @@ func overwriteAttrs(src, dst pcommon.Map) {
 	})
 }
 
-// peerCacheKey is the reserved key under which the peer-IP attribution is
-// memoised in a request's attribute cache. A real token is "c:"/"u:" prefixed,
-// so this cannot collide. peerRejectKey records that the same lookup was
-// REJECTED, so the outcome is memoised as precisely as the success is.
-const (
-	peerCacheKey  = "\x00peer"
-	peerRejectKey = "\x00peer-rejected"
-)
-
 // peerRejectWarnEvery throttles the rejected-peer warning. A relay in front of
 // the listener rewrites EVERY connection, so the condition is either absent or
 // universal; one line per push would bury the diagnosis in its own symptom.
 const peerRejectWarnEvery = time.Minute
 
 // peerAttrs returns the k8s attributes of the pod owning the connection's peer
-// IP, resolved at most ONCE per request, and reports whether the resolution was
-// REJECTED (see Config.PeerReject) as opposed to simply not resolving.
+// IP, resolved at most ONCE per request, and reports whether the lookup
+// RESOLVED and whether the resolution was REJECTED (see Config.PeerReject) as
+// opposed to simply not resolving. resolved comes from the lookup, not from
+// the rendering: the operator's attribute filter can empty the build for a pod
+// the lookup found.
 //
 // The peer is a property of the connection, so every resource in a payload has
 // the same one — yet this ran per resource, and /v1/pod-ips is deliberately
@@ -620,22 +698,18 @@ const peerRejectWarnEvery = time.Minute
 // could be attributed differently if the index changed mid-request. The cache
 // is per request (the enricher itself is shared by concurrent handlers, so
 // nothing may be memoised on it).
-func (e *Enricher) peerAttrs(ctx context.Context, cache map[string]pcommon.Map) (pcommon.Map, bool) {
+func (e *Enricher) peerAttrs(ctx context.Context, cache *reqCache) (built pcommon.Map, resolved, rejected bool) {
 	if !e.cfg.PeerIPFallback {
-		return pcommon.NewMap(), false
+		return pcommon.NewMap(), false, false
 	}
 	ip := peerIP(ctx)
 	if ip == "" {
-		return pcommon.NewMap(), false
+		return pcommon.NewMap(), false, false
 	}
-	if cache != nil {
-		if m, ok := cache[peerCacheKey]; ok {
-			_, rejected := cache[peerRejectKey]
-			return m, rejected
-		}
+	if cache.peerDone {
+		return cache.peer, cache.peerResolved, cache.peerRejected
 	}
-	built := pcommon.NewMap()
-	rejected := false
+	built = pcommon.NewMap()
 	if pod, err := e.cfg.Meta.PodByIP(ctx, ip); err == nil && pod != nil {
 		if e.cfg.PeerReject != nil && e.cfg.PeerReject(pod) {
 			// The address did not come from an application: something between
@@ -653,16 +727,12 @@ func (e *Enricher) peerAttrs(ctx context.Context, cache map[string]pcommon.Map) 
 			// throttle is what is wanted.
 			e.warnPeerRejected(ip, pod)
 		} else {
+			resolved = true
 			built = e.buildFor(pod, nil)
 		}
 	}
-	if cache != nil {
-		cache[peerCacheKey] = built
-		if rejected {
-			cache[peerRejectKey] = pcommon.NewMap()
-		}
-	}
-	return built, rejected
+	cache.peer, cache.peerResolved, cache.peerRejected, cache.peerDone = built, resolved, rejected, true
+	return built, resolved, rejected
 }
 
 // peerFallback is peerAttrs plus the outcome accounting: peer_ip when the
@@ -677,17 +747,17 @@ func (e *Enricher) peerAttrs(ctx context.Context, cache map[string]pcommon.Map) 
 // comment claiming the rejection "has already been counted", which no site did
 // — so -ingest-metrics-mode=datapoint (and an auto push demoted to split)
 // under-reported the exact counter Config.PeerReject's doc promises.
-func (e *Enricher) peerFallback(ctx context.Context, cache map[string]pcommon.Map) pcommon.Map {
-	built, rejected := e.peerAttrs(ctx, cache)
+func (e *Enricher) peerFallback(ctx context.Context, cache *reqCache) (pcommon.Map, bool) {
+	built, resolved, rejected := e.peerAttrs(ctx, cache)
 	switch {
-	case built.Len() > 0:
+	case resolved:
 		obs.Ingested.WithLabelValues("peer_ip").Inc()
 	case rejected:
 		obs.Ingested.WithLabelValues("peer_ip_rejected").Inc()
 	default:
 		obs.Ingested.WithLabelValues("unresolved").Inc()
 	}
-	return built
+	return built, resolved
 }
 
 func (e *Enricher) warnPeerRejected(ip string, pod *kubemeta.Pod) {
@@ -716,7 +786,7 @@ const (
 // unknown_service. A token that DOES resolve is foreign exactly when it names
 // a different object than the resource's — one predicate, sameObject, shared
 // with the split path (see its comment for the drift this repaired).
-func (e *Enricher) foreignID(ctx context.Context, cache map[string]pcommon.Map, tok, resID string) bool {
+func (e *Enricher) foreignID(ctx context.Context, cache *reqCache, tok, resID string) bool {
 	if tok == resID {
 		return false
 	}
@@ -757,10 +827,17 @@ func (e *Enricher) foreignID(ctx context.Context, cache map[string]pcommon.Map, 
 //     path, where the overwrite destroyed the service.name it chose
 //     (TestAutoModeKeepsTheSendersOwnIdentity pins it).
 //
+// The identity compared is the LOOKUP RESULT's (idResult.podUID/container),
+// never the built attribute rendering: the operator's enable/disable filter
+// (or defaults: false) can remove k8s.pod.uid from what the builder emits, and
+// reading its absence as "different objects" made a rendering config demote a
+// sender describing itself to the split path — the exact misattribution
+// TestAutoModeKeepsTheSendersOwnIdentity pins for the default config.
+//
 // Both lookups are memoised per request through the same cache the enrichment
 // uses (attrsFor), so a KSM-shaped payload costs no extra round trips — and
 // the resource branch that usually follows reuses the built attributes.
-func (e *Enricher) sameObject(ctx context.Context, cache map[string]pcommon.Map, a, b string) bool {
+func (e *Enricher) sameObject(ctx context.Context, cache *reqCache, a, b string) bool {
 	if a == "" || b == "" {
 		return false
 	}
@@ -769,17 +846,13 @@ func (e *Enricher) sameObject(ctx context.Context, cache map[string]pcommon.Map,
 	}
 	ra := e.attrsFor(ctx, cache, a)
 	rb := e.attrsFor(ctx, cache, b)
-	if ra.Len() == 0 || rb.Len() == 0 {
+	if !ra.resolved || !rb.resolved {
 		return false // at least one did not resolve: no evidence they match
 	}
-	ua, oka := ra.Get("k8s.pod.uid")
-	ub, okb := rb.Get("k8s.pod.uid")
-	if !oka || !okb || ua.Str() != ub.Str() {
+	if ra.podUID == "" || rb.podUID == "" || ra.podUID != rb.podUID {
 		return false
 	}
-	ca, _ := ra.Get("k8s.container.name")
-	cb, _ := rb.Get("k8s.container.name")
-	return ca.Str() == cb.Str() || ca.Str() == "" || cb.Str() == ""
+	return ra.container == rb.container || ra.container == "" || rb.container == ""
 }
 
 // findID reports the first container ID or pod UID found in a, as a
@@ -792,12 +865,19 @@ func (e *Enricher) findID(a pcommon.Map) (token string, ok bool) {
 	return e.tokenFrom(a, e.podUIDKeys, tokPodUID)
 }
 
-// lookupByID resolves a kind-tagged ID token to metadata (nil pod on miss).
-func (e *Enricher) lookupByID(ctx context.Context, token string) (*kubemeta.Pod, *kubemeta.Container) {
+// lookupByID resolves a kind-tagged ID token to metadata (nil pod on miss),
+// charging the request's lookup budget: past it every id reads as unresolvable.
+// wait is the caller's — probes pass 0, attribution passes Config.Wait.
+func (e *Enricher) lookupByID(ctx context.Context, cache *reqCache, token string, wait time.Duration) (*kubemeta.Pod, *kubemeta.Container) {
+	if cache.lookups >= maxLookupsPerRequest {
+		e.warnLookupBudget()
+		return nil, nil
+	}
+	cache.lookups++
 	switch {
 	case len(token) >= 2 && token[:2] == tokContainer:
 		id := token[2:]
-		md, err := e.cfg.Meta.Container(ctx, id, e.cfg.Wait)
+		md, err := e.cfg.Meta.Container(ctx, id, wait)
 		if err != nil {
 			e.log.Debug("ingest: container lookup failed", "id", id, "error", err)
 			return nil, nil

@@ -10,6 +10,7 @@ import (
 	"slices"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/JohanLindvall/kubescrape/internal/config"
 	"github.com/JohanLindvall/kubescrape/internal/logline"
@@ -241,6 +242,16 @@ func parseLabelTemplate(spec, setPrefix string) (labelTemplate, error) {
 // labelGetter builds the value-producing closure for a label template from
 // whichever of the four forms is present.
 func labelGetter(getKey, value, pattern, reSpec, spec string) (func(func(string) string) string, error) {
+	// A LITERAL value with a mask or a regex transform is a contradiction: the
+	// transform has nothing to read, and the constant arm below would silently
+	// win — `class=status(_xx)` compiled to the constant label class="status",
+	// one merged series, wrong forever, with no error and no counter. The
+	// legitimate spelling is a `$`-prefixed key (`class=$status(_xx)`), which is
+	// also what the bare `status(_xx)` form promotes to before it gets here.
+	if value != "" && (pattern != "" || reSpec != "") {
+		return nil, fmt.Errorf("invalid label %q: the literal value %q cannot carry a mask or a regex transform — write $%s to read the field",
+			spec, value, value)
+	}
 	switch {
 	case value != "":
 		return func(func(string) string) string { return value }, nil
@@ -266,8 +277,18 @@ func labelGetter(getKey, value, pattern, reSpec, spec string) (func(func(string)
 }
 
 // maskPattern overlays value onto pattern: each '_' in pattern is replaced by
-// the corresponding character of value, other characters are kept. So value
+// the corresponding CHARACTER of value, other characters are kept. So value
 // "503" with pattern "_xx" yields "5xx".
+//
+// The step is a rune, not a byte. Byte indexing split a multi-byte rune
+// straddling a mask boundary — maskPattern("é50", "_xx") produced "\xc3xx" —
+// and that value is hashed, retained and finally written to a pcommon.Map,
+// i.e. an invalid-UTF-8 string field in the marshaled OTLP payload, which a
+// strict protobuf receiver rejects PERMANENTLY: the whole chunk, every metric
+// sharing that resource, dropped every interval the series stays live. The
+// mask must not manufacture invalid output from a valid line (truncLabelValue
+// backs off to a rune boundary for the same reason); a byte of value that is
+// already invalid UTF-8 re-encodes as U+FFFD rather than being copied through.
 func maskPattern(value, pattern string) string {
 	if pattern == "" {
 		return ""
@@ -278,15 +299,44 @@ func maskPattern(value, pattern string) string {
 		// an empty value drops the label, matching the plain passthrough.
 		return ""
 	}
-	out := make([]byte, len(pattern))
-	for i := 0; i < len(pattern); i++ {
-		if pattern[i] == '_' && i < len(value) {
-			out[i] = value[i]
-		} else {
-			out[i] = pattern[i]
+	if isASCII(pattern) && isASCII(value) {
+		// Byte and rune step are the same thing here, and this is the log-line
+		// hot path: a status code masked to its class is what the DSL is for.
+		out := make([]byte, len(pattern))
+		for i := 0; i < len(pattern); i++ {
+			if pattern[i] == '_' && i < len(value) {
+				out[i] = value[i]
+			} else {
+				out[i] = pattern[i]
+			}
 		}
+		return string(out)
+	}
+	out := make([]byte, 0, len(pattern)+len(value))
+	rest := value
+	for _, pr := range pattern {
+		// Every mask position consumes one rune of value, masked or not: the
+		// two are overlaid position by position.
+		vr, size := utf8.DecodeRuneInString(rest)
+		rest = rest[size:]
+		if pr == '_' && size > 0 {
+			out = utf8.AppendRune(out, vr)
+			continue
+		}
+		out = utf8.AppendRune(out, pr)
 	}
 	return string(out)
+}
+
+// isASCII reports whether s is entirely single-byte, i.e. whether a byte index
+// into it is also a rune index.
+func isASCII(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] >= utf8.RuneSelf {
+			return false
+		}
+	}
+	return true
 }
 
 // parseRegexpReplace splits a `/pattern/replacement/` spec, honouring

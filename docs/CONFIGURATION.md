@@ -272,7 +272,7 @@ hop or an authenticating proxy.
 | `-buffer-max-bytes` | `1GiB` | per-signal cap on the undelivered on-disk backlog; producers back-pressure (the tailer rewinds) when full |
 | `-logs-exclude-namespaces` | — | comma-separated namespaces not tailed — **always exclude the namespace of your collector** to avoid feedback loops |
 | `-logs-rate-limit` | `0` | per-file line rate limit (lines/second, token bucket; 0 disables). An exhausted file is **paused** — reading stops until tokens refill, the backlog stays on disk, nothing is lost (rotation drains bypass the limiter) |
-| `-logs-rate-burst` | `0` | token bucket size (0 = 2× the rate) |
+| `-logs-rate-burst` | `0` | token bucket size (0 = 2× the rate). A bucket below one whole token could never admit a line, so the tailer raises it to 1 (refill rate unchanged) and startup — `-check-config` included — warns that it did |
 | `-logs-rate-drop` | `false` | discard lines over the limit instead of pausing (lossy; counted in `kubescrape_log_rate_limited_total{action="drop"}`) |
 | `-logs-unknown-files` | `auto` | where a file with no checkpoint entry starts at startup: `end` (skip as pre-existing history), `start` (read whole), `auto` (start when the checkpoint store already has entries — the file appeared while the agent was down; end on a first-ever run). `auto`/`start` mean adding a new log source ingests those files' existing content |
 | `-logs-idle-close` | `0` | close a fully-caught-up file's fd after this much inactivity (`0` = never). Bounds steady-state fds at one per *active* file rather than one per tracked file — but the open fd is the only handle to a rotated-away or deleted file's remaining bytes, so enabling this **forfeits the zero-loss guarantee** for the tail of a dying file. Set it only where a node tracks thousands of log files |
@@ -1448,7 +1448,7 @@ whole traces and are strictly better at it.
 | Flag | Default | Description |
 |---|---|---|
 | `-scrape-interval` | `30s` | one cycle scrapes every target of this node |
-| `-scrape-timeout` | `15s` | per target |
+| `-scrape-timeout` | `15s` | per target. A non-positive value does not mean "no timeout" — it would expire every request's context before it went out — so the scraper substitutes its default and startup, `-check-config` included, warns that it did |
 | `-scrape-concurrency` | `4` | concurrent target scrapes |
 | `-metrics-batch-size` | `10000` | export chunk size in data points — a 100k-series target is exported in ten chunks and never held in memory |
 | `-metrics-batch-bytes` | `3145728` | also flush a chunk once its estimated encoded size reaches this (`0` = size only). The collector's gRPC receive limit applies to the **decompressed** message (4 MiB by default), which a label-rich target (kube-state-metrics, Istio) can exceed well before the point limit — every export of that target would then fail, so this bound is what keeps a chunk deliverable |
@@ -1794,15 +1794,20 @@ directory (not `subPath`). See
 full annotated list.
 
 `agent.logsExcludeNamespaces` is **null by default, and null is not empty**.
-Left unset, the chart excludes this release's own namespace *plus* the
-namespace named by `agent.otlp.endpoint` (the second dot-separated label of its
-host, e.g. `monitoring` for the default `otel-collector.monitoring:4317`).
-Tailing either is a feedback loop that amplifies exactly when the collector is
-already struggling, and the two are not the same namespace whenever the default
-endpoint is kept in a release installed somewhere else. Set the value to a list
-to name the namespaces yourself, or to an explicit `[]` to exclude nothing —
-which is the one thing the old `[]` default could not express, since it was
-indistinguishable from "unset".
+Left unset, the chart excludes this release's own namespace *plus*, when
+`agent.otlp.endpoint` names an in-cluster Service, that Service's namespace
+(the second dot-separated label of its host, e.g. `monitoring` for the default
+`otel-collector.monitoring:4317`). Tailing either is a feedback loop that
+amplifies exactly when the collector is already struggling, and the two are not
+the same namespace whenever the default endpoint is kept in a release installed
+somewhere else. In-cluster means `service.namespace` or anything under `.svc` —
+that is what makes the second label a namespace; an external endpoint
+(`otel.grafana.net:443`) adds nothing, since reading its second label as a
+namespace silently stopped tailing any workload that happened to run in a
+namespace of that name. Set the value to a list to name the namespaces
+yourself, or to an explicit `[]` to exclude nothing — which is the one thing
+the old `[]` default could not express, since it was indistinguishable from
+"unset".
 
 `azure.enabled: true` rides in the same singleton Deployment as
 `events.enabled` (either renders it): `azure.eventhub.*` maps to the

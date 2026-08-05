@@ -173,20 +173,32 @@ spec:
             - -logs-poll-interval={{ .Values.agent.logsPollInterval }}
             - -logs-fingerprint-bytes={{ int64 .Values.agent.logsFingerprintBytes }}
             - -logs-multiline={{ .Values.agent.multiline }}
-            {{- /* Default: this release's namespace AND the namespace the
-                   OTLP endpoint names — tailing either feeds the collector its
-                   own output, a loop that amplifies precisely when the
-                   collector is already slow. The two are NOT the same: the
-                   endpoint defaults to otel-collector.monitoring, so a release
-                   installed anywhere else used to tail the collector's own
-                   namespace. `null` (the default) picks these; an explicit []
-                   excludes nothing, which `default` could not express. */}}
+            {{- /* Default: this release's namespace AND, when the OTLP endpoint
+                   names an IN-CLUSTER Service, that Service's namespace —
+                   tailing either feeds the collector its own output, a loop that
+                   amplifies precisely when the collector is already slow. The
+                   two are NOT the same: the endpoint defaults to
+                   otel-collector.monitoring, so a release installed anywhere
+                   else would tail the collector's own namespace.
+
+                   In-cluster is `service.namespace` or anything under `.svc`,
+                   which is what makes the second label a namespace. Deriving it
+                   from ANY host read the second label of an external endpoint
+                   as one — `otel.grafana.net` excluded a namespace called
+                   `grafana`, whose pods were then dropped at discovery, with no
+                   counter and no warning to tell that apart from "no logs".
+
+                   `null` (the default) picks these; an explicit [] excludes
+                   nothing, which `default` could not express. */}}
             {{- $excl := .Values.agent.logsExcludeNamespaces }}
             {{- if kindIs "invalid" $excl }}
             {{-   $excl = list .Release.Namespace }}
-            {{-   $host := first (splitList ":" (trimPrefix "https://" (trimPrefix "http://" (.Values.agent.otlp.endpoint | default "")))) }}
+            {{-   $hostport := first (splitList "/" (trimPrefix "https://" (trimPrefix "http://" (.Values.agent.otlp.endpoint | default "")))) }}
+            {{-   $host := first (splitList ":" $hostport) }}
             {{-   $parts := splitList "." $host }}
-            {{-   if ge (len $parts) 2 }}{{- $excl = append $excl (index $parts 1) }}{{- end }}
+            {{-   if and (ge (len $parts) 2) (or (eq (len $parts) 2) (hasSuffix ".svc" $host) (contains ".svc." $host)) }}
+            {{-     $excl = append $excl (index $parts 1) }}
+            {{-   end }}
             {{-   $excl = uniq $excl }}
             {{- end }}
             - -logs-exclude-namespaces={{ join "," $excl }}

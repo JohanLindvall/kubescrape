@@ -367,6 +367,15 @@ func (r *k8sSecretReader) remember(ck string, e secretCacheEntry) {
 	if r.cache == nil {
 		r.cache = map[string]secretCacheEntry{}
 	}
+	// A failure never displaces a LIVE success. Fetches happen on a miss only,
+	// so a usable success can be sitting here just one way: the lock is
+	// released across the API call, and two concurrent misses for one ref raced
+	// back in the other order. Storing the slower error would serve every agent
+	// in the fleet a 502 for the whole failure TTL, for a credential this
+	// process has in hand.
+	if cur, ok := r.cache[ck]; ok && e.err != nil && cur.err == nil && time.Since(cur.fetched) < cur.ttl() {
+		return
+	}
 	r.cache[ck] = e
 }
 

@@ -237,6 +237,44 @@ func TestFromPodPortsNotAliased(t *testing.T) {
 	}
 }
 
+// The same aliasing one level down: the struct copy that produces byID's view
+// duplicates a slice HEADER, and every pointer field with it. StartedAt,
+// FinishedAt and ExitCode are allocated once per container, so both views held
+// one pointer apiece — the exact trap the ports clone exists to close, in a
+// package importers decode the model with.
+func TestFromPodPointerFieldsNotAliased(t *testing.T) {
+	pod, byID := FromPod(richPod())
+	var started, finished, exit int
+	for _, c := range pod.Containers {
+		stored, ok := byID[c.ID]
+		if !ok {
+			continue
+		}
+		if c.StartedAt != nil {
+			started++
+			if stored.StartedAt == c.StartedAt {
+				t.Errorf("container %q: byID and pod.Containers share one StartedAt", c.Name)
+			}
+		}
+		if c.FinishedAt != nil {
+			finished++
+			if stored.FinishedAt == c.FinishedAt {
+				t.Errorf("container %q: byID and pod.Containers share one FinishedAt", c.Name)
+			}
+		}
+		if c.ExitCode != nil {
+			exit++
+			if stored.ExitCode == c.ExitCode {
+				t.Errorf("container %q: byID and pod.Containers share one ExitCode", c.Name)
+			}
+		}
+	}
+	if started == 0 || finished == 0 || exit == 0 {
+		t.Fatalf("the fixture exercised %d StartedAt, %d FinishedAt, %d ExitCode; each field must be covered",
+			started, finished, exit)
+	}
+}
+
 func keys(m map[string]kubemeta.Container) []string {
 	out := make([]string, 0, len(m))
 	for k := range m {

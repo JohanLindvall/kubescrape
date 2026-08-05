@@ -31,3 +31,31 @@ func TestFilterAnnotationsDropsLastApplied(t *testing.T) {
 		t.Errorf("nil in, %v out, want nil", got)
 	}
 }
+
+// kubectl is not the only tool that stamps the applied object onto the object:
+// kapp (Carvel) writes the same verbatim payload under its own key on every
+// object it deploys, so on a kapp-managed cluster the leak was open with the
+// filter in place.
+func TestFilterAnnotationsDropsEveryAppliedObjectCopy(t *testing.T) {
+	for _, key := range []string{
+		"kubectl.kubernetes.io/last-applied-configuration",
+		"kapp.k14s.io/original",
+	} {
+		got := FilterAnnotations(map[string]string{
+			key:                    `{"spec":{"env":[{"name":"TOKEN","value":"s3cret"}]}}`,
+			"prometheus.io/scrape": "true",
+		})
+		if _, ok := got[key]; ok {
+			t.Errorf("%s is a copy of the applied object and must not be served", key)
+		}
+		if got["prometheus.io/scrape"] != "true" {
+			t.Errorf("%s: ordinary annotations must survive: %v", key, got)
+		}
+	}
+
+	// A key that merely FINGERPRINTS the applied object carries no spec content
+	// and is left alone — the denylist is for payloads, not for a vendor prefix.
+	if got := FilterAnnotations(map[string]string{"kapp.k14s.io/original-diff-md5": "abc"}); got == nil {
+		t.Error("a checksum annotation must survive the filter")
+	}
+}

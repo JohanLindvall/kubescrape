@@ -8,9 +8,13 @@ package azurediag
 
 import (
 	"context"
+	"errors"
+	"io"
+	"log/slog"
 	"testing"
 	"time"
 
+	"github.com/twmb/franz-go/pkg/kerr"
 	"github.com/twmb/franz-go/pkg/kfake"
 	"github.com/twmb/franz-go/pkg/kgo"
 )
@@ -123,4 +127,53 @@ func TestKafkaEndToEnd(t *testing.T) {
 	}
 	cancel()
 	<-done
+}
+
+// kgo delivers fatal partition conditions AS the poll result — "if any
+// partition has a fatal error and actually had no records, a fake fetch will
+// be injected with the error" — so a poll must not report such a fetch as a
+// clean empty one: consume would fire the azure-eventhub readiness gate on a
+// consumer that can never consume (an identity without read permission on the
+// insights-* hubs) and a truly fatal error would warn-loop forever instead of
+// reaching Run's reopen-with-backoff arm.
+func TestErrorOnlyFetchFailsThePoll(t *testing.T) {
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	authFailed := kgo.Fetches{{Topics: []kgo.FetchTopic{{
+		Topic:      "insights-logs-audit",
+		Partitions: []kgo.FetchPartition{{Partition: 0, Err: kerr.TopicAuthorizationFailed}},
+	}}}}
+	msgs, err := pollResult(authFailed, log)
+	if err == nil {
+		t.Fatal("a fetch carrying only errors must fail the poll, or ready() fires for an unconsumable hub")
+	}
+	if !errors.Is(err, kerr.TopicAuthorizationFailed) {
+		t.Fatalf("err = %v, want the partition error preserved for errors.Is", err)
+	}
+	if msgs != nil {
+		t.Fatalf("msgs = %v, want none from a failed poll", msgs)
+	}
+
+	// Errors beside records stay non-fatal: the records are processed and kgo
+	// retries the broken partitions itself.
+	partial := kgo.Fetches{{Topics: []kgo.FetchTopic{{
+		Topic: "insights-logs-audit",
+		Partitions: []kgo.FetchPartition{
+			{Partition: 0, Records: []*kgo.Record{{Value: []byte("x")}}},
+			{Partition: 1, Err: kerr.NotLeaderForPartition},
+		},
+	}}}}
+	msgs, err = pollResult(partial, log)
+	if err != nil {
+		t.Fatalf("errors beside records must not fail the poll: %v", err)
+	}
+	if len(msgs) != 1 || string(msgs[0]) != "x" {
+		t.Fatalf("msgs = %q, want the fetched record kept", msgs)
+	}
+
+	// A clean empty fetch stays a clean empty poll — what lets the readiness
+	// gate clear on a quiet but reachable hub.
+	if msgs, err = pollResult(kgo.Fetches{}, log); err != nil || len(msgs) != 0 {
+		t.Fatalf("clean empty fetch: msgs=%v err=%v, want empty and nil", msgs, err)
+	}
 }

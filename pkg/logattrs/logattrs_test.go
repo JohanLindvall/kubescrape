@@ -293,3 +293,55 @@ func TestLogfmtValuesAreUnescaped(t *testing.T) {
 		}
 	}
 }
+
+// A BARE logfmt key yields the sentinel "true", which is prose, not a field:
+// `weight=10 disk error` must not lift error="true" onto every record carrying
+// that sentence. Whether the words are scanned at all depends on an unrelated
+// '=' elsewhere on the line (the no-'=' fast path), so admitting them makes an
+// attribute appear and disappear with the rest of the sentence.
+func TestBareLogfmtKeysLiftNothing(t *testing.T) {
+	t.Parallel()
+	e := mustExtractor(t, Rule{Key: "error"}, Rule{Key: "disk"}, Rule{Key: "weight"})
+	for _, line := range []string{`weight=10 disk error`, `disk error`} {
+		r := e.Extract(line)
+		for _, a := range r.Log {
+			if a.Key != "weight" {
+				t.Errorf("line %q lifted %s=%v from a bare word", line, a.Key, a.Val)
+			}
+		}
+	}
+	r := e.Extract(`weight=10 disk error`)
+	if len(r.Log) != 1 || r.Log[0].Key != "weight" || r.Log[0].Val != "10" {
+		t.Errorf("real pairs on the same line must still lift: %+v", r.Log)
+	}
+}
+
+// Duplicate keys resolve FIRST-wins in JSON (lightning's GetPaths contract) and
+// LAST-wins in logfmt (the scan overwrites the slot). Both inputs are
+// malformed and neither reader dictates an answer, so the asymmetry is
+// documented rather than papered over — this pins what the documentation says,
+// here and in the twin extractor in internal/logline.
+func TestDuplicateKeyResolutionIsAsDocumented(t *testing.T) {
+	t.Parallel()
+	e := mustExtractor(t, Rule{Key: "level"})
+	for line, want := range map[string]string{
+		`{"level":"info","level":"warn"}`: "info",
+		`level=info level=warn`:           "warn",
+	} {
+		r := e.Extract(line)
+		if len(r.Log) != 1 || r.Log[0].Val != want {
+			t.Errorf("line %q lifted %+v, want level=%q", line, r.Log, want)
+		}
+	}
+}
+
+// FloatString is the ONE float rendering shared with the metric-label and
+// record-attribute paths: pcommon's ES6 algorithm, not FormatFloat('f').
+func TestFloatStringMatchesPcommon(t *testing.T) {
+	t.Parallel()
+	for _, f := range []float64{5e-7, 1e21, 2.5e22, 1e-6, 42.5, 0, -3e21, -0.125} {
+		if got, want := FloatString(f), pcommon.NewValueDouble(f).AsString(); got != want {
+			t.Errorf("FloatString(%v) = %q, pcommon says %q", f, got, want)
+		}
+	}
+}

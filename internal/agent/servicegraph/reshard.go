@@ -476,9 +476,20 @@ func (r *Resharder) Stats() ReshardStats {
 }
 
 // CountLoopBlocked records a refused application push that carried
-// ForwardedMarker. The refusal itself belongs to the receive path — it has to
-// happen before enrichment, i.e. before this type is consulted at all — but the
-// counter lives here because this is where the marker's whole story is.
+// ForwardedMarker. The refusal belongs to the receive path and the counter lives
+// here, because this is where the marker's whole story is.
+//
+// Where the refusal actually sits: BELOW enrichment. The ingest server enriches
+// a trace payload and then hands it to its Traces exporter, which is the tier's
+// entry (cmd/kubescrape-agent's sgEntry), and the IsForwarded check is that
+// exporter's first line — there is no pre-enrich hook on otlpingest.ServerConfig
+// to hang it from. The amplification the marker exists to stop is still stopped:
+// the refusal is PERMANENT, so the payload is neither re-sharded nor retried,
+// and one hop is where it ends. What the ordering costs under that
+// misconfiguration is wasted metadata lookups and ingest counters
+// (obs.Ingested{enriched|unresolved|peer_ip_rejected}) moved by traffic that is
+// then refused — a bounded, one-time cost on a config that is already broken and
+// already counted here.
 func (r *Resharder) CountLoopBlocked(spans int) {
 	if r == nil || spans < 0 {
 		return
@@ -529,6 +540,11 @@ func (r *Resharder) Close() error {
 func (r *Resharder) Reshard(ctx context.Context, td ptrace.Traces) (ptrace.Traces, error) {
 	if r == nil || len(r.clients) == 0 {
 		// Single-shard tier (or every shard is us): everything is already local.
+		// The unkeyable tally still has to happen — neither counting pass runs on
+		// this path, and a metric whose help text promises "a moving rate means an
+		// SDK is emitting malformed spans" must not be frozen at zero on the
+		// commonest topology there is.
+		r.countUnkeyed(td)
 		r.countLocal(td.SpanCount())
 		return td, nil
 	}
@@ -557,6 +573,31 @@ func (r *Resharder) countLocal(n int) {
 		return
 	}
 	r.counters.spansLocal.Add(uint64(n))
+}
+
+// countUnkeyed tallies the spans of td that carry no trace id — the single-shard
+// path's version of what singleOwner and owner do for the sharded one, and the
+// only walk that path makes (one id check per span, no copy, no hash).
+func (r *Resharder) countUnkeyed(td ptrace.Traces) {
+	if r == nil {
+		return
+	}
+	var unkeyed uint64
+	rss := td.ResourceSpans()
+	for i := 0; i < rss.Len(); i++ {
+		sss := rss.At(i).ScopeSpans()
+		for j := 0; j < sss.Len(); j++ {
+			spans := sss.At(j).Spans()
+			for k := 0; k < spans.Len(); k++ {
+				if spans.At(k).TraceID().IsEmpty() {
+					unkeyed++
+				}
+			}
+		}
+	}
+	if unkeyed > 0 {
+		r.counters.spansUnkeyed.Add(unkeyed)
+	}
 }
 
 // split partitions td by owning shard. The single-owner case — a one-shard tier,

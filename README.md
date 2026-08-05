@@ -437,8 +437,8 @@ pause or drop) keeps one runaway pod from consuming the pipeline. Set
 `-logs-exclude-namespaces` to the observability namespace to avoid feeding
 the collector its own output. (The Helm chart does this for you: with
 `agent.logsExcludeNamespaces` left at its `null` default it excludes the
-release's own namespace plus the one `agent.otlp.endpoint` names. An explicit
-`[]` means exclude nothing.)
+release's own namespace plus, when `agent.otlp.endpoint` names an in-cluster
+Service, that Service's namespace. An explicit `[]` means exclude nothing.)
 
 **Unified config file** (`-config`). All of the agent's YAML configuration
 lives in one file, passed with `-config`. Every section is optional, each
@@ -560,7 +560,10 @@ readiness reports whether the agent can actually do its job and lists the
 pending gates in the body (`not ready: metadata-service`). A DaemonSet rolling
 update advances on this, so a new pod that cannot reach the metadata service —
 and could therefore attribute nothing — halts the rollout instead of replacing
-every node.
+every node. Receiving pipelines gate on their own listeners being bound
+(`otlp-ingest` for `-ingest`, `service-graph-ingest` on the trace tier), since
+a rollout that advanced past an unbound receiver would leave the applications
+pushing into a void on every node it had already replaced.
 
 **Config validation** (`-check-config`). Compiles every section of `-config`
 and `-transforms-file` (templates, regexes, selectors, globs, durations) plus

@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/JohanLindvall/kubescrape/internal/obs"
 	"github.com/JohanLindvall/multiline/patterns"
 	"go.opentelemetry.io/collector/pdata/pcommon"
 )
@@ -547,5 +548,149 @@ func TestTruncatedEntryCarriesAttribute(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("no record carries log.truncated (exports: %d records, first %q)", len(got), got[0])
+	}
+}
+
+// A never-F-closed P-run is flushed line by line, and hasRun is spent by the
+// first of those emissions — the rest must resolve their start from the
+// position captured at FEED time (the stage payload). Deriving it from the
+// CURRENT tail id at flush time stamped fragments carried across a rename
+// rotation into the NEW segment: the watermark then sat in a segment newer
+// than the old segment's commit candidates, flush's clamp read them as
+// unconstrained, and the segment retired with its lines still buffered —
+// lost on the next rewind or crash, with no counter moving.
+func TestFlushedPRunKeepsFeedTimeSegment(t *testing.T) {
+	dir := t.TempDir()
+	exp := &fakeExporter{}
+	tl := newTestTailer(dir, "", exp)
+	f := &file{
+		path:        filepath.Join(dir, logName),
+		source:      &compiledSource{name: "containers", containerd: true, multiline: true},
+		containerID: "0123456789abcdef",
+		resolved:    true,
+		resource:    pcommon.NewResource(),
+	}
+	tl.newPipeline(f)
+	tl.files[f.path] = f
+
+	ctx := context.Background()
+	off := int64(0)
+	for _, l := range []string{
+		timeNowCRI() + " stdout P frag-a",
+		timeNowCRI() + " stdout P frag-b",
+	} {
+		end := off + int64(len(l)) + 1
+		tl.feedLine(ctx, f, l, off, end)
+		off = end
+	}
+	oldSeg := f.curSeg()
+
+	// A rename rotation with the run still buffered: the pipeline is carried,
+	// the old tail closes into a segment, and a fresh tail id is issued.
+	tl.reopen(ctx, f, true, true)
+	if len(f.segments) != 1 || f.segments[0].id != oldSeg {
+		t.Fatalf("segments = %+v, want the old tail recorded as %d", f.segments, oldSeg)
+	}
+
+	// Flush the carried run: every emitted fragment's positions must stay in
+	// the OLD segment, where its bytes were fed.
+	if err := f.criStage.FlushBefore(ctx, time.Now().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if len(tl.batch) == 0 {
+		t.Fatal("the flushed run emitted nothing")
+	}
+	for _, e := range tl.batch {
+		if e.start.seg != oldSeg || e.end.seg != oldSeg {
+			t.Fatalf("entry %q spans segments [%d,%d], want [%d,%d]: a flush-time tail id leaked into a carried fragment",
+				e.body, e.start.seg, e.end.seg, oldSeg, oldSeg)
+		}
+	}
+}
+
+// With Multiline OFF the CRI stage still buffers P-runs, so the age-out
+// clocks must be stamped for it too. Unstamped, sweep fell back to the
+// wall-clock cutoff, and during any backlog catch-up (lag beyond
+// MultilineTimeout) a P-run buffered across a MaxBytesPerSweep boundary was
+// torn into per-fragment records.
+func TestBackloggedPRunSurvivesSweepBoundaryWithMultilineOff(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+	exp := &fakeExporter{}
+	tl := New(Config{
+		Dir:              dir,
+		PollInterval:     20 * time.Millisecond,
+		FlushInterval:    time.Millisecond,
+		BatchSize:        1 << 20,
+		MultilineTimeout: 300 * time.Millisecond,
+		MetadataWait:     time.Second,
+		Metadata:         fakeMeta{},
+		Exporter:         exp,
+	})
+	tl.retryBackoff = time.Millisecond
+	tl.scanDir(tl.loadCheckpoints(), true)
+
+	// A backlog: the lines' own timestamps are far behind the wall clock.
+	l1 := "2026-07-05T10:00:00Z stdout P frag-a"
+	l2 := "2026-07-05T10:00:01Z stdout F frag-b"
+	writeLog(t, dir, l1, l2)
+	tl.scanDir(nil, false)
+
+	tl.cfg.MaxBytesPerSweep = len(l1) + 1
+	tl.sweep(ctx, true) // reads only the P fragment; this sweep's age-out must not tear its run
+	tl.cfg.MaxBytesPerSweep = 1 << 20
+	tl.sweep(ctx, true) // the F line closes and joins the run
+
+	// Idle past the timeout: the wall-clock fallback flushes the closed run.
+	time.Sleep(350 * time.Millisecond)
+	tl.sweep(ctx, true)
+	tl.flush(ctx)
+
+	got := exp.get()
+	if slices.Contains(got, "frag-a") {
+		t.Fatalf("backlogged P-run torn at the sweep boundary: %q", got)
+	}
+	if !slices.Contains(got, "frag-afrag-b") {
+		t.Fatalf("joined record missing: %q", got)
+	}
+}
+
+// A capped trace ending on non-accepting continuation lines leaves their FIFO
+// items orphaned: the caps dropped the lines from retention, so no emission
+// remains to run the head-drop against, and the watermark reported the file
+// buffered forever — a gone file never settled (drainGone re-ran every sweep,
+// with the fd, the files-map entry and the checkpoint pinned for the process
+// life). Both stages empty is the proof of orphanhood reconcileFifos keys on.
+func TestGoneFileSettlesDespiteCapDroppedTrailingLines(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+	exp := &fakeExporter{}
+	tl := driveMultilineTailer(dir, exp) // MaxEntryBytes: 64
+	tl.scanDir(tl.loadCheckpoints(), true)
+	path := filepath.Join(dir, logName)
+
+	// A rust panic over the 64-byte cap whose last line lands in a
+	// NON-ACCEPTING state ("stack backtrace:" with no frames after it): the
+	// line is consumed, dropped by the byte cap, and can never be emitted.
+	ts := timeNowCRI()
+	writeLog(t, dir,
+		ts+" stderr F thread 'main' panicked at src/main.rs:5:5:",
+		ts+" stderr F index out of bounds: the len is 1 but the index is 99",
+		ts+" stderr F stack backtrace:",
+	)
+	tl.scanDir(nil, false)
+	orphansBefore := obs.LogFifoDropped.Value()
+	tl.sweep(ctx, true)
+
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	tl.scanDir(nil, false) // the listing proves the file gone
+	driveUntil(t, ctx, tl, func() bool {
+		_, tracked := tl.files[path]
+		return !tracked
+	}, "gone file settled and released")
+	if obs.LogFifoDropped.Value() <= orphansBefore {
+		t.Fatal("orphaned FIFO items were not counted")
 	}
 }

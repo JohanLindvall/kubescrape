@@ -891,3 +891,41 @@ func TestRenderDoesNotStallRecord(t *testing.T) {
 			stall, render)
 	}
 }
+
+// The render scratch is REUSED across renders, and a later, smaller render
+// reslices it. The tail past the new length keeps its bucket and exemplar
+// capacity on purpose — that reuse is what the scratch is for — but it must not
+// keep the LABELS of series that are gone: a burst up to the cardinality cap
+// followed by mass stale eviction would otherwise pin peak-cardinality label
+// sets (a slice each, plus their retained strings) for the process' life, which
+// is the same pin snapshot already avoids for the pointer slice.
+func TestRenderScratchDoesNotPinTheLabelsOfEvictedSeries(t *testing.T) {
+	const peak = 64
+	now := time.Unix(1_700_000_000, 0)
+	r := NewRegistry(Config{MaxCardinality: peak + 8, StaleAfter: "1m"})
+	fixedClock(r, &now)
+	exp := &capExporter{}
+
+	for i := 0; i < peak; i++ {
+		r.Record(edge(fmt.Sprintf("client-%03d", i), "checkout"))
+	}
+	export(t, r, exp) // renders every series and marks them delivered
+
+	// The whole burst goes stale; the next render covers one series.
+	now = now.Add(10 * time.Minute)
+	r.Record(edge("client-new", "checkout"))
+	export(t, r, exp)
+
+	if got := r.store.Len(); got != 1 {
+		t.Fatalf("the store holds %d series after the eviction, want 1", got)
+	}
+	if cap(r.snap) < peak {
+		t.Fatalf("the scratch shrank to %d: the test no longer exercises its tail", cap(r.snap))
+	}
+	whole := r.snap[:cap(r.snap)]
+	for i := len(r.snap); i < len(whole); i++ {
+		if whole[i].labels != nil {
+			t.Fatalf("scratch slot %d (past the %d live series) still holds an evicted series' label set", i, len(r.snap))
+		}
+	}
+}

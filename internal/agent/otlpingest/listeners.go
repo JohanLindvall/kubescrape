@@ -49,10 +49,10 @@ func KeepaliveOption() grpc.ServerOption {
 // NewPushHTTPServer returns the *http.Server shape for an OTLP/HTTP push
 // listener. ReadHeaderTimeout kills Slowloris header trickling; ReadTimeout
 // bounds a trickled request body (the handlers read up to 16 MiB and senders
-// are node-local, so 60s is generous — it also caps handler runtime via the
-// whole-request read deadline, fine because forwarding is bounded by the
-// exporter's own much shorter timeout and a cut-off surfaces as a retryable
-// 503); IdleTimeout reaps parked keep-alives. WriteTimeout is deliberately
+// are node-local, so 60s is generous). It governs READING the request — body
+// included — and nothing after: a handler that has finished the read runs on
+// its own clock, and what bounds the forward is the exporter's own timeout.
+// IdleTimeout reaps parked keep-alives. WriteTimeout is deliberately
 // omitted: responses are tiny and its clock would race a slow-but-legal body
 // upload plus the forward.
 func NewPushHTTPServer(addr string, h http.Handler) *http.Server {

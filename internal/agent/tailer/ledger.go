@@ -107,9 +107,11 @@ type file struct {
 	pendingBase []byte
 
 	// Two-stage pipeline: criStage rejoins CRI fragments into logical lines
-	// (stage-1 data is the physical start offset), traces joins stack traces
-	// (nil when Multiline is off; data is the first line's timestamp).
-	criStage *cri.Aggregator[int64]
+	// (stage-1 data is the line's segment-qualified start position, captured
+	// at feed time — emission may happen after a carried rotation has moved
+	// the tail id), traces joins stack traces (nil when Multiline is off;
+	// data is the first line's timestamp).
+	criStage *cri.Aggregator[pos]
 	traces   *multiline.Aggregator[time.Time]
 	// ledger tracks which byte offsets are safe to checkpoint and how a group
 	// buffered across a rotation is recovered.
@@ -148,7 +150,10 @@ type file struct {
 	// still buffered. The next flush touching the file re-offers them: the
 	// bytes are delivered, only the checkpoint lags, and without the re-offer
 	// `committed` freezes below readPos forever (the high entry belongs to an
-	// earlier batch that no later candidate set sees). Dead segment ids
+	// earlier batch that no later candidate set sees). reconcileFifos folds
+	// cap-dropped orphan items' ends in through the same map: dropped lines
+	// advance offsets like exported ones, and the clamp defers either kind
+	// while anything below it is still in play. Dead segment ids
 	// (truncated away) resolve to nothing and are dropped harmlessly.
 	//
 	// Keyed BY SEGMENT, because withholding is per segment: the clamp deletes
@@ -361,9 +366,11 @@ func (l *ledger) reset() {
 	l.segmentsFed = false
 	// The purge takes the segments' lines with it: whatever was live is not
 	// any more, so no traversal claim over them is sound until they are
-	// re-fed. reopen restores this for a rotation, which purges nothing.
+	// re-fed (fedTo included — it names lines that were in the purged
+	// pipeline). reopen restores fed for a rotation, which purges nothing.
 	for _, sg := range l.segments {
 		sg.fed = false
+		sg.fedTo = 0
 	}
 	l.streams = nil
 }
@@ -418,6 +425,15 @@ type segment struct {
 	// advances as the segment's entries export; the segment retires once it
 	// reaches to.
 	committed, to int64
+	// fedTo is the replay's FEED progress: lines up to it are already in the
+	// pipeline from an earlier, budget-cut pass of THIS pipeline incarnation.
+	// A resumed pass starts at max(committed, fedTo) — resuming at committed
+	// alone re-fed lines the pipeline still buffers, and a re-fed P fragment
+	// APPENDS to its own still-open run (a duplicated fragment inside one
+	// joined record, not an at-least-once duplicate record). Never
+	// checkpointed: it describes pipeline state, so a purge (ledger.reset)
+	// zeroes it and the replay re-reads from committed.
+	fedTo int64
 	// fd is the rotated inode's still-open handle, kept while the segment is
 	// incomplete: the runtime prunes rotated files on its own schedule (a
 	// bounded rotation count), and once it does, findRotated cannot resolve

@@ -3,6 +3,7 @@ package metrics
 import (
 	"log/slog"
 	"math"
+	"slices"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -297,6 +298,21 @@ func newSeries(spec seriesSpec) *series {
 	}
 	s.maxStreams = spec.maxSize * len(s.buckets)
 	return s
+}
+
+// sameBuckets reports whether a fresh registration of this kind with these
+// bounds would produce the buckets this series already has. Only a histogram
+// has any (newSeries ignores the field otherwise), and the comparison is
+// against the NORMALIZED form: empty means defaultBuckets, and initBuckets
+// appends the +Inf bound.
+func (s *series) sameBuckets(kind seriesKind, buckets []float64) bool {
+	if kind != kindHistogram {
+		return true
+	}
+	if len(buckets) == 0 {
+		buckets = defaultBuckets
+	}
+	return slices.Equal(s.buckets[:len(s.buckets)-1], buckets)
 }
 
 // epoch reads the series' clock: the injected one in tests, the process's

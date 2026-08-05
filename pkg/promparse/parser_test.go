@@ -1,6 +1,7 @@
 package promparse
 
 import (
+	"io"
 	"math"
 	"strings"
 	"testing"
@@ -569,6 +570,130 @@ func TestOverLongLineDoesNotEmitItsTail(t *testing.T) {
 		if malformed == 0 {
 			t.Errorf("tail=%d: over-long line not counted malformed", tail)
 		}
+	}
+}
+
+// A body cut short by a TRANSPORT error ends in a PREFIX, not a line: a value
+// token severed mid-number parses as a smaller, plausible number, and a caller
+// that keeps what was converted before an abort ships it as a real observation
+// — a counter that appears to have reset or plummeted. Prometheus never has
+// this mode: it discards the whole scrape on a read error.
+func TestTruncatedFinalLineIsNotParsed(t *testing.T) {
+	for _, tc := range []struct{ name, body string }{
+		// The true lines were "big_counter_total 12345\n" and
+		// "big_counter_total 3 1700000000000\n".
+		{"value", "a 1\nbig_counter_total 12"},
+		{"timestamp", "a 1\nbig_counter_total 3 17"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p := New(Options{})
+			var got []Sample
+			malformed, err := p.Parse(io.MultiReader(strings.NewReader(tc.body), errReader{}),
+				func(s Sample) error { got = append(got, s); return nil })
+			if err == nil {
+				t.Fatal("the read error must surface")
+			}
+			if len(got) != 1 || got[0].Name != "a" {
+				t.Fatalf("samples = %+v, want only the line the body completed", got)
+			}
+			if malformed != 1 {
+				t.Fatalf("malformed = %d, want 1 (the truncated line)", malformed)
+			}
+		})
+	}
+}
+
+// An unterminated FINAL line at a clean EOF is a complete line — the body
+// simply ended without a newline — and stays legal.
+func TestUnterminatedFinalLineAtCleanEOF(t *testing.T) {
+	got, malformed, err := collect(t, New(Options{}), "a 1\nb 2")
+	if err != nil || malformed != 0 {
+		t.Fatalf("err=%v malformed=%d", err, malformed)
+	}
+	if len(got) != 2 || got[1].Name != "b" || got[1].Value != 2 {
+		t.Fatalf("samples = %+v, want a and b", got)
+	}
+}
+
+// A blank between the metric name and the label block is legal classic
+// exposition — prometheus/prometheus skips tabs and spaces between tMName and
+// tBraceOpen, prometheus/common calls skipBlankTabIfCurrentBlankTab after the
+// name — so rejecting it dropped every series of a target that writes it.
+// OpenMetrics forbids the blank, and rejecting it there is correct.
+func TestBlankBetweenNameAndLabels(t *testing.T) {
+	for _, body := range []string{"m {a=\"b\"} 1\n", "m\t{a=\"b\"} 1\n", "m  {a=\"b\"} 1\n"} {
+		got, malformed, err := collect(t, New(Options{}), body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(got) != 1 || malformed != 0 {
+			t.Fatalf("%q: samples=%+v malformed=%d, want one sample", body, got, malformed)
+		}
+		if got[0].Name != "m" || got[0].Value != 1 ||
+			len(got[0].Labels) != 1 || got[0].Labels[0] != (Label{"a", "b"}) {
+			t.Fatalf("%q: sample = %+v", body, got[0])
+		}
+	}
+	// Consecutive lines take the lastMetric memcmp path, which must reach the
+	// same verdict as the byte scan it short-circuits.
+	got, malformed, err := collect(t, New(Options{}), "m {a=\"b\"} 1\nm {a=\"c\"} 2\n")
+	if err != nil || malformed != 0 || len(got) != 2 || got[1].Labels[0].Value != "c" {
+		t.Fatalf("repeated name: samples=%+v malformed=%d err=%v", got, malformed, err)
+	}
+	got, malformed, err = collect(t, New(Options{OpenMetrics: true}), "m {a=\"b\"} 1\n# EOF\n")
+	if err != nil || len(got) != 0 || malformed != 1 {
+		t.Fatalf("openmetrics: samples=%+v malformed=%d err=%v, want the line rejected", got, malformed, err)
+	}
+}
+
+// Options.Exemplars decides whether an exemplar ATTACHES, never whether the
+// LINE is valid: a target emitting trailing "#" text that is not a well-formed
+// exemplar must keep shipping its samples under both settings, or enabling
+// -scrape-exemplars silently starts dropping series with the malformed counter
+// as the only trace.
+func TestExemplarsFlagDoesNotDecideLineValidity(t *testing.T) {
+	for _, body := range []string{
+		"a 1 # junk\n# EOF\n",
+		"a 1 # {t=\"x\"} 2 3 4\n# EOF\n",
+		"a 1 # {unterminated\n# EOF\n",
+	} {
+		for _, exemplars := range []bool{false, true} {
+			p := New(Options{OpenMetrics: true, Exemplars: exemplars})
+			got, malformed, err := collect(t, p, body)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(got) != 1 || malformed != 0 || got[0].Value != 1 {
+				t.Fatalf("%q exemplars=%v: samples=%+v malformed=%d, want one sample",
+					body, exemplars, got, malformed)
+			}
+			if got[0].Exemplar != nil {
+				t.Fatalf("%q exemplars=%v: attached an exemplar from unparseable text: %+v",
+					body, exemplars, got[0].Exemplar)
+			}
+		}
+	}
+	// A well-formed exemplar still attaches exactly when it is asked for.
+	const withEx = "a 1 # {trace_id=\"abc\"} 0.5\n# EOF\n"
+	got, _, _ := collect(t, New(Options{OpenMetrics: true, Exemplars: true}), withEx)
+	if len(got) != 1 || got[0].Exemplar == nil || got[0].Exemplar.Value != 0.5 {
+		t.Fatalf("exemplar not attached: %+v", got)
+	}
+	got, _, _ = collect(t, New(Options{OpenMetrics: true}), withEx)
+	if len(got) != 1 || got[0].Exemplar != nil {
+		t.Fatalf("exemplar attached with the flag off: %+v", got)
+	}
+}
+
+// HELP text is free text after exactly one separator byte, so indentation an
+// exposition put in a description survives into the OTLP Description.
+func TestHelpKeepsWhitespacePastTheSeparator(t *testing.T) {
+	got, malformed, err := collect(t, New(Options{}), "# HELP m   two  spaces\nm 1\n")
+	if err != nil || malformed != 0 || len(got) != 1 {
+		t.Fatalf("samples=%+v malformed=%d err=%v", got, malformed, err)
+	}
+	if want := "  two  spaces"; got[0].Help != want {
+		t.Fatalf("help = %q, want %q", got[0].Help, want)
 	}
 }
 

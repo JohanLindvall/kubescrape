@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/JohanLindvall/kubescrape/internal/agent/positions"
@@ -122,5 +123,64 @@ func TestRotationWhileDownRecoveredAtZeroOffset(t *testing.T) {
 	}
 	if !slices.Contains(got, "unshipped-old") {
 		t.Fatalf("rotated-while-down inode's uncommitted content lost: exported %v", got)
+	}
+}
+
+// A replay stopped by the per-sweep byte budget leaves the segment's
+// remainder owed: the tail must not be read until the replay finishes, and a
+// resumed pass must continue from the FEED frontier, not the commit frontier.
+// Reading the tail early fed newer lines into the same pipeline key — an F
+// line closed the old segment's still-open P-run and the joiner fused
+// fragments across the gap into a record no file ever contained — and a
+// committed-offset resume re-fed the buffered fragment into its own run,
+// duplicating it inside one joined record.
+func TestBudgetCutReplayDefersTailRead(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+	pos := mustOpenPositions(t, filepath.Join(t.TempDir(), "pos.json"))
+	path := filepath.Join(dir, logName)
+
+	l1 := timeNowCRI() + " stdout F old-one"
+	l2 := timeNowCRI() + " stdout P frag-a"
+	l3 := timeNowCRI() + " stdout F frag-b"
+	rot := path + ".1"
+	writeLines(t, rot, l1, l2, l3)
+	rotIno := inodeOfPath(t, rot)
+	rst, err := os.Stat(rot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeLog(t, dir, timeNowCRI()+" stdout F tail-one")
+	if err := pos.SetLogs(map[string]positions.LogPos{path: {
+		Offset: 0, Inode: inodeOfPath(t, path),
+		Pending: []positions.Prefix{{Inode: rotIno, From: 0, To: rst.Size()}},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+
+	exp := &fakeExporter{}
+	tl := driveTailer(dir, exp)
+	tl.cfg.Positions = pos
+	// The budget lands exactly on the P fragment's line boundary: the replay
+	// pass ends mid-segment with the fragment's run open in the pipeline.
+	tl.cfg.MaxBytesPerSweep = len(l1) + len(l2) + 2
+	tl.scanDir(tl.loadCheckpoints(), true)
+
+	driveUntil(t, ctx, tl, func() bool {
+		all := strings.Join(exp.get(), "\x00")
+		return strings.Contains(all, "old-one") && strings.Contains(all, "frag-b") &&
+			strings.Contains(all, "tail-one")
+	}, "segment and tail content delivered")
+
+	for _, r := range exp.get() {
+		if strings.Contains(r, "frag-a") && strings.Contains(r, "tail-one") {
+			t.Fatalf("old-segment fragment fused with the tail line: %q", r)
+		}
+		if strings.Contains(r, "frag-afrag-a") {
+			t.Fatalf("budget-resumed replay re-fed a buffered fragment: %q", r)
+		}
+	}
+	if got := exp.get(); !slices.Contains(got, "tail-one") {
+		t.Fatalf("tail line not delivered standalone: %q", got)
 	}
 }

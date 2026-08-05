@@ -750,11 +750,14 @@ func (b *Buffer) decide(out *outbound, e *bufTrace, now time.Time, reason string
 			}
 		}
 	}
-	// Charged: this trace was decided before (its verdict has since aged out, or
-	// it was decided early and its remainder started a fresh window). The
-	// evaluator then CHECKS the rateLimiting/composite budgets instead of
-	// spending them again — see the cache's two lifetimes in cache.go.
-	d := b.ev.Decide(tailsample.Trace{TraceID: e.id, Spans: b.scratch, Charged: b.cache.seen(e.id)})
+	// Charged: an earlier decision for this trace BILLED the rateLimiting/
+	// composite budgets (its verdict has since aged out, or it was decided early
+	// and its remainder started a fresh window), so this one CHECKS them instead
+	// of spending them again. The cache remembers the spend the evaluator
+	// reported, not the decision — a decision the budget refused paid nothing,
+	// and skipping the charge for it would admit spans free every fresh window.
+	// See the two lifetimes in cache.go.
+	d := b.ev.Decide(tailsample.Trace{TraceID: e.id, Spans: b.scratch, Charged: b.cache.charged(e.id)})
 
 	c, ok := b.byPolicy[d.Policy]
 	if !ok { // unreachable: Names() covers every name a Decision can carry
@@ -774,7 +777,9 @@ func (b *Buffer) decide(out *outbound, e *bufTrace, now time.Time, reason string
 	}
 
 	b.remove(e)
-	b.cache.put(e.id, d.Sampled, now)
+	// d.Charged, not "we decided it": a re-decision reads this back as
+	// Trace.Charged, and only a budget that actually moved may be skipped.
+	b.cache.put(e.id, d.Sampled, d.Charged, now)
 	if !d.Sampled {
 		b.spansDrop.Add(float64(e.spans))
 		// Release the payload. remove() deliberately leaves this entry's

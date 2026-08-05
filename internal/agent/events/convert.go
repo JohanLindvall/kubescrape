@@ -47,6 +47,9 @@ func (r *Reader) ingest(ctx context.Context, e *corev1.Event) {
 	if ent.ts.IsZero() {
 		ent.ts = e.CreationTimestamp.Time
 	}
+	if len(r.batch) >= r.retainCap() {
+		r.shedOldest()
+	}
 	r.batch = append(r.batch, ent)
 	obs.EventsObserved.WithLabelValues(eventTypeLabel(e.Type)).Inc()
 }

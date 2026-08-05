@@ -161,6 +161,62 @@ func TestGetPodByIP(t *testing.T) {
 	}
 }
 
+// The index is keyed by peerip.Canonical and every lookup arrives in that same
+// form (/v1/self from the connection's source address, the agent's fallback
+// through metaclient.PodByIP). A kubelet or CNI spelling an address differently
+// — IPv4-mapped, uppercase, uncompressed, zoned — must therefore still resolve:
+// keying it verbatim indexed the pod under something no lookup ever forms, and
+// the 404 that produced was indistinguishable from an unknown address.
+func TestGetPodByIPCanonicalizesBothSides(t *testing.T) {
+	for _, tc := range []struct{ name, reported, asked string }{
+		{"ipv4-mapped in status", "::ffff:10.0.0.5", "10.0.0.5"},
+		{"ipv4-mapped in the lookup", "10.0.0.5", "::ffff:10.0.0.5"},
+		{"uppercase ipv6", "FD00::7", "fd00::7"},
+		{"uncompressed ipv6", "fd00:0:0:0:0:0:0:7", "fd00::7"},
+		{"zoned lookup", "fd00::7", "fd00::7%eth0"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := New(time.Minute)
+			s.UpsertPod(&corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{Name: "p1", Namespace: "ns", UID: "u1", ResourceVersion: "1"},
+				Status:     corev1.PodStatus{PodIP: tc.reported, HostIP: "192.168.1.1"},
+			})
+			if np, ok := s.GetPodByIP(tc.asked); !ok || np.Pod.Name != "p1" {
+				t.Fatalf("status %q looked up as %q: %+v ok=%v", tc.reported, tc.asked, np.Pod, ok)
+			}
+			// The SERVED model keeps what the kubelet reported; only the key is
+			// normalised.
+			np, _ := s.GetPodByIP(tc.asked)
+			if np.Pod.PodIP != tc.reported {
+				t.Fatalf("served PodIP = %q, want the verbatim %q", np.Pod.PodIP, tc.reported)
+			}
+			// And the claim is released under the same key, or the entry
+			// outlives the pod (sweep never revisits byPodIP).
+			s.DeletePod("u1")
+			if _, ok := s.GetPodByIP(tc.asked); ok {
+				t.Fatal("deleted pod still resolves: the release keyed a different form than the claim")
+			}
+			if len(s.byPodIP) != 0 || len(s.ipClaimants) != 0 {
+				t.Fatalf("byPodIP=%v ipClaimants=%v left behind", s.byPodIP, s.ipClaimants)
+			}
+		})
+	}
+}
+
+// A hostNetwork pod must not claim the node address however the two are
+// spelled: the backstop compares status.podIP with status.hostIP, and the
+// comparison misses if only one side is canonicalised.
+func TestPodAddressesComparesHostIPInTheSameForm(t *testing.T) {
+	s := New(time.Minute)
+	s.UpsertPod(&corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "hostnet", Namespace: "ns", UID: "u1", ResourceVersion: "1"},
+		Status:     corev1.PodStatus{PodIP: "::ffff:192.168.1.1", HostIP: "192.168.1.1"},
+	})
+	if np, ok := s.GetPodByIP("192.168.1.1"); ok {
+		t.Fatalf("hostNetwork pod %q claimed the node address", np.Pod.Name)
+	}
+}
+
 // A finished pod's status may retain a podIP the CNI has already handed to a
 // live pod; the finished pod must neither steal the mapping nor resolve.
 func TestGetPodByIPIgnoresFinishedPods(t *testing.T) {

@@ -19,6 +19,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 
+	"github.com/JohanLindvall/kubescrape/internal/peerip"
 	"github.com/JohanLindvall/kubescrape/pkg/kubemeta"
 	"github.com/JohanLindvall/kubescrape/pkg/kubemeta/kubeconvert"
 )
@@ -266,12 +267,13 @@ func (s *Store) claimPodIPLocked(rec *record, pod kubemeta.Pod, oldIPs []string)
 	// that one left /v1/self and /v1/pod-ips unresolvable for it — the agent's
 	// self-attribution and the ingest peer-IP fallback silently off, with a 404
 	// indistinguishable from any other.
-	for _, ip := range podAddresses(pod) {
+	addrs := podAddresses(pod)
+	for _, ip := range addrs {
 		s.claimOneIPLocked(rec, ip, oldIPs)
 	}
 	// Addresses the pod no longer reports are released.
 	for _, old := range oldIPs {
-		if old == "" || containsStr(podAddresses(pod), old) {
+		if old == "" || containsStr(addrs, old) {
 			continue
 		}
 		s.releaseIPLocked(rec, old)
@@ -285,12 +287,24 @@ func (s *Store) claimPodIPLocked(rec *record, pod kubemeta.Pod, oldIPs []string)
 // recordAddresses (release/cleanup) MUST read this same list — a claim taken
 // from an address one enumeration sees and the other does not is never
 // released, the dual-stack leak class deletePodLocked's comment describes.
+//
+// Every address is CANONICALISED, because this is what the index is keyed by
+// while every lookup arrives in peerip's form: /v1/self from the connection's
+// source address, the agent's ingest fallback through metaclient.PodByIP. A
+// kubelet or CNI reporting `::ffff:10.1.2.3`, `FD00::0:7` or a zoned address
+// would otherwise index the pod under a key no lookup can ever form, and both
+// of those paths would 404 for it — indistinguishable from any other miss. The
+// SERVED model keeps the verbatim strings; only the keys are normalised.
 func rawIPs(pod kubemeta.Pod) []string {
 	ips := pod.PodIPs
 	if len(ips) == 0 && pod.PodIP != "" {
 		ips = []string{pod.PodIP}
 	}
-	return ips
+	out := make([]string, len(ips))
+	for i, ip := range ips {
+		out[i] = peerip.Canonical(ip)
+	}
+	return out
 }
 
 // podAddresses returns the addresses a pod may legitimately be reached at, or
@@ -302,11 +316,14 @@ func podAddresses(pod kubemeta.Pod) []string {
 		return nil
 	}
 	ips := rawIPs(pod)
+	// The host address in the same form the pod addresses are keyed in, or the
+	// comparison below misses whenever the two are spelled differently.
+	host := peerip.Canonical(pod.HostIP)
 	out := ips[:0:0]
 	for _, ip := range ips {
 		// A hostNetwork pod whose status.hostIP has not been populated yet
 		// would otherwise claim the node address.
-		if ip != "" && ip != pod.HostIP {
+		if ip != "" && ip != host {
 			out = append(out, ip)
 		}
 	}

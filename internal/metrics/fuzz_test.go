@@ -97,15 +97,17 @@ func FuzzLineFields(f *testing.F) {
 // serialized form: parseLabels cuts keys at '=', trims surrounding space, and
 // cannot represent quotes/backslashes/newlines/commas in keys (values may
 // contain anything — they are escaped; keys are not, by design).
+// Whitespace is deliberately NOT trimmed: an edge space in a key is
+// representable (escapeKey escapes it) and the round trip must preserve it —
+// hashed identity and rendered identity are the same identity.
 func sanitizeLabelKey(k string) string {
-	k = strings.Map(func(r rune) rune {
+	return strings.Map(func(r rune) rune {
 		switch r {
 		case '=', ',', '"', '\\', '\n', '{', '}':
 			return -1
 		}
 		return r
 	}, k)
-	return strings.TrimSpace(k)
 }
 
 // FuzzLabelsParse checks that String/parseLabels round-trip arbitrary label

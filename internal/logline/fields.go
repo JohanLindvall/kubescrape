@@ -1,7 +1,6 @@
 package logline
 
 import (
-	"strconv"
 	"strings"
 	"unsafe"
 
@@ -139,6 +138,18 @@ func (ki KeyIndex) Get(lf *Fields, key string) string {
 
 // Parse fills lf.vals (by slot) with the referenced keys from the line: JSON
 // when it starts with '{', otherwise logfmt (flat keys only).
+//
+// DUPLICATE KEYS resolve differently by format, and deliberately stay that way:
+// JSON keeps the FIRST occurrence (lightning's GetPaths fills a path's slot
+// only while it is still nil — its documented contract, and re-resolving it
+// would mean a second pass over the line) while the logfmt scan below keeps the
+// LAST (the callback writes the slot on every match). So `{"level":"info",
+// "level":"warn"}` reads info and `level=info level=warn` reads warn. Both
+// inputs are malformed, and neither format's reader dictates an answer — the
+// logfmt reader's own Get resolves first-NON-EMPTY-wins, a third rule again —
+// so unifying it would mean inventing a rule here and keeping the twin
+// extractor in pkg/logattrs (which has the identical asymmetry, for the
+// identical reason) in step with it forever. It is written down instead.
 func (ki KeyIndex) Parse(lf *Fields) {
 	if t := strings.TrimSpace(lf.line); strings.HasPrefix(t, "{") {
 		// Read-only view: GetPaths only reads the buffer; its outputs alias it.
@@ -158,6 +169,9 @@ func (ki KeyIndex) Parse(lf *Fields) {
 		}
 		return
 	}
+	// A line with no '=' carries no logfmt pair; the scan is skipped as a pure
+	// fast path, which is only sound because bare keys resolve to nothing (see
+	// the IsBareKey guard below).
 	if strings.IndexByte(lf.line, '=') < 0 {
 		return
 	}
@@ -168,6 +182,15 @@ func (ki KeyIndex) Parse(lf *Fields) {
 		// allocation per referenced key per line.
 		slot, ok := ki.want[string(key)]
 		if !ok {
+			return true
+		}
+		// A BARE key yields the sentinel "true", which is prose, not a field:
+		// `weight=10 disk error` would resolve error="true" and fire a selector
+		// written as `error=true`. Worse, whether the words are seen at all
+		// depends on an unrelated '=' elsewhere on the line (the fast path
+		// above), so the same sentence resolves differently depending on its
+		// neighbours.
+		if logfmt.IsBareKey(val) {
 			return true
 		}
 		// Iterate yields RAW values (quotes stripped, escapes intact).
@@ -239,6 +262,14 @@ func RawScalarString(raw []byte) (string, bool) {
 		if err != nil {
 			return "", false
 		}
-		return strconv.FormatFloat(f, 'f', -1, 64), true
+		// logattrs.FloatString, not FormatFloat('f'): the SAME field reaches an
+		// exported string through three paths — this one (a line field read
+		// straight off the line), a record attribute (put on pdata, read back by
+		// AsString) and a lifted resource attribute (logchain's attrString) — and
+		// the other two render ES6. Fixed-point here meant "0.0000005" where they
+		// said "5e-7", so adding or removing an unrelated logAttributes rule for
+		// that key silently renamed every series labelled by it, and a selector
+		// written for one spelling stopped matching.
+		return logattrs.FloatString(f), true
 	}
 }

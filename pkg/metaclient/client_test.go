@@ -1014,3 +1014,28 @@ func TestDecodeErrorNamesThePackageAndTheURL(t *testing.T) {
 		})
 	}
 }
+
+// The over-cap eviction performs the same idle sweep the periodic branch does,
+// so it must advance lastSweep: left behind, the next below-cap insert re-ran
+// a full O(n) idle sweep under the mutex shared with the concurrent ingest and
+// cadvisor lookups, however recently the hard trim had swept.
+func TestOverCapEvictionAdvancesSweepCadence(t *testing.T) {
+	c := New(Config{Base: "http://unused", Timeout: time.Second})
+	now := time.Now()
+	c.now = func() time.Time { return now }
+
+	c.mu.Lock()
+	for i := 0; i <= maxCacheEntries; i++ {
+		c.cache[fmt.Sprintf("u%d", i)] = cacheEntry{used: now}
+	}
+	c.evictLocked()
+	got, sweep := len(c.cache), c.lastSweep
+	c.mu.Unlock()
+
+	if got > evictLowWater {
+		t.Fatalf("cache entries = %d after the over-cap eviction, want <= %d", got, evictLowWater)
+	}
+	if !sweep.Equal(now) {
+		t.Fatalf("lastSweep = %v, want %v: the over-cap eviction swept idles without recording it", sweep, now)
+	}
+}

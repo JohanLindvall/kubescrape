@@ -24,3 +24,30 @@ func TestPeerIPCanonicalises(t *testing.T) {
 		}
 	}
 }
+
+// Canonical is the same normalisation on a bare address — it is what the store
+// keys the index WITH, so From's output and a kubelet's status.podIP land on
+// one key. An address that does not parse stays itself: it is still a key, and
+// both sides have to agree on it too.
+func TestCanonical(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct{ ip, want string }{
+		{"10.1.2.3", "10.1.2.3"},
+		{"::ffff:10.1.2.3", "10.1.2.3"},
+		{"FD00::7", "fd00::7"},
+		{"fd00:0:0:0:0:0:0:7", "fd00::7"},
+		{"fe80::1%eth0", "fe80::1"},
+		{"", ""},
+		{"not-an-ip", "not-an-ip"},
+	} {
+		if got := Canonical(tc.ip); got != tc.want {
+			t.Errorf("Canonical(%q) = %q, want %q", tc.ip, got, tc.want)
+		}
+	}
+
+	// The two must agree: what From hands a lookup is what Canonical made the
+	// key.
+	if got, want := From("[::ffff:10.1.2.3]:34512"), Canonical("::ffff:10.1.2.3"); got != want {
+		t.Errorf("From = %q but the index key is %q", got, want)
+	}
+}

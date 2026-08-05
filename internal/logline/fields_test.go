@@ -1,6 +1,13 @@
 package logline
 
-import "testing"
+import (
+	"strconv"
+	"testing"
+
+	"go.opentelemetry.io/collector/pdata/pcommon"
+
+	"github.com/JohanLindvall/kubescrape/pkg/logattrs"
+)
 
 func TestRawScalarString(t *testing.T) {
 	t.Parallel()
@@ -175,5 +182,80 @@ func TestLogfmtValueSurvivesReset(t *testing.T) {
 	}
 	if now := ki.Get(&f, "msg"); now != "goodbye" {
 		t.Errorf("msg = %q, want goodbye", now)
+	}
+}
+
+// A JSON number renders the same string here as it does through the record and
+// lifted-attribute paths (pcommon's ES6 rendering, which logattrs.FloatString
+// replicates). Fixed-point here meant a line field read "0.0000005" where an
+// attribute lifted from the very same key read "5e-7": adding or removing an
+// unrelated logAttributes rule silently renamed every log-metric series
+// labelled by it, and a selector written for one spelling stopped matching.
+func TestRawScalarStringMatchesAttributeRendering(t *testing.T) {
+	t.Parallel()
+	for _, tok := range []string{"5e-7", "0.0000005", "1e21", "2.5e22", "1e-6", "1.5e-7", "-3e21", "42.5"} {
+		got, ok := RawScalarString([]byte(tok))
+		if !ok {
+			t.Fatalf("RawScalarString(%q) rejected a number", tok)
+		}
+		f, err := strconv.ParseFloat(tok, 64)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if want := pcommon.NewValueDouble(f).AsString(); got != want {
+			t.Errorf("RawScalarString(%q) = %q, but the same value on a record reads %q", tok, got, want)
+		}
+		if want := logattrs.FloatString(f); got != want {
+			t.Errorf("RawScalarString(%q) = %q, logattrs.FloatString = %q", tok, got, want)
+		}
+	}
+}
+
+// A BARE logfmt key yields the sentinel "true", which is prose, not a field:
+// `weight=10 disk error` must not resolve error="true" and fire a selector
+// written as `error=true`. It cannot be admitted even in principle, because
+// whether the words are scanned at all depends on an unrelated '=' elsewhere on
+// the line (the no-'=' fast path), so the identical sentence would resolve two
+// ways depending on its neighbours.
+func TestBareLogfmtKeysResolveToNothing(t *testing.T) {
+	t.Parallel()
+	ki := NewKeyIndex()
+	ki.Add("error")
+	ki.Add("disk")
+	ki.Add("weight")
+	for _, line := range []string{`weight=10 disk error`, `disk error`} {
+		var f Fields
+		f.Reset(line)
+		for _, key := range []string{"error", "disk"} {
+			if got := ki.Get(&f, key); got != "" {
+				t.Errorf("line %q: %s = %q, want nothing (a bare word is not a field)", line, key, got)
+			}
+		}
+	}
+	var f Fields
+	f.Reset(`weight=10 disk error`)
+	if got := ki.Get(&f, "weight"); got != "10" {
+		t.Errorf("weight = %q, want 10 — real pairs on the same line still resolve", got)
+	}
+}
+
+// Duplicate keys resolve FIRST-wins in JSON (lightning's GetPaths contract) and
+// LAST-wins in logfmt (the scan overwrites the slot). Both inputs are
+// malformed and neither reader dictates an answer, so the asymmetry is
+// documented rather than papered over — this pins what the documentation says,
+// here and in the twin extractor in pkg/logattrs.
+func TestDuplicateKeyResolutionIsAsDocumented(t *testing.T) {
+	t.Parallel()
+	ki := NewKeyIndex()
+	ki.Add("level")
+	for line, want := range map[string]string{
+		`{"level":"info","level":"warn"}`: "info",
+		`level=info level=warn`:           "warn",
+	} {
+		var f Fields
+		f.Reset(line)
+		if got := ki.Get(&f, "level"); got != want {
+			t.Errorf("line %q: level = %q, want %q", line, got, want)
+		}
 	}
 }

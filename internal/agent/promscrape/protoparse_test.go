@@ -3,9 +3,11 @@ package promscrape
 import (
 	"context"
 	"encoding/binary"
+	"maps"
 	"math"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -310,20 +312,208 @@ func TestDecodeSpansGuards(t *testing.T) {
 	_, _, ok := decodeSpans([]*dto.BucketSpan{
 		{Offset: ptr(int32(0)), Length: ptr(uint32(1))},
 		{Offset: ptr(int32(100000)), Length: ptr(uint32(1))},
-	}, []int64{1, 0})
+	}, []int64{1, 0}, nil)
 	if ok {
 		t.Fatal("unbounded gap accepted")
 	}
 	// Negative running count.
-	_, _, ok = decodeSpans([]*dto.BucketSpan{{Offset: ptr(int32(0)), Length: ptr(uint32(2))}}, []int64{1, -5})
+	_, _, ok = decodeSpans([]*dto.BucketSpan{{Offset: ptr(int32(0)), Length: ptr(uint32(2))}}, []int64{1, -5}, nil)
 	if ok {
 		t.Fatal("negative count accepted")
 	}
 	// Missing deltas.
-	_, _, ok = decodeSpans([]*dto.BucketSpan{{Offset: ptr(int32(0)), Length: ptr(uint32(3))}}, []int64{1})
+	_, _, ok = decodeSpans([]*dto.BucketSpan{{Offset: ptr(int32(0)), Length: ptr(uint32(3))}}, []int64{1}, nil)
 	if ok {
 		t.Fatal("missing deltas accepted")
 	}
+}
+
+// Span indexes are the TARGET's int32 offsets and uint32 lengths, and in int32
+// arithmetic they wrap: a running index driven past MaxInt32 came back as a
+// small (or negative) one, so the gap check — computed from the wrapped values
+// — saw a legal gap and the point shipped with buckets at a mathematically
+// impossible index. The guard's job is to REFUSE hostile shapes, so leaving
+// int32 range is rejected rather than folded back into it.
+func TestDecodeSpansRejectsIndexOverflow(t *testing.T) {
+	if _, _, ok := decodeSpans([]*dto.BucketSpan{
+		{Offset: ptr(int32(math.MaxInt32)), Length: ptr(uint32(1))},
+		{Offset: ptr(int32(2)), Length: ptr(uint32(1))},
+	}, []int64{1, 1}, nil); ok {
+		t.Fatal("span index past MaxInt32 accepted: the gap guard was bypassed by the wrap")
+	}
+	// The OTLP offset is the first index MINUS ONE, which underflows on its own.
+	if _, _, ok := decodeSpans([]*dto.BucketSpan{
+		{Offset: ptr(int32(math.MinInt32)), Length: ptr(uint32(1))},
+	}, []int64{1}, nil); ok {
+		t.Fatal("span index at MinInt32 accepted: offset-1 underflows to a positive index")
+	}
+}
+
+// A FLOAT native histogram (spans plus absolute positive_count, no deltas) is
+// well formed — Prometheus parses it into a FloatHistogram. Reading only the
+// delta encoding made it "malformed" and dropped the family WHOLE: no buckets,
+// no count, no sum, no classic fallback.
+func TestFloatNativeHistogramConverts(t *testing.T) {
+	fam := &dto.MetricFamily{
+		Name: ptr("rpc_latency_seconds"),
+		Type: dto.MetricType_HISTOGRAM.Enum(),
+		Metric: []*dto.Metric{{
+			Histogram: &dto.Histogram{
+				SampleCountFloat: ptr(9.0),
+				SampleSum:        ptr(2.25),
+				Schema:           ptr(int32(2)),
+				ZeroThreshold:    ptr(1e-9),
+				ZeroCountFloat:   ptr(2.0),
+				PositiveSpan:     []*dto.BucketSpan{{Offset: ptr(int32(1)), Length: ptr(uint32(3))}},
+				PositiveCount:    []float64{4, 2, 1}, // absolute, not deltas
+			},
+		}},
+	}
+	got := scrapeProtoFamilies(t, fam)
+	m, ok := got["rpc_latency_seconds"]
+	if !ok {
+		t.Fatalf("the family was dropped whole; exported %v", slices.Sorted(maps.Keys(got)))
+	}
+	if m.Type() != pmetric.MetricTypeExponentialHistogram {
+		t.Fatalf("float native histogram type = %v", m.Type())
+	}
+	dp := m.ExponentialHistogram().DataPoints().At(0)
+	if dp.Count() != 9 || dp.Sum() != 2.25 || dp.ZeroCount() != 2 || dp.Scale() != 2 {
+		t.Fatalf("dp: count=%d sum=%v zero=%d scale=%d", dp.Count(), dp.Sum(), dp.ZeroCount(), dp.Scale())
+	}
+	if got, want := dp.Positive().BucketCounts().AsRaw(), []uint64{4, 2, 1}; !slices.Equal(got, want) {
+		t.Fatalf("buckets = %v, want %v (absolute float counts, not delta-decoded)", got, want)
+	}
+	if dp.Positive().Offset() != 0 {
+		t.Fatalf("offset = %d, want the first index minus one", dp.Positive().Offset())
+	}
+}
+
+// An exporter that materialises default fields sends a CLASSIC histogram whose
+// schema/zero_threshold/zero_count are all present and all zero. A presence
+// test read that as an empty NATIVE histogram: the classic buckets never
+// converted and the exported point carried count and sum with no buckets at
+// all. Detection is on the VALUES, exactly as Prometheus decides it.
+func TestClassicHistogramWithZeroValuedNativeFields(t *testing.T) {
+	fam := &dto.MetricFamily{
+		Name: ptr("rpc_latency_seconds"),
+		Type: dto.MetricType_HISTOGRAM.Enum(),
+		Metric: []*dto.Metric{{
+			Histogram: &dto.Histogram{
+				SampleCount:   ptr(uint64(4)),
+				SampleSum:     ptr(1.5),
+				Schema:        ptr(int32(0)),
+				ZeroThreshold: ptr(0.0),
+				ZeroCount:     ptr(uint64(0)),
+				Bucket: []*dto.Bucket{
+					{UpperBound: ptr(0.5), CumulativeCount: ptr(uint64(3))},
+					{UpperBound: ptr(math.Inf(1)), CumulativeCount: ptr(uint64(4))},
+				},
+			},
+		}},
+	}
+	got := scrapeProtoFamilies(t, fam)
+	m, ok := got["rpc_latency_seconds"]
+	if !ok {
+		t.Fatalf("the family was not exported at all; got %v", slices.Sorted(maps.Keys(got)))
+	}
+	if m.Type() != pmetric.MetricTypeHistogram {
+		t.Fatalf("type = %v, want a classic histogram: zero-VALUED native fields are not native data", m.Type())
+	}
+	dp := m.Histogram().DataPoints().At(0)
+	if got, want := dp.BucketCounts().AsRaw(), []uint64{3, 1}; !slices.Equal(got, want) {
+		t.Fatalf("buckets = %v, want %v", got, want)
+	}
+	if dp.Count() != 4 || dp.Sum() != 1.5 {
+		t.Fatalf("dp: count=%d sum=%v", dp.Count(), dp.Sum())
+	}
+}
+
+// A native histogram with no observations declares itself with a zero-length
+// no-op span; the value-based detection must still find it, or the ecosystem's
+// own convention breaks.
+func TestNoOpSpanIsStillNative(t *testing.T) {
+	h := &dto.Histogram{
+		SampleCount:  ptr(uint64(0)),
+		Schema:       ptr(int32(3)),
+		PositiveSpan: []*dto.BucketSpan{{Offset: ptr(int32(0)), Length: ptr(uint32(0))}},
+	}
+	if !isNative(h) {
+		t.Fatal("a no-op span must mark a histogram native")
+	}
+}
+
+// GAUGE_HISTOGRAM buckets are a CURRENT snapshot and may decrease, so the
+// cumulative monotonic histogram the HISTOGRAM path builds misdeclares their
+// temporality — and the text front degrades the same family to gauges, so the
+// two formats disagreed about one target. Both ship gauges now.
+func TestGaugeHistogramConvertsToGauges(t *testing.T) {
+	fam := &dto.MetricFamily{
+		Name: ptr("cache_entries"),
+		Type: dto.MetricType_GAUGE_HISTOGRAM.Enum(),
+		Metric: []*dto.Metric{{
+			Histogram: &dto.Histogram{
+				SampleCount: ptr(uint64(4)),
+				SampleSum:   ptr(1.5),
+				Bucket: []*dto.Bucket{
+					{UpperBound: ptr(0.5), CumulativeCount: ptr(uint64(3))},
+					{UpperBound: ptr(math.Inf(1)), CumulativeCount: ptr(uint64(4))},
+				},
+			},
+		}},
+	}
+	got := scrapeProtoFamilies(t, fam)
+	if m, ok := got["cache_entries"]; ok {
+		t.Fatalf("gauge histogram exported as %v: OTLP has no gauge-histogram shape", m.Type())
+	}
+	for _, name := range []string{"cache_entries_bucket", "cache_entries_gsum", "cache_entries_gcount"} {
+		m, ok := got[name]
+		if !ok {
+			t.Fatalf("%s missing; got %v", name, slices.Sorted(maps.Keys(got)))
+		}
+		if m.Type() != pmetric.MetricTypeGauge {
+			t.Fatalf("%s type = %v, want a gauge", name, m.Type())
+		}
+	}
+	if v := got["cache_entries_gcount"].Gauge().DataPoints().At(0).DoubleValue(); v != 4 {
+		t.Fatalf("_gcount = %v, want 4", v)
+	}
+	if got["cache_entries_bucket"].Gauge().DataPoints().Len() != 2 {
+		t.Fatal("bucket rows lost")
+	}
+}
+
+// scrapeProtoFamilies runs one protobuf exposition through a real scrape and
+// returns the exported metrics by name.
+func scrapeProtoFamilies(t *testing.T, families ...*dto.MetricFamily) map[string]pmetric.Metric {
+	t.Helper()
+	body := protoBody(t, families...)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/vnd.google.protobuf; proto=io.prometheus.client.MetricFamily; encoding=delimited")
+		_, _ = w.Write(body)
+	}))
+	t.Cleanup(srv.Close)
+
+	exp := &captureExporter{}
+	s := New(Config{
+		Node: "n1", Interval: time.Hour, Timeout: 5 * time.Second,
+		NativeHistograms: true,
+		Targets:          staticTargets{testTarget(srv.URL)},
+		Exporter:         exp, StartTime: time.Now(),
+	})
+	s.cycle(context.Background())
+
+	out := map[string]pmetric.Metric{}
+	for _, md := range exp.batches {
+		rms := md.ResourceMetrics()
+		for i := range rms.Len() {
+			ms := rms.At(i).ScopeMetrics().At(0).Metrics()
+			for j := range ms.Len() {
+				out[ms.At(j).Name()] = ms.At(j)
+			}
+		}
+	}
+	return out
 }
 
 // The protobuf path must count each classic sample ONCE (emit counts it via

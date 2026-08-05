@@ -2,6 +2,8 @@ package events
 
 import (
 	"context"
+	"fmt"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -930,5 +932,121 @@ func TestColdRestartGrowthDoesNotCommitPastUnexported(t *testing.T) {
 	}
 	if got := exp.records(); len(got) != 2 {
 		t.Fatalf("exported %d records, want 2 (A then B, each exactly once)", len(got))
+	}
+}
+
+// The bookmark variant of the cold-restart-growth case: a bookmark's revision
+// vouches for EVERYTHING the stream delivered before it, including entries
+// retained past the rendered prefix (a redelivers=false restart's fresh
+// appends), so applying it after a flush that covered only the prefix put the
+// committed position ABOVE the unexported tail — a later stream restart's
+// redelivers=true clear then dropped the tail, and the watch resumed from the
+// bookmark never re-delivered it: silent, uncounted loss.
+func TestBookmarkStaysPendingWhileATailIsRetained(t *testing.T) {
+	exp := &captureExporter{failN: 1, err: context.DeadlineExceeded}
+	r, _, _ := newReader(t, Config{Exporter: exp, BatchSize: 100})
+	ctx := context.Background()
+	now := time.Now()
+
+	// Cold reader (nothing committed). Ingest A (rv 10); the first flush fails
+	// transiently, so the batch and its rendering are retained.
+	if err := r.handle(ctx, watch.Event{Type: watch.Added, Object: event("a", "R", "m", "Normal", "10", 1, now)}); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.flush(ctx); err == nil {
+		t.Fatal("first flush should fail transiently")
+	}
+
+	// The redelivers=false restart's new watch appends B (rv 11) past the
+	// frozen prefix, then a bookmark whose revision covers B arrives.
+	if err := r.handle(ctx, watch.Event{Type: watch.Added, Object: event("b", "R", "m", "Normal", "11", 1, now.Add(time.Second))}); err != nil {
+		t.Fatal(err)
+	}
+	bm := &corev1.Event{ObjectMeta: metav1.ObjectMeta{ResourceVersion: "12"}}
+	if err := r.handle(ctx, watch.Event{Type: watch.Bookmark, Object: bm}); err != nil {
+		t.Fatal(err)
+	}
+
+	// The collector recovers; this flush ships only [A]. The bookmark must NOT
+	// commit: its revision is above B, which is still unexported.
+	if err := r.flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := r.committed.ResourceVersion; got != "10" {
+		t.Fatalf("committed=%q, want 10 (A's rv) — a bookmark above the retained tail must not commit", got)
+	}
+	if r.pendingRV != "12" {
+		t.Fatalf("pendingRV=%q, want the bookmark kept pending for the flush that covers the tail", r.pendingRV)
+	}
+
+	// The flush that empties the batch consumes the bookmark.
+	if err := r.flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := r.committed.ResourceVersion; got != "12" {
+		t.Fatalf("committed=%q, want 12 once the tail shipped", got)
+	}
+	if r.pendingRV != "" {
+		t.Fatalf("pendingRV=%q, want cleared once applied", r.pendingRV)
+	}
+	if got := exp.records(); len(got) != 2 {
+		t.Fatalf("exported %d records, want 2 (A then B, each exactly once)", len(got))
+	}
+}
+
+// Before anything commits, every stream restart retains the batch (the
+// redelivers=false contract: the new watch does not re-send it) while
+// appending fresh entries, and BatchSize only triggers flush ATTEMPTS — which
+// fail for as long as the collector is down. Unbounded, that is an OOM
+// against the singleton's memory limit that loses the whole batch AND the
+// whole outage window (StartMode=end after the restart) and takes the
+// co-located pipelines down. The cap sheds the oldest entry the pending
+// payload does not cover, counted into obs.EventsOverflowDropped.
+func TestRetainedBatchIsBoundedDuringOutage(t *testing.T) {
+	exp := &captureExporter{failN: 1 << 30, err: context.DeadlineExceeded}
+	r, _, _ := newReader(t, Config{Exporter: exp, BatchSize: 100})
+	ctx := context.Background()
+	now := time.Now()
+	before := obs.EventsOverflowDropped.Value()
+
+	limit := r.retainCap()
+	const over = 25
+	for i := 0; i < limit+over; i++ {
+		// Flush attempts past BatchSize fail transiently; the stream would
+		// restart on them, which is exactly the retention path under test.
+		_ = r.handle(ctx, watch.Event{Type: watch.Added,
+			Object: event(fmt.Sprintf("e%d", i), "R", "m", "Normal", strconv.Itoa(100+i), 1, now)})
+	}
+	if len(r.batch) != limit {
+		t.Fatalf("batch=%d, want capped at %d", len(r.batch), limit)
+	}
+	if got := obs.EventsOverflowDropped.Value() - before; got != over {
+		t.Fatalf("overflow-dropped=%v, want %d — the loss must be counted", got, over)
+	}
+	// The rendered prefix survives (its entries are in the retained payload,
+	// not lost) and the newest entries survive (drop-oldest); the shed range
+	// sits in between.
+	if r.batch[0].rv != "100" {
+		t.Fatalf("prefix rv=%q, want 100 — shedding inside the rendered prefix orphans the payload", r.batch[0].rv)
+	}
+	if got, want := r.batch[len(r.batch)-1].rv, strconv.Itoa(100+limit+over-1); got != want {
+		t.Fatalf("newest rv=%q, want %s retained", got, want)
+	}
+
+	// Recovery: everything retained ships exactly once and the position lands
+	// on the newest entry — the shed range cost nothing extra.
+	exp.mu.Lock()
+	exp.failN = 0
+	exp.mu.Unlock()
+	for len(r.batch) > 0 {
+		if err := r.flush(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := len(exp.records()); got != limit {
+		t.Fatalf("exported %d records, want %d (the cap's worth, each exactly once)", got, limit)
+	}
+	if got, want := r.committed.ResourceVersion, strconv.Itoa(100+limit+over-1); got != want {
+		t.Fatalf("committed=%q, want %s", got, want)
 	}
 }

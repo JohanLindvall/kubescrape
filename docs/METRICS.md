@@ -32,8 +32,9 @@ Prometheus/Mimir ignore the field by default and are unaffected.
 
 This file is generated from `internal/obs/obs.go`. Regenerate with
 `go test ./internal/obs/ -run TestMetricsDocIsCurrent -update-metrics-doc`;
-`TestDocumentedMetricsExist` additionally fails if prose anywhere in the repo
-names a metric or a label that is not registered.
+`TestDocumentedMetricsExist` additionally fails if prose in `README.md`,
+`CLAUDE.md` or any `docs/*.md` names a metric or a label that is not
+registered.
 
 ## Renamed in this release
 
@@ -87,12 +88,13 @@ is the documented alert for the non-buffered tailer.
 | `kubescrape_events_dropped_records_total` | — | Kubernetes event records lost with those batches (the magnitude of the loss the batch counter only signals). |
 | `kubescrape_events_exported_total` | — | Kubernetes event records exported (after the rules). |
 | `kubescrape_events_observed_total` | `type` | Kubernetes events received from the watch, by event type (normal, warning, other — anything else the API server reports). |
+| `kubescrape_events_overflow_dropped_total` | — | Kubernetes events dropped UNEXPORTED because the retained batch hit its cap before anything could commit (a collector outage on a fresh install); the watch will not re-deliver them, so each is outright loss. |
 | `kubescrape_export_rejected_records_total` | `signal` | Records the collector REJECTED inside a payload it otherwise accepted (OTLP partial_success), by signal. The export succeeded, so every producer advanced its offset, cursor or position past them — these are lost, permanently, and retrying cannot help (OTLP defines them as invalid rather than deferred). Any nonzero rate means telemetry is being discarded downstream; the collector's own message is on the accompanying warning. |
 | `kubescrape_export_requests_total` | `signal`, `outcome` | OTLP export attempts by signal and outcome. |
 | `kubescrape_http_requests_total` | `pattern`, `code` | Metadata API requests by pattern and status code. |
 | `kubescrape_informer_watch_errors_total` | `resource` | List/watch failures reported by the informers, by resource. |
 | `kubescrape_ingest_rejected_total` | — | Pushed OTLP requests refused because a receiver admission bound was reached — concurrent in-flight pushes or buffered payload bytes (retryable: 429 / ResourceExhausted). |
-| `kubescrape_ingest_resources_total` | `outcome` | Distinct pushed identities (container id / pod uid, memoized per request) by enrichment outcome. enriched = an id resolved; peer_ip = no id, attributed by the connection's source address; peer_ip_rejected = that address resolved to the RECEIVER's own workload, so it was rewritten in flight (a proxy, a mesh sidecar, or an internal hop addressed to the application port) and nothing was attributed — anything above zero means peer-IP attribution cannot work on that path; unresolved = nothing identified the sender; split_capped = the push named more distinct objects than one payload may inflate into (maxSplitGroups), so the remainder shares the sender's resource unenriched rather than costing one full resource copy each. |
+| `kubescrape_ingest_resources_total` | `outcome` | Distinct pushed identities (container id / pod uid, memoized per request) by enrichment outcome. enriched = an id resolved; peer_ip = no id, attributed by the connection's source address; peer_ip_rejected = that address resolved to the RECEIVER's own workload, so it was rewritten in flight (a proxy, a mesh sidecar, or an internal hop addressed to the application port) and nothing was attributed — anything above zero means peer-IP attribution cannot work on that path; unresolved = nothing identified the sender; split_capped = the push exceeded what one payload may inflate into — either its distinct-object count (maxSplitGroups) or the bytes those per-object resource copies would cost (maxSplitCopyBytes) — so the remainder shares the sender's resource unenriched rather than costing one full resource copy each. |
 | `kubescrape_journal_dropped_batches_total` | — | Journal batches dropped after a permanent collector rejection (the cursor advances past them). |
 | `kubescrape_journal_dropped_records_total` | — | Journal records lost with those batches. The magnitude of the loss: a batch is up to Config.BatchSize entries. |
 | `kubescrape_journal_entries_total` | — | Journal entries exported. |
@@ -102,6 +104,7 @@ is the documented alert for the non-buffered tailer.
 | `kubescrape_log_archive_errors_total` | — | Compressed log files whose stream failed to decode mid-read (truncated gzip, trailing garbage). What decoded before the error is delivered; the remainder is unrecoverable and the archive settles. |
 | `kubescrape_log_bytes_total` | — | Raw log bytes read from live files and archives. Segment replays (re-reading a rotated file's owed range after a restart or rewind) are not re-counted. |
 | `kubescrape_log_drain_errors_total` | `source` | Reads that failed part-way through DRAINING a file incarnation that is going away (a rotated inode, a compressed archive). The drain cannot be retried — the next sweep would fail identically while holding the fd — so the unread remainder of that incarnation is unrecoverable and lost. Distinct from a clean EOF, which is the drain succeeding. |
+| `kubescrape_log_enrich_time_rejected_total` | — | Timestamps parsed from a log line that did NOT replace the producer's own (the CRI/journal/event time) because they sat a whole zone offset away from it — a quarter-hour multiple between 15 minutes and 14 hours. A steady rate means a workload logs local wall-clock time with no zone, which enrichment must read as UTC; those records keep the accurate ingest time instead of being misdated by the offset. A legitimately old timestamp (an archive, a backfill) does not land on that grid and is kept. |
 | `kubescrape_log_enriched_total` | `format` | Log records by the enrichment strategy that matched (json, logfmt, pattern, none). |
 | `kubescrape_log_entries_total` | — | Log entries exported. With -buffer-dir this counts acceptance into the disk buffer, not collector delivery — reconcile against kubescrape_buffer_dropped_records_total{signal="logs"} for what was later dropped drain-side. |
 | `kubescrape_log_export_failures_total` | — | Log batch exports that failed after retries (files rewound). |
@@ -168,4 +171,4 @@ is the documented alert for the non-buffered tailer.
 | `kubescrape_transform_errors_total` | `signal` | Transform program invocations that failed (the batch is NOT exported; the error propagates to the producer's retry path). |
 | `kubescrape_transform_reloads_total` | `outcome` | Transforms-file reloads by outcome (applied, failed — a failed compile keeps the last good program). |
 
-107 metrics.
+109 metrics.

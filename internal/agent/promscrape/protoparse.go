@@ -184,7 +184,33 @@ func (s *Scraper) protoFamily(mf *dto.MetricFamily, ss *scrapeSession) (int, err
 			if err := ss.accept(Sample{Name: name + "_count", Family: name, Role: RoleSummaryCount, Labels: labels, Value: float64(sum.GetSampleCount()), TimestampMs: ts, Help: help, Unit: unit}); err != nil {
 				return malformed, err
 			}
-		case dto.MetricType_HISTOGRAM, dto.MetricType_GAUGE_HISTOGRAM:
+		case dto.MetricType_GAUGE_HISTOGRAM:
+			// OTLP has no gauge-histogram shape, so every mapping is lossy and
+			// the question is only which loss lies. A gauge histogram's buckets
+			// are a CURRENT snapshot and may DECREASE, so shipping them as the
+			// cumulative monotonic histogram (or exponential point) the
+			// HISTOGRAM path builds misdeclares their temporality and makes
+			// every downstream rate()/delta read nonsense. The components ship
+			// as GAUGES under the OpenMetrics names instead — which is exactly
+			// what the text front produces for `# TYPE x gaugehistogram` (an
+			// unrecognised TYPE degrades to untyped, i.e. gauges), so the two
+			// formats describe one target the same way. A NATIVE gauge histogram
+			// keeps only its _gcount/_gsum: its distribution has no OTLP shape
+			// that would not lie about temporality.
+			h := m.GetHistogram()
+			for _, b := range h.GetBucket() {
+				bl := append(labels[:len(labels):len(labels)], Label{Name: "le", Value: formatFloat(b.GetUpperBound())})
+				if err := ss.accept(Sample{Name: name + "_bucket", Family: name, Role: RoleGauge, Labels: bl, Value: float64(b.GetCumulativeCount()), TimestampMs: ts, Help: help, Unit: unit}); err != nil {
+					return malformed, err
+				}
+			}
+			if err := ss.accept(Sample{Name: name + "_gsum", Family: name, Role: RoleGauge, Labels: labels, Value: h.GetSampleSum(), TimestampMs: ts, Help: help, Unit: unit}); err != nil {
+				return malformed, err
+			}
+			if err := ss.accept(Sample{Name: name + "_gcount", Family: name, Role: RoleGauge, Labels: labels, Value: sampleCount(h), TimestampMs: ts, Help: help, Unit: unit}); err != nil {
+				return malformed, err
+			}
+		case dto.MetricType_HISTOGRAM:
 			h := m.GetHistogram()
 			if isNative(h) {
 				if err := ss.countNative(); err != nil {
@@ -245,8 +271,18 @@ func (s *Scraper) protoExemplar(pe *dto.Exemplar, scratch *Exemplar) *Exemplar {
 }
 
 // isNative reports whether a histogram carries native (exponential) data:
-// a schema plus span-encoded buckets or a zero bucket. NHCB (custom bounds,
+// span-encoded buckets or a non-empty zero bucket. NHCB (custom bounds,
 // schema -53) is NOT native-exponential and falls back to classic buckets.
+//
+// The test is on the VALUES, mirroring Prometheus's own isNativeHistogram
+// (model/textparse/protobufparse.go). Testing FIELD PRESENCE instead read a
+// plain classic histogram from an exporter that materialises default fields —
+// schema/zero_threshold/zero_count all set, all zero — as an EMPTY native one:
+// the classic buckets were never converted and the point that shipped carried
+// count and sum with no buckets at all. The ecosystem contract runs the other
+// way: a native histogram with no observations yet declares itself with a
+// zero-length no-op span (client_golang emits one) precisely so that a
+// value-based test still finds it.
 //
 // A NIL histogram is not native. That case is reachable from the wire: a
 // HISTOGRAM (or GAUGE_HISTOGRAM) family whose Metric omits the histogram
@@ -265,8 +301,38 @@ func isNative(h *dto.Histogram) bool {
 	if h.GetSchema() == -53 {
 		return false
 	}
-	return (h.Schema != nil && (len(h.GetPositiveSpan()) > 0 || len(h.GetNegativeSpan()) > 0)) ||
-		h.ZeroThreshold != nil || h.ZeroCount != nil
+	return len(h.GetPositiveSpan()) > 0 || len(h.GetNegativeSpan()) > 0 ||
+		h.GetZeroThreshold() > 0 || h.GetZeroCount() > 0
+}
+
+// sampleCount and zeroBucketCount read a histogram's observation counts. dto's
+// sample_count_float / zero_count_float OVERRIDE their integer counterparts
+// when > 0 ("Overrides sample_count if > 0", says the message) — that is how a
+// FLOAT native histogram carries them, and it is the pair Prometheus keys its
+// own float variant on.
+func sampleCount(h *dto.Histogram) float64 {
+	if f := h.GetSampleCountFloat(); f > 0 {
+		return f
+	}
+	return float64(h.GetSampleCount())
+}
+
+func zeroBucketCount(h *dto.Histogram) float64 {
+	if f := h.GetZeroCountFloat(); f > 0 {
+		return f
+	}
+	return float64(h.GetZeroCount())
+}
+
+// roundCount folds an observation count into the uint64 OTLP buckets take.
+// Rounding is the whole cost of accepting a float native histogram, and it is
+// bounded: a negative, NaN or out-of-range value is not a count and is refused
+// (counted malformed by the caller) rather than wrapped into a ~1.8e19 bucket.
+func roundCount(f float64) (uint64, bool) {
+	if math.IsNaN(f) || f < 0 || f >= math.MaxUint64 {
+		return 0, false
+	}
+	return uint64(math.Round(f)), true
 }
 
 // addNativeHistogram appends one exponential histogram point to the
@@ -276,11 +342,19 @@ func (s *Scraper) addNativeHistogram(cb chunker, name string, meta metricMeta, l
 	if !ok {
 		return false // batcher variant without exponential support
 	}
-	pos, posOff, ok := decodeSpans(h.GetPositiveSpan(), h.GetPositiveDelta())
+	pos, posOff, ok := decodeSpans(h.GetPositiveSpan(), h.GetPositiveDelta(), h.GetPositiveCount())
 	if !ok {
 		return false
 	}
-	neg, negOff, ok := decodeSpans(h.GetNegativeSpan(), h.GetNegativeDelta())
+	neg, negOff, ok := decodeSpans(h.GetNegativeSpan(), h.GetNegativeDelta(), h.GetNegativeCount())
+	if !ok {
+		return false
+	}
+	count, ok := roundCount(sampleCount(h))
+	if !ok {
+		return false
+	}
+	zero, ok := roundCount(zeroBucketCount(h))
 	if !ok {
 		return false
 	}
@@ -304,9 +378,9 @@ func (s *Scraper) addNativeHistogram(cb chunker, name string, meta metricMeta, l
 		exemplars: exemplars,
 		ts:        ts,
 		schema:    h.GetSchema(),
-		zeroCount: h.GetZeroCount(),
+		zeroCount: zero,
 		zeroTh:    h.GetZeroThreshold(),
-		count:     h.GetSampleCount(),
+		count:     count,
 		sum:       h.GetSampleSum(),
 		hasSum:    h.SampleSum != nil,
 		pos:       pos, posOffset: posOff,
@@ -344,42 +418,81 @@ type expSink interface {
 // indexes (bucket i covers (base^(i-1), base^i]); OTLP buckets are 0-based
 // lower-bound (index j covers (base^(offset+j), base^(offset+j+1)]), so the
 // OTLP offset is the first Prometheus index minus one.
-func decodeSpans(spans []*dto.BucketSpan, deltas []int64) (counts []uint64, offset int32, ok bool) {
+//
+// An INTEGER histogram delta-encodes its bucket counts in deltas; a FLOAT one
+// carries them ABSOLUTELY in the parallel *_count field ("Absolute count of
+// each bucket", says the message), which is what Prometheus reads into a
+// FloatHistogram. Both are well-formed, so the encoding follows what the
+// message actually carries: reading only deltas made every float histogram
+// look like a span run with missing deltas — counted malformed and dropped
+// WHOLE, count and sum included.
+//
+// The running index is int64 because it is driven by int32 offsets and uint32
+// lengths the TARGET chooses: in int32 arithmetic a hostile span pair wrapped
+// past the gap guard and produced a point whose buckets sat at a
+// mathematically impossible index. An index (or an OTLP offset) leaving int32
+// range is refused, never wrapped.
+func decodeSpans(spans []*dto.BucketSpan, deltas []int64, absolute []float64) (counts []uint64, offset int32, ok bool) {
 	if len(spans) == 0 {
 		return nil, 0, true
 	}
-	idx := int32(0)
+	// Deltas win when a message carries both: that is the integer encoding.
+	floats := len(deltas) == 0 && len(absolute) > 0
+	var idx, start int64
 	first := true
 	var cur int64
 	di := 0
-	var start int32
 	for _, sp := range spans {
-		idx += sp.GetOffset()
+		idx += int64(sp.GetOffset())
+		if idx < math.MinInt32 || idx > math.MaxInt32 {
+			return nil, 0, false
+		}
 		if first {
 			start = idx
 			first = false
 		} else {
-			gap := int(idx - start - int32(len(counts)))
-			if gap < 0 || len(counts)+gap > maxExpBuckets {
+			gap := idx - start - int64(len(counts))
+			if gap < 0 || int64(len(counts))+gap > maxExpBuckets {
 				return nil, 0, false
 			}
 			counts = append(counts, make([]uint64, gap)...)
 		}
 		for i := uint32(0); i < sp.GetLength(); i++ {
-			if di >= len(deltas) {
-				return nil, 0, false
+			var v uint64
+			if floats {
+				if di >= len(absolute) {
+					return nil, 0, false
+				}
+				var vok bool
+				if v, vok = roundCount(absolute[di]); !vok {
+					return nil, 0, false
+				}
+			} else {
+				if di >= len(deltas) {
+					return nil, 0, false
+				}
+				cur += deltas[di]
+				if cur < 0 {
+					return nil, 0, false
+				}
+				v = uint64(cur)
 			}
-			cur += deltas[di]
 			di++
-			if cur < 0 || len(counts) >= maxExpBuckets {
+			if len(counts) >= maxExpBuckets {
 				return nil, 0, false
 			}
-			counts = append(counts, uint64(cur))
+			counts = append(counts, v)
 		}
 		// The next span's offset is relative to the index AFTER this span.
-		idx += int32(sp.GetLength())
+		idx += int64(sp.GetLength())
+		if idx < math.MinInt32 || idx > math.MaxInt32 {
+			return nil, 0, false
+		}
 	}
-	return counts, start - 1, true
+	if start-1 < math.MinInt32 {
+		return nil, 0, false
+	}
+	return counts, int32(start - 1), true
 }
 
 // protoLabels converts a metric's label pairs.

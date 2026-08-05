@@ -7,6 +7,7 @@ package logattrs
 
 import (
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 	"sync"
@@ -128,6 +129,18 @@ func New(cfg *Config) (*Extractor, error) {
 // logfmt reader. Per-call state is pooled and scalars decode straight off the
 // raw tokens (string values alias the line where escape-free), keeping the
 // per-line allocations to the extracted values themselves.
+//
+// DUPLICATE KEYS resolve differently by format, and deliberately stay that way:
+// JSON keeps the FIRST occurrence (lightning's GetPaths fills a path's slot
+// only while it is still nil — its documented contract, and re-resolving it
+// would mean a second pass over the line) while the logfmt scan keeps the LAST
+// (the callback overwrites the slot on every match). So `{"level":"info",
+// "level":"warn"}` lifts info and `level=info level=warn` lifts warn. Both
+// inputs are malformed, and neither reader dictates an answer — the logfmt
+// reader's own Get resolves first-NON-EMPTY-wins, a third rule again — so
+// unifying it would mean inventing a rule here and keeping the twin extractor
+// in internal/logline (identical asymmetry, identical reason) in step with it
+// forever. It is written down instead.
 func (e *Extractor) Extract(line string) Result {
 	var res Result
 	if e == nil {
@@ -157,18 +170,32 @@ func (e *Extractor) Extract(line string) Result {
 		}
 		return res
 	}
+	// A line with no '=' carries no logfmt pair; the scan is skipped as a pure
+	// fast path, which is only sound because bare keys lift nothing (see the
+	// IsBareKey guard below).
 	if strings.IndexByte(line, '=') < 0 {
 		return res
 	}
 	// Only the configured keys are captured (a duplicate key keeps its last
-	// value, matching the former all-pairs map); results are emitted in rule
-	// order so equal attribute sets always yield equal grouping keys.
+	// value, matching the former all-pairs map — and NOT what the JSON arm
+	// above does, which keeps the first: see the note on the asymmetry); results
+	// are emitted in rule order so equal attribute sets always yield equal
+	// grouping keys.
 	vals, found := sc.vals, sc.found
 	for i := range found {
 		vals[i], found[i] = "", false
 	}
 	buf := unsafe.Slice(unsafe.StringData(line), len(line))
 	_ = logfmt.Iterate(buf, func(key, val []byte) bool {
+		// A BARE key yields the sentinel "true", which is prose, not a field:
+		// `weight=10 disk error` would lift error="true" onto every record
+		// carrying that sentence. Whether the words are seen at all depends on
+		// an unrelated '=' elsewhere on the line (the fast path above), so
+		// admitting them makes an attribute appear and disappear with the rest
+		// of the sentence.
+		if logfmt.IsBareKey(val) {
+			return true
+		}
 		if idxs, ok := e.want[string(key)]; ok { // string(key) lookup: no alloc
 			// Iterate yields RAW values (quotes stripped, escapes intact).
 			// Decode them, as the JSON arm below and the twin extractor in
@@ -269,6 +296,49 @@ func IsIntegerToken(raw []byte) bool {
 		}
 	}
 	return true
+}
+
+// FloatString renders a float64 the way pcommon.Value.AsString does: the ES6
+// number-to-string algorithm — 'f' inside [1e-6, 1e21), 'e' with an unpadded
+// exponent outside it, NaN/Infinity spelled out.
+//
+// It sits beside IsIntegerToken because it is the other half of the same
+// contract: one line field must render identically however it reaches an
+// exported string. A bare FormatFloat('f') diverged from pcommon outside that
+// range, so the same value read 0.0000005 through one path and 5e-7 through
+// another — two metric series for one number, and a rule matching one spelling
+// and not the other. The consumers are internal/agent/logchain (a lifted
+// attribute rendered as a label, which must equal what AsString gives for the
+// same value put on a record) and internal/logline (a JSON number token
+// rendered as a line-field value). Pinned against the real pcommon rendering by
+// logchain's TestAttrStringMatchesPcommon.
+func FloatString(f float64) string {
+	if math.IsNaN(f) {
+		return "NaN"
+	}
+	if math.IsInf(f, 1) {
+		return "Infinity"
+	}
+	if math.IsInf(f, -1) {
+		return "-Infinity"
+	}
+	scratch := [64]byte{}
+	b := scratch[:0]
+	abs := math.Abs(f)
+	format := byte('f')
+	if abs != 0 && (abs < 1e-6 || abs >= 1e21) {
+		format = 'e'
+	}
+	b = strconv.AppendFloat(b, f, format, -1, 64)
+	if format == 'e' {
+		// clean up e-09 to e-9
+		n := len(b)
+		if n >= 4 && b[n-4] == 'e' && b[n-3] == '-' && b[n-2] == '0' {
+			b[n-2] = b[n-1]
+			b = b[:n-1]
+		}
+	}
+	return string(b)
 }
 
 // add appends the extracted value for rule i to the right target bucket.

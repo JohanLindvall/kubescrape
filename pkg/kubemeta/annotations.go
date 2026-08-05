@@ -5,17 +5,24 @@ package kubemeta
 //
 // The metadata routes are unauthenticated by design ("it carries no secret
 // material and agents poll it constantly"), and that claim only holds if the
-// annotations riding along carry none either. kubectl's last-applied
-// configuration breaks it outright: it is a verbatim copy of the whole applied
-// object, so anything a user inlined into a spec — an env var with a token, a
-// connection string, a webhook URL — is served to any caller that can reach
-// the port, and lands in every log record's resource attributes downstream.
+// annotations riding along carry none either. An applied-object copy breaks it
+// outright: it is the whole spec verbatim, so anything a user inlined — an env
+// var with a token, a connection string, a webhook URL — is served to any
+// caller that can reach the port, and lands in every log record's resource
+// attributes downstream.
 //
-// It is also pure bloat as telemetry metadata: it duplicates the spec the rest
-// of the response already models, and on a CronJob or Deployment it is
+// Such a copy is also pure bloat as telemetry metadata: it duplicates the spec
+// the rest of the response already models, and on a CronJob or Deployment it is
 // routinely the largest field in the payload.
+//
+// The entries are the deploy tools that write one: kubectl apply (and every
+// provider following it — Terraform, Pulumi, Argo CD's default tracking) and
+// kapp, which writes its own copy on every object it deploys. Sibling keys that
+// merely FINGERPRINT the applied object (kapp's `-diff-md5`, Flux's checksums)
+// carry no spec content and stay.
 var droppedAnnotations = map[string]bool{
 	"kubectl.kubernetes.io/last-applied-configuration": true,
+	"kapp.k14s.io/original":                            true,
 }
 
 // CopyMeta deep-copies an object's labels verbatim and passes its annotations
@@ -46,9 +53,9 @@ func cloneMap(m map[string]string) map[string]string {
 // serve. It returns nil for an empty result so the field stays omitempty.
 //
 // The filter is deliberately a fixed, tiny denylist rather than a config knob:
-// the one entry is a Kubernetes-wide convention that no consumer of this API
-// wants, and a per-deployment allowlist would make "is this endpoint safe to
-// expose" depend on configuration nobody reviews.
+// every entry is a deploy-tool convention that no consumer of this API wants,
+// and a per-deployment allowlist would make "is this endpoint safe to expose"
+// depend on configuration nobody reviews.
 func FilterAnnotations(m map[string]string) map[string]string {
 	if len(m) == 0 {
 		return nil

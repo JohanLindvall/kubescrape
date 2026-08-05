@@ -180,6 +180,9 @@ type Reader struct {
 	// relist forces the next stream to start from "" (the full TTL backlog)
 	// after the API server dropped our resourceVersion. See expire.
 	relist bool
+	// overflowWarned rate-limits the shedOldest warning to one per process;
+	// obs.EventsOverflowDropped carries the ongoing magnitude.
+	overflowWarned bool
 }
 
 // entry is one event, already converted to the fields the record needs.
@@ -615,6 +618,7 @@ func (r *Reader) flush(ctx context.Context) error {
 // `rendered` field). covered is the prefix length the payload rendered.
 func (r *Reader) settle(newest entry, covered int) {
 	covered = min(covered, len(r.batch))
+	emptied := covered == len(r.batch)
 	// Slide the retained tail to the front (copy is memmove-safe for the
 	// overlap) and clear the vacated slots so settled entries aren't pinned.
 	n := copy(r.batch, r.batch[covered:])
@@ -627,13 +631,20 @@ func (r *Reader) settle(newest entry, covered int) {
 	if newest.rv != "" && newerRV(newest.rv, r.committed.ResourceVersion) {
 		r.committed.ResourceVersion = newest.rv
 	}
-	// A bookmark seen while the batch was pending is now covered too — but only
-	// if it is NEWER than what this flush just committed. Bookmarks arrive
-	// interleaved with events, so one seen before the last few entries carries
-	// an OLDER revision, and applying it unconditionally walked the committed
-	// position backwards by up to a flush window: a restart or leader handover
-	// then redelivered everything in between.
-	if r.pendingRV != "" {
+	// A bookmark seen while the batch was pending is covered only when this
+	// flush EMPTIED the batch: its revision vouches for everything the stream
+	// delivered before it, which includes entries retained past the rendered
+	// prefix (a redelivers=false restart's fresh appends), so applying it over
+	// a partial flush put the committed position ABOVE unexported tail entries
+	// — a watch resumed from it never re-delivers them, and the persisted
+	// position stopped being a lower bound on what was delivered. With a tail
+	// retained the bookmark stays pending for the flush that covers it. When
+	// it does apply, it must also be NEWER than what this flush committed:
+	// bookmarks arrive interleaved with events, so one seen before the last
+	// few entries carries an OLDER revision, and applying it unconditionally
+	// walked the committed position backwards by up to a flush window — a
+	// restart or leader handover then redelivered everything in between.
+	if r.pendingRV != "" && emptied {
 		if newerRV(r.pendingRV, r.committed.ResourceVersion) {
 			r.committed.ResourceVersion = r.pendingRV
 		}
@@ -658,6 +669,49 @@ func (r *Reader) settle(newest entry, covered int) {
 		// restart resumes from it instead of relisting the full TTL again, and
 		// what the stream delivers from here on is new rather than replayed.
 		r.relist = false
+	}
+}
+
+// maxRetained bounds the batch across failed flushes. Before the first commit
+// every stream restart resolves through the redelivers=false branch, which
+// RETAINS the batch (the new watch does not re-deliver it) while appending
+// fresh entries — so a collector outage on a fresh install grows it without
+// bound (BatchSize only triggers flush ATTEMPTS, which fail), and each entry
+// pins a fully resolved resource (~KBs). Unbounded, that is an OOM against the
+// singleton's memory limit within hours: the whole batch lost, the whole
+// outage window lost with it (StartMode=end after the restart), and the
+// co-located pipelines taken down too. Past the cap the oldest sheddable
+// entry is dropped and counted (obs.EventsOverflowDropped) — bounded,
+// observable loss instead of total.
+const maxRetained = 8192
+
+// retainCap is maxRetained, floored above BatchSize so the count-triggered
+// flush stays reachable however BatchSize is tuned.
+func (r *Reader) retainCap() int {
+	return max(maxRetained, 2*r.cfg.BatchSize)
+}
+
+// shedOldest drops one entry to admit a new one at the cap: the oldest entry
+// the pending payload does NOT cover. The rendered prefix is kept — its
+// entries are not lost (they export when the collector recovers), and
+// dropping inside it would make settle slide fresh entries as covered by a
+// payload that never carried them. Only when EVERYTHING is rendered is the
+// rendering discarded first, so the drop cannot orphan it; the re-render
+// re-observes the LogMetrics once, the price of not wedging at the cap.
+func (r *Reader) shedOldest() {
+	if r.rendered >= len(r.batch) {
+		r.pending.Discard()
+		r.rendered = 0
+	}
+	i := r.rendered
+	copy(r.batch[i:], r.batch[i+1:])
+	r.batch[len(r.batch)-1] = entry{}
+	r.batch = r.batch[:len(r.batch)-1]
+	obs.EventsOverflowDropped.Inc()
+	if !r.overflowWarned {
+		r.overflowWarned = true
+		r.log.Warn("event batch at capacity with nothing committing; dropping the oldest unexported events",
+			"cap", r.retainCap())
 	}
 }
 

@@ -619,3 +619,59 @@ func TestCorruptArchiveTailSettlesCounted(t *testing.T) {
 		t.Fatalf("LogArchiveErrors = %v, want %v (loss must be visible, once)", got, errsBefore+1)
 	}
 }
+
+// The fd-release gates compare against the FED boundary, never readPos:
+// trailing decompressed bytes that never feed (here a final blank line) can
+// never produce a committing entry, and a readPos gate pinned one fd per such
+// archive for the file's life.
+func TestArchiveFdReleasedDespiteUnfeedableTrailingBytes(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+	exp := &fakeExporter{}
+	tl := newArchiveTailer(dir, exp)
+	path := filepath.Join(dir, "app.log.gz")
+	writeGzip(t, path, "hello", "") // decompresses to "hello\n\n": the blank line never feeds
+	tl.scanDir(tl.loadCheckpoints(), true)
+
+	driveUntil(t, ctx, tl, func() bool { return slices.Contains(exp.get(), "hello") },
+		"archive content delivered")
+	f := tl.files[path]
+	driveUntil(t, ctx, tl, func() bool { return f.f == nil && f.gz == nil },
+		"archive fd released despite the unfed trailing blank line")
+}
+
+// An archive read to EOF while its path was already pruned: archiveDone
+// cannot stamp (the identity check has nothing to match), and the
+// pre-commit window used to fall through to openArchive every sweep —
+// re-decompressing from `committed` and RE-FEEDING lines already sitting in
+// the batch, one duplicate copy per sweep until the flush interval landed.
+func TestConsumedArchiveAwaitingCommitIsNotRefed(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+	exp := &fakeExporter{}
+	tl := newArchiveTailer(dir, exp)
+	path := filepath.Join(dir, "app.log.gz")
+	writeGzip(t, path, "a-1")
+	tl.scanDir(tl.loadCheckpoints(), true)
+
+	tl.cfg.MaxBytesPerSweep = 2
+	tl.sweep(ctx, true) // mid-read: fd and reader held
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	tl.cfg.MaxBytesPerSweep = 1 << 20
+	tl.sweep(ctx, true) // EOF from the held fd; the path is gone
+	tl.sweep(ctx, true) // must not reopen: the data is fed, awaiting its flush
+	tl.sweep(ctx, true)
+	tl.flush(ctx)
+
+	n := 0
+	for _, r := range exp.get() {
+		if r == "a-1" {
+			n++
+		}
+	}
+	if n != 1 {
+		t.Fatalf("archive line delivered %d times: re-fed while awaiting its flush", n)
+	}
+}

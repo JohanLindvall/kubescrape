@@ -152,8 +152,10 @@ func (r *Reader) consume(ctx context.Context, src source) error {
 			return err
 		}
 		if ready != nil {
-			// The first poll returning at all (even empty) means the group
-			// is joined and the hub reachable.
+			// The first poll returning WITHOUT error (even empty) means the
+			// group is joined and the hub reachable — poll fails a fetch that
+			// carried only errors, so an unconsumable hub (an authorization
+			// failure) cannot clear the readiness gate.
 			ready()
 			ready = nil
 		}

@@ -7,9 +7,11 @@ package tailer
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"math/rand/v2"
 	"os"
+	"syscall"
 	"time"
 
 	"github.com/JohanLindvall/kubescrape/internal/agent/attrs"
@@ -149,6 +151,36 @@ func (t *Tailer) readFile(ctx context.Context, f *file) error {
 	// (rewind or restart): re-read the rotated-away prefix before the new inode
 	// so the group reconstructs.
 	t.feedSegments(ctx, f)
+	if len(f.segments) > 0 && !f.segmentsFed {
+		// The replay is unfinished (per-sweep budget, a rewind, a transient
+		// segment error): reading the tail now would feed lines NEWER than
+		// the segments' still-owed remainder into the same pipeline keys,
+		// and the joiner fuses fragments across that gap into records that
+		// never existed in any file. Rotation of the tail is still detected
+		// — the held fd must not go stale — but a renamed-away tail is
+		// recorded UN-DRAINED as an open-ended segment (reopen's aborted
+		// arm): draining would feed its lines out of order too, and the
+		// segment machinery replays them in sequence once their turn comes.
+		st, err := os.Stat(f.path)
+		if err != nil {
+			return err
+		}
+		switch {
+		case inodeOf(st) != f.inode:
+			t.reopen(ctx, f, true, false)
+			if err := t.ensureOpen(f); err != nil {
+				t.log.Debug("opening rotated-in file", "path", f.path, "error", err)
+			}
+		case st.Size() < f.readPos,
+			!st.ModTime().Equal(f.lastMod) && !f.fp.matches(f.f):
+			// Truncation (or a same-size copytruncate): the tail's content
+			// was replaced; restart it. The segments are unaffected — they
+			// live on their own inodes.
+			t.reopen(ctx, f, false, true)
+		}
+		f.lastMod = st.ModTime()
+		return nil
+	}
 
 	// Copytruncate whose replacement content is LONGER than our read offset:
 	// the post-read check below cannot see it (bytes come back from the stale
@@ -265,6 +297,32 @@ func (t *Tailer) handleRotation(ctx context.Context, f *file, st os.FileInfo, re
 	}
 }
 
+// openRegular opens path read-only, refusing anything but a regular file.
+// Discovery (claimPath) already skips non-regular files, but that guards the
+// DISCOVERY stat only: a tracked path can be REPLACED by one (a FIFO taking a
+// rotated log's name), and open(2) O_RDONLY on a writer-less FIFO blocks
+// forever — on the single sweep goroutine, that is log collection stopping
+// node-wide with /readyz still green and no counter moving. O_NONBLOCK makes
+// the open itself non-blocking (a FIFO's read end opens immediately) and the
+// fstat refuses the impostor; on a regular file the flag is inert — Linux
+// reads never return EAGAIN there — so it is left set.
+func openRegular(path string) (*os.File, os.FileInfo, error) {
+	fh, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK, 0)
+	if err != nil {
+		return nil, nil, err
+	}
+	st, err := fh.Stat()
+	if err != nil {
+		_ = fh.Close()
+		return nil, nil, err
+	}
+	if !st.Mode().IsRegular() {
+		_ = fh.Close()
+		return nil, nil, fmt.Errorf("%s: not a regular file", path)
+	}
+	return fh, st, nil
+}
+
 // ensureOpen opens the file at the committed offset on first use. The
 // offset is only honored when the file's identity (inode and fingerprint)
 // still matches; otherwise the path names a different file and reading
@@ -273,13 +331,8 @@ func (t *Tailer) ensureOpen(f *file) error {
 	if f.f != nil {
 		return nil
 	}
-	fh, err := os.Open(f.path)
+	fh, st, err := openRegular(f.path)
 	if err != nil {
-		return err
-	}
-	st, err := fh.Stat()
-	if err != nil {
-		_ = fh.Close()
 		return err
 	}
 	inode := inodeOf(st)

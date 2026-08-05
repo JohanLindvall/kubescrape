@@ -417,6 +417,16 @@ func (r *Registry) growSnap(n int) {
 		copy(grown, r.snap)
 		r.snap = grown
 	} else {
+		// The tail past n keeps its bucket and exemplar CAPACITY — reusing that
+		// is what the scratch is for — but must NOT keep its labels: those alias
+		// the label sets of series this render does not cover, so a burst up to
+		// the cardinality cap followed by mass stale eviction would pin every one
+		// of them (a slice plus its retained <= 256 B strings, tens of MB at the
+		// cap) for the process' life. Same reason snapshot clears snapPtrs.
+		whole := r.snap[:cap(r.snap)] // slots an earlier, larger render filled
+		for i := n; i < len(whole); i++ {
+			whole[i].labels = nil
+		}
 		r.snap = r.snap[:n]
 	}
 	nb := len(r.bounds) + 1

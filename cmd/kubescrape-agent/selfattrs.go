@@ -86,15 +86,31 @@ func selfPodName() string {
 
 // hostNetworkSelf reports whether this process shares the host's network
 // namespace, in which case the hostname names the node rather than the pod.
-// /proc/self/ns/net is compared with the host's PID-1 namespace: identical
-// means hostNetwork (or a non-Kubernetes run, where the fallback is equally
-// meaningless).
-func hostNetworkSelf() bool {
-	self, err := os.Readlink("/proc/self/ns/net")
+// /proc/self/ns/net is compared with PID 1's, which is the HOST's init only
+// under `hostPID: true` — no shipped manifest sets it — so the comparison is
+// evidence of nothing unless /proc/1 is provably somebody else.
+//
+// An unprovable comparison is INCONCLUSIVE and keeps the hostname fallback,
+// which is the safe direction: a wrong "yes" costs an ordinary pod the name
+// Kubernetes put in its hostname (the by-name resolve is skipped and a
+// singleton's service.instance.id falls back to the node, colliding with that
+// node's DaemonSet agent), while a wrong "no" costs a lookup for a pod named
+// after the node, which 404s and is reported.
+func hostNetworkSelf() bool { return hostNetworkProc(os.Getpid(), os.Readlink) }
+
+// hostNetworkProc is hostNetworkSelf over an injected pid and readlink.
+func hostNetworkProc(pid int, readlink func(string) (string, error)) bool {
+	if pid == 1 {
+		// /proc/1 is THIS process — the shipped image runs the agent as the
+		// container's entrypoint — so the comparison is self-vs-self and would
+		// claim hostNetwork for every pod that can read the link.
+		return false
+	}
+	self, err := readlink("/proc/self/ns/net")
 	if err != nil {
 		return false
 	}
-	host, err := os.Readlink("/proc/1/ns/net")
+	host, err := readlink("/proc/1/ns/net")
 	if err != nil {
 		return false // cannot tell; keep the hostname fallback
 	}

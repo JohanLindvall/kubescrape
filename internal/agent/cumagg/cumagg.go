@@ -12,6 +12,10 @@
 //     DELIVERED series may be evicted: an export interval may legally exceed
 //     staleAfter and an export can fail, so evicting on staleness alone destroys
 //     observations no collector ever saw;
+//   - an export is ONE transaction over that gate — render, send, mark — and
+//     two of them must not interleave: the mark promotes whatever is currently
+//     Rendered and cannot tell whose render it was, so one export's success
+//     would certify values only the other's FAILED payload carried;
 //   - eviction is what keeps the cardinality cap from being a ONE-WAY LATCH, so
 //     it is not optional and disabling it has to be spelled out;
 //   - a re-created series gets a FRESH start timestamp, or the restarted
@@ -151,6 +155,22 @@ type Store[S Series] struct {
 
 	mu     sync.Mutex
 	series map[string]S
+	// exportGate holds ONE token, taken for the whole of an Export — render,
+	// send and delivery mark together. Export is otherwise NOT safe against
+	// itself: afterDelivered promotes every series whose CURRENT values are
+	// Rendered and cannot tell WHOSE render they were, so two exports in flight
+	// at once let one's successful send mark values delivered that only the
+	// other's FAILED payload carried — and eviction may then destroy them
+	// unseen, exemplars included. Both callers have a path that overlaps
+	// (an explicit final Export beside the one Run makes on its detached
+	// context, which is what a spent producer-join budget leaves), and neither
+	// caller's own render lock can see the other export at all.
+	//
+	// A channel rather than a Mutex because the acquire must be CANCELLABLE:
+	// every final export in this repo runs on a shutdown budget, and waiting out
+	// a send wedged against a dead collector would spend it in a lock nobody
+	// can see (Buffered.drainGate is the same shape for the same reason).
+	exportGate chan struct{}
 }
 
 // NewStore builds a Store from opt.
@@ -158,7 +178,9 @@ func NewStore[S Series](opt Options[S]) *Store[S] {
 	if opt.Now == nil {
 		opt.Now = time.Now
 	}
-	return &Store[S]{opt: opt, series: make(map[string]S)}
+	st := &Store[S]{opt: opt, series: make(map[string]S), exportGate: make(chan struct{}, 1)}
+	st.exportGate <- struct{}{} // the token starts free
+	return st
 }
 
 // Lock and Unlock guard the series map. Everything named *Locked below runs
@@ -295,7 +317,18 @@ func (st *Store[S]) Render(res pcommon.Resource, now time.Time) pmetric.Metrics 
 // The order is the contract: render, send, and only THEN mark delivered — the
 // delivered mark is what unlocks eviction and clears the exemplars, so a failed
 // send must leave both alone.
+//
+// Exports are SERIALIZED (see Store.exportGate): the three steps are one
+// transaction over the delivery gate, and a caller whose ctx ends while another
+// export holds the gate gets that ctx's error having sent nothing — the values
+// are cumulative, so the next export carries them.
 func (st *Store[S]) Export(ctx context.Context, exp Exporter, res pcommon.Resource) error {
+	select {
+	case <-st.exportGate:
+		defer func() { st.exportGate <- struct{}{} }()
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 	md := st.Render(res, st.opt.Now())
 	if md.ResourceMetrics().Len() == 0 {
 		return nil

@@ -16,13 +16,20 @@ package tailbuffer
 //   - "what was the verdict?" — bounded by AGE (decisionCacheTTL). Past it, a
 //     straggler is indistinguishable from a new trace and gets a fresh window,
 //     which is the semantic this knob buys.
-//   - "have we decided this trace before?" — bounded by the CAPACITY
+//   - "did the decision BILL the rate budgets?" — bounded by the CAPACITY
 //     (decisionCacheSize) alone. It outlives the verdict, because it is what
 //     stops the re-decision from CHARGING the rateLimiting and composite budgets
 //     a second time (tailsample.Trace.Charged). The re-decision still happens
 //     and may answer differently — the bucket may have emptied meanwhile — but a
 //     trace's late spans no longer shrink the budget available to genuinely new
 //     traces.
+//
+//     What is remembered is the SPEND the evaluator reported
+//     (tailsample.Decision.Charged), never the mere fact of a decision: a
+//     rateLimiting policy that REFUSED a trace deducted nothing, and a
+//     re-decision told otherwise would peek a budget the trace never paid and
+//     admit its spans free — once per fresh window, for as long as the entry
+//     lives.
 //
 // The map is therefore bounded by decisionCacheSize and nothing else: it fills
 // to the cap and evicts the oldest, where before a quiet shard's entries also
@@ -58,10 +65,13 @@ type decisionCache struct {
 }
 
 type decision struct {
-	id    pcommon.TraceID
-	keep  bool
-	at    time.Time
-	stale bool
+	id pcommon.TraceID
+	// charged is what the deciding evaluation actually SPENT (see the two
+	// lifetimes above), not that it happened.
+	charged bool
+	keep    bool
+	at      time.Time
+	stale   bool
 }
 
 func newDecisionCache(max int, ttl time.Duration) *decisionCache {
@@ -79,16 +89,18 @@ func (c *decisionCache) get(id pcommon.TraceID, now time.Time) (keep, ok bool) {
 	return d.keep, true
 }
 
-// seen reports whether this trace has been decided before, at any age. It is
-// what a re-decision passes to the evaluator as Trace.Charged, so the rate
-// budgets are not billed twice for one trace.
-func (c *decisionCache) seen(id pcommon.TraceID) bool {
-	_, ok := c.m[id]
-	return ok
+// charged reports whether a remembered decision for this trace SPENT a rate
+// budget, at any age. It is what a re-decision passes to the evaluator as
+// Trace.Charged, so the budgets are neither billed twice for one trace nor
+// skipped for one that never paid.
+func (c *decisionCache) charged(id pcommon.TraceID) bool {
+	d, ok := c.m[id]
+	return ok && d.charged
 }
 
-// put remembers a verdict, evicting the oldest entry if the cache is full.
-func (c *decisionCache) put(id pcommon.TraceID, keep bool, now time.Time) {
+// put remembers a verdict and whether producing it billed the rate budgets,
+// evicting the oldest entry if the cache is full.
+func (c *decisionCache) put(id pcommon.TraceID, keep, charged bool, now time.Time) {
 	if old, ok := c.m[id]; ok {
 		old.stale = true // its FIFO slot must not evict the new entry
 		delete(c.m, id)
@@ -96,7 +108,7 @@ func (c *decisionCache) put(id pcommon.TraceID, keep bool, now time.Time) {
 	if len(c.m) >= c.max {
 		c.evict(now)
 	}
-	d := &decision{id: id, keep: keep, at: now}
+	d := &decision{id: id, keep: keep, charged: charged, at: now}
 	c.m[id] = d
 	c.fifo = append(c.fifo, d)
 	c.compact()

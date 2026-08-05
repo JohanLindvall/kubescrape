@@ -388,7 +388,10 @@ type Trace struct {
 
 	// Charged says this trace has ALREADY been charged to the budgets by an
 	// earlier decision, so the two policies that spend one (rateLimiting,
-	// composite) must CHECK their bucket instead of spending it again.
+	// composite) must CHECK their bucket instead of spending it again. It is the
+	// earlier decision's Decision.Charged and nothing else — "we decided this
+	// trace before" is a different fact, and a decision the budget REFUSED spent
+	// nothing to protect.
 	//
 	// It exists because assembly is not a single event. An assembler that
 	// remembers a trace was decided but no longer remembers the verdict — a
@@ -420,6 +423,19 @@ type Decision struct {
 	// "<composite>/<sub-policy>", precomputed at New so naming the author costs
 	// no allocation.
 	Policy string
+	// Charged reports whether this evaluation actually SPENT a rate budget —
+	// what an assembler must feed back as Trace.Charged if it re-decides this
+	// trace, and nothing else.
+	//
+	// "It was decided before" is NOT the same fact, and using it is a hole: a
+	// rateLimiting policy that REFUSED the trace deducted nothing, so a
+	// re-decision told it was charged would peek a budget the trace never paid
+	// and admit its spans free — every fresh window, for as long as the
+	// assembler remembers the id. Note also that a decision may charge without
+	// being the one that sampled (a rateLimiting sub-policy inside an `and`
+	// charges before a later sub-policy abstains), which is why this is not
+	// derivable from Policy or Sampled.
+	Charged bool
 }
 
 // Evaluator applies a compiled policy list. Safe for concurrent use.
@@ -457,8 +473,9 @@ func New(cfg Config) (*Evaluator, error) {
 // The result is a function of t and — for rateLimiting and composite only — of
 // the budget already spent. Deciding the same trace twice may therefore answer
 // differently; every other policy is idempotent. It does not charge twice as
-// long as the caller sets Trace.Charged on the re-decision, which is what an
-// assembler that remembers having decided the trace should do.
+// long as the caller sets Trace.Charged on the re-decision from the first
+// decision's Decision.Charged: remembering that a trace was decided is not the
+// same fact as remembering that the decision BILLED.
 //
 // What Decide CANNOT tell you is whether t is the whole trace. It answers about
 // the spans it was handed.
@@ -467,9 +484,14 @@ func (e *Evaluator) Decide(t Trace) Decision {
 	if e.needClock {
 		now = e.now()
 	}
+	// spent accumulates across the WHOLE list, not just the deciding policy: a
+	// policy that charged and then abstained (a rateLimiting sub-policy inside an
+	// `and` whose later conjunct did not match) moved its bucket all the same.
+	spent := false
 	for i := range e.policies {
 		p := &e.policies[i]
-		v, sub := p.p.eval(t, now)
+		v, sub, s := p.p.eval(t, now)
+		spent = spent || s
 		if v == verdictAbstain {
 			continue
 		}
@@ -477,9 +499,9 @@ func (e *Evaluator) Decide(t Trace) Decision {
 		if sub != "" { // composite: the sub-policy that actually decided
 			name = sub
 		}
-		return Decision{Sampled: v == verdictSample, Policy: name}
+		return Decision{Sampled: v == verdictSample, Policy: name, Charged: spent}
 	}
-	return Decision{}
+	return Decision{Charged: spent}
 }
 
 // Names returns the policy names, in order, including the qualified

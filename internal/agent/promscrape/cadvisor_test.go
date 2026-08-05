@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/JohanLindvall/kubescrape/internal/bearer"
+	"github.com/JohanLindvall/kubescrape/internal/obs"
 	"github.com/JohanLindvall/kubescrape/pkg/kubemeta"
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/pmetric"
@@ -643,5 +644,36 @@ container_memory_working_set_bytes{namespace="ns1",pod="pod1",container="POD",id
 	if fmt.Sprint(points[0]) == fmt.Sprint(points[1]) {
 		t.Errorf("the two points carry identical attributes %v — they are one series downstream, "+
 			"so the pod total and the pause container's value collide", points[0])
+	}
+}
+
+// rejectingExporter stands in for a collector rejecting the chunk.
+type rejectingExporter struct{}
+
+func (rejectingExporter) ExportMetrics(context.Context, pmetric.Metrics) error {
+	return errors.New("collector rejected the chunk")
+}
+
+// The malformed accounting must survive a failing finish or export. Returning
+// on the export error before reporting it made a target serving partly-garbage
+// exposition to an unhealthy collector move
+// kubescrape_scrapes_total{outcome="error"} while
+// kubescrape_scrape_malformed_total — the metric naming the CAUSE — stayed
+// flat, and the protobuf front (which reports from a defer) disagreed with the
+// text front on identical input.
+func TestMalformedReportedWhenTheExportFails(t *testing.T) {
+	body := "# TYPE rpc summary\n" + // the summary sample has no quantile: converter-malformed
+		"rpc 5\n" +
+		"bad{ 1\n" + // parser-malformed
+		"ok_metric 1\n" // something to export, so the failing export is reached
+	s := New(Config{Node: "n1", Interval: time.Minute, Exporter: rejectingExporter{}, StartTime: time.Now()})
+
+	before := obs.ScrapeMalformed.WithLabelValues(pipelineTargets).Value()
+	cb := newBatcher(func(pcommon.Resource) {}, time.Now(), time.Now())
+	if _, err := s.parseAndExport(context.Background(), strings.NewReader(body), false, false, cb, pipelineTargets, "t"); err == nil {
+		t.Fatal("want the export error")
+	}
+	if got := obs.ScrapeMalformed.WithLabelValues(pipelineTargets).Value() - before; got != 2 {
+		t.Fatalf("malformed counted = %v, want 2 (one parser line, one converter sample)", got)
 	}
 }

@@ -14,12 +14,11 @@ import (
 // attributes, producing one ResourceMetrics per (input resource, object).
 // Points without a resolvable ID stay under a copy of their original
 // resource, unenriched. Metric identity (name/type/unit) and scope are
-// preserved.
-func (e *Enricher) splitAndEnrich(ctx context.Context, md pmetric.Metrics) pmetric.Metrics {
+// preserved. The cache is the request's: lookups are memoized once per
+// distinct ID across the whole batch, and the split budgets it carries span
+// every input ResourceMetrics of the push.
+func (e *Enricher) splitAndEnrich(ctx context.Context, cache *reqCache, md pmetric.Metrics) pmetric.Metrics {
 	out := pmetric.NewMetrics()
-	// Enrichment is looked up once per distinct ID across the whole batch.
-	enrichCache := map[string]pcommon.Map{}
-
 	rms := md.ResourceMetrics()
 	for i := 0; i < rms.Len(); i++ {
 		rm := rms.At(i)
@@ -28,7 +27,8 @@ func (e *Enricher) splitAndEnrich(ctx context.Context, md pmetric.Metrics) pmetr
 			ctx:         ctx,
 			srcResource: rm.Resource(),
 			srcSchema:   rm.SchemaUrl(),
-			enrichCache: enrichCache,
+			srcSize:     resourceCopySize(rm.Resource(), rm.SchemaUrl()),
+			cache:       cache,
 			out:         out,
 			rmByID:      map[string]pmetric.ResourceMetrics{},
 			smByID:      map[idScope]pmetric.ScopeMetrics{},
@@ -37,7 +37,7 @@ func (e *Enricher) splitAndEnrich(ctx context.Context, md pmetric.Metrics) pmetr
 		// Points without their own ID fall back to the resource-level one, so
 		// a mixed batch (auto mode) does not lose enrichment for resources
 		// that carried the ID where it belongs.
-		g.resToken = e.resolvableToken(ctx, g.enrichCache, rm.Resource().Attributes())
+		g.resToken = e.resolvableToken(ctx, cache, rm.Resource().Attributes())
 		sms := rm.ScopeMetrics()
 		for j := 0; j < sms.Len(); j++ {
 			sm := sms.At(j)
@@ -62,18 +62,24 @@ type idMetric struct {
 }
 
 // metricGrouper accumulates one input ResourceMetrics' points into per-ID
-// output resources.
+// output resources. The dedup maps (rmByID/smByID/metByID) are per input
+// resource — the same object described by two input resources gets two groups,
+// one per source resource — but the BUDGETS are the request's (reqCache):
+// per-grouper budgets re-armed the caps once per input ResourceMetrics, so the
+// payload's own structure chose its bound.
 type metricGrouper struct {
 	enricher    *Enricher
 	ctx         context.Context
 	srcResource pcommon.Resource
 	srcSchema   string
+	srcSize     int    // estimated bytes one copy of the source resource retains
 	resToken    string // resource-level ID, the fallback for ID-less points
-	enrichCache map[string]pcommon.Map
+	cache       *reqCache
 	out         pmetric.Metrics
 	rmByID      map[string]pmetric.ResourceMetrics
 	smByID      map[idScope]pmetric.ScopeMetrics
 	metByID     map[idMetric]pmetric.Metric
+	refused     map[string]struct{} // IDs already counted split_capped (lazily allocated)
 }
 
 // route moves every data point of m into the output metric for its ID. The
@@ -148,7 +154,7 @@ func metricPointCount(m pmetric.Metric) int {
 // metricFor resolves one data point's ID (falling back to the resource-level
 // one) and returns its output metric.
 func (g *metricGrouper) metricFor(sm pmetric.ScopeMetrics, scopeIdx int, m pmetric.Metric, metricIdx int, dpAttrs pcommon.Map) pmetric.Metric {
-	token := g.enricher.resolvableToken(g.ctx, g.enrichCache, dpAttrs)
+	token := g.enricher.resolvableToken(g.ctx, g.cache, dpAttrs)
 	if token == "" {
 		token = g.resToken
 	}
@@ -156,11 +162,22 @@ func (g *metricGrouper) metricFor(sm pmetric.ScopeMetrics, scopeIdx int, m pmetr
 }
 
 // metric returns the output metric for the given ID, creating the resource,
-// scope and metric shells (and enriching the resource) on first use.
+// scope and metric shells (and enriching the resource) on first use. It is the
+// ONE entry to the creation chain (scope and resource are reached only from
+// here), so the budget gate below covers every copy the splitter mints.
 func (g *metricGrouper) metric(sm pmetric.ScopeMetrics, scopeIdx int, m pmetric.Metric, metricIdx int, id string) pmetric.Metric {
 	mk := idMetric{id: id, scope: scopeIdx, metric: metricIdx}
 	if dst, ok := g.metByID[mk]; ok {
 		return dst
+	}
+	// The `id != ""` guard is load-bearing, not decorative: the fallback is
+	// itself the "" chain — a SINGLE resource/scope/shell set per input
+	// resource, whose creations are bounded by the input — so it is exempt from
+	// both budgets. Gating it would recurse right here (a refused "" folding
+	// back into ""): an unbounded stack on an unauthenticated listener, i.e.
+	// any pod could crash the agent with a >maxSplitGroups-object push.
+	if id != "" && !g.admit(id) {
+		return g.metric(sm, scopeIdx, m, metricIdx, "")
 	}
 	scope := g.scope(sm, scopeIdx, id)
 	dst := scope.Metrics().AppendEmpty()
@@ -182,8 +199,37 @@ func (g *metricGrouper) metric(sm pmetric.ScopeMetrics, scopeIdx int, m pmetric.
 	case pmetric.MetricTypeSummary:
 		dst.SetEmptySummary()
 	}
+	g.cache.splitCopied += metricShellSize(m)
 	g.metByID[mk] = dst
 	return dst
+}
+
+// admit reports whether copies keyed by id may still be minted, against the
+// push-wide budgets: the group COUNT (a new id past maxSplitGroups shares the
+// fallback) and the copy BYTES (past maxSplitCopyBytes even an EXISTING
+// group's new scope/shell copies are refused — the byte bound is on the
+// output, and a group admitted cheaply must not go on minting expensive
+// descriptor copies). A refused id's points fold into the "" fallback:
+// forwarded under the source resource, unenriched, counted once per id per
+// input resource.
+func (g *metricGrouper) admit(id string) bool {
+	over := g.cache.splitCopied >= maxSplitCopyBytes
+	if !over {
+		if _, ok := g.rmByID[id]; !ok && g.cache.splitGroups >= maxSplitGroups {
+			over = true
+		}
+	}
+	if !over {
+		return true
+	}
+	if _, seen := g.refused[id]; !seen {
+		if g.refused == nil {
+			g.refused = map[string]struct{}{}
+		}
+		g.refused[id] = struct{}{}
+		obs.Ingested.WithLabelValues("split_capped").Inc()
+	}
+	return false
 }
 
 func (g *metricGrouper) scope(sm pmetric.ScopeMetrics, scopeIdx int, id string) pmetric.ScopeMetrics {
@@ -195,6 +241,7 @@ func (g *metricGrouper) scope(sm pmetric.ScopeMetrics, scopeIdx int, id string) 
 	dst := rm.ScopeMetrics().AppendEmpty()
 	sm.Scope().CopyTo(dst.Scope())
 	dst.SetSchemaUrl(sm.SchemaUrl())
+	g.cache.splitCopied += scopeCopySize(sm)
 	g.smByID[sk] = dst
 	return dst
 }
@@ -220,43 +267,46 @@ func stripSenderIdentity(a pcommon.Map) {
 	}
 }
 
-// maxSplitGroups bounds the per-object resources one push may inflate into.
-// See resource(): each is a full copy of the sender's resource, so the bound is
-// on MEMORY, which the byte budget cannot express — it counts the payload's raw
-// bytes, and a small payload can name a great many distinct objects.
+// maxSplitGroups bounds the per-object resources one PUSH may inflate into —
+// across every input ResourceMetrics, which is why the count lives on the
+// request's cache rather than the grouper. Each group is a full copy of the
+// sender's resource, so the bound is on MEMORY, which the ingest byte budget
+// cannot express — it counts the payload's raw bytes, and a small payload can
+// name a great many distinct objects. Past the cap the remaining objects share
+// the source resource — unenriched, but forwarded and counted, which is
+// strictly better than an OOM the process cannot defend against on an
+// unauthenticated listener.
 const maxSplitGroups = 2048
+
+// maxSplitCopyBytes bounds the estimated bytes of the copies the splitter
+// mints per push: source-resource copies, scope copies and metric descriptor
+// shells. The group cap alone cannot bound OUTPUT SIZE — every admitted group
+// repeats the sender's resource, and every point routed to a group's new shell
+// repeats its metric's descriptor — so a push carrying a few hundred KiB of
+// resource attributes inflated to hundreds of MB: marshalled as one allocation
+// by the disk buffer's enqueue, or re-sent as a thousand otlpsplit parts
+// without one. 16 MiB is far above what real described-object pushes mint
+// (thousands of groups times KiB-scale resources) and a handful of otlpexport
+// part-splits; past it, creations fold into the "" fallback exactly as the
+// group cap's overflow does, counted under the same outcome.
+const maxSplitCopyBytes = 16 << 20
 
 func (g *metricGrouper) resource(id string) pmetric.ResourceMetrics {
 	if rm, ok := g.rmByID[id]; ok {
 		return rm
 	}
-	// Each group is a full COPY of the sender's resource, so the memory one
-	// push costs scales with its DATA-POINT count, not with the raw bytes the
-	// byte budget bounds: a 3 MiB payload of a thousand points, each naming a
-	// different object, inflates into a thousand enriched resources. Past the
-	// cap the remaining objects share the source resource — unenriched, but
-	// forwarded and counted, which is strictly better than an OOM the process
-	// cannot defend against on an unauthenticated listener.
-	//
-	// The `id != ""` guard is load-bearing, not decorative: the fallback is
-	// itself the "" group, a SINGLE bucket that adds one to the cardinality no
-	// matter how many objects fold into it. Without the guard, a push that hit
-	// the cap with NO id-less point (so "" was never created) recursed
-	// forever — resource("") missed the map, saw the cap still exceeded, and
-	// called resource("") again: an unbounded stack on an unauthenticated
-	// listener, i.e. any pod could crash the agent with a >2048-object push.
-	if id != "" && len(g.rmByID) >= maxSplitGroups {
-		obs.Ingested.WithLabelValues("split_capped").Inc()
-		return g.resource("")
-	}
+	// Admission against the push-wide budgets already happened in metric(), the
+	// one entry to this chain; here every creation is only CHARGED.
 	rm := g.out.ResourceMetrics().AppendEmpty()
 	g.srcResource.CopyTo(rm.Resource())
 	rm.SetSchemaUrl(g.srcSchema)
+	g.cache.splitCopied += g.srcSize
 	if id != "" {
+		g.cache.splitGroups++
 		// One same-object predicate for the whole enricher (Enricher.sameObject):
 		// this used to be a local copy that disagreed with the auto-mode
 		// decision's — see the war story on the shared one.
-		if id != g.resToken && !g.enricher.sameObject(g.ctx, g.enrichCache, id, g.resToken) {
+		if id != g.resToken && !g.enricher.sameObject(g.ctx, g.cache, id, g.resToken) {
 			// This group is keyed by a point-level ID that differs from the
 			// resource's own: the copied resource describes a DIFFERENT object.
 			// Its ID attributes would mislabel (and mis-enrich downstream) every
@@ -267,8 +317,8 @@ func (g *metricGrouper) resource(id string) pmetric.ResourceMetrics {
 			// attributes the builder does not supply (cluster name, SDK attrs,
 			// custom) are untouched.
 			g.stripIDAttrs(rm.Resource().Attributes())
-			built := g.enricher.builtAttrs(g.ctx, g.enrichCache, id)
-			if built.Len() == 0 {
+			r := g.enricher.builtAttrs(g.ctx, g.cache, id)
+			if !r.resolved {
 				// The described object did NOT resolve. Overwriting nothing would
 				// leave the copied SENDER identity (k8s.pod.name, service.name, …)
 				// labeling a foreign object's points — misattribution, with the ID
@@ -286,13 +336,13 @@ func (g *metricGrouper) resource(id string) pmetric.ResourceMetrics {
 				// prevent. Non-identity attributes (cluster name, SDK attrs,
 				// custom) are still the sender's to keep.
 				stripSenderIdentity(rm.Resource().Attributes())
-				overwriteAttrs(built, rm.Resource().Attributes())
+				overwriteAttrs(r.built, rm.Resource().Attributes())
 			}
 			g.rmByID[id] = rm
 			return rm
 		}
-		mergeAttrs(g.enricher.builtAttrs(g.ctx, g.enrichCache, id), rm.Resource().Attributes())
-	} else if built := g.enricher.peerFallback(g.ctx, g.enrichCache); built.Len() > 0 {
+		mergeAttrs(g.enricher.builtAttrs(g.ctx, g.cache, id).built, rm.Resource().Attributes())
+	} else if built, resolved := g.enricher.peerFallback(g.ctx, g.cache); resolved {
 		// No ID anywhere for these points: the opt-in peer-IP fallback still
 		// attributes them to the pushing pod (resolved once per request). The
 		// outcome — peer_ip, peer_ip_rejected or unresolved — is counted inside
@@ -327,5 +377,55 @@ func (g *metricGrouper) stripIDAttrs(a pcommon.Map) {
 	}
 	for _, k := range g.enricher.podUIDKeys {
 		a.Remove(k)
+	}
+}
+
+// resourceCopySize, scopeCopySize and metricShellSize estimate the bytes one
+// splitter-minted copy retains, charged against maxSplitCopyBytes. The
+// estimate tracks the string payloads — the only sender-controlled unbounded
+// inputs — plus a small per-field constant; exactness is not needed, the
+// budget is a memory bound, not a wire contract.
+func resourceCopySize(res pcommon.Resource, schema string) int {
+	return attrsSize(res.Attributes()) + len(schema) + 16
+}
+
+func scopeCopySize(sm pmetric.ScopeMetrics) int {
+	sc := sm.Scope()
+	return len(sc.Name()) + len(sc.Version()) + attrsSize(sc.Attributes()) + len(sm.SchemaUrl()) + 16
+}
+
+func metricShellSize(m pmetric.Metric) int {
+	return len(m.Name()) + len(m.Description()) + len(m.Unit()) + attrsSize(m.Metadata()) + 16
+}
+
+func attrsSize(m pcommon.Map) int {
+	n := 0
+	m.Range(func(k string, v pcommon.Value) bool {
+		n += len(k) + valueSize(v)
+		return true
+	})
+	return n
+}
+
+// valueSize recurses like pcommon's own CopyTo does — no depth cap of its own,
+// since any structure it can be handed has already been built (and will be
+// copied) at that depth.
+func valueSize(v pcommon.Value) int {
+	switch v.Type() {
+	case pcommon.ValueTypeStr:
+		return len(v.Str()) + 8
+	case pcommon.ValueTypeBytes:
+		return v.Bytes().Len() + 8
+	case pcommon.ValueTypeMap:
+		return attrsSize(v.Map()) + 16
+	case pcommon.ValueTypeSlice:
+		n := 16
+		sl := v.Slice()
+		for i := 0; i < sl.Len(); i++ {
+			n += valueSize(sl.At(i))
+		}
+		return n
+	default:
+		return 8
 	}
 }

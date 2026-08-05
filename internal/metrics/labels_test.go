@@ -154,3 +154,33 @@ func TestLabelsKeyEscapingRoundTrip(t *testing.T) {
 		t.Fatalf(`get("evil=key") = %q, want "v"`, got)
 	}
 }
+
+// A key's HASHED identity must equal its RENDERED one. String writes ", "
+// between pairs, so parseLabels — which is what export.go reads a sample's
+// labels back through — used to TrimSpace the key and ate an edge space the
+// hash had counted: " env" and "env" were two live series exporting
+// byte-identical attributes, and an escaped trailing space came back with a
+// dangling backslash.
+func TestLabelKeyEdgeSpaceRoundTrips(t *testing.T) {
+	for _, key := range []string{" env", "env ", " env ", " ", "two words"} {
+		in := labels{}.set(key, "v")
+		in = in.set("other", "w")
+		out, err := parseLabels(in.String())
+		if err != nil {
+			t.Fatalf("parseLabels(%q): %v", in.String(), err)
+		}
+		if got, ok := out.get(key); !ok || got != "v" {
+			t.Fatalf("key %q round-tripped as %v (serialized %q)", key, out, in.String())
+		}
+		if out.hash() != in.hash() {
+			t.Fatalf("key %q: hash changed across the round trip", key)
+		}
+	}
+	// And the two keys stay two series all the way to the rendered form.
+	spaced, plain := labels{}.set(" env", "v"), labels{}.set("env", "v")
+	rs, _ := parseLabels(spaced.String())
+	rp, _ := parseLabels(plain.String())
+	if rs.String() == rp.String() {
+		t.Fatalf("%q and %q render identically as %s", " env", "env", rs.String())
+	}
+}

@@ -347,11 +347,25 @@ func (ac *addContext) labelLookup(key string) string {
 	return logline.ResolveKey(key, ac.raw, ac.lookup, &ac.set.keys, &ac.line)
 }
 
-// valueLookup resolves a numeric key the same way.
+// valueLookup resolves a numeric key the same way: the caller's attributes
+// first, the line's own fields as the fallback — and it must fall through on
+// exactly the same condition the LABEL tier does, or one metric's label names
+// one attribute while its observed value comes from another.
+//
+// The (float64, bool) contract cannot say WHY the numeric lookup missed:
+// absent and present-but-non-numeric are the same false, and only the first is
+// a reason to read the line. The label lookup answers that question in the
+// terms this tier uses everywhere (present = non-empty, see logline.ResolveKey),
+// so it is what decides — the resolver behind it ranks by presence and
+// deliberately treats a present-but-non-numeric value as a miss for the key
+// rather than as permission to look further down.
 func (ac *addContext) valueLookup(key string) (float64, bool) {
 	if ac.values != nil {
 		if v, ok := ac.values(key); ok {
 			return v, true
+		}
+		if ac.lookup != nil && ac.lookup(key) != "" {
+			return 0, false
 		}
 	}
 	raw := ac.set.keys.Get(&ac.line, key)

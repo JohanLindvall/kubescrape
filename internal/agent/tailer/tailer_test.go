@@ -296,3 +296,28 @@ func TestIdleCloseGuards(t *testing.T) {
 		t.Fatalf("closed idle file never reopened: %v", got)
 	}
 }
+
+// allowLine grants only whole tokens and caps the bucket at RateBurst, so an
+// effective burst below 1 could never grant: -logs-rate-limit=0.4 (burst
+// derived as 2x) wedged every file in pause mode and discarded 100% in drop
+// mode, and -check-config passed it. New floors the burst at one grantable
+// token — validateConfig lives in cmd/kubescrape-agent and cannot carry the
+// guard, so the constructor does.
+func TestSubOneRateBurstIsFlooredToGrantable(t *testing.T) {
+	for _, cfg := range []Config{
+		{RateLimit: 0.4},               // derived burst would be 0.8
+		{RateLimit: 2, RateBurst: 0.5}, // explicit sub-1 burst
+	} {
+		cfg.Dir = t.TempDir()
+		cfg.Metadata = fakeMeta{}
+		cfg.Exporter = &fakeExporter{}
+		tl := New(cfg)
+		if tl.cfg.RateBurst < 1 {
+			t.Fatalf("RateLimit=%v: RateBurst=%v cannot hold one token, so no line is ever granted",
+				cfg.RateLimit, tl.cfg.RateBurst)
+		}
+		if !tl.allowLine(&file{}) {
+			t.Fatalf("RateLimit=%v RateBurst=%v: first line refused", cfg.RateLimit, tl.cfg.RateBurst)
+		}
+	}
+}

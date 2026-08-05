@@ -2,6 +2,7 @@ package obs
 
 import (
 	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"testing"
@@ -42,7 +43,21 @@ func TestDocumentedMetricsExist(t *testing.T) {
 	selectorRE := regexp.MustCompile(`(kubescrape_[a-z0-9_]+)\{([^}]*)\}`)
 	labelNameRE := regexp.MustCompile(`[a-z_][a-z0-9_]*`)
 
-	for _, doc := range []string{"../../README.md", "../../docs/CONFIGURATION.md", "../../docs/METRICS.md", "../../CLAUDE.md"} {
+	// EVERY doc, found by glob rather than listed: the four that were named by
+	// hand left the comparison docs and the Alloy migration guide — which name
+	// metrics too — outside a check whose generated preamble claims prose
+	// anywhere in the repo is covered.
+	files := []string{"../../README.md", "../../CLAUDE.md"}
+	found, err := filepath.Glob("../../docs/*.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(found) == 0 {
+		t.Fatal("no docs/*.md found — the scan would pass vacuously")
+	}
+	files = append(files, found...)
+
+	for _, doc := range files {
 		b, err := os.ReadFile(doc)
 		if err != nil {
 			t.Fatalf("reading %s: %v", doc, err)

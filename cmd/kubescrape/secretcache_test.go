@@ -103,6 +103,34 @@ func TestSecretReaderTTLsDiffer(t *testing.T) {
 	}
 }
 
+// Get releases the lock across the API call, so two concurrent misses for one
+// ref race on the way back. A slower FAILURE must not displace the success that
+// already landed: handleScrapeAuth serves a cached error as a 502 to every agent
+// in the fleet, for the whole failure TTL, for a credential this process holds.
+func TestSecretReaderFailureDoesNotOverwriteALiveSuccess(t *testing.T) {
+	r := &k8sSecretReader{}
+	now := time.Now()
+	r.remember("ns/tok/token", secretCacheEntry{value: "v", fetched: now})
+	r.remember("ns/tok/token", secretCacheEntry{err: errors.New("transient"), fetched: now.Add(time.Second)})
+
+	val, err := r.Get(context.Background(), "ns", "tok", "token")
+	if err != nil {
+		t.Fatalf("a resolved credential was replaced by a slower failure: %v", err)
+	}
+	if val != "v" {
+		t.Errorf("value = %q, want v", val)
+	}
+
+	// A success still replaces a cached failure — recovery must not wait out
+	// the failure TTL when the value is already in hand.
+	r = &k8sSecretReader{}
+	r.remember("ns/tok/token", secretCacheEntry{err: errors.New("transient"), fetched: now})
+	r.remember("ns/tok/token", secretCacheEntry{value: "v", fetched: now})
+	if val, err := r.Get(context.Background(), "ns", "tok", "token"); err != nil || val != "v" {
+		t.Fatalf("Get = %q, %v; a success must displace a cached failure", val, err)
+	}
+}
+
 // A missing KEY is the client's mistake and stays cacheable, but it must remain
 // matchable through the cache — handleScrapeAuth uses errors.Is to answer 404
 // rather than the retryable 502 it gives cluster failures.

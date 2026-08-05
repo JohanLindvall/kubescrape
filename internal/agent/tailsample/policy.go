@@ -45,13 +45,20 @@ const (
 
 // policy is one compiled entry of the list.
 type policy interface {
-	// eval returns its verdict and, when a COMPOSING policy delegated the
-	// decision, the precomputed qualified name of the sub-policy that made it
-	// ("" means "attribute this to my own configured name").
+	// eval returns its verdict; when a COMPOSING policy delegated the decision,
+	// the precomputed qualified name of the sub-policy that made it ("" means
+	// "attribute this to my own configured name"); and whether producing it SPENT
+	// a rate budget.
+	//
+	// The spend is reported even when the verdict is abstain — a rateLimiting
+	// sub-policy inside an `and` charges before a later sub-policy abstains — and
+	// it is what Decision.Charged carries to the assembler: what must not be
+	// billed twice is a bucket that actually moved, and a REFUSED charge moves
+	// none.
 	//
 	// now is the single clock reading of this decision, zero when no policy in
 	// the whole list needs one.
-	eval(t Trace, now time.Time) (verdict, string)
+	eval(t Trace, now time.Time) (v verdict, sub string, spent bool)
 }
 
 // namedPolicy pairs a compiled policy with the name a Decision reports. The
@@ -224,7 +231,7 @@ func checkBody(pc PolicyConfig, where string) error {
 
 type alwaysPolicy struct{}
 
-func (alwaysPolicy) eval(Trace, time.Time) (verdict, string) { return verdictSample, "" }
+func (alwaysPolicy) eval(Trace, time.Time) (verdict, string, bool) { return verdictSample, "", false }
 
 // --- latency ----------------------------------------------------------------
 
@@ -257,15 +264,15 @@ func compileLatency(where string, cfg *LatencyConfig) (policy, error) {
 // bound on the real duration whenever assembly is incomplete (see the package
 // doc). A trace with no usable timestamp abstains rather than counting as
 // zero-length: "we cannot tell" is not "it was fast".
-func (p *latencyPolicy) eval(t Trace, _ time.Time) (verdict, string) {
+func (p *latencyPolicy) eval(t Trace, _ time.Time) (verdict, string, bool) {
 	d, ok := traceDuration(t)
 	if !ok {
-		return verdictAbstain, ""
+		return verdictAbstain, "", false
 	}
 	if d >= p.min && d <= p.max {
-		return verdictSample, ""
+		return verdictSample, "", false
 	}
-	return verdictAbstain, ""
+	return verdictAbstain, "", false
 }
 
 // --- statusCode -------------------------------------------------------------
@@ -302,13 +309,13 @@ func parseStatusCode(s string) (ptrace.StatusCode, error) {
 	return 0, fmt.Errorf("unknown status code %q (want ERROR, OK or UNSET)", s)
 }
 
-func (p *statusPolicy) eval(t Trace, _ time.Time) (verdict, string) {
+func (p *statusPolicy) eval(t Trace, _ time.Time) (verdict, string, bool) {
 	for i := range t.Spans {
 		if p.mask&(1<<uint(t.Spans[i].Span.Status().Code())) != 0 {
-			return verdictSample, ""
+			return verdictSample, "", false
 		}
 	}
-	return verdictAbstain, ""
+	return verdictAbstain, "", false
 }
 
 // --- stringAttribute --------------------------------------------------------
@@ -366,7 +373,7 @@ func compileStringAttribute(where string, cfg *StringAttributeConfig) (policy, e
 	return p, nil
 }
 
-func (p *stringAttrPolicy) eval(t Trace, _ time.Time) (verdict, string) {
+func (p *stringAttrPolicy) eval(t Trace, _ time.Time) (verdict, string, bool) {
 	for i := range t.Spans {
 		v, ok := lookup(t.Spans[i], p.key)
 		if !ok || v.Type() != pcommon.ValueTypeStr {
@@ -376,12 +383,12 @@ func (p *stringAttrPolicy) eval(t Trace, _ time.Time) (verdict, string) {
 		}
 		if p.match(v.Str()) {
 			if p.invert {
-				return verdictVeto, ""
+				return verdictVeto, "", false
 			}
-			return verdictSample, ""
+			return verdictSample, "", false
 		}
 	}
-	return verdictAbstain, ""
+	return verdictAbstain, "", false
 }
 
 func (p *stringAttrPolicy) match(s string) bool {
@@ -475,7 +482,7 @@ func compileNumericAttribute(where string, cfg *NumericAttributeConfig) (policy,
 // otherwise never match a policy that looks correct, and the widening
 // comparison is exact for every magnitude either side can express to within the
 // float's own precision.
-func (p *numericPolicy) eval(t Trace, _ time.Time) (verdict, string) {
+func (p *numericPolicy) eval(t Trace, _ time.Time) (verdict, string, bool) {
 	for i := range t.Spans {
 		v, ok := lookup(t.Spans[i], p.key)
 		if !ok {
@@ -484,15 +491,15 @@ func (p *numericPolicy) eval(t Trace, _ time.Time) (verdict, string) {
 		switch v.Type() {
 		case pcommon.ValueTypeInt:
 			if n := v.Int(); n >= p.min && n <= p.max {
-				return verdictSample, ""
+				return verdictSample, "", false
 			}
 		case pcommon.ValueTypeDouble:
 			if d := v.Double(); d >= float64(p.min) && d <= float64(p.max) {
-				return verdictSample, ""
+				return verdictSample, "", false
 			}
 		}
 	}
-	return verdictAbstain, ""
+	return verdictAbstain, "", false
 }
 
 // --- booleanAttribute -------------------------------------------------------
@@ -512,14 +519,14 @@ func compileBooleanAttribute(where string, cfg *BooleanAttributeConfig) (policy,
 	return &boolPolicy{key: cfg.Key, want: *cfg.Value}, nil
 }
 
-func (p *boolPolicy) eval(t Trace, _ time.Time) (verdict, string) {
+func (p *boolPolicy) eval(t Trace, _ time.Time) (verdict, string, bool) {
 	for i := range t.Spans {
 		v, ok := lookup(t.Spans[i], p.key)
 		if ok && v.Type() == pcommon.ValueTypeBool && v.Bool() == p.want {
-			return verdictSample, ""
+			return verdictSample, "", false
 		}
 	}
-	return verdictAbstain, ""
+	return verdictAbstain, "", false
 }
 
 // --- probabilistic ----------------------------------------------------------
@@ -545,11 +552,11 @@ func compileProbabilistic(where string, cfg *ProbabilisticConfig) (policy, error
 // re-decision after a retry, a restart or late spans reaches the same answer),
 // and the unsalted hash makes this stage NEST with the head sampler rather
 // than compound with it. See tracehash's package doc for the contract.
-func (p *probPolicy) eval(t Trace, _ time.Time) (verdict, string) {
+func (p *probPolicy) eval(t Trace, _ time.Time) (verdict, string, bool) {
 	if tracehash.Keep(t.TraceID, p.threshold) {
-		return verdictSample, ""
+		return verdictSample, "", false
 	}
-	return verdictAbstain, ""
+	return verdictAbstain, "", false
 }
 
 // --- rateLimiting -----------------------------------------------------------
@@ -570,28 +577,33 @@ func compileRateLimiting(where string, cfg *RateLimitingConfig) (policy, error) 
 // The charge happens only when this policy is REACHED, so an earlier policy
 // that samples spends nothing here — which is what makes "keep all errors, then
 // rate-limit the rest" mean what it reads like.
-func (p *ratePolicy) eval(t Trace, now time.Time) (verdict, string) {
-	if charge(p.b, float64(len(t.Spans)), now, t.Charged) {
-		return verdictSample, ""
+func (p *ratePolicy) eval(t Trace, now time.Time) (verdict, string, bool) {
+	admitted, spent := charge(p.b, float64(len(t.Spans)), now, t.Charged)
+	if admitted {
+		return verdictSample, "", spent
 	}
-	return verdictAbstain, ""
+	return verdictAbstain, "", spent
 }
 
 // charge spends n against b — or, when the trace was already charged by an
 // earlier decision (Trace.Charged), merely checks that it would fit. A
 // re-decision must not bill the same trace twice: the budget is a rate of spans
-// leaving, and these spans were counted the first time.
+// leaving, and these spans were counted the first time. It reports whether the
+// trace was admitted and, separately, whether that answer SPENT anything: a
+// REFUSED admission moves no tokens, and an assembler told otherwise would
+// remember the trace as billed and never bill it.
 //
 // The bucket itself is tracehash.Bucket, shared with agent/tracesample's rate
 // cap; THIS package's semantics are AdmitDebt (admission needs min(n, burst),
 // the charge is the full n, so an over-sized trace goes into debt rather than
 // being shut out forever) and Peek (the state-untouched re-decision) — the
 // method docs carry the why.
-func charge(b *tracehash.Bucket, n float64, now time.Time, already bool) bool {
+func charge(b *tracehash.Bucket, n float64, now time.Time, already bool) (admitted, spent bool) {
 	if already {
-		return b.Peek(n, now)
+		return b.Peek(n, now), false
 	}
-	return b.AdmitDebt(n, now)
+	admitted = b.AdmitDebt(n, now)
+	return admitted, admitted
 }
 
 // --- and --------------------------------------------------------------------
@@ -624,16 +636,19 @@ func compileAnd(where string, cfg *AndConfig) (policy, bool, error) {
 // that does not sample, so an operator can put the cheap discriminating test
 // first — and so a rateLimiting sub-policy placed last is charged only for
 // traces the rest of the conjunction already accepted.
-func (p *andPolicy) eval(t Trace, now time.Time) (verdict, string) {
+func (p *andPolicy) eval(t Trace, now time.Time) (verdict, string, bool) {
+	spent := false
 	for _, sub := range p.subs {
-		switch v, _ := sub.eval(t, now); v {
+		v, _, s := sub.eval(t, now)
+		spent = spent || s // a sub-policy that charged before a later one abstained still moved its bucket
+		switch v {
 		case verdictVeto:
-			return verdictVeto, ""
+			return verdictVeto, "", spent
 		case verdictAbstain:
-			return verdictAbstain, ""
+			return verdictAbstain, "", spent
 		}
 	}
-	return verdictSample, ""
+	return verdictSample, "", spent
 }
 
 // --- composite --------------------------------------------------------------
@@ -784,21 +799,25 @@ func compositeShares(where string, cfg *CompositeConfig, subs []namedPolicy) (ma
 // much" instead of "this class of trace blocks the ones below it".
 //
 // A veto propagates immediately, for the reason andPolicy.eval gives.
-func (p *compositePolicy) eval(t Trace, now time.Time) (verdict, string) {
+func (p *compositePolicy) eval(t Trace, now time.Time) (verdict, string, bool) {
 	n := float64(len(t.Spans))
+	spent := false
 	for i := range p.subs {
 		sub := &p.subs[i]
-		v, _ := sub.p.eval(t, now)
+		v, _, s := sub.p.eval(t, now)
+		spent = spent || s
 		switch v {
 		case verdictVeto:
-			return verdictVeto, sub.name
+			return verdictVeto, sub.name, spent
 		case verdictSample:
-			if charge(sub.b, n, now, t.Charged) {
-				return verdictSample, sub.name
+			admitted, s := charge(sub.b, n, now, t.Charged)
+			spent = spent || s
+			if admitted {
+				return verdictSample, sub.name, spent
 			}
 		}
 	}
-	return verdictAbstain, ""
+	return verdictAbstain, "", spent
 }
 
 // subNames reports the qualified names a composite can put in a Decision. Its

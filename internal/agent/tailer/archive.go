@@ -58,11 +58,27 @@ func (t *Tailer) readArchive(ctx context.Context, f *file) error {
 		// data has been exported; otherwise every consumed archive would leak
 		// one. Gated on archiveEOF, not on offsets alone: a rewind leaves
 		// readPos == committed, which would look "delivered" while the data is
-		// in fact still owed. Runs whether or not the archive is marked done —
-		// when the path was replaced under us archiveDone was deliberately left
-		// false, and this is what lets the next openArchive see the replacement.
-		if f.f != nil && f.archiveEOF && f.committed >= f.readPos {
+		// in fact still owed. The offset compared is fedEnd, never readPos:
+		// trailing decompressed bytes that never feed — a final blank line, an
+		// unterminated final fragment, a rate-DROPPED tail — can never produce
+		// a committing entry, and a readPos gate pinned one fd per such
+		// archive for the file's life. Runs whether or not the archive is
+		// marked done — when the path was replaced under us archiveDone was
+		// deliberately left false, and this is what lets the next openArchive
+		// see the replacement.
+		if f.f != nil && f.archiveEOF && f.committed >= f.fedEnd() {
 			t.closeArchive(f)
+		}
+		if f.archiveEOF && f.f != nil {
+			// Read to EOF with the batch not yet committed (the retained fd is
+			// the proof — the gate above releases it once everything commits).
+			// The data is fed and merely awaiting its flush: reopening here
+			// re-decompressed from `committed` and RE-FED lines already
+			// sitting in the batch, once per sweep until the flush interval
+			// landed — several duplicate copies delivered in one export. Only
+			// a rewind (which clears archiveEOF: the range is owed again)
+			// re-arms reading.
+			return nil
 		}
 		// A fully-consumed archive would otherwise be reopened and
 		// re-decompressed end-to-end on every poll sweep, forever; skip while
@@ -187,13 +203,10 @@ func (t *Tailer) openArchive(f *file) error {
 		}
 		return nil
 	}
-	fh, err := os.Open(f.path)
+	// openRegular, not os.Open: an open(2) on a FIFO that took the archive's
+	// name would block the sweep goroutine forever (see openRegular).
+	fh, st, err := openRegular(f.path)
 	if err != nil {
-		return err
-	}
-	st, err := fh.Stat()
-	if err != nil {
-		_ = fh.Close()
 		return err
 	}
 	inode := inodeOf(st)
@@ -262,7 +275,10 @@ func (t *Tailer) drainArchive(ctx context.Context, f *file) {
 	if f.gz == nil {
 		// Reader closed at EOF or by a rewind, but the data is not committed and
 		// the fd is still held: re-decompress the uncommitted suffix from it.
-		if f.f == nil || f.committed >= f.readPos && f.archiveDone {
+		// At EOF there is nothing left to drain — everything is fed and merely
+		// awaiting its flush, and re-decompressing here re-fed lines already
+		// in the batch (only a rewind, which clears archiveEOF, re-owes them).
+		if f.f == nil || f.archiveEOF || f.committed >= f.readPos && f.archiveDone {
 			return
 		}
 		if err := t.openArchive(f); err != nil {

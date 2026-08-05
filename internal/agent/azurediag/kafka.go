@@ -141,24 +141,45 @@ func newKafkaSource(cfg *Config) (source, error) {
 	return &kafkaSource{cl: cl, log: cfg.Logger}, nil
 }
 
-// poll blocks for the next fetch and returns the message values. Partition
-// errors are counted and logged but do not fail the poll — the fetched
-// records are still processed (kgo retries the broken partitions itself).
+// poll blocks for the next fetch and returns the message values.
 func (s *kafkaSource) poll(ctx context.Context) ([][]byte, error) {
 	fetches := s.cl.PollFetches(ctx)
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	for _, fe := range fetches.Errors() {
-		obs.AzureFetchErrors.Inc()
-		s.log.Warn("event hubs fetch error", "topic", fe.Topic, "partition", fe.Partition, "error", fe.Err)
-	}
-	var out [][]byte
+	return pollResult(fetches, s.log)
+}
+
+// pollResult separates a fetch's records from its errors. Errors beside
+// records are counted and logged but do not fail the poll — the records are
+// still processed and kgo retries the broken partitions itself. A fetch
+// carrying errors and NO records fails it: that is the shape kgo documents
+// for fatal partition conditions ("if any partition has a fatal error and
+// actually had no records, a fake fetch will be injected with the error" —
+// an authorization failure, a closed client), and by the records alone it is
+// indistinguishable from a clean empty poll, so returning nil here cleared
+// the azure-eventhub readiness gate for a consumer that can never consume
+// and warn-looped on errors only Run's reopen-with-backoff can address.
+func pollResult(fetches kgo.Fetches, log *slog.Logger) ([][]byte, error) {
+	var (
+		out  [][]byte
+		seen bool
+	)
 	fetches.EachRecord(func(rec *kgo.Record) {
+		seen = true
 		if len(rec.Value) > 0 {
 			out = append(out, rec.Value)
 		}
 	})
+	errs := fetches.Errors()
+	for _, fe := range errs {
+		obs.AzureFetchErrors.Inc()
+		log.Warn("event hubs fetch error", "topic", fe.Topic, "partition", fe.Partition, "error", fe.Err)
+	}
+	if !seen && len(errs) > 0 {
+		fe := errs[0]
+		return nil, fmt.Errorf("event hubs fetch (topic %q partition %d): %w", fe.Topic, fe.Partition, fe.Err)
+	}
 	return out, nil
 }
 

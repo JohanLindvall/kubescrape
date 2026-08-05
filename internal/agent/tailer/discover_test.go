@@ -572,3 +572,120 @@ func TestGlobFailureSuppressesGoneDetection(t *testing.T) {
 		t.Fatal("gone-detection did not resume after the good listing")
 	}
 }
+
+// claimPath's non-regular guard covers DISCOVERY only: a TRACKED path
+// replaced by a FIFO used to resurrect through the sweep's bare os.Stat, and
+// the readFile that followed drained the old fd, saw a new inode, and
+// re-opened the path — an open(2) O_RDONLY that blocks forever on a
+// writer-less FIFO, wedging the single sweep goroutine (log collection stops
+// node-wide with /readyz green and no counter moving).
+func TestTrackedPathReplacedByFifoDoesNotWedgeSweep(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+	exp := &fakeExporter{}
+	tl := driveTailer(dir, exp)
+	tl.scanDir(tl.loadCheckpoints(), true)
+	writeLog(t, dir, timeNowCRI()+" stdout F before-fifo")
+	tl.scanDir(nil, false)
+	tl.sweep(ctx, true) // tracked, fd held
+
+	path := filepath.Join(dir, logName)
+	if err := os.Rename(path, path+".1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := syscall.Mkfifo(path, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for range 3 {
+			tl.scanDir(nil, false)
+			tl.sweep(ctx, true)
+			tl.flush(ctx)
+		}
+	}()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("sweep wedged opening the FIFO")
+	}
+	if got := exp.get(); !slices.Contains(got, "before-fifo") {
+		t.Fatalf("old inode's lines lost: %q", got)
+	}
+	if _, tracked := tl.files[path]; tracked {
+		t.Fatal("the FIFO impostor was tracked")
+	}
+}
+
+// The kernel auto-removes an inotify watch when the watched directory itself
+// is deleted or moved, and fsnotify drops it from its bookkeeping without an
+// event this side can key an invalidation on (the event's Name is the dir, so
+// handleEvent attributes it to the parent). A skip list over watchedScan
+// therefore never re-added it: a recreated discovery dir was permanently
+// degraded to poll cadence, under which sub-poll-interval rename rotations
+// lose segments. retryScanWatches must re-register unconditionally.
+func TestScanWatchRecoveredAfterDirRecreation(t *testing.T) {
+	base := t.TempDir()
+	dir := filepath.Join(base, "logs")
+	if err := os.Mkdir(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	tl := driveTailer(dir, &fakeExporter{})
+	w, err := fsnotify.NewWatcher()
+	if err != nil {
+		t.Skipf("fsnotify unavailable: %v", err)
+	}
+	defer func() { _ = w.Close() }()
+	go func() { // drain so the watcher's event goroutine never blocks
+		for range w.Events {
+		}
+	}()
+	go func() {
+		for range w.Errors {
+		}
+	}()
+	tl.watcher = w
+	tl.watchRefs = map[string]int{}
+	tl.watchedScan = map[string]struct{}{}
+	if err := w.Add(dir); err != nil {
+		t.Fatal(err)
+	}
+	tl.watchedScan[dir] = struct{}{}
+
+	if err := os.Remove(dir); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, func() bool { return !slices.Contains(w.WatchList(), dir) },
+		"fsnotify dropping the deleted dir's watch")
+	if err := os.Mkdir(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	tl.retryScanWatches()
+	if !slices.Contains(w.WatchList(), dir) {
+		t.Fatal("recreated discovery dir left unwatched: discovery degraded to poll cadence")
+	}
+}
+
+// A path the glob just listed can vanish before claimPath's stat — a rename
+// rotation caught mid-scan. That ENOENT proves the file WAS there moments
+// ago, not that it is stably absent: left out of `seen`, the same
+// (successful) listing pruned its not-yet-consumed checkpoint entry, so a
+// recreated path read from zero and the Pending prefixes — initFile's only
+// route back to the rotated inode's unshipped tail — were destroyed with it.
+func TestGlobListedButVanishedPathIsUnprovenAbsence(t *testing.T) {
+	dir := t.TempDir()
+	tl := driveTailer(dir, &fakeExporter{})
+	tl.scanDir(tl.loadCheckpoints(), true)
+
+	ghost := filepath.Join(dir, "ghost_ns1_app-ffffffff.log")
+	seen := map[string]struct{}{}
+	if tl.claimPath(tl.sources[0], ghost, seen) {
+		t.Fatal("a vanished path must not be tracked")
+	}
+	if _, ok := seen[ghost]; !ok {
+		t.Fatal("glob-listed-but-ENOENT path not marked seen: this scan would prune its checkpoint entry")
+	}
+}

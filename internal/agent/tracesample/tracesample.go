@@ -137,6 +137,13 @@ func (s *Sampler) ExportTraces(ctx context.Context, td ptrace.Traces) error {
 	}
 	out := ptrace.NewTraces()
 	td.CopyTo(out)
+	// Tallied here, counted after the forward SUCCEEDS — the repo's
+	// forward-first-act-on-success rule, which the spanmetrics tap above this
+	// sampler follows for the same reason. A failed export is re-pushed by the
+	// sender, the probability decision is deterministic, and the identical spans
+	// would be reported dropped once per retry: an operator sizing sampling loss
+	// during a back-pressure window would read it multiplied by the retry count.
+	var byProb, byRate int
 	rss := out.ResourceSpans()
 	rss.RemoveIf(func(rs ptrace.ResourceSpans) bool {
 		sss := rs.ScopeSpans()
@@ -144,11 +151,11 @@ func (s *Sampler) ExportTraces(ctx context.Context, td ptrace.Traces) error {
 			spans := ss.Spans()
 			spans.RemoveIf(func(sp ptrace.Span) bool {
 				if !s.keep(sp) {
-					obs.TraceSpansDropped.WithLabelValues("probability").Inc()
+					byProb++
 					return true
 				}
 				if s.rate > 0 && !s.allow() {
-					obs.TraceSpansDropped.WithLabelValues("rate").Inc()
+					byRate++
 					return true
 				}
 				return false
@@ -158,9 +165,28 @@ func (s *Sampler) ExportTraces(ctx context.Context, td ptrace.Traces) error {
 		return sss.Len() == 0
 	})
 	if out.ResourceSpans().Len() == 0 {
-		return nil // everything sampled away: acked, nothing to send
+		// Everything sampled away: acked, nothing to send — so there is no
+		// forward whose outcome the drops could wait on, and they are final.
+		s.countDropped(byProb, byRate)
+		return nil
 	}
-	return s.next.ExportTraces(ctx, out)
+	if err := s.next.ExportTraces(ctx, out); err != nil {
+		return err
+	}
+	s.countDropped(byProb, byRate)
+	return nil
+}
+
+// countDropped publishes one payload's tallies. The rate arm's tally is the one
+// this pass made: a retry re-bills the bucket, so its own drops may be a
+// different subset, and only the pass that shipped is reported.
+func (s *Sampler) countDropped(byProb, byRate int) {
+	if byProb > 0 {
+		obs.TraceSpansDropped.WithLabelValues("probability").Add(float64(byProb))
+	}
+	if byRate > 0 {
+		obs.TraceSpansDropped.WithLabelValues("rate").Add(float64(byRate))
+	}
 }
 
 // wouldDrop reports whether any span in td would be dropped — the decision

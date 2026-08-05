@@ -306,6 +306,13 @@ func (t *Tailer) feedSegments(ctx context.Context, f *file) {
 		f.feeding = sg.id
 		if !t.replaySegment(ctx, f, sg) {
 			allDone = false
+			// Stop the pass at the FIRST unfinished segment: segments are
+			// oldest-first, so feeding a later one's lines now would put them
+			// into the pipeline AHEAD of this one's still-owed remainder —
+			// the same out-of-order feed the segmentsFed gate exists to
+			// prevent, one level down. (A rewind mid-replay purged the
+			// pipeline outright; continuing was equally wrong there.)
+			break
 		}
 	}
 	f.feeding = 0
@@ -373,12 +380,16 @@ func (t *Tailer) replaySegment(ctx context.Context, f *file, p *segment) bool {
 		return retired
 	}
 	defer closeFh()
-	if _, err := fh.Seek(p.committed, 0); err != nil {
+	// Resume at the FEED frontier, not the commit frontier: a budget-cut pass
+	// left its lines in the pipeline, and re-reading them feeds duplicates
+	// into groups that still buffer the originals.
+	from := max(p.committed, p.fedTo)
+	if _, err := fh.Seek(from, 0); err != nil {
 		t.log.Warn("seeking rotated segment", "path", path, "error", err)
 		return false // transient: retry next sweep
 	}
 
-	remaining := p.to - p.committed
+	remaining := p.to - from
 	if p.to < 0 {
 		// Open-ended (a rotation that happened while the agent was DOWN: the
 		// checkpoint knows the identity and the committed offset but not
@@ -387,8 +398,8 @@ func (t *Tailer) replaySegment(ctx context.Context, f *file, p *segment) bool {
 		remaining = 1 << 62
 	}
 	var carry []byte
-	cur := p.committed
-	fed := p.committed // last FED line boundary — the only offset commits can reach
+	cur := from
+	fed := from // last FED line boundary — the only offset commits can reach
 	var lastErr error
 	discarding := false // an over-cap line's remainder, dropped to its newline
 	buf := t.scratch()
@@ -447,6 +458,10 @@ func (t *Tailer) replaySegment(ctx context.Context, f *file, p *segment) bool {
 					fed = cur
 				}
 			}
+			// Advance the feed frontier BEFORE the flush below: a failed
+			// flush rewinds and resets it (ledger.reset), and stamping it
+			// afterwards would resurrect a frontier the purge invalidated.
+			p.fedTo = fed
 		}
 		if rerr != nil {
 			lastErr = rerr
@@ -552,7 +567,9 @@ func (t *Tailer) findRotated(f *file, p *segment) (string, bool) {
 	for _, de := range entries {
 		full := filepath.Join(dir, de.Name())
 		st, err := os.Stat(full)
-		if err != nil || inodeOf(st) != p.inode {
+		// The regularity check covers inode reuse by a non-file: opening a
+		// FIFO to fingerprint it would block the sweep goroutine forever.
+		if err != nil || !st.Mode().IsRegular() || inodeOf(st) != p.inode {
 			continue
 		}
 		fh, err := os.Open(full)
@@ -608,6 +625,14 @@ func (t *Tailer) drainGone(ctx context.Context, f *file) {
 	// would be closed forever by release() once everything else settles (a pod
 	// deleted during a collector outage after a rotation).
 	t.feedSegments(ctx, f)
+	if len(f.segments) > 0 && !f.segmentsFed {
+		// Unfinished replay: draining the gone inode now would feed its
+		// (newer) lines ahead of the segments' still-owed remainder — the
+		// same out-of-order fuse readFile gates against. The fd is held and
+		// drainGone re-runs every sweep until settledGone, so the drain
+		// merely waits its turn.
+		return
+	}
 	if f.compressed {
 		// A large archive is read incrementally across sweeps; a deletion
 		// mid-read leaves the rest readable from the open fd.
@@ -620,13 +645,23 @@ func (t *Tailer) drainGone(ctx context.Context, f *file) {
 	}
 	if len(f.pending) > 0 {
 		// An unterminated final line (a process killed mid-write) can never be
-		// completed — the file is gone. Without flushing it here, settledGone's
-		// pending check would hold the fd and the files-map entry forever and
-		// the tail would never be delivered. The synthetic terminator advances
-		// readPos with it so the commit reaches goneEnd.
-		f.pending = append(f.pending, '\n')
-		f.readPos++
-		t.consume(ctx, f, true)
+		// completed — the file is gone — and settledGone's pending check would
+		// otherwise hold the fd and the files-map entry forever. Feed it
+		// directly, ending at the REAL EOF: a synthetic terminator advanced
+		// readPos past the file's true size, so every offset downstream named
+		// a byte the file never had — a resurrected (listing-race) file of
+		// unchanged size read as truncated and re-ingested whole, and a
+		// checkpointed offset one past EOF did the same across a restart.
+		// (consume already ran, so pending holds no newline: it IS one
+		// unterminated line.)
+		if f.discarding {
+			// The tail of an oversized discarded line: not a record.
+			f.discarding = false
+		} else {
+			t.feedLine(ctx, f, string(f.pending), f.lineStart, f.readPos)
+		}
+		f.pending = f.pending[:0]
+		f.lineStart = f.readPos
 	}
 	t.stopPipeline(ctx, f)
 	// The settle target is the FED boundary, not readPos: trailing consumed-

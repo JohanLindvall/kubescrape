@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -210,6 +211,37 @@ func TestAgentSelfResourceNamespaceAtStartup(t *testing.T) {
 	}
 	if v, _ := a.Get("service.instance.id"); v.AsString() != "node1" {
 		t.Fatalf("service.instance.id = %q; a namespace must not displace the node", v.AsString())
+	}
+}
+
+// hostNetworkSelf decides whether os.Hostname() names the pod or the node, and
+// it must not claim hostNetwork on evidence it does not have: PID 1 is the
+// HOST's init only under hostPID, which no shipped manifest sets, and in the
+// image the agent IS pid 1 — so the comparison is self-vs-self and read every
+// pod as hostNetwork. That cost an ordinary pod without $POD_NAME the hostname
+// fallback, which is exactly the case the fallback exists for.
+func TestHostNetworkSelfNeedsProofPidOneIsSomebodyElse(t *testing.T) {
+	shared := func(string) (string, error) { return "net:[4026531840]", nil }
+	if hostNetworkProc(1, shared) {
+		t.Error("comparing pid 1's namespace with our own, as pid 1, must be inconclusive")
+	}
+	if !hostNetworkProc(42, shared) {
+		t.Error("a namespace shared with a DISTINCT pid 1 is the hostNetwork signal")
+	}
+
+	own := func(p string) (string, error) {
+		if p == "/proc/1/ns/net" {
+			return "net:[4026531840]", nil
+		}
+		return "net:[4026532567]", nil
+	}
+	if hostNetworkProc(42, own) {
+		t.Error("a namespace of our own is not hostNetwork")
+	}
+
+	denied := func(string) (string, error) { return "", os.ErrPermission }
+	if hostNetworkProc(42, denied) {
+		t.Error("an unreadable /proc must keep the hostname fallback, not claim hostNetwork")
 	}
 }
 

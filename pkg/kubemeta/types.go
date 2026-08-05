@@ -172,8 +172,14 @@ type ScrapeTarget struct {
 	TLSKey          string `json:"tlsKey,omitempty"`
 	TLSServerName   string `json:"tlsServerName,omitempty"`
 	// Interval and ScrapeTimeout override the agent's -scrape-interval and
-	// -scrape-timeout for this target (Go duration strings; empty = the agent's
-	// default). Set from a ServiceMonitor/PodMonitor endpoint's own cadence.
+	// -scrape-timeout for this target; empty = the agent's default. Set from a
+	// ServiceMonitor/PodMonitor endpoint's own cadence, and carried in the
+	// language that endpoint is written in: prometheus-operator's duration
+	// syntax (`y`, `w`, `d`, `h`, `m`, `s`, `ms`, largest unit first — "1d12h"),
+	// which the CRD validates and Go's time.ParseDuration rejects the top three
+	// of. A plain Go duration ("30s", "1m30s") is read by a fallback to that
+	// parser, and an unparseable value makes the agent warn once and use its own
+	// default rather than drop the target.
 	Interval string `json:"interval,omitempty"`
 	// ScrapeTimeout bounds one scrape of this target; it is clamped to the
 	// effective interval by the agent, since a scrape outliving its own period

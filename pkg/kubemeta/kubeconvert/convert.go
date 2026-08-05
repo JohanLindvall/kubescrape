@@ -6,6 +6,8 @@
 package kubeconvert
 
 import (
+	"time"
+
 	corev1 "k8s.io/api/core/v1"
 
 	"github.com/JohanLindvall/kubescrape/pkg/kubemeta"
@@ -92,7 +94,7 @@ func FromPod(p *corev1.Pod) (kubemeta.Pod, map[string]kubemeta.Container) {
 		c := convertContainer(name, image, ports, typ, st)
 		pod.Containers = append(pod.Containers, c)
 		if c.ID != "" {
-			byID[c.ID] = clonePorts(c) // own backing array: the model is self-contained
+			byID[c.ID] = cloneContainer(c) // shares nothing: the model is self-contained
 		}
 		if prev, ok := previousIncarnation(c, st); ok {
 			byID[prev.ID] = prev
@@ -154,7 +156,7 @@ func previousIncarnation(c kubemeta.Container, st *corev1.ContainerStatus) (kube
 	if st == nil || st.LastTerminationState.Terminated == nil || st.LastTerminationState.Terminated.ContainerID == "" {
 		return kubemeta.Container{}, false
 	}
-	prev := clonePorts(c) // a distinct incarnation: never share the current one's ports
+	prev := cloneContainer(c) // a distinct incarnation: it shares nothing with the current one
 	prev.RuntimeID = st.LastTerminationState.Terminated.ContainerID
 	prev.ID = kubemeta.NormalizeContainerID(prev.RuntimeID)
 	prev.Ready = false
@@ -167,15 +169,32 @@ func previousIncarnation(c kubemeta.Container, st *corev1.ContainerStatus) (kube
 	return prev, true
 }
 
-// clonePorts returns a copy of c whose Ports has its own backing array, so a
-// container value stored in a second place (byID, or a prior incarnation) never
-// shares the slice with the one appended to pod.Containers. Ports is the only
-// reference-typed field that is not already freshly allocated per view.
-func clonePorts(c kubemeta.Container) kubemeta.Container {
+// cloneContainer returns a copy of c that shares no memory with it, so a
+// container value stored in a second place (byID, or a prior incarnation) is
+// independent of the one appended to pod.Containers. The struct copy alone
+// leaves the slice and every POINTER field aliased — convertContainer allocates
+// StartedAt/FinishedAt/ExitCode once per container and both views then point at
+// it. Nothing mutates them today; this is a public model whose two views must
+// not become a trap for the code that eventually does.
+func cloneContainer(c kubemeta.Container) kubemeta.Container {
 	if c.Ports != nil {
 		c.Ports = append([]kubemeta.ContainerPort(nil), c.Ports...)
 	}
+	c.StartedAt = cloneTime(c.StartedAt)
+	c.FinishedAt = cloneTime(c.FinishedAt)
+	if c.ExitCode != nil {
+		code := *c.ExitCode
+		c.ExitCode = &code
+	}
 	return c
+}
+
+func cloneTime(t *time.Time) *time.Time {
+	if t == nil {
+		return nil
+	}
+	v := *t
+	return &v
 }
 
 func fillTerminated(c *kubemeta.Container, t *corev1.ContainerStateTerminated) {

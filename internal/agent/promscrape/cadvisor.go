@@ -267,16 +267,22 @@ func (s *Scraper) parseAndExportFiltered(ctx context.Context, body io.Reader, op
 		ss.reportMalformed("aborted scrape had malformed lines", malformed+ss.conv.malformed, err)
 		return ss.samples, err
 	}
+	// Reported from a defer (like reportDropped, and like the protobuf front's
+	// own accounting) so a failing finish or export cannot swallow it: a target
+	// serving partly-garbage exposition to a collector that rejects the chunk
+	// moved kubescrape_scrapes_total{outcome="error"} while the one metric
+	// naming the CAUSE stayed flat — and the two fronts reported differently for
+	// identical input, which is the drift scrapeSession exists to prevent. The
+	// converter's own count is read here, after finish has added to it.
+	defer func() { ss.reportMalformed("scrape had malformed lines", malformed+ss.conv.malformed, nil) }()
 	if err := ss.conv.finish(); err != nil {
 		return ss.samples, err
 	}
-	malformed += ss.conv.malformed // component samples the converter rejected
 	if ss.cb.count() > 0 {
 		if err := ss.export(); err != nil {
 			return ss.samples, err
 		}
 	}
-	ss.reportMalformed("scrape had malformed lines", malformed, nil)
 	return ss.samples, nil
 }
 

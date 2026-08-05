@@ -13,6 +13,7 @@ import (
 
 	"k8s.io/apimachinery/pkg/types"
 
+	"github.com/JohanLindvall/kubescrape/internal/peerip"
 	"github.com/JohanLindvall/kubescrape/pkg/kubemeta"
 )
 
@@ -179,11 +180,16 @@ func (s *Store) GetPodByUID(uid string) (NodePod, bool) {
 // GetPodByIP returns the live pod owning the given pod IP, if any. Deleted
 // and finished pods never resolve (their IP may already belong to a new
 // pod), and hostNetwork pods are not indexed.
+//
+// The argument is canonicalised through the same function the index keys on
+// (peerip.Canonical), so a caller spelling an address the way its transport
+// handed it over — a URL path value, an IPv4-mapped or uppercase IPv6 form —
+// looks the pod up under the key the kubelet's own spelling produced.
 func (s *Store) GetPodByIP(ip string) (NodePod, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	rec := s.byPodIP[ip]
+	rec := s.byPodIP[peerip.Canonical(ip)]
 	if rec == nil || rec.pod.DeletedAt != nil || kubemeta.FinishedPhase(rec.pod.Phase) {
 		return NodePod{}, false
 	}

@@ -51,24 +51,32 @@ func (t *Tailer) handleEvent(ev fsnotify.Event) bool {
 	return dirty
 }
 
-// retryScanWatches re-attempts the discovery-directory watches that have not
-// yet succeeded (see Tailer.watchedScan). Steady state is len(scanDirs) map
-// hits per discovery pass; failures stay at Debug — the startup Warn already
-// named the directory once.
+// retryScanWatches (re-)registers every discovery-directory watch on every
+// discovery pass — UNCONDITIONALLY, never skipping dirs it believes watched.
+// The kernel auto-removes an inotify watch when the watched directory itself
+// is deleted, moved or unmounted, and fsnotify drops it from its bookkeeping
+// without any event this side could key an invalidation on (the event's Name
+// is the dir itself, so handleEvent attributes it to the parent). A skip list
+// therefore turned one dir recreation into a permanent degradation to poll
+// cadence — under which sub-poll-interval rename rotations lose segments.
+// Add is idempotent on a live watch, so the steady state is one cheap
+// inotify_add_watch per dir per pass; watchedScan remains only to log
+// transitions once and to gate the startup "nothing watched" warning.
+// Failures stay at Debug — the startup Warn already named the directory once.
 func (t *Tailer) retryScanWatches() {
 	if t.watcher == nil {
 		return
 	}
 	for dir := range t.scanDirs {
-		if _, ok := t.watchedScan[dir]; ok {
-			continue
-		}
 		if err := t.watcher.Add(dir); err != nil {
+			delete(t.watchedScan, dir)
 			t.log.Debug("watching log directory still failing", "dir", dir, "error", err)
 			continue
 		}
-		t.watchedScan[dir] = struct{}{}
-		t.log.Info("log directory watch established", "dir", dir)
+		if _, ok := t.watchedScan[dir]; !ok {
+			t.watchedScan[dir] = struct{}{}
+			t.log.Info("log directory watch established", "dir", dir)
+		}
 	}
 }
 
@@ -299,16 +307,18 @@ func (s *compiledSource) deniesNamespace(ns string) bool {
 // whether a NEW file was tracked.
 func (t *Tailer) claimPath(src *compiledSource, path string, seen map[string]struct{}) bool {
 	if st, err := os.Stat(path); err != nil || !st.Mode().IsRegular() {
-		// A transient stat failure must not mark the path gone: drop would
-		// delete its stored offset, and a rediscovery would then re-ingest the
-		// whole file from zero. Only genuine absence may.
-		//
-		// Whether the file is currently TRACKED is beside the point — the
-		// checkpoint store is pruned against this same `seen` set, so an
-		// untracked path with a stored offset (one not yet re-opened after a
-		// restart) lost that offset to a single EIO or EACCES. A non-ENOENT
-		// error proves nothing about absence either way.
-		if err != nil && !os.IsNotExist(err) {
+		// A stat failure must not mark the path gone: drop would delete its
+		// stored offset, and a rediscovery would then re-ingest the whole
+		// file from zero. Only proven absence may — and a stat here proves
+		// none. An ENOENT is a path the glob JUST LISTED vanishing between
+		// the two syscalls, i.e. a rename rotation caught mid-scan: pruning
+		// its not-yet-consumed checkpoint entry then would make a recreated
+		// path read from zero AND destroy the Pending prefixes that are
+		// initFile's only route back to the rotated inode's unshipped tail.
+		// A non-ENOENT error (EIO, EACCES, ELOOP) proves nothing either.
+		// Either way, the next scan's own listing — which will not glob a
+		// genuinely absent path at all — is the proof that prunes.
+		if err != nil {
 			seen[path] = struct{}{}
 		}
 		// Non-regular files (FIFOs, sockets, devices) are never tracked:

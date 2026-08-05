@@ -12,7 +12,6 @@ package logchain
 
 import (
 	"fmt"
-	"math"
 	"strconv"
 
 	"go.opentelemetry.io/collector/pdata/pcommon"
@@ -116,7 +115,9 @@ func (r *Resolver) label(k string) string {
 // "0.0000005" through this path (a lifted RESOURCE attribute, read from the
 // lifted slice) and "5e-7" through the record path (target: log, read back
 // off pdata by AsString) — two series for one value, the divergence the
-// shared resolver exists to end.
+// shared resolver exists to end. logattrs.FloatString is that one rendering,
+// shared with the LINE-FIELD path (internal/logline), which had the same
+// divergence for the same reason.
 func attrString(v any) string {
 	switch x := v.(type) {
 	case string:
@@ -126,45 +127,12 @@ func attrString(v any) string {
 	case int64:
 		return strconv.FormatInt(x, 10)
 	case float64:
-		return floatAsString(x)
+		return logattrs.FloatString(x)
 	case nil:
 		return ""
 	default:
 		return fmt.Sprint(x)
 	}
-}
-
-// floatAsString replicates pcommon's unexported float64AsString (pdata
-// pcommon/value.go): ES6 number-to-string — 'f' inside [1e-6, 1e21), 'e' with
-// an unpadded exponent outside, NaN/Infinity spelled out. Pinned against the
-// real pcommon rendering by TestAttrStringMatchesPcommon.
-func floatAsString(f float64) string {
-	if math.IsNaN(f) {
-		return "NaN"
-	}
-	if math.IsInf(f, 1) {
-		return "Infinity"
-	}
-	if math.IsInf(f, -1) {
-		return "-Infinity"
-	}
-	scratch := [64]byte{}
-	b := scratch[:0]
-	abs := math.Abs(f)
-	format := byte('f')
-	if abs != 0 && (abs < 1e-6 || abs >= 1e21) {
-		format = 'e'
-	}
-	b = strconv.AppendFloat(b, f, format, -1, 64)
-	if format == 'e' {
-		// clean up e-09 to e-9
-		n := len(b)
-		if n >= 4 && b[n-4] == 'e' && b[n-3] == '-' && b[n-2] == '0' {
-			b[n-2] = b[n-1]
-			b = b[:n-1]
-		}
-	}
-	return string(b)
 }
 
 func (r *Resolver) ruleKey(k string) string {

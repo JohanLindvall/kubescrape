@@ -500,6 +500,11 @@ func (c *Client) evictLocked() {
 		}
 		return
 	}
+	// The hard-trim path performs the same idle sweep on its way to the cap,
+	// so the periodic cadence counts from it too: leaving lastSweep behind made
+	// the next below-cap insert re-run a full idle sweep immediately, however
+	// recently this one finished.
+	c.lastSweep = now
 	for k, e := range c.cache {
 		if now.Sub(e.used) > cacheMaxIdle {
 			delete(c.cache, k)

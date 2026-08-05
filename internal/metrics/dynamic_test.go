@@ -496,3 +496,40 @@ func TestLoadDynamicMetrics(t *testing.T) {
 		t.Error("missing file: want error")
 	}
 }
+
+// A metric's LABEL and its VALUE must name the same attribute. The numeric
+// lookup answers false for two different things — the key is absent, and the
+// key is present but not a number — and only the first is a reason to read the
+// line's own fields. The label tier falls through on EMPTY only, so a
+// present-but-non-numeric attribute shadowed the line field for the label while
+// the value quietly came from the line: one series whose label says one thing
+// and whose observation measures another.
+func TestValueDoesNotFallThroughToTheLineWhenTheAttributeIsPresent(t *testing.T) {
+	newSet := func() *DynamicMetricSet {
+		set, err := newTestSet([]Dynamic{{Name: "m", Type: GaugeType, Value: "amount", Labels: []string{"amount"}}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return set
+	}
+	noValues := func(string) (float64, bool) { return 0, false }
+
+	present := newSet()
+	present.Add(noValues, func(k string) string {
+		if k == "amount" {
+			return "n/a" // present, and not a number
+		}
+		return ""
+	}, pcommon.NewMap(), "amount=42")
+	if n := len(present.rules[0].series.db); n != 0 {
+		t.Fatalf("observed %d samples: the label read the attribute (n/a) and the value read the line (42)", n)
+	}
+
+	// The fallback itself must stay: with the key absent from the attributes,
+	// the line field is exactly what the label reads too.
+	absent := newSet()
+	absent.Add(noValues, func(string) string { return "" }, pcommon.NewMap(), "amount=42")
+	if n := len(absent.rules[0].series.db); n != 1 {
+		t.Fatalf("observed %d samples from the line field, want 1", n)
+	}
+}

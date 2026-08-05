@@ -1355,3 +1355,41 @@ func TestSecondRotationDuringAbortedDrainKeepsTheMiddleIncarnation(t *testing.T)
 		}
 	}
 }
+
+// drainGone must account an unterminated final line at the REAL EOF. The
+// synthetic terminator it used to append advanced readPos (and committed, and
+// the checkpointed offset) one byte past the file's true size, so a
+// resurrected (listing-race) file of unchanged size read as truncated and
+// re-ingested whole, and a restart found the stored offset beyond EOF with
+// the same result.
+func TestGoneDrainAccountsUnterminatedLineAtRealEOF(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+	exp := &fakeExporter{}
+	tl := driveTailer(dir, exp)
+	tl.scanDir(tl.loadCheckpoints(), true)
+	path := filepath.Join(dir, logName)
+	content := timeNowCRI() + " stdout F one\n" + timeNowCRI() + " stdout F two"
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	tl.scanDir(nil, false)
+	tl.sweep(ctx, true) // reads both lines; "two" stays pending, unterminated
+
+	f := tl.files[path]
+	rotateAway(t, dir, 1)
+	tl.scanDir(nil, false) // gone
+	tl.sweep(ctx, true)    // drain, flush, settle
+
+	size := int64(len(content))
+	if f.readPos != size || f.committed != size || f.goneEnd != size {
+		t.Fatalf("readPos=%d committed=%d goneEnd=%d, want all %d: a synthetic byte leaked into the offsets",
+			f.readPos, f.committed, f.goneEnd, size)
+	}
+	if got := exp.get(); !slices.Contains(got, "two") {
+		t.Fatalf("unterminated final line not delivered: %q", got)
+	}
+	if _, tracked := tl.files[path]; tracked {
+		t.Fatal("drained gone file did not settle")
+	}
+}

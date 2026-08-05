@@ -26,8 +26,19 @@ import (
 // argPattern matches a rendered argument in a YAML args list:
 //
 //   - -log-level={{ .Values.logLevel }}
+//   - --log-level={{ .Values.logLevel }}
 //   - -journald
-var argPattern = regexp.MustCompile(`(?m)^\s*-\s+-([A-Za-z0-9][A-Za-z0-9-]*)`)
+//
+// The second dash is optional because Go's flag package accepts both spellings
+// equally: a manifest written the GNU way must be checked, not skipped.
+var argPattern = regexp.MustCompile(`(?m)^\s*-\s+--?([A-Za-z0-9][A-Za-z0-9-]*)`)
+
+// docSeparator splits a multi-document YAML file. Classification is per
+// DOCUMENT, not per file: a file holding both a service workload and an agent
+// one would otherwise have every flag in it asserted against whichever binary
+// the file as a whole was taken for — the exact bypass this package exists to
+// prevent, on the manifests most likely to grow that way.
+var docSeparator = regexp.MustCompile(`(?m)^---[ \t]*$`)
 
 // AgentCommand identifies the manifests that run the agent: it is the binary
 // the DaemonSet and the singleton Deployment override the image entrypoint
@@ -53,17 +64,18 @@ func Flags(dirs []string, agent bool) (map[string][]string, error) {
 			if err != nil {
 				return nil, fmt.Errorf("reading %s: %w", path, err)
 			}
-			body := string(b)
-			// Only container specs carry flags; skip RBAC, Services, CRDs.
-			if !strings.Contains(body, "args:") && !strings.Contains(body, "command:") {
-				continue
-			}
-			if strings.Contains(body, AgentCommand) != agent {
-				continue
-			}
 			var names []string
-			for _, m := range argPattern.FindAllStringSubmatch(body, -1) {
-				names = append(names, m[1])
+			for _, doc := range docSeparator.Split(string(b), -1) {
+				// Only container specs carry flags; skip RBAC, Services, CRDs.
+				if !strings.Contains(doc, "args:") && !strings.Contains(doc, "command:") {
+					continue
+				}
+				if strings.Contains(doc, AgentCommand) != agent {
+					continue
+				}
+				for _, m := range argPattern.FindAllStringSubmatch(doc, -1) {
+					names = append(names, m[1])
+				}
 			}
 			if len(names) > 0 {
 				out[path] = names

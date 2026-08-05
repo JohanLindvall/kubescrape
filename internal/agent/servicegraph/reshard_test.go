@@ -824,3 +824,36 @@ func BenchmarkReshardSingleOwner(b *testing.B) {
 type nopExporter struct{}
 
 func (nopExporter) ExportTraces(context.Context, ptrace.Traces) error { return nil }
+
+// The single-shard tier is the commonest topology there is, and it takes the
+// fast path — which returns the payload before either counting pass runs. The
+// unkeyable tally must still move there: its metric's whole promise is that a
+// moving rate means an SDK is emitting malformed spans, and frozen at zero it
+// says the opposite about a shard that is drowning in them.
+func TestSpansWithNoTraceIDAreCountedOnASingleShardTier(t *testing.T) {
+	r := testResharder(t, nil, 0) // no peers: everything is already local
+	td := ptrace.NewTraces()
+	rs := td.ResourceSpans().AppendEmpty()
+	realisticResource(rs.Resource(), "checkout")
+	ss := rs.ScopeSpans().AppendEmpty()
+	for i := 0; i < 6; i++ {
+		realisticSpan(ss.Spans().AppendEmpty(), ptrace.SpanKindClient, pcommon.TraceID{}, fwdSpanID(uint64(i)), pcommon.SpanID{})
+	}
+	// One well-formed span, so the count is the unkeyed subset and not the batch.
+	realisticSpan(ss.Spans().AppendEmpty(), ptrace.SpanKindServer, fwdTraceID(1), fwdSpanID(99), pcommon.SpanID{})
+
+	local, err := r.Reshard(context.Background(), td)
+	if err != nil {
+		t.Fatalf("Reshard: %v", err)
+	}
+	if local.SpanCount() != 7 {
+		t.Errorf("kept %d spans locally, want 7", local.SpanCount())
+	}
+	st := r.Stats()
+	if st.SpansUnkeyed != 6 {
+		t.Errorf("SpansUnkeyed = %d, want 6", st.SpansUnkeyed)
+	}
+	if st.SpansLocal != 7 {
+		t.Errorf("SpansLocal = %d, want 7", st.SpansLocal)
+	}
+}

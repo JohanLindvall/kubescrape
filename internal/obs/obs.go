@@ -45,6 +45,12 @@ var (
 			"before its lines were exported, and no open fd survived a restart). These lines are lost.")
 	LogEnriched = Registry.CounterVec("kubescrape_log_enriched_total",
 		"Log records by the enrichment strategy that matched (json, logfmt, pattern, none).", "format")
+	LogEnrichTimeRejected = Registry.Counter("kubescrape_log_enrich_time_rejected_total",
+		"Timestamps parsed from a log line that did NOT replace the producer's own (the CRI/journal/event time) "+
+			"because they sat a whole zone offset away from it — a quarter-hour multiple between 15 minutes and 14 "+
+			"hours. A steady rate means a workload logs local wall-clock time with no zone, which enrichment must read "+
+			"as UTC; those records keep the accurate ingest time instead of being misdated by the offset. A "+
+			"legitimately old timestamp (an archive, a backfill) does not land on that grid and is kept.")
 	// The two lag gauges were named the other way round: the unqualified
 	// kubescrape_log_lag_bytes was the per-file MAXIMUM and the _total_bytes
 	// suffix carried the sum. Both are gauges, and _total is reserved for
@@ -277,7 +283,7 @@ var (
 // OTLP ingest (agent).
 var (
 	Ingested = Registry.CounterVec("kubescrape_ingest_resources_total",
-		"Distinct pushed identities (container id / pod uid, memoized per request) by enrichment outcome. enriched = an id resolved; peer_ip = no id, attributed by the connection's source address; peer_ip_rejected = that address resolved to the RECEIVER's own workload, so it was rewritten in flight (a proxy, a mesh sidecar, or an internal hop addressed to the application port) and nothing was attributed — anything above zero means peer-IP attribution cannot work on that path; unresolved = nothing identified the sender; split_capped = the push named more distinct objects than one payload may inflate into (maxSplitGroups), so the remainder shares the sender's resource unenriched rather than costing one full resource copy each.", "outcome")
+		"Distinct pushed identities (container id / pod uid, memoized per request) by enrichment outcome. enriched = an id resolved; peer_ip = no id, attributed by the connection's source address; peer_ip_rejected = that address resolved to the RECEIVER's own workload, so it was rewritten in flight (a proxy, a mesh sidecar, or an internal hop addressed to the application port) and nothing was attributed — anything above zero means peer-IP attribution cannot work on that path; unresolved = nothing identified the sender; split_capped = the push exceeded what one payload may inflate into — either its distinct-object count (maxSplitGroups) or the bytes those per-object resource copies would cost (maxSplitCopyBytes) — so the remainder shares the sender's resource unenriched rather than costing one full resource copy each.", "outcome")
 	ExportRejected = Registry.CounterVec("kubescrape_export_rejected_records_total",
 		"Records the collector REJECTED inside a payload it otherwise accepted (OTLP partial_success), by signal. "+
 			"The export succeeded, so every producer advanced its offset, cursor or position past them — these are "+
@@ -483,6 +489,8 @@ var (
 		"Kubernetes event batches dropped after a permanent collector rejection (the position advances past them).")
 	EventsDroppedRecords = Registry.Counter("kubescrape_events_dropped_records_total",
 		"Kubernetes event records lost with those batches (the magnitude of the loss the batch counter only signals).")
+	EventsOverflowDropped = Registry.Counter("kubescrape_events_overflow_dropped_total",
+		"Kubernetes events dropped UNEXPORTED because the retained batch hit its cap before anything could commit (a collector outage on a fresh install); the watch will not re-deliver them, so each is outright loss.")
 	EventWatchRestarts = Registry.Counter("kubescrape_event_watch_restarts_total",
 		"Event watch restarts (a closed stream, an error, or an expired resourceVersion).")
 	EventRelists = Registry.CounterVec("kubescrape_event_relists_total",

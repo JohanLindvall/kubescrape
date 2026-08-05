@@ -482,3 +482,84 @@ func TestRegistryCounterFuncVec(t *testing.T) {
 		t.Fatalf("latency = %v, want 10 — per-label delta state leaked between label values", v)
 	}
 }
+
+// Two registrations of one NAME must render ONE metric. The per-instance
+// Register* hooks are documented as supporting several instances (two
+// DynamicMetricSets in one process each publish the log-metrics drop family),
+// and a second series under the same name is not merely untidy: the Prometheus
+// arm renders both as const metrics with an identical name and label set,
+// Gather's duplicate check fails, and promhttp answers 500 to EVERY scrape —
+// the whole self-metrics scrape lost, in the one mode that carries them.
+func TestRegistryDeduplicatesMetricNames(t *testing.T) {
+	r := NewRegistry()
+	var a, b float64
+	r.CounterFunc("dup_total", "d", func() float64 { return a })
+	r.CounterFunc("dup_total", "d", func() float64 { return b })
+
+	countNamed := func(exp *capExporter, name string) int {
+		n := 0
+		for _, md := range exp.md {
+			rms := md.ResourceMetrics()
+			for i := 0; i < rms.Len(); i++ {
+				sms := rms.At(i).ScopeMetrics()
+				for j := 0; j < sms.Len(); j++ {
+					ms := sms.At(j).Metrics()
+					for k := 0; k < ms.Len(); k++ {
+						if ms.At(k).Name() == name {
+							n++
+						}
+					}
+				}
+			}
+		}
+		return n
+	}
+
+	a, b = 3, 4
+	exp := &capExporter{}
+	if err := r.Export(context.Background(), exp, pcommon.NewResource()); err != nil {
+		t.Fatal(err)
+	}
+	if got := countNamed(exp, "dup_total"); got != 1 {
+		t.Fatalf("dup_total rendered %d times in one payload, want 1", got)
+	}
+	// Reuse AGGREGATES: the series accumulates what is observed into it, and
+	// each func keeps its own delta bookkeeping.
+	m, ok := exp.find("dup_total")
+	if !ok {
+		t.Fatal("dup_total not exported")
+	}
+	// The LAST point of the stream is the live cumulative value (a fresh
+	// counter backfills zeros ahead of it).
+	dps := m.Sum().DataPoints()
+	if v := dps.At(dps.Len() - 1).DoubleValue(); v != 7 {
+		t.Fatalf("dup_total = %v, want 7 (3 + 4)", v)
+	}
+
+	// Two handles on one gauge name are two writers of one series, not two
+	// series — and a labeled counter's second registration shares it too.
+	r.Gauge("dup_gauge", "d").Set(1)
+	r.Gauge("dup_gauge", "d").Set(2)
+	exp2 := &capExporter{}
+	if err := r.Export(context.Background(), exp2, pcommon.NewResource()); err != nil {
+		t.Fatal(err)
+	}
+	if got := countNamed(exp2, "dup_gauge"); got != 1 {
+		t.Fatalf("dup_gauge rendered %d times, want 1", got)
+	}
+}
+
+// A name re-registered with a DIFFERENT shape cannot be served: the two cannot
+// both render, and handing one call site the other's series is exactly the
+// silent mismatch the dedupe exists to prevent. Registrations are code-driven
+// and run at startup, so this is a bug to crash on.
+func TestRegistryRefusesConflictingRedeclaration(t *testing.T) {
+	r := NewRegistry()
+	r.Counter("conflict_total", "d")
+	defer func() {
+		if recover() == nil {
+			t.Fatal("re-registering conflict_total as a gauge was accepted")
+		}
+	}()
+	r.Gauge("conflict_total", "d")
+}

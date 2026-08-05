@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"sync"
 	"testing"
 	"time"
 
@@ -187,5 +188,128 @@ func TestWarnOnceDoesNotStormAtTheCap(t *testing.T) {
 	// notice; a clearing table emits (maxWarnKeys+1) * 4.
 	if h.n > maxWarnKeys+1 {
 		t.Errorf("logged %d warnings for %d distinct keys over 4 cycles; the table is re-warning every cycle", h.n, maxWarnKeys+1)
+	}
+}
+
+// mutableTargets is a TargetSource whose list the test rewrites between
+// cycles, standing in for a monitor edit or deletion.
+type mutableTargets struct {
+	mu   sync.Mutex
+	list []kubemeta.ScrapeTarget
+}
+
+func (m *mutableTargets) NodeTargets(context.Context, string) ([]kubemeta.ScrapeTarget, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.list, nil
+}
+
+func (m *mutableTargets) set(list ...kubemeta.ScrapeTarget) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.list = list
+}
+
+// A SHORTENED interval must take effect at the new cadence, not at the due time
+// the OLD one scheduled. The schedule key is stable across the edit, so nothing
+// but this clamp pulls the stored time in: an endpoint edited from `interval:
+// 2h` to 30s — or a deleted monitor whose target falls back to -scrape-interval
+// — went unscraped for the whole residual 2h while every cycle re-committed the
+// stale time, recoverable only by restarting the agent.
+func TestShortenedIntervalPullsInTheDueTime(t *testing.T) {
+	srv := serveBody(t, "m 1\n")
+	exp := &captureExporter{}
+	slow := testTarget(srv.URL)
+	slow.Interval = "2h"
+	src := &mutableTargets{list: []kubemeta.ScrapeTarget{slow}}
+
+	s := New(Config{
+		Node: "n1", Interval: time.Minute, Timeout: 5 * time.Second,
+		Targets: src, Exporter: exp, StartTime: time.Now(),
+	})
+	s.cycle(context.Background()) // scraped once, next due in 2h
+
+	fast := slow
+	fast.Interval = "30s"
+	src.set(fast)
+	s.cycle(context.Background())
+
+	when, ok := s.dueAt(scheduleKey(fast))
+	if !ok {
+		t.Fatal("the target lost its schedule slot across the edit")
+	}
+	if d := time.Until(when); d > 31*time.Second {
+		t.Fatalf("next scrape in %v, want at most the new 30s interval", d)
+	}
+	if got := exp.points(); got != 1 {
+		t.Fatalf("points = %d, want 1: the clamp reschedules, it does not scrape early", got)
+	}
+}
+
+// Two targets can share a URL: the metadata service dedupes them only per POD,
+// so two hostNetwork pods on the node's IP with the same annotated port produce
+// identical URLs with different pod documents. Keying the schedule on the URL
+// alone gave them one slot, so the last one processed in a cycle overwrote the
+// other's due time and interval — one target inherited the other's cadence.
+func TestSameURLTargetsScheduleIndependently(t *testing.T) {
+	srv := serveBody(t, "m 1\n")
+	exp := &captureExporter{}
+
+	fast := testTarget(srv.URL)
+	fast.Pod.Name, fast.Pod.UID = "pod-a", "uid-a"
+	fast.Interval = "10ms"
+	slow := testTarget(srv.URL)
+	slow.Pod.Name, slow.Pod.UID = "pod-b", "uid-b"
+	slow.Source, slow.Monitor, slow.Interval = "servicemonitor", "monitoring/b", "2h"
+
+	s := New(Config{
+		Node: "n1", Interval: time.Minute, Timeout: 5 * time.Second,
+		Targets: staticTargets{fast, slow}, Exporter: exp, StartTime: time.Now(),
+	})
+	s.cycle(context.Background())
+	if got := exp.points(); got != 2 {
+		t.Fatalf("points = %d, want 2: both same-URL targets are scraped", got)
+	}
+	if scheduleKey(fast) == scheduleKey(slow) {
+		t.Fatal("two targets of different pods share one schedule key")
+	}
+
+	time.Sleep(15 * time.Millisecond) // past the fast target's own interval
+	s.cycle(context.Background())
+	if got := exp.points(); got != 3 {
+		t.Fatalf("points = %d, want 3: the 10ms target must not inherit the 2h one's schedule", got)
+	}
+	when, ok := s.dueAt(scheduleKey(slow))
+	if !ok {
+		t.Fatal("the 2h target lost its schedule slot")
+	}
+	if d := time.Until(when); d < time.Hour {
+		t.Fatalf("the 2h target is next due in %v: it was re-clocked onto the fast one", d)
+	}
+}
+
+// A non-positive Timeout is not "no timeout": targetTimeout takes the MINIMUM
+// of it and the intervals, so an unset (or -scrape-timeout=0) value produced an
+// already-expired context and every target plus both kubelet scrapes failed
+// with "context deadline exceeded" on every cycle — total metric loss with
+// nothing but per-scrape warn logs to name it.
+func TestNonPositiveTimeoutIsDefaulted(t *testing.T) {
+	for _, tmo := range []time.Duration{0, -5 * time.Second} {
+		srv := serveBody(t, "m 1\n")
+		exp := &captureExporter{}
+		s := New(Config{
+			Node: "n1", Interval: time.Minute, Timeout: tmo,
+			Targets: staticTargets{testTarget(srv.URL)}, Exporter: exp, StartTime: time.Now(),
+		})
+		if s.cfg.Timeout != defaultScrapeTimeout {
+			t.Fatalf("Timeout %v was not defaulted: %v", tmo, s.cfg.Timeout)
+		}
+		if got := s.targetTimeout(testTarget(srv.URL), time.Minute); got <= 0 {
+			t.Fatalf("effective timeout = %v for a configured %v", got, tmo)
+		}
+		s.cycle(context.Background())
+		if got := exp.points(); got != 1 {
+			t.Fatalf("points = %d with Timeout %v, want 1", got, tmo)
+		}
 	}
 }

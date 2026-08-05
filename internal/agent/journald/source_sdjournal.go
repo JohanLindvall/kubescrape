@@ -3,6 +3,7 @@ package journald
 import (
 	"context"
 	"fmt"
+	"syscall"
 	"time"
 
 	"github.com/coreos/go-systemd/v22/sdjournal"
@@ -78,8 +79,15 @@ func (s *sdSource) next(ctx context.Context) (rawEntry, bool, error) {
 			return rawEntry{}, false, err
 		}
 		if n == 0 {
-			// Caught up; block for new entries, then re-check.
-			s.j.Wait(waitTimeout)
+			// Caught up; block for new entries, then re-check. A failed Wait
+			// returns IMMEDIATELY — it only blocks on success — so ignoring
+			// its status spins this loop at full CPU with nothing surfaced
+			// while Next keeps returning 0 (realistically node-wide inotify
+			// watch/fd exhaustion; sd_journal_wait needs inotify descriptors).
+			// Surfacing it hands the failure to Run's close/reopen/backoff.
+			if err := waitStatusErr(s.j.Wait(waitTimeout)); err != nil {
+				return rawEntry{}, false, err
+			}
 			continue
 		}
 		cursor, err := s.j.GetCursor()
@@ -110,6 +118,17 @@ func (s *sdSource) next(ctx context.Context) (rawEntry, bool, error) {
 		}
 		return re, true, nil
 	}
+}
+
+// waitStatusErr classifies sd_journal_wait's return: non-negative statuses
+// (SD_JOURNAL_NOP/APPEND/INVALIDATE) mean the wait blocked and may have news,
+// negative is a failure spelled errno-style (go-systemd also returns -1 when
+// the libsystemd symbol lookup fails).
+func waitStatusErr(status int) error {
+	if status < 0 {
+		return fmt.Errorf("journal wait: %w", syscall.Errno(-status))
+	}
+	return nil
 }
 
 func (s *sdSource) close() error { return s.j.Close() }

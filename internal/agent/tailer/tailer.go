@@ -116,7 +116,8 @@ type Config struct {
 	// until tokens refill, leaving the backlog on disk (no loss; a rotation
 	// drain bypasses the limiter). RateDrop discards excess lines instead.
 	RateLimit float64
-	// RateBurst is the token bucket size (default 2x RateLimit).
+	// RateBurst is the token bucket size (default 2x RateLimit; floored at 1,
+	// the smallest bucket a whole-token grant can ever come out of).
 	RateBurst float64
 	// RateDrop discards lines over the limit instead of pausing the file.
 	RateDrop bool
@@ -266,6 +267,17 @@ func New(cfg Config) *Tailer {
 	}
 	if cfg.RateLimit > 0 && cfg.RateBurst <= 0 {
 		cfg.RateBurst = 2 * cfg.RateLimit
+	}
+	if cfg.RateLimit > 0 && cfg.RateBurst < 1 {
+		// allowLine grants only whole tokens (tokens >= 1) and caps the
+		// bucket at RateBurst, so a bucket that cannot HOLD one token never
+		// grants: a sub-0.5 rate limit (burst derived as 2x) wedged every
+		// file in pause mode — or discarded 100% in drop mode — and
+		// -check-config passed it. The floor keeps fractional RATES exact
+		// (refill still accrues at RateLimit/s); only the burst is lifted to
+		// the smallest grantable bucket. validateConfig cannot carry this
+		// (it lives in cmd/kubescrape-agent), so the constructor does.
+		cfg.RateBurst = 1
 	}
 	if cfg.MultilineTimeout <= 0 {
 		cfg.MultilineTimeout = time.Second
@@ -466,7 +478,13 @@ func (t *Tailer) sweep(ctx context.Context, all bool) {
 	cutoff := now.Add(-t.cfg.MultilineTimeout)
 	for path, f := range t.files {
 		if f.gone {
-			if _, err := os.Stat(f.path); err == nil {
+			// The regularity check matters as much as the stat: a FIFO taking
+			// the vanished path resurrects the file, and the readFile that
+			// follows would drain, see a new inode, and re-open it — an
+			// open(2) that blocks the sweep goroutine forever (openRegular
+			// guards the opens; this guard keeps the impostor on the gone
+			// path, where the old inode drains from our fd and settles).
+			if st, err := os.Stat(f.path); err == nil && st.Mode().IsRegular() {
 				// A listing raced a rename+recreate rotation: the path was
 				// momentarily absent but is alive again. Dropping now would
 				// discard the tailing state (and, on the next checkpoint
@@ -556,6 +574,12 @@ func (t *Tailer) sweep(ctx context.Context, all bool) {
 		if f.traces != nil {
 			_ = f.traces.FlushBefore(ctx, fc)
 		}
+		// An aged-out capped group can leave cap-dropped trailing lines'
+		// items orphaned in the FIFO (no emission remains to pop them); with
+		// the stages empty they would pin the watermark forever. Reconciled
+		// HERE, before the batch holding the group's entries flushes, so the
+		// recorded highs ride that flush's commit.
+		t.reconcileFifos(f)
 		if len(t.batch) >= t.cfg.BatchSize {
 			t.flush(ctx)
 		}

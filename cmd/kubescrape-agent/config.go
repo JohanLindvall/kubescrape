@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"path"
+	"reflect"
 	"sort"
 	"strings"
 	"sync"
@@ -90,6 +91,22 @@ type agentConfig struct {
 	// delivery to Mimir/Loki/Tempo's distinct OTLP endpoints expressible, with
 	// the disk buffer intact per signal.
 	Export *otlpexport.ExportConfig `json:"export,omitempty"`
+}
+
+// configSections lists the section keys agentConfig accepts, in declaration
+// order, DERIVED from the struct rather than spelled out: the -config flag's
+// help enumerated them by hand and had already drifted three sections behind
+// the type it describes.
+func configSections() string {
+	t := reflect.TypeOf(agentConfig{})
+	names := make([]string, 0, t.NumField())
+	for i := range t.NumField() {
+		name, _, _ := strings.Cut(t.Field(i).Tag.Get("json"), ",")
+		if name != "" && name != "-" {
+			names = append(names, name)
+		}
+	}
+	return strings.Join(names, ", ")
 }
 
 // loadAgentConfig reads and strictly parses the unified config file.
@@ -331,6 +348,30 @@ func compileTransforms(file string) (*transform.Program, error) {
 // run says exactly what a start would.
 func configWarnings(cfg agentConfig) []string {
 	var out []string
+
+	// Flag values their consumers NORMALISE rather than refuse — a nonsense
+	// duration must not CrashLoop a fleet, so promscrape.New defaults the
+	// timeout and tailer.New floors the burst. Normalising silently is the
+	// other half of the trap, though: the operator asked for one thing and gets
+	// another, with nothing anywhere saying so. Neither is a refusal, for the
+	// reason the consumers give: the effective behaviour is defined and
+	// harmless, and refusing would fail the whole DaemonSet over a bound.
+	if *scrapeTimeout <= 0 {
+		out = append(out, fmt.Sprintf(
+			"-scrape-timeout=%s does not mean 'no timeout': a non-positive budget expires a scrape's context before the request goes out, so the scraper substitutes its own default. Set a positive duration to choose one.",
+			*scrapeTimeout))
+	}
+	if *logsRateLimit > 0 {
+		burst := *logsRateBurst
+		if burst <= 0 {
+			burst = 2 * *logsRateLimit // -logs-rate-burst=0 derives it
+		}
+		if burst < 1 {
+			out = append(out, fmt.Sprintf(
+				"-logs-rate-limit=%g with -logs-rate-burst=%g resolves to a bucket of %g, below the one whole token a line costs: the tailer raises it to 1 (the refill rate is unchanged), because a bucket that cannot hold a token pauses every file forever — or, with -logs-rate-drop, discards every line.",
+				*logsRateLimit, *logsRateBurst, burst))
+		}
+	}
 
 	// traceSampling (per-SPAN) above tailSampling (per-TRACE). The two nest
 	// correctly for the PROBABILITY — both hash the trace id the same way, so a

@@ -5,6 +5,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"go.opentelemetry.io/collector/pdata/pcommon"
 )
@@ -253,5 +254,61 @@ func TestMaskPatternMissingFieldDropsLabel(t *testing.T) {
 	}
 	if got := maskPattern("404", "_xx"); got != "4xx" {
 		t.Fatalf("maskPattern present = %q, want 4xx", got)
+	}
+}
+
+// A LITERAL value cannot carry a transform: the constant arm wins, so
+// `class=status(_xx)` compiled to the constant label class="status" and
+// `path=api/x/y/` to path="api" — one merged series, wrong forever, from a
+// config whose only defect is a forgotten '$'. Refuse it, and keep the bare
+// form (which promotes to a key) working.
+func TestLiteralValueWithTransformRejected(t *testing.T) {
+	for _, spec := range []string{"class=status(_xx)", "path=api/x/y/"} {
+		_, err := parseLabelTemplate(spec, "")
+		if err == nil {
+			t.Fatalf("parseLabelTemplate(%q) compiled; want an error", spec)
+		}
+		if !strings.Contains(err.Error(), spec) {
+			t.Errorf("error must name the label spec: %v", err)
+		}
+	}
+	// The same shapes without a set= are bare keys that read themselves.
+	for spec, want := range map[string]string{"status(_xx)": "5xx", "status/0/_/": "5_3"} {
+		lt, err := parseLabelTemplate(spec, "")
+		if err != nil {
+			t.Fatalf("parseLabelTemplate(%q): %v", spec, err)
+		}
+		if got := lt.get(func(string) string { return "503" }); got != want {
+			t.Errorf("parseLabelTemplate(%q).get = %q, want %q", spec, got, want)
+		}
+	}
+	// And through the compiler, where an operator meets it.
+	if _, err := newTestSet([]Dynamic{{
+		Name: "x", Type: CounterType, Value: "1", Labels: []string{"class=status(_xx)"},
+	}}); err == nil {
+		t.Fatal("a literal value with a mask compiled into a rule")
+	}
+}
+
+// The mask steps by RUNE. Byte indexing split a multi-byte rune straddling a
+// boundary, and that value is hashed, retained and written to a pcommon.Map —
+// an invalid-UTF-8 string in the marshaled payload, which a strict protobuf
+// receiver rejects PERMANENTLY, dropping every metric sharing that resource.
+func TestMaskPatternIsRuneAware(t *testing.T) {
+	for _, c := range []struct{ value, pattern, want string }{
+		{"é50", "_xx", "éxx"},
+		{"日本語", "__x", "日本x"},
+		{"é50", "___", "é50"},
+		{"5", "_xx", "5xx"},
+		{"5", "___", "5__"},  // value exhausted: the mask stays literal
+		{"ok", "_é_", "oé_"}, // the literal 'é' consumes 'k'; value exhausted after it
+	} {
+		got := maskPattern(c.value, c.pattern)
+		if got != c.want {
+			t.Errorf("maskPattern(%q, %q) = %q, want %q", c.value, c.pattern, got, c.want)
+		}
+		if !utf8.ValidString(got) {
+			t.Errorf("maskPattern(%q, %q) = %q, which is not valid UTF-8", c.value, c.pattern, got)
+		}
 	}
 }

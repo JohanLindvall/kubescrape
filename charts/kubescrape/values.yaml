@@ -432,11 +432,13 @@ serviceGraph:
     # with a kubescrape pod. The dependable alternative is for senders to set a
     # resource-level container.id (every SDK's container detector does).
     peerIpFallback: false
-    # NetworkPolicy `from` selectors for the trace ports. EMPTY MEANS ANY POD IN
-    # THE CLUSTER MAY PUSH TRACES, with no credential — the same bargain every
-    # unauthenticated in-cluster OTLP collector makes. Setting it scopes the
-    # whole policy rule (health, metrics and the internal port included), so
-    # include whatever the kubelet's probes come from.
+    # NetworkPolicy `from` selectors for the trace ports, and for those ONLY.
+    # EMPTY MEANS ANY POD IN THE CLUSTER MAY PUSH TRACES, with no credential —
+    # the same bargain every unauthenticated in-cluster OTLP collector makes.
+    # The policy is three rules, so setting this leaves the other two alone:
+    # health and metrics stay reachable (the kubelet's probes come from the
+    # node, Prometheus from wherever it runs) and the internal shard port stays
+    # open to this tier's own pods, which the ring is not optional without.
     #   allowFrom:
     #     - namespaceSelector: {matchLabels: {shipping-traces: "true"}}
     allowFrom: []

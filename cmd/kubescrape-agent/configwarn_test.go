@@ -3,6 +3,7 @@ package main
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/JohanLindvall/kubescrape/internal/agent/tailbuffer"
 	"github.com/JohanLindvall/kubescrape/internal/agent/tailsample"
@@ -78,6 +79,47 @@ func TestEitherSamplerAloneIsSilent(t *testing.T) {
 	}
 	if got := warnText(agentConfig{TraceSampling: &tracesample.Config{Probability: 0.1}}); got != "" {
 		t.Fatalf("traceSampling alone warned: %q", got)
+	}
+}
+
+// A bound its consumer normalises rather than refuses is invisible otherwise:
+// the scraper substitutes its own timeout and the tailer lifts the token bucket
+// to the smallest one that can grant, so the process runs — doing something
+// other than what the flags read like, with nothing saying so. -check-config
+// and every start emit these from the same list.
+func TestNormalisedFlagValuesWarn(t *testing.T) {
+	defer func(to time.Duration, limit, burst float64) {
+		*scrapeTimeout, *logsRateLimit, *logsRateBurst = to, limit, burst
+	}(*scrapeTimeout, *logsRateLimit, *logsRateBurst)
+
+	for _, tc := range []struct {
+		name         string
+		timeout      time.Duration
+		limit, burst float64
+		want         string
+	}{
+		{"zero scrape timeout", 0, 0, 0, "-scrape-timeout=0s"},
+		{"negative scrape timeout", -time.Second, 0, 0, "-scrape-timeout=-1s"},
+		{"explicit burst below one token", 15 * time.Second, 100, 0.5, "-logs-rate-burst=0.5"},
+		{"derived burst below one token", 15 * time.Second, 0.2, 0, "bucket of 0.4"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			*scrapeTimeout, *logsRateLimit, *logsRateBurst = tc.timeout, tc.limit, tc.burst
+			if got := warnText(agentConfig{}); !strings.Contains(got, tc.want) {
+				t.Fatalf("warning %q does not name %s", got, tc.want)
+			}
+		})
+	}
+
+	// The usable shapes stay silent, or the warning becomes noise: the
+	// defaults, and a rate whose derived bucket already holds a token.
+	*scrapeTimeout, *logsRateLimit, *logsRateBurst = 15*time.Second, 0, 0
+	if got := warnText(agentConfig{}); got != "" {
+		t.Fatalf("the defaults warned: %q", got)
+	}
+	*logsRateLimit, *logsRateBurst = 100, 0
+	if got := warnText(agentConfig{}); got != "" {
+		t.Fatalf("a usable rate limit warned: %q", got)
 	}
 }
 

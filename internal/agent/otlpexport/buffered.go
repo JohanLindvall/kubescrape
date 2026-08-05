@@ -111,6 +111,15 @@ type Buffer struct {
 	rd   *diskqueue.Reader[[]byte]
 	dir  string
 	opts diskqueue.Options
+	// closed latches a DELIBERATE Close, which is otherwise indistinguishable
+	// from a dead handle — both answer ErrClosed. Without the latch a straggler
+	// enqueue after shutdown sends recover down the reopen path: a fresh
+	// diskqueue with its own flock and its own preallocated segment, which
+	// nothing will ever close, while the enqueue that triggered it still fails.
+	// It is reachable because the agent joins its producers on a BUDGET, so one
+	// wedged against a dead collector can outlive the join and reach the
+	// deferred Close.
+	closed bool
 	// kind and log let recover() report what ITS reopen cost. Set by
 	// NewBuffered, which is where the signal names live.
 	kind string
@@ -147,6 +156,15 @@ func (b *Buffer) handles() (*diskqueue.Queue[[]byte], *diskqueue.Reader[[]byte])
 	b.mu.RLock()
 	defer b.mu.RUnlock()
 	return b.q, b.rd
+}
+
+// retired reports that the handle the caller was using is no longer this
+// buffer's — recover replaced it, or Close retired it for good. Taking the read
+// lock waits out a recover that is mid-swap, so the answer is never "not yet".
+func (b *Buffer) retired(q *diskqueue.Queue[[]byte]) bool {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	return b.closed || b.q != q
 }
 
 // add durably enqueues one payload.
@@ -187,6 +205,7 @@ func (b *Buffer) rewindQ() {
 func (b *Buffer) Close() error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	b.closed = true // a close on purpose is not a handle to recover (see Buffer.closed)
 	return b.q.Close()
 }
 
@@ -199,7 +218,7 @@ func (b *Buffer) Close() error {
 func (b *Buffer) recover(prev *diskqueue.Queue[[]byte]) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	if b.q != prev {
+	if b.closed || b.q != prev {
 		return
 	}
 	_ = b.q.Close()
@@ -581,8 +600,18 @@ func (s *sink[T]) drainLoop(ctx context.Context, untilEmpty bool) {
 			// dead handle (latched I/O failure, or a close under us) is
 			// replaced per diskqueue's close-and-reopen contract.
 			lost := errors.Is(err, diskqueue.ErrCorrupt)
-			obs.BufferReadErrors.WithLabelValues(s.kind, boolLabel(lost)).Inc()
-			s.log.Error("disk buffer read failed", "signal", s.kind, "data_lost", lost, "error", err)
+			// A read on a handle this process RETIRED — the recover swap, or a
+			// deliberate Close — is an expected transition of our own making,
+			// and counting it makes a self-inflicted swap indistinguishable
+			// from a disk that is failing. Everything else is a read failure,
+			// including a reopen that did not take (the handle is then still
+			// ours and still dead).
+			if errors.Is(err, diskqueue.ErrClosed) && s.buf.retired(q) {
+				s.log.Debug("disk buffer handle retired under the drain", "signal", s.kind, "error", err)
+			} else {
+				obs.BufferReadErrors.WithLabelValues(s.kind, boolLabel(lost)).Inc()
+				s.log.Error("disk buffer read failed", "signal", s.kind, "data_lost", lost, "error", err)
+			}
 			if queueDead(err) {
 				s.buf.recover(q)
 			}
@@ -829,10 +858,15 @@ func (s *sink[T]) trySend(ctx context.Context, v T) sendResult {
 			return sendStuck
 		}
 		s.log.Warn("buffered export failed, retrying", "signal", s.kind, "error", err, "backoff", s.cur)
+		// NewTimer+Stop, not time.After (otlpexport.Retry carries the whole
+		// argument): a cancelled wait must not leave the timer live until it
+		// fires, and at SIGTERM every draining sink abandons its wait at once.
+		t := time.NewTimer(s.cur)
 		select {
 		case <-ctx.Done():
+			t.Stop()
 			return sendCancelled
-		case <-time.After(s.cur):
+		case <-t.C:
 		}
 		if s.cur *= 2; s.cur > 30*time.Second {
 			s.cur = 30 * time.Second

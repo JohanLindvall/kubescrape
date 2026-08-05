@@ -44,9 +44,8 @@ type Program struct {
 	logs    *starlarkProgram
 	metrics *starlarkProgram
 	traces  *starlarkProgram
-	// Hash identifies the compiled config (content hash of the file), exposed
-	// on /debug/transforms and as a gauge so per-node convergence after a
-	// reload is observable.
+	// Hash identifies the compiled config (content hash of the file), served on
+	// /debug/transforms so per-node convergence after a reload is observable.
 	Hash string
 }
 

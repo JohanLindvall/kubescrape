@@ -23,6 +23,16 @@ import (
 type Registry struct {
 	mu     sync.Mutex
 	series []*series
+	// byName is the one series per metric NAME. A registration that repeats a
+	// name reuses it rather than appending a second series, because a second
+	// series renders a second Metric under the same name in one ScopeMetrics —
+	// which the Prometheus arm cannot express at all: registryCollector emits
+	// both as const metrics with an identical name and label set, Gather's
+	// duplicate check fails, and promhttp answers 500 to EVERY scrape, i.e. the
+	// whole self-metrics scrape is lost. Repeat registrations are the advertised
+	// shape for the per-instance Register* hooks (two DynamicMetricSets in one
+	// process each publish the log-metrics drop family).
+	byName map[string]*series
 	funcs  []*gaugeFunc
 	// drops are this registry's own refusal counters. They are not published:
 	// a registry has no cardinality cap and its label sets come from code, so
@@ -68,14 +78,36 @@ type gaugeFunc struct {
 // NewRegistry creates an empty registry.
 func NewRegistry() *Registry { return &Registry{} }
 
+// add returns the series for name, creating it on first registration and
+// REUSING it afterwards (see Registry.byName). Reuse is what makes a repeated
+// registration aggregate rather than duplicate: the series ACCUMULATES what is
+// observed into it, so two CounterFuncs of one name sum (each keeps its own
+// delta bookkeeping in its gaugeFunc), and two handles on a gauge are two
+// writers of one value, exactly as two handles on the same registered metric
+// always were.
+//
+// A repeat under a name already registered with a DIFFERENT shape panics: the
+// two cannot both be rendered, registrations are code-driven and run at
+// startup, and silently serving one shape to a call site that asked for the
+// other is the failure this dedupe exists to prevent.
 func (r *Registry) add(name, desc string, kind seriesKind, action gaugeAction, buckets []float64) *series {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if s, ok := r.byName[name]; ok {
+		if s.kind != kind || s.action != action || !s.sameBuckets(kind, buckets) {
+			panic("metrics: " + name + " re-registered with a different type, action or buckets")
+		}
+		return s
+	}
 	s := newSeries(seriesSpec{
 		name: name, desc: desc, kind: kind, action: action,
 		expiration: registryExpiration, buckets: buckets, drops: &r.drops,
 	})
-	r.mu.Lock()
+	if r.byName == nil {
+		r.byName = make(map[string]*series)
+	}
+	r.byName[name] = s
 	r.series = append(r.series, s)
-	r.mu.Unlock()
 	return s
 }
 

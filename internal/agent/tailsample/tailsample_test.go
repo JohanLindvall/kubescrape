@@ -693,3 +693,18 @@ func TestErrPolicyPrefixesAndWraps(t *testing.T) {
 		t.Errorf("errors.Is cannot reach the wrapped cause through errPolicy: %v", err)
 	}
 }
+
+// A rateAllocation an operator wrote to total exactly 100% must be accepted,
+// including when float summation lands a hair over (compositeShares tolerates
+// a 1e-9 epsilon). A genuine over-allocation (60+60) is still refused by the
+// "rateAllocation over 100%" case above.
+func TestRateAllocationSummingToWholeBudgetIsAccepted(t *testing.T) {
+	cfg := Config{Policies: []PolicyConfig{compositeCfg(10, nil,
+		[]RateAllocationConfig{
+			{Policy: "a", Percent: 33.34}, {Policy: "b", Percent: 33.33}, {Policy: "c", Percent: 33.33},
+		},
+		pol("a", TypeAlwaysSample), pol("b", TypeAlwaysSample), pol("c", TypeAlwaysSample))}}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("a rateAllocation totalling 100%% must compile: %v", err)
+	}
+}

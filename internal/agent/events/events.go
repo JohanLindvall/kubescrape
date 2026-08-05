@@ -247,7 +247,10 @@ func (r *Reader) Run(ctx context.Context) {
 	}
 	// Final flush on a DETACHED context: ctx is already cancelled, and the
 	// last batch must still reach the collector before the position is
-	// written (the tailer's shutdown flush does the same).
+	// written (the tailer's shutdown flush does the same). WithoutCancel, not
+	// a fresh Background, so any context VALUE the export chain rides on (the
+	// otlpexport.Own durability marker) survives the detach — the repo-wide
+	// shutdown-context invariant.
 	//
 	// The budget must stay BELOW the lease renew deadline the caller allows
 	// this work to stop within. It was 15s against leader.DefaultRenewDeadline
@@ -258,7 +261,7 @@ func (r *Reader) Run(ctx context.Context) {
 	// co-located -azure-diagnostics consumer with it, contradicting the leader
 	// package's own contract that losing the lease must not take the process
 	// down.
-	fctx, cancel := context.WithTimeout(context.Background(), r.shutdownBudget())
+	fctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), r.shutdownBudget())
 	defer cancel()
 	if err := r.flush(fctx); err != nil {
 		r.log.Warn("final event flush failed", "error", err)

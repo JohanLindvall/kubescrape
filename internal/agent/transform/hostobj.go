@@ -23,9 +23,12 @@ import (
 )
 
 // dropMarker flags an element for post-run pruning. Logs and spans carry it
-// as a record/span attribute; metrics carry it in the pdata-internal Metadata
-// map (never serialized) so a drop-then-rename cannot un-drop it. Either way
-// the marker never survives into the export.
+// as a record/span attribute; metrics carry it in the pdata Metadata map,
+// which keeps it OFF the data-point attributes a rename could touch, so a
+// drop-then-rename cannot un-drop it. The marker never survives into the
+// export regardless — a marked metric is pruned whole and a script error
+// discards the transform's whole working copy — so it never reaches the wire
+// (the Metadata field IS an OTLP wire field, unlike an earlier claim here).
 const dropMarker = "__kubescrape_drop__"
 
 // --- attribute map view ---
@@ -384,10 +387,12 @@ func (m *metricObj) Attr(name string) (starlark.Value, error) {
 	case "datapoints":
 		return &datapoints{m: m.m}, nil
 	case "drop":
-		// Mark in the pdata-internal Metadata map (never serialized to OTLP),
-		// NOT the name — a script doing `m.drop(); m.name = "x"` would
-		// otherwise overwrite a name-based marker and silently un-drop the
-		// metric. Logs/spans mark in an attribute, so drop() is already
+		// Mark in the pdata Metadata map, NOT the name — a script doing
+		// `m.drop(); m.name = "x"` would otherwise overwrite a name-based
+		// marker and silently un-drop the metric. (Metadata is a real OTLP
+		// field, but a marked metric is pruned whole before export, so the
+		// marker never reaches the wire.) Logs/spans mark in an attribute, so
+		// drop() is already
 		// order-independent for them; this makes it so for metrics too.
 		return dropFn{mark: func() { m.m.Metadata().PutBool(dropMarker, true) }}, nil
 	}

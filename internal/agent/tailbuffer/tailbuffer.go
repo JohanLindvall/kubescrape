@@ -258,8 +258,12 @@ func (c *Config) Validate() error {
 	}
 	if !c.Enabled() {
 		// Bounds without policies: the section reads as configured and samples
-		// nothing, which is indistinguishable from the feature being off.
-		if c.DecisionWait != "" || c.MaxTraces != 0 || c.MaxSpans != 0 || c.MaxSpansPerTrace != 0 {
+		// nothing, which is indistinguishable from the feature being off. The
+		// cache knobs count too — `decisionCacheSize: 50000` with no policies
+		// is the same misconfiguration as `maxTraces: 5` with none, and only
+		// the latter used to be caught.
+		if c.DecisionWait != "" || c.MaxTraces != 0 || c.MaxSpans != 0 || c.MaxSpansPerTrace != 0 ||
+			c.DecisionCacheSize != 0 || c.DecisionCacheTTL != "" {
 			return errors.New("tailSampling has buffer settings but no policies (an evaluator with no policies drops every trace, so the settings would silently sample nothing)")
 		}
 		return nil

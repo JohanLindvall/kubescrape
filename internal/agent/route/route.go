@@ -66,8 +66,18 @@ func joinExportErrs(errs []error) error {
 			return &partialFailure{errs: failed}
 		}
 	}
-	return errors.Join(failed...)
+	return &allPermanent{errs: failed}
 }
+
+// allPermanent is the every-destination-rejected error. It FLATTENS its message
+// like partialFailure — this string is handed to http.Error and status.Error,
+// where a newline is a malformed body/status — but, unlike partialFailure, it
+// KEEPS Unwrap: every leaf is permanent, so IsPermanent must still read that
+// verdict through them (errors.Join gave the traversal but a multi-line Error).
+type allPermanent struct{ errs []error }
+
+func (e *allPermanent) Error() string   { return flattenErrs("all", e.errs) }
+func (e *allPermanent) Unwrap() []error { return e.errs }
 
 // partialFailure reports a mixed multi-destination failure without exposing its
 // leaves to a CLASSIFIER, so no one destination's permanent rejection is read as
@@ -85,11 +95,19 @@ func joinExportErrs(errs []error) error {
 type partialFailure struct{ errs []error }
 
 func (e *partialFailure) Error() string {
+	return flattenErrs(strconv.Itoa(len(e.errs))+" of the payload's", e.errs)
+}
+
+// flattenErrs renders a multi-destination failure on ONE line: the string is
+// written into http.Error / status.Error, where a newline is a malformed body
+// or an unreadable gRPC status. count names the scope ("all", "N of the
+// payload's"). Shared by partialFailure and allPermanent.
+func flattenErrs(count string, errs []error) string {
 	var sb strings.Builder
 	sb.WriteString("export failed for ")
-	sb.WriteString(strconv.Itoa(len(e.errs)))
-	sb.WriteString(" of the payload's destinations: ")
-	for i, err := range e.errs {
+	sb.WriteString(count)
+	sb.WriteString(" destinations: ")
+	for i, err := range errs {
 		if i > 0 {
 			sb.WriteString("; ")
 		}

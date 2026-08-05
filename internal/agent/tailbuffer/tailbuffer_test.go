@@ -782,6 +782,10 @@ func TestConfigValidation(t *testing.T) {
 		{"per-trace above the ceiling", Config{Config: alwaysCfg(), MaxSpans: 10, MaxSpansPerTrace: 100}, "could never fit"},
 		{"bad cache ttl", Config{Config: alwaysCfg(), DecisionCacheTTL: "always"}, "decisionCacheTTL"},
 		{"knobs without policies", Config{DecisionWait: "5s"}, "no policies"},
+		// The cache knobs are settings too: cache-only with no policies is the
+		// same silently-samples-nothing misconfiguration as the bound knobs.
+		{"cache size without policies", Config{DecisionCacheSize: 50000}, "no policies"},
+		{"cache ttl without policies", Config{DecisionCacheTTL: "1m"}, "no policies"},
 		{"a bad policy", Config{Config: tailsample.Config{Policies: []tailsample.PolicyConfig{
 			{Name: "x", Type: "nonsense"}}}}, "unknown type"},
 	}

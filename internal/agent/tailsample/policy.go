@@ -753,7 +753,11 @@ func compositeShares(where string, cfg *CompositeConfig, subs []namedPolicy) (ma
 		shares[ra.Policy] = ra.Percent
 		total += ra.Percent
 	}
-	if total > 100 {
+	// A tiny epsilon over 100 is float summation noise, not an over-allocation:
+	// three shares an operator wrote to total 100 (e.g. 33.33+33.33+33.34) sum
+	// to 100.00000000000001 in float64, and refusing that at startup is a
+	// confusing rejection of an arithmetically-correct config.
+	if total > 100+1e-9 {
 		return nil, errPolicy(where, "composite.rateAllocation sums to %v%% (more than the whole budget)", total)
 	}
 	rest := len(subs) - len(shares)

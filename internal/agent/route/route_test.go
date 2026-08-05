@@ -246,3 +246,25 @@ func TestPartialFailureFlattensNestedNewlines(t *testing.T) {
 		t.Errorf("a newline inside one destination's error survived: %q", msg)
 	}
 }
+
+// The all-permanent multi-destination error must (a) still classify permanent
+// via its leaves — IsPermanent traverses Unwrap — and (b) render on ONE line,
+// since the string reaches http.Error/status.Error where a newline is a
+// malformed body or an unreadable gRPC status (it used to be errors.Join,
+// which separates with newlines).
+func TestAllPermanentFlattensAndStaysPermanent(t *testing.T) {
+	err := &allPermanent{errs: []error{
+		&otlpexport.HTTPStatusError{Code: 400, Body: "bad payload"},
+		&otlpexport.HTTPStatusError{Code: 413, Body: "too big"},
+	}}
+	if !otlpexport.IsPermanent(err) {
+		t.Fatal("every leaf is permanent; IsPermanent must read that through Unwrap")
+	}
+	if strings.ContainsAny(err.Error(), "\n") {
+		t.Fatalf("all-permanent error message contains a newline: %q", err.Error())
+	}
+	var hse *otlpexport.HTTPStatusError
+	if !errors.As(err, &hse) {
+		t.Fatal("errors.As must still reach an HTTPStatusError leaf")
+	}
+}

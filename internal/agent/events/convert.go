@@ -8,7 +8,6 @@ package events
 
 import (
 	"context"
-	"strconv"
 	"strings"
 	"time"
 
@@ -243,7 +242,11 @@ func putAttrs(dst pcommon.Map, src map[string]any) {
 		case bool:
 			dst.PutBool(k, t)
 		default:
-			dst.PutStr(k, strconv.Quote(k)) // unreachable: eventAttrs builds only the three kinds above
+			// Unreachable: eventAttrs builds only the three kinds above. If a
+			// fourth is ever added, DROP it rather than emit a wrong value —
+			// this arm used to write the KEY as the value (strconv.Quote(k)),
+			// which is plausible-looking garbage; a missing attribute is the
+			// honest failure, and the new type needs its own case here.
 		}
 	}
 }

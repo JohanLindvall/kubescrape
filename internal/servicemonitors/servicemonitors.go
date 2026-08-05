@@ -31,6 +31,8 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/intstr"
+
+	"github.com/JohanLindvall/kubescrape/pkg/kubemeta"
 )
 
 // GVR is the ServiceMonitor resource.
@@ -138,11 +140,11 @@ func (e *Endpoint) namespaceSecretRefs(ns string) {
 // RelabelRule is the keep/drop subset of a Prometheus relabel_config,
 // evaluated per sample against sourceLabels joined by ";" (Prometheus
 // semantics; "__name__" refers to the metric name).
-type RelabelRule struct {
-	Action       string   `json:"action"`
-	SourceLabels []string `json:"sourceLabels"`
-	Regex        string   `json:"regex"`
-}
+//
+// It IS kubemeta.RelabelRule — the wire type that rides on ScrapeTargets and
+// that the agent compiles — not a structurally-identical local copy for
+// internal/scrape to bridge field-by-field: one type cannot drift from itself.
+type RelabelRule = kubemeta.RelabelRule
 
 // endpointSpec is the shared endpoint shape of ServiceMonitor endpoints and
 // PodMonitor podMetricsEndpoints.
@@ -221,11 +223,8 @@ type endpointSpec struct {
 	Params                   json.RawMessage `json:"params"`
 	HonorLabels              *bool           `json:"honorLabels"`
 	Relabelings              json.RawMessage `json:"relabelings"`
-	BearerTokenSecret        *struct {
-		Name string `json:"name"`
-		Key  string `json:"key"`
-	} `json:"bearerTokenSecret"`
-	MetricRelabelings []struct {
+	BearerTokenSecret        *secretRef      `json:"bearerTokenSecret"`
+	MetricRelabelings        []struct {
 		Action       string   `json:"action"`
 		SourceLabels []string `json:"sourceLabels"`
 		Regex        string   `json:"regex"`
@@ -348,9 +347,9 @@ func (ep endpointSpec) toEndpoint() Endpoint {
 		out.AuthType = ep.Authorization.Type
 		out.AuthCredentials = ep.Authorization.Credentials.ref()
 	}
-	if ep.BearerTokenSecret != nil && ep.BearerTokenSecret.Name != "" && ep.BearerTokenSecret.Key != "" {
-		out.BearerSecret = ep.BearerTokenSecret.Name + "/" + ep.BearerTokenSecret.Key
-	}
+	// secretRef.ref owns the incomplete-ref-is-empty rule; bearerTokenSecret
+	// used to re-spell it inline beside six fields that already went through it.
+	out.BearerSecret = ep.BearerTokenSecret.ref()
 	for _, r := range ep.MetricRelabelings {
 		if !isKeepDrop(r.Action) {
 			continue
@@ -407,13 +406,28 @@ type Monitor struct {
 // ServiceNamespaces returns the namespaces the monitor selects Services in;
 // nil means all.
 func (m *Monitor) ServiceNamespaces() []string {
-	if m.NamespaceAny {
+	return namespaceSelector{Any: m.NamespaceAny, MatchNames: m.Namespaces}.resolve(m.Namespace)
+}
+
+// namespaceSelector is the CRD's namespaceSelector clause, shared verbatim by
+// the ServiceMonitor and PodMonitor specs (it was an anonymous struct in each).
+type namespaceSelector struct {
+	Any        bool     `json:"any"`
+	MatchNames []string `json:"matchNames"`
+}
+
+// resolve returns the namespaces the selector covers for a monitor living in
+// ownNS: nil for "all namespaces", the explicit matchNames when given, else
+// the monitor's own namespace (the CRD default). ServiceNamespaces and
+// PodNamespaces both answer through this — the rule existed twice, verbatim.
+func (s namespaceSelector) resolve(ownNS string) []string {
+	if s.Any {
 		return nil
 	}
-	if len(m.Namespaces) > 0 {
-		return m.Namespaces
+	if len(s.MatchNames) > 0 {
+		return s.MatchNames
 	}
-	return []string{m.Namespace}
+	return []string{ownNS}
 }
 
 // specLimits are the monitor-LEVEL guard rails, shared by ServiceMonitor and
@@ -470,37 +484,75 @@ func (s specLimits) ignored() []string {
 // smSpec mirrors the ServiceMonitor spec fields we interpret.
 type smSpec struct {
 	Selector          metav1.LabelSelector `json:"selector"`
-	NamespaceSelector struct {
-		Any        bool     `json:"any"`
-		MatchNames []string `json:"matchNames"`
-	} `json:"namespaceSelector"`
-	Endpoints  []endpointSpec `json:"endpoints"`
-	specLimits `json:",inline"`
+	NamespaceSelector namespaceSelector    `json:"namespaceSelector"`
+	Endpoints         []endpointSpec       `json:"endpoints"`
+	specLimits        `json:",inline"`
 }
 
-// Parse converts an unstructured ServiceMonitor.
-func Parse(u *unstructured.Unstructured) (*Monitor, error) {
+func (s *smSpec) labelSelector() *metav1.LabelSelector { return &s.Selector }
+func (s *smSpec) nsSelector() namespaceSelector        { return s.NamespaceSelector }
+func (s *smSpec) endpointSpecs() []endpointSpec        { return s.Endpoints }
+func (s *smSpec) monitorIgnored() []string             { return s.ignored() }
+
+// monitorSpec is what the shared parse skeleton needs from a kind's decoded
+// spec shape: its label selector, its namespace selector, its endpoint list
+// (the two kinds spell the JSON key differently) and its monitor-level
+// ignored-fields report. A new monitor arm implements these four accessors
+// and gets the WHOLE skeleton — including the per-endpoint security step in
+// parseMonitorSpec — for free.
+type monitorSpec interface {
+	labelSelector() *metav1.LabelSelector
+	nsSelector() namespaceSelector
+	endpointSpecs() []endpointSpec
+	monitorIgnored() []string
+}
+
+// monitorBase is the kind-independent half a parse produces.
+type monitorBase struct {
+	Namespace    string
+	Name         string
+	Selector     labels.Selector
+	NamespaceAny bool
+	Namespaces   []string
+	Endpoints    []Endpoint
+}
+
+// parseMonitorSpec is the ONE parse skeleton of both monitor kinds: the
+// no-spec error, the unstructured decode into the kind's spec shape, the
+// selector conversion, and — per endpoint — the monitor-level ignored-fields
+// append plus namespaceSecretRefs with the MONITOR's namespace.
+//
+// The last step is a security boundary, which is why it lives here rather than
+// in each kind's parser: namespacing every secret ref with the monitor's own
+// namespace is what confines a monitor to its own secrets and so bounds what
+// /v1/scrape-auth will serve (see Endpoint.secretRefs). The two hand-written
+// copies of this loop agreed; a THIRD arm that forgot the call would have
+// compiled fine and shipped an unnamespaced — unmatchable, so silently
+// unauthenticated — credential ref. An arm cannot skip it now without also
+// rewriting the decode, the selector conversion and the error strings.
+func parseMonitorSpec(u *unstructured.Unstructured, kind string, spec monitorSpec) (monitorBase, error) {
+	var b monitorBase
 	specRaw, ok := u.Object["spec"].(map[string]any)
 	if !ok {
-		return nil, fmt.Errorf("servicemonitor %s/%s: no spec", u.GetNamespace(), u.GetName())
+		return b, fmt.Errorf("%s %s/%s: no spec", kind, u.GetNamespace(), u.GetName())
 	}
-	var spec smSpec
-	if err := runtime.DefaultUnstructuredConverter.FromUnstructured(specRaw, &spec); err != nil {
-		return nil, fmt.Errorf("servicemonitor %s/%s: %w", u.GetNamespace(), u.GetName(), err)
+	if err := runtime.DefaultUnstructuredConverter.FromUnstructured(specRaw, spec); err != nil {
+		return b, fmt.Errorf("%s %s/%s: %w", kind, u.GetNamespace(), u.GetName(), err)
 	}
-	sel, err := metav1.LabelSelectorAsSelector(&spec.Selector)
+	sel, err := metav1.LabelSelectorAsSelector(spec.labelSelector())
 	if err != nil {
-		return nil, fmt.Errorf("servicemonitor %s/%s selector: %w", u.GetNamespace(), u.GetName(), err)
+		return b, fmt.Errorf("%s %s/%s selector: %w", kind, u.GetNamespace(), u.GetName(), err)
 	}
-	m := &Monitor{
+	nss := spec.nsSelector()
+	b = monitorBase{
 		Namespace:    u.GetNamespace(),
 		Name:         u.GetName(),
 		Selector:     sel,
-		NamespaceAny: spec.NamespaceSelector.Any,
-		Namespaces:   spec.NamespaceSelector.MatchNames,
+		NamespaceAny: nss.Any,
+		Namespaces:   nss.MatchNames,
 	}
-	specIgnored := spec.ignored()
-	for _, ep := range spec.Endpoints {
+	specIgnored := spec.monitorIgnored()
+	for _, ep := range spec.endpointSpecs() {
 		e := ep.toEndpoint()
 		// Monitor-level ignored fields ride on every endpoint; IgnoredFields
 		// dedupes across endpoints, so they are reported exactly once.
@@ -508,12 +560,28 @@ func Parse(u *unstructured.Unstructured) (*Monitor, error) {
 		// Every secret reference is namespaced with the MONITOR's namespace: a
 		// monitor may only name secrets in its own namespace, which is what
 		// bounds what /v1/scrape-auth will serve. The FIELD LIST lives on
-		// Endpoint (secretRefs), shared with the PodMonitor parser and with
+		// Endpoint (secretRefs), shared with both parsers and with
 		// AuthSecretRefs — see its doc for why it must be exactly one list.
-		e.namespaceSecretRefs(m.Namespace)
-		m.Endpoints = append(m.Endpoints, e)
+		e.namespaceSecretRefs(b.Namespace)
+		b.Endpoints = append(b.Endpoints, e)
 	}
-	return m, nil
+	return b, nil
+}
+
+// Parse converts an unstructured ServiceMonitor.
+func Parse(u *unstructured.Unstructured) (*Monitor, error) {
+	b, err := parseMonitorSpec(u, "servicemonitor", &smSpec{})
+	if err != nil {
+		return nil, err
+	}
+	return &Monitor{
+		Namespace:    b.Namespace,
+		Name:         b.Name,
+		Selector:     b.Selector,
+		NamespaceAny: b.NamespaceAny,
+		Namespaces:   b.Namespaces,
+		Endpoints:    b.Endpoints,
+	}, nil
 }
 
 // Index is the thread-safe monitor store fed by the informer.
@@ -531,20 +599,36 @@ func NewIndex() *Index {
 	}
 }
 
-// Upsert parses and stores a monitor. A monitor UPDATED to an unparseable spec
-// is removed rather than kept: silently serving the previous version forever
-// would diverge from what the manifest declares (prometheus-operator likewise
-// generates no config for an invalid monitor).
-func (ix *Index) Upsert(u *unstructured.Unstructured) error {
-	m, err := Parse(u)
-	if err != nil {
-		ix.Delete(u.GetNamespace(), u.GetName())
-		return err
-	}
+// upsertMonitor is the ONE invalid-update-removes policy behind Upsert and
+// UpsertPodMonitor: a monitor UPDATED to an unparseable spec is removed rather
+// than kept, because silently serving the previous version forever would
+// diverge from what the manifest declares (prometheus-operator likewise
+// generates no config for an invalid monitor) — and the stale endpoints carry
+// the secret refs AuthSecretRefs allowlists, so keeping them would leave
+// /v1/scrape-auth willing to serve a Secret the live spec no longer names.
+//
+// The parse already happened, outside the lock; one write-lock hold then
+// either stores the monitor or deletes the key. The two arms used different
+// lock choreography for the same observable behavior (the ServiceMonitor arm
+// re-locked via Delete on the error path); the single-hold form is kept for
+// both — each branch is still exactly one atomic map transition, so a
+// concurrent reader sees the same states as before.
+func upsertMonitor[M any](ix *Index, monitors map[string]*M, key string, m *M, err error) error {
 	ix.mu.Lock()
 	defer ix.mu.Unlock()
-	ix.monitors[m.Namespace+"/"+m.Name] = m
+	if err != nil {
+		delete(monitors, key)
+		return err
+	}
+	monitors[key] = m
 	return nil
+}
+
+// Upsert parses and stores a ServiceMonitor (see upsertMonitor for the
+// invalid-update-removes policy).
+func (ix *Index) Upsert(u *unstructured.Unstructured) error {
+	m, err := Parse(u)
+	return upsertMonitor(ix, ix.monitors, u.GetNamespace()+"/"+u.GetName(), m, err)
 }
 
 // Delete removes a monitor.
@@ -554,23 +638,35 @@ func (ix *Index) Delete(namespace, name string) {
 	delete(ix.monitors, namespace+"/"+name)
 }
 
+// sortedMonitors collects a monitor map's values ordered by (namespace, name):
+// map iteration order must not decide which monitor a URL-deduped target is
+// attributed to. The caller holds at least the read lock. It sorts on the two
+// FIELDS, never on the "ns/name" map key: '/' (0x2F) sorts after '-' (0x2D),
+// so the composite string would order "a-x/…" before "a/…" while the field
+// sort orders them the other way.
+func sortedMonitors[M any](monitors map[string]*M, key func(*M) (namespace, name string)) []*M {
+	out := make([]*M, 0, len(monitors))
+	for _, m := range monitors {
+		out = append(out, m)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		ni, nmi := key(out[i])
+		nj, nmj := key(out[j])
+		if ni != nj {
+			return ni < nj
+		}
+		return nmi < nmj
+	})
+	return out
+}
+
 // All returns the current monitors, ordered by namespace/name: map iteration
 // order must not decide which monitor a URL-deduped target is attributed to
 // (the same determinism the server enforces for services).
 func (ix *Index) All() []*Monitor {
 	ix.mu.RLock()
 	defer ix.mu.RUnlock()
-	out := make([]*Monitor, 0, len(ix.monitors))
-	for _, m := range ix.monitors {
-		out = append(out, m)
-	}
-	sort.Slice(out, func(i, j int) bool {
-		if out[i].Namespace != out[j].Namespace {
-			return out[i].Namespace < out[j].Namespace
-		}
-		return out[i].Name < out[j].Name
-	})
-	return out
+	return sortedMonitors(ix.monitors, func(m *Monitor) (string, string) { return m.Namespace, m.Name })
 }
 
 // AuthSecretRefs returns the set of "namespace/name/key" bearerTokenSecret

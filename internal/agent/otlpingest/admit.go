@@ -287,7 +287,10 @@ type reservationKey struct{}
 func (s *Server) tapAdmit(ctx context.Context, _ *tap.Info) (context.Context, error) {
 	if !s.buffer.reserve(grpcReserveBytes) {
 		obs.IngestRejected.Inc()
-		return nil, exhaustedStatus("receiver is holding its maximum buffered payload bytes; retry")
+		// The same refusal text as the HTTP arm's (errBufferBudget, which
+		// WriteBodyError answers 429 with): one condition, one description,
+		// whichever transport a sender used.
+		return nil, exhaustedStatus(errBufferBudget.Error())
 	}
 	// grpc-go makes the context returned here the STREAM's context and reads the
 	// message through it (http2Server.operateHeaders wires s.ctxDone into the

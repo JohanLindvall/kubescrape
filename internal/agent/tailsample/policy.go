@@ -9,9 +9,10 @@ import (
 	"sync"
 	"time"
 
-	"github.com/cespare/xxhash/v2"
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/ptrace"
+
+	"github.com/JohanLindvall/kubescrape/internal/agent/tracehash"
 )
 
 const (
@@ -531,37 +532,21 @@ func compileProbabilistic(where string, cfg *ProbabilisticConfig) (policy, error
 	if pct < 0 || pct > 100 {
 		return nil, errPolicy(where, "probabilistic.samplingPercentage %v is not in [0,100] (this is a percentage: half is 50, not 0.5)", pct)
 	}
-	p := &probPolicy{}
-	if pct >= 100 {
-		p.threshold = math.MaxUint64
-	} else {
-		p.threshold = uint64(pct / 100 * float64(math.MaxUint64))
-	}
-	return p, nil
+	// The FRACTION is passed (pct/100, divided here) so tracehash computes the
+	// threshold's float rounding identically for this policy and for
+	// tracesample's probability — that bit-identity is half the nesting
+	// contract (tracehash's package doc carries the whole of it).
+	return &probPolicy{threshold: tracehash.Threshold(pct / 100)}, nil
 }
 
-// eval hashes the trace id — xxhash, compared against a threshold scaled from
-// the percentage. This is character-for-character the discipline in
+// eval hashes the trace id against the threshold — tracehash.Keep, SHARED with
 // agent/tracesample, and sharing it is the point rather than a coincidence:
-//
-//   - the same trace decides identically wherever it is judged, so a fleet of
-//     agents each holding part of a trace still keeps or drops the WHOLE trace,
-//     and a sharded or re-assembled decision cannot split it;
-//   - a re-decision (late spans arrive, a payload is retried, a process
-//     restarts with the trace re-buffered) reaches the same answer, so a trace
-//     is never half-kept across time either;
-//   - the hash is UNSALTED, which makes this stage nest with the head sampler
-//     rather than compound with it: a tail policy at 50% keeps exactly the
-//     traces a head sampler at probability 0.5 already kept, instead of
-//     independently discarding half of them again. The Collector's hash salt
-//     exists to break that nesting and is deliberately not implemented — nobody
-//     has asked to decorrelate two stages, and the nesting is the safer default.
-//
-// Hashing the id (rather than reading its low bits, as a W3C-random id would
-// permit) keeps the distribution uniform for senders whose ids are not random.
+// the same trace decides identically wherever and whenever it is judged (so a
+// re-decision after a retry, a restart or late spans reaches the same answer),
+// and the unsalted hash makes this stage NEST with the head sampler rather
+// than compound with it. See tracehash's package doc for the contract.
 func (p *probPolicy) eval(t Trace, _ time.Time) (verdict, string) {
-	id := t.TraceID
-	if xxhash.Sum64(id[:]) < p.threshold {
+	if tracehash.Keep(t.TraceID, p.threshold) {
 		return verdictSample, ""
 	}
 	return verdictAbstain, ""
@@ -569,13 +554,13 @@ func (p *probPolicy) eval(t Trace, _ time.Time) (verdict, string) {
 
 // --- rateLimiting -----------------------------------------------------------
 
-type ratePolicy struct{ b *bucket }
+type ratePolicy struct{ b *tracehash.Bucket }
 
 func compileRateLimiting(where string, cfg *RateLimitingConfig) (policy, error) {
 	if cfg.SpansPerSecond <= 0 {
 		return nil, errPolicy(where, "rateLimiting.spansPerSecond must be > 0 (got %v, which would sample nothing)", cfg.SpansPerSecond)
 	}
-	return &ratePolicy{b: newBucket(cfg.SpansPerSecond)}, nil
+	return &ratePolicy{b: tracehash.NewBucket(cfg.SpansPerSecond)}, nil
 }
 
 // eval charges the whole trace, all or nothing: admitting the prefix of a trace
@@ -596,69 +581,17 @@ func (p *ratePolicy) eval(t Trace, now time.Time) (verdict, string) {
 // earlier decision (Trace.Charged), merely checks that it would fit. A
 // re-decision must not bill the same trace twice: the budget is a rate of spans
 // leaving, and these spans were counted the first time.
-func charge(b *bucket, n float64, now time.Time, already bool) bool {
-	if already {
-		return b.peek(n, now)
-	}
-	return b.admit(n, now)
-}
-
-// bucket is a token bucket over spans/second, shared by rateLimiting and by
-// each composite sub-policy's allocation.
-type bucket struct {
-	mu     sync.Mutex
-	rate   float64
-	burst  float64
-	tokens float64
-	last   time.Time
-}
-
-// newBucket gives one second of headroom, floored at a single token so a
-// fractional rate can still admit something (agent/tracesample floors it for
-// the same reason: a bucket that can never accumulate a whole token drops
-// everything forever).
-func newBucket(rate float64) *bucket {
-	burst := max(1, rate)
-	return &bucket{rate: rate, burst: burst, tokens: burst}
-}
-
-// admit charges n spans and reports whether the trace fits.
 //
-// Two halves worth stating. Admission needs min(n, burst) tokens, NOT n: a
-// trace with more spans than the entire bucket could never fit, so a workload
-// whose traces are bigger than the per-second budget would be shut out
-// permanently — a silent total loss for exactly the deep traces most worth
-// sampling. And the charge is the FULL n, so an over-sized trace leaves the
-// bucket in debt and the refill pays it back before anything else is admitted:
-// the long-run rate stays what the operator configured, the cap is exceeded
-// only in the instant, never on average.
-func (b *bucket) admit(n float64, now time.Time) bool {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	if !b.last.IsZero() {
-		b.tokens = min(b.burst, b.tokens+b.rate*now.Sub(b.last).Seconds())
+// The bucket itself is tracehash.Bucket, shared with agent/tracesample's rate
+// cap; THIS package's semantics are AdmitDebt (admission needs min(n, burst),
+// the charge is the full n, so an over-sized trace goes into debt rather than
+// being shut out forever) and Peek (the state-untouched re-decision) — the
+// method docs carry the why.
+func charge(b *tracehash.Bucket, n float64, now time.Time, already bool) bool {
+	if already {
+		return b.Peek(n, now)
 	}
-	b.last = now
-	need := min(n, b.burst)
-	if b.tokens < need {
-		return false
-	}
-	b.tokens -= n
-	return true
-}
-
-// peek answers admit's question WITHOUT spending anything, for a trace that was
-// already charged (see charge). It does not even bank the refill: leaving the
-// bucket's state entirely untouched is what makes a re-decision invisible to
-// every trace being decided for the first time.
-func (b *bucket) peek(n float64, now time.Time) bool {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	tokens := b.tokens
-	if !b.last.IsZero() {
-		tokens = min(b.burst, tokens+b.rate*now.Sub(b.last).Seconds())
-	}
-	return tokens >= min(n, b.burst)
+	return b.AdmitDebt(n, now)
 }
 
 // --- and --------------------------------------------------------------------
@@ -717,7 +650,7 @@ type compositeSub struct {
 	// naming the author of a decision must not concatenate on the hot path.
 	name string
 	p    policy
-	b    *bucket
+	b    *tracehash.Bucket
 }
 
 func compileComposite(name, where string, cfg *CompositeConfig) (policy, error) {
@@ -747,7 +680,7 @@ func compileComposite(name, where string, cfg *CompositeConfig) (policy, error) 
 		out.subs = append(out.subs, compositeSub{
 			name: name + "/" + s.name,
 			p:    s.p,
-			b:    newBucket(rate),
+			b:    tracehash.NewBucket(rate),
 		})
 	}
 	return out, nil

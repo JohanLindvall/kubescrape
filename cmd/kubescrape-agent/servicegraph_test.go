@@ -26,6 +26,7 @@ import (
 	"github.com/JohanLindvall/kubescrape/internal/agent/servicegraph"
 	"github.com/JohanLindvall/kubescrape/internal/bearer"
 	"github.com/JohanLindvall/kubescrape/pkg/kubemeta"
+	"github.com/JohanLindvall/kubescrape/pkg/otlpsplit"
 )
 
 // The trace tier costs a workload, an internal hop per span and a new metric
@@ -984,4 +985,18 @@ func tierOn(t *testing.T) {
 	on, tok := *serviceGraphOn, *serviceGraphToken
 	*serviceGraphOn, *serviceGraphToken = true, "/flag/token"
 	t.Cleanup(func() { *serviceGraphOn, *serviceGraphToken = on, tok })
+}
+
+// The internal hop's receive floor is derived with the sender's default split
+// cap as a lower bound (sgMaxRecvFloor), so raising otlpsplit.DefaultMaxBytes
+// can never silently out-size what a sibling shard will accept. Today the
+// historical 4 MiB dominates; this pin makes any future change of the FLOOR's
+// value a deliberate test update rather than a side effect.
+func TestSGMaxRecvFloorValue(t *testing.T) {
+	if sgMaxRecvFloor != 4<<20 {
+		t.Fatalf("sgMaxRecvFloor = %d, want %d (4 MiB): if otlpsplit.DefaultMaxBytes grew past 4 MiB this is expected — update the pin deliberately", sgMaxRecvFloor, 4<<20)
+	}
+	if sgMaxRecvFloor < otlpsplit.DefaultMaxBytes {
+		t.Fatalf("sgMaxRecvFloor (%d) is below the sender's default split cap (%d): the internal hop would reject default-sized parts", sgMaxRecvFloor, otlpsplit.DefaultMaxBytes)
+	}
 }

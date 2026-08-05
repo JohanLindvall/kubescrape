@@ -128,8 +128,7 @@ func (p cachePolicy) noStore() string {
 // 404, owner/namespace enrichment, then the write its policy calls for.
 // notFound is evaluated lazily so the success path never formats it.
 func (s *Server) servePod(w http.ResponseWriter, r *http.Request, policy cachePolicy, lookup func() (store.NodePod, bool), notFound func() string) {
-	if !s.isReady() {
-		writeError(w, http.StatusServiceUnavailable, "informer caches not synced")
+	if !s.requireReady(w, "") {
 		return
 	}
 	np, ok := lookup()
@@ -214,8 +213,7 @@ func (s *Server) handleSelf(w http.ResponseWriter, r *http.Request) {
 // handleNodeMetadata serves GET /v1/nodes/{node}/metadata: the node's
 // labels and annotations (used by the agent for node-level attributes).
 func (s *Server) handleNodeMetadata(w http.ResponseWriter, r *http.Request) {
-	if !s.isReady() {
-		writeError(w, http.StatusServiceUnavailable, "informer caches not synced")
+	if !s.requireReady(w, "") {
 		return
 	}
 	node := r.PathValue("node")
@@ -229,8 +227,7 @@ func (s *Server) handleNodeMetadata(w http.ResponseWriter, r *http.Request) {
 
 // handleNodeTargets serves GET /v1/nodes/{node}/targets.
 func (s *Server) handleNodeTargets(w http.ResponseWriter, r *http.Request) {
-	if !s.isReady() {
-		writeError(w, http.StatusServiceUnavailable, "informer caches not synced")
+	if !s.requireReady(w, "") {
 		return
 	}
 	node := r.PathValue("node")
@@ -403,17 +400,12 @@ func (s *Server) handleScrapeAuth(w http.ResponseWriter, r *http.Request) {
 	// Scope to secrets a monitor endpoint actually references — the endpoint
 	// must not become a read-any-cluster-secret oracle for anything that can
 	// reach the (unauthenticated, cluster-internal) service.
-	// Gated AFTER the disabled-feature 404 and the anonymous 401 (so neither
-	// changes), and BEFORE the allowlist. The allowlist is derived from a LIVE
-	// servicemonitors.Index, which exists but is EMPTY until the informers sync
-	// — so between ListenAndServe and the ready close, a perfectly valid ref
-	// got a definitive 403 "not referenced by any monitor endpoint", an
-	// assertion the server cannot yet make. Every sibling handler returns a
-	// retryable 503 in that window; this was the one route that did not, and it
-	// turned a startup race into what reads like a monitor misconfiguration.
-	if !s.isReady() {
-		w.Header().Set("Retry-After", "1")
-		writeError(w, http.StatusServiceUnavailable, "informer caches not synced")
+	// The readiness gate sits AFTER the disabled-feature 404 and the anonymous
+	// 401 (so neither changes), and BEFORE the allowlist — this is the route
+	// whose missing gate is requireReady's war story. Retry-After: 1 because
+	// unlike the metadata routes this 503 replaced a DEFINITIVE-looking 403,
+	// so it says out loud when to come back.
+	if !s.requireReady(w, "1") {
 		return
 	}
 	if s.monitors == nil {

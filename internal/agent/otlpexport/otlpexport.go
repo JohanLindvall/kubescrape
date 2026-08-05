@@ -478,10 +478,16 @@ func Retry(ctx context.Context, attempts int, initial time.Duration, send func()
 	backoff := initial
 	for attempt := 0; attempt < attempts; attempt++ {
 		if attempt > 0 {
+			// NewTimer+Stop, not time.After: a cancelled wait must not leave
+			// the timer live until it fires (During shutdown every producer
+			// retries at once, and the leaked timers pin their goroutine's
+			// wakeups for the full backoff).
+			t := time.NewTimer(backoff)
 			select {
 			case <-ctx.Done():
+				t.Stop()
 				return err
-			case <-time.After(backoff):
+			case <-t.C:
 			}
 			backoff *= 2
 		}

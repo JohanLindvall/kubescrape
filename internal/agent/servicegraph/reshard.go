@@ -29,6 +29,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/JohanLindvall/kubescrape/internal/logdedupe"
+
 	"go.opentelemetry.io/collector/pdata/ptrace"
 
 	"github.com/JohanLindvall/kubescrape/internal/agent/otlpexport"
@@ -290,11 +292,15 @@ type shardTarget struct {
 
 // clientConfig builds one shard's exporter config from the flag-built base.
 //
-// It inherits the base's TRANSPORT tuning (timeout, compression, send-size cap)
-// but never its CREDENTIALS or destination: bearer token, headers, TLS material
-// and endpoint are all destination-scoped, and inheriting them would present the
-// collector's token to a sibling shard — a credential leak across a trust
-// boundary caused by leaving a field empty.
+// It inherits the base's TRANSPORT tuning (otlpexport.Config.TransportOnly:
+// timeout, compression, send-size cap) but never its CREDENTIALS or
+// destination: bearer token, headers, TLS material and endpoint are all
+// destination-scoped, and inheriting them would present the collector's token
+// to a sibling shard — a credential leak across a trust boundary caused by
+// leaving a field empty. TransportOnly owns that partition (and
+// otlpexport.TestConfigFieldsAreClassified forces every new Config field onto
+// one side of it); this function only fills in the destination and pins the
+// retry shape.
 func (c *ReshardConfig) clientConfig(t shardTarget, base otlpexport.Config) otlpexport.Config {
 	// The same TLS intent the http scheme is derived from, so the two transports
 	// cannot disagree (TLS material plus plaintext is refused by otlpexport.New).
@@ -303,27 +309,26 @@ func (c *ReshardConfig) clientConfig(t shardTarget, base otlpexport.Config) otlp
 	if c.InsecureSkipVerify != nil {
 		skip = *c.InsecureSkipVerify
 	}
-	return otlpexport.Config{
-		Endpoint:           t.endpoint,
-		Protocol:           c.protocol(),
-		Insecure:           insecure,
-		InsecureSkipVerify: skip,
-		CAFile:             c.CAFile,
-		Headers:            c.Headers,
-		BearerTokenFile:    c.BearerTokenFile,
-		Compression:        base.Compression,
-		CompressionLevel:   base.CompressionLevel,
-		Timeout:            base.Timeout,
-		// One attempt, never a retry, and that is a correctness rule rather than
-		// a preference: the APPLICATION owns the retry. Retrying here would hold
-		// the entry shard's in-flight slot for a multiple of the OTLP timeout
-		// while the sender — which still holds the payload — waits, and a hop
-		// that half-succeeded and then succeeded on the retry would double-count
-		// the owner's cumulative edge and RED counters. Fail fast, tell the
-		// sender, let it re-push.
-		RetryAttempts: 1,
-		MaxSendBytes:  base.MaxSendBytes,
-	}
+	cfg := base.TransportOnly()
+	cfg.Endpoint = t.endpoint
+	cfg.Protocol = c.protocol()
+	cfg.Insecure = insecure
+	cfg.InsecureSkipVerify = skip
+	cfg.CAFile = c.CAFile
+	cfg.Headers = c.Headers
+	cfg.BearerTokenFile = c.BearerTokenFile
+	// One attempt, never a retry, and that is a correctness rule rather than
+	// a preference: the APPLICATION owns the retry. Retrying here would hold
+	// the entry shard's in-flight slot for a multiple of the OTLP timeout
+	// while the sender — which still holds the payload — waits, and a hop
+	// that half-succeeded and then succeeded on the retry would double-count
+	// the owner's cumulative edge and RED counters. Fail fast, tell the
+	// sender, let it re-push. (The backoff is zeroed with it: with one attempt
+	// there is nothing to back off between, and inheriting the base's value
+	// would make the derived config claim a retry shape it does not have.)
+	cfg.RetryAttempts = 1
+	cfg.RetryBackoff = 0
+	return cfg
 }
 
 // Resharder routes spans to the shard owning their trace.
@@ -340,7 +345,7 @@ type Resharder struct {
 	closers []func() error
 	log     *slog.Logger
 
-	lastWarn atomic.Int64
+	warnGate logdedupe.Throttle
 	counters reshardCounters
 }
 
@@ -688,9 +693,7 @@ func (r *Resharder) ownerOf(span ptrace.Span) string {
 
 // warn logs at most once per reshardWarnEvery across all shards.
 func (r *Resharder) warn(msg string, args ...any) {
-	now := time.Now().UnixNano()
-	last := r.lastWarn.Load()
-	if now-last < int64(reshardWarnEvery) || !r.lastWarn.CompareAndSwap(last, now) {
+	if !r.warnGate.Allow(reshardWarnEvery) {
 		return
 	}
 	r.log.Warn(msg, args...)

@@ -17,14 +17,13 @@ import (
 	"strings"
 	"time"
 
-	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/plog"
 	"go.opentelemetry.io/collector/pdata/pmetric"
 	"sigs.k8s.io/yaml"
 
 	"github.com/JohanLindvall/kubescrape/internal/agent/logchain"
-	"github.com/JohanLindvall/kubescrape/internal/agent/logenrich"
 	"github.com/JohanLindvall/kubescrape/internal/agent/logscrub"
+	"github.com/JohanLindvall/kubescrape/internal/agent/tailer"
 	"github.com/JohanLindvall/kubescrape/internal/agent/transform"
 	"github.com/JohanLindvall/kubescrape/internal/logline"
 	"github.com/JohanLindvall/kubescrape/internal/metrics"
@@ -78,28 +77,23 @@ func runConfigTests(cfg agentConfig, transformsFile, testsFile string, log *slog
 		return fmt.Errorf("%s: no tests", testsFile)
 	}
 
-	// The same compiled chains a real start builds.
-	var scrubber *logscrub.Scrubber
-	if cfg.LogScrubbing != nil {
-		if scrubber, err = logscrub.New(*cfg.LogScrubbing); err != nil {
-			return err
-		}
-	}
-	extractor, err := logattrs.New(cfg.LogAttributes)
+	// The same compile helpers a real start (and validateConfig) uses, so the
+	// harness proves the chains production builds, not variants of them.
+	scrubber, err := compileScrub(cfg.LogScrubbing)
 	if err != nil {
 		return err
 	}
-	var rules *logline.LineFilter
-	if cfg.Logs != nil {
-		if rules, err = logline.NewLineFilter(cfg.Logs.Rules); err != nil {
-			return err
-		}
+	extractor, err := compileLogAttrs(cfg.LogAttributes)
+	if err != nil {
+		return err
 	}
-	var transforms *transform.Program
-	if transformsFile != "" {
-		if transforms, err = transform.CompileFile(transformsFile); err != nil {
-			return err
-		}
+	rules, err := compileLogRules(cfg.Logs)
+	if err != nil {
+		return err
+	}
+	transforms, err := compileTransforms(transformsFile)
+	if err != nil {
+		return err
 	}
 
 	failed := 0
@@ -125,50 +119,91 @@ func runConfigTests(cfg agentConfig, transformsFile, testsFile string, log *slog
 	return nil
 }
 
-// runConfigCase pushes one line through the pipeline stages in the tailer's
-// order and returns the assertion failures.
+// captureProducer is the harness's half of the chain (logchain.Producer): a
+// kept record lands in dest, and Stamp writes the one thing the harness knows
+// about the line — its body. Production stamps timestamps and per-entry
+// stream facts here; a test case has none (see the not-modelled note in
+// runConfigCase).
+type captureProducer struct {
+	dest plog.LogRecordSlice
+	body string
+}
+
+func (c *captureProducer) Dest() plog.LogRecordSlice { return c.dest }
+func (c *captureProducer) Stamp(lr plog.LogRecord)   { lr.Body().SetStr(c.body) }
+
+// runConfigCase pushes one line through the SAME per-record chain every log
+// producer runs (logchain.Chain: scrub → lift line attributes → stamp →
+// enrich → logMetrics → rules) and returns the assertion failures. The chain
+// used to be re-implemented here step by step, which could only prove what the
+// re-implementation does; now the harness drives Chain.Line + Chain.Emit and
+// keeps only the producer half every pipeline keeps (the resource, and where
+// records land).
+//
+// The chain runs twice: once WITHOUT the rules, so the record is still there
+// to assert body/severity/attributes/metrics on even when the rules drop it
+// (the assertions are about the line, not the verdict), and once WITH them for
+// the verdict — same Config otherwise, so the second pass is the production
+// evaluation (rules after enrichment, __severity__ from the enriched severity,
+// lifted resource attributes ranked between record and resource). Transforms
+// stay in the harness AFTER the chain: they are an exporter-seam feature, not
+// part of the per-record chain.
 func runConfigCase(cfg agentConfig, scrubber *logscrub.Scrubber, extractor *logattrs.Extractor,
 	rules *logline.LineFilter, transforms *transform.Program, tc configTestCase) []string {
 	var problems []string
 	fail := func(format string, args ...any) { problems = append(problems, fmt.Sprintf(format, args...)) }
 
-	res := pcommon.NewMap()
-	for k, v := range tc.Resource {
-		res.PutStr(k, v)
+	// Metrics observe EVERY line (before rules), exactly as in production; a
+	// fresh set per case keeps cases independent. Compiled through the shared
+	// helper so the prefix participates exactly as it does at a real start.
+	var set *metrics.DynamicMetricSet
+	if len(tc.Expect.Metrics) > 0 {
+		var err error
+		if set, err = compileLogMetrics(cfg.LogMetrics); err != nil {
+			fail("compiling logMetrics: %v", err)
+		} else if set == nil {
+			fail("expect.metrics set but the config has no logMetrics section")
+		}
 	}
 
-	// Scrub FIRST, exactly as the tailer does — everything downstream copies
-	// from the body.
-	body := tc.Line
-	if scrubber != nil {
-		body = scrubber.Scrub(body)
-	}
+	base := logchain.Config{Scrub: scrubber, LogAttrs: extractor, Enrich: *enrichOn}
+	observe := base
+	observe.LogMetrics = set
+	chain := logchain.NewChain[struct{}](observe, false)
+
+	// Scrub + extract precede grouping, as in every producer; the body
+	// assertion reads the post-scrub line.
+	body, ext := chain.Line(tc.Line)
 	if tc.Expect.Body != "" && body != tc.Expect.Body {
 		fail("body = %q, want %q", body, tc.Expect.Body)
 	}
 
-	// Build the record the way flush.go does: line attrs, then enrichment.
-	// Not modelled: the tailer's per-ENTRY facts (log.iostream, log.truncated,
+	// Build the payload the way the tailer's grouper does: the case's resource
+	// plus this line's lifted resource attributes, the tailer's own scope
+	// (name and version, so the harness models what production ships rather
+	// than a nameless scope of its own), the lifted scope attributes. Not
+	// modelled: the tailer's per-ENTRY facts (log.iostream, log.truncated,
 	// log.multiline.match, log.file.*) and pod-annotation rules. Those are
 	// runtime data rather than config, so a case cannot produce them — a rule
 	// keyed on one of them is outside what this harness can prove.
-	extracted := extractor.Extract(body)
 	ld := plog.NewLogs()
 	rl := ld.ResourceLogs().AppendEmpty()
-	res.CopyTo(rl.Resource().Attributes())
-	logattrs.Put(rl.Resource().Attributes(), extracted.Resource)
-	sl := rl.ScopeLogs().AppendEmpty()
-	// Named and versioned like the tailer's, so the harness models what
-	// production ships rather than a nameless scope of its own.
-	sl.Scope().SetName("github.com/JohanLindvall/kubescrape/agent/tailer")
-	sl.Scope().SetVersion(obs.ScopeVersion)
-	logattrs.Put(sl.Scope().Attributes(), extracted.Scope)
-	lr := sl.LogRecords().AppendEmpty()
-	lr.Body().SetStr(body)
-	logattrs.Put(lr.Attributes(), extracted.Log)
-	if *enrichOn {
-		logenrich.Apply(lr, body)
+	for k, v := range tc.Resource {
+		rl.Resource().Attributes().PutStr(k, v)
 	}
+	logattrs.Put(rl.Resource().Attributes(), ext.Resource)
+	sl := rl.ScopeLogs().AppendEmpty()
+	sl.Scope().SetName(tailer.ScopeName)
+	sl.Scope().SetVersion(obs.ScopeVersion)
+	logattrs.Put(sl.Scope().Attributes(), ext.Scope)
+
+	// The group's resource is what metric labels and rule keys resolve against
+	// (after the record's attributes and the line's lifted values) and what
+	// log-metrics bind to — the case resource plus the lifted resource
+	// attributes, as in every producer.
+	in := logchain.Input[struct{}]{Body: body, Lifted: ext, Resource: rl.Resource().Attributes()}
+	chain.Emit(&captureProducer{dest: sl.LogRecords(), body: body}, in)
+	lr := sl.LogRecords().At(0)
 
 	if tc.Expect.Severity != "" && !strings.EqualFold(lr.SeverityText(), tc.Expect.Severity) {
 		fail("severity = %q, want %q", lr.SeverityText(), tc.Expect.Severity)
@@ -182,40 +217,23 @@ func runConfigCase(cfg agentConfig, scrubber *logscrub.Scrubber, extractor *loga
 		}
 	}
 
-	// Resolution is the PRODUCTION resolver itself (internal/agent/logchain),
-	// not a mirror of it: this harness exists to prove what a rule or metric
-	// edit does to real lines, and a re-implementation can only prove what the
-	// re-implementation does. It reads the CASE's resource map plus THIS
-	// line's lifted resource attributes, which is what every producer now
-	// resolves against — without SetLifted the harness agreed with no
-	// pipeline at all, and its own comment about resource-target attributes
-	// being invisible described behaviour the chain no longer has.
-	resolver := logchain.New()
-	resolver.Set(lr.Attributes(), res, logchain.LowerSeverity(lr.SeverityText()))
-	resolver.SetLifted(extracted.Resource)
-	labelFn, valueFn, ruleFn := resolver.LabelFn(), resolver.ValueFn(), resolver.RuleFn()
-
-	// Metrics observe EVERY line (before rules), exactly as in production; a
-	// fresh set per case keeps cases independent.
-	if len(tc.Expect.Metrics) > 0 {
-		if cfg.LogMetrics == nil || len(cfg.LogMetrics.Metrics) == 0 {
-			fail("expect.metrics set but the config has no logMetrics section")
-		} else if set, err := metrics.NewDynamicMetricSet(cfg.LogMetrics.Metrics,
-			metrics.WithNamePrefix(*logsMetricsPrefix)); err != nil {
-			fail("compiling logMetrics: %v", err)
-		} else {
-			set.Bind(res).Add(valueFn, labelFn, body)
-			fired := firedMetricNames(set)
-			for _, want := range tc.Expect.Metrics {
-				if !fired[*logsMetricsPrefix+want] && !fired[want] {
-					fail("metric %q did not observe the line (fired: %v)", want, keys(fired))
-				}
+	if set != nil {
+		fired := firedMetricNames(set)
+		for _, want := range tc.Expect.Metrics {
+			if !fired[*logsMetricsPrefix+want] && !fired[want] {
+				fail("metric %q did not observe the line (fired: %v)", want, keys(fired))
 			}
 		}
 	}
 
-	// Rules, then the logs transform — kept reflects both.
-	kept := rules.Keep(ruleFn, body)
+	// The verdict pass, then the logs transform — kept reflects both.
+	kept := true
+	if rules != nil {
+		ruled := base
+		ruled.Rules = rules
+		verdict := logchain.NewChain[struct{}](ruled, false)
+		kept = verdict.Emit(&captureProducer{dest: plog.NewLogRecordSlice(), body: body}, in)
+	}
 	if kept && transforms != nil {
 		sink := &captureLogs{}
 		w := transform.Wrap(sink, nil, transforms)

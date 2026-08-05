@@ -114,6 +114,19 @@ func checkExcludedPipelines() error {
 	return nil
 }
 
+// excludedPipelineErrorFor is excludedPipelineError with the (flag, tag, what)
+// triple looked up from the registry, for the stubs: re-typing the triple
+// there let a stub's wording drift from the one validateConfig raises for the
+// same refusal. Pinned by TestStubErrorsMatchTheRegistry.
+func excludedPipelineErrorFor(tag string) error {
+	for _, p := range optionalPipelines() {
+		if p.tag == tag {
+			return excludedPipelineError(p.flag, p.tag, p.what)
+		}
+	}
+	return fmt.Errorf("no optional pipeline is tagged %q", tag) // unreachable: every stub names a registered tag
+}
+
 // excludedPipelineError is the one wording, shared by validateConfig and the
 // stubs. It names the tag (so the message explains itself without the reader
 // knowing this feature exists) and how to get a binary that has the pipeline.

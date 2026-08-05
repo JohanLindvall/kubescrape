@@ -268,11 +268,11 @@ func (r *statusRecorder) WriteHeader(code int) {
 	r.ResponseWriter.WriteHeader(code)
 }
 
-// maxContainerIDLen bounds the container-ID path segment. Real runtime IDs
-// are 64 hex characters (plus an optional scheme prefix, stripped before this
-// check); anything longer is rejected up front so hostile IDs never reach the
-// store's waiter map.
-const maxContainerIDLen = 256
+// maxContainerIDLen bounds the container-ID path segment
+// (kubemeta.MaxContainerIDLen carries the 64-hex-runtime rationale): over it
+// the request 404s up front, so hostile IDs never reach the store's waiter
+// map.
+const maxContainerIDLen = kubemeta.MaxContainerIDLen
 
 // monitorEndpoint pairs a ServiceMonitor endpoint with its monitor name.
 type monitorEndpoint struct {
@@ -349,6 +349,33 @@ func (s *Server) isReady() bool {
 	default:
 		return false
 	}
+}
+
+// requireReady gates a handler on the initial informer sync, reporting whether
+// the caller may proceed; false means the retryable JSON 503 was already
+// written. retryAfter, when non-empty, rides as a Retry-After header on that
+// 503 (handleScrapeAuth sends "1"; the other routes historically send none).
+//
+// ONE policy for every instant (non-blocking) gate, because the copies drifted
+// once: handleScrapeAuth skipped the gate entirely and answered a definitive
+// 403 ("secret is not referenced by any monitor endpoint") during the sync
+// window — its allowlist comes from a LIVE servicemonitors.Index that exists
+// but is merely EMPTY until the informers sync, so the assertion could not yet
+// be made, and a startup race read as a monitor misconfiguration. Every other
+// handler was returning the retryable 503 this helper now owns.
+//
+// handleContainer is the deliberate exception, not a fifth copy: it spends its
+// per-request wait budget on readiness first (waitReady) rather than failing
+// fast, because its caller legitimately blocks for metadata to appear.
+func (s *Server) requireReady(w http.ResponseWriter, retryAfter string) bool {
+	if s.isReady() {
+		return true
+	}
+	if retryAfter != "" {
+		w.Header().Set("Retry-After", retryAfter)
+	}
+	writeError(w, http.StatusServiceUnavailable, "informer caches not synced")
+	return false
 }
 
 func (s *Server) waitReady(ctx context.Context) bool {

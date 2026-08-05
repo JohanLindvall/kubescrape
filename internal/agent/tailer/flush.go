@@ -74,12 +74,18 @@ func (g *logGrouper) scope(f *file, resAttrs, scopeAttrs []logattrs.Attr) group 
 	return gr
 }
 
+// ScopeName is the instrumentation scope stamped on every record the tailer
+// exports. Exported so the -test-config harness models the scope production
+// ships instead of re-typing the literal (wire-visible: changing it splits
+// every log stream at the upgrade boundary in backends that group on it).
+const ScopeName = "github.com/JohanLindvall/kubescrape/agent/tailer"
+
 func (g *logGrouper) newScope(f *file, resAttrs, scopeAttrs []logattrs.Attr) group {
 	rl := g.ld.ResourceLogs().AppendEmpty()
 	f.resource.CopyTo(rl.Resource())
 	logattrs.Put(rl.Resource().Attributes(), resAttrs)
 	sl := rl.ScopeLogs().AppendEmpty()
-	sl.Scope().SetName("github.com/JohanLindvall/kubescrape/agent/tailer")
+	sl.Scope().SetName(ScopeName)
 	sl.Scope().SetVersion(obs.ScopeVersion)
 	logattrs.Put(sl.Scope().Attributes(), scopeAttrs)
 	return group{sl: sl, res: rl.Resource().Attributes()}

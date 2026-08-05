@@ -123,7 +123,6 @@ import (
 	"fmt"
 	"log/slog"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"go.opentelemetry.io/collector/pdata/pcommon"
@@ -132,6 +131,7 @@ import (
 	"github.com/JohanLindvall/kubescrape/internal/agent/otlpexport"
 	"github.com/JohanLindvall/kubescrape/internal/agent/tailsample"
 	"github.com/JohanLindvall/kubescrape/internal/config"
+	"github.com/JohanLindvall/kubescrape/internal/logdedupe"
 	"github.com/JohanLindvall/kubescrape/internal/metrics"
 	"github.com/JohanLindvall/kubescrape/internal/obs"
 )
@@ -267,17 +267,8 @@ func (c *Config) Validate() error {
 	if err := c.Config.Validate(); err != nil {
 		return err
 	}
-	s, err := c.settings()
-	if err != nil {
-		return err
-	}
-	// A trace that cannot fit under the total ceiling could never be decided
-	// normally: the per-trace bound would never be reached, and the ceiling would
-	// early-decide it (and everything else) on every payload.
-	if s.maxSpansPerTrace > s.maxSpans {
-		return fmt.Errorf("tailSampling.maxSpansPerTrace %d is above maxSpans %d (one trace could never fit in the buffer)", s.maxSpansPerTrace, s.maxSpans)
-	}
-	return nil
+	_, err := c.settings()
+	return err
 }
 
 // settings resolves the config to its effective values, defaults applied. It is
@@ -322,6 +313,12 @@ func (c *Config) settings() (settings, error) {
 		if b.val > 0 {
 			*b.dst = b.val
 		}
+	}
+	// A trace that cannot fit under the total ceiling could never be decided
+	// normally: the per-trace bound would never be reached, and the ceiling would
+	// early-decide it (and everything else) on every payload.
+	if s.maxSpansPerTrace > s.maxSpans {
+		return s, fmt.Errorf("tailSampling.maxSpansPerTrace %d is above maxSpans %d (one trace could never fit in the buffer)", s.maxSpansPerTrace, s.maxSpans)
 	}
 	return s, nil
 }
@@ -393,7 +390,7 @@ type Buffer struct {
 	lateDrop   *metrics.RegCounter
 	earlyCount map[string]*metrics.RegCounter
 
-	lastWarn atomic.Int64
+	warnGate logdedupe.Throttle
 }
 
 // policyCounters is one policy's two decision counters (it can keep by matching
@@ -420,9 +417,6 @@ func New(cfg Config, next TracesExporter, log *slog.Logger) (*Buffer, error) {
 	set, err := cfg.settings()
 	if err != nil {
 		return nil, err
-	}
-	if set.maxSpansPerTrace > set.maxSpans {
-		return nil, fmt.Errorf("tailSampling.maxSpansPerTrace %d is above maxSpans %d", set.maxSpansPerTrace, set.maxSpans)
 	}
 	ev, err := tailsample.New(cfg.Config)
 	if err != nil {
@@ -919,38 +913,20 @@ func (b *Buffer) drain(ctx context.Context, all bool) {
 	b.spansKept.Add(float64(out.spans))
 }
 
-// sendRetry exports with a bounded backoff. A permanent rejection is not
-// retried (the collector will not change its mind) and a cancelled context ends
-// it immediately — during shutdown the whole final flush is on a budget.
+// sendRetry exports with a bounded backoff — otlpexport.Retry, THE bounded
+// in-call retry shape: a permanent rejection is not retried (the collector
+// will not change its mind) and a cancelled context ends it without another
+// sleep — during shutdown the whole final flush is on a budget. Cold path (the
+// drain has released the mutex), so the closure costs nothing that matters.
 func (b *Buffer) sendRetry(ctx context.Context, td ptrace.Traces) error {
-	var err error
-	delay := sendBackoff
-	for attempt := 0; attempt < sendAttempts; attempt++ {
-		if attempt > 0 {
-			t := time.NewTimer(delay)
-			select {
-			case <-ctx.Done():
-				t.Stop()
-				return err
-			case <-t.C:
-			}
-			delay *= 2
-		}
-		if err = b.next.ExportTraces(ctx, td); err == nil {
-			return nil
-		}
-		if otlpexport.IsPermanent(err) || ctx.Err() != nil {
-			return err
-		}
-	}
-	return err
+	return otlpexport.Retry(ctx, sendAttempts, sendBackoff, func() error {
+		return b.next.ExportTraces(ctx, td)
+	})
 }
 
 // warn logs at most once per warnEvery.
 func (b *Buffer) warn(msg string, args ...any) {
-	now := time.Now().UnixNano()
-	last := b.lastWarn.Load()
-	if now-last < int64(warnEvery) || !b.lastWarn.CompareAndSwap(last, now) {
+	if !b.warnGate.Allow(warnEvery) {
 		return
 	}
 	b.log.Warn(msg, args...)

@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/JohanLindvall/kubescrape/internal/cli"
 	"github.com/JohanLindvall/kubescrape/internal/servicemonitors"
 	"github.com/JohanLindvall/kubescrape/internal/services"
 	"github.com/JohanLindvall/kubescrape/pkg/kubemeta"
@@ -116,11 +117,12 @@ func stampEndpoint(t *kubemeta.ScrapeTarget, ep servicemonitors.Endpoint) {
 	t.TLSCert = ep.TLSCert
 	t.TLSKey = ep.TLSKey
 	t.TLSServerName = ep.TLSServerName
-	for _, r := range ep.MetricRelabelings {
-		t.MetricRelabelings = append(t.MetricRelabelings, kubemeta.RelabelRule{
-			Action: r.Action, SourceLabels: r.SourceLabels, Regex: r.Regex,
-		})
-	}
+	// servicemonitors.RelabelRule IS kubemeta.RelabelRule (a type alias — the
+	// wire contract owns the shape), so the old field-by-field copy here was a
+	// third place a new relabel field had to be remembered, and forgetting it
+	// compiled clean while silently dropping the field from every served
+	// target.
+	t.MetricRelabelings = append(t.MetricRelabelings, ep.MetricRelabelings...)
 }
 
 // PodMonitorTargets derives the targets a PodMonitor endpoint declares on a
@@ -185,18 +187,25 @@ func containerPortByName(pod kubemeta.Pod, name string) (int32, bool) {
 // valid port range; string values that do not parse fall through to the
 // port-name path.
 func MonitorPortNumber(tp intstr.IntOrString) (int32, bool) {
-	var n int64
-	switch tp.Type {
-	case intstr.Int:
-		n = int64(tp.IntVal)
-	default:
-		parsed, err := strconv.ParseInt(tp.StrVal, 10, 32)
-		if err != nil {
-			return 0, false
-		}
-		n = parsed
+	if tp.Type != intstr.Int {
+		return parsePort(tp.StrVal)
 	}
-	if n < 1 || n > 65535 {
+	if n := tp.IntVal; 1 <= n && n <= 65535 {
+		return n, true
+	}
+	return 0, false
+}
+
+// parsePort parses one decimal port entry under the parse-don't-truncate
+// policy every annotation/endpoint port shares: ParseInt with a 32-bit size,
+// so a value overflowing int32 ("4294967297") is rejected, never truncated
+// into a different valid-looking port; and bounded to the real 1-65535 port
+// range. A rejected entry falls back to whatever name matching its caller
+// does, which is safe because a Kubernetes port name must contain a letter —
+// an all-digit string can never name a declared port.
+func parsePort(entry string) (int32, bool) {
+	n, err := strconv.ParseInt(entry, 10, 32)
+	if err != nil || n < 1 || n > 65535 {
 		return 0, false
 	}
 	return int32(n), true
@@ -229,21 +238,15 @@ func monitorPodPort(pod kubemeta.Pod, svc *services.Service, ep servicemonitors.
 	if n, ok := MonitorPortNumber(*ep.TargetPort); ok {
 		return n, true
 	}
-	// Only a String-typed, non-empty targetPort may resolve by container port
-	// NAME: an Int-typed value always has StrVal == "" (a rejected number like
-	// 0 or 70000 names nothing), and matching "" against an UNNAMED container
-	// port by "" == "" would fabricate a phantom target.
-	if ep.TargetPort.Type != intstr.String || ep.TargetPort.StrVal == "" {
+	// Only a String-typed targetPort may resolve by container port NAME: an
+	// Int-typed value always has StrVal == "" (a rejected number like 0 or
+	// 70000 names nothing). containerPortByName carries the other half of the
+	// guard — matching "" against an UNNAMED container port by "" == "" would
+	// fabricate a phantom target.
+	if ep.TargetPort.Type != intstr.String {
 		return 0, false
 	}
-	for _, c := range pod.Containers {
-		for _, p := range c.Ports {
-			if p.Name == ep.TargetPort.StrVal {
-				return p.Port, true
-			}
-		}
-	}
-	return 0, false
+	return containerPortByName(pod, ep.TargetPort.StrVal)
 }
 
 // Scrapeable reports whether a pod can yield scrape targets at all: it must
@@ -261,7 +264,7 @@ func Scrapeable(pod kubemeta.Pod) bool {
 	if pod.PodIP == "" || pod.DeletedAt != nil || pod.DeletionTimestamp != nil {
 		return false
 	}
-	return pod.Phase != "Succeeded" && pod.Phase != "Failed"
+	return !kubemeta.FinishedPhase(pod.Phase)
 }
 
 func schemeAndPath(annotations map[string]string) (scheme, path string) {
@@ -331,10 +334,8 @@ func podPorts(pod kubemeta.Pod) []int32 {
 		return ports
 	}
 	for _, entry := range splitList(ann) {
-		// ParseInt with a 32-bit size: values overflowing int32 must be
-		// skipped, not truncated into a different (valid-looking) port.
-		if n, err := strconv.ParseInt(entry, 10, 32); err == nil {
-			add(int32(n))
+		if n, ok := parsePort(entry); ok {
+			add(n)
 			continue
 		}
 		for _, c := range pod.Containers {
@@ -358,13 +359,9 @@ func selectServicePorts(svc *services.Service) []services.Port {
 	}
 	var out []services.Port
 	for _, entry := range splitList(ann) {
-		// As in podPorts: reject rather than truncate values beyond int32.
-		n, numeric := int64(0), false
-		if v, err := strconv.ParseInt(entry, 10, 32); err == nil {
-			n, numeric = v, true
-		}
+		n, numeric := parsePort(entry)
 		for _, sp := range svc.Ports {
-			if sp.Name == entry || (numeric && sp.Port == int32(n)) {
+			if sp.Name == entry || (numeric && sp.Port == n) {
 				out = append(out, sp)
 			}
 		}
@@ -375,14 +372,7 @@ func selectServicePorts(svc *services.Service) []services.Port {
 // TargetPodPort translates a service port to the pod port it targets.
 func TargetPodPort(pod kubemeta.Pod, sp services.Port) (int32, bool) {
 	if sp.TargetPortName != "" {
-		for _, c := range pod.Containers {
-			for _, p := range c.Ports {
-				if p.Name == sp.TargetPortName {
-					return p.Port, true
-				}
-			}
-		}
-		return 0, false
+		return containerPortByName(pod, sp.TargetPortName)
 	}
 	if sp.TargetPortNum != 0 {
 		return sp.TargetPortNum, true
@@ -390,12 +380,7 @@ func TargetPodPort(pod kubemeta.Pod, sp services.Port) (int32, bool) {
 	return sp.Port, true
 }
 
+// splitList delegates to the one comma-list reader both binaries share.
 func splitList(s string) []string {
-	var out []string
-	for _, part := range strings.Split(s, ",") {
-		if part = strings.TrimSpace(part); part != "" {
-			out = append(out, part)
-		}
-	}
-	return out
+	return cli.SplitList(s)
 }

@@ -13,7 +13,6 @@ import (
 	"context"
 	"log/slog"
 	"strings"
-	"sync/atomic"
 	"time"
 
 	"go.opentelemetry.io/collector/pdata/pcommon"
@@ -24,6 +23,7 @@ import (
 	"github.com/JohanLindvall/kubescrape/internal/agent/attrs"
 	"github.com/JohanLindvall/kubescrape/internal/agent/logenrich"
 	"github.com/JohanLindvall/kubescrape/internal/agent/logscrub"
+	"github.com/JohanLindvall/kubescrape/internal/logdedupe"
 	"github.com/JohanLindvall/kubescrape/internal/obs"
 	"github.com/JohanLindvall/kubescrape/pkg/kubemeta"
 )
@@ -134,9 +134,9 @@ type Enricher struct {
 	mode            MetricsMode
 	log             *slog.Logger
 
-	// lastPeerWarn throttles the rejected-peer warning; the enricher is shared
-	// by concurrent handlers, so it is atomic.
-	lastPeerWarn atomic.Int64
+	// peerWarnGate throttles the rejected-peer warning; the enricher is shared
+	// by concurrent handlers, which is the throttle's contract.
+	peerWarnGate logdedupe.Throttle
 }
 
 // NewEnricher creates an Enricher.
@@ -412,17 +412,10 @@ func (e *Enricher) applyMetadata(ctx context.Context, a pcommon.Map, cache map[s
 	cTok, cOK := e.tokenFrom(a, e.containerIDKeys, tokContainer)
 	uTok, uOK := e.tokenFrom(a, e.podUIDKeys, tokPodUID)
 	if !cOK && !uOK {
-		built, rejected := e.peerAttrs(ctx, cache)
+		built := e.peerFallback(ctx, cache)
 		if built.Len() > 0 {
-			obs.Ingested.WithLabelValues("peer_ip").Inc()
 			mergeAttrs(built, a)
 			return true
-		}
-		// Per RESOURCE, like every other outcome of this counter.
-		if rejected {
-			obs.Ingested.WithLabelValues("peer_ip_rejected").Inc()
-		} else {
-			obs.Ingested.WithLabelValues("unresolved").Inc()
 		}
 		return false
 	}
@@ -460,17 +453,9 @@ func (e *Enricher) tokenFrom(a pcommon.Map, keys []string, prefix string) (strin
 	return "", false
 }
 
-// builtAttrs returns the k8s attributes for a kind-tagged ID token, doing the
-// metadata lookup and attribute build (and the enriched/unresolved counting)
-// once per distinct token per cache. An empty map means the ID did not
-// resolve.
 // resolves reports whether token names an object the metadata service knows,
 // without building or caching its attributes. Used to choose between a
 // container id and a pod uid when a sender supplies both.
-//
-// NOT cached for the case it exists to serve: metaclient caches 200s, and a
-// stale container id — the reason to fall back to the pod uid — answers 404,
-// which is never cached. Each such probe is a live GET.
 func (e *Enricher) resolves(ctx context.Context, cache map[string]pcommon.Map, token string) bool {
 	// Memoised per request, INCLUDING the negative answer. metaclient caches
 	// 200s, but the case this probe exists for — a stale container id — answers
@@ -533,21 +518,32 @@ func (e *Enricher) attrsFor(ctx context.Context, cache map[string]pcommon.Map, t
 	}
 	built := pcommon.NewMap()
 	if pod, container := e.lookupByID(ctx, token); pod != nil {
-		r := pcommon.NewResource()
-		actx := attrs.Context{Pod: pod, Container: container}
-		if e.cfg.NodeInfo != nil {
-			actx.Node = e.cfg.NodeInfo()
-		}
-		e.cfg.Attrs.Build(r, actx)
-		r.Attributes().CopyTo(built)
+		built = e.buildFor(pod, container)
 	}
 	cache[token] = built
 	return built
 }
 
-// builtAttrs is attrsFor plus the outcome counter, for single-token callers.
-// It counts only when the token is resolved for the first time, so the
-// per-resource counters stay per-resource (resource() is memoized by id).
+// buildFor renders the configured k8s resource attributes for a resolved pod
+// (and, when the ID named one, its exact container) — the one build shared by
+// the token path (attrsFor) and the peer-IP path (peerAttrs).
+func (e *Enricher) buildFor(pod *kubemeta.Pod, container *kubemeta.Container) pcommon.Map {
+	r := pcommon.NewResource()
+	actx := attrs.Context{Pod: pod, Container: container}
+	if e.cfg.NodeInfo != nil {
+		actx.Node = e.cfg.NodeInfo()
+	}
+	e.cfg.Attrs.Build(r, actx)
+	built := pcommon.NewMap()
+	r.Attributes().CopyTo(built)
+	return built
+}
+
+// builtAttrs returns the k8s attributes for a kind-tagged ID token — attrsFor
+// plus the outcome counting, for single-token callers: the metadata lookup,
+// the attribute build and the enriched/unresolved tally each happen once per
+// distinct token per cache (so the per-resource counters stay per-resource;
+// resource() is memoized by id). An empty map means the ID did not resolve.
 func (e *Enricher) builtAttrs(ctx context.Context, cache map[string]pcommon.Map, token string) pcommon.Map {
 	_, cached := cache[token]
 	built := e.attrsFor(ctx, cache, token)
@@ -636,13 +632,7 @@ func (e *Enricher) peerAttrs(ctx context.Context, cache map[string]pcommon.Map) 
 			// throttle is what is wanted.
 			e.warnPeerRejected(ip, pod)
 		} else {
-			res := pcommon.NewResource()
-			actx := attrs.Context{Pod: pod}
-			if e.cfg.NodeInfo != nil {
-				actx.Node = e.cfg.NodeInfo()
-			}
-			e.cfg.Attrs.Build(res, actx)
-			res.Attributes().CopyTo(built)
+			built = e.buildFor(pod, nil)
 		}
 	}
 	if cache != nil {
@@ -654,10 +644,33 @@ func (e *Enricher) peerAttrs(ctx context.Context, cache map[string]pcommon.Map) 
 	return built, rejected
 }
 
+// peerFallback is peerAttrs plus the outcome accounting: peer_ip when the
+// attribution lands (the caller merges the returned attributes), peer_ip_rejected
+// when Config.PeerReject vetoed it, unresolved otherwise — counted per call,
+// i.e. per RESOURCE on the resource path and per ""-group on the split path,
+// like every other outcome of kubescrape_ingest_resources_total.
+//
+// ONE helper for the two sites because they had drifted: the resource path
+// (applyMetadata) counted all three outcomes while the splitter's ""-group
+// counted peer_ip and unresolved but NOTHING for a rejected peer — behind a
+// comment claiming the rejection "has already been counted", which no site did
+// — so -ingest-metrics-mode=datapoint (and an auto push demoted to split)
+// under-reported the exact counter Config.PeerReject's doc promises.
+func (e *Enricher) peerFallback(ctx context.Context, cache map[string]pcommon.Map) pcommon.Map {
+	built, rejected := e.peerAttrs(ctx, cache)
+	switch {
+	case built.Len() > 0:
+		obs.Ingested.WithLabelValues("peer_ip").Inc()
+	case rejected:
+		obs.Ingested.WithLabelValues("peer_ip_rejected").Inc()
+	default:
+		obs.Ingested.WithLabelValues("unresolved").Inc()
+	}
+	return built
+}
+
 func (e *Enricher) warnPeerRejected(ip string, pod *kubemeta.Pod) {
-	now := time.Now().UnixNano()
-	last := e.lastPeerWarn.Load()
-	if now-last < int64(peerRejectWarnEvery) || !e.lastPeerWarn.CompareAndSwap(last, now) {
+	if !e.peerWarnGate.Allow(peerRejectWarnEvery) {
 		return
 	}
 	e.log.Warn("refusing to attribute pushed telemetry by peer IP: the connection's source address belongs to this receiver's own workload, so it was rewritten in flight (a proxy, a mesh sidecar, or an internal hop addressed to the application port). Those resources stay unenriched; give senders a resource-level container.id or k8s.pod.uid, or make the path preserve the client address",
@@ -671,27 +684,17 @@ const (
 	tokPodUID    = "u\x00"
 )
 
-// findID reports the first container ID or pod UID found in a, as a kind-
-// tagged token.
 // foreignID reports whether a data-point token names a DIFFERENT OBJECT than
 // the resource's token — the question the auto-mode decision actually needs.
 //
-// Comparing the tokens themselves answered it wrongly twice:
-//
-//   - An UNRESOLVABLE point token is not evidence of a foreign object. It
-//     demoted the payload from the resource path (which would have enriched the
-//     sender correctly) to the split path, where a group whose id resolves to
-//     nothing has its copied resource CLEARED — deleting every attribute the
-//     sender set, so service.name vanished and the Prometheus job became
-//     unknown_service.
-//   - Tokens are KIND-TAGGED, so container.id on the resource and k8s.pod.uid
-//     on a data point name one pod and still differ as strings. That demoted a
-//     self-describing sender to the split path too, where the resolved identity
-//     OVERWRITES the sender's — replacing the service.name it chose with the
-//     derived workload name.
-//
-// Both lookups are memoised per request through the same cache the enrichment
-// uses, so a KSM-shaped payload costs no extra round trips.
+// An UNRESOLVABLE point token is not evidence of a foreign object: it used to
+// demote the payload from the resource path (which would have enriched the
+// sender correctly) to the split path, where a group whose id resolves to
+// nothing has its copied resource CLEARED — deleting every attribute the
+// sender set, so service.name vanished and the Prometheus job became
+// unknown_service. A token that DOES resolve is foreign exactly when it names
+// a different object than the resource's — one predicate, sameObject, shared
+// with the split path (see its comment for the drift this repaired).
 func (e *Enricher) foreignID(ctx context.Context, cache map[string]pcommon.Map, tok, resID string) bool {
 	if tok == resID {
 		return false
@@ -699,27 +702,73 @@ func (e *Enricher) foreignID(ctx context.Context, cache map[string]pcommon.Map, 
 	if !e.resolves(ctx, cache, tok) {
 		return false // unresolvable: not evidence of anything
 	}
-	if resID == "" {
-		return true
-	}
-	// Same object under two id kinds is the sender describing ITSELF.
-	pa, _ := e.lookupByID(ctx, tok)
-	pb, _ := e.lookupByID(ctx, resID)
-	return pa == nil || pb == nil || pa.UID != pb.UID
+	return !e.sameObject(ctx, cache, tok, resID)
 }
 
+// sameObject reports whether two kind-tagged ID tokens name the same
+// Kubernetes object for ATTRIBUTION. It is the one predicate behind both the
+// auto-mode foreign-point decision (foreignID) and the split path's
+// merge-vs-overwrite choice (metricGrouper.resource).
+//
+// It existed TWICE and the copies DISAGREED: the auto-mode one matched on pod
+// UID alone, the split path's required pod UID AND an equal
+// k8s.container.name. So for container A's ID on the resource and container
+// B's ID on the data points — two containers of ONE pod, a pod-internal
+// exporter describing its co-container — auto mode said "not foreign", took
+// the resource branch, and stamped container A's identity on container B's
+// points, while explicit datapoint mode split them correctly. The identical
+// payload, attributed differently by mode: the exact bug class
+// resolvableToken's comment records as fixed for the token-choice half.
+//
+// The rules, and why each is what it is:
+//
+//   - Both tokens must RESOLVE. An unresolved side is no evidence they match
+//     (and no evidence they differ — foreignID handles that asymmetry).
+//   - Same pod UID. Tokens are KIND-TAGGED, so container.id and k8s.pod.uid
+//     naming one pod differ as strings; comparing the RESOLVED object is the
+//     point of this predicate.
+//   - Two DIFFERENT container names are two objects. Container B's series
+//     must not carry container A's identity, however much pod they share.
+//   - A pod-level token beside a container-level one is the SAME object at
+//     pod grain: a sender that identifies its resource by container.id (every
+//     SDK container detector) and labels points with its own k8s.pod.uid is
+//     describing ITSELF, and calling that foreign demoted it to the split
+//     path, where the overwrite destroyed the service.name it chose
+//     (TestAutoModeKeepsTheSendersOwnIdentity pins it).
+//
+// Both lookups are memoised per request through the same cache the enrichment
+// uses (attrsFor), so a KSM-shaped payload costs no extra round trips — and
+// the resource branch that usually follows reuses the built attributes.
+func (e *Enricher) sameObject(ctx context.Context, cache map[string]pcommon.Map, a, b string) bool {
+	if a == "" || b == "" {
+		return false
+	}
+	if a == b {
+		return true
+	}
+	ra := e.attrsFor(ctx, cache, a)
+	rb := e.attrsFor(ctx, cache, b)
+	if ra.Len() == 0 || rb.Len() == 0 {
+		return false // at least one did not resolve: no evidence they match
+	}
+	ua, oka := ra.Get("k8s.pod.uid")
+	ub, okb := rb.Get("k8s.pod.uid")
+	if !oka || !okb || ua.Str() != ub.Str() {
+		return false
+	}
+	ca, _ := ra.Get("k8s.container.name")
+	cb, _ := rb.Get("k8s.container.name")
+	return ca.Str() == cb.Str() || ca.Str() == "" || cb.Str() == ""
+}
+
+// findID reports the first container ID or pod UID found in a, as a
+// kind-tagged token (container keys first — a container ID names the exact
+// incarnation).
 func (e *Enricher) findID(a pcommon.Map) (token string, ok bool) {
-	for _, k := range e.containerIDKeys {
-		if v, ok := a.Get(k); ok && v.Str() != "" {
-			return tokContainer + v.Str(), true
-		}
+	if tok, ok := e.tokenFrom(a, e.containerIDKeys, tokContainer); ok {
+		return tok, true
 	}
-	for _, k := range e.podUIDKeys {
-		if v, ok := a.Get(k); ok && v.Str() != "" {
-			return tokPodUID + v.Str(), true
-		}
-	}
-	return "", false
+	return e.tokenFrom(a, e.podUIDKeys, tokPodUID)
 }
 
 // lookupByID resolves a kind-tagged ID token to metadata (nil pod on miss).

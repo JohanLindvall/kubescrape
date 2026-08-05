@@ -7,6 +7,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/JohanLindvall/kubescrape/pkg/kubemeta"
 )
 
 // TestConcurrentChurnInvariants hammers the read API from 32 goroutines while
@@ -111,7 +113,7 @@ func TestConcurrentChurnInvariants(t *testing.T) {
 					}
 				case 1:
 					if np, ok := s.GetPodByIP(podIP(w, p)); ok {
-						if np.Pod.DeletedAt != nil || finishedPhase(np.Pod.Phase) {
+						if np.Pod.DeletedAt != nil || kubemeta.FinishedPhase(np.Pod.Phase) {
 							select {
 							case readerErr <- fmt.Sprintf("GetPodByIP(%s) returned deleted/finished pod %s", podIP(w, p), np.Pod.Name):
 							default:

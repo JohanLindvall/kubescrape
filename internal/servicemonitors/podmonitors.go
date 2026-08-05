@@ -6,13 +6,9 @@ package servicemonitors
 // probing has no node affinity and does not fit the node-local model.)
 
 import (
-	"fmt"
-	"sort"
-
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/labels"
-	"k8s.io/apimachinery/pkg/runtime"
 )
 
 // PodGVR is the PodMonitor resource.
@@ -32,83 +28,48 @@ type PodMonitor struct {
 // PodNamespaces returns the namespaces the monitor selects pods in; nil
 // means all.
 func (m *PodMonitor) PodNamespaces() []string {
-	if m.NamespaceAny {
-		return nil
-	}
-	if len(m.Namespaces) > 0 {
-		return m.Namespaces
-	}
-	return []string{m.Namespace}
+	return namespaceSelector{Any: m.NamespaceAny, MatchNames: m.Namespaces}.resolve(m.Namespace)
 }
 
 // pmSpec mirrors the PodMonitor spec fields we interpret.
 type pmSpec struct {
-	Selector          metav1.LabelSelector `json:"selector"`
-	NamespaceSelector struct {
-		Any        bool     `json:"any"`
-		MatchNames []string `json:"matchNames"`
-	} `json:"namespaceSelector"`
-	PodMetricsEndpoints []endpointSpec `json:"podMetricsEndpoints"`
+	Selector            metav1.LabelSelector `json:"selector"`
+	NamespaceSelector   namespaceSelector    `json:"namespaceSelector"`
+	PodMetricsEndpoints []endpointSpec       `json:"podMetricsEndpoints"`
 	specLimits          `json:",inline"`
 }
 
-// ParsePodMonitor converts an unstructured PodMonitor.
+func (s *pmSpec) labelSelector() *metav1.LabelSelector { return &s.Selector }
+func (s *pmSpec) nsSelector() namespaceSelector        { return s.NamespaceSelector }
+func (s *pmSpec) endpointSpecs() []endpointSpec        { return s.PodMetricsEndpoints }
+func (s *pmSpec) monitorIgnored() []string             { return s.ignored() }
+
+// ParsePodMonitor converts an unstructured PodMonitor. The skeleton —
+// including the per-endpoint secret-ref namespacing that bounds
+// /v1/scrape-auth — is parseMonitorSpec, shared with Parse.
 func ParsePodMonitor(u *unstructured.Unstructured) (*PodMonitor, error) {
-	specRaw, ok := u.Object["spec"].(map[string]any)
-	if !ok {
-		return nil, fmt.Errorf("podmonitor %s/%s: no spec", u.GetNamespace(), u.GetName())
-	}
-	var spec pmSpec
-	if err := runtime.DefaultUnstructuredConverter.FromUnstructured(specRaw, &spec); err != nil {
-		return nil, fmt.Errorf("podmonitor %s/%s: %w", u.GetNamespace(), u.GetName(), err)
-	}
-	sel, err := metav1.LabelSelectorAsSelector(&spec.Selector)
+	b, err := parseMonitorSpec(u, "podmonitor", &pmSpec{})
 	if err != nil {
-		return nil, fmt.Errorf("podmonitor %s/%s selector: %w", u.GetNamespace(), u.GetName(), err)
+		return nil, err
 	}
-	m := &PodMonitor{
-		Namespace:    u.GetNamespace(),
-		Name:         u.GetName(),
-		Selector:     sel,
-		NamespaceAny: spec.NamespaceSelector.Any,
-		Namespaces:   spec.NamespaceSelector.MatchNames,
-	}
-	specIgnored := spec.ignored()
-	for _, ep := range spec.PodMetricsEndpoints {
-		e := ep.toEndpoint()
-		// See Parse: monitor-level ignored fields ride on every endpoint and
-		// IgnoredFields dedupes them to one report.
-		e.Ignored = append(e.Ignored, specIgnored...)
-		// Every secret reference is namespaced with the MONITOR's namespace: a
-		// monitor may only name secrets in its own namespace, which is what
-		// bounds what /v1/scrape-auth will serve. The FIELD LIST lives on
-		// Endpoint (secretRefs), shared with the PodMonitor parser and with
-		// AuthSecretRefs — see its doc for why it must be exactly one list.
-		e.namespaceSecretRefs(m.Namespace)
-		m.Endpoints = append(m.Endpoints, e)
-	}
-	return m, nil
+	return &PodMonitor{
+		Namespace:    b.Namespace,
+		Name:         b.Name,
+		Selector:     b.Selector,
+		NamespaceAny: b.NamespaceAny,
+		Namespaces:   b.Namespaces,
+		Endpoints:    b.Endpoints,
+	}, nil
 }
 
-// UpsertPodMonitor parses and stores a PodMonitor. Like Upsert, a monitor
-// UPDATED to an unparseable spec is REMOVED rather than kept: silently serving
-// the previous version forever would diverge from what the manifest declares
-// (prometheus-operator likewise generates no config for an invalid monitor).
-//
-// That matters more here than the symmetry suggests — the endpoints being
-// dropped carry the bearerTokenSecret refs AuthSecretRefs allowlists, so a
-// stale one would keep /v1/scrape-auth willing to serve a Secret the live spec
-// no longer names. The rule was documented on Upsert and only implied here.
+// UpsertPodMonitor parses and stores a PodMonitor (see upsertMonitor for the
+// invalid-update-removes policy — which matters doubly here, because the
+// endpoints being dropped carry the bearerTokenSecret refs AuthSecretRefs
+// allowlists, so a stale monitor would keep /v1/scrape-auth willing to serve
+// a Secret the live spec no longer names).
 func (x *Index) UpsertPodMonitor(u *unstructured.Unstructured) error {
 	m, err := ParsePodMonitor(u)
-	x.mu.Lock()
-	defer x.mu.Unlock()
-	if err != nil {
-		delete(x.podMonitors, u.GetNamespace()+"/"+u.GetName())
-		return err
-	}
-	x.podMonitors[m.Namespace+"/"+m.Name] = m
-	return nil
+	return upsertMonitor(x, x.podMonitors, u.GetNamespace()+"/"+u.GetName(), m, err)
 }
 
 // DeletePodMonitor removes one.
@@ -119,22 +80,13 @@ func (x *Index) DeletePodMonitor(namespace, name string) {
 }
 
 // PodMonitors returns all pod monitors (shared, treat as immutable).
+//
+// Sorted like Monitor.All(): when two PodMonitors select the same pod and
+// mint the same URL, the URL-dedup in handleNodeTargets keeps the FIRST, so
+// map-iteration order must not decide which monitor's name / auth /
+// relabelings ride on the surviving target.
 func (x *Index) PodMonitors() []*PodMonitor {
 	x.mu.RLock()
 	defer x.mu.RUnlock()
-	out := make([]*PodMonitor, 0, len(x.podMonitors))
-	for _, m := range x.podMonitors {
-		out = append(out, m)
-	}
-	// Sorted like Monitor.All(): when two PodMonitors select the same pod and
-	// mint the same URL, the URL-dedup in handleNodeTargets keeps the FIRST,
-	// so map-iteration order must not decide which monitor's name / auth /
-	// relabelings ride on the surviving target.
-	sort.Slice(out, func(i, j int) bool {
-		if out[i].Namespace != out[j].Namespace {
-			return out[i].Namespace < out[j].Namespace
-		}
-		return out[i].Name < out[j].Name
-	})
-	return out
+	return sortedMonitors(x.podMonitors, func(m *PodMonitor) (string, string) { return m.Namespace, m.Name })
 }

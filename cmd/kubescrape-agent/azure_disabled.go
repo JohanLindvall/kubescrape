@@ -33,5 +33,5 @@ func (p *pipelines) startAzure(context.Context) error {
 	if !*azureOn {
 		return nil
 	}
-	return excludedPipelineError("azure-diagnostics", "azure", "Azure diagnostics consumer")
+	return excludedPipelineErrorFor("azure")
 }

@@ -13,7 +13,6 @@ package promscrape
 
 import (
 	"bufio"
-	"context"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -21,8 +20,6 @@ import (
 
 	dto "github.com/prometheus/client_model/go"
 	"google.golang.org/protobuf/proto"
-
-	"github.com/JohanLindvall/kubescrape/internal/obs"
 )
 
 // acceptProto is the Accept header offering protobuf exposition first.
@@ -88,75 +85,21 @@ func readDelimited(r io.Reader, dst []byte, n int) ([]byte, error) {
 const maxExpBuckets = 4096
 
 // parseProtoAndExport consumes a delimited-protobuf exposition. Classic
-// families flow through the same converter/filter machinery as text
-// samples; native histograms go straight to the batcher as exponential
-// histogram points.
-func (s *Scraper) parseProtoAndExport(ctx context.Context, body io.Reader, cb chunker, pipeline string, relabel *relabelFilter, export func() error, full func() bool) (samples, malformed int, err error) {
-	filter := s.cfg.Filters.filterFor(pipeline).session()
-	exportFailed := false
-	exportChunk := func() error {
-		if eerr := export(); eerr != nil {
-			exportFailed = true
-			return eerr
-		}
-		return nil
-	}
-	conv := newConverter(cb, func() error {
-		if full() {
-			return exportChunk()
-		}
-		return nil
-	})
-	// Salvage the partially converted scrape on ANY abort (sample limit,
-	// truncated body, read timeout mid-body, over-cap message), exactly as the
-	// text path does. Every metric kind here is cumulative, so a partial scrape
-	// costs only the missing series — whereas discarding the whole conversion
-	// threw away everything parsed before the abort. Pointless when the failure
-	// WAS the export (the collector just rejected a chunk) or when the context
-	// is gone (the send cannot succeed either).
+// families flow through the same converter/filter machinery as text samples
+// (ss.accept); native histograms go straight to the batcher as exponential
+// histogram points. The per-scrape policy — filter/relabel drops, MaxSamples,
+// chunk flushing, the salvage-on-abort — is the shared scrapeSession's; only
+// the format loop lives here. malformed includes the converter's count on
+// every return path.
+func (s *Scraper) parseProtoAndExport(ss *scrapeSession, body io.Reader) (malformed int, err error) {
 	defer func() {
-		if err == nil || exportFailed || ctx.Err() != nil {
-			return
-		}
-		if ferr := conv.finish(); ferr == nil && cb.count() > 0 {
-			if eerr := export(); eerr != nil {
-				s.log.Warn("exporting partial proto scrape", "pipeline", pipeline, "error", eerr)
-			}
+		malformed += ss.conv.malformed
+		if err != nil {
+			// Salvage on ANY abort (sample limit, truncated body, read timeout
+			// mid-body, over-cap message), exactly as the text path does.
+			ss.salvage()
 		}
 	}()
-	// Counted in locals and reported once, for the reason the text path does
-	// it (see parseAndExportFiltered): keep runs per sample. The deferred
-	// report covers the abort paths too.
-	var droppedFilter, droppedRelabel int
-	defer func() {
-		if droppedFilter > 0 {
-			obs.ScrapeSamplesDropped.WithLabelValues(pipeline, "filter").Add(float64(droppedFilter))
-		}
-		if droppedRelabel > 0 {
-			obs.ScrapeSamplesDropped.WithLabelValues(pipeline, "relabel").Add(float64(droppedRelabel))
-		}
-	}()
-	keep := func(name string, labels []Label) bool {
-		if !filter.Keep(name, labels) {
-			droppedFilter++
-			return false
-		}
-		if relabel != nil && !relabel.Keep(name, labels) {
-			droppedRelabel++
-			return false
-		}
-		return true
-	}
-	emit := func(sample Sample) error {
-		samples++
-		if s.cfg.MaxSamples > 0 && samples > s.cfg.MaxSamples {
-			return ErrTooManySamples
-		}
-		if !keep(sample.Name, sample.Labels) {
-			return nil
-		}
-		return conv.add(sample)
-	}
 
 	br := bufio.NewReaderSize(body, 64*1024)
 	var buf []byte
@@ -167,59 +110,39 @@ func (s *Scraper) parseProtoAndExport(ctx context.Context, body io.Reader, cb ch
 			if rerr == io.EOF {
 				break
 			}
-			return samples, malformed + conv.malformed, rerr
+			return malformed, rerr
 		}
 		if n > maxProtoMessageBytes {
-			return samples, malformed + conv.malformed, fmt.Errorf("proto message of %d bytes exceeds the cap", n)
+			return malformed, fmt.Errorf("proto message of %d bytes exceeds the cap", n)
 		}
 		var rerr2 error
 		if buf, rerr2 = readDelimited(br, buf, int(n)); rerr2 != nil {
-			return samples, malformed + conv.malformed, rerr2
+			return malformed, rerr2
 		}
 		mf.Reset()
 		if perr := proto.Unmarshal(buf, &mf); perr != nil {
 			malformed++
 			continue
 		}
-		// flushIfFull lets protoFamily flush BETWEEN the points of a single
-		// native-histogram family: a delimited exposition emits one
-		// MetricFamily per metric holding ALL its series, so checking only at
-		// the family boundary would build the whole batch in memory and blow
-		// BatchBytes for a high-cardinality native family (classic samples
-		// already flush mid-family via converter.check).
-		flushIfFull := func() error {
-			if !full() {
-				return nil
-			}
-			if ferr := conv.finish(); ferr != nil {
-				return ferr
-			}
-			return exportChunk()
-		}
-		m, bad, ferr := s.protoFamily(&mf, cb, keep, emit, samples, flushIfFull)
-		samples += m.samples
+		bad, ferr := s.protoFamily(&mf, ss)
 		malformed += bad
 		if ferr != nil {
-			return samples, malformed + conv.malformed, ferr
+			return malformed, ferr
 		}
-		if ferr := flushIfFull(); ferr != nil {
-			return samples, malformed + conv.malformed, ferr
+		if ferr := ss.flushIfFull(); ferr != nil {
+			return malformed, ferr
 		}
 	}
-	if ferr := conv.finish(); ferr != nil {
-		return samples, malformed + conv.malformed, ferr
+	if ferr := ss.conv.finish(); ferr != nil {
+		return malformed, ferr
 	}
-	return samples, malformed + conv.malformed, nil
+	return malformed, nil
 }
 
-type protoCounts struct{ samples int }
-
-// protoFamily converts one MetricFamily. baseSamples is the sample count
-// BEFORE this family (for the MaxSamples cap on the native path, which does
-// not go through emit); flushIfFull flushes a full batch between native
-// points.
-func (s *Scraper) protoFamily(mf *dto.MetricFamily, cb chunker, keep func(string, []Label) bool, emit func(Sample) error, baseSamples int, flushIfFull func() error) (protoCounts, int, error) {
-	var c protoCounts
+// protoFamily converts one MetricFamily. Native points bypass ss.accept (they
+// do not flow through the converter), so they charge MaxSamples via
+// ss.countNative and flush a full batch between points via ss.flushIfFull.
+func (s *Scraper) protoFamily(mf *dto.MetricFamily, ss *scrapeSession) (int, error) {
 	malformed := 0
 	name := mf.GetName()
 	// The family's HELP/UNIT ride on every sample, exactly as the text path
@@ -236,48 +159,46 @@ func (s *Scraper) protoFamily(mf *dto.MetricFamily, cb chunker, keep func(string
 			cnt := m.GetCounter()
 			smp := Sample{Name: name, Family: name, Role: RoleCounter, Labels: labels, Value: cnt.GetValue(), TimestampMs: ts, Help: help, Unit: unit}
 			smp.Exemplar = s.protoExemplar(cnt.GetExemplar(), &ex)
-			if err := emit(smp); err != nil {
-				return c, malformed, err
+			if err := ss.accept(smp); err != nil {
+				return malformed, err
 			}
 		case dto.MetricType_GAUGE, dto.MetricType_UNTYPED:
 			v := m.GetGauge().GetValue()
 			if mf.GetType() == dto.MetricType_UNTYPED {
 				v = m.GetUntyped().GetValue()
 			}
-			if err := emit(Sample{Name: name, Family: name, Role: RoleGauge, Labels: labels, Value: v, TimestampMs: ts, Help: help, Unit: unit}); err != nil {
-				return c, malformed, err
+			if err := ss.accept(Sample{Name: name, Family: name, Role: RoleGauge, Labels: labels, Value: v, TimestampMs: ts, Help: help, Unit: unit}); err != nil {
+				return malformed, err
 			}
 		case dto.MetricType_SUMMARY:
 			sum := m.GetSummary()
 			for _, q := range sum.GetQuantile() {
 				ql := append(labels[:len(labels):len(labels)], Label{Name: "quantile", Value: formatFloat(q.GetQuantile())})
-				if err := emit(Sample{Name: name, Family: name, Role: RoleSummaryQuantile, Labels: ql, Value: q.GetValue(), TimestampMs: ts, Help: help, Unit: unit}); err != nil {
-					return c, malformed, err
+				if err := ss.accept(Sample{Name: name, Family: name, Role: RoleSummaryQuantile, Labels: ql, Value: q.GetValue(), TimestampMs: ts, Help: help, Unit: unit}); err != nil {
+					return malformed, err
 				}
 			}
-			if err := emit(Sample{Name: name + "_sum", Family: name, Role: RoleSummarySum, Labels: labels, Value: sum.GetSampleSum(), TimestampMs: ts, Help: help, Unit: unit}); err != nil {
-				return c, malformed, err
+			if err := ss.accept(Sample{Name: name + "_sum", Family: name, Role: RoleSummarySum, Labels: labels, Value: sum.GetSampleSum(), TimestampMs: ts, Help: help, Unit: unit}); err != nil {
+				return malformed, err
 			}
-			if err := emit(Sample{Name: name + "_count", Family: name, Role: RoleSummaryCount, Labels: labels, Value: float64(sum.GetSampleCount()), TimestampMs: ts, Help: help, Unit: unit}); err != nil {
-				return c, malformed, err
+			if err := ss.accept(Sample{Name: name + "_count", Family: name, Role: RoleSummaryCount, Labels: labels, Value: float64(sum.GetSampleCount()), TimestampMs: ts, Help: help, Unit: unit}); err != nil {
+				return malformed, err
 			}
 		case dto.MetricType_HISTOGRAM, dto.MetricType_GAUGE_HISTOGRAM:
 			h := m.GetHistogram()
 			if isNative(h) {
-				c.samples++
-				// MaxSamples bounds native points too (they bypass emit).
-				if s.cfg.MaxSamples > 0 && baseSamples+c.samples > s.cfg.MaxSamples {
-					return c, malformed, ErrTooManySamples
+				if err := ss.countNative(); err != nil {
+					return malformed, err
 				}
-				if !keep(name, labels) {
+				if !ss.keep(name, labels) {
 					continue
 				}
-				if !s.addNativeHistogram(cb, name, metricMeta{help: help, unit: unit}, labels, h, ts) {
+				if !s.addNativeHistogram(ss.cb, name, metricMeta{help: help, unit: unit}, labels, h, ts) {
 					malformed++
 					continue
 				}
-				if err := flushIfFull(); err != nil {
-					return c, malformed, err
+				if err := ss.flushIfFull(); err != nil {
+					return malformed, err
 				}
 				continue
 			}
@@ -285,21 +206,21 @@ func (s *Scraper) protoFamily(mf *dto.MetricFamily, cb chunker, keep func(string
 				bl := append(labels[:len(labels):len(labels)], Label{Name: "le", Value: formatFloat(b.GetUpperBound())})
 				smp := Sample{Name: name + "_bucket", Family: name, Role: RoleHistogramBucket, Labels: bl, Value: float64(b.GetCumulativeCount()), TimestampMs: ts, Help: help, Unit: unit}
 				smp.Exemplar = s.protoExemplar(b.GetExemplar(), &ex)
-				if err := emit(smp); err != nil {
-					return c, malformed, err
+				if err := ss.accept(smp); err != nil {
+					return malformed, err
 				}
 			}
-			if err := emit(Sample{Name: name + "_sum", Family: name, Role: RoleHistogramSum, Labels: labels, Value: h.GetSampleSum(), TimestampMs: ts, Help: help, Unit: unit}); err != nil {
-				return c, malformed, err
+			if err := ss.accept(Sample{Name: name + "_sum", Family: name, Role: RoleHistogramSum, Labels: labels, Value: h.GetSampleSum(), TimestampMs: ts, Help: help, Unit: unit}); err != nil {
+				return malformed, err
 			}
-			if err := emit(Sample{Name: name + "_count", Family: name, Role: RoleHistogramCount, Labels: labels, Value: float64(h.GetSampleCount()), TimestampMs: ts, Help: help, Unit: unit}); err != nil {
-				return c, malformed, err
+			if err := ss.accept(Sample{Name: name + "_count", Family: name, Role: RoleHistogramCount, Labels: labels, Value: float64(h.GetSampleCount()), TimestampMs: ts, Help: help, Unit: unit}); err != nil {
+				return malformed, err
 			}
 		default:
 			malformed++
 		}
 	}
-	return c, malformed, nil
+	return malformed, nil
 }
 
 // protoExemplar converts a protobuf exemplar into the shape the text path

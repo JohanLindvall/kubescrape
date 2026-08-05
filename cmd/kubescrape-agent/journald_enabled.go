@@ -6,6 +6,7 @@ import (
 	"context"
 
 	"github.com/JohanLindvall/kubescrape/internal/agent/journald"
+	"github.com/JohanLindvall/kubescrape/internal/cli"
 )
 
 // journaldBuilt reports that this build contains the journal reader: the
@@ -19,7 +20,7 @@ func (p *pipelines) startJournald(ctx context.Context) error {
 	}
 	jr := journald.New(journald.Config{
 		Dir:           *journaldDir,
-		Units:         splitList(*journaldUnits),
+		Units:         cli.SplitList(*journaldUnits),
 		Positions:     p.posStore,
 		BatchSize:     *journaldBatch,
 		MaxBatchBytes: *journaldBytes,

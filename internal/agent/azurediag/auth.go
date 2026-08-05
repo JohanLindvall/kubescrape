@@ -32,6 +32,7 @@ import (
 
 	ljson "github.com/JohanLindvall/lightning/pkg/json"
 
+	"github.com/JohanLindvall/kubescrape/internal/agent/logchain"
 	"github.com/JohanLindvall/kubescrape/internal/logline"
 	"github.com/JohanLindvall/kubescrape/internal/obs"
 )
@@ -225,9 +226,12 @@ func parseTokenResponse(body []byte, what string) (string, time.Duration, error)
 	return tok, ttl, nil
 }
 
+// truncate caps an HTTP body copied into an error, cutting on a rune
+// boundary (a bare s[:n] could split a multibyte rune and put invalid UTF-8
+// into the error string).
 func truncate(s string, n int) string {
 	if len(s) > n {
-		return s[:n] + "…"
+		return logchain.TruncateRunes(s, n) + "…"
 	}
 	return s
 }

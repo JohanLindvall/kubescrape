@@ -20,8 +20,12 @@ import (
 	"github.com/JohanLindvall/kubescrape/internal/agent/attrs"
 	"github.com/JohanLindvall/kubescrape/internal/agent/logchain"
 	"github.com/JohanLindvall/kubescrape/internal/obs"
-	"github.com/JohanLindvall/kubescrape/pkg/logattrs"
 )
+
+// ScopeName is the OTLP instrumentation-scope name on every event record
+// (wire-visible: changing it splits every event stream at the upgrade
+// boundary).
+const ScopeName = "github.com/JohanLindvall/kubescrape/agent/events"
 
 // ingest converts one event into a batch entry, resolving its resource.
 func (r *Reader) ingest(ctx context.Context, e *corev1.Event) {
@@ -172,8 +176,7 @@ func (r *Reader) resource(ctx context.Context, e *corev1.Event) (string, pcommon
 // before the record exists, so the chain's Scrub is nil.
 func (r *Reader) convert() plog.Logs {
 	ld := plog.NewLogs()
-	scopes := make(map[string]plog.ScopeLogs, 8)
-	resAttrs := make(map[string]pcommon.Map, 8)
+	groups := logchain.NewGroups(ld, ScopeName, 8)
 	sink := &recordSink{observed: pcommon.NewTimestampFromTime(time.Now())}
 	chain := logchain.NewChain[string](logchain.Config{
 		LogAttrs:   r.cfg.LogAttrs,
@@ -184,29 +187,16 @@ func (r *Reader) convert() plog.Logs {
 
 	for _, e := range r.batch {
 		body, extracted := chain.Line(e.body)
-		key := e.resKey
-		if r.cfg.LogAttrs != nil {
-			key = e.resKey + "\x01" + logattrs.Key(extracted.Resource) + "\x01" + logattrs.Key(extracted.Scope)
-		}
-		sl, ok := scopes[key]
-		if !ok {
-			rl := ld.ResourceLogs().AppendEmpty()
-			e.res.CopyTo(rl.Resource())
-			logattrs.Put(rl.Resource().Attributes(), extracted.Resource)
-			sl = rl.ScopeLogs().AppendEmpty()
-			sl.Scope().SetName("github.com/JohanLindvall/kubescrape/agent/events")
-			sl.Scope().SetVersion(obs.ScopeVersion)
-			logattrs.Put(sl.Scope().Attributes(), extracted.Scope)
-			scopes[key] = sl
-			resAttrs[key] = rl.Resource().Attributes()
-		}
+		key := chain.GroupKey(e.resKey, extracted)
 		// The group is built BEFORE the record because metric and rule
 		// resolution reads the group's own resource; a group the rules empty is
 		// pruned below.
-		sink.sl, sink.e = sl, e
+		sink.e = e
 		sink.e.body = body
+		ent := groups.Get(key, extracted, sink)
+		sink.sl = ent.SL
 		chain.Emit(sink, logchain.Input[string]{
-			Body: body, Lifted: extracted, Resource: resAttrs[key], BoundKey: key,
+			Body: body, Lifted: extracted, Resource: ent.Res, BoundKey: key,
 		})
 	}
 	// An all-dropped group leaves an empty ResourceLogs behind.
@@ -223,6 +213,10 @@ type recordSink struct {
 }
 
 func (s *recordSink) Dest() plog.LogRecordSlice { return s.sl.LogRecords() }
+
+// FillResource builds a fresh group's resource: the involved object's
+// identity, resolved at ingest time (entry.res).
+func (s *recordSink) FillResource(res pcommon.Resource) { s.e.res.CopyTo(res) }
 
 func (s *recordSink) Stamp(lr plog.LogRecord) {
 	e := s.e

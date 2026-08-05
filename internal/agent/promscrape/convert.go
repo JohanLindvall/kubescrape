@@ -555,12 +555,11 @@ func (b *batcher) metricByName(name string) (pmetric.Metric, bool) {
 	return m, ok
 }
 
-// remember indexes a newly created metric (the sole creation choke point for
-// the plain batcher, so the descriptor's bytes are charged here).
+// remember indexes a newly created metric; the descriptor's bytes are charged
+// at the creation site via chargeDescriptor.
 func (b *batcher) remember(name string, m pmetric.Metric) {
 	b.byName[name] = m
 	b.lastName, b.lastMetric, b.lastOK = name, m, true
-	b.bytes += len(name) + metricOverheadBytes
 }
 
 // addNumber emits a gauge or (monotonic cumulative) sum data point.
@@ -586,18 +585,29 @@ func (b *batcher) addExponential(family string, p expPoint) {
 	if !ok {
 		m = b.sm.Metrics().AppendEmpty()
 		m.SetName(family)
-		b.bytes += p.meta.apply(m)
-		eh := m.SetEmptyExponentialHistogram()
-		eh.SetAggregationTemporality(pmetric.AggregationTemporalityCumulative)
+		shapeExponentialHistogram(m)
+		b.bytes += chargeDescriptor(m, family, p.meta)
 		b.remember(family, m)
 	}
-	if m.Type() != pmetric.MetricTypeExponentialHistogram {
-		obs.ScrapeCollisions.Inc()
+	dp, ok := exponentialDataPoint(m, b.startTS)
+	if !ok {
 		return
 	}
-	dp := m.ExponentialHistogram().DataPoints().AppendEmpty()
-	dp.SetStartTimestamp(b.startTS)
 	dp.SetTimestamp(pointTS(p.ts, b.scrapeTS))
+	fillExponentialPoint(dp, p)
+	putLabels(dp.Attributes(), p.labels)
+	for _, e := range p.exemplars {
+		setExemplar(dp.Exemplars().AppendEmpty(), e, b.scrapeTS)
+	}
+	b.points++
+	b.bytes += expHistBytes(&p)
+}
+
+// fillExponentialPoint copies one decoded native histogram onto an OTLP
+// exponential-histogram point (the schema IS the OTLP scale — both are
+// base-2). The sibling of fillHistogramPoint/fillSummaryPoint; timestamps and
+// attributes stay with the batcher, which owns them.
+func fillExponentialPoint(dp pmetric.ExponentialHistogramDataPoint, p expPoint) {
 	dp.SetScale(p.schema)
 	dp.SetZeroCount(p.zeroCount)
 	dp.SetZeroThreshold(p.zeroTh)
@@ -609,12 +619,6 @@ func (b *batcher) addExponential(family string, p expPoint) {
 	dp.Positive().BucketCounts().FromRaw(p.pos)
 	dp.Negative().SetOffset(p.negOffset)
 	dp.Negative().BucketCounts().FromRaw(p.neg)
-	putLabels(dp.Attributes(), p.labels)
-	for _, e := range p.exemplars {
-		setExemplar(dp.Exemplars().AppendEmpty(), e, b.scrapeTS)
-	}
-	b.points++
-	b.bytes += expHistBytes(&p)
 }
 
 func (b *batcher) addNumber(s Sample, monotonic bool) {
@@ -622,14 +626,8 @@ func (b *batcher) addNumber(s Sample, monotonic bool) {
 	if !ok {
 		m = b.sm.Metrics().AppendEmpty()
 		m.SetName(s.Name)
-		b.bytes += sampleMeta(s).apply(m)
-		if monotonic {
-			sum := m.SetEmptySum()
-			sum.SetIsMonotonic(true)
-			sum.SetAggregationTemporality(pmetric.AggregationTemporalityCumulative)
-		} else {
-			m.SetEmptyGauge()
-		}
+		shapeNumber(m, monotonic)
+		b.bytes += chargeDescriptor(m, s.Name, sampleMeta(s))
 		b.remember(s.Name, m)
 	}
 
@@ -655,18 +653,14 @@ func (b *batcher) addHistogram(family string, acc *histAcc) {
 	if !ok {
 		m = b.sm.Metrics().AppendEmpty()
 		m.SetName(family)
-		b.bytes += acc.meta.apply(m)
-		h := m.SetEmptyHistogram()
-		h.SetAggregationTemporality(pmetric.AggregationTemporalityCumulative)
+		shapeHistogram(m)
+		b.bytes += chargeDescriptor(m, family, acc.meta)
 		b.remember(family, m)
 	}
-	if m.Type() != pmetric.MetricTypeHistogram {
-		obs.ScrapeCollisions.Inc()
+	dp, ok := histogramDataPoint(m, b.startTS)
+	if !ok {
 		return
 	}
-
-	dp := m.Histogram().DataPoints().AppendEmpty()
-	dp.SetStartTimestamp(b.startTS)
 	dp.SetTimestamp(pointTS(acc.ts, b.scrapeTS))
 	fillHistogramPoint(dp, acc)
 	putLabels(dp.Attributes(), acc.labels)
@@ -737,17 +731,14 @@ func (b *batcher) addSummary(family string, acc *summAcc) {
 	if !ok {
 		m = b.sm.Metrics().AppendEmpty()
 		m.SetName(family)
-		b.bytes += acc.meta.apply(m)
-		m.SetEmptySummary()
+		shapeSummary(m)
+		b.bytes += chargeDescriptor(m, family, acc.meta)
 		b.remember(family, m)
 	}
-	if m.Type() != pmetric.MetricTypeSummary {
-		obs.ScrapeCollisions.Inc()
+	dp, ok := summaryDataPoint(m, b.startTS)
+	if !ok {
 		return
 	}
-
-	dp := m.Summary().DataPoints().AppendEmpty()
-	dp.SetStartTimestamp(b.startTS)
 	dp.SetTimestamp(pointTS(acc.ts, b.scrapeTS))
 	fillSummaryPoint(dp, acc)
 	putLabels(dp.Attributes(), acc.labels)
@@ -797,6 +788,12 @@ func pointTS(tsMs int64, scrapeTS pcommon.Timestamp) pcommon.Timestamp {
 // numberDataPoint appends a data point of m's kind — Sum stamps the cumulative
 // start time. ok is false, counted as a name collision, when m is neither a Sum
 // nor a Gauge (a family name reused across incompatible metric shapes).
+//
+// histogramDataPoint/exponentialDataPoint/summaryDataPoint below are its
+// bucketed-kind siblings: one type-mismatch → obs.ScrapeCollisions → bail
+// decision for all three batchers (it used to be open-coded eight times), with
+// the cumulative start time stamped on the appended point. The caller sets the
+// point's own timestamp — which batcher clock applies is the caller's business.
 func numberDataPoint(m pmetric.Metric, startTS pcommon.Timestamp) (pmetric.NumberDataPoint, bool) {
 	switch m.Type() {
 	case pmetric.MetricTypeSum:
@@ -809,6 +806,70 @@ func numberDataPoint(m pmetric.Metric, startTS pcommon.Timestamp) (pmetric.Numbe
 		obs.ScrapeCollisions.Inc()
 		return pmetric.NumberDataPoint{}, false
 	}
+}
+
+func histogramDataPoint(m pmetric.Metric, startTS pcommon.Timestamp) (pmetric.HistogramDataPoint, bool) {
+	if m.Type() != pmetric.MetricTypeHistogram {
+		obs.ScrapeCollisions.Inc()
+		return pmetric.HistogramDataPoint{}, false
+	}
+	dp := m.Histogram().DataPoints().AppendEmpty()
+	dp.SetStartTimestamp(startTS)
+	return dp, true
+}
+
+func exponentialDataPoint(m pmetric.Metric, startTS pcommon.Timestamp) (pmetric.ExponentialHistogramDataPoint, bool) {
+	if m.Type() != pmetric.MetricTypeExponentialHistogram {
+		obs.ScrapeCollisions.Inc()
+		return pmetric.ExponentialHistogramDataPoint{}, false
+	}
+	dp := m.ExponentialHistogram().DataPoints().AppendEmpty()
+	dp.SetStartTimestamp(startTS)
+	return dp, true
+}
+
+func summaryDataPoint(m pmetric.Metric, startTS pcommon.Timestamp) (pmetric.SummaryDataPoint, bool) {
+	if m.Type() != pmetric.MetricTypeSummary {
+		obs.ScrapeCollisions.Inc()
+		return pmetric.SummaryDataPoint{}, false
+	}
+	dp := m.Summary().DataPoints().AppendEmpty()
+	dp.SetStartTimestamp(startTS)
+	return dp, true
+}
+
+// The shape funcs initialize a just-created metric's kind, shared by all three
+// batchers. Top-level funcs, never per-point closures: the split and cadvisor
+// batchers pass them as the `shape` argument on allocation-pinned paths.
+func shapeNumber(m pmetric.Metric, monotonic bool) {
+	if monotonic {
+		sum := m.SetEmptySum()
+		sum.SetIsMonotonic(true)
+		sum.SetAggregationTemporality(pmetric.AggregationTemporalityCumulative)
+	} else {
+		m.SetEmptyGauge()
+	}
+}
+
+func shapeHistogram(m pmetric.Metric) {
+	m.SetEmptyHistogram().SetAggregationTemporality(pmetric.AggregationTemporalityCumulative)
+}
+
+func shapeExponentialHistogram(m pmetric.Metric) {
+	m.SetEmptyExponentialHistogram().SetAggregationTemporality(pmetric.AggregationTemporalityCumulative)
+}
+
+func shapeSummary(m pmetric.Metric) { m.SetEmptySummary() }
+
+// chargeDescriptor stamps a newly created metric's HELP/UNIT and returns the
+// descriptor's full contribution to the chunk-size estimate: name, framing and
+// the description/unit text. It is the ONE spelling of that charge (there were
+// six): a resource-per-object batcher (split, cadvisor) repeats every
+// descriptor per described object, so an uncharged or half-charged descriptor
+// flushes past the collector's 4 MiB receive limit the estimate exists to
+// respect. TestBucketHeavyHistogramStaysUnderCollectorLimit guards the sum.
+func chargeDescriptor(m pmetric.Metric, name string, meta metricMeta) int {
+	return len(name) + metricOverheadBytes + meta.apply(m)
 }
 
 func putLabels(attrs pcommon.Map, labels []Label) {

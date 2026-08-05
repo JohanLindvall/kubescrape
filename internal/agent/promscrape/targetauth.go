@@ -18,7 +18,6 @@ import (
 	"encoding/base64"
 	"fmt"
 	"net/http"
-	"strconv"
 	"time"
 
 	"github.com/JohanLindvall/kubescrape/pkg/kubemeta"
@@ -127,29 +126,9 @@ func (s *Scraper) clientFor(ctx context.Context, t kubemeta.ScrapeTarget, timeou
 	}
 	s.tlsMu.Unlock()
 
-	cfg := &tls.Config{
-		InsecureSkipVerify: t.InsecureSkipVerify, //nolint:gosec // explicit per-endpoint opt-in
-		ServerName:         t.TLSServerName,
-	}
-	if t.TLSCA != "" && caPEM == "" {
-		// A resolvable-but-EMPTY ca.crt (mid-rotation, or a secret an init
-		// container has not populated yet) must not silently degrade to the
-		// system trust store: the endpoint asked to be pinned to a private CA.
-		return nil, fmt.Errorf("scrape tls ca %s: empty", t.TLSCA)
-	}
-	if caPEM != "" {
-		pool := x509.NewCertPool()
-		if !pool.AppendCertsFromPEM([]byte(caPEM)) {
-			return nil, fmt.Errorf("scrape tls ca %s: no certificates found", t.TLSCA)
-		}
-		cfg.RootCAs = pool
-	}
-	if certPEM != "" || keyPEM != "" {
-		pair, err := tls.X509KeyPair([]byte(certPEM), []byte(keyPEM))
-		if err != nil {
-			return nil, fmt.Errorf("scrape tls client certificate: %w", err)
-		}
-		cfg.Certificates = []tls.Certificate{pair}
+	cfg, err := tlsConfigFromPEM(t.TLSServerName, t.InsecureSkipVerify, t.TLSCA, caPEM, certPEM, keyPEM)
+	if err != nil {
+		return nil, err
 	}
 	client := &http.Client{
 		Timeout:       timeout,
@@ -185,6 +164,40 @@ func (s *Scraper) clientFor(ctx context.Context, t kubemeta.ScrapeTarget, timeou
 // maxTLSClients bounds the per-target transport cache.
 const maxTLSClients = 64
 
+// tlsConfigFromPEM builds a target's TLS config from its resolved secret
+// material; caRef is the CA's "ns/name/key" reference (empty = none asked
+// for), used both in errors and to detect the empty-resolution case. The same
+// PEM→config pattern as otlpexport's client TLS, kept here because pkg-boundary
+// direction forbids the import.
+func tlsConfigFromPEM(serverName string, insecureSkipVerify bool, caRef, caPEM, certPEM, keyPEM string) (*tls.Config, error) {
+	cfg := &tls.Config{
+		InsecureSkipVerify: insecureSkipVerify, //nolint:gosec // explicit per-endpoint opt-in
+		ServerName:         serverName,
+	}
+	if caRef != "" && caPEM == "" {
+		// A resolvable-but-EMPTY ca.crt (mid-rotation, or a secret an init
+		// container has not populated yet) must not silently degrade to the
+		// system trust store: the endpoint asked to be pinned to a private CA.
+		return nil, fmt.Errorf("scrape tls ca %s: empty", caRef)
+	}
+	if caPEM != "" {
+		pool := x509.NewCertPool()
+		if !pool.AppendCertsFromPEM([]byte(caPEM)) {
+			return nil, fmt.Errorf("scrape tls ca %s: no certificates found", caRef)
+		}
+		cfg.RootCAs = pool
+	}
+	if certPEM != "" || keyPEM != "" {
+		pair, err := tls.X509KeyPair([]byte(certPEM), []byte(keyPEM))
+		if err != nil {
+			return nil, fmt.Errorf("scrape tls client certificate: %w", err)
+		}
+		cfg.Certificates = []tls.Certificate{pair}
+	}
+	return cfg, nil
+}
+
 // lp length-prefixes a key component so two different configurations cannot
-// serialise to the same cache key.
-func lp(s string) string { return strconv.Itoa(len(s)) + ":" + s }
+// serialise to the same cache key — the string form of appendLP (the package's
+// one injective-join rule; see cadvisorbatch.go).
+func lp(s string) string { return string(appendLP(nil, s)) }

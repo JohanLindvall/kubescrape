@@ -2,11 +2,8 @@ package otlpingest
 
 import (
 	"context"
-	"errors"
-	"fmt"
 
 	"log/slog"
-	"net"
 	"net/http"
 	"time"
 
@@ -21,7 +18,6 @@ import (
 	"google.golang.org/genproto/googleapis/rpc/errdetails"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/durationpb"
 
@@ -171,34 +167,16 @@ func exhaustedStatus(msg string) error {
 	return st.Err()
 }
 
-// Run serves until ctx is cancelled, then shuts both listeners down.
+// Run serves until ctx is cancelled, then shuts both listeners down. The
+// run/shutdown skeleton is Listeners (listeners.go); this builds the two
+// servers it runs.
 func (s *Server) Run(ctx context.Context) error {
-	var grpcSrv *grpc.Server
-	var httpSrv *http.Server
-	errc := make(chan error, 2)
-	started := 0
+	l := Listeners{Name: "otlp ingest", Logger: s.log, Ready: s.cfg.Ready}
 
 	if s.cfg.GRPCAddr != "" {
-		lis, err := net.Listen("tcp", s.cfg.GRPCAddr)
-		if err != nil {
-			return fmt.Errorf("ingest gRPC listen %s: %w", s.cfg.GRPCAddr, err)
-		}
-		// Mirror the HTTP server's IdleTimeout: reap connections apps opened
-		// and abandoned (default gRPC keeps them forever). MaxConnectionIdle
-		// alone does NOT cover the abandoned-STREAM case — a connection carrying
-		// an open stream is not idle, which is why the reservation carries its
-		// own window (grpcReserveWindow). The age bounds are the coarse
-		// complement: whatever a peer accumulates on one socket (stream ids,
-		// HPACK state, half-open RPCs), it gets a GOAWAY after the age and loses
-		// the socket after the grace. Conformant senders reconnect
-		// transparently, and the grace is far longer than any RPC here — those
-		// are bounded by the pre-decode window plus the exporter's own timeout.
-		grpcSrv = grpc.NewServer(
-			grpc.KeepaliveParams(keepalive.ServerParameters{
-				MaxConnectionIdle:     120 * time.Second,
-				MaxConnectionAge:      30 * time.Minute,
-				MaxConnectionAgeGrace: 30 * time.Second,
-			}),
+		l.GRPCAddr = s.cfg.GRPCAddr
+		l.GRPC = grpc.NewServer(
+			KeepaliveOption(),
 			// What each of these actually bounds, since they are easy to
 			// over-credit:
 			//
@@ -228,15 +206,12 @@ func (s *Server) Run(ctx context.Context) error {
 			grpc.UnaryInterceptor(s.limitUnary),
 		)
 		if s.cfg.Exporter != nil {
-			plogotlp.RegisterGRPCServer(grpcSrv, &logsGRPC{s: s})
-			pmetricotlp.RegisterGRPCServer(grpcSrv, &metricsGRPC{s: s})
+			plogotlp.RegisterGRPCServer(l.GRPC, &logsGRPC{s: s})
+			pmetricotlp.RegisterGRPCServer(l.GRPC, &metricsGRPC{s: s})
 		}
 		if s.cfg.Traces != nil {
-			ptraceotlp.RegisterGRPCServer(grpcSrv, &tracesGRPC{s: s})
+			ptraceotlp.RegisterGRPCServer(l.GRPC, &tracesGRPC{s: s})
 		}
-		started++
-		go func() { errc <- grpcSrv.Serve(lis) }()
-		s.log.Info("otlp ingest gRPC listening", "addr", s.cfg.GRPCAddr)
 	}
 
 	if s.cfg.HTTPAddr != "" {
@@ -248,72 +223,24 @@ func (s *Server) Run(ctx context.Context) error {
 		if s.cfg.Traces != nil {
 			mux.HandleFunc("POST /v1/traces", s.handleHTTPTraces)
 		}
-		// ReadHeaderTimeout kills Slowloris header trickling; ReadTimeout
-		// bounds a trickled request body (the handlers read up to 16 MiB and
-		// senders are node-local, so 60s is generous — it also caps handler
-		// runtime via the whole-request read deadline, fine because forwarding
-		// is bounded by the exporter's own much shorter timeout and a cut-off
-		// surfaces as a retryable 503); IdleTimeout reaps parked keep-alives.
-		// WriteTimeout is deliberately omitted: responses are tiny and its
-		// clock would race a slow-but-legal body upload plus the forward.
-		httpSrv = &http.Server{
-			Addr:              s.cfg.HTTPAddr,
-			Handler:           mux,
-			ReadHeaderTimeout: 10 * time.Second,
-			ReadTimeout:       60 * time.Second,
-			IdleTimeout:       120 * time.Second,
-		}
-		// Listened explicitly rather than through ListenAndServe so the BIND
-		// failure is known before Ready fires below: a readiness probe that goes
-		// green on a port nobody bound is worse than no probe.
-		lis, err := net.Listen("tcp", s.cfg.HTTPAddr)
-		if err != nil {
-			if grpcSrv != nil {
-				grpcSrv.Stop()
-			}
-			return fmt.Errorf("ingest HTTP listen %s: %w", s.cfg.HTTPAddr, err)
-		}
-		started++
-		go func() {
-			if err := httpSrv.Serve(lis); err != nil && !errors.Is(err, http.ErrServerClosed) {
-				errc <- err
-				return
-			}
-			errc <- nil
-		}()
-		s.log.Info("otlp ingest HTTP listening", "addr", s.cfg.HTTPAddr)
+		l.HTTP = NewPushHTTPServer(s.cfg.HTTPAddr, mux)
 	}
 
-	if started == 0 {
-		return nil
-	}
-	if s.cfg.Ready != nil {
-		s.cfg.Ready()
-	}
-
-	// A runtime listener failure must propagate to the caller (main treats it
-	// as fatal and exits non-zero); a ctx-cancelled shutdown returns nil.
-	var runErr error
-	select {
-	case <-ctx.Done():
-	case err := <-errc:
-		if err != nil {
-			s.log.Error("otlp ingest listener failed", "error", err)
-			runErr = fmt.Errorf("ingest listener: %w", err)
-		}
-	}
-	if grpcSrv != nil {
-		grpcSrv.GracefulStop()
-	}
-	if httpSrv != nil {
-		sctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		_ = httpSrv.Shutdown(sctx)
-	}
-	return runErr
+	return l.Run(ctx)
 }
 
 // --- gRPC ---
+
+// grpcExport is the shared shape of the three gRPC Export wrappers: stamp the
+// connection's peer address into ctx (the enricher's peer-IP fallback reads
+// it), run the signal's enrich-and-forward step, and map a failure onto a
+// status the sender's SDK retries correctly (grpcForwardStatus).
+func grpcExport(ctx context.Context, forward func(ctx context.Context) error) error {
+	if err := forward(grpcPeerCtx(ctx)); err != nil {
+		return grpcForwardStatus(err)
+	}
+	return nil
+}
 
 type logsGRPC struct {
 	plogotlp.UnimplementedGRPCServer
@@ -321,11 +248,13 @@ type logsGRPC struct {
 }
 
 func (g *logsGRPC) Export(ctx context.Context, req plogotlp.ExportRequest) (plogotlp.ExportResponse, error) {
-	ctx = grpcPeerCtx(ctx)
-	ld := req.Logs()
-	g.s.cfg.Enricher.EnrichLogs(ctx, ld)
-	if err := g.s.cfg.Exporter.ExportLogs(ctx, ld); err != nil {
-		return plogotlp.ExportResponse{}, grpcForwardStatus(err)
+	err := grpcExport(ctx, func(ctx context.Context) error {
+		ld := req.Logs()
+		g.s.cfg.Enricher.EnrichLogs(ctx, ld)
+		return g.s.cfg.Exporter.ExportLogs(ctx, ld)
+	})
+	if err != nil {
+		return plogotlp.ExportResponse{}, err
 	}
 	return plogotlp.NewExportResponse(), nil
 }
@@ -336,10 +265,12 @@ type metricsGRPC struct {
 }
 
 func (g *metricsGRPC) Export(ctx context.Context, req pmetricotlp.ExportRequest) (pmetricotlp.ExportResponse, error) {
-	ctx = grpcPeerCtx(ctx)
-	md := g.s.cfg.Enricher.EnrichMetrics(ctx, req.Metrics())
-	if err := g.s.cfg.Exporter.ExportMetrics(ctx, md); err != nil {
-		return pmetricotlp.ExportResponse{}, grpcForwardStatus(err)
+	err := grpcExport(ctx, func(ctx context.Context) error {
+		md := g.s.cfg.Enricher.EnrichMetrics(ctx, req.Metrics())
+		return g.s.cfg.Exporter.ExportMetrics(ctx, md)
+	})
+	if err != nil {
+		return pmetricotlp.ExportResponse{}, err
 	}
 	return pmetricotlp.NewExportResponse(), nil
 }
@@ -405,112 +336,102 @@ type tracesGRPC struct {
 }
 
 func (g *tracesGRPC) Export(ctx context.Context, req ptraceotlp.ExportRequest) (ptraceotlp.ExportResponse, error) {
-	ctx = grpcPeerCtx(ctx)
-	td := req.Traces()
-	g.s.cfg.Enricher.EnrichTraces(ctx, td)
-	if err := g.s.cfg.Traces.ExportTraces(ctx, td); err != nil {
-		return ptraceotlp.ExportResponse{}, grpcForwardStatus(err)
+	err := grpcExport(ctx, func(ctx context.Context) error {
+		td := req.Traces()
+		g.s.cfg.Enricher.EnrichTraces(ctx, td)
+		return g.s.cfg.Traces.ExportTraces(ctx, td)
+	})
+	if err != nil {
+		return ptraceotlp.ExportResponse{}, err
 	}
 	return ptraceotlp.NewExportResponse(), nil
 }
 
 // --- HTTP (OTLP/HTTP protobuf) ---
 
-func (s *Server) handleHTTPLogs(w http.ResponseWriter, r *http.Request) {
+// servePush is the ONE body of the three HTTP push handlers; they differ only
+// in the codec (unmarshal) and the enrich-and-forward step (handle). The
+// sequence is load-bearing and its steps are ordered deliberately:
+//
+//  1. Read the body (BodyReader: media type, gzip, caps, byte budget) —
+//     failures answer through WriteBodyError (413/415/429/400).
+//  2. The charge is released when the HANDLER returns, not when the read
+//     ends: the body stays alive through enrichment and the forward, so
+//     releasing earlier would leave the bytes resident and unaccounted.
+//  3. The in-flight slot is acquired AFTER the read: holding a slot across
+//     the upload let 32 trickled 16 MiB bodies shed every other sender on
+//     the node for a ReadTimeout (60s) — no credentials required, on an
+//     unauthenticated listener, which is the threat the bound exists for.
+//     What bounds the read itself is the byte budget the body was charged
+//     against (admit.go), not this slot. The gRPC arm is naturally on this
+//     side of the decode. A refusal is RETRYABLE by design (429 +
+//     Retry-After: 1): the sender still holds the payload.
+//  4. A payload that does not unmarshal is 400 — permanent; retrying a
+//     malformed batch can never succeed.
+//  5. A forward failure maps through HTTPForwardStatus (permanent 400 vs
+//     retryable 503), and success answers with the OTLP proto response.
+func (s *Server) servePush(w http.ResponseWriter, r *http.Request,
+	signal string,
+	unmarshal func(body []byte) error,
+	handle func(ctx context.Context) (ProtoMarshaler, error),
+) {
 	body, charged, err := s.body.Read(r)
 	if err != nil {
 		WriteBodyError(w, err)
 		return
 	}
-	// The body stays alive for the whole handler, so its budget charge does
-	// too: releasing it at the end of the read would leave the bytes resident
-	// and unaccounted through enrichment and the forward.
 	defer s.body.Release(charged)
-	// Acquired AFTER the read: holding a slot across the upload let 32
-	// trickled 16 MiB bodies shed every other sender on the node for a
-	// ReadTimeout (60s) — no credentials required, on an unauthenticated
-	// listener, which is the threat the bound exists for. What bounds the read
-	// itself is the byte budget the body was charged against (admit.go), not
-	// this slot. The gRPC arm is naturally on this side of the decode.
 	if !s.acquire() {
-		// Retryable by design: the sender still holds the payload.
 		w.Header().Set("Retry-After", "1")
 		http.Error(w, "too many concurrent pushes", http.StatusTooManyRequests)
 		return
 	}
 	defer s.release()
-	req := plogotlp.NewExportRequest()
-	if err := req.UnmarshalProto(body); err != nil {
-		http.Error(w, "malformed OTLP logs payload", http.StatusBadRequest)
+	if err := unmarshal(body); err != nil {
+		http.Error(w, "malformed OTLP "+signal+" payload", http.StatusBadRequest)
 		return
 	}
-	ctx := withPeerIP(r.Context(), r.RemoteAddr)
-	ld := req.Logs()
-	s.cfg.Enricher.EnrichLogs(ctx, ld)
-	if err := s.cfg.Exporter.ExportLogs(ctx, ld); err != nil {
+	resp, err := handle(withPeerIP(r.Context(), r.RemoteAddr))
+	if err != nil {
 		http.Error(w, err.Error(), HTTPForwardStatus(err))
 		return
 	}
-	WriteProto(w, plogotlp.NewExportResponse())
+	WriteProto(w, resp)
+}
+
+func (s *Server) handleHTTPLogs(w http.ResponseWriter, r *http.Request) {
+	req := plogotlp.NewExportRequest()
+	s.servePush(w, r, "logs", req.UnmarshalProto, func(ctx context.Context) (ProtoMarshaler, error) {
+		ld := req.Logs()
+		s.cfg.Enricher.EnrichLogs(ctx, ld)
+		if err := s.cfg.Exporter.ExportLogs(ctx, ld); err != nil {
+			return nil, err
+		}
+		return plogotlp.NewExportResponse(), nil
+	})
 }
 
 func (s *Server) handleHTTPMetrics(w http.ResponseWriter, r *http.Request) {
-	body, charged, err := s.body.Read(r)
-	if err != nil {
-		WriteBodyError(w, err)
-		return
-	}
-	defer s.body.Release(charged)
-	// Acquired AFTER the read (see handleHTTPLogs).
-	if !s.acquire() {
-		// Retryable by design: the sender still holds the payload.
-		w.Header().Set("Retry-After", "1")
-		http.Error(w, "too many concurrent pushes", http.StatusTooManyRequests)
-		return
-	}
-	defer s.release()
 	req := pmetricotlp.NewExportRequest()
-	if err := req.UnmarshalProto(body); err != nil {
-		http.Error(w, "malformed OTLP metrics payload", http.StatusBadRequest)
-		return
-	}
-	ctx := withPeerIP(r.Context(), r.RemoteAddr)
-	md := s.cfg.Enricher.EnrichMetrics(ctx, req.Metrics())
-	if err := s.cfg.Exporter.ExportMetrics(ctx, md); err != nil {
-		http.Error(w, err.Error(), HTTPForwardStatus(err))
-		return
-	}
-	WriteProto(w, pmetricotlp.NewExportResponse())
+	s.servePush(w, r, "metrics", req.UnmarshalProto, func(ctx context.Context) (ProtoMarshaler, error) {
+		md := s.cfg.Enricher.EnrichMetrics(ctx, req.Metrics())
+		if err := s.cfg.Exporter.ExportMetrics(ctx, md); err != nil {
+			return nil, err
+		}
+		return pmetricotlp.NewExportResponse(), nil
+	})
 }
 
 func (s *Server) handleHTTPTraces(w http.ResponseWriter, r *http.Request) {
-	body, charged, err := s.body.Read(r)
-	if err != nil {
-		WriteBodyError(w, err)
-		return
-	}
-	defer s.body.Release(charged)
-	// Acquired AFTER the read (see handleHTTPLogs).
-	if !s.acquire() {
-		// Retryable by design: the sender still holds the payload.
-		w.Header().Set("Retry-After", "1")
-		http.Error(w, "too many concurrent pushes", http.StatusTooManyRequests)
-		return
-	}
-	defer s.release()
 	req := ptraceotlp.NewExportRequest()
-	if err := req.UnmarshalProto(body); err != nil {
-		http.Error(w, "malformed OTLP traces payload", http.StatusBadRequest)
-		return
-	}
-	ctx := withPeerIP(r.Context(), r.RemoteAddr)
-	td := req.Traces()
-	s.cfg.Enricher.EnrichTraces(ctx, td)
-	if err := s.cfg.Traces.ExportTraces(ctx, td); err != nil {
-		http.Error(w, err.Error(), HTTPForwardStatus(err))
-		return
-	}
-	WriteProto(w, ptraceotlp.NewExportResponse())
+	s.servePush(w, r, "traces", req.UnmarshalProto, func(ctx context.Context) (ProtoMarshaler, error) {
+		td := req.Traces()
+		s.cfg.Enricher.EnrichTraces(ctx, td)
+		if err := s.cfg.Traces.ExportTraces(ctx, td); err != nil {
+			return nil, err
+		}
+		return ptraceotlp.NewExportResponse(), nil
+	})
 }
 
 const maxIngestBody = 16 << 20 // 16 MiB per request

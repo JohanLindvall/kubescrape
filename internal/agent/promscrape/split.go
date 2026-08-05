@@ -362,7 +362,11 @@ func (b *splitBatcher) route(name string, labels []Label) (pmetric.ScopeMetrics,
 		key.WriteString(rule.keyPrefix)
 		for _, v := range b.vals {
 			// Length-prefixed so a label VALUE containing the separator cannot
-			// alias another tuple and merge two described objects.
+			// alias another tuple and merge two described objects. Same rule as
+			// appendLP, spelled into a Builder: Builder.String() hands out its
+			// buffer without the copy string([]byte) pays, and this runs once per
+			// new (rule, groupBy tuple) — appendLP here cost +400 allocs/op in
+			// BenchmarkSplitConvert.
 			key.WriteString(strconv.Itoa(len(v)))
 			key.WriteByte(':')
 			key.WriteString(v)
@@ -561,7 +565,7 @@ func (b *splitBatcher) metric(name string, meta metricMeta, labels []Label, shap
 		b.byKey[key] = m
 		// One descriptor per resource — including its description and unit,
 		// which a split batch repeats for every described object.
-		b.bytes += len(name) + metricOverheadBytes + meta.apply(m)
+		b.bytes += chargeDescriptor(m, name, meta)
 	}
 	b.lastMResKey, b.lastMName, b.lastM, b.lastMOK = resKey, name, m, true
 	return m, rule, dp
@@ -569,13 +573,7 @@ func (b *splitBatcher) metric(name string, meta metricMeta, labels []Label, shap
 
 func (b *splitBatcher) addNumber(s Sample, monotonic bool) {
 	m, rule, dpa := b.metric(s.Name, sampleMeta(s), s.Labels, func(m pmetric.Metric) {
-		if monotonic {
-			sum := m.SetEmptySum()
-			sum.SetIsMonotonic(true)
-			sum.SetAggregationTemporality(pmetric.AggregationTemporalityCumulative)
-		} else {
-			m.SetEmptyGauge()
-		}
+		shapeNumber(m, monotonic)
 	})
 
 	dp, ok := numberDataPoint(m, b.startTS)
@@ -593,15 +591,11 @@ func (b *splitBatcher) addNumber(s Sample, monotonic bool) {
 }
 
 func (b *splitBatcher) addHistogram(family string, acc *histAcc) {
-	m, rule, dpa := b.metric(family, acc.meta, acc.labels, func(m pmetric.Metric) {
-		m.SetEmptyHistogram().SetAggregationTemporality(pmetric.AggregationTemporalityCumulative)
-	})
-	if m.Type() != pmetric.MetricTypeHistogram {
-		obs.ScrapeCollisions.Inc()
+	m, rule, dpa := b.metric(family, acc.meta, acc.labels, shapeHistogram)
+	dp, ok := histogramDataPoint(m, b.startTS)
+	if !ok {
 		return
 	}
-	dp := m.Histogram().DataPoints().AppendEmpty()
-	dp.SetStartTimestamp(b.startTS)
 	dp.SetTimestamp(pointTS(acc.ts, b.scrapeTS))
 	fillHistogramPoint(dp, acc)
 	b.putSplitLabels(dp.Attributes(), rule, acc.labels, dpa)
@@ -618,27 +612,13 @@ func (b *splitBatcher) addHistogram(family string, acc *histAcc) {
 // with expHistBytes. This is what lets splitter-backed targets accept the
 // protobuf exposition instead of being pinned to text.
 func (b *splitBatcher) addExponential(family string, p expPoint) {
-	m, rule, dpa := b.metric(family, p.meta, p.labels, func(m pmetric.Metric) {
-		m.SetEmptyExponentialHistogram().SetAggregationTemporality(pmetric.AggregationTemporalityCumulative)
-	})
-	if m.Type() != pmetric.MetricTypeExponentialHistogram {
-		obs.ScrapeCollisions.Inc()
+	m, rule, dpa := b.metric(family, p.meta, p.labels, shapeExponentialHistogram)
+	dp, ok := exponentialDataPoint(m, b.startTS)
+	if !ok {
 		return
 	}
-	dp := m.ExponentialHistogram().DataPoints().AppendEmpty()
-	dp.SetStartTimestamp(b.startTS)
 	dp.SetTimestamp(pointTS(p.ts, b.scrapeTS))
-	dp.SetScale(p.schema)
-	dp.SetZeroCount(p.zeroCount)
-	dp.SetZeroThreshold(p.zeroTh)
-	dp.SetCount(p.count)
-	if p.hasSum {
-		dp.SetSum(p.sum)
-	}
-	dp.Positive().SetOffset(p.posOffset)
-	dp.Positive().BucketCounts().FromRaw(p.pos)
-	dp.Negative().SetOffset(p.negOffset)
-	dp.Negative().BucketCounts().FromRaw(p.neg)
+	fillExponentialPoint(dp, p)
 	b.putSplitLabels(dp.Attributes(), rule, p.labels, dpa)
 	for _, e := range p.exemplars {
 		setExemplar(dp.Exemplars().AppendEmpty(), e, b.scrapeTS)
@@ -648,15 +628,11 @@ func (b *splitBatcher) addExponential(family string, p expPoint) {
 }
 
 func (b *splitBatcher) addSummary(family string, acc *summAcc) {
-	m, rule, dpa := b.metric(family, acc.meta, acc.labels, func(m pmetric.Metric) {
-		m.SetEmptySummary()
-	})
-	if m.Type() != pmetric.MetricTypeSummary {
-		obs.ScrapeCollisions.Inc()
+	m, rule, dpa := b.metric(family, acc.meta, acc.labels, shapeSummary)
+	dp, ok := summaryDataPoint(m, b.startTS)
+	if !ok {
 		return
 	}
-	dp := m.Summary().DataPoints().AppendEmpty()
-	dp.SetStartTimestamp(b.startTS)
 	dp.SetTimestamp(pointTS(acc.ts, b.scrapeTS))
 	fillSummaryPoint(dp, acc)
 	b.putSplitLabels(dp.Attributes(), rule, acc.labels, dpa)

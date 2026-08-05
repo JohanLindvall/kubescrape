@@ -5,23 +5,21 @@
 // 100% of the spans while only the sampled subset is shipped — the classic
 // spanmetrics-plus-sampling arrangement.
 //
-// Decisions are deterministic per trace ID (an xxhash of the ID against the
-// probability threshold), so all spans of a trace sample identically on this
-// node AND on every other node running the same config — a node-local
-// sampler still yields whole traces. A sender's retry of a failed payload
-// re-samples identically, keeping the at-least-once path consistent.
+// Decisions are deterministic per trace ID (tracehash: an xxhash of the ID
+// against the probability threshold), so all spans of a trace sample
+// identically on this node AND on every other node running the same config —
+// a node-local sampler still yields whole traces. A sender's retry of a failed
+// payload re-samples identically, keeping the at-least-once path consistent.
 package tracesample
 
 import (
 	"context"
 	"fmt"
-	"math"
-	"sync"
 	"time"
 
-	"github.com/cespare/xxhash/v2"
 	"go.opentelemetry.io/collector/pdata/ptrace"
 
+	"github.com/JohanLindvall/kubescrape/internal/agent/tracehash"
 	"github.com/JohanLindvall/kubescrape/internal/config"
 	"github.com/JohanLindvall/kubescrape/internal/obs"
 )
@@ -90,17 +88,15 @@ type Exporter interface {
 // Sampler filters spans and forwards the remainder.
 type Sampler struct {
 	next      Exporter
-	threshold uint64 // keep when xxhash(traceID) < threshold
+	threshold uint64 // tracehash.Threshold(probability); Keep compares the hashed id
 	keepErr   bool
 	slow      time.Duration
 
-	// Token bucket for MaxSpansPerSecond. Guarded: without the ingest
-	// batcher, ExportTraces runs on concurrent ingest handlers.
-	mu     sync.Mutex
+	// Token bucket for MaxSpansPerSecond (tracehash.Bucket carries the mutex:
+	// without the ingest batcher, ExportTraces runs on concurrent ingest
+	// handlers). rate is kept beside it for the is-a-cap-configured checks.
 	rate   float64
-	burst  float64
-	tokens float64
-	last   time.Time
+	bucket *tracehash.Bucket
 	now    func() time.Time // injectable for tests
 }
 
@@ -117,19 +113,13 @@ func New(cfg Config, next Exporter) *Sampler {
 		keepErr: keepErr,
 		slow:    slow,
 		rate:    cfg.MaxSpansPerSecond,
-		// One second of headroom, but never below a single span: allow()
-		// caps tokens at burst and requires a whole token, so a fractional
-		// rate (0 < r < 1) could never accumulate one and dropped 100% of
-		// spans forever — a total trace outage rather than the configured cap.
-		burst: max(1, cfg.MaxSpansPerSecond),
-		now:   time.Now,
+		// Starts full, burst floored at one whole span — tracehash.NewBucket
+		// carries the fractional-rate war story (a burst below one token
+		// dropped 100% of spans forever).
+		bucket: tracehash.NewBucket(cfg.MaxSpansPerSecond),
+		now:    time.Now,
 	}
-	if p == 1 {
-		s.threshold = math.MaxUint64
-	} else {
-		s.threshold = uint64(p * float64(math.MaxUint64))
-	}
-	s.tokens = s.burst
+	s.threshold = tracehash.Threshold(p)
 	return s
 }
 
@@ -212,18 +202,16 @@ func (s *Sampler) keep(sp ptrace.Span) bool {
 		time.Duration(sp.EndTimestamp()-sp.StartTimestamp()) >= s.slow {
 		return true
 	}
-	if s.threshold == math.MaxUint64 {
-		return true
-	}
-	// Deterministic per trace: hashing (rather than trusting W3C trace-ID
-	// randomness) stays uniform even for senders with non-random IDs.
-	id := sp.TraceID()
-	return xxhash.Sum64(id[:]) < s.threshold
+	// tracehash carries the nesting contract with tailsample's probabilistic
+	// policy: same unsalted hash, same threshold arithmetic.
+	return tracehash.Keep(sp.TraceID(), s.threshold)
 }
 
-// consume takes n tokens if the bucket holds them, and reports whether it
-// did. All-or-nothing, so the fast path either pays for the whole payload or
-// hands it to the per-span path.
+// consume takes n tokens if the bucket holds them, and reports whether it did
+// (tracehash.Bucket.TakeExact — all-or-nothing, so the fast path either pays
+// for the whole payload or hands it to the per-span path). It passes s.now
+// (the injectable clock), not time.Now: the two once disagreed, so a test
+// driving the clock forward saw the bucket refill from wall time instead.
 //
 // The fast path MUST pay. It used to peek an availableTokens() that consumed
 // nothing and then forward the payload untouched, so any batch smaller than
@@ -232,25 +220,7 @@ func (s *Sampler) keep(sp ptrace.Span) bool {
 // TraceSpansDropped{reason="rate"} sitting at 0. The cap only ever bound
 // payloads that were ALSO losing spans to probability.
 func (s *Sampler) consume(n float64) bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.refillLocked()
-	if s.tokens < n {
-		return false
-	}
-	s.tokens -= n
-	return true
-}
-
-// refillLocked adds the tokens accrued since the last operation. It reads
-// s.now (the injectable clock), not time.Now: the two disagreed, so a test
-// driving the clock forward saw the bucket refill from wall time instead.
-func (s *Sampler) refillLocked() {
-	now := s.now()
-	if !s.last.IsZero() {
-		s.tokens = min(s.burst, s.tokens+s.rate*now.Sub(s.last).Seconds())
-	}
-	s.last = now
+	return s.bucket.TakeExact(n, s.now())
 }
 
 // allow consumes one rate-cap token.

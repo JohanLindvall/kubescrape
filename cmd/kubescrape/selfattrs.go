@@ -44,20 +44,20 @@ func selfResolver(st *store.Store, resolver server.MetadataResolver) func(contex
 		// "still starting" could not be told from "will never resolve".
 		ns := selfmeta.Namespace()
 		if ns == "" {
-			obs.SelfMetadataLookups.WithLabelValues("error").Inc()
+			obs.SelfMetadataLookups.WithLabelValues(obs.SelfLookupError).Inc()
 			return nil, fmt.Errorf("no namespace ($POD_NAMESPACE or the ServiceAccount projection)")
 		}
 		host, err := os.Hostname()
 		if err != nil {
-			obs.SelfMetadataLookups.WithLabelValues("error").Inc()
+			obs.SelfMetadataLookups.WithLabelValues(obs.SelfLookupError).Inc()
 			return nil, fmt.Errorf("hostname: %w", err)
 		}
 		np, ok := st.GetPodByName(ns, host)
 		if !ok {
-			obs.SelfMetadataLookups.WithLabelValues("error").Inc()
+			obs.SelfMetadataLookups.WithLabelValues(obs.SelfLookupError).Inc()
 			return nil, fmt.Errorf("pod %s/%s not in the store", ns, host)
 		}
-		obs.SelfMetadataLookups.WithLabelValues("by_name").Inc()
+		obs.SelfMetadataLookups.WithLabelValues(obs.SelfLookupByName).Inc()
 		pod := np.Pod
 		pod.Owners = resolver.Resolve(pod.Namespace, np.OwnerRefs)
 		pod.NamespaceMetadata = resolver.Namespace(pod.Namespace)

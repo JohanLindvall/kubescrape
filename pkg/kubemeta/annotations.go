@@ -18,6 +18,30 @@ var droppedAnnotations = map[string]bool{
 	"kubectl.kubernetes.io/last-applied-configuration": true,
 }
 
+// CopyMeta deep-copies an object's labels verbatim and passes its annotations
+// through FilterAnnotations, returning nil for either when empty so the model
+// fields stay omitempty. Every labels+annotations pair the unauthenticated API
+// serves — pods, owners, namespaces/nodes, Services — goes through here: the
+// pairing is the invariant, because when the two were copied by separate
+// per-package helpers, Services (the fourth annotation-bearing object) got the
+// verbatim copy for BOTH and served kubectl's last-applied-configuration on
+// every service- and monitor-derived scrape target.
+func CopyMeta(labels, annotations map[string]string) (map[string]string, map[string]string) {
+	return cloneMap(labels), FilterAnnotations(annotations)
+}
+
+// cloneMap copies m, nil for empty (omitempty stays omitted).
+func cloneMap(m map[string]string) map[string]string {
+	if len(m) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(m))
+	for k, v := range m {
+		out[k] = v
+	}
+	return out
+}
+
 // FilterAnnotations copies m without the annotations this API refuses to
 // serve. It returns nil for an empty result so the field stays omitempty.
 //

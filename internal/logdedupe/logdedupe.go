@@ -27,8 +27,31 @@ package logdedupe
 
 import (
 	"sync"
+	"sync/atomic"
 	"time"
 )
+
+// Throttle gates a KEYLESS repeating warning to at most once per interval,
+// across concurrent callers, without a mutex: one atomic and a
+// CompareAndSwap. The zero value is ready (first Allow fires immediately).
+//
+// The subtle half — the part three hand-rolled copies (the ingest enricher's
+// rejected-peer warn, the resharder's failed-hop warn, tailbuffer's
+// failed-export warn) each had to re-derive — is the LOSER rule: a caller
+// whose CompareAndSwap loses raced a winner that is about to log the same
+// condition, so it must stay silent. Logging on a lost race is exactly the
+// duplicate the throttle exists to prevent.
+//
+// Table (below) is the keyed sibling for conditions that vary by target;
+// Throttle is for one condition per holder, where a map would be waste.
+type Throttle struct{ last atomic.Int64 }
+
+// Allow reports whether the caller may log now, and claims the slot if so.
+func (t *Throttle) Allow(interval time.Duration) bool {
+	now := time.Now().UnixNano()
+	last := t.last.Load()
+	return now-last >= int64(interval) && t.last.CompareAndSwap(last, now)
+}
 
 // Table is a bounded per-key log throttle. The zero value is not usable; call
 // New. It is safe for concurrent use.

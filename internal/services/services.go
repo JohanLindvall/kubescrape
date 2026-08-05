@@ -4,6 +4,7 @@
 package services
 
 import (
+	"maps"
 	"sync"
 
 	corev1 "k8s.io/api/core/v1"
@@ -56,20 +57,28 @@ func NewIndex() *Index {
 
 // Upsert records the current state of a service.
 func (ix *Index) Upsert(svc *corev1.Service) {
+	// CopyMeta filters the annotations, like pods, owners and namespaces: a
+	// Service is the fourth annotation-bearing object this API serves and was
+	// the one missed. Its annotations ride on every service- and monitor-derived
+	// target on the UNAUTHENTICATED /v1/nodes/{node}/targets route, and the
+	// Services that get there are exactly the hand-annotated ones most likely to
+	// carry a kubectl last-applied-configuration — a verbatim copy of the whole
+	// applied object, including anything inlined into it.
+	labels, annotations := kubemeta.CopyMeta(svc.Labels, svc.Annotations)
+	// The selector is a PLAIN copy: it is label-matching input, not served
+	// metadata, so the annotation filter must never apply to it. nil-for-empty
+	// like the meta maps.
+	var selector map[string]string
+	if len(svc.Spec.Selector) > 0 {
+		selector = maps.Clone(svc.Spec.Selector)
+	}
 	rec := &Service{
-		Name:      svc.Name,
-		Namespace: svc.Namespace,
-		UID:       string(svc.UID),
-		Labels:    copyMap(svc.Labels),
-		// FilterAnnotations, like pods, owners and namespaces: a Service is the
-		// fourth annotation-bearing object this API serves and was the one
-		// missed. Its annotations ride on every service- and monitor-derived
-		// target on the UNAUTHENTICATED /v1/nodes/{node}/targets route, and the
-		// Services that get there are exactly the hand-annotated ones most
-		// likely to carry a kubectl last-applied-configuration — a verbatim
-		// copy of the whole applied object, including anything inlined into it.
-		Annotations: kubemeta.FilterAnnotations(svc.Annotations),
-		Selector:    copyMap(svc.Spec.Selector),
+		Name:        svc.Name,
+		Namespace:   svc.Namespace,
+		UID:         string(svc.UID),
+		Labels:      labels,
+		Annotations: annotations,
+		Selector:    selector,
 	}
 	for _, p := range svc.Spec.Ports {
 		port := Port{Name: p.Name, Port: p.Port}
@@ -188,15 +197,4 @@ func selects(selector, labels map[string]string) bool {
 		}
 	}
 	return true
-}
-
-func copyMap(m map[string]string) map[string]string {
-	if len(m) == 0 {
-		return nil
-	}
-	out := make(map[string]string, len(m))
-	for k, v := range m {
-		out[k] = v
-	}
-	return out
 }

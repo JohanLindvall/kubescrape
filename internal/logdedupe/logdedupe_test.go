@@ -157,3 +157,34 @@ func TestExistingKeyAtSaturationIsQuiet(t *testing.T) {
 		t.Errorf("existing key at saturation: allow=%v saturated=%v, want false/false", allow, sat)
 	}
 }
+
+// Throttle: first caller through fires, a caller inside the interval does not,
+// and the CAS loser rule keeps concurrent racers to ONE fire per interval.
+func TestThrottle(t *testing.T) {
+	var th Throttle
+	if !th.Allow(time.Hour) {
+		t.Fatal("zero-value Throttle must allow the first fire")
+	}
+	if th.Allow(time.Hour) {
+		t.Fatal("second fire inside the interval must be suppressed")
+	}
+	var again Throttle
+	fired := 0
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	for i := 0; i < 16; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if again.Allow(time.Hour) {
+				mu.Lock()
+				fired++
+				mu.Unlock()
+			}
+		}()
+	}
+	wg.Wait()
+	if fired != 1 {
+		t.Fatalf("concurrent racers fired %d times, want exactly 1", fired)
+	}
+}

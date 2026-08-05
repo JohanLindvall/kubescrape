@@ -138,11 +138,11 @@ func (s *Store) lookupLocked(id string) (res ContainerResult, ok, gone bool) {
 		return ContainerResult{}, false, false
 	}
 	now := s.now()
-	if !e.expireAt.IsZero() && now.After(e.expireAt) {
+	if expired(e.expireAt, now) {
 		return ContainerResult{}, false, true
 	}
 	rec := s.pods[e.podUID]
-	if rec == nil || (!rec.expireAt.IsZero() && now.After(rec.expireAt)) {
+	if rec == nil || expired(rec.expireAt, now) {
 		return ContainerResult{}, false, true
 	}
 	return ContainerResult{Container: e.container, Pod: rec.pod, OwnerRefs: rec.ownerRefs}, true, false
@@ -156,7 +156,7 @@ func (s *Store) GetPodByName(namespace, name string) (NodePod, bool) {
 	defer s.mu.RUnlock()
 
 	rec := s.byPodName[namespace+"/"+name]
-	if rec == nil || (!rec.expireAt.IsZero() && s.now().After(rec.expireAt)) {
+	if rec == nil || expired(rec.expireAt, s.now()) {
 		return NodePod{}, false
 	}
 	return NodePod{Pod: rec.pod, OwnerRefs: rec.ownerRefs}, true
@@ -170,7 +170,7 @@ func (s *Store) GetPodByUID(uid string) (NodePod, bool) {
 	defer s.mu.RUnlock()
 
 	rec := s.pods[types.UID(uid)]
-	if rec == nil || (!rec.expireAt.IsZero() && s.now().After(rec.expireAt)) {
+	if rec == nil || expired(rec.expireAt, s.now()) {
 		return NodePod{}, false
 	}
 	return NodePod{Pod: rec.pod, OwnerRefs: rec.ownerRefs}, true
@@ -184,7 +184,7 @@ func (s *Store) GetPodByIP(ip string) (NodePod, bool) {
 	defer s.mu.RUnlock()
 
 	rec := s.byPodIP[ip]
-	if rec == nil || rec.pod.DeletedAt != nil || finishedPhase(rec.pod.Phase) {
+	if rec == nil || rec.pod.DeletedAt != nil || kubemeta.FinishedPhase(rec.pod.Phase) {
 		return NodePod{}, false
 	}
 	return NodePod{Pod: rec.pod, OwnerRefs: rec.ownerRefs}, true

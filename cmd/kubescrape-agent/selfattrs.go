@@ -36,20 +36,20 @@ func selfResolve(meta *metaclient.Client) func(context.Context) (*kubemeta.Pod, 
 	return func(ctx context.Context) (*kubemeta.Pod, error) {
 		pod, err := meta.Self(ctx)
 		if err == nil {
-			obs.SelfMetadataLookups.WithLabelValues("self").Inc()
+			obs.SelfMetadataLookups.WithLabelValues(obs.SelfLookupSelf).Inc()
 			return pod, nil
 		}
 		ns, name := selfmeta.Namespace(), selfPodName()
 		if ns == "" || name == "" {
-			obs.SelfMetadataLookups.WithLabelValues("error").Inc()
+			obs.SelfMetadataLookups.WithLabelValues(obs.SelfLookupError).Inc()
 			return nil, err
 		}
 		byName, nameErr := meta.PodByName(ctx, ns, name)
 		if nameErr != nil {
-			obs.SelfMetadataLookups.WithLabelValues("error").Inc()
+			obs.SelfMetadataLookups.WithLabelValues(obs.SelfLookupError).Inc()
 			return nil, fmt.Errorf("peer-address lookup: %w; by name %s/%s: %w", err, ns, name, nameErr)
 		}
-		obs.SelfMetadataLookups.WithLabelValues("by_name").Inc()
+		obs.SelfMetadataLookups.WithLabelValues(obs.SelfLookupByName).Inc()
 		return byName, nil
 	}
 }

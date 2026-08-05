@@ -27,5 +27,5 @@ func (p *pipelines) startJournald(context.Context) error {
 	if !*journaldOn {
 		return nil
 	}
-	return excludedPipelineError("journald", "journald", "systemd journal reader")
+	return excludedPipelineErrorFor("journald")
 }

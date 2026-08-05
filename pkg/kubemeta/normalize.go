@@ -5,6 +5,15 @@ import (
 	"unicode"
 )
 
+// MaxContainerIDLen bounds a container-ID string accepted from a caller.
+// Real runtime IDs are 64 hex characters (plus an optional scheme prefix,
+// stripped by NormalizeContainerID); anything wildly longer is garbage that
+// can never appear in a pod status, so holding it — as a blocked lookup's
+// waiter-map key, as a request path segment — would only serve memory
+// amplification. The store and the HTTP server each enforce it their own way
+// (a degrade-to-miss, a 404), but against this ONE bound.
+const MaxContainerIDLen = 256
+
 // NormalizeContainerID strips the runtime scheme prefix from a container ID,
 // so "containerd://abc", "docker://abc" and "abc" all normalize to "abc".
 // It also tolerates a collapsed "containerd:/abc" form (as produced by HTTP

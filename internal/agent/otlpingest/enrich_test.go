@@ -794,3 +794,39 @@ func TestAutoModeKeepsTheSendersOwnIdentity(t *testing.T) {
 		t.Errorf("a genuinely foreign object must still be split out: k8s.pod.name = %v", got)
 	}
 }
+
+// The split path must count a REJECTED peer attribution exactly as the
+// resource path does. The ""-group's accounting was an open-coded copy of
+// applyMetadata's that counted peer_ip and unresolved but nothing on a
+// rejection — behind a comment claiming another site counted it — so
+// -ingest-metrics-mode=datapoint (and any auto push demoted to split)
+// under-reported the one counter Config.PeerReject's doc promises. Both sites
+// now share one helper (peerFallback).
+func TestSplitPathCountsRejectedPeer(t *testing.T) {
+	e := NewEnricher(Config{
+		Meta:           newMeta(),
+		MetricsMode:    MetricsDatapoint,
+		PeerIPFallback: true,
+		PeerReject:     func(*kubemeta.Pod) bool { return true },
+	})
+
+	md := pmetric.NewMetrics()
+	dp := md.ResourceMetrics().AppendEmpty().ScopeMetrics().AppendEmpty().
+		Metrics().AppendEmpty().SetEmptyGauge().DataPoints().AppendEmpty()
+	dp.SetIntValue(1) // no ID anywhere: the points land in the ""-group
+
+	rejected := obs.Ingested.WithLabelValues("peer_ip_rejected").Value()
+	unresolved := obs.Ingested.WithLabelValues("unresolved").Value()
+
+	out := e.EnrichMetrics(withPeerIP(context.Background(), "10.1.2.3:41234"), md)
+
+	if got := obs.Ingested.WithLabelValues("peer_ip_rejected").Value() - rejected; got != 1 {
+		t.Errorf("peer_ip_rejected moved by %v on the split path, want 1", got)
+	}
+	if got := obs.Ingested.WithLabelValues("unresolved").Value() - unresolved; got != 0 {
+		t.Errorf("unresolved also moved by %v: a rejection must not be counted twice", got)
+	}
+	if n := out.ResourceMetrics().At(0).Resource().Attributes().Len(); n != 0 {
+		t.Errorf("a vetoed peer still enriched the split resource (%d attrs)", n)
+	}
+}

@@ -40,8 +40,9 @@ import (
 	"go.opentelemetry.io/collector/pdata/plog"
 
 	"github.com/JohanLindvall/kubescrape/internal/agent/attrs"
+	"github.com/JohanLindvall/kubescrape/internal/agent/backoff"
+	"github.com/JohanLindvall/kubescrape/internal/agent/logchain"
 	"github.com/JohanLindvall/kubescrape/internal/agent/logscrub"
-	"github.com/JohanLindvall/kubescrape/internal/agent/otlpexport"
 	"github.com/JohanLindvall/kubescrape/internal/leader"
 	"github.com/JohanLindvall/kubescrape/internal/logline"
 	"github.com/JohanLindvall/kubescrape/internal/metrics"
@@ -86,6 +87,11 @@ type Config struct {
 	// stop" and fails the process. Zero uses half the leader default.
 	StopBudget time.Duration
 
+	// BatchSize caps the batch by COUNT only — deliberately no twin of
+	// journald's MaxBatchBytes: events are small (a message plus a handful of
+	// metadata fields, nothing like a megabyte journal record), and the hard
+	// per-payload wire bound lives in the exporter regardless
+	// (otlpexport.Config.MaxSendBytes / pkg/otlpsplit).
 	BatchSize     int
 	FlushInterval time.Duration
 	// PersistInterval rate-limits position writes: a write per event would be
@@ -120,13 +126,10 @@ type Reader struct {
 	log *slog.Logger
 
 	batch []entry
-	// converted marks payload as the current batch's OTLP rendering, held
-	// across export retries. convert() runs the shared logchain — including
-	// the LogMetrics observation — so converting per ATTEMPT re-observed every
-	// retained record on every failed cycle. Cleared with the batch (settle)
-	// and on a stream restart, which discards the batch and re-reads it.
-	payload   plog.Logs
-	converted bool
+	// pending is the batch's OTLP rendering, held across export retries under
+	// logchain.Pending's convert-once/clear-with-the-batch discipline: cleared
+	// with the batch (settle) and on a stream restart that re-reads it.
+	pending logchain.Pending
 	// committed is the position every exported batch has reached; pending is
 	// the newest position SEEN (bookmarks included) but not yet exported.
 	committed Position
@@ -222,25 +225,17 @@ func ValidateStartMode(mode string) error {
 // the leader-only work: it must return when ctx is cancelled.
 func (r *Reader) Run(ctx context.Context) {
 	r.loadPosition(ctx)
-	backoff := r.cfg.RestartBackoff
+	bo := backoff.New(r.cfg.RestartBackoff)
 	for ctx.Err() == nil {
 		started := time.Now()
 		err := r.stream(ctx)
 		if ctx.Err() != nil {
 			break
 		}
-		if time.Since(started) >= 30*time.Second {
-			backoff = r.cfg.RestartBackoff // a healthy stream resets the backoff
-		}
+		bo.ResetIfHealthy(started)
 		obs.EventWatchRestarts.Inc()
-		r.log.Warn("event watch stopped; restarting", "error", err, "backoff", backoff)
-		select {
-		case <-ctx.Done():
-		case <-time.After(backoff):
-		}
-		if backoff *= 2; backoff > 30*time.Second {
-			backoff = 30 * time.Second
-		}
+		r.log.Warn("event watch stopped; restarting", "error", err, "backoff", bo.Delay())
+		bo.Sleep(ctx)
 	}
 	// Final flush on a DETACHED context: ctx is already cancelled, and the
 	// last batch must still reach the collector before the position is
@@ -361,10 +356,10 @@ func (r *Reader) stream(ctx context.Context) error {
 		clear(r.batch)
 		r.batch = r.batch[:0]
 		// The converted payload described the batch just dropped; the watch is
-		// about to re-deliver those entries and they will convert afresh.
-		// Leaving it set would export the OLD payload and then commit the NEW
-		// batch's position — the loss journald had for the same reason.
-		r.payload, r.converted = plog.NewLogs(), false
+		// about to re-deliver those entries and they will convert afresh
+		// (logchain.Pending's restart-clear case — the loss journald had for
+		// the same reason).
+		r.pending.Discard()
 		r.pendingRV = "" // a bookmark from the dead stream vouches only for its own deliveries
 	}
 	w, err := r.cfg.Client.CoreV1().Events(r.cfg.Namespace).Watch(ctx, metav1.ListOptions{
@@ -556,21 +551,12 @@ func (r *Reader) flush(ctx context.Context) error {
 		r.lastFlush = time.Now()
 		return nil
 	}
-	// Convert ONCE per batch, not once per export ATTEMPT. convert() runs the
-	// shared logchain, and that includes the LogMetrics observation — so a
-	// batch RETAINED across a failed cycle (a transient export failure, or a
-	// stream restart where redelivers is false) was observed again on every
-	// lap: configured counters and histograms over-counted by the number of
-	// attempts, permanently biasing cumulative series upward and showing a
-	// rate() spike during exactly the outage an operator is investigating.
-	// journald holds the converted payload for the same reason; this is that
-	// rule, in the producer that had not got it yet. settle() clears the pair
-	// with the batch, and stream()'s restart reset clears it too.
-	if !r.converted {
-		r.payload = r.convert()
-		r.converted = true
-	}
-	ld := r.payload
+	// Convert ONCE per batch, not once per export ATTEMPT — a batch is
+	// RETAINED across a transient failure AND across a redelivers=false stream
+	// restart, and re-converting re-observed the LogMetrics on every lap
+	// (logchain.Pending owns that discipline). settle() clears the pair with
+	// the batch, and stream()'s restart reset clears it too.
+	ld := r.pending.Render(r.convert)
 	// The batch's HIGH-WATER entry, not its last one. A relist delivers the
 	// backlog in store order and each object carries its own resourceVersion,
 	// so the last entry is routinely older than one earlier in the batch —
@@ -591,16 +577,11 @@ func (r *Reader) flush(ctx context.Context) error {
 	count := ld.LogRecordCount()
 	if count > 0 {
 		if err := r.cfg.Exporter.ExportLogs(ctx, ld); err != nil {
-			if otlpexport.IsPermanent(err) {
-				// Skipping past a poison batch, as journald does: re-reading it
-				// forever would wedge the reader on one bad payload.
-				obs.EventsDropped.Inc()
-				// And the records, so the loss has a magnitude and not just an
-				// occurrence — the rules may have dropped some of the batch,
-				// so this is the exported count, matching EventsExported.
-				obs.EventsDroppedRecords.Add(float64(count))
-				r.log.Warn("event batch permanently rejected, skipping past it", "events", len(r.batch), "records", count, "error", err)
-			} else {
+			// The records counted are the EXPORTED count (the rules may have
+			// dropped some of the batch), matching EventsExported.
+			if !logchain.SettlePermanent(err, r.log, "event batch", count,
+				logchain.SettleCounters{Batches: obs.EventsDropped, Records: obs.EventsDroppedRecords},
+				"events", len(r.batch)) {
 				obs.LogExportFailures.Inc()
 				return fmt.Errorf("exporting events: %w", err)
 			}
@@ -618,7 +599,7 @@ func (r *Reader) settle(newest entry) {
 	clear(r.batch)
 	r.batch = r.batch[:0]
 	// The converted payload belongs to the batch just settled.
-	r.payload, r.converted = plog.NewLogs(), false
+	r.pending.Discard()
 	if newest.rv != "" && newerRV(newest.rv, r.committed.ResourceVersion) {
 		r.committed.ResourceVersion = newest.rv
 	}

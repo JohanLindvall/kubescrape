@@ -16,19 +16,22 @@ import (
 	coretesting "k8s.io/client-go/testing"
 
 	"github.com/JohanLindvall/kubescrape/internal/server"
+	"github.com/JohanLindvall/kubescrape/internal/servicemonitors"
 )
 
-// The -servicemonitors pre-check must verify the servicemonitors resource
-// itself, not just the group/version: a cluster with only other
-// monitoring.coreos.com/v1 CRDs (e.g. PrometheusRule) serves the group, but a
-// servicemonitor informer there can never sync and would wedge readiness.
+// The -servicemonitors pre-check (monitoringResources, consumed by
+// startServiceMonitors) must verify the servicemonitors resource itself, not
+// just the group/version: a cluster with only other monitoring.coreos.com/v1
+// CRDs (e.g. PrometheusRule) serves the group, but a servicemonitor informer
+// there can never sync and would wedge readiness.
 //
-// It must ALSO tell "the cluster says no" apart from "the cluster could not be
-// asked". Collapsing the two let one 503 from a rolling API server, or one
-// throttled request, permanently disable an explicitly requested feature: every
-// monitor-derived target vanished for the life of the process behind a single
-// startup log line.
-func TestServiceMonitorCRDPresent(t *testing.T) {
+// It must ALSO tell "the cluster says no" (an empty/partial set, nil error —
+// the caller disables what is absent) apart from "the cluster could not be
+// asked" (an error — the caller fails startup). Collapsing the two let one 503
+// from a rolling API server, or one throttled request, permanently disable an
+// explicitly requested feature: every monitor-derived target vanished for the
+// life of the process behind a single startup log line.
+func TestMonitoringResources(t *testing.T) {
 	disc := func(resources ...metav1.APIResource) *discoveryfake.FakeDiscovery {
 		fake := &coretesting.Fake{}
 		if resources != nil {
@@ -53,12 +56,12 @@ func TestServiceMonitorCRDPresent(t *testing.T) {
 		{"api server 503", errDiscovery{err: apierrors.NewServiceUnavailable("rolling")}, false, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			present, err := serviceMonitorCRDPresent(tc.d)
+			served, err := monitoringResources(tc.d)
 			if (err != nil) != tc.wantErr {
 				t.Fatalf("err = %v, wantErr %v", err, tc.wantErr)
 			}
-			if present != tc.wantPresent {
-				t.Errorf("present = %v, want %v", present, tc.wantPresent)
+			if present := served[servicemonitors.GVR.Resource]; present != tc.wantPresent {
+				t.Errorf("served[%q] = %v, want %v", servicemonitors.GVR.Resource, present, tc.wantPresent)
 			}
 		})
 	}

@@ -110,6 +110,16 @@ type Pod struct {
 	Containers        []Container `json:"containers"`
 }
 
+// FinishedPhase reports whether a pod phase (Pod.Phase) means the pod has
+// stopped running for good: Succeeded or Failed. A finished pod's IP is
+// eligible for reuse by the CNI while its status still reports the old
+// address, so it must neither claim the IP index nor yield scrape targets —
+// the two consumers of this predicate, which must agree or a finished pod
+// would do one but not the other.
+func FinishedPhase(phase string) bool {
+	return phase == "Succeeded" || phase == "Failed"
+}
+
 // ContainerMetadata is the response for a container-ID lookup.
 type ContainerMetadata struct {
 	ContainerID string    `json:"containerId"`

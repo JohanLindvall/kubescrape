@@ -70,15 +70,30 @@ func (r *Registry) Dump() []RegistrySeries {
 	return out
 }
 
+// kindType maps a series kind to its exported Dump type name; ok is false for
+// kinds this reader cannot render (the Registry constructors never mint them).
+// The one mapping, shared by dumpSeries and dumpFunc — twin switch statements
+// are how one gains a kind the other does not.
+func kindType(k seriesKind) (string, bool) {
+	switch k {
+	case kindCounter:
+		return CounterType, true
+	case kindGauge:
+		return GaugeType, true
+	case kindHistogram:
+		return HistogramType, true
+	default:
+		return "", false
+	}
+}
+
 // dumpFunc evaluates one func metric live. gf.mu serializes fn() with
 // Export's own evaluation (fns need not be concurrent-safe); gf.last is
 // deliberately NOT read or written — the delta bookkeeping belongs to the
 // push path alone.
 func dumpFunc(gf *gaugeFunc) RegistrySeries {
-	d := RegistrySeries{Name: gf.s.name, Desc: gf.s.desc, Kind: GaugeType}
-	if gf.s.kind == kindCounter {
-		d.Kind = CounterType
-	}
+	kind, _ := kindType(gf.s.kind) // funcs are only ever counters or gauges
+	d := RegistrySeries{Name: gf.s.name, Desc: gf.s.desc, Kind: kind}
 	gf.mu.Lock()
 	defer gf.mu.Unlock()
 	if gf.fnVec != nil {
@@ -97,17 +112,13 @@ func dumpFunc(gf *gaugeFunc) RegistrySeries {
 // dumpSeries reads one series' samples under its lock. ok is false for kinds
 // the Registry cannot mint (defensive; nothing to render them as).
 func dumpSeries(s *series) (RegistrySeries, bool) {
-	d := RegistrySeries{Name: s.name, Desc: s.desc}
-	switch s.kind {
-	case kindCounter:
-		d.Kind = CounterType
-	case kindGauge:
-		d.Kind = GaugeType
-	case kindHistogram:
-		d.Kind = HistogramType
-		d.Bounds = append([]float64(nil), s.buckets[:len(s.buckets)-1]...)
-	default:
+	kind, ok := kindType(s.kind)
+	if !ok {
 		return RegistrySeries{}, false
+	}
+	d := RegistrySeries{Name: s.name, Desc: s.desc, Kind: kind}
+	if s.kind == kindHistogram {
+		d.Bounds = append([]float64(nil), s.buckets[:len(s.buckets)-1]...)
 	}
 
 	s.mu.Lock()
@@ -124,37 +135,21 @@ func dumpSeries(s *series) (RegistrySeries, bool) {
 		return d, true
 	}
 
-	// Histogram: regroup the per-bucket streams by their labels without "le".
-	// Each stream's count is already the CUMULATIVE count for its bound (observe
-	// records into every bucket the value fits), and the +Inf stream carries the
-	// total count and sum — exactly the Prometheus histogram shape.
-	type hp struct {
-		lbls  labels
-		point RegistryPoint
-	}
-	groups := map[string]*hp{}
+	// Histogram: decode the per-bucket streams through the SAME regrouping the
+	// OTLP render uses (regroupHistogram, a pure read — Dump must mutate
+	// nothing). The buckets stay CUMULATIVE here, which is the Dump contract;
+	// the render converts its copy to OTLP's absolute counts.
+	samples := make([]sample, 0, len(s.db))
 	for _, samp := range s.db {
-		lbls, err := parseLabels(samp.labels)
-		if err != nil {
-			continue
-		}
-		lbls = lbls.without(leLabel)
-		key := lbls.String()
-		g := groups[key]
-		if g == nil {
-			g = &hp{lbls: lbls, point: RegistryPoint{Buckets: make([]uint64, len(d.Bounds))}}
-			groups[key] = g
-		}
-		if samp.bucket == len(d.Bounds) { // +Inf: totals
-			g.point.Count = samp.count
-			g.point.Sum = samp.value
-		} else if samp.bucket < len(d.Bounds) {
-			g.point.Buckets[samp.bucket] = samp.count
-		}
+		samples = append(samples, samp.sample)
 	}
-	for _, g := range groups {
-		g.point.Labels = pairs(g.lbls)
-		d.Points = append(d.Points, g.point)
+	for _, g := range regroupHistogram(samples, len(d.Bounds)) {
+		d.Points = append(d.Points, RegistryPoint{
+			Labels:  pairs(g.lbls),
+			Count:   g.count,
+			Sum:     g.sum,
+			Buckets: g.buckets,
+		})
 	}
 	sortPoints(d.Points)
 	return d, true

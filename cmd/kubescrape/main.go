@@ -36,11 +36,11 @@ import (
 	"k8s.io/client-go/metadata/metadatainformer"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/cache"
-	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/klog/v2"
 
 	"github.com/JohanLindvall/kubescrape/internal/agent/otlpexport"
 	"github.com/JohanLindvall/kubescrape/internal/bearer"
+	"github.com/JohanLindvall/kubescrape/internal/cli"
 	"github.com/JohanLindvall/kubescrape/internal/metrics"
 	"github.com/JohanLindvall/kubescrape/internal/obs"
 	"github.com/JohanLindvall/kubescrape/internal/owners"
@@ -181,41 +181,10 @@ func startServiceMonitors(ctx context.Context, cfg *rest.Config, disco discovery
 	monitors := servicemonitors.NewIndex()
 	var synced []cache.InformerSynced
 	if haveSM {
-		smInformer := dynFactory.ForResource(servicemonitors.GVR).Informer()
-		// Unstructured objects retain managedFields unless stripped, like the
-		// typed informers' transform does. stripManagedFields goes through
-		// apimeta.Accessor, which handles *unstructured.Unstructured, so ONE
-		// transform serves every informer here — this used to be a bespoke
-		// closure, and its PodMonitor sibling was a copy that simply never got
-		// written, leaving that one cache carrying full managedFields trees.
-		if err := smInformer.SetTransform(stripManagedFields); err != nil {
-			return nil, nil, fmt.Errorf("servicemonitor informer transform: %w", err)
-		}
-		if err := watchErrors(smInformer, "servicemonitors"); err != nil {
-			return nil, nil, fmt.Errorf("servicemonitor watch error handler: %w", err)
-		}
-		smReg, err := smInformer.AddEventHandler(typedHandler(
-			func(u *unstructured.Unstructured) {
-				if !monitorAllowed(allowNS, "servicemonitor", u, log) {
-					return
-				}
-				if err := monitors.Upsert(u); err != nil {
-					// Counted, not just logged: an unparseable monitor DELETES it
-					// from the index, dropping every target it contributed. That
-					// is strictly more severe than the "some endpoint fields were
-					// ignored" case, which does get a metric — so the severe one
-					// must not be the unalertable one.
-					obs.MonitorParseErrors.WithLabelValues("servicemonitor").Inc()
-					log.Warn("parsing servicemonitor", "error", err,
-						"namespace", u.GetNamespace(), "name", u.GetName())
-					return
-				}
-				warnIgnored(log, "servicemonitor", u, monitors.Endpoints(u.GetNamespace(), u.GetName()))
-			},
-			func(u *unstructured.Unstructured) { monitors.Delete(u.GetNamespace(), u.GetName()) },
-		))
+		smSynced, err := monitorInformer(dynFactory, servicemonitors.GVR, "servicemonitor", allowNS, log,
+			monitors.Upsert, monitors.Delete, monitors.Endpoints)
 		if err != nil {
-			return nil, nil, fmt.Errorf("registering servicemonitor handler: %w", err)
+			return nil, nil, err
 		}
 		// Readiness must cover every cache a request can read, so collect the
 		// handler registrations rather than returning the ServiceMonitor's alone:
@@ -223,7 +192,7 @@ func startServiceMonitors(ctx context.Context, cfg *rest.Config, disco discovery
 		// out let /readyz report 200 — advancing a rollout — while that index was
 		// empty, or permanently so when podmonitors RBAC is missing and its LIST
 		// 403-loops forever.
-		synced = append(synced, smReg.HasSynced)
+		synced = append(synced, smSynced)
 	}
 
 	// PodMonitors are an optional sibling, watched when the cluster serves it —
@@ -231,34 +200,12 @@ func startServiceMonitors(ctx context.Context, cfg *rest.Config, disco discovery
 	// not supported at all: blackbox probing has no node affinity and does not
 	// fit the node-local model.)
 	if havePM {
-		pmInformer := dynFactory.ForResource(servicemonitors.PodGVR).Informer()
-		// The same transform as every other informer — see the ServiceMonitor
-		// one above.
-		if err := pmInformer.SetTransform(stripManagedFields); err != nil {
-			return nil, nil, fmt.Errorf("podmonitor informer transform: %w", err)
-		}
-		if err := watchErrors(pmInformer, "podmonitors"); err != nil {
-			return nil, nil, fmt.Errorf("podmonitor watch error handler: %w", err)
-		}
-		pmReg, err := pmInformer.AddEventHandler(typedHandler(
-			func(u *unstructured.Unstructured) {
-				if !monitorAllowed(allowNS, "podmonitor", u, log) {
-					return
-				}
-				if err := monitors.UpsertPodMonitor(u); err != nil {
-					obs.MonitorParseErrors.WithLabelValues("podmonitor").Inc()
-					log.Warn("parsing podmonitor", "error", err,
-						"namespace", u.GetNamespace(), "name", u.GetName())
-					return
-				}
-				warnIgnored(log, "podmonitor", u, monitors.PodEndpoints(u.GetNamespace(), u.GetName()))
-			},
-			func(u *unstructured.Unstructured) { monitors.DeletePodMonitor(u.GetNamespace(), u.GetName()) },
-		))
+		pmSynced, err := monitorInformer(dynFactory, servicemonitors.PodGVR, "podmonitor", allowNS, log,
+			monitors.UpsertPodMonitor, monitors.DeletePodMonitor, monitors.PodEndpoints)
 		if err != nil {
-			return nil, nil, fmt.Errorf("registering podmonitor handler: %w", err)
+			return nil, nil, err
 		}
-		synced = append(synced, pmReg.HasSynced)
+		synced = append(synced, pmSynced)
 		log.Info("podmonitor discovery enabled")
 	}
 	dynFactory.Start(ctx.Done())
@@ -273,6 +220,63 @@ func startServiceMonitors(ctx context.Context, cfg *rest.Config, disco discovery
 		}
 		return true
 	}, nil
+}
+
+// monitorInformer wires one monitor-kind informer arm — the shared transform,
+// the watch-error counter, and the handler chain every monitor kind gets: the
+// -monitor-namespaces gate, the upsert with its parse-error counter and
+// warning, the ignored-fields report, and the delete. The ServiceMonitor and
+// PodMonitor arms were verbatim copies differing only in gvr/kind and the
+// three index methods; keeping the chain ONE piece of code means a future arm
+// cannot lose a link (the namespace gate is the multi-tenant boundary, and
+// the parse-error counter is the alert on a monitor being DROPPED).
+func monitorInformer(
+	dynFactory dynamicinformer.DynamicSharedInformerFactory,
+	gvr schema.GroupVersionResource,
+	kind string,
+	allowNS map[string]bool,
+	log *slog.Logger,
+	upsert func(*unstructured.Unstructured) error,
+	del func(namespace, name string),
+	endpoints func(namespace, name string) []servicemonitors.Endpoint,
+) (cache.InformerSynced, error) {
+	inf := dynFactory.ForResource(gvr).Informer()
+	// Unstructured objects retain managedFields unless stripped, like the
+	// typed informers' transform does. stripManagedFields goes through
+	// apimeta.Accessor, which handles *unstructured.Unstructured, so ONE
+	// transform serves every informer here — this used to be a bespoke
+	// closure, and its PodMonitor sibling was a copy that simply never got
+	// written, leaving that one cache carrying full managedFields trees.
+	if err := inf.SetTransform(stripManagedFields); err != nil {
+		return nil, fmt.Errorf("%s informer transform: %w", kind, err)
+	}
+	if err := watchErrors(inf, gvr.Resource); err != nil {
+		return nil, fmt.Errorf("%s watch error handler: %w", kind, err)
+	}
+	reg, err := inf.AddEventHandler(typedHandler(
+		func(u *unstructured.Unstructured) {
+			if !monitorAllowed(allowNS, kind, u, log) {
+				return
+			}
+			if err := upsert(u); err != nil {
+				// Counted, not just logged: an unparseable monitor DELETES it
+				// from the index, dropping every target it contributed. That
+				// is strictly more severe than the "some endpoint fields were
+				// ignored" case, which does get a metric — so the severe one
+				// must not be the unalertable one.
+				obs.MonitorParseErrors.WithLabelValues(kind).Inc()
+				log.Warn("parsing "+kind, "error", err,
+					"namespace", u.GetNamespace(), "name", u.GetName())
+				return
+			}
+			warnIgnored(log, kind, u, endpoints(u.GetNamespace(), u.GetName()))
+		},
+		func(u *unstructured.Unstructured) { del(u.GetNamespace(), u.GetName()) },
+	))
+	if err != nil {
+		return nil, fmt.Errorf("registering %s handler: %w", kind, err)
+	}
+	return reg.HasSynced, nil
 }
 
 // k8sSecretReader resolves Secret keys on demand with a short cache (tokens
@@ -404,25 +408,6 @@ func newScrapeAuthTokens(path string, log *slog.Logger) (*bearer.Rotating, error
 	return rt, nil
 }
 
-// newLogger builds the process logger (mirrors the agent's).
-func newLogger(level, format string) (*slog.Logger, error) {
-	var lvl slog.Level
-	if err := lvl.UnmarshalText([]byte(level)); err != nil {
-		return nil, fmt.Errorf("log level %q: %w", level, err)
-	}
-	opts := &slog.HandlerOptions{Level: lvl}
-	var handler slog.Handler
-	switch format {
-	case "text":
-		handler = slog.NewTextHandler(os.Stderr, opts)
-	case "json":
-		handler = slog.NewJSONHandler(os.Stderr, opts)
-	default:
-		return nil, fmt.Errorf("log format %q (want text or json)", format)
-	}
-	return slog.New(handler), nil
-}
-
 // The metadata service's flag surface. Package-level like the agent's, so the
 // flag set exists at init: a test can then check that every flag the shipped
 // manifests pass is actually defined (see internal/manifestcheck), which is
@@ -485,7 +470,7 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	log, err := newLogger(*logLevel, *logFormat)
+	log, err := cli.NewLogger(*logLevel, *logFormat)
 	if err != nil {
 		return err
 	}
@@ -517,7 +502,7 @@ func run() error {
 			"the cluster-wide `secrets: get` grant it requires is unused")
 	}
 
-	cfg, err := buildConfig(*kubeconfig)
+	cfg, err := cli.KubeConfig(*kubeconfig)
 	if err != nil {
 		return fmt.Errorf("building kubernetes client config: %w", err)
 	}
@@ -758,19 +743,6 @@ func run() error {
 	return runErr
 }
 
-// buildConfig prefers an explicit kubeconfig, then in-cluster config, then
-// the default kubeconfig loading rules ($KUBECONFIG, ~/.kube/config).
-func buildConfig(kubeconfig string) (*rest.Config, error) {
-	if kubeconfig == "" {
-		if cfg, err := rest.InClusterConfig(); err == nil {
-			return cfg, nil
-		}
-	}
-	rules := clientcmd.NewDefaultClientConfigLoadingRules()
-	rules.ExplicitPath = kubeconfig
-	return clientcmd.NewNonInteractiveDeferredLoadingClientConfig(rules, nil).ClientConfig()
-}
-
 // headerFlags collects repeatable -otlp-header key=value flags. Repeatable
 // rather than comma-separated so a header VALUE may contain commas.
 type headerFlags struct{ m map[string]string }
@@ -793,14 +765,13 @@ func (h *headerFlags) Set(v string) error {
 // parseNamespaceSet turns a comma-separated flag value into a lookup set. An
 // empty or whitespace-only value yields nil, meaning "no restriction".
 func parseNamespaceSet(s string) map[string]bool {
-	out := map[string]bool{}
-	for _, ns := range strings.Split(s, ",") {
-		if ns = strings.TrimSpace(ns); ns != "" {
-			out[ns] = true
-		}
-	}
-	if len(out) == 0 {
+	nss := cli.SplitList(s)
+	if len(nss) == 0 {
 		return nil
+	}
+	out := make(map[string]bool, len(nss))
+	for _, ns := range nss {
+		out[ns] = true
 	}
 	return out
 }
@@ -830,26 +801,13 @@ func monitorAllowed(allowNS map[string]bool, kind string, u *unstructured.Unstru
 	return false
 }
 
-// serviceMonitorCRDPresent reports whether the ServiceMonitor CRD is actually
-// served. The group/version existing is not enough: another
-// monitoring.coreos.com/v1 CRD (e.g. PrometheusRule alone) registers the group
-// while servicemonitor LISTs would fail forever, wedging readiness behind an
-// informer that can never sync.
-//
-// A false return means the cluster answered and does not serve the resource.
-// An error means the cluster could not be ASKED, which is not the same thing
-// and must not silently disable the feature — see the caller.
-func serviceMonitorCRDPresent(d discovery.DiscoveryInterface) (bool, error) {
-	served, err := monitoringResources(d)
-	if err != nil {
-		return false, err
-	}
-	return served[servicemonitors.GVR.Resource], nil
-}
-
 // monitoringResources lists which monitoring.coreos.com resources the
 // cluster serves (servicemonitors and podmonitors may be installed
-// independently). A missing group/version is reported as an empty set and no
+// independently). The group/version existing is not enough: another
+// monitoring.coreos.com/v1 CRD (e.g. PrometheusRule alone) registers the
+// group while servicemonitor LISTs would fail forever, wedging readiness
+// behind an informer that can never sync — hence per-RESOURCE answers.
+// A missing group/version is reported as an empty set and no
 // error — that is an answer ("nothing is installed"), not a failure to reach
 // the API server, and only the latter should be fatal to the caller.
 func monitoringResources(d discovery.DiscoveryInterface) (map[string]bool, error) {

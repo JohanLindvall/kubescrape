@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -147,23 +148,14 @@ func validateConfig(cfg agentConfig, transformsFile string) error {
 	if _, err := buildAttrs(cfg.ResourceAttributes); err != nil {
 		return fmt.Errorf("resourceAttributes: %w", err)
 	}
-	if _, err := logattrs.New(cfg.LogAttributes); err != nil {
+	if _, err := compileLogAttrs(cfg.LogAttributes); err != nil {
 		return fmt.Errorf("logAttributes: %w", err)
 	}
-	if cfg.LogScrubbing != nil {
-		if _, err := logscrub.New(*cfg.LogScrubbing); err != nil {
-			return fmt.Errorf("logScrubbing: %w", err)
-		}
+	if _, err := compileScrub(cfg.LogScrubbing); err != nil {
+		return fmt.Errorf("logScrubbing: %w", err)
 	}
-	if cfg.LogMetrics != nil && len(cfg.LogMetrics.Metrics) > 0 {
-		// The SAME options a real start uses: the name prefix participates in
-		// validation (an empty rule name is legal only because the prefix makes
-		// the result non-empty), so validating without it would reject configs
-		// that actually run.
-		opts := []metrics.Option{metrics.WithNamePrefix(*logsMetricsPrefix)}
-		if _, err := metrics.NewDynamicMetricSet(cfg.LogMetrics.Metrics, opts...); err != nil {
-			return fmt.Errorf("logMetrics: %w", err)
-		}
+	if _, err := compileLogMetrics(cfg.LogMetrics); err != nil {
+		return fmt.Errorf("logMetrics: %w", err)
 	}
 	if cfg.Metrics != nil {
 		if _, err := promscrape.NewMetricFilters(cfg.Metrics.Pipelines); err != nil {
@@ -173,13 +165,11 @@ func validateConfig(cfg agentConfig, transformsFile string) error {
 			return fmt.Errorf("metrics.splitters: %w", err)
 		}
 	}
-	if cfg.Logs != nil {
-		if _, err := tailer.ValidateSources(cfg.Logs.Sources); err != nil {
-			return fmt.Errorf("logs.sources: %w", err)
-		}
-		if _, err := logline.NewLineFilter(cfg.Logs.Rules); err != nil {
-			return fmt.Errorf("logs.rules: %w", err)
-		}
+	if _, err := compileSources(cfg.Logs); err != nil {
+		return fmt.Errorf("logs.sources: %w", err)
+	}
+	if _, err := compileLogRules(cfg.Logs); err != nil {
+		return fmt.Errorf("logs.rules: %w", err)
 	}
 	if cfg.TraceMetrics != nil {
 		if err := cfg.TraceMetrics.Validate(); err != nil {
@@ -216,9 +206,10 @@ func validateConfig(cfg agentConfig, transformsFile string) error {
 	// with neither address there is nothing to bind). sgReceiver.Run refuses it,
 	// but only at the real start — so -check-config used to pass a config that
 	// CrashLoops the StatefulSet, from the check whose whole purpose is catching
-	// exactly that. Same wording as the runtime refusal.
+	// exactly that. The SAME const as the runtime refusal, so the wording
+	// cannot drift.
 	if *serviceGraphOn && *serviceGraphListen == "" && *serviceGraphHTTPListen == "" {
-		return fmt.Errorf("-service-graph is set but -service-graph-listen (and -service-graph-http-listen) are empty: the shard would receive nothing")
+		return errors.New(msgShardNoListener)
 	}
 	// The SAME merge of flags and section a real start uses, so the dry run
 	// cannot accept a shard set the start rejects (the flags participate: the
@@ -242,21 +233,12 @@ func validateConfig(cfg agentConfig, transformsFile string) error {
 	}
 	if cfg.Routing != nil {
 		for i, rt := range cfg.Routing.Routes {
-			if rt.Name == "" || len(rt.Namespaces) == 0 {
-				return fmt.Errorf("routing route %d: name and namespaces are required", i)
-			}
-			for _, pat := range rt.Namespaces {
-				if _, err := path.Match(pat, ""); err != nil {
-					return fmt.Errorf("routing route %q: invalid namespace pattern %q: %w", rt.Name, pat, err)
-				}
-			}
-			// Through the SAME derivation a real start uses, then validated
-			// like any other destination. The dry run used to check the name,
-			// the namespaces and the patterns and stop — so a scheme-less
-			// route endpoint, or TLS material inherited onto a plaintext
-			// route, passed -check-config and CrashLooped the agent on start,
-			// which is the one outcome this check exists to prevent.
-			rcfg, err := routeExportConfig(cfg.Export, rt)
+			// Validated like any other destination — the dry run used to check
+			// the name, the namespaces and the patterns and stop, so a
+			// scheme-less route endpoint, or TLS material inherited onto a
+			// plaintext route, passed -check-config and CrashLooped the agent
+			// on start, which is the one outcome this check exists to prevent.
+			rcfg, err := validateRoute(cfg.Export, i, rt)
 			if err != nil {
 				return err
 			}
@@ -265,12 +247,78 @@ func validateConfig(cfg agentConfig, transformsFile string) error {
 			}
 		}
 	}
-	if transformsFile != "" {
-		if _, err := transform.CompileFile(transformsFile); err != nil {
-			return fmt.Errorf("transforms: %w", err)
-		}
+	if _, err := compileTransforms(transformsFile); err != nil {
+		return fmt.Errorf("transforms: %w", err)
 	}
 	return nil
+}
+
+// --- per-section compile helpers ---
+//
+// ONE home per section for "which arguments participate in its validity":
+// validateConfig, run() and the -test-config harness all compile a section
+// through the same helper, so an option that participates in validation (the
+// log-metrics name prefix) or a new refusal cannot land in one path and not
+// the others. validateConfig passes no extras, and every helper acquires
+// NOTHING (no listeners, no log files, no network; compileTransforms reads
+// only the file the flag names, which the dry run always did) — run() supplies
+// loggers and classifiers through the extras.
+
+// compileScrub compiles the logScrubbing section; nil = no scrubbing.
+func compileScrub(cfg *logscrub.Config) (*logscrub.Scrubber, error) {
+	if cfg == nil {
+		return nil, nil
+	}
+	return logscrub.New(*cfg)
+}
+
+// compileLogAttrs compiles the logAttributes section (logattrs.New already
+// returns nil for an absent or empty section; the helper exists so this
+// section reads like the others and keeps one compile path).
+func compileLogAttrs(cfg *logattrs.Config) (*logattrs.Extractor, error) {
+	return logattrs.New(cfg)
+}
+
+// compileLogRules compiles the logs.rules chain; nil when the logs section is
+// absent. Shared by the tailer AND journald (same section, same semantics),
+// which is why run() compiles it outside startLogs — journald must get it even
+// with -logs=false.
+func compileLogRules(logs *tailer.SourcesConfig) (*logline.LineFilter, error) {
+	if logs == nil {
+		return nil, nil
+	}
+	return logline.NewLineFilter(logs.Rules)
+}
+
+// compileSources validates the logs.sources list; nil when the section is
+// absent (the tailer then uses the default containerd source over -log-dir).
+func compileSources(logs *tailer.SourcesConfig) ([]tailer.Source, error) {
+	if logs == nil {
+		return nil, nil
+	}
+	return tailer.ValidateSources(logs.Sources)
+}
+
+// compileLogMetrics compiles the logMetrics section into a set; nil when the
+// section is absent or empty. The name PREFIX is applied here because it
+// participates in validation — an empty rule name is legal only because the
+// prefix makes the result non-empty — so validating without it would reject
+// configs that actually run; extras carry what only a real start wants (the
+// logger, the permanent-rejection classifier).
+func compileLogMetrics(cfg *metrics.DynamicConfig, extra ...metrics.Option) (*metrics.DynamicMetricSet, error) {
+	if cfg == nil || len(cfg.Metrics) == 0 {
+		return nil, nil
+	}
+	opts := append([]metrics.Option{metrics.WithNamePrefix(*logsMetricsPrefix)}, extra...)
+	return metrics.NewDynamicMetricSet(cfg.Metrics, opts...)
+}
+
+// compileTransforms compiles the -transforms-file; "" = none.
+func compileTransforms(file string) (*transform.Program, error) {
+	if file == "" {
+		return nil, nil
+	}
+	return transform.CompileFile(file)
 }
 
 // configWarnings reports combinations that are LEGAL but do something other than
@@ -357,6 +405,31 @@ func logConfigWarnings(cfg agentConfig, log *slog.Logger) {
 	}
 }
 
+// validateRoute checks one routing route's shape — name and namespaces
+// present, every namespace pattern parseable — and derives its export config
+// through the shared derivation. ONE function called by BOTH validateConfig
+// and run()'s route loop, so a new refusal cannot land in one and not the
+// other; i is the route's index, used only when it has no name to report.
+//
+// The pattern check exists because a malformed glob makes path.Match return
+// ErrBadPattern for EVERY namespace, which the matcher reads as "no match":
+// the route never fires and its tenant's telemetry goes silently to the
+// default destination — indistinguishable from "no traffic yet", since the
+// route's counter simply stays at zero. Fail startup instead.
+func validateRoute(exp *otlpexport.ExportConfig, i int, rt route.Route) (otlpexport.Config, error) {
+	if rt.Name == "" || len(rt.Namespaces) == 0 {
+		return otlpexport.Config{}, fmt.Errorf("routing route %d: name and namespaces are required", i)
+	}
+	for _, pat := range rt.Namespaces {
+		if _, err := path.Match(pat, ""); err != nil {
+			return otlpexport.Config{}, fmt.Errorf("routing route %q: invalid namespace pattern %q: %w", rt.Name, pat, err)
+		}
+	}
+	// The SAME derivation on both paths, so a config the dry run accepts is a
+	// config that starts.
+	return routeExportConfig(exp, rt)
+}
+
 // routeExportConfig derives one route destination's client config: the flag
 // base, plus the export section's base additions (headers, client cert), plus
 // the route's own endpoint and headers (which win per key).
@@ -384,21 +457,32 @@ func routeExportConfig(exp *otlpexport.ExportConfig, rt route.Route) (otlpexport
 		rcfg.Headers = merged
 	}
 	if rt.Endpoint != "" {
-		rcfg.Endpoint = rt.Endpoint
 		// A route naming its OWN endpoint does not inherit the default chain's
 		// credentials. Those authenticate this deployment to ITS collector, and
 		// this is a different host — usually a different tenant's, sometimes a
 		// different organization's. Carrying the base BearerTokenFile and mTLS
 		// client certificate over presented them to whatever address the route
 		// named, which is a credential disclosure with no way to opt out: there
-		// was no per-route field to override them with. Each is taken from the
+		// was no per-route field to override them with. So the destination is
+		// rebuilt on otlpexport.Config.TransportOnly — the one spelling of the
+		// transport-vs-destination partition, shared with the reshard hop's
+		// client derivation — and every destination field is taken from the
 		// route or left unset.
-		rcfg.BearerTokenFile = rt.BearerTokenFile
-		rcfg.ClientCertFile = rt.ClientCertFile
-		rcfg.ClientKeyFile = rt.ClientKeyFile
-		rcfg.CAFile = rt.CAFile
-		rcfg.Insecure = rt.Insecure
-		return rcfg, nil
+		out := rcfg.TransportOnly()
+		out.Endpoint = rt.Endpoint
+		// Two deliberate carryovers from the merged base, bit-identical to the
+		// hand-rolled strip this replaced: the MERGED base headers still ride to
+		// an own-endpoint route (a possible header leak, noted by review —
+		// changing it is a product decision, not this refactor), and so does
+		// -otlp-insecure-skip-verify, which a route has no field of its own for.
+		out.Headers = rcfg.Headers
+		out.InsecureSkipVerify = rcfg.InsecureSkipVerify
+		out.BearerTokenFile = rt.BearerTokenFile
+		out.ClientCertFile = rt.ClientCertFile
+		out.ClientKeyFile = rt.ClientKeyFile
+		out.CAFile = rt.CAFile
+		out.Insecure = rt.Insecure
+		return out, nil
 	}
 	if baseEndpointUnused(exp) {
 		return otlpexport.Config{}, fmt.Errorf("routing route %q: no endpoint, and the flag base is not a destination here (export: gives every signal its own endpoint, so nothing dials -otlp-endpoint) — give the route its own endpoint", rt.Name)
@@ -532,6 +616,14 @@ func (r *readiness) done(name string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.gates[name] = true
+}
+
+// gate registers a gate and returns the func that satisfies it, so a
+// require/done pair cannot name two different gates. The returned func has
+// done's semantics: idempotent, safe from any goroutine.
+func (r *readiness) gate(name string) func() {
+	r.require(name)
+	return func() { r.done(name) }
 }
 
 // pending returns the unsatisfied gates, sorted for a stable probe body.

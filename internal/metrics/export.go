@@ -363,9 +363,73 @@ func renderSummary(m pmetric.Metric, samples []sample, ts time.Time) {
 	}
 }
 
-// renderHistogram regroups a histogram's per-bucket samples (keyed by their
-// labels without "le") into cumulative OTLP histogram points, converting the
-// stored cumulative bucket counts to the absolute per-bucket counts OTLP wants.
+// histGroup is one label set's regrouped histogram: the series store keeps a
+// histogram as one stream per bucket (the labels plus "le"), and both readers
+// of that layout — Dump and this OTLP render — need it back as one point per
+// label set.
+type histGroup struct {
+	lbls labels
+	key  string // canonical label string without "le" (putLabels-ready)
+	// first is the group's first sample in input order. Every bucket stream of
+	// one label set is admitted together (observe's admission is
+	// all-or-nothing), so whichever arrives first carries the point's start.
+	first sample
+	// buckets is the CUMULATIVE count per bound, +Inf excluded: each stream's
+	// count already includes every lower bucket's, because observe records
+	// into every bucket the value fits.
+	buckets []uint64
+	// count/sum are the +Inf stream's totals — the point's observation count
+	// and their sum, exactly the Prometheus histogram shape.
+	count uint64
+	sum   float64
+	// hasInf records that the +Inf stream was present, so a render can leave
+	// the optional sum/count unset when it somehow was not (unreachable given
+	// all-or-nothing admission; defensive).
+	hasInf bool
+}
+
+// regroupHistogram decodes the store's bucket-stream layout into one group per
+// label set, in first-seen order. Consumed by BOTH renderHistogram (which
+// converts the cumulative buckets to OTLP's absolute counts) and dumpSeries
+// (which keeps them cumulative, the Dump contract).
+//
+// Keyed by the canonical label STRING, not lbls.hash(): the series store
+// defends 64-bit collisions with a check hash, and dropping that discipline
+// here would silently merge two label sets' buckets into one corrupted point.
+// The string is exact and already needed for the label rendering.
+//
+// PURE READ, by contract: nothing in the samples is mutated — Dump serves a
+// live Registry through this beside the push path (TestDumpNonMutating), so
+// it must never seal, clear or spend anything.
+func regroupHistogram(samples []sample, nBounds int) []*histGroup {
+	groups := map[string]*histGroup{}
+	var out []*histGroup
+	for _, samp := range samples {
+		lbls, err := parseLabels(samp.labels)
+		if err != nil {
+			continue
+		}
+		lbls = lbls.without(leLabel)
+		key := lbls.String()
+		g := groups[key]
+		if g == nil {
+			g = &histGroup{lbls: lbls, key: key, first: samp, buckets: make([]uint64, nBounds)}
+			groups[key] = g
+			out = append(out, g)
+		}
+		switch {
+		case samp.bucket == nBounds: // the +Inf stream carries the totals
+			g.count, g.sum, g.hasInf = samp.count, samp.value, true
+		case samp.bucket < nBounds:
+			g.buckets[samp.bucket] = samp.count
+		}
+	}
+	return out
+}
+
+// renderHistogram writes one cumulative OTLP histogram point per regrouped
+// label set (regroupHistogram), converting the stored cumulative bucket
+// counts to the absolute per-bucket counts OTLP wants (accumulateBuckets).
 func renderHistogram(m pmetric.Metric, s *series, samples []sample, ts time.Time) {
 	now := pcommon.Timestamp(ts.UnixNano())
 	bounds := s.buckets[:len(s.buckets)-1] // drop +Inf
@@ -373,52 +437,34 @@ func renderHistogram(m pmetric.Metric, s *series, samples []sample, ts time.Time
 	hist := m.SetEmptyHistogram()
 	hist.SetAggregationTemporality(pmetric.AggregationTemporalityCumulative)
 
-	// Keyed by the canonical label STRING, not lbls.hash(): the series store
-	// defends 64-bit collisions with a check hash, and dropping that discipline
-	// here would silently merge two label sets' buckets into one corrupted
-	// point. The string is exact and already needed for putLabels.
-	points := map[string]pmetric.HistogramDataPoint{}
-	counts := map[string][]uint64{}
-	for _, sample := range samples {
-		lbls, _ := parseLabels(sample.labels)
-		lbls = lbls.without(leLabel)
-		key := lbls.String()
-
-		dp, ok := points[key]
-		if !ok {
-			dp = hist.DataPoints().AppendEmpty()
-			// Every bucket stream of one label set is admitted together
-			// (observe's admission is all-or-nothing), so whichever arrives
-			// first here carries the point's start.
-			dp.SetStartTimestamp(startOf(sample, ts))
-			dp.SetTimestamp(now)
-			putLabels(dp.Attributes(), key)
-			dp.ExplicitBounds().FromRaw(bounds)
-			points[key] = dp
-			counts[key] = make([]uint64, len(bounds)+1)
+	for _, g := range regroupHistogram(samples, len(bounds)) {
+		dp := hist.DataPoints().AppendEmpty()
+		dp.SetStartTimestamp(startOf(g.first, ts))
+		dp.SetTimestamp(now)
+		putLabels(dp.Attributes(), g.key)
+		dp.ExplicitBounds().FromRaw(bounds)
+		if g.hasInf {
+			dp.SetSum(g.sum)
+			dp.SetCount(g.count)
 		}
-		accumulateBucket(counts[key], sample)
-		if sample.bucket == len(bounds) { // the +Inf bucket carries totals
-			dp.SetSum(sample.value)
-			dp.SetCount(sample.count)
-		}
-	}
-	for key, dp := range points {
-		dp.BucketCounts().FromRaw(counts[key])
+		dp.BucketCounts().FromRaw(accumulateBuckets(g))
 	}
 }
 
-// accumulateBucket converts one cumulative bucket sample into absolute counts:
-// the value belongs to its bucket but was also counted in every higher one, so
-// subtract it from the next.
-func accumulateBucket(counts []uint64, s sample) {
-	if s.count == 0 {
-		return
+// accumulateBuckets converts a group's cumulative bucket counts into the
+// absolute per-bucket counts OTLP wants: a value counted in its bucket was
+// also counted in every higher one, so each slot is its cumulative count
+// minus the previous bound's, and the +Inf slot is the total minus the last
+// bound's.
+func accumulateBuckets(g *histGroup) []uint64 {
+	counts := make([]uint64, len(g.buckets)+1)
+	var prev uint64
+	for i, c := range g.buckets {
+		counts[i] = c - prev
+		prev = c
 	}
-	if s.bucket < len(counts)-1 {
-		counts[s.bucket+1] -= s.count
-	}
-	counts[s.bucket] += s.count
+	counts[len(g.buckets)] = g.count - prev
+	return counts
 }
 
 // putLabels parses a serialized label set and copies its pairs into a pdata map.

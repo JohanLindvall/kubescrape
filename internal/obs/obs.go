@@ -233,6 +233,15 @@ var (
 var SelfMetadataLookups = Registry.CounterVec("kubescrape_self_metadata_lookups_total",
 	"Own-pod metadata lookups for -self-attributes, by outcome.", "outcome")
 
+// SelfMetadataLookups' outcome label values, shared by the two binaries'
+// resolvers so their series stay unionable (each binary re-typing the strings
+// is how one grows a spelling the other's dashboards do not match).
+const (
+	SelfLookupSelf   = "self"    // resolved via GET /v1/self (the agent's first try)
+	SelfLookupByName = "by_name" // resolved via the namespace/name fallback
+	SelfLookupError  = "error"   // not resolved; the error is returned to the poller
+)
+
 // RegisterSelfMetadata exposes whether this process has resolved the pod it
 // runs in, whose attributes it stamps on the metrics it generates about itself
 // (-self-attributes). Both binaries register it whenever the lookup RUNS, and

@@ -50,6 +50,23 @@ func TestExcludedPipelinesRefusedByValidateConfig(t *testing.T) {
 	}
 }
 
+// The stubs raise their refusal through excludedPipelineErrorFor, which looks
+// the (flag, tag, what) triple up from the registry — re-typing it in each
+// stub is how one drifts from the wording validateConfig raises. This pin also
+// anchors the helper in builds where both pipelines are compiled in and no
+// stub exists to call it.
+func TestStubErrorsMatchTheRegistry(t *testing.T) {
+	for _, p := range optionalPipelines() {
+		got, want := excludedPipelineErrorFor(p.tag).Error(), excludedPipelineError(p.flag, p.tag, p.what).Error()
+		if got != want {
+			t.Errorf("excludedPipelineErrorFor(%q) = %q, want %q", p.tag, got, want)
+		}
+	}
+	if err := excludedPipelineErrorFor("no-such-tag"); err == nil {
+		t.Error("an unregistered tag must still produce an error, never nil")
+	}
+}
+
 // A build variant may drop a pipeline's CODE but never its FLAGS: the shipped
 // manifests pass them (internal/manifestcheck guards that against the flag
 // set), and a binary that had quietly dropped one would exit 2 with `flag

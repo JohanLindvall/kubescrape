@@ -71,6 +71,174 @@ type chunker interface {
 // message), leaving room for the size estimate's error margin.
 const defaultBatchBytes = 3 << 20
 
+// scrapeSession owns the per-scrape state the text and protobuf parse fronts
+// share (they drifted twice before it existed — see reportMalformed and
+// salvage): the filter session and relabel chain with their drop counters, the
+// MaxSamples abort, the exportFailed latch, the batch-full predicate, the
+// salvage-on-abort policy and the malformed accounting. State lives in struct
+// fields and the per-sample entry points (accept, keep) are METHODS, never
+// closures: the keep/emit path runs per sample and must stay 0-alloc
+// (TestFilterSessionAllocationBudget is the package's guard on the filter
+// half).
+type scrapeSession struct {
+	s        *Scraper
+	ctx      context.Context
+	cb       chunker
+	conv     *converter
+	pipeline string
+	what     string
+	filter   *filterSession
+	relabel  *relabelFilter
+	proto    bool // selects each front's historical log wording
+
+	samples        int
+	droppedFilter  int
+	droppedRelabel int
+	exportFailed   bool
+}
+
+func (s *Scraper) newScrapeSession(ctx context.Context, cb chunker, pipeline, what string, relabel *relabelFilter, proto bool) *scrapeSession {
+	ss := &scrapeSession{s: s, ctx: ctx, cb: cb, pipeline: pipeline, what: what, relabel: relabel, proto: proto}
+	ss.filter = s.cfg.Filters.filterFor(pipeline).session()
+	ss.conv = newConverter(cb, ss.exportIfFull)
+	return ss
+}
+
+// full reports whether the accumulated chunk hit either batch bound
+// (BatchPoints data points or BatchBytes estimated bytes, whichever first).
+func (ss *scrapeSession) full() bool {
+	return ss.cb.count() >= ss.s.cfg.BatchPoints ||
+		(ss.s.cfg.BatchBytes > 0 && ss.cb.size() >= ss.s.cfg.BatchBytes)
+}
+
+// export ships the accumulated chunk; a failure latches exportFailed so
+// salvage knows re-sending is pointless.
+func (ss *scrapeSession) export() error {
+	if err := ss.s.cfg.Exporter.ExportMetrics(ss.ctx, ss.cb.take()); err != nil {
+		ss.exportFailed = true
+		return err
+	}
+	return nil
+}
+
+// exportIfFull is the converter's emit hook: flush between points once a chunk
+// fills (a single family can hold thousands of label sets).
+func (ss *scrapeSession) exportIfFull() error {
+	if ss.full() {
+		return ss.export()
+	}
+	return nil
+}
+
+// flushIfFull additionally finishes the converter first — the protobuf front's
+// mid-family flush: a delimited exposition emits one MetricFamily per metric
+// holding ALL its series, so checking only at the family boundary would build
+// the whole batch in memory and blow BatchBytes for a high-cardinality native
+// family (classic samples already flush mid-family via exportIfFull).
+func (ss *scrapeSession) flushIfFull() error {
+	if !ss.full() {
+		return nil
+	}
+	if err := ss.conv.finish(); err != nil {
+		return err
+	}
+	return ss.export()
+}
+
+// keep applies the per-pipeline filter, then the endpoint's relabel chain.
+// Drops are counted in fields and reported once per scrape (reportDropped): a
+// WithLabelValues probe here would be on the hot path the whole package's
+// allocation discipline is about.
+func (ss *scrapeSession) keep(name string, labels []Label) bool {
+	if !ss.filter.Keep(name, labels) {
+		ss.droppedFilter++
+		return false
+	}
+	if ss.relabel != nil && !ss.relabel.Keep(name, labels) {
+		ss.droppedRelabel++
+		return false
+	}
+	return true
+}
+
+// accept consumes one classic sample: the text parser's callback and the
+// protobuf front's emit.
+func (ss *scrapeSession) accept(sample Sample) error {
+	ss.samples++
+	if ss.s.cfg.MaxSamples > 0 && ss.samples > ss.s.cfg.MaxSamples {
+		return ErrTooManySamples
+	}
+	if !ss.keep(sample.Name, sample.Labels) {
+		return nil
+	}
+	return ss.conv.add(sample)
+}
+
+// countNative charges one native-histogram point against MaxSamples — native
+// points bypass accept (they go straight to the batcher, not the converter)
+// and the cap must bound them too.
+func (ss *scrapeSession) countNative() error {
+	ss.samples++
+	if ss.s.cfg.MaxSamples > 0 && ss.samples > ss.s.cfg.MaxSamples {
+		return ErrTooManySamples
+	}
+	return nil
+}
+
+// reportDropped tallies the drop counters into obs.ScrapeSamplesDropped, once
+// per scrape from a defer — the abort paths must report too: a scrape that
+// tripped the sample limit still filtered everything it parsed.
+func (ss *scrapeSession) reportDropped() {
+	if ss.droppedFilter > 0 {
+		obs.ScrapeSamplesDropped.WithLabelValues(ss.pipeline, "filter").Add(float64(ss.droppedFilter))
+	}
+	if ss.droppedRelabel > 0 {
+		obs.ScrapeSamplesDropped.WithLabelValues(ss.pipeline, "relabel").Add(float64(ss.droppedRelabel))
+	}
+}
+
+// salvage exports the partially converted scrape after an abort (sample limit,
+// truncated body, read timeout mid-body, over-cap proto message). Every metric
+// kind here is cumulative, so a partial scrape costs only the missing series —
+// whereas discarding the conversion threw away everything parsed before the
+// abort (the protobuf path did exactly that until it learned the text path's
+// policy; the harness exists so the two cannot disagree again). Pointless when
+// the failure WAS the export (the collector just rejected a chunk) or when the
+// context is gone (the send cannot succeed either).
+func (ss *scrapeSession) salvage() {
+	if ss.exportFailed || ss.ctx.Err() != nil {
+		return
+	}
+	if ferr := ss.conv.finish(); ferr == nil && ss.cb.count() > 0 {
+		if eerr := ss.export(); eerr != nil {
+			if ss.proto {
+				ss.s.log.Warn("exporting partial proto scrape", "pipeline", ss.pipeline, "error", eerr)
+			} else {
+				ss.s.log.Warn("exporting partial scrape", "target", ss.what, "error", eerr)
+			}
+		}
+	}
+}
+
+// reportMalformed counts and logs a scrape's rejected lines/families (msg is
+// the front's wording; abortErr rides on the text path's abort report). It
+// runs on the abort paths too: returning without it made a scrape that tripped
+// the sample limit, was truncated, or timed out mid-body report zero malformed
+// lines even when the body was garbage — so the one metric that identifies the
+// cause never moved, and the protobuf path (which did report it) disagreed
+// with the text path on identical input.
+func (ss *scrapeSession) reportMalformed(msg string, malformed int, abortErr error) {
+	if malformed == 0 {
+		return
+	}
+	obs.ScrapeMalformed.WithLabelValues(ss.pipeline).Add(float64(malformed))
+	if abortErr != nil {
+		ss.s.log.Warn(msg, "target", ss.what, "malformed", malformed, "samples", ss.samples, "error", abortErr)
+	} else {
+		ss.s.log.Warn(msg, "target", ss.what, "malformed", malformed, "samples", ss.samples)
+	}
+}
+
 // parseAndExport streams one scrape body through the series filter and the
 // converter into cb, exporting a chunk whenever BatchPoints data points or
 // BatchBytes estimated bytes accumulate. It returns the number of samples
@@ -85,97 +253,31 @@ func (s *Scraper) parseAndExport(ctx context.Context, body io.Reader, openMetric
 }
 
 // parseAndExportFiltered additionally applies a per-target relabel session
-// (monitor endpoints' metricRelabelings; nil = none).
+// (monitor endpoints' metricRelabelings; nil = none). The text-format front:
+// the per-scrape policy lives on scrapeSession, shared with the protobuf
+// front.
 func (s *Scraper) parseAndExportFiltered(ctx context.Context, body io.Reader, openMetrics, withExemplars bool, cb chunker, pipeline, what string, relabel *relabelFilter) (int, error) {
-	filter := s.cfg.Filters.filterFor(pipeline).session()
-	exportFailed := false
-	export := func() error {
-		if err := s.cfg.Exporter.ExportMetrics(ctx, cb.take()); err != nil {
-			exportFailed = true
-			return err
-		}
-		return nil
-	}
-	full := func() bool {
-		return cb.count() >= s.cfg.BatchPoints ||
-			(s.cfg.BatchBytes > 0 && cb.size() >= s.cfg.BatchBytes)
-	}
-	conv := newConverter(cb, func() error {
-		if full() {
-			return export()
-		}
-		return nil
-	})
+	ss := s.newScrapeSession(ctx, cb, pipeline, what, relabel, false)
+	defer ss.reportDropped()
 	parser := promparse.Get(promparse.Options{MaxLineBytes: s.cfg.MaxLineBytes, OpenMetrics: openMetrics, Exemplars: withExemplars})
 	defer promparse.Put(parser)
-	samples := 0
-	// Filtered-away samples are counted in locals and reported once per scrape:
-	// this closure runs per sample and a WithLabelValues probe there would be
-	// on the hot path the whole package's allocation discipline is about. They
-	// are reported on the abort path too — a scrape that tripped the sample
-	// limit still filtered everything it parsed.
-	var droppedFilter, droppedRelabel int
-	defer func() {
-		if droppedFilter > 0 {
-			obs.ScrapeSamplesDropped.WithLabelValues(pipeline, "filter").Add(float64(droppedFilter))
-		}
-		if droppedRelabel > 0 {
-			obs.ScrapeSamplesDropped.WithLabelValues(pipeline, "relabel").Add(float64(droppedRelabel))
-		}
-	}()
-	malformed, err := parser.Parse(body, func(sample Sample) error {
-		samples++
-		if s.cfg.MaxSamples > 0 && samples > s.cfg.MaxSamples {
-			return ErrTooManySamples
-		}
-		if !filter.Keep(sample.Name, sample.Labels) {
-			droppedFilter++
-			return nil
-		}
-		if relabel != nil && !relabel.Keep(sample.Name, sample.Labels) {
-			droppedRelabel++
-			return nil
-		}
-		return conv.add(sample)
-	})
+	malformed, err := parser.Parse(body, ss.accept)
 	if err != nil {
-		// Salvage the partially converted scrape. Pointless when the failure
-		// WAS the export (the collector just rejected a chunk) or when the
-		// context is gone (the send cannot succeed either).
-		if !exportFailed && ctx.Err() == nil {
-			if ferr := conv.finish(); ferr == nil && cb.count() > 0 {
-				if eerr := export(); eerr != nil {
-					s.log.Warn("exporting partial scrape", "target", what, "error", eerr)
-				}
-			}
-		}
-		// Report what the parser DID reject before the abort. Returning without
-		// this made a scrape that tripped the sample limit, was truncated, or
-		// timed out mid-body report zero malformed lines even when the body was
-		// garbage — so the one metric that identifies the cause never moved,
-		// and the protobuf path (which does report it) disagreed with the text
-		// path on identical input.
-		malformed += conv.malformed
-		if malformed > 0 {
-			obs.ScrapeMalformed.WithLabelValues(pipeline).Add(float64(malformed))
-			s.log.Warn("aborted scrape had malformed lines", "target", what, "malformed", malformed, "samples", samples, "error", err)
-		}
-		return samples, err
+		ss.salvage()
+		ss.reportMalformed("aborted scrape had malformed lines", malformed+ss.conv.malformed, err)
+		return ss.samples, err
 	}
-	if err := conv.finish(); err != nil {
-		return samples, err
+	if err := ss.conv.finish(); err != nil {
+		return ss.samples, err
 	}
-	malformed += conv.malformed // component samples the converter rejected
-	if cb.count() > 0 {
-		if err := export(); err != nil {
-			return samples, err
+	malformed += ss.conv.malformed // component samples the converter rejected
+	if ss.cb.count() > 0 {
+		if err := ss.export(); err != nil {
+			return ss.samples, err
 		}
 	}
-	if malformed > 0 {
-		obs.ScrapeMalformed.WithLabelValues(pipeline).Add(float64(malformed))
-		s.log.Warn("scrape had malformed lines", "target", what, "malformed", malformed, "samples", samples)
-	}
-	return samples, nil
+	ss.reportMalformed("scrape had malformed lines", malformed, nil)
+	return ss.samples, nil
 }
 
 // kubeletGet fetches a kubelet URL with bearer-token authentication. The

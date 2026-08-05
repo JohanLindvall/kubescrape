@@ -74,3 +74,37 @@ tests:
 		t.Fatalf("want a 1-of-1 failure, got %v", err)
 	}
 }
+
+// Assertions about the LINE (severity, attributes, body) must hold even for a
+// record the rules DROP: the harness evaluates them on a rules-free pass of
+// the chain before taking the verdict, so a case can assert both "this parses
+// as error" and "this is dropped" at once.
+func TestRunConfigTestsAssertsOnDroppedRecords(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := writeFile(t, dir, "config.yaml", `
+logs:
+  sources:
+    - name: containerd
+      include: ["/var/log/containers/*.log"]
+      containerd: true
+  rules:
+    - action: drop
+      match: ["__severity__=error"]
+`)
+	cfg, err := loadAgentConfig(cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tests := writeFile(t, dir, "tests.yaml", `
+tests:
+  - name: dropped but still asserted
+    line: 'level=error msg="boom"'
+    expect:
+      kept: false
+      severity: error
+      body: 'level=error msg="boom"'
+`)
+	if err := runConfigTests(*cfg, "", tests, slog.Default()); err != nil {
+		t.Fatalf("severity/body assertions must hold for a dropped record: %v", err)
+	}
+}

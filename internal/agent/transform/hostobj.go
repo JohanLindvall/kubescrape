@@ -426,21 +426,8 @@ func (d *datapoints) Truth() starlark.Bool  { return d.Len() > 0 }
 func (d *datapoints) Hash() (uint32, error) { return 0, fmt.Errorf("unhashable") }
 
 // Len makes len(m.datapoints) work and lets a script skip empty metrics.
-func (d *datapoints) Len() int {
-	switch d.m.Type() {
-	case pmetric.MetricTypeGauge:
-		return d.m.Gauge().DataPoints().Len()
-	case pmetric.MetricTypeSum:
-		return d.m.Sum().DataPoints().Len()
-	case pmetric.MetricTypeHistogram:
-		return d.m.Histogram().DataPoints().Len()
-	case pmetric.MetricTypeExponentialHistogram:
-		return d.m.ExponentialHistogram().DataPoints().Len()
-	case pmetric.MetricTypeSummary:
-		return d.m.Summary().DataPoints().Len()
-	}
-	return 0
-}
+// One five-way switch, one owner: engine.go's dataPointCount.
+func (d *datapoints) Len() int { return dataPointCount(d.m) }
 
 func (d *datapoints) Iterate() starlark.Iterator {
 	var dps []*dpObj

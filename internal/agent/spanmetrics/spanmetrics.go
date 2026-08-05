@@ -123,25 +123,11 @@ func (c Config) Validate() error {
 	if c.MaxCardinality < 0 {
 		return fmt.Errorf("maxCardinality must not be negative")
 	}
-	// The same check servicegraph.Config.Validate applies to its identical
-	// histogramBuckets field. Without it, boundsOrDefault sorts but never
-	// de-duplicates, so `buckets: [0.1, 0.1, 1]` shipped an OTLP histogram
-	// whose ExplicitBounds are not strictly increasing — which the spec
-	// requires — giving a bucket that can never receive a value and a
-	// backend that either rejects the metric or renders a nonsense
-	// distribution. The two aggregators are the same shape and had drifted on
-	// exactly this kind of rule before (see cumagg.ParseStaleAfter).
-	var prev float64
-	for i, b := range c.Buckets {
-		if b <= 0 {
-			return fmt.Errorf("buckets[%d] = %v (want > 0, in seconds)", i, b)
-		}
-		if i > 0 && b <= prev {
-			return fmt.Errorf("buckets must be strictly increasing (%v after %v)", b, prev)
-		}
-		prev = b
-	}
-	return nil
+	// Shared with servicegraph's identical histogramBuckets check —
+	// cumagg.ValidateBuckets carries the why (non-increasing ExplicitBounds
+	// violate the OTLP spec, and boundsOrDefault sorts but never
+	// de-duplicates).
+	return cumagg.ValidateBuckets("buckets", c.Buckets)
 }
 
 // Generator aggregates spans into calls/size/duration metrics. Safe for
@@ -269,11 +255,7 @@ func (g *Generator) observe(span ptrace.Span, resAttrs pcommon.Map, svc string, 
 	key = cumagg.AppendKeyPart(key, span.Kind().String())
 	key = cumagg.AppendKeyPart(key, span.Status().Code().String())
 	for _, k := range g.extra {
-		v := cumagg.AttrStr(span.Attributes(), k)
-		if v == "" {
-			v = cumagg.AttrStr(resAttrs, k) // fall back to the resource
-		}
-		key = cumagg.AppendKeyPart(key, cumagg.Trunc(v))
+		key = cumagg.AppendKeyPart(key, cumagg.Trunc(extraDim(span, resAttrs, k)))
 	}
 	d := cumagg.SpanSeconds(span)
 	sz := spanSize(span)
@@ -310,13 +292,23 @@ func (g *Generator) dims(span ptrace.Span, resAttrs pcommon.Map, svc string) []s
 	vals = append(vals, cumagg.Retain(svc), cumagg.Retain(span.Name()),
 		span.Kind().String(), span.Status().Code().String())
 	for _, k := range g.extra {
-		v := cumagg.AttrStr(span.Attributes(), k)
-		if v == "" {
-			v = cumagg.AttrStr(resAttrs, k)
-		}
-		vals = append(vals, cumagg.Retain(v))
+		vals = append(vals, cumagg.Retain(extraDim(span, resAttrs, k)))
 	}
 	return vals
+}
+
+// extraDim resolves one configured dimension: the span attribute first, the
+// resource attribute as the fallback ("" when neither is set). observe's key
+// loop and dims' value loop both read through this ONE spelling — they were
+// character-equal copies, and a drift between them would make a series' KEY
+// disagree with the labels it RENDERS (distinct tuples merging into one label
+// set, or one tuple rendering two).
+func extraDim(span ptrace.Span, resAttrs pcommon.Map, key string) string {
+	v := cumagg.AttrStr(span.Attributes(), key)
+	if v == "" {
+		v = cumagg.AttrStr(resAttrs, key)
+	}
+	return v
 }
 
 // Run exports every interval until ctx is done, then once more on a detached

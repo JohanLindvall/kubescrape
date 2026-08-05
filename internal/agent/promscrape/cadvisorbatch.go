@@ -208,8 +208,12 @@ func (id cadvisorIdentity) appendKey(b []byte) []byte {
 	return append(b, id.containerID...)
 }
 
-// appendLP appends one length-prefixed label-derived key part (collision-proof
-// join).
+// appendLP appends one length-prefixed key part — the package's ONE
+// injective-join rule for anything data-derived that lands in a map key or a
+// cache-key fingerprint (resource identities here and in labelKey, the TLS
+// client key via lp, the relabel-chain fingerprint). Delimiter joins are not
+// collision-proof: exposition label values and secret PEM may contain any
+// delimiter byte, and two configurations serialising to one key silently merge.
 func appendLP(b []byte, v string) []byte {
 	b = strconv.AppendInt(b, int64(len(v)), 10)
 	b = append(b, ':')
@@ -341,7 +345,7 @@ func (cb *cadvisorBatcher) metric(ident cadvisorIdentity, name string, meta metr
 		cb.byKey[key] = m
 		// One descriptor per resource — including its description and unit,
 		// which a per-pod/container batch repeats for every resource.
-		cb.bytes += len(name) + metricOverheadBytes + meta.apply(m)
+		cb.bytes += chargeDescriptor(m, name, meta)
 	}
 	cb.lastMetIdent, cb.lastName, cb.lastMetric, cb.lastPodScope, cb.lastOK = ident, name, m, ident.podScoped(), true
 	return m, cb.lastPodScope
@@ -378,13 +382,7 @@ func (cb *cadvisorBatcher) addNumber(s Sample, monotonic bool) {
 		return
 	}
 	m, podScoped := cb.metric(ident, s.Name, sampleMeta(s), func(m pmetric.Metric) {
-		if monotonic {
-			sum := m.SetEmptySum()
-			sum.SetIsMonotonic(true)
-			sum.SetAggregationTemporality(pmetric.AggregationTemporalityCumulative)
-		} else {
-			m.SetEmptyGauge()
-		}
+		shapeNumber(m, monotonic)
 	})
 
 	dp, ok := numberDataPoint(m, cb.startTS)
@@ -403,15 +401,11 @@ func (cb *cadvisorBatcher) addHistogram(family string, acc *histAcc) {
 	if cb.drop(family, ident) {
 		return
 	}
-	m, podScoped := cb.metric(ident, family, acc.meta, func(m pmetric.Metric) {
-		m.SetEmptyHistogram().SetAggregationTemporality(pmetric.AggregationTemporalityCumulative)
-	})
-	if m.Type() != pmetric.MetricTypeHistogram {
-		obs.ScrapeCollisions.Inc()
+	m, podScoped := cb.metric(ident, family, acc.meta, shapeHistogram)
+	dp, ok := histogramDataPoint(m, cb.startTS)
+	if !ok {
 		return
 	}
-	dp := m.Histogram().DataPoints().AppendEmpty()
-	dp.SetStartTimestamp(cb.startTS)
 	dp.SetTimestamp(pointTS(acc.ts, cb.scrapeTS))
 	fillHistogramPoint(dp, acc)
 	cb.putFilteredLabels(dp.Attributes(), acc.labels, podScoped, ident.sandbox)
@@ -424,15 +418,11 @@ func (cb *cadvisorBatcher) addSummary(family string, acc *summAcc) {
 	if cb.drop(family, ident) {
 		return
 	}
-	m, podScoped := cb.metric(ident, family, acc.meta, func(m pmetric.Metric) {
-		m.SetEmptySummary()
-	})
-	if m.Type() != pmetric.MetricTypeSummary {
-		obs.ScrapeCollisions.Inc()
+	m, podScoped := cb.metric(ident, family, acc.meta, shapeSummary)
+	dp, ok := summaryDataPoint(m, cb.startTS)
+	if !ok {
 		return
 	}
-	dp := m.Summary().DataPoints().AppendEmpty()
-	dp.SetStartTimestamp(cb.startTS)
 	dp.SetTimestamp(pointTS(acc.ts, cb.scrapeTS))
 	fillSummaryPoint(dp, acc)
 	cb.putFilteredLabels(dp.Attributes(), acc.labels, podScoped, ident.sandbox)

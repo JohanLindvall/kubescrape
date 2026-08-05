@@ -184,17 +184,7 @@ func (c *Config) Validate() error {
 	if c.MaxItems < 0 || c.MaxCardinality < 0 {
 		return fmt.Errorf("maxItems and maxCardinality must not be negative")
 	}
-	var prev float64
-	for i, b := range c.HistogramBuckets {
-		if b <= 0 {
-			return fmt.Errorf("histogramBuckets[%d] = %v (want > 0, in seconds)", i, b)
-		}
-		if i > 0 && b <= prev {
-			return fmt.Errorf("histogramBuckets must be strictly increasing (%v after %v)", b, prev)
-		}
-		prev = b
-	}
-	return nil
+	return cumagg.ValidateBuckets("histogramBuckets", c.HistogramBuckets)
 }
 
 // withDefaults returns the config with Tempo's defaults filled in. The two
@@ -231,6 +221,19 @@ func defaultBuckets() []float64 {
 }
 
 // DefaultPeerAttributes is Tempo's defaultPeerAttributes, in precedence order.
+//
+// DELIBERATELY narrower than processor.go's databaseAttrs, which also carries
+// the post-1.30 semconv spellings (db.system.name, db.namespace). The two
+// lists answer different questions — databaseAttrs classifies an edge's
+// connection_type, this list names the VIRTUAL NODE minted for an unpaired
+// client span — and this one is a wire contract: Tempo's verbatim default,
+// which Grafana's Service Graph view and any dashboard ported from Tempo
+// assume. The asymmetry's visible consequence: a client instrumented ONLY with
+// 1.30 conventions classifies as `database` but never promotes to a virtual
+// node — its unpaired spans expire nameless — unless the operator extends
+// `serviceGraph.virtualNodePeerAttributes` (Config.VirtualNodePeerAttributes)
+// with the 1.30 keys. Extending the DEFAULT is a product decision (it changes
+// the `server` label existing dashboards select on), not a refactor.
 func DefaultPeerAttributes() []string {
 	return []string{"peer.service", "db.name", "db.system"}
 }

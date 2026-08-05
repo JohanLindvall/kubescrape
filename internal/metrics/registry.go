@@ -97,22 +97,26 @@ func (r *Registry) Gauge(name, desc string) *RegGauge {
 	return &RegGauge{newBound(r.add(name, desc, kindGauge, actionSet, nil), nil)}
 }
 
+// addFunc is the one constructor behind the four func-metric registrations:
+// a series of the given kind plus a gaugeFunc entry evaluated at export time.
+// labelName/fnVec carry the labeled (Vec) form; fn the scalar one.
+func (r *Registry) addFunc(name, desc string, kind seriesKind, labelName string, fn func() float64, fnVec func() map[string]float64) {
+	s := r.add(name, desc, kind, actionSet, nil)
+	r.mu.Lock()
+	r.funcs = append(r.funcs, &gaugeFunc{s: s, fn: fn, labelName: labelName, fnVec: fnVec})
+	r.mu.Unlock()
+}
+
 // GaugeFunc registers a gauge evaluated at export time.
 func (r *Registry) GaugeFunc(name, desc string, fn func() float64) {
-	s := r.add(name, desc, kindGauge, actionSet, nil)
-	r.mu.Lock()
-	r.funcs = append(r.funcs, &gaugeFunc{s: s, fn: fn})
-	r.mu.Unlock()
+	r.addFunc(name, desc, kindGauge, "", fn, nil)
 }
 
 // CounterFunc registers a monotonic counter whose value is read at export
 // time (for counts owned by another package's atomics). The function must be
 // non-decreasing; it renders as a cumulative monotonic sum.
 func (r *Registry) CounterFunc(name, desc string, fn func() float64) {
-	s := r.add(name, desc, kindCounter, actionSet, nil)
-	r.mu.Lock()
-	r.funcs = append(r.funcs, &gaugeFunc{s: s, fn: fn})
-	r.mu.Unlock()
+	r.addFunc(name, desc, kindCounter, "", fn, nil)
 }
 
 // GaugeFuncVec registers a gauge with ONE label whose values are read at
@@ -121,10 +125,7 @@ func (r *Registry) CounterFunc(name, desc string, fn func() float64) {
 // or per-instance (the disk buffer's per-signal backlog, say) and would
 // otherwise need one differently-NAMED metric each.
 func (r *Registry) GaugeFuncVec(name, desc, labelName string, fn func() map[string]float64) {
-	s := r.add(name, desc, kindGauge, actionSet, nil)
-	r.mu.Lock()
-	r.funcs = append(r.funcs, &gaugeFunc{s: s, labelName: labelName, fnVec: fn})
-	r.mu.Unlock()
+	r.addFunc(name, desc, kindGauge, labelName, nil, fn)
 }
 
 // CounterFuncVec registers a MONOTONIC counter with ONE label whose values are
@@ -138,10 +139,7 @@ func (r *Registry) GaugeFuncVec(name, desc, labelName string, fn func() map[stri
 // its own delta bookkeeping (gaugeFunc.lastVec), for the reason CounterFunc
 // keeps one: the series ACCUMULATES what is observed into it.
 func (r *Registry) CounterFuncVec(name, desc, labelName string, fn func() map[string]float64) {
-	s := r.add(name, desc, kindCounter, actionSet, nil)
-	r.mu.Lock()
-	r.funcs = append(r.funcs, &gaugeFunc{s: s, labelName: labelName, fnVec: fn})
-	r.mu.Unlock()
+	r.addFunc(name, desc, kindCounter, labelName, nil, fn)
 }
 
 // HistogramVec registers a labeled histogram (nil buckets = the default
@@ -282,6 +280,21 @@ type RegHistogram struct{ bound }
 // Observe records one value.
 func (h *RegHistogram) Observe(v float64) { h.observe(v) }
 
+// counterDelta is the value to PUSH for a counter func whose fn returns a
+// running total: the series ACCUMULATES observations (samp.value += v), so
+// each export must push only the growth since the last one — pushing the
+// total re-added the whole count every export, inflating a one-time burst
+// into a permanent per-interval rate. A value that SHRANK means the
+// underlying counter reset (a foreign atomic was zeroed): the new total is
+// all fresh growth. One rule for the scalar and the per-label-value forms,
+// which used to spell it twice.
+func counterDelta(prev, v float64) float64 {
+	if d := v - prev; d >= 0 {
+		return d
+	}
+	return v
+}
+
 // Export renders every registered series into one ResourceMetrics carrying
 // the given resource attributes and sends it.
 func (r *Registry) Export(ctx context.Context, exp Exporter, res pcommon.Resource) error {
@@ -298,18 +311,12 @@ func (r *Registry) Export(ctx context.Context, exp Exporter, res pcommon.Resourc
 				obsV := v
 				if counter {
 					// Per label value, the same delta bookkeeping CounterFunc
-					// does (see gaugeFunc.last): the series accumulates, so
-					// pushing the running total would re-add it every export.
-					// A value that shrank means the underlying total reset.
-					d := v - gf.lastVec[lv]
-					if d < 0 {
-						d = v
-					}
+					// does (see gaugeFunc.last and counterDelta).
+					obsV = counterDelta(gf.lastVec[lv], v)
 					if gf.lastVec == nil {
 						gf.lastVec = map[string]float64{}
 					}
 					gf.lastVec[lv] = v
-					obsV = d
 				}
 				gf.s.observe(labels{}.set(gf.labelName, lv), obsV, resKey{}, emptyResource, nil)
 			}
@@ -318,13 +325,9 @@ func (r *Registry) Export(ctx context.Context, exp Exporter, res pcommon.Resourc
 		}
 		v := gf.fn()
 		if gf.s.kind == kindCounter {
-			// Push the delta since the last export (see gaugeFunc.last). A
-			// shrunken value means the underlying counter reset (a foreign
-			// atomic was zeroed): treat the new total as fresh growth.
-			d := v - gf.last
-			if d < 0 {
-				d = v
-			}
+			// Push the delta since the last export (see gaugeFunc.last and
+			// counterDelta).
+			d := counterDelta(gf.last, v)
 			gf.last = v
 			gf.s.observe(nil, d, resKey{}, emptyResource, nil)
 			gf.mu.Unlock()

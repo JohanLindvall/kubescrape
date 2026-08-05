@@ -5,9 +5,9 @@ package main
 import (
 	"context"
 	"fmt"
-	"strings"
 
 	"github.com/JohanLindvall/kubescrape/internal/agent/azurediag"
+	"github.com/JohanLindvall/kubescrape/internal/cli"
 )
 
 // azureBuilt reports that this build contains the Azure diagnostics consumer:
@@ -46,18 +46,11 @@ func (p *pipelines) startAzure(ctx context.Context) error {
 		ConnectionStringFile: *azureConnFile,
 		ClientID:             *azureClientID,
 		TenantID:             *azureTenantID,
-	}
-	if *azureTopics != "" {
-		for _, t := range strings.Split(*azureTopics, ",") {
-			if t = strings.TrimSpace(t); t != "" {
-				kafka.Topics = append(kafka.Topics, t)
-			}
-		}
+		Topics:               cli.SplitList(*azureTopics),
 	}
 	if err := kafka.Resolve(); err != nil {
 		return fmt.Errorf("azure diagnostics: %w", err)
 	}
-	p.ready.require(gateAzure)
 	reader := azurediag.New(azurediag.Config{
 		Kafka:        kafka,
 		MetricPrefix: *azurePrefix,
@@ -69,7 +62,7 @@ func (p *pipelines) startAzure(ctx context.Context) error {
 		Attrs:        p.attrBuilders.Ingest,
 		Exporter:     p.out,
 		Logger:       p.log,
-		Ready:        func() { p.ready.done(gateAzure) },
+		Ready:        p.ready.gate(gateAzure),
 	})
 	p.spawn(func() { reader.Run(ctx) })
 	p.log.Info("azure diagnostics enabled", "brokers", kafka.Brokers,

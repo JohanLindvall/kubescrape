@@ -41,6 +41,7 @@ func podIPs(p *corev1.Pod) []string {
 // podIPs below, where `go doc` and pkg.go.dev showed this function as a bare
 // signature.
 func FromPod(p *corev1.Pod) (kubemeta.Pod, map[string]kubemeta.Container) {
+	labels, annotations := kubemeta.CopyMeta(p.Labels, p.Annotations)
 	pod := kubemeta.Pod{
 		Name:        p.Name,
 		Namespace:   p.Namespace,
@@ -51,8 +52,8 @@ func FromPod(p *corev1.Pod) (kubemeta.Pod, map[string]kubemeta.Container) {
 		HostIP:      p.Status.HostIP,
 		HostNetwork: p.Spec.HostNetwork,
 		Phase:       string(p.Status.Phase),
-		Labels:      cloneMap(p.Labels),
-		Annotations: kubemeta.FilterAnnotations(p.Annotations),
+		Labels:      labels,
+		Annotations: annotations,
 		CreatedAt:   p.CreationTimestamp.Time,
 	}
 	if p.Status.StartTime != nil {
@@ -188,15 +189,4 @@ func fillTerminated(c *kubemeta.Container, t *corev1.ContainerStateTerminated) {
 		ft := t.FinishedAt.Time
 		c.FinishedAt = &ft
 	}
-}
-
-func cloneMap(m map[string]string) map[string]string {
-	if len(m) == 0 {
-		return nil
-	}
-	out := make(map[string]string, len(m))
-	for k, v := range m {
-		out[k] = v
-	}
-	return out
 }

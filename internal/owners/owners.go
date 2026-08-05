@@ -27,12 +27,51 @@ var (
 	CronJobGVR     = batchv1.SchemeGroupVersion.WithResource("cronjobs")
 	NamespaceGVR   = corev1.SchemeGroupVersion.WithResource("namespaces")
 	NodeGVR        = corev1.SchemeGroupVersion.WithResource("nodes")
-
-	AllGVRs = []schema.GroupVersionResource{
-		ReplicaSetGVR, DeploymentGVR, StatefulSetGVR, DaemonSetGVR,
-		JobGVR, CronJobGVR, NamespaceGVR, NodeGVR,
-	}
 )
+
+// ownerKindRow is one owner-reference kind the resolver can enrich. Matching
+// is by group and kind, deliberately ignoring the reference's version: a
+// v1beta1 ReplicaSet is still cached by the same metadata informer.
+type ownerKindRow struct {
+	group string
+	kind  string
+	gvr   schema.GroupVersionResource
+	// follow marks kinds whose own owners belong in the chain
+	// (ReplicaSet -> Deployment, Job -> CronJob).
+	follow bool
+}
+
+// ownerKinds is the ONE table behind kindGVR, followable and the owner half
+// of AllGVRs — the three used to be parallel structures a new kind had to be
+// added to separately. Adding an owner kind is one row here, plus the
+// ClusterRole in deploy/kubernetes.yaml (and internal/agent/attrs's kindTable,
+// whose test cross-checks AllGVRs).
+//
+// StatefulSets and DaemonSets own their pods DIRECTLY (no intermediate
+// object), so their rows exist for their labels/annotations, not for a chain
+// to follow; without them the pods of every StatefulSet and DaemonSet in the
+// cluster carried a bare owner reference while Deployment pods carried the
+// workload's labels and annotations.
+var ownerKinds = []ownerKindRow{
+	{appsv1.GroupName, "ReplicaSet", ReplicaSetGVR, true},
+	{appsv1.GroupName, "Deployment", DeploymentGVR, false},
+	{appsv1.GroupName, "StatefulSet", StatefulSetGVR, false},
+	{appsv1.GroupName, "DaemonSet", DaemonSetGVR, false},
+	{batchv1.GroupName, "Job", JobGVR, true},
+	{batchv1.GroupName, "CronJob", CronJobGVR, false},
+}
+
+// AllGVRs lists every resource main wires a metadata informer for: the owner
+// kinds in ownerKinds order, then Namespace and Node (cached for their
+// metadata, never matched as owners). The order is part of the surface —
+// keep it stable.
+var AllGVRs = func() []schema.GroupVersionResource {
+	out := make([]schema.GroupVersionResource, 0, len(ownerKinds)+2)
+	for _, k := range ownerKinds {
+		out = append(out, k.gvr)
+	}
+	return append(out, NamespaceGVR, NodeGVR)
+}()
 
 // getFunc fetches cached metadata for an object, nil if unknown. namespace is
 // empty for cluster-scoped resources.
@@ -101,8 +140,7 @@ func (r *Resolver) Resolve(namespace string, refs []metav1.OwnerReference) []kub
 			// (reachable while a pod tombstone outlives its owner).
 			if m := r.get(gvr, namespace, ref.Name); m != nil &&
 				(ref.UID == "" || ref.UID == m.UID) {
-				owner.Labels = copyMap(m.Labels)
-				owner.Annotations = kubemeta.FilterAnnotations(m.Annotations)
+				owner.Labels, owner.Annotations = kubemeta.CopyMeta(m.Labels, m.Annotations)
 				out = append(out, owner)
 				if follow {
 					for _, parent := range m.OwnerReferences {
@@ -135,37 +173,34 @@ func (r *Resolver) clusterScoped(gvr schema.GroupVersionResource, name string) *
 	if m == nil {
 		return nil
 	}
+	labels, annotations := kubemeta.CopyMeta(m.Labels, m.Annotations)
 	return &kubemeta.ObjectMeta{
 		UID:         string(m.UID),
-		Labels:      copyMap(m.Labels),
-		Annotations: kubemeta.FilterAnnotations(m.Annotations),
+		Labels:      labels,
+		Annotations: annotations,
 	}
+}
+
+// ownerKind resolves an owner reference against ownerKinds, nil for kinds
+// the service does not watch (and for an unparseable apiVersion).
+func ownerKind(ref metav1.OwnerReference) *ownerKindRow {
+	gv, err := schema.ParseGroupVersion(ref.APIVersion)
+	if err != nil {
+		return nil
+	}
+	for i := range ownerKinds {
+		if gv.Group == ownerKinds[i].group && ref.Kind == ownerKinds[i].kind {
+			return &ownerKinds[i]
+		}
+	}
+	return nil
 }
 
 // kindGVR maps an owner reference to the resource whose metadata informer
 // caches it, for kinds the service watches.
 func kindGVR(ref metav1.OwnerReference) (schema.GroupVersionResource, bool) {
-	gv, err := schema.ParseGroupVersion(ref.APIVersion)
-	if err != nil {
-		return schema.GroupVersionResource{}, false
-	}
-	switch {
-	case gv.Group == appsv1.GroupName && ref.Kind == "ReplicaSet":
-		return ReplicaSetGVR, true
-	case gv.Group == appsv1.GroupName && ref.Kind == "Deployment":
-		return DeploymentGVR, true
-	// StatefulSets and DaemonSets own their pods DIRECTLY (no intermediate
-	// object), so without these the pods of every StatefulSet and DaemonSet in
-	// the cluster carried a bare owner reference while Deployment pods carried
-	// the workload's labels and annotations.
-	case gv.Group == appsv1.GroupName && ref.Kind == "StatefulSet":
-		return StatefulSetGVR, true
-	case gv.Group == appsv1.GroupName && ref.Kind == "DaemonSet":
-		return DaemonSetGVR, true
-	case gv.Group == batchv1.GroupName && ref.Kind == "Job":
-		return JobGVR, true
-	case gv.Group == batchv1.GroupName && ref.Kind == "CronJob":
-		return CronJobGVR, true
+	if k := ownerKind(ref); k != nil {
+		return k.gvr, true
 	}
 	return schema.GroupVersionResource{}, false
 }
@@ -173,21 +208,6 @@ func kindGVR(ref metav1.OwnerReference) (schema.GroupVersionResource, bool) {
 // followable reports whether ref's own owners belong in the chain
 // (ReplicaSet -> Deployment, Job -> CronJob).
 func followable(ref metav1.OwnerReference) bool {
-	gv, err := schema.ParseGroupVersion(ref.APIVersion)
-	if err != nil {
-		return false
-	}
-	return (gv.Group == appsv1.GroupName && ref.Kind == "ReplicaSet") ||
-		(gv.Group == batchv1.GroupName && ref.Kind == "Job")
-}
-
-func copyMap(m map[string]string) map[string]string {
-	if len(m) == 0 {
-		return nil
-	}
-	out := make(map[string]string, len(m))
-	for k, v := range m {
-		out[k] = v
-	}
-	return out
+	k := ownerKind(ref)
+	return k != nil && k.follow
 }

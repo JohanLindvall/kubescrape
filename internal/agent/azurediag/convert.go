@@ -28,10 +28,12 @@ import (
 	"github.com/JohanLindvall/kubescrape/internal/agent/logchain"
 	"github.com/JohanLindvall/kubescrape/internal/agent/logscrub"
 	"github.com/JohanLindvall/kubescrape/internal/obs"
-	"github.com/JohanLindvall/kubescrape/pkg/logattrs"
 )
 
-const scopeName = "github.com/JohanLindvall/kubescrape/agent/azurediag"
+// ScopeName is the OTLP instrumentation-scope name on every record and
+// metric this package converts (wire-visible: changing it splits every
+// stream at the upgrade boundary).
+const ScopeName = "github.com/JohanLindvall/kubescrape/agent/azurediag"
 
 // severityOf maps Azure's level strings onto OTLP severities. Numeric levels
 // are NOT interpreted — Azure's own conventions disagree on their direction
@@ -109,10 +111,9 @@ func (r *Reader) resource(rec *record) pcommon.Resource {
 // grouping.
 func (r *Reader) convertLogs(recs []record) plog.Logs {
 	ld := plog.NewLogs()
-	scopes := make(map[string]plog.ScopeLogs, 8)
-	resAttrs := make(map[string]pcommon.Map, 8)
+	groups := logchain.NewGroups(ld, ScopeName, 8)
 	observed := pcommon.NewTimestampFromTime(time.Now())
-	sink := &recordSink{observed: observed, scrub: r.cfg.Scrub}
+	sink := &recordSink{r: r, observed: observed, scrub: r.cfg.Scrub}
 	chain := logchain.NewChain[string](logchain.Config{
 		Scrub:      r.cfg.Scrub,
 		LogAttrs:   r.cfg.LogAttrs,
@@ -129,28 +130,15 @@ func (r *Reader) convertLogs(recs []record) plog.Logs {
 		// Scrub runs first, before anything copies from the body.
 		body, extracted := chain.Line(string(rec.raw))
 
-		key := resKey(rec)
-		if r.cfg.LogAttrs != nil {
-			key = key + "\x01" + logattrs.Key(extracted.Resource) + "\x01" + logattrs.Key(extracted.Scope)
-		}
-		sl, ok := scopes[key]
-		if !ok {
-			rl := ld.ResourceLogs().AppendEmpty()
-			r.resource(rec).CopyTo(rl.Resource())
-			logattrs.Put(rl.Resource().Attributes(), extracted.Resource)
-			sl = rl.ScopeLogs().AppendEmpty()
-			sl.Scope().SetName(scopeName)
-			sl.Scope().SetVersion(obs.ScopeVersion)
-			logattrs.Put(sl.Scope().Attributes(), extracted.Scope)
-			scopes[key] = sl
-			resAttrs[key] = rl.Resource().Attributes()
-		}
+		key := chain.GroupKey(resKey(rec), extracted)
 		// The group is built BEFORE the record because metric and rule
 		// resolution reads the group's own resource; a group the rules empty is
 		// pruned below.
-		sink.sl, sink.rec, sink.body = sl, rec, body
+		sink.rec, sink.body = rec, body
+		ent := groups.Get(key, extracted, sink)
+		sink.sl = ent.SL
 		chain.Emit(sink, logchain.Input[string]{
-			Body: body, Lifted: extracted, Resource: resAttrs[key], BoundKey: key,
+			Body: body, Lifted: extracted, Resource: ent.Res, BoundKey: key,
 		})
 	}
 	// An all-dropped group leaves an empty ResourceLogs behind.
@@ -161,6 +149,7 @@ func (r *Reader) convertLogs(recs []record) plog.Logs {
 // recordSink is the chain's Producer for diagnostic records: the group a kept
 // record lands in, and what the Azure reader knows about the record.
 type recordSink struct {
+	r        *Reader
 	sl       plog.ScopeLogs
 	rec      *record
 	body     string
@@ -169,6 +158,10 @@ type recordSink struct {
 }
 
 func (s *recordSink) Dest() plog.LogRecordSlice { return s.sl.LogRecords() }
+
+// FillResource builds a fresh group's resource: the ARM resource the record
+// describes.
+func (s *recordSink) FillResource(res pcommon.Resource) { s.r.resource(s.rec).CopyTo(res) }
 
 func (s *recordSink) Stamp(lr plog.LogRecord) {
 	ts := s.rec.ts
@@ -236,7 +229,7 @@ func (r *Reader) convertMetrics(recs []record) pmetric.Metrics {
 			rm := md.ResourceMetrics().AppendEmpty()
 			r.resource(rec).CopyTo(rm.Resource())
 			sm := rm.ScopeMetrics().AppendEmpty()
-			sm.Scope().SetName(scopeName)
+			sm.Scope().SetName(ScopeName)
 			sm.Scope().SetVersion(obs.ScopeVersion)
 			g = &group{sm: sm, byName: make(map[string]pmetric.NumberDataPointSlice, 8)}
 			groups[key] = g

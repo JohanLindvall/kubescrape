@@ -26,6 +26,8 @@ import (
 	"time"
 
 	"github.com/JohanLindvall/kubescrape/internal/agent/attrs"
+	"github.com/JohanLindvall/kubescrape/internal/agent/backoff"
+	"github.com/JohanLindvall/kubescrape/internal/agent/logchain"
 	"github.com/JohanLindvall/kubescrape/internal/agent/logscrub"
 	"github.com/JohanLindvall/kubescrape/internal/agent/otlpexport"
 	"github.com/JohanLindvall/kubescrape/internal/logline"
@@ -121,12 +123,12 @@ func New(cfg Config) *Reader {
 // unrecoverable consumer errors; per-poll export failures retry in place
 // without disturbing the group membership.
 func (r *Reader) Run(ctx context.Context) {
-	backoff := r.cfg.RetryBackoff
+	bo := backoff.New(r.cfg.RetryBackoff)
 	for ctx.Err() == nil {
 		src, err := r.open()
 		if err != nil {
-			r.log.Warn("opening the event hubs consumer", "error", err, "backoff", backoff)
-			backoff = r.sleep(ctx, backoff)
+			r.log.Warn("opening the event hubs consumer", "error", err, "backoff", bo.Delay())
+			bo.Sleep(ctx)
 			continue
 		}
 		started := time.Now()
@@ -135,11 +137,9 @@ func (r *Reader) Run(ctx context.Context) {
 		if ctx.Err() != nil {
 			return
 		}
-		if time.Since(started) >= 30*time.Second {
-			backoff = r.cfg.RetryBackoff // a healthy consumer resets the backoff
-		}
-		r.log.Warn("event hubs consumer stopped; reopening", "error", err, "backoff", backoff)
-		backoff = r.sleep(ctx, backoff)
+		bo.ResetIfHealthy(started)
+		r.log.Warn("event hubs consumer stopped; reopening", "error", err, "backoff", bo.Delay())
+		bo.Sleep(ctx)
 	}
 }
 
@@ -213,7 +213,7 @@ func (r *Reader) deliver(ctx context.Context, recs []record) bool {
 	md := r.convertMetrics(recs)
 	logsDone := ld.LogRecordCount() == 0
 	metricsDone := md.DataPointCount() == 0
-	backoff := r.cfg.RetryBackoff
+	bo := backoff.New(r.cfg.RetryBackoff)
 	for !logsDone || !metricsDone {
 		if ctx.Err() != nil {
 			return false
@@ -225,51 +225,35 @@ func (r *Reader) deliver(ctx context.Context, recs []record) bool {
 			metricsDone = r.export(ctx, "metrics", md.DataPointCount(), func() error { return r.cfg.Exporter.ExportMetrics(ctx, md) })
 		}
 		if !logsDone || !metricsDone {
-			backoff = r.sleep(ctx, backoff)
+			bo.Sleep(ctx)
 		}
 	}
 	return true
 }
 
 // export sends one signal once; true when it needs no further attempts
-// (delivered, or permanently rejected and dropped).
+// (delivered, or permanently rejected and dropped — a payload the collector
+// definitively refuses would wedge the partition, as everywhere else;
+// logchain.SettlePermanent owns that arm).
 func (r *Reader) export(ctx context.Context, signal string, count int, send func() error) bool {
 	err := send()
-	switch {
-	case err == nil:
+	if err == nil {
 		obs.AzureExported.WithLabelValues(signal).Add(float64(count))
 		return true
-	case otlpexport.IsPermanent(err):
-		// Retrying a payload the collector definitively refuses would wedge
-		// the partition on one bad batch, as everywhere else.
-		obs.AzureDropped.Inc()
-		// One payload is a whole poll's worth of records, so the payload
-		// counter alone says nothing about the size of the loss.
-		obs.AzureDroppedRecords.WithLabelValues(signal).Add(float64(count))
-		r.log.Warn("azure payload permanently rejected, skipping past it", "signal", signal, "records", count, "error", err)
+	}
+	if logchain.SettlePermanent(err, r.log, "azure payload", count,
+		logchain.SettleCounters{Batches: obs.AzureDropped, Records: obs.AzureDroppedRecords.WithLabelValues(signal)},
+		"signal", signal) {
 		return true
-	default:
-		if ctx.Err() == nil {
-			if signal == "logs" {
-				// The metrics signal is already counted by the client layer's
-				// obs.Exports{metrics,error}; kubescrape_log_export_failures
-				// must not absorb it.
-				obs.LogExportFailures.Inc()
-			}
-			r.log.Warn("exporting azure diagnostics", "signal", signal, "error", err)
+	}
+	if ctx.Err() == nil {
+		if signal == "logs" {
+			// The metrics signal is already counted by the client layer's
+			// obs.Exports{metrics,error}; kubescrape_log_export_failures
+			// must not absorb it.
+			obs.LogExportFailures.Inc()
 		}
-		return false
+		r.log.Warn("exporting azure diagnostics", "signal", signal, "error", err)
 	}
-}
-
-// sleep waits the backoff (or ctx) and returns the next backoff, capped.
-func (r *Reader) sleep(ctx context.Context, backoff time.Duration) time.Duration {
-	select {
-	case <-ctx.Done():
-	case <-time.After(backoff):
-	}
-	if backoff *= 2; backoff > 30*time.Second {
-		backoff = 30 * time.Second
-	}
-	return backoff
+	return false
 }

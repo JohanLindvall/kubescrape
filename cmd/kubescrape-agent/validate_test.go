@@ -1,6 +1,7 @@
 package main
 
 import (
+	"reflect"
 	"strings"
 	"testing"
 
@@ -198,5 +199,90 @@ func TestRouteWithoutEndpointRejectedWhenTheBaseIsUnused(t *testing.T) {
 	cfg = agentConfig{Export: inherits, Routing: &route.Config{Routes: headerOnly}}
 	if err := validateConfig(cfg, ""); err != nil {
 		t.Fatalf("rejected a route inheriting a base that a header-only override still dials: %v", err)
+	}
+}
+
+// routeExportConfig's own-endpoint branch now builds on
+// otlpexport.Config.TransportOnly instead of hand-dropping each credential.
+// The rework must be BIT-IDENTICAL to the old derivation — this test IS that
+// old derivation, kept verbatim, compared field-for-field against the new one
+// for every shape the old code distinguished. The base is constructed with
+// EVERY destination-scoped flag and section field set, so a field the new
+// derivation drops (or newly inherits) cannot hide behind a zero value.
+func TestRouteExportConfigMatchesTheOldDerivation(t *testing.T) {
+	oldDerivation := func(exp *otlpexport.ExportConfig, rt route.Route) otlpexport.Config {
+		rcfg := exp.ApplyBase(baseExportConfig())
+		if len(rt.Headers) > 0 {
+			merged := make(map[string]string, len(rcfg.Headers)+len(rt.Headers))
+			for k, v := range rcfg.Headers {
+				merged[k] = v
+			}
+			for k, v := range rt.Headers {
+				merged[k] = v
+			}
+			rcfg.Headers = merged
+		}
+		if rt.Endpoint != "" {
+			rcfg.Endpoint = rt.Endpoint
+			rcfg.BearerTokenFile = rt.BearerTokenFile
+			rcfg.ClientCertFile = rt.ClientCertFile
+			rcfg.ClientKeyFile = rt.ClientKeyFile
+			rcfg.CAFile = rt.CAFile
+			rcfg.Insecure = rt.Insecure
+		}
+		return rcfg
+	}
+
+	// A base with every destination-scoped field populated: bearer, CA,
+	// skip-verify from the flags; headers and the mTLS client pair from the
+	// export section.
+	oldEP, oldBearer, oldCA, oldSkip := *otlpEndpoint, *otlpBearer, *otlpCAFile, *otlpSkipTLS
+	defer func() { *otlpEndpoint, *otlpBearer, *otlpCAFile, *otlpSkipTLS = oldEP, oldBearer, oldCA, oldSkip }()
+	*otlpEndpoint = "base-collector:4317"
+	*otlpBearer = "/base/bearer-token"
+	*otlpCAFile = "/base/ca.pem"
+	*otlpSkipTLS = true
+
+	exp := &otlpexport.ExportConfig{
+		Headers:        map[string]string{"X-Scope-OrgID": "base", "X-Base": "1"},
+		ClientCertFile: "/base/client.pem",
+		ClientKeyFile:  "/base/client-key.pem",
+	}
+
+	for _, tc := range []struct {
+		name string
+		rt   route.Route
+	}{
+		{"base-only route", route.Route{
+			Name: "t", Namespaces: []string{"t-*"},
+		}},
+		{"own-endpoint route with credentials", route.Route{
+			Name: "t", Namespaces: []string{"t-*"},
+			Endpoint:        "https://tenant.example.com:443",
+			BearerTokenFile: "/route/bearer-token",
+			ClientCertFile:  "/route/client.pem",
+			ClientKeyFile:   "/route/client-key.pem",
+			CAFile:          "/route/ca.pem",
+			Insecure:        true,
+		}},
+		{"own-endpoint route without credentials", route.Route{
+			Name: "t", Namespaces: []string{"t-*"},
+			Endpoint: "https://tenant.example.com:443",
+		}},
+		{"headers merge onto an own-endpoint route", route.Route{
+			Name: "t", Namespaces: []string{"t-*"},
+			Endpoint: "https://tenant.example.com:443",
+			Headers:  map[string]string{"X-Scope-OrgID": "route", "X-Route": "1"},
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := routeExportConfig(exp, tc.rt)
+			if err != nil {
+				t.Fatalf("routeExportConfig: %v", err)
+			}
+			if want := oldDerivation(exp, tc.rt); !reflect.DeepEqual(got, want) {
+				t.Errorf("derivation drifted from the old one:\n got: %+v\nwant: %+v", got, want)
+			}
+		})
 	}
 }

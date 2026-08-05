@@ -17,21 +17,25 @@ import (
 	"strconv"
 	"strings"
 	"time"
-	"unicode/utf8"
 
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/plog"
 
 	"github.com/JohanLindvall/kubescrape/internal/agent/attrs"
+	"github.com/JohanLindvall/kubescrape/internal/agent/backoff"
 	"github.com/JohanLindvall/kubescrape/internal/agent/logchain"
 	"github.com/JohanLindvall/kubescrape/internal/agent/logscrub"
-	"github.com/JohanLindvall/kubescrape/internal/agent/otlpexport"
 	"github.com/JohanLindvall/kubescrape/internal/agent/positions"
 	"github.com/JohanLindvall/kubescrape/internal/logline"
 	"github.com/JohanLindvall/kubescrape/internal/metrics"
 	"github.com/JohanLindvall/kubescrape/internal/obs"
 	"github.com/JohanLindvall/kubescrape/pkg/logattrs"
 )
+
+// ScopeName is the OTLP instrumentation-scope name on every journal record
+// (wire-visible: Loki/Elastic see it as a label, so changing it splits every
+// journal stream at the upgrade boundary).
+const ScopeName = "github.com/JohanLindvall/kubescrape/agent/journald"
 
 // LogExporter sends one OTLP logs payload.
 type LogExporter interface {
@@ -136,13 +140,9 @@ type Reader struct {
 	lastFlush   time.Time
 	cursor      string // last successfully exported cursor
 	batchCursor string // cursor of the newest buffered entry
-	// pending is the batch converted to OTLP, held across export retries.
-	// converted says whether it is current: an all-dropped batch legitimately
-	// converts to zero records, so the count cannot stand in for the flag.
-	// Converting per ATTEMPT re-ran the log-metrics observation and inflated
-	// user-configured counters by the retry count (see flush).
-	pending   plog.Logs
-	converted bool
+	// pending is the batch converted to OTLP, held across export retries
+	// under logchain.Pending's convert-once/clear-with-the-batch discipline.
+	pending logchain.Pending
 }
 
 type entry struct {
@@ -183,22 +183,9 @@ func New(cfg Config) *Reader {
 }
 
 // Run reads until ctx is done, restarting the reader on any failure.
-// sleepBackoff waits out the current backoff (honoring ctx) and returns the
-// next value, doubled and capped at 30s.
-func sleepBackoff(ctx context.Context, backoff time.Duration) time.Duration {
-	select {
-	case <-ctx.Done():
-	case <-time.After(backoff):
-	}
-	if backoff *= 2; backoff > 30*time.Second {
-		backoff = 30 * time.Second
-	}
-	return backoff
-}
-
 func (r *Reader) Run(ctx context.Context) {
 	r.cursor = r.loadCursor()
-	backoff := r.cfg.RestartBackoff
+	bo := backoff.New(r.cfg.RestartBackoff)
 	for ctx.Err() == nil {
 		// The restart path recovers unexported entries by RE-READING them from
 		// the committed cursor. That only works once a cursor exists: with none
@@ -210,37 +197,34 @@ func (r *Reader) Run(ctx context.Context) {
 		if r.cursor == "" && len(r.batch) > 0 {
 			if err := r.flush(ctx); err != nil {
 				r.log.Warn("journal export failed with no committed cursor; retrying (a reopen would seek to the tail and lose the entries)",
-					"entries", len(r.batch), "error", err, "backoff", backoff)
-				backoff = sleepBackoff(ctx, backoff)
+					"entries", len(r.batch), "error", err, "backoff", bo.Delay())
+				bo.Sleep(ctx)
 				continue
 			}
-			backoff = r.cfg.RestartBackoff
+			bo.Reset()
 		}
 		started := time.Now()
 		err := r.stream(ctx)
 		if ctx.Err() != nil {
 			break
 		}
-		if time.Since(started) >= 30*time.Second {
-			// A stream that ran healthily resets the backoff; otherwise a few
-			// hiccups spread over the agent's lifetime would pin every future
-			// restart at the 30s worst case.
-			backoff = r.cfg.RestartBackoff
-		}
+		bo.ResetIfHealthy(started)
 		obs.JournalRestarts.Inc()
-		r.log.Warn("journal reader stopped; restarting", "error", err, "backoff", backoff)
-		backoff = sleepBackoff(ctx, backoff)
+		r.log.Warn("journal reader stopped; restarting", "error", err, "backoff", bo.Delay())
+		bo.Sleep(ctx)
 	}
 	// Final flush of whatever is buffered, on a DETACHED but BOUNDED context.
 	// ctx is already cancelled, so the flush needs a deadline of its own — and
-	// this was the only one of the four shutdown flushes (tailer, events,
-	// azurediag, here) that had none: an unreachable collector held it for as
-	// long as the export's own retries took, while the agent's remaining
-	// shutdown work (the final log-metrics window, span metrics, self-metrics,
-	// the disk-buffer drain) waited behind it inside a wg the main budgets at
-	// shutdownDrain. Missing the deadline loses nothing this reader owns: the
-	// cursor is committed only on a successful export, so a dropped final batch
-	// is re-read from the journal after the restart.
+	// this was the only one of the three shutdown flushes (tailer, events,
+	// here) that had none: an unreachable collector held it for as long as the
+	// export's own retries took, while the agent's remaining shutdown work
+	// (the final log-metrics window, span metrics, self-metrics, the
+	// disk-buffer drain) waited behind it inside a wg the main budgets at
+	// shutdownDrain. (azurediag deliberately has NO final flush at all: its
+	// position is the consumer group's committed offsets, so an uncommitted
+	// poll simply replays.) Missing the deadline loses nothing this reader
+	// owns either: the cursor is committed only on a successful export, so a
+	// dropped final batch is re-read from the journal after the restart.
 	//
 	// WithoutCancel, not Background: the values the caller put on ctx (the
 	// otlpexport ownership marker rides there) must survive.
@@ -271,18 +255,12 @@ func (r *Reader) stream(ctx context.Context) error {
 	r.batchBytes = 0
 	r.batchCursor = ""
 	// The CONVERTED payload belongs to the batch just discarded, and must go
-	// with it. flush() converts once per batch and holds the result across
-	// export retries (see r.converted), which is right while the batch stays;
-	// but a restart re-reads those entries from the committed cursor, so the
-	// old payload now describes bytes the NEW batch will carry again. Leaving
-	// it set made the first flush after a restart export the PREVIOUS batch and
-	// then commit the NEW batch's cursor — every entry the new batch held
-	// beyond the stale payload was skipped, permanently and silently. This is
-	// the one place the pair may be cleared without a delivery: Run's
-	// no-cursor-yet branch deliberately keeps retrying r.pending INSTEAD of
-	// reopening, precisely because nothing could be re-read there.
-	r.pending = plog.NewLogs()
-	r.converted = false
+	// with it: this restart re-reads those entries from the committed cursor
+	// (logchain.Pending's restart-clear case). This is the one place the pair
+	// may be cleared without a delivery — Run's no-cursor-yet branch
+	// deliberately keeps retrying r.pending INSTEAD of reopening, precisely
+	// because nothing could be re-read there.
+	r.pending.Discard()
 	r.lastFlush = time.Now()
 
 	// A reader goroutine bound to this source hands entries over so the flush
@@ -374,20 +352,9 @@ func (r *Reader) sanitize(msg string) (body string, origLen int) {
 	raw := len(msg)
 	msg = strings.ToValidUTF8(msg, "�")
 	if len(msg) > r.cfg.MaxEntryBytes {
-		return truncateRunes(msg, r.cfg.MaxEntryBytes), raw
+		return logchain.TruncateRunes(msg, r.cfg.MaxEntryBytes), raw
 	}
 	return msg, 0
-}
-
-// truncateRunes cuts s to at most n bytes on a rune boundary.
-func truncateRunes(s string, n int) string {
-	if len(s) <= n {
-		return s
-	}
-	for n > 0 && !utf8.RuneStart(s[n]) {
-		n--
-	}
-	return s[:n]
 }
 
 // ingest converts one raw journal entry (body already sanitized) into the
@@ -423,18 +390,10 @@ func (r *Reader) flush(ctx context.Context) error {
 	if len(r.batch) == 0 {
 		return nil
 	}
-	// Convert ONCE per batch, not once per export ATTEMPT. convert() runs the
-	// log-metrics observation (and the scrub/enrich/rules chain), so a
-	// transient export failure — a collector rollout, a 503, a deadline — used
-	// to re-observe every record on each retry: configured counters and
-	// histograms over-counted by the number of failed attempts spanning the
-	// batch, permanently biasing cumulative series upward and showing a spike
-	// in rate() during exactly the outage an operator is investigating.
-	if !r.converted {
-		r.pending = r.convert()
-		r.converted = true
-	}
-	ld := r.pending
+	// Convert ONCE per batch, not once per export ATTEMPT: convert() runs the
+	// log-metrics observation, and re-running it per retry inflated
+	// user-configured counters (logchain.Pending owns that discipline).
+	ld := r.pending.Render(r.convert)
 	if ld.LogRecordCount() == 0 {
 		// Every entry was dropped by the rules. Committing without exporting is
 		// the tailer's behaviour too: an empty payload still costs a wire RPC
@@ -444,14 +403,9 @@ func (r *Reader) flush(ctx context.Context) error {
 		return nil
 	}
 	if err := r.cfg.Exporter.ExportLogs(ctx, ld); err != nil {
-		if otlpexport.IsPermanent(err) {
-			obs.JournalDropped.Inc()
-			// The records, not just the batch: a batch is up to BatchSize
-			// entries, so the batch counter alone cannot say how much was lost.
-			// Delivered records are counted the same way below.
-			obs.JournalDroppedRecords.Add(float64(ld.LogRecordCount()))
-			r.log.Warn("journal batch permanently rejected, skipping past it",
-				"entries", len(r.batch), "records", ld.LogRecordCount(), "error", err)
+		if logchain.SettlePermanent(err, r.log, "journal batch", ld.LogRecordCount(),
+			logchain.SettleCounters{Batches: obs.JournalDropped, Records: obs.JournalDroppedRecords},
+			"entries", len(r.batch)) {
 			r.settleBatch()
 			return nil
 		}
@@ -484,8 +438,7 @@ func (r *Reader) settleBatch() {
 	r.batch = r.batch[:0]
 	r.batchBytes = 0
 	// The converted payload belongs to the batch that is now gone.
-	r.pending = plog.NewLogs()
-	r.converted = false
+	r.pending.Discard()
 	r.lastFlush = time.Now()
 	if r.batchCursor != "" {
 		r.cursor = r.batchCursor
@@ -505,8 +458,10 @@ func (r *Reader) settleBatch() {
 // entry, before the record exists, so the chain's Scrub is nil.
 func (r *Reader) convert() plog.Logs {
 	ld := plog.NewLogs()
-	scopes := make(map[string]scopeEntry, 4)
-	sink := &recordSink{observed: pcommon.NewTimestampFromTime(time.Now())}
+	// Every other log producer names its scope (tailer, events); the
+	// journal's records once shipped with an empty otel_scope_name.
+	groups := logchain.NewGroups(ld, ScopeName, 4)
+	sink := &recordSink{r: r, observed: pcommon.NewTimestampFromTime(time.Now())}
 	chain := logchain.NewChain[string](logchain.Config{
 		LogAttrs:   r.cfg.LogAttrs,
 		Enrich:     r.cfg.Enrich,
@@ -525,50 +480,17 @@ func (r *Reader) convert() plog.Logs {
 			// so sharing mis-attributes whichever entry arrives second.
 			groupKey = "i\x02" + unit
 		}
-		// Line-derived resource/scope attributes split records into their own
-		// resources, so they participate in the grouping key. Without an
-		// extractor the unit alone is the key (no per-entry concatenation).
-		key := groupKey
-		if r.cfg.LogAttrs != nil {
-			key = groupKey + "\x01" + logattrs.Key(extracted.Resource) + "\x01" + logattrs.Key(extracted.Scope)
-		}
-		ent, ok := scopes[key]
-		if !ok {
-			rl := ld.ResourceLogs().AppendEmpty()
-			res := rl.Resource()
-			// Identity attributes go in before Build so templates and the
-			// filter see them.
-			name := unit
-			if name == "" {
-				name = "journald"
-			}
-			res.Attributes().PutStr("service.name", strings.TrimSuffix(name, ".service"))
-			if e.unit != "" {
-				res.Attributes().PutStr("systemd.unit", e.unit)
-			}
-			actx := attrs.Context{}
-			if r.cfg.NodeInfo != nil {
-				actx.Node = r.cfg.NodeInfo()
-			}
-			r.cfg.Attrs.Build(res, actx)
-			logattrs.Put(res.Attributes(), extracted.Resource)
-			sl := rl.ScopeLogs().AppendEmpty()
-			// Every other log producer names its scope (tailer, events); the
-			// journal's records shipped with an empty otel_scope_name.
-			sl.Scope().SetName("github.com/JohanLindvall/kubescrape/agent/journald")
-			sl.Scope().SetVersion(obs.ScopeVersion)
-			logattrs.Put(sl.Scope().Attributes(), extracted.Scope)
-			ent = scopeEntry{sl: sl, res: res.Attributes()}
-			scopes[key] = ent
-		}
+		key := chain.GroupKey(groupKey, extracted)
 		// The group is built BEFORE the record because metric and rule
 		// resolution reads the group's own resource; a group the rules empty is
 		// pruned below rather than never created (the tailer, whose resolution
 		// uses the FILE's resource, can be lazy instead — same payload).
-		sink.sl, sink.e = ent.sl, e
+		sink.e, sink.unit = e, unit
 		sink.e.body = body // identical while Scrub is nil; not a fact to rely on
+		ent := groups.Get(key, extracted, sink)
+		sink.sl = ent.SL
 		chain.Emit(sink, logchain.Input[string]{
-			Body: body, Lifted: extracted, Resource: ent.res, BoundKey: key,
+			Body: body, Lifted: extracted, Resource: ent.Res, BoundKey: key,
 		})
 	}
 	// An all-dropped unit leaves an empty group behind; prune so the payload
@@ -580,12 +502,32 @@ func (r *Reader) convert() plog.Logs {
 // recordSink is the chain's Producer for journal entries: the group a kept
 // record lands in, and what the journal knows about the record.
 type recordSink struct {
+	r        *Reader
 	sl       plog.ScopeLogs
 	e        entry
+	unit     string // e.unit with the ident fallback applied
 	observed pcommon.Timestamp
 }
 
 func (s *recordSink) Dest() plog.LogRecordSlice { return s.sl.LogRecords() }
+
+// FillResource builds a fresh unit group's resource. Identity attributes go
+// in before Build so templates and the filter see them.
+func (s *recordSink) FillResource(res pcommon.Resource) {
+	name := s.unit
+	if name == "" {
+		name = "journald"
+	}
+	res.Attributes().PutStr("service.name", strings.TrimSuffix(name, ".service"))
+	if s.e.unit != "" {
+		res.Attributes().PutStr("systemd.unit", s.e.unit)
+	}
+	actx := attrs.Context{}
+	if s.r.cfg.NodeInfo != nil {
+		actx.Node = s.r.cfg.NodeInfo()
+	}
+	s.r.cfg.Attrs.Build(res, actx)
+}
 
 func (s *recordSink) Stamp(lr plog.LogRecord) {
 	e := s.e
@@ -604,14 +546,6 @@ func (s *recordSink) Stamp(lr plog.LogRecord) {
 	if e.pid != 0 {
 		lr.Attributes().PutInt("process.pid", e.pid)
 	}
-}
-
-// scopeEntry is one grouped unit's scope plus its resource attributes (the
-// rules and metrics resolvers read the resource, which plog does not expose
-// back from a ScopeLogs).
-type scopeEntry struct {
-	sl  plog.ScopeLogs
-	res pcommon.Map
 }
 
 // severity maps a syslog priority (0-7) to OTLP severity, following the

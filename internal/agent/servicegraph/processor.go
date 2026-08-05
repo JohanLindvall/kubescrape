@@ -68,6 +68,15 @@ const (
 // spellings after the 1.30 rename — an SDK on today's conventions emits only
 // those, and omitting them would classify every modern database client as a
 // plain service-to-service call.
+//
+// DELIBERATELY wider than DefaultPeerAttributes (servicegraph.go), which stays
+// Tempo's verbatim {peer.service, db.name, db.system}: that list is a wire
+// contract (it names the virtual node, i.e. the `server` label dashboards
+// select on), while this one only classifies connection_type. So a 1.30-only
+// database client gets `connection_type="database"` but NO virtual node for
+// its unpaired spans until the operator adds db.system.name/db.namespace to
+// `serviceGraph.virtualNodePeerAttributes` — the config escape hatch. Widening
+// the default there is a product decision, not something to "fix" here.
 var databaseAttrs = []string{"db.system", "db.name", "db.system.name", "db.namespace"}
 
 // Processor pairs the spans of one shard into edges. It mirrors

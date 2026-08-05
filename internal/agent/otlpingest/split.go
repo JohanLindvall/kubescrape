@@ -226,38 +226,6 @@ func stripSenderIdentity(a pcommon.Map) {
 // bytes, and a small payload can name a great many distinct objects.
 const maxSplitGroups = 2048
 
-// sameObject reports whether two ID tokens name the same Kubernetes object.
-//
-// The tokens are KIND-TAGGED ("c\x00<container-id>" vs "u\x00<pod-uid>"), so a
-// point that identifies itself by container id and a resource that identifies
-// itself by pod uid compare unequal as strings while naming ONE pod. Treating
-// that as "describes a different object" made the split path overwrite the
-// sender's own resource with derived identity — the one case the overwrite rule
-// explicitly does not want, since there the sender IS authoritative.
-//
-// Both lookups go through the per-request enrich cache, so this costs no extra
-// metadata round trip.
-func (g *metricGrouper) sameObject(a, b string) bool {
-	if a == "" || b == "" {
-		return false
-	}
-	ra := g.enricher.builtAttrs(g.ctx, g.enrichCache, a)
-	rb := g.enricher.builtAttrs(g.ctx, g.enrichCache, b)
-	if ra.Len() == 0 || rb.Len() == 0 {
-		return false // at least one did not resolve: no evidence they match
-	}
-	ua, oka := ra.Get("k8s.pod.uid")
-	ub, okb := rb.Get("k8s.pod.uid")
-	if !oka || !okb || ua.Str() != ub.Str() {
-		return false
-	}
-	// Same pod. Same CONTAINER too, or one names the pod and the other a
-	// container within it — which are different objects for attribution.
-	ca, _ := ra.Get("k8s.container.name")
-	cb, _ := rb.Get("k8s.container.name")
-	return ca.Str() == cb.Str()
-}
-
 func (g *metricGrouper) resource(id string) pmetric.ResourceMetrics {
 	if rm, ok := g.rmByID[id]; ok {
 		return rm
@@ -277,7 +245,10 @@ func (g *metricGrouper) resource(id string) pmetric.ResourceMetrics {
 	g.srcResource.CopyTo(rm.Resource())
 	rm.SetSchemaUrl(g.srcSchema)
 	if id != "" {
-		if id != g.resToken && !g.sameObject(id, g.resToken) {
+		// One same-object predicate for the whole enricher (Enricher.sameObject):
+		// this used to be a local copy that disagreed with the auto-mode
+		// decision's — see the war story on the shared one.
+		if id != g.resToken && !g.enricher.sameObject(g.ctx, g.enrichCache, id, g.resToken) {
 			// This group is keyed by a point-level ID that differs from the
 			// resource's own: the copied resource describes a DIFFERENT object.
 			// Its ID attributes would mislabel (and mis-enrich downstream) every
@@ -313,17 +284,13 @@ func (g *metricGrouper) resource(id string) pmetric.ResourceMetrics {
 			return rm
 		}
 		mergeAttrs(g.enricher.builtAttrs(g.ctx, g.enrichCache, id), rm.Resource().Attributes())
-	} else if built, rejected := g.enricher.peerAttrs(g.ctx, g.enrichCache); built.Len() > 0 {
+	} else if built := g.enricher.peerFallback(g.ctx, g.enrichCache); built.Len() > 0 {
 		// No ID anywhere for these points: the opt-in peer-IP fallback still
-		// attributes them to the pushing pod (resolved once per request).
-		obs.Ingested.WithLabelValues("peer_ip").Inc()
+		// attributes them to the pushing pod (resolved once per request). The
+		// outcome — peer_ip, peer_ip_rejected or unresolved — is counted inside
+		// peerFallback, the one accounting shared with the resource path; an
+		// open-coded copy here counted nothing for a rejected peer.
 		mergeAttrs(built, rm.Resource().Attributes())
-	} else if !rejected {
-		// Nothing identified these points. They are still forwarded (under the
-		// unenriched source resource), but the outcome must show up in the
-		// counters exactly as the resource-mode path's does. A REJECTED peer has
-		// already been counted under its own outcome and must not tally twice.
-		obs.Ingested.WithLabelValues("unresolved").Inc()
 	}
 	g.rmByID[id] = rm
 	return rm

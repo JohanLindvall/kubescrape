@@ -31,12 +31,11 @@ import (
 // wait only for containers starting on their own node).
 const defaultMaxWaiters = 16384
 
-// maxWaiterIDLen bounds the container-ID strings held as waiter keys. Real
-// runtime IDs are 64 hex characters; anything wildly longer is garbage that
-// can never appear in a pod status, so blocking (and pinning the bytes as a
-// map key) would only serve memory amplification. Such lookups degrade to a
-// non-blocking miss.
-const maxWaiterIDLen = 256
+// maxWaiterIDLen bounds the container-ID strings held as waiter keys
+// (kubemeta.MaxContainerIDLen carries the 64-hex-runtime rationale). Lookups
+// over the bound degrade to a non-blocking miss — never an error, and never a
+// pinned map entry.
+const maxWaiterIDLen = kubemeta.MaxContainerIDLen
 
 // ErrTooManyWaiters reports that a container lookup was shed because the
 // store already holds the maximum number of blocked lookups. Callers should
@@ -279,18 +278,30 @@ func (s *Store) claimPodIPLocked(rec *record, pod kubemeta.Pod, oldIPs []string)
 	}
 }
 
+// rawIPs is the ONE enumeration of the addresses a pod's status reports:
+// status.podIPs, falling back to the single status.podIP when the list is
+// empty (kubeconvert fills PodIPs today; the backstop covers records built
+// before the field existed). Both podAddresses (claim eligibility) and
+// recordAddresses (release/cleanup) MUST read this same list — a claim taken
+// from an address one enumeration sees and the other does not is never
+// released, the dual-stack leak class deletePodLocked's comment describes.
+func rawIPs(pod kubemeta.Pod) []string {
+	ips := pod.PodIPs
+	if len(ips) == 0 && pod.PodIP != "" {
+		ips = []string{pod.PodIP}
+	}
+	return ips
+}
+
 // podAddresses returns the addresses a pod may legitimately be reached at, or
 // nil when it claims none (hostNetwork, finished).
 func podAddresses(pod kubemeta.Pod) []string {
 	// The spec flag is the authoritative signal; the IP comparison stays as a
 	// backstop for records converted before the field existed.
-	if pod.HostNetwork || finishedPhase(pod.Phase) {
+	if pod.HostNetwork || kubemeta.FinishedPhase(pod.Phase) {
 		return nil
 	}
-	ips := pod.PodIPs
-	if len(ips) == 0 && pod.PodIP != "" {
-		ips = []string{pod.PodIP}
-	}
+	ips := rawIPs(pod)
 	out := ips[:0:0]
 	for _, ip := range ips {
 		// A hostNetwork pod whose status.hostIP has not been populated yet
@@ -306,11 +317,7 @@ func podAddresses(pod kubemeta.Pod) []string {
 // pod that has since gone finished or hostNetwork (podAddresses returns none
 // for those, but their claims still have to be cleaned up).
 func recordAddresses(rec *record) []string {
-	ips := rec.pod.PodIPs
-	if len(ips) == 0 && rec.pod.PodIP != "" {
-		ips = []string{rec.pod.PodIP}
-	}
-	return ips
+	return rawIPs(rec.pod)
 }
 
 func containsStr(xs []string, v string) bool {
@@ -537,17 +544,21 @@ func (s *Store) deletePodLocked(uid types.UID) {
 	}
 }
 
-// finishedPhase reports whether a pod phase means the pod has stopped
-// running (its IP is eligible for reuse by the CNI).
-func finishedPhase(phase string) bool {
-	return phase == "Succeeded" || phase == "Failed"
-}
-
 // Stats reports current cache sizes.
 func (s *Store) Stats() (pods, containers int) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return len(s.pods), len(s.byContainer)
+}
+
+// expired reports whether a tombstone stamp has lapsed. A zero expireAt is
+// the live marker (no tombstone), never "expired at the epoch"; a stamped
+// entry expires strictly AFTER its instant, so an injected test clock sitting
+// exactly on the stamp still resolves. Every expiry decision — the lookups'
+// present-but-unswept checks and Sweep itself — goes through here so they
+// cannot disagree on either edge.
+func expired(expireAt, now time.Time) bool {
+	return !expireAt.IsZero() && now.After(expireAt)
 }
 
 // Sweep removes expired tombstones. It is exported for tests; Run calls it
@@ -558,13 +569,13 @@ func (s *Store) Sweep() {
 	defer s.mu.Unlock()
 
 	for id, e := range s.byContainer {
-		if !e.expireAt.IsZero() && now.After(e.expireAt) {
+		if expired(e.expireAt, now) {
 			delete(s.byContainer, id)
 		}
 	}
 	removed := false
 	for uid, rec := range s.pods {
-		if !rec.expireAt.IsZero() && now.After(rec.expireAt) {
+		if expired(rec.expireAt, now) {
 			s.dropNameIndexLocked(rec)
 			for _, ip := range recordAddresses(rec) {
 				s.dropClaimantLocked(ip, rec)

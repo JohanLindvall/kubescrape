@@ -46,6 +46,32 @@ func ParseStaleAfter(field, value string, def time.Duration) (time.Duration, err
 	return d, nil
 }
 
+// ValidateBuckets checks configured histogram bucket bounds: every bound
+// positive (the units are seconds) and the sequence strictly increasing.
+// field names the config key for the message ("buckets", "histogramBuckets").
+//
+// Why validate at all: the OTLP spec requires a histogram's ExplicitBounds to
+// be strictly increasing, and neither aggregator de-duplicates, so
+// `buckets: [0.1, 0.1, 1]` shipped a histogram with a bucket that can never
+// receive a value and a backend that either rejects the metric or renders a
+// nonsense distribution. Why here: agent/spanmetrics and agent/servicegraph
+// are the same aggregator shape and had already drifted on exactly this kind
+// of rule once (see ParseStaleAfter) — spanmetrics' copy of this check was
+// written admitting it duplicated servicegraph's.
+func ValidateBuckets(field string, bounds []float64) error {
+	var prev float64
+	for i, b := range bounds {
+		if b <= 0 {
+			return fmt.Errorf("%s[%d] = %v (want > 0, in seconds)", field, i, b)
+		}
+		if i > 0 && b <= prev {
+			return fmt.Errorf("%s must be strictly increasing (%v after %v)", field, b, prev)
+		}
+		prev = b
+	}
+	return nil
+}
+
 // Builtins is the set of label names an aggregator owns itself. A configured
 // dimension that collides with one of them is DROPPED rather than rendered: the
 // attributes go into one pcommon.Map, so a colliding key would overwrite the

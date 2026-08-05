@@ -45,11 +45,10 @@ func nodeMetaServer(t *testing.T, labels map[string]string) (*metaclient.Client,
 func TestStartNodeInfoResolvesAndClearsTheGate(t *testing.T) {
 	meta, _ := nodeMetaServer(t, map[string]string{"topology.kubernetes.io/zone": "eu-1a"})
 	ready := newReadiness()
-	ready.require(gateMetadata)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	info := startNodeInfo(ctx, meta, "node1", 50*time.Millisecond, discardLogger(), ready)
+	info := startNodeInfo(ctx, meta, "node1", 50*time.Millisecond, discardLogger(), ready.gate(gateMetadata))
 	if n := info(); n == nil || n.Name != "node1" {
 		t.Fatalf("provider = %+v before the first fetch; want the bare node name", n)
 	}
@@ -74,11 +73,10 @@ func TestStartNodeInfoResolvesAndClearsTheGate(t *testing.T) {
 // only requires it when the refresh is positive).
 func TestStartNodeInfoZeroRefreshMakesNoRequest(t *testing.T) {
 	meta, hits := nodeMetaServer(t, nil)
-	ready := newReadiness()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	info := startNodeInfo(ctx, meta, "node1", 0, discardLogger(), ready)
+	info := startNodeInfo(ctx, meta, "node1", 0, discardLogger(), nil)
 	time.Sleep(30 * time.Millisecond)
 	if n := info(); n == nil || n.Name != "node1" || len(n.Labels) != 0 {
 		t.Fatalf("provider = %+v; want the bare node name", n)

@@ -38,14 +38,12 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
-	"sync/atomic"
 	"time"
 
 	"go.opentelemetry.io/collector/pdata/ptrace"
 	"go.opentelemetry.io/collector/pdata/ptrace/ptraceotlp"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 	"google.golang.org/grpc/tap"
@@ -56,8 +54,10 @@ import (
 	"github.com/JohanLindvall/kubescrape/internal/agent/tailbuffer"
 	"github.com/JohanLindvall/kubescrape/internal/agent/tracesample"
 	"github.com/JohanLindvall/kubescrape/internal/bearer"
+	"github.com/JohanLindvall/kubescrape/internal/logdedupe"
 	"github.com/JohanLindvall/kubescrape/internal/obs"
 	"github.com/JohanLindvall/kubescrape/pkg/kubemeta"
+	"github.com/JohanLindvall/kubescrape/pkg/otlpsplit"
 )
 
 // gateServiceGraph is satisfied once the tier's INTERNAL receiver is BOUND —
@@ -153,13 +153,12 @@ func (p *pipelines) startServiceGraph(ctx context.Context) error {
 		return err
 	}
 
-	p.ready.require(gateServiceGraph)
 	rcv := &sgReceiver{
 		grpcAddr: *serviceGraphListen,
 		httpAddr: *serviceGraphHTTPListen,
 		tokens:   tok.Tokens,
 		consume:  ownerReceive(owner),
-		ready:    func() { p.ready.done(gateServiceGraph) },
+		ready:    p.ready.gate(gateServiceGraph),
 		log:      p.log,
 	}
 	p.spawn(func() {
@@ -167,10 +166,7 @@ func (p *pipelines) startServiceGraph(ctx context.Context) error {
 			// Fatal like the ingest listener: a shard whose internal receiver is
 			// dead accepts no re-sharded spans, and it would otherwise sit there
 			// looking healthy while its siblings' pushes fail.
-			p.log.Error("service-graph receiver failed; shutting down", "error", err)
-			ferr := fmt.Errorf("service-graph receiver: %w", err)
-			p.fatalErr.CompareAndSwap(nil, &ferr) // first fatal wins
-			p.stop()
+			p.fatal("service-graph receiver", err)
 		}
 	})
 	if err := p.startServiceGraphIngest(ctx, owner); err != nil {
@@ -320,28 +316,21 @@ func (p *pipelines) startServiceGraphIngest(ctx context.Context, owner servicegr
 		p.log.Info("trace re-sharding is off: a single-shard tier owns every trace locally")
 	}
 
-	enr := otlpingest.NewEnricher(otlpingest.Config{
-		ContainerIDKeys: splitList(*ingestCidKeys),
-		PodUIDKeys:      splitList(*ingestUIDKeys),
-		Wait:            *ingestWait,
-		EnrichLines:     *enrichOn,
-		PeerIPFallback:  *ingestPeerIP,
-		PeerReject:      p.peerIsOurOwnWorkload,
-		Attrs:           p.attrBuilders.Ingest,
-		// NodeInfo is deliberately NIL here, unlike the DaemonSet's ingest
-		// server. There, `.Node` in a resourceAttributes template is the node
-		// the sending pod runs on, because the agent only ever receives from
-		// its own node. This tier receives from the WHOLE CLUSTER, so the
-		// shard's node is not a property of the spans it is enriching — a
-		// template reading `.Node` stamped this shard's node labels onto every
-		// application span from every node, which renders perfectly and is
-		// wrong on every one. The same argument the events reader records for
-		// leaving actx.Node nil: a described object's node is the object's
-		// property, never the reader's.
-		Meta:   p.meta,
-		Logger: p.log,
-	})
-	p.ready.require(gateServiceGraphIngest)
+	ecfg := p.enricherBase()
+	// The tier's one delta on the shared base: veto a peer-IP attribution that
+	// resolves to our own workload (a sibling shard's hop, a proxy on the tier).
+	ecfg.PeerReject = p.peerIsOurOwnWorkload
+	// NodeInfo is deliberately left NIL here (the shared base does not set it),
+	// unlike the DaemonSet's ingest server. There, `.Node` in a
+	// resourceAttributes template is the node the sending pod runs on, because
+	// the agent only ever receives from its own node. This tier receives from
+	// the WHOLE CLUSTER, so the shard's node is not a property of the spans it
+	// is enriching — a template reading `.Node` stamped this shard's node
+	// labels onto every application span from every node, which renders
+	// perfectly and is wrong on every one. The same argument the events reader
+	// records for leaving actx.Node nil: a described object's node is the
+	// object's property, never the reader's.
+	enr := otlpingest.NewEnricher(ecfg)
 	srv := otlpingest.NewServer(otlpingest.ServerConfig{
 		GRPCAddr:    *serviceGraphIngestGRPC,
 		HTTPAddr:    *serviceGraphIngestHTTP,
@@ -351,15 +340,12 @@ func (p *pipelines) startServiceGraphIngest(ctx context.Context, owner servicegr
 		// on the node-local DaemonSet, where the sender is a pod on the same node
 		// and the payload crosses no network to be attributed.
 		Traces: &sgEntry{resharder: resharder, owner: owner},
-		Ready:  func() { p.ready.done(gateServiceGraphIngest) },
+		Ready:  p.ready.gate(gateServiceGraphIngest),
 		Logger: p.log,
 	})
 	p.spawn(func() {
 		if err := srv.Run(ctx); err != nil {
-			p.log.Error("service-graph trace ingest failed; shutting down", "error", err)
-			ferr := fmt.Errorf("service-graph trace ingest: %w", err)
-			p.fatalErr.CompareAndSwap(nil, &ferr) // first fatal wins
-			p.stop()
+			p.fatal("service-graph trace ingest", err)
 		}
 	})
 	p.log.Info("trace ingest listening", "grpc", *serviceGraphIngestGRPC, "http", *serviceGraphIngestHTTP,
@@ -558,17 +544,32 @@ type sgReceiver struct {
 	// so a zero-value sgReceiver (tests construct one directly) still works.
 	body *otlpingest.BodyReader
 
-	// lastWarn throttles the rejected-push log; see warn.
-	lastWarn atomic.Int64
+	// warnGate throttles the rejected-push log; see warnUnauthorized.
+	warnGate logdedupe.Throttle
 }
 
 // sgAuthRealm is sent on 401s so a client can tell "wrong credentials" from
 // "wrong URL".
 const sgAuthRealm = `Bearer realm="kubescrape service-graph"`
 
+// sgUnauthorizedMsg is the internal receiver's refusal, spelled once for the
+// gRPC tap, the gRPC interceptor and the HTTP handler alike: three sites
+// re-typing it is how one drifts into naming a different flag.
+const sgUnauthorizedMsg = "missing or invalid bearer token (-service-graph-token-file)"
+
+// msgShardNoListener is the "shard would receive nothing" refusal, spelled
+// ONCE: validateConfig raises it so -check-config catches the config before
+// the StatefulSet CrashLoops, and sgReceiver.Run raises it again at the real
+// start. One const is what keeps the two paths' wording from drifting.
+const msgShardNoListener = "-service-graph is set but -service-graph-listen (and -service-graph-http-listen) are empty: the shard would receive nothing"
+
 // sgMaxRecvFloor is the receive cap when the sender's split size is unknown or
-// small. It is the historical constant and matches a collector's own default.
-const sgMaxRecvFloor = 4 << 20
+// small: the historical 4 MiB, matching a collector's own default. Derived
+// with the sender's default split cap as a lower bound so a future raise of
+// otlpsplit.DefaultMaxBytes can never silently out-size the internal hop's
+// receive floor — today DefaultMaxBytes is 3.75 MiB, so the value is
+// unchanged at 4 MiB.
+const sgMaxRecvFloor = max(4<<20, otlpsplit.DefaultMaxBytes)
 
 // sgMaxRecvBytes caps one decoded payload on the internal hop.
 //
@@ -593,6 +594,12 @@ const sgWarnEvery = 30 * time.Second
 
 // Run serves until ctx is cancelled. A runtime listener failure propagates to
 // the caller (fatal there); a cancelled shutdown returns nil.
+//
+// The bind-then-ready-then-serve-then-drain skeleton is otlpingest.Listeners —
+// the SERVERS stay this receiver's own (the auth tap and interceptor on gRPC,
+// the bearer check in the HTTP handler, no in-flight shed — see the type doc),
+// only the run shape is shared. This file's hand-rolled copy of that shape is
+// how the keepalive policy below drifted in the first place.
 func (r *sgReceiver) Run(ctx context.Context) error {
 	if r.body == nil {
 		r.body = otlpingest.NewBodyReader(int64(sgMaxRecvBytes()))
@@ -600,23 +607,23 @@ func (r *sgReceiver) Run(ctx context.Context) error {
 	if r.grpcAddr == "" && r.httpAddr == "" {
 		// A shard with no listener pairs nothing, and would report ready and
 		// idle forever. Refuse instead — indistinguishable-from-working is the
-		// failure mode this whole feature's counters exist to avoid.
-		return errors.New("-service-graph is set but -service-graph-listen (and -service-graph-http-listen) are empty: the shard would receive nothing")
+		// failure mode this whole feature's counters exist to avoid. (Refused
+		// HERE, because Listeners.Run treats nothing-configured as a no-op.)
+		return errors.New(msgShardNoListener)
 	}
 
-	var grpcSrv *grpc.Server
-	var httpSrv *http.Server
-	errc := make(chan error, 2)
-
+	l := otlpingest.Listeners{Name: "service-graph internal", Logger: r.log, Ready: r.ready}
 	if r.grpcAddr != "" {
-		lis, err := net.Listen("tcp", r.grpcAddr)
-		if err != nil {
-			return fmt.Errorf("service-graph gRPC listen %s: %w", r.grpcAddr, err)
-		}
-		grpcSrv = grpc.NewServer(
-			// Reap connections an agent opened and abandoned (default gRPC
-			// keeps them forever), as the ingest server does.
-			grpc.KeepaliveParams(keepalive.ServerParameters{MaxConnectionIdle: 120 * time.Second}),
+		l.GRPCAddr = r.grpcAddr
+		l.GRPC = grpc.NewServer(
+			// Reap connections a peer opened and abandoned, and bound a
+			// socket's AGE (otlpingest.KeepaliveOption, the policy every
+			// kubescrape OTLP receiver shares). The MaxConnectionAge/AgeGrace
+			// half is a deliberate behavior change with this adoption: this
+			// port used to set only MaxConnectionIdle — a documented drift, an
+			// authenticated peer's abandoned stream had no age bound, since a
+			// connection carrying an open stream is never idle.
+			otlpingest.KeepaliveOption(),
 			grpc.MaxRecvMsgSize(sgMaxRecvBytes()),
 			// Authenticate on the HEADERS frame, BEFORE grpc-go reads the
 			// message. A UnaryInterceptor runs only after recvAndDecompress has
@@ -635,68 +642,19 @@ func (r *sgReceiver) Run(ctx context.Context) error {
 			grpc.MaxConcurrentStreams(sgMaxConcurrentStreams),
 			grpc.UnaryInterceptor(r.authUnary),
 		)
-		ptraceotlp.RegisterGRPCServer(grpcSrv, &sgTraces{r: r})
-		go func() { errc <- grpcSrv.Serve(lis) }()
-		r.log.Info("service-graph gRPC receiver listening", "addr", r.grpcAddr)
+		ptraceotlp.RegisterGRPCServer(l.GRPC, &sgTraces{r: r})
 	}
-
 	if r.httpAddr != "" {
-		// Listened explicitly rather than through ListenAndServe so the BIND
-		// failure is known before the readiness gate below clears: a probe that
-		// goes green on a port nobody bound is worse than no probe.
-		lis, err := net.Listen("tcp", r.httpAddr)
-		if err != nil {
-			if grpcSrv != nil {
-				grpcSrv.Stop()
-			}
-			return fmt.Errorf("service-graph HTTP listen %s: %w", r.httpAddr, err)
-		}
 		mux := http.NewServeMux()
 		mux.HandleFunc("POST /v1/traces", r.handleHTTPTraces)
-		// Timeouts as on the ingest receiver: ReadHeaderTimeout kills Slowloris
-		// header trickling, ReadTimeout bounds a trickled body, IdleTimeout
-		// reaps parked keep-alives. WriteTimeout is omitted — the responses are
-		// a few bytes and its clock would race a slow but legal upload.
-		httpSrv = &http.Server{
-			Handler:           mux,
-			ReadHeaderTimeout: 10 * time.Second,
-			ReadTimeout:       60 * time.Second,
-			IdleTimeout:       120 * time.Second,
-		}
-		go func() {
-			if err := httpSrv.Serve(lis); err != nil && !errors.Is(err, http.ErrServerClosed) {
-				errc <- err
-				return
-			}
-			errc <- nil
-		}()
-		r.log.Info("service-graph HTTP receiver listening", "addr", r.httpAddr)
+		// The shared push-server shape: Slowloris header bound, trickled-body
+		// bound, keep-alive reaping, and deliberately no WriteTimeout (its
+		// clock would race a slow but legal upload).
+		l.HTTP = otlpingest.NewPushHTTPServer(r.httpAddr, mux)
 	}
-
-	if r.ready != nil {
-		r.ready()
-	}
-
-	var runErr error
-	select {
-	case <-ctx.Done():
-	case err := <-errc:
-		if err != nil {
-			r.log.Error("service-graph receiver listener failed", "error", err)
-			runErr = fmt.Errorf("listener: %w", err)
-		}
-	}
-	if grpcSrv != nil {
-		// Graceful: in-flight forwards are already-paid-for spans, and pairing
-		// them costs microseconds.
-		grpcSrv.GracefulStop()
-	}
-	if httpSrv != nil {
-		sctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		_ = httpSrv.Shutdown(sctx)
-	}
-	return runErr
+	// Graceful on shutdown: in-flight forwards are already-paid-for spans, and
+	// pairing them costs microseconds.
+	return l.Run(ctx)
 }
 
 // sgMaxConcurrentStreams bounds concurrent RPCs per connection on the internal
@@ -733,7 +691,7 @@ func (r *sgReceiver) authTap(ctx context.Context, info *tap.Info) (context.Conte
 		return ctx, nil
 	}
 	r.warnUnauthorized("grpc")
-	return nil, status.Error(codes.Unauthenticated, "missing or invalid bearer token (-service-graph-token-file)")
+	return nil, status.Error(codes.Unauthenticated, sgUnauthorizedMsg)
 }
 
 // authUnary re-checks the token after decode. The tap above is what actually
@@ -746,7 +704,7 @@ func (r *sgReceiver) authUnary(ctx context.Context, req any, _ *grpc.UnaryServer
 		return handler(ctx, req)
 	}
 	r.warnUnauthorized("grpc")
-	return nil, status.Error(codes.Unauthenticated, "missing or invalid bearer token (-service-graph-token-file)")
+	return nil, status.Error(codes.Unauthenticated, sgUnauthorizedMsg)
 }
 
 // warnUnauthorized logs a rejected push at most once per sgWarnEvery. Silence
@@ -754,9 +712,7 @@ func (r *sgReceiver) authUnary(ctx context.Context, req any, _ *grpc.UnaryServer
 // produces no other symptom on either side — the agents' forwards "fail" into
 // a counter, and the graph is simply empty.
 func (r *sgReceiver) warnUnauthorized(transport string) {
-	now := time.Now().UnixNano()
-	last := r.lastWarn.Load()
-	if now-last < int64(sgWarnEvery) || !r.lastWarn.CompareAndSwap(last, now) {
+	if !r.warnGate.Allow(sgWarnEvery) {
 		return
 	}
 	r.log.Warn("rejected a service-graph push with a missing or invalid bearer token; the agents' -service-graph-token-file must match this shard's",
@@ -799,7 +755,7 @@ func (r *sgReceiver) handleHTTPTraces(w http.ResponseWriter, req *http.Request) 
 		r.warnUnauthorized("http")
 		w.Header().Set("WWW-Authenticate", sgAuthRealm)
 		w.Header().Set("Cache-Control", "no-store")
-		http.Error(w, "missing or invalid bearer token (-service-graph-token-file)", http.StatusUnauthorized)
+		http.Error(w, sgUnauthorizedMsg, http.StatusUnauthorized)
 		return
 	}
 	// otlpingest owns the body reader for BOTH receivers. This one used to

@@ -217,28 +217,20 @@ func New(cfg Config) *Scraper {
 	return sc
 }
 
-// scrapeProto runs the protobuf exposition path with the same export/full
-// closures the text path uses.
+// scrapeProto runs the protobuf exposition path on the same scrapeSession
+// harness the text path uses (proto only ever runs on the targets pipeline).
 func (s *Scraper) scrapeProto(ctx context.Context, body io.Reader, cb chunker, relabel *relabelFilter, what string) (int, error) {
-	export := func() error {
-		return s.cfg.Exporter.ExportMetrics(ctx, cb.take())
-	}
-	full := func() bool {
-		return cb.count() >= s.cfg.BatchPoints ||
-			(s.cfg.BatchBytes > 0 && cb.size() >= s.cfg.BatchBytes)
-	}
-	samples, malformed, err := s.parseProtoAndExport(ctx, body, cb, pipelineTargets, relabel, export, full)
-	if malformed > 0 {
-		obs.ScrapeMalformed.WithLabelValues(pipelineTargets).Add(float64(malformed))
-		s.log.Warn("scrape had malformed proto families", "target", what, "malformed", malformed, "samples", samples)
-	}
+	ss := s.newScrapeSession(ctx, cb, pipelineTargets, what, relabel, true)
+	defer ss.reportDropped()
+	malformed, err := s.parseProtoAndExport(ss, body)
+	ss.reportMalformed("scrape had malformed proto families", malformed, nil)
 	if err != nil {
-		return samples, err
+		return ss.samples, err
 	}
-	if cb.count() > 0 {
-		return samples, export()
+	if ss.cb.count() > 0 {
+		return ss.samples, ss.export()
 	}
-	return samples, nil
+	return ss.samples, nil
 }
 
 // authToken resolves a monitor endpoint's bearer token via the metadata
@@ -321,25 +313,34 @@ func (s *Scraper) tickInterval() time.Duration {
 	return max(out, time.Second)
 }
 
+// parseTargetDuration parses one monitor-supplied duration field (kind names
+// it in the warn key, attr in the log line). ok is false for an unparseable or
+// non-positive value, which is reported once and left to the caller's fallback
+// rather than failing the target — the CR is the user's, and dropping their
+// metrics over a typo in an optional field is worse than scraping at the
+// default cadence. The offending VALUE is part of the warn key, so correcting
+// a typo and re-introducing a different one still warns, while the same bad
+// value on the same monitor never warns twice.
+func (s *Scraper) parseTargetDuration(t kubemeta.ScrapeTarget, kind, attr, value string) (time.Duration, bool) {
+	d, err := parsePromDuration(value)
+	if err != nil || d <= 0 {
+		s.warnOnce(kind+":"+warnTarget(t)+":"+value, "ignoring invalid scrape "+kind+" on target",
+			"url", t.URL, "monitor", t.Monitor, attr, value)
+		return 0, false
+	}
+	return d, true
+}
+
 // targetInterval resolves a target's effective scrape period: its own
-// `interval` when the monitor set a valid one, else the agent's default. An
-// unparseable value is reported once and falls back rather than failing the
-// target — the CR is the user's, and dropping their metrics over a typo in an
-// optional field is worse than scraping it at the default cadence.
+// `interval` when the monitor set a valid one, else the agent's default.
 func (s *Scraper) targetInterval(t kubemeta.ScrapeTarget) time.Duration {
 	if t.Interval == "" {
 		return s.cfg.Interval
 	}
-	d, err := parsePromDuration(t.Interval)
-	if err != nil || d <= 0 {
-		// The offending VALUE is part of the key, so correcting a typo and
-		// re-introducing a different one still warns, while the same bad value
-		// on the same monitor never warns twice.
-		s.warnOnce("interval:"+warnTarget(t)+":"+t.Interval, "ignoring invalid scrape interval on target",
-			"url", t.URL, "monitor", t.Monitor, "interval", t.Interval)
-		return s.cfg.Interval
+	if d, ok := s.parseTargetDuration(t, "interval", "interval", t.Interval); ok {
+		return d
 	}
-	return d
+	return s.cfg.Interval
 }
 
 // targetTimeout resolves a target's per-scrape timeout, clamped to its own
@@ -348,11 +349,7 @@ func (s *Scraper) targetTimeout(t kubemeta.ScrapeTarget, interval time.Duration)
 	out := s.cfg.Timeout
 	asked := time.Duration(0)
 	if t.ScrapeTimeout != "" {
-		d, err := parsePromDuration(t.ScrapeTimeout)
-		if err != nil || d <= 0 {
-			s.warnOnce("timeout:"+warnTarget(t)+":"+t.ScrapeTimeout, "ignoring invalid scrape timeout on target",
-				"url", t.URL, "monitor", t.Monitor, "scrapeTimeout", t.ScrapeTimeout)
-		} else {
+		if d, ok := s.parseTargetDuration(t, "timeout", "scrapeTimeout", t.ScrapeTimeout); ok {
 			out, asked = d, d
 		}
 	}

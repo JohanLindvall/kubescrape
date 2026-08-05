@@ -14,7 +14,7 @@ package promscrape
 import (
 	"fmt"
 	"regexp"
-	"strings"
+	"strconv"
 	"sync"
 
 	"github.com/JohanLindvall/kubescrape/pkg/kubemeta"
@@ -47,16 +47,22 @@ func (c *relabelCache) session(rules []kubemeta.RelabelRule) (*relabelFilter, er
 	if len(rules) == 0 {
 		return nil, nil
 	}
-	var fp strings.Builder
+	// Length-prefixed via appendLP (the package's one injective-join rule): a
+	// regex or source label may contain any delimiter byte, and two rule chains
+	// fingerprinting to one key would hand one endpoint the other's compiled
+	// filter. The source-label COUNT is part of the encoding — the parts are
+	// self-delimiting, but rule boundaries are not without it.
+	fp := make([]byte, 0, 128)
 	for _, r := range rules {
-		fp.WriteString(r.Action)
-		fp.WriteByte(0)
-		fp.WriteString(strings.Join(r.SourceLabels, "\x01"))
-		fp.WriteByte(0)
-		fp.WriteString(r.Regex)
-		fp.WriteByte(0)
+		fp = appendLP(fp, r.Action)
+		fp = strconv.AppendInt(fp, int64(len(r.SourceLabels)), 10)
+		fp = append(fp, ';')
+		for _, src := range r.SourceLabels {
+			fp = appendLP(fp, src)
+		}
+		fp = appendLP(fp, r.Regex)
 	}
-	key := fp.String()
+	key := string(fp)
 	c.mu.Lock()
 	compiled, ok := c.m[key]
 	c.mu.Unlock()
@@ -111,10 +117,5 @@ func labelOrName(name string, labels []Label, key string) string {
 	if key == "__name__" {
 		return name
 	}
-	for _, l := range labels {
-		if l.Name == key {
-			return l.Value
-		}
-	}
-	return ""
+	return labelValue(labels, key)
 }

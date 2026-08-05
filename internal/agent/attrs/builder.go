@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"text/template"
 
 	"go.opentelemetry.io/collector/pdata/pcommon"
@@ -222,9 +223,21 @@ type dynamicAttr struct {
 	tmpl *template.Template
 }
 
-// regexCache backs the template regex functions; patterns come from a fixed
-// config so the cache stays tiny.
-var regexCache sync.Map // pattern -> *regexp.Regexp | error
+// regexCache backs the template regex functions.
+//
+// The patterns USUALLY come from a fixed config, which is what makes a cache
+// with no eviction reasonable — but regexMatch/regexReplace take the pattern as
+// a template ARGUMENT, so a template may compose one from per-object data
+// (`regexMatch .Pod.Name ...`, a label value, an annotation). Every distinct
+// value then pinned a compiled *regexp.Regexp in a process-global map for the
+// agent's life, on a path that runs per resource built. The cap turns that from
+// an unbounded leak into a bounded one that simply stops caching; compilation
+// still succeeds past it, so behaviour is unchanged either way.
+var (
+	regexCache   sync.Map // pattern -> *regexp.Regexp | error
+	regexCacheN  atomic.Int64
+	maxRegexKeys = 1024
+)
 
 func cachedRegexp(pattern string) (*regexp.Regexp, error) {
 	if v, ok := regexCache.Load(pattern); ok {
@@ -234,12 +247,24 @@ func cachedRegexp(pattern string) (*regexp.Regexp, error) {
 		return nil, v.(error)
 	}
 	re, err := regexp.Compile(pattern)
-	if err != nil {
-		regexCache.Store(pattern, err)
-		return nil, err
+	if regexCacheN.Load() >= int64(maxRegexKeys) {
+		// Past the cap, compile every time rather than grow. A config with more
+		// than a thousand distinct patterns is data-derived by construction,
+		// and that is the case this bound exists for.
+		return re, err
 	}
-	regexCache.Store(pattern, re)
-	return re, nil
+	if _, loaded := regexCache.LoadOrStore(pattern, cacheValue(re, err)); !loaded {
+		regexCacheN.Add(1)
+	}
+	return re, err
+}
+
+// cacheValue is what gets stored: the compiled regex, or the compile error.
+func cacheValue(re *regexp.Regexp, err error) any {
+	if err != nil {
+		return err
+	}
+	return re
 }
 
 // templateFuncs are available in attribute templates.

@@ -27,6 +27,7 @@ package spanmetrics
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"sort"
 	"time"
@@ -116,8 +117,31 @@ func (c Config) staleAfter() (time.Duration, error) {
 // clear message (New itself falls back to the default, never refusing to
 // aggregate).
 func (c Config) Validate() error {
-	_, err := c.staleAfter()
-	return err
+	if _, err := c.staleAfter(); err != nil {
+		return err
+	}
+	if c.MaxCardinality < 0 {
+		return fmt.Errorf("maxCardinality must not be negative")
+	}
+	// The same check servicegraph.Config.Validate applies to its identical
+	// histogramBuckets field. Without it, boundsOrDefault sorts but never
+	// de-duplicates, so `buckets: [0.1, 0.1, 1]` shipped an OTLP histogram
+	// whose ExplicitBounds are not strictly increasing — which the spec
+	// requires — giving a bucket that can never receive a value and a
+	// backend that either rejects the metric or renders a nonsense
+	// distribution. The two aggregators are the same shape and had drifted on
+	// exactly this kind of rule before (see cumagg.ParseStaleAfter).
+	var prev float64
+	for i, b := range c.Buckets {
+		if b <= 0 {
+			return fmt.Errorf("buckets[%d] = %v (want > 0, in seconds)", i, b)
+		}
+		if i > 0 && b <= prev {
+			return fmt.Errorf("buckets must be strictly increasing (%v after %v)", b, prev)
+		}
+		prev = b
+	}
+	return nil
 }
 
 // Generator aggregates spans into calls/size/duration metrics. Safe for

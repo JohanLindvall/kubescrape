@@ -2,6 +2,7 @@ package tailer
 
 import (
 	"fmt"
+	"os"
 	"path"
 	"path/filepath"
 	"time"
@@ -263,12 +264,34 @@ func (s *compiledSource) glob() ([]string, bool) {
 		// offsets of files it merely could not see. A node-wide re-ingest on
 		// the next successful listing, or outright loss if a restart landed in
 		// between.
+		// WithFailOnIOErrors does NOT cover the most common failure of all: an
+		// include base that is not mounted yet. In doublestar v4.10.0 a missing
+		// directory is fs.ErrNotExist, which glob/globDoubleStar route to
+		// handlePatternNotExist — and that returns nil unless
+		// WithFailOnPatternNotExist is set (globoptions.go:131). Only a genuine
+		// EIO/EACCES reached forwardErrIfFailOnIOErrors. So an absent log
+		// directory listed as a SUCCESSFUL EMPTY result, which is the one
+		// answer this bool exists to prevent.
+		//
+		// The base is checked directly rather than by adding
+		// WithFailOnPatternNotExist, which is too broad: that option also fires
+		// for a WILDCARD-FREE include whose file simply does not exist right
+		// now (a plain source naming one file, or any file mid-rotation), and
+		// turning that into "the listing failed" would disable gone-detection
+		// on an ordinary steady state. Statting the fixed prefix separates the
+		// two exactly — "I could not look" versus "I looked and there is
+		// nothing".
+		if base, _ := doublestar.SplitPattern(g); base != "" && base != "." {
+			if _, serr := os.Stat(base); serr != nil {
+				ok = false
+				continue
+			}
+		}
 		m, err := doublestar.FilepathGlob(g, doublestar.WithFailOnIOErrors())
 		if err != nil {
 			// Proves nothing about which files are gone; the caller must not
-			// treat absence from this listing as removal. A base directory
-			// that does not exist yet lands here too, which is the same
-			// conservative answer: nothing to prune, nothing to declare gone.
+			// treat absence from this listing as removal — nothing to prune,
+			// nothing to declare gone.
 			ok = false
 			continue
 		}

@@ -19,6 +19,16 @@ data:
       debug:
         verbosity: normal
     service:
+      # Bind the internal metrics endpoint to 0.0.0.0 explicitly. Since
+      # collector v0.111 the telemetry.UseLocalHostAsDefaultMetricsAddress
+      # feature gate is ON by default, so this endpoint listens on 127.0.0.1 —
+      # the prometheus.io/port: "8888" annotation above then pointed the agents
+      # at a port nothing outside the container could reach, and the fixture's
+      # claim to "close the loop" by scraping the collector's own metrics
+      # quietly did nothing.
+      telemetry:
+        metrics:
+          address: 0.0.0.0:8888
       pipelines:
         logs:
           receivers: [otlp]

@@ -901,14 +901,14 @@ func TestServiceGraphHTTPOversizedGzipIs413(t *testing.T) {
 
 	// Incompressible data: the COMPRESSED body itself exceeds the cap, so the
 	// reader's own truncation is what the decompressor trips over.
-	raw := make([]byte, sgMaxRecvBytes+(1<<20))
+	raw := make([]byte, sgMaxRecvBytes()+(1<<20))
 	rnd := mathrand.New(mathrand.NewSource(1))
 	_, _ = rnd.Read(raw)
 	var buf bytes.Buffer
 	zw := gzip.NewWriter(&buf)
 	_, _ = zw.Write(raw)
 	_ = zw.Close()
-	if buf.Len() <= sgMaxRecvBytes {
+	if buf.Len() <= sgMaxRecvBytes() {
 		t.Fatalf("test payload compressed to %d bytes, below the cap", buf.Len())
 	}
 	if code := post(buf.Bytes()); code != http.StatusRequestEntityTooLarge {
@@ -919,7 +919,7 @@ func TestServiceGraphHTTPOversizedGzipIs413(t *testing.T) {
 	// already 413 and must stay so.
 	var bomb bytes.Buffer
 	zw = gzip.NewWriter(&bomb)
-	_, _ = zw.Write(make([]byte, sgMaxRecvBytes+2))
+	_, _ = zw.Write(make([]byte, sgMaxRecvBytes()+2))
 	_ = zw.Close()
 	if code := post(bomb.Bytes()); code != http.StatusRequestEntityTooLarge {
 		t.Errorf("zip-bomb status = %d, want 413", code)

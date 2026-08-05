@@ -157,11 +157,20 @@ func startServiceMonitors(ctx context.Context, cfg *rest.Config, disco discovery
 	// vanished and /v1/scrape-auth 404'd every credential, with one log line
 	// at startup as the only trace. An operator who asked for -servicemonitors
 	// gets a hard failure instead, and can retry.
-	switch present, err := serviceMonitorCRDPresent(disco); {
-	case err != nil:
-		return nil, nil, fmt.Errorf("checking for the servicemonitor CRD: %w", err)
-	case !present:
-		log.Warn("servicemonitors requested but the CRD is unavailable; disabling")
+	// Both CRDs are OPTIONAL and install independently, so ask about both and
+	// disable only when NEITHER is served. Gating the whole function on the
+	// ServiceMonitor CRD alone returned before the PodMonitor check further
+	// down ever ran, so a cluster that serves only PodMonitors — which is a
+	// supported prometheus-operator install — got no monitor discovery at all,
+	// and the log said "servicemonitors requested but the CRD is unavailable"
+	// while the CRD the operator actually had was sitting right there.
+	served, err := monitoringResources(disco)
+	if err != nil {
+		return nil, nil, fmt.Errorf("checking for the monitoring CRDs: %w", err)
+	}
+	haveSM, havePM := served[servicemonitors.GVR.Resource], served[servicemonitors.PodGVR.Resource]
+	if !haveSM && !havePM {
+		log.Warn("servicemonitors requested but neither the ServiceMonitor nor the PodMonitor CRD is available; disabling")
 		return nil, nil, nil
 	}
 	dynClient, err := dynamic.NewForConfig(cfg)
@@ -169,61 +178,59 @@ func startServiceMonitors(ctx context.Context, cfg *rest.Config, disco discovery
 		return nil, nil, fmt.Errorf("creating dynamic client: %w", err)
 	}
 	dynFactory := dynamicinformer.NewDynamicSharedInformerFactory(dynClient, resync)
-	smInformer := dynFactory.ForResource(servicemonitors.GVR).Informer()
-	// Unstructured objects retain managedFields unless stripped, like the
-	// typed informers' transform does. stripManagedFields goes through
-	// apimeta.Accessor, which handles *unstructured.Unstructured, so ONE
-	// transform serves every informer here — this used to be a bespoke
-	// closure, and its PodMonitor sibling was a copy that simply never got
-	// written, leaving that one cache carrying full managedFields trees.
-	if err := smInformer.SetTransform(stripManagedFields); err != nil {
-		return nil, nil, fmt.Errorf("servicemonitor informer transform: %w", err)
-	}
-	if err := watchErrors(smInformer, "servicemonitors"); err != nil {
-		return nil, nil, fmt.Errorf("servicemonitor watch error handler: %w", err)
-	}
 	monitors := servicemonitors.NewIndex()
-	smReg, err := smInformer.AddEventHandler(typedHandler(
-		func(u *unstructured.Unstructured) {
-			if !monitorAllowed(allowNS, "servicemonitor", u, log) {
-				return
-			}
-			if err := monitors.Upsert(u); err != nil {
-				// Counted, not just logged: an unparseable monitor DELETES it
-				// from the index, dropping every target it contributed. That
-				// is strictly more severe than the "some endpoint fields were
-				// ignored" case, which does get a metric — so the severe one
-				// must not be the unalertable one.
-				obs.MonitorParseErrors.WithLabelValues("servicemonitor").Inc()
-				log.Warn("parsing servicemonitor", "error", err,
-					"namespace", u.GetNamespace(), "name", u.GetName())
-				return
-			}
-			warnIgnored(log, "servicemonitor", u, monitors.Endpoints(u.GetNamespace(), u.GetName()))
-		},
-		func(u *unstructured.Unstructured) { monitors.Delete(u.GetNamespace(), u.GetName()) },
-	))
-	if err != nil {
-		return nil, nil, fmt.Errorf("registering servicemonitor handler: %w", err)
+	var synced []cache.InformerSynced
+	if haveSM {
+		smInformer := dynFactory.ForResource(servicemonitors.GVR).Informer()
+		// Unstructured objects retain managedFields unless stripped, like the
+		// typed informers' transform does. stripManagedFields goes through
+		// apimeta.Accessor, which handles *unstructured.Unstructured, so ONE
+		// transform serves every informer here — this used to be a bespoke
+		// closure, and its PodMonitor sibling was a copy that simply never got
+		// written, leaving that one cache carrying full managedFields trees.
+		if err := smInformer.SetTransform(stripManagedFields); err != nil {
+			return nil, nil, fmt.Errorf("servicemonitor informer transform: %w", err)
+		}
+		if err := watchErrors(smInformer, "servicemonitors"); err != nil {
+			return nil, nil, fmt.Errorf("servicemonitor watch error handler: %w", err)
+		}
+		smReg, err := smInformer.AddEventHandler(typedHandler(
+			func(u *unstructured.Unstructured) {
+				if !monitorAllowed(allowNS, "servicemonitor", u, log) {
+					return
+				}
+				if err := monitors.Upsert(u); err != nil {
+					// Counted, not just logged: an unparseable monitor DELETES it
+					// from the index, dropping every target it contributed. That
+					// is strictly more severe than the "some endpoint fields were
+					// ignored" case, which does get a metric — so the severe one
+					// must not be the unalertable one.
+					obs.MonitorParseErrors.WithLabelValues("servicemonitor").Inc()
+					log.Warn("parsing servicemonitor", "error", err,
+						"namespace", u.GetNamespace(), "name", u.GetName())
+					return
+				}
+				warnIgnored(log, "servicemonitor", u, monitors.Endpoints(u.GetNamespace(), u.GetName()))
+			},
+			func(u *unstructured.Unstructured) { monitors.Delete(u.GetNamespace(), u.GetName()) },
+		))
+		if err != nil {
+			return nil, nil, fmt.Errorf("registering servicemonitor handler: %w", err)
+		}
+		// Readiness must cover every cache a request can read, so collect the
+		// handler registrations rather than returning the ServiceMonitor's alone:
+		// /v1/nodes/{node}/targets reads the PodMonitor index too, and leaving it
+		// out let /readyz report 200 — advancing a rollout — while that index was
+		// empty, or permanently so when podmonitors RBAC is missing and its LIST
+		// 403-loops forever.
+		synced = append(synced, smReg.HasSynced)
 	}
-	// Readiness must cover every cache a request can read, so collect the
-	// handler registrations rather than returning the ServiceMonitor's alone:
-	// /v1/nodes/{node}/targets reads the PodMonitor index too, and leaving it
-	// out let /readyz report 200 — advancing a rollout — while that index was
-	// empty, or permanently so when podmonitors RBAC is missing and its LIST
-	// 403-loops forever.
-	synced := []cache.InformerSynced{smReg.HasSynced}
 
-	// PodMonitors are an optional sibling — watch it when the cluster serves
-	// it. This is the same idempotent discovery GET as the pre-check above, so
-	// an error here is as fatal as one there. (Probes are deliberately not
-	// supported at all: blackbox probing has no node affinity and does not fit
-	// the node-local model.)
-	served, err := monitoringResources(disco)
-	if err != nil {
-		return nil, nil, fmt.Errorf("listing monitoring.coreos.com resources: %w", err)
-	}
-	if served[servicemonitors.PodGVR.Resource] {
+	// PodMonitors are an optional sibling, watched when the cluster serves it —
+	// independently of the ServiceMonitor CRD above. (Probes are deliberately
+	// not supported at all: blackbox probing has no node affinity and does not
+	// fit the node-local model.)
+	if havePM {
 		pmInformer := dynFactory.ForResource(servicemonitors.PodGVR).Informer()
 		// The same transform as every other informer — see the ServiceMonitor
 		// one above.
@@ -255,7 +262,9 @@ func startServiceMonitors(ctx context.Context, cfg *rest.Config, disco discovery
 		log.Info("podmonitor discovery enabled")
 	}
 	dynFactory.Start(ctx.Done())
-	log.Info("servicemonitor discovery enabled")
+	// Name what is actually watched: with only one CRD installed, claiming
+	// "servicemonitor discovery enabled" was wrong half the time.
+	log.Info("monitor discovery enabled", "servicemonitors", haveSM, "podmonitors", havePM)
 	return monitors, func() bool {
 		for _, s := range synced {
 			if !s() {

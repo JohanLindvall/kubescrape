@@ -2,6 +2,7 @@ package servicemonitors
 
 import (
 	"slices"
+	"strings"
 	"testing"
 
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -215,6 +216,46 @@ func TestAllIsDeterministicallyOrdered(t *testing.T) {
 		want := []string{"aa/m1", "aa/m2", "mm/x", "zz/m1"}
 		if !slices.Equal(keys, want) {
 			t.Fatalf("All() order = %v, want %v", keys, want)
+		}
+	}
+}
+
+// prometheus-operator's RelabelConfig.action enum accepts both casings
+// (replace;Replace;keep;Keep;drop;Drop;...) and lowercases the value when
+// generating scrape config, so `action: Drop` is an ordinary, valid, honoured
+// rule. Comparing against the lowercase literals alone discarded it and
+// exported the very series the CR asked to drop.
+func TestMetricRelabelActionIsCaseInsensitive(t *testing.T) {
+	u := &unstructured.Unstructured{Object: map[string]any{
+		"metadata": map[string]any{"name": "m1", "namespace": "default"},
+		"spec": map[string]any{
+			"selector": map[string]any{"matchLabels": map[string]any{"app": "web"}},
+			"endpoints": []any{map[string]any{
+				"port": "metrics",
+				"metricRelabelings": []any{
+					map[string]any{"action": "Keep", "sourceLabels": []any{"__name__"}, "regex": "app_.*"},
+					map[string]any{"action": "Drop", "sourceLabels": []any{"__name__"}, "regex": "etcd_.*"},
+					map[string]any{"action": "keep", "sourceLabels": []any{"__name__"}, "regex": "ok_.*"},
+				},
+			}},
+		},
+	}}
+	m, err := Parse(u)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ep := m.Endpoints[0]
+	if got := len(ep.MetricRelabelings); got != 3 {
+		t.Fatalf("kept %d relabel rules, want 3 (capitalized actions discarded?): %+v", got, ep.MetricRelabelings)
+	}
+	for _, r := range ep.MetricRelabelings {
+		if r.Action != "keep" && r.Action != "drop" {
+			t.Errorf("action %q was not normalized to lower case", r.Action)
+		}
+	}
+	for _, ig := range IgnoredFields(m.Endpoints) {
+		if strings.HasPrefix(ig, "metricRelabelings.action=") {
+			t.Errorf("a supported action was reported as ignored: %q", ig)
 		}
 	}
 }

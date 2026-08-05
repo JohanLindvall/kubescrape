@@ -283,6 +283,16 @@ func TestNoStoreOnCallerAndPodIPRoutes(t *testing.T) {
 func TestNodeTargetsCachedWithStableETag(t *testing.T) {
 	st := store.New(time.Minute)
 	addPod(st)
+	// MANY pods, each with several annotated ports. The property under test is
+	// that the response is SORTED before hashing, because PodsOnNode iterates a
+	// map and Go randomizes map order per range — with a single pod and a
+	// single target the slice is trivially ordered and the test could not fail
+	// however the handler behaved, which is what it did for its whole life.
+	// Enough targets that an unsorted body would differ across requests with
+	// overwhelming probability.
+	for i := 0; i < 12; i++ {
+		addTargetPod(st, i)
+	}
 	srv := cachingServer(t, st, 10*time.Second)
 
 	url := srv.URL + "/v1/nodes/node1/targets"
@@ -290,9 +300,10 @@ func TestNodeTargetsCachedWithStableETag(t *testing.T) {
 	if etag == "" {
 		t.Fatal("no ETag on the targets response")
 	}
-	for i := 0; i < 5; i++ { // deterministic body → stable tag
+	for i := 0; i < 20; i++ { // deterministic body → stable tag
 		if e := condGet(t, url, "", http.StatusOK); e != etag {
-			t.Fatalf("ETag changed across identical requests: %q vs %q", e, etag)
+			t.Fatalf("ETag changed across identical requests: %q vs %q "+
+				"(the targets response must be sorted before hashing)", e, etag)
 		}
 	}
 	condGet(t, url, etag, http.StatusNotModified)

@@ -531,7 +531,7 @@ bodies **on the agent**, before anything downstream copies from them
 (enrichment, `logAttributes`, log metrics — and before export), so secrets
 never leave the node. `builtin` enables named patterns — `defaults` expands
 to the low-false-positive set (`bearer`, `basic-auth`, `secret-kv`,
-`aws-key`, `private-key`); `email` and `credit-card` are opt-in by name —
+`aws-key`, `private-key`, `url-userinfo`); `email` and `credit-card` are opt-in by name —
 and `rules` adds user regexes (`name`, `regexp`, `replacement`, `$1`-style
 group references; the default replacement is `[REDACTED]`):
 

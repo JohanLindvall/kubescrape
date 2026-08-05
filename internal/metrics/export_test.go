@@ -448,3 +448,46 @@ func TestSharedSeriesByName(t *testing.T) {
 		t.Errorf("events_total exported %d times, want 1", count)
 	}
 }
+
+// A snapshot is DESTRUCTIVE — it seals aggregation windows, zeroes idled
+// samples and deletes expired ones — so a failed export used to end those
+// observations' lives: the value was gone from the store and had never left the
+// process. The failed chunk's samples are retained and re-offered instead.
+func TestFailedChunkIsReOfferedNextExport(t *testing.T) {
+	set, err := newTestSet([]Dynamic{{
+		Name:   "test_window_max",
+		Type:   GaugeType,
+		Action: "max", // a WINDOWED aggregation: sealing it discards the window
+		Value:  "v",
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	set.Add(valuesFrom(map[string]string{"v": "7"}), labelsFrom(nil),
+		res(map[string]string{"k8s.pod.name": "pod-a"}), "")
+
+	// First export fails outright.
+	fail := &failingExporter{}
+	if err := set.Export(context.Background(), fail, 0); err == nil {
+		t.Fatal("Export returned nil for a failing exporter")
+	}
+	// Nothing new is observed; the second export must still carry the window
+	// the first one sealed and could not deliver.
+	cap2 := &capExporter{}
+	if err := set.Export(context.Background(), cap2, 0); err != nil {
+		t.Fatalf("second Export failed: %v", err)
+	}
+	if len(cap2.md) == 0 {
+		t.Fatal("the undelivered window was not re-offered: nothing was exported")
+	}
+	got := resourceOf(t, cap2, "test_window_max")
+	if got["k8s.pod.name"] != "pod-a" {
+		t.Errorf("re-offered resource = %v, want the pod-a window", got)
+	}
+}
+
+type failingExporter struct{}
+
+func (failingExporter) ExportMetrics(context.Context, pmetric.Metrics) error {
+	return errors.New("collector unavailable")
+}

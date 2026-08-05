@@ -199,15 +199,85 @@ func (g *metricGrouper) scope(sm pmetric.ScopeMetrics, scopeIdx int, id string) 
 	return dst
 }
 
+// senderIdentityAttrs are the resource attributes that name WHO a resource is.
+// On a split group the resource describes a DIFFERENT object than the sender,
+// so every one of these belongs to the described object or to nobody — never to
+// the exporter that happened to report it.
+var senderIdentityAttrs = []string{
+	"k8s.pod.name", "k8s.pod.uid", "k8s.pod.ip",
+	"k8s.container.name", "container.id", "container.name", "container.image.name",
+	"k8s.namespace.name", "k8s.node.name",
+	"k8s.deployment.name", "k8s.statefulset.name", "k8s.daemonset.name",
+	"k8s.job.name", "k8s.cronjob.name", "k8s.replicaset.name",
+	"service.name", "service.namespace", "service.instance.id",
+}
+
+// stripSenderIdentity removes the sender's own identity from a resource that is
+// about to be re-labelled as a described object's.
+func stripSenderIdentity(a pcommon.Map) {
+	for _, k := range senderIdentityAttrs {
+		a.Remove(k)
+	}
+}
+
+// maxSplitGroups bounds the per-object resources one push may inflate into.
+// See resource(): each is a full copy of the sender's resource, so the bound is
+// on MEMORY, which the byte budget cannot express — it counts the payload's raw
+// bytes, and a small payload can name a great many distinct objects.
+const maxSplitGroups = 2048
+
+// sameObject reports whether two ID tokens name the same Kubernetes object.
+//
+// The tokens are KIND-TAGGED ("c\x00<container-id>" vs "u\x00<pod-uid>"), so a
+// point that identifies itself by container id and a resource that identifies
+// itself by pod uid compare unequal as strings while naming ONE pod. Treating
+// that as "describes a different object" made the split path overwrite the
+// sender's own resource with derived identity — the one case the overwrite rule
+// explicitly does not want, since there the sender IS authoritative.
+//
+// Both lookups go through the per-request enrich cache, so this costs no extra
+// metadata round trip.
+func (g *metricGrouper) sameObject(a, b string) bool {
+	if a == "" || b == "" {
+		return false
+	}
+	ra := g.enricher.builtAttrs(g.ctx, g.enrichCache, a)
+	rb := g.enricher.builtAttrs(g.ctx, g.enrichCache, b)
+	if ra.Len() == 0 || rb.Len() == 0 {
+		return false // at least one did not resolve: no evidence they match
+	}
+	ua, oka := ra.Get("k8s.pod.uid")
+	ub, okb := rb.Get("k8s.pod.uid")
+	if !oka || !okb || ua.Str() != ub.Str() {
+		return false
+	}
+	// Same pod. Same CONTAINER too, or one names the pod and the other a
+	// container within it — which are different objects for attribution.
+	ca, _ := ra.Get("k8s.container.name")
+	cb, _ := rb.Get("k8s.container.name")
+	return ca.Str() == cb.Str()
+}
+
 func (g *metricGrouper) resource(id string) pmetric.ResourceMetrics {
 	if rm, ok := g.rmByID[id]; ok {
 		return rm
+	}
+	// Each group is a full COPY of the sender's resource, so the memory one
+	// push costs scales with its DATA-POINT count, not with the raw bytes the
+	// byte budget bounds: a 3 MiB payload of a thousand points, each naming a
+	// different object, inflates into a thousand enriched resources. Past the
+	// cap the remaining objects share the source resource — unenriched, but
+	// forwarded and counted, which is strictly better than an OOM the process
+	// cannot defend against on an unauthenticated listener.
+	if len(g.rmByID) >= maxSplitGroups {
+		obs.Ingested.WithLabelValues("split_capped").Inc()
+		return g.resource("")
 	}
 	rm := g.out.ResourceMetrics().AppendEmpty()
 	g.srcResource.CopyTo(rm.Resource())
 	rm.SetSchemaUrl(g.srcSchema)
 	if id != "" {
-		if id != g.resToken {
+		if id != g.resToken && !g.sameObject(id, g.resToken) {
 			// This group is keyed by a point-level ID that differs from the
 			// resource's own: the copied resource describes a DIFFERENT object.
 			// Its ID attributes would mislabel (and mis-enrich downstream) every
@@ -228,6 +298,15 @@ func (g *metricGrouper) resource(id string) pmetric.ResourceMetrics {
 				rm.Resource().Attributes().Clear()
 				g.putIDAttr(rm.Resource().Attributes(), id)
 			} else {
+				// Clear the sender's OWN Kubernetes identity first. overwriteAttrs
+				// replaces only the keys the builder emits, so any identity key
+				// the described object happens to lack — a container name when the
+				// described object is a pod, a different owner kind, the sender's
+				// service.name — survived from the EXPORTER onto the object it is
+				// describing, which is the exact mislabeling this branch exists to
+				// prevent. Non-identity attributes (cluster name, SDK attrs,
+				// custom) are still the sender's to keep.
+				stripSenderIdentity(rm.Resource().Attributes())
 				overwriteAttrs(built, rm.Resource().Attributes())
 			}
 			g.rmByID[id] = rm

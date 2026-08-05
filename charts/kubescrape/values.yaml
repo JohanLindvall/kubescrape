@@ -466,7 +466,9 @@ serviceGraph:
   # than loss.
   #
   # Sizing rule: maxSpans x 1 KiB must fit a QUARTER of this pod's memory limit
-  # (1 GiB limit -> ~262k spans). It is CHECKED at startup — an unset maxSpans is
+  # (1 GiB limit -> ~262k spans; the DEFAULT limit below is 512Mi, so ~131k —
+  # raise serviceGraph.resources.limits.memory alongside maxSpans, or the
+  # startup check lowers/refuses it). It is CHECKED at startup — an unset maxSpans is
   # lowered to fit, an explicit one that could only OOM is refused — because the
   # likeliest hard kill here is the OOM this buffer itself causes. A shard holds
   # (its span rate x decisionWait) spans: 50k spans/s over 5s is 250k, ~250 MiB.
@@ -479,7 +481,9 @@ serviceGraph:
   #   config:
   #     tailSampling:
   #       decisionWait: 5s      # hold a trace this long from its FIRST span
-  #       maxSpans: 200000      # TOTAL buffered spans; at the bound the OLDEST
+  #       maxSpans: 120000      # TOTAL buffered spans; fits the default 512Mi
+  #                             # limit (a quarter of it, at 1 KiB/span). At the
+  #                             # bound the OLDEST
   #                             # trace is decided EARLY, never dropped unjudged
   #       policies:             # ORDERED, first match wins (the matching policy
   #                             # is a metric label, so "why was this kept" has

@@ -211,6 +211,19 @@ spec:
             - -otlp-tls-ca-file={{ . }}
             {{- end }}
             - -otlp-timeout={{ .Values.agent.otlp.timeout }}
+            {{- /* All three workloads render their exporter from the ONE
+                   agent.otlp block, so they must render all of it. These were
+                   set on the DaemonSet only, so an operator who tuned
+                   retryAttempts/retryBackoff (or raised maxSendBytes for a
+                   collector with a larger receive limit) silently got the
+                   defaults here — and this Deployment ships Kubernetes events
+                   and Azure diagnostics, whose batches are the ones most
+                   likely to need the larger cap. */}}
+            - -otlp-retry-attempts={{ .Values.agent.otlp.retryAttempts }}
+            - -otlp-retry-backoff={{ .Values.agent.otlp.retryBackoff }}
+            {{- with .Values.agent.otlp.maxSendBytes }}
+            - -otlp-max-send-bytes={{ int64 . }}
+            {{- end }}
             {{- if .Values.agent.otlp.bearerTokenSecret.name }}
             - -otlp-bearer-token-file=/etc/kubescrape/otlp-token/{{ .Values.agent.otlp.bearerTokenSecret.key }}
             {{- end }}
@@ -220,6 +233,14 @@ spec:
             {{- end }}
             - -metrics-listen={{ if .Values.metrics.enabled }}{{ .Values.metrics.listen }}{{ end }}
             - -log-level={{ .Values.logLevel }}
+            {{- /* pprofListen is a TOP-LEVEL, unscoped value, but only the
+                   DaemonSet and the metadata service rendered it — so turning
+                   it on gave you profiles from every workload except the two
+                   singletons, which run the same agent binary and define the
+                   same flag. */}}
+            {{- with .Values.pprofListen }}
+            - -pprof-listen={{ . }}
+            {{- end }}
             - -log-format={{ .Values.logFormat }}
             {{- with .Values.events.extraArgs }}
             {{- toYaml . | nindent 12 }}

@@ -25,8 +25,15 @@ import (
 type Config struct {
 	// Builtin enables named built-in patterns. The special name "defaults"
 	// enables the low-false-positive set (bearer, basic-auth, secret-kv,
-	// aws-key, private-key). "email" and "credit-card" are opt-in by name —
-	// they redact legitimate content too often to be defaults.
+	// aws-key, private-key, url-userinfo) — see defaultSet, which is the
+	// authoritative list. "email" and "credit-card" are opt-in by name — they
+	// redact legitimate content too often to be defaults.
+	//
+	// Keep this enumeration in step with defaultSet. It, the README and
+	// CONFIGURATION.md all said "five" long after url-userinfo made it six, so
+	// an operator who spelled the list out instead of writing `defaults` — the
+	// natural thing to do for a reviewable compliance control — silently lost
+	// DSN password redaction. TestDefaultSetIsDocumented pins it now.
 	Builtin []string `json:"builtin,omitempty"`
 	// Rules are additional user patterns, applied after the built-ins.
 	Rules []Rule `json:"rules,omitempty"`
@@ -257,8 +264,16 @@ func kvAssign(s string, j int) bool {
 	for j < len(s) && isRegexpSpace(s[j]) {
 		j++
 	}
+	// The two value branches have DIFFERENT terminator sets, and the prefilter
+	// has to admit both or it is narrower than the regex — which means a secret
+	// ships unredacted, the one failure this whole prefilter design must never
+	// have. A quoted value runs to its closing quote (`["\'][^"\']+`), so the
+	// only byte that cannot start it is another quote; whitespace, commas and
+	// brackets are all legal INSIDE the quotes. An unquoted value still stops
+	// at the delimiter class.
 	if j < len(s) && (s[j] == '"' || s[j] == '\'') {
 		j++
+		return j < len(s) && s[j] != '"' && s[j] != '\''
 	}
 	return j < len(s) && !isValueDelim(s[j])
 }
@@ -338,13 +353,29 @@ var builtins = map[string]pattern{
 		// secret_key, secretKey, secretValue, TOKEN_VALUE — which the
 		// suffix-only form above missed entirely, shipping the whole Django /
 		// AWS-SDK / camelCase-JSON family in clear (see keySuffix).
+		// A QUOTED value ends at its closing quote, not at the first delimiter
+		// inside it. The value class below is the UNQUOTED terminator set, and
+		// applying it to a quoted value redacted only the first fragment:
+		//
+		//	password="hunter2 with spaces"  ->  password="[REDACTED] with spaces"
+		//	{"password":"p@ss w0rd"}        ->  {"password":"[REDACTED] w0rd"}
+		//
+		// i.e. every passphrase containing a space, comma, semicolon, ampersand
+		// or closing bracket shipped its tail in clear, through the tailer,
+		// journald and ingest alike. RE2 has no backreference, so "the same
+		// quote that opened it" is spelled as an ordered alternation whose
+		// first branch captures the opening quote in group 2 and stops before
+		// ANY quote; the closing quote is left in the line, so the replacement
+		// re-emits `key="` + redaction and the original terminator survives.
+		// The unquoted branch is unchanged. Both branches still require at
+		// least one value byte, so `password=""` matches neither, as before.
 		re: regexp.MustCompile(`((?:^|[^0-9A-Za-z_.-])[0-9A-Za-z_.-]*?(?:` +
 			asciiFold("api") + `[_-]?` + asciiFold("key") +
 			`|` + asciiFold("secret") + `|` + asciiFold("password") + `|` + asciiFold("passwd") +
 			`|` + asciiFold("pwd") + `|` + asciiFold("token") +
 			`|` + asciiFold("access") + `[_-]?` + asciiFold("key") +
-			`)` + keySuffix + `["\']?\s*[:=]\s*["\']?)[^\s"\'&,;}\])]+`),
-		repl:      "${1}" + redacted,
+			`)` + keySuffix + `["\']?\s*[:=]\s*)(?:(["\'])[^"\']+|[^\s"\'&,;}\])]+)`),
+		repl:      "${1}${2}" + redacted,
 		prefilter: secretKVCandidate,
 	},
 	"url-userinfo": {

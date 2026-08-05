@@ -30,6 +30,7 @@ type drops struct {
 	capped    atomic.Uint64
 	collision atomic.Uint64
 	nan       atomic.Uint64
+	retained  atomic.Uint64
 
 	mu       sync.Mutex
 	byMetric map[string]uint64
@@ -65,6 +66,15 @@ func (d *drops) Collision() uint64 { return d.collision.Load() }
 // path, since neither is representable as a sample and both would poison every
 // aggregation the series feeds.)
 func (d *drops) NaN() uint64 { return d.nan.Load() }
+
+// Retained counts undelivered export chunks dropped because the
+// re-offer buffer was full — a collector outage lasting longer than
+// maxRetainedResources can hold. These ARE lost observations, and they are the
+// only ones the retention cannot save.
+func (d *drops) Retained() uint64 { return d.retained.Load() }
+
+// addRetained counts n dropped undelivered resources.
+func (d *drops) addRetained(n uint64) { d.retained.Add(n) }
 
 // recordCapped counts one cap-refused observation for metric.
 func (d *drops) recordCapped(metric string) {

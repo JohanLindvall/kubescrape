@@ -216,10 +216,13 @@ deciding where to land:
 - **On Kubernetes, shipping OTLP, wanting zero-config attribution and strong
   delivery guarantees with minimal API-server load** — kubescrape is built
   for exactly this and is the smallest-config option.
-- **Need syslog/kafka/cloud inputs, Windows, remote-write, or cross-node tail
-  sampling** — use Vector, Fluent Bit, Alloy, or the OTel Collector; or run
+- **Need syslog/kafka/cloud inputs, Windows, or remote-write** — use Vector,
+  Fluent Bit, Alloy, or the OTel Collector; or run
   kubescrape for node collection in front of a central collector that does the
-  rest. (Service graphs are no longer on this list: the trace tier
+  rest. (Cross-node tail sampling is no longer on this list either: the
+  `tailSampling` section on the trace tier buffers a trace's spans on its
+  owning shard and decides it whole — see the trace-tier rows above.
+  Service graphs are likewise off it: the trace tier
   shards spans by trace id onto a small StatefulSet, the way Tempo's
   metrics-generator does, and emits the `traces_service_graph_*` series
   Grafana's Service Graph view queries. Tail sampling still is — the routing

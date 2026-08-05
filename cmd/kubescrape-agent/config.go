@@ -360,6 +360,19 @@ func routeExportConfig(exp *otlpexport.ExportConfig, rt route.Route) (otlpexport
 	}
 	if rt.Endpoint != "" {
 		rcfg.Endpoint = rt.Endpoint
+		// A route naming its OWN endpoint does not inherit the default chain's
+		// credentials. Those authenticate this deployment to ITS collector, and
+		// this is a different host — usually a different tenant's, sometimes a
+		// different organization's. Carrying the base BearerTokenFile and mTLS
+		// client certificate over presented them to whatever address the route
+		// named, which is a credential disclosure with no way to opt out: there
+		// was no per-route field to override them with. Each is taken from the
+		// route or left unset.
+		rcfg.BearerTokenFile = rt.BearerTokenFile
+		rcfg.ClientCertFile = rt.ClientCertFile
+		rcfg.ClientKeyFile = rt.ClientKeyFile
+		rcfg.CAFile = rt.CAFile
+		rcfg.Insecure = rt.Insecure
 		return rcfg, nil
 	}
 	if baseEndpointUnused(exp) {

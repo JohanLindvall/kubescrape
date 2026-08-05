@@ -231,6 +231,16 @@ spec:
             - -otlp-tls-ca-file={{ . }}
             {{- end }}
             - -otlp-timeout={{ .Values.agent.otlp.timeout }}
+            {{- /* Rendered here too: all three workloads take their exporter
+                   from the single agent.otlp block, and these were on the
+                   DaemonSet alone. maxSendBytes matters most on this one — the
+                   tier exports span metrics and service-graph edges, whose
+                   payloads grow with cardinality. */}}
+            - -otlp-retry-attempts={{ .Values.agent.otlp.retryAttempts }}
+            - -otlp-retry-backoff={{ .Values.agent.otlp.retryBackoff }}
+            {{- with .Values.agent.otlp.maxSendBytes }}
+            - -otlp-max-send-bytes={{ int64 . }}
+            {{- end }}
             {{- if .Values.agent.otlp.bearerTokenSecret.name }}
             - -otlp-bearer-token-file=/etc/kubescrape/otlp-token/{{ .Values.agent.otlp.bearerTokenSecret.key }}
             {{- end }}
@@ -244,6 +254,10 @@ spec:
             {{- end }}
             - -metrics-listen={{ if .Values.metrics.enabled }}{{ .Values.metrics.listen }}{{ end }}
             - -log-level={{ .Values.logLevel }}
+            {{- /* Top-level, unscoped value; rendered here too (see events.yaml). */}}
+            {{- with .Values.pprofListen }}
+            - -pprof-listen={{ . }}
+            {{- end }}
             - -log-format={{ .Values.logFormat }}
             {{- with $sg.extraArgs }}
             {{- toYaml . | nindent 12 }}
@@ -355,44 +369,56 @@ spec:
       app: {{ .Release.Name }}-servicegraph
   policyTypes: [Ingress]
   ingress:
+    # THREE rules, because these ports have three different audiences and a
+    # NetworkPolicy rule's `from` and `ports` apply TOGETHER. They used to be one
+    # rule, so `serviceGraph.ingest.allowFrom` — whose documented job is to scope
+    # who may push TRACES — silently scoped the internal shard port along with
+    # them and BROKE THE RING at this chart's own default replicas: 2. Shard 0
+    # could no longer reach shard 1, every re-shard hop failed the application's
+    # push, and half of every cross-node edge simply never formed, for a reason
+    # nothing in values.yaml mentions.
+    #
+    # 1. Health/readiness and the scrape port. Deliberately unscoped: the
+    #    kubelet's probes come from the node, and Prometheus discovery comes
+    #    from wherever it runs. Undeclared ports (pprof) stay closed.
     - ports:
-        # Health/readiness (the kubelet probes these), the scrape port when
-        # enabled, the INTERNAL receiver (reachable from the sibling shards,
-        # authenticated by the shared bearer token rather than by the network)
-        # and — when application ingest is on — the OTLP trace ports.
-        #
-        # WHAT THE TRACE PORTS EXPOSE, stated plainly: any pod that can reach
-        # them can push arbitrary OTLP spans into this cluster's traces, with no
-        # credential. Enrichment stamps the SENDER's Kubernetes identity where it
-        # can resolve one, so a forged span is attributable to the pod that sent
-        # it rather than to whatever it claims — but a sender can still emit
-        # spans naming any service.name it likes, and the cost of the volume it
-        # pushes is the tier's and the collector's. That is the same bargain
-        # every unauthenticated OTLP collector in a cluster makes; narrow it with
-        # a `from` selector below if the pod network is not trusted.
-        #
-        # Undeclared ports (pprof) stay closed.
         - port: {{ (split ":" .Values.agent.listen)._1 | int }}
         {{- if .Values.metrics.enabled }}
         - port: {{ (split ":" .Values.metrics.listen)._1 | int }}
         {{- end }}
+    # 2. The INTERNAL receiver. Its only legitimate clients are the sibling
+    #    shards, so it is scoped to this tier's own pods REGARDLESS of
+    #    allowFrom — the ring is not optional — and it is authenticated by the
+    #    shared bearer token, which is what actually guards it.
+    - ports:
         - port: {{ $port }}
-        {{- if $sg.ingest.enabled }}
+      from:
+        - podSelector:
+            matchLabels:
+              app: {{ .Release.Name }}-servicegraph
+    {{- if $sg.ingest.enabled }}
+    # 3. The application OTLP trace ports — the ones allowFrom is FOR.
+    #
+    # WHAT THEY EXPOSE, stated plainly: any pod that can reach them can push
+    # arbitrary OTLP spans into this cluster's traces, with no credential.
+    # Enrichment stamps the SENDER's Kubernetes identity where it can resolve
+    # one, so a forged span is attributable to the pod that sent it rather than
+    # to whatever it claims — but a sender can still emit spans naming any
+    # service.name it likes, and the cost of the volume it pushes is the tier's
+    # and the collector's. That is the same bargain every unauthenticated OTLP
+    # collector in a cluster makes; narrow it with allowFrom if the pod network
+    # is not trusted. EMPTY MEANS ANY POD MAY PUSH TRACES.
+    - ports:
         {{- with $sg.ingest.grpcEndpoint }}
         - port: {{ int (split ":" .)._1 }}
         {{- end }}
         {{- with $sg.ingest.httpEndpoint }}
         - port: {{ int (split ":" .)._1 }}
         {{- end }}
-        {{- end }}
       {{- with $sg.ingest.allowFrom }}
-      # Scope who may push traces. With this set the health, metrics and
-      # internal ports are scoped too — a NetworkPolicy rule's `from` and `ports`
-      # apply together — which is usually what an operator wants but is worth
-      # knowing: the kubelet's probes come from the node, so include a
-      # namespaceSelector/ipBlock that covers it.
       from:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+    {{- end }}
 {{- end }}
 {{- end }}

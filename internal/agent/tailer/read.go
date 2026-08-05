@@ -197,9 +197,7 @@ func (t *Tailer) readFile(ctx context.Context, f *file) error {
 	if err != nil {
 		return err
 	}
-	if !t.handleRotation(ctx, f, st, read) {
-		return nil // aborted rotation drain: retry next sweep, lastMod unstamped
-	}
+	t.handleRotation(ctx, f, st, read)
 	f.lastMod = st.ModTime()
 	return nil
 }
@@ -207,11 +205,16 @@ func (t *Tailer) readFile(ctx context.Context, f *file) error {
 // handleRotation classifies what happened to the file on disk since the last
 // read — rename rotation (new inode at the path), in-place truncation, or a
 // same-size copytruncate only the fingerprint can witness — and runs the
-// matching recovery (no-op when the identity is unchanged). It reports false
-// when a rename rotation's drain aborted (mid-drain flush failure): the
-// caller must leave lastMod unstamped so the rotation is re-detected and
-// retried next sweep.
-func (t *Tailer) handleRotation(ctx context.Context, f *file, st os.FileInfo, read int) bool {
+// matching recovery (no-op when the identity is unchanged).
+//
+// It used to report whether the rotation had been handled, so the caller could
+// leave lastMod unstamped and retry. That contract is gone: an aborted drain no
+// longer abandons the rotation (see the rename case below — reopen records the
+// un-drained inode as an open-ended segment and opens the new incarnation
+// either way), so there was nothing left to retry, the function had a single
+// `return true`, and the caller's abort branch was unreachable code described
+// by a comment that contradicted it. Returning nothing is the honest signature.
+func (t *Tailer) handleRotation(ctx context.Context, f *file, st os.FileInfo, read int) {
 	switch {
 	case inodeOf(st) != f.inode:
 		// Rename rotation: the path names a new file. Drain what the old
@@ -251,7 +254,6 @@ func (t *Tailer) handleRotation(ctx context.Context, f *file, st os.FileInfo, re
 		// or beyond our position (same-size copytruncate). Restart.
 		t.reopen(ctx, f, false, true)
 	}
-	return true
 }
 
 // ensureOpen opens the file at the committed offset on first use. The

@@ -122,9 +122,18 @@ spec:
           livenessProbe:
             httpGet: {path: /healthz, port: http}
           securityContext:
-            # Container log files under /var/log/pods are root-readable only.
+            # Container log files under /var/log/pods are root-readable only,
+            # so this one workload runs as UID 0 — but reading files needs no
+            # CAPABILITIES, and the default set (CHOWN, DAC_OVERRIDE, SETUID,
+            # NET_RAW, ...) was being carried on the one pod that is on every
+            # node in the cluster. Dropping ALL and refusing privilege
+            # escalation matches what the metadata service, the events
+            # singleton and the trace tier already set.
             runAsUser: 0
             readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
           volumeMounts:
             - name: varlog
               mountPath: /var/log

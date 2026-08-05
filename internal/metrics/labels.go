@@ -27,12 +27,56 @@ func (l labels) get(key string) (string, bool) {
 	return "", false
 }
 
+// maxLabelValueBytes bounds ONE retained label value. The cardinality cap
+// counts label COMBINATIONS, never bytes, so without this a single stream could
+// retain megabytes: log-derived label values come from the LINE (a captured
+// regex group, a JSON field, the synthetic __line__ key is the whole body), and
+// they are held for maxAge — 24h by default. Ten thousand streams each holding
+// a 1 MiB value is 10 GB inside a cap that reads as "10000 series".
+//
+// It is applied in set(), which is the one door every label value comes
+// through, so the value that is HASHED is the value that is RENDERED. Cutting
+// only the retained copy would be worse than not cutting: two long values
+// differing past the cut would hash apart and render identical, i.e. one
+// payload carrying the same label set twice. Same bound and same reasoning as
+// cumagg.MaxLabelBytes, which the two span aggregators already apply.
+const maxLabelValueBytes = 256
+
+// truncLabelValue bounds a value, cutting on a rune boundary and COPYING.
+//
+// The copy is the point. Slicing a Go string keeps its whole backing array
+// alive, so a 256-byte view of a 1 MiB log line pins the megabyte for as long
+// as the series lives — the exact leak the bound exists to prevent, arrived at
+// through the fix for it. Only the truncating branch allocates; the
+// overwhelmingly common short value is returned untouched.
+func truncLabelValue(v string) string {
+	if len(v) <= maxLabelValueBytes {
+		return v
+	}
+	end := maxLabelValueBytes
+	// Back off to the start of the rune that straddles the cut, so the value
+	// stays valid UTF-8 rather than ending in a half-encoded code point.
+	for end > 0 && v[end]&0xC0 == 0x80 {
+		end--
+	}
+	if end == 0 {
+		// The whole prefix is continuation bytes, i.e. the value was ALREADY
+		// invalid UTF-8 and has no rune boundary to back off to. Cut at the
+		// byte bound instead: nothing here can make it valid, and returning ""
+		// would DROP the label — set() treats an empty value as absent — so a
+		// series would silently lose a dimension and merge with another.
+		end = maxLabelValueBytes
+	}
+	return string([]byte(v[:end]))
+}
+
 // set appends or replaces key with value, returning the (possibly grown)
 // slice. Empty keys and values are ignored, matching label semantics.
 func (l labels) set(key, value string) labels {
 	if key == "" || value == "" {
 		return l
 	}
+	value = truncLabelValue(value)
 	for i := range l {
 		if l[i].key == key {
 			l[i].value = value

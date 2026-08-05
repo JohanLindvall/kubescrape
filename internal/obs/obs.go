@@ -152,6 +152,17 @@ var (
 	LogArchiveErrors = Registry.Counter("kubescrape_log_archive_errors_total",
 		"Compressed log files whose stream failed to decode mid-read (truncated gzip, trailing garbage). "+
 			"What decoded before the error is delivered; the remainder is unrecoverable and the archive settles.")
+	LogDrainErrors = Registry.CounterVec("kubescrape_log_drain_errors_total",
+		"Reads that failed part-way through DRAINING a file incarnation that is going away (a rotated inode, a "+
+			"compressed archive). The drain cannot be retried — the next sweep would fail identically while "+
+			"holding the fd — so the unread remainder of that incarnation is unrecoverable and lost. Distinct "+
+			"from a clean EOF, which is the drain succeeding.", "source")
+	LogPodAttrsRefused = Registry.CounterVec("kubescrape_log_pod_attrs_refused_total",
+		"Resource-attribute keys a pod's kubescrape.io/logs annotation tried to set that name RESOLVED KUBERNETES "+
+			"IDENTITY (namespace, pod, container, node) and were refused. The annotation is authoritative about the "+
+			"workload's own description, never about which object — or which tenant — the records belong to: "+
+			"k8s.namespace.name is the routing key, so honouring it let any pod redirect its logs into another "+
+			"tenant. A nonzero rate is a workload attempting it, whether by mistake or not.", "key")
 )
 
 // Scrape pipeline (agent).
@@ -251,7 +262,13 @@ var (
 // OTLP ingest (agent).
 var (
 	Ingested = Registry.CounterVec("kubescrape_ingest_resources_total",
-		"Distinct pushed identities (container id / pod uid, memoized per request) by enrichment outcome. enriched = an id resolved; peer_ip = no id, attributed by the connection's source address; peer_ip_rejected = that address resolved to the RECEIVER's own workload, so it was rewritten in flight (a proxy, a mesh sidecar, or an internal hop addressed to the application port) and nothing was attributed — anything above zero means peer-IP attribution cannot work on that path; unresolved = nothing identified the sender.", "outcome")
+		"Distinct pushed identities (container id / pod uid, memoized per request) by enrichment outcome. enriched = an id resolved; peer_ip = no id, attributed by the connection's source address; peer_ip_rejected = that address resolved to the RECEIVER's own workload, so it was rewritten in flight (a proxy, a mesh sidecar, or an internal hop addressed to the application port) and nothing was attributed — anything above zero means peer-IP attribution cannot work on that path; unresolved = nothing identified the sender; split_capped = the push named more distinct objects than one payload may inflate into (maxSplitGroups), so the remainder shares the sender's resource unenriched rather than costing one full resource copy each.", "outcome")
+	ExportRejected = Registry.CounterVec("kubescrape_export_rejected_records_total",
+		"Records the collector REJECTED inside a payload it otherwise accepted (OTLP partial_success), by signal. "+
+			"The export succeeded, so every producer advanced its offset, cursor or position past them — these are "+
+			"lost, permanently, and retrying cannot help (OTLP defines them as invalid rather than deferred). "+
+			"Any nonzero rate means telemetry is being discarded downstream; the collector's own message is on the "+
+			"accompanying warning.", "signal")
 	Routed = Registry.CounterVec("kubescrape_routed_payload_parts_total",
 		"Payload parts forwarded to a non-default routing destination.", "route", "signal")
 	TransformErrors = Registry.CounterVec("kubescrape_transform_errors_total",
@@ -531,6 +548,12 @@ func RegisterLogMetricsDrops(set *metrics.DynamicMetricSet) {
 	Registry.CounterFunc("kubescrape_log_metrics_dropped_nan_total",
 		"Log-metric observations dropped since start because the extracted value was NaN or +/-Inf (neither is representable as a sample).",
 		func() float64 { return float64(set.DroppedNaN()) })
+	Registry.CounterFunc("kubescrape_log_metrics_dropped_undelivered_total",
+		"Undelivered log-metric resources dropped because the re-offer buffer filled. Taking a snapshot is DESTRUCTIVE "+
+			"(it seals aggregation windows, zeroes idled samples and deletes expired ones), so a failed export retains "+
+			"its samples for the next one; this counts what a collector outage longer than that buffer could hold. "+
+			"These are genuinely lost observations — the only ones the retention cannot save.",
+		func() float64 { return float64(set.DroppedUndelivered()) })
 }
 
 // RegisterStoreStats exposes store sizes as gauges evaluated at export time.

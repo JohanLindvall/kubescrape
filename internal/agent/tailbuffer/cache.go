@@ -125,6 +125,34 @@ func (c *decisionCache) evict(now time.Time) {
 // compact drops the consumed prefix once it is more than half the slice, so the
 // FIFO's memory tracks the live entries rather than every decision ever made.
 func (c *decisionCache) compact() {
+	// Drop leading dead slots. head is otherwise advanced ONLY by evict, which
+	// runs only once the map is at its cap — so below the cap head stayed at 0,
+	// the `c.head == 0` guard below returned immediately, and the FIFO grew by
+	// one entry per re-decision forever. A bounded map behind an unbounded
+	// slice: every late span that re-decided a trace leaked a slot for the
+	// process' life.
+	for c.head < len(c.fifo) && c.fifo[c.head].stale {
+		c.fifo[c.head] = nil
+		c.head++
+	}
+	// A re-decided trace's dead slot is wherever it happened to sit, not
+	// necessarily at the front, so leading-drop alone does not bound it.
+	// Rebuild once the slice has drifted well past the live set — amortized
+	// O(1) per put, and the only thing that reclaims interior slots while the
+	// cache is under its cap.
+	if len(c.fifo)-c.head > 2*len(c.m)+compactFloor {
+		n := 0
+		for _, d := range c.fifo[c.head:] {
+			if !d.stale {
+				c.fifo[n] = d
+				n++
+			}
+		}
+		clear(c.fifo[n:])
+		c.fifo = c.fifo[:n]
+		c.head = 0
+		return
+	}
 	if c.head == 0 || c.head < len(c.fifo)/2 {
 		return
 	}
@@ -133,6 +161,10 @@ func (c *decisionCache) compact() {
 	c.fifo = c.fifo[:n]
 	c.head = 0
 }
+
+// compactFloor keeps the rebuild above from running on a nearly-empty cache,
+// where 2*len(m) is a handful of entries and the scan would fire constantly.
+const compactFloor = 64
 
 // len reports the entry count (for tests).
 func (c *decisionCache) len() int { return len(c.m) }

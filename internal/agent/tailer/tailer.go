@@ -451,7 +451,8 @@ func (t *Tailer) sweep(ctx context.Context, all bool) {
 	// Set lazily on the first unresolved file, so a sweep with nothing to
 	// resolve pays nothing.
 	var resolveDeadline time.Time
-	cutoff := time.Now().Add(-t.cfg.MultilineTimeout)
+	now := time.Now()
+	cutoff := now.Add(-t.cfg.MultilineTimeout)
 	for path, f := range t.files {
 		if f.gone {
 			if _, err := os.Stat(f.path); err == nil {
@@ -516,11 +517,33 @@ func (t *Tailer) sweep(ctx context.Context, all bool) {
 			t.log.Warn("reading log file", "path", path, "error", err)
 		}
 		// Age out fragment runs and multi-line groups that never completed.
+		//
+		// The cutoff is compared against the LINE's OWN timestamp (feedLine
+		// passes it to AddParsed/AddAt — the multiline package asks for the
+		// log's own clock precisely so replaying old logs still groups
+		// correctly). A wall-clock cutoff therefore does not measure "how long
+		// has this group waited for its continuation"; it measures "how far
+		// behind real time is this line". Any lag above MultilineTimeout — a
+		// backlog after a restart, a slow collector, a busy node, or simply
+		// reading a rotated file — made EVERY group instantly older than the
+		// cutoff, tearing CRI fragment runs and splitting stack traces exactly
+		// when the tailer is catching up.
+		//
+		// So while lines are still arriving, age out on the LOG's clock; once
+		// the file has been quiet for the timeout, fall back to the wall clock
+		// so a genuinely abandoned group still gets out. Live tailing is
+		// unchanged: there the two clocks agree.
+		fc := cutoff
+		if !f.lastLineTime.IsZero() && now.Sub(f.lastFed) < t.cfg.MultilineTimeout {
+			if lc := f.lastLineTime.Add(-t.cfg.MultilineTimeout); lc.Before(fc) {
+				fc = lc
+			}
+		}
 		if f.criStage != nil {
-			_ = f.criStage.FlushBefore(ctx, cutoff)
+			_ = f.criStage.FlushBefore(ctx, fc)
 		}
 		if f.traces != nil {
-			_ = f.traces.FlushBefore(ctx, cutoff)
+			_ = f.traces.FlushBefore(ctx, fc)
 		}
 		if len(t.batch) >= t.cfg.BatchSize {
 			t.flush(ctx)

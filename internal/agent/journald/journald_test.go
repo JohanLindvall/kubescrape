@@ -657,3 +657,44 @@ func TestIdentDoesNotConflateWithUnit(t *testing.T) {
 		t.Fatal("real-unit entry lost its systemd.unit resource attribute")
 	}
 }
+
+// A failed export leaves the CONVERTED payload cached (flush converts once per
+// batch, deliberately, so retries do not re-observe log metrics). stream()
+// discards the batch on every reopen; if it does not discard the cache with it,
+// the first flush after a restart exports the PREVIOUS batch and then commits
+// the NEW batch's cursor — every entry the new batch held beyond the stale
+// payload is skipped, permanently and silently.
+func TestStalePayloadIsNotReusedAfterRestart(t *testing.T) {
+	first := []rawEntry{
+		mkEntry("c01", "a.service", "one", "6"),
+		mkEntry("c02", "a.service", "two", "6"),
+	}
+	all := append(append([]rawEntry{}, first...), mkEntry("c03", "a.service", "three", "6"))
+
+	exp := &captureExporter{failures: 1} // one transient failure, then success
+	r := New(Config{Exporter: exp, FlushInterval: time.Hour, RestartBackoff: time.Millisecond})
+	// A cursor HAS been committed before, so Run's restart path applies (with
+	// none it deliberately retries the pending batch instead of reopening).
+	r.cursor = "c00"
+	ctx := context.Background()
+
+	r.open = fakeOpener(first, true)
+	_ = r.stream(ctx) // converts, export fails, cursor stays at c00
+
+	r.open = fakeOpener(all, true) // the journal grew; the reader restarts
+	_ = r.stream(ctx)
+
+	got := exp.records()
+	for _, want := range []string{"one", "two", "three"} {
+		found := false
+		for _, g := range got {
+			if g == want {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("entry %q was never exported, but the cursor advanced to %q (exported: %v)",
+				want, r.cursor, got)
+		}
+	}
+}

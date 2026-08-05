@@ -48,6 +48,7 @@ import (
 	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
+	"google.golang.org/grpc/tap"
 
 	"github.com/JohanLindvall/kubescrape/internal/agent/otlpingest"
 	"github.com/JohanLindvall/kubescrape/internal/agent/servicegraph"
@@ -327,9 +328,18 @@ func (p *pipelines) startServiceGraphIngest(ctx context.Context, owner servicegr
 		PeerIPFallback:  *ingestPeerIP,
 		PeerReject:      p.peerIsOurOwnWorkload,
 		Attrs:           p.attrBuilders.Ingest,
-		NodeInfo:        p.nodeInfo,
-		Meta:            p.meta,
-		Logger:          p.log,
+		// NodeInfo is deliberately NIL here, unlike the DaemonSet's ingest
+		// server. There, `.Node` in a resourceAttributes template is the node
+		// the sending pod runs on, because the agent only ever receives from
+		// its own node. This tier receives from the WHOLE CLUSTER, so the
+		// shard's node is not a property of the spans it is enriching — a
+		// template reading `.Node` stamped this shard's node labels onto every
+		// application span from every node, which renders perfectly and is
+		// wrong on every one. The same argument the events reader records for
+		// leaving actx.Node nil: a described object's node is the object's
+		// property, never the reader's.
+		Meta:   p.meta,
+		Logger: p.log,
 	})
 	p.ready.require(gateServiceGraphIngest)
 	srv := otlpingest.NewServer(otlpingest.ServerConfig{
@@ -556,11 +566,25 @@ type sgReceiver struct {
 // "wrong URL".
 const sgAuthRealm = `Bearer realm="kubescrape service-graph"`
 
-// sgMaxRecvBytes caps one decoded payload. The agents' own
-// -otlp-max-send-bytes splits at ~3.75 MiB, under this, so a payload that
-// trips it is a misconfigured sender rather than a big one — and this is the
-// only hard bound on what a single push can allocate here.
-const sgMaxRecvBytes = 4 << 20
+// sgMaxRecvFloor is the receive cap when the sender's split size is unknown or
+// small. It is the historical constant and matches a collector's own default.
+const sgMaxRecvFloor = 4 << 20
+
+// sgMaxRecvBytes caps one decoded payload on the internal hop.
+//
+// It must be at least what the SENDING shard will produce, and the sender is
+// another kubescrape splitting at -otlp-max-send-bytes. That flag is the
+// operator's, tuned for the COLLECTOR's receive limit — so pinning this at a
+// constant meant raising it for a collector that accepts 8 MiB silently made
+// every over-4-MiB shard-to-shard payload fail, breaking the ring for exactly
+// the large traces the raise was for. Derived from the same flag instead, with
+// the floor as a lower bound so a small or unset value cannot shrink it.
+func sgMaxRecvBytes() int {
+	if n := *otlpMaxSendBytes; n > sgMaxRecvFloor {
+		return int(n)
+	}
+	return sgMaxRecvFloor
+}
 
 // sgWarnEvery throttles the rejected-push warning: a fleet pointed at the
 // wrong token would otherwise write one line per forwarded batch — thousands a
@@ -571,7 +595,7 @@ const sgWarnEvery = 30 * time.Second
 // the caller (fatal there); a cancelled shutdown returns nil.
 func (r *sgReceiver) Run(ctx context.Context) error {
 	if r.body == nil {
-		r.body = otlpingest.NewBodyReader(sgMaxRecvBytes)
+		r.body = otlpingest.NewBodyReader(int64(sgMaxRecvBytes()))
 	}
 	if r.grpcAddr == "" && r.httpAddr == "" {
 		// A shard with no listener pairs nothing, and would report ready and
@@ -593,7 +617,22 @@ func (r *sgReceiver) Run(ctx context.Context) error {
 			// Reap connections an agent opened and abandoned (default gRPC
 			// keeps them forever), as the ingest server does.
 			grpc.KeepaliveParams(keepalive.ServerParameters{MaxConnectionIdle: 120 * time.Second}),
-			grpc.MaxRecvMsgSize(sgMaxRecvBytes),
+			grpc.MaxRecvMsgSize(sgMaxRecvBytes()),
+			// Authenticate on the HEADERS frame, BEFORE grpc-go reads the
+			// message. A UnaryInterceptor runs only after recvAndDecompress has
+			// pulled the whole thing into memory, so an unauthenticated peer
+			// could make this process allocate sgMaxRecvBytes per stream and be
+			// refused afterwards — the credential bought nothing it was there
+			// to buy. tap.Info carries the request headers (grpc/tap/tap.go),
+			// which is exactly what the check needs, and the ingest server
+			// already uses a tap for its byte budget for the same reason.
+			grpc.InTapHandle(r.authTap),
+			// A cap on concurrent streams PER CONNECTION. grpc-go's default is
+			// math.MaxUint32, so without it one authenticated connection could
+			// hold unbounded concurrent decodes; this receiver has no in-flight
+			// semaphore of its own (its senders are sibling shards, not
+			// arbitrary applications).
+			grpc.MaxConcurrentStreams(sgMaxConcurrentStreams),
 			grpc.UnaryInterceptor(r.authUnary),
 		)
 		ptraceotlp.RegisterGRPCServer(grpcSrv, &sgTraces{r: r})
@@ -660,18 +699,51 @@ func (r *sgReceiver) Run(ctx context.Context) error {
 	return runErr
 }
 
-// authUnary rejects a push that does not carry an accepted bearer token.
+// sgMaxConcurrentStreams bounds concurrent RPCs per connection on the internal
+// hop. The senders are sibling shards issuing one synchronous forward per push,
+// so this is far above the working set; it exists so a single connection cannot
+// pin an unbounded number of in-flight sgMaxRecvBytes decodes.
+const sgMaxConcurrentStreams = 64
+
+// authorized reports whether the metadata carries an accepted bearer token.
 //
 // gRPC lower-cases metadata keys and otlpexport sends `authorization: Bearer
 // <token>` (otlpexport.grpcAuth), which is the same header its HTTP arm sets —
 // one credential, two transports.
-func (r *sgReceiver) authUnary(ctx context.Context, req any, _ *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
-	md, _ := metadata.FromIncomingContext(ctx)
+func (r *sgReceiver) authorized(md metadata.MD) bool {
 	tokens := r.tokens()
 	for _, v := range md.Get("authorization") {
 		if bearer.Authorized(v, tokens) {
-			return handler(ctx, req)
+			return true
 		}
+	}
+	return false
+}
+
+// authTap rejects an unauthenticated push on the HEADERS frame, before grpc-go
+// reads (and allocates) the message. It runs in the transport's I/O goroutine
+// with its mutex held, so it must not block: a token read and a constant-time
+// compare, both of which internal/bearer already does without I/O (the file is
+// re-read on its own schedule).
+// The returned context BECOMES the stream's context (http2Server.operateHeaders
+// assigns it), so the success path must hand back the one it was given —
+// returning nil leaves the stream with no context at all.
+func (r *sgReceiver) authTap(ctx context.Context, info *tap.Info) (context.Context, error) {
+	if info != nil && r.authorized(info.Header) {
+		return ctx, nil
+	}
+	r.warnUnauthorized("grpc")
+	return nil, status.Error(codes.Unauthenticated, "missing or invalid bearer token (-service-graph-token-file)")
+}
+
+// authUnary re-checks the token after decode. The tap above is what actually
+// keeps an unauthenticated peer from spending memory; this stays as the second
+// line, so a future grpc-go that stopped running taps (they are marked
+// experimental) could not silently open the listener.
+func (r *sgReceiver) authUnary(ctx context.Context, req any, _ *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
+	md, _ := metadata.FromIncomingContext(ctx)
+	if r.authorized(md) {
+		return handler(ctx, req)
 	}
 	r.warnUnauthorized("grpc")
 	return nil, status.Error(codes.Unauthenticated, "missing or invalid bearer token (-service-graph-token-file)")

@@ -54,7 +54,35 @@ func Trunc(v string) string {
 	if len(v) <= MaxLabelBytes {
 		return v
 	}
-	return v[:MaxLabelBytes]
+	return v[:truncLen(v)]
+}
+
+// truncLen is where a value longer than MaxLabelBytes is cut: the byte bound,
+// backed off to the start of any rune straddling it.
+//
+// A blind v[:MaxLabelBytes] splits a multi-byte rune whenever the 256th byte
+// lands inside one, and the result is an invalid-UTF-8 string marshalled
+// straight into an OTLP attribute — protobuf `string` fields are defined as
+// UTF-8, so a strict collector may reject the whole payload and a lenient one
+// stores mojibake. Any non-ASCII dimension (a span name or peer.service with a
+// hostname in a non-Latin script) hits it.
+//
+// It is shared by Trunc and Retain deliberately: they must cut at EXACTLY the
+// same length, or the key and the rendered label disagree and one edge holds
+// two series that render byte-identical attribute sets.
+func truncLen(v string) int {
+	end := MaxLabelBytes
+	for end > 0 && v[end]&0xC0 == 0x80 {
+		end--
+	}
+	if end == 0 {
+		// Every byte of the prefix is a continuation byte: the value was
+		// already invalid UTF-8 and has no boundary to back off to. Cut at the
+		// byte bound rather than returning an empty label, which would blank a
+		// dimension and merge two series that differ only in it.
+		return MaxLabelBytes
+	}
+	return end
 }
 
 // Retain is Trunc for a value something KEEPS: a series' label set, or a
@@ -68,7 +96,7 @@ func Retain(v string) string {
 	if len(v) <= MaxLabelBytes {
 		return v
 	}
-	return strings.Clone(v[:MaxLabelBytes])
+	return strings.Clone(v[:truncLen(v)])
 }
 
 // AttrStr is an attribute's value as a string, or "" when it is absent.

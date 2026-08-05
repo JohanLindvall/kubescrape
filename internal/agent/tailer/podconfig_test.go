@@ -127,3 +127,90 @@ func TestPodAnnotationMultilineOverrideOnInitialPipeline(t *testing.T) {
 		t.Fatalf("multiline override not applied to initial pipeline: joined=%d count=%d", joined, count)
 	}
 }
+
+// A pod annotation is authoritative about the workload's own DESCRIPTION, never
+// about the identity the agent resolved from the API server. k8s.namespace.name
+// in particular is what internal/agent/route keys tenancy on, so an unfiltered
+// write let any user who can annotate a pod in their own namespace ship that
+// pod's logs to another tenant's endpoint (and remove them from their own).
+func TestPodAnnotationCannotForgeResolvedIdentity(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+	exp := &fakeExporter{}
+	tl := driveTailer(dir, exp)
+	tl.cfg.Metadata = annotatedMeta{annotation: `{
+		"serviceName": "checkout",
+		"attributes": {
+			"team": "payments",
+			"k8s.namespace.name": "victim-tenant",
+			"k8s.pod.name": "someone-else",
+			"k8s.node.name": "other-node",
+			"container.id": "deadbeef",
+			"service.instance.id": "forged",
+			"service.namespace": "forged-ns"
+		}
+	}`}
+
+	tl.scanDir(tl.loadCheckpoints(), true)
+	writeLog(t, dir, "2026-07-05T10:00:00Z stdout F hello")
+	tl.scanDir(nil, false)
+	driveUntil(t, ctx, tl, func() bool { return len(exp.get()) == 1 }, "one record")
+
+	var f *file
+	for _, ff := range tl.files {
+		f = ff
+	}
+	attr := func(k string) string {
+		v, _ := f.resource.Attributes().Get(k)
+		return v.Str()
+	}
+	// The descriptive keys the annotation legitimately owns still apply.
+	if got := attr("team"); got != "payments" {
+		t.Errorf("descriptive attribute lost: team=%q, want payments", got)
+	}
+	if got := attr("service.name"); got != "checkout" {
+		t.Errorf("serviceName override lost: service.name=%q, want checkout", got)
+	}
+	// The resolved identity is the agent's, and must survive verbatim.
+	for _, c := range []struct{ key, want string }{
+		{"k8s.namespace.name", "ns1"},
+		{"k8s.pod.name", "pod1"},
+		{"k8s.node.name", "node1"},
+		{"service.namespace", "ns1"},
+	} {
+		if got := attr(c.key); got != c.want {
+			t.Errorf("pod annotation forged %s=%q, want the resolved %q", c.key, got, c.want)
+		}
+	}
+	if got := attr("service.instance.id"); got == "forged" {
+		t.Error("pod annotation forged service.instance.id")
+	}
+	if got := attr("container.id"); got == "deadbeef" {
+		t.Error("pod annotation forged container.id")
+	}
+}
+
+// The per-pod rule bounds: these regexes run on the single sweep goroutine that
+// serves every log file on the node, against every record including the whole
+// raw body, and they come from an annotation any workload author controls.
+func TestPodAnnotationRuleBounds(t *testing.T) {
+	many := make([]string, 0, maxPodRules+1)
+	for i := 0; i <= maxPodRules; i++ {
+		many = append(many, `{"action":"drop","matchRegexp":["__line__=x"]}`)
+	}
+	for _, c := range []struct{ name, raw string }{
+		{"too many rules", `{"rules":[` + strings.Join(many, ",") + `]}`},
+		{"too many selectors", `{"rules":[{"action":"drop","matchRegexp":[` +
+			strings.TrimSuffix(strings.Repeat(`"__line__=x",`, maxPodSelectors+1), ",") + `]}]}`},
+		{"pattern too long", `{"rules":[{"action":"drop","matchRegexp":["__line__=` +
+			strings.Repeat("a", maxPodPatternLength+1) + `"]}]}`},
+	} {
+		if _, _, err := parsePodLogConfig(c.raw); err == nil {
+			t.Errorf("%s: accepted, want a bound error", c.name)
+		}
+	}
+	// A reasonable annotation still compiles.
+	if _, _, err := parsePodLogConfig(`{"rules":[{"action":"drop","matchRegexp":["__line__=debug"]}]}`); err != nil {
+		t.Errorf("ordinary pod rules refused: %v", err)
+	}
+}

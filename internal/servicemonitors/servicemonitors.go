@@ -22,6 +22,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
+	"strings"
 	"sync"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -165,6 +166,15 @@ type endpointSpec struct {
 		Cert               *secretOrCM `json:"cert"`
 		KeySecret          *secretRef  `json:"keySecret"`
 		ServerName         string      `json:"serverName"`
+		// Parsed only to be REPORTED. A minVersion/maxVersion is a security
+		// FLOOR an operator set deliberately, and the agent builds its per-
+		// target client from the resolved CA/cert/serverName without it — so
+		// honouring neither the field nor the reporting machinery meant a
+		// monitor that pinned TLS 1.3 was scraped over whatever the Go default
+		// negotiated, with nothing anywhere saying so. That is the one outcome
+		// Endpoint.Ignored exists to make impossible.
+		MinVersion string `json:"minVersion"`
+		MaxVersion string `json:"maxVersion"`
 		// Parsed only to be REPORTED as uninterpreted. These are the
 		// file-path arms of prometheus-operator's TLSConfig, used by every
 		// kube-prometheus-stack control-plane monitor (etcd, kube-scheduler,
@@ -300,9 +310,11 @@ func (ep endpointSpec) ignoredFields() []string {
 		add("tlsConfig.caFile", ep.TLSConfig.CAFile != "")
 		add("tlsConfig.certFile", ep.TLSConfig.CertFile != "")
 		add("tlsConfig.keyFile", ep.TLSConfig.KeyFile != "")
+		add("tlsConfig.minVersion", ep.TLSConfig.MinVersion != "")
+		add("tlsConfig.maxVersion", ep.TLSConfig.MaxVersion != "")
 	}
 	for _, r := range ep.MetricRelabelings {
-		if r.Action != "keep" && r.Action != "drop" {
+		if !isKeepDrop(r.Action) {
 			out = append(out, "metricRelabelings.action="+r.Action)
 			continue
 		}
@@ -340,7 +352,7 @@ func (ep endpointSpec) toEndpoint() Endpoint {
 		out.BearerSecret = ep.BearerTokenSecret.Name + "/" + ep.BearerTokenSecret.Key
 	}
 	for _, r := range ep.MetricRelabelings {
-		if r.Action != "keep" && r.Action != "drop" {
+		if !isKeepDrop(r.Action) {
 			continue
 		}
 		// A custom separator is reported (below) and the rule SKIPPED: the
@@ -351,12 +363,32 @@ func (ep endpointSpec) toEndpoint() Endpoint {
 			continue
 		}
 		out.MetricRelabelings = append(out.MetricRelabelings, RelabelRule{
-			Action:       r.Action,
+			// Normalized, so everything downstream compares one spelling.
+			Action:       strings.ToLower(r.Action),
 			SourceLabels: r.SourceLabels,
 			Regex:        r.Regex,
 		})
 	}
 	return out
+}
+
+// isKeepDrop reports whether a relabel action is one of the two this repo
+// interprets, in EITHER of the spellings the CRD accepts.
+//
+// prometheus-operator's RelabelConfig.action enum lists both cases explicitly —
+// `replace;Replace;keep;Keep;drop;Drop;hashmod;HashMod;…` — and the operator
+// lowercases the value when it generates scrape config, so `action: Drop` is a
+// perfectly ordinary, CRD-valid, Prometheus-honoured rule. Comparing against
+// the lowercase literals alone therefore DISCARDED it: the rule was reported as
+// an unsupported action and the series the user asked to drop were exported
+// instead — the opposite of what the CR says, with the only signal a generic
+// "field ignored" line naming an action that is in fact supported.
+func isKeepDrop(action string) bool {
+	switch strings.ToLower(action) {
+	case "keep", "drop":
+		return true
+	}
+	return false
 }
 
 // Monitor is one parsed ServiceMonitor.

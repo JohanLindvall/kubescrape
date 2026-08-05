@@ -132,6 +132,11 @@ func (t *Tailer) criEmitFunc(f *file) func(context.Context, string, string, time
 			return nil
 		}
 		st.push(logItem{start: start, end: end, when: when})
+		// The clocks the multi-line age-out needs: the newest LOG timestamp
+		// handed to the trace stage, and the wall-clock instant we handed it
+		// over. sweep compares its cutoff against the former while lines are
+		// still arriving, and falls back to the latter once they stop.
+		f.lastLineTime, f.lastFed = when, time.Now()
 		return f.traces.AddAt(ctx, key, line, when, when)
 	}
 }
@@ -223,6 +228,10 @@ func (t *Tailer) feedPlainLine(ctx context.Context, f *file, raw string, start, 
 		return
 	}
 	f.stPlain.push(logItem{start: pos{seg, start}, end: endPos, when: when})
+	// A plain file's line time IS the feed time, so the two clocks coincide and
+	// the age-out behaves exactly as before; recorded anyway so sweep needs no
+	// special case.
+	f.lastLineTime, f.lastFed = when, when
 	if err := f.traces.AddAt(ctx, plainKey, raw, when, when); err != nil {
 		t.log.Warn("log pipeline", "path", f.path, "error", err)
 	}

@@ -22,31 +22,28 @@
 # StatefulSet buys names, not storage. No ServiceAccount and no RBAC: this tier
 # reads the Kubernetes API not at all.
 #
-# Apply after deploy/kubernetes.yaml (the metadata service):
+# Apply after deploy/kubernetes.yaml (the metadata service). The Secret is
+# STEP ONE and is deliberately NOT part of this file:
 #
 #   kubectl -n monitoring create secret generic kubescrape-service-graph \
 #     --from-literal=token="$(openssl rand -hex 24)"
 #   kubectl apply -f deploy/servicegraph.yaml
 #
+# This file used to ship that Secret with a placeholder token, which made the
+# two commands above cancel each other out: the apply replaced the operator's
+# random token with a literal published in this repository. The token
+# authenticates the tier's INTERNAL hop (:4319) — a receiver reachable from
+# every pod in the cluster, whose payloads are treated as FINAL (never
+# re-enriched, never re-routed) — so anyone able to read this file could inject
+# arbitrary spans into the graph. It is now absent by construction: without the
+# Secret the StatefulSet stays Pending on the missing volume, which is a far
+# better failure than running on a known credential. Both sides re-read the file
+# periodically, so rotation needs no restart.
+#
 # -service-graph-shards must match .spec.replicas below: a larger count
 # addresses pods that do not exist, and a push whose trace hashes there FAILS
 # (the sender retries — the receiving shard holds the only copy of those spans,
 # so it must not pretend otherwise).
-apiVersion: v1
-kind: Secret
-metadata:
-  name: kubescrape-service-graph
-  namespace: monitoring
-type: Opaque
-stringData:
-  # PLACEHOLDER — replace it, or create the Secret with the command above
-  # instead of applying this object. It authenticates the tier's INTERNAL hop,
-  # whose receiver is reachable from every pod in the cluster and whose payloads
-  # are treated as final (never re-enriched, never re-routed); without
-  # -service-graph-token-file the binary refuses to open that listener. Both
-  # sides re-read the file periodically, so rotation needs no restart.
-  token: "replace-me-with-a-random-token"
----
 apiVersion: v1
 kind: Service
 metadata:

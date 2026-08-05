@@ -855,8 +855,12 @@ logScrubbing:
 
 Built-in patterns: `bearer`, `basic-auth`, `secret-kv` (api_key / secret /
 password / token / access_key key-value pairs — the key and separator are
-kept so the line stays readable), `aws-key`, `private-key` (all five =
-`defaults`), plus the opt-in-by-name `email` and `credit-card` (they redact
+kept so the line stays readable; a QUOTED value is redacted to its closing
+quote, so a passphrase containing spaces or commas does not survive as a
+tail), `aws-key`, `private-key`, `url-userinfo` (the password half of a
+`scheme://user:password@host` connection string, which reaches logs through
+dial-failure messages and config dumps where no key=value shape exists) — all
+six = `defaults` — plus the opt-in-by-name `email` and `credit-card` (they redact
 legitimate content too often to be defaults). Every built-in carries a cheap
 prefilter, so the no-match hot path is a scan or two and zero allocations —
 and `secret-kv`'s checks the assignment SHAPE, not just the keyword, because a
@@ -1762,8 +1766,14 @@ and `bearerTokenSecret` are honored (tokens are fetched by agents through
 `GET /v1/scrape-auth/{ns}/{name}/{key}`, served only when the service runs
 `-scrape-auth-secrets`), and the **keep/drop subset** of
 `metricRelabelings` (`action`, `sourceLabels`, `regex`; `__name__` = the
-metric name) is applied per sample by the agent. Other relabel actions,
-other authentication schemes and per-endpoint intervals are ignored.
+metric name — the action is matched case-insensitively, so the CRD-legal
+`Keep`/`Drop` spellings work) is applied per sample by the agent.
+Per-endpoint `interval`/`scrapeTimeout` **are** interpreted (each target is
+scheduled on its own period — see the `-servicemonitors` row above), as are
+`basicAuth` and `authorization`. Relabel actions other than keep/drop, and
+authentication schemes other than those listed, are ignored — and reported,
+never silently: they are collected into `Endpoint.Ignored`, logged once per
+monitor, and counted in `kubescrape_monitor_fields_ignored_total{kind}`.
 
 ## Helm values
 

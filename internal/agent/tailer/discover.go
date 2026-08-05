@@ -168,9 +168,6 @@ func (t *Tailer) scanDir(checkpoints map[string]checkpoint, initial bool) {
 		if listingOK {
 			t.warnedListing = false
 		}
-		// Checkpoint pruning is only safe after a listing that actually saw the
-		// files; see saveCheckpoints.
-		t.lastListingOK = listingOK
 	}()
 	for _, src := range t.sources {
 		paths, ok := src.glob()
@@ -220,6 +217,15 @@ func (t *Tailer) scanDir(checkpoints map[string]checkpoint, initial bool) {
 			}
 		}
 	}
+	// Publish THIS scan's verdict before anything can save. It used to be set
+	// in the defer above, which runs only after the body — so the
+	// saveCheckpoints below ran against the PREVIOUS scan's verdict, and a scan
+	// where one source globbed fine (setting discovered) while another failed
+	// pruned the store as though absence had been proven. That destroys the
+	// persisted offsets of every file the failed listing could not see, after
+	// which the next start treats them as history and skips them to the end —
+	// exactly the loss the flag exists to prevent (see saveCheckpoints).
+	t.lastListingOK = listingOK
 	obs.LogFiles.Set(float64(len(t.files)))
 	if discovered && t.checkpointing() {
 		// Persist immediately: until a file has a checkpoint entry, a crash

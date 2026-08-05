@@ -8,6 +8,7 @@ import (
 	"crypto/x509"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"os"
 	"strings"
@@ -28,6 +29,7 @@ import (
 	"github.com/JohanLindvall/bufpool"
 
 	"github.com/JohanLindvall/kubescrape/internal/bearer"
+	"github.com/JohanLindvall/kubescrape/internal/logdedupe"
 	"github.com/JohanLindvall/kubescrape/internal/obs"
 
 	"github.com/JohanLindvall/kubescrape/pkg/otlpsplit"
@@ -87,6 +89,11 @@ type Config struct {
 // Client exports logs and metrics to one OTLP endpoint.
 type Client struct {
 	cfg Config
+
+	// partialLog rate-limits the partial_success warning: a collector that
+	// rejects one class of record rejects it on every export, and
+	// obs.ExportRejected already carries the magnitude.
+	partialLog *logdedupe.Table
 
 	// gRPC transport.
 	conn    *grpc.ClientConn
@@ -156,6 +163,7 @@ func New(cfg Config) (*Client, error) {
 	if cfg.Protocol == "" {
 		cfg.Protocol = "grpc"
 	}
+	partialLog := logdedupe.New(8, time.Minute)
 	if cfg.RetryAttempts < 1 {
 		cfg.RetryAttempts = 1
 	}
@@ -205,7 +213,7 @@ func New(cfg Config) (*Client, error) {
 			return nil, fmt.Errorf("%s is set but endpoint %q is plain http; use https://", material, cfg.Endpoint)
 		}
 	}
-	c := &Client{cfg: cfg}
+	c := &Client{cfg: cfg, partialLog: partialLog}
 	if cfg.BearerTokenFile != "" {
 		// Not read here: a collector credential that is not yet projected must
 		// not stop the agent from starting, and every export path already
@@ -375,14 +383,27 @@ func (c *Client) sendLogsOnce(ctx context.Context, ld plog.Logs) error {
 		if err != nil {
 			return err
 		}
-		_, err = c.logs.Export(ctx, plogotlp.NewExportRequestFromLogs(ld))
+		resp, err := c.logs.Export(ctx, plogotlp.NewExportRequestFromLogs(ld))
+		if err == nil {
+			c.notePartial("logs", resp.PartialSuccess().RejectedLogRecords(), resp.PartialSuccess().ErrorMessage())
+		}
 		return err
 	}
 	body, err := plogotlp.NewExportRequestFromLogs(ld).MarshalProto()
 	if err != nil {
 		return err
 	}
-	return c.httpPost(ctx, c.logsURL, body)
+	var raw []byte
+	if err := c.httpPost(ctx, c.logsURL, body, &raw); err != nil {
+		return err
+	}
+	if len(raw) > 0 {
+		resp := plogotlp.NewExportResponse()
+		if resp.UnmarshalProto(raw) == nil {
+			c.notePartial("logs", resp.PartialSuccess().RejectedLogRecords(), resp.PartialSuccess().ErrorMessage())
+		}
+	}
+	return nil
 }
 
 // ExportTraces sends one traces payload (single attempt; the pushing sender
@@ -410,14 +431,27 @@ func (c *Client) sendTracesOnce(ctx context.Context, td ptrace.Traces) error {
 		if err != nil {
 			return err
 		}
-		_, err = c.traces.Export(ctx, ptraceotlp.NewExportRequestFromTraces(td))
+		resp, err := c.traces.Export(ctx, ptraceotlp.NewExportRequestFromTraces(td))
+		if err == nil {
+			c.notePartial("traces", resp.PartialSuccess().RejectedSpans(), resp.PartialSuccess().ErrorMessage())
+		}
 		return err
 	}
 	body, err := ptraceotlp.NewExportRequestFromTraces(td).MarshalProto()
 	if err != nil {
 		return err
 	}
-	return c.httpPost(ctx, c.tracesURL, body)
+	var raw []byte
+	if err := c.httpPost(ctx, c.tracesURL, body, &raw); err != nil {
+		return err
+	}
+	if len(raw) > 0 {
+		resp := ptraceotlp.NewExportResponse()
+		if resp.UnmarshalProto(raw) == nil {
+			c.notePartial("traces", resp.PartialSuccess().RejectedSpans(), resp.PartialSuccess().ErrorMessage())
+		}
+	}
+	return nil
 }
 
 func outcome(err error) string {
@@ -473,14 +507,27 @@ func (c *Client) sendMetricsOnce(ctx context.Context, md pmetric.Metrics) error 
 		if err != nil {
 			return err
 		}
-		_, err = c.metrics.Export(ctx, pmetricotlp.NewExportRequestFromMetrics(md))
+		resp, err := c.metrics.Export(ctx, pmetricotlp.NewExportRequestFromMetrics(md))
+		if err == nil {
+			c.notePartial("metrics", resp.PartialSuccess().RejectedDataPoints(), resp.PartialSuccess().ErrorMessage())
+		}
 		return err
 	}
 	body, err := pmetricotlp.NewExportRequestFromMetrics(md).MarshalProto()
 	if err != nil {
 		return err
 	}
-	return c.httpPost(ctx, c.metricsURL, body)
+	var raw []byte
+	if err := c.httpPost(ctx, c.metricsURL, body, &raw); err != nil {
+		return err
+	}
+	if len(raw) > 0 {
+		resp := pmetricotlp.NewExportResponse()
+		if resp.UnmarshalProto(raw) == nil {
+			c.notePartial("metrics", resp.PartialSuccess().RejectedDataPoints(), resp.PartialSuccess().ErrorMessage())
+		}
+	}
+	return nil
 }
 
 // grpcAuth attaches the bearer token as outgoing gRPC metadata.
@@ -550,7 +597,7 @@ func (p *pooledBody) release() {
 	}
 }
 
-func (c *Client) httpPost(ctx context.Context, url string, body []byte) error {
+func (c *Client) httpPost(ctx context.Context, url string, body []byte, out *[]byte) error {
 	token, err := c.bearer()
 	if err != nil {
 		return err
@@ -604,8 +651,23 @@ func (c *Client) httpPost(ctx context.Context, url string, body []byte) error {
 		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 256))
 		return &HTTPStatusError{Code: resp.StatusCode, Body: strings.TrimSpace(string(msg))}
 	}
+	// A 2xx may still carry partial_success — the protocol's channel for "I
+	// accepted the request and REJECTED n records". Discarding it made every
+	// producer treat the send as fully delivered and advance its offset,
+	// cursor or position past records the collector threw away: silent,
+	// uncounted, permanent loss. Bounded: an ExportResponse is a handful of
+	// bytes and a message.
+	if out != nil {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, maxExportRespBytes))
+		*out = b
+	}
 	return nil
 }
+
+// maxExportRespBytes bounds the success body read for partial_success. The
+// response is a rejected count and an error string; anything larger is a
+// collector misbehaving and is not worth the allocation.
+const maxExportRespBytes = 16 << 10
 
 // HTTPStatusError is a non-2xx response from the OTLP/HTTP collector, typed so
 // callers (the buffered drain, the ingest receiver) can classify permanent
@@ -617,4 +679,32 @@ type HTTPStatusError struct {
 
 func (e *HTTPStatusError) Error() string {
 	return fmt.Sprintf("status %d: %s", e.Code, e.Body)
+}
+
+// notePartial reports an OTLP partial_success: the collector ACCEPTED the
+// request and rejected n records within it.
+//
+// It cannot fail the export. partial_success means the rest landed, and OTLP
+// defines the rejected records as invalid rather than deferred — a retry
+// re-sends the whole payload and the collector rejects the same records again,
+// so treating it as failure would duplicate everything that succeeded. So the
+// honest handling is the same one the tailer's permanent-rejection path uses:
+// let the producer advance, and COUNT the loss so it is never silent. It used
+// to be discarded entirely on both transports, which made every producer report
+// full delivery for a payload the collector had partly thrown away.
+func (c *Client) notePartial(signal string, rejected int64, msg string) {
+	if rejected <= 0 && msg == "" {
+		return
+	}
+	if rejected > 0 {
+		obs.ExportRejected.WithLabelValues(signal).Add(float64(rejected))
+	}
+	// Rate-limited: a collector rejecting a class of record does so on every
+	// export, and the counter carries the magnitude. The Client has no logger
+	// of its own (it is constructed from Config alone), so this uses the
+	// process default, as the rest of the package's diagnostics do.
+	if allow, _ := c.partialLog.Allow(signal); allow {
+		slog.Default().Warn("the collector accepted the payload but rejected records within it (partial_success)",
+			"signal", signal, "rejected", rejected, "collector_message", msg)
+	}
 }

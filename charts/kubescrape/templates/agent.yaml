@@ -253,8 +253,15 @@ spec:
                 fieldRef:
                   fieldPath: status.hostIP
           securityContext:
+            # UID 0 because container log files under /var/log/pods are
+            # root-readable only. Reading them needs no CAPABILITIES, though,
+            # and the default set was being carried on the one workload that
+            # runs on every node — the siblings all drop ALL already.
             runAsUser: 0
             readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
           ports:
             - name: http
               containerPort: {{ (split ":" .Values.agent.listen)._1 | int }}

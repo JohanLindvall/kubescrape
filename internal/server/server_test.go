@@ -2,6 +2,7 @@ package server
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -579,4 +580,31 @@ func TestNoPrometheusExpositionEndpoint(t *testing.T) {
 	if resp.StatusCode != http.StatusNotFound {
 		t.Fatalf("GET /metrics = %d, want 404: the Prometheus endpoint was removed", resp.StatusCode)
 	}
+}
+
+// addTargetPod adds one more scrapeable pod on node1, with several annotated
+// ports so a node's target list is long enough for map-iteration order to show
+// up if the response were not sorted before hashing.
+func addTargetPod(st *store.Store, i int) {
+	name := fmt.Sprintf("api-%d", i)
+	st.UpsertPod(&corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            name,
+			Namespace:       "default",
+			UID:             types.UID(fmt.Sprintf("uid-%d", i)),
+			ResourceVersion: "1",
+			Annotations: map[string]string{
+				"prometheus.io/scrape": "true",
+				"prometheus.io/port":   "9090,9100,9200",
+			},
+		},
+		Spec: corev1.PodSpec{
+			NodeName:   "node1",
+			Containers: []corev1.Container{{Name: "app", Image: "img"}},
+		},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodRunning,
+			PodIP: fmt.Sprintf("10.2.0.%d", i+1),
+		},
+	})
 }

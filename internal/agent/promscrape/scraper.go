@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	neturl "net/url"
 	"regexp"
 	"strconv"
 	"strings"
@@ -722,7 +723,38 @@ func (s *Scraper) exportHealth(ctx context.Context, outcomes []scrapeOutcome) {
 // convention shared by the scrape, health, and split-self resources.
 func (s *Scraper) fillTargetResource(res pcommon.Resource, url string, pod *kubemeta.Pod, svc *kubemeta.Service) {
 	res.Attributes().PutStr("url.full", url)
+	// The TARGET's address is its instance, exactly as in Prometheus.
+	//
+	// attrs.Identity otherwise derives service.instance.id from the pod UID,
+	// which does not distinguish two targets on ONE pod — a pod annotated with
+	// `prometheus.io/port: "8080,9100"`, or two ServiceMonitor endpoints. Both
+	// then rendered the same (job, instance), so `up`, scrape_duration_seconds
+	// and scrape_samples_scraped arrived twice with the same identity and the
+	// same timestamp and disagreeing values: a duplicate series in one payload,
+	// which a backend reads as a conflict rather than as two targets. url.full
+	// is on the resource but the OTLP→Prometheus translation makes no label of
+	// it, so it could not disambiguate anything.
+	//
+	// Identity never overwrites an instance a caller already set, so setting it
+	// here wins. WIRE-VISIBLE: series scraped from annotated pods and monitors
+	// change `instance` from the pod UID to host:port at the upgrade boundary —
+	// which is the value Prometheus itself would have used, and the reason the
+	// two targets were indistinguishable before.
+	if inst := targetInstance(url); inst != "" {
+		res.Attributes().PutStr("service.instance.id", inst)
+	}
 	s.attrsFor(pipelineTargets).Build(res, attrs.Context{Pod: pod, Service: svc, Node: s.nodeInfo()})
+}
+
+// targetInstance is the host:port of a scrape URL — Prometheus' `instance`.
+// Empty when the URL does not parse, in which case the caller leaves the
+// derivation to attrs.Identity as before.
+func targetInstance(rawURL string) string {
+	u, err := neturl.Parse(rawURL)
+	if err != nil || u.Host == "" {
+		return ""
+	}
+	return u.Host
 }
 
 // resolveContext resolves a described object's pod/container through the metadata

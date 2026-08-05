@@ -24,8 +24,13 @@ jobs:
       - name: Install libsystemd headers
         run: sudo apt-get update && sudo apt-get install -y libsystemd-dev
 
-      - run: go build ./...
-      - run: go vet ./...
+      # Through `make`, so these carry TAGS (journald,azure) — i.e. the code
+      # that actually ships. A bare `go build ./...` compiles the *_disabled.go
+      # stubs instead of the real journald and Azure pipelines, so CI was
+      # building and testing a variant nobody deploys and both optional
+      # pipelines' wiring went unbuilt on every PR.
+      - run: make build
+      - run: make vet
 
       - name: gofmt
         run: |
@@ -34,7 +39,20 @@ jobs:
             echo "not gofmt'd:"; echo "$unformatted"; exit 1
           fi
 
-      - run: go test ./...
+      - run: make test
+
+      # The build-tag guard: no cgo without journald, no franz-go without
+      # azure. The Makefile calls it "cheap enough for CI" and CI did not run
+      # it, so a stray untagged import in cmd/kubescrape-agent could re-link
+      # libsystemd or franz-go into every variant — including the static image
+      # whose entire purpose is not having them — with nothing to catch it.
+      - run: make verify-tags
+
+      # The tag-less variant still has to compile and pass: it is what a bare
+      # `go build` produces, and its stubs must stay in step with the real
+      # implementations they replace.
+      - name: build and test with no optional pipelines
+        run: make build test TAGS=
 
       # docs/METRICS.md is generated from the registrations; this fails if a
       # metric was added or renamed without regenerating it.

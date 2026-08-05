@@ -268,9 +268,15 @@ manifests, plus `-scrape-auth-token-file` — the bearer token agents present
 on `/v1/scrape-auth`, which the chart generates and mounts on both sides when
 `service.scrapeAuthSecrets` is set), and the keep/drop subset of
 `metricRelabelings` is applied per
-sample by the agent. Other relabel actions, other authentication schemes and
-per-endpoint interval overrides are still **not** interpreted — convert
-those monitors to annotated Services or metrics-config rules.
+sample by the agent (the action is matched case-insensitively, so `Keep`/`Drop`
+work as well as `keep`/`drop`). Per-endpoint `interval`/`scrapeTimeout`
+overrides **are** interpreted — each target is scheduled on its own period —
+so those monitors need no conversion. Relabel actions other than keep/drop, and
+authentication schemes beyond `basicAuth`/`authorization`/`bearerTokenSecret`,
+are still not interpreted: convert those monitors to annotated Services or
+metrics-config rules. Nothing is dropped silently — an uninterpreted field is
+logged once per monitor and counted in
+`kubescrape_monitor_fields_ignored_total{kind}`.
 
 ### `loki.source.journal`
 
@@ -345,7 +351,12 @@ the same config), `keepErrors`/`keepSlowerThan` guard rails and a
 spans/second cap. `-ingest-span-metrics` is the spanmetrics-connector
 counterpart (same `traces.span.metrics.*` naming), derived ahead of the
 sampler so RED metrics keep full coverage. Cross-node **tail** sampling
-(whole-trace decisions on buffered traces) still needs a central collector.
+(whole-trace decisions on buffered traces) is the `tailSampling` config
+section on the `-service-graph` trace tier: the shard buffers a trace's spans
+until `decisionWait` elapses and then exports or discards it whole. Note the
+one delivery caveat, spelled out in that section — a pushed span is acked
+BEFORE its trace is decided, so buffered-but-undecided spans are lost if a
+shard is hard-killed (a graceful stop flushes them).
 
 ### Per-tenant exporters (`otelcol.exporter.* + X-Scope-OrgID`)
 

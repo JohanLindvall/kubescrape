@@ -92,22 +92,37 @@ func (s *DynamicMetricSet) Export(ctx context.Context, exp Exporter, maxBytes in
 	}
 	ts := time.Now()
 	byResource, order := s.groupByResource()
+	// Re-offer whatever a previous export failed to deliver. snapshot() is
+	// DESTRUCTIVE — it seals aggregation windows, zeroes idled samples and
+	// deletes expired ones — so for those the store no longer holds the value
+	// and a failed send used to end the observation's life. (A plain cumulative
+	// series is unaffected either way: the next export re-reads its running
+	// total.) Retaining the samples is what makes this at-least-once, like
+	// every other producer in this repo.
+	order = s.mergeRetry(byResource, order)
 
 	md := pmetric.NewMetrics()
 	size := 0 // accumulated payload size, tracked incrementally (O(n) not O(n^2))
 	// firstErr keeps the first chunk failure but does NOT abort the export: the
-	// snapshot has already sealed every aggregation window and cleared the
-	// counters' initial flag, so abandoning the remaining chunks would discard
-	// data that is gone from the store either way.
+	// remaining chunks hold different resources, and failing them too would
+	// only widen the outage. Each chunk's samples are retained on ITS OWN
+	// failure (below), so nothing is lost by continuing.
 	var firstErr error
+	// chunk names the resources rendered into md since the last flush, so a
+	// failed send retains exactly those and not the ones that landed.
+	var chunk []string
 	flush := func() {
 		if md.ResourceMetrics().Len() == 0 {
 			return
 		}
-		if err := exp.ExportMetrics(ctx, md); err != nil && firstErr == nil {
-			firstErr = err
+		if err := exp.ExportMetrics(ctx, md); err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			s.retain(byResource, chunk)
 		}
 		md.ResourceMetrics().RemoveIf(func(pmetric.ResourceMetrics) bool { return true })
+		chunk = chunk[:0]
 		size = 0
 	}
 
@@ -130,10 +145,61 @@ func (s *DynamicMetricSet) Export(ctx context.Context, exp Exporter, maxBytes in
 			flush()
 		}
 		scratch.ResourceMetrics().MoveAndAppendTo(md.ResourceMetrics())
+		chunk = append(chunk, resStr)
 		size += rmSize
 	}
 	flush()
 	return firstErr
+}
+
+// maxRetainedResources bounds the undelivered snapshot held for the next
+// export. A collector outage is exactly when this fills, and holding a growing
+// pile of dead windows would turn a delivery problem into an OOM — which is the
+// failure the retention exists to avoid, arrived at from the other side. Past
+// the cap the OLDEST retained resources are dropped and counted, so the loss is
+// visible rather than silent.
+const maxRetainedResources = 4096
+
+// retain keeps a failed chunk's samples so the next Export re-offers them.
+func (s *DynamicMetricSet) retain(byResource map[string][]seriesSamples, chunk []string) {
+	if s.retryBy == nil {
+		s.retryBy = map[string][]seriesSamples{}
+	}
+	for _, resStr := range chunk {
+		ss := byResource[resStr]
+		if len(ss) == 0 {
+			continue
+		}
+		if _, ok := s.retryBy[resStr]; !ok {
+			s.retryOrder = append(s.retryOrder, resStr)
+		}
+		s.retryBy[resStr] = append(s.retryBy[resStr], ss...)
+	}
+	for len(s.retryOrder) > maxRetainedResources {
+		oldest := s.retryOrder[0]
+		s.retryOrder = s.retryOrder[1:]
+		delete(s.retryBy, oldest)
+		s.drops.addRetained(1)
+	}
+}
+
+// mergeRetry folds previously undelivered samples into this export's grouping
+// and clears the retention: whatever is not delivered NOW is retained again by
+// flush, so a repeated failure keeps re-offering rather than accumulating twice.
+func (s *DynamicMetricSet) mergeRetry(byResource map[string][]seriesSamples, order []string) []string {
+	if len(s.retryOrder) == 0 {
+		return order
+	}
+	for _, resStr := range s.retryOrder {
+		if _, ok := byResource[resStr]; !ok {
+			order = append(order, resStr)
+		}
+		// Prepended: the undelivered window is older than what the fresh
+		// snapshot just took for the same resource.
+		byResource[resStr] = append(s.retryBy[resStr], byResource[resStr]...)
+	}
+	s.retryBy, s.retryOrder = nil, nil
+	return order
 }
 
 // groupByResource snapshots each unique series and buckets its samples by the

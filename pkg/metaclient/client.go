@@ -320,6 +320,14 @@ func (c *Client) lookupEntry(key string, v any) (entry cacheEntry, cached, fresh
 func (c *Client) fetch(ctx context.Context, u, key string, entry cacheEntry, cached bool, v any) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
+		// Config.Observe is documented as called once per lookup, and every
+		// other exit from this function honours that. This one did not, so a
+		// lookup that failed before the request was even built — a malformed
+		// base URL, most likely, which fails EVERY lookup — bumped nothing:
+		// kubescrape_metadata_requests_total stayed flat while no metadata
+		// resolved at all, which is the worst possible time for the counter
+		// that exists to show exactly that.
+		c.observe(OutcomeError)
 		return err
 	}
 	// Revalidate a stale-but-present entry cheaply.

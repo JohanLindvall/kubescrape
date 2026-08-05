@@ -278,11 +278,24 @@ type DynamicMetricSet struct {
 	drops drops
 	// Count is the number of configured rules.
 	Count int
+	// retryBy/retryOrder hold a previous export's UNDELIVERED samples, keyed by
+	// resource, so the next Export re-offers them. snapshot() is destructive —
+	// it seals aggregation windows, zeroes idled samples and deletes expired
+	// ones — so without this a failed send ended those observations' lives.
+	// Bounded by maxRetainedResources. Touched only from Export, which the
+	// agent runs from one goroutine.
+	retryBy    map[string][]seriesSamples
+	retryOrder []string
 }
 
 // DroppedCapped counts observations this set rejected because a metric's
 // label-set cardinality cap was reached.
 func (s *DynamicMetricSet) DroppedCapped() uint64 { return s.drops.Capped() }
+
+// DroppedUndelivered counts undelivered resources dropped because the re-offer
+// buffer filled (see maxRetainedResources). Unlike a failed export, which is
+// retried, these observations are gone.
+func (s *DynamicMetricSet) DroppedUndelivered() uint64 { return s.drops.Retained() }
 
 // DroppedCappedByMetric reports this set's cap-refused observations per metric
 // name — the only form an operator can act on, since the cap frees slots only

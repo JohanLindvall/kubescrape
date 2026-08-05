@@ -21,10 +21,12 @@ import (
 	"go.opentelemetry.io/collector/pdata/pmetric/pmetricotlp"
 	"go.opentelemetry.io/collector/pdata/ptrace"
 	"go.opentelemetry.io/collector/pdata/ptrace/ptraceotlp"
+	"google.golang.org/genproto/googleapis/rpc/errdetails"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/durationpb"
 )
 
 type captureExporter struct {
@@ -348,6 +350,18 @@ func TestServerGRPC(t *testing.T) {
 
 // A gaugeMetrics helper lives in enrich_test.go; these tests reuse it.
 
+// retryInfoStatus builds the one shape of ResourceExhausted that a conformant
+// OTLP sender retries: the code plus a RetryInfo detail.
+func retryInfoStatus(c codes.Code, msg string) error {
+	st, err := status.New(c, msg).WithDetails(&errdetails.RetryInfo{
+		RetryDelay: durationpb.New(time.Second),
+	})
+	if err != nil {
+		panic(err)
+	}
+	return st.Err()
+}
+
 // grpcForwardStatus must return retryable codes for transient forwarding
 // failures and permanent codes only for definitive upstream rejections.
 func TestGRPCForwardStatus(t *testing.T) {
@@ -364,7 +378,26 @@ func TestGRPCForwardStatus(t *testing.T) {
 		{&otlpexport.HTTPStatusError{Code: 401, Body: "unauthorized"}, codes.Unavailable},
 		{&otlpexport.HTTPStatusError{Code: 404, Body: "not here"}, codes.Unavailable},
 		{context.DeadlineExceeded, codes.Unavailable},
-		{status.Error(codes.ResourceExhausted, "too large"), codes.ResourceExhausted}, // upstream status passes through
+		// An upstream status is preserved only when the SENDER will also read
+		// it as retryable. A bare ResourceExhausted is not: OTLP makes it
+		// retryable only with RetryInfo, and without that both the OTel SDK and
+		// the Collector DROP the batch — so relaying it verbatim (which this
+		// used to do, because the pass-through ran before IsPermanent) turned
+		// upstream back-pressure into silent data loss at the application.
+		{status.Error(codes.ResourceExhausted, "too large"), codes.Unavailable},
+		// With RetryInfo attached it is genuinely retryable, and the more
+		// specific upstream code is worth keeping.
+		{retryInfoStatus(codes.ResourceExhausted, "too large"), codes.ResourceExhausted},
+		// Codes the OTLP spec lists as retryable pass through unchanged.
+		{status.Error(codes.Unavailable, "collector restarting"), codes.Unavailable},
+		{status.Error(codes.Aborted, "conflict"), codes.Aborted},
+		// Codes a sender treats as PERMANENT must not reach it when our own
+		// classifier calls the condition transient: an upstream auth window is
+		// exactly the case IsPermanent deliberately calls retryable, and the
+		// HTTP arm of this receiver answers 503 for it.
+		{status.Error(codes.Unauthenticated, "token rotating"), codes.Unavailable},
+		{status.Error(codes.PermissionDenied, "denied"), codes.Unavailable},
+		{status.Error(codes.Internal, "upstream bug"), codes.Unavailable},
 	}
 	for _, c := range cases {
 		got := status.Code(grpcForwardStatus(c.err))

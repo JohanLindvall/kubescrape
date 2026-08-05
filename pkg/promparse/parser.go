@@ -819,6 +819,28 @@ func (p *Parser) parseExemplar(rest []byte) (*Exemplar, bool) {
 	return &p.exemplar, true
 }
 
+// goOnlyFloatSyntax reports whether a token uses float syntax that Go accepts
+// and the Prometheus exposition format does not.
+//
+// strconv.ParseFloat has, since Go 1.13, accepted digit separators (`1_000`)
+// and hexadecimal floating-point literals (`0x1p-3`). The exposition format
+// defines neither, and Prometheus itself rejects both — so accepting them makes
+// this parser read a value where the reference implementation reads a parse
+// error, and read it as a DIFFERENT NUMBER than the text suggests to anyone
+// looking at the exposition. Rejecting keeps the two in step.
+//
+// "NaN", "+Inf" and "-Inf" are legal exposition values and are unaffected: they
+// contain neither an underscore nor an x.
+func goOnlyFloatSyntax(tok []byte) bool {
+	for i := 0; i < len(tok); i++ {
+		switch tok[i] {
+		case '_', 'x', 'X':
+			return true
+		}
+	}
+	return false
+}
+
 // parseFloatToken reads one whitespace-delimited float.
 func (p *Parser) parseFloatToken(rest []byte) (float64, []byte, bool) {
 	rest = skipSpaceTab(rest)
@@ -826,7 +848,7 @@ func (p *Parser) parseFloatToken(rest []byte) (float64, []byte, bool) {
 	for i < len(rest) && rest[i] != ' ' && rest[i] != '\t' {
 		i++
 	}
-	if i == 0 {
+	if i == 0 || goOnlyFloatSyntax(rest[:i]) {
 		return 0, nil, false
 	}
 	v, err := strconv.ParseFloat(string(rest[:i]), 64)
@@ -845,6 +867,9 @@ func (p *Parser) parseTimestampToken(rest []byte) (int64, []byte, bool) {
 		i++
 	}
 	if i == 0 {
+		return 0, nil, false
+	}
+	if goOnlyFloatSyntax(rest[:i]) {
 		return 0, nil, false
 	}
 	tok := string(rest[:i])

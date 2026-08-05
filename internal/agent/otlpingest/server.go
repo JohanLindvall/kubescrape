@@ -344,22 +344,57 @@ func (g *metricsGRPC) Export(ctx context.Context, req pmetricotlp.ExportRequest)
 	return pmetricotlp.NewExportResponse(), nil
 }
 
+// retryableStatus reports whether a sender's SDK will retry a batch that came
+// back with this status, per the OTLP specification's list.
+func retryableStatus(st *status.Status) bool {
+	switch st.Code() {
+	case codes.Canceled, codes.DeadlineExceeded, codes.Aborted,
+		codes.OutOfRange, codes.Unavailable, codes.DataLoss:
+		return true
+	case codes.ResourceExhausted:
+		// Retryable ONLY when it carries RetryInfo — the same rule this
+		// receiver honours when IT sheds a push (see exhaustedStatus). Without
+		// the detail both the OTel SDK and the Collector drop the batch, so a
+		// bare ResourceExhausted relayed verbatim is a silent data loss; it
+		// gets rewritten to Unavailable below instead.
+		for _, d := range st.Details() {
+			if _, ok := d.(*errdetails.RetryInfo); ok {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // grpcForwardStatus maps a forwarding failure onto a gRPC status the sender's
 // SDK retries correctly. A bare error would surface as codes.Unknown —
 // NON-retryable per the OTLP spec — making senders permanently drop batches on
-// transient conditions (a full disk buffer, an upstream 5xx). A status error
-// from a gRPC upstream passes through unchanged.
+// transient conditions (a full disk buffer, an upstream 5xx).
+//
+// Permanence is classified by otlpexport.IsPermanent, the single source of
+// truth, and that classification has to come FIRST. Passing an upstream status
+// through on sight — which is what this used to do — made IsPermanent dead code
+// for the DEFAULT gRPC upstream, because virtually every failure from it is a
+// status error. So an upstream Unauthenticated/PermissionDenied (a collector
+// token mid-rotation) or Internal reached the pushing application, which reads
+// all three as NON-retryable and drops the batch — while IsPermanent
+// deliberately classifies auth failures and 404 as TRANSIENT, and the HTTP arm
+// of this same receiver answered 503 for the identical error. One receiver, two
+// answers, and the wrong one lost data.
+//
+// An upstream status is still preserved where it is genuinely more informative
+// than Unavailable, but only when the sender will also read it as retryable —
+// otherwise the code is rewritten rather than relayed.
 func grpcForwardStatus(err error) error {
-	if _, ok := status.FromError(err); ok {
-		return err
-	}
-	// Permanence is classified by otlpexport.IsPermanent (the single source of
-	// truth): only definitive upstream rejections become InvalidArgument (do
-	// not retry). Everything else — diskqueue.ErrFull back-pressure, upstream 5xx,
-	// 401/403/404 windows, timeouts, unclassified failures — is Unavailable:
-	// the receiver is a proxy, and the sender retrying is the safe default.
+	// Only definitive upstream rejections become InvalidArgument (do not
+	// retry). Everything else — diskqueue.ErrFull back-pressure, upstream 5xx,
+	// 401/403/404 windows, timeouts, unclassified failures — is retryable: the
+	// receiver is a proxy, and the sender retrying is the safe default.
 	if otlpexport.IsPermanent(err) {
 		return status.Error(codes.InvalidArgument, err.Error())
+	}
+	if st, ok := status.FromError(err); ok && retryableStatus(st) {
+		return err
 	}
 	return status.Error(codes.Unavailable, err.Error())
 }

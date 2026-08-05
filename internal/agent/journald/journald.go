@@ -270,6 +270,19 @@ func (r *Reader) stream(ctx context.Context) error {
 	r.batch = r.batch[:0]
 	r.batchBytes = 0
 	r.batchCursor = ""
+	// The CONVERTED payload belongs to the batch just discarded, and must go
+	// with it. flush() converts once per batch and holds the result across
+	// export retries (see r.converted), which is right while the batch stays;
+	// but a restart re-reads those entries from the committed cursor, so the
+	// old payload now describes bytes the NEW batch will carry again. Leaving
+	// it set made the first flush after a restart export the PREVIOUS batch and
+	// then commit the NEW batch's cursor — every entry the new batch held
+	// beyond the stale payload was skipped, permanently and silently. This is
+	// the one place the pair may be cleared without a delivery: Run's
+	// no-cursor-yet branch deliberately keeps retrying r.pending INSTEAD of
+	// reopening, precisely because nothing could be re-read there.
+	r.pending = plog.NewLogs()
+	r.converted = false
 	r.lastFlush = time.Now()
 
 	// A reader goroutine bound to this source hands entries over so the flush

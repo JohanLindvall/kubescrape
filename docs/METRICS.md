@@ -87,11 +87,12 @@ is the documented alert for the non-buffered tailer.
 | `kubescrape_events_dropped_records_total` | — | Kubernetes event records lost with those batches (the magnitude of the loss the batch counter only signals). |
 | `kubescrape_events_exported_total` | — | Kubernetes event records exported (after the rules). |
 | `kubescrape_events_observed_total` | `type` | Kubernetes events received from the watch, by event type (normal, warning, other — anything else the API server reports). |
+| `kubescrape_export_rejected_records_total` | `signal` | Records the collector REJECTED inside a payload it otherwise accepted (OTLP partial_success), by signal. The export succeeded, so every producer advanced its offset, cursor or position past them — these are lost, permanently, and retrying cannot help (OTLP defines them as invalid rather than deferred). Any nonzero rate means telemetry is being discarded downstream; the collector's own message is on the accompanying warning. |
 | `kubescrape_export_requests_total` | `signal`, `outcome` | OTLP export attempts by signal and outcome. |
 | `kubescrape_http_requests_total` | `pattern`, `code` | Metadata API requests by pattern and status code. |
 | `kubescrape_informer_watch_errors_total` | `resource` | List/watch failures reported by the informers, by resource. |
 | `kubescrape_ingest_rejected_total` | — | Pushed OTLP requests refused because a receiver admission bound was reached — concurrent in-flight pushes or buffered payload bytes (retryable: 429 / ResourceExhausted). |
-| `kubescrape_ingest_resources_total` | `outcome` | Distinct pushed identities (container id / pod uid, memoized per request) by enrichment outcome. enriched = an id resolved; peer_ip = no id, attributed by the connection's source address; peer_ip_rejected = that address resolved to the RECEIVER's own workload, so it was rewritten in flight (a proxy, a mesh sidecar, or an internal hop addressed to the application port) and nothing was attributed — anything above zero means peer-IP attribution cannot work on that path; unresolved = nothing identified the sender. |
+| `kubescrape_ingest_resources_total` | `outcome` | Distinct pushed identities (container id / pod uid, memoized per request) by enrichment outcome. enriched = an id resolved; peer_ip = no id, attributed by the connection's source address; peer_ip_rejected = that address resolved to the RECEIVER's own workload, so it was rewritten in flight (a proxy, a mesh sidecar, or an internal hop addressed to the application port) and nothing was attributed — anything above zero means peer-IP attribution cannot work on that path; unresolved = nothing identified the sender; split_capped = the push named more distinct objects than one payload may inflate into (maxSplitGroups), so the remainder shares the sender's resource unenriched rather than costing one full resource copy each. |
 | `kubescrape_journal_dropped_batches_total` | — | Journal batches dropped after a permanent collector rejection (the cursor advances past them). |
 | `kubescrape_journal_dropped_records_total` | — | Journal records lost with those batches. The magnitude of the loss: a batch is up to Config.BatchSize entries. |
 | `kubescrape_journal_entries_total` | — | Journal entries exported. |
@@ -100,6 +101,7 @@ is the documented alert for the non-buffered tailer.
 | `kubescrape_leader` | — | 1 while this replica holds the cluster-singleton lease, 0 otherwise; sum != 1 means split brain or nobody leading. |
 | `kubescrape_log_archive_errors_total` | — | Compressed log files whose stream failed to decode mid-read (truncated gzip, trailing garbage). What decoded before the error is delivered; the remainder is unrecoverable and the archive settles. |
 | `kubescrape_log_bytes_total` | — | Raw log bytes read from live files and archives. Segment replays (re-reading a rotated file's owed range after a restart or rewind) are not re-counted. |
+| `kubescrape_log_drain_errors_total` | `source` | Reads that failed part-way through DRAINING a file incarnation that is going away (a rotated inode, a compressed archive). The drain cannot be retried — the next sweep would fail identically while holding the fd — so the unread remainder of that incarnation is unrecoverable and lost. Distinct from a clean EOF, which is the drain succeeding. |
 | `kubescrape_log_enriched_total` | `format` | Log records by the enrichment strategy that matched (json, logfmt, pattern, none). |
 | `kubescrape_log_entries_total` | — | Log entries exported. |
 | `kubescrape_log_export_failures_total` | — | Log batch exports that failed after retries (files rewound). |
@@ -110,8 +112,10 @@ is the documented alert for the non-buffered tailer.
 | `kubescrape_log_metrics_dropped_capped_total` | `metric` | Log-metric observations dropped because that metric's label-set cardinality cap was reached, by metric name. sum() over the label is the total. Absent until something is dropped: the label set is data-driven. |
 | `kubescrape_log_metrics_dropped_collision_total` | — | Log-metric observations dropped since start because of a series hash collision. |
 | `kubescrape_log_metrics_dropped_nan_total` | — | Log-metric observations dropped since start because the extracted value was NaN or +/-Inf (neither is representable as a sample). |
+| `kubescrape_log_metrics_dropped_undelivered_total` | — | Undelivered log-metric resources dropped because the re-offer buffer filled. Taking a snapshot is DESTRUCTIVE (it seals aggregation windows, zeroes idled samples and deletes expired ones), so a failed export retains its samples for the next one; this counts what a collector outage longer than that buffer could hold. These are genuinely lost observations — the only ones the retention cannot save. |
 | `kubescrape_log_oversized_dropped_total` | — | Unterminated lines discarded for exceeding the per-entry size bound (no newline within MaxEntryBytes+4096). |
 | `kubescrape_log_permanent_dropped_total` | — | Log records dropped after a definitive collector rejection (retrying could not succeed; offsets advanced so the pipeline survives). |
+| `kubescrape_log_pod_attrs_refused_total` | `key` | Resource-attribute keys a pod's kubescrape.io/logs annotation tried to set that name RESOLVED KUBERNETES IDENTITY (namespace, pod, container, node) and were refused. The annotation is authoritative about the workload's own description, never about which object — or which tenant — the records belong to: k8s.namespace.name is the routing key, so honouring it let any pod redirect its logs into another tenant. A nonzero rate is a workload attempting it, whether by mistake or not. |
 | `kubescrape_log_prefix_lost_total` | — | Rotated-away log segments that could not be re-read (the file was deleted or compressed before its lines were exported, and no open fd survived a restart). These lines are lost. |
 | `kubescrape_log_rate_limited_total` | `action` | Per-file line rate limit hits: lines discarded (action=drop) or reads paused (action=pause). |
 | `kubescrape_log_rotations_total` | — | Log file rotations and truncations handled. |
@@ -163,4 +167,4 @@ is the documented alert for the non-buffered tailer.
 | `kubescrape_transform_errors_total` | `signal` | Transform program invocations that failed (the batch is NOT exported; the error propagates to the producer's retry path). |
 | `kubescrape_transform_reloads_total` | `outcome` | Transforms-file reloads by outcome (applied, failed — a failed compile keeps the last good program). |
 
-102 metrics.
+106 metrics.

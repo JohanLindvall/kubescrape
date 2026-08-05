@@ -120,6 +120,13 @@ type Reader struct {
 	log *slog.Logger
 
 	batch []entry
+	// converted marks payload as the current batch's OTLP rendering, held
+	// across export retries. convert() runs the shared logchain — including
+	// the LogMetrics observation — so converting per ATTEMPT re-observed every
+	// retained record on every failed cycle. Cleared with the batch (settle)
+	// and on a stream restart, which discards the batch and re-reads it.
+	payload   plog.Logs
+	converted bool
 	// committed is the position every exported batch has reached; pending is
 	// the newest position SEEN (bookmarks included) but not yet exported.
 	committed Position
@@ -353,6 +360,11 @@ func (r *Reader) stream(ctx context.Context) error {
 		// retain them.
 		clear(r.batch)
 		r.batch = r.batch[:0]
+		// The converted payload described the batch just dropped; the watch is
+		// about to re-deliver those entries and they will convert afresh.
+		// Leaving it set would export the OLD payload and then commit the NEW
+		// batch's position — the loss journald had for the same reason.
+		r.payload, r.converted = plog.NewLogs(), false
 		r.pendingRV = "" // a bookmark from the dead stream vouches only for its own deliveries
 	}
 	w, err := r.cfg.Client.CoreV1().Events(r.cfg.Namespace).Watch(ctx, metav1.ListOptions{
@@ -544,7 +556,21 @@ func (r *Reader) flush(ctx context.Context) error {
 		r.lastFlush = time.Now()
 		return nil
 	}
-	ld := r.convert()
+	// Convert ONCE per batch, not once per export ATTEMPT. convert() runs the
+	// shared logchain, and that includes the LogMetrics observation — so a
+	// batch RETAINED across a failed cycle (a transient export failure, or a
+	// stream restart where redelivers is false) was observed again on every
+	// lap: configured counters and histograms over-counted by the number of
+	// attempts, permanently biasing cumulative series upward and showing a
+	// rate() spike during exactly the outage an operator is investigating.
+	// journald holds the converted payload for the same reason; this is that
+	// rule, in the producer that had not got it yet. settle() clears the pair
+	// with the batch, and stream()'s restart reset clears it too.
+	if !r.converted {
+		r.payload = r.convert()
+		r.converted = true
+	}
+	ld := r.payload
 	// The batch's HIGH-WATER entry, not its last one. A relist delivers the
 	// backlog in store order and each object carries its own resourceVersion,
 	// so the last entry is routinely older than one earlier in the batch —
@@ -591,6 +617,8 @@ func (r *Reader) flush(ctx context.Context) error {
 func (r *Reader) settle(newest entry) {
 	clear(r.batch)
 	r.batch = r.batch[:0]
+	// The converted payload belongs to the batch just settled.
+	r.payload, r.converted = plog.NewLogs(), false
 	if newest.rv != "" && newerRV(newest.rv, r.committed.ResourceVersion) {
 		r.committed.ResourceVersion = newest.rv
 	}

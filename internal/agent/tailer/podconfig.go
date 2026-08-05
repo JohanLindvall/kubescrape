@@ -11,6 +11,7 @@ import (
 	"fmt"
 
 	"github.com/JohanLindvall/kubescrape/internal/logline"
+	"github.com/JohanLindvall/kubescrape/internal/obs"
 )
 
 // LogAnnotation is the pod annotation carrying per-workload log config, one
@@ -40,11 +41,40 @@ type podLogConfig struct {
 	Rules []logline.LineRule `json:"rules,omitempty"`
 }
 
+// Bounds on what one pod may ask the agent to do per line. Unlike the agent's
+// own `logs.rules`, which an OPERATOR writes once for the node, these arrive
+// from a namespace-scoped annotation any workload author controls — and they
+// are evaluated on the SINGLE sweep goroutine that serves every log file on the
+// node, against every record, including the synthetic `__line__` key (the whole
+// raw body, up to MaxEntryBytes). A pod that ships fifty nested-quantifier
+// regexes therefore does not slow itself down; it stalls log collection for the
+// whole node. The bounds are far above any legitimate self-service use.
+const (
+	maxPodRules         = 16
+	maxPodSelectors     = 16
+	maxPodPatternLength = 512
+)
+
 // parsePodLogConfig parses the annotation value and compiles its rules.
 func parsePodLogConfig(raw string) (*podLogConfig, *logline.LineFilter, error) {
 	var cfg podLogConfig
 	if err := json.Unmarshal([]byte(raw), &cfg); err != nil {
 		return nil, nil, fmt.Errorf("parsing %s annotation: %w", LogAnnotation, err)
+	}
+	if n := len(cfg.Rules); n > maxPodRules {
+		return nil, nil, fmt.Errorf("%s: %d rules exceeds the per-pod maximum of %d", LogAnnotation, n, maxPodRules)
+	}
+	for i, r := range cfg.Rules {
+		if n := len(r.Match) + len(r.MatchRegexp); n > maxPodSelectors {
+			return nil, nil, fmt.Errorf("%s: rule %d has %d selectors, exceeding the per-rule maximum of %d",
+				LogAnnotation, i, n, maxPodSelectors)
+		}
+		for _, p := range r.MatchRegexp {
+			if len(p) > maxPodPatternLength {
+				return nil, nil, fmt.Errorf("%s: rule %d has a %d-byte regex, exceeding the maximum of %d",
+					LogAnnotation, i, len(p), maxPodPatternLength)
+			}
+		}
 	}
 	var rules *logline.LineFilter
 	if len(cfg.Rules) > 0 {
@@ -91,6 +121,52 @@ func (t *Tailer) applyPodConfig(f *file, annotations map[string]string) {
 		attrsMap.PutStr("service.name", cfg.ServiceName)
 	}
 	for k, v := range cfg.Attributes {
+		if reservedIdentityAttr(k) {
+			// The workload is authoritative about its own DESCRIPTION, never
+			// about its IDENTITY — see reservedIdentityAttrs.
+			obs.LogPodAttrsRefused.WithLabelValues(k).Inc()
+			t.log.Warn("refusing a pod-annotation attribute that names resolved Kubernetes identity",
+				"path", f.path, "key", k, "value", v, "annotation", LogAnnotation)
+			continue
+		}
 		attrsMap.PutStr(k, v)
 	}
+}
+
+// reservedIdentityAttrs are the resource attributes a pod annotation may NOT
+// set: the ones the agent RESOLVED from the API server, as opposed to the ones
+// the workload legitimately declares about itself.
+//
+// The distinction is a security boundary, not tidiness. `k8s.namespace.name` is
+// what internal/agent/route keys tenancy on (route.Router.match reads it
+// straight off this resource), so an unfiltered write let any user who can
+// annotate a pod in their OWN namespace — an ordinary namespace-scoped action —
+// send that pod's logs to a different tenant's endpoint under that tenant's
+// X-Scope-OrgID, and simultaneously remove them from their own. The same write
+// forged `service.name`/`service.instance.id`/`k8s.pod.name` in the backend and
+// on every log-derived metric series bound to this resource.
+//
+// The operator's own key filter cannot stand in for this: `attrs.Filter` runs
+// INSIDE `Attrs.Build`, which resolveMetadata calls BEFORE applyPodConfig, so a
+// `resourceAttributes.disable` entry is applied and then overwritten.
+//
+// `service.name` is deliberately NOT here — overriding it is the annotation's
+// documented purpose (and has its own `serviceName` field). It is descriptive:
+// it renames the workload's own series, it does not move them to another owner.
+var reservedIdentityAttrs = map[string]struct{}{
+	"k8s.namespace.name":  {},
+	"k8s.pod.name":        {},
+	"k8s.pod.uid":         {},
+	"k8s.pod.ip":          {},
+	"k8s.container.name":  {},
+	"k8s.node.name":       {},
+	"container.id":        {},
+	"container.name":      {},
+	"service.namespace":   {},
+	"service.instance.id": {},
+}
+
+func reservedIdentityAttr(k string) bool {
+	_, bad := reservedIdentityAttrs[k]
+	return bad
 }

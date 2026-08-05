@@ -64,6 +64,24 @@ func (t *Tailer) drainReader(ctx context.Context, f *file, r io.Reader, what str
 			}
 		}
 		if err != nil {
+			// EOF is the drain succeeding. Anything else is the drain ENDING
+			// EARLY on bytes that exist and cannot be read — an EIO on the
+			// rotated inode, a corrupt gzip member — and the caller is about to
+			// record this incarnation as fully fed, retiring its segment and
+			// advancing past a remainder nobody read. That is a data loss, and
+			// returning the same `true` as EOF made it an invisible one.
+			//
+			// It still returns true: the read cannot be retried into success
+			// (the next sweep would fail identically while holding the fd, a
+			// hot loop on the single sweep goroutine), so the honest handling
+			// is to give up on the remainder and SAY SO. false is reserved for
+			// "a flush failed and rewound this fd", which is genuinely
+			// retryable.
+			if !errors.Is(err, io.EOF) {
+				obs.LogDrainErrors.WithLabelValues(what).Inc()
+				t.log.Error("reading failed mid-drain; the unread remainder of this file is unrecoverable",
+					"path", f.path, "source", what, "drained", drained, "error", err)
+			}
 			return true
 		}
 	}
@@ -464,6 +482,21 @@ func (t *Tailer) replaySegment(ctx context.Context, f *file, p *segment) bool {
 		// makes).
 		return false
 	}
+	// The transient-error check comes FIRST, ahead of the open-ended
+	// completion below. It used to come after, so a non-EOF failure part-way
+	// through an OPEN-ENDED replay (to < 0, the rotation-while-down case) was
+	// read as "reached EOF": the segment was pinned at whatever had been fed so
+	// far — or retired outright when nothing had — and its unread remainder
+	// became unrecoverable, with no obs.LogPrefixLost and no warning. That is
+	// silent loss in the recovery path that exists precisely because nothing
+	// else can recover those bytes.
+	if lastErr != nil && !errors.Is(lastErr, io.EOF) {
+		// A transient read error (EIO on a failing disk, a truncated NFS
+		// handle): the range is still owed, so report the pass unfinished
+		// rather than letting segmentsFed strand it.
+		t.log.Warn("reading rotated segment", "path", path, "error", lastErr)
+		return false
+	}
 	if p.to < 0 {
 		// The open-ended replay reached EOF: pin the range so entry commits
 		// can retire the segment. Only FED bytes count (a trailing fragment,
@@ -476,13 +509,6 @@ func (t *Tailer) replaySegment(ctx context.Context, f *file, p *segment) bool {
 			f.retire(p) // nothing recoverable was fed
 		}
 		return true
-	}
-	if lastErr != nil && !errors.Is(lastErr, io.EOF) {
-		// A transient read error (EIO on a failing disk, a truncated NFS
-		// handle): the range is still owed, so report the pass unfinished
-		// rather than letting segmentsFed strand it.
-		t.log.Warn("reading rotated segment", "path", path, "error", lastErr)
-		return false
 	}
 	if remaining > 0 && errors.Is(lastErr, io.EOF) {
 		// The source ended before the owed range did: the rotated file was

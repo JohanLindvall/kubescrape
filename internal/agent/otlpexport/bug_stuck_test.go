@@ -171,3 +171,34 @@ func TestPoisonBudgetNotSpentWithoutConcurrentProgress(t *testing.T) {
 		}
 	}
 }
+
+// respondedError gates the poison-drop budget: only a collector RESPONSE counts
+// as evidence that this payload is bad, because a transport failure says
+// nothing about the payload and spending the budget during an outage destroys
+// good data. gRPC is the DEFAULT transport, and its arm of that classifier had
+// no test at all — the one existing test hard-codes the boolean it stands for.
+func TestRespondedErrorGRPCArm(t *testing.T) {
+	for _, c := range []struct {
+		name string
+		err  error
+		want bool
+	}{
+		// Back-pressure and outages: the collector may be down or shedding,
+		// which is not evidence about THIS payload.
+		{"unavailable", status.Error(codes.Unavailable, "collector restarting"), false},
+		{"deadline", status.Error(codes.DeadlineExceeded, "too slow"), false},
+		{"canceled", status.Error(codes.Canceled, "client went away"), false},
+		// Genuine responses: the collector looked at the payload and refused it.
+		{"invalid argument", status.Error(codes.InvalidArgument, "bad payload"), true},
+		{"resource exhausted", status.Error(codes.ResourceExhausted, "message too large"), true},
+		{"unimplemented", status.Error(codes.Unimplemented, "no logs service"), true},
+		{"internal", status.Error(codes.Internal, "collector bug"), true},
+		{"unauthenticated", status.Error(codes.Unauthenticated, "bad token"), true},
+		// Not a status at all: a dial failure, a DNS miss, a closed connection.
+		{"plain error", context.DeadlineExceeded, false},
+	} {
+		if got := respondedError(c.err); got != c.want {
+			t.Errorf("%s: respondedError = %v, want %v", c.name, got, c.want)
+		}
+	}
+}

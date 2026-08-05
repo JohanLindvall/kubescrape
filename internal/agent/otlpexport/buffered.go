@@ -95,6 +95,10 @@ type Buffer struct {
 	rd   *diskqueue.Reader[[]byte]
 	dir  string
 	opts diskqueue.Options
+	// kind and log let recover() report what ITS reopen cost. Set by
+	// NewBuffered, which is where the signal names live.
+	kind string
+	log  *slog.Logger
 }
 
 // marshalBytes/unmarshalBytes are the identity codec: the sink owns the pdata
@@ -189,6 +193,21 @@ func (b *Buffer) recover(prev *diskqueue.Queue[[]byte]) {
 	}
 	b.q = q
 	b.rd = q.NewReader()
+	// A reopen runs diskqueue's recovery scan again, and whatever IT drops or
+	// truncates is data no drain will ever see — exactly the loss counted at
+	// startup. It was sampled only in NewBuffered, so corruption discovered by
+	// a latched-I/O recovery (the very situation most likely to have damaged
+	// the queue) passed with the dedicated loss counter flat.
+	if b.kind != "" {
+		st := q.Stats()
+		if lost := st.LostBytes + st.ForeignBytes + st.DiscardedBytes; lost > 0 {
+			obs.BufferTruncated.WithLabelValues(b.kind).Add(float64(lost))
+			if b.log != nil {
+				b.log.Error("disk buffer lost data to damage discovered while recovering from an I/O failure",
+					"signal", b.kind, "bytes_lost", lost)
+			}
+		}
+	}
 }
 
 // queueDead reports an error that poisons the queue handle (recover applies).
@@ -227,6 +246,7 @@ func NewBuffered(inner Exporter, logBuf, metricBuf, traceBuf *Buffer, backoff ti
 		if buf == nil {
 			continue
 		}
+		buf.kind, buf.log = kind, log
 		st := buf.stats()
 		if lost := st.LostBytes + st.ForeignBytes + st.DiscardedBytes; lost > 0 {
 			obs.BufferTruncated.WithLabelValues(kind).Add(float64(lost))

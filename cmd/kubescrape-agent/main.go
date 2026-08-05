@@ -716,9 +716,19 @@ func run() error {
 	// err` below must stop and drain every started goroutine BEFORE their
 	// exporter and spools are closed under them. The normal path's inline
 	// wg.Wait makes this a no-op there.
+	//
+	// BOUNDED, like the inline join. A bare wg.Wait() here silently undid the
+	// budget on the one path where it matters: a producer wedged against a dead
+	// collector held the process past its terminationGracePeriodSeconds and was
+	// SIGKILLed anyway, having first prevented the closes below it from running.
+	// Missing the deadline costs nothing a producer owns — log offsets, the
+	// journal cursor and the events position are all re-read on the next start.
 	defer func() {
 		stop()
-		wg.Wait()
+		if !waitFor(&wg, shutdownDrain) {
+			log.Warn("producers did not stop within the shutdown budget; closing anyway",
+				"budget", shutdownDrain)
+		}
 	}()
 
 	// The sink for the metrics the agent generates ABOUT ITSELF: this pod's own
@@ -813,6 +823,23 @@ func run() error {
 
 	<-ctx.Done()
 	log.Info("shutting down")
+	// One DEADLINE for the whole shutdown sequence, rather than a fixed budget
+	// per step. Summed literals could exceed the pod's termination grace on a
+	// fully-configured trace tier — each step is individually reasonable and
+	// the total is not — after which the kubelet SIGKILLs mid-drain and the
+	// steps that had not run yet lose their data anyway. Sharing a deadline
+	// means a slow step spends the budget the later ones would have had, and
+	// nothing overruns.
+	//
+	// Anchored BEFORE the producer join below, which is part of the sequence and
+	// can itself spend shutdownDrain. Anchoring it after made the real worst
+	// case shutdownDrain + shutdownTotal = 15s + 45s = 60s, i.e. EXACTLY the
+	// terminationGracePeriodSeconds every shipped manifest sets, leaving nothing
+	// for the deferred exporter/spool closes or for the kubelet's own overhead —
+	// so the last step in the sequence, the disk-buffer drain, was the one
+	// SIGKILLed. Now the whole thing fits in shutdownTotal with the grace period
+	// to spare, which is what the constant's comment always claimed.
+	shutdownBy := time.Now().Add(shutdownTotal)
 	// BOUNDED. Everything that salvages in-memory state runs after this: the
 	// final log-metrics window (DynamicMetricSet.Run deliberately does not
 	// export on cancel, so this is its only chance), the final span-metrics
@@ -821,18 +848,10 @@ func run() error {
 	// the whole sequence past the kubelet's grace period and lose all of it to
 	// SIGKILL. Producers that miss the deadline lose nothing they own: log
 	// offsets, the journal cursor and the events position all re-read.
-	if !waitFor(&wg, shutdownDrain) {
+	if drain := min(shutdownDrain, time.Until(shutdownBy)); !waitFor(&wg, drain) {
 		log.Warn("producers did not stop within the shutdown budget; continuing with the final exports",
-			"budget", shutdownDrain)
+			"budget", drain)
 	}
-	// One DEADLINE for the whole shutdown sequence, rather than a fixed budget
-	// per step. Summed literals could exceed the pod's termination grace on a
-	// fully-configured trace tier — each step is individually reasonable and
-	// the total is not — after which the kubelet SIGKILLs mid-drain and the
-	// steps that had not run yet lose their data anyway. Sharing a deadline
-	// means a slow step spends the budget the later ones would have had, and
-	// nothing overruns.
-	shutdownBy := time.Now().Add(shutdownTotal)
 	stepBudget := func() time.Duration {
 		return max(0, min(shutdownStep, time.Until(shutdownBy)))
 	}

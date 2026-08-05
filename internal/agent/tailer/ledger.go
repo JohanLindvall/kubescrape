@@ -83,6 +83,15 @@ type file struct {
 	// lastMod is the modtime observed by the previous sweep, used to detect
 	// same-size in-place rewrites.
 	lastMod time.Time
+	// lastLineTime is the newest LOG timestamp fed from this file, and lastFed
+	// is the wall-clock instant it was fed at. The multi-line age-out compares
+	// its cutoff against a buffered group's own log timestamp, so the cutoff
+	// has to be in the same clock while lines are arriving — otherwise any lag
+	// above MultilineTimeout tears every group (see sweep). lastFed is what
+	// distinguishes "behind" from "idle": an abandoned group in a quiet file
+	// must still age out, and only the wall clock can say that.
+	lastLineTime time.Time
+	lastFed      time.Time
 
 	f         *os.File
 	readPos   int64  // fd position

@@ -32,6 +32,56 @@ const acceptProto = "application/vnd.google.protobuf;proto=io.prometheus.client.
 // maxProtoMessageBytes bounds one delimited MetricFamily message.
 const maxProtoMessageBytes = 64 << 20
 
+// protoPresizeBytes bounds what an UNVERIFIED length prefix may allocate before
+// the target has delivered a single byte of the message. See readDelimited.
+const protoPresizeBytes = 64 << 10
+
+// readDelimited reads the n-byte message body into dst, growing the buffer only
+// as the target actually produces bytes.
+//
+// The length is the TARGET's claim, and this scrape is issued to whatever a
+// pod annotation or a ServiceMonitor points at — not necessarily something the
+// cluster's operator wrote. Sizing the destination from that claim let a target
+// declare the 64 MiB cap and send nothing, allocating 64 MiB per concurrent
+// scrape for free (the scraper runs targets in parallel, so it multiplies). The
+// same reasoning, and the same shape, as otlpingest.readAllCapped and its
+// maxPresizeBytes — the ingest path fixed this for bodies it receives; a scrape
+// response is the identical hazard pointing outward.
+//
+// Growth doubles from a bounded head, so a legitimate large family still costs
+// O(log n) allocations, and the buffer is returned for reuse across messages.
+func readDelimited(r io.Reader, dst []byte, n int) ([]byte, error) {
+	start := n
+	if start > protoPresizeBytes {
+		start = protoPresizeBytes
+	}
+	if cap(dst) < start {
+		dst = make([]byte, 0, start)
+	}
+	dst = dst[:0]
+	for len(dst) < n {
+		if len(dst) == cap(dst) {
+			next := cap(dst) * 2
+			if next > n {
+				next = n
+			}
+			grown := make([]byte, len(dst), next)
+			copy(grown, dst)
+			dst = grown
+		}
+		want := cap(dst)
+		if want > n {
+			want = n
+		}
+		m, err := io.ReadFull(r, dst[len(dst):want])
+		dst = dst[:len(dst)+m]
+		if err != nil {
+			return dst, err
+		}
+	}
+	return dst, nil
+}
+
 // maxExpBuckets bounds the dense expansion of span-encoded buckets: spans
 // can declare arbitrary gaps, and a hostile exposition must not allocate
 // unbounded bucket slices.
@@ -122,12 +172,9 @@ func (s *Scraper) parseProtoAndExport(ctx context.Context, body io.Reader, cb ch
 		if n > maxProtoMessageBytes {
 			return samples, malformed + conv.malformed, fmt.Errorf("proto message of %d bytes exceeds the cap", n)
 		}
-		if cap(buf) < int(n) {
-			buf = make([]byte, n)
-		}
-		buf = buf[:n]
-		if _, rerr := io.ReadFull(br, buf); rerr != nil {
-			return samples, malformed + conv.malformed, rerr
+		var rerr2 error
+		if buf, rerr2 = readDelimited(br, buf, int(n)); rerr2 != nil {
+			return samples, malformed + conv.malformed, rerr2
 		}
 		mf.Reset()
 		if perr := proto.Unmarshal(buf, &mf); perr != nil {

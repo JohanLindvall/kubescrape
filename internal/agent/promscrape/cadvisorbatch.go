@@ -300,6 +300,21 @@ func (cb *cadvisorBatcher) fillResource(res pcommon.Resource, ident cadvisorIden
 		if ident.image != "" && (ident.container != "" || ident.containerID != "") {
 			a.PutStr("container.image.name", ident.image)
 		}
+		// service.name is otherwise obtained only as a SIDE EFFECT of attrs.Pod
+		// running inside Build, which needs resolved metadata — so an
+		// unresolved row carried no service.name at all, and the OTLP→Prometheus
+		// translation gives it no `job` label. Metadata resolution is not
+		// stable (a lookup fails, a pod is replaced by one of the same name),
+		// so the SAME series gained and lost its job label as rows resolved and
+		// stopped resolving: two different Prometheus series, flapping.
+		//
+		// attrs.ServiceName's documented fallback chain ends at the pod name,
+		// which is exactly what is known here. Build does not overwrite an
+		// attribute a caller already set, so a later successful resolution
+		// still yields the owner-derived name.
+		if ident.pod != "" {
+			a.PutStr("service.name", ident.pod)
+		}
 	}
 	cb.s.attrsFor(pipelineCadvisor).Build(res, ctx)
 }

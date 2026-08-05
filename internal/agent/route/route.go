@@ -121,6 +121,25 @@ type Route struct {
 	Endpoint string `json:"endpoint,omitempty"`
 	// Headers are extra headers for this route (e.g. X-Scope-OrgID).
 	Headers map[string]string `json:"headers,omitempty"`
+
+	// Credentials for a route that names its OWN endpoint. They are not
+	// optional decoration: a route with its own endpoint does NOT inherit the
+	// default chain's BearerTokenFile / client certificate, because those
+	// authenticate this deployment to ITS collector and a route is by
+	// definition a different destination — frequently a different tenant's,
+	// sometimes a different organization's. Inheriting them presented the
+	// default collector's credentials to whatever host the route named, which
+	// is a credential disclosure to a third party rather than a convenience.
+	//
+	// A route with no endpoint still inherits everything: it IS the default
+	// destination, reached with extra headers (the header-only tenancy case).
+	BearerTokenFile string `json:"bearerTokenFile,omitempty"`
+	ClientCertFile  string `json:"clientCertFile,omitempty"`
+	ClientKeyFile   string `json:"clientKeyFile,omitempty"`
+	CAFile          string `json:"caFile,omitempty"`
+	// Insecure allows plaintext gRPC to this route (for HTTP the scheme in
+	// Endpoint decides).
+	Insecure bool `json:"insecure,omitempty"`
 }
 
 // Exporter is a full destination (logs+metrics; traces optional via

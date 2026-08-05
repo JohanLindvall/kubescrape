@@ -286,10 +286,12 @@ func (c *converter) add(s Sample) error {
 		acc.count, acc.hasCount = uint64(s.Value), true
 	case RoleSummaryQuantile:
 		q, ok := labelFloat(s.Labels, "quantile")
-		if !ok {
-			// A summary-typed sample without a quantile label is malformed;
-			// emitting it as a gauge would claim the family name and block
-			// the family's real Summary metric (same name, other shape).
+		if !ok || !validQuantile(q) {
+			// A summary-typed sample without a usable quantile label is
+			// malformed; emitting it as a gauge would claim the family name and
+			// block the family's real Summary metric (same name, other shape).
+			// The range check is part of "usable": a `quantile` outside [0,1]
+			// is not a quantile, and OTLP has nowhere to put it.
 			c.malformed++
 			return nil
 		}
@@ -510,13 +512,33 @@ func validCount(v float64) bool {
 	return v >= 0 && v < (1<<63) && !math.IsNaN(v)
 }
 
+// labelFloat parses a numeric label value — `le` on a histogram bucket, or
+// `quantile` on a summary. Both decide where a point LANDS, so a nonsense value
+// is not a nonsense label, it is a corrupted distribution.
+//
+// strconv.ParseFloat happily returns NaN for "NaN"/"nan" and ±Inf for
+// "Inf"/"Infinity", and this was the only gate on either label. A single junk
+// row from a scraped target — which is whatever a pod annotation or a
+// ServiceMonitor points at, not necessarily anything the operator wrote —
+// therefore entered the bucket accumulator with an unorderable bound, and the
+// sort that establishes the cumulative bucket order put it wherever the
+// comparison happened to fall. +Inf is the ONE exception and is legitimate: it
+// is the histogram's mandatory overflow bucket.
 func labelFloat(labels []Label, name string) (float64, bool) {
 	v, err := strconv.ParseFloat(labelValue(labels, name), 64)
 	if err != nil {
 		return 0, false // missing label or unparseable value
 	}
+	if math.IsNaN(v) || math.IsInf(v, -1) {
+		return 0, false
+	}
 	return v, true
 }
+
+// validQuantile bounds a summary's `quantile` label to the [0,1] the Prometheus
+// exposition format defines. Outside it the value is not a quantile at all, and
+// an OTLP consumer reading `quantile: 42` has no way to render it.
+func validQuantile(q float64) bool { return q >= 0 && q <= 1 }
 
 // --- batcher emission ---
 

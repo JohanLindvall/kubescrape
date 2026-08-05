@@ -91,7 +91,12 @@ image:
 
 # Static variant: no journald, hence no cgo, hence no libsystemd — so both
 # binaries fit distroless/static instead of distroless/base + seven .so files.
-# The Azure consumer is kept (it is cgo-free); pass TAGS= to drop it too.
+# The Azure consumer is kept (it is cgo-free); pass TAGS_STATIC= to drop it too.
+#
+# TAGS_STATIC, not TAGS: this target deliberately does not read TAGS, because
+# TAGS defaults to journald,azure and journald is the whole reason the static
+# image cannot exist. The comment used to say `TAGS=`, which silently did
+# nothing and left franz-go in the image the operator was trying to slim.
 image-static:
 	docker build -f Dockerfile.static --build-arg TAGS=$(TAGS_STATIC) -t $(IMAGE):$(TAG)-static .
 

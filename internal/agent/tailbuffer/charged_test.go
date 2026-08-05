@@ -5,6 +5,8 @@ import (
 	"testing"
 	"time"
 
+	"go.opentelemetry.io/collector/pdata/pcommon"
+
 	"github.com/JohanLindvall/kubescrape/internal/agent/tailsample"
 	"github.com/JohanLindvall/kubescrape/internal/obs"
 )
@@ -136,5 +138,28 @@ func TestDecisionCacheStaysBounded(t *testing.T) {
 	}
 	if len(c.fifo) > 32 {
 		t.Fatalf("the eviction FIFO grew to %d slots for a cap of 8", len(c.fifo))
+	}
+}
+
+// The decision FIFO is a slice behind a bounded map, and only evict advanced
+// its head — which runs only once the map is at its cap. Below the cap, every
+// re-decision appended a slot and freed none, so a steady stream of late spans
+// for already-decided traces grew it without bound for the process' life.
+func TestDecisionCacheFIFODoesNotGrowUnbounded(t *testing.T) {
+	c := newDecisionCache(1024, time.Hour)
+	now := time.Now()
+	var id pcommon.TraceID
+	id[0] = 1
+	// Re-decide the SAME few traces far more often than the cap, so the map
+	// stays tiny and evict never runs.
+	for i := 0; i < 100000; i++ {
+		id[1] = byte(i % 8)
+		c.put(id, true, now)
+	}
+	if got := c.len(); got > 8 {
+		t.Fatalf("map holds %d entries, want <= 8", got)
+	}
+	if got := len(c.fifo); got > 2*c.len()+compactFloor+8 {
+		t.Errorf("fifo holds %d slots for %d live entries — it is not being compacted", got, c.len())
 	}
 }

@@ -1,6 +1,7 @@
 package logscrub
 
 import (
+	"os"
 	"strings"
 	"testing"
 )
@@ -266,4 +267,62 @@ func FuzzSecretKVPrefilterNotNarrower(f *testing.F) {
 			t.Fatalf("regex matches %q but the prefilter rejects it", line)
 		}
 	})
+}
+
+// A QUOTED secret runs to its closing quote. The value class is the UNQUOTED
+// terminator set, and applying it inside quotes redacted only the first
+// fragment — so any passphrase containing a space, comma, semicolon, ampersand
+// or closing bracket shipped its tail in clear.
+func TestSecretKVRedactsWholeQuotedValue(t *testing.T) {
+	s, err := New(Config{Builtin: []string{"defaults"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cases := []struct{ in, want string }{
+		{`password="hunter2 with spaces"`, `password="[REDACTED]"`},
+		{`{"password":"p@ss w0rd"}`, `{"password":"[REDACTED]"}`},
+		{`token='part1,part2;part3'`, `token='[REDACTED]'`},
+		{`secret="a}b"`, `secret="[REDACTED]"`},
+		{`api_key="a&b;c d]e"`, `api_key="[REDACTED]"`},
+		// The unquoted form is unchanged: it still stops at the delimiter, so
+		// the surrounding JSON/logfmt structure survives for the extractors
+		// that run after scrubbing.
+		{`password=nospaces`, `password=[REDACTED]`},
+		{`{"password":nospaces}`, `{"password":[REDACTED]}`},
+		// An empty value is not a credential and matched neither branch before.
+		{`password=""`, `password=""`},
+	}
+	for _, c := range cases {
+		if got := s.Scrub(c.in); got != c.want {
+			t.Errorf("Scrub(%q)\n got %q\nwant %q", c.in, got, c.want)
+		}
+	}
+}
+
+// defaultSet is a security control, and its documentation is part of it: an
+// operator who spells the list out instead of writing `defaults` gets exactly
+// what the docs told them the default was. url-userinfo was added to the set
+// and to none of the three places that enumerate it, so following the docs
+// silently disabled DSN-password redaction. Nothing pinned that; this does.
+func TestDefaultSetIsDocumented(t *testing.T) {
+	docs := []string{
+		"../../../README.md",
+		"../../../docs/CONFIGURATION.md",
+		"../../../CLAUDE.md",
+	}
+	for _, name := range defaultSet {
+		if _, ok := builtins[name]; !ok {
+			t.Errorf("defaultSet names %q, which is not a built-in pattern", name)
+		}
+		for _, d := range docs {
+			b, err := os.ReadFile(d)
+			if err != nil {
+				t.Fatalf("reading %s: %v", d, err)
+			}
+			if !strings.Contains(string(b), name) {
+				t.Errorf("%s does not mention the default pattern %q; an operator pinning the "+
+					"documented list would silently lose it", d, name)
+			}
+		}
+	}
 }

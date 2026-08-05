@@ -340,6 +340,14 @@ func (p *pipelines) startServiceGraphIngest(ctx context.Context, owner servicegr
 		// on the node-local DaemonSet, where the sender is a pod on the same node
 		// and the payload crosses no network to be attributed.
 		Traces: &sgEntry{resharder: resharder, owner: owner},
+		// The loop guard belongs on the RECEIVE path, above enrichment: a payload
+		// that is going to be refused must not spend a metadata lookup per
+		// resource, nor move the ingest counters, on its way to the refusal — and
+		// its peer address is a sibling shard, so what enrichment would deduce
+		// from it is wrong anyway.
+		RejectTraces: func(_ context.Context, td ptrace.Traces) error {
+			return refuseForwarded(resharder, td)
+		},
 		Ready:  p.ready.gate(gateServiceGraphIngest),
 		Logger: p.log,
 	})
@@ -353,13 +361,40 @@ func (p *pipelines) startServiceGraphIngest(ctx context.Context, owner servicegr
 	return nil
 }
 
-// sgEntry is the terminal exporter of the APPLICATION listener: it runs after
-// otlpingest.Server has enriched the payload, refuses anything that has already
-// been through the tier, re-shards the rest, and runs the owner chain over
-// whatever this shard owns.
+// msgForwardedToAppPort is the loop guard's refusal, spelled once for the
+// receive-path hook and sgEntry's own second line alike.
+const msgForwardedToAppPort = "this payload carries " + servicegraph.ForwardedMarker +
+	": it was re-sharded by another shard and addressed to the tier's APPLICATION port instead of its internal receiver (-service-graph-listen). Point serviceGraphShards at the internal port"
+
+// refuseForwarded refuses a payload that already carries the tier's re-shard
+// marker — an internal hop addressed to the application port — and counts the
+// spans it turned away. An unmarked payload returns nil, which is every
+// application push.
 //
-// Ordering is fixed by what each step needs. Enrichment happens above (inside
-// the server) because it needs the connection's source address, which only
+// PERMANENT (InvalidArgument, which otlpexport.IsPermanent classifies as
+// do-not-retry) is what turns that misconfiguration into a bounded, counted
+// failure instead of an amplification loop: accepting the payload would
+// re-shard it and send it round again on every hop, and a RETRYABLE refusal
+// would have the sending shard re-push it forever, which is the same loop at a
+// slower rate.
+//
+// r is nil on a single-shard tier; CountLoopBlocked is nil-receiver safe.
+func refuseForwarded(r *servicegraph.Resharder, td ptrace.Traces) error {
+	if !servicegraph.IsForwarded(td) {
+		return nil
+	}
+	r.CountLoopBlocked(td.SpanCount())
+	return status.Error(codes.InvalidArgument, msgForwardedToAppPort)
+}
+
+// sgEntry is the terminal exporter of the APPLICATION listener: it runs after
+// otlpingest.Server has enriched the payload, re-shards it, and runs the owner
+// chain over whatever this shard owns.
+//
+// Ordering is fixed by what each step needs. The loop guard runs on the RECEIVE
+// path, above enrichment (otlpingest.ServerConfig.RejectTraces), because a
+// refused payload must cost nothing. Enrichment happens above this too, inside
+// the server, because it needs the connection's source address, which only
 // exists on the hop the application itself opened. Re-sharding happens after
 // enrichment because the payload that crosses to a sibling must be the finished
 // one — the sibling has no way to attribute it. And the owner chain happens
@@ -371,16 +406,14 @@ type sgEntry struct {
 }
 
 func (e *sgEntry) ExportTraces(ctx context.Context, td ptrace.Traces) error {
-	if servicegraph.IsForwarded(td) {
-		// An internal hop addressed to the application port. Refusing it
-		// PERMANENTLY (InvalidArgument, which otlpexport.IsPermanent classifies as
-		// do-not-retry) is what turns that misconfiguration into a bounded,
-		// counted failure instead of an amplification loop: enriching this
-		// payload would attribute it to the sending SHARD, and re-sharding it
-		// would send it round again, on every hop, forever.
-		e.resharder.CountLoopBlocked(td.SpanCount())
-		return status.Error(codes.InvalidArgument,
-			"this payload carries "+servicegraph.ForwardedMarker+": it was re-sharded by another shard and addressed to the tier's APPLICATION port instead of its internal receiver (-service-graph-listen). Point serviceGraphShards at the internal port")
+	// The loop guard's second line, and the reason it is worth a second one:
+	// this exporter is reachable only through a receiver, but WHICH receiver —
+	// and whether that receiver was given the hook — is the caller's wiring, and
+	// a wiring that forgot it would leave the marker as no defence at all. It
+	// costs one attribute probe per push and never double-counts: with the hook
+	// in place the refusal returns before this exporter is reached.
+	if err := refuseForwarded(e.resharder, td); err != nil {
+		return err
 	}
 	local, err := e.resharder.Reshard(ctx, td) // nil-receiver safe: everything stays local
 	if err != nil {

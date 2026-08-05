@@ -677,3 +677,42 @@ func TestMalformedReportedWhenTheExportFails(t *testing.T) {
 		t.Fatalf("malformed counted = %v, want 2 (one parser line, one converter sample)", got)
 	}
 }
+
+// A broken exemplar suffix costs the sample nothing, so it must not move the
+// data-loss signal — and it must move SOMETHING, or a target emitting invalid
+// exemplars is indistinguishable from one emitting none. Requesting exemplars
+// is also what decides whether anything is looked at: with the flag off the
+// suffix is not parsed and neither counter moves.
+func TestMalformedExemplarsCountedApartFromMalformedSamples(t *testing.T) {
+	// OpenMetrics, since exemplars are only parsed there.
+	body := "ok_metric 1 # {trace_id=\"abc\"} 0.5\n" +
+		"broken_metric 2 # {trace_id=\"abc\"} notafloat\n" +
+		"# EOF\n"
+
+	for _, withExemplars := range []bool{true, false} {
+		exp := &captureExporter{}
+		s := New(Config{Node: "n1", Interval: time.Minute, Exporter: exp, StartTime: time.Now()})
+		beforeEx := obs.ScrapeExemplarsMalformed.WithLabelValues(pipelineTargets).Value()
+		beforeMalformed := obs.ScrapeMalformed.WithLabelValues(pipelineTargets).Value()
+
+		cb := newBatcher(func(pcommon.Resource) {}, time.Now(), time.Now())
+		samples, err := s.parseAndExport(context.Background(), strings.NewReader(body), true, withExemplars, cb, pipelineTargets, "t")
+		if err != nil {
+			t.Fatalf("exemplars=%v: %v", withExemplars, err)
+		}
+		if samples != 2 || exp.points() != 2 {
+			t.Fatalf("exemplars=%v: parsed %d samples, exported %d points, want 2 and 2 — the sample must survive its exemplar",
+				withExemplars, samples, exp.points())
+		}
+		if got := obs.ScrapeMalformed.WithLabelValues(pipelineTargets).Value() - beforeMalformed; got != 0 {
+			t.Fatalf("exemplars=%v: malformed samples counted = %v, want 0 — nothing was dropped", withExemplars, got)
+		}
+		want := float64(1)
+		if !withExemplars {
+			want = 0
+		}
+		if got := obs.ScrapeExemplarsMalformed.WithLabelValues(pipelineTargets).Value() - beforeEx; got != want {
+			t.Fatalf("exemplars=%v: malformed exemplars counted = %v, want %v", withExemplars, got, want)
+		}
+	}
+}

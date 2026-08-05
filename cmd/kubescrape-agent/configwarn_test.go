@@ -3,7 +3,6 @@ package main
 import (
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/JohanLindvall/kubescrape/internal/agent/tailbuffer"
 	"github.com/JohanLindvall/kubescrape/internal/agent/tailsample"
@@ -82,44 +81,42 @@ func TestEitherSamplerAloneIsSilent(t *testing.T) {
 	}
 }
 
-// A bound its consumer normalises rather than refuses is invisible otherwise:
-// the scraper substitutes its own timeout and the tailer lifts the token bucket
-// to the smallest one that can grant, so the process runs — doing something
-// other than what the flags read like, with nothing saying so. -check-config
-// and every start emit these from the same list.
-func TestNormalisedFlagValuesWarn(t *testing.T) {
-	defer func(to time.Duration, limit, burst float64) {
-		*scrapeTimeout, *logsRateLimit, *logsRateBurst = to, limit, burst
-	}(*scrapeTimeout, *logsRateLimit, *logsRateBurst)
+// The one bound still NORMALISED rather than refused: a token bucket DERIVED
+// from a sub-0.5 -logs-rate-limit. The operator typed the rate and gets the
+// rate — only the bucket they did not type moves — so it is named rather than
+// refused, and everything TYPED is refused instead
+// (TestValidateConfigRefusesTypedFlagNonsense). A silent lift would leave the
+// flags reading like one thing and the process doing another.
+func TestDerivedRateBurstWarns(t *testing.T) {
+	defer func(limit, burst float64) {
+		*logsRateLimit, *logsRateBurst = limit, burst
+	}(*logsRateLimit, *logsRateBurst)
 
+	*logsRateLimit, *logsRateBurst = 0.2, 0
+	got := warnText(agentConfig{})
+	for _, want := range []string{"-logs-rate-limit=0.2", "bucket of 0.4", "raises the bucket to 1"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("warning %q does not name %s", got, want)
+		}
+	}
+
+	// Silent shapes, or the warning becomes noise an operator learns to skip:
+	// rate limiting off, a rate whose derived bucket already holds a token, and
+	// a bucket the operator chose (no derivation happens at all).
 	for _, tc := range []struct {
 		name         string
-		timeout      time.Duration
 		limit, burst float64
-		want         string
 	}{
-		{"zero scrape timeout", 0, 0, 0, "-scrape-timeout=0s"},
-		{"negative scrape timeout", -time.Second, 0, 0, "-scrape-timeout=-1s"},
-		{"explicit burst below one token", 15 * time.Second, 100, 0.5, "-logs-rate-burst=0.5"},
-		{"derived burst below one token", 15 * time.Second, 0.2, 0, "bucket of 0.4"},
+		{"rate limiting off", 0, 0},
+		{"usable derived bucket", 100, 0},
+		{"explicit bucket", 0.2, 4},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			*scrapeTimeout, *logsRateLimit, *logsRateBurst = tc.timeout, tc.limit, tc.burst
-			if got := warnText(agentConfig{}); !strings.Contains(got, tc.want) {
-				t.Fatalf("warning %q does not name %s", got, tc.want)
+			*logsRateLimit, *logsRateBurst = tc.limit, tc.burst
+			if got := warnText(agentConfig{}); got != "" {
+				t.Fatalf("warned: %q", got)
 			}
 		})
-	}
-
-	// The usable shapes stay silent, or the warning becomes noise: the
-	// defaults, and a rate whose derived bucket already holds a token.
-	*scrapeTimeout, *logsRateLimit, *logsRateBurst = 15*time.Second, 0, 0
-	if got := warnText(agentConfig{}); got != "" {
-		t.Fatalf("the defaults warned: %q", got)
-	}
-	*logsRateLimit, *logsRateBurst = 100, 0
-	if got := warnText(agentConfig{}); got != "" {
-		t.Fatalf("a usable rate limit warned: %q", got)
 	}
 }
 

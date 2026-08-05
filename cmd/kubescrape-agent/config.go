@@ -2,6 +2,7 @@ package main
 
 import (
 	"errors"
+	"flag"
 	"fmt"
 	"log/slog"
 	"os"
@@ -122,6 +123,68 @@ func loadAgentConfig(path string) (*agentConfig, error) {
 	return &cfg, nil
 }
 
+// flagWasSet reports whether the operator TYPED this flag, from flag.Visit's
+// record of what was Set — never from a comparison against the flag's default.
+// A default is the binary's own choice and must never trip a refusal, and a
+// default that changes later would otherwise silently start refusing configs
+// nobody edited; a value deliberately typed as the default is still a request.
+//
+// A var only for the tests: flag.Set is the one way into that record and there
+// is no way out of it, so a test typing a flag would leave every later test in
+// the package looking like an operator typed it. The real command line is
+// covered end-to-end by the -check-config child process instead.
+var flagWasSet = func(name string) bool {
+	set := false
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == name {
+			set = true
+		}
+	})
+	return set
+}
+
+// checkFlagValues refuses flag values whose only workable meaning is not the
+// one the flag reads like.
+//
+// Both are also NORMALISED by their consumers — promscrape.New defaults a
+// non-positive Timeout, tailer.New floors the effective burst at 1 — and that
+// stays: it is the LIBRARY guarantee, giving a zero value arriving
+// programmatically a defined, non-destructive meaning. This is the other
+// question, and the answer differs: what an OPERATOR TYPED. `-scrape-timeout=0`
+// is typed to mean "no timeout" and silently becomes 15s; a bucket of half a
+// token is typed as a small burst and silently becomes 1. Neither operator gets
+// what they asked for, and neither finds out from a fleet they are mid-rollout
+// on. Refusing is this repo's pattern for operator nonsense (the excluded-
+// pipeline errors above), and it puts the discovery in -check-config.
+//
+// EXPLICITLY TYPED ONLY, so the normalisation still covers everything else.
+// Neither refusal depends on whether the pipeline that reads the value is
+// enabled: a flag belongs to one workload's command line (unlike a -config
+// section, which one ConfigMap shares with three), and making the same typed
+// value legal or illegal according to an unrelated toggle is the trap the
+// composition warning below is careful not to fall into.
+func checkFlagValues() error {
+	// The value is the whole per-request context budget (Scraper.targetTimeout
+	// → context.WithTimeout), so a non-positive one expires before the request
+	// is written: every annotation-discovered target and both kubelet scrapes
+	// fail instantly with "context deadline exceeded", which is total metric
+	// loss on every node carrying the flag.
+	if flagWasSet("scrape-timeout") && *scrapeTimeout <= 0 {
+		return fmt.Errorf("-scrape-timeout=%s does not mean 'no timeout': the value IS each request's context budget, so a non-positive one expires before the request goes out and every target plus both kubelet scrapes fail with 'context deadline exceeded'. "+
+			"Pass a positive duration (the default is 15s); this flag has no spelling for 'unbounded'", *scrapeTimeout)
+	}
+	// A line costs one WHOLE token and the bucket never holds more than the
+	// burst, so a bucket below 1 can never grant. Zero is exempt because it is
+	// the documented sentinel for "derive it as 2x -logs-rate-limit" — the
+	// chart passes it verbatim on every deployment that enables rate limiting,
+	// so reading it as a bucket size would refuse the stock config.
+	if flagWasSet("logs-rate-burst") && *logsRateBurst != 0 && *logsRateBurst < 1 {
+		return fmt.Errorf("-logs-rate-burst=%g is a bucket that can never admit a line: a line spends one WHOLE token and the bucket never holds more than the burst, so pause mode stops reading every log file on this node forever (with -logs-rate-drop, every line is discarded instead). "+
+			"Pass a burst of 1 or more, or -logs-rate-burst=0 to derive it as 2x -logs-rate-limit", *logsRateBurst)
+	}
+	return nil
+}
+
 // validateConfig compiles every section of the unified config (and the
 // separate transforms file) without acquiring a single resource: no listeners,
 // no log files, no positions file, no spools, no network.
@@ -137,6 +200,13 @@ func validateConfig(cfg agentConfig, transformsFile string) error {
 	// where the flag is accepted, nothing is collected, and the only clue is a
 	// missing signal.
 	if err := checkExcludedPipelines(); err != nil {
+		return err
+	}
+	// Flag VALUES that can only be a mistake. Beside the pipeline check because
+	// both are about the command line rather than a section, and here rather
+	// than at the consumer because -check-config is the only place a fleet-wide
+	// flag mistake surfaces before the rollout does.
+	if err := checkFlagValues(); err != nil {
 		return err
 	}
 	// The OTLP transport flags. Shape-only (no dial, no file reads), but they
@@ -349,27 +419,21 @@ func compileTransforms(file string) (*transform.Program, error) {
 func configWarnings(cfg agentConfig) []string {
 	var out []string
 
-	// Flag values their consumers NORMALISE rather than refuse — a nonsense
-	// duration must not CrashLoop a fleet, so promscrape.New defaults the
-	// timeout and tailer.New floors the burst. Normalising silently is the
-	// other half of the trap, though: the operator asked for one thing and gets
-	// another, with nothing anywhere saying so. Neither is a refusal, for the
-	// reason the consumers give: the effective behaviour is defined and
-	// harmless, and refusing would fail the whole DaemonSet over a bound.
-	if *scrapeTimeout <= 0 {
-		out = append(out, fmt.Sprintf(
-			"-scrape-timeout=%s does not mean 'no timeout': a non-positive budget expires a scrape's context before the request goes out, so the scraper substitutes its own default. Set a positive duration to choose one.",
-			*scrapeTimeout))
-	}
-	if *logsRateLimit > 0 {
-		burst := *logsRateBurst
-		if burst <= 0 {
-			burst = 2 * *logsRateLimit // -logs-rate-burst=0 derives it
-		}
-		if burst < 1 {
+	// A DERIVED token bucket below one whole token. The value the operator
+	// typed is -logs-rate-limit, and it is delivered EXACTLY — the floor lifts
+	// the bucket to 1 and leaves the refill accruing at the requested rate — so
+	// nothing they asked for is discarded, which is what separates this from
+	// the typed sub-1 burst checkFlagValues refuses. Refusing here would also
+	// outlaw a legitimate throttle (0.4 lines/s is one line every 2.5s on a
+	// chatty file) and would hang its legality on the 2x derivation constant:
+	// change that to 3x and the same typed rate flips from refused to accepted,
+	// which is not a property of anything the operator wrote. So it is named
+	// rather than refused — silent normalisation is the other half of the trap.
+	if *logsRateLimit > 0 && *logsRateBurst <= 0 {
+		if burst := 2 * *logsRateLimit; burst < 1 {
 			out = append(out, fmt.Sprintf(
-				"-logs-rate-limit=%g with -logs-rate-burst=%g resolves to a bucket of %g, below the one whole token a line costs: the tailer raises it to 1 (the refill rate is unchanged), because a bucket that cannot hold a token pauses every file forever — or, with -logs-rate-drop, discards every line.",
-				*logsRateLimit, *logsRateBurst, burst))
+				"-logs-rate-limit=%g derives a token bucket of %g (-logs-rate-burst=0 means 2x the rate), below the one whole token a line costs: the tailer raises the bucket to 1 — the refill rate stays %g/s — because a bucket that cannot hold a token pauses every file forever, or with -logs-rate-drop discards every line. Set -logs-rate-burst explicitly to choose the bucket.",
+				*logsRateLimit, burst, *logsRateLimit))
 		}
 	}
 

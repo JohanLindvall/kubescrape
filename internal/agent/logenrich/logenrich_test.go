@@ -151,7 +151,9 @@ func TestApplyBodyNeverOverwrites(t *testing.T) {
 // set to anything else hands every record a time off by that zone's offset. On
 // the overwrite path that silently discarded the kernel-accurate CRI/journal
 // time in favour of a value hours away, for that workload's whole history.
-func TestImplausibleParsedTimeKeepsTheProducerTimestamp(t *testing.T) {
+// enrich reports that ambiguity (Result.TimeHasZone), so the rule is exact: a
+// wall clock never displaces a producer timestamp, and an instant always may.
+func TestZonelessParsedTimeKeepsTheProducerTimestamp(t *testing.T) {
 	ingest := time.Date(2026, 1, 2, 8, 4, 5, 0, time.UTC)
 	// America/New_York wall clock for the same instant, with no zone on it.
 	lr := newRecord()
@@ -170,48 +172,84 @@ func TestImplausibleParsedTimeKeepsTheProducerTimestamp(t *testing.T) {
 		t.Errorf("severity = %v, want info", lr.SeverityNumber())
 	}
 
-	// Everything OFF the zone grid is data, not a misread zone, and the parsed
-	// time wins: the moment the application recorded beats the moment the line
-	// was read. A displacement of hours is exactly how an archived file or a
-	// backfilled batch legitimately reads.
+	// Every zone-less shape is refused the same way whatever the displacement
+	// happens to be — including the cases the quarter-hour-grid heuristic this
+	// replaced could not see: a stamp seconds away, one a few minutes away, and
+	// a minute-precision one whose truncation puts it off any grid.
 	for _, line := range []string{
-		"2026-01-02 08:04:03 INFO handled request", // seconds apart
-		"2026-01-02 01:22:37 INFO handled request", // hours, off the quarter-hour grid
-		"2019-03-04 05:06:07 INFO handled request", // years
-		"2026-01-02 23:04:05 INFO handled request", // 15h — past the largest zone offset
+		"2026-01-02 08:04:03 INFO handled request",              // seconds apart
+		"2026-01-02 08:01:05 INFO handled request",              // three minutes
+		"2026-01-02 01:22:37 INFO handled request",              // hours, off any grid
+		"2019-03-04 05:06:07 INFO handled request",              // years
+		"2026-01-02 02:19:05 INFO handled request",              // +05:45 (Nepal)
+		"2026-01-01 18:04:05 INFO handled request",              // +14:00 (Kiribati), the largest
+		"2026/01/02 03:04:05 [info] handled request",            // slash date
+		"I0102 03:04:05.123456       1 controller.go:42] hello", // klog
+	} {
+		lr := newRecord()
+		lr.SetTimestamp(pcommon.NewTimestampFromTime(ingest))
+		before := obs.LogEnrichTimeRejected.Value()
+		Apply(lr, line)
+		if got := lr.Timestamp().AsTime(); !got.Equal(ingest) {
+			t.Errorf("line %q: timestamp = %v, want the producer's %v", line, got, ingest)
+		}
+		if got := obs.LogEnrichTimeRejected.Value() - before; got != 1 {
+			t.Errorf("line %q: rejection counted %v times, want 1", line, got)
+		}
+	}
+
+	// A timestamp that states its own offset is an instant, not a guess, and
+	// wins however far it is from the ingest time: an archived file or a
+	// backfilled batch legitimately reads hours or years old, and nothing about
+	// it is ambiguous.
+	for _, line := range []string{
+		"2019-03-04T05:06:07Z INFO handled request",           // years old, UTC
+		"2019-03-04 05:06:07.000 +02:00 [main] INFO: handled", // offset after a space
+		`{"@t":"2019-03-04T05:06:07Z","@l":"Info","@m":"x"}`,  // JSON
+		`ts=2019-03-04T05:06:07Z level=info msg=x`,            // logfmt
 	} {
 		lr := newRecord()
 		lr.SetTimestamp(pcommon.NewTimestampFromTime(ingest))
 		before := obs.LogEnrichTimeRejected.Value()
 		Apply(lr, line)
 		if got := lr.Timestamp().AsTime(); got.Equal(ingest) {
-			t.Errorf("line %q: kept the producer timestamp; the parsed one must win", line)
+			t.Errorf("line %q: kept the producer timestamp; a zoned parsed time must win", line)
 		}
 		if got := obs.LogEnrichTimeRejected.Value() - before; got != 0 {
 			t.Errorf("line %q: counted as rejected (%v)", line, got)
 		}
 	}
 
-	// Every zone offset in use is on the grid, including the quarter-hour ones.
-	for _, line := range []string{
-		"2026-01-02 02:19:05 INFO handled request", // +05:45 (Nepal)
-		"2026-01-02 13:34:05 INFO handled request", // -05:30
-		"2026-01-01 18:04:05 INFO handled request", // +14:00 (Kiribati), the largest
-	} {
-		lr := newRecord()
-		lr.SetTimestamp(pcommon.NewTimestampFromTime(ingest))
-		Apply(lr, line)
-		if got := lr.Timestamp().AsTime(); !got.Equal(ingest) {
-			t.Errorf("line %q: timestamp = %v, want the producer's %v", line, got, ingest)
-		}
+	// The zoned spelling of the very first line resolves to exactly the instant
+	// the producer stamped — which is the whole point: the zone was the missing
+	// information, not the value.
+	zoned := newRecord()
+	zoned.SetTimestamp(pcommon.NewTimestampFromTime(ingest))
+	Apply(zoned, "2026-01-02T03:04:05-05:00 INFO handled request")
+	if got := zoned.Timestamp().AsTime(); !got.Equal(ingest) {
+		t.Errorf("timestamp = %v, want %v", got, ingest)
 	}
 
-	// With NO producer timestamp there is nothing to disagree with, and the
-	// parsed time is taken whole — which is what keeps a plain (non-CRI) source,
-	// whose records carry none, reading an archive correctly.
+	// With NO producer timestamp there is nothing better to keep, and the parsed
+	// time is taken whole however old and however ambiguous — which is what keeps
+	// a plain (non-CRI) source, whose records carry none, reading an archive
+	// correctly.
 	none := newRecord()
+	before = obs.LogEnrichTimeRejected.Value()
 	Apply(none, "2019-03-04 05:06:07 INFO handled request")
 	if got := none.Timestamp().AsTime(); !got.Equal(time.Date(2019, 3, 4, 5, 6, 7, 0, time.UTC)) {
 		t.Errorf("timestamp = %v, want the parsed 2019-03-04", got)
+	}
+	if got := obs.LogEnrichTimeRejected.Value() - before; got != 0 {
+		t.Errorf("counted as rejected (%v) with no producer timestamp to keep", got)
+	}
+
+	// Same on the ingest path (ApplyBody), where the sender set no timestamp: a
+	// zone-less body stamp still fills it.
+	body := plog.NewLogRecord()
+	body.Body().SetStr("2019-03-04 05:06:07 INFO handled request")
+	ApplyBody(body)
+	if got := body.Timestamp().AsTime(); !got.Equal(time.Date(2019, 3, 4, 5, 6, 7, 0, time.UTC)) {
+		t.Errorf("ApplyBody timestamp = %v, want the parsed 2019-03-04", got)
 	}
 }

@@ -7,7 +7,6 @@ package logenrich
 import (
 	"encoding/hex"
 	"strings"
-	"time"
 
 	"github.com/JohanLindvall/enrich"
 	"go.opentelemetry.io/collector/pdata/pcommon"
@@ -64,7 +63,7 @@ func apply(lr plog.LogRecord, line string, overwrite bool) {
 	enrichedCounter(e.Format).Inc()
 
 	if !e.Time.IsZero() && (overwrite || lr.Timestamp() == 0) {
-		if plausibleTime(e.Time, lr.Timestamp()) {
+		if mayReplaceTimestamp(e.TimeHasZone, lr.Timestamp()) {
 			lr.SetTimestamp(pcommon.NewTimestampFromTime(e.Time))
 		} else {
 			obs.LogEnrichTimeRejected.Inc()
@@ -120,58 +119,44 @@ func apply(lr plog.LogRecord, line string, overwrite bool) {
 	}
 }
 
-// A parsed line timestamp REPLACES the producer's on the overwrite path, and
-// that is right: the producer's is when the line was read, the line's is when
-// the event happened. The one case where it is reliably wrong is a ZONE-LESS
-// timestamp, which enrichment must read as UTC (there is nothing else it could
-// do) — so a container running with TZ set to anything else hands every record
-// a time displaced by exactly that zone's offset, and the kernel-accurate
-// CRI/journal time is discarded in its favour, silently, for that workload's
-// whole history.
+// mayReplaceTimestamp reports whether a timestamp parsed from the line may be
+// stamped on the record, given the producer's own (0 = the producer supplied
+// none). A parsed timestamp REPLACES the producer's on the overwrite path,
+// EXCEPT a zone-less one, which may only fill a producer timestamp that is
+// absent.
 //
-// The refusal keys on the SHAPE of that displacement rather than on its size,
-// because size alone cannot tell a misread zone from a log that is legitimately
-// old (an archived file, a backfilled batch, a message whose own timestamp
-// predates its emission by design). A zone offset is a whole multiple of 15
-// minutes — every offset in use is, from Nepal's +05:45 to Kiribati's +14:00 —
-// between one quarter-hour and fourteen hours, and the gap between an
-// application writing a line and the runtime reading it is milliseconds. A
-// displacement that lands on that grid is a zone; anything else is data.
+// Replacing is usually right: the producer's stamp is when the line was read,
+// the line's is when the event happened. The exception is a timestamp with no
+// zone (enrich.Result.TimeHasZone false — klog's "MMDD hh:mm:ss", syslog
+// RFC3164's, "2006-01-02 15:04:05", the slash-date forms). enrich must read
+// those as UTC because nothing in the line says otherwise, so a container
+// running with TZ set to anything else hands every record a time displaced by
+// exactly that zone's offset — silently, for that workload's whole history.
+// Against an ambiguous wall clock the producer's kernel-accurate CRI/journal
+// stamp is the better datum: for a UTC container the two differ only by the
+// write-to-read gap, and for any other container keeping the producer's is
+// simply correct.
 //
-// What this deliberately does NOT catch, and does not try to: a zone-less log
-// written with MINUTE precision (truncation moves it off the grid by up to a
-// minute), an offset that is not a quarter-hour, and any displacement under 15
-// minutes. What it costs when it fires wrongly — a line whose real emit-to-read
-// delay happens to land within tolerance of a quarter-hour multiple — is that
-// the record carries the ingest time, which ObservedTimestamp carries anyway,
-// and the refusal is counted.
-const (
-	zoneQuantum   = 15 * time.Minute
-	maxZoneOffset = 14 * time.Hour
-	// zoneTolerance absorbs the write-to-read gap and a second-precision
-	// timestamp's truncation. Widening it widens the window in which an
-	// ordinary delay is mistaken for a zone, proportionally.
-	zoneTolerance = 5 * time.Second
-)
-
-// plausibleTime reports whether a parsed line timestamp may replace the
-// producer's own. A zero stamped time means the producer supplied none (a plain
-// non-CRI file stamps none), so there is nothing to disagree with and the
-// parsed time is taken whole however old it is.
-func plausibleTime(parsed time.Time, stamped pcommon.Timestamp) bool {
-	if stamped == 0 {
-		return true
-	}
-	d := parsed.Sub(stamped.AsTime())
-	if d < 0 {
-		d = -d
-	}
-	if d < zoneQuantum-zoneTolerance || d > maxZoneOffset+zoneTolerance {
-		return true
-	}
-	// On the grid, from either side of a quarter-hour boundary.
-	off := d % zoneQuantum
-	return off > zoneTolerance && off < zoneQuantum-zoneTolerance
+// The ambiguity is knowable AT THE PARSE, so it is read off the parse rather
+// than guessed at afterwards from the displacement's size or shape. (The
+// quarter-hour-grid heuristic this replaced could see neither a
+// minute-precision stamp nor a sub-quarter-hour offset, and refused a
+// legitimately displaced timestamp that happened to land near a boundary.)
+//
+// With NO producer timestamp — a plain (non-CRI) tailer source, an ingest
+// record whose sender set none — there is nothing better to keep, so a
+// zone-less time is taken whole however old it is. That is what keeps an
+// archived plain file reading correctly.
+//
+// What the rule costs: an application that buffers and writes an OLD zone-less
+// timestamp loses it in favour of the ingest time. That timestamp was the more
+// accurate one — but only if its writer's clock was UTC, which is exactly what
+// a zone-less stamp cannot tell us; the structured formats an emitter that
+// cares about back-dating tends to use (JSON, logfmt, RFC3339) all carry a
+// zone and are unaffected; ObservedTimestamp carries the ingest time either
+// way; and the refusal is counted (obs.LogEnrichTimeRejected).
+func mayReplaceTimestamp(hasZone bool, producer pcommon.Timestamp) bool {
+	return hasZone || producer == 0
 }
 
 // parseHexID decodes an ID of want bytes from hex, tolerating dashes

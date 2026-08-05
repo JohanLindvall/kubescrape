@@ -104,7 +104,7 @@ is the documented alert for the non-buffered tailer.
 | `kubescrape_log_archive_errors_total` | — | Compressed log files whose stream failed to decode mid-read (truncated gzip, trailing garbage). What decoded before the error is delivered; the remainder is unrecoverable and the archive settles. |
 | `kubescrape_log_bytes_total` | — | Raw log bytes read from live files and archives. Segment replays (re-reading a rotated file's owed range after a restart or rewind) are not re-counted. |
 | `kubescrape_log_drain_errors_total` | `source` | Reads that failed part-way through DRAINING a file incarnation that is going away (a rotated inode, a compressed archive). The drain cannot be retried — the next sweep would fail identically while holding the fd — so the unread remainder of that incarnation is unrecoverable and lost. Distinct from a clean EOF, which is the drain succeeding. |
-| `kubescrape_log_enrich_time_rejected_total` | — | Timestamps parsed from a log line that did NOT replace the producer's own (the CRI/journal/event time) because they sat a whole zone offset away from it — a quarter-hour multiple between 15 minutes and 14 hours. A steady rate means a workload logs local wall-clock time with no zone, which enrichment must read as UTC; those records keep the accurate ingest time instead of being misdated by the offset. A legitimately old timestamp (an archive, a backfill) does not land on that grid and is kept. |
+| `kubescrape_log_enrich_time_rejected_total` | — | Timestamps parsed from a log line that did NOT replace the producer's own (the CRI/journal/event time) because the line's timestamp carried no zone. Such a stamp is a wall clock enrichment must read as UTC, so a workload running with TZ set to anything else would misdate every record by that offset; the accurate ingest time is kept instead. A timestamp that states its own offset (RFC3339, an epoch, any zoned layout) always wins, however old it is, and a record with no producer timestamp at all takes the parsed one either way. |
 | `kubescrape_log_enriched_total` | `format` | Log records by the enrichment strategy that matched (json, logfmt, pattern, none). |
 | `kubescrape_log_entries_total` | — | Log entries exported. With -buffer-dir this counts acceptance into the disk buffer, not collector delivery — reconcile against kubescrape_buffer_dropped_records_total{signal="logs"} for what was later dropped drain-side. |
 | `kubescrape_log_export_failures_total` | — | Log batch exports that failed after retries (files rewound). |
@@ -135,6 +135,7 @@ is the documented alert for the non-buffered tailer.
 | `kubescrape_routed_payload_parts_total` | `route`, `signal` | Payload parts forwarded to a non-default routing destination. |
 | `kubescrape_scrape_auth_failures_total` | `reason` | Failed /v1/scrape-auth Secret resolutions by cause (not_found = no such Secret or key; upstream = forbidden, timeout or unreachable API server; not_utf8 = value cannot be served as a JSON string). |
 | `kubescrape_scrape_duration_seconds` | `pipeline` | Scrape duration by pipeline. |
+| `kubescrape_scrape_exemplars_malformed_total` | `pipeline` | Unparseable OpenMetrics exemplar suffixes by pipeline. NO data was lost: the samples carrying them were exported without the exemplar, which is why this is separate from kubescrape_scrape_malformed_total. Only ever nonzero where exemplar scraping is enabled. |
 | `kubescrape_scrape_malformed_total` | `pipeline` | Exposition samples dropped as malformed by pipeline (unparseable lines, histogram buckets without le, summary rows without quantile). |
 | `kubescrape_scrape_name_collisions_total` | — | Data points dropped because their family name was already claimed by a metric of another shape in the same batch (a target redeclaring a family's TYPE mid-exposition). |
 | `kubescrape_scrape_samples_dropped_total` | `pipeline`, `reason` | Parsed samples discarded before conversion, by pipeline and by what discarded them: filter = the config's metrics keep/drop rules, relabel = a monitor's metricRelabelings. |
@@ -171,4 +172,4 @@ is the documented alert for the non-buffered tailer.
 | `kubescrape_transform_errors_total` | `signal` | Transform program invocations that failed (the batch is NOT exported; the error propagates to the producer's retry path). |
 | `kubescrape_transform_reloads_total` | `outcome` | Transforms-file reloads by outcome (applied, failed — a failed compile keeps the last good program). |
 
-109 metrics.
+110 metrics.

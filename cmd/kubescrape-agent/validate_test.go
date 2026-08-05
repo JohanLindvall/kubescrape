@@ -1,9 +1,14 @@
 package main
 
 import (
+	"fmt"
+	"os"
+	"os/exec"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/JohanLindvall/kubescrape/internal/agent/logscrub"
 	"github.com/JohanLindvall/kubescrape/internal/agent/otlpexport"
@@ -78,6 +83,179 @@ func TestValidateConfigAcceptsEmpty(t *testing.T) {
 	if err := validateConfig(agentConfig{}, ""); err != nil {
 		t.Fatalf("an empty config must be valid: %v", err)
 	}
+}
+
+// typedFlags makes flagWasSet report exactly these flags as typed. The refusals
+// read the OPERATOR's command line, and a test cannot type one: flag.Set is the
+// only way into flag.Visit's record and there is no way out, so a typed flag
+// would leak into every later test in this package. The real command line is
+// covered by TestCheckConfigExitStatus, which parses one in a child process.
+func typedFlags(t *testing.T, names ...string) {
+	t.Helper()
+	old := flagWasSet
+	t.Cleanup(func() { flagWasSet = old })
+	flagWasSet = func(name string) bool { return slices.Contains(names, name) }
+}
+
+// restoreFlagValues restores the flag values a test overwrites in place.
+func restoreFlagValues(t *testing.T) {
+	t.Helper()
+	timeout, limit, burst := *scrapeTimeout, *logsRateLimit, *logsRateBurst
+	t.Cleanup(func() { *scrapeTimeout, *logsRateLimit, *logsRateBurst = timeout, limit, burst })
+}
+
+// A flag value that can only ever be a mistake is REFUSED, not normalised. The
+// consumers still normalise (promscrape.New defaults the timeout, tailer.New
+// floors the burst) — that is the library guarantee for a zeroed field — but an
+// operator who typed the flag asked for something the process will not do, and
+// learning that from a warning scrolling past a rolling update is learning it
+// too late. Every message names the flag, the value and a usable one.
+func TestValidateConfigRefusesTypedFlagNonsense(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		flag  string
+		apply func()
+		want  []string
+	}{
+		{
+			"zero scrape timeout", "scrape-timeout",
+			func() { *scrapeTimeout = 0 },
+			[]string{"-scrape-timeout=0s", "positive duration"},
+		},
+		{
+			"negative scrape timeout", "scrape-timeout",
+			func() { *scrapeTimeout = -time.Second },
+			[]string{"-scrape-timeout=-1s", "positive duration"},
+		},
+		{
+			// A bucket typed as a bucket: it can never hold the one whole token
+			// a line costs, so pause mode reads nothing, forever.
+			"burst below one whole token", "logs-rate-burst",
+			func() { *logsRateLimit, *logsRateBurst = 100, 0.5 },
+			[]string{"-logs-rate-burst=0.5", "burst of 1 or more"},
+		},
+		{
+			"negative burst", "logs-rate-burst",
+			func() { *logsRateLimit, *logsRateBurst = 100, -1 },
+			[]string{"-logs-rate-burst=-1", "burst of 1 or more"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			restoreFlagValues(t)
+			typedFlags(t, tc.flag)
+			tc.apply()
+			err := validateConfig(agentConfig{}, "")
+			if err == nil {
+				t.Fatalf("accepted a typed -%s value the process cannot honour", tc.flag)
+			}
+			for _, want := range tc.want {
+				if !strings.Contains(err.Error(), want) {
+					t.Fatalf("error %q does not name %q", err, want)
+				}
+			}
+		})
+	}
+}
+
+// The refusal is about what an operator TYPED, which is why it reads
+// flag.Visit's record rather than comparing against the flag's default: a
+// non-positive bound arriving any other way — a default that changes later, a
+// value set programmatically — belongs to the constructors that normalise it.
+func TestValidateConfigRefusesOnlyTypedValues(t *testing.T) {
+	restoreFlagValues(t)
+	typedFlags(t) // nothing typed
+	*scrapeTimeout, *logsRateLimit, *logsRateBurst = 0, 100, 0.5
+	if err := validateConfig(agentConfig{}, ""); err != nil {
+		t.Fatalf("refused a value no operator typed: %v", err)
+	}
+}
+
+// The usable shapes must keep passing, or the refusal is worse than the trap it
+// replaces.
+func TestValidateConfigAcceptsUsableTypedFlags(t *testing.T) {
+	restoreFlagValues(t)
+	typedFlags(t, "scrape-timeout", "logs-rate-limit", "logs-rate-burst")
+
+	*scrapeTimeout, *logsRateLimit, *logsRateBurst = 30*time.Second, 100, 200
+	if err := validateConfig(agentConfig{}, ""); err != nil {
+		t.Fatalf("refused usable values: %v", err)
+	}
+
+	// 0 is the documented sentinel for "2x -logs-rate-limit", and the chart
+	// passes it verbatim on every deployment that enables rate limiting, so
+	// reading it as a bucket size would refuse the stock config.
+	*logsRateBurst = 0
+	if err := validateConfig(agentConfig{}, ""); err != nil {
+		t.Fatalf("refused the derive sentinel the chart passes: %v", err)
+	}
+
+	// A bucket DERIVED below one token is warned about (TestDerivedRateBurstWarns),
+	// never refused: the operator typed the rate, not the bucket, and the rate is
+	// delivered exactly.
+	*logsRateLimit = 0.2
+	if err := validateConfig(agentConfig{}, ""); err != nil {
+		t.Fatalf("refused a rate whose derived bucket the tailer floors: %v", err)
+	}
+	if got := warnText(agentConfig{}); !strings.Contains(got, "bucket of 0.4") {
+		t.Fatalf("the derived bucket normalises silently: %q", got)
+	}
+}
+
+// checkConfigArgsEnv carries the child process' command line.
+const checkConfigArgsEnv = "KUBESCRAPE_TEST_CHECK_CONFIG_ARGS"
+
+// Refusing rather than warning is only worth anything if -check-config EXITS
+// NON-ZERO on it: that exit status is what a CI job and a pre-rollout check
+// read. Exercised in a child process, which is also the only place the real
+// command line — flag.Parse, and so the real flagWasSet — is reachable: the
+// parent's os.Args belong to `go test`.
+func TestCheckConfigExitStatus(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		args    []string
+		wantErr bool
+		want    string
+	}{
+		{"typed zero scrape timeout", []string{"-scrape-timeout=0"}, true, "-scrape-timeout=0s"},
+		{"typed sub-token burst", []string{"-logs-rate-limit=100", "-logs-rate-burst=0.5"}, true, "-logs-rate-burst=0.5"},
+		// Warned, and the dry run still exits 0 — the operator typed the rate,
+		// and the rate is what they get.
+		{"derived sub-token bucket", []string{"-logs-rate-limit=0.2"}, false, "bucket of 0.4"},
+		{"usable values", []string{"-scrape-timeout=30s", "-logs-rate-limit=100", "-logs-rate-burst=200"}, false, ""},
+		{"nothing typed", nil, false, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			argv := append([]string{"-check-config", "-node-name=test-node"}, tc.args...)
+			cmd := exec.Command(os.Args[0], "-test.run=TestCheckConfigChild")
+			cmd.Env = append(os.Environ(), checkConfigArgsEnv+"="+strings.Join(argv, " "))
+			out, err := cmd.CombinedOutput()
+			if tc.wantErr && err == nil {
+				t.Fatalf("-check-config exited 0 on %v:\n%s", tc.args, out)
+			}
+			if !tc.wantErr && err != nil {
+				t.Fatalf("-check-config exited non-zero on %v: %v\n%s", tc.args, err, out)
+			}
+			if tc.want != "" && !strings.Contains(string(out), tc.want) {
+				t.Fatalf("-check-config output does not name %q:\n%s", tc.want, out)
+			}
+		})
+	}
+}
+
+// TestCheckConfigChild is the child half of TestCheckConfigExitStatus: it runs
+// the real run(), so the exit status under test is the binary's own. Skipped
+// unless the parent asked for it.
+func TestCheckConfigChild(t *testing.T) {
+	argv := os.Getenv(checkConfigArgsEnv)
+	if argv == "" {
+		t.Skip("child half of TestCheckConfigExitStatus")
+	}
+	os.Args = append([]string{"kubescrape-agent"}, strings.Fields(argv)...)
+	if err := run(); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	os.Exit(0)
 }
 
 // -check-config is only trustworthy if it accepts EXACTLY what a real start

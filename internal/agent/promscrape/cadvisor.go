@@ -239,6 +239,20 @@ func (ss *scrapeSession) reportMalformed(msg string, malformed int, abortErr err
 	}
 }
 
+// reportBadExemplars counts a scrape's unparseable exemplar suffixes, apart
+// from reportMalformed: the samples carrying them were exported, and
+// kubescrape_scrape_malformed_total means data was DROPPED — a target whose
+// exemplars alone are broken must not move an operator's data-loss signal, and
+// must still be visible as something to fix.
+func (ss *scrapeSession) reportBadExemplars(n int) {
+	if n == 0 {
+		return
+	}
+	obs.ScrapeExemplarsMalformed.WithLabelValues(ss.pipeline).Add(float64(n))
+	ss.s.log.Warn("scrape had malformed exemplars (samples exported without them)",
+		"target", ss.what, "exemplars", n, "samples", ss.samples)
+}
+
 // parseAndExport streams one scrape body through the series filter and the
 // converter into cb, exporting a chunk whenever BatchPoints data points or
 // BatchBytes estimated bytes accumulate. It returns the number of samples
@@ -262,6 +276,10 @@ func (s *Scraper) parseAndExportFiltered(ctx context.Context, body io.Reader, op
 	parser := promparse.Get(promparse.Options{MaxLineBytes: s.cfg.MaxLineBytes, OpenMetrics: openMetrics, Exemplars: withExemplars})
 	defer promparse.Put(parser)
 	malformed, err := parser.Parse(body, ss.accept)
+	// Read while the parser is still ours (Put hands it to the next scrape),
+	// and on the abort path too: a body that tripped the sample limit still
+	// carried whatever exemplars were parsed before it.
+	ss.reportBadExemplars(parser.MalformedExemplars())
 	if err != nil {
 		ss.salvage()
 		ss.reportMalformed("aborted scrape had malformed lines", malformed+ss.conv.malformed, err)

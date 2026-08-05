@@ -572,6 +572,16 @@ the positions file, spools or the network. Run it in CI: a DaemonSet's bad
 ConfigMap otherwise surfaces as a fleet-wide CrashLoop. A real start runs the
 same validation, so the two cannot disagree.
 
+Flag **values** are part of that. A value you passed that the process cannot
+honour is an error naming the flag, the value and a usable one — a non-positive
+`-scrape-timeout` (it *is* each request's context budget, so it would fail every
+target and both kubelet scrapes with `context deadline exceeded`), or a
+`-logs-rate-burst` below the one whole token a line costs (pause mode would stop
+reading every file on the node). Both are refused rather than quietly replaced
+by a working default, because a replacement is discovered mid-rollout if at all.
+Only what you *passed*: a flag you left alone is always its default, and a bound
+arriving programmatically still gets the constructor's safe substitute.
+
 **Config unit tests** (`-test-config tests.yaml`). Goes one step further than
 `-check-config`: named sample lines run through the compiled pipeline in the
 tailer's order (scrub → logAttributes → enrich → logMetrics → `logs.rules` →
@@ -604,7 +614,10 @@ which recognizes JSON (Serilog/Pino/Envoy/Azure envelopes and common key
 spellings), logfmt, and a table of plain-text formats (nginx, klog, redis,
 syslog prefixes, Go/Java/Python/.NET stack traces). Whatever the line itself
 carries is promoted into the OTLP record — a parsed timestamp replaces the
-CRI write time, an explicit level sets the severity, trace/span IDs land in
+CRI write time when it carries a zone (a zone-less one is an ambiguous wall
+clock, so the accurate ingest time is kept and
+`kubescrape_log_enrich_time_rejected_total` counts it), an explicit level
+sets the severity, trace/span IDs land in
 the first-class trace fields (GUID-style request IDs included), and template
 / source-context / service / exception details become record attributes
 (`log.template`, `log.source_context`, `exception.type`, …). The body is

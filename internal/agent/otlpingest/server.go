@@ -57,6 +57,27 @@ type ServerConfig struct {
 	// Traces accepts pushed traces on /v1/traces and the gRPC trace service,
 	// enriching resources and passing them through. nil disables traces.
 	Traces TracesExporter
+	// RejectTraces refuses a trace payload on the RECEIVE path — before
+	// enrichment, on both transports. nil accepts everything, which is what a
+	// node-local ingest server wants: it has nothing to refuse.
+	//
+	// A refusal has to be reached before anything is spent on the payload.
+	// Enrichment costs one metadata lookup per resource and moves
+	// kubescrape_ingest_resources_total per resource, so a verdict taken below
+	// it charges the metadata service — and the operator's enriched/unresolved
+	// signal — for traffic that is then thrown away. The trace tier's loop guard
+	// is the case this exists for: a payload carrying the tier's own re-shard
+	// marker on the APPLICATION port was never sent by an application, and
+	// attributing it by the connection's peer address would name a sibling shard.
+	//
+	// The error travels back through the same mapping as an export failure
+	// (grpcForwardStatus / HTTPForwardStatus), so a guard that must refuse
+	// PERMANENTLY returns something otlpexport.IsPermanent classifies as such
+	// (codes.InvalidArgument) and the sender sees InvalidArgument / 400.
+	//
+	// It runs AFTER admission (the byte budget and the in-flight slot), so a
+	// refused push releases everything it took, exactly as an accepted one does.
+	RejectTraces func(ctx context.Context, td ptrace.Traces) error
 	// MaxInFlight bounds concurrently-processed pushes across both transports
 	// (0 = defaultMaxInFlight). Over the bound, senders are refused with a
 	// RETRYABLE answer rather than accepted into memory the node does not have.
@@ -335,9 +356,23 @@ type tracesGRPC struct {
 	s *Server
 }
 
+// rejectTraces consults the receive-path guard (ServerConfig.RejectTraces). It
+// is the FIRST step of both trace handlers and the last one that may run before
+// EnrichTraces: a payload this refuses must cost no metadata lookup and move no
+// ingest counter. An unset guard accepts everything.
+func (s *Server) rejectTraces(ctx context.Context, td ptrace.Traces) error {
+	if s.cfg.RejectTraces == nil {
+		return nil
+	}
+	return s.cfg.RejectTraces(ctx, td)
+}
+
 func (g *tracesGRPC) Export(ctx context.Context, req ptraceotlp.ExportRequest) (ptraceotlp.ExportResponse, error) {
 	err := grpcExport(ctx, func(ctx context.Context) error {
 		td := req.Traces()
+		if err := g.s.rejectTraces(ctx, td); err != nil {
+			return err
+		}
 		g.s.cfg.Enricher.EnrichTraces(ctx, td)
 		return g.s.cfg.Traces.ExportTraces(ctx, td)
 	})
@@ -426,6 +461,9 @@ func (s *Server) handleHTTPTraces(w http.ResponseWriter, r *http.Request) {
 	req := ptraceotlp.NewExportRequest()
 	s.servePush(w, r, "traces", req.UnmarshalProto, func(ctx context.Context) (ProtoMarshaler, error) {
 		td := req.Traces()
+		if err := s.rejectTraces(ctx, td); err != nil {
+			return nil, err
+		}
 		s.cfg.Enricher.EnrichTraces(ctx, td)
 		if err := s.cfg.Traces.ExportTraces(ctx, td); err != nil {
 			return nil, err

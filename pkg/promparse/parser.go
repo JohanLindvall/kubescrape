@@ -179,6 +179,11 @@ type Parser struct {
 	exemplar   Exemplar
 	scratch    []byte // for lines spanning bufio reads
 	eof        bool   // saw "# EOF"
+	// badExemplars counts this parse's unparseable exemplar suffixes. It is
+	// deliberately NOT folded into the malformed count: those samples were
+	// emitted (finishSample keeps them), so a reader of the two numbers can
+	// tell a target with broken exemplars from one losing data.
+	badExemplars int
 }
 
 // DefaultMaxLineBytes bounds one physical line when Options leaves
@@ -281,6 +286,11 @@ func (pp *Pooled) Parse(r io.Reader, emit func(Sample) error) (int, error) {
 	return pp.p.parseFrom(pp.reader, emit)
 }
 
+// MalformedExemplars reports the last parse's unparseable exemplar suffixes
+// (see Parser.MalformedExemplars). Read it before Put: the next user of the
+// pooled parser resets the count.
+func (pp *Pooled) MalformedExemplars() int { return pp.p.MalformedExemplars() }
+
 // lastKV caches the previous line's interned name/value at one label
 // position.
 type lastKV struct {
@@ -361,6 +371,13 @@ func (p *Parser) Parse(r io.Reader, emit func(Sample) error) (malformed int, err
 	return p.parseFrom(bufio.NewReaderSize(r, parseBufSize), emit)
 }
 
+// MalformedExemplars reports how many exemplar suffixes of the last parse were
+// unparseable. Their samples were emitted intact, so this is a count of lost
+// ANNOTATIONS and never of lost data — it belongs on its own counter, not on
+// the caller's malformed-sample one. It is 0 unless Options.Exemplars asked for
+// exemplars: a parser that is not attaching them does not parse them either.
+func (p *Parser) MalformedExemplars() int { return p.badExemplars }
+
 // resetMeta drops the previous exposition's HELP/UNIT declarations (they are
 // per-exposition, exactly like the TYPE table) and the classification memo
 // built from them.
@@ -371,6 +388,10 @@ func (p *Parser) resetMeta() {
 }
 
 func (p *Parser) parseFrom(br *bufio.Reader, emit func(Sample) error) (malformed int, err error) {
+	// Per-parse statistic, reset here rather than in Parse: the pooled path
+	// enters through parseFrom directly, and a count carried over from the
+	// previous scrape would be charged to this target.
+	p.badExemplars = 0
 	for {
 		line, tooLong, rerr := p.readLine(br)
 		// A read error other than io.EOF cut the body mid-line, so what came
@@ -812,9 +833,17 @@ func (p *Parser) finishSample(s *Sample, rest []byte) bool {
 		// the flag would make enabling exemplars drop samples from a target
 		// whose trailing "#" text the same parser had always tolerated, with
 		// the malformed counter as the only signal.
+		//
+		// A suffix that fails to parse is COUNTED (MalformedExemplars), or a
+		// target whose exemplars are syntactically broken is indistinguishable
+		// from one that emits none. The count is only reachable with the flag
+		// on, which is what keeps the flag-off path free of parseExemplar's
+		// trace-id interning.
 		if p.exemplars {
 			if ex, ok := p.parseExemplar(rest[1:]); ok {
 				s.Exemplar = ex
+			} else {
+				p.badExemplars++
 			}
 		}
 	}

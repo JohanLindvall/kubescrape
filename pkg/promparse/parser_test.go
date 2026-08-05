@@ -685,6 +685,65 @@ func TestExemplarsFlagDoesNotDecideLineValidity(t *testing.T) {
 	}
 }
 
+// Keeping the sample must not make the breakage invisible: a target emitting
+// syntactically broken exemplars reads exactly like one emitting none unless
+// the failures are counted somewhere, and the malformed count is the wrong
+// somewhere — it means a DROPPED sample. With the flag off nothing is parsed,
+// so there is nothing to count, which is what keeps parseExemplar's trace-id
+// interning off targets that never asked for exemplars.
+func TestMalformedExemplarsAreCountedNotDropped(t *testing.T) {
+	const body = "a 1 # junk\n" +
+		"b 2 # {t=\"x\"} 2 3 4\n" +
+		"c 3 # {unterminated\n" +
+		"d 4 # {t=\"x\"} 0.5\n" + // well-formed: attaches, counts nothing
+		"e 5\n" + // no suffix at all
+		"# EOF\n"
+
+	on := New(Options{OpenMetrics: true, Exemplars: true})
+	got, malformed, err := collect(t, on, body)
+	if err != nil || malformed != 0 || len(got) != 5 {
+		t.Fatalf("exemplars on: samples=%d malformed=%d err=%v, want 5 samples and no malformed line", len(got), malformed, err)
+	}
+	if on.MalformedExemplars() != 3 {
+		t.Fatalf("exemplars on: MalformedExemplars = %d, want 3", on.MalformedExemplars())
+	}
+	if got[3].Exemplar == nil || got[3].Exemplar.Value != 0.5 {
+		t.Fatalf("exemplars on: the well-formed exemplar did not attach: %+v", got[3].Exemplar)
+	}
+
+	off := New(Options{OpenMetrics: true})
+	got, malformed, err = collect(t, off, body)
+	if err != nil || malformed != 0 || len(got) != 5 {
+		t.Fatalf("exemplars off: samples=%d malformed=%d err=%v, want 5 samples and no malformed line", len(got), malformed, err)
+	}
+	if off.MalformedExemplars() != 0 {
+		t.Fatalf("exemplars off: MalformedExemplars = %d, want 0 (nothing is parsed)", off.MalformedExemplars())
+	}
+
+	// The count is per parse: a scrape must not be charged for its
+	// predecessor's exemplars, including through the pool.
+	if _, _, err := collect(t, on, "z 1\n# EOF\n"); err != nil {
+		t.Fatal(err)
+	}
+	if on.MalformedExemplars() != 0 {
+		t.Fatalf("after a clean parse: MalformedExemplars = %d, want 0", on.MalformedExemplars())
+	}
+	pp := Get(Options{OpenMetrics: true, Exemplars: true})
+	defer Put(pp)
+	if _, err := pp.Parse(strings.NewReader(body), func(Sample) error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if pp.MalformedExemplars() != 3 {
+		t.Fatalf("pooled: MalformedExemplars = %d, want 3", pp.MalformedExemplars())
+	}
+	if _, err := pp.Parse(strings.NewReader("z 1\n# EOF\n"), func(Sample) error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if pp.MalformedExemplars() != 0 {
+		t.Fatalf("pooled, after a clean parse: MalformedExemplars = %d, want 0", pp.MalformedExemplars())
+	}
+}
+
 // HELP text is free text after exactly one separator byte, so indentation an
 // exposition put in a description survives into the OTLP Description.
 func TestHelpKeepsWhitespacePastTheSeparator(t *testing.T) {

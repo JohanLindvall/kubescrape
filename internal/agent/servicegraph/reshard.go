@@ -479,17 +479,15 @@ func (r *Resharder) Stats() ReshardStats {
 // ForwardedMarker. The refusal belongs to the receive path and the counter lives
 // here, because this is where the marker's whole story is.
 //
-// Where the refusal actually sits: BELOW enrichment. The ingest server enriches
-// a trace payload and then hands it to its Traces exporter, which is the tier's
-// entry (cmd/kubescrape-agent's sgEntry), and the IsForwarded check is that
-// exporter's first line — there is no pre-enrich hook on otlpingest.ServerConfig
-// to hang it from. The amplification the marker exists to stop is still stopped:
-// the refusal is PERMANENT, so the payload is neither re-sharded nor retried,
-// and one hop is where it ends. What the ordering costs under that
-// misconfiguration is wasted metadata lookups and ingest counters
+// Where the refusal sits: ABOVE enrichment, on the hook the ingest server
+// consults before it attributes a trace payload
+// (otlpingest.ServerConfig.RejectTraces, wired by cmd/kubescrape-agent). That
+// ordering is the point — a payload this counter records is one nothing should
+// be spent on: no metadata lookup per resource, no ingest counter
 // (obs.Ingested{enriched|unresolved|peer_ip_rejected}) moved by traffic that is
-// then refused — a bounded, one-time cost on a config that is already broken and
-// already counted here.
+// refused, and no attribution deduced from a peer address that belongs to the
+// sending SHARD rather than to any application. The refusal is PERMANENT, so the
+// payload is neither re-sharded nor retried, and one hop is where it ends.
 func (r *Resharder) CountLoopBlocked(spans int) {
 	if r == nil || spans < 0 {
 		return

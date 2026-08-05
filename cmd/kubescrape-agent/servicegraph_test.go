@@ -8,6 +8,7 @@ import (
 	mathrand "math/rand"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -21,11 +22,17 @@ import (
 
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/ptrace"
+	"go.opentelemetry.io/collector/pdata/ptrace/ptraceotlp"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
 
 	"github.com/JohanLindvall/kubescrape/internal/agent/otlpexport"
 	"github.com/JohanLindvall/kubescrape/internal/agent/servicegraph"
 	"github.com/JohanLindvall/kubescrape/internal/bearer"
 	"github.com/JohanLindvall/kubescrape/pkg/kubemeta"
+	"github.com/JohanLindvall/kubescrape/pkg/metaclient"
 	"github.com/JohanLindvall/kubescrape/pkg/otlpsplit"
 )
 
@@ -999,4 +1006,203 @@ func TestSGMaxRecvFloorValue(t *testing.T) {
 	if sgMaxRecvFloor < otlpsplit.DefaultMaxBytes {
 		t.Fatalf("sgMaxRecvFloor (%d) is below the sender's default split cap (%d): the internal hop would reject default-sized parts", sgMaxRecvFloor, otlpsplit.DefaultMaxBytes)
 	}
+}
+
+// --- the loop guard's position in the receive path ---
+
+// The marker's refusal has to be reached BEFORE enrichment, and this is the
+// assertion that says so: a marked payload must cost the metadata service
+// nothing.
+//
+// Enrichment is one lookup per resource and one
+// kubescrape_ingest_resources_total tick per resource, spent on traffic that is
+// then thrown away — and on this port what it would deduce is wrong twice over,
+// since the connection's peer is the sibling SHARD that misaddressed the hop,
+// not an application. The refusal must also stay PERMANENT: a retryable one has
+// the sending shard re-push it forever, which is the amplification loop at a
+// slower rate.
+//
+// It runs through startServiceGraphIngest — the production wiring — because
+// what regresses is the hook being SET, not the guard's verdict.
+func TestApplicationPortRefusesAForwardedPayloadAboveEnrichment(t *testing.T) {
+	var lookups atomic.Int64
+	metaSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		lookups.Add(1)
+		http.NotFound(w, r) // resolving is irrelevant; being ASKED is the signal
+	}))
+	defer metaSrv.Close()
+
+	defer func(on bool, g, h string, shards int, ep string) {
+		*serviceGraphIngest, *serviceGraphIngestGRPC, *serviceGraphIngestHTTP = on, g, h
+		*serviceGraphShards, *serviceGraphEndpoint = shards, ep
+	}(*serviceGraphIngest, *serviceGraphIngestGRPC, *serviceGraphIngestHTTP, *serviceGraphShards, *serviceGraphEndpoint)
+	*serviceGraphIngest = true
+	*serviceGraphIngestGRPC, *serviceGraphIngestHTTP = freeAddr(t), freeAddr(t)
+	*serviceGraphShards, *serviceGraphEndpoint = 0, "" // a single-shard tier: nothing to re-shard
+
+	builders, err := buildAttrs(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, p := testPipelines(t)
+	p.meta = metaclient.New(metaclient.Config{Base: metaSrv.URL, Timeout: 5 * time.Second})
+	p.attrBuilders = builders
+
+	owner := &captureTraces{}
+	if err := p.startServiceGraphIngest(ctx, owner); err != nil {
+		t.Fatalf("startServiceGraphIngest: %v", err)
+	}
+
+	conn, err := grpc.NewClient(*serviceGraphIngestGRPC, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = conn.Close() }()
+	grpcClient := ptraceotlp.NewGRPCClient(conn)
+
+	sendGRPC := func(t *testing.T, td ptrace.Traces) error {
+		t.Helper()
+		var lastErr error
+		for i := 0; i < 100; i++ {
+			_, lastErr = grpcClient.Export(context.Background(), ptraceotlp.NewExportRequestFromTraces(td))
+			if status.Code(lastErr) != codes.Unavailable {
+				return lastErr // bound: this is the server's own answer
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+		return lastErr
+	}
+	postHTTP := func(t *testing.T, td ptrace.Traces) int {
+		t.Helper()
+		body, err := ptraceotlp.NewExportRequestFromTraces(td).MarshalProto()
+		if err != nil {
+			t.Fatal(err)
+		}
+		for i := 0; i < 100; i++ {
+			resp, err := http.Post("http://"+*serviceGraphIngestHTTP+"/v1/traces", "application/x-protobuf", bytes.NewReader(body))
+			if err != nil {
+				time.Sleep(20 * time.Millisecond)
+				continue
+			}
+			defer func() { _ = resp.Body.Close() }()
+			return resp.StatusCode
+		}
+		t.Fatal("the application HTTP listener never answered")
+		return 0
+	}
+
+	// A container id the enricher WOULD look up, so a lookup count of zero is
+	// evidence of the ordering rather than of an idless payload.
+	marked := func() ptrace.Traces {
+		td := oneClientSpan()
+		a := td.ResourceSpans().At(0).Resource().Attributes()
+		a.PutStr("container.id", "cafe01")
+		a.PutBool(servicegraph.ForwardedMarker, true)
+		return td
+	}
+
+	if err := sendGRPC(t, marked()); status.Code(err) != codes.InvalidArgument {
+		t.Errorf("gRPC refusal = %v (%v), want InvalidArgument: anything else has the sending shard re-push it forever", status.Code(err), err)
+	} else if !strings.Contains(err.Error(), servicegraph.ForwardedMarker) {
+		t.Errorf("the refusal %q does not name the marker that caused it", err)
+	}
+	if code := postHTTP(t, marked()); code != http.StatusBadRequest {
+		t.Errorf("HTTP refusal status = %d, want 400 (otlpexport.IsPermanent reads it as do-not-retry)", code)
+	}
+	if n := lookups.Load(); n != 0 {
+		t.Errorf("a refused payload cost %d metadata lookups; the guard runs above enrichment precisely so it costs none", n)
+	}
+	if owner.spans() != 0 {
+		t.Errorf("a refused payload reached the owner chain (%d spans)", owner.spans())
+	}
+
+	// The same payload unmarked: accepted, and the enricher IS consulted — which
+	// is what makes the zero above mean an ordering and not a dead enricher.
+	unmarked := func() ptrace.Traces {
+		td := oneClientSpan()
+		td.ResourceSpans().At(0).Resource().Attributes().PutStr("container.id", "cafe01")
+		return td
+	}
+	if err := sendGRPC(t, unmarked()); err != nil {
+		t.Fatalf("an ordinary application push over gRPC failed: %v", err)
+	}
+	if code := postHTTP(t, unmarked()); code != http.StatusOK {
+		t.Fatalf("an ordinary application push over HTTP answered %d", code)
+	}
+	if lookups.Load() == 0 {
+		t.Error("an accepted push consulted no metadata service; the refusal assertion above proves nothing")
+	}
+	if owner.spans() != 2 {
+		t.Errorf("the owner chain saw %d spans, want 2 (one per transport)", owner.spans())
+	}
+}
+
+// The internal port is the OTHER half of the marker's contract: what a sibling
+// shard forwards arrives marked BY DESIGN, so this port strips it and accepts.
+// Refusing here would break re-sharding outright, and letting the marker survive
+// would put a kubescrape resource attribute on every application span in the
+// cluster.
+func TestInternalPortStripsTheMarkerAndAccepts(t *testing.T) {
+	tokenPath := filepath.Join(t.TempDir(), "token")
+	if err := os.WriteFile(tokenPath, []byte("s3cr3t\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	log := slog.New(slog.DiscardHandler)
+	tok, err := bearer.NewRotating(tokenPath, log)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	owner := &captureTraces{}
+	ready := make(chan struct{})
+	rcv := &sgReceiver{
+		grpcAddr: freeAddr(t),
+		httpAddr: freeAddr(t),
+		tokens:   tok.Tokens,
+		consume:  ownerReceive(owner), // the production callback
+		ready:    sync.OnceFunc(func() { close(ready) }),
+		log:      log,
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	errc := make(chan error, 1)
+	go func() { errc <- rcv.Run(ctx) }()
+	select {
+	case <-ready:
+	case err := <-errc:
+		t.Fatalf("receiver stopped before it was ready: %v", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("the receiver never became ready")
+	}
+
+	send := func(t *testing.T, endpoint, protocol string) {
+		t.Helper()
+		c, err := otlpexport.New(otlpexport.Config{
+			Endpoint: endpoint, Protocol: protocol, Insecure: true,
+			BearerTokenFile: tokenPath, Compression: "gzip", Timeout: 5 * time.Second,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = c.Close() }()
+		td := oneClientSpan()
+		td.ResourceSpans().At(0).Resource().Attributes().PutBool(servicegraph.ForwardedMarker, true)
+		if err := c.ExportTraces(ctx, td); err != nil {
+			t.Fatalf("a marked %s forward to the internal port was refused: %v", protocol, err)
+		}
+	}
+	send(t, rcv.grpcAddr, "grpc")
+	send(t, "http://"+rcv.httpAddr, "http")
+
+	if owner.spans() != 2 {
+		t.Fatalf("the owner chain saw %d spans, want 2 (one per transport)", owner.spans())
+	}
+	for _, batch := range owner.got {
+		if servicegraph.IsForwarded(batch) {
+			t.Error("the internal marker reached the owner chain, and from there the collector")
+		}
+	}
+
+	cancel()
+	<-errc
 }

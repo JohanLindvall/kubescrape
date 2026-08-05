@@ -47,10 +47,11 @@ var (
 		"Log records by the enrichment strategy that matched (json, logfmt, pattern, none).", "format")
 	LogEnrichTimeRejected = Registry.Counter("kubescrape_log_enrich_time_rejected_total",
 		"Timestamps parsed from a log line that did NOT replace the producer's own (the CRI/journal/event time) "+
-			"because they sat a whole zone offset away from it — a quarter-hour multiple between 15 minutes and 14 "+
-			"hours. A steady rate means a workload logs local wall-clock time with no zone, which enrichment must read "+
-			"as UTC; those records keep the accurate ingest time instead of being misdated by the offset. A "+
-			"legitimately old timestamp (an archive, a backfill) does not land on that grid and is kept.")
+			"because the line's timestamp carried no zone. Such a stamp is a wall clock enrichment must read as UTC, "+
+			"so a workload running with TZ set to anything else would misdate every record by that offset; the "+
+			"accurate ingest time is kept instead. A timestamp that states its own offset (RFC3339, an epoch, any "+
+			"zoned layout) always wins, however old it is, and a record with no producer timestamp at all takes the "+
+			"parsed one either way.")
 	// The two lag gauges were named the other way round: the unqualified
 	// kubescrape_log_lag_bytes was the per-file MAXIMUM and the _total_bytes
 	// suffix carried the sum. Both are gauges, and _total is reserved for
@@ -196,6 +197,8 @@ var (
 		"Parsed samples discarded before conversion, by pipeline and by what discarded them: filter = the config's metrics keep/drop rules, relabel = a monitor's metricRelabelings.", "pipeline", "reason")
 	ScrapeMalformed = Registry.CounterVec("kubescrape_scrape_malformed_total",
 		"Exposition samples dropped as malformed by pipeline (unparseable lines, histogram buckets without le, summary rows without quantile).", "pipeline")
+	ScrapeExemplarsMalformed = Registry.CounterVec("kubescrape_scrape_exemplars_malformed_total",
+		"Unparseable OpenMetrics exemplar suffixes by pipeline. NO data was lost: the samples carrying them were exported without the exemplar, which is why this is separate from kubescrape_scrape_malformed_total. Only ever nonzero where exemplar scraping is enabled.", "pipeline")
 	ScrapeCollisions = Registry.Counter("kubescrape_scrape_name_collisions_total",
 		"Data points dropped because their family name was already claimed by a metric of another shape in the same batch (a target redeclaring a family's TYPE mid-exposition).")
 )

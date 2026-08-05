@@ -223,8 +223,13 @@ func (r *Reader) Run(ctx context.Context) {
 	// shutdownDrain. (azurediag deliberately has NO final flush at all: its
 	// position is the consumer group's committed offsets, so an uncommitted
 	// poll simply replays.) Missing the deadline loses nothing this reader
-	// owns either: the cursor is committed only on a successful export, so a
-	// dropped final batch is re-read from the journal after the restart.
+	// owns ONCE A CURSOR EXISTS: the cursor is committed only on a successful
+	// export, so a dropped final batch is re-read from the journal after the
+	// restart. The exception is a shutdown before ANY cursor has been committed
+	// (first run, or no positions store) — a reopen with an empty cursor seeks
+	// to the journal TAIL, so a lost final batch cannot be recovered; the Run
+	// loop's retry-in-place while no cursor exists narrows that window but the
+	// final flush here is single-shot.
 	//
 	// WithoutCancel, not Background: the values the caller put on ctx (the
 	// otlpexport ownership marker rides there) must survive.
@@ -417,7 +422,10 @@ func (r *Reader) flush(ctx context.Context) error {
 	obs.JournalEntries.Add(float64(ld.LogRecordCount()))
 	// Count truncations here, not at read time: a batch whose export fails is
 	// re-read from the committed cursor and re-sanitized, so a per-read counter
-	// would double-count. Like JournalEntries, this reflects delivered records.
+	// would double-count. This scans r.batch — the whole exported batch — so
+	// unlike JournalEntries (delivered records) it also counts a truncation on
+	// an entry the rules dropped: truncation is a read-side sanitation event,
+	// and the rules run downstream of it.
 	truncated := 0
 	for i := range r.batch {
 		if r.batch[i].origLen > 0 {

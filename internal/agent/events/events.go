@@ -130,6 +130,14 @@ type Reader struct {
 	// logchain.Pending's convert-once/clear-with-the-batch discipline: cleared
 	// with the batch (settle) and on a stream restart that re-reads it.
 	pending logchain.Pending
+	// rendered is the number of LEADING batch entries the current pending
+	// payload covers, frozen when convert runs. On a redelivers=false restart
+	// (cold, before the first commit) the batch and its rendering are retained
+	// while the new watch appends FRESH entries past index `rendered` — those
+	// are not in the exported payload, so settle must commit only over the
+	// covered prefix and keep the tail, or a flush would advance the position
+	// (and the watermark) past events it never exported, losing them silently.
+	rendered int
 	// committed is the position every exported batch has reached; pending is
 	// the newest position SEEN (bookmarks included) but not yet exported.
 	committed Position
@@ -360,6 +368,7 @@ func (r *Reader) stream(ctx context.Context) error {
 		// (logchain.Pending's restart-clear case — the loss journald had for
 		// the same reason).
 		r.pending.Discard()
+		r.rendered = 0
 		r.pendingRV = "" // a bookmark from the dead stream vouches only for its own deliveries
 	}
 	w, err := r.cfg.Client.CoreV1().Events(r.cfg.Namespace).Watch(ctx, metav1.ListOptions{
@@ -557,16 +566,19 @@ func (r *Reader) flush(ctx context.Context) error {
 	// (logchain.Pending owns that discipline). settle() clears the pair with
 	// the batch, and stream()'s restart reset clears it too.
 	ld := r.pending.Render(r.convert)
-	// The batch's HIGH-WATER entry, not its last one. A relist delivers the
-	// backlog in store order and each object carries its own resourceVersion,
-	// so the last entry is routinely older than one earlier in the batch —
-	// committing it walked the position BACKWARDS (redelivery on restart), and
-	// in the other order committed a high RV while lower-RV entries of the
-	// same backlog were still undelivered (outright loss on a kill right
-	// after). The whole batch has exported by the time settle runs, so the
-	// maximum is exactly what is safe to commit.
+	// The high-water position over the RENDERED PREFIX, not the whole batch. A
+	// relist delivers the backlog in store order and each object carries its
+	// own resourceVersion, so the last entry is routinely older than one
+	// earlier in the batch — committing it walked the position BACKWARDS
+	// (redelivery on restart), and in the other order committed a high RV while
+	// lower-RV entries of the same backlog were still undelivered (outright
+	// loss on a kill right after). So take the maximum — but only over
+	// [:rendered], the entries this payload actually carries: a redelivers=false
+	// restart appends fresh entries past that boundary that are NOT exported
+	// yet, and committing their RV would lose them (see the `rendered` field).
+	covered := min(r.rendered, len(r.batch))
 	newest := r.batch[0]
-	for _, e := range r.batch[1:] {
+	for _, e := range r.batch[1:covered] {
 		if newerRV(e.rv, newest.rv) {
 			newest.rv = e.rv
 		}
@@ -589,17 +601,26 @@ func (r *Reader) flush(ctx context.Context) error {
 			obs.EventsExported.Add(float64(count))
 		}
 	}
-	r.settle(newest)
+	r.settle(newest, covered)
 	r.lastFlush = time.Now()
 	return nil
 }
 
-// settle clears the batch and advances the position to what it covered.
-func (r *Reader) settle(newest entry) {
-	clear(r.batch)
-	r.batch = r.batch[:0]
-	// The converted payload belongs to the batch just settled.
+// settle advances the position to what the exported payload covered and drops
+// exactly those entries, RETAINING any appended past the rendered prefix (a
+// redelivers=false restart's fresh, not-yet-exported entries — see the
+// `rendered` field). covered is the prefix length the payload rendered.
+func (r *Reader) settle(newest entry, covered int) {
+	covered = min(covered, len(r.batch))
+	// Slide the retained tail to the front (copy is memmove-safe for the
+	// overlap) and clear the vacated slots so settled entries aren't pinned.
+	n := copy(r.batch, r.batch[covered:])
+	clear(r.batch[n:])
+	r.batch = r.batch[:n]
+	// The converted payload belongs to the prefix just settled; the tail
+	// converts afresh (and is observed by log-metrics) on the next flush.
 	r.pending.Discard()
+	r.rendered = 0
 	if newest.rv != "" && newerRV(newest.rv, r.committed.ResourceVersion) {
 		r.committed.ResourceVersion = newest.rv
 	}

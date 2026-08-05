@@ -430,5 +430,13 @@ func (s *DynamicMetricSet) add(values func(string) (float64, bool), lookup func(
 		ac.buf, ac.rbuf = rule.observe(ac.valueFn, ac.labelFn, resource, resAccum, line, &ac.ctx, ac.buf, ac.rbuf)
 	}
 	ac.values, ac.lookup, ac.raw = nil, nil, "" // do not retain caller state in the pool
+	// Drop every reference into the line before pooling: the Fields holds the
+	// line string + its raws/vals views (up to one ~1 MiB multiline body), and
+	// buf/rbuf label values alias it too (a __line__ label IS the whole line).
+	// Clearing lookup state alone left the last line pinned until the next Add.
+	// clear() only, no alloc — the per-line budget tests must stay 0/1-alloc.
+	ac.line.Release()
+	clear(ac.buf[:cap(ac.buf)])
+	clear(ac.rbuf[:cap(ac.rbuf)])
 	s.pool.Put(ac)
 }

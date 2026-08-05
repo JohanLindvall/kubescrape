@@ -175,6 +175,11 @@ func (r *Reader) resource(ctx context.Context, e *corev1.Event) (string, pcommon
 // Bodies are already scrubbed: ingest redacts where it builds the batch entry,
 // before the record exists, so the chain's Scrub is nil.
 func (r *Reader) convert() plog.Logs {
+	// The payload covers exactly the entries present now; anything appended
+	// afterward (a redelivers=false restart's new watch) is not in it and must
+	// not be settled past. logchain.Pending renders once per epoch, so this is
+	// set once per epoch too.
+	r.rendered = len(r.batch)
 	ld := plog.NewLogs()
 	groups := logchain.NewGroups(ld, ScopeName, 8)
 	sink := &recordSink{observed: pcommon.NewTimestampFromTime(time.Now())}

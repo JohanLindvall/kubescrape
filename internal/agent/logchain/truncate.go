@@ -9,6 +9,11 @@ import "unicode/utf8"
 // s[:n], which could split a multibyte rune and put invalid UTF-8 into an
 // error string.
 func TruncateRunes(s string, n int) string {
+	// n <= 0 means "at most zero bytes"; without this, s[n] below panics on a
+	// negative n. Callers pass positive constants, but the cut must be total.
+	if n <= 0 {
+		return ""
+	}
 	if len(s) <= n {
 		return s
 	}

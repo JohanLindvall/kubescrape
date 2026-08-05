@@ -539,15 +539,36 @@ func (e *Enricher) buildFor(pod *kubemeta.Pod, container *kubemeta.Container) pc
 	return built
 }
 
+// countedKey namespaces the "this token's outcome has been tallied" marker so
+// it cannot collide with the token's built-attribute entry nor the resolvability
+// probe. It is what decouples COUNTING from CACHING: the shared sameObject
+// resolves its candidate tokens through attrsFor, which populates cache[token]
+// WITHOUT counting, so a "was cache[token] present?" test tallied nothing for a
+// token sameObject had already resolved.
+func countedKey(token string) string { return "\x00counted:" + token }
+
 // builtAttrs returns the k8s attributes for a kind-tagged ID token — attrsFor
 // plus the outcome counting, for single-token callers: the metadata lookup,
 // the attribute build and the enriched/unresolved tally each happen once per
 // distinct token per cache (so the per-resource counters stay per-resource;
 // resource() is memoized by id). An empty map means the ID did not resolve.
+//
+// The tally is gated on a SEPARATE counted-marker, NOT on whether attrsFor had
+// to build the attributes. The split path calls sameObject (merge-vs-overwrite)
+// BEFORE builtAttrs for the same id, and sameObject resolves both tokens through
+// attrsFor — so by the time builtAttrs runs the id is already in the cache. The
+// old "was it cached?" gate therefore tallied NOTHING for every described
+// object on the datapoint/split path (foreign objects AND same-pod merges),
+// silently zeroing the enriched/unresolved signal for exactly the mode it
+// matters most. The marker fires the FIRST time builtAttrs sees a token per
+// request and never again, so it stays once-per-object and cannot double-count
+// when both sameObject and builtAttrs — or two groupers sharing the cache — run
+// for the same id.
 func (e *Enricher) builtAttrs(ctx context.Context, cache map[string]pcommon.Map, token string) pcommon.Map {
-	_, cached := cache[token]
 	built := e.attrsFor(ctx, cache, token)
-	if !cached {
+	ck := countedKey(token)
+	if _, counted := cache[ck]; !counted {
+		cache[ck] = pcommon.NewMap() // presence marks the outcome as tallied
 		if built.Len() > 0 {
 			obs.Ingested.WithLabelValues("enriched").Inc()
 		} else {

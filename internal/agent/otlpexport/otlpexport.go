@@ -474,6 +474,12 @@ func outcome(err error) string {
 // backoff persists across queue cycles, and its budget is the poison tracker
 // (sink.stuckTooLong), none of which a bounded in-call loop can express.
 func Retry(ctx context.Context, attempts int, initial time.Duration, send func() error) error {
+	// Always send at least once: attempts <= 0 must not report a success for a
+	// send that never happened. Unreachable today (callers pass >= 1), but this
+	// is the shared retry shape.
+	if attempts < 1 {
+		attempts = 1
+	}
 	var err error
 	backoff := initial
 	for attempt := 0; attempt < attempts; attempt++ {

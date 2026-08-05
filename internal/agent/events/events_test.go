@@ -383,7 +383,7 @@ func TestExpiryRelistsRatherThanSkippingAhead(t *testing.T) {
 		t.Fatalf("an uncommitted relist must persist (rv=%q, err=%v)", rv, err)
 	}
 	// A commit secures the replay and disarms it.
-	r.settle(entry{rv: "1001", when: time.Now()})
+	r.settle(entry{rv: "1001", when: time.Now()}, len(r.batch))
 	if rv, _, err = r.startResourceVersion(context.Background()); err != nil || rv != "1001" {
 		t.Fatalf("after a commit the reader resumes from it (rv=%q, err=%v)", rv, err)
 	}
@@ -554,7 +554,7 @@ func TestSettleNeverRegressesTheCommittedPosition(t *testing.T) {
 	mark := time.Now()
 	r.committed.Watermark = mark
 
-	r.settle(entry{rv: "9880001", when: mark.Add(-time.Minute)})
+	r.settle(entry{rv: "9880001", when: mark.Add(-time.Minute)}, len(r.batch))
 	if got := r.committed.ResourceVersion; got != "9900400" {
 		t.Errorf("committed %q after settling an older batch; want 9900400 held — a backwards position redelivers every event in between on the next resume", got)
 	}
@@ -566,7 +566,7 @@ func TestSettleNeverRegressesTheCommittedPosition(t *testing.T) {
 	// A non-numeric resourceVersion is not comparable, so it must be REFUSED
 	// rather than guessed at — the conservative direction is keeping what we
 	// have, since a wrong guess forward is outright loss.
-	r.settle(entry{rv: "not-a-number", when: mark})
+	r.settle(entry{rv: "not-a-number", when: mark}, len(r.batch))
 	if got := r.committed.ResourceVersion; got != "9900400" {
 		t.Errorf("committed %q from an uncomparable resourceVersion; want the known-good 9900400 kept", got)
 	}
@@ -869,7 +869,7 @@ func TestWatermarkIsClampedToWallClock(t *testing.T) {
 
 	future := now.Add(2 * time.Hour)
 	r.batch = []entry{{when: future}}
-	r.settle(entry{when: future})
+	r.settle(entry{when: future}, len(r.batch))
 
 	if r.committed.Watermark.After(now) {
 		t.Errorf("watermark = %v, later than wall clock %v: a fast reporter clock latched the boundary",
@@ -877,5 +877,58 @@ func TestWatermarkIsClampedToWallClock(t *testing.T) {
 	}
 	if r.committed.Watermark.IsZero() {
 		t.Error("the clamp must not discard the watermark entirely")
+	}
+}
+
+// A redelivers=false restart (cold — before the first commit) retains the batch
+// AND its already-rendered payload while the new watch appends fresh entries.
+// A subsequent successful flush exports only the frozen prefix, so it must
+// commit the position over that prefix alone: committing past the appended-but-
+// unexported tail loses those events silently (the watermark then filters them
+// out of any relist forever).
+func TestColdRestartGrowthDoesNotCommitPastUnexported(t *testing.T) {
+	exp := &captureExporter{failN: 1, err: context.DeadlineExceeded}
+	r, _, _ := newReader(t, Config{Exporter: exp, BatchSize: 100})
+	ctx := context.Background()
+	now := time.Now()
+
+	// Cold reader (nothing committed). Ingest A (rv 10); the first flush fails
+	// transiently, so the batch and its rendering are retained.
+	if err := r.handle(ctx, watch.Event{Type: watch.Added, Object: event("a", "R", "m", "Normal", "10", 1, now)}); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.flush(ctx); err == nil {
+		t.Fatal("first flush should fail transiently")
+	}
+
+	// The redelivers=false restart's new watch appends B (rv 11) past the frozen
+	// prefix — the batch grows while the pending payload still covers only [A].
+	if err := r.handle(ctx, watch.Event{Type: watch.Added, Object: event("b", "R", "m", "Normal", "11", 1, now.Add(time.Second))}); err != nil {
+		t.Fatal(err)
+	}
+
+	// The second flush succeeds but ships only [A]; it must NOT commit past B.
+	if err := r.flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if r.committed.ResourceVersion == "11" {
+		t.Fatal("committed rv=11 but B was never exported — silent event loss")
+	}
+	if r.committed.ResourceVersion != "10" {
+		t.Fatalf("committed=%q, want 10 (A's rv, the exported prefix)", r.committed.ResourceVersion)
+	}
+	if len(r.batch) != 1 || r.batch[0].rv != "11" {
+		t.Fatalf("the unexported tail must be retained; batch=%+v", r.batch)
+	}
+
+	// The third flush ships B and commits it — nothing lost.
+	if err := r.flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if r.committed.ResourceVersion != "11" {
+		t.Fatalf("committed=%q, want 11 after shipping B", r.committed.ResourceVersion)
+	}
+	if got := exp.records(); len(got) != 2 {
+		t.Fatalf("exported %d records, want 2 (A then B, each exactly once)", len(got))
 	}
 }

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"net/http"
 	neturl "net/url"
 	"regexp"
@@ -409,7 +410,23 @@ func parsePromDuration(s string) (time.Duration, error) {
 		if err != nil {
 			return 0, fmt.Errorf("duration %q: %w", s, err)
 		}
-		out += time.Duration(n) * u
+		// n and u are both non-negative, so both the per-term multiply and the
+		// running sum are monotonic: a value that wraps int64 lands on a small
+		// or negative duration that the caller's `d <= 0` gate reads as a
+		// plausibly-tiny cadence rather than as invalid. The CRD's `[0-9]+`
+		// admits any magnitude, so scrapeTimeout "18446744073710ms" wrapped to
+		// +448µs — a deadline every scrape exceeds (total metric loss), with no
+		// invalid-duration warning. Refuse the overflow at EACH accumulation
+		// step (compound forms like "290y290y" overflow the sum, not one term)
+		// so parseTargetDuration warns and falls back like any other bad value.
+		if n > math.MaxInt64/int64(u) {
+			return 0, fmt.Errorf("duration %q: overflows time.Duration", s)
+		}
+		term := time.Duration(n) * u
+		if out > math.MaxInt64-term {
+			return 0, fmt.Errorf("duration %q: overflows time.Duration", s)
+		}
+		out += term
 	}
 	return out, nil
 }

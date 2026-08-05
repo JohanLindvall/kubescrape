@@ -11,7 +11,7 @@ import (
 // can never appear in a pod status, so holding it — as a blocked lookup's
 // waiter-map key, as a request path segment — would only serve memory
 // amplification. The store and the HTTP server each enforce it their own way
-// (a degrade-to-miss, a 404), but against this ONE bound.
+// (a degrade-to-miss, a 400), but against this ONE bound.
 const MaxContainerIDLen = 256
 
 // NormalizeContainerID strips the runtime scheme prefix from a container ID,

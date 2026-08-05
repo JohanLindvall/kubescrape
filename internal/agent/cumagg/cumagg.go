@@ -342,7 +342,10 @@ func (st *Store[S]) Run(ctx context.Context, exp Exporter, interval time.Duratio
 		case <-ctx.Done():
 			// The final export runs on a DETACHED context: ctx is already done,
 			// and the last window's observations are as real as any other.
-			fctx, cancel := context.WithTimeout(context.Background(), finalExportTimeout)
+			// WithoutCancel, not Background: any values the caller put on ctx
+			// (the otlpexport ownership marker rides there) must survive the
+			// detach — the repo's shutdown-context invariant.
+			fctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), finalExportTimeout)
 			if err := st.Export(fctx, exp, res); err != nil {
 				log.Warn("final "+st.opt.Name+" export failed", "error", err)
 			}

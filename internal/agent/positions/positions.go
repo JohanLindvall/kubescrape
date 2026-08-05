@@ -15,6 +15,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 
 	"github.com/JohanLindvall/kubescrape/internal/obs"
@@ -73,9 +74,17 @@ func Open(path string) (*Store, error) {
 	// overlapping its replacement — is safe: that writer's rename simply
 	// fails, a save the design already treats as losable, and its next save
 	// starts from a fresh temp.
-	if orphans, err := filepath.Glob(filepath.Join(filepath.Dir(path), filepath.Base(path)+".tmp-*")); err == nil {
-		for _, orphan := range orphans {
-			_ = os.Remove(orphan)
+	//
+	// List the directory and match the basename prefix in code rather than
+	// embedding the path in a filepath.Glob pattern: a positions path holding
+	// a glob metacharacter ([ * ?) would otherwise make the pattern match — and
+	// remove — files that are not this store's temps.
+	if entries, err := os.ReadDir(filepath.Dir(path)); err == nil {
+		prefix := filepath.Base(path) + ".tmp-"
+		for _, e := range entries {
+			if strings.HasPrefix(e.Name(), prefix) {
+				_ = os.Remove(filepath.Join(filepath.Dir(path), e.Name()))
+			}
 		}
 	}
 	data, err := os.ReadFile(path)

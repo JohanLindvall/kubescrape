@@ -237,7 +237,15 @@ func (g *metricGrouper) resource(id string) pmetric.ResourceMetrics {
 	// cap the remaining objects share the source resource — unenriched, but
 	// forwarded and counted, which is strictly better than an OOM the process
 	// cannot defend against on an unauthenticated listener.
-	if len(g.rmByID) >= maxSplitGroups {
+	//
+	// The `id != ""` guard is load-bearing, not decorative: the fallback is
+	// itself the "" group, a SINGLE bucket that adds one to the cardinality no
+	// matter how many objects fold into it. Without the guard, a push that hit
+	// the cap with NO id-less point (so "" was never created) recursed
+	// forever — resource("") missed the map, saw the cap still exceeded, and
+	// called resource("") again: an unbounded stack on an unauthenticated
+	// listener, i.e. any pod could crash the agent with a >2048-object push.
+	if id != "" && len(g.rmByID) >= maxSplitGroups {
 		obs.Ingested.WithLabelValues("split_capped").Inc()
 		return g.resource("")
 	}

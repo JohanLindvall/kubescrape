@@ -54,6 +54,12 @@ func selfResolve(meta *metaclient.Client) func(context.Context) (*kubemeta.Pod, 
 	}
 }
 
+// selfInstanceName is the pod name agentSelfResource uses as a singleton's /
+// shard's service.instance.id, indirected through a var so a test can drive the
+// empty-name case a hostNetwork pod without $POD_NAME produces (selfPodName
+// reads /proc and os.Hostname, neither env-forceable).
+var selfInstanceName = selfPodName
+
 // selfPodName is this pod's name: $POD_NAME when the deployment wires it, else
 // the hostname.
 //

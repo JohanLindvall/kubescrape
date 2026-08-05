@@ -85,3 +85,28 @@ func TestPeekLeavesTheBucketUntouched(t *testing.T) {
 		t.Fatal("Peek mutated the bucket (banked the refill or moved last)")
 	}
 }
+
+// An out-of-order `now` (concurrent handlers read the clock outside the bucket
+// mutex) must not debit tokens or rewind `last`: it is billed as zero elapsed.
+func TestBucketOutOfOrderNowDoesNotDebit(t *testing.T) {
+	b := NewBucket(10) // burst 10, starts full
+	t0 := time.Unix(1_000_000, 0)
+	// Prime `last` and spend down to a known level at t0.
+	if !b.TakeExact(10, t0) {
+		t.Fatal("full bucket must admit its whole burst")
+	}
+	// A later handler advances to t0+1s, crediting 10 tokens, and takes 5.
+	if !b.TakeExact(5, t0.Add(time.Second)) {
+		t.Fatal("after 1s the bucket refilled 10; taking 5 must succeed")
+	}
+	// A straggler now reads an EARLIER clock (t0). It must neither debit nor
+	// rewind: the 5 tokens banked as of t0+1s stay available.
+	if !b.TakeExact(5, t0) {
+		t.Fatal("an out-of-order earlier `now` debited the bucket (F8 regression)")
+	}
+	// And a genuine later time still refills from the highest observed instant,
+	// not the stale straggler value.
+	if !b.TakeExact(10, t0.Add(2*time.Second)) {
+		t.Fatal("refill must resume from the max observed time, not the rewound one")
+	}
+}

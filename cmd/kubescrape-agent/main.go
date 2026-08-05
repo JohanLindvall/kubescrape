@@ -84,8 +84,17 @@ func agentSelfResource(node string) pcommon.Resource {
 	//
 	// Keyed on actually BEING the singleton — perNodePipelinesOff, which
 	// carries the war story — not merely on the flag.
+	//
+	// Only when there is a pod name to use: selfPodName() is "" for a hostNetwork
+	// pod with no $POD_NAME (or on a hostname error). Putting that empty string
+	// would make attrs.Identity treat the key as ALREADY SET and skip its
+	// fallback, pinning the process onto (job, instance="") — merged with every
+	// other empty-instance process, which is strictly worse than the
+	// node/hostname fallback Identity derives when the key is left absent.
 	if singletonRole() || shardRole() {
-		a.PutStr("service.instance.id", selfPodName())
+		if inst := selfInstanceName(); inst != "" {
+			a.PutStr("service.instance.id", inst)
+		}
 	}
 	attrs.Identity(res)
 	return res
@@ -324,8 +333,8 @@ type pipelines struct {
 	// journalRules is the compiled logs.rules chain, applied to journal entries
 	// as well as container logs (same section, same semantics).
 	journalRules *logline.LineFilter
-	// spanMetricsGen is published by startIngest so run() can export the last
-	// aggregation window after every producer has joined.
+	// spanMetricsGen is published by buildOwnerChain (servicegraph.go) so run()
+	// can export the last aggregation window after every producer has joined.
 	spanMetricsGen *spanmetrics.Generator
 	spanMetricsRes pcommon.Resource
 	// The service-graph shard's pairing processor and edge registry, published
@@ -717,20 +726,31 @@ func run() error {
 
 	// Registered AFTER the exporter/spool Close defers (LIFO): an early `return
 	// err` below must stop and drain every started goroutine BEFORE their
-	// exporter and spools are closed under them. The normal path's inline
-	// wg.Wait makes this a no-op there.
+	// exporter and spools are closed under them.
 	//
-	// BOUNDED, like the inline join. A bare wg.Wait() here silently undid the
-	// budget on the one path where it matters: a producer wedged against a dead
-	// collector held the process past its terminationGracePeriodSeconds and was
-	// SIGKILLed anyway, having first prevented the closes below it from running.
-	// Missing the deadline costs nothing a producer owns — log offsets, the
-	// journal cursor and the events position are all re-read on the next start.
+	// BOUNDED, and on the normal shutdown path CLAMPED TO THE SHARED DEADLINE
+	// (shutdownBy, anchored once ctx is cancelled below). This is NOT a no-op on
+	// that path when a producer is wedged: the inline join in the shutdown
+	// sequence times out and CONTINUES to the final exports rather than finishing
+	// the wg, so a fresh shutdownDrain here would stack on top of the inline join
+	// and the steps — shutdownDrain + shutdownTotal = 15s + 45s = 60s, EXACTLY
+	// the terminationGracePeriodSeconds, SIGKILLed mid-close with nothing spared
+	// for the exporter/spool Closes below or the kubelet's own overhead. Clamping
+	// to time.Until(shutdownBy) keeps the whole sequence inside shutdownTotal. On
+	// an early return shutdownBy is still zero and the full shutdownDrain is right
+	// — no steps ran, so there is nothing to fit under. Missing the deadline costs
+	// nothing a producer owns — log offsets, the journal cursor and the events
+	// position are all re-read on the next start.
+	var shutdownBy time.Time // anchored when the shutdown sequence begins (below)
 	defer func() {
 		stop()
-		if !waitFor(&wg, shutdownDrain) {
+		budget := shutdownDrain
+		if !shutdownBy.IsZero() {
+			budget = min(shutdownDrain, time.Until(shutdownBy))
+		}
+		if !waitFor(&wg, budget) {
 			log.Warn("producers did not stop within the shutdown budget; closing anyway",
-				"budget", shutdownDrain)
+				"budget", budget)
 		}
 	}()
 
@@ -845,7 +865,7 @@ func run() error {
 	// so the last step in the sequence, the disk-buffer drain, was the one
 	// SIGKILLed. Now the whole thing fits in shutdownTotal with the grace period
 	// to spare, which is what the constant's comment always claimed.
-	shutdownBy := time.Now().Add(shutdownTotal)
+	shutdownBy = time.Now().Add(shutdownTotal)
 	// BOUNDED. Everything that salvages in-memory state runs after this: the
 	// final log-metrics window (DynamicMetricSet.Run deliberately does not
 	// export on cancel, so this is its only chance), the final span-metrics

@@ -2,6 +2,7 @@ package promscrape
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"sync/atomic"
@@ -42,6 +43,38 @@ func TestRelabelKeepDrop(t *testing.T) {
 	// nil for rule-less targets.
 	if f, _ := c.session(nil); f != nil {
 		t.Fatal("no rules must yield nil session")
+	}
+}
+
+// The compiled-chain cache is bounded: a controller minting monitors with
+// distinct (templated/hashed) regexes must not leak a compiled chain per
+// fingerprint for the process' life. Evict-one at the cap keeps it hot.
+func TestRelabelCacheBounded(t *testing.T) {
+	var c relabelCache
+	for i := 0; i < maxRelabelChains*3; i++ {
+		f, err := c.session([]kubemeta.RelabelRule{
+			{Action: "drop", SourceLabels: []string{"__name__"}, Regex: fmt.Sprintf("metric_%d_.*", i)},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if f == nil {
+			t.Fatal("nil session for a rule-bearing target")
+		}
+		// An evicted chain must not invalidate a live session (it holds its own
+		// compiled slice): its drop rule still matches its own metric name.
+		if f.Keep(fmt.Sprintf("metric_%d_x", i), nil) {
+			t.Fatalf("session %d did not apply its own compiled chain (matching name not dropped)", i)
+		}
+	}
+	c.mu.Lock()
+	n := len(c.m)
+	c.mu.Unlock()
+	if n > maxRelabelChains {
+		t.Errorf("cache holds %d chains, want <= %d", n, maxRelabelChains)
+	}
+	if n == 0 {
+		t.Error("cache emptied itself: every scrape would recompile its chain")
 	}
 }
 

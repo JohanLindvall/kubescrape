@@ -270,8 +270,8 @@ func (r *statusRecorder) WriteHeader(code int) {
 
 // maxContainerIDLen bounds the container-ID path segment
 // (kubemeta.MaxContainerIDLen carries the 64-hex-runtime rationale): over it
-// the request 404s up front, so hostile IDs never reach the store's waiter
-// map.
+// the request 400s up front (handlers.go writes StatusBadRequest), so hostile
+// IDs never reach the store's waiter map.
 const maxContainerIDLen = kubemeta.MaxContainerIDLen
 
 // monitorEndpoint pairs a ServiceMonitor endpoint with its monitor name.

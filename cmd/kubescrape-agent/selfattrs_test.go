@@ -166,6 +166,35 @@ func TestAgentSelfResourceSingletonInstance(t *testing.T) {
 	}
 }
 
+// A hostNetwork singleton with no $POD_NAME has no pod name to use as its
+// instance (selfPodName is ""). It must NOT stamp an EMPTY service.instance.id:
+// attrs.Identity treats a present key as set and returns early, so the empty
+// string would stick and merge this process onto (job, instance="") with every
+// other empty-instance process. Leaving the key absent lets Identity derive its
+// node fallback instead — worse-labelled but not colliding.
+func TestAgentSelfResourceSingletonEmptyPodName(t *testing.T) {
+	defer func(e, a, l, m, c, n, j, i bool) {
+		*eventsOn, *azureOn = e, a
+		*logsOn, *metricsOn, *cadvisorOn, *nodeOn, *journaldOn, *ingestOn = l, m, c, n, j, i
+	}(*eventsOn, *azureOn, *logsOn, *metricsOn, *cadvisorOn, *nodeOn, *journaldOn, *ingestOn)
+	defer func(f func() string) { selfInstanceName = f }(selfInstanceName)
+
+	// The real singleton shape (a cluster-scoped pipeline, every per-node one
+	// off) with no resolvable pod name — the hostNetwork-without-$POD_NAME case.
+	*eventsOn, *azureOn = true, false
+	*logsOn, *metricsOn, *cadvisorOn, *nodeOn, *journaldOn, *ingestOn = false, false, false, false, false, false
+	selfInstanceName = func() string { return "" }
+
+	res := agentSelfResource("node1")
+	v, ok := res.Attributes().Get("service.instance.id")
+	if !ok {
+		t.Fatalf("service.instance.id absent; want the derived node fallback")
+	}
+	if got := v.AsString(); got != "node1" {
+		t.Fatalf("service.instance.id = %q; want the node fallback %q, never an empty string", got, "node1")
+	}
+}
+
 // The namespace half of the Prometheus job must be present from the FIRST
 // export: deriving it later, when /v1/self answers, renames the job of
 // already-running cumulative series.

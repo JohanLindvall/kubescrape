@@ -45,11 +45,23 @@ func NewBucket(rate float64) *Bucket {
 // refillLocked banks the tokens accrued since the last operation. The
 // first-call guard matters: with last still zero there is no elapsed interval
 // to bill, only the initial full burst.
+//
+// A NEGATIVE elapsed is treated as zero, and `last` only ever moves forward:
+// tracesample reads its clock OUTSIDE the bucket mutex (concurrent ingest
+// handlers, injectable-clock design), so two handlers can reach refillLocked
+// with out-of-order `now` values. Billing a negative interval would DEBIT
+// tokens and rewind `last`, transiently misaccounting the rate cap; clamping
+// makes a late handler's earlier `now` a harmless no-op instead. Tokens
+// accrued equal rate × (max observed now − start), which is exactly right.
 func (b *Bucket) refillLocked(now time.Time) {
 	if !b.last.IsZero() {
-		b.tokens = min(b.burst, b.tokens+b.rate*now.Sub(b.last).Seconds())
+		if elapsed := now.Sub(b.last); elapsed > 0 {
+			b.tokens = min(b.burst, b.tokens+b.rate*elapsed.Seconds())
+		}
 	}
-	b.last = now
+	if now.After(b.last) {
+		b.last = now
+	}
 }
 
 // TakeExact takes n tokens if the bucket holds them all, and reports whether
@@ -99,7 +111,9 @@ func (b *Bucket) Peek(n float64, now time.Time) bool {
 	defer b.mu.Unlock()
 	tokens := b.tokens
 	if !b.last.IsZero() {
-		tokens = min(b.burst, tokens+b.rate*now.Sub(b.last).Seconds())
+		if elapsed := now.Sub(b.last); elapsed > 0 { // never a negative bill (see refillLocked)
+			tokens = min(b.burst, tokens+b.rate*elapsed.Seconds())
+		}
 	}
 	return tokens >= min(n, b.burst)
 }

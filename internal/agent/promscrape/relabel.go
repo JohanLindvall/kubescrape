@@ -33,11 +33,22 @@ type relabelFilter struct {
 	buf   []byte
 }
 
-// relabelCache caches compiled chains by fingerprint.
+// relabelCache caches compiled chains by fingerprint. It is process-global (one
+// per Scraper), shared across the concurrent scrape goroutines, and keyed by the
+// full rule text — so a controller minting monitors with templated or hashed
+// regexes would otherwise leak a compiled chain per distinct fingerprint for the
+// process' life. Bounded like its siblings (tlsClients, podCache, warned).
 type relabelCache struct {
 	mu sync.Mutex
 	m  map[string][]compiledRelabel
 }
+
+// maxRelabelChains bounds the compiled-chain cache. The distinct-chain count of
+// a real fleet is tiny (rules rarely differ across monitors and rarely change),
+// so the cap only defends against a generator churning fingerprints; evict-one
+// rather than clear (like tlsClients) so a steady population above the cap does
+// not recompile every chain each cycle.
+const maxRelabelChains = 1024
 
 // session compiles (or reuses) the chain for a target and returns a fresh
 // session around it. Returns nil for targets without rules; a compile error
@@ -84,6 +95,13 @@ func (c *relabelCache) session(rules []kubemeta.RelabelRule) (*relabelFilter, er
 		c.mu.Lock()
 		if c.m == nil {
 			c.m = map[string][]compiledRelabel{}
+		}
+		// Evict one arbitrary entry at the cap before inserting the new chain.
+		if _, present := c.m[key]; !present && len(c.m) >= maxRelabelChains {
+			for k := range c.m {
+				delete(c.m, k)
+				break
+			}
 		}
 		c.m[key] = compiled
 		c.mu.Unlock()

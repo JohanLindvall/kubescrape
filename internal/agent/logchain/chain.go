@@ -122,7 +122,13 @@ type Chain[K comparable] struct {
 // perRecordRules says that some record in this batch may carry its OWN rule set
 // (Input.PodRules). It is a constructor argument rather than a per-record
 // discovery because the scratch slice and the resolver must exist before the
-// first record, and answering it costs the caller one pass over its files.
+// first record, and answering it costs the caller one pass over its files. It
+// is a PROMISE, not a hard precondition: a record arriving with PodRules
+// despite perRecordRules=false upgrades the chain lazily in Emit (one
+// allocation, on that unpinned path only) — the promise is kept by an ordering
+// argument a package away (the tailer's anyPodRules pass over t.files), and a
+// drifted caller must degrade to a small cost, not to a nil-slice panic on the
+// sweep goroutine that serves every log file on the node.
 func NewChain[K comparable](cfg Config, perRecordRules bool) *Chain[K] {
 	c := &Chain[K]{cfg: cfg, rules: cfg.Rules != nil || perRecordRules}
 	if c.cfg.LogMetrics != nil || c.rules {
@@ -160,6 +166,15 @@ func (c *Chain[K]) Line(body string) (string, logattrs.Result) {
 // the drop is already counted (obs.LogRulesDropped).
 func (c *Chain[K]) Emit(p Producer, in Input[K]) bool {
 	scratched := c.cfg.Rules != nil || in.PodRules != nil
+	if scratched && !c.rules {
+		// The perRecordRules promise was violated (see NewChain): upgrade
+		// instead of hitting the zero-value scratch slice.
+		c.rules = true
+		c.scratch = plog.NewLogRecordSlice()
+		if c.resolver == nil {
+			c.resolver = New()
+		}
+	}
 	var lr plog.LogRecord
 	if scratched {
 		lr = c.scratch.AppendEmpty()

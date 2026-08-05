@@ -1,9 +1,12 @@
 package attrs
 
 import (
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"regexp"
+	"regexp/syntax"
 	"slices"
 	"sort"
 	"strings"
@@ -90,10 +93,11 @@ type Config struct {
 var defaultInstancePrefix = map[string]string{"cadvisor": "cadvisor"}
 
 // validatePipelines rejects unknown pipeline names (strict YAML parsing cannot
-// catch bad map keys) and nested pipeline sections. It runs in LoadConfig and
-// again in NewBuilders, so the unified agent config path — which unmarshals
-// the section itself — gets the same errors instead of silently ignoring a
-// typo'd pipeline.
+// catch bad map keys) and nested pipeline sections. It runs in NewBuilders —
+// the one production entry point: the unified agent config unmarshals the
+// section itself, so this is what rejects a typo'd pipeline instead of
+// silently ignoring it. (The standalone LoadConfig lives on only in
+// builder_test.go.)
 func (c *Config) validatePipelines() error {
 	if c == nil {
 		return nil
@@ -149,6 +153,13 @@ func NewBuilders(cfg *Config, filter *Filter) (*Builders, error) {
 		// otherwise the built-in pipeline default (e.g. cadvisor) beats the
 		// top-level base, so a global prefix can't silently strip cadvisor's
 		// collision protection. mergeConfig already left the base value in place.
+		//
+		// KSM split resources LAYER rather than choose: the splitter applies its
+		// rule/default prefix (promscrape SplitRule.InstancePrefix) after Build
+		// has already applied the prefix resolved here, so a top-level
+		// instancePrefix yields "<ruleprefix>-<baseprefix>-<instance>" on split
+		// resources. The instances stay distinct (no collision) — just doubly
+		// prefixed.
 		if sub == nil || sub.InstancePrefix == nil {
 			if p, ok := defaultInstancePrefix[name]; ok {
 				merged.InstancePrefix = &p
@@ -301,7 +312,10 @@ var templateFuncs = template.FuncMap{
 }
 
 // NewBuilder compiles a Builder; a nil cfg means defaults only. Pipeline
-// sections of cfg are ignored here (see NewBuilders).
+// sections of cfg are ignored here (see NewBuilders). Templates are both
+// parsed AND dry-run (validateTemplate): the execution errors that are config
+// errors — a typo'd field, a bad literal regex — surface here, where
+// -check-config sees them, not as a silent per-resource skip at Build time.
 func NewBuilder(cfg *Config, filter *Filter) (*Builder, error) {
 	b := &Builder{defaults: true, filter: filter}
 	if cfg == nil {
@@ -325,9 +339,68 @@ func NewBuilder(cfg *Config, filter *Filter) (*Builder, error) {
 		if err != nil {
 			return nil, fmt.Errorf("attribute %q: %w", key, err)
 		}
+		if err := validateTemplate(tmpl); err != nil {
+			return nil, fmt.Errorf("attribute %q: %w", key, err)
+		}
 		b.dynamic = append(b.dynamic, dynamicAttr{key: key, tmpl: tmpl})
 	}
 	return b, nil
+}
+
+// validationContext is the synthetic Context every template is dry-run against
+// at construction: every pointer populated with a zero-value struct (including
+// the Pod's NamespaceMetadata), so any field a template names is resolved
+// against the real types. The VALUES are deliberately left zero — a non-empty
+// dummy would leak into regex patterns composed from context data
+// (`regexMatch (index .Pod.Labels "pat") ...` renders the pattern "", which
+// always compiles) and could manufacture errors no production value produces.
+func validationContext() Context {
+	return Context{
+		Node:      &NodeInfo{},
+		Pod:       &kubemeta.Pod{NamespaceMetadata: &kubemeta.ObjectMeta{}},
+		Container: &kubemeta.Container{},
+		Service:   &kubemeta.Service{},
+	}
+}
+
+// validateTemplate dry-runs tmpl against validationContext and returns the
+// execution error when it is a config error — one no production Context could
+// avoid. Build's skip-on-error stays the not-applicable escape (a nil .Pod on
+// a node-level resource); this is what keeps that skip from also swallowing
+// typos forever.
+func validateTemplate(tmpl *template.Template) error {
+	err := tmpl.Execute(io.Discard, validationContext())
+	if err == nil || !templateConfigError(err) {
+		return nil
+	}
+	return err
+}
+
+// templateConfigError reports whether a dry-run execution error is
+// value-independent — broken against every Context, not just the synthetic
+// one. Two classes provably are:
+//
+//   - a field miss ("can't evaluate field X in type Y"): Context's types are
+//     static and carry no interface fields, so no production value makes the
+//     field appear. text/template has no typed error for it; the message is
+//     exec.errorf's, stable since Go 1, and pinned by TestTemplateValidation.
+//   - a regex that does not compile, from regexMatch/regexReplace: template
+//     function errors are wrapped (%w), so errors.As reaches the
+//     *syntax.Error. Only a literal (or env-derived — equally config-owned)
+//     pattern can fail here; a data-derived one renders "" against the
+//     zero-value context, and "" compiles.
+//
+// Everything else stays a runtime skip, because value-dependent errors are
+// legitimate against a zero-value context: {{ (index .Pod.Owners 0).Name }}
+// fails on the synthetic nil slice yet works on every owned pod, and
+// {{ slice .Pod.Name 0 5 }} fails on the empty name. Refusing any error would
+// reject configs that work in production.
+func templateConfigError(err error) bool {
+	var syn *syntax.Error
+	if errors.As(err, &syn) {
+		return true
+	}
+	return strings.Contains(err.Error(), "can't evaluate field")
 }
 
 // Build fills res from ctx. Safe on a nil receiver (defaults only, no
@@ -355,7 +428,12 @@ func (b *Builder) Build(res pcommon.Resource, ctx Context) {
 		for _, d := range b.dynamic {
 			sb.Reset()
 			// Execution errors (e.g. a nil .Pod on a node-level resource) and
-			// empty results mean "attribute not applicable here".
+			// empty results mean "attribute not applicable here". The silent
+			// skip is safe because construction dry-ran every template against
+			// a fully-populated Context (validateTemplate): the
+			// value-independent config errors — a typo'd field, a bad literal
+			// regex — were refused at startup, so only not-applicable contexts
+			// and value-dependent misses reach this branch.
 			if err := d.tmpl.Execute(&sb, ctx); err == nil && sb.Len() > 0 {
 				res.Attributes().PutStr(d.key, sb.String())
 			}
@@ -371,5 +449,18 @@ func (b *Builder) Build(res pcommon.Resource, ctx Context) {
 	}
 	// Prefix the (possibly template-overridden) instance last, before filtering.
 	PrefixInstance(res, b.instancePrefix)
+	b.filter.Apply(res)
+}
+
+// FilterResource applies the builder's global attribute filter to an
+// already-built resource. It exists for callers that stamp attributes AFTER
+// Build (the tailer's plain-source statics, which are applied post-Build so
+// they beat templates and defaults): the operator's enable/disable lists must
+// still get the last word over the final attribute set, exactly as they do
+// inside Build. Nil-safe.
+func (b *Builder) FilterResource(res pcommon.Resource) {
+	if b == nil {
+		return
+	}
 	b.filter.Apply(res)
 }

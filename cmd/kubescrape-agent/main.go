@@ -752,7 +752,11 @@ func run() error {
 	// exported (over the shared OTLP exporter), on their own interval.
 	var logMetrics *metrics.DynamicMetricSet
 	if fileCfg.LogMetrics != nil && len(fileCfg.LogMetrics.Metrics) > 0 {
-		opts := []metrics.Option{metrics.WithLogger(log), metrics.WithNamePrefix(*logsMetricsPrefix)}
+		// The permanent classifier is injected (the set cannot import
+		// otlpexport — obs sits between the packages): a definitively rejected
+		// chunk is dropped counted rather than re-offered forever.
+		opts := []metrics.Option{metrics.WithLogger(log), metrics.WithNamePrefix(*logsMetricsPrefix),
+			metrics.WithPermanentClassifier(otlpexport.IsPermanent)}
 		if logMetrics, err = metrics.NewDynamicMetricSet(fileCfg.LogMetrics.Metrics, opts...); err != nil {
 			return fmt.Errorf("logs metrics config: %w", err)
 		}

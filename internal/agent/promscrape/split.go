@@ -85,6 +85,9 @@ type SplitRule struct {
 	// (see attrs.PrefixInstance) so a described object's series don't collide
 	// with its own self-scraped metrics. nil defaults to the describing
 	// target's service.name (e.g. "kube-state-metrics"); "" disables it.
+	// Applied after attrs.Builder.Build, so it layers on top of (rather than
+	// replaces) a resourceAttributes instancePrefix the pipeline already
+	// applied: "<ruleprefix>-<pipelineprefix>-<instance>".
 	InstancePrefix *string `json:"instancePrefix,omitempty"`
 	// DropLabels is an anchored regex on series label names; matching labels
 	// are omitted from the data points (e.g. 'label_.+' to strip the object's

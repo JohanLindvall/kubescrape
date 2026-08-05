@@ -80,26 +80,32 @@ func TestValidateConfigAcceptsEmpty(t *testing.T) {
 }
 
 // -check-config is only trustworthy if it accepts EXACTLY what a real start
-// accepts. The log-metric name prefix participates in validation (an empty rule
-// name is legal precisely because the prefix makes the result non-empty), so
-// validating without the same options rejected configs that actually run.
+// accepts, which means compiling with the SAME options (the name prefix
+// included). A nameless rule is rejected whatever the prefix — the prefix used
+// to mask the empty-name check, compiling a rule with no name into a metric
+// literally named the prefix, with two such rules silently sharing one series
+// — and a named rule must pass with the prefix applied through both paths.
 func TestValidateConfigUsesTheSameOptionsAsAStart(t *testing.T) {
-	cfg := agentConfig{LogMetrics: &metrics.DynamicConfig{Metrics: []metrics.Dynamic{{
+	nameless := agentConfig{LogMetrics: &metrics.DynamicConfig{Metrics: []metrics.Dynamic{{
 		Name: "", Type: metrics.CounterType, Value: "1",
+		MatchRegexp: []string{"__line__=ERROR"},
+	}}}}
+	named := agentConfig{LogMetrics: &metrics.DynamicConfig{Metrics: []metrics.Dynamic{{
+		Name: "errors_total", Type: metrics.CounterType, Value: "1",
 		MatchRegexp: []string{"__line__=ERROR"},
 	}}}}
 
 	old := *logsMetricsPrefix
 	defer func() { *logsMetricsPrefix = old }()
 
-	*logsMetricsPrefix = "app_"
-	if err := validateConfig(cfg, ""); err != nil {
-		t.Fatalf("rejected a config a real start accepts (the prefix makes the name non-empty): %v", err)
-	}
-
-	*logsMetricsPrefix = ""
-	if err := validateConfig(cfg, ""); err == nil {
-		t.Fatal("accepted a nameless metric with no prefix; a real start rejects it")
+	for _, prefix := range []string{"app_", ""} {
+		*logsMetricsPrefix = prefix
+		if err := validateConfig(nameless, ""); err == nil {
+			t.Fatalf("prefix %q: accepted a nameless metric rule", prefix)
+		}
+		if err := validateConfig(named, ""); err != nil {
+			t.Fatalf("prefix %q: rejected a config a real start accepts: %v", prefix, err)
+		}
 	}
 }
 

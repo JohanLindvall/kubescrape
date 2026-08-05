@@ -15,7 +15,7 @@ var Registry = metrics.NewRegistry()
 // Log pipeline (agent).
 var (
 	LogEntries = Registry.Counter("kubescrape_log_entries_total",
-		"Log entries exported.")
+		"Log entries exported. With -buffer-dir this counts acceptance into the disk buffer, not collector delivery — reconcile against kubescrape_buffer_dropped_records_total{signal=\"logs\"} for what was later dropped drain-side.")
 	LogBytes = Registry.Counter("kubescrape_log_bytes_total",
 		"Raw log bytes read from live files and archives. Segment replays (re-reading a rotated file's owed range after a restart or rewind) are not re-counted.")
 	LogExportFailures = Registry.Counter("kubescrape_log_export_failures_total",
@@ -125,7 +125,7 @@ var (
 	BufferRequeued = Registry.CounterVec("kubescrape_buffer_requeued_total",
 		"Buffered batches moved to the back of the queue after repeated transient failures (keeps one stuck batch from blocking the signal).", "signal")
 	BufferFull = Registry.CounterVec("kubescrape_buffer_full_total",
-		"Batches the disk buffer refused: the undelivered backlog is at its cap, or one batch exceeds the whole cap. Back-pressure for logs (the tailer rewinds and re-reads), a lost batch for producers that cannot rewind (scrape, self-metrics, log-metrics).", "signal")
+		"Batches the disk buffer refused: the undelivered backlog is at its cap, or one batch exceeds the whole cap. Back-pressure for logs (the tailer rewinds and re-reads), a lost batch for producers that cannot rewind (scrape, self-metrics, log-metrics). Counted per refusal, not per batch: the tailer's in-flush retries can refuse one batch up to three times.", "signal")
 	// BufferEnqueueErrors counts write-side refusals that are NOT capacity:
 	// a latched fsync failure, a closed queue, ENOSPC from segment
 	// preallocation. For a producer that cannot rewind (scrape, self-metrics,
@@ -140,6 +140,12 @@ var (
 	PositionsCorrupt = Registry.Counter("kubescrape_positions_corrupt_total",
 		"Positions files that failed to parse at startup (whatever decoded is kept; the affected inputs re-read "+
 			"their window). Recurring bumps across restarts point at a failing disk, not a one-off crash.")
+	// PositionsSaveErrors is the write-side counterpart: offsets are silently
+	// NOT being persisted, so a restart re-reads (or, with an empty store,
+	// skips) per -logs-unknown-files while every other metric stays flat — the
+	// same dark-node failure kubescrape_buffer_enqueue_errors_total exists for.
+	PositionsSaveErrors = Registry.Counter("kubescrape_positions_save_errors_total",
+		"Failed writes of the positions file (committed offsets and the journald cursor are not being persisted). Any sustained rate means a bad path, a read-only mount or a full disk.")
 	LogUnresolvedLost = Registry.Counter("kubescrape_log_unresolved_lost_total",
 		"Log files deleted before their metadata ever resolved (the metadata service was unreachable "+
 			"or the container unknown for the file's whole life). Their content was never read and is lost.")
@@ -269,6 +275,9 @@ var (
 			"lost, permanently, and retrying cannot help (OTLP defines them as invalid rather than deferred). "+
 			"Any nonzero rate means telemetry is being discarded downstream; the collector's own message is on the "+
 			"accompanying warning.", "signal")
+
+	// Export seam (agent): routing and transforms. (Grouped here with the
+	// ingest metrics historically; the banner above does not cover them.)
 	Routed = Registry.CounterVec("kubescrape_routed_payload_parts_total",
 		"Payload parts forwarded to a non-default routing destination.", "route", "signal")
 	TransformErrors = Registry.CounterVec("kubescrape_transform_errors_total",
@@ -279,9 +288,11 @@ var (
 	// stream with no error logged and every other metric green. That has
 	// already happened once (see transform/hostobj.go).
 	TransformDropped = Registry.CounterVec("kubescrape_transform_dropped_total",
-		"Records a transform script called drop() on, by signal: log records, metric data points (a dropped metric counts all of its points) and spans.", "signal")
+		"Records a transform script called drop() on, by signal: log records, metric data points (a dropped metric counts all of its points) and spans. Counted per export invocation: a producer retrying a transiently failed export re-runs the script and re-counts its drops.", "signal")
 	TransformReloads = Registry.CounterVec("kubescrape_transform_reloads_total",
 		"Transforms-file reloads by outcome (applied, failed — a failed compile keeps the last good program).", "outcome")
+
+	// Trace tier (the -service-graph shard's sampler and span metrics).
 	TraceSpansDropped = Registry.CounterVec("kubescrape_trace_spans_dropped_total",
 		"Ingested spans dropped by the trace sampler (probability = the consistent trace-ID decision, rate = the spans/second cap).", "reason")
 	SpanMetricsDropped = Registry.Counter("kubescrape_span_metrics_dropped_total",
@@ -549,10 +560,11 @@ func RegisterLogMetricsDrops(set *metrics.DynamicMetricSet) {
 		"Log-metric observations dropped since start because the extracted value was NaN or +/-Inf (neither is representable as a sample).",
 		func() float64 { return float64(set.DroppedNaN()) })
 	Registry.CounterFunc("kubescrape_log_metrics_dropped_undelivered_total",
-		"Undelivered log-metric resources dropped because the re-offer buffer filled. Taking a snapshot is DESTRUCTIVE "+
-			"(it seals aggregation windows, zeroes idled samples and deletes expired ones), so a failed export retains "+
-			"its samples for the next one; this counts what a collector outage longer than that buffer could hold. "+
-			"These are genuinely lost observations — the only ones the retention cannot save.",
+		"Undelivered log-metric resources dropped because the re-offer buffer filled or the collector rejected them "+
+			"PERMANENTLY. Taking a snapshot is DESTRUCTIVE (it seals aggregation windows, zeroes idled samples and "+
+			"deletes expired ones), so a transiently failed export retains its samples for the next one; this counts "+
+			"what a collector outage longer than that buffer could hold, plus definitively rejected chunks that "+
+			"retrying could never deliver. These are genuinely lost observations — the ones the retention cannot save.",
 		func() float64 { return float64(set.DroppedUndelivered()) })
 }
 

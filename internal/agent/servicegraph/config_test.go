@@ -62,10 +62,13 @@ func TestConfigDurationSemantics(t *testing.T) {
 		t.Errorf(`staleAfter "0s" = %v, %v; want 0 (eviction disabled)`, got, err)
 	}
 	// A zero wait is not a pairing window at all (every half-edge would expire
-	// before its partner could arrive), so it reads as "unset" like the empty
-	// string — which is what the old time.Duration field did.
-	if got, err := (Config{Wait: "0"}).wait(); err != nil || got != DefaultWait {
-		t.Errorf(`wait "0" = %v, %v; want the default %v`, got, err, DefaultWait)
+	// before its partner could arrive) — and it is REFUSED (config.Positive),
+	// not silently read as the default: an explicit "0" substituting 10s with
+	// no diagnostic was a third zero-policy beside the config taxonomy's two.
+	// The default still rides along so the constructor can fall back; Validate
+	// is what reports it.
+	if got, err := (Config{Wait: "0"}).wait(); err == nil || got != DefaultWait {
+		t.Errorf(`wait "0" = %v, %v; want an error carrying the default %v`, got, err, DefaultWait)
 	}
 
 	for _, tc := range []struct {

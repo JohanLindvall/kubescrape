@@ -3,6 +3,7 @@ package tailer
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -92,6 +93,70 @@ func TestNewFileCheckpointedOnDiscovery(t *testing.T) {
 		}
 		return strings.Contains(string(data), logName)
 	}, "checkpoint entry persisted at discovery, before the periodic save")
+}
+
+// TestSaveKeepsUnappliedCheckpointForUnstattablePath pins the on-disk half of
+// the transient-stat protection. claimPath keeps a stored-but-unapplied entry
+// whose path fails stat with a non-ENOENT error (ELOOP here; EIO, EACCES) out
+// of the in-memory prune, because its absence is unproven — and saveCheckpoints
+// must agree: it used to rebuild the on-disk doc from t.files alone, so the
+// immediate save triggered by discovering ANY other file destroyed the
+// protected entry's offset (and its Pending segments) on disk, and a crash
+// before the path recovered lost them for good.
+func TestSaveKeepsUnappliedCheckpointForUnstattablePath(t *testing.T) {
+	dir := t.TempDir()
+	posPath := filepath.Join(t.TempDir(), "positions.json")
+
+	loop := filepath.Join(dir, "loop.log")
+	good := filepath.Join(dir, "app.log")
+
+	// Seed a positions file holding a previous run's offset for loop.log.
+	seed := map[string]any{"logs": map[string]any{loop: map[string]any{"offset": 5, "inode": 42}}}
+	data, err := json.Marshal(seed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(posPath, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// loop.log fails stat with ELOOP (a self-referential symlink) — transient
+	// in the sense that it is not ENOENT; app.log is fine.
+	if err := os.Symlink(loop, loop); err != nil {
+		t.Fatal(err)
+	}
+	writeLines(t, good, "hello")
+
+	exp := &fakeExporter{}
+	tl := newSourceTailer(exp, []Source{{
+		Name:    "plain",
+		Include: []string{filepath.Join(dir, "*.log")},
+	}}, false)
+	tl.cfg.Positions = mustOpenPositions(t, posPath)
+
+	// The initial scan lists both names (the glob sees the symlink), discovers
+	// app.log — which persists immediately — and fails to stat loop.log.
+	tl.scanDir(tl.loadCheckpoints(), true)
+
+	if !tl.lastListingOK {
+		t.Fatal("precondition: the listing should be OK (the glob lists the symlink by name)")
+	}
+	if _, ok := tl.checkpoints[loop]; !ok {
+		t.Fatal("precondition: the unapplied entry must survive the in-memory prune")
+	}
+	if _, ok := tl.files[good]; !ok {
+		t.Fatal("precondition: app.log should be tracked")
+	}
+
+	// scanDir already ran saveCheckpoints (discovered && checkpointing); the
+	// stored offset must still be on disk.
+	logs := mustOpenPositions(t, posPath).Logs()
+	if _, ok := logs[loop]; !ok {
+		t.Fatalf("stored offset destroyed by save: on-disk positions = %v", logs)
+	}
+	if _, ok := logs[good]; !ok {
+		t.Fatalf("discovered file missing from save: on-disk positions = %v", logs)
+	}
 }
 
 // A corrupt positions file must not wedge startup: it loads as empty (files

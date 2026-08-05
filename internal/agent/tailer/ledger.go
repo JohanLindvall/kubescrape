@@ -273,8 +273,6 @@ func (l *ledger) curSeg() int {
 	return l.tail
 }
 
-// streamState is the offset accounting for one pipeline key. stream is the
-// precomputed streamOf(key), stamped on emitted entries. hasRun marks a
 // fedEnd returns the last FED line boundary of the current tail incarnation
 // (max streamState.lastEnd at the tail, floored at committed): the highest
 // offset a committing entry can ever reach. Bytes past it — a torn final
@@ -291,6 +289,8 @@ func (f *file) fedEnd() int64 {
 	return end
 }
 
+// streamState is the offset accounting for one pipeline key. stream is the
+// precomputed streamOf(key), stamped on emitted entries. hasRun marks a
 // pending stage-1 run (presence, not just a zero offset).
 type streamState struct {
 	key      string
@@ -488,6 +488,14 @@ func computeFingerprint(f io.ReaderAt, n int64) (fingerprint, error) {
 	h := fnv.New64a()
 	_, _ = h.Write(buf)
 	return fingerprint{Len: int64(len(buf)), Hash: h.Sum64()}, nil
+}
+
+// identityChanged reports whether the file previously had a recorded identity
+// and the inode or head content at hand no longer matches it — the path (or
+// the held fd) now names a DIFFERENT incarnation. Shared by ensureOpen and
+// openArchive, whose replaced-file decisions must agree.
+func (f *file) identityChanged(inode uint64, r io.ReaderAt) bool {
+	return f.inode != 0 && (f.inode != inode || !f.fp.matches(r))
 }
 
 // matches reports whether the file still begins with the fingerprinted

@@ -42,16 +42,18 @@ func (l labels) get(key string) (string, bool) {
 // cumagg.MaxLabelBytes, which the two span aggregators already apply.
 const maxLabelValueBytes = 256
 
-// truncLabelValue bounds a value, cutting on a rune boundary and COPYING.
-//
-// The copy is the point. Slicing a Go string keeps its whole backing array
-// alive, so a 256-byte view of a 1 MiB log line pins the megabyte for as long
-// as the series lives — the exact leak the bound exists to prevent, arrived at
-// through the fix for it. Only the truncating branch allocates; the
-// overwhelmingly common short value is returned untouched.
-func truncLabelValue(v string) string {
+// truncLabelCut returns the byte length a value is bounded to — the exact cut
+// truncLabelValue applies. It exists separately so the HASH paths
+// (resourceAccum, resLabelsAccum) can fold v[:truncLabelCut(v)] — a reslice,
+// no copy — and stay in step with what set() retains and renders: hashed and
+// rendered identity must agree (see maxLabelValueBytes), and hashing the
+// untruncated value while rendering the truncated one split one rendered
+// identity into two live samples — duplicate same-timestamp points every
+// export, and for histograms one merged point whose buckets summed both
+// variants.
+func truncLabelCut(v string) int {
 	if len(v) <= maxLabelValueBytes {
-		return v
+		return len(v)
 	}
 	end := maxLabelValueBytes
 	// Back off to the start of the rune that straddles the cut, so the value
@@ -67,7 +69,21 @@ func truncLabelValue(v string) string {
 		// series would silently lose a dimension and merge with another.
 		end = maxLabelValueBytes
 	}
-	return string([]byte(v[:end]))
+	return end
+}
+
+// truncLabelValue bounds a value, cutting on a rune boundary and COPYING.
+//
+// The copy is the point. Slicing a Go string keeps its whole backing array
+// alive, so a 256-byte view of a 1 MiB log line pins the megabyte for as long
+// as the series lives — the exact leak the bound exists to prevent, arrived at
+// through the fix for it. Only the truncating branch allocates; the
+// overwhelmingly common short value is returned untouched.
+func truncLabelValue(v string) string {
+	if len(v) <= maxLabelValueBytes {
+		return v
+	}
+	return string([]byte(v[:truncLabelCut(v)]))
 }
 
 // set appends or replaces key with value, returning the (possibly grown)

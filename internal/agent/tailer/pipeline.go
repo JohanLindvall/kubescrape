@@ -247,11 +247,18 @@ func (t *Tailer) stopPipeline(ctx context.Context, f *file) {
 	}
 }
 
+// oversizeSlack is the grace past MaxEntryBytes before an unterminated
+// physical line's accumulated prefix is discarded. consume (the live path) and
+// replaySegment (the checkpoint-replay path) must apply the SAME bound: a line
+// capped and discarded live is re-read on replay, and a different bound there
+// would feed as a record what the live path discarded (or vice versa).
+const oversizeSlack = 4096
+
 // maxIdlePendingBytes caps the carry buffer a file keeps between reads. One
-// oversized line grows it to MaxEntryBytes+4096 plus a chunk; pinning that per
-// file forever (a node tracks thousands) costs more than re-growing it the one
-// time another such line shows up. Two 64 KiB read chunks is the steady-state
-// working set, so normal files never hit this path.
+// oversized line grows it to MaxEntryBytes+oversizeSlack plus a chunk; pinning
+// that per file forever (a node tracks thousands) costs more than re-growing it
+// the one time another such line shows up. Two 64 KiB read chunks is the
+// steady-state working set, so normal files never hit this path.
 const maxIdlePendingBytes = 128 * 1024
 
 // appendPending appends one read chunk to the file's carry-over buffer,
@@ -288,7 +295,7 @@ func (t *Tailer) consume(ctx context.Context, f *file, unlimited bool) {
 		i := bytes.IndexByte(f.pending, '\n')
 		if i < 0 {
 			// Bound the carried incomplete physical line.
-			if len(f.pending) > t.cfg.MaxEntryBytes+4096 {
+			if len(f.pending) > t.cfg.MaxEntryBytes+oversizeSlack {
 				f.lineStart += int64(len(f.pending))
 				f.pending = f.pending[:0]
 				// The line's REMAINDER (everything up to its eventual newline)

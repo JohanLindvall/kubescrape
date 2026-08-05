@@ -9,8 +9,9 @@
 // unredacted) and as little else as possible — running the regex is the
 // expensive part, and a pattern admitted on a bare keyword cost 100 ms on a
 // 1 MiB record. Most are literal scans; secret-kv's checks the assignment
-// SHAPE (see secretKVCandidate). A scrubbed line allocates (it must — the body
-// changes).
+// SHAPE (see secretKVCandidate); a user rule gets a Contains gate when its
+// regex proves a literal prefix (see New). A scrubbed line allocates (it must
+// — the body changes).
 package logscrub
 
 import (
@@ -61,6 +62,78 @@ type pattern struct {
 	prefilter func(string) bool
 }
 
+// The secret-kv VOCABULARY — one table, four consumers: the regex alternation
+// (kvKeywordAlt), keySuffix's alternation (kvSuffixAlt), the prefilter's
+// first-byte dispatch (kvDispatch, plus kvTail's suffix probe) and the
+// coverage test's cross product all render from these two lists. Keeping them
+// in one place IS the security property: a keyword present in the regex but
+// absent from the dispatch makes the prefilter narrower than its pattern —
+// the secret ships unredacted — while one present in the dispatch but not the
+// regex admits lines that cost a full regex pass for nothing.
+//
+// A keyword is a sequence of parts joined by an OPTIONAL underscore or dash
+// (so {"api", "key"} spells apikey, api_key and api-key); kvExpand enumerates
+// exactly that language for the literal prefilter.
+var (
+	kvKeywords = [][]string{
+		{"api", "key"},
+		{"secret"},
+		{"password"},
+		{"passwd"},
+		{"pwd"},
+		{"token"},
+		{"access", "key"},
+	}
+	// kvSuffixes is keySuffix's closed alternation (see keySuffix for why the
+	// set is curated rather than open).
+	kvSuffixes = []string{"key", "value", "token", "secret", "password", "passwd", "pwd"}
+)
+
+// kvKeywordAlt renders the keyword table as the regex alternation body: each
+// part ASCII-case-folded (see asciiFold), parts joined by `[_-]?`.
+func kvKeywordAlt() string {
+	var b strings.Builder
+	for i, parts := range kvKeywords {
+		if i > 0 {
+			b.WriteByte('|')
+		}
+		for j, p := range parts {
+			if j > 0 {
+				b.WriteString(`[_-]?`)
+			}
+			b.WriteString(asciiFold(p))
+		}
+	}
+	return b.String()
+}
+
+// kvSuffixAlt renders the suffix table the same way (single-part words).
+func kvSuffixAlt() string {
+	folded := make([]string, len(kvSuffixes))
+	for i, w := range kvSuffixes {
+		folded[i] = asciiFold(w)
+	}
+	return strings.Join(folded, `|`)
+}
+
+// kvExpand enumerates a keyword's literal spellings — the exact language of
+// its `part[_-]?part` regex form, every choice of "", "_" or "-" at every
+// junction. Init- and test-time only; the hot path reads the precomputed
+// kvDispatch.
+func kvExpand(parts []string) []string {
+	out := []string{parts[0]}
+	for _, p := range parts[1:] {
+		next := make([]string, 0, 3*len(out))
+		for _, head := range out {
+			for _, sep := range []string{"", "_", "-"} {
+				next = append(next, head+sep+p)
+			}
+		}
+		out = next
+	}
+	return out
+}
+
 // keySuffix lets a keyword be a PREFIX of the key, but only where the suffix
 // is itself a secret word: SECRET_KEY, secretKey, secretValue, TOKEN_VALUE.
 //
@@ -73,11 +146,8 @@ type pattern struct {
 // turn the defaults off.
 //
 // RE2 has no negative lookahead, so the safe suffixes are excluded by
-// construction: only these words may follow the keyword.
-var keySuffix = `(?:[_-]?(?:` +
-	asciiFold("key") + `|` + asciiFold("value") + `|` + asciiFold("token") +
-	`|` + asciiFold("secret") + `|` + asciiFold("password") + `|` +
-	asciiFold("passwd") + `|` + asciiFold("pwd") + `))?`
+// construction: only the kvSuffixes words may follow the keyword.
+var keySuffix = `(?:[_-]?(?:` + kvSuffixAlt() + `))?`
 
 // asciiFold renders a literal keyword as a regex matching exactly its ASCII
 // case variants ("key" -> "[Kk][Ee][Yy]").
@@ -192,32 +262,28 @@ func digitRun(n int) func(string) bool {
 // narrower than its pattern ships secrets unredacted, which
 // TestPrefilterIsNotNarrowerThanItsRegex exists to catch.
 //
-// It is one pass with a first-byte dispatch rather than a scan per keyword: the
-// keywords start with a, s, p or t, so an ordinary line pays one lowercase and
-// one switch per byte.
-var (
-	kvWordsA = []string{"apikey", "api_key", "api-key", "accesskey", "access_key", "access-key"}
-	kvWordsS = []string{"secret"}
-	kvWordsP = []string{"password", "passwd", "pwd"}
-	kvWordsT = []string{"token"}
-	// kvSuffixWords mirrors keySuffix's alternation, in the same order.
-	kvSuffixWords = []string{"key", "value", "token", "secret", "password", "passwd", "pwd"}
-)
+// It is one pass with a first-byte dispatch rather than a scan per keyword: an
+// ordinary line pays one lowercase and one table load per byte.
+//
+// kvDispatch groups every keyword spelling (kvExpand over kvKeywords) by its
+// lowercased first byte, built once at init — a keyword added to the table
+// reaches the dispatch with no second list to update, and nothing per line
+// allocates.
+var kvDispatch = func() (d [256][]string) {
+	for _, parts := range kvKeywords {
+		for _, w := range kvExpand(parts) {
+			c := lowerASCII(w[0])
+			d[c] = append(d[c], w)
+		}
+	}
+	return
+}()
 
 // secretKVCandidate reports whether the line can match the secret-kv regex.
 func secretKVCandidate(s string) bool {
 	for i := 0; i < len(s); i++ {
-		var words []string
-		switch lowerASCII(s[i]) {
-		case 'a':
-			words = kvWordsA
-		case 's':
-			words = kvWordsS
-		case 'p':
-			words = kvWordsP
-		case 't':
-			words = kvWordsT
-		default:
+		words := kvDispatch[lowerASCII(s[i])]
+		if len(words) == 0 {
 			continue
 		}
 		for _, w := range words {
@@ -239,7 +305,7 @@ func kvTail(s string, j int) bool {
 	if k < len(s) && (s[k] == '_' || s[k] == '-') {
 		k++
 	}
-	for _, w := range kvSuffixWords {
+	for _, w := range kvSuffixes {
 		if hasPrefixFold(s[k:], w) && kvAssign(s, k+len(w)) {
 			return true
 		}
@@ -264,16 +330,18 @@ func kvAssign(s string, j int) bool {
 	for j < len(s) && isRegexpSpace(s[j]) {
 		j++
 	}
-	// The two value branches have DIFFERENT terminator sets, and the prefilter
-	// has to admit both or it is narrower than the regex — which means a secret
-	// ships unredacted, the one failure this whole prefilter design must never
-	// have. A quoted value runs to its closing quote (`["\'][^"\']+`), so the
-	// only byte that cannot start it is another quote; whitespace, commas and
-	// brackets are all legal INSIDE the quotes. An unquoted value still stops
-	// at the delimiter class.
+	// The value branches have DIFFERENT terminator sets, and the prefilter has
+	// to admit every one or it is narrower than the regex — which means a
+	// secret ships unredacted, the one failure this whole prefilter design
+	// must never have. A quoted value runs to the closing quote of its OWN
+	// kind (`"[^"]+` / `'[^']+`), so the only byte that cannot start it is
+	// that same quote — the OTHER kind is a legal first value byte
+	// (`password="'…`), and whitespace, commas and brackets are all legal
+	// INSIDE the quotes. An unquoted value still stops at the delimiter class.
 	if j < len(s) && (s[j] == '"' || s[j] == '\'') {
+		q := s[j]
 		j++
-		return j < len(s) && s[j] != '"' && s[j] != '\''
+		return j < len(s) && s[j] != q
 	}
 	return j < len(s) && !isValueDelim(s[j])
 }
@@ -353,29 +421,29 @@ var builtins = map[string]pattern{
 		// secret_key, secretKey, secretValue, TOKEN_VALUE — which the
 		// suffix-only form above missed entirely, shipping the whole Django /
 		// AWS-SDK / camelCase-JSON family in clear (see keySuffix).
-		// A QUOTED value ends at its closing quote, not at the first delimiter
-		// inside it. The value class below is the UNQUOTED terminator set, and
-		// applying it to a quoted value redacted only the first fragment:
+		// A QUOTED value ends at the closing quote of the SAME kind, not at the
+		// first delimiter inside it — a passphrase may contain spaces, commas,
+		// semicolons, ampersands, closing brackets AND the other quote kind
+		// (`password="don't tell"`, `secret='he said "go"'`), and any class
+		// that stops earlier ships the value's tail in clear, through the
+		// tailer, journald and ingest alike. RE2 has no backreference, so "the
+		// same quote that opened it" is spelled as one ordered branch per quote
+		// kind, each capturing its opening quote (group 2 or 3; exactly one is
+		// set) and excluding only its OWN kind — a class excluding BOTH kinds
+		// would stop a double-quoted value at an embedded apostrophe. The
+		// closing quote is left in the line, so the replacement re-emits
+		// `key="` + redaction and the original terminator survives. The
+		// unquoted branch keeps the delimiter class. Every branch requires at
+		// least one value byte, so `password=""` matches nothing.
 		//
-		//	password="hunter2 with spaces"  ->  password="[REDACTED] with spaces"
-		//	{"password":"p@ss w0rd"}        ->  {"password":"[REDACTED] w0rd"}
-		//
-		// i.e. every passphrase containing a space, comma, semicolon, ampersand
-		// or closing bracket shipped its tail in clear, through the tailer,
-		// journald and ingest alike. RE2 has no backreference, so "the same
-		// quote that opened it" is spelled as an ordered alternation whose
-		// first branch captures the opening quote in group 2 and stops before
-		// ANY quote; the closing quote is left in the line, so the replacement
-		// re-emits `key="` + redaction and the original terminator survives.
-		// The unquoted branch is unchanged. Both branches still require at
-		// least one value byte, so `password=""` matches neither, as before.
+		// The keyword alternation and keySuffix render from the
+		// kvKeywords/kvSuffixes tables — the same tables the prefilter's
+		// dispatch is built from, which is what keeps regex and prefilter in
+		// lockstep (see kvDispatch).
 		re: regexp.MustCompile(`((?:^|[^0-9A-Za-z_.-])[0-9A-Za-z_.-]*?(?:` +
-			asciiFold("api") + `[_-]?` + asciiFold("key") +
-			`|` + asciiFold("secret") + `|` + asciiFold("password") + `|` + asciiFold("passwd") +
-			`|` + asciiFold("pwd") + `|` + asciiFold("token") +
-			`|` + asciiFold("access") + `[_-]?` + asciiFold("key") +
-			`)` + keySuffix + `["\']?\s*[:=]\s*)(?:(["\'])[^"\']+|[^\s"\'&,;}\])]+)`),
-		repl:      "${1}${2}" + redacted,
+			kvKeywordAlt() +
+			`)` + keySuffix + `["\']?\s*[:=]\s*)(?:(")[^"]+|(')[^']+|[^\s"\'&,;}\])]+)`),
+		repl:      "${1}${2}${3}" + redacted,
 		prefilter: secretKVCandidate,
 	},
 	"url-userinfo": {
@@ -491,7 +559,19 @@ func New(cfg Config) (*Scrubber, error) {
 		if repl == "" {
 			repl = redacted
 		}
-		s.patterns = append(s.patterns, pattern{name: name, re: re, repl: repl})
+		p := pattern{name: name, re: re, repl: repl}
+		// User rules get the same never-narrower gate discipline as the
+		// built-ins wherever the engine can prove one: LiteralPrefix is a
+		// literal every match must BEGIN with (complete or not), so a line not
+		// containing it cannot match anywhere and a Contains scan is a sound
+		// superset gate — here guaranteed by the regexp package's contract
+		// rather than by hand-matched construction. A rule whose pattern
+		// yields no literal (a case fold, a leading class or alternation) runs
+		// ungated, paying the full regex per record as before.
+		if lit, _ := re.LiteralPrefix(); lit != "" {
+			p.prefilter = func(s string) bool { return strings.Contains(s, lit) }
+		}
+		s.patterns = append(s.patterns, p)
 	}
 	if len(s.patterns) == 0 {
 		return nil, fmt.Errorf("logScrubbing configured with no patterns (set builtin: [defaults] or add rules)")

@@ -219,34 +219,68 @@ func TestSecretKVPrefilterRejectsUnmatchableLines(t *testing.T) {
 	}
 }
 
+// altCaseASCII renders a word in alternating ASCII case (sEcReT) — the mixed
+// form the prefilter's fold must treat exactly as the regex's case classes do.
+func altCaseASCII(w string) string {
+	b := []byte(strings.ToLower(w))
+	for i := 1; i < len(b); i += 2 {
+		if 'a' <= b[i] && b[i] <= 'z' {
+			b[i] -= 'a' - 'A'
+		}
+	}
+	return string(b)
+}
+
 // The prefilter may only ever be WIDER than its regex. This walks the cross
 // product of the keyword spellings, separators, quoting and suffixes rather
 // than a handful of probes: a shape the regex matches and the prefilter rejects
 // is a secret shipped in clear.
+//
+// The keyword and suffix axes DERIVE from the vocabulary tables (kvKeywords /
+// kvSuffixes) — the same tables the regex and the dispatch render from — so a
+// word added there is covered here with no hand-synced list to forget.
 func TestSecretKVPrefilterCoversEveryMatchingShape(t *testing.T) {
 	p := builtins["secret-kv"]
-	keywords := []string{"api_key", "apikey", "API-KEY", "secret", "SECRET", "sEcReT",
-		"password", "PASSWD", "pwd", "token", "access_key", "ACCESSKEY"}
+	var keywords []string
+	for _, parts := range kvKeywords {
+		for _, w := range kvExpand(parts) {
+			keywords = append(keywords, w, strings.ToUpper(w), altCaseASCII(w))
+		}
+	}
+	suffixes := []string{""}
+	for _, w := range kvSuffixes {
+		suffixes = append(suffixes, "_"+w, "-"+strings.ToUpper(w), altCaseASCII(w))
+	}
 	prefixes := []string{"", "x_", "MY.", "aws-", "{\"", "  "}
-	suffixes := []string{"", "_key", "-VALUE", "token", "_secret", "Password", "_passwd", "PWD"}
 	seps := []string{":", "=", " : ", "\t=\t", "\": \"", "'='"}
 	// "\vraw" is deliberate: \v is not in Go regexp's \s, so it is a legal
 	// first byte of the value class — a prefilter treating it as whitespace
-	// would reject a line the regex matches.
-	values := []string{"hunter2", "0", `"quoted"`, "sk-12345", "\vraw"}
+	// would reject a line the regex matches. The last three embed the OPPOSITE
+	// quote kind in a quoted value: a legal first value byte a same-kind-only
+	// terminator must not reject.
+	values := []string{"hunter2", "0", `"quoted"`, "sk-12345", "\vraw", `"don't"`, `'a"b'`, `"'"`}
+	matched := 0
 	for _, kw := range keywords {
 		for _, pre := range prefixes {
 			for _, suf := range suffixes {
 				for _, sep := range seps {
 					for _, val := range values {
 						line := pre + kw + suf + sep + val
-						if p.re.MatchString(line) && !p.prefilter(line) {
+						if !p.re.MatchString(line) {
+							continue
+						}
+						matched++
+						if !p.prefilter(line) {
 							t.Fatalf("regex matches %q but the prefilter rejects it: the pattern is skipped and the secret ships unredacted", line)
 						}
 					}
 				}
 			}
 		}
+	}
+	// A derivation bug that emptied an axis would pass vacuously.
+	if matched == 0 {
+		t.Fatal("cross product produced no matching lines; the derivation is broken")
 	}
 }
 
@@ -258,6 +292,9 @@ func FuzzSecretKVPrefilterNotNarrower(f *testing.F) {
 		"password=hunter2", "token_count=42", "SECRET_KEY=abc", `{"secretKey":"x"}`,
 		"a perfectly innocuous log line", "pwd:'x'", "api-key\t=\tv", "accessToken: abc",
 		"secret_key_ref: db-creds", "AWS_SECRET_ACCESS_KEY=abc", "toKen=abcdef",
+		// Mixed-quote values: each quoted branch excludes only its OWN kind,
+		// so the other quote is a legal value byte the prefilter must admit.
+		`password="don't tell"`, `secret='he said "go"'`, `password="'"`, `token=''`,
 	} {
 		f.Add(s)
 	}
@@ -295,6 +332,77 @@ func TestSecretKVRedactsWholeQuotedValue(t *testing.T) {
 	for _, c := range cases {
 		if got := s.Scrub(c.in); got != c.want {
 			t.Errorf("Scrub(%q)\n got %q\nwant %q", c.in, got, c.want)
+		}
+	}
+}
+
+// A quoted value ends at the closing quote of its OWN kind: a double-quoted
+// value may contain apostrophes and a single-quoted one double quotes. A value
+// class excluding BOTH kinds stops a double-quoted value at an embedded
+// apostrophe — `password="don't tell"` redacts `don` and ships `'t tell` in
+// clear. The WHOLE value must go.
+func TestSecretKVMixedQuoteValues(t *testing.T) {
+	s := mustNew(t, Config{Builtin: []string{"defaults"}})
+	cases := []struct{ in, want string }{
+		{`password="don't tell"`, `password="[REDACTED]"`},
+		{`{"token":"it's-a-secret"}`, `{"token":"[REDACTED]"}`},
+		{`secret='he said "go away"'`, `secret='[REDACTED]'`},
+		{`pwd='embedded "quotes" here'`, `pwd='[REDACTED]'`},
+		// A value that is ONLY the other quote kind is still a value.
+		{`password="'"`, `password="[REDACTED]"`},
+		{`api_key='"'`, `api_key='[REDACTED]'`},
+		// The empty value still matches neither branch.
+		{`password=""`, `password=""`},
+		{`password=''`, `password=''`},
+	}
+	for _, c := range cases {
+		if got := s.Scrub(c.in); got != c.want {
+			t.Errorf("Scrub(%q)\n got %q\nwant %q", c.in, got, c.want)
+		}
+	}
+}
+
+// A user rule whose regex proves a literal prefix carries a Contains admission
+// gate (LiteralPrefix: every match must BEGIN with the literal, so a line not
+// containing it cannot match anywhere). The gate may only ever SKIP lines the
+// regex cannot match — gated and ungated evaluation must be indistinguishable
+// on every input.
+func TestUserRulePrefilterMatchesUngated(t *testing.T) {
+	cfg := Config{Rules: []Rule{
+		{Name: "session", Regexp: `sess_[0-9a-f]{8}`},
+		{Name: "anchored", Regexp: `^card=[0-9]{12}`, Replacement: "card=x"},
+		{Name: "leading-class", Regexp: `[0-9]{3}-[0-9]{2}-[0-9]{4}`, Replacement: "x-x-x"},
+		{Name: "case-fold", Regexp: `(?i)xtok: [0-9a-f]+`},
+		{Name: "alt", Regexp: `(?:uid|gid)=[0-9]+`},
+	}}
+	gated := mustNew(t, cfg)
+	ungated := mustNew(t, cfg)
+	for i := range ungated.patterns {
+		ungated.patterns[i].prefilter = nil
+	}
+	// The plain-literal rule must actually carry a gate, or this only proves
+	// two ungated scrubbers equal.
+	if gated.patterns[0].prefilter == nil {
+		t.Fatal("rule with a literal prefix got no prefilter")
+	}
+	corpus := []string{
+		"sess_deadbeef at line start",
+		"in the middle sess_0123abcd of the line",
+		"and at the very end: sess_cafef00d",
+		// Near miss: the literal is present but the regex fails — the gate
+		// admits, the regex declines, and the line must be untouched.
+		"sess_XYZ literal without a match",
+		"card=123456789012",
+		"prefix card=123456789012 not at start",
+		"ssn 123-45-6789 on file",
+		"XTOK: abcdef and mixed xToK: 0123",
+		"uid=1000 gid=1000",
+		"a line matching no rule at all",
+		"",
+	}
+	for _, line := range corpus {
+		if g, u := gated.Scrub(line), ungated.Scrub(line); g != u {
+			t.Errorf("gated/ungated diverge on %q:\n gated:   %q\n ungated: %q", line, g, u)
 		}
 	}
 }

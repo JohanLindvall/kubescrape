@@ -148,6 +148,13 @@ func (cfg Config) Validate() error {
 	if cfg.Protocol == "http" && !strings.HasPrefix(cfg.Endpoint, "http://") && !strings.HasPrefix(cfg.Endpoint, "https://") {
 		return fmt.Errorf("endpoint %q needs an http:// or https:// scheme for the http protocol", cfg.Endpoint)
 	}
+	// TLS material on a plaintext connection is a security control that
+	// silently does nothing: gRPC with Insecure discards the whole TLS config,
+	// and an http:// endpoint never handshakes. Refuse loudly — an operator who
+	// mounted a CA bundle or a client certificate wants TLS, not a no-op, and
+	// the failure they would otherwise get is "telemetry shipped in cleartext",
+	// which nothing surfaces. (New runs these checks too, via Validate — the
+	// constructor is the only gate the metadata service's flag path has.)
 	if material := tlsMaterial(cfg); material != "" {
 		if cfg.Protocol == "grpc" && cfg.Insecure {
 			return fmt.Errorf("%s is set but the gRPC connection is plaintext; set insecure=false (-otlp-insecure=false) for this destination", material)
@@ -162,6 +169,19 @@ func (cfg Config) Validate() error {
 func New(cfg Config) (*Client, error) {
 	if cfg.Protocol == "" {
 		cfg.Protocol = "grpc"
+	}
+	if cfg.Compression == "" {
+		cfg.Compression = "gzip"
+	}
+	// ONE set of config checks: New used to re-spell Validate's protocol/
+	// compression/level/TLS-material refusals and the two had drifted — New
+	// accepted an empty endpoint (gRPC dials lazily, so construction succeeded
+	// and every export then failed with a resolver error, transient forever)
+	// and any "://"-bearing scheme for HTTP. The drift was reachable: the
+	// metadata service constructs its exporter straight from flags with no
+	// separate Validate call, so the constructor's checks are the ones it gets.
+	if err := cfg.Validate(); err != nil {
+		return nil, err
 	}
 	partialLog := logdedupe.New(8, time.Minute)
 	if cfg.RetryAttempts < 1 {
@@ -186,32 +206,8 @@ func New(cfg Config) (*Client, error) {
 	if cfg.MaxSendBytes == 0 {
 		cfg.MaxSendBytes = otlpsplit.DefaultMaxBytes
 	}
-	switch cfg.Compression {
-	case "":
-		cfg.Compression = "gzip"
-	case "gzip", "none":
-	default:
-		return nil, fmt.Errorf("compression %q (want gzip or none)", cfg.Compression)
-	}
-	if cfg.CompressionLevel < 0 || cfg.CompressionLevel > 9 {
-		return nil, fmt.Errorf("compression level %d (want 0-9)", cfg.CompressionLevel)
-	}
 	if cfg.CompressionLevel != 0 {
 		setGzipLevel(cfg.CompressionLevel)
-	}
-	// TLS material on a plaintext connection is a security control that
-	// silently does nothing: gRPC with Insecure discards the whole TLS config,
-	// and an http:// endpoint never handshakes. Refuse loudly — an operator who
-	// mounted a CA bundle or a client certificate wants TLS, not a no-op, and
-	// the failure they would otherwise get is "telemetry shipped in cleartext",
-	// which nothing surfaces.
-	if material := tlsMaterial(cfg); material != "" {
-		if cfg.Protocol == "grpc" && cfg.Insecure {
-			return nil, fmt.Errorf("%s is set but the gRPC connection is plaintext; set insecure=false (-otlp-insecure=false) for this destination", material)
-		}
-		if cfg.Protocol == "http" && strings.HasPrefix(cfg.Endpoint, "http://") {
-			return nil, fmt.Errorf("%s is set but endpoint %q is plain http; use https://", material, cfg.Endpoint)
-		}
 	}
 	c := &Client{cfg: cfg, partialLog: partialLog}
 	if cfg.BearerTokenFile != "" {
@@ -251,10 +247,7 @@ func New(cfg Config) (*Client, error) {
 		c.metrics = pmetricotlp.NewGRPCClient(conn)
 		c.traces = ptraceotlp.NewGRPCClient(conn)
 	case "http":
-		base := strings.TrimRight(cfg.Endpoint, "/")
-		if !strings.Contains(base, "://") {
-			return nil, fmt.Errorf("http endpoint %q needs a scheme (http:// or https://)", cfg.Endpoint)
-		}
+		base := strings.TrimRight(cfg.Endpoint, "/") // scheme checked by Validate
 		c.logsURL = base + "/v1/logs"
 		c.metricsURL = base + "/v1/metrics"
 		c.tracesURL = base + "/v1/traces"
@@ -477,6 +470,14 @@ func (c *Client) ExportMetrics(ctx context.Context, md pmetric.Metrics) error {
 		err = c.exportMetricsCounted(ctx, md)
 		if err == nil {
 			return nil
+		}
+		if IsPermanent(err) {
+			// A definitive rejection cannot change between attempts; the
+			// sibling loops (the tailer's exportWithRetry, the drain's
+			// trySend) already short-circuit it, and re-sending a 400 payload
+			// RetryAttempts times every scrape cycle was wasted wire and
+			// counter inflation for an outcome that cannot move.
+			return err
 		}
 	}
 	return err

@@ -213,6 +213,14 @@ type Tailer struct {
 	// Event-driven mode (nil watcher = pure polling).
 	watcher   *fsnotify.Watcher
 	watchRefs map[string]int // watched target directories, refcounted
+	// watchedScan tracks which discovery (scan) directories hold an OS watch.
+	// Registration is retried from every discovery pass, not attempted only at
+	// startup: an include base that appears later (a hostPath mounted after the
+	// agent, a directory another workload creates) would otherwise have its
+	// files discovered by polling but their writes produce no events — silently
+	// degrading that source to poll cadence, under which sub-poll-interval
+	// rename rotations lose segments.
+	watchedScan map[string]struct{}
 	// byTargetDir indexes files by their watched target directory so an
 	// fsnotify event marks only that directory's files dirty instead of
 	// scanning the whole files map per event.
@@ -301,21 +309,24 @@ func (t *Tailer) Run(ctx context.Context) {
 		if w, err := fsnotify.NewWatcher(); err != nil {
 			t.log.Warn("fsnotify unavailable, falling back to polling", "error", err)
 		} else {
-			watched := 0
+			t.watcher = w
+			t.watchRefs = make(map[string]int)
+			t.watchedScan = make(map[string]struct{})
+			defer func() { _ = w.Close() }()
 			for dir := range t.scanDirs {
 				if err := w.Add(dir); err != nil {
-					t.log.Warn("watching log directory failed", "dir", dir, "error", err)
+					t.log.Warn("watching log directory failed; retrying on discovery passes", "dir", dir, "error", err)
 					continue
 				}
-				watched++
+				t.watchedScan[dir] = struct{}{}
 			}
-			if watched == 0 {
-				t.log.Warn("no log directories watched, falling back to polling")
-				_ = w.Close()
-			} else {
-				t.watcher = w
-				t.watchRefs = make(map[string]int)
-				defer func() { _ = w.Close() }()
+			if len(t.watchedScan) == 0 {
+				// The watcher is kept even with nothing watched: an include
+				// base that does not exist YET (a hostPath mounted after
+				// startup) is retried on every discovery pass
+				// (retryScanWatches), and polling covers the meantime. Closing
+				// the watcher here made the degradation permanent.
+				t.log.Warn("no log directories watched yet; polling until one can be watched")
 			}
 		}
 	}

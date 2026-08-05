@@ -357,7 +357,20 @@ func (t *Tailer) flush(ctx context.Context) {
 func (t *Tailer) exportWithRetry(ctx context.Context, ld plog.Logs) error {
 	var err error
 	backoff := t.retryBackoff
+	// Sleep BEFORE the retry, not after every attempt (the ExportMetrics
+	// shape): the try-then-sleep form paid the doubled backoff once more after
+	// the FINAL failure — 4s of the single sweep goroutine (and, at shutdown,
+	// of the 10s budget everything after the tailer shares) spent after the
+	// outcome was already decided.
 	for attempt := 0; attempt < 3; attempt++ {
+		if attempt > 0 {
+			select {
+			case <-ctx.Done():
+				return err
+			case <-time.After(backoff):
+			}
+			backoff *= 2
+		}
 		if err = t.cfg.Exporter.ExportLogs(ctx, ld); err == nil {
 			return nil
 		}
@@ -367,12 +380,6 @@ func (t *Tailer) exportWithRetry(ctx context.Context, ld plog.Logs) error {
 			// on this node. The caller drops the batch and advances.
 			return err
 		}
-		select {
-		case <-ctx.Done():
-			return err
-		case <-time.After(backoff):
-		}
-		backoff *= 2
 	}
 	return err
 }

@@ -3,6 +3,8 @@ package cumagg
 import (
 	"fmt"
 	"time"
+
+	"github.com/JohanLindvall/kubescrape/internal/config"
 )
 
 // ParseStaleAfter reads an operator's staleAfter spelling. field names the
@@ -28,16 +30,18 @@ import (
 // and keep aggregating: reporting a bad value is Validate's job (and
 // -check-config runs it), and refusing to aggregate over it would take the
 // telemetry down for a typo.
+//
+// The policy itself is config.Duration's — empty takes the default, "0" is
+// legal under ZeroDisables, negative and unparseable are errors naming field
+// and value. This wrapper adds only the two things the aggregators need on
+// top: the default beside the error, and the disable-spelling hint. It used to
+// re-implement the whole policy, which is exactly the drift internal/config
+// exists to end (a third spelling of the negative-value error had already
+// appeared).
 func ParseStaleAfter(field, value string, def time.Duration) (time.Duration, error) {
-	if value == "" {
-		return def, nil
-	}
-	d, err := time.ParseDuration(value)
+	d, err := config.Duration(field, value, def, config.ZeroDisables())
 	if err != nil {
-		return def, fmt.Errorf("%s %q: %w", field, value, err)
-	}
-	if d < 0 {
-		return def, fmt.Errorf("%s %q must not be negative (use \"0\" to disable eviction)", field, value)
+		return def, fmt.Errorf("%w (use \"0\" to disable eviction)", err)
 	}
 	return d, nil
 }

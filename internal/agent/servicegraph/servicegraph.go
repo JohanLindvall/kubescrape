@@ -55,6 +55,7 @@ import (
 	"go.opentelemetry.io/collector/pdata/pcommon"
 
 	"github.com/JohanLindvall/kubescrape/internal/agent/cumagg"
+	"github.com/JohanLindvall/kubescrape/internal/config"
 )
 
 // Defaults mirror Tempo's service-graphs processor, so an operator moving from
@@ -141,22 +142,19 @@ type Config struct {
 	VirtualNodePeerAttributes []string `json:"virtualNodePeerAttributes,omitempty"`
 }
 
-// wait parses Wait. Empty — and an explicit zero, which is not a pairing window
-// at all (every half-edge would expire before its partner could arrive) — mean
-// the default.
+// wait parses Wait through config.Duration — the one reader for optional
+// duration strings. Empty takes the default; an explicit zero is REFUSED
+// (config.Positive): a zero pairing window is not a window at all (every
+// half-edge would expire before its partner could arrive), and silently
+// substituting the default — the third zero-policy this field used to carry,
+// beside "0 is legal" and Positive's refusal — meant `wait: "0"` read as 10s
+// with no diagnostic. The default rides along on error so the constructor can
+// fall back; reporting the value is Validate's job.
 func (c Config) wait() (time.Duration, error) {
-	if c.Wait == "" {
-		return DefaultWait, nil
-	}
-	d, err := time.ParseDuration(c.Wait)
+	d, err := config.Duration("serviceGraph.wait", c.Wait, DefaultWait,
+		config.Positive("a zero pairing window would expire every half-edge before its partner arrives"))
 	if err != nil {
-		return DefaultWait, fmt.Errorf("serviceGraph.wait %q: %w", c.Wait, err)
-	}
-	if d < 0 {
-		return DefaultWait, fmt.Errorf("serviceGraph.wait %q must not be negative", c.Wait)
-	}
-	if d == 0 {
-		return DefaultWait, nil
+		return DefaultWait, err
 	}
 	return d, nil
 }

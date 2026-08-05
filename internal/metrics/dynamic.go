@@ -237,6 +237,8 @@ type setConfig struct {
 	log        *slog.Logger
 	// drops is the set's refusal counters, shared by every series it compiles.
 	drops *drops
+	// permanent classifies export errors (see WithPermanentClassifier).
+	permanent func(error) bool
 	// now overrides the coarse clock (tests only; see withClock).
 	now func() int64
 }
@@ -278,14 +280,22 @@ type DynamicMetricSet struct {
 	drops drops
 	// Count is the number of configured rules.
 	Count int
-	// retryBy/retryOrder hold a previous export's UNDELIVERED samples, keyed by
-	// resource, so the next Export re-offers them. snapshot() is destructive —
-	// it seals aggregation windows, zeroes idled samples and deletes expired
-	// ones — so without this a failed send ended those observations' lives.
-	// Bounded by maxRetainedResources. Touched only from Export, which the
-	// agent runs from one goroutine.
-	retryBy    map[string][]seriesSamples
-	retryOrder []string
+	// retryBy/retryOrder hold previous exports' UNDELIVERED samples, keyed by
+	// resource, so the next Export re-offers them at their original snapshot
+	// times. snapshot() is destructive — it seals aggregation windows, zeroes
+	// idled samples and deletes expired ones — so without this a failed send
+	// ended those observations' lives. Bounded by maxRetainedResources AND
+	// maxRetainedSamples (retainedSamples is the running total); permanently
+	// rejected chunks are dropped counted instead of retained (permanent).
+	// Guarded by exportMu: the agent runs Export from one goroutine, but the
+	// FINAL export joins the run loop through a BUDGETED wait, and on a blown
+	// budget the two overlap — the old single-goroutine comment promised more
+	// than that wiring delivers, and the mutex is uncontended everywhere else.
+	exportMu        sync.Mutex
+	permanent       func(error) bool
+	retryBy         map[string][]seriesSamples
+	retryOrder      []string
+	retainedSamples int
 }
 
 // DroppedCapped counts observations this set rejected because a metric's
@@ -293,8 +303,9 @@ type DynamicMetricSet struct {
 func (s *DynamicMetricSet) DroppedCapped() uint64 { return s.drops.Capped() }
 
 // DroppedUndelivered counts undelivered resources dropped because the re-offer
-// buffer filled (see maxRetainedResources). Unlike a failed export, which is
-// retried, these observations are gone.
+// buffer filled (maxRetainedResources / maxRetainedSamples) or because the
+// collector rejected them PERMANENTLY (WithPermanentClassifier). Unlike a
+// transiently failed export, which is retried, these observations are gone.
 func (s *DynamicMetricSet) DroppedUndelivered() uint64 { return s.drops.Retained() }
 
 // DroppedCappedByMetric reports this set's cap-refused observations per metric
@@ -368,7 +379,7 @@ func NewDynamicMetricSet(metrics []Dynamic, opts ...Option) (*DynamicMetricSet, 
 		opt(&cfg)
 	}
 
-	set := &DynamicMetricSet{log: cfg.log}
+	set := &DynamicMetricSet{log: cfg.log, permanent: cfg.permanent}
 	cfg.drops = &set.drops
 	set.pool = sync.Pool{New: func() any {
 		ac := &addContext{buf: make(labels, 0, 16), rbuf: make(labels, 0, 8), set: set}

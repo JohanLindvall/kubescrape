@@ -147,8 +147,11 @@ func TestClientCacheIgnoresWaitParam(t *testing.T) {
 	c := New(Config{Base: srv.URL, Timeout: 5 * time.Second})
 
 	ctx := context.Background()
-	// Different wait values must resolve to the same cache entry.
-	if _, err := c.Container(ctx, "cafe01", 5*time.Second); err != nil {
+	// Different wait values must resolve to the same cache entry. Both waits
+	// sit under the 5s Timeout: Container now refuses wait >= Timeout (the
+	// deadline would fire before the server's wait elapses — pinned by
+	// TestContainerRefusesWaitAtOrPastTimeout), so this test may not use 5s.
+	if _, err := c.Container(ctx, "cafe01", 2*time.Second); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := c.Container(ctx, "cafe01", 0); err != nil {
@@ -156,6 +159,75 @@ func TestClientCacheIgnoresWaitParam(t *testing.T) {
 	}
 	if n := atomic.LoadInt32(&hits); n != 1 {
 		t.Fatalf("server hits = %d; want 1 (wait param must not fragment the cache)", n)
+	}
+}
+
+// Config.Timeout covers the whole request, server-side wait included, so a
+// wait at or past it can never be honored: the client deadline fires while
+// the server is still legitimately holding the request, and the misuse reads
+// as a transport error. Container refuses the combination by name instead.
+func TestContainerRefusesWaitAtOrPastTimeout(t *testing.T) {
+	srv, _ := cachingServer(t, `"v1"`, `{"containerId":"abc"}`)
+	var outcomes []string
+	c := New(Config{Base: srv.URL, Timeout: time.Second,
+		Observe: func(o string) { outcomes = append(outcomes, o) }})
+	ctx := context.Background()
+
+	for _, wait := range []time.Duration{time.Second, 2 * time.Second} {
+		_, err := c.Container(ctx, "abc", wait)
+		if err == nil {
+			t.Fatalf("wait %v with Timeout 1s was accepted", wait)
+		}
+		// The error names both values and the required relationship.
+		for _, want := range []string{wait.String(), "1s", "shorter"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("error %q does not name %q", err, want)
+			}
+		}
+	}
+	// The refusal is still a lookup: Observe is called once per lookup on
+	// every path, this one included.
+	if fmt.Sprint(outcomes) != fmt.Sprint([]string{OutcomeError, OutcomeError}) {
+		t.Errorf("outcomes = %v, want two %s", outcomes, OutcomeError)
+	}
+
+	// Under the timeout the lookup proceeds.
+	if _, err := c.Container(ctx, "abc", 500*time.Millisecond); err != nil {
+		t.Fatal(err)
+	}
+	// With no client timeout there is nothing for the wait to conflict with.
+	c2 := New(Config{Base: srv.URL, Timeout: 0})
+	if _, err := c2.Container(ctx, "abc", time.Hour); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// no-store / no-cache forbid serving a stored response, and either beats an
+// accompanying max-age regardless of directive order. Unreachable against
+// kubescrape's own server (it never combines them with a max-age), but this
+// package is public and other servers do.
+func TestNoStoreNoCacheNeverCached(t *testing.T) {
+	for _, cc := range []string{"no-store, max-age=60", "max-age=60, no-cache", "private, no-store"} {
+		t.Run(cc, func(t *testing.T) {
+			var hits int32
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				atomic.AddInt32(&hits, 1)
+				w.Header().Set("Cache-Control", cc)
+				w.Header().Set("ETag", `"v1"`)
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"name":"web","uid":"u1"}`))
+			}))
+			t.Cleanup(srv.Close)
+			c := New(Config{Base: srv.URL, Timeout: 5 * time.Second})
+			for i := 0; i < 2; i++ {
+				if p, err := c.PodByUID(context.Background(), "u1"); err != nil || p.Name != "web" {
+					t.Fatalf("lookup %d: pod=%+v err=%v", i, p, err)
+				}
+			}
+			if n := atomic.LoadInt32(&hits); n != 2 {
+				t.Fatalf("hits = %d, want 2 (%q must not be cached)", n, cc)
+			}
+		})
 	}
 }
 

@@ -38,26 +38,43 @@ func (lf *Fields) Reset(line string) {
 	clear(lf.vals)
 }
 
-// KeyIndex holds, for a DynamicMetricSet, the distinct line-field keys its
-// rules reference and their dotted JSON paths (parallel slices). want maps each
-// key to its SLOT — its index in keys/paths, and hence in Fields.vals — so the
-// logfmt scan can store a value found under the line's own bytes without
-// materializing them as a string. Precomputed once, not per line.
+// Release drops every reference into the last line before the holder is
+// pooled: the line string itself, the extracted values (which may alias it)
+// and the reused GetPaths buffer's raw views. Clearing lookup state alone
+// released nothing — the pooled holder pinned the last-processed line (up to
+// one max-size multiline entry) until its next use or a GC pool eviction.
+func (lf *Fields) Release() {
+	lf.line = ""
+	lf.parsed = false
+	clear(lf.vals)
+	clear(lf.raws)
+}
+
 // NewKeyIndex builds an empty index; callers Add every key their rules read.
 func NewKeyIndex() KeyIndex {
 	return KeyIndex{want: map[string]int{}}
 }
 
+// KeyIndex holds, for a DynamicMetricSet, the distinct line-field keys its
+// rules reference and their dotted JSON paths (parallel slices). want maps each
+// key to its SLOT — its index in keys/paths, and hence in Fields.vals — so the
+// logfmt scan can store a value found under the line's own bytes without
+// materializing them as a string. Precomputed once, not per line.
 type KeyIndex struct {
 	keys  []string
 	paths [][]string
 	want  map[string]int
 }
 
-// add registers one referenced field key (idempotent; synthetic keys and
-// literals are skipped).
+// Add registers one referenced field key (idempotent; the empty key and the
+// synthetic LineKey are skipped — LineKey is never a line FIELD). The literal
+// "1" is NOT special here: it is a value-DSL constant (metricRule.readValue
+// short-circuits it before consulting values), and skipping it in the shared
+// index silently deadened a selector or label legitimately reading a field
+// named "1" — the classification belongs at the value call site
+// (buildKeyIndex), not in the index every key kind shares.
 func (ki *KeyIndex) Add(key string) {
-	if key == "" || key == "1" || key == LineKey {
+	if key == "" || key == LineKey {
 		return
 	}
 	if _, ok := ki.want[key]; ok {
@@ -68,10 +85,10 @@ func (ki *KeyIndex) Add(key string) {
 	ki.paths = append(ki.paths, strings.Split(key, "."))
 }
 
-// empty reports whether no rule reads any line field.
+// Empty reports whether no rule reads any line field.
 func (ki KeyIndex) Empty() bool { return len(ki.keys) == 0 }
 
-// get returns the value of key from the line, parsing it on first use.
+// Get returns the value of key from the line, parsing it on first use.
 func (ki KeyIndex) Get(lf *Fields, key string) string {
 	if ki.Empty() {
 		return ""
@@ -90,7 +107,7 @@ func (ki KeyIndex) Get(lf *Fields, key string) string {
 	return lf.vals[slot]
 }
 
-// parse fills lf.vals (by slot) with the referenced keys from the line: JSON
+// Parse fills lf.vals (by slot) with the referenced keys from the line: JSON
 // when it starts with '{', otherwise logfmt (flat keys only).
 func (ki KeyIndex) Parse(lf *Fields) {
 	if t := strings.TrimSpace(lf.line); strings.HasPrefix(t, "{") {
@@ -147,31 +164,16 @@ func (ki KeyIndex) Parse(lf *Fields) {
 	})
 }
 
-// isIntegerToken reports whether a JSON number token is a plain integer (no
-// fraction, no exponent), so its text can be used verbatim.
-func isIntegerToken(raw []byte) bool {
-	if len(raw) == 0 {
-		return false
-	}
-	i := 0
-	if raw[0] == '-' {
-		i = 1
-	}
-	if i == len(raw) {
-		return false
-	}
-	for ; i < len(raw); i++ {
-		if raw[i] < '0' || raw[i] > '9' {
-			return false // '.', 'e', 'E' — not integral
-		}
-	}
-	return true
-}
-
 // RawScalarString renders a raw JSON scalar token as a string; objects, arrays
 // and null are rejected. It matches what DecodeAny + a type switch produced
 // (numbers round-trip through float64) without boxing the value in an any.
+// Integral-token classification is logattrs.IsIntegerToken, shared with the
+// twin decoder there (logattrs.decodeScalar) so one line field cannot classify
+// differently as a label and as a lifted attribute.
 func RawScalarString(raw []byte) (string, bool) {
+	if len(raw) == 0 {
+		return "", false // shape check at the parse seam; GetPaths never yields this
+	}
 	switch raw[0] {
 	case '"':
 		if len(raw) < 2 || raw[len(raw)-1] != '"' {
@@ -197,8 +199,10 @@ func RawScalarString(raw []byte) (string, bool) {
 		// one logMetrics series while the record attribute lifted from the same
 		// field (pkg/logattrs.decodeScalar, fixed for this) stayed exact. A
 		// number token is already the decimal text: if it has no fraction or
-		// exponent, it IS the value.
-		if isIntegerToken(raw) {
+		// exponent, it IS the value. (Known residual divergence, accepted: a
+		// token exceeding int64 renders verbatim here but rounds through
+		// float64 in decodeScalar — see IsIntegerToken's doc.)
+		if logattrs.IsIntegerToken(raw) {
 			return string(raw), true
 		}
 		f, err := ljson.ParseFloat(raw)

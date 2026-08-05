@@ -42,6 +42,19 @@ func (t *Tailer) saveCheckpoints() {
 			cps[path] = checkpoint(cp)
 		}
 	}
+	// Stored entries not yet matched to a discovered file survive the rebuild.
+	// claimPath keeps a path whose stat failed with a non-ENOENT error (EIO,
+	// EACCES, ELOOP) out of the in-memory prune precisely because its absence
+	// is unproven — but this rebuild used to consult only t.files, so the very
+	// next save (including the immediate one scanDir triggers on discovery)
+	// destroyed the entry ON DISK while the in-memory map still protected it: a
+	// crash before the path recovered lost the offset and its Pending segments.
+	// The two prunes must agree; t.checkpoints IS the surviving set. (Disjoint
+	// from t.files by construction — initFile consumes an entry on discovery —
+	// and the t.files loop below would win anyway.)
+	for path, cp := range t.checkpoints {
+		cps[path] = cp
+	}
 	for path, f := range t.files {
 		t.extendFingerprint(f)
 		cp := checkpoint{

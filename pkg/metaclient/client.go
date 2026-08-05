@@ -110,7 +110,9 @@ type Config struct {
 	Base string
 
 	// Timeout is the overall per-request timeout. It MUST exceed the wait
-	// passed to Container, or a blocking container lookup can never succeed.
+	// passed to Container, or a blocking container lookup can never succeed —
+	// Container refuses a wait at or past it rather than letting the client
+	// deadline mask the server's wait as a transport error.
 	Timeout time.Duration
 
 	// Observe, if set, is called once per lookup with the outcome (one of the
@@ -184,18 +186,38 @@ func New(cfg Config) *Client {
 // service runs with -scrape-auth-secrets). Responses are no-store; callers
 // cache briefly themselves.
 func (c *Client) ScrapeAuth(ctx context.Context, ref string) (string, error) {
+	// Escape each segment of the ref, keeping the "/" separators as route
+	// structure: a well-formed ns/name/key passes through byte-for-byte (DNS
+	// names and Secret keys need no escaping), while a hostile segment cannot
+	// splice extra path segments, a query or a fragment into the request. This
+	// is the one endpoint method whose argument carries slashes of its own;
+	// the others PathEscape their argument whole.
+	segs := strings.Split(ref, "/")
+	for i, seg := range segs {
+		segs[i] = url.PathEscape(seg)
+	}
 	var out struct {
 		Value string `json:"value"`
 	}
-	if err := c.getJSON(ctx, c.base+"/v1/scrape-auth/"+ref, &out); err != nil {
+	// authed: this is the ONE authenticated route; the bearer decision is made
+	// here, where the URL is built, not by re-matching the path later.
+	if err := c.get(ctx, c.base+"/v1/scrape-auth/"+strings.Join(segs, "/"), true, &out); err != nil {
 		return "", err
 	}
 	return out.Value, nil
 }
 
 // Container fetches metadata for a container ID, letting the service wait up
-// to wait for the metadata to appear.
+// to wait for the metadata to appear. wait must be shorter than the
+// configured Config.Timeout, which covers the whole request — server-side
+// wait included: a wait at or past it can never be honored (the client
+// deadline fires while the server is still legitimately holding the request),
+// so the combination is refused by name instead of surfacing as a timeout.
 func (c *Client) Container(ctx context.Context, id string, wait time.Duration) (*kubemeta.ContainerMetadata, error) {
+	if wait > 0 && c.http.Timeout > 0 && wait >= c.http.Timeout {
+		c.observe(OutcomeError)
+		return nil, fmt.Errorf("metaclient: Container wait %v must be shorter than Config.Timeout %v (the timeout covers the whole request, so the server-side wait could never elapse)", wait, c.http.Timeout)
+	}
 	u := fmt.Sprintf("%s/v1/containers/%s?wait=%s", c.base, url.PathEscape(kubemeta.NormalizeContainerID(id)), wait)
 	var md kubemeta.ContainerMetadata
 	if err := c.getJSON(ctx, u, &md); err != nil {
@@ -277,7 +299,16 @@ func (c *Client) NodeTargets(ctx context.Context, node string) ([]kubemeta.Scrap
 	return resp.Targets, nil
 }
 
+// getJSON is the request path of the unauthenticated metadata endpoints.
 func (c *Client) getJSON(ctx context.Context, u string, v any) error {
+	return c.get(ctx, u, false, v)
+}
+
+// get fetches u into v. authed marks u as the one authenticated route
+// (/v1/scrape-auth): the decision is made where the URL is BUILT, so the
+// route is spelled in exactly one place rather than re-derived by matching
+// the URL here.
+func (c *Client) get(ctx context.Context, u string, authed bool, v any) error {
 	key := cacheKey(u)
 
 	// Fresh cache entry: serve without a request (and without re-decoding —
@@ -288,7 +319,7 @@ func (c *Client) getJSON(ctx context.Context, u string, v any) error {
 		copyDecoded(v, entry.decoded)
 		return nil
 	}
-	return c.fetch(ctx, u, key, entry, cached, v)
+	return c.fetch(ctx, u, key, entry, cached, authed, v)
 }
 
 // lookupEntry reads the cache under the lock, classifying the entry as fresh
@@ -317,7 +348,7 @@ func (c *Client) lookupEntry(key string, v any) (entry cacheEntry, cached, fresh
 
 // fetch performs the HTTP request (revalidating with the entry's ETag when
 // cached), stores a cacheable 200, and decodes into v.
-func (c *Client) fetch(ctx context.Context, u, key string, entry cacheEntry, cached bool, v any) error {
+func (c *Client) fetch(ctx context.Context, u, key string, entry cacheEntry, cached, authed bool, v any) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
 		// Config.Observe is documented as called once per lookup, and every
@@ -334,9 +365,10 @@ func (c *Client) fetch(ctx context.Context, u, key string, entry cacheEntry, cac
 	if cached && entry.etag != "" {
 		req.Header.Set("If-None-Match", entry.etag)
 	}
-	// Only the secret-bearing endpoint is authenticated; sending the token to
-	// every metadata URL would spread it further than it needs to go.
-	if c.token != nil && strings.Contains(u, "/v1/scrape-auth/") {
+	// Only the secret-bearing endpoint is authenticated (authed, decided where
+	// the URL was built); sending the token to every metadata URL would spread
+	// it further than it needs to go.
+	if authed && c.token != nil {
 		if tok := c.token(); tok != "" {
 			req.Header.Set("Authorization", "Bearer "+tok)
 		}
@@ -445,8 +477,10 @@ const maxCacheEntries = 4096
 const evictLowWater = maxCacheEntries * 3 / 4
 
 // evictLocked trims the cache when it exceeds the cap: IDLE entries first,
-// then arbitrary ones (they re-fetch cheaply via ETag revalidation). Caller
-// holds the mutex.
+// then arbitrary ones. An arbitrary eviction discards the ETag with the
+// entry, so that URL's next lookup is a full 200 re-fetch, not a cheap
+// revalidation — the price of the hard bound, paid only when 4096+ distinct
+// URLs are genuinely live. Caller holds the mutex.
 func (c *Client) evictLocked() {
 	now := c.now()
 	// Sweep idle entries periodically even below the cap. The cap alone
@@ -522,17 +556,25 @@ func cacheKey(u string) string {
 	return parsed.String()
 }
 
-// maxAge extracts the Cache-Control max-age; zero when absent or unparseable.
+// maxAge extracts the Cache-Control max-age; zero when absent or unparseable,
+// and zero whenever no-store or no-cache is also present — either directive
+// forbids serving a stored response without asking again, and this client's
+// only storage is its cache, so both mean "do not cache". kubescrape's own
+// server never combines them with a max-age, but this package is public.
 func maxAge(resp *http.Response) time.Duration {
+	var ttl time.Duration
 	for _, part := range strings.Split(resp.Header.Get("Cache-Control"), ",") {
 		part = strings.TrimSpace(part)
+		if part == "no-store" || part == "no-cache" {
+			return 0
+		}
 		if v, ok := strings.CutPrefix(part, "max-age="); ok {
 			if secs, err := strconv.Atoi(v); err == nil && secs > 0 {
-				return time.Duration(secs) * time.Second
+				ttl = time.Duration(secs) * time.Second
 			}
 		}
 	}
-	return 0
+	return ttl
 }
 
 // StatusError is a non-200 response from the metadata service.

@@ -1,7 +1,6 @@
 package logline
 
 import (
-	"errors"
 	"fmt"
 	"math"
 	"sync"
@@ -18,7 +17,10 @@ type LineRule struct {
 	// Action is "keep" or "drop".
 	Action string `json:"action"`
 	// Match / MatchRegexp must all hold for the rule to match (exact and
-	// regex selectors respectively; key!=value negates).
+	// regex selectors respectively; key!=value negates). MatchRegexp patterns
+	// are RE2, passed to the engine VERBATIM (backslash is the regex escape:
+	// `\\d` is a literal backslash then 'd', `\d` a digit class); Match values
+	// may spell a literal backslash or double quote as \\ and \".
 	Match       []string `json:"match,omitempty"`
 	MatchRegexp []string `json:"matchRegexp,omitempty"`
 	// Sample, on a keep rule, keeps only this fraction of the matching lines
@@ -52,6 +54,14 @@ type filterCtx struct {
 	fn     func(string) string
 }
 
+// resolve is the attrs-then-line-fields resolution tier: __line__ is the raw
+// body, the caller's lookup (record/resource attributes) wins when it returns
+// non-empty, and the line's own parsed fields are the fallback. VALUE-based,
+// not presence-based — a present-but-empty attribute cannot shadow a line
+// field (inherent in the func(string) string signature the zero-alloc paths
+// require), unlike the resolver's internal record→lifted→resource ranking.
+// internal/metrics' addContext.labelLookup spells the SAME policy for the
+// same two tiers; a change here must land there too.
 func (fc *filterCtx) resolve(key string) string {
 	if key == LineKey {
 		return fc.raw
@@ -94,7 +104,7 @@ func NewLineFilter(rules []LineRule) (*LineFilter, error) {
 			cr.every = uint64(math.Round(1 / r.Sample))
 		}
 		if len(r.Match) == 0 && len(r.MatchRegexp) == 0 {
-			return nil, errors.New("logs rule: empty match would apply to every line; use an explicit __line__ selector instead")
+			return nil, fmt.Errorf("logs rule %d: empty match would apply to every line; use an explicit __line__ selector instead", i)
 		}
 		match, err := ParseSelectors(r.Match, r.MatchRegexp)
 		if err != nil {
@@ -138,6 +148,7 @@ func (f *LineFilter) Keep(lookup func(string) string, line string) bool {
 		break
 	}
 	fc.lookup, fc.raw = nil, ""
+	fc.line.Release() // the line string and the raws views into it go with it
 	f.pool.Put(fc)
 	return keep
 }

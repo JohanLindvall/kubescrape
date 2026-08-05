@@ -33,8 +33,8 @@ func (t *Tailer) drainFile(ctx context.Context, f *file) bool {
 // — kubelet rotates at 10MiB, rate-limit pause mode accumulates arbitrary
 // backlogs); the cap is only a circuit breaker against a source that outruns the
 // drain forever (a writer holding the rotated fd open, or a gzip bomb).
-// drainReader reads r to EOF into the pipeline. It reports false when a
-// mid-drain flush FAILED and rewound this file: the rewind seeks the very fd
+// It reports false when a mid-drain flush FAILED and rewound this file: the
+// rewind seeks the very fd
 // being drained back to the committed offset, so continuing would re-read the
 // same bytes into a batch whose export just failed — a hot loop burning
 // export attempts on the single sweep goroutine until the 1 GiB cap. The
@@ -363,9 +363,8 @@ func (t *Tailer) openSegmentSource(f *file, p *segment) (fh *os.File, path strin
 }
 
 // replaySegment re-reads one segment's owed [committed,to) range and feeds
-// its lines into the pipeline under the segment's own id.
-// replaySegment re-reads a segment's owed range. It reports whether the range
-// was finished this sweep; an unfinished one must be revisited.
+// its lines into the pipeline under the segment's own id. It reports whether
+// the range was finished this sweep; an unfinished one must be revisited.
 func (t *Tailer) replaySegment(ctx context.Context, f *file, p *segment) bool {
 	fh, path, closeFh, ok, retired := t.openSegmentSource(f, p)
 	if !ok {
@@ -427,7 +426,7 @@ func (t *Tailer) replaySegment(ctx context.Context, f *file, p *segment) bool {
 					// line (whose live read was capped and discarded) must
 					// not be slurped whole into memory on replay. The
 					// remainder up to its newline is part of the same line.
-					if len(carry) > t.cfg.MaxEntryBytes+4096 {
+					if len(carry) > t.cfg.MaxEntryBytes+oversizeSlack {
 						cur += int64(len(carry))
 						carry = carry[:0]
 						discarding = true
@@ -705,5 +704,3 @@ func (t *Tailer) rewind(f *file) {
 	f.restartAt(f.committed)
 	t.newPipeline(f)
 }
-
-// --- checkpoints ---

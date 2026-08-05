@@ -1,12 +1,54 @@
 package attrs
 
 import (
+	"slices"
 	"testing"
 
 	"go.opentelemetry.io/collector/pdata/pcommon"
 
+	"github.com/JohanLindvall/kubescrape/internal/owners"
 	"github.com/JohanLindvall/kubescrape/pkg/kubemeta"
 )
+
+// TestKindTableCoversOwnerResolver pins kindTable against the resolver's
+// informer list: a kind added to internal/owners (a new metadata informer /
+// owner-chain entry) without a row in kindTable would resolve owners whose
+// k8s.<kind>.name attribute is then silently dropped from every resource.
+func TestKindTableCoversOwnerResolver(t *testing.T) {
+	// GVR resource (plural) -> owner kind; "" marks a resolver GVR that is not
+	// an owner kind (Namespace backs namespace METADATA, not the owner chain).
+	kindByResource := map[string]string{
+		"replicasets":  "ReplicaSet",
+		"deployments":  "Deployment",
+		"statefulsets": "StatefulSet",
+		"daemonsets":   "DaemonSet",
+		"jobs":         "Job",
+		"cronjobs":     "CronJob",
+		"nodes":        "Node",
+		"namespaces":   "",
+	}
+	known := make(map[string]bool)
+	for _, gvr := range owners.AllGVRs {
+		kind, listed := kindByResource[gvr.Resource]
+		if !listed {
+			t.Errorf("owners.AllGVRs gained %q: add its kind to kindTable in internal/agent/attrs/attrs.go (and to this map)", gvr.Resource)
+			continue
+		}
+		if kind == "" {
+			continue
+		}
+		known[kind] = true
+		if _, ok := KindAttribute(kind); !ok {
+			t.Errorf("owner kind %q (owners.AllGVRs %q) has no kindTable row in internal/agent/attrs/attrs.go", kind, gvr.Resource)
+		}
+	}
+	// The reverse: no dead rows describing kinds the resolver never caches.
+	for kind := range kindTable {
+		if !known[kind] {
+			t.Errorf("kindTable kind %q has no owners.AllGVRs informer backing it", kind)
+		}
+	}
+}
 
 func TestPrefixInstance(t *testing.T) {
 	// Prepend to an existing instance.
@@ -50,6 +92,61 @@ func TestPodIPAndServiceName(t *testing.T) {
 	Pod(res, kubemeta.Pod{Name: "p", Namespace: "ns", UID: "u"})
 	if _, ok := res.Attributes().Get("k8s.pod.ip"); ok {
 		t.Error("k8s.pod.ip set despite empty PodIP")
+	}
+}
+
+// A partially-filled Pod must not mint empty-string resource attributes:
+// every field is guarded, not just NodeName/PodIP.
+func TestPodEmptyFieldsOmitted(t *testing.T) {
+	res := pcommon.NewResource()
+	Pod(res, kubemeta.Pod{UID: "u"})
+	got := res.Attributes().AsRaw()
+	if got["k8s.pod.uid"] != "u" {
+		t.Errorf("k8s.pod.uid = %v, want u", got["k8s.pod.uid"])
+	}
+	for _, absent := range []string{"k8s.namespace.name", "k8s.pod.name", "service.name"} {
+		if v, ok := got[absent]; ok {
+			t.Errorf("%s = %q set from an empty field; must be omitted", absent, v)
+		}
+	}
+	// The zero Pod yields no attributes at all.
+	res = pcommon.NewResource()
+	Pod(res, kubemeta.Pod{})
+	if n := res.Attributes().Len(); n != 0 {
+		t.Errorf("zero Pod produced %d attributes: %v", n, res.Attributes().AsRaw())
+	}
+}
+
+// ReservedIdentity is the boundary the tailer's pod-annotation filter (and any
+// other workload/line-supplied attribute path) consults; the exact key set is
+// load-bearing for those consumers, so pin it.
+func TestReservedIdentity(t *testing.T) {
+	want := []string{
+		"container.id",
+		"container.name",
+		"k8s.container.name",
+		"k8s.namespace.name",
+		"k8s.node.name",
+		"k8s.pod.ip",
+		"k8s.pod.name",
+		"k8s.pod.uid",
+		"service.instance.id",
+		"service.namespace",
+	}
+	if got := ReservedIdentityKeys(); !slices.Equal(got, want) {
+		t.Errorf("ReservedIdentityKeys() = %v, want %v", got, want)
+	}
+	for _, k := range want {
+		if !ReservedIdentity(k) {
+			t.Errorf("ReservedIdentity(%q) = false, want true", k)
+		}
+	}
+	// service.name is deliberately NOT reserved: descriptive, and overriding
+	// it is the pod annotation's documented purpose.
+	for _, k := range []string{"service.name", "k8s.cluster.name", ""} {
+		if ReservedIdentity(k) {
+			t.Errorf("ReservedIdentity(%q) = true, want false", k)
+		}
 	}
 }
 

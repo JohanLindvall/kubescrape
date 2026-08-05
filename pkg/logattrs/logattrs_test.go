@@ -246,11 +246,22 @@ func TestKeyDistinguishesInt64Values(t *testing.T) {
 	if a == b {
 		t.Fatalf("int64 values dropped from the grouping key: %q == %q", a, b)
 	}
-	// And int64 must not alias the float64 or string forms of the same digits.
+	// int64 must not alias the STRING form of the same digits — but a WHOLE
+	// float64 must key identically to the int64, because Put stores both with
+	// PutInt: key identity follows stored identity, or {"shard":2} and
+	// {"shard":2.0} split into two ResourceLogs whose exported resources are
+	// byte-identical (a duplicate resource per payload for an emitter mixing
+	// spellings).
 	f := Key([]Attr{{Key: "pid", Val: float64(1)}})
+	if a != f {
+		t.Fatalf("whole float64 keys differently from the int64 it is stored as: i=%q f=%q", a, f)
+	}
+	if frac := Key([]Attr{{Key: "pid", Val: 1.5}}); frac == a {
+		t.Fatalf("fractional float64 aliases int64: %q", frac)
+	}
 	s := Key([]Attr{{Key: "pid", Val: "1"}})
-	if a == f || a == s {
-		t.Fatalf("int64 aliases another type: i=%q f=%q s=%q", a, f, s)
+	if a == s {
+		t.Fatalf("int64 aliases the string form: i=%q s=%q", a, s)
 	}
 }
 

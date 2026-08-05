@@ -79,6 +79,16 @@ func (s *DynamicMetricSet) Run(ctx context.Context, exp Exporter, interval time.
 type seriesSamples struct {
 	series  *series
 	samples []sample
+	// ts is the instant the samples were SNAPSHOTTED, and the timestamp they
+	// render at. A retained (previously undelivered) generation keeps its own
+	// snapshot time rather than being restamped by the export that re-offers
+	// it: one clock for retained and fresh alike meant a still-live cumulative
+	// series — re-read by every snapshot — rendered twice under one timestamp
+	// with two different values in one payload (a duplicate a Prometheus-
+	// lineage backend rejects or ingests order-dependently). With the original
+	// time kept, the retained generation is simply the older point of the same
+	// series — exactly what at-least-once means for a metric.
+	ts time.Time
 }
 
 // Export sends the current value of every configured metric as OTLP, grouped
@@ -90,15 +100,18 @@ func (s *DynamicMetricSet) Export(ctx context.Context, exp Exporter, maxBytes in
 	if s == nil {
 		return nil
 	}
+	s.exportMu.Lock()
+	defer s.exportMu.Unlock()
 	ts := time.Now()
-	byResource, order := s.groupByResource()
+	byResource, order := s.groupByResource(ts)
 	// Re-offer whatever a previous export failed to deliver. snapshot() is
 	// DESTRUCTIVE — it seals aggregation windows, zeroes idled samples and
 	// deletes expired ones — so for those the store no longer holds the value
 	// and a failed send used to end the observation's life. (A plain cumulative
 	// series is unaffected either way: the next export re-reads its running
 	// total.) Retaining the samples is what makes this at-least-once, like
-	// every other producer in this repo.
+	// every other producer in this repo; each retained generation renders at
+	// its OWN snapshot time (seriesSamples.ts).
 	order = s.mergeRetry(byResource, order)
 
 	md := pmetric.NewMetrics()
@@ -119,7 +132,18 @@ func (s *DynamicMetricSet) Export(ctx context.Context, exp Exporter, maxBytes in
 			if firstErr == nil {
 				firstErr = err
 			}
-			s.retain(byResource, chunk)
+			if s.permanent != nil && s.permanent(err) {
+				// A definitive rejection (bad payload, unimplemented, over a
+				// receiver's limit) cannot become deliverable: retaining it
+				// re-sent the same refused chunk every interval forever while
+				// the pile grew. Drop it counted, the way every other producer
+				// classifies (the tailer's advanceBatch, the buffer's drain).
+				s.drops.addRetained(uint64(len(chunk)))
+				s.log.Error("dropping a permanently rejected log-metrics chunk",
+					"resources", len(chunk), "error", err)
+			} else {
+				s.retain(byResource, chunk)
+			}
 		}
 		md.ResourceMetrics().RemoveIf(func(pmetric.ResourceMetrics) bool { return true })
 		chunk = chunk[:0]
@@ -138,7 +162,7 @@ func (s *DynamicMetricSet) Export(ctx context.Context, exp Exporter, maxBytes in
 		scope := rm.ScopeMetrics().AppendEmpty()
 		setScope(scope, ScopeName)
 		for _, ss := range byResource[resStr] {
-			renderSeries(scope, ss.series, ss.samples, ts)
+			renderSeries(scope, ss.series, ss.samples, ss.ts)
 		}
 		rmSize := metricsMarshaler.MetricsSize(scratch)
 		if maxBytes > 0 && size > 0 && size+rmSize > maxBytes {
@@ -152,6 +176,14 @@ func (s *DynamicMetricSet) Export(ctx context.Context, exp Exporter, maxBytes in
 	return firstErr
 }
 
+// WithPermanentClassifier installs the export-error classifier (nil = every
+// failure is transient and retained). The set cannot import the exporter's own
+// IsPermanent — obs sits between the two packages — so the caller injects it,
+// the same inversion metaclient uses for Config.Observe.
+func WithPermanentClassifier(f func(error) bool) Option {
+	return func(c *setConfig) { c.permanent = f }
+}
+
 // maxRetainedResources bounds the undelivered snapshot held for the next
 // export. A collector outage is exactly when this fills, and holding a growing
 // pile of dead windows would turn a delivery problem into an OOM — which is the
@@ -159,6 +191,15 @@ func (s *DynamicMetricSet) Export(ctx context.Context, exp Exporter, maxBytes in
 // the cap the OLDEST retained resources are dropped and counted, so the loss is
 // visible rather than silent.
 const maxRetainedResources = 4096
+
+// maxRetainedSamples bounds the retained SAMPLES across all resources. The
+// resource cap alone never bound on a node — a handful of distinct log
+// resources, so a multi-hour outage grew one generation of every live series
+// per failed export inside a cap that counts resources. 50k samples is ~20 MB
+// worst case (per-sample struct plus its share of the interned label/resource
+// strings), an amount worth holding for a recovery and safe to hold through
+// an outage.
+const maxRetainedSamples = 50_000
 
 // retain keeps a failed chunk's samples so the next Export re-offers them.
 func (s *DynamicMetricSet) retain(byResource map[string][]seriesSamples, chunk []string) {
@@ -174,10 +215,16 @@ func (s *DynamicMetricSet) retain(byResource map[string][]seriesSamples, chunk [
 			s.retryOrder = append(s.retryOrder, resStr)
 		}
 		s.retryBy[resStr] = append(s.retryBy[resStr], ss...)
+		for _, e := range ss {
+			s.retainedSamples += len(e.samples)
+		}
 	}
-	for len(s.retryOrder) > maxRetainedResources {
+	for len(s.retryOrder) > maxRetainedResources || (s.retainedSamples > maxRetainedSamples && len(s.retryOrder) > 0) {
 		oldest := s.retryOrder[0]
 		s.retryOrder = s.retryOrder[1:]
+		for _, e := range s.retryBy[oldest] {
+			s.retainedSamples -= len(e.samples)
+		}
 		delete(s.retryBy, oldest)
 		s.drops.addRetained(1)
 	}
@@ -194,18 +241,22 @@ func (s *DynamicMetricSet) mergeRetry(byResource map[string][]seriesSamples, ord
 		if _, ok := byResource[resStr]; !ok {
 			order = append(order, resStr)
 		}
-		// Prepended: the undelivered window is older than what the fresh
-		// snapshot just took for the same resource.
+		// Prepended: the undelivered generations are OLDER than what the fresh
+		// snapshot just took for the same resource, and each carries its own
+		// snapshot ts — per series, points render oldest-first in ascending
+		// timestamp order.
 		byResource[resStr] = append(s.retryBy[resStr], byResource[resStr]...)
 	}
 	s.retryBy, s.retryOrder = nil, nil
+	s.retainedSamples = 0
 	return order
 }
 
 // groupByResource snapshots each unique series and buckets its samples by the
 // resource they carry, returning resource → [(series, its samples)] plus the
-// resource order.
-func (s *DynamicMetricSet) groupByResource() (map[string][]seriesSamples, []string) {
+// resource order. ts is the snapshot instant, stamped on every group (see
+// seriesSamples.ts).
+func (s *DynamicMetricSet) groupByResource(ts time.Time) (map[string][]seriesSamples, []string) {
 	byResource := map[string][]seriesSamples{}
 	var order []string
 	seen := make(map[*series]bool, len(s.rules))
@@ -222,7 +273,7 @@ func (s *DynamicMetricSet) groupByResource() (map[string][]seriesSamples, []stri
 			if _, ok := byResource[resStr]; !ok {
 				order = append(order, resStr)
 			}
-			byResource[resStr] = append(byResource[resStr], seriesSamples{rule.series, samps})
+			byResource[resStr] = append(byResource[resStr], seriesSamples{series: rule.series, samples: samps, ts: ts})
 		}
 	}
 	return byResource, order

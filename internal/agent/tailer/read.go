@@ -122,6 +122,15 @@ func (t *Tailer) resolvePlain(f *file) bool {
 	for k, v := range f.source.attributes {
 		a.PutStr(k, v)
 	}
+	// The source's attributes land AFTER Build so they beat templates and
+	// defaults — but the pipeline's guarantees must still close over the FINAL
+	// set. Re-derive identity (fill-if-absent: a source-declared
+	// k8s.namespace.name now yields service.namespace, so tenancy routing and
+	// the Mimir job agree about the namespace) and re-apply the operator's
+	// global attribute filter (resourceAttributes.disable could not drop a
+	// plain source's static attribute while the stamp bypassed it).
+	attrs.Identity(res)
+	t.cfg.Attrs.FilterResource(res)
 	f.resource = res
 	f.resolved = true
 	return true
@@ -277,7 +286,7 @@ func (t *Tailer) ensureOpen(f *file) error {
 	start := f.committed
 	// A DIFFERENT file now lives at this path: -logs-idle-close released the
 	// fd and the runtime rotated a replacement in while we held none.
-	replaced := f.inode != 0 && (f.inode != inode || !f.fp.matches(fh))
+	replaced := f.identityChanged(inode, fh)
 	if replaced {
 		start = 0
 	}

@@ -3,6 +3,7 @@ package otlpexport
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"sync"
@@ -472,7 +473,13 @@ const maxStuckTracked = 4096
 func (s *sink[T]) enqueue(v T) error {
 	data, err := s.marshal(v)
 	if err != nil {
-		return err
+		// pdata proto marshal is effectively infallible, but a payload that
+		// cannot SERIALIZE can never enqueue: returned bare (and hence
+		// transient) the tailer would rewind and rebuild the same batch
+		// forever with every buffer metric flat. Count it with the other
+		// non-capacity refusals and classify it permanent.
+		obs.BufferEnqueueErrors.WithLabelValues(s.kind).Inc()
+		return fmt.Errorf("%w: %v", errUnmarshalable, err)
 	}
 	err = s.buf.add(data)
 	switch {
@@ -834,14 +841,26 @@ func (s *sink[T]) trySend(ctx context.Context, v T) sendResult {
 // sweep goroutine, and with it log shipping for every file on the node -
 // while the counter added for exactly this class stayed at 0. ErrFull is
 // deliberately NOT here: that one drains.
+// errUnmarshalable marks a payload that cannot serialize for the disk buffer:
+// permanent by definition — retrying cannot change the payload's own
+// encodability.
+var errUnmarshalable = errors.New("payload does not marshal")
+
 func IsPermanent(err error) bool {
-	if errors.Is(err, diskqueue.ErrRecordTooLarge) {
+	if errors.Is(err, diskqueue.ErrRecordTooLarge) || errors.Is(err, errUnmarshalable) {
 		return true
 	}
 	var he *HTTPStatusError
 	if errors.As(err, &he) {
 		switch he.Code {
-		case 400, 405, 413, 414, 415, 422, 431:
+		// 501 is the HTTP spelling of gRPC Unimplemented, which is permanent
+		// below: without it the same collector-serves-no-such-signal mistake
+		// was a counted drop over gRPC and an unbounded rewind-and-rebuild
+		// loop over OTLP/HTTP. (404 stays transient DELIBERATELY: a
+		// collector's routes reprogram during a rollout, and draining a
+		// backlog into drops for a path that returns tomorrow is the wrong
+		// trade.)
+		case 400, 405, 413, 414, 415, 422, 431, 501:
 			return true
 		}
 		return false

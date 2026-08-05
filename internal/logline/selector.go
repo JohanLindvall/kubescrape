@@ -50,7 +50,7 @@ func (c *MatchContext) Reset() {
 	c.falseHashes = c.falseHashes[:0]
 }
 
-// cached returns the memoized result for hash, if known; store records one.
+// Cached returns the memoized result for hash, if known; Store records one.
 // (Two calls rather than an eval(hash, func() bool) so the hot path does not
 // allocate a closure per selector per line.)
 func (c *MatchContext) Cached(hash uint64) (result, known bool) {
@@ -71,7 +71,7 @@ func (c *MatchContext) Store(hash uint64, result bool) {
 	}
 }
 
-// labelKeys returns the distinct label names the selectors read, so a caller
+// LabelKeys returns the distinct label names the selectors read, so a caller
 // can arrange for those to be resolvable.
 func (s *Selectors) LabelKeys() []string {
 	keys := make([]string, 0, len(s.exact)+len(s.regex))
@@ -84,7 +84,7 @@ func (s *Selectors) LabelKeys() []string {
 	return keys
 }
 
-// match reports whether every selector holds for the given label lookup.
+// Match reports whether every selector holds for the given label lookup.
 func (s *Selectors) Match(lookup func(string) string, ctx *MatchContext) bool {
 	for i := range s.exact {
 		sel := &s.exact[i]
@@ -113,17 +113,25 @@ func (s *Selectors) Match(lookup func(string) string, ctx *MatchContext) bool {
 
 // ParseSelectors compiles exact and regex selector strings into a Selectors.
 // Empty inputs yield a set that matches everything.
+//
+// The selector language: "label=value" / "label!=value". An EXACT value may
+// spell a literal backslash or double quote as \\ and \" (one left-to-right
+// pass; anything else after a backslash is verbatim). A REGEX value is passed
+// to RE2 UNTOUCHED — backslash is the regex escape character there, and an
+// extra unescape layer silently rewrote patterns (`C:\\data`, the standard
+// spelling for a literal `C:\data`, became `C:\data`, where \d is a digit
+// class matching `C:5ata`).
 func ParseSelectors(exact, regex []string) (*Selectors, error) {
 	set := &Selectors{}
 	for _, in := range exact {
-		label, expr, want, hash, err := parseSelector(in)
+		label, expr, want, hash, err := parseSelector(in, false)
 		if err != nil {
 			return nil, err
 		}
 		set.exact = append(set.exact, exactSelector{label: label, value: expr, want: want, hash: hash})
 	}
 	for _, in := range regex {
-		label, expr, want, hash, err := parseSelector(in)
+		label, expr, want, hash, err := parseSelector(in, true)
 		if err != nil {
 			return nil, err
 		}
@@ -141,19 +149,32 @@ func ParseSelectors(exact, regex []string) (*Selectors, error) {
 }
 
 // parseSelector splits "label=value" or "label!=value" into its parts. want is
-// false for the negated form.
-func parseSelector(in string) (label, expr string, want bool, hash uint64, err error) {
+// false for the negated form. regex leaves the expression verbatim for RE2
+// (see ParseSelectors); exact values get the \\ / \" unescape.
+//
+// The grammar is strict where leniency compiled into silent misbehavior: an
+// empty label ("=") resolved every lookup to "" and MATCHED EVERY LINE —
+// {action: drop, match: ["="]} silently dropped a node's whole log stream,
+// defeating NewLineFilter's deliberate refusal of an empty match list — and a
+// bare '!' with no '=' ("a!b") read as a != "b" instead of erroring.
+func parseSelector(in string, regex bool) (label, expr string, want bool, hash uint64, err error) {
 	i := strings.IndexAny(in, "!=")
-	if i == -1 {
-		return "", "", false, 0, fmt.Errorf("invalid selector: %s", in)
+	if i <= 0 {
+		return "", "", false, 0, fmt.Errorf("invalid selector %q (want label=value or label!=value)", in)
 	}
 	label = in[:i]
 	want = in[i] == '='
 	rest := in[i+1:]
 	if !want {
-		rest = strings.TrimPrefix(rest, "=") // "label!=value"
+		var found bool
+		if rest, found = strings.CutPrefix(rest, "="); !found {
+			return "", "", false, 0, fmt.Errorf("invalid selector %q ('!' must be followed by '=')", in)
+		}
 	}
-	expr = unescapeSelector(rest)
+	expr = rest
+	if !regex {
+		expr = unescapeSelector(rest)
+	}
 	// Hash label and expression separately: a "\n"-joined string let
 	// "a\nb"="c" and "a"="b\nc" share a memo slot.
 	hash = pairHash(xxhash.Sum64String(label), xxhash.Sum64String(expr))
@@ -163,9 +184,27 @@ func parseSelector(in string) (label, expr string, want bool, hash uint64, err e
 // regexSelectorKind discriminates regex-selector memo hashes from exact ones.
 const regexSelectorKind = 0x9e3779b97f4a7c15
 
+// unescapeSelector decodes an exact selector value's escapes — \\ and \" —
+// in ONE left-to-right pass; any other byte after a backslash is verbatim.
+// The old sequential ReplaceAll pair made the language ambiguous: pass one
+// (\\→\) manufactured a \" that pass two consumed, so the input `\\"` (a
+// literal backslash followed by a bare quote, legal since quotes need no
+// escaping) decoded to `"` instead of `\"`.
 func unescapeSelector(s string) string {
-	s = strings.ReplaceAll(s, `\\`, `\`)
-	return strings.ReplaceAll(s, `\"`, `"`)
+	i := strings.IndexByte(s, '\\')
+	if i < 0 {
+		return s
+	}
+	var b strings.Builder
+	b.Grow(len(s))
+	b.WriteString(s[:i])
+	for ; i < len(s); i++ {
+		if s[i] == '\\' && i+1 < len(s) && (s[i+1] == '\\' || s[i+1] == '"') {
+			i++
+		}
+		b.WriteByte(s[i])
+	}
+	return b.String()
 }
 
 // pairHash folds two 64-bit hashes into one memo key with an avalanche

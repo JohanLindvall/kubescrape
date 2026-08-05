@@ -1,12 +1,39 @@
 package logchain
 
 import (
+	"math"
 	"testing"
 
 	"go.opentelemetry.io/collector/pdata/pcommon"
 
 	"github.com/JohanLindvall/kubescrape/pkg/logattrs"
 )
+
+// attrString must render EXACTLY as pcommon.Value.AsString: the resolver's
+// cross-pipeline parity rests on it, and the float arm diverged once — a bare
+// FormatFloat('f') against pcommon's ES6 rendering meant the same lifted field
+// minted label "0.0000005" through the lifted-resource path and "5e-7" through
+// the record-attribute path, two series for one value.
+func TestAttrStringMatchesPcommon(t *testing.T) {
+	for _, f := range []float64{
+		0, 1, -1, 2.5, math.Copysign(0, -1), 5e-7, 9.99e-7, 1e-6, 1e21,
+		1e21 - (1 << 16), -1e21, 1.5e300, 5e-324, 123456789.123456,
+		math.Inf(1), math.Inf(-1), math.NaN(),
+	} {
+		if got, want := attrString(f), pcommon.NewValueDouble(f).AsString(); got != want {
+			t.Errorf("attrString(%v) = %q, pcommon renders %q", f, got, want)
+		}
+	}
+	if got, want := attrString(int64(42)), pcommon.NewValueInt(42).AsString(); got != want {
+		t.Errorf("int64: attrString %q vs pcommon %q", got, want)
+	}
+	if got, want := attrString(true), pcommon.NewValueBool(true).AsString(); got != want {
+		t.Errorf("bool: attrString %q vs pcommon %q", got, want)
+	}
+	if got, want := attrString("x"), pcommon.NewValueStr("x").AsString(); got != want {
+		t.Errorf("string: attrString %q vs pcommon %q", got, want)
+	}
+}
 
 // maps builds a record/resource attribute pair from literal string maps.
 func maps(rec, res map[string]string) (pcommon.Map, pcommon.Map) {
@@ -213,11 +240,34 @@ func TestLowerSeverity(t *testing.T) {
 
 	// Every constant fast path must produce exactly what the general fallback
 	// would, or the two disagree for the inputs that take the fast path.
-	for _, in := range []string{"TRACE", "DEBUG", "INFO", "WARN", "WARNING", "ERROR", "FATAL"} {
+	for _, in := range []string{
+		"TRACE", "DEBUG", "INFO", "NOTICE", "WARN", "WARNING",
+		"ERROR", "ERR", "CRIT", "ALERT", "EMERG", "FATAL",
+	} {
 		want := asciiLowerReference(in)
 		if got := LowerSeverity(in); got != want {
 			t.Errorf("fast path for %q returned %q; the general lowering gives %q", in, got, want)
 		}
+	}
+}
+
+// journald stamps the syslog severity texts lowercase (journald.go); every one
+// must take an allocation-free path — the journal is the pipeline whose
+// allocation-free severity lowering this function replaced, and five of its
+// eight texts used to miss the constant list and allocate per entry. Any
+// already-lower input is free now (the fallback returns it unchanged), which
+// this pins alongside the constants.
+func TestLowerSeverityIsAllocationFreeForLowercase(t *testing.T) {
+	inputs := []string{
+		"emerg", "alert", "crit", "err", "warning", "notice", "info", "debug",
+		"lowercase-unknown", "level 5",
+	}
+	if avg := testing.AllocsPerRun(100, func() {
+		for _, in := range inputs {
+			_ = LowerSeverity(in)
+		}
+	}); avg != 0 {
+		t.Errorf("lowercase severities allocate: %v allocs/run", avg)
 	}
 }
 

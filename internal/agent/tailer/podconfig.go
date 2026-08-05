@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"fmt"
 
+	"github.com/JohanLindvall/kubescrape/internal/agent/attrs"
 	"github.com/JohanLindvall/kubescrape/internal/logline"
 	"github.com/JohanLindvall/kubescrape/internal/obs"
 )
@@ -133,40 +134,14 @@ func (t *Tailer) applyPodConfig(f *file, annotations map[string]string) {
 	}
 }
 
-// reservedIdentityAttrs are the resource attributes a pod annotation may NOT
-// set: the ones the agent RESOLVED from the API server, as opposed to the ones
-// the workload legitimately declares about itself.
-//
-// The distinction is a security boundary, not tidiness. `k8s.namespace.name` is
-// what internal/agent/route keys tenancy on (route.Router.match reads it
-// straight off this resource), so an unfiltered write let any user who can
-// annotate a pod in their OWN namespace — an ordinary namespace-scoped action —
-// send that pod's logs to a different tenant's endpoint under that tenant's
-// X-Scope-OrgID, and simultaneously remove them from their own. The same write
-// forged `service.name`/`service.instance.id`/`k8s.pod.name` in the backend and
-// on every log-derived metric series bound to this resource.
-//
-// The operator's own key filter cannot stand in for this: `attrs.Filter` runs
-// INSIDE `Attrs.Build`, which resolveMetadata calls BEFORE applyPodConfig, so a
-// `resourceAttributes.disable` entry is applied and then overwritten.
-//
-// `service.name` is deliberately NOT here — overriding it is the annotation's
-// documented purpose (and has its own `serviceName` field). It is descriptive:
-// it renames the workload's own series, it does not move them to another owner.
-var reservedIdentityAttrs = map[string]struct{}{
-	"k8s.namespace.name":  {},
-	"k8s.pod.name":        {},
-	"k8s.pod.uid":         {},
-	"k8s.pod.ip":          {},
-	"k8s.container.name":  {},
-	"k8s.node.name":       {},
-	"container.id":        {},
-	"container.name":      {},
-	"service.namespace":   {},
-	"service.instance.id": {},
-}
-
+// reservedIdentityAttr reports whether a pod annotation may NOT set this
+// resource attribute. The set — and the security reasoning behind it
+// (tenancy routes on k8s.namespace.name; identity keys forge series in the
+// backend; the operator's attrs.Filter runs before this and cannot stand in)
+// — lives in attrs.ReservedIdentity, shared with the agent-config warning for
+// logAttributes rules that lift line values into the same keys. This used to
+// be a private copy of the set, i.e. one more place a new identity key had to
+// land.
 func reservedIdentityAttr(k string) bool {
-	_, bad := reservedIdentityAttrs[k]
-	return bad
+	return attrs.ReservedIdentity(k)
 }

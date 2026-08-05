@@ -12,6 +12,7 @@ package logchain
 
 import (
 	"fmt"
+	"math"
 	"strconv"
 
 	"go.opentelemetry.io/collector/pdata/pcommon"
@@ -109,7 +110,13 @@ func (r *Resolver) label(k string) string {
 	return ""
 }
 
-// attrString renders a lifted value the way pcommon.Value.AsString would.
+// attrString renders a lifted value the way pcommon.Value.AsString would —
+// EXACTLY, floats included. A bare FormatFloat('f') diverged from pcommon's
+// ES6 rendering outside [1e-6, 1e21): the same lifted field minted label
+// "0.0000005" through this path (a lifted RESOURCE attribute, read from the
+// lifted slice) and "5e-7" through the record path (target: log, read back
+// off pdata by AsString) — two series for one value, the divergence the
+// shared resolver exists to end.
 func attrString(v any) string {
 	switch x := v.(type) {
 	case string:
@@ -119,12 +126,45 @@ func attrString(v any) string {
 	case int64:
 		return strconv.FormatInt(x, 10)
 	case float64:
-		return strconv.FormatFloat(x, 'f', -1, 64)
+		return floatAsString(x)
 	case nil:
 		return ""
 	default:
 		return fmt.Sprint(x)
 	}
+}
+
+// floatAsString replicates pcommon's unexported float64AsString (pdata
+// pcommon/value.go): ES6 number-to-string — 'f' inside [1e-6, 1e21), 'e' with
+// an unpadded exponent outside, NaN/Infinity spelled out. Pinned against the
+// real pcommon rendering by TestAttrStringMatchesPcommon.
+func floatAsString(f float64) string {
+	if math.IsNaN(f) {
+		return "NaN"
+	}
+	if math.IsInf(f, 1) {
+		return "Infinity"
+	}
+	if math.IsInf(f, -1) {
+		return "-Infinity"
+	}
+	scratch := [64]byte{}
+	b := scratch[:0]
+	abs := math.Abs(f)
+	format := byte('f')
+	if abs != 0 && (abs < 1e-6 || abs >= 1e21) {
+		format = 'e'
+	}
+	b = strconv.AppendFloat(b, f, format, -1, 64)
+	if format == 'e' {
+		// clean up e-09 to e-9
+		n := len(b)
+		if n >= 4 && b[n-4] == 'e' && b[n-3] == '-' && b[n-2] == '0' {
+			b[n-2] = b[n-1]
+			b = b[:n-1]
+		}
+	}
+	return string(b)
 }
 
 func (r *Resolver) ruleKey(k string) string {
@@ -185,7 +225,10 @@ func numeric(v pcommon.Value) (float64, bool) {
 // version, the tailer's (which alone handled WARNING, so the same log line
 // selected differently depending on which pipeline carried it) and three plain
 // strings.ToLower calls that allocate on every record for input that is almost
-// always already one of these constants.
+// always already one of these constants. The constant list covers BOTH
+// vocabularies that reach it: enrich's levels (trace..fatal) and journald's
+// syslog texts (emerg/alert/crit/err/notice — stamped lowercase, and the
+// pipeline whose allocation-free copy this replaced must stay free per entry).
 func LowerSeverity(s string) string {
 	switch s {
 	case "":
@@ -196,17 +239,41 @@ func LowerSeverity(s string) string {
 		return "debug"
 	case "INFO", "info":
 		return "info"
+	case "NOTICE", "notice":
+		return "notice"
 	case "WARN", "warn":
 		return "warn"
 	case "WARNING", "warning":
 		return "warning"
 	case "ERROR", "error":
 		return "error"
+	case "ERR", "err":
+		return "err"
+	case "CRIT", "crit":
+		return "crit"
+	case "ALERT", "alert":
+		return "alert"
+	case "EMERG", "emerg":
+		return "emerg"
 	case "FATAL", "fatal":
 		return "fatal"
 	}
-	out := make([]byte, len(s))
+	// Anything else lowers only if something is actually upper: returning the
+	// input unchanged keeps unusual-but-already-lower severities free of the
+	// per-record allocation too.
+	upper := -1
 	for i := 0; i < len(s); i++ {
+		if 'A' <= s[i] && s[i] <= 'Z' {
+			upper = i
+			break
+		}
+	}
+	if upper < 0 {
+		return s
+	}
+	out := make([]byte, len(s))
+	copy(out, s[:upper])
+	for i := upper; i < len(s); i++ {
 		c := s[i]
 		if 'A' <= c && c <= 'Z' {
 			c += 'a' - 'A'

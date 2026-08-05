@@ -322,6 +322,31 @@ func configWarnings(cfg agentConfig) []string {
 				strings.Join(rails, " and ")))
 		}
 	}
+
+	// A logAttributes rule lifting a LINE value into a resolved-identity
+	// resource attribute hands whatever writes the log line control of that
+	// key — and k8s.namespace.name is what routing keys tenancy on, so a pod
+	// printing a crafted line could steer its records onto another tenant's
+	// destination. The pod-annotation path REFUSES these keys outright
+	// (attrs.ReservedIdentity, tailer/podconfig.go); here the config is the
+	// OPERATOR's own, so a deliberate lift stays legal — but it is the same
+	// boundary crossed from the other side, and it must be named, not silent.
+	if cfg.LogAttributes != nil {
+		for _, r := range cfg.LogAttributes.Rules {
+			if r.Target != logattrs.TargetResource {
+				continue
+			}
+			attr := r.Attribute
+			if attr == "" {
+				attr = r.Key
+			}
+			if attrs.ReservedIdentity(attr) {
+				out = append(out, fmt.Sprintf(
+					"logAttributes rule %q lifts a log-line value into %q, a RESOLVED-IDENTITY resource attribute: whatever writes the line controls it (k8s.namespace.name keys tenancy routing; service.instance.id and k8s.pod.* forge series identity). The pod-annotation path refuses these keys; lift into a differently-named attribute unless the workload is genuinely authoritative for this one.",
+					r.Key, attr))
+			}
+		}
+	}
 	return out
 }
 

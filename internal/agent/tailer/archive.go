@@ -198,7 +198,7 @@ func (t *Tailer) openArchive(f *file) error {
 	}
 	inode := inodeOf(st)
 	// A replaced file (different inode or head fingerprint) restarts at zero.
-	if f.inode != 0 && (f.inode != inode || !f.fp.matches(fh)) {
+	if f.identityChanged(inode, fh) {
 		f.committed = 0
 	}
 	gz, err := gzipAt(fh, f.path, f.committed)

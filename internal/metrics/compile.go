@@ -98,10 +98,14 @@ func compileRule(d *Dynamic, cfg *setConfig, shared map[string]*series) (*metric
 		return nil, err
 	}
 
-	name := cfg.namePrefix + d.Name
-	if name == "" {
+	// The check is on d.Name, not the prefixed result: a non-empty prefix made
+	// the concatenation pass for a rule with no name at all, which compiled
+	// into a metric literally named the prefix — and two such rules silently
+	// shared one series.
+	if d.Name == "" {
 		return nil, fmt.Errorf("metric rule has no name")
 	}
+	name := cfg.namePrefix + d.Name
 	if kind == kindHistogram {
 		// maxCardinality counts LABEL COMBINATIONS, and a histogram's label set
 		// costs one live sample per bucket — so the memory the cap is defending
@@ -333,7 +337,13 @@ func parseRegexpReplace(in string) (pattern, replacement string, err error) {
 func buildKeyIndex(rules []*metricRule) logline.KeyIndex {
 	ki := logline.NewKeyIndex()
 	for _, r := range rules {
-		ki.Add(r.value)
+		// "1" is the constant-one VALUE literal (readValue short-circuits it),
+		// not a field reference — the classification lives here, at the value
+		// call site, so a selector or label legitimately reading a line field
+		// named "1" still registers it.
+		if r.value != "1" {
+			ki.Add(r.value)
+		}
 		for _, lt := range r.labels {
 			ki.Add(lt.getKey)
 		}

@@ -679,7 +679,15 @@ resolution as the `logMetrics` `match`/`matchRegexp`** — keys resolve against
 the record's attributes (line-derived + enriched) and the file's resource
 attributes, with the line's own JSON/logfmt fields as fallback; `__line__`
 matches the whole raw body and `__severity__` the enriched severity text
-(lowercased) — so "drop debug logs" needs no per-app parsing config:
+(lowercased) — so "drop debug logs" needs no per-app parsing config.
+
+Selector escaping: `matchRegexp` values are **RE2 patterns passed to the
+engine verbatim** — backslash is the regex escape, so `\d` is a digit class
+and `\\` a literal backslash, exactly as in any Go regex. `match` values are
+compared literally; a literal backslash or double quote may be spelled `\\`
+or `\"` (one left-to-right pass; any other character after a backslash is
+taken verbatim). The label half of a selector must be non-empty, and the
+negated form is spelled `label!=value`:
 
 ```yaml
 logs:

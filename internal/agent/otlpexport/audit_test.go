@@ -64,9 +64,11 @@ func TestIsPermanentClassification(t *testing.T) {
 		{"http 502", &HTTPStatusError{Code: 502}, false},
 		{"http 503", &HTTPStatusError{Code: 503}, false},
 		// 501: the OTLP/HTTP twin of gRPC Unimplemented (the signal's pipeline
-		// is not configured). Classified transient while the gRPC form is
-		// permanent — see TestPoisonBatchIsDroppedOnceCollectorTakesOthers.
-		{"http 501 not implemented", &HTTPStatusError{Code: 501}, false},
+		// is not configured), and classified permanent like it. Transient, the
+		// same misconfiguration was a counted drop over gRPC and an unbounded
+		// rewind-and-rebuild loop over OTLP/HTTP. 404 above stays transient
+		// deliberately (routes reprogram during a collector rollout).
+		{"http 501 not implemented", &HTTPStatusError{Code: 501}, true},
 		{"grpc InvalidArgument", status.Error(codes.InvalidArgument, "bad"), true},
 		{"grpc Unimplemented", status.Error(codes.Unimplemented, "no logs pipeline"), true},
 		{"grpc Unavailable", status.Error(codes.Unavailable, "down"), false},

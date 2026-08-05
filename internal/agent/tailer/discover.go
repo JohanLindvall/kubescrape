@@ -51,6 +51,27 @@ func (t *Tailer) handleEvent(ev fsnotify.Event) bool {
 	return dirty
 }
 
+// retryScanWatches re-attempts the discovery-directory watches that have not
+// yet succeeded (see Tailer.watchedScan). Steady state is len(scanDirs) map
+// hits per discovery pass; failures stay at Debug — the startup Warn already
+// named the directory once.
+func (t *Tailer) retryScanWatches() {
+	if t.watcher == nil {
+		return
+	}
+	for dir := range t.scanDirs {
+		if _, ok := t.watchedScan[dir]; ok {
+			continue
+		}
+		if err := t.watcher.Add(dir); err != nil {
+			t.log.Debug("watching log directory still failing", "dir", dir, "error", err)
+			continue
+		}
+		t.watchedScan[dir] = struct{}{}
+		t.log.Info("log directory watch established", "dir", dir)
+	}
+}
+
 // watchTarget registers the file's resolved log directory with the watcher.
 func (t *Tailer) watchTarget(f *file) {
 	if t.watcher == nil {
@@ -147,6 +168,7 @@ func parseFileName(name string) (containerID, namespace string, ok bool) {
 // Tailer.checkpoints and compiledSource.startingUp for why the seeding and the
 // startup-only -logs-unknown-files policy outlive this one call.
 func (t *Tailer) scanDir(checkpoints map[string]checkpoint, initial bool) {
+	t.retryScanWatches()
 	if initial {
 		t.checkpoints = checkpoints
 		t.hadStoredCheckpoints = len(checkpoints) > 0

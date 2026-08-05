@@ -1,8 +1,11 @@
 package attrs
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
+	"regexp/syntax"
+	"strings"
 	"testing"
 
 	"go.opentelemetry.io/collector/pdata/pcommon"
@@ -116,6 +119,74 @@ func TestBuilderFilterRunsLast(t *testing.T) {
 func TestBuilderBadTemplate(t *testing.T) {
 	if _, err := NewBuilder(&Config{Attributes: map[string]string{"x": "{{"}}, nil); err == nil {
 		t.Fatal("invalid template must error")
+	}
+}
+
+// Construction dry-runs every template against a fully-populated synthetic
+// Context, refusing the two value-INDEPENDENT execution-error classes (a
+// field miss, a regex that does not compile) that used to surface only as a
+// silent per-resource skip at Build time — invisible to -check-config.
+func TestTemplateValidation(t *testing.T) {
+	// A typo'd struct field is broken against every Context: refused, naming
+	// the attribute key and the template's own error.
+	_, err := NewBuilder(&Config{Attributes: map[string]string{"team": `{{ .Pod.Lables }}`}}, nil)
+	if err == nil {
+		t.Fatal("typo'd field must fail construction")
+	}
+	for _, want := range []string{`"team"`, "can't evaluate field"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not contain %q", err, want)
+		}
+	}
+
+	// A bad LITERAL regex is a config error too, and the compile error is
+	// reachable through the wrap chain (the tailsample errPolicy convention).
+	_, err = NewBuilder(&Config{Attributes: map[string]string{"m": `{{ regexMatch "(" .Pod.Name }}`}}, nil)
+	if err == nil {
+		t.Fatal("bad literal regex must fail construction")
+	}
+	var syn *syntax.Error
+	if !errors.As(err, &syn) {
+		t.Errorf("error %q does not unwrap to *syntax.Error", err)
+	}
+	if _, err = NewBuilder(&Config{Attributes: map[string]string{"r": `{{ regexReplace "[" "" .Pod.Name }}`}}, nil); err == nil {
+		t.Fatal("bad literal regexReplace pattern must fail construction")
+	}
+
+	// NewBuilders surfaces the same refusal with the pipeline named.
+	_, err = NewBuilders(&Config{Pipelines: map[string]*Config{
+		"logs": {Attributes: map[string]string{"x": `{{ .Container.Imge }}`}},
+	}}, nil)
+	if err == nil || !strings.Contains(err.Error(), `pipeline "logs"`) {
+		t.Errorf("NewBuilders error = %v, want the pipeline named", err)
+	}
+
+	// Value-DEPENDENT failures against the zero-value synthetic context are
+	// NOT config errors — each of these works on real production contexts and
+	// must keep relying on the runtime skip:
+	ok := map[string]string{
+		"owner": `{{ (index .Pod.Owners 0).Name }}`,                  // nil slice at dry-run; every owned pod has index 0
+		"short": `{{ slice .Pod.Name 0 5 }}`,                         // empty name at dry-run
+		"svc":   `{{ .Service.Name }}`,                               // nil .Service at runtime is the not-applicable case
+		"pat":   `{{ regexMatch (index .Pod.Labels "p") "x" }}`,      // data-derived pattern: "" at dry-run, compiles
+		"env":   `{{ regexMatch (env "KUBESCRAPE_UNSET_PAT") "x" }}`, // unset env -> "" pattern
+	}
+	b, err := NewBuilder(&Config{Attributes: ok}, nil)
+	if err != nil {
+		t.Fatalf("value-dependent template refused at construction: %v", err)
+	}
+	// And the runtime behavior is unchanged: applicable ones render, the rest skip.
+	res := pcommon.NewResource()
+	b.Build(res, testCtx())
+	got := res.Attributes().AsRaw()
+	if got["owner"] != "dep1" {
+		t.Errorf("owner = %v, want dep1 (index 0 of testCtx owners)", got["owner"])
+	}
+	if _, present := got["short"]; present {
+		t.Errorf("short = %v, want omitted (pod1 has 4 runes; slice 0:5 errors)", got["short"])
+	}
+	if _, present := got["svc"]; present {
+		t.Errorf("svc = %v, want omitted (nil .Service in testCtx)", got["svc"])
 	}
 }
 

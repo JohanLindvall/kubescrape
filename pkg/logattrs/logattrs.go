@@ -29,6 +29,11 @@ const (
 type Rule struct {
 	// Key is the line's key; dotted keys descend into nested JSON objects
 	// (e.g. "http.status"). For logfmt only flat keys apply.
+	//
+	// Value TYPES follow the line format: JSON scalars lift typed (int/double/
+	// bool/string — `"status":503` is an int64 attribute) while logfmt has no
+	// type syntax, so every logfmt value lifts as a string (`status=503` is
+	// "503"). Escape DECODING is format-independent; the type model is not.
 	Key string `json:"key"`
 	// Attribute is the exported attribute name; defaults to Key.
 	Attribute string `json:"attribute,omitempty"`
@@ -196,6 +201,9 @@ func (e *Extractor) Extract(line string) Result {
 // otherwise; escape-free strings alias the input line, which outlives
 // the extracted attributes (they are copied into pdata at flush).
 func decodeScalar(raw []byte) (any, bool) {
+	if len(raw) == 0 {
+		return nil, false // shape check at the parse seam; GetPaths never yields this
+	}
 	switch raw[0] {
 	case '"':
 		if len(raw) < 2 || raw[len(raw)-1] != '"' {
@@ -217,7 +225,7 @@ func decodeScalar(raw []byte) (any, bool) {
 		// 2^53, so a 64-bit id (snowflake, order/user id) lifted from a JSON log
 		// silently landed one or more off — and looked exact afterwards, since
 		// whole floats are stored with PutInt anyway.
-		if isIntegerToken(raw) {
+		if IsIntegerToken(raw) {
 			if i, err := strconv.ParseInt(string(raw), 10, 64); err == nil {
 				return i, true
 			}
@@ -230,16 +238,34 @@ func decodeScalar(raw []byte) (any, bool) {
 	}
 }
 
-// isIntegerToken reports whether raw is a JSON number with no fractional or
-// exponent part, i.e. one that int64 can represent exactly.
-func isIntegerToken(raw []byte) bool {
+// IsIntegerToken reports whether a JSON number token is a plain integer (an
+// optional sign followed by digits only — no fraction, no exponent), so its
+// text is the exact decimal value. It is the ONE classifier shared by this
+// package's decodeScalar and internal/logline's RawScalarString: the two
+// render the same line field as an attribute and as a metric label, and two
+// classifiers here drifted once (a lax reject-.eE version beside a strict
+// digits-only one). The strict form is required by the label path, which
+// returns the token text verbatim on true.
+//
+// Known residual divergence between the two consumers, accepted: a token
+// exceeding int64's range is verbatim text as a label (exact) but falls back
+// through float64 as an attribute (rounded past 2^53) — same line, same key,
+// two renderings at the extreme. Unifying it would mean string attributes for
+// huge integers, a type change not worth the edge.
+func IsIntegerToken(raw []byte) bool {
 	if len(raw) == 0 {
 		return false
 	}
-	for i := 0; i < len(raw); i++ {
-		switch raw[i] {
-		case '.', 'e', 'E':
-			return false
+	i := 0
+	if raw[0] == '-' {
+		i = 1
+	}
+	if i == len(raw) {
+		return false
+	}
+	for ; i < len(raw); i++ {
+		if raw[i] < '0' || raw[i] > '9' {
+			return false // '.', 'e', 'E', or not a number token at all
 		}
 	}
 	return true

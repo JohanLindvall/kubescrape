@@ -4,10 +4,37 @@
 package attrs
 
 import (
+	"maps"
+	"slices"
+
 	"go.opentelemetry.io/collector/pdata/pcommon"
 
 	"github.com/JohanLindvall/kubescrape/pkg/kubemeta"
 )
+
+// kindTable is the ONE enumeration of the Kubernetes object kinds this package
+// maps to attributes: the k8s.<kind>.name each becomes, and whether the kind
+// names the pod's WORKLOAD (what service.name derives from). ServiceName and
+// KindAttribute both read it, so adding a kind is one row here — and
+// TestKindTableCoversOwnerResolver cross-checks the rows against
+// internal/owners.AllGVRs, so a kind added to the owner resolver without a row
+// fails a test naming this file.
+//
+// workload is false for ReplicaSet (its Deployment is the workload; a bare
+// ReplicaSet owner falls through to the pod name) and Node (a Node owner ref —
+// mirror/static pods — is placement, not a workload).
+var kindTable = map[string]struct {
+	attr     string // the k8s.<kind>.name resource attribute
+	workload bool   // ServiceName derives from owners of this kind
+}{
+	"ReplicaSet":  {attr: "k8s.replicaset.name"},
+	"Deployment":  {attr: "k8s.deployment.name", workload: true},
+	"StatefulSet": {attr: "k8s.statefulset.name", workload: true},
+	"DaemonSet":   {attr: "k8s.daemonset.name", workload: true},
+	"Job":         {attr: "k8s.job.name", workload: true},
+	"CronJob":     {attr: "k8s.cronjob.name", workload: true},
+	"Node":        {attr: "k8s.node.name"},
+}
 
 // ServiceName derives the OTLP service.name for a pod: the name of its
 // workload owner (Deployment/StatefulSet/DaemonSet/Job/CronJob), falling back
@@ -15,8 +42,7 @@ import (
 func ServiceName(pod kubemeta.Pod) string {
 	name := pod.Name
 	for _, o := range pod.Owners {
-		switch o.Kind {
-		case "Deployment", "StatefulSet", "DaemonSet", "Job", "CronJob":
+		if e, ok := kindTable[o.Kind]; ok && e.workload {
 			name = o.Name
 		}
 	}
@@ -27,31 +53,25 @@ func ServiceName(pod kubemeta.Pod) string {
 // attribute (e.g. "Deployment" -> "k8s.deployment.name"); ok is false for a kind
 // with no such attribute. Shared by the pod owner-chain and the events exporter.
 func KindAttribute(kind string) (string, bool) {
-	switch kind {
-	case "ReplicaSet":
-		return "k8s.replicaset.name", true
-	case "Deployment":
-		return "k8s.deployment.name", true
-	case "StatefulSet":
-		return "k8s.statefulset.name", true
-	case "DaemonSet":
-		return "k8s.daemonset.name", true
-	case "Job":
-		return "k8s.job.name", true
-	case "CronJob":
-		return "k8s.cronjob.name", true
-	case "Node":
-		return "k8s.node.name", true
-	}
-	return "", false
+	e, ok := kindTable[kind]
+	return e.attr, ok
 }
 
-// Pod sets the pod-level resource attributes.
+// Pod sets the pod-level resource attributes. Empty fields are omitted, never
+// stamped as "": a partially-filled Pod must not mint empty-string resource
+// attributes (an empty k8s.namespace.name would still participate in routing
+// and identity derivation as if it were a value).
 func Pod(res pcommon.Resource, pod kubemeta.Pod) {
 	a := res.Attributes()
-	a.PutStr("k8s.namespace.name", pod.Namespace)
-	a.PutStr("k8s.pod.name", pod.Name)
-	a.PutStr("k8s.pod.uid", pod.UID)
+	if pod.Namespace != "" {
+		a.PutStr("k8s.namespace.name", pod.Namespace)
+	}
+	if pod.Name != "" {
+		a.PutStr("k8s.pod.name", pod.Name)
+	}
+	if pod.UID != "" {
+		a.PutStr("k8s.pod.uid", pod.UID)
+	}
 	if pod.NodeName != "" {
 		a.PutStr("k8s.node.name", pod.NodeName)
 	}
@@ -64,7 +84,9 @@ func Pod(res pcommon.Resource, pod kubemeta.Pod) {
 			a.PutStr(attr, o.Name)
 		}
 	}
-	a.PutStr("service.name", ServiceName(pod))
+	if name := ServiceName(pod); name != "" {
+		a.PutStr("service.name", name)
+	}
 
 	for k, v := range pod.Labels {
 		a.PutStr("k8s.pod.label."+k, v)
@@ -180,4 +202,47 @@ func PrefixInstance(res pcommon.Resource, prefix string) {
 	if v, ok := a.Get("service.instance.id"); ok {
 		a.PutStr("service.instance.id", prefix+"-"+v.AsString())
 	}
+}
+
+// reservedIdentity is the set behind ReservedIdentity/ReservedIdentityKeys.
+var reservedIdentity = map[string]struct{}{
+	"k8s.namespace.name":  {},
+	"k8s.pod.name":        {},
+	"k8s.pod.uid":         {},
+	"k8s.pod.ip":          {},
+	"k8s.container.name":  {},
+	"k8s.node.name":       {},
+	"container.id":        {},
+	"container.name":      {},
+	"service.namespace":   {},
+	"service.instance.id": {},
+}
+
+// ReservedIdentity reports whether key is a RESOLVED-identity resource
+// attribute — one the agent derives from the API server — which a workload
+// (pod annotation) or a log line must therefore never set.
+//
+// The boundary is security, not tidiness: `k8s.namespace.name` is what
+// internal/agent/route keys tenancy on, so an unfiltered write would let
+// anyone who can annotate a pod in their OWN namespace — an ordinary
+// namespace-scoped action — send that pod's telemetry to a different tenant's
+// endpoint under that tenant's header, and remove it from their own. The
+// service.instance.id / service.namespace / k8s.pod.* / container.* keys forge
+// series identity in the backend and on every log-derived metric bound to the
+// resource. The operator's attrs.Filter cannot stand in for this check: it
+// runs inside Builder.Build, BEFORE workload- or line-supplied attributes are
+// applied on top.
+//
+// `service.name` is deliberately NOT reserved — it is descriptive, and
+// overriding it (renaming the workload's own series, not moving them to
+// another owner) is the pod annotation's documented purpose.
+func ReservedIdentity(key string) bool {
+	_, bad := reservedIdentity[key]
+	return bad
+}
+
+// ReservedIdentityKeys returns the reserved key set, sorted, for callers that
+// enumerate it (documentation, tests) rather than test membership.
+func ReservedIdentityKeys() []string {
+	return slices.Sorted(maps.Keys(reservedIdentity))
 }

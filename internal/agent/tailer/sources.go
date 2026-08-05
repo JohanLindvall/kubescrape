@@ -5,6 +5,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"slices"
 	"time"
 
 	"github.com/bmatcuk/doublestar/v4"
@@ -84,7 +85,7 @@ func ValidateSources(sources []Source) ([]Source, error) {
 		if len(s.Include) == 0 {
 			return nil, fmt.Errorf("source %d (%q): no include patterns", i, s.Name)
 		}
-		for _, g := range append(append([]string{}, s.Include...), s.Exclude...) {
+		for _, g := range slices.Concat(s.Include, s.Exclude) {
 			if !doublestar.ValidatePattern(g) {
 				return nil, fmt.Errorf("source %d (%q): invalid glob %q", i, s.Name, g)
 			}
@@ -94,7 +95,7 @@ func ValidateSources(sources []Source) ([]Source, error) {
 		// "no match", so an unvalidated typo in an allowlist silently collects
 		// NOTHING for the source — no warning, no metric, and -check-config
 		// green. Reject it here, exactly as routing does with its globs.
-		for _, g := range append(append([]string{}, s.Namespaces...), s.ExcludeNamespaces...) {
+		for _, g := range slices.Concat(s.Namespaces, s.ExcludeNamespaces) {
 			if _, err := path.Match(g, ""); err != nil {
 				return nil, fmt.Errorf("source %d (%q): invalid namespace pattern %q: %w", i, s.Name, g, err)
 			}
@@ -232,7 +233,6 @@ func compileSources(sources []Source, dir string, defaultMultiline bool) []*comp
 	return out
 }
 
-// matches reports whether path is included by this source and not excluded.
 // excluded reports whether path hits one of the source's exclude globs. The
 // scan loop uses it directly: glob() output satisfies the includes by
 // construction, and PathMatch re-parses its pattern per call — re-proving

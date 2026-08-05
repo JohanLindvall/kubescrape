@@ -50,6 +50,16 @@ func Key(attrs []Attr) string {
 			b.WriteByte('b')
 			b.WriteString(strconv.FormatBool(v))
 		case float64:
+			// A whole float64 keys as the int it will be STORED as (Put maps it
+			// to PutInt): keying it 'f' while storing it int meant {"shard":2}
+			// and {"shard":2.0} grouped as two ResourceLogs whose exported
+			// resources were byte-identical — split, never merged, but a
+			// duplicate resource per payload for an emitter mixing spellings.
+			if v == float64(int64(v)) {
+				b.WriteByte('i')
+				b.WriteString(strconv.FormatInt(int64(v), 10))
+				break
+			}
 			b.WriteByte('f')
 			b.WriteString(strconv.FormatFloat(v, 'g', -1, 64))
 		case int64: // per the Attr contract; DecodeAny yields float64 today,

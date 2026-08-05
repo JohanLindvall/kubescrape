@@ -269,6 +269,12 @@ func (p *PerSignal) closeBuilt() {
 	_ = p.Close()
 }
 
+// singleAttemptSends implements the drain's singleAttempt seam (buffered.go):
+// each signal's counted one-shot send, resolved to that signal's destination.
+func (p *PerSignal) singleAttemptSends() (func(context.Context, plog.Logs) error, func(context.Context, pmetric.Metrics) error) {
+	return p.logsClient().exportLogsCounted, p.metricsClient().exportMetricsCounted
+}
+
 // logsClient/metricsClient/tracesClient resolve the signal's destination.
 func (p *PerSignal) logsClient() *Client {
 	if p.Logs != nil {

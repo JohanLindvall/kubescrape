@@ -54,24 +54,10 @@ type filterCtx struct {
 	fn     func(string) string
 }
 
-// resolve is the attrs-then-line-fields resolution tier: __line__ is the raw
-// body, the caller's lookup (record/resource attributes) wins when it returns
-// non-empty, and the line's own parsed fields are the fallback. VALUE-based,
-// not presence-based — a present-but-empty attribute cannot shadow a line
-// field (inherent in the func(string) string signature the zero-alloc paths
-// require), unlike the resolver's internal record→lifted→resource ranking.
-// internal/metrics' addContext.labelLookup spells the SAME policy for the
-// same two tiers; a change here must land there too.
+// resolve delegates to ResolveKey — the one attrs-then-line-fields resolution
+// tier, shared with internal/metrics' addContext.labelLookup.
 func (fc *filterCtx) resolve(key string) string {
-	if key == LineKey {
-		return fc.raw
-	}
-	if fc.lookup != nil {
-		if v := fc.lookup(key); v != "" {
-			return v
-		}
-	}
-	return fc.filter.keys.Get(&fc.line, key)
+	return ResolveKey(key, fc.raw, fc.lookup, &fc.filter.keys, &fc.line)
 }
 
 // NewLineFilter compiles rules; empty input yields a nil filter (keep all).

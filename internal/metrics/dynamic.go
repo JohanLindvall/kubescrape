@@ -341,19 +341,10 @@ type addContext struct {
 	valueFn func(string) (float64, bool)
 }
 
-// labelLookup resolves a label key: the synthetic __line__ key is the whole
-// raw line; otherwise the caller's own lookup (record/resource attributes)
-// wins and the line's parsed fields are the fallback.
+// labelLookup delegates to logline.ResolveKey — the one attrs-then-line-fields
+// resolution tier, shared with the rules engine's filterCtx.resolve.
 func (ac *addContext) labelLookup(key string) string {
-	if key == logline.LineKey {
-		return ac.raw
-	}
-	if ac.lookup != nil {
-		if v := ac.lookup(key); v != "" {
-			return v
-		}
-	}
-	return ac.set.keys.Get(&ac.line, key)
+	return logline.ResolveKey(key, ac.raw, ac.lookup, &ac.set.keys, &ac.line)
 }
 
 // valueLookup resolves a numeric key the same way.

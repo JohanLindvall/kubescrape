@@ -354,34 +354,17 @@ func (t *Tailer) flush(ctx context.Context) {
 	}
 }
 
+// exportWithRetry sends one batch through the shared bounded-retry shape
+// (otlpexport.Retry: sleep-before-retry, doubling backoff, permanent
+// rejections returned immediately for the caller to drop-and-advance). This
+// used to be a hand-rolled copy that paid its doubled backoff once more AFTER
+// the final failure — dead seconds on the single sweep goroutine, and of the
+// shutdown budget everything after the tailer shares. The closure costs one
+// allocation per FLUSH (amortized over up to BatchSize lines), not per line.
 func (t *Tailer) exportWithRetry(ctx context.Context, ld plog.Logs) error {
-	var err error
-	backoff := t.retryBackoff
-	// Sleep BEFORE the retry, not after every attempt (the ExportMetrics
-	// shape): the try-then-sleep form paid the doubled backoff once more after
-	// the FINAL failure — 4s of the single sweep goroutine (and, at shutdown,
-	// of the 10s budget everything after the tailer shares) spent after the
-	// outcome was already decided.
-	for attempt := 0; attempt < 3; attempt++ {
-		if attempt > 0 {
-			select {
-			case <-ctx.Done():
-				return err
-			case <-time.After(backoff):
-			}
-			backoff *= 2
-		}
-		if err = t.cfg.Exporter.ExportLogs(ctx, ld); err == nil {
-			return nil
-		}
-		if otlpexport.IsPermanent(err) {
-			// Retrying a definitive rejection cannot succeed; spending the
-			// budget on it only delays the sweep that serves every other file
-			// on this node. The caller drops the batch and advances.
-			return err
-		}
-	}
-	return err
+	return otlpexport.Retry(ctx, 3, t.retryBackoff, func() error {
+		return t.cfg.Exporter.ExportLogs(ctx, ld)
+	})
 }
 
 // batchInfo carries a flushed batch's commit information from build to apply:

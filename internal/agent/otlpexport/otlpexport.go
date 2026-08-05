@@ -346,6 +346,12 @@ func (c *Client) ExportLogs(ctx context.Context, ld plog.Logs) error {
 	return c.exportLogsCounted(ctx, ld)
 }
 
+// singleAttemptSends implements the drain's singleAttempt seam (buffered.go):
+// the counted one-shot sends, without ExportMetrics' retry loop.
+func (c *Client) singleAttemptSends() (func(context.Context, plog.Logs) error, func(context.Context, pmetric.Metrics) error) {
+	return c.exportLogsCounted, c.exportMetricsCounted
+}
+
 // exportLogsCounted is the single-attempt send plus the obs.Exports outcome
 // count — the unit both the public method and the buffered drain use, so
 // wire-send outcomes stay counted when -buffer-dir routes around ExportLogs.
@@ -454,11 +460,23 @@ func outcome(err error) string {
 	return "ok"
 }
 
-// ExportMetrics sends one metrics payload with bounded retries.
-func (c *Client) ExportMetrics(ctx context.Context, md pmetric.Metrics) error {
+// Retry runs send up to attempts times: the sleep comes BEFORE a retry
+// (never after the final failure), the backoff doubles from initial, a
+// PERMANENT rejection (IsPermanent) returns immediately — retrying cannot
+// change it — and ctx cancellation between attempts returns the last error.
+//
+// THE bounded in-call retry shape. Client.ExportMetrics and the tailer's log
+// flush each hand-rolled it, and the copies drifted twice: one paid its
+// doubled backoff once more AFTER the final failure (dead seconds on the
+// single sweep goroutine, and of the shutdown budget), the other re-sent a
+// definitively rejected payload every attempt. The disk-buffer drain is
+// deliberately NOT this shape — its sends are single-attempt by design, its
+// backoff persists across queue cycles, and its budget is the poison tracker
+// (sink.stuckTooLong), none of which a bounded in-call loop can express.
+func Retry(ctx context.Context, attempts int, initial time.Duration, send func() error) error {
 	var err error
-	backoff := c.cfg.RetryBackoff
-	for attempt := 0; attempt < c.cfg.RetryAttempts; attempt++ {
+	backoff := initial
+	for attempt := 0; attempt < attempts; attempt++ {
 		if attempt > 0 {
 			select {
 			case <-ctx.Done():
@@ -467,20 +485,21 @@ func (c *Client) ExportMetrics(ctx context.Context, md pmetric.Metrics) error {
 			}
 			backoff *= 2
 		}
-		err = c.exportMetricsCounted(ctx, md)
-		if err == nil {
+		if err = send(); err == nil {
 			return nil
 		}
 		if IsPermanent(err) {
-			// A definitive rejection cannot change between attempts; the
-			// sibling loops (the tailer's exportWithRetry, the drain's
-			// trySend) already short-circuit it, and re-sending a 400 payload
-			// RetryAttempts times every scrape cycle was wasted wire and
-			// counter inflation for an outcome that cannot move.
 			return err
 		}
 	}
 	return err
+}
+
+// ExportMetrics sends one metrics payload with bounded retries (Retry).
+func (c *Client) ExportMetrics(ctx context.Context, md pmetric.Metrics) error {
+	return Retry(ctx, c.cfg.RetryAttempts, c.cfg.RetryBackoff, func() error {
+		return c.exportMetricsCounted(ctx, md)
+	})
 }
 
 // exportMetricsCounted is one attempt plus the obs.Exports outcome count (see

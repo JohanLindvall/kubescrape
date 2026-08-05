@@ -15,6 +15,36 @@ import (
 // selectors and labels can reference the line contents directly.
 const LineKey = "__line__"
 
+// ResolveKey is THE attrs-then-line-fields resolution tier: LineKey is the
+// raw body, the caller's attribute lookup (record/resource attributes) wins
+// when it returns non-empty, and the line's own parsed fields are the
+// fallback. It was spelled once here (the rules engine's filterCtx) and once
+// in internal/metrics (the log-metrics engine's addContext) — resolution-
+// order policy with two places for a future synthetic key or a change to the
+// empty-means-absent rule to land, the exact drift mode the logchain resolver
+// consolidation ended for the tier above this one.
+//
+// VALUE-based, not presence-based: a present-but-empty attribute cannot
+// shadow a line field. That is inherent in the func(string) string lookup
+// signature the zero-alloc paths require, and deliberately unlike the
+// resolver's internal record→lifted→resource ranking.
+//
+// A plain function over pieces both callers already hold — not a struct, not
+// a closure — so the pooled contexts keep their shapes and the pinned
+// per-line budgets (TestDynamicAddAllocationBudget, the tailer's flush
+// budget) are untouched.
+func ResolveKey(key, raw string, lookup func(string) string, ki *KeyIndex, lf *Fields) string {
+	if key == LineKey {
+		return raw
+	}
+	if lookup != nil {
+		if v := lookup(key); v != "" {
+			return v
+		}
+	}
+	return ki.Get(lf, key)
+}
+
 // Fields lazily extracts the referenced fields from a JSON or logfmt log
 // line so metric label/value keys can read straight from the line, with no
 // separate logAttributes config. Only the keys the set references are parsed

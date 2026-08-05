@@ -21,6 +21,21 @@ import (
 	"github.com/JohanLindvall/kubescrape/internal/obs"
 )
 
+// singleAttempt is the seam through which the disk-buffer drain reaches an
+// exporter's SINGLE-ATTEMPT sends, bypassing the client's own bounded retry
+// loop: the drain owns retry policy (a backoff persisting across queue
+// cycles, requeue rotation, the poison budget), and the Exporter interface
+// alone cannot say that ExportMetrics retries internally while ExportLogs
+// does not. It replaces a concrete-type switch over *Client / *PerSignal
+// whose default arm silently fell back to RETRIED sends for any other
+// Exporter — the enumeration is now each implementation's own business, and
+// the fallback is loud (NewBuffered warns). Unexported deliberately:
+// single-attempt sends are this package's internals, and a foreign wrapper
+// stacking its own retries is exactly what the warning exists to name.
+type singleAttempt interface {
+	singleAttemptSends() (logs func(context.Context, plog.Logs) error, metrics func(context.Context, pmetric.Metrics) error)
+}
+
 // Exporter exports logs and metrics; implemented by *Client and *Buffered, so
 // the agent can route every consumer through one value whether or not
 // buffering is enabled.
@@ -230,16 +245,18 @@ func NewBuffered(inner Exporter, logBuf, metricBuf, traceBuf *Buffer, backoff ti
 	}
 	b := &Buffered{inner: inner, log: log, drainGate: make(chan struct{}, 1)}
 	b.drainGate <- struct{}{} // the token starts free: FinalDrain without a Run must not wait
-	// The drain owns retry policy; when the inner exporter is the raw client
-	// (or the per-signal mux over raw clients), bypass its own bounded retries
-	// so attempts do not multiply (drain x client = up to 15 wire sends per
-	// cycle otherwise).
+	// The drain owns retry policy; reach the inner exporter's single-attempt
+	// sends through the singleAttempt seam so attempts do not multiply (drain
+	// x client = up to 15 wire sends per cycle otherwise). The fallback for an
+	// exporter outside this package is LOUD: stacked retries are a behavior
+	// change worth a log line, not a silent property of whoever wired the
+	// stack.
 	sendLogs, sendMetrics := inner.ExportLogs, inner.ExportMetrics
-	switch c := inner.(type) {
-	case *Client:
-		sendLogs, sendMetrics = c.exportLogsCounted, c.exportMetricsCounted
-	case *PerSignal:
-		sendLogs, sendMetrics = c.logsClient().exportLogsCounted, c.metricsClient().exportMetricsCounted
+	if sa, ok := inner.(singleAttempt); ok {
+		sendLogs, sendMetrics = sa.singleAttemptSends()
+	} else {
+		log.Warn("inner exporter exposes no single-attempt sends; the drain's retries will stack on the exporter's own",
+			"type", fmt.Sprintf("%T", inner))
 	}
 	// Report what corruption cost at open: everything the recovery scan
 	// dropped or truncated away is data no drain will ever see.

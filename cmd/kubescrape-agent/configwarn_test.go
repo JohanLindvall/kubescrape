@@ -3,6 +3,7 @@ package main
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/JohanLindvall/kubescrape/internal/agent/tailbuffer"
 	"github.com/JohanLindvall/kubescrape/internal/agent/tailsample"
@@ -132,5 +133,69 @@ func TestNoCompositionWarningOffTheTraceTier(t *testing.T) {
 		TraceSampling: &tracesample.Config{Probability: 0.1},
 	}); got != "" {
 		t.Fatalf("a DaemonSet agent warned about sections it ignores: %q", got)
+	}
+}
+
+// withPeerIP sets the peer-IP fallback and the self-metadata knobs it silently
+// depends on, restoring all three.
+func withPeerIP(t *testing.T, peerIP, selfAttrs bool, refresh time.Duration) {
+	t.Helper()
+	oldP, oldS, oldR := *ingestPeerIP, *selfAttrsOn, *selfAttrsRefresh
+	*ingestPeerIP, *selfAttrsOn, *selfAttrsRefresh = peerIP, selfAttrs, refresh
+	t.Cleanup(func() { *ingestPeerIP, *selfAttrsOn, *selfAttrsRefresh = oldP, oldS, oldR })
+}
+
+// The tier's veto on a peer-IP attribution resolving to its OWN workload reads
+// the pod -self-attributes resolved. With that lookup off there is no pod, and
+// peerIsOurOwnWorkload's honest "we do not know yet" becomes permanent: a
+// rewritten source address labels application spans with a kubescrape pod, and
+// the counter documented as the signal for that (peer_ip_rejected) stays flat
+// either way, so nothing distinguishes it from success.
+func TestPeerIPFallbackWithoutSelfAttributesWarns(t *testing.T) {
+	withServiceGraph(t)
+
+	for _, tc := range []struct {
+		name      string
+		selfAttrs bool
+		refresh   time.Duration
+		wantFlag  string
+	}{
+		{"self-attributes off", false, time.Minute, "-self-attributes=false"},
+		{"refresh disables the lookup", true, 0, "-self-attributes-refresh=0s"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			withPeerIP(t, true, tc.selfAttrs, tc.refresh)
+			got := warnText(agentConfig{})
+			if !strings.Contains(got, "-ingest-peer-ip-fallback") || !strings.Contains(got, tc.wantFlag) {
+				t.Fatalf("warning must name both flags, got: %q", got)
+			}
+			if !strings.Contains(got, "peer_ip_rejected") {
+				t.Fatalf("warning must name the counter that stays flat, got: %q", got)
+			}
+		})
+	}
+}
+
+// The shapes that must stay silent: the veto works (self-attributes on with a
+// positive refresh), the fallback is off, or this is not the tier at all — the
+// DaemonSet's ingest receiver takes a hop from its own node and has no such
+// workload to confuse itself with.
+func TestPeerIPFallbackWarningIsScoped(t *testing.T) {
+	withServiceGraph(t)
+	withPeerIP(t, true, true, time.Minute)
+	if got := warnText(agentConfig{}); got != "" {
+		t.Fatalf("a working veto warned: %q", got)
+	}
+	withPeerIP(t, false, false, 0)
+	if got := warnText(agentConfig{}); got != "" {
+		t.Fatalf("no peer-IP fallback, nothing to warn about: %q", got)
+	}
+
+	old := *serviceGraphOn
+	*serviceGraphOn = false
+	t.Cleanup(func() { *serviceGraphOn = old })
+	withPeerIP(t, true, false, 0)
+	if got := warnText(agentConfig{}); got != "" {
+		t.Fatalf("a DaemonSet agent warned about the tier's veto: %q", got)
 	}
 }

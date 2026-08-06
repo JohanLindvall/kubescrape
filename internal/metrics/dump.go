@@ -64,10 +64,60 @@ func (r *Registry) Dump() []RegistrySeries {
 			out = append(out, d)
 		}
 	}
+	// Several registrations of ONE name share one series (Registry.byName) and
+	// each keeps its own gaugeFunc, so funcs may name the same series more than
+	// once — the advertised shape for the per-instance Register* hooks (two
+	// DynamicMetricSets in one process each publishing the drop family). One
+	// entry per FUNC would render that name twice, which the Prometheus bridge
+	// cannot express at all: registryCollector emits two const metrics with an
+	// identical name and label set, Gather's duplicate check fails, and promhttp
+	// answers 500 to EVERY scrape — losing the go_*/process_* collectors that
+	// share the handler. The dedupe therefore has to hold on the READ side too,
+	// not only in add().
+	at := make(map[*series]int, len(funcs))
 	for _, gf := range funcs {
-		out = append(out, dumpFunc(gf))
+		d := dumpFunc(gf)
+		if i, ok := at[gf.s]; ok {
+			mergeFuncPoints(&out[i], d.Points, gf.s.kind == kindCounter)
+			continue
+		}
+		at[gf.s] = len(out)
+		out = append(out, d)
 	}
 	return out
+}
+
+// mergeFuncPoints folds one more func's points into the entry already emitted
+// for its series, the way Export folds them into the series itself: every func
+// observes into the shared series, so a COUNTER accumulates each one's
+// contribution (each keeps its own delta bookkeeping, and each fn returns its
+// own running total) while a GAUGE is set, i.e. the last registration wins.
+// Label sets no earlier func reported become points of their own.
+func mergeFuncPoints(d *RegistrySeries, pts []RegistryPoint, counter bool) {
+	for _, p := range pts {
+		i := indexPoint(d.Points, p.Labels)
+		if i < 0 {
+			d.Points = append(d.Points, p)
+			continue
+		}
+		if counter {
+			d.Points[i].Value += p.Value
+		} else {
+			d.Points[i].Value = p.Value
+		}
+	}
+	sortPoints(d.Points)
+}
+
+// indexPoint returns the position of the point carrying exactly these labels,
+// or -1.
+func indexPoint(ps []RegistryPoint, lbls [][2]string) int {
+	for i := range ps {
+		if slices.Equal(ps[i].Labels, lbls) {
+			return i
+		}
+	}
+	return -1
 }
 
 // kindType maps a series kind to its exported Dump type name; ok is false for

@@ -70,6 +70,49 @@ func TestReDecisionDoesNotRechargeTheRateBudget(t *testing.T) {
 	}
 }
 
+// The charge bit must survive EVERY re-decision, not just the first. A
+// re-decision peeks the budget and therefore reports Charged == false, so a
+// cache that stored that verbatim forgot the payment after one straggler and
+// billed the trace again on the next one — a trace whose spans trickle in over
+// hours (a batch job, a Kafka consumer, a backlog released after a collector
+// outage) then eats the rate budget once per decision window.
+//
+// The assertion is the new trace at the end: after three windows for one
+// 10-span trace, the 20-span/s budget has been spent exactly once and a
+// genuinely new 10-span trace still fits.
+func TestTheChargeSurvivesEveryReDecision(t *testing.T) {
+	c := &capture{}
+	b, clk := newTestBuffer(t, Config{
+		Config: rateCfg(20), DecisionWait: "5s", DecisionCacheTTL: "1m",
+	}, c)
+	ctx := context.Background()
+	decide := func(specs ...spanSpec) {
+		t.Helper()
+		if err := b.ExportTraces(ctx, payload("checkout", specs...)); err != nil {
+			t.Fatal(err)
+		}
+		clk.advance(6 * time.Second)
+		b.Sweep(ctx)
+	}
+
+	decide(manySpans(1, 10)...) // spends 10 of the 20
+	if !b.cache.charged(traceID(1)) {
+		t.Fatal("the decision that billed the budget is not remembered as charged")
+	}
+	for window := 2; window <= 3; window++ {
+		clk.advance(61 * time.Second) // past the TTL: a straggler opens a fresh window
+		decide(spanSpec{trace: 1, span: uint64(window), end: 10})
+		if !b.cache.charged(traceID(1)) {
+			t.Fatalf("window %d forgot that trace 1 had paid, so window %d charges the budget again", window, window+1)
+		}
+	}
+
+	decide(manySpans(2, 10)...)
+	if got := c.traces()[traceID(2)]; got != 10 {
+		t.Fatalf("the new trace exported %d of its 10 spans: a re-decided trace was charged twice and ate its budget", got)
+	}
+}
+
 // The cache's two lifetimes, directly: the VERDICT expires at the TTL (a
 // straggler past it gets a fresh window, which is what the knob buys) while the
 // record of what the decision BILLED outlives it (which is what stops the

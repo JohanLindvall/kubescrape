@@ -404,68 +404,80 @@ func TestNodeTargetsFromServiceMonitor(t *testing.T) {
 	}
 }
 
-// The monitor→services match map is O(monitors × services); with a metadata
-// cache TTL configured it must be rebuilt at most once per TTL, and never for
-// a node with no pods.
-func TestMonitoredServicesCached(t *testing.T) {
-	st := store.New(time.Minute)
-	addPod(st)
-	monitors := servicemonitors.NewIndex()
-	s := New(Config{
-		Store:    st,
-		Services: services.NewIndex(),
-		Monitors: monitors,
-		Resolver: stubResolver{},
-		MaxWait:  500 * time.Millisecond,
-		CacheTTL: 30 * time.Second,
-		Ready:    closedChan(),
-	})
-	srv := httptest.NewServer(s.Handler())
-	t.Cleanup(srv.Close)
+// The monitor→services match map is O(monitors × services) and identical for
+// every node, so it is rebuilt when — and only when — one of the two indexes it
+// derives from changes. Never for a node with no pods, never twice for two
+// requests over an unchanged cluster, and always after a change.
+func TestMonitoredServicesRebuiltOnIndexChange(t *testing.T) {
+	for _, cacheTTL := range []time.Duration{30 * time.Second, 0} {
+		t.Run(cacheTTL.String(), func(t *testing.T) {
+			st := store.New(time.Minute)
+			addPod(st)
+			monitors := servicemonitors.NewIndex()
+			svcs := services.NewIndex()
+			s := New(Config{
+				Store:    st,
+				Services: svcs,
+				Monitors: monitors,
+				Resolver: stubResolver{},
+				MaxWait:  500 * time.Millisecond,
+				CacheTTL: cacheTTL,
+				Ready:    closedChan(),
+			})
+			srv := httptest.NewServer(s.Handler())
+			t.Cleanup(srv.Close)
 
-	// A node with no pods must not trigger the build at all.
-	getJSON(t, srv.URL+"/v1/nodes/empty-node/targets", http.StatusOK, nil)
-	if n := s.monBuilds.Load(); n != 0 {
-		t.Fatalf("builds after empty-node request = %d, want 0", n)
-	}
+			// A node with no pods must not trigger the build at all.
+			getJSON(t, srv.URL+"/v1/nodes/empty-node/targets", http.StatusOK, nil)
+			if n := s.monBuilds.Load(); n != 0 {
+				t.Fatalf("builds after empty-node request = %d, want 0", n)
+			}
 
-	// Two consecutive requests within the TTL share one build.
-	getJSON(t, srv.URL+"/v1/nodes/node1/targets", http.StatusOK, nil)
-	getJSON(t, srv.URL+"/v1/nodes/node1/targets", http.StatusOK, nil)
-	if n := s.monBuilds.Load(); n != 1 {
-		t.Fatalf("builds after two requests = %d, want 1", n)
-	}
+			// Repeat requests over an unchanged cluster share ONE build. This is
+			// what -metadata-cache-ttl=0 used to lose: the knob selected both the
+			// HTTP cache lifetime and this memo's, so an operator disabling client
+			// caching for freshness rebuilt the whole cross product per request.
+			for range 3 {
+				getJSON(t, srv.URL+"/v1/nodes/node1/targets", http.StatusOK, nil)
+			}
+			if n := s.monBuilds.Load(); n != 1 {
+				t.Fatalf("builds after three requests = %d, want 1", n)
+			}
 
-	// Past the TTL the map is rebuilt once.
-	now := time.Now()
-	s.now = func() time.Time { return now.Add(time.Minute) }
-	getJSON(t, srv.URL+"/v1/nodes/node1/targets", http.StatusOK, nil)
-	getJSON(t, srv.URL+"/v1/nodes/node1/targets", http.StatusOK, nil)
-	if n := s.monBuilds.Load(); n != 2 {
-		t.Fatalf("builds after TTL expiry = %d, want 2", n)
-	}
-}
+			// A new monitor rebuilds — immediately, not up to a TTL later.
+			if err := monitors.Upsert(&unstructured.Unstructured{Object: map[string]any{
+				"metadata": map[string]any{"name": "m", "namespace": "default"},
+				"spec": map[string]any{
+					"selector":  map[string]any{"matchLabels": map[string]any{"app": "web"}},
+					"endpoints": []any{map[string]any{"port": "http"}},
+				},
+			}}); err != nil {
+				t.Fatal(err)
+			}
+			getJSON(t, srv.URL+"/v1/nodes/node1/targets", http.StatusOK, nil)
+			if n := s.monBuilds.Load(); n != 2 {
+				t.Fatalf("builds after a monitor upsert = %d, want 2", n)
+			}
 
-// With caching disabled (CacheTTL 0) the map is rebuilt per request —
-// staleness must not exceed what the operator opted into.
-func TestMonitoredServicesUncachedWithoutTTL(t *testing.T) {
-	st := store.New(time.Minute)
-	addPod(st)
-	s := New(Config{
-		Store:    st,
-		Services: services.NewIndex(),
-		Monitors: servicemonitors.NewIndex(),
-		Resolver: stubResolver{},
-		MaxWait:  500 * time.Millisecond,
-		Ready:    closedChan(),
-	})
-	srv := httptest.NewServer(s.Handler())
-	t.Cleanup(srv.Close)
+			// And so does a new Service: the map is a match between the two.
+			svcs.Upsert(&corev1.Service{
+				ObjectMeta: metav1.ObjectMeta{Name: "web", Namespace: "default", UID: types.UID("svc-uid")},
+				Spec: corev1.ServiceSpec{
+					Selector: map[string]string{"app": "web"},
+					Ports:    []corev1.ServicePort{{Name: "http", Port: 80, TargetPort: intstr.FromInt32(9090)}},
+				},
+			})
+			getJSON(t, srv.URL+"/v1/nodes/node1/targets", http.StatusOK, nil)
+			if n := s.monBuilds.Load(); n != 3 {
+				t.Fatalf("builds after a service upsert = %d, want 3", n)
+			}
 
-	getJSON(t, srv.URL+"/v1/nodes/node1/targets", http.StatusOK, nil)
-	getJSON(t, srv.URL+"/v1/nodes/node1/targets", http.StatusOK, nil)
-	if n := s.monBuilds.Load(); n != 2 {
-		t.Fatalf("builds = %d, want 2 (no TTL, no caching)", n)
+			// Still nothing rebuilds without a change.
+			getJSON(t, srv.URL+"/v1/nodes/node1/targets", http.StatusOK, nil)
+			if n := s.monBuilds.Load(); n != 3 {
+				t.Fatalf("builds after an unchanged request = %d, want 3", n)
+			}
+		})
 	}
 }
 

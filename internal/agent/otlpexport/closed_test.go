@@ -76,7 +76,8 @@ func TestTrySendAbandonsItsBackoffWhenCancelled(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan sendResult, 1)
-	go func() { done <- s.trySend(ctx, plog.NewLogs()) }()
+	ld := plog.NewLogs()
+	go func() { done <- s.trySend(ctx, func(c context.Context) error { return s.send(c, ld) }) }()
 	cancel()
 
 	select {

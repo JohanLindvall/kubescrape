@@ -453,7 +453,7 @@ func LoadDynamicMetrics(path string) ([]Dynamic, error) {
 // binds a resource first (Bind + BoundResource.Add, which hashes the resource
 // once per flush); the per-call resourceAccum here would be a hot-path
 // regression outside tests.
-func (s *DynamicMetricSet) Add(values func(string) (float64, bool), lookup func(string) string, resource pcommon.Map, line string) {
+func (s *DynamicMetricSet) Add(values ValueFunc, lookup func(string) string, resource pcommon.Map, line string) {
 	if s == nil || len(s.rules) == 0 {
 		return
 	}
@@ -512,12 +512,14 @@ func TestValueDoesNotFallThroughToTheLineWhenTheAttributeIsPresent(t *testing.T)
 		}
 		return set
 	}
-	noValues := func(string) (float64, bool) { return 0, false }
+	// Present, and not a number: ValueFunc reports it, since only the walk that
+	// resolved the value can.
+	presentValues := func(k string) (float64, bool, bool) { return 0, false, k == "amount" }
 
 	present := newSet()
-	present.Add(noValues, func(k string) string {
+	present.Add(presentValues, func(k string) string {
 		if k == "amount" {
-			return "n/a" // present, and not a number
+			return "n/a"
 		}
 		return ""
 	}, pcommon.NewMap(), "amount=42")
@@ -528,8 +530,42 @@ func TestValueDoesNotFallThroughToTheLineWhenTheAttributeIsPresent(t *testing.T)
 	// The fallback itself must stay: with the key absent from the attributes,
 	// the line field is exactly what the label reads too.
 	absent := newSet()
-	absent.Add(noValues, func(string) string { return "" }, pcommon.NewMap(), "amount=42")
+	absent.Add(func(string) (float64, bool, bool) { return 0, false, false },
+		func(string) string { return "" }, pcommon.NewMap(), "amount=42")
 	if n := len(absent.rules[0].series.db); n != 1 {
 		t.Fatalf("observed %d samples from the line field, want 1", n)
+	}
+}
+
+// And it must learn that from the value walk itself. Probing the LABEL closure
+// for presence walked every attribute rank a second time, in full, on exactly
+// the lines where the first walk found nothing — a value key that lives on the
+// line, which is the common case (an attribute-backed one answers on the first
+// walk and never probes).
+func TestValuePresenceCostsNoSecondWalk(t *testing.T) {
+	set, err := newTestSet([]Dynamic{{
+		Name: "m", Type: GaugeType, Value: "amount", Labels: []string{"level"},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	probes := 0
+	lookup := func(k string) string {
+		if k == "amount" {
+			probes++
+		}
+		if k == "level" {
+			return "info"
+		}
+		return ""
+	}
+	values := func(string) (float64, bool, bool) { return 0, false, false }
+	set.Add(values, lookup, pcommon.NewMap(), `{"amount":42}`)
+
+	if probes != 0 {
+		t.Errorf("the label closure was asked for the value key %d times: the attribute ranks are walked twice per line", probes)
+	}
+	if n := len(set.rules[0].series.db); n != 1 {
+		t.Fatalf("observed %d samples, want 1 from the line field", n)
 	}
 }

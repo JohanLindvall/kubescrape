@@ -2,8 +2,12 @@
 // by the log-derived metrics engine (internal/metrics) and the tailer's log
 // rules: label selectors (exact and regex, with per-line memoization), the
 // keep/drop/sample LineFilter, and single-pass JSON/logfmt field extraction
-// for exactly the keys the rules reference. The synthetic LineKey ("__line__")
-// resolves to the whole raw line.
+// for exactly the keys the rules reference. Both synthetic keys live here, in
+// the shared DSL, even though neither tier resolves both: LineKey ("__line__")
+// is the whole raw line, and SeverityKey ("__severity__") is the RULES tier's
+// enriched severity — named here so the metrics engine, which shares the
+// selector language but cannot resolve it, refuses a config using it instead of
+// compiling a rule that matches nothing.
 package logline
 
 import (

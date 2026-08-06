@@ -151,3 +151,55 @@ func TestAuthSecretRefsReadsTheStoredEndpoints(t *testing.T) {
 		t.Errorf("allowlist has %d entries, want 7 (%v)", len(refs), refs)
 	}
 }
+
+// A '/' inside a SecretKeySelector's name or key would make the
+// "namespace/name/key" allowlist entry ambiguous, and the allowlist is checked
+// against three separately-chosen URL path segments — Go's ServeMux unescapes
+// %2F inside one wildcard segment, so the ambiguity is reachable from the wire.
+// The CRD validates neither field, so a monitor in namespace `tenant` could
+// otherwise mint "tenant/victim/creds/token" and have GET
+// /v1/scrape-auth/tenant%2Fvictim/creds/token satisfy it — an allowlist entry
+// naming one secret, an argument naming another.
+//
+// The ref reads as ABSENT, exactly like an incomplete one.
+func TestSecretRefsRejectPathSeparators(t *testing.T) {
+	for _, tc := range []struct{ name, key string }{
+		{"victim/creds", "token"},
+		{"creds", "sub/token"},
+		{"a/b", "c/d"},
+	} {
+		u := &unstructured.Unstructured{Object: map[string]any{
+			"metadata": map[string]any{"name": "sm", "namespace": "tenant"},
+			"spec": map[string]any{
+				"selector": map[string]any{},
+				"endpoints": []any{map[string]any{
+					"port":              "metrics",
+					"bearerTokenSecret": map[string]any{"name": tc.name, "key": tc.key},
+				}},
+			},
+		}}
+		m, err := Parse(u)
+		if err != nil {
+			t.Fatalf("Parse: %v", err)
+		}
+		if got := m.Endpoints[0].BearerSecret; got != "" {
+			t.Errorf("bearerTokenSecret {name:%q key:%q} rendered the ambiguous ref %q",
+				tc.name, tc.key, got)
+		}
+		ix := NewIndex()
+		if err := ix.Upsert(u); err != nil {
+			t.Fatal(err)
+		}
+		for ref := range ix.AuthSecretRefs() {
+			t.Errorf("allowlist gained %q from a ref carrying a path separator", ref)
+		}
+	}
+	// The ordinary ref is untouched.
+	m, err := Parse(serviceMonitorCR("prod", "sm"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := m.Endpoints[0].BearerSecret; got != "prod/bearer/token" {
+		t.Errorf("BearerSecret = %q, want prod/bearer/token", got)
+	}
+}

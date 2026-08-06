@@ -124,9 +124,11 @@ type Scraper struct {
 	// (nil when Kubelet.TokenFile is unset).
 	kubeletToken *bearer.File
 	// podCache backs the metadata lookups of the cadvisor batcher and the
-	// splitters; splitters run on concurrent scrape goroutines.
-	cacheMu  sync.Mutex
-	podCache map[string]podCacheEntry
+	// splitters; splitters run on concurrent scrape goroutines. cacheSwept is
+	// when the expiry sweep last ran (see evictCacheLocked).
+	cacheMu    sync.Mutex
+	podCache   map[string]podCacheEntry
+	cacheSwept time.Time
 
 	// status is the last completed cycle's per-target outcomes, served on the
 	// agent's GET /debug/targets (see status.go).
@@ -239,8 +241,8 @@ func New(cfg Config) *Scraper {
 
 // scrapeProto runs the protobuf exposition path on the same scrapeSession
 // harness the text path uses (proto only ever runs on the targets pipeline).
-func (s *Scraper) scrapeProto(ctx context.Context, body io.Reader, cb chunker, relabel *relabelFilter, what string) (int, error) {
-	ss := s.newScrapeSession(ctx, cb, pipelineTargets, what, relabel, true)
+func (s *Scraper) scrapeProto(ctx context.Context, body io.Reader, cb chunker, relabel *relabelFilter, what, warnKey string) (int, error) {
+	ss := s.newScrapeSession(ctx, cb, pipelineTargets, what, warnKey, relabel, true)
 	defer ss.reportDropped()
 	malformed, err := s.parseProtoAndExport(ss, body)
 	ss.reportMalformed("scrape had malformed proto families", malformed, nil)
@@ -899,10 +901,14 @@ func (s *Scraper) scrapeTarget(ctx context.Context, t kubemeta.ScrapeTarget, tim
 	if err != nil {
 		return 0, err // exporting what the user asked to drop is worse than failing visibly
 	}
+	// warnTarget, never the URL: the per-scrape complaints are deduped by the
+	// CONFIGURATION that produced the target, so a pod restart neither re-fires
+	// them nor grows the shared dedupe table.
+	warnKey := warnTarget(t)
 	if strings.Contains(resp.Header.Get("Content-Type"), "application/vnd.google.protobuf") {
-		return s.scrapeProto(ctx, resp.Body, cb, relabel, t.URL)
+		return s.scrapeProto(ctx, resp.Body, cb, relabel, t.URL, warnKey)
 	}
-	return s.parseAndExportFiltered(ctx, resp.Body, openMetrics, s.cfg.Exemplars, cb, pipelineTargets, t.URL, relabel)
+	return s.parseAndExportFiltered(ctx, resp.Body, openMetrics, s.cfg.Exemplars, cb, pipelineTargets, t.URL, warnKey, relabel)
 }
 
 // batcher accumulates samples of one source into a pmetric.Metrics payload

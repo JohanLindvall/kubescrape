@@ -9,11 +9,30 @@
 // edit keeps the last good program running, counted and warned), so
 // transformation logic changes without a pod restart.
 //
-// Cost model: one Starlark invocation per exported BATCH per signal;
-// records are exposed as lazy host objects, so a script pays only for the
-// fields it touches (~1µs per touched record). The per-line/per-sample hot
-// paths never see any of this — pipelines without transforms don't even get
-// the wrapper installed.
+// Cost model: one Starlark invocation per exported BATCH per signal, PLUS one
+// deep copy of that batch — and the copy, not the script, is what a configured
+// transforms file costs. Measured on a 1024-record log batch with a
+// `def transform(batch): return` script: ~249µs total, of which ld.CopyTo is
+// ~226µs (91%) and the whole Starlark call is 245ns; a 10,000-point metrics
+// payload (one promscrape chunk) is ~2.05ms and 2.3 MB for the same no-op. So
+// enabling transforms multiplies the agent's per-batch export cost before a
+// script does anything, and with -buffer-dir the copy is additionally wasted
+// (its consumer marshals it and drops it immediately).
+//
+// The copy is a CORRECTNESS requirement, not an optimization gap: scripts
+// mutate pdata in place through the host objects, and producers re-export the
+// SAME object on retry (see the comment above ExportLogs). Removing it needs
+// an explicit per-payload ownership marker on the call — the shape
+// otlpexport.Own/Owned already uses for durability — so a producer that
+// rebuilds its batch on retry can license an in-place run while forwarders
+// keep the copy. That wiring lives in the producers, not here.
+//
+// Within a batch, records ARE lazy: the iterators walk positions rather than
+// materializing host objects, and each object resolves only the fields the
+// script touches (~1µs per touched record), so a script that breaks out early
+// pays only for what it visited. The per-line/per-sample hot paths never see
+// any of this — pipelines without transforms don't even get the wrapper
+// installed.
 package transform
 
 import (

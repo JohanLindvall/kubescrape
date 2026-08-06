@@ -2,6 +2,7 @@ package journald
 
 import (
 	"errors"
+	"strings"
 	"syscall"
 	"testing"
 )
@@ -26,5 +27,23 @@ func TestWaitFailureSurfacesAsSourceError(t *testing.T) {
 	}
 	if !errors.Is(err, syscall.EMFILE) {
 		t.Fatalf("err = %v, want the errno preserved for errors.Is", err)
+	}
+}
+
+// go-systemd's Wait returns a bare -1 when the dlsym lookup for
+// sd_journal_wait fails — its own sentinel, not an errno. Read errno-style it
+// renders as syscall.Errno(1) = EPERM, "operation not permitted", which sends
+// an operator after a permissions problem while the reader reopens every 30s
+// forever against a symbol that will never appear.
+func TestSymbolLookupFailureIsNotReportedAsEPERM(t *testing.T) {
+	err := waitStatusErr(-1)
+	if err == nil {
+		t.Fatal("a failed symbol lookup must still surface as an error")
+	}
+	if errors.Is(err, syscall.EPERM) {
+		t.Fatalf("err = %v, want the symbol lookup named rather than a fabricated EPERM", err)
+	}
+	if !strings.Contains(err.Error(), "sd_journal_wait") {
+		t.Fatalf("err = %v, want the missing symbol named", err)
 	}
 }

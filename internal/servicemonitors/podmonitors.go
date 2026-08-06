@@ -76,6 +76,7 @@ func (x *Index) UpsertPodMonitor(u *unstructured.Unstructured) error {
 func (x *Index) DeletePodMonitor(namespace, name string) {
 	x.mu.Lock()
 	defer x.mu.Unlock()
+	x.gen.Add(1)
 	delete(x.podMonitors, namespace+"/"+name)
 }
 

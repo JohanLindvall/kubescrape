@@ -57,7 +57,7 @@ func selfResolve(meta *metaclient.Client) func(context.Context) (*kubemeta.Pod, 
 // selfInstanceName is the pod name agentSelfResource uses as a singleton's /
 // shard's service.instance.id, indirected through a var so a test can drive the
 // empty-name case a hostNetwork pod without $POD_NAME produces (selfPodName
-// reads /proc and os.Hostname, neither env-forceable).
+// reads os.Hostname, which is not env-forceable).
 var selfInstanceName = selfPodName
 
 // selfPodName is this pod's name: $POD_NAME when the deployment wires it, else
@@ -74,47 +74,36 @@ func selfPodName() string {
 	if n := strings.TrimSpace(os.Getenv("POD_NAME")); n != "" {
 		return n
 	}
-	if hostNetworkSelf() {
-		return "" // the node's hostname is not this pod's name
-	}
 	h, err := os.Hostname()
 	if err != nil {
 		return ""
 	}
-	return h
+	return podHostname(h, *nodeName)
 }
 
-// hostNetworkSelf reports whether this process shares the host's network
-// namespace, in which case the hostname names the node rather than the pod.
-// /proc/self/ns/net is compared with PID 1's, which is the HOST's init only
-// under `hostPID: true` — no shipped manifest sets it — so the comparison is
-// evidence of nothing unless /proc/1 is provably somebody else.
+// podHostname returns the hostname unless it names the NODE, in which case
+// this process shares the host's UTS namespace (hostNetwork) and the hostname
+// is not a pod name at all — the caller gets "" and skips the by-name lookup.
 //
-// An unprovable comparison is INCONCLUSIVE and keeps the hostname fallback,
-// which is the safe direction: a wrong "yes" costs an ordinary pod the name
-// Kubernetes put in its hostname (the by-name resolve is skipped and a
-// singleton's service.instance.id falls back to the node, colliding with that
-// node's DaemonSet agent), while a wrong "no" costs a lookup for a pod named
-// after the node, which 404s and is reported.
-func hostNetworkSelf() bool { return hostNetworkProc(os.Getpid(), os.Readlink) }
-
-// hostNetworkProc is hostNetworkSelf over an injected pid and readlink.
-func hostNetworkProc(pid int, readlink func(string) (string, error)) bool {
-	if pid == 1 {
-		// /proc/1 is THIS process — the shipped image runs the agent as the
-		// container's entrypoint — so the comparison is self-vs-self and would
-		// claim hostNetwork for every pod that can read the link.
-		return false
+// The node name is the evidence because it is already MANDATORY (-node-name /
+// $NODE_NAME, checked in run()) and a hostNetwork pod's hostname IS the node's,
+// which is the only case that matters here. The /proc comparison this replaced
+// asked whether pid 1 lives in our network namespace, and every realistic way
+// for the agent not to be pid 1 — shareProcessNamespace's pause container, an
+// init wrapper like tini — puts pid 1 in the POD's namespace, so it answered
+// "hostNetwork" for every pod and cost each one the fallback.
+//
+// A MISMATCH keeps the hostname, which is the safe direction: a wrong "no"
+// (a kubelet whose --hostname-override differs from the registered node name)
+// costs a lookup for a pod named after the node, which 404s and is reported,
+// while a wrong "yes" would skip the by-name resolve outright and leave a
+// singleton's service.instance.id to fall back to the node — colliding with
+// that node's DaemonSet agent on one (job, instance).
+func podHostname(hostname, node string) string {
+	if node != "" && strings.EqualFold(strings.TrimSpace(hostname), strings.TrimSpace(node)) {
+		return ""
 	}
-	self, err := readlink("/proc/self/ns/net")
-	if err != nil {
-		return false
-	}
-	host, err := readlink("/proc/1/ns/net")
-	if err != nil {
-		return false // cannot tell; keep the hostname fallback
-	}
-	return self == host
+	return hostname
 }
 
 // selfBuild runs the configured `self` attribute pipeline over the agent's own

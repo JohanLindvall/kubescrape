@@ -98,6 +98,9 @@ func compileRule(d *Dynamic, cfg *setConfig, shared map[string]*series) (*metric
 	if rule.resLabels, err = parseLabelTemplates(d.ResourceLabels, d.LabelPrefix); err != nil {
 		return nil, err
 	}
+	if err := rejectUnresolvableKeys(d, rule); err != nil {
+		return nil, err
+	}
 
 	// The check is on d.Name, not the prefixed result: a non-empty prefix made
 	// the concatenation pass for a rule with no name at all, which compiled
@@ -128,11 +131,25 @@ func compileRule(d *Dynamic, cfg *setConfig, shared map[string]*series) (*metric
 		if existing.kind != kind || existing.action != action {
 			return nil, fmt.Errorf("metric %q declared with conflicting type/action", d.Name)
 		}
-		// A second rule's buckets/maxCardinality/maxAge would be silently
-		// ignored (the first rule's series wins) — reject a conflicting
-		// histogram bucket declaration like a conflicting type.
+		// Rules sharing a name share the FIRST one's series, so every shape
+		// field a later rule declares is unenforceable — and silently so. A
+		// second rule feeding an existing metric with a deliberately tight
+		// maxCardinality (its label set is the riskier one) started cleanly and
+		// admitted label sets up to the first rule's cap instead, which is the
+		// memory blow-up the field was set to prevent. Refuse a DIFFERING
+		// declaration; leaving a field unset still means "whatever the name
+		// already has".
 		if kind == kindHistogram && len(d.Buckets) > 0 && !slices.Equal(existing.buckets[:len(existing.buckets)-1], d.Buckets) {
 			return nil, fmt.Errorf("metric %q declared with conflicting buckets", d.Name)
+		}
+		if cap := cardinalityCap(d.MaxCardinality); d.MaxCardinality != 0 && cap != existing.maxSize {
+			return nil, fmt.Errorf("metric %q declared with conflicting maxCardinality (%d, already %d)", d.Name, cap, existing.maxSize)
+		}
+		if secs := expirationSeconds(age); d.MaxAge != "" && secs != existing.expiration {
+			return nil, fmt.Errorf("metric %q declared with conflicting maxAge (%ds, already %ds)", d.Name, secs, existing.expiration)
+		}
+		if d.Description != "" && d.Description != existing.desc {
+			return nil, fmt.Errorf("metric %q declared with conflicting description (%q, already %q)", d.Name, d.Description, existing.desc)
 		}
 		rule.series = existing
 	} else {
@@ -158,6 +175,53 @@ func compileRule(d *Dynamic, cfg *setConfig, shared map[string]*series) (*metric
 		return nil, fmt.Errorf("metric %q: type %q needs a value source — set `value` or `valueRegexp`", d.Name, d.Type)
 	}
 	return rule, nil
+}
+
+// rejectUnresolvableKeys refuses the two keys this engine's resolution tiers
+// cannot answer, both of which compile cleanly and then do nothing forever.
+//
+//   - logline.SeverityKey is the RULES tier's synthetic key: only
+//     logchain.Resolver.RuleFn has an arm for it, while the label and value
+//     lookups a metric resolves through see record attributes, resource
+//     attributes and line fields — none of which is the enriched severity. The
+//     selector language, the config file and the documented example are shared
+//     with logs.rules, which is exactly what makes writing it under a metric's
+//     match: the natural mistake, and it yields a permanently absent metric.
+//   - logline.LineKey as the observed VALUE: the label tier resolves it (through
+//     logline.ResolveKey) but the value tier does not, and buildKeyIndex skips
+//     it, so the rule records nothing. The "needs a value source" check below
+//     passes because the string is non-empty, which is what let it through.
+//
+// Both refusals name the alternative: a level FIELD for the first, valueRegexp
+// for the second.
+func rejectUnresolvableKeys(d *Dynamic, rule *metricRule) error {
+	reject := func(where string) error {
+		return fmt.Errorf("metric %q: %s reads %s, which only logs.rules resolves — a log-metric sees record/resource attributes and line fields, so it would match nothing; select on the line's own level field instead",
+			d.Name, where, logline.SeverityKey)
+	}
+	for _, key := range rule.match.LabelKeys() {
+		if key == logline.SeverityKey {
+			return reject("match")
+		}
+	}
+	for _, lt := range rule.labels {
+		if lt.getKey == logline.SeverityKey {
+			return reject("label " + lt.setKey)
+		}
+	}
+	for _, lt := range rule.resLabels {
+		if lt.getKey == logline.SeverityKey {
+			return reject("resourceLabel " + lt.setKey)
+		}
+	}
+	if d.Value == logline.SeverityKey {
+		return reject("value")
+	}
+	if d.Value == logline.LineKey {
+		return fmt.Errorf("metric %q: value %s is the whole raw line, which the value tier does not resolve (and is never a number) — use valueRegexp to capture a number off the line",
+			d.Name, logline.LineKey)
+	}
+	return nil
 }
 
 // cardinalityCap resolves the configured MaxCardinality: unset (or negative)
@@ -282,13 +346,27 @@ func labelGetter(getKey, value, pattern, reSpec, spec string) (func(func(string)
 //
 // The step is a rune, not a byte. Byte indexing split a multi-byte rune
 // straddling a mask boundary — maskPattern("é50", "_xx") produced "\xc3xx" —
-// and that value is hashed, retained and finally written to a pcommon.Map,
-// i.e. an invalid-UTF-8 string field in the marshaled OTLP payload, which a
-// strict protobuf receiver rejects PERMANENTLY: the whole chunk, every metric
-// sharing that resource, dropped every interval the series stays live. The
-// mask must not manufacture invalid output from a valid line (truncLabelValue
-// backs off to a rune boundary for the same reason); a byte of value that is
-// already invalid UTF-8 re-encodes as U+FFFD rather than being copied through.
+// and that value is hashed, retained and finally written to a pcommon.Map, i.e.
+// an invalid-UTF-8 string field in the marshaled OTLP payload, which a strict
+// protobuf receiver can reject PERMANENTLY: the whole chunk, every metric
+// sharing that resource, dropped every interval the series stays live. A byte
+// of value that is ALREADY invalid re-encodes as U+FFFD rather than being
+// copied through, since the rune loop decodes it as RuneError.
+//
+// The rule this states is narrow, and deliberately so: the MASK must not
+// MANUFACTURE invalid output from a valid line. It is not a payload-level
+// guarantee, because this package does not have one — the plain passthrough
+// label returns lookup(getKey) verbatim, which on the logfmt path is an unsafe
+// view straight into the raw line, and truncLabelCut keeps invalid bytes on
+// purpose when a value has no rune boundary to back off to (dropping the label
+// would silently merge two series, which is worse). A validity check at
+// labels.set, the one door every label value comes through, would close only
+// this package's doors — a body, an enriched record attribute and a logattrs
+// resource attribute reach the same payload without passing it — and it costs
+// ~13ns per label per line (utf8.ValidString over a value already cut to
+// maxLabelValueBytes; over the UNCUT value it would be the __line__-sized scan
+// asciiOverlay exists to avoid). Inventing invalidity is what a transform can
+// be held to; passing a line's own bytes through is not.
 func maskPattern(value, pattern string) string {
 	if pattern == "" {
 		return ""
@@ -299,7 +377,7 @@ func maskPattern(value, pattern string) string {
 		// an empty value drops the label, matching the plain passthrough.
 		return ""
 	}
-	if isASCII(pattern) && isASCII(value) {
+	if asciiOverlay(value, pattern) {
 		// Byte and rune step are the same thing here, and this is the log-line
 		// hot path: a status code masked to its class is what the DSL is for.
 		out := make([]byte, len(pattern))
@@ -326,6 +404,23 @@ func maskPattern(value, pattern string) string {
 		out = utf8.AppendRune(out, pr)
 	}
 	return string(out)
+}
+
+// asciiOverlay reports whether the byte-stepped overlay is also the rune-stepped
+// one: pattern entirely single-byte, and value single-byte as far as the overlay
+// READS it.
+//
+// The probe over value is bounded to len(pattern) bytes because that is every
+// byte the loop can touch. An unbounded probe is work proportional to the whole
+// VALUE on a per-line path where the value is routinely a whole log line — a
+// label may read the synthetic __line__ key, and any JSON or logfmt field can be
+// long — so `class=$__line__(_xx)` over a 1 MiB multiline entry cost ~300us of
+// the single sweep goroutine that serves every log file on the node, against
+// ~13ns for the overlay itself. A prefix cut inside a multi-byte rune ends on a
+// byte >= RuneSelf, which routes to the rune loop, so the bound cannot admit a
+// value the byte step would mis-slice.
+func asciiOverlay(value, pattern string) bool {
+	return isASCII(pattern) && isASCII(value[:min(len(value), len(pattern))])
 }
 
 // isASCII reports whether s is entirely single-byte, i.e. whether a byte index

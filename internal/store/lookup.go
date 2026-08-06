@@ -57,6 +57,17 @@ func (s *Store) GetContainer(ctx context.Context, id string) (ContainerResult, b
 		if ok || gone {
 			return res, ok, nil
 		}
+		if ctx.Err() != nil {
+			// A lookup that cannot block must not pay for the waiter protocol:
+			// registering takes the EXCLUSIVE lock, and removeWaiter takes it
+			// again, for a channel the select below could never wait on. The
+			// outcome is identical to the ctx.Done() arm — the read-locked probe
+			// above already made the same final check that arm makes — but this
+			// is the route's cheapest hostile shape (?wait=0, or a client that
+			// hung up), and write-lock churn is contended by every reader and by
+			// the informer goroutine.
+			return ContainerResult{}, false, nil
+		}
 		s.mu.Lock()
 		res, ok, gone = s.lookupLocked(id)
 		if ok || gone {

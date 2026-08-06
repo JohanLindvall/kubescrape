@@ -2,6 +2,8 @@ package metrics
 
 import (
 	"fmt"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -63,11 +65,11 @@ func BenchmarkDynamicAddAttrs(b *testing.B) {
 		"level": "info", "http_status": "200", "method": "GET", "latency_ms": "42.5",
 	}
 	lookup := func(k string) string { return attrs[k] }
-	values := func(k string) (float64, bool) {
+	values := func(k string) (float64, bool, bool) {
 		if k == "latency_ms" {
-			return 42.5, true
+			return 42.5, true, true
 		}
-		return 0, false
+		return 0, false, false
 	}
 	line := `GET /api/v1/orders 200 42.5ms`
 	b.ReportAllocs()
@@ -132,11 +134,11 @@ func BenchmarkDynamicAddHistogram(b *testing.B) {
 	res := benchResource()
 	attrs := map[string]string{"level": "info", "http_status": "200", "method": "GET"}
 	lookup := func(k string) string { return attrs[k] }
-	values := func(k string) (float64, bool) {
+	values := func(k string) (float64, bool, bool) {
 		if k == "latency_s" {
-			return 0.42, true
+			return 0.42, true, true
 		}
-		return 0, false
+		return 0, false, false
 	}
 	line := `GET /api/v1/orders 200 0.42s`
 	bound := set.Bind(res)
@@ -160,6 +162,33 @@ func BenchmarkDynamicAddNoMatch(b *testing.B) {
 		set.Add(nil, lookup, res, line)
 	}
 }
+
+// BenchmarkMaskPattern measures the label mask against the LENGTH of the value
+// it reads. The mask overlays at most len(pattern) bytes, so the cost must be a
+// function of the pattern, not of the value: a label may read the synthetic
+// __line__ key, or any JSON/logfmt field, so the value is a whole log line
+// whenever an operator writes one — up to MaxEntryBytes — and this runs on the
+// single sweep goroutine that serves every log file on the node.
+func BenchmarkMaskPattern(b *testing.B) {
+	for _, tc := range []struct {
+		name  string
+		value string
+	}{
+		{"short", "503"},
+		{"1KiB", strings.Repeat("5", 1<<10)},
+		{"64KiB", strings.Repeat("5", 1<<16)},
+		{"1MiB", strings.Repeat("5", 1<<20)},
+	} {
+		b.Run(tc.name, func(b *testing.B) {
+			b.ReportAllocs()
+			for b.Loop() {
+				sinkString = maskPattern(tc.value, "_xx")
+			}
+		})
+	}
+}
+
+var sinkString string
 
 // BenchmarkExport measures rendering 100 series to OTLP.
 func BenchmarkExport(b *testing.B) {
@@ -197,11 +226,11 @@ func BenchmarkDynamicAddBound(b *testing.B) {
 		"level": "info", "http_status": "200", "method": "GET", "latency_ms": "42.5",
 	}
 	lookup := func(k string) string { return attrs[k] }
-	values := func(k string) (float64, bool) {
+	values := func(k string) (float64, bool, bool) {
 		if k == "latency_ms" {
-			return 42.5, true
+			return 42.5, true, true
 		}
-		return 0, false
+		return 0, false, false
 	}
 	line := `GET /api/v1/orders 200 42.5ms`
 	bound := set.Bind(res)
@@ -209,6 +238,67 @@ func BenchmarkDynamicAddBound(b *testing.B) {
 	for b.Loop() {
 		bound.Add(values, lookup, line)
 	}
+}
+
+// BenchmarkDynamicAddValueFromLine is the shape where the observed value is NOT
+// an attribute: the label keys resolve through the caller's closures and the
+// value comes off the line. It is a common tailer shape, and the one that pays
+// for every walk of the attribute ranks the value tier makes before it gives up
+// and reads the line — so the closures here walk pcommon maps rank by rank, the
+// way logchain's resolver does, rather than hitting a Go map.
+func BenchmarkDynamicAddValueFromLine(b *testing.B) {
+	setTimeForTest(time.Unix(1_700_400_400, 0))
+	defer testEpoch.Store(0)
+	// One rule, so the measurement is the resolution tiers rather than the
+	// selector and label work the multi-rule benchmarks above already cover.
+	set, err := newTestSet([]Dynamic{{
+		Name: "latency_avg_ms", Type: GaugeType, Action: "avg",
+		Value: "latency_ms", Match: []string{"level=info"},
+		Labels: []string{"method=$method"},
+	}})
+	if err != nil {
+		b.Fatal(err)
+	}
+	rec := pcommon.NewMap()
+	rec.PutStr("level", "info")
+	rec.PutStr("http_status", "200")
+	rec.PutStr("method", "GET")
+	res := benchResource()
+	lookup, values := resolverLike(rec, res)
+	line := `{"latency_ms":42.5,"msg":"handled request","path":"/api/v1/orders"}`
+	bound := set.Bind(res)
+	b.ReportAllocs()
+	for b.Loop() {
+		bound.Add(values, lookup, line)
+	}
+}
+
+// resolverLike is logchain.Resolver's record-then-resource ranking, spelled out
+// here because this package cannot import the agent's resolver (it imports
+// this one). The label closure returns the first PRESENT rank's rendering; the
+// value closure answers numerically and reports presence from the same walk.
+func resolverLike(rec, res pcommon.Map) (func(string) string, ValueFunc) {
+	label := func(k string) string {
+		if v, ok := rec.Get(k); ok {
+			return v.AsString()
+		}
+		if v, ok := res.Get(k); ok {
+			return v.AsString()
+		}
+		return ""
+	}
+	value := func(k string) (float64, bool, bool) {
+		v, ok := rec.Get(k)
+		if !ok {
+			if v, ok = res.Get(k); !ok {
+				return 0, false, false
+			}
+		}
+		s := v.AsString()
+		f, err := strconv.ParseFloat(s, 64)
+		return f, err == nil, s != ""
+	}
+	return label, value
 }
 
 // The benchmarks above REPORT the per-line budget; a benchmark cannot fail a
@@ -228,11 +318,11 @@ func TestDynamicAddAllocationBudget(t *testing.T) {
 		"level": "info", "http_status": "200", "method": "GET", "latency_ms": "42.5",
 	}
 	infoLookup := func(k string) string { return infoAttrs[k] }
-	infoValues := func(k string) (float64, bool) {
+	infoValues := func(k string) (float64, bool, bool) {
 		if k == "latency_ms" {
-			return 42.5, true
+			return 42.5, true, true
 		}
-		return 0, false
+		return 0, false, false
 	}
 	debugAttrs := map[string]string{"level": "debug"}
 	debugLookup := func(k string) string { return debugAttrs[k] }
@@ -307,11 +397,11 @@ func TestDynamicAddHistogramAllocationBudget(t *testing.T) {
 	}
 	attrs := map[string]string{"level": "info", "http_status": "200", "method": "GET"}
 	lookup := func(k string) string { return attrs[k] }
-	values := func(k string) (float64, bool) {
+	values := func(k string) (float64, bool, bool) {
 		if k == "latency_s" {
-			return 0.42, true
+			return 0.42, true, true
 		}
-		return 0, false
+		return 0, false, false
 	}
 	bound := set.Bind(benchResource())
 	bound.Add(values, lookup, `GET /api/v1/orders 200 0.42s`)

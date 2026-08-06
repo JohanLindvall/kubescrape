@@ -129,33 +129,93 @@ func TestKafkaEndToEnd(t *testing.T) {
 	<-done
 }
 
-// kgo delivers fatal partition conditions AS the poll result — "if any
-// partition has a fatal error and actually had no records, a fake fetch will
-// be injected with the error" — so a poll must not report such a fetch as a
-// clean empty one: consume would fire the azure-eventhub readiness gate on a
-// consumer that can never consume (an identity without read permission on the
-// insights-* hubs) and a truly fatal error would warn-loop forever instead of
-// reaching Run's reopen-with-backoff arm.
-func TestErrorOnlyFetchFailsThePoll(t *testing.T) {
+// errFetch is the record-less shape kgo injects for every partition-level
+// notification (addFakeReadyForDraining).
+func errFetch(topic string, partition int32, err error) kgo.Fetches {
+	return kgo.Fetches{{Topics: []kgo.FetchTopic{{
+		Topic:      topic,
+		Partitions: []kgo.FetchPartition{{Partition: partition, Err: err}},
+	}}}}
+}
+
+// A fetch carrying errors and NO records must not clear the readiness gate: by
+// its records alone it is indistinguishable from a clean empty poll, so
+// consume would report a consumer that can never consume as ready. It must
+// equally not fail the poll when the error is SCOPED to one topic — Run then
+// closes the source (a full LeaveGroup) and rebuilds after a backoff, so the
+// likeliest partial shape (read permission on nine of ten insights-* hubs, a
+// hub mid-deletion, Event Hubs recycling a group session) turns into a
+// permanent rebalance loop that takes the nine healthy hubs down with it.
+func TestScopedFetchErrorsAreNotFatal(t *testing.T) {
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 
-	authFailed := kgo.Fetches{{Topics: []kgo.FetchTopic{{
-		Topic:      "insights-logs-audit",
-		Partitions: []kgo.FetchPartition{{Partition: 0, Err: kerr.TopicAuthorizationFailed}},
-	}}}}
-	msgs, err := pollResult(authFailed, log)
-	if err == nil {
-		t.Fatal("a fetch carrying only errors must fail the poll, or ready() fires for an unconsumable hub")
+	for _, tc := range []struct {
+		name    string
+		fetches kgo.Fetches
+	}{
+		// A metadata load error scoped to ONE topic; ConsumeRegex over
+		// ^insights-.* makes this the shape of a per-hub ACL gap.
+		{"topic authorization", errFetch("insights-logs-audit", -1, kerr.TopicAuthorizationFailed)},
+		// A hub mid-deletion.
+		{"unknown topic", errFetch("insights-logs-audit", -1, kerr.UnknownTopicOrPartition)},
+		// Informational: kgo resets consuming itself.
+		{"data loss", errFetch("insights-logs-audit", 0, &kgo.ErrDataLoss{Topic: "insights-logs-audit"})},
+		// Informational: kgo rejoins the group itself. Event Hubs recycles
+		// connections aggressively, so this one is routine.
+		{"group session", errFetch("", 0, &kgo.ErrGroupSession{Err: kerr.RebalanceInProgress})},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			msgs, healthy, err := pollResult(tc.fetches, log)
+			if err != nil {
+				t.Fatalf("err = %v, want nil: a rebuilt client cannot fix this and the LeaveGroup takes every other hub with it", err)
+			}
+			if healthy {
+				t.Error("healthy = true for an errors-only fetch; the readiness gate would clear for an unconsumable hub")
+			}
+			if len(msgs) != 0 {
+				t.Errorf("msgs = %q, want none", msgs)
+			}
+		})
 	}
-	if !errors.Is(err, kerr.TopicAuthorizationFailed) {
-		t.Fatalf("err = %v, want the partition error preserved for errors.Is", err)
-	}
-	if msgs != nil {
-		t.Fatalf("msgs = %v, want none from a failed poll", msgs)
-	}
+}
 
-	// Errors beside records stay non-fatal: the records are processed and kgo
-	// retries the broken partitions itself.
+// The other half: a condition no further fetch can clear still reaches Run's
+// reopen-with-backoff arm. Unscoped and non-retriable means every hub is
+// unreachable, which is the only shape a fresh client (with freshly read
+// credentials) can recover from.
+func TestUnscopedFatalFetchErrorsFailThePoll(t *testing.T) {
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	for _, tc := range []struct {
+		name    string
+		fetches kgo.Fetches
+		want    error
+	}{
+		{"cluster authorization", errFetch("", -1, kerr.ClusterAuthorizationFailed), kerr.ClusterAuthorizationFailed},
+		{"sasl authentication", errFetch("", -1, kerr.SaslAuthenticationFailed), kerr.SaslAuthenticationFailed},
+		{"client closed", errFetch("", -1, kgo.ErrClientClosed), kgo.ErrClientClosed},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			msgs, healthy, err := pollResult(tc.fetches, log)
+			if err == nil {
+				t.Fatal("a cluster-wide failure must fail the poll and reach the reopen arm")
+			}
+			if !errors.Is(err, tc.want) {
+				t.Errorf("err = %v, want the partition error preserved for errors.Is", err)
+			}
+			if healthy || msgs != nil {
+				t.Errorf("healthy=%v msgs=%v, want neither from a failed poll", healthy, msgs)
+			}
+		})
+	}
+}
+
+// Records beside errors stay a healthy poll: the records are processed, kgo
+// retries the broken partitions, and a clean empty fetch is what lets the
+// readiness gate clear on a quiet but reachable hub.
+func TestRecordsAndCleanFetchesAreHealthy(t *testing.T) {
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+
 	partial := kgo.Fetches{{Topics: []kgo.FetchTopic{{
 		Topic: "insights-logs-audit",
 		Partitions: []kgo.FetchPartition{
@@ -163,17 +223,15 @@ func TestErrorOnlyFetchFailsThePoll(t *testing.T) {
 			{Partition: 1, Err: kerr.NotLeaderForPartition},
 		},
 	}}}}
-	msgs, err = pollResult(partial, log)
-	if err != nil {
-		t.Fatalf("errors beside records must not fail the poll: %v", err)
+	msgs, healthy, err := pollResult(partial, log)
+	if err != nil || !healthy {
+		t.Fatalf("errors beside records: healthy=%v err=%v, want healthy and nil", healthy, err)
 	}
 	if len(msgs) != 1 || string(msgs[0]) != "x" {
 		t.Fatalf("msgs = %q, want the fetched record kept", msgs)
 	}
 
-	// A clean empty fetch stays a clean empty poll — what lets the readiness
-	// gate clear on a quiet but reachable hub.
-	if msgs, err = pollResult(kgo.Fetches{}, log); err != nil || len(msgs) != 0 {
-		t.Fatalf("clean empty fetch: msgs=%v err=%v, want empty and nil", msgs, err)
+	if msgs, healthy, err = pollResult(kgo.Fetches{}, log); err != nil || !healthy || len(msgs) != 0 {
+		t.Fatalf("clean empty fetch: msgs=%v healthy=%v err=%v, want empty, healthy and nil", msgs, healthy, err)
 	}
 }

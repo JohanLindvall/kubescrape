@@ -15,6 +15,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
 
@@ -249,4 +250,68 @@ func TestTrimPodIsIdempotent(t *testing.T) {
 	if !reflect.DeepEqual(before, p) {
 		t.Error("trimPod is not idempotent: a second application changed the object")
 	}
+}
+
+// Every informer's transform must drop the annotations this API refuses to
+// serve, for the same reason trimPod drops the pod spec: kubemeta's filter runs
+// on the way OUT, so a cached last-applied-configuration is resident for the
+// process lifetime and can never be read by anything. On a kubectl- or
+// kapp-managed cluster it is the largest field on most objects.
+func TestTransformsDropUnservableAnnotations(t *testing.T) {
+	const applied = `{"apiVersion":"apps/v1","kind":"Deployment","spec":{"template":{"spec":{"containers":[{"env":[{"name":"TOKEN","value":"s3cret"}]}]}}}}`
+	meta := func() metav1.ObjectMeta {
+		return metav1.ObjectMeta{
+			Namespace: "prod", Name: "web",
+			Annotations: map[string]string{
+				"kubectl.kubernetes.io/last-applied-configuration": applied,
+				"kapp.k14s.io/original":                            applied,
+				"prometheus.io/scrape":                             "true",
+			},
+		}
+	}
+	check := func(t *testing.T, ann map[string]string) {
+		t.Helper()
+		for _, k := range []string{
+			"kubectl.kubernetes.io/last-applied-configuration",
+			"kapp.k14s.io/original",
+		} {
+			if _, ok := ann[k]; ok {
+				t.Errorf("%q cached by the informer transform; it is never served and never freed", k)
+			}
+		}
+		if ann["prometheus.io/scrape"] != "true" {
+			t.Errorf("the transform dropped an annotation the service reads: %v", ann)
+		}
+	}
+
+	// The owner/namespace/node/monitor informers: PartialObjectMetadata and
+	// unstructured alike, both through apimeta.Accessor.
+	pom := &metav1.PartialObjectMetadata{ObjectMeta: meta()}
+	out, err := stripManagedFields(pom)
+	if err != nil {
+		t.Fatal(err)
+	}
+	check(t, out.(*metav1.PartialObjectMetadata).Annotations)
+
+	u := &unstructured.Unstructured{Object: map[string]any{
+		"metadata": map[string]any{
+			"name": "sm", "namespace": "prod",
+			"annotations": map[string]any{
+				"kubectl.kubernetes.io/last-applied-configuration": applied,
+				"kapp.k14s.io/original":                            applied,
+				"prometheus.io/scrape":                             "true",
+			},
+		},
+	}}
+	if _, err := stripManagedFields(u); err != nil {
+		t.Fatal(err)
+	}
+	check(t, u.GetAnnotations())
+
+	// And the pod informer, which has its own transform.
+	p, err := trimPod(&corev1.Pod{ObjectMeta: meta()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	check(t, p.(*corev1.Pod).Annotations)
 }

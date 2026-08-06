@@ -24,6 +24,11 @@ type FileStatus struct {
 	Compressed  bool   `json:"compressed,omitempty"`
 	Segments    int    `json:"segments,omitempty"`
 	RateLimited bool   `json:"rateLimited,omitempty"`
+	// Stalled: the live tail is NOT being read because a rotated segment's
+	// replay has not finished (readFile's gate). Lag grows while it holds,
+	// nothing is lost, and the aggregate is kubescrape_log_segments_stalled —
+	// this field is which FILE.
+	Stalled bool `json:"stalled,omitempty"`
 }
 
 // Status returns the most recently published per-file snapshot (refreshed on
@@ -40,6 +45,7 @@ func (t *Tailer) Status() []FileStatus {
 func (t *Tailer) publishStatus() {
 	out := make([]FileStatus, 0, len(t.files))
 	var maxLag, totalLag int64
+	var stalled int
 	for _, f := range t.files {
 		if f.excluded {
 			continue // annotation opt-out: nothing is read, lag is not real
@@ -53,6 +59,10 @@ func (t *Tailer) publishStatus() {
 			Compressed:  f.compressed,
 			Segments:    len(f.segments),
 			RateLimited: f.limited,
+			Stalled:     len(f.segments) > 0 && !f.segmentsFed,
+		}
+		if fs.Stalled {
+			stalled++
 		}
 		if f.source != nil {
 			fs.Source = f.source.name
@@ -82,6 +92,7 @@ func (t *Tailer) publishStatus() {
 	slices.SortFunc(out, func(a, b FileStatus) int { return cmp.Compare(b.Lag, a.Lag) })
 	obs.LogLagMaxBytes.Set(float64(maxLag))
 	obs.LogLagTotalBytes.Set(float64(totalLag))
+	obs.LogSegmentsStalled.Set(float64(stalled))
 	t.status.Store(&out)
 	t.lastStatus = time.Now()
 }

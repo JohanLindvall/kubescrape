@@ -6,6 +6,8 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+	"github.com/JohanLindvall/kubescrape/pkg/kubemeta"
 )
 
 func TestFromPod(t *testing.T) {
@@ -209,3 +211,58 @@ func testCorePod() *corev1.Pod {
 		},
 	}
 }
+
+// previousIncarnation runs on the informer callback path, once per restarted
+// container per pod upsert. It clears StartedAt/FinishedAt/ExitCode and refills
+// them from lastState, so a clone that copies them first allocates up to three
+// values per call purely to discard them — invisible in behaviour and paid on
+// every update of every crash-looping pod in the cluster.
+//
+// The budget is what the result genuinely needs: its own Ports array plus the
+// three pointers fillTerminated sets.
+func TestPreviousIncarnationAllocationBudget(t *testing.T) {
+	if raceEnabled {
+		t.Skip("-race perturbs allocation counts")
+	}
+	const budget = 4
+	now := time.Unix(1_700_000_000, 0)
+	lastState := corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{
+		ContainerID: "containerd://appid1", ExitCode: 137,
+		StartedAt:  metav1.Time{Time: now.Add(-time.Hour)},
+		FinishedAt: metav1.Time{Time: now.Add(-time.Minute)},
+	}}
+	for _, tc := range []struct {
+		name  string
+		state corev1.ContainerState
+	}{
+		{"running", corev1.ContainerState{Running: &corev1.ContainerStateRunning{
+			StartedAt: metav1.Time{Time: now},
+		}}},
+		// A crash-looping container caught between restarts: the CURRENT state
+		// carries all three pointers, so all three were cloned and dropped.
+		{"terminated", corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{
+			ContainerID: "containerd://appid2", ExitCode: 1,
+			StartedAt: metav1.Time{Time: now}, FinishedAt: metav1.Time{Time: now},
+		}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			st := &corev1.ContainerStatus{
+				Name: "app", ContainerID: "containerd://appid2", RestartCount: 1,
+				State: tc.state, LastTerminationState: lastState,
+			}
+			c := convertContainer("app", "img",
+				[]corev1.ContainerPort{{Name: "http", ContainerPort: 8080}}, "container", st)
+			got := testing.AllocsPerRun(200, func() {
+				prev, _ := previousIncarnation(c, st)
+				prevSink = prev
+			})
+			if got > budget {
+				t.Errorf("previousIncarnation allocates %v times, want at most %d", got, budget)
+			}
+		})
+	}
+}
+
+// prevSink defeats the dead-store elimination that would let the budget above
+// hold vacuously.
+var prevSink kubemeta.Container

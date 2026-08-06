@@ -929,3 +929,59 @@ func TestRenderScratchDoesNotPinTheLabelsOfEvictedSeries(t *testing.T) {
 		}
 	}
 }
+
+// Clearing the tail's labels bounds the STRINGS but not the ARRAYS: every unused
+// slot keeps two bucket slices and two exemplar slices, and a cumagg.Exemplar is
+// 48 B — 24.3 MB still reachable after one burst to the 20000-series cap and a
+// mass stale eviction that left ONE series, 71% of it exemplars. The reuse is
+// worth having for the steady state, not for a peak the process saw once, so a
+// scratch that stays far under its capacity is rebuilt at the live size.
+func TestRenderScratchShrinksBackAfterACardinalityBurst(t *testing.T) {
+	const peak = 2000
+	now := time.Unix(1_700_000_000, 0)
+	r := NewRegistry(Config{MaxCardinality: peak + 8, StaleAfter: "1m"})
+	fixedClock(r, &now)
+	exp := &capExporter{}
+
+	for i := 0; i < peak; i++ {
+		r.Record(edge(fmt.Sprintf("client-%04d", i), "checkout"))
+	}
+	export(t, r, exp) // renders every series and marks them delivered
+	if cap(r.snap) < peak {
+		t.Fatalf("the scratch holds %d slots after rendering %d series", cap(r.snap), peak)
+	}
+	burstArrays := snapArrayCap(r)
+
+	// The whole burst goes stale and one series takes its place. Several export
+	// cycles, because the shrink is deliberately hysteretic: an oscillating
+	// workload must keep its capacity.
+	now = now.Add(10 * time.Minute)
+	for i := 0; i < snapShrinkRuns+1; i++ {
+		r.Record(edge("client-new", "checkout"))
+		export(t, r, exp)
+		now = now.Add(time.Second)
+	}
+
+	if got := r.store.Len(); got != 1 {
+		t.Fatalf("the store holds %d series after the eviction, want 1", got)
+	}
+	if got := cap(r.snap); got > peak/snapShrinkFactor {
+		t.Errorf("the scratch still holds %d slots for 1 live series", got)
+	}
+	if got := snapArrayCap(r); got > burstArrays/10 {
+		t.Errorf("the scratch retains %d bucket+exemplar slots (peak render: %d): the tail's arrays are still reachable", got, burstArrays)
+	}
+}
+
+// snapArrayCap totals the bucket and exemplar slots the whole scratch holds —
+// its capacity, not its current length, which is the memory that stays
+// reachable between renders.
+func snapArrayCap(r *Registry) int {
+	whole := r.snap[:cap(r.snap)]
+	n := 0
+	for i := range whole {
+		n += cap(whole[i].client.buckets) + cap(whole[i].server.buckets)
+		n += cap(whole[i].client.ex) + cap(whole[i].server.ex)
+	}
+	return n
+}

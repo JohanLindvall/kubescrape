@@ -7,13 +7,21 @@ import (
 	"github.com/JohanLindvall/kubescrape/internal/services"
 )
 
-// TestMonitorEmptyEndpointNoTarget: a ServiceMonitor endpoint that
-// declares NEITHER a port NAME nor a targetPort resolves against a service port
-// whose Name is "" (the common single-port-service case), silently producing a
-// scrape target. prometheus-operator cannot reference an unnamed port by name,
-// so it would generate no scrape config here; kubescrape diverges by matching
-// ""=="" in monitorPodPort (targets.go:164-165). A malformed/empty endpoint
-// should yield nothing.
+// TestMonitorEmptyEndpointNoTarget: a ServiceMonitor endpoint that declares
+// NEITHER a port NAME nor a targetPort would otherwise resolve against a
+// service port whose Name is "" (the common single-port-service case) by
+// matching ""=="" in monitorPodPort, silently producing a scrape target the
+// user never declared.
+//
+// prometheus-operator does something else again — and it is NOT "emits no
+// config", which this comment claimed for a while: its generateEndpointConfig
+// emits the port-name keep-relabeling only inside `if ep.Port != "" { } else if
+// ep.TargetPort != nil { }`, so with neither set it emits no port FILTER and
+// every port of every matching EndpointSlice becomes a target. kubescrape's
+// answer is narrower and deliberately kept — fabricating targets from a
+// malformed endpoint is the worse failure — but being narrower is a choice that
+// has to be VISIBLE, which is what the endpoint's "port(unset)" Ignored entry
+// (servicemonitors.noPortIgnored) is for.
 func TestMonitorEmptyEndpointNoTarget(t *testing.T) {
 	pod := basePod()
 	svc := &services.Service{

@@ -77,6 +77,7 @@ func (c *captureExporter) records() []plog.LogRecord {
 // discipline, applied to sequencing).
 type fakeSource struct {
 	polls     [][][]byte
+	polled    int
 	commits   int
 	committed chan struct{}
 	closed    bool
@@ -86,14 +87,17 @@ func newFakeSource(polls ...[][]byte) *fakeSource {
 	return &fakeSource{polls: polls, committed: make(chan struct{}, 16)}
 }
 
-func (f *fakeSource) poll(ctx context.Context) ([][]byte, error) {
+func (f *fakeSource) poll(ctx context.Context) ([][]byte, bool, error) {
 	if len(f.polls) == 0 {
 		<-ctx.Done()
-		return nil, ctx.Err()
+		return nil, false, ctx.Err()
 	}
 	p := f.polls[0]
 	f.polls = f.polls[1:]
-	return p, nil
+	f.polled++
+	// A nil poll stands for an errors-only fetch: no records, no error, and
+	// not healthy — see pollResult.
+	return p, p != nil, nil
 }
 
 func (f *fakeSource) commit(context.Context) error {
@@ -415,6 +419,25 @@ func TestReadyAfterFirstPoll(t *testing.T) {
 	case <-ready:
 	case <-time.After(2 * time.Second):
 		t.Fatal("ready was not signalled after the first poll")
+	}
+}
+
+// The readiness half of the scoped-fetch-error classification: an errors-only
+// fetch no longer fails the poll (a per-topic problem must not tear the group
+// down), so the gate has to be held closed by the poll's HEALTHY flag instead.
+// Otherwise an identity that can consume nothing reports ready and the
+// azure-eventhub gate stops meaning anything.
+func TestErrorOnlyPollDoesNotClearReadiness(t *testing.T) {
+	// Two errors-only fetches, then a real one.
+	src := newFakeSource(nil, nil, [][]byte{[]byte(logEnvelope)})
+	readyAfter := -1
+	r := newTestReader(Config{
+		Exporter: &captureExporter{},
+		Ready:    func() { readyAfter = src.polled },
+	}, src)
+	runUntilCommit(t, r, src)
+	if readyAfter != 3 {
+		t.Fatalf("ready fired after poll %d, want 3 — an errors-only fetch must leave the gate closed", readyAfter)
 	}
 }
 

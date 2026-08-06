@@ -1393,3 +1393,130 @@ func TestGoneDrainAccountsUnterminatedLineAtRealEOF(t *testing.T) {
 		t.Fatal("drained gone file did not settle")
 	}
 }
+
+// ledger.reset zeroes every segment's fedTo because it is written for the PURGE
+// case (a rewind discarded the buffered lines unemitted, so the replay must
+// start over from `committed`). reopen's non-carry arm reaches it through
+// newPipeline — but only AFTER stopPipeline, which DRAINS: the lines are in the
+// unflushed batch, not gone. With fedTo reset to zero the next sweep re-read
+// [committed, fedTo) and delivered every one of those records twice.
+//
+// Shape: a replay cut by the per-sweep byte budget, and then a rename rotation
+// of the tail while the replay is still unfinished.
+func TestRotationKeepsAnUnflushedReplayFeedFrontier(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+	path := filepath.Join(dir, logName)
+
+	// Three EQUAL-LENGTH lines, so a budget of exactly one line makes every
+	// replay pass stop on a line boundary (never through the overrun escape,
+	// which reads to EOF).
+	base := timeNowCRI() + " stdout F "
+	l1, l2, l3 := base+"seg-one__", base+"seg-two__", base+"seg-thr__"
+	rot := path + ".1"
+	writeLines(t, rot, l1, l2, l3)
+	rotIno := inodeOfPath(t, rot)
+	rst, err := os.Stat(rot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeLog(t, dir, timeNowCRI()+" stdout F tail-one")
+
+	pos := mustOpenPositions(t, filepath.Join(t.TempDir(), "pos.json"))
+	if err := pos.SetLogs(map[string]positions.LogPos{path: {
+		Offset: 0, Inode: inodeOfPath(t, path),
+		Pending: []positions.Prefix{{Inode: rotIno, From: 0, To: rst.Size()}},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+
+	exp := &fakeExporter{}
+	tl := driveTailer(dir, exp)
+	tl.cfg.Positions = pos
+	tl.cfg.MaxBytesPerSweep = len(l1) + 1 // one segment line per pass
+	tl.scanDir(tl.loadCheckpoints(), true)
+
+	// Nothing is flushed until the end, so the segment's `committed` stays at 0
+	// and only fedTo can keep the resumed pass off the lines already fed.
+	tl.sweep(ctx, true) // feeds l1; the tail stays gated
+	rotateAway(t, dir, 2)
+	writeLog(t, dir, timeNowCRI()+" stdout F tail-two")
+	tl.sweep(ctx, true) // feeds l2, then handles the rotation of the gated tail
+	tl.sweep(ctx, true) // resumes the replay
+	tl.flush(ctx)
+
+	for _, want := range []string{"seg-one__", "seg-two__"} {
+		n := 0
+		for _, r := range exp.get() {
+			if r == want {
+				n++
+			}
+		}
+		if n != 1 {
+			t.Fatalf("%q exported %d times: the rotation dropped the replay's feed frontier, so the "+
+				"resumed pass re-read lines already sitting in the unflushed batch (exported %v)",
+				want, n, exp.get())
+		}
+	}
+}
+
+// The tail-read gate is what keeps a rotated segment's replay ahead of the live
+// file: reading the tail with a segment still owed lets the joiner fuse
+// fragments across the gap into records no file ever contained. But
+// openSegmentSource deliberately does NOT retire a segment whose source is
+// still there and merely will not read — EACCES on the rotated file, EMFILE at
+// RLIMIT_NOFILE, EIO on a failing disk — so a PERSISTENT one of those turned
+// "records may mis-join" into "this file collects nothing, ever", with a Warn
+// repeating at sweep cadence as the only signal (obs.LogPrefixLost covers the
+// permanent give-up only). The gate is bounded now: past the bound the segment
+// is given up on exactly as an unrecoverable one is — counted, logged, retired
+// — which is also what lets the file resume.
+func TestUnreadableSegmentEventuallyReleasesTheTailGate(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+	path := filepath.Join(dir, logName)
+
+	rot := path + ".1"
+	writeLines(t, rot, timeNowCRI()+" stdout F rotated-line")
+	rotIno := inodeOfPath(t, rot)
+	rst, err := os.Stat(rot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeLog(t, dir, timeNowCRI()+" stdout F tail-one")
+
+	pos := mustOpenPositions(t, filepath.Join(t.TempDir(), "pos.json"))
+	if err := pos.SetLogs(map[string]positions.LogPos{path: {
+		Offset: 0, Inode: inodeOfPath(t, path),
+		Pending: []positions.Prefix{{Inode: rotIno, From: 0, To: rst.Size()}},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+
+	exp := &fakeExporter{}
+	tl := driveTailer(dir, exp)
+	tl.cfg.Positions = pos
+	tl.segmentStallLimit = 10 * time.Millisecond
+	tl.scanDir(tl.loadCheckpoints(), true)
+
+	f, ok := tl.files[path]
+	if !ok || len(f.segments) != 1 {
+		t.Fatal("setup: the checkpointed segment was not restored")
+	}
+	// Every read of this segment's source fails, for as long as the source
+	// exists: a write-only handle stands in for the EIO/EACCES/EMFILE class,
+	// which openSegmentSource classifies as transient and never gives up on.
+	wo, err := os.OpenFile(rot, os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = wo.Close() })
+	f.segments[0].fd = wo
+
+	lost := obs.LogPrefixLost.Value()
+	driveUntil(t, ctx, tl, func() bool { return slices.Contains(exp.get(), "tail-one") },
+		"the live tail collecting again once the unreadable segment is given up on")
+	if obs.LogPrefixLost.Value() <= lost {
+		t.Fatal("the abandoned segment's lines were not counted lost")
+	}
+}

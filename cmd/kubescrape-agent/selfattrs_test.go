@@ -214,34 +214,55 @@ func TestAgentSelfResourceNamespaceAtStartup(t *testing.T) {
 	}
 }
 
-// hostNetworkSelf decides whether os.Hostname() names the pod or the node, and
-// it must not claim hostNetwork on evidence it does not have: PID 1 is the
-// HOST's init only under hostPID, which no shipped manifest sets, and in the
-// image the agent IS pid 1 — so the comparison is self-vs-self and read every
-// pod as hostNetwork. That cost an ordinary pod without $POD_NAME the hostname
-// fallback, which is exactly the case the fallback exists for.
-func TestHostNetworkSelfNeedsProofPidOneIsSomebodyElse(t *testing.T) {
-	shared := func(string) (string, error) { return "net:[4026531840]", nil }
-	if hostNetworkProc(1, shared) {
-		t.Error("comparing pid 1's namespace with our own, as pid 1, must be inconclusive")
+// The hostname names the pod for an ordinary pod and the NODE for a
+// hostNetwork one, and the node name is what tells them apart. The /proc
+// comparison this replaced asked whether pid 1 shares our network namespace,
+// which every realistic non-hostPID way of not being pid 1 answers yes to —
+// shareProcessNamespace's pause container and an init wrapper (tini,
+// dumb-init, a shell entrypoint) are both in the POD's namespace — so it read
+// EVERY pod as hostNetwork and cost each one the by-name fallback: a singleton
+// or shard then took the node as its service.instance.id and collided with that
+// node's DaemonSet agent.
+func TestPodHostnameRejectsOnlyTheNodesOwnName(t *testing.T) {
+	for _, tc := range []struct{ name, hostname, node, want string }{
+		{"an ordinary pod", "kubescrape-agent-xyz", "node1", "kubescrape-agent-xyz"},
+		{"hostNetwork: the hostname IS the node", "node1", "node1", ""},
+		{"case differences are still the node", "Node1", "node1", ""},
+		// A kubelet whose --hostname-override differs from the registered node
+		// name keeps the hostname: the lookup 404s and is reported, where a wrong
+		// "hostNetwork" would silently skip it.
+		{"a hostname the node name does not match", "node1.internal", "node1", "node1.internal"},
+		{"no node name to compare against", "node1", "", "node1"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := podHostname(tc.hostname, tc.node); got != tc.want {
+				t.Fatalf("podHostname(%q, %q) = %q, want %q", tc.hostname, tc.node, got, tc.want)
+			}
+		})
 	}
-	if !hostNetworkProc(42, shared) {
-		t.Error("a namespace shared with a DISTINCT pid 1 is the hostNetwork signal")
-	}
+}
 
-	own := func(p string) (string, error) {
-		if p == "/proc/1/ns/net" {
-			return "net:[4026531840]", nil
-		}
-		return "net:[4026532567]", nil
+// The same rule through selfPodName, which is what the resolver calls: with no
+// $POD_NAME, this process's real hostname is a pod name unless it is the node's.
+func TestSelfPodNameUsesTheHostnameUnlessItIsTheNode(t *testing.T) {
+	t.Setenv("POD_NAME", "")
+	host, err := os.Hostname()
+	if err != nil {
+		t.Skip("no hostname")
 	}
-	if hostNetworkProc(42, own) {
-		t.Error("a namespace of our own is not hostNetwork")
-	}
+	defer func(n string) { *nodeName = n }(*nodeName)
 
-	denied := func(string) (string, error) { return "", os.ErrPermission }
-	if hostNetworkProc(42, denied) {
-		t.Error("an unreadable /proc must keep the hostname fallback, not claim hostNetwork")
+	*nodeName = "some-other-node"
+	if got := selfPodName(); got != host {
+		t.Fatalf("selfPodName() = %q; want the hostname %q — an ordinary pod's name", got, host)
+	}
+	*nodeName = host
+	if got := selfPodName(); got != "" {
+		t.Fatalf("selfPodName() = %q; a hostNetwork pod's hostname is the NODE's and must not be looked up as a pod", got)
+	}
+	t.Setenv("POD_NAME", "kubescrape-agent-xyz")
+	if got := selfPodName(); got != "kubescrape-agent-xyz" {
+		t.Fatalf("selfPodName() = %q; $POD_NAME is authoritative wherever it is wired", got)
 	}
 }
 

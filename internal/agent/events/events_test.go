@@ -27,16 +27,25 @@ import (
 )
 
 // captureExporter records exported payloads; failN fails the first N sends.
+// calls counts every attempt, failed ones included.
 type captureExporter struct {
 	mu    sync.Mutex
 	sent  []plog.Logs
+	calls int
 	failN int
 	err   error
+}
+
+func (c *captureExporter) attempts() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.calls
 }
 
 func (c *captureExporter) ExportLogs(_ context.Context, ld plog.Logs) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	c.calls++
 	if c.failN > 0 {
 		c.failN--
 		return c.err
@@ -74,6 +83,18 @@ func (f fakeMeta) PodByName(context.Context, string, string) (*kubemeta.Pod, err
 		return nil, context.Canceled
 	}
 	return f.pod, nil
+}
+
+// countingMeta is fakeMeta with a lookup counter; the count is also the number
+// of resources built, since the resolve is the first thing a build does.
+type countingMeta struct {
+	pod   *kubemeta.Pod
+	calls int
+}
+
+func (m *countingMeta) PodByName(context.Context, string, string) (*kubemeta.Pod, error) {
+	m.calls++
+	return m.pod, nil
 }
 
 func event(name, reason, msg, typ string, rv string, count int32, when time.Time) *corev1.Event {
@@ -1010,18 +1031,26 @@ func TestRetainedBatchIsBoundedDuringOutage(t *testing.T) {
 	before := obs.EventsOverflowDropped.Value()
 
 	limit := r.retainCap()
-	const over = 25
-	for i := 0; i < limit+over; i++ {
-		// Flush attempts past BatchSize fail transiently; the stream would
-		// restart on them, which is exactly the retention path under test.
-		_ = r.handle(ctx, watch.Event{Type: watch.Added,
-			Object: event(fmt.Sprintf("e%d", i), "R", "m", "Normal", strconv.Itoa(100+i), 1, now)})
+	over := 2*shedChunk + 25
+	total := limit + over
+	for i := 0; i < total; i++ {
+		// Flush attempts past BatchSize fail transiently; the batch is retained
+		// for the retry, which is exactly the retention path under test.
+		if err := r.handle(ctx, watch.Event{Type: watch.Added,
+			Object: event(fmt.Sprintf("e%d", i), "R", "m", "Normal", strconv.Itoa(100+i), 1, now)}); err != nil {
+			t.Fatalf("handle returned %v — a failed export must not surface as a stream failure", err)
+		}
 	}
-	if len(r.batch) != limit {
-		t.Fatalf("batch=%d, want capped at %d", len(r.batch), limit)
+	if len(r.batch) > limit {
+		t.Fatalf("batch=%d, want at most the cap %d", len(r.batch), limit)
 	}
-	if got := obs.EventsOverflowDropped.Value() - before; got != over {
-		t.Fatalf("overflow-dropped=%v, want %d — the loss must be counted", got, over)
+	dropped := int(obs.EventsOverflowDropped.Value() - before)
+	if dropped+len(r.batch) != total {
+		t.Fatalf("dropped=%d + retained=%d != ingested=%d — the loss must be counted exactly", dropped, len(r.batch), total)
+	}
+	// Shedding a run costs at most one chunk more than the strict surplus.
+	if dropped < over || dropped >= over+shedChunk {
+		t.Fatalf("dropped=%d, want in [%d,%d)", dropped, over, over+shedChunk)
 	}
 	// The rendered prefix survives (its entries are in the retained payload,
 	// not lost) and the newest entries survive (drop-oldest); the shed range
@@ -1029,12 +1058,13 @@ func TestRetainedBatchIsBoundedDuringOutage(t *testing.T) {
 	if r.batch[0].rv != "100" {
 		t.Fatalf("prefix rv=%q, want 100 — shedding inside the rendered prefix orphans the payload", r.batch[0].rv)
 	}
-	if got, want := r.batch[len(r.batch)-1].rv, strconv.Itoa(100+limit+over-1); got != want {
+	if got, want := r.batch[len(r.batch)-1].rv, strconv.Itoa(100+total-1); got != want {
 		t.Fatalf("newest rv=%q, want %s retained", got, want)
 	}
 
 	// Recovery: everything retained ships exactly once and the position lands
 	// on the newest entry — the shed range cost nothing extra.
+	retained := len(r.batch)
 	exp.mu.Lock()
 	exp.failN = 0
 	exp.mu.Unlock()
@@ -1043,10 +1073,240 @@ func TestRetainedBatchIsBoundedDuringOutage(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if got := len(exp.records()); got != limit {
-		t.Fatalf("exported %d records, want %d (the cap's worth, each exactly once)", got, limit)
+	if got := len(exp.records()); got != retained {
+		t.Fatalf("exported %d records, want the %d retained, each exactly once", got, retained)
 	}
-	if got, want := r.committed.ResourceVersion, strconv.Itoa(100+limit+over-1); got != want {
+	if got, want := r.committed.ResourceVersion, strconv.Itoa(100+total-1); got != want {
 		t.Fatalf("committed=%q, want %s", got, want)
+	}
+}
+
+// One shed must drop a RUN. Dropping exactly one entry per admitted event made
+// the shed O(batch): at the cap EVERY event sheds, and each shed memmoved the
+// whole post-prefix tail (measured 47.5 µs against 2.8 µs below the cap,
+// 1.18 MB moved per event). That was masked while a failed export tore the
+// watch down and throttled arrivals to one per backoff; with the watch held
+// open it is the binding cost.
+func TestShedDropsARunSoTheMemmoveAmortises(t *testing.T) {
+	exp := &captureExporter{failN: 1 << 30, err: context.DeadlineExceeded}
+	r, _, _ := newReader(t, Config{Exporter: exp, BatchSize: 100})
+	ctx := context.Background()
+	now := time.Now()
+	before := obs.EventsOverflowDropped.Value()
+
+	limit := r.retainCap()
+	// Fewer over-cap events than one chunk: a per-event shed drops exactly
+	// this many, a chunked shed drops a whole chunk once.
+	over := shedChunk / 2
+	for i := 0; i < limit+over; i++ {
+		if err := r.handle(ctx, watch.Event{Type: watch.Added,
+			Object: event(fmt.Sprintf("e%d", i), "R", "m", "Normal", strconv.Itoa(100+i), 1, now)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	dropped := int(obs.EventsOverflowDropped.Value() - before)
+	if dropped < shedChunk {
+		t.Fatalf("dropped=%d after %d over-cap admissions, want a whole chunk (%d): one entry per event memmoves the tail per event",
+			dropped, over, shedChunk)
+	}
+	if len(r.batch) > limit {
+		t.Fatalf("batch=%d, want at most the cap %d", len(r.batch), limit)
+	}
+}
+
+// The cap's floor exists so the count-triggered flush stays reachable however
+// BatchSize is tuned — but -events-batch-size has no upper bound, so an
+// unfloored max() let it repeal the memory bound outright (100000 => ~400 MB
+// retained at the measured ~2 KB per entry, against a 256Mi limit).
+func TestRetainCapIsBoundedHoweverBatchSizeIsTuned(t *testing.T) {
+	for _, batchSize := range []int{1, 100, 512, 8192, 100000} {
+		r, _, _ := newReader(t, Config{BatchSize: batchSize})
+		got := r.retainCap()
+		if got < maxRetained {
+			t.Errorf("BatchSize=%d: cap=%d, want at least %d", batchSize, got, maxRetained)
+		}
+		if got > maxRetainedCeiling {
+			t.Errorf("BatchSize=%d: cap=%d exceeds the ceiling %d — the cap is no longer a memory bound",
+				batchSize, got, maxRetainedCeiling)
+		}
+	}
+}
+
+// A transient export failure is a FLUSH failure, not a STREAM failure. It used
+// to propagate handle -> stream and tear down the API-server watch; past
+// BatchSize the batch is retained, so the condition held forever and every
+// subsequent event bought another failing export and another teardown. Only
+// one event was handled per round, so seenRV fell behind the cluster's event
+// rate, aged out of the watch window within minutes, and the Gone expired into
+// a relist a cold reader cannot take — the whole gap discarded, counted only
+// by a metric whose name asserts a relist that did not happen.
+func TestExportFailureKeepsTheWatchOpen(t *testing.T) {
+	exp := &captureExporter{failN: 1 << 30, err: context.DeadlineExceeded}
+	// FlushInterval an hour: the only export attempts are the count-triggered
+	// ones, so the pacing is observable.
+	r, _, _ := newReader(t, Config{Exporter: exp, BatchSize: 2, FlushInterval: time.Hour})
+	ctx := context.Background()
+	now := time.Now()
+
+	const n = 10
+	for i := 0; i < n; i++ {
+		if err := r.handle(ctx, watch.Event{Type: watch.Added,
+			Object: event(fmt.Sprintf("e%d", i), "R", "m", "Normal", strconv.Itoa(100+i), 1, now)}); err != nil {
+			t.Fatalf("event %d: handle returned %v; stream() turns that into a watch teardown", i, err)
+		}
+	}
+	// The watch is still the reader's position: seenRV tracks the stream even
+	// though nothing has been acked.
+	if want := strconv.Itoa(100 + n - 1); r.seenRV != want {
+		t.Fatalf("seenRV=%q, want %s — the reader must keep tracking the live stream while the collector is down", r.seenRV, want)
+	}
+	if len(r.batch) != n {
+		t.Fatalf("batch=%d, want all %d retained for the retry", len(r.batch), n)
+	}
+	if r.committed.ResourceVersion != "" {
+		t.Fatalf("committed=%q, want nothing committed — no export succeeded", r.committed.ResourceVersion)
+	}
+	// And the retry is PACED: one attempt, not one per event past BatchSize.
+	if got := exp.attempts(); got != 1 {
+		t.Fatalf("export attempts=%d, want 1 per FlushInterval — a batch parked at BatchSize must not re-export per event", got)
+	}
+
+	// Recovery goes through the same door.
+	exp.mu.Lock()
+	exp.failN = 0
+	exp.mu.Unlock()
+	for len(r.batch) > 0 {
+		if err := r.flush(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got, want := r.committed.ResourceVersion, strconv.Itoa(100+n-1); got != want {
+		t.Fatalf("committed=%q, want %s once the collector recovered", got, want)
+	}
+	if got := len(exp.records()); got != n {
+		t.Fatalf("exported %d records, want all %d, each exactly once", got, n)
+	}
+}
+
+// logchain.Groups.Get fills a group's resource from the FIRST entry that lands
+// in it, so a resource built per EVENT was discarded unread for every repeat —
+// and repeats dominate here by construction, since Kubernetes aggregates
+// recurrences into one object re-sent as Modified. Retained heap was flat in
+// the number of distinct involved objects, which is the tell.
+func TestResourceIsBuiltOncePerInvolvedObject(t *testing.T) {
+	meta := &countingMeta{pod: &kubemeta.Pod{Name: "web-abc", Namespace: "default", UID: "pod-uid"}}
+	r, _, _ := newReader(t, Config{Meta: meta, BatchSize: 1000})
+	ctx := context.Background()
+	now := time.Now()
+
+	// 50 occurrences of the same event object (the "BackOff x47" shape).
+	for i := 0; i < 50; i++ {
+		e := event("a", "BackOff", "back-off", "Warning", strconv.Itoa(100+i), int32(i+1), now)
+		if err := r.handle(ctx, watch.Event{Type: watch.Modified, Object: e}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if meta.calls != 1 {
+		t.Fatalf("resolved the involved pod %d times for 50 occurrences of one object, want 1", meta.calls)
+	}
+	// A different involved object is a different resource.
+	e := event("b", "Pulled", "pulled", "Normal", "200", 1, now)
+	e.InvolvedObject.Name = "web-def"
+	e.InvolvedObject.UID = "pod-uid-2"
+	if err := r.handle(ctx, watch.Event{Type: watch.Added, Object: e}); err != nil {
+		t.Fatal(err)
+	}
+	if meta.calls != 2 {
+		t.Fatalf("meta lookups = %d, want 2 (one per distinct involved object)", meta.calls)
+	}
+	// The payload still groups per object, with the identity intact.
+	ld := r.convert()
+	if got := ld.ResourceLogs().Len(); got != 2 {
+		t.Fatalf("resource groups = %d, want 2", got)
+	}
+	if got := ld.LogRecordCount(); got != 51 {
+		t.Fatalf("records = %d, want 51", got)
+	}
+
+	// The memo is per BATCH: a settled batch must not keep resolving from it.
+	if err := r.flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if len(r.resCache) != 0 {
+		t.Fatalf("resCache holds %d entries after the batch settled", len(r.resCache))
+	}
+}
+
+// recordingStore records whether the context Save ran on was already expired.
+type recordingStore struct {
+	saved   Position
+	savedAt error
+	calls   int
+}
+
+func (s *recordingStore) Load(context.Context) (Position, bool, error) { return Position{}, false, nil }
+
+func (s *recordingStore) Save(ctx context.Context, pos Position) error {
+	s.calls++
+	s.savedAt = ctx.Err()
+	s.saved = pos
+	return ctx.Err()
+}
+
+// budgetBurner fails transiently while the reader is live (so nothing settles
+// before the shutdown) and, on the DEADLINED shutdown context, consumes the
+// whole budget before succeeding — the shape of an exporter whose retries fill
+// it. live signals the first live attempt, which proves the event reached the
+// batch without the test racing the reader's own fields.
+type budgetBurner struct{ live chan struct{} }
+
+func (b *budgetBurner) ExportLogs(ctx context.Context, _ plog.Logs) error {
+	if _, deadlined := ctx.Deadline(); !deadlined {
+		select {
+		case b.live <- struct{}{}:
+		default:
+		}
+		return context.DeadlineExceeded
+	}
+	<-ctx.Done()
+	return nil
+}
+
+// The final flush and the final position write shared ONE deadline, so the
+// exporter's retries could spend all of it and leave persist a Get+Update on
+// an expired context that failed instantly — the successor then replayed up to
+// PersistInterval of events at exactly the handover the ConfigMap position
+// exists for.
+func TestShutdownPersistGetsItsOwnDeadline(t *testing.T) {
+	store := &recordingStore{}
+	exp := &budgetBurner{live: make(chan struct{}, 1)}
+	r, _, w := newReader(t, Config{
+		Exporter:   exp,
+		Positions:  store,
+		StopBudget: 300 * time.Millisecond,
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { r.Run(ctx); close(done) }()
+
+	w.Add(event("a", "R", "m", "Normal", "42", 1, time.Now()))
+	select {
+	case <-exp.live: // the event is in the batch
+	case <-time.After(5 * time.Second):
+		cancel()
+		<-done
+		t.Fatal("timed out waiting for the first export attempt")
+	}
+	cancel()
+	<-done
+
+	if store.calls == 0 {
+		t.Fatal("the final position was never written")
+	}
+	if store.savedAt != nil {
+		t.Fatalf("persist ran on an expired context (%v): the flush spent the whole shutdown budget", store.savedAt)
+	}
+	if store.saved.ResourceVersion != "42" {
+		t.Fatalf("saved position = %q, want 42", store.saved.ResourceVersion)
 	}
 }

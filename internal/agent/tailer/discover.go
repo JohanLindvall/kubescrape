@@ -164,10 +164,43 @@ func parseFileName(name string) (containerID, namespace string, ok bool) {
 		return "", "", false
 	}
 	containerID = name[i+1:]
-	if parts := strings.Split(name[:i], "_"); len(parts) == 3 {
-		namespace = parts[1]
+	// <pod>_<namespace>_<container>: exactly two underscores. Two Cuts rather
+	// than strings.Split, which allocates a three-element slice for every
+	// globbed file on every discovery pass.
+	if _, rest, ok := strings.Cut(name[:i], "_"); ok {
+		if ns, container, ok := strings.Cut(rest, "_"); ok && strings.IndexByte(container, '_') < 0 {
+			namespace = ns
+		}
 	}
 	return containerID, namespace, true
+}
+
+// scanSets are the two INDEPENDENT proofs one discovery pass accumulates.
+//
+// seen is presence: the path was listed AND stat succeeded (or the file was
+// deliberately claimed-and-skipped). It is what clears a tracked file of the
+// gone flag and what keeps it from being set.
+//
+// unproven is "listed, but the stat failed" — an ENOENT (a rename rotation
+// caught between the readdir and the stat), an EIO, an EACCES. It protects the
+// STORED checkpoint from being pruned, and nothing else.
+//
+// They are separate because the two consumers need different proofs. Pruning a
+// checkpoint entry is destructive and irreversible (a recreated path would read
+// from zero and its Pending prefixes — initFile's only route back to a rotated
+// inode's unshipped tail — are gone), so it demands proven absence. Gone-marking
+// a TRACKED file is neither: the sweep re-stats the path and resurrects it if it
+// is back, and until then the file's remaining bytes are drained from the fd we
+// already hold. Conflating them into one set meant an unstattable path suppressed
+// gone-marking too — and for the primary shape this tailer tracks that is not a
+// transient at all: /var/log/containers/*.log are SYMLINKS, the readdir-based
+// glob lists a dangling one forever while os.Stat follows it and returns ENOENT
+// forever, so such a file was never released — fd, unlinked inode, files-map
+// entry and checkpoint entry pinned for the process lifetime with nothing logged
+// and no counter moving.
+type scanSets struct {
+	seen     map[string]struct{}
+	unproven map[string]struct{}
 }
 
 // scanDir discovers new and removed log files across all sources by globbing
@@ -187,7 +220,7 @@ func (t *Tailer) scanDir(checkpoints map[string]checkpoint, initial bool) {
 			src.startingUp = true
 		}
 	}
-	seen := make(map[string]struct{})
+	sets := scanSets{seen: make(map[string]struct{}), unproven: make(map[string]struct{})}
 	discovered := false
 	listingOK := true
 	defer func() {
@@ -205,13 +238,13 @@ func (t *Tailer) scanDir(checkpoints map[string]checkpoint, initial bool) {
 			listingOK = false // a failed glob proves nothing about absent files
 		}
 		for _, path := range paths {
-			if _, done := seen[path]; done {
+			if _, done := sets.seen[path]; done {
 				continue // an earlier source already claimed this file
 			}
 			if src.excluded(path) {
 				continue // the include match is implied: path came from src.glob()
 			}
-			if t.claimPath(src, path, seen) {
+			if t.claimPath(src, path, &sets) {
 				discovered = true
 			}
 		}
@@ -231,7 +264,7 @@ func (t *Tailer) scanDir(checkpoints map[string]checkpoint, initial bool) {
 	// drop its stored offset.
 	if listingOK {
 		for path, f := range t.files {
-			if _, ok := seen[path]; !ok {
+			if _, ok := sets.seen[path]; !ok {
 				f.gone = true
 			}
 		}
@@ -241,10 +274,18 @@ func (t *Tailer) scanDir(checkpoints map[string]checkpoint, initial bool) {
 		// applied to a recreated path — that would skip its first bytes as
 		// though they had shipped. (Keeping the two in lockstep is what makes a
 		// scan-then-save sequence idempotent.)
+		//
+		// This is the ONE consumer the unproven set feeds: a path the glob
+		// listed and the stat could not answer for is not proven absent, and
+		// pruning is the destructive, irreversible half (see scanSets).
 		for path := range t.checkpoints {
-			if _, ok := seen[path]; !ok {
-				delete(t.checkpoints, path)
+			if _, ok := sets.seen[path]; ok {
+				continue
 			}
+			if _, ok := sets.unproven[path]; ok {
+				continue
+			}
+			delete(t.checkpoints, path)
 		}
 	}
 	// Publish THIS scan's verdict before anything can save. It used to be set
@@ -305,21 +346,31 @@ func (s *compiledSource) deniesNamespace(ns string) bool {
 // unparseable CRI name — a later catch-all source must not resurrect it),
 // already tracked (unmark a raced gone flag), or newly discovered. It reports
 // whether a NEW file was tracked.
-func (t *Tailer) claimPath(src *compiledSource, path string, seen map[string]struct{}) bool {
+func (t *Tailer) claimPath(src *compiledSource, path string, sets *scanSets) bool {
+	if known, ok := t.files[path]; ok && known.swept() {
+		// Tracked, open and read by EVERY sweep, which stats this same path
+		// itself and marks the file gone when that stat says ENOENT — so the
+		// stat below would buy nothing here and cost one symlink resolution per
+		// tracked file per pass (~7µs against ~2µs for an fstat), on a pass that
+		// also runs synchronously from every create/remove event in a scan dir,
+		// where its duration is time the fsnotify channel is not drained.
+		// Everything the sweep does NOT stat — unresolved, annotation-excluded,
+		// idle-closed, compressed, already gone — falls through and is stat'd.
+		sets.seen[path] = struct{}{}
+		return false
+	}
 	if st, err := os.Stat(path); err != nil || !st.Mode().IsRegular() {
-		// A stat failure must not mark the path gone: drop would delete its
-		// stored offset, and a rediscovery would then re-ingest the whole
-		// file from zero. Only proven absence may — and a stat here proves
-		// none. An ENOENT is a path the glob JUST LISTED vanishing between
-		// the two syscalls, i.e. a rename rotation caught mid-scan: pruning
-		// its not-yet-consumed checkpoint entry then would make a recreated
-		// path read from zero AND destroy the Pending prefixes that are
-		// initFile's only route back to the rotated inode's unshipped tail.
-		// A non-ENOENT error (EIO, EACCES, ELOOP) proves nothing either.
-		// Either way, the next scan's own listing — which will not glob a
-		// genuinely absent path at all — is the proof that prunes.
+		// An unstattable path is not a proven-absent one: an ENOENT is a path
+		// the glob JUST LISTED vanishing between the two syscalls, i.e. a
+		// rename rotation caught mid-scan, and EIO/EACCES/ELOOP prove nothing
+		// either. Record it as unproven so the checkpoint prune spares it —
+		// pruning a not-yet-consumed entry would make a recreated path read
+		// from zero AND destroy the Pending prefixes that are initFile's only
+		// route back to the rotated inode's unshipped tail. Gone-marking a
+		// TRACKED file is a separate, recoverable decision and deliberately NOT
+		// suppressed here (see scanSets).
 		if err != nil {
-			seen[path] = struct{}{}
+			sets.unproven[path] = struct{}{}
 		}
 		// Non-regular files (FIFOs, sockets, devices) are never tracked:
 		// open(2)/read(2) on a FIFO block indefinitely and would wedge the
@@ -338,7 +389,7 @@ func (t *Tailer) claimPath(src *compiledSource, path string, seen map[string]str
 			// said not to tail, and the case that matters is the observability
 			// feedback loop (the agent tails the collector's namespace and
 			// amplifies precisely when the collector is struggling).
-			seen[path] = struct{}{}
+			sets.seen[path] = struct{}{}
 			return false
 		}
 		if ok && !src.wantNamespace(namespace) {
@@ -360,12 +411,12 @@ func (t *Tailer) claimPath(src *compiledSource, path string, seen map[string]str
 			// and a later source exporting the raw CRI lines would defeat it.
 			// A source's own excludeNamespaces claims-and-skips above for the
 			// same reason. Either way the file is never opened, tracked or read.
-			seen[path] = struct{}{}
+			sets.seen[path] = struct{}{}
 			return false
 		}
 		id = cid
 	}
-	seen[path] = struct{}{}
+	sets.seen[path] = struct{}{}
 	if known, ok := t.files[path]; ok {
 		// A previous listing may have raced a rename+recreate rotation (the
 		// path momentarily absent between the two syscalls) and marked the
@@ -406,19 +457,27 @@ func (t *Tailer) initFile(f *file) {
 		f.committed = cp.Offset
 		f.inode = cp.Inode
 		f.fp = fingerprint{Len: cp.FingerprintLen, Hash: cp.FingerprintHash}
-		for _, pp := range cp.Pending {
-			// Uncommitted rotated-away ranges at shutdown/crash: re-read from
-			// the rotated files (oldest first) before this (new) inode is
-			// consumed. segmentsFed is already false. Ids are per-process:
-			// issue them in list order, below the tail id issued afterwards.
-			f.segSeq++
-			f.segments = append(f.segments, &segment{
-				id:        f.segSeq,
-				inode:     pp.Inode,
-				fp:        fingerprint{Len: pp.FingerprintLen, Hash: pp.FingerprintHash},
-				committed: pp.From,
-				to:        pp.To,
-			})
+		// Segments belong to the incremental path only, exactly like the
+		// open-ended synthesis below: readArchive never calls feedSegments, so a
+		// segment restored onto a COMPRESSED file is owed forever — settledGone
+		// can never be true and saveCheckpoints rewrites the stale Pending list
+		// on every save for the life of the process. (Reachable when a path with
+		// Pending entries is later matched by a `compressed: true` source.)
+		if !f.compressed {
+			for _, pp := range cp.Pending {
+				// Uncommitted rotated-away ranges at shutdown/crash: re-read from
+				// the rotated files (oldest first) before this (new) inode is
+				// consumed. segmentsFed is already false. Ids are per-process:
+				// issue them in list order, below the tail id issued afterwards.
+				f.segSeq++
+				f.segments = append(f.segments, &segment{
+					id:        f.segSeq,
+					inode:     pp.Inode,
+					fp:        fingerprint{Len: pp.FingerprintLen, Hash: pp.FingerprintHash},
+					committed: pp.From,
+					to:        pp.To,
+				})
+			}
 		}
 		// A rotation that happened while the agent was DOWN: the path now
 		// names a DIFFERENT incarnation than the checkpoint. The checkpointed

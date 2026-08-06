@@ -110,8 +110,8 @@ func TestSecretReaderTTLsDiffer(t *testing.T) {
 func TestSecretReaderFailureDoesNotOverwriteALiveSuccess(t *testing.T) {
 	r := &k8sSecretReader{}
 	now := time.Now()
-	r.remember("ns/tok/token", secretCacheEntry{value: "v", fetched: now})
-	r.remember("ns/tok/token", secretCacheEntry{err: errors.New("transient"), fetched: now.Add(time.Second)})
+	r.remember(secretCacheKey("ns", "tok", "token"), secretCacheEntry{value: "v", fetched: now})
+	r.remember(secretCacheKey("ns", "tok", "token"), secretCacheEntry{err: errors.New("transient"), fetched: now.Add(time.Second)})
 
 	val, err := r.Get(context.Background(), "ns", "tok", "token")
 	if err != nil {
@@ -124,8 +124,8 @@ func TestSecretReaderFailureDoesNotOverwriteALiveSuccess(t *testing.T) {
 	// A success still replaces a cached failure — recovery must not wait out
 	// the failure TTL when the value is already in hand.
 	r = &k8sSecretReader{}
-	r.remember("ns/tok/token", secretCacheEntry{err: errors.New("transient"), fetched: now})
-	r.remember("ns/tok/token", secretCacheEntry{value: "v", fetched: now})
+	r.remember(secretCacheKey("ns", "tok", "token"), secretCacheEntry{err: errors.New("transient"), fetched: now})
+	r.remember(secretCacheKey("ns", "tok", "token"), secretCacheEntry{value: "v", fetched: now})
 	if val, err := r.Get(context.Background(), "ns", "tok", "token"); err != nil || val != "v" {
 		t.Fatalf("Get = %q, %v; a success must displace a cached failure", val, err)
 	}
@@ -147,5 +147,22 @@ func TestSecretReaderCachedKeyMissStaysMatchable(t *testing.T) {
 	}
 	if calls != 1 {
 		t.Errorf("API-server GETs = %d, want 1", calls)
+	}
+}
+
+// The reader's cache key must be unambiguous for the same reason the
+// /v1/scrape-auth allowlist key must be: a "/" join lets two distinct triples
+// render identically, and this cache is what a repeated scrape-auth lookup
+// reads INSTEAD of the API server — so a collision serves one monitor's
+// credential for another's ref.
+func TestSecretCacheKeyIsUnambiguous(t *testing.T) {
+	for _, pair := range [][2][3]string{
+		{{"a/b", "c", "d"}, {"a", "b/c", "d"}},
+		{{"ns", "tok/x", "y"}, {"ns", "tok", "x/y"}},
+	} {
+		if k1, k2 := secretCacheKey(pair[0][0], pair[0][1], pair[0][2]),
+			secretCacheKey(pair[1][0], pair[1][1], pair[1][2]); k1 == k2 {
+			t.Errorf("%v and %v share the cache key %q", pair[0], pair[1], k1)
+		}
 	}
 }

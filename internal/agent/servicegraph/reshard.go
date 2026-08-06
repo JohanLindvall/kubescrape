@@ -357,6 +357,28 @@ type reshardCounters struct {
 	loopsBlocked   atomic.Uint64
 }
 
+// disabledCounters is the counter block of the NIL Resharder — the (nil, nil)
+// NewResharder returns for a disabled section, which is not an edge case but the
+// single-shard tier: `-service-graph` with no serviceGraphShards, the simplest
+// way to run the tier and the one every chart-less deployment runs. Every method
+// here is nil-receiver safe because of it, and one that answered a nil receiver
+// by dropping its tally froze all five kubescrape_service_graph_* series at zero
+// for exactly that topology.
+//
+// Package-level is exact rather than a compromise: "no resharder" is ONE thing
+// per process (the wiring builds at most one), so unlike instance state moved
+// out of globals elsewhere in this repo there is nothing here for two owners to
+// merge.
+var disabledCounters reshardCounters
+
+// tally is the block to bump. See disabledCounters for why nil has one.
+func (r *Resharder) tally() *reshardCounters {
+	if r == nil {
+		return &disabledCounters
+	}
+	return &r.counters
+}
+
 // ReshardStats is a snapshot of the resharder's counters. The wire-level outcome
 // of each hop is already counted by otlpexport
 // (kubescrape_export_requests_total{signal="traces"}); these are the numbers only
@@ -463,15 +485,13 @@ func (r *Resharder) Ring() *Ring { return r.ring }
 
 // Stats snapshots the counters.
 func (r *Resharder) Stats() ReshardStats {
-	if r == nil {
-		return ReshardStats{}
-	}
+	c := r.tally()
 	return ReshardStats{
-		SpansForwarded: r.counters.spansForwarded.Load(),
-		SpansLocal:     r.counters.spansLocal.Load(),
-		SpansUnkeyed:   r.counters.spansUnkeyed.Load(),
-		SendsFailed:    r.counters.sendsFailed.Load(),
-		LoopsBlocked:   r.counters.loopsBlocked.Load(),
+		SpansForwarded: c.spansForwarded.Load(),
+		SpansLocal:     c.spansLocal.Load(),
+		SpansUnkeyed:   c.spansUnkeyed.Load(),
+		SendsFailed:    c.sendsFailed.Load(),
+		LoopsBlocked:   c.loopsBlocked.Load(),
 	}
 }
 
@@ -489,10 +509,10 @@ func (r *Resharder) Stats() ReshardStats {
 // sending SHARD rather than to any application. The refusal is PERMANENT, so the
 // payload is neither re-sharded nor retried, and one hop is where it ends.
 func (r *Resharder) CountLoopBlocked(spans int) {
-	if r == nil || spans < 0 {
+	if spans <= 0 {
 		return
 	}
-	r.counters.loopsBlocked.Add(uint64(spans))
+	r.tally().loopsBlocked.Add(uint64(spans))
 }
 
 // Close shuts every shard client down. There is nothing to drain: the hop is
@@ -567,19 +587,24 @@ func (r *Resharder) Reshard(ctx context.Context, td ptrace.Traces) (ptrace.Trace
 }
 
 func (r *Resharder) countLocal(n int) {
-	if r == nil || n <= 0 {
+	if n <= 0 {
 		return
 	}
-	r.counters.spansLocal.Add(uint64(n))
+	r.tally().spansLocal.Add(uint64(n))
 }
 
 // countUnkeyed tallies the spans of td that carry no trace id — the single-shard
 // path's version of what singleOwner and owner do for the sharded one, and the
 // only walk that path makes (one id check per span, no copy, no hash).
+//
+// The walk is UNCONDITIONAL and pays for it: this path goes from O(1) to
+// O(spans), ~1.9 ns/span (BenchmarkReshardSingleOwner, 4.7 ns -> 169 ns on a
+// 20-span batch, 0 allocs). That is 0.19% of one core at a million spans a
+// second, a rate one shard cannot reach — decoding those spans costs orders of
+// magnitude more. Gating it on whether anything reads the counter would buy the
+// walk back and make a zero mean two things, "no malformed spans" and "nobody
+// asked", which is the ambiguity an SDK-health signal must not have.
 func (r *Resharder) countUnkeyed(td ptrace.Traces) {
-	if r == nil {
-		return
-	}
 	var unkeyed uint64
 	rss := td.ResourceSpans()
 	for i := 0; i < rss.Len(); i++ {
@@ -594,7 +619,7 @@ func (r *Resharder) countUnkeyed(td ptrace.Traces) {
 		}
 	}
 	if unkeyed > 0 {
-		r.counters.spansUnkeyed.Add(unkeyed)
+		r.tally().spansUnkeyed.Add(unkeyed)
 	}
 }
 

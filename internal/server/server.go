@@ -118,19 +118,39 @@ type Server struct {
 	now              func() time.Time
 	logger           *slog.Logger
 
-	// monMu guards the monitoredServices cache: the monitor→services match
-	// is O(monitors × services) and identical across the per-node target
-	// requests, so it is rebuilt at most once per cacheTTL (the staleness
-	// horizon the metadata cache already accepts). monBuilds counts rebuilds
-	// for tests.
-	monMu      sync.Mutex
-	monCache   map[string][]monitorEndpoint
-	monBuiltAt time.Time
-	monBuilds  atomic.Int64
+	// monMu guards the monitoredServices cache: the monitor→services match is
+	// O(monitors × services) and identical across the per-node target requests,
+	// so it is rebuilt only when the monitors or the Services actually change
+	// (monGen/svcGen, the two indexes' change tokens). monBuilds counts
+	// rebuilds for tests.
+	//
+	// It used to be rebuilt once per cacheTTL, which made ONE knob select both
+	// the HTTP cache lifetime and this memo's: -metadata-cache-ttl=0 — an
+	// operator disabling client caching for freshness — rebuilt the whole cross
+	// product per REQUEST (measured 77 ms / 129 MB / 197k allocations at 50
+	// monitors × 2,000 Services, plus 50 separate services.Index RLocks per
+	// request contending with the informer's writes). The generations also
+	// remove the up-to-TTL lag before a newly created ServiceMonitor or Service
+	// produced targets: the memo is now exact rather than merely recent.
+	monMu     sync.Mutex
+	monCache  map[string][]monitorEndpoint
+	monGen    uint64
+	svcGen    uint64
+	monValid  bool
+	monBuilds atomic.Int64
 
-	// warnRefs throttles the per-ref scrape-auth failure log. It is
-	// concurrency-safe on its own, so it needs no mutex here.
-	warnRefs *logdedupe.Table
+	// targetsMu guards the per-node ETag memo (see nodeTargetsNotModified).
+	// targetBuilds counts full derivations of a node's target list, for tests:
+	// it is the thing the memo exists to avoid.
+	targetsMu    sync.Mutex
+	targetsETags map[string]nodeTargetsETag
+	targetBuilds atomic.Int64
+
+	// warnRefs throttles the per-ref scrape-auth failure log, warnShadowed the
+	// per-pair shadowed-monitor one. Both are concurrency-safe on their own, so
+	// they need no mutex here.
+	warnRefs     *logdedupe.Table
+	warnShadowed *logdedupe.Table
 }
 
 // New creates a Server.
@@ -153,6 +173,7 @@ func New(cfg Config) *Server {
 		now:              time.Now,
 		logger:           cfg.Log,
 		warnRefs:         logdedupe.New(maxScrapeAuthWarnRefs, scrapeAuthWarnEvery),
+		warnShadowed:     logdedupe.New(maxShadowedWarnPairs, shadowWarnEvery),
 	}
 }
 
@@ -193,6 +214,46 @@ func (s *Server) warnScrapeAuth(ref string, emit func()) {
 	}
 	if allow {
 		emit()
+	}
+}
+
+// shadowWarnEvery bounds how often one shadowed (winner, loser) pair may log.
+// Like the scrape-auth throttle, this is a STEADY state rather than an event:
+// the pair is re-decided on every targets request of every agent that has the
+// pod on its node, so an unthrottled line is a permanent flood proportional to
+// fleet size. The counter carries the rate.
+const shadowWarnEvery = 30 * time.Minute
+
+// maxShadowedWarnPairs bounds the throttle table. Keys are monitor PAIRS, so
+// they are bounded by the indexed monitors; this is belt and braces against a
+// monitor set that churns.
+const maxShadowedWarnPairs = 1024
+
+// reportShadowed records a monitor endpoint target dropped because another
+// monitor already resolved to the same URL on that pod. See
+// obs.MonitorTargetShadowed for why one of them has to lose, and targetDedup's
+// doc for why it is the first by (namespace, name).
+func (s *Server) reportShadowed(kind, winner, loser, url string) {
+	if winner == loser {
+		// One monitor reaching one pod port twice — through two Services
+		// selecting the pod, or through two endpoints that resolve alike. The
+		// second is the same scrape declaration arriving twice, so nothing is
+		// lost and there is nothing to report; the dedup just collapses it, as
+		// it always has.
+		return
+	}
+	obs.MonitorTargetShadowed.WithLabelValues(kind).Inc()
+	if allow, saturated := s.warnShadowed.Allow(kind + "\x00" + winner + "\x00" + loser); allow || saturated {
+		if saturated {
+			s.log().Warn("shadowed-monitor warning dedupe table is full; further distinct pairs are suppressed",
+				"pairs", maxShadowedWarnPairs)
+		}
+		if allow {
+			s.log().Warn("two monitors resolve to one scrape URL; only the first is served",
+				"kind", kind, "serving", winner, "shadowed", loser, "url", url,
+				"note", "the shadowed monitor's auth and metricRelabelings are NOT applied; "+
+					"further warnings for this pair are suppressed for "+shadowWarnEvery.String())
+		}
 	}
 }
 
@@ -275,26 +336,34 @@ func (r *statusRecorder) WriteHeader(code int) {
 const maxContainerIDLen = kubemeta.MaxContainerIDLen
 
 // monitorEndpoint pairs a ServiceMonitor endpoint with its monitor name.
+//
+// The endpoint is a POINTER into the indexed monitor, which is treat-as-
+// immutable and outlives this map; stampEndpoint only reads it. By value the
+// pair was 304 bytes and the memo holds one per (monitor, service, endpoint) —
+// a cluster-wide 50 monitors over 2,000 Services is 100,000 pairs, measured at
+// 40.2 MB resident for as long as the memo lives, with both the old and the new
+// map alive across a rebuild (an 80 MB transient peak) against a 128Mi request.
 type monitorEndpoint struct {
 	monitor  string
-	endpoint servicemonitors.Endpoint
+	endpoint *servicemonitors.Endpoint
 }
 
 // monitoredServices maps Service UIDs to the ServiceMonitor endpoints
-// selecting them. The map is rebuilt at most once per cacheTTL (with a zero
-// TTL, once per request); callers must treat it as read-only.
+// selecting them. It is rebuilt only when the monitor or Service index has
+// changed since the last build; callers must treat it as read-only.
 func (s *Server) monitoredServices() map[string][]monitorEndpoint {
 	if s.monitors == nil {
 		return nil
 	}
-	if s.cacheTTL <= 0 {
-		return s.buildMonitoredServices()
-	}
+	// Read the change tokens BEFORE the build: a change landing during it is
+	// then recorded as unbuilt and rebuilds on the next call, rather than being
+	// stamped as already-included and lost until the next unrelated change.
+	monGen, svcGen := s.monitors.Generation(), s.services.Generation()
 	s.monMu.Lock()
 	defer s.monMu.Unlock()
-	if now := s.now(); s.monBuiltAt.IsZero() || now.Sub(s.monBuiltAt) >= s.cacheTTL {
+	if !s.monValid || s.monGen != monGen || s.svcGen != svcGen {
 		s.monCache = s.buildMonitoredServices()
-		s.monBuiltAt = now
+		s.monGen, s.svcGen, s.monValid = monGen, svcGen, true
 	}
 	return s.monCache
 }
@@ -304,34 +373,51 @@ func (s *Server) buildMonitoredServices() map[string][]monitorEndpoint {
 	s.monBuilds.Add(1)
 	out := map[string][]monitorEndpoint{}
 	for _, m := range s.monitors.All() {
+		name := m.Namespace + "/" + m.Name
 		for _, svc := range s.services.All(m.ServiceNamespaces()) {
 			if !m.Selector.Matches(labels.Set(svc.Labels)) {
 				continue
 			}
-			name := m.Namespace + "/" + m.Name
-			for _, ep := range m.Endpoints {
-				out[svc.UID] = append(out[svc.UID], monitorEndpoint{monitor: name, endpoint: ep})
+			for i := range m.Endpoints {
+				out[svc.UID] = append(out[svc.UID], monitorEndpoint{monitor: name, endpoint: &m.Endpoints[i]})
 			}
 		}
 	}
 	return out
 }
 
-// podMonitorsFor returns the PodMonitors selecting a pod (namespace +
-// label selector).
-func (s *Server) podMonitorsFor(pod kubemeta.Pod, all []*servicemonitors.PodMonitor) []*servicemonitors.PodMonitor {
+// podMonitorRef is one indexed PodMonitor with its "namespace/name" already
+// rendered: the name is stamped on every target the monitor produces, and
+// building it per (pod, monitor) is one allocation per pair on the targets path.
+type podMonitorRef struct {
+	monitor *servicemonitors.PodMonitor
+	name    string
+}
+
+// allPodMonitors snapshots the indexed PodMonitors for one request.
+func (s *Server) allPodMonitors() []podMonitorRef {
 	if s.monitors == nil {
 		return nil
 	}
-	var out []*servicemonitors.PodMonitor
+	all := s.monitors.PodMonitors()
+	out := make([]podMonitorRef, 0, len(all))
 	for _, m := range all {
-		if nss := m.PodNamespaces(); nss != nil && !slices.Contains(nss, pod.Namespace) {
+		out = append(out, podMonitorRef{monitor: m, name: m.Namespace + "/" + m.Name})
+	}
+	return out
+}
+
+// podMonitorsFor filters the request's PodMonitors down to the ones selecting a
+// pod (namespace + label selector), appending into a caller-owned scratch slice.
+func podMonitorsFor(pod kubemeta.Pod, all []podMonitorRef, out []podMonitorRef) []podMonitorRef {
+	for _, ref := range all {
+		if nss := ref.monitor.PodNamespaces(); nss != nil && !slices.Contains(nss, pod.Namespace) {
 			continue
 		}
-		if !m.Selector.Matches(labels.Set(pod.Labels)) {
+		if !ref.monitor.Selector.Matches(labels.Set(pod.Labels)) {
 			continue
 		}
-		out = append(out, m)
+		out = append(out, ref)
 	}
 	return out
 }

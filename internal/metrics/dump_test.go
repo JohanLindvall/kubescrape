@@ -96,6 +96,54 @@ func TestDumpGaugeFuncVec(t *testing.T) {
 	}
 }
 
+// A repeated registration of one NAME reuses the series (Registry.byName) but
+// keeps a gaugeFunc per registration — the shape the per-instance Register*
+// hooks advertise (two DynamicMetricSets in one process each publishing the
+// drop family). Dump must still emit that name ONCE: two entries become two
+// const metrics with an identical name and label set, which fails prometheus
+// Gather and answers 500 to every /metrics scrape, taking the go_*/process_*
+// collectors down with the kubescrape_* ones.
+func TestDumpMergesRepeatedFuncRegistrations(t *testing.T) {
+	r := NewRegistry()
+	r.CounterFunc("kubescrape_dropped_total", "d", func() float64 { return 3 })
+	r.CounterFunc("kubescrape_dropped_total", "d", func() float64 { return 4 })
+	r.GaugeFunc("kubescrape_live", "d", func() float64 { return 1 })
+	r.GaugeFunc("kubescrape_live", "d", func() float64 { return 2 })
+	r.GaugeFuncVec("kubescrape_backlog", "d", "signal", func() map[string]float64 {
+		return map[string]float64{"logs": 1}
+	})
+	r.GaugeFuncVec("kubescrape_backlog", "d", "signal", func() map[string]float64 {
+		return map[string]float64{"logs": 2, "metrics": 5}
+	})
+
+	byName := map[string]RegistrySeries{}
+	for _, d := range r.Dump() {
+		if _, dup := byName[d.Name]; dup {
+			t.Fatalf("%s dumped twice: the /metrics scrape 500s on a duplicate name+labels", d.Name)
+		}
+		byName[d.Name] = d
+	}
+
+	// Merged the way Export merges them into the shared series: a counter
+	// accumulates both funcs' totals, a gauge keeps the last registration's.
+	if v := byName["kubescrape_dropped_total"].Points[0].Value; v != 7 {
+		t.Errorf("counter funcs = %v, want 7 (3+4, as Export accumulates them)", v)
+	}
+	if v := byName["kubescrape_live"].Points[0].Value; v != 2 {
+		t.Errorf("gauge funcs = %v, want 2 (set: the last registration wins)", v)
+	}
+	pts := byName["kubescrape_backlog"].Points
+	if len(pts) != 2 {
+		t.Fatalf("labeled gauge funcs = %+v, want one point per label value", pts)
+	}
+	if pts[0].Labels[0] != [2]string{"signal", "logs"} || pts[0].Value != 2 {
+		t.Errorf("point 0 = %+v, want signal=logs value 2", pts[0])
+	}
+	if pts[1].Labels[0] != [2]string{"signal", "metrics"} || pts[1].Value != 5 {
+		t.Errorf("point 1 = %+v, want signal=metrics value 5", pts[1])
+	}
+}
+
 // The /metrics bridge makes Dump a SECOND concurrent reader of the registry,
 // alongside the push path's Export and the producers' observations. Nothing
 // may race, and no lock ordering between the registry, series and func mutexes

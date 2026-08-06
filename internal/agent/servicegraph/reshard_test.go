@@ -576,8 +576,9 @@ func TestIsForwardedFindsAMarkerOnAnyResource(t *testing.T) {
 }
 
 // TestCountLoopBlocked: the counter belongs to the resharder even though the
-// refusal happens on the receive path, and it tolerates a nil receiver (the
-// single-shard tier has none).
+// refusal happens on the receive path, and a NIL receiver — the single-shard
+// tier, which is the deployment likeliest to have an internal hop pointed at the
+// wrong port — counts rather than swallowing the tally.
 func TestCountLoopBlocked(t *testing.T) {
 	r := testResharder(t, nil, 0)
 	r.CountLoopBlocked(12)
@@ -585,9 +586,10 @@ func TestCountLoopBlocked(t *testing.T) {
 		t.Errorf("LoopsBlocked = %d, want 12", st.LoopsBlocked)
 	}
 	var nilR *Resharder
-	nilR.CountLoopBlocked(3) // must not panic
-	if st := nilR.Stats(); st != (ReshardStats{}) {
-		t.Errorf("nil Stats = %+v, want the zero value", st)
+	before := nilR.Stats() // the nil resharder's counters are process-wide
+	nilR.CountLoopBlocked(3)
+	if got := nilR.Stats().LoopsBlocked - before.LoopsBlocked; got != 3 {
+		t.Errorf("nil LoopsBlocked moved by %d, want 3", got)
 	}
 }
 
@@ -830,8 +832,22 @@ func (nopExporter) ExportTraces(context.Context, ptrace.Traces) error { return n
 // unkeyable tally must still move there: its metric's whole promise is that a
 // moving rate means an SDK is emitting malformed spans, and frozen at zero it
 // says the opposite about a shard that is drowning in them.
+//
+// Built through NewResharder with a DISABLED section, because that is the shape
+// production reaches: `-service-graph` without serviceGraphShards yields a NIL
+// *Resharder, and a counting path that only worked on a constructed one left
+// every kubescrape_service_graph_* series at zero on the un-charted single-shard
+// deployment. The counters of the nil resharder are process-wide (there is one
+// nil resharder), so the assertions are DELTAS.
 func TestSpansWithNoTraceIDAreCountedOnASingleShardTier(t *testing.T) {
-	r := testResharder(t, nil, 0) // no peers: everything is already local
+	r, err := NewResharder(ReshardConfig{}, otlpexportConfigForTest(), discardLog())
+	if err != nil {
+		t.Fatalf("NewResharder(disabled): %v", err)
+	}
+	if r != nil {
+		t.Fatalf("NewResharder(disabled) returned %v; this test is about the nil one production wires", r)
+	}
+	before := r.Stats()
 	td := ptrace.NewTraces()
 	rs := td.ResourceSpans().AppendEmpty()
 	realisticResource(rs.Resource(), "checkout")
@@ -850,10 +866,18 @@ func TestSpansWithNoTraceIDAreCountedOnASingleShardTier(t *testing.T) {
 		t.Errorf("kept %d spans locally, want 7", local.SpanCount())
 	}
 	st := r.Stats()
-	if st.SpansUnkeyed != 6 {
-		t.Errorf("SpansUnkeyed = %d, want 6", st.SpansUnkeyed)
+	if got := st.SpansUnkeyed - before.SpansUnkeyed; got != 6 {
+		t.Errorf("SpansUnkeyed moved by %d, want 6", got)
 	}
-	if st.SpansLocal != 7 {
-		t.Errorf("SpansLocal = %d, want 7", st.SpansLocal)
+	if got := st.SpansLocal - before.SpansLocal; got != 7 {
+		t.Errorf("SpansLocal moved by %d, want 7", got)
+	}
+
+	// The loop guard's tally is on the same block, and a single-shard tier is
+	// where a misdirected internal hop is likeliest — nothing else in the
+	// deployment names the internal port.
+	r.CountLoopBlocked(3)
+	if got := r.Stats().LoopsBlocked - before.LoopsBlocked; got != 3 {
+		t.Errorf("LoopsBlocked moved by %d, want 3", got)
 	}
 }

@@ -159,8 +159,17 @@ type reqCache struct {
 	// already resolved.
 	counted map[string]struct{}
 	// lookups counts the live metadata lookups issued — probes and attribution
-	// builds alike — bounded by maxLookupsPerRequest.
-	lookups int
+	// builds alike — bounded by maxLookupsPerRequest; probeLookups counts the
+	// probe half alone, bounded by maxProbeLookupsPerRequest so a walk of
+	// unresolvable point ids can never spend the attribution's share.
+	lookups      int
+	probeLookups int
+
+	// tokBuf renders a kind-tagged token for a MAP LOOKUP without allocating
+	// (map[string(buf)] reads do not copy). Only the auto-mode point walk uses
+	// it, and only within one call — a token that has to be STORED is
+	// materialised as a string first.
+	tokBuf []byte
 
 	// peer memoises the peer-IP attribution: the peer is a property of the
 	// CONNECTION, so every resource in a payload has the same one (and
@@ -177,12 +186,13 @@ type reqCache struct {
 	splitCopied int
 }
 
+// newReqCache allocates only what EVERY push writes. probes and counted are
+// filled on their own paths (the resolvability walk, the described-object
+// tally) and a push that takes neither used to pay for both maps regardless —
+// on the request path, per push, on the unauthenticated listener. Reading a nil
+// map is legal, so only the writers check.
 func newReqCache() *reqCache {
-	return &reqCache{
-		ids:     map[string]idResult{},
-		probes:  map[string]bool{},
-		counted: map[string]struct{}{},
-	}
+	return &reqCache{ids: map[string]idResult{}}
 }
 
 // idResult is one kind-tagged token's lookup outcome. resolved and the
@@ -209,17 +219,34 @@ type idResult struct {
 // id is treated as unresolvable.
 const maxLookupsPerRequest = 2 * maxSplitGroups
 
+// maxProbeLookupsPerRequest is the share of maxLookupsPerRequest the
+// resolvability PROBES may spend; the remainder is reserved for ATTRIBUTION.
+//
+// The two halves are not interchangeable. A probe answers "is this id worth
+// splitting on", and an unresolvable one is deliberately not evidence of
+// anything — so the auto-mode decision walks EVERY distinct data-point id
+// before the resource's own attribution is even attempted. Sharing one
+// allowance let a push of invented point ids exhaust it during that walk and
+// leave the sender itself unattributed: a resolvable resource-level
+// container.id resolving to nothing, exported wholly unenriched and counted
+// unresolved, indistinguishable from an id the cluster never had.
+const maxProbeLookupsPerRequest = maxLookupsPerRequest - maxSplitGroups
+
 // lookupBudgetWarnEvery throttles the over-budget warning: past the budget
 // EVERY further distinct id takes that path, and the diagnosis is per push,
 // not per id.
 const lookupBudgetWarnEvery = time.Minute
 
-func (e *Enricher) warnLookupBudget() {
+// warnLookupBudget names WHICH allowance bound, since the two degrade
+// different things: the probe share only makes further point ids read as
+// unresolvable to the split/auto DECISION (which is not evidence of anything),
+// while the request total takes attribution with it.
+func (e *Enricher) warnLookupBudget(exhausted string, bound int) {
 	if !e.lookupWarnGate.Allow(lookupBudgetWarnEvery) {
 		return
 	}
 	e.log.Warn("ingest: a push named more distinct ids than one request may look up; the remainder is treated as unresolvable",
-		"budget", maxLookupsPerRequest)
+		"exhausted", exhausted, "budget", bound)
 }
 
 // NewEnricher creates an Enricher.
@@ -401,8 +428,19 @@ func (e *Enricher) enrichMetricResourcesWith(ctx context.Context, cache *reqCach
 // kubescrape_ingest_resources_total{enriched} reading healthy. The same payload
 // in explicit datapoint mode split correctly, which is what
 // TestSplitResourceUsesDescribedObjectIdentity pins.
+//
+// The two halves run as two PASSES, cheapest first. Interleaving them let an
+// early resource's point walk run to completion before a later resource that
+// carries no ID at all — which alone forces false — was ever looked at, and that
+// walk spends the request's lookup budget on probes whose answer cannot change
+// the outcome.
 func (e *Enricher) resourceModeSuffices(ctx context.Context, cache *reqCache, md pmetric.Metrics) bool {
 	rms := md.ResourceMetrics()
+	for i := 0; i < rms.Len(); i++ {
+		if !e.hasID(rms.At(i).Resource().Attributes()) {
+			return false
+		}
+	}
 	for i := 0; i < rms.Len(); i++ {
 		rm := rms.At(i)
 		resID, ok := e.findID(rm.Resource().Attributes())
@@ -441,8 +479,8 @@ func (e *Enricher) anyForeignDataPointID(ctx context.Context, cache *reqCache, r
 
 func (e *Enricher) metricPointsHaveForeignID(ctx context.Context, cache *reqCache, m pmetric.Metric, resID string) bool {
 	has := func(a pcommon.Map) bool {
-		tok, ok := e.findID(a)
-		return ok && e.foreignID(ctx, cache, tok, resID)
+		prefix, val, ok := e.idValue(a)
+		return ok && e.foreignPointID(ctx, cache, prefix, val, resID)
 	}
 	switch m.Type() {
 	case pmetric.MetricTypeGauge:
@@ -531,14 +569,50 @@ func (e *Enricher) applyMetadata(ctx context.Context, a pcommon.Map, cache *reqC
 }
 
 // tokenFrom returns the first non-empty value under keys as a kind-tagged
-// token. The concatenation allocates; the loop over keys does not.
+// token. The concatenation allocates; the loop over keys does not — which is
+// why the auto-mode point walk goes through idValue instead and materialises a
+// token only when one has to be STORED.
 func (e *Enricher) tokenFrom(a pcommon.Map, keys []string, prefix string) (string, bool) {
+	if v, ok := valueUnder(a, keys); ok {
+		return prefix + v, true
+	}
+	return "", false
+}
+
+// valueUnder returns the first non-empty string value under keys.
+func valueUnder(a pcommon.Map, keys []string) (string, bool) {
 	for _, k := range keys {
 		if v, ok := a.Get(k); ok && v.Str() != "" {
-			return prefix + v.Str(), true
+			return v.Str(), true
 		}
 	}
 	return "", false
+}
+
+// idValue is findID in PARTS: the kind prefix and the raw id value, with no
+// token built. The auto-mode decision visits every data point of a push, and
+// the concatenation findID does was one heap allocation each — the largest
+// non-pdata allocator on the default mode's default path.
+func (e *Enricher) idValue(a pcommon.Map) (prefix, val string, ok bool) {
+	if v, ok := valueUnder(a, e.containerIDKeys); ok {
+		return tokContainer, v, true
+	}
+	if v, ok := valueUnder(a, e.podUIDKeys); ok {
+		return tokPodUID, v, true
+	}
+	return "", "", false
+}
+
+// hasID reports whether a carries a container id or pod uid.
+func (e *Enricher) hasID(a pcommon.Map) bool {
+	_, _, ok := e.idValue(a)
+	return ok
+}
+
+// tokenIs reports whether the kind-tagged token tok is prefix+val, comparing in
+// place rather than building the concatenation to compare it against.
+func tokenIs(tok, prefix, val string) bool {
+	return len(tok) == len(prefix)+len(val) && tok[:len(prefix)] == prefix && tok[len(prefix):] == val
 }
 
 // resolves reports whether token names an object the metadata service knows,
@@ -563,7 +637,10 @@ func (e *Enricher) resolves(ctx context.Context, cache *reqCache, token string) 
 	if v, ok := cache.probes[token]; ok {
 		return v
 	}
-	pod, _ := e.lookupByID(ctx, cache, token, 0)
+	pod, _ := e.lookupByID(ctx, cache, token, 0, true)
+	if cache.probes == nil {
+		cache.probes = map[string]bool{}
+	}
 	cache.probes[token] = pod != nil
 	return pod != nil
 }
@@ -604,8 +681,8 @@ func (e *Enricher) attrsFor(ctx context.Context, cache *reqCache, token string) 
 	if r, ok := cache.ids[token]; ok {
 		return r
 	}
-	r := idResult{built: pcommon.NewMap()}
-	if pod, container := e.lookupByID(ctx, cache, token, e.cfg.Wait); pod != nil {
+	r := idResult{built: emptyAttrs}
+	if pod, container := e.lookupByID(ctx, cache, token, e.cfg.Wait, false); pod != nil {
 		r.resolved = true
 		r.podUID = pod.UID
 		if container != nil {
@@ -652,6 +729,9 @@ func (e *Enricher) buildFor(pod *kubemeta.Pod, container *kubemeta.Container) pc
 func (e *Enricher) builtAttrs(ctx context.Context, cache *reqCache, token string) idResult {
 	r := e.attrsFor(ctx, cache, token)
 	if _, counted := cache.counted[token]; !counted {
+		if cache.counted == nil {
+			cache.counted = map[string]struct{}{}
+		}
 		cache.counted[token] = struct{}{}
 		if r.resolved {
 			obs.Ingested.WithLabelValues("enriched").Inc()
@@ -661,6 +741,14 @@ func (e *Enricher) builtAttrs(ctx context.Context, cache *reqCache, token string
 	}
 	return r
 }
+
+// emptyAttrs is the shared "nothing was built" attribute map. Every consumer of
+// a built map only READS it (mergeAttrs/overwriteAttrs Range over the source),
+// so the not-applicable answers need no map of their own — and they are the
+// common ones: an unresolved token per distinct id, and the peer fallback on
+// every id-less resource of every push while the fallback is off, which is the
+// default.
+var emptyAttrs = pcommon.NewMap()
 
 // mergeAttrs adds src's attributes to dst, never overwriting keys the sender
 // already set. The sender is authoritative about ITSELF, which is the same
@@ -699,17 +787,22 @@ const peerRejectWarnEvery = time.Minute
 // is per request (the enricher itself is shared by concurrent handlers, so
 // nothing may be memoised on it).
 func (e *Enricher) peerAttrs(ctx context.Context, cache *reqCache) (built pcommon.Map, resolved, rejected bool) {
-	if !e.cfg.PeerIPFallback {
-		return pcommon.NewMap(), false, false
-	}
-	ip := peerIP(ctx)
-	if ip == "" {
-		return pcommon.NewMap(), false, false
-	}
+	// The memo covers the NOT-APPLICABLE answers too (the fallback is off, or
+	// the transport recorded no address): every id-less resource of a push asks
+	// again, and a fresh empty map per ask was two allocations each on the
+	// default configuration, where the feature is disabled.
 	if cache.peerDone {
 		return cache.peer, cache.peerResolved, cache.peerRejected
 	}
-	built = pcommon.NewMap()
+	var ip string
+	if e.cfg.PeerIPFallback {
+		ip = peerIP(ctx)
+	}
+	if ip == "" {
+		cache.peer, cache.peerDone = emptyAttrs, true
+		return emptyAttrs, false, false
+	}
+	built = emptyAttrs
 	if pod, err := e.cfg.Meta.PodByIP(ctx, ip); err == nil && pod != nil {
 		if e.cfg.PeerReject != nil && e.cfg.PeerReject(pod) {
 			// The address did not come from an application: something between
@@ -796,6 +889,30 @@ func (e *Enricher) foreignID(ctx context.Context, cache *reqCache, tok, resID st
 	return !e.sameObject(ctx, cache, tok, resID)
 }
 
+// foreignPointID is foreignID for a data point's id, taking the id in PARTS.
+// Same answer, same order of decisions — but the kind-tagged token is only
+// materialised on a MEMO MISS, i.e. at most once per distinct id per push,
+// instead of once per data point. Every earlier exit reads the memo through
+// map[string(buf)], which does not copy the key.
+func (e *Enricher) foreignPointID(ctx context.Context, cache *reqCache, prefix, val, resID string) bool {
+	if tokenIs(resID, prefix, val) {
+		return false // the sender's own id: the resource branch attributes it
+	}
+	buf := append(cache.tokBuf[:0], prefix...)
+	buf = append(buf, val...)
+	cache.tokBuf = buf
+	if r, ok := cache.ids[string(buf)]; ok {
+		if !r.resolved {
+			return false // unresolvable: not evidence of anything
+		}
+		return !sameResolved(r, e.attrsFor(ctx, cache, resID))
+	}
+	if resolved, ok := cache.probes[string(buf)]; ok && !resolved {
+		return false
+	}
+	return e.foreignID(ctx, cache, string(buf), resID)
+}
+
 // sameObject reports whether two kind-tagged ID tokens name the same
 // Kubernetes object for ATTRIBUTION. It is the one predicate behind both the
 // auto-mode foreign-point decision (foreignID) and the split path's
@@ -844,8 +961,13 @@ func (e *Enricher) sameObject(ctx context.Context, cache *reqCache, a, b string)
 	if a == b {
 		return true
 	}
-	ra := e.attrsFor(ctx, cache, a)
-	rb := e.attrsFor(ctx, cache, b)
+	return sameResolved(e.attrsFor(ctx, cache, a), e.attrsFor(ctx, cache, b))
+}
+
+// sameResolved is sameObject's rule applied to two lookup OUTCOMES, for callers
+// that already hold one (foreignPointID reads its side out of the memo rather
+// than re-keying it with a materialised token).
+func sameResolved(ra, rb idResult) bool {
 	if !ra.resolved || !rb.resolved {
 		return false // at least one did not resolve: no evidence they match
 	}
@@ -867,13 +989,22 @@ func (e *Enricher) findID(a pcommon.Map) (token string, ok bool) {
 
 // lookupByID resolves a kind-tagged ID token to metadata (nil pod on miss),
 // charging the request's lookup budget: past it every id reads as unresolvable.
-// wait is the caller's — probes pass 0, attribution passes Config.Wait.
-func (e *Enricher) lookupByID(ctx context.Context, cache *reqCache, token string, wait time.Duration) (*kubemeta.Pod, *kubemeta.Container) {
+// wait is the caller's — probes pass 0, attribution passes Config.Wait — and
+// probe says which half of the budget the call spends (see
+// maxProbeLookupsPerRequest).
+func (e *Enricher) lookupByID(ctx context.Context, cache *reqCache, token string, wait time.Duration, probe bool) (*kubemeta.Pod, *kubemeta.Container) {
 	if cache.lookups >= maxLookupsPerRequest {
-		e.warnLookupBudget()
+		e.warnLookupBudget("request", maxLookupsPerRequest)
+		return nil, nil
+	}
+	if probe && cache.probeLookups >= maxProbeLookupsPerRequest {
+		e.warnLookupBudget("probes", maxProbeLookupsPerRequest)
 		return nil, nil
 	}
 	cache.lookups++
+	if probe {
+		cache.probeLookups++
+	}
 	switch {
 	case len(token) >= 2 && token[:2] == tokContainer:
 		id := token[2:]

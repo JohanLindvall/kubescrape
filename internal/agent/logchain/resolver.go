@@ -16,13 +16,19 @@ import (
 
 	"go.opentelemetry.io/collector/pdata/pcommon"
 
+	"github.com/JohanLindvall/kubescrape/internal/logline"
+	"github.com/JohanLindvall/kubescrape/internal/metrics"
 	"github.com/JohanLindvall/kubescrape/pkg/logattrs"
 )
 
 // SeverityKey is the synthetic key exposing a record's enriched severity to
 // keep/drop rules. It is available to RULES only: metric labels have no such
 // key in production, so a resolver used for labels must not invent one.
-const SeverityKey = "__severity__"
+//
+// The name is logline's, not this package's, so the log-metrics engine — which
+// shares the selector language but not this key — can refuse a config naming it
+// instead of compiling a rule that matches nothing.
+const SeverityKey = logline.SeverityKey
 
 // Resolver resolves metric label/value keys and rule keys for ONE record: the
 // record's own attributes (line-derived + enriched) first, then the resource's
@@ -52,7 +58,7 @@ type Resolver struct {
 	Severity string
 
 	labelFn func(string) string
-	valueFn func(string) (float64, bool)
+	valueFn metrics.ValueFunc
 	ruleFn  func(string) string
 }
 
@@ -79,8 +85,11 @@ func (r *Resolver) SetLifted(lifted []logattrs.Attr) { r.Lifted = lifted }
 // LabelFn resolves a metric LABEL key (no synthetic keys).
 func (r *Resolver) LabelFn() func(string) string { return r.labelFn }
 
-// ValueFn resolves a metric VALUE key, numerically.
-func (r *Resolver) ValueFn() func(string) (float64, bool) { return r.valueFn }
+// ValueFn resolves a metric VALUE key, numerically. The three-valued result is
+// metrics.ValueFunc's: the third says the key was PRESENT in the attributes, so
+// the log-metrics engine can tell "not a number here" from "not here" without a
+// second walk of the ranks.
+func (r *Resolver) ValueFn() metrics.ValueFunc { return r.valueFn }
 
 // RuleFn resolves a RULE key, including the synthetic SeverityKey.
 func (r *Resolver) RuleFn() func(string) string { return r.ruleFn }
@@ -150,40 +159,52 @@ func (r *Resolver) ruleKey(k string) string {
 //
 // Ranking is by PRESENCE, not by convertibility: a present-but-non-numeric
 // value is a miss for this key, not a reason to fall through to a lower rank.
-func (r *Resolver) value(k string) (float64, bool) {
+//
+// present is that same first-present rank rendering NON-EMPTY — exactly what
+// label() would return for the key — and it is answered from THIS walk because
+// it is what tells the log-metrics engine whether to read the line instead
+// (metrics.ValueFunc). Asking the label closure for it afterwards walked all
+// three ranks again on every line whose value key lives on the line, which is
+// the common case.
+func (r *Resolver) value(k string) (float64, bool, bool) {
 	if v, ok := r.Record.Get(k); ok {
 		return numeric(v)
 	}
 	if lv, ok := r.liftedValue(k); ok {
 		switch x := lv.(type) {
 		case float64:
-			return x, true
+			return x, true, true
 		case int64:
-			return float64(x), true
+			return float64(x), true, true
 		case string:
 			f, err := strconv.ParseFloat(x, 64)
-			return f, err == nil
+			return f, err == nil, x != ""
+		case nil:
+			return 0, false, false
 		default:
-			return 0, false
+			return 0, false, attrString(x) != ""
 		}
 	}
 	v, ok := r.Resource.Get(k)
 	if !ok {
-		return 0, false
+		return 0, false, false
 	}
 	return numeric(v)
 }
 
-// numeric converts a pcommon.Value the way value() needs it.
-func numeric(v pcommon.Value) (float64, bool) {
+// numeric converts a pcommon.Value the way value() needs it, and reports
+// whether it renders non-empty — label()'s answer for the same value, from the
+// one AsString this already pays for.
+func numeric(v pcommon.Value) (float64, bool, bool) {
 	switch v.Type() {
 	case pcommon.ValueTypeDouble:
-		return v.Double(), true
+		return v.Double(), true, true
 	case pcommon.ValueTypeInt:
-		return float64(v.Int()), true
+		return float64(v.Int()), true, true
 	default:
-		f, err := strconv.ParseFloat(v.AsString(), 64)
-		return f, err == nil
+		s := v.AsString()
+		f, err := strconv.ParseFloat(s, 64)
+		return f, err == nil, s != ""
 	}
 }
 

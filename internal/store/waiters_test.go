@@ -307,3 +307,31 @@ func TestOversizedIDDoesNotWait(t *testing.T) {
 		t.Fatalf("oversized ID registered a waiter (count %d)", got)
 	}
 }
+
+// A lookup that CANNOT block (?wait=0, or a client that already hung up) must
+// not walk the waiter protocol: registering the channel takes the exclusive
+// lock and removeWaiter takes it again, so an unauthenticated caller could
+// drive write-lock churn that every reader and the informer goroutine contend
+// with — for a channel nothing could ever wait on. The allocation count is the
+// proxy: the channel plus its map entry are exactly what the registration
+// costs.
+func TestNonBlockingMissDoesNotRegisterAWaiter(t *testing.T) {
+	if raceEnabled {
+		t.Skip("-race perturbs allocation counts")
+	}
+	s, _ := newTestStore(time.Minute)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	got := testing.AllocsPerRun(100, func() {
+		if _, ok, err := s.GetContainer(ctx, "deadbeef01"); ok || err != nil {
+			t.Fatalf("unknown container resolved: ok=%v err=%v", ok, err)
+		}
+	})
+	if got != 0 {
+		t.Errorf("a non-blocking miss allocates %v times per call, want 0", got)
+	}
+	if n := s.waiterCount(); n != 0 {
+		t.Errorf("%d waiters left registered", n)
+	}
+}

@@ -2,6 +2,7 @@ package journald
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"syscall"
 	"time"
@@ -120,11 +121,24 @@ func (s *sdSource) next(ctx context.Context) (rawEntry, bool, error) {
 	}
 }
 
+// errWaitSymbolLookup is go-systemd's sentinel for a failed dlsym of
+// sd_journal_wait (Journal.Wait returns a bare -1 for it, before any call).
+const errWaitSymbolLookup = -1
+
 // waitStatusErr classifies sd_journal_wait's return: non-negative statuses
 // (SD_JOURNAL_NOP/APPEND/INVALIDATE) mean the wait blocked and may have news,
-// negative is a failure spelled errno-style (go-systemd also returns -1 when
-// the libsystemd symbol lookup fails).
+// negative is a failure spelled errno-style.
+//
+// -1 is NOT one of those. go-systemd returns it as its own sentinel when the
+// dlsym lookup for sd_journal_wait fails, and rendering it errno-style makes
+// it syscall.Errno(1) = EPERM, "operation not permitted" — which sends an
+// operator after a permissions problem while the reader reopens every 30s
+// forever against a symbol that will never appear. A real sd_journal_wait
+// never answers -EPERM either, so the sentinel owns the value.
 func waitStatusErr(status int) error {
+	if status == errWaitSymbolLookup {
+		return errors.New("journal wait: sd_journal_wait is unavailable (libsystemd symbol lookup failed); the linked libsystemd is too old or incomplete")
+	}
 	if status < 0 {
 		return fmt.Errorf("journal wait: %w", syscall.Errno(-status))
 	}

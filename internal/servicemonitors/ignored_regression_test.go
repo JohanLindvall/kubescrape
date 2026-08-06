@@ -1,6 +1,7 @@
 package servicemonitors
 
 import (
+	"slices"
 	"strings"
 	"testing"
 
@@ -146,5 +147,111 @@ func TestPodMonitorPortNumberIsReported(t *testing.T) {
 	// And it still yields no targets — the phantom-target guard is unchanged.
 	if len(m.Endpoints) != 1 || m.Endpoints[0].Port != "" || m.Endpoints[0].TargetPort != nil {
 		t.Errorf("portNumber must not be interpreted as a port: %+v", m.Endpoints[0])
+	}
+}
+
+// The ten fields that were not parsed at all, exercised through the REAL decode
+// path (unstructured → DefaultUnstructuredConverter), not just by setting Go
+// struct fields: a quantity, a string list and a plain string each decode
+// differently, and the reflection-based pinning test cannot see that.
+//
+// scrapeProtocols is the one with visible behaviour behind it: the agent
+// negotiates its own Accept header, so an operator who pinned
+// PrometheusText0.0.4 because a target's OpenMetrics is broken gets the
+// opposite of what the CR says.
+func TestNewlyParsedFieldsAreReportedThroughTheDecode(t *testing.T) {
+	u := &unstructured.Unstructured{Object: map[string]any{
+		"metadata": map[string]any{"namespace": "ns", "name": "m"},
+		"spec": map[string]any{
+			"selector":                       map[string]any{},
+			"scrapeProtocols":                []any{"PrometheusText0.0.4"},
+			"fallbackScrapeProtocol":         "PrometheusText0.0.4",
+			"selectorMechanism":              "RelabelConfig",
+			"nativeHistogramBucketLimit":     int64(160),
+			"nativeHistogramMinBucketFactor": "1.1",
+			"convertClassicHistogramsToNHCB": true,
+			"scrapeClassicHistograms":        true,
+			"endpoints": []any{map[string]any{
+				"port":                 "http",
+				"noProxy":              "10.0.0.0/8",
+				"proxyFromEnvironment": true,
+				"proxyConnectHeader": map[string]any{
+					"Proxy-Authorization": []any{map[string]any{"name": "s", "key": "k"}},
+				},
+			}},
+		},
+	}}
+	m, err := Parse(u)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	got := IgnoredFields(m.Endpoints)
+	for _, want := range []string{
+		"scrapeProtocols", "fallbackScrapeProtocol", "selectorMechanism",
+		"nativeHistogramBucketLimit", "nativeHistogramMinBucketFactor",
+		"convertClassicHistogramsToNHCB", "scrapeClassicHistograms",
+		"noProxy", "proxyFromEnvironment", "proxyConnectHeader",
+	} {
+		if !slices.Contains(got, want) {
+			t.Errorf("%s is set on the CR and not reported: %v", want, got)
+		}
+	}
+	// proxyConnectHeader carries SecretKeySelectors. It is NOT honoured, so it
+	// must not have quietly become a secret channel outside Endpoint.secretRefs.
+	ix := NewIndex()
+	if err := ix.Upsert(u); err != nil {
+		t.Fatal(err)
+	}
+	if refs := ix.AuthSecretRefs(); len(refs) != 0 {
+		t.Errorf("proxyConnectHeader's secret refs reached the scrape-auth allowlist: %v", refs)
+	}
+}
+
+// An endpoint naming neither port nor targetPort resolves to NO targets — the
+// phantom-target guard, which is deliberately narrower than
+// prometheus-operator (which emits no port filter at all and scrapes every port
+// of every matching EndpointSlice). Being narrower is a choice; being silent
+// about it is the defect: the outcome is identical to portNumber's, which IS
+// reported, and whose comment gives the reason.
+func TestEndpointNamingNoPortIsReported(t *testing.T) {
+	sm := &unstructured.Unstructured{Object: map[string]any{
+		"metadata": map[string]any{"namespace": "ns", "name": "m"},
+		"spec": map[string]any{
+			"selector":  map[string]any{},
+			"endpoints": []any{map[string]any{"path": "/metrics"}},
+		},
+	}}
+	m, err := Parse(sm)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if got := IgnoredFields(m.Endpoints); !slices.Contains(got, "port(unset)") {
+		t.Errorf("an endpoint naming no port yields no targets and must say so; got %v", got)
+	}
+	// A named port is the ordinary case and must stay quiet.
+	sm.Object["spec"].(map[string]any)["endpoints"] = []any{map[string]any{"port": "http"}}
+	m, err = Parse(sm)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if got := IgnoredFields(m.Endpoints); slices.Contains(got, "port(unset)") {
+		t.Errorf("an endpoint naming a port must not report port(unset); got %v", got)
+	}
+	// portNumber already names the cause; reporting an unset port beside it
+	// would be false — the endpoint DOES name a port, we just do not honour it.
+	pm := &unstructured.Unstructured{Object: map[string]any{
+		"metadata": map[string]any{"namespace": "ns", "name": "pm"},
+		"spec": map[string]any{
+			"selector":            map[string]any{},
+			"podMetricsEndpoints": []any{map[string]any{"portNumber": int64(9090)}},
+		},
+	}}
+	pmm, err := ParsePodMonitor(pm)
+	if err != nil {
+		t.Fatalf("ParsePodMonitor: %v", err)
+	}
+	got := IgnoredFields(pmm.Endpoints)
+	if !slices.Contains(got, "portNumber") || slices.Contains(got, "port(unset)") {
+		t.Errorf("portNumber alone must report portNumber and nothing about an unset port; got %v", got)
 	}
 }

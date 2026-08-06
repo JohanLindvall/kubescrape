@@ -14,6 +14,15 @@ import (
 // selectors and labels can reference the line contents directly.
 const LineKey = "__line__"
 
+// SeverityKey is the synthetic key exposing a record's ENRICHED severity. Only
+// the keep/drop RULES tier resolves it (logchain.Resolver.RuleFn, which aliases
+// this constant); the log-metrics engine's label and value lookups have no arm
+// for it, and its selector language, its config file and its documented example
+// are all shared with logs.rules — so it lives here, in the shared DSL, for the
+// engine that does NOT resolve it to refuse it by name rather than compile a
+// rule that silently matches nothing.
+const SeverityKey = "__severity__"
+
 // ResolveKey is THE attrs-then-line-fields resolution tier: LineKey is the
 // raw body, the caller's attribute lookup (record/resource attributes) wins
 // when it returns non-empty, and the line's own parsed fields are the

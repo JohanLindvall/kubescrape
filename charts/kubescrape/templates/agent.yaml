@@ -181,12 +181,20 @@ spec:
                    otel-collector.monitoring, so a release installed anywhere
                    else would tail the collector's own namespace.
 
-                   In-cluster is `service.namespace` or anything under `.svc`,
-                   which is what makes the second label a namespace. Deriving it
-                   from ANY host read the second label of an external endpoint
-                   as one — `otel.grafana.net` excluded a namespace called
-                   `grafana`, whose pods were then dropped at discovery, with no
-                   counter and no warning to tell that apart from "no logs".
+                   In-cluster is `service.namespace` or anything under `.svc`.
+                   Deriving it from ANY host read the second label of an external
+                   endpoint as one — `otel.grafana.net` excluded a namespace
+                   called `grafana`, whose pods were then dropped at discovery,
+                   with no counter and no warning to tell that apart from "no
+                   logs".
+
+                   The namespace is the label BEFORE `svc`, not the second one:
+                   those coincide for `<svc>.<ns>.svc...` and not for a
+                   StatefulSet's per-pod `<pod>.<svc>.<ns>.svc...`, where taking
+                   the second excluded a namespace named after the SERVICE and
+                   left the collector's own namespace tailed — the amplification
+                   loop reopened, plus an unrelated namespace silently dropped.
+                   Bare `<svc>.<ns>` has no `svc` label and keeps the second.
 
                    `null` (the default) picks these; an explicit [] excludes
                    nothing, which `default` could not express. */}}
@@ -197,7 +205,13 @@ spec:
             {{-   $host := first (splitList ":" $hostport) }}
             {{-   $parts := splitList "." $host }}
             {{-   if and (ge (len $parts) 2) (or (eq (len $parts) 2) (hasSuffix ".svc" $host) (contains ".svc." $host)) }}
-            {{-     $excl = append $excl (index $parts 1) }}
+            {{-     $ns := index $parts 1 }}
+            {{-     range $i, $label := $parts }}
+            {{-       if and (eq $label "svc") (gt $i 0) }}
+            {{-         $ns = index $parts (sub $i 1) }}
+            {{-       end }}
+            {{-     end }}
+            {{-     $excl = append $excl $ns }}
             {{-   end }}
             {{-   $excl = uniq $excl }}
             {{- end }}

@@ -92,61 +92,102 @@ func Logs(ld plog.Logs, maxBytes int) []plog.Logs {
 }
 
 // splitBigResourceLogs packs one over-large ResourceLogs' records into whole-
-// Logs chunks, each carrying a copy of the resource and scope.
+// Logs chunks, each carrying a copy of the resource and of the scopes it holds
+// records for.
+//
+// A chunk CARRIES ACROSS the scope loop: a scope boundary is not a part
+// boundary. Starting a fresh chunk per scope made the part count
+// max(ceil(bytes/cap), scopes), so an OTel-SDK payload — one ScopeLogs per
+// instrumentation library, which -ingest and the trace tier forward verbatim —
+// split into one part per library however small they were (64 scopes over a
+// 17 MB push: 64 parts against an ideal of 5). Each part is its own timeout,
+// auth build, gzip pass and round trip, and on the trace tier the entry
+// shard's forward is synchronous and holds an in-flight slot for the whole
+// sequence.
 func splitBigResourceLogs(rl plog.ResourceLogs, maxBytes int, out *[]plog.Logs) {
-	base := logMarshaler.ResourceLogsSize(emptyRecordsRL(rl)) + elemOverhead
-	newChunk := func() (plog.Logs, plog.LogRecordSlice, plog.ScopeLogs) {
-		ld := plog.NewLogs()
-		nrl := ld.ResourceLogs().AppendEmpty()
+	// The per-chunk fixed cost is the resource plus the CURRENT scope only,
+	// which is what a chunk actually holds. Measuring it from a copy carrying
+	// EVERY scope's framing charged each chunk (S-1) scopes it does not
+	// contain; the over-count is safe for the cap but real for the budget, and
+	// once it exceeded maxBytes the always-take-one guard turned every single
+	// record into its own part.
+	resBase := logMarshaler.ResourceLogsSize(emptyScopesRL(rl)) + elemOverhead
+	var (
+		ld       plog.Logs
+		nrl      plog.ResourceLogs
+		recs     plog.LogRecordSlice
+		open     bool // a chunk is being filled
+		curBytes int
+		held     int // records in the current chunk, across its scopes
+	)
+	emit := func() {
+		if open {
+			*out = append(*out, ld)
+			open = false
+		}
+	}
+	openChunk := func() {
+		ld = plog.NewLogs()
+		nrl = ld.ResourceLogs().AppendEmpty()
 		rl.Resource().CopyTo(nrl.Resource())
 		nrl.SetSchemaUrl(rl.SchemaUrl())
+		curBytes, held, open = resBase, 0, true
+	}
+	addScope := func(sl plog.ScopeLogs, scopeBytes int) {
 		nsl := nrl.ScopeLogs().AppendEmpty()
-		return ld, nsl.LogRecords(), nsl
+		sl.Scope().CopyTo(nsl.Scope())
+		nsl.SetSchemaUrl(sl.SchemaUrl())
+		recs = nsl.LogRecords()
+		curBytes += scopeBytes
 	}
 	sls := rl.ScopeLogs()
 	for i := 0; i < sls.Len(); i++ {
 		sl := sls.At(i)
-		emptyScope := sl.LogRecords().Len() == 0
-		ld, recs, nsl := newChunk()
-		sl.Scope().CopyTo(nsl.Scope())
-		nsl.SetSchemaUrl(sl.SchemaUrl())
-		curBytes := base
+		// An empty scope carries identity (name, attributes, schema URL) that
+		// the under-cap path preserves, so it rides along in the current chunk
+		// rather than costing a part of its own.
+		scopeBytes := logMarshaler.ScopeLogsSize(emptyRecordsSL(sl)) + elemOverhead
+		if open && curBytes+scopeBytes > maxBytes {
+			emit()
+		}
+		if !open {
+			openChunk()
+		}
+		addScope(sl, scopeBytes)
 		lrs := sl.LogRecords()
 		for j := 0; j < lrs.Len(); j++ {
 			lr := lrs.At(j)
 			recBytes := logMarshaler.LogRecordSize(lr) + elemOverhead
-			if recs.Len() > 0 && curBytes+recBytes > maxBytes {
-				*out = append(*out, ld)
-				ld, recs, nsl = newChunk()
-				sl.Scope().CopyTo(nsl.Scope())
-				nsl.SetSchemaUrl(sl.SchemaUrl())
-				curBytes = base
+			if held > 0 && curBytes+recBytes > maxBytes {
+				emit()
+				openChunk()
+				addScope(sl, scopeBytes)
 			}
 			lr.CopyTo(recs.AppendEmpty())
 			curBytes += recBytes
-		}
-		// Emit the last chunk if it holds records, or the scope was empty — an
-		// empty scope carries identity (attributes, schema URL) that the
-		// under-cap path preserves, so the split must too.
-		if recs.Len() > 0 || emptyScope {
-			*out = append(*out, ld)
+			held++
 		}
 	}
+	emit()
 }
 
-// emptyRecordsRL returns a copy of rl carrying its resource and scope framing
-// but no records, to measure the fixed per-chunk base cost.
-func emptyRecordsRL(rl plog.ResourceLogs) plog.ResourceLogs {
+// emptyScopesRL returns a copy of rl carrying its resource and schema URL but
+// no scopes, to measure the per-chunk cost the resource alone contributes.
+func emptyScopesRL(rl plog.ResourceLogs) plog.ResourceLogs {
 	tmp := plog.NewLogs()
 	nrl := tmp.ResourceLogs().AppendEmpty()
 	rl.Resource().CopyTo(nrl.Resource())
 	nrl.SetSchemaUrl(rl.SchemaUrl())
-	for i := 0; i < rl.ScopeLogs().Len(); i++ {
-		nsl := nrl.ScopeLogs().AppendEmpty()
-		rl.ScopeLogs().At(i).Scope().CopyTo(nsl.Scope())
-		nsl.SetSchemaUrl(rl.ScopeLogs().At(i).SchemaUrl())
-	}
 	return nrl
+}
+
+// emptyRecordsSL returns a copy of sl carrying its scope and schema URL but no
+// records, to measure what adding that scope to a chunk costs.
+func emptyRecordsSL(sl plog.ScopeLogs) plog.ScopeLogs {
+	nsl := plog.NewScopeLogs()
+	sl.Scope().CopyTo(nsl.Scope())
+	nsl.SetSchemaUrl(sl.SchemaUrl())
+	return nsl
 }
 
 // Metrics partitions md so each part's encoded size is <= maxBytes, splitting
@@ -197,26 +238,59 @@ func Metrics(md pmetric.Metrics, maxBytes int) []pmetric.Metrics {
 	return out
 }
 
+// splitBigResourceMetrics packs one over-large ResourceMetrics' metrics into
+// whole-Metrics chunks. Chunks carry across the scope loop and the per-chunk
+// base counts the CURRENT scope only — see splitBigResourceLogs for both.
 func splitBigResourceMetrics(rm pmetric.ResourceMetrics, maxBytes int, out *[]pmetric.Metrics) {
-	base := metricMarshaler.ResourceMetricsSize(emptyMetricsRM(rm)) + elemOverhead
-	newChunk := func(sm pmetric.ScopeMetrics) (pmetric.Metrics, pmetric.MetricSlice) {
-		md := pmetric.NewMetrics()
-		nrm := md.ResourceMetrics().AppendEmpty()
+	resBase := metricMarshaler.ResourceMetricsSize(emptyScopesRM(rm)) + elemOverhead
+	var (
+		md       pmetric.Metrics
+		nrm      pmetric.ResourceMetrics
+		ms       pmetric.MetricSlice
+		open     bool
+		curBytes int
+		held     int
+		scopes   int
+	)
+	emit := func() {
+		if open {
+			*out = append(*out, md)
+			open = false
+		}
+	}
+	openChunk := func() {
+		md = pmetric.NewMetrics()
+		nrm = md.ResourceMetrics().AppendEmpty()
 		rm.Resource().CopyTo(nrm.Resource())
 		nrm.SetSchemaUrl(rm.SchemaUrl())
+		curBytes, held, scopes, open = resBase, 0, 0, true
+	}
+	addScope := func(sm pmetric.ScopeMetrics, scopeBytes int) {
 		nsm := nrm.ScopeMetrics().AppendEmpty()
 		sm.Scope().CopyTo(nsm.Scope())
 		nsm.SetSchemaUrl(sm.SchemaUrl())
-		return md, nsm.Metrics()
+		ms = nsm.Metrics()
+		curBytes += scopeBytes
+		scopes++
 	}
 	sms := rm.ScopeMetrics()
 	for i := 0; i < sms.Len(); i++ {
 		sm := sms.At(i)
-		emptyScope := sm.Metrics().Len() == 0
-		md, ms := newChunk(sm)
-		curBytes := base
+		scopeBytes := metricMarshaler.ScopeMetricsSize(emptyMetricsSM(sm)) + elemOverhead
+		base := resBase + scopeBytes // a chunk holding this scope alone
+		if open && curBytes+scopeBytes > maxBytes {
+			emit()
+		}
+		if !open {
+			openChunk()
+		}
+		addScope(sm, scopeBytes)
 		metrics := sm.Metrics()
 		for j := 0; j < metrics.Len(); j++ {
+			if !open { // the data-point split below closed the chunk
+				openChunk()
+				addScope(sm, scopeBytes)
+			}
 			m := metrics.At(j)
 			mBytes := metricMarshaler.MetricSize(m) + elemOverhead
 			// A metric that cannot fit in a chunk of its own is split by DATA
@@ -225,28 +299,37 @@ func splitBigResourceMetrics(rm pmetric.ResourceMetrics, maxBytes int, out *[]pm
 			// prevent — and a single family (a KSM-style split, a fat
 			// histogram) can be the whole payload.
 			if base+mBytes > maxBytes && dataPointCount(m) > 1 {
-				if ms.Len() > 0 {
-					*out = append(*out, md)
-					md, ms = newChunk(sm)
-					curBytes = base
+				// Emit what is carried, unless the chunk holds nothing but this
+				// scope's own identity — the data-point chunks below carry that
+				// same scope, so emitting it would be a part with no content.
+				if held > 0 || scopes > 1 {
+					emit()
+				} else {
+					open = false
 				}
 				splitBigMetric(m, base, maxBytes, func() (pmetric.Metrics, pmetric.MetricSlice) {
-					return newChunk(sm)
+					nmd := pmetric.NewMetrics()
+					x := nmd.ResourceMetrics().AppendEmpty()
+					rm.Resource().CopyTo(x.Resource())
+					x.SetSchemaUrl(rm.SchemaUrl())
+					nsm := x.ScopeMetrics().AppendEmpty()
+					sm.Scope().CopyTo(nsm.Scope())
+					nsm.SetSchemaUrl(sm.SchemaUrl())
+					return nmd, nsm.Metrics()
 				}, out)
 				continue
 			}
-			if ms.Len() > 0 && curBytes+mBytes > maxBytes {
-				*out = append(*out, md)
-				md, ms = newChunk(sm)
-				curBytes = base
+			if held > 0 && curBytes+mBytes > maxBytes {
+				emit()
+				openChunk()
+				addScope(sm, scopeBytes)
 			}
 			m.CopyTo(ms.AppendEmpty())
 			curBytes += mBytes
-		}
-		if ms.Len() > 0 || emptyScope {
-			*out = append(*out, md)
+			held++
 		}
 	}
+	emit()
 }
 
 // splitBigMetric packs one over-large metric's data points into whole-Metrics
@@ -367,17 +450,19 @@ func pointAccessors(m pmetric.Metric) (n int, sizeOf func(int) int, appendTo fun
 	return 0, func(int) int { return 0 }, func(int, pmetric.Metric) {}
 }
 
-func emptyMetricsRM(rm pmetric.ResourceMetrics) pmetric.ResourceMetrics {
+func emptyScopesRM(rm pmetric.ResourceMetrics) pmetric.ResourceMetrics {
 	tmp := pmetric.NewMetrics()
 	nrm := tmp.ResourceMetrics().AppendEmpty()
 	rm.Resource().CopyTo(nrm.Resource())
 	nrm.SetSchemaUrl(rm.SchemaUrl())
-	for i := 0; i < rm.ScopeMetrics().Len(); i++ {
-		nsm := nrm.ScopeMetrics().AppendEmpty()
-		rm.ScopeMetrics().At(i).Scope().CopyTo(nsm.Scope())
-		nsm.SetSchemaUrl(rm.ScopeMetrics().At(i).SchemaUrl())
-	}
 	return nrm
+}
+
+func emptyMetricsSM(sm pmetric.ScopeMetrics) pmetric.ScopeMetrics {
+	nsm := pmetric.NewScopeMetrics()
+	sm.Scope().CopyTo(nsm.Scope())
+	nsm.SetSchemaUrl(sm.SchemaUrl())
+	return nsm
 }
 
 // Traces partitions td so each part's encoded size is <= maxBytes,
@@ -427,53 +512,78 @@ func Traces(td ptrace.Traces, maxBytes int) []ptrace.Traces {
 	return out
 }
 
+// splitBigResourceSpans packs one over-large ResourceSpans' spans into
+// whole-Traces chunks. Chunks carry across the scope loop and the per-chunk
+// base counts the CURRENT scope only — see splitBigResourceLogs for both.
 func splitBigResourceSpans(rs ptrace.ResourceSpans, maxBytes int, out *[]ptrace.Traces) {
-	base := traceMarshaler.ResourceSpansSize(emptySpansRS(rs)) + elemOverhead
-	newChunk := func() (ptrace.Traces, ptrace.SpanSlice, ptrace.ScopeSpans) {
-		td := ptrace.NewTraces()
-		nrs := td.ResourceSpans().AppendEmpty()
+	resBase := traceMarshaler.ResourceSpansSize(emptyScopesRS(rs)) + elemOverhead
+	var (
+		td       ptrace.Traces
+		nrs      ptrace.ResourceSpans
+		spans    ptrace.SpanSlice
+		open     bool
+		curBytes int
+		held     int
+	)
+	emit := func() {
+		if open {
+			*out = append(*out, td)
+			open = false
+		}
+	}
+	openChunk := func() {
+		td = ptrace.NewTraces()
+		nrs = td.ResourceSpans().AppendEmpty()
 		rs.Resource().CopyTo(nrs.Resource())
 		nrs.SetSchemaUrl(rs.SchemaUrl())
+		curBytes, held, open = resBase, 0, true
+	}
+	addScope := func(ss ptrace.ScopeSpans, scopeBytes int) {
 		nss := nrs.ScopeSpans().AppendEmpty()
-		return td, nss.Spans(), nss
+		ss.Scope().CopyTo(nss.Scope())
+		nss.SetSchemaUrl(ss.SchemaUrl())
+		spans = nss.Spans()
+		curBytes += scopeBytes
 	}
 	sss := rs.ScopeSpans()
 	for i := 0; i < sss.Len(); i++ {
 		ss := sss.At(i)
-		emptyScope := ss.Spans().Len() == 0
-		td, spans, nss := newChunk()
-		ss.Scope().CopyTo(nss.Scope())
-		nss.SetSchemaUrl(ss.SchemaUrl())
-		curBytes := base
+		scopeBytes := traceMarshaler.ScopeSpansSize(emptySpansSS(ss)) + elemOverhead
+		if open && curBytes+scopeBytes > maxBytes {
+			emit()
+		}
+		if !open {
+			openChunk()
+		}
+		addScope(ss, scopeBytes)
 		src := ss.Spans()
 		for j := 0; j < src.Len(); j++ {
 			sp := src.At(j)
 			spBytes := traceMarshaler.SpanSize(sp) + elemOverhead
-			if spans.Len() > 0 && curBytes+spBytes > maxBytes {
-				*out = append(*out, td)
-				td, spans, nss = newChunk()
-				ss.Scope().CopyTo(nss.Scope())
-				nss.SetSchemaUrl(ss.SchemaUrl())
-				curBytes = base
+			if held > 0 && curBytes+spBytes > maxBytes {
+				emit()
+				openChunk()
+				addScope(ss, scopeBytes)
 			}
 			sp.CopyTo(spans.AppendEmpty())
 			curBytes += spBytes
-		}
-		if spans.Len() > 0 || emptyScope {
-			*out = append(*out, td)
+			held++
 		}
 	}
+	emit()
 }
 
-func emptySpansRS(rs ptrace.ResourceSpans) ptrace.ResourceSpans {
+func emptyScopesRS(rs ptrace.ResourceSpans) ptrace.ResourceSpans {
 	tmp := ptrace.NewTraces()
 	nrs := tmp.ResourceSpans().AppendEmpty()
 	rs.Resource().CopyTo(nrs.Resource())
 	nrs.SetSchemaUrl(rs.SchemaUrl())
-	for i := 0; i < rs.ScopeSpans().Len(); i++ {
-		nss := nrs.ScopeSpans().AppendEmpty()
-		rs.ScopeSpans().At(i).Scope().CopyTo(nss.Scope())
-		nss.SetSchemaUrl(rs.ScopeSpans().At(i).SchemaUrl())
-	}
 	return nrs
+}
+
+func emptySpansSS(ss ptrace.ScopeSpans) ptrace.ScopeSpans {
+	nss := ptrace.NewScopeSpans()
+	ss.Scope().CopyTo(nss.Scope())
+	nss.SetSchemaUrl(ss.SchemaUrl())
+	return nss
 }

@@ -17,11 +17,12 @@ import (
 	"unicode/utf8"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/validate/content"
 
 	"github.com/JohanLindvall/kubescrape/internal/obs"
 	"github.com/JohanLindvall/kubescrape/internal/peerip"
 	"github.com/JohanLindvall/kubescrape/internal/scrape"
-	"github.com/JohanLindvall/kubescrape/internal/servicemonitors"
+	"github.com/JohanLindvall/kubescrape/internal/services"
 	"github.com/JohanLindvall/kubescrape/internal/store"
 	"github.com/JohanLindvall/kubescrape/pkg/kubemeta"
 )
@@ -231,40 +232,75 @@ func (s *Server) handleNodeTargets(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	node := r.PathValue("node")
+	// A conditional GET answered from the ETag memo never builds the response
+	// at all — see nodeTargetsNotModified. Every agent poll after the first is
+	// one of these.
+	if s.nodeTargetsNotModified(w, r, node) {
+		return
+	}
+	targets, built := s.nodeTargets(node)
+	// Cached like the other metadata 200s (Cache-Control max-age + ETag): every
+	// agent re-fetches its target list every cycle, and the response embeds the
+	// COMPLETE pod document per target — without revalidation that is the whole
+	// node's pod set re-sent 30x/min regardless of change, the one metadata
+	// route that had no 304 path. Staleness is bounded by the TTL (default 10s,
+	// under the default scrape interval and additive to the agent's own polling
+	// lag); the server-side list itself still drops deleted/finished/terminating
+	// pods immediately (the invariant is about what a fresh response contains).
+	doc := map[string]any{"node": node, "targets": targets}
+	if s.cacheTTL <= 0 {
+		writeJSON(w, http.StatusOK, doc)
+		return
+	}
+	body, err := json.Marshal(doc)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "encoding response")
+		return
+	}
+	etag := entityTag(body)
+	// Memoised BEFORE the response is written: the client may revalidate the
+	// instant it holds the ETag, and remembering afterwards leaves a window in
+	// which the tag this server just handed out is one it cannot recognise.
+	if built {
+		s.rememberNodeTargets(node, etag)
+	}
+	s.writeCachedBody(w, r, body, etag, false)
+}
+
+// nodeTargets derives the scrape targets of every scrapeable pod on a node,
+// deduped and in a deterministic order. built reports whether the node has pods
+// at all — the ETag memo is only for nodes that do (see rememberNodeTargets).
+func (s *Server) nodeTargets(node string) (targets []kubemeta.ScrapeTarget, built bool) {
+	s.targetBuilds.Add(1)
 	pods := s.store.PodsOnNode(node)
-	targets := make([]kubemeta.ScrapeTarget, 0)
-	var monitored map[string][]monitorEndpoint
+	targets = make([]kubemeta.ScrapeTarget, 0)
+	if len(pods) == 0 { // an empty node cannot match any monitored service
+		return targets, false
+	}
+	monitored := s.monitoredServices()
 	// Hoisted out of the per-pod loop: PodMonitors() copies and SORTS the whole
 	// monitor list on every call, so a node with 110 pods and 200 monitors did
 	// 110 sorts and 22k selector evaluations per request, per agent, per scrape
 	// cycle. The sibling ServiceMonitor match is memoised for the same reason.
-	var allPodMonitors []*servicemonitors.PodMonitor
-	if len(pods) > 0 { // an empty node cannot match any monitored service
-		monitored = s.monitoredServices()
-		if s.monitors != nil {
-			allPodMonitors = s.monitors.PodMonitors()
-		}
-	}
+	allPodMonitors := s.allPodMonitors()
+	// ONE snapshot of each namespace's Services for the whole request. The
+	// per-pod Matching() call it replaces took the index RLock and walked every
+	// Service in the pod's namespace, so a 1,000-Service namespace cost 110 lock
+	// round trips and 110 map walks per request — on the DEFAULT annotation
+	// path, while its two siblings on the same request (monitoredServices, the
+	// PodMonitor list) had both already been hoisted out of this loop.
+	svcByNamespace := s.services.InNamespaces(podNamespaces(pods))
+
+	var d targetDedup
+	var matched []*services.Service
+	var podMonitors []podMonitorRef
 	for _, np := range pods {
 		if !scrape.Scrapeable(np.Pod) {
 			continue // finished/deleted pods can never yield targets
 		}
 		// Cheap pre-check before the (per-pod) enrichment work: does the pod
 		// or any service selecting it opt into scraping?
-		matched := s.services.Matching(np.Pod.Namespace, np.Pod.Labels)
-		// Map iteration order in the services index must not decide which
-		// Service a URL-deduped target is attributed to. Guarded because the
-		// overwhelmingly common case is 0 or 1 matching Service, where
-		// sort.Slice still allocates the reflect swapper and the comparison
-		// closure — per pod, per node, per scrape cycle — to sort nothing.
-		if len(matched) > 1 {
-			sort.Slice(matched, func(i, j int) bool {
-				if matched[i].Namespace != matched[j].Namespace {
-					return matched[i].Namespace < matched[j].Namespace
-				}
-				return matched[i].Name < matched[j].Name
-			})
-		}
+		matched = matchingServices(svcByNamespace[np.Pod.Namespace], np.Pod.Labels, matched[:0])
 		podAnnotated := np.Pod.Annotations[scrape.AnnotationScrape] == "true"
 		svcAnnotated := false
 		for _, svc := range matched {
@@ -273,47 +309,55 @@ func (s *Server) handleNodeTargets(w http.ResponseWriter, r *http.Request) {
 				break
 			}
 		}
-		podMonitors := s.podMonitorsFor(np.Pod, allPodMonitors)
+		podMonitors = podMonitorsFor(np.Pod, allPodMonitors, podMonitors[:0])
 		if !podAnnotated && !svcAnnotated && len(podMonitors) == 0 {
 			continue
 		}
 		s.enrich(&np.Pod, np.OwnerRefs)
 
-		podTargets := scrape.PodTargets(np.Pod)
+		d.reset(&targets)
+		for _, t := range scrape.PodTargets(np.Pod) {
+			d.add(t)
+		}
 		for _, svc := range matched {
-			podTargets = append(podTargets, scrape.ServiceTargets(np.Pod, svc)...)
+			for _, t := range scrape.ServiceTargets(np.Pod, svc) {
+				d.add(t)
+			}
 			for _, sme := range monitored[svc.UID] {
-				podTargets = append(podTargets, scrape.MonitorTargets(np.Pod, svc, sme.monitor, sme.endpoint)...)
+				// The URL — a scrape target's identity — resolves without
+				// building the target, so a monitor endpoint this pod already
+				// holds costs a map lookup instead of a 592-byte target with the
+				// whole pod document embedded, a fresh Service view and a copy of
+				// the relabeling rules. Sweeping N cluster-wide ServiceMonitors
+				// over the same Services, the response is byte-identical at every
+				// N while the loop used to build 125 targets per pod to keep 2.
+				url, ok := scrape.MonitorTargetURL(np.Pod, svc, *sme.endpoint)
+				if !ok {
+					continue
+				}
+				if winner, shadowed := d.shadows(url); shadowed {
+					s.reportShadowed("servicemonitor", winner, sme.monitor, url)
+					continue
+				}
+				for _, t := range scrape.MonitorTargets(np.Pod, svc, sme.monitor, *sme.endpoint) {
+					d.add(t)
+				}
 			}
 		}
 		for _, pm := range podMonitors {
-			for _, ep := range pm.Endpoints {
-				podTargets = append(podTargets, scrape.PodMonitorTargets(np.Pod, pm.Namespace+"/"+pm.Name, ep)...)
-			}
-		}
-		// The same endpoint can be reachable via pod and service annotations;
-		// keep the first occurrence (pod source wins).
-		//
-		// EXCEPT when a later duplicate carries monitor configuration the
-		// earlier one cannot: a ServiceMonitor/PodMonitor endpoint's
-		// bearerTokenSecret, insecureSkipVerify and metricRelabelings live only
-		// on the monitor-derived target, and monitors are appended last. An
-		// org-wide `prometheus.io/scrape: "true"` annotation coexisting with
-		// prometheus-operator CRDs is common, and dropping the monitor target
-		// meant scraping a token-protected endpoint unauthenticated (401 — total
-		// metric loss, visible only as up=0) and, worse, exporting the very
-		// series a drop rule asked to remove. The URL is identical either way,
-		// so keeping the configured variant scrapes the same endpoint, correctly.
-		seen := make(map[string]int, len(podTargets)) // URL -> index in targets
-		for _, t := range podTargets {
-			i, dup := seen[t.URL]
-			if !dup {
-				seen[t.URL] = len(targets)
-				targets = append(targets, t)
-				continue
-			}
-			if configuredTarget(t) && !configuredTarget(targets[i]) {
-				targets[i] = t
+			for i := range pm.monitor.Endpoints {
+				ep := &pm.monitor.Endpoints[i]
+				url, ok := scrape.PodMonitorTargetURL(np.Pod, *ep)
+				if !ok {
+					continue
+				}
+				if winner, shadowed := d.shadows(url); shadowed {
+					s.reportShadowed("podmonitor", winner, pm.name, url)
+					continue
+				}
+				for _, t := range scrape.PodMonitorTargets(np.Pod, pm.name, *ep) {
+					d.add(t)
+				}
 			}
 		}
 	}
@@ -336,18 +380,138 @@ func (s *Server) handleNodeTargets(w http.ResponseWriter, r *http.Request) {
 		}
 		return targets[i].Pod.UID < targets[j].Pod.UID
 	})
-	// Cached like the other metadata 200s (Cache-Control max-age + ETag): every
-	// agent re-fetches its target list every cycle, and the response embeds the
-	// COMPLETE pod document per target — without revalidation that is the whole
-	// node's pod set re-sent 30x/min regardless of change, the one metadata
-	// route that had no 304 path. Staleness is bounded by the TTL (default 10s,
-	// under the default scrape interval and additive to the agent's own polling
-	// lag); the server-side list itself still drops deleted/finished/terminating
-	// pods immediately (the invariant is about what a fresh response contains).
-	s.writeCached(w, r, map[string]any{
-		"node":    node,
-		"targets": targets,
-	}, false)
+	return targets, true
+}
+
+// podNamespaces lists the distinct namespaces of a node's pods, for the one
+// Services snapshot the whole request works from.
+func podNamespaces(pods []store.NodePod) []string {
+	seen := make(map[string]struct{}, 8)
+	out := make([]string, 0, 8)
+	for _, np := range pods {
+		if _, dup := seen[np.Pod.Namespace]; dup {
+			continue
+		}
+		seen[np.Pod.Namespace] = struct{}{}
+		out = append(out, np.Pod.Namespace)
+	}
+	return out
+}
+
+// matchingServices filters a namespace's Services down to the ones selecting a
+// pod, appending into a caller-owned scratch slice (one per request, not one
+// per pod). The snapshot is already sorted by name, so the result is too: map
+// iteration order must not decide which Service a URL-deduped target is
+// attributed to.
+func matchingServices(inNamespace []*services.Service, podLabels map[string]string, out []*services.Service) []*services.Service {
+	for _, svc := range inNamespace {
+		if svc.Selects(podLabels) {
+			out = append(out, svc)
+		}
+	}
+	return out
+}
+
+// targetDedup collapses the duplicate targets ONE pod can produce, in the order
+// they are offered (pod annotations, then per Service the service annotations
+// and the ServiceMonitor endpoints, then the PodMonitors). One URL on one pod
+// yields exactly one target.
+//
+//   - The same endpoint reachable via pod and service annotations is ONE target
+//     described twice; keep the first (pod source wins), and let a monitor
+//     UPGRADE it — a ServiceMonitor/PodMonitor endpoint's bearerTokenSecret,
+//     insecureSkipVerify and metricRelabelings live only on the monitor-derived
+//     target, and an org-wide `prometheus.io/scrape: "true"` annotation
+//     coexisting with prometheus-operator CRDs is common. Dropping the monitor
+//     target meant scraping a token-protected endpoint unauthenticated (401 —
+//     total metric loss, visible only as up=0) and, worse, exporting the very
+//     series a drop rule asked to remove.
+//
+//   - Two MONITORS resolving to one URL are two independent scrape declarations
+//     that kubescrape cannot both honour, and this is the one place that is a
+//     real limitation rather than a bug: prometheus-operator emits a job per
+//     (monitor, endpoint) and distinguishes their series by the `job` label,
+//     while a kubescrape target's exported identity is
+//     (url.full, service.instance.id = host:port, pod, service) with NO monitor
+//     component — so serving both would scrape the endpoint twice and export two
+//     byte-identical series identities in one payload, which a backend reads as
+//     a conflict rather than as two targets (promscrape's fillTargetResource
+//     comment describes fixing exactly that, and scheduleKey's says the metadata
+//     service dedupes same-URL targets within a pod). The first monitor by
+//     (namespace, name) therefore wins, deterministically — and the loser is
+//     COUNTED and LOGGED (obs.MonitorTargetShadowed), because the outcome an app
+//     team gets is that its metricRelabelings drop rule is a no-op, decided by
+//     alphabetical order, and that must not be something only a packet capture
+//     can reveal.
+type targetDedup struct {
+	// out is the destination slice, re-pointed per pod (dedup is per pod: two
+	// hostNetwork pods legitimately share the node IP and every URL on it).
+	out *[]kubemeta.ScrapeTarget
+	// urlOwner indexes the entry currently HOLDING a URL — the annotation
+	// target, or the monitor one that claimed it.
+	urlOwner map[string]int
+}
+
+// reset points the dedup at a fresh pod. The map is reused across pods: it is
+// allocated once per request rather than once per pod.
+func (d *targetDedup) reset(out *[]kubemeta.ScrapeTarget) {
+	d.out = out
+	if d.urlOwner == nil {
+		d.urlOwner = make(map[string]int, 4)
+		return
+	}
+	clear(d.urlOwner)
+}
+
+// shadows reports the monitor already holding a URL, when an incoming
+// MONITOR-derived target for it could only be dropped. It is the cheap check
+// the caller makes BEFORE materialising: the answer needs the URL and nothing
+// else, so a shadowed target costs a map lookup instead of a 592-byte target
+// with the whole pod document embedded.
+//
+// A URL held by an ANNOTATION target is deliberately not a hit — the monitor
+// target upgrades it, and that upgrade is why the caller must still build one.
+func (d *targetDedup) shadows(url string) (winner string, shadowed bool) {
+	i, taken := d.urlOwner[url]
+	if !taken {
+		return "", false
+	}
+	// By POINTER: a ScrapeTarget is 592 bytes with the pod document embedded,
+	// and this runs per (pod, monitor endpoint).
+	held := &(*d.out)[i]
+	if !configuredTarget(held) {
+		return "", false
+	}
+	return held.Monitor, true
+}
+
+func (d *targetDedup) add(t kubemeta.ScrapeTarget) {
+	i, taken := d.urlOwner[t.URL]
+	if !taken {
+		d.urlOwner[t.URL] = len(*d.out)
+		*d.out = append(*d.out, t)
+		return
+	}
+	// pod source wins over service source, and a monitor wins over both.
+	if held := &(*d.out)[i]; configuredTarget(&t) && !configuredTarget(held) {
+		carryForward(&t, held)
+		*held = t
+	}
+}
+
+// carryForward moves the fields the replaced target had and the winner lacks.
+//
+// Today that is exactly the Service: a PODMONITOR selects pods directly and its
+// targets carry none, so replacing a service-annotation target with one wholesale
+// stripped k8s.service.name and k8s.service.uid from every sample of that
+// endpoint (promscrape's fillTargetResource reads target.Service). The
+// preference's own justification — that the monitor target carries strictly
+// MORE — is true of the ServiceMonitor arm, which sets Service, and false of
+// the PodMonitor one.
+func carryForward(winner, replaced *kubemeta.ScrapeTarget) {
+	if winner.Service == nil {
+		winner.Service = replaced.Service
+	}
 }
 
 // configuredTarget reports whether t carries endpoint configuration that only
@@ -356,7 +520,7 @@ func (s *Server) handleNodeTargets(w http.ResponseWriter, r *http.Request) {
 // (total metric loss for the target), without insecureSkipVerify an https
 // endpoint with a private CA fails, and without the metricRelabelings the
 // series a drop rule targets are exported anyway.
-func configuredTarget(t kubemeta.ScrapeTarget) bool {
+func configuredTarget(t *kubemeta.ScrapeTarget) bool {
 	// Monitor != "" is the test, NOT a list of the config fields that happen to
 	// exist today: an enumeration silently goes stale every time an endpoint
 	// field is interpreted (it already had, for basicAuth, authorization, the
@@ -411,6 +575,29 @@ func (s *Server) handleScrapeAuth(w http.ResponseWriter, r *http.Request) {
 	if s.monitors == nil {
 		writeError(w, http.StatusNotFound, "no monitors indexed")
 		return
+	}
+	// The allowlist key is a flat "ns/name/key" join checked against three
+	// SEPARATELY-CHOSEN path segments, and Go's ServeMux unescapes %2F inside a
+	// single wildcard segment — so without this, three segments could be
+	// re-cut: GET /v1/scrape-auth/tenant%2Fvictim/creds/token matches the entry
+	// a monitor in namespace `tenant` mints for a bearerTokenSecret named
+	// "victim/creds", and reaches SecretReader.Get with namespace
+	// "tenant/victim". The shipped client-go reader rejects that namespace
+	// before it sends anything, but Secrets is a pluggable interface and a
+	// reader implemented over a lister keyed by "ns/name" — the obvious
+	// optimisation for a per-scrape-cycle path — would perform the read.
+	//
+	// So both ends refuse the ambiguity: servicemonitors' secretRef.ref
+	// declines to MINT such an entry, and this declines to match one. The check
+	// is the API server's own for a name used as a path segment (content.
+	// IsPathSegmentName, which validation/path now merely aliases): "/", "%",
+	// "." and ".." are exactly what re-cutting needs.
+	for what, v := range map[string]string{"namespace": ns, "name": name, "key": key} {
+		if errs := content.IsPathSegmentName(v); len(errs) > 0 {
+			writeError(w, http.StatusBadRequest,
+				fmt.Sprintf("invalid %s %q: %s", what, v, errs[0]))
+			return
+		}
 	}
 	if _, ok := s.monitors.AuthSecretRefs()[ns+"/"+name+"/"+key]; !ok {
 		writeError(w, http.StatusForbidden, "secret is not referenced by any monitor endpoint")
@@ -548,12 +735,38 @@ func (s *Server) writeCached(w http.ResponseWriter, r *http.Request, v any, priv
 		writeError(w, http.StatusInternalServerError, "encoding response")
 		return
 	}
-	etag := `"` + strconv.FormatUint(bodyHash(body), 16) + `"`
-	// max-age has second granularity: a sub-second TTL truncates to 0, which
-	// tells the client not to cache AT ALL — the opposite of a short cache, and
-	// silently (the ETag is still computed on every response). Round up so any
-	// non-zero TTL caches for at least a second; 0 disables caching before we
-	// get here.
+	s.writeCachedBody(w, r, body, entityTag(body), private)
+}
+
+// writeCachedBody serves an already-encoded body under its entity tag: the
+// cache headers, then either the 304 a matching validator asks for or the body.
+// handleNodeTargets encodes for itself, because it memoises the tag and has to
+// do so before the client can act on it.
+func (s *Server) writeCachedBody(w http.ResponseWriter, r *http.Request, body []byte, etag string, private bool) {
+	h := w.Header()
+	h.Set("Content-Type", "application/json")
+	h.Set("Cache-Control", s.cacheControl(private))
+	h.Set("ETag", etag)
+	if match := r.Header.Get("If-None-Match"); match != "" && etagMatches(match, etag) {
+		w.WriteHeader(http.StatusNotModified)
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(body)
+}
+
+// entityTag is the ETag of a response body.
+func entityTag(body []byte) string {
+	return `"` + strconv.FormatUint(bodyHash(body), 16) + `"`
+}
+
+// cacheControl renders the freshness lifetime a cached 200 advertises.
+//
+// max-age has second granularity: a sub-second TTL truncates to 0, which tells
+// the client not to cache AT ALL — the opposite of a short cache, and silently
+// (the ETag is still computed on every response). Round up so any non-zero TTL
+// caches for at least a second; 0 disables caching before we get here.
+func (s *Server) cacheControl(private bool) string {
 	maxAge := int(s.cacheTTL.Seconds())
 	if maxAge < 1 {
 		maxAge = 1
@@ -562,14 +775,90 @@ func (s *Server) writeCached(w http.ResponseWriter, r *http.Request, v any, priv
 	if private {
 		cc = "private, " + cc
 	}
+	return cc
+}
+
+// nodeTargetsETag remembers what one node's target list was called, and when.
+type nodeTargetsETag struct {
+	etag    string
+	builtAt time.Time
+}
+
+// maxNodeTargetETags bounds the memo. An entry is a node name and a 16-hex tag,
+// and one is minted only for a node the store HAS pods on — a caller inventing
+// node names gets an empty list, which costs a map lookup to produce and never
+// reaches the memo. The cap is belt and braces against a cluster far larger
+// than this service is built for; over it the oldest entries are dropped and
+// those nodes simply rebuild.
+const maxNodeTargetETags = 8192
+
+// nodeTargetsNotModified answers a conditional GET for a node's targets from
+// the ETag memo, without building the response — reporting whether it did.
+//
+// The ETag is a body hash, so a 304 otherwise cost EVERYTHING a 200 costs:
+// PodsOnNode, per-pod owner and namespace enrichment, target derivation, the
+// sort and a full json.Marshal, and then the body was discarded (measured at
+// 110 pods: 1.87 ms, 1.90 MB and 7,553 allocations to send an empty 304, with
+// json.Marshal at 48.6% of the request's CPU). With a 10s TTL under a 30s
+// scrape interval EVERY agent poll is exactly this request.
+//
+// Answering from a memo younger than the TTL is not a weaker guarantee than the
+// response already gives: max-age says in as many words that the client may
+// serve its copy for that long WITHOUT asking. A revalidation inside the same
+// window can therefore only confirm what the client was already entitled to
+// assume. Past the TTL the memo is ignored and the response is rebuilt, which
+// is where a changed target list becomes a 200.
+//
+// Only the tag is memoised, never the body: the body is the whole node's pod
+// set (2.21 MB at 110 pods), and holding one per node would put hundreds of
+// megabytes of response bodies in a process with a 128Mi request.
+func (s *Server) nodeTargetsNotModified(w http.ResponseWriter, r *http.Request, node string) bool {
+	if s.cacheTTL <= 0 {
+		return false
+	}
+	match := r.Header.Get("If-None-Match")
+	if match == "" {
+		return false
+	}
+	s.targetsMu.Lock()
+	e, ok := s.targetsETags[node]
+	s.targetsMu.Unlock()
+	if !ok || s.now().Sub(e.builtAt) >= s.cacheTTL || !etagMatches(match, e.etag) {
+		return false
+	}
 	h := w.Header()
 	h.Set("Content-Type", "application/json")
-	h.Set("Cache-Control", cc)
-	h.Set("ETag", etag)
-	if match := r.Header.Get("If-None-Match"); match != "" && etagMatches(match, etag) {
-		w.WriteHeader(http.StatusNotModified)
+	h.Set("Cache-Control", s.cacheControl(false))
+	h.Set("ETag", e.etag)
+	w.WriteHeader(http.StatusNotModified)
+	return true
+}
+
+// rememberNodeTargets records what a node's freshly built target list is
+// called, so the next revalidation inside the TTL can be answered without
+// building it again.
+func (s *Server) rememberNodeTargets(node, etag string) {
+	if etag == "" { // caching disabled, or the response failed to encode
 		return
 	}
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(body)
+	now := s.now()
+	s.targetsMu.Lock()
+	defer s.targetsMu.Unlock()
+	if s.targetsETags == nil {
+		s.targetsETags = make(map[string]nodeTargetsETag)
+	}
+	if len(s.targetsETags) >= maxNodeTargetETags {
+		// Drop what is already useless (a stale entry can only produce a
+		// rebuild anyway). If that frees nothing, skip the memo rather than
+		// grow: rebuilding is the correct answer, just the slow one.
+		for k, v := range s.targetsETags {
+			if now.Sub(v.builtAt) >= s.cacheTTL {
+				delete(s.targetsETags, k)
+			}
+		}
+		if len(s.targetsETags) >= maxNodeTargetETags {
+			return
+		}
+	}
+	s.targetsETags[node] = nodeTargetsETag{etag: etag, builtAt: now}
 }

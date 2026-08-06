@@ -124,18 +124,21 @@ is the documented alert for the non-buffered tailer.
 | `kubescrape_log_rotations_total` | — | Log file rotations and truncations handled. |
 | `kubescrape_log_rules_dropped_total` | — | Log records dropped by the logs rules (including sampled-away lines). |
 | `kubescrape_log_scrubbed_total` | `pattern` | Log bodies redacted by a scrub pattern (one bump per pattern per record, not per match). |
+| `kubescrape_log_segments_stalled` | — | Tracked files whose live tail is currently NOT being read because a rotated segment's replay cannot proceed. |
 | `kubescrape_log_torn_final_lines_total` | — | Unterminated final lines of RENAMED-away files (the fragment can never complete and is dropped). In-place truncation destroys its unread tail unmeasurably — there is nothing left to count — so truncation losses do not appear here or anywhere. |
 | `kubescrape_log_unresolved_lost_total` | — | Log files deleted before their metadata ever resolved (the metadata service was unreachable or the container unknown for the file's whole life). Their content was never read and is lost. |
 | `kubescrape_metadata_requests_total` | `outcome` | Requests to the metadata service by outcome. |
 | `kubescrape_monitor_fields_ignored_total` | `kind` | Monitor upserts whose endpoints set fields kubescrape does not interpret. |
 | `kubescrape_monitor_namespace_refused_total` | `kind` | Monitor upserts ignored because their namespace is not permitted by -monitor-namespaces (an informer re-delivery re-counts the same monitor, exactly like the sibling monitor_* counters). |
 | `kubescrape_monitor_parse_errors_total` | `kind` | Monitor upserts that failed to parse and were dropped from the index. |
+| `kubescrape_monitor_target_shadowed_total` | `kind` | Monitor endpoint targets dropped because another monitor already resolved to the same URL on that pod. |
 | `kubescrape_positions_corrupt_total` | — | Positions files that failed to parse at startup (whatever decoded is kept; the affected inputs re-read their window). Recurring bumps across restarts point at a failing disk, not a one-off crash. |
 | `kubescrape_positions_save_errors_total` | — | Failed writes of the positions file (committed offsets and the journald cursor are not being persisted). Any sustained rate means a bad path, a read-only mount or a full disk. |
 | `kubescrape_routed_payload_parts_total` | `route`, `signal` | Payload parts forwarded to a non-default routing destination. |
 | `kubescrape_scrape_auth_failures_total` | `reason` | Failed /v1/scrape-auth Secret resolutions by cause (not_found = no such Secret or key; upstream = forbidden, timeout or unreachable API server; not_utf8 = value cannot be served as a JSON string). |
 | `kubescrape_scrape_duration_seconds` | `pipeline` | Scrape duration by pipeline. |
 | `kubescrape_scrape_exemplars_malformed_total` | `pipeline` | Unparseable OpenMetrics exemplar suffixes by pipeline. NO data was lost: the samples carrying them were exported without the exemplar, which is why this is separate from kubescrape_scrape_malformed_total. Only ever nonzero where exemplar scraping is enabled. |
+| `kubescrape_scrape_histogram_mixed_total` | `pipeline`, `dropped` | Protobuf histogram metrics dropped because their family resolved to another representation, by pipeline and by the representation that lost: classic = per-bucket rows, nhcb = custom-bucket native (schema -53, whose bounds this client_model cannot read at all). |
 | `kubescrape_scrape_malformed_total` | `pipeline` | Exposition samples dropped as malformed by pipeline (unparseable lines, histogram buckets without le, summary rows without quantile). |
 | `kubescrape_scrape_name_collisions_total` | — | Data points dropped because their family name was already claimed by a metric of another shape in the same batch (a target redeclaring a family's TYPE mid-exposition). |
 | `kubescrape_scrape_samples_dropped_total` | `pipeline`, `reason` | Parsed samples discarded before conversion, by pipeline and by what discarded them: filter = the config's metrics keep/drop rules, relabel = a monitor's metricRelabelings. |
@@ -172,4 +175,4 @@ is the documented alert for the non-buffered tailer.
 | `kubescrape_transform_errors_total` | `signal` | Transform program invocations that failed (the batch is NOT exported; the error propagates to the producer's retry path). |
 | `kubescrape_transform_reloads_total` | `outcome` | Transforms-file reloads by outcome (applied, failed — a failed compile keeps the last good program). |
 
-110 metrics.
+113 metrics.

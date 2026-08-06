@@ -12,6 +12,8 @@ import (
 	"time"
 
 	"github.com/fsnotify/fsnotify"
+
+	"github.com/JohanLindvall/kubescrape/internal/agent/positions"
 )
 
 func TestPreexistingFileStartsAtEnd(t *testing.T) {
@@ -671,7 +673,7 @@ func TestScanWatchRecoveredAfterDirRecreation(t *testing.T) {
 
 // A path the glob just listed can vanish before claimPath's stat — a rename
 // rotation caught mid-scan. That ENOENT proves the file WAS there moments
-// ago, not that it is stably absent: left out of `seen`, the same
+// ago, not that it is stably absent: counted as proven absence, the same
 // (successful) listing pruned its not-yet-consumed checkpoint entry, so a
 // recreated path read from zero and the Pending prefixes — initFile's only
 // route back to the rotated inode's unshipped tail — were destroyed with it.
@@ -681,11 +683,144 @@ func TestGlobListedButVanishedPathIsUnprovenAbsence(t *testing.T) {
 	tl.scanDir(tl.loadCheckpoints(), true)
 
 	ghost := filepath.Join(dir, "ghost_ns1_app-ffffffff.log")
-	seen := map[string]struct{}{}
-	if tl.claimPath(tl.sources[0], ghost, seen) {
+	sets := scanSets{seen: map[string]struct{}{}, unproven: map[string]struct{}{}}
+	if tl.claimPath(tl.sources[0], ghost, &sets) {
 		t.Fatal("a vanished path must not be tracked")
 	}
-	if _, ok := seen[ghost]; !ok {
-		t.Fatal("glob-listed-but-ENOENT path not marked seen: this scan would prune its checkpoint entry")
+	if _, ok := sets.unproven[ghost]; !ok {
+		t.Fatal("glob-listed-but-ENOENT path not marked unproven: this scan would prune its checkpoint entry")
 	}
+	if _, ok := sets.seen[ghost]; ok {
+		t.Fatal("an unstattable path must not count as PRESENT: that suppresses gone-marking of a tracked file")
+	}
+}
+
+// /var/log/containers/*.log are SYMLINKS, and a readdir-based glob lists a
+// DANGLING one forever while os.Stat follows it and returns ENOENT forever. So
+// "the stat failed" is not evidence that this path is about to come back, and
+// treating it as such — to spare the stored checkpoint, which genuinely needs
+// that grace — suppressed gone-marking with it: the file was never released,
+// pinning its fd, its unlinked inode's disk space, its files-map entry and its
+// checkpoint entry for the process lifetime, with nothing logged and no counter
+// moving. The two proofs are separate (scanSets), and this pins both halves at
+// once: the tracked file goes, the un-consumed checkpoint entry stays.
+func TestDanglingSymlinkGoesWhileItsCheckpointStays(t *testing.T) {
+	dir := t.TempDir()
+	targets := t.TempDir()
+
+	target := filepath.Join(targets, "0.log")
+	writeLines(t, target, timeNowCRI()+" stdout F hello")
+	link := filepath.Join(dir, logName)
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+
+	tl := driveTailer(dir, &fakeExporter{})
+	tl.scanDir(tl.loadCheckpoints(), true)
+	f, ok := tl.files[link]
+	if !ok {
+		t.Fatal("setup: the symlinked container log was not discovered")
+	}
+	if f.f != nil {
+		t.Fatal("setup: this fixture never sweeps, so discovery must be the only gone-detector")
+	}
+
+	// A second dangling symlink, this one NOT tracked but carrying a stored
+	// offset — the rename-rotation-caught-mid-scan shape the grace exists for.
+	ghostTarget := filepath.Join(targets, "1.log")
+	ghost := filepath.Join(dir, "other_ns1_app-ffffffffffffffff.log")
+	writeLines(t, ghostTarget, "x")
+	if err := os.Symlink(ghostTarget, ghost); err != nil {
+		t.Fatal(err)
+	}
+	tl.checkpoints = map[string]checkpoint{ghost: {Offset: 7, Inode: 42}}
+
+	// Both targets go; the symlinks stay, so the glob keeps listing both paths.
+	if err := os.Remove(target); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(ghostTarget); err != nil {
+		t.Fatal(err)
+	}
+	tl.scanDir(nil, false)
+
+	if !f.gone {
+		t.Fatal("a permanently dangling symlink was not marked gone: its fd, its unlinked inode, " +
+			"its files-map entry and its checkpoint entry pin for the process lifetime")
+	}
+	if _, ok := tl.checkpoints[ghost]; !ok {
+		t.Fatal("an unstattable path's stored offset was pruned: a recreated path would read from " +
+			"zero and its Pending prefixes — the only route back to a rotated inode's tail — are gone")
+	}
+}
+
+// Discovery skips its stat for a tracked, open file (claimPath / file.swept),
+// because the sweep stats that same path itself once per sweep. That skip is
+// only sound while the sweep's own ENOENT marks the file gone — otherwise it
+// restores exactly the dangling-symlink leak, one layer down and for the files
+// that matter most (the open ones).
+func TestVanishedPathOfAnOpenFileIsReleased(t *testing.T) {
+	dir := t.TempDir()
+	targets := t.TempDir()
+	ctx := context.Background()
+
+	exp := &fakeExporter{}
+	tl := driveTailer(dir, exp)
+	tl.scanDir(tl.loadCheckpoints(), true) // empty dir: what follows is NEW, not history
+
+	target := filepath.Join(targets, "0.log")
+	writeLines(t, target, timeNowCRI()+" stdout F hello")
+	link := filepath.Join(dir, logName)
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+	tl.scanDir(nil, false)
+	driveUntil(t, ctx, tl, func() bool { return slices.Contains(exp.get(), "hello") },
+		"the symlinked log being read")
+	if f := tl.files[link]; f == nil || f.f == nil {
+		t.Fatal("setup: the file must be tracked with an open fd")
+	}
+
+	if err := os.Remove(target); err != nil {
+		t.Fatal(err)
+	}
+	driveUntil(t, ctx, tl, func() bool { _, ok := tl.files[link]; return !ok },
+		"the file whose path stopped resolving being drained and released")
+}
+
+// Segments belong to the incremental path: readArchive never calls
+// feedSegments, so a Pending entry restored onto a COMPRESSED file is owed
+// forever — settledGone can never fire and saveCheckpoints rewrites the stale
+// list on every save for the life of the process. (Reachable when a path with
+// Pending entries is later matched by a `compressed: true` source.) The
+// open-ended synthesis right below it was already gated this way.
+func TestCompressedFileRestoresNoPendingSegments(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+	path := filepath.Join(dir, "app.log.gz")
+	writeGzip(t, path, "arc-one", "arc-two")
+
+	pos := mustOpenPositions(t, filepath.Join(t.TempDir(), "pos.json"))
+	if err := pos.SetLogs(map[string]positions.LogPos{path: {
+		Offset: 0, Inode: inodeOfPath(t, path),
+		Pending: []positions.Prefix{{Inode: 424242, From: 0, To: 100}},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+
+	exp := &fakeExporter{}
+	tl := newArchiveTailer(dir, exp)
+	tl.cfg.Positions = pos
+	tl.scanDir(tl.loadCheckpoints(), true)
+
+	f, ok := tl.files[path]
+	if !ok {
+		t.Fatal("setup: the archive was not discovered")
+	}
+	if n := len(f.segments); n != 0 {
+		t.Fatalf("a compressed file restored %d Pending segment(s) nothing will ever feed: "+
+			"settledGone can never fire and the stale list is rewritten on every save", n)
+	}
+	driveUntil(t, ctx, tl, func() bool { return slices.Contains(exp.get(), "arc-one") },
+		"the archive still being read")
 }

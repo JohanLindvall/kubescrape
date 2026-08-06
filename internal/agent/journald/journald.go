@@ -17,6 +17,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/plog"
@@ -348,18 +349,55 @@ func (r *Reader) stream(ctx context.Context) error {
 	}
 }
 
+// utf8Replacement stands in for each invalid byte, U+FFFD.
+const utf8Replacement = "�"
+
 // sanitize makes one journal message exportable: valid UTF-8 (the journal
 // stores raw bytes) and capped at MaxEntryBytes without splitting a rune.
 // origLen reports the RAW journal length — captured before the UTF-8
 // replacement, whose replacement runes would otherwise inflate/deflate the
 // advertised original size.
+//
+// Two things it must not do, both on the SINGLE reader goroutine that also
+// flushes, so a stall here is a stall for every unit on the node:
+//
+// Validate what it is about to throw away. strings.ToValidUTF8 walks a string
+// rune by rune and is ~31x slower than utf8.ValidString on the overwhelmingly
+// common already-valid input (1 MiB: 2.07 ms against 67 µs), so it is gated on
+// a ValidString probe and, past the cap, runs only over the bytes that survive
+// the cut. Same lesson as logscrub's secretKVCandidate: the admission IS the
+// cost.
+//
+// Hand back a reslice of the original. logchain.TruncateRunes ends in s[:n],
+// which pins the WHOLE journal message for the life of the batch while
+// batchBytes counts only the truncated length — so MaxBatchBytes, documented
+// as "a soft bound that keeps a batch from growing large in memory", bounded
+// nothing. Measured at MaxEntryBytes 1 KiB over 1024 x 64 KiB messages:
+// 1.00 MB accounted, 64.15 MB live. Defaults are nearly immune (both are
+// 1 MiB), so it bit exactly the operator who LOWERED the entry cap to bound
+// memory. The truncating branch clones; the whole-message branch cannot alias
+// anything the batch does not already own.
 func (r *Reader) sanitize(msg string) (body string, origLen int) {
 	raw := len(msg)
-	msg = strings.ToValidUTF8(msg, "�")
-	if len(msg) > r.cfg.MaxEntryBytes {
+	if raw <= r.cfg.MaxEntryBytes {
+		if utf8.ValidString(msg) {
+			return msg, 0
+		}
+		msg = strings.ToValidUTF8(msg, utf8Replacement)
+		if len(msg) <= r.cfg.MaxEntryBytes {
+			return msg, 0
+		}
+		// A replacement rune is wider than the byte it replaces, so a message
+		// that fit before validation need not fit after it.
 		return logchain.TruncateRunes(msg, r.cfg.MaxEntryBytes), raw
 	}
-	return msg, 0
+	cut := logchain.TruncateRunes(msg, r.cfg.MaxEntryBytes)
+	if !utf8.ValidString(cut) {
+		// Fresh allocation, so the second cut aliases only itself; clone below
+		// is then a cheap copy of at most MaxEntryBytes.
+		cut = logchain.TruncateRunes(strings.ToValidUTF8(cut, utf8Replacement), r.cfg.MaxEntryBytes)
+	}
+	return strings.Clone(cut), raw
 }
 
 // ingest converts one raw journal entry (body already sanitized) into the

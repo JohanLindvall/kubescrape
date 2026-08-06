@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"time"
 
 	"github.com/JohanLindvall/kubescrape/internal/obs"
 )
@@ -238,12 +239,31 @@ func (t *Tailer) reopen(ctx context.Context, f *file, renamed, drained bool) {
 		// the pipeline AHEAD of the older lines feedSegments must replay
 		// first — flush the group split instead of joining it out of order.)
 	} else {
+		// ledger.reset zeroes every segment's fedTo because it is written for
+		// the PURGE case (rewind): the lines it names were discarded unemitted,
+		// so the replay must start over from `committed`. stopPipeline does the
+		// opposite — it DRAINS, emitting the buffered lines into the batch — so
+		// a budget-cut replay's already-fed prefix is still live and re-reading
+		// it delivers every one of those records twice, until the batch flushes.
+		// Carry the frontier across the rebuild.
+		//
+		// Unconditionally, unlike the `fed` re-stamp below: the drain preserves
+		// the lines whatever wasFed says, and where wasFed is false because a
+		// rewind already purged, the value carried is the zero that purge left.
+		fedTo := make([]int64, len(f.segments))
+		for i, sg := range f.segments {
+			fedTo[i] = sg.fedTo
+		}
 		t.stopPipeline(ctx, f)
 		t.newPipeline(f)
 		// The segment list is NOT reset here: earlier segments' lines are
 		// still uncommitted, and a second rotation (or a truncation) during a
 		// collector outage does not make them recoverable any other way.
-		// Segments retire individually in commitBatch.
+		// Segments retire individually in commitBatch. Neither call above
+		// touches the list, so the indexes still line up.
+		for i, sg := range f.segments {
+			sg.fedTo = fedTo[i]
+		}
 	}
 	// newPipeline's reset cleared segmentsFed; that reset exists for REWINDS
 	// (where the batch was purged). A rotation purges nothing: entries built
@@ -270,13 +290,34 @@ func (t *Tailer) reopen(ctx context.Context, f *file, renamed, drained bool) {
 	// unwatched hole between reopen and that sweep would lose a second
 	// rotation happening inside one poll interval.
 	f.dirty = true
-	if hopAdded {
-		// Persist the hop NOW, not on the 10s checkpoint cadence: a crash in
-		// the window would leave the on-disk checkpoint with no Pending entry,
-		// and the restart path has no other route back to the rotated inode —
-		// the tail would be lost outright, not merely re-read. (Discovery
-		// already persists immediately for the same reason.)
-		t.saveCheckpoints()
+	if hopAdded && t.checkpointing() {
+		// The hop must reach disk long before the 10s checkpoint cadence: a
+		// crash in that window leaves the on-disk checkpoint with no record of
+		// the rotated inode, and the tail is then lost outright rather than
+		// merely re-read.
+		//
+		// What actually has to hold is narrower than "persist every hop
+		// synchronously", and this is the whole reason a save per SWEEP still
+		// closes the window: initFile reconstructs the ONE hop a stale
+		// checkpoint implies — it sees the path naming a different incarnation
+		// than the stored identity and synthesizes an open-ended segment for it
+		// — so a single unpersisted hop is recoverable from the previous save.
+		// It is the SECOND hop of the same file that has no route back, because
+		// nothing on disk names the intermediate inode. So the invariant is "one
+		// file never carries two unsaved hops", enforced here, and the sweep's
+		// closing save (below, keyed on hopsUnsaved) bounds the exposure of the
+		// first one to the rest of that sweep.
+		//
+		// The cost this buys back is not marginal: a save marshals the WHOLE
+		// positions document and fsyncs it twice (file, then directory) —
+		// ~25ms and ~3.4MB of garbage at 5000 files — on the single sweep
+		// goroutine, and it ran once per hop. A storm in which 50 files rotate
+		// in one sweep paid 50 of them, precisely during the event the
+		// immediate save exists to survive.
+		if f.hopUnsaved {
+			t.saveCheckpoints()
+		}
+		f.hopUnsaved, t.hopsUnsaved = true, true
 	}
 }
 
@@ -304,16 +345,22 @@ func (t *Tailer) feedSegments(ctx context.Context, f *file) {
 	allDone := true
 	for _, sg := range slices.Clone(f.segments) {
 		f.feeding = sg.id
-		if !t.replaySegment(ctx, f, sg) {
-			allDone = false
-			// Stop the pass at the FIRST unfinished segment: segments are
-			// oldest-first, so feeding a later one's lines now would put them
-			// into the pipeline AHEAD of this one's still-owed remainder —
-			// the same out-of-order feed the segmentsFed gate exists to
-			// prevent, one level down. (A rewind mid-replay purged the
-			// pipeline outright; continuing was equally wrong there.)
-			break
+		gen, fedBefore := f.rewindGen, sg.fedTo
+		if t.replaySegment(ctx, f, sg) {
+			sg.stalledSince = time.Time{}
+			continue
 		}
+		allDone = false
+		t.chargeStall(f, sg, gen, fedBefore)
+		// Stop the pass at the FIRST unfinished segment: segments are
+		// oldest-first, so feeding a later one's lines now would put them
+		// into the pipeline AHEAD of this one's still-owed remainder —
+		// the same out-of-order feed the segmentsFed gate exists to
+		// prevent, one level down. (A rewind mid-replay purged the
+		// pipeline outright; continuing was equally wrong there.) A segment
+		// just given up on is gone from the list, so the next sweep starts at
+		// what is now the head.
+		break
 	}
 	f.feeding = 0
 	// Marked fed only AFTER the pass, and only when every segment finished.
@@ -325,6 +372,42 @@ func (t *Tailer) feedSegments(ctx context.Context, f *file) {
 	// A replay that ran out of its per-sweep byte budget is unfinished for the
 	// same reason, and resumes next sweep from wherever its commits reached.
 	f.segmentsFed = allDone
+}
+
+// chargeStall bounds how long the LIVE TAIL may stay gated behind one segment
+// that is making no progress.
+//
+// readFile refuses to read the tail while a replay is unfinished, and
+// openSegmentSource deliberately does not retire a segment whose file is still
+// there but will not open — EACCES on a rotated file, EMFILE at RLIMIT_NOFILE,
+// EIO on a failing disk. Those are transient by CLASS and frequently permanent
+// in fact, and while one persists this file collects nothing at all: it is the
+// tailer's only silent stop, since obs.LogPrefixLost covers the permanent
+// give-up and a Warn at sweep cadence (~2/s) is the sole other signal. Past the
+// bound the segment is given up on exactly as an unrecoverable one is —
+// counted, logged, retired — which is also what releases the gate.
+//
+// A pass that FED anything, and one whose pipeline a rewind purged under it,
+// both count as progress: a budget-cut replay is advancing, and a failed export
+// re-owes the range without the gate being the thing that is stuck.
+func (t *Tailer) chargeStall(f *file, sg *segment, gen int, fedBefore int64) {
+	if f.rewindGen != gen || sg.fedTo > fedBefore {
+		sg.stalledSince = time.Time{}
+		return
+	}
+	now := time.Now()
+	if sg.stalledSince.IsZero() {
+		sg.stalledSince = now
+		return
+	}
+	stalled := now.Sub(sg.stalledSince)
+	if stalled < t.segmentStallLimit {
+		return
+	}
+	obs.LogPrefixLost.Inc()
+	t.log.Error("a rotated segment's source has been unreadable for too long; giving up on its lines so the file resumes collecting",
+		"path", f.path, "inode", sg.inode, "stalled", stalled)
+	f.retire(sg)
 }
 
 // openSegmentSource resolves the readable handle for a segment's replay: the

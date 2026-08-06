@@ -49,6 +49,7 @@ import (
 	"github.com/JohanLindvall/kubescrape/internal/servicemonitors"
 	"github.com/JohanLindvall/kubescrape/internal/services"
 	"github.com/JohanLindvall/kubescrape/internal/store"
+	"github.com/JohanLindvall/kubescrape/pkg/kubemeta"
 )
 
 func main() {
@@ -315,8 +316,20 @@ const secretCacheTTL = time.Minute
 // that repair is the moment responsiveness matters most.
 const secretFailureTTL = 10 * time.Second
 
+// secretCacheKey identifies one Secret key in the reader's cache.
+//
+// NUL-separated, not "/"-joined: a Secret namespace, name and key cannot
+// contain a NUL, so two distinct triples can never share one cached VALUE. The
+// "/" join could — ("a/b","c","d") and ("a","b/c","d") render identically —
+// and this cache is what a repeated scrape-auth lookup reads instead of the
+// API server. The same ambiguity in the /v1/scrape-auth allowlist was the
+// security half of it; this is the caching half.
+func secretCacheKey(namespace, name, key string) string {
+	return namespace + "\x00" + name + "\x00" + key
+}
+
 func (r *k8sSecretReader) Get(ctx context.Context, namespace, name, key string) (string, error) {
-	ck := namespace + "/" + name + "/" + key
+	ck := secretCacheKey(namespace, name, key)
 	r.mu.Lock()
 	if e, ok := r.cache[ck]; ok && time.Since(e.fetched) < e.ttl() {
 		r.mu.Unlock()
@@ -834,13 +847,26 @@ func monitoringResources(d discovery.DiscoveryInterface) (map[string]bool, error
 	return out, nil
 }
 
-// stripManagedFields drops managedFields before objects are stored in the
-// informer caches; they are large and unused here. It goes through
+// stripManagedFields drops managedFields — and the annotations this API refuses
+// to serve — before objects are stored in the informer caches. It goes through
 // apimeta.Accessor, so it serves the typed, metadata-only AND unstructured
 // informers alike — every one of them must call it.
+//
+// The annotations are dropped here for the reason trimPod drops the pod spec:
+// they are resident for the process lifetime and can NEVER be read, since
+// owners.Resolve and the namespace/node lookups funnel everything through
+// kubemeta.CopyMeta → FilterAnnotations. A kubectl- or kapp-managed cluster
+// with a few thousand Deployments/ReplicaSets/Jobs/CronJobs carries several
+// megabytes of them in PartialObjectMetadata alone, against a 128Mi request.
 func stripManagedFields(obj any) (any, error) {
 	if acc, err := apimeta.Accessor(obj); err == nil {
 		acc.SetManagedFields(nil)
+		// SetAnnotations only when something was actually removed: the
+		// unstructured accessor rebuilds the whole map on a set, and the
+		// overwhelmingly common object carries neither key.
+		if ann := acc.GetAnnotations(); kubemeta.StripDroppedAnnotations(ann) {
+			acc.SetAnnotations(ann)
+		}
 	}
 	return obj, nil
 }
@@ -875,6 +901,10 @@ func trimPod(obj any) (any, error) {
 		return stripManagedFields(obj)
 	}
 	pod.ManagedFields = nil
+	// The same never-readable annotations stripManagedFields drops for every
+	// other informer: kubeconvert.FromPod serves pod annotations through
+	// CopyMeta, which filters them out, so a cached copy is pure resident cost.
+	kubemeta.StripDroppedAnnotations(pod.Annotations)
 
 	trimContainers(pod.Spec.Containers)
 	trimContainers(pod.Spec.InitContainers)

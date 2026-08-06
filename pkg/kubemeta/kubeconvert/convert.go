@@ -156,7 +156,13 @@ func previousIncarnation(c kubemeta.Container, st *corev1.ContainerStatus) (kube
 	if st == nil || st.LastTerminationState.Terminated == nil || st.LastTerminationState.Terminated.ContainerID == "" {
 		return kubemeta.Container{}, false
 	}
-	prev := cloneContainer(c) // a distinct incarnation: it shares nothing with the current one
+	// A distinct incarnation: it shares nothing with the current one. Only the
+	// Ports slice is cloned, not the whole container — the three time/exit
+	// pointers cloneContainer copies are cleared on the next lines and refilled
+	// from lastState, so cloning them allocates up to three values per restarted
+	// container per upsert, on the informer callback path, to discard them.
+	prev := c
+	prev.Ports = clonePorts(c.Ports)
 	prev.RuntimeID = st.LastTerminationState.Terminated.ContainerID
 	prev.ID = kubemeta.NormalizeContainerID(prev.RuntimeID)
 	prev.Ready = false
@@ -177,9 +183,7 @@ func previousIncarnation(c kubemeta.Container, st *corev1.ContainerStatus) (kube
 // it. Nothing mutates them today; this is a public model whose two views must
 // not become a trap for the code that eventually does.
 func cloneContainer(c kubemeta.Container) kubemeta.Container {
-	if c.Ports != nil {
-		c.Ports = append([]kubemeta.ContainerPort(nil), c.Ports...)
-	}
+	c.Ports = clonePorts(c.Ports)
 	c.StartedAt = cloneTime(c.StartedAt)
 	c.FinishedAt = cloneTime(c.FinishedAt)
 	if c.ExitCode != nil {
@@ -187,6 +191,15 @@ func cloneContainer(c kubemeta.Container) kubemeta.Container {
 		c.ExitCode = &code
 	}
 	return c
+}
+
+// clonePorts copies a container's declared ports into their own array (nil for
+// nil, so an absent list stays absent).
+func clonePorts(ports []kubemeta.ContainerPort) []kubemeta.ContainerPort {
+	if ports == nil {
+		return nil
+	}
+	return append([]kubemeta.ContainerPort(nil), ports...)
 }
 
 func cloneTime(t *time.Time) *time.Time {

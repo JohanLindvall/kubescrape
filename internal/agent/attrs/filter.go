@@ -18,7 +18,16 @@ import (
 type Filter struct {
 	enable  *regexp.Regexp
 	disable *regexp.Regexp
+	// keep memoizes the verdict per KEY. The decision is a pure function of the
+	// key, and the key set of a resource is closed and tiny (~25 names) while
+	// the filter runs on every attribute of every resource built — 300k anchored
+	// regex evaluations per scrape on a 12k-object split path. Bounded and
+	// evicting (genCache), because label keys reach it and those are data.
+	keep *genCache[bool]
 }
+
+// maxFilterKeys bounds the memoized verdicts (two generations of it).
+const maxFilterKeys = 4096
 
 // NewFilterFromLists compiles a filter from regex LISTS — the only config
 // form. The comma-separated flag form it replaced could not express a pattern
@@ -37,6 +46,7 @@ func NewFilterFromLists(enable, disable []string) (*Filter, error) {
 	if f.enable == nil && f.disable == nil {
 		return nil, nil // keep-everything filters stay nil (no-op fast path)
 	}
+	f.keep = newGenCache[bool](maxFilterKeys)
 	return f, nil
 }
 
@@ -58,6 +68,17 @@ func (f *Filter) Keep(key string) bool {
 	if f == nil {
 		return true
 	}
+	if keep, ok := f.keep.load(key); ok {
+		return keep
+	}
+	keep := f.match(key)
+	f.keep.store(key, keep)
+	return keep
+}
+
+// match is Keep's decision without the memo: kept when it matches the enable
+// set (or there is none) and does not match the disable set.
+func (f *Filter) match(key string) bool {
 	if f.enable != nil && !f.enable.MatchString(key) {
 		return false
 	}

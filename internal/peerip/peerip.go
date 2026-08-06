@@ -53,13 +53,35 @@ func Canonical(ip string) string {
 	return ip
 }
 
+// addrTextMax bounds the canonical text of any address netip renders: the
+// longest form is an IPv4-mapped IPv6 address ("::ffff:255.255.255.255", 22
+// bytes) or a full IPv6 address (39), and the zone is stripped before we get
+// here. A stack buffer this size therefore never spills to the heap.
+const addrTextMax = 48
+
 func canonical(host string) (string, bool) {
 	if i := strings.IndexByte(host, '%'); i >= 0 {
 		host = host[:i]
+	}
+	if host == "" {
+		// Short-circuited BEFORE ParseAddr, which boxes a parseAddrError for an
+		// error this function discards. Every pod with no HostIP takes this
+		// path, twice per upsert, under the store's exclusive write lock.
+		return "", false
 	}
 	addr, err := netip.ParseAddr(host)
 	if err != nil {
 		return "", false
 	}
-	return addr.Unmap().String(), true
+	// Rendered into a stack buffer and returned as the ORIGINAL string when it
+	// matches: the overwhelmingly common input is already canonical (a
+	// kubelet's status.podIP, an accept()ed peer address), and Addr.String
+	// allocates a fresh one every time. `string(buf) == host` compiles to a
+	// comparison with no copy.
+	var buf [addrTextMax]byte
+	rendered := addr.Unmap().AppendTo(buf[:0])
+	if string(rendered) == host {
+		return host, true
+	}
+	return string(rendered), true
 }

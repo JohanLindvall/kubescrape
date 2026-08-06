@@ -85,6 +85,21 @@ var (
 	// typo, a missing CRD, or a monitor that matches nothing.
 	MonitorNamespaceRefused = Registry.CounterVec("kubescrape_monitor_namespace_refused_total",
 		"Monitor upserts ignored because their namespace is not permitted by -monitor-namespaces (an informer re-delivery re-counts the same monitor, exactly like the sibling monitor_* counters).", "kind")
+	// MonitorTargetShadowed counts monitor endpoint targets DROPPED because
+	// another monitor's endpoint already resolved to the same URL on the same
+	// pod. Both are legal CRs and prometheus-operator would scrape both (one
+	// job each, distinguished by the `job` label), but a kubescrape target's
+	// exported identity has no monitor component, so serving both would put two
+	// byte-identical series identities in one payload. The first monitor by
+	// (namespace, name) wins — which means the loser's metricRelabelings and
+	// bearerTokenSecret are not applied, decided by alphabetical order. That is
+	// a real limitation and this is what makes it visible; a nonzero rate wants
+	// the two monitors merged or one of them narrowed.
+	//
+	// Counted per served targets request, like every other decision on that
+	// path: the RATE is the signal, not the absolute value.
+	MonitorTargetShadowed = Registry.CounterVec("kubescrape_monitor_target_shadowed_total",
+		"Monitor endpoint targets dropped because another monitor already resolved to the same URL on that pod.", "kind")
 	// ScrapeAuthFailures counts /v1/scrape-auth requests that reached the
 	// Secret read and failed there, by CAUSE. The route is the only one that
 	// hard-fails on external state, and every cause used to answer 404: an
@@ -176,6 +191,18 @@ var (
 			"workload's own description, never about which object — or which tenant — the records belong to: "+
 			"k8s.namespace.name is the routing key, so honouring it let any pod redirect its logs into another "+
 			"tenant. A nonzero rate is a workload attempting it, whether by mistake or not.", "key")
+	// LogSegmentsStalled is the ONE state in the tailer where a file stops
+	// collecting without losing anything and without any counter moving: a
+	// rotated segment must be replayed before the live tail may be read (or the
+	// joiner fuses fragments across the gap into records that never existed),
+	// and a source that will not open — EACCES on the rotated file, EMFILE at
+	// RLIMIT_NOFILE, EIO on a failing disk — leaves that gate closed. Lag grows,
+	// the fd stays pinned, and the only other signal is a Warn repeating at
+	// sweep cadence. A sustained nonzero value is the alert; under EMFILE it is
+	// fleet-correlated. The gate is bounded, so a stall that outlives the bound
+	// gives the segment up and shows on kubescrape_log_prefix_lost_total.
+	LogSegmentsStalled = Registry.Gauge("kubescrape_log_segments_stalled",
+		"Tracked files whose live tail is currently NOT being read because a rotated segment's replay cannot proceed.")
 )
 
 // Scrape pipeline (agent).
@@ -201,6 +228,14 @@ var (
 		"Unparseable OpenMetrics exemplar suffixes by pipeline. NO data was lost: the samples carrying them were exported without the exemplar, which is why this is separate from kubescrape_scrape_malformed_total. Only ever nonzero where exemplar scraping is enabled.", "pipeline")
 	ScrapeCollisions = Registry.Counter("kubescrape_scrape_name_collisions_total",
 		"Data points dropped because their family name was already claimed by a metric of another shape in the same batch (a target redeclaring a family's TYPE mid-exposition).")
+	// The attributable half of the collision above, for the one case the
+	// protobuf exposition makes reachable without any TYPE redeclaration: a
+	// HISTOGRAM family whose metrics carry different REPRESENTATIONS. One name
+	// carries one OTLP type, so the family resolves to native and the other
+	// representation's data is dropped here rather than silently in the
+	// batcher's type guard.
+	ScrapeHistogramMixed = Registry.CounterVec("kubescrape_scrape_histogram_mixed_total",
+		"Protobuf histogram metrics dropped because their family resolved to another representation, by pipeline and by the representation that lost: classic = per-bucket rows, nhcb = custom-bucket native (schema -53, whose bounds this client_model cannot read at all).", "pipeline", "dropped")
 )
 
 // OTLP exporter (agent).

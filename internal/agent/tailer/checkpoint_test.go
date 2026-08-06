@@ -187,3 +187,68 @@ func TestCorruptPositionsFileIgnored(t *testing.T) {
 		t.Fatalf("checkpoint not overwritten: %v %q", err, data)
 	}
 }
+
+// A rotation hop's segment must reach disk long before the 10s checkpoint
+// cadence — but not once per HOP. A save marshals the WHOLE positions document
+// and fsyncs it twice (~25ms and ~3.4MB of garbage at 5000 files), on the single
+// sweep goroutine, and a storm in which many files rotate inside one sweep paid
+// that per file, precisely during the event the immediate save exists to
+// survive.
+//
+// What has to hold is narrower: initFile reconstructs the ONE hop a stale
+// checkpoint implies (it sees the path naming a different incarnation than the
+// stored identity and synthesizes an open-ended segment), so a single unsaved
+// hop is still recoverable — it is the SECOND hop of the same file that has no
+// on-disk record of the intermediate inode. So: one save per sweep, plus a
+// forced save whenever a file would carry two unsaved hops.
+func TestRotationHopsArePersistedPerSweepNotPerHop(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+	path := filepath.Join(dir, logName)
+	posPath := filepath.Join(t.TempDir(), "pos.json")
+
+	pending := func() int {
+		s, err := positions.Open(posPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return len(s.Logs()[path].Pending)
+	}
+
+	pos := mustOpenPositions(t, posPath)
+	exp := &fakeExporter{}
+	tl := driveTailer(dir, exp)
+	tl.cfg.Positions = pos
+	tl.scanDir(tl.loadCheckpoints(), true) // empty dir: what follows is NEW, not history
+	writeLog(t, dir, timeNowCRI()+" stdout F one")
+	tl.scanDir(nil, false)
+	tl.sweep(ctx, true) // reads the line; nothing is flushed, so nothing commits
+	f, ok := tl.files[path]
+	if !ok {
+		t.Fatal("setup: file not discovered")
+	}
+
+	rotateAway(t, dir, 1)
+	writeLog(t, dir, timeNowCRI()+" stdout F two")
+	tl.reopen(ctx, f, true, true)
+	if n := pending(); n != 0 {
+		t.Fatalf("a rotation hop rewrote the whole positions document synchronously (%d pending): "+
+			"a storm pays one full marshal + two fsyncs per hop on the sweep goroutine", n)
+	}
+	tl.sweep(ctx, true)
+	if pending() == 0 {
+		t.Fatal("the sweep did not persist the rotation hop it recorded: a crash now has no on-disk " +
+			"record of the rotated inode")
+	}
+
+	// Two hops with no save between them: the intermediate inode is the one a
+	// restart cannot reconstruct, so the second hop must force the write.
+	saved := pending()
+	tl.reopen(ctx, f, true, true)
+	tl.ingestChunk(ctx, f, []byte(timeNowCRI()+" stdout F three\n"), true)
+	tl.reopen(ctx, f, true, true)
+	if pending() <= saved {
+		t.Fatalf("two unsaved hops of one file left only %d pending on disk (was %d): the "+
+			"intermediate inode has no record and a crash loses it outright", pending(), saved)
+	}
+}

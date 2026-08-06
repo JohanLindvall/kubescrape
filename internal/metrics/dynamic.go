@@ -97,6 +97,18 @@ type DynamicConfig struct {
 	Metrics []Dynamic `json:"metrics"`
 }
 
+// ValueFunc resolves a metric's observed VALUE key against the caller's
+// attributes (the tailer's record/resource ranking, logchain.Resolver.ValueFn).
+//
+// It is three-valued because two could not say WHY a lookup missed, and the
+// answer decides whether the LINE is read: ok is a numeric hit, present says
+// the attributes held the key at all — in the terms this tier uses everywhere
+// (the first PRESENT rank, rendering non-empty; see logline.ResolveKey) — so a
+// present-but-non-numeric attribute is a miss for the key rather than
+// permission to look further down. Only the walk that resolved the value knows
+// it without walking the ranks again.
+type ValueFunc func(key string) (v float64, ok, present bool)
+
 // labelTemplate produces one metric label from a line's fields. getKey is the
 // line field it reads ("" for a literal), recorded so the set knows which line
 // fields to parse.
@@ -334,7 +346,7 @@ type addContext struct {
 	line logline.Fields
 
 	set     *DynamicMetricSet
-	values  func(string) (float64, bool)
+	values  ValueFunc
 	lookup  func(string) string
 	raw     string
 	labelFn func(string) string
@@ -352,19 +364,18 @@ func (ac *addContext) labelLookup(key string) string {
 // exactly the same condition the LABEL tier does, or one metric's label names
 // one attribute while its observed value comes from another.
 //
-// The (float64, bool) contract cannot say WHY the numeric lookup missed:
-// absent and present-but-non-numeric are the same false, and only the first is
-// a reason to read the line. The label lookup answers that question in the
-// terms this tier uses everywhere (present = non-empty, see logline.ResolveKey),
-// so it is what decides — the resolver behind it ranks by presence and
-// deliberately treats a present-but-non-numeric value as a miss for the key
-// rather than as permission to look further down.
+// present is why ValueFunc is three-valued: absent and present-but-non-numeric
+// are both "no number", and only the first may read the line. Asking the LABEL
+// closure instead walked every attribute rank a second time, in full, on every
+// line whose value key lives on the line — which is the common case, since a
+// value key that is an attribute answers on the first walk.
 func (ac *addContext) valueLookup(key string) (float64, bool) {
 	if ac.values != nil {
-		if v, ok := ac.values(key); ok {
+		v, ok, present := ac.values(key)
+		if ok {
 			return v, true
 		}
-		if ac.lookup != nil && ac.lookup(key) != "" {
+		if present {
 			return 0, false
 		}
 	}
@@ -427,14 +438,14 @@ func (s *DynamicMetricSet) Bind(resource pcommon.Map) BoundResource {
 }
 
 // Add evaluates every rule against one line, as DynamicMetricSet.Add.
-func (b BoundResource) Add(values func(string) (float64, bool), lookup func(string) string, line string) {
+func (b BoundResource) Add(values ValueFunc, lookup func(string) string, line string) {
 	if b.set == nil || len(b.set.rules) == 0 {
 		return
 	}
 	b.set.add(values, lookup, b.res, b.accum, line)
 }
 
-func (s *DynamicMetricSet) add(values func(string) (float64, bool), lookup func(string) string, resource pcommon.Map, resAccum resKey, line string) {
+func (s *DynamicMetricSet) add(values ValueFunc, lookup func(string) string, resource pcommon.Map, resAccum resKey, line string) {
 	ac := s.pool.Get().(*addContext)
 	ac.ctx.Reset()
 	ac.line.Reset(line)

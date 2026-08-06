@@ -742,6 +742,16 @@ func run() error {
 	// nothing a producer owns — log offsets, the journal cursor and the events
 	// position are all re-read on the next start.
 	var shutdownBy time.Time // anchored when the shutdown sequence begins (below)
+	// The sibling-shard clients (startServiceGraph) belong with the exporter and
+	// spool Closes, not above the drain: registered HERE, LIFO runs them AFTER it,
+	// so a started goroutine never has its client closed under it. p is nil until
+	// it is built below — an early return before that has nothing to close.
+	var p *pipelines
+	defer func() {
+		if p != nil {
+			_ = p.sgResharder.Close() // nil-receiver safe
+		}
+	}()
 	defer func() {
 		stop()
 		budget := shutdownDrain
@@ -798,7 +808,7 @@ func run() error {
 	// Atomic because the shutdown join is BUDGETED: see pipelines.fatalErr.
 	var fatalErr atomic.Pointer[error]
 
-	p := &pipelines{
+	p = &pipelines{
 		wg:           &wg,
 		stop:         stop,
 		log:          log,
@@ -831,10 +841,6 @@ func run() error {
 	if err := p.startIngest(ctx); err != nil {
 		return err
 	}
-	// The sibling-shard clients are unrelated to the collector exporter;
-	// registered here (LIFO, so they close before it) once startServiceGraph has
-	// built them.
-	defer func() { _ = p.sgResharder.Close() }() // nil-receiver safe
 	if err := p.startServiceGraph(ctx); err != nil {
 		return err
 	}

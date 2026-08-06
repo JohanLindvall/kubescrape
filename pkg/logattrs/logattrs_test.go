@@ -4,8 +4,10 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
+	ljson "github.com/JohanLindvall/lightning/pkg/json"
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"sigs.k8s.io/yaml"
 )
@@ -181,6 +183,50 @@ func TestLoadConfig(t *testing.T) {
 	}
 	if _, err := LoadConfig(filepath.Join(dir, "nope.yaml")); err == nil {
 		t.Error("missing file: want error")
+	}
+}
+
+// The pooled scratch must hold no reference into the line once Extract has
+// returned. The JSON arm's raws are read-only VIEWS into it, and the GC scans a
+// slice's whole backing array — so truncating the length released nothing and
+// one pooled holder pinned the last line (up to MaxEntryBytes, 1 MiB) until its
+// next use. The twin holder in internal/logline was fixed for exactly this.
+func TestExtractDoesNotPinTheLine(t *testing.T) {
+	t.Parallel()
+	e := mustExtractor(t, Rule{Key: "msg"}, Rule{Key: "level"})
+	line := `{"level":"info","msg":"` + strings.Repeat("x", 1<<20) + `"}`
+
+	// A scratch straight off the JSON arm, then released: every slot must be
+	// nil, not merely out of the slice's LENGTH.
+	sc := &scratch{vals: make([]string, len(e.rules)), found: make([]bool, len(e.rules))}
+	raws, err := ljson.GetPaths([]byte(line), e.paths, sc.raws[:0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	sc.raws = raws[:0]
+	if cap(sc.raws) < len(e.paths) {
+		t.Fatalf("GetPaths filled %d slots, want %d", cap(sc.raws), len(e.paths))
+	}
+	e.release(sc)
+	for i, raw := range sc.raws[:cap(sc.raws)] {
+		if raw != nil {
+			t.Fatalf("slot %d still aliases %d bytes of the line after release", i, len(raw))
+		}
+	}
+
+	// And Extract must go through release. The pooled object is usually the one
+	// this goroutine just returned; when the pool hands back something else
+	// there is nothing to assert, so the check is on what it does hand back —
+	// a false failure here would be worse than the occasional skipped round.
+	if r := e.Extract(line); len(r.Log) != 2 {
+		t.Fatalf("extracted %d attributes, want 2", len(r.Log))
+	}
+	if used, _ := e.scratch.Get().(*scratch); used != nil {
+		for i, raw := range used.raws[:cap(used.raws)] {
+			if raw != nil {
+				t.Fatalf("pooled scratch slot %d still aliases %d bytes: Extract does not release", i, len(raw))
+			}
+		}
 	}
 }
 

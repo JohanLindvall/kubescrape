@@ -17,9 +17,12 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"strconv"
 
 	dto "github.com/prometheus/client_model/go"
 	"google.golang.org/protobuf/proto"
+
+	"github.com/JohanLindvall/kubescrape/internal/obs"
 )
 
 // acceptProto is the Accept header offering protobuf exposition first.
@@ -151,10 +154,37 @@ func (s *Scraper) protoFamily(mf *dto.MetricFamily, ss *scrapeSession) (int, err
 	// One reusable exemplar per family: a Sample only borrows it for the emit
 	// call (the converter deep-copies the ones it keeps).
 	var ex Exemplar
+	typ := mf.GetType()
+	// The component names are FAMILY-invariant, so they are built once here
+	// rather than once per Metric — a 500-metric family rebuilt three of them
+	// 500 times each, for nothing.
+	var nameBucket, nameSum, nameCount, nameGSum, nameGCount string
+	switch typ {
+	case dto.MetricType_SUMMARY:
+		nameSum, nameCount = name+"_sum", name+"_count"
+	case dto.MetricType_HISTOGRAM:
+		nameBucket, nameSum, nameCount = name+"_bucket", name+"_sum", name+"_count"
+	case dto.MetricType_GAUGE_HISTOGRAM:
+		nameBucket, nameGSum, nameGCount = name+"_bucket", name+"_gsum", name+"_gcount"
+	}
+	// Bucket bounds and quantiles repeat verbatim on every Metric of the
+	// family; the memo renders each distinct value once.
+	var floats floatStrings
+	// Resolved ONCE per family, never per Metric: see familyIsNative.
+	native := typ == dto.MetricType_HISTOGRAM && familyIsNative(mf)
+	var droppedClassic, droppedNHCB int
+	defer func() {
+		if droppedClassic > 0 {
+			obs.ScrapeHistogramMixed.WithLabelValues(ss.pipeline, "classic").Add(float64(droppedClassic))
+		}
+		if droppedNHCB > 0 {
+			obs.ScrapeHistogramMixed.WithLabelValues(ss.pipeline, "nhcb").Add(float64(droppedNHCB))
+		}
+	}()
 	for _, m := range mf.GetMetric() {
 		labels := protoLabels(m)
 		ts := m.GetTimestampMs()
-		switch mf.GetType() {
+		switch typ {
 		case dto.MetricType_COUNTER:
 			cnt := m.GetCounter()
 			smp := Sample{Name: name, Family: name, Role: RoleCounter, Labels: labels, Value: cnt.GetValue(), TimestampMs: ts, Help: help, Unit: unit}
@@ -164,7 +194,7 @@ func (s *Scraper) protoFamily(mf *dto.MetricFamily, ss *scrapeSession) (int, err
 			}
 		case dto.MetricType_GAUGE, dto.MetricType_UNTYPED:
 			v := m.GetGauge().GetValue()
-			if mf.GetType() == dto.MetricType_UNTYPED {
+			if typ == dto.MetricType_UNTYPED {
 				v = m.GetUntyped().GetValue()
 			}
 			if err := ss.accept(Sample{Name: name, Family: name, Role: RoleGauge, Labels: labels, Value: v, TimestampMs: ts, Help: help, Unit: unit}); err != nil {
@@ -173,15 +203,15 @@ func (s *Scraper) protoFamily(mf *dto.MetricFamily, ss *scrapeSession) (int, err
 		case dto.MetricType_SUMMARY:
 			sum := m.GetSummary()
 			for _, q := range sum.GetQuantile() {
-				ql := append(labels[:len(labels):len(labels)], Label{Name: "quantile", Value: formatFloat(q.GetQuantile())})
+				ql := append(labels[:len(labels):len(labels)], Label{Name: "quantile", Value: floats.get(q.GetQuantile())})
 				if err := ss.accept(Sample{Name: name, Family: name, Role: RoleSummaryQuantile, Labels: ql, Value: q.GetValue(), TimestampMs: ts, Help: help, Unit: unit}); err != nil {
 					return malformed, err
 				}
 			}
-			if err := ss.accept(Sample{Name: name + "_sum", Family: name, Role: RoleSummarySum, Labels: labels, Value: sum.GetSampleSum(), TimestampMs: ts, Help: help, Unit: unit}); err != nil {
+			if err := ss.accept(Sample{Name: nameSum, Family: name, Role: RoleSummarySum, Labels: labels, Value: sum.GetSampleSum(), TimestampMs: ts, Help: help, Unit: unit}); err != nil {
 				return malformed, err
 			}
-			if err := ss.accept(Sample{Name: name + "_count", Family: name, Role: RoleSummaryCount, Labels: labels, Value: float64(sum.GetSampleCount()), TimestampMs: ts, Help: help, Unit: unit}); err != nil {
+			if err := ss.accept(Sample{Name: nameCount, Family: name, Role: RoleSummaryCount, Labels: labels, Value: float64(sum.GetSampleCount()), TimestampMs: ts, Help: help, Unit: unit}); err != nil {
 				return malformed, err
 			}
 		case dto.MetricType_GAUGE_HISTOGRAM:
@@ -199,20 +229,32 @@ func (s *Scraper) protoFamily(mf *dto.MetricFamily, ss *scrapeSession) (int, err
 			// that would not lie about temporality.
 			h := m.GetHistogram()
 			for _, b := range h.GetBucket() {
-				bl := append(labels[:len(labels):len(labels)], Label{Name: "le", Value: formatFloat(b.GetUpperBound())})
-				if err := ss.accept(Sample{Name: name + "_bucket", Family: name, Role: RoleGauge, Labels: bl, Value: float64(b.GetCumulativeCount()), TimestampMs: ts, Help: help, Unit: unit}); err != nil {
+				bl := append(labels[:len(labels):len(labels)], Label{Name: "le", Value: floats.get(b.GetUpperBound())})
+				if err := ss.accept(Sample{Name: nameBucket, Family: name, Role: RoleGauge, Labels: bl, Value: bucketCount(b), TimestampMs: ts, Help: help, Unit: unit}); err != nil {
 					return malformed, err
 				}
 			}
-			if err := ss.accept(Sample{Name: name + "_gsum", Family: name, Role: RoleGauge, Labels: labels, Value: h.GetSampleSum(), TimestampMs: ts, Help: help, Unit: unit}); err != nil {
+			if err := ss.accept(Sample{Name: nameGSum, Family: name, Role: RoleGauge, Labels: labels, Value: h.GetSampleSum(), TimestampMs: ts, Help: help, Unit: unit}); err != nil {
 				return malformed, err
 			}
-			if err := ss.accept(Sample{Name: name + "_gcount", Family: name, Role: RoleGauge, Labels: labels, Value: sampleCount(h), TimestampMs: ts, Help: help, Unit: unit}); err != nil {
+			if err := ss.accept(Sample{Name: nameGCount, Family: name, Role: RoleGauge, Labels: labels, Value: sampleCount(h), TimestampMs: ts, Help: help, Unit: unit}); err != nil {
 				return malformed, err
 			}
 		case dto.MetricType_HISTOGRAM:
 			h := m.GetHistogram()
-			if isNative(h) {
+			if native {
+				if r := reprOf(h); r != reprNative {
+					// The family ships as ONE exponential histogram metric, and
+					// this child is not carrying that shape: its points would be
+					// refused by the batcher's type guard anyway. Counted so the
+					// discard has an attributable signal.
+					if r == reprNHCB {
+						droppedNHCB++
+					} else {
+						droppedClassic++
+					}
+					continue
+				}
 				if err := ss.countNative(); err != nil {
 					return malformed, err
 				}
@@ -228,18 +270,30 @@ func (s *Scraper) protoFamily(mf *dto.MetricFamily, ss *scrapeSession) (int, err
 				}
 				continue
 			}
+			if isNHCB(h) {
+				// An NHCB message's bounds live in custom_values, and
+				// client_model v0.6.2 — the version Prometheus itself pins —
+				// does not generate that field: they are not reachable from this
+				// message at all, so there is nothing to convert. Falling through
+				// to the classic branch shipped a point with NO bounds and a
+				// single overflow bucket, i.e. a correct count and sum beside a
+				// distribution every histogram_quantile reads as nonsense, and
+				// counted nothing. Refused instead, so the loss is visible.
+				malformed++
+				continue
+			}
 			for _, b := range h.GetBucket() {
-				bl := append(labels[:len(labels):len(labels)], Label{Name: "le", Value: formatFloat(b.GetUpperBound())})
-				smp := Sample{Name: name + "_bucket", Family: name, Role: RoleHistogramBucket, Labels: bl, Value: float64(b.GetCumulativeCount()), TimestampMs: ts, Help: help, Unit: unit}
+				bl := append(labels[:len(labels):len(labels)], Label{Name: "le", Value: floats.get(b.GetUpperBound())})
+				smp := Sample{Name: nameBucket, Family: name, Role: RoleHistogramBucket, Labels: bl, Value: bucketCount(b), TimestampMs: ts, Help: help, Unit: unit}
 				smp.Exemplar = s.protoExemplar(b.GetExemplar(), &ex)
 				if err := ss.accept(smp); err != nil {
 					return malformed, err
 				}
 			}
-			if err := ss.accept(Sample{Name: name + "_sum", Family: name, Role: RoleHistogramSum, Labels: labels, Value: h.GetSampleSum(), TimestampMs: ts, Help: help, Unit: unit}); err != nil {
+			if err := ss.accept(Sample{Name: nameSum, Family: name, Role: RoleHistogramSum, Labels: labels, Value: h.GetSampleSum(), TimestampMs: ts, Help: help, Unit: unit}); err != nil {
 				return malformed, err
 			}
-			if err := ss.accept(Sample{Name: name + "_count", Family: name, Role: RoleHistogramCount, Labels: labels, Value: float64(h.GetSampleCount()), TimestampMs: ts, Help: help, Unit: unit}); err != nil {
+			if err := ss.accept(Sample{Name: nameCount, Family: name, Role: RoleHistogramCount, Labels: labels, Value: sampleCount(h), TimestampMs: ts, Help: help, Unit: unit}); err != nil {
 				return malformed, err
 			}
 		default:
@@ -270,9 +324,65 @@ func (s *Scraper) protoExemplar(pe *dto.Exemplar, scratch *Exemplar) *Exemplar {
 	return scratch
 }
 
+// histRepr is the representation one HISTOGRAM message carries its
+// distribution in. Each maps to a DIFFERENT OTLP metric type (or, for NHCB, to
+// none at all), which is why the choice cannot be made per data point.
+type histRepr uint8
+
+const (
+	reprClassic histRepr = iota // per-bucket `bucket` rows -> OTLP Histogram
+	reprNative                  // span-encoded exponential -> OTLP ExponentialHistogram
+	reprNHCB                    // custom-bucket native (schema -53) -> nothing, see isNHCB
+)
+
+func reprOf(h *dto.Histogram) histRepr {
+	switch {
+	case isNative(h):
+		return reprNative
+	case isNHCB(h):
+		return reprNHCB
+	default:
+		return reprClassic
+	}
+}
+
+// familyIsNative resolves native-vs-classic ONCE per family.
+//
+// The decision cannot be per Metric: one metric NAME carries exactly one OTLP
+// type, so a family whose children mix representations had its type fixed by
+// whichever child was converted first and the other's points were then dropped
+// by the batcher's type guard — visible only as obs.ScrapeCollisions, a bare
+// counter with no pipeline or target label, so a whole classic child could
+// vanish with nothing naming it. Native wins the family, which is Prometheus's
+// own preference; the loser is counted in obs.ScrapeHistogramMixed.
+func familyIsNative(mf *dto.MetricFamily) bool {
+	for _, m := range mf.GetMetric() {
+		if isNative(m.GetHistogram()) {
+			return true
+		}
+	}
+	return false
+}
+
+// isNHCB reports whether a histogram carries CUSTOM-BUCKET native data: schema
+// -53, span-encoded counts, and bounds that live in the message's custom_values
+// field — which client_model v0.6.2 (the version prometheus/prometheus itself
+// pins, and whose own protobuf parser therefore does not read NHCB either) does
+// not generate. The bounds are unreachable, so such a message is refused and
+// counted rather than converted: see the HISTOGRAM branch of protoFamily.
+//
+// A message that ALSO carries classic `bucket` rows is not NHCB by this test —
+// those bounds ARE readable, and the classic path uses them.
+func isNHCB(h *dto.Histogram) bool {
+	if h == nil || h.GetSchema() != -53 || len(h.GetBucket()) > 0 {
+		return false
+	}
+	return len(h.GetPositiveSpan()) > 0 || len(h.GetNegativeSpan()) > 0
+}
+
 // isNative reports whether a histogram carries native (exponential) data:
 // span-encoded buckets or a non-empty zero bucket. NHCB (custom bounds,
-// schema -53) is NOT native-exponential and falls back to classic buckets.
+// schema -53) is NOT native-exponential — see isNHCB for what happens to it.
 //
 // The test is on the VALUES, mirroring Prometheus's own isNativeHistogram
 // (model/textparse/protobufparse.go). Testing FIELD PRESENCE instead read a
@@ -305,16 +415,26 @@ func isNative(h *dto.Histogram) bool {
 		h.GetZeroThreshold() > 0 || h.GetZeroCount() > 0
 }
 
-// sampleCount and zeroBucketCount read a histogram's observation counts. dto's
-// sample_count_float / zero_count_float OVERRIDE their integer counterparts
-// when > 0 ("Overrides sample_count if > 0", says the message) — that is how a
-// FLOAT native histogram carries them, and it is the pair Prometheus keys its
-// own float variant on.
+// sampleCount, bucketCount and zeroBucketCount read a histogram's observation
+// counts. dto's sample_count_float / cumulative_count_float / zero_count_float
+// OVERRIDE their integer counterparts when > 0 ("Overrides sample_count if > 0",
+// says the message) — that is how a FLOAT histogram carries them, classic
+// buckets included, and it is the pair Prometheus keys its own float variant on
+// (model/textparse/protobufparse.go). EVERY count read goes through these:
+// reading the integer field of a float exposition yields a zero for every
+// observation the target made, with no counter moving.
 func sampleCount(h *dto.Histogram) float64 {
 	if f := h.GetSampleCountFloat(); f > 0 {
 		return f
 	}
 	return float64(h.GetSampleCount())
+}
+
+func bucketCount(b *dto.Bucket) float64 {
+	if f := b.GetCumulativeCountFloat(); f > 0 {
+		return f
+	}
+	return float64(b.GetCumulativeCount())
 }
 
 func zeroBucketCount(h *dto.Histogram) float64 {
@@ -508,9 +628,33 @@ func protoLabels(m *dto.Metric) []Label {
 	return out
 }
 
-func formatFloat(v float64) string {
-	if v == math.Trunc(v) && math.Abs(v) < 1e15 {
-		return fmt.Sprintf("%g", v)
+// floatStrings renders the float64 label values of one family — bucket bounds
+// and summary quantiles — once per distinct value.
+//
+// Both are FAMILY-invariant (every Metric of a family repeats the same bound
+// set), and the fmt.Sprintf this replaces cost a string plus the interface
+// boxing of its argument on every bucket of every metric. The rendering is
+// unchanged: fmt's %v for a float64 IS %g at the default precision, so the old
+// integral-vs-not branch produced the same shortest-round-trip form on both
+// sides, which is what strconv writes here.
+type floatStrings struct {
+	buf  []byte
+	memo map[float64]string
+}
+
+func (f *floatStrings) get(v float64) string {
+	if s, ok := f.memo[v]; ok {
+		return s
 	}
-	return fmt.Sprintf("%v", v)
+	f.buf = strconv.AppendFloat(f.buf[:0], v, 'g', -1, 64)
+	s := string(f.buf)
+	if f.memo == nil {
+		f.memo = make(map[float64]string, 16)
+	}
+	// NaN never equals itself, so a bound set of NaNs would insert one entry per
+	// row: bounded like the text parser's own interning.
+	if len(f.memo) < maxInternedValues {
+		f.memo[v] = s
+	}
+	return s
 }

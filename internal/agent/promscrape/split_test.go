@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/JohanLindvall/kubescrape/internal/agent/attrs"
 	"github.com/JohanLindvall/kubescrape/pkg/kubemeta"
 	"go.opentelemetry.io/collector/pdata/pmetric"
 )
@@ -652,6 +653,73 @@ kube_node_labels{node="node9",label_zone="eu-1"} 1
 	}
 }
 
+// A split rule's `attributes` fallbacks are applied AFTER Build, i.e. after the
+// operator's global enable/disable filter has run — so they have to be filtered
+// again, exactly as the tailer re-filters its post-Build source statics. The
+// filter is global by design (a `pipelines:` section may not set enable/disable
+// at all), so a rule fallback silently surviving a `disable` list is the filter
+// not being global after all.
+func TestSplitterAttributesRespectTheAttributeFilter(t *testing.T) {
+	body := "# TYPE kube_pod_info gauge\n" +
+		`kube_pod_info{namespace="ns1",pod="pod1"} 1` + "\n"
+	srv := serveBody(t, body)
+
+	target := testTarget(srv.URL)
+	target.Pod.Name = "ksm-abc"
+	target.Pod.Labels = map[string]string{"app.kubernetes.io/name": "kube-state-metrics"}
+
+	filter, err := attrs.NewFilterFromLists(nil, []string{`cost\.center`})
+	if err != nil {
+		t.Fatal(err)
+	}
+	builder, err := attrs.NewBuilder(&attrs.Config{}, filter)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sp, err := NewSplitters([]SplitterConfig{{
+		Match: SplitterMatch{PodLabels: map[string]string{"app.kubernetes.io/name": "kube-state-metrics"}},
+		Rules: []SplitRule{{
+			Metrics: `kube_pod_.+`,
+			GroupBy: map[string]string{"namespace": "k8s.namespace.name", "pod": "k8s.pod.name"},
+			Attributes: map[string]string{
+				"cost.center":  "cc-42",   // disabled: must not reach the resource
+				"service.name": "unknown", // kept: the fallback still works
+			},
+		}},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	exp := &captureExporter{}
+	s := New(Config{
+		Node: "node1", Interval: time.Hour, Timeout: 5 * time.Second,
+		Targets: staticTargets{target}, Exporter: exp, StartTime: time.Now(),
+		Splitters: sp, Kubelet: KubeletConfig{Meta: &fakeMetaSource{}},
+		Attrs: &attrs.Builders{Targets: builder},
+	})
+	if _, err := s.scrapeTarget(context.Background(), target, s.cfg.Timeout); err != nil {
+		t.Fatal(err)
+	}
+	rms := exp.batches[0].ResourceMetrics()
+	found := false
+	for i := 0; i < rms.Len(); i++ {
+		res := rms.At(i).Resource()
+		if attrStr(res, "k8s.pod.name") != "pod1" {
+			continue
+		}
+		found = true
+		if v, ok := res.Attributes().Get("cost.center"); ok {
+			t.Errorf("disabled attribute survived as a rule fallback: cost.center=%q", v.Str())
+		}
+		if got := attrStr(res, "service.name"); got != "unknown" {
+			t.Errorf("service.name = %q, want the rule's fallback: the re-filter must not eat allowed attributes", got)
+		}
+	}
+	if !found {
+		t.Fatal("pod1 resource not produced")
+	}
+}
+
 func TestSplitterAttributesDontOverride(t *testing.T) {
 	body := "# TYPE kube_pod_info gauge\n" +
 		`kube_pod_info{namespace="ns1",pod="pod1",uid="` + uid1 + `"} 1` + "\n"
@@ -926,5 +994,61 @@ kube_pod_container_resource_requests{namespace="ns1",pod="pod1",resource="memory
 		if !seen[want] {
 			t.Errorf("no resource carries k8s.resource_name=%s; the groupBy attribute was stripped from the points and never written (got %v)", want, seen)
 		}
+	}
+}
+
+// A kube-state-metrics exposition is FAMILY-major: consecutive rows describe
+// DIFFERENT objects, so the batcher's last-seen memos miss on essentially every
+// row and the key path underneath them is what runs. It built the resource key
+// in a strings.Builder and the metric key by concatenation — two allocations per
+// row, ~500k per cycle at 12k pods — where the sibling cadvisor batcher had
+// already established the reused-scratch + map[string(buf)] discipline.
+func TestSplitBatcherRoutingIsAllocationFree(t *testing.T) {
+	if raceEnabled {
+		t.Skip("-race perturbs allocation counts")
+	}
+	sp, err := NewSplitters([]SplitterConfig{{
+		Match: SplitterMatch{PodName: "ksm-.+"},
+		Rules: []SplitRule{{
+			Metrics: `kube_pod_.+`,
+			GroupBy: map[string]string{"namespace": "k8s.namespace.name", "pod": "k8s.pod.name", "uid": "k8s.pod.uid"},
+		}},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := New(Config{
+		Node: "node1", Interval: time.Hour, Timeout: time.Second,
+		Targets: staticTargets{}, Exporter: &captureExporter{},
+		Splitters: sp, Kubelet: KubeletConfig{Meta: &fakeMetaSource{}},
+		StartTime: time.Unix(1, 0),
+	})
+	target := testTarget("http://ksm:8080/metrics")
+	target.Pod.Name = "ksm-abc"
+	cb := newSplitBatcher(s, context.Background(), target, sp[0], time.Unix(2, 0))
+
+	// Two described objects of one family, visited alternately: every call is a
+	// last-seen memo MISS and a map HIT, which is the steady state of a
+	// family-major exposition.
+	rows := [2][]Label{}
+	for i := range rows {
+		rows[i] = []Label{
+			{Name: "namespace", Value: "prod-payments"},
+			{Name: "pod", Value: fmt.Sprintf("payments-6f7b9c%03d", i)},
+			{Name: "uid", Value: fmt.Sprintf("0a1b2c3d-1111-2222-3333-4444555%05d", i)},
+			{Name: "phase", Value: "Running"},
+		}
+	}
+	shape := func(m pmetric.Metric) { shapeNumber(m, false) }
+	for i := range rows {
+		cb.metric("kube_pod_status_phase", metricMeta{}, rows[i], shape) // create both resources and metrics
+	}
+	i := 0
+	allocs := testing.AllocsPerRun(200, func() {
+		cb.metric("kube_pod_status_phase", metricMeta{}, rows[i%2], shape)
+		i++
+	})
+	if allocs != 0 {
+		t.Fatalf("routing an already-known object allocates %v times, want 0: the resource or metric key is being materialized per row", allocs)
 	}
 }

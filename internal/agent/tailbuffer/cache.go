@@ -100,8 +100,21 @@ func (c *decisionCache) charged(id pcommon.TraceID) bool {
 
 // put remembers a verdict and whether producing it billed the rate budgets,
 // evicting the oldest entry if the cache is full.
+//
+// The charge bit ACCUMULATES over the entry being replaced; it is not
+// overwritten. A re-decision passes the remembered bit back as Trace.Charged,
+// which makes charge() take its Peek arm — so that evaluation spends nothing and
+// reports Decision.Charged == false BY CONSTRUCTION. Storing that verbatim would
+// forget the payment after exactly one re-decision, and the trace's THIRD window
+// would bill the budgets a second time; the fact is meant to outlive the verdict
+// and be bounded by the capacity alone (see the two lifetimes above). One bit
+// that simply took the caller's value cannot also express "the evaluator REFUSED
+// this trace, so nothing was spent" — that case is the FIRST put for an id,
+// where there is no earlier entry to accumulate over, so the two coexist only
+// because this one ORs.
 func (c *decisionCache) put(id pcommon.TraceID, keep, charged bool, now time.Time) {
 	if old, ok := c.m[id]; ok {
+		charged = charged || old.charged
 		old.stale = true // its FIFO slot must not evict the new entry
 		delete(c.m, id)
 	}

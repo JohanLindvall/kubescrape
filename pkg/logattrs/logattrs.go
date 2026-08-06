@@ -150,7 +150,7 @@ func (e *Extractor) Extract(line string) Result {
 	if sc == nil {
 		sc = &scratch{vals: make([]string, len(e.rules)), found: make([]bool, len(e.rules))}
 	}
-	defer e.scratch.Put(sc)
+	defer e.release(sc)
 	if t := strings.TrimSpace(line); strings.HasPrefix(t, "{") {
 		// Read-only view of the line: lightning never mutates its input, so
 		// the string→[]byte copy is avoidable.
@@ -220,6 +220,17 @@ func (e *Extractor) Extract(line string) Result {
 		}
 	}
 	return res
+}
+
+// release drops every reference into the last line before the scratch is
+// pooled. Truncating raws to zero LENGTH releases nothing: the GC scans the
+// whole backing array, and the JSON arm's entries are read-only views into the
+// line — so a pooled holder pinned the last-processed line (up to one
+// MaxEntryBytes multiline entry, 1 MiB by default) until its next use or a pool
+// eviction. The twin holder in internal/logline clears for the same reason.
+func (e *Extractor) release(sc *scratch) {
+	clear(sc.raws[:cap(sc.raws)])
+	e.scratch.Put(sc)
 }
 
 // decodeScalar renders a raw JSON scalar token as its typed value; objects,

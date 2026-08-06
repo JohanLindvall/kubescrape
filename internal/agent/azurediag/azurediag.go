@@ -87,7 +87,11 @@ type Config struct {
 // unit-tested without a broker (the journald source pattern). poll blocks
 // until records, an error, or ctx; commit commits everything polled so far.
 type source interface {
-	poll(ctx context.Context) ([][]byte, error)
+	// poll blocks for the next fetch. healthy reports that it was a REAL
+	// fetch — records, or a genuinely clean empty one — as opposed to one
+	// carrying only errors, which by its records alone is indistinguishable
+	// from a clean empty poll.
+	poll(ctx context.Context) (msgs [][]byte, healthy bool, err error)
 	commit(ctx context.Context) error
 	close()
 }
@@ -147,15 +151,18 @@ func (r *Reader) Run(ctx context.Context) {
 func (r *Reader) consume(ctx context.Context, src source) error {
 	ready := r.cfg.Ready
 	for ctx.Err() == nil {
-		msgs, err := src.poll(ctx)
+		msgs, healthy, err := src.poll(ctx)
 		if err != nil {
 			return err
 		}
-		if ready != nil {
-			// The first poll returning WITHOUT error (even empty) means the
-			// group is joined and the hub reachable — poll fails a fetch that
-			// carried only errors, so an unconsumable hub (an authorization
-			// failure) cannot clear the readiness gate.
+		if ready != nil && healthy {
+			// The first HEALTHY poll (even empty) means the group is joined
+			// and the hub reachable. A fetch carrying only errors is not one:
+			// it leaves the gate closed, so an unconsumable hub — an identity
+			// without read permission on it — never reports ready, while
+			// staying non-fatal, because rebuilding the client cannot fix a
+			// permission problem and the LeaveGroup/JoinGroup churn would take
+			// every OTHER hub in the namespace down with it.
 			ready()
 			ready = nil
 		}

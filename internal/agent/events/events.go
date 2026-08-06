@@ -152,6 +152,14 @@ type Reader struct {
 	now         func() time.Time
 	lastPersist time.Time
 	lastFlush   time.Time
+	// flushFailedAt is when the last export attempt failed, zero once one
+	// succeeds. Past BatchSize the batch is RETAINED, so the count trigger
+	// holds forever while the collector is down; pacing the retry against this
+	// keeps it to one attempt per FlushInterval instead of one per event.
+	flushFailedAt time.Time
+	// flushWarned rate-limits the export-failure warning to flushWarnEvery;
+	// obs.LogExportFailures carries the magnitude.
+	flushWarned time.Time
 	// replaying is set while the current stream is a full-backlog replay (it
 	// started from ""), which is the ONLY situation in which the watermark
 	// filter belongs: a replay re-sends events already exported, a positioned
@@ -183,6 +191,9 @@ type Reader struct {
 	// overflowWarned rate-limits the shedOldest warning to one per process;
 	// obs.EventsOverflowDropped carries the ongoing magnitude.
 	overflowWarned bool
+	// resCache memoizes the involved object's resource for the life of the
+	// batch, keyed by the same identity the records group on. See resource().
+	resCache map[string]pcommon.Resource
 }
 
 // entry is one event, already converted to the fields the record needs.
@@ -264,12 +275,28 @@ func (r *Reader) Run(ctx context.Context) {
 	// co-located -azure-diagnostics consumer with it, contradicting the leader
 	// package's own contract that losing the lease must not take the process
 	// down.
-	fctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), r.shutdownBudget())
-	defer cancel()
-	if err := r.flush(fctx); err != nil {
+	//
+	// The two steps get SEPARATE slices of that budget. Sharing one deadline
+	// let the flush spend all of it in the exporter's retries and leave
+	// persist a Get+Update on an already-expired context, failing instantly —
+	// so the successor replayed up to PersistInterval of events at exactly the
+	// handover the ConfigMap position exists for. Bounded replay rather than
+	// loss, but it was the first thing sacrificed.
+	base := context.WithoutCancel(ctx)
+	budget := r.shutdownBudget()
+	flushBudget := budget * 2 / 3
+	fctx, cancel := context.WithTimeout(base, flushBudget)
+	err := r.flush(fctx)
+	cancel()
+	if err != nil {
 		r.log.Warn("final event flush failed", "error", err)
 	}
-	r.persist(fctx, true)
+	// Started AFTER the flush, so a fast flush does not shorten the write; the
+	// two together still stay under shutdownBudget, hence under the renew
+	// deadline leader.elect joins this work within.
+	pctx, pcancel := context.WithTimeout(base, budget-flushBudget)
+	defer pcancel()
+	r.persist(pctx, true)
 }
 
 // shutdownBudget is the ceiling on the final flush and position write. It is
@@ -369,6 +396,7 @@ func (r *Reader) stream(ctx context.Context) error {
 		// retain them.
 		clear(r.batch)
 		r.batch = r.batch[:0]
+		clear(r.resCache)
 		// The converted payload described the batch just dropped; the watch is
 		// about to re-deliver those entries and they will convert afresh
 		// (logchain.Pending's restart-clear case — the loss journald had for
@@ -403,9 +431,7 @@ func (r *Reader) stream(ctx context.Context) error {
 			return ctx.Err()
 		case <-ticker.C:
 			if len(r.batch) > 0 && time.Since(r.lastFlush) >= r.cfg.FlushInterval {
-				if err := r.flush(ctx); err != nil {
-					return err
-				}
+				r.tryFlush(ctx)
 			}
 			r.persist(ctx, false)
 		case ev, ok := <-w.ResultChan():
@@ -532,10 +558,58 @@ func (r *Reader) handle(ctx context.Context, ev watch.Event) error {
 		return nil
 	}
 	r.ingest(ctx, e)
-	if len(r.batch) >= r.cfg.BatchSize {
-		return r.flush(ctx)
+	if len(r.batch) >= r.cfg.BatchSize && r.flushDue() {
+		r.tryFlush(ctx)
 	}
 	return nil
+}
+
+// flushWarnEvery rate-limits the export-failure warning during an outage.
+const flushWarnEvery = time.Minute
+
+// flushDue reports whether the count trigger may attempt an export again. It
+// is unrestricted while flushes are landing; after a failure the batch stays
+// AT or above BatchSize (nothing settles), so the trigger holds for every
+// event that arrives and would re-export per event.
+func (r *Reader) flushDue() bool {
+	return r.flushFailedAt.IsZero() || time.Since(r.flushFailedAt) >= r.cfg.FlushInterval
+}
+
+// tryFlush exports the batch and treats a TRANSIENT failure as a flush
+// failure, not a stream failure.
+//
+// Propagating it tore down the API-server watch, and past BatchSize the batch
+// is retained, so the count trigger held forever and every subsequent event
+// cost another failing export and another teardown — 7681 of them to reach the
+// retention cap from cold, with backoff.ResetIfHealthy needing a 30s-long
+// stream so the backoff pinned at its 30s cap. Worse than the churn was what
+// it did to the position: only one event per round was handled, so seenRV fell
+// behind the cluster's event rate, aged out of the API server's watch window
+// within minutes, and the resulting Gone expired into a relist that a COLD
+// reader cannot take (relist needs a non-zero watermark) — so the watch
+// silently restarted at the CURRENT revision and the whole gap was discarded,
+// counted only by obs.EventRelists{stage="watch"}, whose name asserts a relist
+// that did not happen.
+//
+// Keeping the watch open costs nothing the design does not already carry: the
+// batch is bounded by retainCap, the collector's failure is counted by
+// obs.LogExportFailures, and seenRV keeps tracking the live stream. A
+// PERMANENT rejection is not seen here at all — flush settles it and returns
+// nil, as everywhere else.
+func (r *Reader) tryFlush(ctx context.Context) {
+	if err := r.flush(ctx); err != nil {
+		r.flushFailedAt = time.Now()
+		if time.Since(r.flushWarned) >= flushWarnEvery {
+			r.flushWarned = time.Now()
+			r.log.Warn("event export failed; the watch stays open and the batch is retained",
+				"error", err, "buffered", len(r.batch), "cap", r.retainCap())
+		}
+		return
+	}
+	if !r.flushFailedAt.IsZero() {
+		r.log.Info("event export recovered", "buffered", len(r.batch))
+		r.flushFailedAt, r.flushWarned = time.Time{}, time.Time{}
+	}
 }
 
 // wanted filters a REPLAYED event against the watermark. After a relist we
@@ -628,6 +702,11 @@ func (r *Reader) settle(newest entry, covered int) {
 	// converts afresh (and is observed by log-metrics) on the next flush.
 	r.pending.Discard()
 	r.rendered = 0
+	// The resource memo is per BATCH. Retained tail entries already hold the
+	// resources they were built with, so dropping it costs at most one rebuild
+	// per involved object on the next flush and keeps a settled object's
+	// resource from outliving the entries that referenced it.
+	clear(r.resCache)
 	if newest.rv != "" && newerRV(newest.rv, r.committed.ResourceVersion) {
 		r.committed.ResourceVersion = newest.rv
 	}
@@ -672,29 +751,48 @@ func (r *Reader) settle(newest entry, covered int) {
 	}
 }
 
-// maxRetained bounds the batch across failed flushes. Before the first commit
-// every stream restart resolves through the redelivers=false branch, which
-// RETAINS the batch (the new watch does not re-deliver it) while appending
-// fresh entries — so a collector outage on a fresh install grows it without
-// bound (BatchSize only triggers flush ATTEMPTS, which fail), and each entry
-// pins a fully resolved resource (~KBs). Unbounded, that is an OOM against the
-// singleton's memory limit within hours: the whole batch lost, the whole
-// outage window lost with it (StartMode=end after the restart), and the
-// co-located pipelines taken down too. Past the cap the oldest sheddable
-// entry is dropped and counted (obs.EventsOverflowDropped) — bounded,
-// observable loss instead of total.
+// maxRetained bounds the batch across failed flushes, in entries.
+//
+// A collector outage settles nothing, so the batch grows for the whole length
+// of the outage — at the CLUSTER's event rate, since the watch stays open
+// across a failed export (tryFlush), which on a busy cluster fills this cap in
+// minutes. Retention is ~2 KB per entry where every event names a distinct
+// involved object (repeats share one built resource — see resource()), so the
+// cap is ~16 MB against the singleton's 256Mi limit.
+//
+// The cap is what makes the loss bounded and OBSERVABLE
+// (obs.EventsOverflowDropped) rather than an OOM that takes the whole batch,
+// the whole outage window (StartMode=end after the restart) and the co-located
+// pipelines with it.
 const maxRetained = 8192
 
+// maxRetainedCeiling is the absolute ceiling the floor below may not lift the
+// cap past. -events-batch-size has no upper bound of its own, so the 2*BatchSize
+// floor turned an extreme value into an extreme budget (100000 => ~400 MB
+// retained against a 256Mi limit) — the cap stopped being a cap. Past this
+// ceiling the count-triggered flush is simply unreachable and the FlushInterval
+// ticker does the flushing: slower, never an OOM.
+const maxRetainedCeiling = 2 * maxRetained
+
 // retainCap is maxRetained, floored above BatchSize so the count-triggered
-// flush stays reachable however BatchSize is tuned.
+// flush stays reachable however BatchSize is tuned, and ceilinged so the floor
+// cannot repeal the memory bound.
 func (r *Reader) retainCap() int {
-	return max(maxRetained, 2*r.cfg.BatchSize)
+	return min(max(maxRetained, 2*r.cfg.BatchSize), maxRetainedCeiling)
 }
 
-// shedOldest drops one entry to admit a new one at the cap: the oldest entry
-// the pending payload does NOT cover. The rendered prefix is kept — its
-// entries are not lost (they export when the collector recovers), and
-// dropping inside it would make settle slide fresh entries as covered by a
+// shedChunk is how many entries one shed drops. Dropping exactly one per
+// admitted event made the shed O(batch): at the cap EVERY event sheds, and
+// each shed memmoved the whole post-prefix tail (measured 47.5 µs against
+// 2.8 µs below the cap, 1.18 MB moved per event). Dropping a run amortises the
+// move over that many admissions; the surplus loss is bounded by one chunk at
+// the moment the collector recovers, against a cap of maxRetained.
+const shedChunk = maxRetained / 64
+
+// shedOldest drops a run of entries to admit new ones at the cap, starting at
+// the oldest entry the pending payload does NOT cover. The rendered prefix is
+// kept — its entries are not lost (they export when the collector recovers),
+// and dropping inside it would make settle slide fresh entries as covered by a
 // payload that never carried them. Only when EVERYTHING is rendered is the
 // rendering discarded first, so the drop cannot orphan it; the re-render
 // re-observes the LogMetrics once, the price of not wedging at the cap.
@@ -704,14 +802,18 @@ func (r *Reader) shedOldest() {
 		r.rendered = 0
 	}
 	i := r.rendered
-	copy(r.batch[i:], r.batch[i+1:])
-	r.batch[len(r.batch)-1] = entry{}
-	r.batch = r.batch[:len(r.batch)-1]
-	obs.EventsOverflowDropped.Inc()
+	n := min(shedChunk, len(r.batch)-i)
+	if n <= 0 {
+		return
+	}
+	copy(r.batch[i:], r.batch[i+n:])
+	clear(r.batch[len(r.batch)-n:])
+	r.batch = r.batch[:len(r.batch)-n]
+	obs.EventsOverflowDropped.Add(float64(n))
 	if !r.overflowWarned {
 		r.overflowWarned = true
 		r.log.Warn("event batch at capacity with nothing committing; dropping the oldest unexported events",
-			"cap", r.retainCap())
+			"cap", r.retainCap(), "perShed", shedChunk)
 	}
 }
 

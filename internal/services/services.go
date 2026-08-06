@@ -5,7 +5,9 @@ package services
 
 import (
 	"maps"
+	"sort"
 	"sync"
+	"sync/atomic"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -45,7 +47,30 @@ type Index struct {
 	// are keyed by UID, so a name reused by a RECREATED Service is the one
 	// collision the UID map cannot see — see Upsert.
 	byName map[string]types.UID
+	// gen changes on every mutation, so a consumer that derives something
+	// expensive from the whole index (the server's monitor→services cross
+	// product) can hold it until the index actually changes instead of until a
+	// timer lapses. Atomic and read without the lock: a stale read only costs
+	// one extra rebuild.
+	gen atomic.Uint64
+	// reads counts locked reads; see Reads.
+	reads atomic.Int64
 }
+
+// Generation changes whenever the indexed services change. It is a change
+// TOKEN, not a count: compare it with a previously observed value, never
+// interpret the difference.
+func (ix *Index) Generation() uint64 { return ix.gen.Load() }
+
+// Reads counts the times the index has been read under its lock.
+//
+// It is here because the READ PATTERN is the property worth pinning, and
+// nothing else can see it: matching a node's pods used to take the RLock and
+// scan the whole namespace once PER POD, so a 110-pod node in a 1,000-Service
+// namespace did 110 lock round trips and 110,000 selector evaluations per
+// targets request — on the default annotation path, while the two sibling
+// lookups on the same request had both already been hoisted out of that loop.
+func (ix *Index) Reads() int64 { return ix.reads.Load() }
 
 // NewIndex creates an empty index.
 func NewIndex() *Index {
@@ -93,6 +118,7 @@ func (ix *Index) Upsert(svc *corev1.Service) {
 
 	ix.mu.Lock()
 	defer ix.mu.Unlock()
+	ix.gen.Add(1)
 	m := ix.byNamespace[svc.Namespace]
 	if m == nil {
 		m = make(map[types.UID]*Service)
@@ -126,6 +152,7 @@ func (ix *Index) Upsert(svc *corev1.Service) {
 func (ix *Index) Delete(namespace string, uid types.UID) {
 	ix.mu.Lock()
 	defer ix.mu.Unlock()
+	ix.gen.Add(1)
 	m := ix.byNamespace[namespace]
 	if m == nil {
 		return
@@ -147,6 +174,7 @@ func (ix *Index) Delete(namespace string, uid types.UID) {
 
 // All returns the services in the given namespaces (nil = every namespace).
 func (ix *Index) All(namespaces []string) []*Service {
+	ix.reads.Add(1)
 	ix.mu.RLock()
 	defer ix.mu.RUnlock()
 
@@ -170,20 +198,68 @@ func (ix *Index) All(namespaces []string) []*Service {
 
 // Matching returns the services in namespace whose selector matches the
 // given pod labels. Services without a selector never match.
+//
+// It takes the lock per call, so a caller matching MANY pods (every pod on a
+// node, per targets request) wants InNamespaces + Service.Selects instead: this
+// scans every Service in the namespace, and doing that under a fresh RLock once
+// per pod put 110 lock round trips and a map walk apiece on the default
+// annotation path of every scrape cycle.
 func (ix *Index) Matching(namespace string, podLabels map[string]string) []*Service {
+	ix.reads.Add(1)
 	ix.mu.RLock()
 	defer ix.mu.RUnlock()
 
 	var out []*Service
 	for _, svc := range ix.byNamespace[namespace] {
-		if len(svc.Selector) == 0 {
-			continue
-		}
-		if selects(svc.Selector, podLabels) {
+		if svc.Selects(podLabels) {
 			out = append(out, svc)
 		}
 	}
 	return out
+}
+
+// InNamespaces snapshots the services of each named namespace in ONE lock hold,
+// each list sorted by name. Absent namespaces are simply missing from the
+// result; the slices and the Services in them are shared and must be treated as
+// immutable (the same contract Matching's results carry).
+//
+// The sort is the caller's determinism, taken once here rather than per pod:
+// map iteration order must not decide which Service a URL-deduped scrape target
+// is attributed to, and a per-pod sort of the same handful of Services is pure
+// repetition. Services are keyed by UID, so name ordering is total within a
+// namespace only while names are unique — which Kubernetes guarantees, the
+// same-name-replacement window in Upsert aside.
+func (ix *Index) InNamespaces(namespaces []string) map[string][]*Service {
+	ix.reads.Add(1)
+	ix.mu.RLock()
+	defer ix.mu.RUnlock()
+
+	out := make(map[string][]*Service, len(namespaces))
+	for _, ns := range namespaces {
+		m := ix.byNamespace[ns]
+		if len(m) == 0 || out[ns] != nil {
+			continue
+		}
+		list := make([]*Service, 0, len(m))
+		for _, svc := range m {
+			list = append(list, svc)
+		}
+		if len(list) > 1 {
+			sort.Slice(list, func(i, j int) bool { return list[i].Name < list[j].Name })
+		}
+		out[ns] = list
+	}
+	return out
+}
+
+// Selects reports whether this Service's selector matches a pod's labels. A
+// Service without a selector never matches (it is externally managed; its
+// endpoints are not derived from pods).
+func (s *Service) Selects(podLabels map[string]string) bool {
+	if len(s.Selector) == 0 {
+		return false
+	}
+	return selects(s.Selector, podLabels)
 }
 
 func selects(selector, labels map[string]string) bool {

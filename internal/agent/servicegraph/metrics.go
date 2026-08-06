@@ -144,6 +144,34 @@ type Registry struct {
 	// the copy itself can release and retake the mutex between chunks.
 	snap     []edgeSnapshot
 	snapPtrs []*edgeSeries
+	// snapSmall counts consecutive renders that used far less of the scratch than
+	// it can hold. See snapOversized.
+	snapSmall int
+}
+
+// The render scratch shrinks when it has been much larger than the live series
+// count for several renders running: a burst to the cardinality cap otherwise
+// sizes it to that peak for the process' life, and the eviction that reclaimed
+// the series reclaims nothing here. The hysteresis is the point — the
+// alternative to a stable scratch is two slice allocations per series per
+// export, which is what it exists to avoid — so a workload that merely
+// oscillates keeps its capacity, and only one that has genuinely shrunk pays a
+// single reallocation.
+const (
+	snapShrinkFactor = 4 // shrink at under a quarter occupancy
+	snapShrinkRuns   = 3 // ... sustained for this many renders
+	snapShrinkFloor  = 64
+)
+
+// snapOversized reports whether the scratch has been oversized long enough to be
+// worth rebuilding, and keeps the run length that decides it.
+func (r *Registry) snapOversized(n int) bool {
+	if cap(r.snap) <= snapShrinkFloor || n*snapShrinkFactor >= cap(r.snap) {
+		r.snapSmall = 0
+		return false
+	}
+	r.snapSmall++
+	return r.snapSmall >= snapShrinkRuns
 }
 
 // snapChunk is how many series one snapshot lock-hold copies. It trades the
@@ -412,11 +440,22 @@ func (r *Registry) render(res pcommon.Resource, now time.Time) pmetric.Metrics {
 // bucket and exemplar slices already allocated, so the copy under the mutex is
 // pure memmove. Called without the store lock; the scratch belongs to renderMu.
 func (r *Registry) growSnap(n int) {
-	if cap(r.snap) < n {
+	switch {
+	case cap(r.snap) < n:
 		grown := make([]edgeSnapshot, n)
 		copy(grown, r.snap)
 		r.snap = grown
-	} else {
+		r.snapSmall = 0
+	case r.snapOversized(n):
+		// Start over at the live size. Keeping the tail costs its two arrays per
+		// side per slot — 2*(len(bounds)+1) exemplars at 48 B each dominates —
+		// which measured 24.3 MB still reachable after one burst to the 20000
+		// cardinality cap and a mass stale eviction that left ONE series. The
+		// scratch is worth having for the steady state, not for the peak the
+		// process once saw.
+		r.snap = make([]edgeSnapshot, n, max(snapShrinkFloor, 2*n))
+		r.snapSmall = 0
+	default:
 		// The tail past n keeps its bucket and exemplar CAPACITY — reusing that
 		// is what the scratch is for — but must NOT keep its labels: those alias
 		// the label sets of series this render does not cover, so a burst up to

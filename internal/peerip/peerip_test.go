@@ -51,3 +51,27 @@ func TestCanonical(t *testing.T) {
 		t.Errorf("From = %q but the index key is %q", got, want)
 	}
 }
+
+// Canonical runs twice per pod upsert inside the store's exclusive write lock
+// (podAddresses, for every address plus the host IP), so it must not allocate
+// on the shapes that path actually sees: an already-canonical address, and the
+// empty string every pod with no status.hostIP hands it.
+// Deliberately NOT t.Parallel, unlike the rest of this package: an
+// AllocsPerRun measurement must never run beside another test.
+func TestCanonicalIsAllocationFree(t *testing.T) {
+	if raceEnabled {
+		t.Skip("-race perturbs allocation counts")
+	}
+	for _, ip := range []string{"10.1.2.3", "fd00::7", "", "2001:db8::1"} {
+		got := testing.AllocsPerRun(200, func() {
+			sink = Canonical(ip)
+		})
+		if got != 0 {
+			t.Errorf("Canonical(%q) allocates %v times per call, want 0", ip, got)
+		}
+	}
+}
+
+// sink defeats the dead-store elimination that would let an allocation-free
+// claim hold vacuously.
+var sink string

@@ -89,13 +89,39 @@ func Pod(res pcommon.Resource, pod kubemeta.Pod) {
 	}
 
 	for k, v := range pod.Labels {
-		a.PutStr("k8s.pod.label."+k, v)
+		a.PutStr(prefixedKey(podLabelKeys, podLabelPrefix, k), v)
 	}
 	if pod.NamespaceMetadata != nil {
 		for k, v := range pod.NamespaceMetadata.Labels {
-			a.PutStr("k8s.namespace.label."+k, v)
+			a.PutStr(prefixedKey(nsLabelKeys, nsLabelPrefix, k), v)
 		}
 	}
+}
+
+// The prefixed attribute key for a label is memoized: label VALUES are data,
+// but label KEYS are a property of the cluster's workloads and low-cardinality
+// across it, while the concatenation is one allocation per label per RESOURCE
+// — paid once per described object on a split path, where a 12k-object scrape
+// makes it 84k allocations a cycle. The cache evicts (genCache), so a workload
+// minting label keys from data cannot grow it without bound.
+const (
+	podLabelPrefix = "k8s.pod.label."
+	nsLabelPrefix  = "k8s.namespace.label."
+	maxLabelKeys   = 4096
+)
+
+var (
+	podLabelKeys = newGenCache[string](maxLabelKeys)
+	nsLabelKeys  = newGenCache[string](maxLabelKeys)
+)
+
+func prefixedKey(c *genCache[string], prefix, key string) string {
+	if full, ok := c.load(key); ok {
+		return full
+	}
+	full := prefix + key
+	c.store(key, full)
+	return full
 }
 
 // Container adds the container-level resource attributes on top of Pod's.

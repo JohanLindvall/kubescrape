@@ -10,8 +10,6 @@ import (
 	"slices"
 	"sort"
 	"strings"
-	"sync"
-	"sync/atomic"
 	"text/template"
 
 	"go.opentelemetry.io/collector/pdata/pcommon"
@@ -236,37 +234,29 @@ type dynamicAttr struct {
 
 // regexCache backs the template regex functions.
 //
-// The patterns USUALLY come from a fixed config, which is what makes a cache
-// with no eviction reasonable — but regexMatch/regexReplace take the pattern as
+// The patterns USUALLY come from a fixed config, which is what would make an
+// unbounded cache reasonable — but regexMatch/regexReplace take the pattern as
 // a template ARGUMENT, so a template may compose one from per-object data
 // (`regexMatch .Pod.Name ...`, a label value, an annotation). Every distinct
-// value then pinned a compiled *regexp.Regexp in a process-global map for the
-// agent's life, on a path that runs per resource built. The cap turns that from
-// an unbounded leak into a bounded one that simply stops caching; compilation
-// still succeeds past it, so behaviour is unchanged either way.
-var (
-	regexCache   sync.Map // pattern -> *regexp.Regexp | error
-	regexCacheN  atomic.Int64
-	maxRegexKeys = 1024
-)
+// value then pins a compiled *regexp.Regexp for the agent's life, on a path
+// that runs per resource built. The cap bounds that — by EVICTING, never by
+// refusing to cache: a working set larger than the cap has to keep its hot
+// patterns or every call past the cap is a fresh compile, which is three orders
+// of magnitude dearer than the lookup and lands on precisely the data-derived
+// input this bound exists for (see genCache).
+const maxRegexKeys = 1024
+
+var regexCache = newGenCache[any](maxRegexKeys) // pattern -> *regexp.Regexp | error
 
 func cachedRegexp(pattern string) (*regexp.Regexp, error) {
-	if v, ok := regexCache.Load(pattern); ok {
+	if v, ok := regexCache.load(pattern); ok {
 		if re, ok := v.(*regexp.Regexp); ok {
 			return re, nil
 		}
 		return nil, v.(error)
 	}
 	re, err := regexp.Compile(pattern)
-	if regexCacheN.Load() >= int64(maxRegexKeys) {
-		// Past the cap, compile every time rather than grow. A config with more
-		// than a thousand distinct patterns is data-derived by construction,
-		// and that is the case this bound exists for.
-		return re, err
-	}
-	if _, loaded := regexCache.LoadOrStore(pattern, cacheValue(re, err)); !loaded {
-		regexCacheN.Add(1)
-	}
+	regexCache.store(pattern, cacheValue(re, err))
 	return re, err
 }
 
@@ -406,6 +396,12 @@ func templateConfigError(err error) bool {
 // Build fills res from ctx. Safe on a nil receiver (defaults only, no
 // filter).
 func (b *Builder) Build(res pcommon.Resource, ctx Context) {
+	// Size the attribute slice once instead of growing it through five
+	// reallocations: a realistic pod (2 owners, 7 labels, a container) puts ~22
+	// attributes, and the growth alone was half the bytes this call allocates.
+	// EnsureCapacity is a no-op when the capacity is already there, so a
+	// pre-populated resource (the KSM splitter's) keeps what it has.
+	res.Attributes().EnsureCapacity(res.Attributes().Len() + b.attrCount(ctx))
 	if b == nil || b.defaults {
 		if ctx.Node != nil && ctx.Node.Name != "" {
 			res.Attributes().PutStr("k8s.node.name", ctx.Node.Name)
@@ -450,6 +446,37 @@ func (b *Builder) Build(res pcommon.Resource, ctx Context) {
 	// Prefix the (possibly template-overridden) instance last, before filtering.
 	PrefixInstance(res, b.instancePrefix)
 	b.filter.Apply(res)
+}
+
+// attrCount is an UPPER BOUND on the attributes Build is about to put, for
+// pre-sizing only: an over-estimate costs a few unused slots in one allocation,
+// while an under-estimate costs the reallocation the sizing exists to avoid.
+// Nil-receiver safe, like Build (nil = defaults, no static or template
+// attributes).
+func (b *Builder) attrCount(ctx Context) int {
+	n := 2 // Identity: service.namespace + service.instance.id
+	if b == nil || b.defaults {
+		if ctx.Node != nil {
+			n++ // k8s.node.name
+		}
+		if p := ctx.Pod; p != nil {
+			// namespace, name, uid, node, ip, service.name.
+			n += 6 + len(p.Owners) + len(p.Labels)
+			if p.NamespaceMetadata != nil {
+				n += len(p.NamespaceMetadata.Labels)
+			}
+		}
+		if ctx.Container != nil {
+			n += 4 // name, id, image, restart_count
+		}
+		if ctx.Service != nil {
+			n += 2 // name, uid
+		}
+	}
+	if b != nil {
+		n += len(b.static) + len(b.dynamic)
+	}
+	return n
 }
 
 // FilterResource applies the builder's global attribute filter to an

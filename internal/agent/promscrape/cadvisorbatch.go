@@ -23,6 +23,21 @@ import (
 // across cadvisor scrape cycles.
 const podMetaCacheTTL = time.Minute
 
+// podCacheMaxEntries bounds the metadata cache. Each entry holds a full
+// kubemeta.Pod document, and the objects a splitter describes are the whole
+// cluster's, not this node's.
+const podCacheMaxEntries = 8192
+
+// podCacheLowWater is what a size trim leaves behind. Trimming BELOW the cap
+// rather than down to it amortizes the O(n) sweep over ~2000 inserts instead of
+// running it on every insert while full, which matters because the sweep holds
+// cacheMu — shared by every concurrent scrape goroutine's lookup. Same shape,
+// and the same reason, as metaclient's evictLowWater.
+const podCacheLowWater = podCacheMaxEntries * 3 / 4
+
+// podCacheSweepEvery is how often expired entries are swept below the cap.
+const podCacheSweepEvery = time.Minute
+
 type podCacheEntry struct {
 	pod       *kubemeta.Pod       // nil: lookup failed / unknown
 	container *kubemeta.Container // set for container-ID entries
@@ -499,12 +514,49 @@ func (s *Scraper) cachePut(key string, e podCacheEntry) {
 	s.cacheMu.Lock()
 	defer s.cacheMu.Unlock()
 	s.podCache[key] = e
-	// Opportunistic pruning keeps the cache bounded by live pods/containers.
-	if len(s.podCache) > 8192 {
-		for k, old := range s.podCache {
-			if time.Since(old.fetched) >= podMetaCacheTTL {
-				delete(s.podCache, k)
-			}
+	s.evictCacheLocked(time.Now())
+}
+
+// evictCacheLocked bounds the cache: expired entries first, then arbitrary ones
+// down to the low-water mark. Caller holds cacheMu.
+//
+// Expiry alone is NOT a bound and cannot be one. The entries a splitter's
+// enrichment inserts are all fetched inside one TTL window, so above the cap
+// EVERY insert swept the whole map and deleted nothing — 1.3 s per insert at 12k
+// objects, 5.2 s at 20k, all of it holding the mutex the concurrent scrape
+// goroutines share — and the map never left the branch, so a 12k-pod cluster
+// also retained 12k full pod documents. The cadence keeps the sweep amortized
+// and the low-water trim is what makes the cap real; an arbitrary eviction costs
+// the next lookup a metadata request, which is the price of the hard bound.
+func (s *Scraper) evictCacheLocked(now time.Time) {
+	if len(s.podCache) <= podCacheMaxEntries {
+		if now.Sub(s.cacheSwept) < podCacheSweepEvery {
+			return
+		}
+		s.cacheSwept = now
+		s.sweepExpiredLocked(now)
+		return
+	}
+	// The hard trim sweeps on its way to the cap, so the cadence counts from it
+	// too: leaving cacheSwept behind made the next below-cap insert re-run a full
+	// sweep however recently this one finished.
+	s.cacheSwept = now
+	s.sweepExpiredLocked(now)
+	for k := range s.podCache {
+		if len(s.podCache) <= podCacheLowWater {
+			break
+		}
+		delete(s.podCache, k)
+	}
+}
+
+// sweepExpiredLocked drops entries past podMetaCacheTTL — the same predicate
+// cacheGet reads them by, so nothing usable is thrown away. Caller holds
+// cacheMu.
+func (s *Scraper) sweepExpiredLocked(now time.Time) {
+	for k, e := range s.podCache {
+		if now.Sub(e.fetched) >= podMetaCacheTTL {
+			delete(s.podCache, k)
 		}
 	}
 }

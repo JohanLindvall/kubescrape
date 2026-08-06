@@ -151,36 +151,48 @@ func (b *logBatch) Freeze()               {}
 func (b *logBatch) Truth() starlark.Bool  { return true }
 func (b *logBatch) Hash() (uint32, error) { return 0, fmt.Errorf("unhashable") }
 
+// Iterate walks the batch's (resource, scope, record) positions lazily.
+//
+// It used to materialize the whole batch into a []*logRecord before the first
+// Next, which made "lazy host objects" lazy per FIELD but not per RECORD: a
+// 1024-record batch cost 1,037 allocations and 62 KB before the script ran a
+// line, and a script that broke out early paid for every record it never saw.
+// The walk is now positional, so a break costs only what it consumed.
+//
+// The per-record view is still freshly allocated rather than reused: Starlark
+// hands the value to the loop variable, and a script may keep it past the
+// iteration — `[r for r in batch if r.severity_text == "ERROR"]` is the
+// obvious way to write a two-pass script, and one reused view would silently
+// turn every element of that list into the LAST record.
 func (b *logBatch) Iterate() starlark.Iterator {
-	var recs []*logRecord
-	rls := b.ld.ResourceLogs()
-	for i := 0; i < rls.Len(); i++ {
-		rl := rls.At(i)
+	return &logIter{rls: b.ld.ResourceLogs()}
+}
+
+type logIter struct {
+	rls     plog.ResourceLogsSlice
+	i, j, k int
+}
+
+func (it *logIter) Next(v *starlark.Value) bool {
+	for it.i < it.rls.Len() {
+		rl := it.rls.At(it.i)
 		sls := rl.ScopeLogs()
-		for j := 0; j < sls.Len(); j++ {
-			lrs := sls.At(j).LogRecords()
-			for k := 0; k < lrs.Len(); k++ {
-				recs = append(recs, &logRecord{lr: lrs.At(k), res: rl.Resource()})
-			}
+		if it.j >= sls.Len() {
+			it.i, it.j, it.k = it.i+1, 0, 0
+			continue
 		}
+		lrs := sls.At(it.j).LogRecords()
+		if it.k >= lrs.Len() {
+			it.j, it.k = it.j+1, 0
+			continue
+		}
+		*v = &logRecord{lr: lrs.At(it.k), res: rl.Resource()}
+		it.k++
+		return true
 	}
-	return &sliceIter[*logRecord]{items: recs}
+	return false
 }
-
-type sliceIter[T starlark.Value] struct {
-	items []T
-	i     int
-}
-
-func (it *sliceIter[T]) Next(v *starlark.Value) bool {
-	if it.i >= len(it.items) {
-		return false
-	}
-	*v = it.items[it.i]
-	it.i++
-	return true
-}
-func (it *sliceIter[T]) Done() {}
+func (it *logIter) Done() {}
 
 // logRecord exposes body, severity_text, severity_number, attributes,
 // resource and drop().
@@ -255,21 +267,36 @@ func (b *traceBatch) Freeze()               {}
 func (b *traceBatch) Truth() starlark.Bool  { return true }
 func (b *traceBatch) Hash() (uint32, error) { return 0, fmt.Errorf("unhashable") }
 
+// Iterate walks the batch positionally — see logBatch.Iterate.
 func (b *traceBatch) Iterate() starlark.Iterator {
-	var spans []*spanObj
-	rss := b.td.ResourceSpans()
-	for i := 0; i < rss.Len(); i++ {
-		rs := rss.At(i)
-		sss := rs.ScopeSpans()
-		for j := 0; j < sss.Len(); j++ {
-			sps := sss.At(j).Spans()
-			for k := 0; k < sps.Len(); k++ {
-				spans = append(spans, &spanObj{sp: sps.At(k), res: rs.Resource()})
-			}
-		}
-	}
-	return &sliceIter[*spanObj]{items: spans}
+	return &spanIter{rss: b.td.ResourceSpans()}
 }
+
+type spanIter struct {
+	rss     ptrace.ResourceSpansSlice
+	i, j, k int
+}
+
+func (it *spanIter) Next(v *starlark.Value) bool {
+	for it.i < it.rss.Len() {
+		rs := it.rss.At(it.i)
+		sss := rs.ScopeSpans()
+		if it.j >= sss.Len() {
+			it.i, it.j, it.k = it.i+1, 0, 0
+			continue
+		}
+		sps := sss.At(it.j).Spans()
+		if it.k >= sps.Len() {
+			it.j, it.k = it.j+1, 0
+			continue
+		}
+		*v = &spanObj{sp: sps.At(it.k), res: rs.Resource()}
+		it.k++
+		return true
+	}
+	return false
+}
+func (it *spanIter) Done() {}
 
 type spanObj struct {
 	sp  ptrace.Span
@@ -324,21 +351,36 @@ func (b *metricBatch) Freeze()               {}
 func (b *metricBatch) Truth() starlark.Bool  { return true }
 func (b *metricBatch) Hash() (uint32, error) { return 0, fmt.Errorf("unhashable") }
 
+// Iterate walks the batch positionally — see logBatch.Iterate.
 func (b *metricBatch) Iterate() starlark.Iterator {
-	var ms []*metricObj
-	rms := b.md.ResourceMetrics()
-	for i := 0; i < rms.Len(); i++ {
-		rm := rms.At(i)
-		sms := rm.ScopeMetrics()
-		for j := 0; j < sms.Len(); j++ {
-			mets := sms.At(j).Metrics()
-			for k := 0; k < mets.Len(); k++ {
-				ms = append(ms, &metricObj{m: mets.At(k), res: rm.Resource()})
-			}
-		}
-	}
-	return &sliceIter[*metricObj]{items: ms}
+	return &metricIter{rms: b.md.ResourceMetrics()}
 }
+
+type metricIter struct {
+	rms     pmetric.ResourceMetricsSlice
+	i, j, k int
+}
+
+func (it *metricIter) Next(v *starlark.Value) bool {
+	for it.i < it.rms.Len() {
+		rm := it.rms.At(it.i)
+		sms := rm.ScopeMetrics()
+		if it.j >= sms.Len() {
+			it.i, it.j, it.k = it.i+1, 0, 0
+			continue
+		}
+		mets := sms.At(it.j).Metrics()
+		if it.k >= mets.Len() {
+			it.j, it.k = it.j+1, 0
+			continue
+		}
+		*v = &metricObj{m: mets.At(it.k), res: rm.Resource()}
+		it.k++
+		return true
+	}
+	return false
+}
+func (it *metricIter) Done() {}
 
 type metricObj struct {
 	m   pmetric.Metric
@@ -434,49 +476,52 @@ func (d *datapoints) Hash() (uint32, error) { return 0, fmt.Errorf("unhashable")
 // One five-way switch, one owner: engine.go's dataPointCount.
 func (d *datapoints) Len() int { return dataPointCount(d.m) }
 
+// Iterate walks the metric's data points positionally — see logBatch.Iterate.
+// A promscrape chunk is 10,000 points, and materializing them all cost
+// 52,130 allocations before the script's first statement.
 func (d *datapoints) Iterate() starlark.Iterator {
-	var dps []*dpObj
-	add := func(attrs pcommon.Map, num *pmetric.NumberDataPoint) {
-		dps = append(dps, &dpObj{attrs: attrs, num: num})
-	}
-	switch d.m.Type() {
-	case pmetric.MetricTypeGauge:
-		pts := d.m.Gauge().DataPoints()
-		for i := 0; i < pts.Len(); i++ {
-			p := pts.At(i)
-			add(p.Attributes(), &p)
-		}
-	case pmetric.MetricTypeSum:
-		pts := d.m.Sum().DataPoints()
-		for i := 0; i < pts.Len(); i++ {
-			p := pts.At(i)
-			add(p.Attributes(), &p)
-		}
-	case pmetric.MetricTypeHistogram:
-		pts := d.m.Histogram().DataPoints()
-		for i := 0; i < pts.Len(); i++ {
-			add(pts.At(i).Attributes(), nil)
-		}
-	case pmetric.MetricTypeExponentialHistogram:
-		pts := d.m.ExponentialHistogram().DataPoints()
-		for i := 0; i < pts.Len(); i++ {
-			add(pts.At(i).Attributes(), nil)
-		}
-	case pmetric.MetricTypeSummary:
-		pts := d.m.Summary().DataPoints()
-		for i := 0; i < pts.Len(); i++ {
-			add(pts.At(i).Attributes(), nil)
-		}
-	}
-	return &sliceIter[*dpObj]{items: dps}
+	return &dpIter{m: d.m}
 }
 
+type dpIter struct {
+	m pmetric.Metric
+	i int
+}
+
+func (it *dpIter) Next(v *starlark.Value) bool {
+	if it.i >= dataPointCount(it.m) {
+		return false
+	}
+	i := it.i
+	it.i++
+	switch it.m.Type() {
+	case pmetric.MetricTypeGauge:
+		p := it.m.Gauge().DataPoints().At(i)
+		*v = &dpObj{attrs: p.Attributes(), num: p, scalar: true}
+	case pmetric.MetricTypeSum:
+		p := it.m.Sum().DataPoints().At(i)
+		*v = &dpObj{attrs: p.Attributes(), num: p, scalar: true}
+	case pmetric.MetricTypeHistogram:
+		*v = &dpObj{attrs: it.m.Histogram().DataPoints().At(i).Attributes()}
+	case pmetric.MetricTypeExponentialHistogram:
+		*v = &dpObj{attrs: it.m.ExponentialHistogram().DataPoints().At(i).Attributes()}
+	case pmetric.MetricTypeSummary:
+		*v = &dpObj{attrs: it.m.Summary().DataPoints().At(i).Attributes()}
+	default:
+		return false
+	}
+	return true
+}
+func (it *dpIter) Done() {}
+
 // dpObj is one data point: its attributes, its value where that is a single
-// number, and drop(). num is nil for the bucketed kinds, whose "value" is a
-// distribution rather than a scalar.
+// number, and drop(). scalar is false for the bucketed kinds, whose "value" is
+// a distribution rather than a number; num is then the zero value and is never
+// read.
 type dpObj struct {
-	attrs pcommon.Map
-	num   *pmetric.NumberDataPoint
+	attrs  pcommon.Map
+	num    pmetric.NumberDataPoint
+	scalar bool
 }
 
 func (p *dpObj) String() string        { return "datapoint" }
@@ -492,7 +537,7 @@ func (p *dpObj) Attr(name string) (starlark.Value, error) {
 	case "attributes":
 		return attrsView{p.attrs}, nil
 	case "value":
-		if p.num == nil {
+		if !p.scalar {
 			return starlark.None, nil // bucketed points have no scalar value
 		}
 		if p.num.ValueType() == pmetric.NumberDataPointValueTypeInt {
@@ -512,7 +557,7 @@ func (p *dpObj) SetField(name string, v starlark.Value) error {
 	if name != "value" {
 		return fmt.Errorf("cannot set %s", name)
 	}
-	if p.num == nil {
+	if !p.scalar {
 		return fmt.Errorf("cannot set value on a %s data point", "bucketed")
 	}
 	switch x := v.(type) {

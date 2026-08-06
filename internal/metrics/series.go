@@ -263,6 +263,12 @@ type seriesSpec struct {
 
 var defaultBuckets = []float64{0.005, 0.01, 0.025, 0.05, 0.075, 0.1, 0.25, 0.5, 0.75, 1, 2.5, 5, 7.5, 10}
 
+// expirationSeconds is the stored form of a configured maxAge: whole seconds,
+// rounded UP so a sub-second window never truncates to "expire on every
+// export". compileRule compares against it to reject two rules declaring
+// different maxAges for one metric name, so the conversion must have one home.
+func expirationSeconds(d time.Duration) int64 { return int64(math.Ceil(d.Seconds())) }
+
 func newSeries(spec seriesSpec) *series {
 	log := spec.log
 	if log == nil {
@@ -285,7 +291,7 @@ func newSeries(spec seriesSpec) *series {
 		kind:       spec.kind,
 		action:     spec.action,
 		maxSize:    spec.maxSize,
-		expiration: int64(math.Ceil(spec.expiration.Seconds())),
+		expiration: expirationSeconds(spec.expiration),
 		log:        log,
 	}
 	if spec.kind == kindHistogram {

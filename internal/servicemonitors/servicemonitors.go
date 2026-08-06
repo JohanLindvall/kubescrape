@@ -24,6 +24,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -198,8 +199,17 @@ type endpointSpec struct {
 		Credentials *secretRef `json:"credentials"`
 	} `json:"authorization"`
 	// Parsed only to be REPORTED as uninterpreted (see Endpoint.Ignored).
-	OAuth2   json.RawMessage `json:"oauth2"`
-	ProxyURL string          `json:"proxyUrl"`
+	OAuth2 json.RawMessage `json:"oauth2"`
+	// prometheus-operator's ProxyConfig, all four fields of it. proxyUrl alone
+	// was parsed, so the sibling clauses of the same struct were silently
+	// dropped — and proxyConnectHeader carries SecretKeySelectors, i.e. secret
+	// material named by a monitor and reported nowhere. Harmless only because
+	// none of the four is honoured; inconsistent reporting of one struct is
+	// exactly the partial application Ignored exists to make visible.
+	ProxyURL             string          `json:"proxyUrl"`
+	NoProxy              string          `json:"noProxy"`
+	ProxyFromEnvironment *bool           `json:"proxyFromEnvironment"`
+	ProxyConnectHeader   json.RawMessage `json:"proxyConnectHeader"`
 	// Parsed only to be REPORTED as uninterpreted.
 	BearerTokenFile string `json:"bearerTokenFile"`
 	// filterRunning is an ENDPOINT field on BOTH kinds — ServiceMonitor
@@ -245,9 +255,30 @@ type secretRef struct {
 }
 
 // ref renders "name/key" (the namespace is prefixed by the caller); empty when
-// incomplete.
+// incomplete or when either part carries a '/'.
+//
+// The slash rule is what makes the three-segment join UNAMBIGUOUS, and that is
+// a security property, not tidiness: the rendered string becomes an
+// /v1/scrape-auth allowlist key, and the handler checks that key against three
+// separately-chosen URL path segments. SecretKeySelector.Name and .Key are
+// plain strings in the CRD with no validation of their own, so a tenant able to
+// create a monitor in namespace `tenant` could mint the entry
+// "tenant/victim/creds/token" and satisfy it with
+// GET /v1/scrape-auth/tenant%2Fvictim/creds/token — Go's ServeMux unescapes
+// %2F inside a single wildcard segment — reaching SecretReader.Get with
+// namespace "tenant/victim". The shipped client-go reader rejects that
+// namespace before it sends anything, but SecretReader is a pluggable
+// interface and one implemented over a lister keyed by "ns/name" would perform
+// the read. Refusing here makes the ambiguity inexpressible; handleScrapeAuth
+// re-validates the request's own segments for the same reason.
+//
+// A refused ref reads as absent (the target scrapes unauthenticated, exactly as
+// for an incomplete one) — never as some other secret.
 func (r *secretRef) ref() string {
 	if r == nil || r.Name == "" || r.Key == "" {
+		return ""
+	}
+	if strings.Contains(r.Name, "/") || strings.Contains(r.Key, "/") {
 		return ""
 	}
 	return r.Name + "/" + r.Key
@@ -277,6 +308,11 @@ func (s *secretOrCM) usesConfigMap() bool {
 	return s != nil && s.ConfigMap != nil && s.ConfigMap.Name != ""
 }
 
+// noPortIgnored is the Ignored entry for an endpoint that names neither port
+// nor targetPort. Spelled with the "(unset)" suffix so a reader of the log line
+// sees that this one is about a field's ABSENCE.
+const noPortIgnored = "port(unset)"
+
 // ignoredFields lists the endpoint fields that are set but not interpreted.
 func (ep endpointSpec) ignoredFields() []string {
 	var out []string
@@ -292,11 +328,24 @@ func (ep endpointSpec) ignoredFields() []string {
 	add("honorTimestamps", ep.HonorTimestamps != nil)
 	add("trackTimestampsStaleness", ep.TrackTimestampsStaleness != nil)
 	add("proxyUrl", ep.ProxyURL != "")
+	add("noProxy", ep.NoProxy != "")
+	add("proxyFromEnvironment", ep.ProxyFromEnvironment != nil)
+	add("proxyConnectHeader", len(ep.ProxyConnectHeader) > 0)
 	add("params", len(ep.Params) > 0)
 	add("honorLabels", ep.HonorLabels != nil && *ep.HonorLabels)
 	add("relabelings", len(ep.Relabelings) > 0)
 	add("filterRunning", ep.FilterRunning != nil && !*ep.FilterRunning)
 	add("portNumber", ep.PortNumber != nil)
+	// The one entry that reports an ABSENCE, because the absence has the same
+	// consequence every other entry here has: the endpoint resolves to no
+	// targets at all (scrape.MonitorTargets and PodMonitorTargets both refuse
+	// it — an empty port must not match a Service's unnamed port by "" == ""
+	// and fabricate a phantom target). Every other path to zero targets is
+	// data-dependent and cannot be judged at parse time; this one is a property
+	// of the CR, so it is reported like any other clause we do not act on.
+	// Suppressed when portNumber IS set: that entry already names the cause,
+	// and claiming the endpoint names no port would be false.
+	add(noPortIgnored, ep.Port == "" && ep.TargetPort == nil && ep.PortNumber == nil)
 	if ep.TLSConfig != nil {
 		// Only the configMap arm is unsupported; secret-backed CA/cert are
 		// interpreted below.
@@ -456,6 +505,23 @@ type specLimits struct {
 	BodySizeLimit  string          `json:"bodySizeLimit"`
 	AttachMetadata *map[string]any `json:"attachMetadata"`
 	ScrapeClass    string          `json:"scrapeClass"`
+	// The exposition-format and native-histogram clauses, parsed for the same
+	// reason as the guard rails above them.
+	//
+	// scrapeProtocols/fallbackScrapeProtocol are the loudest of these: the agent
+	// negotiates its own Accept header (OpenMetrics when exemplars are on,
+	// protobuf when native histograms are), so an operator who pinned
+	// PrometheusText0.0.4 because a target's OpenMetrics output is broken gets
+	// the opposite of what the CR says. The nativeHistogram* pair sits in the
+	// CRD beside sampleLimit/targetLimit/labelLimit and guards the same thing —
+	// cardinality — and all three of those ARE reported.
+	ScrapeProtocols                []string        `json:"scrapeProtocols"`
+	FallbackScrapeProtocol         string          `json:"fallbackScrapeProtocol"`
+	SelectorMechanism              string          `json:"selectorMechanism"`
+	NativeHistogramBucketLimit     *uint64         `json:"nativeHistogramBucketLimit"`
+	NativeHistogramMinBucketFactor json.RawMessage `json:"nativeHistogramMinBucketFactor"`
+	ConvertClassicHistogramsToNHCB *bool           `json:"convertClassicHistogramsToNHCB"`
+	ScrapeClassicHistograms        *bool           `json:"scrapeClassicHistograms"`
 }
 
 // ignored lists the monitor-level fields that are set but not interpreted.
@@ -478,6 +544,13 @@ func (s specLimits) ignored() []string {
 	add("bodySizeLimit", s.BodySizeLimit != "")
 	add("attachMetadata", s.AttachMetadata != nil)
 	add("scrapeClass", s.ScrapeClass != "")
+	add("scrapeProtocols", len(s.ScrapeProtocols) > 0)
+	add("fallbackScrapeProtocol", s.FallbackScrapeProtocol != "")
+	add("selectorMechanism", s.SelectorMechanism != "")
+	add("nativeHistogramBucketLimit", s.NativeHistogramBucketLimit != nil)
+	add("nativeHistogramMinBucketFactor", len(s.NativeHistogramMinBucketFactor) > 0)
+	add("convertClassicHistogramsToNHCB", s.ConvertClassicHistogramsToNHCB != nil)
+	add("scrapeClassicHistograms", s.ScrapeClassicHistograms != nil)
 	return out
 }
 
@@ -589,7 +662,18 @@ type Index struct {
 	mu          sync.RWMutex
 	monitors    map[string]*Monitor
 	podMonitors map[string]*PodMonitor
+	// gen changes on every mutation, so a consumer that derives something
+	// expensive from the whole index (the server's monitor→services cross
+	// product) can hold it until the index actually changes instead of until a
+	// timer lapses. Atomic and read without the lock: a stale read only costs
+	// one extra rebuild.
+	gen atomic.Uint64
 }
+
+// Generation changes whenever the indexed monitors change. It is a change
+// TOKEN, not a count: compare it with a previously observed value, never
+// interpret the difference.
+func (ix *Index) Generation() uint64 { return ix.gen.Load() }
 
 // NewIndex creates an empty index.
 func NewIndex() *Index {
@@ -616,6 +700,7 @@ func NewIndex() *Index {
 func upsertMonitor[M any](ix *Index, monitors map[string]*M, key string, m *M, err error) error {
 	ix.mu.Lock()
 	defer ix.mu.Unlock()
+	ix.gen.Add(1)
 	if err != nil {
 		delete(monitors, key)
 		return err
@@ -635,6 +720,7 @@ func (ix *Index) Upsert(u *unstructured.Unstructured) error {
 func (ix *Index) Delete(namespace, name string) {
 	ix.mu.Lock()
 	defer ix.mu.Unlock()
+	ix.gen.Add(1)
 	delete(ix.monitors, namespace+"/"+name)
 }
 

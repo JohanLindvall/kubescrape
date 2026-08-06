@@ -1,13 +1,16 @@
 package promscrape
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"math"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/JohanLindvall/kubescrape/pkg/promparse"
+	dto "github.com/prometheus/client_model/go"
 	"go.opentelemetry.io/collector/pdata/pcommon"
 )
 
@@ -278,5 +281,85 @@ func TestFilterSessionAllocationBudget(t *testing.T) {
 		fs.Keep("http_request_duration_seconds_bucket", labels)
 	}); allocs != 0 {
 		t.Fatalf("the per-sample filter path allocates %v times, want 0", allocs)
+	}
+}
+
+// protoHistBody synthesizes a delimited-protobuf exposition of one classic
+// histogram family: `metrics` label sets of 12 buckets each, the shape
+// -scrape-native-histograms puts EVERY classic family of every target on.
+func protoHistBody(tb testing.TB, metrics int) []byte {
+	bounds := []float64{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, math.Inf(1)}
+	fam := &dto.MetricFamily{
+		Name: ptr("http_request_duration_seconds"), Help: ptr("Request latency."), Unit: ptr("seconds"),
+		Type: dto.MetricType_HISTOGRAM.Enum(),
+	}
+	for i := 0; i < metrics; i++ {
+		h := &dto.Histogram{SampleCount: ptr(uint64(120)), SampleSum: ptr(42.5)}
+		for bi, ub := range bounds {
+			h.Bucket = append(h.Bucket, &dto.Bucket{UpperBound: ptr(ub), CumulativeCount: ptr(uint64((bi + 1) * 10))})
+		}
+		fam.Metric = append(fam.Metric, &dto.Metric{
+			Label: []*dto.LabelPair{
+				{Name: ptr("namespace"), Value: ptr("prod-payments")},
+				{Name: ptr("pod"), Value: ptr(fmt.Sprintf("payments-6f7b9c%03d", i))},
+				{Name: ptr("handler"), Value: ptr("/api/v1/orders")},
+			},
+			Histogram: h,
+		})
+	}
+	return protoBody(tb, fam)
+}
+
+const protoBenchMetrics = 500
+
+// protoBenchScraper feeds one protobuf exposition through the protobuf front.
+func protoBenchScrape(tb testing.TB, s *Scraper, body []byte) {
+	cb := newBatcher(func(pcommon.Resource) {}, time.Unix(1, 0), time.Unix(2, 0))
+	ss := s.newScrapeSession(context.Background(), cb, pipelineTargets, "t", "t", nil, true)
+	if _, err := s.parseProtoAndExport(ss, bytes.NewReader(body)); err != nil {
+		tb.Fatal(err)
+	}
+	if cb.count() == 0 {
+		tb.Fatal("no points")
+	}
+}
+
+// BenchmarkProtoClassicHistograms REPORTS the protobuf front's per-sample cost;
+// TestProtoClassicHistogramAllocationBudget is what fails a build.
+func BenchmarkProtoClassicHistograms(b *testing.B) {
+	body := protoHistBody(b, protoBenchMetrics)
+	s := New(Config{
+		Node: "n1", Interval: time.Hour, Timeout: time.Second,
+		NativeHistograms: true, Targets: staticTargets{}, Exporter: &captureExporter{},
+		StartTime: time.Unix(1, 0),
+	})
+	b.SetBytes(int64(len(body)))
+	b.ReportAllocs()
+	for b.Loop() {
+		protoBenchScrape(b, s, body)
+	}
+}
+
+// The protobuf front rebuilt three family-invariant names ("_bucket", "_sum",
+// "_count") inside the per-Metric loop and rendered the same bucket bound with
+// fmt.Sprintf — a string plus interface boxing — once per bucket of every
+// metric. -scrape-native-histograms puts EVERY classic family of every target
+// on this front, so at the package's 100k-series target that was ~1M avoidable
+// allocations per scrape per target.
+func TestProtoClassicHistogramAllocationBudget(t *testing.T) {
+	if raceEnabled {
+		t.Skip("-race perturbs allocation counts")
+	}
+	body := protoHistBody(t, protoBenchMetrics)
+	s := New(Config{
+		Node: "n1", Interval: time.Hour, Timeout: time.Second,
+		NativeHistograms: true, Targets: staticTargets{}, Exporter: &captureExporter{},
+		StartTime: time.Unix(1, 0),
+	})
+	const samples = protoBenchMetrics * 14 // 12 buckets + _sum + _count
+	allocs := testing.AllocsPerRun(20, func() { protoBenchScrape(t, s, body) })
+	if perSample := allocs / samples; perSample > 8 {
+		t.Fatalf("the protobuf front allocates %.2f times per sample (%v per scrape), want <= 8: "+
+			"the family-invariant names or the bucket-bound strings are being rebuilt per metric", perSample, allocs)
 	}
 }

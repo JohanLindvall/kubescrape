@@ -8,6 +8,8 @@ import (
 	"unicode/utf8"
 
 	"go.opentelemetry.io/collector/pdata/pcommon"
+
+	"github.com/JohanLindvall/kubescrape/internal/logline"
 )
 
 // TestHistogramCardinalityCountsLabelSets pins the UNIT of maxCardinality: it
@@ -29,7 +31,7 @@ func TestHistogramCardinalityCountsLabelSets(t *testing.T) {
 	// each with its full 15-stream distribution.
 	for i := range 10 {
 		id := strconv.Itoa(i)
-		set.Add(func(k string) (float64, bool) { return 1, k == "v" },
+		set.Add(func(k string) (float64, bool, bool) { return 1, k == "v", k == "v" },
 			func(k string) string {
 				if k == "id" {
 					return id
@@ -130,6 +132,90 @@ func TestSharedNameConflictingBucketsRejected(t *testing.T) {
 		{Name: "h", Type: HistogramType, Value: "x"},
 	}); err != nil {
 		t.Fatalf("agreeing shared histogram rejected: %v", err)
+	}
+}
+
+// The same holds for every other shape field a later rule can declare and the
+// shared series cannot honour. A second rule asking for a tight maxCardinality
+// because ITS label set is the riskier one used to start cleanly and admit label
+// sets up to the first rule's cap — the memory blow-up the field was set to
+// prevent, with nothing said about it.
+func TestSharedNameConflictingLimitsRejected(t *testing.T) {
+	base := Dynamic{
+		Name: "m", Type: CounterType, Value: "1",
+		MaxCardinality: 5000, MaxAge: "1h", Description: "the first rule's",
+	}
+	for _, tc := range []struct {
+		name   string
+		second Dynamic
+	}{
+		{"maxCardinality", Dynamic{Name: "m", Type: CounterType, Value: "1", MaxCardinality: 100}},
+		{"maxAge", Dynamic{Name: "m", Type: CounterType, Value: "1", MaxAge: "1s"}},
+		{"description", Dynamic{Name: "m", Type: CounterType, Value: "1", Description: "the second rule's"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			set, err := newTestSet([]Dynamic{base, tc.second})
+			if err == nil {
+				t.Fatalf("a conflicting %s compiled; the shared series keeps the first rule's %s (maxSize=%d expiration=%d desc=%q)",
+					tc.name, tc.name, set.rules[0].series.maxSize, set.rules[0].series.expiration, set.rules[0].series.desc)
+			}
+			if !strings.Contains(err.Error(), tc.name) {
+				t.Errorf("error must name the field: %v", err)
+			}
+		})
+	}
+
+	// Unset means "whatever the name already has", and an equal declaration —
+	// however it is spelled — is not a conflict.
+	if _, err := newTestSet([]Dynamic{
+		base,
+		{Name: "m", Type: CounterType, Value: "1"},
+		{Name: "m", Type: CounterType, Value: "1", MaxCardinality: 5000, MaxAge: "60m", Description: "the first rule's"},
+	}); err != nil {
+		t.Fatalf("agreeing shared rules rejected: %v", err)
+	}
+}
+
+// Two configs that used to compile cleanly and then do nothing, both invited by
+// the DSL the metrics engine shares with logs.rules: __severity__ is resolved
+// only by the rules tier (a metric naming it is permanently absent) and
+// __line__ is resolved by the LABEL tier but not the value one (a metric naming
+// it as its value records nothing). Silence is the defect — an operator reads a
+// clean start as a working rule.
+func TestKeysTheMetricsEngineCannotResolveAreRejected(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		d    Dynamic
+	}{
+		{"match", Dynamic{Name: "m", Type: CounterType, Value: "1", Match: []string{logline.SeverityKey + "=error"}}},
+		{"matchRegexp", Dynamic{Name: "m", Type: CounterType, Value: "1", MatchRegexp: []string{logline.SeverityKey + "=err.*"}}},
+		{"label", Dynamic{Name: "m", Type: CounterType, Value: "1", Labels: []string{"sev=$" + logline.SeverityKey}}},
+		{"resourceLabel", Dynamic{Name: "m", Type: CounterType, Value: "1", ResourceLabels: []string{"sev=$" + logline.SeverityKey}}},
+		{"severity value", Dynamic{Name: "m", Type: GaugeType, Value: logline.SeverityKey}},
+		{"line value", Dynamic{Name: "m", Type: GaugeType, Value: logline.LineKey}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			set, err := newTestSet([]Dynamic{tc.d})
+			if err == nil {
+				set.Add(nil, nil, pcommon.NewMap(), `{"level":"error","amount":42}`)
+				t.Fatalf("compiled, and observed %d samples from a matching line", len(set.rules[0].series.db))
+			}
+		})
+	}
+
+	// The keys each tier DOES resolve stay working: __line__ as a label and as
+	// a selector, and a real line field as the value.
+	set, err := newTestSet([]Dynamic{{
+		Name: "m", Type: GaugeType, Value: "amount",
+		MatchRegexp: []string{logline.LineKey + "=amount"},
+		Labels:      []string{"body=$" + logline.LineKey},
+	}})
+	if err != nil {
+		t.Fatalf("__line__ as a selector/label rejected: %v", err)
+	}
+	set.Add(nil, nil, pcommon.NewMap(), `{"level":"error","amount":42}`)
+	if n := len(set.rules[0].series.db); n != 1 {
+		t.Fatalf("observed %d samples, want 1", n)
 	}
 }
 
@@ -288,6 +374,49 @@ func TestLiteralValueWithTransformRejected(t *testing.T) {
 	}}); err == nil {
 		t.Fatal("a literal value with a mask compiled into a rule")
 	}
+}
+
+// The fast path's ASCII probe must read no more of the value than the overlay
+// itself does. Probing the WHOLE value made a mask cost time proportional to the
+// LINE — `class=$__line__(_xx)` over a 1 MiB entry burned ~300us of the single
+// sweep goroutine per record — while the loop it guards reads at most
+// len(pattern) bytes. Non-ASCII beyond that prefix cannot change the overlay, so
+// it must not push the value onto the slow path either.
+func TestMaskPatternProbeIsBoundedByThePattern(t *testing.T) {
+	long := strings.Repeat("5", 1<<10) + "é"
+	if !asciiOverlay(long, "_xx") {
+		t.Error("a non-ASCII byte past the mask's reach refused the byte overlay: the probe scans the whole value")
+	}
+	// Bounded, but never narrower than the overlay: a rune straddling the cut
+	// ends the prefix on a continuation byte and belongs to the rune loop.
+	if asciiOverlay("é50", "_xx") {
+		t.Error("a value whose FIRST rune is multi-byte took the byte overlay")
+	}
+	// The two paths agree wherever both are legal.
+	for _, c := range []struct{ value, pattern string }{
+		{long, "_xx"}, {"503", "_xx"}, {"é50", "_xx"}, {"5", "___"},
+	} {
+		if got, want := maskPattern(c.value, c.pattern), maskRunes(c.value, c.pattern); got != want {
+			t.Errorf("maskPattern(%.8q, %q) = %q, rune step gives %q", c.value, c.pattern, got, want)
+		}
+	}
+}
+
+// maskRunes is the unconditional rune-stepped overlay — maskPattern's slow path,
+// spelled out so the test can compare the fast path against it.
+func maskRunes(value, pattern string) string {
+	out := make([]byte, 0, len(pattern)+len(value))
+	rest := value
+	for _, pr := range pattern {
+		vr, size := utf8.DecodeRuneInString(rest)
+		rest = rest[size:]
+		if pr == '_' && size > 0 {
+			out = utf8.AppendRune(out, vr)
+			continue
+		}
+		out = utf8.AppendRune(out, pr)
+	}
+	return string(out)
 }
 
 // The mask steps by RUNE. Byte indexing split a multi-byte rune straddling a

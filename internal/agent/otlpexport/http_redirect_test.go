@@ -56,7 +56,7 @@ func TestRedirectDoesNotDoubleReleaseTheGzipBody(t *testing.T) {
 	wg.Wait()
 
 	// The pool must still hand out usable buffers afterwards.
-	if b, err := gzipBody([]byte("still works")); err != nil {
+	if b, err := gzipBody([]byte("still works"), effectiveGzipLevel(0)); err != nil {
 		t.Fatalf("gzip pool unusable after the redirects: %v", err)
 	} else {
 		b.Release()
@@ -71,7 +71,7 @@ func TestRedirectDoesNotDoubleReleaseTheGzipBody(t *testing.T) {
 // the storage to a package-level pool, so a Close that released would reset
 // memory under an active Read and hand live storage to another goroutine.
 func TestPooledBodyReleasesOnlyOnceItIsFullyRead(t *testing.T) {
-	gz, err := gzipBody([]byte("a payload net/http is still streaming"))
+	gz, err := gzipBody([]byte("a payload net/http is still streaming"), effectiveGzipLevel(0))
 	if err != nil {
 		t.Fatal(err)
 	}

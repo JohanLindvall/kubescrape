@@ -590,25 +590,30 @@ func (s *Store) Sweep() {
 			delete(s.byContainer, id)
 		}
 	}
-	removed := false
 	for uid, rec := range s.pods {
-		if expired(rec.expireAt, now) {
-			s.dropNameIndexLocked(rec)
-			for _, ip := range recordAddresses(rec) {
-				s.dropClaimantLocked(ip, rec)
-			}
-			delete(s.pods, uid)
-			removed = true
+		if !expired(rec.expireAt, now) {
+			continue
 		}
-	}
-	if removed {
-		// Container entries always expire no later than their pod's record,
-		// so this pass normally removes nothing; it is defensive.
-		for id, e := range s.byContainer {
-			if s.pods[e.podUID] == nil {
+		s.dropNameIndexLocked(rec)
+		for _, ip := range recordAddresses(rec) {
+			s.dropClaimantLocked(ip, rec)
+		}
+		// The record's OWN container IDs, identity-checked exactly as
+		// deletePodLocked does — never a rescan of byContainer. Container
+		// entries always expire no later than their pod (deletePodLocked stamps
+		// them with the pod's expiry or earlier, and both loops here share one
+		// `now`), so the rescan was documented as normally removing nothing —
+		// but it ran a full second pass over every container in the store,
+		// each entry paying a pods lookup, whenever ANY tombstone lapsed. In a
+		// 30k-pod cluster ordinary churn puts one in essentially every sweep
+		// window, and the pass runs under the exclusive write lock every lookup
+		// and every targets request waits behind.
+		for id := range rec.containerIDs {
+			if e := s.byContainer[id]; e != nil && e.podUID == uid {
 				delete(s.byContainer, id)
 			}
 		}
+		delete(s.pods, uid)
 	}
 }
 

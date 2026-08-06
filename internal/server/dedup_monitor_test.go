@@ -10,6 +10,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/intstr"
 
 	"github.com/JohanLindvall/kubescrape/internal/servicemonitors"
 	"github.com/JohanLindvall/kubescrape/internal/services"
@@ -155,5 +156,132 @@ func TestDedupKeepsEveryKindOfMonitorConfig(t *testing.T) {
 				t.Fatalf("the monitor target lost to dedup, taking its %s with it: %+v", tc.name, out.Targets[0])
 			}
 		})
+	}
+}
+
+// twoPodMonitorsOnOneURL builds a pod selected by TWO PodMonitors whose
+// endpoints resolve to the same container port — the platform-team /
+// app-team shape: a cluster-wide monitor with no configuration and a team's
+// own monitor carrying a drop rule and a credential.
+func twoPodMonitorsOnOneURL(t *testing.T) *httptest.Server {
+	t.Helper()
+	st := store.New(time.Minute)
+	st.UpsertPod(&corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "web-1", Namespace: "default",
+			UID: types.UID("pod-uid"), ResourceVersion: "1",
+			Labels: map[string]string{"app": "web"},
+		},
+		Spec: corev1.PodSpec{
+			NodeName: "node1",
+			Containers: []corev1.Container{{
+				Name: "app", Image: "img",
+				Ports: []corev1.ContainerPort{{Name: "metrics", ContainerPort: 9090}},
+			}},
+		},
+		Status: corev1.PodStatus{Phase: corev1.PodRunning, PodIP: "10.9.9.9"},
+	})
+	monitors := servicemonitors.NewIndex()
+	for name, ep := range map[string]map[string]any{
+		"pm-a": {"port": "metrics"},
+		"pm-b": {
+			"port":              "metrics",
+			"bearerTokenSecret": map[string]any{"name": "tok", "key": "token"},
+			"metricRelabelings": []any{map[string]any{
+				"action": "drop", "sourceLabels": []any{"__name__"}, "regex": "secret_.*",
+			}},
+		},
+	} {
+		if err := monitors.UpsertPodMonitor(&unstructured.Unstructured{Object: map[string]any{
+			"metadata": map[string]any{"name": name, "namespace": "default"},
+			"spec": map[string]any{
+				"selector":            map[string]any{"matchLabels": map[string]any{"app": "web"}},
+				"podMetricsEndpoints": []any{ep},
+			},
+		}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	srv := httptest.NewServer(New(Config{
+		Store: st, Services: services.NewIndex(), Monitors: monitors,
+		Resolver: stubResolver{}, MaxWait: 500 * time.Millisecond, Ready: closedChan(),
+	}).Handler())
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// A PodMonitor target carries no Service (it selects pods directly), so when it
+// UPGRADES a service-annotation target for the same URL it must not take the
+// Service with it: promscrape's fillTargetResource reads it, and every sample
+// of that endpoint would lose k8s.service.name and k8s.service.uid. The
+// preference's justification — that a monitor target carries strictly MORE
+// configuration — is true of the ServiceMonitor arm, which sets Service, and
+// false of this one.
+func TestPodMonitorUpgradeKeepsTheServiceMetadata(t *testing.T) {
+	st := store.New(time.Minute)
+	st.UpsertPod(&corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "web-1", Namespace: "default",
+			UID: types.UID("pod-uid"), ResourceVersion: "1",
+			Labels: map[string]string{"app": "web"},
+		},
+		Spec: corev1.PodSpec{
+			NodeName: "node1",
+			Containers: []corev1.Container{{
+				Name: "app", Image: "img",
+				Ports: []corev1.ContainerPort{{Name: "metrics", ContainerPort: 9090}},
+			}},
+		},
+		Status: corev1.PodStatus{Phase: corev1.PodRunning, PodIP: "10.9.9.9"},
+	})
+	svcs := services.NewIndex()
+	svcs.Upsert(&corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "web", Namespace: "default", UID: types.UID("svc-uid"),
+			Annotations: map[string]string{"prometheus.io/scrape": "true"},
+		},
+		Spec: corev1.ServiceSpec{
+			Selector: map[string]string{"app": "web"},
+			Ports:    []corev1.ServicePort{{Name: "http", Port: 80, TargetPort: intstr.FromString("metrics")}},
+		},
+	})
+	monitors := servicemonitors.NewIndex()
+	if err := monitors.UpsertPodMonitor(&unstructured.Unstructured{Object: map[string]any{
+		"metadata": map[string]any{"name": "pm", "namespace": "default"},
+		"spec": map[string]any{
+			"selector": map[string]any{"matchLabels": map[string]any{"app": "web"}},
+			"podMetricsEndpoints": []any{map[string]any{
+				"port":              "metrics",
+				"bearerTokenSecret": map[string]any{"name": "tok", "key": "token"},
+			}},
+		},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(New(Config{
+		Store: st, Services: svcs, Monitors: monitors,
+		Resolver: stubResolver{}, MaxWait: 500 * time.Millisecond, Ready: closedChan(),
+	}).Handler())
+	t.Cleanup(srv.Close)
+
+	var out struct {
+		Targets []struct {
+			dedupTarget
+			Service *struct {
+				Name string `json:"name"`
+				UID  string `json:"uid"`
+			} `json:"service"`
+		} `json:"targets"`
+	}
+	getJSON(t, srv.URL+"/v1/nodes/node1/targets", http.StatusOK, &out)
+	if len(out.Targets) != 1 {
+		t.Fatalf("want one deduped target, got %+v", out.Targets)
+	}
+	got := out.Targets[0]
+	if got.Monitor != "default/pm" || got.AuthSecret == "" {
+		t.Fatalf("the monitor target did not win the dedup: %+v", got)
+	}
+	if got.Service == nil || got.Service.Name != "web" || got.Service.UID != "svc-uid" {
+		t.Errorf("the surviving target lost the Service the annotation target carried: %+v", got.Service)
 	}
 }

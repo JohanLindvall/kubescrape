@@ -4,6 +4,9 @@ package main
 // pin the places where the dry run drifted from what a real start does.
 
 import (
+	"bytes"
+	"log/slog"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -40,5 +43,34 @@ func TestCheckConfigValidatesMergedExportDestinations(t *testing.T) {
 				t.Fatalf("error %q does not name the offending destination (%q)", err, tc.want)
 			}
 		})
+	}
+}
+
+// The -check-config summary answers "is this what I meant?", so a section it
+// does not print reads as "not configured". Its list was thirteen hand-spelled
+// lines beside the reflect-derived one the -config help uses — the drift that
+// walk was added to end. Both come from the struct now, and this asserts the
+// PRINTED list is the declared one.
+func TestSummaryPrintsEveryDeclaredSection(t *testing.T) {
+	cfg := agentConfig{}
+	v := reflect.ValueOf(&cfg).Elem()
+	for i := range v.NumField() {
+		f := v.Field(i)
+		if f.Kind() != reflect.Pointer {
+			t.Fatalf("field %q is not a pointer; a section's presence is its nil-ness",
+				v.Type().Field(i).Name)
+		}
+		f.Set(reflect.New(f.Type().Elem())) // every section present
+	}
+
+	var buf bytes.Buffer
+	printConfigSummary(cfg, slog.New(slog.NewTextHandler(&buf, nil)))
+	for _, name := range strings.Split(configSections(), ", ") {
+		if !strings.Contains(buf.String(), name) {
+			t.Errorf("section %q is declared but missing from the -check-config summary:\n%s", name, buf.String())
+		}
+	}
+	if len(presentSections(agentConfig{})) != 0 {
+		t.Fatal("an empty config reported sections")
 	}
 }

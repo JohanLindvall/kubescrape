@@ -58,7 +58,12 @@ type Client struct {
 	// for a caller to get wrong.
 	observeFn func(outcome string)
 
-	mu    sync.Mutex
+	// mu guards cache and lastSweep. It is an RWMutex because the HIT path —
+	// the inner loop of the concurrent ingest enrichment, up to
+	// maxLookupsPerRequest lookups times -ingest-max-in-flight handlers per push
+	// wave — only READS, and every one of those hits used to serialise on an
+	// exclusive acquisition to refresh an idle stamp (see usedStampGranularity).
+	mu    sync.RWMutex
 	cache map[string]cacheEntry
 	// lastSweep is when expired entries were last swept (see evictLocked).
 	lastSweep time.Time
@@ -330,21 +335,47 @@ func (c *Client) get(ctx context.Context, u string, authed bool, v any) error {
 // that unreachable in practice — but a value that cannot be copied out must
 // never be served, and dropping it also re-populates the entry usefully.
 func (c *Client) lookupEntry(key string, v any) (entry cacheEntry, cached, fresh bool) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	now := c.now()
+	c.mu.RLock()
 	entry, cached = c.cache[key]
-	if cached && !sameType(v, entry.decoded) {
-		delete(c.cache, key)
+	c.mu.RUnlock()
+	if !cached {
 		return cacheEntry{}, false, false
 	}
-	now := c.now()
-	if cached {
-		entry.used = now
-		c.cache[key] = entry // keeps a revalidated-but-stale entry alive
+	if !sameType(v, entry.decoded) {
+		c.mu.Lock()
+		// Re-check under the write lock: another goroutine may have replaced the
+		// entry with one this caller CAN use while the lock was released, and
+		// dropping that would throw away a good 200.
+		if cur, ok := c.cache[key]; ok && !sameType(v, cur.decoded) {
+			delete(c.cache, key)
+		}
+		c.mu.Unlock()
+		return cacheEntry{}, false, false
 	}
-	fresh = cached && now.Before(entry.expires)
-	return entry, cached, fresh
+	// The stamp feeds eviction and nothing else, against a 5-minute idle window,
+	// so it is refreshed COARSELY: writing it on every hit is what forced the
+	// exclusive lock onto the read path, and an entry read at all is re-stamped
+	// within a fraction of the window either way. (It also keeps a
+	// revalidated-but-stale entry alive, which is why it is not gated on
+	// freshness.)
+	if now.Sub(entry.used) >= usedStampGranularity {
+		c.mu.Lock()
+		if cur, ok := c.cache[key]; ok && cur.used.Equal(entry.used) {
+			cur.used = now
+			c.cache[key] = cur
+		}
+		c.mu.Unlock()
+		entry.used = now
+	}
+	return entry, true, now.Before(entry.expires)
 }
+
+// usedStampGranularity is how stale an entry's idle stamp may get before a hit
+// refreshes it. Small against cacheMaxIdle (so a live entry is never swept) and
+// large against a lookup (so the refresh is rare enough that the hit path is a
+// read-lock acquisition and nothing more).
+const usedStampGranularity = cacheMaxIdle / 10
 
 // fetch performs the HTTP request (revalidating with the entry's ETag when
 // cached), stores a cacheable 200, and decodes into v.

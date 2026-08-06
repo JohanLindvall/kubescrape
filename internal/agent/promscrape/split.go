@@ -7,7 +7,6 @@ import (
 	"slices"
 	"sort"
 	"strconv"
-	"strings"
 	"time"
 
 	"go.opentelemetry.io/collector/pdata/pcommon"
@@ -249,13 +248,16 @@ type splitBatcher struct {
 	defaultPrefix string
 
 	md     pmetric.Metrics
-	scopes map[string]pmetric.ScopeMetrics
+	scopes map[string]splitDest
 	byKey  map[string]pmetric.Metric
-	// dpAttrs holds, per split resource key, the resource attributes moved onto
-	// its data points (rule.datapointAttr).
-	dpAttrs map[string][]kv
-	points  int
-	bytes   int
+	points int
+	bytes  int
+	// keyBuf is the scratch buffer for resource/metric keys, the cadvisor
+	// batcher's discipline: probes use map[string(keyBuf)] (no allocation) and
+	// the string materializes only when a new resource or metric is inserted.
+	// A kube-state-metrics exposition is FAMILY-major, so the last-seen memos
+	// below miss on every row of it and this is the path that runs.
+	keyBuf []byte
 
 	// Last-seen memos, mirroring the plain batcher's metricByName/remember:
 	// KSM series arrive grouped by family and object, so consecutive samples
@@ -264,11 +266,8 @@ type splitBatcher struct {
 	vals        []string // route scratch: current sample's groupBy values
 	lastVals    []string // previous sample's groupBy values
 	lastRule    *compiledSplitRule
-	lastKey     string
-	lastSM      pmetric.ScopeMetrics
-	lastDP      []kv
+	lastDest    splitDest
 	lastRouteOK bool
-	lastMResKey string
 	lastMName   string
 	lastM       pmetric.Metric
 	lastMOK     bool
@@ -286,6 +285,14 @@ type splitBatcher struct {
 type dropKey struct {
 	rule *compiledSplitRule
 	name string
+}
+
+// splitDest is one resource's scope plus the attributes moved off that resource
+// onto every one of its data points (rule.datapointAttr). They are always wanted
+// together, so they share one map entry and one probe.
+type splitDest struct {
+	sm pmetric.ScopeMetrics
+	dp []kv
 }
 
 type kv struct{ key, value string }
@@ -306,13 +313,11 @@ func newSplitBatcher(s *Scraper, ctx context.Context, t kubemeta.ScrapeTarget, s
 func (b *splitBatcher) reset() {
 	b.md = pmetric.NewMetrics()
 	if b.scopes == nil {
-		b.scopes = make(map[string]pmetric.ScopeMetrics)
+		b.scopes = make(map[string]splitDest)
 		b.byKey = make(map[string]pmetric.Metric)
-		b.dpAttrs = make(map[string][]kv)
 	} else {
 		clear(b.scopes)
 		clear(b.byKey)
-		clear(b.dpAttrs)
 	}
 	b.points = 0
 	b.bytes = 0
@@ -330,12 +335,36 @@ func (b *splitBatcher) take() pmetric.Metrics {
 func (b *splitBatcher) count() int { return b.points }
 func (b *splitBatcher) size() int  { return b.bytes }
 
-// route returns the scope, resource key, and rule for one series (rule nil for
-// the target's own resource), plus the resource attributes moved onto its data
-// points (rule.datapointAttr — split resources only). The previous sample's
-// (rule, groupBy values) are memoized: a repeat costs value memcmps instead of
-// rebuilding the key.
-func (b *splitBatcher) route(name string, labels []Label) (pmetric.ScopeMetrics, string, *compiledSplitRule, []kv) {
+// appendRouteKey appends the resource key of the current sample — the rule's
+// identity plus the groupBy values in b.vals — to b.
+//
+// The rule's identity is part of it because two rules with equal-cardinality
+// groupBy sets must not merge objects whose values collide
+// (kube_pod_info{pod="x"} vs kube_node_info{node="x"}). Values are
+// length-prefixed (appendLP) so a label VALUE containing the separator cannot
+// alias another tuple. It appends into a CALLER-OWNED scratch buffer, which is
+// the whole point: an earlier attempt spelled this into a strings.Builder with
+// appendLP on a fresh slice per call and cost +400 allocs/op, because the fresh
+// slice — not appendLP — was the allocation.
+func (b *splitBatcher) appendRouteKey(buf []byte, rule *compiledSplitRule) []byte {
+	if rule == nil {
+		return append(buf, "self"...)
+	}
+	buf = append(buf, rule.keyPrefix...)
+	for _, v := range b.vals {
+		buf = appendLP(buf, v)
+	}
+	return buf
+}
+
+// route returns the destination (scope plus the attributes moved onto its data
+// points) and the rule for one series — rule nil for the target's own resource
+// — and whether it is the SAME destination the previous call resolved. The
+// previous sample's (rule, groupBy values) are memoized: a repeat costs value
+// memcmps instead of rebuilding the key. A kube-state-metrics exposition is
+// family-major, so the memo misses on every row and the keyed map probe below
+// is the hot path.
+func (b *splitBatcher) route(name string, labels []Label) (splitDest, *compiledSplitRule, bool) {
 	rule, ok := b.ruleMemo[name]
 	if !ok {
 		rule = b.sp.ruleFor(name)
@@ -350,34 +379,13 @@ func (b *splitBatcher) route(name string, labels []Label) (pmetric.ScopeMetrics,
 		}
 	}
 	if b.lastRouteOK && rule == b.lastRule && slices.Equal(b.vals, b.lastVals) {
-		return b.lastSM, b.lastKey, rule, b.lastDP
+		return b.lastDest, rule, true
 	}
 
-	// The key carries the rule's identity: two rules with equal-cardinality
-	// groupBy sets must not merge objects whose values collide.
-	var key strings.Builder
-	if rule == nil {
-		key.WriteString("self")
-	} else {
-		key.WriteString(rule.keyPrefix)
-		for _, v := range b.vals {
-			// Length-prefixed so a label VALUE containing the separator cannot
-			// alias another tuple and merge two described objects. Same rule as
-			// appendLP, spelled into a Builder: Builder.String() hands out its
-			// buffer without the copy string([]byte) pays, and this runs once per
-			// new (rule, groupBy tuple) — appendLP here cost +400 allocs/op in
-			// BenchmarkSplitConvert.
-			key.WriteString(strconv.Itoa(len(v)))
-			key.WriteByte(':')
-			key.WriteString(v)
-		}
-	}
-	ks := key.String()
-	sm, ok := b.scopes[ks]
-	var dp []kv
-	if ok {
-		dp = b.dpAttrs[ks]
-	} else {
+	b.keyBuf = b.appendRouteKey(b.keyBuf[:0], rule)
+	dest, ok := b.scopes[string(b.keyBuf)] // no alloc: map read elides the copy
+	if !ok {
+		key := string(b.keyBuf) // materialize once per new resource per batch
 		rm := b.md.ResourceMetrics().AppendEmpty()
 		if rule == nil {
 			b.fillSelfResource(rm.Resource())
@@ -390,23 +398,22 @@ func (b *splitBatcher) route(name string, labels []Label) (pmetric.ScopeMetrics,
 			// resource / target_info.
 			for _, attr := range rule.datapointAttr {
 				if v, ok := rm.Resource().Attributes().Get(attr); ok {
-					dp = append(dp, kv{attr, v.AsString()})
+					dest.dp = append(dest.dp, kv{attr, v.AsString()})
 					rm.Resource().Attributes().Remove(attr)
 				}
 			}
-			b.dpAttrs[ks] = dp
 		}
-		sm = rm.ScopeMetrics().AppendEmpty()
-		sm.Scope().SetName(scopeName)
-		sm.Scope().SetVersion(obs.ScopeVersion)
-		b.scopes[ks] = sm
+		dest.sm = rm.ScopeMetrics().AppendEmpty()
+		dest.sm.Scope().SetName(scopeName)
+		dest.sm.Scope().SetVersion(obs.ScopeVersion)
+		b.scopes[key] = dest
 		// One resource per described object: its attributes are a real part of
 		// the encoded batch, not rounding error (see convert.go).
 		b.bytes += resourceBytes(rm.Resource(), scopeName)
 	}
 	b.lastVals = append(b.lastVals[:0], b.vals...)
-	b.lastRule, b.lastKey, b.lastSM, b.lastDP, b.lastRouteOK = rule, ks, sm, dp, true
-	return sm, ks, rule, dp
+	b.lastRule, b.lastDest, b.lastRouteOK = rule, dest, true
+	return dest, rule, false
 }
 
 // fillSelfResource builds the target's own resource, as the plain batcher
@@ -481,6 +488,12 @@ func (b *splitBatcher) fillSplitResource(res pcommon.Resource, rule *compiledSpl
 			res.Attributes().PutStr(k, v)
 		}
 	}
+	// These land AFTER Build, so the operator's enable/disable lists have not
+	// seen them: re-apply the global filter, the way the tailer does for its
+	// post-Build source statics. The filter is global by design, and a rule
+	// fallback is exactly the kind of attribute a `disable` list is written to
+	// drop. Nil-safe.
+	b.s.attrsFor(pipelineTargets).FilterResource(res)
 }
 
 func labelValue(labels []Label, name string) string {
@@ -550,16 +563,21 @@ func (b *splitBatcher) dropped(rule *compiledSplitRule, name string) bool {
 }
 
 func (b *splitBatcher) metric(name string, meta metricMeta, labels []Label, shape func(pmetric.Metric)) (pmetric.Metric, *compiledSplitRule, []kv) {
-	sm, resKey, rule, dp := b.route(name, labels)
+	dest, rule, sameResource := b.route(name, labels)
 	// Last-seen fast path: consecutive samples of the same object and family
-	// skip the key concatenation (an allocation) and the map probe.
-	if b.lastMOK && resKey == b.lastMResKey && name == b.lastMName {
-		return b.lastM, rule, dp
+	// skip the key building and the map probe entirely. route reports the
+	// resource half of that (it holds the memo), so nothing here has to compare
+	// — or even materialize — a resource key string.
+	if b.lastMOK && sameResource && name == b.lastMName {
+		return b.lastM, rule, dest.dp
 	}
-	key := resKey + "\x00" + name
-	m, ok := b.byKey[key]
+	b.keyBuf = b.appendRouteKey(b.keyBuf[:0], rule)
+	b.keyBuf = append(b.keyBuf, 0)
+	b.keyBuf = append(b.keyBuf, name...)
+	m, ok := b.byKey[string(b.keyBuf)] // no alloc: map read elides the copy
 	if !ok {
-		m = sm.Metrics().AppendEmpty()
+		key := string(b.keyBuf) // materialize once per new metric per batch
+		m = dest.sm.Metrics().AppendEmpty()
 		m.SetName(name)
 		shape(m)
 		b.byKey[key] = m
@@ -567,8 +585,8 @@ func (b *splitBatcher) metric(name string, meta metricMeta, labels []Label, shap
 		// which a split batch repeats for every described object.
 		b.bytes += chargeDescriptor(m, name, meta)
 	}
-	b.lastMResKey, b.lastMName, b.lastM, b.lastMOK = resKey, name, m, true
-	return m, rule, dp
+	b.lastMName, b.lastM, b.lastMOK = name, m, true
+	return m, rule, dest.dp
 }
 
 func (b *splitBatcher) addNumber(s Sample, monotonic bool) {

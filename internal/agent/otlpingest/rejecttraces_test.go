@@ -15,6 +15,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -184,6 +185,27 @@ func TestRejectTracesRefusesBeforeEnrichmentGRPC(t *testing.T) {
 	}
 	if len(texp.traces) != 1 {
 		t.Fatalf("forwarded traces = %d, want 1", len(texp.traces))
+	}
+}
+
+// The refusal a guard returns is ALREADY a gRPC status, and already the code
+// this receiver's classifier would choose. Re-wrapping it rendered the sender
+// `code = InvalidArgument desc = rpc error: code = InvalidArgument desc = …`,
+// which buries the reason it needs one nesting deep inside the field it reads
+// first — and every test here asserted only the code, so nothing held it.
+func TestPermanentStatusRefusalIsRelayedVerbatim(t *testing.T) {
+	const msg = "refused on the receive path"
+	err := grpcForwardStatus(status.Error(codes.InvalidArgument, msg))
+
+	st, ok := status.FromError(err)
+	if !ok || st.Code() != codes.InvalidArgument {
+		t.Fatalf("status = %v, want InvalidArgument", err)
+	}
+	if st.Message() != msg {
+		t.Errorf("status message = %q, want %q", st.Message(), msg)
+	}
+	if strings.Count(err.Error(), "rpc error:") != 1 {
+		t.Errorf("rendered error = %q: a status must not be wrapped in a status", err)
 	}
 }
 

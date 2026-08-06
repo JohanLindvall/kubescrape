@@ -66,9 +66,9 @@ func TestSeverityKeyIsRuleOnly(t *testing.T) {
 		t.Errorf("LabelFn(%s) = %q, want empty: no such attribute exists in production, so a label built from it is the previous record's severity leaking into metric cardinality",
 			SeverityKey, got)
 	}
-	if v, ok := r.ValueFn()(SeverityKey); ok {
-		t.Errorf("ValueFn(%s) = %v (ok=%v), want no value: severity is not a number and must not resolve as one",
-			SeverityKey, v, ok)
+	if v, ok, present := r.ValueFn()(SeverityKey); ok || present {
+		t.Errorf("ValueFn(%s) = %v (ok=%v present=%v), want no value and no attribute: severity is not a number, and reporting it PRESENT would stop a metric reading the line's own field",
+			SeverityKey, v, ok, present)
 	}
 	// The synthetic key must not shadow ordinary lookups either.
 	if got := r.RuleFn()("http.status"); got != "500" {
@@ -185,20 +185,34 @@ func TestValueFnParsesNumbersAndRejectsTheRest(t *testing.T) {
 		{"bytes", 4096}, {"duration", 1.25}, {"count_str", 42},
 		{"float_str", 0.5}, {"negative", -3},
 	} {
-		got, ok := value(tc.key)
-		if !ok || got != tc.want {
-			t.Errorf("ValueFn(%s) = %v (ok=%v), want %v", tc.key, got, ok, tc.want)
+		got, ok, present := value(tc.key)
+		if !ok || got != tc.want || !present {
+			t.Errorf("ValueFn(%s) = %v (ok=%v present=%v), want %v", tc.key, got, ok, present, tc.want)
 		}
 	}
 	for _, key := range []string{"msg", "empty", "k8s.pod.name", "absent"} {
-		if got, ok := value(key); ok {
+		if got, ok, _ := value(key); ok {
 			t.Errorf("ValueFn(%s) = %v (ok=true); a non-numeric field must not be observed as a number", key, got)
 		}
 	}
 	// A bool is not a number: pcommon renders it "true", which ParseFloat
 	// rejects.
-	if got, ok := value("ok"); ok {
+	if got, ok, _ := value("ok"); ok {
 		t.Errorf("ValueFn(ok) = %v (ok=true), want rejected", got)
+	}
+
+	// present is the LABEL tier's answer for the same key, from the same walk:
+	// it is what decides whether the log-metrics engine reads the line instead,
+	// so it must agree with LabelFn on every rank, EMPTY renderings included.
+	label := r.LabelFn()
+	for _, key := range []string{
+		"bytes", "duration", "count_str", "msg", "ok", "empty", "k8s.pod.name", "absent",
+	} {
+		_, _, present := value(key)
+		if want := label(key) != ""; present != want {
+			t.Errorf("ValueFn(%s) present=%v, LabelFn resolves %q: the two halves of a metric would name different attributes",
+				key, present, label(key))
+		}
 	}
 }
 
@@ -339,8 +353,8 @@ func TestLiftedResourceAttributesRankBetweenRecordAndResource(t *testing.T) {
 		}
 	}
 
-	if v, ok := r.ValueFn()("count"); !ok || v != 7 {
-		t.Errorf("value(count) = %v, %v; want 7, true", v, ok)
+	if v, ok, present := r.ValueFn()("count"); !ok || v != 7 || !present {
+		t.Errorf("value(count) = %v, %v, present=%v; want 7, true, true", v, ok, present)
 	}
 
 	// Set clears them: a resolver re-pointed at the next record must not carry

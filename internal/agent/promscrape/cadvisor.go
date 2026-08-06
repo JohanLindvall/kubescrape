@@ -87,9 +87,14 @@ type scrapeSession struct {
 	conv     *converter
 	pipeline string
 	what     string
-	filter   *filterSession
-	relabel  *relabelFilter
-	proto    bool // selects each front's historical log wording
+	// warnKey identifies what an operator would have to EDIT to stop a
+	// per-scrape complaint, for the warnOnce dedupe table: warnTarget(t) for a
+	// discovered target (never the URL — see warnTarget), the flag-derived
+	// endpoint for the kubelet scrapes.
+	warnKey string
+	filter  *filterSession
+	relabel *relabelFilter
+	proto   bool // selects each front's historical log wording
 
 	samples        int
 	droppedFilter  int
@@ -97,8 +102,8 @@ type scrapeSession struct {
 	exportFailed   bool
 }
 
-func (s *Scraper) newScrapeSession(ctx context.Context, cb chunker, pipeline, what string, relabel *relabelFilter, proto bool) *scrapeSession {
-	ss := &scrapeSession{s: s, ctx: ctx, cb: cb, pipeline: pipeline, what: what, relabel: relabel, proto: proto}
+func (s *Scraper) newScrapeSession(ctx context.Context, cb chunker, pipeline, what, warnKey string, relabel *relabelFilter, proto bool) *scrapeSession {
+	ss := &scrapeSession{s: s, ctx: ctx, cb: cb, pipeline: pipeline, what: what, warnKey: warnKey, relabel: relabel, proto: proto}
 	ss.filter = s.cfg.Filters.filterFor(pipeline).session()
 	ss.conv = newConverter(cb, ss.exportIfFull)
 	return ss
@@ -141,6 +146,13 @@ func (ss *scrapeSession) flushIfFull() error {
 	}
 	if err := ss.conv.finish(); err != nil {
 		return err
+	}
+	// finish() emits through the converter's own exportIfFull hook, so the chunk
+	// it just drained can have shipped everything and left this one empty. The
+	// three sibling export sites all guard; an empty payload costs an OTLP RPC
+	// and, with -buffer-dir, a durable queue record.
+	if ss.cb.count() == 0 {
+		return nil
 	}
 	return ss.export()
 }
@@ -227,15 +239,19 @@ func (ss *scrapeSession) salvage() {
 // lines even when the body was garbage — so the one metric that identifies the
 // cause never moved, and the protobuf path (which did report it) disagreed
 // with the text path on identical input.
+//
+// The LOG line is deduped per (complaint, target) — nothing about a target's
+// broken exposition changes between cycles, and the metric is the ongoing
+// signal. Unbounded, it was one Warn per scrape per target forever.
 func (ss *scrapeSession) reportMalformed(msg string, malformed int, abortErr error) {
 	if malformed == 0 {
 		return
 	}
 	obs.ScrapeMalformed.WithLabelValues(ss.pipeline).Add(float64(malformed))
 	if abortErr != nil {
-		ss.s.log.Warn(msg, "target", ss.what, "malformed", malformed, "samples", ss.samples, "error", abortErr)
+		ss.s.warnOnce(msg+":"+ss.warnKey, msg, "target", ss.what, "malformed", malformed, "samples", ss.samples, "error", abortErr)
 	} else {
-		ss.s.log.Warn(msg, "target", ss.what, "malformed", malformed, "samples", ss.samples)
+		ss.s.warnOnce(msg+":"+ss.warnKey, msg, "target", ss.what, "malformed", malformed, "samples", ss.samples)
 	}
 }
 
@@ -249,7 +265,7 @@ func (ss *scrapeSession) reportBadExemplars(n int) {
 		return
 	}
 	obs.ScrapeExemplarsMalformed.WithLabelValues(ss.pipeline).Add(float64(n))
-	ss.s.log.Warn("scrape had malformed exemplars (samples exported without them)",
+	ss.s.warnOnce("exemplars:"+ss.warnKey, "scrape had malformed exemplars (samples exported without them)",
 		"target", ss.what, "exemplars", n, "samples", ss.samples)
 }
 
@@ -262,16 +278,19 @@ func (ss *scrapeSession) reportBadExemplars(n int) {
 // still exports what was converted before the abort: a partial scrape is worth
 // far more than nothing, and every kind here is cumulative, so a missing series
 // simply does not appear for that cycle.
+//
+// The kubelet scrapes (and tests) come through here: their `what` is derived
+// from a flag rather than from a pod IP, so it is a stable warnOnce key.
 func (s *Scraper) parseAndExport(ctx context.Context, body io.Reader, openMetrics, withExemplars bool, cb chunker, pipeline, what string) (int, error) {
-	return s.parseAndExportFiltered(ctx, body, openMetrics, withExemplars, cb, pipeline, what, nil)
+	return s.parseAndExportFiltered(ctx, body, openMetrics, withExemplars, cb, pipeline, what, what, nil)
 }
 
 // parseAndExportFiltered additionally applies a per-target relabel session
-// (monitor endpoints' metricRelabelings; nil = none). The text-format front:
-// the per-scrape policy lives on scrapeSession, shared with the protobuf
-// front.
-func (s *Scraper) parseAndExportFiltered(ctx context.Context, body io.Reader, openMetrics, withExemplars bool, cb chunker, pipeline, what string, relabel *relabelFilter) (int, error) {
-	ss := s.newScrapeSession(ctx, cb, pipeline, what, relabel, false)
+// (monitor endpoints' metricRelabelings; nil = none) and takes the target's
+// warnOnce key. The text-format front: the per-scrape policy lives on
+// scrapeSession, shared with the protobuf front.
+func (s *Scraper) parseAndExportFiltered(ctx context.Context, body io.Reader, openMetrics, withExemplars bool, cb chunker, pipeline, what, warnKey string, relabel *relabelFilter) (int, error) {
+	ss := s.newScrapeSession(ctx, cb, pipeline, what, warnKey, relabel, false)
 	defer ss.reportDropped()
 	parser := promparse.Get(promparse.Options{MaxLineBytes: s.cfg.MaxLineBytes, OpenMetrics: openMetrics, Exemplars: withExemplars})
 	defer promparse.Put(parser)

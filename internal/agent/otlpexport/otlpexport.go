@@ -24,6 +24,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/encoding"
 	"google.golang.org/grpc/metadata"
 
 	"github.com/JohanLindvall/bufpool"
@@ -100,12 +101,21 @@ type Client struct {
 	logs    plogotlp.GRPCClient
 	metrics pmetricotlp.GRPCClient
 	traces  ptraceotlp.GRPCClient
+	// protoCodec is the registered "proto" codec, borrowed by rawCodec for
+	// RESPONSE decoding on the raw send path (rawsend.go). Resolved once here
+	// rather than per call; nil withholds the raw path entirely.
+	protoCodec encoding.CodecV2
 
 	// HTTP transport.
 	httpClient *http.Client
 	logsURL    string
 	metricsURL string
 	tracesURL  string
+
+	// gzipLevel is THIS client's effective gzip level for the OTLP/HTTP body
+	// path (see gzip.go: the gRPC codec's is necessarily process-wide, and
+	// pinned so two destinations cannot disagree about it silently).
+	gzipLevel int
 
 	// token is the bearer credential this client PRESENTS (nil when
 	// BearerTokenFile is unset). Re-read per minute with the last good value
@@ -206,10 +216,9 @@ func New(cfg Config) (*Client, error) {
 	if cfg.MaxSendBytes == 0 {
 		cfg.MaxSendBytes = otlpsplit.DefaultMaxBytes
 	}
-	if cfg.CompressionLevel != 0 {
-		setGzipLevel(cfg.CompressionLevel)
-	}
-	c := &Client{cfg: cfg, partialLog: partialLog}
+	// The gzip level is this client's own for the HTTP body path; the gRPC
+	// codec's is pinned process-wide below, where the protocol is known.
+	c := &Client{cfg: cfg, partialLog: partialLog, gzipLevel: effectiveGzipLevel(cfg.CompressionLevel)}
 	if cfg.BearerTokenFile != "" {
 		// Not read here: a collector credential that is not yet projected must
 		// not stop the agent from starting, and every export path already
@@ -233,6 +242,9 @@ func New(cfg Config) (*Client, error) {
 			if err := assertGzipCodec(); err != nil {
 				return nil, err
 			}
+			if err := pinGzipLevel(c.gzipLevel); err != nil {
+				return nil, err
+			}
 			callOpts = append(callOpts, grpc.UseCompressor(gzipName))
 		}
 		conn, err := grpc.NewClient(cfg.Endpoint,
@@ -246,6 +258,7 @@ func New(cfg Config) (*Client, error) {
 		c.logs = plogotlp.NewGRPCClient(conn)
 		c.metrics = pmetricotlp.NewGRPCClient(conn)
 		c.traces = ptraceotlp.NewGRPCClient(conn)
+		c.protoCodec = encoding.GetCodecV2(protoCodecName)
 	case "http":
 		base := strings.TrimRight(cfg.Endpoint, "/") // scheme checked by Validate
 		c.logsURL = base + "/v1/logs"
@@ -638,7 +651,7 @@ func (c *Client) httpPost(ctx context.Context, url string, body []byte, out *[]b
 	compressed := c.cfg.Compression == "gzip"
 	var pb *pooledBody
 	if compressed {
-		gz, gerr := gzipBody(body)
+		gz, gerr := gzipBody(body, c.gzipLevel)
 		if gerr != nil {
 			return gerr
 		}

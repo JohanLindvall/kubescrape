@@ -138,6 +138,20 @@ func (t *Tailer) resolvePlain(f *file) bool {
 	return true
 }
 
+// swept reports whether every sweep runs this file through readFile's own
+// os.Stat of the path — which is what lets discovery skip its stat (claimPath)
+// and still notice a vanished path, one sweep sooner than the 2s discovery
+// cadence rather than later.
+//
+// The three conditions are exactly readFile's: an OPEN fd means the file is
+// resolved (nothing is read before it can be attributed) and not
+// annotation-excluded (those are never opened), so the sweep reaches readFile;
+// a live file always ends at the path stat, either the segment gate's or the
+// post-read one. A compressed file takes readArchive, which short-circuits on
+// archiveDone without statting, and a file already marked gone is handled ahead
+// of readFile and needs a stat to be resurrected at all.
+func (f *file) swept() bool { return f.f != nil && !f.compressed && !f.gone }
+
 // readFile ingests up to MaxBytesPerSweep appended bytes and detects
 // rotation.
 func (t *Tailer) readFile(ctx context.Context, f *file) error {
@@ -188,11 +202,18 @@ func (t *Tailer) readFile(ctx context.Context, f *file) error {
 	// resume mid-way into the new file, silently skipping its prefix — and
 	// splitting a line. The head fingerprint is the only witness, so re-verify
 	// it here, BEFORE consuming anything, whenever the file changed on disk
-	// since our last read. Costs one stat plus a fingerprint hash per changed
-	// file per sweep.
+	// since our last read.
+	//
+	// The stat is an fstat on the fd WE hold, never a stat of the path. Every
+	// condition below only ever ACTS on our own inode — the branch it guards is
+	// an in-place rewrite — so the path-stat's inode-equality test was
+	// tautological here, and a rename rotation is the post-read stat's job
+	// either way. Through the /var/log/containers symlink a path stat costs
+	// ~6.9µs against ~2.4µs for the fstat, once per tracked file per sweep, and
+	// the poll ticker sweeps every file.
 	if f.readPos > 0 {
-		if st, err := os.Stat(f.path); err == nil &&
-			inodeOf(st) == f.inode && st.Size() >= f.readPos &&
+		if st, err := f.f.Stat(); err == nil &&
+			st.Size() >= f.readPos &&
 			!st.ModTime().Equal(f.lastMod) && !f.fp.matches(f.f) {
 			t.reopen(ctx, f, false, true)
 			f.lastMod = st.ModTime()

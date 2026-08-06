@@ -25,6 +25,27 @@ var droppedAnnotations = map[string]bool{
 	"kapp.k14s.io/original":                            true,
 }
 
+// StripDroppedAnnotations removes the refused keys from m IN PLACE, reporting
+// whether it removed any. It is for the informer TRANSFORMS, which own an
+// object before it enters the cache: FilterAnnotations copies, and copying is
+// exactly what a transform must not do — its job is to keep the bytes out of
+// the cache in the first place.
+//
+// Without it a last-applied-configuration copy is resident for the process
+// lifetime on every cached object and can never be read, because every read
+// path funnels through CopyMeta/FilterAnnotations. On a kubectl- or
+// kapp-managed cluster that is megabytes of permanently unreadable heap.
+func StripDroppedAnnotations(m map[string]string) bool {
+	dropped := false
+	for k := range droppedAnnotations {
+		if _, ok := m[k]; ok {
+			delete(m, k)
+			dropped = true
+		}
+	}
+	return dropped
+}
+
 // CopyMeta deep-copies an object's labels verbatim and passes its annotations
 // through FilterAnnotations, returning nil for either when empty so the model
 // fields stay omitempty. Every labels+annotations pair the unauthenticated API

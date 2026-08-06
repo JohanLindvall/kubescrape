@@ -84,22 +84,52 @@ func ServiceTargets(pod kubemeta.Pod, svc *services.Service) []kubemeta.ScrapeTa
 // names a Service port; targetPort (number or container-port name)
 // overrides the pod port directly.
 func MonitorTargets(pod kubemeta.Pod, svc *services.Service, monitor string, ep servicemonitors.Endpoint) []kubemeta.ScrapeTarget {
-	if svc == nil || !Scrapeable(pod) {
-		return nil
-	}
-	scheme, path := defaultSchemePath(ep.Scheme, ep.Path)
-
-	port, ok := monitorPodPort(pod, svc, ep)
+	scheme, path, port, ok := monitorEndpoint(pod, svc, ep)
 	if !ok {
 		return nil
 	}
-	info := serviceInfo(svc)
 	t := makeTarget(pod, scheme, path, port)
 	t.Source = "servicemonitor"
-	t.Service = info
+	t.Service = serviceInfo(svc)
 	t.Monitor = monitor
 	stampEndpoint(&t, ep)
 	return []kubemeta.ScrapeTarget{t}
+}
+
+// MonitorTargetURL is MonitorTargets' IDENTITY half: the URL the endpoint
+// resolves to on this pod, or false when it resolves to nothing.
+//
+// It exists so a caller can dedup BEFORE materialising. A ScrapeTarget embeds
+// the whole pod document and allocates a Service view and a relabeling copy,
+// and a cluster-wide monitor set makes the served list a tiny fraction of what
+// the loop builds: 50 ServiceMonitors selecting the same Services produced 125
+// targets per pod of which 2 survived the URL dedup, at 641 KB and 1,206
+// allocations per additional monitor for zero additional response bytes.
+//
+// The URL is a pure function of the pod IP, the scheme, the resolved port and
+// the path — all of which are known here — and it goes through the same
+// resolution and the same renderer as MonitorTargets, so the two cannot
+// disagree about what a target is called.
+func MonitorTargetURL(pod kubemeta.Pod, svc *services.Service, ep servicemonitors.Endpoint) (string, bool) {
+	scheme, path, port, ok := monitorEndpoint(pod, svc, ep)
+	if !ok {
+		return "", false
+	}
+	return targetURL(pod, scheme, path, port), true
+}
+
+// monitorEndpoint resolves a ServiceMonitor endpoint against a pod behind a
+// Service: the scheme/path defaults and the pod port the endpoint names.
+func monitorEndpoint(pod kubemeta.Pod, svc *services.Service, ep servicemonitors.Endpoint) (scheme, path string, port int32, ok bool) {
+	if svc == nil || !Scrapeable(pod) {
+		return "", "", 0, false
+	}
+	port, ok = monitorPodPort(pod, svc, ep)
+	if !ok {
+		return "", "", 0, false
+	}
+	scheme, path = defaultSchemePath(ep.Scheme, ep.Path)
+	return scheme, path, port, true
 }
 
 // stampEndpoint copies the endpoint's auth/TLS/relabeling declarations onto
@@ -130,35 +160,54 @@ func stampEndpoint(t *kubemeta.ScrapeTarget, ep servicemonitors.Endpoint) {
 // Port names a CONTAINER port; targetPort (deprecated) is a number or
 // container port name.
 func PodMonitorTargets(pod kubemeta.Pod, monitor string, ep servicemonitors.Endpoint) []kubemeta.ScrapeTarget {
-	if !Scrapeable(pod) {
+	scheme, path, port, ok := podMonitorEndpoint(pod, ep)
+	if !ok {
 		return nil
-	}
-	if ep.Port == "" && ep.TargetPort == nil {
-		return nil // same phantom-target guard as ServiceMonitors
-	}
-	scheme, path := defaultSchemePath(ep.Scheme, ep.Path)
-	var port int32
-	switch {
-	case ep.Port != "":
-		p, ok := containerPortByName(pod, ep.Port)
-		if !ok {
-			return nil
-		}
-		port = p
-	default:
-		if n, ok := MonitorPortNumber(*ep.TargetPort); ok {
-			port = n
-		} else if p, ok := containerPortByName(pod, ep.TargetPort.StrVal); ok {
-			port = p
-		} else {
-			return nil
-		}
 	}
 	t := makeTarget(pod, scheme, path, port)
 	t.Source = "podmonitor"
 	t.Monitor = monitor
 	stampEndpoint(&t, ep)
 	return []kubemeta.ScrapeTarget{t}
+}
+
+// PodMonitorTargetURL is PodMonitorTargets' identity half; see MonitorTargetURL
+// for why the two halves exist.
+func PodMonitorTargetURL(pod kubemeta.Pod, ep servicemonitors.Endpoint) (string, bool) {
+	scheme, path, port, ok := podMonitorEndpoint(pod, ep)
+	if !ok {
+		return "", false
+	}
+	return targetURL(pod, scheme, path, port), true
+}
+
+// podMonitorEndpoint resolves a PodMonitor endpoint against a pod: Port names a
+// CONTAINER port, targetPort (deprecated) is a number or a container port name.
+func podMonitorEndpoint(pod kubemeta.Pod, ep servicemonitors.Endpoint) (scheme, path string, port int32, ok bool) {
+	if !Scrapeable(pod) {
+		return "", "", 0, false
+	}
+	if ep.Port == "" && ep.TargetPort == nil {
+		return "", "", 0, false // same phantom-target guard as ServiceMonitors
+	}
+	switch {
+	case ep.Port != "":
+		p, found := containerPortByName(pod, ep.Port)
+		if !found {
+			return "", "", 0, false
+		}
+		port = p
+	default:
+		if n, numeric := MonitorPortNumber(*ep.TargetPort); numeric {
+			port = n
+		} else if p, found := containerPortByName(pod, ep.TargetPort.StrVal); found {
+			port = p
+		} else {
+			return "", "", 0, false
+		}
+	}
+	scheme, path = defaultSchemePath(ep.Scheme, ep.Path)
+	return scheme, path, port, true
 }
 
 // containerPortByName finds a declared container port by name.
@@ -299,15 +348,31 @@ func serviceInfo(svc *services.Service) *kubemeta.Service {
 }
 
 func makeTarget(pod kubemeta.Pod, scheme, path string, port int32) kubemeta.ScrapeTarget {
-	address := net.JoinHostPort(pod.PodIP, strconv.Itoa(int(port)))
+	address := podAddress(pod, port)
 	return kubemeta.ScrapeTarget{
-		URL:     scheme + "://" + address + path,
+		URL:     renderURL(scheme, address, path),
 		Scheme:  scheme,
 		Address: address,
 		Port:    port,
 		Path:    path,
 		Pod:     pod,
 	}
+}
+
+// targetURL is what makeTarget would name this target, without building it.
+// Both go through renderURL: the URL is a scrape target's IDENTITY (it is what
+// the server dedups on and what the agent keys a scrape by), so the cheap half
+// and the full half must not be able to spell it differently.
+func targetURL(pod kubemeta.Pod, scheme, path string, port int32) string {
+	return renderURL(scheme, podAddress(pod, port), path)
+}
+
+func podAddress(pod kubemeta.Pod, port int32) string {
+	return net.JoinHostPort(pod.PodIP, strconv.Itoa(int(port)))
+}
+
+func renderURL(scheme, address, path string) string {
+	return scheme + "://" + address + path
 }
 
 // podPorts resolves the pod's port annotation (each entry a number or a

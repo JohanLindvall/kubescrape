@@ -55,8 +55,10 @@ func (t *Tailer) saveCheckpoints() {
 	for path, cp := range t.checkpoints {
 		cps[path] = cp
 	}
+	t.hopsUnsaved = false
 	for path, f := range t.files {
 		t.extendFingerprint(f)
+		f.hopUnsaved = false
 		cp := checkpoint{
 			Offset: f.committed, Inode: f.inode,
 			FingerprintLen: f.fp.Len, FingerprintHash: f.fp.Hash,

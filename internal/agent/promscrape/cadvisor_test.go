@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -714,5 +715,89 @@ func TestMalformedExemplarsCountedApartFromMalformedSamples(t *testing.T) {
 		if got := obs.ScrapeExemplarsMalformed.WithLabelValues(pipelineTargets).Value() - beforeEx; got != want {
 			t.Fatalf("exemplars=%v: malformed exemplars counted = %v, want %v", withExemplars, got, want)
 		}
+	}
+}
+
+// The metadata cache's expiry sweep can never bound it: a splitter enriching a
+// 12k-pod cluster inserts every entry inside one TTL window, so above the cap
+// each insert re-swept a growing map, deleted nothing, and did it while holding
+// the mutex the concurrent scrape goroutines share. The cap must be real (a
+// low-water trim) and the sweep must be on a cadence rather than per insert.
+func TestPodCacheIsBoundedAndSweptOnACadence(t *testing.T) {
+	s := New(Config{Node: "n1", Interval: time.Minute, Exporter: &captureExporter{}, StartTime: time.Now()})
+	fresh := time.Now()
+
+	// Every entry fetched inside the TTL window: nothing is expired, so only a
+	// size trim can bound the map.
+	for i := range podCacheMaxEntries + 4000 {
+		s.cachePut(fmt.Sprintf("n\x00ns/pod-%d", i), podCacheEntry{fetched: fresh})
+	}
+	s.cacheMu.Lock()
+	n := len(s.podCache)
+	s.cacheMu.Unlock()
+	if n > podCacheMaxEntries {
+		t.Fatalf("cache holds %d entries with a cap of %d: expiry alone is not a bound", n, podCacheMaxEntries)
+	}
+
+	// An expired entry survives an insert inside the sweep cadence...
+	s.cachePut("stale", podCacheEntry{fetched: fresh.Add(-2 * podMetaCacheTTL)})
+	s.cacheMu.Lock()
+	s.cacheSwept = time.Now()
+	s.cacheMu.Unlock()
+	s.cachePut("n\x00ns/probe-1", podCacheEntry{fetched: fresh})
+	s.cacheMu.Lock()
+	_, held := s.podCache["stale"]
+	s.cacheMu.Unlock()
+	if !held {
+		t.Fatal("an insert inside the sweep cadence swept the whole map: the O(n) pass is not amortized")
+	}
+
+	// ...and is gone once the cadence has elapsed.
+	s.cacheMu.Lock()
+	s.cacheSwept = time.Now().Add(-2 * podCacheSweepEvery)
+	s.cacheMu.Unlock()
+	s.cachePut("n\x00ns/probe-2", podCacheEntry{fetched: fresh})
+	s.cacheMu.Lock()
+	_, held = s.podCache["stale"]
+	s.cacheMu.Unlock()
+	if held {
+		t.Fatal("the periodic sweep never ran: expired entries are retained until the cap is crossed")
+	}
+}
+
+// A target's broken exposition does not change between cycles, so the per-scrape
+// complaints must log once and let the counters carry the ongoing signal —
+// otherwise one target warns on every scrape for the process' life. Deduped by
+// the CONFIGURATION that produced the target (warnTarget), so a pod restart
+// neither re-fires them nor leaks a dedupe-table entry.
+func TestPerScrapeComplaintsAreDedupedPerTarget(t *testing.T) {
+	h := &countingHandler{}
+	s := New(Config{Node: "n1", Interval: time.Minute, Exporter: &captureExporter{}, StartTime: time.Now(), Logger: slog.New(h)})
+	tgt := testTarget("http://10.4.0.1:9090/metrics")
+	tgt.Source, tgt.Monitor = "servicemonitor", "monitoring/api"
+
+	beforeEx := obs.ScrapeExemplarsMalformed.WithLabelValues(pipelineTargets).Value()
+	beforeMalformed := obs.ScrapeMalformed.WithLabelValues(pipelineTargets).Value()
+	const cycles = 5
+	for i := range cycles {
+		// One session per scrape, and a new pod IP every time: only the monitor
+		// endpoint is stable, which is exactly what the operator would edit.
+		url := fmt.Sprintf("http://10.4.0.%d:9090/metrics", i)
+		cb := newBatcher(func(pcommon.Resource) {}, time.Now(), time.Now())
+		ss := s.newScrapeSession(context.Background(), cb, pipelineTargets, url, warnTarget(tgt), nil, false)
+		ss.reportBadExemplars(2)
+		ss.reportMalformed("scrape had malformed lines", 3, nil)
+	}
+	if h.n != 2 {
+		t.Fatalf("logged %d warnings over %d scrapes of one target, want 2 (one per distinct complaint)", h.n, cycles)
+	}
+	if s.warned == nil || s.warned.Len() != 2 {
+		t.Errorf("dedupe table holds %d keys, want 2: it grows per scrape", s.warned.Len())
+	}
+	if got := obs.ScrapeExemplarsMalformed.WithLabelValues(pipelineTargets).Value() - beforeEx; got != 2*cycles {
+		t.Errorf("malformed exemplars counted = %v, want %v: the counter is the ongoing signal", got, 2*cycles)
+	}
+	if got := obs.ScrapeMalformed.WithLabelValues(pipelineTargets).Value() - beforeMalformed; got != 3*cycles {
+		t.Errorf("malformed samples counted = %v, want %v: the counter is the ongoing signal", got, 3*cycles)
 	}
 }

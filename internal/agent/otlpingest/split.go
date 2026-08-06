@@ -170,14 +170,14 @@ func (g *metricGrouper) metric(sm pmetric.ScopeMetrics, scopeIdx int, m pmetric.
 	if dst, ok := g.metByID[mk]; ok {
 		return dst
 	}
-	// The `id != ""` guard is load-bearing, not decorative: the fallback is
-	// itself the "" chain — a SINGLE resource/scope/shell set per input
-	// resource, whose creations are bounded by the input — so it is exempt from
-	// both budgets. Gating it would recurse right here (a refused "" folding
-	// back into ""): an unbounded stack on an unauthenticated listener, i.e.
-	// any pod could crash the agent with a >maxSplitGroups-object push.
-	if id != "" && !g.admit(id) {
-		return g.metric(sm, scopeIdx, m, metricIdx, "")
+	// The fallback ids are load-bearing, not decorative: each is a SINGLE
+	// resource/scope/shell set per input resource, whose creations are bounded
+	// by the input, so both are exempt from both budgets. Gating them would
+	// recurse right here (a refused fallback folding back into itself): an
+	// unbounded stack on an unauthenticated listener, i.e. any pod could crash
+	// the agent with a >maxSplitGroups-object push.
+	if !isFallbackID(id) && !g.admit(id) {
+		return g.metric(sm, scopeIdx, m, metricIdx, g.foldTarget(id))
 	}
 	scope := g.scope(sm, scopeIdx, id)
 	dst := scope.Metrics().AppendEmpty()
@@ -204,30 +204,70 @@ func (g *metricGrouper) metric(sm pmetric.ScopeMetrics, scopeIdx int, m pmetric.
 	return dst
 }
 
+// overflowID keys the group a budget-refused id's points fall into. It is a
+// group of its OWN rather than the id-less "" chain because the two describe
+// different things: "" holds the SENDER's own points, so its copy keeps the
+// sender's identity, while a refused id's points describe OTHER objects — the
+// exporter's k8s.pod.name/service.name on them is the same misattribution the
+// admitted foreign groups strip. The byte budget binds at
+// maxSplitCopyBytes/maxSplitGroups = 8 KiB of resource estimate, so any
+// attribute-rich sender reaches it long before the group cap and the fold was
+// anything but rare. The points keep their own id attributes, so a downstream
+// consumer can still re-resolve what this push could not afford to.
+//
+// The value cannot collide with a real token: those are tokContainer/tokPodUID
+// followed by a non-empty value.
+const overflowID = "\x00overflow"
+
+// isFallbackID reports whether id names one of the two per-input-resource
+// fallback chains rather than a described object.
+func isFallbackID(id string) bool { return id == "" || id == overflowID }
+
+// foldTarget picks the chain a refused id folds into. The sender's OWN id keeps
+// the sender's resource: those points describe the exporter, so its identity IS
+// theirs and stripping it would lose what the push got right. Anything else
+// describes another object and takes the stripped overflow group.
+//
+// The test is token equality, not sameObject: resolving a refused id to compare
+// objects would spend the very lookups the budgets are refusing to spend, and
+// the case this covers — a sender labelling its own points with the id its
+// resource already carries — is exactly equality.
+func (g *metricGrouper) foldTarget(id string) string {
+	if id == g.resToken {
+		return ""
+	}
+	return overflowID
+}
+
 // admit reports whether copies keyed by id may still be minted, against the
 // push-wide budgets: the group COUNT (a new id past maxSplitGroups shares the
 // fallback) and the copy BYTES (past maxSplitCopyBytes even an EXISTING
 // group's new scope/shell copies are refused — the byte bound is on the
 // output, and a group admitted cheaply must not go on minting expensive
-// descriptor copies). A refused id's points fold into the "" fallback:
-// forwarded under the source resource, unenriched, counted once per id per
-// input resource.
+// descriptor copies). A refused id's points fold into the overflow fallback:
+// forwarded under a copy of the source resource stripped of the sender's
+// identity, unenriched.
 func (g *metricGrouper) admit(id string) bool {
-	over := g.cache.splitCopied >= maxSplitCopyBytes
-	if !over {
-		if _, ok := g.rmByID[id]; !ok && g.cache.splitGroups >= maxSplitGroups {
-			over = true
-		}
-	}
+	_, grouped := g.rmByID[id]
+	over := g.cache.splitCopied >= maxSplitCopyBytes ||
+		(!grouped && g.cache.splitGroups >= maxSplitGroups)
 	if !over {
 		return true
 	}
-	if _, seen := g.refused[id]; !seen {
-		if g.refused == nil {
-			g.refused = map[string]struct{}{}
+	// Counted once per refused OBJECT, per input resource. An id that already
+	// has its own group is not "the remainder sharing the sender's resource
+	// unenriched" — the byte budget merely stops it minting FURTHER descriptor
+	// copies, its points still land on its own enriched resource, and tallying
+	// that made kubescrape_ingest_resources_total{split_capped} name objects the
+	// push had in fact enriched.
+	if !grouped {
+		if _, seen := g.refused[id]; !seen {
+			if g.refused == nil {
+				g.refused = map[string]struct{}{}
+			}
+			g.refused[id] = struct{}{}
+			obs.Ingested.WithLabelValues("split_capped").Inc()
 		}
-		g.refused[id] = struct{}{}
-		obs.Ingested.WithLabelValues("split_capped").Inc()
 	}
 	return false
 }
@@ -301,7 +341,16 @@ func (g *metricGrouper) resource(id string) pmetric.ResourceMetrics {
 	g.srcResource.CopyTo(rm.Resource())
 	rm.SetSchemaUrl(g.srcSchema)
 	g.cache.splitCopied += g.srcSize
-	if id != "" {
+	if id == overflowID {
+		// These points describe objects this push could not afford a group for.
+		// The copied resource is the SENDER's, and its identity names the
+		// exporter — leaving it here labels every refused object's points with
+		// the exporter's pod and service.name, which in Prometheus terms is N
+		// objects' series under one job/instance. Strip it: an unenriched
+		// resource is a visible gap, a confidently wrong one is not.
+		g.stripIDAttrs(rm.Resource().Attributes())
+		stripSenderIdentity(rm.Resource().Attributes())
+	} else if id != "" {
 		g.cache.splitGroups++
 		// One same-object predicate for the whole enricher (Enricher.sameObject):
 		// this used to be a local copy that disagreed with the auto-mode
@@ -342,13 +391,21 @@ func (g *metricGrouper) resource(id string) pmetric.ResourceMetrics {
 			return rm
 		}
 		mergeAttrs(g.enricher.builtAttrs(g.ctx, g.cache, id).built, rm.Resource().Attributes())
-	} else if built, resolved := g.enricher.peerFallback(g.ctx, g.cache); resolved {
+	} else if g.resToken == "" {
 		// No ID anywhere for these points: the opt-in peer-IP fallback still
 		// attributes them to the pushing pod (resolved once per request). The
 		// outcome — peer_ip, peer_ip_rejected or unresolved — is counted inside
 		// peerFallback, the one accounting shared with the resource path; an
 		// open-coded copy here counted nothing for a rejected peer.
-		mergeAttrs(built, rm.Resource().Attributes())
+		//
+		// The resToken guard is what keeps that accounting honest. This chain is
+		// only the "the sender named nothing" case when the RESOURCE named
+		// nothing either; reaching it any other way (budget-refused ids used to
+		// fold in here) tallied an unresolved sender for a push whose resource
+		// had resolved perfectly.
+		if built, resolved := g.enricher.peerFallback(g.ctx, g.cache); resolved {
+			mergeAttrs(built, rm.Resource().Attributes())
+		}
 	}
 	g.rmByID[id] = rm
 	return rm
@@ -380,11 +437,15 @@ func (g *metricGrouper) stripIDAttrs(a pcommon.Map) {
 	}
 }
 
-// resourceCopySize, scopeCopySize and metricShellSize estimate the bytes one
-// splitter-minted copy retains, charged against maxSplitCopyBytes. The
-// estimate tracks the string payloads — the only sender-controlled unbounded
-// inputs — plus a small per-field constant; exactness is not needed, the
-// budget is a memory bound, not a wire contract.
+// resourceCopySize, scopeCopySize and metricShellSize estimate the HEAP one
+// splitter-minted copy retains, charged against maxSplitCopyBytes. They are not
+// wire-size estimators — the budget bounds memory, and the two differ in both
+// directions: pcommon's CopyTo copies string HEADERS (a long value's bytes are
+// shared, not re-allocated) while every copied attribute costs a slot and a
+// boxed value the wire does not name. The string payloads are still charged,
+// deliberately: they are the sender-controlled unbounded input, and
+// over-charging a copy binds the ceiling early, which is the safe direction.
+// Exactness is not needed; the SHAPE is (see keyValueOverheadBytes).
 func resourceCopySize(res pcommon.Resource, schema string) int {
 	return attrsSize(res.Attributes()) + len(schema) + 16
 }
@@ -398,10 +459,19 @@ func metricShellSize(m pmetric.Metric) int {
 	return len(m.Name()) + len(m.Description()) + len(m.Unit()) + attrsSize(m.Metadata()) + 16
 }
 
+// keyValueOverheadBytes is what one copied attribute costs REGARDLESS of its
+// payload — its slot in the destination's KeyValue slice plus the copied
+// value's own framing. Charging only the string payloads estimated a
+// 200-attribute resource at under a quarter of what its copy really cost (4.6x
+// for short values, 4.3x for ints; TestCopySizeEstimateBoundsRealMemory
+// measures it), so the ceiling bound that much too late — and the effective
+// bound is that, times -ingest-max-in-flight, on an unauthenticated listener.
+const keyValueOverheadBytes = 48
+
 func attrsSize(m pcommon.Map) int {
 	n := 0
 	m.Range(func(k string, v pcommon.Value) bool {
-		n += len(k) + valueSize(v)
+		n += len(k) + valueSize(v) + keyValueOverheadBytes
 		return true
 	})
 	return n

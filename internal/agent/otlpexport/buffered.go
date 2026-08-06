@@ -193,8 +193,17 @@ func (b *Buffer) stats() diskqueue.Stats {
 // rewindQ returns in-flight (reserved, uncommitted) records to the queue — the
 // bulk nack used when a send is cancelled or a stuck head goes back for
 // rotation.
-func (b *Buffer) rewindQ() {
-	q, _ := b.handles()
+//
+// It takes the queue handle the CALLER observed, for the same reason commit
+// does: nacking is a statement about the reservation the caller holds, and
+// re-reading the current handle would apply it to whatever queue happens to be
+// installed now — a handle on which this drain holds nothing. (Today one drain
+// goroutine per sink means the replacement queue has no reservation to roll
+// back, so the re-read was harmless; the two functions disagreeing about a
+// rule both comments treat as load-bearing is the thing worth not leaving in
+// place.) A retired handle answers ErrClosed, which recover's own guard then
+// resolves to a no-op.
+func (b *Buffer) rewindQ(q *diskqueue.Queue[[]byte]) {
 	if _, err := q.Rewind(); err != nil && queueDead(err) {
 		b.recover(q)
 	}
@@ -277,6 +286,16 @@ func NewBuffered(inner Exporter, logBuf, metricBuf, traceBuf *Buffer, backoff ti
 		log.Warn("inner exporter exposes no single-attempt sends; the drain's retries will stack on the exporter's own",
 			"type", fmt.Sprintf("%T", inner))
 	}
+	// The raw seam is separate and optional: a spooled payload is already the
+	// wire body, so the common drain path sends the reserved bytes verbatim and
+	// materializes pdata only where it is genuinely needed (an over-cap payload
+	// to split, a drop whose counter reports records). An exporter outside this
+	// package cannot promise that equivalence and simply does not get it.
+	var rawLogs, rawMetrics, rawTraces func(context.Context, []byte) error
+	var rawMaxBytes int
+	if ra, ok := inner.(rawSingleAttempt); ok {
+		rawLogs, rawMetrics, rawTraces, rawMaxBytes = ra.rawSingleAttemptSends()
+	}
 	// Report what corruption cost at open: everything the recovery scan
 	// dropped or truncated away is data no drain will ever see.
 	for kind, buf := range map[string]*Buffer{"logs": logBuf, "metrics": metricBuf, "traces": traceBuf} {
@@ -300,6 +319,7 @@ func NewBuffered(inner Exporter, logBuf, metricBuf, traceBuf *Buffer, backoff ti
 			unmarshal: lu.UnmarshalLogs,
 			count:     plog.Logs.LogRecordCount,
 			send:      sendLogs,
+			sendRaw:   rawLogs, maxSendBytes: rawMaxBytes,
 		}
 	}
 	if metricBuf != nil {
@@ -311,6 +331,7 @@ func NewBuffered(inner Exporter, logBuf, metricBuf, traceBuf *Buffer, backoff ti
 			unmarshal: mu.UnmarshalMetrics,
 			count:     pmetric.Metrics.DataPointCount,
 			send:      sendMetrics,
+			sendRaw:   rawMetrics, maxSendBytes: rawMaxBytes,
 		}
 	}
 	if te, ok := inner.(TracesExporter); ok && traceBuf != nil {
@@ -326,7 +347,8 @@ func NewBuffered(inner Exporter, logBuf, metricBuf, traceBuf *Buffer, backoff ti
 			// pushing sender's retry has always been the trace path's retry —
 			// so there is no client-side loop for the drain's own retries to
 			// multiply with.
-			send: te.ExportTraces,
+			send:    te.ExportTraces,
+			sendRaw: rawTraces, maxSendBytes: rawMaxBytes,
 		}
 	} else if traceBuf != nil {
 		log.Error("a traces disk buffer was opened but the exporter does not support traces; owned trace payloads will be refused")
@@ -464,12 +486,20 @@ type sink[T any] struct {
 	// 1..1024 records — without this the magnitude of the loss on the durable
 	// configuration, which is the one an operator is told to alert on, was
 	// simply not knowable.
-	count   func(T) int
-	send    func(context.Context, T) error
-	backoff time.Duration
-	cur     time.Duration // current backoff, persisted across trySend cycles of a failing head
-	log     *slog.Logger
-	kind    string
+	count func(T) int
+	send  func(context.Context, T) error
+	// sendRaw hands the RESERVED BYTES straight to the wire, skipping the
+	// decode-and-re-encode round trip that produced exactly those bytes again
+	// (see rawsend.go). nil when the inner exporter cannot promise the
+	// equivalence, in which case the drain decodes as it always did.
+	// maxSendBytes is the client's send cap: a payload over it needs otlpsplit
+	// and therefore pdata, so that one decodes (<= 0 = splitting disabled).
+	sendRaw      func(context.Context, []byte) error
+	maxSendBytes int
+	backoff      time.Duration
+	cur          time.Duration // current backoff, persisted across trySend cycles of a failing head
+	log          *slog.Logger
+	kind         string
 	// delivered counts batches this sink has successfully exported; stuck
 	// tracks, per stuck payload (keyed by content hash), its accountable failed
 	// cycles and the value of delivered at its own previous failed cycle — the
@@ -550,10 +580,13 @@ func (s *sink[T]) records(v T) int {
 	return s.count(v)
 }
 
-// countDropped counts one dropped batch and the records it took with it.
-func (s *sink[T]) countDropped(v T) {
+// countDropped counts one dropped batch and the n records it took with it.
+// n comes from the caller because the drain decodes the payload ON DEMAND —
+// a drop is the one place the record count is needed, and the one place the
+// pdata round trip is worth paying for.
+func (s *sink[T]) countDropped(n int) {
 	obs.BufferDroppedBatches.WithLabelValues(s.kind).Inc()
-	if n := s.records(v); n > 0 {
+	if n > 0 {
 		obs.BufferDroppedRecords.WithLabelValues(s.kind).Add(float64(n))
 	}
 }
@@ -619,10 +652,16 @@ func (s *sink[T]) drainLoop(ctx context.Context, untilEmpty bool) {
 				if untilEmpty {
 					return // a dead disk must not spin the bounded shutdown pass
 				}
+				// NewTimer+Stop, not time.After — the rule Retry and trySend
+				// already follow: a cancelled wait must not leave the timer live
+				// until it fires, and at SIGTERM every draining sink abandons
+				// its wait at once.
+				t := time.NewTimer(time.Second)
 				select {
 				case <-ctx.Done():
+					t.Stop()
 					return
-				case <-time.After(time.Second):
+				case <-t.C:
 				}
 			}
 			continue
@@ -633,19 +672,68 @@ func (s *sink[T]) drainLoop(ctx context.Context, untilEmpty bool) {
 			}
 			continue // blocking Reserve yields !ok only on ctx/close; re-check both
 		}
-		v, err := s.unmarshal(data)
-		if err != nil {
-			// Undecodable payload: the data is gone either way, but the drop
-			// must be counted like every other one. The RECORD count is the
-			// one thing that cannot be counted here — it lives in the bytes
-			// that failed to decode — so this is the sole drop path that moves
-			// the batch counter alone.
+		// The spooled bytes ARE the wire body (see rawsend.go), so the common
+		// path sends them as they are: decoding here only for the client to
+		// re-encode the identical bytes cost ~520µs and 10,274 allocations per
+		// 215 KB batch, and a node shipping 10 MB/min through the spool pays
+		// ~50 of those a minute. pdata is materialized on the COLD branches
+		// only: a payload over the send cap (otlpsplit needs the structure) and
+		// a DROP (whose counter reports records). A payload that does not decode
+		// is then no longer caught before the send — the collector rejects it
+		// instead, which is the same outcome by a different judge, and
+		// diskqueue's per-record checksums mean this path was already all but
+		// unreachable.
+		var (
+			v       T
+			decoded bool
+		)
+		decode := func() bool {
+			if decoded {
+				return true
+			}
+			dv, derr := s.unmarshal(data)
+			if derr != nil {
+				s.log.Warn("buffered batch does not decode", "signal", s.kind, "error", derr)
+				return false
+			}
+			v, decoded = dv, true
+			return true
+		}
+		// records is the drop counters' magnitude, decoded on demand: a batch
+		// that cannot decode contributes 0 records, exactly as before.
+		records := func() int {
+			if !decode() {
+				return 0
+			}
+			return s.records(v)
+		}
+		sendable := s.sendRaw != nil && (s.maxSendBytes <= 0 || len(data) <= s.maxSendBytes)
+		if !sendable && !decode() {
+			// Undecodable payload with no raw path: the data is gone either way,
+			// but the drop must be counted like every other one. The RECORD count
+			// is the one thing that cannot be counted here — it lives in the
+			// bytes that failed to decode — so this is the sole drop path that
+			// moves the batch counter alone.
 			obs.BufferDroppedBatches.WithLabelValues(s.kind).Inc()
-			s.log.Warn("dropping corrupt buffered batch", "signal", s.kind, "error", err)
+			s.log.Warn("dropping corrupt buffered batch", "signal", s.kind)
 			s.commit(q, rd, off)
 			continue
 		}
-		switch s.trySend(ctx, v) {
+		send := func(c context.Context) error { return s.send(c, v) }
+		if sendable {
+			// One copy, per BATCH. The reserved payload aliases the reader's
+			// buffer and the next queue operation reuses it — Requeue clobbers it
+			// outright — while a transport can still be referencing the body it
+			// was given after a FAILED attempt returns (net/http's writeLoop and
+			// grpc's loopyWriter both finish asynchronously once Do/Invoke has
+			// errored). The pdata path was implicitly safe because each attempt
+			// marshaled private memory. So: one allocation and a memcpy, against
+			// the ~11,300 allocations and 3.7ms the decode-and-re-encode round
+			// trip cost for the same 183 KB batch.
+			payload := append([]byte(nil), data...)
+			send = func(c context.Context) error { return s.sendRaw(c, payload) }
+		}
+		switch s.trySend(ctx, send) {
 		case sendOK:
 			s.forget(data) // a previously-stuck payload that recovered; hash before the next queue op
 			s.commit(q, rd, off)
@@ -653,14 +741,15 @@ func (s *sink[T]) drainLoop(ctx context.Context, untilEmpty bool) {
 		case sendCancelled:
 			// ctx cancelled mid-send: nack the reservation so the batch is
 			// queued for the next run (or the final drain).
-			s.buf.rewindQ()
+			s.buf.rewindQ(q)
 			return
 		case sendRejected:
 			// A definitive rejection (bad payload, auth, unimplemented):
 			// retrying cannot fix it and keeping it would block the queue.
+			n := records()
 			s.log.Error("dropping buffered batch permanently rejected by the collector",
-				"signal", s.kind, "records", s.records(v))
-			s.countDropped(v)
+				"signal", s.kind, "records", n)
+			s.countDropped(n)
 			s.forget(data) // a batch that got stuck then turned permanent must not leak its entry
 			s.commit(q, rd, off)
 		case sendStuck:
@@ -675,13 +764,14 @@ func (s *sink[T]) drainLoop(ctx context.Context, untilEmpty bool) {
 			// head. NOTE the hash in stuckTooLong happens before Requeue —
 			// Requeue clobbers the reader buffer data aliases.
 			if s.stuckTooLong(data) {
+				n := records()
 				s.log.Error("dropping buffered batch the collector never accepted",
-					"signal", s.kind, "cycles", maxDrainCycles, "bytes", len(data), "records", s.records(v))
-				s.countDropped(v)
+					"signal", s.kind, "cycles", maxDrainCycles, "bytes", len(data), "records", n)
+				s.countDropped(n)
 				s.commit(q, rd, off)
 				continue
 			}
-			s.buf.rewindQ()
+			s.buf.rewindQ(q)
 			if s.buf.stats().Backlog > 1 {
 				if requeued, rerr := rd.Requeue(); rerr == nil && requeued {
 					obs.BufferRequeued.WithLabelValues(s.kind).Inc()
@@ -833,8 +923,9 @@ const stuckAfterAttempts = 5
 
 // trySend retries with backoff until the exporter accepts the batch, the
 // error is a permanent rejection, the attempt budget is spent, or ctx is
-// cancelled.
-func (s *sink[T]) trySend(ctx context.Context, v T) sendResult {
+// cancelled. send is the one attempt — the drain chooses between the raw-bytes
+// and the pdata send, and everything else about the policy is identical.
+func (s *sink[T]) trySend(ctx context.Context, send func(context.Context) error) sendResult {
 	// The backoff persists across trySend cycles (s.cur) so a long outage
 	// actually reaches the 30s cap instead of restarting at s.backoff every
 	// stuckAfterAttempts sends; success resets it.
@@ -842,7 +933,7 @@ func (s *sink[T]) trySend(ctx context.Context, v T) sendResult {
 		s.cur = s.backoff
 	}
 	for attempt := 1; ; attempt++ {
-		err := s.send(ctx, v)
+		err := send(ctx)
 		if err == nil {
 			s.cur = 0
 			return sendOK

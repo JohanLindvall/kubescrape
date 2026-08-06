@@ -94,20 +94,45 @@ type agentConfig struct {
 	Export *otlpexport.ExportConfig `json:"export,omitempty"`
 }
 
-// configSections lists the section keys agentConfig accepts, in declaration
-// order, DERIVED from the struct rather than spelled out: the -config flag's
-// help enumerated them by hand and had already drifted three sections behind
-// the type it describes.
-func configSections() string {
+// sectionNames is the JSON name of each agentConfig field, by field index ("
+// for a field that is not a section). ONE walk of the struct, so the -config
+// flag's help and the -check-config summary cannot disagree about what a
+// section is — both enumerated them by hand before, and the help had already
+// drifted three sections behind the type it describes.
+func sectionNames() []string {
 	t := reflect.TypeOf(agentConfig{})
-	names := make([]string, 0, t.NumField())
+	names := make([]string, t.NumField())
 	for i := range t.NumField() {
-		name, _, _ := strings.Cut(t.Field(i).Tag.Get("json"), ",")
-		if name != "" && name != "-" {
-			names = append(names, name)
+		if name, _, _ := strings.Cut(t.Field(i).Tag.Get("json"), ","); name != "-" {
+			names[i] = name
 		}
 	}
-	return strings.Join(names, ", ")
+	return names
+}
+
+// configSections lists the section keys agentConfig accepts, in declaration
+// order.
+func configSections() string {
+	var present []string
+	for _, name := range sectionNames() {
+		if name != "" {
+			present = append(present, name)
+		}
+	}
+	return strings.Join(present, ", ")
+}
+
+// presentSections lists the sections cfg actually carries, in declaration
+// order. Every section is a pointer, so "present" is "not nil".
+func presentSections(cfg agentConfig) []string {
+	v := reflect.ValueOf(cfg)
+	var present []string
+	for i, name := range sectionNames() {
+		if name != "" && !v.Field(i).IsZero() {
+			present = append(present, name)
+		}
+	}
+	return present
 }
 
 // loadAgentConfig reads and strictly parses the unified config file.
@@ -476,6 +501,30 @@ func configWarnings(cfg agentConfig) []string {
 		}
 	}
 
+	// Peer-IP attribution on the trace tier with the self-metadata lookup turned
+	// off. The veto that keeps a rewritten source address from labelling an
+	// application's spans with a kubescrape pod (peerIsOurOwnWorkload) reads the
+	// pod THIS process resolved for -self-attributes; with the lookup never run
+	// it has no pod, and its documented answer for "we do not know yet" — false,
+	// do not veto — becomes the answer for the process LIFETIME.
+	//
+	// A warning rather than a refusal: the fallback still attributes correctly on
+	// a direct hop (the arrangement it is meant for), and -self-attributes is a
+	// legitimate thing to turn off. What must not happen silently is the failure
+	// mode, because it is invisible: the misattribution renders perfectly, and
+	// kubescrape_ingest_resources_total{outcome="peer_ip_rejected"} — documented
+	// as THE signal that peer-IP attribution cannot work on a path — stays flat
+	// whether the veto found nothing or was never able to look.
+	if *serviceGraphOn && *ingestPeerIP && (!*selfAttrsOn || *selfAttrsRefresh <= 0) {
+		off := "-self-attributes=false"
+		if *selfAttrsOn {
+			off = fmt.Sprintf("-self-attributes-refresh=%s (0 disables the lookup)", *selfAttrsRefresh)
+		}
+		out = append(out, fmt.Sprintf(
+			"-ingest-peer-ip-fallback on the trace tier needs this process's own pod to veto an attribution that resolved to the tier's OWN workload, and %s never resolves it: a proxy, mesh or misaddressed hop then labels application spans with a kubescrape pod's identity — on every span, and with peer_ip_rejected flat, so it is indistinguishable from success. "+
+				"Leave -self-attributes on with a positive -self-attributes-refresh, or drop -ingest-peer-ip-fallback and have senders carry k8s.pod.uid / container.id.", off))
+	}
+
 	// A logAttributes rule lifting a LINE value into a resolved-identity
 	// resource attribute hands whatever writes the log line control of that
 	// key — and k8s.namespace.name is what routing keys tenancy on, so a pod
@@ -624,25 +673,11 @@ func printConfigSummary(cfg agentConfig, log *slog.Logger) {
 		}
 		return "off"
 	}
-	sections := []string{}
-	add := func(name string, present bool) {
-		if present {
-			sections = append(sections, name)
-		}
-	}
-	add("resourceAttributes", cfg.ResourceAttributes != nil)
-	add("logs", cfg.Logs != nil)
-	add("logAttributes", cfg.LogAttributes != nil)
-	add("logMetrics", cfg.LogMetrics != nil)
-	add("logScrubbing", cfg.LogScrubbing != nil)
-	add("metrics", cfg.Metrics != nil)
-	add("traceMetrics", cfg.TraceMetrics != nil)
-	add("traceSampling", cfg.TraceSampling != nil)
-	add("tailSampling", cfg.TailSampling != nil)
-	add("serviceGraph", cfg.ServiceGraph != nil)
-	add("serviceGraphShards", cfg.ServiceGraphShards != nil)
-	add("routing", cfg.Routing != nil)
-	add("export", cfg.Export != nil)
+	// DERIVED, not enumerated: a section added to agentConfig updates the -config
+	// help through the same walk, and this summary is what answers "is this what
+	// I meant?" — a section missing from a hand-written list reads as "not
+	// configured", which is the one wrong answer it can give.
+	sections := presentSections(cfg)
 	if len(sections) == 0 {
 		sections = append(sections, "(none)")
 	}

@@ -336,18 +336,33 @@ func (r *Router) ExportTraces(ctx context.Context, td ptrace.Traces) error {
 
 // split computes per-resource destinations; nil means "all default" (the
 // caller then forwards the original payload untouched).
+//
+// The all-default answer must cost NOTHING to reach: it is the documented fast
+// path, and it is what the self-metrics, node and cadvisor-rollup shapes (no
+// k8s.namespace.name at all) take on every export. Building the group slice
+// first and discarding it on !any allocated proportionally to the resource
+// count — 128 KB per export at the 4,000-resource KSM/cadvisor shape, already
+// half the cost of the copy the fast path exists to avoid. So: scan for the
+// FIRST match with no allocation, and only then take a second pass into a
+// slice sized exactly once. Resources before that match are all default, so
+// re-matching them would be pure waste.
 func (r *Router) split(n int, res func(int) pcommon.Resource) []int {
-	var groups []int
-	any := false
+	first := -1
 	for i := 0; i < n; i++ {
-		g := r.match(res(i))
-		if g >= 0 {
-			any = true
+		if r.match(res(i)) >= 0 {
+			first = i
+			break
 		}
-		groups = append(groups, g)
 	}
-	if !any {
+	if first < 0 {
 		return nil
+	}
+	groups := make([]int, n)
+	for i := 0; i < first; i++ {
+		groups[i] = -1
+	}
+	for i := first; i < n; i++ {
+		groups[i] = r.match(res(i))
 	}
 	return groups
 }

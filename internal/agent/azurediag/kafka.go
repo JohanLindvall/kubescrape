@@ -8,12 +8,14 @@ package azurediag
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
 	"strings"
 	"time"
 
+	"github.com/twmb/franz-go/pkg/kerr"
 	"github.com/twmb/franz-go/pkg/kgo"
 	"github.com/twmb/franz-go/pkg/sasl"
 
@@ -142,45 +144,88 @@ func newKafkaSource(cfg *Config) (source, error) {
 }
 
 // poll blocks for the next fetch and returns the message values.
-func (s *kafkaSource) poll(ctx context.Context) ([][]byte, error) {
+func (s *kafkaSource) poll(ctx context.Context) ([][]byte, bool, error) {
 	fetches := s.cl.PollFetches(ctx)
 	if err := ctx.Err(); err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	return pollResult(fetches, s.log)
 }
 
-// pollResult separates a fetch's records from its errors. Errors beside
-// records are counted and logged but do not fail the poll — the records are
-// still processed and kgo retries the broken partitions itself. A fetch
-// carrying errors and NO records fails it: that is the shape kgo documents
-// for fatal partition conditions ("if any partition has a fatal error and
-// actually had no records, a fake fetch will be injected with the error" —
-// an authorization failure, a closed client), and by the records alone it is
-// indistinguishable from a clean empty poll, so returning nil here cleared
-// the azure-eventhub readiness gate for a consumer that can never consume
-// and warn-looped on errors only Run's reopen-with-backoff can address.
-func pollResult(fetches kgo.Fetches, log *slog.Logger) ([][]byte, error) {
-	var (
-		out  [][]byte
-		seen bool
-	)
+// pollResult separates a fetch's records from its errors, classifies the
+// errors by SCOPE, and reports whether the fetch was a real one.
+//
+// kgo delivers EVERY partition-level notification through the same record-less
+// shape — addFakeReadyForDraining builds a Fetch with no records and
+// PollFetches returns it alone — and Fetches.Errors' own documentation
+// classifies most of those as informational and self-healing: *ErrDataLoss
+// ("the client automatically resets consuming ... not worth restarting the
+// client for"), ErrGroupSession (kgo rejoins by itself), and metadata load
+// errors scoped to ONE topic or partition. That last shape is the live one
+// here: newKafkaSource consumes ^insights-.* with ConsumeRegex, so metadata
+// covers every hub in the namespace and an identity with read on nine of ten
+// hubs produces exactly it. Failing the poll there makes Run close the source
+// — a full LeaveGroup — and rebuild after a backoff, so nine healthy hubs go
+// dark and the group rebalances twice per cycle for a permission problem on
+// one.
+//
+// So an error naming a TOPIC never fails the poll: it is scoped to that topic,
+// kgo retries it, and the rest of the namespace keeps streaming. Only a
+// condition no further fetch can clear does (see fatalFetchErr).
+//
+// healthy is false whenever a fetch carried errors and NO records. By the
+// records alone such a fetch is indistinguishable from a clean empty poll, so
+// the caller must not clear the azure-eventhub readiness gate on it — that is
+// how a consumer which can never consume is kept from reporting ready without
+// also tearing the group down over it.
+func pollResult(fetches kgo.Fetches, log *slog.Logger) (msgs [][]byte, healthy bool, err error) {
+	var seen bool
 	fetches.EachRecord(func(rec *kgo.Record) {
 		seen = true
 		if len(rec.Value) > 0 {
-			out = append(out, rec.Value)
+			msgs = append(msgs, rec.Value)
 		}
 	})
 	errs := fetches.Errors()
+	var fatal error
 	for _, fe := range errs {
 		obs.AzureFetchErrors.Inc()
 		log.Warn("event hubs fetch error", "topic", fe.Topic, "partition", fe.Partition, "error", fe.Err)
+		if fatal == nil && fatalFetchErr(fe) {
+			fatal = fmt.Errorf("event hubs fetch (topic %q partition %d): %w", fe.Topic, fe.Partition, fe.Err)
+		}
 	}
-	if !seen && len(errs) > 0 {
-		fe := errs[0]
-		return nil, fmt.Errorf("event hubs fetch (topic %q partition %d): %w", fe.Topic, fe.Partition, fe.Err)
+	if fatal != nil {
+		return nil, false, fatal
 	}
-	return out, nil
+	return msgs, seen || len(errs) == 0, nil
+}
+
+// fatalFetchErr reports a fetch error that only a NEW client can clear, which
+// is the whole set Run's close-and-reopen arm can address.
+//
+// An error naming a topic is scoped to that topic (a metadata load failure, a
+// non-retryable offset-fetch error, an injected *ErrDataLoss), so it says
+// nothing about the other hubs and kgo retries it on its own. An unscoped
+// ErrGroupSession is self-healing too — kgo rejoins the group, and a rebuild
+// would only add a LeaveGroup to a rebalance already under way. What remains
+// is the closed client (which errors.Is tests exactly as Fetches.IsClientClosed
+// does, but per error, so a fetch mixing it with records is still counted and
+// logged) and an unscoped NON-RETRIABLE broker error — a cluster-wide
+// authorization or SASL failure, the one shape where every hub is unreachable
+// and a fresh client with freshly read credentials is the only recovery.
+func fatalFetchErr(fe kgo.FetchError) bool {
+	if errors.Is(fe.Err, kgo.ErrClientClosed) {
+		return true
+	}
+	if fe.Topic != "" {
+		return false
+	}
+	if gs := (*kgo.ErrGroupSession)(nil); errors.As(fe.Err, &gs) {
+		return false
+	}
+	ke := (*kerr.Error)(nil)
+	return errors.As(fe.Err, &ke) && !ke.Retriable
 }
 
 func (s *kafkaSource) commit(ctx context.Context) error {

@@ -198,12 +198,22 @@ type Tailer struct {
 	// while the run is plainly not a first one.
 	hadStoredCheckpoints bool
 
+	// hopsUnsaved: at least one rotation hop this sweep recorded a segment that
+	// no save has persisted. The sweep saves once at its end rather than once
+	// per hop (see reopen).
+	hopsUnsaved bool
+
 	lastIdleScan   time.Time
 	lastFlush      time.Time
 	lastCheckpoint time.Time
 	retryBackoff   time.Duration // initial export retry backoff
 	resolveBudget  time.Duration // ceiling on one sweep's metadata resolutions
 	shutdownBudget time.Duration // ceiling on the final sweep+drain+flush
+	// segmentStallLimit bounds how long one segment's replay may make no
+	// progress before it is given up on (chargeStall). A duration rather than a
+	// pass count because the pass rate is the sweep rate, which ranges from the
+	// poll interval to ~20/s under event-driven load.
+	segmentStallLimit time.Duration
 
 	// status is the published per-file snapshot for /debug/tailer (written by
 	// the sweep goroutine in publishStatus, read from HTTP handlers).
@@ -247,6 +257,12 @@ const defaultResolveBudget = 5 * time.Second
 // that runs after the tailer stops: the final log-metrics window, span metrics,
 // self-metrics and the disk-buffer drain.
 const defaultShutdownBudget = 10 * time.Second
+
+// defaultSegmentStallLimit is how long a rotated segment's replay may make no
+// progress before the file gives up on it and resumes collecting. Generous: an
+// EMFILE or an EACCES from a runtime mid-rotation is worth waiting out, and the
+// alternative to waiting is losing those lines.
+const defaultSegmentStallLimit = 2 * time.Minute
 
 // New creates a Tailer.
 func New(cfg Config) *Tailer {
@@ -304,14 +320,15 @@ func New(cfg Config) *Tailer {
 		// Until a scan runs, treat the listing as good: a save before any
 		// discovery has nothing to prune anyway, and starting false would make
 		// the very first save copy the whole stored map back.
-		lastListingOK:  true,
-		sources:        sources,
-		scanDirs:       scanDirs,
-		files:          make(map[string]*file),
-		retryBackoff:   time.Second,
-		resolveBudget:  defaultResolveBudget,
-		shutdownBudget: defaultShutdownBudget,
-		statusEvery:    10 * time.Second,
+		lastListingOK:     true,
+		sources:           sources,
+		scanDirs:          scanDirs,
+		files:             make(map[string]*file),
+		retryBackoff:      time.Second,
+		resolveBudget:     defaultResolveBudget,
+		shutdownBudget:    defaultShutdownBudget,
+		segmentStallLimit: defaultSegmentStallLimit,
+		statusEvery:       10 * time.Second,
 	}
 }
 
@@ -542,8 +559,21 @@ func (t *Tailer) sweep(ctx context.Context, all bool) {
 			continue
 		}
 		f.dirty = false
-		if err := t.readFile(ctx, f); err != nil && !errors.Is(err, os.ErrNotExist) {
-			t.log.Warn("reading log file", "path", path, "error", err)
+		if err := t.readFile(ctx, f); err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				// The path no longer resolves. This is the gone-detection for
+				// every file discovery skips the stat for (claimPath /
+				// file.swept), and it covers a shape discovery's LISTING cannot
+				// see at all: /var/log/containers/*.log are symlinks, and a
+				// readdir-based glob keeps listing a dangling one forever. Take
+				// the gone path — drain what is left behind our fd, export it,
+				// and release once the offsets commit. A path merely absent for
+				// an instant (a rename+recreate rotation caught mid-sweep) is
+				// resurrected by the gone branch's own stat next sweep.
+				f.gone = true
+			} else {
+				t.log.Warn("reading log file", "path", path, "error", err)
+			}
 		}
 		// Age out fragment runs and multi-line groups that never completed.
 		//
@@ -583,5 +613,11 @@ func (t *Tailer) sweep(ctx context.Context, all bool) {
 		if len(t.batch) >= t.cfg.BatchSize {
 			t.flush(ctx)
 		}
+	}
+	if t.hopsUnsaved {
+		// One save for every rotation this sweep handled, instead of one per
+		// hop — see reopen for why that still closes the crash window the
+		// per-hop save was added for.
+		t.saveCheckpoints()
 	}
 }

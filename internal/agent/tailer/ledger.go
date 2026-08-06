@@ -164,6 +164,11 @@ type file struct {
 	// never retire: its fd stayed held and its checkpoint Prefix entry was
 	// rewritten on every save, forever.
 	exportedHighs map[int]int64
+	// hopUnsaved: a rename rotation recorded a segment for this file that no
+	// save has persisted yet. A second hop while it is set forces the save
+	// (reopen), because the intermediate inode is the one a restart has no
+	// route back to; the sweep's closing save clears it.
+	hopUnsaved bool
 	// discarding marks the remainder of an oversized unterminated line: the
 	// accumulated prefix was dropped (see consume), and everything up to the
 	// line's eventual newline is part of the same line, not a record.
@@ -434,6 +439,10 @@ type segment struct {
 	// checkpointed: it describes pipeline state, so a purge (ledger.reset)
 	// zeroes it and the replay re-reads from committed.
 	fedTo int64
+	// stalledSince is when this segment's replay last made no progress at all
+	// (see chargeStall); zero while it is advancing. It bounds how long the
+	// LIVE TAIL may stay gated behind a source that will not open.
+	stalledSince time.Time
 	// fd is the rotated inode's still-open handle, kept while the segment is
 	// incomplete: the runtime prunes rotated files on its own schedule (a
 	// bounded rotation count), and once it does, findRotated cannot resolve

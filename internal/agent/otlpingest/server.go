@@ -343,6 +343,14 @@ func grpcForwardStatus(err error) error {
 	// 401/403/404 windows, timeouts, unclassified failures — is retryable: the
 	// receiver is a proxy, and the sender retrying is the safe default.
 	if otlpexport.IsPermanent(err) {
+		// Already the answer this function would build (the trace tier's receive
+		// guard returns exactly this): relay it verbatim. Re-wrapping rendered
+		// the sender `code = InvalidArgument desc = rpc error: code =
+		// InvalidArgument desc = …`, burying the reason it needs one nesting deep
+		// inside the field it reads first.
+		if st, ok := status.FromError(err); ok && st.Code() == codes.InvalidArgument {
+			return err
+		}
 		return status.Error(codes.InvalidArgument, err.Error())
 	}
 	if st, ok := status.FromError(err); ok && retryableStatus(st) {

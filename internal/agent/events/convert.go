@@ -112,11 +112,58 @@ func reportingComponent(e *corev1.Event) string {
 	return e.Source.Component
 }
 
-// resource builds the involved object's resource, plus a grouping key. A Pod
-// resolves through the metadata service to its full identity (tombstones keep
-// events about just-deleted pods resolvable); anything else gets the
-// identity the event itself carries.
+// maxResCache bounds the per-batch resource memo. It is cleared with the batch
+// (settle) and on a stream restart, but a collector outage settles nothing, so
+// it needs a bound of its own; past it the memo starts a fresh generation
+// rather than growing alongside a batch that is itself capped.
+const maxResCache = 1024
+
+// resource returns the involved object's resource and a grouping key,
+// memoized by that key for the life of the batch.
+//
+// The memo is not an optimisation of a per-event decision — there is no
+// per-event decision to make. logchain.Groups.Get fills a group's resource
+// from the FIRST entry that lands in it, so every later entry's freshly built
+// resource was discarded unread; retained heap was FLAT in the number of
+// distinct involved objects. Repeats dominate this pipeline by design:
+// Kubernetes aggregates recurrences into ONE object re-sent as Modified, which
+// is the "BackOff x47" case handle exists to catch. Measured at 1012 B and
+// ~2.1 µs per build, a 256-event flush over 32 pods wasted 224 of them.
 func (r *Reader) resource(ctx context.Context, e *corev1.Event) (string, pcommon.Resource) {
+	obj := e.InvolvedObject
+	key := resourceKey(&obj)
+	if res, ok := r.resCache[key]; ok {
+		return key, res
+	}
+	res := r.buildResource(ctx, e)
+	if r.resCache == nil {
+		r.resCache = make(map[string]pcommon.Resource, 8)
+	} else if len(r.resCache) >= maxResCache {
+		clear(r.resCache)
+	}
+	r.resCache[key] = res
+	return key, res
+}
+
+// resourceKey identifies the involved object. Two events about one object
+// share a ResourceLogs — and, through the memo above, one built resource.
+func resourceKey(obj *corev1.ObjectReference) string {
+	var key strings.Builder
+	key.WriteString(obj.Kind)
+	key.WriteByte('\x00')
+	key.WriteString(obj.Namespace)
+	key.WriteByte('\x00')
+	key.WriteString(obj.Name)
+	key.WriteByte('\x00')
+	key.WriteString(string(obj.UID))
+	return key.String()
+}
+
+// buildResource resolves the involved object's identity. A Pod resolves
+// through the metadata service to its full identity (tombstones keep events
+// about just-deleted pods resolvable); anything else gets the identity the
+// event itself carries.
+func (r *Reader) buildResource(ctx context.Context, e *corev1.Event) pcommon.Resource {
 	obj := e.InvolvedObject
 	res := pcommon.NewResource()
 	// No .Node: the node an event is ABOUT is a property of the involved
@@ -154,18 +201,7 @@ func (r *Reader) resource(ctx context.Context, e *corev1.Event) (string, pcommon
 		}
 	}
 	r.cfg.Attrs.Build(res, actx)
-
-	// Group by the resolved identity, not by the raw event: two events about
-	// one pod share a ResourceLogs.
-	var key strings.Builder
-	key.WriteString(obj.Kind)
-	key.WriteByte('\x00')
-	key.WriteString(obj.Namespace)
-	key.WriteByte('\x00')
-	key.WriteString(obj.Name)
-	key.WriteByte('\x00')
-	key.WriteString(string(obj.UID))
-	return key.String(), res
+	return res
 }
 
 // convert groups the batch into one ResourceLogs per involved object. The

@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/JohanLindvall/kubescrape/internal/obs"
 	dto "github.com/prometheus/client_model/go"
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/pmetric"
@@ -19,7 +20,7 @@ import (
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
-func protoBody(t *testing.T, families ...*dto.MetricFamily) []byte {
+func protoBody(t testing.TB, families ...*dto.MetricFamily) []byte {
 	t.Helper()
 	var out []byte
 	var lenBuf [binary.MaxVarintLen64]byte
@@ -538,7 +539,7 @@ func TestProtoClassicSampleCountAccurate(t *testing.T) {
 		NativeHistograms: true, Targets: staticTargets{testTarget(srv.URL)}, Exporter: exp, StartTime: time.Now()})
 
 	// 3 real samples (1 counter + 2 gauges); scrapeProto reports the count.
-	got, err := s.scrapeProto(context.Background(), strings.NewReader(string(body)), newBatcher(func(pcommon.Resource) {}, time.Now(), time.Now()), nil, "t")
+	got, err := s.scrapeProto(context.Background(), strings.NewReader(string(body)), newBatcher(func(pcommon.Resource) {}, time.Now(), time.Now()), nil, "t", "t")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -605,6 +606,273 @@ func TestProtoHistogramWithNoHistogramSubmessage(t *testing.T) {
 			}
 			if !sawCounter {
 				t.Error("the family after the malformed one was not converted: the exposition aborted")
+			}
+		})
+	}
+}
+
+// conv.finish() emits through the converter's own exportIfFull hook, so it can
+// ship the whole chunk itself and return with nothing left. flushIfFull then
+// exported an EMPTY payload — a wasted OTLP RPC, and a wasted durable record
+// with -buffer-dir. The three sibling export sites all guard.
+func TestProtoFlushDoesNotExportEmptyChunks(t *testing.T) {
+	classic := &dto.MetricFamily{
+		Name: ptr("rpc_latency_seconds"),
+		Type: dto.MetricType_HISTOGRAM.Enum(),
+		Metric: []*dto.Metric{{
+			Histogram: &dto.Histogram{
+				SampleCount: ptr(uint64(4)), SampleSum: ptr(1.5),
+				Bucket: []*dto.Bucket{
+					{UpperBound: ptr(0.5), CumulativeCount: ptr(uint64(3))},
+					{UpperBound: ptr(math.Inf(1)), CumulativeCount: ptr(uint64(4))},
+				},
+			},
+		}},
+	}
+	native := &dto.MetricFamily{
+		Name: ptr("io_latency_seconds"),
+		Type: dto.MetricType_HISTOGRAM.Enum(),
+		Metric: []*dto.Metric{{
+			Histogram: &dto.Histogram{
+				SampleCount: ptr(uint64(3)), SampleSum: ptr(0.9),
+				Schema: ptr(int32(2)), ZeroThreshold: ptr(1e-9), ZeroCount: ptr(uint64(1)),
+				PositiveSpan:  []*dto.BucketSpan{{Offset: ptr(int32(1)), Length: ptr(uint32(1))}},
+				PositiveDelta: []int64{2},
+			},
+		}},
+	}
+	body := protoBody(t, classic, native)
+
+	exp := &captureExporter{}
+	s := New(Config{
+		Node: "n1", Interval: time.Hour, Timeout: 5 * time.Second,
+		NativeHistograms: true, BatchPoints: 1,
+		Targets:  staticTargets{},
+		Exporter: exp, StartTime: time.Now(),
+	})
+	cb := newBatcher(func(pcommon.Resource) {}, time.Now(), time.Now())
+	if _, err := s.scrapeProto(context.Background(), strings.NewReader(string(body)), cb, nil, "t", "t"); err != nil {
+		t.Fatal(err)
+	}
+	if len(exp.batches) == 0 {
+		t.Fatal("nothing exported")
+	}
+	for i, md := range exp.batches {
+		if md.DataPointCount() == 0 {
+			t.Fatalf("export %d of %d carried no data points", i+1, len(exp.batches))
+		}
+	}
+}
+
+// protoConvert runs one protobuf exposition through the protobuf front and
+// returns the exported metrics by name plus the malformed count — which
+// scrapeProtoFamilies' full-scrape path cannot show.
+func protoConvert(t *testing.T, families ...*dto.MetricFamily) (map[string]pmetric.Metric, int) {
+	t.Helper()
+	body := protoBody(t, families...)
+	exp := &captureExporter{}
+	s := New(Config{
+		Node: "n1", Interval: time.Hour, Timeout: 5 * time.Second,
+		NativeHistograms: true, Targets: staticTargets{},
+		Exporter: exp, StartTime: time.Now(),
+	})
+	cb := newBatcher(func(pcommon.Resource) {}, time.Now(), time.Now())
+	ss := s.newScrapeSession(context.Background(), cb, pipelineTargets, "t", "t", nil, true)
+	malformed, err := s.parseProtoAndExport(ss, strings.NewReader(string(body)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cb.count() > 0 {
+		if err := ss.export(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	out := map[string]pmetric.Metric{}
+	for _, md := range exp.batches {
+		rms := md.ResourceMetrics()
+		for i := range rms.Len() {
+			ms := rms.At(i).ScopeMetrics().At(0).Metrics()
+			for j := range ms.Len() {
+				out[ms.At(j).Name()] = ms.At(j)
+			}
+		}
+	}
+	return out, malformed
+}
+
+// dto's *_float count fields override their integer counterparts ("Overrides
+// sample_count if > 0"), which is how a FLOAT histogram carries its counts —
+// classic buckets included. Reading the integer fields turned every observation
+// of such a target into a zero, with nothing counted: the series was alive and
+// empty.
+func TestProtoClassicHistogramFloatCounts(t *testing.T) {
+	fam := &dto.MetricFamily{
+		Name: ptr("rpc_latency_seconds"),
+		Type: dto.MetricType_HISTOGRAM.Enum(),
+		Metric: []*dto.Metric{{
+			Histogram: &dto.Histogram{
+				SampleCountFloat: ptr(6.5),
+				SampleSum:        ptr(1.5),
+				Bucket: []*dto.Bucket{
+					{UpperBound: ptr(1.0), CumulativeCount: ptr(uint64(0)), CumulativeCountFloat: ptr(2.5)},
+					{UpperBound: ptr(5.0), CumulativeCount: ptr(uint64(0)), CumulativeCountFloat: ptr(6.5)},
+				},
+			},
+		}},
+	}
+	got, malformed := protoConvert(t, fam)
+	m, ok := got["rpc_latency_seconds"]
+	if !ok {
+		t.Fatalf("family missing; got %v", slices.Sorted(maps.Keys(got)))
+	}
+	if malformed != 0 {
+		t.Fatalf("malformed = %d, want 0", malformed)
+	}
+	dp := m.Histogram().DataPoints().At(0)
+	if dp.Count() != 6 {
+		t.Errorf("count = %d, want 6 (sample_count_float overrides the zero integer field)", dp.Count())
+	}
+	if b := dp.ExplicitBounds().AsRaw(); !slices.Equal(b, []float64{1, 5}) {
+		t.Errorf("bounds = %v, want [1 5]", b)
+	}
+	if c := dp.BucketCounts().AsRaw(); !slices.Equal(c, []uint64{2, 4, 0}) {
+		t.Errorf("bucket counts = %v, want [2 4 0]: cumulative_count_float overrides the zero integer field", c)
+	}
+}
+
+// The same override on the GAUGE_HISTOGRAM branch, which ships its buckets as
+// gauges: a float gauge histogram got a correct _gcount beside all-zero buckets.
+func TestProtoGaugeHistogramFloatBucketCounts(t *testing.T) {
+	fam := &dto.MetricFamily{
+		Name: ptr("cache_entries"),
+		Type: dto.MetricType_GAUGE_HISTOGRAM.Enum(),
+		Metric: []*dto.Metric{{
+			Histogram: &dto.Histogram{
+				SampleCountFloat: ptr(6.5),
+				SampleSum:        ptr(1.5),
+				Bucket: []*dto.Bucket{
+					{UpperBound: ptr(1.0), CumulativeCount: ptr(uint64(0)), CumulativeCountFloat: ptr(2.5)},
+					{UpperBound: ptr(math.Inf(1)), CumulativeCount: ptr(uint64(0)), CumulativeCountFloat: ptr(6.5)},
+				},
+			},
+		}},
+	}
+	got, _ := protoConvert(t, fam)
+	m, ok := got["cache_entries_bucket"]
+	if !ok {
+		t.Fatalf("bucket rows missing; got %v", slices.Sorted(maps.Keys(got)))
+	}
+	dps := m.Gauge().DataPoints()
+	if dps.Len() != 2 {
+		t.Fatalf("bucket rows = %d, want 2", dps.Len())
+	}
+	for i := range dps.Len() {
+		if dps.At(i).DoubleValue() == 0 {
+			le, _ := dps.At(i).Attributes().Get("le")
+			t.Errorf("bucket le=%v carries 0: the integer field was read, not cumulative_count_float", le.AsString())
+		}
+	}
+	if v := got["cache_entries_gcount"].Gauge().DataPoints().At(0).DoubleValue(); v != 6.5 {
+		t.Errorf("_gcount = %v, want 6.5", v)
+	}
+}
+
+// An NHCB message (schema -53) span-encodes its counts and puts the BOUNDS in
+// custom_values, which this client_model does not generate — so there is
+// nothing to convert. Falling through to the classic branch shipped an OTLP
+// Histogram with no bounds and one overflow bucket: a correct count and sum
+// beside a distribution every histogram_quantile reads as nonsense, and nothing
+// counted. The loss must be visible, and the rest of the exposition must
+// survive it.
+func TestProtoNHCBIsRefusedRatherThanShippedBucketless(t *testing.T) {
+	nhcb := &dto.MetricFamily{
+		Name: ptr("rpc_latency_seconds"),
+		Type: dto.MetricType_HISTOGRAM.Enum(),
+		Metric: []*dto.Metric{{
+			Histogram: &dto.Histogram{
+				SampleCount: ptr(uint64(6)), SampleSum: ptr(1.5),
+				Schema:        ptr(int32(-53)),
+				PositiveSpan:  []*dto.BucketSpan{{Offset: ptr(int32(0)), Length: ptr(uint32(2))}},
+				PositiveDelta: []int64{2, 2},
+			},
+		}},
+	}
+	after := &dto.MetricFamily{
+		Name:   ptr("http_requests_total"),
+		Type:   dto.MetricType_COUNTER.Enum(),
+		Metric: []*dto.Metric{{Counter: &dto.Counter{Value: ptr(7.0)}}},
+	}
+	got, malformed := protoConvert(t, nhcb, after)
+	if m, ok := got["rpc_latency_seconds"]; ok {
+		dp := m.Histogram().DataPoints().At(0)
+		t.Errorf("NHCB shipped as a histogram with bounds %v and counts %v: its bounds are not on the wire",
+			dp.ExplicitBounds().AsRaw(), dp.BucketCounts().AsRaw())
+	}
+	if malformed != 1 {
+		t.Errorf("malformed = %d, want 1: the refusal must be counted", malformed)
+	}
+	if _, ok := got["http_requests_total"]; !ok {
+		t.Error("the family after the NHCB one was not converted")
+	}
+}
+
+// isNative/isNHCB are evaluated per Metric, but the OTLP TYPE is per metric
+// NAME: a family whose children mix representations used to have its type fixed
+// by whichever converted first, and the other child's points were then dropped
+// by the batcher's type guard — moving only the unlabelled collision counter, so
+// a whole child could vanish with nothing naming it. The family resolves once,
+// native wins, and the loser is counted with a pipeline label.
+func TestProtoMixedHistogramFamilyResolvesOnceAndCountsTheLoser(t *testing.T) {
+	nativeChild := &dto.Metric{
+		Label: []*dto.LabelPair{{Name: ptr("svc"), Value: ptr("a")}},
+		Histogram: &dto.Histogram{
+			SampleCount: ptr(uint64(3)), SampleSum: ptr(0.9),
+			Schema: ptr(int32(2)), ZeroThreshold: ptr(1e-9), ZeroCount: ptr(uint64(1)),
+			PositiveSpan:  []*dto.BucketSpan{{Offset: ptr(int32(1)), Length: ptr(uint32(1))}},
+			PositiveDelta: []int64{2},
+		},
+	}
+	classicChild := &dto.Metric{
+		Label: []*dto.LabelPair{{Name: ptr("svc"), Value: ptr("b")}},
+		Histogram: &dto.Histogram{
+			SampleCount: ptr(uint64(4)), SampleSum: ptr(1.5),
+			Bucket: []*dto.Bucket{
+				{UpperBound: ptr(0.5), CumulativeCount: ptr(uint64(3))},
+				{UpperBound: ptr(math.Inf(1)), CumulativeCount: ptr(uint64(4))},
+			},
+		},
+	}
+	for _, tc := range []struct {
+		name    string
+		metrics []*dto.Metric
+	}{
+		{"native first", []*dto.Metric{nativeChild, classicChild}},
+		{"classic first", []*dto.Metric{classicChild, nativeChild}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fam := &dto.MetricFamily{Name: ptr("h"), Type: dto.MetricType_HISTOGRAM.Enum(), Metric: tc.metrics}
+			beforeMixed := obs.ScrapeHistogramMixed.WithLabelValues(pipelineTargets, "classic").Value()
+			beforeCollisions := obs.ScrapeCollisions.Value()
+
+			got, malformed := protoConvert(t, fam)
+			m, ok := got["h"]
+			if !ok {
+				t.Fatalf("family missing; got %v", slices.Sorted(maps.Keys(got)))
+			}
+			if m.Type() != pmetric.MetricTypeExponentialHistogram {
+				t.Fatalf("type = %v, want the native representation to carry the family whatever the child order", m.Type())
+			}
+			if n := m.ExponentialHistogram().DataPoints().Len(); n != 1 {
+				t.Fatalf("exponential points = %d, want 1 (the native child)", n)
+			}
+			if malformed != 0 {
+				t.Errorf("malformed = %d, want 0: a mixed family is not malformed exposition", malformed)
+			}
+			if got := obs.ScrapeHistogramMixed.WithLabelValues(pipelineTargets, "classic").Value() - beforeMixed; got != 1 {
+				t.Errorf("dropped classic representations counted = %v, want 1", got)
+			}
+			if got := obs.ScrapeCollisions.Value() - beforeCollisions; got != 0 {
+				t.Errorf("name collisions = %v, want 0: the drop must be attributed, not left to the type guard", got)
 			}
 		})
 	}

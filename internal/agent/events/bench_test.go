@@ -87,6 +87,25 @@ func BenchmarkIngest(b *testing.B) {
 	}
 }
 
+// BenchmarkIngestAtCap is the admission cost once the batch is at retainCap
+// and every arriving event has to shed, with a rendered prefix frozen by a
+// failed flush. The shed's memmove dominates it, which is what shedChunk
+// amortises; this is the binding cost of an outage now that a failed export no
+// longer tears the watch down and throttles arrivals.
+func BenchmarkIngestAtCap(b *testing.B) {
+	r := New(Config{Meta: fakeMeta{pod: benchPod()}, Exporter: &captureExporter{}, BatchSize: 1 << 30})
+	ctx := context.Background()
+	e := benchEvent()
+	for len(r.batch) < r.retainCap() {
+		r.ingest(ctx, e)
+	}
+	r.rendered = 512 // the prefix a failed flush froze
+	b.ReportAllocs()
+	for b.Loop() {
+		r.ingest(ctx, e)
+	}
+}
+
 // BenchmarkConvert renders a realistic flush: 256 events across 32 involved
 // pods, grouped into per-object ResourceLogs. convert only reads the batch,
 // so one ingested batch serves every iteration.

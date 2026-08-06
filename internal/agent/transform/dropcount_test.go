@@ -10,6 +10,8 @@ package transform
 // "a node's logs gone with no error logged and no counter moved".
 
 import (
+	"context"
+	"errors"
 	"testing"
 
 	"go.opentelemetry.io/collector/pdata/plog"
@@ -32,9 +34,11 @@ func TestTransformDropsAreCounted(t *testing.T) {
 		}
 
 		before := obs.TransformDropped.WithLabelValues("logs").Value()
-		if err := prog.runLogs(ld); err != nil {
+		dropped, err := prog.runLogs(ld)
+		if err != nil {
 			t.Fatal(err)
 		}
+		prog.countDropped(dropped)
 		if got := obs.TransformDropped.WithLabelValues("logs").Value() - before; got != 3 {
 			t.Fatalf("counted %v dropped log records, want 3", got)
 		}
@@ -76,9 +80,11 @@ def transform(batch):
 		}
 
 		before := obs.TransformDropped.WithLabelValues("metrics").Value()
-		if err := prog.runMetrics(md); err != nil {
+		dropped, err := prog.runMetrics(md)
+		if err != nil {
 			t.Fatal(err)
 		}
+		prog.countDropped(dropped)
 		// whole: 2 points (SetEmptySum in a loop leaves one point), partial: 2.
 		wholePoints := 1
 		if got := obs.TransformDropped.WithLabelValues("metrics").Value() - before; got != float64(wholePoints+2) {
@@ -98,13 +104,67 @@ def transform(batch):
 		}
 
 		before := obs.TransformDropped.WithLabelValues("traces").Value()
-		if err := prog.runTraces(td); err != nil {
+		dropped, err := prog.runTraces(td)
+		if err != nil {
 			t.Fatal(err)
 		}
+		prog.countDropped(dropped)
 		if got := obs.TransformDropped.WithLabelValues("traces").Value() - before; got != 1 {
 			t.Fatalf("counted %v dropped spans, want 1", got)
 		}
 	})
+}
+
+// failNTimesExp fails the first n forwards, then delivers.
+type failNTimesExp struct {
+	capExp
+	failsLeft int
+}
+
+func (f *failNTimesExp) ExportLogs(ctx context.Context, ld plog.Logs) error {
+	if f.failsLeft > 0 {
+		f.failsLeft--
+		return errTransient
+	}
+	return f.capExp.ExportLogs(ctx, ld)
+}
+
+var errTransient = errors.New("collector unavailable")
+
+// Drops are counted once per DELIVERED batch, not once per attempt: a
+// copy-path producer (journald, events) re-offers the same object on a
+// transient failure and every attempt re-copies and re-runs the script, so
+// counting at prune time inflated the counter by one batch's drops per retry
+// — drop volume proportional to outage length, not operator intent.
+func TestTransformDropsNotDoubleCountedAcrossRetries(t *testing.T) {
+	prog, err := Compile([]byte("logs: |\n  def transform(batch):\n      for r in batch:\n          if r.body != \"keep\":\n              r.drop()\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	next := &failNTimesExp{failsLeft: 2}
+	w := Wrap(next, nil, prog)
+	ld := plog.NewLogs()
+	sl := ld.ResourceLogs().AppendEmpty().ScopeLogs().AppendEmpty()
+	for _, body := range []string{"drop", "keep", "drop"} {
+		sl.LogRecords().AppendEmpty().Body().SetStr(body)
+	}
+
+	before := obs.TransformDropped.WithLabelValues("logs").Value()
+	ctx := context.Background()
+	for range 2 { // the producer's transient retries
+		if err := w.ExportLogs(ctx, ld); err == nil {
+			t.Fatal("want transient failure")
+		}
+	}
+	if got := obs.TransformDropped.WithLabelValues("logs").Value() - before; got != 0 {
+		t.Fatalf("counted %v drops across failed attempts; nothing was delivered", got)
+	}
+	if err := w.ExportLogs(ctx, ld); err != nil {
+		t.Fatal(err)
+	}
+	if got := obs.TransformDropped.WithLabelValues("logs").Value() - before; got != 2 {
+		t.Fatalf("counted %v drops after delivery, want 2 (once, not per attempt)", got)
+	}
 }
 
 // A script that drops NOTHING must not move the counter: an alert on this rate
@@ -119,9 +179,11 @@ func TestTransformNoDropsNoCount(t *testing.T) {
 	sl.LogRecords().AppendEmpty().Body().SetStr("a")
 
 	before := obs.TransformDropped.WithLabelValues("logs").Value()
-	if err := prog.runLogs(ld); err != nil {
+	dropped, err := prog.runLogs(ld)
+	if err != nil {
 		t.Fatal(err)
 	}
+	prog.countDropped(dropped)
 	if got := obs.TransformDropped.WithLabelValues("logs").Value() - before; got != 0 {
 		t.Fatalf("counter moved by %v with nothing dropped", got)
 	}

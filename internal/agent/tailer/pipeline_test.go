@@ -655,12 +655,17 @@ func TestBackloggedPRunSurvivesSweepBoundaryWithMultilineOff(t *testing.T) {
 	}
 }
 
-// A capped trace ending on non-accepting continuation lines leaves their FIFO
-// items orphaned: the caps dropped the lines from retention, so no emission
-// remains to run the head-drop against, and the watermark reported the file
-// buffered forever — a gone file never settled (drainGone re-ran every sweep,
-// with the fd, the files-map entry and the checkpoint pinned for the process
-// life). Both stages empty is the proof of orphanhood reconcileFifos keys on.
+// A capped trace ending on non-accepting continuation lines once left their
+// FIFO items orphaned: the caps dropped the lines from retention, so no
+// emission remained to run the head-drop against, and the watermark reported
+// the file buffered forever — a gone file never settled (drainGone re-ran
+// every sweep, with the fd, the files-map entry and the checkpoint pinned for
+// the process life). multiline >= v0.0.11 charges cap-dropped lines to the
+// last emitted entry's Lines (sum(Lines) equals the lines consumed), so the
+// flush's head-drop pops the FIFO exactly and nothing is orphaned any more:
+// the file must settle with the orphan counter UNMOVED. reconcileFifos stays
+// as the backstop for the shapes exact charging cannot reach (the
+// strict-Before same-nanosecond edge), so the counter itself survives.
 func TestGoneFileSettlesDespiteCapDroppedTrailingLines(t *testing.T) {
 	dir := t.TempDir()
 	ctx := context.Background()
@@ -690,7 +695,42 @@ func TestGoneFileSettlesDespiteCapDroppedTrailingLines(t *testing.T) {
 		_, tracked := tl.files[path]
 		return !tracked
 	}, "gone file settled and released")
-	if obs.LogFifoDropped.Value() <= orphansBefore {
-		t.Fatal("orphaned FIFO items were not counted")
+	if got := obs.LogFifoDropped.Value(); got != orphansBefore {
+		t.Fatalf("FIFO items were orphaned (counter moved by %v); exact Lines charging should pop them all", got-orphansBefore)
+	}
+}
+
+// A never-completing group — an exception header followed by endless
+// frame-shaped continuation lines with no quiet gap — must not grow the
+// offset FIFO without bound while pinning `committed` at the group's start:
+// past maxGroupBuffered consumed lines boundGroup force-flushes the (already
+// truncated) group so memory stays bounded and the checkpoint advances.
+func TestNeverCompletingGroupIsBounded(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+	exp := &fakeExporter{}
+	tl := driveMultilineTailer(dir, exp) // MaxEntryBytes: 64
+	tl.scanDir(tl.loadCheckpoints(), true)
+
+	ts := timeNowCRI()
+	lines := make([]string, 0, maxGroupBuffered+6)
+	lines = append(lines, ts+` stdout F Exception in thread "main" java.lang.RuntimeException: boom`)
+	for range maxGroupBuffered + 5 {
+		lines = append(lines, ts+" stdout F \tat com.example.Main.main(Main.java:1)")
+	}
+	writeLog(t, dir, lines...)
+	tl.scanDir(nil, false)
+	tl.sweep(ctx, true)
+	tl.flush(ctx)
+
+	f := tl.files[filepath.Join(dir, logName)]
+	if n := len(f.stStdout.live()); n >= maxGroupBuffered {
+		t.Fatalf("offset FIFO unbounded under a never-completing group: %d live items", n)
+	}
+	if len(exp.get()) == 0 {
+		t.Fatal("no truncated entry emitted for the bounded group")
+	}
+	if f.committed == 0 {
+		t.Fatal("committed still pinned at the group start after the bound flush")
 	}
 }

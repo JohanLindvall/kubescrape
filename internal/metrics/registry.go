@@ -327,6 +327,13 @@ func counterDelta(prev, v float64) float64 {
 	return v
 }
 
+// seriesSnap pairs a series with its rendered snapshot so a failed export can
+// give consumed zero-baseline flags back (rearmInitial).
+type seriesSnap struct {
+	s       *series
+	samples []sample
+}
+
 // Export renders every registered series into one ResourceMetrics carrying
 // the given resource attributes and sends it. The payload is fresh pdata per
 // call and is never retained or re-sent on failure (the next interval renders
@@ -378,17 +385,27 @@ func (r *Registry) Export(ctx context.Context, exp Exporter, res pcommon.Resourc
 	scope := rm.ScopeMetrics().AppendEmpty()
 	setScope(scope, RegistryScopeName)
 	ts := time.Now()
+	var snaps []seriesSnap
 	for _, s := range series {
 		samples := s.snapshot()
 		if len(samples) == 0 {
 			continue
 		}
 		renderSeries(scope, s, samples, ts)
+		snaps = append(snaps, seriesSnap{s, samples})
 	}
 	if rm.ScopeMetrics().At(0).Metrics().Len() == 0 {
 		return nil
 	}
-	return exp.ExportMetrics(ctx, md)
+	err := exp.ExportMetrics(ctx, md)
+	if err != nil {
+		// The Registry has no retention, so a failed export must give each
+		// counter's never-delivered zero baseline back — see rearmInitial.
+		for _, sn := range snaps {
+			sn.s.rearmInitial(sn.samples)
+		}
+	}
+	return err
 }
 
 // Run exports the registry every interval until ctx is done, then once more.

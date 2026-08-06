@@ -188,6 +188,25 @@ type Reader struct {
 	// relist forces the next stream to start from "" (the full TTL backlog)
 	// after the API server dropped our resourceVersion. See expire.
 	relist bool
+	// replaySecured: the current replay's backlog is known FULLY delivered —
+	// a bookmark applied, and the API server only sends bookmarks once the
+	// watcher is caught up. Trivially true for a positioned or live stream.
+	//
+	// While a replay is unsecured, settle HOLDS the position: the backlog
+	// arrives in STORE order, so no commit made mid-replay bounds what is
+	// still to come — committing the rendered prefix's maximum RV positioned
+	// a restarted stream PAST undelivered lower-RV backlog entries (and the
+	// advanced watermark made the next replay's wanted() drop the
+	// undelivered older-timestamp remainder), silent and uncounted loss on
+	// exactly the recovery path. The exported high-water accumulates in
+	// heldWatermark instead and folds in when the replay secures; the cost
+	// of a death mid-replay is a full re-replay — duplicates, which
+	// at-least-once already tolerates, instead of loss.
+	replaySecured bool
+	// heldWatermark is the wall-clamped high-water of what unsecured-replay
+	// flushes exported, folded into the committed watermark by secureReplay.
+	// It survives stream restarts: it only ever names exported entries.
+	heldWatermark time.Time
 	// overflowWarned rate-limits the shedOldest warning to one per process;
 	// obs.EventsOverflowDropped carries the ongoing magnitude.
 	overflowWarned bool
@@ -370,6 +389,7 @@ func (r *Reader) stream(ctx context.Context) error {
 	// cold start-from-beginning); anything else is positioned exactly by the
 	// API server and delivers only what follows.
 	r.replaying = rv == ""
+	r.replaySecured = !r.replaying
 	// Snapshot, not a live read: see replayFrom.
 	//
 	// With SLACK, because the boundary is a maximum over timestamps written by
@@ -461,8 +481,9 @@ func (r *Reader) startResourceVersion(ctx context.Context) (rv string, redeliver
 		// policy does) would silently lose every event between the expired
 		// version and now — precisely the window a relist exists to cover.
 		// The flag is NOT consumed here: a watch attempt that fails before
-		// anything commits must relist again, or the gap is lost after all —
-		// it clears only when a commit secures the replay (settle/bookmark).
+		// the replay is secured must relist again, or the gap is lost after
+		// all — it clears only when a BOOKMARK proves the backlog fully
+		// delivered (secureReplay; settle holds all commits until then).
 		return "", true, nil
 	}
 	if r.cfg.StartMode == StartBeginning {
@@ -533,6 +554,7 @@ func (r *Reader) handle(ctx context.Context, ev watch.Event) error {
 			if len(r.batch) == 0 {
 				r.committed.ResourceVersion = o.ResourceVersion
 				r.relist = false // a bookmark covers everything before it
+				r.secureReplay()
 			}
 		}
 		return nil
@@ -707,7 +729,11 @@ func (r *Reader) settle(newest entry, covered int) {
 	// per involved object on the next flush and keeps a settled object's
 	// resource from outliving the entries that referenced it.
 	clear(r.resCache)
-	if newest.rv != "" && newerRV(newest.rv, r.committed.ResourceVersion) {
+	// See replaySecured: a mid-replay commit positions a restarted stream
+	// past backlog the store-order replay has not delivered yet, so the
+	// position holds until a bookmark proves the backlog complete.
+	unsecured := r.replaying && !r.replaySecured
+	if !unsecured && newest.rv != "" && newerRV(newest.rv, r.committed.ResourceVersion) {
 		r.committed.ResourceVersion = newest.rv
 	}
 	// A bookmark seen while the batch was pending is covered only when this
@@ -728,19 +754,28 @@ func (r *Reader) settle(newest entry, covered int) {
 			r.committed.ResourceVersion = r.pendingRV
 		}
 		r.pendingRV = ""
+		// The bookmark proves the backlog fully delivered — this flush's own
+		// watermark may now commit directly (recomputed below).
+		r.secureReplay()
 	}
-	if newest.when.After(r.committed.Watermark) {
-		// Clamp to wall clock first. The watermark is a running MAXIMUM over
-		// event timestamps written by whichever component reported each event,
-		// so one reporter with a fast clock would otherwise latch a boundary in
-		// the future and make the relay filter discard everything until real
-		// time caught up — on the one path whose whole purpose is recovering
-		// events that were never delivered.
+	unsecured = r.replaying && !r.replaySecured
+	// Clamp to wall clock first. The watermark is a running MAXIMUM over
+	// event timestamps written by whichever component reported each event,
+	// so one reporter with a fast clock would otherwise latch a boundary in
+	// the future and make the relay filter discard everything until real
+	// time caught up — on the one path whose whole purpose is recovering
+	// events that were never delivered. The clamp applies to the held
+	// accumulator too — secureReplay folds it in verbatim.
+	mark := &r.committed.Watermark
+	if unsecured {
+		mark = &r.heldWatermark
+	}
+	if newest.when.After(*mark) {
 		if now := r.now(); newest.when.After(now) {
 			newest.when = now
 		}
-		if newest.when.After(r.committed.Watermark) {
-			r.committed.Watermark = newest.when
+		if newest.when.After(*mark) {
+			*mark = newest.when
 		}
 	}
 	if r.committed.ResourceVersion != "" {
@@ -749,6 +784,20 @@ func (r *Reader) settle(newest entry, covered int) {
 		// what the stream delivers from here on is new rather than replayed.
 		r.relist = false
 	}
+}
+
+// secureReplay marks the current replay's backlog fully delivered (a bookmark
+// applied — see replaySecured) and folds the held exported high-water into
+// the committed watermark. Idempotent; a no-op outside a replay.
+func (r *Reader) secureReplay() {
+	if r.replaySecured && r.heldWatermark.IsZero() {
+		return
+	}
+	r.replaySecured = true
+	if r.heldWatermark.After(r.committed.Watermark) {
+		r.committed.Watermark = r.heldWatermark
+	}
+	r.heldWatermark = time.Time{}
 }
 
 // maxRetained bounds the batch across failed flushes, in entries.

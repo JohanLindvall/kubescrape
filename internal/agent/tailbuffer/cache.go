@@ -47,6 +47,7 @@ import (
 
 	"go.opentelemetry.io/collector/pdata/pcommon"
 
+	"github.com/JohanLindvall/kubescrape/internal/agent/tailsample"
 	"github.com/JohanLindvall/kubescrape/internal/obs"
 )
 
@@ -66,9 +67,10 @@ type decisionCache struct {
 
 type decision struct {
 	id pcommon.TraceID
-	// charged is what the deciding evaluation actually SPENT (see the two
-	// lifetimes above), not that it happened.
-	charged bool
+	// charged is WHICH rate buckets the deciding evaluation actually SPENT
+	// (see the two lifetimes above), not that it happened — per bucket, so a
+	// re-decision Peeks only the buckets this trace paid.
+	charged tailsample.ChargedMask
 	keep    bool
 	at      time.Time
 	stale   bool
@@ -89,32 +91,36 @@ func (c *decisionCache) get(id pcommon.TraceID, now time.Time) (keep, ok bool) {
 	return d.keep, true
 }
 
-// charged reports whether a remembered decision for this trace SPENT a rate
-// budget, at any age. It is what a re-decision passes to the evaluator as
-// Trace.Charged, so the budgets are neither billed twice for one trace nor
-// skipped for one that never paid.
-func (c *decisionCache) charged(id pcommon.TraceID) bool {
+// charged reports which rate buckets a remembered decision for this trace
+// SPENT, at any age. It is what a re-decision passes to the evaluator as
+// Trace.Charged, so a bucket is neither billed twice for one trace nor
+// skipped for one the trace never paid it.
+func (c *decisionCache) charged(id pcommon.TraceID) tailsample.ChargedMask {
 	d, ok := c.m[id]
-	return ok && d.charged
+	if !ok {
+		return 0
+	}
+	return d.charged
 }
 
 // put remembers a verdict and whether producing it billed the rate budgets,
 // evicting the oldest entry if the cache is full.
 //
-// The charge bit ACCUMULATES over the entry being replaced; it is not
-// overwritten. A re-decision passes the remembered bit back as Trace.Charged,
-// which makes charge() take its Peek arm — so that evaluation spends nothing and
-// reports Decision.Charged == false BY CONSTRUCTION. Storing that verbatim would
-// forget the payment after exactly one re-decision, and the trace's THIRD window
-// would bill the budgets a second time; the fact is meant to outlive the verdict
-// and be bounded by the capacity alone (see the two lifetimes above). One bit
-// that simply took the caller's value cannot also express "the evaluator REFUSED
-// this trace, so nothing was spent" — that case is the FIRST put for an id,
-// where there is no earlier entry to accumulate over, so the two coexist only
-// because this one ORs.
-func (c *decisionCache) put(id pcommon.TraceID, keep, charged bool, now time.Time) {
+// The charge mask ACCUMULATES over the entry being replaced; it is not
+// overwritten. A re-decision passes the remembered mask back as Trace.Charged,
+// which makes charge() take its Peek arm for those buckets — so that
+// evaluation spends nothing there and reports them unset BY CONSTRUCTION.
+// Storing the new mask verbatim would forget the payment after exactly one
+// re-decision, and the trace's THIRD window would bill the budgets a second
+// time; the fact is meant to outlive the verdict and be bounded by the
+// capacity alone (see the two lifetimes above). A mask that simply took the
+// caller's value could not also express "the evaluator REFUSED this trace, so
+// nothing was spent" — that case is the FIRST put for an id, where there is
+// no earlier entry to accumulate over, so the two coexist only because this
+// one ORs.
+func (c *decisionCache) put(id pcommon.TraceID, keep bool, charged tailsample.ChargedMask, now time.Time) {
 	if old, ok := c.m[id]; ok {
-		charged = charged || old.charged
+		charged |= old.charged
 		old.stale = true // its FIFO slot must not evict the new entry
 		delete(c.m, id)
 	}

@@ -289,11 +289,29 @@ func (s *DynamicMetricSet) groupByResource(ts time.Time) (map[string][]seriesSam
 	return byResource, order
 }
 
-// renderSeries appends one metric and the given samples' data points to scope.
+// renderSeries appends the given samples' data points to scope, reusing the
+// Metric an earlier call for the same name already created: a retained
+// (undelivered) generation and the fresh snapshot of one series render into
+// ONE Metric, because two same-named Metrics in one ScopeMetrics violate
+// OTLP's one-metric-per-name rule and a strict consumer may reject the chunk
+// or dedupe order-dependently. Generations arrive oldest-first (mergeRetry
+// prepends), so a series' points stay in ascending timestamp order. The
+// linear name scan is bounded by the configured metric count.
 func renderSeries(scope pmetric.ScopeMetrics, s *series, samples []sample, ts time.Time) {
-	m := scope.Metrics().AppendEmpty()
-	m.SetName(s.name)
-	m.SetDescription(s.desc)
+	var m pmetric.Metric
+	found := false
+	ms := scope.Metrics()
+	for i := 0; i < ms.Len(); i++ {
+		if ms.At(i).Name() == s.name {
+			m, found = ms.At(i), true
+			break
+		}
+	}
+	if !found {
+		m = ms.AppendEmpty()
+		m.SetName(s.name)
+		m.SetDescription(s.desc)
+	}
 
 	switch s.kind {
 	case kindHistogram:
@@ -301,12 +319,17 @@ func renderSeries(scope pmetric.ScopeMetrics, s *series, samples []sample, ts ti
 	case kindSummary:
 		renderSummary(m, samples, ts)
 	case kindGauge:
-		renderNumber(m.SetEmptyGauge().DataPoints(), samples, ts, false)
+		if m.Type() != pmetric.MetricTypeGauge {
+			m.SetEmptyGauge()
+		}
+		renderNumber(m.Gauge().DataPoints(), samples, ts, false)
 	default: // counter
-		sum := m.SetEmptySum()
-		sum.SetIsMonotonic(true)
-		sum.SetAggregationTemporality(pmetric.AggregationTemporalityCumulative)
-		renderNumber(sum.DataPoints(), samples, ts, true)
+		if m.Type() != pmetric.MetricTypeSum {
+			sum := m.SetEmptySum()
+			sum.SetIsMonotonic(true)
+			sum.SetAggregationTemporality(pmetric.AggregationTemporalityCumulative)
+		}
+		renderNumber(m.Sum().DataPoints(), samples, ts, true)
 	}
 }
 
@@ -362,7 +385,12 @@ func renderNumber(dps pmetric.NumberDataPointSlice, samples []sample, ts time.Ti
 // running count and sum (no quantiles).
 func renderSummary(m pmetric.Metric, samples []sample, ts time.Time) {
 	now := pcommon.Timestamp(ts.UnixNano())
-	dps := m.SetEmptySummary().DataPoints()
+	// Reuse an earlier generation's shape — SetEmptySummary would wipe its
+	// points (see renderSeries).
+	if m.Type() != pmetric.MetricTypeSummary {
+		m.SetEmptySummary()
+	}
+	dps := m.Summary().DataPoints()
 	for _, s := range samples {
 		dp := dps.AppendEmpty()
 		dp.SetStartTimestamp(startOf(s, ts))
@@ -444,8 +472,12 @@ func renderHistogram(m pmetric.Metric, s *series, samples []sample, ts time.Time
 	now := pcommon.Timestamp(ts.UnixNano())
 	bounds := s.buckets[:len(s.buckets)-1] // drop +Inf
 
-	hist := m.SetEmptyHistogram()
-	hist.SetAggregationTemporality(pmetric.AggregationTemporalityCumulative)
+	// Reuse an earlier generation's shape — SetEmpty* would wipe its points
+	// (see renderSeries).
+	if m.Type() != pmetric.MetricTypeHistogram {
+		m.SetEmptyHistogram().SetAggregationTemporality(pmetric.AggregationTemporalityCumulative)
+	}
+	hist := m.Histogram()
 
 	for _, g := range regroupHistogram(samples, len(bounds)) {
 		dp := hist.DataPoints().AppendEmpty()

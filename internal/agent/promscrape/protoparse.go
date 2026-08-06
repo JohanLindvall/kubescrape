@@ -148,6 +148,14 @@ func (s *Scraper) parseProtoAndExport(ss *scrapeSession, body io.Reader) (malfor
 func (s *Scraper) protoFamily(mf *dto.MetricFamily, ss *scrapeSession) (int, error) {
 	malformed := 0
 	name := mf.GetName()
+	// The text front structurally cannot produce a nameless sample (the
+	// grammar rejects the line), but an unset proto `name` decodes cleanly —
+	// with type defaulting to COUNTER — and would export an empty-named OTLP
+	// metric that a downstream OTLP→Prometheus translation rejects
+	// per-series. Reject the family as malformed, mirroring the text front.
+	if name == "" {
+		return len(mf.GetMetric()), nil
+	}
 	// The family's HELP/UNIT ride on every sample, exactly as the text path
 	// carries them from the "# HELP"/"# UNIT" comments.
 	help, unit := mf.GetHelp(), mf.GetUnit()
@@ -182,7 +190,11 @@ func (s *Scraper) protoFamily(mf *dto.MetricFamily, ss *scrapeSession) (int, err
 		}
 	}()
 	for _, m := range mf.GetMetric() {
-		labels := protoLabels(m)
+		labels, ok := protoLabels(m)
+		if !ok {
+			malformed++
+			continue
+		}
 		ts := m.GetTimestampMs()
 		switch typ {
 		case dto.MetricType_COUNTER:
@@ -615,17 +627,23 @@ func decodeSpans(spans []*dto.BucketSpan, deltas []int64, absolute []float64) (c
 	return counts, int32(start - 1), true
 }
 
-// protoLabels converts a metric's label pairs.
-func protoLabels(m *dto.Metric) []Label {
+// protoLabels converts a metric's label pairs. ok is false when a pair has an
+// empty NAME — an unset proto field the text grammar cannot express — which
+// would otherwise become an empty OTLP attribute key; the caller drops the
+// metric as malformed, mirroring the text front's whole-line reject.
+func protoLabels(m *dto.Metric) ([]Label, bool) {
 	lps := m.GetLabel()
 	if len(lps) == 0 {
-		return nil
+		return nil, true
 	}
 	out := make([]Label, 0, len(lps))
 	for _, lp := range lps {
+		if lp.GetName() == "" {
+			return nil, false
+		}
 		out = append(out, Label{Name: lp.GetName(), Value: lp.GetValue()})
 	}
-	return out
+	return out, true
 }
 
 // floatStrings renders the float64 label values of one family — bucket bounds

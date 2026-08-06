@@ -836,6 +836,58 @@ func TestRotationWhileDownPrunedCountsAndRetires(t *testing.T) {
 	}
 }
 
+// A rotation landing in the window where the file is TRACKED but no fd is
+// held — here between a restart's initFile (whose stat still saw the old
+// inode, so no while-down synthesis fired) and the first sweep's ensureOpen;
+// the -logs-idle-close reopen shares the same arm. ensureOpen's replaced path
+// must record the old incarnation as an open-ended segment and recover its
+// unshipped remainder, not silently reset committed to zero (the window
+// widens to minutes when metadata resolution is backing off, exactly when
+// busy pods keep rotating).
+func TestRotationBeforeFirstOpenRecoversCheckpointedRemainder(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+	ckpt := filepath.Join(dir, "positions.json")
+
+	exp := &fakeExporter{}
+	tl := newTestTailer(dir, ckpt, exp)
+	tl.scanDir(tl.loadCheckpoints(), true)
+	writeLog(t, dir, "2026-07-05T10:00:00Z stdout F shipped")
+	tl.scanDir(nil, false)
+	tl.sweep(ctx, true)
+	tl.flush(ctx)
+	tl.saveCheckpoints()
+	if got := exp.get(); !slices.Contains(got, "shipped") {
+		t.Fatalf("precondition: %v", got)
+	}
+
+	// Down: one more line lands on the SAME inode.
+	writeLog(t, dir, "2026-07-05T10:00:01Z stdout F written-while-down")
+
+	// Restart: initFile's stat still sees the checkpointed inode, so no
+	// while-down segment is synthesized...
+	exp2 := &fakeExporter{}
+	tl2 := newTestTailer(dir, ckpt, exp2)
+	tl2.scanDir(tl2.loadCheckpoints(), true)
+	// ...and only NOW does the runtime rotate, before the first sweep opens
+	// the file.
+	rotateAway(t, dir, 1)
+	writeLog(t, dir, "2026-07-05T10:00:02Z stdout F after-rotation")
+
+	driveUntil(t, ctx, tl2, func() bool {
+		got := exp2.get()
+		return slices.Contains(got, "written-while-down") && slices.Contains(got, "after-rotation")
+	}, "checkpointed remainder recovered from the rotated file")
+	f := tl2.files[filepath.Join(dir, logName)]
+	driveUntil(t, ctx, tl2, func() bool { return len(f.segments) == 0 },
+		"synthetic segment retires after recovery")
+	for _, r := range exp2.get() {
+		if r == "shipped" {
+			t.Fatalf("committed prefix re-shipped: %v", exp2.get())
+		}
+	}
+}
+
 // TestSecondRotationKeepsCarriedPrefix: reopen()'s NON-carry branch
 // (tailer.go:1719-1731) does `f.carried = nil` unconditionally before recording
 // the current hop. Any earlier hop's prefix — whose lines are live in the

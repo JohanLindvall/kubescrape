@@ -54,7 +54,7 @@ func TestIterationIsLazyPerRecord(t *testing.T) {
 		prog := mustCompile(t, "logs: |\n  def transform(batch):\n      for r in batch:\n          return\n")
 		ld := benchLogs(n)
 		if got := testing.AllocsPerRun(5, func() {
-			if err := prog.logs.runLogs(ld); err != nil {
+			if _, err := prog.logs.runLogs(ld); err != nil {
 				t.Fatal(err)
 			}
 		}); got > ceiling {
@@ -66,7 +66,7 @@ func TestIterationIsLazyPerRecord(t *testing.T) {
 		prog := mustCompile(t, "traces: |\n  def transform(batch):\n      for s in batch:\n          return\n")
 		td := benchTraces(n)
 		if got := testing.AllocsPerRun(5, func() {
-			if err := prog.traces.runTraces(td); err != nil {
+			if _, err := prog.traces.runTraces(td); err != nil {
 				t.Fatal(err)
 			}
 		}); got > ceiling {
@@ -78,7 +78,7 @@ func TestIterationIsLazyPerRecord(t *testing.T) {
 		prog := mustCompile(t, "metrics: |\n  def transform(batch):\n      for m in batch:\n          for p in m.datapoints:\n              return\n")
 		md := benchMetrics(n)
 		if got := testing.AllocsPerRun(5, func() {
-			if err := prog.metrics.runMetrics(md); err != nil {
+			if _, err := prog.metrics.runMetrics(md); err != nil {
 				t.Fatal(err)
 			}
 		}); got > ceiling {
@@ -106,7 +106,7 @@ func TestIteratedRecordsMayBeRetained(t *testing.T) {
 			lrs.At(i).Attributes().PutStr("keep", "yes")
 		}
 	}
-	if err := prog.logs.runLogs(ld); err != nil {
+	if _, err := prog.logs.runLogs(ld); err != nil {
 		t.Fatal(err)
 	}
 	for i := 0; i < lrs.Len(); i++ {

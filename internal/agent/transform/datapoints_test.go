@@ -44,9 +44,11 @@ def transform(batch):
 	h.SetName("latency")
 	h.SetEmptyHistogram().DataPoints().AppendEmpty()
 
-	if err := prog.runMetrics(md); err != nil {
+	dropped, err := prog.runMetrics(md)
+	if err != nil {
 		t.Fatal(err)
 	}
+	prog.countDropped(dropped)
 
 	pts := md.ResourceMetrics().At(0).ScopeMetrics().At(0).Metrics().At(0).Sum().DataPoints()
 	if pts.Len() != 1 {
@@ -79,9 +81,11 @@ func TestMetricEmptiedByDroppedPointsIsPruned(t *testing.T) {
 	m := md.ResourceMetrics().AppendEmpty().ScopeMetrics().AppendEmpty().Metrics().AppendEmpty()
 	m.SetName("g")
 	m.SetEmptyGauge().DataPoints().AppendEmpty().SetIntValue(1)
-	if err := prog.runMetrics(md); err != nil {
+	dropped, err := prog.runMetrics(md)
+	if err != nil {
 		t.Fatal(err)
 	}
+	prog.countDropped(dropped)
 	if md.ResourceMetrics().Len() != 0 {
 		t.Fatalf("resource metrics = %d, want 0", md.ResourceMetrics().Len())
 	}
@@ -105,9 +109,11 @@ def transform(batch):
 	m := md.ResourceMetrics().AppendEmpty().ScopeMetrics().AppendEmpty().Metrics().AppendEmpty()
 	m.SetName("latency")
 	m.SetEmptyHistogram().DataPoints().AppendEmpty()
-	if err := prog.runMetrics(md); err != nil {
+	dropped, err := prog.runMetrics(md)
+	if err != nil {
 		t.Fatal(err)
 	}
+	prog.countDropped(dropped)
 	got := md.ResourceMetrics().At(0).ScopeMetrics().At(0).Metrics().At(0)
 	if got.Unit() != "s" || got.Description() != "d" {
 		t.Fatalf("unit=%q description=%q", got.Unit(), got.Description())

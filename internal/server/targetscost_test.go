@@ -226,6 +226,36 @@ func TestConflictingMonitorAuthIsCountedNotSilent(t *testing.T) {
 	}
 }
 
+// When the URL HOLDER is bare and a merged contributor's auth was adopted, the
+// served credential belongs to the contributor — a later conflict must be
+// judged (and attributed) against THAT material, and the served target proves
+// whose it is: the old warn named the holder, a monitor with no auth at all.
+func TestAdoptedAuthIsServedAndConflictCounted(t *testing.T) {
+	before := obs.MonitorTargetShadowed.WithLabelValues("podmonitor").Value()
+	srv := twoPodMonitorsWithEndpoints(t, map[string]map[string]any{
+		"pm-a": {"port": "metrics"}, // the holder, bare
+		"pm-b": {"port": "metrics", "bearerTokenSecret": map[string]any{"name": "tok-b", "key": "token"}},
+		"pm-c": {"port": "metrics", "bearerTokenSecret": map[string]any{"name": "tok-c", "key": "token"}},
+	})
+
+	var out struct {
+		Targets []dedupTarget `json:"targets"`
+	}
+	getJSON(t, srv.URL+"/v1/nodes/node1/targets", http.StatusOK, &out)
+	if len(out.Targets) != 1 {
+		t.Fatalf("want exactly one target for one URL, got %+v", out.Targets)
+	}
+	if out.Targets[0].Monitor != "default/pm-a" {
+		t.Errorf("winner = %q, want default/pm-a", out.Targets[0].Monitor)
+	}
+	if got := out.Targets[0].AuthSecret; got != "default/tok-b/token" {
+		t.Errorf("served auth = %q, want the adopted contributor's default/tok-b/token", got)
+	}
+	if got := obs.MonitorTargetShadowed.WithLabelValues("podmonitor").Value() - before; got != 1 {
+		t.Errorf("auth conflicts counted = %v, want 1 (pm-c against the adopted material)", got)
+	}
+}
+
 // The SAME auth declared by both monitors is not a conflict: the served
 // material is exactly what each CR asked for, so nothing is lost and nothing
 // may be counted — a false rate here would send an operator hunting for a

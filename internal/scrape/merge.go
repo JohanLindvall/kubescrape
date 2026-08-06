@@ -46,10 +46,15 @@ import (
 // cluster-wide-monitor shape, and the caller relies on this costing field
 // compares and no allocation (see targetDedup.monitorHolder in
 // internal/server).
-func MergeMonitorEndpoint(t *kubemeta.ScrapeTarget, monitor string, ep *servicemonitors.Endpoint) (authConflict bool) {
+//
+// authAdopted reports that THIS endpoint's auth/TLS group was adopted whole
+// (the holder had none): the serving credential now belongs to this monitor,
+// not the URL-holding one, and the caller records that so a later conflict
+// warning names the monitor whose material is actually served.
+func MergeMonitorEndpoint(t *kubemeta.ScrapeTarget, monitor string, ep *servicemonitors.Endpoint) (authAdopted, authConflict bool) {
 	epAuth := endpointAuth(ep)
 	if len(ep.MetricRelabelings) == 0 && ep.Interval == "" && ep.ScrapeTimeout == "" && epAuth == (authMaterial{}) {
-		return false
+		return false, false
 	}
 	contributed := false
 	// stampEndpoint built t.MetricRelabelings as a fresh copy, so appending
@@ -66,6 +71,7 @@ func MergeMonitorEndpoint(t *kubemeta.ScrapeTarget, monitor string, ep *servicem
 		case authMaterial{}:
 			stampAuth(t, epAuth)
 			contributed = true
+			authAdopted = true
 		case epAuth:
 			// The same material declared twice: served as-is, nothing lost.
 		default:
@@ -75,7 +81,7 @@ func MergeMonitorEndpoint(t *kubemeta.ScrapeTarget, monitor string, ep *servicem
 	if contributed {
 		addContributor(t, monitor)
 	}
-	return authConflict
+	return authAdopted, authConflict
 }
 
 // mergeCadence resolves the interval/scrapeTimeout pair, reporting whether the

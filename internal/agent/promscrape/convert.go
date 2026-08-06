@@ -772,16 +772,20 @@ func fillSummaryPoint(dp pmetric.SummaryDataPoint, acc *summAcc) {
 // pointTS is the sample's own timestamp (ms) or the scrape time when it carried
 // none. Shared by all three batchers and setExemplar.
 func pointTS(tsMs int64, scrapeTS pcommon.Timestamp) pcommon.Timestamp {
-	if tsMs != 0 {
+	if tsMs > 0 {
 		// A ms value beyond this wraps the int64 nanosecond product and would
 		// stamp the point with a wildly wrong time (a far-future timestamp
 		// silently became a 1970s one). Fall back to the scrape time, which is
 		// the same thing an absent timestamp gets.
-		if tsMs > math.MaxInt64/int64(time.Millisecond) || tsMs < math.MinInt64/int64(time.Millisecond) {
+		if tsMs > math.MaxInt64/int64(time.Millisecond) {
 			return scrapeTS
 		}
 		return pcommon.Timestamp(tsMs * int64(time.Millisecond))
 	}
+	// Zero means "no timestamp"; a NEGATIVE one (the classic format's
+	// timestamp is a signed int64, so `foo 1 -1` parses cleanly) is pre-epoch,
+	// which pcommon.Timestamp's unsigned model cannot represent — the uint64
+	// cast turned -1 ms into a year-2554 stamp. Same fallback as absent.
 	return scrapeTS
 }
 

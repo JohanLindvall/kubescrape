@@ -173,7 +173,8 @@ func (c *Config) Validate() error {
 	if !c.Enabled() {
 		return nil
 	}
-	_, _, err := compilePolicies(c.Policies, false)
+	var alloc bucketAlloc
+	_, _, err := compilePolicies(c.Policies, false, &alloc)
 	return err
 }
 
@@ -386,12 +387,17 @@ type Trace struct {
 	// policy and can still be sampled by probabilistic or alwaysSample.
 	Spans []Span
 
-	// Charged says this trace has ALREADY been charged to the budgets by an
-	// earlier decision, so the two policies that spend one (rateLimiting,
-	// composite) must CHECK their bucket instead of spending it again. It is the
-	// earlier decision's Decision.Charged and nothing else — "we decided this
-	// trace before" is a different fact, and a decision the budget REFUSED spent
-	// nothing to protect.
+	// Charged says WHICH rate buckets this trace has ALREADY been charged to
+	// by an earlier decision, so the two policies that spend one (rateLimiting,
+	// composite) must CHECK a bucket whose bit is set instead of spending it
+	// again — and must still SPEND a bucket whose bit is not. It is the earlier
+	// decision's Decision.Charged and nothing else — "we decided this trace
+	// before" is a different fact, and a decision the budget REFUSED spent
+	// nothing to protect. Per BUCKET rather than one bit for all of them,
+	// because with several buckets (a composite's shares, multiple rateLimiting
+	// policies) a single bit let a re-decision Peek a bucket the trace never
+	// paid — admitting its spans free against a budget some OTHER bucket's
+	// spend had set the bit for.
 	//
 	// It exists because assembly is not a single event. An assembler that
 	// remembers a trace was decided but no longer remembers the verdict — a
@@ -406,8 +412,14 @@ type Trace struct {
 	// cannot do is guarantee the SAME verdict as the first decision — the bucket
 	// may have emptied since — which is inherent to a bounded memory of past
 	// decisions, not something this flag makes worse.
-	Charged bool
+	Charged ChargedMask
 }
+
+// ChargedMask records which rate buckets an evaluation SPENT, one bit per
+// bucket in compile order (bucketAlloc). Buckets past the mask's width share
+// the last bit — they degrade to single-bit behaviour among themselves, which
+// no realistic policy list reaches. The zero mask means "spent nothing".
+type ChargedMask uint64
 
 // Decision is the verdict plus its author.
 type Decision struct {
@@ -423,7 +435,7 @@ type Decision struct {
 	// "<composite>/<sub-policy>", precomputed at New so naming the author costs
 	// no allocation.
 	Policy string
-	// Charged reports whether this evaluation actually SPENT a rate budget —
+	// Charged reports WHICH rate buckets this evaluation actually SPENT —
 	// what an assembler must feed back as Trace.Charged if it re-decides this
 	// trace, and nothing else.
 	//
@@ -435,7 +447,7 @@ type Decision struct {
 	// being the one that sampled (a rateLimiting sub-policy inside an `and`
 	// charges before a later sub-policy abstains), which is why this is not
 	// derivable from Policy or Sampled.
-	Charged bool
+	Charged ChargedMask
 }
 
 // Evaluator applies a compiled policy list. Safe for concurrent use.
@@ -458,7 +470,8 @@ func New(cfg Config) (*Evaluator, error) {
 	if len(cfg.Policies) == 0 {
 		return nil, errors.New("tail sampling: no policies configured (an evaluator with no policies drops every trace)")
 	}
-	ps, needClock, err := compilePolicies(cfg.Policies, false)
+	var alloc bucketAlloc
+	ps, needClock, err := compilePolicies(cfg.Policies, false, &alloc)
 	if err != nil {
 		return nil, err
 	}
@@ -487,11 +500,11 @@ func (e *Evaluator) Decide(t Trace) Decision {
 	// spent accumulates across the WHOLE list, not just the deciding policy: a
 	// policy that charged and then abstained (a rateLimiting sub-policy inside an
 	// `and` whose later conjunct did not match) moved its bucket all the same.
-	spent := false
+	spent := ChargedMask(0)
 	for i := range e.policies {
 		p := &e.policies[i]
 		v, sub, s := p.p.eval(t, now)
-		spent = spent || s
+		spent |= s
 		if v == verdictAbstain {
 			continue
 		}

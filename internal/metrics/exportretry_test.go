@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/pmetric"
 )
 
@@ -108,6 +109,91 @@ func TestRetryKeepsOriginalTimestamps(t *testing.T) {
 	}
 	if !got[1] || !got[3] {
 		t.Fatalf("want the retained (1) and fresh (3) generations, got values %v", vals)
+	}
+}
+
+// A retained generation and the fresh snapshot of one series must render into
+// ONE Metric per ScopeMetrics: two same-named Metrics in one scope violate
+// OTLP's one-metric-per-name rule, and a strict consumer may reject the chunk
+// (classified permanent → the samples dropped) or dedupe order-dependently.
+func TestRetryMergesIntoOneMetricPerScope(t *testing.T) {
+	setTimeForTest(time.Unix(1_800_000_000, 0))
+	defer testEpoch.Store(0)
+
+	set, err := newTestSet([]Dynamic{{
+		Name: "dup_total", Type: CounterType, Value: "1", Match: []string{"m=1"},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	add := func() {
+		set.Add(nil, labelsFrom(map[string]string{"m": "1"}), res(map[string]string{"k8s.pod.name": "p"}), "")
+	}
+	add()
+	if err := set.Export(context.Background(), &failingExporter{}, 0); err == nil {
+		t.Fatal("want failure")
+	}
+	add()
+	exp := &capExporter{}
+	if err := set.Export(context.Background(), exp, 0); err != nil {
+		t.Fatal(err)
+	}
+	for _, md := range exp.md {
+		rms := md.ResourceMetrics()
+		for i := 0; i < rms.Len(); i++ {
+			sms := rms.At(i).ScopeMetrics()
+			for j := 0; j < sms.Len(); j++ {
+				ms := sms.At(j).Metrics()
+				names := map[string]int{}
+				for k := 0; k < ms.Len(); k++ {
+					names[ms.At(k).Name()]++
+				}
+				for name, n := range names {
+					if n > 1 {
+						t.Fatalf("metric %q rendered %d times in one ScopeMetrics; generations must merge into one Metric", name, n)
+					}
+				}
+			}
+		}
+	}
+	// Both generations still arrived, as points of the one metric.
+	_, vals := numberPoints(exp.md, "dup_total")
+	got := map[float64]bool{}
+	for _, v := range vals {
+		got[v] = true
+	}
+	if !got[1] || !got[2] {
+		t.Fatalf("want the retained (1) and fresh (2) generations, got values %v", vals)
+	}
+}
+
+// The Registry has no retention, so a FAILED export must give each counter's
+// consumed zero-baseline flag back: without the re-arm, a collector outage at
+// the first self-metrics interval permanently ate the synthetic zero points
+// and increase()/rate() missed every counter's whole first ramp — the exact
+// defect the baselines were added for.
+func TestRegistryFailedExportKeepsCounterBaseline(t *testing.T) {
+	r := NewRegistry()
+	c := r.Counter("test_baseline_total", "d")
+	c.Inc()
+	ctx := context.Background()
+	res := pcommon.NewResource()
+	if err := r.Export(ctx, &failingExporter{}, res); err == nil {
+		t.Fatal("want failure")
+	}
+	exp := &capExporter{}
+	if err := r.Export(ctx, exp, res); err != nil {
+		t.Fatal(err)
+	}
+	_, vals := numberPoints(exp.md, "test_baseline_total")
+	zeros := 0
+	for _, v := range vals {
+		if v == 0 {
+			zeros++
+		}
+	}
+	if zeros != 2 {
+		t.Fatalf("delivered payload carried %d baseline zeros (values %v), want 2 — the failed export consumed them", zeros, vals)
 	}
 }
 

@@ -55,10 +55,8 @@ func (t *Tailer) saveCheckpoints() {
 	for path, cp := range t.checkpoints {
 		cps[path] = cp
 	}
-	t.hopsUnsaved = false
 	for path, f := range t.files {
 		t.extendFingerprint(f)
-		f.hopUnsaved = false
 		cp := checkpoint{
 			Offset: f.committed, Inode: f.inode,
 			FingerprintLen: f.fp.Len, FingerprintHash: f.fp.Hash,
@@ -77,6 +75,16 @@ func (t *Tailer) saveCheckpoints() {
 		cps[path] = cp
 	}
 	if err := t.cfg.Positions.SetLogs(cps); err != nil {
+		// The hop flags stay ARMED: clearing them before the write forfeited
+		// the "one file never carries two unsaved hops" invariant on a failed
+		// save (full disk, read-only mount) — the next rotation of the same
+		// file then no longer forced a save, and a crash lost the
+		// intermediate inode the flag protocol exists to protect.
 		t.log.Warn("writing positions file", "error", err)
+		return
+	}
+	t.hopsUnsaved = false
+	for _, f := range t.files {
+		f.hopUnsaved = false
 	}
 }

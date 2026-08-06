@@ -161,7 +161,16 @@ func (w *Wrapper) TransformLogs(ld plog.Logs) error {
 	if p == nil || p.logs == nil {
 		return nil
 	}
-	return p.logs.runLogs(ld)
+	// Counted at transform time: this seam runs ONCE per built batch (the
+	// tailer's retry loop re-sends the same already-transformed object), so
+	// there is no per-attempt re-run to over-count. A sweep-level rewind
+	// rebuilds the batch from source, which is a fresh transform by design.
+	dropped, err := p.logs.runLogs(ld)
+	if err != nil {
+		return err
+	}
+	p.logs.countDropped(dropped)
+	return nil
 }
 
 // Inner is the exporter below the transform layer, for a producer that
@@ -196,13 +205,21 @@ func (w *Wrapper) ExportLogs(ctx context.Context, ld plog.Logs) error {
 			out = plog.NewLogs()
 			ld.CopyTo(out)
 		}
-		if err := p.logs.runLogs(out); err != nil {
+		dropped, err := p.logs.runLogs(out)
+		if err != nil {
 			return err
 		}
 		if out.ResourceLogs().Len() == 0 {
+			p.logs.countDropped(dropped)
 			return nil // everything dropped: acked, nothing to send
 		}
-		return w.next.ExportLogs(ctx, out)
+		if err := w.next.ExportLogs(ctx, out); err != nil {
+			// Not counted: the producer re-offers the batch and the retry
+			// re-runs the script — see run*'s doc.
+			return err
+		}
+		p.logs.countDropped(dropped)
+		return nil
 	}
 	return w.next.ExportLogs(ctx, ld)
 }
@@ -215,13 +232,19 @@ func (w *Wrapper) ExportMetrics(ctx context.Context, md pmetric.Metrics) error {
 			out = pmetric.NewMetrics()
 			md.CopyTo(out)
 		}
-		if err := p.metrics.runMetrics(out); err != nil {
+		dropped, err := p.metrics.runMetrics(out)
+		if err != nil {
 			return err
 		}
 		if out.ResourceMetrics().Len() == 0 {
+			p.metrics.countDropped(dropped)
 			return nil
 		}
-		return w.next.ExportMetrics(ctx, out)
+		if err := w.next.ExportMetrics(ctx, out); err != nil {
+			return err
+		}
+		p.metrics.countDropped(dropped)
+		return nil
 	}
 	return w.next.ExportMetrics(ctx, md)
 }
@@ -237,13 +260,19 @@ func (w *Wrapper) ExportTraces(ctx context.Context, td ptrace.Traces) error {
 			out = ptrace.NewTraces()
 			td.CopyTo(out)
 		}
-		if err := p.traces.runTraces(out); err != nil {
+		dropped, err := p.traces.runTraces(out)
+		if err != nil {
 			return err
 		}
 		if out.ResourceSpans().Len() == 0 {
+			p.traces.countDropped(dropped)
 			return nil
 		}
-		return w.nextTraces.ExportTraces(ctx, out)
+		if err := w.nextTraces.ExportTraces(ctx, out); err != nil {
+			return err
+		}
+		p.traces.countDropped(dropped)
+		return nil
 	}
 	// No traces script: pass through. Require traces capability only when a
 	// script actually exists, so a logs-only transforms file never forces the

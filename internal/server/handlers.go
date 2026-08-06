@@ -339,9 +339,15 @@ func (s *Server) nodeTargets(node string) (targets []kubemeta.ScrapeTarget, buil
 					// The endpoint's configuration merges into the holder — no
 					// target is materialised either way — and only auth/TLS
 					// material both monitors declare differently is a loss
-					// worth reporting.
-					if scrape.MergeMonitorEndpoint(held, sme.monitor, sme.endpoint) {
-						s.reportAuthConflict("servicemonitor", held.Monitor, sme.monitor, url)
+					// worth reporting, attributed to the monitor whose
+					// material is actually served (which may be a merged
+					// contributor's, not the URL holder's).
+					adopted, conflict := scrape.MergeMonitorEndpoint(held, sme.monitor, sme.endpoint)
+					if adopted {
+						d.adoptedAuth(url, sme.monitor)
+					}
+					if conflict {
+						s.reportAuthConflict("servicemonitor", d.servingAuth(url, held.Monitor), sme.monitor, url)
 					}
 					continue
 				}
@@ -358,8 +364,12 @@ func (s *Server) nodeTargets(node string) (targets []kubemeta.ScrapeTarget, buil
 					continue
 				}
 				if held, taken := d.monitorHolder(url); taken {
-					if scrape.MergeMonitorEndpoint(held, pm.name, ep) {
-						s.reportAuthConflict("podmonitor", held.Monitor, pm.name, url)
+					adopted, conflict := scrape.MergeMonitorEndpoint(held, pm.name, ep)
+					if adopted {
+						d.adoptedAuth(url, pm.name)
+					}
+					if conflict {
+						s.reportAuthConflict("podmonitor", d.servingAuth(url, held.Monitor), pm.name, url)
 					}
 					continue
 				}
@@ -463,17 +473,40 @@ type targetDedup struct {
 	// urlOwner indexes the entry currently HOLDING a URL — the annotation
 	// target, or the monitor one that claimed it.
 	urlOwner map[string]int
+	// authOwner names the monitor whose auth/TLS a URL's target actually
+	// SERVES, when it was ADOPTED from a merged contributor rather than
+	// declared by the URL holder itself (MergeMonitorEndpoint's authAdopted).
+	// The conflict warning names this monitor as "serving" — naming the
+	// holder pointed operators at a monitor with no auth material at all.
+	// Lazily allocated: most pods never merge an auth group.
+	authOwner map[string]string
 }
 
-// reset points the dedup at a fresh pod. The map is reused across pods: it is
+// reset points the dedup at a fresh pod. The maps are reused across pods:
 // allocated once per request rather than once per pod.
 func (d *targetDedup) reset(out *[]kubemeta.ScrapeTarget) {
 	d.out = out
 	if d.urlOwner == nil {
 		d.urlOwner = make(map[string]int, 4)
-		return
+	} else {
+		clear(d.urlOwner)
 	}
-	clear(d.urlOwner)
+	clear(d.authOwner)
+}
+
+// adoptedAuth records/answers who supplies a URL's served auth (see authOwner).
+func (d *targetDedup) adoptedAuth(url, monitor string) {
+	if d.authOwner == nil {
+		d.authOwner = make(map[string]string, 1)
+	}
+	d.authOwner[url] = monitor
+}
+
+func (d *targetDedup) servingAuth(url, holder string) string {
+	if m, ok := d.authOwner[url]; ok {
+		return m
+	}
+	return holder
 }
 
 // monitorHolder returns the MONITOR-derived target already holding a URL, when

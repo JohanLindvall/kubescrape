@@ -73,28 +73,32 @@ func (p *starlarkProgram) run(batch starlark.Value) error {
 	return nil
 }
 
-func (p *starlarkProgram) runLogs(ld plog.Logs) error {
+// run* return the pruned-record count WITHOUT counting it: the caller counts
+// via countDropped only once the batch's journey ends in an ack (a delivered
+// forward, or an emptied payload acked without a send). Counting at prune
+// time inflated kubescrape_transform_dropped_total by one full batch per
+// transient retry for the copy-path producers, which re-offer the same object
+// and re-run the script on a fresh copy every attempt — an operator alerting
+// on the rate saw drop volume proportional to outage length, not intent.
+func (p *starlarkProgram) runLogs(ld plog.Logs) (int, error) {
 	if err := p.run(&logBatch{ld: ld}); err != nil {
-		return err
+		return 0, err
 	}
-	p.countDropped(pruneLogs(ld))
-	return nil
+	return pruneLogs(ld), nil
 }
 
-func (p *starlarkProgram) runMetrics(md pmetric.Metrics) error {
+func (p *starlarkProgram) runMetrics(md pmetric.Metrics) (int, error) {
 	if err := p.run(&metricBatch{md: md}); err != nil {
-		return err
+		return 0, err
 	}
-	p.countDropped(pruneMetrics(md))
-	return nil
+	return pruneMetrics(md), nil
 }
 
-func (p *starlarkProgram) runTraces(td ptrace.Traces) error {
+func (p *starlarkProgram) runTraces(td ptrace.Traces) (int, error) {
 	if err := p.run(&traceBatch{td: td}); err != nil {
-		return err
+		return 0, err
 	}
-	p.countDropped(pruneTraces(td))
-	return nil
+	return pruneTraces(td), nil
 }
 
 // countDropped records what this invocation's drop() calls discarded.

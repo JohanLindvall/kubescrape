@@ -340,8 +340,16 @@ func (t *Tailer) flush(ctx context.Context) {
 		if t.cfg.Transform != nil {
 			err = t.cfg.Transform(ld)
 		}
-		if err == nil && ld.ResourceLogs().Len() > 0 {
-			err = t.exportWithRetry(ctx, ld)
+		if err == nil {
+			// kept becomes the DELIVERED count: a transform may have dropped
+			// records (each already counted into transform_dropped_total), and
+			// kubescrape_log_entries_total means "entries exported" — counting
+			// the pre-transform build size credited records nothing sent. The
+			// offsets still commit for all of them.
+			inf.kept = ld.LogRecordCount()
+			if inf.kept > 0 {
+				err = t.exportWithRetry(ctx, ld)
+			}
 		}
 	}
 	switch {

@@ -14,6 +14,34 @@ import (
 	"github.com/JohanLindvall/multiline/cri"
 )
 
+// maxGroupLines is the trace stage's retained-lines cap (WithMaxLines): a
+// group keeps at most this many lines; further continuation lines are
+// consumed but dropped from retention.
+const maxGroupLines = 512
+
+// maxGroupBuffered bounds a NEVER-COMPLETING group. A workload continuously
+// emitting continuation-shaped lines (an exception header followed by endless
+// frame-shaped output) refreshes the group's staleness stamp on every line,
+// so FlushBefore never fires, while the stage keeps consuming past its caps —
+// the offset FIFO then grows by one item (~56 B) per line forever and
+// `committed` stays pinned at the group's start: the checkpoint freezes (a
+// crash re-ingests the whole window), idle-close is blocked and the lag
+// gauges climb. Past DOUBLE the retention cap the group has already been
+// truncated for maxGroupLines lines, so further buffering buys nothing:
+// boundGroup flushes it — the same truncated entry an eventual flush would
+// emit — and the remainder starts a fresh group.
+const maxGroupBuffered = 2 * maxGroupLines
+
+// boundGroup force-flushes a stream's trace-stage group once its offset FIFO
+// shows it consuming past maxGroupBuffered. Called after every trace-stage
+// feed; the comparison is the entire steady-state cost.
+func (t *Tailer) boundGroup(ctx context.Context, f *file, st *streamState, key string) error {
+	if len(st.live()) < maxGroupBuffered {
+		return nil
+	}
+	return f.traces.Flush(ctx, key)
+}
+
 // newPipeline (re)creates the file's aggregation stages with empty state.
 // Incomplete segments (if any) are no longer present in the fresh pipeline
 // and must be re-read (feedSegments) before the current inode is consumed.
@@ -42,7 +70,7 @@ func (t *Tailer) newPipeline(f *file) {
 	}
 	if ml {
 		f.traces = multiline.New(t.traceEmitFunc(f),
-			multiline.WithMaxBytes(t.cfg.MaxEntryBytes), multiline.WithMaxLines(512))
+			multiline.WithMaxBytes(t.cfg.MaxEntryBytes), multiline.WithMaxLines(maxGroupLines))
 	} else {
 		f.traces = nil
 	}
@@ -141,7 +169,10 @@ func (t *Tailer) criEmitFunc(f *file) func(context.Context, string, string, time
 			return nil
 		}
 		st.push(logItem{start: start, end: end, when: when})
-		return f.traces.AddAt(ctx, key, line, when, when)
+		if err := f.traces.AddAt(ctx, key, line, when, when); err != nil {
+			return err
+		}
+		return t.boundGroup(ctx, f, st, key)
 	}
 }
 
@@ -248,6 +279,9 @@ func (t *Tailer) feedPlainLine(ctx context.Context, f *file, raw string, start, 
 	// special case.
 	f.lastLineTime, f.lastFed = when, when
 	if err := f.traces.AddAt(ctx, plainKey, raw, when, when); err != nil {
+		t.log.Warn("log pipeline", "path", f.path, "error", err)
+	}
+	if err := t.boundGroup(ctx, f, f.stPlain, plainKey); err != nil {
 		t.log.Warn("log pipeline", "path", f.path, "error", err)
 	}
 }

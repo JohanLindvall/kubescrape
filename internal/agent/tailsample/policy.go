@@ -58,7 +58,7 @@ type policy interface {
 	//
 	// now is the single clock reading of this decision, zero when no policy in
 	// the whole list needs one.
-	eval(t Trace, now time.Time) (v verdict, sub string, spent bool)
+	eval(t Trace, now time.Time) (v verdict, sub string, spent ChargedMask)
 }
 
 // namedPolicy pairs a compiled policy with the name a Decision reports. The
@@ -81,7 +81,7 @@ func (n namedPolicy) names() []string {
 // compilePolicies compiles a list and reports whether any policy in it needs a
 // clock. sub marks a nested list (and/composite), where and/composite are
 // themselves refused.
-func compilePolicies(list []PolicyConfig, sub bool) ([]namedPolicy, bool, error) {
+func compilePolicies(list []PolicyConfig, sub bool, alloc *bucketAlloc) ([]namedPolicy, bool, error) {
 	out := make([]namedPolicy, 0, len(list))
 	seen := make(map[string]struct{}, len(list))
 	needClock := false
@@ -94,7 +94,7 @@ func compilePolicies(list []PolicyConfig, sub bool) ([]namedPolicy, bool, error)
 			return nil, false, errPolicy(where, "duplicate policy name %q", pc.Name)
 		}
 		seen[pc.Name] = struct{}{}
-		p, clock, err := compilePolicy(pc, where, sub)
+		p, clock, err := compilePolicy(pc, where, sub, alloc)
 		if err != nil {
 			return nil, false, err
 		}
@@ -118,7 +118,7 @@ func policyWhere(sub bool, i int, name string) string {
 
 // compilePolicy builds one policy and checks that exactly the body matching its
 // type is present.
-func compilePolicy(pc PolicyConfig, where string, sub bool) (policy, bool, error) {
+func compilePolicy(pc PolicyConfig, where string, sub bool, alloc *bucketAlloc) (policy, bool, error) {
 	if pc.Type == "" {
 		return nil, false, errPolicy(where, "type is required (one of %s)", strings.Join(allTypes(), ", "))
 	}
@@ -152,18 +152,18 @@ func compilePolicy(pc PolicyConfig, where string, sub bool) (policy, bool, error
 		p, err := compileProbabilistic(where, pc.Probabilistic)
 		return p, false, err
 	case TypeRateLimiting:
-		p, err := compileRateLimiting(where, pc.RateLimiting)
+		p, err := compileRateLimiting(where, pc.RateLimiting, alloc)
 		return p, true, err
 	case TypeAnd:
 		if sub {
 			return nil, false, errPolicy(where, "%s may not be nested inside and/composite (sub-policies must be leaf types)", TypeAnd)
 		}
-		return compileAnd(where, pc.And)
+		return compileAnd(where, pc.And, alloc)
 	case TypeComposite:
 		if sub {
 			return nil, false, errPolicy(where, "%s may not be nested inside and/composite (sub-policies must be leaf types)", TypeComposite)
 		}
-		p, err := compileComposite(pc.Name, where, pc.Composite)
+		p, err := compileComposite(pc.Name, where, pc.Composite, alloc)
 		return p, true, err
 	default:
 		// Unreachable: knownType gated the switch. Kept so that adding a type
@@ -231,7 +231,9 @@ func checkBody(pc PolicyConfig, where string) error {
 
 type alwaysPolicy struct{}
 
-func (alwaysPolicy) eval(Trace, time.Time) (verdict, string, bool) { return verdictSample, "", false }
+func (alwaysPolicy) eval(Trace, time.Time) (verdict, string, ChargedMask) {
+	return verdictSample, "", 0
+}
 
 // --- latency ----------------------------------------------------------------
 
@@ -264,15 +266,15 @@ func compileLatency(where string, cfg *LatencyConfig) (policy, error) {
 // bound on the real duration whenever assembly is incomplete (see the package
 // doc). A trace with no usable timestamp abstains rather than counting as
 // zero-length: "we cannot tell" is not "it was fast".
-func (p *latencyPolicy) eval(t Trace, _ time.Time) (verdict, string, bool) {
+func (p *latencyPolicy) eval(t Trace, _ time.Time) (verdict, string, ChargedMask) {
 	d, ok := traceDuration(t)
 	if !ok {
-		return verdictAbstain, "", false
+		return verdictAbstain, "", 0
 	}
 	if d >= p.min && d <= p.max {
-		return verdictSample, "", false
+		return verdictSample, "", 0
 	}
-	return verdictAbstain, "", false
+	return verdictAbstain, "", 0
 }
 
 // --- statusCode -------------------------------------------------------------
@@ -309,13 +311,13 @@ func parseStatusCode(s string) (ptrace.StatusCode, error) {
 	return 0, fmt.Errorf("unknown status code %q (want ERROR, OK or UNSET)", s)
 }
 
-func (p *statusPolicy) eval(t Trace, _ time.Time) (verdict, string, bool) {
+func (p *statusPolicy) eval(t Trace, _ time.Time) (verdict, string, ChargedMask) {
 	for i := range t.Spans {
 		if p.mask&(1<<uint(t.Spans[i].Span.Status().Code())) != 0 {
-			return verdictSample, "", false
+			return verdictSample, "", 0
 		}
 	}
-	return verdictAbstain, "", false
+	return verdictAbstain, "", 0
 }
 
 // --- stringAttribute --------------------------------------------------------
@@ -373,7 +375,7 @@ func compileStringAttribute(where string, cfg *StringAttributeConfig) (policy, e
 	return p, nil
 }
 
-func (p *stringAttrPolicy) eval(t Trace, _ time.Time) (verdict, string, bool) {
+func (p *stringAttrPolicy) eval(t Trace, _ time.Time) (verdict, string, ChargedMask) {
 	for i := range t.Spans {
 		v, ok := lookup(t.Spans[i], p.key)
 		if !ok || v.Type() != pcommon.ValueTypeStr {
@@ -383,12 +385,12 @@ func (p *stringAttrPolicy) eval(t Trace, _ time.Time) (verdict, string, bool) {
 		}
 		if p.match(v.Str()) {
 			if p.invert {
-				return verdictVeto, "", false
+				return verdictVeto, "", 0
 			}
-			return verdictSample, "", false
+			return verdictSample, "", 0
 		}
 	}
-	return verdictAbstain, "", false
+	return verdictAbstain, "", 0
 }
 
 func (p *stringAttrPolicy) match(s string) bool {
@@ -482,7 +484,7 @@ func compileNumericAttribute(where string, cfg *NumericAttributeConfig) (policy,
 // otherwise never match a policy that looks correct, and the widening
 // comparison is exact for every magnitude either side can express to within the
 // float's own precision.
-func (p *numericPolicy) eval(t Trace, _ time.Time) (verdict, string, bool) {
+func (p *numericPolicy) eval(t Trace, _ time.Time) (verdict, string, ChargedMask) {
 	for i := range t.Spans {
 		v, ok := lookup(t.Spans[i], p.key)
 		if !ok {
@@ -491,15 +493,15 @@ func (p *numericPolicy) eval(t Trace, _ time.Time) (verdict, string, bool) {
 		switch v.Type() {
 		case pcommon.ValueTypeInt:
 			if n := v.Int(); n >= p.min && n <= p.max {
-				return verdictSample, "", false
+				return verdictSample, "", 0
 			}
 		case pcommon.ValueTypeDouble:
 			if d := v.Double(); d >= float64(p.min) && d <= float64(p.max) {
-				return verdictSample, "", false
+				return verdictSample, "", 0
 			}
 		}
 	}
-	return verdictAbstain, "", false
+	return verdictAbstain, "", 0
 }
 
 // --- booleanAttribute -------------------------------------------------------
@@ -519,14 +521,14 @@ func compileBooleanAttribute(where string, cfg *BooleanAttributeConfig) (policy,
 	return &boolPolicy{key: cfg.Key, want: *cfg.Value}, nil
 }
 
-func (p *boolPolicy) eval(t Trace, _ time.Time) (verdict, string, bool) {
+func (p *boolPolicy) eval(t Trace, _ time.Time) (verdict, string, ChargedMask) {
 	for i := range t.Spans {
 		v, ok := lookup(t.Spans[i], p.key)
 		if ok && v.Type() == pcommon.ValueTypeBool && v.Bool() == p.want {
-			return verdictSample, "", false
+			return verdictSample, "", 0
 		}
 	}
-	return verdictAbstain, "", false
+	return verdictAbstain, "", 0
 }
 
 // --- probabilistic ----------------------------------------------------------
@@ -552,22 +554,40 @@ func compileProbabilistic(where string, cfg *ProbabilisticConfig) (policy, error
 // re-decision after a retry, a restart or late spans reaches the same answer),
 // and the unsalted hash makes this stage NEST with the head sampler rather
 // than compound with it. See tracehash's package doc for the contract.
-func (p *probPolicy) eval(t Trace, _ time.Time) (verdict, string, bool) {
+func (p *probPolicy) eval(t Trace, _ time.Time) (verdict, string, ChargedMask) {
 	if tracehash.Keep(t.TraceID, p.threshold) {
-		return verdictSample, "", false
+		return verdictSample, "", 0
 	}
-	return verdictAbstain, "", false
+	return verdictAbstain, "", 0
+}
+
+// bucketAlloc hands each rate bucket its ChargedMask bit, in compile order.
+// Buckets past the mask's width share the last bit and degrade to the old
+// single-bit behaviour among themselves — no realistic policy list gets there.
+type bucketAlloc int
+
+func (a *bucketAlloc) next() ChargedMask {
+	i := int(*a)
+	*a++
+	if i > 63 {
+		i = 63
+	}
+	return ChargedMask(1) << i
 }
 
 // --- rateLimiting -----------------------------------------------------------
 
-type ratePolicy struct{ b *tracehash.Bucket }
+type ratePolicy struct {
+	b *tracehash.Bucket
+	// bit is this bucket's ChargedMask bit (bucketAlloc, compile order).
+	bit ChargedMask
+}
 
-func compileRateLimiting(where string, cfg *RateLimitingConfig) (policy, error) {
+func compileRateLimiting(where string, cfg *RateLimitingConfig, alloc *bucketAlloc) (policy, error) {
 	if cfg.SpansPerSecond <= 0 {
 		return nil, errPolicy(where, "rateLimiting.spansPerSecond must be > 0 (got %v, which would sample nothing)", cfg.SpansPerSecond)
 	}
-	return &ratePolicy{b: tracehash.NewBucket(cfg.SpansPerSecond)}, nil
+	return &ratePolicy{b: tracehash.NewBucket(cfg.SpansPerSecond), bit: alloc.next()}, nil
 }
 
 // eval charges the whole trace, all or nothing: admitting the prefix of a trace
@@ -577,16 +597,19 @@ func compileRateLimiting(where string, cfg *RateLimitingConfig) (policy, error) 
 // The charge happens only when this policy is REACHED, so an earlier policy
 // that samples spends nothing here — which is what makes "keep all errors, then
 // rate-limit the rest" mean what it reads like.
-func (p *ratePolicy) eval(t Trace, now time.Time) (verdict, string, bool) {
-	admitted, spent := charge(p.b, float64(len(t.Spans)), now, t.Charged)
+func (p *ratePolicy) eval(t Trace, now time.Time) (verdict, string, ChargedMask) {
+	admitted, spent := charge(p.b, p.bit, float64(len(t.Spans)), now, t.Charged)
 	if admitted {
 		return verdictSample, "", spent
 	}
 	return verdictAbstain, "", spent
 }
 
-// charge spends n against b — or, when the trace was already charged by an
-// earlier decision (Trace.Charged), merely checks that it would fit. A
+// charge spends n against b — or, when THIS bucket's bit is set in the
+// trace's earlier spend (Trace.Charged), merely checks that it would fit. Per
+// bucket, not one bit for all: with several buckets a single bit let a
+// re-decision Peek a bucket the trace never paid, admitting its spans free
+// against a budget some other bucket's spend had set the bit for. A
 // re-decision must not bill the same trace twice: the budget is a rate of spans
 // leaving, and these spans were counted the first time. It reports whether the
 // trace was admitted and, separately, whether that answer SPENT anything: a
@@ -598,12 +621,14 @@ func (p *ratePolicy) eval(t Trace, now time.Time) (verdict, string, bool) {
 // the charge is the full n, so an over-sized trace goes into debt rather than
 // being shut out forever) and Peek (the state-untouched re-decision) — the
 // method docs carry the why.
-func charge(b *tracehash.Bucket, n float64, now time.Time, already bool) (admitted, spent bool) {
-	if already {
-		return b.Peek(n, now), false
+func charge(b *tracehash.Bucket, bit ChargedMask, n float64, now time.Time, already ChargedMask) (admitted bool, spent ChargedMask) {
+	if already&bit != 0 {
+		return b.Peek(n, now), 0
 	}
-	admitted = b.AdmitDebt(n, now)
-	return admitted, admitted
+	if b.AdmitDebt(n, now) {
+		return true, bit
+	}
+	return false, 0
 }
 
 // --- and --------------------------------------------------------------------
@@ -611,11 +636,11 @@ func charge(b *tracehash.Bucket, n float64, now time.Time, already bool) (admitt
 // andPolicy samples only when every sub-policy does.
 type andPolicy struct{ subs []policy }
 
-func compileAnd(where string, cfg *AndConfig) (policy, bool, error) {
+func compileAnd(where string, cfg *AndConfig, alloc *bucketAlloc) (policy, bool, error) {
 	if len(cfg.SubPolicies) == 0 {
 		return nil, false, errPolicy(where, "and.andSubPolicy is empty")
 	}
-	subs, needClock, err := compilePolicies(cfg.SubPolicies, true)
+	subs, needClock, err := compilePolicies(cfg.SubPolicies, true, alloc)
 	if err != nil {
 		return nil, false, err
 	}
@@ -636,11 +661,11 @@ func compileAnd(where string, cfg *AndConfig) (policy, bool, error) {
 // that does not sample, so an operator can put the cheap discriminating test
 // first — and so a rateLimiting sub-policy placed last is charged only for
 // traces the rest of the conjunction already accepted.
-func (p *andPolicy) eval(t Trace, now time.Time) (verdict, string, bool) {
-	spent := false
+func (p *andPolicy) eval(t Trace, now time.Time) (verdict, string, ChargedMask) {
+	spent := ChargedMask(0)
 	for _, sub := range p.subs {
 		v, _, s := sub.eval(t, now)
-		spent = spent || s // a sub-policy that charged before a later one abstained still moved its bucket
+		spent |= s // a sub-policy that charged before a later one abstained still moved its bucket
 		switch v {
 		case verdictVeto:
 			return verdictVeto, "", spent
@@ -666,16 +691,18 @@ type compositeSub struct {
 	name string
 	p    policy
 	b    *tracehash.Bucket
+	// bit is b's ChargedMask bit (bucketAlloc, compile order).
+	bit ChargedMask
 }
 
-func compileComposite(name, where string, cfg *CompositeConfig) (policy, error) {
+func compileComposite(name, where string, cfg *CompositeConfig, alloc *bucketAlloc) (policy, error) {
 	if cfg.MaxTotalSpansPerSecond <= 0 {
 		return nil, errPolicy(where, "composite.maxTotalSpansPerSecond must be > 0 (got %v, which allocates nothing to any sub-policy)", cfg.MaxTotalSpansPerSecond)
 	}
 	if len(cfg.SubPolicies) == 0 {
 		return nil, errPolicy(where, "composite.compositeSubPolicy is empty")
 	}
-	subs, _, err := compilePolicies(cfg.SubPolicies, true)
+	subs, _, err := compilePolicies(cfg.SubPolicies, true, alloc)
 	if err != nil {
 		return nil, err
 	}
@@ -696,6 +723,7 @@ func compileComposite(name, where string, cfg *CompositeConfig) (policy, error) 
 			name: name + "/" + s.name,
 			p:    s.p,
 			b:    tracehash.NewBucket(rate),
+			bit:  alloc.next(),
 		})
 	}
 	return out, nil
@@ -799,19 +827,19 @@ func compositeShares(where string, cfg *CompositeConfig, subs []namedPolicy) (ma
 // much" instead of "this class of trace blocks the ones below it".
 //
 // A veto propagates immediately, for the reason andPolicy.eval gives.
-func (p *compositePolicy) eval(t Trace, now time.Time) (verdict, string, bool) {
+func (p *compositePolicy) eval(t Trace, now time.Time) (verdict, string, ChargedMask) {
 	n := float64(len(t.Spans))
-	spent := false
+	spent := ChargedMask(0)
 	for i := range p.subs {
 		sub := &p.subs[i]
 		v, _, s := sub.p.eval(t, now)
-		spent = spent || s
+		spent |= s
 		switch v {
 		case verdictVeto:
 			return verdictVeto, sub.name, spent
 		case verdictSample:
-			admitted, s := charge(sub.b, n, now, t.Charged)
-			spent = spent || s
+			admitted, s := charge(sub.b, sub.bit, n, now, t.Charged)
+			spent |= s
 			if admitted {
 				return verdictSample, sub.name, spent
 			}

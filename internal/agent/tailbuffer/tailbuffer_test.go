@@ -385,9 +385,9 @@ func TestDecisionCacheEvictsUnderItsSizeCap(t *testing.T) {
 	now := time.Unix(1, 0)
 	before := counter(obs.TailSampleCacheEvicted)
 
-	c.put(traceID(1), true, true, now)
-	c.put(traceID(2), false, true, now)
-	c.put(traceID(3), true, true, now)
+	c.put(traceID(1), true, 1, now)
+	c.put(traceID(2), false, 1, now)
+	c.put(traceID(3), true, 1, now)
 
 	if _, ok := c.get(traceID(1), now); ok {
 		t.Fatal("the oldest verdict survived the size cap")
@@ -411,11 +411,11 @@ func TestDecisionCacheEvictsUnderItsSizeCap(t *testing.T) {
 func TestDecisionCacheHandlesARedecidedTrace(t *testing.T) {
 	c := newDecisionCache(4, time.Minute)
 	now := time.Unix(1, 0)
-	c.put(traceID(1), true, true, now)
-	c.put(traceID(1), false, true, now) // re-decided
-	c.put(traceID(2), true, true, now)
-	c.put(traceID(3), true, true, now)
-	c.put(traceID(4), true, true, now) // over the cap: evicts the stale slot's owner
+	c.put(traceID(1), true, 1, now)
+	c.put(traceID(1), false, 1, now) // re-decided
+	c.put(traceID(2), true, 1, now)
+	c.put(traceID(3), true, 1, now)
+	c.put(traceID(4), true, 1, now) // over the cap: evicts the stale slot's owner
 	if keep, ok := c.get(traceID(1), now); !ok || keep {
 		t.Fatalf("verdict 1 = (%v,%v), want the SECOND verdict (false,true)", keep, ok)
 	}

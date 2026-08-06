@@ -158,7 +158,14 @@ func splitBigResourceLogs(rl plog.ResourceLogs, maxBytes int, out *[]plog.Logs) 
 		for j := 0; j < lrs.Len(); j++ {
 			lr := lrs.At(j)
 			recBytes := logMarshaler.LogRecordSize(lr) + elemOverhead
-			if held > 0 && curBytes+recBytes > maxBytes {
+			// Emit-and-reopen when the record would overflow a chunk holding
+			// anything beyond this scope's own identity: `held > 0` alone let
+			// a chunk that had accumulated record-less scopes' identity bytes
+			// (curBytes > resBase+scopeBytes with held == 0) take the record
+			// unchecked and emit an over-cap part. Only a record over the cap
+			// in a chunk of its own — after the reopen leaves exactly
+			// resBase+scopeBytes — goes alone.
+			if (held > 0 || curBytes > resBase+scopeBytes) && curBytes+recBytes > maxBytes {
 				emit()
 				openChunk()
 				addScope(sl, scopeBytes)
@@ -319,7 +326,9 @@ func splitBigResourceMetrics(rm pmetric.ResourceMetrics, maxBytes int, out *[]pm
 				}, out)
 				continue
 			}
-			if held > 0 && curBytes+mBytes > maxBytes {
+			// held > 0 alone missed a chunk carrying earlier record-less
+			// scopes' identity bytes — see the Logs splitter.
+			if (held > 0 || curBytes > base) && curBytes+mBytes > maxBytes {
 				emit()
 				openChunk()
 				addScope(sm, scopeBytes)
@@ -560,7 +569,9 @@ func splitBigResourceSpans(rs ptrace.ResourceSpans, maxBytes int, out *[]ptrace.
 		for j := 0; j < src.Len(); j++ {
 			sp := src.At(j)
 			spBytes := traceMarshaler.SpanSize(sp) + elemOverhead
-			if held > 0 && curBytes+spBytes > maxBytes {
+			// held > 0 alone missed a chunk carrying earlier span-less
+			// scopes' identity bytes — see the Logs splitter.
+			if (held > 0 || curBytes > resBase+scopeBytes) && curBytes+spBytes > maxBytes {
 				emit()
 				openChunk()
 				addScope(ss, scopeBytes)

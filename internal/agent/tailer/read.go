@@ -361,6 +361,9 @@ func (t *Tailer) ensureOpen(f *file) error {
 	// A DIFFERENT file now lives at this path: -logs-idle-close released the
 	// fd and the runtime rotated a replacement in while we held none.
 	replaced := f.identityChanged(inode, fh)
+	// The old incarnation's identity and progress, captured before the
+	// assignments below adopt the new file's — the replaced arm records them.
+	oldInode, oldFp, oldCommitted := f.inode, f.fp, f.committed
 	if replaced {
 		start = 0
 	}
@@ -380,6 +383,32 @@ func (t *Tailer) ensureOpen(f *file) error {
 	f.inode = inode
 	f.fp = fp
 	if replaced {
+		// The OLD incarnation rotated away while we held no fd — between
+		// -logs-idle-close releasing it and this reopen, or between a
+		// restart's initFile (whose stat still saw the old inode) and the
+		// file's first open, a window that widens to MINUTES when metadata
+		// resolution is backing off. Its [committed, EOF) was never read and
+		// the rotated file is the only copy: record it as an open-ended
+		// segment (to = -1, the shape discover.go synthesizes for a
+		// rotation-while-down) so feedSegments recovers it via findRotated —
+		// or counts obs.LogPrefixLost and retires it if the runtime already
+		// pruned the file. Previously the remainder was discarded silently,
+		// with every loss counter flat. Not for archives: their offsets are
+		// in decompressed space and archiveReplaced owns that decision.
+		if !f.compressed {
+			f.segments = append(f.segments, &segment{
+				id: f.tail, inode: oldInode, fp: oldFp, committed: oldCommitted, to: -1, fed: false,
+			})
+			if t.checkpointing() {
+				// The hop must reach disk before the next rotation of this
+				// file, not on the 10s cadence — see reopen's identical block
+				// for the one-file-two-unsaved-hops invariant.
+				if f.hopUnsaved {
+					t.saveCheckpoints()
+				}
+				f.hopUnsaved, t.hopsUnsaved = true, true
+			}
+		}
 		// A new incarnation, so take the canonical path rather than resetting
 		// byte positions inline. Keeping the OLD tail id attributed the new
 		// inode's bytes to the previous incarnation's segment, and a withheld

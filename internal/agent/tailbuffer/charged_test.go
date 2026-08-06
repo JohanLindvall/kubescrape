@@ -96,13 +96,13 @@ func TestTheChargeSurvivesEveryReDecision(t *testing.T) {
 	}
 
 	decide(manySpans(1, 10)...) // spends 10 of the 20
-	if !b.cache.charged(traceID(1)) {
+	if b.cache.charged(traceID(1)) == 0 {
 		t.Fatal("the decision that billed the budget is not remembered as charged")
 	}
 	for window := 2; window <= 3; window++ {
 		clk.advance(61 * time.Second) // past the TTL: a straggler opens a fresh window
 		decide(spanSpec{trace: 1, span: uint64(window), end: 10})
-		if !b.cache.charged(traceID(1)) {
+		if b.cache.charged(traceID(1)) == 0 {
 			t.Fatalf("window %d forgot that trace 1 had paid, so window %d charges the budget again", window, window+1)
 		}
 	}
@@ -120,7 +120,7 @@ func TestTheChargeSurvivesEveryReDecision(t *testing.T) {
 func TestDecisionCacheRemembersTheChargePastTheVerdict(t *testing.T) {
 	now := time.Unix(1700000000, 0)
 	c := newDecisionCache(10, time.Minute)
-	c.put(traceID(1), true, true, now)
+	c.put(traceID(1), true, 1, now)
 
 	if keep, ok := c.get(traceID(1), now); !ok || !keep {
 		t.Fatal("the verdict should be live immediately after the put")
@@ -129,10 +129,10 @@ func TestDecisionCacheRemembersTheChargePastTheVerdict(t *testing.T) {
 	if _, ok := c.get(traceID(1), later); ok {
 		t.Fatal("an expired verdict must not be applied: past the TTL a straggler is a new trace")
 	}
-	if !c.charged(traceID(1)) {
+	if c.charged(traceID(1)) == 0 {
 		t.Fatal("the cache forgot this trace had paid, so the re-decision will charge the rate budget a second time")
 	}
-	if c.charged(traceID(2)) {
+	if c.charged(traceID(2)) != 0 {
 		t.Fatal("a trace never decided reads as charged")
 	}
 }
@@ -147,9 +147,9 @@ func TestOnlyLiveVerdictEvictionsAreCounted(t *testing.T) {
 	c := newDecisionCache(2, time.Minute)
 
 	before := obs.TailSampleCacheEvicted.Value()
-	c.put(traceID(1), true, true, now)
-	c.put(traceID(2), true, true, now)
-	c.put(traceID(3), true, true, now) // evicts trace 1, whose verdict is still live
+	c.put(traceID(1), true, 1, now)
+	c.put(traceID(2), true, 1, now)
+	c.put(traceID(3), true, 1, now) // evicts trace 1, whose verdict is still live
 	if got := obs.TailSampleCacheEvicted.Value() - before; got != 1 {
 		t.Fatalf("evicting a live verdict counted %v times, want 1", got)
 	}
@@ -161,8 +161,8 @@ func TestOnlyLiveVerdictEvictionsAreCounted(t *testing.T) {
 	// a signal.
 	old := now.Add(2 * time.Minute)
 	before = obs.TailSampleCacheEvicted.Value()
-	c.put(traceID(4), true, true, old)
-	c.put(traceID(5), true, true, old)
+	c.put(traceID(4), true, 1, old)
+	c.put(traceID(5), true, 1, old)
 	if got := obs.TailSampleCacheEvicted.Value() - before; got != 0 {
 		t.Fatalf("reclaiming expired tombstones counted %v evictions, want 0", got)
 	}
@@ -174,7 +174,7 @@ func TestDecisionCacheStaysBounded(t *testing.T) {
 	now := time.Unix(1700000000, 0)
 	c := newDecisionCache(8, time.Minute)
 	for i := 0; i < 1000; i++ {
-		c.put(traceID(uint64(i)), i%2 == 0, true, now.Add(time.Duration(i)*time.Millisecond))
+		c.put(traceID(uint64(i)), i%2 == 0, 1, now.Add(time.Duration(i)*time.Millisecond))
 	}
 	if c.len() > 8 {
 		t.Fatalf("cache holds %d entries, above its cap of 8", c.len())
@@ -197,7 +197,7 @@ func TestDecisionCacheFIFODoesNotGrowUnbounded(t *testing.T) {
 	// stays tiny and evict never runs.
 	for i := 0; i < 100000; i++ {
 		id[1] = byte(i % 8)
-		c.put(id, true, true, now)
+		c.put(id, true, 1, now)
 	}
 	if got := c.len(); got > 8 {
 		t.Fatalf("map holds %d entries, want <= 8", got)
@@ -236,7 +236,7 @@ func TestARefusedDecisionIsNotRememberedAsCharged(t *testing.T) {
 	}
 
 	decide(manySpans(1, 8)...) // spends 8 of the 10
-	if !b.cache.charged(traceID(1)) {
+	if b.cache.charged(traceID(1)) == 0 {
 		t.Fatal("the decision that billed the budget is not remembered as charged")
 	}
 
@@ -244,7 +244,7 @@ func TestARefusedDecisionIsNotRememberedAsCharged(t *testing.T) {
 	if got := c.traces()[traceID(2)]; got != 0 {
 		t.Fatalf("the over-budget trace exported %d spans", got)
 	}
-	if b.cache.charged(traceID(2)) {
+	if b.cache.charged(traceID(2)) != 0 {
 		t.Fatal("a trace the rate policy REFUSED is remembered as charged, so its next window admits spans nothing ever billed")
 	}
 

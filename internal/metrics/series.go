@@ -700,3 +700,32 @@ func (s *series) snapshot() []sample {
 	}
 	return out
 }
+
+// rearmInitial re-marks the zero-baseline flag on the samples of a FAILED
+// export. snapshot consumes `initial` optimistically; the Registry has no
+// retention (unlike DynamicMetricSet, whose retained raw samples re-render
+// the baseline themselves), so without the re-arm a collector outage at the
+// first export permanently ate every counter's synthetic zero point — the
+// exact first-ramp loss the baselines exist to prevent. Failure-path only;
+// the linear db walk is irrelevant at self-telemetry cardinality.
+func (s *series) rearmInitial(samples []sample) {
+	var want map[string]struct{}
+	for i := range samples {
+		if samples[i].initial {
+			if want == nil {
+				want = make(map[string]struct{})
+			}
+			want[samples[i].resource+"\x00"+samples[i].labels] = struct{}{}
+		}
+	}
+	if want == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, e := range s.db {
+		if _, ok := want[e.resource+"\x00"+e.labels]; ok {
+			e.initial = true
+		}
+	}
+}

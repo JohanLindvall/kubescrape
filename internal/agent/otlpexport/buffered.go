@@ -835,7 +835,23 @@ func (s *sink[T]) stuckTooLong(data []byte) bool {
 	}
 	st, seen := s.stuck[h]
 	if !seen && len(s.stuck) >= maxStuckTracked {
-		return false
+		// Evict the entry with the OLDEST evidence rather than refuse to
+		// track: an entry leaks permanently when its payload leaves the queue
+		// by a path other than success/permanent/max-cycles (an ErrCorrupt
+		// skip-past, a recovery truncation), and a full map that refuses new
+		// entries disarms poison detection for every later payload — the
+		// exact rebuild-forever wedge stuckTooLong exists to break. The
+		// victim's budget resets, which at worst delays a real poison batch
+		// by a few laps; the O(n) scan runs only at the cap, on the failure
+		// path.
+		var evict, evictAt uint64
+		first := true
+		for k, v := range s.stuck {
+			if first || v.lastDelivered < evictAt {
+				evict, evictAt, first = k, v.lastDelivered, false
+			}
+		}
+		delete(s.stuck, evict)
 	}
 	// Did the collector deliver some OTHER batch since THIS lap's predecessor?
 	// That is the whole evidence, and it must be re-established every lap.

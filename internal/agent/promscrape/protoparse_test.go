@@ -700,6 +700,44 @@ func protoConvert(t *testing.T, families ...*dto.MetricFamily) (map[string]pmetr
 	return out, malformed
 }
 
+// The protobuf front must not export shapes the text grammar structurally
+// cannot produce: an unset family name decodes cleanly (type defaulting to
+// COUNTER) and became an empty-named OTLP metric, and an unset label-pair name
+// became an empty attribute key — both junk a downstream OTLP→Prometheus
+// translation rejects per-series. Both are rejected as malformed, mirroring
+// the text front's whole-line reject; well-formed neighbours still convert.
+func TestProtoRejectsEmptyNames(t *testing.T) {
+	nameless := &dto.MetricFamily{ // Name unset entirely
+		Metric: []*dto.Metric{{Counter: &dto.Counter{Value: ptr(1.0)}}},
+	}
+	badLabel := &dto.MetricFamily{
+		Name: ptr("bad_label_total"),
+		Type: dto.MetricType_COUNTER.Enum(),
+		Metric: []*dto.Metric{{
+			Label:   []*dto.LabelPair{{Value: ptr("v")}}, // Name unset
+			Counter: &dto.Counter{Value: ptr(2.0)},
+		}},
+	}
+	good := &dto.MetricFamily{
+		Name:   ptr("good_total"),
+		Type:   dto.MetricType_COUNTER.Enum(),
+		Metric: []*dto.Metric{{Counter: &dto.Counter{Value: ptr(3.0)}}},
+	}
+	got, malformed := protoConvert(t, nameless, badLabel, good)
+	if _, ok := got[""]; ok {
+		t.Error("an empty-named metric was exported")
+	}
+	if _, ok := got["bad_label_total"]; ok {
+		t.Error("a metric with an empty-named label was exported")
+	}
+	if _, ok := got["good_total"]; !ok {
+		t.Errorf("the well-formed family was lost; got %v", slices.Sorted(maps.Keys(got)))
+	}
+	if malformed != 2 {
+		t.Errorf("malformed = %d, want 2 (one per rejected metric)", malformed)
+	}
+}
+
 // dto's *_float count fields override their integer counterparts ("Overrides
 // sample_count if > 0"), which is how a FLOAT histogram carries its counts —
 // classic buckets included. Reading the integer fields turned every observation

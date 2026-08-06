@@ -388,6 +388,11 @@ func (s *Server) buildMonitoredServices() map[string][]monitorEndpoint {
 type podMonitorRef struct {
 	monitor *servicemonitors.PodMonitor
 	name    string
+	// namespaces is monitor.PodNamespaces() resolved ONCE per request: the
+	// common no-namespaceSelector shape allocates a one-element slice per
+	// call, and podMonitorsFor runs per (pod, monitor) pair on the targets
+	// hot path — the same per-pair cost `name` was hoisted for.
+	namespaces []string
 }
 
 // allPodMonitors snapshots the indexed PodMonitors for one request.
@@ -398,7 +403,7 @@ func (s *Server) allPodMonitors() []podMonitorRef {
 	all := s.monitors.PodMonitors()
 	out := make([]podMonitorRef, 0, len(all))
 	for _, m := range all {
-		out = append(out, podMonitorRef{monitor: m, name: m.Namespace + "/" + m.Name})
+		out = append(out, podMonitorRef{monitor: m, name: m.Namespace + "/" + m.Name, namespaces: m.PodNamespaces()})
 	}
 	return out
 }
@@ -407,7 +412,7 @@ func (s *Server) allPodMonitors() []podMonitorRef {
 // pod (namespace + label selector), appending into a caller-owned scratch slice.
 func podMonitorsFor(pod kubemeta.Pod, all []podMonitorRef, out []podMonitorRef) []podMonitorRef {
 	for _, ref := range all {
-		if nss := ref.monitor.PodNamespaces(); nss != nil && !slices.Contains(nss, pod.Namespace) {
+		if ref.namespaces != nil && !slices.Contains(ref.namespaces, pod.Namespace) {
 			continue
 		}
 		if !ref.monitor.Selector.Matches(labels.Set(pod.Labels)) {

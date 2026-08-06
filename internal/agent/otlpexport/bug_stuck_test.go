@@ -102,6 +102,38 @@ func TestStuckEntryForgottenOnPermanentRejection(t *testing.T) {
 	}
 }
 
+// A full stuck map must EVICT its oldest-evidence entry for a new payload, not
+// refuse to track it: entries leak when their payload leaves the queue by a
+// path other than success/permanent/max-cycles (an ErrCorrupt skip-past, a
+// recovery truncation), and a map that refuses new entries at the cap disarms
+// poison detection for every later payload — a genuine poison batch then
+// circles the queue forever, the exact wedge stuckTooLong exists to break.
+func TestStuckMapAtCapStillTracksNewPoison(t *testing.T) {
+	s := &sink[plog.Logs]{kind: "logs", stuckResponded: true}
+	// Fill the map with leaked entries (payloads never seen again).
+	for i := 0; i < maxStuckTracked; i++ {
+		s.stuckTooLong([]byte{byte(i), byte(i >> 8), byte(i >> 16)})
+	}
+	if n := len(s.stuck); n != maxStuckTracked {
+		t.Fatalf("precondition: stuck map holds %d entries, want %d", n, maxStuckTracked)
+	}
+
+	// A genuine poison payload arrives: the live collector delivers others
+	// between its failed laps and responds to every send.
+	poison := []byte("the poison batch")
+	dropped := false
+	for i := 0; i < maxDrainCycles+2 && !dropped; i++ {
+		dropped = s.stuckTooLong(poison)
+		s.delivered++ // other batches get through between laps
+	}
+	if !dropped {
+		t.Fatal("poison payload never dropped: the full stuck map refused to track it")
+	}
+	if n := len(s.stuck); n > maxStuckTracked {
+		t.Fatalf("stuck map grew past its cap: %d", n)
+	}
+}
+
 // TestBlipDeliveryThenOutageDoesNotDrop: a single delivery during a blip must
 // not let the RESUMED outage's transport failures spend the poison budget — the
 // batch was never refused by a live collector. (Laps count only when the

@@ -144,13 +144,15 @@ func TestLabelKeyMemoGroupsInterleavedSets(t *testing.T) {
 }
 
 // A timestamp large enough to overflow the nanosecond conversion must not wrap
-// into a bogus (often 1970s) time.
+// into a bogus (often 1970s) time — and a NEGATIVE one (pre-epoch; the classic
+// format's timestamp is a signed int64, so `foo 1 -1` parses cleanly) must not
+// wrap through pcommon.Timestamp's unsigned model into a far-future stamp.
 func TestOversizedTimestampDoesNotWrap(t *testing.T) {
 	scrape := pcommon.Timestamp(1_700_000_000 * 1e9)
-	for _, ms := range []int64{math.MaxInt64, math.MaxInt64 / 1000, 99999999999999999, math.MinInt64} {
+	for _, ms := range []int64{math.MaxInt64, math.MaxInt64 / 1000, 99999999999999999, math.MinInt64, -1, -1000} {
 		got := pointTS(ms, scrape)
 		if got != scrape {
-			t.Errorf("pointTS(%d) = %d; an overflowing timestamp must fall back to the scrape time, not wrap", ms, got)
+			t.Errorf("pointTS(%d) = %d; an unrepresentable timestamp must fall back to the scrape time, not wrap", ms, got)
 		}
 	}
 	// A normal timestamp still converts exactly.

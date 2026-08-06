@@ -197,10 +197,18 @@ func (p *Processor) Consume(td ptrace.Traces) {
 	// carrying more than 1024 unpairable half-edges then expired fewer than it
 	// added, so occupancy climbed past the honest rate x wait working set,
 	// pinned at MaxItems, and the store started refusing arriving spans.
-	// Spend it in ceiling-sized passes, releasing the mutex between them.
+	// Spend it in ceiling-sized passes, releasing the mutex between them — and
+	// STOP at the first short pass: expire returns how many it took, and a
+	// short pass means nothing more is due at `now` (SweepAll's idiom).
+	// Ignoring the return spent the full budget in up-to-16 lock
+	// acquire/release cycles of the pairing mutex every Consume, even with
+	// nothing due — pure contention against every concurrent Consume and
+	// Record.
 	for budget := min(td.SpanCount()+sweepFloorPerBatch, maxSweepBudgetPerBatch); budget > 0; {
 		n := min(budget, maxSweepPerBatch)
-		p.store.expire(now, n)
+		if p.store.expire(now, n) < n {
+			break
+		}
 		budget -= n
 	}
 

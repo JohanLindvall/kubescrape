@@ -48,6 +48,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/JohanLindvall/kubescrape/internal/agent/transform"
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/pmetric"
 )
@@ -333,7 +334,11 @@ func (st *Store[S]) Export(ctx context.Context, exp Exporter, res pcommon.Resour
 	if md.ResourceMetrics().Len() == 0 {
 		return nil
 	}
-	if err := exp.ExportMetrics(ctx, md); err != nil {
+	// Handoff to the transform seam: md is fresh pdata this Render just built
+	// and is never re-offered — a failed send leaves the series Rendered and
+	// the next export renders again — so the transform wrapper may run its
+	// script in place instead of deep-copying the payload.
+	if err := exp.ExportMetrics(transform.Handoff(ctx), md); err != nil {
 		return err
 	}
 	st.afterDelivered()

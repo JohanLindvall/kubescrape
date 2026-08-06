@@ -329,7 +329,20 @@ func (t *Tailer) flush(ctx context.Context) {
 	// An all-dropped batch has nothing to send but its offsets still commit.
 	var err error
 	if kept > 0 {
-		err = t.exportWithRetry(ctx, ld)
+		// The transform runs ONCE per batch, in place, before the retry loop:
+		// this flush just built ld and nothing else holds it. (Sending through
+		// the transform-wrapped exporter instead re-copied the batch and re-ran
+		// the script on every retry attempt.) A batch transformed to nothing
+		// commits like an all-dropped one; a script error takes the failed-
+		// export path below — not permanent, so the files rewind and the
+		// re-read next sweep re-runs the possibly hot-reloaded program on a
+		// batch rebuilt from source.
+		if t.cfg.Transform != nil {
+			err = t.cfg.Transform(ld)
+		}
+		if err == nil && ld.ResourceLogs().Len() > 0 {
+			err = t.exportWithRetry(ctx, ld)
+		}
 	}
 	switch {
 	case err == nil:

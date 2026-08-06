@@ -83,9 +83,10 @@ func (x *Index) DeletePodMonitor(namespace, name string) {
 // PodMonitors returns all pod monitors (shared, treat as immutable).
 //
 // Sorted like Monitor.All(): when two PodMonitors select the same pod and
-// mint the same URL, the URL-dedup in handleNodeTargets keeps the FIRST, so
-// map-iteration order must not decide which monitor's name / auth /
-// relabelings ride on the surviving target.
+// mint the same URL, the server serves ONE target with the SECOND monitor's
+// endpoint configuration merged into the first's (scrape.MergeMonitorEndpoint)
+// — so map-iteration order must not decide which monitor names the target,
+// whose relabel chain runs first, or whose auth wins a conflict.
 func (x *Index) PodMonitors() []*PodMonitor {
 	x.mu.RLock()
 	defer x.mu.RUnlock()

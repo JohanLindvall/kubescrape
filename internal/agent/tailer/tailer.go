@@ -149,6 +149,17 @@ type Config struct {
 	// synthetic __severity__ key — and after LogMetrics, so metrics still see
 	// every line. Dropped records advance offsets like exported ones.
 	Rules *logline.LineFilter
+	// Transform applies the exporter-seam log transform to a just-built batch
+	// IN PLACE, once, before the retry loop (nil = none; wired from
+	// transform.Wrapper.TransformLogs — a func field so the tailer needs no
+	// dependency on that package). When set, Exporter must be the chain BELOW
+	// the transform layer (transform.Wrapper.Inner()), or every retry would
+	// pay the wrapper's copy and re-run the script. The tailer owns the batch
+	// it just built, so no copy is needed; a batch transformed to nothing
+	// commits its offsets without a send, and a script error behaves like a
+	// failed export — the rewound bytes are re-read and re-transformed under
+	// whatever program is active by then.
+	Transform func(ld plog.Logs) error
 	// Attrs builds the exported resource attributes (nil = defaults).
 	Attrs *attrs.Builder
 	// NodeInfo supplies the agent node's metadata for attribute templates

@@ -8,9 +8,12 @@ package transform
 // Honest reporting only: if the numbers drift, update the doc or the code.
 
 import (
+	"context"
 	"testing"
 
 	"go.opentelemetry.io/collector/pdata/plog"
+	"go.opentelemetry.io/collector/pdata/pmetric"
+	"go.opentelemetry.io/collector/pdata/ptrace"
 )
 
 // benchLogs is a realistic small batch: 256 records under one resource.
@@ -59,5 +62,64 @@ func BenchmarkTransformLogRecord(b *testing.B) {
 	})
 	b.Run("touch-body", func(b *testing.B) {
 		run(b, "logs: |\n  def transform(batch):\n      for r in batch:\n          if \"teapot\" in r.body:\n              pass\n")
+	})
+}
+
+// discardExp forwards nothing: the wrapper benchmarks below measure the seam,
+// not a downstream.
+type discardExp struct{}
+
+func (discardExp) ExportLogs(context.Context, plog.Logs) error          { return nil }
+func (discardExp) ExportMetrics(context.Context, pmetric.Metrics) error { return nil }
+func (discardExp) ExportTraces(context.Context, ptrace.Traces) error    { return nil }
+
+// BenchmarkWrapperNoopScript is the whole-seam cost of a `def
+// transform(batch): return` script: "copy" is the unmarked path (deep copy +
+// invocation — the package doc's headline number), "handoff" the marked
+// in-place path (invocation only; a no-op script leaves the reused payload
+// untouched, so iterating over one object is sound).
+func BenchmarkWrapperNoopScript(b *testing.B) {
+	noop := "  def transform(batch):\n      return\n"
+	prog, err := Compile([]byte("logs: |\n" + noop + "metrics: |\n" + noop))
+	if err != nil {
+		b.Fatal(err)
+	}
+	w := Wrap(discardExp{}, nil, prog)
+	plain, marked := context.Background(), Handoff(context.Background())
+
+	ld := benchLogs(1024)
+	b.Run("logs-1024/copy", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			if err := w.ExportLogs(plain, ld); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+	b.Run("logs-1024/handoff", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			if err := w.ExportLogs(marked, ld); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+
+	md := benchMetrics(10_000) // iterate_test.go's promscrape-chunk shape
+	b.Run("metrics-10k/copy", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			if err := w.ExportMetrics(plain, md); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+	b.Run("metrics-10k/handoff", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			if err := w.ExportMetrics(marked, md); err != nil {
+				b.Fatal(err)
+			}
+		}
 	})
 }

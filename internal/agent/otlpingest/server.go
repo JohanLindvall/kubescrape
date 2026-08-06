@@ -22,6 +22,7 @@ import (
 	"google.golang.org/protobuf/types/known/durationpb"
 
 	"github.com/JohanLindvall/kubescrape/internal/agent/otlpexport"
+	"github.com/JohanLindvall/kubescrape/internal/agent/transform"
 )
 
 // Exporter forwards enriched telemetry; implemented by otlpexport.Client.
@@ -272,7 +273,11 @@ func (g *logsGRPC) Export(ctx context.Context, req plogotlp.ExportRequest) (plog
 	err := grpcExport(ctx, func(ctx context.Context) error {
 		ld := req.Logs()
 		g.s.cfg.Enricher.EnrichLogs(ctx, ld)
-		return g.s.cfg.Exporter.ExportLogs(ctx, ld)
+		// Handoff (logs and metrics only, never traces — the tier's tap reads
+		// a forwarded trace AFTER the export): on failure the decoded ld dies
+		// with this RPC and the sender's retry re-decodes retransmitted bytes,
+		// so the transform seam may run in place instead of deep-copying.
+		return g.s.cfg.Exporter.ExportLogs(transform.Handoff(ctx), ld)
 	})
 	if err != nil {
 		return plogotlp.ExportResponse{}, err
@@ -288,7 +293,9 @@ type metricsGRPC struct {
 func (g *metricsGRPC) Export(ctx context.Context, req pmetricotlp.ExportRequest) (pmetricotlp.ExportResponse, error) {
 	err := grpcExport(ctx, func(ctx context.Context) error {
 		md := g.s.cfg.Enricher.EnrichMetrics(ctx, req.Metrics())
-		return g.s.cfg.Exporter.ExportMetrics(ctx, md)
+		// Handoff: same reasoning as the logs arm — a failed forward drops the
+		// decoded object and the sender retransmits bytes.
+		return g.s.cfg.Exporter.ExportMetrics(transform.Handoff(ctx), md)
 	})
 	if err != nil {
 		return pmetricotlp.ExportResponse{}, err
@@ -447,7 +454,9 @@ func (s *Server) handleHTTPLogs(w http.ResponseWriter, r *http.Request) {
 	s.servePush(w, r, "logs", req.UnmarshalProto, func(ctx context.Context) (ProtoMarshaler, error) {
 		ld := req.Logs()
 		s.cfg.Enricher.EnrichLogs(ctx, ld)
-		if err := s.cfg.Exporter.ExportLogs(ctx, ld); err != nil {
+		// Handoff: as on the gRPC arm — the decoded push dies with a failed
+		// request, and the sender's retry re-decodes retransmitted bytes.
+		if err := s.cfg.Exporter.ExportLogs(transform.Handoff(ctx), ld); err != nil {
 			return nil, err
 		}
 		return plogotlp.NewExportResponse(), nil
@@ -458,7 +467,8 @@ func (s *Server) handleHTTPMetrics(w http.ResponseWriter, r *http.Request) {
 	req := pmetricotlp.NewExportRequest()
 	s.servePush(w, r, "metrics", req.UnmarshalProto, func(ctx context.Context) (ProtoMarshaler, error) {
 		md := s.cfg.Enricher.EnrichMetrics(ctx, req.Metrics())
-		if err := s.cfg.Exporter.ExportMetrics(ctx, md); err != nil {
+		// Handoff: as on the gRPC arm.
+		if err := s.cfg.Exporter.ExportMetrics(transform.Handoff(ctx), md); err != nil {
 			return nil, err
 		}
 		return pmetricotlp.NewExportResponse(), nil

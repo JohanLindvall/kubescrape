@@ -20,6 +20,7 @@ import (
 	"go.opentelemetry.io/collector/pdata/pmetric"
 
 	"github.com/JohanLindvall/kubescrape/internal/agent/attrs"
+	"github.com/JohanLindvall/kubescrape/internal/agent/transform"
 	"github.com/JohanLindvall/kubescrape/internal/bearer"
 	"github.com/JohanLindvall/kubescrape/internal/logdedupe"
 	"github.com/JohanLindvall/kubescrape/internal/obs"
@@ -773,7 +774,10 @@ func (s *Scraper) exportHealth(ctx context.Context, outcomes []scrapeOutcome) {
 		gauge("scrape_duration_seconds", o.duration.Seconds())
 		gauge("scrape_samples_scraped", float64(o.samples))
 	}
-	if err := s.cfg.Exporter.ExportMetrics(ctx, md); err != nil && ctx.Err() == nil {
+	// Handoff: md is fresh per cycle and a failure is only warned about, never
+	// re-sent — the next cycle rebuilds it — so the transform seam may run in
+	// place.
+	if err := s.cfg.Exporter.ExportMetrics(transform.Handoff(ctx), md); err != nil && ctx.Err() == nil {
 		s.log.Warn("exporting scrape health metrics", "error", err)
 	}
 }

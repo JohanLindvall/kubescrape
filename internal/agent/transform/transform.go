@@ -9,23 +9,20 @@
 // edit keeps the last good program running, counted and warned), so
 // transformation logic changes without a pod restart.
 //
-// Cost model: one Starlark invocation per exported BATCH per signal, PLUS one
-// deep copy of that batch — and the copy, not the script, is what a configured
-// transforms file costs. Measured on a 1024-record log batch with a
-// `def transform(batch): return` script: ~249µs total, of which ld.CopyTo is
-// ~226µs (91%) and the whole Starlark call is 245ns; a 10,000-point metrics
-// payload (one promscrape chunk) is ~2.05ms and 2.3 MB for the same no-op. So
-// enabling transforms multiplies the agent's per-batch export cost before a
-// script does anything, and with -buffer-dir the copy is additionally wasted
-// (its consumer marshals it and drops it immediately).
-//
-// The copy is a CORRECTNESS requirement, not an optimization gap: scripts
-// mutate pdata in place through the host objects, and producers re-export the
-// SAME object on retry (see the comment above ExportLogs). Removing it needs
-// an explicit per-payload ownership marker on the call — the shape
-// otlpexport.Own/Owned already uses for durability — so a producer that
-// rebuilds its batch on retry can license an in-place run while forwarders
-// keep the copy. That wiring lives in the producers, not here.
+// Cost model: one Starlark invocation per exported BATCH per signal, PLUS —
+// for a payload NOT marked with Handoff — one deep copy of that batch, and
+// the copy, not the script, is what the copying path costs. Measured on a
+// 1024-record log batch with a `def transform(batch): return` script: ~249µs
+// total, of which ld.CopyTo is ~226µs (91%) and the whole Starlark call is
+// 245ns; a 10,000-point metrics payload (one promscrape chunk) is ~2.05ms and
+// 2.3 MB for the same no-op. A payload marked Handoff(ctx) — the producer's
+// promise that it rebuilds from source on failure rather than re-offering the
+// object (see handoff.go for the roster) — runs the script IN PLACE and pays
+// only the invocation; the copy remains the CORRECTNESS requirement for every
+// unmarked producer, which re-exports the SAME object on retry (see the
+// comment above ExportLogs). The tailer takes a third shape: it transforms
+// its just-built batch once via TransformLogs and retries through Inner(),
+// so its retry loop neither re-copies nor re-runs the script.
 //
 // Within a batch, records ARE lazy: the iterators walk positions rather than
 // materializing host objects, and each object resolves only the fields the
@@ -149,6 +146,29 @@ func (w *Wrapper) Fork(next Exporter, nextTraces TracesExporter) *Wrapper {
 	return &Wrapper{next: next, nextTraces: nextTraces, program: w.program}
 }
 
+// TransformLogs runs the active logs program on ld IN PLACE (drop marks
+// swept, empty groups pruned) and reports the script's error; no program means
+// no-op. It is the tailer's seam: the tailer's retry loop re-sends the SAME
+// batch, so it can neither mark Handoff (the contract forbids the re-send)
+// nor export through the wrapper (every attempt would re-copy and re-run the
+// script) — instead it transforms the batch it just built exactly once, here,
+// and retries through Inner(). The caller decides what an emptied payload
+// means (the tailer commits its offsets without a send) and treats an error
+// like a failed export, so a re-read re-runs the — possibly hot-reloaded —
+// program.
+func (w *Wrapper) TransformLogs(ld plog.Logs) error {
+	p := w.program.Load()
+	if p == nil || p.logs == nil {
+		return nil
+	}
+	return p.logs.runLogs(ld)
+}
+
+// Inner is the exporter below the transform layer, for a producer that
+// applies the transform itself (TransformLogs) and must not pay it again on
+// the send path.
+func (w *Wrapper) Inner() Exporter { return w.next }
+
 // Swap installs a new program (compile-then-commit: callers only pass
 // programs that compiled whole).
 func (w *Wrapper) Swap(p *Program) { w.program.Store(p) }
@@ -156,19 +176,26 @@ func (w *Wrapper) Swap(p *Program) { w.program.Store(p) }
 // Active returns the current program (for /debug/transforms).
 func (w *Wrapper) Active() *Program { return w.program.Load() }
 
-// A transform runs on a COPY of the payload, never the caller's object: the
-// scripts mutate pdata in place (lazy host objects alias it), while the ingest
-// batcher retries the SAME object on a transient failure and the spanmetrics
-// tap Consumes it after forwarding. Mutating in place would double-apply a
-// non-idempotent script on retry and feed the tap the post-transform payload.
-// The no-script fast path forwards the original uncopied (matching route and
+// An UNMARKED payload is transformed on a COPY, never the caller's object: the
+// scripts mutate pdata in place (lazy host objects alias it), while unmarked
+// producers retry the SAME object on a transient failure (logchain.Pending,
+// tailbuffer) and the spanmetrics tap Consumes it after forwarding. Mutating
+// those in place would double-apply a non-idempotent script on retry and feed
+// the tap the post-transform payload. A payload marked Handoff(ctx) — whose
+// producer rebuilds from source on failure and never re-reads the object
+// (handoff.go) — is transformed IN PLACE: a script error there may leave it
+// half-transformed, which the marker's contract makes unobservable. The
+// no-script fast path forwards the original uncopied (matching route and
 // tracesample, which were hardened the same way).
 
 // ExportLogs transforms then forwards.
 func (w *Wrapper) ExportLogs(ctx context.Context, ld plog.Logs) error {
 	if p := w.program.Load(); p != nil && p.logs != nil {
-		out := plog.NewLogs()
-		ld.CopyTo(out)
+		out := ld
+		if !HandedOff(ctx) {
+			out = plog.NewLogs()
+			ld.CopyTo(out)
+		}
 		if err := p.logs.runLogs(out); err != nil {
 			return err
 		}
@@ -183,8 +210,11 @@ func (w *Wrapper) ExportLogs(ctx context.Context, ld plog.Logs) error {
 // ExportMetrics transforms then forwards.
 func (w *Wrapper) ExportMetrics(ctx context.Context, md pmetric.Metrics) error {
 	if p := w.program.Load(); p != nil && p.metrics != nil {
-		out := pmetric.NewMetrics()
-		md.CopyTo(out)
+		out := md
+		if !HandedOff(ctx) {
+			out = pmetric.NewMetrics()
+			md.CopyTo(out)
+		}
 		if err := p.metrics.runMetrics(out); err != nil {
 			return err
 		}
@@ -202,8 +232,11 @@ func (w *Wrapper) ExportTraces(ctx context.Context, td ptrace.Traces) error {
 		if w.nextTraces == nil {
 			return fmt.Errorf("trace transform configured but the exporter does not support traces")
 		}
-		out := ptrace.NewTraces()
-		td.CopyTo(out)
+		out := td
+		if !HandedOff(ctx) {
+			out = ptrace.NewTraces()
+			td.CopyTo(out)
+		}
 		if err := p.traces.runTraces(out); err != nil {
 			return err
 		}

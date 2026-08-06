@@ -337,10 +337,12 @@ func TestSetSeverityNumber(t *testing.T) {
 	}
 }
 
-// The transform must NOT mutate its input: the ingest batcher retries the
-// same payload object, and the spanmetrics tap Consumes it after forwarding.
-// A non-idempotent script re-run on the original must produce the same
-// output, and the input must be unchanged for the tap.
+// An UNMARKED transform must NOT mutate its input: the unmarked producers
+// (logchain.Pending's render-once batches, tailbuffer's drain) retry the SAME
+// payload object, and the spanmetrics tap Consumes a forwarded trace after
+// the export. A non-idempotent script re-run on the original must produce the
+// same output, and the input must be unchanged for the tap. (Handoff-marked
+// payloads opt out of this — see handoff_test.go.)
 func TestTransformDoesNotMutateInput(t *testing.T) {
 	prog, err := Compile([]byte("logs: |\n  def transform(batch):\n      for r in batch:\n          r.body = \"[node] \" + r.body\n"))
 	if err != nil {

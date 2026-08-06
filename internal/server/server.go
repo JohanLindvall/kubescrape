@@ -217,11 +217,11 @@ func (s *Server) warnScrapeAuth(ref string, emit func()) {
 	}
 }
 
-// shadowWarnEvery bounds how often one shadowed (winner, loser) pair may log.
-// Like the scrape-auth throttle, this is a STEADY state rather than an event:
-// the pair is re-decided on every targets request of every agent that has the
-// pod on its node, so an unthrottled line is a permanent flood proportional to
-// fleet size. The counter carries the rate.
+// shadowWarnEvery bounds how often one conflicting (winner, loser) pair may
+// log. Like the scrape-auth throttle, this is a STEADY state rather than an
+// event: the pair is re-decided on every targets request of every agent that
+// has the pod on its node, so an unthrottled line is a permanent flood
+// proportional to fleet size. The counter carries the rate.
 const shadowWarnEvery = 30 * time.Minute
 
 // maxShadowedWarnPairs bounds the throttle table. Keys are monitor PAIRS, so
@@ -229,29 +229,25 @@ const shadowWarnEvery = 30 * time.Minute
 // monitor set that churns.
 const maxShadowedWarnPairs = 1024
 
-// reportShadowed records a monitor endpoint target dropped because another
-// monitor already resolved to the same URL on that pod. See
-// obs.MonitorTargetShadowed for why one of them has to lose, and targetDedup's
-// doc for why it is the first by (namespace, name).
-func (s *Server) reportShadowed(kind, winner, loser, url string) {
-	if winner == loser {
-		// One monitor reaching one pod port twice — through two Services
-		// selecting the pod, or through two endpoints that resolve alike. The
-		// second is the same scrape declaration arriving twice, so nothing is
-		// lost and there is nothing to report; the dedup just collapses it, as
-		// it always has.
-		return
-	}
+// reportAuthConflict records a monitor endpoint whose auth/TLS material could
+// not be merged into the target already holding the same URL on that pod:
+// both declare it and it differs, so the holder's is served (see
+// scrape.MergeMonitorEndpoint — every other endpoint group merges, silently).
+// The scrape is now running with a credential/TLS config one of its CRs did
+// not choose, which must not be discoverable only by a packet capture. The
+// winner may equal the loser: one monitor's two endpoints resolving to one URL
+// with different material is the same unhonoured declaration.
+func (s *Server) reportAuthConflict(kind, winner, loser, url string) {
 	obs.MonitorTargetShadowed.WithLabelValues(kind).Inc()
 	if allow, saturated := s.warnShadowed.Allow(kind + "\x00" + winner + "\x00" + loser); allow || saturated {
 		if saturated {
-			s.log().Warn("shadowed-monitor warning dedupe table is full; further distinct pairs are suppressed",
+			s.log().Warn("conflicting-monitor warning dedupe table is full; further distinct pairs are suppressed",
 				"pairs", maxShadowedWarnPairs)
 		}
 		if allow {
-			s.log().Warn("two monitors resolve to one scrape URL; only the first is served",
-				"kind", kind, "serving", winner, "shadowed", loser, "url", url,
-				"note", "the shadowed monitor's auth and metricRelabelings are NOT applied; "+
+			s.log().Warn("two monitor endpoints declare different auth/TLS for one scrape URL; the first monitor's is served",
+				"kind", kind, "serving", winner, "conflicting", loser, "url", url,
+				"note", "the conflicting endpoint's auth/TLS is NOT applied (its other configuration merges); "+
 					"further warnings for this pair are suppressed for "+shadowWarnEvery.String())
 		}
 	}

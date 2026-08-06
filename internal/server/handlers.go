@@ -335,8 +335,14 @@ func (s *Server) nodeTargets(node string) (targets []kubemeta.ScrapeTarget, buil
 				if !ok {
 					continue
 				}
-				if winner, shadowed := d.shadows(url); shadowed {
-					s.reportShadowed("servicemonitor", winner, sme.monitor, url)
+				if held, taken := d.monitorHolder(url); taken {
+					// The endpoint's configuration merges into the holder — no
+					// target is materialised either way — and only auth/TLS
+					// material both monitors declare differently is a loss
+					// worth reporting.
+					if scrape.MergeMonitorEndpoint(held, sme.monitor, sme.endpoint) {
+						s.reportAuthConflict("servicemonitor", held.Monitor, sme.monitor, url)
+					}
 					continue
 				}
 				for _, t := range scrape.MonitorTargets(np.Pod, svc, sme.monitor, *sme.endpoint) {
@@ -351,8 +357,10 @@ func (s *Server) nodeTargets(node string) (targets []kubemeta.ScrapeTarget, buil
 				if !ok {
 					continue
 				}
-				if winner, shadowed := d.shadows(url); shadowed {
-					s.reportShadowed("podmonitor", winner, pm.name, url)
+				if held, taken := d.monitorHolder(url); taken {
+					if scrape.MergeMonitorEndpoint(held, pm.name, ep) {
+						s.reportAuthConflict("podmonitor", held.Monitor, pm.name, url)
+					}
 					continue
 				}
 				for _, t := range scrape.PodMonitorTargets(np.Pod, pm.name, *ep) {
@@ -428,8 +436,7 @@ func matchingServices(inNamespace []*services.Service, podLabels map[string]stri
 //     series a drop rule asked to remove.
 //
 //   - Two MONITORS resolving to one URL are two independent scrape declarations
-//     that kubescrape cannot both honour, and this is the one place that is a
-//     real limitation rather than a bug: prometheus-operator emits a job per
+//     for a scrape that happens ONCE: prometheus-operator emits a job per
 //     (monitor, endpoint) and distinguishes their series by the `job` label,
 //     while a kubescrape target's exported identity is
 //     (url.full, service.instance.id = host:port, pod, service) with NO monitor
@@ -437,12 +444,18 @@ func matchingServices(inNamespace []*services.Service, podLabels map[string]stri
 //     byte-identical series identities in one payload, which a backend reads as
 //     a conflict rather than as two targets (promscrape's fillTargetResource
 //     comment describes fixing exactly that, and scheduleKey's says the metadata
-//     service dedupes same-URL targets within a pod). The first monitor by
-//     (namespace, name) therefore wins, deterministically — and the loser is
-//     COUNTED and LOGGED (obs.MonitorTargetShadowed), because the outcome an app
-//     team gets is that its metricRelabelings drop rule is a no-op, decided by
-//     alphabetical order, and that must not be something only a packet capture
-//     can reveal.
+//     service dedupes same-URL targets within a pod). The single target instead
+//     honours BOTH declarations: the first monitor by encounter order — the
+//     (namespace, name) index order, ServiceMonitors before PodMonitors, so
+//     deterministically — names the target, and every later endpoint MERGES
+//     into it (scrape.MergeMonitorEndpoint: relabel chains concatenate, the
+//     finer explicit cadence wins with its own timeout, one-sided auth/TLS is
+//     adopted; a bare or identical endpoint merges silently). Only auth/TLS
+//     material both sides declare DIFFERENTLY cannot be honoured twice by one
+//     scrape: the holder's is served and the loser is COUNTED and LOGGED
+//     (obs.MonitorTargetShadowed), because a scrape running with a credential
+//     one of its CRs did not choose must not be something only a packet
+//     capture can reveal.
 type targetDedup struct {
 	// out is the destination slice, re-pointed per pod (dedup is per pod: two
 	// hostNetwork pods legitimately share the node IP and every URL on it).
@@ -463,26 +476,30 @@ func (d *targetDedup) reset(out *[]kubemeta.ScrapeTarget) {
 	clear(d.urlOwner)
 }
 
-// shadows reports the monitor already holding a URL, when an incoming
-// MONITOR-derived target for it could only be dropped. It is the cheap check
-// the caller makes BEFORE materialising: the answer needs the URL and nothing
-// else, so a shadowed target costs a map lookup instead of a 592-byte target
-// with the whole pod document embedded.
+// monitorHolder returns the MONITOR-derived target already holding a URL, when
+// there is one: an incoming monitor endpoint for that URL merges into it
+// instead of being materialised. It is the cheap check the caller makes BEFORE
+// building anything: the answer needs the URL and nothing else, and
+// MergeMonitorEndpoint's own bare-endpoint gate keeps the common shape — N
+// cluster-wide monitors declaring nothing beyond the scrape itself — at a map
+// lookup instead of a 592-byte target with the whole pod document embedded.
 //
 // A URL held by an ANNOTATION target is deliberately not a hit — the monitor
-// target upgrades it, and that upgrade is why the caller must still build one.
-func (d *targetDedup) shadows(url string) (winner string, shadowed bool) {
+// target upgrades it wholesale (see add), and that upgrade is why the caller
+// must still build one.
+func (d *targetDedup) monitorHolder(url string) (*kubemeta.ScrapeTarget, bool) {
 	i, taken := d.urlOwner[url]
 	if !taken {
-		return "", false
+		return nil, false
 	}
 	// By POINTER: a ScrapeTarget is 592 bytes with the pod document embedded,
-	// and this runs per (pod, monitor endpoint).
+	// and this runs per (pod, monitor endpoint). The pointer is into d.out and
+	// dies before the next append can reallocate it.
 	held := &(*d.out)[i]
 	if !configuredTarget(held) {
-		return "", false
+		return nil, false
 	}
-	return held.Monitor, true
+	return held, true
 }
 
 func (d *targetDedup) add(t kubemeta.ScrapeTarget) {

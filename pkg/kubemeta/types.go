@@ -151,6 +151,13 @@ type ScrapeTarget struct {
 	// Monitor names the ServiceMonitor/PodMonitor that produced the
 	// target ("ns/name").
 	Monitor string `json:"monitor,omitempty"`
+	// Monitors lists every monitor whose endpoint configuration this target
+	// carries ("ns/name", Monitor first), set only when more than one
+	// monitor's endpoints resolved to this URL and a second one CONTRIBUTED
+	// configuration — the server serves one merged target per URL rather than
+	// scraping it once per monitor. Absent whenever Monitor alone describes
+	// the target, so existing consumers decode unchanged.
+	Monitors []string `json:"monitors,omitempty"`
 	// InsecureSkipVerify scrapes an https target without verifying its
 	// certificate (from the monitor endpoint's tlsConfig).
 	InsecureSkipVerify bool `json:"insecureSkipVerify,omitempty"`

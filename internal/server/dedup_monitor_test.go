@@ -1,8 +1,11 @@
 package server
 
 import (
+	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"testing"
 	"time"
 
@@ -12,16 +15,20 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
 
+	"github.com/JohanLindvall/kubescrape/internal/obs"
 	"github.com/JohanLindvall/kubescrape/internal/servicemonitors"
 	"github.com/JohanLindvall/kubescrape/internal/services"
 	"github.com/JohanLindvall/kubescrape/internal/store"
 )
 
 type dedupTarget struct {
-	URL               string `json:"url"`
-	Source            string `json:"source"`
-	Monitor           string `json:"monitor"`
-	AuthSecret        string `json:"authSecret"`
+	URL               string   `json:"url"`
+	Source            string   `json:"source"`
+	Monitor           string   `json:"monitor"`
+	Monitors          []string `json:"monitors"`
+	AuthSecret        string   `json:"authSecret"`
+	Interval          string   `json:"interval"`
+	ScrapeTimeout     string   `json:"scrapeTimeout"`
 	MetricRelabelings []struct {
 		Action string   `json:"action"`
 		Regex  string   `json:"regex"`
@@ -159,11 +166,12 @@ func TestDedupKeepsEveryKindOfMonitorConfig(t *testing.T) {
 	}
 }
 
-// twoPodMonitorsOnOneURL builds a pod selected by TWO PodMonitors whose
-// endpoints resolve to the same container port — the platform-team /
-// app-team shape: a cluster-wide monitor with no configuration and a team's
-// own monitor carrying a drop rule and a credential.
-func twoPodMonitorsOnOneURL(t *testing.T) *httptest.Server {
+// twoPodMonitorsWithEndpoints builds a pod selected by several PodMonitors
+// (name → its one endpoint) whose endpoints all resolve to the same container
+// port — the shape the per-URL merge exists for. Upsert order is the map's
+// (random): the served result may depend only on the index's (namespace, name)
+// order.
+func twoPodMonitorsWithEndpoints(t *testing.T, endpoints map[string]map[string]any) *httptest.Server {
 	t.Helper()
 	st := store.New(time.Minute)
 	st.UpsertPod(&corev1.Pod{
@@ -182,16 +190,7 @@ func twoPodMonitorsOnOneURL(t *testing.T) *httptest.Server {
 		Status: corev1.PodStatus{Phase: corev1.PodRunning, PodIP: "10.9.9.9"},
 	})
 	monitors := servicemonitors.NewIndex()
-	for name, ep := range map[string]map[string]any{
-		"pm-a": {"port": "metrics"},
-		"pm-b": {
-			"port":              "metrics",
-			"bearerTokenSecret": map[string]any{"name": "tok", "key": "token"},
-			"metricRelabelings": []any{map[string]any{
-				"action": "drop", "sourceLabels": []any{"__name__"}, "regex": "secret_.*",
-			}},
-		},
-	} {
+	for name, ep := range endpoints {
 		if err := monitors.UpsertPodMonitor(&unstructured.Unstructured{Object: map[string]any{
 			"metadata": map[string]any{"name": name, "namespace": "default"},
 			"spec": map[string]any{
@@ -208,6 +207,204 @@ func twoPodMonitorsOnOneURL(t *testing.T) *httptest.Server {
 	}).Handler())
 	t.Cleanup(srv.Close)
 	return srv
+}
+
+// twoPodMonitorsOnOneURL is the platform-team / app-team shape: a cluster-wide
+// monitor with no configuration and a team's own monitor carrying a drop rule
+// and a credential, both resolving to one URL.
+func twoPodMonitorsOnOneURL(t *testing.T) *httptest.Server {
+	t.Helper()
+	return twoPodMonitorsWithEndpoints(t, map[string]map[string]any{
+		"pm-a": {"port": "metrics"},
+		"pm-b": {
+			"port":              "metrics",
+			"bearerTokenSecret": map[string]any{"name": "tok", "key": "token"},
+			"metricRelabelings": []any{map[string]any{
+				"action": "drop", "sourceLabels": []any{"__name__"}, "regex": "secret_.*",
+			}},
+		},
+	})
+}
+
+// The original failure story: a bare platform monitor sorts first and used to
+// win WHOLE, stripping the app team's drop rule and bearer token from the
+// served target (their scrape then exported the series the CR dropped and
+// 401ed on the credential it named). The single served target must honour
+// BOTH monitors: the winner's name, the loser's relabelings and auth merged in
+// — and nothing counted, because nothing was lost.
+func TestTwoMonitorsOnOneURLMergeConfiguration(t *testing.T) {
+	before := obs.MonitorTargetShadowed.WithLabelValues("podmonitor").Value()
+	srv := twoPodMonitorsOnOneURL(t)
+
+	var out struct {
+		Targets []dedupTarget `json:"targets"`
+	}
+	getJSON(t, srv.URL+"/v1/nodes/node1/targets", http.StatusOK, &out)
+	if len(out.Targets) != 1 {
+		t.Fatalf("want exactly one target for one URL, got %+v", out.Targets)
+	}
+	got := out.Targets[0]
+	if got.Monitor != "default/pm-a" {
+		t.Errorf("target name = %q, want the first monitor default/pm-a", got.Monitor)
+	}
+	if len(got.MetricRelabelings) != 1 || got.MetricRelabelings[0].Regex != "secret_.*" {
+		t.Errorf("the second monitor's drop rule was not merged: %+v", got.MetricRelabelings)
+	}
+	if got.AuthSecret != "default/tok/token" {
+		t.Errorf("the second monitor's bearer token was not merged: %q", got.AuthSecret)
+	}
+	if want := []string{"default/pm-a", "default/pm-b"}; !slices.Equal(got.Monitors, want) {
+		t.Errorf("monitors = %v, want %v", got.Monitors, want)
+	}
+	if n := obs.MonitorTargetShadowed.WithLabelValues("podmonitor").Value() - before; n != 0 {
+		t.Errorf("a mergeable collision was counted %v times as a conflict", n)
+	}
+}
+
+// Two explicit cadences on one URL: the finer interval wins — the coarser
+// monitor is still scraped at least as often as it asked — and the timeout
+// travels with the interval that won (a timeout has no meaning apart from the
+// interval it was written against; the agent clamps it to that interval).
+// Either sort order: fineness decides, not monitor name.
+func TestMergedCadenceFinerIntervalWinsWithItsTimeout(t *testing.T) {
+	for name, endpoints := range map[string]map[string]map[string]any{
+		"finer-second": {
+			"pm-a": {"port": "metrics", "interval": "30s", "scrapeTimeout": "25s"},
+			"pm-b": {"port": "metrics", "interval": "10s", "scrapeTimeout": "5s"},
+		},
+		"finer-first": {
+			"pm-a": {"port": "metrics", "interval": "10s", "scrapeTimeout": "5s"},
+			"pm-b": {"port": "metrics", "interval": "30s", "scrapeTimeout": "25s"},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			srv := twoPodMonitorsWithEndpoints(t, endpoints)
+			var out struct {
+				Targets []dedupTarget `json:"targets"`
+			}
+			getJSON(t, srv.URL+"/v1/nodes/node1/targets", http.StatusOK, &out)
+			if len(out.Targets) != 1 {
+				t.Fatalf("want one merged target, got %+v", out.Targets)
+			}
+			got := out.Targets[0]
+			if got.Monitor != "default/pm-a" {
+				t.Errorf("target name = %q, want default/pm-a", got.Monitor)
+			}
+			if got.Interval != "10s" || got.ScrapeTimeout != "5s" {
+				t.Errorf("cadence = %q/%q, want the finer 10s with its own 5s timeout",
+					got.Interval, got.ScrapeTimeout)
+			}
+		})
+	}
+}
+
+// The merged response is a pure function of the monitor SET: the index orders
+// monitors by (namespace, name) and the merge folds in that order, so the
+// upsert order — informer delivery order, which differs across service
+// replicas and restarts — must not change a byte of the body. The ETag is a
+// body hash, so a shuffled body would also defeat every agent's 304
+// revalidation on the one route that re-sends the node's whole pod set.
+func TestMergedTargetsBodyStableAcrossUpsertOrder(t *testing.T) {
+	monitorsInOrder := func(names []string) *httptest.Server {
+		endpoints := map[string]map[string]any{
+			"sm-bare": {"port": "http"},
+			"sm-cfg": {
+				"port":              "http",
+				"bearerTokenSecret": map[string]any{"name": "tok", "key": "token"},
+				"metricRelabelings": []any{map[string]any{
+					"action": "drop", "sourceLabels": []any{"__name__"}, "regex": "secret_.*",
+				}},
+			},
+			"sm-cadence": {"port": "http", "interval": "10s", "scrapeTimeout": "5s"},
+		}
+		st := store.New(time.Minute)
+		st.UpsertPod(&corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "web-1", Namespace: "default",
+				UID: types.UID("pod-uid"), ResourceVersion: "1",
+				Labels: map[string]string{"app": "web"},
+			},
+			Spec: corev1.PodSpec{
+				NodeName: "node1",
+				Containers: []corev1.Container{{
+					Name: "app", Image: "img",
+					Ports: []corev1.ContainerPort{{Name: "metrics", ContainerPort: 9090}},
+				}},
+			},
+			Status: corev1.PodStatus{Phase: corev1.PodRunning, PodIP: "10.9.9.9"},
+		})
+		svcs := services.NewIndex()
+		svcs.Upsert(&corev1.Service{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "web", Namespace: "default", UID: types.UID("svc-uid"),
+				Labels: map[string]string{"team": "obs"},
+			},
+			Spec: corev1.ServiceSpec{
+				Selector: map[string]string{"app": "web"},
+				Ports:    []corev1.ServicePort{{Name: "http", Port: 80, TargetPort: intstr.FromString("metrics")}},
+			},
+		})
+		monitors := servicemonitors.NewIndex()
+		for _, name := range names {
+			if err := monitors.Upsert(&unstructured.Unstructured{Object: map[string]any{
+				"metadata": map[string]any{"name": name, "namespace": "default"},
+				"spec": map[string]any{
+					"selector":  map[string]any{"matchLabels": map[string]any{"team": "obs"}},
+					"endpoints": []any{endpoints[name]},
+				},
+			}}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		srv := httptest.NewServer(New(Config{
+			Store: st, Services: svcs, Monitors: monitors, Resolver: stubResolver{},
+			MaxWait: 500 * time.Millisecond, CacheTTL: 10 * time.Second, Ready: closedChan(),
+		}).Handler())
+		t.Cleanup(srv.Close)
+		return srv
+	}
+
+	fetch := func(srv *httptest.Server) (string, string) {
+		resp, err := http.Get(srv.URL + "/v1/nodes/node1/targets")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = resp.Body.Close() }()
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(body), resp.Header.Get("ETag")
+	}
+
+	bodyA, etagA := fetch(monitorsInOrder([]string{"sm-bare", "sm-cfg", "sm-cadence"}))
+	bodyB, etagB := fetch(monitorsInOrder([]string{"sm-cadence", "sm-cfg", "sm-bare"}))
+	if bodyA != bodyB {
+		t.Errorf("bodies differ across upsert orders:\n%s\n---\n%s", bodyA, bodyB)
+	}
+	if etagA != etagB {
+		t.Errorf("ETags differ across upsert orders: %q vs %q", etagA, etagB)
+	}
+	// The merge itself happened: the winning monitor's target carries the
+	// others' contributions.
+	var out struct {
+		Targets []dedupTarget `json:"targets"`
+	}
+	if err := json.Unmarshal([]byte(bodyA), &out); err != nil {
+		t.Fatal(err)
+	}
+	if len(out.Targets) != 1 {
+		t.Fatalf("want one merged target, got %+v", out.Targets)
+	}
+	got := out.Targets[0]
+	if got.Monitor != "default/sm-bare" || got.AuthSecret != "default/tok/token" ||
+		got.Interval != "10s" || len(got.MetricRelabelings) != 1 {
+		t.Errorf("merged target = %+v, want sm-bare's name with sm-cfg's auth+rule and sm-cadence's cadence", got)
+	}
+	// Contribution order is the index's (namespace, name) order.
+	if want := []string{"default/sm-bare", "default/sm-cadence", "default/sm-cfg"}; !slices.Equal(got.Monitors, want) {
+		t.Errorf("monitors = %v, want %v", got.Monitors, want)
+	}
 }
 
 // A PodMonitor target carries no Service (it selects pods directly), so when it

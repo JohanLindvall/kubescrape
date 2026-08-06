@@ -193,15 +193,18 @@ func bytesPerTargetsBuild(t *testing.T, f targetsFixture) float64 {
 
 var targetSink []kubemeta.ScrapeTarget
 
-// Two monitors resolving to ONE URL on one pod: only one can be served (a
-// kubescrape target's exported identity has no monitor component, so both would
-// be one series identity twice in a payload), the winner is deterministic, and
-// the LOSER is counted — its metricRelabelings and bearerTokenSecret are not
-// applied, which must not be discoverable only by comparing scraped series with
-// the CR.
-func TestShadowedMonitorIsCountedNotSilent(t *testing.T) {
+// Two monitors declaring DIFFERENT auth for one URL on one pod: one scrape
+// cannot present two credentials, so the first monitor's is served — and the
+// conflict is counted, because a scrape running with a credential one of its
+// CRs did not choose must not be discoverable only by a packet capture. This
+// is the ONE unmergeable endpoint group; everything else merges silently
+// (TestTwoMonitorsOnOneURLMergeConfiguration).
+func TestConflictingMonitorAuthIsCountedNotSilent(t *testing.T) {
 	before := obs.MonitorTargetShadowed.WithLabelValues("podmonitor").Value()
-	srv := twoPodMonitorsOnOneURL(t)
+	srv := twoPodMonitorsWithEndpoints(t, map[string]map[string]any{
+		"pm-a": {"port": "metrics", "bearerTokenSecret": map[string]any{"name": "tok-a", "key": "token"}},
+		"pm-b": {"port": "metrics", "bearerTokenSecret": map[string]any{"name": "tok-b", "key": "token"}},
+	})
 
 	var out struct {
 		Targets []dedupTarget `json:"targets"`
@@ -215,8 +218,34 @@ func TestShadowedMonitorIsCountedNotSilent(t *testing.T) {
 	if out.Targets[0].Monitor != "default/pm-a" {
 		t.Errorf("winner = %q, want default/pm-a", out.Targets[0].Monitor)
 	}
+	if got := out.Targets[0].AuthSecret; got != "default/tok-a/token" {
+		t.Errorf("served auth = %q, want the first monitor's default/tok-a/token", got)
+	}
 	if got := obs.MonitorTargetShadowed.WithLabelValues("podmonitor").Value() - before; got != 1 {
-		t.Errorf("shadowed targets counted = %v, want 1", got)
+		t.Errorf("auth conflicts counted = %v, want 1", got)
+	}
+}
+
+// The SAME auth declared by both monitors is not a conflict: the served
+// material is exactly what each CR asked for, so nothing is lost and nothing
+// may be counted — a false rate here would send an operator hunting for a
+// credential mismatch that does not exist.
+func TestIdenticalMonitorAuthMergesSilently(t *testing.T) {
+	before := obs.MonitorTargetShadowed.WithLabelValues("podmonitor").Value()
+	srv := twoPodMonitorsWithEndpoints(t, map[string]map[string]any{
+		"pm-a": {"port": "metrics", "bearerTokenSecret": map[string]any{"name": "tok", "key": "token"}},
+		"pm-b": {"port": "metrics", "bearerTokenSecret": map[string]any{"name": "tok", "key": "token"}},
+	})
+
+	var out struct {
+		Targets []dedupTarget `json:"targets"`
+	}
+	getJSON(t, srv.URL+"/v1/nodes/node1/targets", http.StatusOK, &out)
+	if len(out.Targets) != 1 || out.Targets[0].AuthSecret != "default/tok/token" {
+		t.Fatalf("want one target carrying the shared auth, got %+v", out.Targets)
+	}
+	if got := obs.MonitorTargetShadowed.WithLabelValues("podmonitor").Value() - before; got != 0 {
+		t.Errorf("identical auth counted %v times as a conflict", got)
 	}
 }
 

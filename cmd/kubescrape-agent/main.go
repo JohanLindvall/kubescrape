@@ -776,7 +776,11 @@ func run() error {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			obs.Registry.Run(ctx, selfOut, *selfMetricsIntv, selfRes, log)
+			// Handoff: the Registry renders fresh pdata per export and never
+			// re-offers a failed payload, but internal/metrics cannot import
+			// the transform package (transform → obs → metrics), so the mark
+			// rides in from here.
+			obs.Registry.Run(transform.Handoff(ctx), selfOut, *selfMetricsIntv, selfRes, log)
 		}()
 		log.Info("self-metrics export started", "interval", *selfMetricsIntv)
 	}
@@ -798,7 +802,12 @@ func run() error {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			logMetrics.Run(ctx, out, *logsMetricsEvery, *logsMetricsBytes)
+			// Handoff for the transform seam: the set renders fresh pdata per
+			// export, and its failed-chunk retention keeps raw SAMPLES that the
+			// next export re-renders (metrics/export.go retain) — never the
+			// pdata. Marked here because internal/metrics cannot import the
+			// transform package (transform → obs → metrics).
+			logMetrics.Run(transform.Handoff(ctx), out, *logsMetricsEvery, *logsMetricsBytes)
 		}()
 		log.Info("log-derived metrics started", "metrics", logMetrics.Count, "interval", *logsMetricsEvery)
 	}
@@ -914,7 +923,7 @@ func run() error {
 		// last window before the deferred exporter/buffer close.
 		fctx, cancel := stepCtx(stepBudget())
 		defer cancel()
-		if err := logMetrics.Export(fctx, out, *logsMetricsBytes); err != nil {
+		if err := logMetrics.Export(transform.Handoff(fctx), out, *logsMetricsBytes); err != nil {
 			log.Warn("final log-metrics export failed", "error", err)
 		}
 	}
@@ -961,7 +970,7 @@ func run() error {
 		// Budgeted here, like every other final export above: ctx is cancelled
 		// by this point, and a dead collector must not outlive the pod's grace.
 		fctx, cancel := stepCtx(min(metrics.FinalExportTimeout, stepBudget()))
-		obs.Registry.FinalExport(fctx, selfOut, selfRes, log)
+		obs.Registry.FinalExport(transform.Handoff(fctx), selfOut, selfRes, log)
 		cancel()
 	}
 	if finalDrain != nil {
@@ -992,7 +1001,7 @@ func (p *pipelines) startLogs(ctx context.Context) (*tailer.Tailer, error) {
 	if err != nil {
 		return nil, fmt.Errorf("logs config: %w", err)
 	}
-	tl := tailer.New(tailer.Config{
+	cfg := tailer.Config{
 		Dir:               *logDir,
 		Sources:           logSources,
 		Positions:         p.posStore,
@@ -1022,7 +1031,19 @@ func (p *pipelines) startLogs(ctx context.Context) (*tailer.Tailer, error) {
 		Metadata:          p.meta,
 		Exporter:          p.out,
 		Logger:            p.log,
-	})
+	}
+	if p.transforms != nil {
+		// The tailer transforms each batch ITSELF — once, in place, before its
+		// retry loop — and exports through the chain BELOW the transform layer:
+		// its retries re-send the SAME payload, which through the wrapper paid a
+		// deep copy plus a script run per attempt. Only the tailer takes this
+		// shape; journald/events/azurediag keep the wrapped `out` (their
+		// logchain.Pending re-offers the same payload, which needs the copy),
+		// and the self chain still sees the shared reloaded program via Fork.
+		cfg.Transform = p.transforms.TransformLogs
+		cfg.Exporter = p.transforms.Inner()
+	}
+	tl := tailer.New(cfg)
 	p.spawn(func() {
 		tl.Run(ctx)
 	})

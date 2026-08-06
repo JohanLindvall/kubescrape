@@ -13,6 +13,7 @@ import (
 	"go.opentelemetry.io/collector/pdata/pmetric"
 
 	"github.com/JohanLindvall/kubescrape/internal/agent/attrs"
+	"github.com/JohanLindvall/kubescrape/internal/agent/transform"
 	"github.com/JohanLindvall/kubescrape/internal/obs"
 	"github.com/JohanLindvall/kubescrape/pkg/kubemeta"
 	"github.com/JohanLindvall/kubescrape/pkg/promparse"
@@ -103,7 +104,12 @@ type scrapeSession struct {
 }
 
 func (s *Scraper) newScrapeSession(ctx context.Context, cb chunker, pipeline, what, warnKey string, relabel *relabelFilter, proto bool) *scrapeSession {
-	ss := &scrapeSession{s: s, ctx: ctx, cb: cb, pipeline: pipeline, what: what, warnKey: warnKey, relabel: relabel, proto: proto}
+	// Handoff to the transform seam, for every chunk this session exports: a
+	// chunk is take()n out of its batcher and never re-sent — a failure
+	// latches exportFailed so even salvage skips it, and the next scrape cycle
+	// rebuilds from a fresh scrape — so the transform wrapper may run its
+	// script in place instead of deep-copying the 3 MiB / 10k-point payload.
+	ss := &scrapeSession{s: s, ctx: transform.Handoff(ctx), cb: cb, pipeline: pipeline, what: what, warnKey: warnKey, relabel: relabel, proto: proto}
 	ss.filter = s.cfg.Filters.filterFor(pipeline).session()
 	ss.conv = newConverter(cb, ss.exportIfFull)
 	return ss

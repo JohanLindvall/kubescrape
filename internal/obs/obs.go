@@ -85,21 +85,24 @@ var (
 	// typo, a missing CRD, or a monitor that matches nothing.
 	MonitorNamespaceRefused = Registry.CounterVec("kubescrape_monitor_namespace_refused_total",
 		"Monitor upserts ignored because their namespace is not permitted by -monitor-namespaces (an informer re-delivery re-counts the same monitor, exactly like the sibling monitor_* counters).", "kind")
-	// MonitorTargetShadowed counts monitor endpoint targets DROPPED because
-	// another monitor's endpoint already resolved to the same URL on the same
-	// pod. Both are legal CRs and prometheus-operator would scrape both (one
-	// job each, distinguished by the `job` label), but a kubescrape target's
-	// exported identity has no monitor component, so serving both would put two
-	// byte-identical series identities in one payload. The first monitor by
-	// (namespace, name) wins — which means the loser's metricRelabelings and
-	// bearerTokenSecret are not applied, decided by alphabetical order. That is
-	// a real limitation and this is what makes it visible; a nonzero rate wants
-	// the two monitors merged or one of them narrowed.
+	// MonitorTargetShadowed counts monitor endpoints whose auth/TLS material
+	// CONFLICTS with the monitor already holding the same URL on the same pod.
+	// Two monitors resolving to one URL are served as ONE merged target that
+	// honours both (a kubescrape target's exported identity has no monitor
+	// component, so scraping twice would put two byte-identical series
+	// identities in one payload): relabel chains concatenate, the finer
+	// explicit cadence wins, one-sided auth/TLS is adopted, and a bare or
+	// identical endpoint merges silently, uncounted. Auth/TLS material is the
+	// one group a single scrape cannot honour twice — when both sides declare
+	// it and it differs, the first monitor's is served and the other's counts
+	// here. A nonzero rate means a scrape is running with a credential or TLS
+	// config one of its CRs did not choose, and wants the two monitors
+	// reconciled.
 	//
 	// Counted per served targets request, like every other decision on that
 	// path: the RATE is the signal, not the absolute value.
 	MonitorTargetShadowed = Registry.CounterVec("kubescrape_monitor_target_shadowed_total",
-		"Monitor endpoint targets dropped because another monitor already resolved to the same URL on that pod.", "kind")
+		"Monitor endpoints whose auth/TLS conflicts with the monitor already holding the same URL on that pod (the holder's is served; the rest of the endpoint's configuration still merges).", "kind")
 	// ScrapeAuthFailures counts /v1/scrape-auth requests that reached the
 	// Secret read and failed there, by CAUSE. The route is the only one that
 	// hard-fails on external state, and every cause used to answer 404: an

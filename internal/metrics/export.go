@@ -202,6 +202,16 @@ const maxRetainedResources = 4096
 const maxRetainedSamples = 50_000
 
 // retain keeps a failed chunk's samples so the next Export re-offers them.
+//
+// What is retained is the raw SAMPLES (seriesSamples over the store's sample
+// structs), never the rendered pdata: the next Export folds them back in via
+// mergeRetry and renders a FRESH pmetric.Metrics. That is what licenses the
+// agent to mark this set's exports with transform.Handoff at its call sites
+// (cmd/kubescrape-agent — this package cannot import the transform package,
+// which reaches it through obs): a payload the transform seam mutated in
+// place is never re-offered, so a script cannot run twice over its own
+// output. If retention ever starts keeping pdata subtrees and merging them
+// into the next payload, those marks become wrong before this comment does.
 func (s *DynamicMetricSet) retain(byResource map[string][]seriesSamples, chunk []string) {
 	if s.retryBy == nil {
 		s.retryBy = map[string][]seriesSamples{}

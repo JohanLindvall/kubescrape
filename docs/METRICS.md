@@ -131,7 +131,7 @@ is the documented alert for the non-buffered tailer.
 | `kubescrape_monitor_fields_ignored_total` | `kind` | Monitor upserts whose endpoints set fields kubescrape does not interpret. |
 | `kubescrape_monitor_namespace_refused_total` | `kind` | Monitor upserts ignored because their namespace is not permitted by -monitor-namespaces (an informer re-delivery re-counts the same monitor, exactly like the sibling monitor_* counters). |
 | `kubescrape_monitor_parse_errors_total` | `kind` | Monitor upserts that failed to parse and were dropped from the index. |
-| `kubescrape_monitor_target_shadowed_total` | `kind` | Monitor endpoint targets dropped because another monitor already resolved to the same URL on that pod. |
+| `kubescrape_monitor_target_shadowed_total` | `kind` | Monitor endpoints whose auth/TLS conflicts with the monitor already holding the same URL on that pod (the holder's is served; the rest of the endpoint's configuration still merges). |
 | `kubescrape_positions_corrupt_total` | — | Positions files that failed to parse at startup (whatever decoded is kept; the affected inputs re-read their window). Recurring bumps across restarts point at a failing disk, not a one-off crash. |
 | `kubescrape_positions_save_errors_total` | — | Failed writes of the positions file (committed offsets and the journald cursor are not being persisted). Any sustained rate means a bad path, a read-only mount or a full disk. |
 | `kubescrape_routed_payload_parts_total` | `route`, `signal` | Payload parts forwarded to a non-default routing destination. |

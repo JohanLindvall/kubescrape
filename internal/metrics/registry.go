@@ -328,7 +328,10 @@ func counterDelta(prev, v float64) float64 {
 }
 
 // Export renders every registered series into one ResourceMetrics carrying
-// the given resource attributes and sends it.
+// the given resource attributes and sends it. The payload is fresh pdata per
+// call and is never retained or re-sent on failure (the next interval renders
+// again), which is what licenses the agent's transform.Handoff mark at the
+// Run/FinalExport call sites in cmd/kubescrape-agent.
 func (r *Registry) Export(ctx context.Context, exp Exporter, res pcommon.Resource) error {
 	r.mu.Lock()
 	series := append([]*series(nil), r.series...)

@@ -615,12 +615,6 @@ func (t *Tailer) sweep(ctx context.Context, all bool) {
 		if f.traces != nil {
 			_ = f.traces.FlushBefore(ctx, fc)
 		}
-		// An aged-out capped group can leave cap-dropped trailing lines'
-		// items orphaned in the FIFO (no emission remains to pop them); with
-		// the stages empty they would pin the watermark forever. Reconciled
-		// HERE, before the batch holding the group's entries flushes, so the
-		// recorded highs ride that flush's commit.
-		t.reconcileFifos(f)
 		if len(t.batch) >= t.cfg.BatchSize {
 			t.flush(ctx)
 		}

@@ -150,10 +150,7 @@ type file struct {
 	// still buffered. The next flush touching the file re-offers them: the
 	// bytes are delivered, only the checkpoint lags, and without the re-offer
 	// `committed` freezes below readPos forever (the high entry belongs to an
-	// earlier batch that no later candidate set sees). reconcileFifos folds
-	// cap-dropped orphan items' ends in through the same map: dropped lines
-	// advance offsets like exported ones, and the clamp defers either kind
-	// while anything below it is still in play. Dead segment ids
+	// earlier batch that no later candidate set sees). Dead segment ids
 	// (truncated away) resolve to nothing and are dropped harmlessly.
 	//
 	// Keyed BY SEGMENT, because withholding is per segment: the clamp deletes
@@ -197,9 +194,6 @@ func (f *file) stateFor(key string) *streamState {
 	return f.state(key)
 }
 
-// logItem is one buffered logical line's offset range; when carries the
-// line's timestamp (CRI-parsed, or the feed time for plain files) so stale
-// items can be recognized (see the fifo pop).
 // pos is a byte position qualified by the segment (file incarnation) it lives
 // in: seg is a per-file monotonic id (the live file is the tail segment; each
 // rename rotation closes the tail into a recorded segment and starts a new
@@ -217,9 +211,9 @@ type pos struct {
 // stream order.
 func (p pos) less(q pos) bool { return p.seg < q.seg || (p.seg == q.seg && p.off < q.off) }
 
+// logItem is one buffered logical line's offset range.
 type logItem struct {
 	start, end pos
-	when       time.Time
 }
 
 // ledger is the byte-offset durability accounting for one file's two-stage
@@ -308,17 +302,6 @@ type streamState struct {
 	lastEnd  pos
 	runStart pos
 	hasRun   bool
-	// A multi-fragment run closed by its F line is not emitted until the
-	// stage sees the NEXT line for the key (or a flush), by which point
-	// feedLine has already advanced lastEnd past it. closed pins the run's
-	// own boundaries for that deferred emission; hasRun stays true meanwhile
-	// so the watermark keeps covering it. nextStart/hasNext hold the
-	// triggering line's registration, installed by the emission callback.
-	closed      bool
-	closedStart pos
-	closedEnd   pos
-	nextStart   pos
-	hasNext     bool
 
 	// fifo holds the buffered logical lines; the live ones are fifo[fifoHead:].
 	// Consumption advances fifoHead rather than re-slicing fifo, so the backing

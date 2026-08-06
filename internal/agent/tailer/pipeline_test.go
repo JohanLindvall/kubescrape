@@ -12,7 +12,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/JohanLindvall/kubescrape/internal/obs"
 	"github.com/JohanLindvall/multiline/patterns"
 	"go.opentelemetry.io/collector/pdata/pcommon"
 )
@@ -76,12 +75,12 @@ func TestNonCRILinePassthrough(t *testing.T) {
 	}
 }
 
-// TestDeferredCRIEmissionOffsets pins the closed-run ledger fix: the stage
-// defers a multi-fragment run's emission until the next line for the key is
-// fed, so the entry's commit offset must be the F line's end (not the
-// triggering line's), and the triggering P fragment must keep watermark
-// coverage (previously the callback stole its registration).
-func TestDeferredCRIEmissionOffsets(t *testing.T) {
+// TestClosedRunEmissionOffsets pins the closed-run ledger accounting: an
+// F-closed multi-fragment run emits within the F line's own AddParsed
+// (multiline >= v0.0.11 FinalMatcher), so the entry's range must be the run's
+// own [runStart, F-line end) — and a P fragment fed AFTERWARDS starts a fresh
+// run that keeps watermark coverage of its own bytes.
+func TestClosedRunEmissionOffsets(t *testing.T) {
 	dir := t.TempDir()
 	exp := &fakeExporter{}
 	tl := newTestTailer(dir, "", exp)
@@ -107,8 +106,8 @@ func TestDeferredCRIEmissionOffsets(t *testing.T) {
 	}
 	endF := int64(len(l1) + len(l2) + 2)
 
-	// Feeding l3 flushed the closed run: exactly one entry, bounded by the
-	// run's own lines.
+	// The F line flushed its run within its own feed: exactly one entry,
+	// bounded by the run's own lines.
 	if len(tl.batch) != 1 {
 		t.Fatalf("batch entries: %d", len(tl.batch))
 	}
@@ -656,16 +655,15 @@ func TestBackloggedPRunSurvivesSweepBoundaryWithMultilineOff(t *testing.T) {
 }
 
 // A capped trace ending on non-accepting continuation lines once left their
-// FIFO items orphaned: the caps dropped the lines from retention, so no
-// emission remained to run the head-drop against, and the watermark reported
-// the file buffered forever — a gone file never settled (drainGone re-ran
-// every sweep, with the fd, the files-map entry and the checkpoint pinned for
-// the process life). multiline >= v0.0.11 charges cap-dropped lines to the
-// last emitted entry's Lines (sum(Lines) equals the lines consumed), so the
-// flush's head-drop pops the FIFO exactly and nothing is orphaned any more:
-// the file must settle with the orphan counter UNMOVED. reconcileFifos stays
-// as the backstop for the shapes exact charging cannot reach (the
-// strict-Before same-nanosecond edge), so the counter itself survives.
+// FIFO items orphaned: the caps dropped the lines from retention with no
+// emission to pop them, and the watermark reported the file buffered forever
+// — a gone file never settled (drainGone re-ran every sweep, with the fd, the
+// files-map entry and the checkpoint pinned for the process life). multiline
+// >= v0.0.11 charges cap-dropped lines to the last emitted entry's Lines
+// (sum(Lines) equals the lines consumed, pinned upstream by
+// FuzzCappedConservation), so every pushed FIFO item is popped exactly and
+// the file settles — the property this test pins now that the orphan
+// reconciliation machinery is deleted.
 func TestGoneFileSettlesDespiteCapDroppedTrailingLines(t *testing.T) {
 	dir := t.TempDir()
 	ctx := context.Background()
@@ -676,7 +674,8 @@ func TestGoneFileSettlesDespiteCapDroppedTrailingLines(t *testing.T) {
 
 	// A rust panic over the 64-byte cap whose last line lands in a
 	// NON-ACCEPTING state ("stack backtrace:" with no frames after it): the
-	// line is consumed, dropped by the byte cap, and can never be emitted.
+	// line is consumed and dropped by the byte cap, but still charged to the
+	// group's eventual entry.
 	ts := timeNowCRI()
 	writeLog(t, dir,
 		ts+" stderr F thread 'main' panicked at src/main.rs:5:5:",
@@ -684,7 +683,6 @@ func TestGoneFileSettlesDespiteCapDroppedTrailingLines(t *testing.T) {
 		ts+" stderr F stack backtrace:",
 	)
 	tl.scanDir(nil, false)
-	orphansBefore := obs.LogFifoDropped.Value()
 	tl.sweep(ctx, true)
 
 	if err := os.Remove(path); err != nil {
@@ -695,9 +693,6 @@ func TestGoneFileSettlesDespiteCapDroppedTrailingLines(t *testing.T) {
 		_, tracked := tl.files[path]
 		return !tracked
 	}, "gone file settled and released")
-	if got := obs.LogFifoDropped.Value(); got != orphansBefore {
-		t.Fatalf("FIFO items were orphaned (counter moved by %v); exact Lines charging should pop them all", got-orphansBefore)
-	}
 }
 
 // A never-completing group — an exception header followed by endless

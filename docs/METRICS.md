@@ -108,7 +108,6 @@ is the documented alert for the non-buffered tailer.
 | `kubescrape_log_enriched_total` | `format` | Log records by the enrichment strategy that matched (json, logfmt, pattern, none). |
 | `kubescrape_log_entries_total` | — | Log entries exported. With -buffer-dir this counts acceptance into the disk buffer, not collector delivery — reconcile against kubescrape_buffer_dropped_records_total{signal="logs"} for what was later dropped drain-side. |
 | `kubescrape_log_export_failures_total` | — | Log batch exports that failed after retries (files rewound). |
-| `kubescrape_log_fifo_orphans_total` | — | Stale per-line offset entries discarded because the multiline stage dropped over-limit lines it never emitted. |
 | `kubescrape_log_files` | — | Log files currently tracked. |
 | `kubescrape_log_lag_bytes` | — | Total backlog across tracked files: bytes on disk not yet exported and committed. |
 | `kubescrape_log_lag_max_bytes` | — | Largest per-file backlog: bytes on disk not yet exported and committed (per-file breakdown on /debug/tailer). |
@@ -175,4 +174,4 @@ is the documented alert for the non-buffered tailer.
 | `kubescrape_transform_errors_total` | `signal` | Transform program invocations that failed (the batch is NOT exported; the error propagates to the producer's retry path). |
 | `kubescrape_transform_reloads_total` | `outcome` | Transforms-file reloads by outcome (applied, failed — a failed compile keeps the last good program). |
 
-113 metrics.
+112 metrics.

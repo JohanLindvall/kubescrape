@@ -160,8 +160,6 @@ var (
 		"Batches the disk buffer refused for a reason other than capacity (I/O error, closed queue, no space left on device).", "signal")
 	BufferReadErrors = Registry.CounterVec("kubescrape_buffer_read_errors_total",
 		"Disk-buffer read failures while draining. lost=true is reported corruption the queue advanced past (its Stats carry the magnitude); lost=false left the queue in place for a retry.", "signal", "lost")
-	LogFifoDropped = Registry.Counter("kubescrape_log_fifo_orphans_total",
-		"Stale per-line offset entries discarded because the multiline stage dropped over-limit lines it never emitted.")
 	PositionsCorrupt = Registry.Counter("kubescrape_positions_corrupt_total",
 		"Positions files that failed to parse at startup (whatever decoded is kept; the affected inputs re-read "+
 			"their window). Recurring bumps across restarts point at a failing disk, not a one-off crash.")

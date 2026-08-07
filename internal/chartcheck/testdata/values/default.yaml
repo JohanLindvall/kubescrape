@@ -1,0 +1,4 @@
+# The chart with no overrides: pins the defaults, including the DERIVED
+# -logs-exclude-namespaces (null value + the default in-cluster
+# otel-collector.monitoring endpoint => release namespace + endpoint namespace).
+{}

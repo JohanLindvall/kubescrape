@@ -482,11 +482,17 @@ var (
 	otlpTimeout          = flag.Duration("otlp-timeout", 15*time.Second, "per-export timeout")
 )
 
-// otlpHeaders is registered in run(): flag.Var needs the value to exist first.
+// otlpHeaders is registered in init() rather than in the var block above:
+// flag.Var needs the value to exist first. init() rather than run() so the
+// registration is visible to reflection over flag.CommandLine — the FLAGS.md
+// generator (flagsdoc_test.go) walks the flag set without calling run().
 var otlpHeaders headerFlags
 
-func run() error {
+func init() {
 	flag.Var(&otlpHeaders, "otlp-header", "static key=value header sent on every self-metrics export (HTTP header / gRPC metadata, e.g. X-Scope-OrgID=tenant); repeatable")
+}
+
+func run() error {
 	flag.Parse()
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

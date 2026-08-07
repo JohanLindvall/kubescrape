@@ -118,6 +118,7 @@ is the documented alert for the non-buffered tailer.
 | `kubescrape_log_oversized_dropped_total` | — | Unterminated lines discarded for exceeding the per-entry size bound (no newline within MaxEntryBytes+4096). |
 | `kubescrape_log_permanent_dropped_total` | — | Log records dropped after a definitive collector rejection (retrying could not succeed; offsets advanced so the pipeline survives). |
 | `kubescrape_log_pod_attrs_refused_total` | `key` | Resource-attribute keys a pod's kubescrape.io/logs annotation tried to set that name RESOLVED KUBERNETES IDENTITY (namespace, pod, container, node) and were refused. The annotation is authoritative about the workload's own description, never about which object — or which tenant — the records belong to: k8s.namespace.name is the routing key, so honouring it let any pod redirect its logs into another tenant. A nonzero rate is a workload attempting it, whether by mistake or not. |
+| `kubescrape_log_pod_config_invalid_total` | — | Files whose pod's kubescrape.io/logs annotation failed to PARSE and was ignored (counted at metadata resolution, once per file). Logs keep flowing under the source defaults — the failure mode this guards against is silent: an operator edits the annotation, nothing changes, and the only signal was one Warn line on one node. The offending files and their parse errors are listed on the agent's GET /debug/tailer as podConfigError. |
 | `kubescrape_log_prefix_lost_total` | — | Rotated-away log segments that could not be re-read (the file was deleted or compressed before its lines were exported, and no open fd survived a restart). These lines are lost. |
 | `kubescrape_log_rate_limited_total` | `action` | Per-file line rate limit hits: lines discarded (action=drop) or reads paused (action=pause). |
 | `kubescrape_log_rotations_total` | — | Log file rotations and truncations handled. |
@@ -174,4 +175,4 @@ is the documented alert for the non-buffered tailer.
 | `kubescrape_transform_errors_total` | `signal` | Transform program invocations that failed (the batch is NOT exported; the error propagates to the producer's retry path). |
 | `kubescrape_transform_reloads_total` | `outcome` | Transforms-file reloads by outcome (applied, failed — a failed compile keeps the last good program). |
 
-112 metrics.
+113 metrics.

@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -502,7 +503,7 @@ func export(t *testing.T, c plogotlp.GRPCClient) error {
 // it. So the reservation must expire on a clock the SENDER does not hold.
 func TestGRPCHeadersOnlyStreamsDoNotPinTheBudget(t *testing.T) {
 	const window = 300 * time.Millisecond
-	s, client, conn := grpcTestServer(t, 4*grpcReserveBytes, window)
+	s, client, conn := grpcTestServer(t, 4*maxIngestGRPCMessage, window)
 
 	if err := export(t, client); err != nil {
 		t.Fatalf("warm-up push: %v", err) // also establishes the connection
@@ -576,7 +577,7 @@ func TestGRPCReserveWindowRacesTheHandoverSafely(t *testing.T) {
 	// A sweep from "always reclaims" to "never reclaims", straddling the
 	// round-trip time in between, so both orderings certainly occur.
 	for _, window := range []time.Duration{time.Nanosecond, 50 * time.Microsecond, 500 * time.Microsecond, 5 * time.Millisecond, 100 * time.Millisecond} {
-		s, client, _ := grpcTestServer(t, 64*grpcReserveBytes, window)
+		s, client, _ := grpcTestServer(t, 64*maxIngestGRPCMessage, window)
 		var wg sync.WaitGroup
 		for range 8 {
 			wg.Add(1)
@@ -617,5 +618,80 @@ func TestGRPCReserveWindowRacesTheHandoverSafely(t *testing.T) {
 	}
 	if refused.Load() == 0 {
 		t.Error("no push was ever reclaimed mid-flight: the window never fired, so nothing raced the handover")
+	}
+}
+
+// ServerConfig.MaxRecvBytes raises the per-message gRPC cap — the counterpart
+// of a collector's max_recv_msg_size — and the buffer budget must scale with
+// it, or a raised cap would leave room for fewer than four reservations (and
+// past 4x the HTTP cap, none at all: tapAdmit could never admit a push).
+func TestMaxRecvBytesScalesCapAndBudget(t *testing.T) {
+	def := NewServer(ServerConfig{})
+	if def.grpcMaxRecv != maxIngestGRPCMessage || def.buffer.limit != maxBufferBytes {
+		t.Fatalf("defaults: grpcMaxRecv=%d budget=%d", def.grpcMaxRecv, def.buffer.limit)
+	}
+	raised := NewServer(ServerConfig{MaxRecvBytes: 40 << 20})
+	if raised.grpcMaxRecv != 40<<20 {
+		t.Fatalf("grpcMaxRecv = %d, want 40 MiB", raised.grpcMaxRecv)
+	}
+	if raised.buffer.limit != 4*(40<<20) {
+		t.Fatalf("budget = %d, want 4x the raised cap", raised.buffer.limit)
+	}
+	// Below the floor the budget stays at the floor: a small cap must not
+	// shrink what the HTTP arm may buffer.
+	small := NewServer(ServerConfig{MaxRecvBytes: 1 << 20})
+	if small.buffer.limit != maxBufferBytes {
+		t.Fatalf("budget = %d, want the %d floor", small.buffer.limit, int64(maxBufferBytes))
+	}
+}
+
+// A push larger than gRPC's 4 MiB default is accepted once MaxRecvBytes covers
+// it — and still refused (ResourceExhausted, grpc-go's own answer) by a
+// default-capped server, which is what makes the flag the difference.
+func TestMaxRecvBytesAdmitsLargePush(t *testing.T) {
+	big := plog.NewLogs()
+	big.ResourceLogs().AppendEmpty().ScopeLogs().AppendEmpty().LogRecords().AppendEmpty().
+		Body().SetStr(strings.Repeat("x", 5<<20))
+
+	push := func(s *Server) error {
+		lis, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		srv := grpc.NewServer(
+			grpc.MaxRecvMsgSize(s.grpcMaxRecv), // Run's wiring
+			grpc.InTapHandle(s.tapAdmit),
+			grpc.UnaryInterceptor(s.limitUnary),
+		)
+		plogotlp.RegisterGRPCServer(srv, &logsGRPC{s: s})
+		go func() { _ = srv.Serve(lis) }()
+		defer srv.Stop()
+		conn, err := grpc.NewClient(lis.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = conn.Close() }()
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		_, err = plogotlp.NewGRPCClient(conn).Export(ctx, plogotlp.NewExportRequestFromLogs(big))
+		return err
+	}
+
+	raised := NewServer(ServerConfig{
+		Enricher:     newEnricher(newMeta(), MetricsAuto),
+		Exporter:     exporterFunc(func(plog.Logs) error { return nil }),
+		MaxRecvBytes: 8 << 20,
+	})
+	if err := push(raised); err != nil {
+		t.Fatalf("5 MiB push refused by an 8 MiB cap: %v", err)
+	}
+
+	def := NewServer(ServerConfig{
+		Enricher: newEnricher(newMeta(), MetricsAuto),
+		Exporter: exporterFunc(func(plog.Logs) error { return nil }),
+	})
+	err := push(def)
+	if st, ok := status.FromError(err); !ok || st.Code() != codes.ResourceExhausted {
+		t.Fatalf("5 MiB push against the default cap: err = %v, want ResourceExhausted", err)
 	}
 }

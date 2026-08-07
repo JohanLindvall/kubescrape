@@ -249,6 +249,9 @@ spec:
             {{- with .Values.agent.ingest.podUidKeys }}
             - -ingest-pod-uid-keys={{ join "," . }}
             {{- end }}
+            {{- with .Values.agent.ingest.grpcMaxRecvBytes }}
+            - -ingest-grpc-max-recv-bytes={{ int64 . }}
+            {{- end }}
             {{- end }}
             - -log-level={{ .Values.logLevel }}
             - -metrics-listen={{ if .Values.metrics.enabled }}{{ .Values.metrics.listen }}{{ end }}

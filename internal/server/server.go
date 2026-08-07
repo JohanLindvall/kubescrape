@@ -263,6 +263,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/self", counted("/v1/self", s.handleSelf))
 	mux.HandleFunc("GET /v1/nodes/{node}/targets", counted("/v1/nodes/targets", s.handleNodeTargets))
 	mux.HandleFunc("GET /v1/nodes/{node}/metadata", counted("/v1/nodes/metadata", s.handleNodeMetadata))
+	mux.HandleFunc("GET /v1/explain/{namespace}/{name}", counted("/v1/explain", s.handleExplain))
 	mux.HandleFunc("GET /v1/scrape-auth/{namespace}/{name}/{key}", counted("/v1/scrape-auth", s.handleScrapeAuth))
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)

@@ -1,0 +1,882 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "additionalProperties": false,
+  "description": "Unified agent configuration (the -config YAML). Generated from the Go config structs; regenerate with: go test ./cmd/kubescrape-agent -run TestConfigSchemaIsCurrent -update-config-schema. Structural only — semantic validation (regex compilation, duration strings, bounds) is -check-config's. See docs/CONFIGURATION.md for what the fields mean.",
+  "properties": {
+    "export": {
+      "additionalProperties": false,
+      "properties": {
+        "clientCertFile": {
+          "type": "string"
+        },
+        "clientKeyFile": {
+          "type": "string"
+        },
+        "headers": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "type": "object"
+        },
+        "logs": {
+          "additionalProperties": false,
+          "properties": {
+            "bearerTokenFile": {
+              "type": "string"
+            },
+            "caFile": {
+              "type": "string"
+            },
+            "clientCertFile": {
+              "type": "string"
+            },
+            "clientKeyFile": {
+              "type": "string"
+            },
+            "compression": {
+              "type": "string"
+            },
+            "endpoint": {
+              "type": "string"
+            },
+            "headers": {
+              "additionalProperties": {
+                "type": "string"
+              },
+              "type": "object"
+            },
+            "insecure": {
+              "type": "boolean"
+            },
+            "insecureSkipVerify": {
+              "type": "boolean"
+            },
+            "protocol": {
+              "type": "string"
+            }
+          },
+          "type": "object"
+        },
+        "metrics": {
+          "additionalProperties": false,
+          "properties": {
+            "bearerTokenFile": {
+              "type": "string"
+            },
+            "caFile": {
+              "type": "string"
+            },
+            "clientCertFile": {
+              "type": "string"
+            },
+            "clientKeyFile": {
+              "type": "string"
+            },
+            "compression": {
+              "type": "string"
+            },
+            "endpoint": {
+              "type": "string"
+            },
+            "headers": {
+              "additionalProperties": {
+                "type": "string"
+              },
+              "type": "object"
+            },
+            "insecure": {
+              "type": "boolean"
+            },
+            "insecureSkipVerify": {
+              "type": "boolean"
+            },
+            "protocol": {
+              "type": "string"
+            }
+          },
+          "type": "object"
+        },
+        "traces": {
+          "additionalProperties": false,
+          "properties": {
+            "bearerTokenFile": {
+              "type": "string"
+            },
+            "caFile": {
+              "type": "string"
+            },
+            "clientCertFile": {
+              "type": "string"
+            },
+            "clientKeyFile": {
+              "type": "string"
+            },
+            "compression": {
+              "type": "string"
+            },
+            "endpoint": {
+              "type": "string"
+            },
+            "headers": {
+              "additionalProperties": {
+                "type": "string"
+              },
+              "type": "object"
+            },
+            "insecure": {
+              "type": "boolean"
+            },
+            "insecureSkipVerify": {
+              "type": "boolean"
+            },
+            "protocol": {
+              "type": "string"
+            }
+          },
+          "type": "object"
+        }
+      },
+      "type": "object"
+    },
+    "logAttributes": {
+      "additionalProperties": false,
+      "properties": {
+        "rules": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "attribute": {
+                "type": "string"
+              },
+              "key": {
+                "type": "string"
+              },
+              "target": {
+                "type": "string"
+              }
+            },
+            "type": "object"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
+    "logMetrics": {
+      "additionalProperties": false,
+      "properties": {
+        "metrics": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "action": {
+                "type": "string"
+              },
+              "buckets": {
+                "items": {
+                  "type": "number"
+                },
+                "type": "array"
+              },
+              "description": {
+                "type": "string"
+              },
+              "labelPrefix": {
+                "type": "string"
+              },
+              "labels": {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "match": {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "matchRegexp": {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "maxAge": {
+                "type": "string"
+              },
+              "maxCardinality": {
+                "type": "integer"
+              },
+              "name": {
+                "type": "string"
+              },
+              "resourceLabels": {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "type": {
+                "type": "string"
+              },
+              "value": {
+                "type": "string"
+              },
+              "valueRegexp": {
+                "type": "string"
+              }
+            },
+            "type": "object"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
+    "logScrubbing": {
+      "additionalProperties": false,
+      "properties": {
+        "builtin": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "rules": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "regexp": {
+                "type": "string"
+              },
+              "replacement": {
+                "type": "string"
+              }
+            },
+            "type": "object"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
+    "logs": {
+      "additionalProperties": false,
+      "properties": {
+        "rules": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "action": {
+                "type": "string"
+              },
+              "match": {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "matchRegexp": {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "sample": {
+                "type": "number"
+              }
+            },
+            "type": "object"
+          },
+          "type": "array"
+        },
+        "sources": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "attributes": {
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "type": "object"
+              },
+              "compressed": {
+                "type": "boolean"
+              },
+              "containerd": {
+                "type": "boolean"
+              },
+              "exclude": {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "excludeNamespaces": {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "ignoreOlder": {
+                "type": "string"
+              },
+              "include": {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "multiline": {
+                "type": "boolean"
+              },
+              "name": {
+                "type": "string"
+              },
+              "namespaces": {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "pathAttributes": {
+                "items": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "attributes": {
+                      "additionalProperties": {
+                        "type": "string"
+                      },
+                      "type": "object"
+                    },
+                    "regexp": {
+                      "type": "string"
+                    }
+                  },
+                  "type": "object"
+                },
+                "type": "array"
+              },
+              "selector": {
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "type": "object"
+              }
+            },
+            "type": "object"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
+    "metrics": {
+      "additionalProperties": false,
+      "properties": {
+        "pipelines": {
+          "additionalProperties": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "action": {
+                  "type": "string"
+                },
+                "labels": {
+                  "additionalProperties": {
+                    "type": "string"
+                  },
+                  "type": "object"
+                },
+                "metrics": {
+                  "type": "string"
+                }
+              },
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "type": "object"
+        },
+        "splitters": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "match": {
+                "additionalProperties": false,
+                "properties": {
+                  "namespace": {
+                    "type": "string"
+                  },
+                  "podLabels": {
+                    "additionalProperties": {
+                      "type": "string"
+                    },
+                    "type": "object"
+                  },
+                  "podName": {
+                    "type": "string"
+                  }
+                },
+                "type": "object"
+              },
+              "rules": {
+                "items": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "attributes": {
+                      "additionalProperties": {
+                        "type": "string"
+                      },
+                      "type": "object"
+                    },
+                    "datapointAttributes": {
+                      "items": {
+                        "type": "string"
+                      },
+                      "type": "array"
+                    },
+                    "dropLabels": {
+                      "type": "string"
+                    },
+                    "enrich": {
+                      "type": "boolean"
+                    },
+                    "groupBy": {
+                      "additionalProperties": {
+                        "type": "string"
+                      },
+                      "type": "object"
+                    },
+                    "instancePrefix": {
+                      "type": "string"
+                    },
+                    "metrics": {
+                      "type": "string"
+                    }
+                  },
+                  "type": "object"
+                },
+                "type": "array"
+              }
+            },
+            "type": "object"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
+    "resourceAttributes": {
+      "additionalProperties": false,
+      "properties": {
+        "attributes": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "type": "object"
+        },
+        "defaults": {
+          "type": "boolean"
+        },
+        "disable": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "enable": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "instancePrefix": {
+          "type": "string"
+        },
+        "pipelines": {
+          "additionalProperties": {},
+          "type": "object"
+        },
+        "static": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "type": "object"
+        }
+      },
+      "type": "object"
+    },
+    "routing": {
+      "additionalProperties": false,
+      "properties": {
+        "routes": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "bearerTokenFile": {
+                "type": "string"
+              },
+              "caFile": {
+                "type": "string"
+              },
+              "clientCertFile": {
+                "type": "string"
+              },
+              "clientKeyFile": {
+                "type": "string"
+              },
+              "endpoint": {
+                "type": "string"
+              },
+              "headers": {
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "type": "object"
+              },
+              "insecure": {
+                "type": "boolean"
+              },
+              "name": {
+                "type": "string"
+              },
+              "namespaces": {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              }
+            },
+            "type": "object"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
+    "serviceGraph": {
+      "additionalProperties": false,
+      "properties": {
+        "dimensions": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "exemplars": {
+          "type": "boolean"
+        },
+        "histogramBuckets": {
+          "items": {
+            "type": "number"
+          },
+          "type": "array"
+        },
+        "maxCardinality": {
+          "type": "integer"
+        },
+        "maxItems": {
+          "type": "integer"
+        },
+        "staleAfter": {
+          "type": "string"
+        },
+        "virtualNodePeerAttributes": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "wait": {
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "serviceGraphShards": {
+      "additionalProperties": false,
+      "properties": {
+        "bearerTokenFile": {
+          "type": "string"
+        },
+        "caFile": {
+          "type": "string"
+        },
+        "endpoints": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "headers": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "type": "object"
+        },
+        "insecure": {
+          "type": "boolean"
+        },
+        "insecureSkipVerify": {
+          "type": "boolean"
+        },
+        "namespace": {
+          "type": "string"
+        },
+        "port": {
+          "type": "integer"
+        },
+        "protocol": {
+          "type": "string"
+        },
+        "replicas": {
+          "type": "integer"
+        },
+        "self": {
+          "type": "string"
+        },
+        "service": {
+          "type": "string"
+        },
+        "statefulSet": {
+          "type": "string"
+        },
+        "tokensPerShard": {
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "tailSampling": {
+      "additionalProperties": false,
+      "properties": {
+        "decisionCacheSize": {
+          "type": "integer"
+        },
+        "decisionCacheTTL": {
+          "type": "string"
+        },
+        "decisionWait": {
+          "type": "string"
+        },
+        "maxSpans": {
+          "type": "integer"
+        },
+        "maxSpansPerTrace": {
+          "type": "integer"
+        },
+        "maxTraces": {
+          "type": "integer"
+        },
+        "policies": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "and": {
+                "additionalProperties": false,
+                "properties": {
+                  "andSubPolicy": {
+                    "items": {},
+                    "type": "array"
+                  }
+                },
+                "type": "object"
+              },
+              "booleanAttribute": {
+                "additionalProperties": false,
+                "properties": {
+                  "key": {
+                    "type": "string"
+                  },
+                  "value": {
+                    "type": "boolean"
+                  }
+                },
+                "type": "object"
+              },
+              "composite": {
+                "additionalProperties": false,
+                "properties": {
+                  "compositeSubPolicy": {
+                    "items": {},
+                    "type": "array"
+                  },
+                  "maxTotalSpansPerSecond": {
+                    "type": "number"
+                  },
+                  "policyOrder": {
+                    "items": {
+                      "type": "string"
+                    },
+                    "type": "array"
+                  },
+                  "rateAllocation": {
+                    "items": {
+                      "additionalProperties": false,
+                      "properties": {
+                        "percent": {
+                          "type": "number"
+                        },
+                        "policy": {
+                          "type": "string"
+                        }
+                      },
+                      "type": "object"
+                    },
+                    "type": "array"
+                  }
+                },
+                "type": "object"
+              },
+              "latency": {
+                "additionalProperties": false,
+                "properties": {
+                  "threshold": {
+                    "type": "string"
+                  },
+                  "upper": {
+                    "type": "string"
+                  }
+                },
+                "type": "object"
+              },
+              "name": {
+                "type": "string"
+              },
+              "numericAttribute": {
+                "additionalProperties": false,
+                "properties": {
+                  "key": {
+                    "type": "string"
+                  },
+                  "maxValue": {
+                    "type": "integer"
+                  },
+                  "minValue": {
+                    "type": "integer"
+                  }
+                },
+                "type": "object"
+              },
+              "probabilistic": {
+                "additionalProperties": false,
+                "properties": {
+                  "samplingPercentage": {
+                    "type": "number"
+                  }
+                },
+                "type": "object"
+              },
+              "rateLimiting": {
+                "additionalProperties": false,
+                "properties": {
+                  "spansPerSecond": {
+                    "type": "number"
+                  }
+                },
+                "type": "object"
+              },
+              "statusCode": {
+                "additionalProperties": false,
+                "properties": {
+                  "statusCodes": {
+                    "items": {
+                      "type": "string"
+                    },
+                    "type": "array"
+                  }
+                },
+                "type": "object"
+              },
+              "stringAttribute": {
+                "additionalProperties": false,
+                "properties": {
+                  "cacheMaxSize": {
+                    "type": "integer"
+                  },
+                  "enabledRegexMatching": {
+                    "type": "boolean"
+                  },
+                  "invertMatch": {
+                    "type": "boolean"
+                  },
+                  "key": {
+                    "type": "string"
+                  },
+                  "values": {
+                    "items": {
+                      "type": "string"
+                    },
+                    "type": "array"
+                  }
+                },
+                "type": "object"
+              },
+              "type": {
+                "type": "string"
+              }
+            },
+            "type": "object"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
+    "traceMetrics": {
+      "additionalProperties": false,
+      "properties": {
+        "buckets": {
+          "items": {
+            "type": "number"
+          },
+          "type": "array"
+        },
+        "dimensions": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "exemplars": {
+          "type": "boolean"
+        },
+        "maxCardinality": {
+          "type": "integer"
+        },
+        "namePrefix": {
+          "type": "string"
+        },
+        "staleAfter": {
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "traceSampling": {
+      "additionalProperties": false,
+      "properties": {
+        "keepErrors": {
+          "type": "boolean"
+        },
+        "keepSlowerThan": {
+          "type": "string"
+        },
+        "maxSpansPerSecond": {
+          "type": "number"
+        },
+        "probability": {
+          "type": "number"
+        }
+      },
+      "type": "object"
+    }
+  },
+  "title": "kubescrape-agent -config",
+  "type": "object"
+}

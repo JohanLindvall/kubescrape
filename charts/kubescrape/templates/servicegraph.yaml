@@ -203,6 +203,11 @@ spec:
             {{- with .Values.agent.ingest.podUidKeys }}
             - -ingest-pod-uid-keys={{ join "," . }}
             {{- end }}
+            {{- with .Values.agent.ingest.grpcMaxRecvBytes }}
+            {{- /* Trace pushes are the largest payloads a fleet sends, so a
+                   raised message cap matters on these ports first. */}}
+            - -ingest-grpc-max-recv-bytes={{ int64 . }}
+            {{- end }}
             {{- else }}
             - -service-graph-ingest=false
             {{- end }}

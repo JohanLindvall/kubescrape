@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/JohanLindvall/kubescrape/internal/agent/attrs"
+	"github.com/JohanLindvall/kubescrape/internal/agent/debugtap"
 	"github.com/JohanLindvall/kubescrape/internal/agent/events"
 	"github.com/JohanLindvall/kubescrape/internal/agent/logscrub"
 	"github.com/JohanLindvall/kubescrape/internal/agent/otlpexport"
@@ -281,6 +282,13 @@ var (
 	// a slow collector needs the pressure surfaced rather than buffered.
 	// Hard-coded, it was tunable only by rebuilding.
 	ingestMaxInFlight = flag.Int("ingest-max-in-flight", 0, "bound on concurrently-processed pushes across both ingest transports; over it senders get a retryable refusal (429 / ResourceExhausted with RetryInfo). 0 uses the built-in default (32)")
+	// The per-message gRPC cap is a real memory grant on an unauthenticated
+	// listener (the tap reserves exactly this much per push), so raising it is
+	// an operator's deliberate trade — but it must BE an operator's: senders
+	// migrating from a collector whose max_recv_msg_size was raised (a common
+	// Alloy tweak) otherwise hit a rebuild-only wall. Applies to the agent's
+	// -ingest listeners and the trace tier's application ports alike.
+	ingestGRPCMaxRecv = flag.Int("ingest-grpc-max-recv-bytes", 0, "cap on one decoded OTLP/gRPC message on the ingest listeners (and the trace tier's application ports); an over-cap push is refused, not truncated. 0 uses gRPC's own default (4 MiB); the OTLP/HTTP body cap stays 16 MiB")
 
 	// The trace tier (-service-graph). Opt-in, off by default, and its own
 	// StatefulSet with every per-node pipeline off: it receives the cluster's
@@ -329,7 +337,10 @@ type pipelines struct {
 	logAttrs     *logattrs.Extractor
 	scrub        *logscrub.Scrubber
 	transforms   *transform.Wrapper
-	logMetrics   *metrics.DynamicMetricSet
+	// debugTap serves the on-demand GET /debug/otlp stream (and its /ui) —
+	// always present, costing one atomic load per export while unused.
+	debugTap   *debugtap.Tap
+	logMetrics *metrics.DynamicMetricSet
 	// journalRules is the compiled logs.rules chain, applied to journal entries
 	// as well as container logs (same section, same semantics).
 	journalRules *logline.LineFilter
@@ -702,6 +713,15 @@ func run() error {
 		log.Info("routing enabled", "routes", len(dests))
 	}
 
+	// The on-demand debug stream (GET /debug/otlp + /debug/otlp/ui): between
+	// the transforms and the router, so it shows payloads exactly as they
+	// will ship — post-transform, routed destinations included. One atomic
+	// load per export while nobody is attached. The self-metrics chain
+	// (preRoute, captured above) deliberately bypasses it along with the
+	// router.
+	debugTap := debugtap.New(out)
+	out = debugTap
+
 	// Transforms wrap the producer-facing exporter ABOVE the disk buffer:
 	// producers → transform → buffer → client, so spooled bytes are final
 	// and a reload never re-interprets a durable backlog. Compile fails
@@ -833,6 +853,7 @@ func run() error {
 		logAttrs:     logAttrs,
 		scrub:        scrub,
 		transforms:   transforms,
+		debugTap:     debugTap,
 		logMetrics:   logMetrics,
 		journalRules: logRules,
 		ingestMode:   ingestMode,
@@ -1159,12 +1180,13 @@ func (p *pipelines) startIngest(ctx context.Context) error {
 	// 404 — a loud, immediate error naming the wrong destination — rather than an
 	// ack for spans that could never have become an edge.
 	scfg := otlpingest.ServerConfig{
-		GRPCAddr:    *ingestGRPC,
-		HTTPAddr:    *ingestHTTP,
-		MaxInFlight: *ingestMaxInFlight,
-		Enricher:    enr,
-		Exporter:    p.out,
-		Logger:      p.log,
+		GRPCAddr:     *ingestGRPC,
+		HTTPAddr:     *ingestHTTP,
+		MaxInFlight:  *ingestMaxInFlight,
+		MaxRecvBytes: *ingestGRPCMaxRecv,
+		Enricher:     enr,
+		Exporter:     p.out,
+		Logger:       p.log,
 	}
 	// The gate only where something binds: with neither address configured the
 	// listeners are a no-op and Ready never fires, so registering it anyway
@@ -1261,6 +1283,12 @@ func (p *pipelines) startDebugServer(ctx context.Context, tl *tailer.Tailer, sc 
 		return
 	}
 	mux := http.NewServeMux()
+	// The homepage's link list is appended beside each registration below, so
+	// it can only ever advertise what this process actually serves.
+	links := []debugLink{
+		{"/healthz", "/healthz", "liveness (static ok)"},
+		{"/readyz", "/readyz", "readiness; pending gates in the body"},
+	}
 	ok := func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))
@@ -1286,6 +1314,8 @@ func (p *pipelines) startDebugServer(ctx context.Context, tl *tailer.Tailer, sc 
 			enc.SetIndent("", "  ")
 			_ = enc.Encode(tl.Status())
 		})
+		links = append(links, debugLink{"/debug/tailer", "/debug/tailer",
+			"per-file tail positions and lag (largest first), rate-limit state, malformed pod annotations"})
 	}
 	if sc != nil {
 		// The last scrape cycle's per-target outcomes, failures first: which
@@ -1296,7 +1326,18 @@ func (p *pipelines) startDebugServer(ctx context.Context, tl *tailer.Tailer, sc 
 			enc.SetIndent("", "  ")
 			_ = enc.Encode(sc.Status())
 		})
+		links = append(links, debugLink{"/debug/targets", "/debug/targets",
+			"per-target last scrape outcomes, failures first, pending targets included"})
 	}
+	// Live OTLP debug stream: what THIS agent is exporting, as JSON lines,
+	// filtered/sampled per request (see internal/agent/debugtap).
+	mux.HandleFunc("GET /debug/otlp", p.debugTap.ServeHTTP)
+	mux.HandleFunc("GET /debug/otlp/ui", p.debugTap.ServeUI)
+	links = append(links,
+		debugLink{"/debug/otlp/ui", "/debug/otlp/ui",
+			"live OTLP debug stream (UI): what this agent is exporting, filtered and sampled"},
+		debugLink{"/debug/otlp?sample=100", "/debug/otlp",
+			"the raw stream (curl -N): signal=logs|metrics|traces, attr=key=value globs, sample=pct"})
 	if p.transforms != nil {
 		// The active transform program's content hash: which nodes have
 		// converged after a reload.
@@ -1304,7 +1345,19 @@ func (p *pipelines) startDebugServer(ctx context.Context, tl *tailer.Tailer, sc 
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(map[string]string{"hash": p.transforms.Active().Hash})
 		})
+		links = append(links, debugLink{"/debug/transforms", "/debug/transforms",
+			"active transform program hash (per-node convergence after a reload)"})
 	}
+	var notes []string
+	if *metricsListen != "" {
+		notes = append(notes, "Prometheus metrics are on their own port: "+*metricsListen+" /metrics.")
+	}
+	if *pprofListen != "" {
+		notes = append(notes, "pprof profiles are on their own port: "+*pprofListen+" /debug/pprof/.")
+	}
+	home := debugHome(links, notes)
+	mux.HandleFunc("GET /debug", home)
+	mux.HandleFunc("GET /debug/{$}", home)
 	// Every handler here answers from an in-memory snapshot in
 	// milliseconds, so tight timeouts are safe: ReadHeaderTimeout kills
 	// Slowloris header trickling, Read/WriteTimeout bound trickled bodies

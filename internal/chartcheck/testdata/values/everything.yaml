@@ -1,0 +1,46 @@
+# Every optional workload and surface on at once: the agent extras (ingest with
+# a raised gRPC cap, journald, disk buffer, explicit exclude list, config file
+# with sources + static attrs), the service's monitors + scrape-auth (token
+# PINNED — lookup() sees no cluster and the fixture must not reach
+# randAlphaNum), the trace tier with span metrics, and the events+azure
+# singleton sharing one Deployment.
+agent:
+  bufferDir: /var/lib/kubescrape-agent/buffer
+  logsExcludeNamespaces: [kube-system, monitoring]
+  staticAttrs:
+    k8s.cluster.name: golden-test
+  journald:
+    enabled: true
+  ingest:
+    enabled: true
+    grpcMaxRecvBytes: 41943040
+    peerIpFallback: true
+  config:
+    resourceAttributes:
+      attributes:
+        team: '{{ with .Pod }}{{ index .Labels "team" }}{{ end }}'
+    logs:
+      sources:
+        - name: containers
+          include: ["/var/log/containers/*.log"]
+          containerd: true
+        - name: azdo
+          include: ["/var/log/host/azdo-diag/**/*.log"]
+          pathAttributes:
+            - regexp: '/azdo-diag/(?P<azdo_agent>[^/]+)/'
+service:
+  serviceMonitors: true
+  scrapeAuthSecrets: true
+  scrapeAuthToken:
+    value: golden-pinned-token
+serviceGraph:
+  enabled: true
+  replicas: 2
+  spanMetrics: true
+events:
+  enabled: true
+azure:
+  enabled: true
+  eventhub:
+    namespace: golden.servicebus.windows.net
+  clientId: 00000000-0000-0000-0000-000000000000

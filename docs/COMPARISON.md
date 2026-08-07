@@ -206,7 +206,12 @@ deciding where to land:
   (kubescrape routes tenancy by namespace, not by log content);
   multi-client dual-write for migration diffing; syslog/cloud/kafka inputs;
   the node-global `limits_config` rate budget (kubescrape's limits are
-  per-file).
+  per-file); journal fields beyond
+  unit/priority/identifier/pid/transport (the reader deliberately fetches
+  only those, one cgo copy each; another field is a code change). Promtail's
+  `regex` stage over `filename` maps to per-source `pathAttributes`
+  (path-regex → resource attributes) plus static per-source `attributes` for
+  per-subtree labelling.
 - **Deeply invested in those**: Alloy is Grafana's supported migration
   target and the path of least resistance
   ([migration guide](MIGRATING-FROM-ALLOY.md) if you change your mind).

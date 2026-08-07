@@ -671,7 +671,7 @@ func (s *Scraper) cycle(ctx context.Context) {
 	}
 	wg.Wait()
 
-	s.publishStatus(outcomes, time.Now())
+	s.publishStatus(outcomes, targets, targetsOK, time.Now())
 	if s.cfg.HealthMetrics && len(outcomes) > 0 && ctx.Err() == nil {
 		s.exportHealth(ctx, outcomes)
 	}

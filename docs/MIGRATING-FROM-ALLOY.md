@@ -201,8 +201,8 @@ Namespace-based defaulting uses `regexMatch`:
 ```
 
 Unwanted attributes are removed with `resourceAttributes.disable` (the
-`delete_key` transforms), e.g. `agent.extraArgs:
-`resourceAttributes.disable: ['k8s\.pod\.label\..*']`. `net.host.name`/
+`delete_key` transforms) — a list of anchored regexes in `agent.config`,
+e.g. `resourceAttributes: {disable: ['k8s\.pod\.ip']}`. `net.host.name`/
 `net.host.port` never exist here, so their deletions have no equivalent.
 
 ### `output_otlp`
@@ -238,7 +238,24 @@ involved.
 
 ### `output_debug_otlp` / the `debug_otlp_output` pod label
 
-Expose the label as an attribute and filter in the collector:
+Built in, and on-demand instead of always-on: every agent serves
+`GET /debug/otlp` on its `-listen` port — a **streaming** dump of what it is
+exporting (logs, metrics and traces, post-transform), one OTLP JSON payload
+per line, with resource-attribute filters (`attr=key=value`, `*`/`?`
+wildcards on both halves, repeatable and ANDed) and a sample percentage as
+query parameters — plus a small built-in page at `/debug/otlp/ui` with
+signal checkboxes, filter fields and a start/stop button:
+
+```sh
+kubectl port-forward ds/kubescrape-agent 8081 &
+curl -sN 'localhost:8081/debug/otlp?signal=logs&attr=k8s.namespace.name=team-*&sample=10'
+```
+
+Nothing is duplicated to the collector and nothing costs anything until a
+client attaches (one atomic load per export). The `debug_otlp_output` pod
+label becomes a filter value instead of pipeline wiring: expose it as an
+attribute (template below) and stream with
+`attr=debug_otlp_output=true`:
 
 ```yaml
 agent:
@@ -247,10 +264,6 @@ agent:
       attributes:
         debug_otlp_output: '{{ with .Pod }}{{ index .Labels "debug_otlp_output" }}{{ end }}'
 ```
-
-with an `otelcol.processor.filter`/debug exporter pair (or a routing
-connector) on the receiving collector, exactly as Alloy's
-`output_debug_otlp` does.
 
 ### `discover_servicemonitors` / `prometheus.operator.servicemonitors`
 
@@ -326,6 +339,34 @@ Two association differences from `otelcol.processor.k8sattributes`:
   replicas; kubescrape never rewrites sender-set attributes. If replicas
   report colliding instance ids, include the pod uid in the sender's
   `OTEL_RESOURCE_ATTRIBUTES` (as above — `service.instance.id=$(POD_UID)`).
+
+One capacity difference: cmb-alloy raises the receiver's gRPC
+`max_recv_msg_size` to 40 MiB, and kubescrape's default is gRPC's own 4 MiB.
+Carry the raise over with `agent.ingest.grpcMaxRecvBytes: 41943040` (flag
+`-ingest-grpc-max-recv-bytes`; it covers the trace tier's application ports
+too, and the receiver's memory budget scales with it). The OTLP/HTTP body cap
+stays 16 MiB. An over-cap push is refused, never truncated, and retrying the
+same batch cannot succeed — the alternative to raising the cap is smaller
+sender batches (an SDK batch-processor setting).
+
+### `input_pure_otlp` (the unenriched listener pair on 14317/14318)
+
+There is no second listener pair and no per-listener enrichment switch —
+but the pure input's job is largely covered by enrichment being strictly
+fill-if-absent: it fires only on a resource carrying a
+`container.id`/`k8s.pod.uid` (connection-IP association stays opt-in), so a
+payload from outside the cluster, or one already fully attributed, passes
+through with its resource attributes untouched. Residual differences: pushed
+log bodies are still parsed for timestamp/severity/trace ids when `-enrich`
+is on (a global switch shared with the tailer), and `datapoint`/`auto`
+metrics mode may still split a payload whose data points carry IDs
+(`-ingest-metrics-mode resource` disables that). One divergence to plan for:
+cmb-alloy's `resourcedetection env` stamps `k8s.cluster.name` on every
+payload, pure ones included, while kubescrape's static attributes ride the
+enrichment merge — an unresolved resource passes with no cluster attribute.
+Stamp it in such senders' `OTEL_RESOURCE_ATTRIBUTES`, or at the downstream
+collector. A sender that must bypass everything should push to the
+downstream collector directly.
 
 ### `prometheus.exporter.unix` (node_exporter)
 

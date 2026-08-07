@@ -1,0 +1,659 @@
+{
+  "type": "object",
+  "properties": {
+    "image": {
+      "type": "object",
+      "properties": {
+        "repository": {
+          "type": "string"
+        },
+        "tag": {
+          "type": "string"
+        },
+        "pullPolicy": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "terminationGracePeriodSeconds": {
+      "type": "integer"
+    },
+    "metrics": {
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "listen": {
+          "type": "string"
+        },
+        "scrapeAnnotations": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false
+    },
+    "pprofListen": {
+      "type": "string"
+    },
+    "logLevel": {
+      "type": "string"
+    },
+    "logFormat": {
+      "type": "string"
+    },
+    "service": {
+      "type": "object",
+      "properties": {
+        "replicas": {
+          "type": "integer"
+        },
+        "priorityClassName": {
+          "type": "string"
+        },
+        "topologySpreadConstraints": {
+          "type": "array",
+          "items": {
+            "type": "object"
+          }
+        },
+        "listen": {
+          "type": "string"
+        },
+        "selfMetricsInterval": {
+          "type": "string"
+        },
+        "waitTimeout": {
+          "type": "string"
+        },
+        "cacheTTL": {
+          "type": "string"
+        },
+        "serviceMonitors": {
+          "type": "boolean"
+        },
+        "otlp": {
+          "type": "object",
+          "properties": {
+            "endpoint": {
+              "type": "string"
+            },
+            "protocol": {
+              "type": "string"
+            },
+            "compression": {
+              "type": "string"
+            },
+            "compressionLevel": {
+              "type": "integer"
+            },
+            "insecure": {
+              "type": "boolean"
+            },
+            "tlsInsecureSkipVerify": {
+              "type": "boolean"
+            },
+            "caFile": {
+              "type": "string"
+            },
+            "timeout": {
+              "type": "string"
+            },
+            "bearerTokenSecret": {
+              "type": "object",
+              "properties": {
+                "name": {
+                  "type": "string"
+                },
+                "key": {
+                  "type": "string"
+                }
+              },
+              "additionalProperties": false
+            }
+          },
+          "additionalProperties": false
+        },
+        "scrapeAuthSecrets": {
+          "type": "boolean"
+        },
+        "scrapeAuthToken": {
+          "type": "object",
+          "properties": {
+            "existingSecret": {
+              "type": "string"
+            },
+            "key": {
+              "type": "string"
+            },
+            "value": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false
+        },
+        "extraRules": {
+          "type": "array",
+          "items": {
+            "type": "object"
+          }
+        },
+        "extraArgs": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "resources": {
+          "type": "object"
+        },
+        "podDisruptionBudget": {
+          "type": "object",
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            },
+            "maxUnavailable": {
+              "type": [
+                "integer",
+                "string"
+              ]
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "agent": {
+      "type": "object",
+      "properties": {
+        "priorityClassName": {
+          "type": "string"
+        },
+        "updateStrategy": {
+          "type": "object"
+        },
+        "tolerations": {
+          "type": "array",
+          "items": {
+            "type": "object"
+          }
+        },
+        "nodeSelector": {
+          "type": "object",
+          "properties": {},
+          "additionalProperties": false
+        },
+        "affinity": {
+          "type": "object",
+          "properties": {},
+          "additionalProperties": false
+        },
+        "listen": {
+          "type": "string"
+        },
+        "selfMetricsInterval": {
+          "type": "string"
+        },
+        "logs": {
+          "type": "boolean"
+        },
+        "metrics": {
+          "type": "boolean"
+        },
+        "cadvisor": {
+          "type": "boolean"
+        },
+        "cadvisorRollups": {
+          "type": "boolean"
+        },
+        "nodeMetrics": {
+          "type": "boolean"
+        },
+        "journald": {
+          "type": "object",
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            },
+            "dir": {
+              "type": "string"
+            },
+            "units": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "batchSize": {
+              "type": "integer"
+            },
+            "maxBatchBytes": {
+              "type": "integer"
+            },
+            "flushInterval": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false
+        },
+        "ingest": {
+          "type": "object",
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            },
+            "grpcEndpoint": {
+              "type": "string"
+            },
+            "httpEndpoint": {
+              "type": "string"
+            },
+            "metricsMode": {
+              "type": "string"
+            },
+            "peerIpFallback": {
+              "type": "boolean"
+            },
+            "containerIdKeys": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "podUidKeys": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "grpcMaxRecvBytes": {
+              "type": "integer"
+            }
+          },
+          "additionalProperties": false
+        },
+        "kubeletEndpoint": {
+          "type": "string"
+        },
+        "kubeletInsecureTLS": {
+          "type": "boolean"
+        },
+        "otlp": {
+          "type": "object",
+          "properties": {
+            "endpoint": {
+              "type": "string"
+            },
+            "protocol": {
+              "type": "string"
+            },
+            "compression": {
+              "type": "string"
+            },
+            "compressionLevel": {
+              "type": "integer"
+            },
+            "insecure": {
+              "type": "boolean"
+            },
+            "tlsInsecureSkipVerify": {
+              "type": "boolean"
+            },
+            "caFile": {
+              "type": "string"
+            },
+            "retryAttempts": {
+              "type": "integer"
+            },
+            "retryBackoff": {
+              "type": "string"
+            },
+            "timeout": {
+              "type": "string"
+            },
+            "maxSendBytes": {
+              "type": "integer"
+            },
+            "bearerTokenSecret": {
+              "type": "object",
+              "properties": {
+                "name": {
+                  "type": "string"
+                },
+                "key": {
+                  "type": "string"
+                }
+              },
+              "additionalProperties": false
+            }
+          },
+          "additionalProperties": false
+        },
+        "logsExcludeNamespaces": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string"
+          },
+          "description": "null derives the default (release namespace + the in-cluster namespace of agent.otlp.endpoint); [] excludes nothing"
+        },
+        "positionsFile": {
+          "type": "string"
+        },
+        "enrich": {
+          "type": "boolean"
+        },
+        "logsRateLimit": {
+          "type": "integer"
+        },
+        "logsRateBurst": {
+          "type": "integer"
+        },
+        "logsRateDrop": {
+          "type": "boolean"
+        },
+        "logsUnknownFiles": {
+          "type": "string"
+        },
+        "logsIdleClose": {
+          "type": "integer"
+        },
+        "logsFileAttributes": {
+          "type": "boolean"
+        },
+        "bufferDir": {
+          "type": "string"
+        },
+        "bufferMaxBytes": {
+          "type": "integer"
+        },
+        "config": {
+          "type": "object"
+        },
+        "logsMetrics": {
+          "type": "object",
+          "properties": {
+            "interval": {
+              "type": "string"
+            },
+            "maxBytes": {
+              "type": "string"
+            },
+            "namePrefix": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false
+        },
+        "logsWatch": {
+          "type": "boolean"
+        },
+        "logsPollInterval": {
+          "type": "string"
+        },
+        "logsFingerprintBytes": {
+          "type": "integer"
+        },
+        "multiline": {
+          "type": "boolean"
+        },
+        "scrapeInterval": {
+          "type": "string"
+        },
+        "scrapeExemplars": {
+          "type": "boolean"
+        },
+        "scrapeHealthMetrics": {
+          "type": "boolean"
+        },
+        "staticAttrs": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "extraArgs": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "extraVolumes": {
+          "type": "array",
+          "items": {
+            "type": "object"
+          }
+        },
+        "extraVolumeMounts": {
+          "type": "array",
+          "items": {
+            "type": "object"
+          }
+        },
+        "resources": {
+          "type": "object"
+        }
+      },
+      "additionalProperties": false
+    },
+    "events": {
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "replicas": {
+          "type": "integer"
+        },
+        "namespace": {
+          "type": "string"
+        },
+        "start": {
+          "type": "string"
+        },
+        "leaseName": {
+          "type": "string"
+        },
+        "positionConfigMap": {
+          "type": "string"
+        },
+        "batchSize": {
+          "type": "integer"
+        },
+        "flushInterval": {
+          "type": "string"
+        },
+        "positionInterval": {
+          "type": "string"
+        },
+        "priorityClassName": {
+          "type": "string"
+        },
+        "nodeSelector": {
+          "type": "object",
+          "properties": {},
+          "additionalProperties": false
+        },
+        "tolerations": {
+          "type": "array",
+          "items": {
+            "type": "object"
+          }
+        },
+        "extraArgs": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "resources": {
+          "type": "object"
+        }
+      },
+      "additionalProperties": false
+    },
+    "serviceGraph": {
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "replicas": {
+          "type": "integer"
+        },
+        "port": {
+          "type": "integer"
+        },
+        "tokenSecret": {
+          "type": "object",
+          "properties": {
+            "name": {
+              "type": "string"
+            },
+            "key": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false
+        },
+        "ingest": {
+          "type": "object",
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            },
+            "grpcEndpoint": {
+              "type": "string"
+            },
+            "httpEndpoint": {
+              "type": "string"
+            },
+            "peerIpFallback": {
+              "type": "boolean"
+            },
+            "allowFrom": {
+              "type": "array",
+              "items": {
+                "type": "object"
+              }
+            }
+          },
+          "additionalProperties": false
+        },
+        "spanMetrics": {
+          "type": "boolean"
+        },
+        "spanMetricsInterval": {
+          "type": "string"
+        },
+        "extraArgs": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "extraVolumes": {
+          "type": "array",
+          "items": {
+            "type": "object"
+          }
+        },
+        "extraVolumeMounts": {
+          "type": "array",
+          "items": {
+            "type": "object"
+          }
+        },
+        "priorityClassName": {
+          "type": "string"
+        },
+        "nodeSelector": {
+          "type": "object",
+          "properties": {},
+          "additionalProperties": false
+        },
+        "tolerations": {
+          "type": "array",
+          "items": {
+            "type": "object"
+          }
+        },
+        "resources": {
+          "type": "object"
+        }
+      },
+      "additionalProperties": false
+    },
+    "azure": {
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "eventhub": {
+          "type": "object",
+          "properties": {
+            "namespace": {
+              "type": "string"
+            },
+            "topics": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "group": {
+              "type": "string"
+            },
+            "connectionStringSecret": {
+              "type": "object",
+              "properties": {
+                "name": {
+                  "type": "string"
+                },
+                "key": {
+                  "type": "string"
+                }
+              },
+              "additionalProperties": false
+            }
+          },
+          "additionalProperties": false
+        },
+        "clientId": {
+          "type": "string"
+        },
+        "tenantId": {
+          "type": "string"
+        },
+        "start": {
+          "type": "string"
+        },
+        "metricPrefix": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "networkPolicy": {
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false
+    },
+    "global": {
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "kubescrape Helm chart values"
+}

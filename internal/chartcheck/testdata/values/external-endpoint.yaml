@@ -1,0 +1,8 @@
+# An OUT-OF-CLUSTER collector endpoint: the logsExcludeNamespaces derivation
+# must exclude only the release namespace — "grafana" is the second label of
+# the host but not a Kubernetes namespace, and excluding it was the bug the
+# in-cluster test exists to prevent.
+agent:
+  otlp:
+    endpoint: otel.grafana.net:443
+    insecure: false

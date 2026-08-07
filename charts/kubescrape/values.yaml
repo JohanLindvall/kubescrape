@@ -188,6 +188,12 @@ agent:
     peerIpFallback: false
     containerIdKeys: []         # default: [container.id, k8s.container.id]
     podUidKeys: []              # default: [k8s.pod.uid]
+    # Cap on one decoded OTLP/gRPC message, in bytes (0 = gRPC's own 4 MiB
+    # default; the OTLP/HTTP body cap stays 16 MiB). An over-cap push is
+    # refused, not truncated. Raising it is a per-push memory grant on an
+    # unauthenticated listener — the receive-buffer budget scales with it.
+    # Also applied to the trace tier's application ports.
+    grpcMaxRecvBytes: 0
 
   # Kubelet scraping; empty disables cadvisor and node metrics.
   kubeletEndpoint: "https://$(NODE_IP):10250"

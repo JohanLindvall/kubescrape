@@ -1,0 +1,7 @@
+# An in-cluster endpoint in a DIFFERENT namespace than the release: the derived
+# -logs-exclude-namespaces must contain both (feedback-loop guard for the
+# collector's own namespace), which is invisible in the default fixture where
+# the two coincide.
+agent:
+  otlp:
+    endpoint: otel-collector.observability.svc:4317

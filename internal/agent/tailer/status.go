@@ -29,6 +29,9 @@ type FileStatus struct {
 	// nothing is lost, and the aggregate is kubescrape_log_segments_stalled —
 	// this field is which FILE.
 	Stalled bool `json:"stalled,omitempty"`
+	// PodConfigError: the pod's kubescrape.io/logs annotation failed to parse
+	// and was ignored (aggregate: kubescrape_log_pod_config_invalid_total).
+	PodConfigError string `json:"podConfigError,omitempty"`
 }
 
 // Status returns the most recently published per-file snapshot (refreshed on
@@ -60,6 +63,8 @@ func (t *Tailer) publishStatus() {
 			Segments:    len(f.segments),
 			RateLimited: f.limited,
 			Stalled:     len(f.segments) > 0 && !f.segmentsFed,
+
+			PodConfigError: f.podConfigErr,
 		}
 		if fs.Stalled {
 			stalled++

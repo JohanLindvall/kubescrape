@@ -2,13 +2,17 @@ package tailer
 
 import (
 	"fmt"
+	"maps"
 	"os"
 	"path"
 	"path/filepath"
+	"regexp"
 	"slices"
+	"strconv"
 	"time"
 
 	"github.com/bmatcuk/doublestar/v4"
+	"go.opentelemetry.io/collector/pdata/pcommon"
 
 	"github.com/JohanLindvall/kubescrape/internal/config"
 	"github.com/JohanLindvall/kubescrape/internal/logline"
@@ -65,6 +69,27 @@ type Source struct {
 	// non-containerd files (ignored for containerd sources, which derive them
 	// from pod metadata). Node attributes from the builder are added too.
 	Attributes map[string]string `json:"attributes,omitempty"`
+	// PathAttributes derive per-file resource attributes from the file's PATH
+	// (a build agent's diagnostic tree encodes job identity in directory
+	// names; nothing on the line carries it). Rules are evaluated once per
+	// file at resolve time, in order, each contributing its captures; they
+	// win over Attributes. Refused on containerd sources, whose path encodes
+	// pod identity that already arrives as metadata.
+	PathAttributes []PathAttribute `json:"pathAttributes,omitempty"`
+}
+
+// PathAttribute is one path-derivation rule: a regexp matched (unanchored)
+// against the file's full path. A non-matching rule contributes nothing.
+type PathAttribute struct {
+	// Regexp is the pattern; a bad one fails startup.
+	Regexp string `json:"regexp"`
+	// Attributes maps attribute key → capture group (a group name, or a group
+	// number as a string). Empty: every NAMED capture group becomes an
+	// attribute keyed by its own name — which cannot express dotted keys
+	// (Go group names are word characters only), so `azdo.agent: agent`
+	// belongs here. A referenced group that does not exist fails startup; a
+	// group that matched empty is skipped.
+	Attributes map[string]string `json:"attributes,omitempty"`
 }
 
 // SourcesConfig is the shape of the `logs` section of the agent config.
@@ -103,6 +128,16 @@ func ValidateSources(sources []Source) ([]Source, error) {
 		if _, err := parseIgnoreOlder(s.IgnoreOlder); err != nil {
 			return nil, fmt.Errorf("source %d (%q): %w", i, s.Name, err)
 		}
+		// Refused rather than ignored: a containerd path encodes pod identity
+		// that already arrives as metadata, so a pathAttributes section there
+		// is a misconfiguration, and this repo does not apply configs
+		// partially in silence.
+		if len(s.PathAttributes) > 0 && s.Containerd {
+			return nil, fmt.Errorf("source %d (%q): pathAttributes is not supported on containerd sources", i, s.Name)
+		}
+		if _, err := compilePathAttributes(s.PathAttributes); err != nil {
+			return nil, fmt.Errorf("source %d (%q): %w", i, s.Name, err)
+		}
 	}
 	return sources, nil
 }
@@ -125,6 +160,7 @@ type compiledSource struct {
 	// ignoreOlder is the resolved mtime cutoff (0 = read everything).
 	ignoreOlder time.Duration
 	attributes  map[string]string
+	pathAttrs   []compiledPathAttr
 	// namespaces/excludeNamespaces gate a containerd source by the namespace
 	// in the CRI filename (discovery time — the file is never opened);
 	// selector gates it by pod labels (resolve time — nothing is ever read).
@@ -148,6 +184,87 @@ type compiledSource struct {
 	// startup scan reads what it finds whole (at-least-once tolerates the
 	// duplicates) rather than skipping a file's backlog as history.
 	startingUp bool
+}
+
+// compiledPathAttr is one PathAttribute with its regexp compiled and every
+// attribute mapping resolved to a submatch index, so applying it is one
+// FindStringSubmatch and no per-file name resolution.
+type compiledPathAttr struct {
+	re   *regexp.Regexp
+	maps []pathAttrMapping
+}
+
+// pathAttrMapping is one attribute the rule produces, in deterministic order
+// (declaration order of named groups, sorted key order for an explicit map).
+type pathAttrMapping struct {
+	key   string
+	group int
+}
+
+// apply stamps the rule's captures onto the attribute map; a non-matching
+// rule, or a group that matched empty, contributes nothing.
+func (c *compiledPathAttr) apply(path string, a pcommon.Map) {
+	m := c.re.FindStringSubmatch(path)
+	if m == nil {
+		return
+	}
+	for _, pm := range c.maps {
+		if v := m[pm.group]; v != "" {
+			a.PutStr(pm.key, v)
+		}
+	}
+}
+
+// compilePathAttributes resolves each rule's group references at startup, so a
+// typo'd group name is a -check-config failure rather than a silently absent
+// attribute on every record.
+func compilePathAttributes(rules []PathAttribute) ([]compiledPathAttr, error) {
+	if len(rules) == 0 {
+		return nil, nil
+	}
+	out := make([]compiledPathAttr, 0, len(rules))
+	for i, r := range rules {
+		re, err := regexp.Compile(r.Regexp)
+		if err != nil {
+			return nil, fmt.Errorf("pathAttributes[%d]: %w", i, err)
+		}
+		var ms []pathAttrMapping
+		if len(r.Attributes) == 0 {
+			for idx, name := range re.SubexpNames() {
+				if name != "" {
+					ms = append(ms, pathAttrMapping{key: name, group: idx})
+				}
+			}
+			if len(ms) == 0 {
+				return nil, fmt.Errorf("pathAttributes[%d] (%q): no named capture groups and no attributes mapping — the rule can produce nothing", i, r.Regexp)
+			}
+		} else {
+			for _, key := range slices.Sorted(maps.Keys(r.Attributes)) {
+				idx, err := subexpIndex(re, r.Attributes[key])
+				if err != nil {
+					return nil, fmt.Errorf("pathAttributes[%d] (%q): attribute %q: %w", i, r.Regexp, key, err)
+				}
+				ms = append(ms, pathAttrMapping{key: key, group: idx})
+			}
+		}
+		out = append(out, compiledPathAttr{re: re, maps: ms})
+	}
+	return out, nil
+}
+
+// subexpIndex resolves a capture-group reference: a name, or a 1-based group
+// number spelled as a string.
+func subexpIndex(re *regexp.Regexp, ref string) (int, error) {
+	if n, err := strconv.Atoi(ref); err == nil {
+		if n < 1 || n > re.NumSubexp() {
+			return 0, fmt.Errorf("capture group %d out of range (the regexp has %d)", n, re.NumSubexp())
+		}
+		return n, nil
+	}
+	if idx := re.SubexpIndex(ref); idx >= 0 {
+		return idx, nil
+	}
+	return 0, fmt.Errorf("no capture group named %q", ref)
 }
 
 // wantNamespace reports whether a containerd source accepts this namespace.
@@ -215,6 +332,7 @@ func compileSources(sources []Source, dir string, defaultMultiline bool) []*comp
 		// Validated by ValidateSources; a parse error here cannot happen and
 		// degrades to "no cutoff" rather than dropping the source.
 		ignoreOlder, _ := parseIgnoreOlder(s.IgnoreOlder)
+		pathAttrs, _ := compilePathAttributes(s.PathAttributes)
 		out = append(out, &compiledSource{
 			name:        s.Name,
 			include:     s.Include,
@@ -224,6 +342,7 @@ func compileSources(sources []Source, dir string, defaultMultiline bool) []*comp
 			multiline:   ml,
 			ignoreOlder: ignoreOlder,
 			attributes:  s.Attributes,
+			pathAttrs:   pathAttrs,
 
 			namespaces:        s.Namespaces,
 			excludeNamespaces: s.ExcludeNamespaces,

@@ -1,0 +1,992 @@
+---
+# Source: kubescrape/templates/agent.yaml
+# Agent ingress. The selector must be the AGENT's label: this policy used to
+# select `app: <release>` — the metadata SERVICE's pods — so enabling it left
+# the DaemonSet with no policy at all while silently narrowing the service to a
+# single port. Every port declared on the container belongs here, or the chart
+# would firewall off an endpoint it opened in the same file; the metrics port in
+# particular is the one metrics.scrapeAnnotations tells Prometheus to scrape.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: kubescrape-agent
+  namespace: monitoring
+  labels: 
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/instance: kubescrape
+    helm.sh/chart: kubescrape-0.1.0
+spec:
+  podSelector:
+    matchLabels:
+      app: kubescrape-agent
+  policyTypes: [Ingress]
+  ingress:
+    - ports:
+        - port: 8081
+        - port: 9090
+        - port: 4317
+        - port: 4318
+---
+# Source: kubescrape/templates/events.yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: kubescrape-events
+  namespace: monitoring
+  labels: 
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/instance: kubescrape
+    helm.sh/chart: kubescrape-0.1.0
+spec:
+  podSelector:
+    matchLabels:
+      app: kubescrape-events
+  policyTypes: [Ingress]
+  ingress:
+    - ports:
+        # Health/readiness (the kubelet probes these) and, when enabled, the
+        # scrape port. Nothing else is served.
+        - port: 8081
+        - port: 9090
+---
+# Source: kubescrape/templates/service.yaml
+# Metadata-service ingress. The agent fleet polls the API port and, when
+# metrics.scrapeAnnotations is on, a scraper reaches the metrics port — so both
+# belong here. The pprof port is deliberately NOT opened: it exposes goroutine
+# stacks and heap contents, and is the one listener the chart wants firewalled.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: kubescrape
+  namespace: monitoring
+  labels: 
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/instance: kubescrape
+    helm.sh/chart: kubescrape-0.1.0
+spec:
+  podSelector:
+    matchLabels:
+      app: kubescrape
+  policyTypes: [Ingress]
+  ingress:
+    - ports:
+        - port: 8080
+        - port: 9090
+---
+# Source: kubescrape/templates/servicegraph.yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: kubescrape-servicegraph
+  namespace: monitoring
+  labels: 
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/instance: kubescrape
+    helm.sh/chart: kubescrape-0.1.0
+spec:
+  podSelector:
+    matchLabels:
+      app: kubescrape-servicegraph
+  policyTypes: [Ingress]
+  ingress:
+    # THREE rules, because these ports have three different audiences and a
+    # NetworkPolicy rule's `from` and `ports` apply TOGETHER. They used to be one
+    # rule, so `serviceGraph.ingest.allowFrom` — whose documented job is to scope
+    # who may push TRACES — silently scoped the internal shard port along with
+    # them and BROKE THE RING at this chart's own default replicas: 2. Shard 0
+    # could no longer reach shard 1, every re-shard hop failed the application's
+    # push, and half of every cross-node edge simply never formed, for a reason
+    # nothing in values.yaml mentions.
+    #
+    # 1. Health/readiness and the scrape port. Deliberately unscoped: the
+    #    kubelet's probes come from the node, and Prometheus discovery comes
+    #    from wherever it runs. Undeclared ports (pprof) stay closed.
+    - ports:
+        - port: 8081
+        - port: 9090
+    # 2. The INTERNAL receiver. Its only legitimate clients are the sibling
+    #    shards, so it is scoped to this tier's own pods REGARDLESS of
+    #    allowFrom — the ring is not optional — and it is authenticated by the
+    #    shared bearer token, which is what actually guards it.
+    - ports:
+        - port: 4319
+      from:
+        - podSelector:
+            matchLabels:
+              app: kubescrape-servicegraph
+    # 3. The application OTLP trace ports — the ones allowFrom is FOR.
+    #
+    # WHAT THEY EXPOSE, stated plainly: any pod that can reach them can push
+    # arbitrary OTLP spans into this cluster's traces, with no credential.
+    # Enrichment stamps the SENDER's Kubernetes identity where it can resolve
+    # one, so a forged span is attributable to the pod that sent it rather than
+    # to whatever it claims — but a sender can still emit spans naming any
+    # service.name it likes, and the cost of the volume it pushes is the tier's
+    # and the collector's. That is the same bargain every unauthenticated OTLP
+    # collector in a cluster makes; narrow it with allowFrom if the pod network
+    # is not trusted. EMPTY MEANS ANY POD MAY PUSH TRACES.
+    - ports:
+        - port: 4317
+        - port: 4318
+---
+# Source: kubescrape/templates/agent.yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: kubescrape-agent
+  namespace: monitoring
+  labels: 
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/instance: kubescrape
+    helm.sh/chart: kubescrape-0.1.0
+---
+# Source: kubescrape/templates/events.yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: kubescrape-events
+  namespace: monitoring
+  labels: 
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/instance: kubescrape
+    helm.sh/chart: kubescrape-0.1.0
+  annotations:
+    # The AKS workload-identity webhook keys the federated credential off
+    # this annotation (plus the pod label below).
+    azure.workload.identity/client-id: 00000000-0000-0000-0000-000000000000
+---
+# Source: kubescrape/templates/service.yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: kubescrape
+  namespace: monitoring
+  labels: 
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/instance: kubescrape
+    helm.sh/chart: kubescrape-0.1.0
+---
+# Source: kubescrape/templates/service.yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: kubescrape-scrape-auth
+  namespace: monitoring
+  labels: 
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/instance: kubescrape
+    helm.sh/chart: kubescrape-0.1.0
+type: Opaque
+stringData:
+  token: "golden-pinned-token"
+---
+# Source: kubescrape/templates/agent.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kubescrape-agent-config
+  namespace: monitoring
+  labels: 
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/instance: kubescrape
+    helm.sh/chart: kubescrape-0.1.0
+data:
+  config.yaml: |
+    logs:
+      sources:
+      - containerd: true
+        include:
+        - /var/log/containers/*.log
+        name: containers
+      - include:
+        - /var/log/host/azdo-diag/**/*.log
+        name: azdo
+        pathAttributes:
+        - regexp: /azdo-diag/(?P<azdo_agent>[^/]+)/
+    resourceAttributes:
+      attributes:
+        team: '{{ with .Pod }}{{ index .Labels "team" }}{{ end }}'
+      static:
+        k8s.cluster.name: golden-test
+---
+# Source: kubescrape/templates/agent.yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kubescrape-agent
+  labels: 
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/instance: kubescrape
+    helm.sh/chart: kubescrape-0.1.0
+rules:
+  # Solely for authenticating to the kubelet (cadvisor / node metrics).
+  - apiGroups: [""]
+    resources: ["nodes/metrics"]
+    verbs: ["get"]
+---
+# Source: kubescrape/templates/events.yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kubescrape-events
+  labels: 
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/instance: kubescrape
+    helm.sh/chart: kubescrape-0.1.0
+rules:
+  # The only cluster-wide grant: reading events. It lands on THIS
+  # ServiceAccount, never on the DaemonSet's.
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["events.k8s.io"]
+    resources: ["events"]
+    verbs: ["get", "list", "watch"]
+---
+# Source: kubescrape/templates/service.yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kubescrape
+  labels: 
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/instance: kubescrape
+    helm.sh/chart: kubescrape-0.1.0
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "namespaces", "services", "nodes"]
+    verbs: ["get", "list", "watch"]
+  # StatefulSets and DaemonSets own their pods directly (no ReplicaSet in
+  # between), so their metadata informers are what gives those workloads'
+  # pods owner labels and annotations at all.
+  - apiGroups: ["apps"]
+    resources: ["replicasets", "deployments", "statefulsets", "daemonsets"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["batch"]
+    resources: ["jobs", "cronjobs"]
+    verbs: ["get", "list", "watch"]
+  # Optional: ServiceMonitor discovery (-servicemonitors).
+  - apiGroups: ["monitoring.coreos.com"]
+    resources: ["servicemonitors", "podmonitors"]
+    verbs: ["get", "list", "watch"]
+  # Serving monitor endpoints' bearerTokenSecret to agents. The flag, this
+  # rule and both sides' token all key off service.scrapeAuthSecrets, so they
+  # cannot drift apart.
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get"]
+---
+# Source: kubescrape/templates/agent.yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: kubescrape-agent
+  labels: 
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/instance: kubescrape
+    helm.sh/chart: kubescrape-0.1.0
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: kubescrape-agent
+subjects:
+  - kind: ServiceAccount
+    name: kubescrape-agent
+    namespace: monitoring
+---
+# Source: kubescrape/templates/events.yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: kubescrape-events
+  labels: 
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/instance: kubescrape
+    helm.sh/chart: kubescrape-0.1.0
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: kubescrape-events
+subjects:
+  - kind: ServiceAccount
+    name: kubescrape-events
+    namespace: monitoring
+---
+# Source: kubescrape/templates/service.yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: kubescrape
+  labels: 
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/instance: kubescrape
+    helm.sh/chart: kubescrape-0.1.0
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: kubescrape
+subjects:
+  - kind: ServiceAccount
+    name: kubescrape
+    namespace: monitoring
+---
+# Source: kubescrape/templates/events.yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: kubescrape-events
+  namespace: monitoring
+  labels: 
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/instance: kubescrape
+    helm.sh/chart: kubescrape-0.1.0
+rules:
+  # Leader election: exactly one replica may watch, or every event ships twice.
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "create", "update"]
+  # The resume position. It cannot be a node-local file like the tailer's
+  # positions store: the leader moves, and the successor after a kill is a
+  # different pod that must be able to read where the previous one got to.
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "create", "update"]
+---
+# Source: kubescrape/templates/events.yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: kubescrape-events
+  namespace: monitoring
+  labels: 
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/instance: kubescrape
+    helm.sh/chart: kubescrape-0.1.0
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: kubescrape-events
+subjects:
+  - kind: ServiceAccount
+    name: kubescrape-events
+    namespace: monitoring
+---
+# Source: kubescrape/templates/service.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: kubescrape
+  namespace: monitoring
+  labels: 
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/instance: kubescrape
+    helm.sh/chart: kubescrape-0.1.0
+spec:
+  selector:
+    app: kubescrape
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+---
+# Source: kubescrape/templates/servicegraph.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: kubescrape-servicegraph
+  namespace: monitoring
+  labels:
+    app: kubescrape-servicegraph
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/instance: kubescrape
+    helm.sh/chart: kubescrape-0.1.0
+spec:
+  # HEADLESS (clusterIP: None). This Service exists for the per-pod DNS names
+  # it publishes — <release>-servicegraph-0.<release>-servicegraph.<ns>.svc —
+  # which are what the ring addresses for the INTERNAL hop. A ClusterIP would
+  # round-robin, i.e. send a trace's client half to one shard and its server
+  # half to another: the one failure mode the ring exists to prevent.
+  #
+  # Applications do NOT use this Service; they use the ClusterIP one below,
+  # whose round-robin is exactly what the internal hop then undoes.
+  clusterIP: None
+  # Shards must be addressable while they are still starting (and during a
+  # rolling restart), or the internal hop fails for the whole readiness delay
+  # and the pushes that hash there are refused rather than delayed.
+  publishNotReadyAddresses: true
+  selector:
+    app: kubescrape-servicegraph
+  ports:
+    # Only the internal receiver port: the pods' own health and metrics ports
+    # are reached directly (kubelet probes, prometheus.io/* discovery), not
+    # through this Service.
+    - name: service-graph
+      port: 4319
+      targetPort: service-graph
+---
+# Source: kubescrape/templates/servicegraph.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: kubescrape-traces
+  namespace: monitoring
+  labels:
+    app: kubescrape-servicegraph
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/instance: kubescrape
+    helm.sh/chart: kubescrape-0.1.0
+spec:
+  type: ClusterIP
+  selector:
+    app: kubescrape-servicegraph
+  ports:
+    - name: otlp-grpc
+      port: 4317
+      targetPort: otlp-grpc
+    - name: otlp-http
+      port: 4318
+      targetPort: otlp-http
+---
+# Source: kubescrape/templates/agent.yaml
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: kubescrape-agent
+  namespace: monitoring
+  labels:
+    app: kubescrape-agent
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/instance: kubescrape
+    helm.sh/chart: kubescrape-0.1.0
+spec:
+  updateStrategy:
+    rollingUpdate:
+      maxUnavailable: 1
+    type: RollingUpdate
+  selector:
+    matchLabels:
+      app: kubescrape-agent
+  template:
+    metadata:
+      labels:
+        app: kubescrape-agent
+      annotations:
+        checksum/config: f89226f5b2aefe355feea2a8f5915960ad610c5ba4dc2e894a0e1e38af09d72b
+        # kubescrape discovers prometheus.io/* annotations itself, so the agent
+        # scrapes its own runtime metrics like any other pod.
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9090"
+        prometheus.io/path: /metrics
+    spec:
+      serviceAccountName: kubescrape-agent
+      # The shutdown sequence is bounded but not instant: producers stop
+      # under a budget, then the final log-metrics, span-metrics and
+      # self-metrics exports run, then the disk buffer drains. The kubelet
+      # default of 30s cuts that short during a collector outage.
+      terminationGracePeriodSeconds: 60
+      priorityClassName: system-node-critical
+      tolerations:
+        - effect: NoSchedule
+          key: node-role.kubernetes.io/control-plane
+          operator: Exists
+      containers:
+        - name: agent
+          image: ghcr.io/johanlindvall/kubescrape:latest
+          imagePullPolicy: IfNotPresent
+          command: ["/kubescrape-agent"]
+          args:
+            - -metadata-endpoint=http://kubescrape.monitoring
+            # /v1/scrape-auth returns Secret values and is authenticated. The
+            # flag, the mount and the service's own token all key off this one
+            # value so the two sides cannot drift apart.
+            - -scrape-auth-token-file=/etc/kubescrape/scrape-auth/token
+            - -listen=:8081
+            - -self-metrics-interval=1m
+            - -otlp-endpoint=otel-collector.monitoring:4317
+            - -otlp-protocol=grpc
+            - -otlp-compression=gzip
+            - -otlp-compression-level=0
+            - -otlp-insecure=true
+            - -otlp-tls-insecure-skip-verify=false
+            - -otlp-timeout=15s
+            - -otlp-retry-attempts=3
+            - -otlp-retry-backoff=1s
+            - -logs=true
+            - -metrics=true
+            - -cadvisor=true
+            - -cadvisor-rollups=true
+            - -node-metrics=true
+            - -kubelet-endpoint=https://$(NODE_IP):10250
+            - -kubelet-insecure-tls=true
+            - -positions-file=/var/lib/kubescrape-agent/positions.json
+            - -enrich=true
+            - -logs-file-attributes=false
+            - -logs-unknown-files=auto
+            - -logs-idle-close=0
+            - -buffer-dir=/var/lib/kubescrape-agent/buffer
+            - -buffer-max-bytes=1073741824
+            - -config=/etc/kubescrape/config/config.yaml
+            - -logs-watch=true
+            - -logs-poll-interval=500ms
+            - -logs-fingerprint-bytes=1024
+            - -logs-multiline=true
+            - -logs-exclude-namespaces=kube-system,monitoring
+            - -scrape-interval=30s
+            - -scrape-exemplars=false
+            - -scrape-health-metrics=true
+            - -journald
+            - -journald-batch-size=1024
+            - -journald-max-batch-bytes=1048576
+            - -journald-flush-interval=2s
+            - -ingest
+            - -ingest-grpc-endpoint=:4317
+            - -ingest-http-endpoint=:4318
+            - -ingest-metrics-mode=auto
+            - -ingest-peer-ip-fallback=true
+            - -ingest-grpc-max-recv-bytes=41943040
+            - -log-level=info
+            - -metrics-listen=:9090
+            - -log-format=text
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            # The by-name self-metadata fallback needs this: under
+            # hostNetwork the hostname is the NODE's, not the pod's.
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: NODE_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.hostIP
+          securityContext:
+            # UID 0 because container log files under /var/log/pods are
+            # root-readable only. Reading them needs no CAPABILITIES, though,
+            # and the default set was being carried on the one workload that
+            # runs on every node — the siblings all drop ALL already.
+            runAsUser: 0
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          ports:
+            - name: http
+              containerPort: 8081
+            - name: metrics
+              containerPort: 9090
+            - name: otlp-grpc
+              containerPort: 4317
+            - name: otlp-http
+              containerPort: 4318
+          readinessProbe:
+            httpGet: {path: /readyz, port: http}
+          livenessProbe:
+            httpGet: {path: /healthz, port: http}
+          volumeMounts:
+            - name: config
+              mountPath: /etc/kubescrape/config
+              readOnly: true
+            - name: scrape-auth
+              mountPath: /etc/kubescrape/scrape-auth
+              readOnly: true
+            - name: varlog
+              mountPath: /var/log
+              readOnly: true
+            - name: state
+              mountPath: /var/lib/kubescrape-agent
+            # Volatile journals; persistent ones live under the /var/log
+            # mount above.
+            - name: runlogjournal
+              mountPath: /run/log/journal
+              readOnly: true
+          resources: 
+            limits:
+              memory: 512Mi
+            requests:
+              cpu: 50m
+              memory: 128Mi
+      volumes:
+        - name: varlog
+          hostPath:
+            path: /var/log
+        - name: state
+          hostPath:
+            path: /var/lib/kubescrape-agent
+            type: DirectoryOrCreate
+        - name: config
+          configMap:
+            name: kubescrape-agent-config
+        - name: scrape-auth
+          secret:
+            secretName: kubescrape-scrape-auth
+        - name: runlogjournal
+          hostPath:
+            path: /run/log/journal
+            type: DirectoryOrCreate
+---
+# Source: kubescrape/templates/events.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kubescrape-events
+  namespace: monitoring
+  labels:
+    app: kubescrape-events
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/instance: kubescrape
+    helm.sh/chart: kubescrape-0.1.0
+spec:
+  # One replica is the norm; leader election makes >1 safe (and makes a
+  # rolling update's overlap safe even at 1).
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: kubescrape-events
+  template:
+    metadata:
+      labels:
+        app: kubescrape-events
+        azure.workload.identity/use: "true"
+      annotations:
+        checksum/config: f89226f5b2aefe355feea2a8f5915960ad610c5ba4dc2e894a0e1e38af09d72b
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9090"
+        prometheus.io/path: /metrics
+    spec:
+      serviceAccountName: kubescrape-events
+      # The shutdown sequence is bounded but not instant: producers stop
+      # under a budget, then the final log-metrics, span-metrics and
+      # self-metrics exports run, then the disk buffer drains. The kubelet
+      # default of 30s cuts that short during a collector outage.
+      terminationGracePeriodSeconds: 60
+      containers:
+        - name: events
+          image: ghcr.io/johanlindvall/kubescrape:latest
+          imagePullPolicy: IfNotPresent
+          command: ["/kubescrape-agent"]
+          args:
+            # Every per-node pipeline off: this replica only runs the
+            # cluster-scoped ones.
+            - -logs=false
+            - -metrics=false
+            - -cadvisor=false
+            - -node-metrics=false
+            - -journald=false
+            - -ingest=false
+            - -metadata-endpoint=http://kubescrape.monitoring
+            - -listen=:8081
+            - -self-metrics-interval=1m
+            - -events
+            - -events-lease=kubescrape-cluster-leader
+            - -events-position-configmap=kubescrape-events-position
+            - -events-start=auto
+            - -events-batch-size=512
+            - -events-flush-interval=2s
+            - -events-position-interval=10s
+            - -azure-diagnostics
+            - -azure-eventhub-namespace=golden.servicebus.windows.net
+            - -azure-eventhub-group=$Default
+            - -azure-client-id=00000000-0000-0000-0000-000000000000
+            - -azure-start=end
+            - -azure-metric-prefix=azure.
+            - -otlp-endpoint=otel-collector.monitoring:4317
+            - -otlp-protocol=grpc
+            - -otlp-compression=gzip
+            - -otlp-compression-level=0
+            - -otlp-insecure=true
+            - -otlp-tls-insecure-skip-verify=false
+            - -otlp-timeout=15s
+            - -otlp-retry-attempts=3
+            - -otlp-retry-backoff=1s
+            - -enrich=true
+            - -config=/etc/kubescrape/config/config.yaml
+            - -metrics-listen=:9090
+            - -log-level=info
+            - -log-format=text
+          env:
+            # The agent requires a node name (its own self-metrics identity);
+            # events themselves never carry it — a described object's node is
+            # the object's property, not this reader's.
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef: {fieldPath: spec.nodeName}
+            # The Lease and the position ConfigMap live in this pod's own
+            # namespace; without it the reader cannot tell where to put them.
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef: {fieldPath: metadata.namespace}
+            # Identity for the self-metadata by-name fallback (the hostname
+            # is not the pod's name when the pod shares the host's namespaces).
+            - name: POD_NAME
+              valueFrom:
+                fieldRef: {fieldPath: metadata.name}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 65532
+            capabilities:
+              drop: ["ALL"]
+          ports:
+            - name: http
+              containerPort: 8081
+            - name: metrics
+              containerPort: 9090
+          readinessProbe:
+            httpGet: {path: /readyz, port: http}
+          livenessProbe:
+            httpGet: {path: /healthz, port: http}
+          volumeMounts:
+            - name: config
+              mountPath: /etc/kubescrape/config
+              readOnly: true
+          resources: 
+            limits:
+              memory: 256Mi
+            requests:
+              cpu: 20m
+              memory: 64Mi
+      volumes:
+        - name: config
+          configMap:
+            name: kubescrape-agent-config
+---
+# Source: kubescrape/templates/service.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kubescrape
+  namespace: monitoring
+  labels:
+    app: kubescrape
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/instance: kubescrape
+    helm.sh/chart: kubescrape-0.1.0
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: kubescrape
+  template:
+    metadata:
+      labels:
+        app: kubescrape
+      annotations:
+        # kubescrape's own agents discover prometheus.io/* annotations, so the
+        # service's runtime metrics are scraped like any other pod's.
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9090"
+        prometheus.io/path: /metrics
+    spec:
+      serviceAccountName: kubescrape
+      priorityClassName: system-cluster-critical
+      containers:
+        - name: kubescrape
+          image: ghcr.io/johanlindvall/kubescrape:latest
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 65532
+            capabilities:
+              drop: ["ALL"]
+          args:
+            - -listen=:8080
+            - -self-metrics-interval=1m
+            - -wait-timeout=5s
+            - -cache-ttl=5m
+            - -servicemonitors=true
+            - -scrape-auth-secrets=true
+            - -scrape-auth-token-file=/etc/kubescrape/scrape-auth/token
+            - -otlp-endpoint=otel-collector.monitoring:4317
+            - -otlp-protocol=grpc
+            - -otlp-compression=gzip
+            - -otlp-compression-level=0
+            - -otlp-insecure=true
+            - -otlp-tls-insecure-skip-verify=false
+            - -otlp-timeout=15s
+            - -log-level=info
+            - -metrics-listen=:9090
+            - -log-format=text
+          volumeMounts:
+            - name: scrape-auth-token
+              mountPath: /etc/kubescrape/scrape-auth
+              readOnly: true
+          ports:
+            - name: http
+              containerPort: 8080
+            - name: metrics
+              containerPort: 9090
+          readinessProbe:
+            httpGet: {path: /readyz, port: http}
+          livenessProbe:
+            httpGet: {path: /healthz, port: http}
+          resources: 
+            requests:
+              cpu: 50m
+              memory: 128Mi
+      volumes:
+        - name: scrape-auth-token
+          secret:
+            secretName: kubescrape-scrape-auth
+---
+# Source: kubescrape/templates/servicegraph.yaml
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: kubescrape-servicegraph
+  namespace: monitoring
+  labels:
+    app: kubescrape-servicegraph
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/instance: kubescrape
+    helm.sh/chart: kubescrape-0.1.0
+spec:
+  # The governing headless Service above. Without it the pods get no stable
+  # DNS names and the ring addresses nothing.
+  serviceName: kubescrape-servicegraph
+  # This number IS part of the ring definition: the agents are told the same
+  # count (-service-graph-shards) and derive shard names from it. Scaling the
+  # tier means a `helm upgrade`, not a `kubectl scale` — an agent addressing
+  # the old width keeps working (it simply never uses the new shards), but a
+  # count LARGER than the StatefulSet's addresses pods that do not exist and
+  # their traces are never paired.
+  replicas: 2
+  # Shards are independent — nothing about pairing is ordered — and ordered
+  # startup would delay the last shard's traces for no benefit.
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      app: kubescrape-servicegraph
+  template:
+    metadata:
+      labels:
+        app: kubescrape-servicegraph
+      annotations:
+        checksum/config: f89226f5b2aefe355feea2a8f5915960ad610c5ba4dc2e894a0e1e38af09d72b
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9090"
+        prometheus.io/path: /metrics
+    spec:
+      # A shard restart drops whatever half-edges it was holding, so the
+      # shutdown budget matters here for the same reason it does elsewhere:
+      # the final service-graph and self-metrics exports run before exit.
+      terminationGracePeriodSeconds: 60
+      containers:
+        - name: servicegraph
+          image: ghcr.io/johanlindvall/kubescrape:latest
+          imagePullPolicy: IfNotPresent
+          command: ["/kubescrape-agent"]
+          args:
+            # Every per-node pipeline off: this tier does traces and nothing
+            # else. -ingest in particular stays off — that flag is the
+            # DaemonSet's LOGS-AND-METRICS receiver, and this workload's trace
+            # listeners are -service-graph-ingest-* below.
+            - -logs=false
+            - -metrics=false
+            - -cadvisor=false
+            - -node-metrics=false
+            - -journald=false
+            - -ingest=false
+            - -metadata-endpoint=http://kubescrape.monitoring
+            - -listen=:8081
+            - -self-metrics-interval=1m
+            - -service-graph
+            - -service-graph-listen=:4319
+            # The APPLICATION-facing listeners, behind the ClusterIP Service
+            # above. Unauthenticated by design; scope them with the
+            # NetworkPolicy at the bottom of this file.
+            - -service-graph-ingest
+            - -service-graph-ingest-grpc=:4317
+            - -service-graph-ingest-http=:4318
+            - -ingest-peer-ip-fallback=false
+            - -ingest-grpc-max-recv-bytes=41943040
+            - -service-graph-shards=2
+            - -service-graph-endpoint=kubescrape-servicegraph.monitoring.svc:4319
+            # RED metrics from the spans this tier receives. Derived on the
+            # OWNING shard, so each span is counted exactly once.
+            - -ingest-span-metrics
+            - -ingest-span-metrics-interval=1m
+            - -otlp-endpoint=otel-collector.monitoring:4317
+            - -otlp-protocol=grpc
+            - -otlp-compression=gzip
+            - -otlp-compression-level=0
+            - -otlp-insecure=true
+            - -otlp-tls-insecure-skip-verify=false
+            - -otlp-timeout=15s
+            - -otlp-retry-attempts=3
+            - -otlp-retry-backoff=1s
+            # The same rendered agent config as the DaemonSet. Its
+            # `serviceGraph` (wait / maxItems / maxCardinality / staleAfter /
+            # histogramBuckets / dimensions), `traceMetrics` and
+            # `traceSampling` sections are this tier's tuning; the rest of the
+            # file is the DaemonSet's and is simply unread here.
+            - -config=/etc/kubescrape/config/config.yaml
+            - -metrics-listen=:9090
+            - -log-level=info
+            - -log-format=text
+          env:
+            # The agent binary wants a node name for its own self-metrics
+            # identity; the edges it emits never carry it (an edge is a
+            # property of the two services, not of the shard that paired it).
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef: {fieldPath: spec.nodeName}
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef: {fieldPath: metadata.namespace}
+            # THIS SHARD'S NAME IN THE RING (-service-graph-shard-name defaults
+            # to it): a StatefulSet pod's name is <sts>-<ordinal>, which is
+            # exactly what the ring derives its tokens from. Without it every
+            # span this pod already owns would take a needless network hop back
+            # to this pod. It is also the identity for the self-metadata
+            # by-name fallback.
+            - name: POD_NAME
+              valueFrom:
+                fieldRef: {fieldPath: metadata.name}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 65532
+            capabilities:
+              drop: ["ALL"]
+          ports:
+            - name: http
+              containerPort: 8081
+            - name: metrics
+              containerPort: 9090
+            - name: service-graph
+              containerPort: 4319
+            - name: otlp-grpc
+              containerPort: 4317
+            - name: otlp-http
+              containerPort: 4318
+          readinessProbe:
+            httpGet: {path: /readyz, port: http}
+          livenessProbe:
+            httpGet: {path: /healthz, port: http}
+          volumeMounts:
+            - name: config
+              mountPath: /etc/kubescrape/config
+              readOnly: true
+          resources: 
+            limits:
+              memory: 512Mi
+            requests:
+              cpu: 50m
+              memory: 128Mi
+      volumes:
+        - name: config
+          configMap:
+            name: kubescrape-agent-config

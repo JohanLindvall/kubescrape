@@ -332,10 +332,14 @@ func (p *pipelines) startServiceGraphIngest(ctx context.Context, owner servicegr
 	// object's property, never the reader's.
 	enr := otlpingest.NewEnricher(ecfg)
 	srv := otlpingest.NewServer(otlpingest.ServerConfig{
-		GRPCAddr:    *serviceGraphIngestGRPC,
-		HTTPAddr:    *serviceGraphIngestHTTP,
-		MaxInFlight: *ingestMaxInFlight,
-		Enricher:    enr,
+		GRPCAddr: *serviceGraphIngestGRPC,
+		HTTPAddr: *serviceGraphIngestHTTP,
+		// The application ports share the DaemonSet receiver's admission
+		// knobs: trace pushes are the LARGEST payloads a fleet sends, so the
+		// raised message cap matters here first.
+		MaxInFlight:  *ingestMaxInFlight,
+		MaxRecvBytes: *ingestGRPCMaxRecv,
+		Enricher:     enr,
 		// Exporter nil: this listener serves TRACES only. Logs and metrics belong
 		// on the node-local DaemonSet, where the sender is a pod on the same node
 		// and the payload crosses no network to be attributed.

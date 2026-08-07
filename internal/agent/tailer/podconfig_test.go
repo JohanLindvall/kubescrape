@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/JohanLindvall/kubescrape/internal/obs"
 	"github.com/JohanLindvall/kubescrape/pkg/kubemeta"
 )
 
@@ -92,12 +93,22 @@ func TestPodAnnotationMalformedIsIgnored(t *testing.T) {
 	tl := driveTailer(dir, exp)
 	tl.cfg.Metadata = annotatedMeta{annotation: `{not json`}
 
+	before := obs.LogPodConfigInvalid.Value()
 	tl.scanDir(tl.loadCheckpoints(), true)
 	writeLog(t, dir, "2026-07-05T10:00:00Z stdout F still collected")
 	tl.scanDir(nil, false)
 	driveUntil(t, ctx, tl, func() bool { return len(exp.get()) == 1 }, "record despite bad annotation")
 	if got := exp.get(); !strings.Contains(got[0], "still collected") {
 		t.Fatalf("records = %v", got)
+	}
+	// Ignored is not silent: counted, and named on /debug/tailer.
+	if got := obs.LogPodConfigInvalid.Value(); got != before+1 {
+		t.Errorf("LogPodConfigInvalid = %v, want %v", got, before+1)
+	}
+	tl.publishStatus()
+	st := tl.Status()
+	if len(st) != 1 || st[0].PodConfigError == "" {
+		t.Errorf("status must carry the parse error: %+v", st)
 	}
 }
 

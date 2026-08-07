@@ -97,9 +97,16 @@ func (t *Tailer) applyPodConfig(f *file, annotations map[string]string) {
 	}
 	cfg, rules, err := parsePodLogConfig(raw)
 	if err != nil {
+		// Counted and kept on the file for /debug/tailer (podConfigError):
+		// the Warn line lands on ONE node while the operator who edited the
+		// annotation is elsewhere, and "I changed it and nothing happened"
+		// otherwise has no signal at all.
+		f.podConfigErr = err.Error()
+		obs.LogPodConfigInvalid.Inc()
 		t.log.Warn("ignoring malformed pod log annotation", "path", f.path, "error", err)
 		return
 	}
+	f.podConfigErr = ""
 	if cfg.Exclude {
 		f.excluded = true
 		t.log.Info("pod opted out of log collection", "path", f.path)

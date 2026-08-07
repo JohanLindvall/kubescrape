@@ -83,6 +83,14 @@ type ServerConfig struct {
 	// (0 = defaultMaxInFlight). Over the bound, senders are refused with a
 	// RETRYABLE answer rather than accepted into memory the node does not have.
 	MaxInFlight int
+	// MaxRecvBytes caps ONE decoded gRPC message (0 = maxIngestGRPCMessage,
+	// grpc-go's own 4 MiB default). It exists for senders that batch large —
+	// a collector or Alloy config raising max_recv_msg_size has no other
+	// counterpart here — and it is a real memory grant on an unauthenticated
+	// listener: the tap reserves exactly this much per push, and the byte
+	// budget scales with it (NewServer) so a single legal push always fits.
+	// The HTTP body cap is unaffected (maxIngestBody, already 16 MiB).
+	MaxRecvBytes int
 	// Ready is called once every configured listener is BOUND (not once
 	// something has been received). It is what a readiness gate hangs on: a
 	// rollout that advanced on a probe answering before the port existed would
@@ -118,6 +126,9 @@ type Server struct {
 	// a peer may sit between its HEADERS frame and a decoded message
 	// (grpcReserveWindow). Tests shorten it to exercise the reclaim.
 	reserveWindow time.Duration
+	// grpcMaxRecv is the resolved MaxRecvBytes: the per-message gRPC cap and
+	// the tap's per-push reservation.
+	grpcMaxRecv int
 	// body reads one HTTP request body against that budget and this receiver's
 	// cap. The same reader serves the trace tier's internal listener with a
 	// different cap and no budget (httpbody.go).
@@ -134,11 +145,24 @@ func NewServer(cfg ServerConfig) *Server {
 	if n <= 0 {
 		n = defaultMaxInFlight
 	}
+	recv := cfg.MaxRecvBytes
+	if recv <= 0 {
+		recv = maxIngestGRPCMessage
+	}
+	// The budget must scale with the reservation size: at the fixed
+	// 4x-maxIngestBody it holds sixteen default-size gRPC reservations, but a
+	// raised MaxRecvBytes past maxIngestBody would leave room for fewer than
+	// four — and past 4x it would admit no push at all.
+	budget := int64(maxBufferBytes)
+	if b := 4 * int64(recv); b > budget {
+		budget = b
+	}
 	s := &Server{
 		cfg: cfg, log: log,
 		inFlight:      make(chan struct{}, n),
 		maxInFlight:   n,
-		buffer:        &byteBudget{limit: maxBufferBytes},
+		grpcMaxRecv:   recv,
+		buffer:        &byteBudget{limit: budget},
 		reserveWindow: grpcReserveWindow,
 	}
 	s.body = &BodyReader{max: maxIngestBody, budget: s.buffer}
@@ -202,9 +226,9 @@ func (s *Server) Run(ctx context.Context) error {
 			// What each of these actually bounds, since they are easy to
 			// over-credit:
 			//
-			//   - MaxRecvMsgSize caps ONE decoded message (the gRPC default,
-			//     stated explicitly because it is the only hard cap on how
-			//     much a single push can allocate).
+			//   - MaxRecvMsgSize caps ONE decoded message (the gRPC default
+			//     unless ServerConfig.MaxRecvBytes raises it — the only hard
+			//     cap on how much a single push can allocate).
 			//   - MaxConcurrentStreams caps concurrent RPCs PER CONNECTION.
 			//     Connections themselves are not capped, so this is not a
 			//     server-wide bound: N connections may decode N x this many
@@ -222,7 +246,7 @@ func (s *Server) Run(ctx context.Context) error {
 			//     That closes the gap the previous three left — unbounded
 			//     concurrent BUFFERING — and it can carry the RetryInfo a shed
 			//     needs, because writeEarlyAbort forwards a status' details.
-			grpc.MaxRecvMsgSize(maxIngestGRPCMessage),
+			grpc.MaxRecvMsgSize(s.grpcMaxRecv),
 			grpc.MaxConcurrentStreams(uint32(s.maxInFlight)),
 			grpc.InTapHandle(s.tapAdmit),
 			grpc.UnaryInterceptor(s.limitUnary),

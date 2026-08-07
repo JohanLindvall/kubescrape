@@ -106,15 +106,16 @@ type Config struct {
 // the converter consumes, plus the opaque cursor and realtime timestamp. The
 // source reads these individually (sdjournal GetDataValue) rather than via
 // GetEntry, which enumerates EVERY field of the entry into a fresh map —
-// 20-30 cgo string copies per entry where five suffice.
+// 20-30 cgo string copies per entry where six suffice.
 type rawEntry struct {
-	message  string
-	unit     string // _SYSTEMD_UNIT
-	ident    string // SYSLOG_IDENTIFIER
-	priority string
-	pid      string // _PID
-	cursor   string
-	realtime time.Time
+	message   string
+	unit      string // _SYSTEMD_UNIT
+	ident     string // SYSLOG_IDENTIFIER
+	priority  string
+	pid       string // _PID
+	transport string // _TRANSPORT (journal/stdout/kernel/syslog/audit/driver)
+	cursor    string
+	realtime  time.Time
 }
 
 // source streams journal entries in order and supports cursor resume.
@@ -147,13 +148,14 @@ type Reader struct {
 }
 
 type entry struct {
-	unit     string // resource grouping key
-	body     string
-	ts       time.Time
-	severity plog.SeverityNumber
-	sevText  string
-	pid      int64
-	ident    string // SYSLOG_IDENTIFIER
+	unit      string // resource grouping key
+	body      string
+	ts        time.Time
+	severity  plog.SeverityNumber
+	sevText   string
+	pid       int64
+	ident     string // SYSLOG_IDENTIFIER
+	transport string // _TRANSPORT; distinguishes kernel/stdout/syslog streams
 	// origLen is the message's byte length before truncation, or 0 if it was
 	// not truncated. A truncated record carries log.truncated + this length so a
 	// consumer can tell a cut body from a whole one.
@@ -404,11 +406,12 @@ func (r *Reader) sanitize(msg string) (body string, origLen int) {
 // batch.
 func (r *Reader) ingest(re rawEntry, body string, origLen int) {
 	e := entry{
-		unit:    re.unit,
-		ident:   re.ident,
-		body:    body,
-		ts:      re.realtime,
-		origLen: origLen,
+		unit:      re.unit,
+		ident:     re.ident,
+		transport: re.transport,
+		body:      body,
+		ts:        re.realtime,
+		origLen:   origLen,
 	}
 	if e.ts.IsZero() {
 		e.ts = time.Now()
@@ -591,6 +594,9 @@ func (s *recordSink) Stamp(lr plog.LogRecord) {
 	}
 	if e.pid != 0 {
 		lr.Attributes().PutInt("process.pid", e.pid)
+	}
+	if e.transport != "" {
+		lr.Attributes().PutStr("systemd.transport", e.transport)
 	}
 }
 

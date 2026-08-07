@@ -128,6 +128,96 @@ func TestPlainSourceTailing(t *testing.T) {
 	}
 }
 
+func TestPathAttributes(t *testing.T) {
+	dir := t.TempDir()
+	sub := filepath.Join(dir, "azdo-diag", "agent-7", "buildlogs", "tl-42")
+	if err := os.MkdirAll(sub, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	exp := &fakeExporter{}
+	tl := newSourceTailer(exp, []Source{{
+		Name:       "azdo",
+		Include:    []string{filepath.Join(dir, "**", "*.log")},
+		Attributes: map[string]string{"azdo.agent": "static-loses"},
+		PathAttributes: []PathAttribute{
+			// Named groups map verbatim.
+			{Regexp: `/azdo-diag/(?P<agent>[^/]+)/`, Attributes: map[string]string{"azdo.agent": "agent"}},
+			// Explicit mapping: dotted keys, plus a numeric group reference.
+			{
+				Regexp: `/buildlogs/(?P<timeline>[^/]+)/(.+)\.log$`,
+				Attributes: map[string]string{
+					"azdo.timeline.id":   "timeline",
+					"azdo.display.name":  "2",
+					"azdo.never.matches": "timeline", // same group, second key: both set
+				},
+			},
+			// A non-matching rule contributes nothing (and must not error).
+			{Regexp: `/gh-diag/(?P<gh>[^/]+)/`},
+		},
+	}}, false)
+	stop := startTailer(t, tl)
+	defer stop()
+
+	writeLines(t, filepath.Join(sub, "Compile-Job.log"), "hello")
+	waitFor(t, func() bool { return len(exp.get()) == 1 }, "1 record")
+
+	exp.mu.Lock()
+	ra := exp.resAttrs
+	exp.mu.Unlock()
+	want := map[string]string{
+		"azdo.agent":        "agent-7", // the path capture beats the static
+		"azdo.timeline.id":  "tl-42",
+		"azdo.display.name": "Compile-Job",
+	}
+	for k, v := range want {
+		if ra[k] != v {
+			t.Errorf("attr %s = %q, want %q (all: %v)", k, ra[k], v, ra)
+		}
+	}
+	if _, ok := ra["gh"]; ok {
+		t.Errorf("non-matching rule produced an attribute: %v", ra)
+	}
+}
+
+func TestPathAttributesValidation(t *testing.T) {
+	valid := []Source{{
+		Include: []string{"/var/log/**/*.log"},
+		PathAttributes: []PathAttribute{
+			{Regexp: `/x/(?P<a>[^/]+)/`},
+			{Regexp: `/y/([^/]+)/`, Attributes: map[string]string{"k8s.thing": "1"}},
+		},
+	}}
+	if _, err := ValidateSources(valid); err != nil {
+		t.Fatalf("valid config refused: %v", err)
+	}
+
+	bad := []struct {
+		name string
+		pa   PathAttribute
+	}{
+		{"bad regexp", PathAttribute{Regexp: `(`}},
+		{"unknown group name", PathAttribute{Regexp: `/x/(?P<a>.+)/`, Attributes: map[string]string{"k": "b"}}},
+		{"group number out of range", PathAttribute{Regexp: `/x/(.+)/`, Attributes: map[string]string{"k": "2"}}},
+		{"no groups at all", PathAttribute{Regexp: `/x/.+/`}},
+	}
+	for _, tc := range bad {
+		src := []Source{{Include: []string{"/var/log/*.log"}, PathAttributes: []PathAttribute{tc.pa}}}
+		if _, err := ValidateSources(src); err == nil {
+			t.Errorf("%s: want error, got nil", tc.name)
+		}
+	}
+
+	// Refused (not ignored) on containerd sources.
+	cd := []Source{{
+		Include:        []string{"/var/log/containers/*.log"},
+		Containerd:     true,
+		PathAttributes: []PathAttribute{{Regexp: `(?P<a>.+)`}},
+	}}
+	if _, err := ValidateSources(cd); err == nil || !strings.Contains(err.Error(), "containerd") {
+		t.Errorf("containerd + pathAttributes: want refusal naming containerd, got %v", err)
+	}
+}
+
 func TestSourceIncludeExclude(t *testing.T) {
 	dir := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(dir, "skip"), 0o755); err != nil {

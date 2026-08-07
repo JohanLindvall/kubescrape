@@ -99,13 +99,14 @@ func fakeOpener(all []rawEntry, ended bool) openFunc {
 // entry builds a rawEntry with the common journal fields.
 func mkEntry(cursor, unit, msg, priority string) rawEntry {
 	return rawEntry{
-		message:  msg,
-		priority: priority,
-		unit:     unit,
-		pid:      "42",
-		ident:    "stub",
-		cursor:   cursor,
-		realtime: time.UnixMicro(1_700_000_000_000000),
+		message:   msg,
+		priority:  priority,
+		unit:      unit,
+		pid:       "42",
+		ident:     "stub",
+		transport: "journal",
+		cursor:    cursor,
+		realtime:  time.UnixMicro(1_700_000_000_000000),
 	}
 }
 
@@ -165,6 +166,9 @@ func TestJournalExport(t *testing.T) {
 			}
 			if pid, ok := lr.Attributes().Get("process.pid"); !ok || pid.Int() != 42 {
 				t.Errorf("process.pid = %v", pid)
+			}
+			if tr, ok := lr.Attributes().Get("systemd.transport"); !ok || tr.Str() != "journal" {
+				t.Errorf("systemd.transport = %v", tr)
 			}
 		}
 	}

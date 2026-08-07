@@ -40,9 +40,17 @@ AGENT_CGO := $(if $(findstring journald,$(TAGS)),1,0)
 GOLANGCI_LINT_VERSION := v2.12.2
 GOLANGCI_LINT         := $(shell go env GOPATH)/bin/golangci-lint
 
-.PHONY: all build test vet fmt tidy lint run image image-static verify-tags cluster-up cluster-down clean
+.PHONY: all build test vet fmt fmt-check tidy lint run image image-static verify-tags helm-lint check cluster-up cluster-down e2e clean
 
 all: build
+
+# Everything a pre-merge check runs, ordered to fail fastest: formatting
+# (reported, not rewritten — `make fmt` fixes), then static analysis, then the
+# chart (helm-lint also bootstraps helm into hack/bin, which the chart golden
+# tests in internal/chartcheck pick up), then the test suite and the build-tag
+# guard. One green `make check` is the whole local CI story except `make e2e`,
+# which needs docker/kind and is deliberately separate.
+check: fmt-check vet lint helm-lint test verify-tags
 
 # Local build: unstripped, so delve/gdb work. The release IMAGE strips with
 # -ldflags="-s -w" (see Dockerfile) for a ~30% smaller binary; that does not
@@ -63,6 +71,12 @@ vet:
 
 fmt:
 	gofmt -w .
+
+fmt-check:
+	@out="$$(gofmt -l .)"; if [ -n "$$out" ]; then echo "needs gofmt (run make fmt):"; echo "$$out"; exit 1; fi
+
+helm-lint:
+	"$$(./hack/ensure-helm.sh)" lint charts/kubescrape
 
 tidy:
 	go mod tidy
@@ -106,6 +120,14 @@ cluster-up:
 
 cluster-down:
 	./hack/cluster-down.sh
+
+# End-to-end smoke test: build the image, load it into the kind cluster
+# (created if absent), deploy the shipped manifests plus the debug collector,
+# and assert the pipeline works — readiness gates clear, targets are
+# discovered, the store answers, and telemetry reaches the collector. The
+# cluster is left running for iteration; KEEP=0 tears it down afterwards.
+e2e:
+	./hack/e2e.sh
 
 clean:
 	rm -rf bin

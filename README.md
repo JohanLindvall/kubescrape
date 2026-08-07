@@ -229,6 +229,22 @@ The node's labels and annotations (the agent's `startNodeInfo` provider
 refreshes from this on `-node-metadata-refresh` for `.Node` attribute
 templates).
 
+### `GET /v1/explain/{namespace}/{pod}`
+
+**Why is this pod (not) scraped?** — the decision chain, walked for one pod
+and reported verdict by verdict: whether the pod is scrapeable (and if not,
+why: no IP, terminating, finished), what the `prometheus.io/*` annotations
+say with an **entry-by-entry port resolution** (a numeric port no container
+declares gets a caveat; a port *name* nothing declares is called out as
+resolving to nothing), the declared container ports for comparison, every
+Service selecting the pod with the same per-port analysis (including a
+`targetPort` name that matches no container port), every
+ServiceMonitor/PodMonitor endpoint's verdict, and the final target list
+exactly as `/v1/nodes/{node}/targets` would serve it — dedup and merges
+included. Always answers 200 with a JSON document (a missing pod is
+`"found": false` plus a hint), so `curl -s .../v1/explain/team-a/api-6f9c…-x2 | jq .`
+is the whole workflow. Diagnostic and read-only: no counters move.
+
 ### `GET /v1/scrape-auth/{namespace}/{name}/{key}`
 
 One key of a Secret referenced by a ServiceMonitor/PodMonitor
@@ -340,7 +356,13 @@ rather than degrading quietly. `statefulsets.apps` and `daemonsets.apps`
 are the most recent additions.
 
 `make image` builds a container image from the [Dockerfile](Dockerfile);
-`make test` and `make vet` run the test suite and static checks.
+`make test` and `make vet` run the test suite and static checks. `make check`
+runs the whole pre-merge story in one command — formatting, vet, lint, chart
+lint (bootstrapping `helm` into `hack/bin` if needed), tests and the
+build-tag guard — and `make e2e` runs the kind-based end-to-end smoke test
+([hack/e2e.sh](hack/e2e.sh)): build and load the image, deploy the shipped
+manifests plus a debug collector, and assert readiness, target discovery, a
+container-ID lookup and telemetry arriving at the collector.
 
 ### Build variants (optional pipelines)
 
@@ -1197,11 +1219,21 @@ already knows, so the Prometheus job cannot change mid-series when the lookup
 lands; and the agent's own metrics bypass the namespace router, so a route glob
 covering the agent's namespace cannot move the fleet's own health signal off
 the durable buffered chain (transforms still apply to them).
-`-listen` (default `:8081`) serves `GET /healthz`, `GET /readyz`,
-`GET /debug/tailer` (per-file positions and lag), `GET /debug/targets` (the
-last scrape cycle's per-target outcomes — up/error/duration/samples,
-failures first), `GET /debug/transforms` (the active transform program's
-content hash, for checking per-node convergence after a reload).
+`-listen` (default `:8081`) serves `GET /debug` (a homepage linking every
+debug surface the process serves), `GET /healthz`, `GET /readyz`,
+`GET /debug/tailer` (per-file positions and lag, plus any pod's malformed
+`kubescrape.io/logs` annotation as `podConfigError`), `GET /debug/targets`
+(per-target last outcomes — up/error/duration/samples, merged across cycles
+so long-interval targets keep their last result and undue ones show as
+pending; failures first), `GET /debug/transforms` (the active transform
+program's content hash, for checking per-node convergence after a reload),
+and `GET /debug/otlp` — a **live stream** of what the agent is exporting
+(logs, metrics and traces, post-transform) as OTLP JSON lines, filtered by
+resource attributes (`attr=key=value`, `*`/`?` wildcards on both halves,
+ANDed) and downsampled (`sample=10`), with a built-in page at
+`/debug/otlp/ui`; it costs one atomic load per export until a client
+attaches, and a slow client drops (counted on its own stream) rather than
+ever back-pressuring delivery.
 
 **Three separate listeners.** `-listen` carries health and the `/debug`
 surface; `-metrics-listen` (default `:9090`) serves the Prometheus

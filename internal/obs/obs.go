@@ -186,6 +186,12 @@ var (
 			"compressed archive). The drain cannot be retried — the next sweep would fail identically while "+
 			"holding the fd — so the unread remainder of that incarnation is unrecoverable and lost. Distinct "+
 			"from a clean EOF, which is the drain succeeding.", "source")
+	LogPodConfigInvalid = Registry.Counter("kubescrape_log_pod_config_invalid_total",
+		"Files whose pod's kubescrape.io/logs annotation failed to PARSE and was ignored (counted at metadata "+
+			"resolution, once per file). Logs keep flowing under the source defaults — the failure mode this "+
+			"guards against is silent: an operator edits the annotation, nothing changes, and the only signal "+
+			"was one Warn line on one node. The offending files and their parse errors are listed on the "+
+			"agent's GET /debug/tailer as podConfigError.")
 	LogPodAttrsRefused = Registry.CounterVec("kubescrape_log_pod_attrs_refused_total",
 		"Resource-attribute keys a pod's kubescrape.io/logs annotation tried to set that name RESOLVED KUBERNETES "+
 			"IDENTITY (namespace, pod, container, node) and were refused. The annotation is authoritative about the "+

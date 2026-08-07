@@ -44,11 +44,12 @@ import (
 )
 
 // maxBufferBytes bounds the raw payload bytes both transports may hold at once,
-// at four full-size requests. It is a hard ceiling rather than a flag: it must
-// be at least maxIngestBody or a single legal request could never be admitted,
-// and the knob an operator actually tunes is -ingest-max-in-flight, which bounds
-// the far more expensive resource (inflated pdata held across a collector's ack
-// latency).
+// at four full-size requests. It is a floor, not a flag: it must be at least
+// maxIngestBody or a single legal request could never be admitted, NewServer
+// raises it in step with a raised ServerConfig.MaxRecvBytes for the same
+// reason, and the knob an operator actually tunes is -ingest-max-in-flight,
+// which bounds the far more expensive resource (inflated pdata held across a
+// collector's ack latency).
 //
 // What is charged is the PAYLOAD as it is read. The buffer it lands in grows by
 // doubling past a small pre-sized head (readAllCapped), so its peak can briefly
@@ -60,14 +61,13 @@ const maxBufferBytes = 4 * maxIngestBody
 // touches the shared counter once per 64 KiB rather than once per Read.
 const budgetGranule = 64 << 10
 
-// grpcReserveBytes is what one gRPC push reserves before grpc-go reads it. The
-// size of the message is not knowable at that point — the tap runs on the
-// HEADERS frame — so the reservation is the worst case the transport will
-// accept (MaxRecvMsgSize). It is released again as soon as the message is
-// decoded and the interceptor takes over, so this bounds concurrent DECODES,
-// not concurrent pushes: the reservation is held for microseconds of unmarshal,
+// One gRPC push reserves Server.grpcMaxRecv before grpc-go reads it. The size
+// of the message is not knowable at that point — the tap runs on the HEADERS
+// frame — so the reservation is the worst case the transport will accept
+// (MaxRecvMsgSize). It is released again as soon as the message is decoded and
+// the interceptor takes over, so this bounds concurrent DECODES, not
+// concurrent pushes: the reservation is held for microseconds of unmarshal,
 // not for the seconds a slow collector holds a processing slot.
-const grpcReserveBytes = maxIngestGRPCMessage
 
 // grpcReserveWindow bounds how long ONE reservation may live, and it is the
 // difference between a bound and a gift.
@@ -285,7 +285,8 @@ type reservationKey struct{}
 // It runs with the transport's own mutex held, so it must not block: what
 // follows is two atomics, a context and an armed timer.
 func (s *Server) tapAdmit(ctx context.Context, _ *tap.Info) (context.Context, error) {
-	if !s.buffer.reserve(grpcReserveBytes) {
+	reserve := int64(s.grpcMaxRecv)
+	if !s.buffer.reserve(reserve) {
 		obs.IngestRejected.Inc()
 		// The same refusal text as the HTTP arm's (errBufferBudget, which
 		// WriteBodyError answers 429 with): one condition, one description,
@@ -298,7 +299,7 @@ func (s *Server) tapAdmit(ctx context.Context, _ *tap.Info) (context.Context, er
 	// frames that never arrive. That is what gives expire something to reap.
 	ctx, cancel := context.WithCancel(ctx)
 	r := &reservation{b: s.buffer, cancel: cancel}
-	r.held.Store(grpcReserveBytes)
+	r.held.Store(reserve)
 	ctx = context.WithValue(ctx, reservationKey{}, r)
 	// The stream context is cancelled on every RPC outcome, so this is the
 	// backstop for the paths that never reach the interceptor but do end.

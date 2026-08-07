@@ -114,6 +114,7 @@ func (s *sdSource) next(ctx context.Context) (rawEntry, bool, error) {
 		re.ident, _ = s.j.GetDataValue("SYSLOG_IDENTIFIER")
 		re.priority, _ = s.j.GetDataValue("PRIORITY")
 		re.pid, _ = s.j.GetDataValue("_PID")
+		re.transport, _ = s.j.GetDataValue("_TRANSPORT")
 		if usec, err := s.j.GetRealtimeUsec(); err == nil {
 			re.realtime = time.UnixMicro(int64(usec))
 		}

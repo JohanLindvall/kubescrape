@@ -16,6 +16,20 @@ Starlark transforms file (`-transforms-file`). The
 [Helm chart](../charts/kubescrape) exposes all of it as values; the raw
 manifests live in [deploy/](../deploy).
 
+This document is the narrative reference; the exhaustive per-binary flag
+inventory is [FLAGS.md](FLAGS.md), **generated** from the registered flag sets
+— its defaults are authoritative because they cannot drift.
+
+Two machine-readable schemas, both generated/enforced by tests:
+[agent-config.schema.json](agent-config.schema.json) is a JSON Schema for the
+`-config` YAML, generated from the very structs the file decodes into
+(`additionalProperties: false` matches the strict decoder exactly) — point
+your editor at it (`# yaml-language-server: $schema=…`) or validate in CI;
+the chart carries a `values.schema.json`, so a typo'd Helm value fails
+`helm install`/`template` instead of being silently ignored. Structural
+only — `-check-config` remains the semantic validator (regexes, durations,
+bounds, templates).
+
 - [Build variants (optional pipelines)](#build-variants-optional-pipelines)
 - [Metadata service](#metadata-service)
 - [Agent: general](#agent-general)
@@ -153,7 +167,7 @@ manifests — enable deliberately) — see
 | Flag | Default | Description |
 |---|---|---|
 | `-node-name` | `$NODE_NAME` | the node this agent runs on (set via the downward API) |
-| `-listen` | `:8081` | serves `/healthz`, `/readyz`, `/debug/tailer` (per-file positions/lag), `/debug/targets` (last scrape cycle's per-target outcomes, failures first), `/debug/transforms` (active transform program hash); empty disables. NOT `/metrics` — the Prometheus endpoint lives on its own `-metrics-listen` port |
+| `-listen` | `:8081` | serves `/debug` (homepage linking the debug surfaces), `/healthz`, `/readyz`, `/debug/tailer` (per-file positions/lag, malformed pod annotations), `/debug/targets` (per-target last outcomes, failures first), `/debug/transforms` (active transform program hash), `/debug/otlp` (live stream of exported OTLP as JSON lines; `signal`/`attr`/`sample` query params, UI at `/debug/otlp/ui`); empty disables. NOT `/metrics` — the Prometheus endpoint lives on its own `-metrics-listen` port |
 | `-self-metrics-interval` | `1m` | export the agent's own metrics over OTLP at this interval (0 disables); both binaries have this flag |
 | `-metadata-endpoint` | `http://kubescrape.monitoring` | base URL of the metadata service |
 | `-metadata-wait` | `5s` | server-side wait for not-yet-known containers (covers the gap between container start and the kubelet posting its status) |
@@ -319,7 +333,10 @@ Backlog is observable per node — `kubescrape_log_lag_bytes` (the total across
 tracked files) and `kubescrape_log_lag_max_bytes` (the largest single file's) in
 the self-metrics — and per file on
 `GET /debug/tailer` (path, container, read/committed offsets, lag,
-rate-limited flag; refreshed ~10s, largest lag first).
+rate-limited flag, and — for a pod whose `kubescrape.io/logs` annotation
+failed to parse — the error as `podConfigError`, with the aggregate on
+`kubescrape_log_pod_config_invalid_total`; refreshed ~10s, largest lag
+first).
 
 ### Disk buffer
 
@@ -371,8 +388,10 @@ libsystemd (`github.com/coreos/go-systemd/v22/sdjournal`, cgo — the agent bina
 is built with cgo and the image ships libsystemd) and exports the entries as
 OTLP log records, one resource per systemd unit (`service.name` = the unit
 without `.service`, `systemd.unit`, plus node attributes via the `journal` attrs
-pipeline; syslog priorities map to OTLP severities; `syslog.identifier` and
-`process.pid` become record attributes).
+pipeline; syslog priorities map to OTLP severities; `syslog.identifier`,
+`process.pid` and `systemd.transport` — the journal's `_TRANSPORT`, which is
+what separates `kernel`/`stdout`/`syslog` streams sharing a unit — become
+record attributes).
 
 > **Upgrade note.** Journal records now carry an instrumentation-scope name —
 > `otel_scope_name=github.com/JohanLindvall/kubescrape/agent/journald` — where
@@ -667,6 +686,34 @@ Per-source options:
   tailing, pre-existing ones *are* ingested; scope `include` to avoid re-reading
   unwanted history. A partially-read archive resumes correctly across a restart.
 
+- `pathAttributes` (plain sources) derives **per-file** resource attributes
+  from the file's path — a build agent's diagnostic tree encodes job identity
+  in directory names, and nothing on the line carries it (Promtail's `regex`
+  stage over `filename`). Rules are evaluated once per file at resolve time,
+  in order; each rule's regexp matches unanchored against the full path, a
+  non-matching rule contributes nothing, and captures win over the source's
+  static `attributes`:
+
+  ```yaml
+  logs:
+    sources:
+      - name: azdo-diag
+        include: ["/var/log/host/azdo-diag/**/*.log"]
+        pathAttributes:
+          # Named capture groups become attributes keyed by their own name…
+          - regexp: '/azdo-diag/(?P<azdo_agent>[^/]+)/'
+          # …or map captures explicitly (dotted keys, numbered groups):
+          - regexp: '/buildlogs/(?P<tl>[^/]+)/(.+)\.log$'
+            attributes:
+              azdo.timeline.id: tl
+              azdo.display.name: "2"
+  ```
+
+  A bad regexp, a reference to a capture group that does not exist, or a rule
+  that can produce nothing fails startup (`-check-config` catches it), and the
+  section is **refused on containerd sources** — their path encodes pod
+  identity that already arrives as metadata.
+
 Caveat: a blank line inside a plain file is dropped, so multi-line formats that
 rely on a blank separator (Go panics) do not join for plain files;
 indentation-based traces (Python, Java, .NET) join normally.
@@ -903,6 +950,7 @@ receiver never has. This listener does not register the OTLP trace service or
 | `-ingest-pod-uid-keys` | `k8s.pod.uid` | attribute keys inspected for a pod UID |
 | `-ingest-metadata-wait` | `0` | how long a lookup may block for a not-yet-known object |
 | `-ingest-max-in-flight` | `0` (= 32) | bound on pushes processed concurrently **across both transports**. Over it, senders are refused *retryably* rather than admitted into memory the node does not have |
+| `-ingest-grpc-max-recv-bytes` | `0` (= 4 MiB) | cap on **one decoded gRPC message** (the counterpart of a collector's `max_recv_msg_size`); an over-cap push is refused, not truncated. Applies to the trace tier's application ports too; the OTLP/HTTP body cap stays 16 MiB. Raising it is a per-push memory grant on an unauthenticated listener — the buffer budget below scales with it |
 
 A container ID resolves the exact container incarnation; a pod UID resolves
 the pod. Outcomes count into `kubescrape_ingest_resources_total{outcome}`
@@ -927,12 +975,22 @@ body before taking a slot (holding one across a trickled 16 MiB upload would let
 a few senders shed everyone else for a `ReadTimeout`), and gRPC decodes the
 message before the interceptor runs. A second, fixed bound — 64 MiB of raw
 payload across both transports — covers that window, refused the same retryable
-way: an HTTP body is charged as it is read (a declared `Content-Length` is
-reserved before the first byte), and a gRPC push reserves `MaxRecvMsgSize` from
+way: an HTTP body is charged as it is read, in 64 KiB steps — a declared
+`Content-Length` is never credited up front, since the declaration is the
+sender's claim, not a fact — and a gRPC push reserves `MaxRecvMsgSize` from
 the moment its headers arrive until its message is decoded. It is not a flag:
 the operator knob is the count above, which bounds the far more expensive
 resource, while this one only has to keep an unauthenticated listener from
 buffering without limit.
+
+The per-push size caps are **4 MiB per gRPC message**
+(`-ingest-grpc-max-recv-bytes` raises it; the buffer budget scales in step so
+a single legal push always fits) and a fixed **16 MiB per HTTP body**. An
+over-cap push is refused (`ResourceExhausted` / `413 Content Too Large`),
+never truncated — and unlike an over-the-count refusal, retrying the same
+batch cannot succeed, so a sender that hits the gRPC cap must ship smaller
+batches (an SDK batch-processor setting), switch to OTLP/HTTP, or have the
+cap raised to what a collector's `max_recv_msg_size` used to grant it.
 
 Refusals count into `kubescrape_ingest_rejected_total`. A persistently non-zero
 rate means the node cannot keep up with what is being pushed at it — raise the
@@ -942,7 +1000,8 @@ every slot for `-otlp-timeout`), or push less at this node.
 ## Agent: span metrics
 
 The `traceMetrics` section tunes the RED metrics `-ingest-span-metrics` derives
-from the spans the trace tier receives. Both the flag and this section belong on
+from the spans the trace tier receives, exported on `-ingest-span-metrics-interval`
+(default `1m`). Both the flag and this section belong on
 that tier (`serviceGraph.spanMetrics` in the chart); aggregation runs on the
 shard that OWNS each trace, so a span is counted exactly once however many
 shards its push passed through:
@@ -1464,10 +1523,15 @@ Histograms and summaries are converted to proper OTLP Histogram/Summary
 points (de-cumulated buckets, explicit bounds, quantiles); counters become
 cumulative monotonic sums.
 
-The last completed cycle's per-target outcomes — pipeline, URL, source,
-monitor, up, error, duration, samples — are served on `GET /debug/targets`
-(failures first, then by URL): the human-readable counterpart of the health
-gauges. Targets derived from monitor endpoints may carry
+Per-target outcomes — pipeline, URL, source, monitor, up, error, duration,
+samples, scrape time — are served on `GET /debug/targets` (failures first,
+then pending, then by URL): the human-readable counterpart of the health
+gauges. The snapshot **merges across cycles** rather than showing only the
+last one: per-target cadences mean a cycle scrapes only what was due, so a
+long-interval target keeps its LAST outcome (`scraped` says how old it is), a
+discovered-but-never-scraped target appears as `"pending": true` instead of
+not at all, and a target only disappears when a *successful* listing no
+longer contains it. Targets derived from monitor endpoints may carry
 `insecureSkipVerify`, a bearer-token secret reference (resolved via
 `GET /v1/scrape-auth/...`, which requires `-scrape-auth-secrets` on the
 metadata service) and keep/drop `metricRelabelings` applied per sample —

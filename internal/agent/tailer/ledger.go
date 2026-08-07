@@ -131,9 +131,14 @@ type file struct {
 	// Per-pod annotation config (podconfig.go), stamped at resolve time:
 	// excluded skips the file entirely; multiline overrides the source's
 	// stack-trace joining; podRules run before the global rules.
-	excluded  bool
-	multiline *bool
-	podRules  *logline.LineFilter
+	excluded bool
+	// podConfigErr is the parse error of a malformed kubescrape.io/logs
+	// annotation (the annotation is then ignored — a malformed one must not
+	// lose logs). Kept for /debug/tailer: the Warn line is on one node,
+	// while the operator who edited the annotation is on another.
+	podConfigErr string
+	multiline    *bool
+	podRules     *logline.LineFilter
 
 	// Per-file line rate limiting (Config.RateLimit): a token bucket refilled
 	// by elapsed time. limited marks a paused file (tokens exhausted, reading

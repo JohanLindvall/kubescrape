@@ -124,6 +124,11 @@ func (t *Tailer) resolvePlain(f *file) bool {
 	for k, v := range f.source.attributes {
 		a.PutStr(k, v)
 	}
+	// Path-derived attributes land after the statics: a per-file capture is
+	// more specific than the source-wide constant it may share a key with.
+	for i := range f.source.pathAttrs {
+		f.source.pathAttrs[i].apply(f.path, a)
+	}
 	// The source's attributes land AFTER Build so they beat templates and
 	// defaults — but the pipeline's guarantees must still close over the FINAL
 	// set. Re-derive identity (fill-if-absent: a source-declared

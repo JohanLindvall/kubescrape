@@ -23,6 +23,8 @@ import (
 
 	"github.com/JohanLindvall/kubescrape/internal/agent/otlpexport"
 	"github.com/JohanLindvall/kubescrape/internal/agent/transform"
+	"github.com/JohanLindvall/kubescrape/internal/logline"
+	"github.com/JohanLindvall/kubescrape/internal/metrics"
 )
 
 // Exporter forwards enriched telemetry; implemented by otlpexport.Client.
@@ -79,6 +81,19 @@ type ServerConfig struct {
 	// It runs AFTER admission (the byte budget and the in-flight slot), so a
 	// refused push releases everything it took, exactly as an accepted one does.
 	RejectTraces func(ctx context.Context, td ptrace.Traces) error
+	// Rules is the global logs.rules keep/drop/sample chain, applied to
+	// INGESTED log records after enrichment (so __severity__ selects on the
+	// enriched severity) — the same chain, same semantics, as the tailer,
+	// journald, events and Azure producers. A dropped record is removed from
+	// the payload before forwarding and the push is still ACKED: the sender
+	// delivered it, the operator chose to drop it (obs.LogRulesDropped). nil
+	// forwards everything.
+	Rules *logline.LineFilter
+	// LogMetrics observes EVERY ingested log record (before Rules — a metric
+	// counting errors must not fall to zero because a rule stopped shipping
+	// the lines), with the sender's enriched resource as the metric resource.
+	// nil observes nothing.
+	LogMetrics *metrics.DynamicMetricSet
 	// MaxInFlight bounds concurrently-processed pushes across both transports
 	// (0 = defaultMaxInFlight). Over the bound, senders are refused with a
 	// RETRYABLE answer rather than accepted into memory the node does not have.
@@ -297,6 +312,11 @@ func (g *logsGRPC) Export(ctx context.Context, req plogotlp.ExportRequest) (plog
 	err := grpcExport(ctx, func(ctx context.Context) error {
 		ld := req.Logs()
 		g.s.cfg.Enricher.EnrichLogs(ctx, ld)
+		// logs.rules + logMetrics, AFTER enrichment (logchain.go); a payload
+		// filtered to nothing is acked without a send.
+		if !g.s.applyLogChain(ld) {
+			return nil
+		}
 		// Handoff (logs and metrics only, never traces — the tier's tap reads
 		// a forwarded trace AFTER the export): on failure the decoded ld dies
 		// with this RPC and the sender's retry re-decodes retransmitted bytes,
@@ -478,6 +498,11 @@ func (s *Server) handleHTTPLogs(w http.ResponseWriter, r *http.Request) {
 	s.servePush(w, r, "logs", req.UnmarshalProto, func(ctx context.Context) (ProtoMarshaler, error) {
 		ld := req.Logs()
 		s.cfg.Enricher.EnrichLogs(ctx, ld)
+		// logs.rules + logMetrics, AFTER enrichment (logchain.go); a payload
+		// filtered to nothing is acked without a send.
+		if !s.applyLogChain(ld) {
+			return plogotlp.NewExportResponse(), nil
+		}
 		// Handoff: as on the gRPC arm — the decoded push dies with a failed
 		// request, and the sender's retry re-decodes retransmitted bytes.
 		if err := s.cfg.Exporter.ExportLogs(transform.Handoff(ctx), ld); err != nil {

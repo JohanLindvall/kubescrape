@@ -953,7 +953,18 @@ receiver never has. This listener does not register the OTLP trace service or
 | `-ingest-grpc-max-recv-bytes` | `0` (= 4 MiB) | cap on **one decoded gRPC message** (the counterpart of a collector's `max_recv_msg_size`); an over-cap push is refused, not truncated. Applies to the trace tier's application ports too; the OTLP/HTTP body cap stays 16 MiB. Raising it is a per-push memory grant on an unauthenticated listener — the buffer budget below scales with it |
 
 A container ID resolves the exact container incarnation; a pod UID resolves
-the pod. Outcomes count into `kubescrape_ingest_resources_total{outcome}`
+the pod.
+
+**The operator's log cost levers reach pushed logs too**: after enrichment,
+ingested log records run the same compiled `logs.rules` chain and feed the
+same `logMetrics` set as the tailer, journald, events and Azure producers —
+one config, one behavior, however the line arrived. Metrics observe every
+record (before the rules), rules select on the enriched severity
+(`__severity__`), a dropped record is removed before forwarding and counted
+(`kubescrape_log_rules_dropped_total`) while the push is still acked — the
+sender delivered it; the operator chose to drop it. A payload filtered to
+nothing is acked without a send. Bodies were already scrubbed
+(`logScrubbing`, structured bodies included) and enriched (`-enrich`). Outcomes count into `kubescrape_ingest_resources_total{outcome}`
 (`enriched` / `unresolved` / `peer_ip` / `peer_ip_rejected`).
 
 Both listeners are unauthenticated and node-local, and every in-flight request

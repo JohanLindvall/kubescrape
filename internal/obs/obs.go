@@ -64,7 +64,10 @@ var (
 	LogRateLimited = Registry.CounterVec("kubescrape_log_rate_limited_total",
 		"Per-file line rate limit hits: lines discarded (action=drop) or reads paused (action=pause).", "action")
 	LogRulesDropped = Registry.Counter("kubescrape_log_rules_dropped_total",
-		"Log records dropped by the logs rules (including sampled-away lines).")
+		"Log records dropped by the logs rules (including sampled-away lines), whichever path carried the "+
+			"record: the tailer, journald, Kubernetes events, Azure diagnostics, or an OTLP push into -ingest "+
+			"(a dropped pushed record is still acked to its sender — it was delivered; the operator chose "+
+			"to drop it).")
 	// MonitorFieldsIgnored counts ServiceMonitor/PodMonitor upserts carrying
 	// endpoint fields kubescrape does not interpret — the metric form of the
 	// startup warning, so a partially-applied CR is alertable and not just

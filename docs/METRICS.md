@@ -122,7 +122,7 @@ is the documented alert for the non-buffered tailer.
 | `kubescrape_log_prefix_lost_total` | — | Rotated-away log segments that could not be re-read (the file was deleted or compressed before its lines were exported, and no open fd survived a restart). These lines are lost. |
 | `kubescrape_log_rate_limited_total` | `action` | Per-file line rate limit hits: lines discarded (action=drop) or reads paused (action=pause). |
 | `kubescrape_log_rotations_total` | — | Log file rotations and truncations handled. |
-| `kubescrape_log_rules_dropped_total` | — | Log records dropped by the logs rules (including sampled-away lines). |
+| `kubescrape_log_rules_dropped_total` | — | Log records dropped by the logs rules (including sampled-away lines), whichever path carried the record: the tailer, journald, Kubernetes events, Azure diagnostics, or an OTLP push into -ingest (a dropped pushed record is still acked to its sender — it was delivered; the operator chose to drop it). |
 | `kubescrape_log_scrubbed_total` | `pattern` | Log bodies redacted by a scrub pattern (one bump per pattern per record, not per match). |
 | `kubescrape_log_segments_stalled` | — | Tracked files whose live tail is currently NOT being read because a rotated segment's replay cannot proceed. |
 | `kubescrape_log_torn_final_lines_total` | — | Unterminated final lines of RENAMED-away files (the fragment can never complete and is dropped). In-place truncation destroys its unread tail unmeasurably — there is nothing left to count — so truncation losses do not appear here or anywhere. |

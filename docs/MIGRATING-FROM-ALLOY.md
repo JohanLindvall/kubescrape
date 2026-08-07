@@ -369,7 +369,8 @@ fill-if-absent: it fires only on a resource carrying a
 payload from outside the cluster, or one already fully attributed, passes
 through with its resource attributes untouched. Residual differences: pushed
 log bodies are still parsed for timestamp/severity/trace ids when `-enrich`
-is on (a global switch shared with the tailer), and `datapoint`/`auto`
+is on (a global switch shared with the tailer), configured `logs.rules` and
+`logMetrics` apply to pushed log records exactly as to tailed ones, and `datapoint`/`auto`
 metrics mode may still split a payload whose data points carry IDs
 (`-ingest-metrics-mode resource` disables that). One divergence to plan for:
 cmb-alloy's `resourcedetection env` stamps `k8s.cluster.name` on every

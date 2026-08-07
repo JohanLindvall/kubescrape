@@ -1186,7 +1186,13 @@ func (p *pipelines) startIngest(ctx context.Context) error {
 		MaxRecvBytes: *ingestGRPCMaxRecv,
 		Enricher:     enr,
 		Exporter:     p.out,
-		Logger:       p.log,
+		// The operator's cost levers reach pushed logs too: the same compiled
+		// logs.rules chain and the same logMetrics set the tailer, journald,
+		// events and Azure producers run — one config, one behavior, however
+		// the line arrived.
+		Rules:      p.journalRules,
+		LogMetrics: p.logMetrics,
+		Logger:     p.log,
 	}
 	// The gate only where something binds: with neither address configured the
 	// listeners are a no-op and Ready never fires, so registering it anyway

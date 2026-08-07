@@ -21,7 +21,6 @@ import (
 	"go.opentelemetry.io/collector/pdata/ptrace"
 
 	"github.com/JohanLindvall/kubescrape/internal/agent/attrs"
-	"github.com/JohanLindvall/kubescrape/internal/agent/logenrich"
 	"github.com/JohanLindvall/kubescrape/internal/agent/logscrub"
 	"github.com/JohanLindvall/kubescrape/internal/logdedupe"
 	"github.com/JohanLindvall/kubescrape/internal/obs"
@@ -275,26 +274,30 @@ func (e *Enricher) EnrichLogs(ctx context.Context, ld plog.Logs) {
 	for i := 0; i < rls.Len(); i++ {
 		rl := rls.At(i)
 		e.enrichResource(ctx, rl.Resource(), cache)
-		if !e.cfg.EnrichLines && e.cfg.Scrub == nil {
+		if e.cfg.Scrub == nil {
 			continue
 		}
 		sls := rl.ScopeLogs()
 		for j := 0; j < sls.Len(); j++ {
 			lrs := sls.At(j).LogRecords()
 			for k := 0; k < lrs.Len(); k++ {
-				lr := lrs.At(k)
-				if e.cfg.Scrub != nil {
-					// Scrub BEFORE ApplyBody: enrich copies body slices
-					// (exception attributes) that must not carry secrets.
-					e.scrubBody(lr.Body(), 0)
-				}
-				if e.cfg.EnrichLines {
-					logenrich.ApplyBody(lr)
-				}
+				// Scrub BEFORE anything reads the body: enrichment (which
+				// runs later, in the server's applyLogChain — one bounded
+				// body render shared with log-metrics and the rules) copies
+				// body slices (exception attributes) that must not carry
+				// secrets, and the metric/rule chain matches against the
+				// same scrubbed view.
+				e.scrubBody(lrs.At(k).Body(), 0)
 			}
 		}
 	}
 }
+
+// LinesEnabled reports whether per-line body enrichment (-enrich) is on. The
+// enrichment itself runs in the server's applyLogChain — beside log-metrics
+// and the rules, over ONE bounded rendering of the body — but the flag lives
+// in this config.
+func (e *Enricher) LinesEnabled() bool { return e.cfg.EnrichLines }
 
 // maxBodyScrubDepth bounds the walk over a structured body. Bodies come from
 // unauthenticated senders, so the recursion needs a ceiling; real structured

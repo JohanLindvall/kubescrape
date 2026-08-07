@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"go.opentelemetry.io/collector/pdata/pcommon"
+	"go.opentelemetry.io/collector/pdata/plog"
 
 	"github.com/JohanLindvall/kubescrape/pkg/logattrs"
 )
@@ -362,5 +363,34 @@ func TestLiftedResourceAttributesRankBetweenRecordAndResource(t *testing.T) {
 	r.Set(rec, res, "info")
 	if got := label("tenant"); got != "base" {
 		t.Errorf("after Set, label(tenant) = %q; the previous line's lifted attributes leaked", got)
+	}
+}
+
+func TestRecordSeverityNumberBands(t *testing.T) {
+	lr := plog.NewLogRecord()
+	for _, tc := range []struct {
+		n    plog.SeverityNumber
+		want string
+	}{
+		{plog.SeverityNumberUnspecified, ""},
+		{plog.SeverityNumberTrace, "trace"},
+		{plog.SeverityNumberDebug4, "debug"},
+		{plog.SeverityNumberInfo, "info"},
+		{plog.SeverityNumberWarn3, "warn"},
+		{plog.SeverityNumberError2, "error"},
+		{plog.SeverityNumberFatal4, "fatal"},
+		{plog.SeverityNumber(99), ""},
+	} {
+		lr.SetSeverityNumber(tc.n)
+		lr.SetSeverityText("")
+		if got := RecordSeverity(lr); got != tc.want {
+			t.Errorf("number %d: %q, want %q", tc.n, got, tc.want)
+		}
+	}
+	// Text always wins over the number.
+	lr.SetSeverityNumber(plog.SeverityNumberError)
+	lr.SetSeverityText("WARNING")
+	if got := RecordSeverity(lr); got != "warning" {
+		t.Errorf("text override: %q, want warning", got)
 	}
 }

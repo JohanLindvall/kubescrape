@@ -24,11 +24,19 @@ func Apply(lr plog.LogRecord, line string) {
 	apply(lr, line, true)
 }
 
-// ApplyBody enriches one log record from its own body (the OTLP ingest path).
-// Unlike Apply it never overwrites a timestamp, severity, trace/span ID or
-// attribute the sender already set — the sender is authoritative.
-func ApplyBody(lr plog.LogRecord) {
-	apply(lr, lr.Body().Str(), false)
+// ApplyBodyText enriches one log record from a pre-rendered text view of its
+// body (the OTLP ingest path). Unlike Apply it never overwrites a timestamp,
+// severity, trace/span ID or attribute the sender already set — the sender is
+// authoritative. The CALLER renders and passes the view rather
+// than this package reading lr.Body() itself, for two reasons the adversarial
+// review measured: a STRUCTURED body's Str() is "" (so reading it here meant
+// the same logical `{"level":"error"}` line was severity-parsed when tailed
+// and passed through untouched when pushed), and its AsString rendering costs
+// 14-18x the wire bytes in transient heap — so it must be rendered ONCE,
+// bounded, and shared by enrichment, log-metrics and the rules (otlpingest's
+// chainBody), never re-rendered per consumer.
+func ApplyBodyText(lr plog.LogRecord, body string) {
+	apply(lr, body, false)
 }
 
 // The enrichment-outcome counters, resolved once per format: the label values

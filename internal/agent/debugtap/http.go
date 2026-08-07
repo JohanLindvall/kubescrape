@@ -7,6 +7,7 @@ package debugtap
 
 import (
 	"fmt"
+	"math"
 	"net/http"
 	"path"
 	"strconv"
@@ -47,7 +48,11 @@ func (t *Tap) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	sample := 100.0
 	if v := q.Get("sample"); v != "" {
 		f, err := strconv.ParseFloat(v, 64)
-		if err != nil || f < 0 || f > 100 {
+		// The explicit NaN check matters: ParseFloat accepts "NaN", every
+		// comparison against it is false, and a NaN sample would stream
+		// silence indistinguishable from "no traffic" — the exact failure
+		// mode the glob validation below exists to prevent.
+		if err != nil || math.IsNaN(f) || f < 0 || f > 100 {
 			http.Error(w, fmt.Sprintf("sample %q is not a percentage (0-100)", v), http.StatusBadRequest)
 			return
 		}
@@ -73,6 +78,16 @@ func (t *Tap) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		filters = append(filters, attrFilter{Key: key, Value: val})
 	}
 
+	// Subscribe BEFORE the response header goes out: a refusal must still be
+	// able to answer 503, and headers are one-shot.
+	sub, unsubscribe := t.subscribe(sig, filters, sample)
+	if sub == nil {
+		http.Error(w, fmt.Sprintf("too many debug streams (max %d); close one and retry", maxSubscribers),
+			http.StatusServiceUnavailable)
+		return
+	}
+	defer unsubscribe()
+
 	// The -listen server's WriteTimeout would kill this stream after 30s;
 	// streams own their deadline (none — the client's disconnect ends it).
 	rc := http.NewResponseController(w)
@@ -85,14 +100,12 @@ func (t *Tap) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	_, _ = fmt.Fprintf(w, "# streaming; signals=%s sample=%g%% filters=%d — one OTLP JSON payload per line\n",
 		sigNames(sig), sample, len(filters))
 	_ = rc.Flush()
-
-	sub, unsubscribe := t.subscribe(sig, filters, sample)
-	defer unsubscribe()
 	for {
 		select {
 		case <-r.Context().Done():
 			return
 		case b := <-sub.ch:
+			sub.queued.Add(int64(-len(b)))
 			if _, err := w.Write(append(b, '\n')); err != nil {
 				return
 			}

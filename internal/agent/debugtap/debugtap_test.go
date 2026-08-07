@@ -161,3 +161,78 @@ func TestUIServes(t *testing.T) {
 		t.Fatalf("ui = %d %q…", rec.Code, rec.Body.String()[:60])
 	}
 }
+
+// The subscriber cap: the port is unauthenticated and each stream costs a
+// render per export on the exporting goroutine, so streams past the cap are
+// refused with 503 — and a closed one frees the slot.
+func TestSubscriberCap(t *testing.T) {
+	tap := New(&fakeInner{})
+	var unsubs []func()
+	for i := 0; i < maxSubscribers; i++ {
+		sub, unsub := tap.subscribe(sigAll, nil, 100)
+		if sub == nil {
+			t.Fatalf("subscriber %d refused under the cap", i)
+		}
+		unsubs = append(unsubs, unsub)
+	}
+	if sub, _ := tap.subscribe(sigAll, nil, 100); sub != nil {
+		t.Fatal("subscriber over the cap admitted")
+	}
+	srv := httptest.NewServer(http.HandlerFunc(tap.ServeHTTP))
+	defer srv.Close()
+	resp, err := http.Get(srv.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("over-cap stream = %d, want 503", resp.StatusCode)
+	}
+	unsubs[0]()
+	if sub, unsub := tap.subscribe(sigAll, nil, 100); sub == nil {
+		t.Fatal("slot not freed by unsubscribe")
+	} else {
+		unsub()
+	}
+	for _, u := range unsubs[1:] {
+		u()
+	}
+}
+
+// The queue is bounded by BYTES, not just slots: a reader that stops reading
+// pins at most maxQueuedBytes, and everything past it drops (counted).
+func TestQueueIsByteBounded(t *testing.T) {
+	tap := New(&fakeInner{})
+	sub, unsub := tap.subscribe(sigLogs, nil, 100)
+	defer unsub()
+
+	// ~1 MiB per rendered payload; maxQueuedBytes should bind long before the
+	// 256-slot channel does.
+	big := strings.Repeat("x", 1<<20)
+	ld := plog.NewLogs()
+	rl := ld.ResourceLogs().AppendEmpty()
+	rl.ScopeLogs().AppendEmpty().LogRecords().AppendEmpty().Body().SetStr(big)
+	for i := 0; i < 64; i++ {
+		_ = tap.ExportLogs(context.Background(), ld)
+	}
+	if sub.dropped.Load() == 0 {
+		t.Fatal("64 MiB queued with no reader and nothing dropped")
+	}
+	if q := sub.queued.Load(); q > maxQueuedBytes {
+		t.Fatalf("queued %d bytes, cap %d", q, int64(maxQueuedBytes))
+	}
+}
+
+func TestSampleNaNRejected(t *testing.T) {
+	tap := New(&fakeInner{})
+	srv := httptest.NewServer(http.HandlerFunc(tap.ServeHTTP))
+	defer srv.Close()
+	resp, err := http.Get(srv.URL + "?sample=NaN")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("sample=NaN = %d, want 400 (it parses, and every comparison against it is false)", resp.StatusCode)
+	}
+}

@@ -67,6 +67,22 @@ func (f attrFilter) matches(attrs pcommon.Map) bool {
 	return found
 }
 
+// maxSubscribers bounds concurrent debug streams. The port is
+// unauthenticated and every subscriber costs a render per export ON THE
+// EXPORTING GOROUTINE (~70 ms for a 16 MiB payload), which for the tailer is
+// the single sweep goroutine serving every log file on the node — so N idle
+// curls must not be able to multiply that unboundedly. Over the cap the
+// stream is refused with 503; four concurrent debugging humans is already a
+// crowded incident call.
+const maxSubscribers = 4
+
+// maxQueuedBytes bounds what ONE subscriber's channel may hold. The channel's
+// slot count (256) bounds nothing by itself — 256 slots of 16 MiB renders is
+// 4 GB pinned by a reader that connected and stopped reading — so the queue
+// is bounded by BYTES and an over-budget payload is dropped for that stream
+// (counted, reported on the stream) exactly like a full channel.
+const maxQueuedBytes = 32 << 20
+
 // subscriber is one attached debug stream.
 type subscriber struct {
 	signals signal
@@ -74,6 +90,9 @@ type subscriber struct {
 	sample  float64 // percent of matching RESOURCES kept, 0-100
 	ch      chan []byte
 	dropped atomic.Int64
+	// queued tracks the bytes sitting in ch: charged on send, released by the
+	// reader after receive.
+	queued atomic.Int64
 }
 
 // Tap wraps the export chain and fans matching payloads out to subscribers.
@@ -195,8 +214,13 @@ func (t *Tap) offer(sig signal, render func(*subscriber) ([]byte, bool)) {
 		if !ok {
 			continue
 		}
+		if sub.queued.Load()+int64(len(b)) > maxQueuedBytes {
+			sub.dropped.Add(1)
+			continue
+		}
 		select {
 		case sub.ch <- b:
+			sub.queued.Add(int64(len(b)))
 		default:
 			sub.dropped.Add(1)
 		}
@@ -213,10 +237,14 @@ func matchAll(attrs pcommon.Map, filters []attrFilter) bool {
 }
 
 // subscribe attaches a stream; the returned unsubscribe is idempotent enough
-// for a defer.
+// for a defer. nil means the subscriber cap is reached.
 func (t *Tap) subscribe(sig signal, filters []attrFilter, sample float64) (*subscriber, func()) {
 	sub := &subscriber{signals: sig, filters: filters, sample: sample, ch: make(chan []byte, 256)}
 	t.mu.Lock()
+	if len(t.subs) >= maxSubscribers {
+		t.mu.Unlock()
+		return nil, nil
+	}
 	id := t.next
 	t.next++
 	t.subs[id] = sub

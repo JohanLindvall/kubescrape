@@ -963,8 +963,18 @@ record (before the rules), rules select on the enriched severity
 (`__severity__`), a dropped record is removed before forwarding and counted
 (`kubescrape_log_rules_dropped_total`) while the push is still acked — the
 sender delivered it; the operator chose to drop it. A payload filtered to
-nothing is acked without a send. Bodies were already scrubbed
-(`logScrubbing`, structured bodies included) and enriched (`-enrich`). Outcomes count into `kubescrape_ingest_resources_total{outcome}`
+nothing is acked without a send. Bodies are scrubbed first (`logScrubbing`,
+structured bodies included), then enriched (`-enrich`) from ONE bounded text
+view per body that metrics and rules share — a structured (map/slice) body
+enriches from its JSON rendering, the same text the tailer would have seen,
+and `__severity__` falls back to the OTLP severity-number band when a sender
+set only the number. Because the listeners are unauthenticated, the
+line-derived half is bounded: bodies whose text view exceeds 1 MiB (the
+tailer never feeds longer lines either), resources wider than 64 attributes,
+and resources past the first 256 of one push skip enrichment/observation —
+counted in `kubescrape_ingest_log_chain_skipped_total{reason}`, with the
+data itself always still forwarded. Duplicate resource keys (legal OTLP, a
+hostile-sender shape) are deduped last-wins before metric binding. Outcomes count into `kubescrape_ingest_resources_total{outcome}`
 (`enriched` / `unresolved` / `peer_ip` / `peer_ip_rejected`).
 
 Both listeners are unauthenticated and node-local, and every in-flight request

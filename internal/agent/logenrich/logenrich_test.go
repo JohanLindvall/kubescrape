@@ -122,13 +122,13 @@ func TestParseHexID(t *testing.T) {
 	}
 }
 
-// ApplyBody (the ingest path) fills only what the sender left unset.
+// ApplyBodyText (the ingest path) fills only what the sender left unset.
 func TestApplyBodyNeverOverwrites(t *testing.T) {
 	lr := plog.NewLogRecord()
 	lr.Body().SetStr(`{"level":"error","message":"boom","ts":"2026-07-11T10:00:00Z"}`)
 
 	// Sender set nothing: severity and timestamp come from the body.
-	ApplyBody(lr)
+	ApplyBodyText(lr, lr.Body().Str())
 	if lr.SeverityNumber() != plog.SeverityNumberError {
 		t.Fatalf("severity = %v", lr.SeverityNumber())
 	}
@@ -141,7 +141,7 @@ func TestApplyBodyNeverOverwrites(t *testing.T) {
 	lr2.Body().SetStr(`{"level":"error","message":"boom"}`)
 	lr2.SetSeverityNumber(plog.SeverityNumberInfo)
 	lr2.SetSeverityText("INFO")
-	ApplyBody(lr2)
+	ApplyBodyText(lr2, lr2.Body().Str())
 	if lr2.SeverityNumber() != plog.SeverityNumberInfo {
 		t.Fatalf("sender severity overwritten: %v", lr2.SeverityNumber())
 	}
@@ -244,12 +244,12 @@ func TestZonelessParsedTimeKeepsTheProducerTimestamp(t *testing.T) {
 		t.Errorf("counted as rejected (%v) with no producer timestamp to keep", got)
 	}
 
-	// Same on the ingest path (ApplyBody), where the sender set no timestamp: a
+	// Same on the ingest path (ApplyBodyText), where the sender set no timestamp: a
 	// zone-less body stamp still fills it.
 	body := plog.NewLogRecord()
 	body.Body().SetStr("2019-03-04 05:06:07 INFO handled request")
-	ApplyBody(body)
+	ApplyBodyText(body, body.Body().Str())
 	if got := body.Timestamp().AsTime(); !got.Equal(time.Date(2019, 3, 4, 5, 6, 7, 0, time.UTC)) {
-		t.Errorf("ApplyBody timestamp = %v, want the parsed 2019-03-04", got)
+		t.Errorf("ApplyBodyText timestamp = %v, want the parsed 2019-03-04", got)
 	}
 }

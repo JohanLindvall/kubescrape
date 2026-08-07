@@ -15,6 +15,7 @@ import (
 	"strconv"
 
 	"go.opentelemetry.io/collector/pdata/pcommon"
+	"go.opentelemetry.io/collector/pdata/plog"
 
 	"github.com/JohanLindvall/kubescrape/internal/logline"
 	"github.com/JohanLindvall/kubescrape/internal/metrics"
@@ -270,4 +271,36 @@ func LowerSeverity(s string) string {
 		out[i] = c
 	}
 	return string(out)
+}
+
+// RecordSeverity resolves the severity string the rules' __severity__ key
+// sees for a record: the lowercased SeverityText when present, else the OTLP
+// severity-NUMBER band ("trace".."fatal"). The fallback exists for ingest —
+// an SDK may legally set only the number, and this repo's own producers
+// always stamp text, so before it a SeverityNumber-only pushed record
+// resolved __severity__ to "" and a `drop __severity__=error` rule silently
+// missed exactly the records it was written for. The number's fine grades
+// (error2..error4) fold into their band's base word, which is what rules
+// match on.
+func RecordSeverity(lr plog.LogRecord) string {
+	if s := lr.SeverityText(); s != "" {
+		return LowerSeverity(s)
+	}
+	n := lr.SeverityNumber()
+	switch {
+	case n < plog.SeverityNumberTrace || n > plog.SeverityNumberFatal4:
+		return ""
+	case n <= plog.SeverityNumberTrace4:
+		return "trace"
+	case n <= plog.SeverityNumberDebug4:
+		return "debug"
+	case n <= plog.SeverityNumberInfo4:
+		return "info"
+	case n <= plog.SeverityNumberWarn4:
+		return "warn"
+	case n <= plog.SeverityNumberError4:
+		return "error"
+	default:
+		return "fatal"
+	}
 }

@@ -208,7 +208,7 @@ func (c *Chain[K]) Emit(p Producer, in Input[K]) bool {
 	}
 	// Rules run AFTER enrichment, so __severity__ selects on the ENRICHED
 	// severity rather than whatever the producer stamped.
-	c.resolver.Set(lr.Attributes(), in.Resource, LowerSeverity(lr.SeverityText()))
+	c.resolver.Set(lr.Attributes(), in.Resource, RecordSeverity(lr))
 	// This line's lifted resource attributes rank between the record's and the
 	// resource's. Without it the same logAttributes + rules config selected
 	// differently depending on which pipeline carried the line — the tailer was

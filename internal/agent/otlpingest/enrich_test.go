@@ -125,8 +125,14 @@ func TestEnrichLogsLineEnrichment(t *testing.T) {
 	lr := rl.ScopeLogs().AppendEmpty().LogRecords().AppendEmpty()
 	lr.Body().SetStr(`{"level":"error","@t":"2026-01-02T03:04:05Z","msg":"boom"}`)
 
-	e := NewEnricher(Config{Meta: newMeta(), EnrichLines: true})
-	e.EnrichLogs(context.Background(), ld)
+	// Line enrichment runs in the server's applyLogChain (one bounded body
+	// render shared with log-metrics and the rules), after EnrichLogs' scrub.
+	s := NewServer(ServerConfig{
+		Enricher: NewEnricher(Config{Meta: newMeta(), EnrichLines: true}),
+		Exporter: &captureExporter{},
+	})
+	s.cfg.Enricher.EnrichLogs(context.Background(), ld)
+	s.applyLogChain(ld)
 	if lr.SeverityNumber() != plog.SeverityNumberError {
 		t.Errorf("severity = %v (line enrichment not applied)", lr.SeverityNumber())
 	}
@@ -142,7 +148,12 @@ func TestEnrichLogsLineEnrichmentRespectsSender(t *testing.T) {
 	lr.SetSeverityNumber(plog.SeverityNumberInfo)
 	lr.Body().SetStr(`{"level":"error","msg":"boom"}`)
 
-	NewEnricher(Config{Meta: newMeta(), EnrichLines: true}).EnrichLogs(context.Background(), ld)
+	s := NewServer(ServerConfig{
+		Enricher: NewEnricher(Config{Meta: newMeta(), EnrichLines: true}),
+		Exporter: &captureExporter{},
+	})
+	s.cfg.Enricher.EnrichLogs(context.Background(), ld)
+	s.applyLogChain(ld)
 	if lr.SeverityNumber() != plog.SeverityNumberInfo {
 		t.Errorf("overrode sender severity: %v", lr.SeverityNumber())
 	}

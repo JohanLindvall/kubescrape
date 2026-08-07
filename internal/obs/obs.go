@@ -262,6 +262,15 @@ var (
 	// retryable and the sender still holds the payload, but a persistently
 	// non-zero rate means the node cannot keep up with what is being pushed at
 	// it.
+	IngestChainSkipped = Registry.CounterVec("kubescrape_ingest_log_chain_skipped_total",
+		"Ingested log RECORDS or RESOURCES whose line-derived processing (body enrichment, log-metrics "+
+			"observation) was skipped by an abuse bound — the data itself is still forwarded. Reasons: "+
+			"body_too_large (one record whose body's text view exceeds 1 MiB; the tailer never feeds lines past "+
+			"-logs-max-entry-bytes either, and attribute/severity-keyed rules still apply), resource_too_wide "+
+			"(one resource with more than 64 attributes — the metric store retains a serialization of the whole "+
+			"resource per series, so sender-chosen width is sender-chosen retained heap), resources_capped (a "+
+			"resource past the first 256 of one push). The listeners are unauthenticated; a nonzero rate is a "+
+			"sender worth finding.", "reason")
 	IngestRejected = Registry.Counter("kubescrape_ingest_rejected_total",
 		"Pushed OTLP requests refused because a receiver admission bound was reached — concurrent in-flight pushes or buffered payload bytes (retryable: 429 / ResourceExhausted).")
 )

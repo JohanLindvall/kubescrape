@@ -2,6 +2,8 @@ package otlpingest
 
 import (
 	"context"
+	"fmt"
+	"strings"
 	"testing"
 
 	"go.opentelemetry.io/collector/pdata/plog"
@@ -160,4 +162,185 @@ func (c *copyMetricsExporter) ExportMetrics(_ context.Context, md pmetric.Metric
 	md.CopyTo(cp)
 	c.md = append(c.md, cp)
 	return nil
+}
+
+// The two severity edges the adversarial review confirmed: a record whose
+// sender set only SeverityNumber, and a STRUCTURED (map) body whose level
+// field only enrichment can surface. Both must select identically to the
+// tailed form of the same logical line.
+func TestIngestedSeverityEdges(t *testing.T) {
+	rules, err := logline.NewLineFilter([]logline.LineRule{
+		{Action: "drop", Match: []string{"__severity__=error"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	exp := &captureExporter{}
+	s := NewServer(ServerConfig{
+		Enricher: NewEnricher(Config{Meta: newMeta(), MetricsMode: MetricsAuto, EnrichLines: true}),
+		Exporter: exp,
+		Rules:    rules,
+	})
+
+	ld := plog.NewLogs()
+	lrs := ld.ResourceLogs().AppendEmpty().ScopeLogs().AppendEmpty().LogRecords()
+
+	// SeverityNumber-only (an SDK's legal shape): __severity__ resolves from
+	// the number band.
+	numberOnly := lrs.AppendEmpty()
+	numberOnly.Body().SetStr("boom")
+	numberOnly.SetSeverityNumber(plog.SeverityNumberError2) // 18: error band
+
+	// A structured body carrying the level: enrichment must read the JSON
+	// rendering (Str() is empty for a map body) or the rule misses.
+	structured := lrs.AppendEmpty()
+	structured.Body().SetEmptyMap().PutStr("level", "error")
+
+	// The survivor.
+	keep := lrs.AppendEmpty()
+	keep.Body().SetStr("all fine")
+	keep.SetSeverityText("info")
+
+	if err := grpcExportLogs(s, ld); err != nil {
+		t.Fatal(err)
+	}
+	if len(exp.logs) != 1 {
+		t.Fatalf("exports = %d, want 1", len(exp.logs))
+	}
+	if got := exp.logs[0].LogRecordCount(); got != 1 {
+		t.Fatalf("records forwarded = %d, want 1 (both error shapes dropped)", got)
+	}
+	body := exp.logs[0].ResourceLogs().At(0).ScopeLogs().At(0).LogRecords().At(0).Body().AsString()
+	if body != "all fine" {
+		t.Fatalf("survivor = %q", body)
+	}
+}
+
+// The unauthenticated-sender bounds the adversarial review measured: a body
+// over 1 MiB skips line-derived processing (attribute rules still apply), a
+// resource wider than 64 attributes or past the first 256 of a push is not
+// observed into the metric set — and every skip is counted while the data
+// itself still forwards.
+func TestIngestChainBounds(t *testing.T) {
+	set, err := metrics.NewDynamicMetricSet([]metrics.Dynamic{{
+		Name: "seen", Type: "counter", Value: "1",
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	exp := &captureExporter{}
+	s := NewServer(ServerConfig{
+		Enricher:   newEnricher(newMeta(), MetricsAuto),
+		Exporter:   exp,
+		LogMetrics: set,
+	})
+
+	bodyBig := obs.IngestChainSkipped.WithLabelValues("body_too_large").Value()
+	tooWide := obs.IngestChainSkipped.WithLabelValues("resource_too_wide").Value()
+	capped := obs.IngestChainSkipped.WithLabelValues("resources_capped").Value()
+
+	ld := plog.NewLogs()
+	// A resource wider than the bound.
+	wide := ld.ResourceLogs().AppendEmpty()
+	for i := 0; i < maxObservedResourceAttrs+1; i++ {
+		wide.Resource().Attributes().PutStr(fmt.Sprintf("k%03d", i), "v")
+	}
+	wide.ScopeLogs().AppendEmpty().LogRecords().AppendEmpty().Body().SetStr("wide")
+	// A record whose STRING body is over the cap, and a structured body over
+	// the cap (estimated without materializing).
+	normal := ld.ResourceLogs().AppendEmpty()
+	lrs := normal.ScopeLogs().AppendEmpty().LogRecords()
+	lrs.AppendEmpty().Body().SetStr(strings.Repeat("x", maxChainBodyBytes+1))
+	bigMap := lrs.AppendEmpty().Body().SetEmptyMap()
+	bigMap.PutStr("payload", strings.Repeat("y", maxChainBodyBytes+1))
+	lrs.AppendEmpty().Body().SetStr("small and fine")
+	// More resources than one push may observe.
+	for i := 0; i < maxObservedResources; i++ {
+		rl := ld.ResourceLogs().AppendEmpty()
+		rl.Resource().Attributes().PutStr("service.name", fmt.Sprintf("svc-%d", i))
+		rl.ScopeLogs().AppendEmpty().LogRecords().AppendEmpty().Body().SetStr("z")
+	}
+
+	if err := grpcExportLogs(s, ld); err != nil {
+		t.Fatal(err)
+	}
+	// Everything still forwards.
+	if len(exp.logs) != 1 || exp.logs[0].LogRecordCount() != 4+maxObservedResources {
+		t.Fatalf("forwarded %d records, want %d", exp.logs[0].LogRecordCount(), 4+maxObservedResources)
+	}
+	if got := obs.IngestChainSkipped.WithLabelValues("body_too_large").Value() - bodyBig; got != 2 {
+		t.Errorf("body_too_large moved %v, want 2", got)
+	}
+	if got := obs.IngestChainSkipped.WithLabelValues("resource_too_wide").Value() - tooWide; got != 1 {
+		t.Errorf("resource_too_wide moved %v, want 1", got)
+	}
+	// 2 + maxObservedResources resources total; the wide one was refused for
+	// width (index 0), so indexes >= maxObservedResources are capped: 2.
+	if got := obs.IngestChainSkipped.WithLabelValues("resources_capped").Value() - capped; got != 2 {
+		t.Errorf("resources_capped moved %v, want 2", got)
+	}
+}
+
+// Duplicate resource keys — legal on the OTLP wire, impossible in every
+// agent-built resource — must not defeat the metric store's sum-fold
+// identity: {k=p,k=q} vs {k=q,k=p} used to MERGE two senders' series, and
+// {k=v,k=v} minted a series distinct from {k=v} that rendered identically
+// (duplicate points in one payload). The boundary dedupes last-wins.
+func TestIngestDedupesDuplicateResourceKeys(t *testing.T) {
+	set, err := metrics.NewDynamicMetricSet([]metrics.Dynamic{{
+		Name: "dup", Type: "counter", Value: "1",
+		Labels: []string{"svc=$service.name"},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := NewServer(ServerConfig{
+		Enricher:   newEnricher(newMeta(), MetricsAuto),
+		Exporter:   &captureExporter{},
+		LogMetrics: set,
+	})
+
+	// Raw OTLP allows repeated keys; build them via FromRaw-then-append on the
+	// wire shape: pdata's Map has no public duplicate-insert, so go through
+	// the JSON unmarshaler like a hostile sender would.
+	raw := []byte(`{"resourceLogs":[{"resource":{"attributes":[
+		{"key":"service.name","value":{"stringValue":"loser"}},
+		{"key":"service.name","value":{"stringValue":"winner"}}
+	]},"scopeLogs":[{"logRecords":[{"body":{"stringValue":"hello"}}]}]}]}`)
+	var um plog.JSONUnmarshaler
+	ld, err := um.UnmarshalLogs(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ld.ResourceLogs().At(0).Resource().Attributes().Len() != 2 {
+		t.Fatal("test premise broken: duplicate keys were deduped at decode")
+	}
+	if err := grpcExportLogs(s, ld); err != nil {
+		t.Fatal(err)
+	}
+
+	mexp := &copyMetricsExporter{}
+	if err := set.Export(context.Background(), mexp, 0); err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, md := range mexp.md {
+		for r := 0; r < md.ResourceMetrics().Len(); r++ {
+			ms := md.ResourceMetrics().At(r).ScopeMetrics().At(0).Metrics()
+			for mi := 0; mi < ms.Len(); mi++ {
+				dps := ms.At(mi).Sum().DataPoints()
+				for d := 0; d < dps.Len(); d++ {
+					if v, ok := dps.At(d).Attributes().Get("svc"); ok {
+						found = true
+						if v.Str() != "winner" {
+							t.Errorf("svc label = %q, want the last-wins winner", v.Str())
+						}
+					}
+				}
+			}
+		}
+	}
+	if !found {
+		t.Fatal("no labelled data point exported")
+	}
 }

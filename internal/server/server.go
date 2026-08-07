@@ -265,6 +265,13 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/nodes/{node}/metadata", counted("/v1/nodes/metadata", s.handleNodeMetadata))
 	mux.HandleFunc("GET /v1/explain/{namespace}/{name}", counted("/v1/explain", s.handleExplain))
 	mux.HandleFunc("GET /v1/scrape-auth/{namespace}/{name}/{key}", counted("/v1/scrape-auth", s.handleScrapeAuth))
+	// The debug homepage (forms for the parameterised routes above), plus a
+	// root redirect so a bare port-forward lands somewhere useful.
+	mux.HandleFunc("GET /debug", s.handleDebugHome)
+	mux.HandleFunc("GET /debug/{$}", s.handleDebugHome)
+	mux.HandleFunc("GET /{$}", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/debug", http.StatusTemporaryRedirect)
+	})
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))

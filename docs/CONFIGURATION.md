@@ -121,7 +121,7 @@ kubescrape -listen :8080 -wait-timeout 5s -cache-ttl 5m -log-format json
 
 | Flag | Default | Description |
 |---|---|---|
-| `-listen` | `:8080` | HTTP listen address |
+| `-listen` | `:8080` | HTTP listen address (the `/v1` API, `/healthz`, `/readyz`, and a `/debug` homepage with forms for the parameterised routes; `/` redirects there) |
 | `-kubeconfig` | — | kubeconfig path; defaults to in-cluster config, then `$KUBECONFIG` / `~/.kube/config` |
 | `-wait-timeout` | `5s` | default and maximum time a container lookup blocks waiting for metadata (`?wait=` can shorten per request, never lengthen) |
 | `-cache-ttl` | `5m` | how long metadata of deleted pods and replaced container IDs stays resolvable (tombstones) |

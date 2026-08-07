@@ -1358,6 +1358,10 @@ func (p *pipelines) startDebugServer(ctx context.Context, tl *tailer.Tailer, sc 
 	home := debugHome(links, notes)
 	mux.HandleFunc("GET /debug", home)
 	mux.HandleFunc("GET /debug/{$}", home)
+	// A bare port-forward lands on the homepage rather than a 404.
+	mux.HandleFunc("GET /{$}", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/debug", http.StatusTemporaryRedirect)
+	})
 	// Every handler here answers from an in-memory snapshot in
 	// milliseconds, so tight timeouts are safe: ReadHeaderTimeout kills
 	// Slowloris header trickling, Read/WriteTimeout bound trickled bodies

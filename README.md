@@ -229,6 +229,15 @@ The node's labels and annotations (the agent's `startNodeInfo` provider
 refreshes from this on `-node-metadata-refresh` for `.Node` attribute
 templates).
 
+### `GET /debug` (homepage)
+
+Small HTML index of the service's debug surface, with forms for the
+parameterised routes — namespace/pod for the explain endpoint, node for the
+target list, container-ID/UID/IP lookups. `GET /` redirects here, so a bare
+`kubectl port-forward deploy/kubescrape 8080` plus a browser is the whole
+workflow. Served even when the service is not ready (that is exactly when
+someone reaches for it); the agents serve their own homepage on `-listen`.
+
 ### `GET /v1/explain/{namespace}/{pod}`
 
 **Why is this pod (not) scraped?** — the decision chain, walked for one pod

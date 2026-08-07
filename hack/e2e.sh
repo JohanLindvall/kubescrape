@@ -123,6 +123,11 @@ explain_answers() {
 }
 wait_until 30 "the explain endpoint explains the demo pod" explain_answers
 
+service_home_links() {
+  curl -fsS http://127.0.0.1:18080/debug | grep '/v1/explain/' >/dev/null
+}
+wait_until 15 "the service /debug homepage carries the explain form" service_home_links
+
 log "asserting an agent sees its node's targets"
 agent_pod="$("${KCTL[@]}" -n monitoring get pods -l app=kubescrape-agent \
   --field-selector "spec.nodeName=$demo_node" -o jsonpath='{.items[0].metadata.name}')"

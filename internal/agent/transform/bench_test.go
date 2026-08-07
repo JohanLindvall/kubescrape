@@ -42,7 +42,7 @@ func BenchmarkTransformLogRecord(b *testing.B) {
 			b.Fatal(err)
 		}
 		ld := benchLogs(n)
-		if _, err := prog.logs.runLogs(ld); err != nil { // warm + sanity
+		if _, err := prog.logs.runLogs(ld, nil); err != nil { // warm + sanity
 			b.Fatal(err)
 		}
 		if ld.LogRecordCount() != n {
@@ -51,7 +51,7 @@ func BenchmarkTransformLogRecord(b *testing.B) {
 		b.ReportAllocs()
 		b.ResetTimer()
 		for b.Loop() {
-			if _, err := prog.logs.runLogs(ld); err != nil {
+			if _, err := prog.logs.runLogs(ld, nil); err != nil {
 				b.Fatal(err)
 			}
 		}

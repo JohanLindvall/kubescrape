@@ -69,6 +69,15 @@ type Source struct {
 	// non-containerd files (ignored for containerd sources, which derive them
 	// from pod metadata). Node attributes from the builder are added too.
 	Attributes map[string]string `json:"attributes,omitempty"`
+	// ParseScript runs the transforms file's parse: hook (parse(line)) on
+	// every line of this source before the shared chain: exotic formats a
+	// script can parse (body rewrite, severity, timestamp) without teaching
+	// the tailer another format. Plain sources only — containerd lines are
+	// CRI, already parsed — and the cost is one Starlark call per line ON
+	// THIS SOURCE only, which is why it is per-source opt-in rather than
+	// global (see the refusals note in CONFIGURATION.md: the containerd hot
+	// path never pays it).
+	ParseScript bool `json:"parseScript,omitempty"`
 	// PathAttributes derive per-file resource attributes from the file's PATH
 	// (a build agent's diagnostic tree encodes job identity in directory
 	// names; nothing on the line carries it). Rules are evaluated once per
@@ -135,6 +144,9 @@ func ValidateSources(sources []Source) ([]Source, error) {
 		if len(s.PathAttributes) > 0 && s.Containerd {
 			return nil, fmt.Errorf("source %d (%q): pathAttributes is not supported on containerd sources", i, s.Name)
 		}
+		if s.ParseScript && s.Containerd {
+			return nil, fmt.Errorf("source %d (%q): parseScript is not supported on containerd sources (CRI lines are already parsed)", i, s.Name)
+		}
 		if _, err := compilePathAttributes(s.PathAttributes); err != nil {
 			return nil, fmt.Errorf("source %d (%q): %w", i, s.Name, err)
 		}
@@ -161,6 +173,7 @@ type compiledSource struct {
 	ignoreOlder time.Duration
 	attributes  map[string]string
 	pathAttrs   []compiledPathAttr
+	parseScript bool
 	// namespaces/excludeNamespaces gate a containerd source by the namespace
 	// in the CRI filename (discovery time — the file is never opened);
 	// selector gates it by pod labels (resolve time — nothing is ever read).
@@ -343,6 +356,7 @@ func compileSources(sources []Source, dir string, defaultMultiline bool) []*comp
 			ignoreOlder: ignoreOlder,
 			attributes:  s.Attributes,
 			pathAttrs:   pathAttrs,
+			parseScript: s.ParseScript,
 
 			namespaces:        s.Namespaces,
 			excludeNamespaces: s.ExcludeNamespaces,

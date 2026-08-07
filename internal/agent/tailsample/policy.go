@@ -133,6 +133,11 @@ func compilePolicy(pc PolicyConfig, where string, sub bool, alloc *bucketAlloc) 
 	switch pc.Type {
 	case TypeAlwaysSample:
 		return alwaysPolicy{}, false, nil
+	case TypeScript:
+		if alloc.script == nil {
+			return nil, false, errPolicy(where, "type script requires a transforms file (-transforms-file) with a sample: section defining decide(trace)")
+		}
+		return scriptPolicy{fn: alloc.script}, false, nil
 	case TypeLatency:
 		p, err := compileLatency(where, pc.Latency)
 		return p, false, err
@@ -176,7 +181,7 @@ func allTypes() []string {
 	return []string{
 		TypeAlwaysSample, TypeLatency, TypeStatusCode, TypeStringAttribute,
 		TypeNumericAttribute, TypeBooleanAttribute, TypeProbabilistic,
-		TypeRateLimiting, TypeAnd, TypeComposite,
+		TypeRateLimiting, TypeAnd, TypeComposite, TypeScript,
 	}
 }
 
@@ -218,8 +223,8 @@ func checkBody(pc PolicyConfig, where string) error {
 			return errPolicy(where, "type is %q but a %q body is also set", pc.Type, b.typ)
 		}
 	}
-	if pc.Type == TypeAlwaysSample {
-		return nil // alwaysSample has no body to require
+	if pc.Type == TypeAlwaysSample || pc.Type == TypeScript {
+		return nil // alwaysSample and script have no body to require
 	}
 	if !own {
 		return errPolicy(where, "type is %q but no %q body is set", pc.Type, pc.Type)
@@ -561,18 +566,43 @@ func (p *probPolicy) eval(t Trace, _ time.Time) (verdict, string, ChargedMask) {
 	return verdictAbstain, "", 0
 }
 
-// bucketAlloc hands each rate bucket its ChargedMask bit, in compile order.
-// Buckets past the mask's width share the last bit and degrade to the old
-// single-bit behaviour among themselves — no realistic policy list gets there.
-type bucketAlloc int
+// bucketAlloc hands each rate bucket its ChargedMask bit, in compile order,
+// and carries the compile-scoped injections (the script policy body) so
+// nested leaves inside and/composite reach them without another parameter on
+// every compile function. Buckets past the mask's width share the last bit
+// and degrade to the old single-bit behaviour among themselves — no
+// realistic policy list gets there.
+type bucketAlloc struct {
+	bits   int
+	script func(Trace) (sample, abstain bool)
+}
 
 func (a *bucketAlloc) next() ChargedMask {
-	i := int(*a)
-	*a++
+	i := a.bits
+	a.bits++
 	if i > 63 {
 		i = 63
 	}
 	return ChargedMask(1) << i
+}
+
+// scriptPolicy delegates to the injected Starlark decide(trace): True
+// samples, False drops, None — and any script error, which the engine
+// reports as abstain — falls to the next policy.
+type scriptPolicy struct {
+	fn func(Trace) (sample, abstain bool)
+}
+
+func (p scriptPolicy) eval(t Trace, _ time.Time) (verdict, string, ChargedMask) {
+	s, abstain := p.fn(t)
+	switch {
+	case abstain:
+		return verdictAbstain, "", 0
+	case s:
+		return verdictSample, "", 0
+	default:
+		return verdictVeto, "", 0
+	}
 }
 
 // --- rateLimiting -----------------------------------------------------------

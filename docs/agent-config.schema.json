@@ -343,6 +343,9 @@
                 },
                 "type": "array"
               },
+              "parseScript": {
+                "type": "boolean"
+              },
               "pathAttributes": {
                 "items": {
                   "additionalProperties": false,

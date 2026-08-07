@@ -359,8 +359,17 @@ func validateConfig(cfg agentConfig, transformsFile string) error {
 			}
 		}
 	}
-	if _, err := compileTransforms(transformsFile); err != nil {
+	prog, err := compileTransforms(transformsFile)
+	if err != nil {
 		return fmt.Errorf("transforms: %w", err)
+	}
+	// Cross-file check: a `type: script` tail-sampling policy is only
+	// satisfiable when the transforms file defines a sample: section.
+	// Validate() itself uses a placeholder (the injection has not happened at
+	// check time), so without this a config that CrashLoops the StatefulSet
+	// would pass -check-config.
+	if cfg.TailSampling.Enabled() && cfg.TailSampling.UsesScript() && !prog.HasSample() {
+		return fmt.Errorf("tailSampling: a `type: script` policy requires -transforms-file with a sample: section defining decide(trace)")
 	}
 	return nil
 }

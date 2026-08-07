@@ -48,6 +48,8 @@ package otlpingest
 import (
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/plog"
+	"go.opentelemetry.io/collector/pdata/pmetric"
+	"go.opentelemetry.io/collector/pdata/ptrace"
 
 	"github.com/JohanLindvall/kubescrape/internal/agent/logchain"
 	"github.com/JohanLindvall/kubescrape/internal/agent/logenrich"
@@ -229,4 +231,50 @@ func dedupeResourceKeys(m pcommon.Map) {
 	// rebuilds the attribute list from it. Boxing the tree is acceptable on
 	// this path: it only runs for a payload that actually repeated a key.
 	_ = m.FromRaw(m.AsRaw())
+}
+
+// admitLogs/admitMetrics/admitTraces apply the operator's ingest admission
+// hook (ServerConfig.Admit — the transforms file's ingest: section) per
+// pushed RESOURCE, before enrichment: a rejected resource is removed and
+// counted, the push is still acked, and an emptied payload acks without a
+// send. Before enrichment deliberately — a rejected sender must not spend a
+// metadata lookup per resource on its way out (the same argument as
+// RejectTraces).
+func (s *Server) admitLogs(ld plog.Logs) {
+	if s.cfg.Admit == nil {
+		return
+	}
+	ld.ResourceLogs().RemoveIf(func(rl plog.ResourceLogs) bool {
+		if s.cfg.Admit(rl.Resource().Attributes()) {
+			return false
+		}
+		obs.IngestAdmissionRejected.Inc()
+		return true
+	})
+}
+
+func (s *Server) admitMetrics(md pmetric.Metrics) {
+	if s.cfg.Admit == nil {
+		return
+	}
+	md.ResourceMetrics().RemoveIf(func(rm pmetric.ResourceMetrics) bool {
+		if s.cfg.Admit(rm.Resource().Attributes()) {
+			return false
+		}
+		obs.IngestAdmissionRejected.Inc()
+		return true
+	})
+}
+
+func (s *Server) admitTraces(td ptrace.Traces) {
+	if s.cfg.Admit == nil {
+		return
+	}
+	td.ResourceSpans().RemoveIf(func(rs ptrace.ResourceSpans) bool {
+		if s.cfg.Admit(rs.Resource().Attributes()) {
+			return false
+		}
+		obs.IngestAdmissionRejected.Inc()
+		return true
+	})
 }

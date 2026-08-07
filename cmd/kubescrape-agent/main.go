@@ -815,6 +815,12 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("logs metrics config: %w", err)
 	}
+	if transforms != nil && logMetrics != nil {
+		// The emit_metric bridge: scripts observe into DECLARED logMetrics
+		// series. Guarded on the typed value — a nil *DynamicMetricSet boxed
+		// into the interface would defeat the builtin's own nil check.
+		transforms.SetMetricEmitter(logMetrics)
+	}
 	if logMetrics != nil {
 		// The refused-observation counters belong to THIS set (they used to be
 		// process globals); publish them now that one exists.
@@ -1063,6 +1069,21 @@ func (p *pipelines) startLogs(ctx context.Context) (*tailer.Tailer, error) {
 		// and the self chain still sees the shared reloaded program via Fork.
 		cfg.Transform = p.transforms.TransformLogs
 		cfg.Exporter = p.transforms.Inner()
+		// The parse: hook, consulted only for sources flagged parseScript
+		// (the adapter keeps the tailer free of a transform dependency).
+		w := p.transforms
+		cfg.ParseLine = func(line string) (tailer.ParsedLine, bool) {
+			parsed, ok := w.ParseLine(line)
+			if !ok {
+				return tailer.ParsedLine{}, false
+			}
+			return tailer.ParsedLine{
+				Body:         parsed.Body,
+				HasBody:      parsed.HasBody,
+				SeverityText: parsed.SeverityText,
+				TimeUnixNano: parsed.TimeUnixNano,
+			}, true
+		}
 	}
 	tl := tailer.New(cfg)
 	p.spawn(func() {
@@ -1194,6 +1215,12 @@ func (p *pipelines) startIngest(ctx context.Context) error {
 		LogMetrics: p.logMetrics,
 		Logger:     p.log,
 	}
+	if p.transforms != nil {
+		// The ingest: admission hook (per resource, pre-enrichment; hot
+		// reload adds/removes it without a restart — AdmitResource resolves
+		// the active program per call and admits when no hook exists).
+		scfg.Admit = p.transforms.AdmitResource
+	}
 	// The gate only where something binds: with neither address configured the
 	// listeners are a no-op and Ready never fires, so registering it anyway
 	// would hold /readyz down for the process lifetime.
@@ -1241,8 +1268,14 @@ func (p *pipelines) startScraper(ctx context.Context) *promscrape.Scraper {
 	kubeletScrapes := *kubeletEndpoint != "" && (*cadvisorOn || *nodeOn)
 	var sc0 *promscrape.Scraper
 	if *metricsOn || kubeletScrapes {
+		var targetHook func([]kubemeta.ScrapeTarget) []kubemeta.ScrapeTarget
+		if p.transforms != nil {
+			// The targets: hook — per fetched target, once per cycle.
+			targetHook = p.transforms.TransformTargets
+		}
 		sc := promscrape.New(promscrape.Config{
 			Node:           *nodeName,
+			TargetHook:     targetHook,
 			Interval:       *scrapeInterval,
 			Timeout:        *scrapeTimeout,
 			Concurrency:    *scrapeConcurrency,

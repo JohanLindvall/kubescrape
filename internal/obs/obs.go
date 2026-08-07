@@ -262,6 +262,11 @@ var (
 	// retryable and the sender still holds the payload, but a persistently
 	// non-zero rate means the node cannot keep up with what is being pushed at
 	// it.
+	IngestAdmissionRejected = Registry.Counter("kubescrape_ingest_admission_rejected_total",
+		"Pushed RESOURCES the transforms file's ingest admission hook (ingest: admit(resource)) rejected — "+
+			"removed before enrichment, push still acked. The hook is the operator's per-sender policy on "+
+			"listeners nothing authenticates; a script error fails OPEN (the resource is admitted) and counts "+
+			"into kubescrape_transform_errors_total{signal=\"ingest\"} instead.")
 	IngestChainSkipped = Registry.CounterVec("kubescrape_ingest_log_chain_skipped_total",
 		"Ingested log RECORDS or RESOURCES whose line-derived processing (body enrichment, log-metrics "+
 			"observation) was skipped by an abuse bound — the data itself is still forwarded. Reasons: "+

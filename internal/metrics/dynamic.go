@@ -3,7 +3,9 @@ package metrics
 import (
 	"fmt"
 	"log/slog"
+	"maps"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -464,4 +466,33 @@ func (s *DynamicMetricSet) add(values ValueFunc, lookup func(string) string, res
 	clear(ac.buf[:cap(ac.buf)])
 	clear(ac.rbuf[:cap(ac.rbuf)])
 	s.pool.Put(ac)
+}
+
+// EmitDirect records one observation into a DECLARED metric, bypassing the
+// line matching — the transform-script bridge (emit_metric). The metric must
+// exist in the logMetrics config: declaration is where its type, action,
+// buckets and cardinality cap live, and an undeclared name is a script bug
+// reported as a script error rather than a silently minted unbounded series.
+// The observation lands in the rule's own series under all the usual caps;
+// labels are applied in sorted-key order for a deterministic identity. Safe
+// on a nil set (returns an error naming the reason).
+//
+// At-least-once caveat, same as every producer's: a retried batch re-runs
+// its script, so a transient export failure re-emits.
+func (s *DynamicMetricSet) EmitDirect(name string, value float64, lbls map[string]string, resource pcommon.Map) error {
+	if s == nil {
+		return fmt.Errorf("emit_metric %q: no logMetrics section is configured", name)
+	}
+	for _, r := range s.rules {
+		if r.series.name != name {
+			continue
+		}
+		var buf labels
+		for _, k := range slices.Sorted(maps.Keys(lbls)) {
+			buf = buf.set(k, lbls[k])
+		}
+		r.series.observe(buf, value, resourceAccum(resource), resource, nil)
+		return nil
+	}
+	return fmt.Errorf("emit_metric %q: no logMetrics rule declares this metric", name)
 }

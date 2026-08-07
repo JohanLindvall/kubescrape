@@ -38,6 +38,7 @@ import (
 	"os"
 	"sync/atomic"
 
+	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/plog"
 	"go.opentelemetry.io/collector/pdata/pmetric"
 	"go.opentelemetry.io/collector/pdata/ptrace"
@@ -51,6 +52,22 @@ type Config struct {
 	Logs    string `json:"logs,omitempty"`
 	Metrics string `json:"metrics,omitempty"`
 	Traces  string `json:"traces,omitempty"`
+
+	// The hook sections (hooks.go), each optional and each defining its own
+	// function; all fail open on script errors:
+	//
+	// Ingest defines admit(resource) — per pushed resource, before
+	// enrichment; False removes it (the operator's per-sender policy).
+	Ingest string `json:"ingest,omitempty"`
+	// Targets defines target(t) — per fetched scrape target; t.drop()
+	// removes it, t.path is writable.
+	Targets string `json:"targets,omitempty"`
+	// Sample defines decide(trace) — the tail-sampling `script` policy body
+	// (True samples, False drops, None abstains).
+	Sample string `json:"sample,omitempty"`
+	// Parse defines parse(line) — plain log sources flagged parseScript run
+	// it per line; a dict return may set body/severity_text/time_unix_nano.
+	Parse string `json:"parse,omitempty"`
 }
 
 // Program is a compiled, immutable set of per-signal transforms. Swapped
@@ -60,6 +77,10 @@ type Program struct {
 	logs    *starlarkProgram
 	metrics *starlarkProgram
 	traces  *starlarkProgram
+	ingest  *starlarkProgram
+	targets *starlarkProgram
+	sample  *starlarkProgram
+	parse   *starlarkProgram
 	// Hash identifies the compiled config (content hash of the file), served on
 	// /debug/transforms so per-node convergence after a reload is observable.
 	Hash string
@@ -89,6 +110,22 @@ func Compile(raw []byte) (*Program, error) {
 			return nil, err
 		}
 	}
+	for _, h := range []struct {
+		src, signal, fn string
+		dst             **starlarkProgram
+	}{
+		{cfg.Ingest, "ingest", "admit", &p.ingest},
+		{cfg.Targets, "targets", "target", &p.targets},
+		{cfg.Sample, "sample", "decide", &p.sample},
+		{cfg.Parse, "parse", "parse", &p.parse},
+	} {
+		if h.src == "" {
+			continue
+		}
+		if *h.dst, err = compileStarlarkFn(h.signal, h.src, h.fn); err != nil {
+			return nil, err
+		}
+	}
 	return p, nil
 }
 
@@ -103,7 +140,8 @@ func CompileFile(path string) (*Program, error) {
 
 // Empty reports a program with no transforms at all.
 func (p *Program) Empty() bool {
-	return p == nil || (p.logs == nil && p.metrics == nil && p.traces == nil)
+	return p == nil || (p.logs == nil && p.metrics == nil && p.traces == nil &&
+		p.ingest == nil && p.targets == nil && p.sample == nil && p.parse == nil)
 }
 
 // Exporter is the downstream the wrapper forwards to (otlpexport.Client and
@@ -118,11 +156,20 @@ type TracesExporter interface {
 	ExportTraces(ctx context.Context, td ptrace.Traces) error
 }
 
+// MetricEmitter is the emit_metric bridge target: the logMetrics set's
+// EmitDirect. An interface so transform needs no metrics import in its API.
+type MetricEmitter interface {
+	EmitDirect(name string, value float64, labels map[string]string, resource pcommon.Map) error
+}
+
 // Wrapper applies the active program to every batch, then forwards. The
 // program pointer is swapped by the reloader; each Export loads it once.
 type Wrapper struct {
 	next       Exporter
 	nextTraces TracesExporter
+	// emitter is the emit_metric target (nil = the builtin errors, naming the
+	// missing logMetrics section). Set once at wiring time, before traffic.
+	emitter MetricEmitter
 	// program is a POINTER so forks can share one reloaded program (see Fork):
 	// a second wrapper over a different downstream must not need a second
 	// reloader, or a broken edit could leave the two chains on different
@@ -143,8 +190,12 @@ func Wrap(next Exporter, nextTraces TracesExporter, initial *Program) *Wrapper {
 // agent uses it for the chain carrying its own metrics, which skips the
 // namespace router but must still see the operator's transforms.
 func (w *Wrapper) Fork(next Exporter, nextTraces TracesExporter) *Wrapper {
-	return &Wrapper{next: next, nextTraces: nextTraces, program: w.program}
+	return &Wrapper{next: next, nextTraces: nextTraces, program: w.program, emitter: w.emitter}
 }
+
+// SetMetricEmitter wires the emit_metric bridge (call before traffic flows;
+// main wires it once at startup).
+func (w *Wrapper) SetMetricEmitter(m MetricEmitter) { w.emitter = m }
 
 // TransformLogs runs the active logs program on ld IN PLACE (drop marks
 // swept, empty groups pruned) and reports the script's error; no program means
@@ -165,7 +216,7 @@ func (w *Wrapper) TransformLogs(ld plog.Logs) error {
 	// tailer's retry loop re-sends the same already-transformed object), so
 	// there is no per-attempt re-run to over-count. A sweep-level rewind
 	// rebuilds the batch from source, which is a fresh transform by design.
-	dropped, err := p.logs.runLogs(ld)
+	dropped, err := p.logs.runLogs(ld, w.emitter)
 	if err != nil {
 		return err
 	}
@@ -205,7 +256,7 @@ func (w *Wrapper) ExportLogs(ctx context.Context, ld plog.Logs) error {
 			out = plog.NewLogs()
 			ld.CopyTo(out)
 		}
-		dropped, err := p.logs.runLogs(out)
+		dropped, err := p.logs.runLogs(out, w.emitter)
 		if err != nil {
 			return err
 		}
@@ -232,7 +283,7 @@ func (w *Wrapper) ExportMetrics(ctx context.Context, md pmetric.Metrics) error {
 			out = pmetric.NewMetrics()
 			md.CopyTo(out)
 		}
-		dropped, err := p.metrics.runMetrics(out)
+		dropped, err := p.metrics.runMetrics(out, w.emitter)
 		if err != nil {
 			return err
 		}
@@ -260,7 +311,7 @@ func (w *Wrapper) ExportTraces(ctx context.Context, td ptrace.Traces) error {
 			out = ptrace.NewTraces()
 			td.CopyTo(out)
 		}
-		dropped, err := p.traces.runTraces(out)
+		dropped, err := p.traces.runTraces(out, w.emitter)
 		if err != nil {
 			return err
 		}
@@ -282,3 +333,7 @@ func (w *Wrapper) ExportTraces(ctx context.Context, td ptrace.Traces) error {
 	}
 	return w.nextTraces.ExportTraces(ctx, td)
 }
+
+// HasSample reports whether the program carries a sample: section (the
+// `type: script` tail-sampling body); config validation cross-checks it.
+func (p *Program) HasSample() bool { return p != nil && p.sample != nil }

@@ -25,10 +25,12 @@ package route
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"path"
 	"slices"
 	"strconv"
 	"strings"
+	"time"
 
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/plog"
@@ -36,6 +38,7 @@ import (
 	"go.opentelemetry.io/collector/pdata/ptrace"
 
 	"github.com/JohanLindvall/kubescrape/internal/agent/otlpexport"
+	"github.com/JohanLindvall/kubescrape/internal/logdedupe"
 	"github.com/JohanLindvall/kubescrape/internal/obs"
 )
 
@@ -179,10 +182,23 @@ type Destination struct {
 	Exporter   Exporter
 }
 
+// ScriptMarker is the reserved resource attribute a transform script's
+// route("name") verb stamps: the router honors it BEFORE the namespace
+// globs and strips it from the outgoing copy, so kubescrape plumbing never
+// reaches a collector. It exists as a sanctioned verb because scripts could
+// already steer routing by rewriting k8s.namespace.name — an accidental
+// contract worth replacing with an explicit one. A name matching no
+// configured route falls to the default chain, warned (throttled) rather
+// than dropped: a typo must degrade to the safe destination, not to loss.
+const ScriptMarker = "kubescrape.route"
+
 // Router splits payloads across destinations.
 type Router struct {
 	def   Exporter
 	dests []Destination
+	// unknownRouteGate throttles the typo'd-ScriptMarker warning: the script
+	// stamps every record of a busy stream, and the condition is a state.
+	unknownRouteGate logdedupe.Throttle
 }
 
 // New builds a Router forwarding unmatched resources to def.
@@ -190,21 +206,39 @@ func New(def Exporter, dests []Destination) *Router {
 	return &Router{def: def, dests: dests}
 }
 
-// match returns the destination index for a namespace (-1 = default).
-func (r *Router) match(res pcommon.Resource) int {
-	ns, ok := res.Attributes().Get("k8s.namespace.name")
+// match returns the destination index for a resource (-1 = default) and
+// whether a ScriptMarker was present. marked forces the SPLIT path even for
+// the default destination: the marker must be stripped before anything is
+// sent, and stripping may only happen on the split's copy — the caller's
+// payload is retried as-is by its producer.
+func (r *Router) match(res pcommon.Resource) (idx int, marked bool) {
+	attrs := res.Attributes()
+	if v, ok := attrs.Get(ScriptMarker); ok {
+		want := v.Str()
+		for i, d := range r.dests {
+			if d.Name == want {
+				return i, true
+			}
+		}
+		if r.unknownRouteGate.Allow(time.Minute) {
+			slog.Warn("transform script routed to an unknown route; using the default chain",
+				"route", want)
+		}
+		return -1, true
+	}
+	ns, ok := attrs.Get("k8s.namespace.name")
 	if !ok {
-		return -1
+		return -1, false
 	}
 	name := ns.Str()
 	for i, d := range r.dests {
 		for _, pat := range d.Namespaces {
 			if ok, _ := path.Match(pat, name); ok {
-				return i
+				return i, false
 			}
 		}
 	}
-	return -1
+	return -1, false
 }
 
 // ExportLogs splits by resource namespace and forwards each group.
@@ -228,7 +262,9 @@ func (r *Router) ExportLogs(ctx context.Context, ld plog.Logs) error {
 	rls := ld.ResourceLogs()
 	for i := 0; i < rls.Len(); i++ {
 		g := groups[i]
-		rls.At(i).CopyTo(parts[g+1].ResourceLogs().AppendEmpty())
+		dst := parts[g+1].ResourceLogs().AppendEmpty()
+		rls.At(i).CopyTo(dst)
+		stripMarker(dst.Resource())
 	}
 	var errs []error
 	if parts[0].ResourceLogs().Len() > 0 {
@@ -266,7 +302,9 @@ func (r *Router) ExportMetrics(ctx context.Context, md pmetric.Metrics) error {
 	rms := md.ResourceMetrics()
 	for i := 0; i < rms.Len(); i++ {
 		g := groups[i]
-		rms.At(i).CopyTo(parts[g+1].ResourceMetrics().AppendEmpty())
+		dst := parts[g+1].ResourceMetrics().AppendEmpty()
+		rms.At(i).CopyTo(dst)
+		stripMarker(dst.Resource())
 	}
 	var errs []error
 	if parts[0].ResourceMetrics().Len() > 0 {
@@ -307,7 +345,9 @@ func (r *Router) ExportTraces(ctx context.Context, td ptrace.Traces) error {
 	rss := td.ResourceSpans()
 	for i := 0; i < rss.Len(); i++ {
 		g := groups[i]
-		rss.At(i).CopyTo(parts[g+1].ResourceSpans().AppendEmpty())
+		dst := parts[g+1].ResourceSpans().AppendEmpty()
+		rss.At(i).CopyTo(dst)
+		stripMarker(dst.Resource())
 	}
 	var errs []error
 	if parts[0].ResourceSpans().Len() > 0 {
@@ -349,7 +389,7 @@ func (r *Router) ExportTraces(ctx context.Context, td ptrace.Traces) error {
 func (r *Router) split(n int, res func(int) pcommon.Resource) []int {
 	first := -1
 	for i := 0; i < n; i++ {
-		if r.match(res(i)) >= 0 {
+		if idx, marked := r.match(res(i)); idx >= 0 || marked {
 			first = i
 			break
 		}
@@ -362,7 +402,13 @@ func (r *Router) split(n int, res func(int) pcommon.Resource) []int {
 		groups[i] = -1
 	}
 	for i := first; i < n; i++ {
-		groups[i] = r.match(res(i))
+		groups[i], _ = r.match(res(i))
 	}
 	return groups
+}
+
+// stripMarker removes the script-routing marker from a COPIED resource; it
+// must never reach a destination.
+func stripMarker(res pcommon.Resource) {
+	res.Attributes().Remove(ScriptMarker)
 }

@@ -9,6 +9,7 @@ import (
 
 	"github.com/JohanLindvall/kubescrape/internal/obs"
 
+	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/plog"
 	"go.opentelemetry.io/collector/pdata/plog/plogotlp"
 	"go.opentelemetry.io/collector/pdata/pmetric"
@@ -81,6 +82,12 @@ type ServerConfig struct {
 	// It runs AFTER admission (the byte budget and the in-flight slot), so a
 	// refused push releases everything it took, exactly as an accepted one does.
 	RejectTraces func(ctx context.Context, td ptrace.Traces) error
+	// Admit, when set, is consulted once per pushed RESOURCE (all three
+	// signals) before enrichment: false removes the resource from the
+	// payload — the transforms file's ingest: hook, the operator's
+	// per-sender policy on listeners nothing authenticates. Removals are
+	// counted (obs.IngestAdmissionRejected) and the push is still acked.
+	Admit func(attrs pcommon.Map) bool
 	// Rules is the global logs.rules keep/drop/sample chain, applied to
 	// INGESTED log records after enrichment (so __severity__ selects on the
 	// enriched severity) — the same chain, same semantics, as the tailer,
@@ -311,6 +318,8 @@ type logsGRPC struct {
 func (g *logsGRPC) Export(ctx context.Context, req plogotlp.ExportRequest) (plogotlp.ExportResponse, error) {
 	err := grpcExport(ctx, func(ctx context.Context) error {
 		ld := req.Logs()
+		// Admission first (ingest: hook, per resource, pre-enrichment).
+		g.s.admitLogs(ld)
 		g.s.cfg.Enricher.EnrichLogs(ctx, ld)
 		// logs.rules + logMetrics, AFTER enrichment (logchain.go); a payload
 		// filtered to nothing is acked without a send.
@@ -336,7 +345,12 @@ type metricsGRPC struct {
 
 func (g *metricsGRPC) Export(ctx context.Context, req pmetricotlp.ExportRequest) (pmetricotlp.ExportResponse, error) {
 	err := grpcExport(ctx, func(ctx context.Context) error {
-		md := g.s.cfg.Enricher.EnrichMetrics(ctx, req.Metrics())
+		in := req.Metrics()
+		g.s.admitMetrics(in) // admission first (ingest: hook, pre-enrichment)
+		if in.ResourceMetrics().Len() == 0 {
+			return nil // everything rejected: acked without a send
+		}
+		md := g.s.cfg.Enricher.EnrichMetrics(ctx, in)
 		// Handoff: same reasoning as the logs arm — a failed forward drops the
 		// decoded object and the sender retransmits bytes.
 		return g.s.cfg.Exporter.ExportMetrics(transform.Handoff(ctx), md)
@@ -432,6 +446,10 @@ func (g *tracesGRPC) Export(ctx context.Context, req ptraceotlp.ExportRequest) (
 		if err := g.s.rejectTraces(ctx, td); err != nil {
 			return err
 		}
+		g.s.admitTraces(td) // admission after the loop guard, pre-enrichment
+		if td.ResourceSpans().Len() == 0 {
+			return nil // everything rejected: acked without a send
+		}
 		g.s.cfg.Enricher.EnrichTraces(ctx, td)
 		return g.s.cfg.Traces.ExportTraces(ctx, td)
 	})
@@ -497,6 +515,7 @@ func (s *Server) handleHTTPLogs(w http.ResponseWriter, r *http.Request) {
 	req := plogotlp.NewExportRequest()
 	s.servePush(w, r, "logs", req.UnmarshalProto, func(ctx context.Context) (ProtoMarshaler, error) {
 		ld := req.Logs()
+		s.admitLogs(ld) // admission first (ingest: hook, pre-enrichment)
 		s.cfg.Enricher.EnrichLogs(ctx, ld)
 		// logs.rules + logMetrics, AFTER enrichment (logchain.go); a payload
 		// filtered to nothing is acked without a send.
@@ -515,7 +534,12 @@ func (s *Server) handleHTTPLogs(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleHTTPMetrics(w http.ResponseWriter, r *http.Request) {
 	req := pmetricotlp.NewExportRequest()
 	s.servePush(w, r, "metrics", req.UnmarshalProto, func(ctx context.Context) (ProtoMarshaler, error) {
-		md := s.cfg.Enricher.EnrichMetrics(ctx, req.Metrics())
+		in := req.Metrics()
+		s.admitMetrics(in) // admission first (ingest: hook, pre-enrichment)
+		if in.ResourceMetrics().Len() == 0 {
+			return pmetricotlp.NewExportResponse(), nil // all rejected: acked
+		}
+		md := s.cfg.Enricher.EnrichMetrics(ctx, in)
 		// Handoff: as on the gRPC arm.
 		if err := s.cfg.Exporter.ExportMetrics(transform.Handoff(ctx), md); err != nil {
 			return nil, err
@@ -530,6 +554,10 @@ func (s *Server) handleHTTPTraces(w http.ResponseWriter, r *http.Request) {
 		td := req.Traces()
 		if err := s.rejectTraces(ctx, td); err != nil {
 			return nil, err
+		}
+		s.admitTraces(td) // admission after the loop guard, pre-enrichment
+		if td.ResourceSpans().Len() == 0 {
+			return ptraceotlp.NewExportResponse(), nil // all rejected: acked
 		}
 		s.cfg.Enricher.EnrichTraces(ctx, td)
 		if err := s.cfg.Traces.ExportTraces(ctx, td); err != nil {

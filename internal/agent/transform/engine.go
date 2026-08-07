@@ -41,6 +41,13 @@ type starlarkProgram struct {
 // compile includes a smoke evaluation of the module (top-level statements
 // run), so syntax and load-time errors are caught at config time.
 func compileStarlark(signal, src string) (*starlarkProgram, error) {
+	return compileStarlarkFn(signal, src, "transform")
+}
+
+// compileStarlarkFn compiles src and resolves fnName — the batch transforms
+// all define transform(batch); the hook sections each define their own
+// (admit/target/decide/parse).
+func compileStarlarkFn(signal, src, fnName string) (*starlarkProgram, error) {
 	opts := &syntax.FileOptions{Set: true, While: true, GlobalReassign: true}
 	thread := &starlark.Thread{Name: "compile:" + signal}
 	// Bound the smoke evaluation like the run path: a top-level comprehension
@@ -50,16 +57,29 @@ func compileStarlark(signal, src string) (*starlarkProgram, error) {
 	// run()) or wedge the reload goroutine forever, breaking the
 	// keep-last-good-program guarantee. maxSteps caps it to a config error.
 	thread.SetMaxExecutionSteps(maxSteps)
-	globals, err := starlark.ExecFileOptions(opts, thread, signal+".star", src, nil)
+	globals, err := starlark.ExecFileOptions(opts, thread, signal+".star", src, predeclared(signal))
 	if err != nil {
 		return nil, fmt.Errorf("transforms %s: %w", signal, err)
 	}
-	fn, ok := globals["transform"].(starlark.Callable)
+	fn, ok := globals[fnName].(starlark.Callable)
 	if !ok {
-		return nil, fmt.Errorf("transforms %s: script must define transform(batch)", signal)
+		return nil, fmt.Errorf("transforms %s: script must define %s(...)", signal, fnName)
 	}
 	globals.Freeze() // shared across export goroutines: must be immutable
 	return &starlarkProgram{signal: signal, fn: fn}, nil
+}
+
+// call invokes the program's function with args on a fresh bounded thread,
+// returning its value (the hook accessors interpret it; run below discards
+// it). Errors count into obs.TransformErrors under the program's signal.
+func (p *starlarkProgram) call(args ...starlark.Value) (starlark.Value, error) {
+	thread := &starlark.Thread{Name: "transform:" + p.signal}
+	thread.SetMaxExecutionSteps(maxSteps)
+	v, err := starlark.Call(thread, p.fn, starlark.Tuple(args), nil)
+	if err != nil {
+		return nil, fmt.Errorf("transform %s: %w", p.signal, err)
+	}
+	return v, nil
 }
 
 // run invokes transform(batch) on a fresh bounded thread.
@@ -80,22 +100,22 @@ func (p *starlarkProgram) run(batch starlark.Value) error {
 // transient retry for the copy-path producers, which re-offer the same object
 // and re-run the script on a fresh copy every attempt — an operator alerting
 // on the rate saw drop volume proportional to outage length, not intent.
-func (p *starlarkProgram) runLogs(ld plog.Logs) (int, error) {
-	if err := p.run(&logBatch{ld: ld}); err != nil {
+func (p *starlarkProgram) runLogs(ld plog.Logs, em MetricEmitter) (int, error) {
+	if err := p.run(&logBatch{ld: ld, em: em}); err != nil {
 		return 0, err
 	}
 	return pruneLogs(ld), nil
 }
 
-func (p *starlarkProgram) runMetrics(md pmetric.Metrics) (int, error) {
-	if err := p.run(&metricBatch{md: md}); err != nil {
+func (p *starlarkProgram) runMetrics(md pmetric.Metrics, em MetricEmitter) (int, error) {
+	if err := p.run(&metricBatch{md: md, em: em}); err != nil {
 		return 0, err
 	}
 	return pruneMetrics(md), nil
 }
 
-func (p *starlarkProgram) runTraces(td ptrace.Traces) (int, error) {
-	if err := p.run(&traceBatch{td: td}); err != nil {
+func (p *starlarkProgram) runTraces(td ptrace.Traces, em MetricEmitter) (int, error) {
+	if err := p.run(&traceBatch{td: td, em: em}); err != nil {
 		return 0, err
 	}
 	return pruneTraces(td), nil

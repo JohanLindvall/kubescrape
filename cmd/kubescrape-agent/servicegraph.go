@@ -228,6 +228,12 @@ func (p *pipelines) buildOwnerChain(ctx context.Context, proc *servicegraph.Proc
 	}
 	chain := out
 	if cfg := p.fileCfg.TailSampling; cfg.Enabled() { // nil-receiver safe
+		if p.transforms != nil {
+			// The `type: script` policy body (the transforms file's sample:
+			// section). nil when the section is absent — the policy compiler
+			// then refuses `type: script` at config time, naming the fix.
+			cfg.Script = p.transforms.SampleDecider()
+		}
 		tb, err := tailbuffer.New(*cfg, chain, p.log)
 		if err != nil {
 			return nil, fmt.Errorf("tailSampling: %w", err)

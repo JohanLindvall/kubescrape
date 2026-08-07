@@ -145,6 +145,11 @@ const (
 	TypeRateLimiting     = "rateLimiting"
 	TypeAnd              = "and"
 	TypeComposite        = "composite"
+	// TypeScript is the injected Starlark policy: the transforms file's
+	// sample: section (decide(trace) -> True/False/None). Not a Collector
+	// type; it exists so bespoke keep-logic (cross-span invariants,
+	// tenant-aware sampling) does not grow this DSL forever.
+	TypeScript = "script"
 )
 
 // Config is the policy list. The assembly layer's own section (how long to wait
@@ -158,6 +163,15 @@ type Config struct {
 	// refuses it, because an evaluator that can never sample anything is a
 	// caller bug rather than a config state.
 	Policies []PolicyConfig `json:"policies"`
+
+	// Script is the `type: script` policy body, INJECTED by the wiring from
+	// the transforms file's sample: section — never decoded from YAML (this
+	// package stays free of Starlark; the engine hands it a closure). It
+	// returns (sample, abstain); errors inside the script surface as abstain
+	// there, so a broken hot-reloaded script degrades to the next policy in
+	// the list rather than to a verdict. nil + a `type: script` policy is a
+	// config error naming the missing section.
+	Script func(Trace) (sample, abstain bool) `json:"-"`
 }
 
 // Enabled reports whether any policy is configured.
@@ -174,8 +188,39 @@ func (c *Config) Validate() error {
 		return nil
 	}
 	var alloc bucketAlloc
+	// Shape validation must not depend on the INJECTED script body (Validate
+	// runs in -check-config, where the wiring has not happened): a
+	// placeholder satisfies the type: script compile, and the cross-check
+	// that the transforms file actually defines a sample: section lives in
+	// the agent's validateConfig, beside the transforms compile (UsesScript).
+	alloc.script = func(Trace) (bool, bool) { return false, true }
 	_, _, err := compilePolicies(c.Policies, false, &alloc)
 	return err
+}
+
+// UsesScript reports whether any policy — top level or nested inside
+// and/composite — is `type: script`, so config validation can require the
+// transforms file's sample: section.
+func (c *Config) UsesScript() bool {
+	if c == nil {
+		return false
+	}
+	var uses func(pcs []PolicyConfig) bool
+	uses = func(pcs []PolicyConfig) bool {
+		for _, pc := range pcs {
+			if pc.Type == TypeScript {
+				return true
+			}
+			if pc.And != nil && uses(pc.And.SubPolicies) {
+				return true
+			}
+			if pc.Composite != nil && uses(pc.Composite.SubPolicies) {
+				return true
+			}
+		}
+		return false
+	}
+	return uses(c.Policies)
 }
 
 // PolicyConfig is one entry of the list. The body lives under a key named after
@@ -471,6 +516,7 @@ func New(cfg Config) (*Evaluator, error) {
 		return nil, errors.New("tail sampling: no policies configured (an evaluator with no policies drops every trace)")
 	}
 	var alloc bucketAlloc
+	alloc.script = cfg.Script
 	ps, needClock, err := compilePolicies(cfg.Policies, false, &alloc)
 	if err != nil {
 		return nil, err

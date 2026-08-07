@@ -20,6 +20,8 @@ import (
 	"go.opentelemetry.io/collector/pdata/pmetric"
 	"go.opentelemetry.io/collector/pdata/ptrace"
 	"go.starlark.net/starlark"
+
+	"github.com/JohanLindvall/kubescrape/internal/agent/route"
 )
 
 // dropMarker flags an element for post-run pruning. Logs and spans carry it
@@ -143,7 +145,10 @@ func (d dropFn) CallInternal(*starlark.Thread, starlark.Tuple, []starlark.Tuple)
 
 // --- log batch ---
 
-type logBatch struct{ ld plog.Logs }
+type logBatch struct {
+	ld plog.Logs
+	em MetricEmitter
+}
 
 func (b *logBatch) String() string        { return "log_batch" }
 func (b *logBatch) Type() string          { return "log_batch" }
@@ -165,11 +170,12 @@ func (b *logBatch) Hash() (uint32, error) { return 0, fmt.Errorf("unhashable") }
 // obvious way to write a two-pass script, and one reused view would silently
 // turn every element of that list into the LAST record.
 func (b *logBatch) Iterate() starlark.Iterator {
-	return &logIter{rls: b.ld.ResourceLogs()}
+	return &logIter{rls: b.ld.ResourceLogs(), em: b.em}
 }
 
 type logIter struct {
 	rls     plog.ResourceLogsSlice
+	em      MetricEmitter
 	i, j, k int
 }
 
@@ -186,7 +192,7 @@ func (it *logIter) Next(v *starlark.Value) bool {
 			it.j, it.k = it.j+1, 0
 			continue
 		}
-		*v = &logRecord{lr: lrs.At(it.k), res: rl.Resource()}
+		*v = &logRecord{lr: lrs.At(it.k), res: rl.Resource(), scope: sls.At(it.j).Scope(), em: it.em}
 		it.k++
 		return true
 	}
@@ -197,8 +203,10 @@ func (it *logIter) Done() {}
 // logRecord exposes body, severity_text, severity_number, attributes,
 // resource and drop().
 type logRecord struct {
-	lr  plog.LogRecord
-	res pcommon.Resource
+	lr    plog.LogRecord
+	res   pcommon.Resource
+	scope pcommon.InstrumentationScope
+	em    MetricEmitter
 }
 
 func (r *logRecord) String() string        { return "log_record" }
@@ -208,7 +216,11 @@ func (r *logRecord) Truth() starlark.Bool  { return true }
 func (r *logRecord) Hash() (uint32, error) { return 0, fmt.Errorf("unhashable") }
 
 func (r *logRecord) AttrNames() []string {
-	return []string{"attributes", "body", "drop", "resource", "severity_number", "severity_text"}
+	return []string{
+		"attributes", "body", "drop", "emit_metric", "observed_time_unix_nano",
+		"resource", "route", "scope_name", "severity_number", "severity_text",
+		"span_id", "time_unix_nano", "trace_id",
+	}
 }
 
 func (r *logRecord) Attr(name string) (starlark.Value, error) {
@@ -225,6 +237,20 @@ func (r *logRecord) Attr(name string) (starlark.Value, error) {
 		return attrsView{r.res.Attributes()}, nil
 	case "drop":
 		return dropFn{mark: func() { r.lr.Attributes().PutBool(dropMarker, true) }}, nil
+	case "route":
+		return routeFn(r.res), nil
+	case "emit_metric":
+		return emitFn(r.res, r.em), nil
+	case "time_unix_nano":
+		return starlark.MakeInt64(int64(r.lr.Timestamp())), nil
+	case "observed_time_unix_nano":
+		return starlark.MakeInt64(int64(r.lr.ObservedTimestamp())), nil
+	case "trace_id":
+		return hexID(r.lr.TraceID().String(), r.lr.TraceID().IsEmpty()), nil
+	case "span_id":
+		return hexID(r.lr.SpanID().String(), r.lr.SpanID().IsEmpty()), nil
+	case "scope_name":
+		return starlark.String(r.scope.Name()), nil
 	}
 	return nil, nil
 }
@@ -253,13 +279,40 @@ func (r *logRecord) SetField(name string, v starlark.Value) error {
 		i, _ := n.Int64()
 		r.lr.SetSeverityNumber(plog.SeverityNumber(i))
 		return nil
+	case "time_unix_nano", "observed_time_unix_nano":
+		n, ok := v.(starlark.Int)
+		if !ok {
+			return fmt.Errorf("%s must be an int (unix nanoseconds)", name)
+		}
+		i, ok := n.Int64()
+		if !ok || i < 0 {
+			return fmt.Errorf("%s out of range", name)
+		}
+		if name == "time_unix_nano" {
+			r.lr.SetTimestamp(pcommon.Timestamp(i))
+		} else {
+			r.lr.SetObservedTimestamp(pcommon.Timestamp(i))
+		}
+		return nil
 	}
 	return fmt.Errorf("cannot set %s", name)
 }
 
+// hexID renders a trace/span id for scripts: the lowercase hex string, or
+// None for the zero id (so `if r.trace_id:` reads naturally).
+func hexID(hex string, empty bool) starlark.Value {
+	if empty {
+		return starlark.None
+	}
+	return starlark.String(hex)
+}
+
 // --- trace batch ---
 
-type traceBatch struct{ td ptrace.Traces }
+type traceBatch struct {
+	td ptrace.Traces
+	em MetricEmitter
+}
 
 func (b *traceBatch) String() string        { return "trace_batch" }
 func (b *traceBatch) Type() string          { return "trace_batch" }
@@ -269,11 +322,12 @@ func (b *traceBatch) Hash() (uint32, error) { return 0, fmt.Errorf("unhashable")
 
 // Iterate walks the batch positionally — see logBatch.Iterate.
 func (b *traceBatch) Iterate() starlark.Iterator {
-	return &spanIter{rss: b.td.ResourceSpans()}
+	return &spanIter{rss: b.td.ResourceSpans(), em: b.em}
 }
 
 type spanIter struct {
 	rss     ptrace.ResourceSpansSlice
+	em      MetricEmitter
 	i, j, k int
 }
 
@@ -290,7 +344,7 @@ func (it *spanIter) Next(v *starlark.Value) bool {
 			it.j, it.k = it.j+1, 0
 			continue
 		}
-		*v = &spanObj{sp: sps.At(it.k), res: rs.Resource()}
+		*v = &spanObj{sp: sps.At(it.k), res: rs.Resource(), em: it.em}
 		it.k++
 		return true
 	}
@@ -301,6 +355,7 @@ func (it *spanIter) Done() {}
 type spanObj struct {
 	sp  ptrace.Span
 	res pcommon.Resource
+	em  MetricEmitter
 }
 
 func (s *spanObj) String() string        { return "span" }
@@ -310,7 +365,28 @@ func (s *spanObj) Truth() starlark.Bool  { return true }
 func (s *spanObj) Hash() (uint32, error) { return 0, fmt.Errorf("unhashable") }
 
 func (s *spanObj) AttrNames() []string {
-	return []string{"attributes", "drop", "name", "resource", "status_code"}
+	return []string{
+		"attributes", "drop", "duration_ms", "emit_metric", "kind", "name",
+		"resource", "route", "span_id", "status_code", "status_message",
+		"trace_id",
+	}
+}
+
+// spanKind names the kind for scripts, in the spanmetrics/OTLP spelling.
+func spanKind(k ptrace.SpanKind) string {
+	switch k {
+	case ptrace.SpanKindInternal:
+		return "internal"
+	case ptrace.SpanKindServer:
+		return "server"
+	case ptrace.SpanKindClient:
+		return "client"
+	case ptrace.SpanKindProducer:
+		return "producer"
+	case ptrace.SpanKindConsumer:
+		return "consumer"
+	}
+	return "unspecified"
 }
 
 func (s *spanObj) Attr(name string) (starlark.Value, error) {
@@ -325,6 +401,21 @@ func (s *spanObj) Attr(name string) (starlark.Value, error) {
 		return attrsView{s.res.Attributes()}, nil
 	case "drop":
 		return dropFn{mark: func() { s.sp.Attributes().PutBool(dropMarker, true) }}, nil
+	case "route":
+		return routeFn(s.res), nil
+	case "emit_metric":
+		return emitFn(s.res, s.em), nil
+	case "kind":
+		return starlark.String(spanKind(s.sp.Kind())), nil
+	case "status_message":
+		return starlark.String(s.sp.Status().Message()), nil
+	case "duration_ms":
+		d := int64(s.sp.EndTimestamp()) - int64(s.sp.StartTimestamp())
+		return starlark.Float(float64(d) / 1e6), nil
+	case "trace_id":
+		return hexID(s.sp.TraceID().String(), s.sp.TraceID().IsEmpty()), nil
+	case "span_id":
+		return hexID(s.sp.SpanID().String(), s.sp.SpanID().IsEmpty()), nil
 	}
 	return nil, nil
 }
@@ -343,7 +434,10 @@ func (s *spanObj) SetField(name string, v starlark.Value) error {
 
 // --- metric batch ---
 
-type metricBatch struct{ md pmetric.Metrics }
+type metricBatch struct {
+	md pmetric.Metrics
+	em MetricEmitter
+}
 
 func (b *metricBatch) String() string        { return "metric_batch" }
 func (b *metricBatch) Type() string          { return "metric_batch" }
@@ -353,11 +447,12 @@ func (b *metricBatch) Hash() (uint32, error) { return 0, fmt.Errorf("unhashable"
 
 // Iterate walks the batch positionally — see logBatch.Iterate.
 func (b *metricBatch) Iterate() starlark.Iterator {
-	return &metricIter{rms: b.md.ResourceMetrics()}
+	return &metricIter{rms: b.md.ResourceMetrics(), em: b.em}
 }
 
 type metricIter struct {
 	rms     pmetric.ResourceMetricsSlice
+	em      MetricEmitter
 	i, j, k int
 }
 
@@ -374,7 +469,7 @@ func (it *metricIter) Next(v *starlark.Value) bool {
 			it.j, it.k = it.j+1, 0
 			continue
 		}
-		*v = &metricObj{m: mets.At(it.k), res: rm.Resource()}
+		*v = &metricObj{m: mets.At(it.k), res: rm.Resource(), em: it.em}
 		it.k++
 		return true
 	}
@@ -385,6 +480,7 @@ func (it *metricIter) Done() {}
 type metricObj struct {
 	m   pmetric.Metric
 	res pcommon.Resource
+	em  MetricEmitter
 }
 
 func (m *metricObj) String() string        { return "metric" }
@@ -394,7 +490,7 @@ func (m *metricObj) Truth() starlark.Bool  { return true }
 func (m *metricObj) Hash() (uint32, error) { return 0, fmt.Errorf("unhashable") }
 
 func (m *metricObj) AttrNames() []string {
-	return []string{"datapoints", "description", "drop", "name", "resource", "type", "unit"}
+	return []string{"datapoints", "description", "drop", "emit_metric", "name", "resource", "route", "type", "unit"}
 }
 
 // metricType names the metric's data shape for scripts (`m.type == "sum"`).
@@ -428,6 +524,10 @@ func (m *metricObj) Attr(name string) (starlark.Value, error) {
 		return attrsView{m.res.Attributes()}, nil
 	case "datapoints":
 		return &datapoints{m: m.m}, nil
+	case "route":
+		return routeFn(m.res), nil
+	case "emit_metric":
+		return emitFn(m.res, m.em), nil
 	case "drop":
 		// Mark in the pdata Metadata map, NOT the name — a script doing
 		// `m.drop(); m.name = "x"` would otherwise overwrite a name-based
@@ -573,4 +673,74 @@ func (p *dpObj) SetField(name string, v starlark.Value) error {
 		return fmt.Errorf("value must be a number")
 	}
 	return nil
+}
+
+// routeFn is the route("name") verb on every item: it stamps the item's
+// RESOURCE with the reserved attribute the namespace router honors before
+// its globs (route.ScriptMarker, stripped by the router before anything is
+// sent). Scripts could already steer routing by rewriting
+// k8s.namespace.name; this is the sanctioned spelling. Resource-scoped by
+// nature: routing splits payloads per resource, so routing one record
+// routes its whole resource group.
+func routeFn(res pcommon.Resource) starlark.Value {
+	return starlark.NewBuiltin("route", func(_ *starlark.Thread, b *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
+		var name string
+		if err := starlark.UnpackPositionalArgs(b.Name(), args, kwargs, 1, &name); err != nil {
+			return nil, err
+		}
+		res.Attributes().PutStr(route.ScriptMarker, name)
+		return starlark.None, nil
+	})
+}
+
+// emitFn is the emit_metric(name, value, labels={}) verb: one observation
+// into a metric DECLARED in the logMetrics config (declaration is where the
+// type, action, buckets and cardinality cap live), grouped under this item's
+// resource. An undeclared name — or no logMetrics section at all — is a
+// script error, surfaced like any other (obs.TransformErrors + the export's
+// retry); the fix is a config edit, and both files hot-reload.
+func emitFn(res pcommon.Resource, em MetricEmitter) starlark.Value {
+	return starlark.NewBuiltin("emit_metric", func(_ *starlark.Thread, b *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
+		var name string
+		var value starlark.Value
+		var lblDict *starlark.Dict
+		if err := starlark.UnpackArgs(b.Name(), args, kwargs, "name", &name, "value", &value, "labels?", &lblDict); err != nil {
+			return nil, err
+		}
+		var f float64
+		switch x := value.(type) {
+		case starlark.Int:
+			i, ok := x.Int64()
+			if !ok {
+				return nil, fmt.Errorf("emit_metric: value out of range")
+			}
+			f = float64(i)
+		case starlark.Float:
+			f = float64(x)
+		default:
+			return nil, fmt.Errorf("emit_metric: value must be a number")
+		}
+		var lbls map[string]string
+		if lblDict != nil {
+			lbls = make(map[string]string, lblDict.Len())
+			for _, kv := range lblDict.Items() {
+				k, ok := starlark.AsString(kv[0])
+				if !ok {
+					return nil, fmt.Errorf("emit_metric: label keys must be strings")
+				}
+				v, ok := starlark.AsString(kv[1])
+				if !ok {
+					v = kv[1].String()
+				}
+				lbls[k] = v
+			}
+		}
+		if em == nil {
+			return nil, fmt.Errorf("emit_metric %q: no logMetrics section is configured", name)
+		}
+		if err := em.EmitDirect(name, f, lbls, res.Attributes()); err != nil {
+			return nil, err
+		}
+		return starlark.None, nil
+	})
 }

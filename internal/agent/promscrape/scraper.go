@@ -69,6 +69,11 @@ type Config struct {
 	// Exemplars negotiates the OpenMetrics format and attaches exemplars to
 	// counter and histogram data points.
 	Exemplars bool
+	// TargetHook, when set, runs over each fetched target list before
+	// scheduling (the transforms file's targets: hook — drop or rewrite
+	// targets with script logic the declarative config cannot express). It
+	// runs once per fetch, not per sample: N targets per 30s cycle.
+	TargetHook func([]kubemeta.ScrapeTarget) []kubemeta.ScrapeTarget
 	// DisableTargets turns off scraping of annotation-discovered pod and
 	// service targets (the kubelet scrapes are configured separately).
 	DisableTargets bool
@@ -521,6 +526,9 @@ func (s *Scraper) cycle(ctx context.Context) {
 		var err error
 		targets, err = s.cfg.Targets.NodeTargets(ctx, s.cfg.Node)
 		targetsOK = err == nil
+		if targetsOK && s.cfg.TargetHook != nil {
+			targets = s.cfg.TargetHook(targets)
+		}
 		if err != nil {
 			s.log.Error("fetching scrape targets", "node", s.cfg.Node, "error", err)
 			// The kubelet scrapes below do not depend on the target list.

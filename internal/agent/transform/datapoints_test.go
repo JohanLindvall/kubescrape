@@ -44,7 +44,7 @@ def transform(batch):
 	h.SetName("latency")
 	h.SetEmptyHistogram().DataPoints().AppendEmpty()
 
-	dropped, err := prog.runMetrics(md)
+	dropped, err := prog.runMetrics(md, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -81,7 +81,7 @@ func TestMetricEmptiedByDroppedPointsIsPruned(t *testing.T) {
 	m := md.ResourceMetrics().AppendEmpty().ScopeMetrics().AppendEmpty().Metrics().AppendEmpty()
 	m.SetName("g")
 	m.SetEmptyGauge().DataPoints().AppendEmpty().SetIntValue(1)
-	dropped, err := prog.runMetrics(md)
+	dropped, err := prog.runMetrics(md, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -109,7 +109,7 @@ def transform(batch):
 	m := md.ResourceMetrics().AppendEmpty().ScopeMetrics().AppendEmpty().Metrics().AppendEmpty()
 	m.SetName("latency")
 	m.SetEmptyHistogram().DataPoints().AppendEmpty()
-	dropped, err := prog.runMetrics(md)
+	dropped, err := prog.runMetrics(md, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

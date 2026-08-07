@@ -1632,6 +1632,99 @@ traces: |
   and the producer's usual retry applies) instead of wedging an export
   goroutine.
 
+### Builtins
+
+Every script (batch transforms and hooks alike) compiles against a tiny
+predeclared environment:
+
+* **`re`** — RE2 with a bounded compiled-pattern cache:
+  `re.match(pat, s)` (bool, unanchored — anchor with `^$` yourself),
+  `re.find(pat, s)` (first match or `None`), `re.findall(pat, s)`,
+  `re.groups(pat, s)` (`[whole, group1, …]` or `None`) and
+  `re.replace(pat, repl, s)` (Go `$1`/`${name}` references). A bad pattern
+  is a script error like any other.
+* **`log(msg)`** — a throttled (1/s per script) line into the agent log, for
+  debugging a predicate without flooding the agent's own stream.
+
+### Extended fields and verbs
+
+Beyond the fields above: log records also expose `time_unix_nano` and
+`observed_time_unix_nano` (read/write), `trace_id`/`span_id` (read-only hex,
+`None` when zero) and `scope_name`; spans also expose `kind`
+(`server`/`client`/…), `duration_ms`, `status_message` and
+`trace_id`/`span_id`. Two verbs exist on every item:
+
+* **`r.route("name")`** — send this item's whole RESOURCE group to the named
+  `routing` route instead of matching namespaces (a reserved attribute the
+  router honors first and strips before anything is sent; an unknown name
+  warns and falls to the default chain). Scripts could always steer routing
+  by rewriting `k8s.namespace.name`; this is the sanctioned spelling.
+* **`r.emit_metric(name, value, labels={})`** — one observation into a
+  metric **declared in `logMetrics`** (declaration is where the type,
+  buckets and cardinality cap live), grouped under the item's resource. An
+  undeclared name is a script error. Retries re-run scripts, so a transient
+  export failure re-emits — the same at-least-once every producer's metrics
+  already have.
+
+### Hooks
+
+Four more optional sections in the same hot-reloaded file put scripts at
+other decision points. Each defines its own function, and each **fails
+open** — a script error degrades to "the hook did nothing" (counted in
+`kubescrape_transform_errors_total{signal}`, warned throttled), never to
+data loss:
+
+```yaml
+ingest: |                  # per pushed RESOURCE, before enrichment
+  def admit(resource):     # False removes it (counted in
+      return resource["team"] != "banned"   # kubescrape_ingest_admission_rejected_total)
+targets: |                 # per fetched scrape target, once per cycle
+  def target(t):           # t.url/.path/.namespace/.pod/.labels/.source/.monitor
+      if t.labels["scrape-tier"] == "none":
+          t.drop()
+sample: |                  # the tailSampling `type: script` policy body
+  def decide(trace):       # True samples, False drops, None abstains
+      for s in trace.spans:
+          if s.attributes["retain"] == "always": return True
+      return None
+parse: |                   # per line of plain sources flagged parseScript
+  def parse(line):         # None = leave the line alone
+      if line.startswith("<log>"):
+          return {"body": line[5:], "severity_text": "warn"}
+```
+
+The admission hook is the operator's **per-sender policy** on listeners
+nothing authenticates — the honest mitigation for a sender minting resources
+to latch a cardinality cap, which built-in bounds can only slow. The target
+hook is full relabel-power (drop, rewrite `path`) without growing the
+declarative config. The sample policy plugs into the `tailSampling` policy
+list as `type: script` (refused at config time if this section is missing).
+The parse hook runs **only** on plain sources that opt in with
+`parseScript: true` — one Starlark call per line on those sources alone.
+
+### Deliberate refusals
+
+Three hook points were considered and refused; they are recorded here so the
+next person to want one finds the reasoning rather than an accident:
+
+* **No per-line hook on the containerd tail path, and no per-sample hook in
+  the Prometheus scraper.** Both paths are allocation-pinned (0 allocs/op,
+  enforced by build-failing tests) and sized for 100k+ series and full-node
+  log volume; a ~1µs Starlark call per line/sample is 5-50x the entire
+  current per-item cost. Everything those hooks could do is expressible at
+  the batch seam, in `logs.rules`/`metrics.pipelines`, or — for exotic plain
+  files — in the opt-in per-source `parse` hook, which is per-source
+  precisely so the containerd hot path never pays it.
+* **No mutable cross-batch script state.** Producers re-run scripts on
+  retry (that is why unmarked payloads are transformed on a copy), so
+  persistent state would make every retry a correctness question; counters
+  belong in `emit_metric`, which inherits the producers' documented
+  at-least-once semantics instead of inventing new ones.
+* **No I/O, network, or clock builtins.** Hermeticity is what makes a
+  hot-reloaded, operator-edited script safe to run inside the export path;
+  a script that could block on the network would hold the tailer's single
+  sweep goroutine.
+
 ## Agent: routing
 
 The `routing` section fans exported payloads out **by Kubernetes namespace**

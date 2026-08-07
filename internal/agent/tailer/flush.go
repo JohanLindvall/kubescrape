@@ -112,6 +112,10 @@ type recordBuilder struct {
 	// Emit the way logchain.Resolver.Set re-points the resolver.
 	e   entry
 	ext logattrs.Result
+	// parsedSev is the parse hook's severity for the CURRENT entry (reset per
+	// record in buildRecord; applied in Stamp so the chain's enrichment and
+	// rules see it).
+	parsedSev string
 	// materialised records that a group was created before the rules ran, so
 	// the flush knows it may need pruning.
 	materialised bool
@@ -154,6 +158,9 @@ func (b *recordBuilder) Stamp(lr plog.LogRecord) {
 	}
 	lr.SetObservedTimestamp(b.now)
 	lr.Body().SetStr(e.body)
+	if b.parsedSev != "" {
+		lr.SetSeverityText(b.parsedSev)
+	}
 	if e.stream != "" {
 		lr.Attributes().PutStr("log.iostream", e.stream)
 	}
@@ -190,6 +197,22 @@ func (t *Tailer) anyPodRules() bool {
 // at resolve time), the grouping, and the offset bookkeeping the caller does
 // around this.
 func (t *Tailer) buildRecord(b *recordBuilder, e entry) {
+	b.parsedSev = ""
+	// The parse hook (plain sources flagged parseScript) runs FIRST: it
+	// produces the body the rest of the chain — scrub, extraction, metrics,
+	// rules — then reads. Enrichment still runs after and may refine what the
+	// script set.
+	if t.cfg.ParseLine != nil && e.file.source.parseScript {
+		if p, ok := t.cfg.ParseLine(e.body); ok {
+			if p.HasBody {
+				e.body = p.Body
+			}
+			if p.TimeUnixNano > 0 {
+				e.time = time.Unix(0, p.TimeUnixNano)
+			}
+			b.parsedSev = p.SeverityText
+		}
+	}
 	// Scrub + extract must precede GROUPING: the extraction's resource/scope
 	// halves decide which ResourceLogs/ScopeLogs the record lands in.
 	body, ext := b.chain.Line(e.body)

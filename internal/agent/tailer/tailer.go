@@ -160,6 +160,10 @@ type Config struct {
 	// failed export — the rewound bytes are re-read and re-transformed under
 	// whatever program is active by then.
 	Transform func(ld plog.Logs) error
+	// ParseLine is the transforms file's parse: hook (a func field for the
+	// same no-dependency reason as Transform), consulted per line ONLY for
+	// plain sources flagged parseScript. ok=false leaves the line untouched.
+	ParseLine func(line string) (ParsedLine, bool)
 	// Attrs builds the exported resource attributes (nil = defaults).
 	Attrs *attrs.Builder
 	// NodeInfo supplies the agent node's metadata for attribute templates
@@ -625,4 +629,14 @@ func (t *Tailer) sweep(ctx context.Context, all bool) {
 		// per-hop save was added for.
 		t.saveCheckpoints()
 	}
+}
+
+// ParsedLine is what the parse hook produced for one plain-source line
+// (mirrors transform.Parsed; a local type so the tailer needs no transform
+// dependency).
+type ParsedLine struct {
+	Body         string
+	HasBody      bool
+	SeverityText string
+	TimeUnixNano int64
 }

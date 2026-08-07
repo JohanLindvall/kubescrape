@@ -34,7 +34,7 @@ func TestTransformDropsAreCounted(t *testing.T) {
 		}
 
 		before := obs.TransformDropped.WithLabelValues("logs").Value()
-		dropped, err := prog.runLogs(ld)
+		dropped, err := prog.runLogs(ld, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -80,7 +80,7 @@ def transform(batch):
 		}
 
 		before := obs.TransformDropped.WithLabelValues("metrics").Value()
-		dropped, err := prog.runMetrics(md)
+		dropped, err := prog.runMetrics(md, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -104,7 +104,7 @@ def transform(batch):
 		}
 
 		before := obs.TransformDropped.WithLabelValues("traces").Value()
-		dropped, err := prog.runTraces(td)
+		dropped, err := prog.runTraces(td, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -179,7 +179,7 @@ func TestTransformNoDropsNoCount(t *testing.T) {
 	sl.LogRecords().AppendEmpty().Body().SetStr("a")
 
 	before := obs.TransformDropped.WithLabelValues("logs").Value()
-	dropped, err := prog.runLogs(ld)
+	dropped, err := prog.runLogs(ld, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

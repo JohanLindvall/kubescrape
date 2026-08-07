@@ -13,8 +13,13 @@ Two cooperating services:
   enriched with resource attributes fetched from the metadata service.
 
 Full flag and config-file reference with examples:
-[docs/CONFIGURATION.md](docs/CONFIGURATION.md). Every `kubescrape_*` metric,
-with its labels: [docs/METRICS.md](docs/METRICS.md).
+[docs/CONFIGURATION.md](docs/CONFIGURATION.md); the exhaustive generated
+per-binary flag inventory: [docs/FLAGS.md](docs/FLAGS.md). Every
+`kubescrape_*` metric, with its labels: [docs/METRICS.md](docs/METRICS.md).
+The agent's `-config` YAML has a generated JSON Schema for editor/CI
+validation ([docs/agent-config.schema.json](docs/agent-config.schema.json)),
+and the chart ships a `values.schema.json`, so a typo'd value fails at
+install time.
 
 ## How it works
 
@@ -1415,6 +1420,10 @@ own), and renders the `agent.config` value verbatim into the single mounted
 ```sh
 helm install kubescrape charts/kubescrape -n monitoring -f my-values.yaml
 ```
+
+Values are validated against the chart's `values.schema.json` at
+install/template time, so a misspelled key is an immediate error rather than
+a silently-ignored setting.
 
 Migrating from a Grafana Alloy setup? See
 [docs/MIGRATING-FROM-ALLOY.md](docs/MIGRATING-FROM-ALLOY.md). For how

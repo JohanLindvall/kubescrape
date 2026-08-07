@@ -15,6 +15,17 @@ flag or a config-file entry.
 | Logs | not collected | collected (CRI + multiline joining, at-least-once, drop/keep/sample rules, per-file rate limit) |
 | Delivery | batch processor + sending queue | logs: checkpointed at-least-once with rewind; metrics: bounded retries |
 
+## Top-level blocks
+
+The `logging` block maps to flags on both binaries: `-log-format json` and
+`-log-level` (debug/info/warn/error). `livedebugging` maps to the agent's
+`GET /debug/otlp` — the same live-inspection idea, but per HTTP session
+instead of a process-wide toggle: resource-attribute glob filters and a
+sample percentage ride the request, a built-in page lives at
+`/debug/otlp/ui`, and an agent nobody is watching pays one atomic load per
+export. Each binary also serves a `/debug` homepage indexing its whole debug
+surface (`/` redirects there).
+
 ## Component mapping
 
 ### `scrape_prometheus_k8s_pods` (both instances)

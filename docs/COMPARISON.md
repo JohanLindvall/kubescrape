@@ -66,6 +66,8 @@ fully attributed — the cache-race gap that per-node watchers accept.
 | Per-workload (annotation) log config | ✔ `kubescrape.io/logs` (exclude, multiline, rules, attributes) | ~ PodLogs CRD (GA: per-workload selection/relabeling; no multiline/rule overrides) | ~ `vector.dev/exclude` label + exclude-containers annotation | ~ `fluentbit.io/exclude`, parser annotations | ✘ |
 | Body rewriting / templating | ✔ opt-in (Starlark transforms; the built-in pipeline never modifies bodies) | ✔ | ✔ VRL | ✔ | ✔ OTTL |
 | General transform language | **Starlark** (per-batch, hot-reloaded, opt-in) | River/stages | **VRL** | Lua/WASM/SQL stream processor/processors | **OTTL** |
+| Live debug tap of shipped data | ✔ `GET /debug/otlp`: streamed OTLP JSON, resource-attr glob filters + sample %, built-in UI, zero cost unattached | ✔ Alloy `livedebugging` UI (per component) | ✔ `vector tap` (glob on component IDs) | ✘ | ~ debug exporter (always-on config, whole feed, needs a config edit + restart) |
+| "Why is this pod (not) scraped?" | ✔ `GET /v1/explain/{ns}/{pod}`: the whole decision chain, verdict by verdict | ~ targets pages show the post-relabel result, not the why | ✘ | ✘ | ~ targetallocator debug endpoints (jobs/targets, no per-pod verdicts) |
 
 † Cells describe Alloy; Promtail differences are noted inline. Promtail
 itself is EOL — see [Migrating off Promtail](#migrating-off-promtail).

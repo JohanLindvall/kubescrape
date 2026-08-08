@@ -12,12 +12,10 @@ package scrape
 // their own.
 
 import (
-	"math"
-	"regexp"
 	"slices"
-	"strconv"
 	"time"
 
+	"github.com/JohanLindvall/kubescrape/internal/promdur"
 	"github.com/JohanLindvall/kubescrape/internal/servicemonitors"
 	"github.com/JohanLindvall/kubescrape/pkg/kubemeta"
 )
@@ -208,48 +206,15 @@ func relabelChainsEqual(a, b []kubemeta.RelabelRule) bool {
 }
 
 // promDuration parses a monitor's interval for the ONE comparison the merge
-// makes (which of two explicit intervals is finer). It mirrors the agent's
-// promscrape.parsePromDuration — prometheus-operator's duration syntax
-// (largest unit first, y/w/d/h/m/s/ms), Go's parser as the fallback — because
-// the value is written in that language; the implementation is a second copy
-// only because the agent's lives in the OTLP scraper, which the metadata
-// service must not link. ok is false for a non-positive, overflowing or
-// unparseable value, which the merge reads as incomparable (the holder keeps);
-// the agent independently warns on such a value at scrape time.
+// makes (which of two explicit intervals is finer), through internal/promdur —
+// the same parser the agent's promscrape schedules by, so the interval this
+// merge picks as "finer" is finer under the reading that will actually scrape.
+// The edge rule that is OURS, not the parser's: "0" (and anything else
+// non-positive) is not a usable interval, so ok is false for it exactly as for
+// an overflowing or unparseable value, which the merge reads as incomparable
+// (the holder keeps); the agent independently warns on such a value at scrape
+// time.
 func promDuration(s string) (time.Duration, bool) {
-	m := promDurationRE.FindStringSubmatch(s)
-	if m == nil {
-		d, err := time.ParseDuration(s)
-		return d, err == nil && d > 0
-	}
-	units := [...]time.Duration{
-		365 * 24 * time.Hour, // y, as prometheus/common/model defines it
-		7 * 24 * time.Hour,   // w
-		24 * time.Hour,       // d
-		time.Hour,
-		time.Minute,
-		time.Second,
-		time.Millisecond,
-	}
-	var out time.Duration
-	for i, u := range units {
-		g := m[i+1]
-		if g == "" {
-			continue
-		}
-		n, err := strconv.ParseInt(g, 10, 64)
-		if err != nil || n > math.MaxInt64/int64(u) {
-			return 0, false
-		}
-		term := time.Duration(n) * u
-		if out > math.MaxInt64-term {
-			return 0, false
-		}
-		out += term
-	}
-	return out, out > 0
+	d, err := promdur.Parse(s)
+	return d, err == nil && d > 0
 }
-
-// promDurationRE mirrors prometheus-operator's Duration validation pattern
-// (and the agent's copy), so exactly the values the API server admits compare.
-var promDurationRE = regexp.MustCompile(`^(?:([0-9]+)y)?(?:([0-9]+)w)?(?:([0-9]+)d)?(?:([0-9]+)h)?(?:([0-9]+)m)?(?:([0-9]+)s)?(?:([0-9]+)ms)?$`)

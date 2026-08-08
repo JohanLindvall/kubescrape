@@ -6,12 +6,10 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
-	"path"
 	"reflect"
 	"sort"
 	"strings"
 	"sync"
-	"time"
 
 	"sigs.k8s.io/yaml"
 
@@ -26,6 +24,7 @@ import (
 	"github.com/JohanLindvall/kubescrape/internal/agent/tailer"
 	"github.com/JohanLindvall/kubescrape/internal/agent/tracesample"
 	"github.com/JohanLindvall/kubescrape/internal/agent/transform"
+	"github.com/JohanLindvall/kubescrape/internal/config"
 	"github.com/JohanLindvall/kubescrape/internal/logline"
 	"github.com/JohanLindvall/kubescrape/internal/metrics"
 	"github.com/JohanLindvall/kubescrape/pkg/logattrs"
@@ -498,7 +497,10 @@ func configWarnings(cfg agentConfig) []string {
 				rails[len(rails)-1] = "keepErrors (defaulted on)"
 			}
 		}
-		if d, err := time.ParseDuration(cfg.TraceSampling.KeepSlowerThan); err == nil && d > 0 {
+		// The sampler's OWN parse (config.Duration through SlowerThan), not a
+		// re-parse: the warning asks whether the guard rail is armed, and it
+		// must read the field exactly as the code that arms it does.
+		if d, err := cfg.TraceSampling.SlowerThan(); err == nil && d > 0 {
 			rails = append(rails, "keepSlowerThan")
 		}
 		if len(rails) > 0 {
@@ -574,17 +576,16 @@ func logConfigWarnings(cfg agentConfig, log *slog.Logger) {
 // and run()'s route loop, so a new refusal cannot land in one and not the
 // other; i is the route's index, used only when it has no name to report.
 //
-// The pattern check exists because a malformed glob makes path.Match return
-// ErrBadPattern for EVERY namespace, which the matcher reads as "no match":
-// the route never fires and its tenant's telemetry goes silently to the
-// default destination — indistinguishable from "no traffic yet", since the
-// route's counter simply stays at zero. Fail startup instead.
+// The pattern check fails startup because a malformed glob reads as silent
+// no-match at runtime — the route never fires and its tenant's telemetry goes
+// to the default destination, indistinguishable from "no traffic yet"
+// (config.Glob carries the full rationale).
 func validateRoute(exp *otlpexport.ExportConfig, i int, rt route.Route) (otlpexport.Config, error) {
 	if rt.Name == "" || len(rt.Namespaces) == 0 {
 		return otlpexport.Config{}, fmt.Errorf("routing route %d: name and namespaces are required", i)
 	}
 	for _, pat := range rt.Namespaces {
-		if _, err := path.Match(pat, ""); err != nil {
+		if err := config.Glob(pat); err != nil {
 			return otlpexport.Config{}, fmt.Errorf("routing route %q: invalid namespace pattern %q: %w", rt.Name, pat, err)
 		}
 	}

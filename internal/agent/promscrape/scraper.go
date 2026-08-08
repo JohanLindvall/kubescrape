@@ -6,11 +6,8 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"math"
 	"net/http"
 	neturl "net/url"
-	"regexp"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -24,6 +21,7 @@ import (
 	"github.com/JohanLindvall/kubescrape/internal/bearer"
 	"github.com/JohanLindvall/kubescrape/internal/logdedupe"
 	"github.com/JohanLindvall/kubescrape/internal/obs"
+	"github.com/JohanLindvall/kubescrape/internal/promdur"
 	"github.com/JohanLindvall/kubescrape/pkg/kubemeta"
 )
 
@@ -350,7 +348,10 @@ func (s *Scraper) tickInterval() time.Duration {
 // a typo and re-introducing a different one still warns, while the same bad
 // value on the same monitor never warns twice.
 func (s *Scraper) parseTargetDuration(t kubemeta.ScrapeTarget, kind, attr, value string) (time.Duration, bool) {
-	d, err := parsePromDuration(value)
+	// promdur is the shared prometheus-operator duration parser (the metadata
+	// service's monitor merge reads the same values through it); the
+	// non-positive gate below is THIS caller's rule, not the parser's.
+	d, err := promdur.Parse(value)
 	if err != nil || d <= 0 {
 		s.warnOnce(kind+":"+warnTarget(t)+":"+value, "ignoring invalid scrape "+kind+" on target",
 			"url", t.URL, "monitor", t.Monitor, attr, value)
@@ -399,68 +400,6 @@ func (s *Scraper) targetTimeout(t kubemeta.ScrapeTarget, interval time.Duration)
 	}
 	return got
 }
-
-// parsePromDuration accepts the duration syntax prometheus-operator's CRD
-// validates (`y`, `w`, `d`, `h`, `m`, `s`, `ms`, largest unit first, e.g.
-// "1d12h"), falling back to Go's parser for anything it does not recognise so
-// plain "30s"/"1m30s" keep working.
-//
-// Go's time.ParseDuration rejects y/w/d outright, so an `interval: 1d` — which
-// the API server ACCEPTS, because the CRD's own pattern allows it — used to
-// parse-fail and silently drop the target back to the default cadence.
-func parsePromDuration(s string) (time.Duration, error) {
-	if s == "0" {
-		return 0, nil
-	}
-	m := promDurationRE.FindStringSubmatch(s)
-	if m == nil {
-		// Not the Prometheus shape; let Go try (it also accepts "1h30m",
-		// "500ms" and the fractional forms Prometheus does not).
-		return time.ParseDuration(s)
-	}
-	units := []time.Duration{
-		365 * 24 * time.Hour, // y, as prometheus/common/model defines it
-		7 * 24 * time.Hour,   // w
-		24 * time.Hour,       // d
-		time.Hour,            // h
-		time.Minute,          // m
-		time.Second,          // s
-		time.Millisecond,     // ms
-	}
-	var out time.Duration
-	for i, u := range units {
-		g := m[i+1]
-		if g == "" {
-			continue
-		}
-		n, err := strconv.ParseInt(g, 10, 64)
-		if err != nil {
-			return 0, fmt.Errorf("duration %q: %w", s, err)
-		}
-		// n and u are both non-negative, so both the per-term multiply and the
-		// running sum are monotonic: a value that wraps int64 lands on a small
-		// or negative duration that the caller's `d <= 0` gate reads as a
-		// plausibly-tiny cadence rather than as invalid. The CRD's `[0-9]+`
-		// admits any magnitude, so scrapeTimeout "18446744073710ms" wrapped to
-		// +448µs — a deadline every scrape exceeds (total metric loss), with no
-		// invalid-duration warning. Refuse the overflow at EACH accumulation
-		// step (compound forms like "290y290y" overflow the sum, not one term)
-		// so parseTargetDuration warns and falls back like any other bad value.
-		if n > math.MaxInt64/int64(u) {
-			return 0, fmt.Errorf("duration %q: overflows time.Duration", s)
-		}
-		term := time.Duration(n) * u
-		if out > math.MaxInt64-term {
-			return 0, fmt.Errorf("duration %q: overflows time.Duration", s)
-		}
-		out += term
-	}
-	return out, nil
-}
-
-// promDurationRE mirrors prometheus-operator's Duration validation pattern, so
-// exactly the values the API server admits are the values we accept.
-var promDurationRE = regexp.MustCompile(`^(?:([0-9]+)y)?(?:([0-9]+)w)?(?:([0-9]+)d)?(?:([0-9]+)h)?(?:([0-9]+)m)?(?:([0-9]+)s)?(?:([0-9]+)ms)?$`)
 
 // maxWarnKeys bounds the dedupe table. The keys are configuration-derived, so a
 // healthy cluster holds a handful of them; the cap only catches a pathological

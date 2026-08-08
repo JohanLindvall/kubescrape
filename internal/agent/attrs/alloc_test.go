@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"testing"
 
+	"github.com/JohanLindvall/kubescrape/internal/testrace"
 	"go.opentelemetry.io/collector/pdata/pcommon"
 )
 
@@ -14,7 +15,7 @@ import (
 // memoized (one concatenation per label per resource otherwise). A benchmark
 // cannot fail a build, so the ceiling lives here.
 func TestBuildAllocationBudget(t *testing.T) {
-	if raceEnabled {
+	if testrace.Enabled {
 		t.Skip("the race detector changes escape analysis and adds allocations")
 	}
 	ctx := benchContext()
@@ -35,7 +36,7 @@ func TestBuildAllocationBudget(t *testing.T) {
 // regexes must not be re-run per attribute per resource — and the whole-resource
 // call must not allocate at all.
 func TestFilterApplyIsAllocationFree(t *testing.T) {
-	if raceEnabled {
+	if testrace.Enabled {
 		t.Skip("the race detector changes escape analysis and adds allocations")
 	}
 	f, err := NewFilterFromLists(nil, []string{`k8s\.pod\.label\.internal\..*`, `k8s\.namespace\.label\.internal\..*`})

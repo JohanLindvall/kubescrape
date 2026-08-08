@@ -15,6 +15,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/JohanLindvall/kubescrape/internal/testrace"
 	"go.opentelemetry.io/collector/pdata/pmetric"
 	"go.opentelemetry.io/collector/pdata/ptrace"
 )
@@ -44,7 +45,7 @@ func benchMetrics(points int) pmetric.Metrics {
 // batch. The ceiling is a small constant plus Starlark's own per-call frames —
 // nothing proportional to n.
 func TestIterationIsLazyPerRecord(t *testing.T) {
-	if raceEnabled {
+	if testrace.Enabled {
 		t.Skip("the race detector changes escape analysis and adds bookkeeping allocations")
 	}
 	const n = 4096

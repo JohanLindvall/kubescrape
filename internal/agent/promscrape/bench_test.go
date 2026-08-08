@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/JohanLindvall/kubescrape/internal/testrace"
 	"github.com/JohanLindvall/kubescrape/pkg/promparse"
 	dto "github.com/prometheus/client_model/go"
 	"go.opentelemetry.io/collector/pdata/pcommon"
@@ -347,7 +348,7 @@ func BenchmarkProtoClassicHistograms(b *testing.B) {
 // on this front, so at the package's 100k-series target that was ~1M avoidable
 // allocations per scrape per target.
 func TestProtoClassicHistogramAllocationBudget(t *testing.T) {
-	if raceEnabled {
+	if testrace.Enabled {
 		t.Skip("-race perturbs allocation counts")
 	}
 	body := protoHistBody(t, protoBenchMetrics)

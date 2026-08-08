@@ -174,9 +174,9 @@ func TestKeepSlowerThanAcceptsDurationString(t *testing.T) {
 	if err := c.Validate(); err != nil {
 		t.Fatalf("Validate: %v", err)
 	}
-	got, err := c.slowerThan()
+	got, err := c.SlowerThan()
 	if err != nil || got != 2*time.Second {
-		t.Fatalf("slowerThan = %v, %v; want 2s", got, err)
+		t.Fatalf("SlowerThan = %v, %v; want 2s", got, err)
 	}
 	// A malformed value must fail startup, not silently disable the guard rail.
 	var bad Config

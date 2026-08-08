@@ -9,10 +9,11 @@ import (
 	"fmt"
 	"math"
 	"net/http"
-	"path"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/JohanLindvall/kubescrape/internal/config"
 )
 
 // ServeHTTP streams matching payloads as OTLP JSON Lines until the client
@@ -66,11 +67,12 @@ func (t *Tap) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, fmt.Sprintf("attr %q is not key=value", a), http.StatusBadRequest)
 			return
 		}
-		// Validate the globs now: path.Match reports a malformed pattern only
-		// when matching, and a filter that silently matches nothing would
-		// stream silence indistinguishable from "no traffic".
+		// Validate the globs now: a malformed pattern reads as silent no-match
+		// at match time, and a filter that matches nothing would stream
+		// silence indistinguishable from "no traffic" (config.Glob carries
+		// the rationale).
 		for _, g := range []string{key, val} {
-			if _, err := path.Match(g, ""); err != nil {
+			if err := config.Glob(g); err != nil {
 				http.Error(w, fmt.Sprintf("attr %q: bad pattern %q: %v", a, g, err), http.StatusBadRequest)
 				return
 			}

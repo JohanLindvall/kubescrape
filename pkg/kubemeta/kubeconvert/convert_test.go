@@ -7,6 +7,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
+	"github.com/JohanLindvall/kubescrape/internal/testrace"
 	"github.com/JohanLindvall/kubescrape/pkg/kubemeta"
 )
 
@@ -221,7 +222,7 @@ func testCorePod() *corev1.Pod {
 // The budget is what the result genuinely needs: its own Ports array plus the
 // three pointers fillTerminated sets.
 func TestPreviousIncarnationAllocationBudget(t *testing.T) {
-	if raceEnabled {
+	if testrace.Enabled {
 		t.Skip("-race perturbs allocation counts")
 	}
 	const budget = 4

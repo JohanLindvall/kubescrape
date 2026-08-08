@@ -145,23 +145,39 @@ func singletonRole() bool {
 // The agent's flag surface. Package-level so the per-pipeline start
 // functions can read them directly; main parses.
 var (
-	configFile           = flag.String("config", "", "unified YAML config file; sections: "+configSections()+" (docs/CONFIGURATION.md)")
-	nodeName             = flag.String("node-name", os.Getenv("NODE_NAME"), "name of the node this agent runs on (default $NODE_NAME)")
-	metricsListen        = flag.String("metrics-listen", ":9090", "listen address for the Prometheus /metrics endpoint (Go runtime and process metrics; with -self-metrics-interval=0 also the kubescrape_* internal metrics, replacing the OTLP push with a scrape; empty disables). Separate from -listen so the debug/health surface and the scrape target can be exposed independently")
-	listen               = flag.String("listen", ":8081", "HTTP listen address for /healthz, /readyz, /debug/tailer and /debug/targets (empty disables)")
-	selfMetricsIntv      = flag.Duration("self-metrics-interval", time.Minute, "export the agent's own metrics over OTLP at this interval (0 disables)")
-	metadataURL          = flag.String("metadata-endpoint", "http://kubescrape.monitoring", "base URL of the kubescrape metadata service")
-	metadataWait         = flag.Duration("metadata-wait", 5*time.Second, "how long the metadata service may block waiting for a new container")
-	scrapeAuthToken      = flag.String("scrape-auth-token-file", "", "bearer token file for the metadata service's /v1/scrape-auth endpoint (re-read periodically); required when the service runs -scrape-auth-secrets")
-	otlpEndpoint         = flag.String("otlp-endpoint", "otel-collector.monitoring:4317", "OTLP endpoint: host:port for grpc, base URL for http")
-	otlpProtocol         = flag.String("otlp-protocol", "grpc", "OTLP transport: grpc or http")
-	otlpCompression      = flag.String("otlp-compression", "gzip", "OTLP payload compression: gzip or none")
-	otlpCompressionLevel = flag.Int("otlp-compression-level", 0, "gzip level 1 (fastest, ~2-3x less CPU for ~10% larger payloads) to 9 (smallest); 0 = library default")
-	otlpInsecure         = flag.Bool("otlp-insecure", true, "use a plaintext gRPC connection (for http, use an http:// endpoint)")
-	otlpSkipTLS          = flag.Bool("otlp-tls-insecure-skip-verify", false, "skip TLS certificate verification towards the collector")
-	otlpCAFile           = flag.String("otlp-tls-ca-file", "", "PEM CA bundle for verifying the collector")
-	otlpBearer           = flag.String("otlp-bearer-token-file", "", "file with a bearer token sent on every export (re-read periodically)")
-	otlpTimeout          = flag.Duration("otlp-timeout", 15*time.Second, "per-export-attempt timeout")
+	configFile = flag.String("config", "", "unified YAML config file; sections: "+configSections()+" (docs/CONFIGURATION.md)")
+	nodeName   = flag.String("node-name", os.Getenv("NODE_NAME"), "name of the node this agent runs on (default $NODE_NAME)")
+	listen     = flag.String("listen", ":8081", "HTTP listen address for /healthz, /readyz, /debug/tailer and /debug/targets (empty disables)")
+
+	// The process-observability block (metrics/pprof listeners, self-metrics
+	// cadence, logger) is registered through internal/cli, SHARED with the
+	// metadata service: one registration, so defaults and help text cannot
+	// drift between the binaries again. The two parameters are the hints that
+	// genuinely differ per binary.
+	obsFlags        = cli.RegisterObsFlags(flag.CommandLine, "agent", "the debug/health surface")
+	metricsListen   = obsFlags.MetricsListen
+	pprofListen     = obsFlags.PprofListen
+	selfMetricsIntv = obsFlags.SelfMetricsInterval
+	logLevel        = obsFlags.LogLevel
+	logFormat       = obsFlags.LogFormat
+
+	metadataURL     = flag.String("metadata-endpoint", "http://kubescrape.monitoring", "base URL of the kubescrape metadata service")
+	metadataWait    = flag.Duration("metadata-wait", 5*time.Second, "how long the metadata service may block waiting for a new container")
+	scrapeAuthToken = flag.String("scrape-auth-token-file", "", "bearer token file for the metadata service's /v1/scrape-auth endpoint (re-read periodically); required when the service runs -scrape-auth-secrets")
+
+	// The shared -otlp-* registration (internal/cli); the retry and
+	// split-size knobs below stay agent-only, and only the endpoint help is
+	// this binary's own.
+	otlpFlags            = cli.RegisterOTLPFlags(flag.CommandLine, "OTLP endpoint: host:port for grpc, base URL for http")
+	otlpEndpoint         = otlpFlags.Endpoint
+	otlpProtocol         = otlpFlags.Protocol
+	otlpCompression      = otlpFlags.Compression
+	otlpCompressionLevel = otlpFlags.CompressionLevel
+	otlpInsecure         = otlpFlags.Insecure
+	otlpSkipTLS          = otlpFlags.InsecureSkipVerify
+	otlpCAFile           = otlpFlags.CAFile
+	otlpBearer           = otlpFlags.BearerTokenFile
+	otlpTimeout          = otlpFlags.Timeout
 	otlpRetries          = flag.Int("otlp-retry-attempts", 3, "tries per metrics export (logs retry via the tailer's rewind)")
 	otlpBackoff          = flag.Duration("otlp-retry-backoff", time.Second, "initial backoff between metric export retries, doubled per attempt")
 	otlpMaxSendBytes     = flag.Int("otlp-max-send-bytes", 0, "cap on one exported payload's encoded protobuf size; a larger payload is split into parts before sending (0 = default ~3.75 MiB, under the 4 MiB gRPC limit; negative disables)")
@@ -171,9 +187,6 @@ var (
 	nativeHists = flag.Bool("scrape-native-histograms", false, "offer the Prometheus protobuf exposition to scrape targets and convert native histograms to OTLP exponential histograms")
 	checkConfig = flag.Bool("check-config", false, "validate -config and -transforms-file (every section compiled: templates, regexes, selectors, globs) plus the flags, print a summary and exit — no listeners, log files, positions file, spools or network. For CI and pre-rollout checks: a DaemonSet's bad ConfigMap otherwise surfaces as a fleet-wide CrashLoop")
 	testConfig  = flag.String("test-config", "", "run the YAML test cases in this file through the compiled log pipeline (scrub → logAttributes → enrich → logMetrics → logs.rules → transforms) and exit non-zero on failure — CI proof of what a rule/scrub/transform edit does to sample lines, with nothing acquired (like -check-config)")
-	pprofListen = flag.String("pprof-listen", "", "listen address for net/http/pprof under /debug/pprof, on its own port (empty disables). Off by default and separate from -listen and -metrics-listen: profiles expose goroutine stacks and heap contents, so this is the port to firewall or bind to localhost")
-	logLevel    = flag.String("log-level", "info", "log level: debug, info, warn, error")
-	logFormat   = flag.String("log-format", "text", "log format: text or json")
 
 	// One switch for all three log-producing paths. They were three separate
 	// flags (-logs-enrich/-journald-enrich/-ingest-logs-enrich) for one
@@ -270,8 +283,10 @@ var (
 	ingestHTTP    = flag.String("ingest-http-endpoint", ":4318", "listen address for pushed OTLP/HTTP protobuf on /v1/logs and /v1/metrics (empty disables)")
 	ingestWait    = flag.Duration("ingest-metadata-wait", 0, "how long an ingest metadata lookup may block for not-yet-known objects")
 	ingestMetrics = flag.String("ingest-metrics-mode", "auto", "how pushed metrics resolve their object: resource (id on the resource), datapoint (id on each point, split into per-object resources), or auto")
-	ingestCidKeys = flag.String("ingest-container-id-keys", "container.id,k8s.container.id", "comma-separated attribute keys inspected for a container id")
-	ingestUIDKeys = flag.String("ingest-pod-uid-keys", "k8s.pod.uid", "comma-separated attribute keys inspected for a pod uid")
+	// Defaults BUILT from the enricher's own (otlpingest.Default*Keys), so the
+	// flag and the package cannot state them differently.
+	ingestCidKeys = flag.String("ingest-container-id-keys", strings.Join(otlpingest.DefaultContainerIDKeys, ","), "comma-separated attribute keys inspected for a container id")
+	ingestUIDKeys = flag.String("ingest-pod-uid-keys", strings.Join(otlpingest.DefaultPodUIDKeys, ","), "comma-separated attribute keys inspected for a pod uid")
 	spanMetrics   = flag.Bool("ingest-span-metrics", false, "derive RED (calls + duration histogram) metrics from received spans, dimensioned by service.name/span.name/span.kind/status.code; exported over OTLP (tune via the traceMetrics config section). Traces are received by the -service-graph tier, so this belongs on that workload")
 	spanMetricsIv = flag.Duration("ingest-span-metrics-interval", time.Minute, "export interval for span metrics")
 	ingestPeerIP  = flag.Bool("ingest-peer-ip-fallback", false, "attribute pushed telemetry whose resource carries no container id / pod uid to the pod owning the connection's SOURCE address (hostNetwork senders never resolve). Only correct where that address still names the sender: a proxy, a mesh sidecar that terminates, or any NAT hop replaces it, and on the -service-graph tier a source address belonging to the tier's own workload is refused and counted (kubescrape_ingest_resources_total{outcome=\"peer_ip_rejected\"}) rather than attributed")

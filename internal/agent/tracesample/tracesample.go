@@ -56,9 +56,12 @@ func (c Config) Enabled() bool {
 	return (c.Probability > 0 && c.Probability < 1) || c.MaxSpansPerSecond > 0
 }
 
-// slowerThan parses KeepSlowerThan. An empty value — and an explicit zero —
-// disables the guard rail.
-func (c Config) slowerThan() (time.Duration, error) {
+// SlowerThan parses KeepSlowerThan. An empty value — and an explicit zero —
+// disables the guard rail. Exported because the agent's configWarnings
+// (cmd/kubescrape-agent) asks "is this guard rail armed?" and must read the
+// field EXACTLY as the sampler does — it used to re-parse with bare
+// time.ParseDuration, so a semantic change here would not have reached it.
+func (c Config) SlowerThan() (time.Duration, error) {
 	return config.Duration("traceSampling.keepSlowerThan", c.KeepSlowerThan, 0, config.ZeroDisables())
 }
 
@@ -75,7 +78,7 @@ func (c Config) Validate() error {
 	if c.MaxSpansPerSecond < 0 {
 		return fmt.Errorf("maxSpansPerSecond %v is negative", c.MaxSpansPerSecond)
 	}
-	_, err := c.slowerThan()
+	_, err := c.SlowerThan()
 	return err
 }
 
@@ -102,7 +105,7 @@ type Sampler struct {
 
 // New builds a Sampler in front of next.
 func New(cfg Config, next Exporter) *Sampler {
-	slow, _ := cfg.slowerThan() // validated at startup via Validate
+	slow, _ := cfg.SlowerThan() // validated at startup via Validate
 	p := cfg.Probability
 	if p <= 0 || p > 1 {
 		p = 1

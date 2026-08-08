@@ -435,16 +435,25 @@ func newScrapeAuthTokens(path string, log *slog.Logger) (*bearer.Rotating, error
 // manifests pass is actually defined (see internal/manifestcheck), which is
 // impossible while the declarations live inside run().
 var (
-	listen        = flag.String("listen", ":8080", "HTTP listen address")
-	pprofListen   = flag.String("pprof-listen", "", "listen address for net/http/pprof under /debug/pprof, on its own port (empty disables); profiles expose goroutine stacks and heap contents")
-	metricsListen = flag.String("metrics-listen", ":9090", "listen address for the Prometheus /metrics endpoint (Go runtime and process metrics; with -self-metrics-interval=0 also the kubescrape_* internal metrics, replacing the OTLP push with a scrape; empty disables). Separate from -listen so the API and the scrape target can be exposed independently")
-	kubeconfig    = flag.String("kubeconfig", "", "path to a kubeconfig; defaults to in-cluster config, then $KUBECONFIG/~/.kube/config")
-	maxWait       = flag.Duration("wait-timeout", 5*time.Second, "default and maximum time a container lookup blocks waiting for metadata to appear (shorten per request with ?wait=)")
-	cacheTTL      = flag.Duration("cache-ttl", 5*time.Minute, "how long metadata of deleted pods and replaced container IDs stays resolvable")
-	metaCacheTTL  = flag.Duration("metadata-cache-ttl", 10*time.Second, "max-age sent on metadata responses (Cache-Control + ETag) so agents cache lookups client-side; 0 disables the cache headers. The server-side ServiceMonitor->Service memo is exact (invalidated by index generation, not this TTL), so 0 no longer costs a cross-product rebuild per request")
-	resync        = flag.Duration("resync", 0, "informer resync period (0 disables periodic resync; the watch stream keeps the cache current)")
-	logLevel      = flag.String("log-level", "info", "log level: debug, info, warn, error")
-	logFormat     = flag.String("log-format", "text", "log format: text or json")
+	listen = flag.String("listen", ":8080", "HTTP listen address")
+
+	// The process-observability block (metrics/pprof listeners, self-metrics
+	// cadence, logger) is registered through internal/cli, SHARED with the
+	// agent: one registration, so defaults and help text cannot drift between
+	// the binaries again. The two parameters are the hints that genuinely
+	// differ per binary.
+	obsFlags        = cli.RegisterObsFlags(flag.CommandLine, "service", "the API")
+	pprofListen     = obsFlags.PprofListen
+	metricsListen   = obsFlags.MetricsListen
+	selfMetricsIntv = obsFlags.SelfMetricsInterval
+	logLevel        = obsFlags.LogLevel
+	logFormat       = obsFlags.LogFormat
+
+	kubeconfig   = flag.String("kubeconfig", "", "path to a kubeconfig; defaults to in-cluster config, then $KUBECONFIG/~/.kube/config")
+	maxWait      = flag.Duration("wait-timeout", 5*time.Second, "default and maximum time a container lookup blocks waiting for metadata to appear (shorten per request with ?wait=)")
+	cacheTTL     = flag.Duration("cache-ttl", 5*time.Minute, "how long metadata of deleted pods and replaced container IDs stays resolvable")
+	metaCacheTTL = flag.Duration("metadata-cache-ttl", 10*time.Second, "max-age sent on metadata responses (Cache-Control + ETag) so agents cache lookups client-side; 0 disables the cache headers. The server-side ServiceMonitor->Service memo is exact (invalidated by index generation, not this TTL), so 0 no longer costs a cross-product rebuild per request")
+	resync       = flag.Duration("resync", 0, "informer resync period (0 disables periodic resync; the watch stream keeps the cache current)")
 
 	// ServiceMonitor CRDs (opt-in).
 	monitorsOn = flag.Bool("servicemonitors", false, "serve targets for monitoring.coreos.com ServiceMonitors (pod-backed Services) and PodMonitors. Endpoint port/targetPort/path/scheme, per-endpoint interval/scrapeTimeout, basicAuth/authorization/bearerTokenSecret and secret-backed tlsConfig (needs -scrape-auth-secrets), and the keep/drop subset of metricRelabelings are interpreted; everything else is reported through kubescrape_monitor_fields_ignored_total and a startup warning")
@@ -468,18 +477,20 @@ var (
 	scrapeAuthOn        = flag.Bool("scrape-auth-secrets", false, "serve the Secret keys ServiceMonitor/PodMonitor endpoints reference — bearerTokenSecret, basicAuth username/password, authorization credentials and tlsConfig ca/cert/keySecret (a CLIENT PRIVATE KEY) — to agents on /v1/scrape-auth. Only keys some indexed monitor actually names are served. Requires cluster-wide `secrets get` RBAC and -scrape-auth-token-file")
 	scrapeAuthTokenFile = flag.String("scrape-auth-token-file", "", "file holding the shared bearer token that clients must present on /v1/scrape-auth (Authorization: Bearer <token>); REQUIRED with -scrape-auth-secrets")
 
-	// Self-metrics -> OTLP (the service's only OTLP producer).
-	selfMetricsIntv      = flag.Duration("self-metrics-interval", time.Minute, "export the service's own metrics over OTLP at this interval (0 disables)")
+	// Self-metrics -> OTLP (the service's only OTLP producer). The -otlp-*
+	// block is the shared registration (internal/cli); only the endpoint help
+	// is this binary's own, saying what it sends there.
 	selfAttrs            = flag.Bool("self-attributes", true, "add THIS pod's Kubernetes resource attributes (namespace, pod, uid, owners, labels) to the service's own exported metrics. Resolved from the service's OWN store — its pod name is the hostname, its namespace comes from $POD_NAMESPACE or the ServiceAccount projection — so it needs no API traffic and no extra manifest wiring. Attributes already set (service.name, service.instance.id) are never overwritten; a process that is not a pod of that name simply gets none")
-	otlpEndpoint         = flag.String("otlp-endpoint", "otel-collector.monitoring:4317", "OTLP endpoint for self-metrics: host:port for grpc, base URL for http")
-	otlpProtocol         = flag.String("otlp-protocol", "grpc", "OTLP transport: grpc or http")
-	otlpCompression      = flag.String("otlp-compression", "gzip", "OTLP payload compression: gzip or none")
-	otlpCompressionLevel = flag.Int("otlp-compression-level", 0, "gzip level 1 (fastest, ~2-3x less CPU for ~10% larger payloads) to 9 (smallest); 0 = library default")
-	otlpInsecure         = flag.Bool("otlp-insecure", true, "use a plaintext gRPC connection")
-	otlpSkipTLS          = flag.Bool("otlp-tls-insecure-skip-verify", false, "skip TLS certificate verification towards the collector")
-	otlpCAFile           = flag.String("otlp-tls-ca-file", "", "PEM CA bundle for verifying the collector")
-	otlpBearer           = flag.String("otlp-bearer-token-file", "", "file with a bearer token sent on every export (re-read periodically)")
-	otlpTimeout          = flag.Duration("otlp-timeout", 15*time.Second, "per-export timeout")
+	otlpFlags            = cli.RegisterOTLPFlags(flag.CommandLine, "OTLP endpoint for self-metrics: host:port for grpc, base URL for http")
+	otlpEndpoint         = otlpFlags.Endpoint
+	otlpProtocol         = otlpFlags.Protocol
+	otlpCompression      = otlpFlags.Compression
+	otlpCompressionLevel = otlpFlags.CompressionLevel
+	otlpInsecure         = otlpFlags.Insecure
+	otlpSkipTLS          = otlpFlags.InsecureSkipVerify
+	otlpCAFile           = otlpFlags.CAFile
+	otlpBearer           = otlpFlags.BearerTokenFile
+	otlpTimeout          = otlpFlags.Timeout
 )
 
 // otlpHeaders is registered in init() rather than in the var block above:

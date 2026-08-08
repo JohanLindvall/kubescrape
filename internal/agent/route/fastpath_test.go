@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"testing"
 
+	"github.com/JohanLindvall/kubescrape/internal/testrace"
 	"go.opentelemetry.io/collector/pdata/plog"
 	"go.opentelemetry.io/collector/pdata/pmetric"
 )
@@ -40,7 +41,7 @@ func defaultLogs(n int) plog.Logs {
 }
 
 func TestAllDefaultExportIsAllocationFree(t *testing.T) {
-	if raceEnabled {
+	if testrace.Enabled {
 		t.Skip("the race detector changes escape analysis and adds bookkeeping allocations")
 	}
 	def := &noopDest{}

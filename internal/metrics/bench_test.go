@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/JohanLindvall/kubescrape/internal/testrace"
 	"go.opentelemetry.io/collector/pdata/pcommon"
 )
 
@@ -308,7 +309,7 @@ func resolverLike(rec, res pcommon.Map) (func(string) string, ValueFunc) {
 // per-line closure, a map literal, a fmt call or an interface boxing in the
 // observe path costs one allocation each and nothing else would notice.
 func TestDynamicAddAllocationBudget(t *testing.T) {
-	if raceEnabled {
+	if testrace.Enabled {
 		t.Skip("-race perturbs allocation counts")
 	}
 	// Bound once, outside every measured call, exactly as the tailer's flush
@@ -380,7 +381,7 @@ func TestDynamicAddAllocationBudget(t *testing.T) {
 // A histogram observation walks every bucket stream — the hottest multiplier in
 // the store. It must not allocate per bucket.
 func TestDynamicAddHistogramAllocationBudget(t *testing.T) {
-	if raceEnabled {
+	if testrace.Enabled {
 		t.Skip("-race perturbs allocation counts")
 	}
 	setTimeForTest(time.Unix(1_700_600_100, 0))

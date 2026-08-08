@@ -36,12 +36,12 @@ Both binaries accept flags with one or two dashes (`-listen` / `--listen`).
 | `-otlp-compression` | `gzip` | OTLP payload compression: gzip or none |
 | `-otlp-endpoint` | `otel-collector.monitoring:4317` | OTLP endpoint for self-metrics: host:port for grpc, base URL for http |
 | `-otlp-header` | — | static key=value header sent on every self-metrics export (HTTP header / gRPC metadata, e.g. X-Scope-OrgID=tenant); repeatable |
-| `-otlp-insecure` | `true` | use a plaintext gRPC connection |
+| `-otlp-insecure` | `true` | use a plaintext gRPC connection (for http, use an http:// endpoint) |
 | `-otlp-protocol` | `grpc` | OTLP transport: grpc or http |
-| `-otlp-timeout` | `15s` | per-export timeout |
+| `-otlp-timeout` | `15s` | per-export-attempt timeout |
 | `-otlp-tls-ca-file` | — | PEM CA bundle for verifying the collector |
 | `-otlp-tls-insecure-skip-verify` | `false` | skip TLS certificate verification towards the collector |
-| `-pprof-listen` | — | listen address for net/http/pprof under /debug/pprof, on its own port (empty disables); profiles expose goroutine stacks and heap contents |
+| `-pprof-listen` | — | listen address for net/http/pprof under /debug/pprof, on its own port (empty disables). Off by default and separate from -listen and -metrics-listen: profiles expose goroutine stacks and heap contents, so this is the port to firewall or bind to localhost |
 | `-resync` | `0s` | informer resync period (0 disables periodic resync; the watch stream keeps the cache current) |
 | `-scrape-auth-secrets` | `false` | serve the Secret keys ServiceMonitor/PodMonitor endpoints reference — bearerTokenSecret, basicAuth username/password, authorization credentials and tlsConfig ca/cert/keySecret (a CLIENT PRIVATE KEY) — to agents on /v1/scrape-auth. Only keys some indexed monitor actually names are served. Requires cluster-wide `secrets get` RBAC and -scrape-auth-token-file |
 | `-scrape-auth-token-file` | — | file holding the shared bearer token that clients must present on /v1/scrape-auth (Authorization: Bearer <token>); REQUIRED with -scrape-auth-secrets |

@@ -124,13 +124,11 @@ func ValidateSources(sources []Source) ([]Source, error) {
 				return nil, fmt.Errorf("source %d (%q): invalid glob %q", i, s.Name, g)
 			}
 		}
-		// Namespace patterns are path.Match, which returns ErrBadPattern for
-		// EVERY input when the pattern is malformed. wantNamespace reads that as
-		// "no match", so an unvalidated typo in an allowlist silently collects
-		// NOTHING for the source — no warning, no metric, and -check-config
-		// green. Reject it here, exactly as routing does with its globs.
+		// Namespace patterns are path.Match; config.Glob carries the rationale
+		// (a malformed pattern reads as silent no-match at runtime, so an
+		// allowlist typo would collect NOTHING with -check-config green).
 		for _, g := range slices.Concat(s.Namespaces, s.ExcludeNamespaces) {
-			if _, err := path.Match(g, ""); err != nil {
+			if err := config.Glob(g); err != nil {
 				return nil, fmt.Errorf("source %d (%q): invalid namespace pattern %q: %w", i, s.Name, g, err)
 			}
 		}

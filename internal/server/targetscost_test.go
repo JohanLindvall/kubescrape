@@ -15,6 +15,7 @@ import (
 	"unsafe"
 
 	"github.com/JohanLindvall/kubescrape/internal/obs"
+	"github.com/JohanLindvall/kubescrape/internal/testrace"
 	"github.com/JohanLindvall/kubescrape/pkg/kubemeta"
 )
 
@@ -148,7 +149,7 @@ func TestNodeTargetsReadsTheServicesIndexOncePerNamespace(t *testing.T) {
 // monitor) and threw all but one away. The marginal cost of one more monitor
 // selecting the same Services is now the URL resolution and nothing else.
 func TestShadowedMonitorTargetsAreNotMaterialised(t *testing.T) {
-	if raceEnabled {
+	if testrace.Enabled {
 		t.Skip("-race perturbs allocation counts")
 	}
 	const (

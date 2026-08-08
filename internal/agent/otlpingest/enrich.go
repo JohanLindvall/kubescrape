@@ -104,18 +104,28 @@ type Config struct {
 	Logger *slog.Logger
 }
 
+// DefaultContainerIDKeys and DefaultPodUIDKeys are the resource-attribute
+// keys inspected when Config leaves ContainerIDKeys/PodUIDKeys unset. Exported
+// so the agent's flag defaults (-ingest-container-id-keys /
+// -ingest-pod-uid-keys) are BUILT from them rather than restating them — the
+// two spellings had nothing keeping them equal. Treat as immutable.
+var (
+	DefaultContainerIDKeys = []string{"container.id", "k8s.container.id"}
+	DefaultPodUIDKeys      = []string{"k8s.pod.uid"}
+)
+
 func (c Config) containerIDKeys() []string {
 	if len(c.ContainerIDKeys) > 0 {
 		return c.ContainerIDKeys
 	}
-	return []string{"container.id", "k8s.container.id"}
+	return DefaultContainerIDKeys
 }
 
 func (c Config) podUIDKeys() []string {
 	if len(c.PodUIDKeys) > 0 {
 		return c.PodUIDKeys
 	}
-	return []string{"k8s.pod.uid"}
+	return DefaultPodUIDKeys
 }
 
 func (c Config) metricsMode() MetricsMode {

@@ -7,6 +7,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/JohanLindvall/kubescrape/internal/testrace"
 )
 
 func TestWaitForContainer(t *testing.T) {
@@ -316,7 +318,7 @@ func TestOversizedIDDoesNotWait(t *testing.T) {
 // proxy: the channel plus its map entry are exactly what the registration
 // costs.
 func TestNonBlockingMissDoesNotRegisterAWaiter(t *testing.T) {
-	if raceEnabled {
+	if testrace.Enabled {
 		t.Skip("-race perturbs allocation counts")
 	}
 	s, _ := newTestStore(time.Minute)

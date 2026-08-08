@@ -21,8 +21,8 @@
 //     say so with Positive, which folds the follow-up bound check — and its
 //     explanation — into the same error.
 //
-// Not in scope: promscrape.parsePromDuration, which parses
-// prometheus-operator's `y/w/d` CRD syntax. That is a different input
+// Not in scope: internal/promdur, which parses prometheus-operator's `y/w/d`
+// CRD syntax for the monitor merge and the scraper. That is a different input
 // LANGUAGE (Go durations have no unit above the hour), not a different reading
 // of the same one.
 package config

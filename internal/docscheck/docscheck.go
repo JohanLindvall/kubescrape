@@ -34,10 +34,12 @@ import (
 // scope (bounded-word matching over prose is what FlagMentioned is for).
 var tableFlagPattern = regexp.MustCompile("(?m)^\\|\\s*\\(?`--?([A-Za-z0-9][A-Za-z0-9-]*)")
 
-// registerPattern matches a flag registration in source. The name is always a
+// registerPattern matches a flag registration in source — on the package-level
+// flag.CommandLine (`flag.String(...)`) or on the FlagSet parameter of
+// internal/cli's shared registrations (`fs.String(...)`). The name is always a
 // string literal in this repo (a computed name could not be matched — nothing
 // registers one, and the FLAGS.md generator would catch the omission anyway).
-var registerPattern = regexp.MustCompile(`flag\.(?:String|Bool|Int64|Int|Uint64|Uint|Float64|Duration|Var|Func|TextVar)\(\s*(?:&[A-Za-z0-9_.]+,\s*)?"([A-Za-z0-9][A-Za-z0-9-]*)"`)
+var registerPattern = regexp.MustCompile(`(?:flag|fs)\.(?:String|Bool|Int64|Int|Uint64|Uint|Float64|Duration|Var|Func|TextVar)\(\s*(?:&[A-Za-z0-9_.]+,\s*)?"([A-Za-z0-9][A-Za-z0-9-]*)"`)
 
 // TableFlags returns the flag names documented in markdown table rows of the
 // given files, deduplicated, with the file and line of the first occurrence.
@@ -89,8 +91,10 @@ func SourceFlags(dirs ...string) (map[string]bool, error) {
 	return out, nil
 }
 
-// CmdDirs are the two binaries' source directories, relative to this package.
-var CmdDirs = []string{"../../cmd/kubescrape", "../../cmd/kubescrape-agent"}
+// CmdDirs are the directories whose sources register flags, relative to this
+// package: the two binaries' mains plus internal/cli, where the flag blocks
+// both binaries share are registered once.
+var CmdDirs = []string{"../../cmd/kubescrape", "../../cmd/kubescrape-agent", "../../internal/cli"}
 
 // FlagMentioned reports whether doc names the flag anywhere, as a whole word
 // preceded by a dash — `-scrape-interval` matches, `-scrape-interval-x` and

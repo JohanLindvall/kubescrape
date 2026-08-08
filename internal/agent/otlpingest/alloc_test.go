@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"testing"
 
+	"github.com/JohanLindvall/kubescrape/internal/testrace"
 	"go.opentelemetry.io/collector/pdata/pmetric"
 )
 
@@ -39,7 +40,7 @@ func autoDecisionPush(points int) pmetric.Metrics {
 // comparison and the memo lookups are in-place now; a token is materialised
 // only when one has to be STORED, i.e. once per distinct id.
 func TestAutoDecisionWalkAllocationBudget(t *testing.T) {
-	if raceEnabled {
+	if testrace.Enabled {
 		t.Skip("the race detector's bookkeeping allocations make the ceiling meaningless")
 	}
 	const points = 2000
@@ -63,7 +64,7 @@ func TestAutoDecisionWalkAllocationBudget(t *testing.T) {
 // answer minted a fresh empty map — two allocations — for every id-less
 // resource of every push, and memoised nothing, so each one paid again.
 func TestPeerFallbackNotApplicableIsAllocationFree(t *testing.T) {
-	if raceEnabled {
+	if testrace.Enabled {
 		t.Skip("the race detector's bookkeeping allocations make the ceiling meaningless")
 	}
 	e := NewEnricher(Config{Meta: newMeta()}) // PeerIPFallback off: the default
@@ -86,7 +87,7 @@ var reqCacheSink *reqCache
 // counted-outcome marker are filled only on their own paths, so allocating them
 // up front cost every push the maps it does not use.
 func TestNewReqCacheDoesNotPreallocateUnusedMaps(t *testing.T) {
-	if raceEnabled {
+	if testrace.Enabled {
 		t.Skip("the race detector's bookkeeping allocations make the ceiling meaningless")
 	}
 	got := testing.AllocsPerRun(100, func() { reqCacheSink = newReqCache() })

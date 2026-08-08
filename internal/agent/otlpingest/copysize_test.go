@@ -14,6 +14,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/JohanLindvall/kubescrape/internal/testrace"
 	"go.opentelemetry.io/collector/pdata/pcommon"
 )
 
@@ -34,7 +35,7 @@ func copyHeapBytes(a pcommon.Map, n int) int {
 }
 
 func TestCopySizeEstimateBoundsRealMemory(t *testing.T) {
-	if raceEnabled {
+	if testrace.Enabled {
 		t.Skip("the race detector's own bookkeeping distorts the allocation measurement")
 	}
 	for _, tc := range []struct {

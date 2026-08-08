@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/JohanLindvall/kubescrape/internal/testrace"
 	"github.com/JohanLindvall/multiline/patterns"
 	"go.opentelemetry.io/collector/pdata/pcommon"
 )
@@ -361,7 +362,7 @@ func TestOversizedUnterminatedLineKeepsOffsetsExact(t *testing.T) {
 // proportional to the log volume read. One buffer per file: the only per-chunk
 // allocations left are consume's per-line string(line).
 func TestPendingBufferIsReusedAcrossChunks(t *testing.T) {
-	if raceEnabled {
+	if testrace.Enabled {
 		t.Skip("-race perturbs allocation counts")
 	}
 	ctx := context.Background()
@@ -390,7 +391,7 @@ func TestPendingBufferIsReusedAcrossChunks(t *testing.T) {
 // nothing else would notice. The only allocation the path is allowed is the
 // batch slice growing, which amortizes to well under one per line.
 func TestIngestLineAllocationBudget(t *testing.T) {
-	if raceEnabled {
+	if testrace.Enabled {
 		t.Skip("-race perturbs allocation counts")
 	}
 	tl, f := benchTailer(t, Config{Multiline: true})
@@ -417,7 +418,7 @@ func TestIngestLineAllocationBudget(t *testing.T) {
 // its budget is a small constant per line, not a function of the line's
 // content. A regression here is a per-line map or closure in the flush loop.
 func TestIngestFlushAllocationBudget(t *testing.T) {
-	if raceEnabled {
+	if testrace.Enabled {
 		t.Skip("-race perturbs allocation counts")
 	}
 	ctx := context.Background()

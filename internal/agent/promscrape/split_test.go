@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/JohanLindvall/kubescrape/internal/agent/attrs"
+	"github.com/JohanLindvall/kubescrape/internal/testrace"
 	"github.com/JohanLindvall/kubescrape/pkg/kubemeta"
 	"go.opentelemetry.io/collector/pdata/pmetric"
 )
@@ -1004,7 +1005,7 @@ kube_pod_container_resource_requests{namespace="ns1",pod="pod1",resource="memory
 // row, ~500k per cycle at 12k pods — where the sibling cadvisor batcher had
 // already established the reused-scratch + map[string(buf)] discipline.
 func TestSplitBatcherRoutingIsAllocationFree(t *testing.T) {
-	if raceEnabled {
+	if testrace.Enabled {
 		t.Skip("-race perturbs allocation counts")
 	}
 	sp, err := NewSplitters([]SplitterConfig{{

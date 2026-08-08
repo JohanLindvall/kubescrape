@@ -4,7 +4,11 @@
 // for byte; this is the single implementation they share.
 package peerip
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/JohanLindvall/kubescrape/internal/testrace"
+)
 
 func TestPeerIPCanonicalises(t *testing.T) {
 	t.Parallel()
@@ -59,7 +63,7 @@ func TestCanonical(t *testing.T) {
 // Deliberately NOT t.Parallel, unlike the rest of this package: an
 // AllocsPerRun measurement must never run beside another test.
 func TestCanonicalIsAllocationFree(t *testing.T) {
-	if raceEnabled {
+	if testrace.Enabled {
 		t.Skip("-race perturbs allocation counts")
 	}
 	for _, ip := range []string{"10.1.2.3", "fd00::7", "", "2001:db8::1"} {

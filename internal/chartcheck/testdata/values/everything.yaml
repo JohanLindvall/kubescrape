@@ -6,6 +6,11 @@
 # singleton sharing one Deployment.
 agent:
   bufferDir: /var/lib/kubescrape-agent/buffer
+  # A DURATION here, deliberately: -logs-idle-close is a flag.Duration, and the
+  # schema typed it integer-only — "30s" failed helm validation while a bare 30
+  # passed helm and crashed the agent at flag parse. This pins the string form
+  # rendering verbatim into the flag.
+  logsIdleClose: "30s"
   logsExcludeNamespaces: [kube-system, monitoring]
   staticAttrs:
     k8s.cluster.name: golden-test

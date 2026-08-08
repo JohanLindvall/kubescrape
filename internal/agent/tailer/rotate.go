@@ -245,14 +245,21 @@ func (t *Tailer) reopen(ctx context.Context, f *file, renamed, drained bool) {
 		// opposite — it DRAINS, emitting the buffered lines into the batch — so
 		// a budget-cut replay's already-fed prefix is still live and re-reading
 		// it delivers every one of those records twice, until the batch flushes.
-		// Carry the frontier across the rebuild.
+		// Carry the frontier across the rebuild — the discard frontier
+		// (skipTo/discarding) with it: it describes DISK content (an oversized
+		// line's already-dropped prefix), which the drain does not invalidate,
+		// and dropping it merely re-reads and re-discards the same bytes.
 		//
 		// Unconditionally, unlike the `fed` re-stamp below: the drain preserves
 		// the lines whatever wasFed says, and where wasFed is false because a
 		// rewind already purged, the value carried is the zero that purge left.
-		fedTo := make([]int64, len(f.segments))
+		type frontier struct {
+			fedTo, skipTo int64
+			discarding    bool
+		}
+		frontiers := make([]frontier, len(f.segments))
 		for i, sg := range f.segments {
-			fedTo[i] = sg.fedTo
+			frontiers[i] = frontier{sg.fedTo, sg.skipTo, sg.discarding}
 		}
 		t.stopPipeline(ctx, f)
 		t.newPipeline(f)
@@ -262,7 +269,7 @@ func (t *Tailer) reopen(ctx context.Context, f *file, renamed, drained bool) {
 		// Segments retire individually in commitBatch. Neither call above
 		// touches the list, so the indexes still line up.
 		for i, sg := range f.segments {
-			sg.fedTo = fedTo[i]
+			sg.fedTo, sg.skipTo, sg.discarding = frontiers[i].fedTo, frontiers[i].skipTo, frontiers[i].discarding
 		}
 	}
 	// newPipeline's reset cleared segmentsFed; that reset exists for REWINDS
@@ -345,13 +352,13 @@ func (t *Tailer) feedSegments(ctx context.Context, f *file) {
 	allDone := true
 	for _, sg := range slices.Clone(f.segments) {
 		f.feeding = sg.id
-		gen, fedBefore := f.rewindGen, sg.fedTo
+		gen, progressBefore := f.rewindGen, max(sg.fedTo, sg.skipTo)
 		if t.replaySegment(ctx, f, sg) {
 			sg.stalledSince = time.Time{}
 			continue
 		}
 		allDone = false
-		t.chargeStall(f, sg, gen, fedBefore)
+		t.chargeStall(f, sg, gen, progressBefore)
 		// Stop the pass at the FIRST unfinished segment: segments are
 		// oldest-first, so feeding a later one's lines now would put them
 		// into the pipeline AHEAD of this one's still-owed remainder —
@@ -387,11 +394,14 @@ func (t *Tailer) feedSegments(ctx context.Context, f *file) {
 // bound the segment is given up on exactly as an unrecoverable one is —
 // counted, logged, retired — which is also what releases the gate.
 //
-// A pass that FED anything, and one whose pipeline a rewind purged under it,
-// both count as progress: a budget-cut replay is advancing, and a failed export
-// re-owes the range without the gate being the thing that is stuck.
-func (t *Tailer) chargeStall(f *file, sg *segment, gen int, fedBefore int64) {
-	if f.rewindGen != gen || sg.fedTo > fedBefore {
+// A pass that FED anything, one that DISCARDED anything (an oversized line
+// advancing only the skipTo frontier is still advancing — stalling it out
+// would retire the segment and lose the readable remainder past the line),
+// and one whose pipeline a rewind purged under it, all count as progress: a
+// budget-cut replay is advancing, and a failed export re-owes the range
+// without the gate being the thing that is stuck.
+func (t *Tailer) chargeStall(f *file, sg *segment, gen int, progressBefore int64) {
+	if f.rewindGen != gen || max(sg.fedTo, sg.skipTo) > progressBefore {
 		sg.stalledSince = time.Time{}
 		return
 	}
@@ -465,8 +475,12 @@ func (t *Tailer) replaySegment(ctx context.Context, f *file, p *segment) bool {
 	defer closeFh()
 	// Resume at the FEED frontier, not the commit frontier: a budget-cut pass
 	// left its lines in the pipeline, and re-reading them feeds duplicates
-	// into groups that still buffer the originals.
-	from := max(p.committed, p.fedTo)
+	// into groups that still buffer the originals. The DISCARD frontier
+	// (skipTo) counts too: an oversized line's already-discarded prefix can
+	// never produce a committing entry, and re-reading it re-discarded the
+	// same bytes every pass — for a line whose newline is out of one pass's
+	// reach, forever (see the segment field doc).
+	from := max(p.committed, p.fedTo, p.skipTo)
 	if _, err := fh.Seek(from, 0); err != nil {
 		t.log.Warn("seeking rotated segment", "path", path, "error", err)
 		return false // transient: retry next sweep
@@ -482,9 +496,16 @@ func (t *Tailer) replaySegment(ctx context.Context, f *file, p *segment) bool {
 	}
 	var carry []byte
 	cur := from
-	fed := from // last FED line boundary — the only offset commits can reach
+	// fed is the last FED line boundary — the only offset commits can reach.
+	// Deliberately NOT `from`: from may sit at skipTo, mid-discard, and the
+	// open-ended completion below pins `to` from fed — a `to` inside a
+	// discarded run is an offset no entry commits, wedging the segment.
+	fed := max(p.committed, p.fedTo)
 	var lastErr error
-	discarding := false // an over-cap line's remainder, dropped to its newline
+	// An over-cap line's remainder, dropped to its newline. Resumed from the
+	// segment: a pass that ends mid-discard persists the state, or the next
+	// pass would feed the oversized line's remainder as a fresh record.
+	discarding := p.discarding
 	buf := t.scratch()
 	// Bounded like every other read loop. The open-ended case (a rotation that
 	// happened while the agent was down) reads to EOF, so a large rotated
@@ -493,14 +514,18 @@ func (t *Tailer) replaySegment(ctx context.Context, f *file, p *segment) bool {
 	// for its whole duration. The budget stops the pass; the segment keeps its
 	// committed progress and resumes on the next sweep.
 	budget := int64(t.cfg.MaxBytesPerSweep)
-	// A pass never stops MID-LINE. `carry` is a per-pass local, and the
-	// oversize escape fires at MaxEntryBytes+4096 — 1 MiB + 4 KiB against a
-	// 1 MiB default budget — so a single line at or above the budget could
-	// never reach either the escape or a newline within one pass: nothing was
-	// fed, `committed` could not advance, segmentsFed stayed false, and the
-	// same megabyte was re-read every sweep forever, pinning an fd and
-	// starving the sweep goroutine. Once the budget is spent the loop keeps
-	// reading to the next newline, so at least one line always progresses.
+	// A pass never stops MID-LINE without persisting where it stopped. `carry`
+	// is a per-pass local, and the oversize escape fires at MaxEntryBytes+4096
+	// — 1 MiB + 4 KiB against a 1 MiB default budget — so a single line at or
+	// above the budget could never reach either the escape or a newline within
+	// one pass: nothing was fed, `committed` could not advance, segmentsFed
+	// stayed false, and the same megabyte was re-read every sweep forever,
+	// pinning an fd and starving the sweep goroutine. Once the budget is spent
+	// the loop keeps reading to the next newline, so a line always progresses —
+	// either whole (fed, fedTo advances) or by the discarded chunk the oversize
+	// escape just dropped (skipTo advances; the escape empties carry, so the
+	// overrun stops there and the next pass resumes past the discarded run
+	// instead of re-reading it).
 	overrun := false
 	for remaining > 0 && (budget > 0 || overrun) {
 		want := remaining
@@ -524,6 +549,11 @@ func (t *Tailer) replaySegment(ctx context.Context, f *file, p *segment) bool {
 						cur += int64(len(carry))
 						carry = carry[:0]
 						discarding = true
+						// Persist the discard progress on the segment BEFORE the
+						// flush below (like fedTo): a failed flush rewinds and
+						// ledger.reset zeroes it, and stamping afterwards would
+						// resurrect a frontier the purge invalidated.
+						p.skipTo, p.discarding = cur, true
 						obs.LogOversizedDropped.Inc()
 					}
 					break
@@ -534,6 +564,7 @@ func (t *Tailer) replaySegment(ctx context.Context, f *file, p *segment) bool {
 				carry = carry[i+1:]
 				if discarding {
 					discarding = false // the newline ends the dropped line
+					p.skipTo, p.discarding = cur, false
 					continue
 				}
 				if len(line) > 0 {

@@ -498,6 +498,14 @@ func renderHistogram(m pmetric.Metric, s *series, samples []sample, ts time.Time
 // also counted in every higher one, so each slot is its cumulative count
 // minus the previous bound's, and the +Inf slot is the total minus the last
 // bound's.
+//
+// Without the +Inf stream (hasInf false) the total is unknown, so the +Inf
+// slot stays 0 — the same treatment renderHistogram gives the optional
+// sum/count. The branch is currently unreachable (a histogram's bucket
+// streams expire in lockstep, so admission is all-or-nothing — the invariant
+// hasInf documents); it is defense in depth for a future per-stream eviction,
+// where g.count would be 0 and the unguarded unsigned subtraction wrapped to
+// ~1.8e19.
 func accumulateBuckets(g *histGroup) []uint64 {
 	counts := make([]uint64, len(g.buckets)+1)
 	var prev uint64
@@ -505,7 +513,9 @@ func accumulateBuckets(g *histGroup) []uint64 {
 		counts[i] = c - prev
 		prev = c
 	}
-	counts[len(g.buckets)] = g.count - prev
+	if g.hasInf {
+		counts[len(g.buckets)] = g.count - prev
+	}
 	return counts
 }
 

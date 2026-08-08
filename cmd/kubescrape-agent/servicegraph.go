@@ -337,7 +337,7 @@ func (p *pipelines) startServiceGraphIngest(ctx context.Context, owner servicegr
 	// records for leaving actx.Node nil: a described object's node is the
 	// object's property, never the reader's.
 	enr := otlpingest.NewEnricher(ecfg)
-	srv := otlpingest.NewServer(otlpingest.ServerConfig{
+	scfg := otlpingest.ServerConfig{
 		GRPCAddr: *serviceGraphIngestGRPC,
 		HTTPAddr: *serviceGraphIngestHTTP,
 		// The application ports share the DaemonSet receiver's admission
@@ -360,7 +360,16 @@ func (p *pipelines) startServiceGraphIngest(ctx context.Context, owner servicegr
 		},
 		Ready:  p.ready.gate(gateServiceGraphIngest),
 		Logger: p.log,
-	})
+	}
+	if p.transforms != nil {
+		// The ingest: admission hook (per resource, pre-enrichment; hot
+		// reload adds/removes it without a restart — AdmitResource resolves
+		// the active program per call and admits when no hook exists). The
+		// same wiring as the DaemonSet's receiver (startIngest): the hook's
+		// contract covers all three signals, and trace pushes arrive HERE.
+		scfg.Admit = p.transforms.AdmitResource
+	}
+	srv := otlpingest.NewServer(scfg)
 	p.spawn(func() {
 		if err := srv.Run(ctx); err != nil {
 			p.fatal("service-graph trace ingest", err)

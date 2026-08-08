@@ -157,11 +157,22 @@ func (s *Server) handleExplain(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if len(doc.Targets) == 0 && doc.Hint == "" {
+		// doc.Services lists EVERY selector-matching Service; only one that is
+		// scrape-annotated or selected by a ServiceMonitor is an opt-in, so a
+		// pod whose sole matches are unannotated Services still gets the
+		// "nothing opts this pod in" hint rather than a phantom opt-in.
+		svcOptIn := false
+		for _, es := range doc.Services {
+			if es.Annotated || len(es.Monitors) > 0 {
+				svcOptIn = true
+				break
+			}
+		}
 		switch {
 		case !doc.Scrapeable:
 			doc.Hint = "pod is not scrapeable; see notScrapeableWhy"
-		case !doc.PodAnnotated && len(doc.Services) == 0 && len(doc.PodMonitors) == 0:
-			doc.Hint = "nothing opts this pod into scraping: no prometheus.io/scrape=\"true\" pod annotation, no Service selecting it, and no PodMonitor matching it"
+		case !doc.PodAnnotated && !svcOptIn && len(doc.PodMonitors) == 0:
+			doc.Hint = "nothing opts this pod into scraping: no prometheus.io/scrape=\"true\" pod annotation, no scrape-annotated or monitor-selected Service selecting it, and no PodMonitor matching it"
 		default:
 			doc.Hint = "an opt-in exists but no port resolved; see portEntries / services[].portEntries for the entry-by-entry verdicts"
 		}

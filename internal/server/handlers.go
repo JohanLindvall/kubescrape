@@ -455,9 +455,11 @@ func matchingServices(inNamespace []*services.Service, podLabels map[string]stri
 //     a conflict rather than as two targets (promscrape's fillTargetResource
 //     comment describes fixing exactly that, and scheduleKey's says the metadata
 //     service dedupes same-URL targets within a pod). The single target instead
-//     honours BOTH declarations: the first monitor by encounter order — the
-//     (namespace, name) index order, ServiceMonitors before PodMonitors, so
-//     deterministically — names the target, and every later endpoint MERGES
+//     honours BOTH declarations: the first monitor by encounter order —
+//     matched Services sorted by name first, then the monitor index's
+//     (namespace, name) order within each Service, ServiceMonitors before
+//     PodMonitors, so deterministically — names the target, and every later
+//     endpoint MERGES
 //     into it (scrape.MergeMonitorEndpoint: relabel chains concatenate, the
 //     finer explicit cadence wins with its own timeout, one-sided auth/TLS is
 //     adopted; a bare or identical endpoint merges silently). Only auth/TLS
@@ -838,8 +840,10 @@ type nodeTargetsETag struct {
 // and one is minted only for a node the store HAS pods on — a caller inventing
 // node names gets an empty list, which costs a map lookup to produce and never
 // reaches the memo. The cap is belt and braces against a cluster far larger
-// than this service is built for; over it the oldest entries are dropped and
-// those nodes simply rebuild.
+// than this service is built for; at the cap, entries already staler than the
+// TTL (useless: they can only produce a rebuild) are dropped, and if that
+// frees no room the new tag is simply not memoised — that node's
+// revalidations rebuild until room appears.
 const maxNodeTargetETags = 8192
 
 // nodeTargetsNotModified answers a conditional GET for a node's targets from

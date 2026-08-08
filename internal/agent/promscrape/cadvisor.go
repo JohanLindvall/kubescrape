@@ -365,12 +365,28 @@ func drainClose(rc io.ReadCloser) {
 	_ = rc.Close()
 }
 
+// kubeletTimeout is the per-scrape budget for the two kubelet endpoints,
+// clamped to the scrape interval exactly as targetTimeout clamps every
+// discovered target: cycle() waits for every scrape it started and Run only
+// ticks after cycle returns, so a -scrape-timeout longer than -scrape-interval
+// stretched the WHOLE NODE's cadence whenever a kubelet hung — the kubelet
+// scrapes were the one pair the clamp missed. The clamp lives in the request
+// CONTEXT, which wins over the kubelet client's baked-in Timeout (the shorter
+// of the two applies; the client's is only the backstop for a request without
+// a deadline).
+func (s *Scraper) kubeletTimeout() time.Duration {
+	if s.cfg.Interval > 0 {
+		return min(s.cfg.Timeout, s.cfg.Interval)
+	}
+	return s.cfg.Timeout
+}
+
 // scrapeCadvisor scrapes <kubelet>/metrics/cadvisor. cadvisor series carry
 // the pod identity as labels (namespace/pod/container); they are routed into
 // one OTLP resource per pod and container, with full metadata resolved
 // through the metadata service.
 func (s *Scraper) scrapeCadvisor(ctx context.Context) (int, error) {
-	ctx, cancel := context.WithTimeout(ctx, s.cfg.Timeout)
+	ctx, cancel := context.WithTimeout(ctx, s.kubeletTimeout())
 	defer cancel()
 
 	url := strings.TrimRight(s.cfg.Kubelet.Endpoint, "/") + "/metrics/cadvisor"
@@ -386,7 +402,7 @@ func (s *Scraper) scrapeCadvisor(ctx context.Context) (int, error) {
 
 // scrapeNodeMetrics scrapes <kubelet>/metrics under a node-level resource.
 func (s *Scraper) scrapeNodeMetrics(ctx context.Context) (int, error) {
-	ctx, cancel := context.WithTimeout(ctx, s.cfg.Timeout)
+	ctx, cancel := context.WithTimeout(ctx, s.kubeletTimeout())
 	defer cancel()
 
 	url := strings.TrimRight(s.cfg.Kubelet.Endpoint, "/") + "/metrics"
@@ -415,6 +431,10 @@ func (s *Scraper) metaSource() MetaSource {
 // newKubeletHTTPClient builds the TLS client for the kubelet.
 func newKubeletHTTPClient(cfg KubeletConfig, timeout time.Duration) *http.Client {
 	return &http.Client{
+		// A backstop only: the effective per-scrape budget is the request
+		// context's kubeletTimeout() deadline, which may be SHORTER (clamped to
+		// -scrape-interval) and always wins. This raw -scrape-timeout value
+		// merely bounds a request that somehow arrives without a deadline.
 		Timeout: timeout,
 		// The rationale is written out at targetauth.go's noRedirect: Go does
 		// not strip Authorization across a same-host https->http redirect. This

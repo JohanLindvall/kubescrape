@@ -135,18 +135,55 @@ func Run(ctx context.Context, cfg Config) error {
 	return nil
 }
 
+// acquireLatch wraps the resource lock to latch, synchronously, that THIS
+// replica's identity was successfully written to the lease. client-go's Run
+// spawns the OnStartedLeading goroutine exactly when acquire() succeeds, and
+// acquire() succeeds exactly when such a write lands (tryAcquireOrRenew's
+// Create/Update) — so the latch is the one reliable "the work goroutine
+// exists" signal available BEFORE Run returns. The callbacks cannot provide
+// it: OnStartedLeading itself may not be scheduled yet when Run returns (a
+// ctx cancel between acquire and renew makes renew return immediately), and
+// OnNewLeader is dispatched via `go` in maybeReportTransition, so it is just
+// as unscheduled in that window. release()'s write is excluded by the
+// identity check — it writes an empty HolderIdentity.
+type acquireLatch struct {
+	resourcelock.Interface
+	acquired *atomic.Bool
+}
+
+func (l *acquireLatch) Create(ctx context.Context, ler resourcelock.LeaderElectionRecord) error {
+	err := l.Interface.Create(ctx, ler)
+	l.latch(&ler, err)
+	return err
+}
+
+func (l *acquireLatch) Update(ctx context.Context, ler resourcelock.LeaderElectionRecord) error {
+	err := l.Interface.Update(ctx, ler)
+	l.latch(&ler, err)
+	return err
+}
+
+func (l *acquireLatch) latch(ler *resourcelock.LeaderElectionRecord, err error) {
+	if err == nil && ler.HolderIdentity == l.Identity() {
+		l.acquired.Store(true)
+	}
+}
+
 // elect runs ONE election round: acquire, work, and unwind after a loss. A
 // fresh elector per round — re-running one that already observed a lease
 // record is not a documented use of the API.
 func elect(ctx context.Context, cfg *Config) error {
-	var led atomic.Bool
+	var acquired atomic.Bool
 	work := make(chan struct{})
 
 	le, err := leaderelection.NewLeaderElector(leaderelection.LeaderElectionConfig{
-		Lock: &resourcelock.LeaseLock{
-			LeaseMeta:  metav1.ObjectMeta{Name: cfg.Name, Namespace: cfg.Namespace},
-			Client:     cfg.Client.CoordinationV1(),
-			LockConfig: resourcelock.ResourceLockConfig{Identity: cfg.Identity},
+		Lock: &acquireLatch{
+			Interface: &resourcelock.LeaseLock{
+				LeaseMeta:  metav1.ObjectMeta{Name: cfg.Name, Namespace: cfg.Namespace},
+				Client:     cfg.Client.CoordinationV1(),
+				LockConfig: resourcelock.ResourceLockConfig{Identity: cfg.Identity},
+			},
+			acquired: &acquired,
 		},
 		// Hand the lease back on shutdown so the successor starts in
 		// RetryPeriod instead of waiting out LeaseDuration. This only works if
@@ -159,7 +196,6 @@ func elect(ctx context.Context, cfg *Config) error {
 		Callbacks: leaderelection.LeaderCallbacks{
 			OnStartedLeading: func(lctx context.Context) {
 				defer close(work)
-				led.Store(true)
 				cfg.OnLeading(true)
 				cfg.Log.Info("acquired leadership", "lease", cfg.Name)
 				cfg.OnStarted(lctx)
@@ -167,11 +203,12 @@ func elect(ctx context.Context, cfg *Config) error {
 			OnStoppedLeading: func() {
 				// Deferred inside Run BEFORE the acquire attempt, so this also
 				// fires for a replica that never led (a plain shutdown while
-				// waiting). Reporting a lost lease there would be a lie.
-				if led.Load() {
-					cfg.OnLeading(false)
-					cfg.Log.Warn("lost leadership", "lease", cfg.Name)
-				}
+				// waiting), where reporting a lost lease would be a lie — and
+				// it can even run BEFORE the OnStartedLeading goroutine is
+				// scheduled (ctx cancelled between acquire and renew), so no
+				// state it could consult here distinguishes the cases without
+				// racing OnLeading(true). All reporting therefore happens in
+				// elect, after the work join.
 			},
 			OnNewLeader: func(id string) {
 				if id != cfg.Identity {
@@ -186,16 +223,27 @@ func elect(ctx context.Context, cfg *Config) error {
 
 	le.Run(ctx) // returns on ctx done OR on a lost lease — never re-acquires
 
-	if !led.Load() {
-		return nil // never acquired; nothing to unwind
+	if !acquired.Load() {
+		return nil // never acquired; OnStartedLeading was never spawned
 	}
-	// OnStartedLeading runs in its own goroutine, so the work may still be
-	// unwinding. Wait for it: re-entering the election with the previous
-	// watcher still alive would put two of them in one process.
+	// The lease was acquired, so the OnStartedLeading goroutine WAS spawned —
+	// even if it has not been scheduled yet (Run returns without waiting for
+	// it when ctx is cancelled between acquire and renew). Join it: re-entering
+	// the election with the previous watcher still alive would put two of them
+	// in one process, and returning without the join would leave the work's
+	// shutdown flush running unjoined while main exits.
 	select {
 	case <-work:
+		// close(work) happens-after OnLeading(true) in the same goroutine, so
+		// this down-report can never be overtaken by a late up-report — the
+		// gauge cannot latch at 1. (Reporting from OnStoppedLeading raced
+		// exactly that way.)
+		cfg.OnLeading(false)
+		cfg.Log.Warn("lost leadership", "lease", cfg.Name)
 		return nil
 	case <-time.After(cfg.RenewDeadline):
+		// The work ignored its context and is still running; the gauge
+		// honestly stays up, and the error is fatal to Run's caller.
 		return errors.New("leader: leader work did not stop within the renew deadline")
 	}
 }

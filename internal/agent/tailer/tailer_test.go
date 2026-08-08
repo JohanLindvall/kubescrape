@@ -297,6 +297,137 @@ func TestIdleCloseGuards(t *testing.T) {
 	}
 }
 
+// closeIdle drives one file through idle-close: age its mtime past IdleClose,
+// let a sweep observe the new mtime, and force the idle scan.
+func closeIdle(t *testing.T, tl *Tailer, ctx context.Context, path string, f *file) {
+	t.Helper()
+	old := time.Now().Add(-time.Minute)
+	if err := os.Chtimes(path, old, old); err != nil {
+		t.Fatal(err)
+	}
+	tl.sweep(ctx, true) // re-stat: lastMod picks up the aged mtime, no content change
+	tl.flush(ctx)
+	tl.lastIdleScan = time.Time{}
+	tl.closeIdleFiles()
+	if f.f != nil {
+		t.Fatal("precondition: idle fd not closed")
+	}
+	if !f.idleClosed {
+		t.Fatal("precondition: idleClosed not marked")
+	}
+}
+
+// An idle-closed fd must STAY closed across activity-free poll sweeps: the
+// poll case sweeps every tracked file each PollInterval, and readFile's
+// unconditional ensureOpen reopened any f.f == nil file (fingerprint read
+// included) just for closeIdleFiles to re-close it on its own, coarser
+// cadence — idle fds were open ~98% of steady state, defeating
+// -logs-idle-close. An append IS activity and must still reopen and deliver.
+func TestIdleClosedFileStaysClosedAcrossPollSweeps(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+	exp := &fakeExporter{}
+	tl := driveTailer(dir, exp)
+	tl.cfg.IdleClose = time.Millisecond
+
+	tl.scanDir(tl.loadCheckpoints(), true)
+	writeLog(t, dir, timeNowCRI()+" stdout F one")
+	tl.scanDir(nil, false)
+	path := filepath.Join(dir, logName)
+	tl.sweep(ctx, true)
+	tl.flush(ctx)
+	f := tl.files[path]
+	closeIdle(t, tl, ctx, path, f)
+
+	// (a) no activity: poll sweeps leave the fd closed.
+	for range 5 {
+		tl.sweep(ctx, true)
+		tl.flush(ctx)
+		if f.f != nil {
+			t.Fatal("a poll sweep reopened an idle-closed file with no activity")
+		}
+	}
+
+	// (b) an append is activity: the stat gate sees the size move, the file
+	// reopens (identity re-verified) and the new line is delivered.
+	writeLog(t, dir, timeNowCRI()+" stdout F after-idle")
+	driveUntil(t, ctx, tl, func() bool { return slices.Contains(exp.get(), "after-idle") },
+		"append after idle-close delivered")
+}
+
+// A rename rotation while the fd is idle-closed must still be recovered: the
+// stat gate sees a different inode at the path and falls through to
+// ensureOpen, whose replaced arm records the old incarnation as an open-ended
+// segment and replays its unshipped remainder via findRotated. The gate must
+// never swallow that detection.
+func TestIdleClosedRotationRecovered(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+	exp := &fakeExporter{}
+	tl := driveTailer(dir, exp)
+	tl.cfg.IdleClose = time.Millisecond
+
+	tl.scanDir(tl.loadCheckpoints(), true)
+	writeLog(t, dir, timeNowCRI()+" stdout F one")
+	tl.scanDir(nil, false)
+	path := filepath.Join(dir, logName)
+	tl.sweep(ctx, true)
+	tl.flush(ctx)
+	f := tl.files[path]
+	closeIdle(t, tl, ctx, path, f)
+
+	// While no fd is held: the writer appends its final line, the runtime
+	// rotates the file away, and a fresh incarnation appears at the path.
+	writeLog(t, dir, timeNowCRI()+" stdout F final-before-rotate")
+	rotateAway(t, dir, 1)
+	writeLog(t, dir, timeNowCRI()+" stdout F after-rotate")
+
+	driveUntil(t, ctx, tl, func() bool {
+		got := exp.get()
+		return slices.Contains(got, "final-before-rotate") && slices.Contains(got, "after-rotate")
+	}, "rotation while idle-closed recovered through the replaced arm")
+	driveUntil(t, ctx, tl, func() bool { return len(f.segments) == 0 },
+		"open-ended segment retired after recovery")
+}
+
+// A caught-up file whose trailing bytes never entered the pipeline — a blank
+// final line here; a rate-DROPPED or oversize-discarded tail are the same
+// class — must still idle-close. The old guard compared readPos to committed,
+// and such bytes can never commit (no entry ever covers them), so those files
+// held their fd forever; the guard now compares fedEnd() to committed like
+// every sibling completion decision.
+func TestIdleCloseWithTrailingBlankLine(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+	exp := &fakeExporter{}
+	tl := driveTailer(dir, exp)
+	tl.cfg.IdleClose = time.Millisecond
+
+	tl.scanDir(tl.loadCheckpoints(), true)
+	writeLog(t, dir, timeNowCRI()+" stdout F one", "")
+	tl.scanDir(nil, false)
+	path := filepath.Join(dir, logName)
+	tl.sweep(ctx, true)
+	tl.flush(ctx)
+	f := tl.files[path]
+	if f.readPos == f.committed {
+		t.Fatalf("precondition: want never-fed trailing bytes (readPos=%d committed=%d)",
+			f.readPos, f.committed)
+	}
+
+	old := time.Now().Add(-time.Minute)
+	if err := os.Chtimes(path, old, old); err != nil {
+		t.Fatal(err)
+	}
+	tl.sweep(ctx, true)
+	tl.flush(ctx)
+	tl.lastIdleScan = time.Time{}
+	tl.closeIdleFiles()
+	if f.f != nil {
+		t.Fatal("a caught-up file with a trailing blank line never idle-closed")
+	}
+}
+
 // allowLine grants only whole tokens and caps the bucket at RateBurst, so an
 // effective burst below 1 could never grant: -logs-rate-limit=0.4 (burst
 // derived as 2x) wedged every file in pause mode and discarded 100% in drop

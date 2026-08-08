@@ -220,7 +220,7 @@ func TestAudit_MalformedInputs(t *testing.T) {
 		{"no value", "a\ngood 2\n", false, 1},
 		{"no value with labels", `a{x="1"}` + "\n" + "good 2\n", false, 1},
 		{"value not a number", "a 1x\ngood 2\n", false, 1},
-		{"duplicate labels", `a{x="1",x="2"} 3` + "\ngood 2\n", false, 2},
+		{"duplicate labels", `a{x="1",x="2"} 3` + "\ngood 2\n", false, 1},
 		{"utf8 name", "métrique 1\ngood 2\n", false, 2},
 		{"crlf", "a 1\r\ngood 2\r\n", false, 2},
 		{"trailing garbage after ts", "a 1 2 3\ngood 2\n", false, 1},

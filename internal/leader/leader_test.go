@@ -10,7 +10,10 @@ import (
 
 	coordinationv1 "k8s.io/api/coordination/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/fake"
+	ktesting "k8s.io/client-go/testing"
+	"k8s.io/client-go/tools/leaderelection/resourcelock"
 )
 
 // The fake clientset does not enforce the optimistic-concurrency conflicts
@@ -139,6 +142,116 @@ func TestNeverLedReportsNoLoss(t *testing.T) {
 		t.Fatalf("a replica that never led reported %d leadership transitions, want 0", got)
 	}
 }
+
+// Cancellation BETWEEN lease acquisition and the renew loop: client-go's Run
+// is acquire → `go OnStartedLeading` → renew, so a ctx cancelled inside the
+// acquiring write makes renew return before the work goroutine is ever
+// scheduled. elect must still join the work — returning early would leave the
+// events reader's shutdown flush running unjoined while main exits, and the
+// leading gauge latched at 1.
+//
+// The fake clientset's reactor runs synchronously inside the lock write, so
+// the window is created deterministically; whether the goroutine then gets
+// scheduled before elect's post-Run check is the scheduler's choice, which is
+// exactly the race the acquireLatch closes. This is the best approximation an
+// uninjected elector allows: under the old led-flag code this test failed
+// (flakily by nature, reliably in practice with the sleep below).
+func TestCancelDuringAcquireStillJoinsWork(t *testing.T) {
+	client := fake.NewSimpleClientset()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var once sync.Once
+	// The first acquisition on an absent Lease is a create; guard update too
+	// in case client-go's flow changes.
+	hook := func(ktesting.Action) (bool, runtime.Object, error) {
+		once.Do(cancel)
+		return false, nil, nil // continue to the default reactor: the write succeeds
+	}
+	client.PrependReactor("create", "leases", hook)
+	client.PrependReactor("update", "leases", hook)
+
+	var flushed atomic.Bool
+	cfg := testConfig(func(ctx context.Context) {
+		<-ctx.Done()
+		time.Sleep(20 * time.Millisecond) // a shutdown flush, unwinding after cancel
+		flushed.Store(true)
+	})
+	cfg.Client = client
+	var mu sync.Mutex
+	var leading []bool
+	cfg.OnLeading = func(v bool) { mu.Lock(); leading = append(leading, v); mu.Unlock() }
+
+	done := make(chan error, 1)
+	go func() { done <- Run(ctx, cfg) }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Run: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not return")
+	}
+
+	if !flushed.Load() {
+		t.Fatal("Run returned before the leader work finished unwinding")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(leading) == 0 || leading[len(leading)-1] {
+		t.Fatalf("leadership transitions = %v, want them to end leading=false (gauge must not latch at 1)", leading)
+	}
+}
+
+// The latch fires only on a successful write of OUR identity — the exact
+// condition under which client-go's acquire() succeeds and spawns the work
+// goroutine. A failed write, another holder's record, and release()'s
+// empty-identity record must not arm it.
+func TestAcquireLatch(t *testing.T) {
+	for name, tt := range map[string]struct {
+		holder string
+		err    error
+		want   bool
+	}{
+		"own identity write":       {holder: "pod-a", want: true},
+		"failed write":             {holder: "pod-a", err: context.DeadlineExceeded, want: false},
+		"release writes no holder": {holder: "", want: false},
+		"other holder":             {holder: "pod-b", want: false},
+	} {
+		t.Run(name, func(t *testing.T) {
+			for _, op := range []string{"create", "update"} {
+				var acquired atomic.Bool
+				l := &acquireLatch{Interface: &fakeLock{identity: "pod-a", err: tt.err}, acquired: &acquired}
+				rec := resourcelock.LeaderElectionRecord{HolderIdentity: tt.holder}
+				var err error
+				if op == "create" {
+					err = l.Create(context.Background(), rec)
+				} else {
+					err = l.Update(context.Background(), rec)
+				}
+				if (err != nil) != (tt.err != nil) {
+					t.Fatalf("%s: err = %v, want %v (the wrapper must pass errors through)", op, err, tt.err)
+				}
+				if acquired.Load() != tt.want {
+					t.Errorf("%s: acquired = %v, want %v", op, acquired.Load(), tt.want)
+				}
+			}
+		})
+	}
+}
+
+type fakeLock struct {
+	identity string
+	err      error
+}
+
+func (f *fakeLock) Get(context.Context) (*resourcelock.LeaderElectionRecord, []byte, error) {
+	return nil, nil, f.err
+}
+func (f *fakeLock) Create(context.Context, resourcelock.LeaderElectionRecord) error { return f.err }
+func (f *fakeLock) Update(context.Context, resourcelock.LeaderElectionRecord) error { return f.err }
+func (f *fakeLock) RecordEvent(string)                                              {}
+func (f *fakeLock) Identity() string                                                { return f.identity }
+func (f *fakeLock) Describe() string                                                { return "fake" }
 
 func ptr[T any](v T) *T { return &v }
 

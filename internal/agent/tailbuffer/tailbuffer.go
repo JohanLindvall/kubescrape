@@ -541,8 +541,14 @@ func (b *Buffer) ExportTraces(ctx context.Context, td ptrace.Traces) error {
 	if td.SpanCount() == 0 {
 		return nil
 	}
-	out, late, mine := b.take(td)
+	out, late, lateDropped, mine := b.take(td)
 	if out.spans == 0 {
+		// Nothing to forward means the push is acked right here — and the ack
+		// is what makes its late-DROPPED spans final, so this is where they are
+		// counted (see the success path below for the symmetric argument).
+		if lateDropped > 0 {
+			b.lateDrop.Add(float64(lateDropped))
+		}
 		return nil
 	}
 	if mine > 0 {
@@ -563,6 +569,13 @@ func (b *Buffer) ExportTraces(ctx context.Context, td ptrace.Traces) error {
 	}
 	// Counted only now: a late span the sender will re-push must not be counted
 	// twice, and a decided trace's spans are "kept" only once they have landed.
+	// The late-DROPPED tally defers to the same ack: those spans are not in
+	// out.td, but a NACKed push is retransmitted whole, so counting them at
+	// receive time tallied the same spans once per retry attempt — this return
+	// is what stops the retransmissions that would re-present them.
+	if lateDropped > 0 {
+		b.lateDrop.Add(float64(lateDropped))
+	}
 	if late > 0 {
 		b.lateKept.Add(float64(late))
 	}
@@ -574,11 +587,12 @@ func (b *Buffer) ExportTraces(ctx context.Context, td ptrace.Traces) error {
 
 // take is the receive path's whole critical section: one walk of the payload
 // that buffers, classifies and enforces. It returns the payload to forward, how
-// many of its spans came from THIS push (the sender can re-send those) and how
-// many came out of the buffer (it cannot).
-func (b *Buffer) take(td ptrace.Traces) (out outbound, late, mine int) {
+// many of its spans came from THIS push (the sender can re-send those), how
+// many were dropped against a cached DROP verdict (tallied by the caller only
+// once the push acks — a NACKed push is retransmitted and re-presents them),
+// and how many came out of the buffer (the sender cannot re-send those).
+func (b *Buffer) take(td ptrace.Traces) (out outbound, late, lateDropped, mine int) {
 	now := b.now()
-	var lateDropped int
 
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -634,10 +648,7 @@ func (b *Buffer) take(td ptrace.Traces) (out outbound, late, mine int) {
 			}
 		}
 	}
-	if lateDropped > 0 {
-		b.lateDrop.Add(float64(lateDropped))
-	}
-	return out, late, mine
+	return out, late, lateDropped, mine
 }
 
 // add copies one span into its trace's buffer, creating the trace and the

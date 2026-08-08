@@ -184,3 +184,64 @@ func TestBudgetCutReplayDefersTailRead(t *testing.T) {
 		t.Fatalf("tail line not delivered standalone: %q", got)
 	}
 }
+
+// A checkpointed segment containing an oversized line whose newline is out of
+// one pass's reach (longer than the pass budget plus the discard escape's cap)
+// must still make progress. The discard progress used to be pass-local
+// (`cur`/`carry`/`discarding` locals) while the resume point was
+// max(committed, fedTo), which only FED lines advance: every pass re-read the
+// same prefix, discarded it, and returned with the frontier unmoved — the
+// segment sat pinned at one offset until the stall limit retired it
+// (obs.LogPrefixLost) and the readable remainder (the trailing line here) was
+// lost. skipTo/discarding now persist the frontier on the segment, so each
+// pass advances past what it discarded and the segment finishes and retires
+// normally.
+func TestReplayOversizedLineDoesNotWedgeSegment(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+	pos := mustOpenPositions(t, filepath.Join(t.TempDir(), "pos.json"))
+	path := filepath.Join(dir, logName)
+
+	l1 := timeNowCRI() + " stdout F seg-head"
+	huge := timeNowCRI() + " stdout F " + strings.Repeat("x", 200_000)
+	l3 := timeNowCRI() + " stdout F seg-tail"
+	rot := path + ".1"
+	writeLines(t, rot, l1, huge, l3)
+	rotIno := inodeOfPath(t, rot)
+	rst, err := os.Stat(rot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeLog(t, dir, timeNowCRI()+" stdout F live-tail")
+	if err := pos.SetLogs(map[string]positions.LogPos{path: {
+		Offset: 0, Inode: inodeOfPath(t, path),
+		Pending: []positions.Prefix{{Inode: rotIno, From: 0, To: rst.Size()}},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+
+	exp := &fakeExporter{}
+	tl := driveTailer(dir, exp)
+	tl.cfg.Positions = pos
+	// Small caps: the discard escape fires at MaxEntryBytes+oversizeSlack
+	// (4160 here) and the budget is far below the oversized line, so no
+	// single pass can reach its newline — the shape that used to wedge.
+	tl.cfg.MaxEntryBytes = 64
+	tl.cfg.MaxBytesPerSweep = 512
+	tl.scanDir(tl.loadCheckpoints(), true)
+	f := tl.files[path]
+	if f == nil {
+		t.Fatal("file not tracked")
+	}
+
+	driveUntil(t, ctx, tl, func() bool {
+		all := strings.Join(exp.get(), "\x00")
+		return strings.Contains(all, "seg-tail") && strings.Contains(all, "live-tail") &&
+			len(f.segments) == 0
+	}, "oversized-line segment replayed past the discard, remainder delivered, segment retired")
+	for _, r := range exp.get() {
+		if strings.Contains(r, "xxxx") {
+			t.Fatalf("a fragment of the discarded oversized line was exported: %.80q", r)
+		}
+	}
+}

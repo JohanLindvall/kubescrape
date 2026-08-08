@@ -165,7 +165,7 @@ func (b *recordBuilder) Stamp(lr plog.LogRecord) {
 		lr.Attributes().PutStr("log.iostream", e.stream)
 	}
 	if e.truncated {
-		lr.Attributes().PutBool("log.truncated", true)
+		lr.Attributes().PutBool(logchain.AttrTruncated, true)
 	}
 	if e.match != "" {
 		lr.Attributes().PutStr("log.multiline.match", e.match)

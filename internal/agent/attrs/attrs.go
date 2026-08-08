@@ -230,6 +230,58 @@ func PrefixInstance(res pcommon.Resource, prefix string) {
 	}
 }
 
+// identityKeys is the set behind IdentityKeys: every FIXED resource-attribute
+// key the built-in mapping can emit, i.e. everything Pod, Container, Service,
+// ServiceName and Identity put — the attributes that describe the resource's
+// OWN object. The kind attributes are derived from kindTable (itself
+// test-pinned against owners.AllGVRs), and
+// TestIdentityKeysCoverEveryFixedEmission pins the rest against the actual
+// emissions, so a key added to any of those functions without landing here
+// fails a test naming this file.
+//
+// Deliberately NOT here: the label attributes (k8s.pod.label.*,
+// k8s.namespace.label.*), whose keys are data (one per cluster label key) and
+// cannot be enumerated — consumers of this list strip by exact key.
+var identityKeys = func() []string {
+	set := map[string]struct{}{
+		// Pod
+		"k8s.namespace.name": {},
+		"k8s.pod.name":       {},
+		"k8s.pod.uid":        {},
+		"k8s.node.name":      {},
+		"k8s.pod.ip":         {},
+		// Container
+		"k8s.container.name":          {},
+		"container.id":                {},
+		"container.image.name":        {},
+		"k8s.container.restart_count": {},
+		// Service
+		"k8s.service.name": {},
+		"k8s.service.uid":  {},
+		// ServiceName (via Pod) and Identity
+		"service.name":        {},
+		"service.namespace":   {},
+		"service.instance.id": {},
+	}
+	for _, e := range kindTable {
+		set[e.attr] = struct{}{}
+	}
+	return slices.Sorted(maps.Keys(set))
+}()
+
+// IdentityKeys returns (a copy of) every fixed resource-attribute key this
+// package's built-in mapping can emit, sorted. It exists for consumers that
+// must treat "an attribute naming WHO a resource is" as a closed set — the
+// ingest splitter strips exactly these from a sender's resource before
+// re-labelling it as a described object's (a key the described object LACKS
+// would otherwise survive from the exporter onto the object it describes,
+// since the overwrite only replaces keys the builder emits for THAT object).
+// The list had been re-spelled there by hand and drifted when Service grew
+// k8s.service.name/uid; deriving it here is what pins it.
+func IdentityKeys() []string {
+	return slices.Clone(identityKeys)
+}
+
 // reservedIdentity is the set behind ReservedIdentity/ReservedIdentityKeys.
 var reservedIdentity = map[string]struct{}{
 	"k8s.namespace.name":  {},

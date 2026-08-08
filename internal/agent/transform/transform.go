@@ -167,9 +167,15 @@ type MetricEmitter interface {
 type Wrapper struct {
 	next       Exporter
 	nextTraces TracesExporter
-	// emitter is the emit_metric target (nil = the builtin errors, naming the
-	// missing logMetrics section). Set once at wiring time, before traffic.
-	emitter MetricEmitter
+	// emitter is the emit_metric target (unset = the builtin errors, naming
+	// the missing logMetrics section). A shared POINTER for the same reason
+	// program is one: Fork used to copy the interface VALUE, and main builds
+	// the self-chain fork before it wires the emitter, so the fork's stayed
+	// nil forever and a metrics script's emit_metric failed the self chain's
+	// every export. Atomic because SetMetricEmitter may run after forks exist
+	// (and, in principle, after traffic flows); the holder indirection is
+	// because an interface cannot ride an atomic.Pointer directly.
+	emitter *atomic.Pointer[emitterHolder]
 	// program is a POINTER so forks can share one reloaded program (see Fork):
 	// a second wrapper over a different downstream must not need a second
 	// reloader, or a broken edit could leave the two chains on different
@@ -177,25 +183,46 @@ type Wrapper struct {
 	program *atomic.Pointer[Program]
 }
 
+// emitterHolder boxes the MetricEmitter interface so the wrapper (and every
+// fork aliasing the same pointer) can load it atomically.
+type emitterHolder struct{ m MetricEmitter }
+
 // Wrap builds a Wrapper forwarding to next (nextTraces may be nil when the
 // exporter cannot ship traces).
 func Wrap(next Exporter, nextTraces TracesExporter, initial *Program) *Wrapper {
-	w := &Wrapper{next: next, nextTraces: nextTraces, program: &atomic.Pointer[Program]{}}
+	w := &Wrapper{
+		next:       next,
+		nextTraces: nextTraces,
+		program:    &atomic.Pointer[Program]{},
+		emitter:    &atomic.Pointer[emitterHolder]{},
+	}
 	w.program.Store(initial)
 	return w
 }
 
 // Fork returns a wrapper over a DIFFERENT downstream that shares this one's
-// program: one reloader keeps both current, and they can never diverge. The
-// agent uses it for the chain carrying its own metrics, which skips the
-// namespace router but must still see the operator's transforms.
+// program AND its emit_metric target: one reloader keeps both current, and a
+// SetMetricEmitter on either reaches both — they can never diverge. The agent
+// uses it for the chain carrying its own metrics, which skips the namespace
+// router but must still see the operator's transforms.
 func (w *Wrapper) Fork(next Exporter, nextTraces TracesExporter) *Wrapper {
 	return &Wrapper{next: next, nextTraces: nextTraces, program: w.program, emitter: w.emitter}
 }
 
-// SetMetricEmitter wires the emit_metric bridge (call before traffic flows;
-// main wires it once at startup).
-func (w *Wrapper) SetMetricEmitter(m MetricEmitter) { w.emitter = m }
+// SetMetricEmitter wires the emit_metric bridge. It may be called after Fork —
+// forks alias the same slot — and the caller keeps the typed-value guard: a
+// nil *DynamicMetricSet boxed into the interface would defeat the builtin's
+// own nil check, so main only calls this with a non-nil concrete value.
+func (w *Wrapper) SetMetricEmitter(m MetricEmitter) { w.emitter.Store(&emitterHolder{m: m}) }
+
+// metricEmitter loads the wired emit_metric target; nil until SetMetricEmitter
+// has run (the builtin then errors, naming the missing logMetrics section).
+func (w *Wrapper) metricEmitter() MetricEmitter {
+	if h := w.emitter.Load(); h != nil {
+		return h.m
+	}
+	return nil
+}
 
 // TransformLogs runs the active logs program on ld IN PLACE (drop marks
 // swept, empty groups pruned) and reports the script's error; no program means
@@ -216,7 +243,7 @@ func (w *Wrapper) TransformLogs(ld plog.Logs) error {
 	// tailer's retry loop re-sends the same already-transformed object), so
 	// there is no per-attempt re-run to over-count. A sweep-level rewind
 	// rebuilds the batch from source, which is a fresh transform by design.
-	dropped, err := p.logs.runLogs(ld, w.emitter)
+	dropped, err := p.logs.runLogs(ld, w.metricEmitter())
 	if err != nil {
 		return err
 	}
@@ -256,7 +283,7 @@ func (w *Wrapper) ExportLogs(ctx context.Context, ld plog.Logs) error {
 			out = plog.NewLogs()
 			ld.CopyTo(out)
 		}
-		dropped, err := p.logs.runLogs(out, w.emitter)
+		dropped, err := p.logs.runLogs(out, w.metricEmitter())
 		if err != nil {
 			return err
 		}
@@ -283,7 +310,7 @@ func (w *Wrapper) ExportMetrics(ctx context.Context, md pmetric.Metrics) error {
 			out = pmetric.NewMetrics()
 			md.CopyTo(out)
 		}
-		dropped, err := p.metrics.runMetrics(out, w.emitter)
+		dropped, err := p.metrics.runMetrics(out, w.metricEmitter())
 		if err != nil {
 			return err
 		}
@@ -311,7 +338,7 @@ func (w *Wrapper) ExportTraces(ctx context.Context, td ptrace.Traces) error {
 			out = ptrace.NewTraces()
 			td.CopyTo(out)
 		}
-		dropped, err := p.traces.runTraces(out, w.emitter)
+		dropped, err := p.traces.runTraces(out, w.metricEmitter())
 		if err != nil {
 			return err
 		}

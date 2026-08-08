@@ -361,7 +361,10 @@
           "type": "string"
         },
         "logsIdleClose": {
-          "type": "integer"
+          "type": ["integer", "string"],
+          "minimum": 0,
+          "maximum": 0,
+          "description": "-logs-idle-close is a Go duration flag: use a duration string (e.g. 30s) or 0 (= never); a bare non-zero integer would fail the agent's flag parse, so only 0 is accepted as an integer"
         },
         "logsFileAttributes": {
           "type": "boolean"

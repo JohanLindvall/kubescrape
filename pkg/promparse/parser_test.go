@@ -756,6 +756,88 @@ func TestHelpKeepsWhitespacePastTheSeparator(t *testing.T) {
 	}
 }
 
+// A duplicate label name on one sample is malformed: Prometheus rejects the
+// whole scrape for it, and accepting the pair produced byte-identical
+// duplicate data points in one payload with malformed=0 (the OTLP attribute
+// map upserts, so both pairs collapse identically, while an accumulator key
+// built from the label list keeps both). Only the LINE fails — the deliberate
+// per-line-degradation divergence from Prometheus — so the rest of the scrape
+// survives.
+func TestDuplicateLabelNameIsMalformed(t *testing.T) {
+	cases := []struct {
+		name  string
+		input string
+		om    bool
+	}{
+		{"classic", `m{a="1",a="2"} 1` + "\ngood 2\n", false},
+		{"openmetrics", `m{a="1",a="2"} 1` + "\ngood 2\n# EOF\n", true},
+		{"quoted name form", `{"my.metric",code="200",code="201"} 1` + "\ngood 2\n", false},
+		{"quoted label names", `{"my.metric","a.b"="1","a.b"="2"} 1` + "\ngood 2\n", false},
+		{"dup le on one bucket line", "# TYPE h histogram\n" + `h_bucket{le="1",le="1"} 5` + "\ngood 2\n", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, malformed, err := collect(t, New(Options{OpenMetrics: tc.om}), tc.input)
+			if err != nil {
+				t.Fatalf("Parse returned err %v (malformed input must not fail the scrape)", err)
+			}
+			if malformed != 1 {
+				t.Errorf("malformed = %d, want 1", malformed)
+			}
+			if len(got) != 1 || got[0].Name != "good" {
+				t.Fatalf("samples = %+v, want only good=2 (dup-label line dropped, parser not desynced)", got)
+			}
+		})
+	}
+}
+
+// The positional lastKV fast path only short-circuits re-interning a repeated
+// name; it must not let a line that repeats the PREVIOUS line's name at one
+// position and duplicates it at another slip past the duplicate check.
+func TestDuplicateLabelNamePastLastKVFastPath(t *testing.T) {
+	input := `m{a="1",b="2"} 1` + "\n" + `m{a="1",a="3"} 1` + "\ngood 2\n"
+	got, malformed, err := collect(t, New(Options{}), input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if malformed != 1 {
+		t.Errorf("malformed = %d, want 1: the fast path admitted a duplicate", malformed)
+	}
+	if len(got) != 2 || got[0].Name != "m" || got[1].Name != "good" {
+		t.Fatalf("samples = %+v, want the first m line and good=2", got)
+	}
+}
+
+// The quoted-name form keeps the metric name on Sample.Name, never as a label
+// entry, so a label that merely equals its metric's name is not a duplicate.
+func TestQuotedNameDoesNotCollideWithSameNamedLabel(t *testing.T) {
+	got, malformed, err := collect(t, New(Options{}), `{"my.metric","my.metric"="v"} 1`+"\n")
+	if err != nil || malformed != 0 {
+		t.Fatalf("malformed=%d err=%v, want a clean parse", malformed, err)
+	}
+	if len(got) != 1 || got[0].Name != "my.metric" ||
+		len(got[0].Labels) != 1 || got[0].Labels[0] != (Label{Name: "my.metric", Value: "v"}) {
+		t.Fatalf("samples = %+v, want my.metric with one same-named label", got)
+	}
+}
+
+// A duplicate label name in an EXEMPLAR fails only the exemplar (counted in
+// MalformedExemplars), never the sample carrying it — the same policy as any
+// other unparseable exemplar suffix.
+func TestDuplicateExemplarLabelDropsOnlyTheExemplar(t *testing.T) {
+	p := New(Options{OpenMetrics: true, Exemplars: true})
+	got, malformed, err := collect(t, p, "# TYPE m counter\n"+`m_total 1 # {t="a",t="b"} 0.5`+"\n# EOF\n")
+	if err != nil || malformed != 0 {
+		t.Fatalf("malformed=%d err=%v, want the sample kept", malformed, err)
+	}
+	if len(got) != 1 || got[0].Exemplar != nil {
+		t.Fatalf("samples = %+v, want one sample without its exemplar", got)
+	}
+	if p.MalformedExemplars() != 1 {
+		t.Fatalf("MalformedExemplars = %d, want 1", p.MalformedExemplars())
+	}
+}
+
 // BenchmarkParseLargeScrape REPORTS the budget; a benchmark cannot fail a
 // build, so this is what holds it. The parser exists because expfmt buffers
 // whole metric families and this has to survive 100k series: the interning

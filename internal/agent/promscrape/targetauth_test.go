@@ -12,6 +12,7 @@ import (
 	"math/big"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -157,6 +158,45 @@ func TestTLSClientCacheKeyedByMaterial(t *testing.T) {
 	}
 	if c3 == c1 {
 		t.Fatal("a rotated CA must not keep using the client built from the old one")
+	}
+}
+
+// Two goroutines missing the cache for one key both build; the insert must
+// re-check under the write lock so the second adopts the first's client
+// instead of overwriting it — the overwritten client was already serving the
+// winner's scrape, and nothing would ever close its pooled connections.
+func TestTLSClientCacheConcurrentBuildYieldsOneClient(t *testing.T) {
+	s := New(Config{Node: "n1", Interval: time.Hour, Timeout: time.Second,
+		Auth: &mapAuth{vals: map[string]string{"ns/tls/ca.crt": otherCAPEM}}})
+	tgt := testTarget("https://x/metrics")
+	tgt.TLSCA = "ns/tls/ca.crt"
+
+	const goroutines = 8
+	clients := make([]*http.Client, goroutines)
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	for i := 0; i < goroutines; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			c, err := s.clientFor(context.Background(), tgt, time.Second)
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			clients[i] = c
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+	for i := 1; i < goroutines; i++ {
+		if clients[i] != clients[0] {
+			t.Fatal("concurrent builds for one key returned distinct clients: the losing insert overwrote the one in use")
+		}
+	}
+	if len(s.tlsClients) != 1 {
+		t.Fatalf("cache holds %d entries for one key, want 1", len(s.tlsClients))
 	}
 }
 

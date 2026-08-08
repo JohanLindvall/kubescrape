@@ -82,6 +82,27 @@ func TestTimeoutClampedToInterval(t *testing.T) {
 	}
 }
 
+// The KUBELET scrapes get the same clamp as every target: cycle() waits for
+// every scrape it started, so a -scrape-timeout 60s with -scrape-interval 30s
+// stretched the whole node's cadence whenever a kubelet hung — the two kubelet
+// endpoints were the one pair using the raw timeout.
+func TestKubeletTimeoutClampedToInterval(t *testing.T) {
+	s := New(Config{Node: "n1", Interval: 30 * time.Second, Timeout: time.Minute})
+	if got := s.kubeletTimeout(); got != 30*time.Second {
+		t.Fatalf("kubeletTimeout = %v, want it clamped to the 30s interval", got)
+	}
+	s = New(Config{Node: "n1", Interval: time.Minute, Timeout: 10 * time.Second})
+	if got := s.kubeletTimeout(); got != 10*time.Second {
+		t.Fatalf("kubeletTimeout = %v, want the shorter 10s timeout", got)
+	}
+	// A non-positive interval means "the loop will not run", not "clamp to
+	// nothing": the timeout stands alone.
+	s = New(Config{Node: "n1", Timeout: 10 * time.Second})
+	if got := s.kubeletTimeout(); got != 10*time.Second {
+		t.Fatalf("kubeletTimeout = %v with no interval, want the 10s timeout", got)
+	}
+}
+
 // countingHandler is a slog handler that just tallies records, so a test can
 // assert on how often a warnOnce fired.
 type countingHandler struct{ n int }

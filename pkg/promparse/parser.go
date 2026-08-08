@@ -1010,6 +1010,25 @@ func (p *Parser) parseLabels(rest []byte, dst *[]Label, cache *[]lastKV) ([]byte
 		if !ok {
 			return nil, false
 		}
+		// A duplicate label name on one sample is MALFORMED. Prometheus rejects
+		// the WHOLE SCRAPE for it; failing only this line is the deliberate
+		// divergence — this parser degrades per line — but accepting the pair
+		// silently produced byte-identical duplicate data points in one payload
+		// (OTLP attribute maps upsert, so both pairs collapse to one attribute
+		// while the series key downstream kept both) with malformed=0. The scan
+		// runs on every APPENDED pair, so the positional lastKV fast path
+		// cannot admit a duplicate: it only skips re-interning a name, never
+		// this check. The quoted-form metric name is not a dst entry
+		// (parseQuotedNameSample keeps it on Sample.Name, exactly as the
+		// classic path does), so a label merely named like its metric does not
+		// false-positive. Names are interned, so the O(n²) compare over a
+		// sample's few labels is usually a pointer equality and never
+		// allocates.
+		for i := range *dst {
+			if (*dst)[i].Name == name {
+				return nil, false
+			}
+		}
 		*dst = append(*dst, Label{Name: name, Value: value})
 		rest = skipSpaceTab(rem)
 		if len(rest) > 0 && rest[0] == ',' {

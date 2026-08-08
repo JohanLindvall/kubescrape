@@ -522,7 +522,7 @@ spec:
             - -enrich=true
             - -logs-file-attributes=false
             - -logs-unknown-files=auto
-            - -logs-idle-close=0
+            - -logs-idle-close=30s
             - -buffer-dir=/var/lib/kubescrape-agent/buffer
             - -buffer-max-bytes=1073741824
             - -config=/etc/kubescrape/config/config.yaml

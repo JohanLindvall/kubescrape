@@ -7,6 +7,7 @@ import (
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/pmetric"
 
+	"github.com/JohanLindvall/kubescrape/internal/agent/attrs"
 	"github.com/JohanLindvall/kubescrape/internal/obs"
 )
 
@@ -246,7 +247,18 @@ func (g *metricGrouper) foldTarget(id string) string {
 // output, and a group admitted cheaply must not go on minting expensive
 // descriptor copies). A refused id's points fold into the overflow fallback:
 // forwarded under a copy of the source resource stripped of the sender's
-// identity, unenriched.
+// identity, unenriched. That is true for the GROUPED id too: the byte budget
+// refuses the new (scope, metric) shell this point needs, so the point lands
+// in the overflow group beside the never-grouped remainder, while the group's
+// EXISTING shells keep taking points — the object's series end up split across
+// its enriched resource and the stripped overflow one.
+//
+// Exempting an existing group from the byte gate — its resource copy is paid,
+// and one more shell is small — was considered and rejected: shell bytes are
+// sender-controlled (name, description, metadata) and MULTIPLY, up to
+// #groups x #descriptors copies of descriptors the wire carries once, so a
+// 16 MiB payload could mint gigabytes of exempt shells. The gate stays; the
+// degradation is counted instead.
 func (g *metricGrouper) admit(id string) bool {
 	_, grouped := g.rmByID[id]
 	over := g.cache.splitCopied >= maxSplitCopyBytes ||
@@ -254,20 +266,20 @@ func (g *metricGrouper) admit(id string) bool {
 	if !over {
 		return true
 	}
-	// Counted once per refused OBJECT, per input resource. An id that already
-	// has its own group is not "the remainder sharing the sender's resource
-	// unenriched" — the byte budget merely stops it minting FURTHER descriptor
-	// copies, its points still land on its own enriched resource, and tallying
-	// that made kubescrape_ingest_resources_total{split_capped} name objects the
-	// push had in fact enriched.
-	if !grouped {
-		if _, seen := g.refused[id]; !seen {
-			if g.refused == nil {
-				g.refused = map[string]struct{}{}
-			}
-			g.refused[id] = struct{}{}
-			obs.Ingested.WithLabelValues("split_capped").Inc()
+	// Counted once per refused OBJECT, per input resource — grouped or not. A
+	// grouped id is refused only its FURTHER descriptor copies, but those
+	// points fold into the stripped overflow resource unenriched, which is
+	// exactly what split_capped reports; leaving it uncounted (as this branch
+	// once did, behind a comment claiming the points "still land on their own
+	// enriched resource") made a mid-push byte-budget bind invisible: the
+	// counter moved only for never-grouped ids while an admitted object's
+	// series quietly forked onto the overflow resource.
+	if _, seen := g.refused[id]; !seen {
+		if g.refused == nil {
+			g.refused = map[string]struct{}{}
 		}
+		g.refused[id] = struct{}{}
+		obs.Ingested.WithLabelValues("split_capped").Inc()
 	}
 	return false
 }
@@ -290,14 +302,26 @@ func (g *metricGrouper) scope(sm pmetric.ScopeMetrics, scopeIdx int, id string) 
 // On a split group the resource describes a DIFFERENT object than the sender,
 // so every one of these belongs to the described object or to nobody — never to
 // the exporter that happened to report it.
-var senderIdentityAttrs = []string{
-	"k8s.pod.name", "k8s.pod.uid", "k8s.pod.ip",
-	"k8s.container.name", "container.id", "container.name", "container.image.name",
-	"k8s.namespace.name", "k8s.node.name",
-	"k8s.deployment.name", "k8s.statefulset.name", "k8s.daemonset.name",
-	"k8s.job.name", "k8s.cronjob.name", "k8s.replicaset.name",
-	"service.name", "service.namespace", "service.instance.id",
-}
+//
+// INVARIANT: this list must cover every fixed key the attrs builder can emit.
+// The strip matters exactly for the keys the described object LACKS —
+// overwriteAttrs replaces only what the builder emits for THAT object, so any
+// builder-emittable key missing here survives from the EXPORTER onto the
+// object it describes. It is therefore attrs.IdentityKeys() (the pinned union
+// of every such key; a hand-copied list here had already drifted, letting a
+// sender's k8s.service.name/uid leak onto every split-described object) plus
+// the semconv siblings senders set that the builder never emits.
+// TestSenderIdentityAttrsCoverEveryBuilderIdentityKey holds the superset.
+//
+// Known, accepted gap: the label attributes (k8s.pod.label.*,
+// k8s.namespace.label.*) are keyed by DATA and not enumerable, so a sender's
+// pod labels whose keys the described object lacks are not stripped.
+var senderIdentityAttrs = append(attrs.IdentityKeys(),
+	// container.name: the bare semconv sibling of k8s.container.name. The
+	// builder never emits it, but SDK container detectors do, and it names the
+	// sender's container as surely as the prefixed form.
+	"container.name",
+)
 
 // stripSenderIdentity removes the sender's own identity from a resource that is
 // about to be re-labelled as a described object's.

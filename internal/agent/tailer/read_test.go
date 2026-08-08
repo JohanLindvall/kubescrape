@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -596,5 +597,64 @@ func TestSweepResolveBudgetBoundsLookups(t *testing.T) {
 	tl.sweep(context.Background(), true)
 	if meta.calls != files {
 		t.Errorf("lookups = %d, want %d: a generous budget must not hold files back", meta.calls, files)
+	}
+}
+
+// resolvePlain must not LATCH a nil NodeInfo: it runs once per file and the
+// built resource is the file's identity for life, so resolving before a
+// CONFIGURED node-info provider's first successful fetch permanently stripped
+// the node attributes from every record the file exports. With the provider
+// returning nil the file now stays unresolved (nothing is read before it can
+// be attributed — the containerd path's rule) and the next sweep retries; the
+// shipped agent's provider (selfmeta.Poll with a non-nil Initial) never
+// returns nil, so this defers only for wirings whose provider genuinely
+// resolves later. A nil Config.NodeInfo (node metadata not wanted at all)
+// still resolves immediately.
+func TestPlainResolveDefersUntilNodeInfoAvailable(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+	exp := &fakeExporter{}
+	var node atomic.Pointer[attrs.NodeInfo]
+	tl := New(Config{
+		Sources:       []Source{{Name: "plain", Include: []string{filepath.Join(dir, "*.log")}}},
+		PollInterval:  20 * time.Millisecond,
+		FlushInterval: time.Millisecond,
+		BatchSize:     1 << 20,
+		MetadataWait:  time.Second,
+		Metadata:      fakeMeta{},
+		NodeInfo:      func() *attrs.NodeInfo { return node.Load() },
+		Exporter:      exp,
+	})
+	tl.retryBackoff = time.Millisecond
+
+	tl.scanDir(tl.loadCheckpoints(), true)
+	path := filepath.Join(dir, "app.log")
+	writeLines(t, path, "plain-one")
+	tl.scanDir(nil, false)
+	f := tl.files[path]
+	if f == nil {
+		t.Fatal("setup: file not tracked")
+	}
+
+	// Provider configured but unresolved: resolution defers, nothing is read.
+	for range 3 {
+		tl.sweep(ctx, true)
+		tl.flush(ctx)
+	}
+	if f.resolved {
+		t.Fatal("plain file resolved against a nil NodeInfo — the nil would be latched into its resource")
+	}
+	if got := exp.get(); len(got) != 0 {
+		t.Fatalf("records exported before attribution: %v", got)
+	}
+
+	// The provider yields: the file resolves and its records carry node attrs.
+	node.Store(&attrs.NodeInfo{Name: "node1"})
+	driveUntil(t, ctx, tl, func() bool { return slices.Contains(exp.get(), "plain-one") },
+		"plain line delivered once node info resolved")
+	exp.mu.Lock()
+	defer exp.mu.Unlock()
+	if exp.resAttrs["k8s.node.name"] != "node1" {
+		t.Fatalf("node attribute missing after deferred resolve: %v", exp.resAttrs)
 	}
 }

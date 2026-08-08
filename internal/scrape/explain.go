@@ -10,6 +10,7 @@ package scrape
 import (
 	"fmt"
 	"strconv"
+	"strings"
 
 	"github.com/JohanLindvall/kubescrape/internal/services"
 	"github.com/JohanLindvall/kubescrape/pkg/kubemeta"
@@ -67,8 +68,11 @@ func DeclaredPorts(pod kubemeta.Pod) []DeclaredPort {
 // annotation entry, or — with no (non-blank) annotation — one per declared
 // container port. annotated reports which of the two shapes applied.
 func ExplainPodPorts(pod kubemeta.Pod) (verdicts []PortVerdict, annotated bool) {
+	// The fallback predicate must be EXACTLY podPorts': absent or all-blank
+	// falls back to declared ports; a present annotation never does, even one
+	// whose entries all split away (","), which selects nothing.
 	ann, ok := pod.Annotations[AnnotationPort]
-	if !ok || len(splitList(ann)) == 0 {
+	if !ok || strings.TrimSpace(ann) == "" {
 		for _, dp := range DeclaredPorts(pod) {
 			entry := strconv.Itoa(int(dp.Port))
 			if dp.Name != "" {
@@ -82,7 +86,14 @@ func ExplainPodPorts(pod kubemeta.Pod) (verdicts []PortVerdict, annotated bool) 
 		}
 		return verdicts, false
 	}
-	for _, entry := range splitList(ann) {
+	entries := splitList(ann)
+	if len(entries) == 0 {
+		return []PortVerdict{{
+			Entry: ann,
+			Note:  "annotation is present but contains no entries (commas and whitespace only); a present annotation never falls back to the declared container ports, so it resolves to nothing",
+		}}, true
+	}
+	for _, entry := range entries {
 		verdicts = append(verdicts, explainPodPortEntry(pod, entry))
 	}
 	return verdicts, true
@@ -121,10 +132,19 @@ func explainPodPortEntry(pod kubemeta.Pod, entry string) PortVerdict {
 // each translates to. annotated reports whether a port annotation narrowed
 // the selection.
 func ExplainServicePorts(pod kubemeta.Pod, svc *services.Service) (verdicts []PortVerdict, annotated bool) {
+	// The predicate must be EXACTLY selectServicePorts': absent or all-blank
+	// selects every service port; a present annotation never falls back, even
+	// one whose entries all split away (","), which selects nothing.
 	ann, hasAnn := svc.Annotations[AnnotationPort]
-	entries := splitList(ann)
-	annotated = hasAnn && len(entries) > 0
+	annotated = hasAnn && strings.TrimSpace(ann) != ""
 	if annotated {
+		entries := splitList(ann)
+		if len(entries) == 0 {
+			return []PortVerdict{{
+				Entry: ann,
+				Note:  "annotation is present but contains no entries (commas and whitespace only); a present annotation never falls back to the declared service ports, so it selects nothing",
+			}}, true
+		}
 		// Per annotation entry: does it name a service port at all?
 		for _, entry := range entries {
 			n, numeric := parsePort(entry)

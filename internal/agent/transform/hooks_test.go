@@ -1,6 +1,7 @@
 package transform
 
 import (
+	"reflect"
 	"testing"
 	"time"
 
@@ -95,6 +96,75 @@ targets: |
 	we := hookWrapper(t, "targets: |\n  def target(t):\n      fail(\"boom\")\n")
 	if got := we.TransformTargets(ts[:1]); len(got) != 1 || got[0].URL != ts[0].URL {
 		t.Fatal("a script error must keep the target untouched")
+	}
+}
+
+// cachedTargets builds the same three-target slice every call: one the hook
+// drops, two it path-rewrites. A fresh copy per call is what lets the tests
+// below compare a slice the hook saw against one it never did.
+func cachedTargets() []kubemeta.ScrapeTarget {
+	return []kubemeta.ScrapeTarget{
+		{
+			URL: "http://10.0.0.1:9090/metrics", Scheme: "http", Address: "10.0.0.1:9090", Path: "/metrics",
+			Pod: kubemeta.Pod{Namespace: "x", Name: "drop-me"},
+		},
+		{
+			URL: "http://10.0.0.2:9090/metrics", Scheme: "http", Address: "10.0.0.2:9090", Path: "/metrics",
+			Pod: kubemeta.Pod{Namespace: "x", Name: "b"},
+		},
+		{
+			URL: "http://10.0.0.3:9090/metrics", Scheme: "http", Address: "10.0.0.3:9090", Path: "/metrics",
+			Pod: kubemeta.Pod{Namespace: "x", Name: "c"},
+		},
+	}
+}
+
+// dropAndRewrite drops "drop-me" and rewrites every other path — the two
+// writes the hook is allowed to make, aimed at the two ways it used to reach
+// the caller's slice (compaction into ts[:0], Path/URL through &ts[i]).
+const dropAndRewrite = `
+targets: |
+  def target(t):
+      if t.pod == "drop-me":
+          t.drop()
+          return
+      t.path = "/rewritten"
+`
+
+// The input slice is metaclient's CACHED value (shallow-copied out under the
+// treat-as-immutable contract): the hook must never write the slice or its
+// elements. It used to compact survivors into ts[:0] — leaving the cached
+// backing array as [B, C, C], one target scraped twice per cycle — and wrote
+// Path/URL through the shared elements.
+func TestTransformTargetsDoesNotMutateInput(t *testing.T) {
+	w := hookWrapper(t, dropAndRewrite)
+	ts := cachedTargets()
+	orig := cachedTargets()
+
+	out := w.TransformTargets(ts)
+	if len(out) != 2 || out[0].Path != "/rewritten" || out[0].URL != "http://10.0.0.2:9090/rewritten" {
+		t.Fatalf("hook output: %+v", out)
+	}
+	if !reflect.DeepEqual(ts, orig) {
+		t.Fatalf("the caller's slice was mutated:\n got %+v\nwant %+v", ts, orig)
+	}
+}
+
+// A cache hit re-serves the SAME slice: the second invocation must see the
+// original targets, not the first invocation's output (shifted survivors,
+// compounded path rewrites).
+func TestTransformTargetsSecondInvocationSeesOriginals(t *testing.T) {
+	w := hookWrapper(t, dropAndRewrite)
+	ts := cachedTargets()
+	orig := cachedTargets()
+
+	first := w.TransformTargets(ts)
+	second := w.TransformTargets(ts)
+	if !reflect.DeepEqual(second, first) {
+		t.Fatalf("cache-hit invocation diverged:\nfirst  %+v\nsecond %+v", first, second)
+	}
+	if !reflect.DeepEqual(ts, orig) {
+		t.Fatalf("the cached slice drifted across invocations:\n got %+v\nwant %+v", ts, orig)
 	}
 }
 

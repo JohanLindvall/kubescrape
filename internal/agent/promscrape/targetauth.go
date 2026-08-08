@@ -141,6 +141,16 @@ func (s *Scraper) clientFor(ctx context.Context, t kubemeta.ScrapeTarget, timeou
 	}
 
 	s.tlsMu.Lock()
+	// Re-check under the write lock: two scrape goroutines missing the cache
+	// for one key both build. Without the re-check the second insert
+	// OVERWROTE the first — whose transport the winner's scrape was already
+	// using, and whose pooled connections nothing would ever close. The loser
+	// built here adopts the cached client instead; it has served no request,
+	// so there is nothing of its own to close.
+	if c, ok := s.tlsClients[key]; ok {
+		s.tlsMu.Unlock()
+		return c, nil
+	}
 	// Bound the cache: the key includes the secret bytes, so a rotating
 	// credential would otherwise accumulate a transport per rotation. Evict ONE
 	// entry (and close its idle connections) rather than clearing the map: a

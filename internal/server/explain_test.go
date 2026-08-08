@@ -131,3 +131,49 @@ func TestExplainUnresolvedPorts(t *testing.T) {
 		t.Errorf("declaredPorts = %+v", doc.DeclaredPorts)
 	}
 }
+
+// A pod with no scrape annotation whose only selector match is an UNannotated
+// Service is not opted into scraping by anything: doc.Services lists every
+// selector match regardless of annotation, so the hint must not read a mere
+// match as an opt-in and claim "an opt-in exists but no port resolved".
+func TestExplainUnannotatedServiceGetsNothingOptsInHint(t *testing.T) {
+	st := store.New(time.Minute)
+	st.UpsertPod(&corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "plain-1", Namespace: "prod", UID: types.UID("plain-uid"), ResourceVersion: "1",
+			Labels: map[string]string{"app": "plain"},
+		},
+		Spec: corev1.PodSpec{NodeName: "node1", Containers: []corev1.Container{{
+			Name:  "c",
+			Ports: []corev1.ContainerPort{{Name: "http", ContainerPort: 8080}},
+		}}},
+		Status: corev1.PodStatus{Phase: corev1.PodRunning, PodIP: "10.0.0.8"},
+	})
+	idx := services.NewIndex()
+	idx.Upsert(&corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			// No prometheus.io/scrape annotation: the Service matches the pod
+			// but opts nothing into scraping.
+			Name: "plain", Namespace: "prod", UID: types.UID("plain-svc-uid"), ResourceVersion: "1",
+		},
+		Spec: corev1.ServiceSpec{
+			Selector: map[string]string{"app": "plain"},
+			Ports:    []corev1.ServicePort{{Name: "web", Port: 80, TargetPort: intstr.FromInt(8080)}},
+		},
+	})
+	srv := testServerWithServices(t, st, idx, closedChan())
+
+	var doc explainDoc
+	getJSON(t, srv.URL+"/v1/explain/prod/plain-1", 200, &doc)
+	if len(doc.Targets) != 0 {
+		t.Fatalf("targets = %+v", doc.Targets)
+	}
+	// The matched Service is still listed (with annotated=false) — the hint
+	// just must not count it as an opt-in.
+	if len(doc.Services) != 1 || doc.Services[0].Annotated {
+		t.Fatalf("services = %+v", doc.Services)
+	}
+	if !strings.Contains(doc.Hint, "nothing opts this pod into scraping") {
+		t.Errorf("hint = %q", doc.Hint)
+	}
+}

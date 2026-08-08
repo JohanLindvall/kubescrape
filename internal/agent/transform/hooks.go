@@ -89,24 +89,36 @@ func (w *Wrapper) HasAdmit() bool {
 // TransformTargets runs target(t) over each fetched scrape target: t.drop()
 // removes it, t.path is writable (the URL re-renders). Errors keep the
 // target untouched.
+//
+// The input slice is metaclient's CACHED value (shallow-copied out under the
+// treat-as-immutable contract, served again on every cache hit and 304
+// revalidation), so neither the slice nor its elements may be written:
+// compacting into ts[:0] shifted survivors over the cached backing array
+// (leaving a stale tail a later cycle scraped twice), and a path rewrite
+// through &ts[i] compounded across cycles. Each target is copied BY VALUE
+// before the script may touch it — sufficient because targetObj's only
+// writable surface is the top-level Path string (SetField), plus the URL
+// re-render here — and survivors go into a fresh slice. Once per scrape
+// cycle, not a hot path.
 func (w *Wrapper) TransformTargets(ts []kubemeta.ScrapeTarget) []kubemeta.ScrapeTarget {
 	p := w.program.Load()
 	if p == nil || p.targets == nil {
 		return ts
 	}
-	out := ts[:0]
+	out := make([]kubemeta.ScrapeTarget, 0, len(ts))
 	for i := range ts {
-		tgt := &targetObj{t: &ts[i]}
+		t := ts[i] // value copy: the script's writes must never reach the cached element
+		tgt := &targetObj{t: &t}
 		if _, err := p.targets.call(tgt); err != nil {
 			hookErr(&hookWarnGates.targets, "targets", err)
-			out = append(out, ts[i])
+			out = append(out, t)
 			continue
 		}
 		if tgt.mutatedPath {
-			ts[i].URL = ts[i].Scheme + "://" + ts[i].Address + ts[i].Path
+			t.URL = t.Scheme + "://" + t.Address + t.Path
 		}
 		if !tgt.dropped {
-			out = append(out, ts[i])
+			out = append(out, t)
 		}
 	}
 	return out

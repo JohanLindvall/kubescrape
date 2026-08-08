@@ -2,6 +2,18 @@ package logchain
 
 import "testing"
 
+// The truncation-marking keys are wire-visible (backends filter on them, and
+// journald's + the tailer's records already ship them): a refactor renaming
+// the constants must not change the strings.
+func TestTruncationAttrKeysAreStable(t *testing.T) {
+	if AttrTruncated != "log.truncated" {
+		t.Errorf("AttrTruncated = %q, want %q", AttrTruncated, "log.truncated")
+	}
+	if AttrOriginalLength != "log.original_length" {
+		t.Errorf("AttrOriginalLength = %q, want %q", AttrOriginalLength, "log.original_length")
+	}
+}
+
 func TestTruncateRunes(t *testing.T) {
 	tests := []struct {
 		name string

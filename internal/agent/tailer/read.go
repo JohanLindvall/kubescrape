@@ -20,10 +20,11 @@ import (
 )
 
 // resolveMetadata builds the file's resource attributes. Plain files resolve
-// immediately from the source's static attributes plus node metadata;
-// containerd files fetch pod metadata from the service (backing off between
-// attempts), and are not consumed until it is available — the data waits on
-// disk, nothing is lost.
+// from the source's static attributes plus node metadata (immediately, except
+// while a CONFIGURED node-info provider has not yielded its first value — see
+// resolvePlain); containerd files fetch pod metadata from the service (backing
+// off between attempts), and are not consumed until it is available — the data
+// waits on disk, nothing is lost.
 // metadata resolution backoff bounds: the first retry is quick (a container
 // genuinely racing the API server resolves within a second or two), the cap
 // keeps a permanently unresolvable file down to one blocking call a minute.
@@ -113,6 +114,22 @@ func (t *Tailer) resolvePlain(f *file) bool {
 	actx := attrs.Context{}
 	if t.cfg.NodeInfo != nil {
 		actx.Node = t.cfg.NodeInfo()
+		if actx.Node == nil {
+			// A provider is CONFIGURED but has not resolved yet. This runs once
+			// per file and the result is latched as the file's resource, so
+			// building now would permanently strip the node attributes from
+			// every record the file ever exports. Defer instead: the file stays
+			// unresolved (nothing is read before it can be attributed — the
+			// containerd path's rule) and the next sweep retries at one cheap
+			// provider call per sweep. This cannot wedge a file in the shipped
+			// agent: cmd/kubescrape-agent wires NodeInfo from selfmeta.Poll
+			// with a non-nil Initial (the bare node name), so the provider
+			// never returns nil there — nil only happens for a wiring whose
+			// provider genuinely resolves later, which is exactly the case to
+			// wait for. A deployment that wants no node metadata at all leaves
+			// Config.NodeInfo itself nil and resolves immediately.
+			return false
+		}
 	}
 	t.cfg.Attrs.Build(res, actx)
 	a := res.Attributes()
@@ -162,6 +179,29 @@ func (f *file) swept() bool { return f.f != nil && !f.compressed && !f.gone }
 func (t *Tailer) readFile(ctx context.Context, f *file) error {
 	if f.compressed {
 		return t.readArchive(ctx, f)
+	}
+	// An idle-closed file stays closed until the path shows evidence of
+	// activity: the poll sweep runs every file through here each
+	// PollInterval, and an unconditional ensureOpen reopened the fd (plus a
+	// fingerprint read and a seek) only for closeIdleFiles to re-close it on
+	// its own, coarser cadence — idle fds were open ~98% of steady state,
+	// defeating -logs-idle-close. One stat of the path decides: the same
+	// inode at the same size and mtime the close verified is still idle
+	// (skip; a vanished path still errors into the gone handling, exactly as
+	// ensureOpen's open would have). ANY deviation falls through to
+	// ensureOpen, whose identity check tells an append (same inode: resume at
+	// committed) from a replacement at the path (rotation while closed:
+	// the replaced arm records the old incarnation as an open-ended segment
+	// and recovers its remainder via findRotated) — the gate must never
+	// bypass that arm, so it only ever skips the no-change case.
+	if f.f == nil && f.idleClosed {
+		st, err := os.Stat(f.path)
+		if err != nil {
+			return err
+		}
+		if inodeOf(st) == f.inode && st.Size() == f.readPos && st.ModTime().Equal(f.lastMod) {
+			return nil
+		}
 	}
 	if err := t.ensureOpen(f); err != nil {
 		return err
@@ -387,6 +427,7 @@ func (t *Tailer) ensureOpen(f *file) error {
 	f.f = fh
 	f.inode = inode
 	f.fp = fp
+	f.idleClosed = false // open again: the idle-close stat gate no longer applies
 	if replaced {
 		// The OLD incarnation rotated away while we held no fd — between
 		// -logs-idle-close releasing it and this reopen, or between a

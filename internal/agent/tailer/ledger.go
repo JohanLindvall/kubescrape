@@ -175,6 +175,15 @@ type file struct {
 	// accumulated prefix was dropped (see consume), and everything up to the
 	// line's eventual newline is part of the same line, not a record.
 	discarding bool
+	// idleClosed: the fd was released by closeIdleFiles with the file fully
+	// caught up. readFile then gates the reopen on a cheap stat of the path
+	// showing evidence of activity (size/mtime moved, or a different inode at
+	// the path) — without the gate, every poll sweep's ensureOpen reopened the
+	// fd (and re-read the fingerprint) just for closeIdleFiles to re-close it
+	// on its own cadence, leaving idle fds open ~98% of steady state. Cleared
+	// by any successful open (ensureOpen), so it is only ever consulted for a
+	// close that THIS mechanism performed.
+	idleClosed bool
 
 	// keyStdout/keyStderr are the precomputed pipeline keys
 	// ("<containerID>/<stream>") — feedLine runs per physical line and must
@@ -361,9 +370,14 @@ func (l *ledger) reset() {
 	// any more, so no traversal claim over them is sound until they are
 	// re-fed (fedTo included — it names lines that were in the purged
 	// pipeline). reopen restores fed for a rotation, which purges nothing.
+	// skipTo/discarding go with fedTo: a re-replay from committed must re-feed
+	// the purged lines BELOW the discard frontier, so resuming at skipTo would
+	// lose them — the discard window is re-derived from the re-read instead
+	// (see the field doc for why the pair resets together).
 	for _, sg := range l.segments {
 		sg.fed = false
 		sg.fedTo = 0
+		sg.skipTo, sg.discarding = 0, false
 	}
 	l.streams = nil
 }
@@ -420,13 +434,37 @@ type segment struct {
 	committed, to int64
 	// fedTo is the replay's FEED progress: lines up to it are already in the
 	// pipeline from an earlier, budget-cut pass of THIS pipeline incarnation.
-	// A resumed pass starts at max(committed, fedTo) — resuming at committed
-	// alone re-fed lines the pipeline still buffers, and a re-fed P fragment
-	// APPENDS to its own still-open run (a duplicated fragment inside one
-	// joined record, not an at-least-once duplicate record). Never
+	// A resumed pass starts at max(committed, fedTo, skipTo) — resuming at
+	// committed alone re-fed lines the pipeline still buffers, and a re-fed P
+	// fragment APPENDS to its own still-open run (a duplicated fragment inside
+	// one joined record, not an at-least-once duplicate record). Never
 	// checkpointed: it describes pipeline state, so a purge (ledger.reset)
 	// zeroes it and the replay re-reads from committed.
 	fedTo int64
+	// skipTo is the replay's DISCARD progress: the already-discarded prefix of
+	// an oversized line ends here, so a resumed pass skips past it (a discarded
+	// run can never produce a committing entry, so skipping it is safe). It is
+	// SEPARATE from fedTo because fedTo is a committable line boundary — the
+	// open-ended replay pins `to` from it, and a `to` at the end of a discarded
+	// run is an offset no entry can ever commit, wedging the segment below
+	// retirement. Without skipTo the discard progress was pass-local: a line
+	// whose newline is out of one pass's reach was re-read from fedTo and
+	// re-discarded identically every sweep — the segment pinned at one offset
+	// until the stall limit retired it and lost its readable remainder.
+	// discarding mirrors the live path's file.discarding: skipTo sits MID-LINE,
+	// so the remainder up to the line's eventual newline is part of the same
+	// oversized line, not a record — resuming without the flag would feed that
+	// remainder as a fresh record.
+	//
+	// Neither is checkpointed (positions.Prefix carries commit progress only —
+	// a restart re-reads from committed and re-derives the discard window from
+	// the same bytes, which suffices), and ledger.reset zeroes BOTH together
+	// with fedTo: a purge re-replays from committed, which re-derives them, and
+	// zeroing one without the other would either feed the oversized line's tail
+	// as a record (skipTo kept, discarding cleared) or swallow legitimate lines
+	// up to the next newline (discarding kept, skipTo zeroed).
+	skipTo     int64
+	discarding bool
 	// stalledSince is when this segment's replay last made no progress at all
 	// (see chargeStall); zero while it is advancing. It bounds how long the
 	// LIVE TAIL may stay gated behind a source that will not open.

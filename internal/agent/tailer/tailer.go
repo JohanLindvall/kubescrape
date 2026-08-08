@@ -479,7 +479,15 @@ func (t *Tailer) closeIdleFiles() {
 		if f.f == nil || f.compressed || f.dirty || f.limited {
 			continue
 		}
-		if len(f.pending) > 0 || f.readPos != f.committed || len(f.segments) > 0 {
+		// Caught up when everything FED has committed (fedEnd, not readPos):
+		// trailing bytes that never entered the pipeline — a blank line, a
+		// rate-DROPPED or oversize-discarded tail — can never produce a
+		// committing entry, so readPos != committed held forever for such
+		// files and their fds never closed. Every sibling completion decision
+		// (segment `to`, goneEnd) already compares against fedEnd for the same
+		// byte class; unread-on-disk bytes are the re-stat's job below, and
+		// un-fed bytes still buffered are the watermark's.
+		if len(f.pending) > 0 || f.fedEnd() > f.committed || len(f.segments) > 0 {
 			continue
 		}
 		if _, buffered := f.watermark(); buffered {
@@ -490,13 +498,16 @@ func (t *Tailer) closeIdleFiles() {
 		}
 		// lastMod is the cached mtime from the last read; re-stat so a write
 		// the sweep has not consumed yet cannot have its fd pulled out from
-		// under it.
+		// under it. Size compares against readPos (bytes READ), not fedEnd:
+		// consumed-but-never-fed trailing bytes were still read, and only
+		// bytes past readPos are unconsumed activity.
 		st, err := os.Stat(f.path)
 		if err != nil || st.Size() != f.readPos || !st.ModTime().Equal(f.lastMod) {
 			continue
 		}
 		_ = f.f.Close()
-		f.f = nil // ensureOpen reopens and re-verifies identity on activity
+		f.f = nil // readFile reopens (identity re-verified) on evidence of activity
+		f.idleClosed = true
 	}
 }
 

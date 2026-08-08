@@ -356,6 +356,57 @@ func TestLateSpanFollowsADrop(t *testing.T) {
 	}
 }
 
+// Both late tallies wait for the push's ACK. A late KEEP rides out in the
+// forwarded payload, so a failed forward means the sender retries and
+// re-presents it; a late DROP is not in the payload, but its finality rides
+// the same ack — only a NACKed push is retransmitted. Counting the drop at
+// receive time (as take once did) tallied the same spans once per retry
+// attempt, asymmetric with the keep side's deliberate deferral.
+func TestLateSpanTalliesWaitForTheAck(t *testing.T) {
+	cap := &capture{}
+	b, clk := newTestBuffer(t, Config{Config: errorsCfg(), DecisionWait: "1s"}, cap)
+	ctx := context.Background()
+
+	// Trace 41 (an ERROR span) decides KEEP; trace 42 decides DROP.
+	if err := b.ExportTraces(ctx, payload("checkout",
+		spanSpec{trace: 41, span: 1, end: 5, status: ptrace.StatusCodeError},
+		spanSpec{trace: 42, span: 1, end: 5})); err != nil {
+		t.Fatal(err)
+	}
+	clk.advance(2 * time.Second)
+	b.Sweep(ctx)
+
+	beforeKept := counter(obs.TailSampleLate.WithLabelValues("kept"))
+	beforeDrop := counter(obs.TailSampleLate.WithLabelValues("dropped"))
+
+	// One payload carrying a late span for each verdict.
+	late := payload("checkout",
+		spanSpec{trace: 41, span: 2, end: 5},
+		spanSpec{trace: 42, span: 2, end: 5})
+	cap.fail(errors.New("collector down"))
+	if err := b.ExportTraces(ctx, late); err == nil {
+		t.Fatal("the forward of the late keep must fail the push so the sender retries it")
+	}
+	if got := counter(obs.TailSampleLate.WithLabelValues("kept")) - beforeKept; got != 0 {
+		t.Fatalf("late{kept} counted %v on a NACKed push, want 0", got)
+	}
+	if got := counter(obs.TailSampleLate.WithLabelValues("dropped")) - beforeDrop; got != 0 {
+		t.Fatalf("late{dropped} counted %v on a NACKed push, want 0 (the sender's retry re-presents the same spans)", got)
+	}
+
+	// The sender's retry, this time acked.
+	cap.fail(nil)
+	if err := b.ExportTraces(ctx, late); err != nil {
+		t.Fatal(err)
+	}
+	if got := counter(obs.TailSampleLate.WithLabelValues("kept")) - beforeKept; got != 1 {
+		t.Fatalf("late{kept} = %v across a failed attempt plus its retry, want exactly one payload's worth (1)", got)
+	}
+	if got := counter(obs.TailSampleLate.WithLabelValues("dropped")) - beforeDrop; got != 1 {
+		t.Fatalf("late{dropped} = %v across a failed attempt plus its retry, want exactly one payload's worth (1)", got)
+	}
+}
+
 // Past the cache the trace is simply unknown again, and a span for it starts a
 // fresh window — the documented cost of bounding the cache.
 func TestVerdictExpiresAndTheTraceStartsAFreshWindow(t *testing.T) {

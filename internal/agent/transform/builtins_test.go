@@ -284,6 +284,58 @@ logs: |
 	}
 }
 
+// Fork shares the emit_metric target through a pointer, exactly like the
+// program: main builds the self-chain fork (routing enabled) BEFORE it wires
+// the emitter, so a Fork that copied the interface VALUE froze the fork's at
+// nil forever — and a metrics script's emit_metric then failed the self
+// chain's export every interval. Wiring the parent after the fork exists must
+// reach both.
+func TestEmitMetricThroughForkWiredAfter(t *testing.T) {
+	set, err := metrics.NewDynamicMetricSet([]metrics.Dynamic{{
+		Name: "script_events", Type: "counter", Value: "1",
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	prog, err := Compile([]byte(`
+logs: |
+  def transform(batch):
+      for r in batch:
+          r.emit_metric("script_events", 1)
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	w := Wrap(&capExp{}, nil, prog)
+	fork := w.Fork(&capExp{}, nil) // main's order: the fork exists first...
+	w.SetMetricEmitter(set)        // ...and the emitter is wired afterwards.
+	if err := fork.ExportLogs(context.Background(), logsPayload("x")); err != nil {
+		t.Fatalf("emit_metric through a fork wired after Fork: %v", err)
+	}
+
+	// The observation landed in the set, through the fork.
+	exp := &capMetrics{}
+	if err := set.Export(context.Background(), exp, 0); err != nil {
+		t.Fatal(err)
+	}
+	total := 0.0
+	for _, md := range exp.md {
+		rms := md.ResourceMetrics()
+		for i := 0; i < rms.Len(); i++ {
+			ms := rms.At(i).ScopeMetrics().At(0).Metrics()
+			for j := 0; j < ms.Len(); j++ {
+				dps := ms.At(j).Sum().DataPoints()
+				for d := 0; d < dps.Len(); d++ {
+					total += dps.At(d).DoubleValue() + float64(dps.At(d).IntValue())
+				}
+			}
+		}
+	}
+	if total != 1 {
+		t.Fatalf("emitted total = %v, want 1", total)
+	}
+}
+
 // capMetrics deep-copies (DynamicMetricSet.Export clears its payload).
 type capMetrics struct{ md []pmetric.Metrics }
 

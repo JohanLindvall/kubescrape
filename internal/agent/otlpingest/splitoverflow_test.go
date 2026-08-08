@@ -151,12 +151,16 @@ func TestByteRefusedGroupDoesNotCountUnresolved(t *testing.T) {
 	}
 }
 
-// split_capped names OBJECTS the push could not enrich. Once the byte budget
-// binds, admit also refuses further scope/shell copies for ids that ALREADY
-// have their own enriched group — a real refusal (the byte bound is on the
-// output), but not a capped object, and counting it made the metric name
-// objects the push had in fact enriched.
-func TestByteRefusedShellOfAnEnrichedGroupIsNotCounted(t *testing.T) {
+// Once the byte budget binds, admit also refuses further scope/shell copies
+// for ids that ALREADY have their own enriched group — and those refusals ARE
+// counted, once per object. The refused points do not stay on the group: they
+// fold into the stripped overflow resource, so the object's series fork across
+// its enriched resource and an unenriched one — a real degradation of an
+// object the push named, which is what split_capped reports. (An earlier
+// version left the grouped case uncounted on the theory that the object "was
+// in fact enriched"; its points' actual placement made that claim false and
+// the mid-push bind invisible.)
+func TestByteRefusedShellOfAnEnrichedGroupIsCounted(t *testing.T) {
 	capped := obs.Ingested.WithLabelValues("split_capped").Value()
 
 	const objects = 8
@@ -185,19 +189,42 @@ func TestByteRefusedShellOfAnEnrichedGroupIsNotCounted(t *testing.T) {
 	if got := out.DataPointCount(); got != 2*objects {
 		t.Fatalf("forwarded %d points, want all %d", got, 2*objects)
 	}
-	// Every object got its own group from the first metric, so the budget bound
-	// on the second must cost the counter nothing.
+	// Every object got its own group from the first metric; the fat metric's
+	// points split between shells admitted before the budget bound (on their
+	// enriched groups) and the stripped overflow fallback after it.
 	enriched := 0
+	forked := map[string]struct{}{} // uids whose fat-metric points landed on overflow
 	rms := out.ResourceMetrics()
 	for i := 0; i < rms.Len(); i++ {
-		if _, ok := rms.At(i).Resource().Attributes().Get("k8s.pod.name"); ok {
+		rm := rms.At(i)
+		_, isEnriched := rm.Resource().Attributes().Get("k8s.pod.name")
+		if isEnriched {
 			enriched++
+		}
+		sms := rm.ScopeMetrics()
+		for j := 0; j < sms.Len(); j++ {
+			ms := sms.At(j).Metrics()
+			for k := 0; k < ms.Len(); k++ {
+				m := ms.At(k)
+				if isEnriched || len(m.Description()) == 0 {
+					continue
+				}
+				dps := m.Gauge().DataPoints()
+				for l := 0; l < dps.Len(); l++ {
+					if v, ok := dps.At(l).Attributes().Get("k8s.pod.uid"); ok {
+						forked[v.Str()] = struct{}{}
+					}
+				}
+			}
 		}
 	}
 	if enriched != objects {
 		t.Fatalf("enriched groups = %d, want %d: the payload no longer admits every object first", enriched, objects)
 	}
-	if got := obs.Ingested.WithLabelValues("split_capped").Value() - capped; got != 0 {
-		t.Errorf("split_capped delta = %v, want 0: every object in this push was enriched", got)
+	if len(forked) == 0 {
+		t.Fatal("no fat-metric point landed on the overflow fallback: the payload no longer exercises the mid-push byte bind")
+	}
+	if got := obs.Ingested.WithLabelValues("split_capped").Value() - capped; got != float64(len(forked)) {
+		t.Errorf("split_capped delta = %v, want %d: each grouped object whose refused shell folded to overflow must count exactly once", got, len(forked))
 	}
 }

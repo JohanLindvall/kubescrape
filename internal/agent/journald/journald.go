@@ -586,8 +586,8 @@ func (s *recordSink) Stamp(lr plog.LogRecord) {
 	lr.SetSeverityText(e.sevText)
 	lr.Body().SetStr(e.body)
 	if e.origLen > 0 {
-		lr.Attributes().PutBool("log.truncated", true)
-		lr.Attributes().PutInt("log.original_length", int64(e.origLen))
+		lr.Attributes().PutBool(logchain.AttrTruncated, true)
+		lr.Attributes().PutInt(logchain.AttrOriginalLength, int64(e.origLen))
 	}
 	if e.ident != "" {
 		lr.Attributes().PutStr("syslog.identifier", e.ident)

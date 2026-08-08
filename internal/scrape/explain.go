@@ -64,10 +64,46 @@ func DeclaredPorts(pod kubemeta.Pod) []DeclaredPort {
 	return out
 }
 
+// portFilter mirrors podPorts' `add`: a pod port becomes a target ONCE, and
+// only inside 1..65535. It is threaded across every verdict of one pod rather
+// than applied per entry, because podPorts dedupes across the WHOLE resolution
+// — two containers declaring the same number, `prometheus.io/port: "8080,8080"`
+// or a name and a number naming one port each yield ONE target, and explain
+// over-reported them as two. The mirrored `add` is the reason this file exists
+// (the package header's "cannot drift"); it was the one part not mirrored.
+type portFilter map[int32]struct{}
+
+// keep splits the ports one entry matched into those that actually become
+// targets and a note explaining the rest.
+func (f portFilter) keep(ports []int32) (kept []int32, note string) {
+	var dup, bad []string
+	for _, p := range ports {
+		_, seen := f[p]
+		switch {
+		case p < 1 || p > 65535:
+			bad = append(bad, strconv.Itoa(int(p)))
+		case seen:
+			dup = append(dup, strconv.Itoa(int(p)))
+		default:
+			f[p] = struct{}{}
+			kept = append(kept, p)
+		}
+	}
+	var notes []string
+	if len(dup) > 0 {
+		notes = append(notes, fmt.Sprintf("port %s already resolved through an earlier entry or declaration; this one adds no target", strings.Join(dup, ", ")))
+	}
+	if len(bad) > 0 {
+		notes = append(notes, fmt.Sprintf("port %s is outside 1-65535 and resolves to nothing", strings.Join(bad, ", ")))
+	}
+	return kept, strings.Join(notes, "; ")
+}
+
 // ExplainPodPorts explains what podPorts does with this pod: one verdict per
 // annotation entry, or — with no (non-blank) annotation — one per declared
 // container port. annotated reports which of the two shapes applied.
 func ExplainPodPorts(pod kubemeta.Pod) (verdicts []PortVerdict, annotated bool) {
+	filter := portFilter{}
 	// The fallback predicate must be EXACTLY podPorts': absent or all-blank
 	// falls back to declared ports; a present annotation never does, even one
 	// whose entries all split away (","), which selects nothing.
@@ -78,11 +114,11 @@ func ExplainPodPorts(pod kubemeta.Pod) (verdicts []PortVerdict, annotated bool) 
 			if dp.Name != "" {
 				entry = dp.Name
 			}
-			verdicts = append(verdicts, PortVerdict{
-				Entry: entry,
-				Ports: []int32{dp.Port},
-				Note:  "declared container port (no prometheus.io/port annotation; every declared port is a target)",
-			})
+			ports, note := filter.keep([]int32{dp.Port})
+			if note == "" {
+				note = "declared container port (no prometheus.io/port annotation; every declared port is a target)"
+			}
+			verdicts = append(verdicts, PortVerdict{Entry: entry, Ports: ports, Note: note})
 		}
 		return verdicts, false
 	}
@@ -94,7 +130,7 @@ func ExplainPodPorts(pod kubemeta.Pod) (verdicts []PortVerdict, annotated bool) 
 		}}, true
 	}
 	for _, entry := range entries {
-		verdicts = append(verdicts, explainPodPortEntry(pod, entry))
+		verdicts = append(verdicts, explainPodPortEntry(pod, entry, filter))
 	}
 	return verdicts, true
 }
@@ -102,10 +138,11 @@ func ExplainPodPorts(pod kubemeta.Pod) (verdicts []PortVerdict, annotated bool) 
 // explainPodPortEntry is podPorts' per-entry logic with its verdict spelled
 // out — including the caveat the user cannot see from the target list alone:
 // a NUMERIC entry resolves whether or not any container declares the port.
-func explainPodPortEntry(pod kubemeta.Pod, entry string) PortVerdict {
+func explainPodPortEntry(pod kubemeta.Pod, entry string, filter portFilter) PortVerdict {
 	if n, ok := parsePort(entry); ok {
-		v := PortVerdict{Entry: entry, Ports: []int32{n}}
-		if !containerDeclaresNumber(pod, n) {
+		ports, note := filter.keep([]int32{n})
+		v := PortVerdict{Entry: entry, Ports: ports, Note: note}
+		if note == "" && !containerDeclaresNumber(pod, n) {
 			v.Note = fmt.Sprintf("no container declares port %d — the target is still served (containerPort declarations are optional), but if nothing listens there the scrape will fail", n)
 		}
 		return v
@@ -113,18 +150,19 @@ func explainPodPortEntry(pod kubemeta.Pod, entry string) PortVerdict {
 	if allDigits(entry) {
 		return PortVerdict{Entry: entry, Note: "not a valid port number (1-65535), and an all-digit string can never name a declared port; the entry resolves to nothing"}
 	}
-	var ports []int32
+	var matched []int32
 	for _, c := range pod.Containers {
 		for _, p := range c.Ports {
 			if p.Name == entry {
-				ports = append(ports, p.Port)
+				matched = append(matched, p.Port)
 			}
 		}
 	}
-	if len(ports) == 0 {
+	if len(matched) == 0 {
 		return PortVerdict{Entry: entry, Note: fmt.Sprintf("no container declares a port named %q; the entry resolves to nothing", entry)}
 	}
-	return PortVerdict{Entry: entry, Ports: ports}
+	ports, note := filter.keep(matched)
+	return PortVerdict{Entry: entry, Ports: ports, Note: note}
 }
 
 // ExplainServicePorts explains what ServiceTargets does with this pod behind

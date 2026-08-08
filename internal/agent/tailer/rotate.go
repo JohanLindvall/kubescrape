@@ -521,12 +521,22 @@ func (t *Tailer) replaySegment(ctx context.Context, f *file, p *segment) bool {
 	// one pass: nothing was fed, `committed` could not advance, segmentsFed
 	// stayed false, and the same megabyte was re-read every sweep forever,
 	// pinning an fd and starving the sweep goroutine. Once the budget is spent
-	// the loop keeps reading to the next newline, so a line always progresses —
-	// either whole (fed, fedTo advances) or by the discarded chunk the oversize
-	// escape just dropped (skipTo advances; the escape empties carry, so the
-	// overrun stops there and the next pass resumes past the discarded run
-	// instead of re-reading it).
+	// the loop keeps reading until that line progresses — either whole (fed,
+	// fedTo advances) or by the discarded chunk the oversize escape just
+	// dropped (skipTo advances) — and stops there, so the next pass resumes
+	// past it instead of re-reading it.
+	//
+	// overrunFrom is the frontier the escape armed at, and it is what ENDS the
+	// overrun. Re-deriving the escape from `len(carry) > 0` instead re-armed it
+	// after every read whose 64 KiB boundary did not happen to fall on a
+	// newline — essentially every read — so a pass that ran out of budget
+	// mid-line went on to read the WHOLE owed range (up to a rotated kubelet
+	// log's 10 MiB) in one go, with a synchronous export per BatchSize, on the
+	// single sweep goroutine that serves every file on the node. The budget
+	// bounded nothing in exactly the open-ended rotation-while-down case it was
+	// written for.
 	overrun := false
+	var overrunFrom int64
 	for remaining > 0 && (budget > 0 || overrun) {
 		want := remaining
 		if !overrun {
@@ -548,13 +558,19 @@ func (t *Tailer) replaySegment(ctx context.Context, f *file, p *segment) bool {
 					if len(carry) > t.cfg.MaxEntryBytes+oversizeSlack {
 						cur += int64(len(carry))
 						carry = carry[:0]
+						// Counted once per LINE, exactly like consume's live
+						// path: a line longer than the cap is discarded in as
+						// many slabs as it has, and each pass of a replay that
+						// resumes mid-discard would add another.
+						if !discarding {
+							obs.LogOversizedDropped.Inc()
+						}
 						discarding = true
 						// Persist the discard progress on the segment BEFORE the
 						// flush below (like fedTo): a failed flush rewinds and
 						// ledger.reset zeroes it, and stamping afterwards would
 						// resurrect a frontier the purge invalidated.
 						p.skipTo, p.discarding = cur, true
-						obs.LogOversizedDropped.Inc()
 					}
 					break
 				}
@@ -581,10 +597,18 @@ func (t *Tailer) replaySegment(ctx context.Context, f *file, p *segment) bool {
 			lastErr = rerr
 			break
 		}
+		// Spent the budget mid-line: keep going until that line progresses,
+		// then stop (see overrunFrom above).
+		switch {
+		case overrun:
+			if max(fed, p.skipTo) > overrunFrom {
+				overrun = false
+			}
+		case budget <= 0 && len(carry) > 0:
+			overrun, overrunFrom = true, max(fed, p.skipTo)
+		}
 		// Ship what has accumulated rather than holding a whole rotated file
 		// in one payload (which the collector would likely reject anyway).
-		// Spent the budget mid-line: keep going to the next newline, then stop.
-		overrun = budget <= 0 && len(carry) > 0
 		gen := f.rewindGen
 		t.flushDuringDrain(ctx)
 		if f.rewindGen != gen {

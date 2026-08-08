@@ -38,6 +38,7 @@ import (
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/klog/v2"
 
+	"github.com/JohanLindvall/kubescrape/internal/agent/attrs"
 	"github.com/JohanLindvall/kubescrape/internal/agent/otlpexport"
 	"github.com/JohanLindvall/kubescrape/internal/bearer"
 	"github.com/JohanLindvall/kubescrape/internal/cli"
@@ -503,6 +504,37 @@ func init() {
 	flag.Var(&otlpHeaders, "otlp-header", "static key=value header sent on every self-metrics export (HTTP header / gRPC metadata, e.g. X-Scope-OrgID=tenant); repeatable")
 }
 
+// serviceSelfResource is this process's own OTLP resource identity, carried by
+// its self-metrics export and its final export alike (the agent's twin is
+// agentSelfResource).
+//
+// It ends with attrs.Identity for the same reason the agent's does: Identity is
+// the sole producer of service.namespace, which is half the Prometheus job, and
+// the ONLY other call is inside the self-metadata stamp — which builds a FRESH
+// resource from the resolved pod, so with the lookup slow (or permanently
+// impossible: an overridden spec.hostname, hostNetwork) the job stayed the
+// unqualified `kubescrape` while the agent under the identical flags reported
+// `<namespace>/kubescrape-agent`. Identity returns early on the keys already
+// set here, so the hostname keeps naming the instance.
+func serviceSelfResource() pcommon.Resource {
+	res := pcommon.NewResource()
+	a := res.Attributes()
+	a.PutStr("service.name", "kubescrape")
+	a.PutStr("service.version", obs.BuildVersion())
+	if host, err := os.Hostname(); err == nil {
+		a.PutStr("service.instance.id", host)
+	}
+	// Known without any lookup, and set here rather than left to the
+	// self-metadata stamp: attrs.Identity derives service.namespace from
+	// it, and that is half the Prometheus job. Learning it later would
+	// rename the job of already-running cumulative series mid-flight.
+	if ns := selfmeta.Namespace(); ns != "" {
+		a.PutStr("k8s.namespace.name", ns)
+	}
+	attrs.Identity(res)
+	return res
+}
+
 func run() error {
 	flag.Parse()
 
@@ -623,12 +655,36 @@ func run() error {
 	// export before returning, so it finishes before the deferred
 	// exporter.Close fires (mirrors the agent).
 	var wg sync.WaitGroup
+	// One DEADLINE for the whole shutdown sequence, rather than a fixed budget
+	// per step (the agent's shutdownBy, same reasoning). The steps below are
+	// each individually reasonable and their SUM was not: 10s draining the HTTP
+	// server, then up to metrics.FinalExportTimeout inside the producers' join
+	// for Registry.Run's own shutdown export, then another 10s for the final
+	// export — 30s before the deferred stopPprof/stopMetrics spend 5s each.
+	// This Deployment sets no terminationGracePeriodSeconds (unlike the agent's
+	// manifests, which set 60), so it runs on Kubernetes' 30s DEFAULT and was
+	// SIGKILLed mid-sequence against an unreachable collector, losing the very
+	// exports the budgets exist to fit inside it. Sharing a deadline means a
+	// slow step spends what the later ones would have had, and nothing overruns.
+	var shutdownBy time.Time
+	// stepBudget is what remains of the deadline, capped per step. A zero
+	// shutdownBy means we are NOT on the signal path — an early return, where
+	// nothing is racing a termination grace — and each step gets its full
+	// budget.
+	stepBudget := func() time.Duration {
+		if shutdownBy.IsZero() {
+			return shutdownStep
+		}
+		return max(0, min(shutdownStep, time.Until(shutdownBy)))
+	}
 	// Registered AFTER exporter.Close (LIFO): an early `return err` below must
 	// stop and drain the started goroutines BEFORE the exporter is closed under
-	// them. The normal path's inline wg.Wait makes this a no-op there.
+	// them. The normal path's inline join makes this a no-op there — and it is
+	// bounded by the same deadline, or a join that gave up on the signal path
+	// would simply block here instead, spending the budget twice.
 	defer func() {
 		stop()
-		wg.Wait()
+		_ = waitFor(&wg, stepBudget())
 	}()
 	var selfRes pcommon.Resource
 	// selfOut is the exporter plus this pod's own Kubernetes attributes,
@@ -639,20 +695,7 @@ func run() error {
 	// rather than exporting through a nil client.
 	var selfOut selfmeta.Exporter
 	if *selfMetricsIntv > 0 {
-		selfRes = pcommon.NewResource()
-		a := selfRes.Attributes()
-		a.PutStr("service.name", "kubescrape")
-		a.PutStr("service.version", obs.BuildVersion())
-		if host, err := os.Hostname(); err == nil {
-			a.PutStr("service.instance.id", host)
-		}
-		// Known without any lookup, and set here rather than left to the
-		// self-metadata stamp: attrs.Identity derives service.namespace from
-		// it, and that is half the Prometheus job. Learning it later would
-		// rename the job of already-running cumulative series mid-flight.
-		if ns := selfmeta.Namespace(); ns != "" {
-			a.PutStr("k8s.namespace.name", ns)
-		}
+		selfRes = serviceSelfResource()
 		selfOut = exporter
 		if *selfAttrs {
 			// This process's own pod, out of its own store — no HTTP hop, no
@@ -759,7 +802,11 @@ func run() error {
 		runErr = fmt.Errorf("http server: %w", err)
 	case <-ctx.Done():
 		log.Info("shutting down")
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		shutdownBy = time.Now().Add(shutdownTotal)
+		// WithoutCancel(ctx) rather than a bare Background: ctx is already
+		// cancelled, but its VALUES must survive into every shutdown step (the
+		// repo-wide rule — otlpexport's ownership marker rides on a context).
+		shutdownCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), stepBudget())
 		defer cancel()
 		if err := srv.Shutdown(shutdownCtx); err != nil && !errors.Is(err, context.DeadlineExceeded) {
 			runErr = fmt.Errorf("http shutdown: %w", err)
@@ -767,19 +814,53 @@ func run() error {
 	}
 	// Cancel ctx (a no-op on the signal path) and wait for the exporting
 	// goroutines' final flushes before the deferred exporter.Close fires.
+	// BOUNDED: Registry.Run's shutdown branch opens its own FinalExportTimeout
+	// that this process cannot shorten, so an unreachable collector would
+	// otherwise spend it in full and leave nothing for the export below.
+	// Missing the deadline costs nothing that is not already lost — the
+	// goroutines' own exports are what is being waited for.
 	stop()
-	wg.Wait()
+	if !waitFor(&wg, stepBudget()) {
+		log.Warn("exporting goroutines did not stop within the shutdown budget; continuing with the final export")
+	}
 	if *selfMetricsIntv > 0 {
 		// Registry.Run's own final export raced the final flushes inside
 		// wg.Wait (the events drain, the last batches); counters they bumped
 		// would otherwise die unexported. One more export now that all are done.
 		// Bounded here, by us: ctx is cancelled by this point, and a dead
 		// collector must not hold the process past its termination grace.
-		fctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), metrics.FinalExportTimeout)
+		fctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), stepBudget())
 		obs.Registry.FinalExport(fctx, selfOut, selfRes, log)
 		cancel()
 	}
 	return runErr
+}
+
+// shutdownTotal bounds the WHOLE shutdown sequence run() controls and
+// shutdownStep any single step of it.
+//
+// The total is deliberately well under the 30s the kubelet gives a pod that
+// names no terminationGracePeriodSeconds — which is what this Deployment is:
+// the two deferred listener stoppers (obs.ServeMetrics/ServePprof, 5s each) run
+// AFTER this sequence, so 15 + 5 + 5 = 25s leaves the kubelet's own overhead
+// and the exporter close inside the grace. shutdownStep is
+// metrics.FinalExportTimeout, so nothing changes on the path that has the whole
+// budget to itself.
+const (
+	shutdownTotal = 15 * time.Second
+	shutdownStep  = metrics.FinalExportTimeout
+)
+
+// waitFor waits for wg with a deadline, reporting whether it finished in time.
+func waitFor(wg *sync.WaitGroup, budget time.Duration) bool {
+	done := make(chan struct{})
+	go func() { wg.Wait(); close(done) }()
+	select {
+	case <-done:
+		return true
+	case <-time.After(budget):
+		return false
+	}
 }
 
 // headerFlags collects repeatable -otlp-header key=value flags. Repeatable

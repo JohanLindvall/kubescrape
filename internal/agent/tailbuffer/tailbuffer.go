@@ -769,6 +769,16 @@ func (b *Buffer) decide(out *outbound, e *bufTrace, now time.Time, reason string
 	// and skipping the charge for it would admit spans free every fresh window.
 	// See the two lifetimes in cache.go.
 	d := b.ev.Decide(tailsample.Trace{TraceID: e.id, Spans: b.scratch, Charged: b.cache.charged(e.id)})
+	// The evaluator retains nothing (tailsample.Trace says so), so every element
+	// is dead the instant Decide returns — and they are HANDLES, not values: each
+	// one pins a whole span message plus its group's resource attributes. `[:0]`
+	// alone leaves the tail of the largest decision so far pointing into a trace
+	// this call is about to release (the drop branch below nils e.td for exactly
+	// that reason), and a workload of small traces would then never overwrite it.
+	// clear() zeroes [0,len) and the refill above starts from the front, so
+	// nothing past a decision's own fill is ever live. It allocates nothing, so
+	// the decision path stays allocation-free.
+	clear(b.scratch)
 
 	c, ok := b.byPolicy[d.Policy]
 	if !ok { // unreachable: Names() covers every name a Decision can carry
@@ -872,6 +882,15 @@ func (b *Buffer) Run(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-t.C:
+			// A tick that came ready while the previous sweep was exporting is
+			// still sitting in the ticker's one-slot channel when the process is
+			// cancelled — and a select with two ready cases picks at random, so
+			// without this the loop runs one more sweep after shutdown began.
+			// That sweep would pull due traces out of the buffer moments before
+			// main's Flush, which is the pass with a budget of its own.
+			if ctx.Err() != nil {
+				return
+			}
 			b.Sweep(ctx)
 		}
 	}
@@ -924,13 +943,45 @@ func (b *Buffer) drain(ctx context.Context, all bool) {
 	// workload the send below is an append to the traces spool and a collector
 	// outage becomes a backlog; without one it is a direct send and a spent
 	// retry budget is loss.
-	if err := b.sendRetry(otlpexport.Own(ctx), out.td); err != nil {
+	//
+	// Which is why the send does not run on the CALLER's cancellation — see
+	// sendContext. Ours is the only copy from the moment decide() removed these
+	// traces, so a ctx cancelled mid-send is not a retry, it is loss, and the
+	// shutdown Flush cannot recover it: those traces are already out of the
+	// buffer and their verdicts are already cached.
+	sctx, cancel := sendContext(ctx)
+	defer cancel()
+	if err := b.sendRetry(otlpexport.Own(sctx), out.td); err != nil {
 		b.spansLost.Add(float64(out.spans))
 		b.warn("exporting tail-sampled traces failed; the spans are dropped (they were acked to their sender when they were buffered, and no disk buffer took them)",
 			"spans", out.spans, "error", err)
 		return
 	}
 	b.spansKept.Add(float64(out.spans))
+}
+
+// sendContext is the context a drain's SEND runs on: the caller's DEADLINE
+// without the caller's CANCELLATION.
+//
+// The cancellation goes because the payload is already ours — the spans left the
+// buffer before the send started — so propagating the process's shutdown into it
+// destroys exactly the decided keeps the shutdown Flush exists to salvage, and
+// destroys them where nothing can re-decide them. The DEADLINE stays because it
+// is the caller's BUDGET rather than its cancellation: Flush runs on the
+// shutdown step's and must not outlive the pod's termination grace, while the
+// Run loop's own sweeps carry none and stay bounded by the export's retries as
+// they always were.
+//
+// WithoutCancel rather than context.Background(), always: otlpexport.Own's
+// durability marker is a context VALUE and a fresh Background would strip it,
+// turning the send that a disk buffer would have spooled into one that is merely
+// retried and then lost.
+func sendContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	sctx := context.WithoutCancel(ctx)
+	if d, ok := ctx.Deadline(); ok {
+		return context.WithDeadline(sctx, d)
+	}
+	return sctx, func() {}
 }
 
 // sendRetry exports with a bounded backoff — otlpexport.Retry, THE bounded

@@ -8,6 +8,8 @@ import (
 	"go.opentelemetry.io/collector/pdata/plog"
 
 	"github.com/JohanLindvall/kubescrape/pkg/logattrs"
+
+	"github.com/JohanLindvall/kubescrape/internal/testrace"
 )
 
 // attrString must render EXACTLY as pcommon.Value.AsString: the resolver's
@@ -273,6 +275,9 @@ func TestLowerSeverity(t *testing.T) {
 // already-lower input is free now (the fallback returns it unchanged), which
 // this pins alongside the constants.
 func TestLowerSeverityIsAllocationFreeForLowercase(t *testing.T) {
+	if testrace.Enabled {
+		t.Skip("-race perturbs allocation counts")
+	}
 	inputs := []string{
 		"emerg", "alert", "crit", "err", "warning", "notice", "info", "debug",
 		"lowercase-unknown", "level 5",
@@ -300,6 +305,9 @@ func asciiLowerReference(s string) string {
 // nothing: the tailer's per-line budget (BenchmarkIngestLine, 0 allocs/op)
 // depends on it.
 func TestResolverIsAllocationFree(t *testing.T) {
+	if testrace.Enabled {
+		t.Skip("-race perturbs allocation counts")
+	}
 	rec, res := maps(map[string]string{"tenant": "a"}, map[string]string{"k8s.pod.name": "web-abc"})
 	r := New()
 	label, rule := r.LabelFn(), r.RuleFn()

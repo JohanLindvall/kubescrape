@@ -5,6 +5,8 @@ import (
 	"math"
 	"strings"
 	"testing"
+
+	"github.com/JohanLindvall/kubescrape/internal/testrace"
 )
 
 func parseAllMode(t *testing.T, input string, openMetrics, exemplars bool) []Sample {
@@ -848,6 +850,9 @@ func TestDuplicateExemplarLabelDropsOnlyTheExemplar(t *testing.T) {
 // sample path would cost one allocation PER SAMPLE and nothing else would
 // notice.
 func TestParseAllocationBudget(t *testing.T) {
+	if testrace.Enabled {
+		t.Skip("-race perturbs allocation counts")
+	}
 	const samples = 10_000
 	var sb strings.Builder
 	sb.WriteString("# TYPE bench_metric counter\n")

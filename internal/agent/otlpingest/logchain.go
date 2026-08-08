@@ -140,10 +140,11 @@ func (s *Server) applyLogChain(ld plog.Logs) bool {
 // and the rules all share. A string body is used as-is; a structured body
 // (map/slice — an SDK's legal shape) renders through AsString, which is the
 // text the tailer would have seen for the equivalent logged line. false means
-// the body exceeds maxChainBodyBytes and line-derived processing is skipped —
-// the size of a STRUCTURED body is estimated by a materialization-free walk,
-// because rendering first and then measuring is the exact amplification the
-// bound exists to prevent.
+// the body exceeds maxChainBodyBytes — or nests past the depth the estimate
+// walks, which is the same thing since an unmeasured subtree cannot be shown
+// to fit — and line-derived processing is skipped. The size of a STRUCTURED
+// body is estimated by a materialization-free walk, because rendering first
+// and then measuring is the exact amplification the bound exists to prevent.
 func chainBody(lr plog.LogRecord) (string, bool) {
 	b := lr.Body()
 	if b.Type() == pcommon.ValueTypeStr {
@@ -165,8 +166,18 @@ func chainBody(lr plog.LogRecord) (string, bool) {
 // bodies come from unauthenticated senders.
 func renderedSizeOver(v pcommon.Value, rem *int, depth int) bool {
 	if depth > maxBodyScrubDepth {
-		*rem -= 16
-		return *rem < 0
+		// UNMEASURABLE IS OVER BUDGET, never under. Charging a flat cost for an
+		// unwalked subtree made the bound unenforceable: ~130 wire bytes of
+		// nesting put the whole 16 MiB body below the cut-off, the estimate came
+		// back tiny and AsString then materialized it in full — the 14-18x
+		// amplification the bound exists to prevent, with body_too_large flat
+		// while it happened. It is also the depth scrubValue stops at, so a
+		// subtree below it is UNSCRUBBED and must not reach the text view that
+		// enrichment, log-metrics (whose labels can lift the raw line) and the
+		// rules all read. The cost is that an honest body nested deeper than
+		// this skips line-derived processing — counted, and still forwarded.
+		*rem = -1
+		return true
 	}
 	switch v.Type() {
 	case pcommon.ValueTypeStr:

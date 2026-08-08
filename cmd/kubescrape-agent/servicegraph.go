@@ -876,7 +876,17 @@ func serviceGraphShardConfig(sec *servicegraph.ReshardConfig) (servicegraph.Resh
 		if err != nil {
 			return cfg, err
 		}
-		cfg.StatefulSet, cfg.Service = name, name
+		cfg.StatefulSet = name
+		// Guarded like Namespace and Port below, and for the same reason: the
+		// endpoint's first label feeds the Service only as the CONVENTION's
+		// default (the governing Service carries the StatefulSet's name).
+		// Overwriting a section that named a differently-named headless Service
+		// discarded the one field that decides the per-pod DNS the ring dials,
+		// so every remote share addressed a name nothing publishes — silently,
+		// since the merge reports no error and -check-config stays green.
+		if cfg.Service == "" {
+			cfg.Service = name
+		}
 		if cfg.Namespace == "" {
 			cfg.Namespace = ns
 		}
@@ -908,6 +918,51 @@ func serviceGraphShardConfig(sec *servicegraph.ReshardConfig) (servicegraph.Resh
 		return cfg, fmt.Errorf("-service-graph-endpoint %q has no shard count: set -service-graph-shards to the StatefulSet's replica count (it is part of the ring's definition, so every shard must be given the same number)", *serviceGraphEndpoint)
 	}
 	return cfg, nil
+}
+
+// shardRingReachesThisShard cross-checks the ring's TRANSPORT and PORT against
+// the receivers this shard actually binds.
+//
+// The two surfaces are configured independently — the ring's protocol and port
+// from the serviceGraphShards section (or -service-graph-endpoint), the
+// listeners from -service-graph-listen / -service-graph-http-listen — and a
+// TEMPLATE ring is symmetric: it addresses THIS pod on exactly the protocol and
+// port it addresses every sibling on. So `protocol: http` beside an empty
+// -service-graph-http-listen means every sibling POSTs /v1/traces at a
+// gRPC-only listener; the hop is synchronous and failable, so every application
+// push is refused for the tier's lifetime while both readiness gates stay green
+// (they gate on BINDING, and the gRPC listener binds). Same for a port the ring
+// dials that nothing serves. Refused HERE, like msgShardNoListener, so
+// -check-config catches it instead of the StatefulSet rolling out healthy and
+// forwarding nothing.
+//
+// Two deliberate exemptions, both "this pod need not be in the ring it dials":
+// explicit `endpoints` name the shard set outright (NewResharder only WARNS
+// when self is not among them), and a single-shard template has no internal hop
+// at all.
+func shardRingReachesThisShard(cfg servicegraph.ReshardConfig) error {
+	if len(cfg.Endpoints) > 0 || cfg.StatefulSet == "" || cfg.Replicas <= 1 {
+		return nil
+	}
+	proto, listen, flagName := "gRPC", *serviceGraphListen, "-service-graph-listen"
+	if cfg.Protocol == "http" {
+		proto, listen, flagName = "OTLP/HTTP", *serviceGraphHTTPListen, "-service-graph-http-listen"
+	}
+	if strings.TrimSpace(listen) == "" {
+		return fmt.Errorf("serviceGraphShards addresses the ring over %s but %s is empty: a sibling's forward would reach a receiver this shard does not serve", proto, flagName)
+	}
+	port := cfg.Port
+	if port == 0 {
+		port = servicegraph.DefaultShardPort
+	}
+	_, p, err := net.SplitHostPort(listen)
+	if err != nil {
+		return fmt.Errorf("%s %q is not host:port: %w", flagName, listen, err)
+	}
+	if lp, err := strconv.Atoi(p); err != nil || lp != port {
+		return fmt.Errorf("serviceGraphShards addresses each shard on port %d but %s binds %q: a sibling's forward would reach nothing", port, flagName, listen)
+	}
+	return nil
 }
 
 // parseShardEndpoint reads the shard tier's GOVERNING HEADLESS SERVICE address

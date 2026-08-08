@@ -89,6 +89,17 @@ func TestStatusConcurrentScrape(t *testing.T) {
 		}
 	}()
 
+	// One client with an idle pool as wide as the scraper fleet. The default
+	// transport keeps MaxIdleConnsPerHost=2, so 16 goroutines looping without
+	// pause close and redial ~14 connections per round and burn the ephemeral
+	// port range (~16k ports) within the second this test runs — the GETs then
+	// fail "can't assign requested address" and are counted as scrape failures,
+	// which is a property of the local port table, not of Status(). The failure
+	// is machine-speed dependent: it appears exactly when the box is fast
+	// enough to complete the range inside `duration`.
+	client := &http.Client{Transport: &http.Transport{MaxIdleConns: 64, MaxIdleConnsPerHost: 64}}
+	defer client.CloseIdleConnections()
+
 	var scrapes, failures atomic.Int64
 	for range 16 {
 		wg.Add(1)
@@ -100,7 +111,7 @@ func TestStatusConcurrentScrape(t *testing.T) {
 					return
 				default:
 				}
-				resp, err := http.Get(srv.URL + "/debug/tailer")
+				resp, err := client.Get(srv.URL + "/debug/tailer")
 				if err != nil {
 					failures.Add(1)
 					return

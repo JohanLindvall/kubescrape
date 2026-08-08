@@ -772,9 +772,12 @@ func targetInstance(rawURL string) string {
 // service — an exact container incarnation by container id, else the pod by
 // namespace+name (cross-checked against uid) with a named container matched
 // within it; a container-name miss stamps k8s.container.name on res. It returns
-// the built attrs.Context (Node NOT set — the caller adds it) and whether
-// anything resolved; on no resolution the caller writes its own identity
-// fallback. Shared by the cadvisor and split batchers.
+// the built attrs.Context (Node NOT set — the caller adds it) and whether the
+// row's IDENTITY resolved; on false the caller writes its own identity fallback.
+// The two questions are not the same one: a row naming a container id the store
+// does not know yet gets the POD context (Build still enriches from it) together
+// with false, because its container identity can only come from the caller's own
+// labels. Shared by the cadvisor and split batchers.
 func (s *Scraper) resolveContext(ctx context.Context, containerID, namespace, pod, uid, container string, res pcommon.Resource) (attrs.Context, bool) {
 	var actx attrs.Context
 	if containerID != "" {
@@ -782,6 +785,24 @@ func (s *Scraper) resolveContext(ctx context.Context, containerID, namespace, po
 			actx.Pod, actx.Container = &md.Pod, &md.Container
 			return actx, true
 		}
+		// The store does not know THIS incarnation — typically because the kubelet
+		// has not posted a just-started container's id to the API server yet, and
+		// the miss is negative-cached for a minute. Falling through to the pod
+		// branch below would match the pod's CURRENT container by NAME and stamp
+		// that incarnation's container.id, image and restart_count — hence
+		// service.instance.id — onto this row: a dead incarnation's identity on
+		// the live one's cumulative counters, and a resource byte-identical to the
+		// one the other incarnation is keyed under (both keys carry the container
+		// id), i.e. two ResourceMetrics with the same identity in one payload.
+		// Take the pod for its owner/label enrichment, but report UNRESOLVED so
+		// the caller's identity fallback keeps the row's OWN container id, name
+		// and image.
+		if pod != "" {
+			if meta := s.podMeta(ctx, namespace, pod); meta != nil && (uid == "" || meta.UID == uid) {
+				actx.Pod = meta
+			}
+		}
+		return actx, false
 	}
 	if pod != "" {
 		if meta := s.podMeta(ctx, namespace, pod); meta != nil && (uid == "" || meta.UID == uid) {

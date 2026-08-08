@@ -489,6 +489,18 @@ spec:
         - effect: NoSchedule
           key: node-role.kubernetes.io/control-plane
           operator: Exists
+      nodeSelector:
+        kubernetes.io/os: linux
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: kubernetes.io/arch
+                operator: In
+                values:
+                - amd64
+                - arm64
       containers:
         - name: agent
           image: ghcr.io/johanlindvall/kubescrape:latest
@@ -521,11 +533,17 @@ spec:
             - -positions-file=/var/lib/kubescrape-agent/positions.json
             - -enrich=true
             - -logs-file-attributes=false
+            - -logs-rate-limit=0.5
+            - -logs-rate-burst=1.5
+            - -logs-rate-drop=false
             - -logs-unknown-files=auto
             - -logs-idle-close=30s
             - -buffer-dir=/var/lib/kubescrape-agent/buffer
             - -buffer-max-bytes=1073741824
             - -config=/etc/kubescrape/config/config.yaml
+            - -logs-metrics-interval=10s
+            - -logs-metrics-max-bytes=1048576
+            - -logs-metrics-name-prefix=acme_
             - -logs-watch=true
             - -logs-poll-interval=500ms
             - -logs-fingerprint-bytes=1024
@@ -668,6 +686,8 @@ spec:
       # self-metrics exports run, then the disk buffer drains. The kubelet
       # default of 30s cuts that short during a collector outage.
       terminationGracePeriodSeconds: 60
+      nodeSelector:
+        kubernetes.io/os: linux
       containers:
         - name: events
           image: ghcr.io/johanlindvall/kubescrape:latest
@@ -709,6 +729,9 @@ spec:
             - -otlp-retry-backoff=1s
             - -enrich=true
             - -config=/etc/kubescrape/config/config.yaml
+            - -logs-metrics-interval=10s
+            - -logs-metrics-max-bytes=1048576
+            - -logs-metrics-name-prefix=acme_
             - -metrics-listen=:9090
             - -log-level=info
             - -log-format=text
@@ -882,6 +905,8 @@ spec:
       # shutdown budget matters here for the same reason it does elsewhere:
       # the final service-graph and self-metrics exports run before exit.
       terminationGracePeriodSeconds: 60
+      nodeSelector:
+        kubernetes.io/os: linux
       containers:
         - name: servicegraph
           image: ghcr.io/johanlindvall/kubescrape:latest

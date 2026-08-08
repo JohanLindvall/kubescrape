@@ -130,13 +130,29 @@ func TestPermanentRejectionCountsMetricDataPoints(t *testing.T) {
 		return &HTTPStatusError{Code: 400, Body: "bad payload"}
 	}
 
+	// The shape is deliberately asymmetric — 2 resources / 2 scopes / 2 metrics
+	// / 5 data points — so the assertion can only be satisfied by counting
+	// POINTS. SetEmptyGauge installs a fresh Gauge, so it must stay out of the
+	// append loop: calling it per point left this fixture at one point of
+	// everything, where a resource, scope, metric or per-batch count all read
+	// the same and the unit this test exists to pin was unpinned.
 	md := pmetric.NewMetrics()
-	g := md.ResourceMetrics().AppendEmpty().ScopeMetrics().AppendEmpty().Metrics().AppendEmpty()
-	g.SetName("cpu")
+	cpu := md.ResourceMetrics().AppendEmpty().ScopeMetrics().AppendEmpty().Metrics().AppendEmpty()
+	cpu.SetName("cpu")
+	cpuPoints := cpu.SetEmptyGauge().DataPoints()
 	for i := 0; i < 3; i++ {
-		g.SetEmptyGauge().DataPoints().AppendEmpty()
+		cpuPoints.AppendEmpty()
 	}
-	want := float64(md.DataPointCount())
+	mem := md.ResourceMetrics().AppendEmpty().ScopeMetrics().AppendEmpty().Metrics().AppendEmpty()
+	mem.SetName("mem")
+	memPoints := mem.SetEmptyGauge().DataPoints()
+	for i := 0; i < 2; i++ {
+		memPoints.AppendEmpty()
+	}
+	const want = 5.0
+	if got := md.DataPointCount(); got != int(want) {
+		t.Fatalf("fixture builds %d data points, want %v", got, want)
+	}
 
 	beforeRecords := obs.BufferDroppedRecords.WithLabelValues("metrics").Value()
 	ctx, cancel := context.WithCancel(context.Background())

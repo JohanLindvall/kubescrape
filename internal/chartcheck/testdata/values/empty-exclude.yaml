@@ -1,0 +1,8 @@
+# An EXPLICIT empty exclude list: the opt-out half of the `kindIs "invalid"`
+# discriminator (agent.yaml), which null-valued fixtures cannot see. `[]` must
+# render an EMPTY -logs-exclude-namespaces; degrade the discriminator to an
+# emptiness test (`if empty $excl`, or the older `default` form) and this golden
+# is the only one that moves — every other fixture is null or non-empty, where
+# the two spellings agree.
+agent:
+  logsExcludeNamespaces: []

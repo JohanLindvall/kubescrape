@@ -2,9 +2,10 @@
 // exporter: GET /debug/otlp streams a text (OTLP JSON Lines) representation
 // of the payloads flowing through the export chain to any attached HTTP
 // client, filtered by resource attributes (path.Match globs on key and
-// value) and downsampled by a percentage — both query parameters, so the
-// cost is chosen per session, not per deployment. /debug/otlp/ui is a
-// minimal built-in page driving the same endpoint.
+// value, with '/' an ordinary character — see globMatch) and downsampled by a
+// percentage — both query parameters, so the cost is chosen per session, not
+// per deployment. /debug/otlp/ui is a minimal built-in page driving the same
+// endpoint.
 //
 // The tap sits between the transforms and the router (producers → transform
 // → tap → router → buffer → client), so it shows payloads as they will ship
@@ -24,6 +25,7 @@ import (
 	"errors"
 	"math/rand/v2"
 	"path"
+	"strings"
 	"sync"
 	"sync/atomic"
 
@@ -47,7 +49,8 @@ const (
 
 // attrFilter is one resource-attribute condition: a resource matches when ANY
 // of its attributes has a key matching Key and a value (rendered as string)
-// matching Value — both path.Match globs. A subscriber's filters are ANDed.
+// matching Value — both path.Match globs, with '/' an ordinary character (see
+// globMatch). A subscriber's filters are ANDed.
 type attrFilter struct {
 	Key   string
 	Value string
@@ -56,8 +59,8 @@ type attrFilter struct {
 func (f attrFilter) matches(attrs pcommon.Map) bool {
 	found := false
 	attrs.Range(func(k string, v pcommon.Value) bool {
-		if ok, _ := path.Match(f.Key, k); ok {
-			if ok, _ := path.Match(f.Value, v.AsString()); ok {
+		if globMatch(f.Key, k) {
+			if globMatch(f.Value, v.AsString()) {
 				found = true
 				return false
 			}
@@ -65,6 +68,22 @@ func (f attrFilter) matches(attrs pcommon.Map) bool {
 		return true
 	})
 	return found
+}
+
+// globMatch is path.Match with the SEPARATOR NEUTRALIZED: neither half of an
+// attribute filter is a path, but path.Match's `*` and `?` stop at '/', so
+// `container.image.name=*nginx*` could never match
+// "docker.io/library/nginx:1.25" and `k8s.pod.label.*` could never match the
+// `app.kubernetes.io/name` key attrs stamps for the commonest Kubernetes label
+// form. The result is an empty stream indistinguishable from "this agent is
+// exporting nothing" — the very outcome the pattern validation at the query
+// seam exists to prevent. NUL is an ordinary byte to path.Match and occurs in
+// neither operand, so classes, escapes and config.Glob's validity probe are
+// unaffected; strings.ReplaceAll returns its input unchanged when there is no
+// '/' to replace.
+func globMatch(pat, s string) bool {
+	ok, _ := path.Match(strings.ReplaceAll(pat, "/", "\x00"), strings.ReplaceAll(s, "/", "\x00"))
+	return ok
 }
 
 // maxSubscribers bounds concurrent debug streams. The port is

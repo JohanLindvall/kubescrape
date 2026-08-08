@@ -231,6 +231,23 @@ spec:
             {{- if $cfg }}
             - -config=/etc/kubescrape/config/config.yaml
             {{- end }}
+            {{- /* Same argument as the -otlp-* block above: this Deployment
+                   mounts the SAME agent config and runs the SAME logMetrics set
+                   over Kubernetes events and Azure diagnostics (the chain is
+                   compiled in run(), not startLogs, precisely so it survives
+                   -logs=false). Rendering these on the DaemonSet only split one
+                   declared rule into two metric NAMES on two cadences, and every
+                   dashboard written against the prefixed name silently missed
+                   the events + Azure half. */}}
+            {{- with .Values.agent.logsMetrics.interval }}
+            - -logs-metrics-interval={{ . }}
+            {{- end }}
+            {{- with .Values.agent.logsMetrics.maxBytes }}
+            - -logs-metrics-max-bytes={{ int64 . }}
+            {{- end }}
+            {{- with .Values.agent.logsMetrics.namePrefix }}
+            - -logs-metrics-name-prefix={{ . }}
+            {{- end }}
             - -metrics-listen={{ if .Values.metrics.enabled }}{{ .Values.metrics.listen }}{{ end }}
             - -log-level={{ .Values.logLevel }}
             {{- /* pprofListen is a TOP-LEVEL, unscoped value, but only the

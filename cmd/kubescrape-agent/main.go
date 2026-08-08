@@ -705,10 +705,23 @@ func run() error {
 	// durability chain.
 	// Captured before the router so the agent's own metrics can keep the
 	// default (buffered) chain — see selfSink below.
-	preRoute := out
+	//
+	// BOTH chains terminate in a Router, even with no destinations, because the
+	// Router is the only thing that strips route.ScriptMarker — the reserved
+	// attribute a transform script's route() stamps. Left on, it ships to the
+	// collector as a resource attribute and changes the stream identity
+	// (target_info) of everything the script touched. So a config with no
+	// routing: section, and the self chain (which forks below the router by
+	// design), used to export the marker verbatim. A destination-less Router
+	// costs one attrs.Get per resource: split() returns nil for an unmarked
+	// payload and the export takes the uncopied fast path, so the marker-free
+	// case stays allocation-free, and a stamped one takes match()'s no-match
+	// arm — throttled warn, default chain, marker removed — which is exactly
+	// the documented unknown-route behaviour.
+	preRoute := route.New(out, nil)
 	routed := false
+	var dests []route.Destination
 	if fileCfg.Routing != nil && len(fileCfg.Routing.Routes) > 0 {
-		var dests []route.Destination
 		for i, rt := range fileCfg.Routing.Routes {
 			// The SAME checks and derivation -check-config runs (validateRoute),
 			// so a config the dry run accepts is a config that starts.
@@ -723,10 +736,12 @@ func run() error {
 			defer func() { _ = rc.Close() }()
 			dests = append(dests, route.Destination{Name: rt.Name, Namespaces: rt.Namespaces, Exporter: rc})
 		}
-		out = route.New(out, dests)
 		routed = true
 		log.Info("routing enabled", "routes", len(dests))
 	}
+	// `routed` stays gated on a real route list, so selfSink's bypass semantics
+	// are unchanged; only the marker strip is unconditional.
+	out = route.New(out, dests)
 
 	// The on-demand debug stream (GET /debug/otlp + /debug/otlp/ui): between
 	// the transforms and the router, so it shows payloads exactly as they
@@ -1104,9 +1119,10 @@ func (p *pipelines) startLogs(ctx context.Context) (*tailer.Tailer, error) {
 	p.spawn(func() {
 		tl.Run(ctx)
 	})
-	if *positionsFile == "" {
-		p.log.Warn("no -positions-file: offsets are not persisted (a restart re-reads per -logs-unknown-files; journald starts at the tail)")
-	}
+	// The no-persistence warning is NOT here: it also describes journald, which
+	// runs with -logs=false, so behind this function's toggle it could never
+	// reach the deployment it was written for. It is a configWarnings entry now
+	// (config.go), which -check-config reports too.
 	p.log.Info("log tailer started", "dir", *logDir, "positions", *positionsFile)
 	return tl, nil
 }

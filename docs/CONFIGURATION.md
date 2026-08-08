@@ -1997,15 +1997,19 @@ full annotated list.
 
 `agent.logsExcludeNamespaces` is **null by default, and null is not empty**.
 Left unset, the chart excludes this release's own namespace *plus*, when
-`agent.otlp.endpoint` names an in-cluster Service, that Service's namespace
-(the second dot-separated label of its host, e.g. `monitoring` for the default
-`otel-collector.monitoring:4317`). Tailing either is a feedback loop that
-amplifies exactly when the collector is already struggling, and the two are not
-the same namespace whenever the default endpoint is kept in a release installed
-somewhere else. In-cluster means `service.namespace` or anything under `.svc` —
-that is what makes the second label a namespace; an external endpoint
-(`otel.grafana.net:443`) adds nothing, since reading its second label as a
-namespace silently stopped tailing any workload that happened to run in a
+`agent.otlp.endpoint` names an in-cluster Service, that Service's namespace —
+the dot-separated label immediately *before* `svc`, falling back to the second
+label for a bare `<svc>.<ns>` (e.g. `monitoring` for the default
+`otel-collector.monitoring:4317`). The two rules coincide for
+`<svc>.<ns>.svc…` and diverge for a StatefulSet's per-pod address:
+`otel-collector-0.otel-collector.observability.svc.cluster.local` excludes
+`observability`, not the service name `otel-collector`. Tailing either is a
+feedback loop that amplifies exactly when the collector is already struggling,
+and the two are not the same namespace whenever the default endpoint is kept in
+a release installed somewhere else. In-cluster means `service.namespace` or
+anything under `.svc` — that is what makes the label a namespace; an external
+endpoint (`otel.grafana.net:443`) adds nothing, since reading its second label
+as a namespace silently stopped tailing any workload that happened to run in a
 namespace of that name. Set the value to a list to name the namespaces
 yourself, or to an explicit `[]` to exclude nothing — which is the one thing
 the old `[]` default could not express, since it was indistinguishable from
@@ -2043,9 +2047,15 @@ receiver. `serviceGraph.port` (default 4319) is that receiver.
 `serviceGraph.ingest.*` covers the application-facing side:
 `grpcEndpoint`/`httpEndpoint` (the ports on the ClusterIP Service),
 `peerIpFallback`, and `allowFrom` — NetworkPolicy `from` selectors for the trace
-ports. **Empty `allowFrom` means any pod in the cluster may push traces, with no
-credential.** Setting it scopes the whole policy rule (health, metrics and the
-internal port included), so include whatever the kubelet's probes come from.
+ports, and for those **only**. **Empty `allowFrom` means any pod in the cluster
+may push traces, with no credential.** The policy is three rules, so setting
+this leaves the other two alone: health/readiness and the metrics port stay
+reachable (the kubelet's probes come from the node, Prometheus from wherever it
+runs) and the internal shard port stays open to this tier's own pods, which the
+ring needs — scoping it along with the trace ports broke the ring at this
+chart's own default `replicas: 2`. Health and metrics being unscoped also means
+the tier's `-listen` port (which serves `/debug/otlp`) is reachable cluster-wide
+unless you add a policy of your own.
 
 `serviceGraph.spanMetrics` turns on the RED metrics derived from the spans this
 tier receives; tuning is `agent.config.traceMetrics`, and edge-pairing tuning is

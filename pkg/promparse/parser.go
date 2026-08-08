@@ -434,13 +434,23 @@ func (p *Parser) readLine(br *bufio.Reader) (line []byte, tooLong bool, err erro
 		// SAMPLE that does not exist in the exposition, with malformed=0 and
 		// no error. The flag has to survive the whole physical line.
 		if !tooLong && len(p.scratch) == 0 && rerr == nil {
-			if len(chunk) > p.maxLineBytes {
-				return nil, true, nil
+			// The bound is on the LINE — what this function returns, terminator
+			// excluded. Measuring the ReadSlice chunk instead charged the '\n',
+			// so a line of exactly MaxLineBytes was dropped as malformed when it
+			// was terminated and parsed when it happened to be the final
+			// unterminated line: the same bytes, two verdicts, and the sample
+			// lost in one of them.
+			if line := trimEOL(chunk); len(line) <= p.maxLineBytes {
+				// Whole line inside the buffer: no copy needed.
+				return line, false, nil
 			}
-			// Whole line inside the buffer: no copy needed.
-			return trimEOL(chunk), false, nil
+			return nil, true, nil
 		}
-		if len(p.scratch)+len(chunk) <= p.maxLineBytes {
+		n := len(chunk)
+		if rerr == nil {
+			n = len(trimEOL(chunk)) // the terminating chunk: see above
+		}
+		if len(p.scratch)+n <= p.maxLineBytes {
 			p.scratch = append(p.scratch, chunk...)
 		} else {
 			tooLong = true
@@ -759,7 +769,17 @@ func (p *Parser) parseSample(line []byte) (Sample, bool) {
 		}
 	}
 	s.Labels = p.labels
-	return s, p.finishSample(&s, rest)
+	// Sequenced deliberately: finishSample MUTATES s (value, timestamp,
+	// exemplar), and `return s, p.finishSample(&s, rest)` leaves it to the
+	// compiler whether the returned copy of s is taken before or after that
+	// call. The Go spec orders function CALLS within a return statement but
+	// explicitly leaves the order of the other operands unspecified (the
+	// `[]int{a, f()}` case), so the one-line form is only correct by luck of
+	// gc's current evaluation order — and the failure it permits is silent:
+	// every sample would ship with a zero Value/Timestamp/Exemplar, with
+	// malformed=0 and no error, on the hot path of every scrape.
+	ok := p.finishSample(&s, rest)
+	return s, ok
 }
 
 // parseQuotedNameSample parses the Prometheus 3 quoted-name sample form,
@@ -798,7 +818,10 @@ func (p *Parser) parseQuotedNameSample(line []byte) (Sample, bool) {
 		return s, false
 	}
 	s.Labels = p.labels
-	return s, p.finishSample(&s, rem)
+	// Sequenced for the reason parseSample's identical tail spells out: the
+	// call mutates s, and its order against the returned copy is unspecified.
+	ok = p.finishSample(&s, rem)
+	return s, ok
 }
 
 // finishSample parses the value, optional timestamp and optional exemplar

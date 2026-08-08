@@ -10,6 +10,8 @@ import (
 	"testing"
 	"unicode/utf8"
 	"unsafe"
+
+	"github.com/JohanLindvall/kubescrape/internal/testrace"
 )
 
 // benchBody defeats dead-code elimination of sanitize's result.
@@ -89,6 +91,9 @@ func TestOverCapMessageIsValidatedOnlyUpToTheCap(t *testing.T) {
 // allocation-free and hand back the message itself. A fix that cloned or
 // rebuilt unconditionally would pay for every entry on the node.
 func TestValidMessageUnderTheCapIsFree(t *testing.T) {
+	if testrace.Enabled {
+		t.Skip("-race perturbs allocation counts")
+	}
 	r := sanitizer(1 << 20)
 	msg := strings.Repeat("kubelet: pod sandbox ready\n", 64)
 	if n := testing.AllocsPerRun(200, func() {

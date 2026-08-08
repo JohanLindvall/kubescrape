@@ -2,8 +2,11 @@ package logscrub
 
 import (
 	"os"
+	"sort"
 	"strings"
 	"testing"
+
+	"github.com/JohanLindvall/kubescrape/internal/testrace"
 )
 
 func mustNew(t *testing.T, cfg Config) *Scrubber {
@@ -32,6 +35,9 @@ func TestDefaultsRedact(t *testing.T) {
 }
 
 func TestNoMatchReturnsSameString(t *testing.T) {
+	if testrace.Enabled {
+		t.Skip("-race perturbs allocation counts")
+	}
 	s := mustNew(t, Config{Builtin: []string{"defaults"}})
 	in := "a perfectly innocuous log line with nothing sensitive"
 	if got := s.Scrub(in); got != in {
@@ -407,11 +413,24 @@ func TestUserRulePrefilterMatchesUngated(t *testing.T) {
 	}
 }
 
+// maxEnumWindow bounds how far apart the default names may sit and still read
+// as ONE enumeration. The widest today is CONFIGURATION.md's, whose secret-kv
+// entry carries a parenthetical gloss (~350 bytes); 600 leaves room for prose
+// without letting a mention on the other side of the file stand in for a list
+// entry.
+const maxEnumWindow = 600
+
 // defaultSet is a security control, and its documentation is part of it: an
 // operator who spells the list out instead of writing `defaults` gets exactly
 // what the docs told them the default was. url-userinfo was added to the set
 // and to none of the three places that enumerate it, so following the docs
 // silently disabled DSN-password redaction. Nothing pinned that; this does.
+//
+// It pins the ENUMERATION, not the bare name. A Contains check was vacuous for
+// the member most likely to be dropped as a duplicate: `bearer` occurs ten-plus
+// times in each of these files for unrelated OTLP- and scrape-auth-token
+// reasons, so deleting it from all three lists left the guard green. Requiring
+// every name inside ONE small window is what makes a deletion visible.
 func TestDefaultSetIsDocumented(t *testing.T) {
 	docs := []string{
 		"../../../README.md",
@@ -422,15 +441,126 @@ func TestDefaultSetIsDocumented(t *testing.T) {
 		if _, ok := builtins[name]; !ok {
 			t.Errorf("defaultSet names %q, which is not a built-in pattern", name)
 		}
-		for _, d := range docs {
-			b, err := os.ReadFile(d)
-			if err != nil {
-				t.Fatalf("reading %s: %v", d, err)
-			}
-			if !strings.Contains(string(b), name) {
+	}
+	for _, d := range docs {
+		b, err := os.ReadFile(d)
+		if err != nil {
+			t.Fatalf("reading %s: %v", d, err)
+		}
+		doc := string(b)
+		for _, name := range defaultSet {
+			if !strings.Contains(doc, name) {
 				t.Errorf("%s does not mention the default pattern %q; an operator pinning the "+
 					"documented list would silently lose it", d, name)
 			}
 		}
+		if w := minEnumWindow(doc, defaultSet); w < 0 || w > maxEnumWindow {
+			t.Errorf("%s does not enumerate the default set in one place (smallest window holding "+
+				"all of %v is %d bytes, want <= %d); an operator pinning the documented list would "+
+				"silently lose whatever was dropped from it", d, defaultSet, w, maxEnumWindow)
+		}
 	}
+
+	// The FOURTH enumeration is in this package: Config.Builtin's doc comment,
+	// whose own text claims this test pins it. Only the comment block is
+	// scanned — over the whole file defaultSet's own literal would satisfy any
+	// check trivially.
+	src, err := os.ReadFile("logscrub.go")
+	if err != nil {
+		t.Fatalf("reading logscrub.go: %v", err)
+	}
+	block := docCommentBefore(string(src), "Builtin []string")
+	if block == "" {
+		t.Fatal("no doc comment found above Config.Builtin")
+	}
+	for _, name := range defaultSet {
+		if !strings.Contains(block, name) {
+			t.Errorf("Config.Builtin's doc comment omits the default pattern %q", name)
+		}
+	}
+}
+
+// The guard above is only worth having if it DISCRIMINATES: this is the exact
+// regression it exists for — the enumeration with `bearer` deleted, beside the
+// unrelated `-otlp-bearer-token-file` prose that kept a bare Contains check
+// green while DSN-token redaction quietly left the documented default set.
+func TestEnumWindowCatchesADroppedName(t *testing.T) {
+	list := "`basic-auth`, `secret-kv`, `aws-key`, `private-key`, `url-userinfo`"
+	filler := strings.Repeat("unrelated prose. ", 100) // well past maxEnumWindow
+	dropped := "`-otlp-bearer-token-file` names the file holding the export token." +
+		filler + "builtin `defaults` expands to " + list + "." + filler +
+		"the scrape-auth bearer token is re-read every minute."
+
+	if !strings.Contains(dropped, "bearer") {
+		t.Fatal("fixture must still mention bearer elsewhere, or it proves nothing")
+	}
+	if w := minEnumWindow(dropped, defaultSet); w >= 0 && w <= maxEnumWindow {
+		t.Errorf("a list with `bearer` deleted still read as an enumeration (window %d bytes)", w)
+	}
+
+	// Positive control: put it back and the same text is one enumeration.
+	intact := strings.Replace(dropped, "expands to `basic-auth`", "expands to `bearer`, `basic-auth`", 1)
+	if w := minEnumWindow(intact, defaultSet); w < 0 || w > maxEnumWindow {
+		t.Errorf("the intact list did not read as an enumeration (window %d bytes)", w)
+	}
+}
+
+// minEnumWindow returns the length of the smallest byte window of doc holding
+// every name, or -1 when one of them is absent.
+func minEnumWindow(doc string, names []string) int {
+	type occ struct{ at, end, name int }
+	var occs []occ
+	for i, n := range names {
+		for from := 0; from < len(doc); {
+			j := strings.Index(doc[from:], n)
+			if j < 0 {
+				break
+			}
+			at := from + j
+			occs = append(occs, occ{at: at, end: at + len(n), name: i})
+			from = at + 1
+		}
+	}
+	sort.Slice(occs, func(i, j int) bool { return occs[i].at < occs[j].at })
+	seen := make([]int, len(names))
+	distinct, best, lo := 0, -1, 0
+	for hi := range occs {
+		if seen[occs[hi].name] == 0 {
+			distinct++
+		}
+		seen[occs[hi].name]++
+		for distinct == len(names) {
+			end := 0
+			for _, o := range occs[lo : hi+1] {
+				if o.end > end {
+					end = o.end
+				}
+			}
+			if w := end - occs[lo].at; best < 0 || w < best {
+				best = w
+			}
+			seen[occs[lo].name]--
+			if seen[occs[lo].name] == 0 {
+				distinct--
+			}
+			lo++
+		}
+	}
+	return best
+}
+
+// docCommentBefore returns the contiguous //-comment block immediately above
+// the line containing decl.
+func docCommentBefore(src, decl string) string {
+	i := strings.Index(src, decl)
+	if i < 0 {
+		return ""
+	}
+	lines := strings.Split(src[:i], "\n")
+	end := len(lines) - 1 // the (partial) line carrying decl
+	start := end
+	for start > 0 && strings.HasPrefix(strings.TrimSpace(lines[start-1]), "//") {
+		start--
+	}
+	return strings.Join(lines[start:end], "\n")
 }

@@ -183,8 +183,20 @@ func stampAuth(t *kubemeta.ScrapeTarget, a authMaterial) {
 // caller's encounter order keeps the list (and with it the response body and
 // its ETag) deterministic. A monitor contributing through two endpoints is
 // listed once.
+//
+// The HOLDER contributing through a second of its OWN endpoints is not a
+// second monitor: the caller walks every endpoint of one monitor against one
+// pod, so two endpoints of one CR resolving to one URL (the same port spelled
+// twice, or one carrying an interval the other lacks) reach the merge with
+// monitor == t.Monitor. Seeding the list there shipped `"monitors":["ns/x"]`
+// on a target only ONE monitor describes — which the model documents as absent
+// in that case, and which a consumer reads as "more than one monitor resolved
+// to this URL".
 func addContributor(t *kubemeta.ScrapeTarget, monitor string) {
 	if len(t.Monitors) == 0 {
+		if monitor == t.Monitor {
+			return
+		}
 		t.Monitors = append(t.Monitors, t.Monitor)
 	}
 	if !slices.Contains(t.Monitors, monitor) {

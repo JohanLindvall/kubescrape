@@ -190,14 +190,71 @@ func TestMergeConflictStillMergesTheRest(t *testing.T) {
 
 // The merge must not write into the indexed monitor's own rule slice:
 // stampEndpoint copies, and appending must stay on the copy.
+//
+// The fixture has SPARE CAPACITY and the assertions look past len, because the
+// obvious shape of this test cannot fail: a one-element slice literal has
+// cap == len, so the merge's append always reallocates and an aliasing
+// stampEndpoint leaves the endpoint's array untouched — the test passed on the
+// broken implementation it was written to catch. The pointer check is the
+// direct one (aliasing is a shared backing array, nothing else); the
+// through-write check is what an index-1 write into a shared array looks like.
 func TestMergeDoesNotAliasTheEndpointsRules(t *testing.T) {
-	epA := servicemonitors.Endpoint{MetricRelabelings: []kubemeta.RelabelRule{dropRule}}
+	rules := append(make([]kubemeta.RelabelRule, 0, 4), dropRule)
+	epA := servicemonitors.Endpoint{MetricRelabelings: rules}
 	held := mergeHeld("ns/a", epA)
+	if len(held.MetricRelabelings) == 0 {
+		t.Fatal("stampEndpoint dropped the endpoint's rules")
+	}
+	if &held.MetricRelabelings[0] == &epA.MetricRelabelings[0] {
+		t.Fatal("stampEndpoint aliased the indexed endpoint's rule slice instead of copying it")
+	}
 	_, _ = MergeMonitorEndpoint(&held, "ns/b", &servicemonitors.Endpoint{
 		MetricRelabelings: []kubemeta.RelabelRule{keepRule},
 	})
 	if len(epA.MetricRelabelings) != 1 || epA.MetricRelabelings[0].Regex != dropRule.Regex {
 		t.Errorf("the indexed endpoint's rules were mutated: %+v", epA.MetricRelabelings)
+	}
+	if full := rules[:cap(rules)]; full[1].Action != "" || full[1].Regex != "" {
+		t.Errorf("the merge wrote into the indexed endpoint's backing array: %+v", full[1])
+	}
+}
+
+// A monitor contributing through a SECOND of its own endpoints is still one
+// monitor: the `monitors` list is documented as absent whenever Monitor alone
+// describes the target, so a consumer reading a non-empty list as "more than
+// one monitor resolved to this URL" reads it wrong. The server walks every
+// endpoint of one CR against one pod, so two endpoints colliding on one URL —
+// here the second carrying an interval the first lacks — reach the merge with
+// monitor == t.Monitor.
+func TestMergeSameMonitorSecondEndpointIsNotAContributor(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		ep   servicemonitors.Endpoint
+	}{
+		{"cadence", servicemonitors.Endpoint{Interval: "15s"}},
+		{"relabelings", servicemonitors.Endpoint{MetricRelabelings: []kubemeta.RelabelRule{keepRule}}},
+		{"auth", servicemonitors.Endpoint{BearerSecret: "ns/tok/token"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			held := mergeHeld("ns/pm", servicemonitors.Endpoint{
+				MetricRelabelings: []kubemeta.RelabelRule{dropRule},
+			})
+			_, _ = MergeMonitorEndpoint(&held, "ns/pm", &tc.ep)
+			if held.Monitors != nil {
+				t.Errorf("a single monitor's second endpoint produced monitors = %v, want absent", held.Monitors)
+			}
+		})
+	}
+
+	// A genuinely second monitor arriving AFTER the holder's own extra endpoint
+	// still lists both — the holder first.
+	held := mergeHeld("ns/pm", servicemonitors.Endpoint{})
+	_, _ = MergeMonitorEndpoint(&held, "ns/pm", &servicemonitors.Endpoint{Interval: "15s"})
+	_, _ = MergeMonitorEndpoint(&held, "ns/other", &servicemonitors.Endpoint{
+		MetricRelabelings: []kubemeta.RelabelRule{keepRule},
+	})
+	if want := []string{"ns/pm", "ns/other"}; !slices.Equal(held.Monitors, want) {
+		t.Errorf("monitors = %v, want %v", held.Monitors, want)
 	}
 }
 

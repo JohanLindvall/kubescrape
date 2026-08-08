@@ -4,6 +4,8 @@ import (
 	"testing"
 
 	"go.opentelemetry.io/collector/pdata/ptrace"
+
+	"github.com/JohanLindvall/kubescrape/internal/testrace"
 )
 
 // Decide sits on the assembly layer's decision path — once per trace, on
@@ -175,6 +177,9 @@ func BenchmarkDecideManySpans(b *testing.B) {
 // to keep it at zero. A slice, a map, a fmt call or a closure per trace would
 // each cost one allocation and nothing else would notice.
 func TestDecideAllocationBudget(t *testing.T) {
+	if testrace.Enabled {
+		t.Skip("-race perturbs allocation counts")
+	}
 	excl := pol("exclude-healthz", TypeStringAttribute)
 	excl.StringAttribute = &StringAttributeConfig{Key: "http.route", Values: []string{"/healthz"}, InvertMatch: true}
 	errs := pol("errors", TypeStatusCode)

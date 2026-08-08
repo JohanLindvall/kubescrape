@@ -26,7 +26,17 @@ func tailOnly() *tailbuffer.Config {
 	}}}
 }
 
-func warnText(cfg agentConfig) string { return strings.Join(configWarnings(cfg), "\n") }
+// warnText joins the warnings for cfg with the process in the shipped
+// manifests' shape for the FLAGS these tests do not exercise: every manifest
+// renders -positions-file, and its own warning (persistence off) would
+// otherwise land in every "this composition must be silent" assertion here.
+// The positions warning has its own test — TestPositionsWarningCoversJournald.
+func warnText(cfg agentConfig) string {
+	old := *positionsFile
+	*positionsFile = "/var/lib/kubescrape/positions.json"
+	defer func() { *positionsFile = old }()
+	return strings.Join(configWarnings(cfg), "\n")
+}
 
 // The footgun: the head sampler's guard rails are decided PER SPAN, so below a
 // whole-trace tail sampler they hand it fragments. keepErrors defaults to on, so

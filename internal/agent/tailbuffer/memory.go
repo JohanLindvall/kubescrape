@@ -34,6 +34,15 @@ package tailbuffer
 // lowered, because the operator asked — it warns above the budget share and is
 // REFUSED only when the spans alone would need the whole limit, which is not a
 // judgement call but an OOM by construction.
+//
+// The lowering has ONE floor, maxSpansPerTrace, because a trace that cannot be
+// buffered whole could never be decided normally — and that floor can push a
+// DERIVED ceiling back over the budget share, or at a small enough limit over
+// the whole limit. So the derived value is judged by the same two guards as an
+// explicit one, naming maxSpansPerTrace as the field that binds, since maxSpans
+// then holds a number nobody wrote. The guards used to be later arms of the same
+// switch as the lowering, which made "lowered to fit" the only thing ever said
+// about a ceiling that did not fit.
 
 import (
 	"bufio"
@@ -142,31 +151,48 @@ func applyMemoryBudget(s *settings, explicit bool, limit int64, source string, l
 		return nil
 	}
 	affordable := int64(float64(limit)*bufferBudgetShare) / spanCostBytes
-	switch {
-	case !explicit && affordable < int64(s.maxSpans):
+	// binding names the field an operator has to change when the ceiling turns
+	// out not to fit — maxSpans, unless the derivation below floors it on
+	// maxSpansPerTrace, in which case maxSpans holds a number nobody wrote and
+	// lowering it would change nothing.
+	binding := "tailSampling.maxSpans"
+	// The DERIVATION first, then the guards on whatever ceiling came out of it.
+	// They were arms of ONE switch, so the lowering was mutually exclusive with
+	// them: the maxSpansPerTrace floor could raise a derived ceiling back over
+	// the budget share (and at a small enough limit over the whole limit) and the
+	// only thing said about it was that it had been lowered "to fit".
+	if !explicit && affordable < int64(s.maxSpans) {
 		// A default that does not fit. Lower it: an early decision is a graceful
 		// degradation, an OOM loses every buffered span at once.
 		n := int(affordable)
+		msg := "lowering the tail-sampling maxSpans default to fit this workload's memory limit"
 		if n < s.maxSpansPerTrace {
 			// The bound Validate/New enforce must survive the derivation, or a
-			// single trace could never be buffered whole.
+			// single trace could never be buffered whole. The floor wins — and
+			// then says so, rather than claiming a fit it does not have.
 			n = s.maxSpansPerTrace
+			msg = "lowering the tail-sampling maxSpans default as far as maxSpansPerTrace allows, which is still above what this workload's memory limit affords"
+			binding = "tailSampling.maxSpansPerTrace"
 		}
-		log.Warn("lowering the tail-sampling maxSpans default to fit this workload's memory limit",
-			"maxSpans", n, "default", s.maxSpans, "limitBytes", limit, "limitSource", source,
+		log.Warn(msg,
+			"maxSpans", n, "default", s.maxSpans, "affordableMaxSpans", affordable,
+			"limitBytes", limit, "limitSource", source,
 			"bytesPerSpan", spanCostBytes, "budgetShare", bufferBudgetShare,
 			"note", "set tailSampling.maxSpans explicitly to override, raise the memory limit, or add shards (the ring divides the span rate)")
 		s.maxSpans = n
+		est = int64(n) * spanCostBytes
+	}
+	switch {
 	case est >= limit:
 		// Not a judgement call: the spans alone need the whole limit, so this
 		// config reaches its own ceiling only by being OOM-killed first — and an
 		// OOM loses every buffered span, which is the failure this layer's
 		// bounds exist to trade AGAINST.
-		return fmt.Errorf("tailSampling.maxSpans %d needs about %d bytes of spans (at ~%d B each), which is at or above this workload's memory limit of %d bytes (%s): it would be OOM-killed before the bound ever bound, losing every buffered span. Lower maxSpans to at most %d, raise the memory limit, or add shards",
-			s.maxSpans, est, spanCostBytes, limit, source, affordable)
+		return fmt.Errorf("%s %d needs about %d bytes of spans (at ~%d B each), which is at or above this workload's memory limit of %d bytes (%s): it would be OOM-killed before the bound ever bound, losing every buffered span. Lower %s to at most %d, raise the memory limit, or add shards",
+			binding, s.maxSpans, est, spanCostBytes, limit, source, binding, affordable)
 	case int64(s.maxSpans) > affordable:
 		log.Warn("tailSampling.maxSpans is above this workload's memory budget; a hard kill here is an OOM and loses every buffered span",
-			"maxSpans", s.maxSpans, "estimatedBytes", est, "affordableMaxSpans", affordable,
+			"maxSpans", s.maxSpans, "estimatedBytes", est, "affordableMaxSpans", affordable, "binding", binding,
 			"limitBytes", limit, "limitSource", source, "bytesPerSpan", spanCostBytes, "budgetShare", bufferBudgetShare)
 	default:
 		log.Info("tail-sampling buffer sized",

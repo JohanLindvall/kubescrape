@@ -188,8 +188,8 @@ func WithPermanentClassifier(f func(error) bool) Option {
 // export. A collector outage is exactly when this fills, and holding a growing
 // pile of dead windows would turn a delivery problem into an OOM — which is the
 // failure the retention exists to avoid, arrived at from the other side. Past
-// the cap the OLDEST retained resources are dropped and counted, so the loss is
-// visible rather than silent.
+// the cap the STALEST retained resources are dropped and counted (see
+// stalestRetained), so the loss is visible rather than silent.
 const maxRetainedResources = 4096
 
 // maxRetainedSamples bounds the retained SAMPLES across all resources. The
@@ -230,14 +230,56 @@ func (s *DynamicMetricSet) retain(byResource map[string][]seriesSamples, chunk [
 		}
 	}
 	for len(s.retryOrder) > maxRetainedResources || (s.retainedSamples > maxRetainedSamples && len(s.retryOrder) > 0) {
-		oldest := s.retryOrder[0]
-		s.retryOrder = s.retryOrder[1:]
-		for _, e := range s.retryBy[oldest] {
+		i := s.stalestRetained()
+		victim := s.retryOrder[i]
+		s.retryOrder = append(s.retryOrder[:i], s.retryOrder[i+1:]...)
+		for _, e := range s.retryBy[victim] {
 			s.retainedSamples -= len(e.samples)
 		}
-		delete(s.retryBy, oldest)
+		delete(s.retryBy, victim)
 		s.drops.addRetained(1)
 	}
+}
+
+// stalestRetained picks the eviction victim: the retained resource whose most
+// recent generation is oldest — the one that has gone quietest — with the
+// resource string breaking ties so the choice is deterministic.
+//
+// SLICE POSITION IS NOT AGE, which is what this replaced. mergeRetry nils
+// retryBy/retryOrder on every Export, so nothing about the previous order
+// survives, and retain then rebuilds retryOrder in chunk order — which is
+// groupByResource's map-ranged FRESH resources first and mergeRetry's
+// retained-only ones appended LAST. Popping index 0 therefore destroyed, every
+// interval, a resource that was still producing (picked at random among them)
+// while the piles of resources that had gone quiet survived at the tail: the
+// exact inverse of the intent, and unrecoverable for the samples the store no
+// longer holds — snapshot() seals an aggregating gauge's window and the
+// expiry-grace branch emits a sample once before deleting it.
+//
+// seriesSamples.ts carries the real age. Generations are appended in export
+// order (mergeRetry prepends the retained ones before the fresh), so the LAST
+// one is a resource's freshest.
+func (s *DynamicMetricSet) stalestRetained() int {
+	victim := 0
+	newest := s.newestRetainedTS(s.retryOrder[0])
+	for i := 1; i < len(s.retryOrder); i++ {
+		ts := s.newestRetainedTS(s.retryOrder[i])
+		if ts.Before(newest) || (ts.Equal(newest) && s.retryOrder[i] < s.retryOrder[victim]) {
+			victim, newest = i, ts
+		}
+	}
+	return victim
+}
+
+// newestRetainedTS is the snapshot time of a resource's freshest retained
+// generation. A resource with none (retain never records an empty group) reads
+// as infinitely stale, so it is evicted first rather than being kept forever.
+func (s *DynamicMetricSet) newestRetainedTS(res string) time.Time {
+	gens := s.retryBy[res]
+	if len(gens) == 0 {
+		return time.Time{}
+	}
+	return gens[len(gens)-1].ts
 }
 
 // mergeRetry folds previously undelivered samples into this export's grouping

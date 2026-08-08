@@ -19,6 +19,8 @@ import (
 
 	"github.com/JohanLindvall/kubescrape/internal/agent/cumagg"
 	"github.com/JohanLindvall/kubescrape/internal/obs"
+
+	"github.com/JohanLindvall/kubescrape/internal/testrace"
 )
 
 // capExporter captures exported payloads (mutexed: the Run test reads it from
@@ -693,6 +695,9 @@ func BenchmarkRecord(b *testing.B) {
 // closure, a fmt call or a sort.Strings in this function would silently cost an
 // allocation per request.
 func TestRecordIsAllocationFree(t *testing.T) {
+	if testrace.Enabled {
+		t.Skip("-race perturbs allocation counts")
+	}
 	r := NewRegistry(Config{})
 	e := edge("frontend", "checkout")
 	e.Dimensions = []EdgeDimension{{"client_http.method", "GET"}, {"server_db.system", "postgresql"}}

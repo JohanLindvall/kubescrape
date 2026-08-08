@@ -12,6 +12,32 @@ agent:
   # rendering verbatim into the flag.
   logsIdleClose: "30s"
   logsExcludeNamespaces: [kube-system, monitoring]
+  # FRACTIONAL, deliberately: both -logs-rate-* are flag.Float64 and a rate
+  # below one line/second is a supported throttle, but values.schema.json typed
+  # them integer-only, so helm refused the value before rendering anything.
+  logsRateLimit: 0.5
+  logsRateBurst: 1.5
+  # NON-EMPTY scheduling maps, deliberately: the schema declared these as an
+  # object with empty `properties` and additionalProperties:false, which rejects
+  # EVERY key — the four values the templates render verbatim were unusable and
+  # no fixture rendered one. These are what fails if the schema re-tightens.
+  nodeSelector:
+    kubernetes.io/os: linux
+  affinity:
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+          - matchExpressions:
+              - key: kubernetes.io/arch
+                operator: In
+                values: [amd64, arm64]
+  # Agent-WIDE log-metrics knobs: they must reach the events/Azure singleton
+  # too, which runs the same logMetrics set over the same mounted config — the
+  # prefix rendering on the DaemonSet alone split one rule into two names.
+  logsMetrics:
+    interval: 10s
+    maxBytes: "1048576"
+    namePrefix: acme_
   staticAttrs:
     k8s.cluster.name: golden-test
   journald:
@@ -42,8 +68,12 @@ serviceGraph:
   enabled: true
   replicas: 2
   spanMetrics: true
+  nodeSelector:
+    kubernetes.io/os: linux
 events:
   enabled: true
+  nodeSelector:
+    kubernetes.io/os: linux
 azure:
   enabled: true
   eventhub:

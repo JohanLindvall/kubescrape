@@ -64,9 +64,11 @@ func TestAudit_MaxLineBytesBoundary(t *testing.T) {
 	}
 }
 
-// TestAudit_MaxLineBytesOffByOne pins the actual boundary: the check counts the
-// trailing newline, so the effective content limit is MaxLineBytes-1 — and the
-// SAME line is accepted when it is the last line with no trailing newline.
+// TestAudit_MaxLineBytesOffByOne pins the actual boundary: MaxLineBytes bounds
+// the LINE, terminator excluded, so a line of exactly MaxLineBytes bytes parses
+// — and parses the same way whether or not it is terminated. The check used to
+// measure the ReadSlice chunk, which carries the '\n', so the two disagreed;
+// this test SAW that and only logged it, so it could never fail. It asserts now.
 func TestAudit_MaxLineBytesOffByOne(t *testing.T) {
 	const limit = 16
 	line := "m" + strings.Repeat("x", limit-3) + " 1" // exactly 'limit' bytes
@@ -82,9 +84,13 @@ func TestAudit_MaxLineBytesOffByOne(t *testing.T) {
 
 	t.Logf("line of exactly MaxLineBytes(%d) bytes: with newline -> %d samples (malformed=%d); "+
 		"without trailing newline -> %d samples (malformed=%d)", limit, len(withNL), m1, len(noNL), m2)
-	if len(withNL) != len(noNL) {
-		t.Logf("INCONSISTENT: MaxLineBytes counts the newline in the ReadSlice chunk, so a line of exactly " +
-			"MaxLineBytes bytes is dropped when terminated and kept when it is the final unterminated line")
+	if len(withNL) != len(noNL) || m1 != m2 {
+		t.Errorf("INCONSISTENT: the same %d-byte line yields %d samples (malformed=%d) terminated and %d (malformed=%d) "+
+			"unterminated — whether a line fits must not depend on the body's last byte", limit, len(withNL), m1, len(noNL), m2)
+	}
+	if len(withNL) != 1 || m1 != 0 {
+		t.Errorf("a line of exactly MaxLineBytes(%d) bytes yielded %d samples (malformed=%d), want 1 (malformed=0): "+
+			"the bound excludes the terminator", limit, len(withNL), m1)
 	}
 }
 

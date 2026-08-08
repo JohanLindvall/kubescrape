@@ -316,8 +316,15 @@ func (t *Tailer) consume(ctx context.Context, f *file, unlimited bool) {
 				// is part of the same oversized line: without this flag it
 				// would be fed as a "line" of its own — an arbitrary mid-line
 				// suffix, exported as a garbage record.
+				//
+				// Which is also why the counter is bumped only on the FIRST
+				// slab: consume runs per 64 KiB read chunk, so counting each
+				// over-cap flush reported one 10 MiB line as ~10 dropped LINES,
+				// which is what the metric says it counts.
+				if !f.discarding {
+					obs.LogOversizedDropped.Inc()
+				}
 				f.discarding = true
-				obs.LogOversizedDropped.Inc()
 			}
 			return
 		}

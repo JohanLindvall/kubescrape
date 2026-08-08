@@ -263,6 +263,9 @@ func BenchmarkConvertScrape(b *testing.B) {
 // a map keyed by a struct built per call, would put an allocation back on every
 // sample and only a benchmark would notice.
 func TestFilterSessionAllocationBudget(t *testing.T) {
+	if testrace.Enabled {
+		t.Skip("-race perturbs allocation counts")
+	}
 	filter, err := newMetricFilter([]FilterRule{
 		{Action: "keep", Metrics: "http_request_duration_seconds_bucket", Labels: map[string]string{"handler": "/api"}},
 		{Action: "drop", Metrics: "(go_|promhttp_|process_start_).+"},

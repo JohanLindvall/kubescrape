@@ -95,10 +95,18 @@ const (
 )
 
 // resourceBytes estimates the encoded size of one ResourceMetrics' non-point
-// content: the resource attributes plus the framing of the resource, its scope
-// and the scope name.
+// content: the resource attributes plus the framing of the resource, its scope,
+// the scope name and the scope VERSION.
+//
+// The version is charged for the same reason the name is: every creation site
+// stamps obs.ScopeVersion, which is a 40-char VCS revision in a shipped build,
+// and the split and cadvisor batchers create one ScopeMetrics per DESCRIBED
+// OBJECT — thousands per scrape on a KSM target, i.e. hundreds of kilobytes
+// encoded and counted nowhere. A `go test` binary carries no VCS stamp, so the
+// chunk-size guard tests see the 7-char fallback and cannot notice the
+// omission; the shipped estimate was the one running short.
 func resourceBytes(res pcommon.Resource, scopeName string) int {
-	n := resOverheadBytes + len(scopeName)
+	n := resOverheadBytes + len(scopeName) + len(obs.ScopeVersion) + metaFieldBytes
 	res.Attributes().Range(func(k string, v pcommon.Value) bool {
 		n += len(k) + len(v.AsString()) + attrOverheadBytes
 		return true

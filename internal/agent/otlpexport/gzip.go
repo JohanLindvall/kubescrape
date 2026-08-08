@@ -140,10 +140,15 @@ func gzipWriterPool(level int) *sync.Pool {
 
 // gzipBody compresses an OTLP/HTTP request body into a pooled buffer at the
 // CALLER's level — the HTTP path has no process-global registry to work
-// around, so a per-destination level actually takes effect here. The buffer
-// returns to its pool on Close, so it can be handed to the HTTP transport as
-// the request body (the transport always closes the body, even on errors); a
-// caller that never reaches the transport must Release it.
+// around, so a per-destination level actually takes effect here.
+//
+// The returned buffer must NOT be handed to net/http as the request body:
+// bufpool's Close IS Release, net/http closes a request body twice on a
+// redirect, and the second close lands while the transport may still be
+// reading — a package-level pool hand-off under an in-flight read. Wrap it in
+// a pooledBody (see its doc), whose Close is a no-op and whose release() pools
+// the buffer only once it has been read to EOF. A caller that never reaches
+// the transport releases it itself.
 func gzipBody(body []byte, level int) (*bufpool.Buffer, error) {
 	buf := httpGzipBufs.Get()
 	pool := gzipWriterPool(level)

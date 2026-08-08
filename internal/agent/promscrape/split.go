@@ -52,7 +52,9 @@ import (
 // container.id when mapped, else by k8s.namespace.name + k8s.pod.name,
 // cross-checked against a mapped k8s.pod.uid) and carries the full metadata
 // set; otherwise (or when resolution fails) the mapped label values are used
-// as-is.
+// as-is. A mapped container.id the store does not know yet keeps its OWN value:
+// the pod is still resolved for the owner/label enrichment, but its current
+// container is a DIFFERENT incarnation and is never adopted for it.
 type SplitterConfig struct {
 	Match SplitterMatch `json:"match"`
 	Rules []SplitRule   `json:"rules"`
@@ -169,7 +171,17 @@ func NewSplitters(cfgs []SplitterConfig) ([]*Splitter, error) {
 			}
 			sort.Strings(labels)
 			for _, label := range labels {
-				cr.groupBy = append(cr.groupBy, groupMapping{label: label, attr: r.GroupBy[label]})
+				attr := r.GroupBy[label]
+				// An empty attribute name is a silent dimension loss, not a no-op:
+				// putSplitLabels strips a grouped label from every data point keyed on
+				// the LABEL name, so the label leaves the points regardless, and its
+				// value is then written to the resource under the empty KEY — where
+				// nothing can query it. Refused here, beside the sibling regexes, so
+				// -check-config catches the typo instead of a missing dimension doing.
+				if attr == "" {
+					return nil, fmt.Errorf("splitter %d rule %d groupBy %q: empty attribute name", i, j, label)
+				}
+				cr.groupBy = append(cr.groupBy, groupMapping{label: label, attr: attr})
 			}
 			cr.datapointAttr = defaultDatapointAttrs
 			if r.DatapointAttributes != nil {
@@ -486,6 +498,30 @@ func (b *splitBatcher) fillSplitResource(res pcommon.Resource, rule *compiledSpl
 	for k, v := range rule.attributes {
 		if _, ok := res.Attributes().Get(k); !ok {
 			res.Attributes().PutStr(k, v)
+		}
+	}
+	// A rule that ASKED for enrichment and did not get it must still name a
+	// service. service.name is otherwise produced only as a side effect of
+	// attrs.Pod running inside Build, which needs the resolved pod — so a 404, a
+	// same-name pod failing the uid cross-check, or one unreachable metadata
+	// service (negative-cached for a minute) left the resource with no
+	// service.name at all, and the OTLP→Prometheus translation gives it no `job`
+	// label. The SAME series therefore appeared and disappeared as rows resolved
+	// and stopped resolving — unselectable by any job-scoped alert while it was
+	// gone — rather than merely changing a label value. attrs.ServiceName's
+	// documented fallback chain ends at the pod name, which is what the groupBy
+	// already put on the resource; the cadvisor batcher makes exactly this
+	// compensation for exactly this reason. It runs AFTER the rule's own
+	// fallbacks so an explicit `attributes: {service.name: …}` still wins, and
+	// only for enrich rules — a label-only rule never had a resolution to lose,
+	// and minting a job label for it would change series identity for a shape
+	// that never flapped.
+	if rule.enrich && !resolved {
+		a := res.Attributes()
+		if _, ok := a.Get("service.name"); !ok {
+			if v, ok := a.Get("k8s.pod.name"); ok && v.Str() != "" {
+				a.PutStr("service.name", v.Str())
+			}
 		}
 	}
 	// These land AFTER Build, so the operator's enable/disable lists have not

@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/cespare/xxhash/v2"
 	"go.opentelemetry.io/collector/pdata/pcommon"
 
 	"github.com/JohanLindvall/kubescrape/internal/logline"
@@ -491,8 +492,46 @@ func (s *DynamicMetricSet) EmitDirect(name string, value float64, lbls map[strin
 		for _, k := range slices.Sorted(maps.Keys(lbls)) {
 			buf = buf.set(k, lbls[k])
 		}
-		r.series.observe(buf, value, resourceAccum(resource), resource, nil)
+		r.series.observe(buf, value, uniqueResourceAccum(resource), resource, nil)
 		return nil
 	}
 	return fmt.Errorf("emit_metric %q: no logMetrics rule declares this metric", name)
+}
+
+// uniqueResourceAccum folds a resource's attributes the way resourceString
+// RENDERS them — last-wins per key — instead of one term per map ENTRY.
+//
+// resourceAccum sums a term per entry, which is right for every agent-built
+// resource (they come from a Go map and cannot repeat a key) and wrong for one
+// that arrived on the wire: OTLP encodes attributes as a repeated KeyValue and
+// pdata does not dedupe on decode. {k=v, k=v} then hashes DISTINCT from {k=v}
+// while both render {k="v"}, so the two live samples put byte-identical data
+// points in one exported Metric; and {k=p, k=q} hashes IDENTICAL to {k=q, k=p}
+// in both accumulators — a sum cannot tell a multiset from its permutation —
+// so two senders' observations merge under whichever resource string was
+// frozen at admit. Neither moves a counter: the collision check is a
+// projection of the same pairs and agrees.
+//
+// EmitDirect is the door such a resource reaches the store through: a transform
+// script's emit_metric over an ingested METRICS or TRACES payload, which
+// otlpingest's dedupeResourceKeys does not cover (that runs on the log chain
+// only, and before the transform seam). It is a cold per-script-call path that
+// already allocates, so it pays the extra pass; Bind's per-flush hot path,
+// whose resources are all agent-built, is untouched.
+func uniqueResourceAccum(res pcommon.Map) resKey {
+	ls := make(labels, 0, res.Len())
+	res.Range(func(k string, v pcommon.Value) bool {
+		ls = ls.set(k, v.AsString())
+		return true
+	})
+	var rk resKey
+	for _, e := range ls {
+		// set() already truncated the value, which is exactly what
+		// resourceAccum's truncLabelCut reslice achieves: the hashed identity
+		// must be the rendered one.
+		hk, hv := xxhash.Sum64String(e.key), xxhash.Sum64String(e.value)
+		rk.accum += combineResHash(hk, hv)
+		rk.check += combineResCheck(hk, hv)
+	}
+	return rk
 }

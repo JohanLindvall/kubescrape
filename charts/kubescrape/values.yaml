@@ -7,9 +7,14 @@ image:
 # below — see `metrics.enabled`. The former `runtimeMetrics` value configured a
 # flag that no longer exists and made every agent refuse to start.)
 
-# Grace period for the agent and the events/Azure singleton. It has to cover
-# the bounded shutdown sequence: producers stop, the final log-metrics,
-# span-metrics and self-metrics exports run, then the disk buffer drains.
+# Grace period for ALL THREE workloads — the agent DaemonSet, the events/Azure
+# singleton AND the service-graph StatefulSet. It has to cover the bounded
+# shutdown sequence: producers stop, the final log-metrics, span-metrics and
+# self-metrics exports run, then the disk buffer drains. Lowering it to speed up
+# node drains truncates the trace tier too, where the shutdown flush is the only
+# thing that saves the in-memory pairing store and the tail-sampling buffer's
+# undecided spans — those have no sender still holding them and are simply lost
+# to a SIGKILL.
 terminationGracePeriodSeconds: 60
 
 # Prometheus /metrics endpoint on a DEDICATED port, serving this process's Go
@@ -285,9 +290,19 @@ agent:
   #   tailSampling:       decide WHOLE traces on the trace tier after a decision
   #                       window (policies / decisionWait / memory bounds)
   #   serviceGraph:       edge pairing on the trace tier (see serviceGraph below)
+  #   serviceGraphShards: the tier's shard set for a topology this chart does
+  #                       not render (see serviceGraph.replicas below, which
+  #                       wires the chart's own)
   #   routing:            per-namespace fan-out to extra OTLP destinations or
   #                       tenants (endpoint / headers, e.g. X-Scope-OrgID)
-  # See docs/CONFIGURATION.md. Example:
+  #   export:             per-signal OTLP destinations, static headers and an
+  #                       mTLS client cert over the agent.otlp base — the only
+  #                       way to send logs/metrics/traces to DIFFERENT endpoints
+  #                       (collectorless Mimir/Loki/Tempo), which agent.otlp,
+  #                       being one endpoint, cannot express
+  # This list is a hand-kept copy; the authoritative one is sectionNames() in
+  # cmd/kubescrape-agent/config.go (`-check-config` prints it). See
+  # docs/CONFIGURATION.md. Example:
   #   config:
   #     logs:
   #       sources:

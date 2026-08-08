@@ -25,20 +25,29 @@ RUN CGO_ENABLED=0 go build -trimpath -tags "$TAGS" -ldflags="-s -w" -o /kubescra
 RUN case "$TAGS" in *journald*) CGO=1 ;; *) CGO=0 ;; esac; \
 	CGO_ENABLED=$CGO go build -trimpath -tags "$TAGS" -ldflags="-s -w" -o /kubescrape-agent ./cmd/kubescrape-agent
 
+# Stage libsystemd and its runtime dependencies under a MIRRORED tree instead of
+# COPYing /usr/lib/x86_64-linux-gnu/* straight across: Debian's multiarch path is
+# architecture-specific on both ends, so the hardcoded triplet made this image
+# unbuildable on an arm64 host ("not found" at the COPY, hence no `make image`
+# and no `make e2e` there) — the architecture hack/cluster-up.sh and
+# hack/ensure-helm.sh both go out of their way to support. The directory is
+# derived from where libsystemd actually is, so a missing library fails the build
+# loudly rather than shipping an agent the dynamic linker refuses to start.
+RUN set -eu; \
+	dir="$(dirname "$(ls /usr/lib/*-linux-gnu/libsystemd.so.0 | head -n1)")"; \
+	mkdir -p "/staging$dir"; \
+	for lib in libsystemd.so.0 libcap.so.2 libgcrypt.so.20 libgpg-error.so.0 liblz4.so.1 liblzma.so.5 libzstd.so.1; do \
+		cp -a "$dir/$lib"* "/staging$dir/"; \
+	done
+
 # distroless/base has glibc (the cgo agent needs it); static-debian12 would not
 # run the agent. The agent (command: /kubescrape-agent) needs root to read
 # container logs; the metadata service runs as nonroot via its securityContext.
 FROM gcr.io/distroless/base-debian12
-# libsystemd and its runtime dependencies for the agent's journald reader.
-COPY --from=build \
-	/usr/lib/x86_64-linux-gnu/libsystemd.so.0* \
-	/usr/lib/x86_64-linux-gnu/libcap.so.2* \
-	/usr/lib/x86_64-linux-gnu/libgcrypt.so.20* \
-	/usr/lib/x86_64-linux-gnu/libgpg-error.so.0* \
-	/usr/lib/x86_64-linux-gnu/liblz4.so.1* \
-	/usr/lib/x86_64-linux-gnu/liblzma.so.5* \
-	/usr/lib/x86_64-linux-gnu/libzstd.so.1* \
-	/usr/lib/x86_64-linux-gnu/
+# libsystemd and its runtime dependencies for the agent's journald reader, staged
+# above under their real multiarch directory so this lands in the right place on
+# amd64 and arm64 alike.
+COPY --from=build /staging/ /
 COPY --from=build /kubescrape /kubescrape
 COPY --from=build /kubescrape-agent /kubescrape-agent
 ENTRYPOINT ["/kubescrape"]

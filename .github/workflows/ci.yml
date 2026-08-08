@@ -39,6 +39,14 @@ jobs:
             echo "not gofmt'd:"; echo "$unformatted"; exit 1
           fi
 
+      # internal/chartcheck renders the chart and diffs it against goldens, and
+      # it SKIPS without a helm binary — so `make test` ran it as a no-op here
+      # for as long as this job existed, and template-logic regressions reached
+      # main behind a green check. helmBin() now fails instead of skipping when
+      # CI is set, which turns a missing step like this into a loud failure
+      # rather than silent lost coverage.
+      - uses: azure/setup-helm@v5
+
       - run: make test
 
       # The build-tag guard: no cgo without journald, no franz-go without

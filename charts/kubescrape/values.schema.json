@@ -183,13 +183,13 @@
         },
         "nodeSelector": {
           "type": "object",
-          "properties": {},
-          "additionalProperties": false
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "free-form label -> value map, rendered verbatim into the pod spec; do NOT re-add `properties: {}` with additionalProperties:false, which rejects every key and so every non-empty selector"
         },
         "affinity": {
-          "type": "object",
-          "properties": {},
-          "additionalProperties": false
+          "type": "object"
         },
         "listen": {
           "type": "string"
@@ -349,10 +349,14 @@
           "type": "boolean"
         },
         "logsRateLimit": {
-          "type": "integer"
+          "type": "number",
+          "minimum": 0,
+          "description": "-logs-rate-limit is a flag.Float64: a fractional rate is a supported throttle (0.5 = one line every two seconds), so this must not be typed integer-only"
         },
         "logsRateBurst": {
-          "type": "integer"
+          "type": "number",
+          "minimum": 0,
+          "description": "-logs-rate-burst is a flag.Float64; the agent refuses only a non-zero burst below 1"
         },
         "logsRateDrop": {
           "type": "boolean"
@@ -479,8 +483,10 @@
         },
         "nodeSelector": {
           "type": "object",
-          "properties": {},
-          "additionalProperties": false
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "free-form label -> value map, rendered verbatim into the pod spec; do NOT re-add `properties: {}` with additionalProperties:false, which rejects every key and so every non-empty selector"
         },
         "tolerations": {
           "type": "array",
@@ -577,8 +583,10 @@
         },
         "nodeSelector": {
           "type": "object",
-          "properties": {},
-          "additionalProperties": false
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "free-form label -> value map, rendered verbatim into the pod spec; do NOT re-add `properties: {}` with additionalProperties:false, which rejects every key and so every non-empty selector"
         },
         "tolerations": {
           "type": "array",

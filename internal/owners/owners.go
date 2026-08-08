@@ -43,9 +43,19 @@ type ownerKindRow struct {
 
 // ownerKinds is the ONE table behind kindGVR, followable and the owner half
 // of AllGVRs — the three used to be parallel structures a new kind had to be
-// added to separately. Adding an owner kind is one row here, plus the
-// ClusterRole in deploy/kubernetes.yaml (and internal/agent/attrs's kindTable,
-// whose test cross-checks AllGVRs).
+// added to separately. Adding an owner kind is one row here, plus BOTH shipped
+// ClusterRoles — deploy/kubernetes.yaml and charts/kubescrape/templates/service.yaml
+// — and internal/agent/attrs's kindTable, whose test cross-checks AllGVRs.
+//
+// Both ClusterRoles, because main wires one metadata informer per AllGVRs entry
+// and a missing rule 403-loops its initial LIST: that informer's HasSynced never
+// flips, WaitForCacheSync never returns, and /readyz answers 503 for the
+// process' life — exactly the failure the missing podmonitors rule once caused.
+// This comment named only deploy/kubernetes.yaml, which is the copy hack/e2e.sh
+// exercises; the chart's is the one every Helm install runs, and nothing read
+// either (manifestcheck extracts flags and skips RBAC; chartcheck's goldens are
+// regenerated from the chart itself). auditfix_test.go now cross-checks both,
+// in the shape internal/agent/attrs's kindTable check already had.
 //
 // StatefulSets and DaemonSets own their pods DIRECTLY (no intermediate
 // object), so their rows exist for their labels/annotations, not for a chain

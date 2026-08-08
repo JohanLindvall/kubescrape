@@ -80,16 +80,27 @@ func (t *Tailer) retryScanWatches() {
 	}
 }
 
-// watchTarget registers the file's resolved log directory with the watcher.
+// watchTarget resolves the file's log directory, caches it on the file and
+// registers it with the watcher.
 func (t *Tailer) watchTarget(f *file) {
-	if t.watcher == nil {
-		return
-	}
 	target, err := filepath.EvalSymlinks(f.path)
 	if err != nil {
 		return // next open retries; any existing watch stays
 	}
 	dir := filepath.Dir(target)
+	if t.watcher == nil {
+		// No watcher (-logs-watch=false, or a failed fsnotify init) — but the
+		// RESOLVED DIRECTORY is still needed: findRotated locates a rotated
+		// segment's file by name in it, and by the time that runs the live path
+		// is frequently gone (a container GC'd after a CrashLoop restart takes
+		// the /var/log/containers symlink while its rotated files remain), so
+		// its EvalSymlinks fallback fails. Leaving targetDir empty for the
+		// file's whole life declared still-on-disk segments unrecoverable —
+		// counted obs.LogPrefixLost and retired. releaseDir/unwatchTarget are
+		// refcount no-ops without a watcher, so the cache costs nothing else.
+		f.targetDir = dir
+		return
+	}
 	if dir == f.targetDir {
 		return // unchanged (the common case for every reopen)
 	}
@@ -163,16 +174,26 @@ func parseFileName(name string) (containerID, namespace string, ok bool) {
 	if i < 0 || i == len(name)-1 {
 		return "", "", false
 	}
-	containerID = name[i+1:]
 	// <pod>_<namespace>_<container>: exactly two underscores. Two Cuts rather
 	// than strings.Split, which allocates a three-element slice for every
 	// globbed file on every discovery pass.
-	if _, rest, ok := strings.Cut(name[:i], "_"); ok {
-		if ns, container, ok := strings.Cut(rest, "_"); ok && strings.IndexByte(container, '_') < 0 {
-			namespace = ns
-		}
+	//
+	// The structure is part of the VERDICT, not just of the namespace: a name
+	// without it is not a CRI name, and reporting ok with an empty namespace
+	// made claimPath's "unparseable CRI name" claim-and-skip miss exactly those
+	// files. Each was then tracked with a bogus container ID (the tail after
+	// the last '-'), never read — nothing is read before it resolves — and
+	// blocking on a metadata lookup that can never succeed once a minute
+	// forever, on the single sweep goroutine.
+	_, rest, ok := strings.Cut(name[:i], "_")
+	if !ok {
+		return "", "", false
 	}
-	return containerID, namespace, true
+	ns, container, ok := strings.Cut(rest, "_")
+	if !ok || strings.IndexByte(container, '_') >= 0 {
+		return "", "", false
+	}
+	return name[i+1:], ns, true
 }
 
 // scanSets are the two INDEPENDENT proofs one discovery pass accumulates.
@@ -359,7 +380,8 @@ func (t *Tailer) claimPath(src *compiledSource, path string, sets *scanSets) boo
 		sets.seen[path] = struct{}{}
 		return false
 	}
-	if st, err := os.Stat(path); err != nil || !st.Mode().IsRegular() {
+	st, err := os.Stat(path)
+	if err != nil || !st.Mode().IsRegular() {
 		// An unstattable path is not a proven-absent one: an ENOENT is a path
 		// the glob JUST LISTED vanishing between the two syscalls, i.e. a
 		// rename rotation caught mid-scan, and EIO/EACCES/ELOOP prove nothing
@@ -375,8 +397,6 @@ func (t *Tailer) claimPath(src *compiledSource, path string, sets *scanSets) boo
 		// Non-regular files (FIFOs, sockets, devices) are never tracked:
 		// open(2)/read(2) on a FIFO block indefinitely and would wedge the
 		// single sweep goroutine node-wide.
-		return false
-	} else if src.ignoreOlder > 0 && t.tooOld(st, path, src.ignoreOlder) {
 		return false
 	}
 	var id string
@@ -415,6 +435,17 @@ func (t *Tailer) claimPath(src *compiledSource, path string, sets *scanSets) boo
 			return false
 		}
 		id = cid
+	}
+	// AFTER the prohibitions above, never before them. A stale file in an
+	// excluded namespace is still PROHIBITED, and skipping it here without the
+	// claim left it for the next source — which, being a catch-all, has no
+	// namespace logic at all and tailed the excluded namespace's raw CRI lines
+	// for the process lifetime (once tracked, tooOld never fires again). The
+	// cutoff itself stays a per-source SELECTION, like the namespaces
+	// allowlist: unclaimed, so a later source with its own (or no) cutoff may
+	// take the file.
+	if src.ignoreOlder > 0 && t.tooOld(st, path, src.ignoreOlder) {
+		return false
 	}
 	sets.seen[path] = struct{}{}
 	if known, ok := t.files[path]; ok {

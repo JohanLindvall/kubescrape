@@ -461,12 +461,25 @@ func (r *Reader) flush(ctx context.Context) error {
 	// Delivered records, not ingested entries: the rules may have dropped some,
 	// and the metric documents itself as entries EXPORTED.
 	obs.JournalEntries.Add(float64(ld.LogRecordCount()))
-	// Count truncations here, not at read time: a batch whose export fails is
-	// re-read from the committed cursor and re-sanitized, so a per-read counter
-	// would double-count. This scans r.batch — the whole exported batch — so
-	// unlike JournalEntries (delivered records) it also counts a truncation on
-	// an entry the rules dropped: truncation is a read-side sanitation event,
-	// and the rules run downstream of it.
+	r.settleBatch()
+	return nil
+}
+
+// settleBatch clears the batch (releasing the bodies pinned by the backing
+// array), counts its truncations and commits its newest cursor.
+func (r *Reader) settleBatch() {
+	// Count truncations on SETTLE, not at read time: a batch whose export fails
+	// transiently is re-read from the committed cursor and re-sanitized, and
+	// settle is exactly where a batch stops being re-read, so a per-read counter
+	// would double-count while this cannot. It scans r.batch — every entry the
+	// batch held — so unlike JournalEntries (delivered records) it also counts a
+	// truncation on an entry the rules dropped or the collector permanently
+	// rejected: truncation is a read-side sanitation event and the rules run
+	// downstream of it. Counting after the successful export instead made the
+	// metric depend on BATCH COMPOSITION — the same cut message tallied or not
+	// according to whether some unrelated sibling entry survived the rules —
+	// and a journal the rules empty (the heavily-sampled node this feature
+	// exists for) reported no truncations at all.
 	truncated := 0
 	for i := range r.batch {
 		if r.batch[i].origLen > 0 {
@@ -476,13 +489,6 @@ func (r *Reader) flush(ctx context.Context) error {
 	if truncated > 0 {
 		obs.JournalTruncated.Add(float64(truncated))
 	}
-	r.settleBatch()
-	return nil
-}
-
-// settleBatch clears the batch (releasing the bodies pinned by the backing
-// array) and commits its newest cursor.
-func (r *Reader) settleBatch() {
 	clear(r.batch)
 	r.batch = r.batch[:0]
 	r.batchBytes = 0

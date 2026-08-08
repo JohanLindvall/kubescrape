@@ -67,24 +67,45 @@ func TestAuditTruncationIsCountedAndMarked(t *testing.T) {
 	}
 }
 
-// TestAuditByteCapCountsBodiesOnly documents a scope limit of MaxBatchBytes: it
-// bounds the summed BODY bytes only, not the marshaled OTLP payload. With
-// enrichment on, each record also carries parsed attributes (exception.*, etc.),
-// resource attributes, timestamps and per-record framing — none counted. The
-// exported wire payload can therefore run several times past MaxBatchBytes. A
-// gRPC collector rejecting an oversized message with ResourceExhausted is
-// TRANSIENT (not in otlpexport.IsPermanent), so such a batch is retried, never
-// split. The scrape path re-checks bytes between points for exactly this reason;
-// journald does not. (Default 4x gRPC headroom usually absorbs it — hence low.)
+// TestAuditByteCapCountsBodiesOnly enforces a scope limit of MaxBatchBytes: it
+// bounds the summed message BODY bytes only, so the marshaled OTLP payload runs
+// larger — record attributes (syslog.identifier, process.pid, the enriched
+// exception.*), the resource, timestamps and per-record framing are all
+// uncounted. It is a soft in-memory bound and not a wire guarantee; the hard
+// per-payload bound is the exporter's (otlpexport.Config.MaxSendBytes, which
+// splits an over-cap payload through pkg/otlpsplit before sending), which is
+// what keeps this scope limit from being a rejected-batch bug.
+//
+// Both halves of the shape are chosen so the assertion can actually FAIL — the
+// version this replaces could not: its only terminal branch was a t.Skipf when
+// the payload stayed within the cap, and it fell off the end when it did not.
+// Bodies are SMALL relative to the cap (a batch holds ~20 of them), so the
+// marshaled size is dominated by the uncounted part; and the amplifier is a
+// long SYSLOG_IDENTIFIER rather than enrichment output, so the margin cannot
+// quietly evaporate when a parsing dependency emits fewer attributes. Widen the
+// accounting to charge those attributes and batches shrink to a couple of
+// records, the payload lands near the cap, and this fails — which is the point.
 func TestAuditByteCapCountsBodiesOnly(t *testing.T) {
-	trace := strings.Repeat("   at Acme.Worker.Run() in /src/W.cs:line 42\\r\\n", 10)
-	line := `{"@l":"Error","@mt":"boom {X}","@x":"System.InvalidOperationException: boom\r\n` + trace + `"}`
+	const capBytes = 2000
+	line := `{"@l":"Error","@mt":"boom","pad":"` + strings.Repeat("p", 60) + `"}`
+	ident := strings.Repeat("i", 900) // a record attribute; charged to nothing
 	var entries []rawEntry
-	for i := 0; i < 20; i++ {
-		entries = append(entries, mkEntry(mkCursor(i), "a.service", line, "6"))
+	for i := 0; i < 40; i++ {
+		e := mkEntry(mkCursor(i), "a.service", line, "6")
+		e.ident = ident
+		entries = append(entries, e)
 	}
-	exp, _ := startReader(t, Config{Enrich: true, MaxBatchBytes: 2000, BatchSize: 1000}, entries, false, 0)
-	waitFor(t, "all 20 records", func() bool { return len(exp.records()) == 20 })
+	// Not startReader: its 20ms flush interval could split a batch before the
+	// byte cap does, and this test is about what the byte cap admits.
+	exp := &captureExporter{}
+	r := New(Config{Exporter: exp, Enrich: true, MaxBatchBytes: capBytes, BatchSize: 1000,
+		FlushInterval: 200 * time.Millisecond, RestartBackoff: 10 * time.Millisecond})
+	r.open = fakeOpener(entries, false)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { defer close(done); r.Run(ctx) }()
+	t.Cleanup(func() { cancel(); <-done })
+	waitFor(t, "all 40 records", func() bool { return len(exp.records()) == 40 })
 
 	exp.mu.Lock()
 	defer exp.mu.Unlock()
@@ -98,9 +119,16 @@ func TestAuditByteCapCountsBodiesOnly(t *testing.T) {
 			worst = len(b)
 		}
 	}
-	t.Logf("largest marshaled batch = %d bytes vs MaxBatchBytes=2000 (bodies-only cap)", worst)
-	if worst <= 2000 {
-		t.Skipf("payload stayed within cap (%d)", worst)
+	t.Logf("largest marshaled batch = %d bytes vs MaxBatchBytes=%d (bodies-only cap)", worst, capBytes)
+	// "Several times past", not merely past: one entry always exports alone
+	// however big it is, so a bare `> capBytes` would hold for any accounting
+	// at all and assert nothing. Bodies-only puts ~20 records with a 900-byte
+	// identifier each in one batch, i.e. ~10x the cap.
+	if worst <= 2*capBytes {
+		t.Errorf("largest marshaled batch = %d bytes against a %d-byte cap: every record carries a "+
+			"900-byte identifier the cap does not count, so the payload should run several times past it — "+
+			"the accounting has widened (update this test and Config.MaxBatchBytes' doc) or the batching changed",
+			worst, capBytes)
 	}
 }
 

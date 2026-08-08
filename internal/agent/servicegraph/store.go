@@ -178,11 +178,19 @@ func newEdgeStore(cfg Config, wait time.Duration, onEdge func(Edge)) *edgeStore 
 // upsert records one half of a request under k. When it completes the edge, the
 // edge is handed to onEdge and the entry retires.
 //
-// The obs counters are bumped OUTSIDE the store's mutex: a Registry counter
-// takes the metric store's own lock, and a shard's pairing path should not hold
-// two locks to do its bookkeeping (spanmetrics unlocks before its drop counter
-// for the same reason). The Stats fields, which callers read as a consistent
-// snapshot, are maintained inside.
+// The counters THIS store bumps (ServiceGraphStoreFull here, ServiceGraphExpired
+// in expire) are bumped OUTSIDE the pairing mutex: a Registry counter takes the
+// metric store's own lock, and holding the pairing mutex across it stalls every
+// concurrent Consume for that long. The Stats fields, which callers read as a
+// consistent snapshot, are maintained inside.
+//
+// This is NOT a claim that the pairing path holds one lock at a time — it holds
+// the pairing mutex across sink.Record by design (see metrics.go's render
+// strategy), so the cardinality-cap refusal is counted inside
+// cumagg.AdmitLocked, under the cumagg store's lock, with this one held.
+// cumagg.Lock owns that rule ("nothing here ever takes another lock while
+// holding this one except the Counter it was given"); the same is true of
+// spanmetrics, whose drop counter moved INTO AdmitLocked with the extraction.
 func (s *edgeStore) upsert(now time.Time, k edgeKey, side edgeSide, h halfSpan, dims []EdgeDimension) {
 	if s.insert(now, k, side, h, dims) {
 		obs.ServiceGraphStoreFull.Inc()

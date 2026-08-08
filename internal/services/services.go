@@ -173,6 +173,7 @@ func (ix *Index) Delete(namespace string, uid types.UID) {
 }
 
 // All returns the services in the given namespaces (nil = every namespace).
+// Each Service appears ONCE however often its namespace is named.
 func (ix *Index) All(namespaces []string) []*Service {
 	ix.reads.Add(1)
 	ix.mu.RLock()
@@ -190,7 +191,26 @@ func (ix *Index) All(namespaces []string) []*Service {
 		}
 		return out
 	}
+	if len(namespaces) == 1 {
+		// The common shape — a monitor selecting its own namespace — has nothing
+		// to dedupe and must not pay for the map.
+		appendNS(namespaces[0])
+		return out
+	}
+	// The list comes STRAIGHT from a ServiceMonitor's
+	// namespaceSelector.matchNames, which prometheus-operator's CRD does not
+	// constrain to be unique — so a repeated entry appended a namespace's whole
+	// Service set again, multiplying the server's monitor→services memo and the
+	// per-request target loop by the repeat count. InNamespaces already guards
+	// exactly this (its `out[ns] != nil` check); All was the sibling that
+	// forgot. First-occurrence order is preserved: the caller derives the merged
+	// relabel chain from the encounter order.
+	seen := make(map[string]struct{}, len(namespaces))
 	for _, ns := range namespaces {
+		if _, dup := seen[ns]; dup {
+			continue
+		}
+		seen[ns] = struct{}{}
 		appendNS(ns)
 	}
 	return out

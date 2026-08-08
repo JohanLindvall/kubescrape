@@ -10,6 +10,8 @@ import (
 
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/ptrace"
+
+	"github.com/JohanLindvall/kubescrape/internal/testrace"
 )
 
 // sgSpan is one span in a test batch.
@@ -711,6 +713,9 @@ func BenchmarkConsumePairWithDimensions(b *testing.B) {
 // recycled buffers pays none. A closure, a sort or a per-edge slice in this
 // path would silently put it back.
 func TestConsumeWithDimensionsIsAllocationFree(t *testing.T) {
+	if testrace.Enabled {
+		t.Skip("-race perturbs allocation counts")
+	}
 	p := NewProcessor(Config{Dimensions: []string{"http.method", "http.route"}}, nil)
 	p.SetSink(&countSink{})
 	attrs := map[string]string{"http.method": "GET", "http.route": "/api/v1/orders"}
@@ -746,6 +751,9 @@ func BenchmarkConsumeUnpaired(b *testing.B) {
 // not arrived, which is what every span costs until it pairs. A per-span map,
 // a fmt call or a slice built per lookup would each land here.
 func TestConsumeUnpairedIsAllocationFree(t *testing.T) {
+	if testrace.Enabled {
+		t.Skip("-race perturbs allocation counts")
+	}
 	p := NewProcessor(Config{MaxItems: 1 << 20}, nil)
 	p.SetSink(&countSink{})
 	spans := make([]sgSpan, 100)

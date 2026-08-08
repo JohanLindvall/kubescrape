@@ -6,6 +6,8 @@ import (
 	"time"
 
 	"go.opentelemetry.io/collector/pdata/ptrace"
+
+	"github.com/JohanLindvall/kubescrape/internal/testrace"
 )
 
 // The receive path runs on the tier's handler goroutines, once per pushed span,
@@ -170,6 +172,9 @@ func BenchmarkReceiveLateDrop(b *testing.B) {
 // path here — every span of every already-dropped trace — so a per-push map, a
 // slice or a closure is a per-span cost on the busiest goroutines the tier has.
 func TestReceiveLateDropAllocationBudget(t *testing.T) {
+	if testrace.Enabled {
+		t.Skip("-race perturbs allocation counts")
+	}
 	buf, td, ctx := decidedDropBuffer(t)
 	if err := buf.ExportTraces(ctx, td); err != nil { // warm the grouping scratch
 		t.Fatal(err)

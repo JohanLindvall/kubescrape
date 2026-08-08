@@ -17,8 +17,11 @@
 // Fixtures deliberately pin everything nondeterministic (the scrape-auth
 // token value; helm's lookup() returns nothing without a cluster, and the
 // fixture must not fall through to randAlphaNum). Golden output can differ
-// across helm MAJOR versions in whitespace details — hack/ensure-helm.sh pins
-// the version CI uses.
+// across helm MAJOR versions in whitespace details, so hack/ensure-helm.sh
+// bootstraps the pinned version — but only hack/bin/helm IS that pin: a helm
+// found on PATH here is whatever the machine (or the CI runner image) ships,
+// and regenerating goldens under one while comparing under another is what the
+// pin exists to prevent. Run `make helm-lint` once before `-update-chart-golden`.
 package chartcheck
 
 import (
@@ -42,6 +45,18 @@ func helmBin(t *testing.T) string {
 	}
 	if p, err := exec.LookPath("helm"); err == nil {
 		return p
+	}
+	// A developer without helm gets a skip; CI does NOT. This whole guard is a
+	// no-op without a helm binary, and the CI job that runs the Go tests never
+	// installed one — so the rendered-chart goldens, the only check that can
+	// see template LOGIC (the logsExcludeNamespaces derivation that the
+	// text-reading manifestcheck cannot), silently protected nothing on every
+	// PR. A guard that quietly downgrades to "pass" in the one environment
+	// that gates merges is worse than no guard, because the green check is
+	// read as coverage. GitHub Actions sets CI=true.
+	if os.Getenv("CI") != "" {
+		t.Fatal("no helm binary (hack/bin/helm or PATH), but CI is set: the chart golden " +
+			"guard must not silently skip in CI — install helm in this job (see .github/workflows/ci.yml)")
 	}
 	t.Skip("no helm binary (hack/bin/helm or PATH); run `make helm-lint` once to bootstrap it")
 	return ""
@@ -109,8 +124,12 @@ func unifiedDiff(t *testing.T, want, got []byte) string {
 
 // values.schema.json makes a typo'd value a helm-time error instead of a
 // silently-ignored key. Both directions matter: the default values (and every
-// fixture above) must VALIDATE — helm lint and TestChartGolden cover that —
-// and an unknown key must REFUSE to render.
+// fixture above) must VALIDATE — helm lint and TestChartGolden cover that,
+// which is why everything.yaml carries a NON-EMPTY nodeSelector/affinity and a
+// fractional logs rate: a schema that types a free-form map as
+// `properties: {}, additionalProperties: false` refuses every legal value, and
+// only a fixture that sets one renders it — and an unknown key must REFUSE to
+// render.
 func TestValuesSchemaRejectsUnknownKeys(t *testing.T) {
 	helm := helmBin(t)
 	for _, set := range []string{

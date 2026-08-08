@@ -186,7 +186,10 @@ type Reader struct {
 	// began?
 	replayFrom time.Time
 	// relist forces the next stream to start from "" (the full TTL backlog)
-	// after the API server dropped our resourceVersion. See expire.
+	// after the API server dropped our resourceVersion (see expire), or after
+	// the stored position could not be READ (see loadPosition). Both mean the
+	// same thing — we do not know where the last delivery stopped — and a
+	// replay is the only answer to that which cannot lose the gap.
 	relist bool
 	// replaySecured: the current replay's backlog is known FULLY delivered —
 	// a bookmark applied, and the API server only sends bookmarks once the
@@ -369,10 +372,26 @@ func (r *Reader) loadPosition(ctx context.Context) {
 	pos, found, err := r.cfg.Positions.Load(ctx)
 	switch {
 	case err != nil:
-		// Unparseable: treat as a cold start but COUNT it — an undecodable
-		// checkpoint must never masquerade as a first run.
+		// An unreadable position is not a first run, and it must not be
+		// answered with the LOSS direction. Two failure classes arrive here in
+		// ONE shape — the store makes a single Get, so an undecodable document
+		// and a 503 / timeout / expired credential are indistinguishable — and
+		// under `auto` the cold-start policy takes the CURRENT revision: one
+		// failed Get during a control-plane roll (exactly when leadership
+		// churns) discards every event since the predecessor stopped, and the
+		// first persist then overwrites the only record of where that was.
+		//
+		// So replay the TTL backlog instead. It is unfiltered — no watermark
+		// loaded — so it costs duplicates, which at-least-once already
+		// tolerates, and it is what the sibling this store's doc claims parity
+		// with does: the tailer's positions store reports Corrupt() so `auto`
+		// RE-READS rather than skipping every file to its end as history. An
+		// explicit `end` or `start` is the operator naming a cold-start policy
+		// outright and is honoured.
 		obs.EventPositionErrors.WithLabelValues("load").Inc()
-		r.log.Warn("event position unreadable; starting per the start mode", "error", err)
+		r.relist = r.cfg.StartMode == StartAuto
+		r.log.Warn("event position unreadable", "error", err,
+			"startMode", r.cfg.StartMode, "replayingBacklog", r.relist)
 	case found:
 		r.committed = pos
 		r.log.Info("resuming events", "resourceVersion", pos.ResourceVersion, "watermark", pos.Watermark)
@@ -523,7 +542,6 @@ func (r *Reader) startResourceVersion(ctx context.Context) (rv string, redeliver
 // expire drops the committed resourceVersion so the next stream relists,
 // keeping the watermark to filter the replay.
 func (r *Reader) expire(stage string) {
-	obs.EventRelists.WithLabelValues(stage).Inc()
 	r.committed.ResourceVersion = ""
 	r.pendingRV = ""
 	// The revision aged out of the API server's watch window, so the
@@ -533,6 +551,20 @@ func (r *Reader) expire(stage string) {
 	// would filter the replay, and a cold -events-start=end would turn its
 	// first expiry into the full backlog the operator asked to skip.
 	r.relist = !r.committed.Watermark.IsZero()
+	// Count the fall-back only where the next stream actually takes it: the
+	// armed relist, or a -events-start=start whose cold policy replays anyway.
+	// The counter is registered as watches that "fell back to a relist", and
+	// bumping it before the decision made the two OPPOSITE outcomes of this
+	// function indistinguishable to an alert — under auto/end a watermark-less
+	// expiry restarts at the CURRENT revision and DISCARDS the gap, which
+	// tryFlush's comment already names as harm ("whose name asserts a relist
+	// that did not happen").
+	if r.relist || r.cfg.StartMode == StartBeginning {
+		obs.EventRelists.WithLabelValues(stage).Inc()
+		return
+	}
+	r.log.Warn("event watch expired before anything was exported; restarting per the start mode and discarding the gap",
+		"stage", stage, "startMode", r.cfg.StartMode)
 }
 
 // handle consumes one watch event.
@@ -647,8 +679,18 @@ func (r *Reader) tryFlush(ctx context.Context) {
 // component with a fast clock latched a FUTURE watermark, which is persisted in
 // the position ConfigMap: the blackout then survived restarts and leader
 // handover.
+//
+// And it stops at the SECURING BOOKMARK, not at the end of the stream. The
+// `replaying` flag is per-stream and deliberately survives a commit (see the
+// field), but a bookmark proves the backlog FULLY delivered — the same proof
+// settle already trusts to release the position hold, the strictly more
+// dangerous of the two — so what the stream delivers after it is LIVE. Keeping
+// the filter armed there is the live-stream drop above, one watch lifetime long
+// after every relist: replayFrom is frozen at stream start, so a reporter whose
+// clock trails it by more than replaySlack goes dark, silently (noteSeen has
+// already advanced the resume point past the event) and uncounted.
 func (r *Reader) wanted(e *corev1.Event) bool {
-	if !r.replaying || r.replayFrom.IsZero() {
+	if !r.replaying || r.replaySecured || r.replayFrom.IsZero() {
 		return true
 	}
 	when := eventTime(e)

@@ -214,6 +214,19 @@ func (s *Scraper) protoFamily(mf *dto.MetricFamily, ss *scrapeSession) (int, err
 			}
 		case dto.MetricType_SUMMARY:
 			sum := m.GetSummary()
+			// The component label is appended AFTER the metric's own, so a
+			// target that already carries it creates exactly the duplicate
+			// protoLabels refuses — only where protoLabels can no longer see
+			// it. The consequence is the same and worse: every reader resolves
+			// `quantile`/`le` to the FIRST (the target's) pair while the export
+			// carries the last, so a histogram's bucket rows all read one bound
+			// and collapse into a single accumulator with malformed=0. The text
+			// grammar cannot express it either (`x_bucket{le="1",le="2"}` fails
+			// the line), so the metric is malformed here too.
+			if len(sum.GetQuantile()) > 0 && hasLabel(labels, "quantile") {
+				malformed++
+				continue
+			}
 			for _, q := range sum.GetQuantile() {
 				ql := append(labels[:len(labels):len(labels)], Label{Name: "quantile", Value: floats.get(q.GetQuantile())})
 				if err := ss.accept(Sample{Name: name, Family: name, Role: RoleSummaryQuantile, Labels: ql, Value: q.GetValue(), TimestampMs: ts, Help: help, Unit: unit}); err != nil {
@@ -240,6 +253,11 @@ func (s *Scraper) protoFamily(mf *dto.MetricFamily, ss *scrapeSession) (int, err
 			// keeps only its _gcount/_gsum: its distribution has no OTLP shape
 			// that would not lie about temporality.
 			h := m.GetHistogram()
+			// A synthesized `le` beside the target's own: see the SUMMARY case.
+			if len(h.GetBucket()) > 0 && hasLabel(labels, "le") {
+				malformed++
+				continue
+			}
 			for _, b := range h.GetBucket() {
 				bl := append(labels[:len(labels):len(labels)], Label{Name: "le", Value: floats.get(b.GetUpperBound())})
 				if err := ss.accept(Sample{Name: nameBucket, Family: name, Role: RoleGauge, Labels: bl, Value: bucketCount(b), TimestampMs: ts, Help: help, Unit: unit}); err != nil {
@@ -291,6 +309,13 @@ func (s *Scraper) protoFamily(mf *dto.MetricFamily, ss *scrapeSession) (int, err
 				// single overflow bucket, i.e. a correct count and sum beside a
 				// distribution every histogram_quantile reads as nonsense, and
 				// counted nothing. Refused instead, so the loss is visible.
+				malformed++
+				continue
+			}
+			// A synthesized `le` beside the target's own: see the SUMMARY case.
+			// The native branch above appends nothing — there `le` is an
+			// ordinary label — so the check belongs on the classic path only.
+			if len(h.GetBucket()) > 0 && hasLabel(labels, "le") {
 				malformed++
 				continue
 			}
@@ -631,6 +656,16 @@ func decodeSpans(spans []*dto.BucketSpan, deltas []int64, absolute []float64) (c
 // empty NAME — an unset proto field the text grammar cannot express — which
 // would otherwise become an empty OTLP attribute key; the caller drops the
 // metric as malformed, mirroring the text front's whole-line reject.
+//
+// ok is also false for a REPEATED name. `repeated LabelPair` carries duplicates
+// by construction, so this is the one shape the wire format admits and the text
+// grammar does not (the text front fails the whole line, parser.go's
+// parseLabels). It must be refused here for the same reason: every reader in
+// this package resolves a name through labelValue, which returns the FIRST
+// match, while pcommon.Map.PutStr upserts, so the LAST pair is what ships — a
+// keep/drop rule then matches a value the export does not carry, and a
+// histogram whose own `le` repeats collapses every bucket row into one
+// accumulator with malformed=0. The O(n²) scan runs over a metric's few labels.
 func protoLabels(m *dto.Metric) ([]Label, bool) {
 	lps := m.GetLabel()
 	if len(lps) == 0 {
@@ -638,12 +673,30 @@ func protoLabels(m *dto.Metric) ([]Label, bool) {
 	}
 	out := make([]Label, 0, len(lps))
 	for _, lp := range lps {
-		if lp.GetName() == "" {
+		name := lp.GetName()
+		if name == "" {
 			return nil, false
 		}
-		out = append(out, Label{Name: lp.GetName(), Value: lp.GetValue()})
+		for i := range out {
+			if out[i].Name == name {
+				return nil, false
+			}
+		}
+		out = append(out, Label{Name: name, Value: lp.GetValue()})
 	}
 	return out, true
+}
+
+// hasLabel reports whether the pairs already carry name. Used for the
+// SYNTHESIZED component labels (`le`, `quantile`), which protoLabels cannot see
+// because they are appended after it returns.
+func hasLabel(labels []Label, name string) bool {
+	for i := range labels {
+		if labels[i].Name == name {
+			return true
+		}
+	}
+	return false
 }
 
 // floatStrings renders the float64 label values of one family — bucket bounds

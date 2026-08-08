@@ -4,6 +4,8 @@ import (
 	"testing"
 
 	"go.opentelemetry.io/collector/pdata/ptrace"
+
+	"github.com/JohanLindvall/kubescrape/internal/testrace"
 )
 
 func benchTraces(svc string, attrs map[string]string) ptrace.Traces {
@@ -51,6 +53,9 @@ func BenchmarkConsumeBatch(b *testing.B) {
 // span, or reading the clock per span instead of per batch each cost one
 // allocation and nothing else would notice.
 func TestConsumeAllocationBudget(t *testing.T) {
+	if testrace.Enabled {
+		t.Skip("-race perturbs allocation counts")
+	}
 	for _, tc := range []struct {
 		name string
 		cfg  Config

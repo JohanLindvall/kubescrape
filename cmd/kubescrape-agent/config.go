@@ -341,6 +341,12 @@ func validateConfig(cfg agentConfig, transformsFile string) error {
 		if err := shards.Validate(); err != nil { // its messages already name the section
 			return err
 		}
+		// ReshardConfig.Validate is shape-only by contract and cannot see the
+		// flags, so the ring's transport and port are checked against this
+		// shard's own listeners here — the one place that knows both.
+		if err := shardRingReachesThisShard(shards); err != nil {
+			return err
+		}
 	}
 	if cfg.Routing != nil {
 		for i, rt := range cfg.Routing.Routes {
@@ -451,6 +457,22 @@ func compileTransforms(file string) (*transform.Program, error) {
 // run says exactly what a start would.
 func configWarnings(cfg agentConfig) []string {
 	var out []string
+
+	// No offset persistence at all, for a pipeline that has offsets. The
+	// consequence differs per pipeline and neither is visible from the flag:
+	// the tailer re-reads per -logs-unknown-files, while journald has NO cursor
+	// file of its own and so seeks to the journal TAIL on every restart, losing
+	// whatever was written while the process was down. This lived inside
+	// startLogs, behind the -logs toggle — so the journald half, the only place
+	// that consequence is written down, could never be said to the
+	// journald-only agent it describes.
+	//
+	// Named rather than refused: running without persistence is a supported
+	// arrangement (the flag's own help says empty disables it), just one whose
+	// cost is invisible until a restart.
+	if *positionsFile == "" && (*logsOn || *journaldOn) {
+		out = append(out, "no -positions-file: offsets are not persisted — a -logs restart re-reads per -logs-unknown-files, and -journald resumes at the journal TAIL, losing every entry written while the process was down (journald has no cursor file of its own)")
+	}
 
 	// A DERIVED token bucket below one whole token. The value the operator
 	// typed is -logs-rate-limit, and it is delivered EXACTLY — the floor lifts

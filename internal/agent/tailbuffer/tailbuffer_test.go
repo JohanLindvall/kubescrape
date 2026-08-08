@@ -625,10 +625,12 @@ func TestFailedDecisionExportCountsLost(t *testing.T) {
 	before := counter(obs.TailSampleSpans.WithLabelValues("lost"))
 	clk.advance(2 * time.Second)
 
-	// Cancelled context: the retry must not sit here for the whole backoff, and
-	// the shutdown path passes a budgeted one for exactly this reason.
-	cctx, cancel := context.WithCancel(ctx)
-	cancel()
+	// A spent BUDGET: the retry must not sit here for the whole backoff, and the
+	// shutdown path passes a budgeted context for exactly this reason. A merely
+	// cancelled one would not do it — drain detaches the send from the caller's
+	// cancellation, because by then nobody else holds these spans (sendContext).
+	cctx, cancel := context.WithDeadline(ctx, time.Now().Add(-time.Second))
+	defer cancel()
 	b.Sweep(cctx)
 
 	if got := counter(obs.TailSampleSpans.WithLabelValues("lost")) - before; got != 2 {

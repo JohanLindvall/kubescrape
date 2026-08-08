@@ -98,7 +98,8 @@ jobs:
             "--set agent.staticAttrs.foo=bar" \
             "--set networkPolicy.enabled=true" \
             "--set agent.ingest.enabled=true --set networkPolicy.enabled=true" \
-            "--set service.scrapeAuthSecrets=true --set service.scrapeAuthTokenSecret=tok"; do
+            "--set service.scrapeAuthSecrets=true --set service.scrapeAuthToken.existingSecret=tok" \
+            "--set service.scrapeAuthSecrets=true --set service.scrapeAuthToken.value=tok"; do
             echo "== helm template $args"
             out=$(helm template t charts/kubescrape $args)
             flag=$(printf '%s' "$out" | grep -c 'config=/etc/kubescrape/config/config.yaml' || true)

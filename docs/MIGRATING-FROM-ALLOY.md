@@ -298,7 +298,10 @@ overrides **are** interpreted — each target is scheduled on its own period —
 so those monitors need no conversion. Relabel actions other than keep/drop, and
 authentication schemes beyond `basicAuth`/`authorization`/`bearerTokenSecret`,
 are still not interpreted: convert those monitors to annotated Services or
-metrics-config rules. Nothing is dropped silently — an uninterpreted field is
+metrics-config rules — or, for relabel power the declarative rules lack, the
+transforms file's `targets:` hook, which runs a script per fetched scrape
+target per cycle (drop it, rewrite its path). Nothing is dropped silently —
+an uninterpreted field is
 logged once per monitor and counted in
 `kubescrape_monitor_fields_ignored_total{kind}`.
 
@@ -391,9 +394,17 @@ a PodMonitor) like any other target.
 The declarative layers (metrics `pipelines` filters, splitters,
 `logs.rules`, attribute templates) cover most OTTL uses. For the remainder,
 `-transforms-file` runs **Starlark** scripts (`transform(batch)` per signal)
-at the exporter seam: mutate or drop log records / metrics / spans, with
+at the exporter seam: mutate or drop log records / metrics / spans (down to
+individual data points), with
 hot reload (compile-then-commit — a broken edit keeps the last good program)
-and a step limit. It is deliberately narrower than OTTL: per exported batch,
+and a step limit. The same file also carries `route()`/`emit_metric()` verbs
+(the routing-connector and count-connector shapes) and four hooks at other
+decision points — `ingest:` per-resource admission on the push listeners,
+`targets:` per scrape target (the relabel-parity gap above), `sample:` as a
+tail-sampling policy body, `parse:` per line of opted-in plain log sources —
+see the transforms section of
+[CONFIGURATION.md](CONFIGURATION.md#agent-transforms-starlark). It is
+deliberately narrower than OTTL: batch- and hook-scoped,
 lazy field access, no I/O.
 
 ### `otelcol.processor.probabilistic_sampler` / spanmetrics connector

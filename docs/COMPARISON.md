@@ -65,8 +65,8 @@ fully attributed — the cache-race gap that per-node watchers accept.
 | Secret/PII scrubbing | ✔ `logScrubbing` (curated built-ins + custom regexes, pre-enrichment) | ~ `loki.secretfilter` (curated Gitleaks rules + entropy detection; experimental) / config stages | VRL | config | ✔ redaction processor |
 | Per-workload (annotation) log config | ✔ `kubescrape.io/logs` (exclude, multiline, rules, attributes) | ~ PodLogs CRD (GA: per-workload selection/relabeling; no multiline/rule overrides) | ~ `vector.dev/exclude` label + exclude-containers annotation | ~ `fluentbit.io/exclude`, parser annotations | ✘ |
 | Body rewriting / templating | ✔ opt-in (Starlark transforms; the built-in pipeline never modifies bodies) | ✔ | ✔ VRL | ✔ | ✔ OTTL |
-| General transform language | **Starlark** (per-batch, hot-reloaded, opt-in) | River/stages | **VRL** | Lua/WASM/SQL stream processor/processors | **OTTL** |
-| Live debug tap of shipped data | ✔ `GET /debug/otlp`: streamed OTLP JSON, resource-attr glob filters + sample %, built-in UI, zero cost unattached | ✔ Alloy `livedebugging` UI (per component) | ✔ `vector tap` (glob on component IDs) | ✘ | ~ debug exporter (always-on config, whole feed, needs a config edit + restart) |
+| General transform language | **Starlark** (per-batch plus ingest/targets/sample/parse hooks; `route()`/`emit_metric()` verbs; hot-reloaded, opt-in) | River/stages | **VRL** | Lua/WASM/SQL stream processor/processors | **OTTL** |
+| Live debug tap of shipped data | ✔ `GET /debug/otlp`: streamed OTLP JSON, resource-attr glob filters + sample %, built-in UI, zero cost unattached; a `GET /debug` homepage on both binaries indexes every debug surface | ✔ Alloy `livedebugging` UI (per component) | ✔ `vector tap` (glob on component IDs) | ✘ | ~ debug exporter (always-on config, whole feed, needs a config edit + restart) |
 | "Why is this pod (not) scraped?" | ✔ `GET /v1/explain/{ns}/{pod}`: the whole decision chain, verdict by verdict | ~ targets pages show the post-relabel result, not the why | ✘ | ✘ | ~ targetallocator debug endpoints (jobs/targets, no per-pod verdicts) |
 
 † Cells describe Alloy; Promtail differences are noted inline. Promtail
@@ -76,8 +76,10 @@ One property of the table that no comparator matches uniformly: the whole
 processing chain — scrubbing, enrichment, attribute lifting, log-derived
 metrics, drop/keep/sample rules, Starlark transforms, routing, disk buffer —
 applies identically to **every log source**: container files, plain host
-files, gzip archives, journald, Kubernetes events and Azure Event Hubs
-diagnostics. Comparators typically wire parsing and enrichment per source
+files, gzip archives, journald, Kubernetes events, Azure Event Hubs
+diagnostics — and OTLP-pushed logs, which run the same scrubbing, enrichment,
+log-metrics and drop/keep/sample rules on the ingest path. Comparators
+typically wire parsing and enrichment per source
 type, so a rule that works on file tails has to be rebuilt (or is
 unavailable) for their journald or events inputs.
 
@@ -113,7 +115,7 @@ logs+metrics over OTLP is kubescrape's.
 
 | | kubescrape | Alloy | Vector | Fluent Bit | OTel Collector |
 |---|---|---|---|---|---|
-| OTLP ingest (push) with k8s enrichment | ✔ logs/metrics on the node agent, traces on the trace tier, peer-IP fallback (payloads forwarded as received — batch in the SDK or downstream) | ✔ | ~ OTLP source decodes, but no k8s enrichment of pushed data | ✔ | ✔ |
+| OTLP ingest (push) with k8s enrichment | ✔ logs/metrics on the node agent, traces on the trace tier, peer-IP fallback; pushed logs run the full chain (scrub, enrich, `logMetrics`, `logs.rules`); payloads forwarded as received — batch in the SDK or downstream | ✔ | ~ OTLP source decodes, but no k8s enrichment of pushed data | ✔ | ✔ |
 | Traces | a dedicated sharded tier: enrichment + re-sharding by trace id + RED span metrics + consistent probabilistic sampling (`traceSampling`) + **whole-trace tail sampling** (`tailSampling`, the Collector's policy vocabulary, first-match-wins attribution) + Grafana-Tempo-compatible service-graph edges (opt-in) | ✔ full | ~ pass-through (practical since v0.50); OSS has no sampling or span metrics | ✔ head **and** conditional tail sampling (v4 sampling processor: latency/status/attribute policies) | ✔ full (tail sampling etc.) |
 | Multi-destination / tenant routing | ✔ per-signal destinations + tenant headers on the buffered default chain (`export` section: Mimir/Loki/Tempo's distinct OTLP endpoints, collectorless); plus per-namespace fan-out (`routing`; unbuffered by design) | ✔ | ✔ | ✔ | ✔ routing connector |
 | Log delivery | **ack-gated at-least-once** + rewind; offsets never pass unacked data | positions synced on timer (loss/dup window) | ✔ e2e acks + disk buffers | offsets on read; `storage.type filesystem` persists read-but-undelivered chunks across restarts | checkpoints when the downstream consumer accepts (not backend ack); persistent sending queue bounds outage loss |
@@ -232,9 +234,7 @@ deciding where to land:
   Service graphs are likewise off it: the trace tier
   shards spans by trace id onto a small StatefulSet, the way Tempo's
   metrics-generator does, and emits the `traces_service_graph_*` series
-  Grafana's Service Graph view queries. Tail sampling still is — the routing
-  that puts a whole trace on one shard is there, but nothing buffers a trace
-  until it is complete.)
+  Grafana's Service Graph view queries.)
 - **Metrics-first with InfluxDB or a zoo of non-Kubernetes inputs** —
   Telegraf (see the note under [Metrics](#metrics)).
 - **Deeply invested in Prometheus relabel_configs / Loki** — Alloy is the
@@ -243,7 +243,8 @@ deciding where to land:
 
 ## Honest gaps
 
-The transform language (Starlark, per exported batch) is deliberately
+The transform language (Starlark — per exported batch, plus the
+ingest/targets/sample/parse hooks) is deliberately
 narrower than VRL/OTTL and has none of their ecosystem; traces need their own
 sharded tier, which is then a hard cluster-wide dependency for them (no
 per-node fallback, and each span crosses the network twice at full fidelity),
@@ -277,4 +278,7 @@ are collected even though host *metrics* are not. The distinction is
 operational necessity — those unit logs are how you debug a node's Kubernetes
 plane, and on many distros they exist only in the journal — and it is worth
 the cgo dependency on libsystemd (a non-static agent binary) that host
-metrics, already covered by node_exporter, are not.
+metrics, already covered by node_exporter, are not. Even that cost is now a
+choice: the reader sits behind the `journald` build tag, which the default
+build sets — dropping it yields a cgo-free, fully static agent at the price
+of the node's unit logs.

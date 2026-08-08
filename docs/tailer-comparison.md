@@ -6,11 +6,11 @@ layer, and it supports two things almost nobody else does. This document
 compares the design against the major log shippers and names honestly which
 parts of the complexity are essential and which are self-inflicted.
 
-Sizes as of the segment refactor: ~3,300 production lines, split by concern
+Sizes (as of mid-2026): ~5,000 production lines, split by concern
 (`tailer.go`, `ledger.go`, `discover.go`, `pipeline.go`, `read.go`,
 `rotate.go`, `archive.go`, `flush.go`, `checkpoint.go`, `sources.go`,
-`status.go`) and roughly one and a half times that in tests, grouped the
-same way.
+`podconfig.go`, `status.go`) and roughly one and two-thirds times that in
+tests, grouped the same way.
 The historical sections below describe the PRE-refactor design they analyzed;
 "If it should ever get simpler" records what has since been done.
 
@@ -25,7 +25,7 @@ Each competitor weakens at least one leg that this tailer keeps:
 | Multiline group joins **across** a rotation | **yes** | no | no | no | no |
 | copytruncate handled | **yes** (fingerprint re-verify) | docs say "don't use copytruncate" | poorly | via checksums | partially |
 | Compressed archives, resumable | **yes** (decompressed offsets) | no | no | no | no |
-| Retry buffer | **the disk itself** (rewind + re-read) | memory queue | memory queue (lossy) | memory/disk buffers | chunks + storage |
+| Retry buffer | **the disk itself** (rewind + re-read); opt-in fsync'd spool (`-buffer-dir`) | memory queue | memory queue (lossy) | memory/disk buffers | chunks + storage |
 | Rate limiting without loss | yes (pause + salvage) | no | drop-based | throttle transform | no |
 
 ## Per-tool notes
@@ -63,7 +63,7 @@ offset accounting entirely (a crash loses buffered groups).
 
 ## Why this code *looks* worse than it is
 
-1. **Concentration.** ~3,150 lines do what Filebeat spreads across harvester +
+1. **Concentration.** ~5,000 lines do what Filebeat spreads across harvester +
    input manager + spooler + queue + registrar — well over 10k lines before
    counting libbeat. No single Filebeat file looks scary; the complexity hides
    in the seams between abstractions. The single-sweep-goroutine design means
@@ -92,8 +92,9 @@ offset accounting entirely (a crash loses buffered groups).
    `restartAt`/fingerprint-extension/quarantine code is the shape correctness
    takes when those are *not* accepted as known limitations.
 
-The 5,607 test lines against 3,150 production lines is an unusually strong
-ratio, and interleaving-exact tests are themselves a design constraint: the
+The test suite runs about one and two-thirds the production line count — an
+unusually strong
+ratio — and interleaving-exact tests are themselves a design constraint: the
 synchronous sweep exists partly so tests can drive exact orderings, which is
 why the audits could *prove* properties competitors cannot.
 
@@ -255,8 +256,9 @@ interleaving-exact tests pin the behavior being preserved):
 
 **Cost/benefit.** Net line count likely similar or slightly higher; per-file
 complexity much lower; the win is correctness-by-construction for the class of
-bug the audits kept finding. The right trigger: the next bug that lands in the
-carry/gen machinery, or before any new feature that touches rotation.
+bug the audits kept finding. (That judgment held: the decomposition has since
+landed and the carry/gen machinery it replaced is deleted — the offset model
+described in CLAUDE.md's tailer section *is* this design.)
 
 ## Verdict
 

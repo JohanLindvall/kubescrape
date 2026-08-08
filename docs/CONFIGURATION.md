@@ -11,7 +11,8 @@ kubescrape consists of two binaries built from one image:
 Everything is configured through flags plus one optional unified YAML file on
 the agent (`-config`, with `resourceAttributes`, `logs`, `logAttributes`,
 `logMetrics`, `logScrubbing`, `metrics`, `traceMetrics`, `traceSampling`,
-`tailSampling`, `routing` and `export` sections) — plus, optionally, a separate hot-reloaded
+`tailSampling`, `serviceGraph`, `serviceGraphShards`, `routing` and `export`
+sections) — plus, optionally, a separate hot-reloaded
 Starlark transforms file (`-transforms-file`). The
 [Helm chart](../charts/kubescrape) exposes all of it as values; the raw
 manifests live in [deploy/](../deploy).
@@ -127,7 +128,7 @@ kubescrape -listen :8080 -wait-timeout 5s -cache-ttl 5m -log-format json
 | `-cache-ttl` | `5m` | how long metadata of deleted pods and replaced container IDs stays resolvable (tombstones) |
 | `-metadata-cache-ttl` | `10s` | `max-age` stamped on metadata responses (`Cache-Control` + `ETag`) so the agent's client caches lookups and revalidates with `If-None-Match`/304; 0 disables cache headers |
 | `-resync` | `0` | informer resync period (0 = watch stream only) |
-| `-servicemonitors` | `false` | serve targets for `monitoring.coreos.com/v1` ServiceMonitors selecting pod-backed Services — plus **PodMonitors** (endpoints name container ports) when the cluster serves that CRD. Endpoint `port`/`targetPort`/`path`/`scheme`, `interval`/`scrapeTimeout`, `basicAuth`, `authorization`, `bearerTokenSecret`, `tlsConfig` (`insecureSkipVerify`, secret-backed `ca`/`cert`/`keySecret`, `serverName`) and the keep/drop subset of `metricRelabelings` are honored. Anything else (`oauth2`, `proxyUrl`, `params`, `honorLabels`, target `relabelings`, other relabel actions, configMap-backed `ca`/`cert`) is **reported**: logged once per monitor and counted in `kubescrape_monitor_fields_ignored_total{kind}`, so a partially-applied CR is never silent. Self-disables with a warning when the CRD is absent |
+| `-servicemonitors` | `false` | serve targets for `monitoring.coreos.com/v1` ServiceMonitors selecting pod-backed Services — plus **PodMonitors** (endpoints name container ports) when the cluster serves that CRD. Endpoint `port`/`targetPort`/`path`/`scheme`, `interval`/`scrapeTimeout`, `basicAuth`, `authorization`, `bearerTokenSecret`, `tlsConfig` (`insecureSkipVerify`, secret-backed `ca`/`cert`/`keySecret`, `serverName`) and the keep/drop subset of `metricRelabelings` are honored. Anything else an endpoint or monitor sets — `oauth2`, proxy settings, target `relabelings`, non-keep/drop relabel actions, configMap- and file-backed TLS material, the monitor-level guard rails (`sampleLimit`, `scrapeProtocols`, …); the authoritative list is `endpointSpec.ignoredFields()` + `specLimits.ignored()` in `internal/servicemonitors` — is **reported**: logged once per monitor and counted in `kubescrape_monitor_fields_ignored_total{kind}`, so a partially-applied CR is never silent. Self-disables with a warning when the CRD is absent |
 | `-monitor-namespaces` | — | comma-separated namespaces whose ServiceMonitors/PodMonitors are honoured (empty = all, the historical default). **This is the gate**: a monitor is an instruction to every agent to issue a GET, so without it anyone who can create a ServiceMonitor in their own namespace can point `selector: {}` + `namespaceSelector.any: true` at an arbitrary path cluster-wide. It applies at INDEXING time, so a refused monitor never widens the `-scrape-auth-secrets` allowlist either. Reachable from the chart via `extraArgs` |
 | `-scrape-auth-secrets` | `false` | serve monitor endpoints' `bearerTokenSecret` values to agents on `GET /v1/scrape-auth/{ns}/{name}/{key}`. Opt-in: requires `secrets get` RBAC (commented out in the manifests), `-scrape-auth-token-file`, and ships tokens over the cluster-internal HTTP channel |
 | `-scrape-auth-token-file` | — | file with the shared bearer token callers must present on `/v1/scrape-auth` as `Authorization: Bearer <token>`. **Mandatory** with `-scrape-auth-secrets` — that endpoint is the only one serving Secret material, so starting without a token is refused rather than leaving it open to every pod in the cluster. Compared in constant time. The file is re-read about once a minute, and after a change the PREVIOUS token stays accepted for a 5-minute grace window — so rotating the Secret is a non-event: agents (which re-read their copy on the same cadence) and the service converge with no restarts and no 401 storm |
@@ -269,7 +270,7 @@ hop or an authenticating proxy.
 
 | Flag | Default | Description |
 |---|---|---|
-| `-config` | — | single YAML file holding all sections: `resourceAttributes`, `logs`, `logAttributes`, `logMetrics`, `logScrubbing`, `metrics`, `traceMetrics`, `traceSampling`, `tailSampling`, `routing`, `export` ([below](#unified-config-file)) |
+| `-config` | — | single YAML file holding all sections: `resourceAttributes`, `logs`, `logAttributes`, `logMetrics`, `logScrubbing`, `metrics`, `traceMetrics`, `traceSampling`, `tailSampling`, `serviceGraph`, `serviceGraphShards`, `routing`, `export` ([below](#unified-config-file)) |
 | `-log-dir` | `/var/log/containers` | containerd log directory; the default source when the `logs` section is unset |
 | `-positions-file` | — | single JSON file persisting BOTH log offsets and the journald cursor across restarts (mount a hostPath); empty disables persistence |
 | `-logs-watch` | `true` | fsnotify events trigger reads and discovery; polling remains the fallback |
@@ -598,9 +599,15 @@ metrics:       {pipelines: {...}, splitters: [...]}   # see Metrics config
 traceMetrics:  {dimensions: [...], buckets: [...]}    # see Agent: span metrics
 traceSampling: {probability: 0.1, ...}                # see Agent: trace sampling
 tailSampling:  {policies: [...], decisionWait: 5s}    # see Agent: tail sampling
+serviceGraph:  {wait: 10s, dimensions: [...]}         # see Agent: service graph
+serviceGraphShards: {endpoints: [...], self: ...}     # see Agent: service graph
 routing:       {routes: [...]}                        # see Agent: routing
 export:        {headers: {...}, logs: {...}, ...}     # see Per-signal destinations
 ```
+
+The two `serviceGraph*` sections are read only by the trace tier
+(`-service-graph`); every other section is ignored by a role that does not run
+the pipeline it configures.
 
 The sections below document each in turn. (Starlark transforms deliberately
 do **not** live here: they have their own file, `-transforms-file`, so they
@@ -713,6 +720,13 @@ Per-source options:
   that can produce nothing fails startup (`-check-config` catches it), and the
   section is **refused on containerd sources** — their path encodes pod
   identity that already arrives as metadata.
+
+- `parseScript: true` (plain sources) runs the transforms file's `parse:`
+  [hook](#hooks) on every line of the source, before scrubbing and the rest
+  of the chain — for exotic formats no declarative rule can read. Like
+  `pathAttributes` it is **refused on containerd sources**, whose per-line
+  budget is allocation-pinned; the hook costs one Starlark call per line on
+  the sources that opt in, and only there.
 
 Caveat: a blank line inside a plain file is dropped, so multi-line formats that
 rely on a blank separator (Go panics) do not join for plain files;
@@ -1340,7 +1354,9 @@ Every duration is a Go duration **string** (`5s`, `1m`, `500ms`), like
 The policy set and semantics are the OpenTelemetry Collector's
 `tailsamplingprocessor` — `alwaysSample`, `latency`, `statusCode`,
 `stringAttribute`, `numericAttribute`, `booleanAttribute`, `probabilistic`,
-`rateLimiting`, `and`, `composite` — spelled in this repo's camelCase, so a
+`rateLimiting`, `and`, `composite` — plus one addition of this repo's,
+`script`, whose body is the transforms file's `sample:` [hook](#hooks) and
+which is a policy type like any other in the same list. They are spelled in this repo's camelCase, so a
 Collector policy list is *transcribed* key for key rather than pasted
 (`string_attribute` → `stringAttribute`, `threshold_ms: 500` →
 `threshold: "500ms"`). A leftover snake_case key is a strict-decode failure, not
@@ -1704,7 +1720,8 @@ The parse hook runs **only** on plain sources that opt in with
 
 ### Deliberate refusals
 
-Three hook points were considered and refused; they are recorded here so the
+Two hook points and two script capabilities were considered and refused; they
+are recorded here so the
 next person to want one finds the reasoning rather than an accident:
 
 * **No per-line hook on the containerd tail path, and no per-sample hook in
@@ -1798,7 +1815,9 @@ resourceAttributes:
   # container.image.name, service.name (workload owner). Default true.
   defaults: true
 
-  # Fixed attributes on every resource (flag statics override these).
+  # Fixed attributes on every resource. This is the only home for them: the
+  # former -resource-attrs-static flag is gone, and the chart's convenience
+  # value agent.staticAttrs merges INTO this map (an explicit entry here wins).
   static:
     k8s.cluster.name: prod-eu
 
@@ -1956,10 +1975,15 @@ metric name — the action is matched case-insensitively, so the CRD-legal
 `Keep`/`Drop` spellings work) is applied per sample by the agent.
 Per-endpoint `interval`/`scrapeTimeout` **are** interpreted (each target is
 scheduled on its own period — see the `-servicemonitors` row above), as are
-`basicAuth` and `authorization`. Relabel actions other than keep/drop, and
-authentication schemes other than those listed, are ignored — and reported,
+`basicAuth` and `authorization`. Every other field an endpoint or monitor
+sets that kubescrape does not interpret — relabel actions other than
+keep/drop, other authentication schemes, proxy settings, the monitor-level
+guard rails — is ignored **and reported**,
 never silently: they are collected into `Endpoint.Ignored`, logged once per
 monitor, and counted in `kubescrape_monitor_fields_ignored_total{kind}`.
+The authoritative list is `endpointSpec.ignoredFields()` +
+`specLimits.ignored()` in `internal/servicemonitors`; this document
+deliberately does not enumerate it (hand-kept copies drifted).
 
 ## Helm values
 

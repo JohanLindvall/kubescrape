@@ -165,7 +165,13 @@ Targets come from four sources:
 
 Pods without an IP or in phase `Succeeded`/`Failed` are excluded, and
 duplicate endpoints reachable through both sources are reported once (pod
-source wins). Each target embeds the complete pod metadata (including owners
+source wins; a monitor-derived target upgrades an annotation one wholesale).
+Two **monitors** resolving to the same URL on one pod are served as **one
+merged target** honouring both endpoint declarations — relabel chains
+concatenate, the finer explicit cadence wins, one-sided auth/TLS is adopted
+whole — with the contributing monitors listed in an additive `monitors`
+field (absent on single-monitor targets, so existing consumers decode
+unchanged). Each target embeds the complete pod metadata (including owners
 and namespace metadata); service-derived targets also embed the service's
 identity, labels and annotations:
 
@@ -491,6 +497,8 @@ metrics:       {pipelines: {...}, splitters: [...]}   # scraped-series rules
 traceMetrics:  {dimensions: [...], buckets: [...], staleAfter: 15m}  # span-derived RED metrics (trace tier)
 traceSampling: {probability: 0.1, ...}          # sample spans by trace ID (trace tier)
 tailSampling:  {policies: [...], decisionWait: 5s}   # decide whole traces (trace tier)
+serviceGraph:  {wait: 10s, dimensions: [...]}   # edge pairing and its bounds (trace tier)
+serviceGraphShards: {endpoints: [...], self: ...}   # the ring, in its richer form (trace tier)
 routing:       {routes: [...]}    # per-namespace fan-out / tenancy
 export:        {headers: {...}, logs: {...}, metrics: {...}, traces: {...}}  # per-signal OTLP destinations, buffered-chain headers, mTLS
 ```
@@ -545,7 +553,11 @@ one JSON object in a pod annotation: `exclude` (opt the pod out of
 collection entirely), `multiline` (override stack-trace joining for this
 pod), `serviceName` (override the derived `service.name`), `attributes`
 (extra resource attributes, overwriting — the workload is authoritative
-about itself), and `rules` (keep/drop/sample rules, same shape as
+about itself, with one carve-out: keys naming resolved Kubernetes identity
+(namespace, pod, container, node) are refused and counted in
+`kubescrape_log_pod_attrs_refused_total{key}`, because `k8s.namespace.name`
+is the routing key and honouring it would let any pod redirect its logs into
+another tenant), and `rules` (keep/drop/sample rules, same shape as
 `logs.rules`, evaluated **before** the global chain: a pod-rule drop is
 final, a pod-rule keep still passes through the global rules):
 
@@ -580,7 +592,8 @@ logScrubbing:
       replacement: 'session=[REDACTED]'
 ```
 
-It applies to the tailer, journald and OTLP-ingest log paths alike. Every
+It applies to every log-producing pipeline alike — the tailer, journald,
+Kubernetes events, Azure diagnostics and OTLP-ingested logs. Every
 built-in pattern carries a cheap prefilter, so the no-match hot path costs a
 scan or two and zero allocations. The key-value pattern's prefilter checks the
 whole `keyword[suffix]["]:=` SHAPE rather than the bare keyword: admitting a
@@ -597,7 +610,9 @@ pending gates in the body (`not ready: metadata-service`). A DaemonSet rolling
 update advances on this, so a new pod that cannot reach the metadata service —
 and could therefore attribute nothing — halts the rollout instead of replacing
 every node. Receiving pipelines gate on their own listeners being bound
-(`otlp-ingest` for `-ingest`, `service-graph-ingest` on the trace tier), since
+(`otlp-ingest` for `-ingest`; the trace tier has both `service-graph-ingest`
+for the application ports and `service-graph-receiver` for the internal
+listener), since
 a rollout that advanced past an unbound receiver would leave the applications
 pushing into a void on every node it had already replaced.
 
@@ -974,7 +989,17 @@ For each pushed resource it finds a container ID (`container.id` /
 the metadata service (a container ID pins the exact incarnation), and merges
 the k8s resource attributes **without overwriting anything the sender already
 set**. Pushed log bodies additionally run the same line enrichment as the
-tailer (`-enrich`, filling only fields the sender left unset).
+tailer (`-enrich`, filling only fields the sender left unset) — and the rest
+of the log chain reaches them too: `logScrubbing` redacts the bodies, and the
+same compiled `logMetrics` and `logs.rules` that serve the tailer observe and
+filter each ingested record (metrics before rules; a dropped record is still
+acked, and an all-dropped payload acks without a send), so one config selects
+identically however a line arrived. Line-derived processing is
+sender-bounded (oversized bodies, over-wide or excess resources are skipped
+and counted in `kubescrape_ingest_log_chain_skipped_total{reason}`, the data
+still forwarded), and per-resource admission policy is the transforms file's
+`ingest:` hook (rejections count into
+`kubescrape_ingest_admission_rejected_total`).
 Metrics resolve per `-ingest-metrics-mode`: `resource` (the ID is a resource
 attribute), `datapoint` (the ID is a per-point label; points are split into
 one resource per object, as a kube-state-metrics-style stream needs), or
@@ -995,9 +1020,10 @@ the process that also tails the node's logs. Over the bound a sender is refused
 **retryably**, never dropped: HTTP `429` with `Retry-After: 1`, gRPC
 `ResourceExhausted` **with a `RetryInfo` detail** (without it, conformant
 senders read the code as permanent and discard the batch). Because a body is
-read (and a gRPC message decoded) *before* a slot is taken, a second fixed bound
-of 64 MiB caps the raw payload bytes both transports may buffer at once, refused
-the same retryable way. Refusals count into `kubescrape_ingest_rejected_total`.
+read (and a gRPC message decoded) *before* a slot is taken, a second bound —
+64 MiB, or four times `-ingest-grpc-max-recv-bytes` when that flag lifts the
+per-message cap past it — caps the raw payload bytes both transports may buffer
+at once, refused the same retryable way. Refusals count into `kubescrape_ingest_rejected_total`.
 
 **Trace sampling** (`traceSampling` section, on the trace tier). Received spans
 can be sampled before export: `probability` keeps that fraction of **traces**
@@ -1029,7 +1055,8 @@ for a **decision window** (`decisionWait`, 5s) and then judges the *whole trace*
 against an ordered policy list — the OpenTelemetry Collector's
 `tailsamplingprocessor` vocabulary (`statusCode`, `latency`, `stringAttribute`,
 `numericAttribute`, `booleanAttribute`, `probabilistic`, `rateLimiting`, `and`,
-`composite`) in this repo's camelCase, **first match wins**, so the policy that
+`composite` — plus this repo's `script`, whose body is the transforms file's
+`sample:` hook) in this repo's camelCase, **first match wins**, so the policy that
 kept a trace is a metric label rather than "some subset of the list". It runs
 below the head sampler and below both taps, so the graph and the RED metrics
 still see 100% of spans; the two samplers **nest** rather than compound (both
@@ -1244,7 +1271,8 @@ program's content hash, for checking per-node convergence after a reload),
 and `GET /debug/otlp` — a **live stream** of what the agent is exporting
 (logs, metrics and traces, post-transform) as OTLP JSON lines, filtered by
 resource attributes (`attr=key=value`, `*`/`?` wildcards on both halves,
-ANDed) and downsampled (`sample=10`), with a built-in page at
+ANDed), by signal (`signal=logs|metrics|traces`) and downsampled
+(`sample=10`), with a built-in page at
 `/debug/otlp/ui`; it costs one atomic load per export until a client
 attaches, and a slow client drops (counted on its own stream) rather than
 ever back-pressuring delivery.
@@ -1351,9 +1379,13 @@ script runs once per exported **batch** at the exporter seam, above the disk
 buffer — so spooled bytes are final and a reload never re-interprets a
 durable backlog. Batch elements are **lazy host objects** over the OTLP
 data: log records expose `body`, `severity_text`, `severity_number`,
-`attributes`, `resource` and `drop()`; spans expose `name`, `status_code`,
-`attributes`, `resource`, `drop()`; metrics expose `name`, `resource`,
-`drop()` — mutations are in place, a script pays only for the fields it
+`attributes`, `resource`, timestamps (writable), trace/span IDs and the
+scope name, plus `drop()`; spans expose `name`, `kind`, `status_code`,
+`status_message`, `duration_ms`, IDs, `attributes`, `resource`, `drop()`;
+metrics expose `name`, `type`, `unit`, `description`, `resource`, `drop()`
+and `datapoints` — per-point attributes, scalar `value` and per-point
+`drop()`, so shedding one label set doesn't cost the whole metric.
+Mutations are in place, a script pays only for the fields it
 touches, and dropped elements (and emptied groups) are pruned after the run:
 
 ```yaml
@@ -1364,6 +1396,22 @@ logs: |
               r.drop()
           r.resource["env"] = "prod"
 ```
+
+Every item also carries two verbs beyond mutation: `route("name")` sends its
+payload to a named `routing` route ahead of the namespace globs, and
+`emit_metric(name, value, labels)` observes into a **declared** `logMetrics`
+series (an undeclared name is a script error). Scripts are predeclared `re`
+(RE2, with a bounded compile cache) and a 1/s-throttled `log()`. The same
+file can define four **hooks**, all fail-open (an error means the hook did
+nothing, counted and warned): `ingest:` `admit(resource)` runs per pushed
+resource before enrichment — the operator's per-sender policy on the
+unauthenticated listeners; `targets:` `target(t)` runs per scrape target per
+cycle (drop or rewrite paths); `sample:` `decide(trace)` is the body of tail
+sampling's `type: script` policy; and `parse:` `parse(line)` pre-parses
+lines of plain log sources flagged `parseScript: true` (refused on
+containerd sources, whose per-line budget is allocation-pinned). See
+[docs/CONFIGURATION.md](docs/CONFIGURATION.md#agent-transforms-starlark) for
+the full surface and its deliberate refusals.
 
 The file is **hot-reloaded** (fsnotify on the directory — mount its
 ConfigMap as a directory, not `subPath`, or updates never arrive — with a

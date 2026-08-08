@@ -15,8 +15,9 @@ terminationGracePeriodSeconds: 60
 # Prometheus /metrics endpoint on a DEDICATED port, serving this process's Go
 # runtime and process metrics (go_*, process_*). Separate from the health/debug
 # listener so the scrape target can be exposed independently. kubescrape's own
-# kubescrape_* metrics are NOT here: they are pushed over OTLP with the
-# telemetry the service produces about the cluster.
+# kubescrape_* metrics are NOT here while the OTLP push runs (the default):
+# they ride the push. With selfMetricsInterval: 0 the push is off and this
+# port serves them too — one knob selects the delivery, never both.
 metrics:
   enabled: true
   listen: ":9090"
@@ -52,10 +53,13 @@ service:
   # Serve targets for monitoring.coreos.com ServiceMonitors that select
   # pod-backed Services (needs the CRD installed; RBAC is always granted).
   # PodMonitors are discovered under the same flag whenever the
-  # cluster serves that CRD. Endpoint tlsConfig.insecureSkipVerify,
-  # bearerTokenSecret and keep/drop metricRelabelings are honored; serving
-  # the bearer tokens to agents additionally needs -scrape-auth-secrets
-  # (see extraArgs below).
+  # cluster serves that CRD. Honored per endpoint: port/targetPort/path/
+  # scheme, interval/scrapeTimeout, basicAuth, authorization,
+  # bearerTokenSecret, tlsConfig (insecureSkipVerify, secret-backed
+  # ca/cert/keySecret, serverName) and keep/drop metricRelabelings; anything
+  # else is reported, never silently dropped. Serving the secret-backed
+  # material to agents additionally needs -scrape-auth-secrets
+  # (see scrapeAuthSecrets below).
   # NOTE: honouring monitors cluster-wide means any namespace owner can direct
   # every agent's scrapes. Restrict which namespaces' monitors count with
   # `extraArgs: [-monitor-namespaces=monitoring,platform]` — and note the
@@ -75,8 +79,6 @@ service:
     bearerTokenSecret:
       name: ""
       key: token
-  # Less-common service flags go here (scrapeAuthSecrets below already passes
-  # -scrape-auth-secrets and -scrape-auth-token-file; do not repeat them).
 
   # Serve monitor endpoints' bearerTokenSecret (and the other secret-backed
   # auth/TLS material) to agents on GET /v1/scrape-auth. Setting this to true
@@ -105,6 +107,8 @@ service:
     value: ""            # literal token to put in the generated Secret
   # Extra ClusterRole rules appended verbatim.
   extraRules: []
+  # Less-common service flags go here (scrapeAuthSecrets above already passes
+  # -scrape-auth-secrets and -scrape-auth-token-file; do not repeat them).
   extraArgs: []
   resources:
     requests:
@@ -250,7 +254,9 @@ agent:
   # Close the fd of a fully-caught-up file after this much inactivity. The open
   # fd is the only handle to a rotated-away or deleted file's remaining bytes,
   # so this trades the zero-loss guarantee for bounded fd usage: 0 (never) is
-  # the default. Set it only if a node tracks thousands of log files.
+  # the default. Set it only if a node tracks thousands of log files. Use a
+  # duration string ("30s"); the schema refuses bare non-zero integers, which
+  # would fail the agent's flag parse.
   logsIdleClose: 0
   # Stamp log.file.name and log.file.position (byte offset) on every record,
   # for each file source.

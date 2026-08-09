@@ -109,7 +109,8 @@ type subscriber struct {
 	sample  float64 // percent of matching RESOURCES kept, 0-100
 	ch      chan []byte
 	dropped atomic.Int64
-	// queued tracks the bytes sitting in ch: charged on send, released by the
+	// queued tracks the bytes sitting in ch: reserved before the send (and
+	// released again when the send loses to a full channel), released by the
 	// reader after receive.
 	queued atomic.Int64
 }
@@ -221,26 +222,44 @@ func (s *subscriber) keeps(attrs pcommon.Map, randFloat func() float64) bool {
 }
 
 // offer renders the payload once per subscriber (their filters differ) and
-// delivers without blocking: a full channel counts a drop instead.
+// delivers without blocking: an over-budget or full channel counts a drop
+// instead. The subscriber set is snapshotted and t.mu released BEFORE any
+// rendering: a render is a deep copy plus a JSON marshal (~70 ms for a
+// 16 MiB payload), and holding the lock across it would serialise every
+// concurrent export in the process — the ingest handlers, the scrape
+// goroutines, the tailer's single sweep — behind one debug session's
+// renders. A snapshotted subscriber is safe to use unlocked: its fields are
+// set once before publication, its counters are atomics, and unsubscribe
+// only removes it from the map — the channel is never closed, so a send
+// racing an unsubscribe at worst parks the payload in a channel nobody
+// reads until the subscriber is collected.
 func (t *Tap) offer(sig signal, render func(*subscriber) ([]byte, bool)) {
 	t.mu.Lock()
-	defer t.mu.Unlock()
+	subs := make([]*subscriber, 0, len(t.subs))
 	for _, sub := range t.subs {
-		if sub.signals&sig == 0 {
-			continue
+		if sub.signals&sig != 0 {
+			subs = append(subs, sub)
 		}
+	}
+	t.mu.Unlock()
+	for _, sub := range subs {
 		b, ok := render(sub)
 		if !ok {
 			continue
 		}
-		if sub.queued.Load()+int64(len(b)) > maxQueuedBytes {
+		// Reserve the bytes before the send: offers are no longer serialised
+		// by t.mu, and load-then-add would let racing exports pass the budget
+		// check together and overshoot the cap.
+		n := int64(len(b))
+		if sub.queued.Add(n) > maxQueuedBytes {
+			sub.queued.Add(-n)
 			sub.dropped.Add(1)
 			continue
 		}
 		select {
 		case sub.ch <- b:
-			sub.queued.Add(int64(len(b)))
 		default:
+			sub.queued.Add(-n)
 			sub.dropped.Add(1)
 		}
 	}

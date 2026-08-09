@@ -730,3 +730,42 @@ func TestNeverCompletingGroupIsBounded(t *testing.T) {
 		t.Fatal("committed still pinned at the group start after the bound flush")
 	}
 }
+
+// The STAGE-1 sibling of the test above: a run of P fragments whose F never
+// arrives (a workload writing one endless logical line). Nothing reaches the
+// stage-2 FIFO, so boundGroup cannot see it, and every fragment refreshes the
+// age-out stamps, so FlushBefore never fires — the watermark then pinned at
+// runStart forever: checkpoint frozen (a crash re-ingests the whole window),
+// idle-close blocked, one unretirable segment per carried rotation. Past
+// double MaxEntryBytes of consumed run bytes the crossing fragment is
+// rewritten as the F line that closes the run, and the checkpoint advances.
+func TestEndlessFragmentRunDoesNotWedgeTheCheckpoint(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+	exp := &fakeExporter{}
+	tl := newTestTailer(dir, "", exp)
+	tl.cfg.MaxEntryBytes = 256 // force-close a run past 512 consumed bytes
+
+	tl.scanDir(tl.loadCheckpoints(), true)
+	ts := timeNowCRI()
+	frag := strings.Repeat("x", 40)
+	lines := make([]string, 0, 64)
+	for range 64 { // ~5 KiB of fragments, no F anywhere
+		lines = append(lines, ts+" stdout P "+frag)
+	}
+	writeLog(t, dir, lines...)
+	tl.scanDir(nil, false)
+	tl.sweep(ctx, true)
+	tl.flush(ctx)
+
+	f := tl.files[filepath.Join(dir, logName)]
+	if f == nil {
+		t.Fatal("file not tracked")
+	}
+	if f.committed == 0 {
+		t.Fatal("committed still pinned at the run start: the endless P-run wedged the checkpoint")
+	}
+	if len(exp.get()) == 0 {
+		t.Fatal("no entry emitted from the force-closed run")
+	}
+}

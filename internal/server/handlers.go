@@ -856,12 +856,18 @@ const maxNodeTargetETags = 8192
 // json.Marshal at 48.6% of the request's CPU). With a 10s TTL under a 30s
 // scrape interval EVERY agent poll is exactly this request.
 //
-// Answering from a memo younger than the TTL is not a weaker guarantee than the
-// response already gives: max-age says in as many words that the client may
-// serve its copy for that long WITHOUT asking. A revalidation inside the same
-// window can therefore only confirm what the client was already entitled to
-// assume. Past the TTL the memo is ignored and the response is rebuilt, which
-// is where a changed target list becomes a 200.
+// Staleness stays bounded by the TTL because every grant — the 200's and this
+// 304's alike — expires by builtAt+TTL, the last instant the store is known to
+// have agreed with the tag. The 200 hands out exactly that window. The 304 must
+// hand out LESS: the revalidating client is not necessarily the requester whose
+// build stamped builtAt (any other caller — a second agent during a rolling
+// update, an operator's curl, a restarted client — rebuilds the unchanged list
+// and refreshes the memo), so re-stamping a FULL max-age on an up-to-TTL-old
+// memo would entitle a lapsed client to its copy until builtAt+2×TTL while the
+// list may have changed just after builtAt. The 304 therefore advertises only
+// the REMAINING window, floored to whole seconds (rounding can only shorten
+// the grant, never extend it); once nothing remains the memo is ignored and
+// the response is rebuilt, which is where a changed target list becomes a 200.
 //
 // Only the tag is memoised, never the body: the body is the whole node's pod
 // set (2.21 MB at 110 pods), and holding one per node would put hundreds of
@@ -877,12 +883,20 @@ func (s *Server) nodeTargetsNotModified(w http.ResponseWriter, r *http.Request, 
 	s.targetsMu.Lock()
 	e, ok := s.targetsETags[node]
 	s.targetsMu.Unlock()
-	if !ok || s.now().Sub(e.builtAt) >= s.cacheTTL || !etagMatches(match, e.etag) {
+	if !ok || !etagMatches(match, e.etag) {
+		return false
+	}
+	// The remaining window, floored: the client's expiry must not pass
+	// builtAt+TTL (the bound argued above). A remainder under a second grants
+	// nothing, so the memo counts as expired — which subsumes the age >= TTL
+	// check — and the store is consulted.
+	maxAge := int((s.cacheTTL - s.now().Sub(e.builtAt)) / time.Second)
+	if maxAge < 1 {
 		return false
 	}
 	h := w.Header()
 	h.Set("Content-Type", "application/json")
-	h.Set("Cache-Control", s.cacheControl(false))
+	h.Set("Cache-Control", "max-age="+strconv.Itoa(maxAge))
 	h.Set("ETag", e.etag)
 	w.WriteHeader(http.StatusNotModified)
 	return true

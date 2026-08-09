@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -220,6 +221,91 @@ func TestQueueIsByteBounded(t *testing.T) {
 	}
 	if q := sub.queued.Load(); q > maxQueuedBytes {
 		t.Fatalf("queued %d bytes, cap %d", q, int64(maxQueuedBytes))
+	}
+}
+
+// Renders run OUTSIDE the tap mutex (offer snapshots the subscriber set and
+// releases t.mu before copying/marshaling), so concurrent exports, subscriber
+// churn and readers draining mid-offer must coexist with no deadlock and no
+// send on a closed channel — unsubscribe only unpublishes, it never closes
+// sub.ch. Run under -race; the pinned unread stream proves the bounded queue
+// keeps counting drops through the churn.
+func TestConcurrentOffersRaceSubscriberChurn(t *testing.T) {
+	inner := &fakeInner{}
+	tap := New(inner)
+
+	pinned, unsubPinned := tap.subscribe(sigLogs, nil, 100)
+	defer unsubPinned()
+
+	const exporters = 8
+	const exportsEach = 200
+	var churn sync.WaitGroup
+	stop := make(chan struct{})
+	// With pinned held, four churners are one more than maxSubscribers, so
+	// cap refusals race the offers too.
+	for range 4 {
+		churn.Add(1)
+		go func() {
+			defer churn.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				sub, unsub := tap.subscribe(sigLogs, nil, 100)
+				if sub == nil {
+					continue
+				}
+				select { // drain like the HTTP reader, racing offer's send
+				case b := <-sub.ch:
+					sub.queued.Add(int64(-len(b)))
+				default:
+				}
+				unsub()
+			}
+		}()
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		var wg sync.WaitGroup
+		for range exporters {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				ld := logsWithNamespaces("team-a", "team-b")
+				for range exportsEach {
+					if err := tap.ExportLogs(context.Background(), ld); err != nil {
+						t.Error(err)
+						return
+					}
+				}
+			}()
+		}
+		wg.Wait()
+	}()
+	select {
+	case <-done:
+	case <-time.After(30 * time.Second):
+		t.Fatal("exports deadlocked against subscriber churn")
+	}
+	close(stop)
+	churn.Wait()
+
+	const total = exporters * exportsEach
+	if got := inner.logs.Load(); got != total {
+		t.Fatalf("inner exports = %d, want %d", got, total)
+	}
+	// Every export offered pinned exactly one payload: enqueued or dropped.
+	if got := int64(len(pinned.ch)) + pinned.dropped.Load(); got != total {
+		t.Fatalf("pinned enqueued+dropped = %d, want %d", got, total)
+	}
+	if pinned.dropped.Load() == 0 {
+		t.Fatal("an unread stream took every payload without a counted drop")
+	}
+	if q := pinned.queued.Load(); q < 0 || q > maxQueuedBytes {
+		t.Fatalf("queued = %d, want within [0, %d]", q, int64(maxQueuedBytes))
 	}
 }
 

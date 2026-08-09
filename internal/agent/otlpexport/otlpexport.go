@@ -405,17 +405,7 @@ func (c *Client) sendLogsOnce(ctx context.Context, ld plog.Logs) error {
 	if err != nil {
 		return err
 	}
-	var raw []byte
-	if err := c.httpPost(ctx, c.logsURL, body, &raw); err != nil {
-		return err
-	}
-	if len(raw) > 0 {
-		resp := plogotlp.NewExportResponse()
-		if resp.UnmarshalProto(raw) == nil {
-			c.notePartial("logs", resp.PartialSuccess().RejectedLogRecords(), resp.PartialSuccess().ErrorMessage())
-		}
-	}
-	return nil
+	return c.httpExport(ctx, "logs", c.logsURL, body, logsPartialSuccess)
 }
 
 // ExportTraces sends one traces payload (single attempt; the pushing sender
@@ -453,17 +443,7 @@ func (c *Client) sendTracesOnce(ctx context.Context, td ptrace.Traces) error {
 	if err != nil {
 		return err
 	}
-	var raw []byte
-	if err := c.httpPost(ctx, c.tracesURL, body, &raw); err != nil {
-		return err
-	}
-	if len(raw) > 0 {
-		resp := ptraceotlp.NewExportResponse()
-		if resp.UnmarshalProto(raw) == nil {
-			c.notePartial("traces", resp.PartialSuccess().RejectedSpans(), resp.PartialSuccess().ErrorMessage())
-		}
-	}
-	return nil
+	return c.httpExport(ctx, "traces", c.tracesURL, body, tracesPartialSuccess)
 }
 
 func outcome(err error) string {
@@ -562,17 +542,7 @@ func (c *Client) sendMetricsOnce(ctx context.Context, md pmetric.Metrics) error 
 	if err != nil {
 		return err
 	}
-	var raw []byte
-	if err := c.httpPost(ctx, c.metricsURL, body, &raw); err != nil {
-		return err
-	}
-	if len(raw) > 0 {
-		resp := pmetricotlp.NewExportResponse()
-		if resp.UnmarshalProto(raw) == nil {
-			c.notePartial("metrics", resp.PartialSuccess().RejectedDataPoints(), resp.PartialSuccess().ErrorMessage())
-		}
-	}
-	return nil
+	return c.httpExport(ctx, "metrics", c.metricsURL, body, metricsPartialSuccess)
 }
 
 // grpcAuth attaches the bearer token as outgoing gRPC metadata.
@@ -588,6 +558,58 @@ func (c *Client) grpcAuth(ctx context.Context) (context.Context, error) {
 		return ctx, nil
 	}
 	return metadata.AppendToOutgoingContext(ctx, "authorization", "Bearer "+token), nil
+}
+
+// httpExport is the OTLP/HTTP send every signal shares — the three pdata sends
+// and rawsend.go's three raw (spooled-bytes) siblings: post the body, then
+// surface the collector's partial_success from the bounded 2xx response read
+// (httpPost, maxExportRespBytes). A partial-success rule change (the bound, the
+// counting, a new response field) belongs here, once — six copies of this flow
+// had nothing keeping them equal, and missing one diverged the pdata path from
+// the raw path for one signal.
+//
+// partial extracts the signal's (rejected, message) pair; an undecodable body
+// returns (0, ""), which notePartial's own guard reads as "no partial success"
+// — the same verdict a successful gRPC Export with an empty PartialSuccess
+// carries, and never an export failure (the payload WAS accepted).
+func (c *Client) httpExport(ctx context.Context, signal, url string, body []byte, partial func([]byte) (int64, string)) error {
+	var raw []byte
+	if err := c.httpPost(ctx, url, body, &raw); err != nil {
+		return err
+	}
+	if len(raw) > 0 {
+		rejected, msg := partial(raw)
+		c.notePartial(signal, rejected, msg)
+	}
+	return nil
+}
+
+// The per-signal partial_success extractors for httpExport. Package-level
+// funcs, not method values or closures — passing them costs no per-call
+// allocation.
+
+func logsPartialSuccess(raw []byte) (int64, string) {
+	resp := plogotlp.NewExportResponse()
+	if resp.UnmarshalProto(raw) != nil {
+		return 0, ""
+	}
+	return resp.PartialSuccess().RejectedLogRecords(), resp.PartialSuccess().ErrorMessage()
+}
+
+func metricsPartialSuccess(raw []byte) (int64, string) {
+	resp := pmetricotlp.NewExportResponse()
+	if resp.UnmarshalProto(raw) != nil {
+		return 0, ""
+	}
+	return resp.PartialSuccess().RejectedDataPoints(), resp.PartialSuccess().ErrorMessage()
+}
+
+func tracesPartialSuccess(raw []byte) (int64, string) {
+	resp := ptraceotlp.NewExportResponse()
+	if resp.UnmarshalProto(raw) != nil {
+		return 0, ""
+	}
+	return resp.PartialSuccess().RejectedSpans(), resp.PartialSuccess().ErrorMessage()
 }
 
 // pooledBody hands a pooled buffer to net/http without letting net/http

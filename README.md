@@ -1428,8 +1428,11 @@ the producer's usual semantics). The active program's content hash is on
 Kubernetes namespace** to extra destinations or tenants: each route matches
 `k8s.namespace.name` against glob patterns (first matching route wins) and
 forwards to its own OTLP client — a different `endpoint`, extra `headers`
-(e.g. `X-Scope-OrgID` for per-tenant Mimir/Loki), or both; route clients
-otherwise inherit the main `-otlp-*` settings. Unmatched resources use the
+(e.g. `X-Scope-OrgID` for per-tenant Mimir/Loki), or both; an endpoint-less
+route inherits the whole `-otlp-*` base, while a route with its own endpoint
+inherits transport, headers and (unless it sets `insecure` itself) the
+base's plaintext-vs-TLS choice but **never the base credentials** — those
+are per-route fields. Unmatched resources use the
 default chain. Payloads are split per destination; a failed destination
 fails the whole export, and the producer's retry re-splits
 deterministically (destinations that already succeeded receive duplicates —

@@ -140,17 +140,7 @@ func (c *Client) sendRawLogsOnce(ctx context.Context, data []byte) error {
 		}
 		return err
 	}
-	var raw []byte
-	if err := c.httpPost(ctx, c.logsURL, data, &raw); err != nil {
-		return err
-	}
-	if len(raw) > 0 {
-		resp := plogotlp.NewExportResponse()
-		if resp.UnmarshalProto(raw) == nil {
-			c.notePartial("logs", resp.PartialSuccess().RejectedLogRecords(), resp.PartialSuccess().ErrorMessage())
-		}
-	}
-	return nil
+	return c.httpExport(ctx, "logs", c.logsURL, data, logsPartialSuccess)
 }
 
 func (c *Client) sendRawMetricsOnce(ctx context.Context, data []byte) error {
@@ -171,17 +161,7 @@ func (c *Client) sendRawMetricsOnce(ctx context.Context, data []byte) error {
 		}
 		return err
 	}
-	var raw []byte
-	if err := c.httpPost(ctx, c.metricsURL, data, &raw); err != nil {
-		return err
-	}
-	if len(raw) > 0 {
-		resp := pmetricotlp.NewExportResponse()
-		if resp.UnmarshalProto(raw) == nil {
-			c.notePartial("metrics", resp.PartialSuccess().RejectedDataPoints(), resp.PartialSuccess().ErrorMessage())
-		}
-	}
-	return nil
+	return c.httpExport(ctx, "metrics", c.metricsURL, data, metricsPartialSuccess)
 }
 
 func (c *Client) sendRawTracesOnce(ctx context.Context, data []byte) error {
@@ -202,17 +182,7 @@ func (c *Client) sendRawTracesOnce(ctx context.Context, data []byte) error {
 		}
 		return err
 	}
-	var raw []byte
-	if err := c.httpPost(ctx, c.tracesURL, data, &raw); err != nil {
-		return err
-	}
-	if len(raw) > 0 {
-		resp := ptraceotlp.NewExportResponse()
-		if resp.UnmarshalProto(raw) == nil {
-			c.notePartial("traces", resp.PartialSuccess().RejectedSpans(), resp.PartialSuccess().ErrorMessage())
-		}
-	}
-	return nil
+	return c.httpExport(ctx, "traces", c.tracesURL, data, tracesPartialSuccess)
 }
 
 // rawSingleAttemptSends resolves each signal to ITS destination, like the

@@ -316,6 +316,12 @@ type streamState struct {
 	lastEnd  pos
 	runStart pos
 	hasRun   bool
+	// runBytes counts the bytes consumed by the CURRENT stage-1 fragment run
+	// (a byte count, not an offset, so a run carried across a rename rotation
+	// keeps accumulating where segment-qualified offsets could not subtract).
+	// feedLine bounds it: past double the retention cap the run force-closes
+	// (the never-completing-run wedge — see the bound in feedLine).
+	runBytes int64
 
 	// fifo holds the buffered logical lines; the live ones are fifo[fifoHead:].
 	// Consumption advances fifoHead rather than re-slicing fifo, so the backing

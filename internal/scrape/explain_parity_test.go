@@ -3,6 +3,8 @@ package scrape
 import (
 	"strings"
 	"testing"
+
+	"github.com/JohanLindvall/kubescrape/internal/services"
 )
 
 // The explain functions MUST give the same verdict as the derivation they
@@ -113,6 +115,52 @@ func TestExplainServicePortsParityOnDegenerateAnnotations(t *testing.T) {
 			t.Errorf("%s: derivation served %d targets, explain resolved %d ports; want 2/2 (every service port)",
 				tc.name, len(targets), resolvedPorts(verdicts))
 		}
+	}
+}
+
+func TestExplainServicePortsParityOnSharedPodPort(t *testing.T) {
+	// Two service ports translating to the SAME pod port: ServiceTargets'
+	// seen-port dedup serves ONE target, so explain must claim exactly one
+	// resolving entry and say why the later one adds nothing.
+	pod := basePod()
+	svc := baseService()
+	svc.Ports = []services.Port{
+		{Name: "http", Port: 80, TargetPortNum: 8080},
+		{Name: "https", Port: 443, TargetPortNum: 8080},
+	}
+
+	if targets := ServiceTargets(pod, svc); len(targets) != 1 || targets[0].Port != 8080 {
+		t.Fatalf("derivation served %+v, want one target on pod port 8080", targets)
+	}
+	verdicts, annotated := ExplainServicePorts(pod, svc)
+	if annotated {
+		t.Errorf("explain reports annotated=true with no port annotation")
+	}
+	if len(verdicts) != 2 || resolvedPorts(verdicts) != 1 {
+		t.Fatalf("want 2 verdicts resolving 1 port, got %+v", verdicts)
+	}
+	if len(verdicts[0].Ports) != 1 || verdicts[0].Ports[0] != 8080 || verdicts[0].Note != "" {
+		t.Errorf("first entry = %+v, want it resolving 8080 with no note", verdicts[0])
+	}
+	if len(verdicts[1].Ports) != 0 || !strings.Contains(verdicts[1].Note, "pod port 8080, already claimed by service port 80") {
+		t.Errorf("second entry = %+v, want no ports and the already-claimed note", verdicts[1])
+	}
+
+	// The dedup spans annotation entries too — same two ports, selected
+	// explicitly.
+	svc.Annotations[AnnotationPort] = "80, 443"
+	if targets := ServiceTargets(pod, svc); len(targets) != 1 {
+		t.Fatalf("annotated: derivation served %+v, want one target", targets)
+	}
+	verdicts, annotated = ExplainServicePorts(pod, svc)
+	if !annotated {
+		t.Errorf("annotated: explain reports annotated=false for a present annotation")
+	}
+	if len(verdicts) != 2 || resolvedPorts(verdicts) != 1 {
+		t.Fatalf("annotated: want 2 verdicts resolving 1 port, got %+v", verdicts)
+	}
+	if !strings.Contains(verdicts[1].Note, "already claimed by service port 80") {
+		t.Errorf("annotated: second entry = %+v, want the already-claimed note", verdicts[1])
 	}
 }
 

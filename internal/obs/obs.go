@@ -182,8 +182,9 @@ var (
 	LogScrubbed = Registry.CounterVec("kubescrape_log_scrubbed_total",
 		"Log bodies redacted by a scrub pattern (one bump per pattern per record, not per match).", "pattern")
 	LogArchiveErrors = Registry.Counter("kubescrape_log_archive_errors_total",
-		"Compressed log files whose stream failed to decode mid-read (truncated gzip, trailing garbage). "+
-			"What decoded before the error is delivered; the remainder is unrecoverable and the archive settles.")
+		"Compressed log files whose remainder was lost: the stream failed to decode mid-read (truncated gzip, "+
+			"trailing garbage), or the file vanished with uncommitted data and no retained fd. What decoded "+
+			"before the failure is delivered; the remainder is unrecoverable and the archive settles.")
 	LogDrainErrors = Registry.CounterVec("kubescrape_log_drain_errors_total",
 		"Reads that failed part-way through DRAINING a file incarnation that is going away (a rotated inode, a "+
 			"compressed archive). The drain cannot be retried — the next sweep would fail identically while "+
@@ -557,6 +558,8 @@ var (
 		"Event watch restarts (a closed stream, an error, or an expired resourceVersion).")
 	EventRelists = Registry.CounterVec("kubescrape_event_relists_total",
 		"Event watches that fell back to a relist because the stored resourceVersion had aged out of the API server's watch window.", "stage")
+	EventGapDiscarded = Registry.CounterVec("kubescrape_event_gap_discarded_total",
+		"Event watch expiries with no relist to fall back to (nothing exported yet and none armed): the next stream restarts at the CURRENT revision and whatever the dead watch never delivered is discarded — the events pipeline's one silent-loss arm, worth an alert wherever kubescrape_event_relists_total has one.", "stage")
 	EventPositionErrors = Registry.CounterVec("kubescrape_event_position_errors_total",
 		"Failures reading or writing the event position ConfigMap, by operation (load, save).", "operation")
 )

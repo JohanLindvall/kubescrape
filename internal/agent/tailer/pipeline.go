@@ -29,7 +29,9 @@ const maxGroupLines = 512
 // gauges climb. Past DOUBLE the retention cap the group has already been
 // truncated for maxGroupLines lines, so further buffering buys nothing:
 // boundGroup flushes it — the same truncated entry an eventual flush would
-// emit — and the remainder starts a fresh group.
+// emit — and the remainder starts a fresh group. Stage 1 has the same wedge
+// through endless P fragments that never reach this FIFO at all; feedLine
+// bounds that run by CONSUMED BYTES (the force-close beside forceFinal).
 const maxGroupBuffered = 2 * maxGroupLines
 
 // boundGroup force-flushes a stream's trace-stage group once its offset FIFO
@@ -209,6 +211,28 @@ func (t *Tailer) feedLine(ctx context.Context, f *file, raw string, start, end i
 	st.lastEnd = endPos
 	if !st.hasRun {
 		st.runStart, st.hasRun = startPos, true
+		st.runBytes = 0
+	}
+	st.runBytes += end - start
+	// Bound a NEVER-COMPLETING stage-1 run — maxGroupBuffered's sibling one
+	// stage down. A workload writing one endless logical line (P fragments
+	// forever, no F) wedges the file without this: nothing reaches stage 2, so
+	// boundGroup sees nothing; every fragment refreshes the age-out stamps, so
+	// FlushBefore never fires; and the watermark pins at runStart — the
+	// checkpoint freezes (a crash re-ingests the whole window), idle-close is
+	// blocked, and every rotation carried adds a segment that can never
+	// retire. Past DOUBLE the retention cap the run has been truncating for a
+	// full cap of bytes and further buffering buys nothing: the fragment's tag
+	// flips to F so the stage closes the run ITSELF — one joined (truncated)
+	// entry, emitted synchronously inside this AddParsed where runStart and
+	// lastEnd still describe the run — and the remainder starts a fresh run,
+	// exactly as after a FlushBefore. The flip must rewrite the RAW line, not
+	// just the parse: with a run pending the stage classifies by re-splitting
+	// raw, and Line.Partial alone is consulted only on the buffer-free fast
+	// path.
+	if ok && l.Partial && st.runBytes >= 2*int64(t.cfg.MaxEntryBytes) {
+		raw = forceFinal(raw)
+		l.Partial = false
 	}
 	// AddParsed reuses this parse — the only one on the whole line's path.
 	// The payload is the SEGMENT-QUALIFIED start position: the stage may hold
@@ -216,6 +240,29 @@ func (t *Tailer) feedLine(ctx context.Context, f *file, raw string, start, end i
 	if err := f.criStage.AddParsed(ctx, f.containerID, raw, l, ok, startPos); err != nil {
 		t.log.Warn("log pipeline", "path", f.path, "error", err)
 	}
+}
+
+// forceFinal rewrites a parsed CRI "P" fragment as the "F" line that closes
+// its run: the tag field of the "<ts> <stream> <tag> <content>" header flips.
+// Only called on a line cri.Parse accepted as Partial, so the two spaces and
+// the single-byte tag are guaranteed present; the guards keep a malformed
+// line unchanged (the wedge is preferable to corrupting a record).
+func forceFinal(raw string) string {
+	i := strings.IndexByte(raw, ' ')
+	if i < 0 {
+		return raw
+	}
+	j := strings.IndexByte(raw[i+1:], ' ')
+	if j < 0 {
+		return raw
+	}
+	k := i + 1 + j + 1
+	if k >= len(raw) || raw[k] != 'P' {
+		return raw
+	}
+	b := []byte(raw)
+	b[k] = 'F'
+	return string(b)
 }
 
 // feedPlainLine feeds one line of a non-containerd file. The record timestamp

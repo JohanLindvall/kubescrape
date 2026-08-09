@@ -547,10 +547,18 @@ func (r *Reader) expire(stage string) {
 	// The revision aged out of the API server's watch window, so the
 	// in-process memory of it is dead too and must not be resumed from.
 	r.seenRV = ""
-	// Only once something has been exported: with a zero watermark nothing
-	// would filter the replay, and a cold -events-start=end would turn its
-	// first expiry into the full backlog the operator asked to skip.
-	r.relist = !r.committed.Watermark.IsZero()
+	// Never DISARM an armed relist: loadPosition arms one with a ZERO
+	// watermark when the stored position is unreadable, and an unsecured
+	// replay holds its exported high-water in heldWatermark precisely so the
+	// committed watermark stays zero — recomputing from the committed
+	// watermark alone read both as "nothing to recover" and restarted the
+	// next stream at the CURRENT revision, silently discarding the gap on
+	// exactly the recovery path. Beyond an armed flag, anything exported
+	// justifies the replay (the committed watermark filters it; a held one
+	// folds in when the replay secures); only a truly cold reader — nothing
+	// exported, nothing armed — restarts per the start mode, so a cold
+	// -events-start=end still skips the backlog the operator asked to skip.
+	r.relist = r.relist || !r.committed.Watermark.IsZero() || !r.heldWatermark.IsZero()
 	// Count the fall-back only where the next stream actually takes it: the
 	// armed relist, or a -events-start=start whose cold policy replays anyway.
 	// The counter is registered as watches that "fell back to a relist", and
@@ -563,6 +571,9 @@ func (r *Reader) expire(stage string) {
 		obs.EventRelists.WithLabelValues(stage).Inc()
 		return
 	}
+	// The discard arm is the pipeline's one silent-loss path: it must move a
+	// counter of its own, not just a Warn on one pod's stderr.
+	obs.EventGapDiscarded.WithLabelValues(stage).Inc()
 	r.log.Warn("event watch expired before anything was exported; restarting per the start mode and discarding the gap",
 		"stage", stage, "startMode", r.cfg.StartMode)
 }

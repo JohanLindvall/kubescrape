@@ -656,18 +656,30 @@ func routeExportConfig(exp *otlpexport.ExportConfig, rt route.Route) (otlpexport
 		// route or left unset.
 		out := rcfg.TransportOnly()
 		out.Endpoint = rt.Endpoint
-		// Two deliberate carryovers from the merged base, bit-identical to the
-		// hand-rolled strip this replaced: the MERGED base headers still ride to
-		// an own-endpoint route (a possible header leak, noted by review —
-		// changing it is a product decision, not this refactor), and so does
-		// -otlp-insecure-skip-verify, which a route has no field of its own for.
+		// Deliberate carryovers from the merged base: the MERGED base headers
+		// still ride to an own-endpoint route (a possible header leak, noted by
+		// review — changing it is a product decision, not this refactor), so
+		// does -otlp-insecure-skip-verify, which a route has no field of its
+		// own for, and so does Insecure when the route leaves its own field
+		// unset (below).
 		out.Headers = rcfg.Headers
 		out.InsecureSkipVerify = rcfg.InsecureSkipVerify
 		out.BearerTokenFile = rt.BearerTokenFile
 		out.ClientCertFile = rt.ClientCertFile
 		out.ClientKeyFile = rt.ClientKeyFile
 		out.CAFile = rt.CAFile
-		out.Insecure = rt.Insecure
+		// The third carryover, overridable: an UNSET route insecure inherits
+		// the merged base's (the ExportOverride pattern). Every own-endpoint
+		// route written before the field existed reached its plaintext
+		// in-cluster collector through the base's -otlp-insecure — a bool zero
+		// value here flipped those to TLS on upgrade, an endless transient
+		// export failure that -check-config could not see. Plaintext-ness is
+		// transport to the named host, not a credential, so this is not the
+		// disclosure the rebuild above exists to prevent.
+		out.Insecure = rcfg.Insecure
+		if rt.Insecure != nil {
+			out.Insecure = *rt.Insecure
+		}
 		return out, nil
 	}
 	if baseEndpointUnused(exp) {

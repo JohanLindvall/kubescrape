@@ -20,6 +20,63 @@ import (
 	"github.com/JohanLindvall/kubescrape/pkg/kubemeta"
 )
 
+// mergeClass classifies one servicemonitors.Endpoint field for the merge:
+// either MergeMonitorEndpoint must honour it when a second monitor's endpoint
+// collides on a URL, or ignoring it must be safe by construction.
+type mergeClass int
+
+const (
+	// inertClass fields need no merge logic: Port/TargetPort/Path/Scheme only
+	// derive the URL — the collision key, which two endpoints meeting here
+	// already agree on — and Ignored is reporting metadata no target carries.
+	// The bare gate must read an endpoint carrying ONLY inert fields as bare.
+	inertClass mergeClass = iota
+	// relabelClass: the endpoint's chain concatenates after the holder's.
+	relabelClass
+	// cadenceClass: interval/scrapeTimeout resolve through mergeCadence.
+	cadenceClass
+	// authClass: the auth/TLS group, compared and adopted whole through
+	// authMaterial (endpointAuth/targetAuth/stampAuth below).
+	authClass
+)
+
+// endpointMergeClass is the AUTHORITATIVE classification of every Endpoint
+// field for the merge — the servicemonitors.Endpoint.secretRefs pattern: one
+// declared list where there were four hand-maintained ones (the bare gate and
+// the three authMaterial functions). The gate and the adopt logic stay
+// hand-written field compares (the bare path is relied on to cost field
+// compares and no allocation — see targetDedup.monitorHolder), so
+// merge_guard_test.go is what holds them to this map: an Endpoint field
+// missing here fails the sweep, and a field classified mergeable that the
+// gate cannot see — or that authMaterial does not carry through the adopt
+// round trip — fails the behavioural half. Without that, a newly interpreted
+// field carried ALONE reads as BARE at the gate and is silently dropped on
+// every URL two monitors share: no adoption, no MonitorTargetShadowed count,
+// up=0 the only symptom.
+var endpointMergeClass = map[string]mergeClass{
+	"Port":       inertClass,
+	"TargetPort": inertClass,
+	"Path":       inertClass,
+	"Scheme":     inertClass,
+	"Ignored":    inertClass,
+
+	"MetricRelabelings": relabelClass,
+
+	"Interval":      cadenceClass,
+	"ScrapeTimeout": cadenceClass,
+
+	"InsecureSkipVerify": authClass,
+	"BearerSecret":       authClass,
+	"BasicAuthUser":      authClass,
+	"BasicAuthPass":      authClass,
+	"AuthType":           authClass,
+	"AuthCredentials":    authClass,
+	"TLSCA":              authClass,
+	"TLSCert":            authClass,
+	"TLSKey":             authClass,
+	"TLSServerName":      authClass,
+}
+
 // MergeMonitorEndpoint folds a monitor endpoint into the monitor-derived
 // target already holding its URL, reporting whether the endpoint's auth/TLS
 // material CONFLICTS with the holder's (both declare it, differently) — the
@@ -51,6 +108,11 @@ import (
 // warning names the monitor whose material is actually served.
 func MergeMonitorEndpoint(t *kubemeta.ScrapeTarget, monitor string, ep *servicemonitors.Endpoint) (authAdopted, authConflict bool) {
 	epAuth := endpointAuth(ep)
+	// The bare gate: one arm per mergeable class of endpointMergeClass —
+	// relabel, cadence, and the whole auth group in a single authMaterial
+	// compare. A mergeable field no arm reads would make an endpoint carrying
+	// only it bare, silently dropping the declaration; merge_guard_test.go
+	// holds every classified field to an arm.
 	if len(ep.MetricRelabelings) == 0 && ep.Interval == "" && ep.ScrapeTimeout == "" && epAuth == (authMaterial{}) {
 		return false, false
 	}
@@ -121,6 +183,9 @@ func mergeCadence(t *kubemeta.ScrapeTarget, ep *servicemonitors.Endpoint) bool {
 // WHAT credential and trust a scrape presents. It is one group, compared and
 // adopted whole: mixing one monitor's client cert with another's CA (or
 // serverName, or skip-verify) would build a TLS client neither CR describes.
+// Its fields correspond 1:1 to endpointMergeClass's authClass entries, and
+// merge_guard_test.go pins the endpointAuth → stampAuth → targetAuth round
+// trip, so a field cannot enter one of the three functions and miss another.
 type authMaterial struct {
 	insecureSkipVerify bool
 	bearer             string

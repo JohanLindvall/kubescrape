@@ -59,14 +59,21 @@ func (t *Tailer) readArchive(ctx context.Context, f *file) error {
 		// one. Gated on archiveEOF, not on offsets alone: a rewind leaves
 		// readPos == committed, which would look "delivered" while the data is
 		// in fact still owed. The offset compared is fedEnd, never readPos:
-		// trailing decompressed bytes that never feed — a final blank line, an
-		// unterminated final fragment, a rate-DROPPED tail — can never produce
-		// a committing entry, and a readPos gate pinned one fd per such
-		// archive for the file's life. Runs whether or not the archive is
-		// marked done — when the path was replaced under us archiveDone was
-		// deliberately left false, and this is what lets the next openArchive
-		// see the replacement.
-		if f.f != nil && f.archiveEOF && f.committed >= f.fedEnd() {
+		// trailing decompressed bytes that never feed AND never will — a final
+		// blank line, a rate-DROPPED or oversize-DISCARDED tail — can never
+		// produce a committing entry, and a readPos gate pinned one fd per
+		// such archive for the file's life. An UNTERMINATED final fragment is
+		// the deliberate exception (the pending gate): deletion turns it into
+		// a record (drainGone feeds it), and releasing the fd made that record
+		// unrecoverable — the gone drain's flush fails transiently, the rewind
+		// discards the pipeline, and with the inode unlinked and no fd there
+		// is nothing left to re-read, so the tail was lost with no counter
+		// moving while settledGone pinned the entry forever. One held fd per
+		// unterminated-tail archive is the price of that record. Runs whether
+		// or not the archive is marked done — when the path was replaced under
+		// us archiveDone was deliberately left false, and this is what lets
+		// the next openArchive see the replacement.
+		if f.f != nil && f.archiveEOF && f.committed >= f.fedEnd() && len(f.pending) == 0 {
 			t.closeArchive(f)
 		}
 		if f.archiveEOF && f.f != nil {
@@ -278,7 +285,27 @@ func (t *Tailer) drainArchive(ctx context.Context, f *file) {
 		// At EOF there is nothing left to drain — everything is fed and merely
 		// awaiting its flush, and re-decompressing here re-fed lines already
 		// in the batch (only a rewind, which clears archiveEOF, re-owes them).
-		if f.f == nil || f.archiveEOF || f.committed >= f.readPos && f.archiveDone {
+		if f.f == nil {
+			// No handle: nothing can be re-read. Normally nothing is owed
+			// either — the release gate keeps the fd while anything fed is
+			// uncommitted or an unterminated fragment sits in pending — but if
+			// an owed range survives here anyway (a handle lost some other
+			// way), returning silently every sweep is a wedge: goneEnd stays
+			// above committed, settledGone never fires, and the entry (files
+			// map, checkpoint, gone-sweep) is pinned forever with no counter
+			// moving. The range is unrecoverable, so count it and settle,
+			// like the corrupt-stream arm: reported loss, never a wedged
+			// file. Pending bytes are deliverable from memory; drainGone
+			// feeds them right after this.
+			if f.goneEnd > f.committed {
+				obs.LogArchiveErrors.Inc()
+				t.log.Warn("archive gone with uncommitted data and no retained fd; remainder lost",
+					"path", f.path, "committed", f.committed, "owedTo", f.goneEnd)
+				f.goneEnd = f.committed
+			}
+			return
+		}
+		if f.archiveEOF || f.committed >= f.readPos && f.archiveDone {
 			return
 		}
 		if err := t.openArchive(f); err != nil {

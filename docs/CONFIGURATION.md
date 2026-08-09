@@ -1759,9 +1759,17 @@ routing:
 ```
 
 First-matching route wins; a payload where everything matches the default is
-forwarded untouched (no copy). Route clients inherit the main `-otlp-*`
-settings (protocol, TLS, compression, retries) unless the route overrides
-the endpoint. Delivery is at-least-once per destination: a failed
+forwarded untouched (no copy). An endpoint-less route inherits the whole
+merged `-otlp-*`/`export:` base (it IS the default destination, reached with
+extra headers). A route naming its **own** endpoint inherits only the
+transport settings (protocol, compression, retries, timeout, send-size cap),
+the merged headers, `-otlp-tls-insecure-skip-verify` and — unless the route
+sets its own `insecure` — the base's plaintext-vs-TLS choice; it does **not**
+inherit the base credentials (`-otlp-bearer-token-file`, the mTLS client
+pair, the CA bundle), because those authenticate this deployment to *its*
+collector and a route is a different destination — set the route's own
+`bearerTokenFile`/`clientCertFile`/`clientKeyFile`/`caFile` instead.
+Delivery is at-least-once per destination: a failed
 destination fails the whole export and the producer's retry re-splits
 deterministically (already-succeeded destinations receive duplicates, which
 OTLP consumers must tolerate anyway). Per-route destinations are **direct
@@ -1770,8 +1778,9 @@ durability; routes are for tenancy/fan-out, not for doubling the durability
 machinery. Routed parts count into
 `kubescrape_routed_payload_parts_total{route,signal}`.
 
-**The agent's own self-metrics and span metrics BYPASS the router** and always
-go to the default (buffered) chain. `-self-attributes` stamps this pod's
+**The agent's own self-metrics and span metrics BYPASS the router** (and the
+`/debug/otlp` tap, which sits beside it) and always go to the default
+(buffered) chain — with or without a `routing` section configured. `-self-attributes` stamps this pod's
 `k8s.namespace.name` on those resources, so without the bypass a route globbing
 the namespace the agent runs in would silently move the fleet's own health
 signal onto an unbuffered per-tenant destination — filed under whatever

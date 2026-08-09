@@ -111,7 +111,10 @@ func (w *Wrapper) TransformTargets(ts []kubemeta.ScrapeTarget) []kubemeta.Scrape
 		tgt := &targetObj{t: &t}
 		if _, err := p.targets.call(tgt); err != nil {
 			hookErr(&hookWarnGates.targets, "targets", err)
-			out = append(out, t)
+			// ts[i], not t: the script may have written Path before erroring,
+			// and "untouched" excludes a half-applied write whose URL was
+			// never re-rendered.
+			out = append(out, ts[i])
 			continue
 		}
 		if tgt.mutatedPath {

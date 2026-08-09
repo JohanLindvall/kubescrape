@@ -699,10 +699,12 @@ func run() error {
 
 	// Routing sits between transforms and the default delivery chain:
 	// producers → transform → router → {default buffered chain | route
-	// clients}. Route clients inherit the main endpoint/TLS/compression
-	// settings unless the route overrides the endpoint; per-route
-	// destinations are direct (unbuffered) — the default keeps the full
-	// durability chain.
+	// clients}. An endpoint-less route inherits the whole merged base; a
+	// route naming its OWN endpoint keeps only the transport settings, the
+	// merged headers, skip-verify and (unless it sets its own `insecure`)
+	// the base's plaintext-ness — never the base credentials
+	// (routeExportConfig). Per-route destinations are direct (unbuffered) —
+	// the default keeps the full durability chain.
 	// Captured before the router so the agent's own metrics can keep the
 	// default (buffered) chain — see selfSink below.
 	//
@@ -719,7 +721,6 @@ func run() error {
 	// arm — throttled warn, default chain, marker removed — which is exactly
 	// the documented unknown-route behaviour.
 	preRoute := route.New(out, nil)
-	routed := false
 	var dests []route.Destination
 	if fileCfg.Routing != nil && len(fileCfg.Routing.Routes) > 0 {
 		for i, rt := range fileCfg.Routing.Routes {
@@ -736,11 +737,8 @@ func run() error {
 			defer func() { _ = rc.Close() }()
 			dests = append(dests, route.Destination{Name: rt.Name, Namespaces: rt.Namespaces, Exporter: rc})
 		}
-		routed = true
 		log.Info("routing enabled", "routes", len(dests))
 	}
-	// `routed` stays gated on a real route list, so selfSink's bypass semantics
-	// are unchanged; only the marker strip is unconditional.
 	out = route.New(out, dests)
 
 	// The on-demand debug stream (GET /debug/otlp + /debug/otlp/ui): between
@@ -817,7 +815,7 @@ func run() error {
 	// The sink for the metrics the agent generates ABOUT ITSELF: this pod's own
 	// Kubernetes attributes filled in where the agent's identity left a key
 	// unset, over the chain selfSink picks.
-	selfOut := selfmeta.Wrap(selfSink(out, preRoute, routed, transforms), selfPod,
+	selfOut := selfmeta.Wrap(selfSink(preRoute, transforms), selfPod,
 		selfBuild(attrBuilders.Self, nodeInfo))
 
 	var selfRes pcommon.Resource
@@ -1543,19 +1541,24 @@ func baseExportConfig() otlpexport.Config {
 }
 
 // selfSink picks the export chain for the metrics the agent generates about
-// ITSELF: `out` normally, and the PRE-ROUTING chain when routing is enabled.
+// ITSELF: the PRE-ROUTING chain (preRoute, captured above the debug tap and
+// the router), forked through the shared transform program when transforms
+// are on.
 //
-// The router fans out by the k8s.namespace.name on the resource, and these
-// resources only acquired one when self-attributes started stamping it — so a
-// route globbing the agent's own namespace would silently move the fleet's own
-// health signal off the durable buffered chain onto an unbuffered per-tenant
-// destination, and would do it only from the moment the lookup resolved.
-// Transforms still apply: the fork shares the reloaded program, so the two
-// chains can never run different scripts.
-func selfSink(out, preRoute otlpexport.Exporter, routed bool, transforms *transform.Wrapper) selfmeta.Exporter {
-	if !routed {
-		return out
-	}
+// The bypass is UNCONDITIONAL. The router fans out by the k8s.namespace.name
+// on the resource, and these resources only acquired one when self-attributes
+// started stamping it — so a route globbing the agent's own namespace would
+// silently move the fleet's own health signal off the durable buffered chain
+// onto an unbuffered per-tenant destination, and would do it only from the
+// moment the lookup resolved. The debug tap is bypassed with the router: it
+// sits between the transforms and the router, and gating this pick on whether
+// any route was configured made /debug/otlp show the agent's own metrics
+// exactly when no routing section existed and silently omit them once a route
+// was added — a config-dependent difference in a debug surface, denied by
+// every comment describing this chain. Transforms still apply: the fork
+// shares the reloaded program, so the two chains can never run different
+// scripts.
+func selfSink(preRoute otlpexport.Exporter, transforms *transform.Wrapper) selfmeta.Exporter {
 	if transforms != nil {
 		return transforms.Fork(preRoute, nil)
 	}

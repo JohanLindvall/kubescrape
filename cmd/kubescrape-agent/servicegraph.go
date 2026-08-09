@@ -34,6 +34,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"net"
 	"net/http"
 	"strconv"
@@ -632,9 +633,26 @@ const sgMaxRecvFloor = max(4<<20, otlpsplit.DefaultMaxBytes)
 // every over-4-MiB shard-to-shard payload fail, breaking the ring for exactly
 // the large traces the raise was for. Derived from the same flag instead, with
 // the floor as a lower bound so a small or unset value cannot shrink it.
+//
+// A NEGATIVE flag disables splitting outright, so "what the sender will
+// produce" stops being a split cap and becomes the whole enriched payload —
+// bounded by no constant this side can name (the application ports cap what
+// enters the ring per push, but enrichment grows a payload by its resource
+// count). The receive cap is therefore disabled WITH the splitting: they are
+// one decision, and the flag spells it. Reading the negative form as "use the
+// floor" instead sent unsplit shares into a sibling capped at 4 MiB — every
+// large trace deterministically rejected on the ring, a rejection
+// sgForwardStatus hands the application as retryable, so its SDK re-pushed an
+// undeliverable payload until the retry budget dropped the spans, with only
+// SendsFailed moving.
 func sgMaxRecvBytes() int {
-	if n := *otlpMaxSendBytes; n > sgMaxRecvFloor {
-		return int(n)
+	n := *otlpMaxSendBytes
+	if n < 0 {
+		// grpc-go's own ceiling; the internal hop's BodyReader shares it (Run).
+		return math.MaxInt32
+	}
+	if n > sgMaxRecvFloor {
+		return n
 	}
 	return sgMaxRecvFloor
 }

@@ -170,6 +170,7 @@ func explainPodPortEntry(pod kubemeta.Pod, entry string, filter portFilter) Port
 // each translates to. annotated reports whether a port annotation narrowed
 // the selection.
 func ExplainServicePorts(pod kubemeta.Pod, svc *services.Service) (verdicts []PortVerdict, annotated bool) {
+	filter := servicePortFilter{}
 	// The predicate must be EXACTLY selectServicePorts': absent or all-blank
 	// selects every service port; a present annotation never falls back, even
 	// one whose entries all split away (","), which selects nothing.
@@ -190,7 +191,7 @@ func ExplainServicePorts(pod kubemeta.Pod, svc *services.Service) (verdicts []Po
 			for _, sp := range svc.Ports {
 				if sp.Name == entry || (numeric && sp.Port == n) {
 					matched = true
-					verdicts = append(verdicts, servicePortVerdict(pod, entry, sp))
+					verdicts = append(verdicts, servicePortVerdict(pod, entry, sp, filter))
 				}
 			}
 			if !matched {
@@ -204,20 +205,45 @@ func ExplainServicePorts(pod kubemeta.Pod, svc *services.Service) (verdicts []Po
 		if sp.Name != "" {
 			entry = sp.Name
 		}
-		verdicts = append(verdicts, servicePortVerdict(pod, entry, sp))
+		verdicts = append(verdicts, servicePortVerdict(pod, entry, sp, filter))
 	}
 	return verdicts, false
 }
 
+// servicePortFilter mirrors ServiceTargets' `seen`: one Service yields ONE
+// target per resolved pod port, however many of its service ports translate
+// to it. Keyed by the resolved pod port like the derivation's map, threaded
+// across the whole resolution in selectServicePorts' order (annotation
+// entries or the all-ports fallback) — two service ports sharing a
+// targetPort, or two entries naming one service port, yield one target, and
+// explain over-reported them as two. The value remembers the claiming
+// SERVICE port for the note. portFilter is deliberately not reused: podPorts'
+// `add` also range-checks, ServiceTargets does not, and that extra branch
+// would explain away a target the derivation serves.
+type servicePortFilter map[int32]int32
+
+// claim registers a resolved pod port, or says why a service port resolving
+// to an already-claimed one adds no target.
+func (f servicePortFilter) claim(podPort, svcPort int32) (note string, dup bool) {
+	if claimer, taken := f[podPort]; taken {
+		return fmt.Sprintf("resolves to pod port %d, already claimed by service port %d; this entry adds no target", podPort, claimer), true
+	}
+	f[podPort] = svcPort
+	return "", false
+}
+
 // servicePortVerdict explains one selected service port's translation to a
-// pod port (TargetPodPort's decision).
-func servicePortVerdict(pod kubemeta.Pod, entry string, sp services.Port) PortVerdict {
+// pod port (TargetPodPort's decision, then ServiceTargets' seen-port dedup).
+func servicePortVerdict(pod kubemeta.Pod, entry string, sp services.Port, filter servicePortFilter) PortVerdict {
 	port, ok := TargetPodPort(pod, sp)
 	if !ok {
 		return PortVerdict{
 			Entry: entry,
 			Note:  fmt.Sprintf("service port %d targets container port name %q, which no container of this pod declares; it resolves to nothing", sp.Port, sp.TargetPortName),
 		}
+	}
+	if note, dup := filter.claim(port, sp.Port); dup {
+		return PortVerdict{Entry: entry, Note: note}
 	}
 	v := PortVerdict{Entry: entry, Ports: []int32{port}}
 	if sp.TargetPortName == "" && !containerDeclaresNumber(pod, port) {

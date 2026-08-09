@@ -383,10 +383,14 @@ func TestRouteWithoutEndpointRejectedWhenTheBaseIsUnused(t *testing.T) {
 // routeExportConfig's own-endpoint branch now builds on
 // otlpexport.Config.TransportOnly instead of hand-dropping each credential.
 // The rework must be BIT-IDENTICAL to the old derivation — this test IS that
-// old derivation, kept verbatim, compared field-for-field against the new one
-// for every shape the old code distinguished. The base is constructed with
-// EVERY destination-scoped flag and section field set, so a field the new
-// derivation drops (or newly inherits) cannot hide behind a zero value.
+// old derivation, compared field-for-field against the new one for every
+// shape the old code distinguished, with ONE deliberate divergence spelled
+// here: an UNSET route `insecure` (nil) keeps the merged base's value instead
+// of a bool's zero, because every route written before the field existed
+// dialled plaintext through -otlp-insecure and must keep doing so across the
+// upgrade. The base is constructed with EVERY destination-scoped flag and
+// section field set, so a field the new derivation drops (or newly inherits)
+// cannot hide behind a zero value.
 func TestRouteExportConfigMatchesTheOldDerivation(t *testing.T) {
 	oldDerivation := func(exp *otlpexport.ExportConfig, rt route.Route) otlpexport.Config {
 		rcfg := exp.ApplyBase(baseExportConfig())
@@ -406,7 +410,9 @@ func TestRouteExportConfigMatchesTheOldDerivation(t *testing.T) {
 			rcfg.ClientCertFile = rt.ClientCertFile
 			rcfg.ClientKeyFile = rt.ClientKeyFile
 			rcfg.CAFile = rt.CAFile
-			rcfg.Insecure = rt.Insecure
+			if rt.Insecure != nil {
+				rcfg.Insecure = *rt.Insecure
+			}
 		}
 		return rcfg
 	}
@@ -427,6 +433,7 @@ func TestRouteExportConfigMatchesTheOldDerivation(t *testing.T) {
 		ClientKeyFile:  "/base/client-key.pem",
 	}
 
+	insecureTrue, insecureFalse := true, false
 	for _, tc := range []struct {
 		name string
 		rt   route.Route
@@ -441,7 +448,12 @@ func TestRouteExportConfigMatchesTheOldDerivation(t *testing.T) {
 			ClientCertFile:  "/route/client.pem",
 			ClientKeyFile:   "/route/client-key.pem",
 			CAFile:          "/route/ca.pem",
-			Insecure:        true,
+			Insecure:        &insecureTrue,
+		}},
+		{"own-endpoint route with an explicit insecure:false", route.Route{
+			Name: "t", Namespaces: []string{"t-*"},
+			Endpoint: "tenant.example.com:4317",
+			Insecure: &insecureFalse,
 		}},
 		{"own-endpoint route without credentials", route.Route{
 			Name: "t", Namespaces: []string{"t-*"},
@@ -462,5 +474,44 @@ func TestRouteExportConfigMatchesTheOldDerivation(t *testing.T) {
 				t.Errorf("derivation drifted from the old one:\n got: %+v\nwant: %+v", got, want)
 			}
 		})
+	}
+}
+
+// A route config written before the `insecure` field existed reached its
+// plaintext in-cluster collector through the flag base's -otlp-insecure
+// (default true). The field's introduction must not flip those routes to TLS
+// on upgrade — the exports fail as endless transient Unavailable, which
+// -check-config cannot see — so unset (nil) inherits the merged base and an
+// explicit value wins in either direction.
+func TestRouteInsecureUnsetInheritsTheFlagBase(t *testing.T) {
+	rt := route.Route{Name: "t", Namespaces: []string{"t-*"}, Endpoint: "collector.team-a:4317"}
+
+	got, err := routeExportConfig(nil, rt)
+	if err != nil {
+		t.Fatalf("routeExportConfig: %v", err)
+	}
+	if !got.Insecure {
+		t.Fatal("an insecure-less own-endpoint route flipped to TLS: pre-field configs dial plaintext through the base")
+	}
+
+	// An explicit false is the operator choosing TLS, base notwithstanding.
+	no := false
+	rt.Insecure = &no
+	if got, err = routeExportConfig(nil, rt); err != nil || got.Insecure {
+		t.Fatalf("insecure:false must mean TLS whatever the base (insecure=%v, err=%v)", got.Insecure, err)
+	}
+
+	// And with a TLS base, unset still inherits while explicit true wins.
+	oldInsecure := *otlpInsecure
+	defer func() { *otlpInsecure = oldInsecure }()
+	*otlpInsecure = false
+	rt.Insecure = nil
+	if got, err = routeExportConfig(nil, rt); err != nil || got.Insecure {
+		t.Fatalf("unset insecure must inherit a TLS base (insecure=%v, err=%v)", got.Insecure, err)
+	}
+	yes := true
+	rt.Insecure = &yes
+	if got, err = routeExportConfig(nil, rt); err != nil || !got.Insecure {
+		t.Fatalf("insecure:true must mean plaintext whatever the base (insecure=%v, err=%v)", got.Insecure, err)
 	}
 }

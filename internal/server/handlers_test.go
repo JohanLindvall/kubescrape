@@ -179,6 +179,87 @@ func condGet(t *testing.T, url, inm string, want int) string {
 	return resp.Header.Get("ETag")
 }
 
+// A node-targets 304 answered from the ETag memo must never extend a client's
+// entitlement past the memo's builtAt+TTL. builtAt is refreshed by WHOEVER
+// rebuilds the list (a second agent during a rolling update, an operator's
+// curl, a restarted client), so a revalidation can arrive from a client whose
+// own copy dates from an earlier window; re-stamping a full max-age on a memo
+// already almost a TTL old would let that client serve its copy for ~2×TTL
+// after the list changed. The 304 must grant only the remaining window
+// (floored — rounding up would over-promise), and once nothing remains the
+// store must be consulted.
+func TestNodeTargetsMemo304GrantsOnlyTheRemainingTTL(t *testing.T) {
+	s := targetsFixture{pods: 3, cacheTTL: 10 * time.Second}.build(t)
+	base := time.Now()
+	now := base
+	s.now = func() time.Time { return now }
+	srv := httptest.NewServer(s.Handler())
+	t.Cleanup(srv.Close)
+	url := srv.URL + "/v1/nodes/node1/targets"
+
+	revalidate := func(t *testing.T, etag string) (int, string, string) {
+		t.Helper()
+		req, _ := http.NewRequest(http.MethodGet, url, nil)
+		req.Header.Set("If-None-Match", etag)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = resp.Body.Close() }()
+		return resp.StatusCode, resp.Header.Get("Cache-Control"), resp.Header.Get("ETag")
+	}
+
+	// t=0: client A takes the 200 and its full 10s window.
+	etag := getETag(t, url, "")
+	if etag == "" {
+		t.Fatal("no ETag on the first response")
+	}
+
+	// t=2: a second requester with no validator rebuilds the unchanged list,
+	// refreshing the memo's builtAt to t=2.
+	now = base.Add(2 * time.Second)
+	if got := getETag(t, url, ""); got != etag {
+		t.Fatalf("unchanged list renamed: %q -> %q", etag, got)
+	}
+	builds := s.targetBuilds.Load()
+
+	// t=3: the node's target list actually changes. The memo does not notice —
+	// it is bounded by time, not invalidated by store writes.
+	addPod(s.store)
+
+	// t=10: client A's window lapsed; it revalidates. The memo (age 8s) still
+	// answers 304 — up-to-TTL staleness is the trade the memo makes — but the
+	// grant is the REMAINING 2s, not a fresh 10: max-age=10 here would entitle
+	// A to the t=0 list until t=20, ~2×TTL after the change at t=3.
+	now = base.Add(10 * time.Second)
+	status, cc, _ := revalidate(t, etag)
+	if status != http.StatusNotModified {
+		t.Fatalf("revalidation inside the memo window: status = %d, want 304", status)
+	}
+	if cc != "max-age=2" {
+		t.Errorf("Cache-Control = %q, want max-age=2 (TTL 10s minus memo age 8s, floored)", cc)
+	}
+	if n := s.targetBuilds.Load(); n != builds {
+		t.Errorf("builds = %d, want %d: a memo 304 must not derive the response", n, builds)
+	}
+
+	// t=11.5: 500ms of the memo's window remain, which floors to no grant at
+	// all — the memo counts as expired, the store is consulted, and the changed
+	// list becomes a 200 under a new tag. Client A's total entitlement never
+	// passed t=12 = builtAt+TTL.
+	now = base.Add(11*time.Second + 500*time.Millisecond)
+	status, _, newTag := revalidate(t, etag)
+	if status != http.StatusOK {
+		t.Fatalf("revalidation past the remaining window: status = %d, want 200", status)
+	}
+	if newTag == etag {
+		t.Error("changed list served under the old tag")
+	}
+	if n := s.targetBuilds.Load(); n != builds+1 {
+		t.Errorf("builds = %d, want %d: an expired memo must consult the store", n, builds+1)
+	}
+}
+
 // A plain-integer ?wait= with a SUB-SECOND MaxWait must clamp to MaxWait, not
 // truncate to zero whole seconds (which silently made the lookup non-blocking).
 func TestWaitBudgetSubSecondMaxWait(t *testing.T) {

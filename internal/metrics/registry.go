@@ -33,7 +33,14 @@ type Registry struct {
 	// shape for the per-instance Register* hooks (two DynamicMetricSets in one
 	// process each publish the log-metrics drop family).
 	byName map[string]*series
-	funcs  []*gaugeFunc
+	// funcNames marks the names registered through addFunc. Func-ness is part
+	// of a name's shape: Dump reports a func-backed series from its live fns
+	// and SKIPS its db, so a direct handle observing into the shared series
+	// would ship on the OTLP push (Export folds both) and silently vanish from
+	// the Prometheus scrape — the one -self-metrics-interval knob choosing the
+	// delivery modality must not also choose the values.
+	funcNames map[string]bool
+	funcs     []*gaugeFunc
 	// drops are this registry's own refusal counters. They are not published:
 	// a registry has no cardinality cap and its label sets come from code, so
 	// only a 64-bit hash collision between two code-defined label sets can move
@@ -89,13 +96,18 @@ func NewRegistry() *Registry { return &Registry{} }
 // A repeat under a name already registered with a DIFFERENT shape panics: the
 // two cannot both be rendered, registrations are code-driven and run at
 // startup, and silently serving one shape to a call site that asked for the
-// other is the failure this dedupe exists to prevent.
-func (r *Registry) add(name, desc string, kind seriesKind, action gaugeAction, buckets []float64) *series {
+// other is the failure this dedupe exists to prevent. Func-ness is part of
+// that shape (Registry.funcNames): a mixed name would render on the push and
+// not on the scrape, so it is a conflict even when kind and action agree.
+func (r *Registry) add(name, desc string, kind seriesKind, action gaugeAction, buckets []float64, funcBacked bool) *series {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if s, ok := r.byName[name]; ok {
 		if s.kind != kind || s.action != action || !s.sameBuckets(kind, buckets) {
 			panic("metrics: " + name + " re-registered with a different type, action or buckets")
+		}
+		if r.funcNames[name] != funcBacked {
+			panic("metrics: " + name + " re-registered as both a direct metric and a func-backed one")
 		}
 		return s
 	}
@@ -107,33 +119,39 @@ func (r *Registry) add(name, desc string, kind seriesKind, action gaugeAction, b
 		r.byName = make(map[string]*series)
 	}
 	r.byName[name] = s
+	if funcBacked {
+		if r.funcNames == nil {
+			r.funcNames = make(map[string]bool)
+		}
+		r.funcNames[name] = true
+	}
 	r.series = append(r.series, s)
 	return s
 }
 
 // Counter registers a monotonic counter.
 func (r *Registry) Counter(name, desc string) *RegCounter {
-	return &RegCounter{newBound(r.add(name, desc, kindCounter, actionSet, nil), nil)}
+	return &RegCounter{newBound(r.add(name, desc, kindCounter, actionSet, nil, false), nil)}
 }
 
 // CounterVec registers a labeled monotonic counter.
 func (r *Registry) CounterVec(name, desc string, labelNames ...string) *RegCounterVec {
 	return &RegCounterVec{vec[RegCounter]{
-		s: r.add(name, desc, kindCounter, actionSet, nil), keys: labelNames,
+		s: r.add(name, desc, kindCounter, actionSet, nil, false), keys: labelNames,
 		wrap: func(b bound) *RegCounter { return &RegCounter{b} },
 	}}
 }
 
 // Gauge registers a set-latest gauge.
 func (r *Registry) Gauge(name, desc string) *RegGauge {
-	return &RegGauge{newBound(r.add(name, desc, kindGauge, actionSet, nil), nil)}
+	return &RegGauge{newBound(r.add(name, desc, kindGauge, actionSet, nil, false), nil)}
 }
 
 // addFunc is the one constructor behind the four func-metric registrations:
 // a series of the given kind plus a gaugeFunc entry evaluated at export time.
 // labelName/fnVec carry the labeled (Vec) form; fn the scalar one.
 func (r *Registry) addFunc(name, desc string, kind seriesKind, labelName string, fn func() float64, fnVec func() map[string]float64) {
-	s := r.add(name, desc, kind, actionSet, nil)
+	s := r.add(name, desc, kind, actionSet, nil, true)
 	r.mu.Lock()
 	r.funcs = append(r.funcs, &gaugeFunc{s: s, fn: fn, labelName: labelName, fnVec: fnVec})
 	r.mu.Unlock()
@@ -178,7 +196,7 @@ func (r *Registry) CounterFuncVec(name, desc, labelName string, fn func() map[st
 // latency buckets, matching prometheus.DefBuckets).
 func (r *Registry) HistogramVec(name, desc string, buckets []float64, labelNames ...string) *RegHistogramVec {
 	return &RegHistogramVec{vec[RegHistogram]{
-		s: r.add(name, desc, kindHistogram, actionSet, buckets), keys: labelNames,
+		s: r.add(name, desc, kindHistogram, actionSet, buckets, false), keys: labelNames,
 		wrap: func(b bound) *RegHistogram { return &RegHistogram{b} },
 	}}
 }

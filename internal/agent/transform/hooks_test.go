@@ -9,6 +9,7 @@ import (
 	"go.opentelemetry.io/collector/pdata/ptrace"
 
 	"github.com/JohanLindvall/kubescrape/internal/agent/tailsample"
+	"github.com/JohanLindvall/kubescrape/internal/obs"
 	"github.com/JohanLindvall/kubescrape/pkg/kubemeta"
 )
 
@@ -165,6 +166,30 @@ func TestTransformTargetsSecondInvocationSeesOriginals(t *testing.T) {
 	}
 	if !reflect.DeepEqual(ts, orig) {
 		t.Fatalf("the cached slice drifted across invocations:\n got %+v\nwant %+v", ts, orig)
+	}
+}
+
+// A script that WRITES and then errors must not ship its partial state:
+// SetField has already applied t.path when fail() unwinds, so appending the
+// working copy emitted a target whose Path disagreed with its never
+// re-rendered URL. "Errors keep the target untouched" means byte-identical
+// to the input — drop() marks included, since fail-open keeps the target.
+func TestTargetHookErrorKeepsTargetUntouched(t *testing.T) {
+	w := hookWrapper(t, `
+targets: |
+  def target(t):
+      t.path = "/mutated"
+      t.drop()
+      fail("boom")
+`)
+	ts := cachedTargets()
+	before := obs.TransformErrors.WithLabelValues("targets").Value()
+	out := w.TransformTargets(ts)
+	if !reflect.DeepEqual(out, cachedTargets()) {
+		t.Fatalf("mutate-then-error must emit the pristine targets:\n got %+v\nwant %+v", out, cachedTargets())
+	}
+	if got := obs.TransformErrors.WithLabelValues("targets").Value() - before; got != float64(len(ts)) {
+		t.Fatalf("transform_errors{targets} moved %v, want %v", got, len(ts))
 	}
 }
 

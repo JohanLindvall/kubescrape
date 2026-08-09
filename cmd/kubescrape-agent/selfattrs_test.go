@@ -326,42 +326,39 @@ func (r *recordingExporter) ExportMetrics(context.Context, pmetric.Metrics) erro
 	return nil
 }
 
-// The agent's own metrics must keep the DEFAULT (buffered) chain when routing
-// is configured: the router fans out by k8s.namespace.name, which these
+// The agent's own metrics keep the PRE-ROUTING (buffered) chain
+// unconditionally: the router fans out by k8s.namespace.name, which these
 // resources only acquired when self-attributes started stamping it, so a route
 // covering the agent's own namespace would move the fleet's health signal onto
-// an unbuffered tenant destination.
-func TestSelfSinkBypassesTheRouter(t *testing.T) {
-	routerChain, defaultChain := &recordingExporter{}, &recordingExporter{}
+// an unbuffered tenant destination — and the debug tap sits with the router,
+// so a bypass gated on "any route configured" made /debug/otlp show the
+// agent's own metrics exactly when no routing section existed and omit them
+// once one was added.
+func TestSelfSinkBypassesTheRouterAndTheTap(t *testing.T) {
+	routedChain, defaultChain := &recordingExporter{}, &recordingExporter{}
 	md := pmetric.NewMetrics()
 	md.ResourceMetrics().AppendEmpty().ScopeMetrics().AppendEmpty().Metrics().AppendEmpty().SetName("kubescrape_up")
 
-	// No routing: the one chain is the chain.
-	if got := selfSink(routerChain, defaultChain, false, nil); got != selfmeta.Exporter(routerChain) {
-		t.Fatal("selfSink diverted the chain with no routing configured")
+	// No transforms: the pre-routing chain itself, not whatever the routed
+	// chain grew into (tap, router).
+	if got := selfSink(defaultChain, nil); got != selfmeta.Exporter(defaultChain) {
+		t.Fatal("selfSink must hand the self chain the pre-routing exporter")
 	}
 
-	// Routing configured, no transforms: straight to the pre-routing chain.
-	if err := selfSink(routerChain, defaultChain, true, nil).ExportMetrics(context.Background(), md); err != nil {
-		t.Fatal(err)
-	}
-	if defaultChain.metrics != 1 || routerChain.metrics != 0 {
-		t.Fatalf("default=%d router=%d; self-metrics must skip the router", defaultChain.metrics, routerChain.metrics)
-	}
-
-	// Routing plus transforms: still skips the router, and still transforms.
+	// Transforms on: still the pre-routing chain, still transformed. The fork
+	// must aim at preRoute, never at the wrapper's own routed inner.
 	prog, err := transform.Compile([]byte("metrics: |\n  def transform(batch):\n      for m in batch:\n          m.name = \"renamed\"\n"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	w := transform.Wrap(routerChain, nil, prog)
-	sink := selfSink(w, defaultChain, true, w)
+	w := transform.Wrap(routedChain, nil, prog)
+	sink := selfSink(defaultChain, w)
 	if err := sink.ExportMetrics(context.Background(), md); err != nil {
 		t.Fatal(err)
 	}
-	if defaultChain.metrics != 2 || routerChain.metrics != 0 {
-		t.Fatalf("default=%d router=%d with transforms; self-metrics must still skip the router",
-			defaultChain.metrics, routerChain.metrics)
+	if defaultChain.metrics != 1 || routedChain.metrics != 0 {
+		t.Fatalf("default=%d routed=%d with transforms; self-metrics must skip the routed chain",
+			defaultChain.metrics, routedChain.metrics)
 	}
 	if fork, ok := sink.(*transform.Wrapper); !ok || fork.Active() != w.Active() {
 		t.Fatal("the self chain must share the reloaded transform program")

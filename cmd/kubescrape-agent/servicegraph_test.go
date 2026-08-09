@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"math"
 	mathrand "math/rand"
 	"net"
 	"net/http"
@@ -1005,6 +1006,29 @@ func TestSGMaxRecvFloorValue(t *testing.T) {
 	}
 	if sgMaxRecvFloor < otlpsplit.DefaultMaxBytes {
 		t.Fatalf("sgMaxRecvFloor (%d) is below the sender's default split cap (%d): the internal hop would reject default-sized parts", sgMaxRecvFloor, otlpsplit.DefaultMaxBytes)
+	}
+}
+
+// A negative -otlp-max-send-bytes disables splitting, so the sending shard
+// forwards whole enriched payloads with no cap of its own; the internal hop's
+// receive cap is disabled with it. Reading the negative form as "use the
+// floor" turned every over-floor share into a deterministic ring rejection
+// that the application's SDK then retried until its budget dropped the spans.
+func TestSGMaxRecvBytesNegativeDisablesTheCapWithTheSplitting(t *testing.T) {
+	old := *otlpMaxSendBytes
+	defer func() { *otlpMaxSendBytes = old }()
+
+	*otlpMaxSendBytes = -1
+	if got := sgMaxRecvBytes(); got != math.MaxInt32 {
+		t.Fatalf("sgMaxRecvBytes() with splitting disabled = %d, want unlimited (MaxInt32): a finite cap under an uncapped sender re-creates the rejection", got)
+	}
+	*otlpMaxSendBytes = 0
+	if got := sgMaxRecvBytes(); got != sgMaxRecvFloor {
+		t.Fatalf("sgMaxRecvBytes() at the default = %d, want the floor %d", got, sgMaxRecvFloor)
+	}
+	*otlpMaxSendBytes = 8 << 20
+	if got := sgMaxRecvBytes(); got != 8<<20 {
+		t.Fatalf("sgMaxRecvBytes() = %d, want the raised flag value 8 MiB", got)
 	}
 }
 

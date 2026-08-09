@@ -915,3 +915,79 @@ func TestProtoMixedHistogramFamilyResolvesOnceAndCountsTheLoser(t *testing.T) {
 		})
 	}
 }
+
+// schema and zero_threshold are the TARGET's values and are stamped verbatim
+// onto the OTLP point (scale, zero region). Prometheus only defines exponential
+// schemas in [-4, 8] (-53, NHCB, is routed off before this path), and a zero
+// region cannot be negative or non-finite: a point built from anything else is
+// spec-invalid and a strict backend rejects the whole BATCH carrying it — the
+// target's co-batched metrics, every cycle. Such a histogram is refused and
+// counted malformed like any other hostile shape (no clamp — a silent rewrite
+// hides the producer bug), and the rest of the exposition survives; the full
+// range Prometheus defines, boundaries included, still converts.
+func TestNativeHistogramSchemaAndZeroThresholdBounds(t *testing.T) {
+	mk := func(schema int32, zeroTh float64) *dto.MetricFamily {
+		return &dto.MetricFamily{
+			Name: ptr("rpc_latency_seconds"),
+			Type: dto.MetricType_HISTOGRAM.Enum(),
+			Metric: []*dto.Metric{{
+				Histogram: &dto.Histogram{
+					SampleCount: ptr(uint64(3)), SampleSum: ptr(0.9),
+					Schema: ptr(schema), ZeroThreshold: ptr(zeroTh), ZeroCount: ptr(uint64(1)),
+					PositiveSpan:  []*dto.BucketSpan{{Offset: ptr(int32(1)), Length: ptr(uint32(1))}},
+					PositiveDelta: []int64{2},
+				},
+			}},
+		}
+	}
+	after := &dto.MetricFamily{
+		Name:   ptr("http_requests_total"),
+		Type:   dto.MetricType_COUNTER.Enum(),
+		Metric: []*dto.Metric{{Counter: &dto.Counter{Value: ptr(7.0)}}},
+	}
+	for _, tc := range []struct {
+		name   string
+		schema int32
+		zeroTh float64
+		valid  bool
+	}{
+		{"schema 1000000", 1000000, 1e-9, false},
+		{"schema -100", -100, 1e-9, false},
+		{"zero_threshold NaN", 2, math.NaN(), false},
+		{"zero_threshold negative", 2, -1e-9, false},
+		{"zero_threshold +Inf", 2, math.Inf(1), false},
+		{"schema -4 boundary", -4, 1e-9, true},
+		{"schema 8 boundary", 8, 1e-9, true},
+		{"zero_threshold 0 counts exact zeros", 2, 0, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, malformed := protoConvert(t, mk(tc.schema, tc.zeroTh), after)
+			if _, ok := got["http_requests_total"]; !ok {
+				t.Error("the family after this one was not converted: the exposition aborted")
+			}
+			if tc.valid {
+				m, ok := got["rpc_latency_seconds"]
+				if !ok {
+					t.Fatalf("valid native histogram refused; got %v", slices.Sorted(maps.Keys(got)))
+				}
+				if m.Type() != pmetric.MetricTypeExponentialHistogram {
+					t.Fatalf("type = %v", m.Type())
+				}
+				dp := m.ExponentialHistogram().DataPoints().At(0)
+				if dp.Scale() != tc.schema || dp.ZeroThreshold() != tc.zeroTh {
+					t.Errorf("scale=%d zero_threshold=%v, want %d/%v", dp.Scale(), dp.ZeroThreshold(), tc.schema, tc.zeroTh)
+				}
+				if malformed != 0 {
+					t.Errorf("malformed = %d, want 0", malformed)
+				}
+				return
+			}
+			if m, ok := got["rpc_latency_seconds"]; ok {
+				t.Errorf("spec-invalid native histogram shipped as %v", m.Type())
+			}
+			if malformed != 1 {
+				t.Errorf("malformed = %d, want 1: the refusal must be counted", malformed)
+			}
+		})
+	}
+}

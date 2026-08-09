@@ -3,6 +3,8 @@
 package tailer
 
 import (
+	"bytes"
+	"compress/gzip"
 	"context"
 	"os"
 	"path/filepath"
@@ -618,6 +620,73 @@ func TestCorruptArchiveTailSettlesCounted(t *testing.T) {
 	if got := obs.LogArchiveErrors.Value(); got != errsBefore+1 {
 		t.Fatalf("LogArchiveErrors = %v, want %v (loss must be visible, once)", got, errsBefore+1)
 	}
+}
+
+// writeGzipRaw writes path as one gzip member of exactly content — no added
+// line terminators, unlike writeGzip.
+func writeGzipRaw(t *testing.T, path, content string) {
+	t.Helper()
+	var buf bytes.Buffer
+	zw := gzip.NewWriter(&buf)
+	if _, err := zw.Write([]byte(content)); err != nil {
+		t.Fatal(err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, buf.Bytes(), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// An archive whose final line is UNTERMINATED keeps its fd while the fragment
+// sits in pending: deletion turns that fragment into a record (drainGone
+// feeds it), and the retained fd is the only recovery handle when the record's
+// first flush fails — released, the rewind had nothing to re-read from, so the
+// tail was lost with no counter moving while settledGone pinned the entry
+// forever.
+func TestUnterminatedArchiveTailSurvivesDeletionAndFailedExport(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+	exp := &fakeExporter{}
+	tl := newArchiveTailer(dir, exp)
+	path := filepath.Join(dir, "app.log.gz")
+	writeGzipRaw(t, path, "done-line\ntorn-tail")
+	tl.scanDir(tl.loadCheckpoints(), true)
+
+	// Drive to EOF: the terminated line ships; the torn tail stays pending
+	// and holds the fd (the release gate's deliberate exception).
+	driveUntil(t, ctx, tl, func() bool {
+		f := tl.files[path]
+		return f != nil && f.archiveEOF && slices.Contains(exp.get(), "done-line")
+	}, "terminated prefix delivered and archive at EOF")
+	f := tl.files[path]
+	tl.sweep(ctx, true) // a settling sweep runs the release gate
+	if f.f == nil {
+		t.Fatal("fd released while an unterminated fragment sat in pending: deletion would lose it")
+	}
+
+	// The archive is pruned; the gone drain's first flush (3 attempts) fails.
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	exp.mu.Lock()
+	exp.fail = 3
+	exp.mu.Unlock()
+
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) && !slices.Contains(exp.get(), "torn-tail") {
+		tl.scanDir(nil, false)
+		tl.sweep(ctx, true)
+		tl.flush(ctx)
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !slices.Contains(exp.get(), "torn-tail") {
+		t.Fatalf("torn tail lost after deletion + failed export; exported = %v", exp.get())
+	}
+	// And the settled file releases everything rather than pinning the entry.
+	driveUntil(t, ctx, tl, func() bool { return f.f == nil && f.gz == nil },
+		"gone archive settled and its fd released")
 }
 
 // The fd-release gates compare against the FED boundary, never readPos:

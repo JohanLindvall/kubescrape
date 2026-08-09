@@ -493,11 +493,28 @@ func roundCount(f float64) (uint64, bool) {
 }
 
 // addNativeHistogram appends one exponential histogram point to the
-// batcher; false = undecodable (counted malformed by the caller).
+// batcher; false = undecodable, or a value no valid OTLP point can carry
+// (counted malformed by the caller).
 func (s *Scraper) addNativeHistogram(cb chunker, name string, meta metricMeta, labels []Label, h *dto.Histogram, ts int64) bool {
 	eb, ok := cb.(expSink)
 	if !ok {
 		return false // batcher variant without exponential support
+	}
+	// schema and zero_threshold are stamped VERBATIM onto the OTLP point
+	// (fillExponentialPoint: scale, zero region), and both are the TARGET's
+	// values: Prometheus defines standard exponential schemas only in [-4, 8]
+	// (-53 is NHCB and never reaches this path), and a zero region cannot be
+	// negative or non-finite. Out of range they make a spec-invalid point a
+	// strict backend rejects PER BATCH — the target's co-batched metrics with
+	// it, every cycle, with only a generic export error as signal — so they
+	// are refused like the hostile span shapes below (no classic fallback:
+	// decodeSpans failures get none either), never clamped, which would hide
+	// the producer bug behind rewritten data.
+	if sch := h.GetSchema(); sch < -4 || sch > 8 {
+		return false
+	}
+	if zt := h.GetZeroThreshold(); math.IsNaN(zt) || math.IsInf(zt, 0) || zt < 0 {
+		return false
 	}
 	pos, posOff, ok := decodeSpans(h.GetPositiveSpan(), h.GetPositiveDelta(), h.GetPositiveCount())
 	if !ok {

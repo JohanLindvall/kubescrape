@@ -2,6 +2,7 @@ package metrics
 
 import (
 	"context"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -562,4 +563,65 @@ func TestRegistryRefusesConflictingRedeclaration(t *testing.T) {
 		}
 	}()
 	r.Gauge("conflict_total", "d")
+}
+
+// A name registered BOTH directly and as a func is a shape conflict even when
+// kind and action agree: the two would share one series, and Dump reports a
+// func-backed series from its live fns alone, SKIPPING the db the direct
+// handle observes into — so the direct increments would ship on the OTLP push
+// (Export folds both) and silently vanish from the Prometheus scrape, the one
+// delivery-modality knob (-self-metrics-interval) silently changing the
+// values. Same-shape repeats stay legal in both forms: func+func and a direct
+// gauge pair are pinned by TestRegistryDeduplicatesMetricNames (the advertised
+// per-instance hook pattern), a direct counter pair by the control below.
+func TestRegistryRefusesDirectFuncMix(t *testing.T) {
+	mustPanic := func(what, name string, f func()) {
+		t.Helper()
+		defer func() {
+			p := recover()
+			if p == nil {
+				t.Fatalf("%s was accepted", what)
+			}
+			if msg, ok := p.(string); !ok || !strings.Contains(msg, name) {
+				t.Fatalf("%s: panic %q does not name the metric", what, p)
+			}
+		}()
+		f()
+	}
+
+	r := NewRegistry()
+	r.Counter("mix_total", "d").Inc()
+	mustPanic("re-registering direct mix_total as a CounterFunc", "mix_total", func() {
+		r.CounterFunc("mix_total", "d", func() float64 { return 0 })
+	})
+
+	r = NewRegistry()
+	r.GaugeFunc("mix_gauge", "d", func() float64 { return 0 })
+	mustPanic("re-registering func-backed mix_gauge as a direct gauge", "mix_gauge", func() {
+		r.Gauge("mix_gauge", "d")
+	})
+
+	// The Vec forms register through the same add path and must refuse the
+	// same mix.
+	r = NewRegistry()
+	r.CounterVec("mix_vec_total", "d", "l").WithLabelValues("v").Inc()
+	mustPanic("re-registering direct mix_vec_total as a CounterFuncVec", "mix_vec_total", func() {
+		r.CounterFuncVec("mix_vec_total", "d", "l", func() map[string]float64 { return nil })
+	})
+
+	r = NewRegistry()
+	r.GaugeFuncVec("mix_vec_gauge", "d", "l", func() map[string]float64 { return nil })
+	mustPanic("re-registering func-backed mix_vec_gauge as a direct gauge", "mix_vec_gauge", func() {
+		r.Gauge("mix_vec_gauge", "d")
+	})
+
+	// Control: a same-shape DIRECT repeat still shares the series without
+	// panicking.
+	r = NewRegistry()
+	r.Counter("repeat_total", "d").Inc()
+	c := r.Counter("repeat_total", "d")
+	c.Inc()
+	if v := c.Value(); v != 2 {
+		t.Fatalf("repeat_total = %v, want 2 (two handles on one series)", v)
+	}
 }

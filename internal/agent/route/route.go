@@ -159,8 +159,14 @@ type Route struct {
 	ClientKeyFile   string `json:"clientKeyFile,omitempty"`
 	CAFile          string `json:"caFile,omitempty"`
 	// Insecure allows plaintext gRPC to this route (for HTTP the scheme in
-	// Endpoint decides).
-	Insecure bool `json:"insecure,omitempty"`
+	// Endpoint decides). Unset (nil) INHERITS the merged flag base's
+	// -otlp-insecure — the ExportOverride pattern, and what every route
+	// written before this field existed relied on: a plain bool's zero value
+	// flipped those routes to TLS on upgrade, turning a working plaintext
+	// destination into an endless transient export failure with no startup
+	// signal. Plaintext-ness is transport to the named host, not a credential,
+	// so inheriting it is not the disclosure the fields above guard against.
+	Insecure *bool `json:"insecure,omitempty"`
 }
 
 // Exporter is a full destination (logs+metrics; traces optional via

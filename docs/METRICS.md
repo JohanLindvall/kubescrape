@@ -81,6 +81,7 @@ is the documented alert for the non-buffered tailer.
 | `kubescrape_buffer_truncated_bytes_total` | `signal` | Bytes the disk buffer lost to damage discovered at open (truncated, dropped or foreign segments). |
 | `kubescrape_container_lookups_blocked` | — | Container lookups currently blocked waiting for a container ID to appear. |
 | `kubescrape_container_lookups_shed_total` | — | Blocking container lookups refused because the store's concurrent-waiter cap was reached. |
+| `kubescrape_event_gap_discarded_total` | `stage` | Event watch expiries with no relist to fall back to (nothing exported yet and none armed): the next stream restarts at the CURRENT revision and whatever the dead watch never delivered is discarded — the events pipeline's one silent-loss arm, worth an alert wherever kubescrape_event_relists_total has one. |
 | `kubescrape_event_position_errors_total` | `operation` | Failures reading or writing the event position ConfigMap, by operation (load, save). |
 | `kubescrape_event_relists_total` | `stage` | Event watches that fell back to a relist because the stored resourceVersion had aged out of the API server's watch window. |
 | `kubescrape_event_watch_restarts_total` | — | Event watch restarts (a closed stream, an error, or an expired resourceVersion). |
@@ -103,7 +104,7 @@ is the documented alert for the non-buffered tailer.
 | `kubescrape_journal_restarts_total` | — | Journal reader restarts. |
 | `kubescrape_journal_truncated_total` | — | Journal messages truncated at MaxEntryBytes (the record carries log.truncated). |
 | `kubescrape_leader` | — | 1 while this replica holds the cluster-singleton lease, 0 otherwise; sum != 1 means split brain or nobody leading. |
-| `kubescrape_log_archive_errors_total` | — | Compressed log files whose stream failed to decode mid-read (truncated gzip, trailing garbage). What decoded before the error is delivered; the remainder is unrecoverable and the archive settles. |
+| `kubescrape_log_archive_errors_total` | — | Compressed log files whose remainder was lost: the stream failed to decode mid-read (truncated gzip, trailing garbage), or the file vanished with uncommitted data and no retained fd. What decoded before the failure is delivered; the remainder is unrecoverable and the archive settles. |
 | `kubescrape_log_bytes_total` | — | Raw log bytes read from live files and archives. Segment replays (re-reading a rotated file's owed range after a restart or rewind) are not re-counted. |
 | `kubescrape_log_drain_errors_total` | `source` | Reads that failed part-way through DRAINING a file incarnation that is going away (a rotated inode, a compressed archive). The drain cannot be retried — the next sweep would fail identically while holding the fd — so the unread remainder of that incarnation is unrecoverable and lost. Distinct from a clean EOF, which is the drain succeeding. |
 | `kubescrape_log_enrich_time_rejected_total` | — | Timestamps parsed from a log line that did NOT replace the producer's own (the CRI/journal/event time) because the line's timestamp carried no zone. Such a stamp is a wall clock enrichment must read as UTC, so a workload running with TZ set to anything else would misdate every record by that offset; the accurate ingest time is kept instead. A timestamp that states its own offset (RFC3339, an epoch, any zoned layout) always wins, however old it is, and a record with no producer timestamp at all takes the parsed one either way. |
@@ -177,4 +178,4 @@ is the documented alert for the non-buffered tailer.
 | `kubescrape_transform_errors_total` | `signal` | Transform program invocations that failed (the batch is NOT exported; the error propagates to the producer's retry path). |
 | `kubescrape_transform_reloads_total` | `outcome` | Transforms-file reloads by outcome (applied, failed — a failed compile keeps the last good program). |
 
-115 metrics.
+116 metrics.

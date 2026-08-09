@@ -82,6 +82,58 @@ func TestAuditFixWatermarklessExpiryIsNotCountedAsARelist(t *testing.T) {
 	}
 }
 
+// expire must never DISARM an armed relist. loadPosition arms one with a zero
+// committed watermark (unreadable position under `auto`), and an unsecured
+// replay keeps its exported high-water in heldWatermark while the committed
+// watermark stays zero — recomputing relist from the committed watermark alone
+// read both as "nothing to recover" and restarted at the CURRENT revision,
+// silently discarding the gap on exactly the recovery path.
+func TestAuditFixExpireKeepsArmedRelistAndHeldExports(t *testing.T) {
+	client := listingClient("999")
+
+	// Armed by loadPosition, nothing exported: a watch that expires before
+	// the replay secures must relist again, not skip the gap.
+	r := New(Config{Client: client}) // StartMode defaults to auto
+	r.relist = true
+	before := obs.EventRelists.WithLabelValues("auditfix-armed").Value()
+	r.expire("auditfix-armed")
+	if !r.relist {
+		t.Fatal("expire disarmed a relist armed before anything was exported")
+	}
+	if got := obs.EventRelists.WithLabelValues("auditfix-armed").Value(); got != before+1 {
+		t.Fatalf("EventRelists delta = %v for an armed relist's expiry, want 1", got-before)
+	}
+
+	// Exports made during an UNSECURED replay live in heldWatermark with the
+	// committed watermark still zero; they are exports all the same.
+	r = New(Config{Client: client})
+	r.heldWatermark = time.Now().Add(-time.Minute)
+	r.expire("auditfix-held")
+	if !r.relist {
+		t.Fatal("an expiry with held (unsecured) exports must relist, not discard the gap")
+	}
+}
+
+// The discard arm is the events pipeline's one silent-loss path; it must move
+// a counter of its own, not just a Warn on one pod's stderr.
+func TestAuditFixDiscardedGapIsCounted(t *testing.T) {
+	client := listingClient("999")
+	relistsBefore := obs.EventRelists.WithLabelValues("auditfix-discard").Value()
+	discardsBefore := obs.EventGapDiscarded.WithLabelValues("auditfix-discard").Value()
+
+	r := New(Config{Client: client, StartMode: StartEnd})
+	r.expire("auditfix-discard")
+	if r.relist {
+		t.Fatal("precondition: nothing exported and nothing armed cannot relist")
+	}
+	if got := obs.EventGapDiscarded.WithLabelValues("auditfix-discard").Value(); got != discardsBefore+1 {
+		t.Fatalf("EventGapDiscarded delta = %v for a discarded gap, want 1", got-discardsBefore)
+	}
+	if got := obs.EventRelists.WithLabelValues("auditfix-discard").Value(); got != relistsBefore {
+		t.Fatal("a discarded gap must not count as a relist")
+	}
+}
+
 // An UNREADABLE position is not a cold start. The store reports a transient
 // API-server failure and an undecodable document in one shape, and under `auto`
 // the cold-start policy skips to the CURRENT revision — discarding every event

@@ -998,6 +998,190 @@ kube_pod_container_resource_requests{namespace="ns1",pod="pod1",resource="memory
 	}
 }
 
+// TestSplitterCoalescingGroupByMergesSpellings pins that the route key is the
+// RENDERED identity — one effective value per distinct ATTRIBUTE — not the
+// per-label value vector. Several groupBy labels may map to one attribute
+// (namespace vs exported_namespace, the relabeled-exporter shape), and a
+// per-label key minted one resource per SPELLING: two rows naming the same
+// object through different labels rendered byte-identical attribute sets on
+// two ResourceMetrics, whose points — every groupBy label stripped by
+// putSplitLabels — became byte-identical duplicate series in one payload, the
+// exact duplicate class the parser rejects per line.
+func TestSplitterCoalescingGroupByMergesSpellings(t *testing.T) {
+	body := `# TYPE kube_namespace_status_phase gauge
+kube_namespace_status_phase{namespace="ns1",phase="Active"} 1
+kube_namespace_status_phase{exported_namespace="ns1",phase="Terminating"} 0
+`
+	srv := serveBody(t, body)
+	target := testTarget(srv.URL)
+	target.Pod.Name = "ksm-abc"
+	target.Pod.Labels = map[string]string{"app.kubernetes.io/name": "kube-state-metrics"}
+	sp, err := NewSplitters([]SplitterConfig{{
+		Match: SplitterMatch{PodLabels: map[string]string{"app.kubernetes.io/name": "kube-state-metrics"}},
+		Rules: []SplitRule{{
+			Metrics: `kube_namespace_.+`,
+			GroupBy: map[string]string{
+				"namespace":          "k8s.namespace.name",
+				"exported_namespace": "k8s.namespace.name",
+			},
+		}},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	exp := &captureExporter{}
+	s := New(Config{
+		Node: "node1", Interval: time.Hour, Timeout: 5 * time.Second,
+		Targets: staticTargets{target}, Exporter: exp, StartTime: time.Now(),
+		Splitters: sp, Kubelet: KubeletConfig{Meta: &fakeMetaSource{}},
+	})
+	if _, err := s.scrapeTarget(context.Background(), target, s.cfg.Timeout); err != nil {
+		t.Fatal(err)
+	}
+
+	rms := exp.batches[0].ResourceMetrics()
+	if rms.Len() != 1 {
+		t.Fatalf("got %d resources, want 1: rows spelling one object through different groupBy labels must share a resource", rms.Len())
+	}
+	if got := attrStr(rms.At(0).Resource(), "k8s.namespace.name"); got != "ns1" {
+		t.Fatalf("k8s.namespace.name = %q, want ns1", got)
+	}
+	ms := rms.At(0).ScopeMetrics().At(0).Metrics()
+	if ms.Len() != 1 {
+		t.Fatalf("got %d metrics, want 1: %v", ms.Len(), metricNames(rms.At(0)))
+	}
+	dps := ms.At(0).Gauge().DataPoints()
+	if dps.Len() != 2 {
+		t.Fatalf("got %d data points, want both rows on the one merged resource", dps.Len())
+	}
+	phases := map[string]bool{}
+	for i := 0; i < dps.Len(); i++ {
+		for _, l := range []string{"namespace", "exported_namespace"} {
+			if _, leaked := dps.At(i).Attributes().Get(l); leaked {
+				t.Fatalf("grouped label %s leaked to data point: %v", l, dps.At(i).Attributes().AsRaw())
+			}
+		}
+		v, _ := dps.At(i).Attributes().Get("phase")
+		phases[v.Str()] = true
+	}
+	if !phases["Active"] || !phases["Terminating"] {
+		t.Fatalf("missing data points: %v", phases)
+	}
+}
+
+// The other half of the coalescing contract: rows naming genuinely DIFFERENT
+// objects keep distinct resources, and when both coalescing labels are set the
+// LAST non-empty in sorted-label order wins — the same precedence the rendered
+// attributes give it (non-empty overwrites), so the key can never disagree
+// with the resource it selects.
+func TestSplitterCoalescingGroupByKeepsDistinctObjects(t *testing.T) {
+	// Sorted-label coalesce order is exported_namespace, then namespace: the
+	// third row must key on "ns1", not "shadow".
+	body := `# TYPE kube_namespace_status_phase gauge
+kube_namespace_status_phase{namespace="ns1",phase="Active"} 1
+kube_namespace_status_phase{exported_namespace="ns2",phase="Active"} 1
+kube_namespace_status_phase{exported_namespace="shadow",namespace="ns1",phase="Terminating"} 0
+`
+	srv := serveBody(t, body)
+	target := testTarget(srv.URL)
+	target.Pod.Name = "ksm-abc"
+	target.Pod.Labels = map[string]string{"app.kubernetes.io/name": "kube-state-metrics"}
+	sp, err := NewSplitters([]SplitterConfig{{
+		Match: SplitterMatch{PodLabels: map[string]string{"app.kubernetes.io/name": "kube-state-metrics"}},
+		Rules: []SplitRule{{
+			Metrics: `kube_namespace_.+`,
+			GroupBy: map[string]string{
+				"namespace":          "k8s.namespace.name",
+				"exported_namespace": "k8s.namespace.name",
+			},
+		}},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	exp := &captureExporter{}
+	s := New(Config{
+		Node: "node1", Interval: time.Hour, Timeout: 5 * time.Second,
+		Targets: staticTargets{target}, Exporter: exp, StartTime: time.Now(),
+		Splitters: sp, Kubelet: KubeletConfig{Meta: &fakeMetaSource{}},
+	})
+	if _, err := s.scrapeTarget(context.Background(), target, s.cfg.Timeout); err != nil {
+		t.Fatal(err)
+	}
+
+	// Exactly TWO resources: counting points per namespace alone would also
+	// pass on the old per-label keying, which minted a third resource for the
+	// both-labels row and still rendered it as ns1.
+	rms := exp.batches[0].ResourceMetrics()
+	if rms.Len() != 2 {
+		t.Fatalf("got %d resources, want 2 (ns1 and ns2)", rms.Len())
+	}
+	points := map[string]int{}
+	for i := 0; i < rms.Len(); i++ {
+		ns := attrStr(rms.At(i).Resource(), "k8s.namespace.name")
+		points[ns] += rms.At(i).ScopeMetrics().At(0).Metrics().At(0).Gauge().DataPoints().Len()
+	}
+	if points["ns1"] != 2 || points["ns2"] != 1 {
+		t.Fatalf("points per namespace = %v, want ns1:2 ns2:1 (namespace beats the earlier-sorted exported_namespace)", points)
+	}
+}
+
+// TestSplitterCoalescingExtractionKeepsNonEmptyIdentity pins the identity
+// EXTRACTION feeding resolveContext against the same last-non-empty coalesce:
+// it used to assign per groupBy entry unconditionally, so a coalescing rule
+// whose later-sorted label was EMPTY blanked the pod name the row did carry —
+// enrichment then failed (or resolved another object) while the rendered
+// attributes, which skip empties, still named the right one.
+func TestSplitterCoalescingExtractionKeepsNonEmptyIdentity(t *testing.T) {
+	body := "# TYPE kube_pod_info gauge\n" +
+		`kube_pod_info{namespace="ns1",pod="pod1"} 1` + "\n"
+	srv := serveBody(t, body)
+	target := testTarget(srv.URL)
+	target.Pod.Name = "ksm-abc"
+	target.Pod.Labels = map[string]string{"app.kubernetes.io/name": "kube-state-metrics"}
+	sp, err := NewSplitters([]SplitterConfig{{
+		Match: SplitterMatch{PodLabels: map[string]string{"app.kubernetes.io/name": "kube-state-metrics"}},
+		Rules: []SplitRule{{
+			Metrics: `kube_pod_.+`,
+			// "pod" and "pod_name" coalesce onto k8s.pod.name; "pod_name"
+			// sorts LAST and is absent from the row.
+			GroupBy: map[string]string{
+				"namespace": "k8s.namespace.name",
+				"pod":       "k8s.pod.name",
+				"pod_name":  "k8s.pod.name",
+			},
+			Enrich: true,
+		}},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	exp := &captureExporter{}
+	s := New(Config{
+		Node: "node1", Interval: time.Hour, Timeout: 5 * time.Second,
+		Targets: staticTargets{target}, Exporter: exp, StartTime: time.Now(),
+		Splitters: sp, Kubelet: KubeletConfig{Meta: &fakeMetaSource{}},
+	})
+	if _, err := s.scrapeTarget(context.Background(), target, s.cfg.Timeout); err != nil {
+		t.Fatal(err)
+	}
+
+	rms := exp.batches[0].ResourceMetrics()
+	if rms.Len() != 1 {
+		t.Fatalf("got %d resources, want 1", rms.Len())
+	}
+	res := rms.At(0).Resource()
+	// Only a successful pod resolution can supply the uid and the owner chain:
+	// the row carries neither.
+	if got := attrStr(res, "k8s.pod.uid"); got != uid1 {
+		t.Fatalf("k8s.pod.uid = %q, want %s: the empty pod_name label blanked the extracted pod name and enrichment never resolved (attrs %v)",
+			got, uid1, res.Attributes().AsRaw())
+	}
+	if got := attrStr(res, "k8s.deployment.name"); got != "dep1" {
+		t.Fatalf("k8s.deployment.name = %q, want dep1 (attrs %v)", got, res.Attributes().AsRaw())
+	}
+}
+
 // A kube-state-metrics exposition is FAMILY-major: consecutive rows describe
 // DIFFERENT objects, so the batcher's last-seen memos miss on essentially every
 // row and the key path underneath them is what runs. It built the resource key

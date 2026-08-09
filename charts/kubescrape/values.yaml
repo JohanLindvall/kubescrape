@@ -317,7 +317,10 @@ agent:
   #       static: {cluster: prod-eu}
   config: {}
   # Runtime settings for log-derived metrics (config.logMetrics); empty uses the
-  # binary defaults (interval 30s, max-bytes 3MiB, no name prefix).
+  # binary defaults (interval 30s, max-bytes 3 MiB, no name prefix). maxBytes is
+  # integer BYTES as a string (e.g. "3145728"); human-format sizes ("3MiB") are
+  # refused at template time — helm's int64 would silently parse them to 0,
+  # which the flag defines as "no byte bound, one payload per export".
   logsMetrics:
     interval: ""
     maxBytes: ""

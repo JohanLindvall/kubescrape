@@ -1572,3 +1572,119 @@ func TestUnreadableSegmentEventuallyReleasesTheTailGate(t *testing.T) {
 		t.Fatal("the abandoned segment's lines were not counted lost")
 	}
 }
+
+// A gone file's drain may END IN A READ ERROR sweep after sweep without that
+// being a wedge: as long as the boundary is stable, the readable prefix
+// commits, committed reaches the fed boundary and the file settles —
+// LogDrainErrors already carries the unreadable tail. chargeGoneStall must not
+// fire for those cycles: a rewind (failed export) and commit progress both
+// reset it, exactly as chargeStall treats a segment replay, so a collector
+// outage overlapping the erring drain spends none of the budget.
+func TestGoneDrainStableErrorBoundarySettles(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+	exp := &fakeExporter{}
+	tl := newArchiveTailer(dir, exp)
+	tl.segmentStallLimit = 10 * time.Millisecond // any two charged cycles would give up
+	tl.cfg.MaxBytesPerSweep = 6                  // exactly "a-one\n" decompressed
+
+	path := filepath.Join(dir, "app.log.gz")
+	tl.scanDir(tl.loadCheckpoints(), true)
+	writeGzip(t, path, "a-one", "a-two", "a-three")
+	// Trailing garbage after the valid member: every drain past it errors at
+	// the same decompressed offset — a stable error boundary.
+	fh, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fh.Write([]byte("this is not a gzip member")); err != nil {
+		t.Fatal(err)
+	}
+	_ = fh.Close()
+
+	tl.scanDir(nil, false)
+	tl.sweep(ctx, true) // reads only a-one (budget); the gzip reader is retained mid-read
+	tl.flush(ctx)       // commits it
+	if got := exp.get(); !slices.Equal(got, []string{"a-one"}) {
+		t.Fatalf("first sweep = %v, want [a-one]", got)
+	}
+
+	prefixBefore := obs.LogPrefixLost.Value()
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	exp.fail = 6 // two full gone-drain flush cycles fail before one succeeds
+	tl.scanDir(nil, false)
+	driveUntil(t, ctx, tl, func() bool { _, tracked := tl.files[path]; return !tracked },
+		"the gone archive settling despite its corrupt tail")
+
+	got := exp.get()
+	for _, want := range []string{"a-two", "a-three"} {
+		if !slices.Contains(got, want) {
+			t.Fatalf("readable line %q lost to a premature give-up: %v", want, got)
+		}
+	}
+	if got := obs.LogPrefixLost.Value(); got != prefixBefore {
+		t.Fatalf("LogPrefixLost = %v, want %v: a settling drain must not be given up on", got, prefixBefore)
+	}
+}
+
+// The wedge chargeGoneStall exists for: a gone file's first drain pins goneEnd
+// (deliberately rewind-proof — see drainGone), the flush fails, and the
+// retry's reads error out BELOW that boundary for good. Commit can then never
+// reach goneEnd, so before the budget the entry, the fd and the checkpoint
+// line were pinned forever with LogDrainErrors and an Error at sweep cadence
+// as the only signal. Past the stall limit the file must be given up on
+// loudly: one LogPrefixLost, the entry released, the checkpoint pruned.
+func TestGoneDrainRegressingErrorBoundaryGivesUp(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+	pos := mustOpenPositions(t, filepath.Join(t.TempDir(), "pos.json"))
+	exp := &fakeExporter{}
+	tl := driveTailer(dir, exp)
+	tl.cfg.Positions = pos
+	tl.segmentStallLimit = 10 * time.Millisecond
+	tl.scanDir(tl.loadCheckpoints(), true)
+
+	path := filepath.Join(dir, logName)
+	writeLog(t, dir, timeNowCRI()+" stdout F one")
+	tl.scanDir(nil, false)
+	tl.sweep(ctx, true)
+	tl.flush(ctx) // "one" delivered and committed
+	f := tl.files[path]
+	if f == nil || f.committed == 0 {
+		t.Fatal("setup: first line not committed")
+	}
+
+	writeLog(t, dir, timeNowCRI()+" stdout F two")
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	exp.fail = 6        // the next two flushes (3 attempts each) fail
+	tl.sweep(ctx, true) // reads "two" from the fd; the post-read stat marks the file gone
+	tl.flush(ctx)       // FAILS -> rewind
+	tl.sweep(ctx, true) // gone drain re-reads "two", pins goneEnd; its flush FAILS -> rewind
+	if f.goneEnd <= f.committed {
+		t.Fatalf("setup: goneEnd=%d not pinned above committed=%d", f.goneEnd, f.committed)
+	}
+
+	// The unlinked inode's reads now fail for good (stands in for EIO from
+	// spreading bad sectors): the boundary regressed below goneEnd.
+	_ = f.f.Close() // release() closes again later; the double close is ignored
+
+	prefixBefore := obs.LogPrefixLost.Value()
+	driveUntil(t, ctx, tl, func() bool { _, tracked := tl.files[path]; return !tracked },
+		"the wedged gone file being given up on")
+
+	if got := obs.LogPrefixLost.Value() - prefixBefore; got != 1 {
+		t.Fatalf("give-up counted %v times, want exactly once", got)
+	}
+	if got := exp.get(); slices.Contains(got, "two") {
+		t.Fatalf("the unreadable remainder was reported lost yet exported: %v", got)
+	}
+	tl.scanDir(nil, false)
+	tl.saveCheckpoints()
+	if _, ok := pos.Logs()[path]; ok {
+		t.Fatal("the given-up file's checkpoint line was not pruned")
+	}
+}

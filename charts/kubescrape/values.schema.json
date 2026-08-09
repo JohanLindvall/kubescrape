@@ -389,7 +389,8 @@
               "type": "string"
             },
             "maxBytes": {
-              "type": "string"
+              "type": "string",
+              "pattern": "^[0-9]*$"
             },
             "namePrefix": {
               "type": "string"

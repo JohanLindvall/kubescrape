@@ -85,7 +85,7 @@ logs: |
 	if v, ok := ld.ResourceLogs().At(0).Resource().Attributes().Get("env"); !ok || v.Str() != "prod" {
 		t.Fatal("resource attribute not set")
 	}
-	if _, ok := lrs.At(0).Attributes().Get(dropMarker); ok {
+	if _, ok := lrs.At(0).Attributes().Get(DropMarker); ok {
 		t.Fatal("drop marker leaked into export")
 	}
 }

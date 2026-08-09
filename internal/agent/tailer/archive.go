@@ -219,7 +219,29 @@ func (t *Tailer) openArchive(f *file) error {
 	inode := inodeOf(st)
 	// A replaced file (different inode or head fingerprint) restarts at zero.
 	if f.identityChanged(inode, fh) {
+		// The reset below abandons the old stream's [committed, end)
+		// remainder — its offsets are decompressed positions that mean
+		// nothing in the replacement — so it is a loss unless everything had
+		// shipped. In-process that is knowable: a consumed archive still
+		// carries archiveEOF (only a rewind, which retains the fd and routes
+		// the reopen through the reuse branch above, clears it before this
+		// open), so reaching here with it set means every fed byte committed.
+		// Across a restart it is not knowable — exactly like the plain path's
+		// rotation-while-down synthesis, whose findRotated miss counts
+		// obs.LogPrefixLost without knowing whether the vanished remainder
+		// was empty. Count it the same way; first discovery (no recorded
+		// identity) never takes this arm.
+		if !f.archiveEOF {
+			obs.LogPrefixLost.Inc()
+			t.log.Warn("archive replaced with its content not fully shipped; the old stream's remainder is lost",
+				"path", f.path, "committed", f.committed)
+		}
 		f.committed = 0
+		// The old identity is spent with the reset. Kept, it re-fired this
+		// arm — and the count — on the NEXT replacement whenever this open
+		// fails below (the non-gzip quarantine returns before the new
+		// identity is adopted).
+		f.inode, f.fp = 0, fingerprint{}
 	}
 	gz, err := gzipAt(fh, f.path, f.committed)
 	if err != nil {
@@ -309,6 +331,11 @@ func (t *Tailer) drainArchive(ctx context.Context, f *file) {
 			return
 		}
 		if err := t.openArchive(f); err != nil {
+			// A failed reopen is a drain that ended in an error without
+			// reading anything: a corrupt committed prefix fails the CopyN
+			// discard identically every sweep, which is the same
+			// unreachable-goneEnd wedge chargeGoneStall bounds.
+			f.drainErred = true
 			t.log.Warn("re-opening archive to drain", "path", f.path, "error", err)
 			return
 		}

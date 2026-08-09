@@ -133,7 +133,7 @@ func TestHandoffDropMarkerDoesNotLeak(t *testing.T) {
 	if lrs.Len() != 1 || lrs.At(0).Body().Str() != "keep" {
 		t.Fatalf("in-place prune left %d records", lrs.Len())
 	}
-	if _, ok := lrs.At(0).Attributes().Get(dropMarker); ok {
+	if _, ok := lrs.At(0).Attributes().Get(DropMarker); ok {
 		t.Fatal("drop marker leaked onto a survivor on the in-place path")
 	}
 }

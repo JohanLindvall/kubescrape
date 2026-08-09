@@ -292,7 +292,7 @@ hop or an authenticating proxy.
 | `-logs-unknown-files` | `auto` | where a file with no checkpoint entry starts at startup: `end` (skip as pre-existing history), `start` (read whole), `auto` (start when the checkpoint store already has entries — the file appeared while the agent was down; end on a first-ever run). `auto`/`start` mean adding a new log source ingests those files' existing content |
 | `-logs-idle-close` | `0` | close a fully-caught-up file's fd after this much inactivity (`0` = never). Bounds steady-state fds at one per *active* file rather than one per tracked file — but the open fd is the only handle to a rotated-away or deleted file's remaining bytes, so enabling this **forfeits the zero-loss guarantee** for the tail of a dying file. Set it only where a node tracks thousands of log files |
 | `-logs-metrics-interval` | `30s` | export interval for the `logMetrics` metrics ([below](#agent-log-metrics)) |
-| `-logs-metrics-max-bytes` | `3MiB` | export log-derived metrics in chunks below this many bytes (0 = one payload) |
+| `-logs-metrics-max-bytes` | `3145728` (3 MiB) | export log-derived metrics in chunks below this many bytes (0 = one payload). Integer bytes only — human-format sizes like `3MiB` are not parsed (and the chart's `agent.logsMetrics.maxBytes` refuses them at template time) |
 | `-logs-metrics-name-prefix` | — | prefix prepended to every log-derived metric name |
 
 Delivery is at-least-once: offsets are committed only after the collector
@@ -962,7 +962,7 @@ receiver never has. This listener does not register the OTLP trace service or
 | `-ingest-peer-ip-fallback` | `false` | attribute telemetry whose resource carries **no** container id / pod uid to the pod owning the connection's source address (`GET /v1/pod-ips/{ip}`, live non-hostNetwork pods only). Opt-in: a proxy, a mesh sidecar or any NAT hop rewrites that address, and hostNetwork senders share the node IP and never resolve. Counted as `kubescrape_ingest_resources_total{outcome="peer_ip"}`. Read by the trace tier too |
 | `-ingest-container-id-keys` | `container.id,k8s.container.id` | attribute keys inspected for a container ID |
 | `-ingest-pod-uid-keys` | `k8s.pod.uid` | attribute keys inspected for a pod UID |
-| `-ingest-metadata-wait` | `0` | how long a lookup may block for a not-yet-known object |
+| `-ingest-metadata-wait` | `0` | how long a lookup may block for a not-yet-known object. A push's attribution lookups may block at most 4× this in TOTAL (the remainder proceed without waiting), so a payload naming many distinct unknown IDs cannot stack waits into a long in-flight-slot hold |
 | `-ingest-max-in-flight` | `0` (= 32) | bound on pushes processed concurrently **across both transports**. Over it, senders are refused *retryably* rather than admitted into memory the node does not have |
 | `-ingest-grpc-max-recv-bytes` | `0` (= 4 MiB) | cap on **one decoded gRPC message** (the counterpart of a collector's `max_recv_msg_size`); an over-cap push is refused, not truncated. Applies to the trace tier's application ports too; the OTLP/HTTP body cap stays 16 MiB. Raising it is a per-push memory grant on an unauthenticated listener — the buffer budget below scales with it |
 
@@ -1674,7 +1674,12 @@ Beyond the fields above: log records also expose `time_unix_nano` and
   `routing` route instead of matching namespaces (a reserved attribute the
   router honors first and strips before anything is sent; an unknown name
   warns and falls to the default chain). Scripts could always steer routing
-  by rewriting `k8s.namespace.name`; this is the sanctioned spelling.
+  by rewriting `k8s.namespace.name`; this is the sanctioned spelling. The
+  marker is reserved to scripts: a copy arriving on the wire is stripped at
+  first receipt on the application-facing ingest listeners — as is the
+  transform drop marker, whose presence would otherwise read as an
+  operator-intended drop — counted
+  `kubescrape_ingest_reserved_stripped_total{key}`.
 * **`r.emit_metric(name, value, labels={})`** — one observation into a
   metric **declared in `logMetrics`** (declaration is where the type,
   buckets and cardinality cap live), grouped under the item's resource. An

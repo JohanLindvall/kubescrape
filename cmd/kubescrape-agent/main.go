@@ -1236,6 +1236,10 @@ func (p *pipelines) startIngest(ctx context.Context) error {
 		MaxRecvBytes: *ingestGRPCMaxRecv,
 		Enricher:     enr,
 		Exporter:     p.out,
+		// Wire-supplied copies of kubescrape's plumbing keys die at receipt
+		// (ingestReservedAttrs): the router and the transform prune cannot
+		// tell them from kubescrape's own.
+		ReservedAttrs: ingestReservedAttrs(),
 		// The operator's cost levers reach pushed logs too: the same compiled
 		// logs.rules chain and the same logMetrics set the tailer, journald,
 		// events and Azure producers run — one config, one behavior, however
@@ -1268,6 +1272,27 @@ func (p *pipelines) startIngest(ctx context.Context) error {
 	})
 	p.log.Info("otlp ingest started", "grpc", *ingestGRPC, "http", *ingestHTTP, "metricsMode", *ingestMetrics)
 	return nil
+}
+
+// ingestReservedAttrs is the reserved-plumbing strip list every
+// APPLICATION-FACING receiver wires — the DaemonSet's ingest listeners
+// (startIngest) and the trace tier's application ports
+// (startServiceGraphIngest); the tier's internal receiver is
+// kubescrape-to-kubescrape and deliberately not on it. Both consumers of
+// these keys are presence-only and cannot tell kubescrape's own mark from a
+// sender's: the router honors route.ScriptMarker on a RESOURCE before its
+// namespace globs, so a wire-supplied copy selects any configured route and
+// that route's tenant headers, and the transform prune deletes any ELEMENT
+// carrying transform.DropMarker whenever a script for its signal is active,
+// counting it as an operator-intended drop. The lists are minimal and true —
+// the router never reads its marker off an element, so ScriptMarker is NOT in
+// Element. One derivation, for enricherBase's reason: spelling it twice is
+// how the two receivers drift.
+func ingestReservedAttrs() otlpingest.ReservedAttrs {
+	return otlpingest.ReservedAttrs{
+		Resource: []string{route.ScriptMarker},
+		Element:  []string{transform.DropMarker},
+	}
 }
 
 // enricherBase is the flag-derived subset of the ingest enricher's config that

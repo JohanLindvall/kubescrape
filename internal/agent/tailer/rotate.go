@@ -80,6 +80,10 @@ func (t *Tailer) drainReader(ctx context.Context, f *file, r io.Reader, what str
 			// retryable.
 			if !errors.Is(err, io.EOF) {
 				obs.LogDrainErrors.WithLabelValues(what).Inc()
+				// The gone path's stall accounting keys on this: a drain that
+				// ERRORED without commit progress is what can leave goneEnd
+				// unreachable forever (chargeGoneStall).
+				f.drainErred = true
 				t.log.Error("reading failed mid-drain; the unread remainder of this file is unrecoverable",
 					"path", f.path, "source", what, "drained", drained, "error", err)
 			}
@@ -420,6 +424,45 @@ func (t *Tailer) chargeStall(f *file, sg *segment, gen int, progressBefore int64
 	f.retire(sg)
 }
 
+// chargeGoneStall bounds how long a vanished file may stay pinned behind a
+// drain that can no longer reach goneEnd.
+//
+// drainGone's `max` keeps goneEnd rewind-proof on purpose — a transient short
+// read must not settle the file early and silently lose the [error, goneEnd)
+// bytes an earlier drain proved exist. But when the fd's readable boundary
+// REGRESSES for good (spreading bad sectors on the unlinked inode, a corrupt
+// committed prefix failing every re-decompression), commit can never reach
+// goneEnd again: settledGone stays false and the entry, the fd and the
+// checkpoint line are pinned forever, with obs.LogDrainErrors and an Error at
+// sweep cadence as the only signal. That is the segment replay's stall wedge
+// one path over, so the same budget applies: a cycle whose drain ENDED IN A
+// READ ERROR without commit progress charges the stall; progress, a rewind (a
+// failed export re-owes the range without the drain being what is stuck —
+// chargeStall's rule) or a cycle that ends at EOF resets it. Past the limit
+// the remainder is given up on exactly as a stalled segment is — counted
+// obs.LogPrefixLost, logged — and the caller releases the entry through the
+// normal gone cleanup (the next successful-listing save prunes its checkpoint
+// line). It reports whether the file was given up on.
+func (t *Tailer) chargeGoneStall(f *file, gen int, progressBefore int64) bool {
+	if f.rewindGen != gen || !f.drainErred || f.committed > progressBefore || f.committed >= f.goneEnd {
+		f.goneStalledSince = time.Time{}
+		return false
+	}
+	now := time.Now()
+	if f.goneStalledSince.IsZero() {
+		f.goneStalledSince = now
+		return false
+	}
+	stalled := now.Sub(f.goneStalledSince)
+	if stalled < t.segmentStallLimit {
+		return false
+	}
+	obs.LogPrefixLost.Inc()
+	t.log.Error("a vanished file's drain has been erring without progress for too long; giving up on its unread remainder",
+		"path", f.path, "committed", f.committed, "goneEnd", f.goneEnd, "stalled", stalled)
+	return true
+}
+
 // openSegmentSource resolves the readable handle for a segment's replay: the
 // retained fd first (it reaches the inode even after the runtime has deleted
 // or compressed the rotated file, which findRotated — resolving by NAME —
@@ -731,6 +774,10 @@ func (t *Tailer) findRotated(f *file, p *segment) (string, bool) {
 // shutdown budget did not cover the final sweep's gone-file drain — a stuck
 // collector could hold shutdown past it and cost the final saveCheckpoints.
 func (t *Tailer) drainGone(ctx context.Context, f *file) {
+	// Re-armed per cycle: chargeGoneStall reads it right after this cycle's
+	// flush, and a verdict left over from an earlier cycle (or a rotation
+	// drain) must not charge a cycle whose drain never ran.
+	f.drainErred = false
 	if !f.resolved {
 		// Nothing was ever read (nothing is read before it can be attributed),
 		// and with the file gone nothing can be: the content is lost. Make the
@@ -755,6 +802,17 @@ func (t *Tailer) drainGone(ctx context.Context, f *file) {
 			obs.LogPrefixLost.Inc()
 			f.retire(f.segments[0])
 		}
+		return
+	}
+	if f.excluded {
+		// The workload opted out: nothing was ever read (the sweep never
+		// reads an excluded file) and nothing may be exported now that the
+		// path is gone — feeding restored segments here would ship exactly
+		// the backlog the exclusion refuses. dropExcludedBacklog retired them
+		// at resolve time; the guard holds regardless of that ordering, as
+		// the same intent-not-loss (no counter). goneEnd stays untouched, so
+		// settledGone releases the entry on this sweep.
+		t.dropExcludedBacklog(f)
 		return
 	}
 	// Incomplete segments are OLDER than the current inode's remainder and

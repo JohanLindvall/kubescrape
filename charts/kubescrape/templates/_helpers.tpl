@@ -9,6 +9,26 @@ helm.sh/chart: {{ .Chart.Name }}-{{ .Chart.Version }}
 {{- end -}}
 
 {{/*
+kubescrape.logsMetricsMaxBytes validates and renders agent.logsMetrics.maxBytes
+for the -logs-metrics-max-bytes flag. The flag takes integer BYTES, and helm's
+int64 parses any non-number to 0 — which the agent defines as "no byte bound,
+one payload per export": a human-format "3MiB" passed the string-typed schema,
+was truthy for `with`, and silently rendered the OPPOSITE of the requested
+bound. The schema's digits-only pattern refuses it first in the normal path;
+this guard is what still refuses it under --skip-schema-validation and in
+subchart use, where the parent's schema does not apply. Shared by BOTH
+workloads that render the flag (the DaemonSet and the events/Azure singleton)
+so the two sites cannot drift. Callers pass the VALUE, never empty — both
+sites sit inside `with`.
+*/}}
+{{- define "kubescrape.logsMetricsMaxBytes" -}}
+{{- if not (regexMatch "^[0-9]+$" (toString .)) -}}
+{{- fail (printf "agent.logsMetrics.maxBytes must be integer bytes as a string (e.g. \"3145728\"), got %q" (toString .)) -}}
+{{- end -}}
+{{- int64 . -}}
+{{- end -}}
+
+{{/*
 kubescrape.agentConfig renders the agent's unified config with the staticAttrs
 convenience value merged into resourceAttributes.static (an explicit config
 value wins). It returns YAML, which callers parse with fromYaml.

@@ -243,7 +243,7 @@ spec:
             - -logs-metrics-interval={{ . }}
             {{- end }}
             {{- with .Values.agent.logsMetrics.maxBytes }}
-            - -logs-metrics-max-bytes={{ int64 . }}
+            - -logs-metrics-max-bytes={{ include "kubescrape.logsMetricsMaxBytes" . }}
             {{- end }}
             {{- with .Values.agent.logsMetrics.namePrefix }}
             - -logs-metrics-name-prefix={{ . }}

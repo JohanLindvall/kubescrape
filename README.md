@@ -1398,7 +1398,9 @@ logs: |
 ```
 
 Every item also carries two verbs beyond mutation: `route("name")` sends its
-payload to a named `routing` route ahead of the namespace globs, and
+payload to a named `routing` route ahead of the namespace globs (the marker
+is reserved to scripts — a copy arriving on the wire is stripped and counted
+at ingest receipt), and
 `emit_metric(name, value, labels)` observes into a **declared** `logMetrics`
 series (an undeclared name is a script error). Scripts are predeclared `re`
 (RE2, with a bounded compile cache) and a 1/s-throttled `log()`. The same

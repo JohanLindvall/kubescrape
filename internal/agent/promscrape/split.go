@@ -116,8 +116,12 @@ type compiledSplitRule struct {
 	// keyPrefix stamps the rule's identity into the split resource key: two
 	// rules with equal-cardinality groupBy sets must not merge objects whose
 	// label VALUES collide (kube_pod_info{pod="x"} vs kube_node_info{node="x"}).
-	keyPrefix      string
-	groupBy        []groupMapping    // sorted by label for deterministic keys
+	keyPrefix string
+	groupBy   []groupMapping // sorted by label for deterministic keys
+	// slotCount is the number of DISTINCT groupBy attributes — the length of
+	// the per-attribute value vector the route key is built from (see
+	// groupMapping.slot). Equal to len(groupBy) unless the rule coalesces.
+	slotCount      int
 	datapointAttr  []string          // resource attrs moved onto the data points
 	instancePrefix *string           // nil = default to the target's service.name
 	dropLabels     *regexp.Regexp    // data-point labels to omit; nil keeps all
@@ -131,6 +135,25 @@ var defaultDatapointAttrs = []string{"k8s.node.name"}
 
 type groupMapping struct {
 	label, attr string
+	// slot indexes the rule's per-ATTRIBUTE value vector (splitBatcher.vals),
+	// assigned per distinct attr in first-appearance (sorted-label) order.
+	// Several groupBy labels may map to ONE attribute — the coalesce
+	// fillSplitResource renders — so keying the split resource on the
+	// per-LABEL value vector minted one resource per SPELLING: two rows
+	// naming the same object through different labels (namespace="ns1" vs
+	// exported_namespace="ns1") got distinct route keys, rendered
+	// byte-identical attribute sets, and — putSplitLabels stripping every
+	// groupBy label from the points — became byte-identical duplicate series
+	// in one payload, the exact class the parser rejects per line. The key is
+	// therefore the RENDERED identity: one effective value per attribute,
+	// last non-empty label in coalesce order. Single-label attrs (the common
+	// case) reduce to the old per-label vector.
+	slot int
+	// normalize applies kubemeta.NormalizeContainerID before the route key's
+	// empty-skip, exactly as fillSplitResource does before its own: the
+	// rendered value is the NORMALIZED one, so keying the raw label split the
+	// spellings of one rendered resource ("containerd://<id>" vs "<id>").
+	normalize bool
 }
 
 // NewSplitters compiles splitter configs.
@@ -170,6 +193,7 @@ func NewSplitters(cfgs []SplitterConfig) ([]*Splitter, error) {
 				labels = append(labels, label)
 			}
 			sort.Strings(labels)
+			slotOf := make(map[string]int, len(labels))
 			for _, label := range labels {
 				attr := r.GroupBy[label]
 				// An empty attribute name is a silent dimension loss, not a no-op:
@@ -181,8 +205,17 @@ func NewSplitters(cfgs []SplitterConfig) ([]*Splitter, error) {
 				if attr == "" {
 					return nil, fmt.Errorf("splitter %d rule %d groupBy %q: empty attribute name", i, j, label)
 				}
-				cr.groupBy = append(cr.groupBy, groupMapping{label: label, attr: attr})
+				slot, seen := slotOf[attr]
+				if !seen {
+					slot = len(slotOf)
+					slotOf[attr] = slot
+				}
+				cr.groupBy = append(cr.groupBy, groupMapping{
+					label: label, attr: attr,
+					slot: slot, normalize: attr == "container.id",
+				})
 			}
+			cr.slotCount = len(slotOf)
 			cr.datapointAttr = defaultDatapointAttrs
 			if r.DatapointAttributes != nil {
 				cr.datapointAttr = *r.DatapointAttributes
@@ -275,8 +308,8 @@ type splitBatcher struct {
 	// KSM series arrive grouped by family and object, so consecutive samples
 	// usually route to the same resource and metric — a memcmp replaces the
 	// key-building allocation and map probes.
-	vals        []string // route scratch: current sample's groupBy values
-	lastVals    []string // previous sample's groupBy values
+	vals        []string // route scratch: one effective groupBy value per attr slot
+	lastVals    []string // previous sample's per-slot values
 	lastRule    *compiledSplitRule
 	lastDest    splitDest
 	lastRouteOK bool
@@ -348,7 +381,7 @@ func (b *splitBatcher) count() int { return b.points }
 func (b *splitBatcher) size() int  { return b.bytes }
 
 // appendRouteKey appends the resource key of the current sample — the rule's
-// identity plus the groupBy values in b.vals — to b.
+// identity plus the per-attribute effective groupBy values in b.vals — to b.
 //
 // The rule's identity is part of it because two rules with equal-cardinality
 // groupBy sets must not merge objects whose values collide
@@ -386,8 +419,23 @@ func (b *splitBatcher) route(name string, labels []Label) (splitDest, *compiledS
 	}
 	b.vals = b.vals[:0]
 	if rule != nil {
+		// One effective value per ATTRIBUTE slot: the last non-empty label
+		// value in coalesce (sorted-label) order, container.id normalized —
+		// mirroring what fillSplitResource ends up rendering (its overwrite
+		// skips empties too), so rows spelling one object through different
+		// labels share one resource instead of minting byte-identical
+		// duplicates (see groupMapping.slot).
+		for range rule.slotCount {
+			b.vals = append(b.vals, "")
+		}
 		for _, g := range rule.groupBy {
-			b.vals = append(b.vals, labelValue(labels, g.label))
+			v := labelValue(labels, g.label)
+			if g.normalize {
+				v = kubemeta.NormalizeContainerID(v)
+			}
+			if v != "" {
+				b.vals[g.slot] = v
+			}
 		}
 	}
 	if b.lastRouteOK && rule == b.lastRule && slices.Equal(b.vals, b.lastVals) {
@@ -438,17 +486,30 @@ func (b *splitBatcher) fillSelfResource(res pcommon.Resource) {
 func (b *splitBatcher) fillSplitResource(res pcommon.Resource, rule *compiledSplitRule, labels []Label) {
 	var namespace, pod, uid, container, containerID string
 	for _, g := range rule.groupBy {
+		// Same last-non-empty coalesce as the rendered-attribute loop below
+		// and the route key: assigning unconditionally let a LATER EMPTY
+		// label of a coalescing rule blank an earlier non-empty one, so the
+		// identity handed to enrichment disagreed with the attributes
+		// actually rendered — the row resolved (or failed to) as an object
+		// other than the one its resource named.
+		value := labelValue(labels, g.label)
+		if g.attr == "container.id" {
+			value = kubemeta.NormalizeContainerID(value)
+		}
+		if value == "" {
+			continue
+		}
 		switch g.attr {
 		case "k8s.namespace.name":
-			namespace = labelValue(labels, g.label)
+			namespace = value
 		case "k8s.pod.name":
-			pod = labelValue(labels, g.label)
+			pod = value
 		case "k8s.pod.uid":
-			uid = labelValue(labels, g.label)
+			uid = value
 		case "k8s.container.name":
-			container = labelValue(labels, g.label)
+			container = value
 		case "container.id":
-			containerID = kubemeta.NormalizeContainerID(labelValue(labels, g.label))
+			containerID = value
 		}
 	}
 

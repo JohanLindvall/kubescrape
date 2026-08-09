@@ -199,3 +199,30 @@ func TestValuesSchemaRejectsUnknownKeys(t *testing.T) {
 		}
 	}
 }
+
+// A human-format agent.logsMetrics.maxBytes ("3MiB") used to pass the
+// string-typed schema and render `-logs-metrics-max-bytes=0`: helm's int64
+// parses any non-number to 0, and the agent defines 0 as "no byte bound, one
+// payload per export" — the OPPOSITE of the requested bound, with no signal
+// anywhere. Two layers now refuse it and this exercises both: the schema's
+// digits-only pattern in the normal path, and the template's own fail()
+// (kubescrape.logsMetricsMaxBytes) under --skip-schema-validation, which is
+// what protects subchart use, where the parent's schema does not apply. Each
+// assertion is on the one thing both error texts name — the value's key —
+// so a future reshuffle of which layer fires first stays green.
+func TestLogsMetricsMaxBytesRejectsHumanSizes(t *testing.T) {
+	helm := helmBin(t)
+	for _, extra := range [][]string{
+		nil,                          // the schema pattern refuses it
+		{"--skip-schema-validation"}, // the template guard refuses it
+	} {
+		args := append([]string{"template", "kubescrape", "../../charts/kubescrape",
+			"--namespace", "monitoring", "--set", "agent.logsMetrics.maxBytes=3MiB"}, extra...)
+		out, err := exec.Command(helm, args...).CombinedOutput()
+		if err == nil {
+			t.Errorf("maxBytes=3MiB rendered fine (extra flags %v); it must be refused, not parsed to 0:\n%s", extra, out)
+		} else if !strings.Contains(string(out), "maxBytes") {
+			t.Errorf("the refusal (extra flags %v) does not name maxBytes: %s", extra, out)
+		}
+	}
+}

@@ -41,8 +41,11 @@ var (
 	LogRotations = Registry.Counter("kubescrape_log_rotations_total",
 		"Log file rotations and truncations handled.")
 	LogPrefixLost = Registry.Counter("kubescrape_log_prefix_lost_total",
-		"Rotated-away log segments that could not be re-read (the file was deleted or compressed "+
-			"before its lines were exported, and no open fd survived a restart). These lines are lost.")
+		"Log content given up on as unrecoverable: a rotated-away segment that could not be re-read "+
+			"(the file was deleted or compressed before its lines were exported, and no open fd survived "+
+			"a restart), a segment or vanished file whose reads kept erring without progress past the "+
+			"stall budget, or a compressed archive replaced across a restart before its old stream fully "+
+			"shipped. One count per given-up segment/file/archive; these lines are lost.")
 	LogEnriched = Registry.CounterVec("kubescrape_log_enriched_total",
 		"Log records by the enrichment strategy that matched (json, logfmt, pattern, none).", "format")
 	LogEnrichTimeRejected = Registry.Counter("kubescrape_log_enrich_time_rejected_total",
@@ -279,6 +282,13 @@ var (
 			"sender worth finding.", "reason")
 	IngestRejected = Registry.Counter("kubescrape_ingest_rejected_total",
 		"Pushed OTLP requests refused because a receiver admission bound was reached — concurrent in-flight pushes or buffered payload bytes (retryable: 429 / ResourceExhausted).")
+	IngestReservedStripped = Registry.CounterVec("kubescrape_ingest_reserved_stripped_total",
+		"Attribute occurrences removed at first receipt because a sender shipped a key reserved for "+
+			"kubescrape's own plumbing, by key — the namespace router's script marker (honored on a resource "+
+			"before any routing glob, so a wire-supplied copy would steer the payload onto any configured "+
+			"route and its tenant headers) or the transform engine's drop marker (whose presence-only prune "+
+			"would delete the element and count it as an operator-intended transform drop whenever a script "+
+			"for that signal is active). The data itself is still forwarded, minus the reserved key.", "key")
 )
 
 // Metadata client (agent).
@@ -366,7 +376,7 @@ var (
 	// stream with no error logged and every other metric green. That has
 	// already happened once (see transform/hostobj.go).
 	TransformDropped = Registry.CounterVec("kubescrape_transform_dropped_total",
-		"Records a transform script called drop() on, by signal: log records, metric data points (a dropped metric counts all of its points) and spans. Counted per export invocation: a producer retrying a transiently failed export re-runs the script and re-counts its drops.", "signal")
+		"Records a transform script called drop() on, by signal: log records, metric data points (a dropped metric counts all of its points) and spans. Counted when the batch's export is ACKED (a delivered forward, or a payload transformed to nothing and acked without a send), so a producer's transient retries never re-count. The one exception is the tailer's in-place seam, which counts at transform time: a rewound re-read after a failed export re-runs the (possibly hot-reloaded) script and re-counts.", "signal")
 	TransformReloads = Registry.CounterVec("kubescrape_transform_reloads_total",
 		"Transforms-file reloads by outcome (applied, failed — a failed compile keeps the last good program).", "outcome")
 

@@ -542,15 +542,20 @@ func (t *Tailer) sweep(ctx context.Context, all bool) {
 				// the fd, the t.files entry and its checkpoint entry are pinned
 				// forever, and drainGone+flush re-run every sweep.
 				f.goneEnd = 0
+				// The stall clock dies with the gone verdict: left set, a later
+				// gone episode's first errored cycle reads the stale stamp as an
+				// already-spent budget and gives up on sight (chargeGoneStall).
+				f.goneStalledSince = time.Time{}
 			} else {
 				// The file is gone from disk; its remaining bytes live only
 				// behind our fd. Drain, export, and only let the inode go once
 				// the offsets commit — a failed export must be able to re-read
 				// it (rewind seeks the still-open fd back), or a pod deleted
 				// during a collector outage would lose its final lines.
+				gen, committedBefore := f.rewindGen, f.committed
 				t.drainGone(ctx, f)
 				t.flush(ctx)
-				if t.settledGone(f) {
+				if t.settledGone(f) || t.chargeGoneStall(f, gen, committedBefore) {
 					t.release(f)
 					delete(t.files, path)
 				}
@@ -581,6 +586,7 @@ func (t *Tailer) sweep(ctx context.Context, all bool) {
 			// The pod opted out via its annotation; nothing is read, the
 			// file stays tracked (cheap) so rediscovery does not re-resolve
 			// it every sweep.
+			t.dropExcludedBacklog(f)
 			f.dirty = false
 			continue
 		}
@@ -638,6 +644,30 @@ func (t *Tailer) sweep(ctx context.Context, all bool) {
 		// One save for every rotation this sweep handled, instead of one per
 		// hop — see reopen for why that still closes the crash window the
 		// per-hop save was added for.
+		t.saveCheckpoints()
+	}
+}
+
+// dropExcludedBacklog retires the checkpoint-restored segments of a file whose
+// resolve marked it excluded (pod annotation, or a source selector miss).
+// Exclusion is authoritative and reaches the backlog too: the sweep never
+// reads an excluded file, so restored segments (initFile) would never replay
+// and never retire — their stale Prefix entries rewritten by every checkpoint
+// save for the process lifetime — and a deletion would hand them to drainGone,
+// whose feed EXPORTS the very content the workload opted out of (drainGone
+// carries the matching guard). Dropped as intent, not loss: no counter moves.
+// The immediate save is what removes the Prefix entries; the plain offset
+// entry stays with the tracked file. Nothing else needs discarding — reads are
+// gated on resolution, so when exclusion is learned no byte of this file has
+// ever entered pending or the pipeline.
+func (t *Tailer) dropExcludedBacklog(f *file) {
+	if len(f.segments) == 0 {
+		return
+	}
+	n := len(f.segments)
+	f.closeSegments()
+	t.log.Info("dropping the restored backlog of an excluded file", "path", f.path, "segments", n)
+	if t.checkpointing() {
 		t.saveCheckpoints()
 	}
 }

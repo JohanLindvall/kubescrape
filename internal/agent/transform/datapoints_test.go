@@ -58,7 +58,7 @@ def transform(batch):
 	if _, ok := p.Attributes().Get("pod_name"); ok {
 		t.Error("pod_name survived deletion")
 	}
-	if v, _ := p.Attributes().Get(dropMarker); v.Str() != "" || p.Attributes().Len() != 1 {
+	if v, _ := p.Attributes().Get(DropMarker); v.Str() != "" || p.Attributes().Len() != 1 {
 		t.Errorf("survivor attributes = %v, want just code", p.Attributes().AsRaw())
 	}
 	if p.DoubleValue() != 6 {

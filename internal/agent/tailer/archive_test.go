@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/JohanLindvall/kubescrape/internal/agent/positions"
 	"github.com/JohanLindvall/kubescrape/internal/obs"
 )
 
@@ -742,5 +743,123 @@ func TestConsumedArchiveAwaitingCommitIsNotRefed(t *testing.T) {
 	}
 	if n != 1 {
 		t.Fatalf("archive line delivered %d times: re-fed while awaiting its flush", n)
+	}
+}
+
+// An archive replaced while the agent was DOWN loses the old stream's
+// undelivered remainder unavoidably — gzip offsets mean nothing in a different
+// stream, so openArchive's identity-changed arm restarts at zero — but the
+// loss must be REPORTED: the plain path's equivalent (initFile's open-ended
+// synthesis, findRotated missing) counts obs.LogPrefixLost, and this arm was
+// the one silent sibling.
+func TestArchiveReplacedWhileDownCountsLostRemainder(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+	path := filepath.Join(dir, "app.log.gz")
+
+	// The previous run: a partially shipped archive (committed mid-stream).
+	writeGzip(t, path, "old-one", "old-two", "old-three")
+	oldIno := inodeOfPath(t, path)
+	fh, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st, err := fh.Stat()
+	if err != nil {
+		t.Fatal(err)
+	}
+	fp, err := computeFingerprint(fh, min(int64(1024), st.Size()))
+	_ = fh.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	pos := mustOpenPositions(t, filepath.Join(t.TempDir(), "pos.json"))
+	if err := pos.SetLogs(map[string]positions.LogPos{path: {
+		Offset: int64(len("old-one\n")), Inode: oldIno,
+		FingerprintLen: fp.Len, FingerprintHash: fp.Hash,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Replaced while down: a DIFFERENT archive now holds the path. The first
+	// new line is exactly as long as the committed prefix, so a committed
+	// offset that failed to reset would skip it whole.
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	writeGzip(t, path, "new-one", "new-two")
+
+	prefixBefore := obs.LogPrefixLost.Value()
+	exp := &fakeExporter{}
+	tl := newArchiveTailer(dir, exp)
+	tl.cfg.Positions = pos
+	tl.scanDir(tl.loadCheckpoints(), true)
+	driveUntil(t, ctx, tl, func() bool {
+		got := exp.get()
+		return slices.Contains(got, "new-one") && slices.Contains(got, "new-two")
+	}, "the replacement archive being read from zero")
+	for range 3 { // idle sweeps must not re-count
+		tl.sweep(ctx, true)
+		tl.flush(ctx)
+	}
+	if got := obs.LogPrefixLost.Value() - prefixBefore; got != 1 {
+		t.Fatalf("replaced-archive loss counted %v times, want exactly once", got)
+	}
+}
+
+// First discovery has no prior identity, so the identity-changed arm (and its
+// loss count) must not fire for it.
+func TestArchiveFirstDiscoveryDoesNotCountLoss(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+	path := filepath.Join(dir, "app.log.gz")
+	writeGzip(t, path, "fresh-one")
+
+	prefixBefore := obs.LogPrefixLost.Value()
+	exp := &fakeExporter{}
+	tl := newArchiveTailer(dir, exp)
+	tl.cfg.Positions = mustOpenPositions(t, filepath.Join(t.TempDir(), "pos.json"))
+	tl.scanDir(tl.loadCheckpoints(), true)
+	driveUntil(t, ctx, tl, func() bool { return slices.Contains(exp.get(), "fresh-one") },
+		"the fresh archive being read")
+	if got := obs.LogPrefixLost.Value(); got != prefixBefore {
+		t.Fatalf("LogPrefixLost = %v, want %v: first discovery has nothing to lose", got, prefixBefore)
+	}
+}
+
+// The in-process consumed-then-replaced flow reaches the same identity-changed
+// arm with nothing lost (everything fed had committed before the fd was
+// released; archiveEOF is still standing witness). It must not count.
+func TestConsumedArchiveReplacementDoesNotCountLoss(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+	exp := &fakeExporter{}
+	tl := newArchiveTailer(dir, exp)
+	path := filepath.Join(dir, "app.log.gz")
+
+	tl.scanDir(tl.loadCheckpoints(), true)
+	writeGzip(t, path, "a-one")
+	tl.scanDir(nil, false)
+	tl.sweep(ctx, true)
+	tl.flush(ctx)
+	tl.sweep(ctx, true) // EOF settling sweep: fd released, archive done
+	f := tl.files[path]
+	if f == nil || !f.archiveDone || f.f != nil {
+		t.Fatal("setup: archive not consumed and settled")
+	}
+
+	// logrotate's shape: a NEW inode renamed over the path (two lines, so the
+	// size differs and the done short-circuit re-opens).
+	other := filepath.Join(dir, "next.tmp")
+	writeGzip(t, other, "b-one", "b-two")
+	if err := os.Rename(other, path); err != nil {
+		t.Fatal(err)
+	}
+
+	prefixBefore := obs.LogPrefixLost.Value()
+	driveUntil(t, ctx, tl, func() bool { return slices.Contains(exp.get(), "b-two") },
+		"the replacement archive being read")
+	if got := obs.LogPrefixLost.Value(); got != prefixBefore {
+		t.Fatalf("LogPrefixLost = %v, want %v: a fully shipped archive's replacement is not a loss", got, prefixBefore)
 	}
 }

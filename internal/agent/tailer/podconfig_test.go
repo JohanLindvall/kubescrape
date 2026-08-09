@@ -2,10 +2,13 @@ package tailer
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/JohanLindvall/kubescrape/internal/agent/positions"
 	"github.com/JohanLindvall/kubescrape/internal/obs"
 	"github.com/JohanLindvall/kubescrape/pkg/kubemeta"
 )
@@ -198,6 +201,134 @@ func TestPodAnnotationCannotForgeResolvedIdentity(t *testing.T) {
 	}
 	if got := attr("container.id"); got == "deadbeef" {
 		t.Error("pod annotation forged container.id")
+	}
+}
+
+// A restart restores checkpointed Pending segments (initFile) before metadata
+// can say the pod opted out. Exclusion is authoritative and reaches that
+// backlog too: left in place, the segments never replay (the sweep never reads
+// an excluded file) and never retire, so their stale Prefix entries were
+// rewritten by every checkpoint save for the process lifetime — and a later
+// deletion handed them to drainGone, which exported the very content the pod
+// opted out of. The drop is intent, not loss: no counter moves, and the plain
+// offset entry stays with the tracked file.
+func TestExcludedFileDropsRestoredCheckpointSegments(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+	pos := mustOpenPositions(t, filepath.Join(t.TempDir(), "pos.json"))
+	path := filepath.Join(dir, logName)
+
+	// A rotated-away file the restored segment could genuinely replay from:
+	// were exclusion not covering the backlog, its content would export.
+	rot := path + ".1"
+	writeLines(t, rot, timeNowCRI()+" stdout F rotated-secret")
+	rotIno := inodeOfPath(t, rot)
+	rst, err := os.Stat(rot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeLog(t, dir, timeNowCRI()+" stdout F live-line")
+	if err := pos.SetLogs(map[string]positions.LogPos{path: {
+		Offset: 7, Inode: inodeOfPath(t, path),
+		Pending: []positions.Prefix{{Inode: rotIno, From: 0, To: rst.Size()}},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+
+	prefixBefore := obs.LogPrefixLost.Value()
+	exp := &fakeExporter{}
+	tl := driveTailer(dir, exp)
+	tl.cfg.Positions = pos
+	tl.cfg.Metadata = annotatedMeta{annotation: `{"exclude": true}`}
+	tl.scanDir(tl.loadCheckpoints(), true)
+	f := tl.files[path]
+	if f == nil || len(f.segments) != 1 {
+		t.Fatal("setup: the checkpointed segment was not restored")
+	}
+
+	for range 3 {
+		tl.sweep(ctx, true)
+		tl.flush(ctx)
+	}
+
+	if !f.excluded {
+		t.Fatal("setup: the file did not resolve as excluded")
+	}
+	if len(f.segments) != 0 {
+		t.Fatalf("restored segments survived exclusion: %d left", len(f.segments))
+	}
+	if got := exp.get(); len(got) != 0 {
+		t.Fatalf("excluded backlog exported: %v", got)
+	}
+	if got := obs.LogPrefixLost.Value(); got != prefixBefore {
+		t.Fatalf("LogPrefixLost = %v, want %v: an opt-out is intent, not loss", got, prefixBefore)
+	}
+	cp, ok := pos.Logs()[path]
+	if !ok {
+		t.Fatal("the plain offset entry was pruned along with the Prefix list")
+	}
+	if cp.Offset != 7 {
+		t.Fatalf("checkpoint Offset = %d, want the restored 7", cp.Offset)
+	}
+	if len(cp.Pending) != 0 {
+		t.Fatalf("stale Prefix entries still persisted after the drop: %+v", cp.Pending)
+	}
+}
+
+// The gone path must never feed an excluded file's backlog, wherever the
+// segments came from: dropExcludedBacklog runs at resolve time, but the
+// exclusion contract ("nothing is read") has to hold even with a segment still
+// present when the deletion is noticed — drainGone's feed would read the
+// rotated file (findRotated resolves it via targetDir) and export content the
+// workload opted out of.
+func TestExcludedGoneFileReleasesWithoutExporting(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+	exp := &fakeExporter{}
+	tl := driveTailer(dir, exp)
+	tl.cfg.Metadata = annotatedMeta{annotation: `{"exclude": true}`}
+	tl.scanDir(tl.loadCheckpoints(), true)
+
+	path := filepath.Join(dir, logName)
+	rot := path + ".1"
+	writeLines(t, rot, timeNowCRI()+" stdout F rotated-secret")
+	rst, err := os.Stat(rot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeLog(t, dir, timeNowCRI()+" stdout F live-line")
+	tl.scanDir(nil, false)
+	tl.sweep(ctx, true) // resolves; the annotation excludes the file
+	f := tl.files[path]
+	if f == nil || !f.excluded {
+		t.Fatal("setup: file not tracked or not excluded")
+	}
+
+	// A segment present at deletion time (the resolve-time drop makes this
+	// unreachable today; the guard must hold whatever the ordering) — fully
+	// recoverable, so a missing guard would export it.
+	f.segSeq++
+	f.segments = append(f.segments, &segment{
+		id: f.segSeq, inode: inodeOfPath(t, rot), committed: 0, to: rst.Size(),
+	})
+	f.segmentsFed = false
+	f.targetDir = dir // what watchTarget would have cached had the file ever been opened
+
+	prefixBefore := obs.LogPrefixLost.Value()
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	driveUntil(t, ctx, tl, func() bool {
+		tl.scanDir(nil, false)
+		_, tracked := tl.files[path]
+		return !tracked
+	}, "excluded gone file released")
+
+	if got := exp.get(); len(got) != 0 {
+		t.Fatalf("excluded gone file exported: %v", got)
+	}
+	if got := obs.LogPrefixLost.Value(); got != prefixBefore {
+		t.Fatalf("LogPrefixLost = %v, want %v: an opt-out is intent, not loss", got, prefixBefore)
 	}
 }
 

@@ -8,10 +8,14 @@ package otlpingest
 import (
 	"context"
 	"fmt"
+	"sync"
 	"testing"
 	"time"
 
+	"go.opentelemetry.io/collector/pdata/plog"
 	"go.opentelemetry.io/collector/pdata/pmetric"
+
+	"github.com/JohanLindvall/kubescrape/pkg/kubemeta"
 )
 
 // A push whose data points name thousands of unresolvable ids must still
@@ -85,6 +89,126 @@ func TestResourceIDPassPrecedesThePointWalk(t *testing.T) {
 		for _, w := range waits {
 			if w == 0 {
 				t.Fatalf("probed %s while a later resource already decided the answer", id)
+			}
+		}
+	}
+}
+
+// blockingMeta parks every waited container lookup for its FULL requested
+// wait — the metadata service's behaviour for an id that never appears — and
+// records the waits it was granted, in order.
+type blockingMeta struct {
+	*fakeMeta
+	mu    sync.Mutex
+	waits []time.Duration
+}
+
+func (b *blockingMeta) Container(ctx context.Context, id string, wait time.Duration) (*kubemeta.ContainerMetadata, error) {
+	b.mu.Lock()
+	b.waits = append(b.waits, wait)
+	b.mu.Unlock()
+	if wait > 0 {
+		time.Sleep(wait)
+	}
+	return b.fakeMeta.Container(ctx, id, wait)
+}
+
+// ghostLogs is one ResourceLogs per distinct never-to-resolve container id —
+// the shape whose every attribution lookup parks for the full wait.
+func ghostLogs(ids int) plog.Logs {
+	ld := plog.NewLogs()
+	for i := 0; i < ids; i++ {
+		rl := ld.ResourceLogs().AppendEmpty()
+		rl.Resource().Attributes().PutStr("container.id", fmt.Sprintf("ghost-%d", i))
+		rl.ScopeLogs().AppendEmpty().LogRecords().AppendEmpty()
+	}
+	return ld
+}
+
+// The count budget bounds how many lookups one push may issue; it never
+// bounded TIME. With a non-default -ingest-metadata-wait each distinct
+// fabricated id parked its attribution lookup for the full wait, serially,
+// inside the handler — the in-flight slot (and, on HTTP, the byte-budget
+// charge) held for count x wait, sender-controlled via the distinct-id count.
+// The wait-time budget clamps the total: the granted waits can never sum past
+// lookupWaitBudgetFactor x Wait (each waited call elapses at least what it was
+// granted), later lookups run wait-free, and none of it costs the count
+// budget a lookup.
+func TestWaitBudgetBoundsARequestsBlockedTime(t *testing.T) {
+	const wait = 25 * time.Millisecond
+	const ids = 12
+	meta := &blockingMeta{fakeMeta: newMeta()}
+	e := NewEnricher(Config{Meta: meta, Wait: wait})
+
+	start := time.Now()
+	e.EnrichLogs(context.Background(), ghostLogs(ids))
+	elapsed := time.Since(start)
+
+	if len(meta.waits) != ids {
+		t.Fatalf("lookups = %d, want %d: the wait budget must not spend the count budget", len(meta.waits), ids)
+	}
+	var granted time.Duration
+	zeroed := 0
+	for _, w := range meta.waits {
+		granted += w
+		if w == 0 {
+			zeroed++
+		}
+	}
+	if budget := lookupWaitBudgetFactor * wait; granted > budget {
+		t.Errorf("granted waits sum to %v, want <= the %v budget", granted, budget)
+	}
+	if zeroed == 0 {
+		t.Error("no lookup ran wait-free: the push should have exhausted the wait budget")
+	}
+	// Wall-clock sanity with generous slack: unbounded stacking is ids x wait.
+	if limit := time.Duration(ids-2) * wait; elapsed >= limit {
+		t.Errorf("the handler blocked %v; the budget bounds it well under %v", elapsed, limit)
+	}
+}
+
+// The budget exists for the hostile many-id shape; a push resolving ONE id —
+// the legitimate case, an app racing the kubelet posting its own id — must be
+// granted the full configured wait, unclamped.
+func TestSingleIDPushKeepsItsFullWait(t *testing.T) {
+	const wait = 5 * time.Millisecond
+	meta := &blockingMeta{fakeMeta: newMeta()}
+	e := NewEnricher(Config{Meta: meta, Wait: wait})
+
+	ld := plog.NewLogs()
+	rl := ld.ResourceLogs().AppendEmpty()
+	rl.Resource().Attributes().PutStr("container.id", "cafe01")
+	rl.ScopeLogs().AppendEmpty().LogRecords().AppendEmpty()
+
+	e.EnrichLogs(context.Background(), ld)
+
+	if len(meta.waits) != 1 || meta.waits[0] != wait {
+		t.Errorf("granted waits = %v, want exactly [%v]", meta.waits, wait)
+	}
+	if v, ok := rl.Resource().Attributes().Get("k8s.pod.name"); !ok || v.Str() != "web-1" {
+		t.Errorf("k8s.pod.name = %q (present=%v), want web-1", v.Str(), ok)
+	}
+}
+
+// The budget is charged by time actually ELAPSED, never by waits requested: a
+// lookup that returns immediately — the wait releases the moment the id
+// appears — leaves the budget intact for the ids that genuinely park. A
+// requested-wait charge would zero every id past the fourth here.
+func TestFastLookupsSpendNoWaitBudget(t *testing.T) {
+	const wait = 250 * time.Millisecond
+	const ids = 20
+	meta := &recordingMeta{fakeMeta: newMeta()} // records waits, returns instantly
+	e := NewEnricher(Config{Meta: meta, Wait: wait})
+
+	e.EnrichLogs(context.Background(), ghostLogs(ids))
+
+	if got := len(meta.waits); got != ids {
+		t.Fatalf("distinct ids looked up = %d, want %d", got, ids)
+	}
+	for id, waits := range meta.waits {
+		for _, w := range waits {
+			if w != wait {
+				t.Fatalf("lookup for %s granted %v, want the full %v: fast lookups must not spend the budget", id, w, wait)
 			}
 		}
 	}

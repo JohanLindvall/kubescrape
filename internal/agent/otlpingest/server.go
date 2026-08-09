@@ -24,6 +24,7 @@ import (
 
 	"github.com/JohanLindvall/kubescrape/internal/agent/otlpexport"
 	"github.com/JohanLindvall/kubescrape/internal/agent/transform"
+	"github.com/JohanLindvall/kubescrape/internal/logdedupe"
 	"github.com/JohanLindvall/kubescrape/internal/logline"
 	"github.com/JohanLindvall/kubescrape/internal/metrics"
 )
@@ -88,6 +89,14 @@ type ServerConfig struct {
 	// per-sender policy on listeners nothing authenticates. Removals are
 	// counted (obs.IngestAdmissionRejected) and the push is still acked.
 	Admit func(attrs pcommon.Map) bool
+	// ReservedAttrs are kubescrape's own plumbing keys, stripped from every
+	// accepted payload before enrichment (see reserved.go — their consumers
+	// are presence-only and cannot tell kubescrape's mark from a sender's, so
+	// a wire-supplied copy steers routing or masquerades as an operator's
+	// drop()). WHICH keys are reserved is the caller's knowledge, like
+	// RejectTraces' marker: this package must not know route's or transform's
+	// spellings. The zero value strips nothing.
+	ReservedAttrs ReservedAttrs
 	// Rules is the global logs.rules keep/drop/sample chain, applied to
 	// INGESTED log records after enrichment (so __severity__ selects on the
 	// enriched severity) — the same chain, same semantics, as the tailer,
@@ -155,6 +164,10 @@ type Server struct {
 	// cap. The same reader serves the trace tier's internal listener with a
 	// different cap and no budget (httpbody.go).
 	body *BodyReader
+	// reservedWarns throttles the stripped-reserved-key warning per key. The
+	// key space is the operator-wired ReservedAttrs lists — never
+	// sender-chosen — so the table is sized to exactly that.
+	reservedWarns *logdedupe.Table
 }
 
 // NewServer creates an ingest Server.
@@ -186,6 +199,7 @@ func NewServer(cfg ServerConfig) *Server {
 		grpcMaxRecv:   recv,
 		buffer:        &byteBudget{limit: budget},
 		reserveWindow: grpcReserveWindow,
+		reservedWarns: logdedupe.New(len(cfg.ReservedAttrs.Resource)+len(cfg.ReservedAttrs.Element), reservedWarnEvery),
 	}
 	s.body = &BodyReader{max: maxIngestBody, budget: s.buffer}
 	return s
@@ -320,6 +334,8 @@ func (g *logsGRPC) Export(ctx context.Context, req plogotlp.ExportRequest) (plog
 		ld := req.Logs()
 		// Admission first (ingest: hook, per resource, pre-enrichment).
 		g.s.admitLogs(ld)
+		// Reserved plumbing keys die before anything reads them (reserved.go).
+		g.s.sanitizeLogs(ld)
 		g.s.cfg.Enricher.EnrichLogs(ctx, ld)
 		// logs.rules + logMetrics, AFTER enrichment (logchain.go); a payload
 		// filtered to nothing is acked without a send.
@@ -350,6 +366,8 @@ func (g *metricsGRPC) Export(ctx context.Context, req pmetricotlp.ExportRequest)
 		if in.ResourceMetrics().Len() == 0 {
 			return nil // everything rejected: acked without a send
 		}
+		// Reserved plumbing keys die before anything reads them (reserved.go).
+		g.s.sanitizeMetrics(in)
 		md := g.s.cfg.Enricher.EnrichMetrics(ctx, in)
 		// Handoff: same reasoning as the logs arm — a failed forward drops the
 		// decoded object and the sender retransmits bytes.
@@ -450,6 +468,9 @@ func (g *tracesGRPC) Export(ctx context.Context, req ptraceotlp.ExportRequest) (
 		if td.ResourceSpans().Len() == 0 {
 			return nil // everything rejected: acked without a send
 		}
+		// Reserved plumbing keys die before anything reads them (reserved.go);
+		// after the loop guard, since a refused payload needs no sanitizing.
+		g.s.sanitizeTraces(td)
 		g.s.cfg.Enricher.EnrichTraces(ctx, td)
 		return g.s.cfg.Traces.ExportTraces(ctx, td)
 	})
@@ -516,6 +537,8 @@ func (s *Server) handleHTTPLogs(w http.ResponseWriter, r *http.Request) {
 	s.servePush(w, r, "logs", req.UnmarshalProto, func(ctx context.Context) (ProtoMarshaler, error) {
 		ld := req.Logs()
 		s.admitLogs(ld) // admission first (ingest: hook, pre-enrichment)
+		// Reserved plumbing keys die before anything reads them (reserved.go).
+		s.sanitizeLogs(ld)
 		s.cfg.Enricher.EnrichLogs(ctx, ld)
 		// logs.rules + logMetrics, AFTER enrichment (logchain.go); a payload
 		// filtered to nothing is acked without a send.
@@ -539,6 +562,8 @@ func (s *Server) handleHTTPMetrics(w http.ResponseWriter, r *http.Request) {
 		if in.ResourceMetrics().Len() == 0 {
 			return pmetricotlp.NewExportResponse(), nil // all rejected: acked
 		}
+		// Reserved plumbing keys die before anything reads them (reserved.go).
+		s.sanitizeMetrics(in)
 		md := s.cfg.Enricher.EnrichMetrics(ctx, in)
 		// Handoff: as on the gRPC arm.
 		if err := s.cfg.Exporter.ExportMetrics(transform.Handoff(ctx), md); err != nil {
@@ -559,6 +584,9 @@ func (s *Server) handleHTTPTraces(w http.ResponseWriter, r *http.Request) {
 		if td.ResourceSpans().Len() == 0 {
 			return ptraceotlp.NewExportResponse(), nil // all rejected: acked
 		}
+		// Reserved plumbing keys die before anything reads them (reserved.go);
+		// after the loop guard, since a refused payload needs no sanitizing.
+		s.sanitizeTraces(td)
 		s.cfg.Enricher.EnrichTraces(ctx, td)
 		if err := s.cfg.Traces.ExportTraces(ctx, td); err != nil {
 			return nil, err

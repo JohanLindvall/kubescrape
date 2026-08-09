@@ -347,6 +347,11 @@ func (p *pipelines) startServiceGraphIngest(ctx context.Context, owner servicegr
 		MaxInFlight:  *ingestMaxInFlight,
 		MaxRecvBytes: *ingestGRPCMaxRecv,
 		Enricher:     enr,
+		// The application ports are first receipt for traces, so the same
+		// reserved-plumbing strip as the DaemonSet's receiver applies; the
+		// INTERNAL receiver (sgReceiver) deliberately does not — what arrives
+		// there was sanitized when an application pushed it.
+		ReservedAttrs: ingestReservedAttrs(),
 		// Exporter nil: this listener serves TRACES only. Logs and metrics belong
 		// on the node-local DaemonSet, where the sender is a pod on the same node
 		// and the payload crosses no network to be attributed.

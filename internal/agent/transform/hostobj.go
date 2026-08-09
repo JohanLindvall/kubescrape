@@ -24,14 +24,22 @@ import (
 	"github.com/JohanLindvall/kubescrape/internal/agent/route"
 )
 
-// dropMarker flags an element for post-run pruning. Logs and spans carry it
+// DropMarker flags an element for post-run pruning. Logs and spans carry it
 // as a record/span attribute; metrics carry it in the pdata Metadata map,
 // which keeps it OFF the data-point attributes a rename could touch, so a
 // drop-then-rename cannot un-drop it. The marker never survives into the
 // export regardless — a marked metric is pruned whole and a script error
 // discards the transform's whole working copy — so it never reaches the wire
 // (the Metadata field IS an OTLP wire field, unlike an earlier claim here).
-const dropMarker = "__kubescrape_drop__"
+//
+// Exported because the key is RESERVED plumbing, like route.ScriptMarker: the
+// prune is presence-only and cannot tell a script's mark from a sender's, so
+// a marked element arriving ON THE WIRE would be deleted — and counted as an
+// operator-intended kubescrape_transform_dropped_total — whenever any script
+// for its signal is active. The ingest receivers strip it at first receipt
+// (otlpingest.ServerConfig.ReservedAttrs, wired in cmd/kubescrape-agent), and
+// they take the spelling from here so the two cannot drift.
+const DropMarker = "__kubescrape_drop__"
 
 // --- attribute map view ---
 
@@ -236,7 +244,7 @@ func (r *logRecord) Attr(name string) (starlark.Value, error) {
 	case "resource":
 		return attrsView{r.res.Attributes()}, nil
 	case "drop":
-		return dropFn{mark: func() { r.lr.Attributes().PutBool(dropMarker, true) }}, nil
+		return dropFn{mark: func() { r.lr.Attributes().PutBool(DropMarker, true) }}, nil
 	case "route":
 		return routeFn(r.res), nil
 	case "emit_metric":
@@ -400,7 +408,7 @@ func (s *spanObj) Attr(name string) (starlark.Value, error) {
 	case "resource":
 		return attrsView{s.res.Attributes()}, nil
 	case "drop":
-		return dropFn{mark: func() { s.sp.Attributes().PutBool(dropMarker, true) }}, nil
+		return dropFn{mark: func() { s.sp.Attributes().PutBool(DropMarker, true) }}, nil
 	case "route":
 		return routeFn(s.res), nil
 	case "emit_metric":
@@ -536,7 +544,7 @@ func (m *metricObj) Attr(name string) (starlark.Value, error) {
 		// marker never reaches the wire.) Logs/spans mark in an attribute, so
 		// drop() is already
 		// order-independent for them; this makes it so for metrics too.
-		return dropFn{mark: func() { m.m.Metadata().PutBool(dropMarker, true) }}, nil
+		return dropFn{mark: func() { m.m.Metadata().PutBool(DropMarker, true) }}, nil
 	}
 	return nil, nil
 }
@@ -648,7 +656,7 @@ func (p *dpObj) Attr(name string) (starlark.Value, error) {
 		// Marked in the point's own attributes and swept after the run, like
 		// logs and spans. A metric left with no points at all is pruned too —
 		// an empty metric is not a valid OTLP payload element to ship.
-		return dropFn{mark: func() { p.attrs.PutBool(dropMarker, true) }}, nil
+		return dropFn{mark: func() { p.attrs.PutBool(DropMarker, true) }}, nil
 	}
 	return nil, nil
 }

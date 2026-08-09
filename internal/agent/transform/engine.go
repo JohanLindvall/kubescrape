@@ -144,9 +144,9 @@ func pruneLogs(ld plog.Logs) int {
 		sls := rl.ScopeLogs()
 		sls.RemoveIf(func(sl plog.ScopeLogs) bool {
 			sl.LogRecords().RemoveIf(func(lr plog.LogRecord) bool {
-				_, drop := lr.Attributes().Get(dropMarker)
+				_, drop := lr.Attributes().Get(DropMarker)
 				if drop {
-					lr.Attributes().Remove(dropMarker)
+					lr.Attributes().Remove(DropMarker)
 					dropped++
 				}
 				return drop
@@ -165,7 +165,7 @@ func pruneMetrics(md pmetric.Metrics) int {
 		sms := rm.ScopeMetrics()
 		sms.RemoveIf(func(sm pmetric.ScopeMetrics) bool {
 			sm.Metrics().RemoveIf(func(m pmetric.Metric) bool {
-				if _, drop := m.Metadata().Get(dropMarker); drop {
+				if _, drop := m.Metadata().Get(DropMarker); drop {
 					// A whole metric costs every point it carried: the unit
 					// this counter reports is data points, so that a metrics
 					// drop is comparable with a logs one.
@@ -210,7 +210,7 @@ func dataPointCount(m pmetric.Metric) int {
 // where only SOME points were dropped keeps the rest.
 func pruneDataPoints(m pmetric.Metric) (dropped int, empty bool) {
 	drop := func(attrs pcommon.Map) bool {
-		if _, ok := attrs.Get(dropMarker); ok {
+		if _, ok := attrs.Get(DropMarker); ok {
 			dropped++
 			return true
 		}
@@ -248,9 +248,9 @@ func pruneTraces(td ptrace.Traces) int {
 		sss := rs.ScopeSpans()
 		sss.RemoveIf(func(ss ptrace.ScopeSpans) bool {
 			ss.Spans().RemoveIf(func(sp ptrace.Span) bool {
-				_, drop := sp.Attributes().Get(dropMarker)
+				_, drop := sp.Attributes().Get(DropMarker)
 				if drop {
-					sp.Attributes().Remove(dropMarker)
+					sp.Attributes().Remove(DropMarker)
 					dropped++
 				}
 				return drop

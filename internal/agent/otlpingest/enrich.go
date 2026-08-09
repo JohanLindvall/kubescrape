@@ -143,10 +143,12 @@ type Enricher struct {
 	mode            MetricsMode
 	log             *slog.Logger
 
-	// peerWarnGate/lookupWarnGate throttle their warnings; the enricher is
-	// shared by concurrent handlers, which is the throttles' contract.
+	// peerWarnGate/lookupWarnGate/waitWarnGate throttle their warnings; the
+	// enricher is shared by concurrent handlers, which is the throttles'
+	// contract.
 	peerWarnGate   logdedupe.Throttle
 	lookupWarnGate logdedupe.Throttle
+	waitWarnGate   logdedupe.Throttle
 }
 
 // reqCache is the state one push's enrichment shares across every decision it
@@ -173,6 +175,13 @@ type reqCache struct {
 	// unresolvable point ids can never spend the attribution's share.
 	lookups      int
 	probeLookups int
+	// waitSpent is the server-side wait time this request's attribution
+	// lookups have actually consumed, bounded by lookupWaitBudgetFactor x
+	// Config.Wait (containerLookup): the count budgets above bound how many
+	// lookups a push may issue, this bounds how long they may BLOCK. Elapsed
+	// time, not requested waits — a lookup that resolves fast spends only
+	// what it waited.
+	waitSpent time.Duration
 
 	// tokBuf renders a kind-tagged token for a MAP LOOKUP without allocating
 	// (map[string(buf)] reads do not copy). Only the auto-mode point walk uses
@@ -241,6 +250,22 @@ const maxLookupsPerRequest = 2 * maxSplitGroups
 // unresolved, indistinguishable from an id the cluster never had.
 const maxProbeLookupsPerRequest = maxLookupsPerRequest - maxSplitGroups
 
+// lookupWaitBudgetFactor sizes the per-request WAIT-TIME budget for
+// attribution lookups, as a multiple of Config.Wait. The count budget above
+// bounds how many lookups one push may issue but not how long each may park:
+// a waited container lookup sits in the metadata service's waiter map for the
+// full -ingest-metadata-wait, serially, inside this handler — so with a
+// non-default wait, a push naming distinct fabricated ids held its in-flight
+// slot (and, on HTTP, its byte-budget charge) for count x wait, and ~32 such
+// sockets shed the node's whole ingest. Four waits covers the legitimate
+// shape — a push racing the kubelet posting a few of its OWN ids, each wait
+// released the moment the id appears — without letting invented ids stack
+// maxLookupsPerRequest waits. The budget is charged by time actually ELAPSED,
+// never by waits requested, so a lookup that resolves fast spends almost
+// nothing; past it a lookup proceeds with wait 0, which still resolves every
+// already-posted id.
+const lookupWaitBudgetFactor = 4
+
 // lookupBudgetWarnEvery throttles the over-budget warning: past the budget
 // EVERY further distinct id takes that path, and the diagnosis is per push,
 // not per id.
@@ -256,6 +281,18 @@ func (e *Enricher) warnLookupBudget(exhausted string, bound int) {
 	}
 	e.log.Warn("ingest: a push named more distinct ids than one request may look up; the remainder is treated as unresolvable",
 		"exhausted", exhausted, "budget", bound)
+}
+
+// warnWaitBudget is the wait variant: the third allowance degrades the least —
+// past it lookups still run and still resolve already-posted ids, they just no
+// longer park in the metadata service's waiter map for ids that may never
+// appear.
+func (e *Enricher) warnWaitBudget() {
+	if !e.waitWarnGate.Allow(lookupBudgetWarnEvery) {
+		return
+	}
+	e.log.Warn("ingest: a push's distinct ids exhausted the per-request metadata wait budget; further lookups run without waiting (already-posted ids still resolve)",
+		"exhausted", "wait", "budget", lookupWaitBudgetFactor*e.cfg.Wait)
 }
 
 // NewEnricher creates an Enricher.
@@ -1004,7 +1041,8 @@ func (e *Enricher) findID(a pcommon.Map) (token string, ok bool) {
 // charging the request's lookup budget: past it every id reads as unresolvable.
 // wait is the caller's — probes pass 0, attribution passes Config.Wait — and
 // probe says which half of the budget the call spends (see
-// maxProbeLookupsPerRequest).
+// maxProbeLookupsPerRequest); a positive wait is additionally clamped against
+// the request's wait-time budget (containerLookup).
 func (e *Enricher) lookupByID(ctx context.Context, cache *reqCache, token string, wait time.Duration, probe bool) (*kubemeta.Pod, *kubemeta.Container) {
 	if cache.lookups >= maxLookupsPerRequest {
 		e.warnLookupBudget("request", maxLookupsPerRequest)
@@ -1021,7 +1059,7 @@ func (e *Enricher) lookupByID(ctx context.Context, cache *reqCache, token string
 	switch {
 	case len(token) >= 2 && token[:2] == tokContainer:
 		id := token[2:]
-		md, err := e.cfg.Meta.Container(ctx, id, wait)
+		md, err := e.containerLookup(ctx, cache, id, wait)
 		if err != nil {
 			e.log.Debug("ingest: container lookup failed", "id", id, "error", err)
 			return nil, nil
@@ -1037,4 +1075,28 @@ func (e *Enricher) lookupByID(ctx context.Context, cache *reqCache, token string
 		return pod, nil
 	}
 	return nil, nil
+}
+
+// containerLookup issues the container lookup, charging the request's
+// wait-time budget for the server-side block a positive wait buys (see
+// lookupWaitBudgetFactor). The clamp is against time already ELAPSED, and the
+// spend is measured around the call itself: a lookup that resolves the moment
+// the id appears — the case the wait exists for — burns only that moment, so
+// the whole budget stays available for the ids that actually park.
+func (e *Enricher) containerLookup(ctx context.Context, cache *reqCache, id string, wait time.Duration) (*kubemeta.ContainerMetadata, error) {
+	if wait <= 0 {
+		return e.cfg.Meta.Container(ctx, id, 0)
+	}
+	remaining := lookupWaitBudgetFactor*e.cfg.Wait - cache.waitSpent
+	if remaining <= 0 {
+		e.warnWaitBudget()
+		return e.cfg.Meta.Container(ctx, id, 0)
+	}
+	if wait > remaining {
+		wait = remaining
+	}
+	start := time.Now()
+	md, err := e.cfg.Meta.Container(ctx, id, wait)
+	cache.waitSpent += time.Since(start)
+	return md, err
 }

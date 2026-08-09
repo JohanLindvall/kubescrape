@@ -128,6 +128,16 @@ type file struct {
 	// its checkpointed segments retired — drainGone must not re-count on the
 	// sweeps between the drain and the release.
 	unresolvedLost bool
+	// drainErred: the most recent drain attempt over this file ended in a
+	// read error (drainReader's non-EOF arm, or drainArchive failing to
+	// reopen) rather than at EOF. Re-armed by every drainGone cycle;
+	// chargeGoneStall is the only consumer.
+	drainErred bool
+	// goneStalledSince is when a gone file's drain last ERRORED with no
+	// commit progress (chargeGoneStall); zero while advancing. It bounds how
+	// long a goneEnd no read can reach again may pin the fd, the files-map
+	// entry and the checkpoint line.
+	goneStalledSince time.Time
 	// Per-pod annotation config (podconfig.go), stamped at resolve time:
 	// excluded skips the file entirely; multiline overrides the source's
 	// stack-trace joining; podRules run before the global rules.

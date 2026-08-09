@@ -45,7 +45,16 @@ jobs:
       # main behind a green check. helmBin() now fails instead of skipping when
       # CI is set, which turns a missing step like this into a loud failure
       # rather than silent lost coverage.
-      - uses: azure/setup-helm@v5
+      #
+      # hack/ensure-helm.sh rather than azure/setup-helm, for the reason `make
+      # lint` gives below: the pin (hack/helm-version) is already in the repo,
+      # and a second one in the workflow drifts. The action installs LATEST by
+      # default, so the runner image's move to helm v4 — which renders one more
+      # blank line after a list — failed every golden on a commit that touched
+      # no template. This step puts the pinned helm in hack/bin, where the test
+      # looks first.
+      - name: install pinned helm
+        run: hack/ensure-helm.sh
 
       - run: make test
 
@@ -93,8 +102,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: azure/setup-helm@v5
-      - run: helm lint charts/kubescrape
+      # The same pinned helm the golden test renders under (hack/helm-version).
+      # A lint and a template that pass under a different major than the one
+      # main is pinned to prove nothing about what `helm install` will do.
+      - name: install pinned helm
+        run: echo "HELM=$(hack/ensure-helm.sh)" >> "$GITHUB_ENV"
+      - run: "$HELM lint charts/kubescrape"
       # Render the value combinations that have broken before: staticAttrs
       # alone once rendered -config plus its ConfigMap but neither the volume
       # nor the mount, CrashLoopBackOff-ing every node.
@@ -109,7 +122,7 @@ jobs:
             "--set service.scrapeAuthSecrets=true --set service.scrapeAuthToken.existingSecret=tok" \
             "--set service.scrapeAuthSecrets=true --set service.scrapeAuthToken.value=tok"; do
             echo "== helm template $args"
-            out=$(helm template t charts/kubescrape $args)
+            out=$($HELM template t charts/kubescrape $args)
             flag=$(printf '%s' "$out" | grep -c 'config=/etc/kubescrape/config/config.yaml' || true)
             mount=$(printf '%s' "$out" | grep -c 'mountPath: /etc/kubescrape/config' || true)
             if [ "$flag" != "$mount" ]; then

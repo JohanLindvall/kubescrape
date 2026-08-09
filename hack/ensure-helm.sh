@@ -6,14 +6,30 @@
 # the chart with the same helm as everybody else.
 set -euo pipefail
 
-HELM_VERSION="${HELM_VERSION:-v3.19.0}"
-
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BIN_DIR="$SCRIPT_DIR/bin"
 
+# The pin lives in hack/helm-version because internal/chartcheck reads it too:
+# the golden test must be able to refuse a helm that is not this one, and a
+# version string it cannot see is a pin it cannot enforce.
+HELM_VERSION="${HELM_VERSION:-$(tr -d '[:space:]' < "$SCRIPT_DIR/helm-version")}"
+
+helm_version_of() {
+  "$1" version --short 2>/dev/null | cut -d+ -f1
+}
+
+# An ALREADY-DOWNLOADED hack/bin/helm is checked like any other candidate. It
+# used to be returned unconditionally, which made the pin bind only on the first
+# bootstrap: a checkout that fetched v3.17.0 months ago kept rendering goldens
+# with it forever, and a bump of HELM_VERSION changed nothing on any machine
+# that had ever run this script.
 if [ -x "$BIN_DIR/helm" ]; then
-  echo "$BIN_DIR/helm"
-  exit 0
+  if [ "$(helm_version_of "$BIN_DIR/helm")" = "$HELM_VERSION" ]; then
+    echo "$BIN_DIR/helm"
+    exit 0
+  fi
+  echo "helm in $BIN_DIR is not the pinned $HELM_VERSION; re-downloading" >&2
+  rm -f "$BIN_DIR/helm"
 fi
 # A helm already on PATH is used only when it IS the pinned version. The chart
 # goldens (internal/chartcheck) differ across helm majors in whitespace details,
@@ -26,7 +42,7 @@ path_helm=""
 path_version=""
 if command -v helm >/dev/null 2>&1; then
   path_helm="$(command -v helm)"
-  path_version="$("$path_helm" version --short 2>/dev/null | cut -d+ -f1)"
+  path_version="$(helm_version_of "$path_helm")"
   if [ "$path_version" = "$HELM_VERSION" ]; then
     echo "$path_helm"
     exit 0

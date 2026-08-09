@@ -11,6 +11,7 @@ import (
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/ptrace"
 
+	"github.com/JohanLindvall/kubescrape/internal/obs"
 	"github.com/JohanLindvall/kubescrape/internal/testrace"
 )
 
@@ -87,6 +88,19 @@ func clientSpan(dur float64, attrs map[string]string) sgSpan {
 
 func serverSpan(dur float64, attrs map[string]string) sgSpan {
 	return sgSpan{name: "GET /orders", kind: ptrace.SpanKindServer, dur: dur,
+		traceID: traceID(1), spanID: spanID(2), parentID: spanID(1), attrs: attrs}
+}
+
+// producerSpan/consumerSpan are a messaging hop's two halves, keyed exactly
+// like clientSpan/serverSpan (a producer is the client side, a consumer the
+// server side).
+func producerSpan(dur float64, attrs map[string]string) sgSpan {
+	return sgSpan{name: "publish orders", kind: ptrace.SpanKindProducer, dur: dur,
+		traceID: traceID(1), spanID: spanID(1), attrs: attrs}
+}
+
+func consumerSpan(dur float64, attrs map[string]string) sgSpan {
+	return sgSpan{name: "consume orders", kind: ptrace.SpanKindConsumer, dur: dur,
 		traceID: traceID(1), spanID: spanID(2), parentID: spanID(1), attrs: attrs}
 }
 
@@ -196,15 +210,54 @@ func TestConsumeDatabaseClassification(t *testing.T) {
 			attrs: map[string]string{"db.system": "postgresql"}, want: ConnectionUnknown,
 		},
 		{"no database attributes", ptrace.SpanKindClient, nil, ConnectionUnknown},
+
+		// PRODUCER spans arrive kind-classified messaging_system, and any
+		// databaseAttrs attribute overrides that default UNIFORMLY. These three
+		// are the same statement — "my callee is a database" — in three
+		// spellings, and they used to classify three different ways (db.name
+		// alone → database, the other two → messaging survived): which
+		// connection_type an edge got depended on which attribute the SDK
+		// happened to spell it with.
+		{"db.name alone on a producer", ptrace.SpanKindProducer, map[string]string{"db.name": "orders"}, ConnectionDatabase},
+		{
+			name: "peer.service plus db.system on a producer", kind: ptrace.SpanKindProducer,
+			attrs: map[string]string{"peer.service": "orders-db", "db.system": "postgresql"}, want: ConnectionDatabase,
+		},
+		{"db.system.name alone on a producer", ptrace.SpanKindProducer, map[string]string{"db.system.name": "postgresql"}, ConnectionDatabase},
+		// The kind's default stands where nothing overrides it.
+		{"no database attributes on a producer", ptrace.SpanKindProducer, nil, ConnectionMessagingSystem},
+		{
+			// The server-side exclusion read through the messaging kinds: a
+			// CONSUMER carrying db.* keeps its kind's classification — the
+			// side it is missing is its CALLER, and no database ever calls in.
+			name: "db.system on the consumer", kind: ptrace.SpanKindConsumer,
+			attrs: map[string]string{"db.system": "postgresql"}, want: ConnectionMessagingSystem,
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			p, sink, _ := newTestProcessor(t, Config{})
-			if tc.kind == ptrace.SpanKindClient {
+			// The attribute-carrying half under test pairs with a bare
+			// partner, ORDERED so the edge's connection_type is decided by
+			// that half alone: merge keeps the first non-empty
+			// classification, so on the messaging kinds — where the partner
+			// carries one too — the half under test must arrive first (the
+			// consumer case would otherwise assert only that the producer's
+			// messaging stuck, not that the consumer's db.* was excluded).
+			// The client/server partners classify Unknown, so their arrival
+			// order cannot mask anything.
+			switch tc.kind {
+			case ptrace.SpanKindClient:
 				p.Consume(sgTraces("checkout", clientSpan(0.1, tc.attrs)))
 				p.Consume(sgTraces("orders", serverSpan(0.05, nil)))
-			} else {
+			case ptrace.SpanKindServer:
 				p.Consume(sgTraces("checkout", clientSpan(0.1, nil)))
 				p.Consume(sgTraces("orders", serverSpan(0.05, tc.attrs)))
+			case ptrace.SpanKindProducer:
+				p.Consume(sgTraces("checkout", producerSpan(0.1, tc.attrs)))
+				p.Consume(sgTraces("shipping", consumerSpan(0.05, nil)))
+			case ptrace.SpanKindConsumer:
+				p.Consume(sgTraces("shipping", consumerSpan(0.05, tc.attrs)))
+				p.Consume(sgTraces("checkout", producerSpan(0.1, nil)))
 			}
 			if e := sink.only(t); e.Connection != tc.want {
 				t.Fatalf("connection = %q, want %q", e.Connection, tc.want)
@@ -447,6 +500,59 @@ func TestConsumeIgnoresUnpairableSpans(t *testing.T) {
 				t.Fatalf("unkeyable = %d, want %d", s.Unkeyable, tc.wantUnkeyable)
 			}
 		})
+	}
+}
+
+// A resource with no service.name — or an empty one — has nothing to name a
+// graph node with: its spans are skipped for the graph at the RESOURCE level,
+// counted into kubescrape_service_graph_unnamed_spans_total, and never reach
+// the pairing store (a nameless half-edge could only ever mint a ""-labeled
+// vertex shared by every unattributable sender). Consume does not consume the
+// payload — forwarding is the tap's, and happens regardless — so the batch is
+// untouched.
+func TestConsumeSkipsResourcesWithoutServiceName(t *testing.T) {
+	p, sink, _ := newTestProcessor(t, Config{})
+
+	// One NAMED resource carrying a complete pair, one resource with NO
+	// service.name (two spans), one with an EMPTY service.name (one span).
+	td := sgTraces("checkout", clientSpan(0.1, nil), serverSpan(0.05, nil))
+	anon := td.ResourceSpans().AppendEmpty().ScopeSpans().AppendEmpty().Spans()
+	for i := byte(0); i < 2; i++ {
+		s := anon.AppendEmpty()
+		s.SetName("orphan")
+		s.SetKind(ptrace.SpanKindClient)
+		s.SetTraceID(traceID(7))
+		s.SetSpanID(spanID(i + 1))
+	}
+	empty := td.ResourceSpans().AppendEmpty()
+	empty.Resource().Attributes().PutStr(attrServiceName, "")
+	s := empty.ScopeSpans().AppendEmpty().Spans().AppendEmpty()
+	s.SetName("orphan")
+	s.SetKind(ptrace.SpanKindClient)
+	s.SetTraceID(traceID(8))
+	s.SetSpanID(spanID(1))
+
+	before := obs.ServiceGraphUnnamed.Value()
+	p.Consume(td)
+
+	if got := obs.ServiceGraphUnnamed.Value() - before; got != 3 {
+		t.Errorf("unnamed counter delta = %v, want 3 (every span of both nameless resources)", got)
+	}
+	// The named resource still paired into its edge.
+	if e := sink.only(t); e.ClientService != "checkout" || !e.HaveClient || !e.HaveServer {
+		t.Fatalf("edge = %+v, want the named resource's pair", e)
+	}
+	// Nothing of the nameless resources reached the store: their client halves
+	// would otherwise sit pending (and later expire into anonymous edges), and
+	// none of them is unkeyable — the ids are fine, the resource is nameless,
+	// and the two counters must not blur.
+	if st := p.Stats(); st.Items != 0 || st.Unkeyable != 0 {
+		t.Fatalf("stats = %+v, want no half-edge and no unkeyable count from the skipped resources", st)
+	}
+	// The payload is neither consumed nor trimmed — only the graph goes
+	// without these spans.
+	if n := td.SpanCount(); n != 5 {
+		t.Fatalf("SpanCount = %d after Consume, want 5 (Consume must not mutate the batch)", n)
 	}
 }
 

@@ -1277,7 +1277,12 @@ is asked for in any form — `caFile`, `insecureSkipVerify: true` or an explicit
 instrumented produces no server span, so no true edge can form. Those calls
 appear as **virtual nodes** instead — the far side is named from the first
 matching `virtualNodePeerAttributes` key on the client span (`peer.service`,
-`db.name`, `db.system` by default), the edge carries
+`db.name`, `db.system` by default). It works in both directions: an expired
+**server** half carrying such a key names its uninstrumented *caller* (an
+ingress, a browser, an external client) and the edge is labelled
+`virtual_node="client"`. A half naming none of those keys is counted unpaired
+and mints no node at all — unlike Tempo, which synthesizes a literal `user`
+client for an unpaired root server span. The edge carries
 `connection_type="virtual_node"` and only the client-side duration. A client
 that names nothing at all produces no edge whatsoever. The graph is therefore a
 map of what is instrumented, not of what the cluster does; and spans that never
@@ -1720,6 +1725,13 @@ to latch a cardinality cap, which built-in bounds can only slow. The target
 hook is full relabel-power (drop, rewrite `path`) without growing the
 declarative config. The sample policy plugs into the `tailSampling` policy
 list as `type: script` (refused at config time if this section is missing).
+A later hot reload that REMOVES the section cannot be refused the same way —
+the reload sees only the transforms file, never `tailSampling` — so the
+policy abstains on every decision from then on (traces fall through to the
+next policy, or to the default drop). That is not silent: each abstaining
+decision counts `kubescrape_transform_errors_total{signal="sample"}` and a
+throttled warning names the remedy (restore the section, or drop the
+`type: script` policy).
 The parse hook runs **only** on plain sources that opt in with
 `parseScript: true` — one Starlark call per line on those sources alone.
 

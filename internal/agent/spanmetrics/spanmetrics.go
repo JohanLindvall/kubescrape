@@ -345,7 +345,11 @@ func (g *Generator) renderRED(sm pmetric.ScopeMetrics, now time.Time) {
 	dur := cumagg.HistMetric(sm, g.prefix+".duration", "Span duration in seconds, by dimensions.")
 	g.store.EachLocked(func(s *spanSeries) {
 		g.store.MarkRenderedLocked(s)
-		start := pcommon.NewTimestampFromTime(s.Start)
+		// Clamped: a series admitted between Export's clock read and this
+		// render's lock hold carries a Start past ts, and stamping it
+		// unclamped is an inverted cumulative interval on the series' first
+		// export (cumagg.ClampStart has the full race).
+		start := cumagg.ClampStart(pcommon.NewTimestampFromTime(s.Start), ts)
 		cp := calls.AppendEmpty()
 		putDims(cp.Attributes(), g.names, s.dims)
 		cp.SetStartTimestamp(start)

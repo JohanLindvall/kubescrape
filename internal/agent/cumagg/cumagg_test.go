@@ -246,6 +246,23 @@ func TestRunFinalExportIsDetached(t *testing.T) {
 	}
 }
 
+// ClampStart bounds the STAMP, never Meta.Start: a series admitted between an
+// export's clock read and the render's lock hold renders start == ts on that
+// first export (the OTLP "cumulative began now" spelling) and its true start
+// from the next export on, whose ts lies past it.
+func TestClampStart(t *testing.T) {
+	ts := pcommon.Timestamp(1_000)
+	for _, tc := range []struct{ start, want pcommon.Timestamp }{
+		{500, 500},     // the ordinary series: the true start renders
+		{1_000, 1_000}, // exactly the export instant: a legal interval, kept
+		{1_500, 1_000}, // admitted after the export's clock read: clamped to ts
+	} {
+		if got := ClampStart(tc.start, ts); got != tc.want {
+			t.Errorf("ClampStart(%v, %v) = %v, want %v", tc.start, ts, got, tc.want)
+		}
+	}
+}
+
 func TestParseStaleAfter(t *testing.T) {
 	const def = 15 * time.Minute
 	for _, tc := range []struct {

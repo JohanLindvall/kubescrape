@@ -84,9 +84,13 @@ const (
 // it binds, so a too-small value is visible rather than silent.
 type Config struct {
 	// Wait is how long a half-edge waits for its partner before it expires (a
-	// Go duration such as "10s"; empty = 10s). An expired CLIENT half can still
-	// become an edge against a virtual node (see VirtualNodePeerAttributes); an
-	// expired server half cannot, and is counted as unpaired.
+	// Go duration such as "10s"; empty = 10s). An expired half carrying a peer
+	// attribute — EITHER side — still becomes an edge against a virtual node
+	// (see VirtualNodePeerAttributes): an expired client half names its CALLEE
+	// (virtual_node="server"), and an expired server half names its CALLER
+	// (virtual_node="client"), which is how uninstrumented external callers —
+	// browsers, ingresses — get named on the graph. A half with no peer
+	// attribute is counted as unpaired.
 	//
 	// A STRING, not a time.Duration, and this is not a style choice: the agent
 	// config is decoded through sigs.k8s.io/yaml -> encoding/json, which accepts

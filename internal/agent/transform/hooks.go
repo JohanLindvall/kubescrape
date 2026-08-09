@@ -33,6 +33,14 @@ import (
 // then takes its fail-open path.
 var hookWarnGates struct {
 	ingest, targets, sample, parse logdedupe.Throttle
+	// sampleGone gates SampleDecider's section-removed warning SEPARATELY
+	// from sample (the script-error gate): the two classes alternate across
+	// the very transitions the messages exist to report — an error-warned
+	// script edited away, a restored section erroring — and a shared window
+	// would let the earlier class suppress the state change's one actionable
+	// line for up to a minute, leaving only a log line about a script that no
+	// longer exists.
+	sampleGone logdedupe.Throttle
 }
 
 func hookErr(gate *logdedupe.Throttle, signal string, err error) {
@@ -214,8 +222,21 @@ func (s stringMapView) Has(k starlark.Value) (bool, error) {
 
 // SampleDecider adapts the sample hook to tailsample's injected script
 // policy: decide(trace) -> True samples, False drops, None (or an error)
-// abstains to the next policy. nil when the section is absent — the policy
-// compiler then refuses `type: script`, at config time.
+// abstains to the next policy. nil when the section is absent at STARTUP —
+// the policy compiler then refuses `type: script`, at config time.
+//
+// A hot reload can remove the section after that check, and it cannot be
+// refused at reload time: a sectionless file still compiles, so it commits
+// as an APPLIED reload (last-good retention covers compile failures only),
+// and this package cannot know whether tailsample is configured with a
+// `type: script` policy that depends on the hook — the UsesScript/HasSample
+// cross-check is the agent's, at startup, and never re-runs. The closure
+// then keeps failing open (abstain, the hooks' contract) but as loudly as
+// the error arm — every decision counted into
+// kubescrape_transform_errors_total{signal="sample"} plus a throttled warn —
+// because a silent abstain turns a load-bearing sampling policy off with
+// zero signal: traces fall through to the next policy or the default drop
+// while every reload metric reads green.
 func (w *Wrapper) SampleDecider() func(tailsample.Trace) (sample, abstain bool) {
 	if p := w.program.Load(); p == nil || p.sample == nil {
 		return nil
@@ -223,6 +244,16 @@ func (w *Wrapper) SampleDecider() func(tailsample.Trace) (sample, abstain bool) 
 	return func(t tailsample.Trace) (bool, bool) {
 		p := w.program.Load() // hot reload: resolve per decision
 		if p == nil || p.sample == nil {
+			// A reload removed the section out from under a live script
+			// policy (doc above). Abstaining is the contract; abstaining
+			// SILENTLY is the failure this arm prevents — a script ERROR on
+			// the same path is counted and warned, and the missing section
+			// must not be quieter than a bug in it.
+			obs.TransformErrors.WithLabelValues("sample").Inc()
+			if hookWarnGates.sampleGone.Allow(time.Minute) {
+				slog.Warn("transforms file no longer defines a sample: section; the type: script tail-sampling policy abstains on every decision (traces fall through to the next policy or the default drop) — restore the section or remove the type: script policy",
+					"hook", "sample")
+			}
 			return false, true
 		}
 		v, err := p.sample.call(&traceView{t: t})

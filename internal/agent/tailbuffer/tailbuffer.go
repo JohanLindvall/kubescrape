@@ -35,7 +35,14 @@
 //   - by SIZE: at most maxSpans of them, whatever the rate;
 //   - by SHUTDOWN: a graceful stop (SIGTERM, a rolling update, an eviction)
 //     calls Flush, which decides every buffered trace immediately and exports
-//     the keeps before the exporter closes. Only a hard kill — SIGKILL, an OOM,
+//     the keeps before the exporter closes — and LATCHES the buffer: nothing
+//     will flush it a second time, so a straggler push that outlives the
+//     receivers' graceful stop (an active handler http.Server.Shutdown never
+//     interrupts, an RPC gRPC's GracefulStop was still waiting on when the
+//     producer-join budget expired) is decided inside its own take(), on the
+//     spans present, with its keeps riding out on that push's own ack.
+//     Without the latch those spans re-filled a buffer nobody would flush
+//     again and were lost behind a 200. Only a hard kill — SIGKILL, an OOM,
 //     a node failure — loses anything.
 //
 // The likeliest hard kill is the OOM this buffer's own bounds cause, which is
@@ -359,8 +366,17 @@ type Buffer struct {
 	log  *slog.Logger
 	now  func() time.Time // injectable for tests
 
-	mu    sync.Mutex
-	trace map[pcommon.TraceID]*bufTrace
+	mu sync.Mutex
+	// flushed latches when Flush's drain runs and is never cleared: the final
+	// flush is the LAST pass anyone makes over this buffer, so a span buffered
+	// after it would sit here until the process died — acked, counted by no
+	// counter, visible only as a gauge nobody is left to act on. take()
+	// consults it to decide a post-Flush push's new traces on the spot
+	// (reason=shutdown) instead of buffering them. Under mu, like everything
+	// else: a push either lands before Flush's drain (which then decides it)
+	// or sees the latch — there is no in-between where it buffers unseen.
+	flushed bool
+	trace   map[pcommon.TraceID]*bufTrace
 	// order is the arrival FIFO. Every trace waits the same decisionWait, so
 	// first-seen order IS deadline order and the oldest — the next to decide
 	// normally, and the one an early decision takes — is the front. Entries are
@@ -537,11 +553,21 @@ func (b *Buffer) Stats() Stats {
 // re-deliver against the cached verdict. Counting them lost over-reports a rare
 // corner — a bound binding in the same instant the collector fails — in the
 // direction that does not hide loss.)
+//
+// After the shutdown Flush has run (the flushed latch), a push's NEW traces are
+// decided inside take() itself — buffering them would be silent loss, since
+// nothing will flush this buffer again — and their keeps ride out in the same
+// returned payload as everything else: tallied only when this push acks, never
+// marked otlpexport.Own and never counted lost, because unlike `mine` the
+// sender still holds every one of them, and a NACK makes it retransmit them
+// against the verdict take() just cached (whereupon they are ordinary late
+// spans). The straggler's ack is thereby honest: a 200 means its keeps went
+// out on this very push.
 func (b *Buffer) ExportTraces(ctx context.Context, td ptrace.Traces) error {
 	if td.SpanCount() == 0 {
 		return nil
 	}
-	out, late, lateDropped, mine := b.take(td)
+	out, late, lateDropped, mine, flushKept := b.take(td)
 	if out.spans == 0 {
 		// Nothing to forward means the push is acked right here — and the ack
 		// is what makes its late-DROPPED spans final, so this is where they are
@@ -564,7 +590,16 @@ func (b *Buffer) ExportTraces(ctx context.Context, td ptrace.Traces) error {
 		if mine > 0 {
 			b.spansLost.Add(float64(mine))
 		}
-		b.warn("exporting tail-sampled spans failed", "spans", out.spans, "buffered", mine, "error", err)
+		// flushKept spans are deliberately NOT in that lost count: the push is
+		// NACKed below, the sender retransmits it, and the retransmission
+		// follows the cached verdicts as late spans — a loss tally for spans
+		// the sender still holds would be the over-report, not the honesty.
+		// And "lost" itself is an upper bound even for `mine`: downstream this
+		// send may be COMPOSITE (a routing fan-out, an otlpsplit into parts),
+		// so shares of it can have been delivered or spooled before the
+		// failure — at-least-once keeps those real.
+		b.warn("exporting tail-sampled spans failed; the push is NACKed (the sender's retry re-presents its own spans) and the spans that came out of the buffer are dropped from this process and counted lost — an upper bound: under a routed or size-split export, earlier shares may already have been delivered or spooled",
+			"spans", out.spans, "buffered", mine, "error", err)
 		return err
 	}
 	// Counted only now: a late span the sender will re-push must not be counted
@@ -572,15 +607,17 @@ func (b *Buffer) ExportTraces(ctx context.Context, td ptrace.Traces) error {
 	// The late-DROPPED tally defers to the same ack: those spans are not in
 	// out.td, but a NACKed push is retransmitted whole, so counting them at
 	// receive time tallied the same spans once per retry attempt — this return
-	// is what stops the retransmissions that would re-present them.
+	// is what stops the retransmissions that would re-present them. flushKept
+	// rides the same ack for the same reason, into the kept tally: those spans
+	// left the buffer by a decision, and this ack is what made them real.
 	if lateDropped > 0 {
 		b.lateDrop.Add(float64(lateDropped))
 	}
 	if late > 0 {
 		b.lateKept.Add(float64(late))
 	}
-	if mine > 0 {
-		b.spansKept.Add(float64(mine))
+	if mine+flushKept > 0 {
+		b.spansKept.Add(float64(mine + flushKept))
 	}
 	return nil
 }
@@ -590,8 +627,11 @@ func (b *Buffer) ExportTraces(ctx context.Context, td ptrace.Traces) error {
 // many of its spans came from THIS push (the sender can re-send those), how
 // many were dropped against a cached DROP verdict (tallied by the caller only
 // once the push acks — a NACKed push is retransmitted and re-presents them),
-// and how many came out of the buffer (the sender cannot re-send those).
-func (b *Buffer) take(td ptrace.Traces) (out outbound, late, lateDropped, mine int) {
+// how many came out of the buffer (the sender cannot re-send those), and how
+// many of THIS push's spans a post-Flush shutdown decision kept (flushKept —
+// like late, the sender still holds them, so they ride the push's ack and are
+// never marked owned or counted lost).
+func (b *Buffer) take(td ptrace.Traces) (out outbound, late, lateDropped, mine, flushKept int) {
 	now := b.now()
 
 	b.mu.Lock()
@@ -644,11 +684,42 @@ func (b *Buffer) take(td ptrace.Traces) (out outbound, late, lateDropped, mine i
 				// composite while the cache still remembers the trace at all;
 				// see decide and cache.go's two lifetimes).
 				e := b.add(id, sp, rs, ss, now)
+				if b.flushed {
+					// Post-Flush the span is only PARKED here until the end of
+					// this walk, where its trace is decided on the spans
+					// present (the loop below). enforce is skipped: the
+					// occupancy is transient inside this critical section and
+					// bounded by one push (the listeners cap payload bytes),
+					// and a bound firing here would classify this push's spans
+					// as `mine` — owned, spooled, counted lost on a failure —
+					// when their sender in fact still holds every one of them.
+					continue
+				}
 				mine += b.enforce(&out, e, now)
 			}
 		}
 	}
-	return out, late, lateDropped, mine
+	if b.flushed {
+		// The final Flush has run, so nothing will ever drain this buffer
+		// again: decide everything the walk above parked, each trace on the
+		// spans this push carried for it. Every trace here IS from this push —
+		// the buffer was empty when the walk began (Flush drained it, and
+		// every earlier post-Flush take ended in this same loop) — so the
+		// keeps return as flushKept and ride the push's own ack like late
+		// spans: a NACKed sender retransmits, and the retransmission follows
+		// the verdicts cached here. That is what keeps a straggler's ack
+		// honest and the buffered-spans gauges at zero after Flush.
+		for b.head < len(b.order) {
+			e := b.order[b.head]
+			if e.gone {
+				b.head++
+				continue
+			}
+			b.head++
+			flushKept += b.decide(&out, e, now, reasonShutdown)
+		}
+	}
+	return out, late, lateDropped, mine, flushKept
 }
 
 // add copies one span into its trace's buffer, creating the trace and the
@@ -900,9 +971,14 @@ func (b *Buffer) Run(ctx context.Context) {
 func (b *Buffer) Sweep(ctx context.Context) { b.drain(ctx, false) }
 
 // Flush decides EVERY buffered trace immediately, whatever its window, and
-// exports the keeps. It is the graceful-shutdown path: it is what bounds the
-// loss this layer's contract admits to a hard kill (see the package doc), so it
-// must run after the receivers have stopped and before the exporter closes.
+// exports the keeps — then leaves the buffer LATCHED: a straggler push that
+// outlives the receivers' graceful stop (an active handler http.Server.Shutdown
+// never interrupts, an RPC GracefulStop was still waiting on when the join
+// budget expired) is decided inside its own take() rather than buffered where
+// nothing will ever flush it. It is the graceful-shutdown path: it is what
+// bounds the loss this layer's contract admits to a hard kill (see the package
+// doc), so it runs after the receivers have been ASKED to stop and before the
+// exporter closes.
 func (b *Buffer) Flush(ctx context.Context) { b.drain(ctx, true) }
 
 // drain decides the due traces (or all of them) and sends the keeps as ONE
@@ -915,6 +991,16 @@ func (b *Buffer) drain(ctx context.Context, all bool) {
 	var out outbound
 
 	b.mu.Lock()
+	if all {
+		// The final flush LATCHES the buffer before it drains: nothing runs a
+		// flush after this one, so from here take() must never buffer again —
+		// a post-Flush push's traces are decided inside its own take (see the
+		// package doc's shutdown bullet). Set under the same mutex the receive
+		// path holds, a push either lands before this drain (which then
+		// decides it) or sees the latch; there is no in-between where spans
+		// re-fill a buffer nobody will empty.
+		b.flushed = true
+	}
 	for b.head < len(b.order) {
 		e := b.order[b.head]
 		if e.gone {
@@ -949,11 +1035,17 @@ func (b *Buffer) drain(ctx context.Context, all bool) {
 	// traces, so a ctx cancelled mid-send is not a retry, it is loss, and the
 	// shutdown Flush cannot recover it: those traces are already out of the
 	// buffer and their verdicts are already cached.
+	//
+	// One known over-report, accepted: downstream this send may be COMPOSITE
+	// (a routing fan-out, an otlpsplit into size-bounded parts), and a failure
+	// after some shares landed still counts the WHOLE payload into
+	// {outcome="lost"} — at-least-once delivered those shares for real, so the
+	// lost counter is an upper bound on loss, never an under-count.
 	sctx, cancel := sendContext(ctx)
 	defer cancel()
 	if err := b.sendRetry(otlpexport.Own(sctx), out.td); err != nil {
 		b.spansLost.Add(float64(out.spans))
-		b.warn("exporting tail-sampled traces failed; the spans are dropped (they were acked to their sender when they were buffered, and no disk buffer took them)",
+		b.warn("exporting tail-sampled traces failed on the final attempt; the spans are dropped from this process (their senders were acked at buffering time) and counted lost — an upper bound: under a routed or size-split export, earlier shares may already have been delivered or spooled",
 			"spans", out.spans, "error", err)
 		return
 	}

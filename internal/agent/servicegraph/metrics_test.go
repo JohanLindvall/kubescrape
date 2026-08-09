@@ -647,6 +647,67 @@ func TestReCreatedSeriesGetsFreshStartTimestamp(t *testing.T) {
 	}
 }
 
+// A series ADMITTED between Export's clock read and the snapshot's first lock
+// hold carries a Meta.Start LATER than the timestamp every point of that
+// payload is stamped with; unclamped, its first export rendered
+// StartTimestamp > Timestamp — an inverted cumulative interval. The stamp is
+// clamped to ts (cumagg.ClampStart), and the TRUE start renders from the next
+// export on.
+func TestStartClampedWhenSeriesAdmittedDuringExport(t *testing.T) {
+	r := NewRegistry(Config{})
+	admitted := t0.Add(time.Second) // the receive goroutine's later clock read
+	fixedClock(r, &admitted)
+	r.Record(edge("frontend", "checkout"))
+
+	// Render with the export's EARLIER clock read — exactly what Export stamps
+	// when the admission lands inside the window.
+	exportTS := pcommon.NewTimestampFromTime(t0)
+	assertPointStamps(t, r.render(pcommon.NewResource(), t0), exportTS, exportTS)
+
+	// The next export's ts lies past the true start, which renders unclamped.
+	next := t0.Add(2 * time.Second)
+	assertPointStamps(t, r.render(pcommon.NewResource(), next),
+		pcommon.NewTimestampFromTime(admitted), pcommon.NewTimestampFromTime(next))
+}
+
+// assertPointStamps checks every data point of every metric in md against one
+// wanted (start, ts) pair.
+func assertPointStamps(t *testing.T, md pmetric.Metrics, wantStart, wantTS pcommon.Timestamp) {
+	t.Helper()
+	points := 0
+	check := func(name string, start, ts pcommon.Timestamp) {
+		points++
+		if start != wantStart || ts != wantTS {
+			t.Errorf("%s point start/ts = %v/%v, want %v/%v", name, start, ts, wantStart, wantTS)
+		}
+	}
+	rms := md.ResourceMetrics()
+	for i := 0; i < rms.Len(); i++ {
+		sms := rms.At(i).ScopeMetrics()
+		for j := 0; j < sms.Len(); j++ {
+			ms := sms.At(j).Metrics()
+			for k := 0; k < ms.Len(); k++ {
+				m := ms.At(k)
+				switch m.Type() {
+				case pmetric.MetricTypeSum:
+					dps := m.Sum().DataPoints()
+					for l := 0; l < dps.Len(); l++ {
+						check(m.Name(), dps.At(l).StartTimestamp(), dps.At(l).Timestamp())
+					}
+				case pmetric.MetricTypeHistogram:
+					dps := m.Histogram().DataPoints()
+					for l := 0; l < dps.Len(); l++ {
+						check(m.Name(), dps.At(l).StartTimestamp(), dps.At(l).Timestamp())
+					}
+				}
+			}
+		}
+	}
+	if points == 0 {
+		t.Fatal("no data points rendered")
+	}
+}
+
 // An empty registry sends nothing at all rather than an empty payload, and Run
 // always makes a final export so the last window's edges are not lost at
 // shutdown.

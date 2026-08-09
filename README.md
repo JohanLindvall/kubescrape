@@ -1189,8 +1189,9 @@ completeness for memory; each has a counter that moves when it binds, because
 a missing edge looks exactly like a call that never happened. **The limitation
 is structural**: an uninstrumented callee emits no server span, so its calls
 appear only as **virtual nodes** named from the client span's `peer.service` /
-`db.name` / `db.system` — and a client naming none of those yields no edge at
-all. See
+`db.name` / `db.system` (symmetrically, an expired server half carrying one of
+those names its uninstrumented *caller*) — and a party naming none of them
+yields no edge at all. See
 [docs/CONFIGURATION.md](docs/CONFIGURATION.md#agent-service-graph).
 
 **What this topology costs.** The tier is a hard, cluster-wide dependency for

@@ -1,6 +1,8 @@
 package transform
 
 import (
+	"context"
+	"path/filepath"
 	"reflect"
 	"testing"
 	"time"
@@ -248,6 +250,83 @@ sample: |
 		Policies: []tailsample.PolicyConfig{{Name: "custom", Type: tailsample.TypeScript}},
 	}); err == nil {
 		t.Fatal("type script without an injected body must refuse")
+	}
+}
+
+// A hot reload that REMOVES the sample: section must be as loud as a script
+// error, never a silent abstain: the sectionless file compiles, so it commits
+// as an APPLIED reload, and the startup UsesScript/HasSample cross-check does
+// not re-run — the counter and the throttled warn are the only signal that a
+// live `type: script` policy stopped deciding. The decider is captured by
+// tailsample once at startup, so ONE closure must decide normally, abstain
+// loudly while the section is gone, and resume when a reload restores it.
+// Warn assertions ride the throttle gate (this package's tests assert
+// counters, not log output): a claimed gate is the proof the warn fired.
+func TestSampleDeciderReloadRemovingSectionCountsAndWarns(t *testing.T) {
+	withSample := "sample: |\n  def decide(trace):\n      return True\n"
+	withoutSample := "logs: |\n  def transform(batch): pass\n"
+	path := filepath.Join(t.TempDir(), "transforms.yaml")
+	writeAtomic(t, path, withSample)
+	prog, err := CompileFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w := Wrap(&capExp{}, nil, prog)
+	decider := w.SampleDecider()
+	if decider == nil {
+		t.Fatal("no decider despite a sample section")
+	}
+	tr := tailsample.Trace{} // the script returns True without reading it
+
+	// (1) Section present: decides normally, the error counter stays still.
+	errs := obs.TransformErrors.WithLabelValues("sample")
+	before := errs.Value()
+	if s, ab := decider(tr); !s || ab {
+		t.Fatalf("with sample section: sample=%v abstain=%v, want sample", s, ab)
+	}
+	if got := errs.Value() - before; got != 0 {
+		t.Fatalf("transform_errors{sample} moved %v on a normal decision", got)
+	}
+
+	// The REAL reload path commits the edit that removes the section.
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { defer close(done); Reload(ctx, w, path, 20*time.Millisecond, testLogger()) }()
+	defer func() { cancel(); <-done }()
+	writeAtomic(t, path, withoutSample)
+	waitFor(t, "the sectionless program to go active", func() bool {
+		return w.Active().Hash == contentHash([]byte(withoutSample))
+	})
+
+	// (2)+(3) Section gone: abstain, counter on EVERY decision, warn once —
+	// the gate claim after the first decision proves the warn fired, and the
+	// second decision must keep counting while the gate throttles its warn.
+	before = errs.Value()
+	if s, ab := decider(tr); s || !ab {
+		t.Fatalf("section gone: sample=%v abstain=%v, want abstain", s, ab)
+	}
+	if hookWarnGates.sampleGone.Allow(time.Minute) {
+		t.Fatal("the section-removed warning did not claim its throttle gate (no warn fired)")
+	}
+	if s, ab := decider(tr); s || !ab {
+		t.Fatalf("second decision with section gone: sample=%v abstain=%v, want abstain", s, ab)
+	}
+	if got := errs.Value() - before; got != 2 {
+		t.Fatalf("transform_errors{sample} moved %v across two decisions, want 2", got)
+	}
+
+	// (4) Restoring the section resumes normal decisions through the SAME
+	// closure, and the counter goes quiet again.
+	writeAtomic(t, path, withSample)
+	waitFor(t, "the restored program to go active", func() bool {
+		return w.Active().Hash == contentHash([]byte(withSample))
+	})
+	before = errs.Value()
+	if s, ab := decider(tr); !s || ab {
+		t.Fatalf("after restore: sample=%v abstain=%v, want sample", s, ab)
+	}
+	if got := errs.Value() - before; got != 0 {
+		t.Fatalf("transform_errors{sample} moved %v after the section was restored", got)
 	}
 }
 

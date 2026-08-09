@@ -46,6 +46,15 @@ func KeepaliveOption() grpc.ServerOption {
 	})
 }
 
+// httpShutdownGrace bounds the HTTP side of a listener shutdown: how long
+// Shutdown waits for in-flight requests before Run force-closes the
+// connections. The Close that follows an expired grace is load-bearing:
+// http.Server.Shutdown NEVER interrupts an active handler, and
+// NewPushHTTPServer's ReadTimeout allows a request body 60 seconds of trickle
+// — so without it a straggling handler could finish its push, and be acked,
+// long after the rest of the process had flushed and stopped.
+const httpShutdownGrace = 5 * time.Second
+
 // NewPushHTTPServer returns the *http.Server shape for an OTLP/HTTP push
 // listener. ReadHeaderTimeout kills Slowloris header trickling; ReadTimeout
 // bounds a trickled request body (the handlers read up to 16 MiB and senders
@@ -90,12 +99,18 @@ type Listeners struct {
 	// rollout that advanced on a probe answering before the port existed would
 	// march a broken listener across the fleet.
 	Ready func()
+
+	// shutdownGrace overrides httpShutdownGrace (tests only; zero = the
+	// default). Injectable so the grace-expired-then-Close path is provable
+	// without a five-second test.
+	shutdownGrace time.Duration
 }
 
 // Run serves until ctx is cancelled, then shuts both listeners down
-// (GracefulStop for gRPC; a 5-second-bounded Shutdown for HTTP). A runtime
-// listener failure propagates as an error — callers treat it as fatal — while
-// a ctx-cancelled shutdown returns nil.
+// (GracefulStop for gRPC; for HTTP a Shutdown bounded by httpShutdownGrace,
+// force-Closing whatever outlives it). A runtime listener failure propagates
+// as an error — callers treat it as fatal — while a ctx-cancelled shutdown
+// returns nil.
 func (l Listeners) Run(ctx context.Context) error {
 	log := l.Logger
 	if log == nil {
@@ -159,9 +174,24 @@ func (l Listeners) Run(ctx context.Context) error {
 		l.GRPC.GracefulStop()
 	}
 	if l.HTTP != nil {
-		sctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		_ = l.HTTP.Shutdown(sctx)
+		grace := l.shutdownGrace
+		if grace <= 0 {
+			grace = httpShutdownGrace
+		}
+		sctx, cancel := context.WithTimeout(context.Background(), grace)
+		err := l.HTTP.Shutdown(sctx)
+		cancel()
+		if err != nil {
+			// The grace expired with requests still in flight (Shutdown never
+			// interrupts an active handler, and ReadTimeout gives a trickled
+			// body 60s). A handler still running past the grace now answers
+			// into a closed connection: its sender sees a transport error and
+			// RETRIES against the replacement pod, which is at-least-once —
+			// better a NACK than an ack nothing downstream will honor, because
+			// by this point the final flushes have run and whatever that
+			// handler acked would die with the process.
+			_ = l.HTTP.Close()
+		}
 	}
 	return runErr
 }

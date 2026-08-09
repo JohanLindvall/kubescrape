@@ -196,3 +196,22 @@ func HistMetric(sm pmetric.ScopeMetrics, name, desc string) pmetric.HistogramDat
 	h.SetAggregationTemporality(pmetric.AggregationTemporalityCumulative)
 	return h.DataPoints()
 }
+
+// ClampStart bounds a series' start timestamp by the point timestamp it is
+// about to be stamped beside, and exists for one narrow race: Export reads the
+// export clock ONCE, before the render's first hold of the series lock, so a
+// series ADMITTED in that window — its Meta.Start stamped from a later clock
+// read on a receive goroutine — would render StartTimestamp > Timestamp on its
+// very first export. The window is microseconds and self-correcting, but the
+// point is malformed: OTLP requires a cumulative point's start at or before its
+// time, and a consumer may reject the payload or misread the inversion as a
+// reset. Clamping the STAMP to ts is the OTLP first-point spelling of "the
+// cumulative began now"; Meta.Start itself is untouched, so the true start
+// renders from the next export on, whose ts lies past it. Call it at every
+// site that writes a Meta.Start next to an export timestamp.
+func ClampStart(start, ts pcommon.Timestamp) pcommon.Timestamp {
+	if start > ts {
+		return ts
+	}
+	return start
+}

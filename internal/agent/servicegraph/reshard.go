@@ -397,7 +397,8 @@ type ReshardStats struct {
 	// SendsFailed is failed internal sends (one per shard per batch). The
 	// application's push fails with them.
 	SendsFailed uint64
-	// LoopsBlocked is application pushes refused for carrying ForwardedMarker —
+	// LoopsBlocked is SPANS refused off application pushes carrying
+	// ForwardedMarker (CountLoopBlocked tallies the push's span count) —
 	// always zero in a correct deployment.
 	LoopsBlocked uint64
 }

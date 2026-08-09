@@ -574,7 +574,11 @@ func (r *Registry) renderEdges(sm pmetric.ScopeMetrics, now time.Time) {
 
 	for i := range snap {
 		s := &snap[i]
-		start := pcommon.NewTimestampFromTime(s.start)
+		// Clamped: a series admitted between Export's clock read and the
+		// snapshot's first lock hold carries a Start past ts, and stamping it
+		// unclamped is an inverted cumulative interval on the series' first
+		// export (cumagg.ClampStart has the full race).
+		start := cumagg.ClampStart(pcommon.NewTimestampFromTime(s.start), ts)
 
 		rp := requests.AppendEmpty()
 		putLabels(rp.Attributes(), s.labels)

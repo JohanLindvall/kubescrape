@@ -9,6 +9,7 @@ import (
 	"go.opentelemetry.io/collector/pdata/ptrace"
 
 	"github.com/JohanLindvall/kubescrape/internal/agent/cumagg"
+	"github.com/JohanLindvall/kubescrape/internal/obs"
 )
 
 // edgeSink receives every edge the store finishes with: completed pairs and
@@ -220,6 +221,27 @@ func (p *Processor) Consume(td ptrace.Traces) {
 		// this resource's spans produce.
 		svc := cumagg.Retain(cumagg.AttrStr(resAttrs, attrServiceName))
 		sss := rs.ScopeSpans()
+		if svc == "" {
+			// No service.name (or an empty one) is nothing to name a graph
+			// node with: pairing these spans anyway minted anonymous
+			// ""-labeled nodes that every unattributable sender in the
+			// cluster shared — one bogus vertex accreting edges to real
+			// services — where Tempo skips them. Skipped at the RESOURCE and
+			// for the GRAPH only: the tap calling Consume forwards first, so
+			// the spans still reach the collector, and only the graph goes
+			// without them. Counted, never silent — the shipped tier enriches
+			// at entry and derives service.name for every attributable
+			// sender, so a sustained rate here means senders the tier cannot
+			// attribute, whose requests are on no edge at all.
+			n := 0
+			for j := 0; j < sss.Len(); j++ {
+				n += sss.At(j).Spans().Len()
+			}
+			if n > 0 {
+				obs.ServiceGraphUnnamed.Add(float64(n))
+			}
+			continue
+		}
 		for j := 0; j < sss.Len(); j++ {
 			spans := sss.At(j).Spans()
 			for k := 0; k < spans.Len(); k++ {
@@ -324,11 +346,12 @@ func (p *Processor) observe(span ptrace.Span, resAttrs pcommon.Map, svc string, 
 	// an uninstrumented CALLER — a browser, an external client, an ingress —
 	// gets a name, which is the whole virtual_node "client" case.
 	//
-	// The db.* attributes are the exception, and they are skipped on a server
-	// half: they describe the span's own CALLEE, while the side missing from a
-	// server half is the CALLER, so honouring them there would name the far
-	// side backwards ("postgresql called us") and classify an ordinary
-	// application edge as a database one.
+	// The db.* attributes are skipped on a server half — for NAMING here and
+	// for classification below alike, since both would read the same attribute
+	// the same wrong way round: db.* describes the span's own CALLEE, while
+	// the side missing from a server half is its CALLER, so honouring it there
+	// would name the far side backwards ("postgresql called us") and label
+	// every application edge INTO a database-using service as a database call.
 	for i, a := range p.peerAttrs {
 		if p.peerIsDB[i] && side == sideServer {
 			continue
@@ -343,13 +366,28 @@ func (p *Processor) observe(span ptrace.Span, resAttrs pcommon.Map, svc string, 
 		}
 		break
 	}
-	// A client span naming a database is a database edge even when its peer
-	// attribute was peer.service (or absent): the db.* attributes are the
-	// authoritative statement that the callee is a datastore. Only the client
-	// side is asked — a database does not emit the server half, so a server
-	// span carrying db.* is a service that happens to talk to one, not the
-	// database itself.
-	if h.connection == ConnectionUnknown && side == sideClient && namesDatabase(spanAttrs) {
+	// Connection-type precedence, settled here for the whole CLIENT SIDE of
+	// the call (side == sideClient is exactly the CLIENT and PRODUCER kinds —
+	// the switch above maps no other kind to it): a databaseAttrs attribute is
+	// AUTHORITATIVE over the kind-derived classification. The kind supplies a
+	// DEFAULT inferred from the call's shape (producer/consumer =>
+	// messaging_system); a db.* attribute is the instrumentation's explicit
+	// statement about what the callee IS, and the explicit statement wins —
+	// Tempo's rule too, whose database attributes overwrite to database on the
+	// client-side kinds. Gating this on ConnectionUnknown instead made the
+	// winner a function of WHICH spelling the SDK used: a db-flagged peer
+	// attribute (db.name alone) already overwrote messaging in the scan above,
+	// while the same statement spelled peer.service + db.*, or spelled only in
+	// the post-1.30 db.system.name, left messaging standing — three spellings
+	// of "my callee is a database", three different connection_types on a
+	// producer span. Database itself is never overwritten back: the != guard
+	// also skips the four-attribute scan once the peer scan settled it, and
+	// that scan's own assignment still matters, being the only classifier for
+	// an operator-configured db.* peer attribute outside databaseAttrs. The
+	// server side is excluded for the scan's reason above: a database emits no
+	// spans at all, so a server-side half carrying db.* is a service that
+	// TALKS to one, never the database itself.
+	if side == sideClient && h.connection != ConnectionDatabase && namesDatabase(spanAttrs) {
 		h.connection = ConnectionDatabase
 	}
 

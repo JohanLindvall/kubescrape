@@ -532,6 +532,65 @@ func TestReCreatedSeriesGetsFreshStartTimestamp(t *testing.T) {
 	}
 }
 
+// A series ADMITTED between Export's clock read and renderRED's lock hold
+// carries a Meta.Start LATER than the payload's point timestamp; unclamped,
+// its first export rendered StartTimestamp > Timestamp — an inverted
+// cumulative interval (cumagg.ClampStart has the full race). The true start
+// renders from the next export on.
+func TestStartClampedWhenSeriesAdmittedDuringExport(t *testing.T) {
+	g := New(Config{})
+	exportTime := time.Unix(1_700_000_000, 0) // Export's one clock read
+	admitted := exportTime.Add(time.Second)   // the receive goroutine's later one
+	g.now = func() time.Time { return admitted }
+	g.Consume(span("op"))
+
+	wantTS := pcommon.NewTimestampFromTime(exportTime)
+	checkStamps(t, g.store.Render(pcommon.NewResource(), exportTime), wantTS, wantTS)
+
+	// The next export's ts lies past the true start, which renders unclamped.
+	next := exportTime.Add(2 * time.Second)
+	checkStamps(t, g.store.Render(pcommon.NewResource(), next),
+		pcommon.NewTimestampFromTime(admitted), pcommon.NewTimestampFromTime(next))
+}
+
+// checkStamps checks every data point of every metric in md against one wanted
+// (start, ts) pair.
+func checkStamps(t *testing.T, md pmetric.Metrics, wantStart, wantTS pcommon.Timestamp) {
+	t.Helper()
+	points := 0
+	check := func(name string, start, ts pcommon.Timestamp) {
+		points++
+		if start != wantStart || ts != wantTS {
+			t.Errorf("%s point start/ts = %v/%v, want %v/%v", name, start, ts, wantStart, wantTS)
+		}
+	}
+	rms := md.ResourceMetrics()
+	for i := 0; i < rms.Len(); i++ {
+		sms := rms.At(i).ScopeMetrics()
+		for j := 0; j < sms.Len(); j++ {
+			ms := sms.At(j).Metrics()
+			for k := 0; k < ms.Len(); k++ {
+				m := ms.At(k)
+				switch m.Type() {
+				case pmetric.MetricTypeSum:
+					dps := m.Sum().DataPoints()
+					for l := 0; l < dps.Len(); l++ {
+						check(m.Name(), dps.At(l).StartTimestamp(), dps.At(l).Timestamp())
+					}
+				case pmetric.MetricTypeHistogram:
+					dps := m.Histogram().DataPoints()
+					for l := 0; l < dps.Len(); l++ {
+						check(m.Name(), dps.At(l).StartTimestamp(), dps.At(l).Timestamp())
+					}
+				}
+			}
+		}
+	}
+	if points == 0 {
+		t.Fatal("no data points rendered")
+	}
+}
+
 func TestStaleAfterConfig(t *testing.T) {
 	if got := New(Config{}).store.StaleAfter(); got != defaultStaleAfter {
 		t.Fatalf("default staleAfter = %v, want %v", got, defaultStaleAfter)

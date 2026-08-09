@@ -965,10 +965,17 @@ func run() error {
 		// The one shutdown step that salvages ACKED data rather than a last
 		// aggregation window: the tail-sampling buffer holds spans whose senders
 		// were told they had landed, and nothing else holds a copy. The receivers
-		// have stopped (wg above), so nothing is arriving; decide everything now
-		// and let the keeps reach the exporter (and, with -buffer-dir, the final
-		// drain below). Budgeted like the rest — a dead collector must not outlive
-		// the pod's termination grace, and what it costs is counted as lost.
+		// have been ASKED to stop (wg above), which is weaker than stopped: the
+		// join budget can expire while gRPC's GracefulStop still waits on a slow
+		// RPC, and http.Server.Shutdown never interrupts an active handler — so a
+		// straggler can still push after this Flush. Flush latches the buffer
+		// against exactly that: a post-Flush push is decided immediately on the
+		// spans present and its keeps ride out on its own ack (tailbuffer's
+		// shutdown bullet), so nothing silently re-fills a buffer nobody will
+		// flush again. Decide everything now and let the keeps reach the exporter
+		// (and, with -buffer-dir, the final drain below). Budgeted like the rest —
+		// a dead collector must not outlive the pod's termination grace, and what
+		// it costs is counted as lost.
 		fctx, cancel := stepCtx(stepBudget())
 		p.tailBuffer.Flush(fctx)
 		cancel()

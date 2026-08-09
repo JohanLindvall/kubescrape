@@ -390,10 +390,11 @@ var (
 )
 
 // Service-graph edges (the -service-graph shard). Every one of these counts a
-// place where the graph is INCOMPLETE, and each names the config bound that
-// caused it, because all three bounds trade completeness for memory and an
-// operator has to be able to see which one is binding: an edge missing from
-// Grafana's Service Graph view looks exactly like a call that never happened.
+// place where the graph is INCOMPLETE, and each names its cause — a config
+// bound for all but the unnamed-spans counter, because those bounds trade
+// completeness for memory and an operator has to be able to see which one is
+// binding: an edge missing from Grafana's Service Graph view looks exactly
+// like a call that never happened.
 var (
 	ServiceGraphDropped = Registry.Counter("kubescrape_service_graph_dropped_total",
 		"Edges not aggregated because the serviceGraph.maxCardinality series cap was reached (existing edges keep reporting; a new one is lost until eviction frees a slot).")
@@ -411,6 +412,14 @@ var (
 	// delivery gap, or the two halves are landing on different shards.
 	ServiceGraphExpired = Registry.Counter("kubescrape_service_graph_expired_total",
 		"Half-edges that expired after serviceGraph.wait without their partner arriving.")
+	// ServiceGraphUnnamed is the one counter in this block with no config bound
+	// behind it: the incompleteness is the SENDER's. A resource without
+	// service.name gives the graph no label value to name a node with, and
+	// pairing its spans anyway minted one anonymous ""-labeled vertex that
+	// every unattributable sender in the cluster shared, accreting edges to
+	// real services (Tempo skips such resources too).
+	ServiceGraphUnnamed = Registry.Counter("kubescrape_service_graph_unnamed_spans_total",
+		"Spans skipped by the service-graph processor because their resource carries no service.name — nothing to name a graph node with. The shipped tier enriches at entry and derives service.name for every attributable sender, so a sustained rate means unattributable senders whose spans can mint no edge (they still forward to the collector; only the graph skips them).")
 )
 
 // RegisterServiceGraphStats publishes the pairing store's own numbers on the
@@ -508,9 +517,9 @@ var (
 	TailSampleTraces = Registry.CounterVec("kubescrape_tail_sampling_traces_total",
 		"Traces decided by the tail sampler, by verdict (keep, drop) and by the policy that decided. policy=\"none\" is the default drop — no policy had an opinion — which is what a policy list matching nothing looks like. Every configured policy gets its series at startup, so a policy that has never fired reads as zero rather than as absent. This counts DECISIONS: whether the kept trace then reached the collector is kubescrape_tail_sampling_spans_total.", "decision", "policy")
 	TailSampleSpans = Registry.CounterVec("kubescrape_tail_sampling_spans_total",
-		"Spans leaving the tail-sampling buffer, by fate: kept = the trace was sampled and the export was acked (with -buffer-dir, acked means SPOOLED — a decided keep is durable and a collector outage becomes a backlog); dropped = the trace was not sampled; lost = the trace was sampled but neither the collector nor the disk buffer took it, and nothing else holds a copy (the sender was acked when the spans were buffered). A moving lost rate is data loss, not back-pressure; without -buffer-dir a collector outage produces it directly, with one it means the spool itself refused the payload.", "outcome")
+		"Spans leaving the tail-sampling buffer, by fate: kept = the trace was sampled and the export was acked (with -buffer-dir, acked means SPOOLED — a decided keep is durable and a collector outage becomes a backlog); dropped = the trace was not sampled; lost = the final attempt to move the trace's spans out of this process failed and nothing here holds a copy any longer (the sender was acked when the spans were buffered). Under a routed or size-split export, earlier shares may already have been delivered or spooled, so lost is an UPPER BOUND on loss — it never under-counts. A moving lost rate is data loss, not back-pressure; without -buffer-dir a collector outage produces it directly, with one it means the spool itself refused the payload.", "outcome")
 	TailSampleEarly = Registry.CounterVec("kubescrape_tail_sampling_early_decisions_total",
-		"Traces decided BEFORE their decisionWait elapsed, by the bound that forced it (spans_per_trace, max_traces, max_spans) or shutdown (a graceful stop flushing the buffer). An early decision judges the spans present, so it degrades gracefully — a slow trace can be missed, a fast one is never invented — but a sustained rate against a bound means that bound is sized below the shard's span rate.", "reason")
+		"Traces decided BEFORE their decisionWait elapsed, by the bound that forced it (spans_per_trace, max_traces, max_spans) or shutdown (a graceful stop flushing the buffer, plus any straggler push decided on arrival after that flush). An early decision judges the spans present, so it degrades gracefully — a slow trace can be missed, a fast one is never invented — but a sustained rate against a bound means that bound is sized below the shard's span rate.", "reason")
 	TailSampleLate = Registry.CounterVec("kubescrape_tail_sampling_late_spans_total",
 		"Spans that arrived after their trace was decided and followed the cached verdict, by outcome (kept = forwarded immediately, dropped). A large kept+dropped share means decisionWait is shorter than the spread of a trace's arrival.", "outcome")
 	TailSampleCacheEvicted = Registry.Counter("kubescrape_tail_sampling_cache_evictions_total",

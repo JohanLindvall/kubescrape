@@ -80,7 +80,7 @@ a build that lacks the pipeline is a startup error naming the tag (see
 | `-check-config` | `false` | validate -config and -transforms-file (every section compiled: templates, regexes, selectors, globs) plus the flags, print a summary and exit — no listeners, log files, positions file, spools or network. For CI and pre-rollout checks: a DaemonSet's bad ConfigMap otherwise surfaces as a fleet-wide CrashLoop |
 | `-config` | — | unified YAML config file; sections: resourceAttributes, logs, logAttributes, logMetrics, metrics, traceMetrics, routing, logScrubbing, serviceGraph, serviceGraphShards, traceSampling, tailSampling, export (docs/CONFIGURATION.md) |
 | `-enrich` | `true` | parse per-line metadata (timestamp, severity, trace/span IDs, exception details) into the OTLP record fields via github.com/JohanLindvall/enrich, for container logs, journald, Kubernetes events, Azure diagnostics and pushed OTLP log bodies alike |
-| `-events-batch-size` | `512` | flush events after this many |
+| `-events-batch-size` | `512` | flush events after this many, clamped to the retained-batch cap: the startup backlog walk blocks the reader goroutine and services no ticker, so a value above the cap would make the count trigger unreachable and shed the whole backlog |
 | `-events-flush-interval` | `2s` | flush events at least this often |
 | `-events-lease-namespace` | — | namespace for the Lease and position ConfigMap (default: this pod's own, via $POD_NAMESPACE or the ServiceAccount projection) |
 | `-events-lease` | `kubescrape-cluster-leader` | Lease coordinating the cluster-singleton pipelines |

@@ -907,7 +907,10 @@ at-least-once: the cursor of the newest exported entry is persisted (via
 `-positions-file`) only after a successful export, and on export failure or a
 reader error it restarts from the committed cursor with backoff.
 `-journald-units` restricts to specific units and `-journald-dir` reads a
-non-default journal directory (e.g. `/run/log/journal`). `-enrich`
+non-default journal directory. The host journal must be **mounted into the
+container** (`/var/log/journal` and/or `/run/log/journal`) — the chart does
+this behind `agent.journald.enabled`; without it the reader starts, reports
+ready and collects nothing, which the agent now warns about at startup. `-enrich`
 (default true) applies the same per-line enrichment here as to container logs; an
 explicit level found in the message wins over the journal priority.
 

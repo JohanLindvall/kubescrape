@@ -232,7 +232,7 @@ func TestWatermarkFiltersReplay(t *testing.T) {
 	r, _, _ := newReader(t, Config{})
 	base := time.Now()
 	r.committed.Watermark = base
-	r.replaying = true  // the state a relist establishes (stream started from "")
+	r.replaying = true  // the state the backlog walk runs in (replayBacklog)
 	r.replayFrom = base // frozen by stream() from the committed watermark
 
 	if r.wanted(event("old", "R", "m", "Normal", "1", 1, base.Add(-time.Minute))) {
@@ -333,12 +333,24 @@ func TestExpiryClearsResourceVersionButKeepsWatermark(t *testing.T) {
 	r, _, _ := newReader(t, Config{})
 	mark := time.Now()
 	r.committed = Position{ResourceVersion: "10", Watermark: mark}
+	r.pendingRV = "12"
 	r.expire("watch")
 	if r.committed.ResourceVersion != "" {
 		t.Fatal("an expired position must be cleared so the next stream relists")
 	}
 	if !r.committed.Watermark.Equal(mark) {
 		t.Fatal("the watermark must survive to filter the replay")
+	}
+	// The pending bookmark goes with it, and that is load-bearing rather than
+	// tidiness: expire is the ONLY path that empties the committed revision, so
+	// it is the only path into a relist that can be carrying one. A bookmark
+	// surviving into the replay would be applied by the first flush that
+	// empties the batch — mid-walk — and settle's pending-bookmark branch
+	// SECURES the replay, releasing the position hold over a backlog only
+	// partly read. A restart from that position skips the rest of it.
+	if r.pendingRV != "" {
+		t.Fatalf("pendingRV = %q after an expiry; a dead stream's bookmark must not be able to secure the "+
+			"replay that follows", r.pendingRV)
 	}
 }
 
@@ -361,24 +373,24 @@ func TestColdStartModes(t *testing.T) {
 		return true, &corev1.EventList{ListMeta: metav1.ListMeta{ResourceVersion: "424242"}}, nil
 	})
 	r := New(Config{Client: client, StartMode: StartEnd})
-	rv, redelivers, err := r.startResourceVersion(context.Background())
+	start, err := r.startResourceVersion(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if rv != "424242" || redelivers {
-		t.Fatalf("end mode must start at the current revision without redelivery, got %q/%v", rv, redelivers)
+	if start.rv != "424242" || start.redelivers || start.replay {
+		t.Fatalf("end mode must start at the current revision without redelivery or replay, got %+v", start)
 	}
 
 	r = New(Config{Client: client, StartMode: StartBeginning})
-	if rv, redelivers, err = r.startResourceVersion(context.Background()); err != nil || rv != "" || !redelivers {
-		t.Fatalf("start mode must replay from the oldest available (rv=%q, redelivers=%v, err=%v)", rv, redelivers, err)
+	if start, err = r.startResourceVersion(context.Background()); err != nil || !start.replay || !start.redelivers {
+		t.Fatalf("start mode must replay the backlog (%+v, err=%v)", start, err)
 	}
 
 	// A stored position always wins over the start mode.
 	r = New(Config{Client: client, StartMode: StartEnd})
 	r.committed.ResourceVersion = "77"
-	if rv, redelivers, err = r.startResourceVersion(context.Background()); err != nil || rv != "77" || !redelivers {
-		t.Fatalf("a stored position must win and redeliver (rv=%q, redelivers=%v, err=%v)", rv, redelivers, err)
+	if start, err = r.startResourceVersion(context.Background()); err != nil || start.rv != "77" || !start.redelivers || start.replay {
+		t.Fatalf("a stored position must win and redeliver without a replay (%+v, err=%v)", start, err)
 	}
 }
 
@@ -396,19 +408,19 @@ func TestExpiryRelistsRatherThanSkippingAhead(t *testing.T) {
 	r.committed.Watermark = time.Now().Add(-time.Minute) // something was exported
 
 	r.expire("watch")
-	rv, _, err := r.startResourceVersion(context.Background())
-	if err != nil || rv != "" {
-		t.Fatalf("after Gone the reader must relist from the oldest available (rv=%q, err=%v)", rv, err)
+	start, err := r.startResourceVersion(context.Background())
+	if err != nil || !start.replay {
+		t.Fatalf("after Gone the reader must replay the backlog (%+v, err=%v)", start, err)
 	}
 	// The relist SURVIVES a failed attempt: a watch that dies before anything
 	// commits must relist again, or the gap is lost after all.
-	if rv, _, err = r.startResourceVersion(context.Background()); err != nil || rv != "" {
-		t.Fatalf("an uncommitted relist must persist (rv=%q, err=%v)", rv, err)
+	if start, err = r.startResourceVersion(context.Background()); err != nil || !start.replay {
+		t.Fatalf("an uncommitted relist must persist (%+v, err=%v)", start, err)
 	}
 	// A commit secures the replay and disarms it.
 	r.settle(entry{rv: "1001", when: time.Now()}, len(r.batch))
-	if rv, _, err = r.startResourceVersion(context.Background()); err != nil || rv != "1001" {
-		t.Fatalf("after a commit the reader resumes from it (rv=%q, err=%v)", rv, err)
+	if start, err = r.startResourceVersion(context.Background()); err != nil || start.rv != "1001" || start.replay {
+		t.Fatalf("after a commit the reader resumes from it (%+v, err=%v)", start, err)
 	}
 	if r.relist {
 		t.Fatal("a commit must disarm the relist")
@@ -419,8 +431,8 @@ func TestExpiryRelistsRatherThanSkippingAhead(t *testing.T) {
 	r = New(Config{Client: client, StartMode: StartEnd})
 	r.committed.ResourceVersion = "77"
 	r.expire("watch")
-	if rv, _, err = r.startResourceVersion(context.Background()); err != nil || rv != "999" {
-		t.Fatalf("a watermark-less expiry must honour the start mode (rv=%q, err=%v)", rv, err)
+	if start, err = r.startResourceVersion(context.Background()); err != nil || start.rv != "999" || start.replay {
+		t.Fatalf("a watermark-less expiry must honour the start mode (%+v, err=%v)", start, err)
 	}
 }
 
@@ -489,49 +501,84 @@ func TestWatermarkDoesNotFilterLiveStream(t *testing.T) {
 	}
 }
 
-// The replay filter is per-STREAM and survives a commit. Clearing it on the
-// first acked batch disarmed it seconds into a replay that delivers the whole
-// event TTL, so the rest of the backlog re-exported as duplicates — each Pod
-// event costing a metadata lookup. Only the NEXT stream, positioned by the
-// committed resourceVersion, starts unfiltered. And while the replay is
-// UNSECURED (no bookmark yet), the commit itself is HELD: the backlog arrives
-// in store order, so an advanced position would strand its undelivered
-// remainder on a restart — the exported high-water accumulates aside and
-// folds in when a bookmark secures the replay.
+// The replay filter's boundary is frozen for the whole WALK and does not follow
+// the commits the walk makes. A backlog page that flushes raises the exported
+// high-water, and the pages after it carry OLDER timestamps (a list arrives in
+// key order, not time order): filtering those against the live watermark drops
+// them as "already exported" when they never were, destroying exactly the gap
+// the relist exists to recover. And the commit itself is HELD for the same
+// reason — an advanced position strands the undelivered remainder on a restart
+// — with the exported high-water accumulating aside until the walk secures.
+//
+// Driven through the real walk, one page at a time, so the mid-walk state is
+// the one replayBacklog actually produces rather than one a test arranged.
 func TestReplayFilterSurvivesACommit(t *testing.T) {
-	r, _, _ := newReader(t, Config{Exporter: &captureExporter{}, BatchSize: 1})
-	r.replaying = true
 	base := time.Now()
-	r.committed.Watermark = base
+	client := &backlogClient{Clientset: fake.NewSimpleClientset()}
+	var r *Reader
+	// The reader's state at the moment the SECOND page is requested: page one's
+	// entry has been exported and acked by then (BatchSize 1).
+	var midReplaying bool
+	var midFrom, midWatermark, midHeld time.Time
+	var midPos string
+	page := 0
+	client.PrependReactor("list", "events", func(a k8stesting.Action) (bool, runtime.Object, error) {
+		client.lists = append(client.lists, a.(k8stesting.ListActionImpl).ListOptions)
+		page++
+		if page == 1 {
+			// Newer than the boundary and newer than anything else in the
+			// backlog: exporting it is what would advance a live watermark.
+			return true, backlogPage("9900500", "page-2",
+				event("newest", "BackOff", "m", "Warning", "9900400", 1, base.Add(time.Second))), nil
+		}
+		midReplaying, midFrom = r.replaying, r.replayFrom
+		midWatermark, midHeld, midPos = r.committed.Watermark, r.heldWatermark, r.committed.ResourceVersion
+		// OLDER than the entry page 1 exported, but newer than the frozen
+		// boundary: still owed, and only a filter that followed the commit
+		// would drop it.
+		return true, backlogPage("9900500", "",
+			event("owed", "Started", "m", "Normal", "9900100", 1, base.Add(-30*time.Second))), nil
+	})
+	client.stopWatches()
+	exp := &captureExporter{}
+	r = New(Config{Client: client, Exporter: exp, BatchSize: 1, FlushInterval: time.Hour})
+	// Everything up to an hour ago was exported before the Gone that armed the
+	// relist; the backlog re-reads the window since.
+	startWatermark := base.Add(-time.Hour)
+	r.committed.Watermark = startWatermark
+	r.relist = true
+	wantFrom := startWatermark.Add(-replaySlack)
 
-	ctx := context.Background()
-	if err := r.handle(ctx, watch.Event{Type: watch.Added, Object: event("new", "R", "m", "Normal", "11", 1, base.Add(time.Second))}); err != nil {
-		t.Fatal(err)
+	if err := r.stream(context.Background()); err == nil {
+		t.Fatal("the pre-stopped watch must end the stream")
 	}
-	if !r.replaying {
-		t.Fatal("replay disarmed by a commit; the rest of the backlog would re-export")
+	if !midReplaying {
+		t.Error("the filter was disarmed by a mid-walk commit; the rest of the backlog would re-export as duplicates")
 	}
-	if r.committed.Watermark.After(base) {
-		t.Fatal("watermark advanced mid-replay; a subsequent replay would drop the undelivered older-timestamp remainder")
+	if !midFrom.Equal(wantFrom) {
+		t.Errorf("replayFrom moved to %v mid-walk, want the boundary frozen at %v", midFrom, wantFrom)
 	}
-	if r.committed.ResourceVersion != "" {
-		t.Fatalf("position %q committed mid-replay; a restarted stream would skip the undelivered lower-RV backlog", r.committed.ResourceVersion)
+	if !midWatermark.Equal(startWatermark) {
+		t.Errorf("committed watermark = %v mid-walk, want it still at %v: an advanced one makes the NEXT "+
+			"replay drop the undelivered older-timestamp remainder", midWatermark, startWatermark)
 	}
-	if !r.heldWatermark.After(base) {
-		t.Fatal("exported high-water not held for the fold on secure")
+	if midPos != "" {
+		t.Errorf("position %q committed mid-walk; a restarted stream skips the undelivered lower-RV backlog", midPos)
 	}
-
-	// A bookmark secures the replay: the held watermark folds in and later
-	// flushes commit directly.
-	bm := &corev1.Event{ObjectMeta: metav1.ObjectMeta{ResourceVersion: "12"}}
-	if err := r.handle(ctx, watch.Event{Type: watch.Bookmark, Object: bm}); err != nil {
-		t.Fatal(err)
+	if !midHeld.After(base) {
+		t.Errorf("exported high-water = %v, want it held aside for the fold on secure", midHeld)
 	}
-	if !r.committed.Watermark.After(base) {
-		t.Fatal("held watermark not folded in when the bookmark secured the replay")
+	if got := len(exp.records()); got != 2 {
+		t.Fatalf("exported %d records, want both pages': the page-2 entry is older than the page-1 commit "+
+			"and a filter that followed that commit drops it", got)
 	}
-	if r.committed.ResourceVersion != "12" {
-		t.Fatalf("committed %q, want the securing bookmark's revision", r.committed.ResourceVersion)
+	// The walk is over: the hold releases, the held high-water folds in and the
+	// snapshot revision is the committed position.
+	if !r.committed.Watermark.Equal(midHeld) {
+		t.Errorf("committed watermark = %v after the walk, want the held %v folded in", r.committed.Watermark, midHeld)
+	}
+	if r.committed.ResourceVersion != "9900500" {
+		t.Errorf("committed = %q after the walk, want the list snapshot", r.committed.ResourceVersion)
 	}
 }
 
@@ -541,6 +588,12 @@ func TestReplayFilterSurvivesACommit(t *testing.T) {
 // stream never delivered — a positioned resume silently loses them. The
 // commits are held while the replay is unsecured, so the next attempt
 // relists and the watermark (also held) still filters what was exported.
+//
+// The backlog entries go in through replayItem, which is the walk's own
+// per-item step. Feeding them to handle() instead would drive a state the
+// stream cannot produce — a WATCH event arriving with the backlog flag set —
+// and would quietly pin the filter to the watch path, which is the one place
+// it must never be applied.
 func TestStreamDeathMidReplayRelistsAgain(t *testing.T) {
 	exp := &captureExporter{}
 	r, _, _ := newReader(t, Config{Exporter: exp, BatchSize: 1000})
@@ -551,31 +604,28 @@ func TestStreamDeathMidReplayRelistsAgain(t *testing.T) {
 	if !r.relist {
 		t.Fatal("precondition: relist armed")
 	}
-	rv, redelivers, err := r.startResourceVersion(ctx)
-	if err != nil || rv != "" || !redelivers {
-		t.Fatalf("relist start = (%q, %v, %v), want a full replay", rv, redelivers, err)
+	start, err := r.startResourceVersion(ctx)
+	if err != nil || !start.replay || !start.redelivers {
+		t.Fatalf("relist start = (%+v, %v), want a full replay", start, err)
 	}
 	r.replaying, r.replaySecured = true, false
 
 	// The replay delivers in STORE order: [100, 900] flush and ack while 200
 	// is still undelivered.
 	for _, ev := range []string{"9900100", "9900900"} {
-		if err := r.handle(ctx, watch.Event{Type: watch.Added,
-			Object: event("e"+ev, "R", "m", "Normal", ev, 1, base.Add(time.Minute))}); err != nil {
-			t.Fatal(err)
-		}
+		r.replayItem(ctx, event("e"+ev, "R", "m", "Normal", ev, 1, base.Add(time.Minute)))
 	}
 	if err := r.flush(ctx); err != nil {
 		t.Fatal(err)
 	}
 
 	// The stream dies here. The next attempt must relist, not resume at 900.
-	rv2, _, err := r.startResourceVersion(ctx)
+	next, err := r.startResourceVersion(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if rv2 != "" {
-		t.Fatalf("resumed positioned at %q after a mid-replay flush; the undelivered lower-RV backlog is lost", rv2)
+	if !next.replay {
+		t.Fatalf("resumed positioned at %q after a mid-replay flush; the undelivered lower-RV backlog is lost", next.rv)
 	}
 	if !r.relist {
 		t.Fatal("relist disarmed by a mid-replay commit")
@@ -694,12 +744,19 @@ func TestShutdownBudgetStaysUnderTheRenewDeadline(t *testing.T) {
 	}
 }
 
-// replaying is derived per STREAM, from the resourceVersion that stream starts
-// at, and nothing inside the stream may change it. It gates the watermark
-// filter: armed on a stream that re-receives the whole TTL backlog, disarmed on
-// one the API server positioned exactly. Getting it wrong in either direction
-// is a data bug — a stuck-on flag drops live events whose reporter's clock
-// trails the watermark, a cleared one re-exports the rest of a backlog.
+// Whether a stream REPLAYS is derived per stream, from where it can start, and
+// nothing inside the stream may change it. It decides two things: the watermark
+// filter (armed for a backlog re-read, never for a positioned or live watch)
+// and the position hold. Getting it wrong in either direction is a data bug — a
+// stuck-on filter drops live events whose reporter's clock trails the
+// watermark, a cleared one re-exports the rest of a backlog.
+//
+// The observable is the POSITION: a replay commits its list's snapshot revision
+// once the backlog is exported (here an empty one, so immediately), while a
+// positioned or cold-skip stream commits nothing of its own. That is the whole
+// bug this pins — the replay used to wait for a bookmark that never comes for
+// core/v1 events, so the position stopped advancing after the first relist and
+// every restart replayed the entire event TTL.
 func TestReplayingIsDerivedPerStream(t *testing.T) {
 	newStopped := func() *fake.Clientset {
 		client := fake.NewSimpleClientset()
@@ -713,36 +770,40 @@ func TestReplayingIsDerivedPerStream(t *testing.T) {
 	}
 
 	for _, tc := range []struct {
-		name  string
-		setup func(*Reader)
-		mode  string
-		want  bool
+		name string
+		// setup runs before the stream; wantPos is the committed position it
+		// must leave behind ("" = nothing of its own committed).
+		setup   func(*Reader)
+		mode    string
+		replays bool
+		wantPos string
 	}{
-		// Cold start, skip the backlog: positioned at the List revision.
-		{"cold-end", func(*Reader) {}, StartEnd, false},
-		// Cold start from the beginning: "" replays the whole TTL.
-		{"cold-start", func(*Reader) {}, StartBeginning, true},
+		// Cold start, skip the backlog: positioned at the List revision, and
+		// nothing before it was ever consumed, so nothing commits.
+		{"cold-end", func(*Reader) {}, StartEnd, false, ""},
+		// Cold start from the beginning: the whole TTL backlog is re-read.
+		{"cold-start", func(*Reader) {}, StartBeginning, true, "500"},
 		// A committed position: the API server delivers only what follows.
-		{"committed-resume", func(r *Reader) { r.committed.ResourceVersion = "77" }, StartEnd, false},
-		// A relist after Gone: "" again, and the watermark is what keeps the
-		// replay from re-exporting.
+		{"committed-resume", func(r *Reader) { r.committed.ResourceVersion = "77" }, StartEnd, false, "77"},
+		// A relist after Gone: re-read the backlog, and the watermark is what
+		// keeps the replay from re-exporting.
 		{"relist-after-gone", func(r *Reader) {
 			r.committed.ResourceVersion = "77"
 			r.committed.Watermark = time.Now().Add(-time.Minute)
 			r.expire("watch")
-		}, StartEnd, true},
+		}, StartEnd, true, "500"},
 		// An expiry with nothing ever exported honours the start mode instead
 		// (a zero watermark cannot filter anything).
 		{"expiry-without-watermark", func(r *Reader) {
 			r.committed.ResourceVersion = "77"
 			r.expire("watch")
-		}, StartEnd, false},
+		}, StartEnd, false, ""},
 		// A stale flag from the PREVIOUS stream must be re-derived, not
 		// inherited: the stream that follows a relist is positioned exactly.
 		{"stale-flag-recomputed", func(r *Reader) {
 			r.replaying = true
 			r.committed.ResourceVersion = "77"
-		}, StartEnd, false},
+		}, StartEnd, false, "77"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			r := New(Config{Client: newStopped(), Exporter: &captureExporter{}, StartMode: tc.mode})
@@ -750,8 +811,19 @@ func TestReplayingIsDerivedPerStream(t *testing.T) {
 			if err := r.stream(context.Background()); err == nil {
 				t.Fatal("the pre-stopped watch must end the stream")
 			}
-			if r.replaying != tc.want {
-				t.Fatalf("replaying = %v after stream(), want %v", r.replaying, tc.want)
+			// The walk is over by the time the watch is established, however
+			// the stream started: the filter must never outlive the backlog.
+			if r.replaying {
+				t.Fatal("replaying still set after stream(): the watch would filter live events against a frozen watermark")
+			}
+			if !r.replaySecured {
+				t.Fatal("replay left unsecured after an empty backlog: the position hold is permanent and the ConfigMap never advances again")
+			}
+			if got := r.committed.ResourceVersion; got != tc.wantPos {
+				t.Fatalf("committed = %q after stream(), want %q (replays=%v)", got, tc.wantPos, tc.replays)
+			}
+			if tc.replays && r.relist {
+				t.Fatal("a secured replay must disarm the relist, or every restart replays the whole event TTL again")
 			}
 			// The filter's boundary is snapshotted by the SAME call. Without
 			// this assertion the only production writer of replayFrom could be
@@ -775,52 +847,17 @@ func TestReplayingIsDerivedPerStream(t *testing.T) {
 	}
 }
 
-// Nothing WITHIN a stream may disarm the replay filter, and a mid-replay
-// COMMIT may not disarm the relist either: the store-order backlog is not
-// covered by any prefix's position, so an acked flush holds the position and
-// keeps the relist armed. Only a BOOKMARK — which the API server sends once
-// the watcher is caught up — proves the backlog fully delivered; it secures
-// the relist and moves the position, while the replay filter still survives
-// for the stream's lifetime (it is per-stream by definition).
-func TestReplayingSurvivesCommitsAndBookmarks(t *testing.T) {
-	r, _, _ := newReader(t, Config{Exporter: &captureExporter{}, BatchSize: 1})
-	r.replaying = true
-	r.relist = true
-	base := time.Now()
-	r.committed.Watermark = base
-	ctx := context.Background()
-
-	// A committed batch (BatchSize 1 flushes inline).
-	if err := r.handle(ctx, watch.Event{Type: watch.Added,
-		Object: event("new", "R", "m", "Normal", "11", 1, base.Add(time.Second))}); err != nil {
-		t.Fatal(err)
-	}
-	if !r.replaying {
-		t.Fatal("a commit disarmed the replay filter; the rest of the backlog would re-export as duplicates")
-	}
-	if !r.relist {
-		t.Error("a mid-replay commit disarmed the relist; a death before the backlog finishes then resumes positioned and loses the remainder")
-	}
-	if r.committed.ResourceVersion != "" {
-		t.Errorf("a mid-replay commit advanced the position to %q; a restarted stream would skip undelivered lower-RV backlog", r.committed.ResourceVersion)
-	}
-
-	// A bookmark, applied immediately (nothing buffered): it secures the
-	// relist and the position.
-	if err := r.handle(ctx, watch.Event{Type: watch.Bookmark,
-		Object: &corev1.Event{ObjectMeta: metav1.ObjectMeta{ResourceVersion: "120"}}}); err != nil {
-		t.Fatal(err)
-	}
-	if !r.replaying {
-		t.Fatal("a bookmark disarmed the replay filter; a bookmark carries a position, not the start of a new stream")
-	}
-	if r.relist {
-		t.Error("the securing bookmark must disarm the relist")
-	}
-	if r.committed.ResourceVersion != "120" {
-		t.Fatalf("idle bookmark not applied, got %q", r.committed.ResourceVersion)
-	}
-}
+// (TestReplayingSurvivesCommitsAndBookmarks lived here. It drove handle() with
+// the backlog flag set — a state stream() cannot produce, since replayBacklog
+// clears the flag before the watch is opened — and its prose described the
+// bookmark as the thing that proves a backlog delivered, which for core/v1
+// events never arrives. Each of its assertions has a home that exercises the
+// real mechanism: the filter surviving a mid-walk commit and the position hold
+// are TestReplayFilterSurvivesACommit above, the relist staying armed until the
+// backlog is exported is TestStreamDeathMidReplayRelistsAgain, the release is
+// TestReplayCommitsWithoutABookmark, and the bookmark path that must not rot is
+// TestBookmarkStillSecuresAReplay, which says in as many words that it forces a
+// state nothing reaches.)
 
 // A relist delivers the backlog in STORE order, not time order, so a batch
 // committed mid-replay routinely carries a timestamp NEWER than events still
@@ -916,12 +953,12 @@ func TestColdRestartResumesFromTheHighestSeenRevision(t *testing.T) {
 	r := New(Config{Client: client, Exporter: &captureExporter{}, StartMode: StartEnd})
 
 	// First stream: no committed position and nothing seen -> List.
-	rv, redelivers, err := r.startResourceVersion(context.Background())
+	start, err := r.startResourceVersion(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if rv != "500" || redelivers {
-		t.Fatalf("first start: rv=%q redelivers=%v, want 500/false", rv, redelivers)
+	if start.rv != "500" || start.redelivers {
+		t.Fatalf("first start: %+v, want rv 500 without redelivery", start)
 	}
 	if lists != 1 {
 		t.Fatalf("first start issued %d Lists, want 1", lists)
@@ -937,15 +974,15 @@ func TestColdRestartResumesFromTheHighestSeenRevision(t *testing.T) {
 
 	// The stream dies and restarts. It must resume at 507, not re-List at 500
 	// (or at whatever the store has advanced to since).
-	rv, redelivers, err = r.startResourceVersion(context.Background())
+	start, err = r.startResourceVersion(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if rv != "507" {
+	if start.rv != "507" {
 		t.Errorf("cold restart resumed at %q, want 507 — the events between the dead watch "+
-			"and the restart are lost", rv)
+			"and the restart are lost", start.rv)
 	}
-	if redelivers {
+	if start.redelivers {
 		t.Error("resuming past the seen revision does not redeliver, so the batch must be retained")
 	}
 	if lists != 1 {
@@ -1207,6 +1244,16 @@ func TestRetainCapIsBoundedHoweverBatchSizeIsTuned(t *testing.T) {
 		if got > maxRetainedCeiling {
 			t.Errorf("BatchSize=%d: cap=%d exceeds the ceiling %d — the cap is no longer a memory bound",
 				batchSize, got, maxRetainedCeiling)
+		}
+		// The ceiling stops the cap following BatchSize, so above it the RAW
+		// count trigger becomes unreachable: the batch sits at the cap shedding
+		// the oldest entries and never fires. Survivable on the watch path (the
+		// ticker flushes), fatal in the backlog walk, which services no ticker
+		// and shed a whole backlog unexported. Both paths trigger on flushAt,
+		// which is why it may never exceed what the batch can reach.
+		if at := r.flushAt(); at > got {
+			t.Errorf("BatchSize=%d: flush trigger %d is above the retain cap %d and can never fire",
+				batchSize, at, got)
 		}
 	}
 }

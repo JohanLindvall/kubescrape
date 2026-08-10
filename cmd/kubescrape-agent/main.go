@@ -229,7 +229,7 @@ var (
 	eventsOn        = flag.Bool("events", false, "watch Kubernetes Events and export them as OTLP logs, enriched with the involved object's identity. Cluster-singleton: exactly one replica runs it (leader election), so deploy it as its own Deployment with -logs=false -metrics=false -cadvisor=false -node-metrics=false, NOT in the DaemonSet")
 	eventsNamespace = flag.String("events-namespace", "", "namespace to watch (empty = cluster-wide)")
 	eventsStart     = flag.String("events-start", "auto", "where a cold start begins: end (skip the backlog), start (replay everything still within the API server's event TTL), auto (resume the stored position, else end)")
-	eventsBatch     = flag.Int("events-batch-size", 512, "flush events after this many")
+	eventsBatch     = flag.Int("events-batch-size", 512, "flush events after this many, clamped to the retained-batch cap: the startup backlog walk blocks the reader goroutine and services no ticker, so a value above the cap would make the count trigger unreachable and shed the whole backlog")
 	eventsFlush     = flag.Duration("events-flush-interval", 2*time.Second, "flush events at least this often")
 	eventsPersist   = flag.Duration("events-position-interval", 10*time.Second, "how often the position is written to its ConfigMap. A write per event would be an API-server write per event, so this is the bound on how much is REPLAYED after a hard kill (bounded duplicates, never loss); a graceful stop always writes a final position")
 	eventsConfigMap = flag.String("events-position-configmap", "kubescrape-events-position", "ConfigMap holding the resume position. NOT a node-local file: the leader moves, so the successor must be able to read it")

@@ -376,16 +376,43 @@ func renderSeries(scope pmetric.ScopeMetrics, s *series, samples []sample, ts ti
 }
 
 // startOf renders a sample's start-of-accumulation stamp (sample.start, epoch
-// seconds) as an OTLP timestamp. A sample that somehow never went through
-// admit falls back to ts, which is the old always-a-reset behaviour — wrong,
-// but never AHEAD of the point's own timestamp, which some backends reject
-// outright.
+// seconds) as an OTLP timestamp, BOUNDED BY the point timestamp it is about to
+// be stamped beside. A sample that somehow never went through admit falls back
+// to ts, which is the old always-a-reset behaviour — wrong, but never AHEAD of
+// the point's own timestamp.
+//
+// The clamp exists for one narrow race, the same one internal/agent/cumagg's
+// ClampStart was written for (this package cannot call it: cumagg imports
+// transform, which imports obs, which imports this package). Both exports read
+// their clock ONCE, before the first snapshot (Export above, and Registry.Export),
+// so a sample ADMITTED in that window — its start stamped from a later read of
+// the coarse clock, on a producer goroutine — renders StartTimestamp >
+// Timestamp on its very first export. COUNTERS are safe on their own
+// (counterBaselineSeconds backdates the stream three minutes), which is why
+// this went unseen; a gauge, histogram or summary stamps the admission instant
+// and inverts. OTLP requires a cumulative point's start at or before its time,
+// and a consumer may reject the payload or read the inversion as a reset.
+//
+// Clamping the STAMP is the OTLP first-point spelling of "the stream began
+// now"; sample.start itself is untouched, so the true start renders from the
+// next export on, whose ts lies past it.
 func startOf(s sample, ts time.Time) pcommon.Timestamp {
+	now := pcommon.Timestamp(ts.UnixNano())
 	if s.start <= 0 {
-		return pcommon.Timestamp(ts.UnixNano())
+		return now
 	}
-	return pcommon.Timestamp(time.Unix(s.start, 0).UnixNano())
+	if start := pcommon.Timestamp(time.Unix(s.start, 0).UnixNano()); start < now {
+		return start
+	}
+	return now
 }
+
+// baselineBack is how far before the export the OLDER of a counter's two
+// synthetic zeros is stamped (the younger is at half of it). It is also the
+// bound startOf clamps a first counter point's start against: clamping to the
+// export instant instead would put the inversion the clamp removes straight
+// back onto the two points that exist to BE a baseline, which sit before it.
+const baselineBack = 2 * time.Minute
 
 // renderNumber writes gauge or counter samples as number data points. Counters
 // additionally emit two synthetic zero points before a series' first real
@@ -404,10 +431,17 @@ func startOf(s sample, ts time.Time) pcommon.Timestamp {
 func renderNumber(dps pmetric.NumberDataPointSlice, samples []sample, ts time.Time, counter bool) {
 	now := pcommon.Timestamp(ts.UnixNano())
 	for _, s := range samples {
-		start := startOf(s, ts)
+		// The clamp bound is the EARLIEST timestamp this sample will render
+		// at, not the export instant: a first counter point brings two zeros
+		// stamped before ts along with it.
+		earliest := ts
 		if counter && s.initial {
-			for back := 2; back >= 1; back-- {
-				prev := pcommon.Timestamp(ts.Add(time.Duration(-back) * time.Minute).UnixNano())
+			earliest = ts.Add(-baselineBack)
+		}
+		start := startOf(s, earliest)
+		if counter && s.initial {
+			for _, back := range [...]time.Duration{baselineBack, baselineBack / 2} {
+				prev := pcommon.Timestamp(ts.Add(-back).UnixNano())
 				zero := dps.AppendEmpty()
 				zero.SetDoubleValue(0)
 				zero.SetStartTimestamp(start)

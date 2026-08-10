@@ -317,7 +317,14 @@ func kvTail(s string, j int) bool {
 // its value class — a keyword with no value after the separator is not a
 // credential and must not cost a regex pass.
 func kvAssign(s string, j int) bool {
-	if j < len(s) && (s[j] == '"' || s[j] == '\'') {
+	// The key's own closing quote may be ESCAPED — `{\"password\":\"x\"}`, JSON
+	// inside a JSON message field — which is the regex's `(?:\\?["'])?`.
+	// Skipping only a bare quote left the prefilter NARROWER than its pattern
+	// on exactly the lines the escaped value branches were added for, i.e. the
+	// pattern skipped and the secret shipped in clear.
+	if j+1 < len(s) && s[j] == '\\' && (s[j+1] == '"' || s[j+1] == '\'') {
+		j += 2
+	} else if j < len(s) && (s[j] == '"' || s[j] == '\'') {
 		j++
 	}
 	for j < len(s) && isRegexpSpace(s[j]) {
@@ -338,6 +345,10 @@ func kvAssign(s string, j int) bool {
 	// that same quote — the OTHER kind is a legal first value byte
 	// (`password="'…`), and whitespace, commas and brackets are all legal
 	// INSIDE the quotes. An unquoted value still stops at the delimiter class.
+	// A backslash opens BOTH the escape-quoted branches (`password=\"x\"`) and
+	// an ordinary unquoted value (`C:\Users`), and it is not in the delimiter
+	// class, so the fall-through below admits it — deliberately wider than the
+	// regex here, which also requires a value byte after the escaped quote.
 	if j < len(s) && (s[j] == '"' || s[j] == '\'') {
 		q := s[j]
 		j++
@@ -428,13 +439,56 @@ var builtins = map[string]pattern{
 		// that stops earlier ships the value's tail in clear, through the
 		// tailer, journald and ingest alike. RE2 has no backreference, so "the
 		// same quote that opened it" is spelled as one ordered branch per quote
-		// kind, each capturing its opening quote (group 2 or 3; exactly one is
-		// set) and excluding only its OWN kind — a class excluding BOTH kinds
-		// would stop a double-quoted value at an embedded apostrophe. The
-		// closing quote is left in the line, so the replacement re-emits
-		// `key="` + redaction and the original terminator survives. The
-		// unquoted branch keeps the delimiter class. Every branch requires at
-		// least one value byte, so `password=""` matches nothing.
+		// kind, each capturing its opening quote (exactly one group is set) and
+		// excluding only its OWN kind — a class excluding BOTH kinds would stop
+		// a double-quoted value at an embedded apostrophe. The closing quote is
+		// left in the line, so the replacement re-emits `key="` + redaction and
+		// the original terminator survives. The unquoted branch keeps the
+		// delimiter class. Every branch requires at least one value byte, so
+		// `password=""` matches nothing.
+		//
+		// A `\"` INSIDE a plainly-quoted value is ESCAPED CONTENT, not that
+		// value's closing quote, and any JSON encoder writes one for a
+		// passphrase containing a quote. A bare `[^"]+` stopped there, so
+		// `{"password":"he said \"hi\" ok"}` came out as
+		// `{"password":"[REDACTED]"hi\" ok"}` — the same
+		// report-success-while-failing output the escaped-value branches below
+		// exist to prevent, one level in, and the one failure no counter can
+		// tell apart from a clean redaction. So the plain branches take an
+		// escape and its escapee as ONE unit (`\\[\s\S]` — any byte, newline
+		// included, since `[^"]` already spanned lines and a multi-line record
+		// must not start truncating) and stop only at a BARE quote, which is
+		// exactly where a JSON string ends. The cost is a literal UNPAIRED
+		// backslash immediately before the closing quote (malformed JSON): it
+		// reads as an escape and the value runs on to the next quote —
+		// over-redaction, the safe direction, pinned by
+		// TestKnownOverRedactionsAreAccepted.
+		//
+		// The quotes may be ESCAPED, and that is the ORDINARY shape, not an
+		// exotic one: any logging library that stringifies a payload into a
+		// message field emits `{"msg":"password=\"hunter2\" tail"}`. Without
+		// its own branches the value alternation fell through to the unquoted
+		// class, which matched the lone `\` and stopped at the quote — output
+		// `password=[REDACTED]"hunter2\" tail`, which is WORSE than no match:
+		// the line reads redacted and carries the secret anyway, so a reviewer
+		// sampling the output stops there. The key's closing quote may be
+		// escaped too (`{\"password\":\"…`, JSON inside JSON), which is the
+		// `(?:\\?["'])?` on the separator side.
+		//
+		// ONE level of escaping is what these branches decode: inside an
+		// escaped value a `\"` is the encoded closing quote and TERMINATES,
+		// while a `\` before anything else is content — exactly
+		// `(?:[^"\\]|\\[^"])+`. (`\\.` instead would eat the closing `\"` and
+		// run on to the next quote, redacting the rest of the message.) That
+		// is the OPPOSITE of the plain-quoted branches' rule above — there
+		// `\"` is content and only a BARE quote terminates — and deliberately
+		// so: the two contexts spell their terminator differently, and which
+		// rule applies is decided by the OPENING quote, which is why they are
+		// separate branches and why the escaped pair is tried FIRST. The
+		// unquoted branch drops a `\` that PRECEDES a quote for the same
+		// reason — that backslash is a value terminator, and matching it alone
+		// is the false redaction above — while keeping `\` before anything
+		// else, or `password=C:\Users\svc` would redact `C:` and ship the path.
 		//
 		// The keyword alternation and keySuffix render from the
 		// kvKeywords/kvSuffixes tables — the same tables the prefilter's
@@ -442,8 +496,9 @@ var builtins = map[string]pattern{
 		// lockstep (see kvDispatch).
 		re: regexp.MustCompile(`((?:^|[^0-9A-Za-z_.-])[0-9A-Za-z_.-]*?(?:` +
 			kvKeywordAlt() +
-			`)` + keySuffix + `["\']?\s*[:=]\s*)(?:(")[^"]+|(')[^']+|[^\s"\'&,;}\])]+)`),
-		repl:      "${1}${2}${3}" + redacted,
+			`)` + keySuffix + `(?:\\?["\'])?\s*[:=]\s*)` +
+			`(?:(\\")(?:[^"\\]|\\[^"])+|(\\')(?:[^'\\]|\\[^'])+|(")(?:[^"\\]|\\[\s\S])+|(')(?:[^'\\]|\\[\s\S])+|(?:[^\s"\'&,;}\])\\]|\\[^"\'])+)`),
+		repl:      "${1}${2}${3}${4}${5}" + redacted,
 		prefilter: secretKVCandidate,
 	},
 	"url-userinfo": {
@@ -465,7 +520,20 @@ var builtins = map[string]pattern{
 		// The user half is `*`, not `+`: `redis://:hunter2@host` is the
 		// standard Redis/Sentinel spelling and was the one credential form
 		// this pattern MISSED.
-		re:   regexp.MustCompile(`([a-zA-Z][a-zA-Z0-9+.-]*://[^\s:/@]*:)[^\s"'&,;}\])/@]+(@)`),
+		//
+		// '@' is deliberately NOT excluded from the PASSWORD class, even though
+		// it terminates it. The class is greedy, so leaving '@' in runs the
+		// match to the LAST '@' inside the token and a password containing one
+		// — `svc:p@ss@db-1`, an everyday DSN — is removed WHOLE. Excluding it
+		// stopped at the FIRST '@' and emitted `svc:[REDACTED]@ss@db-1`: a line
+		// that claims a redaction and still carries most of the credential.
+		// What bounds the match is the DELIMITER set above, not '@', so this
+		// widens nothing that matters: every line the excluding form matched
+		// still matches, over the same span or a longer one, and the only line
+		// newly matched is one whose password is itself an '@'.
+		// TestURLUserinfoDoesNotEatSurroundingContent is the corpus that keeps
+		// the delimiters honest.
+		re:   regexp.MustCompile(`([a-zA-Z][a-zA-Z0-9+.-]*://[^\s:/@]*:)[^\s"'&,;}\])/]+(@)`),
 		repl: "${1}" + redacted + "${2}",
 		prefilter: func(s string) bool {
 			return strings.Contains(s, "://")

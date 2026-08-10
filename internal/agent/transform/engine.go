@@ -3,14 +3,17 @@ package transform
 // The Starlark engine. Each signal's script defines transform(batch); batch
 // iterates lazy host objects (record/span/metric views over pdata), so a
 // script pays only for the fields it touches. Starlark is hermetic by
-// construction — no I/O, no imports, no clock — and each run gets a fresh
-// Thread with a step limit, so a pathological script terminates with an
-// error instead of wedging an export goroutine.
+// construction — no I/O, no imports, no clock — and every invocation, the
+// compile-time module evaluation included, runs under the budget in limits.go
+// (steps, wall clock, and the per-value/per-invocation size caps the operator
+// amplifiers are rewritten into), so a pathological script terminates with an
+// error instead of wedging an export goroutine or OOM-killing the process.
 
 import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"sync"
 
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/plog"
@@ -22,11 +25,6 @@ import (
 	"github.com/JohanLindvall/kubescrape/internal/obs"
 )
 
-// maxSteps bounds one transform invocation (~a few ms of work). A batch is
-// at most a few thousand records; a well-behaved script uses a tiny fraction
-// of this.
-const maxSteps = 10_000_000
-
 func contentHash(raw []byte) string {
 	h := sha256.Sum256(raw)
 	return hex.EncodeToString(h[:8])
@@ -35,7 +33,48 @@ func contentHash(raw []byte) string {
 type starlarkProgram struct {
 	signal string
 	fn     starlark.Callable
+	// print routes the universe's print() into the throttled script log; built
+	// once per program so no invocation allocates a closure for it.
+	print func(*starlark.Thread, string)
+	// threads pools armed threads. The parse hook runs ONE invocation PER
+	// LINE, where a fresh Thread plus the thread-local map the guards read
+	// their budget from is pure per-line overhead; a Thread also carries its
+	// frame freelist, so reuse is cheaper than what this replaced.
+	threads sync.Pool
 }
+
+// newThread builds a thread with the whole budget wired: Print (never
+// starlark-go's fmt.Fprintln(os.Stderr) fallback), the thread-local the guards
+// charge against, and the periodic OnMaxSteps checkpoint.
+func (p *starlarkProgram) newThread(name string) *starlark.Thread {
+	th := &starlark.Thread{Name: name, Print: p.print}
+	th.SetLocal(budgetKey, &budget{})
+	th.OnMaxSteps = budgetOf(th).onMaxSteps
+	return th
+}
+
+// arm resets everything an invocation could carry into the next one: the step
+// counter, the cancellation latch (a cancelled thread stays cancelled) and the
+// budget's clock and spend.
+func arm(th *starlark.Thread) *starlark.Thread {
+	th.Steps = 0
+	th.Uncancel()
+	th.SetMaxExecutionSteps(stepsPerCheck)
+	budgetOf(th).reset()
+	return th
+}
+
+func (p *starlarkProgram) thread() *starlark.Thread {
+	if th, ok := p.threads.Get().(*starlark.Thread); ok {
+		return arm(th)
+	}
+	return arm(p.newThread("transform:" + p.signal))
+}
+
+// release returns a thread to the pool. Called only on a normal return: a
+// panic unwinds past it, leaving the dirty thread to the garbage collector
+// (this repo has no recover(), so the process is going down anyway).
+func (p *starlarkProgram) release(th *starlark.Thread) { p.threads.Put(th) }
 
 // compileStarlark compiles src and resolves its transform() function. The
 // compile includes a smoke evaluation of the module (top-level statements
@@ -47,17 +86,31 @@ func compileStarlark(signal, src string) (*starlarkProgram, error) {
 // compileStarlarkFn compiles src and resolves fnName — the batch transforms
 // all define transform(batch); the hook sections each define their own
 // (admit/target/decide/parse).
+//
+// The parse/rewrite/compile steps are spelled out rather than left to
+// ExecFileOptions because the amplifier rewrite (rewrite.go) has to happen
+// between the parse and the resolve.
 func compileStarlarkFn(signal, src, fnName string) (*starlarkProgram, error) {
 	opts := &syntax.FileOptions{Set: true, While: true, GlobalReassign: true}
-	thread := &starlark.Thread{Name: "compile:" + signal}
-	// Bound the smoke evaluation like the run path: a top-level comprehension
-	// (e.g. `_ = [x for x in range(1<<40)]`) is a plain expression Starlark
-	// runs at module load, with no step or ctx cap otherwise — an operator
-	// typo would hang the agent at startup (CompileFile is synchronous in
-	// run()) or wedge the reload goroutine forever, breaking the
-	// keep-last-good-program guarantee. maxSteps caps it to a config error.
-	thread.SetMaxExecutionSteps(maxSteps)
-	globals, err := starlark.ExecFileOptions(opts, thread, signal+".star", src, predeclared(signal))
+	f, err := opts.Parse(signal+".star", src, 0)
+	if err != nil {
+		return nil, fmt.Errorf("transforms %s: %w", signal, err)
+	}
+	if err := rewriteAmplifiers(f); err != nil {
+		return nil, fmt.Errorf("transforms %s: %w", signal, err)
+	}
+	pre := predeclared(signal)
+	prog, err := starlark.FileProgram(f, pre.Has)
+	if err != nil {
+		return nil, fmt.Errorf("transforms %s: %w", signal, err)
+	}
+	p := &starlarkProgram{signal: signal}
+	p.print = func(_ *starlark.Thread, msg string) { scriptLog(signal, msg) }
+	// The module evaluation gets the SAME budget as a run: its top-level
+	// statements are ordinary code (`_hog = list(range(1<<26))` is eleven steps
+	// and a gigabyte), it runs at every startup and every reload, and a process
+	// that dies here dies before there is a last-good program to fall back to.
+	globals, err := prog.Init(arm(p.newThread("compile:"+signal)), pre)
 	if err != nil {
 		return nil, fmt.Errorf("transforms %s: %w", signal, err)
 	}
@@ -66,27 +119,29 @@ func compileStarlarkFn(signal, src, fnName string) (*starlarkProgram, error) {
 		return nil, fmt.Errorf("transforms %s: script must define %s(...)", signal, fnName)
 	}
 	globals.Freeze() // shared across export goroutines: must be immutable
-	return &starlarkProgram{signal: signal, fn: fn}, nil
+	p.fn = fn
+	return p, nil
 }
 
-// call invokes the program's function with args on a fresh bounded thread,
-// returning its value (the hook accessors interpret it; run below discards
-// it). Errors count into obs.TransformErrors under the program's signal.
+// call invokes the program's function with args on a bounded thread, returning
+// its value (the hook accessors interpret it; run below discards it). Errors
+// count into obs.TransformErrors under the program's signal.
 func (p *starlarkProgram) call(args ...starlark.Value) (starlark.Value, error) {
-	thread := &starlark.Thread{Name: "transform:" + p.signal}
-	thread.SetMaxExecutionSteps(maxSteps)
-	v, err := starlark.Call(thread, p.fn, starlark.Tuple(args), nil)
+	th := p.thread()
+	v, err := starlark.Call(th, p.fn, starlark.Tuple(args), nil)
+	p.release(th)
 	if err != nil {
 		return nil, fmt.Errorf("transform %s: %w", p.signal, err)
 	}
 	return v, nil
 }
 
-// run invokes transform(batch) on a fresh bounded thread.
+// run invokes transform(batch) on a bounded thread.
 func (p *starlarkProgram) run(batch starlark.Value) error {
-	thread := &starlark.Thread{Name: "transform:" + p.signal}
-	thread.SetMaxExecutionSteps(maxSteps)
-	if _, err := starlark.Call(thread, p.fn, starlark.Tuple{batch}, nil); err != nil {
+	th := p.thread()
+	_, err := starlark.Call(th, p.fn, starlark.Tuple{batch}, nil)
+	p.release(th)
+	if err != nil {
 		obs.TransformErrors.WithLabelValues(p.signal).Inc()
 		return fmt.Errorf("transform %s: %w", p.signal, err)
 	}

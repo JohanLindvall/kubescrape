@@ -5,6 +5,7 @@ import (
 
 	"log/slog"
 	"net/http"
+	"sync/atomic"
 	"time"
 
 	"github.com/JohanLindvall/kubescrape/internal/obs"
@@ -168,6 +169,13 @@ type Server struct {
 	// key space is the operator-wired ReservedAttrs lists — never
 	// sender-chosen — so the table is sized to exactly that.
 	reservedWarns *logdedupe.Table
+	// reserveExpiries is the since-start total of pre-decode reservations
+	// reclaimed by the decode window, and it exists ONLY to put a magnitude on
+	// the throttled log line reserveExpiryWarns paces — the series an operator
+	// alerts on is obs.IngestReserveExpired, kept apart from obs.IngestRejected
+	// on purpose (reservation.expire says why).
+	reserveExpiries    atomic.Uint64
+	reserveExpiryWarns logdedupe.Throttle
 }
 
 // NewServer creates an ingest Server.

@@ -163,8 +163,16 @@ agent:
   nodeMetrics: true
 
   # Read the systemd journal natively (libsystemd, via cgo). The default image
-  # ships libsystemd; dir "" reads the system default (/var/log/journal is
-  # mounted read-only; set dir to /run/log/journal for volatile journals).
+  # ships libsystemd.
+  #
+  # Enabling this adds the /run/log/journal hostPath mount to the DaemonSet,
+  # because a node whose journal is VOLATILE (systemd Storage=volatile, or auto
+  # with no /var/log/journal) keeps it there and nowhere under the /var/log
+  # mount that carries the persistent one. dir "" reads BOTH, which is what you
+  # want; setting dir restricts the reader to that ONE directory, and a
+  # directory holding no journal files makes the reader start cleanly, wait
+  # forever and export nothing (it warns at startup — but /readyz stays 200 and
+  # no counter moves, an untouched counter never being exported).
   #
   # This pipeline is behind the `journald` BUILD TAG, which the default image
   # sets. A custom image built without it (`make image-static`, whose whole

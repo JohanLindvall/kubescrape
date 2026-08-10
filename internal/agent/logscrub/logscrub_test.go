@@ -140,6 +140,30 @@ func TestURLUserinfoRedacted(t *testing.T) {
 	}
 }
 
+// A DSN password may itself contain '@' — `p@ssw0rd` is not an exotic choice,
+// and a URL-encoding library is what usually hides it. Excluding '@' from the
+// password class stopped the match at the FIRST one and emitted
+// `svc:[REDACTED]@ss@db-1`: a line that claims a redaction and still carries
+// most of the credential, which is the one failure obs.LogScrubbed cannot
+// distinguish from a clean one. The class is greedy, so leaving '@' in runs to
+// the LAST one inside the token; what bounds the token is the delimiter set,
+// pinned by TestURLUserinfoDoesNotEatSurroundingContent.
+func TestURLUserinfoRedactsPasswordContainingAtSign(t *testing.T) {
+	s := mustNew(t, Config{Builtin: []string{"defaults"}})
+	for _, c := range []struct{ in, want string }{
+		{`dial failed: postgres://svc:p@ss@db-1:5432/app`, `dial failed: postgres://svc:[REDACTED]@db-1:5432/app`},
+		{`{"dsn":"postgres://u:p@ss@h/db"}`, `{"dsn":"postgres://u:[REDACTED]@h/db"}`},
+		{`redis://:h@nt@r2@cache:6379`, `redis://:[REDACTED]@cache:6379`},
+		// The single-'@' spellings must be untouched by the same change.
+		{`connect failed: https://user:hunter2@host/path?retry=1`, `connect failed: https://user:[REDACTED]@host/path?retry=1`},
+		{`amqp://guest:guest@rabbit:5672/`, `amqp://guest:[REDACTED]@rabbit:5672/`},
+	} {
+		if got := s.Scrub(c.in); got != c.want {
+			t.Errorf("Scrub(%q)\n got %q\nwant %q", c.in, got, c.want)
+		}
+	}
+}
+
 // The userinfo pattern must not walk past the credential into ordinary
 // content. Scrubbing runs BEFORE logAttributes, enrich, logMetrics and the
 // rules, so a corrupted line kills every field extraction downstream of it.
@@ -257,14 +281,24 @@ func TestSecretKVPrefilterCoversEveryMatchingShape(t *testing.T) {
 	for _, w := range kvSuffixes {
 		suffixes = append(suffixes, "_"+w, "-"+strings.ToUpper(w), altCaseASCII(w))
 	}
-	prefixes := []string{"", "x_", "MY.", "aws-", "{\"", "  "}
-	seps := []string{":", "=", " : ", "\t=\t", "\": \"", "'='"}
+	prefixes := []string{"", "x_", "MY.", "aws-", "{\"", "  ", `{\"`}
+	// The last two separators are ESCAPE-quoted: a message stringified into a
+	// JSON field carries `{\"password\":\"…`, so the key's closing quote is a
+	// backslash-quote pair the prefilter has to walk past exactly as the regex
+	// does.
+	seps := []string{":", "=", " : ", "\t=\t", "\": \"", "'='", `\": \"`, `\'=\'`}
 	// "\vraw" is deliberate: \v is not in Go regexp's \s, so it is a legal
 	// first byte of the value class — a prefilter treating it as whitespace
-	// would reject a line the regex matches. The last three embed the OPPOSITE
+	// would reject a line the regex matches. The next three embed the OPPOSITE
 	// quote kind in a quoted value: a legal first value byte a same-kind-only
-	// terminator must not reject.
-	values := []string{"hunter2", "0", `"quoted"`, "sk-12345", "\vraw", `"don't"`, `'a"b'`, `"'"`}
+	// terminator must not reject. The next three are the escape-quoted value
+	// branches, plus a bare backslash value. The last three are PLAINLY quoted
+	// values carrying an ESCAPED quote of their own kind — the branches now
+	// read an escape and its escapee as one unit, so they reach past a `\"` the
+	// prefilter must also walk past.
+	values := []string{"hunter2", "0", `"quoted"`, "sk-12345", "\vraw", `"don't"`, `'a"b'`, `"'"`,
+		`\"escaped\"`, `\'escaped\'`, `C:\Users\svc`,
+		`"a\"b"`, `'a\'b'`, `"C:\Users\svc"`}
 	matched := 0
 	for _, kw := range keywords {
 		for _, pre := range prefixes {
@@ -301,6 +335,20 @@ func FuzzSecretKVPrefilterNotNarrower(f *testing.F) {
 		// Mixed-quote values: each quoted branch excludes only its OWN kind,
 		// so the other quote is a legal value byte the prefilter must admit.
 		`password="don't tell"`, `secret='he said "go"'`, `password="'"`, `token=''`,
+		// ESCAPE-quoted values and keys — the shape a payload stringified into
+		// a JSON message field takes. The value branches start at a backslash
+		// and the key's closing quote is a backslash-quote pair; a prefilter
+		// walking past neither is narrower than its pattern on the most
+		// ordinary secret spelling there is.
+		`{"msg":"password=\"hunter2\" tail"}`, `{\"password\":\"hunter2\"}`,
+		`password=\'x\'`, `password=\"\"`, `password=\"`, `password=C:\Users\svc`,
+		// A PLAINLY quoted value carrying an escaped quote of its own kind:
+		// the branch reads `\"` as content and runs past it, so the prefilter
+		// has to admit the whole shape too. The last two are the edges of that
+		// rule — an escaped backslash, and a value that is a lone trailing
+		// backslash (which the escape-unit form no longer matches at all).
+		`{"password":"he said \"hi\" ok"}`, `secret='don\'t tell'`,
+		`password="C:\Users\svc"`, `{"password":"a\\","user":"bob"}`, `password="\`,
 	} {
 		f.Add(s)
 	}

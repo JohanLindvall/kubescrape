@@ -77,7 +77,7 @@ type cadvisorBatcher struct {
 	// new resource or metric is inserted.
 	keyBuf []byte
 
-	// cgroupMemo caches cgroupid.Identity per raw "id" value: each container's
+	// cgroupMemo caches cgroupid.Parse per raw "id" value: each container's
 	// cgroup path recurs in every family of the scrape (~60×), and the parse
 	// (plus the systemd layout's uid underscore rewrite) is the expensive part
 	// of identityOf. The mapping is pure, so the memo survives reset() and
@@ -87,6 +87,10 @@ type cadvisorBatcher struct {
 
 type cgroupPair struct {
 	podUID, containerID string
+	// podContainer is cgroupid.Parse's shape verdict: the container scope is the
+	// pod slice's immediate child. It is memoized with the ids because isSandbox
+	// needs it per sample and re-deriving it would mean a second walk.
+	podContainer bool
 }
 
 func newCadvisorBatcher(s *Scraper, scrape time.Time, ctx context.Context) *cadvisorBatcher {
@@ -135,21 +139,21 @@ type cadvisorIdentity struct {
 	podUID, containerID       string
 	image                     string // "image" label, container rows only
 	hasCgroup                 bool   // an "id" label was present
-	// sandbox marks a container="POD" row. It is deliberately NOT part of
-	// appendKey — the pause row still folds into the pod's resource, which is
-	// the intended behaviour — but it must survive to putFilteredLabels: with
-	// the pod-cgroup row of the same family the two identities are otherwise
-	// byte-identical (the podUID key branch omits namespace/pod, and the
-	// sandbox's containerID and image are cleared just below), so both land on
-	// one metric and the redundant-label elision then removes the only labels
-	// that told them apart — two data points with identical attribute sets in
-	// one metric, which is one series downstream.
+	// sandbox marks a row describing the pod's SANDBOX (see isSandbox). It is
+	// deliberately NOT part of appendKey — the pause row still folds into the
+	// pod's resource, which is the intended behaviour — but it must survive to
+	// putFilteredLabels: with the pod-cgroup row of the same family the two
+	// identities are otherwise byte-identical (the podUID key branch omits
+	// namespace/pod, and the sandbox's containerID and image are cleared in
+	// identityOf), so both land on one metric and the redundant-label elision
+	// then removes the only labels that told them apart — two data points with
+	// identical attribute sets in one metric, which is one series downstream.
 	sandbox bool
 }
 
 func (cb *cadvisorBatcher) identityOf(labels []Label) cadvisorIdentity {
 	var ident cadvisorIdentity
-	sandbox := false
+	labelledPOD, podContainer := false, false
 	for _, l := range labels {
 		switch l.Name {
 		case "namespace":
@@ -158,7 +162,7 @@ func (cb *cadvisorBatcher) identityOf(labels []Label) cadvisorIdentity {
 			ident.pod = l.Value
 		case "container":
 			if l.Value == "POD" {
-				sandbox = true
+				labelledPOD = true
 			} else {
 				ident.container = l.Value
 			}
@@ -168,24 +172,131 @@ func (cb *cadvisorBatcher) identityOf(labels []Label) cadvisorIdentity {
 			ident.hasCgroup = true
 			pair, ok := cb.cgroupMemo[l.Value]
 			if !ok {
-				pair.podUID, pair.containerID = cgroupid.Identity(l.Value)
+				pair.podUID, pair.containerID, pair.podContainer = cgroupid.Parse(l.Value)
 				if len(cb.cgroupMemo) < maxTrackedFamilies {
 					cb.cgroupMemo[l.Value] = pair
 				}
 			}
 			ident.podUID, ident.containerID = pair.podUID, pair.containerID
+			podContainer = pair.podContainer
 		}
 	}
-	// Sandbox ("POD") rows are pod-level; with the systemd driver their
-	// cgroup names the pause container, whose ID is not part of the pod's
-	// container statuses — drop it so the row shares the pod resource. The
-	// image label names the pause container too, never the workload.
-	if sandbox {
+	// A sandbox row is pod-level: its cgroup names the PAUSE container, whose ID
+	// is not among the pod's container statuses, so a lookup can only miss and
+	// mint an unresolved resource of its own; the image label names the pause
+	// image, never the workload. Clearing both is what makes the row share the
+	// pod's resource — where putFilteredLabels then KEEPS its `id`, the one
+	// label separating the pause point from the pod-cgroup point of the same
+	// family.
+	if isSandbox(ident, labelledPOD, podContainer) {
 		ident.containerID = ""
 		ident.image = ""
 		ident.sandbox = true
 	}
 	return ident
+}
+
+// isSandbox reports whether a cadvisor row describes the pod's sandbox (the
+// pause / infra container) rather than a workload container, a runtime helper
+// cgroup, or a cgroup cadvisor could not attribute to a pod at all. labelledPOD
+// is the container="POD" label, which the caller has already stripped from
+// ident; podContainer is cgroupid.Parse's shape verdict — the row's cgroup is a
+// container scope DIRECTLY beneath a pod slice.
+//
+// The predicate identifies a sandbox POSITIVELY and everything that fails it
+// keeps its own resource, because the two errors are not symmetric. Folding is
+// DESTRUCTIVE: the row shares the pod's resource, and scope() fills a resource
+// from the FIRST identity that reaches it, so a wrongly folded row arriving
+// before the pod's own rows would name the resource that every container_*
+// series of that pod is exported under. Not folding costs one extra resource.
+// An absence-based rule ("no container name" ⇒ sandbox) got this backwards.
+//
+// Two shapes, one per runtime family, and both must be caught or the pod grows a
+// phantom third resource carrying the pause image and an unresolvable id:
+//
+//   - dockershim and CRI-O label the infra container container="POD". CRI-O is
+//     current and still does; dockershim was removed in Kubernetes 1.24. The
+//     convention is not extinct — it was never containerd's, which is why this,
+//     as the ONLY predicate, had stopped firing in practice: a live containerd
+//     v1.33 node emits ZERO such rows.
+//
+//   - containerd's sandbox is not a CRI *container*: it carries the pod's
+//     io.kubernetes.pod.{name,namespace} labels but no io.kubernetes.container.name,
+//     so cadvisor emits namespace/pod with container="" — the same empty
+//     container label the POD CGROUP row carries. Only the cgroup path separates
+//     the two: the pod slice parses to (uid, ""), the pause scope beneath it to
+//     (uid, <container id>).
+//
+// The pod ATTRIBUTION is the load-bearing check, and BOTH arms require it.
+// cadvisor learns `pod`/`namespace` and `container` from the SAME CRI labels, so
+// a row carrying the pod but no container name is the sandbox by construction,
+// while every impostor is a RAW cgroup cadvisor could not attribute at all and
+// so carries neither: raw-handler rows, CRI-O's crio-conmon-<id>.scope, a
+// kata/gVisor helper scope parked in the pod slice, a container whose CRI lookup
+// failed. Requiring it is also what BOUNDS a mis-fold: a folded row always names
+// the pod whose resource it joins, so whichever row creates that resource it
+// resolves to the same pod, and the worst case is one extra data point —
+// distinguishable, since putFilteredLabels keeps a sandbox row's `id` — never a
+// stripped identity.
+//
+// The pause IMAGE corroborates but is never required: containerd's sandbox_image
+// is configurable and a fleet mirroring it under its own name must not regrow
+// the phantom. It is the SOLE evidence in one place only — a cgroup root the pod
+// segment does not parse out of (a custom --cgroup-root), where there is no uid
+// to place the scope by — and it is never consulted for a row that names its
+// container, so an unlucky workload image cannot swallow a real container.
+//
+// Known gaps, all failing the safe way (the row keeps its own resource, which is
+// the pre-fold behaviour: a phantom, not a loss):
+//
+//   - a custom --cgroup-root AND a custom sandbox_image together satisfy neither
+//     arm;
+//   - a runtime whose sandbox row carries no pod attribution at all.
+//
+// Pre-existing and NOT about the fold: an unrecognised child of a pod slice
+// whose name yields no container id (kata's kata_<sandbox-id>) parses as the
+// POD's own cgroup and shares its resource — the path alone cannot tell it from
+// the pod slice, and this predicate never sees it.
+func isSandbox(ident cadvisorIdentity, labelledPOD, podContainer bool) bool {
+	if ident.namespace == "" || ident.pod == "" {
+		// cadvisor could not attribute the cgroup to a pod, so nothing here says
+		// WHICH pod's sandbox it would be — and a fold must name the resource it
+		// joins.
+		return false
+	}
+	if labelledPOD {
+		return true // the runtime said so
+	}
+	if ident.container != "" || ident.containerID == "" {
+		return false // a named workload container, or not a container cgroup at all
+	}
+	if podContainer {
+		return true
+	}
+	// No parseable pod segment (a custom --cgroup-root): the image is what is
+	// left. A parseable one that placed the scope somewhere OTHER than directly
+	// under the pod slice is a helper cgroup, not the sandbox.
+	return ident.podUID == "" && isPauseImage(ident.image)
+}
+
+// isPauseImage reports whether an image reference names a sandbox image.
+// Registry and tag are stripped so every mirror spelling matches
+// (registry.k8s.io/pause:3.10, gcr.io/google_containers/pause-amd64:3.1,
+// rancher/mirrored-pause:3.6, registry:5000/pause@sha256:…), and the match is on
+// the repository's LAST path segment rather than a substring of the whole
+// reference: a registry host or a namespace containing "pause" must not read as
+// the sandbox. Allocation-free — it runs inside identityOf, once per sample.
+func isPauseImage(image string) bool {
+	if i := strings.IndexByte(image, '@'); i >= 0 {
+		image = image[:i] // digest
+	}
+	if i := strings.LastIndexByte(image, '/'); i >= 0 {
+		image = image[i+1:] // registry host (which may carry a :port) and namespace
+	}
+	if i := strings.IndexByte(image, ':'); i >= 0 {
+		image = image[:i] // tag
+	}
+	return image == "pause" || strings.HasPrefix(image, "pause-") || strings.HasSuffix(image, "-pause")
 }
 
 // rollup reports whether the sample belongs to a cgroup above pod level.
@@ -375,8 +486,19 @@ func (cb *cadvisorBatcher) drop(name string, ident cadvisorIdentity) bool {
 	if ident.rollup() {
 		return true // above pod level
 	}
-	// A pod-level row of a container-scoped family duplicates the sum of
-	// its containers; only families without a per-container breakdown pass.
+	// Pod level. TWO row shapes reach this branch and only one of them is a
+	// duplicate: the pod CGROUP row is the sum of the pod's containers, while the
+	// folded SANDBOX row (isSandbox cleared its container id, which is what lands
+	// it here) is a COMPONENT of that sum — the pause container's own usage, which
+	// nothing else reports once the pod row is gone.
+	//
+	// It is dropped anyway, deliberately. The flag's contract is "per-WORKLOAD-
+	// container series only", and the sandbox is pod infrastructure: ~1 mcore and
+	// a few MiB that no dashboard queries, its series distinguishable from the pod
+	// row's only by the raw cgroup path in `id`. Keeping it would also spend back
+	// most of what the flag saves here — one point per family per pod, the same
+	// order as the pod-cgroup row it would stand in for — so the pod level would be
+	// halved rather than dropped. Families with no per-container breakdown pass.
 	if ident.hasCgroup && ident.container == "" && ident.containerID == "" &&
 		(ident.pod != "" || ident.podUID != "") && !podScopedFamily(name) {
 		return true

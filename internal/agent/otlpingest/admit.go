@@ -242,6 +242,10 @@ type reservation struct {
 	b      *byteBudget
 	held   atomic.Int64
 	cancel context.CancelFunc
+	// expired is called by expire, and ONLY by expire, so the window elapsing
+	// stays distinguishable from an admission refusal (see there). nil is
+	// tolerated: the package's own tests build bare reservations.
+	expired func()
 	// timer is written after it is armed and read by release, which can run on
 	// another goroutine; a nil load simply skips the Stop and leaves a timer
 	// whose expire finds held already at zero.
@@ -264,10 +268,28 @@ func (r *reservation) release() {
 // without paying for one, and so nothing is decoded outside the accounting. The
 // sender sees codes.Canceled — retryable per the OTLP spec — which is the
 // degradation an honest-but-slow sender gets.
+//
+// It deliberately does NOT count obs.IngestRejected. That counter means one
+// thing — a push refused because an admission bound was REACHED, answered
+// 429/ResourceExhausted with the payload still in the sender's hands — and it
+// is read as "this node cannot keep up with what is being pushed at it". An
+// expiry is the opposite shape: the budget had room, and a peer that opened a
+// stream and then delivered nothing inside the decode window was reaped. One
+// headers-only prober, at zero cost in bytes, could therefore drive the rate
+// an operator scales on.
+//
+// The two causes need different responses, so they are two series — NOT one
+// cause made invisible. Separating them by dropping the count would be the
+// worse of the two errors this seam can make: the reclaim cancels a peer's
+// stream and hands its bytes back, and a listener nothing authenticates is
+// exactly where that has to be visible to Prometheus. expired is the seam
+// (Server.noteReserveExpired → obs.IngestReserveExpired).
 func (r *reservation) expire() {
 	if n := r.held.Swap(0); n > 0 {
 		r.b.release(n)
-		obs.IngestRejected.Inc()
+		if r.expired != nil {
+			r.expired()
+		}
 		r.cancel()
 	}
 }
@@ -298,7 +320,7 @@ func (s *Server) tapAdmit(ctx context.Context, _ *tap.Info) (context.Context, er
 	// recvBufferReader), so cancelling it aborts a read that is waiting for DATA
 	// frames that never arrive. That is what gives expire something to reap.
 	ctx, cancel := context.WithCancel(ctx)
-	r := &reservation{b: s.buffer, cancel: cancel}
+	r := &reservation{b: s.buffer, cancel: cancel, expired: s.noteReserveExpired}
 	r.held.Store(reserve)
 	ctx = context.WithValue(ctx, reservationKey{}, r)
 	// The stream context is cancelled on every RPC outcome, so this is the
@@ -309,6 +331,27 @@ func (s *Server) tapAdmit(ctx context.Context, _ *tap.Info) (context.Context, er
 	// and release tolerates a not-yet-stored timer.
 	r.timer.Store(time.AfterFunc(s.reserveWindow, r.expire))
 	return ctx, nil
+}
+
+// reserveExpiryWarnEvery is the re-warn cadence for reaped decode windows. The
+// condition is a peer's behaviour, not an event worth a line each: one slow or
+// probing sender can produce one per stream open.
+const reserveExpiryWarnEvery = time.Minute
+
+// noteReserveExpired reports a reaped pre-decode reservation: it counts the
+// metric that is the condition's ONLY standing signal — see reservation.expire
+// for why it may not fold into obs.IngestRejected — and warns, throttled,
+// because the condition is a peer's behaviour rather than an event worth a line
+// each (one probing sender produces one per stream open). The local total is
+// kept only to put a magnitude on that one line; the series is obs's.
+func (s *Server) noteReserveExpired() {
+	obs.IngestReserveExpired.Inc()
+	total := s.reserveExpiries.Add(1)
+	if s.reserveExpiryWarns.Allow(reserveExpiryWarnEvery) {
+		s.log.Warn("reclaimed a gRPC pre-decode buffer reservation and cancelled the stream: "+
+			"a peer opened a stream and delivered no message inside the decode window",
+			"window", s.reserveWindow, "reserved_bytes", s.grpcMaxRecv, "total", total)
+	}
 }
 
 // releaseReservation hands the accounting over from the decode window to the

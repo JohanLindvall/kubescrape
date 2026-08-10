@@ -396,6 +396,37 @@ func (s *series) recordSingle(hash, check uint64, value float64, lbls labels, no
 	samp.when = now
 }
 
+// materialize admits the sample for a fixed label set at ZERO, without
+// recording an observation, so a series that has been BOUND exists before it
+// first fires. It is the registry's half of the absent-vs-zero problem: a
+// counter whose series appears only once something increments it makes "this
+// never happened" indistinguishable from "this code path does not exist in
+// this build / this policy is not configured", and every alert written over
+// the absent form silently matches nothing.
+//
+// Idempotent, and never an OBSERVATION: value and count stay 0, so the first
+// real bump is still the first bump. Only the Registry's bound wrappers reach
+// it — a DynamicMetricSet's label sets come from log DATA, where a series
+// nothing has observed is exactly what should not exist.
+func (s *series) materialize(lbls labels, hash, check uint64) {
+	if s.kind == kindHistogram {
+		if _, ok := lbls.get(leLabel); ok {
+			// baseAccum folds an "le" OUT of a histogram's identity, so the
+			// caller's precomputed hash is not the one its observations land
+			// on (observePreHashed diverts them to the general path). Creating
+			// a sample under it would mint a second, never-observed series.
+			return
+		}
+	}
+	now := s.epoch()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.db[hash]; ok {
+		return
+	}
+	s.admit(hash, check, lbls, now, emptyResource, nil)
+}
+
 // baseAccum hashes the caller's data-point labels once (order-independent). For
 // a histogram it strips any caller-provided "le": the per-bucket "le" is a
 // rendering artifact of the Prometheus exposition, never part of a stored

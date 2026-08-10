@@ -733,7 +733,11 @@ func (s *sink[T]) drainLoop(ctx context.Context, untilEmpty bool) {
 			payload := append([]byte(nil), data...)
 			send = func(c context.Context) error { return s.sendRaw(c, payload) }
 		}
-		switch s.trySend(ctx, send) {
+		// data still aliases the reader's buffer — no queue operation has run
+		// since Reserve, and trySend performs none — so it is still the right
+		// bytes to key the stuck map on. Every later use of it (stuckTooLong,
+		// forget) carries the same note for the same reason.
+		switch s.trySend(ctx, send, s.accountableLap(data)) {
 		case sendOK:
 			s.forget(data) // a previously-stuck payload that recovered; hash before the next queue op
 			s.commit(q, rd, off)
@@ -867,6 +871,10 @@ func (s *sink[T]) stuckTooLong(data []byte) bool {
 	// behind in the queue during a recovery, advance s.delivered without any
 	// failed lap of ours spanning them — the comparison is against the delivery
 	// count at our own previous failure, so they cannot count either.
+	//
+	// accountableLap reads these same two fields BEFORE the send to decide
+	// whether the lap may end after one attempt; keep them the one predicate, or
+	// trySend starts shortening laps that spend no budget.
 	progressed := seen && s.delivered > st.lastDelivered
 	// A lap counts only when the collector is alive (progressed) AND actually
 	// RESPONDED to this lap's send (a rejection, not a transport failure): only
@@ -937,11 +945,50 @@ const (
 // reporting the batch stuck (drain then rotates it to the back of the queue).
 const stuckAfterAttempts = 5
 
+// accountableLap reports whether a failure of THIS payload, right now, would
+// count toward its poison budget: it has already failed a whole lap (so it is
+// in the stuck map) and the collector has delivered some OTHER batch since that
+// lap. It is deliberately the SAME predicate stuckTooLong weighs after the send,
+// read off the same two fields, evaluated before it — so a lap trySend cuts
+// short is always a lap the drop rule is already spending. It is therefore
+// never true on a payload's first sighting, which is what leaves every batch
+// its full stuckAfterAttempts before anything about it is held against it.
+//
+// The evidence has to be about the PAYLOAD. A sink-wide "has the collector
+// delivered anything since the last failure here" is a property of the
+// COLLECTOR, and it is true on attempt 1 for every batch that meets a responded
+// transient error while the sink is warm — and respondedError is true for
+// exactly the classes IsPermanent deliberately treats as transient: the 401/403
+// of a rotating bearer token, the 404 of a collector rolling out behind an
+// ingress. Gating on it cut the retry depth of good data to one attempt per lap
+// during precisely the two events the depth exists for, and rotated it into
+// drop evidence five times faster.
+//
+// It is self-limiting: stuckTooLong stamps st.lastDelivered on every failed lap,
+// so a second short lap must be earned by a fresh delivery of something else. A
+// queue with nothing else left to drain falls back to the full backed-off cycle
+// instead of spinning on its only record at wire speed.
+//
+// The empty-map short circuit keeps the hash off the drain's steady state: the
+// map holds entries only while something is failing.
+func (s *sink[T]) accountableLap(data []byte) bool {
+	if len(s.stuck) == 0 {
+		return false
+	}
+	st, seen := s.stuck[xxhash.Sum64(data)]
+	return seen && s.delivered > st.lastDelivered
+}
+
 // trySend retries with backoff until the exporter accepts the batch, the
 // error is a permanent rejection, the attempt budget is spent, or ctx is
 // cancelled. send is the one attempt — the drain chooses between the raw-bytes
 // and the pdata send, and everything else about the policy is identical.
-func (s *sink[T]) trySend(ctx context.Context, send func(context.Context) error) sendResult {
+//
+// accountable (accountableLap) shortens the cycle to ONE attempt for a payload
+// that is ALREADY spending its poison budget — see the early return below. The
+// queue head is a node-shared resource, and the whole point is to stop holding
+// it for a question this payload has already had answered.
+func (s *sink[T]) trySend(ctx context.Context, send func(context.Context) error, accountable bool) sendResult {
 	// The backoff persists across trySend cycles (s.cur) so a long outage
 	// actually reaches the 30s cap instead of restarting at s.backoff every
 	// stuckAfterAttempts sends; success resets it.
@@ -959,8 +1006,36 @@ func (s *sink[T]) trySend(ctx context.Context, send func(context.Context) error)
 			s.log.Warn("buffered export permanently rejected", "signal", s.kind, "error", err)
 			return sendRejected
 		}
-		if attempt >= stuckAfterAttempts {
-			s.stuckResponded = respondedError(err)
+		responded := respondedError(err)
+		// End the cycle after ONE attempt when this lap is one the drop rule is
+		// ALREADY counting: the payload failed a whole cycle before, the
+		// collector has delivered some OTHER batch since that failure, and it has
+		// now ANSWERED about this one rather than gone quiet. Under all three the
+		// remaining attempts only re-ask, at the QUEUE HEAD, a question answered
+		// this lap and the last — and the head is a resource the whole node
+		// shares, since commits are a cursor and nothing behind it drains while it
+		// is held. With the backoff persisting across cycles (s.cur, capped at
+		// 30s) such a head rotated at most once every ~2 minutes, and the drop
+		// rule's evidence accrues at most once per rotation: one sender pushing
+		// records no collector will accept (a single over-4-MiB log record is
+		// enough) stalled every other producer's logs on that node for minutes at
+		// a time, repeatedly.
+		//
+		// What it may NOT do is shorten the depth of a payload that is merely
+		// meeting a transient collector condition, which is why the gate is
+		// accountableLap and not "the collector is up": respondedError is true for
+		// the classes IsPermanent deliberately treats as transient (a rotating
+		// token's 401, a rollout's 404), so a sink-warm gate fired on attempt 1
+		// for good data during exactly the two events the retry depth exists for.
+		//
+		// The arithmetic, first sighting to drop: stuckAfterAttempts attempts on
+		// the first lap — nothing is accountable yet, so a condition lasting four
+		// attempts is still delivered on the fifth — and one attempt on each of
+		// the maxDrainCycles accountable laps after it. Eight wire attempts,
+		// against the twenty a full cycle per lap costs, and no lap that the drop
+		// rule is not already spending is ever shortened, warm sink or cold.
+		if attempt >= stuckAfterAttempts || (accountable && responded) {
+			s.stuckResponded = responded
 			s.log.Warn("buffered export still failing, requeueing", "signal", s.kind, "error", err, "attempts", attempt)
 			return sendStuck
 		}

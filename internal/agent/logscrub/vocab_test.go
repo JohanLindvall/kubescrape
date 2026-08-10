@@ -20,7 +20,8 @@ func TestSecretKVRegexSourceIsPinned(t *testing.T) {
 		`|` + asciiFold("secret") + `|` + asciiFold("password") + `|` + asciiFold("passwd") +
 		`|` + asciiFold("pwd") + `|` + asciiFold("token") +
 		`|` + asciiFold("access") + `[_-]?` + asciiFold("key") +
-		`)` + handSuffix + `["\']?\s*[:=]\s*)(?:(")[^"]+|(')[^']+|[^\s"\'&,;}\])]+)`
+		`)` + handSuffix + `(?:\\?["\'])?\s*[:=]\s*)` +
+		`(?:(\\")(?:[^"\\]|\\[^"])+|(\\')(?:[^'\\]|\\[^'])+|(")(?:[^"\\]|\\[\s\S])+|(')(?:[^'\\]|\\[\s\S])+|(?:[^\s"\'&,;}\])\\]|\\[^"\'])+)`
 	if got := builtins["secret-kv"].re.String(); got != want {
 		t.Fatalf("table-derived secret-kv regex drifted from the pinned hand-written source:\n got:  %s\nwant: %s", got, want)
 	}

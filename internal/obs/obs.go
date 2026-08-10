@@ -311,6 +311,13 @@ var (
 			"sender worth finding.", "reason")
 	IngestRejected = Registry.Counter("kubescrape_ingest_rejected_total",
 		"Pushed OTLP requests refused because a receiver admission bound was reached — concurrent in-flight pushes or buffered payload bytes (retryable: 429 / ResourceExhausted).")
+	IngestReserveExpired = Registry.Counter("kubescrape_ingest_reserve_expired_total",
+		"gRPC pre-decode buffer reservations reclaimed because the peer sent no message inside the decode "+
+			"window; the reclaim also cancels that stream (the sender sees Canceled, which OTLP lists as "+
+			"retryable). Deliberately NOT kubescrape_ingest_rejected_total: nothing was refused and the budget "+
+			"had room, so folding the two would let one headers-only prober, at zero cost in bytes, drive the "+
+			"rate an operator scales the node on. A sustained rate here is one slow or probing sender on a "+
+			"listener nothing authenticates.")
 	IngestReservedStripped = Registry.CounterVec("kubescrape_ingest_reserved_stripped_total",
 		"Attribute occurrences removed at first receipt because a sender shipped a key reserved for "+
 			"kubescrape's own plumbing, by key — the namespace router's script marker (honored on a resource "+

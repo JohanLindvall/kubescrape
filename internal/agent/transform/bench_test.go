@@ -63,6 +63,13 @@ func BenchmarkTransformLogRecord(b *testing.B) {
 	b.Run("touch-body", func(b *testing.B) {
 		run(b, "logs: |\n  def transform(batch):\n      for r in batch:\n          if \"teapot\" in r.body:\n              pass\n")
 	})
+	// `+` is not an operator here: bounding it means it compiles to a call to
+	// the guard in limits.go (rewrite.go), which is the only construct in this
+	// package that got SLOWER for the sake of not being able to allocate 2 GiB
+	// in 74 steps. This is what that costs on the most common shape.
+	b.Run("concat-body", func(b *testing.B) {
+		run(b, "logs: |\n  def transform(batch):\n      for r in batch:\n          r.body = \"[t] \" + r.body\n")
+	})
 }
 
 // discardExp forwards nothing: the wrapper benchmarks below measure the seam,

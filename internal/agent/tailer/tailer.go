@@ -636,9 +636,11 @@ func (t *Tailer) sweep(ctx context.Context, all bool) {
 		if f.traces != nil {
 			_ = f.traces.FlushBefore(ctx, fc)
 		}
-		if len(t.batch) >= t.cfg.BatchSize {
-			t.flush(ctx)
-		}
+		// The backstop for entries the age-out flushes above emitted; the ones
+		// consume feeds are checked against the threshold per RECORD, where
+		// they are added. A rewind here needs no handling: this file's
+		// iteration is over.
+		_ = t.maybeFlush(ctx, f)
 	}
 	if t.hopsUnsaved {
 		// One save for every rotation this sweep handled, instead of one per

@@ -16,10 +16,30 @@ import "strings"
 // The QoS segment is absent for Guaranteed pods; container scopes may be
 // prefixed cri-containerd-, crio- or docker-. Unrecognized segments yield
 // empty results.
+func Identity(id string) (podUID, containerID string) {
+	podUID, containerID, _ = Parse(id)
+	return podUID, containerID
+}
+
+// Parse is Identity plus the SHAPE of the path: podContainer reports that the
+// segment the container ID came from is the pod segment's IMMEDIATE child and
+// the path's LAST segment — the layout every runtime uses for a container of
+// that pod, and nothing deeper.
+//
+// `podUID != "" && containerID != ""` does NOT imply it, which is why the flag
+// exists: any descendant of a pod slice carrying a hex-looking tail satisfies
+// that pair, so a caller deciding what a row DESCRIBES (cadvisor's sandbox
+// detection) would otherwise read a runtime helper cgroup parked beside the
+// containers as one of them. It is deliberately a SHAPE verdict and nothing
+// more — the last segment's prefix is not vetted, so CRI-O's
+// crio-conmon-<containerID>.scope, which really is an immediate child of the pod
+// slice, still reports true; a caller that must exclude it needs evidence the
+// path does not carry (see isSandbox in internal/agent/promscrape).
 //
 // Runs once per cadvisor sample, so the path is walked in place (substring
 // slices) rather than split into an allocated segment slice.
-func Identity(id string) (podUID, containerID string) {
+func Parse(id string) (podUID, containerID string, podContainer bool) {
+	segs, podSeg, cidSeg := 0, -1, -1
 	for start := 0; start < len(id); {
 		var seg string
 		if i := strings.IndexByte(id[start:], '/'); i >= 0 {
@@ -32,6 +52,11 @@ func Identity(id string) (podUID, containerID string) {
 		if seg == "" {
 			continue
 		}
+		// Empty segments are skipped above, so the index counted here is the one
+		// "immediate child" must be measured in: "/kubepods//pod<uid>//<cid>" is
+		// the same path as its single-slash spelling.
+		idx := segs
+		segs++
 		seg = strings.TrimSuffix(seg, ".slice")
 		seg = strings.TrimSuffix(seg, ".scope")
 
@@ -39,7 +64,7 @@ func Identity(id string) (podUID, containerID string) {
 		// "kubepods-<qos>-pod<uid_with_underscores>" (systemd).
 		if i := strings.LastIndex(seg, "pod"); i >= 0 {
 			if uid := strings.ReplaceAll(seg[i+3:], "_", "-"); IsPodUID(uid) {
-				podUID = uid
+				podUID, podSeg = uid, idx
 				continue
 			}
 		}
@@ -50,10 +75,10 @@ func Identity(id string) (podUID, containerID string) {
 			cand = cand[i+1:]
 		}
 		if IsContainerID(cand) {
-			containerID = cand
+			containerID, cidSeg = cand, idx
 		}
 	}
-	return podUID, containerID
+	return podUID, containerID, podSeg >= 0 && cidSeg == podSeg+1 && cidSeg == segs-1
 }
 
 // IsPodUID matches the canonical UID form 8-4-4-4-12 (hex and dashes).

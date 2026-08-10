@@ -26,6 +26,12 @@ type sdSource struct {
 // openJournal opens the journal positioned just after afterCursor, or at the
 // tail when afterCursor is empty. It is the default Reader.open.
 func openJournal(cfg Config, afterCursor string) (source, error) {
+	// A journal with no journal files under it opens FINE and then never
+	// yields an entry, so the only report of a missing mount is this one
+	// (journalfiles.go). It sits here rather than in New because this is the
+	// function that decides which directories are read — and because tests
+	// inject their own source and must not probe the host's journal.
+	warnIfJournalEmpty(cfg)
 	var (
 		j   *sdjournal.Journal
 		err error

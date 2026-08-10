@@ -54,6 +54,13 @@ func (r *Reader) ingest(ctx context.Context, e *corev1.Event) {
 	obs.EventsObserved.WithLabelValues(eventTypeLabel(e.Type)).Inc()
 }
 
+// eventTypeLabels is every value eventTypeLabel can return, so publishMetrics
+// can give each of them a series at zero. TestEventTypeLabelsAreComplete keeps
+// the two in step: a value missing here is a series that appears only once the
+// cluster happens to produce it, which is the absent-vs-zero defect the
+// publication exists to close.
+var eventTypeLabels = []string{"normal", "warning", "other"}
+
 // eventTypeLabel collapses Event.Type to the two documented values plus
 // "other". It is the only obs label populated from cluster data, and the
 // core/v1 create path does not enforce the Normal/Warning validation — while

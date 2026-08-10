@@ -222,6 +222,11 @@ func (b bound) observe(v float64) {
 	b.s.observePreHashed(b.lbls, b.hash, b.check, v, emptyResource)
 }
 
+// materialize creates this label set's series at zero (see series.materialize).
+func (b bound) materialize() {
+	b.s.materialize(b.lbls, b.hash, b.check)
+}
+
 // Value returns the current sum across the bound label set's samples (for
 // tests and debugging).
 func (b bound) Value() float64 {
@@ -255,6 +260,25 @@ func (g *RegGauge) Set(v float64) { g.observe(v) }
 // vec resolves label values to bound wrappers, caching the WRAPPER per value
 // tuple so a repeated WithLabelValues on the hot path (e.g. a per-log-record
 // counter) neither rebuilds the label set nor allocates the returned pointer.
+//
+// BINDING A LABEL SET CREATES ITS SERIES, at zero (series.materialize). Callers
+// bind up front precisely to say "these outcomes exist in this process" —
+// tailbuffer resolves one pair per configured tail-sampling policy from
+// Evaluator.Names(), logenrich one per enrich format — and until this, that
+// statement had no effect on the wire: the series still appeared only when the
+// outcome first occurred, so "policy X kept nothing" read exactly like "policy
+// X is not configured", which is the ambiguity those call sites (and the metric
+// help texts) claim to remove. The materialization is per value tuple and
+// happens on the cold cache-miss path, so a hot-path bump is unchanged.
+//
+// BINDING is the right moment for it and REGISTRATION is not, which is why
+// Registry.Counter/Gauge keep publishing nothing until they are used: obs
+// registers every metric of both binaries unconditionally at package init, so
+// materializing there would have the metadata service publish a zero for every
+// ingest, tailer and tail-sampling counter it does not have a code path for —
+// "this never happened" asserted about a feature that is not in this process.
+// A vec's label values are bound by the feature's own constructor, so they are
+// a statement about what THIS process is configured to do.
 type vec[W any] struct {
 	s    *series
 	keys []string
@@ -298,7 +322,9 @@ func (v *vec[W]) with(vals []string) *W {
 				lbls = lbls.set(k, vals[i])
 			}
 		}
-		w = v.wrap(newBound(v.s, lbls))
+		b := newBound(v.s, lbls)
+		b.materialize()
+		w = v.wrap(b)
 		if v.cache == nil {
 			v.cache = make(map[string]*W)
 		}

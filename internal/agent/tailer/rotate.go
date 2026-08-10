@@ -55,12 +55,12 @@ func (t *Tailer) drainReader(ctx context.Context, f *file, r io.Reader, what str
 		n, err := r.Read(buf)
 		if n > 0 {
 			drained += int64(n)
-			// Bypass the rate limit: pausing a drain would lose the remainder
-			// when the fd is dropped.
+			// Drain mode: the rate limit is bypassed (pausing would lose the
+			// remainder when the fd is dropped) and consume does not flush —
+			// this is the drain's own flush point, paired with the rewind check
+			// the drain has to make.
 			t.ingestChunk(ctx, f, buf[:n], true)
-			before := f.readPos
-			t.flushDuringDrain(ctx)
-			if f.readPos < before {
+			if t.maybeFlush(ctx, f) {
 				return false // flush failed and rewound the drained fd
 			}
 		}
@@ -92,15 +92,6 @@ func (t *Tailer) drainReader(ctx context.Context, f *file, r io.Reader, what str
 	}
 	t.log.Error("source still yielding after draining 1GiB, abandoning remainder", "path", f.path, "source", what)
 	return true
-}
-
-// flushDuringDrain keeps a large drain from accumulating everything into one
-// batch (and one OTLP payload, likely over the collector's receive limit) and
-// from starving the sweep for the drain's whole duration.
-func (t *Tailer) flushDuringDrain(ctx context.Context) {
-	if len(t.batch) >= t.cfg.BatchSize {
-		t.flush(ctx)
-	}
 }
 
 // reopen switches to the file now at the path and resets the byte position so
@@ -652,9 +643,7 @@ func (t *Tailer) replaySegment(ctx context.Context, f *file, p *segment) bool {
 		}
 		// Ship what has accumulated rather than holding a whole rotated file
 		// in one payload (which the collector would likely reject anyway).
-		gen := f.rewindGen
-		t.flushDuringDrain(ctx)
-		if f.rewindGen != gen {
+		if t.maybeFlush(ctx, f) {
 			// The flush FAILED and rewound the file: the pipeline was purged,
 			// so every line this pass already fed is gone unemitted. Reading
 			// on from the unrewound fd would leave that prefix owed while the
@@ -851,8 +840,13 @@ func (t *Tailer) drainGone(ctx context.Context, f *file) {
 		// (consume already ran, so pending holds no newline: it IS one
 		// unterminated line.)
 		if f.discarding {
-			// The tail of an oversized discarded line: not a record.
+			// The tail of an oversized discarded line: not a record, so no
+			// entry will ever commit its bytes. Record the boundary the
+			// frontier may cross to (file.skipEnd) like every other never-fed
+			// line, so the flush of this drain's own entries carries the
+			// checkpoint over it.
 			f.discarding = false
+			f.skipEnd = f.readPos
 		} else {
 			t.feedLine(ctx, f, string(f.pending), f.lineStart, f.readPos)
 		}

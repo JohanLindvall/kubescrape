@@ -71,8 +71,16 @@ func TestRunsWorkAndStopsOnCancel(t *testing.T) {
 	}
 	mu.Lock()
 	defer mu.Unlock()
-	if len(leading) == 0 || !leading[0] {
-		t.Fatalf("leadership transitions = %v, want a leading=true first", leading)
+	// The state is published DOWN before competing (so the gauge exists on a
+	// replica that never wins), then up on acquisition, then down on the stop.
+	want := []bool{false, true, false}
+	if len(leading) != len(want) {
+		t.Fatalf("leadership reports = %v, want %v", leading, want)
+	}
+	for i := range want {
+		if leading[i] != want[i] {
+			t.Fatalf("leadership reports = %v, want %v", leading, want)
+		}
 	}
 }
 
@@ -113,7 +121,7 @@ func TestNeverLedReportsNoLoss(t *testing.T) {
 			AcquireTime:          &metav1.MicroTime{Time: time.Now()},
 		},
 	})
-	var transitions atomic.Int32
+	var ledReports, lostReports atomic.Int32
 	var ranWork atomic.Bool
 	cfg := Config{
 		Client: client, Namespace: "monitoring", Name: "kubescrape-cluster-leader",
@@ -121,7 +129,13 @@ func TestNeverLedReportsNoLoss(t *testing.T) {
 		// Long enough that the held lease never looks expired during the test.
 		LeaseDuration: 30 * time.Second, RenewDeadline: 20 * time.Second, RetryPeriod: 100 * time.Millisecond,
 		OnStarted: func(ctx context.Context) { ranWork.Store(true); <-ctx.Done() },
-		OnLeading: func(bool) { transitions.Add(1) },
+		OnLeading: func(v bool) {
+			if v {
+				ledReports.Add(1)
+			} else {
+				lostReports.Add(1)
+			}
+		},
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -138,8 +152,67 @@ func TestNeverLedReportsNoLoss(t *testing.T) {
 	if ranWork.Load() {
 		t.Fatal("leader-only work ran without the lease")
 	}
-	if got := transitions.Load(); got != 0 {
-		t.Fatalf("a replica that never led reported %d leadership transitions, want 0", got)
+	if got := ledReports.Load(); got != 0 {
+		t.Fatalf("a replica that never led reported leading=true %d times, want 0", got)
+	}
+	// It reports DOWN exactly once, at the start: the gauge must exist (0) on a
+	// replica that is participating without winning, and a repeat per election
+	// round would be a lease LOSS it never had.
+	if got := lostReports.Load(); got != 1 {
+		t.Fatalf("a replica that never led reported leading=false %d times, want exactly the one initial publication", got)
+	}
+}
+
+// kubescrape_leader is documented with "sum != 1 means split brain or nobody
+// leading", and the nobody-leading half of that alert cannot fire unless a
+// non-leader exports the series at all: a gauge only ever Set on acquisition is
+// ABSENT on every replica that has not won, so a fleet with zero leaders and a
+// fleet with zero replicas render identically. Run therefore publishes the down
+// state before the first lease operation — and, being sequenced before le.Run,
+// before anything can report up.
+func TestLeadingStateIsPublishedBeforeCompeting(t *testing.T) {
+	client := fake.NewSimpleClientset()
+	var published, publishedAtFirstLeaseOp, firstReport atomic.Bool
+	var once sync.Once
+	client.PrependReactor("*", "leases", func(ktesting.Action) (bool, runtime.Object, error) {
+		once.Do(func() { publishedAtFirstLeaseOp.Store(published.Load()) })
+		return false, nil, nil // fall through to the default reactor
+	})
+
+	started := make(chan struct{})
+	cfg := testConfig(func(ctx context.Context) { close(started); <-ctx.Done() })
+	cfg.Client = client
+	var reportOnce sync.Once
+	cfg.OnLeading = func(v bool) {
+		reportOnce.Do(func() { firstReport.Store(v) })
+		published.Store(true)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- Run(ctx, cfg) }()
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		cancel()
+		t.Fatal("never acquired the lease")
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Run: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not return")
+	}
+
+	if !publishedAtFirstLeaseOp.Load() {
+		t.Fatal("the leadership state was not published before the first lease operation: a replica that never wins " +
+			"the election exports no series at all, and 'nobody is leading' is then indistinguishable from 'nobody is deployed'")
+	}
+	if firstReport.Load() {
+		t.Fatal("the first report was leading=true; the pre-election publication must be the DOWN state")
 	}
 }
 

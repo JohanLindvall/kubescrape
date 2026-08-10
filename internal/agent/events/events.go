@@ -160,17 +160,21 @@ type Reader struct {
 	// flushWarned rate-limits the export-failure warning to flushWarnEvery;
 	// obs.LogExportFailures carries the magnitude.
 	flushWarned time.Time
-	// replaying is set while the current stream is a full-backlog replay (it
-	// started from ""), which is the ONLY situation in which the watermark
-	// filter belongs: a replay re-sends events already exported, a positioned
-	// or live stream never does. See wanted.
+	// replaying is set while the current stream is consuming the REPLAY LIST —
+	// the backlog re-read that recovers a position we no longer have (see
+	// replayBacklog). That is the ONLY situation in which the watermark filter
+	// belongs: a replay re-reads events already exported, a positioned or live
+	// watch never does. See wanted.
 	//
 	// It is per-STREAM and is NOT cleared by a commit. Clearing it there
 	// disarmed the filter after the first acked batch — a couple of seconds
 	// into a replay that delivers the whole event TTL — so the rest of the
 	// backlog re-exported as duplicates, each Pod event costing a PodByName
-	// lookup. The next stream is positioned by the committed resourceVersion
-	// and starts false on its own.
+	// lookup. It IS cleared when the last page has been read: everything the
+	// watch that follows delivers is newer than the list's snapshot, and
+	// filtering THAT against a boundary frozen at stream start drops, for the
+	// rest of the watch, every event from a reporter whose clock trails it by
+	// more than replaySlack.
 	replaying bool
 	// replayFrom is the watermark the CURRENT replay filters against, frozen
 	// when the stream started.
@@ -191,9 +195,9 @@ type Reader struct {
 	// same thing — we do not know where the last delivery stopped — and a
 	// replay is the only answer to that which cannot lose the gap.
 	relist bool
-	// replaySecured: the current replay's backlog is known FULLY delivered —
-	// a bookmark applied, and the API server only sends bookmarks once the
-	// watcher is caught up. Trivially true for a positioned or live stream.
+	// replaySecured: the current replay's backlog is known FULLY exported, so
+	// the position may advance again. Trivially true for a positioned or live
+	// stream, and for a Reader that has not started one (New).
 	//
 	// While a replay is unsecured, settle HOLDS the position: the backlog
 	// arrives in STORE order, so no commit made mid-replay bounds what is
@@ -205,7 +209,33 @@ type Reader struct {
 	// heldWatermark instead and folds in when the replay secures; the cost
 	// of a death mid-replay is a full re-replay — duplicates, which
 	// at-least-once already tolerates, instead of loss.
+	//
+	// THE SECURING CONDITION IS OURS, NOT THE API SERVER'S. It used to be a
+	// watch BOOKMARK, on the theory that one arrives once the watcher is caught
+	// up. Bookmarks are discretionary by contract — "Servers that do not
+	// implement bookmarks may ignore this flag ... nor may [clients] assume the
+	// server will send any BOOKMARK event during a session"
+	// (metav1.ListOptions.AllowWatchBookmarks) — and for core/v1 events
+	// kube-apiserver serves the watch straight from etcd, with no watch cache,
+	// which is where bookmarks come from. So none ever arrived: after the FIRST
+	// relist the hold was permanent, the position ConfigMap never advanced
+	// again, and every restart replayed the whole event TTL, forever. The
+	// backlog is a paginated LIST now (replayBacklog) and its exhaustion plus
+	// replayOwed == 0 is the proof — a fact this process observes rather than a
+	// signal it waits for. A bookmark, where a cluster does send one, still
+	// secures: it is a strictly stronger statement.
 	replaySecured bool
+	// replayRV is the revision of the LIST snapshot the current replay read. A
+	// consistent list returns every event that existed at that revision, and
+	// the watch that follows starts there, so it is a hard boundary: the
+	// position the replay commits when it secures. The maximum over ingested
+	// items cannot be that boundary — a list arrives in KEY order.
+	replayRV string
+	// replayOwed is how many LEADING batch entries came from the replay list
+	// and have not settled yet. Entries are appended in order and the batch is
+	// emptied before the list starts, so the owed ones are always a prefix;
+	// settle and shedOldest are the only things that remove them.
+	replayOwed int
 	// heldWatermark is the wall-clamped high-water of what unsecured-replay
 	// flushes exported, folded into the committed watermark by secureReplay.
 	// It survives stream restarts: it only ever names exported entries.
@@ -253,7 +283,58 @@ func New(cfg Config) *Reader {
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
 	}
-	return &Reader{cfg: cfg, log: cfg.Logger, now: time.Now}
+	// replaySecured starts TRUE: no replay is in flight, so nothing holds the
+	// position. The zero value would hold every commit of a Reader whose stream
+	// never ran (every direct-drive test, and the window before the first
+	// stream() call).
+	return &Reader{cfg: cfg, log: cfg.Logger, now: time.Now, replaySecured: true}
+}
+
+// Stage labels for obs.EventRelists / obs.EventGapDiscarded: WHERE the
+// resourceVersion was found to have aged out. They are metric label VALUES, so
+// the set is named once here rather than spelled at each call site, and
+// publishMetrics gives every one of them a series.
+const (
+	stageWatch  = "watch"  // the watch itself returned Gone / Expired
+	stageReplay = "replay" // a paginated backlog list lost its snapshot mid-walk
+)
+
+// Op labels for obs.EventPositionErrors.
+const (
+	opLoad = "load"
+	opSave = "save"
+)
+
+// publishMetrics gives every counter this pipeline owns a series at zero, so
+// ABSENT means "this replica is not running the events reader" (it does not
+// hold the lease) and 0 means "running, nothing has happened". Without it a
+// pipeline that has never lost, dropped or relisted anything is
+// indistinguishable from one that is not there — and every alert written
+// against those counters silently matches nothing on a healthy leader, which
+// is precisely when the operator wants to see the zero.
+//
+// It runs from Run, i.e. exactly when the reader RUNS, following
+// obs.RegisterSelfMetadata's rule: a follower replica must NOT publish a flat
+// zero export rate it is not responsible for.
+func publishMetrics() {
+	obs.EventsExported.Add(0)
+	obs.EventsDropped.Add(0)
+	obs.EventsDroppedRecords.Add(0)
+	obs.EventsOverflowDropped.Add(0)
+	obs.EventWatchRestarts.Add(0)
+	for _, t := range eventTypeLabels {
+		obs.EventsObserved.WithLabelValues(t).Add(0)
+	}
+	for _, stage := range []string{stageWatch, stageReplay} {
+		obs.EventRelists.WithLabelValues(stage).Add(0)
+	}
+	// Only the WATCH stage can discard a gap: a replay-stage expiry always has
+	// a relist to fall back on, being one already. Publishing a series that
+	// nothing can ever write would be its own small lie.
+	obs.EventGapDiscarded.WithLabelValues(stageWatch).Add(0)
+	for _, op := range []string{opLoad, opSave} {
+		obs.EventPositionErrors.WithLabelValues(op).Add(0)
+	}
 }
 
 // ValidateStartMode reports an unknown start mode.
@@ -268,6 +349,7 @@ func ValidateStartMode(mode string) error {
 // Run watches until ctx is done, then flushes and persists what it has. It is
 // the leader-only work: it must return when ctx is cancelled.
 func (r *Reader) Run(ctx context.Context) {
+	publishMetrics()
 	r.loadPosition(ctx)
 	bo := backoff.New(r.cfg.RestartBackoff)
 	for ctx.Err() == nil {
@@ -388,7 +470,7 @@ func (r *Reader) loadPosition(ctx context.Context) {
 		// RE-READS rather than skipping every file to its end as history. An
 		// explicit `end` or `start` is the operator naming a cold-start policy
 		// outright and is honoured.
-		obs.EventPositionErrors.WithLabelValues("load").Inc()
+		obs.EventPositionErrors.WithLabelValues(opLoad).Inc()
 		r.relist = r.cfg.StartMode == StartAuto
 		r.log.Warn("event position unreadable", "error", err,
 			"startMode", r.cfg.StartMode, "replayingBacklog", r.relist)
@@ -400,15 +482,15 @@ func (r *Reader) loadPosition(ctx context.Context) {
 
 // stream establishes one watch and consumes it until it ends.
 func (r *Reader) stream(ctx context.Context) error {
-	rv, redelivers, err := r.startResourceVersion(ctx)
+	start, err := r.startResourceVersion(ctx)
 	if err != nil {
 		return err
 	}
-	// An empty resourceVersion replays the whole TTL backlog (a relist, or a
-	// cold start-from-beginning); anything else is positioned exactly by the
-	// API server and delivers only what follows.
-	r.replaying = rv == ""
-	r.replaySecured = !r.replaying
+	// A replay re-reads the backlog by LIST before the watch; anything else is
+	// positioned exactly by the API server and delivers only what follows.
+	r.replaying = start.replay
+	r.replaySecured = !start.replay
+	r.replayRV, r.replayOwed = "", 0
 	// Snapshot, not a live read: see replayFrom.
 	//
 	// With SLACK, because the boundary is a maximum over timestamps written by
@@ -424,10 +506,12 @@ func (r *Reader) stream(ctx context.Context) error {
 	if !r.replayFrom.IsZero() {
 		r.replayFrom = r.replayFrom.Add(-replaySlack)
 	}
-	if redelivers && len(r.batch) > 0 {
-		// Everything buffered is AFTER rv (entries only outlive a flush that
-		// failed, and the position never advanced past them), so this watch
-		// re-sends every one of them. Keeping the batch would duplicate the
+	if start.redelivers && len(r.batch) > 0 {
+		// Everything buffered is AFTER the resume point (entries only outlive a
+		// flush that failed, and the position never advanced past them), so
+		// this stream delivers every one of them again — a positioned watch
+		// re-sends them, and a replay's list snapshot still contains them.
+		// Keeping the batch would duplicate the
 		// whole backlog once per restart and grow memory without bound across
 		// a long collector outage; dropping it loses nothing — the entries
 		// are re-ingested from the re-delivery. Only the cold skip-backlog
@@ -444,16 +528,23 @@ func (r *Reader) stream(ctx context.Context) error {
 		r.rendered = 0
 		r.pendingRV = "" // a bookmark from the dead stream vouches only for its own deliveries
 	}
+	rv := start.rv
+	if start.replay {
+		if rv, err = r.replayBacklog(ctx); err != nil {
+			return err
+		}
+	}
 	w, err := r.cfg.Client.CoreV1().Events(r.cfg.Namespace).Watch(ctx, metav1.ListOptions{
 		ResourceVersion: rv,
 		// Bookmarks advance the resourceVersion on an idle cluster, so the
 		// persisted position stays inside the API server's watch window and a
-		// restart resumes instead of falling back to a relist.
+		// restart resumes instead of falling back to a relist. Nothing DEPENDS
+		// on one arriving — see replaySecured; for core/v1 events none does.
 		AllowWatchBookmarks: true,
 	})
 	if err != nil {
 		if isExpired(err) {
-			r.expire("watch")
+			r.expire(stageWatch)
 			return fmt.Errorf("watch from %q expired: %w", rv, err)
 		}
 		return err
@@ -484,14 +575,27 @@ func (r *Reader) stream(ctx context.Context) error {
 	}
 }
 
-// startResourceVersion resolves where this watch begins: the committed
-// position, or the start policy on a cold start. redelivers reports whether
-// the new watch re-sends everything the reader has already buffered — true
-// for every path except the cold skip-the-backlog List, whose revision is
-// AFTER anything currently batched.
-func (r *Reader) startResourceVersion(ctx context.Context) (rv string, redelivers bool, err error) {
+// startPoint is where one stream begins.
+type startPoint struct {
+	// rv positions the watch. It is empty only when replay is set, and then it
+	// is replayBacklog that resolves the revision the watch actually starts at.
+	rv string
+	// redelivers reports whether the new stream re-sends everything the reader
+	// has already buffered — true for every path except the cold
+	// skip-the-backlog List, whose revision is AFTER anything currently
+	// batched.
+	redelivers bool
+	// replay reports that the backlog must be re-read before the watch,
+	// because the position we would have watched from is gone (or was never
+	// taken). See replayBacklog.
+	replay bool
+}
+
+// startResourceVersion resolves where this stream begins: the committed
+// position, a replay of the backlog, or the start policy on a cold start.
+func (r *Reader) startResourceVersion(ctx context.Context) (startPoint, error) {
 	if r.committed.ResourceVersion != "" {
-		return r.committed.ResourceVersion, true, nil
+		return startPoint{rv: r.committed.ResourceVersion, redelivers: true}, nil
 	}
 	if r.relist {
 		// Recovering from a Gone, not starting cold: replay everything the API
@@ -501,13 +605,13 @@ func (r *Reader) startResourceVersion(ctx context.Context) (rv string, redeliver
 		// version and now — precisely the window a relist exists to cover.
 		// The flag is NOT consumed here: a watch attempt that fails before
 		// the replay is secured must relist again, or the gap is lost after
-		// all — it clears only when a BOOKMARK proves the backlog fully
-		// delivered (secureReplay; settle holds all commits until then).
-		return "", true, nil
+		// all — it clears only once the whole backlog has been exported
+		// (secureReplay; settle holds all commits until then).
+		return startPoint{redelivers: true, replay: true}, nil
 	}
 	if r.cfg.StartMode == StartBeginning {
-		// "" replays everything the API server still holds (the event TTL).
-		return "", true, nil
+		// Replay everything the API server still holds (the event TTL).
+		return startPoint{redelivers: true, replay: true}, nil
 	}
 	if r.seenRV != "" {
 		// A stream that already ran in this process resumes where it stopped.
@@ -525,24 +629,187 @@ func (r *Reader) startResourceVersion(ctx context.Context) (rv string, redeliver
 		// branch below. seenRV is deliberately NOT persisted: the ConfigMap
 		// position stays strictly ack-gated, and this only closes the
 		// in-process gap.
-		return r.seenRV, false, nil
+		return startPoint{rv: r.seenRV}, nil
 	}
 	// Skip the backlog: take a resourceVersion without the items. Persisting
 	// this later is legitimate — everything after it is either exported or
 	// replayed — but nothing before it was ever consumed.
 	list, err := r.cfg.Client.CoreV1().Events(r.cfg.Namespace).List(ctx, metav1.ListOptions{Limit: 1})
 	if err != nil {
-		return "", false, err
+		return startPoint{}, err
 	}
 	r.log.Info("starting events at the current revision", "resourceVersion", list.ResourceVersion)
 	r.seenRV = list.ResourceVersion
-	return list.ResourceVersion, false, nil
+	return startPoint{rv: list.ResourceVersion}, nil
+}
+
+// replayPageSize bounds one backlog page. The backlog is a whole --event-ttl
+// window (an hour by default) and can be six figures on a busy cluster, so it
+// is paged rather than materialised whole: the singleton runs against a 256Mi
+// limit and one unbounded List response would be the OOM the retained-batch cap
+// exists to prevent, arriving before a single entry is exported. It matches
+// client-go's reflector default.
+const replayPageSize = 500
+
+// replayBacklog re-reads the events the watch cannot position us into and
+// returns the revision the watch that follows must start at.
+//
+// WHY A LIST AND NOT A WATCH FROM "". A watch started at "" delivers the same
+// backlog as synthetic ADDED events, and that is what this used to do — but
+// those events arrive in STORE order carrying their own arbitrary revisions,
+// and the stream never says where the backlog ENDS. So the position had to be
+// held (see replaySecured) until something proved the watcher caught up, and
+// the only such signal the API offers is a BOOKMARK, which for core/v1 events
+// never comes. A List answers both questions itself: it TERMINATES (an empty
+// Continue), and its snapshot revision is a boundary no item can exceed.
+//
+// The order the pages arrive in still tells us nothing, so the position stays
+// held for the whole walk and until every listed entry has been exported —
+// what changed is that the release is now reachable.
+//
+// WHY NOT client-go's pager.ListPager, which is in the module already. It pages
+// exactly like this; the one behaviour it adds is FullListIfExpired, which
+// recovers a compacted continue token by re-issuing the List UNPAGED — the
+// single unbounded response the paging exists to prevent (a whole --event-ttl
+// window materialised at once against the singleton's 256Mi limit). With that
+// off it returns the same error this loop already handles, and its per-ITEM
+// callback hides the page boundary where the continue token, the snapshot
+// revision and the interleaved flush all live. Hand-rolled deliberately.
+//
+// THE COST OF THE LIST-THEN-WATCH SHAPE, accepted rather than fixed: the watch
+// that follows is positioned at the FIRST page's snapshot, so the walk's own
+// duration is charged against the API server's compaction window — the old
+// watch-from-"" start had no such exposure, since it began at the CURRENT
+// revision. This is the shape client-go's own reflector uses, and the recovery
+// is the one it uses too: the watch fails Gone and expire arms another relist.
+// What keeps that from re-exporting the backlog lap after lap is the flush at
+// the END of this walk — a lap that COMPLETES commits the snapshot revision and
+// the watermark together, so the next lap's wanted() drops everything this one
+// shipped (bar the replaySlack window). A lap aborted mid-walk by the continue
+// token expiring commits nothing and does re-export, which is at-least-once
+// behaving as documented.
+func (r *Reader) replayBacklog(ctx context.Context) (string, error) {
+	// No ResourceVersion: a quorum read, so the snapshot is the most recent
+	// state and the watch that resumes from it cannot start behind one.
+	opts := metav1.ListOptions{Limit: replayPageSize}
+	pages, listed, kept := 0, 0, 0
+	for {
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
+		list, err := r.cfg.Client.CoreV1().Events(r.cfg.Namespace).List(ctx, opts)
+		if err != nil {
+			if isExpired(err) {
+				// The snapshot the continue token pins aged out mid-walk. The
+				// pages already read cannot be completed by a second snapshot
+				// (that one starts at a different revision), so the replay is
+				// abandoned and re-armed: expire counts it and keeps relist
+				// set, and what was already exported is filtered out of the
+				// next attempt by the watermark, exactly as after a Gone watch.
+				r.expire(stageReplay)
+			}
+			return "", fmt.Errorf("listing the event backlog: %w", err)
+		}
+		if r.replayRV == "" {
+			// Every page of a continued list is served from the FIRST page's
+			// snapshot, so this revision covers the whole walk.
+			r.replayRV = list.ResourceVersion
+		}
+		for i := range list.Items {
+			if r.replayItem(ctx, &list.Items[i]) {
+				kept++
+			}
+		}
+		listed += len(list.Items)
+		pages++
+		if list.Continue == "" {
+			break
+		}
+		if list.Continue == opts.Continue {
+			// A token that does not advance is a walk that never terminates,
+			// and this loop holds the single reader goroutine. It is an error
+			// rather than a break: breaking would secure the replay over a
+			// backlog only partly read, which is the silent loss the hold
+			// exists to prevent. A page COUNT limit would do the same to a
+			// legitimately huge backlog, so the guard is exactly "no progress".
+			return "", fmt.Errorf("the event backlog list repeated its continue token after %d pages", pages)
+		}
+		opts.Continue = list.Continue
+	}
+	if r.replayRV == "" {
+		// Without a boundary the watch could only be started at "" again, which
+		// is the unbounded backlog this function exists to replace, and nothing
+		// could ever secure the replay. Fail the stream instead: Run retries it
+		// with the relist still armed.
+		return "", errors.New("the event backlog list carries no resourceVersion; the watch after it cannot be positioned")
+	}
+	// The backlog is read: everything the watch delivers from here is NEWER
+	// than the snapshot, so the watermark filter must not touch it.
+	r.replaying = false
+	// Read the boundary out BEFORE securing, which consumes r.replayRV: the
+	// watch must be positioned at it, and returning the emptied field started
+	// the watch at "" — the unbounded server-side backlog this replaced.
+	rv := r.replayRV
+	r.noteSeen(rv)
+	// Flush the TAIL before the watch is established. The count trigger leaves
+	// up to flushAt entries behind on every walk, and the next opportunity to
+	// export them is the FlushInterval ticker inside the watch loop — i.e. only
+	// if establishing the watch succeeds, which is exactly the step the stale
+	// snapshot revision (see above) can fail. Owed entries there hold the
+	// position, so a Gone watch re-lapped the whole backlog with nothing
+	// committed and nothing filtering it. This is also what secures the replay
+	// on the ordinary path, and what makes an aborted lap terminate.
+	if len(r.batch) > 0 && r.flushDue() {
+		r.tryFlush(ctx)
+	}
+	r.log.Info("replayed the event backlog", "resourceVersion", rv,
+		"pages", pages, "listed", listed, "kept", kept, "awaitingExport", r.replayOwed)
+	// A backlog that was empty, entirely filtered, or already flushed secures
+	// right here — otherwise the flush that drains the last owed entry does it.
+	r.maybeSecureReplay()
+	return rv, nil
+}
+
+// replayItem consumes one backlog item, in the order the walk applies them: the
+// watermark filter, the ingest, the owed count, then the COUNT-triggered
+// export. It reports whether the item was kept.
+//
+// This walk BLOCKS the single reader goroutine, so the count trigger is the
+// only one there is until it returns: the FlushInterval ticker and persist both
+// live in the watch loop that has not started yet (persist would write nothing
+// anyway — every commit is held while the replay is unsecured). That is why the
+// trigger is flushAt rather than BatchSize, and why the tail flushes above.
+//
+// It is a method rather than the loop body it was so a test can drive the exact
+// mid-walk state — an export with `replaying` still set — that no other path
+// can produce: the flag is cleared before the watch opens, and driving a WATCH
+// event with it set would pin the filter to the watch path, which is precisely
+// where it must never be applied.
+func (r *Reader) replayItem(ctx context.Context, e *corev1.Event) bool {
+	if !r.wanted(e) {
+		return false
+	}
+	r.ingest(ctx, e)
+	// ingest may have SHED to make room, which already adjusted replayOwed;
+	// this entry is the newest and is always in the batch.
+	r.replayOwed++
+	if len(r.batch) >= r.flushAt() && r.flushDue() {
+		r.tryFlush(ctx)
+	}
+	return true
 }
 
 // expire drops the committed resourceVersion so the next stream relists,
 // keeping the watermark to filter the replay.
 func (r *Reader) expire(stage string) {
 	r.committed.ResourceVersion = ""
+	// The pending bookmark dies with the revision it was pending against, and
+	// this is the only path into a relist that could be carrying one (nothing
+	// else empties the committed revision). Carried into the replay, the first
+	// flush that empties the batch would apply it through settle's pending
+	// branch — which SECURES the replay, releasing the position hold over a
+	// backlog only partly read. TestExpiryClearsResourceVersionButKeepsWatermark
+	// pins it.
 	r.pendingRV = ""
 	// The revision aged out of the API server's watch window, so the
 	// in-process memory of it is dead too and must not be resumed from.
@@ -584,7 +851,7 @@ func (r *Reader) handle(ctx context.Context, ev watch.Event) error {
 	case watch.Error:
 		err := apierrors.FromObject(ev.Object)
 		if isExpired(err) {
-			r.expire("watch")
+			r.expire(stageWatch)
 		}
 		return fmt.Errorf("watch error: %w", err)
 	case watch.Bookmark:
@@ -615,15 +882,14 @@ func (r *Reader) handle(ctx context.Context, ev watch.Event) error {
 	if !ok {
 		return nil
 	}
-	// Before the wanted() filter: seenRV records where the STREAM is, which is
-	// true of a replayed event the watermark drops just as much as of one we
-	// keep. Recording it only for kept events would resume behind the filter.
+	// seenRV records where the STREAM is. Nothing filters here: every event a
+	// watch delivers is newer than the revision it was positioned at — the
+	// backlog is read by replayBacklog, not by the watch — and applying the
+	// watermark to a live stream drops, permanently and silently, every event
+	// from a reporter whose clock trails it (see wanted).
 	r.noteSeen(e.ResourceVersion)
-	if !r.wanted(e) {
-		return nil
-	}
 	r.ingest(ctx, e)
-	if len(r.batch) >= r.cfg.BatchSize && r.flushDue() {
+	if len(r.batch) >= r.flushAt() && r.flushDue() {
 		r.tryFlush(ctx)
 	}
 	return nil
@@ -634,8 +900,8 @@ const flushWarnEvery = time.Minute
 
 // flushDue reports whether the count trigger may attempt an export again. It
 // is unrestricted while flushes are landing; after a failure the batch stays
-// AT or above BatchSize (nothing settles), so the trigger holds for every
-// event that arrives and would re-export per event.
+// at or above flushAt (nothing settles), so the trigger holds for every event
+// that arrives and would re-export per event.
 func (r *Reader) flushDue() bool {
 	return r.flushFailedAt.IsZero() || time.Since(r.flushFailedAt) >= r.cfg.FlushInterval
 }
@@ -677,31 +943,28 @@ func (r *Reader) tryFlush(ctx context.Context) {
 	}
 }
 
-// wanted filters a REPLAYED event against the watermark. After a relist we
-// re-receive everything still within the TTL; the watermark drops what was
-// already exported. Timestamps come from the REPORTING component's clock, so
-// the comparison is biased toward re-emitting (at-least-once).
+// wanted filters a REPLAYED event against the watermark. A replay re-reads
+// everything still within the TTL; the watermark drops what was already
+// exported. Timestamps come from the REPORTING component's clock, so the
+// comparison is biased toward re-emitting (at-least-once).
 //
-// It applies ONLY while replaying. Event timestamps come from whichever
-// component reported the event, and a watch carries several — kubelet events
-// are second-truncated metav1.Time, scheduler and controller-manager events are
-// microsecond MicroTime — so on a live stream this dropped any event whose
-// reporter's clock trailed the watermark, permanently and silently. Worse, one
+// It applies ONLY to the backlog list, which is the only thing that can carry
+// an already-exported event. Event timestamps come from whichever component
+// reported the event, and a stream carries several — kubelet events are
+// second-truncated metav1.Time, scheduler and controller-manager events are
+// microsecond MicroTime — so applied to a WATCH this dropped any event whose
+// reporter's clock trailed the watermark, permanently and silently (noteSeen
+// has already advanced the resume point past it) and uncounted. Worse, one
 // component with a fast clock latched a FUTURE watermark, which is persisted in
 // the position ConfigMap: the blackout then survived restarts and leader
 // handover.
 //
-// And it stops at the SECURING BOOKMARK, not at the end of the stream. The
-// `replaying` flag is per-stream and deliberately survives a commit (see the
-// field), but a bookmark proves the backlog FULLY delivered — the same proof
-// settle already trusts to release the position hold, the strictly more
-// dangerous of the two — so what the stream delivers after it is LIVE. Keeping
-// the filter armed there is the live-stream drop above, one watch lifetime long
-// after every relist: replayFrom is frozen at stream start, so a reporter whose
-// clock trails it by more than replaySlack goes dark, silently (noteSeen has
-// already advanced the resume point past the event) and uncounted.
+// That is why the filter is scoped by `replaying`, which replayBacklog clears
+// the moment the last page is read, rather than by the stream's lifetime: the
+// watch that follows a replay is positioned at the list's snapshot and delivers
+// nothing the replay could already have carried.
 func (r *Reader) wanted(e *corev1.Event) bool {
-	if !r.replaying || r.replaySecured || r.replayFrom.IsZero() {
+	if !r.replaying || r.replayFrom.IsZero() {
 		return true
 	}
 	when := eventTime(e)
@@ -782,10 +1045,15 @@ func (r *Reader) settle(newest entry, covered int) {
 	// per involved object on the next flush and keeps a settled object's
 	// resource from outliving the entries that referenced it.
 	clear(r.resCache)
+	// The replay list's entries are the batch's LEADING ones, so a settled
+	// prefix retires exactly that many of them. Reaching zero with the walk
+	// finished is what secures the replay.
+	r.replayOwed -= min(covered, r.replayOwed)
+	r.maybeSecureReplay()
 	// See replaySecured: a mid-replay commit positions a restarted stream
 	// past backlog the store-order replay has not delivered yet, so the
-	// position holds until a bookmark proves the backlog complete.
-	unsecured := r.replaying && !r.replaySecured
+	// position holds until the whole backlog has been exported.
+	unsecured := !r.replaySecured
 	if !unsecured && newest.rv != "" && newerRV(newest.rv, r.committed.ResourceVersion) {
 		r.committed.ResourceVersion = newest.rv
 	}
@@ -811,7 +1079,7 @@ func (r *Reader) settle(newest entry, covered int) {
 		// watermark may now commit directly (recomputed below).
 		r.secureReplay()
 	}
-	unsecured = r.replaying && !r.replaySecured
+	unsecured = !r.replaySecured
 	// Clamp to wall clock first. The watermark is a running MAXIMUM over
 	// event timestamps written by whichever component reported each event,
 	// so one reporter with a fast clock would otherwise latch a boundary in
@@ -839,18 +1107,46 @@ func (r *Reader) settle(newest entry, covered int) {
 	}
 }
 
-// secureReplay marks the current replay's backlog fully delivered (a bookmark
-// applied — see replaySecured) and folds the held exported high-water into
-// the committed watermark. Idempotent; a no-op outside a replay.
+// maybeSecureReplay secures the replay once its backlog is fully accounted
+// for: the last page read (replaying cleared) and every entry it contributed
+// settled or shed. That is the securing condition the API server cannot give
+// us — see replaySecured.
+func (r *Reader) maybeSecureReplay() {
+	if r.replaySecured || r.replaying || r.replayOwed > 0 {
+		return
+	}
+	r.secureReplay()
+}
+
+// secureReplay marks the current replay's backlog fully exported: the position
+// may advance again, it advances to the LIST SNAPSHOT's revision (the boundary
+// no listed item can exceed, and where the following watch is positioned), and
+// the held exported high-water folds into the committed watermark. Idempotent;
+// a no-op outside a replay.
 func (r *Reader) secureReplay() {
 	if r.replaySecured && r.heldWatermark.IsZero() {
 		return
 	}
 	r.replaySecured = true
+	// The snapshot revision, not the maximum over the entries: a consistent
+	// list returned everything that existed at it, so committing it skips
+	// nothing — while the entry maximum would leave the position below events
+	// the list proved are already handled, and on an idle cluster the watch
+	// would age out of the API server's window again with nothing to advance
+	// it (the whole reason bookmarks exist).
+	if r.replayRV != "" && newerRV(r.replayRV, r.committed.ResourceVersion) {
+		r.committed.ResourceVersion = r.replayRV
+	}
+	r.replayRV, r.replayOwed = "", 0
 	if r.heldWatermark.After(r.committed.Watermark) {
 		r.committed.Watermark = r.heldWatermark
 	}
 	r.heldWatermark = time.Time{}
+	if r.committed.ResourceVersion != "" {
+		// A restart resumes from the position instead of relisting the full
+		// TTL again.
+		r.relist = false
+	}
 }
 
 // maxRetained bounds the batch across failed flushes, in entries.
@@ -883,6 +1179,22 @@ func (r *Reader) retainCap() int {
 	return min(max(maxRetained, 2*r.cfg.BatchSize), maxRetainedCeiling)
 }
 
+// flushAt is the batch length that triggers an export: BatchSize, clamped to
+// the retention cap because the batch can never grow past that.
+//
+// -events-batch-size has no upper bound, and the ceiling above stops retainCap
+// following it, so a BatchSize over maxRetainedCeiling made the raw count
+// trigger UNREACHABLE — the batch sat at the cap shedding the oldest entries
+// forever. On the watch path that was survivable (the FlushInterval ticker
+// flushes), but the backlog walk services no ticker: measured against a 30,000
+// event backlog, BatchSize=512 exported 29,696 while BatchSize=20000 exported
+// NOTHING and dropped 13,696 into kubescrape_events_overflow_dropped_total —
+// documented as outright loss — before the watch was even opened. Both paths
+// use this, so the trigger cannot be unreachable on either.
+func (r *Reader) flushAt() int {
+	return min(r.cfg.BatchSize, r.retainCap())
+}
+
 // shedChunk is how many entries one shed drops. Dropping exactly one per
 // admitted event made the shed O(batch): at the cap EVERY event sheds, and
 // each shed memmoved the whole post-prefix tail (measured 47.5 µs against
@@ -911,6 +1223,14 @@ func (r *Reader) shedOldest() {
 	copy(r.batch[i:], r.batch[i+n:])
 	clear(r.batch[len(r.batch)-n:])
 	r.batch = r.batch[:len(r.batch)-n]
+	// Shed entries the replay list contributed stop being OWED. They are
+	// counted loss and no export can ever carry them, so holding the position
+	// for them would wedge it exactly as waiting for a bookmark did — and the
+	// snapshot revision the replay commits is no less honest than the shed
+	// already is.
+	if r.replayOwed > i {
+		r.replayOwed -= min(i+n, r.replayOwed) - i
+	}
 	obs.EventsOverflowDropped.Add(float64(n))
 	if !r.overflowWarned {
 		r.overflowWarned = true
@@ -931,7 +1251,7 @@ func (r *Reader) persist(ctx context.Context, force bool) {
 	pos := r.committed
 	pos.Holder = hostname()
 	if err := r.cfg.Positions.Save(ctx, pos); err != nil {
-		obs.EventPositionErrors.WithLabelValues("save").Inc()
+		obs.EventPositionErrors.WithLabelValues(opSave).Inc()
 		r.log.Warn("writing the event position", "error", err)
 	}
 }

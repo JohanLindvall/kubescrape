@@ -51,7 +51,11 @@ type Config struct {
 	// Run waits for it before competing again, so that a flap can never leave
 	// two of them overlapping inside one process.
 	OnStarted func(ctx context.Context)
-	// OnLeading reports leadership transitions (a metric gauge, typically).
+	// OnLeading reports this replica's leadership STATE (a metric gauge,
+	// typically): false once as soon as Run starts competing, then true/false
+	// per transition. The leading edge of the first call is deliberate — see
+	// Run — so a gauge driven by this publishes 0 for a replica that has never
+	// led instead of nothing at all.
 	OnLeading func(bool)
 
 	Log *slog.Logger
@@ -120,6 +124,19 @@ func Run(ctx context.Context, cfg Config) error {
 	if err := cfg.defaults(); err != nil {
 		return err
 	}
+	// Publish the DOWN state before competing, so a gauge fed from OnLeading
+	// exists from the moment this replica starts participating. Without it a
+	// candidate that never wins exports no series at all, and the alert the
+	// metric is documented for — "sum != 1 means split brain or nobody
+	// leading" — cannot fire for the nobody-leading half: zero leaders and
+	// zero replicas look identical to a query that only ever sees the winner.
+	// Same rule as obs.RegisterSelfMetadata and the tail-sampling policy
+	// counters: registered exactly when the thing RUNS, so absent means "not
+	// participating" and 0 means "participating, not leading".
+	//
+	// It is safe to be a plain call rather than a transition: it happens-before
+	// le.Run, hence before any OnStartedLeading goroutine can report true.
+	cfg.OnLeading(false)
 	cfg.Log.Info("competing for leadership", "lease", cfg.Name, "namespace", cfg.Namespace, "identity", cfg.Identity)
 	for ctx.Err() == nil {
 		if err := elect(ctx, &cfg); err != nil {

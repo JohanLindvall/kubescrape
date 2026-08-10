@@ -88,6 +88,21 @@ spec:
             # individual pipelines with -logs=false, -metrics=false,
             # -cadvisor=false or -node-metrics=false.
             - -kubelet-endpoint=https://$(NODE_IP):10250
+            # The systemd journal — kubelet, containerd and the node's other
+            # units, which on many distros exist NOWHERE else. Needs an image
+            # built with the `journald` build tag; the default one is, while a
+            # `make build TAGS=azure` binary refuses to start with this set,
+            # naming the tag (docs/CONFIGURATION.md, "Build variants").
+            #
+            # Uncomment the flag AND the runlogjournal volume + mount below
+            # TOGETHER. Persistent journals arrive through the /var/log mount,
+            # but a node whose journal is volatile keeps it only under
+            # /run/log/journal, which nothing else here mounts: the reader then
+            # starts cleanly, blocks waiting for entries that cannot arrive and
+            # exports zero records. The startup WARNING naming the empty
+            # journal is the only signal — /readyz stays 200 and no counter
+            # moves, an untouched counter never being exported at all.
+            #- -journald
           env:
             - name: NODE_NAME
               valueFrom:
@@ -140,6 +155,14 @@ spec:
               readOnly: true
             - name: state
               mountPath: /var/lib/kubescrape-agent
+            # Volatile journals (systemd Storage=volatile, or auto on a node
+            # with no /var/log/journal) live ONLY here; persistent ones come in
+            # through the /var/log mount above. Uncomment with -journald, which
+            # otherwise has nothing to read. The chart mounts this whenever
+            # agent.journald.enabled is set.
+            #- name: runlogjournal
+            #  mountPath: /run/log/journal
+            #  readOnly: true
           resources:
             requests:
               cpu: 50m
@@ -154,3 +177,8 @@ spec:
           hostPath:
             path: /var/lib/kubescrape-agent
             type: DirectoryOrCreate
+        # Uncomment with -journald and its mount above.
+        #- name: runlogjournal
+        #  hostPath:
+        #    path: /run/log/journal
+        #    type: DirectoryOrCreate

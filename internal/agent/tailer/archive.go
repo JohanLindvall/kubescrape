@@ -51,7 +51,12 @@ func (t *Tailer) readArchive(ctx context.Context, f *file) error {
 	// and the done path would otherwise return early on every sweep, wedging
 	// those lines forever while the tokens sit refilled and unconsulted.
 	if f.limited {
-		t.consume(ctx, f, false)
+		if t.consume(ctx, f, false) {
+			// A batch flush failed and rewound: rewind dropped the gzip reader
+			// (f.gz is nil) and re-armed the range, so the next sweep
+			// re-decompresses from the committed offset.
+			return nil
+		}
 	}
 	if f.gz == nil {
 		// An fd retained for recovery (see closeArchiveReader) can go once its
@@ -110,7 +115,14 @@ func (t *Tailer) readArchive(ctx context.Context, f *file) error {
 		n, err := f.gz.Read(buf[:min(len(buf), budget)])
 		if n > 0 {
 			budget -= n
-			t.ingestChunk(ctx, f, buf[:n], false)
+			if t.ingestChunk(ctx, f, buf[:n], false) {
+				// A batch flush inside consume failed and rewound the archive:
+				// rewind CLOSES the gzip reader, so the loop's next f.gz.Read
+				// would dereference nil and take the sweep goroutine — and with
+				// it log collection for the whole node — down. The retained fd
+				// re-decompresses from committed on the next sweep.
+				return nil
+			}
 		}
 		if err != nil {
 			if errors.Is(err, io.EOF) {

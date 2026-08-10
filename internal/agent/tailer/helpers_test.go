@@ -81,6 +81,18 @@ func (f *fakeExporter) get() []string {
 	return append([]string(nil), f.records...)
 }
 
+// batchSizes returns the record count of each exported batch, in order — what
+// -logs-batch-size is a bound on.
+func (f *fakeExporter) batchSizes() []int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]int, 0, len(f.full))
+	for _, ld := range f.full {
+		out = append(out, ld.LogRecordCount())
+	}
+	return out
+}
+
 // record returns the exported log record at global index i.
 func (f *fakeExporter) record(i int) (plog.LogRecord, bool) {
 	f.mu.Lock()
@@ -305,8 +317,10 @@ func bodies(tl *Tailer) []string {
 }
 
 // driveTailer builds a tailer that is driven synchronously by the test (no Run
-// goroutine), so the sweep/flush interleavings below are exact.
-func driveTailer(dir string, exp *fakeExporter) *Tailer {
+// goroutine), so the sweep/flush interleavings below are exact. It takes the
+// bare LogExporter so a test can substitute a fakeExporter that also perturbs
+// the tailer's state mid-export.
+func driveTailer(dir string, exp LogExporter) *Tailer {
 	tl := New(Config{
 		Dir:           dir,
 		PollInterval:  20 * time.Millisecond,

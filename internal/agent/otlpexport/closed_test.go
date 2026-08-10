@@ -77,7 +77,10 @@ func TestTrySendAbandonsItsBackoffWhenCancelled(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan sendResult, 1)
 	ld := plog.NewLogs()
-	go func() { done <- s.trySend(ctx, func(c context.Context) error { return s.send(c, ld) }) }()
+	// alive=false: the cheap-lap early return must not short-circuit the wait
+	// this test is about (and DeadlineExceeded is not a collector response
+	// either way).
+	go func() { done <- s.trySend(ctx, func(c context.Context) error { return s.send(c, ld) }, false) }()
 	cancel()
 
 	select {

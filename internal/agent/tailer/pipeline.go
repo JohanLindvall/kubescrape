@@ -334,24 +334,45 @@ func (f *file) appendPending(chunk []byte) {
 }
 
 // ingestChunk accounts one read chunk (byte counter, pending buffer, read
-// position) and consumes it — the shared body of every read/drain loop.
-func (t *Tailer) ingestChunk(ctx context.Context, f *file, chunk []byte, unlimited bool) {
+// position) and consumes it — the shared body of every read/drain loop. It
+// passes consume's rewound verdict back to the caller.
+func (t *Tailer) ingestChunk(ctx context.Context, f *file, chunk []byte, draining bool) bool {
 	obs.LogBytes.Add(float64(len(chunk)))
 	f.appendPending(chunk)
 	f.readPos += int64(len(chunk))
-	t.consume(ctx, f, unlimited)
+	if t.consume(ctx, f, draining) {
+		return true
+	}
 	if len(f.pending) == 0 && cap(f.pendingBase) > maxIdlePendingBytes {
 		// Everything read has been consumed and the buffer is oversized (an
 		// over-long line grew it): give it back instead of holding it for the
 		// life of the file.
 		f.pending, f.pendingBase = nil, nil
 	}
+	return false
 }
 
 // consume splits pending bytes into physical lines and feeds the pipeline.
-// unlimited bypasses the per-file rate limit (rotation drains, where pausing
-// would lose the remainder of the rotated-away inode).
-func (t *Tailer) consume(ctx context.Context, f *file, unlimited bool) {
+//
+// draining marks the passes that must read a doomed source to its end: a
+// rename/removal drain, and the pending-line salvage reopen and the archive
+// restart run before they rebuild the pipeline. Two things follow from it. The
+// per-file rate limit is bypassed, because pausing would lose the remainder
+// once the fd drops. And the batch is never flushed from inside this loop:
+// drainReader owns its own flush point together with the rewind check that must
+// follow it, while reopen and readArchive are mid-way through a restart
+// sequence whose state a rewind would purge under them — the rotation they were
+// about to record would then never be recorded at all.
+//
+// It reports whether a mid-loop flush FAILED and rewound the file. Pending, the
+// pipeline and the read position are all reset in that case, so the caller must
+// stop this pass instead of reading on from an fd that was seeked back.
+func (t *Tailer) consume(ctx context.Context, f *file, draining bool) bool {
+	// Bytes the loop below skips only become committable once every line fed
+	// ahead of them has exported, which is normally a later flush (advanceBatch
+	// calls this again). But in pure-drop mode nothing is ever fed, so no flush
+	// ever runs for this file and this is the only place the frontier can move.
+	defer f.absorbSkipped()
 	for {
 		i := bytes.IndexByte(f.pending, '\n')
 		if i < 0 {
@@ -373,7 +394,7 @@ func (t *Tailer) consume(ctx context.Context, f *file, unlimited bool) {
 				}
 				f.discarding = true
 			}
-			return
+			return false
 		}
 		if f.discarding {
 			// The tail of an oversized discarded line: its newline ends the
@@ -385,20 +406,25 @@ func (t *Tailer) consume(ctx context.Context, f *file, unlimited bool) {
 			f.pending = f.pending[i+1:]
 			f.lineStart += int64(i + 1)
 			f.discarding = false
+			// The whole oversized line is now behind us, on a line boundary:
+			// this is the first offset past it a checkpoint may name (its
+			// mid-line prefix frontier never is).
+			f.skipEnd = f.lineStart
 			continue
 		}
-		if !unlimited && !t.allowLine(f) {
+		if !draining && !t.allowLine(f) {
 			if !t.cfg.RateDrop {
 				// Pause: keep pending, stop reading until tokens refill.
 				if !f.limited {
 					f.limited = true
 					obs.LogRateLimited.WithLabelValues("pause").Inc()
 				}
-				return
+				return false
 			}
 			// Drop: discard the line, keep consuming.
 			f.pending = f.pending[i+1:]
 			f.lineStart += int64(i + 1)
+			f.skipEnd = f.lineStart
 			obs.LogRateLimited.WithLabelValues("drop").Inc()
 			continue
 		}
@@ -409,9 +435,21 @@ func (t *Tailer) consume(ctx context.Context, f *file, unlimited bool) {
 		f.lineStart += int64(i + 1)
 
 		if len(line) == 0 {
+			// A blank physical line produces no record, so nothing will ever
+			// commit its byte — same class as a dropped one.
+			f.skipEnd = f.lineStart
 			continue
 		}
 		t.feedLine(ctx, f, string(line), start, f.lineStart)
+		// The batch threshold belongs HERE, where records are added. Checked
+		// once per file per sweep instead — after readFile had already consumed
+		// up to MaxBytesPerSweep and fed every line of it — -logs-batch-size
+		// ("flush after this many entries") was in practice "flush after a
+		// sweep's worth of them": measured at 10x the configured size on a
+		// backlog, and 90x with a small one.
+		if !draining && t.maybeFlush(ctx, f) {
+			return true
+		}
 	}
 }
 

@@ -479,6 +479,24 @@ func (s *DynamicMetricSet) add(values ValueFunc, lookup func(string) string, res
 // labels are applied in sorted-key order for a deterministic identity. Safe
 // on a nil set (returns an error naming the reason).
 //
+// THE RESOURCE IS READ AT CALL TIME, and that is the contract — not an
+// accident of where the bridge happens to hold a handle. A transform script
+// mutates resource attributes in place, so a script that edits the resource
+// between two emit_metric calls puts the two observations in two different
+// series; one that edits it first puts both under the edited one. The
+// alternative — snapshotting the resource once when the batch is handed to the
+// script — was rejected for two reasons: every other read a script makes
+// (item.resource[k], the route glob, the attributes the payload finally ships
+// under) sees the CURRENT value, so a single verb reading a stale one is the
+// surprise; and a script that enriches the resource precisely so its metric
+// carries the enrichment would then be silently ignored. It is deterministic
+// either way — the script is hermetic and its statements are ordered — so the
+// rule is "the resource as of this call", and it is pinned by test.
+//
+// Nothing is retained: the attributes are rendered into the sample's identity
+// here (admit), so a later mutation of the caller's map cannot rewrite a series
+// already created.
+//
 // At-least-once caveat, same as every producer's: a retried batch re-runs
 // its script, so a transient export failure re-emits.
 func (s *DynamicMetricSet) EmitDirect(name string, value float64, lbls map[string]string, resource pcommon.Map) error {

@@ -94,10 +94,26 @@ type file struct {
 	lastFed      time.Time
 
 	f         *os.File
-	readPos   int64  // fd position
-	lineStart int64  // offset of the first byte not yet consumed as a line
-	committed int64  // offset covered by successful exports / checkpoint
-	pending   []byte // incomplete physical line carried between sweeps
+	readPos   int64 // fd position
+	lineStart int64 // offset of the first byte not yet consumed as a line
+	committed int64 // offset covered by successful exports / checkpoint
+	// skipEnd is the end offset of the newest line consume took WITHOUT feeding
+	// it: a rate-DROPPED line, a blank line, or an oversized one whose discard
+	// window just closed. `committed` only ever advances to an EXPORTED entry's
+	// end, and an entry's end derives from a fed line's boundary, so a TRAILING
+	// run of skipped lines — the normal shape for a rate-limited or finished
+	// container — is otherwise permanently uncommittable: the checkpoint freezes
+	// at the first of them, kubescrape_log_lag_bytes counts deliberately
+	// discarded bytes forever, and a restart re-reads and RE-DELIVERS lines this
+	// process already dropped. absorbSkipped is what lets committed cross them.
+	//
+	// Always a real line BOUNDARY, never the mid-line frontier an unfinished
+	// oversize discard leaves behind (consume stamps it when the discard's
+	// newline arrives, not when its prefix is dropped), so a restart resuming
+	// here can never land inside a line. Bound to the byte-consumption state, so
+	// restartAt clears it with pending and `discarding`.
+	skipEnd int64
+	pending []byte // incomplete physical line carried between sweeps
 	// pendingBase pins the ONE backing array behind pending. consume advances
 	// pending by RE-SLICING, so its base pointer walks forward and its spare
 	// capacity drains to zero; appendPending moves the remainder back to the
@@ -317,6 +333,22 @@ func (f *file) fedEnd() int64 {
 	return end
 }
 
+// absorbSkipped advances `committed` across bytes the read CONSUMED but never
+// FED (file.skipEnd), which no entry can ever commit for it.
+//
+// The guard is `fedEnd() == committed`, i.e. no fed line at the tail ends above
+// the commit frontier. That single test covers everything that could be lost by
+// jumping the frontier: a line still buffered in either stage, and a line
+// already emitted into the unflushed batch, both keep a lastEnd above committed
+// (a line's bytes are only committed once its entry exports), so neither can be
+// live when it holds. Old segments are untouched — they carry their own
+// committed frontier and their lines never land in the tail's lastEnd.
+func (f *file) absorbSkipped() {
+	if f.skipEnd > f.committed && f.fedEnd() == f.committed {
+		f.committed = f.skipEnd
+	}
+}
+
 // streamState is the offset accounting for one pipeline key. stream is the
 // precomputed streamOf(key), stamped on emitted entries. hasRun marks a
 // pending stage-1 run (presence, not just a zero offset).
@@ -428,7 +460,7 @@ type segment struct {
 	// segment genuinely covers it through `to`.
 	//
 	// Per-SEGMENT, because the file-level segmentsFed is only true after the
-	// WHOLE replay pass finishes: every flushDuringDrain inside the pass sees
+	// WHOLE replay pass finishes: every mid-pass flush (maybeFlush) sees
 	// it false, and proposeCandidates is evaluated once per entry at flush
 	// time, so gating on it DROPPED the traversal claim instead of deferring
 	// it — and after the pass f.feeding is 0, so no later entry can start in
@@ -618,10 +650,11 @@ type entry struct {
 
 // restartAt resets the byte-consumption state to off: read/line positions,
 // the pending buffer, and the flags whose lifetime is bound to pending (a
-// rate-limit pause and an oversized-line discard window both die with it —
-// the bytes are re-read and re-evaluated from off). Every restart/rewind
-// path shares this ONE helper deliberately: the archiveReplaced restart once
-// drifted from reopen by omitting two of these resets, each a real bug.
+// rate-limit pause, an oversized-line discard window and the skipped-bytes
+// frontier all die with it — the bytes are re-read and re-evaluated from off).
+// Every restart/rewind path shares this ONE helper deliberately: the
+// archiveReplaced restart once drifted from reopen by omitting two of these
+// resets, each a real bug.
 func (f *file) restartAt(off int64) {
 	f.readPos = off
 	f.lineStart = off
@@ -630,6 +663,11 @@ func (f *file) restartAt(off int64) {
 	f.pending = f.pendingBase[:0]
 	f.limited = false
 	f.discarding = false
+	// A frontier from the discarded pass names bytes off no longer covers (and
+	// on a rotation, an offset in a different incarnation entirely): kept, it
+	// would let absorbSkipped jump `committed` over lines the re-read is about
+	// to feed.
+	f.skipEnd = 0
 }
 
 func inodeOf(st os.FileInfo) uint64 {

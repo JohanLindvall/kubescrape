@@ -9,6 +9,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/kubernetes/fake"
 	k8stesting "k8s.io/client-go/testing"
 
@@ -25,28 +26,52 @@ func listingClient(rv string) *fake.Clientset {
 	return client
 }
 
-// The replay filter must stop at the SECURING BOOKMARK, not at the end of the
-// stream. `replaying` is per-stream and survives a commit on purpose, but the
-// same stream keeps running after the bookmark proved the backlog delivered —
-// and everything it delivers from there is LIVE. Filtering that against a
-// boundary frozen at stream start drops, for the rest of the watch, every event
-// from a reporter whose clock trails it by more than replaySlack: silently
-// (noteSeen has already advanced the resume point past it) and uncounted.
+// The replay filter must stop at the END OF THE BACKLOG, not at the end of the
+// stream. `replaying` is per-stream and survives a commit on purpose, but only
+// the backlog can carry an already-exported event; the watch that follows it is
+// positioned at the list's snapshot and everything it delivers is LIVE.
+// Filtering that against a boundary frozen at stream start drops, for the rest
+// of the watch, every event from a reporter whose clock trails it by more than
+// replaySlack: silently (noteSeen has already advanced the resume point past
+// it) and uncounted.
+//
+// The scope is now structural — the filter is applied by replayBacklog and by
+// nothing else — so the assertion is on BOTH halves: the predicate stops
+// filtering when the walk ends, and the watch path never consults it at all.
+//
+// The second half drives handle with `replaying` still SET, which stream() can
+// no longer produce (replayBacklog clears the flag before the watch is opened).
+// That is the point: with the flag clear, wanted() returns true for everything
+// and a `if !r.wanted(e) { return nil }` restored to handle would be inert —
+// the whole suite passed with that line back in. Forcing the flag is the only
+// way this test can fail for the reason it names.
 func TestAuditFixSecuredReplayDoesNotFilterLiveEvents(t *testing.T) {
-	r, _, _ := newReader(t, Config{})
+	exp := &captureExporter{}
+	r, _, _ := newReader(t, Config{Exporter: exp, BatchSize: 1})
 	base := time.Now()
 	r.replaying, r.replaySecured = true, false
 	r.replayFrom = base
 
 	lagging := event("lagging", "OOMKilling", "m", "Warning", "9", 1, base.Add(-5*time.Minute))
 	if r.wanted(lagging) {
-		t.Fatal("an UNSECURED replay must still filter the backlog against the frozen watermark")
+		t.Fatal("an in-flight backlog walk must still filter against the frozen watermark")
 	}
-	// The bookmark that releases the position hold also ends the replay.
-	r.secureReplay()
+	// replayBacklog clears the flag when the last page has been read.
+	r.replaying = false
 	if !r.wanted(lagging) {
-		t.Fatal("a live event was dropped after the replay was secured: the filter belongs to the backlog, " +
-			"and the post-bookmark part of the stream is live")
+		t.Fatal("a live event was dropped after the backlog was read: the filter belongs to the backlog")
+	}
+
+	// The watch path does not filter, and cannot be made to: even with the
+	// backlog flag forced on and the boundary armed — the state in which
+	// wanted() rejects this event outright, asserted above — handle exports it.
+	r.replaying, r.replaySecured = true, false
+	if err := r.handle(context.Background(), watch.Event{Type: watch.Added, Object: lagging}); err != nil {
+		t.Fatal(err)
+	}
+	if got := len(exp.records()); got != 1 {
+		t.Fatalf("exported %d records for a lagging-clock live event, want 1: the watch path must never "+
+			"apply the replay watermark", got)
 	}
 }
 
@@ -146,18 +171,18 @@ func TestAuditFixUnreadablePositionReplaysRatherThanSkipping(t *testing.T) {
 
 	r := New(Config{Client: client, Positions: unreadable}) // StartMode defaults to auto
 	r.loadPosition(ctx)
-	rv, redelivers, err := r.startResourceVersion(ctx)
-	if err != nil || rv != "" || !redelivers {
-		t.Fatalf("start after an unreadable position = (%q, %v, %v); `auto` must replay the backlog, "+
-			"not skip to the current revision", rv, redelivers, err)
+	start, err := r.startResourceVersion(ctx)
+	if err != nil || !start.replay || !start.redelivers {
+		t.Fatalf("start after an unreadable position = (%+v, %v); `auto` must replay the backlog, "+
+			"not skip to the current revision", start, err)
 	}
 
 	// An explicit start mode is the operator naming a cold-start policy
 	// outright, and is honoured.
 	r = New(Config{Client: client, Positions: unreadable, StartMode: StartEnd})
 	r.loadPosition(ctx)
-	if rv, _, err = r.startResourceVersion(ctx); err != nil || rv != "999" {
-		t.Fatalf("start after an unreadable position with -events-start=end = (%q, %v), want the current revision", rv, err)
+	if start, err = r.startResourceVersion(ctx); err != nil || start.rv != "999" || start.replay {
+		t.Fatalf("start after an unreadable position with -events-start=end = (%+v, %v), want the current revision", start, err)
 	}
 }
 

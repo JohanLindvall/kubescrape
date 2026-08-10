@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -390,26 +391,39 @@ func TestIdleClosedRotationRecovered(t *testing.T) {
 		"open-ended segment retired after recovery")
 }
 
-// A caught-up file whose trailing bytes never entered the pipeline — a blank
-// final line here; a rate-DROPPED or oversize-discarded tail are the same
-// class — must still idle-close. The old guard compared readPos to committed,
-// and such bytes can never commit (no entry ever covers them), so those files
-// held their fd forever; the guard now compares fedEnd() to committed like
-// every sibling completion decision.
-func TestIdleCloseWithTrailingBlankLine(t *testing.T) {
+// A caught-up file whose trailing bytes never entered the pipeline must still
+// idle-close. The old guard compared readPos to committed, and such bytes can
+// never commit (no entry ever covers them), so those files held their fd
+// forever; the guard compares fedEnd() to committed like every sibling
+// completion decision.
+//
+// The tail here is the prefix of an oversized line whose discard window is
+// still OPEN, which is the one member of that class the commit frontier cannot
+// absorb: file.skipEnd only ever names a line BOUNDARY, and this frontier sits
+// mid-line (blank and rate-DROPPED tails are absorbed instead, so for those the
+// two guards now agree — see TestBlankTrailingLineAdvancesTheCommitFrontier).
+func TestIdleCloseWithNeverFedTrailingBytes(t *testing.T) {
 	dir := t.TempDir()
 	ctx := context.Background()
 	exp := &fakeExporter{}
 	tl := driveTailer(dir, exp)
 	tl.cfg.IdleClose = time.Millisecond
+	tl.cfg.MaxEntryBytes = 1024
 
 	tl.scanDir(tl.loadCheckpoints(), true)
-	writeLog(t, dir, timeNowCRI()+" stdout F one", "")
-	tl.scanDir(nil, false)
 	path := filepath.Join(dir, logName)
+	// One over-cap line with no terminator: the prefix is discarded unseen and
+	// the discard window stays open.
+	if err := os.WriteFile(path, []byte(strings.Repeat("y", tl.cfg.MaxEntryBytes+oversizeSlack+1)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	tl.scanDir(nil, false)
 	tl.sweep(ctx, true)
 	tl.flush(ctx)
 	f := tl.files[path]
+	if !f.discarding {
+		t.Fatal("precondition: the oversized prefix was not discarded")
+	}
 	if f.readPos == f.committed {
 		t.Fatalf("precondition: want never-fed trailing bytes (readPos=%d committed=%d)",
 			f.readPos, f.committed)
@@ -424,7 +438,7 @@ func TestIdleCloseWithTrailingBlankLine(t *testing.T) {
 	tl.lastIdleScan = time.Time{}
 	tl.closeIdleFiles()
 	if f.f != nil {
-		t.Fatal("a caught-up file with a trailing blank line never idle-closed")
+		t.Fatal("a caught-up file with never-fed trailing bytes never idle-closed")
 	}
 }
 

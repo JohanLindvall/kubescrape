@@ -287,6 +287,23 @@ func proposeCandidates(cands map[*file]map[int]int64, e entry) {
 	}
 }
 
+// maybeFlush ships the batch once it has reached Config.BatchSize, and reports
+// whether that flush FAILED and rewound f.
+//
+// Every caller sits inside a read/feed loop over f, and every one of them must
+// stop on true: the rewind seeks the fd back to the committed offset and
+// discards the pipeline, so reading on re-feeds the same bytes into a batch
+// whose export just failed — a hot loop burning export attempts on the single
+// sweep goroutine that serves every file on the node.
+func (t *Tailer) maybeFlush(ctx context.Context, f *file) bool {
+	if len(t.batch) < t.cfg.BatchSize {
+		return false
+	}
+	gen := f.rewindGen
+	t.flush(ctx)
+	return f.rewindGen != gen
+}
+
 func (t *Tailer) flush(ctx context.Context) {
 	if len(t.batch) == 0 {
 		t.lastFlush = time.Now()
@@ -492,6 +509,12 @@ func (t *Tailer) advanceBatch(inf *batchInfo) {
 				f.exportedHighs[seg] = off
 			}
 		}
+		// This delivery may have retired the last fed line standing between the
+		// commit frontier and a run of skipped bytes behind it (a rate-DROPPED
+		// or blank tail): those bytes are committable exactly now. Without it
+		// `committed` freezes below readPos for the file's life — see
+		// file.skipEnd.
+		f.absorbSkipped()
 	}
 }
 

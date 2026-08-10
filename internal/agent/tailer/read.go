@@ -271,7 +271,9 @@ func (t *Tailer) readFile(ctx context.Context, f *file) error {
 	// A paused (rate-limited) file first retries its retained pending bytes;
 	// reading resumes only once they drain.
 	if f.limited {
-		t.consume(ctx, f, false)
+		if t.consume(ctx, f, false) {
+			return nil // a batch flush failed and rewound; retry from committed
+		}
 	}
 	budget := t.cfg.MaxBytesPerSweep
 	buf := t.scratch()
@@ -282,7 +284,17 @@ func (t *Tailer) readFile(ctx context.Context, f *file) error {
 		if n > 0 {
 			budget -= n
 			read += n
-			t.ingestChunk(ctx, f, buf[:n], false)
+			if t.ingestChunk(ctx, f, buf[:n], false) {
+				// A batch flush inside consume failed and rewound this file:
+				// the fd is back at the committed offset and the pipeline is
+				// purged, so reading on would re-feed the same bytes into a
+				// batch whose export just failed. Stop reading, but still fall
+				// through to the rotation check below — the fd must not be left
+				// pointing at an inode the path no longer names, or a second
+				// rotation inside the export outage loses the incarnation
+				// between them.
+				break
+			}
 		}
 		if err != nil {
 			if !errors.Is(err, io.EOF) {
@@ -290,6 +302,19 @@ func (t *Tailer) readFile(ctx context.Context, f *file) error {
 			}
 			break
 		}
+	}
+
+	if f.f == nil {
+		// The only way to reach this with no fd is the break above: a mid-read
+		// flush failed AND its rewind's Seek failed, so rewind dropped the
+		// handle. The file then has no live identity to compare a rotation
+		// against, and handleRotation's reopen would CLEAR the STORED
+		// inode+fingerprint — after which the next ensureOpen can no longer
+		// recognise a replacement at the path, and the rotated-away
+		// incarnation's uncommitted range is lost uncounted. Leave the decision
+		// to that ensureOpen, whose replaced arm records it as an open-ended
+		// segment and recovers it through findRotated.
+		return nil
 	}
 
 	// A first read on a file opened at size 0 (a fresh container log) leaves

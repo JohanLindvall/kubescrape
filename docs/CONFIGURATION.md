@@ -425,7 +425,7 @@ record attributes).
 
 | Flag | Default | Description |
 |---|---|---|
-| `-journald-dir` | — | read a specific journal directory; empty opens the default system journal (set to `/run/log/journal` for volatile journals) |
+| `-journald-dir` | — | read a specific journal directory; empty opens the default system journal, which already covers the volatile one. **What the pipeline actually needs is the host journal MOUNTED into the container** — `/var/log/journal` (persistent) and/or `/run/log/journal` (volatile). The chart does it behind `agent.journald.enabled`; a hand-rolled manifest must add it, or the reader starts, reports ready and collects nothing. The agent now WARNs at startup when the resolved journal holds no readable files |
 | `-journald-units` | — | comma-separated units (matched on `_SYSTEMD_UNIT`); empty reads everything |
 | `-journald-batch-size` | `1024` | flush after this many entries |
 | `-journald-max-batch-bytes` | `1048576` | flush before a batch's summed message bytes exceed this |
@@ -466,7 +466,7 @@ or `replicas > 1`, never double-ships.
 | `-events` | `false` | enable the events reader |
 | `-events-namespace` | — | watch one namespace; empty is cluster-wide |
 | `-events-start` | `auto` | where a **cold** start begins (no stored position): `end` skips the backlog, `start` replays everything still within the API server's event TTL (typically 1h), `auto` resumes the stored position and otherwise behaves as `end` |
-| `-events-batch-size` | `512` | flush after this many events |
+| `-events-batch-size` | `512` | flush after this many events, **clamped to the retained-batch cap** (16384). The startup backlog walk blocks the single reader goroutine and services no flush ticker, so its only trigger is this count — unclamped, a larger value made the trigger unreachable and shed the entire backlog into `kubescrape_events_overflow_dropped_total` before the watch even opened |
 | `-events-flush-interval` | `2s` | flush at least this often |
 | `-events-position-interval` | `10s` | how often the position is written to its ConfigMap. A write per event would be an API-server write per event, so this bounds how much is **replayed** after a hard kill (bounded duplicates, never loss); a graceful stop always writes a final position |
 | `-events-position-configmap` | `kubescrape-events-position` | ConfigMap holding the resume position |
@@ -924,14 +924,27 @@ logScrubbing:
 ```
 
 Built-in patterns: `bearer`, `basic-auth`, `secret-kv` (api_key / secret /
-password / token / access_key key-value pairs — the key and separator are
-kept so the line stays readable; a QUOTED value is redacted to its closing
-quote, so a passphrase containing spaces or commas does not survive as a
-tail), `aws-key`, `private-key`, `url-userinfo` (the password half of a
-`scheme://user:password@host` connection string, which reaches logs through
-dial-failure messages and config dumps where no key=value shape exists) — all
-six = `defaults` — plus the opt-in-by-name `email` and `credit-card` (they redact
-legitimate content too often to be defaults). Every built-in carries a cheap
+password / token / access_key key-value pairs), `aws-key`, `private-key`,
+`url-userinfo` (the password half of a `scheme://user:password@host`
+connection string, which reaches logs through dial-failure messages and
+config dumps where no key=value shape exists) — all six = `defaults` — plus
+the opt-in-by-name `email` and `credit-card` (they redact legitimate content
+too often to be defaults).
+
+`secret-kv` keeps the key and separator so the line stays readable, and
+redacts a QUOTED value to its closing quote, so a passphrase containing
+spaces or commas does not survive as a tail. That includes a quote ESCAPED
+inside it (`{"password":"he said \"hi\" ok"}` goes whole) and the
+escaped-quote spelling a payload stringified into a JSON field takes
+(`{"msg":"password=\"hunter2\" tail"}`, which used to emit
+`password=[REDACTED]"hunter2\"` — a line that CLAIMS a redaction and still
+carries the secret). Two shapes are **not** fully redacted, both visible in
+the output: an UNQUOTED value containing one of the value class' own
+delimiters (`&`, `,`, `;`, `}`, `]`, `)`, whitespace or a quote) is redacted
+only up to that delimiter — quote the value, which every structured logger
+already does — and more than ONE level of escaping is not decoded.
+`url-userinfo` redacts to the LAST `@` in the token, so a DSN password
+containing one (`svc:p@ss@db-1`) goes whole. Every built-in carries a cheap
 prefilter, so the no-match hot path is a scan or two and zero allocations —
 and `secret-kv`'s checks the assignment SHAPE, not just the keyword, because a
 line admitted to the regex pays for the whole record (100 ms for a 1 MiB line,
@@ -1649,10 +1662,27 @@ traces: |
   hash is on `GET /debug/transforms`, so per-node convergence after a
   reload is checkable.
 * **Safety**: Starlark is hermetic (no I/O, no imports, no clock) and every
-  run is step-limited, so a pathological script errors out
+  run is bounded four ways, so a pathological script errors out
   (`kubescrape_transform_errors_total{signal}`, the batch is not exported
   and the producer's usual retry applies) instead of wedging an export
-  goroutine.
+  goroutine or killing the process. The bounds are a **step limit**
+  (10,000,000 instructions, ~130 ms of pure looping), a **wall clock** (2s),
+  **per-value caps** (1Mi elements per sequence, 16 MiB per string, 1Mi bits
+  per integer) and a **cumulative allocation budget** (128 MiB per
+  invocation). The last three exist because the step limit counts *bytecode
+  instructions*, and a Go-implemented builtin does unbounded work for one
+  step: `list(range(1<<26))` is eleven steps and a gigabyte, and
+  `[0] * ((1<<30)-1)` is fifteen steps and seventeen. So the amplifying
+  builtins are shadowed by bounded wrappers (`range`, `list`, `tuple`,
+  `sorted`, `reversed`, `set`, `dict`, `enumerate`, `zip`, `str`, `repr`,
+  `bytes`, plus `re.findall`/`re.replace`), and `*` and `+` — operators, with
+  no builtin to shadow — are rewritten into guarded calls between parse and
+  resolve. **All of it applies to the compile-time evaluation of module-level
+  code too**, which is the path that mattered: a module-level allocation used
+  to OOM-kill every agent in the fleet from one ConfigMap edit and then
+  CrashLoop them permanently, because startup re-evaluates the module and
+  dies again before the last-good-program machinery can help. A refusal is
+  now an ordinary config error, which that machinery already handles.
 
 ### Builtins
 
@@ -1759,6 +1789,39 @@ next person to want one finds the reasoning rather than an accident:
   hot-reloaded, operator-edited script safe to run inside the export path;
   a script that could block on the network would hold the tailer's single
   sweep goroutine.
+* **`+=`/`*=` on a target that contains a call.** Bounding the `+` and `*`
+  operators (they are the only amplifiers with no builtin to shadow) rewrites
+  `t += x` into `t = <guard>(t, x)`, so the target appears twice and is
+  evaluated twice. That is free of consequence for a name, a field
+  (`r.body += " tag"`) and an index (`r.attributes["n"] += 1`, `a[i] *= 2`) —
+  every read a script can perform on a host object is a pure read — but not
+  for `d[f()] += 1`, where `f()` would run twice. Assign the call's result to
+  a name first: `k = f()`, then `d[k] += 1`. The refusal is a config error
+  naming the call's position and that spelling. Everything else about
+  augmented assignment is unchanged, including the in-place list extend:
+  `d["l"] += [2]` extends the list the dict already holds, exactly as starlark
+  does. One difference from plain starlark, reachable only when the right-hand
+  side MUTATES a container the target reads its key from: `d[a[0]] += f()`
+  where `f` writes `a[0]` stores under the NEW key, because the bounded form is
+  exactly the hand-written `d[a[0]] = d[a[0]] + f()` rather than starlark's
+  evaluate-the-address-once `+=`.
+* **The three guard identifiers (dunder-prefixed `kubescrape` names ending in
+  `add`, `iadd` and `mul`) are reserved as NAMES.** The rewritten operators
+  call them, and a global, def, parameter or loop variable of such a name
+  resolves before the predeclared guard and would quietly unbound every `*`
+  and `+` in the file. Only as a name: the same spelling used as an attribute
+  selector, as a keyword-argument label, as a string literal or as a dict key
+  can neither bind nor shadow, and is left alone — a fatal compile error over
+  an incidental spelling would CrashLoop a fleet for nothing.
+* **`secret-kv` over-redacts a quoted keyword followed by `:` or `=`.** In
+  RE2 that is indistinguishable from an assignment, so ordinary prose written
+  that way loses its next token: `{"msg":"unknown field \"token\": ignoring"}`
+  redacts `ignoring`. The damage is bounded to one token (the unquoted value
+  class stops at the first delimiter), and a quoted keyword with NO assignment
+  after it (`missing key \"api_key\" in config`) is untouched. Not refused:
+  over-redaction is far safer than under-redaction in a compliance control.
+  Pinned by `TestKnownOverRedactionsAreAccepted`, so a future change to the
+  pattern re-opens the decision instead of silently widening it.
 
 ## Agent: routing
 

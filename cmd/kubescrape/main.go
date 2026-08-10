@@ -12,6 +12,7 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/signal"
 	"strings"
@@ -456,6 +457,16 @@ var (
 	metaCacheTTL = flag.Duration("metadata-cache-ttl", 10*time.Second, "max-age sent on metadata responses (Cache-Control + ETag) so agents cache lookups client-side; 0 disables the cache headers. The server-side ServiceMonitor->Service memo is exact (invalidated by index generation, not this TTL), so 0 no longer costs a cross-product rebuild per request")
 	resync       = flag.Duration("resync", 0, "informer resync period (0 disables periodic resync; the watch stream keeps the cache current)")
 
+	// The ACTIVE reachability signal for the API-server connection. While the
+	// server is merely unreachable client-go retries the watch internally and
+	// never relists, so the informer watch-error counter can stay flat for the
+	// whole outage, and readiness latches at the initial sync (see
+	// cmd/kubescrape/apiserver.go for the mechanism and the measurements):
+	// without this probe a cluster-wide outage can pass unremarked in this
+	// process' telemetry and its logs.
+	apiserverProbeInterval = flag.Duration("apiserver-probe-interval", 30*time.Second,
+		"how often to probe API-server reachability with a metadata-only LIST of one namespace, publishing kubescrape_apiserver_reachable and kubescrape_apiserver_probe_failures_total (0 disables the probe, and then neither metric is published). It probes a NEW connection, so it reports reachability rather than whether the caches are advancing: readiness latches at the initial sync, and client-go retries a refused watch without relisting, so the watch-error counter is not a dependable substitute")
+
 	// ServiceMonitor CRDs (opt-in).
 	monitorsOn = flag.Bool("servicemonitors", false, "serve targets for monitoring.coreos.com ServiceMonitors (pod-backed Services) and PodMonitors. Endpoint port/targetPort/path/scheme, per-endpoint interval/scrapeTimeout, basicAuth/authorization/bearerTokenSecret and secret-backed tlsConfig (needs -scrape-auth-secrets), and the keep/drop subset of metricRelabelings are interpreted; everything else is reported through kubescrape_monitor_fields_ignored_total and a startup warning")
 
@@ -560,6 +571,12 @@ func run() error {
 	if *resync < 0 {
 		return fmt.Errorf("-resync %v: must not be negative (0 disables periodic resync)", *resync)
 	}
+	// Negative is a typo, not a mode: a ticker refuses it (time.NewTicker
+	// panics), and silently reading it as "disabled" would remove the one
+	// signal an API-server outage produces without saying so.
+	if *apiserverProbeInterval < 0 {
+		return fmt.Errorf("-apiserver-probe-interval %v: must not be negative (0 disables the probe)", *apiserverProbeInterval)
+	}
 	// -scrape-auth-secrets derives its allowlist from INDEXED monitors, so
 	// without -servicemonitors nothing is ever indexed and every request to
 	// /v1/scrape-auth 404s ("no monitors indexed") — while the deployment
@@ -594,7 +611,7 @@ func run() error {
 
 	st := store.New(*cacheTTL)
 	obs.RegisterStoreStats(st.Stats)
-	obs.RegisterWaiterStats(st.BlockedLookups, st.ShedLookups)
+	obs.RegisterWaiterStats(st.BlockedLookups, st.ShedLookups, st.DrainedLookups)
 
 	// Full objects (spec+status are both read), minus what nothing reads:
 	// trimPod drops managedFields from everything and, for PODS ONLY, the bulk
@@ -718,6 +735,29 @@ func run() error {
 	metaFactory.Start(ctx.Done())
 	go st.Run(ctx)
 
+	// The only ACTIVE check that the API server is still there. Everything else
+	// in this process is watch-driven, and a watch that keeps failing retriably
+	// reports nothing at all, so the passive signals cannot be relied on for a
+	// connection that has gone away (apiserver.go carries the mechanism).
+	if startAPIServerWatchdog(ctx, apiserverProbe(metaClient), *apiserverProbeInterval, log) != nil {
+		log.Info("api server probe started", "interval", *apiserverProbeInterval)
+	}
+
+	// Readiness LATCHES here, and that is deliberate — do not "fix" it by
+	// re-evaluating the informers' health per request.
+	//
+	// /readyz gates the Deployment's Service endpoints. Flipping it to 503
+	// when the API server later becomes unreachable would DELETE those
+	// endpoints and cut the whole agent fleet off a cache that is still
+	// serving useful data: pods do not vanish because the API server did, and
+	// a slightly stale answer beats no answer for every consumer here (log
+	// attribution, scrape targets, ingest enrichment). Availability is the
+	// right trade here.
+	//
+	// What was missing is the OTHER half: making the staleness visible without
+	// also withdrawing the service. That is kubescrape_apiserver_reachable (the
+	// watchdog above), and it is where the alert belongs — a gauge can say
+	// "stale" without also saying "go away".
 	ready := make(chan struct{})
 	go func() {
 		if !cache.WaitForCacheSync(ctx.Done(), synced...) {
@@ -770,7 +810,8 @@ func run() error {
 	if err := serverCfg.Validate(); err != nil {
 		return err
 	}
-	srv := server.New(serverCfg).HTTPServer(*listen)
+	api := server.New(serverCfg)
+	srv := api.HTTPServer(*listen)
 
 	// With the OTLP self-metrics push disabled (-self-metrics-interval=0) the
 	// kubescrape_* metrics ride the /metrics scrape instead — the service then
@@ -806,11 +847,11 @@ func run() error {
 		// WithoutCancel(ctx) rather than a bare Background: ctx is already
 		// cancelled, but its VALUES must survive into every shutdown step (the
 		// repo-wide rule — otlpexport's ownership marker rides on a context).
-		shutdownCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), stepBudget())
-		defer cancel()
-		if err := srv.Shutdown(shutdownCtx); err != nil && !errors.Is(err, context.DeadlineExceeded) {
-			runErr = fmt.Errorf("http shutdown: %w", err)
-		}
+		// api.Drain, not st.Drain: a container lookup parks in TWO places and
+		// both have to be released (the server's wait for the initial sync is
+		// the one a SIGTERM during startup hits, when the store has no waiters
+		// at all).
+		runErr = shutdownHTTP(context.WithoutCancel(ctx), srv, api.Drain, api.InFlight, stepBudget(), log)
 	}
 	// Cancel ctx (a no-op on the signal path) and wait for the exporting
 	// goroutines' final flushes before the deferred exporter.Close fires.
@@ -850,6 +891,52 @@ const (
 	shutdownTotal = 15 * time.Second
 	shutdownStep  = metrics.FinalExportTimeout
 )
+
+// shutdownHTTP releases the parked container lookups and then drains the HTTP
+// server within budget. It returns an error only for a shutdown failure that is
+// not the deadline; a missed deadline is reported as a WARN.
+//
+// The ORDER is the fix, and the mechanism is worth stating exactly, because the
+// obvious reading of it is wrong. srv.Shutdown stops the listeners, closes the
+// IDLE connections and then waits for the active handlers; at its deadline it
+// merely RETURNS context.DeadlineExceeded — it does not touch an active
+// connection (only srv.Close does), and a handler that finishes afterwards
+// still writes its response to a client that is still attached. What actually
+// cut the observed request was the PROCESS EXITING a few steps later: run
+// returns, the sockets die with it, and the client sees "Empty reply from
+// server" — no status, no body, nothing an agent can classify — while the
+// process exited 0 with four INFO lines and no hint anything had been dropped.
+// Draining FIRST turns every parked lookup into a 503 + Retry-After that
+// finishes well inside the step, and the deadline — which used to be swallowed
+// on purpose — now WARNS with what is still in flight and about to be cut by
+// the exit, because that silence is what made this invisible in the first place.
+func shutdownHTTP(ctx context.Context, srv *http.Server, drain func() int, inFlight func() int64, budget time.Duration, log *slog.Logger) error {
+	if n := drain(); n > 0 {
+		// Worth a line of its own: these clients got a refusal rather than the
+		// metadata they asked for, and it is the one loss a graceful shutdown
+		// causes. The count spans BOTH parking spots (the store's per-ID waiters
+		// and the requests waiting on the initial sync);
+		// kubescrape_container_lookups_drained_total carries the store's share
+		// into the final export.
+		log.Info("released blocked container lookups so they can be answered", "lookups", n)
+	}
+	sctx, cancel := context.WithTimeout(ctx, budget)
+	defer cancel()
+	err := srv.Shutdown(sctx)
+	switch {
+	case err == nil:
+		return nil
+	case errors.Is(err, context.DeadlineExceeded):
+		// Shutdown gave up WAITING; it did not close anything. These handlers
+		// keep running and their clients stay attached until the process exits
+		// moments later, which is what cuts them without a response.
+		log.Warn("http shutdown budget exceeded; requests still in flight will be cut without a response when the process exits",
+			"budget", budget, "requestsInFlight", inFlight())
+		return nil
+	default:
+		return fmt.Errorf("http shutdown: %w", err)
+	}
+}
 
 // waitFor waits for wg with a deadline, reporting whether it finished in time.
 func waitFor(wg *sync.WaitGroup, budget time.Duration) bool {
@@ -1063,11 +1150,18 @@ func trimContainer(c *corev1.Container) {
 // Readiness LATCHES: /readyz gates on the initial sync and is never
 // re-evaluated. So a list/watch that breaks AFTER that — revoked RBAC, a
 // deleted CRD, an apiserver rejecting the watch — leaves the reflector
-// retrying forever while /readyz stays 200, the store gauges freeze at
-// plausible values, and every response is served from a cache that has quietly
-// stopped advancing. Without this the only trace is a klog line, which is not
-// alertable; the startup half of exactly this failure was already found and
-// fixed once (the PodMonitor informer that 403-looped behind a green /readyz).
+// retrying forever while /readyz stays 200 and every response is served from a
+// cache that has quietly stopped advancing. Nor do the store gauges freeze at
+// plausible values: the tombstone sweeper keeps running over a store nothing
+// refills, so kubescrape_store_pods DECAYS (measured 89 -> 85 over five
+// minutes) and an alert on a FLAT gauge reads healthy exactly when it must not.
+// Without this the only trace is a klog line, which is not alertable; the
+// startup half of exactly this failure was already found and fixed once (the
+// PodMonitor informer that 403-looped behind a green /readyz).
+//
+// It covers the refusals the API server ANSWERS, and a failed relist. It does
+// NOT reliably cover an UNREACHABLE server — that is what the reachability
+// probe in apiserver.go is for; obs.InformerWatchErrors carries the mechanism.
 //
 // Must be called before the informer is started.
 func watchErrors(inf cache.SharedInformer, resource string) error {

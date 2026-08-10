@@ -29,9 +29,10 @@ const (
 // scrapeable (no IP, already finished).
 //
 // Each entry of the port annotation may be a port number or the name of a
-// declared container port. Without a port annotation, every declared
-// container port becomes a target. The pod (including any owners the caller
-// resolved) is embedded in each target.
+// declared container port (ONE declaration of it — containerPortByName's rule,
+// shared with every other path that resolves a name). Without a port
+// annotation, every declared container port becomes a target. The pod
+// (including any owners the caller resolved) is embedded in each target.
 func PodTargets(pod kubemeta.Pod) []kubemeta.ScrapeTarget {
 	if pod.Annotations[AnnotationScrape] != "true" || !Scrapeable(pod) {
 		return nil
@@ -53,7 +54,9 @@ func PodTargets(pod kubemeta.Pod) []kubemeta.ScrapeTarget {
 // Each entry of the service's port annotation may be a service port number
 // or a service port name; without the annotation every service port is used.
 // Service ports are translated to pod ports via their targetPort (named
-// container port, explicit number, or the port itself).
+// container port — resolved to ONE declaration by containerPortByName, exactly
+// as the endpoints controller and a ServiceMonitor endpoint resolve it —
+// explicit number, or the port itself).
 func ServiceTargets(pod kubemeta.Pod, svc *services.Service) []kubemeta.ScrapeTarget {
 	if svc == nil || svc.Annotations[AnnotationScrape] != "true" || !Scrapeable(pod) {
 		return nil
@@ -210,19 +213,84 @@ func podMonitorEndpoint(pod kubemeta.Pod, ep servicemonitors.Endpoint) (scheme, 
 	return scheme, path, port, true
 }
 
-// containerPortByName finds a declared container port by name.
+// containerPortByName resolves a container-port NAME to a pod port: the first
+// declaration on a REGULAR container, and only if none carries the name, the
+// first on an init/sidecar or ephemeral container.
+//
+// It is the ONE resolver for that question, and every path in this package
+// that asks it goes through here — the pod annotation's named entry
+// (podPorts), a Service port's named targetPort (TargetPodPort, hence
+// ServiceTargets), a ServiceMonitor endpoint's targetPort and a PodMonitor
+// endpoint's port/targetPort (monitorPodPort/podMonitorEndpoint). One function
+// because one pod must get ONE answer: a pod may legally declare one name on
+// two containers (Kubernetes only WARNS about it at admission), and while the
+// paths each open-coded the walk they disagreed about exactly that pod — the
+// annotation resolved the name to every declaration and the Service's
+// targetPort to the first, two answers in one response for one name on one
+// pod. TestEveryPortPathAgreesOnADuplicateName pins the agreement.
+//
+// ONE declaration, not every one, because that is what the rest of the stack
+// resolves: the endpoints/EndpointSlice controller translates a named
+// targetPort with podutil.FindPort, which returns the first container port
+// carrying the name, so the EndpointSlice carries ONE port — and both the
+// classic prometheus.io/* Service convention (Prometheus' endpoints role) and
+// prometheus-operator's generated jobs (endpointslice role, a keep on the
+// endpoint's port name) scrape exactly that one. Resolving every declaration
+// would make kubescrape scrape a port neither of them does, and — since the
+// monitor path resolves ONE URL by contract (MonitorTargetURL is the identity
+// the server dedups and merges on) — it would do it through a target no
+// monitor endpoint could ever upgrade: the live shape was a monitor-derived
+// target on the first port carrying the CR's bearer token and drop rules, and
+// a bare service-source target on the second carrying neither. A pod that
+// wants both declarations scraped names them by NUMBER
+// ("prometheus.io/port: 9100,9200") or drops the annotation — without one
+// every declared container port is a target, which is unchanged; explain says
+// so on any name a pod declares twice.
+//
+// REGULAR CONTAINERS FIRST is the other half of that fidelity argument, and it
+// is not the order the pod document is in: kubeconvert.FromPod appends
+// spec.initContainers BEFORE spec.containers (it builds the model in the spec's
+// own order, which is what the container endpoints report), while FindPort
+// iterates spec.Containers ONLY. A native sidecar — an initContainer with
+// restartPolicy: Always, the recommended sidecar shape since 1.29 — that
+// declares the app's port name (a service mesh's "metrics" is the live case)
+// therefore came first in this walk and won, so kubescrape scraped the mesh
+// proxy's 15020 where Kubernetes, Prometheus and prometheus-operator all
+// resolve the app's 9090. Preferring the regular containers restores exactly
+// FindPort's answer wherever FindPort has one.
+//
+// A name NO regular container declares still resolves, from the init/ephemeral
+// pass, and that is deliberate: it is the one case where FindPort has no answer
+// at all (an EndpointSlice would carry nothing), so nothing is being contradicted
+// — while dropping it would silently stop scraping a metrics port a sidecar
+// legitimately owns, which is a common shape for a proxy or an exporter running
+// as a native sidecar in a pod whose app declares no ports. Second pass, not
+// first: the fallback must never outrank a regular container's declaration.
+//
+// The empty-name check is NOT a redundant nil-guard, and must not be removed
+// as one: it is the phantom-target guard PodMonitorTargets depends on. That
+// path passes a degenerate string targetPort straight here, so without it an
+// endpoint with `targetPort: ""` would match the first UNNAMED container port
+// and mint a scrape target the user never declared. MonitorTargets states the
+// same precondition explicitly at its own call site; this is where the
+// PodMonitor half of it lives.
 func containerPortByName(pod kubemeta.Pod, name string) (int32, bool) {
-	// The empty-name check is NOT a redundant nil-guard, and must not be
-	// removed as one: it is the phantom-target guard PodMonitorTargets depends
-	// on. That path passes a degenerate string targetPort straight here, so
-	// without it an endpoint with `targetPort: ""` would match the first
-	// UNNAMED container port and mint a scrape target the user never declared.
-	// MonitorTargets states the same precondition explicitly at its own call
-	// site; this is where the PodMonitor half of it lives.
 	if name == "" {
 		return 0, false
 	}
+	if p, ok := portByName(pod, name, true); ok {
+		return p, true
+	}
+	return portByName(pod, name, false)
+}
+
+// portByName is containerPortByName's one pass: the first declaration of the
+// name among the regular containers, or among the others.
+func portByName(pod kubemeta.Pod, name string, regular bool) (int32, bool) {
 	for _, c := range pod.Containers {
+		if regularContainer(c) != regular {
+			continue
+		}
 		for _, p := range c.Ports {
 			if p.Name == name {
 				return p.Port, true
@@ -230,6 +298,38 @@ func containerPortByName(pod kubemeta.Pod, name string) (int32, bool) {
 		}
 	}
 	return 0, false
+}
+
+// regularContainer reports whether this is one of spec.containers — the list
+// podutil.FindPort walks.
+//
+// It tests for the two OTHER types rather than for "container", so a Pod model
+// built without the field (a hand-written one in a test, or a future producer
+// that leaves it empty) keeps the whole-document order this walk had before the
+// two passes existed. An unstamped container mis-sorted into the fallback pass
+// would be a silent port change; mis-sorted into the first pass it is exactly
+// the old behaviour.
+func regularContainer(c kubemeta.Container) bool {
+	return c.Type != "init" && c.Type != "ephemeral"
+}
+
+// containerPortDeclarations counts how many containers declare a port under
+// this name. Nothing derives a target from it — it exists so explain can say
+// that a duplicated name resolved to ONE of its declarations and how to reach
+// the others (containerPortByName's rule, which is silent in the target list).
+func containerPortDeclarations(pod kubemeta.Pod, name string) int {
+	if name == "" {
+		return 0
+	}
+	n := 0
+	for _, c := range pod.Containers {
+		for _, p := range c.Ports {
+			if p.Name == name {
+				n++
+			}
+		}
+	}
+	return n
 }
 
 // MonitorPortNumber extracts a numeric targetPort, bounds-checked to the
@@ -403,12 +503,12 @@ func podPorts(pod kubemeta.Pod) []int32 {
 			add(n)
 			continue
 		}
-		for _, c := range pod.Containers {
-			for _, p := range c.Ports {
-				if p.Name == entry {
-					add(p.Port)
-				}
-			}
+		// Through the ONE name resolver, not a fourth open-coded walk: this
+		// used to add EVERY declaration of the name while the Service and
+		// monitor paths took the first, so one pod got two answers for one
+		// name in one response (containerPortByName's doc has the whole rule).
+		if p, ok := containerPortByName(pod, entry); ok {
+			add(p)
 		}
 	}
 	return ports
@@ -434,7 +534,11 @@ func selectServicePorts(svc *services.Service) []services.Port {
 	return out
 }
 
-// TargetPodPort translates a service port to the pod port it targets.
+// TargetPodPort translates a service port to the pod port it targets — the ONE
+// answer both callers of a Service port get: the service-annotation path
+// (ServiceTargets) and a ServiceMonitor endpoint naming that port
+// (monitorPodPort). A named targetPort goes through containerPortByName, whose
+// doc carries the first-declaration rule and why it is the whole stack's.
 func TargetPodPort(pod kubemeta.Pod, sp services.Port) (int32, bool) {
 	if sp.TargetPortName != "" {
 		return containerPortByName(pod, sp.TargetPortName)

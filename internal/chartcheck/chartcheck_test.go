@@ -200,6 +200,13 @@ func TestValuesSchemaRejectsUnknownKeys(t *testing.T) {
 	}
 }
 
+// selfMetricsInterval's own test lived here: "0 disables" is what an operator
+// copies, YAML reads a bare 0 as a NUMBER, and the string-only schema refused
+// the install before rendering anything. It has moved into duration_test.go's
+// generic tables — the field turned out to be one of FIFTEEN chart values
+// rendered into a flag.Duration, and a per-field test is exactly what let its
+// twin (agent.logsIdleClose) keep half a guard.
+
 // A human-format agent.logsMetrics.maxBytes ("3MiB") used to pass the
 // string-typed schema and render `-logs-metrics-max-bytes=0`: helm's int64
 // parses any non-number to 0, and the agent defines 0 as "no byte bound, one

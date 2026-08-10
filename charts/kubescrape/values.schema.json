@@ -62,13 +62,16 @@
           "type": "string"
         },
         "selfMetricsInterval": {
-          "type": "string"
+          "$ref": "#/definitions/durationOrZero",
+          "description": "-self-metrics-interval: a duration, or 0 = the OTLP push off, kubescrape_* served on the /metrics scrape instead"
         },
         "waitTimeout": {
-          "type": "string"
+          "$ref": "#/definitions/duration",
+          "description": "-wait-timeout"
         },
         "cacheTTL": {
-          "type": "string"
+          "$ref": "#/definitions/duration",
+          "description": "-cache-ttl"
         },
         "serviceMonitors": {
           "type": "boolean"
@@ -98,7 +101,8 @@
               "type": "string"
             },
             "timeout": {
-              "type": "string"
+              "$ref": "#/definitions/duration",
+              "description": "-otlp-timeout"
             },
             "bearerTokenSecret": {
               "type": "object",
@@ -195,7 +199,8 @@
           "type": "string"
         },
         "selfMetricsInterval": {
-          "type": "string"
+          "$ref": "#/definitions/durationOrZero",
+          "description": "-self-metrics-interval: a duration, or 0 = the OTLP push off, kubescrape_* served on the /metrics scrape instead"
         },
         "logs": {
           "type": "boolean"
@@ -234,7 +239,8 @@
               "type": "integer"
             },
             "flushInterval": {
-              "type": "string"
+              "$ref": "#/definitions/duration",
+              "description": "-journald-flush-interval"
             }
           },
           "additionalProperties": false
@@ -309,10 +315,12 @@
               "type": "integer"
             },
             "retryBackoff": {
-              "type": "string"
+              "$ref": "#/definitions/duration",
+              "description": "-otlp-retry-backoff"
             },
             "timeout": {
-              "type": "string"
+              "$ref": "#/definitions/duration",
+              "description": "-otlp-timeout"
             },
             "maxSendBytes": {
               "type": "integer"
@@ -365,10 +373,8 @@
           "type": "string"
         },
         "logsIdleClose": {
-          "type": ["integer", "string"],
-          "minimum": 0,
-          "maximum": 0,
-          "description": "-logs-idle-close is a Go duration flag: use a duration string (e.g. 30s) or 0 (= never); a bare non-zero integer would fail the agent's flag parse, so only 0 is accepted as an integer"
+          "$ref": "#/definitions/durationOrZero",
+          "description": "-logs-idle-close: a duration, or 0 = never close an idle file's fd"
         },
         "logsFileAttributes": {
           "type": "boolean"
@@ -386,11 +392,13 @@
           "type": "object",
           "properties": {
             "interval": {
-              "type": "string"
+              "$ref": "#/definitions/durationOrEmpty",
+              "description": "-logs-metrics-interval; \"\" omits the flag (the binary's own 30s default)"
             },
             "maxBytes": {
               "type": "string",
-              "pattern": "^[0-9]*$"
+              "pattern": "^[0-9]*$",
+              "description": "-logs-metrics-max-bytes takes integer BYTES, so this is digits-only as a STRING (\"3145728\"); \"\" omits the flag. A human-format \"3MiB\" is refused here and, under --skip-schema-validation, again by the kubescrape.logsMetricsMaxBytes template guard — helm's int64 parses it to 0, which the flag defines as \"no byte bound\", the opposite of the requested bound. Deliberately NOT typed integer: a values-file number reaches the template as a float64 whose toString is \"3.145728e+06\", which the guard refuses anyway — a quoted string is the only form that survives both layers"
             },
             "namePrefix": {
               "type": "string"
@@ -402,7 +410,8 @@
           "type": "boolean"
         },
         "logsPollInterval": {
-          "type": "string"
+          "$ref": "#/definitions/duration",
+          "description": "-logs-poll-interval"
         },
         "logsFingerprintBytes": {
           "type": "integer"
@@ -411,7 +420,8 @@
           "type": "boolean"
         },
         "scrapeInterval": {
-          "type": "string"
+          "$ref": "#/definitions/duration",
+          "description": "-scrape-interval"
         },
         "scrapeExemplars": {
           "type": "boolean"
@@ -474,10 +484,12 @@
           "type": "integer"
         },
         "flushInterval": {
-          "type": "string"
+          "$ref": "#/definitions/duration",
+          "description": "-events-flush-interval"
         },
         "positionInterval": {
-          "type": "string"
+          "$ref": "#/definitions/duration",
+          "description": "-events-position-interval"
         },
         "priorityClassName": {
           "type": "string"
@@ -559,7 +571,8 @@
           "type": "boolean"
         },
         "spanMetricsInterval": {
-          "type": "string"
+          "$ref": "#/definitions/duration",
+          "description": "-ingest-span-metrics-interval"
         },
         "extraArgs": {
           "type": "array",
@@ -666,6 +679,37 @@
     }
   },
   "additionalProperties": false,
+  "definitions": {
+    "duration": {
+      "type": "string",
+      "pattern": "^(0|(([0-9]+(\\.[0-9]*)?|\\.[0-9]+)(ns|us|µs|μs|ms|s|m|h))+)$",
+      "description": "A Go duration for a flag.Duration: 30s, 500ms, 1h30m, or a bare 0. helm renders the value VERBATIM into the flag, so whatever time.ParseDuration rejects here is `invalid value for flag` + exit 2 at container start — a CrashLoopBackOff found after the rollout began, instead of a refused helm upgrade. The pattern IS Go's grammar (a unit is required on every non-zero number, so 60 and 1e1 are refused; ns/us/µs/μs/ms/s/m/h only, so no d or w) minus the sign, because every duration in this chart is a period, a timeout or a budget where a negative silently means off or immediate. ONE home for the grammar: every duration value $refs this, which is what keeps a fix from reaching one field and missing its twin"
+    },
+    "durationOrEmpty": {
+      "anyOf": [
+        {
+          "const": ""
+        },
+        {
+          "$ref": "#/definitions/duration"
+        }
+      ],
+      "description": "A duration, or \"\" for the values whose flag is `with`-guarded in the template and simply not rendered when empty. Only those: everywhere else an empty string renders `-flag=`, which is `invalid duration \"\"`"
+    },
+    "durationOrZero": {
+      "anyOf": [
+        {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 0
+        },
+        {
+          "$ref": "#/definitions/duration"
+        }
+      ],
+      "description": "A duration, or the NUMBER 0 — for the values that values.yaml documents as `0 disables`, which is what an operator copies and which YAML reads as a number. Both forms must stay legal and render the same flag, so `--set x=0` and `--set-string x=0` cannot produce different pods. Both branches need their own guard: the integer branch is bounded to exactly 0 (a bare non-zero number is not a duration), and the string branch needs the pattern because helm's strvals keeps every token it cannot read as an int64 as a STRING — 0.5, abc and 1e1 never reach the number branch at all — while --set-string bypasses it by design"
+    }
+  },
   "$schema": "http://json-schema.org/draft-07/schema#",
   "title": "kubescrape Helm chart values"
 }

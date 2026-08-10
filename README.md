@@ -159,7 +159,7 @@ Targets come from four sources:
 | Annotation             | Meaning                                                        |
 |------------------------|----------------------------------------------------------------|
 | `prometheus.io/scrape` | must be `"true"` for targets to be generated                   |
-| `prometheus.io/port`   | comma-separated list of port numbers and/or port names (container-port names on pods, service-port names/numbers on services); if absent, every declared port becomes a target |
+| `prometheus.io/port`   | comma-separated list of port numbers and/or port names (container-port names on pods, service-port names/numbers on services); if absent, every declared port becomes a target. A NAME resolves to one port: a regular container's declaration wins over an init/sidecar or ephemeral one (so a native sidecar cannot take the app container's port name), and every path — this annotation, a Service's named `targetPort`, a monitor endpoint — resolves it the same way |
 | `prometheus.io/path`   | metrics path, default `/metrics`                               |
 | `prometheus.io/scheme` | `http` (default) or `https`                                    |
 

@@ -75,7 +75,19 @@ func (s *Server) handleExplain(w http.ResponseWriter, r *http.Request) {
 	if !s.requireReady(w, "") {
 		return
 	}
-	namespace, name := r.PathValue("namespace"), r.PathValue("name")
+	doc, _ := s.explainPod(r.PathValue("namespace"), r.PathValue("name"))
+	// 200 even for a miss: the explanation IS the resource this endpoint
+	// serves, and `curl -f` hiding the body on a 404 would defeat its purpose.
+	writeJSON(w, http.StatusOK, doc)
+}
+
+// explainPod builds the document, returning the ScrapeTargets it derived
+// alongside it. The targets are returned — not merely summarised into the
+// document — so explain_parity_test.go can compare them field for field against
+// the ones nodeTargets serves: the document exposes the URL, source and monitor
+// list, while a fold divergence first shows up in the merged relabel chain and
+// cadence, which are not on the document at all.
+func (s *Server) explainPod(namespace, name string) (explainDoc, []kubemeta.ScrapeTarget) {
 	doc := explainDoc{
 		Namespace:       namespace,
 		Pod:             name,
@@ -85,10 +97,7 @@ func (s *Server) handleExplain(w http.ResponseWriter, r *http.Request) {
 	np, ok := s.store.GetPodByName(namespace, name)
 	if !ok {
 		doc.Hint = "pod not found in the store (wrong namespace/name, or deleted longer than -cache-ttl ago); the store is filled from the pod informer, so a very recently created pod may appear within a second"
-		// 200, not 404: the explanation IS the resource this endpoint serves,
-		// and `curl -f` hiding the body on a 404 would defeat its purpose.
-		writeJSON(w, http.StatusOK, doc)
-		return
+		return doc, nil
 	}
 	doc.Found = true
 	pod := np.Pod
@@ -113,6 +122,15 @@ func (s *Server) handleExplain(w http.ResponseWriter, r *http.Request) {
 	var targets []kubemeta.ScrapeTarget
 	var d targetDedup
 	d.reset(&targets)
+	// The SAME offer dedup nodeTargets uses, not a second one shaped like it:
+	// the monitor endpoints are swept once per matched SERVICE here too, and
+	// scrape.MergeMonitorEndpoint is a fold, so without it a pod behind two
+	// Services was explained with a contributor list and a relabel chain the
+	// served target does not have — the drift this endpoint exists to make
+	// impossible. explain_parity_test.go drives both paths over 1, 2 and 3
+	// Services.
+	var offers monitorOffers
+	offers.reset()
 	for _, t := range scrape.PodTargets(pod) {
 		d.add(t)
 	}
@@ -126,10 +144,13 @@ func (s *Server) handleExplain(w http.ResponseWriter, r *http.Request) {
 			d.add(t)
 		}
 		for _, sme := range monitored[svc.UID] {
-			es.Monitors = append(es.Monitors, s.explainMonitorEndpoint(&d, pod, svc, sme))
+			es.Monitors = append(es.Monitors, s.explainMonitorEndpoint(&d, &offers, pod, svc, sme))
 		}
 		doc.Services = append(doc.Services, es)
 	}
+	// No offer dedup on this sweep, exactly as in nodeTargets: a PodMonitor
+	// selects PODS, so each of its endpoints is offered once per pod with no
+	// enclosing per-Service loop and there is no repeat to suppress.
 	for _, pm := range podMonitors {
 		for i := range pm.monitor.Endpoints {
 			ep := &pm.monitor.Endpoints[i]
@@ -177,12 +198,15 @@ func (s *Server) handleExplain(w http.ResponseWriter, r *http.Request) {
 			doc.Hint = "an opt-in exists but no port resolved; see portEntries / services[].portEntries for the entry-by-entry verdicts"
 		}
 	}
-	writeJSON(w, http.StatusOK, doc)
+	return doc, targets
 }
 
 // explainMonitorEndpoint runs one ServiceMonitor endpoint through the same
-// resolve-then-dedup the targets path uses, recording the verdict.
-func (s *Server) explainMonitorEndpoint(d *targetDedup, pod kubemeta.Pod, svc *services.Service, sme monitorEndpoint) explainMonitor {
+// resolve-then-offer-then-dedup the targets path takes, recording the verdict.
+// Every step here is nodeTargets' step, in nodeTargets' order — the counters
+// and the conflict warning are the only things left out (see the package
+// comment); a step skipped here explains a target the server does not serve.
+func (s *Server) explainMonitorEndpoint(d *targetDedup, offers *monitorOffers, pod kubemeta.Pod, svc *services.Service, sme monitorEndpoint) explainMonitor {
 	em := explainMonitor{Monitor: sme.monitor}
 	url, ok := scrape.MonitorTargetURL(pod, svc, *sme.endpoint)
 	if !ok {
@@ -190,7 +214,16 @@ func (s *Server) explainMonitorEndpoint(d *targetDedup, pod kubemeta.Pod, svc *s
 		return em
 	}
 	em.Resolved, em.URL = true, url
+	if !offers.first(url, sme.endpoint) {
+		// Resolved, and honoured — through the earlier Service. Reporting it as
+		// a fresh merge would be reporting a second fold that does not happen.
+		em.Note = "already folded in through an earlier Service selecting this pod; each monitor endpoint is honoured once per URL, so this repeat changes nothing"
+		return em
+	}
 	if held, taken := d.monitorHolder(url); taken {
+		// The adopted/conflict verdicts are the counter's and the warning's,
+		// which this endpoint does not move: the targets path reports the
+		// conflict once, and reporting it from here would double-count it.
 		scrape.MergeMonitorEndpoint(held, sme.monitor, sme.endpoint)
 		em.Note = "merged into the target already held for this URL"
 		return em

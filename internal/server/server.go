@@ -151,6 +151,28 @@ type Server struct {
 	// they need no mutex here.
 	warnRefs     *logdedupe.Table
 	warnShadowed *logdedupe.Table
+
+	// inFlight counts /v1 requests currently inside a handler. It exists for
+	// ONE line: when http.Server.Shutdown hits its budget it stops waiting and
+	// returns, leaving those handlers running — and the process exit a moment
+	// later is what cuts their connections without a response. That used to be
+	// completely silent: a parked container lookup got "Empty reply from
+	// server" and the process exited 0 with nothing logged. The number is what
+	// makes the warning actionable. Two atomics on a path that already bumps a
+	// counter vec; the health and debug routes are not wrapped and never block.
+	inFlight atomic.Int64
+
+	// draining is closed by Drain. It releases the OTHER place a container
+	// lookup parks: waitReady, which holds the request for its whole wait
+	// budget while the initial informer sync is outstanding. The store's waiter
+	// is the one everybody thinks of, but a SIGTERM before the caches sync
+	// never reaches it — and that is the case most correlated with an
+	// API-server outage, i.e. exactly when a rollout is likeliest to be killed
+	// mid-startup. readyParked is how many requests are sitting there, for the
+	// count Drain reports.
+	drainOnce   sync.Once
+	draining    chan struct{}
+	readyParked atomic.Int64
 }
 
 // New creates a Server.
@@ -174,7 +196,49 @@ func New(cfg Config) *Server {
 		logger:           cfg.Log,
 		warnRefs:         logdedupe.New(maxScrapeAuthWarnRefs, scrapeAuthWarnEvery),
 		warnShadowed:     logdedupe.New(maxShadowedWarnPairs, shadowWarnEvery),
+		draining:         make(chan struct{}),
 	}
+}
+
+// Drain releases every request parked waiting for metadata and refuses the
+// later ones, returning how many were released. Idempotent; safe to call from
+// any goroutine.
+//
+// It covers BOTH parking spots a container lookup has, which is the whole
+// point: the store's per-ID waiter (Store.Drain) and this Server's wait for the
+// initial informer sync (waitReady). The second one is easy to forget and is
+// the one that bites on the worst path — a SIGTERM arriving before the caches
+// sync leaves no store waiters at all, because no request has got that far, so
+// draining only the store would still leave every lookup parked for its full
+// wait budget and cut without a response when the process exits.
+//
+// It must run BEFORE http.Server.Shutdown: Shutdown WAITS for these handlers
+// and, at its deadline, returns without closing anything, so a request left
+// parked is cut by the process exit rather than answered.
+//
+// Idempotent means the COUNT too, not just the close: a second call reports 0.
+// The whole body is inside the guard because the number is a log line's — the
+// caller logs "released blocked container lookups" when it is nonzero — and a
+// readyParked read left outside would let a second Drain re-report parks the
+// first call had already released and re-log the loss they represent. The
+// store's half returns 0 on its own second call; this keeps the two halves
+// answering the same way.
+func (s *Server) Drain() int {
+	released := 0
+	s.drainOnce.Do(func() {
+		// Read the readiness parks BEFORE the close: they wake the instant the
+		// channel closes and decrement on their way out, so a count taken
+		// afterwards shrinks while it is being read. A request parking in that
+		// same instant is missed instead — neither direction is worth a lock on
+		// the request path. The store's half IS exact, being taken under its
+		// write lock.
+		released = int(s.readyParked.Load())
+		close(s.draining)
+		if s.store != nil {
+			released += s.store.Drain()
+		}
+	})
+	return released
 }
 
 // log returns the configured logger, or the process default.
@@ -256,15 +320,15 @@ func (s *Server) reportAuthConflict(kind, winner, loser, url string) {
 // Handler returns the HTTP routes.
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /v1/containers/{id...}", counted("/v1/containers", s.handleContainer))
-	mux.HandleFunc("GET /v1/pods/{namespace}/{name}", counted("/v1/pods", s.handlePod))
-	mux.HandleFunc("GET /v1/pod-uids/{uid}", counted("/v1/pod-uids", s.handlePodByUID))
-	mux.HandleFunc("GET /v1/pod-ips/{ip}", counted("/v1/pod-ips", s.handlePodByIP))
-	mux.HandleFunc("GET /v1/self", counted("/v1/self", s.handleSelf))
-	mux.HandleFunc("GET /v1/nodes/{node}/targets", counted("/v1/nodes/targets", s.handleNodeTargets))
-	mux.HandleFunc("GET /v1/nodes/{node}/metadata", counted("/v1/nodes/metadata", s.handleNodeMetadata))
-	mux.HandleFunc("GET /v1/explain/{namespace}/{name}", counted("/v1/explain", s.handleExplain))
-	mux.HandleFunc("GET /v1/scrape-auth/{namespace}/{name}/{key}", counted("/v1/scrape-auth", s.handleScrapeAuth))
+	mux.HandleFunc("GET /v1/containers/{id...}", s.counted("/v1/containers", s.handleContainer))
+	mux.HandleFunc("GET /v1/pods/{namespace}/{name}", s.counted("/v1/pods", s.handlePod))
+	mux.HandleFunc("GET /v1/pod-uids/{uid}", s.counted("/v1/pod-uids", s.handlePodByUID))
+	mux.HandleFunc("GET /v1/pod-ips/{ip}", s.counted("/v1/pod-ips", s.handlePodByIP))
+	mux.HandleFunc("GET /v1/self", s.counted("/v1/self", s.handleSelf))
+	mux.HandleFunc("GET /v1/nodes/{node}/targets", s.counted("/v1/nodes/targets", s.handleNodeTargets))
+	mux.HandleFunc("GET /v1/nodes/{node}/metadata", s.counted("/v1/nodes/metadata", s.handleNodeMetadata))
+	mux.HandleFunc("GET /v1/explain/{namespace}/{name}", s.counted("/v1/explain", s.handleExplain))
+	mux.HandleFunc("GET /v1/scrape-auth/{namespace}/{name}/{key}", s.counted("/v1/scrape-auth", s.handleScrapeAuth))
 	// The debug homepage (forms for the parameterised routes above), plus a
 	// root redirect so a bare port-forward lands somewhere useful.
 	mux.HandleFunc("GET /debug", s.handleDebugHome)
@@ -276,9 +340,14 @@ func (s *Server) Handler() http.Handler {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))
 	})
+	// /readyz reports the INITIAL sync and nothing after it, on purpose: see
+	// the latch comment in cmd/kubescrape's run. An API server that goes away
+	// later must not flip this to 503 — that would delete the Service's
+	// endpoints and cut every agent off a cache that is still serving useful
+	// data. kubescrape_apiserver_reachable is where that condition is reported.
 	mux.HandleFunc("GET /readyz", func(w http.ResponseWriter, _ *http.Request) {
 		if !s.isReady() {
-			http.Error(w, "informer caches not synced", http.StatusServiceUnavailable)
+			http.Error(w, errNotSynced.Error(), http.StatusServiceUnavailable)
 			return
 		}
 		w.WriteHeader(http.StatusOK)
@@ -314,14 +383,22 @@ func (s *Server) HTTPServer(addr string) *http.Server {
 	}
 }
 
-// counted wraps a handler with the per-pattern request counter.
-func counted(pattern string, h http.HandlerFunc) http.HandlerFunc {
+// counted wraps a handler with the per-pattern request counter and the
+// in-flight gauge shutdown reports from.
+func (s *Server) counted(pattern string, h http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		s.inFlight.Add(1)
+		defer s.inFlight.Add(-1)
 		rec := &statusRecorder{ResponseWriter: w, code: http.StatusOK}
 		h(rec, r)
 		obs.HTTPRequests.WithLabelValues(pattern, strconv.Itoa(rec.code)).Inc()
 	}
 }
+
+// InFlight reports how many /v1 requests are inside a handler right now. Read
+// by the shutdown path to say how many were still running when the budget ran
+// out — and so will be cut, without a response, by the process exit.
+func (s *Server) InFlight() int64 { return s.inFlight.Load() }
 
 type statusRecorder struct {
 	http.ResponseWriter
@@ -469,23 +546,49 @@ func (s *Server) requireReady(w http.ResponseWriter, retryAfter string) bool {
 	if retryAfter != "" {
 		w.Header().Set("Retry-After", retryAfter)
 	}
-	writeError(w, http.StatusServiceUnavailable, "informer caches not synced")
+	writeError(w, http.StatusServiceUnavailable, errNotSynced.Error())
 	return false
 }
 
-func (s *Server) waitReady(ctx context.Context) bool {
+// waitReady spends a container lookup's wait budget on the initial informer
+// sync, returning nil once the caches are synced.
+//
+// It is the SECOND place such a request parks (the store's per-ID waiter is the
+// first), and it is drained the same way: Drain closes s.draining and every
+// parked request answers errDraining — a retryable 503 — instead of holding the
+// handler until the process exits and cuts it without a status.
+func (s *Server) waitReady(ctx context.Context) error {
 	select {
 	case <-s.ready:
-		return true
+		return nil
 	default:
 	}
+	s.readyParked.Add(1)
+	defer s.readyParked.Add(-1)
 	select {
 	case <-s.ready:
-		return true
+		return nil
+	case <-s.draining:
+		// Both may be closed: a drain that arrives just as the caches sync must
+		// still serve the request, so readiness wins the race explicitly rather
+		// than by select's coin flip.
+		if s.isReady() {
+			return nil
+		}
+		return errDraining
 	case <-ctx.Done():
-		return false
+		return errNotSynced
 	}
 }
+
+// The two refusals waitReady can produce. Both are retryable 503s, and they say
+// different things to whoever is holding the request: errNotSynced means this
+// pod is still filling its caches (wait), errDraining means this pod is going
+// away (retry — the next pod behind the Service can answer at once).
+var (
+	errNotSynced = errors.New("informer caches not synced")
+	errDraining  = errors.New("server is shutting down")
+)
 
 // etagMatches evaluates an If-None-Match header against the current entity
 // tag per RFC 9110: a comma-separated list of entity tags compared weakly (a

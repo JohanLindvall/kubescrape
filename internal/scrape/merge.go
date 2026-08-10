@@ -88,7 +88,7 @@ var endpointMergeClass = map[string]mergeClass{
 //     chains are order-insensitive for the union semantics and idempotent
 //     under duplication, so a longer chain is always safe; a chain identical
 //     to the holder's whole current chain is skipped (the same declaration
-//     arriving twice, e.g. one monitor reaching the pod through two Services).
+//     made twice — two monitors that agree).
 //   - interval/scrapeTimeout: an explicit interval beats an empty one; two
 //     explicit intervals resolve to the FINER (the coarser monitor is still
 //     scraped at least as often as it asked), and the timeout travels with
@@ -106,6 +106,30 @@ var endpointMergeClass = map[string]mergeClass{
 // (the holder had none): the serving credential now belongs to this monitor,
 // not the URL-holding one, and the caller records that so a later conflict
 // warning names the monitor whose material is actually served.
+//
+// # The caller contract: each endpoint is offered to a URL AT MOST ONCE
+//
+// This is a FOLD, not an idempotent operation — the second offer of a chain
+// appends it a second time, the second offer of a conflicting auth group
+// reports a second conflict — and it cannot be made idempotent from in here:
+// the only state it has is the served target, and "was THIS endpoint already
+// folded" is not a question the served target can answer. Nothing on the wire
+// records fold boundaries, so every test derived from the accumulated chain is
+// a guess. The contiguous-run guess was tried and is wrong in both directions:
+// with one Service, monitors declaring [A,B] and [A] served monitors=[] (the
+// contributor list EMPTY, where the model documents it as absent only when
+// Monitor alone describes the target), and a third monitor whose chain happens
+// to be a run of the merged one vanished from the list entirely.
+//
+// So the exactness lives at the caller, which knows the identity the merge
+// cannot see — the endpoint DECLARATION — and offers each (URL, endpoint) once
+// per pod: internal/server's monitorOffers. It has to, because that caller
+// walks the monitor endpoints once per matched SERVICE, so a pod behind two
+// Services reaches this function twice with the same declaration and the union
+// the API promises would otherwise be served doubled at two Services and
+// tripled at three (a single Service is exactly the union, which is why
+// nothing caught it for so long). internal/server's
+// TestMergedChainIsTheUnionAcrossMatchingServices drives the real loop.
 func MergeMonitorEndpoint(t *kubemeta.ScrapeTarget, monitor string, ep *servicemonitors.Endpoint) (authAdopted, authConflict bool) {
 	epAuth := endpointAuth(ep)
 	// The bare gate: one arm per mergeable class of endpointMergeClass —
@@ -269,6 +293,13 @@ func addContributor(t *kubemeta.ScrapeTarget, monitor string) {
 	}
 }
 
+// relabelChainsEqual is the identical-declaration test: two monitors asking
+// for exactly the same chain get it once, and the second is not a contributor
+// (nothing of its declaration was lost — see the "bare and identical merge
+// silently" rule). It is deliberately NOT a subsequence or substring test: a
+// monitor whose rules merely appear inside the accumulated chain made its own
+// declaration and must be listed as a contributor, whatever the other monitors
+// happen to have asked for.
 func relabelChainsEqual(a, b []kubemeta.RelabelRule) bool {
 	if len(a) != len(b) {
 		return false

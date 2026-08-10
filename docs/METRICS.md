@@ -61,6 +61,8 @@ is the documented alert for the non-buffered tailer.
 
 | Metric | Labels | Description |
 |---|---|---|
+| `kubescrape_apiserver_probe_failures_total` | — | API-server reachability probes that failed (a metadata-only LIST of one namespace, the same TCP/TLS/authn/authz path the informers use). Nonzero with the gauge back at 1 means the outage healed; a rising rate with the gauge at 0 is an outage in progress. |
+| `kubescrape_apiserver_reachable` | — | 1 when the last API-server probe opened a NEW connection and got an answer, 0 when it did not. A proxy for 'the informer caches can still refill', not a reading of the caches: a blackholed established watch can leave them frozen while this reads 1, and a single failed probe does not prove they stopped. Alert on it sustained. The service keeps serving its in-memory cache either way — readiness latches at the initial sync on purpose. Absent when -apiserver-probe-interval=0 (no probe runs); never 0 for that reason. |
 | `kubescrape_azure_commit_errors_total` | — | Offset commit failures (the records were delivered; a redelivery produces at-least-once duplicates). |
 | `kubescrape_azure_decode_errors_total` | — | Event Hubs messages or records that could not be decoded as Azure diagnostics JSON (skipped, committed past). |
 | `kubescrape_azure_dropped_batches_total` | — | Azure diagnostic payloads dropped after a permanent collector rejection (the offsets advance past them). |
@@ -80,6 +82,7 @@ is the documented alert for the non-buffered tailer.
 | `kubescrape_buffer_segments` | `signal` | Disk-buffer segment files on disk per signal. Physical footprint can exceed the backlog by up to one segment (a delivered but unreclaimed prefix). |
 | `kubescrape_buffer_truncated_bytes_total` | `signal` | Bytes the disk buffer lost to damage discovered at open (truncated, dropped or foreign segments). |
 | `kubescrape_container_lookups_blocked` | — | Container lookups currently blocked waiting for a container ID to appear. |
+| `kubescrape_container_lookups_drained_total` | — | Blocking container lookups answered with a retryable 503 because the process began shutting down. Without the drain they stayed parked until the process exit killed the connection mid-wait (curl reports an empty reply); this counts the answers, and it is expected to be nonzero on a rolling update, unlike kubescrape_container_lookups_shed_total. |
 | `kubescrape_container_lookups_shed_total` | — | Blocking container lookups refused because the store's concurrent-waiter cap was reached. |
 | `kubescrape_event_gap_discarded_total` | `stage` | Event watch expiries with no relist to fall back to (nothing exported yet and none armed): the next stream restarts at the CURRENT revision and whatever the dead watch never delivered is discarded — the events pipeline's one silent-loss arm, worth an alert wherever kubescrape_event_relists_total has one. |
 | `kubescrape_event_position_errors_total` | `operation` | Failures reading or writing the event position ConfigMap, by operation (load, save). |
@@ -93,7 +96,7 @@ is the documented alert for the non-buffered tailer.
 | `kubescrape_export_rejected_records_total` | `signal` | Records the collector REJECTED inside a payload it otherwise accepted (OTLP partial_success), by signal. The export succeeded, so every producer advanced its offset, cursor or position past them — these are lost, permanently, and retrying cannot help (OTLP defines them as invalid rather than deferred). Any nonzero rate means telemetry is being discarded downstream; the collector's own message is on the accompanying warning. |
 | `kubescrape_export_requests_total` | `signal`, `outcome` | OTLP export attempts by signal and outcome. |
 | `kubescrape_http_requests_total` | `pattern`, `code` | Metadata API requests by pattern and status code. |
-| `kubescrape_informer_watch_errors_total` | `resource` | List/watch failures reported by the informers, by resource. |
+| `kubescrape_informer_watch_errors_total` | `resource` | List/watch failures the informers REPORT, by resource: the refusals the API server ANSWERS (revoked RBAC, a deleted CRD, a rejected watch), plus any relist that fails. It does NOT reliably move while the API server is UNREACHABLE — client-go retries a refused watch internally and never relists, so this stayed flat through outages of up to five minutes — so alert on kubescrape_apiserver_reachable for that half. |
 | `kubescrape_ingest_admission_rejected_total` | — | Pushed RESOURCES the transforms file's ingest admission hook (ingest: admit(resource)) rejected — removed before enrichment, push still acked. The hook is the operator's per-sender policy on listeners nothing authenticates; a script error fails OPEN (the resource is admitted) and counts into kubescrape_transform_errors_total{signal="ingest"} instead. |
 | `kubescrape_ingest_log_chain_skipped_total` | `reason` | Ingested log RECORDS or RESOURCES whose line-derived processing (body enrichment, log-metrics observation) was skipped by an abuse bound — the data itself is still forwarded. Reasons: body_too_large (one record whose body's text view exceeds 1 MiB; the tailer never feeds lines past -logs-max-entry-bytes either, and attribute/severity-keyed rules still apply), resource_too_wide (one resource with more than 64 attributes — the metric store retains a serialization of the whole resource per series, so sender-chosen width is sender-chosen retained heap), resources_capped (a resource past the first 256 of one push). The listeners are unauthenticated; a nonzero rate is a sender worth finding. |
 | `kubescrape_ingest_rejected_total` | — | Pushed OTLP requests refused because a receiver admission bound was reached — concurrent in-flight pushes or buffered payload bytes (retryable: 429 / ResourceExhausted). |
@@ -180,4 +183,4 @@ is the documented alert for the non-buffered tailer.
 | `kubescrape_transform_errors_total` | `signal` | Transform program invocations that failed (the batch is NOT exported; the error propagates to the producer's retry path). |
 | `kubescrape_transform_reloads_total` | `outcome` | Transforms-file reloads by outcome (applied, failed — a failed compile keeps the last good program). |
 
-118 metrics.
+121 metrics.

@@ -258,6 +258,15 @@ func TestMergeSameMonitorSecondEndpointIsNotAContributor(t *testing.T) {
 	}
 }
 
+// The multi-Service fold — the same monitor endpoint offered once per matched
+// Service, which is where the union broke — is pinned in internal/server
+// (monitorunion_test.go), against the REAL nodeTargets loop. It was pinned
+// here first, against a hand-copied miniature of that loop, and a miniature
+// proves nothing about the caller: the exactness that keeps the fold a union
+// is the caller's offer dedup (see MergeMonitorEndpoint's caller contract), so
+// a re-implementation here would have passed while the server served the
+// chain twice.
+
 func TestPromDurationComparison(t *testing.T) {
 	for _, tc := range []struct {
 		in   string

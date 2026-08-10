@@ -148,6 +148,65 @@ func TestFromPodReadyAndDeletionTimestamp(t *testing.T) {
 	}
 }
 
+// A CrashLoopBackOff pod is the shape that breaks previousIncarnation's "a
+// restarted container gets a NEW runtime ID" premise: between restarts the
+// kubelet keeps status.containerID EQUAL to lastState.terminated.containerID
+// (observed live on real clusters). One runtime ID must have exactly ONE state
+// in the response — the live one — or GET /v1/containers/{id} contradicts the
+// pod document embedded in the same body.
+func TestFromPodCrashLoopBackOffSameContainerID(t *testing.T) {
+	started := time.Date(2026, 8, 1, 10, 0, 0, 0, time.UTC)
+	finished := started.Add(2 * time.Second)
+	pod, byID := FromPod(&corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "p", Namespace: "ns", UID: "u"},
+		Spec: corev1.PodSpec{
+			NodeName:   "node1",
+			Containers: []corev1.Container{{Name: "app", Image: "app:2"}},
+		},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodRunning,
+			ContainerStatuses: []corev1.ContainerStatus{{
+				Name:         "app",
+				ContainerID:  "containerd://sameid",
+				ImageID:      "sha256:img2",
+				RestartCount: 5,
+				State: corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{
+					Reason: "CrashLoopBackOff",
+				}},
+				LastTerminationState: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{
+					ContainerID: "containerd://sameid",
+					ExitCode:    1,
+					StartedAt:   metav1.Time{Time: started},
+					FinishedAt:  metav1.Time{Time: finished},
+				}},
+			}},
+		},
+	})
+
+	if len(byID) != 1 {
+		t.Fatalf("byID = %v, want exactly one entry: lastState names the SAME runtime ID as the live status", byID)
+	}
+	got, ok := byID["sameid"]
+	if !ok {
+		t.Fatalf("byID missing the container ID: %v", byID)
+	}
+	// The live status wins: waiting/CrashLoopBackOff, no exit code.
+	if got.State != "waiting" || got.WaitingReason != "CrashLoopBackOff" || got.ExitCode != nil {
+		t.Errorf("byID[sameid] = state %q reason %q exitCode %v, want the live waiting/CrashLoopBackOff view",
+			got.State, got.WaitingReason, got.ExitCode)
+	}
+	// ...and it agrees with the pod document served in the same response.
+	if len(pod.Containers) != 1 {
+		t.Fatalf("containers = %+v", pod.Containers)
+	}
+	cur := pod.Containers[0]
+	if got.State != cur.State || got.WaitingReason != cur.WaitingReason ||
+		got.RestartCount != cur.RestartCount || got.Image != cur.Image ||
+		(got.ExitCode == nil) != (cur.ExitCode == nil) {
+		t.Errorf("byID entry %+v disagrees with the pod document's container %+v", got, cur)
+	}
+}
+
 func testCorePod() *corev1.Pod {
 	created := time.Date(2026, 7, 1, 10, 0, 0, 0, time.UTC)
 	started := created.Add(5 * time.Second)

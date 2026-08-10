@@ -123,15 +123,44 @@ var (
 	// unrelated things across metrics an operator reads together.
 	ScrapeAuthFailures = Registry.CounterVec("kubescrape_scrape_auth_failures_total",
 		"Failed /v1/scrape-auth Secret resolutions by cause (not_found = no such Secret or key; upstream = forbidden, timeout or unreachable API server; not_utf8 = value cannot be served as a JSON string).", "reason")
-	// InformerWatchErrors counts list/watch failures reported by the shared
-	// informers' error handler. Readiness latches once the initial sync
-	// completes and is never re-evaluated, so a watch that breaks AFTER that
-	// (revoked RBAC, a deleted CRD, an apiserver rejecting the watch) leaves
-	// the reflector retrying forever while /readyz stays 200, the store gauges
-	// freeze at plausible values, and every response is served from a cache
-	// that has stopped advancing. This is the signal that says so.
+	// InformerWatchErrors counts the list/watch failures the reflector REPORTS
+	// to its error handler — a strictly smaller set than "the watch is
+	// unhealthy", and the difference is the point of this comment.
+	//
+	// client-go reaches the handler only when ListAndWatchWithContext RETURNS
+	// an error (reflector.go RunWithContext calls watchErrorHandler on any
+	// non-nil return). Two things do return one, and both land here: a refusal
+	// the API server ANSWERS on the LIST — revoked RBAC, a deleted CRD, a watch
+	// the server rejects — and a RELIST that fails for any reason at all
+	// (`err = r.list(ctx); if err != nil { return err }`).
+	//
+	// What it does NOT do is fire RELIABLY while the API server is
+	// UNREACHABLE, which is the shape an operator most wants to see. As long as
+	// the watch REQUEST itself keeps failing retriably (connection refused,
+	// 429 — isWatchErrorRetriable), the reflector backs off and `continue`s
+	// inside watchWithResync: it never returns, so it never relists, so nothing
+	// is reported. Measured across four outage shapes of up to five minutes: no
+	// series at all, /readyz 200 throughout, every log line INFO — and in one
+	// real outage the counter stepped only five seconds AFTER recovery. It may
+	// equally step during the next relist an outage happens to trigger; that is
+	// a signal you cannot alert on the absence of.
+	//
+	// The half it does cover is worth alerting on, because readiness LATCHES —
+	// /readyz gates on the initial sync and is never re-evaluated, deliberately,
+	// since an unready service loses its endpoints and cuts every agent off a
+	// cache that is still serving useful data — so once the process is up, this
+	// and the reachability probe are all that speak.
+	//
+	// For the unreachable half the signal is kubescrape_apiserver_reachable
+	// (RegisterAPIServerProbe), which exists because no PASSIVE signal is
+	// dependable:
+	// the store gauges do not even freeze at plausible values. The tombstone
+	// sweeper keeps running over a store nothing refills, so
+	// kubescrape_store_pods DECAYS during an outage (measured: 89 -> 85 over
+	// five minutes) — an alert on a FLAT gauge reads healthy exactly when it
+	// should not.
 	InformerWatchErrors = Registry.CounterVec("kubescrape_informer_watch_errors_total",
-		"List/watch failures reported by the informers, by resource.", "resource")
+		"List/watch failures the informers REPORT, by resource: the refusals the API server ANSWERS (revoked RBAC, a deleted CRD, a rejected watch), plus any relist that fails. It does NOT reliably move while the API server is UNREACHABLE — client-go retries a refused watch internally and never relists, so this stayed flat through outages of up to five minutes — so alert on kubescrape_apiserver_reachable for that half.", "resource")
 
 	// BufferTruncated counts bytes the disk buffer lost to damage discovered
 	// at OPEN (truncated tails, dropped or foreign segments — diskqueue's
@@ -679,6 +708,46 @@ func RegisterStoreStats(stats func() (pods, containers int)) {
 		func() float64 { _, containers := stats(); return float64(containers) })
 }
 
+// RegisterAPIServerProbe publishes the API-server reachability watchdog's two
+// series: a 1/0 gauge for the last probe's verdict and a counter of failed
+// probes.
+//
+// Registered exactly when the probe RUNS (-apiserver-probe-interval > 0), the
+// way RegisterSelfMetadata is: a published 0 then always means UNREACHABLE and
+// never "the probe is off", and an ABSENT family means nobody is looking —
+// which is a distinct thing for an alert to select on.
+//
+// It exists because no passive signal reliably sees the commonest outage.
+// kubescrape_informer_watch_errors_total stays flat while the API server is
+// merely unreachable (client-go retries a refused watch internally and never
+// relists — see that metric); /readyz latches at the initial sync by design;
+// and kubescrape_store_pods DECAYS rather than freezing, because the tombstone
+// sweeper keeps running over a store nothing refills.
+//
+// What the gauge measures is EXACTLY one thing: whether a NEW connection from
+// this pod, with this ServiceAccount, reached the API server on the last probe.
+// That is a proxy for "the cache can refill", not a reading of the cache
+// itself, and it is wrong in both directions at the margins. False negative:
+// an ESTABLISHED watch blackholed by a NetworkPolicy or a dead conntrack entry
+// leaves the cache frozen while a fresh connection still succeeds and this
+// reads 1 — the classic silent stall. False positive: one failed probe (a
+// dropped packet, an API server mid-restart, a 10s timeout under load) reads 0
+// without proving the informers missed anything. Alert on it SUSTAINED, and
+// read the failure counter for the history of an outage the process survived.
+func RegisterAPIServerProbe(reachable func() bool, failures func() int64) {
+	Registry.GaugeFunc("kubescrape_apiserver_reachable",
+		"1 when the last API-server probe opened a NEW connection and got an answer, 0 when it did not. A proxy for 'the informer caches can still refill', not a reading of the caches: a blackholed established watch can leave them frozen while this reads 1, and a single failed probe does not prove they stopped. Alert on it sustained. The service keeps serving its in-memory cache either way — readiness latches at the initial sync on purpose. Absent when -apiserver-probe-interval=0 (no probe runs); never 0 for that reason.",
+		func() float64 {
+			if reachable() {
+				return 1
+			}
+			return 0
+		})
+	Registry.CounterFunc("kubescrape_apiserver_probe_failures_total",
+		"API-server reachability probes that failed (a metadata-only LIST of one namespace, the same TCP/TLS/authn/authz path the informers use). Nonzero with the gauge back at 1 means the outage healed; a rising rate with the gauge at 0 is an outage in progress.",
+		func() float64 { return float64(failures()) })
+}
+
 // RegisterWaiterStats exposes the container-lookup waiter state: how many
 // lookups are blocked right now, and how many have been SHED by the cap.
 //
@@ -689,16 +758,25 @@ func RegisterStoreStats(stats func() (pods, containers int)) {
 // exactly the moment the operator needs the two told apart — and the gauge is
 // what shows the pressure building before the cap is reached.
 //
+// The shutdown drain gets its OWN counter rather than a second reason on the
+// shed one. Both answer the same retryable 503, but they mean opposite things
+// to an operator: the cap binding is abuse or an anomaly worth paging on, while
+// the drain is one line per rolling update — and blurring them would make every
+// deploy fire the abuse alert.
+//
 // A hook rather than a counter the store bumps directly: internal/store has no
 // obs dependency, the same way the buffer stats and the self-metadata gauge
 // are wired.
-func RegisterWaiterStats(blocked func() int, shed func() int64) {
+func RegisterWaiterStats(blocked func() int, shed, drained func() int64) {
 	Registry.GaugeFunc("kubescrape_container_lookups_blocked",
 		"Container lookups currently blocked waiting for a container ID to appear.",
 		func() float64 { return float64(blocked()) })
 	Registry.CounterFunc("kubescrape_container_lookups_shed_total",
 		"Blocking container lookups refused because the store's concurrent-waiter cap was reached.",
 		func() float64 { return float64(shed()) })
+	Registry.CounterFunc("kubescrape_container_lookups_drained_total",
+		"Blocking container lookups answered with a retryable 503 because the process began shutting down. Without the drain they stayed parked until the process exit killed the connection mid-wait (curl reports an empty reply); this counts the answers, and it is expected to be nonzero on a rolling update, unlike kubescrape_container_lookups_shed_total.",
+		func() float64 { return float64(drained()) })
 }
 
 // RegisterBufferStats exposes the disk buffer's per-signal backlog as gauges

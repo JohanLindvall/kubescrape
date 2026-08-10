@@ -23,6 +23,7 @@ Both binaries accept flags with one or two dashes (`-listen` / `--listen`).
 
 | Flag | Default | Description |
 |---|---|---|
+| `-apiserver-probe-interval` | `30s` | how often to probe API-server reachability with a metadata-only LIST of one namespace, publishing kubescrape_apiserver_reachable and kubescrape_apiserver_probe_failures_total (0 disables the probe, and then neither metric is published). It probes a NEW connection, so it reports reachability rather than whether the caches are advancing: readiness latches at the initial sync, and client-go retries a refused watch without relisting, so the watch-error counter is not a dependable substitute |
 | `-cache-ttl` | `5m0s` | how long metadata of deleted pods and replaced container IDs stays resolvable |
 | `-kubeconfig` | — | path to a kubeconfig; defaults to in-cluster config, then $KUBECONFIG/~/.kube/config |
 | `-listen` | `:8080` | HTTP listen address |

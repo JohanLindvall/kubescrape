@@ -23,8 +23,9 @@ import (
 // per container ID, not global on the cache. The initial lookup always
 // happens, so an already-expired ctx degrades to a non-blocking lookup.
 //
-// The returned error is non-nil only when the lookup was shed by the waiter
-// cap (ErrTooManyWaiters); ok is false then. A plain miss is (false, nil).
+// The returned error is non-nil only when the lookup was REFUSED rather than
+// resolved: ErrTooManyWaiters (the waiter cap) or ErrShuttingDown (Drain has
+// run). ok is false then, and both are retryable — a plain miss is (false, nil).
 func (s *Store) GetContainer(ctx context.Context, id string) (ContainerResult, bool, error) {
 	id = kubemeta.NormalizeContainerID(id)
 	if id == "" {
@@ -74,6 +75,17 @@ func (s *Store) GetContainer(ctx context.Context, id string) (ContainerResult, b
 			s.mu.Unlock()
 			return res, ok, nil
 		}
+		if s.draining {
+			// Shutting down: the informers are stopping, so the ID this lookup
+			// would park on can never be indexed. Answer retryably instead of
+			// holding the handler for a budget that outlives the process — the
+			// exit is what would cut it, with no status at all. Checked BEFORE
+			// the cap so a drain that arrives while the cap is full still
+			// refuses for the honest reason.
+			s.mu.Unlock()
+			s.drained.Add(1)
+			return ContainerResult{}, false, ErrShuttingDown
+		}
 		if s.nWaiters >= s.maxWaiters {
 			// Load shedding: every additional waiter is a pinned handler
 			// goroutine + map entry for the full wait budget. Fail fast and
@@ -108,6 +120,39 @@ func (s *Store) GetContainer(ctx context.Context, id string) (ContainerResult, b
 // lookups.
 func (s *Store) SetMaxWaiters(n int) { s.maxWaiters = n }
 
+// Drain releases every parked container lookup so its handler can answer, and
+// refuses every later one, reporting how many were released. Idempotent.
+//
+// It is the shutdown counterpart of the wakeup in indexContainersLocked, and it
+// must run BEFORE http.Server.Shutdown: Shutdown waits for the in-flight
+// handlers and, at its deadline, simply RETURNS (it never closes an active
+// connection — only srv.Close does). A lookup parked on a 30s wait is therefore
+// still parked when the process exits a moment later, and the exit is what cuts
+// it: no status, no body ("Empty reply from server"), the one outcome a client
+// can neither retry on nor diagnose. Woken lookups re-check the index (an ID
+// that landed in the same moment is still served) and otherwise return
+// ErrShuttingDown, which the handler surfaces as 503 + Retry-After.
+//
+// The channels are closed AND their map entries deleted, exactly as the wakeup
+// path does: an upsert racing the drain must not close a channel twice.
+func (s *Store) Drain() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.draining {
+		return 0
+	}
+	s.draining = true
+	released := s.nWaiters
+	for id, ws := range s.waiters {
+		for _, ch := range ws {
+			close(ch)
+		}
+		delete(s.waiters, id)
+	}
+	s.nWaiters = 0
+	return released
+}
+
 func (s *Store) removeWaiter(id string, ch chan struct{}) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -136,6 +181,11 @@ func (s *Store) BlockedLookups() int {
 // ShedLookups reports how many blocking lookups the waiter cap has refused
 // since startup.
 func (s *Store) ShedLookups() int64 { return s.shed.Load() }
+
+// DrainedLookups reports how many blocking lookups have been refused because
+// the store is shutting down (see Drain). Separate from ShedLookups: this one
+// is expected to move on every rolling update.
+func (s *Store) DrainedLookups() int64 { return s.drained.Load() }
 
 // waiterCount reports the blocked-lookup count (tests).
 func (s *Store) waiterCount() int { return s.BlockedLookups() }

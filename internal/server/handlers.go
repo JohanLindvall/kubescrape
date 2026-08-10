@@ -55,17 +55,26 @@ func (s *Server) handleContainer(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 
 	// Don't report "not found" from a cache that hasn't finished its initial
-	// sync; spend the wait budget on readiness first if needed.
-	if !s.waitReady(ctx) {
-		writeError(w, http.StatusServiceUnavailable, "informer caches not synced")
+	// sync; spend the wait budget on readiness first if needed. A drain ends
+	// that wait too — the shutdown path must not leave a request parked here
+	// (see Server.Drain), and its refusal carries Retry-After because the next
+	// pod behind the Service can answer at once, unlike a sync that is merely
+	// slow.
+	if err := s.waitReady(ctx); err != nil {
+		if errors.Is(err, errDraining) {
+			w.Header().Set("Retry-After", "1")
+		}
+		writeError(w, http.StatusServiceUnavailable, err.Error())
 		return
 	}
 
 	res, ok, err := s.store.GetContainer(ctx, id)
 	if err != nil {
-		// Waiter cap: shed the blocking lookup as retryable, never as 404 —
-		// the container may exist momentarily, the store is just saturated
-		// with blocked lookups.
+		// The store REFUSED to wait — the waiter cap is saturated
+		// (ErrTooManyWaiters) or shutdown has drained the waiters
+		// (ErrShuttingDown). Either way retryable, never a 404: the container
+		// may exist momentarily, and on the shutdown path the next pod behind
+		// the Service can answer at once.
 		w.Header().Set("Retry-After", "1")
 		writeError(w, http.StatusServiceUnavailable, err.Error())
 		return
@@ -292,6 +301,10 @@ func (s *Server) nodeTargets(node string) (targets []kubemeta.ScrapeTarget, buil
 	svcByNamespace := s.services.InNamespaces(podNamespaces(pods))
 
 	var d targetDedup
+	// The monitor endpoints are swept once per matched SERVICE, so a pod behind
+	// two Services reaches the merge twice with the same declaration; the merge
+	// is a fold and cannot tell (monitorOffers' doc has the whole story).
+	var offers monitorOffers
 	var matched []*services.Service
 	var podMonitors []podMonitorRef
 	for _, np := range pods {
@@ -316,6 +329,7 @@ func (s *Server) nodeTargets(node string) (targets []kubemeta.ScrapeTarget, buil
 		s.enrich(&np.Pod, np.OwnerRefs)
 
 		d.reset(&targets)
+		offers.reset()
 		for _, t := range scrape.PodTargets(np.Pod) {
 			d.add(t)
 		}
@@ -333,6 +347,12 @@ func (s *Server) nodeTargets(node string) (targets []kubemeta.ScrapeTarget, buil
 				// N while the loop used to build 125 targets per pod to keep 2.
 				url, ok := scrape.MonitorTargetURL(np.Pod, svc, *sme.endpoint)
 				if !ok {
+					continue
+				}
+				// Two Services selecting one pod offer each of their monitors'
+				// endpoints twice; the merge below is a fold and would serve
+				// the union doubled and count the conflict twice.
+				if !offers.first(url, sme.endpoint) {
 					continue
 				}
 				if held, taken := d.monitorHolder(url); taken {

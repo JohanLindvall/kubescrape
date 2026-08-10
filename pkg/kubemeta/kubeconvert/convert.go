@@ -156,6 +156,42 @@ func previousIncarnation(c kubemeta.Container, st *corev1.ContainerStatus) (kube
 	if st == nil || st.LastTerminationState.Terminated == nil || st.LastTerminationState.Terminated.ContainerID == "" {
 		return kubemeta.Container{}, false
 	}
+	prevID := kubemeta.NormalizeContainerID(st.LastTerminationState.Terminated.ContainerID)
+	// The "new runtime ID" premise above FAILS during CrashLoopBackOff: between
+	// restarts the kubelet leaves status.containerID equal to
+	// lastState.terminated.containerID (observed live), so there is no distinct
+	// previous incarnation — the two describe one runtime container, and the
+	// caller indexes both under the same key. Indexing the historical view would
+	// clobber the live one, and GET /v1/containers/{id} would then answer
+	// "terminated" + an exitCode for an ID the pod document in the SAME response
+	// reports as waiting/CrashLoopBackOff (and would carry the CURRENT
+	// restartCount and image on a record presented as history). The current
+	// status is authoritative for its own ID; do not remove this guard.
+	//
+	// WHAT THE GUARD COSTS, said plainly because the API model cannot hold both
+	// views at once (kubemeta.Container has no last-terminated section): for the
+	// duration of the backoff window, that ID's entry carries the LIVE
+	// container's state — waiting + waitingReason=CrashLoopBackOff — and
+	// therefore serves NO exitCode, startedAt or finishedAt for the run that
+	// just crashed. Attribution is unaffected (pod, namespace, container name,
+	// image, labels, owners are the same either way); only the crashed run's
+	// exit detail is missing, and nothing in this model reports it during the
+	// window — a consumer that needs it must read the pod's
+	// status.lastState.terminated from the Kubernetes API. The answer for that
+	// one ID also CHANGES when the kubelet finally
+	// starts the next incarnation: status.containerID becomes the new
+	// container's, this ID becomes a genuine previous incarnation, and it is
+	// served terminated + exitCode from then on (until the pod's tombstone TTL).
+	// Both are deliberate. A single ID must have exactly ONE state in a response
+	// — serving the terminated view under an ID the same body reports as live
+	// makes the two halves contradict each other, and every consumer keying off
+	// the container ID (the tailer attributing the log file the container is
+	// about to write to again, the cadvisor router) would then attribute LIVE
+	// data to a record marked terminated with an exit code. Missing history is
+	// recoverable; a self-contradicting response is not.
+	if prevID == c.ID {
+		return kubemeta.Container{}, false
+	}
 	// A distinct incarnation: it shares nothing with the current one. Only the
 	// Ports slice is cloned, not the whole container — the three time/exit
 	// pointers cloneContainer copies are cleared on the next lines and refilled
@@ -164,7 +200,7 @@ func previousIncarnation(c kubemeta.Container, st *corev1.ContainerStatus) (kube
 	prev := c
 	prev.Ports = clonePorts(c.Ports)
 	prev.RuntimeID = st.LastTerminationState.Terminated.ContainerID
-	prev.ID = kubemeta.NormalizeContainerID(prev.RuntimeID)
+	prev.ID = prevID
 	prev.Ready = false
 	prev.State = "terminated"
 	prev.WaitingReason = ""

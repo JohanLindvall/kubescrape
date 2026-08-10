@@ -51,7 +51,10 @@ service:
   topologySpreadConstraints: []
   listen: ":8080"
   # Export the service's own metrics over OTLP at this interval (0 disables);
-  # uses the otlp settings below.
+  # uses the otlp settings below. A Go duration string (1m, 500ms, 1h30m), or a
+  # bare 0 — the value the line above documents, which YAML reads as a number.
+  # The schema refuses everything the binary's duration flag would reject, in
+  # both forms it can arrive in: 60, 0.5, 1e1, abc and negatives, quoted or not.
   selfMetricsInterval: 1m
   waitTimeout: 5s
   cacheTTL: 5m
@@ -148,7 +151,9 @@ agent:
   # Prometheus /metrics endpoint is NOT here — it has its own port, see the
   # top-level `metrics:` section.
   listen: ":8081"
-  # Export the agent's own metrics over OTLP at this interval (0 disables).
+  # Export the agent's own metrics over OTLP at this interval (0 disables). A Go
+  # duration string, or a bare 0; anything the duration flag would reject is
+  # refused by the schema (see service.selfMetricsInterval above).
   selfMetricsInterval: 1m
   # Pipeline toggles.
   logs: true
@@ -259,9 +264,11 @@ agent:
   # Close the fd of a fully-caught-up file after this much inactivity. The open
   # fd is the only handle to a rotated-away or deleted file's remaining bytes,
   # so this trades the zero-loss guarantee for bounded fd usage: 0 (never) is
-  # the default. Set it only if a node tracks thousands of log files. Use a
-  # duration string ("30s"); the schema refuses bare non-zero integers, which
-  # would fail the agent's flag parse.
+  # the default. Set it only if a node tracks thousands of log files. A Go
+  # duration string ("30s"), or a bare 0 — like every duration in this chart,
+  # the schema refuses whatever the agent's flag parse would (a bare non-zero
+  # number, a unitless or misspelled string, a negative), in both the quoted
+  # and unquoted forms it can arrive in.
   logsIdleClose: 0
   # Stamp log.file.name and log.file.position (byte offset) on every record,
   # for each file source.

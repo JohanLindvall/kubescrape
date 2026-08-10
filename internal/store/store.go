@@ -43,6 +43,13 @@ const maxWaiterIDLen = kubemeta.MaxContainerIDLen
 // surface it as a retryable condition (HTTP 503), never as "not found".
 var ErrTooManyWaiters = errors.New("too many blocked container lookups")
 
+// ErrShuttingDown reports that a blocking container lookup was refused because
+// Drain has been called: the process is terminating and the metadata this
+// lookup waits for can no longer arrive. Callers surface it exactly like
+// ErrTooManyWaiters — a retryable 503, never a 404 — because the container may
+// well exist and the next pod behind the Service can answer.
+var ErrShuttingDown = errors.New("store is shutting down")
+
 // Store is safe for concurrent use.
 type Store struct {
 	ttl time.Duration
@@ -81,6 +88,13 @@ type Store struct {
 	// keys (bounded by maxWaiters).
 	waiters  map[string][]chan struct{}
 	nWaiters int
+	// draining is set once by Drain and never cleared: after it, no lookup may
+	// park, because the informers are stopping and the ID it would wait for can
+	// never be indexed. A parked lookup that is not woken here is still parked
+	// when the process exits — http.Server.Shutdown gives up WAITING at its
+	// deadline but closes nothing — and the exit cuts the connection with no
+	// status and no body, the one answer a client cannot act on.
+	draining bool
 	// ipSeq orders genuine pod-IP ACQUISITIONS so a later acquirer beats an
 	// earlier one; a record merely re-asserting an address it already holds
 	// keeps its old sequence and cannot displace the live owner.
@@ -91,6 +105,11 @@ type Store struct {
 	// itself — internal/store has no obs dependency, like the buffer stats and
 	// the self-metadata gauge. Atomic because it is read outside the lock.
 	shed atomic.Int64
+	// drained counts lookups refused because the store is shutting down, kept
+	// SEPARATE from shed: the cap binding means abuse or an anomaly, the drain
+	// means a rolling update, and one counter for both would fire the first
+	// alert on every deploy.
+	drained atomic.Int64
 }
 
 type record struct {

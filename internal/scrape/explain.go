@@ -150,18 +150,17 @@ func explainPodPortEntry(pod kubemeta.Pod, entry string, filter portFilter) Port
 	if allDigits(entry) {
 		return PortVerdict{Entry: entry, Note: "not a valid port number (1-65535), and an all-digit string can never name a declared port; the entry resolves to nothing"}
 	}
-	var matched []int32
-	for _, c := range pod.Containers {
-		for _, p := range c.Ports {
-			if p.Name == entry {
-				matched = append(matched, p.Port)
-			}
-		}
-	}
-	if len(matched) == 0 {
+	// Through containerPortByName, the derivation's own resolver: mirroring it
+	// with a second walk is how explain came to affirm every declaration of a
+	// duplicated name while podPorts served the first.
+	port, found := containerPortByName(pod, entry)
+	if !found {
 		return PortVerdict{Entry: entry, Note: fmt.Sprintf("no container declares a port named %q; the entry resolves to nothing", entry)}
 	}
-	ports, note := filter.keep(matched)
+	ports, note := filter.keep([]int32{port})
+	if note == "" {
+		note = duplicateNameNote(pod, entry, port, podAnnotationRemedy)
+	}
 	return PortVerdict{Entry: entry, Ports: ports, Note: note}
 }
 
@@ -246,10 +245,66 @@ func servicePortVerdict(pod kubemeta.Pod, entry string, sp services.Port, filter
 		return PortVerdict{Entry: entry, Note: note}
 	}
 	v := PortVerdict{Entry: entry, Ports: []int32{port}}
-	if sp.TargetPortName == "" && !containerDeclaresNumber(pod, port) {
+	switch {
+	case sp.TargetPortName == "" && !containerDeclaresNumber(pod, port):
 		v.Note = fmt.Sprintf("no container declares port %d — the target is still served, but if nothing listens there the scrape will fail", port)
+	case sp.TargetPortName != "":
+		v.Note = duplicateNameNote(pod, sp.TargetPortName, port, servicePortRemedy)
 	}
 	return v
+}
+
+// nameRemedy identifies the path a duplicate-name note is attached to, which
+// is what decides the REMEDY: the other declarations are reached differently
+// depending on who resolved the name, and a note offering the wrong one sends
+// an operator to edit a field that cannot change the outcome.
+type nameRemedy int
+
+const (
+	// podAnnotationRemedy: the pod's own prometheus.io/port named the port, so
+	// the pod's annotation can name the others by number.
+	podAnnotationRemedy nameRemedy = iota
+	// servicePortRemedy: a SERVICE port's named targetPort resolved the name.
+	// Numbers in the pod annotation are a different discovery path entirely
+	// (source "pod", not "service"), and they cannot reach a second declaration
+	// THROUGH this Service — the fix belongs in the Service.
+	servicePortRemedy
+)
+
+// duplicateNameNote is the caveat a duplicated container-port name earns on
+// every path that resolves one: containerPortByName resolves ONE declaration,
+// the target list shows one port, and nothing in it says the pod declares the
+// name twice. Empty when the name is declared once, which is the normal case.
+func duplicateNameNote(pod kubemeta.Pod, name string, resolved int32, remedy nameRemedy) string {
+	n := containerPortDeclarations(pod, name)
+	if n < 2 {
+		return ""
+	}
+	fix := "Name the ports by number in prometheus.io/port to scrape the others"
+	if remedy == servicePortRemedy {
+		// Not "name them by number in the pod annotation": that would be a
+		// second, pod-source target rather than this Service's, and it does not
+		// exist unless the pod is itself scrape-annotated.
+		fix = "A named targetPort can only ever reach this one declaration; give the Service a second port whose targetPort is another declaration's NUMBER to scrape it"
+	}
+	// Not "the FIRST declaration": the resolver prefers a REGULAR container's
+	// over an init/sidecar or ephemeral one, so on the shape this note exists
+	// for — a native sidecar declaring the app's port name — the winner is not
+	// the first one the pod document lists.
+	// The EndpointSlice-controller comparison holds only while a REGULAR
+	// container declares the name: podutil.FindPort walks spec.Containers and
+	// has no answer at all for a name only an init/sidecar or ephemeral
+	// container declares, which is the case this resolver deliberately still
+	// answers (see containerPortByName). Claiming the comparison there would be
+	// telling an operator their sidecar port is what Kubernetes routes to.
+	_, regularHasIt := portByName(pod, name, true)
+	agrees := ""
+	if regularHasIt {
+		agrees = ", which is what a Service's named targetPort, a monitor endpoint and the EndpointSlice controller all resolve to"
+	} else {
+		agrees = "; no REGULAR container declares this name, so Kubernetes' own named-targetPort resolution has no answer for it and this target exists only because kubescrape falls back to the sidecar's declaration"
+	}
+	return fmt.Sprintf("%d containers declare a port named %q; port %d resolves — the resolver prefers a REGULAR container's declaration over an init/sidecar or ephemeral one and then takes the first%s. %s", n, name, resolved, agrees, fix)
 }
 
 // containerDeclaresNumber reports whether any container declares this port

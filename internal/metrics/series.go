@@ -4,7 +4,6 @@ import (
 	"log/slog"
 	"math"
 	"slices"
-	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -144,14 +143,23 @@ func (s *series) aggregateValue(samp *sample) float64 {
 
 // sample is one (resource, label combination) live value. labels is the
 // serialized data-point label set and resource the serialized resource-attribute
-// set (both via labels.String); bucket indexes into series.buckets for
-// histograms.
+// set (both via labels.String).
 type sample struct {
 	value    float64
 	labels   string
 	resource string
-	bucket   int
 	count    uint64
+	// counts holds a histogram's CUMULATIVE observation count per finite bucket
+	// bound (series.buckets minus the +Inf entry; the +Inf figures are value/
+	// count — the sum and total). A histogram keeps ONE sample per label set
+	// rather than one per bucket stream: fifteen map entries and fifteen full
+	// label strings per label set cost ~15x what a counter does, made
+	// maxCardinality count bucket streams instead of the label sets it
+	// documents (patched by the maxStreams translation this replaced), and let
+	// a partially-admitted family export underflowed cumulative buckets. One
+	// entry per label set makes a partial family unrepresentable. Nil for
+	// every non-histogram.
+	counts []uint64
 	// start is the epoch second this cumulative stream began accumulating: the
 	// admission of the sample, or the last idle reset that genuinely zeroed it.
 	// It becomes StartTimeUnixNano on every exported point.
@@ -206,43 +214,21 @@ type series struct {
 
 	action  gaugeAction // gauge fold mode; ignored for other kinds
 	maxSize int         // cap on distinct LABEL COMBINATIONS (config maxCardinality)
-	// maxStreams is maxSize expressed in db entries: db is keyed per BUCKET
-	// STREAM, so a histogram's label set costs len(buckets) entries. Comparing
-	// len(db) against maxSize directly divided the configured cap by the bucket
-	// count behind the user's back — `maxCardinality: 10000` on a default
-	// 15-stream histogram admitted 666 label combinations, and the config,
-	// README and warning all said 10000. Counters and gauges have one stream,
-	// so for them the two are equal and nothing changes.
-	maxStreams int
+	// db is keyed per LABEL COMBINATION for every kind — a histogram is one
+	// sample carrying its whole per-bucket distribution (sample.counts) — so
+	// len(db) compares against maxSize directly. The store used to key
+	// histograms per bucket STREAM and translate the cap through a derived
+	// maxStreams budget; the translation is gone with the layout.
 	expiration int64 // seconds of inactivity before a combination expires
 	lastWarn   int64 // epoch seconds of the last cardinality warning
 	log        *slog.Logger
 
-	// buckets are the histogram boundaries with +Inf appended; bucketStr the
-	// matching "le" strings; bucketHash[i] = combineHash(hash("le"),
-	// hash(bucketStr[i])), precomputed so observe folds a bucket's le label into
-	// the base hash without materializing a per-bucket label set. All nil for
-	// non-histograms, where the single "bucket" carries the value directly.
-	buckets     []float64
-	bucketStr   []string
-	bucketHash  []uint64
-	bucketCheck []uint64
+	// buckets are the histogram boundaries with +Inf appended; nil for
+	// non-histograms.
+	buckets []float64
 	// lastWarn rate-limits the cardinality-cap notice; lastCollision the
 	// hash-collision warn — separate so neither suppresses the other.
 	lastCollision int64
-
-	// probe is observe's per-observation histogram scratch, reused under s.mu:
-	// the admission pre-pass and the record loop walk the same bucket streams,
-	// so the pre-pass memoises each stream's hash and looked-up sample here and
-	// the record loop reads them back. Without it every matched line hashed and
-	// probed the map twice per bucket. Non-nil only for histograms.
-	probe []bucketProbe
-}
-
-// bucketProbe is one bucket stream's memoised lookup (see series.probe).
-type bucketProbe struct {
-	hash uint64
-	samp *expiringSample
 }
 
 // seriesSpec configures a new series.
@@ -296,13 +282,7 @@ func newSeries(spec seriesSpec) *series {
 	}
 	if spec.kind == kindHistogram {
 		s.initBuckets(spec.buckets)
-	} else {
-		// A single implicit bucket with an infinite bound so observe's loop
-		// records every value once.
-		s.buckets = []float64{math.Inf(1)}
-		s.bucketStr = []string{""}
 	}
-	s.maxStreams = spec.maxSize * len(s.buckets)
 	return s
 }
 
@@ -330,34 +310,23 @@ func (s *series) epoch() int64 {
 	return coarseEpoch()
 }
 
-// initBuckets sorts out the histogram bucket bounds and precomputes the "le"
-// label strings and fold hashes.
+// initBuckets sorts out the histogram bucket bounds (+Inf appended).
 func (s *series) initBuckets(buckets []float64) {
 	if len(buckets) == 0 {
 		buckets = defaultBuckets
 	}
 	s.buckets = append(append([]float64(nil), buckets...), math.Inf(1))
-	s.bucketStr = make([]string, 0, len(s.buckets))
-	for _, b := range buckets {
-		s.bucketStr = append(s.bucketStr, strconv.FormatFloat(b, 'f', -1, 64))
-	}
-	s.bucketStr = append(s.bucketStr, "+Inf")
-
-	leHash := xxhash.Sum64String(leLabel)
-	s.bucketHash = make([]uint64, len(s.bucketStr))
-	s.bucketCheck = make([]uint64, len(s.bucketStr))
-	for i, bs := range s.bucketStr {
-		hv := xxhash.Sum64String(bs)
-		s.bucketHash[i] = combineHash(leHash, hv)
-		s.bucketCheck[i] = combineCheck(leHash, hv)
-	}
 }
+
+// bounds are the histogram's finite bucket bounds — what sample.counts indexes.
+func (s *series) bounds() []float64 { return s.buckets[:len(s.buckets)-1] }
 
 // observe records value for the given data-point label set, resource, and extra
 // resource labels. The series is keyed by all three together (their hashes
-// XOR-fold into the base accumulator), so per-resource series are distinct. For
-// a histogram the value is counted into every bucket whose bound it does not
-// exceed.
+// XOR-fold into the base accumulator), so per-resource series are distinct. A
+// histogram is ONE sample per label set — the value folds into its sum/count
+// and every counts slot whose bound it does not exceed — so every kind is a
+// single hash and a single map probe per observation.
 func (s *series) observe(lbls labels, value float64, resAccum resKey, res pcommon.Map, resLabels labels) {
 	if math.IsNaN(value) || math.IsInf(value, 0) {
 		// Inf too, and for the same reason: ParseFloat accepts "inf"/"Infinity"
@@ -376,92 +345,9 @@ func (s *series) observe(lbls labels, value float64, resAccum resKey, res pcommo
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.kind != kindHistogram {
-		// Single stream (counter/gauge/summary, bound +Inf): one lookup and one
-		// hash. The two-pass form below exists solely for histogram all-or-nothing
-		// admission; running it here would pay a redundant lookup+avalanche per
-		// matched line.
-		s.recordSingle(s.streamHash(base, 0), check, value, lbls, now, res, resLabels)
-		return
-	}
-	// Pre-pass over every bucket stream: histogram admission is all-or-nothing
-	// (a partial set of streams exports underflowed cumulative counts), and a
-	// check-hash mismatch anywhere drops the WHOLE observation for the same
-	// reason — a mid-loop skip would leave sibling buckets recording.
-	//
-	// The record loop below needs the very same per-bucket hash and map entry,
-	// so the pre-pass memoises both into s.probe: the cap check still sees
-	// every stream before anything is admitted (the semantics the two passes
-	// exist for), but a matched line now pays ONE hash and ONE map probe per
-	// bucket instead of two.
-	if cap(s.probe) < len(s.buckets) {
-		s.probe = make([]bucketProbe, len(s.buckets))
-	}
-	probe := s.probe[:len(s.buckets)]
-	{
-		missing := 0
-		for i := range s.buckets {
-			h := s.streamHash(base, i)
-			samp := s.db[h]
-			probe[i] = bucketProbe{hash: h, samp: samp}
-			if samp == nil {
-				missing++
-				continue
-			}
-			if samp.check != s.streamCheck(check, i) {
-				// 64-bit collision between distinct series (~2^-64 per
-				// pair): refuse to merge.
-				s.drops.collision.Add(1)
-				if now-s.lastCollision >= 3600 {
-					s.lastCollision = now
-					s.log.Warn("series hash collision, dropping observation", "metric", s.name)
-				}
-				return
-			}
-		}
-		if s.maxStreams > 0 && missing > 0 && len(s.db)+missing > s.maxStreams {
-			s.warnCapped(lbls, now)
-			return
-		}
-	}
-	for i, bound := range s.buckets {
-		samp := probe[i].samp
-		if samp == nil {
-			// The pre-pass proved there is room for every missing stream, so
-			// admit cannot refuse here; it re-checks anyway (it is shared with
-			// the single-stream path) and a nil is still handled.
-			samp = s.admit(probe[i].hash, s.streamCheck(check, i), lbls, i, now, res, resLabels)
-			if samp == nil {
-				continue
-			}
-		}
-		if value <= bound {
-			s.record(samp, value)
-		} else {
-			// An observation changes the whole histogram POINT, not just the
-			// buckets it lands in: the unchanged lower buckets must still be
-			// re-emitted so the exported cumulative distribution stays complete.
-			// Mark them unexported too, or snapshot's per-bucket never-exported
-			// guard would emit ONLY the touched buckets on an idle reset/delete
-			// and silently drop the rest (a strict subset of the distribution).
-			samp.exported = false
-		}
-		samp.when = now
-	}
+	s.recordSingle(mixHash(base), check, value, lbls, now, res, resLabels)
 }
 
-// streamCheck is bucket i's collision-check hash (the check-side mirror of
-// streamHash).
-func (s *series) streamCheck(check uint64, bucket int) uint64 {
-	if s.kind == kindHistogram {
-		return check + s.bucketCheck[bucket]
-	}
-	return check
-}
-
-// observePre is observe for callers with precomputed label accumulators and
-// no resource attributes (the internal registry): hot counters skip rehashing
-// their fixed label set on every bump.
 // observePreHashed is the registry fast path: the bound wrappers bump fixed
 // label sets, so the accumulators AND the finalized hash are precomputed at
 // construction; a bump pays neither the label rehash nor the avalanche.
@@ -471,9 +357,14 @@ func (s *series) observePreHashed(lbls labels, hash, check uint64, value float64
 		return
 	}
 	if s.kind == kindHistogram {
-		// Histograms fold per-bucket labels; take the general path.
-		s.observe(lbls, value, resKey{}, res, nil)
-		return
+		if _, ok := lbls.get(leLabel); ok {
+			// A caller-supplied "le" must be folded OUT of a histogram's
+			// identity (baseAccum), which the precomputed hash did not do;
+			// take the general path. Registry label sets come from code, so
+			// this is a pathological shape, not a hot one.
+			s.observe(lbls, value, resKey{}, res, nil)
+			return
+		}
 	}
 	now := s.epoch()
 	s.mu.Lock()
@@ -481,18 +372,19 @@ func (s *series) observePreHashed(lbls labels, hash, check uint64, value float64
 	s.recordSingle(hash, check, value, lbls, now, res, nil)
 }
 
-// recordSingle folds one observation into a single-stream metric
-// (counter/gauge/summary): it admits the sample on first sight and refuses a
-// check-hash collision, then records the value. The caller holds s.mu. Shared by
-// observe's non-histogram path and the registry's observePreHashed.
+// recordSingle folds one observation into its sample: it admits the sample on
+// first sight and refuses a check-hash collision, then records the value. The
+// caller holds s.mu. Shared by observe and the registry's observePreHashed.
 func (s *series) recordSingle(hash, check uint64, value float64, lbls labels, now int64, res pcommon.Map, resLabels labels) {
 	samp := s.db[hash]
 	if samp == nil {
-		samp = s.admit(hash, check, lbls, 0, now, res, resLabels)
+		samp = s.admit(hash, check, lbls, now, res, resLabels)
 		if samp == nil {
 			return
 		}
 	} else if samp.check != check {
+		// 64-bit collision between distinct series (~2^-64 per pair): refuse
+		// to merge.
 		s.drops.collision.Add(1)
 		if now-s.lastCollision >= 3600 {
 			s.lastCollision = now
@@ -505,8 +397,10 @@ func (s *series) recordSingle(hash, check uint64, value float64, lbls labels, no
 }
 
 // baseAccum hashes the caller's data-point labels once (order-independent). For
-// a histogram it strips any caller-provided "le" so the synthetic per-bucket one
-// is the only contribution folded in per bucket.
+// a histogram it strips any caller-provided "le": the per-bucket "le" is a
+// rendering artifact of the Prometheus exposition, never part of a stored
+// series' identity, so a line carrying one must land on the same sample as its
+// siblings without it.
 func (s *series) baseAccum(lbls labels) (base, check uint64) {
 	base, check = lbls.accums()
 	if s.kind == kindHistogram {
@@ -519,30 +413,26 @@ func (s *series) baseAccum(lbls labels) (base, check uint64) {
 	return base, check
 }
 
-// streamHash is the finalized hash of bucket i's series: the base accumulator
-// XOR-folded with the bucket's "le" label for a histogram, or just the base.
-func (s *series) streamHash(base uint64, bucket int) uint64 {
-	if s.kind == kindHistogram {
-		return mixHash(base + s.bucketHash[bucket])
-	}
-	return mixHash(base)
-}
-
-// admit inserts a new sample for a previously unseen stream, or returns nil
-// (warning at most hourly) when the cardinality cap is reached. It runs only on
-// the cold path, so materializing the full label set here is cheap.
-func (s *series) admit(hash, check uint64, lbls labels, bucket int, now int64, res pcommon.Map, resLabels labels) *expiringSample {
+// admit inserts a new sample for a previously unseen label combination, or
+// returns nil (warning at most hourly) when the cardinality cap is reached. It
+// runs only on the cold path, so materializing the label set here is cheap.
+func (s *series) admit(hash, check uint64, lbls labels, now int64, res pcommon.Map, resLabels labels) *expiringSample {
 	full := lbls
 	if s.kind == kindHistogram {
-		full = lbls.without(leLabel).set(leLabel, s.bucketStr[bucket])
+		// The stored labels mirror the identity hash, which baseAccum strips
+		// any caller-supplied "le" from.
+		full = lbls.without(leLabel)
 	}
-	if s.maxStreams > 0 && len(s.db) >= s.maxStreams {
+	if s.maxSize > 0 && len(s.db) >= s.maxSize {
 		s.warnCapped(full, now)
 		return nil
 	}
 	samp := &expiringSample{
-		sample: sample{labels: full.String(), resource: resourceString(res, resLabels), bucket: bucket, check: check, initial: true, start: s.streamStart(now)},
+		sample: sample{labels: full.String(), resource: resourceString(res, resLabels), check: check, initial: true, start: s.streamStart(now)},
 		when:   now,
+	}
+	if s.kind == kindHistogram {
+		samp.counts = make([]uint64, len(s.bounds()))
 	}
 	s.db[hash] = samp
 	return samp
@@ -579,7 +469,9 @@ func (s *series) warnCapped(lbls labels, now int64) {
 }
 
 // record folds one observation into a sample. Gauges apply their action;
-// counters, summaries and histograms accumulate.
+// counters, summaries and histograms accumulate (a histogram's value/count are
+// its sum and total observation count, and each counts slot tallies the
+// values within its bound).
 func (s *series) record(samp *expiringSample, value float64) {
 	samp.exported = false // a new value: an export must carry it before it may be reset
 	if s.aggregating() {
@@ -626,6 +518,25 @@ func (s *series) record(samp *expiringSample, value float64) {
 	}
 	samp.value += value
 	samp.count++
+	if s.kind == kindHistogram {
+		for i, bound := range s.bounds() {
+			if value <= bound {
+				samp.counts[i]++
+			}
+		}
+	}
+}
+
+// emit copies a sample out for a snapshot's caller. The value copy alone is
+// not enough for a histogram: counts aliases the live per-bucket array, which
+// keeps counting (and is cleared on idle reset) after s.mu is released, and
+// export retention legitimately holds emitted samples across intervals.
+func (samp *expiringSample) emit() sample {
+	out := samp.sample
+	if out.counts != nil {
+		out.counts = slices.Clone(out.counts)
+	}
+	return out
 }
 
 // snapshot returns the live samples. Combinations idle past their expiration
@@ -648,7 +559,7 @@ func (s *series) snapshot() []sample {
 			// observed once, then idled straight past the grace before any
 			// snapshot ran the aggregating branch, is otherwise destroyed unseen.
 			if !samp.exported {
-				emit := samp.sample
+				emit := samp.emit()
 				if s.aggregating() {
 					emit.value = s.aggregateValue(&samp.sample)
 				}
@@ -678,11 +589,12 @@ func (s *series) snapshot() []sample {
 			// exported — with maxAge below the export interval, the observation
 			// would otherwise be destroyed having never left the process.
 			if !samp.exported {
-				out = append(out, samp.sample)
+				out = append(out, samp.emit())
 			}
 			samp.initial = false
 			samp.count = 0
 			samp.value = 0
+			clear(samp.counts)
 			// The ONE place a live sample's accumulation genuinely restarts, so
 			// the one place start moves. The emit above copied the pre-reset
 			// sample, so it keeps the old start; everything after this carries
@@ -694,7 +606,7 @@ func (s *series) snapshot() []sample {
 			samp.exported = true // the zero needs no further emission
 			continue
 		}
-		out = append(out, samp.sample)
+		out = append(out, samp.emit())
 		samp.initial = false
 		samp.exported = true
 	}

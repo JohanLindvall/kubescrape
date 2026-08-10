@@ -8,48 +8,69 @@ import (
 	"strings"
 	"testing"
 	"time"
-
-	"github.com/cespare/xxhash/v2"
 )
 
-// TestHistogramLeFoldExact pins the fold-subtract path in baseAccum/streamHash
-// against the ground truth: for every bucket, subtracting the caller's "le"
-// pair and adding the precomputed bucketHash/bucketCheck must be EXACTLY the
-// accumulators of the merged label set that admit() serializes. With the new
-// linear-projection combineHash this must stay exact (wrapping sum fold).
+// TestHistogramLeFoldExact pins the fold-subtract path in baseAccum against
+// the ground truth: a caller-supplied "le" pair contributes NOTHING to a
+// histogram's identity — the accumulators with it stripped must be EXACTLY
+// the le-less label set's, so a line carrying one lands on the same sample as
+// its siblings without it, and the stored labels drop it.
 func TestHistogramLeFoldExact(t *testing.T) {
 	s := newTestSeries(seriesSpec{name: "h", kind: kindHistogram, buckets: []float64{0.1, 0.5, 1}})
 
 	for _, lbls := range []labels{
-		labels{}.set("handler", "/api"),
-		labels{}.set("handler", "/api").set("le", "0.5"), // caller-provided le stripped
+		labels{}.set("handler", "/api").set("le", "0.5"),
 		labels{}.set("le", "+Inf"),
-		nil,
 	} {
 		base, check := s.baseAccum(lbls)
-		for i := range s.buckets {
-			gotHash := s.streamHash(base, i)
-			gotCheck := s.streamCheck(check, i)
-
-			full := lbls.without(leLabel).set(leLabel, s.bucketStr[i])
-			wantBase, wantCheck := full.accums()
-			if gotHash != mixHash(wantBase) {
-				t.Errorf("labels %v bucket %d: streamHash %#x != full-set hash %#x", lbls, i, gotHash, mixHash(wantBase))
-			}
-			if gotCheck != wantCheck {
-				t.Errorf("labels %v bucket %d: streamCheck %#x != full-set check %#x", lbls, i, gotCheck, wantCheck)
-			}
+		wantBase, wantCheck := lbls.without(leLabel).accums()
+		if base != wantBase || check != wantCheck {
+			t.Errorf("labels %v: baseAccum (%#x,%#x) != le-less accums (%#x,%#x)",
+				lbls, base, check, wantBase, wantCheck)
 		}
 	}
 
-	// Fold a pair out and back in: byte-identical accumulators.
-	lbls := labels{}.set("a", "1").set("le", "0.25")
-	h0, c0 := lbls.accums()
-	hk, hv := xxhash.Sum64String("le"), xxhash.Sum64String("0.25")
-	h1 := h0 - combineHash(hk, hv) + combineHash(hk, hv)
-	c1 := c0 - combineCheck(hk, hv) + combineCheck(hk, hv)
-	if h0 != h1 || c0 != c1 {
-		t.Errorf("fold out+in not identity: (%#x,%#x) vs (%#x,%#x)", h0, c0, h1, c1)
+	// End to end: with and without "le" merge into ONE sample, stored without it.
+	s.observe(labels{}.set("handler", "/api"), 0.3, resKey{}, emptyResource, nil)
+	s.observe(labels{}.set("handler", "/api").set("le", "0.5"), 0.3, resKey{}, emptyResource, nil)
+	if len(s.db) != 1 {
+		t.Fatalf("caller-supplied le split the series: %d samples, want 1", len(s.db))
+	}
+	for _, samp := range s.db {
+		if samp.count != 2 {
+			t.Fatalf("count = %d, want 2 (both observations on one sample)", samp.count)
+		}
+		if strings.Contains(samp.labels, "le=") {
+			t.Fatalf("stored labels carry le: %q", samp.labels)
+		}
+	}
+}
+
+// TestPreHashedHistogramLeFallback: the registry fast path precomputes the
+// bound label set's hash WITHOUT baseAccum's le-stripping, so a histogram
+// bound to a label set that carries "le" must fall back to the general path —
+// or the same conceptual series would live under two hashes depending on
+// which constructor observed it.
+func TestPreHashedHistogramLeFallback(t *testing.T) {
+	s := newTestSeries(seriesSpec{name: "h", kind: kindHistogram, buckets: []float64{1}, expiration: registryExpiration})
+	newBound(s, labels{}.set("k", "v").set("le", "0.5")).observe(0.5)
+	newBound(s, labels{}.set("k", "v")).observe(0.5)
+	if len(s.db) != 1 {
+		t.Fatalf("le-carrying bound split the series: %d samples, want 1", len(s.db))
+	}
+	for _, samp := range s.db {
+		if samp.count != 2 {
+			t.Fatalf("count = %d, want 2 (both bounds on one sample)", samp.count)
+		}
+		if strings.Contains(samp.labels, "le=") {
+			t.Fatalf("stored labels carry le: %q", samp.labels)
+		}
+	}
+
+	// The fast path's NaN guard: counted, never admitted.
+	newBound(s, labels{}.set("k", "v")).observe(math.NaN())
+	if got := s.drops.NaN(); got != 1 {
+		t.Fatalf("NaN drops = %d, want 1", got)
 	}
 }
 
@@ -90,24 +111,20 @@ func TestCollisionDropObserve(t *testing.T) {
 	}
 }
 
-// TestHistogramCollisionAllOrNothing: a check mismatch on ANY bucket stream
-// must drop the whole observation — a partial record would export underflowed
-// cumulative buckets.
+// TestHistogramCollisionAllOrNothing: a check mismatch must drop the whole
+// observation — sum, count and every bucket slot together. (One sample per
+// label set makes a PARTIALLY recorded family unrepresentable by construction;
+// what is left to pin is that a collision leaves the sample untouched.)
 func TestHistogramCollisionAllOrNothing(t *testing.T) {
 	setTimeForTest(time.Unix(1_700_400_100, 0))
 	defer testEpoch.Store(0)
 
 	s := newTestSeries(seriesSpec{name: "h", kind: kindHistogram, buckets: []float64{1, 10}})
 	lbls := labels{}.set("k", "v")
-	s.observe(lbls, 0.5, resKey{}, emptyResource, nil) // all 3 streams admitted, count 1 each
+	s.observe(lbls, 0.5, resKey{}, emptyResource, nil) // one sample, count 1
 
-	// Corrupt exactly one stream's check.
-	done := false
 	for _, samp := range s.db {
-		if !done {
-			samp.check++
-			done = true
-		}
+		samp.check++ // simulate: existing sample belongs to a colliding series
 	}
 	s.observe(lbls, 0.5, resKey{}, emptyResource, nil)
 	if got := s.drops.Collision(); got != 1 {
@@ -115,7 +132,12 @@ func TestHistogramCollisionAllOrNothing(t *testing.T) {
 	}
 	for _, samp := range s.db {
 		if samp.count != 1 {
-			t.Fatalf("sibling bucket recorded after a collision drop: count = %d, want 1 (labels %s)", samp.count, samp.labels)
+			t.Fatalf("collision merged data: count = %d, want 1 (labels %s)", samp.count, samp.labels)
+		}
+		for i, c := range samp.counts {
+			if want := []uint64{1, 1}[i]; c != want {
+				t.Fatalf("bucket %d recorded after a collision drop: %d, want %d", i, c, want)
+			}
 		}
 	}
 }
@@ -533,12 +555,12 @@ func TestHistogramIdleEmitThroughExport(t *testing.T) {
 	}
 }
 
-// TestHistogramIdleEmitKeepsAllBuckets is the regression test for the partial
-// histogram emit: with the export interval longer than maxAge, an observation
-// that lands only in the upper buckets used to make the next idle snapshot emit
-// ONLY those buckets, dropping the lower buckets' cumulative counts from the
-// point (a strict subset of the distribution). Every bucket of a family shares
-// its idle deadline, so a complete point must carry all of them.
+// TestHistogramIdleEmitKeepsAllBuckets: with the export interval longer than
+// maxAge, the idle snapshot's emit must carry the COMPLETE cumulative
+// distribution — an observation that lands only in the upper buckets must not
+// narrow what the point reports (with the old one-sample-per-bucket layout
+// that was a real bug; with counts on one sample it is structural, and this
+// pins the emitted copy plus the reset that follows it).
 func TestHistogramIdleEmitKeepsAllBuckets(t *testing.T) {
 	t0 := int64(1_700_600_000)
 	setTimeForTest(time.Unix(t0, 0))
@@ -550,7 +572,7 @@ func TestHistogramIdleEmitKeepsAllBuckets(t *testing.T) {
 	lbls := labels{}.set("route", "/x")
 
 	s.observe(lbls, 5, resKey{}, emptyResource, nil) // lands in le>=5
-	if len(s.snapshot()) == 0 {                      // full export: marks every bucket exported
+	if len(s.snapshot()) == 0 {                      // full export: marks the sample exported
 		t.Fatal("first snapshot emitted nothing")
 	}
 
@@ -558,24 +580,34 @@ func TestHistogramIdleEmitKeepsAllBuckets(t *testing.T) {
 	s.observe(lbls, 8, resKey{}, emptyResource, nil) // lands only in le>=10
 
 	setTimeForTest(time.Unix(t0+75, 0)) // past maxAge -> idle reset branch
-	byBucket := map[int]uint64{}
-	for _, sm := range s.snapshot() {
-		byBucket[sm.bucket] = sm.count
+	out := s.snapshot()
+	if len(out) != 1 {
+		t.Fatalf("idle snapshot emitted %d samples, want 1", len(out))
+	}
+	sm := out[0]
+	// Cumulative counts over bounds {1,5,7.5,10} must reflect BOTH
+	// observations: one <=5, both <=10; +Inf (the total) is sm.count.
+	want := []uint64{0, 1, 1, 2}
+	for i, c := range sm.counts {
+		if c != want[i] {
+			t.Fatalf("counts = %v, want %v: distribution corrupted", sm.counts, want)
+		}
+	}
+	if sm.count != 2 {
+		t.Fatalf("+Inf count = %d, want 2", sm.count)
 	}
 
-	// All five bucket streams (le=1,5,7.5,10,+Inf) must be present, and the
-	// cumulative counts must reflect BOTH observations: one <=5, both <=10.
-	if len(byBucket) != 5 {
-		t.Fatalf("idle snapshot emitted %d/5 bucket streams: %v — lower buckets were dropped", len(byBucket), byBucket)
-	}
-	if byBucket[1] != 1 { // le=5
-		t.Fatalf("le=5 count = %d, want 1 (the value-5 observation): distribution corrupted", byBucket[1])
-	}
-	if byBucket[3] != 2 { // le=10
-		t.Fatalf("le=10 count = %d, want 2", byBucket[3])
-	}
-	if byBucket[4] != 2 { // +Inf
-		t.Fatalf("+Inf count = %d, want 2", byBucket[4])
+	// The reset that followed the emit zeroed the live distribution — and the
+	// emitted copy above must NOT have been zeroed with it (counts is cloned).
+	for _, samp := range s.db {
+		if samp.count != 0 {
+			t.Fatalf("idle reset kept count = %d, want 0", samp.count)
+		}
+		for i, c := range samp.counts {
+			if c != 0 {
+				t.Fatalf("idle reset kept bucket %d = %d, want 0", i, c)
+			}
+		}
 	}
 }
 

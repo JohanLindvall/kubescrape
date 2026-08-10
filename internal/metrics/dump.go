@@ -185,20 +185,21 @@ func dumpSeries(s *series) (RegistrySeries, bool) {
 		return d, true
 	}
 
-	// Histogram: decode the per-bucket streams through the SAME regrouping the
-	// OTLP render uses (regroupHistogram, a pure read — Dump must mutate
-	// nothing). The buckets stay CUMULATIVE here, which is the Dump contract;
-	// the render converts its copy to OTLP's absolute counts.
-	samples := make([]sample, 0, len(s.db))
+	// Histogram: one sample IS one label set's whole distribution. The buckets
+	// stay CUMULATIVE here, which is the Dump contract; the OTLP render
+	// converts its copy to absolute counts. counts is CLONED — the live array
+	// keeps counting after the lock is released — and nothing is mutated (Dump
+	// serves a live Registry beside the push path, TestDumpNonMutating).
 	for _, samp := range s.db {
-		samples = append(samples, samp.sample)
-	}
-	for _, g := range regroupHistogram(samples, len(d.Bounds)) {
+		lbls, err := parseLabels(samp.labels)
+		if err != nil {
+			continue
+		}
 		d.Points = append(d.Points, RegistryPoint{
-			Labels:  pairs(g.lbls),
-			Count:   g.count,
-			Sum:     g.sum,
-			Buckets: g.buckets,
+			Labels:  pairs(lbls),
+			Count:   samp.count,
+			Sum:     samp.value,
+			Buckets: slices.Clone(samp.counts),
 		})
 	}
 	sortPoints(d.Points)

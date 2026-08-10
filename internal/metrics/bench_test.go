@@ -126,8 +126,8 @@ func benchHistogramRules(b testing.TB) *DynamicMetricSet {
 }
 
 // BenchmarkDynamicAddHistogram measures a matched line against a histogram
-// metric: observe walks every bucket stream, which is the hottest multiplier in
-// the store (one line = len(buckets)+1 map probes at best).
+// metric: one hash and one map probe like every other kind, plus the
+// per-bound counts fold (one sample per label set carries the distribution).
 func BenchmarkDynamicAddHistogram(b *testing.B) {
 	setTimeForTest(time.Unix(1_700_400_400, 0))
 	defer testEpoch.Store(0)
@@ -378,8 +378,8 @@ func TestDynamicAddAllocationBudget(t *testing.T) {
 	}
 }
 
-// A histogram observation walks every bucket stream — the hottest multiplier in
-// the store. It must not allocate per bucket.
+// A histogram observation folds into one sample's per-bucket counts. It must
+// not allocate — per bucket or otherwise.
 func TestDynamicAddHistogramAllocationBudget(t *testing.T) {
 	if testrace.Enabled {
 		t.Skip("-race perturbs allocation counts")
@@ -410,7 +410,7 @@ func TestDynamicAddHistogramAllocationBudget(t *testing.T) {
 		bound.Add(values, lookup, `GET /api/v1/orders 200 0.42s`)
 	})
 	if allocs > 0.5 {
-		t.Fatalf("a histogram observation allocates %v times, want ~0 (15 bucket streams "+
-			"per line: anything per-bucket here is a per-line multiplier)", allocs)
+		t.Fatalf("a histogram observation allocates %v times, want ~0 (this runs once "+
+			"per matched line on the tailer's sweep goroutine)", allocs)
 	}
 }

@@ -851,8 +851,8 @@ logMetrics:
       resourceLabels:               # → resource attributes (same DSL)
         - tenant=$tenant
       maxCardinality: 5000          # cap on unique label sets (unset = default 10000, also the hard cap).
-                                    # Counts LABEL SETS, not samples: a histogram costs one sample per
-                                    # bucket, and maxCardinality x buckets > 150000 is refused at startup.
+                                    # A histogram is one stored sample per label set (its buckets ride
+                                    # along), and maxCardinality x buckets > 150000 is refused at startup.
       maxAge: 1h                    # expire idle series (default/cap 24h)
       labelPrefix: ""               # optional prefix on every label name
     - name: request_duration_seconds

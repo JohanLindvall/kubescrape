@@ -492,28 +492,21 @@ func (failingExporter) ExportMetrics(context.Context, pmetric.Metrics) error {
 	return errors.New("collector unavailable")
 }
 
-// accumulateBuckets without the +Inf stream: the total (g.count) is unknown
-// (zero), so the +Inf slot must stay 0 rather than wrapping the unsigned
-// g.count - prev subtraction to ~1.8e19. Unreachable today — a histogram's
-// bucket streams expire in lockstep, so admission is all-or-nothing — this
-// pins the defensive branch a future per-stream eviction would reach.
-func TestAccumulateBucketsWithoutInfStream(t *testing.T) {
-	g := &histGroup{buckets: []uint64{2, 5, 9}} // cumulative; hasInf false, count 0
-
-	got := accumulateBuckets(g)
-	want := []uint64{2, 3, 4, 0} // per-bucket absolutes; +Inf slot 0, not 0-9 wrapped
+// absoluteBuckets differences a sample's cumulative counts into OTLP's
+// absolute per-bucket counts, with the +Inf slot the total's remainder.
+func TestAbsoluteBuckets(t *testing.T) {
+	got := absoluteBuckets([]uint64{2, 5, 9}, 12)
+	want := []uint64{2, 3, 4, 3}
 	if len(got) != len(want) {
-		t.Fatalf("accumulateBuckets = %v, want %v", got, want)
+		t.Fatalf("absoluteBuckets = %v, want %v", got, want)
 	}
 	for i := range want {
 		if got[i] != want[i] {
-			t.Fatalf("accumulateBuckets = %v, want %v", got, want)
+			t.Fatalf("absoluteBuckets = %v, want %v", got, want)
 		}
 	}
-
-	// The complete group still gets the real +Inf remainder.
-	g = &histGroup{buckets: []uint64{2, 5, 9}, count: 12, sum: 30, hasInf: true}
-	if got := accumulateBuckets(g); got[3] != 3 {
-		t.Fatalf("with hasInf, +Inf slot = %d, want 3 (got %v)", got[3], got)
+	// No bounds at all: everything lands in +Inf.
+	if got := absoluteBuckets(nil, 7); len(got) != 1 || got[0] != 7 {
+		t.Fatalf("absoluteBuckets(nil, 7) = %v, want [7]", got)
 	}
 }

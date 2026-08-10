@@ -443,76 +443,12 @@ func renderSummary(m pmetric.Metric, samples []sample, ts time.Time) {
 	}
 }
 
-// histGroup is one label set's regrouped histogram: the series store keeps a
-// histogram as one stream per bucket (the labels plus "le"), and both readers
-// of that layout — Dump and this OTLP render — need it back as one point per
-// label set.
-type histGroup struct {
-	lbls labels
-	key  string // canonical label string without "le" (putLabels-ready)
-	// first is the group's first sample in input order. Every bucket stream of
-	// one label set is admitted together (observe's admission is
-	// all-or-nothing), so whichever arrives first carries the point's start.
-	first sample
-	// buckets is the CUMULATIVE count per bound, +Inf excluded: each stream's
-	// count already includes every lower bucket's, because observe records
-	// into every bucket the value fits.
-	buckets []uint64
-	// count/sum are the +Inf stream's totals — the point's observation count
-	// and their sum, exactly the Prometheus histogram shape.
-	count uint64
-	sum   float64
-	// hasInf records that the +Inf stream was present, so a render can leave
-	// the optional sum/count unset when it somehow was not (unreachable given
-	// all-or-nothing admission; defensive).
-	hasInf bool
-}
-
-// regroupHistogram decodes the store's bucket-stream layout into one group per
-// label set, in first-seen order. Consumed by BOTH renderHistogram (which
-// converts the cumulative buckets to OTLP's absolute counts) and dumpSeries
-// (which keeps them cumulative, the Dump contract).
-//
-// Keyed by the canonical label STRING, not lbls.hash(): the series store
-// defends 64-bit collisions with a check hash, and dropping that discipline
-// here would silently merge two label sets' buckets into one corrupted point.
-// The string is exact and already needed for the label rendering.
-//
-// PURE READ, by contract: nothing in the samples is mutated — Dump serves a
-// live Registry through this beside the push path (TestDumpNonMutating), so
-// it must never seal, clear or spend anything.
-func regroupHistogram(samples []sample, nBounds int) []*histGroup {
-	groups := map[string]*histGroup{}
-	var out []*histGroup
-	for _, samp := range samples {
-		lbls, err := parseLabels(samp.labels)
-		if err != nil {
-			continue
-		}
-		lbls = lbls.without(leLabel)
-		key := lbls.String()
-		g := groups[key]
-		if g == nil {
-			g = &histGroup{lbls: lbls, key: key, first: samp, buckets: make([]uint64, nBounds)}
-			groups[key] = g
-			out = append(out, g)
-		}
-		switch {
-		case samp.bucket == nBounds: // the +Inf stream carries the totals
-			g.count, g.sum, g.hasInf = samp.count, samp.value, true
-		case samp.bucket < nBounds:
-			g.buckets[samp.bucket] = samp.count
-		}
-	}
-	return out
-}
-
-// renderHistogram writes one cumulative OTLP histogram point per regrouped
-// label set (regroupHistogram), converting the stored cumulative bucket
-// counts to the absolute per-bucket counts OTLP wants (accumulateBuckets).
+// renderHistogram writes one cumulative OTLP histogram point per sample — a
+// histogram sample IS one label set's whole distribution (sample.counts) —
+// converting the stored cumulative bucket counts to the absolute per-bucket
+// counts OTLP wants (absoluteBuckets).
 func renderHistogram(m pmetric.Metric, s *series, samples []sample, ts time.Time) {
 	now := pcommon.Timestamp(ts.UnixNano())
-	bounds := s.buckets[:len(s.buckets)-1] // drop +Inf
 
 	// Reuse an earlier generation's shape — SetEmpty* would wipe its points
 	// (see renderSeries).
@@ -521,44 +457,35 @@ func renderHistogram(m pmetric.Metric, s *series, samples []sample, ts time.Time
 	}
 	hist := m.Histogram()
 
-	for _, g := range regroupHistogram(samples, len(bounds)) {
+	for _, samp := range samples {
 		dp := hist.DataPoints().AppendEmpty()
-		dp.SetStartTimestamp(startOf(g.first, ts))
+		dp.SetStartTimestamp(startOf(samp, ts))
 		dp.SetTimestamp(now)
-		putLabels(dp.Attributes(), g.key)
-		dp.ExplicitBounds().FromRaw(bounds)
-		if g.hasInf {
-			dp.SetSum(g.sum)
-			dp.SetCount(g.count)
-		}
-		dp.BucketCounts().FromRaw(accumulateBuckets(g))
+		putLabels(dp.Attributes(), samp.labels)
+		dp.ExplicitBounds().FromRaw(s.bounds())
+		dp.SetSum(samp.value)
+		dp.SetCount(samp.count)
+		dp.BucketCounts().FromRaw(absoluteBuckets(samp.counts, samp.count))
 	}
 }
 
-// accumulateBuckets converts a group's cumulative bucket counts into the
+// absoluteBuckets converts a sample's cumulative bucket counts into the
 // absolute per-bucket counts OTLP wants: a value counted in its bucket was
 // also counted in every higher one, so each slot is its cumulative count
 // minus the previous bound's, and the +Inf slot is the total minus the last
-// bound's.
-//
-// Without the +Inf stream (hasInf false) the total is unknown, so the +Inf
-// slot stays 0 — the same treatment renderHistogram gives the optional
-// sum/count. The branch is currently unreachable (a histogram's bucket
-// streams expire in lockstep, so admission is all-or-nothing — the invariant
-// hasInf documents); it is defense in depth for a future per-stream eviction,
-// where g.count would be 0 and the unguarded unsigned subtraction wrapped to
-// ~1.8e19.
-func accumulateBuckets(g *histGroup) []uint64 {
-	counts := make([]uint64, len(g.buckets)+1)
+// bound's. total >= counts[last] by construction — record increments them
+// together and the idle reset clears them together — so the unsigned
+// subtraction cannot underflow (the partial-family case the old per-bucket
+// layout had to defend against is unrepresentable in one sample).
+func absoluteBuckets(counts []uint64, total uint64) []uint64 {
+	out := make([]uint64, len(counts)+1)
 	var prev uint64
-	for i, c := range g.buckets {
-		counts[i] = c - prev
+	for i, c := range counts {
+		out[i] = c - prev
 		prev = c
 	}
-	if g.hasInf {
-		counts[len(g.buckets)] = g.count - prev
-	}
-	return counts
+	out[len(counts)] = total - prev
+	return out
 }
 
 // putLabels parses a serialized label set and copies its pairs into a pdata map.

@@ -321,3 +321,58 @@ func TestNamePrefixDoesNotMaskEmptyName(t *testing.T) {
 		t.Fatalf("want a no-name refusal, got %v", err)
 	}
 }
+
+// A retained histogram generation must be immune to observations that arrive
+// between the failed export and the successful re-offer: sample.counts on the
+// live entry keeps counting, so snapshot's emit CLONES it — without the clone
+// the retained (older) point would render with the newer distribution under
+// its older timestamp and count, an internally inconsistent point.
+func TestRetainedHistogramGenerationImmutable(t *testing.T) {
+	setTimeForTest(time.Unix(1_800_100_000, 0))
+	defer testEpoch.Store(0)
+
+	set, err := newTestSet([]Dynamic{{
+		Name: "h_seconds", Type: HistogramType, Value: "v", Buckets: []float64{1, 10},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	add := func(v string) {
+		set.Add(valuesFrom(map[string]string{"v": v}), labelsFrom(nil), noRes(), "")
+	}
+
+	add("0.5") // cumulative counts [1, 1], total 1
+	if err := set.Export(context.Background(), &failingExporter{}, 0); err == nil {
+		t.Fatal("want failure")
+	}
+	add("5") // live entry moves on: cumulative [1, 2], total 2
+	exp := &capExporter{}
+	if err := set.Export(context.Background(), exp, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	m, ok := exp.find("h_seconds")
+	if !ok || m.Type() != pmetric.MetricTypeHistogram {
+		t.Fatalf("histogram not rendered: %v", ok)
+	}
+	dps := m.Histogram().DataPoints()
+	if dps.Len() != 2 {
+		t.Fatalf("points = %d, want 2 (retained generation + fresh snapshot)", dps.Len())
+	}
+	// mergeRetry prepends: the retained generation renders first, and must
+	// carry the pre-failure distribution exactly.
+	old := dps.At(0)
+	if old.Count() != 1 {
+		t.Fatalf("retained count = %d, want 1", old.Count())
+	}
+	if got := old.BucketCounts().AsRaw(); got[0] != 1 || got[1] != 0 || got[2] != 0 {
+		t.Fatalf("retained buckets = %v, want [1 0 0] — the later observation leaked into the retained generation", got)
+	}
+	fresh := dps.At(1)
+	if fresh.Count() != 2 {
+		t.Fatalf("fresh count = %d, want 2", fresh.Count())
+	}
+	if got := fresh.BucketCounts().AsRaw(); got[0] != 1 || got[1] != 1 || got[2] != 0 {
+		t.Fatalf("fresh buckets = %v, want [1 1 0]", got)
+	}
+}

@@ -714,11 +714,11 @@ record's enriched attributes and resource attributes (k8s metadata) first, then
 **straight from the log line's own JSON or logfmt fields** (dotted keys descend
 into nested JSON) — so a metric can read any field of the line with no separate
 `logAttributes` config. Series expire after `maxAge` of inactivity and are
-capped at `maxCardinality` unique label combinations (hard cap 10000). The cap
-counts label combinations, not stored samples: a histogram's label set costs one
-sample per bucket, and a configuration whose `maxCardinality` x buckets would
-exceed 150000 live samples is rejected at startup rather than quietly admitting
-fewer label sets than asked for.
+capped at `maxCardinality` unique label combinations (hard cap 10000). A
+histogram is one stored sample per label combination, carrying its whole
+per-bucket distribution — but each bucket is still a slot in that sample and a
+series in every export, so a configuration whose `maxCardinality` x buckets
+would exceed 150000 bucket slots is rejected at startup.
 
 **Resource attributes.** The log line's own resource attributes (the pod's k8s
 identity: namespace, pod, container, node, `service.name`, owners, and the

@@ -28,7 +28,7 @@ func TestHistogramCardinalityCountsLabelSets(t *testing.T) {
 		t.Fatalf("compile: %v", err)
 	}
 	// Ten distinct label sets against a cap of five: exactly five must land,
-	// each with its full 15-stream distribution.
+	// each one sample carrying its full per-bucket distribution.
 	for i := range 10 {
 		id := strconv.Itoa(i)
 		set.Add(func(k string) (float64, bool, bool) { return 1, k == "v", k == "v" },
@@ -39,17 +39,15 @@ func TestHistogramCardinalityCountsLabelSets(t *testing.T) {
 				return ""
 			}, pcommon.NewMap(), "")
 	}
-	streams := len(defaultBuckets) + 1
 	ser := set.rules[0].series
-	if got := len(ser.db) / streams; got != want {
-		t.Fatalf("admitted %d label combinations (%d samples / %d streams), want %d",
-			got, len(ser.db), streams, want)
+	if got := len(ser.db); got != want {
+		t.Fatalf("admitted %d label combinations, want %d", got, want)
 	}
 }
 
 // A histogram whose label-set cap times its bucket count would outgrow the
-// store's live-sample budget is rejected at compile time — loudly, rather than
-// by silently admitting fewer label sets than configured.
+// store's bucket-slot budget (per-sample counts memory, per-export rendered
+// bucket series) is rejected at compile time — loudly, up front.
 func TestHistogramStreamBudgetGuard(t *testing.T) {
 	buckets := make([]float64, 200)
 	for i := range buckets {
@@ -59,9 +57,9 @@ func TestHistogramStreamBudgetGuard(t *testing.T) {
 		Name: "h", Type: HistogramType, Value: "v", Buckets: buckets, MaxCardinality: 10000,
 	}})
 	if err == nil {
-		t.Fatal("10000 label sets x 201 buckets compiled — that is 2M live samples")
+		t.Fatal("10000 label sets x 201 buckets compiled — that is 2M bucket slots")
 	}
-	if !strings.Contains(err.Error(), "live samples") {
+	if !strings.Contains(err.Error(), "bucket slots") {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	// Lowering the cardinality to fit is accepted.

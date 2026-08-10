@@ -53,7 +53,7 @@ func TestDumpNonMutating(t *testing.T) {
 }
 
 // Histogram dumps carry the Prometheus shape directly: cumulative per-bound
-// counts, total count and sum from the +Inf stream.
+// counts, the total count and the sum.
 func TestDumpHistogramShape(t *testing.T) {
 	r := NewRegistry()
 	h := r.HistogramVec("kubescrape_test_seconds", "d", []float64{1, 5}, "op")
@@ -78,6 +78,14 @@ func TestDumpHistogramShape(t *testing.T) {
 	}
 	if len(p.Labels) != 1 || p.Labels[0] != [2]string{"op", "x"} {
 		t.Fatalf("labels = %v", p.Labels)
+	}
+
+	// The dump is a snapshot: Buckets is CLONED off the live counts array,
+	// which keeps counting after Dump returns — a later observation must not
+	// rewrite an already-returned dump.
+	h.WithLabelValues("x").Observe(0.5)
+	if !reflect.DeepEqual(p.Buckets, []uint64{2, 3}) {
+		t.Fatalf("a post-dump observation leaked into the dump: buckets = %v, want [2 3]", p.Buckets)
 	}
 }
 

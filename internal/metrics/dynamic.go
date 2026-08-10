@@ -29,12 +29,13 @@ const (
 	defaultMaxAge     = 24 * time.Hour
 	maxMaxAge         = 24 * time.Hour
 	maxCardinalityCap = 10000
-	// maxStreamCap bounds the LIVE SAMPLES one metric may hold. maxCardinality
-	// counts label combinations, and a histogram costs one sample per bucket,
-	// so the product is what actually sizes the agent's memory. It is exactly
-	// the default histogram at the hard cardinality cap (10000 label sets x 15
-	// streams); anything wider is a deliberate trade the operator must spell
-	// out by lowering maxCardinality.
+	// maxStreamCap bounds a histogram's BUCKET SLOTS (label sets x buckets):
+	// each live sample carries a counts entry per bucket, and every export
+	// renders one bucket series per slot, so the product is what sizes both
+	// the store and the payload. It is exactly the default histogram at the
+	// hard cardinality cap (10000 label sets x 15 buckets incl. +Inf);
+	// anything wider is a deliberate trade the operator must spell out by
+	// lowering maxCardinality.
 	// (defaultBuckets is a slice, so len() is not a constant expression;
 	// TestStreamCapMatchesDefaultHistogram pins the two together.)
 	maxStreamCap = maxCardinalityCap * 15

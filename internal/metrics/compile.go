@@ -111,11 +111,11 @@ func compileRule(d *Dynamic, cfg *setConfig, shared map[string]*series) (*metric
 	}
 	name := cfg.namePrefix + d.Name
 	if kind == kindHistogram {
-		// maxCardinality counts LABEL COMBINATIONS, and a histogram's label set
-		// costs one live sample per bucket — so the memory the cap is defending
-		// is the PRODUCT. Refuse a combination that could outgrow the store's
-		// stream budget rather than silently admitting fewer label sets than
-		// configured (which is exactly the bug this unit fix removed). The
+		// maxCardinality counts LABEL COMBINATIONS (and since the one-sample-
+		// per-label-set layout, so does the store — no translation needed), but
+		// a histogram's cost still scales with the PRODUCT: every live sample
+		// carries a counts slot per bucket, and every export renders all of
+		// them. Refuse a combination that could outgrow that budget. The
 		// effective bucket count is what matters: an empty Buckets is replaced
 		// by defaultBuckets in newSeries.
 		streams := len(d.Buckets) + 1
@@ -123,7 +123,7 @@ func compileRule(d *Dynamic, cfg *setConfig, shared map[string]*series) (*metric
 			streams = len(defaultBuckets) + 1
 		}
 		if cap := cardinalityCap(d.MaxCardinality); cap*streams > maxStreamCap {
-			return nil, fmt.Errorf("metric %q: maxCardinality %d x %d buckets = %d live samples, above the %d-sample budget — lower maxCardinality or use fewer buckets",
+			return nil, fmt.Errorf("metric %q: maxCardinality %d x %d buckets = %d bucket slots, above the %d-slot budget — lower maxCardinality or use fewer buckets",
 				d.Name, cap, streams, cap*streams, maxStreamCap)
 		}
 	}

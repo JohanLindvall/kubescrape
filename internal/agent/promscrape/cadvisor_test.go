@@ -17,6 +17,7 @@ import (
 	"github.com/JohanLindvall/kubescrape/internal/bearer"
 	"github.com/JohanLindvall/kubescrape/internal/obs"
 	"github.com/JohanLindvall/kubescrape/pkg/kubemeta"
+	"github.com/JohanLindvall/kubescrape/pkg/metaclient"
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/pmetric"
 )
@@ -213,7 +214,7 @@ func (f *fakeMetaSource) PodByName(_ context.Context, namespace, name string) (*
 		p := pod1Meta
 		return &p, nil
 	}
-	return nil, errors.New("not found")
+	return nil, notFound()
 }
 
 func (f *fakeMetaSource) Container(_ context.Context, id string, _ time.Duration) (*kubemeta.ContainerMetadata, error) {
@@ -222,7 +223,18 @@ func (f *fakeMetaSource) Container(_ context.Context, id string, _ time.Duration
 		p := pod1Meta
 		return &kubemeta.ContainerMetadata{ContainerID: id, Container: p.Containers[0], Pod: p}, nil
 	}
-	return nil, errors.New("not found")
+	return nil, notFound()
+}
+
+// notFound is the error a real metaclient returns for an object the metadata
+// service does not know, and the TYPE is load-bearing rather than decorative:
+// containerMeta classifies a miss by it (metaclient.IsNotFound), and the cgroup
+// sampler's whole retry policy turns on that classification. A fake returning a
+// bare errors.New would report every miss as "the service could not answer",
+// which is the opposite verdict — and would do it silently, in the fake, where
+// no production code could be blamed for it.
+func notFound() error {
+	return &metaclient.StatusError{Code: http.StatusNotFound, Body: "no such object"}
 }
 
 var cadvisorBody = strings.NewReplacer(

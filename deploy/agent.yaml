@@ -103,6 +103,34 @@ spec:
             # journal is the only signal — /readyz stays 200 and no counter
             # moves, an untouched counter never being exported at all.
             #- -journald
+            # High-frequency cgroup sampling. The cadvisor scrape above reports
+            # ONE average per -scrape-interval, so a container that spikes to 4
+            # cores for 2s inside a 30s window is reported as ~0.27 cores. This
+            # samples each container's cgroup every second and ships the
+            # distribution — container_cpu_usage_{stddev,max,min} and
+            # container_memory_working_set_bytes_{stddev,max,min}, six gauges
+            # per container per window, next to the cadvisor series they
+            # explain.
+            #
+            # Uncomment the flag AND the cgroup volume + mount below TOGETHER.
+            # Without the host's /sys/fs/cgroup the agent sees only its OWN
+            # cgroup, finds no pod cgroups and exports nothing — the same shape
+            # as the journald trap above. It says so at startup (a WARNING
+            # naming the mount) and kubescrape_cgroup_containers is published at
+            # 0, which is what tells "on and finding nothing" from "off".
+            # cgroup v2 only, and a mixed fleet is fine: a v1 node logs an
+            # ERROR naming the version and this flag, disables this pipeline
+            # alone and keeps every other one — logs included — running, rather
+            # than misreading v1's nanosecond counters as microseconds or
+            # CrashLooping the node's log shipping over a metric.
+            #
+            # Only containers the metadata service can place are exported (a
+            # series with no service.name has no Prometheus job and joins
+            # nothing), which is also what keeps each pod's sandbox/pause
+            # cgroup out of the payload: watch
+            # kubescrape_cgroup_unresolved_containers, where one entry per pod
+            # is normal and permanent.
+            #- -cgroup-stats
           env:
             - name: NODE_NAME
               valueFrom:
@@ -163,6 +191,13 @@ spec:
             #- name: runlogjournal
             #  mountPath: /run/log/journal
             #  readOnly: true
+            # The host's cgroup hierarchy, for -cgroup-stats. Read-only: the
+            # sampler only ever reads three files per container. Uncomment with
+            # the flag above; the chart mounts this whenever
+            # agent.cgroupStats.enabled is set.
+            #- name: cgroup
+            #  mountPath: /sys/fs/cgroup
+            #  readOnly: true
           resources:
             requests:
               cpu: 50m
@@ -182,3 +217,11 @@ spec:
         #  hostPath:
         #    path: /run/log/journal
         #    type: DirectoryOrCreate
+        # Uncomment with -cgroup-stats and its mount above. `Directory`, not
+        # DirectoryOrCreate: an absent /sys/fs/cgroup is a node this feature
+        # cannot work on, and creating an empty directory over it would hand the
+        # agent a root that looks mounted and holds nothing.
+        #- name: cgroup
+        #  hostPath:
+        #    path: /sys/fs/cgroup
+        #    type: Directory

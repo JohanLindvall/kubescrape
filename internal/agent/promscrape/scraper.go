@@ -778,12 +778,20 @@ func targetInstance(rawURL string) string {
 // does not know yet gets the POD context (Build still enriches from it) together
 // with false, because its container identity can only come from the caller's own
 // labels. Shared by the cadvisor and split batchers.
-func (s *Scraper) resolveContext(ctx context.Context, containerID, namespace, pod, uid, container string, res pcommon.Resource) (attrs.Context, bool) {
+//
+// The THIRD value classifies a failure for the one caller whose retry policy
+// turns on it (FillContainerResource, for internal/agent/cgroupstats): true
+// means the metadata service ANSWERED and its answer placed nothing, false
+// means it could not answer at all. With no id to look up at all it is true —
+// nothing was asked, so there is no outage to wait out and no later attempt
+// that could go differently.
+func (s *Scraper) resolveContext(ctx context.Context, containerID, namespace, pod, uid, container string, res pcommon.Resource) (attrs.Context, bool, bool) {
 	var actx attrs.Context
 	if containerID != "" {
-		if md := s.containerMeta(ctx, containerID); md != nil {
+		md, answered := s.containerMeta(ctx, containerID)
+		if md != nil {
 			actx.Pod, actx.Container = &md.Pod, &md.Container
-			return actx, true
+			return actx, true, true
 		}
 		// The store does not know THIS incarnation — typically because the kubelet
 		// has not posted a just-started container's id to the API server yet, and
@@ -797,15 +805,20 @@ func (s *Scraper) resolveContext(ctx context.Context, containerID, namespace, po
 		// Take the pod for its owner/label enrichment, but report UNRESOLVED so
 		// the caller's identity fallback keeps the row's OWN container id, name
 		// and image.
+		//
+		// The classification stays the CONTAINER lookup's: the service has said
+		// this container id is unknown, and whether the pod lookup beside it
+		// also reached the service says nothing about that verdict.
 		if pod != "" {
-			if meta := s.podMeta(ctx, namespace, pod); meta != nil && (uid == "" || meta.UID == uid) {
+			if meta, _ := s.podMeta(ctx, namespace, pod); meta != nil && (uid == "" || meta.UID == uid) {
 				actx.Pod = meta
 			}
 		}
-		return actx, false
+		return actx, false, answered
 	}
 	if pod != "" {
-		if meta := s.podMeta(ctx, namespace, pod); meta != nil && (uid == "" || meta.UID == uid) {
+		meta, answered := s.podMeta(ctx, namespace, pod)
+		if meta != nil && (uid == "" || meta.UID == uid) {
 			actx.Pod = meta
 			if container != "" {
 				for i := range meta.Containers {
@@ -818,10 +831,14 @@ func (s *Scraper) resolveContext(ctx context.Context, containerID, namespace, po
 					res.Attributes().PutStr("k8s.container.name", container)
 				}
 			}
-			return actx, true
+			return actx, true, true
 		}
+		// A pod that resolved under a DIFFERENT uid is an answer too: this name
+		// belongs to another pod now, and asking again in a second changes
+		// nothing.
+		return actx, false, answered
 	}
-	return actx, false
+	return actx, false, true
 }
 
 func (s *Scraper) scrapeTarget(ctx context.Context, t kubemeta.ScrapeTarget, timeout time.Duration) (int, error) {

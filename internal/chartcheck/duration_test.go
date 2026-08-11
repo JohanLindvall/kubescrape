@@ -48,6 +48,7 @@ var durationValues = []struct {
 	{path: "agent.logsPollInterval", flag: "logs-poll-interval"},
 	{path: "agent.scrapeInterval", flag: "scrape-interval"},
 	{path: "agent.journald.flushInterval", flag: "journald-flush-interval"},
+	{path: "agent.cgroupStats.interval", flag: "cgroup-stats-interval"},
 	{path: "events.flushInterval", flag: "events-flush-interval"},
 	{path: "events.positionInterval", flag: "events-position-interval"},
 	{path: "serviceGraph.spanMetricsInterval", flag: "ingest-span-metrics-interval"},
@@ -66,6 +67,7 @@ var durationRefs = map[string]bool{
 // an `if`, so one `helm template` covers all of durationValues.
 var featureFlags = []string{
 	"--set", "agent.journald.enabled=true",
+	"--set", "agent.cgroupStats.enabled=true",
 	"--set", "events.enabled=true",
 	"--set", "serviceGraph.enabled=true",
 	"--set", "serviceGraph.spanMetrics=true",

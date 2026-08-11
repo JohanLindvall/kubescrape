@@ -191,6 +191,57 @@ agent:
     # (there is no standalone journald cursor file); without it, every restart
     # begins at the journal tail.
 
+  # High-frequency cgroup sampling: read each container's cgroup every
+  # `interval` and export the DISTRIBUTION of each scrapeInterval window —
+  # container_cpu_usage_{stddev,max,min} in cores and
+  # container_memory_working_set_bytes_{stddev,max,min}. The cadvisor scrape
+  # above reports one AVERAGE per window, so a container spiking to 4 cores for
+  # two seconds inside a 30s window is reported as ~0.27 cores; these six gauges
+  # per container recover the burst at roughly the cost of the cadvisor series
+  # they sit beside, instead of the 30x a 1s raw series would cost.
+  #
+  # Enabling this mounts the host's /sys/fs/cgroup READ-ONLY into the agent —
+  # the sampler reads three files per container and writes nothing. Without that
+  # mount the agent would see only its own cgroup and export nothing, so the
+  # chart renders the flag and the mount together.
+  #
+  # cgroup v2 ONLY, and a MIXED FLEET is fine: a v1 node logs an error naming
+  # the version and this flag, disables this one pipeline and keeps every other
+  # one — logs included — running. (It never misreads v1's nanosecond CPU
+  # counters as microseconds, and it never CrashLoops the node's log shipping
+  # over a metric. An explicit `root` below that is not a cgroup v2 hierarchy is
+  # a different thing — an operator error, identical on every node — and still
+  # refuses to start.)
+  #
+  # Only containers the metadata service can place are exported: a series with
+  # no service.name has no Prometheus job and joins nothing. That is also what
+  # keeps each pod's sandbox (pause) cgroup out of the payload. Watch
+  # kubescrape_cgroup_unresolved_containers if fewer containers appear than
+  # expected — one per pod is normal.
+  cgroupStats:
+    enabled: false
+    # Sampling period. Must be well below scrapeInterval, which is the window
+    # the distribution describes: the CPU gauges need two readings inside one
+    # window to derive a single rate, and a window with fewer than two samples
+    # of a signal re-states the last distribution measured rather than
+    # publishing a one-sample one (the agent warns when the period is that
+    # coarse). Below 100ms is refused, and below 500ms warns: a sweep is three
+    # cgroup reads per container on the goroutine that also tails this node's
+    # logs.
+    interval: 1s
+    # cgroup v2 mount point INSIDE the agent container; empty means
+    # /sys/fs/cgroup. Only the MOUNT POINT — the layout beneath it is
+    # discovered, so kind's kubelet.slice nesting, a stock systemd node's
+    # kubepods.slice and a cgroupfs-driver node's kubepods all work unset.
+    #
+    # This drives the mount as well as the flag, so setting it to e.g.
+    # /host/sys/fs/cgroup relocates both together. (It used to render only the
+    # flag, against a mount fixed at /sys/fs/cgroup, so every value except the
+    # default CrashLooped the DaemonSet.) The host side is always the node's
+    # /sys/fs/cgroup; mounting some other host path is what extraVolumes and
+    # extraVolumeMounts are for.
+    root: ""
+
   # Receive OTLP LOGS AND METRICS pushed by apps on the node and enrich them
   # with k8s attributes from a container.id / k8s.pod.uid on the data before
   # forwarding.

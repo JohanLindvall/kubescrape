@@ -245,6 +245,23 @@
           },
           "additionalProperties": false
         },
+        "cgroupStats": {
+          "type": "object",
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            },
+            "interval": {
+              "$ref": "#/definitions/duration",
+              "description": "-cgroup-stats-interval"
+            },
+            "root": {
+              "type": "string",
+              "description": "-cgroup-stats-root, and the mountPath the host's cgroup hierarchy is bind-mounted at (empty means /sys/fs/cgroup)"
+            }
+          },
+          "additionalProperties": false
+        },
         "ingest": {
           "type": "object",
           "properties": {

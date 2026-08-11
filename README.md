@@ -899,6 +899,31 @@ ServiceAccount token (`nodes/metrics` RBAC, see
 * **node metrics** (`/metrics`): the kubelet's own metrics under a node-level
   resource (`k8s.node.name`, `service.name: kubelet`).
 
+**High-frequency cgroup sampling** (opt-in, `-cgroup-stats`). cadvisor is
+scraped once per `-scrape-interval`, so a container that spikes to 4 cores for
+two seconds inside a 60-second window is reported as roughly 0.13 cores — the
+average hides the burst that mattered. With `-cgroup-stats` the agent reads
+each container's `cpu.stat`, `memory.current` and `memory.stat` **directly,
+once a second**, and exports the *distribution* of each scrape window as six
+extra gauges beside the cadvisor series they annotate:
+`container_cpu_usage_stddev` / `_max` / `_min` (in **cores**, from the rate)
+and `container_memory_working_set_bytes_stddev` / `_max` / `_min`. Measured on
+a real burst workload, the sampler reported a max of 2.000 cores where
+cadvisor's 30-second average read 0.394 — a 5.1x gap — and on memory it
+bracketed a known 192 MiB allocation to +0.26% while cadvisor's single sample
+per scrape missed the peak in two windows out of three. The sampling costs
+about 0.25% of one core at 200 containers.
+
+The six gauges carry the **same resource attributes as the cadvisor series for
+the same container**, so they join in a query; a container the metadata
+service cannot resolve is not exported at all, which is also what keeps the
+pod sandbox out. Requires the host's `/sys/fs/cgroup` mounted read-only — the
+chart does it behind `agent.cgroupStats.enabled`, and
+[deploy/agent.yaml](deploy/agent.yaml) carries the flag, mount and volume
+commented out together. cgroup **v2 only**: a v1 node disables this pipeline
+alone and logs an error, leaving every other pipeline running. See
+[docs/CONFIGURATION.md](docs/CONFIGURATION.md#agent-high-frequency-cgroup-sampling).
+
 **journald** (opt-in, `-journald`). The agent reads the systemd journal
 natively through libsystemd (`coreos/go-systemd/sdjournal`) and exports the
 entries as OTLP log records, one resource per unit (`service.name` = unit

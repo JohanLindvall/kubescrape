@@ -40,6 +40,12 @@ var hostPathPipelines = []struct {
 		why: "volatile journals (systemd Storage=volatile, or auto on a node with no /var/log/journal) live only under /run/log/journal, " +
 			"which the /var/log mount does not cover; without it the reader starts, waits and exports nothing",
 	},
+	{
+		flag:     "cgroup-stats",
+		hostPath: "/sys/fs/cgroup",
+		why: "the agent's own /sys/fs/cgroup shows only its OWN cgroup (a container gets a cgroup namespace), so without the host's hierarchy " +
+			"bind-mounted in, discovery finds no pod cgroups and the sampler exports nothing on every node",
+	},
 }
 
 // manifestDirs is Dirs resolved from THIS package. Dirs is spelled relative to

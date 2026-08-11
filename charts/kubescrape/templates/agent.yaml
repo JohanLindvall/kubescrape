@@ -231,6 +231,21 @@ spec:
             - -journald-max-batch-bytes={{ int64 .Values.agent.journald.maxBatchBytes }}
             - -journald-flush-interval={{ .Values.agent.journald.flushInterval }}
             {{- end }}
+            {{- if .Values.agent.cgroupStats.enabled }}
+            {{- /* High-frequency cgroup sampling. The cadvisor scrape reports
+                   one average per scrapeInterval; this ships the distribution
+                   (stddev/max/min of the CPU rate and the working set) of the
+                   same window, so a two-second burst inside a thirty-second
+                   window is still visible. Needs the read-only /sys/fs/cgroup
+                   mount rendered below — without it the agent sees only its own
+                   cgroup and exports nothing, which it warns about at startup
+                   and reports as kubescrape_cgroup_containers 0. */}}
+            - -cgroup-stats
+            - -cgroup-stats-interval={{ .Values.agent.cgroupStats.interval }}
+            {{- with .Values.agent.cgroupStats.root }}
+            - -cgroup-stats-root={{ . }}
+            {{- end }}
+            {{- end }}
             {{- if .Values.agent.ingest.enabled }}
             {{- /* LOGS AND METRICS. Traces are pushed to the trace tier
                    (templates/servicegraph.yaml) instead: both things worth
@@ -344,6 +359,23 @@ spec:
               mountPath: /run/log/journal
               readOnly: true
             {{- end }}
+            {{- if .Values.agent.cgroupStats.enabled }}
+            {{- /* The mount point follows `root`, because `root` is where the
+                   agent LOOKS. Rendering -cgroup-stats-root against a mountPath
+                   hardcoded to /sys/fs/cgroup made every non-default value
+                   CrashLoop the DaemonSet: an explicitly configured root that
+                   is not a cgroup v2 hierarchy is fatal by design (an operator
+                   error, identical on every node), so the value was unusable
+                   without hand-rolling a volume through extraVolumes. The
+                   hostPath below stays /sys/fs/cgroup — that is where the
+                   hierarchy is ON THE NODE, and a node where it is not is one
+                   this feature cannot work on. */}}
+            # The host's cgroup hierarchy. Read-only: the sampler reads three
+            # files per container and writes nothing.
+            - name: cgroup
+              mountPath: {{ .Values.agent.cgroupStats.root | default "/sys/fs/cgroup" }}
+              readOnly: true
+            {{- end }}
             {{- with .Values.agent.extraVolumeMounts }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
@@ -376,6 +408,16 @@ spec:
           hostPath:
             path: /run/log/journal
             type: DirectoryOrCreate
+        {{- end }}
+        {{- if .Values.agent.cgroupStats.enabled }}
+        {{- /* `Directory`, not DirectoryOrCreate: an absent /sys/fs/cgroup is a
+               node this feature cannot work on, and creating an empty directory
+               over it would hand the agent a root that looks mounted and holds
+               nothing — a silent zero instead of a scheduling failure. */}}
+        - name: cgroup
+          hostPath:
+            path: /sys/fs/cgroup
+            type: Directory
         {{- end }}
         {{- with .Values.agent.extraVolumes }}
         {{- toYaml . | nindent 8 }}

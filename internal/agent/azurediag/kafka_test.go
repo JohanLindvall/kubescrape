@@ -7,10 +7,15 @@ package azurediag
 // committed rather than re-consuming or skipping ahead.
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
 	"log/slog"
+	"os"
+	"path/filepath"
+	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -233,5 +238,241 @@ func TestRecordsAndCleanFetchesAreHealthy(t *testing.T) {
 
 	if msgs, healthy, err = pollResult(kgo.Fetches{}, log); err != nil || !healthy || len(msgs) != 0 {
 		t.Fatalf("clean empty fetch: msgs=%v healthy=%v err=%v, want empty, healthy and nil", msgs, healthy, err)
+	}
+}
+
+// writeCS drops a connection string in a temp file and returns its path.
+func writeCS(t *testing.T, cs string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "cs")
+	if err := os.WriteFile(path, []byte(cs+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+// An ENTITY-SCOPED connection string names the one hub the credential may
+// read. Resolve must consume exactly that hub: the `^insights-.*` default
+// needs namespace-wide metadata this credential cannot list, and would not
+// match the entity's name anyway — so without this the consumer joins the
+// group and then sits at zero topics, indistinguishable from a quiet hub.
+func TestResolveDerivesTopicFromEntityPath(t *testing.T) {
+	const key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+	cs := "Endpoint=sb://mydiag-we-0a1b2c3d.servicebus.windows.net/;SharedAccessKeyName=test;SharedAccessKey=" + key + ";EntityPath=azure"
+
+	k := KafkaConfig{ConnectionStringFile: writeCS(t, cs)}
+	if err := k.Resolve(slog.New(slog.NewTextHandler(io.Discard, nil))); err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"mydiag-we-0a1b2c3d.servicebus.windows.net:9093"}; !slices.Equal(k.Brokers, want) {
+		t.Fatalf("brokers = %v, want %v", k.Brokers, want)
+	}
+	if want := []string{"azure"}; !slices.Equal(k.Topics, want) {
+		t.Fatalf("topics = %v, want %v (the EntityPath hub)", k.Topics, want)
+	}
+	if k.Mechanism == nil || k.Mechanism.Name() != "PLAIN" {
+		t.Fatalf("mechanism = %v, want PLAIN", k.Mechanism)
+	}
+	if k.TLSConfig == nil {
+		t.Fatal("Event Hubs' Kafka surface is TLS-only; TLSConfig must be set")
+	}
+}
+
+// A namespace-scoped string carries no EntityPath, so the regex default must
+// survive untouched (empty Topics is what newKafkaSource reads as ^insights-.*).
+func TestResolveNamespaceScopedKeepsRegexDefault(t *testing.T) {
+	k := KafkaConfig{ConnectionStringFile: writeCS(t,
+		"Endpoint=sb://myns.servicebus.windows.net/;SharedAccessKeyName=Root;SharedAccessKey=AAAA=")}
+	if err := k.Resolve(slog.New(slog.NewTextHandler(io.Discard, nil))); err != nil {
+		t.Fatal(err)
+	}
+	if len(k.Topics) != 0 {
+		t.Fatalf("topics = %v, want empty (the ^insights-.* regex path)", k.Topics)
+	}
+}
+
+// Explicit topics beat the derived default, and an explicit list that omits
+// the entity is warned about at startup — every fetch would otherwise fail
+// authorization with the reason only in kgo's error log.
+func TestResolveExplicitTopicsWinOverEntityPath(t *testing.T) {
+	cs := "Endpoint=sb://ns.servicebus.windows.net/;SharedAccessKey=AAAA=;EntityPath=azure"
+
+	var buf bytes.Buffer
+	k := KafkaConfig{ConnectionStringFile: writeCS(t, cs), Topics: []string{"azure", "other"}}
+	if err := k.Resolve(slog.New(slog.NewTextHandler(&buf, nil))); err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"azure", "other"}; !slices.Equal(k.Topics, want) {
+		t.Fatalf("topics = %v, want %v (explicit wins)", k.Topics, want)
+	}
+	if strings.Contains(buf.String(), "fail authorization") {
+		t.Fatalf("warned although the entity IS in the list: %s", buf.String())
+	}
+
+	buf.Reset()
+	k = KafkaConfig{ConnectionStringFile: writeCS(t, cs), Topics: []string{"other"}}
+	if err := k.Resolve(slog.New(slog.NewTextHandler(&buf, nil))); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(buf.String(), "fail authorization") {
+		t.Fatalf("no warning for topics excluding the entity: %s", buf.String())
+	}
+}
+
+// An explicit -azure-eventhub-namespace still wins over the Endpoint, but the
+// EntityPath must be honoured either way — the two are independent halves.
+func TestResolveExplicitNamespaceStillTakesEntityPath(t *testing.T) {
+	k := KafkaConfig{
+		Namespace:            "override.servicebus.windows.net",
+		ConnectionStringFile: writeCS(t, "Endpoint=sb://ns.servicebus.windows.net/;SharedAccessKey=AAAA=;EntityPath=azure"),
+	}
+	if err := k.Resolve(slog.New(slog.NewTextHandler(io.Discard, nil))); err != nil {
+		t.Fatal(err)
+	}
+	if k.Brokers[0] != "override.servicebus.windows.net:9093" {
+		t.Fatalf("brokers = %v, want the explicit namespace", k.Brokers)
+	}
+	if want := []string{"azure"}; !slices.Equal(k.Topics, want) {
+		t.Fatalf("topics = %v, want %v", k.Topics, want)
+	}
+}
+
+// A connection string with no Endpoint and no -azure-eventhub-namespace has
+// nothing to dial: refuse at startup, naming the file.
+func TestResolveWithoutEndpointFails(t *testing.T) {
+	k := KafkaConfig{ConnectionStringFile: writeCS(t, "SharedAccessKeyName=test;SharedAccessKey=AAAA=")}
+	err := k.Resolve(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err == nil || !strings.Contains(err.Error(), "Endpoint=sb://") {
+		t.Fatalf("err = %v, want a refusal naming the missing Endpoint", err)
+	}
+}
+
+// The entity-scoped path end to end over a real kgo client: a hub whose name
+// does NOT match ^insights-.* is consumed when the EntityPath named it. This
+// is the half Resolve's unit tests cannot reach — that populating Topics puts
+// newKafkaSource on kgo.ConsumeTopics instead of the ConsumeRegex branch, and
+// that the resulting client really does read the hub.
+func TestKafkaConsumesEntityPathTopic(t *testing.T) {
+	const hub = "azure" // deliberately not an insights-* name
+	cluster, err := kfake.NewCluster(kfake.NumBrokers(1), kfake.SeedTopics(1, hub))
+	if err != nil {
+		t.Skipf("kfake unavailable: %v", err)
+	}
+	defer cluster.Close()
+
+	cl, err := kgo.NewClient(kgo.SeedBrokers(cluster.ListenAddrs()...), kgo.DefaultProduceTopic(hub))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	if err := cl.ProduceSync(ctx, &kgo.Record{Value: []byte(logEnvelope)}).FirstErr(); err != nil {
+		cancel()
+		t.Fatal(err)
+	}
+	cancel()
+	cl.Close()
+
+	// What Resolve derives from ...;EntityPath=azure.
+	exp := &captureExporter{}
+	r := New(Config{
+		Kafka: KafkaConfig{
+			Brokers: cluster.ListenAddrs(),
+			Group:   "kubescrape-entity-test",
+			Start:   StartBeginning,
+			Topics:  []string{hub},
+		},
+		Exporter: exp,
+	})
+	runCtx, stop := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { r.Run(runCtx); close(done) }()
+	defer func() { stop(); <-done }()
+
+	deadline := time.After(20 * time.Second)
+	for {
+		exp.mu.Lock()
+		got := 0
+		for _, ld := range exp.logs {
+			got += ld.LogRecordCount()
+		}
+		exp.mu.Unlock()
+		if got >= 2 { // the envelope carries two records
+			return
+		}
+		select {
+		case <-deadline:
+			t.Fatal("timed out: the EntityPath hub was never consumed")
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
+}
+
+// Two consumers, two hubs, one export chain: the multi-source shape end to
+// end over real kgo clients. Each Reader owns its client, group and offsets,
+// and both deliver into the shared exporter — which is what running N
+// entity-scoped credentials in one process actually does.
+func TestKafkaMultipleSourcesConsumeInParallel(t *testing.T) {
+	const hubA, hubB = "azure", "otherhub"
+	cluster, err := kfake.NewCluster(kfake.NumBrokers(1), kfake.SeedTopics(1, hubA, hubB))
+	if err != nil {
+		t.Skipf("kfake unavailable: %v", err)
+	}
+	defer cluster.Close()
+
+	for _, hub := range []string{hubA, hubB} {
+		cl, err := kgo.NewClient(kgo.SeedBrokers(cluster.ListenAddrs()...), kgo.DefaultProduceTopic(hub))
+		if err != nil {
+			t.Fatal(err)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		if err := cl.ProduceSync(ctx, &kgo.Record{Value: []byte(logEnvelope)}).FirstErr(); err != nil {
+			cancel()
+			cl.Close()
+			t.Fatal(err)
+		}
+		cancel()
+		cl.Close()
+	}
+
+	// What ResolveSources produces for two entity-scoped credentials in one
+	// namespace: a client per hub, each in its OWN group.
+	exp := &captureExporter{}
+	runCtx, stop := context.WithCancel(context.Background())
+	done := make(chan struct{}, 2)
+	for _, hub := range []string{hubA, hubB} {
+		r := New(Config{
+			Kafka: KafkaConfig{
+				Brokers: cluster.ListenAddrs(),
+				Group:   "kubescrape-multi." + hub,
+				Start:   StartBeginning,
+				Topics:  []string{hub},
+			},
+			Exporter: exp,
+		})
+		go func() { r.Run(runCtx); done <- struct{}{} }()
+	}
+	defer func() {
+		stop()
+		<-done
+		<-done
+	}()
+
+	// Both hubs carry the two-record envelope, so all four must arrive.
+	deadline := time.After(30 * time.Second)
+	for {
+		exp.mu.Lock()
+		got := 0
+		for _, ld := range exp.logs {
+			got += ld.LogRecordCount()
+		}
+		exp.mu.Unlock()
+		if got >= 4 {
+			return
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("timed out: only %d of 4 records arrived from the two hubs", got)
+		case <-time.After(20 * time.Millisecond):
+		}
 	}
 }

@@ -626,6 +626,12 @@
             "namespace": {
               "type": "string"
             },
+            "namespaces": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
             "topics": {
               "type": "array",
               "items": {
@@ -643,6 +649,12 @@
                 },
                 "key": {
                   "type": "string"
+                },
+                "keys": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
                 }
               },
               "additionalProperties": false

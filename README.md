@@ -961,7 +961,18 @@ across restarts and replicas, committed only after the collector acks
 Event Hubs **connection string** (SASL PLAIN, mounted secret, re-read per
 connection) or **managed identity** (SASL OAUTHBEARER — AKS workload
 identity when its environment is present, else IMDS; no Azure SDK, the two
-token exchanges are implemented directly). Log records keep the diagnostic
+token exchanges are implemented directly). A connection string may be
+namespace-scoped or **entity-scoped** (`…;EntityPath=myhub`, the shape copied
+from a single event hub's shared access policies) — an `EntityPath` bounds
+what the credential may reach, so it also selects the hub to consume, in
+place of the `^insights-.*` pattern that would match nothing for it.
+**Several hubs** cost one client per *credential*, not per hub: a namespace
+policy (or managed identity) consumes any number over one connection, while
+entity-scoped strings need one client each, so both the namespace and the
+connection-string flags take lists. A namespace with several clients gives
+each its own consumer group automatically, since Event Hubs' groups are
+namespace-wide and a shared one lets the group leader starve members whose
+hubs it cannot see. Log records keep the diagnostic
 record's verbatim JSON as the body — the full chain applies (scrubbing,
 `logAttributes`, `-enrich`, `logMetrics`, `logs.rules`, transforms, routing,
 disk buffer) — while metric records become **real OTLP gauges**

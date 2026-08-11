@@ -11,9 +11,12 @@ import (
 	"go.opentelemetry.io/collector/pdata/plog"
 	"go.opentelemetry.io/collector/pdata/pmetric"
 
+	"github.com/JohanLindvall/kubescrape/internal/agent/logscrub"
 	"github.com/JohanLindvall/kubescrape/internal/agent/otlpexport"
 	"github.com/JohanLindvall/kubescrape/internal/logline"
+	"github.com/JohanLindvall/kubescrape/internal/metrics"
 	"github.com/JohanLindvall/kubescrape/internal/obs"
+	"github.com/JohanLindvall/kubescrape/pkg/logattrs"
 )
 
 // captureExporter records exported payloads; failN fails the first N sends
@@ -457,16 +460,6 @@ func TestSeverityMapping(t *testing.T) {
 	}
 }
 
-func TestNamespaceFromConnectionString(t *testing.T) {
-	cs := "Endpoint=sb://myns.servicebus.windows.net/;SharedAccessKeyName=RootManageSharedAccessKey;SharedAccessKey=abc="
-	if got := namespaceFromConnectionString(cs); got != "myns.servicebus.windows.net" {
-		t.Fatalf("namespace = %q", got)
-	}
-	if got := namespaceFromConnectionString("SharedAccessKey=abc"); got != "" {
-		t.Fatalf("namespace = %q, want empty", got)
-	}
-}
-
 // Severity TEXT casing is a cross-producer contract, not a local style
 // choice: convert runs logenrich.Apply with overwrite semantics over every
 // record, and enrich writes its six level names in lowercase. Uppercase here
@@ -511,5 +504,80 @@ func TestRecordsCounterUsesSignalLabel(t *testing.T) {
 	}
 	if got := obs.AzureRecords.WithLabelValues("metric").Value(); got != 0 {
 		t.Errorf("the singular kind value \"metric\" is still being emitted: %v", got)
+	}
+}
+
+// Several Readers now run in ONE process (one per credential — see
+// ResolveSources), and they share the compiled chain: the scrubber, the
+// logattrs extractor, the rules filter and — the one with mutable state — the
+// log-metrics set. Nothing here was concurrent before this: a single azurediag
+// Reader owned the chain within its own goroutine. Run under -race, this is
+// what says the sharing is safe; without it the failure would be a corrupted
+// series map on a customer's node, not a test.
+func TestConcurrentReadersShareTheChain(t *testing.T) {
+	scrub, err := logscrub.New(logscrub.Config{Builtin: []string{"defaults"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	extractor, err := logattrs.New(&logattrs.Config{Rules: []logattrs.Rule{
+		{Key: "properties.user", Attribute: "enduser.id"},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rules, err := logline.NewLineFilter([]logline.LineRule{
+		{Action: "keep", Match: []string{"azure.category=SQLSecurityAuditEvents"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	set, err := metrics.NewDynamicMetricSet([]metrics.Dynamic{{
+		Name: "azure_records_total", Type: metrics.CounterType, Value: "1",
+		Labels: []string{"category=$azure.category"},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const readers = 4
+	exp := &captureExporter{} // shared: its own mutex is part of what is exercised
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var wg sync.WaitGroup
+	srcs := make([]*fakeSource, readers)
+	for i := range readers {
+		polls := make([][][]byte, 8)
+		for p := range polls {
+			polls[p] = [][]byte{[]byte(logEnvelope)}
+		}
+		src := newFakeSource(polls...)
+		srcs[i] = src
+		r := newTestReader(Config{
+			Exporter: exp, Enrich: true, Scrub: scrub, LogAttrs: extractor,
+			Rules: rules, LogMetrics: set,
+		}, src)
+		wg.Add(1)
+		go func() { defer wg.Done(); r.Run(ctx) }()
+	}
+
+	// Wait for every reader to have committed all of its polls, then stop.
+	for _, src := range srcs {
+		for range 8 {
+			select {
+			case <-src.committed:
+			case <-time.After(30 * time.Second):
+				cancel()
+				wg.Wait()
+				t.Fatal("timed out waiting for the readers to drain")
+			}
+		}
+	}
+	cancel()
+	wg.Wait()
+
+	// Every envelope carries two SQLSecurityAuditEvents records, all kept.
+	if got, want := len(exp.records()), readers*8*2; got != want {
+		t.Fatalf("records = %d, want %d — a shared chain dropped or duplicated work", got, want)
 	}
 }

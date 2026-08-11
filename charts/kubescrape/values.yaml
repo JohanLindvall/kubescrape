@@ -600,17 +600,30 @@ azure:
     # Namespace host (myns.servicebus.windows.net). May be left empty when a
     # connection string is given — its Endpoint names the namespace.
     namespace: ""
-    # Hubs to consume; empty consumes every hub matching ^insights-.* (the
+    # Several namespaces, each consumed by its own client (the per-region
+    # shape: one hub name, one namespace per region). Wins over `namespace`
+    # when set. With connection strings give at most ONE namespace — each
+    # string names its own in its Endpoint.
+    namespaces: []
+    # Hubs to consume; empty consumes the hub an entity-scoped connection
+    # string's EntityPath names, else every hub matching ^insights-.* (the
     # names diagnostic settings create by default).
     topics: []
     # Consumer group holding the committed offsets.
     group: "$Default"
-    # Secret with an Event Hubs connection string (SASL PLAIN). Leave name
-    # empty to authenticate with managed identity instead (OAUTHBEARER via
-    # AKS workload identity — see clientId below — or IMDS).
+    # Secret with an Event Hubs connection string (SASL PLAIN), namespace- or
+    # entity-scoped — an entity-scoped one (…;EntityPath=myhub, copied from a
+    # single hub's shared access policies) also selects the hub to consume.
+    # Leave name empty to authenticate with managed identity instead
+    # (OAUTHBEARER via AKS workload identity — see clientId below — or IMDS).
     connectionStringSecret:
       name: ""
       key: connection-string
+      # Several connection strings are several KEYS of the one Secret, each
+      # its own client — which entity-scoped credentials force, one per hub
+      # (a connection authenticates with exactly one credential). Wins over
+      # `key` when set.
+      keys: []
   # Workload-identity / user-assigned managed identity client id. When set,
   # the ServiceAccount is annotated azure.workload.identity/client-id and the
   # pod labelled azure.workload.identity/use=true, so the AKS webhook injects

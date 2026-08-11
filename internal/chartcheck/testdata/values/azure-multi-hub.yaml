@@ -1,0 +1,16 @@
+# The multi-source Azure shape: several ENTITY-SCOPED connection strings, one
+# per hub, mounted as separate keys of one Secret. Each becomes its own client
+# (a connection authenticates with exactly one credential), so this pins that
+# the chart renders ONE comma-separated -azure-eventhub-connection-string-file
+# holding every key's path — the singular `key` being the other fixture.
+azure:
+  enabled: true
+  eventhub:
+    connectionStringSecret:
+      name: azure-eventhub-creds
+      keys:
+        - hub-azure
+        - hub-other
+  start: start
+events:
+  enabled: false

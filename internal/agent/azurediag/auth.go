@@ -48,6 +48,18 @@ const (
 // connectionStringMechanism authenticates with the Event Hubs connection
 // string: SASL PLAIN, the string itself as the password. The file is re-read
 // per session, so rotation needs no restart (the bearer-token-file pattern).
+//
+// The string is sent VERBATIM, including an `EntityPath=` on an entity-scoped
+// one. Do not be tempted to strip that: a SAS rule's scope is the resource it
+// was created on, never a token in the string, so stripping cannot widen
+// access — while an entity-level rule NAME is only unique within its entity,
+// which is plausibly what EntityPath lets the service resolve. Stripping
+// therefore risks breaking authentication to buy nothing. (Microsoft's .NET
+// Kafka quickstart claims an entity-level string "will not work" at all, but
+// that text is from 2018, was posted alongside a promise to enable it, and
+// has never been revisited; entity-scoped strings are shown working over the
+// Kafka surface by several vendors since. If one is genuinely refused, the
+// answer is a NAMESPACE-level policy, not a doctored string.)
 func connectionStringMechanism(path string) sasl.Mechanism {
 	return plain.Plain(func(context.Context) (plain.Auth, error) {
 		b, err := os.ReadFile(path)
@@ -58,15 +70,49 @@ func connectionStringMechanism(path string) sasl.Mechanism {
 	})
 }
 
-// namespaceFromConnectionString extracts the host from Endpoint=sb://host/.
-func namespaceFromConnectionString(cs string) string {
+// connString is the parsed form of an Event Hubs connection string. Only the
+// two fields this consumer routes on are kept — the CREDENTIAL halves
+// (SharedAccessKeyName/SharedAccessKey) are deliberately never extracted:
+// the whole string is the SASL password, so pulling the secret into a struct
+// field would only add places for it to be logged from.
+type connString struct {
+	// Namespace is the host from Endpoint=sb://host/ — "" when absent.
+	Namespace string
+	// EntityPath is the single hub an ENTITY-SCOPED connection string names
+	// (the shape you get by copying a shared access policy from one Event Hub
+	// rather than from the namespace). "" for a namespace-scoped string.
+	EntityPath string
+}
+
+// parseConnectionString splits the `Key=Value;...` form.
+//
+// Each part is cut at its FIRST '=' — not split on every one. That is free
+// insurance rather than a fix for a live bug: the two fields read here
+// (Endpoint, EntityPath) carry no '=' in their values, so a naive split would
+// behave identically today. It matters the moment anything reads a field that
+// DOES — a base64 SharedAccessKey ends in '=' padding, a SharedAccessSignature
+// is full of them — which is why the cut is here rather than left as a trap
+// for whoever adds the third field. (Reading the credential is deliberately
+// not done at all; see connectionStringMechanism.) Keys are matched
+// case-insensitively, as the Azure SDKs' own parsers do.
+func parseConnectionString(cs string) connString {
+	var out connString
 	for _, part := range strings.Split(cs, ";") {
-		if v, ok := strings.CutPrefix(strings.TrimSpace(part), "Endpoint="); ok {
+		k, v, ok := strings.Cut(strings.TrimSpace(part), "=")
+		if !ok {
+			continue
+		}
+		v = strings.TrimSpace(v)
+		switch strings.ToLower(strings.TrimSpace(k)) {
+		case "endpoint":
 			v = strings.TrimPrefix(v, "sb://")
-			return strings.Trim(strings.TrimSpace(v), "/")
+			v = strings.TrimPrefix(v, "amqps://")
+			out.Namespace = strings.Trim(v, "/")
+		case "entitypath":
+			out.EntityPath = strings.Trim(v, "/")
 		}
 	}
-	return ""
+	return out
 }
 
 // tokenSource caches one Entra token and refreshes it ahead of expiry. get

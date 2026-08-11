@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"slices"
 	"strings"
 	"time"
 
@@ -52,21 +53,25 @@ type KafkaConfig struct {
 }
 
 // Resolve derives Brokers/TLSConfig/Mechanism from the Azure-facing fields.
-func (k *KafkaConfig) Resolve() error {
+func (k *KafkaConfig) Resolve(log *slog.Logger) error {
+	if log == nil {
+		log = slog.Default()
+	}
 	host := strings.TrimSpace(k.Namespace)
 	if k.ConnectionStringFile != "" {
+		// Read once here — the SASL path re-reads per session, but neither the
+		// HOST nor the ENTITY of a rotated key changes.
+		cs, err := readTrimmed(k.ConnectionStringFile)
+		if err != nil {
+			return err
+		}
+		parsed := parseConnectionString(cs)
 		if host == "" {
-			// The connection string names the namespace; read it once here —
-			// the SASL path re-reads per session, but the HOST of a rotated
-			// key never changes.
-			cs, err := readTrimmed(k.ConnectionStringFile)
-			if err != nil {
-				return err
-			}
-			if host = namespaceFromConnectionString(cs); host == "" {
+			if host = parsed.Namespace; host == "" {
 				return fmt.Errorf("connection string in %s carries no Endpoint=sb://... to derive the namespace from", k.ConnectionStringFile)
 			}
 		}
+		k.applyEntityPath(parsed.EntityPath, log)
 		k.Mechanism = connectionStringMechanism(k.ConnectionStringFile)
 	} else {
 		if host == "" {
@@ -80,6 +85,51 @@ func (k *KafkaConfig) Resolve() error {
 	k.Brokers = []string{host}
 	k.TLSConfig = &tls.Config{MinVersion: tls.VersionTLS12}
 	return nil
+}
+
+// applyEntityPath honours an ENTITY-SCOPED connection string's EntityPath.
+//
+// Such a string (a shared access policy copied from one Event Hub rather than
+// from the namespace) both NAMES the hub and BOUNDS the credential: Azure
+// documents SAS scope as the resource the rule was created on, so an
+// entity-level rule "enforces granular access to topic1 only". That makes the
+// default topic selection wrong for two reasons of very different strength:
+//
+//   - CERTAIN: the default is the `^insights-.*` pattern, and an entity is
+//     rarely named `insights-...` — yours is whatever the diagnostic setting
+//     called it. The pattern matches nothing, so the consumer joins the group
+//     and then consumes from zero topics, which is indistinguishable from a
+//     hub with no traffic.
+//   - CONTESTED, and sidestepped rather than resolved: the pattern is a REGEX
+//     subscription, which makes kgo issue a metadata request for the WHOLE
+//     namespace (empty topic list). azure-event-hubs-for-kafka#159 — open
+//     since 2021, past a fix Microsoft announced as rolling out — has the
+//     broker force-closing exactly that request for an entity-level identity,
+//     surfacing as a TCP reset ("run out of available brokers"), not as an
+//     error code. That report is OAuth; one tester says SAS did not reproduce
+//     it, while knative#2692 hits the same signature with an entity-scoped SAS
+//     key. Nobody has published the entity-scoped-SAS-plus-regex case either
+//     way. Naming the topic means never asking the question.
+//
+// Naming the entity explicitly avoids both. An EXPLICIT
+// -azure-eventhub-topics still wins (explicit configuration beats a derived
+// default), but a list that does not contain the entity can only end in a
+// topic-authorization error per fetch, so it is warned about at startup where
+// it is diagnosable rather than left to the fetch-error log.
+func (k *KafkaConfig) applyEntityPath(entity string, log *slog.Logger) {
+	if entity == "" {
+		return
+	}
+	if len(k.Topics) == 0 {
+		k.Topics = []string{entity}
+		log.Info("azure event hubs: consuming the hub the connection string's EntityPath names",
+			"topic", entity)
+		return
+	}
+	if !slices.Contains(k.Topics, entity) {
+		log.Warn("azure event hubs: the connection string is scoped to one hub that the configured topics do not include — fetches will fail authorization",
+			"entityPath", entity, "topics", k.Topics)
+	}
 }
 
 func hostOnly(h string) string {

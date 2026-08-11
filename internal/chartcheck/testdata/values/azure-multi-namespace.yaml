@@ -1,0 +1,14 @@
+# The managed-identity multi-namespace shape (one hub name, one namespace per
+# region): `namespaces` wins over the singular `namespace` and renders one
+# comma-separated -azure-eventhub-namespace.
+azure:
+  enabled: true
+  eventhub:
+    namespaces:
+      - diag-we.servicebus.windows.net
+      - diag-ne.servicebus.windows.net
+    topics:
+      - insights-logs-audit
+  clientId: 00000000-0000-0000-0000-000000000000
+events:
+  enabled: false

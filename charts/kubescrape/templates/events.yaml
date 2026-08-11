@@ -182,7 +182,7 @@ spec:
             {{- end }}
             {{- if .Values.azure.enabled }}
             - -azure-diagnostics
-            {{- with .Values.azure.eventhub.namespace }}
+            {{- with include "kubescrape.azureNamespaces" . }}
             - -azure-eventhub-namespace={{ . }}
             {{- end }}
             {{- with .Values.azure.eventhub.topics }}
@@ -190,7 +190,7 @@ spec:
             {{- end }}
             - -azure-eventhub-group={{ .Values.azure.eventhub.group }}
             {{- if .Values.azure.eventhub.connectionStringSecret.name }}
-            - -azure-eventhub-connection-string-file=/etc/kubescrape/azure-eventhub/{{ .Values.azure.eventhub.connectionStringSecret.key }}
+            - -azure-eventhub-connection-string-file={{ include "kubescrape.azureConnStringFiles" . }}
             {{- end }}
             {{- with .Values.azure.clientId }}
             - -azure-client-id={{ . }}

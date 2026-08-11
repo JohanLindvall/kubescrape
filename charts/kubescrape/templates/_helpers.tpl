@@ -51,3 +51,37 @@ while the singleton kept emitting the old value indefinitely.
 {{- end }}
 {{- toYaml $cfg }}
 {{- end -}}
+
+{{/*
+kubescrape.azureNamespaces renders -azure-eventhub-namespace's value.
+
+`namespaces` (a list) wins over the singular `namespace` when set, so the
+common one-namespace deployment keeps the scalar it always had while a
+multi-namespace one is a plain list rather than a hand-joined string.
+*/}}
+{{- define "kubescrape.azureNamespaces" -}}
+{{- $eh := .Values.azure.eventhub -}}
+{{- if $eh.namespaces -}}
+{{- join "," $eh.namespaces -}}
+{{- else -}}
+{{- $eh.namespace -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+kubescrape.azureConnStringFiles renders -azure-eventhub-connection-string-file:
+one path per secret key, comma-separated.
+
+The whole Secret is mounted at one path, so several connection strings are
+several KEYS of it — which is what entity-scoped credentials force, one per
+hub. `keys` (a list) wins over the singular `key` when set.
+*/}}
+{{- define "kubescrape.azureConnStringFiles" -}}
+{{- $s := .Values.azure.eventhub.connectionStringSecret -}}
+{{- $keys := $s.keys | default (list $s.key) -}}
+{{- $paths := list -}}
+{{- range $keys -}}
+{{- $paths = append $paths (printf "/etc/kubescrape/azure-eventhub/%s" .) -}}
+{{- end -}}
+{{- join "," $paths -}}
+{{- end -}}

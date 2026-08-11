@@ -530,10 +530,10 @@ is a startup error, caught by `-check-config`.
 | Flag | Default | Description |
 |---|---|---|
 | `-azure-diagnostics` | `false` | enable the consumer |
-| `-azure-eventhub-namespace` | — | namespace host (`myns.servicebus.windows.net`); may be omitted when the connection string supplies it |
-| `-azure-eventhub-topics` | — | comma-separated hubs; empty consumes every hub matching `^insights-.*` (the names diagnostic settings create by default) |
+| `-azure-eventhub-namespace` | — | comma-separated namespace hosts (`myns.servicebus.windows.net`), one client each; may be omitted when the connection strings supply it, where at most one is allowed as an override |
+| `-azure-eventhub-topics` | — | comma-separated hubs; empty consumes the hub an entity-scoped connection string's `EntityPath` names, else every hub matching `^insights-.*` (the names diagnostic settings create by default) |
 | `-azure-eventhub-group` | `$Default` | consumer group holding the committed offsets |
-| `-azure-eventhub-connection-string-file` | — | file with an Event Hubs connection string → **SASL PLAIN** (re-read per connection, so rotation needs no restart); empty → **managed identity** |
+| `-azure-eventhub-connection-string-file` | — | comma-separated files, one connection string each, namespace- or entity-scoped → **SASL PLAIN** (re-read per connection, so rotation needs no restart), **one client per file**; empty → **managed identity** |
 | `-azure-client-id` | `$AZURE_CLIENT_ID` | user-assigned managed identity / workload identity client id |
 | `-azure-tenant-id` | `$AZURE_TENANT_ID` | Entra tenant for workload identity |
 | `-azure-start` | `end` | where a group with **no committed offsets** starts: `end` (skip the backlog) or `start` (replay everything the hubs retain) |
@@ -552,6 +552,82 @@ Both protocols are implemented directly (two small HTTP exchanges) — no
 Azure SDK dependency. On the Azure side the identity needs the **Azure Event
 Hubs Data Receiver** role on the namespace (or hub); a connection string
 needs a policy with the **Listen** claim.
+
+**Connection-string scope.** Both shapes are accepted, and which one you paste
+changes the topic default:
+
+```
+# namespace-scoped — copied from the NAMESPACE's shared access policies
+Endpoint=sb://myns.servicebus.windows.net/;SharedAccessKeyName=Root;SharedAccessKey=<key>
+
+# entity-scoped — copied from ONE event hub's shared access policies
+Endpoint=sb://myns.servicebus.windows.net/;SharedAccessKeyName=test;SharedAccessKey=<key>;EntityPath=azure
+```
+
+An `EntityPath` both names a hub and bounds what the credential may reach (a
+SAS rule's scope is the resource it was created on), so with no explicit
+`-azure-eventhub-topics` the consumer subscribes to exactly that hub. That is
+not a convenience — the `^insights-.*` default would not work:
+
+* it is a *pattern*, and your entity is rarely named `insights-...`, so it
+  matches nothing and the consumer joins the group and then reads no topic at
+  all, which looks exactly like a hub with no traffic; and
+* being a pattern, it makes the client request metadata for the **whole
+  namespace**. How an entity-scoped key is answered there is undocumented; the
+  nearest precedent (entity-level *OAuth*,
+  [azure-event-hubs-for-kafka#159](https://github.com/Azure/azure-event-hubs-for-kafka/issues/159))
+  had the broker closing the connection. Treat namespace-wide metadata as
+  unsupported for such a credential rather than as something to rely on.
+
+An explicit topic list still wins; if it does not include the `EntityPath`
+hub, startup warns, because every fetch will then fail authorization. If you
+want one deployment to consume *several* hubs, use a **namespace-level**
+policy with **Listen** — that is the shape the regex default is built for.
+
+The string is sent as the SASL password **verbatim**, `EntityPath` included.
+Do not strip it: SAS scope follows the rule the key was created on, so
+stripping cannot widen access, while an entity-level rule *name* is only
+unique within its entity. If an entity-scoped string is genuinely refused, the
+fix is a namespace-level policy, not an edited string.
+
+**Several hubs.** How many *clients* that takes depends on how many
+*credentials* it takes, because a Kafka connection authenticates exactly once:
+
+| you have | you get |
+|---|---|
+| one namespace-scoped string (or managed identity) + `-azure-eventhub-topics=a,b` | **one** client, both hubs |
+| *N* entity-scoped strings (`-azure-eventhub-connection-string-file=a,b`) | ***N*** clients, one hub each |
+| *N* namespaces (`-azure-eventhub-namespace=ns1,ns2`, managed identity) | ***N*** clients, sharing the topic list |
+
+So prefer a namespace-level policy with **Listen** when you can: one client,
+one group, one set of offsets. Entity-scoped credentials force one client per
+hub — that is a property of SAS, not of this agent. Each client owns its
+offsets and its `/readyz` gate; with more than one, the gate names what it
+consumes (`azure-eventhub[myns.servicebus.windows.net/azure]`), so an
+unreadable hub is identified rather than masked by a sibling that polled
+first. Two entries resolving to the same namespace *and* topics are refused as
+a duplicate.
+
+**Consumer groups span the namespace,** which is why the group name is not
+always the one you configured. Event Hubs' Kafka groups are autocreated and
+distinct from the AMQP ones (there is no need for `$Default` to exist), but
+they are namespace-wide names — so several clients sharing one there are one
+*group*. That is correct when they share a subscription (members split
+partitions) and a trap when they do not: the group **leader** computes the
+assignment from the union of the members' subscriptions using *its own*
+metadata, and an entity-scoped credential is not authorized for its siblings'
+hubs, so it sees no partitions for them and assigns none — starving them in a
+way that looks exactly like a hub with no traffic.
+
+So when a namespace has more than one client, each gets its own group,
+`<group>.<topics>` (e.g. `$Default.azure`), logged at startup; a namespace
+with a single client — and every namespace when there are several, since their
+groups cannot collide — keeps the name verbatim. (Two clients of the *same*
+namespace and topics never arise: that is the duplicate refused above.)
+**One consequence worth planning for:** growing a namespace from one client to
+several renames the first one's group, and a group's committed offsets *are*
+the resume position — so that transition restarts consumption per
+`-azure-start` rather than resuming where it left off.
 
 **Records.** Each Event Hubs message is the `{"records":[...]}` envelope;
 every record is classified individually, so logs and metrics may share a

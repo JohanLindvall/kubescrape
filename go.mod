@@ -3,12 +3,12 @@ module github.com/JohanLindvall/kubescrape
 go 1.26.3
 
 require (
-	github.com/JohanLindvall/bufpool v0.2.3
-	github.com/JohanLindvall/diskqueue v0.0.6
-	github.com/JohanLindvall/enrich v0.1.7
-	github.com/JohanLindvall/lightning v0.0.62
-	github.com/JohanLindvall/logfmt v0.0.13
-	github.com/JohanLindvall/multiline v0.0.11
+	github.com/JohanLindvall/bufpool v0.2.7
+	github.com/JohanLindvall/diskqueue v0.0.13
+	github.com/JohanLindvall/enrich v0.1.13
+	github.com/JohanLindvall/lightning v0.0.67
+	github.com/JohanLindvall/logfmt v0.0.15
+	github.com/JohanLindvall/multiline v0.0.13
 	github.com/bmatcuk/doublestar/v4 v4.10.0
 	github.com/cespare/xxhash/v2 v2.3.0
 	github.com/coreos/go-systemd/v22 v22.7.0
@@ -20,9 +20,9 @@ require (
 	github.com/twmb/franz-go/pkg/kfake v0.0.0-20260727183601-4176fc0fcaf7
 	go.opentelemetry.io/collector/pdata v1.64.0
 	go.starlark.net v0.0.0-20260708150628-5395d018f003
-	google.golang.org/genproto/googleapis/rpc v0.0.0-20260803160001-6ac0973c030d
+	google.golang.org/genproto/googleapis/rpc v0.0.0-20260810153831-ec0a7760b754
 	google.golang.org/grpc v1.83.0
-	google.golang.org/protobuf v1.36.12-0.20260120151049-f2248ac996af
+	google.golang.org/protobuf v1.36.12
 	k8s.io/api v0.36.3
 	k8s.io/apimachinery v0.36.3
 	k8s.io/client-go v0.36.3

@@ -114,7 +114,7 @@ func apply(lr plog.LogRecord, line string, overwrite bool) {
 	putStr("log.service_version", e.Version)
 	putStr("log.product", e.Product)
 	putStr("cloud.resource_id", e.ResourceID)
-	putStr("azure.resource_group", e.ResourceGroup)
+	putStr("azure.resource_group.id", e.ResourceGroupID)
 	putStr("azure.event_category", e.EventCategory)
 	putStr("exception.type", e.ExceptionType)
 	putStr("exception.message", e.ExceptionMessage)

@@ -5,7 +5,7 @@ go 1.26.3
 require (
 	github.com/JohanLindvall/bufpool v0.2.7
 	github.com/JohanLindvall/diskqueue v0.0.13
-	github.com/JohanLindvall/enrich v0.1.13
+	github.com/JohanLindvall/enrich v0.1.14
 	github.com/JohanLindvall/lightning v0.0.67
 	github.com/JohanLindvall/logfmt v0.0.15
 	github.com/JohanLindvall/multiline v0.0.13

@@ -253,3 +253,48 @@ func TestZonelessParsedTimeKeepsTheProducerTimestamp(t *testing.T) {
 		t.Errorf("ApplyBodyText timestamp = %v, want the parsed 2019-03-04", got)
 	}
 }
+
+// TestAzureAttributeKeys pins the record attributes an Azure-shaped line
+// stamps, and the SHAPE of each value — the pair is what makes the key names
+// load-bearing rather than cosmetic.
+//
+// `azure.resource_group.id` carries the resource group's own full ARM resource
+// ID, never its bare name. It was spelled `azure.resource_group` until a
+// semconv v1.44.0 audit: the registry defines `azure.resource_group.name` (the
+// bare name) and nothing else in that namespace, so the bare key sat one dot
+// from a real attribute while holding a different shape of its value — the
+// silent-conflict case semconv's naming guidance warns about. Renaming to
+// `.id` was wire-visible, so this test exists to make a revert deliberate.
+func TestAzureAttributeKeys(t *testing.T) {
+	lr := newRecord()
+	line := `{"resourceId":"/SUBSCRIPTIONS/11111111-1111-1111-1111-111111111111/RESOURCEGROUPS/SHOP/PROVIDERS/MICROSOFT.WEB/SITES/ORDERS","eventCategory":"Administrative"}`
+	lr.Body().SetStr(line)
+	Apply(lr, line)
+
+	want := map[string]string{
+		"cloud.resource_id":       "/subscriptions/11111111-1111-1111-1111-111111111111/resourcegroups/shop/providers/microsoft.web/sites/orders",
+		"azure.resource_group.id": "/subscriptions/11111111-1111-1111-1111-111111111111/resourcegroups/shop",
+		"azure.event_category":    "Administrative",
+	}
+	for key, exp := range want {
+		v, ok := lr.Attributes().Get(key)
+		if !ok {
+			t.Errorf("missing %s", key)
+			continue
+		}
+		if v.Str() != exp {
+			t.Errorf("%s = %q, want %q", key, v.Str(), exp)
+		}
+	}
+
+	// The pre-audit spelling must not come back alongside the new one.
+	if _, ok := lr.Attributes().Get("azure.resource_group"); ok {
+		t.Error("azure.resource_group is the pre-semconv-audit key; only azure.resource_group.id may be emitted")
+	}
+	// This path never mints the registry's own key: it holds the BARE name,
+	// which enrich does not extract. Only the azurediag converter, which parses
+	// the ARM id from the envelope, is authoritative enough to set it.
+	if _, ok := lr.Attributes().Get("azure.resource_group.name"); ok {
+		t.Error("azure.resource_group.name is the converter's to set, from the envelope's own resourceId")
+	}
+}

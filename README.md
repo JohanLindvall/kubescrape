@@ -679,6 +679,19 @@ since there the body is the raw JSON. Hit rates per strategy are exported as
 `kubescrape_log_enriched_total{format="json|logfmt|pattern|none"}` on the
 agent's self-metrics (pushed over OTLP).
 
+The full set it can stamp is `log.template`, `log.template_hash`,
+`log.source_context`, `log.service`, `log.service_version`, `log.product`,
+`exception.type`, `exception.message`, `exception.stacktrace`, and — for lines
+carrying an Azure resource ID — `cloud.resource_id`,
+`azure.resource_group.id` (the resource group's own full ARM ID, *not* its
+bare name) and `azure.event_category`. Only `log.iostream`, `log.file.name`,
+`cloud.resource_id` and the three `exception.*` keys are OpenTelemetry
+semantic-convention attributes; the rest have no registry counterpart as of
+semconv v1.44.0 and are this project's own. On the Azure diagnostics pipeline
+`cloud.resource_id` and `azure.resource_group.id` are dropped from the record
+again, because there the *resource* already states the identity authoritatively
+— see [Azure diagnostics](docs/CONFIGURATION.md#agent-azure-diagnostics).
+
 **Log attributes from the line** (`logAttributes` section). Beyond the fixed
 set enrich recognizes, this section lifts *arbitrary* keys out of a structured
 line onto the record. Each rule names a JSON or logfmt `key` (dotted keys

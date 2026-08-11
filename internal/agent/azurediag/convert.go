@@ -162,16 +162,25 @@ func (r *Reader) convertLogs(recs []record) plog.Logs {
 // control. It is also pure egress: measured against a live Event Hub, 286
 // bytes on every record, 1 MB per 3,500-record payload.
 //
-// `azure.resource_group` goes for a second reason: enrich's ResourceGroup is
-// the group's full ARM ID (`/subscriptions/<sub>/resourcegroups/<name>`), while
-// the resource carries the bare name as `azure.resource_group.name` — two keys
-// one letter apart holding different shapes of the same fact.
+// `azure.resource_group.id` goes for a second reason: enrich's ResourceGroupID
+// is the group's full ARM ID (`/subscriptions/<sub>/resourcegroups/<name>`),
+// while the resource carries the bare name as `azure.resource_group.name` —
+// two shapes of the same fact, one per key.
+//
+// The `.id` suffix is load-bearing, not cosmetic. This attribute was spelled
+// `azure.resource_group` until semconv v1.44.0 was checked against it: the
+// registry defines `azure.resource_group.name` and nothing else in that
+// namespace, so the bare key sat one dot from a real attribute while holding a
+// different shape of its value — the collision semconv's naming guidance warns
+// about, where a future OTel definition of that exact key would conflict
+// silently rather than merely coexist. `.id` cannot collide that way: if OTel
+// ever mints it, it means what we mean.
 //
 // Scoped to THIS path on purpose. The tailer, journald and ingest have no ARM
 // resource, so for them the record attribute is the only carrier and
 // logenrich must keep emitting it.
 func redundantOnAzureResource(key string) bool {
-	return key == "cloud.resource_id" || key == "azure.resource_group"
+	return key == "cloud.resource_id" || key == "azure.resource_group.id"
 }
 
 // elideRedundantIdentity drops the duplicated identity attributes from every

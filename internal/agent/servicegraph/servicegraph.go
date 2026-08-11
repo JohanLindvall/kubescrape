@@ -227,17 +227,31 @@ func defaultBuckets() []float64 {
 // DefaultPeerAttributes is Tempo's defaultPeerAttributes, in precedence order.
 //
 // DELIBERATELY narrower than processor.go's databaseAttrs, which also carries
-// the post-1.30 semconv spellings (db.system.name, db.namespace). The two
+// the current semconv spellings (db.system.name, db.namespace). The two
 // lists answer different questions — databaseAttrs classifies an edge's
 // connection_type, this list names the VIRTUAL NODE minted for an unpaired
 // client span — and this one is a wire contract: Tempo's verbatim default,
 // which Grafana's Service Graph view and any dashboard ported from Tempo
 // assume. The asymmetry's visible consequence: a client instrumented ONLY with
-// 1.30 conventions classifies as `database` but never promotes to a virtual
+// current conventions classifies as `database` but never promotes to a virtual
 // node — its unpaired spans expire nameless — unless the operator extends
 // `serviceGraph.virtualNodePeerAttributes` (Config.VirtualNodePeerAttributes)
-// with the 1.30 keys. Extending the DEFAULT is a product decision (it changes
-// the `server` label existing dashboards select on), not a refactor.
+// with the current keys. Extending the DEFAULT is a product decision (it
+// changes the `server` label existing dashboards select on), not a refactor.
+//
+// As of semconv v1.44.0 ALL THREE entries here are deprecated upstream:
+// db.name -> db.namespace (v1.26.0), db.system -> db.system.name (v1.30.0),
+// and peer.service -> service.peer.name (v1.39.0, alongside a new
+// service.peer.namespace that has no analogue here). The db pair is only half
+// the story, since databaseAttrs already classifies both spellings;
+// peer.service is the one that widens the gap, being the GENERAL case — a
+// callee named only via service.peer.name mints no virtual node at all, not
+// even a misclassified one. Operators on current SDKs want:
+//
+//	serviceGraph:
+//	  virtualNodePeerAttributes: [peer.service, service.peer.name, db.name, db.system, db.namespace, db.system.name]
+//
+// which is the list CONFIGURATION.md documents, rather than this one.
 func DefaultPeerAttributes() []string {
 	return []string{"peer.service", "db.name", "db.system"}
 }

@@ -634,7 +634,10 @@ every record is classified individually, so logs and metrics may share a
 hub. A **log** record exports with the record's verbatim JSON as the body,
 severity from `level`, and `azure.category`, `azure.operation.name`,
 `azure.result.type`/`.description` (scrubbed), `azure.correlation.id` and
-`azure.tenant.id` as record attributes. A **metric** record — Azure's
+`azure.tenant.id` as record attributes. `azure.category` comes from the
+envelope's own `category` field and is distinct from the `azure.event_category`
+that `-enrich` may stamp from an `eventCategory` key inside the body — related
+concepts, different source fields, so both are kept. A **metric** record — Azure's
 pre-aggregated window statistics — becomes **real OTLP gauge data points**,
 one per present aggregation: `azure.<metricname>.count`/`.total`/`.minimum`/
 `.maximum`/`.average`, with `azure.metric.timegrain` on the data point
@@ -1367,7 +1370,27 @@ is asked for in any form — `caFile`, `insecureSkipVerify: true` or an explicit
 instrumented produces no server span, so no true edge can form. Those calls
 appear as **virtual nodes** instead — the far side is named from the first
 matching `virtualNodePeerAttributes` key on the client span (`peer.service`,
-`db.name`, `db.system` by default). It works in both directions: an expired
+`db.name`, `db.system` by default).
+
+> **On current semconv, extend this list.** The default is Tempo's verbatim, and
+> as of semconv v1.44.0 all three of its keys are deprecated upstream:
+> `db.name` → `db.namespace` (v1.26.0), `db.system` → `db.system.name`
+> (v1.30.0) and `peer.service` → `service.peer.name` (v1.39.0). The default
+> stays as it is because it names the `server` label existing Tempo dashboards
+> select on. The database pair matters least — `connection_type` is classified
+> from both spellings either way — but a callee named *only* via
+> `service.peer.name` mints **no virtual node at all**, so an SDK on current
+> conventions loses the far side of every uninstrumented call. Set:
+>
+> ```yaml
+> serviceGraph:
+>   virtualNodePeerAttributes: [peer.service, service.peer.name, db.name, db.system, db.namespace, db.system.name]
+> ```
+>
+> Listing both spellings is safe: the keys are tried in order and the first
+> present one wins, so a span carrying the old key is unaffected.
+
+It works in both directions: an expired
 **server** half carrying such a key names its uninstrumented *caller* (an
 ingress, a browser, an external client) and the edge is labelled
 `virtual_node="client"`. A half naming none of those keys is counted unpaired

@@ -1,6 +1,7 @@
 package servicegraph
 
 import (
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -124,5 +125,43 @@ func TestStaleAfterZeroDisablesEviction(t *testing.T) {
 	export(t, r, exp)
 	if r.store.Len() != 1 {
 		t.Fatalf("series = %d after 24h with staleAfter disabled, want 1", r.store.Len())
+	}
+}
+
+// TestDefaultPeerAttributesAreTempoVerbatim pins a WIRE CONTRACT, not an
+// implementation detail: this list names the virtual node, i.e. the `server`
+// label Grafana's Service Graph view and every dashboard ported from Tempo
+// select on. Changing it silently renames nodes in existing dashboards.
+//
+// It is deliberately NOT updated to current semconv even though, as of v1.44.0,
+// all three entries are deprecated upstream — db.name -> db.namespace
+// (v1.26.0), db.system -> db.system.name (v1.30.0), peer.service ->
+// service.peer.name (v1.39.0). The escape hatch is per-deployment config
+// (`serviceGraph.virtualNodePeerAttributes`), which CONFIGURATION.md documents
+// with the both-spellings list; widening the DEFAULT is a product decision.
+//
+// Note the asymmetry this preserves with processor.go's databaseAttrs, which
+// DOES carry both spellings: a modern client still classifies as `database`,
+// it just mints no virtual node. peer.service is the sharper gap, being the
+// general (non-database) case.
+func TestDefaultPeerAttributesAreTempoVerbatim(t *testing.T) {
+	got := DefaultPeerAttributes()
+	want := []string{"peer.service", "db.name", "db.system"}
+	if len(got) != len(want) {
+		t.Fatalf("DefaultPeerAttributes() = %v, want Tempo's verbatim %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("DefaultPeerAttributes()[%d] = %q, want %q (precedence order is part of the contract)", i, got[i], want[i])
+		}
+	}
+
+	// databaseAttrs may drift ahead of this list; that is the documented
+	// asymmetry. What must NOT happen is the reverse — a db spelling reaching
+	// the default virtual-node list without the product decision above.
+	for _, k := range got[1:] {
+		if !slices.Contains(databaseAttrs, k) {
+			t.Errorf("%q names a virtual node but no longer classifies connection_type", k)
+		}
 	}
 }

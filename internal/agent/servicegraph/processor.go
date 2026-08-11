@@ -66,9 +66,10 @@ const (
 
 // databaseAttrs mark a client span as talking to a database. The first two are
 // Tempo's (dbNameAttr/db.system); the other two are the current semconv
-// spellings after the 1.30 rename — an SDK on today's conventions emits only
-// those, and omitting them would classify every modern database client as a
-// plain service-to-service call.
+// spellings after the renames — db.name -> db.namespace landed in v1.26.0 and
+// db.system -> db.system.name in v1.30.0 (v1.31.0 for database METRICS) — an
+// SDK on today's conventions emits only those, and omitting them would
+// classify every modern database client as a plain service-to-service call.
 //
 // DELIBERATELY wider than DefaultPeerAttributes (servicegraph.go), which stays
 // Tempo's verbatim {peer.service, db.name, db.system}: that list is a wire

@@ -2,8 +2,8 @@ github.com/JohanLindvall/bufpool v0.2.7 h1:cYg3DkxVB9P4cS1OZeQQ7DpfYzg1dGtmaUpAI
 github.com/JohanLindvall/bufpool v0.2.7/go.mod h1:0PNe2odUbGvNNH6TqXJvexZ+ZhlbO3qyDYGavLdFU1I=
 github.com/JohanLindvall/diskqueue v0.0.13 h1:O0eO03LZjMV9UN5zSZ+37PPMgT4PxUQZZVJgaNeNCFY=
 github.com/JohanLindvall/diskqueue v0.0.13/go.mod h1:eeiOq7kMcqGWbbx/qsZplndd7Nnd7dRX+/BD/2pSGVQ=
-github.com/JohanLindvall/enrich v0.1.13 h1:TINYMvo0+khmN4uK5wMhXS15ClGBgJ864A7gvDdxUMk=
-github.com/JohanLindvall/enrich v0.1.13/go.mod h1:qH4klfcRSw11IW/6sh0fs72AlAivQIPQ9nNCEcjHSoE=
+github.com/JohanLindvall/enrich v0.1.14 h1:xsKQWfGZ/oFNEePE/8hm++TeJ2LqP+QgEFHA0VfchRI=
+github.com/JohanLindvall/enrich v0.1.14/go.mod h1:qH4klfcRSw11IW/6sh0fs72AlAivQIPQ9nNCEcjHSoE=
 github.com/JohanLindvall/lightning v0.0.67 h1:e/hm7s6pVvW0ZDzVmwWOoUUIHaV7eNquWioZUv37Ybk=
 github.com/JohanLindvall/lightning v0.0.67/go.mod h1:uGs5O1o/2myfnC3XsItHKPCIKDpVae66exbxNpSq430=
 github.com/JohanLindvall/logfmt v0.0.15 h1:ZsEPN0/xBvQpX35oHc1OAFTZBxvh2G7rLnF9621F5ks=

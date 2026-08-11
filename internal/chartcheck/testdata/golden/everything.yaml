@@ -556,6 +556,9 @@ spec:
             - -journald-batch-size=1024
             - -journald-max-batch-bytes=1048576
             - -journald-flush-interval=2s
+            - -cgroup-stats
+            - -cgroup-stats-interval=500ms
+            - -cgroup-stats-root=/host/sys/fs/cgroup
             - -ingest
             - -ingest-grpc-endpoint=:4317
             - -ingest-http-endpoint=:4318
@@ -624,6 +627,11 @@ spec:
             - name: runlogjournal
               mountPath: /run/log/journal
               readOnly: true
+            # The host's cgroup hierarchy. Read-only: the sampler reads three
+            # files per container and writes nothing.
+            - name: cgroup
+              mountPath: /host/sys/fs/cgroup
+              readOnly: true
           resources: 
             limits:
               memory: 512Mi
@@ -648,6 +656,10 @@ spec:
           hostPath:
             path: /run/log/journal
             type: DirectoryOrCreate
+        - name: cgroup
+          hostPath:
+            path: /sys/fs/cgroup
+            type: Directory
 ---
 # Source: kubescrape/templates/events.yaml
 apiVersion: apps/v1

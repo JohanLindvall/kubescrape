@@ -42,6 +42,20 @@ agent:
     k8s.cluster.name: golden-test
   journald:
     enabled: true
+  # The flag block AND the read-only /sys/fs/cgroup mount must render together
+  # — internal/manifestcheck asserts they are offered in the same state, and
+  # this is what pins that the chart actually emits both. A non-default interval
+  # and an explicit root, so the two optional args are covered too.
+  #
+  # The explicit root is the interesting half: it is the ONE value that used to
+  # render a flag the mount contradicted (-cgroup-stats-root=/host/sys/fs/cgroup
+  # against a mountPath hardcoded to /sys/fs/cgroup), so the shipped chart
+  # CrashLooped on it and this fixture froze the contradiction into a golden
+  # file. The golden now has the mount and the flag naming the same path.
+  cgroupStats:
+    enabled: true
+    interval: 500ms
+    root: /host/sys/fs/cgroup
   ingest:
     enabled: true
     grpcMaxRecvBytes: 41943040

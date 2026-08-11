@@ -379,6 +379,48 @@ func RegisterSelfMetadata(resolved func() bool) {
 		})
 }
 
+// High-frequency cgroup sampler (agent, -cgroup-stats).
+var (
+	CgroupSamples = Registry.Counter("kubescrape_cgroup_samples_total",
+		"Per-container cgroup sampling rounds. Divided by the number of containers and the elapsed time this is the effective sampling rate, which is what tells a stalled sampler (a slow export goroutine cannot stall it, but a wedged filesystem can) from a quiet node.")
+	CgroupReadErrors = Registry.CounterVec("kubescrape_cgroup_read_errors_total",
+		"Failed reads of a held cgroup file, by file. A container removed between two samples produces a burst of these until the next discovery pass drops it, so a small steady rate on a node with churn is normal; a rate proportional to the container count is not.", "file")
+	CgroupOpenErrors = Registry.Counter("kubescrape_cgroup_open_errors_total",
+		"Discovered container cgroups whose files could not be opened (the container went away between the directory listing and the open, or its controllers are not enabled). The container is retried on the next discovery pass.")
+	CgroupCounterResets = Registry.Counter("kubescrape_cgroup_counter_resets_total",
+		"Intervals discarded because cpu.stat's usage_usec went backwards — the cgroup was replaced under a path still being sampled. The reading becomes the new baseline; no rate is derived across the reset, since the unsigned difference would render an enormous positive burst that never happened.")
+	CgroupContainersCapped = Registry.CounterVec("kubescrape_cgroup_containers_capped_total",
+		"Discovered container cgroups refused because a cap was reached, by which cap. The two bound different resources and have different remedies: `tracked` is the FILE DESCRIPTOR cap (three are held open per sampled container so the per-second read path allocates nothing), and a container refused there is discovered and attributable but never sampled; `pending` is the MEMORY cap on the not-yet-attributed set, which holds no descriptors at all and is sized for every pod's sandbox cgroup plus a metadata outage's worth of real containers. A nonzero `tracked` rate above the kubelet's max-pods means either an unusual node or a discovery walking something it should not; a nonzero `pending` rate means the hierarchy holds thousands of cgroups nothing can place.", "cap")
+	CgroupDiscoveryErrors = Registry.CounterVec("kubescrape_cgroup_discovery_errors_total",
+		"Discovery passes that could not read part of the cgroup hierarchy, by scope. `root` is the whole pass failing to list -cgroup-stats-root: the root is unmounted or unreadable, NOTHING is discovered and the sampler is exporting nothing — the same condition the startup warning names. `subtree` is a directory below the root failing to list: the pass still returns what it found, but it is INCOMPLETE, so nothing is retired from it (an unreadable directory is indistinguishable from a container that went away) and a container that really did go away keeps its descriptors until a complete listing proves otherwise.", "scope")
+	CgroupWindowsDropped = Registry.CounterVec("kubescrape_cgroup_windows_dropped_total",
+		"Container windows measured and then discarded rather than exported, by reason. This is the pipeline's LOSS counter and any sustained rate is data an operator asked for and did not get. `unresolved` means the metadata service could not place the container when the payload was built, so the window had no resource to carry it (the samples are already reset; a window describes one bounded interval and is never carried forward, which would silently stretch the interval the numbers claim to cover). `export_failed` means the collector — or, with -buffer-dir, the spool — refused the payload.", "reason")
+	CgroupHeldWindows = Registry.CounterVec("kubescrape_cgroup_held_windows_total",
+		"Signal windows that took fewer than two samples, by what was done about it. A single reading is not a distribution (its stddev is 0 by construction and its max and min are the same number — the average the cadvisor scrape already publishes), so `held` re-states the last distribution actually measured, which bridges a sampling gap of a second or two without the series alternating between real and degenerate points. The hold is BOUNDED: `expired` counts a signal reaching the bound and ceasing to be exported, which is what keeps a dead-but-still-listed container (a CRI-O conmon scope outliving its container, or a stale listing) from republishing its last measurement as fresh data forever.", "outcome")
+	CgroupScanTruncated = Registry.Counter("kubescrape_cgroup_scan_truncated_total",
+		"Discovery passes that hit the directory budget and stopped early, so the container set is INCOMPLETE. Never expected on a Kubernetes node; if it moves, -cgroup-stats-root is pointing at something far larger than a cgroup hierarchy.")
+	CgroupUnresolved = Registry.CounterVec("kubescrape_cgroup_unresolved_total",
+		"Identity lookups that did not place a container cgroup, by outcome. Such a cgroup is NOT exported: a resource with no service.name has no Prometheus job, joins none of the cadvisor series these gauges exist to explain, and would appear and disappear with a job attached as lookups succeeded and stopped succeeding. `pending` counts one DEFINITIVE miss at discovery — the metadata service answered and does not know this container id — where the verdict decides whether to spend three file descriptors on the cgroup; `unreachable` counts a lookup the service could not answer at all (transport failure, 5xx, timeout), which is deliberately kept apart because it says nothing about the cgroup and therefore never counts toward giving up on it; `abandoned` counts giving up on one after a grace period of definitive misses, after which it is retried far more slowly — a cadence an unreachable lookup drops it back out of, so the node resumes within a minute of the service returning. `export` counts a failure at the other seam, where the resource is rebuilt from current metadata to carry a window that has already been measured — so unlike the others it costs data, counted again as kubescrape_cgroup_windows_dropped_total{reason=\"unresolved\"}. A steady low `pending` rate is normal and expected (every pod's sandbox cgroup lives there permanently, its container id appearing in no pod's containerStatuses); any sustained `unreachable` or `export` rate means the metadata service is not answering.", "outcome")
+	CgroupContainersRetired = Registry.Counter("kubescrape_cgroup_containers_retired_total",
+		"Containers dropped from the sampled set because every read of all three of their cgroup files failed for several consecutive export windows: the cgroup is still listed but no longer readable. It is what a CRI-O container whose own scope was removed while its conmon scope lingers looks like, and what a stale directory listing looks like anywhere. Their descriptors are released and they stop being counted in kubescrape_cgroup_containers; without the retirement they held three file descriptors and issued three failing reads per sampling period for the life of the process. A sustained rate means containers are disappearing in a way discovery cannot see.")
+)
+
+// RegisterCgroupStats publishes the tracked-container gauge, registered exactly
+// when the sampler RUNS — the RegisterSelfMetadata rule, for the same reason. A
+// published 0 then always means "enabled and finding nothing", which is the
+// whole failure this pipeline had to be built not to hide: an agent with no
+// /sys/fs/cgroup mount starts cleanly, answers /readyz 200 and exports no
+// container at all, and an absent metric family is indistinguishable from a
+// feature nobody turned on.
+func RegisterCgroupStats(containers, unresolved func() int) {
+	Registry.GaugeFunc("kubescrape_cgroup_containers",
+		"Container cgroups currently sampled by -cgroup-stats. Registered whenever the sampler runs, so 0 means it is running and finding nothing (typically a missing read-only /sys/fs/cgroup mount) rather than disabled.",
+		func() float64 { return float64(containers()) })
+	Registry.GaugeFunc("kubescrape_cgroup_unresolved_containers",
+		"Container cgroups discovered by -cgroup-stats whose identity the metadata service has not placed, and which are therefore not exported. One per pod is EXPECTED and permanent (the sandbox/pause cgroup appears in no pod's containerStatuses); a value that tracks the container count while kubescrape_cgroup_containers sits near 0 means the metadata service is not answering.",
+		func() float64 { return float64(unresolved()) })
+}
+
 // Journald input (agent).
 var (
 	JournalEntries = Registry.Counter("kubescrape_journal_entries_total",

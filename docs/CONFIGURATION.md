@@ -39,6 +39,7 @@ bounds, templates).
 - [Unified config file (`-config`)](#unified-config-file)
 - [Agent: log sources](#agent-log-sources)
 - [Agent: journald](#agent-journald)
+- [Agent: high-frequency cgroup sampling](#agent-high-frequency-cgroup-sampling)
 - [Agent: Kubernetes events](#agent-kubernetes-events)
 - [Agent: Azure diagnostics](#agent-azure-diagnostics)
 - [Agent: log attributes](#agent-log-attributes)
@@ -1708,6 +1709,107 @@ container incarnation through the metadata service; pod-scoped series (e.g.
 cgroup pod UID.
 
 
+## Agent: high-frequency cgroup sampling
+
+| Flag | Default | Description |
+|---|---|---|
+| `-cgroup-stats` | `false` | sample container cgroups directly and export the distribution of each `-scrape-interval` window |
+| `-cgroup-stats-interval` | `1s` | sampling period; must be well below `-scrape-interval` |
+| `-cgroup-stats-root` | — | cgroup v2 mount point; empty autodetects `/sys/fs/cgroup` |
+
+The cadvisor scrape above reads a cumulative counter once per
+`-scrape-interval`, which yields exactly one number: the average over that
+window. A container that pins 4 cores for 2 seconds inside a 60s window is
+reported as ~0.13 cores. Shipping 1s raw series instead would restore the
+signal at 30-60x the egress.
+
+`-cgroup-stats` samples each container's own cgroup at
+`-cgroup-stats-interval` and exports six gauges per container per window,
+named in cadvisor's Prometheus style so they sit beside the series they
+explain:
+
+| Metric | Unit |
+|---|---|
+| `container_cpu_usage_stddev` / `_max` / `_min` | cores (the *rate* of `cpu.stat`'s `usage_usec`, hence no `_seconds` in the name) |
+| `container_memory_working_set_bytes_stddev` / `_max` / `_min` | bytes (`memory.current − inactive_file`, cadvisor's own definition) |
+
+The resource attributes are built by the same code that builds a cadvisor
+row's, so the two join on `job`/`instance`. The standard deviation is the
+population one over the window, computed with Welford's algorithm.
+
+Requirements and refusals:
+
+* **The host's `/sys/fs/cgroup` must be mounted read-only.** A container sees
+  only its own cgroup otherwise. The chart mounts it behind
+  `agent.cgroupStats.enabled`; `deploy/agent.yaml` carries the flag, the mount
+  and the volume commented out together. Without pod cgroups the agent WARNS
+  loudly at startup (and periodically after) and publishes
+  `kubescrape_cgroup_containers` at 0 — registered exactly when the sampler
+  runs, so 0 means "on and finding nothing", never "off".
+* **cgroup v2 only**, because v1's `cpuacct.usage` is nanoseconds and reading
+  it as microseconds would silently report usage 1000x low. A v1 node
+  **disables this pipeline alone** and logs an ERROR naming v1 and the flag —
+  every other pipeline keeps running, because the cgroup version is a
+  property of the node and not an operator mistake, and one flag must not
+  take the log pipeline down across a mixed fleet. An explicit
+  `-cgroup-stats-root` that is not a cgroup v2 hierarchy IS fatal: that one
+  is an operator mistake, and `-check-config` cannot catch it because the
+  node's cgroup version is not knowable at check time.
+* The layout below the mount point is **discovered**, so kind's
+  `kubelet.slice` nesting, a stock systemd node's `kubepods.slice` and a
+  cgroupfs-driver node's `kubepods` all work with `-cgroup-stats-root` unset.
+* **A sparse window holds the last value, at most twice.** A CPU rate needs
+  two readings and the working-set gauge needs two for a distribution, so a
+  window that collected fewer re-emits that signal's previous distribution
+  rather than a stddev over one sample or a gap — per signal, since CPU is
+  structurally one reading behind memory. That hold is bounded to two
+  consecutive windows (a window is a whole `-scrape-interval`, so two of them
+  cover any real sampling hiccup several times over); past it the signal
+  stops entirely, and a container's FIRST window emits nothing rather than
+  inventing a value. Held windows are counted in
+  `kubescrape_cgroup_held_windows_total`, which is how you tell a bridged gap
+  from a live reading — the value itself carries no marker, deliberately,
+  because a resource attribute would fork the derived job/instance and a
+  data-point attribute would break the cadvisor join for exactly the windows
+  that are held.
+* A container that VANISHES flushes its final window and is then retired, so
+  an OOM-killed container's burst is exported rather than discarded — that
+  case is the reason the feature exists. That final flush is never a held
+  value: the last datapoint before a kill is the one an operator zooms into,
+  so it is real or it is absent.
+* A container the metadata service cannot resolve is **not exported at all**.
+  A cgroup path carries a pod UID and a container ID but never a pod NAME, so
+  there is nothing to derive `service.name` from, and a series with no
+  Prometheus `job` cannot join the cadvisor series these gauges exist to
+  annotate. This is also what keeps the pod sandbox out: a pause container's
+  ID appears in no pod's `containerStatuses`, so it never resolves and never
+  ships. Unresolved cgroups are retried on a cadence that depends on **why**
+  the lookup failed, which is the difference between a sandbox and an outage:
+  a **404** is a definitive answer — a pause container will never become a
+  workload container — so after a short grace it drops to one retry every ten
+  minutes, roughly one lookup per pod per ten minutes for the whole sandbox
+  set; a lookup the metadata service **could not answer** (unreachable, 5xx,
+  timeout) abandons nothing, so a transient outage never costs a node its
+  real containers, and it puts an already-abandoned cgroup back on a
+  one-minute clock so sampling resumes within a minute of the service
+  returning. Both are counted in `kubescrape_cgroup_unresolved_total`, whose
+  `outcome` label separates them.
+* A container that is still **listed but answers no read** for three
+  consecutive windows is **retired**: its descriptors are released, a
+  throttled warning is logged and `kubescrape_cgroup_containers_retired_total`
+  is incremented. It is then held on the ten-minute clock rather than
+  re-adopted on the next 15-second discovery pass, so a lingering CRI-O
+  supervisor scope or a stale listing cannot pin three descriptors and three
+  failing reads per second indefinitely. Consequently
+  `kubescrape_cgroup_containers` counts what is being **sampled**, not what is
+  tracked — a container that goes unreadable leaves the gauge after one window
+  and rejoins it if a read succeeds again.
+* `-check-config` prints `cgroupStats=requested`, never `on`: the dry run
+  acquires nothing and cannot know the node's cgroup version, so it reports
+  what was asked for. The startup log is authoritative — `cgroup sampler
+  started` or `cgroup stats are not available on this node`.
+
+
 ## Agent: transforms (Starlark)
 
 `-transforms-file` points at a separate YAML file holding one optional
@@ -2203,6 +2305,11 @@ namespace of that name. Set the value to a list to name the namespaces
 yourself, or to an explicit `[]` to exclude nothing — which is the one thing
 the old `[]` default could not express, since it was indistinguishable from
 "unset".
+
+`agent.cgroupStats.enabled: true` renders more than a flag: the agent gets the
+host's `/sys/fs/cgroup` bind-mounted read-only, because the sampler has nothing
+to read without it. `interval` maps to `-cgroup-stats-interval` and `root` to
+`-cgroup-stats-root`.
 
 `azure.enabled: true` rides in the same singleton Deployment as
 `events.enabled` (either renders it): `azure.eventhub.*` maps to the

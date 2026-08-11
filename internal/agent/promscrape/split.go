@@ -516,7 +516,10 @@ func (b *splitBatcher) fillSplitResource(res pcommon.Resource, rule *compiledSpl
 	var ctx attrs.Context
 	resolved := false
 	if rule.enrich {
-		ctx, resolved = b.s.resolveContext(b.ctx, containerID, namespace, pod, uid, container, res)
+		// The failure classification is the cgroup sampler's alone (it decides a
+		// retry cadence); a split row is emitted with its label identity either
+		// way.
+		ctx, resolved, _ = b.s.resolveContext(b.ctx, containerID, namespace, pod, uid, container, res)
 	}
 	// The groupBy labels move onto the resource under their mapped attribute
 	// names — ALWAYS, not only when enrichment failed. putSplitLabels strips

@@ -6,14 +6,17 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"reflect"
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"sigs.k8s.io/yaml"
 
 	"github.com/JohanLindvall/kubescrape/internal/agent/attrs"
+	"github.com/JohanLindvall/kubescrape/internal/agent/cgroupstats"
 	"github.com/JohanLindvall/kubescrape/internal/agent/logscrub"
 	"github.com/JohanLindvall/kubescrape/internal/agent/otlpexport"
 	"github.com/JohanLindvall/kubescrape/internal/agent/promscrape"
@@ -205,6 +208,41 @@ func checkFlagValues() error {
 	if flagWasSet("logs-rate-burst") && *logsRateBurst != 0 && *logsRateBurst < 1 {
 		return fmt.Errorf("-logs-rate-burst=%g is a bucket that can never admit a line: a line spends one WHOLE token and the bucket never holds more than the burst, so pause mode stops reading every log file on this node forever (with -logs-rate-drop, every line is discarded instead). "+
 			"Pass a burst of 1 or more, or -logs-rate-burst=0 to derive it as 2x -logs-rate-limit", *logsRateBurst)
+	}
+	// The sampler's ticker period. A non-positive one is not "as fast as
+	// possible" and not "off" — time.NewTicker PANICS on it, which would take
+	// the whole agent down at the point the pipeline starts rather than at the
+	// point the flag was typed. cgroupstats.New defaults a non-positive value
+	// (the library guarantee, for a Config arriving programmatically); this is
+	// the other question, what an operator TYPED, and the answer is the same as
+	// -scrape-timeout's: they did not get what they asked for and would find
+	// out mid-rollout.
+	if flagWasSet("cgroup-stats-interval") && *cgroupStatsIv <= 0 {
+		return fmt.Errorf("-cgroup-stats-interval=%s is not a sampling period: this flag has no spelling for 'as fast as possible' or for 'off' (-cgroup-stats=false is off). "+
+			"Pass a positive duration well below -scrape-interval, which is the window the distribution describes (the default is %s)", *cgroupStatsIv, cgroupstats.DefaultInterval)
+	}
+	// The floor, and it only exists in the direction that BURNS THE NODE. One
+	// sweep is three cgroup reads per container on the goroutine that also runs
+	// discovery, so the period is what divides that cost: at the floor a
+	// 200-container node already issues 6000 reads a second, and a tenth of it
+	// would be a busy loop on the process that also tails every log file here —
+	// bought for no signal, since a burst shorter than 100ms cannot be
+	// attributed to anything anyway. Refused rather than clamped because the
+	// operator typed it; cgroupstats.New clamps the same value arriving
+	// programmatically.
+	if flagWasSet("cgroup-stats-interval") && *cgroupStatsIv > 0 && *cgroupStatsIv < cgroupstats.MinInterval {
+		return fmt.Errorf("-cgroup-stats-interval=%s is below the %s floor: one sweep is three cgroup file reads per container on the goroutine that also discovers them, so this asks the node agent for %.0f reads a second per 100 containers and buys no burst resolution that survives a %s export window. "+
+			"Pass %s or more (the default is %s)",
+			*cgroupStatsIv, cgroupstats.MinInterval, 300*float64(time.Second)/float64(*cgroupStatsIv),
+			*scrapeInterval, cgroupstats.MinInterval, cgroupstats.DefaultInterval)
+	}
+	// A relative cgroup root would be resolved against the process' working
+	// directory, which in a distroless container is "/" — so it would silently
+	// almost-work, finding nothing, which is precisely the outcome this
+	// pipeline is built to never produce quietly.
+	if flagWasSet("cgroup-stats-root") && *cgroupRoot != "" && !filepath.IsAbs(*cgroupRoot) {
+		return fmt.Errorf("-cgroup-stats-root=%q must be an absolute path (empty autodetects %s): a relative one resolves against the container's working directory and would find no cgroups while reporting no error",
+			*cgroupRoot, cgroupstats.DefaultRoot)
 	}
 	return nil
 }
@@ -582,8 +620,41 @@ func configWarnings(cfg agentConfig) []string {
 			}
 		}
 	}
+
+	// A sampling period that is not comfortably SHORTER than the export window
+	// buys nothing: the window is -scrape-interval, a CPU rate needs two
+	// readings inside one window, and at parity there is at most one reading —
+	// so the CPU gauges would be absent most windows and the memory ones would
+	// report a one-sample "distribution" whose stddev is 0 and whose max and min
+	// are the same number the cadvisor scrape already publishes. Named rather
+	// than refused: the value is legal, it just quietly undoes the reason the
+	// pipeline was enabled, and the threshold (a quarter of the window, i.e.
+	// four-plus samples) is a judgement rather than a correctness boundary.
+	if *cgroupStatsOn && *scrapeInterval > 0 && *cgroupStatsIv*4 > *scrapeInterval {
+		out = append(out, fmt.Sprintf(
+			"-cgroup-stats-interval=%s against a -scrape-interval=%s export window yields at most %d samples per window: the CPU gauges need TWO readings to derive one rate and are omitted below that, and a one- or two-sample window's stddev/max/min is not a distribution — it is the last one re-stated, which is the average the cadvisor scrape already reports under six new names. "+
+				"Sample at a small fraction of the window (the default 1s against 30s is 30 samples) or turn -cgroup-stats off.",
+			*cgroupStatsIv, *scrapeInterval, *scrapeInterval / *cgroupStatsIv))
+	}
+	// The other end of the same flag, the one that costs the NODE rather than
+	// the signal. Above the floor checkFlagValues refuses, so this is legal —
+	// but three reads per container per period on the goroutine that also runs
+	// discovery is a cost an operator should have chosen deliberately, and a
+	// burst finer than this window is not attributable to anything anyway.
+	if *cgroupStatsOn && *cgroupStatsIv > 0 && *cgroupStatsIv < costlyCgroupInterval {
+		out = append(out, fmt.Sprintf(
+			"-cgroup-stats-interval=%s asks this node agent for %.0f cgroup file reads a second per 100 containers, on the same goroutine that discovers them — and it is the process that also tails every log file on the node. "+
+				"The default %s already resolves a burst far shorter than any export window; go below %s only for a measured reason.",
+			*cgroupStatsIv, 300*float64(time.Second)/float64(*cgroupStatsIv),
+			cgroupstats.DefaultInterval, costlyCgroupInterval))
+	}
 	return out
 }
+
+// costlyCgroupInterval is where -cgroup-stats-interval stops being free and
+// starts being a choice. It is not a boundary — cgroupstats.MinInterval is —
+// which is why it warns rather than refuses.
+const costlyCgroupInterval = 500 * time.Millisecond
 
 // logConfigWarnings emits configWarnings.
 func logConfigWarnings(cfg agentConfig, log *slog.Logger) {
@@ -726,13 +797,28 @@ func printConfigSummary(cfg agentConfig, log *slog.Logger) {
 		sections = append(sections, "(none)")
 	}
 
+	// -cgroup-stats is the one pipeline a NODE can refuse: on a cgroup v1 host
+	// (or one with no /sys/fs/cgroup mounted into the pod) cgroupstats.New
+	// reports ErrUnsupportedNode and the agent disables this pipeline alone,
+	// keeping every other one running. This summary reads FLAGS and probes
+	// nothing — deliberately, and the node's cgroup version is not knowable
+	// from a dry run anyway, which is the whole reason that classification
+	// exists — so "on" would be this line claiming a pipeline runs where it
+	// may never start. It reports the REQUEST instead; what actually happened
+	// is the startup log's "cgroup sampler started" or "cgroup stats are not
+	// available on this node", which is emitted where the answer is known.
+	cgroupStats := "off"
+	if *cgroupStatsOn {
+		cgroupStats = "requested"
+	}
+
 	log.Info("config is valid",
 		"sections", strings.Join(sections, ","),
 		// Which binary this is, not just whether the config parses: the
 		// optional pipelines are build-tag-gated (buildtags.go).
 		"optionalPipelines", builtPipelines(),
-		"pipelines", fmt.Sprintf("logs=%s metrics=%s cadvisor=%s node=%s journald=%s ingest=%s events=%s azure=%s serviceGraph=%s",
-			on(*logsOn), on(*metricsOn), on(*cadvisorOn), on(*nodeOn), on(*journaldOn), on(*ingestOn), on(*eventsOn), on(*azureOn), on(*serviceGraphOn)),
+		"pipelines", fmt.Sprintf("logs=%s metrics=%s cadvisor=%s cgroupStats=%s node=%s journald=%s ingest=%s events=%s azure=%s serviceGraph=%s",
+			on(*logsOn), on(*metricsOn), on(*cadvisorOn), cgroupStats, on(*nodeOn), on(*journaldOn), on(*ingestOn), on(*eventsOn), on(*azureOn), on(*serviceGraphOn)),
 		"otlp-endpoint", *otlpEndpoint,
 		"otlp-protocol", *otlpProtocol,
 		"buffer-dir", *bufferDir,

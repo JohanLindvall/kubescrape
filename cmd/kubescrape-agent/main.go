@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/JohanLindvall/kubescrape/internal/agent/attrs"
+	"github.com/JohanLindvall/kubescrape/internal/agent/cgroupstats"
 	"github.com/JohanLindvall/kubescrape/internal/agent/debugtap"
 	"github.com/JohanLindvall/kubescrape/internal/agent/events"
 	"github.com/JohanLindvall/kubescrape/internal/agent/logscrub"
@@ -128,7 +129,7 @@ func shardRole() bool {
 // a pod name that changes on every restart, resetting each node's whole
 // cumulative history.
 func perNodePipelinesOff() bool {
-	return !*logsOn && !*metricsOn && !*cadvisorOn && !*nodeOn && !*journaldOn && !*ingestOn
+	return !*logsOn && !*metricsOn && !*cadvisorOn && !*nodeOn && !*journaldOn && !*ingestOn && !*cgroupStatsOn
 }
 
 // singletonRole reports whether this process is the cluster-singleton
@@ -275,6 +276,12 @@ var (
 	rollupsOn  = flag.Bool("cadvisor-rollups", true, "include cadvisor rollup series: cgroups above pod level and pod-level rows of container-scoped families")
 	nodeOn     = flag.Bool("node-metrics", true, "scrape <kubelet-endpoint>/metrics (kubelet/node metrics)")
 
+	// The high-frequency cgroup sampler. Off by default: it needs a host mount
+	// the other pipelines do not, and it adds a metric family per container.
+	cgroupStatsOn = flag.Bool("cgroup-stats", false, "sample container cgroups directly every -cgroup-stats-interval and export the DISTRIBUTION (stddev/max/min of the CPU rate and the memory working set) of each -scrape-interval window. The cadvisor scrape reports one average per window, so a container spiking to 4 cores for 2s inside a 60s window reads as ~0.13 cores; this recovers that at six gauges per container instead of 60x the raw series. Requires the host's /sys/fs/cgroup mounted read-only (the shipped DaemonSet and the chart do so behind this flag) and cgroup v2 — a v1 node logs an error naming the version and this flag, disables this pipeline alone and keeps the others running, rather than misreading v1's nanosecond CPU counters or CrashLooping the node's log shipping over a metric. Only containers the metadata service can place are exported (a series with no service.name joins nothing), which is also what keeps each pod's sandbox cgroup out")
+	cgroupStatsIv = flag.Duration("cgroup-stats-interval", cgroupstats.DefaultInterval, "sampling period for -cgroup-stats. Shorter catches shorter bursts and costs three cgroup file reads per container per period; it must be well below -scrape-interval, which is the window the distribution describes, and at least 100ms")
+	cgroupRoot    = flag.String("cgroup-stats-root", "", "cgroup v2 mount point for -cgroup-stats (empty autodetects /sys/fs/cgroup). Only the MOUNT POINT: the layout beneath it is discovered, so kind's kubelet.slice nesting, a stock systemd node's kubepods.slice and a cgroupfs-driver node's kubepods all work unconfigured")
+
 	// OTLP ingest (apps push telemetry to the local agent for enrichment).
 	// LOGS AND METRICS ONLY: traces are received by the -service-graph tier,
 	// which is the only place that can hold a whole trace (see startServiceGraph).
@@ -359,6 +366,11 @@ type pipelines struct {
 	// journalRules is the compiled logs.rules chain, applied to journal entries
 	// as well as container logs (same section, same semantics).
 	journalRules *logline.LineFilter
+	// cgroupSampler is published by startCgroupStats so run() can ship the last
+	// sampling window after the sampler has joined. Sampler.Run deliberately
+	// does NOT export on cancel: the budget belongs to the shutdown sequence's
+	// shared deadline, not to a constant inside the package.
+	cgroupSampler *cgroupstats.Sampler
 	// spanMetricsGen is published by buildOwnerChain (servicegraph.go) so run()
 	// can export the last aggregation window after every producer has joined.
 	spanMetricsGen *spanmetrics.Generator
@@ -915,6 +927,9 @@ func run() error {
 		return err
 	}
 	sc := p.startScraper(ctx)
+	if err := p.startCgroupStats(ctx, sc); err != nil {
+		return err
+	}
 	p.startDebugServer(ctx, tl, sc)
 
 	<-ctx.Done()
@@ -988,6 +1003,20 @@ func run() error {
 		if err := logMetrics.Export(transform.Handoff(fctx), out, *logsMetricsBytes); err != nil {
 			log.Warn("final log-metrics export failed", "error", err)
 		}
+	}
+	if p.cgroupSampler != nil {
+		// The last sampling window — up to a whole -scrape-interval of burst
+		// data, including the final seconds of anything that vanished just
+		// before shutdown, which is exactly the OOM-killed container this
+		// pipeline exists for. Sampler.Run exports nothing on cancel by design:
+		// the budget is this sequence's shared deadline, not a constant the
+		// package would have to guess (the same correction internal/metrics'
+		// FinalExport already carries).
+		fctx, cancel := stepCtx(stepBudget())
+		if err := p.cgroupSampler.FinalExport(transform.Handoff(fctx), p.out); err != nil {
+			log.Warn("final cgroup-stats export failed", "error", err)
+		}
+		cancel()
 	}
 	if p.spanMetricsGen != nil {
 		// Generator.Run does its final export when ctx is cancelled, but the
@@ -1374,6 +1403,74 @@ func (p *pipelines) startScraper(ctx context.Context) *promscrape.Scraper {
 		sc0 = sc
 	}
 	return sc0
+}
+
+// startCgroupStats starts the high-frequency cgroup sampler (-cgroup-stats).
+//
+// It takes the Scraper because the sampler must build its resources through the
+// SAME code the cadvisor scrape does — see promscrape.FillContainerResource for
+// why a second implementation would be worse than useless. sc is nil when every
+// scrape pipeline is off, and the sampler is still perfectly valid then (it is
+// the only container CPU/memory signal on such an agent), so a Scraper is
+// constructed for its resolver alone: promscrape.New starts no goroutines,
+// binds nothing and dials nothing until Run, so what is built here is the
+// metadata cache and the attribute builder and nothing else.
+func (p *pipelines) startCgroupStats(ctx context.Context, sc *promscrape.Scraper) error {
+	if !*cgroupStatsOn {
+		return nil
+	}
+	resolver := sc
+	if resolver == nil {
+		resolver = promscrape.New(promscrape.Config{
+			Node:     *nodeName,
+			Attrs:    p.attrBuilders,
+			NodeInfo: p.nodeInfo,
+			Logger:   p.log,
+			Kubelet:  promscrape.KubeletConfig{Meta: p.meta},
+		})
+	}
+	s, err := cgroupstats.New(cgroupstats.Config{
+		Root:     *cgroupRoot,
+		Interval: *cgroupStatsIv,
+		Resolver: resolver,
+		Logger:   p.log,
+	})
+	switch {
+	case errors.Is(err, cgroupstats.ErrUnsupportedNode):
+		// A property of the NODE, not of anything the operator typed: this node
+		// runs cgroup v1 (or exposes no cgroup hierarchy at all at the default
+		// root), and no amount of waiting changes it. DEGRADE — one pipeline
+		// off, every other one running.
+		//
+		// It used to be fatal, and that made enabling one flag on a MIXED FLEET
+		// take the LOG pipeline down on every v1 node: the DaemonSet pod
+		// CrashLoops, so the node stops shipping logs, for a metric. And
+		// -check-config cannot catch it in advance, because the cgroup version
+		// is a property of the node the pod lands on. An explicit
+		// -cgroup-stats-root that is not a cgroup v2 hierarchy stays fatal
+		// below: that one is an operator error, identical on every node.
+		p.log.Error("cgroup stats are not available on this node; the pipeline is disabled and every other pipeline keeps running",
+			"error", err, "flag", "-cgroup-stats", "root", cgroupstats.DefaultRoot)
+		return nil
+	case err != nil:
+		return fmt.Errorf("cgroup stats: %w", err)
+	}
+	// Registered only now, so a published 0 means "running and finding
+	// nothing" rather than "off" (obs.RegisterCgroupStats).
+	obs.RegisterCgroupStats(s.Containers, s.Unresolved)
+	p.cgroupSampler = s
+	p.spawn(func() {
+		// Handoff for the transform seam: every export renders fresh pdata from
+		// a window that is reset as it is rendered, and a failed payload is
+		// never re-offered, so a script may run in place instead of paying a
+		// deep copy. Marked here rather than inside the package for the reason
+		// internal/metrics is (the mark belongs to the call site that knows the
+		// retry policy).
+		s.Run(transform.Handoff(ctx), p.out, *scrapeInterval)
+	})
+	p.log.Info("cgroup sampler started", "root", s.Root(), "interval", *cgroupStatsIv,
+		"window", *scrapeInterval, "cgroups", s.Discovered())
+	return nil
 }
 
 // startDebugServer serves /healthz, /readyz and the /debug endpoints on

@@ -15,6 +15,7 @@ import (
 
 	"github.com/JohanLindvall/kubescrape/internal/obs"
 	"github.com/JohanLindvall/kubescrape/pkg/kubemeta"
+	"github.com/JohanLindvall/kubescrape/pkg/metaclient"
 
 	"github.com/JohanLindvall/kubescrape/pkg/cgroupid"
 )
@@ -42,6 +43,19 @@ type podCacheEntry struct {
 	pod       *kubemeta.Pod       // nil: lookup failed / unknown
 	container *kubemeta.Container // set for container-ID entries
 	fetched   time.Time
+	// answered records WHY a negative entry is negative, which is the one thing
+	// a caller cannot reconstruct from a nil pod: true means the metadata
+	// service replied and its reply was 404 (this id is not a container of any
+	// pod it knows — a pod sandbox's permanent condition), false means it could
+	// not be reached or could not answer (transport failure, 5xx, an
+	// undecodable body).
+	//
+	// It has to live IN the cache, not just in the return value, because a
+	// negative entry is served for podMetaCacheTTL: reconstructing the reason
+	// as "definitive" on a cache hit would turn one unreachable minute into a
+	// definitive verdict for every lookup inside it — which is exactly the
+	// distinction internal/agent/cgroupstats' retry policy is built on.
+	answered bool
 }
 
 // cadvisorBatcher implements sink, routing each point into a ResourceMetrics
@@ -399,9 +413,52 @@ func (cb *cadvisorBatcher) scope(ident cadvisorIdentity) pmetric.ScopeMetrics {
 // then the pod (by name, cross-checked against the cgroup pod UID), then the
 // raw label identity.
 func (cb *cadvisorBatcher) fillResource(res pcommon.Resource, ident cadvisorIdentity) {
+	// The verdict is the cgroup sampler's business, not a scraped row's: a
+	// cadvisor row is exported either way, with the label identity as its
+	// fallback.
+	_, _ = cb.s.fillIdentityResource(cb.ctx, res, ident)
+}
+
+// FillContainerResource builds the resource attributes describing one container
+// identified by its CGROUP PATH — the runtime container id and the pod uid of
+// the slice it sits in — using exactly the machinery a cadvisor row goes
+// through: the same metadata lookup, the same TTL cache, the same
+// unresolved-row fallback and the same `cadvisor` attribute builder (hence the
+// same instance prefix).
+//
+// It exists for internal/agent/cgroupstats, whose six gauges are only worth
+// anything if they JOIN the cadvisor series they explain — and two series join
+// when their resource attributes, and so the derived Prometheus job and
+// instance, are byte-identical. A second implementation would agree with this
+// one until the first edit to either; sharing the body means the sampler cannot
+// drift from the scrape even in principle.
+//
+// The first bool is what a cgroup path costs. A cadvisor row carries namespace,
+// pod and container LABELS, so an unresolvable one still falls back to a
+// resource with a service.name (the pod name) and keeps its Prometheus `job`. A
+// cgroup path yields only two ids, so the same fallback here produces a resource
+// with no service.name at all — a series attributed to nothing, joining none of
+// the cadvisor series the sampler exists to explain, and one successful later
+// lookup away from silently becoming a DIFFERENT series. So the verdict is
+// reported and the caller declines to export what did not resolve; see
+// cgroupstats.Resolver.
+//
+// The second bool CLASSIFIES a failure, and it exists because the two ways to
+// not resolve want opposite retry policies. See cgroupstats.Resolver for the
+// contract and containerMeta for where the classification comes from.
+func (s *Scraper) FillContainerResource(ctx context.Context, res pcommon.Resource, containerID, podUID string) (ok, answered bool) {
+	return s.fillIdentityResource(ctx, res, cadvisorIdentity{containerID: containerID, podUID: podUID})
+}
+
+// fillIdentityResource is fillResource's body, lifted onto the Scraper so the
+// exported seam above and the batcher below are literally one code path. It
+// reports whether the metadata service PLACED the identity (as opposed to the
+// resource having been built from the caller's own labels), and whether it
+// ANSWERED at all.
+func (s *Scraper) fillIdentityResource(ctx context.Context, res pcommon.Resource, ident cadvisorIdentity) (bool, bool) {
 	// Exact container incarnation via the cgroup container ID, else the pod.
-	ctx, resolved := cb.s.resolveContext(cb.ctx, ident.containerID, ident.namespace, ident.pod, ident.podUID, ident.container, res)
-	ctx.Node = cb.s.nodeInfo()
+	actx, resolved, answered := s.resolveContext(ctx, ident.containerID, ident.namespace, ident.pod, ident.podUID, ident.container, res)
+	actx.Node = s.nodeInfo()
 
 	if !resolved && (ident.pod != "" || ident.podUID != "" || ident.containerID != "") {
 		// Metadata unavailable (or a same-name pod replaced this one, or a
@@ -446,7 +503,8 @@ func (cb *cadvisorBatcher) fillResource(res pcommon.Resource, ident cadvisorIden
 			a.PutStr("service.name", ident.pod)
 		}
 	}
-	cb.s.attrsFor(pipelineCadvisor).Build(res, ctx)
+	s.attrsFor(pipelineCadvisor).Build(res, actx)
+	return resolved, answered
 }
 
 // metric returns the (per-resource) metric for one sample's identity, plus
@@ -582,44 +640,58 @@ func (cb *cadvisorBatcher) putFilteredLabels(attrs pcommon.Map, labels []Label, 
 }
 
 // podMeta resolves pod metadata by name with a small TTL cache; nil when
-// unknown.
-func (s *Scraper) podMeta(ctx context.Context, namespace, pod string) *kubemeta.Pod {
+// unknown. The second value is podCacheEntry.answered: on a nil pod it says
+// whether the metadata service ANSWERED (a 404) or could not be asked.
+func (s *Scraper) podMeta(ctx context.Context, namespace, pod string) (*kubemeta.Pod, bool) {
 	key := "n\x00" + namespace + "/" + pod
 	if e, ok := s.cacheGet(key); ok {
-		return e.pod
+		return e.pod, e.pod != nil || e.answered
 	}
 	meta, err := s.metaSource().PodByName(ctx, namespace, pod)
+	answered := true
 	if err != nil {
 		meta = nil
 		if ctx.Err() != nil {
-			return nil // do not negative-cache cancellations
+			// A cancellation is not an answer, and it is not cached either.
+			return nil, false
 		}
+		answered = metaclient.IsNotFound(err)
 	}
-	s.cachePut(key, podCacheEntry{pod: meta, fetched: time.Now()})
-	return meta
+	s.cachePut(key, podCacheEntry{pod: meta, fetched: time.Now(), answered: answered})
+	return meta, meta != nil || answered
 }
 
 // containerMeta resolves the exact container incarnation by runtime ID; nil
 // when unknown. The lookup is non-blocking (wait 0): the scraped series only
 // reference containers that already exist.
-func (s *Scraper) containerMeta(ctx context.Context, containerID string) *kubemeta.ContainerMetadata {
+//
+// The second value classifies a MISS, and it is what makes the cgroup sampler's
+// retry policy possible (internal/agent/cgroupstats): a 404 is a definitive
+// statement about this container id — nothing about the node changing will make
+// a pause container's id appear in a pod's containerStatuses — while a
+// transport failure, a 5xx or an undecodable body is a statement about the
+// metadata SERVICE, and the retry that follows must be soon rather than rare.
+// Both still produce a nil here, and the cadvisor path still treats them
+// alike: the row is exported with its label identity either way.
+func (s *Scraper) containerMeta(ctx context.Context, containerID string) (*kubemeta.ContainerMetadata, bool) {
 	key := "c\x00" + containerID
 	if e, ok := s.cacheGet(key); ok {
 		if e.pod == nil {
-			return nil
+			return nil, e.answered
 		}
-		return &kubemeta.ContainerMetadata{ContainerID: containerID, Container: *e.container, Pod: *e.pod}
+		return &kubemeta.ContainerMetadata{ContainerID: containerID, Container: *e.container, Pod: *e.pod}, true
 	}
 	md, err := s.metaSource().Container(ctx, containerID, 0)
 	if err != nil {
 		if ctx.Err() != nil {
-			return nil // do not negative-cache cancellations
+			return nil, false // do not negative-cache cancellations
 		}
-		s.cachePut(key, podCacheEntry{fetched: time.Now()})
-		return nil
+		answered := metaclient.IsNotFound(err)
+		s.cachePut(key, podCacheEntry{fetched: time.Now(), answered: answered})
+		return nil, answered
 	}
-	s.cachePut(key, podCacheEntry{pod: &md.Pod, container: &md.Container, fetched: time.Now()})
-	return md
+	s.cachePut(key, podCacheEntry{pod: &md.Pod, container: &md.Container, fetched: time.Now(), answered: true})
+	return md, true
 }
 
 func (s *Scraper) cacheGet(key string) (podCacheEntry, bool) {

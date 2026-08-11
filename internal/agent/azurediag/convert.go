@@ -141,9 +141,63 @@ func (r *Reader) convertLogs(recs []record) plog.Logs {
 			Body: body, Lifted: extracted, Resource: ent.Res, BoundKey: key,
 		})
 	}
+	// AFTER the chain, deliberately: log-metrics observe every record and the
+	// keep/drop rules run before this, so a rule or a metric label keyed on
+	// cloud.resource_id still sees it. Only the EXPORTED record loses the copy.
+	elideRedundantIdentity(ld)
 	// An all-dropped group leaves an empty ResourceLogs behind.
 	logchain.Prune(ld)
 	return ld
+}
+
+// redundantOnAzureResource reports whether an enrich-derived record attribute
+// merely repeats what r.resource() already put on the OTLP resource.
+//
+// The converter is authoritative for identity on this path: it parses the ARM
+// id out of the envelope's own resourceId field, while enrich re-derives one
+// from the body TEXT. Keeping both is not just redundant, it is contradictory
+// — the resource carries the id verbatim and enrich's copy is lowercased, so
+// one payload ships two values under `cloud.resource_id` and a backend that
+// flattens resource and record attributes picks a winner this repo does not
+// control. It is also pure egress: measured against a live Event Hub, 286
+// bytes on every record, 1 MB per 3,500-record payload.
+//
+// `azure.resource_group` goes for a second reason: enrich's ResourceGroup is
+// the group's full ARM ID (`/subscriptions/<sub>/resourcegroups/<name>`), while
+// the resource carries the bare name as `azure.resource_group.name` — two keys
+// one letter apart holding different shapes of the same fact.
+//
+// Scoped to THIS path on purpose. The tailer, journald and ingest have no ARM
+// resource, so for them the record attribute is the only carrier and
+// logenrich must keep emitting it.
+func redundantOnAzureResource(key string) bool {
+	return key == "cloud.resource_id" || key == "azure.resource_group"
+}
+
+// elideRedundantIdentity drops the duplicated identity attributes from every
+// record whose RESOURCE actually carries the ARM identity.
+//
+// The gate is what makes this safe: a record whose envelope had no resourceId
+// (or one parseResourceID could not read) leaves the resource without
+// cloud.resource_id, and there enrich's body-derived attributes are the ONLY
+// carrier — dropping them would lose the identity rather than de-duplicate it.
+func elideRedundantIdentity(ld plog.Logs) {
+	rls := ld.ResourceLogs()
+	for i := 0; i < rls.Len(); i++ {
+		rl := rls.At(i)
+		if _, ok := rl.Resource().Attributes().Get("cloud.resource_id"); !ok {
+			continue
+		}
+		sls := rl.ScopeLogs()
+		for j := 0; j < sls.Len(); j++ {
+			recs := sls.At(j).LogRecords()
+			for k := 0; k < recs.Len(); k++ {
+				recs.At(k).Attributes().RemoveIf(func(key string, _ pcommon.Value) bool {
+					return redundantOnAzureResource(key)
+				})
+			}
+		}
+	}
 }
 
 // recordSink is the chain's Producer for diagnostic records: the group a kept

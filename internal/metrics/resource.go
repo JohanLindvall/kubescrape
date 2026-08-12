@@ -9,6 +9,15 @@ import (
 // attributes (rendered as strings), matching labels.hashAccum so a resource and
 // extra resource labels can be folded into one series key.
 //
+// CONTRACT: res must not repeat a key. The fold is XOR, so a pair folded twice
+// CANCELS — an undeduped {k=v, k=v} hashes as the EMPTY resource and merges
+// with an unrelated attribute-less one. Every agent-built resource comes from a
+// Go map and satisfies this for free; a WIRE resource does not (OTLP encodes
+// attributes as a repeated KeyValue and pdata does not dedupe on decode), which
+// is why both wire doors fold through set() first — otlpingest.dedupeResourceKeys
+// before Bind, and uniqueResourceAccum for a script's resource. Do not call this
+// on a resource of unknown provenance; call uniqueResourceAccum.
+//
 // Values are hashed at their TRUNCATED length (truncLabelCut — a reslice, no
 // copy): resourceString goes through set(), which truncates, and the hashed
 // identity must be the rendered identity. Hashing the full value while
@@ -23,7 +32,7 @@ func resourceAccum(res pcommon.Map) xxh3.Uint128 {
 			return true // resourceString's set drops these; the hash must too
 		}
 		hk, hv := strHash(k), strHash(s[:truncLabelCut(s)])
-		rk = add128(rk, combineResHash(hk, hv))
+		rk = xor128(rk, combineResHash(hk, hv))
 		return true
 	})
 	return rk
@@ -47,12 +56,12 @@ func resLabelsAccum(res pcommon.Map, extra labels) xxh3.Uint128 {
 				// The subtraction must cancel resourceAccum's addition exactly,
 				// so it folds the SAME truncated view.
 				hv := strHash(s[:truncLabelCut(s)])
-				rk = sub128(rk, combineResHash(hk, hv))
+				rk = xor128(rk, combineResHash(hk, hv)) // self-inverse: folds the replaced pair back OUT
 			}
 		}
 		// e.value came through set() and is already truncated.
 		hv := strHash(e.value)
-		rk = add128(rk, combineResHash(hk, hv))
+		rk = xor128(rk, combineResHash(hk, hv))
 	}
 	return rk
 }

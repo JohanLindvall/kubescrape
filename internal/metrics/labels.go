@@ -150,18 +150,45 @@ func (l labels) without(key string) labels {
 // yet slowed 6.2%. Do not go looking for it in the hashing.
 func strHash(s string) xxh3.Uint128 { return xxh3.HashString128(s) }
 
-// hashAccum is the order-independent accumulator of the label set: every
-// entry contributes combineHash(hash(key), hash(value)) and they are summed
-// (wrapping). Summation is order-independent like XOR but not self-inverse
-// under duplication — with XOR, the same key=value pair contributed twice
-// (e.g. in both the data-point labels and the resource labels) cancelled to
-// zero, silently merging distinct series. Addition still supports folding a
-// single label in or out (subtract its combined hash), which the histogram
-// observe path uses for the per-bucket "le".
+// hashAccum is the order-independent accumulator of the label set: every entry
+// contributes combineHash(hash(key), hash(value)) and they are XOR-folded.
+//
+// XOR rather than a wrapping sum. Both are order-independent and both are
+// exactly uniform over uniform independent contributions — folding in any
+// finite abelian group is — so this is not a distribution choice; measured over
+// 400k realistic label sets x 8 populations x 2 bit windows, chi-square on the
+// FINALIZED key (mixHash applied, which is what the map sees) gives mean |z|
+// 0.65 for XOR against 0.51 for the sum, both at the ~0.80 a uniform
+// distribution predicts, with the ordering inverting against the raw un-mixed
+// fold. It is not a speed choice either: swapping the two moves nothing
+// measurable (interleaved, n=8: LabelsAccums, ResourceAccum, DynamicAddAttrs,
+// DynamicAddHistogram, DynamicAddBound all ~, geomean 0.13%). XOR is chosen for
+// being SELF-INVERSE: the fold-out that resLabelsAccum needs is the same
+// operation as the fold-in, so there is one primitive instead of a pair, and no
+// carry/borrow to get right.
+//
+// THE PRICE, and it is the thing to know before touching any caller: XOR is
+// blind to EVEN MULTIPLICITY. A contribution folded twice cancels to zero, so
+// {k=v, k=v} hashes identically to {} — where a sum merely hashed it distinctly
+// from {k=v}. The history here is not hypothetical: this fold WAS XOR, a pair
+// reaching it twice silently merged distinct series, and it was changed to a
+// sum for that reason. What makes XOR safe again is that no caller can now fold
+// a duplicate:
+//
+//   - labels.set() replaces by key, so a label set cannot hold one key twice.
+//   - resourceAccum ranges a pcommon.Map, whose keys are unique when the map is
+//     agent-built. Its doc carries the contract for callers that are not.
+//   - a WIRE resource can legally repeat a key (OTLP encodes attributes as a
+//     repeated KeyValue and pdata does not dedupe on decode), so both doors
+//     from the wire fold through set() first: otlpingest dedupes last-wins
+//     before Bind, and uniqueResourceAccum does it for a script's resource.
+//
+// That invariant is now load-bearing rather than merely tidy, which is why it
+// is enumerated here and pinned by TestXorFoldDependsOnCallerDedup.
 func (l labels) hashAccum() xxh3.Uint128 {
 	var h xxh3.Uint128
 	for _, e := range l {
-		h = add128(h, combineHash(strHash(e.key), strHash(e.value)))
+		h = xor128(h, combineHash(strHash(e.key), strHash(e.value)))
 	}
 	return h
 }
@@ -365,24 +392,16 @@ const (
 	prime5 uint64 = 2870177450012600261
 )
 
-// add128 and sub128 are the wrapping 128-bit sum and difference the
-// accumulators fold with. The accumulator must be a GROUP for the fold-out to
-// work — subtracting a pair's contribution has to undo its addition exactly,
-// which is what lets baseAccum strip a caller-supplied "le" from a histogram's
-// identity and resLabelsAccum cancel an overridden resource key. Wrapping
-// two's-complement addition is one; carry/borrow make the 128-bit version of it
-// exact rather than two independent 64-bit wraps (which would NOT be a group
-// over the pair, since a low-half wrap would be lost instead of carried).
-func add128(a, b xxh3.Uint128) xxh3.Uint128 {
-	lo, carry := bits.Add64(a.Lo, b.Lo, 0)
-	hi, _ := bits.Add64(a.Hi, b.Hi, carry)
-	return xxh3.Uint128{Hi: hi, Lo: lo}
-}
-
-func sub128(a, b xxh3.Uint128) xxh3.Uint128 {
-	lo, borrow := bits.Sub64(a.Lo, b.Lo, 0)
-	hi, _ := bits.Sub64(a.Hi, b.Hi, borrow)
-	return xxh3.Uint128{Hi: hi, Lo: lo}
+// xor128 is the fold. It is its OWN INVERSE, which is why there is no separate
+// cancel operation: resLabelsAccum folds a replaced resource pair back out by
+// folding it in again.
+//
+// The cost of that convenience is stated at hashAccum and is real: XOR is blind
+// to even multiplicity, so any contribution folded twice vanishes. Nothing in
+// this package may fold the same (domain, key, value) twice — see the callers'
+// contracts, which is where that invariant now lives.
+func xor128(a, b xxh3.Uint128) xxh3.Uint128 {
+	return xxh3.Uint128{Hi: a.Hi ^ b.Hi, Lo: a.Lo ^ b.Lo}
 }
 
 // combineHash folds a key's and a value's 128-bit hashes into one 128-bit

@@ -210,11 +210,19 @@ func renderedSizeOver(v pcommon.Value, rem *int, depth int) bool {
 
 // dedupeResourceKeys rewrites a resource whose attributes repeat a key. OTLP
 // encodes attributes as a repeated KeyValue and pdata does not dedupe on
-// decode; the metric store's order-independent SUM-fold hashes every entry
-// while its rendered identity applies last-wins, so {k=p, k=q} and
-// {k=q, k=p} hash identical (two senders' series MERGE) while {k=v, k=v}
-// hashes distinct from {k=v} yet renders the same (byte-identical duplicate
-// points in one exported payload — invalid for a Prometheus-shaped backend).
+// decode; the metric store's order-independent fold hashes every entry while
+// its rendered identity applies last-wins, so {k=p, k=q} and {k=q, k=p} hash
+// identical (two senders' series MERGE).
+//
+// {k=v, k=v} is the sharper case and this call is now the ONLY thing standing
+// between it and a wrong answer. The store's fold is XOR (metrics/labels.go
+// hashAccum), which is blind to even multiplicity: a pair folded twice CANCELS,
+// so an undeduped {k=v, k=v} hashes as the EMPTY resource and merges with
+// whatever unrelated resource happens to carry no attributes — verified, it
+// folds to exactly zero. Under the wrapping sum this fold used to use, the same
+// input merely hashed distinct from {k=v} while rendering the same, i.e.
+// duplicate points rather than a merge. The failure got worse when the fold
+// changed; the guard did not move.
 // Every agent-built resource comes from a map and cannot repeat a key, so
 // the fix lives at this boundary instead of taxing every producer's hot
 // path. Last-wins, which is what any map-shaped consumer of the forwarded

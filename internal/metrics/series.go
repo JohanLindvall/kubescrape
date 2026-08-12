@@ -327,7 +327,7 @@ func (s *series) observe(lbls labels, value float64, resAccum xxh3.Uint128, res 
 	}
 	now := s.epoch()
 	base := s.baseAccum(lbls)
-	base = add128(base, add128(resAccum, resLabelsAccum(res, resLabels)))
+	base = xor128(base, xor128(resAccum, resLabelsAccum(res, resLabels)))
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -388,7 +388,7 @@ func (s *series) materialize(lbls labels, hash xxh3.Uint128) {
 // baseAccum hashes the caller's data-point labels once (order-independent).
 //
 // It used to strip a caller-supplied "le" from a histogram's identity here, via
-// the fold-out sub128. That moved to the two doors an "le" can arrive through —
+// the fold-out. That moved to the two doors an "le" can arrive through —
 // rejectHistogramLe at config compile and EmitDirect for a script's label map —
 // so the hot path no longer probes every histogram observation for a label that
 // is now refused before it can be observed.

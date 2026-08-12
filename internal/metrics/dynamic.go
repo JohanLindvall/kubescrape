@@ -556,7 +556,7 @@ func uniqueResourceAccum(res pcommon.Map) xxh3.Uint128 {
 		// resourceAccum's truncLabelCut reslice achieves: the hashed identity
 		// must be the rendered one.
 		hk, hv := strHash(e.key), strHash(e.value)
-		rk = add128(rk, combineResHash(hk, hv))
+		rk = xor128(rk, combineResHash(hk, hv))
 	}
 	return rk
 }

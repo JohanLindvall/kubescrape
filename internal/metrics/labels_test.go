@@ -27,22 +27,49 @@ func TestLabelsHashAccumFoldable(t *testing.T) {
 	// property the histogram observe path relies on.
 	base := labels{{"a", "1"}, {"b", "2"}}
 	full := append(labels{}, base...).set("le", "0.5")
-	// The fold is 128-bit wrapping addition (add128), and it must be the exact
-	// inverse of the sub128 baseAccum uses to strip an "le" back out.
-	folded := add128(base.hashAccum(), combineHash(strHash("le"), strHash("0.5")))
+	// The fold is xor128, and folding a pair in must equal hashing the full set.
+	folded := xor128(base.hashAccum(), combineHash(strHash("le"), strHash("0.5")))
 	if mixHash(folded) != full.hash() {
 		t.Error("sum-folded le label does not match full hash")
 	}
 }
 
-func TestLabelsHashNoDuplicateCancellation(t *testing.T) {
-	// The regression the sum fold fixes: with XOR, an identical key=value pair
-	// contributed from two sets (data-point labels and resource labels)
-	// cancelled out, making every user's series hash identical.
-	alice := labels{{"user", "alice"}}
-	bob := labels{{"user", "bob"}}
-	if add128(alice.hashAccum(), alice.hashAccum()) == add128(bob.hashAccum(), bob.hashAccum()) {
-		t.Error("duplicated pair still cancels: distinct users share a hash")
+// TestXorFoldDependsOnCallerDedup pins the price of the XOR fold and the
+// guarantees that pay it.
+//
+// XOR is blind to EVEN MULTIPLICITY: a contribution folded twice cancels. That
+// is not a defect to fix in the arithmetic — it is the property that makes the
+// fold self-inverse, which is what resLabelsAccum's cancel relies on. It is
+// safe only because no caller can fold a duplicate, so this test asserts BOTH
+// halves: that the hazard is real, and that each door closes it.
+func TestXorFoldDependsOnCallerDedup(t *testing.T) {
+	// The hazard, stated outright: fold one pair twice and it vanishes.
+	c := combineHash(strHash("user"), strHash("alice"))
+	if xor128(c, c) != (xxh3.Uint128{}) {
+		t.Fatal("xor128 is no longer self-inverse; the cancel in resLabelsAccum depends on it")
+	}
+
+	// Door 1: labels.set replaces by key, so a label set cannot hold one key
+	// twice — the shape that would cancel is unrepresentable.
+	l := labels{}.set("user", "alice").set("user", "alice")
+	if len(l) != 1 {
+		t.Fatalf("set kept %d entries for one key; a duplicate would cancel under XOR", len(l))
+	}
+	if l.hashAccum() == (labels{}).hashAccum() {
+		t.Fatal("a deduped single-pair set collided with the empty set")
+	}
+
+	// Door 2: a WIRE resource may legally repeat a key (OTLP encodes attributes
+	// as a repeated KeyValue; pdata does not dedupe on decode). Folded raw that
+	// would cancel to the EMPTY resource's hash — a merge with something
+	// unrelated, which is strictly worse than the sum's duplicate-series bug.
+	// uniqueResourceAccum folds through set() first, so it does not.
+	dup := dupKeyResource(t, "service.name", "a", "a")
+	if got := uniqueResourceAccum(dup); got == (xxh3.Uint128{}) {
+		t.Fatal("a resource repeating one key cancelled to the empty hash")
+	}
+	if uniqueResourceAccum(dup) != uniqueResourceAccum(res(map[string]string{"service.name": "a"})) {
+		t.Fatal("a repeated key must hash as the identity it RENDERS, which is the deduped one")
 	}
 }
 
@@ -161,45 +188,27 @@ func TestLabelKeyEdgeSpaceRoundTrips(t *testing.T) {
 	}
 }
 
-// TestAdd128Sub128AreExactInverses pins the property the whole fold rests on:
-// the accumulator must be a GROUP, so subtracting a pair's contribution undoes
-// its addition exactly. resLabelsAccum relies on it to cancel a resource key an
-// extra label overrides — hash the merged set, not the merged-plus-original.
-//
-// The interesting cases are the ones that CROSS the half boundary. Two
-// independent 64-bit wraps (Hi and Lo added separately, no carry) pass a naive
-// test and fail here: a low-half wrap would be dropped instead of carried into
-// Hi, and subtract would then not undo add. That is why add128/sub128 use
-// bits.Add64/bits.Sub64 rather than plain += on each field.
-func TestAdd128Sub128AreExactInverses(t *testing.T) {
+// TestXor128IsItsOwnInverse pins the property the fold rests on: folding a
+// contribution out is the SAME operation as folding it in, which is what lets
+// resLabelsAccum cancel a resource key an extra label overrides without a
+// second primitive. Checked over values that exercise both halves.
+func TestXor128IsItsOwnInverse(t *testing.T) {
 	const max = ^uint64(0)
 	vals := []xxh3.Uint128{
 		{},
 		{Lo: 1},
 		{Hi: 1},
 		{Hi: max, Lo: max},
-		{Lo: max},            // +1 carries into Hi
-		{Hi: max},            // -1 borrows out of Hi
-		{Hi: 7, Lo: max - 3}, // carry with both halves populated
+		{Lo: max},
+		{Hi: max},
+		{Hi: 7, Lo: max - 3},
 		{Hi: 0x0123456789abcdef, Lo: 0xfedcba9876543210},
 	}
 	for _, a := range vals {
 		for _, b := range vals {
-			if got := sub128(add128(a, b), b); got != a {
-				t.Errorf("sub128(add128(%v, %v), %v) = %v, want %v", a, b, b, got, a)
-			}
-			if got := add128(sub128(a, b), b); got != a {
-				t.Errorf("add128(sub128(%v, %v), %v) = %v, want %v", a, b, b, got, a)
+			if got := xor128(xor128(a, b), b); got != a {
+				t.Errorf("xor128(xor128(%v, %v), %v) = %v, want %v", a, b, b, got, a)
 			}
 		}
-	}
-
-	// The carry is real, not incidental: adding 1 to a saturated low half must
-	// move Hi. A field-wise += would leave Hi untouched here.
-	if got := add128(xxh3.Uint128{Lo: max}, xxh3.Uint128{Lo: 1}); got != (xxh3.Uint128{Hi: 1, Lo: 0}) {
-		t.Errorf("add128 dropped the carry: %v", got)
-	}
-	if got := sub128(xxh3.Uint128{Hi: 1}, xxh3.Uint128{Lo: 1}); got != (xxh3.Uint128{Hi: 0, Lo: max}) {
-		t.Errorf("sub128 dropped the borrow: %v", got)
 	}
 }

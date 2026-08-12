@@ -206,26 +206,26 @@ func (r *Registry) HistogramVec(name, desc string, buckets []float64, labelNames
 // label accumulators are precomputed at construction so a hot-path Inc does
 // not rehash the label set on every call.
 type bound struct {
-	s           *series
-	lbls        labels
-	base, check xxh3.Uint128
-	hash        xxh3.Uint128 // mixHash(base), precomputed — bumps skip the avalanche
+	s    *series
+	lbls labels
+	base xxh3.Uint128
+	hash xxh3.Uint128 // mixHash(base), precomputed — bumps skip the avalanche
 }
 
 func newBound(s *series, lbls labels) bound {
-	base, check := lbls.accums()
-	return bound{s: s, lbls: lbls, base: base, check: check, hash: mixHash(base)}
+	base := lbls.hashAccum()
+	return bound{s: s, lbls: lbls, base: base, hash: mixHash(base)}
 }
 
 var emptyResource = pcommon.NewMap()
 
 func (b bound) observe(v float64) {
-	b.s.observePreHashed(b.lbls, b.hash, b.check, v, emptyResource)
+	b.s.observePreHashed(b.lbls, b.hash, v, emptyResource)
 }
 
 // materialize creates this label set's series at zero (see series.materialize).
 func (b bound) materialize() {
-	b.s.materialize(b.lbls, b.hash, b.check)
+	b.s.materialize(b.lbls, b.hash)
 }
 
 // Value returns the current sum across the bound label set's samples (for
@@ -405,7 +405,7 @@ func (r *Registry) Export(ctx context.Context, exp Exporter, res pcommon.Resourc
 					}
 					gf.lastVec[lv] = v
 				}
-				gf.s.observe(labels{}.set(gf.labelName, lv), obsV, resKey{}, emptyResource, nil)
+				gf.s.observe(labels{}.set(gf.labelName, lv), obsV, xxh3.Uint128{}, emptyResource, nil)
 			}
 			gf.mu.Unlock()
 			continue
@@ -416,11 +416,11 @@ func (r *Registry) Export(ctx context.Context, exp Exporter, res pcommon.Resourc
 			// counterDelta).
 			d := counterDelta(gf.last, v)
 			gf.last = v
-			gf.s.observe(nil, d, resKey{}, emptyResource, nil)
+			gf.s.observe(nil, d, xxh3.Uint128{}, emptyResource, nil)
 			gf.mu.Unlock()
 			continue
 		}
-		gf.s.observe(nil, v, resKey{}, emptyResource, nil)
+		gf.s.observe(nil, v, xxh3.Uint128{}, emptyResource, nil)
 		gf.mu.Unlock()
 	}
 

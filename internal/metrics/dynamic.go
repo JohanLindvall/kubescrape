@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/zeebo/xxh3"
 	"go.opentelemetry.io/collector/pdata/pcommon"
 
 	"github.com/JohanLindvall/kubescrape/internal/logline"
@@ -173,7 +174,7 @@ func (r *metricRule) readValue(values func(string) (float64, bool), line string)
 // it matches. buf/rbuf are reused for the data-point and resource label sets and
 // returned (set may grow them). resAccum is the hash of res (the line's resource
 // attributes), computed once by the caller.
-func (r *metricRule) observe(values func(string) (float64, bool), lookup func(string) string, res pcommon.Map, resAccum resKey, line string, ctx *logline.MatchContext, buf, rbuf labels) (labels, labels) {
+func (r *metricRule) observe(values func(string) (float64, bool), lookup func(string) string, res pcommon.Map, resAccum xxh3.Uint128, line string, ctx *logline.MatchContext, buf, rbuf labels) (labels, labels) {
 	if !r.match.Match(lookup, ctx) {
 		return buf, rbuf
 	}
@@ -330,10 +331,6 @@ func (s *DynamicMetricSet) DroppedCappedByMetric() map[string]float64 {
 	return s.drops.CappedByMetric()
 }
 
-// DroppedCollision counts observations this set rejected because their hash
-// matched an existing sample of a DIFFERENT series.
-func (s *DynamicMetricSet) DroppedCollision() uint64 { return s.drops.Collision() }
-
 // DroppedNaN counts observations this set rejected because the extracted value
 // was not finite (NaN or +/-Inf).
 func (s *DynamicMetricSet) DroppedNaN() uint64 { return s.drops.NaN() }
@@ -427,7 +424,7 @@ func NewDynamicMetricSet(metrics []Dynamic, opts ...Option) (*DynamicMetricSet, 
 type BoundResource struct {
 	set   *DynamicMetricSet
 	res   pcommon.Map
-	accum resKey
+	accum xxh3.Uint128
 }
 
 // Bind precomputes the per-resource state for repeated Adds. Safe on a nil
@@ -448,7 +445,7 @@ func (b BoundResource) Add(values ValueFunc, lookup func(string) string, line st
 	b.set.add(values, lookup, b.res, b.accum, line)
 }
 
-func (s *DynamicMetricSet) add(values ValueFunc, lookup func(string) string, resource pcommon.Map, resAccum resKey, line string) {
+func (s *DynamicMetricSet) add(values ValueFunc, lookup func(string) string, resource pcommon.Map, resAccum xxh3.Uint128, line string) {
 	ac := s.pool.Get().(*addContext)
 	ac.ctx.Reset()
 	ac.line.Reset(line)
@@ -536,20 +533,19 @@ func (s *DynamicMetricSet) EmitDirect(name string, value float64, lbls map[strin
 // only, and before the transform seam). It is a cold per-script-call path that
 // already allocates, so it pays the extra pass; Bind's per-flush hot path,
 // whose resources are all agent-built, is untouched.
-func uniqueResourceAccum(res pcommon.Map) resKey {
+func uniqueResourceAccum(res pcommon.Map) xxh3.Uint128 {
 	ls := make(labels, 0, res.Len())
 	res.Range(func(k string, v pcommon.Value) bool {
 		ls = ls.set(k, v.AsString())
 		return true
 	})
-	var rk resKey
+	var rk xxh3.Uint128
 	for _, e := range ls {
 		// set() already truncated the value, which is exactly what
 		// resourceAccum's truncLabelCut reslice achieves: the hashed identity
 		// must be the rendered one.
 		hk, hv := strHash(e.key), strHash(e.value)
-		rk.accum = add128(rk.accum, combineResHash(hk, hv))
-		rk.check = add128(rk.check, combineResCheck(hk, hv))
+		rk = add128(rk, combineResHash(hk, hv))
 	}
 	return rk
 }

@@ -15,16 +15,15 @@ import (
 // rendering the cut one made two resources differing only past the bound two
 // live samples sharing one serialized identity — duplicate points every
 // export, merged corrupt points for histograms.
-func resourceAccum(res pcommon.Map) resKey {
-	var rk resKey
+func resourceAccum(res pcommon.Map) xxh3.Uint128 {
+	var rk xxh3.Uint128
 	res.Range(func(k string, v pcommon.Value) bool {
 		s := v.AsString()
 		if k == "" || s == "" {
 			return true // resourceString's set drops these; the hash must too
 		}
 		hk, hv := strHash(k), strHash(s[:truncLabelCut(s)])
-		rk.accum = add128(rk.accum, combineResHash(hk, hv))
-		rk.check = add128(rk.check, combineResCheck(hk, hv))
+		rk = add128(rk, combineResHash(hk, hv))
 		return true
 	})
 	return rk
@@ -36,8 +35,8 @@ func resourceAccum(res pcommon.Map) resKey {
 // both pairs made {svc:foo}+override svc=bar collide-or-diverge from
 // {svc:bar} inconsistently with its serialized identity, yielding duplicate
 // data points within one exported resource group.
-func resLabelsAccum(res pcommon.Map, extra labels) resKey {
-	var rk resKey
+func resLabelsAccum(res pcommon.Map, extra labels) xxh3.Uint128 {
+	var rk xxh3.Uint128
 	for _, e := range extra {
 		if e.key == "" || e.value == "" {
 			continue
@@ -48,21 +47,15 @@ func resLabelsAccum(res pcommon.Map, extra labels) resKey {
 				// The subtraction must cancel resourceAccum's addition exactly,
 				// so it folds the SAME truncated view.
 				hv := strHash(s[:truncLabelCut(s)])
-				rk.accum = sub128(rk.accum, combineResHash(hk, hv))
-				rk.check = sub128(rk.check, combineResCheck(hk, hv))
+				rk = sub128(rk, combineResHash(hk, hv))
 			}
 		}
 		// e.value came through set() and is already truncated.
 		hv := strHash(e.value)
-		rk.accum = add128(rk.accum, combineResHash(hk, hv))
-		rk.check = add128(rk.check, combineResCheck(hk, hv))
+		rk = add128(rk, combineResHash(hk, hv))
 	}
 	return rk
 }
-
-// resKey carries a resource's two order-independent hash accumulators (the
-// series key contribution and the collision-check contribution).
-type resKey struct{ accum, check xxh3.Uint128 }
 
 // resourceString serializes a resource's attributes plus any extra resource
 // labels into the sorted label string used to key and later emit the per-metric

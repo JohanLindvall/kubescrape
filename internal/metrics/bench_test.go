@@ -428,16 +428,16 @@ func benchLabels() labels {
 }
 
 // BenchmarkLabelsAccums measures the series-identity fold directly, undiluted
-// by the rest of Add: this is the per-observation string hashing that a change
-// of hash function moves. accums() is the paired form every series lookup uses.
+// by the rest of Add: this is the per-observation string hashing and folding
+// that a change of hash function moves.
 func BenchmarkLabelsAccums(b *testing.B) {
 	l := benchLabels()
 	b.ReportAllocs()
-	var h, c xxh3.Uint128
+	var h xxh3.Uint128
 	for b.Loop() {
-		h, c = l.accums()
+		h = l.hashAccum()
 	}
-	sinkAccum(h, c)
+	sinkAccum(h)
 }
 
 // BenchmarkResourceAccum measures the resource half of the same key. The
@@ -446,14 +446,14 @@ func BenchmarkLabelsAccums(b *testing.B) {
 func BenchmarkResourceAccum(b *testing.B) {
 	res := benchResource()
 	b.ReportAllocs()
-	var rk resKey
+	var rk xxh3.Uint128
 	for b.Loop() {
 		rk = resourceAccum(res)
 	}
-	sinkAccum(rk.accum, rk.check)
+	sinkAccum(rk)
 }
 
 //go:noinline
-func sinkAccum(a, b xxh3.Uint128) { accumSinkA, accumSinkB = a, b }
+func sinkAccum(a xxh3.Uint128) { accumSink = a }
 
-var accumSinkA, accumSinkB xxh3.Uint128
+var accumSink xxh3.Uint128

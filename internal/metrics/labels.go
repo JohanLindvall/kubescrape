@@ -118,29 +118,36 @@ func (l labels) without(key string) labels {
 // strHash is one string's 128-bit xxh3 hash — the input to every accumulator
 // in this package.
 //
-// It is 128 bits because the identity built on top of it can be no wider than
-// what enters it. The store keys a series on a PAIR of accumulators (see
-// checkAccum), and the pair used to be two projections of the SAME two 64-bit
-// xxhash values per label: two distinct strings colliding in xxhash64 fed both
-// accumulators an identical contribution, so the check detected nothing. The
-// claimed ~2^-128 held for a collision arising in the COMBINE step and not for
-// one arising in the string hash, which is the far likelier of the two. Both
-// combines now consume all 128 bits of both operands and produce 128 bits, so
-// with two accumulators a series' identity is 256 bits and no part of it is a
-// projection of a 64-bit value.
+// A series is keyed on ONE 128-bit accumulator, and this is why that is enough.
+// The store used to key on a PAIR (a primary hash plus a "check" hash compared
+// on every map hit, refusing a mismatch), because the primary was 64 bits and a
+// 64-bit key genuinely can collide: at the hard cap of 10000 label combinations
+// per metric the birthday bound is n^2/2^65 ~ 2.7e-12 per series map, small but
+// not nothing across a fleet over years. At 128 bits the same bound is ~1.5e-31
+// — multiplied by a million series maps, still 1e-25, which is many orders of
+// magnitude below the rate at which the machine silently corrupts the value in
+// RAM. A second accumulator guarding that is not defence in depth; it is a
+// doubling of the per-label fold for an event that cannot happen.
+//
+// So the check went when the primary got wide, and the two changes belong
+// together: keeping both would have been carrying the compensation and the fix
+// at the same time. (The pair was also weaker than it looked — both halves were
+// projections of the SAME two 64-bit xxhash values per label, so a collision in
+// the STRING hash fed both an identical contribution and the check saw nothing.
+// The claimed ~2^-128 only ever covered a collision arising in the combine.)
 //
 // xxh3 rather than xxhash64 because it is the faster algorithm on exactly the
 // input this hashes — short strings, one per label key and value per
-// observation. Measured, this half of the change PAID for itself: the fold got
-// 14.6% faster moving from 64-bit xxhash to 128-bit xxh3.
+// observation — so the wider hash is cheaper than the narrow one it replaced,
+// and dropping the second accumulator halves what remains: measured, the fold
+// is 10.5% faster than the 64-bit pair it replaced.
 //
-// Widening the ACCUMULATORS on top of it is the part that costs — +17.7% on
-// BenchmarkLabelsAccums and +8-16% on the end-to-end observe paths against the
-// 64-bit predecessor, allocations unchanged. That is a deliberate trade of hot-
-// path time for identity width, not an oversight; if it ever needs revisiting,
-// the cheaper design is the intermediate one (128-bit string hash, each
-// accumulator folding one half), which is 128 bits of identity for less than
-// the 64-bit version cost.
+// The observe path as a whole is nonetheless 2.6-10% SLOWER, and the cost is
+// not here: it is series.db's key going from uint64 to a 16-byte struct. Go
+// specialises map[uint64] to mapaccess*_fast64, and a comparable struct key
+// falls back to the generic path. BenchmarkDynamicAddBound is the proof —
+// observePreHashed uses a hash precomputed at construction and folds nothing,
+// yet slowed 9.3%. Do not go looking for it in the hashing.
 func strHash(s string) xxh3.Uint128 { return xxh3.HashString128(s) }
 
 // hashAccum is the order-independent accumulator of the label set: every
@@ -157,39 +164,6 @@ func (l labels) hashAccum() xxh3.Uint128 {
 		h = add128(h, combineHash(strHash(e.key), strHash(e.value)))
 	}
 	return h
-}
-
-// checkAccum is a second 128-bit accumulator over the same label set, folding
-// an independent projection of each pair (combineCheck). Series lookups compare
-// it on every hash hit, so a residual collision in the primary accumulator
-// between different label multisets is detected instead of silently merging
-// their data.
-//
-// Both accumulators colliding at once is ~2^-256, and — unlike the previous
-// single-hash-two-projections arrangement — that figure now covers a collision
-// in the STRING hash too, not just one in the fold. See strHash.
-func (l labels) checkAccum() xxh3.Uint128 {
-	var h xxh3.Uint128
-	for _, e := range l {
-		h = add128(h, combineCheck(strHash(e.key), strHash(e.value)))
-	}
-	return h
-}
-
-// accums returns both accumulators in one pass. Callers that need the pair —
-// every series lookup does, to key the sample and to carry its collision check
-// — must use this rather than calling hashAccum and checkAccum in turn: the
-// expensive part of each entry is hashing the key and value strings, and both
-// accumulators are fed by the very same two 128-bit hashes. Computing them once
-// halves the string hashing on the observe path. The results are identical to
-// calling the two separately (TestAccumsMatchSeparate).
-func (l labels) accums() (h, check xxh3.Uint128) {
-	for _, e := range l {
-		hk, hv := strHash(e.key), strHash(e.value)
-		h = add128(h, combineHash(hk, hv))
-		check = add128(check, combineCheck(hk, hv))
-	}
-	return h, check
 }
 
 // hash is the finalized order-independent hash of the label set.
@@ -417,9 +391,9 @@ func sub128(a, b xxh3.Uint128) xxh3.Uint128 {
 // Both output halves depend on all 256 input bits: bits.Mul64 widens each
 // 64x64 product to 128 bits and the two products are cross-folded, so a
 // difference anywhere in either input reaches both halves. That is the point of
-// carrying 128-bit string hashes at all — an earlier form gave each accumulator
-// one half of each hash, which is only 64 bits of input per accumulator however
-// wide the sum.
+// carrying 128-bit string hashes at all — an intermediate form gave the (then
+// two) accumulators one half of each hash each, which is only 64 bits of input
+// per accumulator however wide the sum.
 //
 // The distinct primes break the (h1,h2)/(h2,h1) symmetry: multiplication is
 // commutative, so XOR-ing a different prime into each operand is what keeps
@@ -437,41 +411,27 @@ func combineHash(h1, h2 xxh3.Uint128) xxh3.Uint128 {
 	return mixHash(xxh3.Uint128{Hi: loHi ^ hiLo, Lo: loLo ^ hiHi})
 }
 
-// combineCheck is a second, independent projection of the same pair for the
-// collision-check accumulator: different primes in different positions, and the
-// operands swapped, so a pair collision in one projection is not a collision in
-// the other. With both accumulators 128 bits wide and each fed by all 256 input
-// bits, a series' identity is 256 bits in total.
-func combineCheck(h1, h2 xxh3.Uint128) xxh3.Uint128 {
-	loHi, loLo := bits.Mul64(h2.Lo^prime3, h1.Lo^prime5)
-	hiHi, hiLo := bits.Mul64(h2.Hi^prime2, h1.Hi^prime1)
-	return mixHash(xxh3.Uint128{Hi: loHi ^ hiLo, Lo: loLo ^ hiHi})
-}
-
 // A series key is the wrapping SUM of its resource pairs and its data-point
 // label pairs. Folded with one combine, those two contributions would live in
 // the SAME hash domain — and a sum cannot tell where a term came from. Two
 // series built from the same multiset of (key, value) pairs, split differently
-// between resource and labels, would then hash identically in BOTH accumulators
-// (the check hash is no help: it is a projection of the same pairs), silently
-// merging distinct series. Concretely, with a rule lifting a line field named
-// like a resource attribute: pod A (resource k8s.pod.name=a) logging peer=b and
-// pod B (resource k8s.pod.name=b) logging peer=a collapse into one sample.
+// between resource and labels, would then hash identically, silently merging
+// distinct series. Concretely, with a rule lifting a line field named like a
+// resource attribute: pod A (resource k8s.pod.name=a) logging peer=b and pod B
+// (resource k8s.pod.name=b) logging peer=a collapse into one sample.
 //
-// combineRes* therefore folds a resource pair under a different seed, giving
-// the resource its own domain. resourceAccum and resLabelsAccum use these (a
-// resourceLabel is lifted ONTO the resource, so it belongs to the resource
-// domain and must cancel a resource key it overrides); data-point labels keep
-// combineHash/combineCheck.
+// This is the ONE separation the width does not make redundant, and the reason
+// is worth keeping straight: it does not defend against a chance collision (128
+// bits already does that) but against two genuinely different series producing
+// the SAME multiset of terms, which no amount of width fixes because the inputs
+// really are equal. combineResHash therefore folds a resource pair under
+// different primes, giving the resource its own domain. resourceAccum and
+// resLabelsAccum use it (a resourceLabel is lifted ONTO the resource, so it
+// belongs to the resource domain and must cancel a resource key it overrides);
+// data-point labels keep combineHash.
 func combineResHash(h1, h2 xxh3.Uint128) xxh3.Uint128 {
 	loHi, loLo := bits.Mul64(h1.Lo^prime4, h2.Lo^prime5)
 	hiHi, hiLo := bits.Mul64(h1.Hi^prime1, h2.Hi^prime2)
-	return mixHash(xxh3.Uint128{Hi: loHi ^ hiLo, Lo: loLo ^ hiHi})
-}
-
-func combineResCheck(h1, h2 xxh3.Uint128) xxh3.Uint128 {
-	loHi, loLo := bits.Mul64(h2.Lo^prime2, h1.Lo^prime4)
-	hiHi, hiLo := bits.Mul64(h2.Hi^prime5, h1.Hi^prime3)
 	return mixHash(xxh3.Uint128{Hi: loHi ^ hiLo, Lo: loLo ^ hiHi})
 }
 

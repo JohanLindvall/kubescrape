@@ -27,10 +27,9 @@ const leLabel = "le"
 // the log-metrics one, and six tests had to do before/after arithmetic to
 // isolate themselves from every other test in the package.
 type drops struct {
-	capped    atomic.Uint64
-	collision atomic.Uint64
-	nan       atomic.Uint64
-	retained  atomic.Uint64
+	capped   atomic.Uint64
+	nan      atomic.Uint64
+	retained atomic.Uint64
 
 	mu       sync.Mutex
 	byMetric map[string]uint64
@@ -55,11 +54,6 @@ func (d *drops) CappedByMetric() map[string]float64 {
 	}
 	return out
 }
-
-// Collision counts observations rejected because their hash matched an
-// existing sample of a DIFFERENT series (a 64-bit collision; merging them would
-// corrupt both).
-func (d *drops) Collision() uint64 { return d.collision.Load() }
 
 // NaN counts observations rejected because the extracted value was not
 // finite — NaN or +/-Inf alike. (The name predates the Inf arm; both take this
@@ -172,11 +166,7 @@ type sample struct {
 	// consumer (Datadog, Dynatrace, AWS EMF) then reports the whole running
 	// total as that interval's delta, and Google Cloud rejects a point whose
 	// start is not strictly before its end.
-	start int64
-	// check is the independent second hash of the sample's identity; a lookup
-	// whose primary hash matches but whose check differs is a 64-bit
-	// collision between distinct series and is rejected instead of merged.
-	check   xxh3.Uint128
+	start   int64
 	initial bool
 	// sealed marks an aggregation window as already emitted; the next observed
 	// value starts a fresh window (min/max/avg/first/last gauges).
@@ -226,9 +216,7 @@ type series struct {
 	// buckets are the histogram boundaries with +Inf appended; nil for
 	// non-histograms.
 	buckets []float64
-	// lastWarn rate-limits the cardinality-cap notice; lastCollision the
-	// hash-collision warn — separate so neither suppresses the other.
-	lastCollision int64
+	// lastWarn rate-limits the cardinality-cap notice.
 }
 
 // seriesSpec configures a new series.
@@ -327,7 +315,7 @@ func (s *series) bounds() []float64 { return s.buckets[:len(s.buckets)-1] }
 // histogram is ONE sample per label set — the value folds into its sum/count
 // and every counts slot whose bound it does not exceed — so every kind is a
 // single hash and a single map probe per observation.
-func (s *series) observe(lbls labels, value float64, resAccum resKey, res pcommon.Map, resLabels labels) {
+func (s *series) observe(lbls labels, value float64, resAccum xxh3.Uint128, res pcommon.Map, resLabels labels) {
 	if math.IsNaN(value) || math.IsInf(value, 0) {
 		// Inf too, and for the same reason: ParseFloat accepts "inf"/"Infinity"
 		// from a log line, and Inf is ABSORBING under every accumulate path —
@@ -338,20 +326,18 @@ func (s *series) observe(lbls labels, value float64, resAccum resKey, res pcommo
 		return
 	}
 	now := s.epoch()
-	base, check := s.baseAccum(lbls)
-	rl := resLabelsAccum(res, resLabels)
-	base = add128(base, add128(resAccum.accum, rl.accum))
-	check = add128(check, add128(resAccum.check, rl.check))
+	base := s.baseAccum(lbls)
+	base = add128(base, add128(resAccum, resLabelsAccum(res, resLabels)))
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.recordSingle(mixHash(base), check, value, lbls, now, res, resLabels)
+	s.recordSingle(mixHash(base), value, lbls, now, res, resLabels)
 }
 
 // observePreHashed is the registry fast path: the bound wrappers bump fixed
 // label sets, so the accumulators AND the finalized hash are precomputed at
 // construction; a bump pays neither the label rehash nor the avalanche.
-func (s *series) observePreHashed(lbls labels, hash, check xxh3.Uint128, value float64, res pcommon.Map) {
+func (s *series) observePreHashed(lbls labels, hash xxh3.Uint128, value float64, res pcommon.Map) {
 	if math.IsNaN(value) || math.IsInf(value, 0) {
 		s.drops.nan.Add(1)
 		return
@@ -362,35 +348,26 @@ func (s *series) observePreHashed(lbls labels, hash, check xxh3.Uint128, value f
 			// identity (baseAccum), which the precomputed hash did not do;
 			// take the general path. Registry label sets come from code, so
 			// this is a pathological shape, not a hot one.
-			s.observe(lbls, value, resKey{}, res, nil)
+			s.observe(lbls, value, xxh3.Uint128{}, res, nil)
 			return
 		}
 	}
 	now := s.epoch()
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.recordSingle(hash, check, value, lbls, now, res, nil)
+	s.recordSingle(hash, value, lbls, now, res, nil)
 }
 
 // recordSingle folds one observation into its sample: it admits the sample on
-// first sight and refuses a check-hash collision, then records the value. The
+// first sight, then records the value. The
 // caller holds s.mu. Shared by observe and the registry's observePreHashed.
-func (s *series) recordSingle(hash, check xxh3.Uint128, value float64, lbls labels, now int64, res pcommon.Map, resLabels labels) {
+func (s *series) recordSingle(hash xxh3.Uint128, value float64, lbls labels, now int64, res pcommon.Map, resLabels labels) {
 	samp := s.db[hash]
 	if samp == nil {
-		samp = s.admit(hash, check, lbls, now, res, resLabels)
+		samp = s.admit(hash, lbls, now, res, resLabels)
 		if samp == nil {
 			return
 		}
-	} else if samp.check != check {
-		// 64-bit collision between distinct series (~2^-64 per pair): refuse
-		// to merge.
-		s.drops.collision.Add(1)
-		if now-s.lastCollision >= 3600 {
-			s.lastCollision = now
-			s.log.Warn("series hash collision, dropping observation", "metric", s.name)
-		}
-		return
 	}
 	s.record(samp, value)
 	samp.when = now
@@ -408,7 +385,7 @@ func (s *series) recordSingle(hash, check xxh3.Uint128, value float64, lbls labe
 // real bump is still the first bump. Only the Registry's bound wrappers reach
 // it — a DynamicMetricSet's label sets come from log DATA, where a series
 // nothing has observed is exactly what should not exist.
-func (s *series) materialize(lbls labels, hash, check xxh3.Uint128) {
+func (s *series) materialize(lbls labels, hash xxh3.Uint128) {
 	if s.kind == kindHistogram {
 		if _, ok := lbls.get(leLabel); ok {
 			// baseAccum folds an "le" OUT of a histogram's identity, so the
@@ -424,7 +401,7 @@ func (s *series) materialize(lbls labels, hash, check xxh3.Uint128) {
 	if _, ok := s.db[hash]; ok {
 		return
 	}
-	s.admit(hash, check, lbls, now, emptyResource, nil)
+	s.admit(hash, lbls, now, emptyResource, nil)
 }
 
 // baseAccum hashes the caller's data-point labels once (order-independent). For
@@ -432,22 +409,21 @@ func (s *series) materialize(lbls labels, hash, check xxh3.Uint128) {
 // rendering artifact of the Prometheus exposition, never part of a stored
 // series' identity, so a line carrying one must land on the same sample as its
 // siblings without it.
-func (s *series) baseAccum(lbls labels) (base, check xxh3.Uint128) {
-	base, check = lbls.accums()
+func (s *series) baseAccum(lbls labels) (base xxh3.Uint128) {
+	base = lbls.hashAccum()
 	if s.kind == kindHistogram {
 		if v, ok := lbls.get(leLabel); ok {
 			hk, hv := strHash(leLabel), strHash(v)
 			base = sub128(base, combineHash(hk, hv))
-			check = sub128(check, combineCheck(hk, hv))
 		}
 	}
-	return base, check
+	return base
 }
 
 // admit inserts a new sample for a previously unseen label combination, or
 // returns nil (warning at most hourly) when the cardinality cap is reached. It
 // runs only on the cold path, so materializing the label set here is cheap.
-func (s *series) admit(hash, check xxh3.Uint128, lbls labels, now int64, res pcommon.Map, resLabels labels) *expiringSample {
+func (s *series) admit(hash xxh3.Uint128, lbls labels, now int64, res pcommon.Map, resLabels labels) *expiringSample {
 	full := lbls
 	if s.kind == kindHistogram {
 		// The stored labels mirror the identity hash, which baseAccum strips
@@ -459,7 +435,7 @@ func (s *series) admit(hash, check xxh3.Uint128, lbls labels, now int64, res pco
 		return nil
 	}
 	samp := &expiringSample{
-		sample: sample{labels: full.String(), resource: resourceString(res, resLabels), check: check, initial: true, start: s.streamStart(now)},
+		sample: sample{labels: full.String(), resource: resourceString(res, resLabels), initial: true, start: s.streamStart(now)},
 		when:   now,
 	}
 	if s.kind == kindHistogram {

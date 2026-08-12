@@ -153,7 +153,7 @@ func FuzzLabelsParse(f *testing.F) {
 		}
 
 		// hash must be order-independent and stable across the round-trip.
-		if got.hash() != want.hash() || got.checkAccum() != want.checkAccum() {
+		if got.hash() != want.hash() {
 			t.Fatalf("hash not stable across round-trip (serialized %q)", s)
 		}
 	})

@@ -44,9 +44,6 @@ func TestLabelsHashNoDuplicateCancellation(t *testing.T) {
 	if add128(alice.hashAccum(), alice.hashAccum()) == add128(bob.hashAccum(), bob.hashAccum()) {
 		t.Error("duplicated pair still cancels: distinct users share a hash")
 	}
-	if alice.checkAccum() == bob.checkAccum() {
-		t.Error("check accumulators collide for distinct values")
-	}
 }
 
 func TestLabelsSetGetWithout(t *testing.T) {
@@ -108,29 +105,6 @@ func TestResourceLabelOverrideKeysMergedIdentity(t *testing.T) {
 	for _, samp := range s.db {
 		if samp.value != 2 {
 			t.Fatalf("merged value: %v, want 2", samp.value)
-		}
-	}
-}
-
-// TestAccumsMatchSeparate pins the fused accumulator to the two it replaces on
-// the observe path. If they ever diverge, series identity silently changes and
-// every existing series in a running agent would be orphaned.
-func TestAccumsMatchSeparate(t *testing.T) {
-	for _, ls := range []labels{
-		nil,
-		{},
-		{{"a", "1"}},
-		{{"zone", "eu"}, {"status", "3xx"}, {"country", "ad"}},
-		{{"le", "0.5"}, {"handler", "/api"}},
-		{{"dup", "x"}, {"dup", "x"}}, // the duplicate case XOR got wrong
-		{{"k", ""}, {"", "v"}},
-	} {
-		h, c := ls.accums()
-		if want := ls.hashAccum(); h != want {
-			t.Errorf("accums hash %d, hashAccum %d (labels %v)", h, want, ls)
-		}
-		if want := ls.checkAccum(); c != want {
-			t.Errorf("accums check %d, checkAccum %d (labels %v)", c, want, ls)
 		}
 	}
 }

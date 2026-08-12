@@ -10,68 +10,78 @@ import (
 	"time"
 
 	"github.com/zeebo/xxh3"
+	"go.opentelemetry.io/collector/pdata/pcommon"
 )
 
-// TestHistogramLeFoldExact pins the fold-subtract path in baseAccum against
-// the ground truth: a caller-supplied "le" pair contributes NOTHING to a
-// histogram's identity — the accumulators with it stripped must be EXACTLY
-// the le-less label set's, so a line carrying one lands on the same sample as
-// its siblings without it, and the stored labels drop it.
-func TestHistogramLeFoldExact(t *testing.T) {
-	s := newTestSeries(seriesSpec{name: "h", kind: kindHistogram, buckets: []float64{0.1, 0.5, 1}})
-
-	for _, lbls := range []labels{
-		labels{}.set("handler", "/api").set("le", "0.5"),
-		labels{}.set("le", "+Inf"),
-	} {
-		base := s.baseAccum(lbls)
-		want := lbls.without(leLabel).hashAccum()
-		if base != want {
-			t.Errorf("labels %v: baseAccum %v != le-less hashAccum %v", lbls, base, want)
-		}
+// TestHistogramLeIsRefusedAtCompile pins the config-load half of the "le" rule.
+// A histogram keyed on a label set containing "le" would split its distribution
+// into one sample per value, each rendering a full bucket set, so the label is
+// refused where its name is known — statically, from the spec plus labelPrefix.
+func TestHistogramLeIsRefusedAtCompile(t *testing.T) {
+	_, err := newTestSet([]Dynamic{{
+		Name:    "h",
+		Type:    HistogramType,
+		Value:   "ms",
+		Buckets: []float64{1, 5},
+		Labels:  []string{"le=$bucket"},
+	}})
+	if err == nil {
+		t.Fatal("a histogram rule setting le compiled; want a startup error")
+	}
+	if !strings.Contains(err.Error(), "le") || !strings.Contains(err.Error(), "h") {
+		t.Errorf("error must name the label and the metric: %v", err)
 	}
 
-	// End to end: with and without "le" merge into ONE sample, stored without it.
-	s.observe(labels{}.set("handler", "/api"), 0.3, xxh3.Uint128{}, emptyResource, nil)
-	s.observe(labels{}.set("handler", "/api").set("le", "0.5"), 0.3, xxh3.Uint128{}, emptyResource, nil)
-	if len(s.db) != 1 {
-		t.Fatalf("caller-supplied le split the series: %d samples, want 1", len(s.db))
+	// The prefixed form is the same label and must be refused identically —
+	// the name is checked AFTER labelPrefix is applied.
+	if _, err := newTestSet([]Dynamic{{
+		Name: "h2", Type: HistogramType, Value: "ms", Buckets: []float64{1},
+		LabelPrefix: "l", Labels: []string{"e=$bucket"},
+	}}); err == nil {
+		t.Error("labelPrefix composing to \"le\" compiled; want a startup error")
 	}
-	for _, samp := range s.db {
-		if samp.count != 2 {
-			t.Fatalf("count = %d, want 2 (both observations on one sample)", samp.count)
-		}
-		if strings.Contains(samp.labels, "le=") {
-			t.Fatalf("stored labels carry le: %q", samp.labels)
-		}
+
+	// Non-histograms are untouched: there "le" is an ordinary label.
+	if _, err := newTestSet([]Dynamic{{
+		Name: "c", Type: CounterType, Value: "1", Labels: []string{"le=$bucket"},
+	}}); err != nil {
+		t.Errorf("le on a counter must stay legal: %v", err)
 	}
 }
 
-// TestPreHashedHistogramLeFallback: the registry fast path precomputes the
-// bound label set's hash WITHOUT baseAccum's le-stripping, so a histogram
-// bound to a label set that carries "le" must fall back to the general path —
-// or the same conceptual series would live under two hashes depending on
-// which constructor observed it.
-func TestPreHashedHistogramLeFallback(t *testing.T) {
-	s := newTestSeries(seriesSpec{name: "h", kind: kindHistogram, buckets: []float64{1}, expiration: registryExpiration})
-	newBound(s, labels{}.set("k", "v").set("le", "0.5")).observe(0.5)
-	newBound(s, labels{}.set("k", "v")).observe(0.5)
-	if len(s.db) != 1 {
-		t.Fatalf("le-carrying bound split the series: %d samples, want 1", len(s.db))
+// TestHistogramLeIsRefusedByEmitDirect pins the runtime half. A Starlark
+// script's label map is the ONE door whose keys are not known at compile time,
+// so it carries the only remaining check.
+func TestHistogramLeIsRefusedByEmitDirect(t *testing.T) {
+	set, err := newTestSet([]Dynamic{
+		{Name: "h", Type: HistogramType, Value: "ms", Buckets: []float64{1, 5}},
+		{Name: "c", Type: CounterType, Value: "1"},
+	})
+	if err != nil {
+		t.Fatal(err)
 	}
-	for _, samp := range s.db {
-		if samp.count != 2 {
-			t.Fatalf("count = %d, want 2 (both bounds on one sample)", samp.count)
-		}
-		if strings.Contains(samp.labels, "le=") {
-			t.Fatalf("stored labels carry le: %q", samp.labels)
+	res := pcommon.NewMap()
+
+	err = set.EmitDirect("h", 0.5, map[string]string{"le": "1"}, res)
+	if err == nil {
+		t.Fatal("emit_metric set le on a histogram; want an error")
+	}
+	if !strings.Contains(err.Error(), "le") {
+		t.Errorf("error must name the label: %v", err)
+	}
+	// Refused means NOT observed: a rejected emit must not leave a sample.
+	for _, r := range set.rules {
+		if r.series.name == "h" && len(r.series.db) != 0 {
+			t.Errorf("refused emit still admitted %d samples", len(r.series.db))
 		}
 	}
 
-	// The fast path's NaN guard: counted, never admitted.
-	newBound(s, labels{}.set("k", "v")).observe(math.NaN())
-	if got := s.drops.NaN(); got != 1 {
-		t.Fatalf("NaN drops = %d, want 1", got)
+	// Same label on a non-histogram is fine, and a histogram without it is fine.
+	if err := set.EmitDirect("c", 1, map[string]string{"le": "1"}, res); err != nil {
+		t.Errorf("le on a counter must stay legal: %v", err)
+	}
+	if err := set.EmitDirect("h", 0.5, map[string]string{"route": "/x"}, res); err != nil {
+		t.Errorf("histogram without le must emit: %v", err)
 	}
 }
 

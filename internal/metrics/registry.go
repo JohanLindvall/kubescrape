@@ -196,6 +196,25 @@ func (r *Registry) CounterFuncVec(name, desc, labelName string, fn func() map[st
 // HistogramVec registers a labeled histogram (nil buckets = the default
 // latency buckets, matching prometheus.DefBuckets).
 func (r *Registry) HistogramVec(name, desc string, buckets []float64, labelNames ...string) *RegHistogramVec {
+	// The third and last door an "le" can reach a histogram's identity through
+	// (the others are a logMetrics rule, refused by rejectHistogramLe, and a
+	// script's label map, refused by EmitDirect). A histogram keyed on "le"
+	// splits its distribution into one sample per value, each rendering a full
+	// bucket set, and downstream it collides with the bucket label a Prometheus
+	// consumer generates from the histogram's own buckets.
+	//
+	// A panic rather than an error because this door is CODE: label names here
+	// are compile-time literals, every binary builds its metrics during startup,
+	// and obs.go's registrations run in every test binary — so this cannot reach
+	// production without failing the build first. That is the loud, immediate
+	// report a programmer error deserves, and it is a construction-time
+	// assertion, not a runtime one (nothing recovers it; see CLAUDE.md).
+	for _, k := range labelNames {
+		if k == leLabel {
+			panic("metrics: histogram " + name + " declares a label named " + leLabel +
+				": it is the bucket-bound label generated from the histogram's own buckets")
+		}
+	}
 	return &RegHistogramVec{vec[RegHistogram]{
 		s: r.add(name, desc, kindHistogram, actionSet, buckets, false), keys: labelNames,
 		wrap: func(b bound) *RegHistogram { return &RegHistogram{b} },

@@ -503,6 +503,17 @@ func (s *DynamicMetricSet) EmitDirect(name string, value float64, lbls map[strin
 		if r.series.name != name {
 			continue
 		}
+		// The one runtime "le" check. Every other door into the store has
+		// static label names (config specs, checked by rejectHistogramLe;
+		// registry label sets, which come from code), but a script's label map
+		// is arbitrary — and an "le" on a histogram would split the
+		// distribution into one sample per value, each rendering its own full
+		// bucket set. An error rather than a silent drop, matching how every
+		// other mistake in emit_metric is reported.
+		if _, ok := lbls[leLabel]; ok && r.series.kind == kindHistogram {
+			return fmt.Errorf("emit_metric %q: a histogram may not set a label named %q — "+
+				"it is the bucket-bound label generated from the histogram's own buckets", name, leLabel)
+		}
 		var buf labels
 		for _, k := range slices.Sorted(maps.Keys(lbls)) {
 			buf = buf.set(k, lbls[k])

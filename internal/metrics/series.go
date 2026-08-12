@@ -342,16 +342,6 @@ func (s *series) observePreHashed(lbls labels, hash xxh3.Uint128, value float64,
 		s.drops.nan.Add(1)
 		return
 	}
-	if s.kind == kindHistogram {
-		if _, ok := lbls.get(leLabel); ok {
-			// A caller-supplied "le" must be folded OUT of a histogram's
-			// identity (baseAccum), which the precomputed hash did not do;
-			// take the general path. Registry label sets come from code, so
-			// this is a pathological shape, not a hot one.
-			s.observe(lbls, value, xxh3.Uint128{}, res, nil)
-			return
-		}
-	}
 	now := s.epoch()
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -386,15 +376,6 @@ func (s *series) recordSingle(hash xxh3.Uint128, value float64, lbls labels, now
 // it — a DynamicMetricSet's label sets come from log DATA, where a series
 // nothing has observed is exactly what should not exist.
 func (s *series) materialize(lbls labels, hash xxh3.Uint128) {
-	if s.kind == kindHistogram {
-		if _, ok := lbls.get(leLabel); ok {
-			// baseAccum folds an "le" OUT of a histogram's identity, so the
-			// caller's precomputed hash is not the one its observations land
-			// on (observePreHashed diverts them to the general path). Creating
-			// a sample under it would mint a second, never-observed series.
-			return
-		}
-	}
 	now := s.epoch()
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -404,38 +385,25 @@ func (s *series) materialize(lbls labels, hash xxh3.Uint128) {
 	s.admit(hash, lbls, now, emptyResource, nil)
 }
 
-// baseAccum hashes the caller's data-point labels once (order-independent). For
-// a histogram it strips any caller-provided "le": the per-bucket "le" is a
-// rendering artifact of the Prometheus exposition, never part of a stored
-// series' identity, so a line carrying one must land on the same sample as its
-// siblings without it.
-func (s *series) baseAccum(lbls labels) (base xxh3.Uint128) {
-	base = lbls.hashAccum()
-	if s.kind == kindHistogram {
-		if v, ok := lbls.get(leLabel); ok {
-			hk, hv := strHash(leLabel), strHash(v)
-			base = sub128(base, combineHash(hk, hv))
-		}
-	}
-	return base
-}
+// baseAccum hashes the caller's data-point labels once (order-independent).
+//
+// It used to strip a caller-supplied "le" from a histogram's identity here, via
+// the fold-out sub128. That moved to the two doors an "le" can arrive through —
+// rejectHistogramLe at config compile and EmitDirect for a script's label map —
+// so the hot path no longer probes every histogram observation for a label that
+// is now refused before it can be observed.
+func (s *series) baseAccum(lbls labels) xxh3.Uint128 { return lbls.hashAccum() }
 
 // admit inserts a new sample for a previously unseen label combination, or
 // returns nil (warning at most hourly) when the cardinality cap is reached. It
-// runs only on the cold path, so materializing the label set here is cheap.
+// runs only on the cold path, so serializing the label set here is cheap.
 func (s *series) admit(hash xxh3.Uint128, lbls labels, now int64, res pcommon.Map, resLabels labels) *expiringSample {
-	full := lbls
-	if s.kind == kindHistogram {
-		// The stored labels mirror the identity hash, which baseAccum strips
-		// any caller-supplied "le" from.
-		full = lbls.without(leLabel)
-	}
 	if s.maxSize > 0 && len(s.db) >= s.maxSize {
-		s.warnCapped(full, now)
+		s.warnCapped(lbls, now)
 		return nil
 	}
 	samp := &expiringSample{
-		sample: sample{labels: full.String(), resource: resourceString(res, resLabels), initial: true, start: s.streamStart(now)},
+		sample: sample{labels: lbls.String(), resource: resourceString(res, resLabels), initial: true, start: s.streamStart(now)},
 		when:   now,
 	}
 	if s.kind == kindHistogram {

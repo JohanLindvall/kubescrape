@@ -1,9 +1,11 @@
 // Package journald reads the systemd journal through libsystemd (via
 // github.com/coreos/go-systemd/v22/sdjournal — cgo) and exports the entries as
 // OTLP log records. Delivery is at-least-once: the cursor of the newest
-// exported entry is persisted only after a successful export, and on any
+// exported entry is persisted only after a successful export, and on a SOURCE
 // failure the reader restarts from the persisted cursor, re-reading whatever
-// was in flight.
+// was in flight. An EXPORT failure does not restart the reader — the batch is
+// retried in place (flushRetry), which is what keeps the per-record chain from
+// running twice over one entry.
 //
 // Because it links libsystemd, the agent binary is built with cgo and the
 // image must provide libsystemd (see the Dockerfile). The journal itself is
@@ -138,8 +140,7 @@ type Reader struct {
 	open openFunc
 
 	batch       []entry
-	batchBytes  int // summed body sizes of the buffered entries
-	lastFlush   time.Time
+	batchBytes  int    // summed body sizes of the buffered entries
 	cursor      string // last successfully exported cursor
 	batchCursor string // cursor of the newest buffered entry
 	// pending is the batch converted to OTLP, held across export retries
@@ -190,22 +191,13 @@ func (r *Reader) Run(ctx context.Context) {
 	r.cursor = r.loadCursor()
 	bo := backoff.New(r.cfg.RestartBackoff)
 	for ctx.Err() == nil {
-		// The restart path recovers unexported entries by RE-READING them from
-		// the committed cursor. That only works once a cursor exists: with none
-		// (the first run, or no positions store at all) a reopen seeks to the
-		// journal TAIL and the buffered entries are gone. So while no cursor has
-		// been committed, keep retrying the pending batch's export instead of
-		// reopening — the journal itself is the buffer, and the moment one
-		// export lands the cursor covers everything that follows.
-		if r.cursor == "" && len(r.batch) > 0 {
-			if err := r.flush(ctx); err != nil {
-				r.log.Warn("journal export failed with no committed cursor; retrying (a reopen would seek to the tail and lose the entries)",
-					"entries", len(r.batch), "error", err, "backoff", bo.Delay())
-				bo.Sleep(ctx)
-				continue
-			}
-			bo.Reset()
-		}
+		// No batch can reach this point: stream retries a failed export IN
+		// PLACE and only ever returns once the batch is settled or ctx is dead
+		// (flushRetry), so the loop restarts the SOURCE and nothing else. This
+		// used to carry a special case for the cursor-less first run — a reopen
+		// with an empty cursor seeks to the journal TAIL, so the buffered
+		// entries would have been gone — and flushRetry generalises it: no
+		// batch is discarded for an export failure, cursor or not.
 		started := time.Now()
 		err := r.stream(ctx)
 		if ctx.Err() != nil {
@@ -230,9 +222,9 @@ func (r *Reader) Run(ctx context.Context) {
 	// export, so a dropped final batch is re-read from the journal after the
 	// restart. The exception is a shutdown before ANY cursor has been committed
 	// (first run, or no positions store) — a reopen with an empty cursor seeks
-	// to the journal TAIL, so a lost final batch cannot be recovered; the Run
-	// loop's retry-in-place while no cursor exists narrows that window but the
-	// final flush here is single-shot.
+	// to the journal TAIL, so a lost final batch cannot be recovered; the
+	// in-place retry inside stream narrows that window but the final flush here
+	// is single-shot, because it is the one flush that must fit a budget.
 	//
 	// WithoutCancel, not Background: the values the caller put on ctx (the
 	// otlpexport ownership marker rides there) must survive.
@@ -248,9 +240,10 @@ func (r *Reader) Run(ctx context.Context) {
 // inside the pod's terminationGracePeriodSeconds.
 const shutdownFlushBudget = 10 * time.Second
 
-// stream opens one journal source and reads until it ends or an export fails.
-// On export failure the buffered entries are dropped; the caller restarts from
-// the committed cursor, re-reading them.
+// stream opens one journal source and reads until it ends, the source errors,
+// or ctx is done. An export failure does NOT end it: flushRetry keeps the batch
+// and retries it in place, so the entries are never re-read and the per-record
+// chain never runs over them twice.
 func (r *Reader) stream(ctx context.Context) error {
 	src, err := r.open(r.cfg, r.cursor)
 	if err != nil {
@@ -263,13 +256,14 @@ func (r *Reader) stream(ctx context.Context) error {
 	r.batchBytes = 0
 	r.batchCursor = ""
 	// The CONVERTED payload belongs to the batch just discarded, and must go
-	// with it: this restart re-reads those entries from the committed cursor
-	// (logchain.Pending's restart-clear case). This is the one place the pair
-	// may be cleared without a delivery — Run's no-cursor-yet branch
-	// deliberately keeps retrying r.pending INSTEAD of reopening, precisely
-	// because nothing could be re-read there.
+	// with it: this reopen re-reads those entries from the committed cursor
+	// (logchain.Pending's restart-clear case). Only a SOURCE failure gets here
+	// with anything buffered — an export failure retries in place — and even
+	// that path flushes first (the !ok arm below runs before the read error is
+	// returned), so the clear is normalisation rather than a live loss path. It
+	// stays because the alternative, a payload outliving the batch it describes,
+	// exports the PREVIOUS batch and then commits the NEW one's cursor.
 	r.pending.Discard()
-	r.lastFlush = time.Now()
 
 	// A reader goroutine bound to this source hands entries over so the flush
 	// ticker still fires while no entries arrive. It must stop before src.close
@@ -302,21 +296,38 @@ func (r *Reader) stream(ctx context.Context) error {
 	// Ensure the goroutine has fully exited before src.close runs.
 	defer func() { cancel(); <-done }()
 
+	// The ticker is the "flush at least this often" promise, and it is measured
+	// from the LAST FLUSH, not from the last tick: flushNow resets it after
+	// every flush, whatever triggered that flush. The guard this replaced —
+	// tick AND time.Since(lastFlush) >= FlushInterval, with lastFlush stamped
+	// after the flush completed — could never be satisfied on the tick it was
+	// meant for, because a fixed-period ticker fires exactly FlushInterval after
+	// the PREVIOUS TICK, which is microseconds BEFORE that interval has elapsed
+	// since the flush the tick caused. Every tick was therefore skipped and the
+	// flush landed on the next one: a measured 2.00x the configured interval
+	// (2s -> ~3.9s, 10s -> ~20s), for a flag documented as an upper bound.
 	ticker := time.NewTicker(r.cfg.FlushInterval)
 	defer ticker.Stop()
+	flushNow := func() error {
+		if err := r.flushRetry(ctx); err != nil {
+			return err
+		}
+		ticker.Reset(r.cfg.FlushInterval)
+		return nil
+	}
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-ticker.C:
-			if len(r.batch) > 0 && time.Since(r.lastFlush) >= r.cfg.FlushInterval {
-				if err := r.flush(ctx); err != nil {
+			if len(r.batch) > 0 {
+				if err := flushNow(); err != nil {
 					return err
 				}
 			}
 		case e, ok := <-entries:
 			if !ok {
-				if err := r.flush(ctx); err != nil {
+				if err := flushNow(); err != nil {
 					return err
 				}
 				select {
@@ -337,13 +348,13 @@ func (r *Reader) stream(ctx context.Context) error {
 			// (entries are never split), so one payload can exceed it by up
 			// to MaxEntryBytes.
 			if len(r.batch) > 0 && r.batchBytes+len(body) > r.cfg.MaxBatchBytes {
-				if err := r.flush(ctx); err != nil {
+				if err := flushNow(); err != nil {
 					return err
 				}
 			}
 			r.ingest(e, body, origLen)
 			if len(r.batch) >= r.cfg.BatchSize {
-				if err := r.flush(ctx); err != nil {
+				if err := flushNow(); err != nil {
 					return err
 				}
 			}
@@ -427,11 +438,71 @@ func (r *Reader) ingest(re rawEntry, body string, origLen int) {
 	r.batchBytes += len(body)
 }
 
-// flush exports the batch; on success the newest cursor is committed. A batch
-// the collector permanently rejects is dropped and its cursor committed too —
-// re-reading it forever (the restart path) would wedge the reader on one
-// poison batch. Transient failures return the error; the caller restarts from
-// the committed cursor.
+// flushRetry exports the batch, RETRYING THE SAME BATCH IN PLACE until it
+// settles (delivered, all-dropped, or permanently rejected) or ctx is done. It
+// is the only flush the read loop uses.
+//
+// Why in place rather than tearing the reader down and re-reading from the
+// committed cursor, which is what an export failure used to do:
+//
+// Re-reading rebuilds the batch, and rebuilding re-runs the per-record chain —
+// the log-metrics observations and the keep/drop rules. Delivery is
+// at-least-once and duplicate RECORDS are fine (the collector dedupes nothing,
+// but the data is the same); duplicate OBSERVATIONS are not, because a counter
+// or histogram the operator configured is cumulative. Measured on the shape
+// TestJournaldObservesOncePerDeliveryAcrossACollectorOutage drives — six
+// entries, a collector refusing eight attempts — the old restart-and-re-read
+// path counted 46 observations for those six entries and nine rule drops for
+// the one entry the rules actually dropped: the metric lying by ~8x at exactly
+// the moment it was being read to diagnose the outage, and worse the longer the
+// outage ran. Retrying in place converts once (logchain.Pending) and observes
+// once.
+//
+// The batch is bounded (BatchSize / MaxBatchBytes) and the journal is the
+// buffer behind it — the reader goroutine simply blocks handing over the next
+// entry — so holding it costs a bounded amount of memory and loses nothing: the
+// cursor is committed only on a successful export, so a crash mid-retry re-reads
+// from the journal exactly as a crash mid-stream would.
+//
+// The retry is deliberately unbounded. Giving up would mean discarding the
+// batch or advancing past it, and both are worse than waiting for a collector
+// that will come back; a genuinely undeliverable payload is the PERMANENT case,
+// which flush settles on its own.
+func (r *Reader) flushRetry(ctx context.Context) error {
+	bo := backoff.New(r.cfg.RestartBackoff)
+	for {
+		// A dead context is a SHUTDOWN, not a collector problem, and the check
+		// belongs at the TOP: backoff.Sleep returns EARLY when ctx is done, so
+		// without it the cancellation that ends the wait was immediately spent
+		// on one more ExportLogs that could only fail with context.Canceled —
+		// an attempt against a collector that was never asked, and a spike on
+		// kubescrape_journal_export_failures_total on every rolling update.
+		// Returning here leaves the batch and its rendered payload intact for
+		// Run's final flush, which carries them on a detached budgeted context.
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		err := r.flush(ctx)
+		if err == nil {
+			return nil
+		}
+		if ctx.Err() != nil {
+			// Cancelled DURING the export: that attempt really was made and its
+			// failure really was counted, so this arm only avoids the backoff.
+			return err
+		}
+		r.log.Warn("journal export failed; retrying the same batch (re-reading it would re-observe its log metrics)",
+			"entries", len(r.batch), "error", err, "backoff", bo.Delay())
+		bo.Sleep(ctx)
+	}
+}
+
+// flush exports the batch once; on success the newest cursor is committed. A
+// batch the collector permanently rejects is dropped and its cursor committed
+// too — retrying it forever would wedge the reader on one poison batch.
+// Transient failures return the error and leave the batch (and its converted
+// payload) intact for flushRetry; the only single-attempt caller is Run's final
+// flush, which has a budget to fit.
 func (r *Reader) flush(ctx context.Context) error {
 	if len(r.batch) == 0 {
 		return nil
@@ -455,7 +526,12 @@ func (r *Reader) flush(ctx context.Context) error {
 			r.settleBatch()
 			return nil
 		}
-		obs.LogExportFailures.Inc()
+		// The journal's OWN failure counter, not the tailer's
+		// kubescrape_log_export_failures_total: that one documents itself as
+		// "files rewound", and this reader rewinds no file — it does not even
+		// need -logs to be enabled, so on a journal-only agent every increment
+		// of it named a file that could not exist.
+		obs.JournalExportFailures.Inc()
 		return fmt.Errorf("exporting journal batch: %w", err)
 	}
 	// Delivered records, not ingested entries: the rules may have dropped some,
@@ -468,18 +544,24 @@ func (r *Reader) flush(ctx context.Context) error {
 // settleBatch clears the batch (releasing the bodies pinned by the backing
 // array), counts its truncations and commits its newest cursor.
 func (r *Reader) settleBatch() {
-	// Count truncations on SETTLE, not at read time: a batch whose export fails
-	// transiently is re-read from the committed cursor and re-sanitized, and
-	// settle is exactly where a batch stops being re-read, so a per-read counter
-	// would double-count while this cannot. It scans r.batch — every entry the
-	// batch held — so unlike JournalEntries (delivered records) it also counts a
-	// truncation on an entry the rules dropped or the collector permanently
-	// rejected: truncation is a read-side sanitation event and the rules run
-	// downstream of it. Counting after the successful export instead made the
-	// metric depend on BATCH COMPOSITION — the same cut message tallied or not
-	// according to whether some unrelated sibling entry survived the rules —
-	// and a journal the rules empty (the heavily-sampled node this feature
-	// exists for) reported no truncations at all.
+	// Truncations are counted on SETTLE because settle is the one point every
+	// terminal path meets — delivered, emptied by the rules, permanently
+	// rejected — and each batch reaches it exactly once. Counting after the
+	// SUCCESSFUL export instead made the metric depend on BATCH COMPOSITION:
+	// the same cut message was tallied or not according to whether some
+	// unrelated sibling entry survived the rules, and a journal the rules empty
+	// (the heavily-sampled node this feature exists for) reported no
+	// truncations at all. It scans r.batch — every entry the batch held — so
+	// unlike JournalEntries (delivered records) it also counts a truncation on
+	// an entry the rules dropped: truncation is a read-side sanitation event
+	// and the rules run downstream of it.
+	//
+	// This used to be argued from the transient-failure RE-READ, which a
+	// read-time counter would have double-counted. That path is gone — an
+	// export failure retries the same batch in place (flushRetry) and the
+	// entries are never re-read — so a read-time counter would now be correct
+	// too. The batch-composition argument above is the one that still holds,
+	// and it is why this did not move back.
 	truncated := 0
 	for i := range r.batch {
 		if r.batch[i].origLen > 0 {
@@ -494,7 +576,6 @@ func (r *Reader) settleBatch() {
 	r.batchBytes = 0
 	// The converted payload belongs to the batch that is now gone.
 	r.pending.Discard()
-	r.lastFlush = time.Now()
 	if r.batchCursor != "" {
 		r.cursor = r.batchCursor
 		r.saveCursor()

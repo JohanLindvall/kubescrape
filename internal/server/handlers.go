@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
 	"unicode/utf8"
 
@@ -50,6 +51,22 @@ func (s *Server) handleContainer(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "container id too long")
 		return
 	}
+	// …and the id that passed that check is a SLICE of the path: NormalizeContainerID
+	// returns what follows the last colon, so `<16 KB>:<64hex>` yields a 64-byte
+	// string whose backing array is the whole 16 KB. It outlives the release
+	// below — it is this handler's local for the whole wait AND the store's
+	// waiter-map key — so it is copied out here, where the length check has just
+	// bounded what the copy can cost.
+	id = strings.Clone(id)
+
+	// Everything this handler still needs from the request head has been read
+	// above, and both of its parking spots are below. Drop the rest before
+	// either: net/http's parse of a head expands it by 20-30x and the store's
+	// waiter cap is a COUNT, so a request that holds its parsed head across the
+	// wait budget makes that count bound a number rather than the process
+	// (releaseParkedHead carries the measurements). "id" is the route's wildcard
+	// (`GET /v1/containers/{id...}`), whose matched value is one of the copies.
+	releaseParkedHead(r, "id")
 
 	ctx, cancel := context.WithTimeout(r.Context(), wait)
 	defer cancel()
@@ -61,7 +78,12 @@ func (s *Server) handleContainer(w http.ResponseWriter, r *http.Request) {
 	// pod behind the Service can answer at once, unlike a sync that is merely
 	// slow.
 	if err := s.waitReady(ctx); err != nil {
-		if errors.Is(err, errDraining) {
+		// errDraining: the next pod behind the Service can answer at once.
+		// ErrTooManyWaiters: the blocked-lookup cap is saturated, exactly as it
+		// is when the store refuses below — same refusal, same signal to the
+		// agent's backoff. errNotSynced is the one that carries no Retry-After:
+		// this pod is merely still filling its caches.
+		if errors.Is(err, errDraining) || errors.Is(err, store.ErrTooManyWaiters) {
 			w.Header().Set("Retry-After", "1")
 		}
 		writeError(w, http.StatusServiceUnavailable, err.Error())

@@ -193,12 +193,23 @@ agent:
 
   # High-frequency cgroup sampling: read each container's cgroup every
   # `interval` and export the DISTRIBUTION of each scrapeInterval window —
-  # container_cpu_usage_{stddev,max,min} in cores and
-  # container_memory_working_set_bytes_{stddev,max,min}. The cadvisor scrape
-  # above reports one AVERAGE per window, so a container spiking to 4 cores for
-  # two seconds inside a 30s window is reported as ~0.27 cores; these six gauges
-  # per container recover the burst at roughly the cost of the cadvisor series
-  # they sit beside, instead of the 30x a 1s raw series would cost.
+  # container_cpu_usage_{stddev,max,min,mean,samples} in cores and
+  # container_memory_working_set_bytes_{stddev,max,min,mean,samples}. The
+  # cadvisor scrape above reports one AVERAGE per window, so a container spiking
+  # to 4 cores for two seconds inside a 30s window is reported as ~0.27 cores;
+  # these ten gauges per container recover the burst at roughly the cost of the
+  # cadvisor series they sit beside, instead of the 30x a 1s raw series would
+  # cost. (`_samples` is that window's own reading count: below 2 the four
+  # beside it are the previous window's, re-stated because one reading is not a
+  # distribution.)
+  #
+  # Measured against 200 real cgroup v2 scopes, sampler-on vs sampler-off in
+  # separate processes, eight pairs: 0.48% of one core (0.43-0.51%) and
+  # +5.5 MiB RSS (+4.7 to +6.3). The memory is the per-window EXPORT (pdata
+  # build, proto marshal, gzip) rather than anything retained — the sampler
+  # holds ~1.5 KiB per container — and it is a floor, not a steady state: a
+  # 300s window reads +7.2 MiB with the same retained heap, so leave headroom
+  # above the figure rather than sizing to it.
   #
   # Enabling this mounts the host's /sys/fs/cgroup READ-ONLY into the agent —
   # the sampler reads three files per container and writes nothing. Without that
@@ -226,9 +237,24 @@ agent:
     # of a signal re-states the last distribution measured rather than
     # publishing a one-sample one (the agent warns when the period is that
     # coarse). Below 100ms is refused, and below 500ms warns: a sweep is three
-    # cgroup reads per container on the goroutine that also tails this node's
+    # cgroup reads per container, on the process that also tails this node's
     # logs.
     interval: 1s
+    # How often the container set is re-read from the cgroup hierarchy.
+    #
+    # This is the pipeline's BLIND SPOT and the reason it is a value rather than
+    # a constant: discovery is the ONLY way into the sampled set, so a container
+    # that starts and exits between two passes is never sampled and leaves no
+    # trace that it existed. Measured at this 15s default, the share of
+    # containers with at least one exported window is 0% at a 2s lifetime, 20%
+    # at 5s, 53% at 10s, 87% at 15s and 100% from 17s up — this interval plus
+    # the two sampling periods a distribution needs. Lower it on nodes that run
+    # init containers, CronJob pods or crashloops.
+    #
+    # What it costs is the METADATA SERVICE, not this node: every pass re-offers
+    # each cgroup that has not resolved yet, and each pod contributes one that
+    # never will (its sandbox). Below 5s the agent warns; below 1s it refuses.
+    discoverInterval: 15s
     # cgroup v2 mount point INSIDE the agent container; empty means
     # /sys/fs/cgroup. Only the MOUNT POINT — the layout beneath it is
     # discovered, so kind's kubelet.slice nesting, a stock systemd node's

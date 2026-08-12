@@ -50,17 +50,18 @@ const (
 	// in aggregate.
 	maxSweepBudgetPerBatch = 16384
 
-	// sweepBudget bounds one TICKER Sweep call — cmd/kubescrape-agent's
-	// sweepServiceGraph, whose cadence is wait/2 clamped to [1s, 30s], i.e. 5s
-	// at the default 10s wait. Bounded for the same mutex reason.
+	// sweepBudget is the PER-LOCK-HOLD ceiling of the sweeps driven from outside
+	// Consume — the ticker's (cmd/kubescrape-agent's sweepServiceGraph, cadence
+	// wait/2 clamped to [1s, 30s], i.e. 5s at the default 10s wait) and the
+	// shutdown one. Bounded for the same mutex reason as maxSweepPerBatch, and
+	// bounded ONLY per hold: both spend it in as many passes as the backlog
+	// needs (see sweepDue).
 	//
-	// This loop is NOT what keeps up with ingest; the per-batch pass above is.
-	// It exists for the shard that has gone QUIET, where nothing is arriving to
-	// drive expiry and a client half that could still become a virtual-node edge
-	// would otherwise sit until the next busy batch — or, on a tier that
-	// quiesces overnight, until morning. At the default cadence it retires 1024
-	// half-edges every 5s, which drains a full 10k store in under a minute of
-	// silence.
+	// Those sweeps are NOT what keeps up with ingest; the per-batch pass above
+	// is. They exist for the shard that has gone QUIET, where nothing is
+	// arriving to drive expiry and a client half that could still become a
+	// virtual-node edge would otherwise sit until the next busy batch — or, on a
+	// tier that quiesces overnight, until morning.
 	sweepBudget = 1024
 )
 
@@ -252,23 +253,47 @@ func (p *Processor) Consume(td ptrace.Traces) {
 	}
 }
 
-// Sweep runs one bounded expiry pass. Safe to call periodically (and cheap when
-// nothing is due); the caller owns the cadence.
-func (p *Processor) Sweep() { p.store.expire(p.now(), sweepBudget) }
-
-// SweepAll expires everything DUE, in bounded passes, releasing the mutex
-// between them.
+// Sweep retires every half-edge whose Wait has ELAPSED, in bounded passes. Safe
+// to call periodically (and cheap when nothing is due); the caller owns the
+// cadence.
 //
-// For the SHUTDOWN sweep: that one is not keeping up with ingest, it is the
-// last chance to promote half-edges whose wait elapsed, and a bounded pass
-// silently discarded the remainder on a busy tier — the shutdown path claims
-// to emit them. Nothing is contending the mutex by then (the receivers have
-// joined), but the passes stay bounded so a pathological store cannot hold it
-// for an unbounded stretch inside the shutdown budget.
-func (p *Processor) SweepAll() {
-	now := p.now()
-	// expire returns how many it took; a short pass means nothing more is due
-	// at `now`, so the loop cannot spin.
+// Everything due, not one budget's worth of it. The cadence its caller picks is
+// a PROMISE about promotion delay — sweepInterval takes wait/2 so a promotable
+// half-edge reaches the graph within 1.5x wait — and one bounded pass per tick
+// keeps that promise only while fewer than sweepBudget halves are pending. Past
+// that the sweep is a RATE (sweepBudget per tick), so the delay grows with the
+// backlog instead of being bounded by it. The arithmetic at the defaults:
+// MaxItems 10,000 over sweepBudget 1,024 is ten ticks, and at DefaultWait 10s
+// the cadence is 5s, so the LAST due half-edge waited 45s past its deadline
+// against the 15s the cadence promises — and an operator raising MaxItems made
+// that worse without touching anything named like a deadline. The quiet shard is
+// the ONLY case this entry point exists for, so nothing else corrects it.
+//
+// What stays bounded is the LOCK HOLD: sweepDue spends the backlog in
+// sweepBudget-sized passes, releasing the pairing mutex between them, because
+// that mutex is the one every concurrent Consume needs and the one the sink
+// runs under (see metrics.go's render strategy).
+func (p *Processor) Sweep() { p.sweepDue(p.now()) }
+
+// SweepAll is Sweep under the name the SHUTDOWN path calls it by
+// (cmd/kubescrape-agent's stop sequence, after the receivers have joined). The
+// two were different functions while the ticker's pass was a single bounded one;
+// they are one function now, and the names are kept because the two call sites
+// mean different things by it: the ticker is keeping a promotion-delay promise,
+// the shutdown is taking the last chance to promote half-edges whose wait
+// elapsed — a bounded pass there silently discarded the remainder on a busy
+// tier, which the shutdown path claims to emit.
+func (p *Processor) SweepAll() { p.sweepDue(p.now()) }
+
+// sweepDue retires everything due at now, in passes of at most sweepBudget with
+// the pairing mutex released between them.
+//
+// The loop cannot spin: expire reports how many it retired, a short pass means
+// nothing more is due at THIS now, and nothing inserted while it runs can become
+// due at that same now (an entry is stamped its inserter's clock + wait, and
+// wait is always positive — Config.wait parses it under config.Positive and
+// falls back to DefaultWait).
+func (p *Processor) sweepDue(now time.Time) {
 	for p.store.expire(now, sweepBudget) == sweepBudget {
 	}
 }

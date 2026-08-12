@@ -127,6 +127,7 @@ kubescrape -listen :8080 -wait-timeout 5s -cache-ttl 5m -log-format json
 | `-kubeconfig` | — | kubeconfig path; defaults to in-cluster config, then `$KUBECONFIG` / `~/.kube/config` |
 | `-wait-timeout` | `5s` | default and maximum time a container lookup blocks waiting for metadata (`?wait=` can shorten per request, never lengthen) |
 | `-cache-ttl` | `5m` | how long metadata of deleted pods and replaced container IDs stays resolvable (tombstones) |
+| `-max-blocked-lookups` | `512` | how many container lookups may be blocked on `-wait-timeout` at once; past it `/v1/containers` answers 503 + `Retry-After` (counted `kubescrape_container_lookups_shed_total`) instead of parking another handler. **It is a memory bound wearing a count**: a parked lookup is an HTTP handler — two goroutines, their stacks, the connection buffers and the parsed request — held for the whole wait, on a route that is unauthenticated by design. Measured against a real listener: about 30 KiB for an agent's actual poll and 46 KiB for the worst shape the server's header bound admits, against a 64 KiB budget apiece — so the default spends 32 MiB, a quarter of the 128Mi the chart requests for this pod. (The budget is the arithmetic rather than the measurement: a parked lookup retains one ordinary poll plus, at most, one copy of the admitted head.) The same cap covers BOTH places a lookup parks — the per-ID waiters and the readiness wait during the initial informer sync. Legitimate demand is normally at most one blocked lookup per NODE, since the agent's tailer resolves on a single sweep goroutine and the cadvisor path never waits; the exception is an agent run with `-ingest-metadata-wait` (default 0, which blocks not at all), whose ingest handlers wait one lookup at a time per push and can add up to its own `-ingest-max-in-flight` (default 32). So a fleet larger than the default needs this raised — together with the pod's memory, by n x 64 KiB, since a cluster that big has outgrown the request the default was derived against. **Upgrade note:** this default was 16384 and is now 512, a 32x reduction, and the same budget now also covers the readiness park. Nothing warns on upgrade, so a cluster that was relying on the old headroom will start seeing retryable 503s where it previously parked: watch `kubescrape_container_lookups_shed_total` after upgrading and set this flag explicitly if it moves. The old value permitted several times the pod's entire memory request in parked requests alone, i.e. it could cause the eviction the cap exists to prevent. Reachable from the chart via `extraArgs` |
 | `-metadata-cache-ttl` | `10s` | `max-age` stamped on metadata responses (`Cache-Control` + `ETag`) so the agent's client caches lookups and revalidates with `If-None-Match`/304; 0 disables cache headers |
 | `-resync` | `0` | informer resync period (0 = watch stream only) |
 | `-apiserver-probe-interval` | `30s` | how often to check that the API server is still reachable **from this pod** (0 disables). This is the outage signal, and it exists because nothing else is one: readiness LATCHES once the initial sync completes (deliberately — an unready service is dropped from its Service endpoints, cutting every agent off a cache that is still serving useful data), and `kubescrape_informer_watch_errors_total` cannot be relied on to cover an unreachable server, because client-go treats a refused connection as retriable and retries the watch inside the reflector without ever returning an error to the handler the counter lives in — measured silent across four outage shapes up to five minutes. Each probe is one `limit=1` metadata list of namespaces (a resource the service already watches, so no extra RBAC) with no `resourceVersion`, so it fails when etcd does rather than being answered from the watch cache. It publishes `kubescrape_apiserver_reachable` (1/0) and `kubescrape_apiserver_probe_failures_total`, warns on the transition and re-warns on a throttle while the outage persists, and logs the recovery. **Alert on it sustained, not on a single failure**: the probe measures whether a NEW connection reaches the API server, which is neither proof that the informer caches are advancing (a blackholed established watch probes healthy) nor proof that they stopped (one failed probe may be a blip). Set to `0` to turn the steady-state list off entirely; reachable from the chart via `extraArgs` |
@@ -434,8 +435,11 @@ record attributes).
 | (`-enrich`) | `true` | per-message enrichment, same switch as container logs; an explicit level in the message wins over the journal priority |
 
 Delivery is at-least-once: the cursor is committed only after a successful
-export; on export failure or a reader error, it restarts from the committed
-cursor with backoff (re-reading anything in flight). The cursor is
+export. A READER error restarts from the committed cursor with backoff; an
+EXPORT failure retries the same batch in place and never re-reads it — re-reading
+rebuilds the batch, and rebuilding re-runs the per-record chain, which multiplied
+the log-metric and rules counters by the number of retries an outage spanned.
+The attempts are counted `kubescrape_journal_export_failures_total`. The cursor is
 persisted only through `-positions-file` (there is no standalone journald
 cursor file); without it, every start begins at the journal tail.
 
@@ -1715,6 +1719,7 @@ cgroup pod UID.
 |---|---|---|
 | `-cgroup-stats` | `false` | sample container cgroups directly and export the distribution of each `-scrape-interval` window |
 | `-cgroup-stats-interval` | `1s` | sampling period; must be well below `-scrape-interval` |
+| `-cgroup-stats-discover-interval` | `15s` | how often the container set is re-read from the hierarchy; the blind spot for short-lived containers |
 | `-cgroup-stats-root` | — | cgroup v2 mount point; empty autodetects `/sys/fs/cgroup` |
 
 The cadvisor scrape above reads a cumulative counter once per
@@ -1724,14 +1729,25 @@ reported as ~0.13 cores. Shipping 1s raw series instead would restore the
 signal at 30-60x the egress.
 
 `-cgroup-stats` samples each container's own cgroup at
-`-cgroup-stats-interval` and exports six gauges per container per window,
+`-cgroup-stats-interval` and exports ten gauges per container per window,
 named in cadvisor's Prometheus style so they sit beside the series they
 explain:
 
 | Metric | Unit |
 |---|---|
-| `container_cpu_usage_stddev` / `_max` / `_min` | cores (the *rate* of `cpu.stat`'s `usage_usec`, hence no `_seconds` in the name) |
-| `container_memory_working_set_bytes_stddev` / `_max` / `_min` | bytes (`memory.current − inactive_file`, cadvisor's own definition) |
+| `container_cpu_usage_stddev` / `_max` / `_min` / `_mean` | cores (the *rate* of `cpu.stat`'s `usage_usec`, hence no `_seconds` in the name) |
+| `container_cpu_usage_samples` | readings taken this window |
+| `container_memory_working_set_bytes_stddev` / `_max` / `_min` / `_mean` | bytes (`memory.current − inactive_file`, cadvisor's own definition) |
+| `container_memory_working_set_bytes_samples` | readings taken this window |
+
+`_mean` and `_samples` exist because the other four are not interpretable
+alone. cadvisor's CPU *counter* yields the window mean as a `rate()`, but its
+`container_memory_working_set_bytes` is a gauge sampled once per scrape, so the
+average working set was available nowhere; and `-cadvisor=false` (or a failing
+kubelet scrape) removes the CPU one too. `_samples` is **this** window's own
+reading count, so a value below 2 says the four statistics beside it are the
+previous window's, re-stated (see the sparse-window hold below) — the one thing
+the six-gauge set could not tell you about a single container.
 
 The resource attributes are built by the same code that builds a cadvisor
 row's, so the two join on `job`/`instance`. The standard deviation is the
@@ -1758,6 +1774,21 @@ Requirements and refusals:
 * The layout below the mount point is **discovered**, so kind's
   `kubelet.slice` nesting, a stock systemd node's `kubepods.slice` and a
   cgroupfs-driver node's `kubepods` all work with `-cgroup-stats-root` unset.
+* **Short-lived containers are missed, and the miss is not fully countable.**
+  Discovery is the only way into the sampled set, so a container that starts
+  and exits between two `-cgroup-stats-discover-interval` passes is never
+  sampled — and its cgroup directory is created and removed inside the
+  interval, so nothing is left to count it by. Measured capture at the 15s
+  default, by container lifetime (6000 trials, following (L-2)/15): 0% at 2s,
+  20% at 5s, 53% at 10s, 87% at 15s, 100% from 17s up.
+  cadvisor's housekeeping has the same blind spot for the same reason. Lower
+  the interval to catch init containers, CronJob pods and crashloops; the
+  price is a directory walk plus one metadata lookup per still-unresolved
+  cgroup per pass, which for the first three minutes of a pod's life includes
+  its permanently unresolvable sandbox cgroup. The half that IS countable is
+  `kubescrape_cgroup_windows_dropped_total{reason="too_short"}`: a container
+  seen and then gone before it produced two samples of anything — a lower
+  bound on what a shorter interval would recover.
 * **A sparse window holds the last value, at most twice.** A CPU rate needs
   two readings and the working-set gauge needs two for a distribution, so a
   window that collected fewer re-emits that signal's previous distribution
@@ -1772,6 +1803,16 @@ Requirements and refusals:
   because a resource attribute would fork the derived job/instance and a
   data-point attribute would break the cadvisor join for exactly the windows
   that are held.
+* **These gauges are built by the `cadvisor` resource-attribute pipeline**, not
+  by one of their own. That is deliberate and load-bearing: the whole point of
+  these series is to sit beside the cadvisor series for the same
+  `container.id`, and a join works only while both resources carry a
+  byte-identical attribute set — so they are built through the same
+  `Scraper.FillContainerResource` the cadvisor batcher uses, and they read
+  `resourceAttributes.pipelines.cadvisor` with it. The consequence to know
+  before you edit that section: a template, an `enable`/`disable` entry or an
+  `instancePrefix` set there moves BOTH, and setting one for the cgroup gauges
+  alone is not expressible — it would break the join it exists to serve.
 * A container that VANISHES flushes its final window and is then retired, so
   an OOM-killed container's burst is exported rather than discarded — that
   case is the reason the feature exists. That final flush is never a held

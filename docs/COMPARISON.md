@@ -230,9 +230,22 @@ Kubernetes-shaped exposition):
 
 The full kubescrape pipeline outruns the reference parser doing strictly less
 work (Prometheus still has relabeling + append ahead at that point). Parse
-alone: 552 MB/s, 21 allocs per 10k-series scrape, constant memory.
+alone: 552 MB/s, 2 allocs per 10k-series scrape, constant memory. (The 21 this
+said until 2026-08 predated the last-seen memcmp caches and the pooled
+parser/reader; the allocation count is machine-independent, the throughput is
+not.) **Every MB/s figure on this page came from one machine in one sitting**,
+which is what makes the comparison meaningful — the same corpus, the same box,
+the same afternoon. Only the RATIOS travel: re-measuring parse alone on other
+hardware has read 233 and 368 MB/s against the 552 here, so treat a lower
+absolute on your own machine as a different CPU, not a regression, and
+re-measure the comparators beside it before concluding anything.
 
-**Log-derived metrics**: 229–270 ns/line, ≤1 alloc — µs-scale in the
+**Log-derived metrics**: ≤1 alloc where the keys resolve through the caller's
+bound closures or off a logfmt line, 3 on the JSON fallback (`GetPaths` into
+the reused `Fields` buffer — a small constant, not a function of the line's
+field count), 0 on a line matching no rule; per-line time is hardware-relative
+like the throughputs above (sub-µs through the bound closures, 1.4-1.8 µs on the
+logfmt and JSON fallbacks on the machine this paragraph was last checked on) — µs-scale in the
 comparators (Promtail metrics stage, Vector log_to_metric).
 
 **Cluster-scoped pipelines** (the events/Azure singleton, same committed

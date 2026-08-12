@@ -278,9 +278,13 @@ var (
 
 	// The high-frequency cgroup sampler. Off by default: it needs a host mount
 	// the other pipelines do not, and it adds a metric family per container.
-	cgroupStatsOn = flag.Bool("cgroup-stats", false, "sample container cgroups directly every -cgroup-stats-interval and export the DISTRIBUTION (stddev/max/min of the CPU rate and the memory working set) of each -scrape-interval window. The cadvisor scrape reports one average per window, so a container spiking to 4 cores for 2s inside a 60s window reads as ~0.13 cores; this recovers that at six gauges per container instead of 60x the raw series. Requires the host's /sys/fs/cgroup mounted read-only (the shipped DaemonSet and the chart do so behind this flag) and cgroup v2 — a v1 node logs an error naming the version and this flag, disables this pipeline alone and keeps the others running, rather than misreading v1's nanosecond CPU counters or CrashLooping the node's log shipping over a metric. Only containers the metadata service can place are exported (a series with no service.name joins nothing), which is also what keeps each pod's sandbox cgroup out")
+	cgroupStatsOn = flag.Bool("cgroup-stats", false, "sample container cgroups directly every -cgroup-stats-interval and export the DISTRIBUTION (stddev/max/min/mean plus the sample count, for the CPU rate and the memory working set) of each -scrape-interval window. The cadvisor scrape reports one average per window, so a container spiking to 4 cores for 2s inside a 60s window reads as ~0.13 cores; this recovers that at ten gauges per container instead of 60x the raw series. Requires the host's /sys/fs/cgroup mounted read-only (the shipped DaemonSet and the chart do so behind this flag) and cgroup v2 — a v1 node logs an error naming the version and this flag, disables this pipeline alone and keeps the others running, rather than misreading v1's nanosecond CPU counters or CrashLooping the node's log shipping over a metric. Only containers the metadata service can place are exported (a series with no service.name joins nothing), which is also what keeps each pod's sandbox cgroup out. Measured against 200 real cgroup v2 scopes, sampler-on vs sampler-off in separate processes, eight pairs: 0.48% of one core (0.43-0.51%) and +5.5 MiB RSS (+4.7 to +6.3) — the sampler's own cost, excluding the metadata lookups the -cadvisor pipeline's one-minute cache already pays for. The memory is the per-window export (pdata build, proto marshal, gzip) rather than retention — the sampler holds ~1.5 KiB per container — and it is a floor: a 300s window reads +7.2 MiB with the same retained heap")
 	cgroupStatsIv = flag.Duration("cgroup-stats-interval", cgroupstats.DefaultInterval, "sampling period for -cgroup-stats. Shorter catches shorter bursts and costs three cgroup file reads per container per period; it must be well below -scrape-interval, which is the window the distribution describes, and at least 100ms")
-	cgroupRoot    = flag.String("cgroup-stats-root", "", "cgroup v2 mount point for -cgroup-stats (empty autodetects /sys/fs/cgroup). Only the MOUNT POINT: the layout beneath it is discovered, so kind's kubelet.slice nesting, a stock systemd node's kubepods.slice and a cgroupfs-driver node's kubepods all work unconfigured")
+	// The blind spot this flag exists for is stated in the help, because it is
+	// not visible anywhere else: a container that starts and exits between two
+	// passes is never sampled and leaves nothing behind to count.
+	cgroupDiscoverIv = flag.Duration("cgroup-stats-discover-interval", cgroupstats.DefaultDiscoverInterval, "how often -cgroup-stats re-reads the container set from the cgroup hierarchy. Discovery is the ONLY way into the sampled set, so a container that starts and exits between two passes is never sampled and leaves NO trace that it existed — measured at the 15s default (6000 trials per lifetime, the container's start a continuous random phase), the share of containers with at least one exported window is 0% at a 2s lifetime, 20% at 5s, 53% at 10s, 87% at 15s and 100% from 17s up — one discovery period plus the two sampling periods a distribution needs (cadvisor's housekeeping has the same blind spot for the same reason). Lower it to catch init containers, CronJob pods and crashloops, at the price of a directory walk plus one metadata lookup for every cgroup that has not resolved yet — which for the first three minutes of a pod's life includes its sandbox cgroup, one per pod, permanently unresolvable. One CORNER of the loss is countable: kubescrape_cgroup_windows_dropped_total{reason=\"too_short\"} counts a container the sampler had descriptors open on that vanished before two readings, which is 13% of containers at every lifetime up to 15s — two sampling periods out of each discovery period, real evidence that a shorter interval would recover something, and a weak lower bound on how much")
+	cgroupRoot       = flag.String("cgroup-stats-root", "", "cgroup v2 mount point for -cgroup-stats (empty autodetects /sys/fs/cgroup). Only the MOUNT POINT: the layout beneath it is discovered, so kind's kubelet.slice nesting, a stock systemd node's kubepods.slice and a cgroupfs-driver node's kubepods all work unconfigured")
 
 	// OTLP ingest (apps push telemetry to the local agent for enrichment).
 	// LOGS AND METRICS ONLY: traces are received by the -service-graph tier,
@@ -1041,11 +1045,13 @@ func run() error {
 		// the pairing state is in-memory and worth no more than the wait window
 		// that bounds it.
 		if p.serviceGraphProc != nil {
-			// SweepAll, not Sweep: the bounded per-pass budget is sized for the
-			// ingest path, where it protects a mutex every concurrent Consume
-			// needs. Here the receivers have joined and this is the last chance
-			// to promote what is due, so a capped pass silently discarded the
-			// remainder on a busy tier — edges the shutdown path claims to emit.
+			// SweepAll is the name the shutdown path spells this by; it and
+			// Sweep are one function now, since the ticker's pass had the same
+			// bug and got the same fix. So this is no longer a choice between
+			// two behaviours — what it asks for is the behaviour BOTH have: a
+			// drain of everything due, in bounded lock holds. A pass capped at
+			// one hold silently discarded the remainder on a busy tier, and
+			// those are edges the shutdown path claims to emit.
 			p.serviceGraphProc.SweepAll()
 		}
 		fctx, cancel := stepCtx(stepBudget())
@@ -1430,10 +1436,11 @@ func (p *pipelines) startCgroupStats(ctx context.Context, sc *promscrape.Scraper
 		})
 	}
 	s, err := cgroupstats.New(cgroupstats.Config{
-		Root:     *cgroupRoot,
-		Interval: *cgroupStatsIv,
-		Resolver: resolver,
-		Logger:   p.log,
+		Root:             *cgroupRoot,
+		Interval:         *cgroupStatsIv,
+		DiscoverInterval: *cgroupDiscoverIv,
+		Resolver:         resolver,
+		Logger:           p.log,
 	})
 	switch {
 	case errors.Is(err, cgroupstats.ErrUnsupportedNode):
@@ -1468,8 +1475,11 @@ func (p *pipelines) startCgroupStats(ctx context.Context, sc *promscrape.Scraper
 		// retry policy).
 		s.Run(transform.Handoff(ctx), p.out, *scrapeInterval)
 	})
-	p.log.Info("cgroup sampler started", "root", s.Root(), "interval", *cgroupStatsIv,
-		"window", *scrapeInterval, "cgroups", s.Discovered())
+	// The EFFECTIVE periods, not the flag values: New clamps a sub-floor one,
+	// and the line that says what this pipeline is doing must not report what
+	// was asked for instead.
+	p.log.Info("cgroup sampler started", "root", s.Root(), "interval", s.Interval(),
+		"discoverInterval", s.DiscoverInterval(), "window", *scrapeInterval, "cgroups", s.Discovered())
 	return nil
 }
 

@@ -24,18 +24,134 @@ import (
 	"github.com/JohanLindvall/kubescrape/pkg/kubemeta/kubeconvert"
 )
 
-// defaultMaxWaiters bounds the number of concurrently blocked GetContainer
-// calls. Each waiter pins a map entry (keyed by a client-chosen string) and a
-// parked HTTP handler for up to the wait budget, so without a cap a hostile
-// client posting distinct garbage IDs could grow the waiter map without
-// bound. The cap is far above what a legitimate agent fleet produces (agents
-// wait only for containers starting on their own node).
-const defaultMaxWaiters = 16384
+// The blocked-lookup cap is a MEMORY budget expressed in waiters.
+//
+// A parked GetContainer is not a map entry. The map entry is the cheapest part
+// of it: what it holds for the whole wait budget is a parked HTTP handler — two
+// goroutines and their stacks, the connection's read and write buffers, the
+// request state (including the parsed header map) and one file descriptor.
+//
+// A count is the right MECHANISM, but only while each waiter costs about the
+// same — and the sender picks part of that cost unless something takes it away.
+// Measured against a real listener with lookups parked on
+// `/v1/containers/{id}?wait=`, as retained HEAP after a GC plus a flat 16 KiB
+// per waiter for the goroutines net/http parks with it. The stack is ALLOWED
+// FOR rather than measured because the runtime pools freed stacks, so
+// MemStats.StackInuse cannot be attributed to one measurement — the same
+// 200-waiter poll reported between 1.1 and 10.5 KB per waiter while its heap
+// figure moved by 532 B (internal/server's parkedStackAllowance carries the
+// derivation; overstating it can only make the assertions stricter):
+//
+//	an agent's actual poll                                   30 KB
+//	the worst shape it now admits, measured                  46 KB
+//	that shape's BOUND: a poll plus one admitted head        47 KB   <- budgeted
+//	a 16 KB URI of %-escapes, with the URI HELD               63 KB
+//	the widest header block, with the whole head HELD        266 KB
+//	the same at net/http's 1 MiB default                >= 4.09 MB
+//
+// The measured worst and the budgeted bound nearly coincide because they are
+// the same case: the worst shape is the one that gets a whole admitted head
+// retained, so the arithmetic and the measurement meet. That is the bound
+// working, not a coincidence.
+//
+// The budgeted row is the ARITHMETIC, not the measurement: the measurement
+// moves several KB run to run and with the toolchain, and what cannot move is
+// that a parked lookup retains an ordinary poll plus, at most, one copy of the
+// head that was admitted.
+//
+// That is the whole reason WaiterCostBytes cannot be derived from anything this
+// package allocates. The bottom three rows are what internal/server had to fix
+// and how: net/http's parse expands a request head by 20 to 30 times, and most
+// of that expansion cannot be counted from the request it hands the handler (it
+// deletes Host/Transfer-Encoding/Trailer from the map, and net/textproto
+// pre-sizes the map from a peek at the LINE count, so the capacity outlives the
+// deletions; and the request LINE is one string that r.Method, r.RequestURI and
+// r.URL.RawPath are all SLICES of, with two more unescaped copies made for a
+// path carrying a %-escape). So the head is RELEASED before the handler parks
+// (internal/server's releaseParkedHead), which makes the parked cost a property
+// of this process rather than of the request.
+// internal/server/waitercost_test.go re-measures it against a real listener and
+// fails if it outgrows WaiterCostBytes.
+//
+// What is left is ONE copy of the wire, which is why the budget can be stated
+// at all: whatever the sender spends its head on, the retained residue is
+// either the request line (which http.conn.lastMethod holds for the life of the
+// connection, out of any handler's reach) or the If-None-Match validator (kept
+// on purpose), and they share the one admission rather than adding to it. That
+// admission is ~16 KB, not the 8 KiB MaxHeaderBytes nor the 12 KiB a fresh
+// connection is held to: a head arriving on a REUSED connection is partly
+// pre-buffered by the previous request's read and never charged (measured
+// 16350 admitted, 16351 refused; internal/server's maxHeaderBytes carries the
+// mechanism, and its waitercost_test.go re-derives the number).
+//
+// The cap then has to be CHOSEN against that cost, and the historical 16384 was
+// not: the shipped chart requests 128Mi for this pod and sets no limit
+// (charts/kubescrape/values.yaml), so 16384 permitted several times the pod's
+// entire request in parked requests alone — node memory pressure and an
+// eviction, which is the outcome the cap exists to prevent, reached by way of
+// the cap itself. So the default is a division:
+//
+//	WaiterBudgetBytes / WaiterCostBytes = 512 waiters
+//
+// What the cap costs when it binds: a LEGITIMATE blocked lookup is one node
+// agent's tailer waiting out the ~1s gap between a container starting and the
+// kubelet posting its ID. On the DEFAULT agent configuration there is at most
+// one of those per node — the tailer resolves on ONE sweep goroutine, and the
+// cadvisor path never waits. The exception is an agent run with
+// `-ingest-metadata-wait` (default 0, which blocks not at all): its ingest
+// handlers wait too, one lookup at a time per push, so that agent can add up to
+// its own `-ingest-max-in-flight` (default 32) blocked lookups on top. So the
+// default binds when hundreds of nodes sit in that window at the same instant —
+// far sooner if the fleet waits on ingest — and what it costs there is bounded
+// and retryable: 503 +
+// Retry-After, counted kubescrape_container_lookups_shed_total, and the agent's
+// metadata backoff re-asks. A few seconds of one file's log shipping, never
+// data.
+//
+// A cluster big enough to reach it has also outgrown the 128Mi this budget is a
+// quarter of — the records in THIS package measured 3.2 KB per pod (20k
+// two-container pods with ordinary labels, annotations and statuses), with the
+// informer's own trimmed copy on top — so raising it is one
+// half of a pair: `-max-blocked-lookups n` on the service, and n x
+// WaiterCostBytes more memory on the pod. That flag, not this constant, is the
+// knob; the constant only says what the DEFAULT pod can afford.
+const (
+	// WaiterCostBytes is what one parked lookup is budgeted at. The worst case
+	// admissible today is 47 KB — an ordinary poll plus one copy of the ~16 KB
+	// head a reused connection admits, whichever term the sender spends it on —
+	// against 30 KB for an ordinary agent poll, both on a keep-alive connection,
+	// which is the shape every agent's net/http.Transport uses and the shape
+	// that admits the most wire (the worst shape MEASURES 46 KB; 47 is the bound
+	// it cannot pass). This covers the worst with the ~1.2x
+	// RSS overhead measured alongside it (RSS is what gets a pod evicted) and
+	// then some. The headroom is deliberately not spent: the worst case was
+	// 51 KB when this number was chosen, and re-dividing the budget on every
+	// measurement would move -max-blocked-lookups' default — which is a
+	// documented operational number — for a memory saving nobody asked for.
+	WaiterCostBytes = 64 << 10
+	// WaiterBudgetBytes is what parked lookups on an unauthenticated route may
+	// occupy in total: a quarter of the 128Mi the chart requests for this pod,
+	// leaving the store, the informer caches and Go's own slack the rest. In
+	// TOTAL means both parking spots — this package's per-ID waiters and
+	// internal/server's readiness wait, which draws on the same cap through
+	// TryPark; a budget covering one of the two would be spent twice.
+	WaiterBudgetBytes = 32 << 20
+	// DefaultMaxWaiters bounds concurrently blocked container lookups — the
+	// waiters here and the readiness parks together — unless
+	// -max-blocked-lookups overrides it.
+	DefaultMaxWaiters = WaiterBudgetBytes / WaiterCostBytes
+)
 
 // maxWaiterIDLen bounds the container-ID strings held as waiter keys
 // (kubemeta.MaxContainerIDLen carries the 64-hex-runtime rationale). Lookups
 // over the bound degrade to a non-blocking miss — never an error, and never a
 // pinned map entry.
+//
+// It bounds LENGTH, which is not the whole of what a key can cost: a short id
+// CUT OUT of a long string (a slice, which in Go keeps the whole backing array
+// alive) pins that string for as long as the waiter lives. Callers that derive
+// an id from request text must copy it, which is what internal/server's
+// handleContainer does before this package ever sees it.
 const maxWaiterIDLen = kubemeta.MaxContainerIDLen
 
 // ErrTooManyWaiters reports that a container lookup was shed because the
@@ -55,8 +171,10 @@ type Store struct {
 	ttl time.Duration
 	now func() time.Time
 
-	// maxWaiters caps concurrently blocked GetContainer calls (see
-	// defaultMaxWaiters); SetMaxWaiters overrides it (tests, tuning).
+	// maxWaiters caps concurrently blocked container lookups — the GetContainer
+	// waiters below and the caller's readiness parks (TryPark) together — as a
+	// memory budget expressed in waiters, see DefaultMaxWaiters; SetMaxWaiters
+	// overrides it (tests, tuning).
 	maxWaiters int
 
 	mu          sync.RWMutex
@@ -88,6 +206,15 @@ type Store struct {
 	// keys (bounded by maxWaiters).
 	waiters  map[string][]chan struct{}
 	nWaiters int
+	// nExternal counts blocked container lookups parked OUTSIDE this store —
+	// internal/server's waitReady, which holds the request for its whole wait
+	// budget while the informer caches are unsynced. They cost the same parked
+	// handler as a waiter here and they are the same route, so they spend the
+	// same budget: the cap below is applied to nWaiters+nExternal, and TryPark
+	// is how the other spot draws on it. Without that the cap covered whichever
+	// spot happened to be in use, which is the wrong one — the readiness park is
+	// STARTUP, when a whole agent fleet is likeliest to be asking at once.
+	nExternal int
 	// draining is set once by Drain and never cleared: after it, no lookup may
 	// park, because the informers are stopping and the ID it would wait for can
 	// never be indexed. A parked lookup that is not woken here is still parked
@@ -152,7 +279,7 @@ func New(ttl time.Duration) *Store {
 	return &Store{
 		ttl:         ttl,
 		now:         time.Now,
-		maxWaiters:  defaultMaxWaiters,
+		maxWaiters:  DefaultMaxWaiters,
 		pods:        make(map[types.UID]*record),
 		byContainer: make(map[string]*containerEntry),
 		byNode:      make(map[string]map[types.UID]*record),

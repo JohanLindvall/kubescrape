@@ -585,32 +585,135 @@ func TestConsumeMaxItemsDrops(t *testing.T) {
 	}
 }
 
-// Sweep is bounded per call: it holds the mutex every concurrent Consume needs,
-// so it may never drain an arbitrarily deep store in one go.
-func TestSweepIsBounded(t *testing.T) {
-	p, _, clock := newTestProcessor(t, Config{Wait: "1s", MaxItems: sweepBudget * 2})
-	total := sweepBudget + 100
+// One ticker Sweep must retire everything DUE, not sweepBudget of it.
+//
+// The cadence its caller picks is a promise: sweepInterval takes wait/2 so a
+// promotable half-edge reaches the graph within 1.5x wait. One bounded pass per
+// tick keeps that promise only while fewer than sweepBudget halves are pending —
+// past that the sweep is a RATE, and the delay grows with the backlog: a full
+// default store (MaxItems 10,000, sweepBudget 1,024) is ten ticks, so at the
+// default 5s cadence its last due half-edge waits 45s against a promised 15s.
+// The quiet shard this entry point exists for is where nothing else corrects it.
+func TestSweepDrainsEverythingDue(t *testing.T) {
+	p, sink, clock := newTestProcessor(t, Config{Wait: "1s", MaxItems: sweepBudget * 4})
+	total := sweepBudget*2 + 100
 	spans := make([]sgSpan, total)
 	for i := range spans {
 		// Both ids start at 1: a zero trace id is unkeyable by design, and so is
 		// a zero SPAN id on a client half (it would key where every root server
 		// span of its trace keys). Either would be skipped rather than stored.
+		// peer.service makes each half PROMOTABLE, so the drain is observable as
+		// virtual-node edges reaching the sink and not merely as an empty store.
 		spans[i] = sgSpan{kind: ptrace.SpanKindClient, dur: 0.1,
-			traceID: traceID(byte(i/200) + 1), spanID: spanID(byte(i%200) + 1)}
+			traceID: traceID(byte(i/200) + 1), spanID: spanID(byte(i%200) + 1),
+			attrs: map[string]string{"peer.service": "orders"}}
 	}
 	// Distinct keys: 200 span ids x ceil(total/200) trace ids.
 	p.Consume(sgTraces("checkout", spans...))
 	if s := p.Stats(); s.Items != total {
 		t.Fatalf("items = %d, want %d distinct keys", s.Items, total)
 	}
+
 	*clock = t0.Add(time.Second)
 	p.Sweep()
-	if s := p.Stats(); s.Items != 100 {
-		t.Fatalf("items = %d after one Sweep, want exactly %d retired", s.Items, sweepBudget)
-	}
-	p.Sweep()
 	if s := p.Stats(); s.Items != 0 {
-		t.Fatalf("items = %d after the second Sweep, want 0", s.Items)
+		t.Fatalf("items = %d after one Sweep, want 0: %d of %d due half-edges wait for a later tick, "+
+			"so the promotion delay is a rate rather than the 1.5x wait the cadence promises",
+			s.Items, s.Items, total)
+	}
+	if len(sink.edges) != total {
+		t.Fatalf("sink got %d edges, want %d: the drained halves must reach the graph as virtual nodes", len(sink.edges), total)
+	}
+}
+
+// …and the drain it does that with is spent in bounded LOCK HOLDS. The mutex
+// sweepDue takes is the one every concurrent Consume needs and the one the sink
+// runs under, so the drain above may not become one long hold: an operator who
+// raises MaxItems would otherwise be lengthening a stall on the ingest path.
+//
+// It is pinned by OBSERVING THE RELEASE, not by calling expire with a budget and
+// checking that expire honours it — that is expire's own contract and
+// TestStoreExpireIsBounded already owns it, and a test spelled that way passes
+// unchanged when sweepDue stops passing a budget at all (which is exactly how
+// this test's predecessor failed to police the thing it was named after).
+//
+// The observable is kubescrape_service_graph_expired_total, and it is exact
+// rather than timing-dependent: expire bumps it with the pass's count AFTER
+// sweep has returned, i.e. strictly between two holds and never inside one. So
+// the value the sink reads while an edge is being emitted names the hold that
+// edge belongs to, and the edge index at which it first moves IS the size of the
+// first hold. A drain that never released the mutex would emit every edge under
+// one unchanged reading.
+func TestSweepReleasesTheMutexEveryBudget(t *testing.T) {
+	total := sweepBudget*2 + 100
+	p := NewProcessor(Config{Wait: "1s", MaxItems: total * 2}, discardLog())
+	clock := t0
+	p.now = func() time.Time { return clock }
+	sink := &passWatchSink{}
+	p.SetSink(sink)
+
+	p.Consume(unpairableClientSpans(0, total))
+	if s := p.Stats(); s.Items != total {
+		t.Fatalf("items = %d, want %d distinct keys", s.Items, total)
+	}
+
+	sink.watch = true
+	base := obs.ServiceGraphExpired.Value()
+	clock = t0.Add(time.Second)
+	p.Sweep()
+
+	if len(sink.seen) != total {
+		t.Fatalf("sink saw %d edges, want %d", len(sink.seen), total)
+	}
+	// seen[i] is the counter as edge i+1 was emitted, so the first index whose
+	// reading has moved off `base` is the number of edges the first hold retired.
+	first := len(sink.seen)
+	for i, v := range sink.seen {
+		if v != base {
+			first = i
+			break
+		}
+	}
+	if first == len(sink.seen) {
+		t.Fatalf("all %d retirements happened inside ONE lock hold: a deep store stalls every "+
+			"concurrent Consume, and the sink, for the whole drain", total)
+	}
+	if first != sweepBudget {
+		t.Fatalf("the first lock release came after %d retirements, want sweepBudget = %d: "+
+			"the per-hold ceiling is not the constant that documents it", first, sweepBudget)
+	}
+}
+
+// passWatchSink records, for every edge the store emits, the expiry counter as
+// it stood inside that hold. Called only from the sweeping goroutine, under the
+// pairing mutex.
+type passWatchSink struct {
+	watch bool
+	seen  []float64
+}
+
+func (s *passWatchSink) Record(Edge) {
+	if s.watch {
+		s.seen = append(s.seen, obs.ServiceGraphExpired.Value())
+	}
+}
+
+// A sweep retires only what is DUE. The FIFO is expiry-ordered, so the pass
+// stops at the first entry whose wait has not elapsed — draining past it would
+// destroy half-edges whose partner is still legitimately in flight.
+func TestSweepLeavesUndueHalvesAlone(t *testing.T) {
+	p, sink, clock := newTestProcessor(t, Config{Wait: "10s", MaxItems: 100})
+	p.Consume(unpairableClientSpans(0, 10))
+	*clock = t0.Add(5 * time.Second) // half a wait later
+	p.Consume(unpairableClientSpans(10, 10))
+
+	*clock = t0.Add(11 * time.Second) // the first ten are due, the second ten are not
+	p.Sweep()
+	if s := p.Stats(); s.Items != 10 {
+		t.Fatalf("items = %d after Sweep, want the 10 not-yet-due halves left", s.Items)
+	}
+	if len(sink.edges) != 10 {
+		t.Fatalf("sink got %d edges, want 10", len(sink.edges))
 	}
 }
 

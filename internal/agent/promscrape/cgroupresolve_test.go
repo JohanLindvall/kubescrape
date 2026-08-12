@@ -21,7 +21,7 @@ import (
 // resourceAttrs flattens a resource for comparison.
 func resourceAttrs(res pcommon.Resource) map[string]any { return res.Attributes().AsRaw() }
 
-// FillContainerResource exists so internal/agent/cgroupstats' six gauges JOIN
+// FillContainerResource exists so internal/agent/cgroupstats' ten gauges JOIN
 // the cadvisor series they explain, and joining is decided entirely by whether
 // the two resources carry the same attributes — the OTLP→Prometheus translation
 // derives `job` and `instance` from them. This is the assertion that says so:

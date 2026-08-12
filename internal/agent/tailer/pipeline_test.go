@@ -437,7 +437,7 @@ func TestIngestFlushAllocationBudget(t *testing.T) {
 	})
 	if allocs > 4 {
 		t.Fatalf("the flush path allocates %v times per line, want <= 4 "+
-			"(BenchmarkIngestFlush/enrich reports 2 allocs/op)", allocs)
+			"(BenchmarkIngestFlush/enrich reports 4 allocs/op)", allocs)
 	}
 }
 

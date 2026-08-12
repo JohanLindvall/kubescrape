@@ -25,8 +25,8 @@ func discoveredIDs(t *testing.T, root string) []string {
 	return ids
 }
 
-// The kind layout is the one the orchestrator verified on a live node, and the
-// one a hardcoded /sys/fs/cgroup/kubepods.slice would miss entirely.
+// The kind layout is the one verified on a live node, and the one a hardcoded
+// /sys/fs/cgroup/kubepods.slice would miss entirely.
 func TestDiscoverKindNestedLayout(t *testing.T) {
 	root := newRoot(t)
 	a, b := hexID(1), hexID(2)
@@ -184,6 +184,44 @@ func TestDiscoverEmptyRootFindsNothing(t *testing.T) {
 func TestDiscoverUnreadableRootIsAnError(t *testing.T) {
 	if _, _, err := discoverContainers(filepath.Join(t.TempDir(), "not-mounted")); err == nil {
 		t.Fatal("expected an error for a root that does not exist")
+	}
+}
+
+// The other side of that rule, in the ROOT SEARCH specifically: a directory
+// BELOW the root that cannot be listed is an incomplete pass, never an error —
+// so whatever the search did find is still returned and still sampled.
+//
+// It is pinned because kubepodsRoots used to say otherwise in its shape: one
+// recursive func returning error, with a `depth == 0` arm that only the
+// outermost call could reach, and error plumbing threaded through the loop that
+// could not fire. A future edit that made a subtree failure escape would have
+// looked like tightening the existing code, and it would have made an
+// unreadable neighbour directory retire every container on the node
+// (Sampler.walk drops the whole pass on an error).
+func TestDiscoverUnreadableDirectoryBesideTheRootIsIncompleteNotAnError(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root can read a 0000 directory")
+	}
+	root := newRoot(t)
+	makeContainer(t, systemdContainerDir(root, 1, hexID(1)), 1000, 1<<20, 1<<18)
+	// A sibling of kubepods.slice that the depth-0 pass descends into (every
+	// child of the root is walked, since a custom --cgroup-root can be named
+	// anything) and cannot list.
+	locked := filepath.Join(root, "kubelet.slice")
+	if err := os.Mkdir(locked, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(locked, 0o755) })
+
+	found, complete, err := discoverContainers(root)
+	if err != nil {
+		t.Fatalf("an unreadable directory beside the root failed the whole pass: %v", err)
+	}
+	if complete {
+		t.Error("the pass reported itself COMPLETE with a directory it could not read; discovery would then retire every container the failed subtree might have held")
+	}
+	if len(found) != 1 {
+		t.Errorf("found %d containers, want the 1 under the readable root", len(found))
 	}
 }
 

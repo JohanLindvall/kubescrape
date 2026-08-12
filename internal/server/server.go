@@ -6,6 +6,7 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"slices"
 	"strconv"
 	"strings"
@@ -356,6 +357,184 @@ func (s *Server) Handler() http.Handler {
 	return mux
 }
 
+// maxHeaderBytes bounds the WIRE size of a request head. Over it net/http writes
+// its own 431 and never reaches a handler, and the same limit covers the request
+// LINE as well as the header block.
+//
+// It is not the ADMISSION, and the gap is wider than net/http's documented slop.
+// Server.initialReadLimitSize adds 4 KiB, which puts a head arriving on a FRESH
+// connection at 12288 bytes admitted and 12289 refused. On a REUSED one the
+// limit is set on the connReader, which counts bytes taken from the SOCKET, and
+// a fill issued while the PREVIOUS request's head was being parsed can already
+// have pulled up to a whole 4 KiB bufio buffer of this head in — bytes that
+// limit never sees. Measured against this package's own listener: behind a
+// 34-byte prelude the same server admits 16350 and refuses 16351, tracking
+// 12288 + 4096 - len(prelude) byte for byte. So the real admission is ~16 KB,
+// and that is the wire term everything below is stated against
+// (internal/server/waitercost_test.go's maxAdmittedHead re-derives the number
+// from a live listener rather than from this arithmetic).
+//
+// 8 KiB is the bound nginx and Apache have shipped for years, and the fattest
+// thing this API legitimately carries is a ServiceAccount JWT of about 1 KB on
+// the one authenticated route.
+//
+// That refusal is INVISIBLE to kubescrape_http_requests_total, and there is no
+// way to make it otherwise: net/http writes the 431 from its own connection
+// loop, before the handler chain this process installs exists for that request.
+// An operator looking for evidence of it reads the client's side, or the ingress
+// in front. (Refusing a second, WIDTH-based half here and counting THAT was
+// tried and removed: it made the metric look like the refusal signal while
+// carrying only whichever half a hostile sender did not use.)
+//
+// It is a wire bound and NOT a cost bound, and nothing here pretends otherwise
+// any more. What a parked request COSTS is bounded by releaseParkedHead
+// instead — see store.WaiterCostBytes for why the cost has to be bounded at
+// all — and the reason it cannot be bounded by counting anything on the parsed
+// request is worth writing down, because two separate attempts at counting
+// header fields failed at it:
+//
+// net/http's parse expands a head by 20 to 30 times, and most of that expansion
+// is INVISIBLE to any arithmetic over the request it hands the handler. Measured
+// as retained heap per parsed request (internal/server, go1.26, amd64):
+//
+//	head on the wire                            r.Header holds   retained
+//	2242 distinct 4-byte lines (12 KiB)         2242 keys         239 KB
+//	one key repeated 1024x (4 KiB!)             1 key             124 KB
+//	Transfer-Encoding + a 12 KiB Trailer list   0 keys            217 KB
+//	Transfer-Encoding + 1000 `Trailer: a` lines 0 keys             23 KB
+//
+// The bottom two are the shape a field count cannot see AT ALL: net/http deletes
+// Host, Transfer-Encoding and Trailer from r.Header (request.go's readRequest,
+// transfer.go's parseTransferEncoding and fixTrailer) and expands the trailer
+// LIST into r.Trailer, so a two-line header block leaves len(r.Header) == 0
+// while the request retains a fifth of a megabyte. And the retention is not only
+// the entries: net/textproto pre-sizes the header map and its value-string block
+// from a peek at the upcoming LINE count (readMIMEHeader/upcomingHeaderKeys, up
+// to 1000 lines), and that capacity survives every one of those deletions —
+// which is how a request with nothing left to price still retains 23 KB.
+//
+// So there is no arithmetic over r.Header, r.Trailer and the URL that bounds
+// this. What bounds it is not HOLDING it.
+const maxHeaderBytes = 8 << 10
+
+// releaseParkedHead drops the sender-chosen parse products before a handler
+// PARKS, so that what a parked request costs is a property of this process
+// rather than of the request — which is what makes store.DefaultMaxWaiters, a
+// COUNT, a memory bound. wildcards names the route's path wildcards, whose
+// matched values are one of those products (see below).
+//
+// Measured on the shapes tabulated at maxHeaderBytes, as retained heap per
+// parsed request: 239 KB, 124 KB, 217 KB and 23 KB before, 1.3-2.2 KB after.
+//
+// The HEADER block was only half of it, and the half that is easy to see. The
+// other half is the REQUEST LINE, and every copy of it is retained by something
+// that looks harmless:
+//
+//   - net/textproto reads the line as ONE string, and r.Method, r.RequestURI,
+//     r.Proto, r.URL.RawPath and r.URL.RawQuery are all SLICES of it — a Go
+//     string slice keeps its whole backing array alive, so a three-byte
+//     r.Method pins the whole 16 KB.
+//   - url.Parse's setPath UNESCAPES the path into a second copy whenever it
+//     contains a %-escape (and ServeMux's multi-wildcard match pathUnescapes it
+//     into a third, r.matches, reachable only through SetPathValue).
+//   - kubemeta.NormalizeContainerID returns what follows the LAST colon, which
+//     is again a slice: a well-formed 64-hex id parked as the store's waiter
+//     key can pin the whole path it was cut out of (handleContainer clones it
+//     for that reason).
+//
+// So `GET /v1/containers/<12167 x A>%41:<64hex>?wait=9s` — inside the byte
+// bound, a valid id, indistinguishable from an agent's poll to any count —
+// parked at 63 KB against 30 KB for that poll, i.e. 98% of the 64 KiB
+// store.WaiterCostBytes budgets for it. Bounding the URI text (parkedURIBytes,
+// COPIED, since a truncation that merely reslices pins exactly what it was
+// truncating) takes the same request to 46 KB on the same listener, and the
+// request's OWN retention — measured without the connection, through the real
+// mux — from 37.8 KB to 1.9 KB.
+//
+// 46 rather than 30 because ONE copy of the line survives everything this
+// function can do: `c.lastMethod = req.Method` (net/http server.go) parks a
+// slice of the line on the CONNECTION, which outlives the request and is
+// unexported. That residue is bounded by the admission, and it does not ADD to
+// the validator below — the two share the one ~16 KB head — so the worst
+// admissible parked lookup is an ordinary poll plus one wire, whichever term
+// the sender spends it on: 30 KB + 16 KB = 47 KB, against the 64 KiB
+// store.WaiterCostBytes budgets.
+//
+// ONE thing is deliberately kept in full: the If-None-Match validator, because
+// the response this handler will eventually write is a conditional one
+// (writeCachedBody) and dropping it would silently turn every agent's 304 into
+// a full document — a bandwidth regression with no error anywhere, which is why
+// TestIfNoneMatchMultipleETags (an existing conditional-GET test on this very
+// route) is what fails if this line goes. It is one string, allocated at its
+// own length by net/textproto and bounded by the byte bound above, and it is
+// therefore the ONLY term of a parked request that the sender still sizes —
+// which is exactly the property waitercost_test.go's fuzz target measures.
+//
+// Safety: net/http does not read req.Header after a handler starts. It populates
+// response.wants10KeepAlive/wantsClose ahead of the call for exactly that reason
+// (server.go, "so we're not reading from req.Header after their Handler starts",
+// issue 14940), and the only later touch of either map is body.Close() merging
+// REAL trailers into r.Trailer, which assigns straight through a nil map
+// (transfer.go's mergeSetHeader). Header.Get on a nil map returns "" rather than
+// panicking, so a handler reached through some future path that reads a header
+// after parking degrades to "absent", never to a crash. The same holds for the
+// line: net/http reads neither r.URL nor r.RequestURI after the handler returns
+// (finishRequest and shouldReuseConnection go by the response), and the fields
+// are left POPULATED — truncated, never nil — so a logging middleware still
+// prints a recognisable request.
+func releaseParkedHead(r *http.Request, wildcards ...string) {
+	if match := r.Header.Get("If-None-Match"); match != "" {
+		r.Header = http.Header{"If-None-Match": []string{match}}
+	} else {
+		r.Header = nil
+	}
+	r.Trailer = nil
+
+	// The request line. Clone even the tiny fields: their size is not the
+	// point, their BACKING ARRAY is.
+	r.Method = strings.Clone(r.Method)
+	r.Proto = strings.Clone(r.Proto)
+	r.Host = clipParked(r.Host)
+	r.RequestURI = clipParked(r.RequestURI)
+	if r.URL != nil {
+		// A fresh URL rather than an edit in place: r.URL may be shared with a
+		// shallow copy of this request (http.Request.WithContext), and User is
+		// dropped whole — nothing downstream reads it.
+		r.URL = &url.URL{
+			Scheme:   strings.Clone(r.URL.Scheme),
+			Opaque:   clipParked(r.URL.Opaque),
+			Host:     clipParked(r.URL.Host),
+			Path:     clipParked(r.URL.Path),
+			RawPath:  "",
+			RawQuery: clipParked(r.URL.RawQuery),
+			Fragment: clipParked(r.URL.Fragment),
+		}
+	}
+	// ServeMux's matched wildcard values: an unescaped copy of the path, held in
+	// an unexported field whose only door is SetPathValue. The guard keeps a
+	// handler reached without a pattern (a direct call in a test) from
+	// allocating r.otherValues to store the emptiness.
+	for _, name := range wildcards {
+		if r.PathValue(name) != "" {
+			r.SetPathValue(name, "")
+		}
+	}
+}
+
+// parkedURIBytes bounds the URI text a parked request keeps for diagnostics.
+// An agent's poll is ~90 bytes of URI ("/v1/containers/<64hex>?wait=5s"), so
+// nothing this API issues is truncated at all; the bound exists for the ~16 KB
+// a head is admitted at.
+const parkedURIBytes = 256
+
+// clipParked returns a COPY of s, truncated to parkedURIBytes. The copy is the
+// point: s is typically a slice of the request line, and reslicing it — which
+// is what any truncation that returns s[:n] does — keeps the whole line alive,
+// truncating the value while retaining every byte of the cost.
+func clipParked(s string) string {
+	return strings.Clone(s[:min(len(s), parkedURIBytes)])
+}
+
 // HTTPServer wraps s.Handler() in an http.Server with hardened timeouts. The
 // metadata service fronts a whole DaemonSet fleet, so a single slow, buggy or
 // hostile client must never pin connections and goroutines indefinitely:
@@ -371,6 +550,8 @@ func (s *Server) Handler() http.Handler {
 //     background read hits the whole-request read deadline mid-handler),
 //     which would abort legitimate waits early. Hence MaxWait + slack, never
 //     a fixed constant.
+//   - MaxHeaderBytes bounds the wire size of a head; releaseParkedHead is what
+//     makes a parked request's COST bounded rather than only its count.
 func (s *Server) HTTPServer(addr string) *http.Server {
 	const slack = 30 * time.Second
 	return &http.Server{
@@ -380,6 +561,7 @@ func (s *Server) HTTPServer(addr string) *http.Server {
 		ReadTimeout:       s.maxWait + slack,
 		WriteTimeout:      s.maxWait + slack,
 		IdleTimeout:       120 * time.Second,
+		MaxHeaderBytes:    maxHeaderBytes,
 	}
 }
 
@@ -557,14 +739,37 @@ func (s *Server) requireReady(w http.ResponseWriter, retryAfter string) bool {
 // first), and it is drained the same way: Drain closes s.draining and every
 // parked request answers errDraining — a retryable 503 — instead of holding the
 // handler until the process exits and cuts it without a status.
+//
+// It is also CAPPED the same way, and by the same counter: a park here costs
+// exactly what a waiter in the store costs, on the same unauthenticated route,
+// so it draws a slot from the store's blocked-lookup budget (Store.TryPark) and
+// answers store.ErrTooManyWaiters — a retryable 503 + Retry-After, counted on
+// kubescrape_container_lookups_shed_total — when the budget is spent. Before
+// that, this spot was uncapped while the OTHER one carried the flag's promise:
+// 1200 concurrent lookups all parked here at a cap of 4, 71 MB of them, with
+// the blocked-lookup gauge reading 0. And this is the startup window, when a
+// whole agent fleet is likeliest to be asking at once.
 func (s *Server) waitReady(ctx context.Context) error {
 	select {
 	case <-s.ready:
 		return nil
 	default:
 	}
+	if s.store != nil {
+		if !s.store.TryPark() {
+			return store.ErrTooManyWaiters
+		}
+		defer s.store.Unpark()
+	}
 	s.readyParked.Add(1)
 	defer s.readyParked.Add(-1)
+	// Re-check: the caches may have synced while the slot was being taken, and
+	// a request that can be served must not spend a wait budget on the select.
+	select {
+	case <-s.ready:
+		return nil
+	default:
+	}
 	select {
 	case <-s.ready:
 		return nil

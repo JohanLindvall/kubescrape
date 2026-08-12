@@ -558,6 +558,7 @@ spec:
             - -journald-flush-interval=2s
             - -cgroup-stats
             - -cgroup-stats-interval=500ms
+            - -cgroup-stats-discover-interval=30s
             - -cgroup-stats-root=/host/sys/fs/cgroup
             - -ingest
             - -ingest-grpc-endpoint=:4317

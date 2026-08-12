@@ -70,7 +70,14 @@ var (
 		"Log records dropped by the logs rules (including sampled-away lines), whichever path carried the "+
 			"record: the tailer, journald, Kubernetes events, Azure diagnostics, or an OTLP push into -ingest "+
 			"(a dropped pushed record is still acked to its sender — it was delivered; the operator chose "+
-			"to drop it).")
+			"to drop it). Counted ONCE PER RECORD, not once per attempt: the tailer rewinds and re-reads "+
+			"the same bytes after a failed export, and counting every pass multiplied this by the number of "+
+			"rewinds an outage spanned. Per RECORD rather than per DELIVERY is the exact claim — a record "+
+			"withheld by a commit clamp and then rewound is DELIVERED twice and counted once, which is the "+
+			"direction to be wrong in: under-claiming only inflates, while over-claiming would destroy "+
+			"observations invisibly. The residual skew is a `sample` rule, whose verdict is a per-filter "+
+			"counter rather than a function of the bytes — after a rewind the re-read samples a DIFFERENT set "+
+			"of lines, and the drops are attributed to the pass that first put those bytes through the chain.")
 	// MonitorFieldsIgnored counts ServiceMonitor/PodMonitor upserts carrying
 	// endpoint fields kubescrape does not interpret — the metric form of the
 	// startup warning, so a partially-applied CR is alertable and not just
@@ -300,6 +307,24 @@ var (
 			"removed before enrichment, push still acked. The hook is the operator's per-sender policy on "+
 			"listeners nothing authenticates; a script error fails OPEN (the resource is admitted) and counts "+
 			"into kubescrape_transform_errors_total{signal=\"ingest\"} instead.")
+	IngestBodyRejected = Registry.CounterVec("kubescrape_ingest_body_rejected_total",
+		"OTLP/HTTP request bodies refused at the receiver's door, before anything was decoded, by reason. FOUR "+
+			"of the five describe a request that is WRONG, so the sender must change something before a retry "+
+			"can work: too_large (413, over the receiver's cap in either the compressed or the decompressed "+
+			"direction), media_type (415, a Content-Type that is not application/x-protobuf), content_encoding "+
+			"(400, a Content-Encoding that is neither gzip nor identity) and malformed (400, a body that would "+
+			"not decompress, or bytes that are not a valid OTLP payload). Each of those carries a throttled Warn "+
+			"naming the peer, which on a listener nothing authenticates is the only way to tell a misconfigured "+
+			"sender apart from a probe. `aborted` is the ODD ONE OUT and carries no Warn: the client went away "+
+			"mid-upload (a killed pod, a rolled deployment, an SDK export timeout), so nothing was wrong with "+
+			"the request and the retry is exactly what happens next — a rolling deployment would otherwise log "+
+			"one accusation per evicted pod. It is answered 503, deliberately neither 400 nor 408. Also "+
+			"deliberately SEPARATE from kubescrape_ingest_rejected_total, which is the receiver protecting "+
+			"ITSELF (in-flight or byte-budget back-pressure) and is retryable as sent. Only the APPLICATION-"+
+			"facing listeners feed this family: the trace tier runs its authenticated internal hop in the same "+
+			"process, and folding sibling-shard traffic in would put bearer-authenticated pushes into the series "+
+			"an operator reads as \"somebody out there is pushing wrong\" — a failed hop is already one "+
+			"kubescrape_service_graph_sends_failed_total on the SENDING shard, where the peer is known.", "reason")
 	IngestChainSkipped = Registry.CounterVec("kubescrape_ingest_log_chain_skipped_total",
 		"Ingested log RECORDS or RESOURCES whose line-derived processing (body enrichment, log-metrics "+
 			"observation) was skipped by an abuse bound — the data itself is still forwarded. Reasons: "+
@@ -394,7 +419,7 @@ var (
 	CgroupDiscoveryErrors = Registry.CounterVec("kubescrape_cgroup_discovery_errors_total",
 		"Discovery passes that could not read part of the cgroup hierarchy, by scope. `root` is the whole pass failing to list -cgroup-stats-root: the root is unmounted or unreadable, NOTHING is discovered and the sampler is exporting nothing — the same condition the startup warning names. `subtree` is a directory below the root failing to list: the pass still returns what it found, but it is INCOMPLETE, so nothing is retired from it (an unreadable directory is indistinguishable from a container that went away) and a container that really did go away keeps its descriptors until a complete listing proves otherwise.", "scope")
 	CgroupWindowsDropped = Registry.CounterVec("kubescrape_cgroup_windows_dropped_total",
-		"Container windows measured and then discarded rather than exported, by reason. This is the pipeline's LOSS counter and any sustained rate is data an operator asked for and did not get. `unresolved` means the metadata service could not place the container when the payload was built, so the window had no resource to carry it (the samples are already reset; a window describes one bounded interval and is never carried forward, which would silently stretch the interval the numbers claim to cover). `export_failed` means the collector — or, with -buffer-dir, the spool — refused the payload.", "reason")
+		"Container windows measured and then discarded rather than exported, by reason. ALERT ON THE REASON, NOT THE FAMILY: two of the three are faults and the third is expected on an ordinary node. `unresolved` means the metadata service could not place the container when the payload was built, so the window had no resource to carry it (the samples are already reset; a window describes one bounded interval and is never carried forward, which would silently stretch the interval the numbers claim to cover). `export_failed` means the collector — or, with -buffer-dir, the spool — refused the payload. Those two are the pipeline's LOSS signal: a sustained rate is data an operator asked for and did not get. `too_short` is NOT a fault — it is a container that entered the sampled set and left the cgroup hierarchy before any window of its life could be described, which is the only evidence a node can produce that -cgroup-stats-discover-interval is missing short-lived containers (a container that starts AND exits between two discovery passes is never seen at all and leaves nothing to count). It fires on ~13% of containers at every lifetime up to the discovery interval, so any node running CronJobs or init containers sits permanently nonzero; the remedy is a shorter discovery interval, paid for in metadata-service lookups. A rate(...) > 0 alert over the whole family therefore pages on normal pod churn.", "reason")
 	CgroupHeldWindows = Registry.CounterVec("kubescrape_cgroup_held_windows_total",
 		"Signal windows that took fewer than two samples, by what was done about it. A single reading is not a distribution (its stddev is 0 by construction and its max and min are the same number — the average the cadvisor scrape already publishes), so `held` re-states the last distribution actually measured, which bridges a sampling gap of a second or two without the series alternating between real and degenerate points. The hold is BOUNDED: `expired` counts a signal reaching the bound and ceasing to be exported, which is what keeps a dead-but-still-listed container (a CRI-O conmon scope outliving its container, or a stale listing) from republishing its last measurement as fresh data forever.", "outcome")
 	CgroupScanTruncated = Registry.Counter("kubescrape_cgroup_scan_truncated_total",
@@ -429,6 +454,14 @@ var (
 		"Journal reader restarts.")
 	JournalTruncated = Registry.Counter("kubescrape_journal_truncated_total",
 		"Journal messages truncated at MaxEntryBytes (the record carries log.truncated).")
+	JournalExportFailures = Registry.Counter("kubescrape_journal_export_failures_total",
+		"Journal batch exports that failed and are being retried IN PLACE. The batch is kept and never re-read, "+
+			"so this counts ATTEMPTS — not lost entries, and not re-reads: a steady rate is a collector outage the "+
+			"reader is riding out with its cursor uncommitted, and the loss counter is "+
+			"kubescrape_journal_dropped_batches_total. Deliberately NOT kubescrape_log_export_failures_total, which "+
+			"is the tailer's files-rewound counter and cannot apply here — journald rewinds no file, and the "+
+			"singleton that reads a journal typically runs with -logs=false, so those increments landed on a "+
+			"metric whose help described something that had not happened.")
 )
 
 // OTLP ingest (agent).
@@ -818,7 +851,11 @@ func RegisterAPIServerProbe(reachable func() bool, failures func() int64) {
 // are wired.
 func RegisterWaiterStats(blocked func() int, shed, drained func() int64) {
 	Registry.GaugeFunc("kubescrape_container_lookups_blocked",
-		"Container lookups currently blocked waiting for a container ID to appear.",
+		"Container lookups currently parked, in EITHER of the two places one can park: waiting for a container "+
+			"ID to appear in the store, or — only until the informer caches finish their initial sync — waiting "+
+			"for the store to become readable at all. Both draw on the one -max-blocked-lookups budget, because "+
+			"both hold a request on a route nothing authenticates; the second is transient by nature, but it is "+
+			"exactly when an agent fleet arrives at once.",
 		func() float64 { return float64(blocked()) })
 	Registry.CounterFunc("kubescrape_container_lookups_shed_total",
 		"Blocking container lookups refused because the store's concurrent-waiter cap was reached.",

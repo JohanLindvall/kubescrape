@@ -451,9 +451,28 @@ var (
 	logLevel        = obsFlags.LogLevel
 	logFormat       = obsFlags.LogFormat
 
-	kubeconfig   = flag.String("kubeconfig", "", "path to a kubeconfig; defaults to in-cluster config, then $KUBECONFIG/~/.kube/config")
-	maxWait      = flag.Duration("wait-timeout", 5*time.Second, "default and maximum time a container lookup blocks waiting for metadata to appear (shorten per request with ?wait=)")
-	cacheTTL     = flag.Duration("cache-ttl", 5*time.Minute, "how long metadata of deleted pods and replaced container IDs stays resolvable")
+	kubeconfig = flag.String("kubeconfig", "", "path to a kubeconfig; defaults to in-cluster config, then $KUBECONFIG/~/.kube/config")
+	maxWait    = flag.Duration("wait-timeout", 5*time.Second, "default and maximum time a container lookup blocks waiting for metadata to appear (shorten per request with ?wait=)")
+	cacheTTL   = flag.Duration("cache-ttl", 5*time.Minute, "how long metadata of deleted pods and replaced container IDs stays resolvable")
+
+	// The blocked-lookup cap, as a NUMBER because that is the thing the process
+	// can enforce, but chosen as MEMORY: store.DefaultMaxWaiters is
+	// store.WaiterBudgetBytes / store.WaiterCostBytes, and the cost is measured
+	// (internal/server/waitercost_test.go) rather than assumed. It is a flag
+	// because the default is derived from the memory the DEFAULT chart gives
+	// this pod, and a cluster large enough to reach the cap has already been
+	// given more than that — the two are raised together or not at all, which
+	// is what the help text says.
+	maxWaiters = flag.Int("max-blocked-lookups", store.DefaultMaxWaiters,
+		fmt.Sprintf("how many container lookups may be blocked waiting for metadata at once; over it, /v1/containers answers 503 + Retry-After "+
+			"(counted kubescrape_container_lookups_shed_total) instead of parking another handler. This is a MEMORY bound wearing a count: "+
+			"each parked lookup is an HTTP handler held for up to -wait-timeout, measured at %d KiB for an agent's poll and budgeted at %d KiB "+
+			"for the worst request the header bound admits, so the default spends %d MiB — a quarter of the 128Mi the chart requests for this pod. "+
+			"On the DEFAULT agent configuration legitimate demand is at most one blocked lookup per NODE (the tailer resolves on one sweep "+
+			"goroutine and the cadvisor path never waits); an agent run with -ingest-metadata-wait (default 0) also blocks in its ingest "+
+			"handlers, one lookup at a time per push, adding up to its -ingest-max-in-flight (default 32) per node. So raise this for a fleet "+
+			"bigger than the default, or for agents that wait on ingest, and add n x %d KiB to the pod's memory in the same change",
+			30, store.WaiterCostBytes>>10, store.WaiterBudgetBytes>>20, store.WaiterCostBytes>>10))
 	metaCacheTTL = flag.Duration("metadata-cache-ttl", 10*time.Second, "max-age sent on metadata responses (Cache-Control + ETag) so agents cache lookups client-side; 0 disables the cache headers. The server-side ServiceMonitor->Service memo is exact (invalidated by index generation, not this TTL), so 0 no longer costs a cross-product rebuild per request")
 	resync       = flag.Duration("resync", 0, "informer resync period (0 disables periodic resync; the watch stream keeps the cache current)")
 
@@ -546,6 +565,44 @@ func serviceSelfResource() pcommon.Resource {
 	return res
 }
 
+// newMetadataStore builds the store with the operator's blocked-lookup cap
+// applied. One function rather than two lines in run() so the wiring is
+// testable: the cap only exists as a knob if the flag reaches the shed decision,
+// and before -max-blocked-lookups store.SetMaxWaiters had no production caller
+// at all.
+func newMetadataStore(ttl time.Duration, maxWaiters int) *store.Store {
+	st := store.New(ttl)
+	st.SetMaxWaiters(maxWaiters)
+	return st
+}
+
+// checkWaiterCap validates -max-blocked-lookups and reports the one thing an
+// operator cannot see from the number itself: what it costs.
+//
+// A cap of 0 or less sheds EVERY blocking lookup, which turns the ~1s gap
+// between a container starting and the kubelet posting its ID into a 503 on the
+// first log line of every container on every node. Nothing else in the process
+// would name that as the cause, so it is refused rather than served.
+//
+// Above the budget is NOT an error — an operator who has given the pod the
+// memory is entitled to spend it, and a cluster big enough to need a bigger cap
+// has outgrown the 128Mi the default was derived against anyway. But the
+// arithmetic is the whole point of the number, so a cap whose saturation exceeds
+// that budget says so once, with the multiplication already done.
+func checkWaiterCap(n int, log *slog.Logger) error {
+	if n < 1 {
+		return fmt.Errorf("-max-blocked-lookups %d: must be at least 1 (every blocking container lookup would be shed; "+
+			"the default %d is store.WaiterBudgetBytes/store.WaiterCostBytes)", n, store.DefaultMaxWaiters)
+	}
+	if over := int64(n) * store.WaiterCostBytes; over > store.WaiterBudgetBytes {
+		log.Warn("-max-blocked-lookups is above the memory budget its default was derived from",
+			"waiters", n, "saturatedMiB", over>>20, "budgetMiB", int64(store.WaiterBudgetBytes)>>20,
+			"perWaiterKiB", store.WaiterCostBytes>>10,
+			"note", "parked lookups are unauthenticated HTTP handlers held for up to -wait-timeout; raise the pod's memory to match")
+	}
+	return nil
+}
+
 func run() error {
 	flag.Parse()
 
@@ -576,6 +633,9 @@ func run() error {
 	// signal an API-server outage produces without saying so.
 	if *apiserverProbeInterval < 0 {
 		return fmt.Errorf("-apiserver-probe-interval %v: must not be negative (0 disables the probe)", *apiserverProbeInterval)
+	}
+	if err := checkWaiterCap(*maxWaiters, log); err != nil {
+		return err
 	}
 	// -scrape-auth-secrets derives its allowlist from INDEXED monitors, so
 	// without -servicemonitors nothing is ever indexed and every request to
@@ -609,7 +669,7 @@ func run() error {
 		return fmt.Errorf("creating metadata client: %w", err)
 	}
 
-	st := store.New(*cacheTTL)
+	st := newMetadataStore(*cacheTTL, *maxWaiters)
 	obs.RegisterStoreStats(st.Stats)
 	obs.RegisterWaiterStats(st.BlockedLookups, st.ShedLookups, st.DrainedLookups)
 

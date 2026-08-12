@@ -197,6 +197,12 @@ func (t *Tailer) anyPodRules() bool {
 // at resolve time), the grouping, and the offset bookkeeping the caller does
 // around this.
 func (t *Tailer) buildRecord(b *recordBuilder, e entry) {
+	// Before anything below rewrites the body: the observed identity is the
+	// entry as the BATCH holds it, not as the parse hook or the scrubber leave
+	// it. Costs a field load per entry while THIS file's set is empty, and a
+	// body hash per entry while it is not — which a withheld commit is enough
+	// to cause, with no failure anywhere (see alreadyObserved).
+	observed := e.file.alreadyObserved(e)
 	b.parsedSev = ""
 	// The parse hook (plain sources flagged parseScript) runs FIRST: it
 	// produces the body the rest of the chain — scrub, extraction, metrics,
@@ -245,6 +251,13 @@ func (t *Tailer) buildRecord(b *recordBuilder, e entry) {
 		// Pod-annotation rules run before the global chain: a pod drop is
 		// final, a pod keep still passes the global rules.
 		PodRules: e.file.podRules,
+		// This exact entry — same bytes, same segment, same joined body — has
+		// been through the chain before: on a pass a failed export rewound, or
+		// on one that shipped it with its commit withheld and a later failure
+		// rewound past it. The record is rebuilt and the rules re-run (a
+		// hot-reloaded rule set must still be able to change the verdict), but
+		// its log metrics and its rules-drop are NOT counted a second time.
+		Observed: observed,
 	}) {
 		b.kept++
 	}
@@ -363,8 +376,14 @@ func (t *Tailer) flush(ctx context.Context) {
 		kept:  kept,
 		cands: cands, highs: highs,
 	}
-	clear(t.batch) // unpin the exported bodies (a burst otherwise stays reachable)
-	t.batch = t.batch[:0]
+	// Hand the batch to t.flushed and give the (already cleared) previous array
+	// back as the empty t.batch. The entries have to outlive the export — which
+	// of them a rewind can still bring back is decided by the OUTCOME, and
+	// file.observe reads their ranges and bodies afterwards — while t.batch must
+	// be empty the moment flush returns, because every caller sits in a read
+	// loop that appends to it. A swap rather than a per-entry copy into a side
+	// list: this loop runs once per log line on every node in the fleet.
+	t.flushed, t.batch = t.batch, t.flushed[:0]
 	t.lastFlush = time.Now()
 	// An all-dropped batch has nothing to send but its offsets still commit.
 	var err error
@@ -419,6 +438,31 @@ func (t *Tailer) flush(ctx context.Context) {
 	default:
 		t.failBatch(inf, err)
 	}
+	// After the outcome, because it is the outcome that decides which of these
+	// entries a rewind can still bring back. ONE path for all three arms: the
+	// predicate ("still above its own segment's committed frontier") is what
+	// distinguishes them, and it reads the frontiers the arms just moved.
+	// The prune runs over inf.cands because that map is the same set of files
+	// already deduplicated: t.flushed is per ENTRY, and a batch spanning
+	// several sweeps interleaves its files rather than grouping them.
+	//
+	// With everything committed and nothing withheld, observe refuses every
+	// entry on its byte range alone, so this loop hashes no body and allocates
+	// no map. That state is not the same as "the steady state": a withheld
+	// commit needs no failure — an open multi-line group on the other stream is
+	// enough, which is routine with -logs-multiline on — and while one is
+	// outstanding both this loop and buildRecord's lookup pay per entry. The
+	// cost is measured at alreadyObserved.
+	for f := range inf.cands {
+		f.pruneObserved()
+	}
+	for i := range t.flushed {
+		t.flushed[i].file.observe(&t.flushed[i])
+	}
+	// Unpin the exported bodies and their files: the backing array outlives this
+	// flush, and a burst (or a released file) must not stay reachable through a
+	// slot nothing will overwrite until the next batch is this large again.
+	clear(t.flushed)
 }
 
 // exportWithRetry sends one batch through the shared bounded-retry shape
@@ -520,7 +564,8 @@ func (t *Tailer) advanceBatch(inf *batchInfo) {
 
 // failBatch rewinds a failed batch's files to their committed offsets; their
 // bytes are re-read after the rewind. (t.batch is always empty here: flush
-// clears it before the synchronous export, and nothing appends during it.)
+// swaps the batch out into t.flushed before the synchronous export, and nothing
+// appends during it.)
 func (t *Tailer) failBatch(inf *batchInfo, err error) {
 	t.log.Error("exporting logs failed, rewinding", "records", inf.kept, "error", err)
 	obs.LogExportFailures.Inc()

@@ -222,19 +222,32 @@ func checkFlagValues() error {
 			"Pass a positive duration well below -scrape-interval, which is the window the distribution describes (the default is %s)", *cgroupStatsIv, cgroupstats.DefaultInterval)
 	}
 	// The floor, and it only exists in the direction that BURNS THE NODE. One
-	// sweep is three cgroup reads per container on the goroutine that also runs
-	// discovery, so the period is what divides that cost: at the floor a
-	// 200-container node already issues 6000 reads a second, and a tenth of it
-	// would be a busy loop on the process that also tails every log file here —
-	// bought for no signal, since a burst shorter than 100ms cannot be
-	// attributed to anything anyway. Refused rather than clamped because the
-	// operator typed it; cgroupstats.New clamps the same value arriving
-	// programmatically.
+	// sweep is three cgroup reads per container, so the period is what divides
+	// that cost: at the floor a 200-container node already issues 6000 reads a
+	// second, and a tenth of it would be a busy loop on the process that also
+	// tails every log file here — bought for no signal, since a burst shorter
+	// than 100ms cannot be attributed to anything anyway. Refused rather than
+	// clamped because the operator typed it; cgroupstats.New clamps the same
+	// value arriving programmatically.
 	if flagWasSet("cgroup-stats-interval") && *cgroupStatsIv > 0 && *cgroupStatsIv < cgroupstats.MinInterval {
-		return fmt.Errorf("-cgroup-stats-interval=%s is below the %s floor: one sweep is three cgroup file reads per container on the goroutine that also discovers them, so this asks the node agent for %.0f reads a second per 100 containers and buys no burst resolution that survives a %s export window. "+
+		return fmt.Errorf("-cgroup-stats-interval=%s is below the %s floor: one sweep is three cgroup file reads per container, so this asks the node agent for %.0f reads a second per 100 containers and buys no burst resolution that survives a %s export window. "+
 			"Pass %s or more (the default is %s)",
 			*cgroupStatsIv, cgroupstats.MinInterval, 300*float64(time.Second)/float64(*cgroupStatsIv),
 			*scrapeInterval, cgroupstats.MinInterval, cgroupstats.DefaultInterval)
+	}
+	// The discovery ticker's period, and the same two refusals for the same two
+	// reasons: time.NewTicker PANICS on a non-positive one (at the point the
+	// pipeline starts, not the point the flag was typed), and below the floor a
+	// pass re-offers every unresolved cgroup to the metadata service — which on
+	// a fresh node is every pod's sandbox, one per pod, for maxUnresolvedAge.
+	if flagWasSet("cgroup-stats-discover-interval") && *cgroupDiscoverIv <= 0 {
+		return fmt.Errorf("-cgroup-stats-discover-interval=%s is not a discovery cadence: this flag has no spelling for 'never re-scan' or for 'off' (-cgroup-stats=false is off), and discovery is the ONLY way a container enters the sampled set. "+
+			"Pass a positive duration (the default is %s)", *cgroupDiscoverIv, cgroupstats.DefaultDiscoverInterval)
+	}
+	if flagWasSet("cgroup-stats-discover-interval") && *cgroupDiscoverIv > 0 && *cgroupDiscoverIv < cgroupstats.MinDiscoverInterval {
+		return fmt.Errorf("-cgroup-stats-discover-interval=%s is below the %s floor: every pass walks the cgroup hierarchy AND asks the metadata service about each cgroup that has not resolved yet, which on a fresh node is one per pod (the sandbox cgroup, which never resolves) for the first few minutes. "+
+			"Pass %s or more (the default is %s)",
+			*cgroupDiscoverIv, cgroupstats.MinDiscoverInterval, cgroupstats.MinDiscoverInterval, cgroupstats.DefaultDiscoverInterval)
 	}
 	// A relative cgroup root would be resolved against the process' working
 	// directory, which in a distroless container is "/" — so it would silently
@@ -632,21 +645,35 @@ func configWarnings(cfg agentConfig) []string {
 	// four-plus samples) is a judgement rather than a correctness boundary.
 	if *cgroupStatsOn && *scrapeInterval > 0 && *cgroupStatsIv*4 > *scrapeInterval {
 		out = append(out, fmt.Sprintf(
-			"-cgroup-stats-interval=%s against a -scrape-interval=%s export window yields at most %d samples per window: the CPU gauges need TWO readings to derive one rate and are omitted below that, and a one- or two-sample window's stddev/max/min is not a distribution — it is the last one re-stated, which is the average the cadvisor scrape already reports under six new names. "+
+			"-cgroup-stats-interval=%s against a -scrape-interval=%s export window yields at most %d samples per window: the CPU gauges need TWO readings to derive one rate and are omitted below that, and a one- or two-sample window's stddev/max/min is not a distribution — it is the last one re-stated (which the exported container_cpu_usage_samples / container_memory_working_set_bytes_samples then report as 0 or 1), i.e. the average the cadvisor scrape already publishes, under ten new names. "+
 				"Sample at a small fraction of the window (the default 1s against 30s is 30 samples) or turn -cgroup-stats off.",
 			*cgroupStatsIv, *scrapeInterval, *scrapeInterval / *cgroupStatsIv))
 	}
 	// The other end of the same flag, the one that costs the NODE rather than
 	// the signal. Above the floor checkFlagValues refuses, so this is legal —
-	// but three reads per container per period on the goroutine that also runs
-	// discovery is a cost an operator should have chosen deliberately, and a
-	// burst finer than this window is not attributable to anything anyway.
+	// but three reads per container per period is a cost an operator should
+	// have chosen deliberately, and a burst finer than this window is not
+	// attributable to anything anyway.
 	if *cgroupStatsOn && *cgroupStatsIv > 0 && *cgroupStatsIv < costlyCgroupInterval {
 		out = append(out, fmt.Sprintf(
-			"-cgroup-stats-interval=%s asks this node agent for %.0f cgroup file reads a second per 100 containers, on the same goroutine that discovers them — and it is the process that also tails every log file on the node. "+
+			"-cgroup-stats-interval=%s asks this node agent for %.0f cgroup file reads a second per 100 containers — on the process that also tails every log file on the node. "+
 				"The default %s already resolves a burst far shorter than any export window; go below %s only for a measured reason.",
 			*cgroupStatsIv, 300*float64(time.Second)/float64(*cgroupStatsIv),
 			cgroupstats.DefaultInterval, costlyCgroupInterval))
+	}
+	// A fast discovery cadence buys short-lived containers and is paid for by
+	// the METADATA SERVICE rather than by this node: every pass re-offers every
+	// cgroup that has not resolved, and on a node whose pods are still starting
+	// that is one lookup per pod per pass — the sandbox cgroup never resolves,
+	// by construction, and only stops being asked about after its grace period.
+	// Legal above the floor, but it is a fleet-wide cost an operator should
+	// have chosen rather than discovered on the service's request graph.
+	if *cgroupStatsOn && *cgroupDiscoverIv > 0 && *cgroupDiscoverIv < costlyCgroupDiscoverInterval {
+		out = append(out, fmt.Sprintf(
+			"-cgroup-stats-discover-interval=%s re-walks the cgroup hierarchy and re-offers every unresolved cgroup to the metadata service that often; on a 110-pod node that is ~%.0f lookups a second while pods are starting, since each pod's sandbox cgroup is permanently unresolvable. "+
+				"It does buy shorter-lived containers (the default %s misses most containers living under ~10s, and there is no counter for the ones it never sees) — go below %s deliberately, and watch kubescrape_cgroup_unresolved_total.",
+			*cgroupDiscoverIv, 110*float64(time.Second)/float64(*cgroupDiscoverIv),
+			cgroupstats.DefaultDiscoverInterval, costlyCgroupDiscoverInterval))
 	}
 	return out
 }
@@ -655,6 +682,13 @@ func configWarnings(cfg agentConfig) []string {
 // starts being a choice. It is not a boundary — cgroupstats.MinInterval is —
 // which is why it warns rather than refuses.
 const costlyCgroupInterval = 500 * time.Millisecond
+
+// costlyCgroupDiscoverInterval is the same threshold for the discovery
+// cadence, and it is far larger than its sampling sibling because the two spend
+// different budgets: a sweep costs this node three preads per container, while
+// a discovery pass costs the METADATA SERVICE one lookup per unresolved cgroup
+// — a fleet-wide cost, multiplied by every node.
+const costlyCgroupDiscoverInterval = 5 * time.Second
 
 // logConfigWarnings emits configWarnings.
 func logConfigWarnings(cfg agentConfig, log *slog.Logger) {

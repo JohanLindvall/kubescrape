@@ -25,17 +25,27 @@ type captureExporter struct {
 	mu       sync.Mutex
 	batches  []plog.Logs
 	failures int
+	// tries counts EVERY call, delivered or refused — what a test asserting on
+	// how many times the reader went to the collector reads.
+	tries int
 }
 
 func (c *captureExporter) ExportLogs(_ context.Context, ld plog.Logs) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	c.tries++
 	if c.failures > 0 {
 		c.failures--
 		return fmt.Errorf("injected export failure")
 	}
 	c.batches = append(c.batches, ld)
 	return nil
+}
+
+func (c *captureExporter) attempts() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.tries
 }
 
 func (c *captureExporter) records() []string {
@@ -668,6 +678,12 @@ func TestIdentDoesNotConflateWithUnit(t *testing.T) {
 // the first flush after a restart exports the PREVIOUS batch and then commits
 // the NEW batch's cursor — every entry the new batch held beyond the stale
 // payload is skipped, permanently and silently.
+//
+// Since flushRetry, an export failure no longer ends the stream at all (it
+// retries the same batch in place), so what this drives is a reopen over a
+// journal that GREW: the first stream delivers its batch on the retry and the
+// second must pick up from that batch's cursor, exporting the new entry and
+// nothing else twice.
 func TestStalePayloadIsNotReusedAfterRestart(t *testing.T) {
 	first := []rawEntry{
 		mkEntry("c01", "a.service", "one", "6"),

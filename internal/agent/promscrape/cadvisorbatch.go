@@ -426,7 +426,7 @@ func (cb *cadvisorBatcher) fillResource(res pcommon.Resource, ident cadvisorIden
 // unresolved-row fallback and the same `cadvisor` attribute builder (hence the
 // same instance prefix).
 //
-// It exists for internal/agent/cgroupstats, whose six gauges are only worth
+// It exists for internal/agent/cgroupstats, whose ten gauges are only worth
 // anything if they JOIN the cadvisor series they explain — and two series join
 // when their resource attributes, and so the derived Prometheus job and
 // instance, are byte-identical. A second implementation would agree with this

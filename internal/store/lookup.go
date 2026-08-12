@@ -86,10 +86,13 @@ func (s *Store) GetContainer(ctx context.Context, id string) (ContainerResult, b
 			s.drained.Add(1)
 			return ContainerResult{}, false, ErrShuttingDown
 		}
-		if s.nWaiters >= s.maxWaiters {
+		if s.nWaiters+s.nExternal >= s.maxWaiters {
 			// Load shedding: every additional waiter is a pinned handler
 			// goroutine + map entry for the full wait budget. Fail fast and
-			// retryable rather than degrading everyone.
+			// retryable rather than degrading everyone. The lookups parked in
+			// the caller's readiness wait (TryPark) are counted here too: they
+			// are the same handlers on the same route, so one budget covers
+			// both spots.
 			s.mu.Unlock()
 			s.shed.Add(1)
 			return ContainerResult{}, false, ErrTooManyWaiters
@@ -115,9 +118,18 @@ func (s *Store) GetContainer(ctx context.Context, id string) (ContainerResult, b
 	}
 }
 
-// SetMaxWaiters overrides the blocked-lookup cap (primarily for tests; 0 or
-// negative sheds every blocking lookup). Not safe to call concurrently with
+// SetMaxWaiters overrides the blocked-lookup cap — the production caller is
+// cmd/kubescrape's -max-blocked-lookups; tests use it to make the cap reachable.
+// 0 or negative sheds every blocking lookup. Not safe to call concurrently with
 // lookups.
+//
+// The cap is a MEMORY budget expressed in waiters (DefaultMaxWaiters carries the
+// measurement): each admitted waiter is a parked HTTP handler — two goroutines,
+// their stacks, the connection buffers, the request and an fd, measured at 30 KB
+// for an agent's poll and bounded at 47 KB for the worst request internal/server
+// admits — on a route nothing authenticates. It covers BOTH spots such a lookup
+// parks in (see TryPark). Raising it spends n x WaiterCostBytes of the pod's
+// memory, so the pod's memory goes up first.
 func (s *Store) SetMaxWaiters(n int) { s.maxWaiters = n }
 
 // Drain releases every parked container lookup so its handler can answer, and
@@ -169,13 +181,59 @@ func (s *Store) removeWaiter(id string, ch chan struct{}) {
 	}
 }
 
-// BlockedLookups reports how many container lookups are blocked right now.
-// Published as a gauge (see obs.RegisterWaiterStats): it is what shows waiter
-// pressure building BEFORE the cap starts shedding.
+// TryPark reserves one slot of the blocked-lookup budget for a container lookup
+// that parks OUTSIDE this store, and reports whether it may park. The caller
+// MUST pair a true return with Unpark.
+//
+// The one caller is internal/server's waitReady, which holds a container lookup
+// for its whole wait budget while the informer caches are still syncing. That
+// park costs exactly what a waiter here costs (WaiterCostBytes: a pinned
+// handler, its goroutines, the connection and an fd) on exactly the same
+// unauthenticated route, so it draws on the same cap rather than on a second
+// one — otherwise -max-blocked-lookups would bound half the requests it names,
+// and the uncovered half is the STARTUP half, when a fleet of agents is
+// likeliest to be asking at once.
+//
+// A refusal is counted as a shed lookup, like the store's own: it is the same
+// cap binding for the same reason, and an operator watching
+// kubescrape_container_lookups_shed_total must not have to know which of the two
+// spots a request had reached.
+//
+// The handover is deliberately not atomic — waitReady releases its slot before
+// GetContainer takes one — so the instantaneous total may exceed the cap by the
+// number of lookups between the two, for as long as a mutex acquisition takes.
+// It cannot grow: once the caches are synced nothing enters the readiness park
+// at all.
+func (s *Store) TryPark() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.nWaiters+s.nExternal >= s.maxWaiters {
+		s.shed.Add(1)
+		return false
+	}
+	s.nExternal++
+	return true
+}
+
+// Unpark returns a slot taken by TryPark.
+func (s *Store) Unpark() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.nExternal > 0 {
+		s.nExternal--
+	}
+}
+
+// BlockedLookups reports how many container lookups are blocked right now —
+// both spots: this store's per-ID waiters and the lookups parked in the
+// caller's readiness wait (TryPark). Published as a gauge (see
+// obs.RegisterWaiterStats): it is what shows waiter pressure building BEFORE
+// the cap starts shedding, and a gauge that omitted the readiness parks would
+// read 0 through the whole window in which they are the only thing parked.
 func (s *Store) BlockedLookups() int {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return s.nWaiters
+	return s.nWaiters + s.nExternal
 }
 
 // ShedLookups reports how many blocking lookups the waiter cap has refused

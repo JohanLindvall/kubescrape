@@ -839,7 +839,10 @@ func (r *sgReceiver) handleHTTPTraces(w http.ResponseWriter, req *http.Request) 
 	// whose sender is another kubescrape, whose exporter reads 400 as PERMANENT
 	// and drops the batch. The CAP is the parameter (4 MiB here, 16 MiB for
 	// application pushes); the byte budget is deliberately absent, as is the
-	// in-flight semaphore — see the type doc.
+	// in-flight semaphore — see the type doc. So is the door COUNTER: this
+	// process serves the unauthenticated application ports too, and
+	// kubescrape_ingest_body_rejected_total means "an application push was
+	// refused at a listener nothing authenticates" (otlpingest.NewBodyReader).
 	body, charged, err := r.body.Read(req)
 	if err != nil {
 		otlpingest.WriteBodyError(w, err)

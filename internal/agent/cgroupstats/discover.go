@@ -29,7 +29,6 @@ package cgroupstats
 
 import (
 	"context"
-	"os"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -52,7 +51,7 @@ const (
 	maxPodDepth = 3
 	// maxScanDirs bounds one discovery pass. The tree is small on any sane
 	// node; the bound is there so a pathological or hostile hierarchy cannot
-	// stall the sampler goroutine, and it is counted when it binds.
+	// stall the discovery goroutine, and it is counted when it binds.
 	maxScanDirs = 8192
 )
 
@@ -64,7 +63,9 @@ type containerDir struct {
 }
 
 // discover re-reads the container set, reconciles it against what is tracked,
-// and resolves the identity of anything new. It runs on the sampler goroutine.
+// and resolves the identity of anything new. It runs on the DISCOVERY
+// goroutine, never on the sampler's (see the Sampler doc for the stall that
+// sharing produced).
 //
 // The two phases are separate because they have opposite locking needs:
 // reconciliation touches the tracked set and must hold the mutex the sample
@@ -98,12 +99,12 @@ func (s *Sampler) walk() (found []containerDir, complete, ok bool) {
 		// have nothing in common but the word "discovery" — this one is a
 		// missing mount and a silent pipeline, that one is a directory the
 		// sampler could not read inside an otherwise working hierarchy.
-		listErrRoot.Inc()
+		s.c.listErrRoot.Inc()
 		s.log.Warn("cgroup discovery failed", "root", s.root, "error", err)
 		return nil, false, false
 	}
 	if !complete {
-		listErrSubtree.Inc()
+		s.c.listErrSubtree.Inc()
 		if s.listWarn.Allow(readWarnEvery) {
 			s.log.Warn("cgroup discovery could not list part of the hierarchy (throttled); nothing is retired this pass, since an unreadable directory is indistinguishable from a container that went away",
 				"root", s.root)
@@ -139,7 +140,7 @@ func (s *Sampler) reconcile(found []containerDir, complete bool) {
 		// every pod's sandbox cgroup is permanently pending, a large node's
 		// sandboxes crowded its real containers out of the sampled set.
 		if len(s.pending) >= s.maxPending {
-			cappedPending.Inc()
+			s.c.cappedPending.Inc()
 			if !s.capped {
 				s.capped = true
 				s.log.Warn("cgroup sampler is at its unresolved-cgroup cap; further cgroups are not even offered to the resolver",
@@ -231,7 +232,7 @@ func (s *Sampler) repointLocked(c *container, d containerDir, base int) {
 //
 // An unresolved container is NOT SAMPLED at all, which is the same rule the
 // export applies one seam later. A series attributed to nothing does not join
-// the cadvisor series it explains, which is the only reason these six gauges
+// the cadvisor series it explains, which is the only reason these ten gauges
 // exist; declining at discovery too means the sampler never holds descriptors,
 // never reads, and never accumulates a window for a container whose data can
 // never be exported. It also removes the pod SANDBOX for free: the pause
@@ -241,9 +242,12 @@ func (s *Sampler) repointLocked(c *container, d containerDir, base int) {
 // cadvisorbatch.go already carries.
 //
 // The pass is BUDGETED. A node full of cgroups whose metadata service has gone
-// slow would otherwise stall the sampler goroutine — which is also the sweep
-// goroutine — for as long as every lookup takes; what does not fit rolls to the
-// next pass. Which is exactly why maxUnresolvedAge is measured from the first
+// slow would otherwise hold this goroutine for as long as every lookup takes,
+// pushing the next pass out behind it and starving the just-started containers
+// waiting to be sampled; what does not fit rolls to the next pass. (The budget
+// no longer protects the SWEEP — that is what moving discovery onto its own
+// goroutine did — but it still bounds how far behind the container set may
+// get.) Which is exactly why maxUnresolvedAge is measured from the first
 // ANSWERED FAILURE rather than from discovery: a rolled-over entry has not been
 // asked about yet, and abandoning it for a grace period it never got to spend
 // would turn one slow minute into a node-wide drop to the ten-minute cadence.
@@ -332,7 +336,7 @@ func (s *Sampler) track(id string, now time.Time) {
 	// it in the queue never are).
 	p.lastTry = now
 	if len(s.tracked) >= s.maxTracked {
-		cappedTracked.Inc()
+		s.c.cappedTracked.Inc()
 		if !s.cappedFDs {
 			s.cappedFDs = true
 			s.log.Warn("cgroup sampler is at its container cap; further containers are resolved but not sampled",
@@ -384,9 +388,9 @@ func (s *Sampler) track(id string, now time.Time) {
 //     evidence tally.
 func (s *Sampler) resolveFailed(id string, now time.Time, answered bool) {
 	if answered {
-		unresolvedPending.Inc()
+		s.c.unresolvedPending.Inc()
 	} else {
-		unresolvedUnreachable.Inc()
+		s.c.unresolvedUnreachable.Inc()
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -414,7 +418,7 @@ func (s *Sampler) resolveFailed(id string, now time.Time, answered bool) {
 	}
 	if !p.gaveUp && now.Sub(p.firstFail) >= maxUnresolvedAge {
 		p.gaveUp = true
-		unresolvedAbandoned.Inc()
+		s.c.unresolvedAbandoned.Inc()
 		s.log.Debug("cgroup sampler gave up resolving a container cgroup; it is not exported (one per pod is expected — the sandbox/pause cgroup appears in no pod's containerStatuses)",
 			"cgroup", p.dir, "podUID", p.podUID, "retryIn", abandonRetryEvery)
 	}
@@ -426,7 +430,8 @@ func (s *Sampler) resolveFailed(id string, now time.Time, answered bool) {
 // discoverContainers walks root and returns every container cgroup under it,
 // plus whether the listing was complete (see Sampler.walk).
 func discoverContainers(root string) ([]containerDir, bool, error) {
-	sc := &scan{root: root, budget: maxScanDirs, byID: map[string]int{}, complete: true}
+	sc := &scan{root: root, budget: maxScanDirs, byID: map[string]int{}, complete: true,
+		buf: make([]byte, dirBufBytes)}
 	roots, err := sc.kubepodsRoots()
 	if err != nil {
 		return nil, false, err
@@ -456,23 +461,23 @@ type scan struct {
 	// the shortest wins and the choice is deterministic across passes.
 	byID     map[string]int
 	complete bool
+	// buf is the getdents64 scratch shared by every directory of the pass; see
+	// readdir_linux.go for why the listing does not go through os.ReadDir.
+	buf []byte
 }
 
 func (sc *scan) walkPods(dir string, depth int) {
 	if depth > maxPodDepth || sc.budget <= 0 {
 		return
 	}
-	ents, err := os.ReadDir(dir)
+	names, err := subdirs(dir, sc.buf)
 	if err != nil {
 		sc.complete = false
 		return
 	}
 	sc.budget--
-	for _, e := range ents {
-		if !e.IsDir() {
-			continue
-		}
-		p := filepath.Join(dir, e.Name())
+	for _, name := range names {
+		p := filepath.Join(dir, name)
 		rel, err := filepath.Rel(sc.root, p)
 		if err != nil {
 			continue
@@ -483,7 +488,7 @@ func (sc *scan) walkPods(dir string, depth int) {
 		podUID, cid, isContainer := cgroupid.Parse(rel)
 		if isContainer {
 			if j, ok := sc.byID[cid]; ok {
-				if len(e.Name()) < len(filepath.Base(sc.out[j].path)) {
+				if len(name) < len(filepath.Base(sc.out[j].path)) {
 					sc.out[j] = containerDir{id: cid, podUID: podUID, path: p}
 				}
 				continue
@@ -511,41 +516,56 @@ func (sc *scan) kubepodsRoots() ([]string, error) {
 	if isKubepodsSlice(filepath.Base(sc.root)) {
 		return []string{sc.root}, nil
 	}
-	// The root's own readdir is the one error worth REPORTING rather than
+	if sc.budget <= 0 {
+		return nil, nil
+	}
+	// The ROOT's own listing is the one error worth REPORTING rather than
 	// merely flagging: it is what an unmounted or unreadable
 	// -cgroup-stats-root looks like, and the whole pipeline is silent without
-	// it.
-	if _, err := os.ReadDir(sc.root); err != nil {
+	// it. So it is read HERE, once, outside the recursion — which is what lets
+	// everything below it be error-free by construction. (It used to be probed
+	// with a SECOND full listing of the root before the walk read it again; one
+	// listing answers both questions.)
+	top, err := subdirs(sc.root, sc.buf)
+	if err != nil {
 		return nil, err
 	}
+	sc.budget--
+
+	// Below the root a failed listing is an INCOMPLETE pass (sc.complete),
+	// which retires nothing, and never an error — so descend returns none.
+	// This used to be one recursive func returning error with a `depth == 0`
+	// arm inside it, and since every recursive call passes depth+1 that arm was
+	// reachable only from the outermost call: the error plumbing threaded
+	// through the loop could not fire, and read as if a subtree failure might
+	// abort the pass, which is the opposite of the rule above.
 	var out []string
-	var walk func(dir string, depth int)
-	walk = func(dir string, depth int) {
-		if depth > maxRootSearchDepth || sc.budget <= 0 {
-			return
-		}
-		ents, err := os.ReadDir(dir)
-		if err != nil {
-			sc.complete = false
-			return
-		}
-		sc.budget--
-		for _, e := range ents {
-			if !e.IsDir() {
-				continue
-			}
-			name := e.Name()
+	var descend func(dir string, depth int)
+	visit := func(dir string, depth int, names []string) {
+		for _, name := range names {
 			p := filepath.Join(dir, name)
 			if isKubepodsSlice(name) {
 				out = append(out, p)
 				continue // pods live below it; nothing above them is another root
 			}
 			if depth == 0 || strings.Contains(name, "kube") {
-				walk(p, depth+1)
+				descend(p, depth+1)
 			}
 		}
 	}
-	walk(sc.root, 0)
+	descend = func(dir string, depth int) {
+		if depth > maxRootSearchDepth || sc.budget <= 0 {
+			return
+		}
+		names, err := subdirs(dir, sc.buf)
+		if err != nil {
+			sc.complete = false
+			return
+		}
+		sc.budget--
+		visit(dir, depth, names)
+	}
+	visit(sc.root, 0, top)
 	return out, nil
 }
 

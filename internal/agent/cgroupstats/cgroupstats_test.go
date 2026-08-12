@@ -698,7 +698,7 @@ func TestTheCgroupPathSuppliesBothHalvesOfTheIdentity(t *testing.T) {
 // Caching the resource for the container's lifetime does fix identity FLAPPING,
 // and it buys staleness that defeats the feature just as thoroughly: an edited
 // pod or namespace label — or a `.Node` attribute template that resolved before
-// node metadata landed — leaves these six gauges carrying one attribute set
+// node metadata landed — leaves these ten gauges carrying one attribute set
 // while cadvisor's carry another, under the same job and instance. Two
 // attribute sets that disagree do not join, and joining is the entire premise.
 func TestResourceIsRebuiltFromCurrentMetadataOnEveryExport(t *testing.T) {
@@ -894,14 +894,14 @@ func TestUnresolvedContainerIsRetriedOnEachDiscoveryPass(t *testing.T) {
 		t.Fatal("the refused container was tracked anyway")
 	}
 
-	h.t = h.t.Add(discoverEvery)
+	h.t = h.t.Add(DefaultDiscoverInterval)
 	h.discover()
 	if got := len(h.res.asked()); got != 2 {
 		t.Fatalf("the resolver was asked %d times over two passes, want 2 (an unresolved container must be retried)", got)
 	}
 
 	h.res.accept(hexID(1))
-	h.t = h.t.Add(discoverEvery)
+	h.t = h.t.Add(DefaultDiscoverInterval)
 	h.discover()
 	if got := h.Containers(); got != 1 {
 		t.Fatalf("Containers() = %d after the metadata service caught up, want 1", got)
@@ -926,7 +926,7 @@ func TestUnresolvableContainerIsGivenUpOnAndRetriedSlowly(t *testing.T) {
 	before := obs.CgroupUnresolved.WithLabelValues("abandoned").Value()
 	h.discover()
 	for range 3 { // a few passes, all inside the grace period
-		h.t = h.t.Add(discoverEvery)
+		h.t = h.t.Add(DefaultDiscoverInterval)
 		h.discover()
 	}
 	if got := obs.CgroupUnresolved.WithLabelValues("abandoned").Value(); got != before {
@@ -942,7 +942,7 @@ func TestUnresolvableContainerIsGivenUpOnAndRetriedSlowly(t *testing.T) {
 
 	// And no longer asked about on every pass.
 	asked := len(h.res.asked())
-	h.t = h.t.Add(discoverEvery)
+	h.t = h.t.Add(DefaultDiscoverInterval)
 	h.discover()
 	if got := len(h.res.asked()); got != asked {
 		t.Errorf("an abandoned cgroup was retried on the very next pass (%d -> %d); one lookup per pod per %s is the point of giving up", asked, got, abandonRetryEvery)
@@ -981,17 +981,22 @@ func TestResolutionBudgetBoundsOnePass(t *testing.T) {
 	}
 }
 
-// The six names are the contract with every dashboard that will join them
+// The ten names are the contract with every dashboard that will join them
 // against cadvisor's. A rename is a wire break, so it costs a deliberate test
-// edit.
-func TestMetricNamesAreExactlyTheDocumentedSix(t *testing.T) {
+// edit. (An ADDITION is not a break, which is what made _mean and _samples
+// affordable; see the argument above the name block.)
+func TestMetricNamesAreExactlyTheDocumentedTen(t *testing.T) {
 	want := []string{
 		"container_cpu_usage_stddev",
 		"container_cpu_usage_max",
 		"container_cpu_usage_min",
+		"container_cpu_usage_mean",
+		"container_cpu_usage_samples",
 		"container_memory_working_set_bytes_stddev",
 		"container_memory_working_set_bytes_max",
 		"container_memory_working_set_bytes_min",
+		"container_memory_working_set_bytes_mean",
+		"container_memory_working_set_bytes_samples",
 	}
 	if len(metricNames) != len(want) {
 		t.Fatalf("metricNames has %d entries, want %d", len(metricNames), len(want))
@@ -1014,6 +1019,9 @@ func TestUnitsCannotRewriteTheNames(t *testing.T) {
 	if unitBytes != "" {
 		t.Errorf("unitBytes = %q; the memory names carry _bytes in the MIDDLE, so a stated unit risks "+
 			"container_memory_working_set_bytes_max_bytes, which joins nothing", unitBytes)
+	}
+	if !strings.HasPrefix(unitSamples, "{") || !strings.HasSuffix(unitSamples, "}") {
+		t.Errorf("unitSamples = %q; a bare unit would render container_cpu_usage_samples_samples", unitSamples)
 	}
 }
 
@@ -1077,7 +1085,14 @@ func TestEachContainerIsTimedFromItsOwnRead(t *testing.T) {
 	// And a second sweep re-times each of them individually rather than
 	// stamping one shared instant again: the divisor of every rate derived
 	// below is that container's own read-to-read distance.
+	//
+	// The base moves a whole sampling period first, because the clock above
+	// only models the offsets WITHIN a sweep: back to back it would put the two
+	// sweeps 40ms apart, which sampleOne's minimum-elapsed guard refuses to
+	// derive a rate from (and, refusing, deliberately KEEPS the old stamp — the
+	// behaviour TestAStalledSweepDoesNotInflateTheMax pins).
 	sweep1 := len(handed)
+	base = base.Add(time.Second)
 	h.sample()
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -1444,11 +1459,11 @@ func TestACapRefusedContainerDoesNotStarveTheQueue(t *testing.T) {
 		t.Fatalf("Containers() = %d after the first pass, want 1", got)
 	}
 	// Pass 2 asks about the next one, which the cap refuses.
-	h.t = h.t.Add(discoverEvery)
+	h.t = h.t.Add(DefaultDiscoverInterval)
 	h.discover()
 	// Pass 3 must ask about the LAST one — the only pending container that has
 	// never been tried.
-	h.t = h.t.Add(discoverEvery)
+	h.t = h.t.Add(DefaultDiscoverInterval)
 	h.discover()
 
 	asked := h.res.asked()
@@ -1657,7 +1672,7 @@ func TestAListedButUnreadableContainerIsRetired(t *testing.T) {
 	// discovery pass that treated it as new would re-open its descriptors
 	// fifteen seconds later and start the same three dead windows again — a
 	// retirement undone before it saved anything.
-	h.t = h.t.Add(discoverEvery)
+	h.t = h.t.Add(DefaultDiscoverInterval)
 	h.discover()
 	if got := h.Containers(); got != 0 {
 		t.Errorf("Containers() = %d one discovery pass after the retirement: the cgroup is still listed, and re-adopting it puts the descriptors and the failing reads straight back", got)
@@ -1666,7 +1681,7 @@ func TestAListedButUnreadableContainerIsRetired(t *testing.T) {
 		t.Errorf("Unresolved() = %d, want the retired container held on the slow clock (a give-up is not a deletion — whatever broke may heal)", got)
 	}
 	for range 4 { // more passes, still nothing re-adopted
-		h.t = h.t.Add(discoverEvery)
+		h.t = h.t.Add(DefaultDiscoverInterval)
 		h.discover()
 		h.advance(time.Second)
 	}
@@ -1776,15 +1791,21 @@ func TestAVanishedContainersFinalWindowIsNeverAHeldValue(t *testing.T) {
 // pipeline emits one ResourceMetrics PER CONTAINER: descriptor text is repeated
 // once per container per metric per export, forever.
 //
-// The first cut of these six descriptions carried a ~480-byte explanatory note
-// apiece. Measured by this test's own fixture — 110 containers, a realistic
-// resource — that was 410,740 bytes per export of which 288,640 were
-// description: 70% of the payload, four bytes of prose shipped and parsed for
-// every byte of data, every scrape interval, forever. (Shipped and parsed, not
-// STORED: Prometheus and Mimir keep HELP per metric family, not per series, so
-// the repetition is a wire and parse cost and not a storage one.) Shortening
-// them took the payload to 173,800 bytes with 51,700 of description, a 58% cut
-// overall and an 82% cut in descriptor text.
+// The first cut of the descriptions — six of them then — carried a ~480-byte
+// explanatory note apiece. Measured by this test's own fixture at that revision
+// — 110 containers, a realistic resource — that was 410,740 bytes per export of
+// which 288,640 were description: 70% of the payload, four bytes of prose
+// shipped and parsed for every byte of data, every scrape interval, forever.
+// (Shipped and parsed, not STORED: Prometheus and Mimir keep HELP per metric
+// family, not per series, so the repetition is a wire and parse cost and not a
+// storage one.) Shortening them took that payload to 173,800 bytes with 51,700
+// of description, a 58% cut overall and an 82% cut in descriptor text.
+//
+// The set is TEN now, and the fixture re-measures at 237,930 bytes with 86,900
+// of description (37%) — 790 bytes of prose per container per export. Both
+// budgets below are asserted because they answer different questions and the
+// per-metric one alone let the per-container one grow unwatched: a longer
+// description is caught per metric, and a wider SET is caught per container.
 //
 // That is the same arithmetic promscrape's cadvisor and split batchers charge
 // to their chunk estimate (metricMeta.apply / metaFieldBytes), and the reason
@@ -1817,8 +1838,8 @@ func TestDescriptionsAreAffordablePerContainer(t *testing.T) {
 	for i := range containers {
 		snap = append(snap, windowPair{
 			id: hexID(i + 1), podUID: podUID(i + 1),
-			cpu: signalOut{emit: true, stddev: 0.25, max: 4, min: 0.01},
-			mem: signalOut{emit: true, stddev: 1 << 20, max: 512 << 20, min: 16 << 20},
+			cpu: signalOut{emit: true, stddev: 0.25, max: 4, min: 0.01, mean: 0.4, samples: 29},
+			mem: signalOut{emit: true, stddev: 1 << 20, max: 512 << 20, min: 16 << 20, mean: 64 << 20, samples: 30},
 		})
 	}
 	md := h.build(context.Background(), snap, h.t)
@@ -1845,11 +1866,28 @@ func TestDescriptionsAreAffordablePerContainer(t *testing.T) {
 	share := float64(desc) / float64(total)
 	t.Logf("%d containers: %d bytes total, %d bytes of description (%.0f%%); the pre-shortening fixture measured 410740 / 288640 (70%%)",
 		containers, total, desc, share*100)
-	// The absolute budget is the one that means something — the share is partly
-	// a property of how small six float64s are — but both are asserted, because
-	// a payload that is mostly prose is the thing that went wrong.
-	if per := desc / containers; per > 700 {
-		t.Errorf("descriptions cost %d bytes per container per export (%d for six metrics), over the 700-byte budget", per, desc)
+	// TWO budgets, because one of them was silently lost. This test is named for
+	// the PER-CONTAINER cost — the thing an operator pays, once per container
+	// per export, forever — and it was rebased onto a per-metric budget alone
+	// when _mean and _samples were added. The per-metric cost did not move (79
+	// bytes, then and now); the per-container cost went from 474 to 790 bytes
+	// and sailed past the 700-byte limit this test used to enforce, with
+	// nothing left watching it.
+	//
+	// So: per-METRIC catches a description growing, per-CONTAINER catches the
+	// SET growing. 850 is the measured 790 plus headroom deliberately smaller
+	// than one more gauge (+79), so an eleventh gauge has to arrive together
+	// with a new number here rather than instead of one.
+	const perMetricBudget = 90
+	if per := desc / containers / len(metricNames); per > perMetricBudget {
+		t.Errorf("descriptions cost %d bytes per metric per container per export (%d bytes for %d metrics on %d containers), over the %d-byte budget",
+			per, desc, len(metricNames), containers, perMetricBudget)
+	}
+	const perContainerBudget = 850
+	if per := desc / containers; per > perContainerBudget {
+		t.Errorf("descriptions cost %d bytes per container per export (%d metrics), over the %d-byte budget: "+
+			"this is the number repeated once per container on every scrape interval, and widening the metric SET spends it just as surely as lengthening a description does",
+			per, len(metricNames), perContainerBudget)
 	}
 	if share > 0.40 {
 		t.Errorf("descriptions are %.0f%% of the payload (%d of %d bytes) for %d containers. "+
@@ -1858,7 +1896,10 @@ func TestDescriptionsAreAffordablePerContainer(t *testing.T) {
 	}
 	// And each one has to be short enough that a longer one is a deliberate act
 	// rather than an accident.
-	for _, d := range []string{descCPUStddev, descCPUMax, descCPUMin, descMemStddev, descMemMax, descMemMin} {
+	for _, d := range []string{
+		descCPUStddev, descCPUMax, descCPUMin, descCPUMean, descCPUSamples,
+		descMemStddev, descMemMax, descMemMin, descMemMean, descMemSamples,
+	} {
 		if len(d) > 110 {
 			t.Errorf("description is %d bytes, over the 110-byte budget: %q", len(d), d)
 		}
@@ -1949,7 +1990,7 @@ func TestAbandonedSandboxesCostOneLookupPerSlowRetry(t *testing.T) {
 		for i := range n {
 			mem += 1 << 20
 			setMem(t, live, mem, 0)
-			h.advance(discoverEvery)
+			h.advance(DefaultDiscoverInterval)
 			h.discover()
 			if i%2 == 1 {
 				h.exportOnce(t)
@@ -2012,7 +2053,7 @@ func TestAnUnreachableServiceAbandonsNothingAndRecoversPromptly(t *testing.T) {
 	h.discover()
 	// Half an hour of outage: many times maxUnresolvedAge.
 	for range 30 * 4 {
-		h.t = h.t.Add(discoverEvery)
+		h.t = h.t.Add(DefaultDiscoverInterval)
 		h.discover()
 	}
 	if got := obs.CgroupUnresolved.WithLabelValues("abandoned").Value(); got != before {
@@ -2024,7 +2065,7 @@ func TestAnUnreachableServiceAbandonsNothingAndRecoversPromptly(t *testing.T) {
 
 	// The service comes back.
 	h.res.setDown(false)
-	h.t = h.t.Add(discoverEvery)
+	h.t = h.t.Add(DefaultDiscoverInterval)
 	h.discover()
 	if got := h.Containers(); got != 1 {
 		t.Fatalf("Containers() = %d on the first pass after the metadata service recovered, want 1", got)
@@ -2084,7 +2125,7 @@ func TestSomebodyElsesSuccessDoesNotReconsiderADefinitiveMiss(t *testing.T) {
 	asked := len(h.res.asked())
 	for i := 2; i <= 5; i++ {
 		makeContainer(t, systemdContainerDir(h.root, i, hexID(i)), 0, uint64(i)<<20, 0)
-		h.t = h.t.Add(discoverEvery)
+		h.t = h.t.Add(DefaultDiscoverInterval)
 		h.discover()
 	}
 	extra := len(h.res.asked()) - asked - 4 // minus the four new containers

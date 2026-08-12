@@ -178,12 +178,20 @@ type Config struct {
 // Tailer tails all container logs in a directory. All methods run on the
 // single Run goroutine.
 type Tailer struct {
-	cfg           Config
-	log           *slog.Logger
-	sources       []*compiledSource
-	scanDirs      map[string]struct{} // fixed base dirs of all include globs, watched for new files
-	files         map[string]*file    // by path
-	batch         []entry
+	cfg      Config
+	log      *slog.Logger
+	sources  []*compiledSource
+	scanDirs map[string]struct{} // fixed base dirs of all include globs, watched for new files
+	files    map[string]*file    // by path
+	batch    []entry
+	// flushed is the batch the CURRENT flush is exporting: flush swaps it out of
+	// batch (so batch is empty again the moment the export starts, as every
+	// caller's read loop requires) and walks it once more after the outcome, to
+	// record which of its entries a rewind could still bring back
+	// (file.observed / logchain.Input.Observed). The two slices ping-pong, so a
+	// flush costs no per-entry copy and no allocation; the price is one extra
+	// batch-sized array, cleared after every flush so it pins no bodies.
+	flushed       []entry
 	readBuf       []byte // reusable read scratch (single sweep goroutine)
 	warnedListing bool   // a glob-failure warning was already emitted
 	// lastListingOK reports whether the most recent scan actually listed the

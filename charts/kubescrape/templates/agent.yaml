@@ -242,6 +242,11 @@ spec:
                    and reports as kubescrape_cgroup_containers 0. */}}
             - -cgroup-stats
             - -cgroup-stats-interval={{ .Values.agent.cgroupStats.interval }}
+            {{- /* The discovery cadence is the pipeline's blind spot for
+                   short-lived containers, and lowering it spends the METADATA
+                   SERVICE's request budget rather than this node's CPU — which
+                   is why it is a value and not a constant. */}}
+            - -cgroup-stats-discover-interval={{ .Values.agent.cgroupStats.discoverInterval }}
             {{- with .Values.agent.cgroupStats.root }}
             - -cgroup-stats-root={{ . }}
             {{- end }}

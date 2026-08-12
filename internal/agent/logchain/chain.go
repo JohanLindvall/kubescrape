@@ -59,6 +59,9 @@ type Config struct {
 	Enrich bool
 	// LogMetrics observes EVERY record, kept or dropped: a metric counting
 	// errors must not fall to zero because a rule stopped shipping the lines.
+	// Once per RECORD, though, not once per export attempt — see Input.Observed.
+	// Per record rather than per delivery is the exact claim: a record withheld by
+	// a commit clamp and then rewound is DELIVERED twice and observed once.
 	LogMetrics *metrics.DynamicMetricSet
 	// Rules is the global ordered keep/drop/sample chain, evaluated last.
 	Rules *logline.LineFilter
@@ -103,6 +106,61 @@ type Input[K comparable] struct {
 	// a pod drop is final, a pod keep still passes the global rules. Only the
 	// tailer has them (pod annotation config); nil everywhere else.
 	PodRules *logline.LineFilter
+	// Observed says an earlier pass over the same bytes already applied this
+	// record's observations, so this pass must not repeat them. The record is
+	// still built and the rules still RUN — their verdict decides whether it
+	// ships, and it is free to differ from the earlier pass's (a hot-reloaded
+	// rule set, or a `sample` rule, whose verdict is a counter rather than a
+	// function of the bytes); only the counting is suppressed, with the
+	// consequences for the drop tally spelled out where Emit counts it.
+	//
+	// It exists because delivery is at-least-once and observation is not.
+	// Producers that rebuild a failed batch from source — the tailer rewinds
+	// its files and re-reads them next sweep — would otherwise multiply every
+	// user-configured counter and histogram by the number of attempts an outage
+	// spanned, biasing cumulative series upward for good and spiking rate()
+	// during exactly the outage the operator is reading them to diagnose.
+	// (journald takes the other route: it retries the same batch in place, so
+	// nothing is rebuilt and nothing sets this.) The producer owns the proof —
+	// for the tailer, the exact identity (segment-qualified byte range plus a
+	// hash of the joined body) of every entry a rewind can bring back.
+	//
+	// EXACTLY TWO THINGS ARE GATED, and the narrowness is deliberate rather
+	// than an oversight:
+	//
+	//   - Config.LogMetrics.Add, the operator's own counters/histograms. These
+	//     are the ones that matter: they are cumulative, someone alerts on
+	//     them, and nothing downstream can undo a double count.
+	//   - obs.LogRulesDropped, the tally of records the keep/drop chain refused.
+	//
+	// NOT gated: everything else, and the rule rather than the list is what to
+	// remember — anything a producer counts OUTSIDE this chain still multiplies
+	// by the number of passes a rewind spans. Two classes, with examples that
+	// are not an exhaustive list:
+	//
+	//   - counted inside the work this chain calls, a package away:
+	//     kubescrape_log_scrubbed_total (logscrub.Scrub, from Chain.Line) and
+	//     kubescrape_log_enriched_total /
+	//     kubescrape_log_enrich_time_rejected_total (logenrich.Apply).
+	//   - counted on a producer's READ side, before a record exists and so
+	//     before this chain can be told anything: for the tailer,
+	//     kubescrape_log_rate_limited_total (both label values, in consume),
+	//     kubescrape_log_bytes_total and kubescrape_log_oversized_dropped_total
+	//     — a rewind re-reads the bytes, so it re-counts them.
+	//
+	// All of these are PIPELINE-ACTIVITY diagnostics — how many lines carried a
+	// secret, what fraction parsed as JSON, how much a rate limit is biting —
+	// rather than series an operator builds alerts or dashboards on, and the
+	// read-side ones describe passes over bytes, which is honestly what they
+	// count. Threading a suppression flag through two more packages, or down to
+	// the read path, to fix a diagnostic counter was not judged worth it; the
+	// point of writing it down is that the guarantee above is not read as wider
+	// than it is.
+	//
+	// Under-claiming is safe (a re-observation, i.e. the behaviour before this
+	// existed); over-claiming loses observations outright, so a producer must
+	// only set it where the bytes provably went through the chain before.
+	Observed bool
 }
 
 // Chain holds the per-flush state: the key resolver with its closures bound
@@ -163,7 +221,8 @@ func (c *Chain[K]) Line(body string) (string, logattrs.Result) {
 
 // Emit builds one record and reports whether it was KEPT. A false return means
 // the rules dropped it: the producer must still advance its offsets/cursor, and
-// the drop is already counted (obs.LogRulesDropped).
+// the drop is already counted (obs.LogRulesDropped — unless Input.Observed says
+// an earlier pass over the same bytes already counted it).
 func (c *Chain[K]) Emit(p Producer, in Input[K]) bool {
 	scratched := c.cfg.Rules != nil || in.PodRules != nil
 	if scratched && !c.rules {
@@ -186,7 +245,7 @@ func (c *Chain[K]) Emit(p Producer, in Input[K]) bool {
 	if c.cfg.Enrich {
 		logenrich.Apply(lr, in.Body)
 	}
-	if c.cfg.LogMetrics != nil {
+	if c.cfg.LogMetrics != nil && !in.Observed {
 		// Metric label/value keys resolve against the record's attributes
 		// (line-derived + enriched) first, then this line's lifted resource
 		// attributes, then the resource; the resource itself becomes the
@@ -223,7 +282,35 @@ func (c *Chain[K]) Emit(p Producer, in Input[K]) bool {
 		return true
 	}
 	c.scratch.RemoveIf(func(plog.LogRecord) bool { return true })
-	obs.LogRulesDropped.Inc()
+	// Counted for the pass that FIRST put these bytes through the chain, never
+	// for a re-read of them. So a record whose VERDICT differs between the two
+	// passes is attributed to the wrong one: kept on pass one and dropped on
+	// pass two is not counted at all, dropped on pass one and kept on pass two
+	// is counted although it shipped.
+	//
+	// TWO things flip a verdict, and only one of them is rare. A hot-reloaded
+	// rule set landing inside a rewind window is the rare one. The other is a
+	// `sample` keep rule, which needs no reload and skews on EVERY rewind: a
+	// sample verdict is not a function of the bytes at all but of a per-rule
+	// atomic counter (internal/logline: `(picked.Add(1)-1)%every == 0`), which
+	// the rewound pass already advanced, so the re-read keeps a DIFFERENT
+	// subset — and every drop in it is suppressed here. Feeding the same three
+	// matching lines through a `sample: 0.5` rule twice keeps lines 1 and 3,
+	// then line 2.
+	//
+	// It is still the right direction, because this error does not grow with
+	// the outage while the alternative does. Over one batch of N matching
+	// lines a sample rule keeps floor(N/every) or ceil(N/every) of them
+	// whichever pass runs, so what is counted (the first pass's drops) and what
+	// actually shipped (the last pass's) differ by the phase alone — one record
+	// in the example above, and never by more than that batch however many
+	// attempts the outage spans, because only the first pass counts at all.
+	// Counting every pass instead multiplies both this tally and the operator's
+	// own log metrics by the number of attempts: wrong for every record, and
+	// worst for exactly the config that drops the most of them.
+	if !in.Observed {
+		obs.LogRulesDropped.Inc()
+	}
 	return false
 }
 

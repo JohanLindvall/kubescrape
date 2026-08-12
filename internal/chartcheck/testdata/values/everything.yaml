@@ -55,6 +55,10 @@ agent:
   cgroupStats:
     enabled: true
     interval: 500ms
+    # Deliberately NOT the 15s default: a template that hardcoded the discovery
+    # cadence would render identically to the default and this golden would not
+    # notice.
+    discoverInterval: 30s
     root: /host/sys/fs/cgroup
   ingest:
     enabled: true

@@ -209,7 +209,7 @@ func NewServer(cfg ServerConfig) *Server {
 		reserveWindow: grpcReserveWindow,
 		reservedWarns: logdedupe.New(len(cfg.ReservedAttrs.Resource)+len(cfg.ReservedAttrs.Element), reservedWarnEvery),
 	}
-	s.body = &BodyReader{max: maxIngestBody, budget: s.buffer}
+	s.body = newBodyReader(maxIngestBody, s.buffer, log)
 	return s
 }
 
@@ -495,7 +495,11 @@ func (g *tracesGRPC) Export(ctx context.Context, req ptraceotlp.ExportRequest) (
 // sequence is load-bearing and its steps are ordered deliberately:
 //
 //  1. Read the body (BodyReader: media type, gzip, caps, byte budget) —
-//     failures answer through WriteBodyError (413/415/429/400).
+//     failures answer through WriteBodyError: 413 over either cap, 415 on the
+//     media type, 429 + Retry-After when the byte budget is full, 503 for an
+//     upload that ENDED rather than arrived (a killed pod, a rolled
+//     deployment, the server's own ReadTimeout — retryable, and deliberately
+//     not 400 or 408; see BodyErrorStatus), 400 for everything else.
 //  2. The charge is released when the HANDLER returns, not when the read
 //     ends: the body stays alive through enrichment and the forward, so
 //     releasing earlier would leave the bytes resident and unaccounted.
@@ -529,6 +533,12 @@ func (s *Server) servePush(w http.ResponseWriter, r *http.Request,
 	}
 	defer s.release()
 	if err := unmarshal(body); err != nil {
+		// The same door as the read above, and the same reason label: a body
+		// that arrived intact and is not OTLP. This was answered and counted by
+		// NOTHING while the seam three lines up owned a reason literally called
+		// "malformed" — the likelier of the two ways to be wrong was the
+		// invisible one.
+		s.body.noteMalformed(r, err)
 		http.Error(w, "malformed OTLP "+signal+" payload", http.StatusBadRequest)
 		return
 	}

@@ -107,10 +107,17 @@ spec:
             # ONE average per -scrape-interval, so a container that spikes to 4
             # cores for 2s inside a 30s window is reported as ~0.27 cores. This
             # samples each container's cgroup every second and ships the
-            # distribution — container_cpu_usage_{stddev,max,min} and
-            # container_memory_working_set_bytes_{stddev,max,min}, six gauges
-            # per container per window, next to the cadvisor series they
-            # explain.
+            # distribution — container_cpu_usage_{stddev,max,min,mean,samples}
+            # and container_memory_working_set_bytes_{stddev,max,min,mean,
+            # samples}, ten gauges per container per window, next to the
+            # cadvisor series they explain. (`_samples` is that window's own
+            # reading count: below 2 the four beside it are the previous
+            # window's, one reading not being a distribution.) Measured against
+            # 200 real cgroup v2 scopes, sampler-on vs sampler-off in separate
+            # processes, eight pairs: 0.48% of one core (0.43-0.51%) and
+            # +5.5 MiB RSS (+4.7 to +6.3) — the memory being the per-window
+            # export rather than anything retained (~1.5 KiB per container),
+            # and a floor: a 300s window reads +7.2 MiB.
             #
             # Uncomment the flag AND the cgroup volume + mount below TOGETHER.
             # Without the host's /sys/fs/cgroup the agent sees only its OWN
@@ -130,7 +137,19 @@ spec:
             # cgroup out of the payload: watch
             # kubescrape_cgroup_unresolved_containers, where one entry per pod
             # is normal and permanent.
+            #
+            # -cgroup-stats-discover-interval (default 15s) is how often the
+            # container set is re-read, and it is the pipeline's BLIND SPOT: a
+            # container that starts and exits between two passes is never
+            # sampled and leaves no trace. Measured at the default, the share
+            # with at least one exported window is 0% at a 2s lifetime, 20% at
+            # 5s, 53% at 10s, 87% at 15s and 100% from 17s up — this interval
+            # plus the two sampling periods a distribution needs, which is the
+            # rule at any setting (at 5s, everything from 7s up). Lowering it
+            # costs the METADATA SERVICE one lookup per unresolved cgroup a pass
+            # (one per pod is permanent — the sandbox), not this node's CPU.
             #- -cgroup-stats
+            #- -cgroup-stats-discover-interval=15s
           env:
             - name: NODE_NAME
               valueFrom:

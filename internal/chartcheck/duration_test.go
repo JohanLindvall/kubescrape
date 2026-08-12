@@ -49,6 +49,7 @@ var durationValues = []struct {
 	{path: "agent.scrapeInterval", flag: "scrape-interval"},
 	{path: "agent.journald.flushInterval", flag: "journald-flush-interval"},
 	{path: "agent.cgroupStats.interval", flag: "cgroup-stats-interval"},
+	{path: "agent.cgroupStats.discoverInterval", flag: "cgroup-stats-discover-interval"},
 	{path: "events.flushInterval", flag: "events-flush-interval"},
 	{path: "events.positionInterval", flag: "events-position-interval"},
 	{path: "serviceGraph.spanMetricsInterval", flag: "ingest-span-metrics-interval"},

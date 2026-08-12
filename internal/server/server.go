@@ -14,7 +14,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/cespare/xxhash/v2"
+	"github.com/zeebo/xxh3"
 
 	"github.com/JohanLindvall/kubescrape/internal/logdedupe"
 	"github.com/JohanLindvall/kubescrape/internal/obs"
@@ -813,15 +813,27 @@ func etagMatches(header, etag string) bool {
 	return false
 }
 
-// bodyHash is the ETag digest. xxhash rather than hash/fnv: FNV-1a is a
-// byte-at-a-time loop (~1.2 GB/s) and this runs over the FULL body of every
-// cached response, including every 304 revalidation — most visibly on
-// /v1/nodes/{node}/targets, which re-serializes every pod document on the node
-// each scrape cycle. ETags are opaque to clients (etagMatches only string-
-// compares, W/ prefix stripped), so the digest function is a free choice; the
-// only visible effect is one full 200 per cached client at the upgrade
-// boundary, exactly as any other ETag change would produce.
-func bodyHash(b []byte) uint64 { return xxhash.Sum64(b) }
+// bodyHash is the ETag digest: xxh3, 128 bits wide.
+//
+// Not hash/fnv, because FNV-1a is a byte-at-a-time loop (~1.2 GB/s) and this
+// runs over the FULL body of every cached response, including every 304
+// revalidation — most visibly on /v1/nodes/{node}/targets, which re-serializes
+// every pod document on the node each scrape cycle.
+//
+// 128 bits rather than 64 because of what a collision COSTS here, not because
+// one is likely: two bodies sharing a digest make writeCached answer a
+// revalidation with 304, and the agent then keeps serving the PREVIOUS node's
+// target list — a wrong answer that persists until the body changes again and
+// looks exactly like a correctly-cached response while it lasts. A digest is
+// also the one place where the input is attacker-influenced in principle (a pod
+// annotation lands in the body), and 64-bit xxhash is not collision-resistant
+// against a chosen input. The width is close to free: xxh3 computes the 128-bit
+// result in the same pass as the 64-bit one.
+//
+// ETags stay opaque to clients (etagMatches only string-compares, W/ prefix
+// stripped), so widening the digest costs one full 200 per cached client at the
+// upgrade boundary, exactly as any other ETag change would.
+func bodyHash(b []byte) xxh3.Uint128 { return xxh3.Hash128(b) }
 
 func writeError(w http.ResponseWriter, status int, msg string) {
 	writeJSON(w, status, map[string]string{"error": msg})

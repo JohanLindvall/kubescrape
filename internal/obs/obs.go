@@ -765,9 +765,16 @@ func RegisterLogMetricsDrops(set *metrics.DynamicMetricSet) {
 	Registry.CounterFuncVec("kubescrape_log_metrics_dropped_capped_total",
 		"Log-metric observations dropped because that metric's label-set cardinality cap was reached, by metric name. sum() over the label is the total. Absent until something is dropped: the label set is data-driven.",
 		"metric", set.DroppedCappedByMetric)
-	Registry.CounterFunc("kubescrape_log_metrics_dropped_collision_total",
-		"Log-metric observations dropped since start because of a series hash collision.",
-		func() float64 { return float64(set.DroppedCollision()) })
+	// kubescrape_log_metrics_dropped_collision_total was REMOVED here, and the
+	// removal is the point rather than a tidy-up. It counted observations the
+	// store refused because a second "check" hash disagreed on a primary-hash
+	// hit — a guard that existed because the primary key was 64 bits. The key is
+	// 128 bits now, which puts a collision at ~1.5e-31 per series map (10000
+	// label sets, birthday bound), so the guard was removed with it and this
+	// counter could never move again. A counter that is structurally incapable
+	// of moving is worse than no counter: it reads as evidence of absence, and
+	// an operator alerting on it would believe they were watching something.
+	// See metrics/labels.go's strHash for the full argument.
 	Registry.CounterFunc("kubescrape_log_metrics_dropped_nan_total",
 		"Log-metric observations dropped since start because the extracted value was NaN or +/-Inf (neither is representable as a sample).",
 		func() float64 { return float64(set.DroppedNaN()) })

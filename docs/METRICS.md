@@ -135,7 +135,6 @@ is the documented alert for the non-buffered tailer.
 | `kubescrape_log_lag_bytes` | — | Total backlog across tracked files: bytes on disk not yet exported and committed. |
 | `kubescrape_log_lag_max_bytes` | — | Largest per-file backlog: bytes on disk not yet exported and committed (per-file breakdown on /debug/tailer). |
 | `kubescrape_log_metrics_dropped_capped_total` | `metric` | Log-metric observations dropped because that metric's label-set cardinality cap was reached, by metric name. sum() over the label is the total. Absent until something is dropped: the label set is data-driven. |
-| `kubescrape_log_metrics_dropped_collision_total` | — | Log-metric observations dropped since start because of a series hash collision. |
 | `kubescrape_log_metrics_dropped_nan_total` | — | Log-metric observations dropped since start because the extracted value was NaN or +/-Inf (neither is representable as a sample). |
 | `kubescrape_log_metrics_dropped_undelivered_total` | — | Undelivered log-metric resources dropped because the re-offer buffer filled or the collector rejected them PERMANENTLY. Taking a snapshot is DESTRUCTIVE (it seals aggregation windows, zeroes idled samples and deletes expired ones), so a transiently failed export retains its samples for the next one; this counts what a collector outage longer than that buffer could hold, plus definitively rejected chunks that retrying could never deliver. These are genuinely lost observations — the ones the retention cannot save. |
 | `kubescrape_log_oversized_dropped_total` | — | Unterminated lines discarded for exceeding the per-entry size bound (no newline within MaxEntryBytes+4096). |
@@ -199,4 +198,4 @@ is the documented alert for the non-buffered tailer.
 | `kubescrape_transform_errors_total` | `signal` | Transform program invocations that failed (the batch is NOT exported; the error propagates to the producer's retry path). |
 | `kubescrape_transform_reloads_total` | `outcome` | Transforms-file reloads by outcome (applied, failed — a failed compile keeps the last good program). |
 
-137 metrics.
+136 metrics.

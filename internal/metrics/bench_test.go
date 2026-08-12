@@ -7,6 +7,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/zeebo/xxh3"
+
 	"github.com/JohanLindvall/kubescrape/internal/testrace"
 	"go.opentelemetry.io/collector/pdata/pcommon"
 )
@@ -414,3 +416,44 @@ func TestDynamicAddHistogramAllocationBudget(t *testing.T) {
 			"per matched line on the tailer's sweep goroutine)", allocs)
 	}
 }
+
+// benchLabels is a typical log-derived data-point label set.
+func benchLabels() labels {
+	var l labels
+	l = l.set("status", "2xx")
+	l = l.set("method", "GET")
+	l = l.set("route", "/api/v1/orders/{id}")
+	l = l.set("tenant", "acme-corp")
+	return l
+}
+
+// BenchmarkLabelsAccums measures the series-identity fold directly, undiluted
+// by the rest of Add: this is the per-observation string hashing and folding
+// that a change of hash function moves.
+func BenchmarkLabelsAccums(b *testing.B) {
+	l := benchLabels()
+	b.ReportAllocs()
+	var h xxh3.Uint128
+	for b.Loop() {
+		h = l.hashAccum()
+	}
+	sinkAccum(h)
+}
+
+// BenchmarkResourceAccum measures the resource half of the same key. The
+// resource is hashed once per flush by Bind, but a resource carries more (and
+// longer) pairs than the data-point labels do.
+func BenchmarkResourceAccum(b *testing.B) {
+	res := benchResource()
+	b.ReportAllocs()
+	var rk xxh3.Uint128
+	for b.Loop() {
+		rk = resourceAccum(res)
+	}
+	sinkAccum(rk)
+}
+
+//go:noinline
+func sinkAccum(a xxh3.Uint128) { accumSink = a }
+
+var accumSink xxh3.Uint128

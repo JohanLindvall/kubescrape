@@ -1,4 +1,4 @@
-// Tests for the series store (series.go): hashing/collision guards, expiry
+// Tests for the series store (series.go): hashing/fold guards, expiry
 // and cardinality caps, and gauge actions/windowed aggregations.
 package metrics
 
@@ -8,168 +8,82 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/zeebo/xxh3"
+	"go.opentelemetry.io/collector/pdata/pcommon"
 )
 
-// TestHistogramLeFoldExact pins the fold-subtract path in baseAccum against
-// the ground truth: a caller-supplied "le" pair contributes NOTHING to a
-// histogram's identity — the accumulators with it stripped must be EXACTLY
-// the le-less label set's, so a line carrying one lands on the same sample as
-// its siblings without it, and the stored labels drop it.
-func TestHistogramLeFoldExact(t *testing.T) {
-	s := newTestSeries(seriesSpec{name: "h", kind: kindHistogram, buckets: []float64{0.1, 0.5, 1}})
-
-	for _, lbls := range []labels{
-		labels{}.set("handler", "/api").set("le", "0.5"),
-		labels{}.set("le", "+Inf"),
-	} {
-		base, check := s.baseAccum(lbls)
-		wantBase, wantCheck := lbls.without(leLabel).accums()
-		if base != wantBase || check != wantCheck {
-			t.Errorf("labels %v: baseAccum (%#x,%#x) != le-less accums (%#x,%#x)",
-				lbls, base, check, wantBase, wantCheck)
-		}
+// TestHistogramLeIsRefusedAtCompile pins the config-load half of the "le" rule.
+// A histogram keyed on a label set containing "le" would split its distribution
+// into one sample per value, each rendering a full bucket set, so the label is
+// refused where its name is known — statically, from the spec plus labelPrefix.
+func TestHistogramLeIsRefusedAtCompile(t *testing.T) {
+	_, err := newTestSet([]Dynamic{{
+		Name:    "h",
+		Type:    HistogramType,
+		Value:   "ms",
+		Buckets: []float64{1, 5},
+		Labels:  []string{"le=$bucket"},
+	}})
+	if err == nil {
+		t.Fatal("a histogram rule setting le compiled; want a startup error")
+	}
+	if !strings.Contains(err.Error(), "le") || !strings.Contains(err.Error(), "h") {
+		t.Errorf("error must name the label and the metric: %v", err)
 	}
 
-	// End to end: with and without "le" merge into ONE sample, stored without it.
-	s.observe(labels{}.set("handler", "/api"), 0.3, resKey{}, emptyResource, nil)
-	s.observe(labels{}.set("handler", "/api").set("le", "0.5"), 0.3, resKey{}, emptyResource, nil)
-	if len(s.db) != 1 {
-		t.Fatalf("caller-supplied le split the series: %d samples, want 1", len(s.db))
+	// The prefixed form is the same label and must be refused identically —
+	// the name is checked AFTER labelPrefix is applied.
+	if _, err := newTestSet([]Dynamic{{
+		Name: "h2", Type: HistogramType, Value: "ms", Buckets: []float64{1},
+		LabelPrefix: "l", Labels: []string{"e=$bucket"},
+	}}); err == nil {
+		t.Error("labelPrefix composing to \"le\" compiled; want a startup error")
 	}
-	for _, samp := range s.db {
-		if samp.count != 2 {
-			t.Fatalf("count = %d, want 2 (both observations on one sample)", samp.count)
-		}
-		if strings.Contains(samp.labels, "le=") {
-			t.Fatalf("stored labels carry le: %q", samp.labels)
-		}
+
+	// Non-histograms are untouched: there "le" is an ordinary label.
+	if _, err := newTestSet([]Dynamic{{
+		Name: "c", Type: CounterType, Value: "1", Labels: []string{"le=$bucket"},
+	}}); err != nil {
+		t.Errorf("le on a counter must stay legal: %v", err)
 	}
 }
 
-// TestPreHashedHistogramLeFallback: the registry fast path precomputes the
-// bound label set's hash WITHOUT baseAccum's le-stripping, so a histogram
-// bound to a label set that carries "le" must fall back to the general path —
-// or the same conceptual series would live under two hashes depending on
-// which constructor observed it.
-func TestPreHashedHistogramLeFallback(t *testing.T) {
-	s := newTestSeries(seriesSpec{name: "h", kind: kindHistogram, buckets: []float64{1}, expiration: registryExpiration})
-	newBound(s, labels{}.set("k", "v").set("le", "0.5")).observe(0.5)
-	newBound(s, labels{}.set("k", "v")).observe(0.5)
-	if len(s.db) != 1 {
-		t.Fatalf("le-carrying bound split the series: %d samples, want 1", len(s.db))
+// TestHistogramLeIsRefusedByEmitDirect pins the runtime half. A Starlark
+// script's label map is the ONE door whose keys are not known at compile time,
+// so it carries the only remaining check.
+func TestHistogramLeIsRefusedByEmitDirect(t *testing.T) {
+	set, err := newTestSet([]Dynamic{
+		{Name: "h", Type: HistogramType, Value: "ms", Buckets: []float64{1, 5}},
+		{Name: "c", Type: CounterType, Value: "1"},
+	})
+	if err != nil {
+		t.Fatal(err)
 	}
-	for _, samp := range s.db {
-		if samp.count != 2 {
-			t.Fatalf("count = %d, want 2 (both bounds on one sample)", samp.count)
-		}
-		if strings.Contains(samp.labels, "le=") {
-			t.Fatalf("stored labels carry le: %q", samp.labels)
+	res := pcommon.NewMap()
+
+	err = set.EmitDirect("h", 0.5, map[string]string{"le": "1"}, res)
+	if err == nil {
+		t.Fatal("emit_metric set le on a histogram; want an error")
+	}
+	if !strings.Contains(err.Error(), "le") {
+		t.Errorf("error must name the label: %v", err)
+	}
+	// Refused means NOT observed: a rejected emit must not leave a sample.
+	for _, r := range set.rules {
+		if r.series.name == "h" && len(r.series.db) != 0 {
+			t.Errorf("refused emit still admitted %d samples", len(r.series.db))
 		}
 	}
 
-	// The fast path's NaN guard: counted, never admitted.
-	newBound(s, labels{}.set("k", "v")).observe(math.NaN())
-	if got := s.drops.NaN(); got != 1 {
-		t.Fatalf("NaN drops = %d, want 1", got)
+	// Same label on a non-histogram is fine, and a histogram without it is fine.
+	if err := set.EmitDirect("c", 1, map[string]string{"le": "1"}, res); err != nil {
+		t.Errorf("le on a counter must stay legal: %v", err)
+	}
+	if err := set.EmitDirect("h", 0.5, map[string]string{"route": "/x"}, res); err != nil {
+		t.Errorf("histogram without le must emit: %v", err)
 	}
 }
-
-// TestCollisionDropObserve verifies the check-hash rejection on both observe
-// paths: a primary-hash hit with a differing check is dropped and counted,
-// never merged.
-func TestCollisionDropObserve(t *testing.T) {
-	setTimeForTest(time.Unix(1_700_400_000, 0))
-	defer testEpoch.Store(0)
-
-	s := newTestSeries(seriesSpec{name: "c", kind: kindCounter})
-	lbls := labels{}.set("u", "alice")
-	s.observe(lbls, 1, resKey{}, emptyResource, nil)
-
-	for _, samp := range s.db {
-		samp.check++ // simulate: existing sample belongs to a colliding series
-	}
-	s.observe(lbls, 5, resKey{}, emptyResource, nil)
-	if got := s.drops.Collision(); got != 1 {
-		t.Fatalf("collision drops = %d, want 1", got)
-	}
-	for _, samp := range s.db {
-		if samp.value != 1 {
-			t.Fatalf("collision merged data: value = %v, want 1", samp.value)
-		}
-	}
-
-	// observePreHashed path (registry counters).
-	s2 := newTestSeries(seriesSpec{name: "c2", kind: kindCounter, expiration: registryExpiration})
-	b := newBound(s2, labels{}.set("k", "v"))
-	b.observe(1)
-	for _, samp := range s2.db {
-		samp.check++
-	}
-	b.observe(1)
-	if got := s2.drops.Collision(); got != 1 {
-		t.Fatalf("observePreHashed collision drops = %d, want 1", got)
-	}
-}
-
-// TestHistogramCollisionAllOrNothing: a check mismatch must drop the whole
-// observation — sum, count and every bucket slot together. (One sample per
-// label set makes a PARTIALLY recorded family unrepresentable by construction;
-// what is left to pin is that a collision leaves the sample untouched.)
-func TestHistogramCollisionAllOrNothing(t *testing.T) {
-	setTimeForTest(time.Unix(1_700_400_100, 0))
-	defer testEpoch.Store(0)
-
-	s := newTestSeries(seriesSpec{name: "h", kind: kindHistogram, buckets: []float64{1, 10}})
-	lbls := labels{}.set("k", "v")
-	s.observe(lbls, 0.5, resKey{}, emptyResource, nil) // one sample, count 1
-
-	for _, samp := range s.db {
-		samp.check++ // simulate: existing sample belongs to a colliding series
-	}
-	s.observe(lbls, 0.5, resKey{}, emptyResource, nil)
-	if got := s.drops.Collision(); got != 1 {
-		t.Fatalf("collision drops = %d, want 1", got)
-	}
-	for _, samp := range s.db {
-		if samp.count != 1 {
-			t.Fatalf("collision merged data: count = %d, want 1 (labels %s)", samp.count, samp.labels)
-		}
-		for i, c := range samp.counts {
-			if want := []uint64{1, 1}[i]; c != want {
-				t.Fatalf("bucket %d recorded after a collision drop: %d, want %d", i, c, want)
-			}
-		}
-	}
-}
-
-// TestResourceAccumCollisionCaught: two resources whose PRIMARY accumulators
-// collide (simulated) but whose check accumulators differ must not merge — the
-// observation is dropped and counted (angle 4).
-func TestResourceAccumCollisionCaught(t *testing.T) {
-	setTimeForTest(time.Unix(1_700_400_200, 0))
-	defer testEpoch.Store(0)
-
-	s := newTestSeries(seriesSpec{name: "c", kind: kindCounter})
-	lbls := labels{}.set("k", "v")
-	resA := res(map[string]string{"k8s.pod.name": "pod-a"})
-	resB := res(map[string]string{"k8s.pod.name": "pod-b"})
-
-	s.observe(lbls, 1, resKey{accum: 12345, check: 1}, resA, nil)
-	s.observe(lbls, 1, resKey{accum: 12345, check: 2}, resB, nil)
-	if got := s.drops.Collision(); got != 1 {
-		t.Fatalf("collision drops = %d, want 1", got)
-	}
-	if len(s.db) != 1 {
-		t.Fatalf("samples = %d, want 1 (collision must not admit)", len(s.db))
-	}
-	for _, samp := range s.db {
-		if samp.value != 1 {
-			t.Fatalf("value = %v, want 1 (pod-b's observation must be dropped, not merged)", samp.value)
-		}
-	}
-}
-
-// --- Angle 2: expiry + cardinality caps -------------------------------------
 
 // TestEvictThenReadmitAtCap: at maxSize, a new label set is refused; after the
 // old sample expires and is swept, the SAME refused hash must be admitted.
@@ -179,9 +93,9 @@ func TestEvictThenReadmitAtCap(t *testing.T) {
 	defer testEpoch.Store(0)
 
 	s := newTestSeries(seriesSpec{name: "c", kind: kindCounter, maxSize: 1, expiration: 60 * time.Second})
-	s.observe(labels{}.set("u", "a"), 1, resKey{}, emptyResource, nil)
+	s.observe(labels{}.set("u", "a"), 1, xxh3.Uint128{}, emptyResource, nil)
 
-	s.observe(labels{}.set("u", "b"), 1, resKey{}, emptyResource, nil)
+	s.observe(labels{}.set("u", "b"), 1, xxh3.Uint128{}, emptyResource, nil)
 	if got := s.drops.Capped(); got != 1 {
 		t.Fatalf("cap drops = %d, want 1", got)
 	}
@@ -202,7 +116,7 @@ func TestEvictThenReadmitAtCap(t *testing.T) {
 	}
 
 	// The same hash re-arrives: admitted as a fresh series.
-	s.observe(labels{}.set("u", "b"), 1, resKey{}, emptyResource, nil)
+	s.observe(labels{}.set("u", "b"), 1, xxh3.Uint128{}, emptyResource, nil)
 	if len(s.db) != 1 {
 		t.Fatalf("re-admission after evict failed: db = %d", len(s.db))
 	}
@@ -225,7 +139,7 @@ func TestExpiryEmitsBeforeDiscarding(t *testing.T) {
 
 	// maxAge 10s, export gap 30s — a legal configuration (maxAge: 10s).
 	s := newTestSeries(seriesSpec{name: "c", kind: kindCounter, expiration: 10 * time.Second})
-	s.observe(labels{}.set("k", "v"), 1, resKey{}, emptyResource, nil)
+	s.observe(labels{}.set("k", "v"), 1, xxh3.Uint128{}, emptyResource, nil)
 
 	setTimeForTest(time.Unix(t0+30, 0)) // first export 30s later
 	var total float64
@@ -233,7 +147,7 @@ func TestExpiryEmitsBeforeDiscarding(t *testing.T) {
 		total += samp.value
 	}
 	setTimeForTest(time.Unix(t0+31, 0))
-	s.observe(labels{}.set("k", "v"), 1, resKey{}, emptyResource, nil)
+	s.observe(labels{}.set("k", "v"), 1, xxh3.Uint128{}, emptyResource, nil)
 	setTimeForTest(time.Unix(t0+32, 0))
 	for _, samp := range s.snapshot() {
 		total += samp.value
@@ -266,7 +180,7 @@ func TestAggregationsAcrossThreeExports(t *testing.T) {
 		s := newTestSeries(seriesSpec{name: "g", kind: kindGauge, action: c.action, expiration: time.Hour})
 		lbls := labels{}.set("m", "1")
 		for _, v := range []float64{10, 5, 20} {
-			s.observe(lbls, v, resKey{}, emptyResource, nil)
+			s.observe(lbls, v, xxh3.Uint128{}, emptyResource, nil)
 		}
 		// Export 1: the window's aggregate; this seals it.
 		out := s.snapshot()
@@ -283,7 +197,7 @@ func TestAggregationsAcrossThreeExports(t *testing.T) {
 		// old min/max/Welford state).
 		setTimeForTest(time.Unix(t0+120, 0))
 		for _, v := range []float64{2, 4} {
-			s.observe(lbls, v, resKey{}, emptyResource, nil)
+			s.observe(lbls, v, xxh3.Uint128{}, emptyResource, nil)
 		}
 		out = s.snapshot()
 		if len(out) != 1 || math.Abs(out[0].value-c.w2) > eps {
@@ -431,7 +345,7 @@ func TestDeleteEmitsNeverExportedSample(t *testing.T) {
 	// maxAge 30s, export interval 5m: both legal, and their combination means
 	// idle == 300-30 == 270 >= 240 at the very first export.
 	s := newTestSeries(seriesSpec{name: "c", kind: kindCounter, expiration: 30 * time.Second})
-	s.observe(labels{}.set("k", "v"), 7, resKey{}, emptyResource, nil)
+	s.observe(labels{}.set("k", "v"), 7, xxh3.Uint128{}, emptyResource, nil)
 
 	setTimeForTest(time.Unix(t0+300, 0)) // the first export after the observation
 	var total float64
@@ -451,7 +365,7 @@ func TestAggregatingGaugeEmittedBeforeDelete(t *testing.T) {
 
 	// action=avg is an aggregating gauge; expiration 30s, export interval 5m.
 	s := newTestSeries(seriesSpec{name: "g", kind: kindGauge, action: actionAvg, expiration: 30 * time.Second})
-	s.observe(labels{}.set("k", "v"), 5, resKey{}, emptyResource, nil)
+	s.observe(labels{}.set("k", "v"), 5, xxh3.Uint128{}, emptyResource, nil)
 
 	setTimeForTest(time.Unix(t0+300, 0)) // first export after the observation
 	got := s.snapshot()
@@ -476,7 +390,7 @@ func TestAggregatingGaugeNotReEmittedAtDelete(t *testing.T) {
 	defer testEpoch.Store(0)
 
 	s := newTestSeries(seriesSpec{name: "g", kind: kindGauge, action: actionAvg, expiration: 30 * time.Second})
-	s.observe(labels{}.set("k", "v"), 5, resKey{}, emptyResource, nil)
+	s.observe(labels{}.set("k", "v"), 5, xxh3.Uint128{}, emptyResource, nil)
 
 	// First snapshot within the grace window: the aggregating branch emits the
 	// window (avg 5) and marks it exported.
@@ -571,13 +485,13 @@ func TestHistogramIdleEmitKeepsAllBuckets(t *testing.T) {
 		buckets: []float64{1, 5, 7.5, 10}, expiration: 30 * time.Second})
 	lbls := labels{}.set("route", "/x")
 
-	s.observe(lbls, 5, resKey{}, emptyResource, nil) // lands in le>=5
-	if len(s.snapshot()) == 0 {                      // full export: marks the sample exported
+	s.observe(lbls, 5, xxh3.Uint128{}, emptyResource, nil) // lands in le>=5
+	if len(s.snapshot()) == 0 {                            // full export: marks the sample exported
 		t.Fatal("first snapshot emitted nothing")
 	}
 
 	setTimeForTest(time.Unix(t0+15, 0))
-	s.observe(lbls, 8, resKey{}, emptyResource, nil) // lands only in le>=10
+	s.observe(lbls, 8, xxh3.Uint128{}, emptyResource, nil) // lands only in le>=10
 
 	setTimeForTest(time.Unix(t0+75, 0)) // past maxAge -> idle reset branch
 	out := s.snapshot()

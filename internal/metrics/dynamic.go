@@ -11,7 +11,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/cespare/xxhash/v2"
+	"github.com/zeebo/xxh3"
 	"go.opentelemetry.io/collector/pdata/pcommon"
 
 	"github.com/JohanLindvall/kubescrape/internal/logline"
@@ -174,7 +174,7 @@ func (r *metricRule) readValue(values func(string) (float64, bool), line string)
 // it matches. buf/rbuf are reused for the data-point and resource label sets and
 // returned (set may grow them). resAccum is the hash of res (the line's resource
 // attributes), computed once by the caller.
-func (r *metricRule) observe(values func(string) (float64, bool), lookup func(string) string, res pcommon.Map, resAccum resKey, line string, ctx *logline.MatchContext, buf, rbuf labels) (labels, labels) {
+func (r *metricRule) observe(values func(string) (float64, bool), lookup func(string) string, res pcommon.Map, resAccum xxh3.Uint128, line string, ctx *logline.MatchContext, buf, rbuf labels) (labels, labels) {
 	if !r.match.Match(lookup, ctx) {
 		return buf, rbuf
 	}
@@ -331,10 +331,6 @@ func (s *DynamicMetricSet) DroppedCappedByMetric() map[string]float64 {
 	return s.drops.CappedByMetric()
 }
 
-// DroppedCollision counts observations this set rejected because their hash
-// matched an existing sample of a DIFFERENT series.
-func (s *DynamicMetricSet) DroppedCollision() uint64 { return s.drops.Collision() }
-
 // DroppedNaN counts observations this set rejected because the extracted value
 // was not finite (NaN or +/-Inf).
 func (s *DynamicMetricSet) DroppedNaN() uint64 { return s.drops.NaN() }
@@ -428,7 +424,7 @@ func NewDynamicMetricSet(metrics []Dynamic, opts ...Option) (*DynamicMetricSet, 
 type BoundResource struct {
 	set   *DynamicMetricSet
 	res   pcommon.Map
-	accum resKey
+	accum xxh3.Uint128
 }
 
 // Bind precomputes the per-resource state for repeated Adds. Safe on a nil
@@ -449,7 +445,7 @@ func (b BoundResource) Add(values ValueFunc, lookup func(string) string, line st
 	b.set.add(values, lookup, b.res, b.accum, line)
 }
 
-func (s *DynamicMetricSet) add(values ValueFunc, lookup func(string) string, resource pcommon.Map, resAccum resKey, line string) {
+func (s *DynamicMetricSet) add(values ValueFunc, lookup func(string) string, resource pcommon.Map, resAccum xxh3.Uint128, line string) {
 	ac := s.pool.Get().(*addContext)
 	ac.ctx.Reset()
 	ac.line.Reset(line)
@@ -507,6 +503,17 @@ func (s *DynamicMetricSet) EmitDirect(name string, value float64, lbls map[strin
 		if r.series.name != name {
 			continue
 		}
+		// The one runtime "le" check. Every other door into the store has
+		// static label names (config specs, checked by rejectHistogramLe;
+		// registry label sets, which come from code), but a script's label map
+		// is arbitrary — and an "le" on a histogram would split the
+		// distribution into one sample per value, each rendering its own full
+		// bucket set. An error rather than a silent drop, matching how every
+		// other mistake in emit_metric is reported.
+		if _, ok := lbls[leLabel]; ok && r.series.kind == kindHistogram {
+			return fmt.Errorf("emit_metric %q: a histogram may not set a label named %q — "+
+				"it is the bucket-bound label generated from the histogram's own buckets", name, leLabel)
+		}
 		var buf labels
 		for _, k := range slices.Sorted(maps.Keys(lbls)) {
 			buf = buf.set(k, lbls[k])
@@ -520,16 +527,18 @@ func (s *DynamicMetricSet) EmitDirect(name string, value float64, lbls map[strin
 // uniqueResourceAccum folds a resource's attributes the way resourceString
 // RENDERS them — last-wins per key — instead of one term per map ENTRY.
 //
-// resourceAccum sums a term per entry, which is right for every agent-built
+// resourceAccum XORs a term per entry, which is right for every agent-built
 // resource (they come from a Go map and cannot repeat a key) and wrong for one
 // that arrived on the wire: OTLP encodes attributes as a repeated KeyValue and
-// pdata does not dedupe on decode. {k=v, k=v} then hashes DISTINCT from {k=v}
-// while both render {k="v"}, so the two live samples put byte-identical data
-// points in one exported Metric; and {k=p, k=q} hashes IDENTICAL to {k=q, k=p}
-// in both accumulators — a sum cannot tell a multiset from its permutation —
-// so two senders' observations merge under whichever resource string was
-// frozen at admit. Neither moves a counter: the collision check is a
-// projection of the same pairs and agrees.
+// pdata does not dedupe on decode. XOR is self-inverse, so an even multiplicity
+// CANCELS: {k=v, k=v} folds to the accumulator of the EMPTY resource — bit for
+// bit — while it renders {k="v"}, so a duplicate-keyed resource collides with
+// every other duplicate-keyed resource and with the attribute-less one, and
+// their observations merge into whichever resource string was frozen at admit.
+// It moves no counter and logs nothing: the map lookup SUCCEEDS, which is the
+// whole problem. That is the price of the self-inverse fold, and it is paid by
+// the callers guaranteeing uniqueness rather than by the arithmetic — so a new
+// path that folds a resource of unknown provenance must come through here.
 //
 // EmitDirect is the door such a resource reaches the store through: a transform
 // script's emit_metric over an ingested METRICS or TRACES payload, which
@@ -537,20 +546,19 @@ func (s *DynamicMetricSet) EmitDirect(name string, value float64, lbls map[strin
 // only, and before the transform seam). It is a cold per-script-call path that
 // already allocates, so it pays the extra pass; Bind's per-flush hot path,
 // whose resources are all agent-built, is untouched.
-func uniqueResourceAccum(res pcommon.Map) resKey {
+func uniqueResourceAccum(res pcommon.Map) xxh3.Uint128 {
 	ls := make(labels, 0, res.Len())
 	res.Range(func(k string, v pcommon.Value) bool {
 		ls = ls.set(k, v.AsString())
 		return true
 	})
-	var rk resKey
+	var rk xxh3.Uint128
 	for _, e := range ls {
 		// set() already truncated the value, which is exactly what
 		// resourceAccum's truncLabelCut reslice achieves: the hashed identity
 		// must be the rendered one.
-		hk, hv := xxhash.Sum64String(e.key), xxhash.Sum64String(e.value)
-		rk.accum += combineResHash(hk, hv)
-		rk.check += combineResCheck(hk, hv)
+		hk, hv := strHash(e.key), strHash(e.value)
+		rk = xor128(rk, combineResHash(hk, hv))
 	}
 	return rk
 }

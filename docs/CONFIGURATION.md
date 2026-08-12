@@ -942,7 +942,7 @@ logMetrics:
     - name: request_duration_seconds
       type: histogram
       value: duration_s
-      buckets: [0.1, 0.5, 1, 5]
+      buckets: [0.1, 0.5, 1, 5]      # a histogram may NOT set a label named `le`
       match: ["msg=request completed"]
     - name: goroutine_panics_total  # __line__ = the whole raw line
       type: counter
@@ -988,6 +988,16 @@ any field of the line without a separate `logAttributes` rule. Additional knobs:
 count and sum (no quantiles); `counter` emits a monotonic sum (with synthetic
 zero baseline points). Rules sharing a `name` share one underlying series (and
 must agree on type/action).
+
+> **A histogram may not set a label named `le`.** It is refused at startup,
+> naming the rule. `le` is the bucket-bound label a Prometheus consumer
+> generates from the histogram's own buckets, so setting it as a dimension
+> would split one distribution into a separate series per value — each still
+> rendering a full set of buckets — and collide with the generated label
+> downstream. The same refusal applies to a `labelPrefix` that composes to
+> `le`, and to `emit_metric()` in a transform script (an error there, since a
+> script's label names are only known at runtime). On any other metric type
+> `le` is an ordinary label and stays legal.
 
 ## Agent: log scrubbing
 
@@ -1961,7 +1971,10 @@ Beyond the fields above: log records also expose `time_unix_nano` and
 * **`r.emit_metric(name, value, labels={})`** — one observation into a
   metric **declared in `logMetrics`** (declaration is where the type,
   buckets and cardinality cap live), grouped under the item's resource. An
-  undeclared name is a script error. Retries re-run scripts, so a transient
+  undeclared name is a script error, and so is a label named `le` on a
+  histogram — a script's label names are the only ones not known before the
+  agent starts, so this is where that refusal has to live (see the callout
+  under **Agent: log-derived metrics**). Retries re-run scripts, so a transient
   export failure re-emits — the same at-least-once every producer's metrics
   already have.
 

@@ -6,6 +6,8 @@ package server
 
 import (
 	"context"
+	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -16,6 +18,8 @@ import (
 	"strings"
 	"time"
 	"unicode/utf8"
+
+	"github.com/zeebo/xxh3"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/validate/content"
@@ -849,9 +853,30 @@ func (s *Server) writeCachedBody(w http.ResponseWriter, r *http.Request, body []
 	_, _ = w.Write(body)
 }
 
-// entityTag is the ETag of a response body.
-func entityTag(body []byte) string {
-	return `"` + strconv.FormatUint(bodyHash(body), 16) + `"`
+// entityTag is the ETag of a response body: the 128-bit digest as 32 hex
+// digits, high half first, in quotes.
+//
+// Rendered into a fixed-size array rather than with fmt or two FormatUint
+// calls: the width is constant, so the whole tag is one allocation (the
+// returned string) on a path that runs for every cached response including
+// every 304 revalidation. Zero-PADDING is the part that matters for
+// correctness — FormatUint drops leading zeros, which would let two distinct
+// digests render as the same tag whenever one half is small.
+func entityTag(body []byte) string { return formatTag(bodyHash(body)) }
+
+// formatTag renders one digest. Split from entityTag so the padding can be
+// asserted on a CHOSEN digest (TestEntityTagIsFixedWidthHex) — searching for a
+// body that hashes to a half with leading zeros is not a test's job.
+func formatTag(h xxh3.Uint128) string {
+	var half [8]byte
+	var out [2 + 32]byte
+	out[0] = '"'
+	binary.BigEndian.PutUint64(half[:], h.Hi)
+	hex.Encode(out[1:17], half[:])
+	binary.BigEndian.PutUint64(half[:], h.Lo)
+	hex.Encode(out[17:33], half[:])
+	out[33] = '"'
+	return string(out[:])
 }
 
 // cacheControl renders the freshness lifetime a cached 200 advertises.

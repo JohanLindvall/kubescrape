@@ -98,6 +98,9 @@ func compileRule(d *Dynamic, cfg *setConfig, shared map[string]*series) (*metric
 	if rule.resLabels, err = parseLabelTemplates(d.ResourceLabels, d.LabelPrefix); err != nil {
 		return nil, err
 	}
+	if err := rejectHistogramLe(d, kind, rule.labels); err != nil {
+		return nil, err
+	}
 	if err := rejectUnresolvableKeys(d, rule); err != nil {
 		return nil, err
 	}
@@ -500,4 +503,41 @@ func buildKeyIndex(rules []*metricRule) logline.KeyIndex {
 		}
 	}
 	return ki
+}
+
+// rejectHistogramLe refuses a histogram rule that sets a data-point label named
+// "le". The store keys a histogram on ONE sample per label set carrying its
+// whole bucket array, so an "le" in the identity splits the distribution into
+// one sample per value the lines happened to carry, each of which then renders
+// its own complete bucket set — the same conceptual histogram exported several
+// times over, none of them whole.
+//
+// "le" is also what a Prometheus consumer synthesizes per bucket from that
+// array (client_golang's const-histogram bridge does it on the Dump path), so a
+// user-set one would collide with the generated label downstream even if the
+// split did not happen.
+//
+// Refused at COMPILE time rather than coerced at observe time. The label name
+// is static — it comes from the `set=` half of the spec plus labelPrefix — so
+// nothing about it depends on the data, which makes a startup error naming the
+// rule strictly better than silently dropping the label on every line and
+// leaving the operator to wonder why their dimension never appears. The store
+// used to strip it per observation instead, which cost a probe on every
+// histogram observation and needed a matching fallback on the registry's
+// precomputed-hash path; EmitDirect keeps the only runtime check, because a
+// Starlark script's label map is the one door whose keys are not known here.
+// It takes the compiled kind and label templates rather than the rule, because
+// rule.series is not assigned until after this runs.
+func rejectHistogramLe(d *Dynamic, kind seriesKind, lbls []labelTemplate) error {
+	if kind != kindHistogram {
+		return nil
+	}
+	for _, lt := range lbls {
+		if lt.setKey == leLabel {
+			return fmt.Errorf("metric %q: a histogram may not set a label named %q — "+
+				"it is the bucket-bound label a Prometheus consumer generates from the "+
+				"histogram's own buckets, and setting it splits the distribution", d.Name, leLabel)
+		}
+	}
+	return nil
 }

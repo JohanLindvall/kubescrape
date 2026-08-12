@@ -13,6 +13,7 @@ package metrics
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"go.opentelemetry.io/collector/pdata/pcommon"
@@ -112,16 +113,20 @@ func TestBoundHistogramExportsZeroPoint(t *testing.T) {
 	}
 }
 
-func TestBoundHistogramWithLeLabelMintsNothing(t *testing.T) {
+// TestRegistryHistogramLeLabelPanics pins the registry's half of the "le" rule.
+// Label names here are compile-time literals, so the refusal is a construction
+// -time assertion: it fires while a binary builds its metrics, which every test
+// binary does, so a mistake cannot reach production without failing the build.
+func TestRegistryHistogramLeLabelPanics(t *testing.T) {
 	r := NewRegistry()
-	h := r.HistogramVec("kubescrape_test_le_seconds", "help", []float64{1, 10}, leLabel)
-	h.WithLabelValues("5")
-	if n := len(h.s.db); n != 0 {
-		t.Fatalf("materialized %d samples for an le-labelled bind; observations fold le OUT of the identity, "+
-			"so any sample created under the pre-hashed key is one nothing will ever observe into", n)
-	}
-	h.WithLabelValues("5").Observe(2)
-	if n := len(h.s.db); n != 1 {
-		t.Fatalf("samples after observing = %d, want 1", n)
-	}
+	defer func() {
+		v := recover()
+		if v == nil {
+			t.Fatal("HistogramVec accepted an le label; want a panic")
+		}
+		if msg, _ := v.(string); !strings.Contains(msg, leLabel) {
+			t.Errorf("panic must name the label: %v", v)
+		}
+	}()
+	r.HistogramVec("kubescrape_test_le_seconds", "help", []float64{1, 10}, leLabel)
 }

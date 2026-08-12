@@ -4,7 +4,7 @@ import (
 	"log/slog"
 	"testing"
 
-	"github.com/cespare/xxhash/v2"
+	"github.com/zeebo/xxh3"
 	"go.opentelemetry.io/collector/pdata/pcommon"
 )
 
@@ -17,7 +17,7 @@ func TestLabelsHashOrderIndependent(t *testing.T) {
 	if a.hash() == (labels{{"country", "ad"}, {"status", "3xx"}, {"zone", "eu"}}).hash() {
 		t.Error("different label sets share a hash")
 	}
-	if labels(nil).hash() != mixHash(0) {
+	if labels(nil).hash() != mixHash(xxh3.Uint128{}) {
 		t.Error("empty hash unexpected")
 	}
 }
@@ -27,23 +27,49 @@ func TestLabelsHashAccumFoldable(t *testing.T) {
 	// property the histogram observe path relies on.
 	base := labels{{"a", "1"}, {"b", "2"}}
 	full := append(labels{}, base...).set("le", "0.5")
-	folded := base.hashAccum() + combineHash(xxhash.Sum64String("le"), xxhash.Sum64String("0.5"))
+	// The fold is xor128, and folding a pair in must equal hashing the full set.
+	folded := xor128(base.hashAccum(), combineHash(strHash("le"), strHash("0.5")))
 	if mixHash(folded) != full.hash() {
 		t.Error("sum-folded le label does not match full hash")
 	}
 }
 
-func TestLabelsHashNoDuplicateCancellation(t *testing.T) {
-	// The regression the sum fold fixes: with XOR, an identical key=value pair
-	// contributed from two sets (data-point labels and resource labels)
-	// cancelled out, making every user's series hash identical.
-	alice := labels{{"user", "alice"}}
-	bob := labels{{"user", "bob"}}
-	if alice.hashAccum()+alice.hashAccum() == bob.hashAccum()+bob.hashAccum() {
-		t.Error("duplicated pair still cancels: distinct users share a hash")
+// TestXorFoldDependsOnCallerDedup pins the price of the XOR fold and the
+// guarantees that pay it.
+//
+// XOR is blind to EVEN MULTIPLICITY: a contribution folded twice cancels. That
+// is not a defect to fix in the arithmetic — it is the property that makes the
+// fold self-inverse, which is what resLabelsAccum's cancel relies on. It is
+// safe only because no caller can fold a duplicate, so this test asserts BOTH
+// halves: that the hazard is real, and that each door closes it.
+func TestXorFoldDependsOnCallerDedup(t *testing.T) {
+	// The hazard, stated outright: fold one pair twice and it vanishes.
+	c := combineHash(strHash("user"), strHash("alice"))
+	if xor128(c, c) != (xxh3.Uint128{}) {
+		t.Fatal("xor128 is no longer self-inverse; the cancel in resLabelsAccum depends on it")
 	}
-	if alice.checkAccum() == bob.checkAccum() {
-		t.Error("check accumulators collide for distinct values")
+
+	// Door 1: labels.set replaces by key, so a label set cannot hold one key
+	// twice — the shape that would cancel is unrepresentable.
+	l := labels{}.set("user", "alice").set("user", "alice")
+	if len(l) != 1 {
+		t.Fatalf("set kept %d entries for one key; a duplicate would cancel under XOR", len(l))
+	}
+	if l.hashAccum() == (labels{}).hashAccum() {
+		t.Fatal("a deduped single-pair set collided with the empty set")
+	}
+
+	// Door 2: a WIRE resource may legally repeat a key (OTLP encodes attributes
+	// as a repeated KeyValue; pdata does not dedupe on decode). Folded raw that
+	// would cancel to the EMPTY resource's hash — a merge with something
+	// unrelated, which is strictly worse than the sum's duplicate-series bug.
+	// uniqueResourceAccum folds through set() first, so it does not.
+	dup := dupKeyResource(t, "service.name", "a", "a")
+	if got := uniqueResourceAccum(dup); got == (xxh3.Uint128{}) {
+		t.Fatal("a resource repeating one key cancelled to the empty hash")
+	}
+	if uniqueResourceAccum(dup) != uniqueResourceAccum(res(map[string]string{"service.name": "a"})) {
+		t.Fatal("a repeated key must hash as the identity it RENDERS, which is the deduped one")
 	}
 }
 
@@ -110,29 +136,6 @@ func TestResourceLabelOverrideKeysMergedIdentity(t *testing.T) {
 	}
 }
 
-// TestAccumsMatchSeparate pins the fused accumulator to the two it replaces on
-// the observe path. If they ever diverge, series identity silently changes and
-// every existing series in a running agent would be orphaned.
-func TestAccumsMatchSeparate(t *testing.T) {
-	for _, ls := range []labels{
-		nil,
-		{},
-		{{"a", "1"}},
-		{{"zone", "eu"}, {"status", "3xx"}, {"country", "ad"}},
-		{{"le", "0.5"}, {"handler", "/api"}},
-		{{"dup", "x"}, {"dup", "x"}}, // the duplicate case XOR got wrong
-		{{"k", ""}, {"", "v"}},
-	} {
-		h, c := ls.accums()
-		if want := ls.hashAccum(); h != want {
-			t.Errorf("accums hash %d, hashAccum %d (labels %v)", h, want, ls)
-		}
-		if want := ls.checkAccum(); c != want {
-			t.Errorf("accums check %d, checkAccum %d (labels %v)", c, want, ls)
-		}
-	}
-}
-
 // Resource keys are arbitrary config-supplied strings: a key containing '='
 // (or ',', '"', '\') must round-trip String→parseLabels exactly — an
 // unescaped '=' made the parser cut the pair at the wrong place, silently
@@ -182,5 +185,30 @@ func TestLabelKeyEdgeSpaceRoundTrips(t *testing.T) {
 	rp, _ := parseLabels(plain.String())
 	if rs.String() == rp.String() {
 		t.Fatalf("%q and %q render identically as %s", " env", "env", rs.String())
+	}
+}
+
+// TestXor128IsItsOwnInverse pins the property the fold rests on: folding a
+// contribution out is the SAME operation as folding it in, which is what lets
+// resLabelsAccum cancel a resource key an extra label overrides without a
+// second primitive. Checked over values that exercise both halves.
+func TestXor128IsItsOwnInverse(t *testing.T) {
+	const max = ^uint64(0)
+	vals := []xxh3.Uint128{
+		{},
+		{Lo: 1},
+		{Hi: 1},
+		{Hi: max, Lo: max},
+		{Lo: max},
+		{Hi: max},
+		{Hi: 7, Lo: max - 3},
+		{Hi: 0x0123456789abcdef, Lo: 0xfedcba9876543210},
+	}
+	for _, a := range vals {
+		for _, b := range vals {
+			if got := xor128(xor128(a, b), b); got != a {
+				t.Errorf("xor128(xor128(%v, %v), %v) = %v, want %v", a, b, b, got, a)
+			}
+		}
 	}
 }

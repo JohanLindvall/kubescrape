@@ -18,6 +18,7 @@ require (
 	github.com/prometheus/client_model v0.6.2
 	github.com/twmb/franz-go v1.21.5
 	github.com/twmb/franz-go/pkg/kfake v0.0.0-20260727183601-4176fc0fcaf7
+	github.com/zeebo/xxh3 v1.1.0
 	go.opentelemetry.io/collector/pdata v1.64.0
 	go.starlark.net v0.0.0-20260708150628-5395d018f003
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260810153831-ec0a7760b754
@@ -54,6 +55,7 @@ require (
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/hashicorp/go-version v1.9.0 // indirect
 	github.com/json-iterator/go v1.1.12 // indirect
+	github.com/klauspost/cpuid/v2 v2.2.10 // indirect
 	github.com/modern-go/concurrent v0.0.0-20180306012644-bacd9c7ef1dd // indirect
 	github.com/modern-go/reflect2 v1.0.3-0.20250322232337-35a7c28c31ee // indirect
 	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect

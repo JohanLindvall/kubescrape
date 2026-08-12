@@ -117,6 +117,18 @@ const (
 // otherwise costs two real seconds of spinning per case.
 var wallClock = 2 * time.Second
 
+// now is the budget's clock, injectable for the same reason store.now and
+// series.now are: a test that asserts the wall-clock bound FIRES must not be a
+// race between the interpreter and the machine.
+//
+// TestWallClockBudgetFiresInAPureLoop used to bet that 1,000,000 interpreter
+// steps outrun a lowered 25ms budget. That is a property of the hardware, not
+// of this package: on a fast CPU the loop finishes first and the test fails
+// with "no error", on a slow one it passes, and on a loaded one it flaps.
+// Advancing a fake clock instead makes the assertion exact — the checkpoint
+// either consults the clock and cancels, or it does not.
+var now = time.Now
+
 // budgetKey names the thread-local the guards read. It has to be thread-local:
 // the guard builtins are created ONCE per compiled program (predeclared is
 // bound at compile time) and shared by every concurrent invocation of it, so
@@ -136,7 +148,7 @@ func budgetOf(th *starlark.Thread) *budget {
 
 // reset arms the budget for a new invocation (threads are pooled).
 func (b *budget) reset() {
-	b.start = time.Now()
+	b.start = now()
 	b.alloc = 0
 }
 
@@ -160,7 +172,7 @@ func (b *budget) overtime() error {
 	if b == nil {
 		return nil
 	}
-	if d := time.Since(b.start); d > wallClock {
+	if d := now().Sub(b.start); d > wallClock {
 		return fmt.Errorf("script ran for %s, over the %s budget for one invocation — it runs on the exporting goroutine (on the tailer, the single sweep goroutine serving every log file on the node)",
 			d.Round(time.Millisecond), wallClock)
 	}

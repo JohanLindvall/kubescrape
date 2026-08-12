@@ -7,6 +7,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/zeebo/xxh3"
+
 	"github.com/JohanLindvall/kubescrape/internal/testrace"
 	"go.opentelemetry.io/collector/pdata/pcommon"
 )
@@ -431,7 +433,7 @@ func benchLabels() labels {
 func BenchmarkLabelsAccums(b *testing.B) {
 	l := benchLabels()
 	b.ReportAllocs()
-	var h, c uint64
+	var h, c xxh3.Uint128
 	for b.Loop() {
 		h, c = l.accums()
 	}
@@ -452,6 +454,6 @@ func BenchmarkResourceAccum(b *testing.B) {
 }
 
 //go:noinline
-func sinkAccum(a, b uint64) { accumSinkA, accumSinkB = a, b }
+func sinkAccum(a, b xxh3.Uint128) { accumSinkA, accumSinkB = a, b }
 
-var accumSinkA, accumSinkB uint64
+var accumSinkA, accumSinkB xxh3.Uint128

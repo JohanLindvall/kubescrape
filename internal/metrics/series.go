@@ -8,6 +8,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/zeebo/xxh3"
 	"go.opentelemetry.io/collector/pdata/pcommon"
 )
 
@@ -175,7 +176,7 @@ type sample struct {
 	// check is the independent second hash of the sample's identity; a lookup
 	// whose primary hash matches but whose check differs is a 64-bit
 	// collision between distinct series and is rejected instead of merged.
-	check   uint64
+	check   xxh3.Uint128
 	initial bool
 	// sealed marks an aggregation window as already emitted; the next observed
 	// value starts a fresh window (min/max/avg/first/last gauges).
@@ -197,7 +198,7 @@ type expiringSample struct {
 // each expiring after a period of inactivity and capped in number.
 type series struct {
 	mu   sync.Mutex
-	db   map[uint64]*expiringSample
+	db   map[xxh3.Uint128]*expiringSample
 	name string
 	desc string
 	kind seriesKind
@@ -268,7 +269,7 @@ func newSeries(spec seriesSpec) *series {
 		startEpochClock()
 	}
 	s := &series{
-		db:         make(map[uint64]*expiringSample),
+		db:         make(map[xxh3.Uint128]*expiringSample),
 		drops:      dr,
 		now:        spec.now,
 		name:       spec.name,
@@ -339,8 +340,8 @@ func (s *series) observe(lbls labels, value float64, resAccum resKey, res pcommo
 	now := s.epoch()
 	base, check := s.baseAccum(lbls)
 	rl := resLabelsAccum(res, resLabels)
-	base += resAccum.accum + rl.accum
-	check += resAccum.check + rl.check
+	base = add128(base, add128(resAccum.accum, rl.accum))
+	check = add128(check, add128(resAccum.check, rl.check))
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -350,7 +351,7 @@ func (s *series) observe(lbls labels, value float64, resAccum resKey, res pcommo
 // observePreHashed is the registry fast path: the bound wrappers bump fixed
 // label sets, so the accumulators AND the finalized hash are precomputed at
 // construction; a bump pays neither the label rehash nor the avalanche.
-func (s *series) observePreHashed(lbls labels, hash, check uint64, value float64, res pcommon.Map) {
+func (s *series) observePreHashed(lbls labels, hash, check xxh3.Uint128, value float64, res pcommon.Map) {
 	if math.IsNaN(value) || math.IsInf(value, 0) {
 		s.drops.nan.Add(1)
 		return
@@ -374,7 +375,7 @@ func (s *series) observePreHashed(lbls labels, hash, check uint64, value float64
 // recordSingle folds one observation into its sample: it admits the sample on
 // first sight and refuses a check-hash collision, then records the value. The
 // caller holds s.mu. Shared by observe and the registry's observePreHashed.
-func (s *series) recordSingle(hash, check uint64, value float64, lbls labels, now int64, res pcommon.Map, resLabels labels) {
+func (s *series) recordSingle(hash, check xxh3.Uint128, value float64, lbls labels, now int64, res pcommon.Map, resLabels labels) {
 	samp := s.db[hash]
 	if samp == nil {
 		samp = s.admit(hash, check, lbls, now, res, resLabels)
@@ -407,7 +408,7 @@ func (s *series) recordSingle(hash, check uint64, value float64, lbls labels, no
 // real bump is still the first bump. Only the Registry's bound wrappers reach
 // it — a DynamicMetricSet's label sets come from log DATA, where a series
 // nothing has observed is exactly what should not exist.
-func (s *series) materialize(lbls labels, hash, check uint64) {
+func (s *series) materialize(lbls labels, hash, check xxh3.Uint128) {
 	if s.kind == kindHistogram {
 		if _, ok := lbls.get(leLabel); ok {
 			// baseAccum folds an "le" OUT of a histogram's identity, so the
@@ -431,13 +432,13 @@ func (s *series) materialize(lbls labels, hash, check uint64) {
 // rendering artifact of the Prometheus exposition, never part of a stored
 // series' identity, so a line carrying one must land on the same sample as its
 // siblings without it.
-func (s *series) baseAccum(lbls labels) (base, check uint64) {
+func (s *series) baseAccum(lbls labels) (base, check xxh3.Uint128) {
 	base, check = lbls.accums()
 	if s.kind == kindHistogram {
 		if v, ok := lbls.get(leLabel); ok {
 			hk, hv := strHash(leLabel), strHash(v)
-			base -= combineHash(hk.Lo, hv.Lo)
-			check -= combineCheck(hk.Hi, hv.Hi)
+			base = sub128(base, combineHash(hk, hv))
+			check = sub128(check, combineCheck(hk, hv))
 		}
 	}
 	return base, check
@@ -446,7 +447,7 @@ func (s *series) baseAccum(lbls labels) (base, check uint64) {
 // admit inserts a new sample for a previously unseen label combination, or
 // returns nil (warning at most hourly) when the cardinality cap is reached. It
 // runs only on the cold path, so materializing the label set here is cheap.
-func (s *series) admit(hash, check uint64, lbls labels, now int64, res pcommon.Map, resLabels labels) *expiringSample {
+func (s *series) admit(hash, check xxh3.Uint128, lbls labels, now int64, res pcommon.Map, resLabels labels) *expiringSample {
 	full := lbls
 	if s.kind == kindHistogram {
 		// The stored labels mirror the identity hash, which baseAccum strips

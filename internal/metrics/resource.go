@@ -1,6 +1,7 @@
 package metrics
 
 import (
+	"github.com/zeebo/xxh3"
 	"go.opentelemetry.io/collector/pdata/pcommon"
 )
 
@@ -22,8 +23,8 @@ func resourceAccum(res pcommon.Map) resKey {
 			return true // resourceString's set drops these; the hash must too
 		}
 		hk, hv := strHash(k), strHash(s[:truncLabelCut(s)])
-		rk.accum += combineResHash(hk.Lo, hv.Lo)
-		rk.check += combineResCheck(hk.Hi, hv.Hi)
+		rk.accum = add128(rk.accum, combineResHash(hk, hv))
+		rk.check = add128(rk.check, combineResCheck(hk, hv))
 		return true
 	})
 	return rk
@@ -47,21 +48,21 @@ func resLabelsAccum(res pcommon.Map, extra labels) resKey {
 				// The subtraction must cancel resourceAccum's addition exactly,
 				// so it folds the SAME truncated view.
 				hv := strHash(s[:truncLabelCut(s)])
-				rk.accum -= combineResHash(hk.Lo, hv.Lo)
-				rk.check -= combineResCheck(hk.Hi, hv.Hi)
+				rk.accum = sub128(rk.accum, combineResHash(hk, hv))
+				rk.check = sub128(rk.check, combineResCheck(hk, hv))
 			}
 		}
 		// e.value came through set() and is already truncated.
 		hv := strHash(e.value)
-		rk.accum += combineResHash(hk.Lo, hv.Lo)
-		rk.check += combineResCheck(hk.Hi, hv.Hi)
+		rk.accum = add128(rk.accum, combineResHash(hk, hv))
+		rk.check = add128(rk.check, combineResCheck(hk, hv))
 	}
 	return rk
 }
 
 // resKey carries a resource's two order-independent hash accumulators (the
 // series key contribution and the collision-check contribution).
-type resKey struct{ accum, check uint64 }
+type resKey struct{ accum, check xxh3.Uint128 }
 
 // resourceString serializes a resource's attributes plus any extra resource
 // labels into the sorted label string used to key and later emit the per-metric

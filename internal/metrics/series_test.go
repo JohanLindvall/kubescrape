@@ -8,6 +8,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/zeebo/xxh3"
 )
 
 // TestHistogramLeFoldExact pins the fold-subtract path in baseAccum against
@@ -86,7 +88,9 @@ func TestCollisionDropObserve(t *testing.T) {
 	s.observe(lbls, 1, resKey{}, emptyResource, nil)
 
 	for _, samp := range s.db {
-		samp.check++ // simulate: existing sample belongs to a colliding series
+		// Simulate: the existing sample belongs to a colliding series. Perturb
+		// the LOW half; add128 carries, so this is a genuine 128-bit difference.
+		samp.check = add128(samp.check, xxh3.Uint128{Lo: 1})
 	}
 	s.observe(lbls, 5, resKey{}, emptyResource, nil)
 	if got := s.drops.Collision(); got != 1 {
@@ -103,7 +107,7 @@ func TestCollisionDropObserve(t *testing.T) {
 	b := newBound(s2, labels{}.set("k", "v"))
 	b.observe(1)
 	for _, samp := range s2.db {
-		samp.check++
+		samp.check = add128(samp.check, xxh3.Uint128{Lo: 1})
 	}
 	b.observe(1)
 	if got := s2.drops.Collision(); got != 1 {
@@ -124,7 +128,9 @@ func TestHistogramCollisionAllOrNothing(t *testing.T) {
 	s.observe(lbls, 0.5, resKey{}, emptyResource, nil) // one sample, count 1
 
 	for _, samp := range s.db {
-		samp.check++ // simulate: existing sample belongs to a colliding series
+		// Simulate: the existing sample belongs to a colliding series. Perturb
+		// the LOW half; add128 carries, so this is a genuine 128-bit difference.
+		samp.check = add128(samp.check, xxh3.Uint128{Lo: 1})
 	}
 	s.observe(lbls, 0.5, resKey{}, emptyResource, nil)
 	if got := s.drops.Collision(); got != 1 {
@@ -154,8 +160,8 @@ func TestResourceAccumCollisionCaught(t *testing.T) {
 	resA := res(map[string]string{"k8s.pod.name": "pod-a"})
 	resB := res(map[string]string{"k8s.pod.name": "pod-b"})
 
-	s.observe(lbls, 1, resKey{accum: 12345, check: 1}, resA, nil)
-	s.observe(lbls, 1, resKey{accum: 12345, check: 2}, resB, nil)
+	s.observe(lbls, 1, resKey{accum: xxh3.Uint128{Lo: 12345}, check: xxh3.Uint128{Lo: 1}}, resA, nil)
+	s.observe(lbls, 1, resKey{accum: xxh3.Uint128{Lo: 12345}, check: xxh3.Uint128{Lo: 2}}, resB, nil)
 	if got := s.drops.Collision(); got != 1 {
 		t.Fatalf("collision drops = %d, want 1", got)
 	}

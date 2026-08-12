@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/zeebo/xxh3"
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/pmetric"
 )
@@ -207,8 +208,8 @@ func (r *Registry) HistogramVec(name, desc string, buckets []float64, labelNames
 type bound struct {
 	s           *series
 	lbls        labels
-	base, check uint64
-	hash        uint64 // mixHash(base), precomputed — bumps skip the avalanche
+	base, check xxh3.Uint128
+	hash        xxh3.Uint128 // mixHash(base), precomputed — bumps skip the avalanche
 }
 
 func newBound(s *series, lbls labels) bound {

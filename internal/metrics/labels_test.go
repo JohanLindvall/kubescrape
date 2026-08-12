@@ -4,6 +4,7 @@ import (
 	"log/slog"
 	"testing"
 
+	"github.com/zeebo/xxh3"
 	"go.opentelemetry.io/collector/pdata/pcommon"
 )
 
@@ -16,7 +17,7 @@ func TestLabelsHashOrderIndependent(t *testing.T) {
 	if a.hash() == (labels{{"country", "ad"}, {"status", "3xx"}, {"zone", "eu"}}).hash() {
 		t.Error("different label sets share a hash")
 	}
-	if labels(nil).hash() != mixHash(0) {
+	if labels(nil).hash() != mixHash(xxh3.Uint128{}) {
 		t.Error("empty hash unexpected")
 	}
 }
@@ -26,9 +27,9 @@ func TestLabelsHashAccumFoldable(t *testing.T) {
 	// property the histogram observe path relies on.
 	base := labels{{"a", "1"}, {"b", "2"}}
 	full := append(labels{}, base...).set("le", "0.5")
-	// The fold must use the same halves production does: hashAccum folds the LOW
-	// half of each 128-bit string hash (checkAccum folds the high half).
-	folded := base.hashAccum() + combineHash(strHash("le").Lo, strHash("0.5").Lo)
+	// The fold is 128-bit wrapping addition (add128), and it must be the exact
+	// inverse of the sub128 baseAccum uses to strip an "le" back out.
+	folded := add128(base.hashAccum(), combineHash(strHash("le"), strHash("0.5")))
 	if mixHash(folded) != full.hash() {
 		t.Error("sum-folded le label does not match full hash")
 	}
@@ -40,7 +41,7 @@ func TestLabelsHashNoDuplicateCancellation(t *testing.T) {
 	// cancelled out, making every user's series hash identical.
 	alice := labels{{"user", "alice"}}
 	bob := labels{{"user", "bob"}}
-	if alice.hashAccum()+alice.hashAccum() == bob.hashAccum()+bob.hashAccum() {
+	if add128(alice.hashAccum(), alice.hashAccum()) == add128(bob.hashAccum(), bob.hashAccum()) {
 		t.Error("duplicated pair still cancels: distinct users share a hash")
 	}
 	if alice.checkAccum() == bob.checkAccum() {

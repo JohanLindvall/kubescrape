@@ -9,7 +9,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/cespare/xxhash/v2"
+	"github.com/zeebo/xxh3"
 	"go.opentelemetry.io/collector/pdata/plog"
 	"go.opentelemetry.io/collector/pdata/pmetric"
 	"go.opentelemetry.io/collector/pdata/ptrace"
@@ -505,7 +505,7 @@ type sink[T any] struct {
 	// cycles and the value of delivered at its own previous failed cycle — the
 	// two together are the poison evidence (see stuckTooLong).
 	delivered uint64
-	stuck     map[uint64]stuckBatch
+	stuck     map[xxh3.Uint128]stuckBatch
 	// stuckResponded records whether the latest sendStuck's final error carried
 	// a RESPONSE from the collector (vs a transport failure); set by trySend,
 	// read by stuckTooLong (both on the drain goroutine).
@@ -832,10 +832,18 @@ func boolLabel(b bool) string {
 // format) means the count resets on restart — which is what we want: a fresh
 // process should re-offer the batch, since the collector may have been fixed or
 // upgraded in the meantime.
+//
+// The key is 128 bits because a collision here DESTROYS GOOD DATA rather than
+// merely mis-measuring: two distinct payloads sharing a slot pool their
+// accountable-failure counts, so a healthy batch can inherit a poison batch's
+// budget and be dropped after fewer laps than maxDrainCycles allows. The map is
+// keyed by hash alone — there is no stored payload to re-compare against on a
+// hit, which is what would otherwise turn a collision back into a miss — so the
+// width IS the whole defence.
 func (s *sink[T]) stuckTooLong(data []byte) bool {
-	h := xxhash.Sum64(data)
+	h := xxh3.Hash128(data)
 	if s.stuck == nil {
-		s.stuck = make(map[uint64]stuckBatch)
+		s.stuck = make(map[xxh3.Uint128]stuckBatch)
 	}
 	st, seen := s.stuck[h]
 	if !seen && len(s.stuck) >= maxStuckTracked {
@@ -848,7 +856,8 @@ func (s *sink[T]) stuckTooLong(data []byte) bool {
 		// victim's budget resets, which at worst delays a real poison batch
 		// by a few laps; the O(n) scan runs only at the cap, on the failure
 		// path.
-		var evict, evictAt uint64
+		var evict xxh3.Uint128
+		var evictAt uint64
 		first := true
 		for k, v := range s.stuck {
 			if first || v.lastDelivered < evictAt {
@@ -928,7 +937,7 @@ func respondedError(err error) bool {
 // eventually succeeds does not leak an entry to the maxStuckTracked cap.
 func (s *sink[T]) forget(data []byte) {
 	if s.stuck != nil {
-		delete(s.stuck, xxhash.Sum64(data))
+		delete(s.stuck, xxh3.Hash128(data))
 	}
 }
 
@@ -975,7 +984,7 @@ func (s *sink[T]) accountableLap(data []byte) bool {
 	if len(s.stuck) == 0 {
 		return false
 	}
-	st, seen := s.stuck[xxhash.Sum64(data)]
+	st, seen := s.stuck[xxh3.Hash128(data)]
 	return seen && s.delivered > st.lastDelivered
 }
 

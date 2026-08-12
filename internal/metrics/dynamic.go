@@ -11,7 +11,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/cespare/xxhash/v2"
 	"go.opentelemetry.io/collector/pdata/pcommon"
 
 	"github.com/JohanLindvall/kubescrape/internal/logline"
@@ -548,9 +547,9 @@ func uniqueResourceAccum(res pcommon.Map) resKey {
 		// set() already truncated the value, which is exactly what
 		// resourceAccum's truncLabelCut reslice achieves: the hashed identity
 		// must be the rendered one.
-		hk, hv := xxhash.Sum64String(e.key), xxhash.Sum64String(e.value)
-		rk.accum += combineResHash(hk, hv)
-		rk.check += combineResCheck(hk, hv)
+		hk, hv := strHash(e.key), strHash(e.value)
+		rk.accum += combineResHash(hk.Lo, hv.Lo)
+		rk.check += combineResCheck(hk.Hi, hv.Hi)
 	}
 	return rk
 }

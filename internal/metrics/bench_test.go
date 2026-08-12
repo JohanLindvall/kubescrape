@@ -414,3 +414,44 @@ func TestDynamicAddHistogramAllocationBudget(t *testing.T) {
 			"per matched line on the tailer's sweep goroutine)", allocs)
 	}
 }
+
+// benchLabels is a typical log-derived data-point label set.
+func benchLabels() labels {
+	var l labels
+	l = l.set("status", "2xx")
+	l = l.set("method", "GET")
+	l = l.set("route", "/api/v1/orders/{id}")
+	l = l.set("tenant", "acme-corp")
+	return l
+}
+
+// BenchmarkLabelsAccums measures the series-identity fold directly, undiluted
+// by the rest of Add: this is the per-observation string hashing that a change
+// of hash function moves. accums() is the paired form every series lookup uses.
+func BenchmarkLabelsAccums(b *testing.B) {
+	l := benchLabels()
+	b.ReportAllocs()
+	var h, c uint64
+	for b.Loop() {
+		h, c = l.accums()
+	}
+	sinkAccum(h, c)
+}
+
+// BenchmarkResourceAccum measures the resource half of the same key. The
+// resource is hashed once per flush by Bind, but a resource carries more (and
+// longer) pairs than the data-point labels do.
+func BenchmarkResourceAccum(b *testing.B) {
+	res := benchResource()
+	b.ReportAllocs()
+	var rk resKey
+	for b.Loop() {
+		rk = resourceAccum(res)
+	}
+	sinkAccum(rk.accum, rk.check)
+}
+
+//go:noinline
+func sinkAccum(a, b uint64) { accumSinkA, accumSinkB = a, b }
+
+var accumSinkA, accumSinkB uint64

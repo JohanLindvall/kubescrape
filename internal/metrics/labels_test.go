@@ -4,7 +4,6 @@ import (
 	"log/slog"
 	"testing"
 
-	"github.com/cespare/xxhash/v2"
 	"go.opentelemetry.io/collector/pdata/pcommon"
 )
 
@@ -27,7 +26,9 @@ func TestLabelsHashAccumFoldable(t *testing.T) {
 	// property the histogram observe path relies on.
 	base := labels{{"a", "1"}, {"b", "2"}}
 	full := append(labels{}, base...).set("le", "0.5")
-	folded := base.hashAccum() + combineHash(xxhash.Sum64String("le"), xxhash.Sum64String("0.5"))
+	// The fold must use the same halves production does: hashAccum folds the LOW
+	// half of each 128-bit string hash (checkAccum folds the high half).
+	folded := base.hashAccum() + combineHash(strHash("le").Lo, strHash("0.5").Lo)
 	if mixHash(folded) != full.hash() {
 		t.Error("sum-folded le label does not match full hash")
 	}

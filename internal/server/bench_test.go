@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"testing"
 	"time"
 
@@ -162,3 +163,26 @@ func BenchmarkNodeTargets(b *testing.B) {
 func BenchmarkNodeTargetsRevalidation(b *testing.B) {
 	benchTargets(b, targetsFixture{pods: 110, cacheTTL: 10 * time.Second}, true)
 }
+
+// BenchmarkEntityTag measures the ETag digest directly. It runs over the FULL
+// body of every cached response including every 304 revalidation, so the digest
+// is on the hot path for the route that re-serializes every pod document on the
+// node each scrape cycle. Sizes bracket a small pod document and a node's whole
+// target list.
+func BenchmarkEntityTag(b *testing.B) {
+	for _, size := range []int{512, 8 << 10, 256 << 10} {
+		body := make([]byte, size)
+		for i := range body {
+			body[i] = byte('a' + i%26)
+		}
+		b.Run(strconv.Itoa(size)+"B", func(b *testing.B) {
+			b.SetBytes(int64(size))
+			b.ReportAllocs()
+			for b.Loop() {
+				tagSink = entityTag(body)
+			}
+		})
+	}
+}
+
+var tagSink string

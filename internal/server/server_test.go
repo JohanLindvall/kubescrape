@@ -5,8 +5,12 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/zeebo/xxh3"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -619,4 +623,40 @@ func addTargetPod(st *store.Store, i int) {
 			PodIP: fmt.Sprintf("10.2.0.%d", i+1),
 		},
 	})
+}
+
+// TestEntityTagIsFixedWidthHex pins the ETag rendering, whose whole job is to
+// be injective in the digest.
+//
+// The digest is 128 bits and the tag renders it as exactly 32 hex digits, high
+// half first. Zero-PADDING is the load-bearing part: the obvious two-FormatUint
+// spelling drops leading zeros, so a digest whose low half is small would
+// render the same tag as a completely different digest — a 304 served for a
+// body that changed, which is precisely the failure the width was widened to
+// avoid. A leading-zero half is not exotic at 1-in-16 per digit.
+func TestEntityTagIsFixedWidthHex(t *testing.T) {
+	seen := map[string]string{}
+	for i := 0; i < 20000; i++ {
+		body := []byte(strconv.Itoa(i))
+		tag := entityTag(body)
+		if len(tag) != 34 || tag[0] != '"' || tag[33] != '"' {
+			t.Fatalf("entityTag(%q) = %q, want 32 hex digits in quotes", body, tag)
+		}
+		for _, c := range tag[1:33] {
+			if !strings.ContainsRune("0123456789abcdef", c) {
+				t.Fatalf("entityTag(%q) = %q has a non-hex digit %q", body, tag, c)
+			}
+		}
+		if prev, dup := seen[tag]; dup {
+			t.Fatalf("entityTag collision: %q and %q both render %s", prev, body, tag)
+		}
+		seen[tag] = string(body)
+	}
+
+	// A digest half with leading zeros must still occupy its full 16 digits.
+	// Asserted on the renderer directly, since finding a body that hashes to a
+	// small half is not something a test should search for.
+	if got := formatTag(xxh3.Uint128{Hi: 1, Lo: 2}); got != `"00000000000000010000000000000002"` {
+		t.Fatalf("formatTag of a small digest = %s, want both halves zero-padded", got)
+	}
 }

@@ -6,7 +6,7 @@ import (
 	"slices"
 	"strings"
 
-	"github.com/cespare/xxhash/v2"
+	"github.com/zeebo/xxh3"
 )
 
 // A metric's label set is a plain slice of key-value pairs. Order does not
@@ -115,6 +115,28 @@ func (l labels) without(key string) labels {
 	return l
 }
 
+// strHash is one string's 128-bit xxh3 hash. Its two halves are INDEPENDENT,
+// and that independence is the whole reason this is a 128-bit hash and not a
+// 64-bit one.
+//
+// The series identity is a PAIR of accumulators (see checkAccum), and the pair
+// is only worth 128 bits if a collision in one half implies nothing about the
+// other. That used to hold for the fold and NOT for its inputs: both
+// accumulators were projections of the same two 64-bit xxhash values, so two
+// distinct strings colliding in xxhash64 fed BOTH accumulators an identical
+// contribution and the check hash detected nothing. The comment on combineCheck
+// claimed ~2^-128 for the pair; that was true of a collision arising in the
+// combine step and false of one arising in the string hash, which is the far
+// likelier of the two. Hashing each string to 128 bits and giving each
+// accumulator its own half closes that: the check is now independent all the
+// way down.
+//
+// xxh3 rather than xxhash64 because it is the faster algorithm on exactly the
+// input this hashes — short strings, one per label key and value per
+// observation — so the wider hash costs nothing (see the bench numbers in the
+// commit that introduced it).
+func strHash(s string) xxh3.Uint128 { return xxh3.HashString128(s) }
+
 // hashAccum is the order-independent accumulator of the label set: every
 // entry contributes combineHash(hash(key), hash(value)) and they are summed
 // (wrapping). Summation is order-independent like XOR but not self-inverse
@@ -126,19 +148,23 @@ func (l labels) without(key string) labels {
 func (l labels) hashAccum() uint64 {
 	var h uint64
 	for _, e := range l {
-		h += combineHash(xxhash.Sum64String(e.key), xxhash.Sum64String(e.value))
+		h += combineHash(strHash(e.key).Lo, strHash(e.value).Lo)
 	}
 	return h
 }
 
-// checkAccum is a second, independently-mixed accumulator over the same label
-// set. Series lookups compare it on every hash hit, so a residual 64-bit
-// collision between different label multisets is detected instead of silently
-// merging their data (both sums colliding at once is ~2^-128).
+// checkAccum is a second accumulator over the same label set, folding the HIGH
+// halves where hashAccum folds the low ones. Series lookups compare it on every
+// hash hit, so a residual 64-bit collision between different label multisets is
+// detected instead of silently merging their data.
+//
+// Both halves colliding at once is ~2^-128 — and unlike the previous
+// single-hash-two-projections arrangement, that figure now covers a collision
+// in the STRING hash too, not just one in the fold. See strHash.
 func (l labels) checkAccum() uint64 {
 	var h uint64
 	for _, e := range l {
-		h += combineCheck(xxhash.Sum64String(e.key), xxhash.Sum64String(e.value))
+		h += combineCheck(strHash(e.key).Hi, strHash(e.value).Hi)
 	}
 	return h
 }
@@ -146,15 +172,15 @@ func (l labels) checkAccum() uint64 {
 // accums returns both accumulators in one pass. Callers that need the pair —
 // every series lookup does, to key the sample and to carry its collision check
 // — must use this rather than calling hashAccum and checkAccum in turn: the
-// expensive part of each entry is hashing the key and value strings, and the
-// two accumulators fold the very same two hashes. Computing them once halves
-// the string hashing on the observe path. The results are identical to calling
-// the two separately (TestAccumsMatchSeparate).
+// expensive part of each entry is hashing the key and value strings, and both
+// accumulators are fed by the very same two 128-bit hashes. Computing them once
+// halves the string hashing on the observe path. The results are identical to
+// calling the two separately (TestAccumsMatchSeparate).
 func (l labels) accums() (h, check uint64) {
 	for _, e := range l {
-		hk, hv := xxhash.Sum64String(e.key), xxhash.Sum64String(e.value)
-		h += combineHash(hk, hv)
-		check += combineCheck(hk, hv)
+		hk, hv := strHash(e.key), strHash(e.value)
+		h += combineHash(hk.Lo, hv.Lo)
+		check += combineCheck(hk.Hi, hv.Hi)
 	}
 	return h, check
 }

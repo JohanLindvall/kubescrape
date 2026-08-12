@@ -1,7 +1,6 @@
 package metrics
 
 import (
-	"github.com/cespare/xxhash/v2"
 	"go.opentelemetry.io/collector/pdata/pcommon"
 )
 
@@ -22,9 +21,9 @@ func resourceAccum(res pcommon.Map) resKey {
 		if k == "" || s == "" {
 			return true // resourceString's set drops these; the hash must too
 		}
-		hk, hv := xxhash.Sum64String(k), xxhash.Sum64String(s[:truncLabelCut(s)])
-		rk.accum += combineResHash(hk, hv)
-		rk.check += combineResCheck(hk, hv)
+		hk, hv := strHash(k), strHash(s[:truncLabelCut(s)])
+		rk.accum += combineResHash(hk.Lo, hv.Lo)
+		rk.check += combineResCheck(hk.Hi, hv.Hi)
 		return true
 	})
 	return rk
@@ -42,20 +41,20 @@ func resLabelsAccum(res pcommon.Map, extra labels) resKey {
 		if e.key == "" || e.value == "" {
 			continue
 		}
-		hk := xxhash.Sum64String(e.key)
+		hk := strHash(e.key)
 		if v, ok := res.Get(e.key); ok {
 			if s := v.AsString(); s != "" {
 				// The subtraction must cancel resourceAccum's addition exactly,
 				// so it folds the SAME truncated view.
-				hv := xxhash.Sum64String(s[:truncLabelCut(s)])
-				rk.accum -= combineResHash(hk, hv)
-				rk.check -= combineResCheck(hk, hv)
+				hv := strHash(s[:truncLabelCut(s)])
+				rk.accum -= combineResHash(hk.Lo, hv.Lo)
+				rk.check -= combineResCheck(hk.Hi, hv.Hi)
 			}
 		}
 		// e.value came through set() and is already truncated.
-		hv := xxhash.Sum64String(e.value)
-		rk.accum += combineResHash(hk, hv)
-		rk.check += combineResCheck(hk, hv)
+		hv := strHash(e.value)
+		rk.accum += combineResHash(hk.Lo, hv.Lo)
+		rk.check += combineResCheck(hk.Hi, hv.Hi)
 	}
 	return rk
 }

@@ -8,7 +8,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/cespare/xxhash/v2"
 	"go.opentelemetry.io/collector/pdata/pcommon"
 )
 
@@ -436,9 +435,9 @@ func (s *series) baseAccum(lbls labels) (base, check uint64) {
 	base, check = lbls.accums()
 	if s.kind == kindHistogram {
 		if v, ok := lbls.get(leLabel); ok {
-			hk, hv := xxhash.Sum64String(leLabel), xxhash.Sum64String(v)
-			base -= combineHash(hk, hv)
-			check -= combineCheck(hk, hv)
+			hk, hv := strHash(leLabel), strHash(v)
+			base -= combineHash(hk.Lo, hv.Lo)
+			check -= combineCheck(hk.Hi, hv.Hi)
 		}
 	}
 	return base, check

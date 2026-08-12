@@ -1455,7 +1455,8 @@ payload to a named `routing` route ahead of the namespace globs (the marker
 is reserved to scripts — a copy arriving on the wire is stripped and counted
 at ingest receipt), and
 `emit_metric(name, value, labels)` observes into a **declared** `logMetrics`
-series (an undeclared name is a script error). Scripts are predeclared `re`
+series (an undeclared name is a script error, as is a label named `le` on a
+histogram — it is generated from the histogram's own buckets). Scripts are predeclared `re`
 (RE2, with a bounded compile cache) and a 1/s-throttled `log()`. The same
 file can define four **hooks**, all fail-open (an error means the hook did
 nothing, counted and warned): `ingest:` `admit(resource)` runs per pushed

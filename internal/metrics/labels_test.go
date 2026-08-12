@@ -160,3 +160,46 @@ func TestLabelKeyEdgeSpaceRoundTrips(t *testing.T) {
 		t.Fatalf("%q and %q render identically as %s", " env", "env", rs.String())
 	}
 }
+
+// TestAdd128Sub128AreExactInverses pins the property the whole fold rests on:
+// the accumulator must be a GROUP, so subtracting a pair's contribution undoes
+// its addition exactly. resLabelsAccum relies on it to cancel a resource key an
+// extra label overrides — hash the merged set, not the merged-plus-original.
+//
+// The interesting cases are the ones that CROSS the half boundary. Two
+// independent 64-bit wraps (Hi and Lo added separately, no carry) pass a naive
+// test and fail here: a low-half wrap would be dropped instead of carried into
+// Hi, and subtract would then not undo add. That is why add128/sub128 use
+// bits.Add64/bits.Sub64 rather than plain += on each field.
+func TestAdd128Sub128AreExactInverses(t *testing.T) {
+	const max = ^uint64(0)
+	vals := []xxh3.Uint128{
+		{},
+		{Lo: 1},
+		{Hi: 1},
+		{Hi: max, Lo: max},
+		{Lo: max},            // +1 carries into Hi
+		{Hi: max},            // -1 borrows out of Hi
+		{Hi: 7, Lo: max - 3}, // carry with both halves populated
+		{Hi: 0x0123456789abcdef, Lo: 0xfedcba9876543210},
+	}
+	for _, a := range vals {
+		for _, b := range vals {
+			if got := sub128(add128(a, b), b); got != a {
+				t.Errorf("sub128(add128(%v, %v), %v) = %v, want %v", a, b, b, got, a)
+			}
+			if got := add128(sub128(a, b), b); got != a {
+				t.Errorf("add128(sub128(%v, %v), %v) = %v, want %v", a, b, b, got, a)
+			}
+		}
+	}
+
+	// The carry is real, not incidental: adding 1 to a saturated low half must
+	// move Hi. A field-wise += would leave Hi untouched here.
+	if got := add128(xxh3.Uint128{Lo: max}, xxh3.Uint128{Lo: 1}); got != (xxh3.Uint128{Hi: 1, Lo: 0}) {
+		t.Errorf("add128 dropped the carry: %v", got)
+	}
+	if got := sub128(xxh3.Uint128{Hi: 1}, xxh3.Uint128{Lo: 1}); got != (xxh3.Uint128{Hi: 0, Lo: max}) {
+		t.Errorf("sub128 dropped the borrow: %v", got)
+	}
+}

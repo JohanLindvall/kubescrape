@@ -140,14 +140,14 @@ func (l labels) without(key string) labels {
 // input this hashes — short strings, one per label key and value per
 // observation — so the wider hash is cheaper than the narrow one it replaced,
 // and dropping the second accumulator halves what remains: measured, the fold
-// is 10.5% faster than the 64-bit pair it replaced.
+// is 11.4% faster than the 64-bit pair it replaced.
 //
-// The observe path as a whole is nonetheless 2.6-10% SLOWER, and the cost is
+// The observe path as a whole is nonetheless 2.2-6.2% SLOWER, and the cost is
 // not here: it is series.db's key going from uint64 to a 16-byte struct. Go
 // specialises map[uint64] to mapaccess*_fast64, and a comparable struct key
 // falls back to the generic path. BenchmarkDynamicAddBound is the proof —
 // observePreHashed uses a hash precomputed at construction and folds nothing,
-// yet slowed 9.3%. Do not go looking for it in the hashing.
+// yet slowed 6.2%. Do not go looking for it in the hashing.
 func strHash(s string) xxh3.Uint128 { return xxh3.HashString128(s) }
 
 // hashAccum is the order-independent accumulator of the label set: every

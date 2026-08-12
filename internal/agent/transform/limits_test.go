@@ -416,9 +416,26 @@ func TestWallClockBudgetFires(t *testing.T) {
 
 // The checkpoint has to fire from inside a tight loop that allocates nothing
 // at all, i.e. from OnMaxSteps rather than from a guard.
+//
+// The clock is FAKE here, and that is the point. This test used to run a
+// 1,000,000-iteration loop against a lowered 25ms budget and assert the budget
+// won that race — which is a claim about the machine, not about this package.
+// It failed on fast hardware ("no error": the loop finished inside 25ms),
+// passed on slow, and flapped under load. With a clock that jumps a second per
+// reading, the first checkpoint the loop reaches is unambiguously over budget
+// on any hardware, and what is being asserted is the thing the test is named
+// for: that a loop touching no builtin and allocating nothing still gets
+// cancelled, i.e. that OnMaxSteps consults the clock.
 func TestWallClockBudgetFiresInAPureLoop(t *testing.T) {
 	withWallClock(t, 25*time.Millisecond)
-	mustContain(t, runBody(t, "n = 0\nfor _i in range(1000000):\n    n = n\n"), "over the 25ms budget")
+	withFakeClock(t, time.Second)
+	// A `while` loop, NOT `for _i in range(...)`: range is a guarded builtin,
+	// so its own overtime check would fire before the loop body ever ran and
+	// the test would pass with the checkpoint entirely removed. This body calls
+	// nothing, so OnMaxSteps is the only thing that can cancel it — which is
+	// what the test is for. If the checkpoint stops consulting the clock, the
+	// loop runs to the STEP budget and the assertion fails on the message.
+	mustContain(t, runBody(t, "n = 0\nwhile True:\n    n = n\n"), "over the 25ms budget")
 }
 
 // The MODULE evaluation is on the same clock: CompileFile is synchronous in
@@ -562,6 +579,26 @@ func withWallClock(t *testing.T, d time.Duration) {
 	old := wallClock
 	wallClock = d
 	t.Cleanup(func() { wallClock = old })
+}
+
+// withFakeClock replaces the budget's clock with one that advances by step on
+// every reading. budget.reset takes the first reading, so the FIRST overtime
+// check a script reaches already sees one full step of elapsed time — set step
+// above the budget and the first checkpoint cancels, deterministically.
+//
+// Package-global like withWallClock, which is safe here because nothing in this
+// package calls t.Parallel.
+func withFakeClock(t *testing.T, step time.Duration) {
+	t.Helper()
+	base := time.Unix(1_700_000_000, 0)
+	var readings int64
+	old := now
+	now = func() time.Time {
+		cur := base.Add(time.Duration(readings) * step)
+		readings++
+		return cur
+	}
+	t.Cleanup(func() { now = old })
 }
 
 // --- print ---

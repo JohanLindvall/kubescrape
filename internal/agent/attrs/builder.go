@@ -37,7 +37,15 @@ type Context struct {
 // Pipeline names accepted under Config.Pipelines. "self" is the agent's own
 // generated metrics (self-metrics and span metrics), whose Pod context is the
 // pod the agent itself runs in.
-var pipelineNames = []string{"logs", "targets", "cadvisor", "node", "journal", "ingest", "self"}
+//
+// "summary" governs the NODE-level resource of the kubelet's /stats/summary
+// scrape and nothing else: the pod, container and volume resources that scrape
+// builds are the CADVISOR pipeline's, because a summary series is only worth
+// anything while it joins the cadvisor series for the same object, and two
+// resources join only while they are byte-identical. A separate attribute
+// surface over them would be a supported way to break that (the coupling
+// internal/agent/cgroupstats documents for the same reason).
+var pipelineNames = []string{"logs", "targets", "cadvisor", "node", "summary", "journal", "ingest", "self"}
 
 // Config declares how resource attributes are built. It is the
 // `resourceAttributes` section of the agent config:
@@ -49,7 +57,7 @@ var pipelineNames = []string{"logs", "targets", "cadvisor", "node", "journal", "
 //	  team: '{{ index .Pod.Labels "team" }}'
 //	  service.name: '{{ coalesce (index .Pod.Labels "gp/service-name") (index .Pod.Labels "app.kubernetes.io/name") .Pod.Name }}'
 //	  k8s.node.zone: '{{ with .Node }}{{ index .Labels "topology.kubernetes.io/zone" }}{{ end }}'
-//	pipelines:                # per-pipeline overrides (logs|targets|cadvisor|node|journal|ingest|self)
+//	pipelines:                # per-pipeline overrides (logs|targets|cadvisor|node|summary|journal|ingest|self)
 //	  node:
 //	    attributes:
 //	      service.name: aks-node
@@ -88,7 +96,14 @@ type Config struct {
 // defaultInstancePrefix is the built-in service.instance.id prefix per pipeline
 // (empty for pipelines whose resources are the exporter's own identity). It
 // applies unless the config sets InstancePrefix explicitly.
-var defaultInstancePrefix = map[string]string{"cadvisor": "cadvisor"}
+//
+// "summary" is here for the same collision the cadvisor entry prevents, one
+// level up: the kubelet's /stats/summary node resource carries service.name
+// "kubelet" and the node's name exactly as the /metrics scrape's does, so
+// without a prefix the two would share (job, instance) while differing on
+// url.full — a target_info flapping between two attribute sets every cycle, and
+// two conflicting `up` values in one payload from exportHealth.
+var defaultInstancePrefix = map[string]string{"cadvisor": "cadvisor", "summary": "summary"}
 
 // validatePipelines rejects unknown pipeline names (strict YAML parsing cannot
 // catch bad map keys) and nested pipeline sections. It runs in NewBuilders —
@@ -123,6 +138,7 @@ type Builders struct {
 	Targets  *Builder
 	Cadvisor *Builder
 	Node     *Builder
+	Summary  *Builder
 	Journal  *Builder
 	Ingest   *Builder
 	Self     *Builder
@@ -138,8 +154,8 @@ func NewBuilders(cfg *Config, filter *Filter) (*Builders, error) {
 	b := &Builders{}
 	assign := map[string]**Builder{
 		"logs": &b.Logs, "targets": &b.Targets, "cadvisor": &b.Cadvisor,
-		"node": &b.Node, "journal": &b.Journal, "ingest": &b.Ingest,
-		"self": &b.Self,
+		"node": &b.Node, "summary": &b.Summary, "journal": &b.Journal,
+		"ingest": &b.Ingest, "self": &b.Self,
 	}
 	for _, name := range pipelineNames {
 		var sub *Config

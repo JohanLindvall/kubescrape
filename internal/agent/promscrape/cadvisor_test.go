@@ -574,7 +574,7 @@ func TestKubeletTokenSurvivesAFailedReread(t *testing.T) {
 	// waiting out the production interval.
 	s.kubeletToken = bearer.NewFile(tokenFile, nil, bearer.WithInterval(time.Nanosecond))
 
-	resp, err := s.kubeletGet(context.Background(), srv.URL+"/metrics")
+	resp, err := s.kubeletGet(context.Background(), srv.URL+"/metrics", acceptExposition)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -588,7 +588,7 @@ func TestKubeletTokenSurvivesAFailedReread(t *testing.T) {
 		t.Fatal(err)
 	}
 	gotAuth.Store("")
-	resp, err = s.kubeletGet(context.Background(), srv.URL+"/metrics")
+	resp, err = s.kubeletGet(context.Background(), srv.URL+"/metrics", acceptExposition)
 	if err != nil {
 		t.Fatalf("kubelet scrape failed during a token rotation window: %v; the last good token must be presented instead", err)
 	}
@@ -600,7 +600,7 @@ func TestKubeletTokenSurvivesAFailedReread(t *testing.T) {
 	// With nothing ever read, the scrape still fails: an unauthenticated
 	// kubelet request would 401 anyway, and the error names the real cause.
 	s.kubeletToken = bearer.NewFile(filepath.Join(t.TempDir(), "never-existed"), nil)
-	if _, err := s.kubeletGet(context.Background(), srv.URL+"/metrics"); err == nil {
+	if _, err := s.kubeletGet(context.Background(), srv.URL+"/metrics", acceptExposition); err == nil {
 		t.Fatal("an unreadable token file with nothing cached must fail the scrape")
 	}
 }

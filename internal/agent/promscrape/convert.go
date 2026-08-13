@@ -92,6 +92,7 @@ const (
 const (
 	scopeName         = "github.com/JohanLindvall/kubescrape/agent/promscrape"
 	scopeNameCadvisor = "github.com/JohanLindvall/kubescrape/agent/promscrape/cadvisor"
+	scopeNameSummary  = "github.com/JohanLindvall/kubescrape/agent/promscrape/summary"
 )
 
 // resourceBytes estimates the encoded size of one ResourceMetrics' non-point

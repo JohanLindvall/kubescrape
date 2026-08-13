@@ -60,6 +60,12 @@ agent:
     # notice.
     discoverInterval: 30s
     root: /host/sys/fs/cgroup
+  # The kubelet's /stats/summary scrape, the one pipeline toggle whose default
+  # is off. Every other fixture pins the rendered `-kubelet-summary=false`; this
+  # is what pins the true arm, and what would notice a template that gated the
+  # flag on the value instead of rendering it either way — which would leave an
+  # agent enabling it through extraArgs with no way to turn it back off.
+  kubeletSummary: true
   ingest:
     enabled: true
     grpcMaxRecvBytes: 41943040

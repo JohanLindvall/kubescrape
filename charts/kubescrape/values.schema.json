@@ -217,6 +217,9 @@
         "nodeMetrics": {
           "type": "boolean"
         },
+        "kubeletSummary": {
+          "type": "boolean"
+        },
         "journald": {
           "type": "object",
           "properties": {

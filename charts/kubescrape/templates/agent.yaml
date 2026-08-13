@@ -19,9 +19,17 @@ metadata:
   name: {{ .Release.Name }}-agent
   labels: {{ include "kubescrape.labels" . | nindent 4 }}
 rules:
-  # Solely for authenticating to the kubelet (cadvisor / node metrics).
+  # Solely for authenticating to the kubelet. The kubelet picks the subresource
+  # from the request PATH: /metrics and /metrics/cadvisor authorize against
+  # nodes/metrics, /stats/* against nodes/stats, so agent.kubeletSummary needs
+  # the second one. Both are granted UNCONDITIONALLY rather than behind the
+  # value: enabling the scrape through agent.extraArgs — which people do —
+  # would otherwise 403 on every node, every scrape interval, with the
+  # ClusterRole looking correct. The grant is read-only node telemetry either
+  # way; nodes/stats names the same pods nodes/metrics does, plus their volume
+  # and PVC names.
   - apiGroups: [""]
-    resources: ["nodes/metrics"]
+    resources: ["nodes/metrics", "nodes/stats"]
     verbs: ["get"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
@@ -139,6 +147,16 @@ spec:
             - -cadvisor={{ .Values.agent.cadvisor }}
             - -cadvisor-rollups={{ .Values.agent.cadvisorRollups }}
             - -node-metrics={{ .Values.agent.nodeMetrics }}
+            {{- /* The kubelet's third endpoint, /stats/summary: JSON rather
+                   than exposition, and the only source of per-pod ephemeral
+                   storage USAGE — the quantity the eviction manager measures a
+                   pod against, which neither /metrics/cadvisor nor
+                   kube-state-metrics reports. Parts of the rest of the payload
+                   DO restate cadvisor rows; values.yaml lists which. OFF by
+                   default because it authorizes against nodes/stats: the
+                   ClusterRole above grants it, but a chart upgrade is not the
+                   only way this binary reaches a node. */}}
+            - -kubelet-summary={{ .Values.agent.kubeletSummary }}
             {{- with .Values.agent.kubeletEndpoint }}
             - -kubelet-endpoint={{ . }}
             {{- end }}

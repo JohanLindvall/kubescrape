@@ -903,6 +903,21 @@ ServiceAccount token (`nodes/metrics` RBAC, see
   pod-scoped families (`container_network_*`) and `machine_*`.
 * **node metrics** (`/metrics`): the kubelet's own metrics under a node-level
   resource (`k8s.node.name`, `service.name: kubelet`).
+* **stats summary** (`/stats/summary`, opt-in `-kubelet-summary`): the kubelet's
+  JSON stats report, the only source of **per-pod ephemeral-storage usage** —
+  writable layers plus logs plus on-disk `emptyDir`s, which is what the eviction
+  manager measures a pod against and what `limits["ephemeral-storage"]` bounds,
+  and which neither cadvisor nor kube-state-metrics reports. Also per-container
+  log bytes, inodes-used at every level, and every volume the kubelet can
+  measure — `emptyDir`, `configMap`, `secret` and the projected token included —
+  attributed to the **pod that mounts it**, with the volume named on the data
+  point. Each statistic lands on the resource for the object it describes, built
+  by the same code a cadvisor row goes through, so the series join cadvisor's for
+  the same `container.id`; static (mirror) pods included, via the mirror
+  annotation rather than a name fallback that would let a name-reusing pod claim
+  its predecessor's numbers. Off by default because `/stats/*` authorizes against
+  the `nodes/stats` subresource rather than `nodes/metrics`, so a binary rolling
+  ahead of its ClusterRole would 403 fleet-wide.
 
 **High-frequency cgroup sampling** (opt-in, `-cgroup-stats`). cadvisor is
 scraped once per `-scrape-interval`, so a container that spikes to 4 cores for

@@ -6,7 +6,9 @@
 # This is the agent BINARY run as its own single-replica Deployment with every
 # per-node pipeline off, deliberately NOT part of the DaemonSet: putting it
 # there would grant every node cluster-wide `events` read plus lease/configmap
-# writes (the DaemonSet holds only `nodes/metrics: get`), and each non-leader
+# writes (the DaemonSet holds nothing but the two kubelet subresources —
+# `nodes/metrics` and `nodes/stats`, get — and makes no API-server request at
+# all; those authorize a call to the kubelet), and each non-leader
 # would poll the election Lease once per retry period — an API-server fan-out
 # that scales with node count.
 #

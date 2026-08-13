@@ -129,7 +129,7 @@ func shardRole() bool {
 // a pod name that changes on every restart, resetting each node's whole
 // cumulative history.
 func perNodePipelinesOff() bool {
-	return !*logsOn && !*metricsOn && !*cadvisorOn && !*nodeOn && !*journaldOn && !*ingestOn && !*cgroupStatsOn
+	return !*logsOn && !*metricsOn && !*cadvisorOn && !*nodeOn && !*summaryOn && !*journaldOn && !*ingestOn && !*cgroupStatsOn
 }
 
 // singletonRole reports whether this process is the cluster-singleton
@@ -261,7 +261,7 @@ var (
 	exemplars         = flag.Bool("scrape-exemplars", false, "negotiate OpenMetrics and attach exemplars to counter and histogram data points")
 	healthMetrics     = flag.Bool("scrape-health-metrics", true, "export synthetic up/scrape_duration_seconds/scrape_samples_scraped gauges per target")
 
-	kubeletEndpoint = flag.String("kubelet-endpoint", "", "kubelet base URL, e.g. https://$(NODE_IP):10250 (empty disables the cadvisor and node-metrics scrapes)")
+	kubeletEndpoint = flag.String("kubelet-endpoint", "", "kubelet base URL, e.g. https://$(NODE_IP):10250 (empty disables the cadvisor, node-metrics and stats-summary scrapes)")
 	kubeletToken    = flag.String("kubelet-token-file", "/var/run/secrets/kubernetes.io/serviceaccount/token", "bearer token file for the kubelet (re-read per scrape)")
 	kubeletInsecure = flag.Bool("kubelet-insecure-tls", true, "skip TLS verification for the kubelet (its serving certificate is typically self-signed)")
 
@@ -275,6 +275,26 @@ var (
 	cadvisorOn = flag.Bool("cadvisor", true, "scrape <kubelet-endpoint>/metrics/cadvisor (per-container metrics)")
 	rollupsOn  = flag.Bool("cadvisor-rollups", true, "include cadvisor rollup series: cgroups above pod level and pod-level rows of container-scoped families")
 	nodeOn     = flag.Bool("node-metrics", true, "scrape <kubelet-endpoint>/metrics (kubelet/node metrics)")
+
+	// The third kubelet scrape, and the only one whose payload is JSON. Off by
+	// default because of RBAC rather than cost: the kubelet authorizes /stats/*
+	// against the nodes/stats subresource, which the agent's ClusterRole did
+	// not hold until this feature shipped. On by default, a binary that rolled
+	// ahead of its RBAC — the normal order for deploy/*.yaml, a hand-managed
+	// ClusterRole, and any GitOps setup that applies RBAC separately — would
+	// 403 on every node in the fleet, every scrape interval, forever. Same
+	// reasoning as -cgroup-stats, which needs a host mount the operator has to
+	// grant: a pipeline whose prerequisite is outside the binary starts off.
+	//
+	// The help below enumerates what this endpoint has that /metrics/cadvisor
+	// does not AND what it merely restates, because the two lists are both
+	// non-empty and only the first is a reason to turn the scrape on. cadvisor
+	// does carry filesystem families (container_fs_usage_bytes and its
+	// _limit_bytes/_inodes_free/_inodes_total siblings, keyed by device); what
+	// it has no concept of is the kubelet's ephemeral-storage accounting, a
+	// volume of any kind, an inodes-USED number, and which node filesystem is
+	// nodefs, imagefs or containerfs.
+	summaryOn = flag.Bool("kubelet-summary", false, "scrape <kubelet-endpoint>/stats/summary, the kubelet's JSON stats report, as per-pod, per-container, per-volume and per-node filesystem, ephemeral-storage and process gauges. WHAT ONLY THIS ENDPOINT HAS: per-pod ephemeral-storage USAGE (its containers' writable layers plus their logs plus their on-disk emptyDirs — the quantity the eviction manager and limits[\"ephemeral-storage\"] are measured against, reported by neither cadvisor nor kube-state-metrics), per-container LOG bytes, every volume the kubelet can measure attributed to the POD that mounts it (emptyDir, configMap, secret and the projected token included), and inodes-USED at every level, which cadvisor has no metric for anywhere. WHAT OVERLAPS, because /metrics/cadvisor is not silent about filesystems — it carries container_fs_usage_bytes, container_fs_limit_bytes, container_fs_inodes_free and container_fs_inodes_total, keyed by DEVICE: the eighteen k8s.node.{filesystem,imagefs,containerfs}.* restate cadvisor's root-cgroup (id=\"/\") rows, adding the nodefs/imagefs/containerfs ROLE that the eviction thresholds are written against and that a device name cannot give you; k8s.pod.process.count is the kubelet's sum of its containers' cadvisor process counts, i.e. the numbers container_processes already carries, pre-summed; k8s.container.ephemeral_storage.usage{fs.type=rootfs} is the same ground as container_fs_usage_bytes, separately computed by the kubelet and per rootfs rather than per device, so the two can disagree; and on a PVC-backed volume the six k8s.volume.* restate kubelet_volume_stats_* from the -node-metrics scrape, adding the pod attribution those lack (they are labelled by namespace and PVC only). cpu, memory, network and swap are left to the cadvisor scrape entirely. Each statistic lands on the resource for the object it DESCRIBES, built by the same code a cadvisor row goes through, so the series join cadvisor's for the same container.id; a volume's stats ride its pod's resource with the volume named on the data point. OFF by default because of RBAC, not cost: the kubelet authorizes /stats/* against the nodes/stats subresource while /metrics and /metrics/cadvisor go through nodes/metrics, so a binary that rolls ahead of its ClusterRole 403s on every node in the fleet. Grant the agent's ClusterRole a rule with apiGroups [\"\"], resources [\"nodes/stats\"] and verbs [\"get\"] — the shipped manifests and the chart do, unconditionally — before enabling this. Measured on a synthetic 110-pod node with two containers and two measured volumes each: 2550 data points per scrape, of which 1320 (just over half) are volume series at six per measured volume, 880 container, 330 pod and 20 node. The lever is a drop rule under the config's metrics.pipelines.summary, which sees the data-point attributes (k8s.volume.name, fs.type) as labels; this flag is all or nothing")
 
 	// The high-frequency cgroup sampler. Off by default: it needs a host mount
 	// the other pipelines do not, and it adds a metric family per container.
@@ -1358,10 +1378,14 @@ func (p *pipelines) enricherBase() otlpingest.Config {
 }
 
 // startScraper starts the Prometheus scraper (annotation/ServiceMonitor
-// targets and/or kubelet cadvisor+node scrapes). The returned Scraper (nil
-// when scraping is off) is exposed on /debug/targets.
+// targets and/or the kubelet's cadvisor, node-metrics and stats-summary
+// scrapes). The returned Scraper (nil when scraping is off) is exposed on
+// /debug/targets.
 func (p *pipelines) startScraper(ctx context.Context) *promscrape.Scraper {
-	kubeletScrapes := *kubeletEndpoint != "" && (*cadvisorOn || *nodeOn)
+	// The endpoint gates all three kubelet scrapes: with it empty they are not
+	// disabled, they are never scheduled. configWarnings names that, because
+	// nothing else can — no counter moves for a scrape that never ran.
+	kubeletScrapes := *kubeletEndpoint != "" && (*cadvisorOn || *nodeOn || *summaryOn)
 	var sc0 *promscrape.Scraper
 	if *metricsOn || kubeletScrapes {
 		var targetHook func([]kubemeta.ScrapeTarget) []kubemeta.ScrapeTarget
@@ -1386,6 +1410,7 @@ func (p *pipelines) startScraper(ctx context.Context) *promscrape.Scraper {
 				Cadvisor:       *cadvisorOn,
 				DisableRollups: !*rollupsOn,
 				NodeMetrics:    *nodeOn,
+				Summary:        *summaryOn,
 				TokenFile:      *kubeletToken,
 				InsecureTLS:    *kubeletInsecure,
 				Meta:           p.meta,
@@ -1405,7 +1430,8 @@ func (p *pipelines) startScraper(ctx context.Context) *promscrape.Scraper {
 			sc.Run(ctx)
 		})
 		p.log.Info("prometheus scraper started", "node", *nodeName, "interval", *scrapeInterval,
-			"targets", *metricsOn, "cadvisor", kubeletScrapes && *cadvisorOn, "nodeMetrics", kubeletScrapes && *nodeOn)
+			"targets", *metricsOn, "cadvisor", kubeletScrapes && *cadvisorOn, "nodeMetrics", kubeletScrapes && *nodeOn,
+			"summary", kubeletScrapes && *summaryOn)
 		sc0 = sc
 	}
 	return sc0

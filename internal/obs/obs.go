@@ -272,6 +272,19 @@ var (
 	// collector.
 	ScrapeSamplesDropped = Registry.CounterVec("kubescrape_scrape_samples_dropped_total",
 		"Parsed samples discarded before conversion, by pipeline and by what discarded them: filter = the config's metrics keep/drop rules, relabel = a monitor's metricRelabelings.", "pipeline", "reason")
+	SummaryUnresolved = Registry.CounterVec("kubescrape_summary_unresolved_total",
+		"Objects in the kubelet's /stats/summary that the metadata service could not place, by the LEVEL of "+
+			"the object: `pod` (no pod of that namespace and name, or one whose UID neither matches nor MIRRORS "+
+			"the UID the kubelet reported — a static pod's kubelet-minted UID is proved against the mirror pod's "+
+			"kubernetes.io/config.mirror or config.hash annotation, and a pod merely REUSING the name carries "+
+			"neither) and `container` (the pod resolved, but the summary named a container it does not list). "+
+			"Counted once per OBJECT per scrape, never per data point — a pod with four statistics is one "+
+			"unplaceable pod. The statistics are still exported, carrying the identity the payload itself gave "+
+			"them, so nothing is lost; what an unplaceable object loses is the JOIN, since a series with no pod "+
+			"identity cannot line up with the cadvisor row for the same container. A steady low rate is ordinary "+
+			"— a pod that ended between the kubelet building the summary and the lookup landing — while a "+
+			"sustained or fleet-wide rate means the metadata service is not answering, and the ephemeral-storage "+
+			"series it exists for are arriving unattributable.", "level")
 	ScrapeMalformed = Registry.CounterVec("kubescrape_scrape_malformed_total",
 		"Exposition samples dropped as malformed by pipeline (unparseable lines, histogram buckets without le, summary rows without quantile).", "pipeline")
 	ScrapeExemplarsMalformed = Registry.CounterVec("kubescrape_scrape_exemplars_malformed_total",

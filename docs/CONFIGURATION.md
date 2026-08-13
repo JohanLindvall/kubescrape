@@ -1722,6 +1722,89 @@ container incarnation through the metadata service; pod-scoped series (e.g.
 `container_network_*`) resolve by namespace/name cross-checked against the
 cgroup pod UID.
 
+### `/stats/summary` — ephemeral storage and volumes
+
+| Flag | Default | Description |
+|---|---|---|
+| `-kubelet-summary` | `false` | scrape `<kubelet-endpoint>/stats/summary`, the kubelet's JSON stats report |
+
+The kubelet's third endpoint is **JSON, not exposition**, and it is the only
+source of one number an operator repeatedly wants: **per-pod ephemeral-storage
+usage** — a pod's containers' writable layers, plus their logs, plus their
+on-disk `emptyDir`s. That is the quantity the kubelet's eviction manager
+measures a pod against, and the one `limits["ephemeral-storage"]` bounds.
+Neither cadvisor nor kube-state-metrics reports it. Also only here: per-container
+log bytes, **inodes-used** at every level (cadvisor has no metric for it
+anywhere), and every volume the kubelet can measure — `emptyDir`, `configMap`,
+`secret` and the projected token included — attributed to the pod that mounts
+it.
+
+**It is OFF by default because of RBAC, not cost.** The kubelet authorizes
+`/stats/*` against the `nodes/stats` subresource, while `/metrics` and
+`/metrics/cadvisor` go through `nodes/metrics` — so a binary that rolls ahead
+of its ClusterRole 403s on every node in the fleet, every scrape interval, with
+the ClusterRole looking correct. The shipped manifests and the chart grant
+`nodes/stats` **unconditionally** for that reason, rather than behind the
+value: enabling the scrape through `extraArgs` is a thing people do.
+
+**What overlaps, stated plainly**, because `/metrics/cadvisor` is not silent
+about filesystems — it carries `container_fs_usage_bytes`,
+`container_fs_limit_bytes` and the inode pair, keyed by *device*:
+
+* the eighteen `k8s.node.{filesystem,imagefs,containerfs}.*` restate cadvisor's
+  root-cgroup rows, adding the nodefs/imagefs/containerfs **role** the eviction
+  thresholds are written against, which a device name cannot give you;
+* `k8s.pod.process.count` is the kubelet's pre-summed version of
+  `container_processes` — and it survives `-cadvisor-rollups=false`, which
+  deletes the pod-cgroup row that otherwise carries the pids signal;
+* `k8s.container.ephemeral_storage.usage{fs.type="rootfs"}` is the same ground
+  as `container_fs_usage_bytes`, separately computed by the kubelet and per
+  rootfs rather than per device, **so the two can legitimately disagree**;
+* on a PVC-backed volume the six `k8s.volume.*` restate `kubelet_volume_stats_*`
+  from the `-node-metrics` scrape, adding the pod attribution those lack (they
+  carry namespace and PVC only).
+
+CPU, memory, network and swap are left to the cadvisor scrape entirely.
+
+**Attribution is the point.** Every statistic lands on the resource for the
+object it *describes* — a container stat on that container's resource, a pod
+stat on the pod's, a volume stat on its **pod's** resource with
+`k8s.volume.name` on the data point (a volume is a property of the pod, not an
+identity of its own), a node stat on the node's. The resource is built by the
+same code a cadvisor row goes through, so these series **join** cadvisor's for
+the same `container.id`.
+
+Static (mirror) pods resolve too, and the mechanism is worth knowing because
+the obvious implementation is wrong. A kubelet mints a static pod's UID from
+its manifest, so it matches no pod in the API server and a UID lookup misses
+forever — which would leave `kube-apiserver`, `etcd`, `kube-scheduler` and
+`kube-controller-manager` permanently unattributed, on the node whose disk is
+most likely to fill. Falling back to namespace/name would fix those and break
+something worse: a pod that merely **reuses** a name would lend its identity to
+statistics about its predecessor. So the UID cross-check is *redirected* rather
+than dropped — the kubelet stamps that same UID onto the mirror pod as
+`kubernetes.io/config.hash`, which the mirror client copies to
+`kubernetes.io/config.mirror`, and a by-name answer is accepted only when one
+of those annotations equals the UID the kubelet reported. A name-reusing pod
+carries neither and stays unresolved.
+
+An object the metadata service cannot place is **still exported**, carrying the
+identity the payload itself gave it; what it loses is the join. That is counted
+by `kubescrape_summary_unresolved_total{level}`, once per object per scrape
+rather than per data point.
+
+Cost, measured on a synthetic 110-pod node with two containers and two measured
+volumes each: **2550 data points per scrape** — 1320 volume series (just over
+half, at six per measured volume), 880 container, 330 pod and 20 node. The lever
+is a drop rule under `metrics.pipelines.summary`, which sees the data-point
+attributes (`k8s.volume.name`, `fs.type`) as labels; the flag itself is all or
+nothing.
+
+A stat carries **its own timestamp**, not the scrape's: the kubelet refreshes
+volume statistics on its own jittered ~1-minute cycle, so at a 15s scrape
+interval three scrapes in four carry a figure that is genuinely up to a minute
+old, and stamping scrape time would fabricate freshness.
+
 
 ## Agent: high-frequency cgroup sampling
 

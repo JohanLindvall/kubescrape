@@ -599,6 +599,46 @@ func configWarnings(cfg agentConfig) []string {
 		out = append(out, "no -positions-file: offsets are not persisted — a -logs restart re-reads per -logs-unknown-files, and -journald resumes at the journal TAIL, losing every entry written while the process was down (journald has no cursor file of its own)")
 	}
 
+	// A kubelet scrape asked for with no kubelet to scrape. startScraper gates
+	// all three of them on -kubelet-endpoint being non-empty, so the pipeline is
+	// not disabled, not failing and not retrying: it is never SCHEDULED. That is
+	// the quietest failure a pipeline has — nothing is attempted, so no scrape
+	// counter moves, no error is logged, and /debug/targets carries no row for
+	// them (it lists the outcomes of scrapes that RAN); the only evidence is
+	// metrics that never arrive, which reads exactly like a collector or a query
+	// problem. -cadvisor and -node-metrics DEFAULT to on, so the commonest way
+	// in is typing nothing at all.
+	//
+	// The flag VALUES, never whether they were typed: the chart renders
+	// -cadvisor= and -node-metrics= unconditionally, so keying on explicitness
+	// would make one rendered ConfigMap warn and an identical hand-written one
+	// stay silent — the same "does the same effective config behave differently
+	// depending on whether a default was spelled out" trap the guard-rail
+	// warning below refuses.
+	//
+	// Named rather than refused: a logs-only agent that leaves the metric
+	// toggles at their defaults is a legitimate deployment, and refusing to
+	// start it would take a node's log shipping down over a metric it never
+	// asked for.
+	if *kubeletEndpoint == "" {
+		var asked []string
+		if *cadvisorOn {
+			asked = append(asked, "-cadvisor")
+		}
+		if *nodeOn {
+			asked = append(asked, "-node-metrics")
+		}
+		if *summaryOn {
+			asked = append(asked, "-kubelet-summary")
+		}
+		if len(asked) > 0 {
+			out = append(out, fmt.Sprintf(
+				"-kubelet-endpoint is empty, so the kubelet scrapes that depend on it are never scheduled: %s. Nothing is attempted and nothing fails — no scrape counter moves and no error is logged — so the only symptom is the missing metrics. "+
+					"Set -kubelet-endpoint=https://$(NODE_IP):10250 (the shipped manifests and the chart do), or turn those flags off so the startup log describes what is actually collected.",
+				strings.Join(asked, ", ")))
+		}
+	}
+
 	// A DERIVED token bucket below one whole token. The value the operator
 	// typed is -logs-rate-limit, and it is delivered EXACTLY — the floor lifts
 	// the bucket to 1 and leaves the refill accruing at the requested rate — so
@@ -947,8 +987,8 @@ func printConfigSummary(cfg agentConfig, log *slog.Logger) {
 		// Which binary this is, not just whether the config parses: the
 		// optional pipelines are build-tag-gated (buildtags.go).
 		"optionalPipelines", builtPipelines(),
-		"pipelines", fmt.Sprintf("logs=%s metrics=%s cadvisor=%s cgroupStats=%s node=%s journald=%s ingest=%s events=%s azure=%s serviceGraph=%s",
-			on(*logsOn), on(*metricsOn), on(*cadvisorOn), cgroupStats, on(*nodeOn), on(*journaldOn), on(*ingestOn), on(*eventsOn), on(*azureOn), on(*serviceGraphOn)),
+		"pipelines", fmt.Sprintf("logs=%s metrics=%s cadvisor=%s cgroupStats=%s node=%s summary=%s journald=%s ingest=%s events=%s azure=%s serviceGraph=%s",
+			on(*logsOn), on(*metricsOn), on(*cadvisorOn), cgroupStats, on(*nodeOn), on(*summaryOn), on(*journaldOn), on(*ingestOn), on(*eventsOn), on(*azureOn), on(*serviceGraphOn)),
 		"otlp-endpoint", *otlpEndpoint,
 		"otlp-protocol", *otlpProtocol,
 		"buffer-dir", *bufferDir,

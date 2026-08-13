@@ -373,6 +373,15 @@ func validateConfig(cfg agentConfig, transformsFile string) error {
 	if *serviceGraphOn && *serviceGraphListen == "" && *serviceGraphHTTPListen == "" {
 		return errors.New(msgShardNoListener)
 	}
+	// Two of the tier's four listeners on one address. Fatal at the real start
+	// (the second bind loses), and the chart renders three of them from values,
+	// so it is a one-value mistake — checked here for the same reason as the
+	// refusal above.
+	if *serviceGraphOn {
+		if err := serviceGraphListenersDistinct(); err != nil {
+			return err
+		}
+	}
 	// The SAME merge of flags and section a real start uses, so the dry run
 	// cannot accept a shard set the start rejects (the flags participate: the
 	// chart configures this feature entirely through them).
@@ -389,7 +398,14 @@ func validateConfig(cfg agentConfig, transformsFile string) error {
 		if err != nil {
 			return err
 		}
-		if err := shards.Validate(); err != nil { // its messages already name the section
+		// ValidateAgainst, not Validate: the section's own shape AND the
+		// per-shard exporter configs NewResharder derives from it over the same
+		// flag base a start uses. Checking only the section left every rule that
+		// exists after the derivation out of the dry run — TLS material beside a
+		// plaintext gRPC hop, a scheme-less explicit endpoint under
+		// protocol: http — so -check-config exited 0 and the same ConfigMap then
+		// aborted every pod of the tier's StatefulSet at startup.
+		if err := shards.ValidateAgainst(baseExportConfig()); err != nil { // its messages already name the section
 			return err
 		}
 		// ReshardConfig.Validate is shape-only by contract and cannot see the
@@ -476,6 +492,60 @@ func compileSources(logs *tailer.SourcesConfig) ([]tailer.Source, error) {
 	return tailer.ValidateSources(logs.Sources)
 }
 
+// plainSourcePodSelectionWarnings names the three pod-selection keys on a source
+// that has no pods.
+//
+// `namespaces`, `excludeNamespaces` and `selector` all select by POD identity:
+// the first two are read from the CRI FILENAME at discovery and the third from
+// the pod's labels once metadata resolves, and neither exists for a plain file —
+// so on a plain source all three do nothing at all. Silently: every matched file
+// is collected, -check-config stays green, and the operator's evidence that the
+// filter works is the absence of an error.
+//
+// NAMED, not refused, and the reason is not the usual "it might be deliberate".
+// A refusal here is strictly worse than the inert key it reports: one -config is
+// shared by every workload of this chart, and only ENABLING a pipeline a binary
+// lacks may fail startup — no section belongs to one pipeline, precisely so a
+// shared ConfigMap stays decodable by all of them. Refusing aborts the
+// events/Azure singleton and the trace tier, neither of which ever tails a file,
+// over a key that is inert in their config by construction; and on the DaemonSet
+// that does read it, it turns a running fleet into a CrashLoop at the next
+// rollout for a mistake that costs egress, not correctness. The keys stay inert
+// either way — this makes the operator's evidence a line of output instead of a
+// silence.
+//
+// It is deliberately ungated: the fault is in the config TEXT, so every workload
+// reading that ConfigMap reports the same list, and one `-check-config` in CI
+// speaks for all of them.
+func plainSourcePodSelectionWarnings(logs *tailer.SourcesConfig) []string {
+	if logs == nil {
+		return nil
+	}
+	var out []string
+	for i, s := range logs.Sources {
+		if s.Containerd {
+			continue
+		}
+		var keys []string
+		if len(s.Namespaces) > 0 {
+			keys = append(keys, "namespaces")
+		}
+		if len(s.ExcludeNamespaces) > 0 {
+			keys = append(keys, "excludeNamespaces")
+		}
+		if len(s.Selector) > 0 {
+			keys = append(keys, "selector")
+		}
+		if len(keys) > 0 {
+			out = append(out, fmt.Sprintf(
+				"logs.sources[%d] (%q) is a plain (non-containerd) source and %s selects pods, which its files do not have — the namespace filters read the CRI FILENAME at discovery and the selector reads pod labels at resolve time, so the key is IGNORED and every matched file is collected. "+
+					"Set containerd: true if these are container logs, or narrow the source with include/exclude globs (or logs.rules, which costs the read first).",
+				i, s.Name, strings.Join(keys, " and ")))
+		}
+	}
+	return out
+}
+
 // compileLogMetrics compiles the logMetrics section into a set; nil when the
 // section is absent or empty. The name PREFIX is applied here because it
 // participates in validation — an empty rule name is legal only because the
@@ -508,6 +578,10 @@ func compileTransforms(file string) (*transform.Program, error) {
 // run says exactly what a start would.
 func configWarnings(cfg agentConfig) []string {
 	var out []string
+
+	// Pod-selection keys on a source that has no pods; see the function for why
+	// this is a warning and not the refusal it was first written as.
+	out = append(out, plainSourcePodSelectionWarnings(cfg.Logs)...)
 
 	// No offset persistence at all, for a pipeline that has offsets. The
 	// consequence differs per pipeline and neither is visible from the flag:
@@ -583,6 +657,28 @@ func configWarnings(cfg agentConfig) []string {
 					"traceSampling.probability is safe below a tail sampler (the two nest: a tail probabilistic policy at the same fraction keeps exactly what the head kept) and so is maxSpansPerSecond, which is an overload valve.",
 				strings.Join(rails, " and ")))
 		}
+	}
+
+	// A traceSampling section on the tier that samples NOTHING. The trap is
+	// `probability: 0`: it reads as "ship no traces" and does the exact
+	// opposite, because Probability is a plain float64 — 0 is indistinguishable
+	// from an unset field, so Enabled() is false, buildOwnerChain never wires the
+	// sampler, no "trace sampling enabled" line is logged, and New would map 0 to
+	// keep-all anyway. Nothing else says so either: the configured-but-ignored
+	// warnings only fire OFF the tier, and no counter moves for a sampler that
+	// does not exist, so the only symptom is the egress bill.
+	//
+	// Named rather than refused, and for once the reason is not "it might be
+	// deliberate": 0 CANNOT be told from unset, so refusing it would refuse a
+	// section that merely spells out its defaults. Refusing is what
+	// tracesample.Validate already does for the values that are unambiguously
+	// wrong (a negative, or the 50-for-50% typo). `probability: 1` is left silent
+	// — it is an honest, explicit "keep everything".
+	if *serviceGraphOn && cfg.TraceSampling != nil && !cfg.TraceSampling.Enabled() && cfg.TraceSampling.Probability != 1 {
+		out = append(out, fmt.Sprintf(
+			"traceSampling is configured but samples nothing: probability=%v keeps EVERY trace (only a fraction strictly BETWEEN 0 and 1 samples — 0.1 is a tenth; 0 is indistinguishable from an unset field and means keep-all, not drop-all) and maxSpansPerSecond=%v is uncapped, so the section is inert and 100%% of the cluster's spans are shipped. "+
+				"There is no value here that drops everything — stop the senders, or express the intent as tailSampling policies.",
+			cfg.TraceSampling.Probability, cfg.TraceSampling.MaxSpansPerSecond))
 	}
 
 	// Peer-IP attribution on the trace tier with the self-metadata lookup turned

@@ -320,12 +320,21 @@ agent:
       name: ""
       key: token
 
-  # null means "this release's namespace plus the one agent.otlp.endpoint
-  # names" (see the template): tailing the namespace the agent or the collector
-  # runs in is a feedback loop that amplifies exactly when the collector is
-  # already struggling, and the two namespaces differ whenever the endpoint
-  # default (otel-collector.monitoring) is kept in a release installed
-  # elsewhere. Set [] to exclude nothing.
+  # null means "this release's namespace plus the namespace of every IN-CLUSTER
+  # destination that receives ALL of this agent's output" — agent.otlp.endpoint
+  # and each per-signal agent.config.export override (see the template): tailing
+  # the namespace the agent or one of those destinations runs in is a feedback
+  # loop that amplifies exactly when that destination is already struggling, and
+  # the namespaces differ whenever the endpoint default
+  # (otel-collector.monitoring) is kept in a release installed elsewhere — or
+  # whenever a collectorless export section ships a signal somewhere else
+  # entirely.
+  #
+  # agent.config.routing routes are NOT included: a route is selected BY
+  # namespace, so per-tenant routing normally names the tenant's own namespace
+  # on both sides and excluding it would drop the very logs the route delivers.
+  # Name a genuinely self-shipping route's namespace here explicitly if you have
+  # one. Set [] to exclude nothing.
   logsExcludeNamespaces: null
   # A single file persisting BOTH log offsets and the journald cursor across
   # restarts (empty disables persistence).

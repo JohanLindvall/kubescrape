@@ -256,12 +256,15 @@ func (r *Reader) export(ctx context.Context, signal string, count int, send func
 		return true
 	}
 	if ctx.Err() == nil {
-		if signal == "logs" {
-			// The metrics signal is already counted by the client layer's
-			// obs.Exports{metrics,error}; kubescrape_log_export_failures
-			// must not absorb it.
-			obs.LogExportFailures.Inc()
-		}
+		// This pipeline's OWN transient-failure counter, per signal.
+		// kubescrape_log_export_failures_total documents itself as the tailer's
+		// "files rewound"; this reader owns no file and runs in the singleton
+		// Deployment with -logs=false, so those increments described something
+		// that had not happened — and only the LOGS signal was ever counted
+		// there (the metrics one was left to the client layer's generic
+		// obs.Exports{metrics,error}, which cannot say WHICH pipeline retried),
+		// so a hub carrying platform metrics retried invisibly.
+		obs.AzureExportFailures.WithLabelValues(signal).Inc()
 		r.log.Warn("exporting azure diagnostics", "signal", signal, "error", err)
 	}
 	return false

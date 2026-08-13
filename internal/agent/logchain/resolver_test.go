@@ -9,6 +9,7 @@ import (
 
 	"github.com/JohanLindvall/kubescrape/pkg/logattrs"
 
+	"github.com/JohanLindvall/kubescrape/internal/logline"
 	"github.com/JohanLindvall/kubescrape/internal/testrace"
 )
 
@@ -400,5 +401,81 @@ func TestRecordSeverityNumberBands(t *testing.T) {
 	lr.SetSeverityText("WARNING")
 	if got := RecordSeverity(lr); got != "warning" {
 		t.Errorf("text override: %q, want warning", got)
+	}
+}
+
+// __severity__ resolves to the PRODUCER's own severity word, lowercased, and a
+// rule literal that selects records today must keep selecting them.
+//
+// There is a real defect underneath this, and it is deliberately NOT fixed
+// here: the two vocabularies that reach the key disagree on the same level.
+// journald stamps the syslog word (priority 4 is "warning", 3 "err", 2 "crit")
+// while logenrich.Apply overwrites SeverityText with enrich's word ("warn",
+// "error", "fatal") whenever it parses a level out of the BODY, so `drop
+// __severity__=warn` applies to whichever priority-4 entries happen to be
+// parseable. Operators spell around it with a regex — `__severity__=~^(warn|
+// warning)$` — and the exported severity_number is unaffected.
+//
+// Canonicalising the key onto enrich's six level words looks like the fix and
+// is a far worse trade, which is what this test exists to keep out. It
+// un-matches every other spelling with no startup error, no -check-config
+// complaint and no counter, and it does so in the direction that costs data:
+// the NEGATED form INVERTS. `{action: drop, match: ["__severity__!=err"]}` —
+// ship only the priority-3 journal entries — stops matching "err" on any record
+// at all and drops the node's entire journal. Fixing the split honestly means
+// canonicalising BOTH sides of the comparison, which the exact-selector DSL
+// does not do (and a regex selector could not be canonicalised at all), and no
+// startup guard can cover the pod-annotation rules of kubescrape.io/logs, which
+// compile from cluster data and are deliberately IGNORED when malformed rather
+// than refused.
+func TestRecordSeverityKeepsProducerSpellingsSelectable(t *testing.T) {
+	lr := plog.NewLogRecord()
+	// journald's severity() texts, with the numbers it stamps beside them: six
+	// of the eight are spellings no canonical vocabulary contains.
+	for _, tc := range []struct {
+		text string
+		n    plog.SeverityNumber
+	}{
+		{"emerg", plog.SeverityNumberFatal3},
+		{"alert", plog.SeverityNumberFatal2},
+		{"crit", plog.SeverityNumberFatal},
+		{"err", plog.SeverityNumberError},
+		{"warning", plog.SeverityNumberWarn},
+		{"notice", plog.SeverityNumberInfo2},
+		{"info", plog.SeverityNumberInfo},
+		{"debug", plog.SeverityNumberDebug},
+	} {
+		lr.SetSeverityText(tc.text)
+		lr.SetSeverityNumber(tc.n)
+		if got := RecordSeverity(lr); got != tc.text {
+			t.Errorf("__severity__ for the journald text %q = %q: every rule naming %q silently stops "+
+				"selecting, and its negated form inverts into matching everything", tc.text, got, tc.text)
+		}
+	}
+
+	// The inversion itself, through the real rule engine rather than by
+	// inspection of the resolved string.
+	f, err := logline.NewLineFilter([]logline.LineRule{
+		{Action: "drop", Match: []string{"__severity__!=err"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := New()
+	keep := func(text string, n plog.SeverityNumber, body string) bool {
+		rec := plog.NewLogRecord()
+		rec.SetSeverityText(text)
+		rec.SetSeverityNumber(n)
+		r.Set(pcommon.NewMap(), pcommon.NewMap(), RecordSeverity(rec))
+		return f.Keep(r.RuleFn(), body)
+	}
+	if !keep("err", plog.SeverityNumberError, "sshd: authentication failure") {
+		t.Error("`drop __severity__!=err` dropped the priority-3 entry it exists to keep: the selector " +
+			"inverted, so it now drops every entry on the node and nothing reports it")
+	}
+	// The other half of the rule must still work, or the assertion above would
+	// pass for a filter that keeps everything.
+	if keep("info", plog.SeverityNumberInfo, "started unit") {
+		t.Error("`drop __severity__!=err` kept a priority-6 entry: the rule is not being applied at all")
 	}
 }

@@ -63,6 +63,46 @@ func minSweep(s *Store, n int, arm func(i int)) time.Duration {
 	return best
 }
 
+// A lapsed pod must take its NAME index entry with it too. Nothing else ever
+// revisits byPodName — Sweep is the last event in a record's life — so an entry
+// left behind keeps the whole kubemeta.Pod reachable for the process lifetime,
+// one per expired tombstone, on a cluster whose pod names never repeat (Jobs,
+// CronJobs, any generateName workload).
+//
+// It is invisible from the API, which is why nothing caught it: the stale
+// record's expireAt is in the past, so GetPodByName's expiry check rejects it
+// and every lookup still answers correctly. Only the map grows. The existing
+// TestPodIPIndexDoesNotLeakAcrossDeletes runs the same create/delete/sweep loop
+// and checks byPodIP alone.
+func TestSweepDropsTheNameIndexEntry(t *testing.T) {
+	s, clk := newTestStore(time.Minute)
+	const n = 300
+	for i := range n {
+		uid := fmt.Sprintf("uid-%d", i)
+		s.UpsertPod(makePod(uid, fmt.Sprintf("pod-%d", i), "node1", "1",
+			map[string]string{"app": fmt.Sprintf("c0ffee%06d", i)}))
+		s.DeletePod(types.UID(uid))
+	}
+	// One pod that is NOT deleted: the sweep must not take the live index with
+	// the dead entries.
+	s.UpsertPod(makePod("live", "pod-live", "node1", "1", map[string]string{"app": "abcdef000001"}))
+
+	clk.Advance(2 * time.Minute)
+	s.Sweep()
+
+	s.mu.RLock()
+	names, pods := len(s.byPodName), len(s.pods)
+	s.mu.RUnlock()
+	if names != 1 {
+		t.Fatalf("byPodName holds %d entries after %d tombstones lapsed (pods=%d, want 1 of each): "+
+			"each leaked entry pins a whole kubemeta.Pod and nothing ever revisits the index",
+			names, n, pods)
+	}
+	if _, ok := s.GetPodByName("default", "pod-live"); !ok {
+		t.Fatal("the live pod's name entry was swept away")
+	}
+}
+
 // Whatever the sweep's shape, a lapsed pod must take its container entries with
 // it: they are looked up by ID with no pod reference, so a survivor would
 // resolve into a record that no longer exists.

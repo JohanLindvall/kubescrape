@@ -67,6 +67,7 @@ is the documented alert for the non-buffered tailer.
 | `kubescrape_azure_decode_errors_total` | — | Event Hubs messages or records that could not be decoded as Azure diagnostics JSON (skipped, committed past). |
 | `kubescrape_azure_dropped_batches_total` | — | Azure diagnostic payloads dropped after a permanent collector rejection (the offsets advance past them). |
 | `kubescrape_azure_dropped_records_total` | `signal` | Azure diagnostic records (log records or metric data points) lost with those payloads, by signal. |
+| `kubescrape_azure_export_failures_total` | `signal` | Azure diagnostic payload exports that failed transiently and are being retried IN PLACE, by signal (logs, metrics). The payload is kept and the Kafka offsets do not advance until the collector acks, so this counts ATTEMPTS, not lost records; the loss counters are kubescrape_azure_dropped_batches_total and kubescrape_azure_dropped_records_total. Deliberately NOT kubescrape_log_export_failures_total, the tailer's files-rewound counter: this reader owns no file, it runs in the singleton Deployment with -logs=false, and only its LOGS signal was ever counted there — so a hub carrying platform metrics retried invisibly. |
 | `kubescrape_azure_exported_total` | `signal` | Azure diagnostic records exported, by signal (logs, metrics). |
 | `kubescrape_azure_fetch_errors_total` | — | Kafka fetch errors from the Event Hubs consumer (retried; partial fetches are still processed). |
 | `kubescrape_azure_records_total` | `signal` | Azure diagnostic records decoded from Event Hubs messages, by signal (logs, metrics). |
@@ -103,6 +104,7 @@ is the documented alert for the non-buffered tailer.
 | `kubescrape_event_watch_restarts_total` | — | Event watch restarts (a closed stream, an error, or an expired resourceVersion). |
 | `kubescrape_events_dropped_batches_total` | — | Kubernetes event batches dropped after a permanent collector rejection (the position advances past them). |
 | `kubescrape_events_dropped_records_total` | — | Kubernetes event records lost with those batches (the magnitude of the loss the batch counter only signals). |
+| `kubescrape_events_export_failures_total` | — | Kubernetes event batch exports that failed transiently. The batch is KEPT and the watch stays open (tryFlush), so this counts ATTEMPTS — one per flush, not lost events: a steady rate is a collector outage the reader is riding out with its position uncommitted, and the loss counters are kubescrape_events_dropped_batches_total (a permanent rejection) and kubescrape_events_overflow_dropped_total (the retained batch reaching its cap). Deliberately NOT kubescrape_log_export_failures_total, which is the tailer's files-rewound counter and cannot apply here — this reader rewinds no file, and the singleton that collects events runs with -logs=false, so those increments landed on a metric whose help described something that had not happened. |
 | `kubescrape_events_exported_total` | — | Kubernetes event records exported (after the rules). |
 | `kubescrape_events_observed_total` | `type` | Kubernetes events received from the watch, by event type (normal, warning, other — anything else the API server reports). |
 | `kubescrape_events_overflow_dropped_total` | — | Kubernetes events dropped UNEXPORTED because the retained batch hit its cap before anything could commit (a collector outage on a fresh install); the watch will not re-deliver them, so each is outright loss. |
@@ -198,4 +200,4 @@ is the documented alert for the non-buffered tailer.
 | `kubescrape_transform_errors_total` | `signal` | Transform program invocations that failed (the batch is NOT exported; the error propagates to the producer's retry path). |
 | `kubescrape_transform_reloads_total` | `outcome` | Transforms-file reloads by outcome (applied, failed — a failed compile keeps the last good program). |
 
-136 metrics.
+138 metrics.

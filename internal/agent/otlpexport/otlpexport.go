@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -125,7 +126,12 @@ type Client struct {
 	token *bearer.File
 }
 
-// New creates a Client for cfg.
+// msgClientCertPair is the mTLS pairing refusal, spelled ONCE: Validate raises
+// it so -check-config catches it before a rollout, buildTLS keeps it as the
+// constructor-side guard, and one const is what stops the two from drifting
+// into different sentences for the same mistake.
+const msgClientCertPair = "client certificate needs BOTH clientCertFile and clientKeyFile"
+
 // Validate checks everything about a Config that can be judged WITHOUT
 // touching the filesystem, the network or a TLS keypair — the same checks New
 // makes before it builds anything.
@@ -155,6 +161,16 @@ func (cfg Config) Validate() error {
 	if cfg.Endpoint == "" {
 		return fmt.Errorf("no endpoint")
 	}
+	// The mTLS pair, checked HERE and not only in buildTLS. It is a pure-shape
+	// rule (two strings, no file touched) that New refuses at startup, so
+	// leaving it out of Validate broke the one promise this function makes: a
+	// routing route carrying only clientCertFile passed -check-config and then
+	// killed the process at `creating OTLP exporter`, from the check whose whole
+	// purpose is catching that before a rollout. Same message as the
+	// constructor's, so the two paths cannot be told apart in a log.
+	if (cfg.ClientCertFile == "") != (cfg.ClientKeyFile == "") {
+		return errors.New(msgClientCertPair)
+	}
 	if cfg.Protocol == "http" && !strings.HasPrefix(cfg.Endpoint, "http://") && !strings.HasPrefix(cfg.Endpoint, "https://") {
 		return fmt.Errorf("endpoint %q needs an http:// or https:// scheme for the http protocol", cfg.Endpoint)
 	}
@@ -176,6 +192,7 @@ func (cfg Config) Validate() error {
 	return nil
 }
 
+// New creates a Client for cfg.
 func New(cfg Config) (*Client, error) {
 	if cfg.Protocol == "" {
 		cfg.Protocol = "grpc"
@@ -315,8 +332,12 @@ func buildTLS(cfg Config) (*tls.Config, error) {
 		tlsCfg.RootCAs = pool
 	}
 	if cfg.ClientCertFile != "" || cfg.ClientKeyFile != "" {
+		// Unreachable from New (Validate rejects the unpaired shape first) and
+		// kept as the second line for any other caller of buildTLS: loading a
+		// keypair from one empty path is the failure that must never degrade
+		// into "mTLS silently not presented".
 		if cfg.ClientCertFile == "" || cfg.ClientKeyFile == "" {
-			return nil, fmt.Errorf("client certificate needs BOTH clientCertFile and clientKeyFile")
+			return nil, errors.New(msgClientCertPair)
 		}
 		pair, err := tls.LoadX509KeyPair(cfg.ClientCertFile, cfg.ClientKeyFile)
 		if err != nil {

@@ -230,3 +230,147 @@ func TestNegativeFingerprintBytesInodeOnlyIdentity(t *testing.T) {
 		t.Fatalf("rotation missed under inode-only identity: %v", got)
 	}
 }
+
+// pos.less orders SEGMENT-first, and that is what makes watermark() the lowest
+// position in STREAM order rather than the smallest raw offset. Comparing
+// offsets alone lets a NEWER segment's low-offset buffered item win (a fresh
+// inode starts at 0), so the OLDER segment's commit candidate matches neither
+// clamp arm in flush() — it commits its whole owed range and the segment is
+// RETIRED with its lines still buffered, closing the only fd to a possibly
+// unlinked inode and dropping its checkpoint entry.
+//
+// The shape, all through the real read/rotate/flush path, with stack-trace
+// joining off so the only buffered state is a stage-1 CRI fragment run:
+//
+//	segment 1 (old inode)   stderr F alpha    [0, a)   -> entry in the batch
+//	                        stdout P frag     [a, b)   -> stdout run OPEN at a
+//	                        stderr F beta     [b, c)   -> entry in the batch
+//	rename rotation: nothing left to drain and stdout's run is buffered, so the
+//	pipeline is CARRIED and the old inode is recorded as segment 1 {0, c}
+//	segment 2 (new inode)   stderr P frag2    [0, x)   -> stderr run OPEN at 0
+//
+// The watermark must be {seg 1, off a} — the stdout run buffered in the OLD
+// segment precedes the stderr run at offset 0 of the new one.
+func TestWatermarkOrdersBySegmentBeforeOffset(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+	exp := &fakeExporter{}
+	tl := driveTailer(dir, exp)
+	path := filepath.Join(dir, logName)
+
+	tl.scanDir(tl.loadCheckpoints(), true) // no files yet: the next one is new
+
+	ts := timeNowCRI() // near now, or the sweep's age-out tears the run
+	l1 := ts + " stderr F alpha"
+	l2 := ts + " stdout P frag"
+	l3 := ts + " stderr F beta"
+	a := int64(len(l1) + 1)
+	b := a + int64(len(l2)+1)
+	c := b + int64(len(l3)+1)
+
+	writeLog(t, dir, l1, l2, l3)
+	tl.scanDir(nil, false)
+	tl.sweep(ctx, true)
+
+	f := tl.files[path]
+	if f == nil {
+		t.Fatal("setup: file not tracked")
+	}
+	if !f.stStdout.hasRun || f.stStdout.runStart != (pos{seg: f.tail, off: a}) {
+		t.Fatalf("setup: stdout run = %+v hasRun=%v, want an open run at offset %d",
+			f.stStdout.runStart, f.stStdout.hasRun, a)
+	}
+	if len(tl.batch) != 2 {
+		t.Fatalf("setup: batch = %v, want the two stderr entries", bodies(tl))
+	}
+
+	oldSeg := f.tail
+	rotateAway(t, dir, 1)
+	writeLog(t, dir, ts+" stderr P frag2")
+	tl.sweep(ctx, true) // handles the rotation
+	tl.sweep(ctx, true) // reads the new inode
+
+	sg := f.segmentByID(oldSeg)
+	if sg == nil {
+		t.Fatalf("setup: no segment recorded for the rotated inode (segments %+v)", f.segments)
+	}
+	if sg.to != c || sg.committed != 0 {
+		t.Fatalf("setup: segment %d = {committed %d, to %d}, want {0, %d}", oldSeg, sg.committed, sg.to, c)
+	}
+	if !f.stStdout.hasRun || f.stStdout.runStart != (pos{seg: oldSeg, off: a}) {
+		t.Fatalf("setup: stdout run after the rotation = %+v hasRun=%v, want it still open at {%d, %d}",
+			f.stStdout.runStart, f.stStdout.hasRun, oldSeg, a)
+	}
+	if !f.stStderr.hasRun || f.stStderr.runStart != (pos{seg: f.tail, off: 0}) {
+		t.Fatalf("setup: stderr run in the new inode = %+v hasRun=%v, want {%d, 0}",
+			f.stStderr.runStart, f.stStderr.hasRun, f.tail)
+	}
+
+	if wm, ok := f.watermark(); !ok || wm != (pos{seg: oldSeg, off: a}) {
+		t.Errorf("watermark = %+v (ok=%v), want {seg %d, off %d}: the stdout run buffered in the OLD "+
+			"segment precedes the stderr run at offset 0 of the new one", wm, ok, oldSeg, a)
+	}
+
+	// The flush that exports alpha+beta: their end (c) is segment 1's whole
+	// owed range, so only the watermark clamp keeps the segment alive.
+	tl.flush(ctx)
+
+	if sg := f.segmentByID(oldSeg); sg == nil {
+		t.Fatalf("SEGMENT %d RETIRED with its lines still buffered: the stdout fragment run owns [%d, %d) "+
+			"of the rotated-away inode, and retirement closed its fd and dropped its checkpoint entry",
+			oldSeg, a, b)
+	} else if sg.committed != a {
+		t.Fatalf("segment %d committed = %d, want %d (clamped to the buffered stdout run)", oldSeg, sg.committed, a)
+	}
+}
+
+// The consequence of that premature retirement, driven to an actual export: the
+// rotated inode's fd is closed and its segment record gone, so the buffered
+// stdout fragment can never be replayed. A later export failure rewinds the
+// file and purges the pipeline; feedSegments must be able to re-read the owed
+// range so the joined record ships whole ("frag"+"rest") instead of as "rest"
+// alone — a silently truncated log line with no counter moving.
+func TestCarriedFragmentSurvivesARewindAfterRotation(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+	exp := &fakeExporter{}
+	tl := driveTailer(dir, exp)
+	path := filepath.Join(dir, logName)
+
+	tl.scanDir(tl.loadCheckpoints(), true)
+
+	ts := timeNowCRI()
+	writeLog(t, dir, ts+" stderr F alpha", ts+" stdout P frag", ts+" stderr F beta")
+	tl.scanDir(nil, false)
+	tl.sweep(ctx, true)
+
+	f := tl.files[path]
+	oldSeg := f.tail
+	rotateAway(t, dir, 1)
+	writeLog(t, dir, ts+" stderr P frag2")
+	tl.sweep(ctx, true)
+	tl.sweep(ctx, true)
+	tl.flush(ctx) // exports alpha+beta; the clamp must keep segment 1 alive
+
+	// The stdout fragment run completes in the new inode.
+	writeLines(t, path, ts+" stdout F rest")
+	tl.sweep(ctx, true)
+	if !emitted(tl, "fragrest") {
+		t.Fatalf("setup: joined stdout entry not in the batch: %v", bodies(tl))
+	}
+
+	// That export fails: the file rewinds and the pipeline is purged, so the
+	// prefix has to come back from the old segment's record.
+	exp.fail = 3
+	tl.flush(ctx)
+
+	for i := 0; i < 6; i++ {
+		tl.sweep(ctx, true)
+		tl.flush(ctx)
+	}
+	if slices.Contains(exp.get(), "fragrest") {
+		return
+	}
+	t.Fatalf("the fragment buffered in segment %d was lost across the rewind (segment retired early, "+
+		"fd closed, nothing to replay): exported %v", oldSeg, exp.get())
+}

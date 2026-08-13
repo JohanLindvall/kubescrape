@@ -213,6 +213,18 @@ func (ss *scrapeSession) reportDropped() {
 	if ss.droppedRelabel > 0 {
 		obs.ScrapeSamplesDropped.WithLabelValues(ss.pipeline, "relabel").Add(float64(ss.droppedRelabel))
 	}
+	// The third reason is not a config decision like the other two: the
+	// converter refused to hold more of one histogram/summary family
+	// (maxFamilyAccBytes). Nobody asked for that drop, so unlike filter/relabel
+	// it also warns — deduped per target like every other per-scrape complaint,
+	// since a target's exposition does not change between cycles and the counter
+	// is the ongoing signal.
+	if ss.conv.dropped > 0 {
+		obs.ScrapeSamplesDropped.WithLabelValues(ss.pipeline, "accumulator").Add(float64(ss.conv.dropped))
+		ss.s.warnOnce("accbudget:"+ss.warnKey,
+			"scrape family exceeded the converter's per-family memory budget; the samples past it were dropped",
+			"target", ss.what, "dropped", ss.conv.dropped, "samples", ss.samples)
+	}
 }
 
 // salvage exports the partially converted scrape after an abort (sample limit,

@@ -157,9 +157,11 @@ func TestRotatingGraceWindow(t *testing.T) {
 	}
 
 	// Rotate the file; the cached value is still fresh, so nothing changes yet.
+	// "Fresh" for a receiver is DefaultRefreshInterval, not the read interval —
+	// the clock has not moved at all here, so neither cadence has elapsed.
 	write(t, path, "new-token\n")
 	if got := r.Tokens(); len(got) != 1 || got[0] != "old-token" {
-		t.Fatalf("within the read interval: %v, want the cached [old-token]", got)
+		t.Fatalf("within the refresh cadence: %v, want the cached [old-token]", got)
 	}
 
 	// Past the read interval: both are accepted.
@@ -193,6 +195,97 @@ func TestNewRotatingRefusesAMissingOrEmptyFile(t *testing.T) {
 	write(t, path, "\n\n")
 	if _, err := NewRotating(path, discard()); err == nil {
 		t.Error("an empty token file must refuse to construct")
+	}
+}
+
+// THE OTHER DIRECTION of a rotation, which had no mechanism at all: the client
+// re-read FIRST and presents a token the receiver has not seen. No grace window
+// can cover that — a receiver cannot accept a value it has never read — so the
+// only remedy is that the receiver reads soon, which is what
+// DefaultRefreshInterval is for.
+//
+// The sequence is the friendliest possible case for the design: ONE shared
+// token file, one clock, no kubelet projection skew. With the receiver on the
+// same minute cadence as the client, the receiver's last read simply lands
+// EARLIER in the minute than the client's, and every request in between is a
+// hard 401 — measured at 57 consecutive seconds of rejection on
+// /v1/scrape-auth, at the moment this package's doc called rotation a
+// non-event.
+func TestRotatingAcceptsATokenTheClientRotatedToFirst(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "token")
+	write(t, path, "A")
+	c := newClock()
+
+	// t=0: the receiver reads A at construction.
+	rt, err := NewRotating(path, discard(), WithClock(c.now))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// t=1: the client reads A. Its cadence is now one second AHEAD of the
+	// receiver's — which is the whole setup; nothing about it is unusual.
+	c.advance(time.Second)
+	f := NewFile(path, discard(), WithClock(c.now))
+	if _, err := f.Read(); err != nil {
+		t.Fatal(err)
+	}
+	// t=60: Run's ticker fires on the receiver. Nothing has changed.
+	c.advance(DefaultReadInterval - time.Second)
+	rt.Tokens()
+
+	// t=61: the Secret is rotated. t=62: the client's own interval has elapsed,
+	// so it presents the new token.
+	c.advance(time.Second)
+	write(t, path, "B")
+	c.advance(time.Second)
+	presented, err := f.Token()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if presented != "B" {
+		t.Fatalf("the client presents %q; the test needs it to have re-read first", presented)
+	}
+	if !Authorized("Bearer "+presented, rt.Tokens()) {
+		t.Fatalf("the receiver rejected the rotated token the client already presents "+
+			"(accepts %v); a client that re-reads first must not be 401'd", rt.Tokens())
+	}
+	// And the direction that DOES have a grace window is unaffected: a client
+	// that has not re-read yet still authenticates with the predecessor.
+	if !Authorized("Bearer A", rt.Tokens()) {
+		t.Fatalf("the predecessor stopped being accepted (accepts %v); the grace window is what "+
+			"covers every client that has not re-read yet", rt.Tokens())
+	}
+}
+
+// The refresh cadence must not become a per-second retry of a BROKEN file: the
+// warn it logs is per receiver, so a projection that stays unreadable would
+// otherwise be one log line per second per process, fleet-wide, about a state
+// that is not changing. A failed read backs off to the periodic interval.
+func TestRotatingBacksOffToTheIntervalAfterAFailedRead(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "token")
+	write(t, path, "tok")
+	c := newClock()
+	r, err := NewRotating(path, discard(), WithClock(c.now))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	c.advance(DefaultRefreshInterval)
+	if got := r.Tokens(); len(got) != 1 || got[0] != "tok" {
+		t.Fatalf("after a failed read: %v, want the last good [tok]", got)
+	}
+	// Restore the file. A read at the refresh cadence would pick it up
+	// immediately; the backoff means it does not.
+	write(t, path, "new")
+	c.advance(2 * DefaultRefreshInterval)
+	if got := r.Tokens(); len(got) != 1 || got[0] != "tok" {
+		t.Fatalf("%v: a FAILED read must consume the periodic interval, not the refresh cadence — "+
+			"otherwise an unreadable token file is re-read (and warned about) once a second", got)
+	}
+	c.advance(DefaultReadInterval)
+	if got := r.Tokens(); len(got) != 2 || got[0] != "new" || got[1] != "tok" {
+		t.Fatalf("past the interval: %v, want [new tok]", got)
 	}
 }
 

@@ -58,6 +58,7 @@ func probePublishedSeries(t *testing.T) {
 		{name: "kubescrape_events_dropped_batches_total"},
 		{name: "kubescrape_events_dropped_records_total"},
 		{name: "kubescrape_events_overflow_dropped_total"},
+		{name: "kubescrape_events_export_failures_total"},
 		{name: "kubescrape_event_watch_restarts_total"},
 	}
 	for _, tl := range eventTypeLabels {

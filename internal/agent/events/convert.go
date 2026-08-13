@@ -43,6 +43,7 @@ func (r *Reader) ingest(ctx context.Context, e *corev1.Event) {
 		body: body, ts: eventTime(e), severity: sev, sevText: sevText,
 		resKey: key, res: res, rv: e.ResourceVersion, when: eventTime(e),
 		attrs: eventAttrs(e),
+		okey:  obsKey{uid: string(e.UID), rv: e.ResourceVersion},
 	}
 	if ent.ts.IsZero() {
 		ent.ts = e.CreationTimestamp.Time
@@ -219,6 +220,20 @@ func (r *Reader) buildResource(ctx context.Context, e *corev1.Event) pcommon.Res
 //
 // Bodies are already scrubbed: ingest redacts where it builds the batch entry,
 // before the record exists, so the chain's Scrub is nil.
+//
+// An entry an earlier convert already ran the chain over says so
+// (logchain.Input.Observed), and the observed set is what makes that decidable.
+// logchain.Pending keeps ONE conversion per batch epoch, which covers the
+// export retries — but not a WATCH RESTART, which clears the batch and its
+// rendering precisely because the new stream re-delivers every buffered entry
+// (stream). Those re-ingested events are converted afresh, so without this the
+// operator's own log metrics and kubescrape_log_rules_dropped_total stepped
+// once per restart or relist lap over the whole retained batch — a rate() spike
+// during exactly the outage those series are read to diagnose, and a permanent
+// upward bias afterwards. It is the defect journald fixed by retrying its batch
+// in place; this reader cannot (the API server re-sends what it re-sends), so
+// it takes the tailer's route instead: make the OBSERVATION idempotent, with
+// the occurrence itself as the proof.
 func (r *Reader) convert() plog.Logs {
 	// The payload covers exactly the entries present now; anything appended
 	// afterward (a redelivers=false restart's new watch) is not in it and must
@@ -247,8 +262,11 @@ func (r *Reader) convert() plog.Logs {
 		sink.sl = ent.SL
 		chain.Emit(sink, logchain.Input[string]{
 			Body: body, Lifted: extracted, Resource: ent.Res, BoundKey: key,
+			Observed: r.wasObserved(e.okey),
 		})
 	}
+	// After the loop, never inside it: see markObserved.
+	r.markObserved(r.batch)
 	// An all-dropped group leaves an empty ResourceLogs behind.
 	logchain.Prune(ld)
 	return ld

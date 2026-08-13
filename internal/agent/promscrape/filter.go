@@ -202,10 +202,26 @@ func (f *MetricFilter) session() *filterSession {
 	return s
 }
 
+// maxMemoBytes bounds the KEY TEXT the per-scrape memos below retain. Their
+// entry caps (maxTrackedFamilies, maxInternedValues) bound how MANY names and
+// values are remembered, and a count is not a memory bound: both keys are text
+// the TARGET chooses, capped only by the parser's line bound. 100k series names
+// of 16 KiB — a body that gzips to ~2 MiB, since the amplifier is the
+// compression — would retain 1.6 GB here, the sibling of the promparse TYPE
+// table's own byte bound (maxTypeBytes) and reachable whenever a `metrics`
+// filter is configured. Past the budget the memo simply stops growing: a later
+// name pays the regex walk the memo would have saved, never a different
+// verdict.
+const maxMemoBytes = 1 << 20
+
 type filterSession struct {
 	f        *MetricFilter
 	masks    map[string]uint64 // name -> bitmask of name-matching rules
 	lblMatch map[lblMatchKey]bool
+	// memoBytes is the key text both memos hold; see maxMemoBytes. One budget
+	// for the session, because it is the session's retained heap that matters
+	// and either memo alone can spend it.
+	memoBytes int
 }
 
 // lblMatchKey memoizes one label matcher's verdict on one value: label values
@@ -230,8 +246,9 @@ func (s *filterSession) Keep(name string, labels []Label) bool {
 				mask |= 1 << i
 			}
 		}
-		if len(s.masks) < maxTrackedFamilies { // bound the per-scrape memo
+		if len(s.masks) < maxTrackedFamilies && s.memoBytes+len(name) <= maxMemoBytes { // bound the per-scrape memo
 			s.masks[name] = mask
+			s.memoBytes += len(name)
 		}
 	}
 	for mask != 0 {
@@ -254,8 +271,9 @@ func (s *filterSession) labelsMatch(r *compiledRule, labels []Label) bool {
 		matched, ok := s.lblMatch[key]
 		if !ok {
 			matched = m.re.MatchString(value)
-			if len(s.lblMatch) < maxInternedValues { // bound the per-scrape memo
+			if len(s.lblMatch) < maxInternedValues && s.memoBytes+len(value) <= maxMemoBytes { // bound the per-scrape memo
 				s.lblMatch[key] = matched
+				s.memoBytes += len(value)
 			}
 		}
 		if !matched {

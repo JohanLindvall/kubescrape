@@ -443,6 +443,9 @@ func isKeepDrop(action string) bool {
 type Monitor struct {
 	Namespace string
 	Name      string
+	// resourceVersion is the object this record was parsed from; see
+	// upsertMonitor. Not part of the model and never served.
+	resourceVersion string
 	// Selector selects Services by their labels.
 	Selector labels.Selector
 	// NamespaceAny selects Services in all namespaces; otherwise Namespaces
@@ -588,6 +591,9 @@ type monitorBase struct {
 	NamespaceAny bool
 	Namespaces   []string
 	Endpoints    []Endpoint
+	// ResourceVersion of the object parsed, carried so the index can tell a
+	// re-delivery that changes nothing from a real update (see upsertMonitor).
+	ResourceVersion string
 }
 
 // parseMonitorSpec is the ONE parse skeleton of both monitor kinds: the
@@ -618,11 +624,12 @@ func parseMonitorSpec(u *unstructured.Unstructured, kind string, spec monitorSpe
 	}
 	nss := spec.nsSelector()
 	b = monitorBase{
-		Namespace:    u.GetNamespace(),
-		Name:         u.GetName(),
-		Selector:     sel,
-		NamespaceAny: nss.Any,
-		Namespaces:   nss.MatchNames,
+		Namespace:       u.GetNamespace(),
+		Name:            u.GetName(),
+		Selector:        sel,
+		NamespaceAny:    nss.Any,
+		Namespaces:      nss.MatchNames,
+		ResourceVersion: u.GetResourceVersion(),
 	}
 	specIgnored := spec.monitorIgnored()
 	for _, ep := range spec.endpointSpecs() {
@@ -648,12 +655,13 @@ func Parse(u *unstructured.Unstructured) (*Monitor, error) {
 		return nil, err
 	}
 	return &Monitor{
-		Namespace:    b.Namespace,
-		Name:         b.Name,
-		Selector:     b.Selector,
-		NamespaceAny: b.NamespaceAny,
-		Namespaces:   b.Namespaces,
-		Endpoints:    b.Endpoints,
+		Namespace:       b.Namespace,
+		Name:            b.Name,
+		resourceVersion: b.ResourceVersion,
+		Selector:        b.Selector,
+		NamespaceAny:    b.NamespaceAny,
+		Namespaces:      b.Namespaces,
+		Endpoints:       b.Endpoints,
 	}, nil
 }
 
@@ -697,17 +705,44 @@ func NewIndex() *Index {
 // re-locked via Delete on the error path); the single-hold form is kept for
 // both — each branch is still exactly one atomic map transition, so a
 // concurrent reader sees the same states as before.
-func upsertMonitor[M any](ix *Index, monitors map[string]*M, key string, m *M, err error) error {
+//
+// It is also where the CHANGE TOKEN is moved, and only a real change may move
+// it. An informer resync re-delivers every monitor byte-identical, and the
+// token is what holds the server's monitor→Service cross product together
+// (buildMonitoredServices: 19.8 ms and 9.67 MB at 50 monitors x 2,000
+// Services) — bumping it for a re-delivery meant a `-resync`-configured
+// service rebuilt that cross product on essentially every agent poll. Three
+// no-ops are recognised: the same resourceVersion stored under the same key, a
+// failed parse for a key that is already absent, and (in Delete) a key that was
+// not there. An EMPTY resourceVersion counts as changed — only hand-built
+// objects have one, and for those the version says nothing about the content.
+func upsertMonitor[M any, P interface {
+	*M
+	version() string
+}](ix *Index, monitors map[string]P, key string, m P, err error) error {
 	ix.mu.Lock()
 	defer ix.mu.Unlock()
-	ix.gen.Add(1)
 	if err != nil {
+		if _, had := monitors[key]; !had {
+			return err // a repeat of a rejected monitor changes nothing
+		}
 		delete(monitors, key)
+		ix.gen.Add(1)
 		return err
 	}
+	if cur, ok := monitors[key]; ok && m.version() != "" && cur.version() == m.version() {
+		return nil // re-delivery of the object already indexed
+	}
 	monitors[key] = m
+	ix.gen.Add(1)
 	return nil
 }
+
+// version reports the resourceVersion a record was parsed from. It is the
+// constraint upsertMonitor takes, so a third monitor kind cannot be added
+// without one — the alternative is a kind whose re-deliveries silently
+// invalidate the server's memo again.
+func (m *Monitor) version() string { return m.resourceVersion }
 
 // Upsert parses and stores a ServiceMonitor (see upsertMonitor for the
 // invalid-update-removes policy).
@@ -720,8 +755,19 @@ func (ix *Index) Upsert(u *unstructured.Unstructured) error {
 func (ix *Index) Delete(namespace, name string) {
 	ix.mu.Lock()
 	defer ix.mu.Unlock()
+	deleteMonitor(ix, ix.monitors, namespace+"/"+name)
+}
+
+// deleteMonitor removes a key and moves the change token only if it was there.
+// A delete for a key the index never held (a monitor that failed to parse, a
+// DeletedFinalStateUnknown replay) changes nothing, and the token's whole job
+// is to say when something changed. Caller holds the write lock.
+func deleteMonitor[M any](ix *Index, monitors map[string]*M, key string) {
+	if _, had := monitors[key]; !had {
+		return
+	}
+	delete(monitors, key)
 	ix.gen.Add(1)
-	delete(ix.monitors, namespace+"/"+name)
 }
 
 // sortedMonitors collects a monitor map's values ordered by (namespace, name):

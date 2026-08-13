@@ -4,6 +4,7 @@ package tailer
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
@@ -12,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/JohanLindvall/kubescrape/internal/agent/positions"
 	"go.opentelemetry.io/collector/pdata/pcommon"
 )
 
@@ -465,4 +467,86 @@ func TestSubOneRateBurstIsFlooredToGrantable(t *testing.T) {
 			t.Fatalf("RateLimit=%v RateBurst=%v: first line refused", cfg.RateLimit, tl.cfg.RateBurst)
 		}
 	}
+}
+
+// An idle file whose ROTATED SEGMENT is still owed keeps its fd. The replay
+// only ever runs from readFile, whose idle-close stat gate returns BEFORE
+// feedSegments for a file that has not changed on disk — so releasing the fd
+// here defers the rest of the segment until the live file is written to again,
+// which for a stopped container is never: the lines are neither delivered nor
+// counted lost, and the file never settles.
+func TestIdleCloseKeepsTheFdWhileARotatedSegmentIsOwed(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+	pos := mustOpenPositions(t, filepath.Join(t.TempDir(), "pos.json"))
+	path := filepath.Join(dir, logName)
+
+	// The rotated inode, checkpointed as an owed Pending range.
+	rot := path + ".1"
+	// Fixed-WIDTH timestamps: RFC3339Nano trims trailing zeros, so a per-line
+	// byte budget derived from the first line would not hold for the rest.
+	var segLines []string
+	for i := 0; i < 6; i++ {
+		segLines = append(segLines, fmt.Sprintf("2026-07-05T10:00:%02dZ stdout F seg-%d", i, i))
+	}
+	writeLines(t, rot, segLines...)
+	rotIno := inodeOfPath(t, rot)
+	rst, err := os.Stat(rot)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The live tail was fully shipped before the crash, so nothing about IT
+	// keeps the fd: the segment is the only guard left.
+	writeLog(t, dir, timeNowCRI()+" stdout F tail-one")
+	tst, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := pos.SetLogs(map[string]positions.LogPos{path: {
+		Offset: tst.Size(), Inode: inodeOfPath(t, path),
+		Pending: []positions.Prefix{{Inode: rotIno, From: 0, To: rst.Size()}},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+
+	exp := &fakeExporter{}
+	tl := driveTailer(dir, exp)
+	tl.cfg.Positions = pos
+	tl.cfg.IdleClose = time.Millisecond
+	tl.cfg.MaxBytesPerSweep = len(segLines[0]) + 1 // one segment line per sweep
+	tl.scanDir(tl.loadCheckpoints(), true)
+
+	tl.sweep(ctx, true) // the replay's first pass
+	tl.flush(ctx)
+	f := tl.files[path]
+	if f == nil {
+		t.Fatal("setup: file not tracked")
+	}
+	if len(f.segments) == 0 || f.segmentsFed {
+		t.Fatalf("setup: want an unfinished replay (segments=%d fed=%v)", len(f.segments), f.segmentsFed)
+	}
+	if f.readPos != f.committed || f.readPos != tst.Size() {
+		t.Fatalf("setup: tail not caught up (readPos=%d committed=%d size=%d)", f.readPos, f.committed, tst.Size())
+	}
+
+	// Age the tail's mtime past IdleClose and let a sweep observe it, so every
+	// OTHER idle-close guard is clear.
+	old := time.Now().Add(-time.Minute)
+	if err := os.Chtimes(path, old, old); err != nil {
+		t.Fatal(err)
+	}
+	tl.sweep(ctx, true)
+	tl.flush(ctx)
+	tl.lastIdleScan = time.Time{}
+	tl.closeIdleFiles()
+	if f.f == nil {
+		t.Fatal("idle-close pulled the fd of a file with a rotated segment still owed: " +
+			"readFile's idle stat gate now returns before feedSegments, so the replay never resumes")
+	}
+
+	// And the whole segment does finish, with no further writes to the file.
+	driveUntil(t, ctx, tl, func() bool {
+		return slices.Contains(exp.get(), "seg-5")
+	}, "the rest of the rotated segment being replayed while the live file stays idle")
 }

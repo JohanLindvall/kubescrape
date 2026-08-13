@@ -862,6 +862,35 @@ func (t *Tailer) drainGone(ctx context.Context, f *file) {
 	f.goneEnd = max(f.goneEnd, f.fedEnd())
 }
 
+// resurrect withdraws a gone verdict for a file whose path is proven alive
+// again — a listing (or a stat in the gone branch) racing a rename+recreate
+// rotation, or a rotated-away name taken by a new file. The three fields are
+// ONE decision and must be cleared together, which is why both callers
+// (scanDir's claimPath and sweep's gone branch) come through here: they were
+// written twice and the discovery half already disagreed, leaving goneEnd set.
+//
+//   - goneEnd pinned the PREVIOUS incarnation's EOF. Left set, every later
+//     completion check compares a fresh (usually shorter) stream's committed
+//     offset against a stale, larger one: settledGone can never fire, so the
+//     fd, the files-map entry and its checkpoint line are pinned for the
+//     process lifetime with drainGone+flush re-running every sweep — or, if
+//     the next deletion finds no handle to re-read from, drainArchive's
+//     no-handle arm reports a lost remainder (obs.LogArchiveErrors plus a WARN
+//     quoting committed from one stream and owedTo from another) for a file
+//     whose every record was in fact delivered. A false loss alarm is
+//     indistinguishable from the real one the same counter reports.
+//   - The stall clock dies with the gone verdict: left set, a later gone
+//     episode's first errored cycle reads the stale stamp as an already-spent
+//     budget and gives up on sight (chargeGoneStall).
+//
+// What happens to the bytes is NOT decided here: readFile's rotation detection
+// (or, for an archive, openArchive's identity check) owns the live path again.
+func (f *file) resurrect() {
+	f.gone = false
+	f.goneEnd = 0
+	f.goneStalledSince = time.Time{}
+}
+
 // release closes the file's handles and watches. After this the inode is
 // unreachable, so it must not be called while data read from it is still
 // uncommitted.

@@ -112,9 +112,19 @@ type pendingEdge struct {
 	// onto the outgoing Edge (see joinDims) and never stored.
 	dims []EdgeDimension
 	// expiresAt is stamped at INSERT and never refreshed by the second half:
-	// every entry gets the same Wait, so insertion order IS expiry order and
+	// every entry gets the same Wait, so insertion order is expiry order and
 	// the expiry pass needs no ordering work. (Refreshing it on the second
 	// arrival would break that and turn expiry into a scan.)
+	//
+	// "Is" up to one skew, precisely: Consume reads the clock ONCE PER BATCH
+	// and outside this mutex (a syscall per span is what that buys), so two
+	// concurrent pushes can enter the FIFO in the opposite order to their
+	// stamps — the loser of the clock read winning the lock. The skew is the
+	// clock-read-to-lock-acquire gap, microseconds against a Wait measured in
+	// seconds, and its only consequence is that sweep's break-at-the-first-
+	// not-due leaves an already-due entry for the next pass. It is written down
+	// rather than removed: the fix would be stamping under the lock, i.e. the
+	// per-span clock read this design deliberately does not pay.
 	expiresAt time.Time
 	// prev/next thread the expiry FIFO (oldest first) while the entry is live,
 	// and the free list once it is retired.

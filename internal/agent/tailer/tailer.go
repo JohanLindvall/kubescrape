@@ -540,20 +540,10 @@ func (t *Tailer) sweep(ctx context.Context, all bool) {
 				// momentarily absent but is alive again. Dropping now would
 				// discard the tailing state (and, on the next checkpoint
 				// save, its entry) and lose every inode rotated away before
-				// rediscovery; clear the flag and let readFile's rotation
-				// detection handle the identity change instead.
-				f.gone = false
-				// goneEnd pinned the PREVIOUS incarnation's EOF; the file is
-				// alive again and readFile's rotation detection now owns it.
-				// Left set, settledGone() compares a fresh (shorter) incarnation's
-				// committed offset against a stale, larger one and never settles —
-				// the fd, the t.files entry and its checkpoint entry are pinned
-				// forever, and drainGone+flush re-run every sweep.
-				f.goneEnd = 0
-				// The stall clock dies with the gone verdict: left set, a later
-				// gone episode's first errored cycle reads the stale stamp as an
-				// already-spent budget and gives up on sight (chargeGoneStall).
-				f.goneStalledSince = time.Time{}
+				// rediscovery; withdraw the verdict (file.resurrect owns what
+				// that entails) and let readFile's rotation detection handle
+				// the identity change instead.
+				f.resurrect()
 			} else {
 				// The file is gone from disk; its remaining bytes live only
 				// behind our fd. Drain, export, and only let the inode go once

@@ -1,10 +1,15 @@
 package store
 
-// Regression tests for the pod-IP index across deletion. promoteIPClaimantLocked
-// filters candidates on the tombstone marker (expireAt), but DeletePod runs the
-// promotion BEFORE stamping it — and with -cache-ttl 0 removes the record
-// instead of stamping it at all. Without an explicit exclusion the pod being
-// deleted was therefore still an eligible candidate and re-claimed its own IP.
+// Regression tests for the pod-IP index across deletion: what the delete path
+// must leave behind (no entry, no leak, the live owner promoted deterministically).
+//
+// What they do NOT cover, and used to claim to: promoteIPClaimantLocked's `skip`
+// exclusion. releaseIPLocked drops the releasing record from ipClaimants before
+// it promotes, so on this path the promotion never even sees it — replacing that
+// branch with a panic leaves the whole store and server suites green. The
+// exclusion is a contract of the promotion itself (nothing else in the scan
+// would catch a record whose tombstone is not stamped yet), so it is pinned by
+// calling the function directly, at the bottom of this file.
 
 import (
 	"strconv"
@@ -75,6 +80,38 @@ func TestPodIPIndexDoesNotLeakAcrossDeletes(t *testing.T) {
 	s.mu.RUnlock()
 	if ips != 0 {
 		t.Fatalf("after %d create+delete cycles and a full sweep: pods=%d byPodIP=%d (want byPodIP=0)", n, pods, ips)
+	}
+}
+
+// The `skip` exclusion itself, as a CONTRACT of promoteIPClaimantLocked rather
+// than as a property of one caller. releaseIPLocked drops the releasing record
+// from ipClaimants before promoting, so no test driving the public API can reach
+// this branch — and none of the scan's other filters would catch the releaser
+// either: DeletePod stamps expireAt only AFTER the promotion, and with
+// -cache-ttl 0 never stamps it at all, so the pod being deleted still reads as
+// live. The record here is given the HIGHEST ipSeq, which is what makes it the
+// winner under every other rule in the scan.
+func TestPromotionNeverReturnsTheAddressToTheRecordThatReleasedIt(t *testing.T) {
+	s, _ := newTestStore(time.Minute)
+	s.UpsertPod(ipPod("survivor", "p-survivor", "10.0.0.5")) // acquires first
+	s.UpsertPod(ipPod("leaver", "p-leaver", "10.0.0.5"))     // later acquisition: holds it
+
+	s.mu.Lock()
+	leaver, survivor := s.pods["leaver"], s.pods["survivor"]
+	// Exactly the state a release promotes from, minus the claimant drop that
+	// happens to precede it today.
+	delete(s.byPodIP, "10.0.0.5")
+	s.promoteIPClaimantLocked("10.0.0.5", leaver)
+	got := s.byPodIP["10.0.0.5"]
+	s.mu.Unlock()
+
+	if got == leaver {
+		t.Fatal("the record that released the address was promoted back onto it: it is not tombstoned " +
+			"yet (and with -cache-ttl 0 never will be), so it would serve a deleted pod from " +
+			"GET /v1/pod-ips for the process lifetime — Sweep never revisits byPodIP")
+	}
+	if got != survivor {
+		t.Fatalf("promoted %v, want the surviving claimant p-survivor", got)
 	}
 }
 

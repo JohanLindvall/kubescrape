@@ -110,11 +110,36 @@ type Sample struct {
 	Unit string
 }
 
-// MaxTrackedFamilies bounds the TYPE table so a pathological endpoint cannot
-// exhaust memory through unique # TYPE lines. It is exported because callers
-// that memoize per parse (a filter caching decisions per series name, say)
-// want the same bound.
+// MaxTrackedFamilies bounds the ENTRY COUNT of the TYPE table. It is exported
+// because callers that memoize per parse (a filter caching decisions per series
+// name, say) want the same bound.
+//
+// A count is only half a memory bound, and this doc used to claim it was the
+// whole one: the KEYS are family names the target chooses, bounded only by the
+// line bound, so the count alone permits MaxTrackedFamilies x MaxLineBytes of
+// retained heap. maxTypeBytes and maxFamilyNameBytes are the other half.
 const MaxTrackedFamilies = 100_000
+
+// maxFamilyNameBytes bounds ONE family token on a TYPE/HELP/UNIT line. The line
+// bound already caps what is read; this caps what is RETAINED per declaration,
+// and it exists so that a single absurd name cannot spend the whole
+// maxTypeBytes budget and leave every later family of the exposition untyped —
+// histogram buckets exported as gauges — through a cap that reports nothing.
+// A TYPE line refused here is counted MALFORMED (the existing verdict for a
+// TYPE line this parser will not honour), so a pathological target moves
+// kubescrape_scrape_malformed_total instead of degrading silently. Real names
+// are nowhere near it: the intern table already treats 256 bytes as long.
+const maxFamilyNameBytes = 1024
+
+// maxTypeBytes bounds the family names the TYPE table RETAINS for one
+// exposition, the way maxMetaBytes bounds the HELP/UNIT text. Without it, a
+// ~2 MiB gzip response carrying 100k `# TYPE <16 KiB name> counter` lines and
+// no samples at all inflated to >1.5 GB of live heap in the agent — an OOMKill
+// of the node's DaemonSet pod, recorded as a scrape with outcome "ok", zero
+// samples and nothing malformed. Past the budget a family simply keeps no
+// declared type (it classifies as untyped), which is exactly what the count cap
+// above already does.
+const maxTypeBytes = 1 << 20
 
 // Interning bounds: metric and label names are low-cardinality and repeat on
 // nearly every line; label values (namespace, pod, le, code, ...) repeat
@@ -151,9 +176,11 @@ type Parser struct {
 	// (OpenMetrics only).
 	exemplars bool
 
-	types  map[string]MetricType
-	names  map[string]string // interned metric/label names
-	values map[string]string // interned label values
+	types map[string]MetricType
+	// typeBytes is the retained key text of the TYPE table; see maxTypeBytes.
+	typeBytes int
+	names     map[string]string // interned metric/label names
+	values    map[string]string // interned label values
 	// metas holds each family's HELP/UNIT, recorded once per family from its
 	// comment lines and stamped on every sample of it via lastClass below.
 	// metaBytes is the retained text budget; see maxMetaBytes.
@@ -263,7 +290,7 @@ func Get(opts Options) *Pooled {
 	p.lastKV = p.lastKV[:0]
 	p.exLastKV = p.exLastKV[:0]
 	p.resetMeta()
-	clear(p.types) // family types are per-exposition
+	p.resetTypes() // family types are per-exposition
 	if len(p.names) >= maxInternedNames/2 {
 		clear(p.names)
 	}
@@ -366,7 +393,7 @@ func (p *Parser) Parse(r io.Reader, emit func(Sample) error) (malformed int, err
 	// resets the pooled path, but New()+Parse+Parse is a legal use of the
 	// public API and must not corrupt quietly.
 	p.eof = false
-	clear(p.types)
+	p.resetTypes()
 	p.resetMeta()
 	return p.parseFrom(bufio.NewReaderSize(r, parseBufSize), emit)
 }
@@ -377,6 +404,16 @@ func (p *Parser) Parse(r io.Reader, emit func(Sample) error) (malformed int, err
 // the caller's malformed-sample one. It is 0 unless Options.Exemplars asked for
 // exemplars: a parser that is not attaching them does not parse them either.
 func (p *Parser) MalformedExemplars() int { return p.badExemplars }
+
+// resetTypes drops the previous exposition's TYPE declarations together with
+// the byte charge that bounds them. The two must move as one: a charge left
+// standing over a cleared table would refuse to type the NEXT exposition's
+// families, so it lives here rather than beside each of the two calls that
+// clear the table (which is how the pooled path and Parse would drift).
+func (p *Parser) resetTypes() {
+	clear(p.types)
+	p.typeBytes = 0
+}
 
 // resetMeta drops the previous exposition's HELP/UNIT declarations (they are
 // per-exposition, exactly like the TYPE table) and the classification memo
@@ -549,8 +586,17 @@ func (p *Parser) parseComment(line []byte) bool {
 		if !ok || len(typ) == 0 || len(skipSpaceTab(rest)) != 0 {
 			return false // malformed TYPE: counted, not silently ignored
 		}
-		if len(p.types) >= MaxTrackedFamilies {
-			return true // over the table bound: a deliberate cap, not malformed
+		// The charge is per NEW key and never per line: exporters that repeat a
+		// family's TYPE before every one of its samples exist, and charging them
+		// again each time would spend the budget on one legitimate family and
+		// leave the rest of the exposition untyped. A map assignment to an
+		// existing key keeps the ORIGINAL key string, so the first charge is
+		// exactly what stays retained.
+		if _, seen := p.types[family]; !seen {
+			if len(p.types) >= MaxTrackedFamilies || p.typeBytes+len(family) > maxTypeBytes {
+				return true // over the table bound: a deliberate cap, not malformed
+			}
+			p.typeBytes += len(family)
 		}
 		var t MetricType
 		switch string(typ) {
@@ -576,14 +622,22 @@ func (p *Parser) parseComment(line []byte) bool {
 // including spaces) or a bare field. The UNESCAPED name is the table key, so
 // it matches the names quoted sample lines produce. Cold path (one call per
 // comment line), so the string materialization costs nothing that matters.
+//
+// A token past maxFamilyNameBytes is refused rather than returned: it would be
+// RETAINED for the whole exposition as a TYPE-table key (or charged to the meta
+// budget), and the bare arm checks the length before materializing the string
+// so an absurd name is not even copied once.
 func familyToken(rest []byte) (string, []byte, bool) {
 	rest = skipSpaceTab(rest)
 	if len(rest) > 0 && rest[0] == '"' {
 		fam, rem, ok := parseQuotedSlow(rest[1:])
-		return fam, rem, ok && fam != ""
+		return fam, rem, ok && fam != "" && len(fam) <= maxFamilyNameBytes
 	}
 	tok, rem := nextField(rest)
-	return string(tok), rem, len(tok) > 0
+	if len(tok) == 0 || len(tok) > maxFamilyNameBytes {
+		return "", rem, false
+	}
+	return string(tok), rem, true
 }
 
 // setMeta records a family's HELP text or UNIT (the empty string leaves the

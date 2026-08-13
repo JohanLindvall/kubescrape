@@ -592,11 +592,24 @@ func cacheKey(u string) string {
 	return parsed.String()
 }
 
+// maxCacheTTL caps the freshness lifetime this client will honour. The header
+// is the SERVER's, and time.Duration is int64 NANOseconds: 1.85e10 seconds
+// overflows it, so an unclamped `secs * time.Second` turns a large max-age into
+// either a ~49-year TTL (the entry is served forever, never revalidated, and
+// the idle sweep cannot reclaim it while something keeps reading it) or a
+// NEGATIVE one (caching silently off — the opposite of what the header asked
+// for). Clamping is not only overflow insurance: no metadata document is worth
+// holding for a day, and a header past this is a misdirected or hostile
+// endpoint, which the response-size and ETag paths already guard against.
+const maxCacheTTL = 24 * time.Hour
+
 // maxAge extracts the Cache-Control max-age; zero when absent or unparseable,
 // and zero whenever no-store or no-cache is also present — either directive
 // forbids serving a stored response without asking again, and this client's
 // only storage is its cache, so both mean "do not cache". kubescrape's own
 // server never combines them with a max-age, but this package is public.
+//
+// The value is clamped to maxCacheTTL BEFORE the multiply (see the constant).
 func maxAge(resp *http.Response) time.Duration {
 	var ttl time.Duration
 	for _, part := range strings.Split(resp.Header.Get("Cache-Control"), ",") {
@@ -606,6 +619,10 @@ func maxAge(resp *http.Response) time.Duration {
 		}
 		if v, ok := strings.CutPrefix(part, "max-age="); ok {
 			if secs, err := strconv.Atoi(v); err == nil && secs > 0 {
+				if secs > int(maxCacheTTL/time.Second) {
+					ttl = maxCacheTTL
+					continue
+				}
 				ttl = time.Duration(secs) * time.Second
 			}
 		}

@@ -18,6 +18,32 @@
 //	a re-read failure keeps the last good value and warns;
 //	a failure with NO last good value is an error.
 //
+// A rotation puts the two ends out of step in BOTH directions, and each
+// direction needs its own mechanism:
+//
+//   - the CLIENT still presents the OLD token, because it re-reads on its own
+//     cadence. DefaultGrace covers that: the receiver keeps accepting the
+//     predecessor for the whole window.
+//   - the client already presents the NEW one, because IT re-read first. No
+//     grace can cover that — a receiver cannot accept a token it has never
+//     read — so the only remedy is for the receiver to read SOON. That is
+//     DefaultRefreshInterval: Rotating re-reads on a one-second cadence rather
+//     than DefaultReadInterval's minute, so the receiver's copy of a file it
+//     shares with its clients is never more than a second behind theirs.
+//
+// The second half was missing, and only the first was documented. A rotation
+// therefore 401'd every client that re-read before the receiver did — up to a
+// full minute of hard rejections on /v1/scrape-auth and on the trace tier's
+// internal hop — while this doc called rotation a non-event.
+//
+// What no mechanism here can remove: the two ends read two different MOUNTS of
+// the same Secret, and each kubelet updates its own on its own schedule. While
+// the receiver's projection still carries the old value there is nothing to
+// read, and a client whose projection already carries the new one is rejected
+// until the receiver's kubelet catches up. Rotation is a non-event within one
+// process's reach; the residual window is the projection skew, and it converges
+// within DefaultRefreshInterval of the receiver's file actually changing.
+//
 // What is deliberately NOT unified is the fatality of the INITIAL read. A
 // receiver that authenticates callers (the metadata service's /v1/scrape-auth,
 // the trace tier's internal listener) must refuse to start without a token —
@@ -48,17 +74,36 @@ import (
 )
 
 const (
-	// DefaultReadInterval bounds how often a token file is re-read. Long
-	// enough that a hot path (every kubelet scrape, every OTLP export) does not
-	// touch the filesystem; short enough that a rotation converges inside the
-	// grace window below.
+	// DefaultReadInterval bounds how often a CLIENT re-reads the token it
+	// presents, and how often a receiver with no traffic at all re-reads
+	// (Rotating.Run's ticker). Long enough that a hot path (every kubelet
+	// scrape, every OTLP export) does not touch the filesystem; short enough
+	// that a rotation converges well inside the grace window below.
 	DefaultReadInterval = time.Minute
 
-	// DefaultGrace keeps the PREVIOUS token accepted after a rotation. Both
-	// ends re-read their copy on independent per-minute cadences, so without a
-	// grace window a rotated Secret 401s every client that has not re-read yet.
-	// With it, rotation is a non-event: update the Secret and both sides
-	// converge with no restart and no lockstep flip.
+	// DefaultRefreshInterval bounds how often a RECEIVER re-reads its accept
+	// set. It is a second rather than a minute because the receiver's staleness
+	// is the one direction of a rotation NOTHING else covers: a client that
+	// re-read first presents a token the receiver has not seen, and there is no
+	// grace for a value the receiver does not hold — it is a hard 401 for as
+	// long as the receiver's copy lags. At a minute that was up to sixty
+	// seconds of rejections per rotation; a second is one failed request that
+	// the caller's own retry absorbs.
+	//
+	// The cost is bounded by the cadence, not by the request rate: an idle
+	// receiver reads nothing (Tokens is only called by a request or by Run's
+	// ticker) and a saturated one reads once per second. A FAILED read backs
+	// off to DefaultReadInterval instead — a broken projection is not a
+	// rotating one, and retrying it per second would turn one bad mount into a
+	// per-second warn on every receiver in the fleet.
+	DefaultRefreshInterval = time.Second
+
+	// DefaultGrace keeps the PREVIOUS token accepted after a rotation, which is
+	// what covers a client that has NOT re-read yet (they re-read on
+	// DefaultReadInterval, independently of the receiver). The opposite
+	// direction — a client that re-read FIRST — is covered by
+	// DefaultRefreshInterval above, not by any grace: a receiver can only
+	// accept tokens it has read.
 	DefaultGrace = 5 * time.Minute
 )
 
@@ -74,19 +119,30 @@ type Option func(*settings)
 
 type settings struct {
 	interval time.Duration
+	refresh  time.Duration
 	grace    time.Duration
 	now      func() time.Time
 }
 
 func resolve(opts []Option) settings {
-	s := settings{interval: DefaultReadInterval, grace: DefaultGrace, now: time.Now}
+	s := settings{interval: DefaultReadInterval, refresh: DefaultRefreshInterval, grace: DefaultGrace, now: time.Now}
 	for _, o := range opts {
 		o(&s)
+	}
+	// The receiver's cadence is never SLOWER than the periodic one: a caller
+	// that shortens the interval is asking to notice a rotation sooner, and a
+	// refresh above it would silently overrule that (and make Run's ticker
+	// re-read nothing, since Tokens would refuse every tick).
+	if s.refresh > s.interval {
+		s.refresh = s.interval
 	}
 	return s
 }
 
-// WithInterval overrides the re-read interval.
+// WithInterval overrides the periodic re-read interval — a client's cadence,
+// and a receiver's Run ticker. It also LOWERS a receiver's refresh cadence to
+// match when it is the shorter of the two (see resolve): a caller asking to
+// notice a rotation sooner must not be overruled by the refresh default.
 func WithInterval(d time.Duration) Option {
 	return func(s *settings) {
 		if d > 0 {
@@ -217,6 +273,10 @@ func (f *File) Get() string {
 // Rotating is the SERVER half: the set of tokens a receiver ACCEPTS — the
 // current file contents plus, for the grace window after a change, its
 // predecessor.
+//
+// It re-reads on DefaultRefreshInterval rather than DefaultReadInterval,
+// because the two ends of a rotation go out of step in both directions and only
+// one of them has a grace window; see the package doc.
 type Rotating struct {
 	path string
 	log  *slog.Logger
@@ -225,7 +285,9 @@ type Rotating struct {
 	mu        sync.Mutex
 	cur, prev string
 	prevUntil time.Time
-	fetched   time.Time
+	// nextRead is the earliest time the file may be read again: refresh after a
+	// good read, the longer interval after a failed one.
+	nextRead time.Time
 }
 
 // NewRotating reads the token file once, FATALLY: "no path", "unreadable" and
@@ -245,7 +307,7 @@ func NewRotating(path string, log *slog.Logger, opts ...Option) (*Rotating, erro
 	if err != nil {
 		return nil, err
 	}
-	r.cur, r.fetched = tok, r.set.now()
+	r.cur, r.nextRead = tok, r.set.now().Add(r.set.refresh)
 	return r, nil
 }
 
@@ -282,21 +344,30 @@ func (r *Rotating) Run(ctx context.Context) {
 // empty re-read keeps the last good value: a transient error during a Secret
 // swap must not 401 the whole fleet.
 //
+// STALE here means DefaultRefreshInterval, not DefaultReadInterval. A client
+// that re-read before the receiver presents a token no grace window can cover,
+// so the receiver's own lag is the whole cost of that direction of a rotation
+// and it is paid as a hard 401. A failed read backs off to the longer interval,
+// because a file that cannot be read is not a file that is rotating.
+//
 // Run drives this from a ticker so a quiet listener still notices a rotation
-// within one interval; request traffic re-reads it too.
+// within one interval; request traffic refreshes it far sooner.
 func (r *Rotating) Tokens() []string {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	now := r.set.now()
-	if now.Sub(r.fetched) >= r.set.interval {
-		r.fetched = now
+	if !now.Before(r.nextRead) {
 		if next, err := ReadFile(r.path); err != nil {
+			r.nextRead = now.Add(r.set.interval)
 			r.log.Warn("re-reading token file; keeping the last good token", "path", r.path, "error", err)
-		} else if next != r.cur {
-			r.prev, r.prevUntil = r.cur, now.Add(r.set.grace)
-			r.cur = next
-			r.log.Info("bearer token rotated; the previous token stays accepted for the grace window",
-				"path", r.path, "grace", r.set.grace)
+		} else {
+			r.nextRead = now.Add(r.set.refresh)
+			if next != r.cur {
+				r.prev, r.prevUntil = r.cur, now.Add(r.set.grace)
+				r.cur = next
+				r.log.Info("bearer token rotated; the previous token stays accepted for the grace window",
+					"path", r.path, "grace", r.set.grace)
+			}
 		}
 	}
 	if r.prev != "" && now.Before(r.prevUntil) {

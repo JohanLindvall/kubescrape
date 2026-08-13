@@ -209,3 +209,54 @@ func TestPeerIPFallbackWarningIsScoped(t *testing.T) {
 		t.Fatalf("a DaemonSet agent warned about the tier's veto: %q", got)
 	}
 }
+
+// `probability: 0` reads as "ship nothing" and ships everything: Probability is
+// a plain float64, so 0 is indistinguishable from unset, Enabled() is false, the
+// sampler is never wired and no line, warning or counter says so. The operator's
+// only symptom is the egress bill — which is the one shape this repo refuses to
+// leave silent.
+func TestInertTraceSamplingSectionWarns(t *testing.T) {
+	withServiceGraph(t)
+
+	got := warnText(agentConfig{TraceSampling: &tracesample.Config{Probability: 0}})
+	if !strings.Contains(got, "samples nothing") || !strings.Contains(got, "keeps EVERY trace") {
+		t.Fatalf("an inert traceSampling section was not named: %q", got)
+	}
+	// It must say what a sampling value looks like, or the operator repeats the
+	// mistake with 0.0 and then with 50.
+	if !strings.Contains(got, "BETWEEN 0 and 1") {
+		t.Fatalf("the warning does not say what to write instead: %q", got)
+	}
+
+	// The guard rails do not make it live: they only rescue spans a probability
+	// decision dropped, and there is no such decision here.
+	no := false
+	if got := warnText(agentConfig{TraceSampling: &tracesample.Config{KeepErrors: &no, KeepSlowerThan: "2s"}}); !strings.Contains(got, "samples nothing") {
+		t.Fatalf("a section of nothing but guard rails is still inert: %q", got)
+	}
+
+	// Silent shapes. A rate cap alone IS sampling (an overload valve), a
+	// fraction is the whole point, `probability: 1` is an honest explicit
+	// keep-everything, and off the tier the section is ignored wholesale — with
+	// startServiceGraph saying so once, per section.
+	for _, tc := range []struct {
+		name string
+		cfg  agentConfig
+		tier bool
+	}{
+		{"rate cap alone", agentConfig{TraceSampling: &tracesample.Config{MaxSpansPerSecond: 5000}}, true},
+		{"a real fraction", agentConfig{TraceSampling: &tracesample.Config{Probability: 0.1}}, true},
+		{"an explicit keep-everything", agentConfig{TraceSampling: &tracesample.Config{Probability: 1}}, true},
+		{"no section at all", agentConfig{}, true},
+		{"inert, off the tier", agentConfig{TraceSampling: &tracesample.Config{}}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			old := *serviceGraphOn
+			*serviceGraphOn = tc.tier
+			t.Cleanup(func() { *serviceGraphOn = old })
+			if got := warnText(tc.cfg); got != "" {
+				t.Fatalf("warned: %q", got)
+			}
+		})
+	}
+}

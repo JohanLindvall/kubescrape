@@ -246,7 +246,31 @@ type Reader struct {
 	// resCache memoizes the involved object's resource for the life of the
 	// batch, keyed by the same identity the records group on. See resource().
 	resCache map[string]pcommon.Resource
+	// observed is the set of batch entries the per-record chain has already
+	// run over — the positional proof that lets a re-ingested event say
+	// logchain.Input.Observed. See obsKey and markObserved.
+	observed map[obsKey]struct{}
 }
+
+// obsKey identifies an event OCCURRENCE exactly: the object's UID and the
+// resourceVersion of the write that produced this delivery.
+//
+// It is a positional proof in the sense logchain.Input.Observed demands, and
+// the two halves are both load-bearing. The resourceVersion is etcd's revision
+// for that write, so a REPEAT — which Kubernetes aggregates into the same
+// object re-sent as Modified with a growing count, the "BackOff x47" case — is
+// a different revision and a different key: a genuine new occurrence is never
+// mistaken for a re-delivery. The UID keeps two objects apart if a cluster ever
+// hands out a revision this reader has seen on another key. An entry missing
+// BOTH (a synthetic event with no metadata) claims nothing, because the
+// asymmetry runs one way: under-claiming re-counts, over-claiming destroys
+// observations invisibly.
+type obsKey struct {
+	uid string
+	rv  string
+}
+
+func (k obsKey) valid() bool { return k.uid != "" || k.rv != "" }
 
 // entry is one event, already converted to the fields the record needs.
 type entry struct {
@@ -261,6 +285,8 @@ type entry struct {
 	// rv/when are this event's position contribution.
 	rv   string
 	when time.Time
+	// okey identifies the occurrence for the observed set (see obsKey).
+	okey obsKey
 }
 
 // New creates a Reader.
@@ -321,6 +347,7 @@ func publishMetrics() {
 	obs.EventsDropped.Add(0)
 	obs.EventsDroppedRecords.Add(0)
 	obs.EventsOverflowDropped.Add(0)
+	obs.EventsExportFailures.Add(0)
 	obs.EventWatchRestarts.Add(0)
 	for _, t := range eventTypeLabels {
 		obs.EventsObserved.WithLabelValues(t).Add(0)
@@ -520,6 +547,13 @@ func (r *Reader) stream(ctx context.Context) error {
 		clear(r.batch)
 		r.batch = r.batch[:0]
 		clear(r.resCache)
+		// The observed set is deliberately NOT cleared with them: those entries
+		// are about to be re-ingested and it is the only record that the chain
+		// already counted them, which is what keeps a collector outage from
+		// multiplying the operator's log metrics by the number of restarts it
+		// spans. It retires per entry instead, as the re-delivered batch settles
+		// or sheds (forgetObserved).
+		//
 		// The converted payload described the batch just dropped; the watch is
 		// about to re-deliver those entries and they will convert afresh
 		// (logchain.Pending's restart-clear case — the loss journald had for
@@ -1012,7 +1046,14 @@ func (r *Reader) flush(ctx context.Context) error {
 			if !logchain.SettlePermanent(err, r.log, "event batch", count,
 				logchain.SettleCounters{Batches: obs.EventsDropped, Records: obs.EventsDroppedRecords},
 				"events", len(r.batch)) {
-				obs.LogExportFailures.Inc()
+				// This pipeline's OWN transient-failure counter, not
+				// kubescrape_log_export_failures_total: that one documents
+				// itself as the tailer's "files rewound", and the singleton
+				// that collects events runs with -logs=false, so an operator
+				// alerting on a rewinding tailer was paged by a pod that owns
+				// no file. journald was given its own counter for exactly this
+				// reason and its two siblings were left behind.
+				obs.EventsExportFailures.Inc()
 				return fmt.Errorf("exporting events: %w", err)
 			}
 		} else {
@@ -1031,6 +1072,9 @@ func (r *Reader) flush(ctx context.Context) error {
 func (r *Reader) settle(newest entry, covered int) {
 	covered = min(covered, len(r.batch))
 	emptied := covered == len(r.batch)
+	// These entries are done with: the chain will not see them again unless a
+	// relist replays them, which is a new DELIVERY and is observed again.
+	r.forgetObserved(r.batch[:covered])
 	// Slide the retained tail to the front (copy is memmove-safe for the
 	// overlap) and clear the vacated slots so settled entries aren't pinned.
 	n := copy(r.batch, r.batch[covered:])
@@ -1208,8 +1252,9 @@ const shedChunk = maxRetained / 64
 // kept — its entries are not lost (they export when the collector recovers),
 // and dropping inside it would make settle slide fresh entries as covered by a
 // payload that never carried them. Only when EVERYTHING is rendered is the
-// rendering discarded first, so the drop cannot orphan it; the re-render
-// re-observes the LogMetrics once, the price of not wedging at the cap.
+// rendering discarded first, so the drop cannot orphan it; the re-render costs
+// nothing but the conversion, since the surviving entries are already in the
+// observed set and the chain will not count them twice.
 func (r *Reader) shedOldest() {
 	if r.rendered >= len(r.batch) {
 		r.pending.Discard()
@@ -1220,6 +1265,9 @@ func (r *Reader) shedOldest() {
 	if n <= 0 {
 		return
 	}
+	// Shed entries are gone for good, so their observation proof goes too — it
+	// would otherwise be a key no batch entry can ever retire.
+	r.forgetObserved(r.batch[i : i+n])
 	copy(r.batch[i:], r.batch[i+n:])
 	clear(r.batch[len(r.batch)-n:])
 	r.batch = r.batch[:len(r.batch)-n]
@@ -1236,6 +1284,68 @@ func (r *Reader) shedOldest() {
 		r.overflowWarned = true
 		r.log.Warn("event batch at capacity with nothing committing; dropping the oldest unexported events",
 			"cap", r.retainCap(), "perShed", shedChunk)
+	}
+}
+
+// tracksObservation reports whether anything the chain counts is configured.
+// With neither log metrics nor rules there is nothing to observe twice, so the
+// set is not maintained at all and costs a nil map lookup.
+func (r *Reader) tracksObservation() bool {
+	return r.cfg.LogMetrics != nil || r.cfg.Rules != nil
+}
+
+// wasObserved reports whether an earlier convert already ran the per-record
+// chain over this occurrence.
+func (r *Reader) wasObserved(k obsKey) bool {
+	if !k.valid() {
+		return false
+	}
+	_, ok := r.observed[k]
+	return ok
+}
+
+// markObserved records that the chain has run over these occurrences. It is
+// called with the whole rendered batch AFTER the render, never entry by entry
+// inside it: two entries of one batch carrying the same key (which no delivery
+// path produces, but nothing structurally forbids) must both be counted, and
+// marking as we went would suppress the second — the over-claiming direction,
+// which destroys observations invisibly.
+//
+// Past the cap the set is CLEARED rather than grown. The live need is one key
+// per un-settled batch entry, which retainCap already bounds; anything above
+// that is keys for entries a re-delivery never brought back, and clearing them
+// costs at most one re-observation of what is still buffered — the safe
+// direction, and the behaviour that existed before the set did.
+func (r *Reader) markObserved(entries []entry) {
+	if !r.tracksObservation() {
+		return
+	}
+	if r.observed == nil {
+		r.observed = make(map[obsKey]struct{}, len(entries))
+	} else if len(r.observed)+len(entries) > r.retainCap() {
+		clear(r.observed)
+	}
+	for i := range entries {
+		if k := entries[i].okey; k.valid() {
+			r.observed[k] = struct{}{}
+		}
+	}
+}
+
+// forgetObserved drops the keys of entries LEAVING the batch: settled
+// (delivered, all-dropped or permanently rejected) or shed.
+//
+// Delivery is at-least-once and observation is once per DELIVERY, so a settled
+// entry that a later relist replays is a new delivery and is observed again;
+// keeping its key would also make the set grow without any bound the batch
+// provides. What must NOT be forgotten is a stream restart's clear of the batch
+// (stream), which is precisely the case where the same delivery comes back.
+func (r *Reader) forgetObserved(entries []entry) {
+	if len(r.observed) == 0 {
+		return
+	}
+	for i := range entries {
+		delete(r.observed, entries[i].okey)
 	}
 }
 

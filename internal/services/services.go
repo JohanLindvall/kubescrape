@@ -26,6 +26,10 @@ type Service struct {
 	Annotations map[string]string
 	Selector    map[string]string
 	Ports       []Port
+	// resourceVersion is the informer object this record was derived from. It
+	// exists only so Upsert can recognise a re-delivery that changes nothing;
+	// it is not served and not part of the model.
+	resourceVersion string
 }
 
 // Port is one service port with its target-port mapping.
@@ -98,12 +102,13 @@ func (ix *Index) Upsert(svc *corev1.Service) {
 		selector = maps.Clone(svc.Spec.Selector)
 	}
 	rec := &Service{
-		Name:        svc.Name,
-		Namespace:   svc.Namespace,
-		UID:         string(svc.UID),
-		Labels:      labels,
-		Annotations: annotations,
-		Selector:    selector,
+		Name:            svc.Name,
+		Namespace:       svc.Namespace,
+		UID:             string(svc.UID),
+		Labels:          labels,
+		Annotations:     annotations,
+		Selector:        selector,
+		resourceVersion: svc.ResourceVersion,
 	}
 	for _, p := range svc.Spec.Ports {
 		port := Port{Name: p.Name, Port: p.Port}
@@ -118,8 +123,23 @@ func (ix *Index) Upsert(svc *corev1.Service) {
 
 	ix.mu.Lock()
 	defer ix.mu.Unlock()
-	ix.gen.Add(1)
 	m := ix.byNamespace[svc.Namespace]
+	// A re-delivery that changes NOTHING must not move the change token. The
+	// token is what holds the server's monitor→Service cross product together
+	// (buildMonitoredServices: 19.8 ms and 9.67 MB at 50 monitors x 2,000
+	// Services), and an informer resync re-delivers every Service byte-identical
+	// — so with `-resync` set, an unconditional bump meant essentially every
+	// agent poll paid a full rebuild. The pod path (store.UpsertPod) has had
+	// this short-circuit all along; the two index paths did not.
+	//
+	// An EMPTY resourceVersion is treated as changed. Only hand-built objects
+	// have one (the informer always sets it), and for those "same version" is
+	// not a statement about content — a test or an embedder mutating a fixture
+	// in place would otherwise have its update silently ignored.
+	if cur := m[svc.UID]; cur != nil && svc.ResourceVersion != "" && cur.resourceVersion == svc.ResourceVersion {
+		return
+	}
+	ix.gen.Add(1)
 	if m == nil {
 		m = make(map[types.UID]*Service)
 		ix.byNamespace[svc.Namespace] = m

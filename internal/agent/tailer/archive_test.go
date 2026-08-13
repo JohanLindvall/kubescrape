@@ -863,3 +863,142 @@ func TestConsumedArchiveReplacementDoesNotCountLoss(t *testing.T) {
 		t.Fatalf("LogPrefixLost = %v, want %v: a fully shipped archive's replacement is not a loss", got, prefixBefore)
 	}
 }
+
+// A gone archive whose PATH is taken by a different archive is resurrected by
+// the next listing (claimPath), and the gone verdict has to be withdrawn
+// WHOLE: goneEnd pinned the previous stream's decompressed EOF, and the new
+// stream's offsets are measured in a different space entirely. Left behind, it
+// either makes the next deletion report a remainder it never owed
+// (obs.LogArchiveErrors + "remainder lost", quoting committed from one stream
+// and owedTo from another, for a file whose every record was delivered) or —
+// when that deletion lands while the retained fd is still held — pins the
+// files-map entry, its fd and its checkpoint line for the process lifetime
+// with no counter and no log at all.
+func TestResurrectedArchiveDoesNotInheritThePreviousStreamsGoneEnd(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+	exp := &fakeExporter{}
+	tl := newArchiveTailer(dir, exp)
+	path := filepath.Join(dir, "app.1.log.gz")
+
+	tl.scanDir(tl.loadCheckpoints(), true)
+	writeGzip(t, path, "old-1", "old-2", "old-3")
+	exp.mu.Lock()
+	exp.fail = 1 << 20 // the collector is down: nothing commits
+	exp.mu.Unlock()
+	tl.scanDir(nil, false)
+	tl.sweep(ctx, true)
+	tl.flush(ctx)
+	f := tl.files[path]
+	if f == nil {
+		t.Fatal("setup: archive not tracked")
+	}
+
+	// logrotate renames it away: the drain re-reads it from the retained fd
+	// and pins goneEnd at that stream's EOF — correct, it is genuinely owed.
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	tl.scanDir(nil, false) // proves absence: gone
+	tl.sweep(ctx, true)    // drainGone pins goneEnd; its flush fails
+	oldEnd := f.goneEnd
+	if oldEnd == 0 {
+		t.Fatalf("setup: goneEnd not pinned (committed=%d readPos=%d gone=%v)", f.committed, f.readPos, f.gone)
+	}
+	if _, tracked := tl.files[path]; !tracked {
+		t.Fatal("setup: the gone archive was released before its data shipped")
+	}
+
+	// A DIFFERENT, much smaller archive takes the name; the listing resurrects
+	// the tracked file.
+	writeGzip(t, path, "new-1")
+	tl.scanDir(nil, false)
+	if f.gone {
+		t.Fatal("setup: the reappeared path did not resurrect the file")
+	}
+
+	// The collector recovers: the old stream ships from the retained fd, then
+	// the identity check restarts the file on the replacement. Nothing is lost.
+	exp.mu.Lock()
+	exp.fail = 0
+	exp.mu.Unlock()
+	driveUntil(t, ctx, tl, func() bool {
+		got := exp.get()
+		return slices.Contains(got, "old-3") && slices.Contains(got, "new-1")
+	}, "both streams delivered")
+
+	// And now the path rotates away for good.
+	errsBefore := obs.LogArchiveErrors.Value()
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	tl.scanDir(nil, false)
+	for range 20 {
+		tl.sweep(ctx, true)
+		tl.flush(ctx)
+	}
+	if _, tracked := tl.files[path]; tracked {
+		t.Fatalf("the deleted archive is still tracked (committed=%d goneEnd=%d, inherited from a stream that ended at %d): "+
+			"entry, fd and checkpoint pinned for the process lifetime with no counter moving",
+			f.committed, f.goneEnd, oldEnd)
+	}
+	if got := obs.LogArchiveErrors.Value(); got != errsBefore {
+		t.Fatalf("LogArchiveErrors = %v, want %v: every record was delivered, so the loss alarm is false "+
+			"(committed=%d measured against a previous stream's goneEnd=%d)", got, errsBefore, f.committed, oldEnd)
+	}
+}
+
+// An archive REWRITTEN IN PLACE (same inode, `gzip -c > x.gz`) while we are
+// mid-read destroys the old stream's unread remainder: decompressed offsets
+// mean nothing in the new content and the inode no longer holds the old bytes,
+// so the restart is unavoidable — but it must be REPORTED. The sibling arm one
+// layer down (openArchive's identity check) already counts obs.LogPrefixLost;
+// this one moved only obs.LogRotations, which also moves for every ordinary
+// rotation of every container log on the node, so an operator had no way to
+// learn the lines had existed.
+func TestArchiveRewrittenInPlaceCountsTheLostRemainder(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+	exp := &fakeExporter{}
+	tl := newArchiveTailer(dir, exp)
+	path := filepath.Join(dir, "app.log.gz")
+
+	tl.scanDir(tl.loadCheckpoints(), true)
+	writeGzip(t, path, "old-one", "old-two", "old-three")
+	tl.scanDir(nil, false)
+
+	// Stop mid-stream: the first line ships, the rest is still unread behind
+	// the retained fd.
+	tl.cfg.MaxBytesPerSweep = len("old-one\n")
+	tl.sweep(ctx, true)
+	tl.flush(ctx)
+	f := tl.files[path]
+	if f == nil || f.f == nil || f.archiveEOF {
+		t.Fatalf("setup: archive not held mid-read (tracked=%v archiveEOF=%v)", f != nil, f != nil && f.archiveEOF)
+	}
+	if got := exp.get(); !slices.Contains(got, "old-one") || slices.Contains(got, "old-three") {
+		t.Fatalf("setup: want only the first line shipped, got %v", got)
+	}
+
+	// logrotate recompresses over the same inode.
+	time.Sleep(10 * time.Millisecond) // a distinguishable mtime
+	writeGzip(t, path, "new-one")
+	prefixBefore := obs.LogPrefixLost.Value()
+
+	tl.cfg.MaxBytesPerSweep = 1 << 20
+	driveUntil(t, ctx, tl, func() bool { return slices.Contains(exp.get(), "new-one") },
+		"the rewritten archive being read from zero")
+	for range 3 { // idle sweeps must not re-count
+		tl.sweep(ctx, true)
+		tl.flush(ctx)
+	}
+
+	if got := exp.get(); slices.Contains(got, "old-three") {
+		t.Fatalf("setup no longer models a loss: the old remainder was delivered after all (%v)", got)
+	}
+	if got := obs.LogPrefixLost.Value() - prefixBefore; got != 1 {
+		t.Fatalf("LogPrefixLost moved %v times, want exactly 1: the old stream's unread remainder "+
+			"(%q, %q) was destroyed with only LogRotations — which every ordinary rotation moves — to show for it",
+			got, "old-two", "old-three")
+	}
+}

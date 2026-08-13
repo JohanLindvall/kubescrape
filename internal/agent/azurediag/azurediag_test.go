@@ -581,3 +581,43 @@ func TestConcurrentReadersShareTheChain(t *testing.T) {
 		t.Fatalf("records = %d, want %d — a shared chain dropped or duplicated work", got, want)
 	}
 }
+
+// A transient export failure is THIS pipeline's, on BOTH signals.
+//
+// It used to bump kubescrape_log_export_failures_total, whose help reads "Log
+// batch exports that failed after retries (files rewound)" — and this reader
+// owns no file at all: the shipped singleton runs `-azure-diagnostics
+// -logs=false`, so an operator alerting on a rewinding tailer was paged by a
+// pod that runs none. journald was given its own counter for exactly that
+// reason and its two siblings were left behind. The METRICS signal was worse
+// than mislabelled: it was counted NOWHERE per-pipeline (only the client
+// layer's generic obs.Exports, which cannot say which producer retried), so a
+// hub carrying platform metrics retried invisibly.
+func TestTransientExportFailuresCountPerSignal(t *testing.T) {
+	beforeLogs := obs.AzureExportFailures.WithLabelValues("logs").Value()
+	beforeMetrics := obs.AzureExportFailures.WithLabelValues("metrics").Value()
+	beforeRewinds := obs.LogExportFailures.Value()
+
+	// One envelope of each signal, each failing twice before it lands.
+	exp := &captureExporter{failLogs: 2, failMet: 2, err: errors.New("collector down")}
+	src := newFakeSource([][]byte{[]byte(logEnvelope), []byte(metricEnvelope)})
+	r := newTestReader(Config{Exporter: exp, RetryBackoff: time.Millisecond}, src)
+	runUntilCommit(t, r, src)
+
+	if len(exp.logs) != 1 || len(exp.metrics) != 1 {
+		t.Fatalf("delivered logs=%d metrics=%d, want 1 each (retried past the failures)",
+			len(exp.logs), len(exp.metrics))
+	}
+	if got := obs.AzureExportFailures.WithLabelValues("logs").Value() - beforeLogs; got != 2 {
+		t.Errorf("kubescrape_azure_export_failures_total{signal=\"logs\"} delta = %v, want 2 "+
+			"(one per failed attempt)", got)
+	}
+	if got := obs.AzureExportFailures.WithLabelValues("metrics").Value() - beforeMetrics; got != 2 {
+		t.Errorf("kubescrape_azure_export_failures_total{signal=\"metrics\"} delta = %v, want 2: "+
+			"the metrics signal's retries were counted by no per-pipeline series at all", got)
+	}
+	if got := obs.LogExportFailures.Value() - beforeRewinds; got != 0 {
+		t.Errorf("kubescrape_log_export_failures_total delta = %v, want 0: azurediag must not bump "+
+			"the tailer's files-rewound counter", got)
+	}
+}

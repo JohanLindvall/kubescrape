@@ -52,8 +52,16 @@ func TestFilterApplyIsAllocationFree(t *testing.T) {
 	}
 }
 
-// The memo must be a memo: the same verdict as the regexes, for a key first
-// seen before the cache rotated and again after.
+// The memo must be a memo: the same verdict as the regexes on a cache HIT, on a
+// hit PROMOTED out of the previous generation, and after both generations have
+// turned over and the key is computed again.
+//
+// Every assertion below has to land on a stated cache state, and the second and
+// third are the ones this test was named for and did not make. It used to
+// assert only first-sight verdicts — a miss on the way in, and, after churning
+// past 3x the cap, a miss on the way back — so the memoized branch of Keep was
+// never read at an assertion point at all. Inverting that branch
+// (`return !keep`) left this test, and the whole package, green.
 func TestFilterMemoAgreesWithTheRegexesAcrossRotations(t *testing.T) {
 	f, err := NewFilterFromLists([]string{`k8s\..*`}, []string{`k8s\.pod\.label\..*`})
 	if err != nil {
@@ -65,13 +73,36 @@ func TestFilterMemoAgreesWithTheRegexesAcrossRotations(t *testing.T) {
 	want := map[string]bool{}
 	for _, k := range keys {
 		want[k] = f.match(k)
+		// First call: a miss, which computes and admits.
 		if got := f.Keep(k); got != want[k] {
-			t.Fatalf("Keep(%q) = %v, want %v", k, got, want[k])
+			t.Fatalf("first Keep(%q) = %v, want %v", k, got, want[k])
+		}
+		// Second call, nothing in between: a HIT in the current generation.
+		// This is the branch the memo exists for, and the one every resource
+		// after the first takes.
+		if got := f.Keep(k); got != want[k] {
+			t.Fatalf("memoized Keep(%q) = %v, want %v", k, got, want[k])
 		}
 	}
-	// Push the memo past its cap so both generations turn over.
-	for i := range 3 * maxFilterKeys {
+	// Churn just past ONE rotation, so the keys sit in the PREVIOUS generation:
+	// a hit there is promoted back into the current one, which is what keeps a
+	// hot key cached across a rotation.
+	for i := range maxFilterKeys {
 		f.Keep(fmt.Sprintf("k8s.pod.label.churn-%d", i))
+	}
+	for _, k := range keys {
+		if got := f.Keep(k); got != want[k] {
+			t.Fatalf("promoted Keep(%q) = %v, want %v", k, got, want[k])
+		}
+		// The promotion put it back in the current generation: hit again.
+		if got := f.Keep(k); got != want[k] {
+			t.Fatalf("after promotion Keep(%q) = %v, want %v", k, got, want[k])
+		}
+	}
+	// Push the memo past its cap so both generations turn over and the verdict
+	// is computed from the regexes again.
+	for i := range 3 * maxFilterKeys {
+		f.Keep(fmt.Sprintf("k8s.pod.label.churn2-%d", i))
 	}
 	for _, k := range keys {
 		if got := f.Keep(k); got != want[k] {

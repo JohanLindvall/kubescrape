@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/JohanLindvall/kubescrape/internal/testrace"
+	"github.com/JohanLindvall/multiline"
 	"github.com/JohanLindvall/multiline/patterns"
 	"go.opentelemetry.io/collector/pdata/pcommon"
 )
@@ -767,5 +768,46 @@ func TestEndlessFragmentRunDoesNotWedgeTheCheckpoint(t *testing.T) {
 	}
 	if len(exp.get()) == 0 {
 		t.Fatal("no entry emitted from the force-closed run")
+	}
+}
+
+// The trace stage's emission callback maps an entry back to the per-stream
+// FIFO by Entry.Lines, and `min(e.Lines, len(items))` is what keeps a Lines
+// count larger than the FIFO from indexing out of range. Its trigger is
+// unmodelled — the library's contract (sum(Lines) == lines consumed) says it
+// cannot happen — but the defence is real: without it the panic lands on the
+// single sweep goroutine, taking log collection down for the WHOLE NODE, and
+// this repo carries no recover() by design. So it is exercised directly.
+func TestTraceEmitSurvivesAnEntryClaimingMoreLinesThanTheFifoHolds(t *testing.T) {
+	dir := t.TempDir()
+	exp := &fakeExporter{}
+	tl := newTestTailer(dir, "", exp)
+	f := &file{
+		path:        filepath.Join(dir, logName),
+		source:      &compiledSource{name: "containers", containerd: true},
+		containerID: "0123456789abcdef",
+		resolved:    true,
+		resource:    pcommon.NewResource(),
+	}
+	tl.newPipeline(f)
+	tl.files[f.path] = f
+
+	st := f.stStdout
+	st.push(logItem{start: pos{seg: f.tail, off: 0}, end: pos{seg: f.tail, off: 10}})
+
+	err := tl.traceEmitFunc(f)(context.Background(), multiline.Entry[time.Time]{
+		Key: f.keyStdout, Text: "joined", Data: time.Now(), Lines: 5,
+	})
+	if err != nil {
+		t.Fatalf("emit: %v", err)
+	}
+	if len(tl.batch) != 1 {
+		t.Fatalf("batch = %v, want the one entry the FIFO could account for", bodies(tl))
+	}
+	if got := tl.batch[0].end; got != (pos{seg: f.tail, off: 10}) {
+		t.Fatalf("entry end = %+v, want the last item the FIFO actually held", got)
+	}
+	if n := len(st.live()); n != 0 {
+		t.Fatalf("%d items left in the FIFO: the over-count must consume what is there, no more", n)
 	}
 }

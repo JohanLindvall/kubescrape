@@ -17,6 +17,7 @@ import (
 	"github.com/JohanLindvall/kubescrape/internal/metrics"
 	"github.com/JohanLindvall/kubescrape/internal/obs"
 	"github.com/JohanLindvall/kubescrape/pkg/logattrs"
+	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/plog"
 	"go.opentelemetry.io/collector/pdata/pmetric"
 )
@@ -731,5 +732,61 @@ func TestLogMetricResourceCarriesLiftedResourceAttrs(t *testing.T) {
 			t.Errorf("no log-metric resource carries tenant.id=%q; the metric's resource omits the "+
 				"line-lifted attributes its records were grouped by (got %v)", want, got)
 		}
+	}
+}
+
+// The watermark clamp has three arms, and the one for a candidate in a segment
+// NEWER than the watermark's (`wm.seg < seg`) withholds the commit entirely:
+// the buffered bytes precede it in stream order but live in an OLDER
+// incarnation, so no offset in this segment is safe yet. Only the other two
+// arms were exercised. Without it the tail's checkpoint advances over a
+// carried multi-line group's still-unexported bytes, and a crash there ships
+// the record with its middle missing (the joined "frag-a"+"frag-b"+"frag-c"
+// arrives as "frag-a"+"frag-c") with every loss counter flat.
+func TestCandidateInANewerSegmentThanTheWatermarkIsWithheld(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+	exp := &fakeExporter{}
+	tl := newTestTailer(dir, "", exp)
+	f := &file{
+		path:        filepath.Join(dir, logName),
+		source:      &compiledSource{name: "containers", containerd: true},
+		containerID: "0123456789abcdef",
+		resolved:    true,
+		resource:    pcommon.NewResource(),
+	}
+	tl.newPipeline(f)
+	tl.files[f.path] = f
+
+	// Segment 1: one P fragment, so stage 1 holds an open run.
+	l1 := timeNowCRI() + " stdout P frag-a"
+	end1 := int64(len(l1) + 1)
+	tl.feedLine(ctx, f, l1, 0, end1)
+
+	// A rename rotation with the run buffered: the pipeline is CARRIED, the
+	// old tail is recorded as a segment and a fresh tail id is issued.
+	tl.reopen(ctx, f, true, true)
+
+	// Segment 2 (the new inode): the run continues at offset 0 ...
+	l2 := timeNowCRI() + " stdout P frag-b"
+	end2 := int64(len(l2) + 1)
+	tl.feedLine(ctx, f, l2, 0, end2)
+	// ... and the OTHER stream ships a complete line right after it, whose
+	// end is a commit candidate in the NEW segment while the watermark sits
+	// in the old one.
+	l3 := timeNowCRI() + " stderr F done"
+	end3 := end2 + int64(len(l3)+1)
+	tl.feedLine(ctx, f, l3, end2, end3)
+
+	tl.flush(ctx)
+
+	if f.committed != 0 {
+		t.Fatalf("committed = %d, want 0: the checkpoint advanced past frag-b, still buffered at [0,%d) "+
+			"of the new inode — a crash here loses the middle of the joined record", f.committed, end2)
+	}
+	if f.exportedHighs[f.tail] != end3 {
+		t.Fatalf("exportedHighs = %v, want the withheld high %d re-offered at the next flush "+
+			"(without it `committed` never catches up: the fd is pinned and the lag gauges show phantom backlog)",
+			f.exportedHighs, end3)
 	}
 }

@@ -27,6 +27,21 @@ func (t *Tailer) readArchive(ctx context.Context, f *file) error {
 		// recoverable and joining across the boundary is meaningless. Discard
 		// the pipeline and restart the file from zero.
 		obs.LogRotations.Inc()
+		// The restart abandons whatever of the old stream had not been read
+		// (and, after a rewind, what had been read and re-owed): decompressed
+		// offsets mean nothing in the new content, and the inode no longer
+		// holds the bytes. archiveEOF is the in-process witness that there was
+		// nothing left — only a rewind clears it, and a stream read to EOF has
+		// every byte fed, in the batch and on its way out. Reaching here
+		// WITHOUT it is a real loss and must be counted like the sibling arm in
+		// openArchive: LogRotations moves for every ordinary rotation of every
+		// file on the node, so on its own it left an operator no way to learn
+		// the lines had existed.
+		if !f.archiveEOF {
+			obs.LogPrefixLost.Inc()
+			t.log.Warn("archive rewritten in place with its content not fully shipped; the old stream's remainder is lost",
+				"path", f.path, "committed", f.committed, "read", f.readPos)
+		}
 		// As in reopen: pause-retained complete pending lines were read from
 		// the OLD stream and are deliverable; feed them before the pipeline is
 		// discarded.

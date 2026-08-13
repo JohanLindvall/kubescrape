@@ -991,6 +991,102 @@ func shardRingReachesThisShard(cfg servicegraph.ReshardConfig) error {
 	return nil
 }
 
+// tierListener is one address the trace tier binds, with the flag that named it.
+type tierListener struct {
+	flag string
+	addr string
+}
+
+// tierListeners are the addresses this process will bind for the trace tier, in
+// the order the flags are documented. The application ports are listed only when
+// they are actually served (-service-graph-ingest): a dry run that refused a
+// collision with a listener the start never binds would be stricter than the
+// start, which CrashLoops just as hard as being laxer.
+func tierListeners() []tierListener {
+	out := []tierListener{
+		{"-service-graph-listen", *serviceGraphListen},
+		{"-service-graph-http-listen", *serviceGraphHTTPListen},
+	}
+	if *serviceGraphIngest {
+		out = append(out,
+			tierListener{"-service-graph-ingest-grpc", *serviceGraphIngestGRPC},
+			tierListener{"-service-graph-ingest-http", *serviceGraphIngestHTTP})
+	}
+	return out
+}
+
+// serviceGraphListenersDistinct refuses two of the tier's listeners configured
+// on one address.
+//
+// The tier binds up to four, from four independent flags — and the chart renders
+// three of them from values, so `serviceGraph.port: 4317` (warned against in
+// values.yaml prose, enforced nowhere) puts the INTERNAL receiver on the
+// application gRPC port. The two servers start concurrently, so whichever binds
+// second dies with `address already in use` and takes the process with it; which
+// one that is varies between restarts. Loud, but only at the real start —
+// refused here, beside the ring cross-check, because this is the other place
+// that knows more than one listener exists.
+func serviceGraphListenersDistinct() error {
+	ls := tierListeners()
+	for i := range ls {
+		for _, other := range ls[i+1:] {
+			if sameListenAddr(ls[i].addr, other.addr) {
+				return fmt.Errorf("%s and %s are both %q: the tier binds them concurrently, so whichever loses the race fails with `address already in use` and takes the process down. The internal hop and the application ports must be different ports — an internal hop addressed to an application port would also re-enrich and re-shard on every pass",
+					ls[i].flag, other.flag, ls[i].addr)
+			}
+		}
+	}
+	return nil
+}
+
+// sameListenAddr reports whether two listen addresses would contend for one
+// socket. Empty disables a listener, so it collides with nothing; an address
+// that is not host:port is left to fail at bind, where the error names it.
+//
+// Hosts must match or one must be a WILDCARD: two different loopback or pod
+// addresses on one port are legitimate, while 0.0.0.0 (or "", or ::) covers
+// every address on that port and so contends with all of them.
+func sameListenAddr(a, b string) bool {
+	ha, pa, ok := splitListen(a)
+	if !ok {
+		return false
+	}
+	hb, pb, ok := splitListen(b)
+	if !ok || pa != pb {
+		return false
+	}
+	return ha == hb || wildcardHost(ha) || wildcardHost(hb)
+}
+
+// splitListen splits a listen address into host and normalised port.
+func splitListen(addr string) (host, port string, ok bool) {
+	addr = strings.TrimSpace(addr)
+	if addr == "" {
+		return "", "", false
+	}
+	h, p, err := net.SplitHostPort(addr)
+	if err != nil {
+		return "", "", false
+	}
+	// ":04317" and ":4317" are one port; a NAMED port (":http") is compared as
+	// written, which is exact for the equality this is used for.
+	if n, err := strconv.Atoi(p); err == nil {
+		p = strconv.Itoa(n)
+	}
+	return h, p, true
+}
+
+// wildcardHost reports whether a listen host covers every local address.
+// net.SplitHostPort has already stripped the brackets from "[::]:4319", so the
+// bracketed spelling never reaches here.
+func wildcardHost(h string) bool {
+	switch h {
+	case "", "0.0.0.0", "::":
+		return true
+	}
+	return false
+}
+
 // parseShardEndpoint reads the shard tier's GOVERNING HEADLESS SERVICE address
 // — `<statefulset>.<namespace>.svc[.cluster.local][:port]`, which is what the
 // chart renders — into the template ReshardConfig expands to each shard's

@@ -163,12 +163,66 @@ func summBytes(acc *summAcc) int {
 		len(acc.quantiles)*quantileBytes
 }
 
+// maxFamilyAccBytes bounds the heap the converter RETAINS while accumulating
+// one histogram/summary family. Holding accumulators for the current family
+// only keeps memory off the whole-scrape scale, but it is not a bound: a family
+// is as large as the target says it is, and a target is input this process does
+// not control. A 524 KiB gzipped exposition — one histogram family of ~900k
+// one-line label sets, which compresses to almost nothing because the lines are
+// nearly identical — drove 447 MiB of peak heap and OOMKilled the node's agent
+// while the scrape recorded outcome "ok". This is the sibling of the parser's
+// own maxTypeBytes/maxMetaBytes: a bound on ENTRIES is not a bound on BYTES
+// when the target chooses the keys.
+//
+// The value is per CONVERTER, and one lives per in-flight scrape, so the
+// process-wide worst case is Config.Concurrency times this (plus the two
+// kubelet scrapes): 16 MiB against the chart's default 512Mi agent limit and
+// the default concurrency of 4 is ~64 MiB charged even if every target on the
+// node is hostile at once. The floor under it is a family this repo already
+// treats as legitimate — TestExemplarChunksStayUnderCollectorLimit's 6000
+// series x 6 exemplar-bearing buckets charges ~11 MB — so the budget must stay
+// comfortably above that, and a plain family of tens of thousands of label sets
+// fits easily.
+const maxFamilyAccBytes = 16 << 20
+
+// The charge constants approximate RETAINED HEAP, and are deliberately NOT the
+// pointOverheadBytes/attrOverheadBytes family above, which estimate the OTLP
+// ENCODING of an emitted point. Approximate is enough: this bound exists to
+// keep a hostile family inside an order of magnitude, not to account bytes.
+// Every one of them errs high (a label's text is charged once through the key
+// fingerprint even though the accumulator may retain its own copy of an
+// un-interned value), because under-charging is what the budget is for.
+const (
+	// accOverheadBytes is one accumulator's fixed cost: the histAcc/summAcc
+	// struct, its map entry, its c.order entry and the headers of its slices.
+	accOverheadBytes = 192
+	// labelRetainBytes is one []Label element (two string headers); the label
+	// TEXT is charged once, as part of the key fingerprint.
+	labelRetainBytes = 32
+	// One cumBucket / one quantileValue.
+	bucketRetainBytes   = 16
+	quantileRetainBytes = 16
+	// One retained Exemplar beside its (separately charged) labels.
+	exemplarRetainBytes = 64
+)
+
+// exemplarRetained is one deep-copied exemplar's charge. Exemplar labels are
+// bounded only by the line bound, so 16 of them per point (maxExemplarsPerPoint)
+// is megabytes per accumulator if nothing charges them.
+func exemplarRetained(e *Exemplar) int {
+	n := exemplarRetainBytes
+	for _, l := range e.Labels {
+		n += labelRetainBytes + len(l.Name) + len(l.Value)
+	}
+	return n
+}
+
 // converter turns the sample stream into OTLP points. Gauges and counters
 // pass straight through to the sink; histogram and summary component
 // series (_bucket/_sum/_count, quantiles) are accumulated per family and per
 // label set and emitted as proper Histogram/Summary data points when the
 // family ends. Memory is bounded by the largest single family, not the
-// scrape.
+// scrape — and, within one family, by maxFamilyAccBytes.
 type converter struct {
 	b sink
 	// emit is called after every data point reaches the sink, giving the
@@ -205,6 +259,15 @@ type converter struct {
 	// family (a bucket without le, a summary row without quantile); the
 	// caller folds it into the parser's malformed count.
 	malformed int
+	// accBytes is what the current family's accumulators are charged (see
+	// maxFamilyAccBytes); it is released with them in flushFamily. dropped
+	// counts the component samples refused because the budget was spent —
+	// perfectly well-formed exposition this process declined to hold, which is
+	// why it is NOT folded into malformed: the operator is being told about a
+	// refusal of ours, not a defect of theirs. The caller reports it as
+	// obs.ScrapeSamplesDropped{reason="accumulator"}.
+	accBytes int
+	dropped  int
 }
 
 type histAcc struct {
@@ -250,6 +313,17 @@ func newConverter(b sink, emit func() error) *converter {
 	}
 }
 
+// charge reserves n bytes of the current family's accumulator budget, reporting
+// whether it fit. A refusal spends nothing, so a large exemplar that will not
+// fit cannot starve the buckets that would have.
+func (c *converter) charge(n int) bool {
+	if c.accBytes+n > maxFamilyAccBytes {
+		return false
+	}
+	c.accBytes += n
+	return true
+}
+
 // check gives the caller a chance to flush after a point was emitted.
 func (c *converter) check() error {
 	if c.emit == nil {
@@ -259,6 +333,14 @@ func (c *converter) check() error {
 }
 
 // add consumes one sample. Labels/exemplar are only valid during the call.
+//
+// The family switch below flushes on EVERY change, so a target that interleaves
+// its families — against the format's "one single group" MUST — has each run of
+// a histogram/summary family emitted as its own point, and a series repeated in
+// the exposition becomes two points. Both are accepted costs of holding
+// accumulators for the current family only (the constant-memory property this
+// parser exists for); TestKnownDuplicateDataPointDivergences pins the shapes and
+// states what fixing either would cost.
 func (c *converter) add(s Sample) error {
 	if s.Family != c.family {
 		if err := c.flushFamily(); err != nil {
@@ -278,12 +360,29 @@ func (c *converter) add(s Sample) error {
 			return nil
 		}
 		acc := c.hist(s)
+		if acc == nil || !c.charge(bucketRetainBytes) {
+			// Over the family's byte budget: the sample is dropped and counted
+			// HERE, once, for every refusal shape (hist/summ return nil without
+			// counting, so a refused label set is one drop and not two). A
+			// histogram that loses buckets but keeps its _count still emits a
+			// valid point — the overflow bucket absorbs the difference by
+			// construction, see fillHistogramPoint — so this degrades resolution
+			// rather than shipping a broken distribution.
+			c.dropped++
+			return nil
+		}
 		acc.buckets = append(acc.buckets, cumBucket{le: le, cum: uint64(s.Value)})
-		if s.Exemplar != nil && len(acc.exemplars) < maxExemplarsPerPoint {
+		// A refused exemplar is not a refused sample: the point ships without
+		// it, exactly as it does past maxExemplarsPerPoint.
+		if s.Exemplar != nil && len(acc.exemplars) < maxExemplarsPerPoint && c.charge(exemplarRetained(s.Exemplar)) {
 			acc.exemplars = append(acc.exemplars, copyExemplar(*s.Exemplar))
 		}
 	case RoleHistogramSum:
 		acc := c.hist(s)
+		if acc == nil {
+			c.dropped++
+			return nil
+		}
 		acc.sum, acc.hasSum = s.Value, true
 	case RoleHistogramCount:
 		if !validCount(s.Value) {
@@ -291,6 +390,10 @@ func (c *converter) add(s Sample) error {
 			return nil
 		}
 		acc := c.hist(s)
+		if acc == nil {
+			c.dropped++
+			return nil
+		}
 		acc.count, acc.hasCount = uint64(s.Value), true
 	case RoleSummaryQuantile:
 		q, ok := labelFloat(s.Labels, "quantile")
@@ -304,9 +407,17 @@ func (c *converter) add(s Sample) error {
 			return nil
 		}
 		acc := c.summ(s)
+		if acc == nil || !c.charge(quantileRetainBytes) {
+			c.dropped++
+			return nil
+		}
 		acc.quantiles = append(acc.quantiles, quantileValue{q: q, v: s.Value})
 	case RoleSummarySum:
 		acc := c.summ(s)
+		if acc == nil {
+			c.dropped++
+			return nil
+		}
 		acc.sum, acc.hasSum = s.Value, true
 	case RoleSummaryCount:
 		if !validCount(s.Value) {
@@ -314,6 +425,10 @@ func (c *converter) add(s Sample) error {
 			return nil
 		}
 		acc := c.summ(s)
+		if acc == nil {
+			c.dropped++
+			return nil
+		}
 		acc.count, acc.hasCount = uint64(s.Value), true
 	case RoleCounter:
 		c.b.addNumber(s, true)
@@ -368,6 +483,11 @@ func (c *converter) flushFamily() error {
 	c.order = c.order[:0]
 	clear(c.hists)
 	clear(c.summs)
+	// The budget is released with the state it charged. It must move with the
+	// maps — a charge left standing over a cleared family would refuse the NEXT
+	// family's accumulators, which is the "silently exports nothing after the
+	// first big family" shape of the same bug.
+	c.accBytes = 0
 	return err
 }
 
@@ -383,6 +503,16 @@ func (c *converter) hist(s Sample) *histAcc {
 	}
 	acc, ok := c.hists[string(c.keyBuf)] // keyed lookup: no allocation
 	if !ok {
+		if !c.charge(accOverheadBytes + len(c.keyBuf) + labelRetainBytes*len(s.Labels)) {
+			// The family's byte budget is spent, so this label set gets no
+			// accumulator (the caller counts the drop). Clearing the memo is not
+			// housekeeping: labelKey has already recorded THIS label set as the
+			// last one seen, so leaving lastHistAcc pointing at the previously
+			// admitted accumulator would make the next component sample of this
+			// refused set — its _sum, say — fold into ANOTHER series' point.
+			c.lastHistAcc, c.lastSummAcc = nil, nil
+			return nil
+		}
 		key := string(c.keyBuf)
 		if n := len(c.histFree); n > 0 {
 			acc = c.histFree[n-1]
@@ -412,6 +542,10 @@ func (c *converter) summ(s Sample) *summAcc {
 	}
 	acc, ok := c.summs[string(c.keyBuf)] // keyed lookup: no allocation
 	if !ok {
+		if !c.charge(accOverheadBytes + len(c.keyBuf) + labelRetainBytes*len(s.Labels)) {
+			c.lastHistAcc, c.lastSummAcc = nil, nil // see hist: a stale memo folds one series into another
+			return nil
+		}
 		key := string(c.keyBuf)
 		if n := len(c.summFree); n > 0 {
 			acc = c.summFree[n-1]
@@ -720,17 +854,38 @@ func fillHistogramPoint(dp pmetric.HistogramDataPoint, acc *histAcc) {
 
 	bounds := dp.ExplicitBounds()
 	counts := dp.BucketCounts()
-	var prev uint64
+	// run is the cumulative count this point has EMITTED so far, which is what
+	// the next difference must be taken against — not the exposition's own
+	// previous cum. OTLP requires sum(bucket_counts) == count, and deriving each
+	// bucket from a number that was never emitted breaks that on any exposition
+	// whose cumulative counts are not monotonic or disagree with its _count:
+	// `h_bucket{le="1"} 9` beside `h_count 3` shipped counts=[9 0] against
+	// count=3, and a decreasing pair (le=1 -> 10, le=2 -> 5, _count 10) shipped
+	// [10 0 5] = 15 against 10. Such a point is not merely wrong, it is invalid
+	// OTLP: a validating collector may reject the whole chunk, which would cost
+	// every OTHER target in it. Clamping into [run, total] makes the identity
+	// hold BY CONSTRUCTION for every input, and leaves a well-formed histogram
+	// (cums non-decreasing, total >= the last one) byte-identical.
+	//
+	// The two clamps say different things and both are the conservative reading:
+	// a cumulative count cannot decrease (keep the frontier — what the retired
+	// monotonicDiff did, except that it compared against the un-emitted cum and
+	// so let the error back in one bucket later), and no bound may claim more
+	// observations than the population the exposition declares in _count.
+	var run uint64
 	for _, bk := range buckets {
 		if math.IsInf(bk.le, 1) {
 			continue
 		}
 		bounds.Append(bk.le)
-		counts.Append(monotonicDiff(bk.cum, prev))
-		prev = bk.cum
+		cum := max(bk.cum, run)
+		cum = min(cum, total)
+		counts.Append(cum - run)
+		run = cum
 	}
-	// Overflow bucket: everything above the last finite bound.
-	counts.Append(monotonicDiff(total, prev))
+	// Overflow bucket: everything above the last finite bound. run <= total
+	// holds above, so this closes the point to exactly count.
+	counts.Append(total - run)
 }
 
 // addSummary emits one Summary data point from accumulated quantiles.
@@ -920,13 +1075,4 @@ func setExemplar(ex pmetric.Exemplar, e Exemplar, fallbackTS pcommon.Timestamp) 
 		}
 		ex.FilteredAttributes().PutStr(l.Name, l.Value)
 	}
-}
-
-// monotonicDiff clamps decreasing cumulative counts (which would indicate a
-// malformed exposition) to zero-width buckets.
-func monotonicDiff(cur, prev uint64) uint64 {
-	if cur < prev {
-		return 0
-	}
-	return cur - prev
 }

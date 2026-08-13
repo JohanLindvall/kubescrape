@@ -749,9 +749,14 @@ func restoreServiceGraphFlags(t *testing.T) func() {
 	t.Helper()
 	on, listen, httpListen := *serviceGraphOn, *serviceGraphListen, *serviceGraphHTTPListen
 	token, shards, endpoint := *serviceGraphToken, *serviceGraphShards, *serviceGraphEndpoint
+	// The application listeners too: they are half of what the listener
+	// cross-check reads, and a test that moved one without restoring it would
+	// hand every later test in this package a tier bound to the wrong ports.
+	ingest, igrpc, ihttp := *serviceGraphIngest, *serviceGraphIngestGRPC, *serviceGraphIngestHTTP
 	return func() {
 		*serviceGraphOn, *serviceGraphListen, *serviceGraphHTTPListen = on, listen, httpListen
 		*serviceGraphToken, *serviceGraphShards, *serviceGraphEndpoint = token, shards, endpoint
+		*serviceGraphIngest, *serviceGraphIngestGRPC, *serviceGraphIngestHTTP = ingest, igrpc, ihttp
 	}
 }
 

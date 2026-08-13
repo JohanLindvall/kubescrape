@@ -1,0 +1,30 @@
+# The COLLECTORLESS arrangement the export section exists for: per-signal
+# destinations in agent.config while agent.otlp.endpoint keeps its default. The
+# derived -logs-exclude-namespaces must carry the release namespace AND every
+# in-cluster destination that receives ALL of the agent's output — the export
+# overrides' — or the agent tails the pods of the very gateway it ships to,
+# which amplifies exactly when that gateway is slow, at DISCOVERY, so nothing
+# counts and nothing warns. Reading only agent.otlp.endpoint (what the
+# derivation used to do) renders `monitoring` alone.
+#
+# The routing route below is the NEGATIVE half and the reason the golden reads
+# `monitoring,logging` and not `monitoring,logging,tenant-a`: a route is
+# selected BY namespace, so its endpoint's namespace is normally the tenant's
+# own, and excluding it would drop the whole tenant — exactly the logs the route
+# exists to deliver.
+agent:
+  config:
+    export:
+      logs:
+        endpoint: http://loki-gateway.logging.svc:4318
+        protocol: http
+      metrics:
+        # External: must NOT contribute a namespace ("grafana" is a host label,
+        # not a namespace) — the same trap the in-cluster test guards.
+        endpoint: https://otlp-gateway.grafana.net/otlp
+        protocol: http
+    routing:
+      routes:
+        - name: tenant-a
+          namespaces: ["tenant-a"]
+          endpoint: otel-collector.tenant-a.svc:4317

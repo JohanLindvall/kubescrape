@@ -25,13 +25,39 @@ type FileStatus struct {
 	Segments    int    `json:"segments,omitempty"`
 	RateLimited bool   `json:"rateLimited,omitempty"`
 	// Stalled: the live tail is NOT being read because a rotated segment's
-	// replay has not finished (readFile's gate). Lag grows while it holds,
-	// nothing is lost, and the aggregate is kubescrape_log_segments_stalled —
-	// this field is which FILE.
+	// replay CANNOT PROCEED (readFile's gate, held by a segment whose stall
+	// clock is running). Lag grows while it holds, nothing is lost, and the
+	// aggregate is kubescrape_log_segments_stalled — this field is which FILE.
+	// A replay merely UNFINISHED is not stalled: see file.stalledReplay.
 	Stalled bool `json:"stalled,omitempty"`
 	// PodConfigError: the pod's kubescrape.io/logs annotation failed to parse
 	// and was ignored (aggregate: kubescrape_log_pod_config_invalid_total).
 	PodConfigError string `json:"podConfigError,omitempty"`
+}
+
+// stalledReplay reports whether this file's live tail is gated behind a
+// rotated segment that is not PROGRESSING — the one state where a file stops
+// collecting without losing anything, which is what the gauge is alerted on.
+//
+// "Unfinished" is the wrong test and was the one used: a replay walking a 10
+// MiB rotated log at MaxBytesPerSweep is unfinished for its whole (healthy)
+// duration, so a node recovering from an outage held the gauge up throughout
+// and a sustained-nonzero alert paged on a recovery that was working. The
+// stall CLOCK is the honest signal — chargeStall arms it on a pass that fed
+// nothing, discarded nothing and was not purged by a rewind, and clears it on
+// any of the three — so a budget-cut replay never lights it, a collector
+// outage never lights it, and a source that will not open lights it on its
+// second pass and stays lit until the segment is given up on.
+func (f *file) stalledReplay() bool {
+	if f.segmentsFed {
+		return false
+	}
+	for _, sg := range f.segments {
+		if !sg.stalledSince.IsZero() {
+			return true
+		}
+	}
+	return false
 }
 
 // Status returns the most recently published per-file snapshot (refreshed on
@@ -62,7 +88,7 @@ func (t *Tailer) publishStatus() {
 			Compressed:  f.compressed,
 			Segments:    len(f.segments),
 			RateLimited: f.limited,
-			Stalled:     len(f.segments) > 0 && !f.segmentsFed,
+			Stalled:     f.stalledReplay(),
 
 			PodConfigError: f.podConfigErr,
 		}

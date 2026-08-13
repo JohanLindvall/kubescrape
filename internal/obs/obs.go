@@ -684,6 +684,15 @@ var (
 		"Kubernetes event records lost with those batches (the magnitude of the loss the batch counter only signals).")
 	EventsOverflowDropped = Registry.Counter("kubescrape_events_overflow_dropped_total",
 		"Kubernetes events dropped UNEXPORTED because the retained batch hit its cap before anything could commit (a collector outage on a fresh install); the watch will not re-deliver them, so each is outright loss.")
+	EventsExportFailures = Registry.Counter("kubescrape_events_export_failures_total",
+		"Kubernetes event batch exports that failed transiently. The batch is KEPT and the watch stays open "+
+			"(tryFlush), so this counts ATTEMPTS — one per flush, not lost events: a steady rate is a collector "+
+			"outage the reader is riding out with its position uncommitted, and the loss counters are "+
+			"kubescrape_events_dropped_batches_total (a permanent rejection) and "+
+			"kubescrape_events_overflow_dropped_total (the retained batch reaching its cap). Deliberately NOT "+
+			"kubescrape_log_export_failures_total, which is the tailer's files-rewound counter and cannot apply "+
+			"here — this reader rewinds no file, and the singleton that collects events runs with -logs=false, so "+
+			"those increments landed on a metric whose help described something that had not happened.")
 	EventWatchRestarts = Registry.Counter("kubescrape_event_watch_restarts_total",
 		"Event watch restarts (a closed stream, an error, or an expired resourceVersion).")
 	EventRelists = Registry.CounterVec("kubescrape_event_relists_total",
@@ -710,6 +719,14 @@ var (
 		"Azure diagnostic payloads dropped after a permanent collector rejection (the offsets advance past them).")
 	AzureDroppedRecords = Registry.CounterVec("kubescrape_azure_dropped_records_total",
 		"Azure diagnostic records (log records or metric data points) lost with those payloads, by signal.", "signal")
+	AzureExportFailures = Registry.CounterVec("kubescrape_azure_export_failures_total",
+		"Azure diagnostic payload exports that failed transiently and are being retried IN PLACE, by signal "+
+			"(logs, metrics). The payload is kept and the Kafka offsets do not advance until the collector acks, "+
+			"so this counts ATTEMPTS, not lost records; the loss counters are "+
+			"kubescrape_azure_dropped_batches_total and kubescrape_azure_dropped_records_total. Deliberately NOT "+
+			"kubescrape_log_export_failures_total, the tailer's files-rewound counter: this reader owns no file, "+
+			"it runs in the singleton Deployment with -logs=false, and only its LOGS signal was ever counted "+
+			"there — so a hub carrying platform metrics retried invisibly.", "signal")
 	AzureFetchErrors = Registry.Counter("kubescrape_azure_fetch_errors_total",
 		"Kafka fetch errors from the Event Hubs consumer (retried; partial fetches are still processed).")
 	AzureCommitErrors = Registry.Counter("kubescrape_azure_commit_errors_total",

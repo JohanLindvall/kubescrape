@@ -74,6 +74,7 @@ func FuzzConverter(f *testing.F) {
 			if _, err := marshaler.MarshalMetrics(md); err != nil {
 				t.Fatalf("MarshalProto: %v", err)
 			}
+			checkHistogramsSumToCount(t, md)
 		}
 
 		b := newBatcher(func(res pcommon.Resource) {
@@ -98,4 +99,42 @@ func FuzzConverter(f *testing.F) {
 		}
 		checkTaken(b.take())
 	})
+}
+
+// checkHistogramsSumToCount asserts the one OTLP invariant a histogram point
+// cannot express its way out of: sum(bucket_counts) == count. It is checked on
+// every batch the converter fuzz target produces (seed corpus included, so a
+// plain `go test` runs it) rather than only on hand-written bodies, because the
+// inputs that break it are exactly the ones nobody writes by hand — a
+// cumulative sequence that decreases, a bucket claiming more than _count, the
+// same le spelled twice. A point that violates it is invalid OTLP, and a
+// validating collector may answer by rejecting the whole chunk, which costs
+// every other target batched with it.
+func checkHistogramsSumToCount(t *testing.T, md pmetric.Metrics) {
+	t.Helper()
+	rms := md.ResourceMetrics()
+	for i := 0; i < rms.Len(); i++ {
+		sms := rms.At(i).ScopeMetrics()
+		for j := 0; j < sms.Len(); j++ {
+			ms := sms.At(j).Metrics()
+			for k := 0; k < ms.Len(); k++ {
+				m := ms.At(k)
+				if m.Type() != pmetric.MetricTypeHistogram {
+					continue
+				}
+				dps := m.Histogram().DataPoints()
+				for d := 0; d < dps.Len(); d++ {
+					dp := dps.At(d)
+					var sum uint64
+					for _, c := range dp.BucketCounts().AsRaw() {
+						sum += c
+					}
+					if sum != dp.Count() {
+						t.Fatalf("metric %q point %d: sum(bucket_counts) = %d, count = %d (bounds=%v counts=%v) — OTLP requires them equal",
+							m.Name(), d, sum, dp.Count(), dp.ExplicitBounds().AsRaw(), dp.BucketCounts().AsRaw())
+					}
+				}
+			}
+		}
+	}
 }

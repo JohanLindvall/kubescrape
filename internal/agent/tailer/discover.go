@@ -452,11 +452,11 @@ func (t *Tailer) claimPath(src *compiledSource, path string, sets *scanSets) boo
 		// A previous listing may have raced a rename+recreate rotation (the
 		// path momentarily absent between the two syscalls) and marked the
 		// file gone; this listing proves it is back — unmark it before a
-		// sweep drops it. A later gone episode must start with a fresh stall
-		// clock, or chargeGoneStall reads the stale stamp as an already-spent
-		// budget.
-		known.gone = false
-		known.goneStalledSince = time.Time{}
+		// sweep drops it. Through file.resurrect, the one home for that
+		// decision: this branch cleared two of the three fields, and the
+		// goneEnd it left behind made a replaced archive report a lost
+		// remainder it had in fact delivered (see resurrect).
+		known.resurrect()
 		return false
 	}
 	f := &file{

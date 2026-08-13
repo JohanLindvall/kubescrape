@@ -17,13 +17,20 @@ var PodGVR = GVR.GroupVersion().WithResource("podmonitors")
 // PodMonitor is one parsed PodMonitor: a pod label selector plus container
 // port endpoints.
 type PodMonitor struct {
-	Namespace    string
-	Name         string
-	Selector     labels.Selector // selects PODS by label
-	NamespaceAny bool
-	Namespaces   []string
-	Endpoints    []Endpoint // Port names a CONTAINER port
+	Namespace string
+	Name      string
+	// resourceVersion is the object this record was parsed from; see
+	// upsertMonitor. Not part of the model and never served.
+	resourceVersion string
+	Selector        labels.Selector // selects PODS by label
+	NamespaceAny    bool
+	Namespaces      []string
+	Endpoints       []Endpoint // Port names a CONTAINER port
 }
+
+// version reports the resourceVersion this record was parsed from; see
+// upsertMonitor, whose constraint it satisfies.
+func (m *PodMonitor) version() string { return m.resourceVersion }
 
 // PodNamespaces returns the namespaces the monitor selects pods in; nil
 // means all.
@@ -53,12 +60,13 @@ func ParsePodMonitor(u *unstructured.Unstructured) (*PodMonitor, error) {
 		return nil, err
 	}
 	return &PodMonitor{
-		Namespace:    b.Namespace,
-		Name:         b.Name,
-		Selector:     b.Selector,
-		NamespaceAny: b.NamespaceAny,
-		Namespaces:   b.Namespaces,
-		Endpoints:    b.Endpoints,
+		Namespace:       b.Namespace,
+		Name:            b.Name,
+		resourceVersion: b.ResourceVersion,
+		Selector:        b.Selector,
+		NamespaceAny:    b.NamespaceAny,
+		Namespaces:      b.Namespaces,
+		Endpoints:       b.Endpoints,
 	}, nil
 }
 
@@ -76,8 +84,7 @@ func (x *Index) UpsertPodMonitor(u *unstructured.Unstructured) error {
 func (x *Index) DeletePodMonitor(namespace, name string) {
 	x.mu.Lock()
 	defer x.mu.Unlock()
-	x.gen.Add(1)
-	delete(x.podMonitors, namespace+"/"+name)
+	deleteMonitor(x, x.podMonitors, namespace+"/"+name)
 }
 
 // PodMonitors returns all pod monitors (shared, treat as immutable).

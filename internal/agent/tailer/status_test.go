@@ -2,15 +2,21 @@
 package tailer
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/JohanLindvall/kubescrape/internal/agent/positions"
+	"github.com/JohanLindvall/kubescrape/internal/obs"
 )
 
 // Status reports per-file positions and lag for /debug/tailer.
@@ -145,4 +151,83 @@ func TestStatusConcurrentScrape(t *testing.T) {
 	}
 	waitFor(t, func() bool { return len(tl.Status()) == 1 }, "status to include the file")
 	t.Logf("status scrapes: %d in %v (%.0f/s)", scrapes.Load(), duration, float64(scrapes.Load())/duration.Seconds())
+}
+
+// kubescrape_log_segments_stalled (and FileStatus.Stalled) is the signal for a
+// rotated segment whose replay CANNOT PROCEED — the one state where a file
+// stops collecting without losing anything, and the thing its documented
+// sustained-nonzero alert selects for. A replay that is merely UNFINISHED is
+// not that: a 10 MiB rotated log walked at MaxBytesPerSweep is unfinished for
+// its whole healthy duration, so counting it held the gauge up for every
+// outage recovery and paged on a node that was working.
+func TestStalledIsNotRaisedForAHealthyBudgetCutReplay(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+	pos := mustOpenPositions(t, filepath.Join(t.TempDir(), "pos.json"))
+	path := filepath.Join(dir, logName)
+
+	rot := path + ".1"
+	// Fixed-WIDTH timestamps: RFC3339Nano trims trailing zeros, so
+	// timeNowCRI() lines vary in length and a per-line byte budget derived
+	// from the first one lets two short lines through a pass.
+	var lines []string
+	for i := 0; i < 8; i++ {
+		lines = append(lines, fmt.Sprintf("2026-07-05T10:00:%02dZ stdout F seg-%d", i, i))
+	}
+	writeLines(t, rot, lines...)
+	rotIno := inodeOfPath(t, rot)
+	rst, err := os.Stat(rot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeLog(t, dir, timeNowCRI()+" stdout F tail-one")
+	if err := pos.SetLogs(map[string]positions.LogPos{path: {
+		Offset: 0, Inode: inodeOfPath(t, path),
+		Pending: []positions.Prefix{{Inode: rotIno, From: 0, To: rst.Size()}},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+
+	exp := &fakeExporter{}
+	tl := driveTailer(dir, exp)
+	tl.cfg.Positions = pos
+	tl.cfg.MaxBytesPerSweep = len(lines[0]) + 1 // one line per pass: 8 passes
+	tl.scanDir(tl.loadCheckpoints(), true)
+
+	f := tl.files[path]
+	for range 4 {
+		tl.sweep(ctx, true)
+		tl.flush(ctx)
+		if f.segmentsFed {
+			t.Fatal("setup: the replay finished too early to model a budget-cut one")
+		}
+		tl.publishStatus()
+		for _, fs := range tl.Status() {
+			if fs.Stalled {
+				t.Fatalf("a progressing budget-cut replay reported STALLED (segments=%d committed=%d): "+
+					"the gauge's documented alert fires on every outage recovery", fs.Segments, fs.Committed)
+			}
+		}
+		if got := obs.LogSegmentsStalled.Value(); got != 0 {
+			t.Fatalf("kubescrape_log_segments_stalled = %v during a healthy replay, want 0", got)
+		}
+	}
+
+	// Control: a segment whose source will not read is exactly what the gauge
+	// is for, and it must light up.
+	wo, err := os.OpenFile(rot, os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = wo.Close() })
+	f.segments[0].fd = wo
+	tl.segmentStallLimit = time.Hour // stay stalled rather than being given up on
+	for range 3 {
+		tl.sweep(ctx, true)
+		tl.flush(ctx)
+	}
+	tl.publishStatus()
+	if got := obs.LogSegmentsStalled.Value(); got != 1 {
+		t.Fatalf("kubescrape_log_segments_stalled = %v with an unreadable segment gating the tail, want 1", got)
+	}
 }

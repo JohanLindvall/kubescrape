@@ -214,25 +214,95 @@ func (c *ReshardConfig) Validate() error {
 	return nil
 }
 
+// ValidateAgainst checks the section's shape AND the per-shard exporter configs
+// NewResharder will build from it over base — exactly the Configs it hands to
+// otlpexport.New.
+//
+// Validate alone is not enough for a dry run, for the same reason
+// otlpexport.ExportConfig.ValidateAgainst exists beside its Validate: every rule
+// that only becomes checkable once the DESTINATION is derived was invisible to
+// -check-config — TLS material beside a plaintext gRPC hop, a scheme-less
+// explicit endpoint under protocol: http — so the dry run exited 0, printed the
+// ring as if it were fine, and the same ConfigMap then aborted every pod of the
+// trace-tier StatefulSet at startup (podManagementPolicy: Parallel, so a fresh
+// install CrashLoops the whole tier), which is the one outcome -check-config
+// exists to prevent.
+//
+// Still shape-only in the sense that matters: no filesystem, no DNS, no
+// namespace resolution (see dryRunNamespace).
+func (c *ReshardConfig) ValidateAgainst(base otlpexport.Config) error {
+	if err := c.Validate(); err != nil {
+		return err
+	}
+	if c == nil || !c.Enabled() {
+		return nil
+	}
+	ns := c.Namespace
+	if ns == "" {
+		ns = dryRunNamespace
+	}
+	for _, t := range c.targets(ns) {
+		if t.name == c.Self {
+			// NewResharder builds no client for ourselves, so validating one here
+			// would refuse a config a real start accepts. A dry run has to be
+			// wrong in neither direction.
+			continue
+		}
+		if err := c.clientConfig(t, base).Validate(); err != nil {
+			return shardClientErr(t, err)
+		}
+	}
+	return nil
+}
+
+// dryRunNamespace stands in for this pod's namespace when ValidateAgainst
+// renders the template's per-pod hostnames. $POD_NAMESPACE is a POD fact and
+// -check-config commonly runs in CI, so resolving it would either touch the
+// ServiceAccount projection (which the dry run must not) or fail a config that
+// starts perfectly in the pod that reads it. Substituting it cannot change a
+// verdict: it fills one DNS label, and every shape rule reads the scheme, the
+// port or the TLS material. Deliberately not a legal label, so an error message
+// carrying it cannot be mistaken for a real namespace.
+const dryRunNamespace = "NAMESPACE"
+
+// shardClientErr wraps a per-shard client failure, spelled once so the dry run's
+// refusal and NewResharder's are the same sentence about the same shard.
+func shardClientErr(t shardTarget, err error) error {
+	return fmt.Errorf("service-graph shard %s (%s): %w", t.name, t.endpoint, err)
+}
+
 // shardTargets resolves the configured shard set to (name, endpoint) pairs. The
 // NAME is what the ring hashes, so it must be stable across shards and across
 // restarts: the pod's ordinal identity for the template form, the endpoint
 // string itself for the explicit form.
 func (c *ReshardConfig) shardTargets() ([]shardTarget, error) {
+	ns := c.Namespace
+	// Only the TEMPLATE form needs one: explicit endpoints carry their own host,
+	// so resolving (and failing on) a namespace they never use would refuse a
+	// perfectly addressable shard set.
+	if len(c.Endpoints) == 0 {
+		if ns == "" {
+			ns = selfmeta.Namespace()
+		}
+		if ns == "" {
+			return nil, fmt.Errorf("serviceGraphShards.namespace is empty and this pod's own namespace could not be resolved ($POD_NAMESPACE or the ServiceAccount projection)")
+		}
+	}
+	return c.targets(ns), nil
+}
+
+// targets renders the shard set with ns as the namespace label of the derived
+// per-pod DNS names (ignored by the explicit form, which needs no namespace).
+// Split out of shardTargets so the DRY RUN can render the identical set without
+// resolving a namespace it has no business resolving.
+func (c *ReshardConfig) targets(ns string) []shardTarget {
 	if len(c.Endpoints) > 0 {
 		out := make([]shardTarget, 0, len(c.Endpoints))
 		for _, e := range c.Endpoints {
 			e = strings.TrimSpace(e)
 			out = append(out, shardTarget{name: e, endpoint: e})
 		}
-		return out, nil
-	}
-	ns := c.Namespace
-	if ns == "" {
-		ns = selfmeta.Namespace()
-	}
-	if ns == "" {
-		return nil, fmt.Errorf("serviceGraphShards.namespace is empty and this pod's own namespace could not be resolved ($POD_NAMESPACE or the ServiceAccount projection)")
+		return out
 	}
 	svc := c.Service
 	if svc == "" {
@@ -258,7 +328,7 @@ func (c *ReshardConfig) shardTargets() ([]shardTarget, error) {
 		}
 		out = append(out, shardTarget{name: name, endpoint: host})
 	}
-	return out, nil
+	return out
 }
 
 func (c *ReshardConfig) protocol() string {
@@ -442,7 +512,7 @@ func NewResharder(cfg ReshardConfig, base otlpexport.Config, log *slog.Logger) (
 		c, err := otlpexport.New(cfg.clientConfig(t, base))
 		if err != nil {
 			_ = r.Close()
-			return nil, fmt.Errorf("service-graph shard %s (%s): %w", t.name, t.endpoint, err)
+			return nil, shardClientErr(t, err)
 		}
 		r.clients[t.name] = c
 		r.closers = append(r.closers, c.Close)

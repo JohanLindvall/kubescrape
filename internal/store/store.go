@@ -549,16 +549,24 @@ func (s *Store) claimOneIPLocked(rec *record, ip string, oldIPs []string) {
 // terminating one (same precedence the claim path applies); among equals the
 // pick is arbitrary — exactly like concurrent last-write-wins claims.
 //
-// skip is the record that just gave the IP up and must never win it back. It
-// is REQUIRED for correctness on the delete path: DeletePod stamps expireAt
-// (the tombstone marker this scan filters on) only AFTER the promotion runs,
-// and with -cache-ttl 0 removes the record instead of stamping it at all — so
-// without an explicit exclusion the pod being deleted is still "live" here and
-// re-claims its own IP. That resurrects it in byPodIP with DeletedAt unset,
-// serving a DELETED pod from GET /v1/pod-ips forever (Sweep never revisits
-// byPodIP), leaking one entry per deleted pod, and — when a live pod holds the
-// recycled IP — stealing the mapping from the real owner at map-iteration
-// random.
+// skip is the record that just gave the IP up and must never win it back. It is
+// this function's OWN precondition, not a patch for its caller: the scan is over
+// ipClaimants[ip], and the one caller (releaseIPLocked) drops rec from that map
+// BEFORE calling — so today the branch is never taken, and a test proving it is
+// unreachable would prove nothing about whether it may be deleted.
+//
+// It stays because the alternative is a promotion whose correctness rests on
+// call ORDER, and the outcome of getting that order wrong is silent. None of
+// this scan's other filters would catch the releaser: DeletePod stamps expireAt
+// (the tombstone marker filtered on above) only AFTER the promotion runs, and
+// with -cache-ttl 0 removes the record instead of stamping it at all, so the pod
+// being deleted still reads as live here. It would take its own address back
+// with DeletedAt unset and serve a DELETED pod from GET /v1/pod-ips forever
+// (Sweep never revisits byPodIP), leaking one entry per deleted pod and — when a
+// live pod holds the recycled IP — stealing the mapping from the real owner.
+// TestPromotionNeverReturnsTheAddressToTheRecordThatReleasedIt calls this
+// function directly, with the releaser still in the claimant set, so the
+// exclusion is pinned as a contract rather than as unreachable code.
 func (s *Store) promoteIPClaimantLocked(ip string, skip *record) {
 	var pick *record
 	for _, r := range s.ipClaimants[ip] {

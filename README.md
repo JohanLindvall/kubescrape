@@ -479,8 +479,11 @@ pause or drop) keeps one runaway pod from consuming the pipeline. Set
 `-logs-exclude-namespaces` to the observability namespace to avoid feeding
 the collector its own output. (The Helm chart does this for you: with
 `agent.logsExcludeNamespaces` left at its `null` default it excludes the
-release's own namespace plus, when `agent.otlp.endpoint` names an in-cluster
-Service, that Service's namespace. An explicit `[]` means exclude nothing.)
+release's own namespace plus, when an in-cluster Service is named as a LOGS
+destination — `agent.otlp.endpoint`, or `agent.config.export.logs.endpoint` —
+that Service's namespace. Only a logs destination counts: excluding a metrics
+or traces endpoint's namespace would drop logs it never caused. An explicit
+`[]` means exclude nothing.)
 
 **Unified config file** (`-config`). All of the agent's YAML configuration
 lives in one file, passed with `-config`. Every section is optional, each

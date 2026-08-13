@@ -14,6 +14,7 @@ import (
 	"github.com/fsnotify/fsnotify"
 
 	"github.com/JohanLindvall/kubescrape/internal/agent/positions"
+	"github.com/JohanLindvall/kubescrape/internal/obs"
 )
 
 func TestPreexistingFileStartsAtEnd(t *testing.T) {
@@ -823,4 +824,132 @@ func TestCompressedFileRestoresNoPendingSegments(t *testing.T) {
 	}
 	driveUntil(t, ctx, tl, func() bool { return slices.Contains(exp.get(), "arc-one") },
 		"the archive still being read")
+}
+
+// A gone verdict is withdrawn by TWO paths — a listing that finds the path
+// again (claimPath) and the sweep's own stat of a gone file — and withdrawing
+// it is ONE decision: gone, goneEnd and goneStalledSince die together
+// (file.resurrect). They were written twice and had already diverged, the
+// discovery half leaving goneEnd pinned at the previous incarnation's EOF: a
+// completion check then measures the new stream against the old one's end, so
+// the file either never settles (entry, fd and checkpoint pinned for the
+// process lifetime, nothing counted) or reports a remainder it never owed.
+func TestBothResurrectPathsWithdrawTheWholeGoneVerdict(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		// withdraw drives the path that must clear the verdict, with the
+		// file's path present on disk.
+		withdraw func(tl *Tailer, f *file)
+	}{
+		{"listing (claimPath)", func(tl *Tailer, _ *file) { tl.scanDir(nil, false) }},
+		{"sweep's stat of a gone file", func(tl *Tailer, _ *file) { tl.sweep(context.Background(), true) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			exp := &fakeExporter{}
+			tl := newTestTailer(dir, "", exp)
+			writeLog(t, dir, "2026-07-05T10:00:00Z stdout F one")
+			tl.scanDir(tl.loadCheckpoints(), true)
+			f := tl.files[filepath.Join(dir, logName)]
+			if f == nil {
+				t.Fatal("setup: file not tracked")
+			}
+
+			f.gone = true
+			f.goneEnd = 12345
+			f.goneStalledSince = time.Now().Add(-time.Hour)
+
+			tc.withdraw(tl, f)
+
+			if f.gone {
+				t.Fatal("gone not cleared for a path that is back on disk")
+			}
+			if f.goneEnd != 0 {
+				t.Fatalf("goneEnd = %d, want 0: it pins the PREVIOUS incarnation's EOF, and the live "+
+					"file's offsets are measured against it forever (settledGone never fires)", f.goneEnd)
+			}
+			if !f.goneStalledSince.IsZero() {
+				t.Fatalf("goneStalledSince = %v, want the zero time: a later gone episode reads the stale "+
+					"stamp as an already-spent budget and gives up on sight", f.goneStalledSince)
+			}
+		})
+	}
+}
+
+// initFile CONSUMES the stored position: from the moment a file is discovered
+// the tailer's own offset is authoritative. The scan-time prune covers a path
+// a LISTING proved absent, but a dangling symlink is listed forever and is
+// deliberately spared as "unproven" — so this is the one thing standing
+// between a recreated path and its predecessor's offset. Applied a second
+// time, that offset either skips the new file's first bytes as if they had
+// shipped (the runtime reused the inode, and nothing catches it) or
+// synthesizes an open-ended segment for an incarnation that no longer exists,
+// counting a loss (obs.LogPrefixLost) that never happened. Which of the two
+// depends only on whether the inode was reused, so neither may occur.
+func TestDiscoveryConsumesTheStoredCheckpoint(t *testing.T) {
+	dir := t.TempDir()
+	targets := t.TempDir()
+	ctx := context.Background()
+	pos := mustOpenPositions(t, filepath.Join(t.TempDir(), "pos.json"))
+	link := filepath.Join(dir, logName)
+
+	// The first incarnation, fully shipped before this run started. The
+	// /var/log/containers shape: a symlink the glob keeps listing even once
+	// its target is gone.
+	target := filepath.Join(targets, "0.log")
+	// Fixed, equal-length timestamps: the stale offset must land exactly on a
+	// line boundary of the REPLACEMENT for the skip to be unambiguous.
+	writeLines(t, target, "2026-07-05T10:00:00Z stdout F old-one", "2026-07-05T10:00:01Z stdout F old-two")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+	st, err := os.Stat(link)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := pos.SetLogs(map[string]positions.LogPos{link: {
+		Offset: st.Size(), Inode: inodeOfPath(t, link),
+	}}); err != nil {
+		t.Fatal(err)
+	}
+
+	exp := &fakeExporter{}
+	tl := driveTailer(dir, exp)
+	tl.cfg.Positions = pos
+	tl.scanDir(tl.loadCheckpoints(), true)
+	tl.sweep(ctx, true)
+	tl.flush(ctx)
+	if got := exp.get(); len(got) != 0 {
+		t.Fatalf("setup: a fully shipped file re-delivered %v", got)
+	}
+
+	// The target goes; the symlink stays, so the glob keeps listing the path
+	// and the scan-time prune spares its (already consumed) entry.
+	if err := os.Remove(target); err != nil {
+		t.Fatal(err)
+	}
+	driveUntil(t, ctx, tl, func() bool { _, tracked := tl.files[link]; return !tracked },
+		"the file whose path stopped resolving being released")
+
+	// A NEW incarnation takes the path — same name, same line lengths, so the
+	// predecessor's offset would land exactly past its first two lines.
+	prefixBefore := obs.LogPrefixLost.Value()
+	writeLines(t, target,
+		"2026-07-05T11:00:00Z stdout F new-one",
+		"2026-07-05T11:00:01Z stdout F new-two",
+		"2026-07-05T11:00:02Z stdout F new-three")
+	tl.scanDir(nil, false)
+	driveUntil(t, ctx, tl, func() bool { return slices.Contains(exp.get(), "new-three") },
+		"the recreated file being read")
+
+	for _, want := range []string{"new-one", "new-two"} {
+		if got := exp.get(); !slices.Contains(got, want) {
+			t.Fatalf("the recreated file's line %q was skipped as if shipped: exported %v "+
+				"(a consumed checkpoint entry was applied a second time)", want, got)
+		}
+	}
+	if got := obs.LogPrefixLost.Value(); got != prefixBefore {
+		t.Fatalf("LogPrefixLost = %v, want %v: a recreated path re-initialised from its predecessor's "+
+			"identity synthesizes a rotated segment for an incarnation that never rotated", got, prefixBefore)
+	}
 }

@@ -53,6 +53,59 @@ while the singleton kept emitting the old value indefinitely.
 {{- end -}}
 
 {{/*
+kubescrape.inClusterNamespace reads the Kubernetes NAMESPACE out of one OTLP
+endpoint, or renders empty when the endpoint does not name an in-cluster
+Service. It takes the endpoint STRING as its context (with or without a scheme,
+port or path).
+
+It is the feedback-loop guard's one derivation, used by agent.yaml for the
+UNCONDITIONAL destinations the chart renders — the -otlp-endpoint flag and each
+per-signal `agent.config.export` override — because every log line the agent
+tails goes to those, including the destination's own, and that amplifies
+precisely when the destination is already struggling. It lived inline beside the
+flag and so covered only the flag: a collectorless
+`export.logs.endpoint: http://loki-gateway.logging.svc:4318` reopened exactly the
+loop the default exists to close, silently, since files are skipped at DISCOVERY
+and nothing counts or warns.
+
+`agent.config.routing` routes are deliberately NOT read here. A route is SELECTED
+BY namespace, so its endpoint receives only the namespaces its globs match, and
+the usual per-tenant shape names the tenant's own namespace on both sides
+(`namespaces: [tenant-a]` → `otel-collector.tenant-a.svc`). Excluding that
+namespace would drop precisely the logs the route exists to deliver — the whole
+tenant, at discovery, with nothing counted and nothing warned. Whether a route
+loops at all depends on its runtime globs, which the chart cannot evaluate, so
+the safe default is to leave routes out and let an operator name a genuinely
+looping route in `agent.logsExcludeNamespaces` explicitly.
+
+In-cluster is `<svc>.<ns>` or anything under `.svc`. Deriving a namespace from
+ANY host read the second label of an EXTERNAL endpoint as one — `otel.grafana.net`
+excluded a namespace called `grafana`, whose pods were then dropped with no
+counter and no warning to tell that apart from "no logs".
+
+The namespace is the label BEFORE `svc`, not the second one: those coincide for
+`<svc>.<ns>.svc...` and not for a StatefulSet's per-pod `<pod>.<svc>.<ns>.svc...`,
+where taking the second excluded a namespace named after the SERVICE and left the
+destination's own namespace tailed — the loop reopened, plus an unrelated
+namespace silently dropped. Bare `<svc>.<ns>` has no `svc` label and keeps the
+second.
+*/}}
+{{- define "kubescrape.inClusterNamespace" -}}
+{{- $hostport := first (splitList "/" (trimPrefix "https://" (trimPrefix "http://" (. | default "")))) -}}
+{{- $host := first (splitList ":" $hostport) -}}
+{{- $parts := splitList "." $host -}}
+{{- if and (ge (len $parts) 2) (or (eq (len $parts) 2) (hasSuffix ".svc" $host) (contains ".svc." $host)) -}}
+{{-   $ns := index $parts 1 -}}
+{{-   range $i, $label := $parts -}}
+{{-     if and (eq $label "svc") (gt $i 0) -}}
+{{-       $ns = index $parts (sub $i 1) -}}
+{{-     end -}}
+{{-   end -}}
+{{-   $ns -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
 kubescrape.azureNamespaces renders -azure-eventhub-namespace's value.
 
 `namespaces` (a list) wins over the singular `namespace` when set, so the

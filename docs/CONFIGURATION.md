@@ -2341,8 +2341,9 @@ directory (not `subPath`). See
 full annotated list.
 
 `agent.logsExcludeNamespaces` is **null by default, and null is not empty**.
-Left unset, the chart excludes this release's own namespace *plus*, when
-`agent.otlp.endpoint` names an in-cluster Service, that Service's namespace —
+Left unset, the chart excludes this release's own namespace *plus*, when an
+in-cluster Service is named as a **logs** destination — `agent.otlp.endpoint`,
+or `agent.config.export.logs.endpoint` — that Service's namespace —
 the dot-separated label immediately *before* `svc`, falling back to the second
 label for a bare `<svc>.<ns>` (e.g. `monitoring` for the default
 `otel-collector.monitoring:4317`). The two rules coincide for

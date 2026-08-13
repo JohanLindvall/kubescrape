@@ -125,37 +125,43 @@ type Input[K comparable] struct {
 	// for the tailer, the exact identity (segment-qualified byte range plus a
 	// hash of the joined body) of every entry a rewind can bring back.
 	//
-	// EXACTLY TWO THINGS ARE GATED, and the narrowness is deliberate rather
-	// than an oversight:
+	// WHAT IS GATED is every counter whose unit is a RECORD, wherever the
+	// increment physically lives:
 	//
 	//   - Config.LogMetrics.Add, the operator's own counters/histograms. These
-	//     are the ones that matter: they are cumulative, someone alerts on
+	//     are the ones that matter most: they are cumulative, someone alerts on
 	//     them, and nothing downstream can undo a double count.
 	//   - obs.LogRulesDropped, the tally of records the keep/drop chain refused.
+	//   - obs.LogEnriched and obs.LogEnrichTimeRejected, a package away in
+	//     logenrich — reached through ApplyUncounted rather than Apply, which
+	//     is why Emit branches on this field around one call.
 	//
-	// NOT gated: everything else, and the rule rather than the list is what to
-	// remember — anything a producer counts OUTSIDE this chain still multiplies
-	// by the number of passes a rewind spans. Two classes, with examples that
-	// are not an exhaustive list:
+	// The enrichment pair is worth the extra entry point because it is read
+	// AGAINST a delivery count: sum(kubescrape_log_enriched_total) is the
+	// decomposition of kubescrape_log_entries_total by parse format, and the two
+	// agree to the record whenever nothing is failing. Counting passes in the
+	// numerator and deliveries in the denominator turns "what fraction of my
+	// lines are JSON" into a multiple of itself during exactly the outage
+	// someone is reading it to diagnose — 32,245 against 277 entries, 116x,
+	// measured over a three-minute collector outage — and skews the format MIX
+	// too, since the extra passes sample the rewinding batch, not the stream.
 	//
-	//   - counted inside the work this chain calls, a package away:
-	//     kubescrape_log_scrubbed_total (logscrub.Scrub, from Chain.Line) and
-	//     kubescrape_log_enriched_total /
-	//     kubescrape_log_enrich_time_rejected_total (logenrich.Apply).
-	//   - counted on a producer's READ side, before a record exists and so
-	//     before this chain can be told anything: for the tailer,
+	// NOT gated, and the rule rather than the list is what to remember —
+	// anything counted where this field cannot reach still multiplies by the
+	// number of passes a rewind spans:
+	//
+	//   - kubescrape_log_scrubbed_total, bumped inside logscrub.Scrub from
+	//     Chain.Line — 6 for 3 delivered records across one rewind. Redaction
+	//     has to precede grouping, so it happens in Line, which takes a body
+	//     rather than an Input and so never sees this field. Same shape as the
+	//     enrichment pair and the same fix: carry the flag into Line and give
+	//     logscrub an uncounted entry point beside the counting one.
+	//   - the producer's READ side, before a record exists and so before this
+	//     chain can be told anything: for the tailer,
 	//     kubescrape_log_rate_limited_total (both label values, in consume),
-	//     kubescrape_log_bytes_total and kubescrape_log_oversized_dropped_total
-	//     — a rewind re-reads the bytes, so it re-counts them.
-	//
-	// All of these are PIPELINE-ACTIVITY diagnostics — how many lines carried a
-	// secret, what fraction parsed as JSON, how much a rate limit is biting —
-	// rather than series an operator builds alerts or dashboards on, and the
-	// read-side ones describe passes over bytes, which is honestly what they
-	// count. Threading a suppression flag through two more packages, or down to
-	// the read path, to fix a diagnostic counter was not judged worth it; the
-	// point of writing it down is that the guarantee above is not read as wider
-	// than it is.
+	//     kubescrape_log_bytes_total and kubescrape_log_oversized_dropped_total.
+	//     These count passes over BYTES, which is honestly what they measure —
+	//     a rewind really does re-read them — so there is nothing here to fix.
 	//
 	// Under-claiming is safe (a re-observation, i.e. the behaviour before this
 	// existed); over-claiming loses observations outright, so a producer must
@@ -243,7 +249,14 @@ func (c *Chain[K]) Emit(p Producer, in Input[K]) bool {
 	p.Stamp(lr)
 	logattrs.Put(lr.Attributes(), in.Lifted.Log)
 	if c.cfg.Enrich {
-		logenrich.Apply(lr, in.Body)
+		if in.Observed {
+			// Same enrichment, no counters: obs.LogEnriched and
+			// obs.LogEnrichTimeRejected are per-RECORD outcomes, and this
+			// record's were tallied by the pass a rewind brought it back from.
+			logenrich.ApplyUncounted(lr, in.Body)
+		} else {
+			logenrich.Apply(lr, in.Body)
+		}
 	}
 	if c.cfg.LogMetrics != nil && !in.Observed {
 		// Metric label/value keys resolve against the record's attributes

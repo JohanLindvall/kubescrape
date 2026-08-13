@@ -48,6 +48,48 @@ func TestCgroupIdentity(t *testing.T) {
 	}
 }
 
+// A STATIC pod's cgroup is named after a UID no API server ever assigned: the
+// kubelet mints it from the manifest as an md5, so it is 32 bare hex digits
+// rather than the canonical 8-4-4-4-12. Dropping it is not a cosmetic loss of
+// one attribute — it is the loss of the only thing a caller can cross-check a
+// by-name metadata lookup against, and the pods it happens to are the control
+// plane's, on every node.
+//
+// The path and both ids are copied from a live kind v1.33 node (kubelet run
+// with --cgroup-root, hence the kubelet- prefixes): the pod is
+// kube-system/kube-apiserver-<node>, whose mirror pod carries this very value
+// as kubernetes.io/config.hash.
+func TestIdentityReadsAStaticPodsKubeletMintedUID(t *testing.T) {
+	const (
+		staticUID = "690540eda46e8f874de849cc6a40a909"
+		cid       = "5573a6c340a7927c3195da3397600c3d15cd15b6008cafd98441fbf3fa781251"
+		podSlice  = "/kubelet.slice/kubelet-kubepods.slice/kubelet-kubepods-burstable.slice/kubelet-kubepods-burstable-pod" + staticUID + ".slice"
+	)
+	cases := []struct {
+		id       string
+		uid, cid string
+		child    bool
+	}{
+		{podSlice, staticUID, "", false},
+		{podSlice + "/cri-containerd-" + cid + ".scope", staticUID, cid, true},
+		// The cgroupfs driver's spelling of the same pod.
+		{"/kubepods/burstable/pod" + staticUID + "/" + cid, staticUID, cid, true},
+		// Not a UID: 31 and 33 hex digits, and one with a non-hex byte. The
+		// 32-hex form is accepted because the kubelet writes it, not because
+		// "a hex-looking tail" is enough.
+		{"/kubepods/burstable/pod" + staticUID[:31] + "/" + cid, "", cid, false},
+		{"/kubepods/burstable/pod" + staticUID + "aa/" + cid, "", cid, false},
+		{"/kubepods/burstable/pod" + staticUID[:31] + "g/" + cid, "", cid, false},
+	}
+	for _, c := range cases {
+		uid, gotCID, child := cgroupid.Parse(c.id)
+		if uid != c.uid || gotCID != c.cid || child != c.child {
+			t.Errorf("cgroupid.Parse(%q) = (%q, %q, %v), want (%q, %q, %v)",
+				c.id, uid, gotCID, child, c.uid, c.cid, c.child)
+		}
+	}
+}
+
 // Parse's shape verdict is what tells a container OF a pod from anything else
 // living under the pod slice. cadvisor's sandbox detection folds such a row onto
 // the pod's resource, and folding something that merely sits beside the
@@ -90,8 +132,9 @@ func TestParseReportsAContainerDirectlyUnderThePodSlice(t *testing.T) {
 }
 
 // FuzzCgroupIdentity feeds arbitrary strings through the cadvisor cgroup-path
-// parser. Invariants: no panics; a non-empty pod UID is always canonical
-// 8-4-4-4-12 form; a non-empty container ID is always 64 hex characters; and a
+// parser. Invariants: no panics; a non-empty pod UID is always one of the two
+// forms IsPodUID takes (canonical 8-4-4-4-12, or a static pod's 32 bare hex
+// digits); a non-empty container ID is always 64 hex characters; and a
 // podContainer verdict always carries both ids, since it claims to have placed
 // one segment relative to the other.
 func FuzzCgroupIdentity(f *testing.F) {
@@ -110,7 +153,7 @@ func FuzzCgroupIdentity(f *testing.F) {
 	f.Fuzz(func(t *testing.T, id string) {
 		podUID, containerID, podContainer := cgroupid.Parse(id)
 		if podUID != "" && !cgroupid.IsPodUID(podUID) {
-			t.Fatalf("cgroupid.Parse(%q) returned non-canonical pod UID %q", id, podUID)
+			t.Fatalf("cgroupid.Parse(%q) returned a pod UID of neither accepted form: %q", id, podUID)
 		}
 		if containerID != "" && !cgroupid.IsContainerID(containerID) {
 			t.Fatalf("cgroupid.Parse(%q) returned non-hex container ID %q", id, containerID)

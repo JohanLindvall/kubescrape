@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/JohanLindvall/enrich"
 	"github.com/JohanLindvall/kubescrape/internal/logline"
 	"github.com/JohanLindvall/kubescrape/internal/metrics"
 	"github.com/JohanLindvall/kubescrape/internal/obs"
@@ -335,4 +336,77 @@ func fileSize(t *testing.T, path string) int64 {
 		t.Fatal(err)
 	}
 	return st.Size()
+}
+
+// enrichedTotal is sum(kubescrape_log_enriched_total). The sum is the number
+// that matters: the series exists to decompose kubescrape_log_entries_total by
+// the parse format that matched, so its total is a RECORD count and the two
+// agree exactly whenever nothing is failing.
+func enrichedTotal() float64 {
+	total := 0.0
+	for _, format := range []string{
+		enrich.FormatJSON, enrich.FormatLogfmt, enrich.FormatPattern,
+		"none", // logenrich's label for a line enrich made nothing of
+	} {
+		total += obs.LogEnriched.WithLabelValues(format).Value()
+	}
+	return total
+}
+
+// The enrichment counters across the same rewind, measured the way an operator
+// reads them: against kubescrape_log_entries_total, which counts DELIVERED
+// records and therefore does not move for a re-read.
+//
+// Enrichment runs inside the chain but tallies a package away in logenrich, so
+// it sat below the Observed gate and multiplied by the number of attempts an
+// outage spanned. On a live three-node cluster whose collector was scaled to
+// zero for three minutes: kubescrape_log_enriched_total 32,245 and
+// kubescrape_log_enrich_time_rejected_total 31,324 against
+// kubescrape_log_entries_total 277 — a ratio of 116x on a pair of series whose
+// healthy readings were 211 and 211.
+func TestEnrichmentCountsOncePerRecordAcrossARewind(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+	exp := &fakeExporter{fail: 3} // exportWithRetry's whole budget: the batch rewinds
+	tl := driveTailer(dir, exp)
+	tl.cfg.Enrich = true
+
+	tl.scanDir(tl.loadCheckpoints(), true)
+	// A ZONE-LESS timestamp in each body, beneath the CRI header's zoned one:
+	// enrich parses it, the producer's accurate stamp wins, and that refusal is
+	// what kubescrape_log_enrich_time_rejected_total counts — once per record.
+	writeLog(t, dir,
+		timeNowCRI()+" stdout F 2026-01-02 03:04:05 INFO one",
+		timeNowCRI()+" stdout F 2026-01-02 03:04:06 INFO two",
+		timeNowCRI()+" stdout F 2026-01-02 03:04:07 INFO three",
+		timeNowCRI()+" stdout F 2026-01-02 03:04:08 INFO four",
+		timeNowCRI()+" stdout F 2026-01-02 03:04:09 INFO five",
+	)
+	tl.scanDir(nil, false)
+	enriched := enrichedTotal()
+	rejected := obs.LogEnrichTimeRejected.Value()
+	entries := obs.LogEntries.Value()
+	rewinds := obs.LogExportFailures.Value()
+	driveUntil(t, ctx, tl, func() bool { return len(exp.get()) == 5 }, "the five records delivered")
+
+	if got := obs.LogExportFailures.Value() - rewinds; got != 1 {
+		t.Fatalf("precondition: want exactly one rewind, got %v", got)
+	}
+	if exp.attempts < 4 {
+		t.Fatalf("precondition: want the batch re-sent after the rewind, attempts = %d", exp.attempts)
+	}
+	if got := obs.LogEntries.Value() - entries; got != 5 {
+		t.Fatalf("precondition: kubescrape_log_entries_total delta = %v, want 5", got)
+	}
+
+	if got := enrichedTotal() - enriched; got != 5 {
+		t.Errorf("sum(kubescrape_log_enriched_total) delta = %v for 5 delivered records, want 5: "+
+			"the rewind re-enriched the same records and counted them again, so the format "+
+			"decomposition of kubescrape_log_entries_total reads as a multiple of it", got)
+	}
+	if got := obs.LogEnrichTimeRejected.Value() - rejected; got != 5 {
+		t.Errorf("kubescrape_log_enrich_time_rejected_total delta = %v for 5 delivered records, want 5: "+
+			"a refusal is a property of the record, so an operator cannot tell five displaced "+
+			"timestamps from ten", got)
+	}
 }

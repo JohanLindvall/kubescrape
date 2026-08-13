@@ -110,7 +110,7 @@ const maxExactCount = 1 << 53
 // what the filter then removed is the dropped counter, and the difference is
 // what reached the collector.
 func (s *Scraper) scrapeSummary(ctx context.Context) (int, error) {
-	ctx, cancel := context.WithTimeout(ctx, s.kubeletTimeout())
+	ctx, cancel := s.scrapeContext(ctx, s.kubeletTimeout(), pipelineSummary)
 	defer cancel()
 
 	url := strings.TrimRight(s.cfg.Kubelet.Endpoint, "/") + summaryPath

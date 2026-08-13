@@ -20,8 +20,40 @@ import (
 // path). A parsed timestamp replaces the record timestamp (the CRI/journal
 // ingest time belongs in ObservedTimestamp) and an explicit level replaces
 // the severity; enrich's severity numbers are the OTLP severity numbers.
+//
+// The outcome is counted: obs.LogEnriched by the format that matched, and
+// obs.LogEnrichTimeRejected when a zone-less parsed timestamp is refused. Both
+// are per-RECORD tallies, so a producer that can hand the SAME record here
+// twice must use ApplyUncounted for the repeat.
 func Apply(lr plog.LogRecord, line string) {
-	apply(lr, line, true)
+	apply(lr, line, true, true)
+}
+
+// ApplyUncounted is Apply for a record an earlier pass already enriched and
+// counted: the same enrichment, with the counters left alone.
+//
+// It exists because delivery is at-least-once and observation is not. The
+// tailer rewinds a failed batch's files and re-reads the same bytes next sweep,
+// so the record is rebuilt — and every counter reached along the way moved once
+// per ATTEMPT. Measured on a live cluster whose collector was scaled to zero for
+// three minutes: 32,245 kubescrape_log_enriched_total and 31,324
+// kubescrape_log_enrich_time_rejected_total against 277 delivered records, i.e.
+// 116x, on a pair of series that read 211 and 211 while the collector was up.
+//
+// That exact agreement with kubescrape_log_entries_total is how the series is
+// read — sum(log_enriched_total) is log_entries_total decomposed by parse
+// format — and it is the RATIO the multiplication destroys, not the absolute
+// number: passes in the numerator against deliveries in the denominator turns
+// "what fraction of my lines are JSON" into a multiple of itself during exactly
+// the outage someone is reading it to diagnose. The format MIX skews too, since
+// the extra passes sample the rewinding batch rather than the stream.
+//
+// The caller owns the proof that these bytes came through before — for the
+// tailer, the segment-qualified byte range plus a hash of the joined body
+// (logchain.Input.Observed, file.observed). Under-claiming is safe (it is the
+// over-count above); over-claiming loses an observation outright.
+func ApplyUncounted(lr plog.LogRecord, line string) {
+	apply(lr, line, true, false)
 }
 
 // ApplyBodyText enriches one log record from a pre-rendered text view of its
@@ -36,7 +68,11 @@ func Apply(lr plog.LogRecord, line string) {
 // bounded, and shared by enrichment, log-metrics and the rules (otlpingest's
 // chainBody), never re-rendered per consumer.
 func ApplyBodyText(lr plog.LogRecord, body string) {
-	apply(lr, body, false)
+	// Always counted. A rejected push is retransmitted by its sender as BYTES —
+	// the decoded pdata this ran over dies with the RPC — and the receiver keeps
+	// no identity for a pushed record, so a retransmission is indistinguishable
+	// from a new push and there is nothing an uncounted variant could key on.
+	apply(lr, body, false, true)
 }
 
 // The enrichment-outcome counters, resolved once per format: the label values
@@ -63,17 +99,20 @@ func enrichedCounter(format string) *metrics.RegCounter {
 }
 
 // apply parses line and promotes its metadata onto lr. When overwrite is
-// false, only fields the record leaves unset are filled.
-func apply(lr plog.LogRecord, line string, overwrite bool) {
+// false, only fields the record leaves unset are filled. When count is false
+// the record is built identically and no counter moves (see ApplyUncounted).
+func apply(lr plog.LogRecord, line string, overwrite, count bool) {
 	var res enrich.Result // stack-held; ParseInto avoids the per-line heap Result
 	enrich.ParseInto(line, &res)
 	e := &res
-	enrichedCounter(e.Format).Inc()
+	if count {
+		enrichedCounter(e.Format).Inc()
+	}
 
 	if !e.Time.IsZero() && (overwrite || lr.Timestamp() == 0) {
 		if mayReplaceTimestamp(e.TimeHasZone, lr.Timestamp()) {
 			lr.SetTimestamp(pcommon.NewTimestampFromTime(e.Time))
-		} else {
+		} else if count {
 			obs.LogEnrichTimeRejected.Inc()
 		}
 	}

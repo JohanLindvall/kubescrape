@@ -61,7 +61,6 @@ import (
 
 	"github.com/JohanLindvall/kubescrape/internal/agent/attrs"
 	"github.com/JohanLindvall/kubescrape/internal/obs"
-	"github.com/JohanLindvall/kubescrape/pkg/kubemeta"
 )
 
 // The units. A count is never dimensionless here: see the naming note above for
@@ -320,12 +319,6 @@ type summaryBatcher struct {
 	// metadata service could not place them; see object().
 	unresolved struct{ pods, containers int }
 
-	// The one-entry memo behind mirrorIdentity: the pod whose podRef the last
-	// lookup was made for, and the API-server UID to use for it ("" = use the
-	// reported one). A pod's volumes and containers are walked immediately
-	// after the pod itself, so one entry is every hit there is.
-	mirrorNS, mirrorPod, mirrorStatic, mirrorUID string
-
 	// The GetPaths output buffers, one per element shape so a nested walk cannot
 	// clobber the slots its caller is still reading.
 	podSlots, ctrSlots, volSlots, nodeSlots [][]byte
@@ -407,11 +400,6 @@ func (sb *summaryBatcher) scope(t summaryTarget) summaryScope {
 		return sc
 	}
 	return sb.newScope(string(sb.keyBuf), func(res pcommon.Resource) {
-		// The key stays the payload's own identity — it only has to be unique
-		// within the chunk — while the RESOURCE is built from the identity the
-		// API server can actually be asked about, which for a static pod is not
-		// the one the kubelet reports.
-		ident := sb.mirrorIdentity(t.ident)
 		// ONE identity path, shared with the cadvisor batcher and with
 		// FillContainerResource: that is what makes these series join the cadvisor
 		// series for the same object, and a copy would agree until the first edit.
@@ -425,7 +413,7 @@ func (sb *summaryBatcher) scope(t summaryTarget) summaryScope {
 		// unresolved cadvisor row for the same object produces. Consistency in both
 		// states is the point: resolved or not, the two rows are built by one
 		// function from the same inputs.
-		if resolved, _ := sb.s.fillIdentityResource(sb.ctx, res, ident); !resolved {
+		if resolved, _ := sb.s.fillIdentityResource(sb.ctx, res, t.ident); !resolved {
 			switch t.level {
 			case levelPod:
 				sb.unresolved.pods++
@@ -434,71 +422,6 @@ func (sb *summaryBatcher) scope(t summaryTarget) summaryScope {
 			}
 		}
 	})
-}
-
-// The two annotations the kubelet stamps on a mirror pod, both carrying the
-// STATIC pod's own UID: config.hash is written onto the static pod as the
-// kubelet generates that UID from the manifest, and the mirror client copies
-// that value into config.mirror when it creates the API object. Either one on
-// its own is the proof mirrorIdentity needs, so both are read — they are
-// written by different code, and a pod that has one has the claim.
-const (
-	annConfigMirror = "kubernetes.io/config.mirror"
-	annConfigHash   = "kubernetes.io/config.hash"
-)
-
-// mirrorIdentity returns the identity to build ident's resource from, which for
-// a STATIC pod is not the identity the kubelet reported.
-//
-// A static pod's UID is minted by the kubelet from its manifest and is what
-// every statistic in the summary carries, while the object the API server holds
-// is a MIRROR pod under a UID the API server assigned — so the UID cross-check
-// resolveContext applies to every by-name lookup refuses the answer, and
-// kube-apiserver, etcd, kube-scheduler and kube-controller-manager resolve to
-// nothing on every scrape for the life of the cluster. Those are the pods whose
-// ephemeral-storage numbers are worth the most, on the node whose disk fills
-// up, and their cadvisor rows resolve fine (a container id is a container id),
-// so the join this pipeline exists for is the half that breaks.
-//
-// The cross-check is REDIRECTED, not dropped. Resolving a UID miss by name
-// alone would let a pod recreated under the same name lend its identity to
-// statistics about its predecessor — the hazard internal/agent/events resolves
-// its involved objects by UID for, and the one the store's byPodName guard is
-// about. A mirror pod names the static pod it was minted from, so there is
-// something to check against after all: the fallback is taken only when the pod
-// the API server holds SAYS it is the mirror of the pod being described. A
-// recreated pod says nothing of the kind and stays unresolved, exported with
-// its label identity like any other object the service cannot place.
-func (sb *summaryBatcher) mirrorIdentity(ident cadvisorIdentity) cadvisorIdentity {
-	if ident.pod == "" || ident.podUID == "" {
-		// Nothing to redirect: with no UID resolveContext already takes the pod by
-		// name, and with no name there is nothing to take it by.
-		return ident
-	}
-	if sb.mirrorNS != ident.namespace || sb.mirrorPod != ident.pod || sb.mirrorStatic != ident.podUID {
-		sb.mirrorNS, sb.mirrorPod, sb.mirrorStatic, sb.mirrorUID = ident.namespace, ident.pod, ident.podUID, ""
-		// The same lookup fillIdentityResource is about to make, served from the
-		// same one-minute cache, so the cost of asking here is a cache probe.
-		if meta, _ := sb.s.podMeta(sb.ctx, ident.namespace, ident.pod); meta != nil &&
-			meta.UID != ident.podUID && isMirrorOf(meta, ident.podUID) {
-			sb.mirrorUID = meta.UID
-		}
-	}
-	if sb.mirrorUID != "" {
-		ident.podUID = sb.mirrorUID
-	}
-	return ident
-}
-
-// isMirrorOf reports whether the pod the API server holds is the mirror of the
-// static pod whose UID the kubelet reported.
-func isMirrorOf(meta *kubemeta.Pod, staticUID string) bool {
-	if staticUID == "" {
-		// A pod carrying neither annotation would otherwise match "", which is
-		// every pod the metadata service cannot place a UID for.
-		return false
-	}
-	return meta.Annotations[annConfigMirror] == staticUID || meta.Annotations[annConfigHash] == staticUID
 }
 
 func (sb *summaryBatcher) newScope(key string, fill func(pcommon.Resource)) summaryScope {

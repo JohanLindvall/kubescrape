@@ -15,7 +15,8 @@ import "strings"
 //
 // The QoS segment is absent for Guaranteed pods; container scopes may be
 // prefixed cri-containerd-, crio- or docker-. Unrecognized segments yield
-// empty results.
+// empty results. <uid> is either form IsPodUID takes — a STATIC pod's is the
+// kubelet's undashed 32-hex one, not an API-server UID.
 func Identity(id string) (podUID, containerID string) {
 	podUID, containerID, _ = Parse(id)
 	return podUID, containerID
@@ -81,24 +82,50 @@ func Parse(id string) (podUID, containerID string, podContainer bool) {
 	return podUID, containerID, podSeg >= 0 && cidSeg == podSeg+1 && cidSeg == segs-1
 }
 
-// IsPodUID matches the canonical UID form 8-4-4-4-12 (hex and dashes).
+// IsPodUID matches either form of pod UID a kubelet names a cgroup after: the
+// canonical 8-4-4-4-12 of an API-server-assigned UID, and the 32 bare hex
+// digits of a STATIC pod's.
+//
+// The second form is not a variant spelling of the first — it is a different
+// UID. A static pod is never admitted by the API server, so nothing assigns it
+// one; the kubelet mints it from the manifest (an md5, hex-encoded and
+// undashed) and names the pod's cgroup after it, then stamps that same value on
+// the MIRROR pod it creates as kubernetes.io/config.mirror and
+// kubernetes.io/config.hash. Refusing it here does not merely lose a uid: it
+// leaves a caller cross-checking a by-name lookup with nothing to check
+// against, so under a static pod's cgroup an unrelated pod that happens to
+// share the name is accepted — the whole control plane's cgroups on every node
+// (see resolveContext in internal/agent/promscrape, which reads a mirror pod's
+// annotations to decide whether it answers for the uid a path carries).
+//
+// 32 hex digits are also unambiguous where this is used: a segment reaches the
+// test only after a literal "pod" prefix inside a cgroup path the kubelet
+// built.
 func IsPodUID(s string) bool {
-	if len(s) != 36 {
-		return false
-	}
-	for i := 0; i < len(s); i++ {
-		switch i {
-		case 8, 13, 18, 23:
-			if s[i] != '-' {
-				return false
-			}
-		default:
+	switch len(s) {
+	case 32:
+		for i := 0; i < len(s); i++ {
 			if !isHexByte(s[i]) {
 				return false
 			}
 		}
+		return true
+	case 36:
+		for i := 0; i < len(s); i++ {
+			switch i {
+			case 8, 13, 18, 23:
+				if s[i] != '-' {
+					return false
+				}
+			default:
+				if !isHexByte(s[i]) {
+					return false
+				}
+			}
+		}
+		return true
 	}
-	return true
+	return false
 }
 
 // IsContainerID matches a 64-character hex runtime container ID.

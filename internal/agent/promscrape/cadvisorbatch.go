@@ -507,6 +507,63 @@ func (s *Scraper) fillIdentityResource(ctx context.Context, res pcommon.Resource
 	return resolved, answered
 }
 
+// The two annotations the kubelet stamps on a mirror pod, both carrying the
+// STATIC pod's own UID: config.hash is written onto the static pod as the
+// kubelet generates that UID from the manifest, and the mirror client copies
+// that value into config.mirror when it creates the API object. Either one on
+// its own is the proof podAnswersFor needs, so both are read — they are written
+// by different code, and a pod that has one has the claim.
+const (
+	annConfigMirror = "kubernetes.io/config.mirror"
+	annConfigHash   = "kubernetes.io/config.hash"
+)
+
+// podAnswersFor reports whether the pod object the API server holds is the pod
+// the KUBELET described under uid. It is the ONE rule behind every by-name
+// resolution in this package, whichever kubelet endpoint the identity came from
+// — the cgroup path in a /metrics/cadvisor row's `id` label, or podRef.uid in a
+// /stats/summary element — because the two pipelines' series are only worth
+// having while they JOIN, and a pod one of them refuses to place must be a pod
+// the other refuses to place too.
+//
+// A UID match is the ordinary case. The MIRROR case is the one that needs
+// explaining: a static pod's UID is minted by the kubelet from its manifest and
+// is what every statistic about it carries, while the object the API server
+// holds is a MIRROR pod under a UID the API server assigned — so a plain UID
+// comparison refuses the answer, and kube-apiserver, etcd, kube-scheduler and
+// kube-controller-manager resolve to nothing on every scrape for the life of
+// the cluster. A mirror pod NAMES the static pod it was minted from, so there
+// is something to check against after all.
+//
+// The cross-check is REDIRECTED, never dropped: resolving a UID miss by name
+// alone lets a pod that merely shares the name lend its identity to statistics
+// about another object — the hazard internal/agent/events resolves its involved
+// objects by UID for, and the one the store's byPodName guard is about. A pod
+// claiming no mirror stays unresolved and is exported with its label identity.
+//
+// An EMPTY uid is the one permissive branch, and it is the caller's statement
+// that the kubelet reported no uid at all — a cgroup layout with no parseable
+// pod segment. There is nothing to check against and no evidence of a mismatch
+// either, so the name is all there is; podRef.uid is always present, so this
+// branch belongs to the cadvisor side alone.
+func podAnswersFor(meta *kubemeta.Pod, uid string) bool {
+	if uid == "" || meta.UID == uid {
+		return true
+	}
+	return isMirrorOf(meta, uid)
+}
+
+// isMirrorOf reports whether the pod the API server holds is the mirror of the
+// static pod whose UID the kubelet reported.
+func isMirrorOf(meta *kubemeta.Pod, staticUID string) bool {
+	if staticUID == "" {
+		// A pod carrying neither annotation would otherwise match "", which is
+		// every pod the metadata service cannot place a UID for.
+		return false
+	}
+	return meta.Annotations[annConfigMirror] == staticUID || meta.Annotations[annConfigHash] == staticUID
+}
+
 // metric returns the (per-resource) metric for one sample's identity, plus
 // whether the sample's row is pod/container-scoped (its id/name/image labels
 // are then redundant with the resource and elided from the data points).
@@ -647,12 +704,22 @@ func (s *Scraper) podMeta(ctx context.Context, namespace, pod string) (*kubemeta
 	if e, ok := s.cacheGet(key); ok {
 		return e.pod, e.pod != nil || e.answered
 	}
-	meta, err := s.metaSource().PodByName(ctx, namespace, pod)
+	lctx, spent, may := s.metaLookup(ctx)
+	if !may {
+		// The scrape has spent its metadata allowance (metabudget.go): the object
+		// keeps its label identity, exactly as it would against a service that
+		// REFUSED the connection. Nothing was asked, so nothing is cached.
+		return nil, false
+	}
+	defer spent()
+	meta, err := s.metaSource().PodByName(lctx, namespace, pod)
 	answered := true
 	if err != nil {
 		meta = nil
-		if ctx.Err() != nil {
-			// A cancellation is not an answer, and it is not cached either.
+		if lctx.Err() != nil {
+			// A cancellation is not an answer, and it is not cached either. The
+			// LOOKUP's context is what is read, so a lookup cut short by the
+			// allowance is classified the same way — the service said nothing.
 			return nil, false
 		}
 		answered = metaclient.IsNotFound(err)
@@ -681,9 +748,14 @@ func (s *Scraper) containerMeta(ctx context.Context, containerID string) (*kubem
 		}
 		return &kubemeta.ContainerMetadata{ContainerID: containerID, Container: *e.container, Pod: *e.pod}, true
 	}
-	md, err := s.metaSource().Container(ctx, containerID, 0)
+	lctx, spent, may := s.metaLookup(ctx)
+	if !may {
+		return nil, false // allowance spent; see podMeta
+	}
+	defer spent()
+	md, err := s.metaSource().Container(lctx, containerID, 0)
 	if err != nil {
-		if ctx.Err() != nil {
+		if lctx.Err() != nil {
 			return nil, false // do not negative-cache cancellations
 		}
 		answered := metaclient.IsNotFound(err)

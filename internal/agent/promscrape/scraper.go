@@ -157,6 +157,11 @@ type Scraper struct {
 	// with the metadata service's scrape-auth throttle — the two were written
 	// separately and disagreed on exactly that policy.
 	warned *logdedupe.Table
+	// metaBudgetWarn throttles the exhausted-metadata-allowance warning
+	// (metabudget.go). Keyless and re-arming, unlike warned: the condition is
+	// an OUTAGE rather than a configuration mistake, so it is worth saying
+	// again the next time it happens.
+	metaBudgetWarn logdedupe.Throttle
 
 	// insecureHTTP serves monitor endpoints with tlsConfig.insecureSkipVerify.
 	insecureHTTP *http.Client
@@ -783,8 +788,10 @@ func targetInstance(rawURL string) string {
 
 // resolveContext resolves a described object's pod/container through the metadata
 // service — an exact container incarnation by container id, else the pod by
-// namespace+name (cross-checked against uid) with a named container matched
-// within it; a container-name miss stamps k8s.container.name on res. It returns
+// namespace+name (accepted only when podAnswersFor says the object the API
+// server holds is the one the kubelet described under uid) with a named
+// container matched within it; a container-name miss stamps
+// k8s.container.name on res. It returns
 // the built attrs.Context (Node NOT set — the caller adds it) and whether the
 // row's IDENTITY resolved; on false the caller writes its own identity fallback.
 // The two questions are not the same one: a row naming a container id the store
@@ -823,7 +830,7 @@ func (s *Scraper) resolveContext(ctx context.Context, containerID, namespace, po
 		// this container id is unknown, and whether the pod lookup beside it
 		// also reached the service says nothing about that verdict.
 		if pod != "" {
-			if meta, _ := s.podMeta(ctx, namespace, pod); meta != nil && (uid == "" || meta.UID == uid) {
+			if meta, _ := s.podMeta(ctx, namespace, pod); meta != nil && podAnswersFor(meta, uid) {
 				actx.Pod = meta
 			}
 		}
@@ -831,7 +838,7 @@ func (s *Scraper) resolveContext(ctx context.Context, containerID, namespace, po
 	}
 	if pod != "" {
 		meta, answered := s.podMeta(ctx, namespace, pod)
-		if meta != nil && (uid == "" || meta.UID == uid) {
+		if meta != nil && podAnswersFor(meta, uid) {
 			actx.Pod = meta
 			if container != "" {
 				for i := range meta.Containers {
@@ -855,7 +862,11 @@ func (s *Scraper) resolveContext(ctx context.Context, containerID, namespace, po
 }
 
 func (s *Scraper) scrapeTarget(ctx context.Context, t kubemeta.ScrapeTarget, timeout time.Duration) (int, error) {
-	ctx, cancel := context.WithTimeout(ctx, timeout)
+	// The allowance covers a SPLITTER's per-object enrichment, which resolves
+	// through the same podMeta/containerMeta seam the kubelet batchers use and
+	// on the same scrape context — a KSM target naming thousands of objects is
+	// the shape with the most lookups per scrape in the whole agent.
+	ctx, cancel := s.scrapeContext(ctx, timeout, pipelineTargets)
 	defer cancel()
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, t.URL, nil)

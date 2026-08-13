@@ -285,6 +285,17 @@ var (
 			"— a pod that ended between the kubelet building the summary and the lookup landing — while a "+
 			"sustained or fleet-wide rate means the metadata service is not answering, and the ephemeral-storage "+
 			"series it exists for are arriving unattributable.", "level")
+	ScrapeMetaBudgetExhausted = Registry.CounterVec("kubescrape_scrape_metadata_budget_exhausted_total",
+		"Scrapes that spent their whole per-scrape metadata allowance, by pipeline. The allowance is half the "+
+			"scrape timeout; past it the remaining objects are NOT looked up at all, so they export under the "+
+			"identity the payload itself carried and lose only the join. It exists because a metadata service "+
+			"that HANGS — a partition or a dropping firewall, as opposed to one that refuses, which fails "+
+			"instantly and is harmless — would otherwise consume the entire scrape budget and take the kubelet "+
+			"pipelines down with it, discarding stats already parsed. So this counter is the difference between "+
+			"degraded attribution and no data: a sustained rate means the metadata service is slow or "+
+			"unreachable and this node's cadvisor and summary series are arriving unjoinable. It is the only "+
+			"signal for the objects that were never asked about — kubescrape_metadata_requests_total cannot "+
+			"move for a request that is never issued.", "pipeline")
 	ScrapeMalformed = Registry.CounterVec("kubescrape_scrape_malformed_total",
 		"Exposition samples dropped as malformed by pipeline (unparseable lines, histogram buckets without le, summary rows without quantile).", "pipeline")
 	ScrapeExemplarsMalformed = Registry.CounterVec("kubescrape_scrape_exemplars_malformed_total",

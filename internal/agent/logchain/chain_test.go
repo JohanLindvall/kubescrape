@@ -3,13 +3,16 @@ package logchain
 import (
 	"context"
 	"testing"
+	"time"
 
+	"github.com/JohanLindvall/enrich"
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/plog"
 	"go.opentelemetry.io/collector/pdata/pmetric"
 
 	"github.com/JohanLindvall/kubescrape/internal/logline"
 	"github.com/JohanLindvall/kubescrape/internal/metrics"
+	"github.com/JohanLindvall/kubescrape/internal/obs"
 	"github.com/JohanLindvall/kubescrape/pkg/logattrs"
 )
 
@@ -23,6 +26,9 @@ type testProducer struct {
 	// producers put there (journald's PRIORITY, the events reader's Type).
 	severity string
 	body     string
+	// ts stands in for the producer's own timestamp (the CRI/journal ingest
+	// time), which is what a zone-less timestamp parsed off the line loses to.
+	ts pcommon.Timestamp
 	// stamped counts Stamp calls, to pin that a record is stamped exactly once.
 	stamped int
 }
@@ -44,6 +50,9 @@ func (p *testProducer) Stamp(lr plog.LogRecord) {
 	lr.Body().SetStr(p.body)
 	if p.severity != "" {
 		lr.SetSeverityText(p.severity)
+	}
+	if p.ts != 0 {
+		lr.SetTimestamp(p.ts)
 	}
 }
 
@@ -233,6 +242,69 @@ func TestPruneRemovesEmptyGroups(t *testing.T) {
 	}
 	if got := ld.ResourceLogs().At(0).ScopeLogs().At(0).LogRecords().At(0).Body().Str(); got != "x" {
 		t.Errorf("the surviving record is %q", got)
+	}
+}
+
+// The enrichment counters are per-RECORD outcomes, so Input.Observed has to
+// reach them too — they live a package away in logenrich, below the gate that
+// already covers LogMetrics.Add and LogRulesDropped, and the chain is the only
+// place that knows a pass is a re-read.
+//
+// It matters because sum(kubescrape_log_enriched_total) is read as
+// kubescrape_log_entries_total decomposed by parse format: the two agree to the
+// record whenever nothing is failing, and a rewind counts passes in the
+// numerator against deliveries in the denominator. Measured on a live cluster
+// whose collector was scaled to zero for three minutes: 32,245 enrichments and
+// 31,324 timestamp refusals for 277 delivered records.
+//
+// What must NOT change is the record: suppression is counting-only, so the
+// re-read is enriched exactly as the first pass was.
+func TestEnrichmentCountersSkipAnObservedRecord(t *testing.T) {
+	c := NewChain[string](Config{Enrich: true}, false)
+	p := newTestProducer()
+	// A zone-less timestamp on the line, and a producer timestamp for it to
+	// lose to — which is the refusal LogEnrichTimeRejected counts.
+	ingest := time.Date(2026, 1, 2, 8, 4, 5, 0, time.UTC)
+	p.body = "2026-01-02 03:04:05 INFO handled request"
+	p.ts = pcommon.NewTimestampFromTime(ingest)
+
+	enriched := obs.LogEnriched.WithLabelValues(enrich.FormatPattern).Value()
+	rejected := obs.LogEnrichTimeRejected.Value()
+
+	in := Input[string]{Body: p.body, Resource: emptyRes(), BoundKey: "k"}
+	if !c.Emit(p, in) {
+		t.Fatal("Emit dropped the first pass's record")
+	}
+	// The same bytes again, as a rewind hands them back.
+	in.Observed = true
+	if !c.Emit(p, in) {
+		t.Fatal("Emit dropped the re-read record")
+	}
+
+	if got := obs.LogEnriched.WithLabelValues(enrich.FormatPattern).Value() - enriched; got != 1 {
+		t.Errorf("kubescrape_log_enriched_total{format=pattern} moved by %v for one record read twice, want 1: "+
+			"a re-read multiplies the format decomposition of kubescrape_log_entries_total by the number of "+
+			"attempts an outage spans", got)
+	}
+	if got := obs.LogEnrichTimeRejected.Value() - rejected; got != 1 {
+		t.Errorf("kubescrape_log_enrich_time_rejected_total moved by %v for one record read twice, want 1", got)
+	}
+
+	// Both records exist and both were enriched: the producer's timestamp
+	// survived the zone-less parse, and the line's level reached the severity.
+	if p.records() != 2 {
+		t.Fatalf("payload carries %d records, want 2", p.records())
+	}
+	recs := p.sl.LogRecords()
+	for i := 0; i < recs.Len(); i++ {
+		lr := recs.At(i)
+		if got := lr.Timestamp().AsTime(); !got.Equal(ingest) {
+			t.Errorf("record %d: timestamp = %v, want the producer's %v", i, got, ingest)
+		}
+		if lr.SeverityNumber() != plog.SeverityNumberInfo {
+			t.Errorf("record %d: severity = %v, want info — suppressing the COUNT must not suppress the enrichment",
+				i, lr.SeverityNumber())
+		}
 	}
 }
 

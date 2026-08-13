@@ -1143,10 +1143,11 @@ func TestSummaryStaticPodJoinsTheCadvisorRow(t *testing.T) {
 	cadvisorExp := &captureExporter{}
 	cs := newSummaryScraper(t, "http://unused", &mirrorMetaSource{pod: apiserverMirrorPod}, cadvisorExp)
 	cb := newCadvisorBatcher(cs, summaryScrape, context.Background())
-	// A static pod's cgroup carries that same kubelet-minted UID, which is not
-	// the canonical 8-4-4-4-12 form, so cgroupid parses no pod uid out of the
-	// path at all: this row resolves through its container id, which is exactly
-	// why the cadvisor half of the join works while the summary's does not.
+	// A static pod's cgroup carries that same kubelet-minted UID, in the undashed
+	// form cgroupid reads as a pod uid alongside the canonical one. This row
+	// resolves through its container id regardless — an id is an id — which is
+	// why the cadvisor half of the join has always worked while the summary's
+	// did not.
 	row := fmt.Sprintf("# TYPE container_fs_usage_bytes gauge\n"+
 		"container_fs_usage_bytes{namespace=\"kube-system\",pod=\"kube-apiserver-node1\",container=\"kube-apiserver\",id=%q,image=%q} 229376\n",
 		staticPodCgroup, apiserverImage)

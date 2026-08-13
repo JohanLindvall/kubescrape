@@ -857,9 +857,31 @@ are counted in `kubescrape_log_rules_dropped_total`. `sample` is only valid on
 keep rules; a matching line beyond the sampled fraction is dropped.
 
 The same chain applies to **journald** entries (as does `logMetrics`), with the
-same ordering: metrics observe every entry, the rules run after enrichment so
-`__severity__` sees the enriched severity, and a dropped entry still advances
-the journal cursor.
+same ordering: metrics observe every entry, the rules run after enrichment, and
+a dropped entry still advances the journal cursor.
+
+> **Known limitation — `__severity__` on journald entries spans two
+> vocabularies.** journald stamps the *syslog* word (priority 4 is `warning`,
+> 3 `err`, 2 `crit`), while enrichment overwrites the severity text with its own
+> word (`warn`, `error`, `fatal`) whenever it parses a level out of the **body**.
+> So one priority reaches the rules under either spelling depending on whether
+> that particular line happened to be parseable, and `drop __severity__=warn`
+> applies to only the parseable half of priority 4. Verified on a live journal:
+> with `__severity__=warning` a plain priority-4 line is dropped while one whose
+> body says `level=warn` is delivered, and with `__severity__=warn` it is the
+> other way round.
+>
+> **Spell around it with a regex** — `__severity__=~^(warn|warning)$` — which
+> selects both halves. The exported `severityNumber` is unaffected and is the
+> reliable thing to alert on (both spellings export 13).
+>
+> This is not fixed by canonicalising the key onto one vocabulary, and that is
+> a deliberate decision rather than an oversight: canonicalising un-matches
+> every other spelling silently, and the **negated** form inverts —
+> `{action: drop, match: ["__severity__!=err"]}`, meaning "ship only priority-3
+> entries", would stop matching on any record and drop the node's whole journal.
+> Fixing it honestly means canonicalising *both* sides of the comparison, which
+> the exact-selector DSL does not do and a regex selector could not do at all.
 
 ### Per-workload log config (pod annotation)
 
@@ -1716,6 +1738,30 @@ all honored automatically, no agent flags involved.
 | `-kubelet-insecure-tls` | `true` | kubelet serving certificates are typically self-signed |
 | `-cadvisor-rollups` | `true` | `false` drops the hierarchy aggregates (`/`, `/kubepods`, QoS/system slices) and pod-level rows of container-scoped families, keeping container-level series, `container_network_*` and `machine_*` |
 
+**A metadata outage costs attribution, not data.** Every enriched kubelet
+pipeline resolves the objects it describes through the metadata service, and
+those lookups are bounded by a **per-scrape allowance of half the scrape
+timeout**. Past it the remaining objects are not looked up at all: they export
+under the identity the payload itself carried and lose only the join, and the
+scrape ships.
+
+The allowance exists because the two outage shapes are not alike. A metadata
+service that **refuses** connections is harmless — lookups fail instantly, the
+scrape actually gets *faster*, and attribution is all that is lost. One that
+**hangs** — a partition, a dropping firewall, a blackholed address — used to
+consume the entire scrape budget and take *both* kubelet pipelines down with it,
+discarding stats already parsed: measured on a live cluster, 23 consecutive
+cycles of `context deadline exceeded` on cadvisor and summary together, with
+~3300 summary samples and ~6100 cadvisor samples parsed and then thrown away,
+while the `/metrics` pipeline beside them — the one that resolves nothing — kept
+succeeding. The allowance turns the hanging case into the refused case.
+
+When it binds, `kubescrape_scrape_metadata_budget_exhausted_total{pipeline}`
+counts the scrape (once per scrape, not per shed object) and a warning naming
+the allowance and the timeout is logged at most once a minute. A sustained rate
+means the metadata service is slow or unreachable and this node's series are
+arriving unjoinable.
+
 cadvisor series are split into one OTLP resource per pod/container, keyed by
 the cgroup path in the `id` label: the container ID resolves the exact
 container incarnation through the metadata service; pod-scoped series (e.g.
@@ -1753,16 +1799,38 @@ about filesystems — it carries `container_fs_usage_bytes`,
 
 * the eighteen `k8s.node.{filesystem,imagefs,containerfs}.*` restate cadvisor's
   root-cgroup rows, adding the nodefs/imagefs/containerfs **role** the eviction
-  thresholds are written against, which a device name cannot give you;
-* `k8s.pod.process.count` is the kubelet's pre-summed version of
-  `container_processes` — and it survives `-cadvisor-rollups=false`, which
-  deletes the pod-cgroup row that otherwise carries the pids signal;
-* `k8s.container.ephemeral_storage.usage{fs.type="rootfs"}` is the same ground
-  as `container_fs_usage_bytes`, separately computed by the kubelet and per
-  rootfs rather than per device, **so the two can legitimately disagree**;
+  thresholds are written against, which a device name cannot give you. Note the
+  two sides arrive under **different `job` and `instance`** — the summary node
+  resource is `service.name=kubelet`, `service.instance.id=summary-<node>`, the
+  cadvisor rollup resource `cadvisor-<node>` — so the overlap cannot be
+  deduplicated, or even compared, in a single backend query without a join on
+  `k8s.node.name`;
+* `k8s.pod.process.count` is **not** a pre-summed `container_processes`, though
+  it is tempting to read it as one. Measured on a live node, three different
+  numbers exist for one pod: the pod-cgroup row reads 0, the sandbox row 1, and
+  the app container its own count. This is the kubelet's own figure for the pod,
+  and it survives `-cadvisor-rollups=false`, which deletes the pod-cgroup row;
+* `k8s.container.ephemeral_storage.usage{fs.type="rootfs"}` **has no cadvisor
+  counterpart on a modern node**, whatever the family names suggest. Measured on
+  v1.33.1 + containerd, `container_fs_usage_bytes` is emitted only for `id="/"`,
+  keyed by device, with `container=""` and `pod=""` — there are no per-container
+  filesystem rows for it to disagree with. Treat the per-container figure as
+  this endpoint's alone;
 * on a PVC-backed volume the six `k8s.volume.*` restate `kubelet_volume_stats_*`
   from the `-node-metrics` scrape, adding the pod attribution those lack (they
-  carry namespace and PVC only).
+  carry namespace and PVC only). Not reproducible on kind, whose default
+  StorageClass yields hostPath PVs that the kubelet measures on *neither* side.
+
+**A caveat on `k8s.volume.available` and `k8s.volume.capacity`.** For a volume
+that lives on the node filesystem — `emptyDir`, `configMap`, `secret`, the
+projected token — the kubelet reports the **node filesystem's** free and total
+bytes, repeated identically for every such volume, because that genuinely is
+the space the volume can grow into. Only `usage` and the inode triple describe
+the volume itself. So a "volume percent full" alert built from
+`usage / capacity` measures the node's disk, not the volume, and reads near-zero
+for every one of them. Alert on `k8s.volume.usage` directly, or restrict the
+ratio to PVC-backed volumes (those carrying
+`k8s.persistentvolumeclaim.name`).
 
 CPU, memory, network and swap are left to the cadvisor scrape entirely.
 
@@ -1800,10 +1868,15 @@ is a drop rule under `metrics.pipelines.summary`, which sees the data-point
 attributes (`k8s.volume.name`, `fs.type`) as labels; the flag itself is all or
 nothing.
 
-A stat carries **its own timestamp**, not the scrape's: the kubelet refreshes
-volume statistics on its own jittered ~1-minute cycle, so at a 15s scrape
-interval three scrapes in four carry a figure that is genuinely up to a minute
-old, and stamping scrape time would fabricate freshness.
+A stat carries **its own timestamp**, not the scrape's, and volume statistics
+are **older than the "roughly a minute" the kubelet's refresh period suggests**.
+Measured over six consecutive scrapes on a 12-pod node (n=72 volume points, age
+taken against the fetch instant): min 6s, median 56s, p90 107s, **max 167s**,
+with 42% older than 60 seconds. The kubelet refreshes volume stats on its own
+jittered cycle and the jitter compounds, so size a staleness alert against the
+p90, not the period. Stamping scrape time instead would fabricate freshness; an
+unrefreshed stat re-sends an identical (series, timestamp, value) triple, which
+Prometheus accepts as idempotent.
 
 
 ## Agent: high-frequency cgroup sampling
@@ -2300,7 +2373,7 @@ The `metrics` section (for scraped series, distinct from `logMetrics`) has two
 subsections.
 
 **`pipelines`** — ordered keep/drop rules per pipeline (`all` is prepended
-to every pipeline; then `targets`, `cadvisor`, `node`). First matching rule
+to every pipeline; then `targets`, `cadvisor`, `node`, `summary`). First matching rule
 decides; no match keeps the series. Regexes are anchored; `labels` matchers
 must all match (a missing label matches `""`). Filtering happens on the
 scraped series names (`foo_bucket`, …) before histogram grouping.

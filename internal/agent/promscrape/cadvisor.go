@@ -450,7 +450,7 @@ func (s *Scraper) kubeletTimeout() time.Duration {
 // one OTLP resource per pod and container, with full metadata resolved
 // through the metadata service.
 func (s *Scraper) scrapeCadvisor(ctx context.Context) (int, error) {
-	ctx, cancel := context.WithTimeout(ctx, s.kubeletTimeout())
+	ctx, cancel := s.scrapeContext(ctx, s.kubeletTimeout(), pipelineCadvisor)
 	defer cancel()
 
 	url := strings.TrimRight(s.cfg.Kubelet.Endpoint, "/") + "/metrics/cadvisor"
@@ -466,6 +466,9 @@ func (s *Scraper) scrapeCadvisor(ctx context.Context) (int, error) {
 
 // scrapeNodeMetrics scrapes <kubelet>/metrics under a node-level resource.
 func (s *Scraper) scrapeNodeMetrics(ctx context.Context) (int, error) {
+	// No metadata allowance is carved out here and none is needed: this is the
+	// one kubelet pipeline that resolves nothing, which is exactly why it kept
+	// succeeding throughout the outage metabudget.go quotes.
 	ctx, cancel := context.WithTimeout(ctx, s.kubeletTimeout())
 	defer cancel()
 

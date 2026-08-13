@@ -1,3 +1,5 @@
+[![CI](https://github.com/JohanLindvall/kubescrape/actions/workflows/ci.yml/badge.svg)](https://github.com/JohanLindvall/kubescrape/actions/workflows/ci.yml)
+
 # kubescrape
 
 Two cooperating services:

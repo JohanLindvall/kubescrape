@@ -161,6 +161,77 @@ agent:
   cadvisor: true
   cadvisorRollups: true
   nodeMetrics: true
+  # The kubelet's THIRD endpoint, /stats/summary — JSON rather than Prometheus
+  # exposition.
+  #
+  # WHAT ONLY THIS ENDPOINT HAS, which is the reason to turn it on:
+  #   * per-pod ephemeral-storage USAGE — the pod's containers' writable layers
+  #     plus their logs plus their on-disk emptyDirs, i.e. the quantity the
+  #     kubelet's eviction manager and a pod's limits["ephemeral-storage"] are
+  #     measured against. Neither cadvisor nor kube-state-metrics reports it
+  #     (kube-state-metrics has the LIMIT, never the usage);
+  #   * per-container LOG bytes — container logs live on nodefs, outside the
+  #     container's cgroup, so cadvisor cannot see them;
+  #   * every volume the kubelet can measure — emptyDir, configMap, secret and
+  #     projected included — attributed to the POD that mounts it;
+  #   * inodes-USED at every level: cadvisor publishes inodes free and total and
+  #     has no used metric anywhere.
+  #
+  # WHAT IT RESTATES, said here because /metrics/cadvisor is NOT silent about
+  # filesystems — it carries container_fs_usage_bytes, container_fs_limit_bytes,
+  # container_fs_inodes_free and container_fs_inodes_total, keyed by DEVICE:
+  #   * the eighteen k8s.node.{filesystem,imagefs,containerfs}.* are cadvisor's
+  #     root-cgroup (id="/") rows again, available and inodes.used as a
+  #     subtraction. What is new is the ROLE — which device is nodefs, which
+  #     imagefs, which containerfs — and the eviction thresholds are written
+  #     per role, not per device. The cadvisor rows also disappear under
+  #     agent.cadvisorRollups=false;
+  #   * k8s.pod.process.count is the kubelet's sum of its containers' cadvisor
+  #     process counts — the numbers container_processes already carries,
+  #     pre-summed, and the per-container rows survive cadvisorRollups=false;
+  #   * k8s.container.ephemeral_storage.usage{fs.type=rootfs} covers the same
+  #     ground as container_fs_usage_bytes, computed separately by the kubelet
+  #     and per rootfs rather than per device, so the two can disagree;
+  #   * on a PVC-BACKED volume the six k8s.volume.* restate the six
+  #     kubelet_volume_stats_* that agent.nodeMetrics already collects from
+  #     /metrics — those carry namespace and persistentvolumeclaim labels and no
+  #     pod, which is the attribution this adds.
+  # CPU, memory, network and swap are deliberately not collected here at all —
+  # /metrics/cadvisor already reports them, on the same resources.
+  #
+  # OFF by default, and the reason is RBAC rather than cost: the kubelet
+  # authorizes /stats/* against the nodes/stats subresource, not nodes/metrics.
+  # The ClusterRole this chart renders grants both, so `helm upgrade` is safe in
+  # either order — but the binary reaches nodes by other routes too (a
+  # hand-managed ClusterRole, a GitOps setup that applies RBAC separately), and
+  # on by default would turn those into a 403 on every node every scrape
+  # interval. The agent surfaces such a 403 once, naming the rule to add.
+  #
+  # COST, measured on a synthetic 110-pod node with two containers and two
+  # measured volumes per pod (cmd/kubescrape-agent's summary cost test, which
+  # fails if these numbers drift): 2550 data points per scrape — 1320 volume,
+  # 880 container, 330 pod, 20 node. Volumes are just over half of it, at six
+  # points per measured volume, so the kube-api-access-* projected token a pod
+  # mounts by default is 660 of them on its own. The lever is a drop rule under
+  # the config's `metrics.pipelines.summary`, which sees the data-point
+  # attributes (k8s.volume.name, fs.type) as labels — not this toggle, which is
+  # all or nothing. Dropping the token volumes and the one series cadvisor
+  # already carries takes the same node from 2550 points to 1780, in
+  # agent.config:
+  #
+  #   metrics:
+  #     pipelines:
+  #       summary:
+  #         # 660 points: six per pod to report a few KiB of tmpfs.
+  #         - action: drop
+  #           metrics: 'k8s\.volume\..+'
+  #           labels:
+  #             k8s.volume.name: 'kube-api-access-.*'
+  #         # 110 points: the cadvisor scrape already carries the
+  #         # per-container counts the kubelet sums to get this.
+  #         - action: drop
+  #           metrics: 'k8s\.pod\.process\.count'
+  kubeletSummary: false
 
   # Read the systemd journal natively (libsystemd, via cgo). The default image
   # ships libsystemd.
@@ -294,7 +365,11 @@ agent:
     # Also applied to the trace tier's application ports.
     grpcMaxRecvBytes: 0
 
-  # Kubelet scraping; empty disables cadvisor and node metrics.
+  # Kubelet scraping; empty disables cadvisor, node metrics AND the
+  # /stats/summary scrape — all three toggles above are a no-op without it,
+  # which is a pipeline that is never scheduled rather than one that fails, so
+  # no counter moves. The agent warns at startup naming whichever of the three
+  # was asked for; nothing else would say so.
   kubeletEndpoint: "https://$(NODE_IP):10250"
   kubeletInsecureTLS: true
 

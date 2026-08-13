@@ -28,13 +28,16 @@ func tailOnly() *tailbuffer.Config {
 
 // warnText joins the warnings for cfg with the process in the shipped
 // manifests' shape for the FLAGS these tests do not exercise: every manifest
-// renders -positions-file, and its own warning (persistence off) would
+// renders -positions-file and -kubelet-endpoint, and each has a warning of its
+// own (persistence off; kubelet scrapes that are never scheduled) that would
 // otherwise land in every "this composition must be silent" assertion here.
-// The positions warning has its own test — TestPositionsWarningCoversJournald.
+// Both have their own tests — TestPositionsWarningCoversJournald and
+// TestKubeletScrapeWithoutEndpointWarns.
 func warnText(cfg agentConfig) string {
-	old := *positionsFile
+	pos, endpoint := *positionsFile, *kubeletEndpoint
 	*positionsFile = "/var/lib/kubescrape/positions.json"
-	defer func() { *positionsFile = old }()
+	*kubeletEndpoint = "https://10.0.0.1:10250"
+	defer func() { *positionsFile, *kubeletEndpoint = pos, endpoint }()
 	return strings.Join(configWarnings(cfg), "\n")
 }
 

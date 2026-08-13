@@ -561,11 +561,14 @@ func (s *Scraper) cycle(ctx context.Context) {
 
 	if s.cfg.Kubelet.Endpoint != "" {
 		base := strings.TrimRight(s.cfg.Kubelet.Endpoint, "/")
-		if s.cfg.Kubelet.Cadvisor && dueNow(kubeletDueKeys[0], s.cfg.Interval) {
+		if s.cfg.Kubelet.Cadvisor && dueNow(dueKeyCadvisor, s.cfg.Interval) {
 			spawn(pipelineCadvisor, base+"/metrics/cadvisor", nil, s.scrapeCadvisor)
 		}
-		if s.cfg.Kubelet.NodeMetrics && dueNow(kubeletDueKeys[1], s.cfg.Interval) {
+		if s.cfg.Kubelet.NodeMetrics && dueNow(dueKeyNode, s.cfg.Interval) {
 			spawn(pipelineNode, base+"/metrics", nil, s.scrapeNodeMetrics)
+		}
+		if s.cfg.Kubelet.Summary && dueNow(dueKeySummary, s.cfg.Interval) {
+			spawn(pipelineSummary, base+summaryPath, nil, s.scrapeSummary)
 		}
 	}
 
@@ -658,9 +661,19 @@ func (s *Scraper) setKubeletSchedule(due map[string]time.Time) {
 	}
 }
 
-// kubeletDueKeys are the schedule keys of the two kubelet scrapes. They are
-// NUL-prefixed so they cannot collide with a target URL.
-var kubeletDueKeys = []string{"\x00cadvisor", "\x00node"}
+// The schedule keys of the three kubelet scrapes, NUL-prefixed so they cannot
+// collide with a target URL. cycle() names them individually and
+// kubeletDueKeys is what setKubeletSchedule commits: an index into the slice
+// would let a fourth scrape (or a removed one) shift the entries under a call
+// site the compiler cannot check — which is a panic on a path that runs once
+// per cycle on every node.
+const (
+	dueKeyCadvisor = "\x00cadvisor"
+	dueKeyNode     = "\x00node"
+	dueKeySummary  = "\x00summary"
+)
+
+var kubeletDueKeys = []string{dueKeyCadvisor, dueKeyNode, dueKeySummary}
 
 // scheduleKey identifies one target's schedule slot. The URL alone does NOT:
 // the metadata service dedupes same-URL targets only WITHIN a pod, so two
@@ -962,6 +975,7 @@ const (
 	pipelineTargets  = "targets"
 	pipelineCadvisor = "cadvisor"
 	pipelineNode     = "node"
+	pipelineSummary  = "summary"
 )
 
 // attrsFor picks the attribute builder for a pipeline; nil is valid (built-in
@@ -975,6 +989,15 @@ func (s *Scraper) attrsFor(pipeline string) *attrs.Builder {
 		return s.cfg.Attrs.Cadvisor
 	case pipelineNode:
 		return s.cfg.Attrs.Node
+	case pipelineSummary:
+		// Only the /stats/summary NODE resource and this pipeline's health
+		// gauges: the pod, container and volume resources go through
+		// fillIdentityResource, which is the cadvisor builder's, so they stay
+		// byte-identical to the cadvisor series they join. Without the case,
+		// exportHealth's kubelet branch would fall through to the TARGETS builder
+		// and emit up{job="kubelet",instance="<node>"} a second time with a
+		// different value — one series, two conflicting points, one payload.
+		return s.cfg.Attrs.Summary
 	default:
 		return s.cfg.Attrs.Targets
 	}

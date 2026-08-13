@@ -81,9 +81,17 @@ metadata:
     app.kubernetes.io/instance: kubescrape
     helm.sh/chart: kubescrape-0.1.0
 rules:
-  # Solely for authenticating to the kubelet (cadvisor / node metrics).
+  # Solely for authenticating to the kubelet. The kubelet picks the subresource
+  # from the request PATH: /metrics and /metrics/cadvisor authorize against
+  # nodes/metrics, /stats/* against nodes/stats, so agent.kubeletSummary needs
+  # the second one. Both are granted UNCONDITIONALLY rather than behind the
+  # value: enabling the scrape through agent.extraArgs — which people do —
+  # would otherwise 403 on every node, every scrape interval, with the
+  # ClusterRole looking correct. The grant is read-only node telemetry either
+  # way; nodes/stats names the same pods nodes/metrics does, plus their volume
+  # and PVC names.
   - apiGroups: [""]
-    resources: ["nodes/metrics"]
+    resources: ["nodes/metrics", "nodes/stats"]
     verbs: ["get"]
 ---
 # Source: kubescrape/templates/service.yaml
@@ -232,6 +240,7 @@ spec:
             - -cadvisor=true
             - -cadvisor-rollups=true
             - -node-metrics=true
+            - -kubelet-summary=false
             - -kubelet-endpoint=https://$(NODE_IP):10250
             - -kubelet-insecure-tls=true
             - -positions-file=/var/lib/kubescrape-agent/positions.json

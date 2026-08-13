@@ -5,6 +5,7 @@ import (
 	"math/bits"
 	"regexp"
 	"sort"
+	"strings"
 )
 
 // FilterRule is one keep/drop decision.
@@ -19,7 +20,7 @@ type FilterRule struct {
 
 // filterPipelineNames are the sections accepted under pipelines ("all" plus
 // the scrape pipelines).
-var filterPipelineNames = []string{"all", "targets", "cadvisor", "node"}
+var filterPipelineNames = []string{"all", "targets", "cadvisor", "node", "summary"}
 
 // MetricFilters holds the compiled per-pipeline series filters; nil (or a
 // nil field) keeps everything.
@@ -27,6 +28,11 @@ type MetricFilters struct {
 	Targets  *MetricFilter
 	Cadvisor *MetricFilter
 	Node     *MetricFilter
+	// Summary filters the kubelet /stats/summary pipeline. Its rules see the
+	// OTLP metric name and the DATA POINT attributes as labels, so a rule can
+	// select on k8s.volume.name or fs.type — which is this pipeline's
+	// cardinality lever, most of its series being one pod's volumes.
+	Summary *MetricFilter
 }
 
 // MetricsConfig is the `metrics` section of the agent config: per-pipeline
@@ -73,7 +79,10 @@ func NewMetricFilters(pipelines map[string][]FilterRule) (*MetricFilters, error)
 			}
 		}
 		if !ok {
-			return nil, fmt.Errorf("unknown pipeline %q (want one of all, targets, cadvisor, node)", name)
+			// Derived from the list rather than spelled out beside it: the two had
+			// to be edited together, which is exactly the pairing a new pipeline
+			// forgets.
+			return nil, fmt.Errorf("unknown pipeline %q (want one of %s)", name, strings.Join(filterPipelineNames, ", "))
 		}
 	}
 	compile := func(pipeline string) (*MetricFilter, error) {
@@ -91,7 +100,10 @@ func NewMetricFilters(pipelines map[string][]FilterRule) (*MetricFilters, error)
 	if out.Node, err = compile("node"); err != nil {
 		return nil, err
 	}
-	if out.Targets == nil && out.Cadvisor == nil && out.Node == nil {
+	if out.Summary, err = compile("summary"); err != nil {
+		return nil, err
+	}
+	if out.Targets == nil && out.Cadvisor == nil && out.Node == nil && out.Summary == nil {
 		return nil, nil
 	}
 	return &out, nil
@@ -107,6 +119,8 @@ func (f *MetricFilters) filterFor(pipeline string) *MetricFilter {
 		return f.Cadvisor
 	case pipelineNode:
 		return f.Node
+	case pipelineSummary:
+		return f.Summary
 	default:
 		return f.Targets
 	}

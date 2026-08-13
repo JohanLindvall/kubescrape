@@ -6,7 +6,9 @@
 
     * every agent would need cluster-wide `events` read plus lease/configmap
       write, putting those credentials on every node in the cluster, where the
-      DaemonSet today holds only `nodes/metrics: get`;
+      DaemonSet today holds nothing but the two kubelet subresources
+      (`nodes/metrics` and `nodes/stats`, get, which authorize a call to the
+      kubelet) and makes no API-server request at all;
     * each non-leader polls the election Lease once per RetryPeriod, so the
       election alone would cost ~N/2 API reads per second — the fan-out this
       project exists to avoid.

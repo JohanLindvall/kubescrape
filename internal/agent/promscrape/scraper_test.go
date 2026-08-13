@@ -566,10 +566,14 @@ func TestScrapeStatusSnapshot(t *testing.T) {
 
 // The kubelet due times must survive a cycle whose target list could not be
 // fetched. They are not derived from that list — they ride in the same map for
-// convenience — and discarding them left both kubelet scrapes permanently past
+// convenience — and discarding them left every kubelet scrape permanently past
 // due while targetIntervals stayed frozen at whatever fine cadence a monitor
 // had requested. A metadata-service rollout then re-clocked /metrics/cadvisor
 // and /metrics to that cadence on every node in the cluster.
+//
+// All THREE kubelet scrapes are enabled here, /stats/summary included: it is
+// the most expensive of them on a dense node, and it is a per-pipeline flag
+// away from being the only one an agent runs.
 func TestKubeletScheduleSurvivesTargetFetchFailure(t *testing.T) {
 	kubelet := serveBody(t, "# TYPE up gauge\nup 1\n")
 	s := New(Config{
@@ -578,7 +582,7 @@ func TestKubeletScheduleSurvivesTargetFetchFailure(t *testing.T) {
 		Exporter:  &captureExporter{},
 		StartTime: time.Now(),
 		Kubelet: KubeletConfig{
-			Endpoint: kubelet.URL, Cadvisor: true, NodeMetrics: true,
+			Endpoint: kubelet.URL, Cadvisor: true, NodeMetrics: true, Summary: true,
 			Meta: &fakeMetaSource{},
 		},
 	})

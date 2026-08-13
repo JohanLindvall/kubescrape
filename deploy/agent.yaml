@@ -2,7 +2,8 @@
 # Prometheus targets (including the kubelet's cadvisor endpoint), exporting
 # OTLP to an OpenTelemetry collector. Pod metadata comes from the kubescrape
 # metadata service; the ServiceAccount exists solely to authenticate to the
-# kubelet for cadvisor (nodes/metrics).
+# kubelet — cadvisor and node metrics via nodes/metrics, /stats/summary via
+# nodes/stats.
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -14,8 +15,16 @@ kind: ClusterRole
 metadata:
   name: kubescrape-agent
 rules:
+  # The kubelet picks the subresource from the request PATH: /metrics and
+  # /metrics/cadvisor authorize against nodes/metrics, /stats/* against
+  # nodes/stats. Both are granted here even though -kubelet-summary below ships
+  # commented out, so that uncommenting the flag is the whole change; withhold
+  # nodes/stats and the reward for that one-line edit is a 403 on every node,
+  # every scrape interval, under a ClusterRole that looks right. The grant is
+  # read-only node telemetry either way — nodes/stats names the same pods
+  # nodes/metrics does, plus their volume and PVC names.
   - apiGroups: [""]
-    resources: ["nodes/metrics"]
+    resources: ["nodes/metrics", "nodes/stats"]
     verbs: ["get"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
@@ -84,10 +93,57 @@ spec:
             - -scrape-interval=30s
             # Do not tail the collector's own output (feedback loop).
             - -logs-exclude-namespaces=monitoring
-            # Enables the cadvisor and node-metrics scrapes; disable
-            # individual pipelines with -logs=false, -metrics=false,
-            # -cadvisor=false or -node-metrics=false.
+            # Enables the cadvisor, node-metrics and /stats/summary scrapes;
+            # disable individual pipelines with -logs=false, -metrics=false,
+            # -cadvisor=false or -node-metrics=false. Empty here makes all
+            # three a no-op — never scheduled rather than failing, so no
+            # counter moves — which the agent warns about at startup.
             - -kubelet-endpoint=https://$(NODE_IP):10250
+            # The kubelet's THIRD endpoint, /stats/summary — JSON rather than
+            # Prometheus exposition.
+            #
+            # What only it has: per-pod ephemeral-storage USAGE (the pod's
+            # containers' writable layers plus their logs plus their on-disk
+            # emptyDirs — what the eviction manager and a pod's
+            # limits["ephemeral-storage"] are measured against, and what
+            # neither cadvisor nor kube-state-metrics reports); per-container
+            # LOG bytes, which live on nodefs outside the container's cgroup;
+            # every volume the kubelet can measure, emptyDir/configMap/secret/
+            # projected included, attributed to the POD that mounts it; and
+            # inodes-USED, which cadvisor has no metric for at any level.
+            #
+            # What it restates — /metrics/cadvisor is not silent about
+            # filesystems, it has container_fs_usage_bytes and its
+            # _limit_bytes/_inodes_free/_inodes_total siblings keyed by DEVICE:
+            # the eighteen k8s.node.{filesystem,imagefs,containerfs}.* are
+            # cadvisor's root-cgroup rows again, adding the
+            # nodefs/imagefs/containerfs ROLE the eviction thresholds are
+            # written against; k8s.pod.process.count is the kubelet's sum of
+            # its containers' cadvisor process counts, which
+            # container_processes already carries; and on a PVC-backed volume
+            # the six k8s.volume.* restate kubelet_volume_stats_* from the
+            # -node-metrics scrape, which carry no pod label. CPU, memory,
+            # network and swap are deliberately absent: cadvisor reports them
+            # on the same resources, so collecting both would be the same
+            # numbers twice under two names.
+            #
+            # Unlike -journald and -cgroup-stats below this needs no host
+            # mount, only the nodes/stats grant already in the ClusterRole
+            # above — so uncommenting the flag is the whole change. It is
+            # commented out rather than on because the grant is what an
+            # out-of-band ClusterRole is most likely to be missing, and the
+            # failure is a 403 per node per scrape interval; the agent says so
+            # once, naming the rule.
+            #
+            # Measured on a synthetic 110-pod node with two containers and two
+            # measured volumes per pod: 2550 data points per scrape — 1320
+            # volume, 880 container, 330 pod, 20 node. Volumes are just over
+            # half of it at six points each. Trim with a drop rule under the
+            # config's metrics.pipelines.summary, which sees the data-point
+            # attributes (k8s.volume.name, fs.type) as labels — the toggle here
+            # is all or nothing; charts/kubescrape/values.yaml has the worked
+            # example.
+            #- -kubelet-summary
             # The systemd journal — kubelet, containerd and the node's other
             # units, which on many distros exist NOWHERE else. Needs an image
             # built with the `journald` build tag; the default one is, while a

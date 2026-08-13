@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -37,6 +38,17 @@ type KubeletConfig struct {
 	// NodeMetrics scrapes <Endpoint>/metrics: the kubelet's own metrics,
 	// exported under a node-level resource.
 	NodeMetrics bool
+	// Summary scrapes <Endpoint>/stats/summary: the kubelet's JSON stats
+	// document, converted into the per-pod, per-container, per-volume and
+	// per-node filesystem/ephemeral-storage/process gauges cadvisor does not
+	// report (summary.go).
+	//
+	// It authorizes against a DIFFERENT subresource from the other two — the
+	// kubelet checks /stats/* against nodes/stats, not nodes/metrics — which is
+	// why the flag behind it is off by default: with the binary rolled ahead of
+	// the ClusterRole, an on-by-default scrape would 403 on every node in the
+	// fleet every interval.
+	Summary bool
 	// TokenFile supplies the bearer token (the mounted ServiceAccount token;
 	// it rotates). Empty sends no Authorization. Re-read at most once per
 	// minute through internal/bearer, with the last good value kept across a
@@ -59,12 +71,24 @@ type KubeletConfig struct {
 	Meta MetaSource
 }
 
-// chunker is a sink that also manages batch lifecycles.
-type chunker interface {
-	sink
+// batch is the chunk-lifecycle half: what a batcher has to offer for the shared
+// BatchPoints/BatchBytes bound (Scraper.chunkFull) to apply to it. It is split
+// out of chunker because the /stats/summary batcher builds its points from JSON
+// and never receives an exposition Sample — implementing sink there would mean
+// three methods that can never be called, while the bound is the half that MUST
+// be shared: it is what keeps a chunk under the collector's receive limit, and
+// summary.go's one-resource-per-object shape is exactly where an unbounded
+// batch goes past it.
+type batch interface {
 	take() pmetric.Metrics
 	count() int
 	size() int // estimated encoded size of the accumulated batch
+}
+
+// chunker is a sink that also manages batch lifecycles.
+type chunker interface {
+	sink
+	batch
 }
 
 // defaultBatchBytes bounds one exported chunk well below the 4 MiB default
@@ -115,12 +139,17 @@ func (s *Scraper) newScrapeSession(ctx context.Context, cb chunker, pipeline, wh
 	return ss
 }
 
-// full reports whether the accumulated chunk hit either batch bound
-// (BatchPoints data points or BatchBytes estimated bytes, whichever first).
-func (ss *scrapeSession) full() bool {
-	return ss.cb.count() >= ss.s.cfg.BatchPoints ||
-		(ss.s.cfg.BatchBytes > 0 && ss.cb.size() >= ss.s.cfg.BatchBytes)
+// chunkFull reports whether an accumulated chunk hit either batch bound
+// (BatchPoints data points or BatchBytes estimated bytes, whichever first). On
+// the Scraper rather than on scrapeSession because the /stats/summary scrape
+// needs the same bound without the exposition-parse machinery around it.
+func (s *Scraper) chunkFull(cb batch) bool {
+	return cb.count() >= s.cfg.BatchPoints ||
+		(s.cfg.BatchBytes > 0 && cb.size() >= s.cfg.BatchBytes)
 }
+
+// full reports whether the accumulated chunk hit either batch bound.
+func (ss *scrapeSession) full() bool { return ss.s.chunkFull(ss.cb) }
 
 // export ships the accumulated chunk; a failure latches exportFailed so
 // salvage knows re-sending is pointless.
@@ -341,14 +370,37 @@ func (s *Scraper) parseAndExportFiltered(ctx context.Context, body io.Reader, op
 	return ss.samples, nil
 }
 
-// kubeletGet fetches a kubelet URL with bearer-token authentication. The
-// caller must close the response body.
-func (s *Scraper) kubeletGet(ctx context.Context, url string) (*http.Response, error) {
+// The Accept headers the kubelet endpoints are fetched with. Two of the three
+// serve Prometheus exposition; /stats/summary serves JSON and is asked for as
+// such (the kubelet ignores Accept there, but a request that claims to want
+// exposition and parses JSON is a lie a future reader has to untangle).
+const (
+	acceptExposition = "text/plain;version=0.0.4"
+	acceptJSON       = "application/json"
+)
+
+// kubeletStatusError is a non-200 from the kubelet, carrying the code so a
+// caller can say something more useful about it than the number.
+//
+// The bare number is not diagnosable for the one status an operator will
+// actually meet: the kubelet authorizes each of its endpoints against its own
+// subresource, so a 403 on /stats/summary while /metrics/cadvisor succeeds
+// means a missing RBAC RULE, not a broken credential — and the text says so
+// where the summary scrape catches it. The message is unchanged from the
+// fmt.Errorf it replaced, so nothing reading the log line moves.
+type kubeletStatusError struct{ code int }
+
+func (e *kubeletStatusError) Error() string { return "status " + strconv.Itoa(e.code) }
+
+// kubeletGet fetches a kubelet URL with bearer-token authentication, offering
+// accept as the request's Accept header. The caller must close the response
+// body.
+func (s *Scraper) kubeletGet(ctx context.Context, url, accept string) (*http.Response, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("Accept", "text/plain;version=0.0.4")
+	req.Header.Set("Accept", accept)
 	if s.kubeletToken != nil {
 		// A read error here fails only a scrape whose credential has NEVER been
 		// readable; a transient failure mid-rotation serves the last good token
@@ -365,7 +417,7 @@ func (s *Scraper) kubeletGet(ctx context.Context, url string) (*http.Response, e
 	}
 	if resp.StatusCode != http.StatusOK {
 		drainClose(resp.Body)
-		return nil, fmt.Errorf("status %d", resp.StatusCode)
+		return nil, &kubeletStatusError{code: resp.StatusCode}
 	}
 	return resp, nil
 }
@@ -402,7 +454,7 @@ func (s *Scraper) scrapeCadvisor(ctx context.Context) (int, error) {
 	defer cancel()
 
 	url := strings.TrimRight(s.cfg.Kubelet.Endpoint, "/") + "/metrics/cadvisor"
-	resp, err := s.kubeletGet(ctx, url)
+	resp, err := s.kubeletGet(ctx, url, acceptExposition)
 	if err != nil {
 		return 0, err
 	}
@@ -418,7 +470,7 @@ func (s *Scraper) scrapeNodeMetrics(ctx context.Context) (int, error) {
 	defer cancel()
 
 	url := strings.TrimRight(s.cfg.Kubelet.Endpoint, "/") + "/metrics"
-	resp, err := s.kubeletGet(ctx, url)
+	resp, err := s.kubeletGet(ctx, url, acceptExposition)
 	if err != nil {
 		return 0, err
 	}

@@ -1,0 +1,73 @@
+{
+  "node": {
+    "nodeName": "node1",
+    "startTime": "2026-08-13T09:00:00Z",
+    "cpu": { "time": "2026-08-13T10:00:00Z", "usageNanoCores": 612000000, "usageCoreNanoSeconds": 19876543210000 },
+    "memory": { "time": "2026-08-13T10:00:00Z", "availableBytes": 4442450944, "workingSetBytes": 3000000000 },
+    "fs": {
+      "time": "2026-08-13T10:00:00Z",
+      "availableBytes": 12000000000,
+      "capacityBytes": 50000000000,
+      "usedBytes": 38000000000,
+      "inodesFree": 2400000,
+      "inodes": 3000000,
+      "inodesUsed": 600000
+    },
+    "runtime": {
+      "imageFs": {
+        "time": "2026-08-13T10:00:00Z",
+        "availableBytes": 12000000000,
+        "capacityBytes": 50000000000,
+        "usedBytes": 9000000000,
+        "inodesFree": 2400000,
+        "inodes": 3000000,
+        "inodesUsed": 60000
+      }
+    },
+    "rlimit": { "time": "2026-08-13T10:00:00Z", "maxpid": 131072, "curproc": 512 }
+  },
+  "pods": [
+    {
+      "podRef": { "name": "kube-apiserver-node1", "namespace": "kube-system", "uid": "1b4f0e9851971998e732078544c96b36" },
+      "startTime": "2026-08-13T09:00:12Z",
+      "cpu": { "time": "2026-08-13T10:00:00Z", "usageNanoCores": 148000000, "usageCoreNanoSeconds": 4210000000000 },
+      "memory": { "time": "2026-08-13T10:00:00Z", "workingSetBytes": 1073741824, "pageFaults": 8100 },
+      "containers": [
+        {
+          "name": "kube-apiserver",
+          "startTime": "2026-08-13T09:00:14Z",
+          "cpu": { "time": "2026-08-13T10:00:00Z", "usageNanoCores": 147000000, "usageCoreNanoSeconds": 4200000000000 },
+          "memory": { "time": "2026-08-13T10:00:00Z", "workingSetBytes": 1070000000 },
+          "rootfs": {
+            "time": "2026-08-13T10:00:00Z",
+            "availableBytes": 12000000000,
+            "capacityBytes": 50000000000,
+            "usedBytes": 229376,
+            "inodesFree": 2400000,
+            "inodes": 3000000,
+            "inodesUsed": 11
+          },
+          "logs": {
+            "time": "2026-08-13T10:00:00Z",
+            "availableBytes": 12000000000,
+            "capacityBytes": 50000000000,
+            "usedBytes": 13729792,
+            "inodesFree": 2400000,
+            "inodes": 3000000,
+            "inodesUsed": 1
+          }
+        }
+      ],
+      "ephemeral-storage": {
+        "time": "2026-08-13T10:00:00Z",
+        "availableBytes": 12000000000,
+        "capacityBytes": 50000000000,
+        "usedBytes": 13959168,
+        "inodesFree": 2400000,
+        "inodes": 3000000,
+        "inodesUsed": 12
+      },
+      "process_stats": { "process_count": 14 }
+    }
+  ]
+}

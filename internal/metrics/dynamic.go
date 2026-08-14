@@ -11,7 +11,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/zeebo/xxh3"
 	"go.opentelemetry.io/collector/pdata/pcommon"
 
 	"github.com/JohanLindvall/kubescrape/internal/logline"
@@ -172,9 +171,9 @@ func (r *metricRule) readValue(values func(string) (float64, bool), line string)
 
 // observe evaluates the rule against one line and records an observation when
 // it matches. buf/rbuf are reused for the data-point and resource label sets and
-// returned (set may grow them). resAccum is the hash of res (the line's resource
-// attributes), computed once by the caller.
-func (r *metricRule) observe(values func(string) (float64, bool), lookup func(string) string, res pcommon.Map, resAccum xxh3.Uint128, line string, ctx *logline.MatchContext, buf, rbuf labels) (labels, labels) {
+// returned (set may grow them). res carries the line's resource attributes and
+// the derivations of them the caller resolved once (see resourceFold).
+func (r *metricRule) observe(values func(string) (float64, bool), lookup func(string) string, res resourceFold, line string, ctx *logline.MatchContext, buf, rbuf labels) (labels, labels) {
 	if !r.match.Match(lookup, ctx) {
 		return buf, rbuf
 	}
@@ -208,7 +207,7 @@ func (r *metricRule) observe(values func(string) (float64, bool), lookup func(st
 	for _, lt := range r.resLabels {
 		rbuf = rbuf.set(lt.setKey, lt.get(lookup))
 	}
-	r.series.observe(buf, value, resAccum, res, rbuf)
+	r.series.observeFold(buf, value, res, rbuf)
 	return buf, rbuf
 }
 
@@ -294,6 +293,12 @@ type DynamicMetricSet struct {
 	// process: obs registers getters over it (RegisterLogMetricsDrops), the
 	// way it does for the disk buffer's stats and the self-metadata gauge.
 	drops drops
+	// hasResLabels reports whether ANY rule lifts labels onto the resource. It
+	// is what Bind reads to decide whether the resource's identity is worth
+	// resolving: only such a rule can override a resource key, and only an
+	// override needs the value that key renders. A set without one keeps the
+	// allocation-free one-pass fold.
+	hasResLabels bool
 	// Count is the number of configured rules.
 	Count int
 	// retryBy/retryOrder hold previous exports' UNDELIVERED samples, keyed by
@@ -411,28 +416,55 @@ func NewDynamicMetricSet(metrics []Dynamic, opts ...Option) (*DynamicMetricSet, 
 			return nil, err
 		}
 		set.rules = append(set.rules, rule)
+		set.hasResLabels = set.hasResLabels || len(rule.resLabels) > 0
 	}
 	set.keys = buildKeyIndex(set.rules)
 	set.Count = len(set.rules)
 	return set, nil
 }
 
-// BoundResource is a DynamicMetricSet bound to one resource, with the
-// resource's hash precomputed — use it to Add many lines sharing the same
-// resource attributes (e.g. all records of one file in a flush) without
-// re-hashing the resource per line.
+// BoundResource is a DynamicMetricSet bound to one resource, with everything
+// the store derives from that resource precomputed — use it to Add many lines
+// sharing the same resource attributes (e.g. all records of one file in a
+// flush) without re-deriving any of it per line.
 type BoundResource struct {
-	set   *DynamicMetricSet
-	res   pcommon.Map
-	accum xxh3.Uint128
+	set *DynamicMetricSet
+	res resourceFold
 }
 
 // Bind precomputes the per-resource state for repeated Adds. Safe on a nil
 // set (Add becomes a no-op).
 func (s *DynamicMetricSet) Bind(resource pcommon.Map) BoundResource {
-	b := BoundResource{set: s, res: resource}
-	if s != nil && len(s.rules) > 0 {
-		b.accum = resourceAccum(resource)
+	b := BoundResource{set: s, res: resourceFold{res: resource}}
+	switch {
+	case s == nil || len(s.rules) == 0:
+	case s.hasResLabels:
+		// A rule lifts labels ONTO the resource, so an observation may REPLACE
+		// one of its keys, and the cancel that keeps the hashed identity equal
+		// to the rendered one needs the value that key renders. That is a fact
+		// about the RESOURCE: resolving it inside the cancel meant re-deriving
+		// it for every line, and deriving it means walking the whole map (only
+		// the LAST occurrence of a key decides, so the walk cannot stop early),
+		// which put the resource's attribute count into the per-line cost of
+		// every config that lifts a label.
+		//
+		// So the identity is resolved here, once, and handed forward. This
+		// branch is the more expensive Bind — resourceIdentity resolves
+		// last-wins through set(), which is quadratic in the resource's width
+		// and takes one allocation, where resourceAccum's one-pass fold takes
+		// none (see its cost note) — and that is the right way round: a Bind
+		// serves every line of a file's flush.
+		//
+		// The two branches must agree, and do: the identity is the materializing
+		// definition of the fold that resourceAccum's fast path is proven
+		// bit-for-bit equal to (TestWideResourcesHashAsTheirRenderedIdentity,
+		// TestBindKeysAResourceTheSameWhicheverBranchItTakes), so which branch
+		// binds a resource decides only what Bind spends — never which series a
+		// line lands in.
+		b.res.ident = resourceIdentity(resource, make(labels, 0, resource.Len()))
+		b.res.accum = b.res.ident.resAccum()
+	default:
+		b.res.accum = resourceAccum(resource)
 	}
 	return b
 }
@@ -442,17 +474,17 @@ func (b BoundResource) Add(values ValueFunc, lookup func(string) string, line st
 	if b.set == nil || len(b.set.rules) == 0 {
 		return
 	}
-	b.set.add(values, lookup, b.res, b.accum, line)
+	b.set.add(values, lookup, b.res, line)
 }
 
-func (s *DynamicMetricSet) add(values ValueFunc, lookup func(string) string, resource pcommon.Map, resAccum xxh3.Uint128, line string) {
+func (s *DynamicMetricSet) add(values ValueFunc, lookup func(string) string, resource resourceFold, line string) {
 	ac := s.pool.Get().(*addContext)
 	ac.ctx.Reset()
 	ac.line.Reset(line)
 	ac.values, ac.lookup, ac.raw = values, lookup, line
 
 	for _, rule := range s.rules {
-		ac.buf, ac.rbuf = rule.observe(ac.valueFn, ac.labelFn, resource, resAccum, line, &ac.ctx, ac.buf, ac.rbuf)
+		ac.buf, ac.rbuf = rule.observe(ac.valueFn, ac.labelFn, resource, line, &ac.ctx, ac.buf, ac.rbuf)
 	}
 	ac.values, ac.lookup, ac.raw = nil, nil, "" // do not retain caller state in the pool
 	// Drop every reference into the line before pooling: the Fields holds the
@@ -518,47 +550,8 @@ func (s *DynamicMetricSet) EmitDirect(name string, value float64, lbls map[strin
 		for _, k := range slices.Sorted(maps.Keys(lbls)) {
 			buf = buf.set(k, lbls[k])
 		}
-		r.series.observe(buf, value, uniqueResourceAccum(resource), resource, nil)
+		r.series.observe(buf, value, resourceAccum(resource), resource, nil)
 		return nil
 	}
 	return fmt.Errorf("emit_metric %q: no logMetrics rule declares this metric", name)
-}
-
-// uniqueResourceAccum folds a resource's attributes the way resourceString
-// RENDERS them — last-wins per key — instead of one term per map ENTRY.
-//
-// resourceAccum XORs a term per entry, which is right for every agent-built
-// resource (they come from a Go map and cannot repeat a key) and wrong for one
-// that arrived on the wire: OTLP encodes attributes as a repeated KeyValue and
-// pdata does not dedupe on decode. XOR is self-inverse, so an even multiplicity
-// CANCELS: {k=v, k=v} folds to the accumulator of the EMPTY resource — bit for
-// bit — while it renders {k="v"}, so a duplicate-keyed resource collides with
-// every other duplicate-keyed resource and with the attribute-less one, and
-// their observations merge into whichever resource string was frozen at admit.
-// It moves no counter and logs nothing: the map lookup SUCCEEDS, which is the
-// whole problem. That is the price of the self-inverse fold, and it is paid by
-// the callers guaranteeing uniqueness rather than by the arithmetic — so a new
-// path that folds a resource of unknown provenance must come through here.
-//
-// EmitDirect is the door such a resource reaches the store through: a transform
-// script's emit_metric over an ingested METRICS or TRACES payload, which
-// otlpingest's dedupeResourceKeys does not cover (that runs on the log chain
-// only, and before the transform seam). It is a cold per-script-call path that
-// already allocates, so it pays the extra pass; Bind's per-flush hot path,
-// whose resources are all agent-built, is untouched.
-func uniqueResourceAccum(res pcommon.Map) xxh3.Uint128 {
-	ls := make(labels, 0, res.Len())
-	res.Range(func(k string, v pcommon.Value) bool {
-		ls = ls.set(k, v.AsString())
-		return true
-	})
-	var rk xxh3.Uint128
-	for _, e := range ls {
-		// set() already truncated the value, which is exactly what
-		// resourceAccum's truncLabelCut reslice achieves: the hashed identity
-		// must be the rendered one.
-		hk, hv := strHash(e.key), strHash(e.value)
-		rk = xor128(rk, combineResHash(hk, hv))
-	}
-	return rk
 }

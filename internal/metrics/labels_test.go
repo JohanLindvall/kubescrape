@@ -30,19 +30,20 @@ func TestLabelsHashAccumFoldable(t *testing.T) {
 	// The fold is xor128, and folding a pair in must equal hashing the full set.
 	folded := xor128(base.hashAccum(), combineHash(strHash("le"), strHash("0.5")))
 	if mixHash(folded) != full.hash() {
-		t.Error("sum-folded le label does not match full hash")
+		t.Error("the folded-in le label does not match hashing the full set")
 	}
 }
 
-// TestXorFoldDependsOnCallerDedup pins the price of the XOR fold and the
-// guarantees that pay it.
+// TestXorFoldIsSafeBecauseNoFoldCanRepeatAPair pins the price of the XOR fold
+// and the guarantees that pay it.
 //
 // XOR is blind to EVEN MULTIPLICITY: a contribution folded twice cancels. That
 // is not a defect to fix in the arithmetic — it is the property that makes the
 // fold self-inverse, which is what resLabelsAccum's cancel relies on. It is
-// safe only because no caller can fold a duplicate, so this test asserts BOTH
-// halves: that the hazard is real, and that each door closes it.
-func TestXorFoldDependsOnCallerDedup(t *testing.T) {
+// safe only because no fold in this package can be handed a duplicate, so this
+// test asserts BOTH halves: that the hazard is real, and that each fold closes
+// it itself rather than requiring it of a caller.
+func TestXorFoldIsSafeBecauseNoFoldCanRepeatAPair(t *testing.T) {
 	// The hazard, stated outright: fold one pair twice and it vanishes.
 	c := combineHash(strHash("user"), strHash("alice"))
 	if xor128(c, c) != (xxh3.Uint128{}) {
@@ -60,15 +61,16 @@ func TestXorFoldDependsOnCallerDedup(t *testing.T) {
 	}
 
 	// Door 2: a WIRE resource may legally repeat a key (OTLP encodes attributes
-	// as a repeated KeyValue; pdata does not dedupe on decode). Folded raw that
-	// would cancel to the EMPTY resource's hash — a merge with something
-	// unrelated, which is strictly worse than the sum's duplicate-series bug.
-	// uniqueResourceAccum folds through set() first, so it does not.
+	// as a repeated KeyValue; pdata does not dedupe on decode). Folded entry by
+	// entry that would cancel to the EMPTY resource's hash — a merge with
+	// something unrelated, which is strictly worse than the duplicate-series
+	// bug a wrapping sum would have left. resourceAccum proves key-uniqueness
+	// before it takes that shortcut, so it does not.
 	dup := dupKeyResource(t, "service.name", "a", "a")
-	if got := uniqueResourceAccum(dup); got == (xxh3.Uint128{}) {
+	if got := resourceAccum(dup); got == (xxh3.Uint128{}) {
 		t.Fatal("a resource repeating one key cancelled to the empty hash")
 	}
-	if uniqueResourceAccum(dup) != uniqueResourceAccum(res(map[string]string{"service.name": "a"})) {
+	if resourceAccum(dup) != resourceAccum(res(map[string]string{"service.name": "a"})) {
 		t.Fatal("a repeated key must hash as the identity it RENDERS, which is the deduped one")
 	}
 }

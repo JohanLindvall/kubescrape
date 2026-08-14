@@ -282,10 +282,13 @@ func TestIngestChainBounds(t *testing.T) {
 }
 
 // Duplicate resource keys — legal on the OTLP wire, impossible in every
-// agent-built resource — must not defeat the metric store's sum-fold
-// identity: {k=p,k=q} vs {k=q,k=p} used to MERGE two senders' series, and
-// {k=v,k=v} minted a series distinct from {k=v} that rendered identically
-// (duplicate points in one payload). The boundary dedupes last-wins.
+// agent-built resource — are normalized last-wins at this boundary. The metric
+// store's own identity no longer depends on it (metrics.resourceAccum proves
+// key-uniqueness before it takes its one-pass shortcut), but this chain reads
+// the resource through logchain.Resolver, whose Get is FIRST-wins against that
+// last-wins identity — so the "winner" label asserted below is what the dedupe
+// still buys — and the payload forwarded on would otherwise carry the
+// ambiguity to the collector.
 func TestIngestDedupesDuplicateResourceKeys(t *testing.T) {
 	set, err := metrics.NewDynamicMetricSet([]metrics.Dynamic{{
 		Name: "dup", Type: "counter", Value: "1",

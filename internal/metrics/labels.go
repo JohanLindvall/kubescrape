@@ -172,19 +172,27 @@ func strHash(s string) xxh3.Uint128 { return xxh3.HashString128(s) }
 // {k=v, k=v} hashes identically to {} — where a sum merely hashed it distinctly
 // from {k=v}. The history here is not hypothetical: this fold WAS XOR, a pair
 // reaching it twice silently merged distinct series, and it was changed to a
-// sum for that reason. What makes XOR safe again is that no caller can now fold
-// a duplicate:
+// sum for that reason. Note that a sum is not the fix it looks like — it stops
+// the merge with {} and still hashes {k=v, k=v} apart from the {k="v"} it
+// RENDERS, which is the milder historical failure (duplicate points every
+// export, merged corrupt points for histograms) rather than none.
+//
+// What makes XOR safe is that no contribution can be folded twice, and every
+// fold in this package now establishes that itself rather than asking its
+// caller to:
 //
 //   - labels.set() replaces by key, so a label set cannot hold one key twice.
+//     Every label fold — hashAccum here, resAccum, the registry's bound
+//     wrappers, EmitDirect's label map — builds through it.
 //   - resourceAccum ranges a pcommon.Map, whose keys are unique when the map is
-//     agent-built. Its doc carries the contract for callers that are not.
-//   - a WIRE resource can legally repeat a key (OTLP encodes attributes as a
-//     repeated KeyValue and pdata does not dedupe on decode), so both doors
-//     from the wire fold through set() first: otlpingest dedupes last-wins
-//     before Bind, and uniqueResourceAccum does it for a script's resource.
+//     agent-built and NOT when it arrived on the wire (OTLP encodes attributes
+//     as a repeated KeyValue and pdata does not dedupe on decode). It proves
+//     uniqueness as it folds and materializes the identity through set() when
+//     it cannot — see there; it used to state the requirement as a contract on
+//     the caller instead, and the contract had already leaked.
 //
-// That invariant is now load-bearing rather than merely tidy, which is why it
-// is enumerated here and pinned by TestXorFoldDependsOnCallerDedup.
+// Pinned by TestXorFoldIsSafeBecauseNoFoldCanRepeatAPair and, for the resource
+// half, by FuzzResourceIdentityMatchesItsRender.
 func (l labels) hashAccum() xxh3.Uint128 {
 	var h xxh3.Uint128
 	for _, e := range l {
@@ -398,14 +406,16 @@ const (
 //
 // The cost of that convenience is stated at hashAccum and is real: XOR is blind
 // to even multiplicity, so any contribution folded twice vanishes. Nothing in
-// this package may fold the same (domain, key, value) twice — see the callers'
-// contracts, which is where that invariant now lives.
+// this package may fold the same (domain, key, value) twice — every fold builds
+// through set(), or proves the input key-unique before taking a shortcut past
+// it (resourceAccum). That is the invariant, and it is the folds' own to keep;
+// it used to be a contract on their callers.
 func xor128(a, b xxh3.Uint128) xxh3.Uint128 {
 	return xxh3.Uint128{Hi: a.Hi ^ b.Hi, Lo: a.Lo ^ b.Lo}
 }
 
 // combineHash folds a key's and a value's 128-bit hashes into one 128-bit
-// contribution for the outer wrapping sum.
+// contribution for the outer XOR fold.
 //
 // Both output halves depend on all 256 input bits: bits.Mul64 widens each
 // 64x64 product to 128 bits and the two products are cross-folded, so a
@@ -430,14 +440,15 @@ func combineHash(h1, h2 xxh3.Uint128) xxh3.Uint128 {
 	return mixHash(xxh3.Uint128{Hi: loHi ^ hiLo, Lo: loLo ^ hiHi})
 }
 
-// A series key is the wrapping SUM of its resource pairs and its data-point
-// label pairs. Folded with one combine, those two contributions would live in
-// the SAME hash domain — and a sum cannot tell where a term came from. Two
-// series built from the same multiset of (key, value) pairs, split differently
-// between resource and labels, would then hash identically, silently merging
-// distinct series. Concretely, with a rule lifting a line field named like a
-// resource attribute: pod A (resource k8s.pod.name=a) logging peer=b and pod B
-// (resource k8s.pod.name=b) logging peer=a collapse into one sample.
+// A series key is the XOR fold of its resource pairs and its data-point label
+// pairs. Folded with one combine, those two contributions would live in the
+// SAME hash domain — and an order-independent fold cannot tell where a term
+// came from. Two series built from the same multiset of (key, value) pairs,
+// split differently between resource and labels, would then hash identically,
+// silently merging distinct series. Concretely, with a rule lifting a line
+// field named like a resource attribute: pod A (resource k8s.pod.name=a)
+// logging peer=b and pod B (resource k8s.pod.name=b) logging peer=a collapse
+// into one sample.
 //
 // This is the ONE separation the width does not make redundant, and the reason
 // is worth keeping straight: it does not defend against a chance collision (128

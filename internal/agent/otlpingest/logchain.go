@@ -89,9 +89,9 @@ func (s *Server) applyLogChain(ld plog.Logs) bool {
 			observe = false
 		}
 		if observe {
-			// The store's order-independent sum-fold hash needs KEY-UNIQUE
-			// attributes to be an identity (see dedupeResourceKeys); only
-			// ingested resources can violate that.
+			// Not for the store's identity — that fold handles a repeated
+			// key itself now — but for the resolver reading this resource
+			// and for the payload forwarded on. See dedupeResourceKeys.
 			dedupeResourceKeys(rattrs)
 		}
 		// Bound once per resource: Bind hashes the attribute set, and a push
@@ -210,23 +210,26 @@ func renderedSizeOver(v pcommon.Value, rem *int, depth int) bool {
 
 // dedupeResourceKeys rewrites a resource whose attributes repeat a key. OTLP
 // encodes attributes as a repeated KeyValue and pdata does not dedupe on
-// decode; the metric store's order-independent fold hashes every entry while
-// its rendered identity applies last-wins, so {k=p, k=q} and {k=q, k=p} hash
-// identical (two senders' series MERGE).
+// decode, and nothing downstream of here agrees about what such a resource
+// MEANS: a Go-map-shaped consumer takes the last entry, pcommon.Map.Get takes
+// the first, and this chain reads the resource both ways.
 //
-// {k=v, k=v} is the sharper case and this call is now the ONLY thing standing
-// between it and a wrong answer. The store's fold is XOR (metrics/labels.go
-// hashAccum), which is blind to even multiplicity: a pair folded twice CANCELS,
-// so an undeduped {k=v, k=v} hashes as the EMPTY resource and merges with
-// whatever unrelated resource happens to carry no attributes — verified, it
-// folds to exactly zero. Under the wrapping sum this fold used to use, the same
-// input merely hashed distinct from {k=v} while rendering the same, i.e.
-// duplicate points rather than a merge. The failure got worse when the fold
-// changed; the guard did not move.
-// Every agent-built resource comes from a map and cannot repeat a key, so
-// the fix lives at this boundary instead of taxing every producer's hot
-// path. Last-wins, which is what any map-shaped consumer of the forwarded
-// payload reads anyway; the rewrite is visible only as attribute order.
+// It is NO LONGER what keeps the metric store's identity honest — the store's
+// fold proves key-uniqueness itself now (metrics.resourceAccum), so an
+// undeduped resource keys as the identity it renders whether or not this ran.
+// It stays for the two readers the store cannot speak for:
+//
+//   - logchain.Resolver resolves a metric LABEL or a rule key off the resource
+//     with Get, i.e. FIRST-wins, while the store renders the resource last-wins.
+//     Undeduped, a label lifted from the resource would disagree with the
+//     resource the series carries.
+//   - the payload FORWARDED to the collector, which is passed through
+//     untouched and would hand the same ambiguity to whatever receives it.
+//
+// Every agent-built resource comes from a map and cannot repeat a key, so this
+// stays at the boundary rather than taxing every producer's hot path.
+// Last-wins, which is what any map-shaped consumer reads anyway and what the
+// store's identity applies; the rewrite is visible only as attribute order.
 func dedupeResourceKeys(m pcommon.Map) {
 	var seen [maxObservedResourceAttrs]string
 	n, dup := 0, false

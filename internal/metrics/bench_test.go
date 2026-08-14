@@ -243,6 +243,72 @@ func BenchmarkDynamicAddBound(b *testing.B) {
 	}
 }
 
+// benchResourceLabelRules is the shape that pays for the override cancel: a
+// rule lifting log-derived labels ONTO the resource, one of them REPLACING a
+// key the resource already carries (service.name) and one it does not
+// (tenant). The replaced key's rendered value has to be resolved for every
+// observation, so this is the only config shape that exercises resLabelsAccum's
+// cancel — and there was no benchmark for it.
+func benchResourceLabelRules(b testing.TB) *DynamicMetricSet {
+	b.Helper()
+	set, err := newTestSet([]Dynamic{{
+		Name:           "http_requests_total",
+		Type:           CounterType,
+		Value:          "1",
+		Match:          []string{"level=info"},
+		Labels:         []string{"status=$http_status(_xx)", "method=$method"},
+		ResourceLabels: []string{"tenant=$tenant", "service.name=$service"},
+	}})
+	if err != nil {
+		b.Fatal(err)
+	}
+	return set
+}
+
+// resourceLabelLookup is the attribute set benchResourceLabelRules reads.
+func resourceLabelLookup() func(string) string {
+	attrs := map[string]string{
+		"level": "info", "http_status": "200", "method": "GET",
+		"tenant": "acme-corp", "service": "payments-api",
+	}
+	return func(k string) string { return attrs[k] }
+}
+
+// wideResource is benchResource plus filler attributes, for measuring what
+// scales with a resource's WIDTH. A tailer resource carries a dozen or so;
+// static/template attributes from resourceAttributes push it further, and the
+// ingest path allows up to maxObservedResourceAttrs (64).
+func wideResource(n int) pcommon.Map {
+	m := benchResource()
+	for i := m.Len(); i < n; i++ {
+		m.PutStr(fmt.Sprintf("attr.%03d", i), fmt.Sprintf("value-%03d", i))
+	}
+	return m
+}
+
+// BenchmarkDynamicAddResourceLabels measures the bound path for a config using
+// resourceLabels. The resource fold itself is once per Bind; what is measured
+// here is the PER-LINE remainder — the cancel of every resource key an extra
+// label replaces. It is run against resources of several widths on purpose:
+// resolving the replaced key by walking the resource map makes a per-line cost
+// out of a per-resource fact, so the widths are where that shows.
+func BenchmarkDynamicAddResourceLabels(b *testing.B) {
+	for _, n := range []int{7, 16, 32, 64} {
+		b.Run(fmt.Sprintf("attrs=%d", n), func(b *testing.B) {
+			setTimeForTest(time.Unix(1_700_400_500, 0))
+			defer testEpoch.Store(0)
+			set := benchResourceLabelRules(b)
+			lookup := resourceLabelLookup()
+			line := `GET /api/v1/orders 200 42.5ms`
+			bound := set.Bind(wideResource(n))
+			b.ReportAllocs()
+			for b.Loop() {
+				bound.Add(nil, lookup, line)
+			}
+		})
+	}
+}
+
 // BenchmarkDynamicAddValueFromLine is the shape where the observed value is NOT
 // an attribute: the label keys resolve through the caller's closures and the
 // value comes off the line. It is a common tailer shape, and the one that pays
@@ -417,6 +483,28 @@ func TestDynamicAddHistogramAllocationBudget(t *testing.T) {
 	}
 }
 
+// A config using resourceLabels pays the override cancel on EVERY line, so it
+// gets its own budget rather than riding on the shapes above (none of which
+// declares one). The cancel resolves the value each replaced resource key
+// renders; resolving it by walking the resource map per line would still be
+// allocation-free, so the ceiling here is what keeps the LOOKUP off the heap,
+// and BenchmarkDynamicAddResourceLabels is what reports its cost.
+func TestDynamicAddResourceLabelsAllocationBudget(t *testing.T) {
+	if testrace.Enabled {
+		t.Skip("-race perturbs allocation counts")
+	}
+	setTimeForTest(time.Unix(1_700_600_200, 0))
+	defer testEpoch.Store(0)
+	set := benchResourceLabelRules(t)
+	lookup := resourceLabelLookup()
+	bound := set.Bind(benchResource())
+	add := func() { bound.Add(nil, lookup, `GET /api/v1/orders 200 42.5ms`) }
+	add() // admit the series and warm every pool
+	if allocs := testing.AllocsPerRun(200, add); allocs > 1.5 {
+		t.Fatalf("Add allocates %v times per line with resourceLabels, want <= 1.5", allocs)
+	}
+}
+
 // benchLabels is a typical log-derived data-point label set.
 func benchLabels() labels {
 	var l labels
@@ -451,6 +539,29 @@ func BenchmarkResourceAccum(b *testing.B) {
 		rk = resourceAccum(res)
 	}
 	sinkAccum(rk)
+}
+
+// BenchmarkResLabelsAccum measures the override cancel alone, which is the half
+// of the resource key that runs per OBSERVATION rather than per Bind: for each
+// resourceLabel it folds the replaced pair back out and the new one in. The
+// widths are the point — the value a replaced key renders is a fact about the
+// RESOURCE, so this must not scale with the resource's attribute count.
+func BenchmarkResLabelsAccum(b *testing.B) {
+	// One label replacing a key the resource carries, one that is new: the two
+	// branches of the cancel.
+	extra := labels{{"service.name", "payments-api"}, {"tenant", "acme-corp"}}
+	for _, n := range []int{7, 16, 32, 64} {
+		b.Run(fmt.Sprintf("attrs=%d", n), func(b *testing.B) {
+			res := wideResource(n)
+			ident := resourceIdentity(res, make(labels, 0, res.Len()))
+			b.ReportAllocs()
+			var rk xxh3.Uint128
+			for b.Loop() {
+				rk = resLabelsAccum(ident, extra)
+			}
+			sinkAccum(rk)
+		})
+	}
 }
 
 //go:noinline

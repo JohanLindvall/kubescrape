@@ -118,10 +118,10 @@ func TestEmitDirectHashesTheRenderedResourceIdentity(t *testing.T) {
 }
 
 // The permutation half of the same divergence: {k=p,k=q} and {k=q,k=p} are the
-// same multiset, so the sum-fold hashed them identically in BOTH accumulators
-// (the check hash is a projection of the same pairs and cannot see it) while
-// they render as different resources — two senders' observations merged under
-// whichever string was frozen at admit.
+// same multiset, so any order-independent fold over one term per ENTRY hashes
+// them identically while they render as different resources — two senders'
+// observations merged under whichever string was frozen at admit. Resolving
+// the repeat last-wins, as the render does, is what separates them.
 func TestEmitDirectDistinguishesPermutedDuplicateKeys(t *testing.T) {
 	setTimeForTest(time.Unix(1_800_500_000, 0))
 	defer testEpoch.Store(0)

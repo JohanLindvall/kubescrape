@@ -311,11 +311,23 @@ func (s *series) bounds() []float64 { return s.buckets[:len(s.buckets)-1] }
 
 // observe records value for the given data-point label set, resource, and extra
 // resource labels. The series is keyed by all three together (their hashes
-// XOR-fold into the base accumulator), so per-resource series are distinct. A
-// histogram is ONE sample per label set — the value folds into its sum/count
-// and every counts slot whose bound it does not exceed — so every kind is a
-// single hash and a single map probe per observation.
+// XOR-fold into the base accumulator), so per-resource series are distinct.
+//
+// This is the door for a caller holding only the map and its accumulator (the
+// Registry's func gauges, EmitDirect, tests). The per-line path comes through
+// observeFold with the resource's identity already resolved; passing it here
+// would key the same series, so the difference is cost and not correctness —
+// see resourceFold.
 func (s *series) observe(lbls labels, value float64, resAccum xxh3.Uint128, res pcommon.Map, resLabels labels) {
+	s.observeFold(lbls, value, resourceFold{res: res, accum: resAccum}, resLabels)
+}
+
+// observeFold is observe against a resource whose derivations the caller
+// resolved once (Bind). A histogram is ONE sample per label set — the value
+// folds into its sum/count and every counts slot whose bound it does not
+// exceed — so every kind is a single hash and a single map probe per
+// observation.
+func (s *series) observeFold(lbls labels, value float64, res resourceFold, resLabels labels) {
 	if math.IsNaN(value) || math.IsInf(value, 0) {
 		// Inf too, and for the same reason: ParseFloat accepts "inf"/"Infinity"
 		// from a log line, and Inf is ABSORBING under every accumulate path —
@@ -327,11 +339,19 @@ func (s *series) observe(lbls labels, value float64, resAccum xxh3.Uint128, res 
 	}
 	now := s.epoch()
 	base := s.baseAccum(lbls)
-	base = xor128(base, xor128(resAccum, resLabelsAccum(res, resLabels)))
+	rk := res.accum
+	if len(resLabels) > 0 {
+		// Only a resource label can override a resource key, so only a rule
+		// declaring one pays the cancel — or reaches for the identity it
+		// resolves against. XOR is associative, so folding it in here rather
+		// than into a combined resource term is the same bits.
+		rk = xor128(rk, resLabelsAccum(res.identity(), resLabels))
+	}
+	base = xor128(base, rk)
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.recordSingle(mixHash(base), value, lbls, now, res, resLabels)
+	s.recordSingle(mixHash(base), value, lbls, now, res.res, resLabels)
 }
 
 // observePreHashed is the registry fast path: the bound wrappers bump fixed

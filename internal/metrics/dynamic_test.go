@@ -449,15 +449,17 @@ func LoadDynamicMetrics(path string) ([]Dynamic, error) {
 	return cfg.Metrics, nil
 }
 
-// Add is the unbound test/bench convenience over add: production exclusively
-// binds a resource first (Bind + BoundResource.Add, which hashes the resource
-// once per flush); the per-call resourceAccum here would be a hot-path
-// regression outside tests.
+// Add is the unbound test/bench convenience over Bind: production exclusively
+// binds a resource first (Bind + BoundResource.Add, which resolves the
+// resource's derivations once per flush); the per-call Bind here would be a
+// hot-path regression outside tests.
+//
+// It goes through Bind rather than assembling the fold itself so that every
+// test written against this convenience exercises the same per-resource state
+// production does — including the identity a resourceLabels config's override
+// cancel resolves against, which Bind is the only producer of.
 func (s *DynamicMetricSet) Add(values ValueFunc, lookup func(string) string, resource pcommon.Map, line string) {
-	if s == nil || len(s.rules) == 0 {
-		return
-	}
-	s.add(values, lookup, resource, resourceAccum(resource), line)
+	s.Bind(resource).Add(values, lookup, line)
 }
 
 func TestLoadDynamicMetrics(t *testing.T) {

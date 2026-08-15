@@ -116,6 +116,22 @@ var (
 	// path: the RATE is the signal, not the absolute value.
 	MonitorTargetShadowed = Registry.CounterVec("kubescrape_monitor_target_shadowed_total",
 		"Monitor endpoints whose auth/TLS conflicts with the monitor already holding the same URL on that pod (the holder's is served; the rest of the endpoint's configuration still merges).", "kind")
+	TargetIdentityCollisions = Registry.Counter("kubescrape_scrape_target_identity_collisions_total",
+		"Groups of scrape targets on one node that resolve to the SAME exported series identity — the same "+
+			"Prometheus (job, instance), where job is the workload and instance is host:port. Every target in "+
+			"such a group is still served and still scraped, because each was configured deliberately and "+
+			"dropping one is invisible in the data (indistinguishable from an app that stopped exporting); what "+
+			"collides is what they EXPORT. Two shapes reach it: two paths on one port (a pod annotation beside a "+
+			"Service annotation, or two monitor endpoints), where url.full at least differs; and two hostNetwork "+
+			"pods of ONE workload annotated with the same port, where even url.full is identical. The symptom "+
+			"without this counter is anonymous — a metric name the endpoints share arrives as one series "+
+			"alternating between their values so rate() sees resets, and up{} arrives as both 0 and 1 at one "+
+			"timestamp, which a backend rejects as a duplicate sample. READ THE VALUE, NOT A SHORT RATE: it "+
+			"increments once per colliding group per target DERIVATION, so its rate tracks how often the node's "+
+			"target list is rebuilt, not how broken the configuration is. Alert on increase over an hour, or "+
+			"simply on the throttled WARN beside it, which names the job, the instance and every colliding URL; "+
+			"GET /v1/explain/{ns}/{pod} lists the same collisions per target under `collidesWith`. The remedy is "+
+			"always the operator's: give the endpoints separate container ports, or drop one declaration.")
 	// ScrapeAuthFailures counts /v1/scrape-auth requests that reached the
 	// Secret read and failed there, by CAUSE. The route is the only one that
 	// hard-fails on external state, and every cause used to answer 404: an

@@ -132,7 +132,7 @@ func TestIndex(t *testing.T) {
 	})); err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := ix.AuthSecretRefs()["ns/tok/token"]; !ok {
+	if !ix.AuthSecretRefs().Has("ns/tok/token") {
 		t.Fatal("setup: the endpoint's secret ref should be allowlisted")
 	}
 	if err := ix.Upsert(monitorObj("ns", "b", map[string]any{
@@ -188,7 +188,7 @@ func TestIndexUnparseableUpdateRemoves(t *testing.T) {
 	// Secret reachable through /v1/scrape-auth. The PodMonitor mirror asserts
 	// the same thing, and it is the assertion that survives a mutation which
 	// merely memoizes AuthSecretRefs without invalidating it here.
-	if n := len(ix.AuthSecretRefs()); n != 0 {
+	if n := ix.AuthSecretRefs().Len(); n != 0 {
 		t.Errorf("the removed monitor's secret refs are still allowlisted: %d", n)
 	}
 }

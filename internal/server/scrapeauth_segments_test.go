@@ -67,7 +67,7 @@ func TestScrapeAuthRefusesReCutPathSegments(t *testing.T) {
 	}}); err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := monitors.AuthSecretRefs()["tenant/victim/creds/token"]; !ok {
+	if !monitors.AuthSecretRefs().Has("tenant/victim/creds/token") {
 		t.Fatalf("test setup: the allowlist entry under attack does not exist: %v", monitors.AuthSecretRefs())
 	}
 

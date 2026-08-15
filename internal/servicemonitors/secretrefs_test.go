@@ -108,7 +108,7 @@ func TestEverySecretRefIsNamespacedAndAllowlisted(t *testing.T) {
 				if strings.Count(*p, "/") != 2 {
 					t.Errorf("%s ref %q is not ns/name/key", tc.kind, *p)
 				}
-				if _, ok := refs[*p]; !ok {
+				if !refs.Has(*p) {
 					t.Errorf("%s ref %q is carried on the endpoint but NOT allowlisted: /v1/scrape-auth would 404 it and the target scrapes unauthenticated", tc.kind, *p)
 				}
 			}
@@ -143,12 +143,12 @@ func TestAuthSecretRefsReadsTheStoredEndpoints(t *testing.T) {
 		"monitoring/authz/creds",
 		"monitoring/tls/ca.crt", "monitoring/tls/tls.crt", "monitoring/tls/tls.key",
 	} {
-		if _, ok := refs[want]; !ok {
+		if !refs.Has(want) {
 			t.Errorf("%q missing from the allowlist", want)
 		}
 	}
-	if len(refs) != 7 {
-		t.Errorf("allowlist has %d entries, want 7 (%v)", len(refs), refs)
+	if refs.Len() != 7 {
+		t.Errorf("allowlist has %d entries, want 7 (%v)", refs.Len(), refs.refs)
 	}
 }
 
@@ -190,7 +190,7 @@ func TestSecretRefsRejectPathSeparators(t *testing.T) {
 		if err := ix.Upsert(u); err != nil {
 			t.Fatal(err)
 		}
-		for ref := range ix.AuthSecretRefs() {
+		for ref := range ix.AuthSecretRefs().refs {
 			t.Errorf("allowlist gained %q from a ref carrying a path separator", ref)
 		}
 	}

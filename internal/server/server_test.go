@@ -346,6 +346,13 @@ func TestNodeTargetsFromServiceMonitor(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	// NOTE: the two monitors below put /stats and /metrics on ONE container
+	// port of default/mon-web-1, so this fixture is also an exported-identity
+	// collision (see scrape/instance.go) and trips its warning. That is
+	// deliberate — it is the shape two innocent CRs produce — and
+	// TestTwoMonitorEndpointsOnOnePortCollide pins it as such; keep them in
+	// step if this fixture's paths or ports change.
+	//
 	// Selects the service across namespaces via its port name.
 	upsertMonitor("web", map[string]any{
 		"selector":          map[string]any{"matchLabels": map[string]any{"team": "obs"}},

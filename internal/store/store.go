@@ -226,6 +226,11 @@ type Store struct {
 	// earlier one; a record merely re-asserting an address it already holds
 	// keeps its old sequence and cannot displace the live owner.
 	ipSeq uint64
+	// pending lists every tombstone that has been stamped and not yet swept, so
+	// a sweep costs what EXPIRED rather than what the store holds. See
+	// stampLocked (the one place a stamp is made, and the invariant that keeps
+	// this list complete) and Sweep.
+	pending []pendingExpiry
 
 	// shed counts lookups refused by the waiter cap. Instance state published
 	// through obs.RegisterWaiterStats rather than a counter this package bumps
@@ -273,6 +278,27 @@ type containerEntry struct {
 	expireAt time.Time
 }
 
+// pendingExpiry is one stamped tombstone waiting to be swept: a pod record or
+// a container entry.
+//
+// It is a HINT, never the truth. The truth is the expireAt on the record or
+// entry itself, which the sweep re-reads before removing anything: a tombstone
+// can be resurrected (UpsertPod clears the stamp), re-stamped later (a
+// replayed DeletePod), replaced (a restart re-indexes the ID) or already gone
+// (its pod swept it), and each of those simply makes the hint a no-op. The
+// cost of a stale hint is one map probe.
+//
+// isPod says which map to look in, rather than the emptiness of uid or id: a
+// record keyed by an empty UID is degenerate but perfectly representable, and
+// a discriminator that reads it as a container id would leave that record's
+// tombstone in the store forever.
+type pendingExpiry struct {
+	when  time.Time
+	uid   types.UID
+	id    string
+	isPod bool
+}
+
 // New creates a store that retains metadata for deleted pods and replaced
 // container IDs for ttl. A ttl <= 0 disables the tombstone cache.
 func New(ttl time.Duration) *Store {
@@ -307,12 +333,28 @@ type NodePod struct {
 // UpsertPod records the current state of a pod. It is called for informer
 // add and update events (including the initial list).
 func (s *Store) UpsertPod(p *corev1.Pod) {
+	// The resync probe runs FIRST, under the read lock, because the expensive
+	// part of this function is the conversion and not the indexing: FromPod
+	// deep-copies the labels, annotations, owner refs and every container, and
+	// with `-resync` set client-go re-delivers every pod in the cluster
+	// byte-identical on each period. Converting first meant a 20k-pod resync
+	// allocated 20k full copies to discard them on the next line, and took the
+	// EXCLUSIVE lock 20k times — in a burst, against every reader and the
+	// informer itself — to discover there was nothing to do.
+	if s.resyncNoOp(p) {
+		return
+	}
+
 	pod, containers := kubeconvert.FromPod(p)
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	rec := s.pods[p.UID]
+	// Re-checked under the write lock, since the probe above dropped its lock:
+	// the informer delivers pod events on one goroutine, so nothing can have
+	// changed in between today, but that is the caller's property and not this
+	// type's.
 	if rec != nil && rec.expireAt.IsZero() && rec.resourceVersion == p.ResourceVersion {
 		return // periodic resync, nothing changed
 	}
@@ -370,6 +412,17 @@ func (s *Store) UpsertPod(p *corev1.Pod) {
 	s.byPodName[nameKey] = rec
 
 	s.claimPodIPLocked(rec, pod, oldIPs)
+}
+
+// resyncNoOp reports that this delivery carries a resourceVersion the store
+// already holds for a LIVE record — an informer resync of an unchanged pod,
+// which has nothing to do and nothing to convert. A tombstoned record is never
+// a no-op: the upsert resurrects it.
+func (s *Store) resyncNoOp(p *corev1.Pod) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	rec := s.pods[p.UID]
+	return rec != nil && rec.expireAt.IsZero() && rec.resourceVersion == p.ResourceVersion
 }
 
 // indexContainersLocked replaces the record's container-ID index: new IDs are
@@ -703,6 +756,7 @@ func (s *Store) deletePodLocked(uid types.UID) {
 	deletedAt := now
 	rec.pod.DeletedAt = &deletedAt
 	rec.expireAt = now.Add(s.ttl)
+	s.stampLocked(pendingExpiry{when: rec.expireAt, uid: uid, isPod: true})
 	// Only entries with NO expiry yet are stamped: a replayed DeletePod (an
 	// informer resync) extends the pod tombstone but deliberately not the
 	// container entries — their clocks started at the first deletion (or at a
@@ -711,8 +765,30 @@ func (s *Store) deletePodLocked(uid types.UID) {
 	for id := range rec.containerIDs {
 		if e := s.byContainer[id]; e != nil && e.podUID == uid && e.expireAt.IsZero() {
 			e.expireAt = rec.expireAt
+			// Listed even though the pod's own sweep takes its container IDs
+			// with it: the pod may be RESURRECTED before that (a late update
+			// after a missed delete) while an ID that has meanwhile aged out of
+			// its status keeps this stamp. Then no pod sweep will ever reach
+			// it, and the entry is only reclaimable through its own listing.
+			s.stampLocked(pendingExpiry{when: e.expireAt, id: id})
 		}
 	}
+}
+
+// stampLocked records a tombstone that Sweep must revisit. EVERY assignment to
+// a record's or an entry's expireAt goes through here (there are exactly two
+// callers, deletePodLocked and expireEntryLocked); one that did not would be a
+// tombstone nothing ever reclaims, since the sweep no longer scans the store
+// looking for them.
+//
+// The list is kept in stamp order, which is also expiry order: every stamp is
+// now+ttl for one ttl fixed at construction, and now does not go backwards
+// (time.Now carries a monotonic reading; the injectable test clock only
+// advances). Sweep therefore stops at the first unexpired entry instead of
+// walking the rest. Were that ever violated, the entries behind the head would
+// be swept in a later window rather than leak — a delay, not a loss.
+func (s *Store) stampLocked(p pendingExpiry) {
+	s.pending = append(s.pending, p)
 }
 
 // Stats reports current cache sizes.
@@ -734,41 +810,87 @@ func expired(expireAt, now time.Time) bool {
 
 // Sweep removes expired tombstones. It is exported for tests; Run calls it
 // periodically.
+//
+// It walks the PENDING list, not the store. Sweep holds the exclusive write
+// lock, so every container lookup, every pod lookup and every node-targets
+// request waits behind it, and the informer's own upserts queue up too — the
+// cost has to be proportional to what expired. Scanning byContainer and pods
+// instead made it proportional to the whole store whether or not anything was
+// due: at 20k pods a sweep with NOTHING to remove measured 0.77-1.02 ms
+// against 73-99 ns now, and it runs on a ticker of ttl/4 clamped to
+// [5s, 60s] — so a short -cache-ttl paid that every five seconds for nothing.
+// Both figures are indicative; the durable claim is
+// TestSweepCostDoesNotScaleWithTheStore, which measures the SHAPE.
 func (s *Store) Sweep() {
 	now := s.now()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	for id, e := range s.byContainer {
-		if expired(e.expireAt, now) {
+	n := 0
+	for ; n < len(s.pending); n++ {
+		p := s.pending[n]
+		if !expired(p.when, now) {
+			break // stamped in expiry order: nothing behind this is due either
+		}
+		if p.isPod {
+			s.sweepPodLocked(p.uid, now)
+		} else {
+			s.sweepContainerLocked(p.id, now)
+		}
+	}
+	if n == 0 {
+		return
+	}
+	// Compact rather than reslice. A reslice walks the backing array forward
+	// until its capacity runs out and then reallocates, and in the steady state
+	// of one stamp arriving per sweep that is a fresh array every time.
+	rest := copy(s.pending, s.pending[n:])
+	clear(s.pending[rest:]) // the moved-from tail keeps its strings alive
+	s.pending = s.pending[:rest]
+	if rest == 0 && cap(s.pending) > maxIdlePendingStamps {
+		// A rollout of a 5000-pod deployment stamps three tombstones per pod
+		// and then drains them all inside one TTL. Reusing the array is the
+		// point of compacting, but keeping the PEAK of it for the process
+		// lifetime is not: nothing else in the store is sized by the largest
+		// burst it ever saw.
+		s.pending = nil
+	}
+}
+
+// maxIdlePendingStamps is the largest empty pending array Sweep keeps for
+// reuse: 1024 stamps, ~64 KB, comfortably more than steady-state churn between
+// two ticks and small enough that a burst's high-water mark is not resident
+// forever.
+const maxIdlePendingStamps = 1024
+
+// sweepContainerLocked removes one container entry if the stamp that listed it
+// is still the entry's own and has lapsed. A restart that re-indexed the ID
+// installed a fresh entry with no stamp, and this must not remove that.
+func (s *Store) sweepContainerLocked(id string, now time.Time) {
+	if e := s.byContainer[id]; e != nil && expired(e.expireAt, now) {
+		delete(s.byContainer, id)
+	}
+}
+
+// sweepPodLocked retires one lapsed pod tombstone and every index that still
+// points at it.
+func (s *Store) sweepPodLocked(uid types.UID, now time.Time) {
+	rec := s.pods[uid]
+	if rec == nil || !expired(rec.expireAt, now) {
+		return // already gone, resurrected, or re-stamped by a replayed delete
+	}
+	s.dropNameIndexLocked(rec)
+	for _, ip := range recordAddresses(rec) {
+		s.dropClaimantLocked(ip, rec)
+	}
+	// The record's OWN container IDs, identity-checked exactly as
+	// deletePodLocked does — never a rescan of byContainer.
+	for id := range rec.containerIDs {
+		if e := s.byContainer[id]; e != nil && e.podUID == uid {
 			delete(s.byContainer, id)
 		}
 	}
-	for uid, rec := range s.pods {
-		if !expired(rec.expireAt, now) {
-			continue
-		}
-		s.dropNameIndexLocked(rec)
-		for _, ip := range recordAddresses(rec) {
-			s.dropClaimantLocked(ip, rec)
-		}
-		// The record's OWN container IDs, identity-checked exactly as
-		// deletePodLocked does — never a rescan of byContainer. Container
-		// entries always expire no later than their pod (deletePodLocked stamps
-		// them with the pod's expiry or earlier, and both loops here share one
-		// `now`), so the rescan was documented as normally removing nothing —
-		// but it ran a full second pass over every container in the store,
-		// each entry paying a pods lookup, whenever ANY tombstone lapsed. In a
-		// 30k-pod cluster ordinary churn puts one in essentially every sweep
-		// window, and the pass runs under the exclusive write lock every lookup
-		// and every targets request waits behind.
-		for id := range rec.containerIDs {
-			if e := s.byContainer[id]; e != nil && e.podUID == uid {
-				delete(s.byContainer, id)
-			}
-		}
-		delete(s.pods, uid)
-	}
+	delete(s.pods, uid)
 }
 
 // Run sweeps expired tombstones until ctx is done.
@@ -798,6 +920,7 @@ func (s *Store) expireEntryLocked(id string, e *containerEntry) {
 		return
 	}
 	e.expireAt = s.now().Add(s.ttl)
+	s.stampLocked(pendingExpiry{when: e.expireAt, id: id})
 }
 
 // dropNameIndexLocked removes rec from the name index unless a newer pod

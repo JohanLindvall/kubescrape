@@ -76,15 +76,24 @@ func ParsePodMonitor(u *unstructured.Unstructured) (*PodMonitor, error) {
 // allowlists, so a stale monitor would keep /v1/scrape-auth willing to serve
 // a Secret the live spec no longer names).
 func (x *Index) UpsertPodMonitor(u *unstructured.Unstructured) error {
+	_, err := x.UpsertPodMonitorChanged(u)
+	return err
+}
+
+// UpsertPodMonitorChanged is UpsertPodMonitor, additionally reporting whether
+// the delivery was news — Index.UpsertChanged's mirror, and for the same
+// caller.
+func (x *Index) UpsertPodMonitorChanged(u *unstructured.Unstructured) (bool, error) {
 	m, err := ParsePodMonitor(u)
-	return upsertMonitor(x, x.podMonitors, u.GetNamespace()+"/"+u.GetName(), m, err)
+	return upsertMonitor(x, x.podMonitors, x.rejectedPodMonitors,
+		u.GetNamespace()+"/"+u.GetName(), u.GetResourceVersion(), m, err)
 }
 
 // DeletePodMonitor removes one.
 func (x *Index) DeletePodMonitor(namespace, name string) {
 	x.mu.Lock()
 	defer x.mu.Unlock()
-	deleteMonitor(x, x.podMonitors, namespace+"/"+name)
+	deleteMonitor(x, x.podMonitors, x.rejectedPodMonitors, namespace+"/"+name)
 }
 
 // PodMonitors returns all pod monitors (shared, treat as immutable).

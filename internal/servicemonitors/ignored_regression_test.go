@@ -202,7 +202,7 @@ func TestNewlyParsedFieldsAreReportedThroughTheDecode(t *testing.T) {
 	if err := ix.Upsert(u); err != nil {
 		t.Fatal(err)
 	}
-	if refs := ix.AuthSecretRefs(); len(refs) != 0 {
+	if refs := ix.AuthSecretRefs(); refs.Len() != 0 {
 		t.Errorf("proxyConnectHeader's secret refs reached the scrape-auth allowlist: %v", refs)
 	}
 }

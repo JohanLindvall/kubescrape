@@ -140,6 +140,20 @@ type Server struct {
 	monValid  bool
 	monBuilds atomic.Int64
 
+	// pmMu guards the PodMonitor snapshot, held on the monitor index's change
+	// token for the same reason monCache is: the list is identical across every
+	// node and every request until a monitor changes, and allPodMonitors was
+	// hoisted out of the per-pod loop but not out of the per-REQUEST path — so
+	// a 200-PodMonitor cluster re-sorted 200 pointers and minted 200 name
+	// strings and 200 namespace slices on every agent's poll (measured 15,576 B
+	// and 204 allocations per request at 200 monitors, for an answer that is a
+	// pure function of the index contents). pmBuilds counts snapshots for tests.
+	pmMu     sync.Mutex
+	pmCache  []podMonitorRef
+	pmGen    uint64
+	pmValid  bool
+	pmBuilds atomic.Int64
+
 	// targetsMu guards the per-node ETag memo (see nodeTargetsNotModified).
 	// targetBuilds counts full derivations of a node's target list, for tests:
 	// it is the thing the memo exists to avoid.
@@ -147,11 +161,21 @@ type Server struct {
 	targetsETags map[string]nodeTargetsETag
 	targetBuilds atomic.Int64
 
+	// svcSelectorEvals counts Service selector evaluations on the targets path,
+	// for tests: it is the term that used to be O(pods × services), and the
+	// property worth pinning is its SHAPE, which nothing else can see. A
+	// wall-clock or allocation assertion would pass at any fixture size the
+	// scan happens to be cheap at. Accumulated per request and added once, so
+	// the count costs one atomic per derivation rather than one per pod.
+	svcSelectorEvals atomic.Int64
+
 	// warnRefs throttles the per-ref scrape-auth failure log, warnShadowed the
-	// per-pair shadowed-monitor one. Both are concurrency-safe on their own, so
+	// per-pair shadowed-monitor one and warnCollide the per-(pod, host:port)
+	// colliding-identity one. All three are concurrency-safe on their own, so
 	// they need no mutex here.
 	warnRefs     *logdedupe.Table
 	warnShadowed *logdedupe.Table
+	warnCollide  *logdedupe.Table
 
 	// inFlight counts /v1 requests currently inside a handler. It exists for
 	// ONE line: when http.Server.Shutdown hits its budget it stops waiting and
@@ -197,6 +221,7 @@ func New(cfg Config) *Server {
 		logger:           cfg.Log,
 		warnRefs:         logdedupe.New(maxScrapeAuthWarnRefs, scrapeAuthWarnEvery),
 		warnShadowed:     logdedupe.New(maxShadowedWarnPairs, shadowWarnEvery),
+		warnCollide:      logdedupe.New(maxCollisionWarnKeys, collisionWarnEvery),
 		draining:         make(chan struct{}),
 	}
 }
@@ -632,12 +657,53 @@ func (s *Server) monitoredServices() map[string][]monitorEndpoint {
 }
 
 // buildMonitoredServices resolves the monitor→services match from scratch.
+//
+// The Service snapshot is taken once per RUN of monitors sharing a namespace
+// set, not once per monitor. services.All allocates and fills a slice of every
+// Service in the named namespaces, and the shape this cross product exists for
+// is a fleet of cluster-wide monitors (`namespaceSelector.any: true`, what
+// kube-prometheus-stack ships): 200 of them over 2,000 Services took 200 copies
+// of the same 2,000-element list — measured 41.5 MB and ~89 ms per rebuild, of
+// which the snapshots are the overwhelming majority, and a rebuild is triggered
+// by ANY Service change while monMu is held against every concurrent poll.
+//
+// ONE entry rather than a map of them, deliberately: Index.All returns monitors
+// in (namespace, name) order, which puts monitors sharing a namespace set in a
+// run for both shapes that matter — every monitor cluster-wide (one run), and
+// monitors selecting their own namespace (one run per namespace) — so a
+// one-entry cache collapses the repeats without ever holding more than a single
+// snapshot alive. A map keyed by the namespace set would retain one snapshot
+// per distinct set for the whole build, which on a heavily overlapping set of
+// matchNames is the same 41.5 MB, live at once instead of collectable.
+//
+// The monitor ORDER is untouched, and must be: the order endpoints land in
+// out[uid] is the encounter order MergeMonitorEndpoint folds in, so grouping
+// monitors by namespace set — the obvious alternative — would silently change
+// which monitor names a merged target and how its relabel chains concatenate.
+//
+// The monitors of one run now see ONE point-in-time view of their namespaces
+// instead of a fresh read apiece, which is if anything more coherent; a Service
+// change arriving mid-build is handled where it always was, by monitoredServices
+// reading the change tokens BEFORE the build and rebuilding on the next call.
 func (s *Server) buildMonitoredServices() map[string][]monitorEndpoint {
 	s.monBuilds.Add(1)
 	out := map[string][]monitorEndpoint{}
+	var (
+		runKey   []byte
+		runSvcs  []*services.Service
+		runValid bool
+		key      []byte
+	)
 	for _, m := range s.monitors.All() {
 		name := m.Namespace + "/" + m.Name
-		for _, svc := range s.services.All(m.ServiceNamespaces()) {
+		namespaces := m.ServiceNamespaces()
+		key = appendNamespaceSetKey(key[:0], namespaces)
+		if !runValid || string(key) != string(runKey) {
+			runSvcs = s.services.All(namespaces)
+			runKey = append(runKey[:0], key...)
+			runValid = true
+		}
+		for _, svc := range runSvcs {
 			if !m.Selector.Matches(labels.Set(svc.Labels)) {
 				continue
 			}
@@ -647,6 +713,24 @@ func (s *Server) buildMonitoredServices() map[string][]monitorEndpoint {
 		}
 	}
 	return out
+}
+
+// appendNamespaceSetKey renders a monitor's resolved namespace set into dst.
+//
+// nil means EVERY namespace and is not the same question as any explicit list,
+// so it gets its own marker byte rather than an empty join — otherwise a
+// cluster-wide monitor and one naming no namespace at all would share a
+// snapshot, and the cluster-wide one would be answered with nothing.
+func appendNamespaceSetKey(dst []byte, namespaces []string) []byte {
+	if namespaces == nil {
+		return append(dst, 0x01)
+	}
+	dst = append(dst, 0x02)
+	for _, ns := range namespaces {
+		dst = append(dst, ns...)
+		dst = append(dst, 0x00)
+	}
+	return dst
 }
 
 // podMonitorRef is one indexed PodMonitor with its "namespace/name" already
@@ -662,16 +746,33 @@ type podMonitorRef struct {
 	namespaces []string
 }
 
-// allPodMonitors snapshots the indexed PodMonitors for one request.
+// allPodMonitors returns the indexed PodMonitors, rendered once per change of
+// the monitor index rather than once per request (see pmMu).
+//
+// THE RESULT IS SHARED AND MUST BE TREATED AS READ-ONLY — the same contract
+// monitoredServices and servicemonitors.PodMonitors already carry.
+// podMonitorsFor only reads it, copying the refs it keeps into a caller-owned
+// slice.
 func (s *Server) allPodMonitors() []podMonitorRef {
 	if s.monitors == nil {
 		return nil
 	}
+	// The token BEFORE the lock, exactly as monitoredServices does: a change
+	// landing during the render is then recorded as unbuilt and re-rendered on
+	// the next call, rather than stamped as already-included.
+	gen := s.monitors.Generation()
+	s.pmMu.Lock()
+	defer s.pmMu.Unlock()
+	if s.pmValid && s.pmGen == gen {
+		return s.pmCache
+	}
+	s.pmBuilds.Add(1)
 	all := s.monitors.PodMonitors()
 	out := make([]podMonitorRef, 0, len(all))
 	for _, m := range all {
 		out = append(out, podMonitorRef{monitor: m, name: m.Namespace + "/" + m.Name, namespaces: m.PodNamespaces()})
 	}
+	s.pmCache, s.pmGen, s.pmValid = out, gen, true
 	return out
 }
 
@@ -694,6 +795,92 @@ func podMonitorsFor(pod kubemeta.Pod, all []podMonitorRef, out []podMonitorRef) 
 func (s *Server) enrich(pod *kubemeta.Pod, refs []metav1.OwnerReference) {
 	pod.Owners = s.resolver.Resolve(pod.Namespace, refs)
 	pod.NamespaceMetadata = s.resolver.Namespace(pod.Namespace)
+}
+
+// enrichCache memoises ONE request's related-object resolutions.
+//
+// A node's pods are not a random sample of the cluster: they are a handful of
+// workloads' replicas in one or two namespaces, so the same owner chain and the
+// same namespace are resolved over and over. Each resolution is a lister Get
+// plus kubemeta.CopyMeta — two map clones and the annotation denylist filter —
+// per owner in the chain, and the chain is followed (ReplicaSet → Deployment),
+// so a 110-pod node owned by 8 ReplicaSets under one Deployment performed 110
+// namespace resolutions where 1 suffices and 110 chain resolutions where 8 do.
+//
+// PER REQUEST, never per process: the resolvers read live informer caches, and
+// a memo that outlived the request would stop a label edit on a Deployment or a
+// namespace from ever reaching the documents this route serves.
+//
+// The resolved values are SHARED by every pod that keys to them. Nothing
+// mutates them — enrich is the only writer of Pod.Owners and
+// Pod.NamespaceMetadata in the process, and both are read-only from there on
+// (marshalled and discarded) — which is the same treat-as-immutable contract
+// the store's records and the Service snapshots are served under.
+type enrichCache struct {
+	// owners is keyed by the resolution's full input: the namespace and every
+	// owner reference. Keying on the pod's controller UID alone would be
+	// smaller and wrong — Resolve takes the WHOLE ref list and reads each ref's
+	// name and kind, and it cross-checks the UID against the cached object, so
+	// two refs agreeing on UID but not on name are two different answers.
+	owners map[string][]kubemeta.Owner
+	// namespaces caches the pod's namespace metadata. A nil value is a real
+	// answer (the namespace is not in the informer cache), so presence is read
+	// from the lookup's second result, never from the value.
+	namespaces map[string]*kubemeta.ObjectMeta
+	// key is the owner key's scratch buffer, reused across pods: a map read
+	// through map[string(key)] does not copy, so only a genuinely new chain
+	// allocates.
+	key []byte
+}
+
+// enrichCached is enrich through a request-scoped memo (see enrichCache).
+func (s *Server) enrichCached(c *enrichCache, pod *kubemeta.Pod, refs []metav1.OwnerReference) {
+	c.key = appendOwnerKey(c.key[:0], pod.Namespace, refs)
+	if owners, ok := c.owners[string(c.key)]; ok {
+		pod.Owners = owners
+	} else {
+		pod.Owners = s.resolver.Resolve(pod.Namespace, refs)
+		if c.owners == nil {
+			c.owners = make(map[string][]kubemeta.Owner, 8)
+		}
+		c.owners[string(c.key)] = pod.Owners
+	}
+	if meta, ok := c.namespaces[pod.Namespace]; ok {
+		pod.NamespaceMetadata = meta
+	} else {
+		pod.NamespaceMetadata = s.resolver.Namespace(pod.Namespace)
+		if c.namespaces == nil {
+			c.namespaces = make(map[string]*kubemeta.ObjectMeta, 2)
+		}
+		c.namespaces[pod.Namespace] = pod.NamespaceMetadata
+	}
+}
+
+// appendOwnerKey renders (namespace, owner refs) into dst.
+//
+// NUL-separated, because it is the one byte none of these fields can contain: a
+// namespace and an owner name are DNS labels, a kind and an apiVersion are Go
+// identifiers and a group/version pair, and a UID is hex with dashes. The
+// controller flag rides as a byte because Resolve copies it onto the answer.
+func appendOwnerKey(dst []byte, namespace string, refs []metav1.OwnerReference) []byte {
+	dst = append(dst, namespace...)
+	for i := range refs {
+		ref := &refs[i]
+		dst = append(dst, 0x00)
+		dst = append(dst, ref.APIVersion...)
+		dst = append(dst, 0x00)
+		dst = append(dst, ref.Kind...)
+		dst = append(dst, 0x00)
+		dst = append(dst, ref.Name...)
+		dst = append(dst, 0x00)
+		dst = append(dst, ref.UID...)
+		if ref.Controller != nil && *ref.Controller {
+			dst = append(dst, 0x01)
+		} else {
+			dst = append(dst, 0x02)
+		}
+	}
+	return dst
 }
 
 func (s *Server) isReady() bool {
@@ -749,11 +936,38 @@ func (s *Server) requireReady(w http.ResponseWriter, retryAfter string) bool {
 // 1200 concurrent lookups all parked here at a cap of 4, 71 MB of them, with
 // the blocked-lookup gauge reading 0. And this is the startup window, when a
 // whole agent fleet is likeliest to be asking at once.
+//
+// …and it carries GetContainer's other guard too: a lookup that CANNOT block
+// does not pay for the park. See the ctx check below.
 func (s *Server) waitReady(ctx context.Context) error {
 	select {
 	case <-s.ready:
 		return nil
 	default:
+	}
+	if ctx.Err() != nil {
+		// A lookup that cannot block must not pay for the parking protocol —
+		// store.GetContainer's guard, on the spot that is reached FIRST. Both
+		// TryPark and Unpark take the store's EXCLUSIVE lock, which during the
+		// initial sync is the lock the pod informer needs once per pod to fill
+		// the very caches this request is waiting for, and the park below could
+		// never wait on anything for a ctx that is already done.
+		//
+		// The shape is not hypothetical: the agent's cadvisor batcher and two
+		// ingest-enricher paths poll this route with `?wait=0`, and -cadvisor is
+		// on by default. Without this, every one of those on every node spends
+		// two exclusive acquisitions during the restart window, can be REFUSED
+		// by a cap it declined to use — taking a slot from the blocking lookups
+		// the cap exists to protect — and moves
+		// kubescrape_container_lookups_shed_total, which is the abuse signal a
+		// rolling update must not page like.
+		//
+		// errNotSynced, not a miss: this pod's caches genuinely are not filled,
+		// so the honest answer is the retryable 503 the ctx.Done() arm below
+		// returns. (That arm and s.draining could both be ready at once there,
+		// with select picking arbitrarily; this makes the wait=0 case one
+		// answer rather than a coin flip.)
+		return errNotSynced
 	}
 	if s.store != nil {
 		if !s.store.TryPark() {

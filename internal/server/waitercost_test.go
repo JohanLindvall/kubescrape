@@ -725,9 +725,13 @@ func hostileShapes() []hostileShape {
 // that is specific to -count=2; a second iteration only guarantees there is a
 // previous round to be polluted by. With the join in place an ordinary poll
 // measured between 14,261 and 14,834 B over 120 measurements in twelve
-// processes. (retainedWhileParked, the fuzz half, joined its handlers from the
-// start and says why in as many words. The rule is the same one; only this half
-// was not applying it.)
+// processes. (retainedWhileParked, the fuzz half, said the same thing from the
+// start — and was doing HALF of it: its join was a wg.Wait, which returns one
+// deferred call before the goroutines exit, so it gave back its handlers
+// without giving back the stacks that still rooted their requests. That is the
+// version of this bug that survived here, it made the fuzz target flaky on a
+// clean tree, and it is fixed there now. The rule is one rule: give the
+// goroutines back, not the handlers.)
 func parkAndMeasure(t *testing.T, n int, shape hostileShape) (perWaiter int) {
 	t.Helper()
 
@@ -902,19 +906,48 @@ const plausibleParkedHeap = 8 << 10
 // per-connection floor the end-to-end test measures. The mux is not optional
 // though — r.matches, one of the copies of the path, exists only for a request
 // routed by one.
-func retainedWhileParked(t *testing.T, head string, n int) (perRequest int, validator string, ok bool) {
+func retainedWhileParked(t measureT, head string, n int) (perRequest int, validator string, ok bool) {
 	t.Helper()
 	st := store.New(time.Minute)
-	st.SetMaxWaiters(n + 8)
+	// Every attempt parks another batch (see the corroboration loop below), and
+	// the pilot holds one slot of its own.
+	st.SetMaxWaiters(n*measureAttempts + 8)
 	h := newAPI(st, 10*time.Minute).Handler()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	var wg sync.WaitGroup
+	// The goroutine count this case has to give back, taken before it starts
+	// any: see the join below.
+	quiescent := runtime.NumGoroutine()
 	// Cancel and JOIN: a straggler from one case still unwinding while the next
 	// one takes its baseline would land in that case's delta.
+	//
+	// wg.Wait() is not that join, and believing it was is what made this target
+	// flaky. It returns when every handler has RETURNED, which is one deferred
+	// call short of the goroutine exiting — and until the goroutine exits its
+	// stack is a GC root holding that case's Request, URL and response writer.
+	// So the next case took its baseline with up to n of the previous case's
+	// parked requests still reachable, and they were freed inside its window: a
+	// SUBTRACTION from the delta it was measuring, which is the same failure
+	// parkAndMeasure's doc describes for the other half of this file. Measured
+	// at HEAD, on the whole package in three concurrent processes: 3 failures in
+	// 36 runs, reading 338, 368 and 427 B per request against a floor of 512 and
+	// a true figure of 1.2-2.3 KB — and in the instrumented run, both heap
+	// readings had SETTLED in every failing case, so it was never the settle
+	// loop.
+	//
+	// Best-effort, deliberately: it waits for the count to come back and then
+	// gives up quietly rather than failing, because a fuzz target must not
+	// acquire a new way to go red on a scheduler that is merely slow. What
+	// GUARANTEES the reading is the corroboration below; this only keeps the
+	// dominant noise out of it.
 	t.Cleanup(func() {
 		cancel()
 		wg.Wait()
+		deadline := time.Now().Add(10 * time.Second)
+		for runtime.NumGoroutine() > quiescent && time.Now().Before(deadline) {
+			time.Sleep(time.Millisecond)
+		}
 	})
 
 	parse := func() *http.Request {
@@ -977,30 +1010,67 @@ func retainedWhileParked(t *testing.T, head string, n int) (perRequest int, vali
 		runtime.Gosched()
 	}
 
-	baseHeap := retainedHeap()
-	for range n {
-		r := parse()
-		if r == nil {
-			return 0, "", false
+	// The reading, CORROBORATED before it is disbelieved: each attempt parks
+	// another batch of n over a fresh baseline, which is an independent estimate
+	// of the same quantity, and the floor fails only when EVERY attempt reads
+	// low.
+	//
+	// Only the floor is retried, never the bound the property is stated as. The
+	// two are different kinds of check and that is the whole argument for
+	// treating them differently: the ceiling is the PROPERTY (retrying it until
+	// it passes is how a guard is weakened into a formality), while the floor is
+	// this harness auditing ITSELF, and the thing it exists to catch — a delta
+	// that has lost the term it reports — reads low on every attempt by
+	// construction. A one-off heap release landing inside one window does not.
+	parkedSoFar := 1 // the pilot
+	readings := make([]int, 0, measureAttempts)
+	for range measureAttempts {
+		baseHeap := retainedHeap()
+		if heapChurn != nil {
+			heapChurn()
 		}
-		_ = serve(r)
+		for range n {
+			r := parse()
+			if r == nil {
+				return 0, "", false
+			}
+			_ = serve(r)
+		}
+		parkedSoFar += n
+		if !parked(parkedSoFar) {
+			t.Fatalf("only %d of %d requests parked after the pilot did", st.BlockedLookups()-1, parkedSoFar-1)
+		}
+		// NOT max(delta, 0): clamping a negative delta to zero converts a broken
+		// measurement into a passing one, and every other assertion here is an
+		// upper bound, so zero passes them all. A park that retains nothing is not
+		// a cost that improved — it is a reading that stopped reading.
+		perRequest = int((retainedHeap() - baseHeap) / int64(n))
+		readings = append(readings, perRequest)
+		if perRequest >= plausibleRequestHeap {
+			return perRequest, validator, true
+		}
 	}
-	if !parked(n + 1) {
-		t.Fatalf("only %d of %d requests parked after the pilot did", st.BlockedLookups()-1, n)
-	}
-	// NOT max(delta, 0): clamping a negative delta to zero converts a broken
-	// measurement into a passing one, and every other assertion here is an
-	// upper bound, so zero passes them all. A park that retains nothing is not
-	// a cost that improved — it is a reading that stopped reading.
-	perRequest = int((retainedHeap() - baseHeap) / int64(n))
-	if perRequest < plausibleRequestHeap {
-		t.Fatalf("%d parked requests retained %d B each, under the %d B a parked request "+
-			"cannot help holding (its Request, URL, context and response writer): this is a "+
-			"measurement that stopped measuring, and it would pass the upper bound above",
-			n, perRequest, plausibleRequestHeap)
-	}
-	return perRequest, validator, true
+	t.Fatalf("%d parked requests retained %v B each over %d independent attempts, every one of them under "+
+		"the %d B a parked request cannot help holding (its Request, URL, context and response writer): a "+
+		"single low reading is noise — some other part of the process freeing memory inside the window — but "+
+		"a low reading that REPEATS is a measurement that stopped measuring, and it would pass the upper "+
+		"bound above",
+		n, readings, measureAttempts, plausibleRequestHeap)
+	return 0, "", false
 }
+
+// measureAttempts is how many independent readings the floor gets before it is
+// believed. Three, because the noise it filters is a one-off (see the loop) and
+// because every attempt costs another n parked requests.
+const measureAttempts = 3
+
+// heapChurn, when non-nil, runs immediately after a measurement takes its
+// baseline. It is the one thing this file cannot ask the runtime for: a heap
+// release timed to land INSIDE the window, which is the noise that was actually
+// observed here (a previous case's teardown). Tests set it to prove that a
+// one-off release is retried and a repeating one still fails; nothing in
+// production or in the fuzz path sets it.
+var heapChurn func()
 
 // plausibleRequestHeap is the floor a no-listener park measurement clears
 // before it is believed. The connection floor (plausibleParkedHeap, two 4 KiB

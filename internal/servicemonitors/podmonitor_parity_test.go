@@ -37,7 +37,7 @@ func TestPodMonitorUnparseableUpdateRemoves(t *testing.T) {
 	})); err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := ix.AuthSecretRefs()["ns/tok/token"]; !ok {
+	if !ix.AuthSecretRefs().Has("ns/tok/token") {
 		t.Fatal("setup: the endpoint's secret ref should be allowlisted")
 	}
 
@@ -53,7 +53,7 @@ func TestPodMonitorUnparseableUpdateRemoves(t *testing.T) {
 	}
 	// The allowlist must shrink with it, or the refused spec keeps a Secret
 	// reachable through /v1/scrape-auth.
-	if _, ok := ix.AuthSecretRefs()["ns/tok/token"]; ok {
+	if ix.AuthSecretRefs().Has("ns/tok/token") {
 		t.Error("the removed podmonitor's secret ref is still allowlisted")
 	}
 }

@@ -70,3 +70,48 @@ func TestVersionlessServicesAreAlwaysApplied(t *testing.T) {
 		t.Fatalf("a versionless update was dropped: %+v", matched)
 	}
 }
+
+// The same rule on the delete side, which is where the two index types had
+// drifted: servicemonitors' deleteMonitor returns without bumping when the key
+// was absent, while this one bumped before it had established that anything
+// was there to remove.
+//
+// The reachable no-op delete is the tail of the same-name guard above: a
+// Service recreated inside a relist gap arrives as an Update with a new UID,
+// Upsert drops the predecessor, and the predecessor's own Delete event then
+// arrives for a UID that is already gone.
+func TestGenerationIgnoresADeleteOfSomethingNeverIndexed(t *testing.T) {
+	ix := NewIndex()
+	ix.Upsert(svcRV("uid-a", "web", "7", nil))
+	after := ix.Generation()
+
+	ix.Delete("ns", "uid-does-not-exist")
+	if got := ix.Generation(); got != after {
+		t.Errorf("the change token moved (%d -> %d) for a delete of an unknown UID", after, got)
+	}
+	ix.Delete("no-such-namespace", "uid-a")
+	if got := ix.Generation(); got != after {
+		t.Errorf("the change token moved (%d -> %d) for a delete in a namespace holding no Services", after, got)
+	}
+
+	// The recreation-in-a-relist-gap tail: the successor's Upsert already
+	// dropped the predecessor, so its late Delete finds nothing.
+	ix.Upsert(svcRV("uid-b", "web", "1", nil)) // same name, new UID
+	after = ix.Generation()
+	ix.Delete("ns", "uid-a")
+	if got := ix.Generation(); got != after {
+		t.Errorf("the change token moved (%d -> %d) for the late Delete of a predecessor Upsert had already replaced", after, got)
+	}
+	if matched := ix.Matching("ns", map[string]string{"app": "web"}); len(matched) != 1 || matched[0].UID != "uid-b" {
+		t.Fatalf("the late Delete disturbed the live successor: %+v", matched)
+	}
+
+	// ...and a delete that really removes something still moves it.
+	ix.Delete("ns", "uid-b")
+	if got := ix.Generation(); got == after {
+		t.Error("the change token did not move for a delete that removed a Service")
+	}
+	if matched := ix.Matching("ns", map[string]string{"app": "web"}); len(matched) != 0 {
+		t.Fatalf("the Service survived its delete: %+v", matched)
+	}
+}

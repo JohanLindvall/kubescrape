@@ -131,7 +131,7 @@ func TestAuthMaterialParsedAndAuthorized(t *testing.T) {
 		"monitoring/creds/user", "monitoring/creds/pass",
 		"monitoring/etcd-tls/ca.crt", "monitoring/etcd-tls/tls.crt", "monitoring/etcd-tls/tls.key",
 	} {
-		if _, ok := refs[want]; !ok {
+		if !refs.Has(want) {
 			t.Errorf("%q not authorized for serving; the agent could not fetch it", want)
 		}
 	}

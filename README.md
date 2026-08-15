@@ -229,10 +229,16 @@ deployment that runs the binary.
 
 The address is taken from the connection and **never** from a header
 (`X-Forwarded-For` is caller-controlled, and this endpoint hands out whatever
-pod owns the address it is given). Resolution goes through the same live-only
-pod-IP index as `/v1/pod-ips`, so a caller on hostNetwork — sharing the node
-IP — or behind an address-rewriting hop gets a `404` rather than someone
-else's identity. Responses carry `Cache-Control: private, max-age=<TTL>` +
+pod owns the address it is given). A forwarding header is still *read* — but
+only as evidence, never as a source: a request carrying `Forwarded`,
+`X-Forwarded-For` or `X-Real-Ip` is answered `404`, because the header says
+the connection's address may no longer be the caller's, and a wrong identity
+here is stamped on every one of that agent's records. Resolution otherwise
+goes through the same live-only pod-IP index as `/v1/pod-ips`, so a caller on
+hostNetwork — sharing the node IP — or behind an address-rewriting hop also
+gets a `404` rather than someone else's identity. Every `404` falls back to a
+lookup by pod name, so the cost of the strict answer is one extra request, not
+a missing identity. Responses carry `Cache-Control: private, max-age=<TTL>` +
 `ETag`: the answer names its caller, so a per-client cache may keep it (and
 revalidate with `If-None-Match`) while a shared one must not store it at all.
 

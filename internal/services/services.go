@@ -172,19 +172,29 @@ func (ix *Index) Upsert(svc *corev1.Service) {
 func (ix *Index) Delete(namespace string, uid types.UID) {
 	ix.mu.Lock()
 	defer ix.mu.Unlock()
-	ix.gen.Add(1)
 	m := ix.byNamespace[namespace]
 	if m == nil {
 		return
 	}
-	if svc, ok := m[uid]; ok {
-		// Only if this UID still holds the name: a recreation may already have
-		// claimed it above, and a late Delete for the predecessor must not
-		// unindex the live successor.
-		nameKey := namespace + "/" + svc.Name
-		if cur, ok := ix.byName[nameKey]; ok && cur == uid {
-			delete(ix.byName, nameKey)
-		}
+	svc, ok := m[uid]
+	if !ok {
+		// A delete for a UID this index never held changes nothing, and the
+		// token's whole job is to say when something changed — the rule Upsert
+		// states above and servicemonitors' deleteMonitor already implements.
+		// The reachable case is the one Upsert's same-name guard handles: a
+		// Service recreated inside a relist gap has its predecessor removed
+		// there, and the predecessor's own late Delete then arrives for a UID
+		// that is gone. Bumping for it would rebuild the whole monitor→Service
+		// cross product on the next targets request.
+		return
+	}
+	ix.gen.Add(1)
+	// Only if this UID still holds the name: a recreation may already have
+	// claimed it above, and a late Delete for the predecessor must not
+	// unindex the live successor.
+	nameKey := namespace + "/" + svc.Name
+	if cur, ok := ix.byName[nameKey]; ok && cur == uid {
+		delete(ix.byName, nameKey)
 	}
 	delete(m, uid)
 	if len(m) == 0 {

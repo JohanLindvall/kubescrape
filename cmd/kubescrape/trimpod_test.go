@@ -1,16 +1,19 @@
 package main
 
-// The pod informer's transform drops most of the pod SPEC to keep the cache
-// small. That is only safe while the dropped parts are exactly the parts
-// nothing reads — and "nothing reads them" is a property of
-// kubeconvert.FromPod, which can change. So assert it the strong way: convert
-// the ORIGINAL and the TRIMMED pod and require the results to be identical.
-// A future FromPod that starts reading, say, container resources fails here
-// rather than in production, where it would surface as a silently empty field.
+// The pod informer's transform drops most of the pod SPEC and most of the
+// STATUS to keep the cache small. That is only safe while the dropped parts
+// are exactly the parts nothing reads — and "nothing reads them" is a property
+// of kubeconvert.FromPod (plus the three ObjectMeta fields store.UpsertPod
+// takes off the same cached object), which can change. So assert it the strong
+// way: convert the ORIGINAL and the TRIMMED pod and require the results to be
+// identical. A future FromPod that starts reading, say, container resources
+// fails here rather than in production, where it would surface as a silently
+// empty field.
 
 import (
 	"reflect"
 	"testing"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -65,8 +68,9 @@ func fatPod() *corev1.Pod {
 	return &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Namespace: "prod", Name: "web-abc123", UID: types.UID("uid-1"),
-			Labels:      map[string]string{"app": "web"},
-			Annotations: map[string]string{"prometheus.io/scrape": "true"},
+			ResourceVersion: "100042",
+			Labels:          map[string]string{"app": "web"},
+			Annotations:     map[string]string{"prometheus.io/scrape": "true"},
 			ManagedFields: []metav1.ManagedFieldsEntry{
 				{Manager: "kubectl", Operation: metav1.ManagedFieldsOperationApply},
 			},
@@ -104,19 +108,94 @@ func fatPod() *corev1.Pod {
 			Overhead:        corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("64Mi")},
 			DNSConfig:       &corev1.PodDNSConfig{Nameservers: []string{"10.0.0.10"}},
 		},
-		Status: corev1.PodStatus{
-			Phase: corev1.PodRunning, PodIP: "10.1.2.3",
-			PodIPs: []corev1.PodIP{{IP: "10.1.2.3"}, {IP: "fd00::1"}},
-			HostIP: "192.168.1.1",
-			Conditions: []corev1.PodCondition{
-				{Type: corev1.PodReady, Status: corev1.ConditionTrue}},
-			ContainerStatuses: []corev1.ContainerStatus{{
-				Name: "app", ContainerID: "containerd://abc123", Ready: true, RestartCount: 2,
-				Image: "registry.example.com/app:v1.2.3", ImageID: "sha256:deadbeef",
-				State:                corev1.ContainerState{Running: &corev1.ContainerStateRunning{}},
-				LastTerminationState: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ContainerID: "containerd://old"}},
-			}},
+		Status: fatStatus(),
+	}
+}
+
+// fatStatus carries every status field trimPodStatus removes, and every field
+// it must preserve — including the three per-container arms (running, waiting,
+// terminated) and a lastState, since each is read through a different branch
+// of convertContainer. A field left unset here makes the equivalence assertion
+// below compare zero to zero for it, and the guarantee holds vacuously for
+// exactly the field that was forgotten.
+func fatStatus() corev1.PodStatus {
+	// A FIXED instant, not metav1.Now(): the guard below converts two
+	// separately built fixtures and compares the results, and a clock reading
+	// would differ between them for reasons that have nothing to do with the
+	// trim.
+	now := metav1.NewTime(time.Date(2026, 7, 5, 12, 0, 0, 0, time.UTC))
+	fat := func(c corev1.ContainerStatus) corev1.ContainerStatus {
+		rro := corev1.RecursiveReadOnlyDisabled
+		c.Ready = true
+		// The RESOLVED image, deliberately not the spec's: FromPod takes the
+		// spec image, and if it ever started taking this one instead, a fixture
+		// that spelled them the same would pass while the trim silently emptied
+		// the field.
+		c.Image = "registry.example.com/" + c.Name + "@sha256:resolved"
+		c.ImageID = "registry.example.com/" + c.Name + "@sha256:deadbeef"
+		c.Started = ptr(true)
+		c.Resources = &corev1.ResourceRequirements{
+			Requests: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("128Mi")},
+			Limits:   corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("500m")},
+		}
+		c.AllocatedResources = corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("100m")}
+		c.AllocatedResourcesStatus = []corev1.ResourceStatus{{Name: "example.com/gpu"}}
+		c.VolumeMounts = []corev1.VolumeMountStatus{
+			{Name: "data", MountPath: "/data", RecursiveReadOnly: &rro}}
+		c.User = &corev1.ContainerUser{Linux: &corev1.LinuxContainerUser{UID: 1000, GID: 1000}}
+		c.StopSignal = ptr(corev1.SIGTERM)
+		return c
+	}
+	return corev1.PodStatus{
+		Phase: corev1.PodRunning, PodIP: "10.1.2.3",
+		PodIPs:    []corev1.PodIP{{IP: "10.1.2.3"}, {IP: "fd00::1"}},
+		HostIP:    "192.168.1.1",
+		StartTime: &now,
+		Conditions: []corev1.PodCondition{
+			{Type: corev1.PodInitialized, Status: corev1.ConditionTrue, LastTransitionTime: now},
+			{Type: corev1.PodReady, Status: corev1.ConditionTrue, LastTransitionTime: now,
+				Reason: "SomeReason", Message: "some message"},
+			{Type: corev1.ContainersReady, Status: corev1.ConditionTrue, LastTransitionTime: now},
+			{Type: corev1.PodScheduled, Status: corev1.ConditionTrue, LastTransitionTime: now},
 		},
+		InitContainerStatuses: []corev1.ContainerStatus{fat(corev1.ContainerStatus{
+			Name: "init", ContainerID: "containerd://init1", RestartCount: 1,
+			State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{
+				ExitCode: 0, Signal: 9, Reason: "Completed", Message: "done",
+				StartedAt: now, FinishedAt: now, ContainerID: "containerd://init1"}},
+		})},
+		ContainerStatuses: []corev1.ContainerStatus{
+			fat(corev1.ContainerStatus{
+				Name: "app", ContainerID: "containerd://abc123", RestartCount: 2,
+				State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{StartedAt: now}},
+				LastTerminationState: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{
+					ExitCode: 137, Signal: 9, Reason: "OOMKilled", Message: "killed",
+					StartedAt: now, FinishedAt: now, ContainerID: "containerd://old"}},
+			}),
+			fat(corev1.ContainerStatus{
+				Name: "sidecar", ContainerID: "containerd://side1", RestartCount: 7,
+				State: corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{
+					Reason: "CrashLoopBackOff", Message: "back-off 5m0s restarting failed container"}},
+				LastTerminationState: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{
+					ExitCode: 1, Reason: "Error", Message: "panic: nil pointer dereference",
+					StartedAt: now, FinishedAt: now, ContainerID: "containerd://side0"}},
+			}),
+		},
+		EphemeralContainerStatuses: []corev1.ContainerStatus{fat(corev1.ContainerStatus{
+			Name: "debug", ContainerID: "containerd://dbg1",
+			State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{StartedAt: now}},
+		})},
+		// Every remaining pod-level status field trimPodStatus drops.
+		Message: "pod message", Reason: "Evicted", NominatedNodeName: "node-2",
+		QOSClass:                    corev1.PodQOSBurstable,
+		HostIPs:                     []corev1.HostIP{{IP: "192.168.1.1"}},
+		Resize:                      "InProgress",
+		ObservedGeneration:          4,
+		ResourceClaimStatuses:       []corev1.PodResourceClaimStatus{{Name: "claim"}},
+		ExtendedResourceClaimStatus: &corev1.PodExtendedResourceClaimStatus{ResourceClaimName: "erc"},
+		AllocatedResources:          corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("100m")},
+		Resources: &corev1.ResourceRequirements{
+			Limits: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("1")}},
 	}
 }
 
@@ -198,8 +277,134 @@ func TestTrimPodActuallyDropsTheHeavyFields(t *testing.T) {
 		len(p.Spec.Containers[0].Ports) != 2 || p.Spec.Containers[0].Name != "app" {
 		t.Errorf("trim removed something FromPod needs: %+v", p.Spec.Containers[0])
 	}
-	if p.Status.PodIP == "" || len(p.Status.ContainerStatuses) != 1 {
-		t.Error("trim must not touch status")
+}
+
+// The status half, which on a current kubelet is nearly half of what the spec
+// trim leaves behind. Same vacuity argument as above: without it the
+// equivalence guard passes just as happily over a transform that trims
+// nothing.
+func TestTrimPodActuallyDropsTheHeavyStatusFields(t *testing.T) {
+	trimmed, err := trimPod(fatPod())
+	if err != nil {
+		t.Fatalf("trimPod: %v", err)
+	}
+	st := trimmed.(*corev1.Pod).Status
+
+	for _, f := range []struct {
+		name string
+		got  any
+	}{
+		{"Status.Message", st.Message},
+		{"Status.Reason", st.Reason},
+		{"Status.NominatedNodeName", st.NominatedNodeName},
+		{"Status.QOSClass", st.QOSClass},
+		{"Status.HostIPs", st.HostIPs},
+		{"Status.Resize", st.Resize},
+		{"Status.ObservedGeneration", st.ObservedGeneration},
+		{"Status.ResourceClaimStatuses", st.ResourceClaimStatuses},
+		{"Status.ExtendedResourceClaimStatus", st.ExtendedResourceClaimStatus},
+		{"Status.AllocatedResources", st.AllocatedResources},
+		{"Status.Resources", st.Resources},
+	} {
+		if !reflect.ValueOf(f.got).IsZero() {
+			t.Errorf("%s was not trimmed: %+v", f.name, f.got)
+		}
+	}
+
+	// Only the PodReady condition survives, and only its Status.
+	if len(st.Conditions) != 1 || st.Conditions[0].Type != corev1.PodReady ||
+		st.Conditions[0].Status != corev1.ConditionTrue {
+		t.Fatalf("conditions were not reduced to PodReady: %+v", st.Conditions)
+	}
+	if !reflect.DeepEqual(st.Conditions[0],
+		corev1.PodCondition{Type: corev1.PodReady, Status: corev1.ConditionTrue}) {
+		t.Errorf("the kept condition carries more than its status: %+v", st.Conditions[0])
+	}
+	// A reslice would keep the other three conditions' array alive, which is
+	// the cost the reduction exists to remove.
+	if cap(st.Conditions) != 1 {
+		t.Errorf("the kept condition still points into the full array (cap %d): the dropped conditions are retained", cap(st.Conditions))
+	}
+
+	all := [][]corev1.ContainerStatus{st.InitContainerStatuses, st.ContainerStatuses, st.EphemeralContainerStatuses}
+	if len(st.InitContainerStatuses) != 1 || len(st.ContainerStatuses) != 2 || len(st.EphemeralContainerStatuses) != 1 {
+		t.Fatalf("a container status list was dropped: %+v", all)
+	}
+	for _, list := range all {
+		for i := range list {
+			c := &list[i]
+			for _, f := range []struct {
+				name string
+				got  any
+			}{
+				{"Image", c.Image},
+				{"Started", c.Started},
+				{"Resources", c.Resources},
+				{"AllocatedResources", c.AllocatedResources},
+				{"AllocatedResourcesStatus", c.AllocatedResourcesStatus},
+				{"VolumeMounts", c.VolumeMounts},
+				{"User", c.User},
+				{"StopSignal", c.StopSignal},
+			} {
+				if !reflect.ValueOf(f.got).IsZero() {
+					t.Errorf("container %q status %s was not trimmed: %+v", c.Name, f.name, f.got)
+				}
+			}
+			for arm, s := range map[string]*corev1.ContainerState{"state": &c.State, "lastState": &c.LastTerminationState} {
+				if s.Waiting != nil && s.Waiting.Message != "" {
+					t.Errorf("container %q %s.waiting.message retained: %q", c.Name, arm, s.Waiting.Message)
+				}
+				if s.Terminated != nil {
+					if s.Terminated.Reason != "" || s.Terminated.Message != "" || s.Terminated.Signal != 0 {
+						t.Errorf("container %q %s.terminated kept reason/message/signal: %+v", c.Name, arm, s.Terminated)
+					}
+				}
+			}
+		}
+	}
+
+	// ...and what the status must still carry.
+	if st.Phase != corev1.PodRunning || st.PodIP == "" || len(st.PodIPs) != 2 ||
+		st.HostIP == "" || st.StartTime == nil {
+		t.Errorf("trim removed a pod status field FromPod reads: %+v", st)
+	}
+	app := st.ContainerStatuses[0]
+	if app.Name != "app" || app.ContainerID == "" || app.ImageID == "" ||
+		app.RestartCount != 2 || !app.Ready || app.State.Running == nil ||
+		app.LastTerminationState.Terminated == nil ||
+		app.LastTerminationState.Terminated.ContainerID == "" {
+		t.Errorf("trim removed a container status field FromPod reads: %+v", app)
+	}
+}
+
+// The trim's contract covers everything that reads the CACHED object, and
+// store.UpsertPod reads three fields off it that never pass through FromPod:
+// the UID it keys records by, the resourceVersion its resync short-circuit
+// compares, and the owner references that become every served pod's owner
+// chain. The equivalence guard above cannot see them — a trim that nilled
+// OwnerReferences would pass it and silently strip the owner chain from every
+// pod document.
+func TestTrimPodPreservesEverythingUpsertPodReads(t *testing.T) {
+	original := fatPod()
+	trimmed, err := trimPod(fatPod())
+	if err != nil {
+		t.Fatalf("trimPod: %v", err)
+	}
+	p := trimmed.(*corev1.Pod)
+
+	if p.UID != original.UID {
+		t.Errorf("UID changed: %q -> %q; the store keys every record by it", original.UID, p.UID)
+	}
+	if p.ResourceVersion != original.ResourceVersion {
+		t.Errorf("resourceVersion changed: %q -> %q; the resync short-circuit compares it, so every resync would rewrite the store under the write lock",
+			original.ResourceVersion, p.ResourceVersion)
+	}
+	if !reflect.DeepEqual(p.OwnerReferences, original.OwnerReferences) {
+		t.Errorf("ownerReferences changed:\n original: %+v\n trimmed:  %+v\n every served pod's owner chain is resolved from these",
+			original.OwnerReferences, p.OwnerReferences)
+	}
+	if len(p.OwnerReferences) == 0 || p.ResourceVersion == "" {
+		t.Fatal("the fixture must populate these, or this guard holds vacuously")
 	}
 }
 

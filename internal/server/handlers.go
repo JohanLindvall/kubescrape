@@ -224,11 +224,48 @@ func (s *Server) handlePodByIP(w http.ResponseWriter, r *http.Request) {
 // wired into every deployment that runs the binary.
 //
 // The address comes from the connection (r.RemoteAddr) and NEVER from a
-// header: X-Forwarded-For is caller-controlled, and this endpoint hands out
-// whatever pod owns the address it is given. It resolves through the same
-// live-only pod-IP index as /v1/pod-ips, so a caller behind an address-
-// rewriting hop — or one on hostNetwork, sharing the node IP — gets a 404
-// rather than someone else's identity.
+// header for the LOOKUP: X-Forwarded-For is caller-controlled, and this
+// endpoint hands out whatever pod owns the address it is given. It resolves
+// through the same live-only pod-IP index as /v1/pod-ips, so a caller on
+// hostNetwork (sharing the node IP), one behind SNAT, and one from outside the
+// cluster all get a 404 rather than someone else's identity.
+//
+// WHAT THIS ROUTE CANNOT DO, stated plainly because the answer is an identity:
+// a hop that RE-ORIGINATES the request is itself usually a pod, and its address
+// is a perfectly good pod IP, so the answer names THE HOP. The connection is
+// all there is — nothing distinguishes "this address is my caller" from "this
+// address is a proxy in front of my caller" — and the corroboration the agent
+// does on its side (selfmeta.verified, pod name against hostname) needs
+// something the caller would have to already know, which is the very thing
+// this route exists to supply.
+//
+// So the one hop that CAN be recognised is refused: a request carrying a
+// forwarding header (Forwarded, X-Forwarded-For, X-Real-Ip) says, in the hop's
+// own words, that the connection is not the caller's. The header is still never
+// READ for an address — it selects nothing and names nobody, so no caller can
+// use one to be told about somebody else; its mere PRESENCE is the whole
+// effect, and the refusal it produces is one a caller can only inflict on
+// itself.
+//
+// THAT COSTS SOMETHING, and it is paid by a deployment that works today: a
+// forwarding header is evidence of a HOP, not evidence of address REWRITING,
+// and a sidecar in the caller's OWN network namespace — a mesh proxy on the
+// agent's pod — appends X-Forwarded-For while leaving the source address
+// exactly as it was. Such a caller was answered 200, correctly, and is now
+// answered 404. The trade is taken because the two outcomes are not symmetric.
+// The 404 is loud and recoverable: the agent falls back to a lookup BY NAME and
+// ends up with the SAME pod, at one extra request per -self-attributes-refresh
+// and a visible kubescrape_self_metadata_lookups_total{outcome="by_name"}. The
+// answer it prevents is silent and permanent: a proxy pod's name, uid and
+// namespace stamped on every self-metric the caller ever exports, 200, cached,
+// nothing counted anywhere. The fallback is not ASSUMED to cover the sidecar —
+// cmd/kubescrape-agent's TestSelfResolveSurvivesASidecarThatAppendsForwardedFor
+// drives this handler with that header through a real store and requires the
+// agent to come out holding its own identity.
+//
+// A hop that adds no header remains indistinguishable from the caller, and
+// TestASilentReOriginatingHopIsAnsweredWithTheHopsOwnIdentity pins that limit
+// rather than leaving it to be rediscovered as a bug.
 //
 // The response is cached like any other metadata 200, but PRIVATE: it names
 // the caller, so only a per-client cache may hold it. That is what lets a
@@ -241,9 +278,37 @@ func (s *Server) handleSelf(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, fmt.Sprintf("unparseable peer address %q", r.RemoteAddr))
 		return
 	}
+	via := forwardedVia(r)
 	s.servePod(w, r, cachePrivate,
-		func() (store.NodePod, bool) { return s.store.GetPodByIP(ip) },
-		func() string { return fmt.Sprintf("no live pod with peer IP %q", ip) })
+		func() (store.NodePod, bool) {
+			if via != "" {
+				return store.NodePod{}, false
+			}
+			return s.store.GetPodByIP(ip)
+		},
+		func() string {
+			if via != "" {
+				return fmt.Sprintf("request carries %s, so this connection belongs to a hop and not to the "+
+					"caller; /v1/self can only attribute a direct connection", via)
+			}
+			return fmt.Sprintf("no live pod with peer IP %q", ip)
+		})
+}
+
+// forwardedHeaders are the headers a hop sets when it re-originates a request.
+// Any one of them present is the hop declaring itself, which is the only
+// evidence /v1/self can have that the address it is holding is not its
+// caller's.
+var forwardedHeaders = []string{"Forwarded", "X-Forwarded-For", "X-Real-Ip"}
+
+// forwardedVia names the forwarding header the request carries, or "".
+func forwardedVia(r *http.Request) string {
+	for _, h := range forwardedHeaders {
+		if r.Header.Get(h) != "" {
+			return h
+		}
+	}
+	return ""
 }
 
 // handleNodeMetadata serves GET /v1/nodes/{node}/metadata: the node's
@@ -268,8 +333,9 @@ func (s *Server) handleNodeTargets(w http.ResponseWriter, r *http.Request) {
 	}
 	node := r.PathValue("node")
 	// A conditional GET answered from the ETag memo never builds the response
-	// at all — see nodeTargetsNotModified. Every agent poll after the first is
-	// one of these.
+	// at all — see nodeTargetsNotModified, including which callers can actually
+	// reach it (a DaemonSet agent polling on its scrape interval is not one of
+	// them).
 	if s.nodeTargetsNotModified(w, r, node) {
 		return
 	}
@@ -318,13 +384,13 @@ func (s *Server) nodeTargets(node string) (targets []kubemeta.ScrapeTarget, buil
 	// 110 sorts and 22k selector evaluations per request, per agent, per scrape
 	// cycle. The sibling ServiceMonitor match is memoised for the same reason.
 	allPodMonitors := s.allPodMonitors()
-	// ONE snapshot of each namespace's Services for the whole request. The
-	// per-pod Matching() call it replaces took the index RLock and walked every
-	// Service in the pod's namespace, so a 1,000-Service namespace cost 110 lock
-	// round trips and 110 map walks per request — on the DEFAULT annotation
-	// path, while its two siblings on the same request (monitoredServices, the
-	// PodMonitor list) had both already been hoisted out of this loop.
-	svcByNamespace := s.services.InNamespaces(podNamespaces(pods))
+	// ONE snapshot of each namespace's Services for the whole request, NARROWED
+	// to the ones that can opt a pod in. The per-pod Matching() call the
+	// snapshot replaced took the index RLock and walked every Service in the
+	// pod's namespace, so a 1,000-Service namespace cost 110 lock round trips
+	// and 110 map walks per request; the narrowing is what takes the remaining
+	// per-pod WALK off the same shape (see optInServices).
+	optIn := optInServices(s.services.InNamespaces(podNamespaces(pods)), monitored)
 
 	var d targetDedup
 	// The monitor endpoints are swept once per matched SERVICE, so a pod behind
@@ -333,26 +399,28 @@ func (s *Server) nodeTargets(node string) (targets []kubemeta.ScrapeTarget, buil
 	var offers monitorOffers
 	var matched []*services.Service
 	var podMonitors []podMonitorRef
+	// enrich is memoised for the request: a node's pods share a handful of
+	// owner chains and one or two namespaces (see enrichCache).
+	var enr enrichCache
+	var evals int64
 	for _, np := range pods {
 		if !scrape.Scrapeable(np.Pod) {
 			continue // finished/deleted pods can never yield targets
 		}
 		// Cheap pre-check before the (per-pod) enrichment work: does the pod
-		// or any service selecting it opt into scraping?
-		matched = matchingServices(svcByNamespace[np.Pod.Namespace], np.Pod.Labels, matched[:0])
+		// or any service selecting it opt into scraping? matched holds only
+		// opt-in Services, so its emptiness IS "no Service opts this pod in" —
+		// the separate scan for an annotated-or-monitored member is what the
+		// narrowing above replaced.
+		inNamespace := optIn[np.Pod.Namespace]
+		evals += int64(len(inNamespace))
+		matched = matchingServices(inNamespace, np.Pod.Labels, matched[:0])
 		podAnnotated := np.Pod.Annotations[scrape.AnnotationScrape] == "true"
-		svcAnnotated := false
-		for _, svc := range matched {
-			if svc.Annotations[scrape.AnnotationScrape] == "true" || len(monitored[svc.UID]) > 0 {
-				svcAnnotated = true
-				break
-			}
-		}
 		podMonitors = podMonitorsFor(np.Pod, allPodMonitors, podMonitors[:0])
-		if !podAnnotated && !svcAnnotated && len(podMonitors) == 0 {
+		if !podAnnotated && len(matched) == 0 && len(podMonitors) == 0 {
 			continue
 		}
-		s.enrich(&np.Pod, np.OwnerRefs)
+		s.enrichCached(&enr, &np.Pod, np.OwnerRefs)
 
 		d.reset(&targets)
 		offers.reset()
@@ -425,6 +493,7 @@ func (s *Server) nodeTargets(node string) (targets []kubemeta.ScrapeTarget, buil
 			}
 		}
 	}
+	s.svcSelectorEvals.Add(evals)
 	// Deterministic order: PodsOnNode iterates a map, and writeCached's ETag is
 	// a body hash — an order that shuffled per request would mint a fresh ETag
 	// every time and defeat the 304 revalidation entirely. URL first, then
@@ -444,6 +513,13 @@ func (s *Server) nodeTargets(node string) (targets []kubemeta.ScrapeTarget, buil
 		}
 		return targets[i].Pod.UID < targets[j].Pod.UID
 	})
+	// Every declaration on the node has been offered, so the served list is
+	// final and the identities it exports can be checked against each other.
+	// AFTER the sort, so the members of a group are listed in the order the
+	// response lists them and one collision reads the same way on every request.
+	for _, c := range d.inst.Collisions(targets) {
+		s.reportInstanceCollision(c)
+	}
 	return targets, true
 }
 
@@ -458,6 +534,55 @@ func podNamespaces(pods []store.NodePod) []string {
 		}
 		seen[np.Pod.Namespace] = struct{}{}
 		out = append(out, np.Pod.Namespace)
+	}
+	return out
+}
+
+// optInServices narrows each namespace's Service snapshot to the Services that
+// can OPT A POD IN — scrape-annotated, or selected by a ServiceMonitor.
+//
+// It is the difference between O(pods × services) and O(services) per request.
+// The selector scan below runs per pod, and it ran over the namespace's ENTIRE
+// Service population before deciding the pod was uninteresting: a node whose
+// pods are neither annotated nor selected by anything paid the whole scan on
+// every request of every scrape cycle — measured at 110 pods, on the derivation
+// alone: 26 µs with no Services in the namespace, 8.0 ms at 1,000, 18.5 ms at
+// 2,000 and 38 ms at 4,000, for a response of `{"node":"node1","targets":[]}`.
+// A Service population is a namespace-wide property while the pods on a node
+// are a sliver of it, so the term that grows is the one that had no business
+// being inside the loop.
+//
+// Narrowing here cannot change what is served, because a Service that opts into
+// nothing contributes nothing downstream: scrape.ServiceTargets returns nil
+// unless the Service carries prometheus.io/scrape="true", and the monitor sweep
+// iterates monitored[svc.UID], which is empty by construction for the rest. It
+// cannot reorder anything either — the snapshot is sorted by name and filtering
+// preserves order, which is what keeps the encounter order (hence which monitor
+// names a merged target, and which Service the dedup's carryForward donates)
+// deterministic.
+//
+// /v1/explain deliberately does NOT narrow: it reports every Service whose
+// selector matches, annotated or not, because "this Service selects your pod
+// and opts into nothing" is exactly the answer an operator came for.
+func optInServices(byNamespace map[string][]*services.Service, monitored map[string][]monitorEndpoint) map[string][]*services.Service {
+	var out map[string][]*services.Service
+	for ns, list := range byNamespace {
+		var kept []*services.Service
+		for _, svc := range list {
+			if svc.Annotations[scrape.AnnotationScrape] == "true" || len(monitored[svc.UID]) > 0 {
+				kept = append(kept, svc)
+			}
+		}
+		if len(kept) == 0 {
+			// A namespace with no opt-in Service is absent rather than empty:
+			// reading a missing key yields the nil slice the loop wants, and
+			// most namespaces on most nodes are this case.
+			continue
+		}
+		if out == nil {
+			out = make(map[string][]*services.Service, len(byNamespace))
+		}
+		out[ns] = kept
 	}
 	return out
 }
@@ -528,18 +653,45 @@ type targetDedup struct {
 	// holder pointed operators at a monitor with no auth material at all.
 	// Lazily allocated: most pods never merge an auth group.
 	authOwner map[string]string
+	// base is where this pod's targets start in *out — the dedup is per pod
+	// while the slice accumulates across the node, and collisions() needs the
+	// pod's own window.
+	base int
+	// inst is the identity scan's scratch, kept here so ONE map serves a whole
+	// request: the targets path scans the node's finished list once, explain
+	// scans the one pod it derived.
+	inst scrape.InstanceScan
 }
 
 // reset points the dedup at a fresh pod. The maps are reused across pods:
 // allocated once per request rather than once per pod.
 func (d *targetDedup) reset(out *[]kubemeta.ScrapeTarget) {
 	d.out = out
+	d.base = len(*out)
 	if d.urlOwner == nil {
 		d.urlOwner = make(map[string]int, 4)
 	} else {
 		clear(d.urlOwner)
 	}
 	clear(d.authOwner)
+}
+
+// collisions reports the served targets of THIS pod that the URL dedup keeps
+// apart and the exported (job, instance) cannot — same address, different path
+// or scheme (scrape/instance.go carries the whole argument, including why they
+// are served rather than merged away).
+//
+// It is the same scan the targets path runs, over the dedup's own window, so
+// the two cannot disagree about what a collision IS: explain exists to explain
+// what nodeTargets serves, and a second implementation shaped like this one is
+// exactly the drift explain_parity_test.go was written after.
+//
+// The SCOPE does differ, and honestly: this endpoint derives one pod, so a
+// collision whose other member is a DIFFERENT pod — two hostNetwork replicas of
+// one workload — is invisible here and is reported by the targets path, which
+// holds the node's whole list.
+func (d *targetDedup) collisions() []scrape.InstanceCollision {
+	return d.inst.Collisions((*d.out)[d.base:])
 }
 
 // adoptedAuth records/answers who supplies a URL's served auth (see authOwner).
@@ -591,25 +743,156 @@ func (d *targetDedup) add(t kubemeta.ScrapeTarget) {
 		return
 	}
 	// pod source wins over service source, and a monitor wins over both.
-	if held := &(*d.out)[i]; configuredTarget(&t) && !configuredTarget(held) {
+	held := &(*d.out)[i]
+	if configuredTarget(&t) && !configuredTarget(held) {
 		carryForward(&t, held)
 		*held = t
+		return
 	}
+	// The holder keeps the URL — and carries forward from the target it
+	// displaces, on this path too. The preference is about which DECLARATION
+	// wins, never about discarding a view of the endpoint the winner has no way
+	// to hold: a pod-annotation target arrives first and carries no Service, so
+	// the service-annotation target for the same URL used to be dropped whole
+	// and every sample of that endpoint lost k8s.service.name and
+	// k8s.service.uid — the identical loss carryForward was written for on the
+	// replace path, on the arm nobody had looked at. Which Service donates is
+	// deterministic: matchingServices preserves the snapshot's name order.
+	carryForward(held, &t)
 }
 
-// carryForward moves the fields the replaced target had and the winner lacks.
+// carryForward moves the fields the losing target had and the winner lacks.
 //
 // Today that is exactly the Service: a PODMONITOR selects pods directly and its
 // targets carry none, so replacing a service-annotation target with one wholesale
 // stripped k8s.service.name and k8s.service.uid from every sample of that
 // endpoint (promscrape's fillTargetResource reads target.Service). The
-// preference's own justification — that the monitor target carries strictly
-// MORE — is true of the ServiceMonitor arm, which sets Service, and false of
-// the PodMonitor one.
-func carryForward(winner, replaced *kubemeta.ScrapeTarget) {
+// preference's own justification — that the winner carries strictly MORE — is
+// true of the ServiceMonitor arm, which sets Service, and false both of the
+// PodMonitor one and of a pod-annotation target displacing a service-annotation
+// one, which is why add calls this on both of its paths.
+func carryForward(winner, loser *kubemeta.ScrapeTarget) {
 	if winner.Service == nil {
-		winner.Service = replaced.Service
+		winner.Service = loser.Service
 	}
+}
+
+// collisionWarnEvery bounds how often ONE colliding configuration may log. Like
+// the shadowed-monitor warning this is a STEADY state rather than an event: the
+// collision is re-derived on every targets request of every agent whose node
+// holds one of the pods, so an unthrottled line is a permanent flood
+// proportional to fleet size.
+const collisionWarnEvery = 30 * time.Minute
+
+// maxCollisionWarnKeys bounds the throttle table. Every component of a key is
+// something an operator WROTE (see collisionWarnKey), so the live set is
+// bounded by the cluster's configuration: a workload contributes one key per
+// annotated port per set of colliding declarations, whatever its replica count,
+// however often its pods are replaced and however many nodes it runs on. This
+// is belt and braces against a cluster that churns those declarations.
+const maxCollisionWarnKeys = 1024
+
+// collisionWarnKey identifies a collision by the CONFIGURATION that produced
+// it, never by the pods it currently lands on — the mistake this repo has
+// already recorded twice (the agent's warnTarget: "The URL embeds the pod IP,
+// so keying on it was wrong twice over: the table grew one entry per pod
+// incarnation for the process' whole life, and the warning re-fired on every
+// pod restart"; reportAuthConflict keys on the monitor PAIR because pairs are
+// bounded by the indexed monitors).
+//
+// Keying on the pod and its address was the same mistake a third time: measured
+// at 20 replicas of one misconfigured Deployment, 20 WARN lines — and 20 more
+// the moment a rollout gave them new names and new IPs, with the table at 40.
+// The throttle's own doc says it exists because an unthrottled line is a flood
+// proportional to fleet size, which is what that key left it as.
+//
+// What an operator has to fix is a workload's annotation, a Service's or a
+// monitor CR's, so the key is what those say: the JOB (namespace plus the
+// workload owner's name, which outlives every pod under it — attrs.ServiceName
+// takes the Deployment, not the per-revision ReplicaSet, so a rollout keeps the
+// key), the PORT, and each declaration's scheme, path, source and monitor. The
+// pod IP is the one part of the address that is an incarnation, and it is
+// exactly what is cut out.
+func collisionWarnKey(c scrape.InstanceCollision) string {
+	var b strings.Builder
+	b.WriteString(c.Job)
+	b.WriteByte(0)
+	b.WriteString(portOf(c.Address))
+	for _, ct := range c.Targets {
+		scheme, path := splitAtAddress(ct.URL, c.Address)
+		for _, part := range [...]string{scheme, path, ct.Source, ct.Monitor} {
+			b.WriteByte(0)
+			b.WriteString(part)
+		}
+	}
+	return b.String()
+}
+
+// portOf is the port half of a host:port. The host half is a pod IP, which is
+// an incarnation rather than configuration; the port was annotated.
+func portOf(address string) string {
+	if i := strings.LastIndexByte(address, ':'); i >= 0 {
+		return address[i+1:]
+	}
+	return ""
+}
+
+// splitAtAddress cuts a member's URL around the address the whole group shares,
+// leaving its two CONFIGURED halves — the scheme prefix and the path. They are
+// substrings, so this allocates nothing. A URL not containing the address is
+// unreachable for a derived target (the address is what built it); it degrades
+// to keying on the whole URL rather than dropping the member from the key.
+func splitAtAddress(url, address string) (scheme, path string) {
+	i := strings.Index(url, address)
+	if i < 0 {
+		return url, ""
+	}
+	return url[:i], url[i+len(address):]
+}
+
+// reportInstanceCollision warns that two served targets collapse onto one
+// exported series identity. BOTH are still served — scrape/instance.go carries
+// the argument for that — so this warning is the operator's only notice that
+// the two are about to overwrite each other.
+//
+// Every other symptom is anonymous: `up` alternating 0 and 1 at one timestamp,
+// a shared counter alternating between two endpoints' values so rate() reads
+// resets, or a backend's duplicate-sample rejection — none of which names the
+// pods, and none of which names the two declarations.
+func (s *Server) reportInstanceCollision(c scrape.InstanceCollision) {
+	// Counted BEFORE the throttle, like MonitorTargetShadowed: the log line is
+	// suppressed for collisionWarnEvery per configuration, so a counter behind
+	// the throttle would move once every half hour and there would be nothing
+	// an operator could alert on between. The price is that the rate tracks
+	// how often the node's target list is rebuilt rather than how broken the
+	// configuration is, which the metric's own help says in as many words.
+	obs.TargetIdentityCollisions.Inc()
+	allow, saturated := s.warnCollide.Allow(collisionWarnKey(c))
+	if saturated {
+		s.log().Warn("colliding-target warning dedupe table is full; further distinct collisions are suppressed",
+			"keys", maxCollisionWarnKeys)
+	}
+	if !allow {
+		return
+	}
+	// Each member names its pod: a group can span pods (two hostNetwork
+	// replicas of one workload), and those members agree on everything else.
+	members := make([]string, 0, len(c.Targets))
+	for _, ct := range c.Targets {
+		who := ct.Source
+		if ct.Monitor != "" {
+			who += " " + ct.Monitor
+		}
+		members = append(members, ct.URL+" ["+who+" on "+ct.Pod+"]")
+	}
+	s.log().Warn("two scrape targets export the same series identity; both are scraped and their samples collide",
+		"job", c.Job, "instance", c.Address, "targets", strings.Join(members, ", "),
+		"note", "the exported identity is the pod's workload plus host:port and does NOT include the path, so up, "+
+			"scrape_duration_seconds and scrape_samples_scraped arrive once per target with one identity and one "+
+			"timestamp, and any metric name the endpoints share becomes one series carrying both their values; "+
+			"give the endpoints separate container ports, or drop one declaration — and where the two targets name "+
+			"different pods, the two hostNetwork pods are annotated for one port on one node. Further warnings for "+
+			"this configuration are suppressed for "+collisionWarnEvery.String())
 }
 
 // configuredTarget reports whether t carries endpoint configuration that only
@@ -697,7 +980,7 @@ func (s *Server) handleScrapeAuth(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	if _, ok := s.monitors.AuthSecretRefs()[ns+"/"+name+"/"+key]; !ok {
+	if !s.monitors.AuthSecretRefs().Has(ns + "/" + name + "/" + key) {
 		writeError(w, http.StatusForbidden, "secret is not referenced by any monitor endpoint")
 		return
 	}
@@ -916,12 +1199,26 @@ const maxNodeTargetETags = 8192
 // nodeTargetsNotModified answers a conditional GET for a node's targets from
 // the ETag memo, without building the response — reporting whether it did.
 //
-// The ETag is a body hash, so a 304 otherwise cost EVERYTHING a 200 costs:
+// The ETag is a body hash, so a 304 otherwise costs EVERYTHING a 200 costs:
 // PodsOnNode, per-pod owner and namespace enrichment, target derivation, the
-// sort and a full json.Marshal, and then the body was discarded (measured at
+// sort and a full json.Marshal, and then the body is discarded (measured at
 // 110 pods: 1.87 ms, 1.90 MB and 7,553 allocations to send an empty 304, with
-// json.Marshal at 48.6% of the request's CPU). With a 10s TTL under a 30s
-// scrape interval EVERY agent poll is exactly this request.
+// json.Marshal at 48.6% of the request's CPU).
+//
+// WHO REACHES THIS, because it is narrower than it looks and the answer is
+// forced by the arithmetic below: the memo lives for cacheTTL from the build,
+// and cacheTTL is also the max-age the 200 advertises, so a client that honours
+// its own cache asks again exactly when — or after — the memo lapses. The two
+// windows are the same window. A single DaemonSet agent polling on its scrape
+// interval therefore NEVER hits this and pays the full derivation on every
+// poll; what does hit it is a caller asking faster than the max-age it was
+// given — a second agent during a rolling update, an operator's curl loop, a
+// client whose cache was evicted. Making it cover the agent needs a validity
+// signal that is not a wall clock (a change token spanning the pod store, the
+// owner/namespace caches, services.Index and servicemonitors.Index), which the
+// last two publish and the first two do not.
+// TestNodeTargetsMemoCannotServeAConformingClient pins that limit, and
+// BenchmarkNodeTargetsRevalidation reports both shapes side by side.
 //
 // Staleness stays bounded by the TTL because every grant — the 200's and this
 // 304's alike — expires by builtAt+TTL, the last instant the store is known to

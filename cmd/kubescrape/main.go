@@ -185,7 +185,7 @@ func startServiceMonitors(ctx context.Context, cfg *rest.Config, disco discovery
 	var synced []cache.InformerSynced
 	if haveSM {
 		smSynced, err := monitorInformer(dynFactory, servicemonitors.GVR, "servicemonitor", allowNS, log,
-			monitors.Upsert, monitors.Delete, monitors.Endpoints)
+			monitors.UpsertChanged, monitors.Delete, monitors.Endpoints)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -204,7 +204,7 @@ func startServiceMonitors(ctx context.Context, cfg *rest.Config, disco discovery
 	// fit the node-local model.)
 	if havePM {
 		pmSynced, err := monitorInformer(dynFactory, servicemonitors.PodGVR, "podmonitor", allowNS, log,
-			monitors.UpsertPodMonitor, monitors.DeletePodMonitor, monitors.PodEndpoints)
+			monitors.UpsertPodMonitorChanged, monitors.DeletePodMonitor, monitors.PodEndpoints)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -239,7 +239,7 @@ func monitorInformer(
 	kind string,
 	allowNS map[string]bool,
 	log *slog.Logger,
-	upsert func(*unstructured.Unstructured) error,
+	upsert func(*unstructured.Unstructured) (news bool, err error),
 	del func(namespace, name string),
 	endpoints func(namespace, name string) []servicemonitors.Endpoint,
 ) (cache.InformerSynced, error) {
@@ -261,18 +261,38 @@ func monitorInformer(
 			if !monitorAllowed(allowNS, kind, u, log) {
 				return
 			}
-			if err := upsert(u); err != nil {
+			news, err := upsert(u)
+			if err != nil {
 				// Counted, not just logged: an unparseable monitor DELETES it
 				// from the index, dropping every target it contributed. That
 				// is strictly more severe than the "some endpoint fields were
 				// ignored" case, which does get a metric — so the severe one
 				// must not be the unalertable one.
-				obs.MonitorParseErrors.WithLabelValues(kind).Inc()
-				log.Warn("parsing "+kind, "error", err,
-					"namespace", u.GetNamespace(), "name", u.GetName())
+				//
+				// …and, being the same shape of report as that sibling, gated
+				// the same way: this one described an EVENT while firing per
+				// DELIVERY too, so a single monitor nobody ever fixes re-logged
+				// and re-incremented every resync period forever. news is what
+				// separates the first sighting of a broken monitor — which must
+				// always be reported, and which is NOT a change to the index,
+				// since a monitor that never parsed was never in it — from the
+				// resync re-delivering it (see upsertMonitor).
+				if news {
+					obs.MonitorParseErrors.WithLabelValues(kind).Inc()
+					log.Warn("parsing "+kind, "error", err,
+						"namespace", u.GetNamespace(), "name", u.GetName())
+				}
 				return
 			}
-			warnIgnored(log, kind, u, endpoints(u.GetNamespace(), u.GetName()))
+			if news {
+				// Only on a real change. An informer resync re-delivers every
+				// object it holds, and the ignored-fields report is a statement
+				// about an EVENT: unthrottled, it made the WARN and
+				// kubescrape_monitor_fields_ignored_total repeat once per
+				// monitor per resync period, forever — the same repetition the
+				// namespace refusal above was demoted to Debug for.
+				warnIgnored(log, kind, u, endpoints(u.GetNamespace(), u.GetName()))
+			}
 		},
 		func(u *unstructured.Unstructured) { del(u.GetNamespace(), u.GetName()) },
 	))
@@ -1117,7 +1137,8 @@ func stripManagedFields(obj any) (any, error) {
 }
 
 // trimPod is the pod informer's transform: strip managedFields like every
-// other informer, then drop the parts of the SPEC nothing here reads.
+// other informer, then drop the parts of the SPEC and the STATUS nothing here
+// reads.
 //
 // The pod cache is the service's dominant memory cost, and kubeconvert.FromPod
 // consumes a thin slice of the spec — NodeName, HostNetwork, and each
@@ -1125,7 +1146,9 @@ func stripManagedFields(obj any) (any, error) {
 // vars, volumes and their mounts, resource requirements, the three probes,
 // lifecycle hooks, affinity, tolerations, scheduling gates) is retained
 // verbatim for the process lifetime and never read: on a large cluster that is
-// tens of megabytes of resident heap against a 128Mi request.
+// tens of megabytes of resident heap against a 128Mi request. trimPodStatus
+// below does the same for the status, which on a current kubelet is nearly
+// HALF of what this trim leaves behind.
 //
 // It runs as a TYPE SWITCH rather than trimming unconditionally because the
 // Service informer shares this factory and services.Index genuinely reads
@@ -1175,6 +1198,8 @@ func trimPod(obj any) (any, error) {
 	pod.Spec.Overhead = nil
 	pod.Spec.DNSConfig = nil
 	pod.Spec.HostAliases = nil
+
+	trimPodStatus(&pod.Status)
 	return pod, nil
 }
 
@@ -1201,6 +1226,127 @@ func trimContainer(c *corev1.Container) {
 	c.StartupProbe = nil
 	c.Lifecycle = nil
 	c.SecurityContext = nil
+}
+
+// trimPodStatus is the STATUS half of the trim: the spec trim above left the
+// status whole, and every release since 1.31 has widened ContainerStatus with
+// a per-container field nothing here reads. Measured as RETAINED heap over
+// protobuf-decoded pods (two containers — the shape client-go actually
+// caches), spec-trimmed and then status-trimmed:
+//
+//	pre-1.31 kubelet                          5896 ->  5400 B/pod
+//	+ volumeMounts        (1.31, beta/on)     6792 ->  5416 B/pod
+//	+ user/resources      (1.33, beta/on)     9832 ->  5416 B/pod  = 88 MB @20k pods
+//	+ allocatedResources  (alpha)            11256 ->  5416 B/pod  = 117 MB @20k pods
+//	a CrashLoopBackOff pod, 1.33               10824 ->  5848 B/pod
+//
+// against a chart that requests 128Mi and sets no limit. The 1.33 row is 45%
+// of what the informer cache holds per pod — an unchanged 20k-pod deployment
+// goes from 256 MB to 168 MB of pods, cache plus store. Nothing names the
+// waste while it accumulates: the store holds none of it, so
+// kubescrape_store_pods is unchanged and the only symptom is RSS.
+//
+// What it costs is one allocation and ~450 ns per pod event, on the informer
+// goroutine (indicative; measured on a loaded machine).
+//
+// These are KEEP-lists, not drop-lists, and deliberately so: the drop-list
+// style trimContainer uses above has to be extended by hand for every field a
+// future k8s adds, and the fields being added are exactly the fat ones
+// (in-place resize alone put a ResourceRequirements on every container status,
+// worth 1.4 KB/container). Rebuilding the struct from the fields
+// kubeconvert.FromPod reads means a new API field costs nothing the day it
+// ships. It is a struct assignment, so it allocates nothing; only the kept
+// condition does, and it frees a four-element array to do it.
+//
+// What FromPod reads is the whole of the keep-list below and nothing else —
+// TestTrimPodPreservesEverythingFromPodReads converts the fat pod and the
+// trimmed pod and requires the results to be identical, over a fixture that
+// populates every field named here (and gives the status a DIFFERENT resolved
+// image than the spec, so a future read of ContainerStatus.Image fails the
+// guard instead of matching by coincidence).
+func trimPodStatus(st *corev1.PodStatus) {
+	trimContainerStatuses(st.InitContainerStatuses)
+	trimContainerStatuses(st.ContainerStatuses)
+	trimContainerStatuses(st.EphemeralContainerStatuses)
+	*st = corev1.PodStatus{
+		Phase:                      st.Phase,
+		Conditions:                 readyConditionOnly(st.Conditions),
+		HostIP:                     st.HostIP,
+		PodIP:                      st.PodIP,
+		PodIPs:                     st.PodIPs,
+		StartTime:                  st.StartTime,
+		InitContainerStatuses:      st.InitContainerStatuses,
+		ContainerStatuses:          st.ContainerStatuses,
+		EphemeralContainerStatuses: st.EphemeralContainerStatuses,
+	}
+}
+
+// readyConditionOnly reduces the condition list to the one condition
+// kubemeta.Pod.Ready is derived from, carrying only its Status.
+//
+// A fresh one-element slice rather than a reslice of the original: the
+// kubelet reports four conditions on every healthy pod, and a reslice keeps
+// the whole four-element array (with both timestamps and the reason/message
+// strings of the three dropped entries) alive for the process lifetime, which
+// is the cost this is here to avoid.
+func readyConditionOnly(cs []corev1.PodCondition) []corev1.PodCondition {
+	for i := range cs {
+		if cs[i].Type == corev1.PodReady {
+			return []corev1.PodCondition{{Type: cs[i].Type, Status: cs[i].Status}}
+		}
+	}
+	return nil
+}
+
+func trimContainerStatuses(cs []corev1.ContainerStatus) {
+	for i := range cs {
+		trimContainerStatus(&cs[i])
+	}
+}
+
+// trimContainerStatus keeps the fields convertContainer and
+// previousIncarnation fold into kubemeta.Container. Image is NOT among them:
+// the model's Image comes from the SPEC container, and the status copy is the
+// runtime-resolved duplicate of it.
+func trimContainerStatus(c *corev1.ContainerStatus) {
+	trimContainerState(&c.State)
+	trimContainerState(&c.LastTerminationState)
+	*c = corev1.ContainerStatus{
+		Name:                 c.Name,
+		State:                c.State,
+		LastTerminationState: c.LastTerminationState,
+		Ready:                c.Ready,
+		RestartCount:         c.RestartCount,
+		ImageID:              c.ImageID,
+		ContainerID:          c.ContainerID,
+	}
+}
+
+// trimContainerState keeps the arms in place (replacing them would allocate on
+// every informer event) and clears the fields inside them that no reader
+// takes. The two casualties are the ones worth naming: a waiting container's
+// Message is the "back-off 5m0s restarting failed container=..." line, and a
+// terminated one's is up to 4 KiB of termination message — per container, on
+// exactly the pods a struggling cluster has most of.
+//
+// Terminated.ContainerID is kept in BOTH states although only
+// LastTerminationState's is read (it is the previous incarnation's ID). One
+// trim serves both arms, and the cost is one string on terminated containers.
+func trimContainerState(s *corev1.ContainerState) {
+	if s.Waiting != nil {
+		*s.Waiting = corev1.ContainerStateWaiting{Reason: s.Waiting.Reason}
+	}
+	if s.Terminated != nil {
+		*s.Terminated = corev1.ContainerStateTerminated{
+			ExitCode:    s.Terminated.ExitCode,
+			StartedAt:   s.Terminated.StartedAt,
+			FinishedAt:  s.Terminated.FinishedAt,
+			ContainerID: s.Terminated.ContainerID,
+		}
+	}
+	// ContainerStateRunning holds StartedAt and nothing else; there is
+	// nothing to drop, and a keep-list here would be a struct copy onto
+	// itself.
 }
 
 // watchErrors installs a watch-error handler that counts before delegating to

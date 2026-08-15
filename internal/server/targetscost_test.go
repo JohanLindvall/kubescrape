@@ -23,9 +23,14 @@ import (
 //
 // The ETag is a body hash, so a 304 otherwise cost everything a 200 cost —
 // PodsOnNode, per-pod owner and namespace enrichment, target derivation, the
-// sort and a full json.Marshal — and then threw the body away. With a 10s TTL
-// under a 30s scrape interval, that is what EVERY agent poll after the first
-// is.
+// sort and a full json.Marshal — and then threw the body away.
+//
+// The clock is HELD STILL here, and that is not a convenience: it is the only
+// way a revalidation lands inside the memo's window, because the window and the
+// max-age the response advertises are the same duration. This test therefore
+// pins the MECHANISM and says nothing about whether a DaemonSet agent ever
+// reaches it — TestNodeTargetsMemoCannotServeAConformingClient below is the one
+// that answers that, and the answer is no.
 func TestNodeTargetsRevalidationDoesNotRebuild(t *testing.T) {
 	f := targetsFixture{pods: 20, services: 5, cacheTTL: 10 * time.Second}
 	s := f.build(t)
@@ -118,6 +123,75 @@ func TestUnknownNodeIsNotMemoised(t *testing.T) {
 	getJSON(t, srv.URL+"/v1/nodes/node1/targets", http.StatusOK, nil)
 	if n := s.memoisedNodes(); n != 1 {
 		t.Errorf("ETags memoised for a real node = %d, want 1", n)
+	}
+}
+
+// THE MEMO'S REACH, pinned as a limit rather than left to be rediscovered.
+//
+// TestNodeTargetsRevalidationDoesNotRebuild above holds the server's clock
+// still, which is the only way a single conforming client's revalidation can
+// land inside the memo's window — and that is not an artefact of the test, it
+// is the design. The memo lives for cacheTTL from the build, and cacheTTL is
+// also the max-age the response advertises, so a client that honours its own
+// cache does not ask again until its copy expires, which is the instant the
+// memo does. The two windows are the same window.
+//
+// The consequence at the shipped defaults (-metadata-cache-ttl 10s under a 30s
+// -scrape-interval, one DaemonSet agent per node): EVERY steady-state poll
+// re-derives, re-marshals and re-hashes the node's whole target list and then
+// discards the body to write an empty 304. BenchmarkNodeTargetsRevalidation's
+// agent_cadence arm reports what that costs.
+//
+// What the memo does still cover is a caller asking FASTER than the max-age it
+// was handed — a second agent during a rolling update, an operator's curl loop,
+// a client whose cache was evicted — which is the two-client case below.
+//
+// Making it cover the DaemonSet needs a validity signal that is not a wall
+// clock: a change token spanning the pod store, the owner/namespace metadata
+// caches, the Services index and the monitor index, so an unchanged node can be
+// answered 304 without re-deriving AND without claiming freshness it has not
+// checked. Two of those four already publish one (services.Index.Generation,
+// servicemonitors.Index.Generation); the store and internal/owners do not. Until
+// they do, this test is what says the memo is not doing the job its own doc
+// comment describes — and it fails, deliberately, the moment someone makes it.
+func TestNodeTargetsMemoCannotServeAConformingClient(t *testing.T) {
+	const ttl, poll = 10 * time.Second, 30 * time.Second
+	f := targetsFixture{pods: 20, services: 5, cacheTTL: ttl}
+	s := f.build(t)
+	now := time.Now()
+	s.now = func() time.Time { return now }
+	srv := httptest.NewServer(s.Handler())
+	t.Cleanup(srv.Close)
+	url := srv.URL + "/v1/nodes/node1/targets"
+
+	etag := getETag(t, url, "")
+	builds := s.targetBuilds.Load()
+	const polls = 5
+	for range polls {
+		now = now.Add(poll) // the agent's next scrape cycle
+		if status, tag := conditionalGet(t, url, etag); status != http.StatusNotModified || tag != etag {
+			t.Fatalf("poll answered %d with tag %s, want 304 with %s", status, tag, etag)
+		}
+	}
+	if got := s.targetBuilds.Load() - builds; got != polls {
+		t.Errorf("derivations across %d polls at %s under a %s TTL = %d, want %d.\n"+
+			"If this is now FEWER, the memo has been given a real validity signal — good, but the "+
+			"staleness bound has to be restated: a 304 must still never claim the list is current "+
+			"as of longer ago than the response's own max-age unless something PROVED it unchanged.",
+			polls, poll, ttl, got, polls)
+	}
+
+	// The reach it does have: a second client asking inside the window is
+	// answered from the memo, which is what keeps this machinery worth its map.
+	now = now.Add(poll)
+	fresh := getETag(t, url, "") // rebuilds, and re-stamps builtAt at `now`
+	builds = s.targetBuilds.Load()
+	now = now.Add(ttl / 2)
+	if status, _ := conditionalGet(t, url, fresh); status != http.StatusNotModified {
+		t.Fatalf("in-window revalidation status = %d, want 304", status)
+	}
+	if got := s.targetBuilds.Load() - builds; got != 0 {
+		t.Errorf("derivations for a revalidation %s into a %s window = %d, want 0", ttl/2, ttl, got)
 	}
 }
 

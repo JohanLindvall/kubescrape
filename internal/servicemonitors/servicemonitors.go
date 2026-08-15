@@ -670,12 +670,35 @@ type Index struct {
 	mu          sync.RWMutex
 	monitors    map[string]*Monitor
 	podMonitors map[string]*PodMonitor
+	// The resourceVersion of the object last REJECTED under each key, per kind,
+	// so upsertMonitor can tell a newly broken monitor from the same broken
+	// monitor re-delivered by a resync. It holds nothing the index serves — a
+	// rejected monitor is exactly the one that is not indexed — and it is
+	// bounded by the broken monitors that exist: an entry is dropped when the
+	// key parses again (upsertMonitor) and when the object goes away
+	// (deleteMonitor, which clears it BEFORE its own not-indexed early return,
+	// since a rejected key is never in the monitor map).
+	//
+	// Per kind and not one shared map: the key is "namespace/name", which a
+	// ServiceMonitor and a PodMonitor may both carry.
+	rejectedMonitors    map[string]string
+	rejectedPodMonitors map[string]string
 	// gen changes on every mutation, so a consumer that derives something
 	// expensive from the whole index (the server's monitor→services cross
 	// product) can hold it until the index actually changes instead of until a
 	// timer lapses. Atomic and read without the lock: a stale read only costs
 	// one extra rebuild.
 	gen atomic.Uint64
+
+	// The AuthSecretRefs memo, on that same token. Its own mutex, never mu: the
+	// build takes mu for reading, and a read path that took the index's WRITE
+	// lock would serialise every /v1/scrape-auth request against the informer.
+	// authBuilds counts full harvests, for tests.
+	authMu     sync.Mutex
+	authRefs   AuthRefs
+	authGen    uint64
+	authValid  bool
+	authBuilds atomic.Int64
 }
 
 // Generation changes whenever the indexed monitors change. It is a change
@@ -686,8 +709,10 @@ func (ix *Index) Generation() uint64 { return ix.gen.Load() }
 // NewIndex creates an empty index.
 func NewIndex() *Index {
 	return &Index{
-		monitors:    make(map[string]*Monitor),
-		podMonitors: make(map[string]*PodMonitor),
+		monitors:            make(map[string]*Monitor),
+		podMonitors:         make(map[string]*PodMonitor),
+		rejectedMonitors:    make(map[string]string),
+		rejectedPodMonitors: make(map[string]string),
 	}
 }
 
@@ -712,30 +737,63 @@ func NewIndex() *Index {
 // (buildMonitoredServices: 19.8 ms and 9.67 MB at 50 monitors x 2,000
 // Services) — bumping it for a re-delivery meant a `-resync`-configured
 // service rebuilt that cross product on essentially every agent poll. Three
-// no-ops are recognised: the same resourceVersion stored under the same key, a
-// failed parse for a key that is already absent, and (in Delete) a key that was
-// not there. An EMPTY resourceVersion counts as changed — only hand-built
-// objects have one, and for those the version says nothing about the content.
+// deliveries leave the TOKEN alone: the same resourceVersion stored under the
+// same key, a failed parse for a key that is already absent, and (in Delete) a
+// key that was not there. An EMPTY resourceVersion counts as changed — only
+// hand-built objects have one, and for those the version says nothing about the
+// content.
+//
+// It REPORTS that decision as well as acting on it. The change token settles
+// what the index does; the CALLER has reporting of its own that is just as
+// event-shaped — the metadata service logs a monitor's uninterpreted fields and
+// counts kubescrape_monitor_fields_ignored_total, and it logs and counts a
+// monitor it could not parse — and a re-delivery re-fired all of it. With
+// `-resync 10m`, fifty monitors carrying a `relabelings` or a `sampleLimit`
+// (ordinary in a prometheus-operator install) meant fifty WARN lines every ten
+// minutes forever and a counter whose RATE tracked the resync period rather
+// than anything an operator changed, which is not a thing an alert can be
+// written against. The sibling refusal in the same handler chain was demoted to
+// Debug for exactly this reason, and said so.
+//
+// So the reported bool is "this delivery is NEWS", which is what an event
+// report needs, and the ERROR path is included in that — it is the branch the
+// gate is easiest to get wrong. `!had` cannot stand in for "already reported":
+// a monitor that never parsed is not indexed either, so the FIRST sighting of a
+// broken monitor and the thousandth resync of it are the same map lookup, and
+// gating on the index alone would silence exactly the report an operator needs
+// (an applied monitor doing nothing) while still firing forever for the one it
+// does not. The rejected-version tables are what separate them: news is a
+// monitor DROPPED from the index, a key never rejected before, or a rejection
+// at a resourceVersion different from the one last rejected — with an empty
+// resourceVersion news every time, the same rule the success path applies and
+// for the same reason.
 func upsertMonitor[M any, P interface {
 	*M
 	version() string
-}](ix *Index, monitors map[string]P, key string, m P, err error) error {
+}](ix *Index, monitors map[string]P, rejected map[string]string, key, resourceVersion string, m P, err error) (news bool, _ error) {
 	ix.mu.Lock()
 	defer ix.mu.Unlock()
 	if err != nil {
-		if _, had := monitors[key]; !had {
-			return err // a repeat of a rejected monitor changes nothing
+		_, had := monitors[key]
+		if had {
+			// The invalid-update-removes policy: this one really did change
+			// what is served, so the token moves and the report is news
+			// whatever was rejected here before.
+			delete(monitors, key)
+			ix.gen.Add(1)
 		}
-		delete(monitors, key)
-		ix.gen.Add(1)
-		return err
+		previous, seen := rejected[key]
+		rejected[key] = resourceVersion
+		return had || !seen || resourceVersion == "" || previous != resourceVersion, err
 	}
+	// It parses now, so a later failure is news again.
+	delete(rejected, key)
 	if cur, ok := monitors[key]; ok && m.version() != "" && cur.version() == m.version() {
-		return nil // re-delivery of the object already indexed
+		return false, nil // re-delivery of the object already indexed
 	}
 	monitors[key] = m
 	ix.gen.Add(1)
-	return nil
+	return true, nil
 }
 
 // version reports the resourceVersion a record was parsed from. It is the
@@ -747,22 +805,41 @@ func (m *Monitor) version() string { return m.resourceVersion }
 // Upsert parses and stores a ServiceMonitor (see upsertMonitor for the
 // invalid-update-removes policy).
 func (ix *Index) Upsert(u *unstructured.Unstructured) error {
+	_, err := ix.UpsertChanged(u)
+	return err
+}
+
+// UpsertChanged is Upsert, additionally reporting whether the delivery was
+// NEWS — false for the byte-identical re-delivery an informer resync makes of
+// every object it holds, including a re-delivery of an object that does not
+// parse. A caller whose logging or metrics describe an EVENT rather than a
+// state gates them on it; see upsertMonitor for what the distinction costs when
+// it is not made, and for why the error path cannot be gated on the index alone.
+func (ix *Index) UpsertChanged(u *unstructured.Unstructured) (bool, error) {
 	m, err := Parse(u)
-	return upsertMonitor(ix, ix.monitors, u.GetNamespace()+"/"+u.GetName(), m, err)
+	return upsertMonitor(ix, ix.monitors, ix.rejectedMonitors,
+		u.GetNamespace()+"/"+u.GetName(), u.GetResourceVersion(), m, err)
 }
 
 // Delete removes a monitor.
 func (ix *Index) Delete(namespace, name string) {
 	ix.mu.Lock()
 	defer ix.mu.Unlock()
-	deleteMonitor(ix, ix.monitors, namespace+"/"+name)
+	deleteMonitor(ix, ix.monitors, ix.rejectedMonitors, namespace+"/"+name)
 }
 
 // deleteMonitor removes a key and moves the change token only if it was there.
 // A delete for a key the index never held (a monitor that failed to parse, a
 // DeletedFinalStateUnknown replay) changes nothing, and the token's whole job
 // is to say when something changed. Caller holds the write lock.
-func deleteMonitor[M any](ix *Index, monitors map[string]*M, key string) {
+//
+// The rejection record goes FIRST and unconditionally, before that early
+// return: a rejected key is precisely the one that is not in the monitor map,
+// so clearing it afterwards would never run — leaving the entry until the
+// process exits, and making a re-created monitor that is broken the same way
+// report nothing.
+func deleteMonitor[M any](ix *Index, monitors map[string]*M, rejected map[string]string, key string) {
+	delete(rejected, key)
 	if _, had := monitors[key]; !had {
 		return
 	}
@@ -801,12 +878,74 @@ func (ix *Index) All() []*Monitor {
 	return sortedMonitors(ix.monitors, func(m *Monitor) (string, string) { return m.Namespace, m.Name })
 }
 
+// AuthRefs is the allowlist AuthSecretRefs answers with: a READ-ONLY view of
+// the memoised "namespace/name/key" set.
+//
+// A bare map is the obvious return type and was the previous one. It is the
+// wrong one HERE, because what is returned is not a value the caller owns: it
+// is the memo itself, shared by every concurrent /v1/scrape-auth request until
+// the next monitor change, and it is the boundary that keeps
+// -scrape-auth-secrets from being a general secret-read API. One entry written
+// into it widens what the service is willing to read, cluster-wide, with
+// nothing anywhere to notice. Handing out a COPY instead would put an
+// allocation back on the route the memo exists to keep free — a maps.Clone of
+// the 400 refs BenchmarkAuthSecretRefs builds is 13,656 B and 4 allocations per
+// request, against 0 for this view — so the safety is structural rather than a
+// copy or a comment: the set has no exported field and no method that can add
+// to it, so a caller outside this package CANNOT widen it. It is not trusted
+// not to.
+type AuthRefs struct{ refs map[string]struct{} }
+
+// Has reports whether ref — the "namespace/name/key" join the scrape-auth
+// route builds from its three path segments — is allowlisted.
+func (a AuthRefs) Has(ref string) bool {
+	_, ok := a.refs[ref]
+	return ok
+}
+
+// Len is the number of allowlisted references.
+func (a AuthRefs) Len() int { return len(a.refs) }
+
 // AuthSecretRefs returns the set of "namespace/name/key" bearerTokenSecret
 // references across all indexed ServiceMonitor and PodMonitor endpoints. The
 // scrape-auth endpoint serves ONLY these, so a direct HTTP caller cannot use
 // it to read arbitrary cluster secrets — only the tokens a monitor actually
 // references.
-func (x *Index) AuthSecretRefs() map[string]struct{} {
+//
+// THE RESULT IS THE SHARED MEMO, not a copy — see AuthRefs for why that is a
+// type and not a comment. (server.monitoredServices carries the same shared
+// contract by convention; its consumer is inside this repo's own request path,
+// and what it holds is not a security boundary.)
+//
+// Memoised on the change token, because this is the allowlist check on the ONE
+// route holding cluster-wide `secrets: get` and every agent re-asks each
+// credential once a minute: rebuilding it per request was O(monitors ×
+// endpoints) of pure garbage under the index's read lock, which the informer's
+// writes contend with. Measured (BenchmarkAuthSecretRefs, 200 ServiceMonitors +
+// 200 PodMonitors of one secret-bearing endpoint each): 27,112 B and 15
+// allocations per request, scaling with the REFS — an endpoint that also names
+// a tlsConfig ca/cert/keySecret is four of them — against 0 allocations once
+// the answer is held.
+func (x *Index) AuthSecretRefs() AuthRefs {
+	// Read the token BEFORE the build, exactly as server.monitoredServices
+	// does: a mutation landing during the harvest is then recorded as unbuilt
+	// and rebuilds on the next call, rather than being stamped as
+	// already-included and lost until some unrelated change moves the token.
+	// Getting this backwards on THIS map would leave a removed monitor's secret
+	// reachable.
+	gen := x.Generation()
+	x.authMu.Lock()
+	defer x.authMu.Unlock()
+	if !x.authValid || x.authGen != gen {
+		x.authRefs = x.buildAuthSecretRefs()
+		x.authGen, x.authValid = gen, true
+	}
+	return x.authRefs
+}
+
+// buildAuthSecretRefs harvests the allowlist from scratch.
+func (x *Index) buildAuthSecretRefs() AuthRefs {
+	x.authBuilds.Add(1)
 	x.mu.RLock()
 	defer x.mu.RUnlock()
 	out := map[string]struct{}{}
@@ -835,7 +974,7 @@ func (x *Index) AuthSecretRefs() map[string]struct{} {
 	for _, m := range x.podMonitors {
 		add(m.Endpoints)
 	}
-	return out
+	return AuthRefs{refs: out}
 }
 
 // IgnoredFields returns the distinct endpoint fields present on these

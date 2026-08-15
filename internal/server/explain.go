@@ -69,6 +69,15 @@ type explainTarget struct {
 	Source   string   `json:"source"`
 	Monitor  string   `json:"monitor,omitempty"`
 	Monitors []string `json:"monitors,omitempty"`
+	// CollidesWith lists the OTHER served targets of this pod that export the
+	// same series identity as this one — same host:port, different path or
+	// scheme, which the exported (job, instance) cannot tell apart
+	// (scrape.InstanceCollisions). Absent on the overwhelming majority of
+	// targets, which collide with nothing. The endpoint's whole purpose is
+	// "why is this pod (not) scraped, and what does it produce?", and a pod
+	// whose two targets overwrite each other's `up` was answered with a list
+	// of two targets and no hint that they collapse.
+	CollidesWith []string `json:"collidesWith,omitempty"`
 }
 
 func (s *Server) handleExplain(w http.ResponseWriter, r *http.Request) {
@@ -171,9 +180,23 @@ func (s *Server) explainPod(namespace, name string) (explainDoc, []kubemeta.Scra
 			doc.PodMonitors = append(doc.PodMonitors, em)
 		}
 	}
+	// The same collision set the targets path warns about, read off the same
+	// dedup rather than recomputed here: explain must not be able to describe a
+	// target list the server does not serve.
+	collidesWith := map[string][]string{}
+	for _, c := range d.collisions() {
+		for _, ct := range c.Targets {
+			for _, other := range c.Targets {
+				if other.URL != ct.URL {
+					collidesWith[ct.URL] = append(collidesWith[ct.URL], other.URL)
+				}
+			}
+		}
+	}
 	for _, t := range targets {
 		doc.Targets = append(doc.Targets, explainTarget{
 			URL: t.URL, Source: t.Source, Monitor: t.Monitor, Monitors: t.Monitors,
+			CollidesWith: collidesWith[t.URL],
 		})
 	}
 

@@ -156,6 +156,7 @@ is the documented alert for the non-buffered tailer.
 | `kubescrape_monitor_namespace_refused_total` | `kind` | Monitor upserts ignored because their namespace is not permitted by -monitor-namespaces (an informer re-delivery re-counts the same monitor, exactly like the sibling monitor_* counters). |
 | `kubescrape_monitor_parse_errors_total` | `kind` | Monitor upserts that failed to parse and were dropped from the index. |
 | `kubescrape_monitor_target_shadowed_total` | `kind` | Monitor endpoints whose auth/TLS conflicts with the monitor already holding the same URL on that pod (the holder's is served; the rest of the endpoint's configuration still merges). |
+| `kubescrape_monitors_rejected` | `kind` | Monitors whose current object fails to parse and is therefore ABSENT from the index — every target it contributed is dropped while this is nonzero. The state half of kubescrape_monitor_parse_errors_total (the news-gated event): the counter says a breakage happened, this says one is still true, and it returns to 0 when the object is fixed or deleted. Registered only while -servicemonitors is on with the CRD present, and a kind appears only while that CRD is watched, so 0 means watched-and-clean, never off. |
 | `kubescrape_positions_corrupt_total` | — | Positions files that failed to parse at startup (whatever decoded is kept; the affected inputs re-read their window). Recurring bumps across restarts point at a failing disk, not a one-off crash. |
 | `kubescrape_positions_save_errors_total` | — | Failed writes of the positions file (committed offsets and the journald cursor are not being persisted). Any sustained rate means a bad path, a read-only mount or a full disk. |
 | `kubescrape_routed_payload_parts_total` | `route`, `signal` | Payload parts forwarded to a non-default routing destination. |
@@ -203,4 +204,4 @@ is the documented alert for the non-buffered tailer.
 | `kubescrape_transform_errors_total` | `signal` | Transform program invocations that failed (the batch is NOT exported; the error propagates to the producer's retry path). |
 | `kubescrape_transform_reloads_total` | `outcome` | Transforms-file reloads by outcome (applied, failed — a failed compile keeps the last good program). |
 
-141 metrics.
+142 metrics.

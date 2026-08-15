@@ -906,6 +906,26 @@ func (a AuthRefs) Has(ref string) bool {
 // Len is the number of allowlisted references.
 func (a AuthRefs) Len() int { return len(a.refs) }
 
+// Rejected counts the monitors whose CURRENT object does not parse, by kind.
+//
+// This is STATE, not an event: upsertMonitor's error arm records the object
+// (keyed by resourceVersion, so a resync of the same broken object is not
+// news), a later parse success or a Delete removes it, and the count is what
+// remains true right now. kubescrape_monitor_parse_errors_total is the event
+// half — it says a breakage HAPPENED and never comes back down — while a
+// rejected monitor is one whose targets are gone TODAY: an unparseable update
+// deletes the monitor from the index, dropping every target it contributed,
+// and until this returns to zero some configuration is contributing nothing.
+//
+// Counts rather than names, because the consumer is a gauge: the names are on
+// the parse-failure warn line, and cloning two maps per export to repeat them
+// here would be retained-nothing work on every self-metrics tick.
+func (ix *Index) Rejected() (serviceMonitors, podMonitors int) {
+	ix.mu.RLock()
+	defer ix.mu.RUnlock()
+	return len(ix.rejectedMonitors), len(ix.rejectedPodMonitors)
+}
+
 // AuthSecretRefs returns the set of "namespace/name/key" bearerTokenSecret
 // references across all indexed ServiceMonitor and PodMonitor endpoints. The
 // scrape-auth endpoint serves ONLY these, so a direct HTTP caller cannot use

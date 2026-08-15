@@ -182,9 +182,15 @@ func startServiceMonitors(ctx context.Context, cfg *rest.Config, disco discovery
 	}
 	dynFactory := dynamicinformer.NewDynamicSharedInformerFactory(dynClient, resync)
 	monitors := servicemonitors.NewIndex()
+	// The rejected-monitor STATE, registered here because this is the one
+	// place that knows the feature is genuinely ON (the CRD pre-check passed)
+	// and WHICH kinds are watched. kubescrape_monitor_parse_errors_total is
+	// news-gated by design, so without this a monitor that stays broken is one
+	// warn line and one increment, and "still broken now" is unalertable.
+	obs.RegisterMonitorsRejected(monitorsRejectedHook(monitors, haveSM, havePM))
 	var synced []cache.InformerSynced
 	if haveSM {
-		smSynced, err := monitorInformer(dynFactory, servicemonitors.GVR, "servicemonitor", allowNS, log,
+		smSynced, err := monitorInformer(dynFactory, servicemonitors.GVR, kindServiceMonitor, allowNS, log,
 			monitors.UpsertChanged, monitors.Delete, monitors.Endpoints)
 		if err != nil {
 			return nil, nil, err
@@ -203,7 +209,7 @@ func startServiceMonitors(ctx context.Context, cfg *rest.Config, disco discovery
 	// not supported at all: blackbox probing has no node affinity and does not
 	// fit the node-local model.)
 	if havePM {
-		pmSynced, err := monitorInformer(dynFactory, servicemonitors.PodGVR, "podmonitor", allowNS, log,
+		pmSynced, err := monitorInformer(dynFactory, servicemonitors.PodGVR, kindPodMonitor, allowNS, log,
 			monitors.UpsertPodMonitorChanged, monitors.DeletePodMonitor, monitors.PodEndpoints)
 		if err != nil {
 			return nil, nil, err
@@ -1097,6 +1103,32 @@ func monitorAllowed(allowNS map[string]bool, kind string, u *unstructured.Unstru
 // A missing group/version is reported as an empty set and no
 // error — that is an answer ("nothing is installed"), not a failure to reach
 // the API server, and only the latter should be fatal to the caller.
+// The kind label every monitor metric shares. Constants because three series
+// families key on them (parse errors, fields ignored, monitors rejected) from
+// two files, and a drifted literal would split one kind across two labels.
+const (
+	kindServiceMonitor = "servicemonitor"
+	kindPodMonitor     = "podmonitor"
+)
+
+// monitorsRejectedHook adapts the index's Rejected counts to the kinds this
+// process actually watches: an unwatched kind is ABSENT from the map — hence
+// from the exposition — rather than a forever-0 series claiming a CRD nobody
+// serves is clean.
+func monitorsRejectedHook(monitors *servicemonitors.Index, haveSM, havePM bool) func() map[string]int {
+	return func() map[string]int {
+		sm, pm := monitors.Rejected()
+		out := make(map[string]int, 2)
+		if haveSM {
+			out[kindServiceMonitor] = sm
+		}
+		if havePM {
+			out[kindPodMonitor] = pm
+		}
+		return out
+	}
+}
+
 func monitoringResources(d discovery.DiscoveryInterface) (map[string]bool, error) {
 	list, err := d.ServerResourcesForGroupVersion(servicemonitors.GVR.GroupVersion().String())
 	if err != nil {

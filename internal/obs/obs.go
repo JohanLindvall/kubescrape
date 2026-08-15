@@ -433,6 +433,44 @@ const (
 // and the metadata service's own lookup touches no counter at all — so "my
 // agents' own metrics carry no pod" is unalertable, and the symptom (a missing
 // label on one job) is easy to read as a dashboard problem.
+// RegisterMonitorsRejected publishes kubescrape_monitors_rejected — the count
+// of monitors whose CURRENT object does not parse, by kind — from the index's
+// own state (servicemonitors.Index.Rejected, adapted by the caller to the
+// kinds actually watched).
+//
+// It is the STATE beside kubescrape_monitor_parse_errors_total's events. The
+// counter says a breakage happened and is news-gated, so a monitor that stays
+// broken for weeks is one warn line and one increment — nothing an operator
+// can alert "still true" on. An unparseable update DELETES the monitor from
+// the index, dropping every target it contributed, so a nonzero value here
+// means some configuration is presently contributing nothing; it returns to 0
+// when the object is fixed or deleted.
+//
+// Called exactly when -servicemonitors runs with a monitoring CRD present, and
+// the caller's hook emits a kind only while that kind's CRD is watched — so a
+// published 0 always means "watched, and none rejected", never "off", and an
+// unwatched kind is absent rather than a forever-0 series (the
+// self-metadata gauge's rule). Alert on nonzero sustained longer than a
+// rollout: a blip is an operator mid-edit, a plateau is a monitor nobody has
+// noticed is dead.
+func RegisterMonitorsRejected(rejected func() map[string]int) {
+	Registry.GaugeFuncVec("kubescrape_monitors_rejected",
+		"Monitors whose current object fails to parse and is therefore ABSENT from the index — every target "+
+			"it contributed is dropped while this is nonzero. The state half of "+
+			"kubescrape_monitor_parse_errors_total (the news-gated event): the counter says a breakage "+
+			"happened, this says one is still true, and it returns to 0 when the object is fixed or deleted. "+
+			"Registered only while -servicemonitors is on with the CRD present, and a kind appears only while "+
+			"that CRD is watched, so 0 means watched-and-clean, never off.",
+		"kind", func() map[string]float64 {
+			counts := rejected()
+			out := make(map[string]float64, len(counts))
+			for k, v := range counts {
+				out[k] = float64(v)
+			}
+			return out
+		})
+}
+
 func RegisterSelfMetadata(resolved func() bool) {
 	Registry.GaugeFunc("kubescrape_self_metadata_resolved",
 		"1 when this process has resolved its own pod's metadata for -self-attributes, 0 while it has not.",

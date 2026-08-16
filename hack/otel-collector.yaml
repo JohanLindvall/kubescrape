@@ -1,8 +1,17 @@
-# Minimal OpenTelemetry collector (contrib distribution) for testing the
-# kubescrape-agent pipeline: receives OTLP gRPC and prints summaries via the
-# debug exporter. Its own internal metrics (port 8888) are annotated for
-# scraping, closing the loop: the agent scrapes the collector and exports the
-# result back to it.
+# OpenTelemetry collector (contrib distribution) for testing the
+# kubescrape-agent pipeline: receives OTLP gRPC for all THREE signals, prints
+# summaries via the debug exporter, and — the part assertions depend on —
+# writes every received payload verbatim through the FILE exporter.
+#
+# The debug exporter only prints summaries ("N log records"), which can prove
+# that data arrived but never that an ATTRIBUTE HAS THE RIGHT VALUE. hack/e2e.sh
+# and hack/chaos/* need the latter, so the file exporter captures the payloads
+# and a busybox `reader` sidecar exists purely to `cat` them back out: the
+# collector image is distroless, so `kubectl exec`/`kubectl cp` into it fail
+# (no shell, no tar).
+#
+# Its own internal metrics (port 8888) are annotated for scraping, closing the
+# loop: the agent scrapes the collector and exports the result back to it.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -18,6 +27,18 @@ data:
     exporters:
       debug:
         verbosity: normal
+      # One file per signal, read back by the `reader` sidecar. Rotation keeps
+      # a long run from filling the node; assertions grab a snapshot and look
+      # for what they expect rather than counting the whole history.
+      file/logs:
+        path: /data/logs.json
+        rotation: {max_megabytes: 200, max_backups: 2}
+      file/metrics:
+        path: /data/metrics.json
+        rotation: {max_megabytes: 200, max_backups: 2}
+      file/traces:
+        path: /data/traces.json
+        rotation: {max_megabytes: 200, max_backups: 2}
     service:
       # Bind the internal metrics endpoint to 0.0.0.0 explicitly. Since
       # collector v0.111 the telemetry.UseLocalHostAsDefaultMetricsAddress
@@ -32,10 +53,15 @@ data:
       pipelines:
         logs:
           receivers: [otlp]
-          exporters: [debug]
+          exporters: [debug, file/logs]
         metrics:
           receivers: [otlp]
-          exporters: [debug]
+          exporters: [debug, file/metrics]
+        # The trace tier (-service-graph) exports spans, so the fixture has to
+        # accept them or its pushes fail and the tier's own health suffers.
+        traces:
+          receivers: [otlp]
+          exporters: [debug, file/traces]
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -69,10 +95,23 @@ spec:
           volumeMounts:
             - name: config
               mountPath: /etc/otelcol
+            - name: data
+              mountPath: /data
+        # Exists only so assertions can read the captured payloads: the
+        # collector image is distroless (no shell, no tar), so exec/cp into it
+        # fail. `kubectl exec -c reader -- cat /data/<signal>.json` works.
+        - name: reader
+          image: busybox:1.36
+          command: ["/bin/sh", "-c", "sleep infinity"]
+          volumeMounts:
+            - name: data
+              mountPath: /data
       volumes:
         - name: config
           configMap:
             name: otel-collector-config
+        - name: data
+          emptyDir: {}
 ---
 apiVersion: v1
 kind: Service

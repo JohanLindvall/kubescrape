@@ -3,3 +3,9 @@
 *.test
 /kubescrape-agent
 /kubescrape
+
+# e2e fixture build artifact (hack/e2e.sh builds and removes it)
+hack/nhexporter/nhexporter
+
+# chaos scenario payload snapshots
+hack/chaos/.cap/

@@ -40,7 +40,7 @@ AGENT_CGO := $(if $(findstring journald,$(TAGS)),1,0)
 GOLANGCI_LINT_VERSION := v2.12.2
 GOLANGCI_LINT         := $(shell go env GOPATH)/bin/golangci-lint
 
-.PHONY: all build test vet fmt fmt-check tidy lint run image image-static verify-tags helm-lint check cluster-up cluster-down e2e clean
+.PHONY: all build test vet fmt fmt-check tidy lint run image image-static verify-tags helm-lint check cluster-up cluster-down e2e chaos clean
 
 all: build
 
@@ -124,10 +124,24 @@ cluster-down:
 # End-to-end smoke test: build the image, load it into the kind cluster
 # (created if absent), deploy the shipped manifests plus the debug collector,
 # and assert the pipeline works — readiness gates clear, targets are
-# discovered, the store answers, and telemetry reaches the collector. The
+# discovered, the store answers, telemetry reaches the collector, and the
+# protobuf scrape path converts a real native histogram (hack/nhexporter). The
 # cluster is left running for iteration; KEEP=0 tears it down afterwards.
 e2e:
 	./hack/e2e.sh
+
+# Chaos scenarios against the deployment `make e2e` leaves running. Each one
+# breaks something an operator's cluster will break on its own — the collector
+# goes away, the agent is SIGKILLed, logs rotate under load, the API server is
+# blackholed — and asserts the invariant that must survive it. They take
+# minutes each (real outages, real recovery), so they are NOT part of `make
+# check`; run one at a time with hack/chaos/<name>.sh, or all of them here.
+chaos:
+	@for s in hack/chaos/collector-outage.sh hack/chaos/agent-kill.sh \
+	          hack/chaos/log-rotation.sh hack/chaos/apiserver-blackhole.sh; do \
+	  echo; echo "=== $$s ==="; "$$s" || exit 1; \
+	done
+	@echo; echo "all chaos scenarios PASSED"
 
 clean:
 	rm -rf bin

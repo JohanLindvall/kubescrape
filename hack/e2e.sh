@@ -13,7 +13,10 @@
 #   2. the metadata service discovers the annotated test workloads as scrape
 #      targets and resolves a live container ID,
 #   3. the agent's own /debug/targets sees targets on its node,
-#   4. telemetry (logs AND metrics) reaches the collector.
+#   4. telemetry (logs AND metrics) reaches the collector,
+#   5. the PROTOBUF scrape path converts a real Prometheus NATIVE histogram
+#      into an OTLP exponential histogram — and refuses a target that serves
+#      protobuf when -scrape-native-histograms is off (hack/nhexporter).
 #
 # The cluster is left running for iteration (the same trade cluster-up makes);
 # KEEP=0 tears it down at the end. SKIP_BUILD=1 skips the image build+load for
@@ -25,6 +28,7 @@ IMAGE="${IMAGE:-ghcr.io/johanlindvall/kubescrape}"
 TAG="${TAG:-latest}"
 KEEP="${KEEP:-1}"
 SKIP_BUILD="${SKIP_BUILD:-0}"
+NH_IMAGE="${NH_IMAGE:-kubescrape-e2e/nhexporter:latest}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(dirname "$SCRIPT_DIR")"
@@ -75,6 +79,16 @@ if [ "$SKIP_BUILD" != 1 ]; then
   log "building and loading $IMAGE:$TAG"
   make -C "$REPO_DIR" image IMAGE="$IMAGE" TAG="$TAG"
   kind load docker-image "$IMAGE:$TAG" --name "$CLUSTER_NAME"
+
+  # The native-histogram fixture. Built here rather than vendored as a
+  # published image because it must be the CURRENT client_golang: native
+  # histograms only exist over the protobuf exposition, and which fields that
+  # emits is a property of the library version.
+  log "building and loading the native-histogram fixture"
+  ( cd "$REPO_DIR" && CGO_ENABLED=0 go build -trimpath -o hack/nhexporter/nhexporter ./hack/nhexporter )
+  docker build -q -t "$NH_IMAGE" "$REPO_DIR/hack/nhexporter" >/dev/null
+  rm -f "$REPO_DIR/hack/nhexporter/nhexporter"
+  kind load docker-image "$NH_IMAGE" --name "$CLUSTER_NAME"
 fi
 
 log "deploying the collector and the shipped manifests"
@@ -165,10 +179,140 @@ collector_got() {
   # -q exits on the first match, kubectl dies of SIGPIPE (141), and under
   # this script's `set -o pipefail` every matching attempt then reads as a
   # failure — the whole assertion times out precisely when the data is there.
-  "${KCTL[@]}" -n monitoring logs -l app=otel-collector --tail=-1 --since=2m 2>/dev/null | grep "$1" >/dev/null
+  # `-c collector` because the pod also runs the `reader` sidecar the payload
+  # assertions below read the file exporter through.
+  "${KCTL[@]}" -n monitoring logs -l app=otel-collector -c collector --tail=-1 --since=2m 2>/dev/null | grep "$1" >/dev/null
 }
 wait_until 120 "collector received log records" collector_got '"log records"'
 wait_until 120 "collector received metric data points" collector_got '"data points"'
+
+log "asserting the PROTOBUF scrape path (native histograms)"
+# Two targets from one fixture image: a well-behaved one that negotiates the
+# format from Accept, and a MISBEHAVING one (FORCE_PROTO) that answers protobuf
+# whatever was asked. The shipped agent runs WITHOUT -scrape-native-histograms,
+# so the well-behaved target is scraped as text and the misbehaving one must be
+# REFUSED rather than decoded — the format is the operator's choice, never the
+# target's, because the protobuf decode materialises the whole message and is
+# gzip-amplified.
+"${KCTL[@]}" apply -f - >/dev/null <<EOF
+apiVersion: v1
+kind: Namespace
+metadata: {name: kubescrape-nh}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: nh-negotiating, namespace: kubescrape-nh, labels: {app: nh-negotiating}}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: nh-negotiating}}
+  template:
+    metadata:
+      labels: {app: nh-negotiating}
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9400"
+        prometheus.io/path: /metrics
+    spec:
+      containers:
+        - name: exporter
+          image: $NH_IMAGE
+          imagePullPolicy: IfNotPresent
+          ports: [{containerPort: 9400}]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: nh-forceproto, namespace: kubescrape-nh, labels: {app: nh-forceproto}}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: nh-forceproto}}
+  template:
+    metadata:
+      labels: {app: nh-forceproto}
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9400"
+        prometheus.io/path: /metrics
+    spec:
+      containers:
+        - name: exporter
+          image: $NH_IMAGE
+          imagePullPolicy: IfNotPresent
+          env: [{name: FORCE_PROTO, value: "1"}]
+          ports: [{containerPort: 9400}]
+EOF
+"${KCTL[@]}" -n kubescrape-nh rollout status deploy/nh-negotiating --timeout=180s
+"${KCTL[@]}" -n kubescrape-nh rollout status deploy/nh-forceproto --timeout=180s
+
+nh_node="$("${KCTL[@]}" -n kubescrape-nh get pods -l app=nh-forceproto \
+  -o jsonpath='{.items[0].spec.nodeName}')"
+nh_agent="$("${KCTL[@]}" -n monitoring get pods -l app=kubescrape-agent \
+  --field-selector "spec.nodeName=$nh_node" -o jsonpath='{.items[0].metadata.name}')"
+
+# Without the opt-in, the forced-protobuf target must fail the scrape VISIBLY.
+forceproto_refused() {
+  "${KCTL[@]}" -n monitoring logs "$nh_agent" --tail=-1 --since=3m 2>/dev/null \
+    | grep "native histograms are not enabled" >/dev/null
+}
+wait_until 120 "a protobuf-serving target is REFUSED without -scrape-native-histograms" \
+  forceproto_refused
+
+# The well-behaved target must be unaffected: it negotiates down to text and is
+# scraped normally, which is what makes the refusal above a targeted guard
+# rather than collateral damage.
+negotiating_scraped() {
+  collector_got 'e2e_classic_latency_seconds'
+}
+wait_until 180 "a well-behaved target still scrapes (text) with the flag off" \
+  negotiating_scraped
+
+# Now turn the opt-in ON and prove the conversion: schema -> scale, spans and
+# deltas -> dense positive buckets.
+log "enabling -scrape-native-histograms and asserting the conversion"
+"${KCTL[@]}" -n monitoring patch ds/kubescrape-agent --type=json \
+  -p '[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"-scrape-native-histograms"}]' >/dev/null
+"${KCTL[@]}" -n monitoring rollout status ds/kubescrape-agent --timeout=240s
+
+native_converted() {
+  local pod out
+  pod="$("${KCTL[@]}" -n monitoring get pods -l app=otel-collector -o jsonpath='{.items[0].metadata.name}')"
+  # Capture to a variable, THEN parse: piping kubectl straight into a reader
+  # that stops early makes kubectl die of SIGPIPE, and under this script's
+  # `set -o pipefail` the attempt reads as a failure exactly when the data is
+  # there (the same trap documented for `grep -q` in collector_got). The
+  # reader below also consumes all of stdin for the same reason.
+  out="$("${KCTL[@]}" -n monitoring exec "$pod" -c reader -- cat /data/metrics.json 2>/dev/null)" || return 1
+  printf '%s' "$out" | python3 -c '
+import json, sys
+ok = False
+for line in sys.stdin:                    # consume ALL of stdin, never exit early
+    line = line.strip()
+    if not line or "e2e_native_latency_seconds" not in line or ok:
+        continue
+    try:
+        payload = json.loads(line)
+    except Exception:
+        continue
+    for rm in payload.get("resourceMetrics", []):
+        for sm in rm.get("scopeMetrics", []):
+            for m in sm.get("metrics", []):
+                if m["name"] != "e2e_native_latency_seconds" or "exponentialHistogram" not in m:
+                    continue
+                for dp in m["exponentialHistogram"].get("dataPoints", []):
+                    # The Prometheus schema must arrive as the OTLP scale, and
+                    # the span/delta encoding must have decoded into real
+                    # buckets — that pair is the conversion under test.
+                    if dp.get("scale") == 3 and len(dp.get("positive", {}).get("bucketCounts", [])) > 10:
+                        ok = True
+sys.exit(0 if ok else 1)
+'
+}
+wait_until 180 "a NATIVE histogram converts to an OTLP exponential histogram (scale=schema, spans decoded)" \
+  native_converted
+
+# Put the DaemonSet back the way the shipped manifest has it, so a re-run starts
+# from the documented configuration.
+"${KCTL[@]}" apply -f "$REPO_DIR/deploy/agent.yaml" >/dev/null
+"${KCTL[@]}" -n monitoring rollout status ds/kubescrape-agent --timeout=240s >/dev/null
 
 log "e2e smoke test PASSED"
 if [ "$KEEP" != 1 ]; then

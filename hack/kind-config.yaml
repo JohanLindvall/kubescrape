@@ -1,6 +1,20 @@
 # Three-node test cluster: one control plane, two workers.
 kind: Cluster
 apiVersion: kind.x-k8s.io/v1alpha4
+# A SMALL container-log rotation threshold (the kubelet default is 10Mi).
+#
+# hack/chaos/log-rotation.sh exercises the tailer's rename-rotation machinery —
+# segment records, carried fds, the drain-before-retire rule — which only runs
+# when the kubelet actually rotates a container log. At the default a test would
+# have to write tens of megabytes to trigger one rotation, so the cheap version
+# of that test wrote a few hundred kilobytes, rotated nothing, and passed
+# vacuously. 1Mi makes a few megabytes cross the threshold several times, which
+# is both faster and honest.
+kubeadmConfigPatches:
+  - |
+    kind: KubeletConfiguration
+    containerLogMaxSize: 1Mi
+    containerLogMaxFiles: 5
 nodes:
   - role: control-plane
   - role: worker

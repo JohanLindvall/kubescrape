@@ -133,7 +133,17 @@ func (a attrsView) SetKey(k, v starlark.Value) error {
 		a.m.Remove(key)
 		return nil
 	}
-	return fromStarlark(a.m.PutEmpty(key), v)
+	// PutEmpty adds the key BEFORE the value is converted, so a conversion
+	// error (an unsupported Starlark type, an out-of-range int) would leave an
+	// Empty-valued attribute behind — a partial mutation the fail-open `admit`
+	// hook then forwards, contradicting "a hook error did nothing". Remove the
+	// key on error so a failed assignment leaves nothing. (Zero-alloc: no
+	// detached temp value on the transform hot path.)
+	if err := fromStarlark(a.m.PutEmpty(key), v); err != nil {
+		a.m.Remove(key)
+		return err
+	}
+	return nil
 }
 
 // --- shared element plumbing ---

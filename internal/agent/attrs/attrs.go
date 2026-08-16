@@ -324,3 +324,39 @@ func ReservedIdentity(key string) bool {
 func ReservedIdentityKeys() []string {
 	return slices.Sorted(maps.Keys(reservedIdentity))
 }
+
+// reservedPlumbing is the set behind ReservedPlumbing: kubescrape's OWN
+// control-plane resource attributes, which describe how the pipeline should
+// treat a payload rather than what the payload is ABOUT. They must never be set
+// by an untrusted input surface. The literals are duplicated here (rather than
+// imported from internal/agent/route and internal/agent/transform, which
+// would be an import cycle — both depend on this package) and pinned to the
+// originals by TestReservedPlumbingMatchesTheMarkers so they cannot drift.
+var reservedPlumbing = map[string]struct{}{
+	"kubescrape.route":    {}, // == route.ScriptMarker
+	"__kubescrape_drop__": {}, // == transform.DropMarker
+}
+
+// ReservedPlumbing reports whether key is one of kubescrape's own control-plane
+// markers — the router's route selector and the transform prune marker — which
+// a workload (pod annotation) or a log line must NEVER set.
+//
+// The boundary is security, the sibling of ReservedIdentity's: the router
+// honours route.ScriptMarker on a resource BEFORE its namespace globs, so an
+// unfiltered write lets anyone who can annotate a pod in their own namespace
+// steer that pod's telemetry to a different tenant's route and its tenant
+// headers (X-Scope-OrgID) — the same attack ReservedIdentity blocks via the
+// k8s.namespace.name relabel, reached here more directly. The application-facing
+// ingest listeners already strip these keys (otlpingest.ReservedAttrs); this is
+// the predicate the per-node input surfaces (the tailer's pod annotation, a
+// logAttributes rule) share so a fourth surface cannot drift from the strip.
+func ReservedPlumbing(key string) bool {
+	_, bad := reservedPlumbing[key]
+	return bad
+}
+
+// ReservedPlumbingKeys returns the reserved plumbing set, sorted, for callers
+// that enumerate it (documentation, the drift cross-check test).
+func ReservedPlumbingKeys() []string {
+	return slices.Sorted(maps.Keys(reservedPlumbing))
+}

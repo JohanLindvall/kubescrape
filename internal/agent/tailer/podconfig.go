@@ -129,11 +129,12 @@ func (t *Tailer) applyPodConfig(f *file, annotations map[string]string) {
 		attrsMap.PutStr("service.name", cfg.ServiceName)
 	}
 	for k, v := range cfg.Attributes {
-		if reservedIdentityAttr(k) {
+		if reservedAttr(k) {
 			// The workload is authoritative about its own DESCRIPTION, never
-			// about its IDENTITY — see reservedIdentityAttrs.
+			// about its IDENTITY or kubescrape's control-plane markers — see
+			// reservedAttr.
 			obs.LogPodAttrsRefused.WithLabelValues(k).Inc()
-			t.log.Warn("refusing a pod-annotation attribute that names resolved Kubernetes identity",
+			t.log.Warn("refusing a reserved pod-annotation attribute",
 				"path", f.path, "key", k, "value", v, "annotation", LogAnnotation)
 			continue
 		}
@@ -141,14 +142,20 @@ func (t *Tailer) applyPodConfig(f *file, annotations map[string]string) {
 	}
 }
 
-// reservedIdentityAttr reports whether a pod annotation may NOT set this
-// resource attribute. The set — and the security reasoning behind it
-// (tenancy routes on k8s.namespace.name; identity keys forge series in the
-// backend; the operator's attrs.Filter runs before this and cannot stand in)
-// — lives in attrs.ReservedIdentity, shared with the agent-config warning for
-// logAttributes rules that lift line values into the same keys. This used to
-// be a private copy of the set, i.e. one more place a new identity key had to
-// land.
-func reservedIdentityAttr(k string) bool {
-	return attrs.ReservedIdentity(k)
+// reservedAttr reports whether a pod annotation may NOT set this resource
+// attribute. Two disjoint sets, both security boundaries, both single-homed in
+// internal/agent/attrs so a new key lands in one place:
+//
+//   - attrs.ReservedIdentity — resolved Kubernetes identity (k8s.namespace.name,
+//     k8s.pod.*, container.*, …): forging it steers a pod's telemetry to another
+//     tenant's route via the namespace glob, or forges series identity.
+//   - attrs.ReservedPlumbing — kubescrape's own control-plane markers
+//     (route.ScriptMarker, transform.DropMarker): the router honours the route
+//     marker BEFORE the namespace globs, so a pod-annotation copy steers this
+//     pod's logs to any route and its tenant headers — the DIRECT form of the
+//     same attack ReservedIdentity blocks indirectly, and the one the ingest
+//     listeners already strip (otlpingest.ReservedAttrs). This surface was the
+//     one that lacked the strip.
+func reservedAttr(k string) bool {
+	return attrs.ReservedIdentity(k) || attrs.ReservedPlumbing(k)
 }

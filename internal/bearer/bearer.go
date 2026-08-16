@@ -357,17 +357,28 @@ func (r *Rotating) Tokens() []string {
 	defer r.mu.Unlock()
 	now := r.set.now()
 	if !now.Before(r.nextRead) {
-		if next, err := ReadFile(r.path); err != nil {
+		// Do the file I/O with the lock DROPPED. This is every authenticated
+		// request's read path (the metadata service's /v1/scrape-auth, the
+		// trace tier's internal hop), so holding the mutex across os.ReadFile
+		// would serialise every auth check behind a slow or wedged Secret mount
+		// (a stuck CSI/NFS projection), not just the one request that triggered
+		// the refresh. Claim the refresh slot first (advance nextRead) so a
+		// concurrent caller sees the read as not-yet-due and returns the
+		// last-good set instead of also reading; publish the result after.
+		r.nextRead = now.Add(r.set.refresh)
+		path := r.path
+		r.mu.Unlock()
+		next, err := ReadFile(path)
+		r.mu.Lock()
+		now = r.set.now()
+		if err != nil {
 			r.nextRead = now.Add(r.set.interval)
-			r.log.Warn("re-reading token file; keeping the last good token", "path", r.path, "error", err)
-		} else {
-			r.nextRead = now.Add(r.set.refresh)
-			if next != r.cur {
-				r.prev, r.prevUntil = r.cur, now.Add(r.set.grace)
-				r.cur = next
-				r.log.Info("bearer token rotated; the previous token stays accepted for the grace window",
-					"path", r.path, "grace", r.set.grace)
-			}
+			r.log.Warn("re-reading token file; keeping the last good token", "path", path, "error", err)
+		} else if next != r.cur {
+			r.prev, r.prevUntil = r.cur, now.Add(r.set.grace)
+			r.cur = next
+			r.log.Info("bearer token rotated; the previous token stays accepted for the grace window",
+				"path", path, "grace", r.set.grace)
 		}
 	}
 	if r.prev != "" && now.Before(r.prevUntil) {

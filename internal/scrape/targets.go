@@ -24,6 +24,22 @@ const (
 	AnnotationScheme = "prometheus.io/scheme"
 )
 
+// MaxPortsPerPod bounds how many scrape targets one pod may produce from its
+// own (or a selecting Service's) port annotation — the same kind of
+// anti-abuse ceiling as podconfig's maxPodRules, and here for a sharper
+// reason. Every ScrapeTarget embeds the WHOLE pod document by value
+// (kubemeta.ScrapeTarget.Pod), so N targets carry N copies of the pod's
+// annotations; a tenant who can annotate a pod in their own namespace (an
+// ordinary namespaced action) can pair a ~256 KiB annotation object with a
+// long comma-separated prometheus.io/port list and make the singleton
+// metadata service marshal an O(N²) /v1/nodes/{node}/targets body — a
+// fleet-wide OOM built from one pod. A real workload scrapes a handful of
+// ports; this ceiling is far above any legitimate use and caps the response
+// at O(pod) per pod rather than O(pod × ports). The cap is applied at the
+// derivation seam so it protects both /v1/nodes/{node}/targets and
+// /v1/explain (which builds the same targets in an intermediate slice).
+const MaxPortsPerPod = 16
+
 // PodTargets returns the scrape targets derived from a pod's own
 // annotations, or nil if the pod is not annotated for scraping or is not
 // scrapeable (no IP, already finished).
@@ -66,6 +82,9 @@ func ServiceTargets(pod kubemeta.Pod, svc *services.Service) []kubemeta.ScrapeTa
 	var targets []kubemeta.ScrapeTarget
 	seen := make(map[int32]struct{})
 	for _, sp := range selectServicePorts(svc) {
+		if len(targets) >= MaxPortsPerPod {
+			break // anti-abuse: every target embeds the whole pod (MaxPortsPerPod)
+		}
 		port, ok := TargetPodPort(pod, sp)
 		if !ok {
 			continue
@@ -481,8 +500,10 @@ func renderURL(scheme, address, path string) string {
 func podPorts(pod kubemeta.Pod) []int32 {
 	var ports []int32
 	seen := make(map[int32]struct{})
+	// capped bounds the target count per pod (MaxPortsPerPod): every target
+	// embeds the whole pod, so an unbounded port list is a quadratic response.
 	add := func(p int32) {
-		if _, ok := seen[p]; ok || p < 1 || p > 65535 {
+		if _, ok := seen[p]; ok || p < 1 || p > 65535 || len(ports) >= MaxPortsPerPod {
 			return
 		}
 		seen[p] = struct{}{}
@@ -499,6 +520,9 @@ func podPorts(pod kubemeta.Pod) []int32 {
 		return ports
 	}
 	for _, entry := range splitList(ann) {
+		if len(ports) >= MaxPortsPerPod {
+			break // the cap is reached; stop parsing a hostile-length list
+		}
 		if n, ok := parsePort(entry); ok {
 			add(n)
 			continue

@@ -29,8 +29,17 @@ import (
 const acceptProto = "application/vnd.google.protobuf;proto=io.prometheus.client.MetricFamily;encoding=delimited;q=1," +
 	"application/openmetrics-text;version=1.0.0;q=0.8,text/plain;version=0.0.4;q=0.5"
 
-// maxProtoMessageBytes bounds one delimited MetricFamily message.
-const maxProtoMessageBytes = 64 << 20
+// maxProtoMessageBytes bounds one delimited MetricFamily message. proto.Unmarshal
+// materialises the ENTIRE message (there is no streaming decode like the text
+// front's), and a message of many tiny metrics inflates ~47× wire→heap, so this
+// cap — not the wire size alone — is what bounds the decode's transient heap.
+// The body is already gunzipped by the transport, so this is a bound on the
+// DECOMPRESSED size. Kept at the OTLP/gRPC 4 MiB convention: a single family
+// (one metric name's series, or one native histogram) fits comfortably, while a
+// hostile "millions of tiny metrics in one family" message is refused before it
+// can OOM the DaemonSet. Reachability is doubly bounded now — only an operator
+// who enabled -scrape-native-histograms decodes protobuf at all (scraper.go).
+const maxProtoMessageBytes = 4 << 20
 
 // protoPresizeBytes bounds what an UNVERIFIED length prefix may allocate before
 // the target has delivered a single byte of the message. See readDelimited.

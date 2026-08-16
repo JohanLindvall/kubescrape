@@ -227,6 +227,7 @@ func predeclared(signal string) starlark.StringDict {
 		addGuard:  addBuiltin(),
 		iaddGuard: iaddBuiltin(),
 		"range":   boundedRange(),
+		"int":     boundedInt(),
 	}
 	for _, name := range materialisers {
 		d[name] = boundedMaterialiser(name)

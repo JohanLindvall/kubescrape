@@ -41,6 +41,7 @@ import (
 	"github.com/JohanLindvall/kubescrape/internal/agent/attrs"
 	"github.com/JohanLindvall/kubescrape/internal/agent/logscrub"
 	"github.com/JohanLindvall/kubescrape/internal/agent/positions"
+	"github.com/JohanLindvall/kubescrape/internal/logdedupe"
 	"github.com/JohanLindvall/kubescrape/internal/logline"
 	"github.com/JohanLindvall/kubescrape/internal/metrics"
 	"github.com/JohanLindvall/kubescrape/pkg/kubemeta"
@@ -183,6 +184,13 @@ type Tailer struct {
 	sources  []*compiledSource
 	scanDirs map[string]struct{} // fixed base dirs of all include globs, watched for new files
 	files    map[string]*file    // by path
+	// readWarn throttles the per-file "reading log file" warning. A
+	// persistently unreadable file (bad permissions, an SELinux denial, EIO on
+	// a failing disk) fails readFile on EVERY sweep — poll interval plus every
+	// fsnotify event — so an unthrottled warn is a flood proportional to the
+	// number of such files, the exact persisting-state complaint logdedupe
+	// exists to bound. Keyed by path, re-warned on a schedule.
+	readWarn *logdedupe.Table
 	batch    []entry
 	// flushed is the batch the CURRENT flush is exporting: flush swaps it out of
 	// batch (so batch is empty again the moment the export starts, as every
@@ -347,6 +355,7 @@ func New(cfg Config) *Tailer {
 		sources:           sources,
 		scanDirs:          scanDirs,
 		files:             make(map[string]*file),
+		readWarn:          logdedupe.New(256, time.Minute),
 		retryBackoff:      time.Second,
 		resolveBudget:     defaultResolveBudget,
 		shutdownBudget:    defaultShutdownBudget,
@@ -601,7 +610,9 @@ func (t *Tailer) sweep(ctx context.Context, all bool) {
 				// an instant (a rename+recreate rotation caught mid-sweep) is
 				// resurrected by the gone branch's own stat next sweep.
 				f.gone = true
-			} else {
+			} else if allow, _ := t.readWarn.Allow(path); allow {
+				// Throttled: a persistently unreadable file fails here on every
+				// sweep, and an unthrottled warn is a flood (see readWarn).
 				t.log.Warn("reading log file", "path", path, "error", err)
 			}
 		}

@@ -156,6 +156,20 @@ const (
 	maxInternedValueLen = 128
 )
 
+// maxLabelsPerSample bounds the label count of ONE sample line. The
+// duplicate-name check in parseLabels is a linear scan over the labels seen so
+// far, run on every appended pair — O(labels²) for one line — and the label
+// count is otherwise bounded only by MaxLineBytes (≈116k 5-byte labels in the
+// 1 MiB default). That parse is CPU-bound with no ctx check, so the scrape
+// timeout cannot abort it (measured: a single ~800 KB line takes ~30s, one
+// scrape cycle 1m22s against a 1s timeout) and one hostile/broken target
+// freezes the whole node's scrape loop (cycle() waits for every scrape it
+// started). Prometheus enforces a label-count limit; past this ceiling the
+// line is dropped as malformed, exactly as a duplicate label name is. Real
+// exposition rarely exceeds a few dozen labels; this is far above any
+// legitimate use.
+const maxLabelsPerSample = 4096
+
 // maxMetaBytes bounds the "# HELP"/"# UNIT" text retained for one exposition.
 // The meta table is per-exposition like the TYPE table, but its VALUES are free
 // text (a whole line each), which MaxTrackedFamilies alone would not bound —
@@ -1101,6 +1115,12 @@ func (p *Parser) parseLabels(rest []byte, dst *[]Label, cache *[]lastKV) ([]byte
 		// false-positive. Names are interned, so the O(n²) compare over a
 		// sample's few labels is usually a pointer equality and never
 		// allocates.
+		// A pathological label count turns the dedupe scan below quadratic and
+		// is uninterruptible by the scrape timeout; drop the line as malformed
+		// past the ceiling (see maxLabelsPerSample) before the scan runs again.
+		if len(*dst) >= maxLabelsPerSample {
+			return nil, false
+		}
 		for i := range *dst {
 			if (*dst)[i].Name == name {
 				return nil, false

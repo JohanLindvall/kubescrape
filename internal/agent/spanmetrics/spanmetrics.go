@@ -30,6 +30,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sort"
+	"sync"
 	"time"
 
 	"go.opentelemetry.io/collector/pdata/pcommon"
@@ -141,7 +142,40 @@ type Generator struct {
 	now       func() time.Time
 
 	store *cumagg.Store[*spanSeries]
+
+	// renderMu serializes renders so the snapshot scratch (snap/snapPtrs) can
+	// be REUSED across them. Lock order is renderMu BEFORE the store's mutex;
+	// nothing ever takes renderMu while holding the store lock.
+	renderMu  sync.Mutex
+	snap      []spanSnapshot // series values copied out under the store lock, then read lock-free
+	snapPtrs  []*spanSeries  // the series order the copy walks, taken in one cheap pass
+	snapSmall int            // consecutive renders that used far less of the scratch than it holds
 }
+
+// spanSnapshot is one series' state as of the instant the render read it. dims
+// is ALIASED (built once at admission, never mutated); buckets and the set
+// exemplars are COPIES, because Consume writes them under the mutex the build
+// runs without.
+type spanSnapshot struct {
+	dims    []string
+	calls   uint64
+	size    int64
+	count   uint64
+	sum     float64
+	start   time.Time
+	buckets []uint64
+	ex      []cumagg.Exemplar // only the SET exemplars, in bucket order
+}
+
+// snapChunk is how many series one snapshot lock-hold copies — the same
+// trade-off as agent/servicegraph's: bound one receive-path stall to a fraction
+// of a millisecond rather than the whole cardinality-cap build.
+const (
+	snapChunk        = 512
+	snapShrinkFactor = 4  // shrink the scratch at under a quarter occupancy
+	snapShrinkRuns   = 3  // ... sustained for this many renders
+	snapShrinkFloor  = 64 // ... but never below this many slots
+)
 
 type spanSeries struct {
 	// Meta is the shared bookkeeping: creation time (the cumulative start
@@ -328,28 +362,33 @@ func (g *Generator) Export(ctx context.Context, exp Exporter, res pcommon.Resour
 // renderRED writes the three RED metrics for every live series. It is the
 // store's Render callback.
 //
-// Unlike agent/servicegraph's, it builds the payload UNDER the series lock: the
-// two aggregators' receive paths differ in what a stall costs (there, Record is
-// called from inside the pairing store's own mutex, so a long hold stops every
-// shard goroutine), and the lock strategy is deliberately the caller's to pick.
+// It snapshots the series' values under the store lock in CHUNKS and builds the
+// pdata payload LOCK-FREE, exactly as agent/servicegraph does — because the
+// span-metrics tap calls Consume with the ingest RPC waiting on it (Tap forwards
+// then Consumes, and Consume takes this same lock per span), so holding the lock
+// across the whole cardinality-cap build stalls every trace-push on the tier
+// for the render's duration (measured ~89 ms at the 20k cap). Chunking bounds
+// one stall to a few hundred microseconds (TestRenderDoesNotStall).
 func (g *Generator) renderRED(sm pmetric.ScopeMetrics, now time.Time) {
-	g.store.Lock()
-	defer g.store.Unlock()
-	g.store.EvictLocked(now)
-	if g.store.CountLocked() == 0 {
+	g.renderMu.Lock()
+	defer g.renderMu.Unlock()
+
+	snap := g.snapshot(now)
+	if len(snap) == 0 {
 		return
 	}
+
 	ts := pcommon.NewTimestampFromTime(now)
 	calls := cumagg.SumMetric(sm, g.prefix+".calls", "Count of spans observed, by dimensions.", "")
 	size := cumagg.SumMetric(sm, g.prefix+".size", "Total size of spans observed, in bytes.", "By")
 	dur := cumagg.HistMetric(sm, g.prefix+".duration", "Span duration in seconds, by dimensions.")
-	g.store.EachLocked(func(s *spanSeries) {
-		g.store.MarkRenderedLocked(s)
-		// Clamped: a series admitted between Export's clock read and this
-		// render's lock hold carries a Start past ts, and stamping it
-		// unclamped is an inverted cumulative interval on the series' first
-		// export (cumagg.ClampStart has the full race).
-		start := cumagg.ClampStart(pcommon.NewTimestampFromTime(s.Start), ts)
+	for i := range snap {
+		s := &snap[i]
+		// Clamped: a series admitted between Export's clock read and the
+		// snapshot's lock hold carries a Start past ts, and stamping it
+		// unclamped is an inverted cumulative interval on its first export
+		// (cumagg.ClampStart has the full race).
+		start := cumagg.ClampStart(pcommon.NewTimestampFromTime(s.start), ts)
 		cp := calls.AppendEmpty()
 		putDims(cp.Attributes(), g.names, s.dims)
 		cp.SetStartTimestamp(start)
@@ -370,12 +409,100 @@ func (g *Generator) renderRED(sm pmetric.ScopeMetrics, now time.Time) {
 		hp.SetSum(s.sum)
 		hp.ExplicitBounds().FromRaw(g.bounds)
 		hp.BucketCounts().FromRaw(s.buckets)
-		for i := range s.ex {
-			if s.ex[i].Set {
-				cumagg.PutExemplar(hp.Exemplars(), s.ex[i])
+		for j := range s.ex {
+			cumagg.PutExemplar(hp.Exemplars(), s.ex[j])
+		}
+	}
+}
+
+// snapshot copies every live series' values out under the store mutex, marking
+// them rendered, and returns them for a lock-free build. It is the ONLY part of
+// a render that holds the store lock. See renderRED for why the build must not.
+func (g *Generator) snapshot(now time.Time) []spanSnapshot {
+	// Hold 1: evict, then take the series POINTERS in one cheap pass (one
+	// pointer write each) so the expensive value copy can be chunked — a slice
+	// can be walked across lock releases, a map cannot.
+	g.store.Lock()
+	g.store.EvictLocked(now)
+	ptrs := g.store.PointersLocked(g.snapPtrs[:0])
+	g.snapPtrs = ptrs
+	g.store.Unlock()
+
+	g.growSnap(len(ptrs))
+	snap := g.snap
+
+	// Holds 2..n: the values, in chunks, so one stall is bounded to snapChunk
+	// series. A Consume landing between chunks runs freely and puts that series
+	// back in cumagg.Observed, exactly as one landing between the render and the
+	// delivery mark always could.
+	for start := 0; start < len(ptrs); start += snapChunk {
+		end := min(start+snapChunk, len(ptrs))
+		g.store.Lock()
+		for i := start; i < end; i++ {
+			s := ptrs[i]
+			g.store.MarkRenderedLocked(s)
+			e := &snap[i]
+			e.dims = s.dims // aliased: built once at admission, never mutated
+			e.calls, e.size = s.calls, s.size
+			e.count, e.sum, e.start = s.count, s.sum, s.Start
+			e.buckets = append(e.buckets[:0], s.buckets...)
+			e.ex = e.ex[:0]
+			for j := range s.ex {
+				if s.ex[j].Set {
+					e.ex = append(e.ex, s.ex[j])
+				}
 			}
 		}
-	})
+		g.store.Unlock()
+	}
+	clear(ptrs) // do not pin evicted series until the next render
+	return snap[:len(ptrs)]
+}
+
+// growSnap sizes the render scratch to n slots, reusing its buffers across
+// renders while never pinning the labels or per-bucket arrays of series a
+// smaller render does not cover (the memory hazard agent/servicegraph documents
+// at its own growSnap).
+func (g *Generator) growSnap(n int) {
+	switch {
+	case cap(g.snap) < n:
+		grown := make([]spanSnapshot, n)
+		copy(grown, g.snap)
+		g.snap = grown
+		g.snapSmall = 0
+	case g.snapOversized(n):
+		g.snap = make([]spanSnapshot, n, max(snapShrinkFloor, 2*n))
+		g.snapSmall = 0
+	default:
+		// The tail past n keeps its bucket/exemplar CAPACITY (what the scratch
+		// is for) but must NOT keep its dims: those alias the label sets of
+		// series this render does not cover, so a burst to the cardinality cap
+		// then mass stale eviction would pin every one for the process' life.
+		whole := g.snap[:cap(g.snap)]
+		for i := n; i < len(whole); i++ {
+			whole[i].dims = nil
+		}
+		g.snap = g.snap[:n]
+	}
+	nb := len(g.bounds) + 1
+	for i := range g.snap {
+		e := &g.snap[i]
+		if cap(e.buckets) < nb {
+			e.buckets = make([]uint64, 0, nb)
+			e.ex = make([]cumagg.Exemplar, 0, nb)
+		}
+	}
+}
+
+// snapOversized reports whether the scratch has been oversized long enough to be
+// worth rebuilding, keeping the run length that decides it.
+func (g *Generator) snapOversized(n int) bool {
+	if cap(g.snap) <= snapShrinkFloor || n*snapShrinkFactor >= cap(g.snap) {
+		g.snapSmall = 0
+		return false
+	}
+	g.snapSmall++
+	return g.snapSmall >= snapShrinkRuns
 }
 
 // Tap returns a TracesExporter that feeds each batch through Consume and then

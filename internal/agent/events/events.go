@@ -151,7 +151,16 @@ type Reader struct {
 	// exists so the watermark clamp below is testable without sleeping.
 	now         func() time.Time
 	lastPersist time.Time
-	lastFlush   time.Time
+	// flushTicker is the "flush at least this often" ticker, held on the
+	// Reader so tryFlush can Reset it after every flush — the interval is
+	// measured from the LAST FLUSH, not the last tick. A fixed-period ticker
+	// fires exactly FlushInterval after the PREVIOUS tick, i.e. microseconds
+	// BEFORE that interval has elapsed since the flush that tick caused, so the
+	// old "tick AND time.Since(lastFlush) >= interval" guard could never pass
+	// on the tick it was meant for and delivery ran at ~2× the configured
+	// interval. Same trap and same fix as journald's stream loop. nil during
+	// replayBacklog (before the watch/ticker exist), so tryFlush guards it.
+	flushTicker *time.Ticker
 	// flushFailedAt is when the last export attempt failed, zero once one
 	// succeeds. Past BatchSize the batch is RETAINED, so the count trigger
 	// holds forever while the collector is down; pacing the retry against this
@@ -586,15 +595,20 @@ func (r *Reader) stream(ctx context.Context) error {
 	defer w.Stop()
 
 	ticker := time.NewTicker(r.cfg.FlushInterval)
-	defer ticker.Stop()
-	r.lastFlush = time.Now()
+	r.flushTicker = ticker
+	defer func() {
+		ticker.Stop()
+		r.flushTicker = nil
+	}()
 
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-ticker.C:
-			if len(r.batch) > 0 && time.Since(r.lastFlush) >= r.cfg.FlushInterval {
+			// tryFlush Resets the ticker on success, so the cadence is measured
+			// from the last flush (whatever triggered it), not from this tick.
+			if len(r.batch) > 0 {
 				r.tryFlush(ctx)
 			}
 			r.persist(ctx, false)
@@ -971,6 +985,11 @@ func (r *Reader) tryFlush(ctx context.Context) {
 		}
 		return
 	}
+	// Measure the next flush from THIS flush, not from the last tick (see
+	// flushTicker). nil during replayBacklog, before the watch's ticker exists.
+	if r.flushTicker != nil {
+		r.flushTicker.Reset(r.cfg.FlushInterval)
+	}
 	if !r.flushFailedAt.IsZero() {
 		r.log.Info("event export recovered", "buffered", len(r.batch))
 		r.flushFailedAt, r.flushWarned = time.Time{}, time.Time{}
@@ -1009,7 +1028,6 @@ func (r *Reader) wanted(e *corev1.Event) bool {
 // acknowledges it.
 func (r *Reader) flush(ctx context.Context) error {
 	if len(r.batch) == 0 {
-		r.lastFlush = time.Now()
 		return nil
 	}
 	// Convert ONCE per batch, not once per export ATTEMPT — a batch is
@@ -1061,7 +1079,6 @@ func (r *Reader) flush(ctx context.Context) error {
 		}
 	}
 	r.settle(newest, covered)
-	r.lastFlush = time.Now()
 	return nil
 }
 

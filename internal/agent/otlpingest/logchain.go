@@ -88,10 +88,16 @@ func (s *Server) applyLogChain(ld plog.Logs) bool {
 			obs.IngestChainSkipped.WithLabelValues("resource_too_wide").Inc()
 			observe = false
 		}
-		if observe {
-			// Not for the store's identity — that fold handles a repeated
-			// key itself now — but for the resolver reading this resource
-			// and for the payload forwarded on. See dedupeResourceKeys.
+		if resolver != nil {
+			// Not for the store's identity — that fold handles a repeated key
+			// itself now — but for the resolver reading this resource (Get is
+			// FIRST-wins, while the store renders last-wins) and for the
+			// payload forwarded on. Independent of `observe`: a rules-only
+			// config (no LogMetrics), or a resource past the observe cap/width,
+			// still reads the resource through the resolver and still forwards
+			// it, so gating the dedupe on the metric-observation eligibility
+			// let a drop rule evaluate against the wrong value. See
+			// dedupeResourceKeys.
 			dedupeResourceKeys(rattrs)
 		}
 		// Bound once per resource: Bind hashes the attribute set, and a push
@@ -231,21 +237,40 @@ func renderedSizeOver(v pcommon.Value, rem *int, depth int) bool {
 // Last-wins, which is what any map-shaped consumer reads anyway and what the
 // store's identity applies; the rewrite is visible only as attribute order.
 func dedupeResourceKeys(m pcommon.Map) {
-	var seen [maxObservedResourceAttrs]string
-	n, dup := 0, false
-	m.Range(func(k string, _ pcommon.Value) bool {
-		for i := 0; i < n; i++ {
-			if seen[i] == k {
+	if m.Len() < 2 {
+		return
+	}
+	dup := false
+	if m.Len() <= maxObservedResourceAttrs {
+		// Fast, allocation-free path for the common case: a fixed scratch, no
+		// map. Sound because every key is compared against every earlier one.
+		var seen [maxObservedResourceAttrs]string
+		n := 0
+		m.Range(func(k string, _ pcommon.Value) bool {
+			for i := 0; i < n; i++ {
+				if seen[i] == k {
+					dup = true
+					return false
+				}
+			}
+			seen[n] = k
+			n++
+			return true
+		})
+	} else {
+		// A resource wider than the scratch (rare) falls back to a map so a
+		// duplicate among keys past position 64 is still detected — the old
+		// fixed-scratch scan silently stopped tracking there.
+		seen := make(map[string]struct{}, m.Len())
+		m.Range(func(k string, _ pcommon.Value) bool {
+			if _, ok := seen[k]; ok {
 				dup = true
 				return false
 			}
-		}
-		if n < len(seen) {
-			seen[n] = k
-			n++
-		}
-		return true
-	})
+			seen[k] = struct{}{}
+			return true
+		})
+	}
 	if !dup {
 		return
 	}

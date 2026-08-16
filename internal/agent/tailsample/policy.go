@@ -90,6 +90,16 @@ func compilePolicies(list []PolicyConfig, sub bool, alloc *bucketAlloc) ([]named
 		if pc.Name == "" {
 			return nil, false, errPolicy(where, "name is required (it is what a Decision and its metric label report)")
 		}
+		// "none" is the metric label the buffering layer renders for the
+		// UNATTRIBUTED default drop (tailbuffer.policyLabel(""))*, so a policy
+		// literally named "none" would share those counter objects and make
+		// kubescrape_tail_sampling_traces_total{policy="none"} conflate its
+		// decisions with every no-opinion drop. Refuse the reserved name rather
+		// than silently merge. (*Hardcoded here because tailsample cannot import
+		// tailbuffer, which imports it.)
+		if pc.Name == "none" {
+			return nil, false, errPolicy(where, "\"none\" is reserved (it is the metric label for the unattributed default drop); pick another name")
+		}
 		if _, dup := seen[pc.Name]; dup {
 			return nil, false, errPolicy(where, "duplicate policy name %q", pc.Name)
 		}

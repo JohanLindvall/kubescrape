@@ -420,10 +420,22 @@ func (s *compiledSource) glob() ([]string, bool) {
 		}
 		m, err := doublestar.FilepathGlob(g, doublestar.WithFailOnIOErrors())
 		if err != nil {
-			// Proves nothing about which files are gone; the caller must not
-			// treat absence from this listing as removal — nothing to prune,
-			// nothing to declare gone.
+			// An IO error (a single unreadable subdirectory anywhere under a
+			// `**` include — an SELinux denial on one container's dir, a
+			// transient EACCES) makes WithFailOnIOErrors abort the WHOLE walk
+			// and return NO matches, which would blind the tailer to every
+			// readable file under this include for as long as the bad dir
+			// persists. So: mark the listing incomplete (ok=false, which
+			// disables gone-detection and checkpoint pruning — absence here
+			// proves nothing about removal) AND still collect whatever IS
+			// readable, by re-globbing WITHOUT the fail-on-IO option. That
+			// second call ignores the unreadable subtree and returns the
+			// readable matches, so one bad directory degrades to "skip that
+			// subtree", not "collect nothing under this include".
 			ok = false
+			if partial, perr := doublestar.FilepathGlob(g); perr == nil {
+				out = append(out, partial...)
+			}
 			continue
 		}
 		out = append(out, m...)

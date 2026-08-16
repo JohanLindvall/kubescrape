@@ -142,7 +142,7 @@ a build that lacks the pipeline is a startup error naming the tag (see
 | `-logs` | `true` | tail container logs |
 | `-metadata-endpoint` | `http://kubescrape.monitoring` | base URL of the kubescrape metadata service |
 | `-metadata-wait` | `5s` | how long the metadata service may block waiting for a new container |
-| `-metrics-batch-bytes` | `3145728` | also flush a metrics chunk once its estimated encoded size reaches this many bytes (0 = only -metrics-batch-size). The collector's gRPC receive limit applies to the DECOMPRESSED message (4 MiB by default), and a label-rich target can exceed it well before the point limit — every export of that target would then fail |
+| `-metrics-batch-bytes` | `3145728` | also flush a metrics chunk once its estimated encoded size reaches this many bytes (0 = the 3 MiB default; NEGATIVE disables the byte bound, leaving only -metrics-batch-size). The collector's gRPC receive limit applies to the DECOMPRESSED message (4 MiB by default), and a label-rich target can exceed it well before the point limit — every export of that target would then fail |
 | `-metrics-batch-size` | `10000` | export metrics in chunks of this many data points |
 | `-metrics-listen` | `:9090` | listen address for the Prometheus /metrics endpoint (Go runtime and process metrics; with -self-metrics-interval=0 also the kubescrape_* internal metrics, replacing the OTLP push with a scrape; empty disables). Separate from -listen so the debug/health surface and the scrape target can be exposed independently |
 | `-metrics` | `true` | scrape annotation-discovered pod/service targets |

@@ -273,3 +273,21 @@ func TestConnectionStringPasswordIsVerbatim(t *testing.T) {
 		t.Fatalf("password = %q, want the connection string verbatim %q", parts[2], cs)
 	}
 }
+
+// A non-finite expires_in ("Inf"/"+Inf") must not become a negative TTL (which
+// would force a token refresh on every connection). Regression.
+func TestParseTokenResponseRejectsNonFiniteExpiry(t *testing.T) {
+	for _, s := range []string{`"Inf"`, `"+Inf"`, `"Infinity"`, `"NaN"`} {
+		_, ttl, err := parseTokenResponse([]byte(`{"access_token":"t","expires_in":`+s+`}`), "test")
+		if err != nil {
+			t.Fatalf("expires_in=%s errored: %v", s, err)
+		}
+		if ttl <= 0 {
+			t.Errorf("expires_in=%s gave ttl=%v; want the positive default (a non-finite value must not land in the past)", s, ttl)
+		}
+	}
+	// A normal numeric value is still honoured.
+	if _, ttl, _ := parseTokenResponse([]byte(`{"access_token":"t","expires_in":"3599"}`), "test"); ttl != 3599*time.Second {
+		t.Errorf("numeric expires_in ttl = %v", ttl)
+	}
+}

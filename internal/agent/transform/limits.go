@@ -93,6 +93,16 @@ const (
 	// they never reach this check).
 	maxIntBits = 1 << 20
 
+	// maxIntStringLen bounds the STRING an int() call parses. Go's big.Int
+	// decimal parse is O(len²), and it happens inside a single Starlark step —
+	// so the step and clock guards cannot interrupt it: one int() over a long
+	// attacker-influenced string (a log body a script does int() on) spends
+	// seconds on the single export goroutine before OnMaxSteps ever runs
+	// (measured: a 1 MiB string ≈ 3s, superlinear). A real number in a log line
+	// is a handful of digits; 4096 is astronomically larger and keeps one
+	// int() call in the microseconds.
+	maxIntStringLen = 4096
+
 	// maxAllocBytes bounds what ONE invocation may build in total. Per-value
 	// caps cannot bound a loop that keeps appending bounded values: 500
 	// iterations of `l.append("x" * (16<<20))` is 8 GiB and costs ~2500 steps.
@@ -521,6 +531,28 @@ func boundedRange() *starlark.Builtin {
 				s.Len(), int64(maxSeqElems), int64(maxSteps)))
 		}
 		return v, nil
+	})
+}
+
+// boundedInt shadows the universe `int`. Unlike the materialisers, its danger
+// is not the result size but the PARSE: int(<long decimal string>) is O(len²)
+// in Go's big.Int and runs as one uninterruptible Starlark step, so a script
+// doing int() on an attacker-influenced value (a log body/attribute) stalls the
+// export goroutine for seconds before any step/clock guard can fire. Refuse an
+// over-length string argument up front; every non-string form (and short
+// strings) falls straight through to the library.
+func boundedInt() *starlark.Builtin {
+	inner := starlark.Universe["int"].(*starlark.Builtin)
+	return starlark.NewBuiltin("int", func(th *starlark.Thread, b *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
+		if err := budgetOf(th).overtime(); err != nil {
+			return nil, positioned(th, err)
+		}
+		if len(args) > 0 {
+			if s, ok := args[0].(starlark.String); ok && len(s) > maxIntStringLen {
+				return nil, positioned(th, fmt.Errorf("int() of a %d-character string is over the %d-character limit (the parse is quadratic and uninterruptible)", len(s), maxIntStringLen))
+			}
+		}
+		return inner.CallInternal(th, args, kwargs)
 	})
 }
 

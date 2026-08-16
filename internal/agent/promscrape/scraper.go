@@ -919,6 +919,17 @@ func (s *Scraper) scrapeTarget(ctx context.Context, t kubemeta.ScrapeTarget, tim
 	// them nor grows the shared dedupe table.
 	warnKey := warnTarget(t)
 	if strings.Contains(resp.Header.Get("Content-Type"), "application/vnd.google.protobuf") {
+		// Only decode protobuf when the operator OPTED IN (NativeHistograms).
+		// The proto path materialises the whole MetricFamily via proto.Unmarshal
+		// (no streaming bound like the text front's), and the transport
+		// transparently gunzips, so a tiny gzip body inflates to a multi-hundred-MB
+		// heap spike that OOMKills the DaemonSet — and the target, not the
+		// operator, chooses the response Content-Type. Without the opt-in we
+		// sent Accept: text/plain, so a protobuf response is a misbehaving
+		// target: fail the scrape visibly (up=0) rather than parse it.
+		if !s.cfg.NativeHistograms {
+			return 0, fmt.Errorf("target served protobuf but native histograms are not enabled")
+		}
 		return s.scrapeProto(ctx, resp.Body, cb, relabel, t.URL, warnKey)
 	}
 	return s.parseAndExportFiltered(ctx, resp.Body, openMetrics, s.cfg.Exemplars, cb, pipelineTargets, t.URL, warnKey, relabel)

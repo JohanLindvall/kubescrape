@@ -18,6 +18,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/url"
 	"os"
@@ -264,7 +265,12 @@ func parseTokenResponse(body []byte, what string) (string, time.Duration, error)
 	ttl := time.Hour // a sane default when expires_in is absent
 	if len(raws[1]) > 0 {
 		if s, ok := logline.RawScalarString(raws[1]); ok {
-			if secs, err := strconv.ParseFloat(s, 64); err == nil && secs > 0 {
+			// strconv.ParseFloat accepts "Inf"/"NaN" without error. NaN fails
+			// secs > 0 (falls back to the default), but +Inf PASSES it and
+			// time.Duration(+Inf) overflows to a large NEGATIVE duration, so
+			// expiry lands in the past and the token is refreshed on every
+			// connection. Reject non-finite (and cap absurd finite) values.
+			if secs, err := strconv.ParseFloat(s, 64); err == nil && secs > 0 && !math.IsInf(secs, 1) {
 				ttl = time.Duration(secs * float64(time.Second))
 			}
 		}

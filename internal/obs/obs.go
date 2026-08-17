@@ -116,6 +116,27 @@ var (
 	// path: the RATE is the signal, not the absolute value.
 	MonitorTargetShadowed = Registry.CounterVec("kubescrape_monitor_target_shadowed_total",
 		"Monitor endpoints whose auth/TLS conflicts with the monitor already holding the same URL on that pod (the holder's is served; the rest of the endpoint's configuration still merges).", "kind")
+	// ScrapeTargetsCapped counts scrape targets REFUSED because one pod
+	// already produced scrape.MaxPortsPerPod of them. Every ScrapeTarget
+	// embeds the whole pod document, so N targets carry N copies of the pod's
+	// annotations: without a ceiling a tenant who can annotate a pod (or
+	// author a ServiceMonitor with many endpoints, which needs no annotation
+	// at all) makes the singleton metadata service marshal an O(N²) response
+	// and OOM, taking target discovery for the whole fleet with it. The cap
+	// sits where targets are ACCUMULATED so it covers every door — pod
+	// annotation, Service annotation, ServiceMonitor and PodMonitor alike.
+	//
+	// A nonzero value means some endpoint of that pod is NOT being scraped;
+	// /v1/explain names the pod and says so.
+	// LogReadErrors counts sweeps that failed to read a tracked log file for a
+	// reason other than "it is gone" (permission denied, EIO on a failing
+	// disk, an SELinux denial). The WARN beside it is throttled per path and
+	// SATURATES past a bounded number of distinct paths, so without a counter a
+	// broad failure becomes invisible rather than merely quiet.
+	LogReadErrors = Registry.Counter("kubescrape_log_read_errors_total",
+		"Failed reads of a tracked log file (excluding the file being gone); the per-path warning is throttled, this is not.")
+	ScrapeTargetsCapped = Registry.Counter("kubescrape_scrape_targets_capped_total",
+		"Scrape targets refused because a single pod exceeded the per-pod target ceiling; those endpoints are not scraped (see /v1/explain for the pod).")
 	TargetIdentityCollisions = Registry.Counter("kubescrape_scrape_target_identity_collisions_total",
 		"Groups of scrape targets on one node that resolve to the SAME exported series identity — the same "+
 			"Prometheus (job, instance), where job is the workload and instance is host:port. Every target in "+

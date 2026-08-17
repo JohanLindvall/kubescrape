@@ -71,21 +71,36 @@ func DeclaredPorts(pod kubemeta.Pod) []DeclaredPort {
 // or a name and a number naming one port each yield ONE target, and explain
 // over-reported them as two. The mirrored `add` is the reason this file exists
 // (the package header's "cannot drift"); it was the one part not mirrored.
-type portFilter map[int32]struct{}
+type portFilter struct {
+	seen map[int32]struct{}
+	// kept counts the ports that became targets for this pod, so the mirror
+	// can report the per-pod ceiling the same way the derivation applies it.
+	// Without this, explain reported a capped pod's ports as WORKING targets —
+	// inverting the one question it exists to answer ("why is my 17th port not
+	// scraped?" answered with "it is") and drifting from the derivation the
+	// package header says it cannot drift from.
+	kept int
+}
 
 // keep splits the ports one entry matched into those that actually become
 // targets and a note explaining the rest.
-func (f portFilter) keep(ports []int32) (kept []int32, note string) {
-	var dup, bad []string
+func (f *portFilter) keep(ports []int32) (kept []int32, note string) {
+	if f.seen == nil {
+		f.seen = map[int32]struct{}{}
+	}
+	var dup, bad, capped []string
 	for _, p := range ports {
-		_, seen := f[p]
+		_, seen := f.seen[p]
 		switch {
 		case p < 1 || p > 65535:
 			bad = append(bad, strconv.Itoa(int(p)))
 		case seen:
 			dup = append(dup, strconv.Itoa(int(p)))
+		case f.kept >= MaxPortsPerPod:
+			capped = append(capped, strconv.Itoa(int(p)))
 		default:
-			f[p] = struct{}{}
+			f.seen[p] = struct{}{}
+			f.kept++
 			kept = append(kept, p)
 		}
 	}
@@ -96,6 +111,9 @@ func (f portFilter) keep(ports []int32) (kept []int32, note string) {
 	if len(bad) > 0 {
 		notes = append(notes, fmt.Sprintf("port %s is outside 1-65535 and resolves to nothing", strings.Join(bad, ", ")))
 	}
+	if len(capped) > 0 {
+		notes = append(notes, fmt.Sprintf("port %s is over the per-pod ceiling of %d targets and is NOT scraped", strings.Join(capped, ", "), MaxPortsPerPod))
+	}
 	return kept, strings.Join(notes, "; ")
 }
 
@@ -103,7 +121,7 @@ func (f portFilter) keep(ports []int32) (kept []int32, note string) {
 // annotation entry, or — with no (non-blank) annotation — one per declared
 // container port. annotated reports which of the two shapes applied.
 func ExplainPodPorts(pod kubemeta.Pod) (verdicts []PortVerdict, annotated bool) {
-	filter := portFilter{}
+	filter := &portFilter{}
 	// The fallback predicate must be EXACTLY podPorts': absent or all-blank
 	// falls back to declared ports; a present annotation never does, even one
 	// whose entries all split away (","), which selects nothing.
@@ -138,7 +156,7 @@ func ExplainPodPorts(pod kubemeta.Pod) (verdicts []PortVerdict, annotated bool) 
 // explainPodPortEntry is podPorts' per-entry logic with its verdict spelled
 // out — including the caveat the user cannot see from the target list alone:
 // a NUMERIC entry resolves whether or not any container declares the port.
-func explainPodPortEntry(pod kubemeta.Pod, entry string, filter portFilter) PortVerdict {
+func explainPodPortEntry(pod kubemeta.Pod, entry string, filter *portFilter) PortVerdict {
 	if n, ok := parsePort(entry); ok {
 		ports, note := filter.keep([]int32{n})
 		v := PortVerdict{Entry: entry, Ports: ports, Note: note}

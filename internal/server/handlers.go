@@ -661,6 +661,14 @@ type targetDedup struct {
 	// request: the targets path scans the node's finished list once, explain
 	// scans the one pod it derived.
 	inst scrape.InstanceScan
+	// capped counts THIS pod's targets refused by the per-pod ceiling. The
+	// ceiling lives here, at the accumulation seam, rather than at any single
+	// door: scrape.MaxPortsPerPod was first applied only where the pod
+	// ANNOTATION resolves ports, which left the ServiceMonitor endpoint list —
+	// a second door needing no annotation on the pod at all — free to produce
+	// unbounded full-pod targets and reopen the O(N²) response it was added to
+	// close. Everything that materialises a target for a pod goes through add.
+	capped int
 }
 
 // reset points the dedup at a fresh pod. The maps are reused across pods:
@@ -668,6 +676,7 @@ type targetDedup struct {
 func (d *targetDedup) reset(out *[]kubemeta.ScrapeTarget) {
 	d.out = out
 	d.base = len(*out)
+	d.capped = 0
 	if d.urlOwner == nil {
 		d.urlOwner = make(map[string]int, 4)
 	} else {
@@ -738,6 +747,16 @@ func (d *targetDedup) monitorHolder(url string) (*kubemeta.ScrapeTarget, bool) {
 func (d *targetDedup) add(t kubemeta.ScrapeTarget) {
 	i, taken := d.urlOwner[t.URL]
 	if !taken {
+		// The per-pod ceiling, counted on the NEW-URL arm only: a target that
+		// merges into a URL this pod already holds costs no extra response
+		// bytes, so it must not be refused (16 entries collapsing to 3 URLs
+		// legitimately yields 3). Refusing here loses that endpoint — which is
+		// why it is counted and reported by /v1/explain rather than silent.
+		if len(*d.out)-d.base >= scrape.MaxPortsPerPod {
+			d.capped++
+			obs.ScrapeTargetsCapped.Inc()
+			return
+		}
 		d.urlOwner[t.URL] = len(*d.out)
 		*d.out = append(*d.out, t)
 		return

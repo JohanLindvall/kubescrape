@@ -133,17 +133,41 @@ func (a attrsView) SetKey(k, v starlark.Value) error {
 		a.m.Remove(key)
 		return nil
 	}
-	// PutEmpty adds the key BEFORE the value is converted, so a conversion
-	// error (an unsupported Starlark type, an out-of-range int) would leave an
-	// Empty-valued attribute behind — a partial mutation the fail-open `admit`
-	// hook then forwards, contradicting "a hook error did nothing". Remove the
-	// key on error so a failed assignment leaves nothing. (Zero-alloc: no
-	// detached temp value on the transform hot path.)
-	if err := fromStarlark(a.m.PutEmpty(key), v); err != nil {
-		a.m.Remove(key)
+	// Check convertibility BEFORE touching the map, so a failed assignment is a
+	// genuine no-op.
+	//
+	// Two wrong versions preceded this one, and both are easy to re-introduce.
+	// PutEmpty adds the key before the value is converted, so returning the
+	// error alone left an Empty-valued attribute behind — a partial mutation
+	// the fail-open `admit` hook then forwards, contradicting "a hook error did
+	// nothing". Removing the key on error is WORSE, not better: PutEmpty has
+	// already overwritten whatever was there, so a failed assignment to an
+	// EXISTING key deleted it outright — turning a stray attribute into data
+	// loss, on a path where the deleted key can be identity (a script assigning
+	// a parsed JSON object to service.name). Only a pre-check leaves the map
+	// untouched in both cases. It costs one type switch and allocates nothing.
+	if err := convertible(v); err != nil {
 		return err
 	}
-	return nil
+	return fromStarlark(a.m.PutEmpty(key), v)
+}
+
+// convertible reports whether fromStarlark would accept v, WITHOUT a
+// destination to write into. It must stay exhaustive against fromStarlark's
+// switch — including the Int64 range check, which is the one failure that is
+// not merely a type mismatch.
+func convertible(v starlark.Value) error {
+	switch x := v.(type) {
+	case starlark.String, starlark.Bool, starlark.Float:
+		return nil
+	case starlark.Int:
+		if _, ok := x.Int64(); !ok {
+			return fmt.Errorf("integer out of range")
+		}
+		return nil
+	default:
+		return fmt.Errorf("unsupported attribute type %s", v.Type())
+	}
 }
 
 // --- shared element plumbing ---

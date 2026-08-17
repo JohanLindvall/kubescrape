@@ -80,10 +80,14 @@ func Threshold(fraction float64) uint64 {
 // The id is fed as its two little-endian halves rather than as a slice.
 // rapidhash.Sum64Uint128 hashes exactly the bytes Sum64(id[:]) would — the two
 // are equal for every input, which TestUint128FormEqualsRawBytes pins — but it
-// takes them in registers instead of through a slice header, which on the
-// measured machine is 2.4ns against 6.4ns for the slice form and 12.6ns for
-// the xxhash this replaced. This runs once per span in BOTH samplers, so the
-// difference is worth the two loads.
+// takes them in registers instead of through a slice header.
+//
+// Measured on the real Keep with VARYING ids (an in-binary A/B against the old
+// implementation, interleaved n=5): ~12.9ns -> ~5.6ns, about 2.3x. Quote that
+// pair, not the 2.4-vs-12.6 an isolated microbenchmark first produced — that
+// one hashed a CONSTANT id, which flatters the cheaper function and overstated
+// the win as ~5x. This runs once per span in BOTH samplers, so 2.3x is still
+// worth the two loads.
 func Keep(id pcommon.TraceID, threshold uint64) bool {
 	if threshold == math.MaxUint64 {
 		return true

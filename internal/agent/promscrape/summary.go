@@ -541,7 +541,13 @@ func parseCount(raw []byte) (uint64, bool) {
 	if err != nil {
 		return 0, false
 	}
-	if f < 0 || f > maxExactCount || f != math.Trunc(f) {
+	// >= not >: 2^53+1 is not representable and ParseFloat rounds it DOWN to
+	// exactly 2^53, so a strict > accepted it and reported a DIFFERENT (one
+	// lower) number — the one input where this function turns a number into
+	// another number rather than into "absent", which is the single thing it
+	// exists to prevent. Refusing 2^53 itself costs nothing real: these are
+	// byte, inode and process counts.
+	if f < 0 || f >= maxExactCount || f != math.Trunc(f) {
 		return 0, false
 	}
 	return uint64(f), true

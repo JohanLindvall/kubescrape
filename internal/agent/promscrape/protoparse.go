@@ -697,6 +697,19 @@ func protoLabels(m *dto.Metric) ([]Label, bool) {
 	if len(lps) == 0 {
 		return nil, true
 	}
+	// The SAME ceiling the text front applies, for the same reason and more
+	// urgently. The duplicate-name scan below is O(labels²) and runs inside one
+	// uninterruptible call; the text path survives a hostile line only because
+	// its parse is interleaved with 64 KiB socket reads, so the scrape deadline
+	// lands between them. Here the whole message is already resident
+	// (readDelimited + proto.Unmarshal) before the first comparison, so nothing
+	// interrupts it: 120k labels in one metric — 1.38 MiB, well inside
+	// maxProtoMessageBytes — measured 80s against a 1s scrape timeout, and
+	// cycle() waits for every scrape it starts. Past the cap the metric is
+	// malformed, exactly as a duplicate name is.
+	if len(lps) > maxLabelsPerSample {
+		return nil, false
+	}
 	out := make([]Label, 0, len(lps))
 	for _, lp := range lps {
 		name := lp.GetName()

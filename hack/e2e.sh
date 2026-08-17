@@ -280,7 +280,13 @@ native_converted() {
   # `set -o pipefail` the attempt reads as a failure exactly when the data is
   # there (the same trap documented for `grep -q` in collector_got). The
   # reader below also consumes all of stdin for the same reason.
-  out="$("${KCTL[@]}" -n monitoring exec "$pod" -c reader -- cat /data/metrics.json 2>/dev/null)" || return 1
+  # Bounded read. The capture grows for the whole run and reaches the
+  # exporter's rotation threshold, so `cat` streamed ~97 MB per attempt through
+  # the exec channel — and wait_until retries every 2s for up to 180s, i.e.
+  # gigabytes per `make e2e`. The answer only needs the RECENT tail: the
+  # conversion under test is re-exported every scrape interval.
+  out="$("${KCTL[@]}" -n monitoring exec "$pod" -c reader -- \
+    sh -c 'tail -c 8000000 /data/metrics.json' 2>/dev/null)" || return 1
   printf '%s' "$out" | python3 -c '
 import json, sys
 ok = False

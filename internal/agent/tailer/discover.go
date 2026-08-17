@@ -269,12 +269,24 @@ func (t *Tailer) scanDir(checkpoints map[string]checkpoint, initial bool) {
 				discovered = true
 			}
 		}
-		if ok {
-			// This source's startup ends here — AFTER its own paths were claimed,
-			// so the files this very pass discovered are still governed by
-			// -logs-unknown-files, and anything appearing under it later is
-			// genuinely new. Per source: a sibling stuck on a failing glob must
-			// not keep this one's new files being skipped as history.
+		// This source's startup ends here — AFTER its own paths were claimed,
+		// so the files this very pass discovered are still governed by
+		// -logs-unknown-files, and anything appearing under it later is
+		// genuinely new. Per source: a sibling stuck on a failing glob must not
+		// keep this one's new files being skipped as history.
+		//
+		// It ends on a PARTIAL listing too, which is the whole distinction: a
+		// permanently unreadable subdirectory under a `**` include keeps ok
+		// false for the life of the process, and gating on ok therefore left
+		// the source in startup forever — so every file it discovered an hour
+		// later was treated as history, seeked to EOF under
+		// -logs-unknown-files=end (also what `auto` resolves to on a first run)
+		// and CHECKPOINTED there. That silently skips a new container's first
+		// lines, uncounted. "Has this source produced a listing?" and "was the
+		// listing complete?" are different questions; ok answers only the
+		// second, and it still gates gone-detection and checkpoint pruning
+		// below, which are the things that genuinely need absence proven.
+		if ok || len(paths) > 0 {
 			src.startingUp = false
 		}
 	}

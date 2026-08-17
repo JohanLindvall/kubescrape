@@ -14,8 +14,12 @@ trap cleanup_writers EXIT
 
 MARK="CHAOSCOL$(date +%s)"
 NODE="${NODE:-$("${KCTL[@]}" get nodes -o jsonpath='{.items[1].metadata.name}')}"
-COUNT="${COUNT:-200}"
 OUTAGE="${OUTAGE:-90}"
+# One line per second for exactly the outage, so "every line is produced while
+# there is nowhere to deliver it" is TRUE rather than nearly-half true: at the
+# old default of 200 the writer outlived the outage by 110s and most lines took
+# the ordinary path.
+COUNT="${COUNT:-$OUTAGE}"
 
 # The collector goes down FIRST, and only then does the writer start. Every
 # line is therefore produced while there is nowhere to deliver it, so every

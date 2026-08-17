@@ -288,6 +288,17 @@ type Rotating struct {
 	// nextRead is the earliest time the file may be read again: refresh after a
 	// good read, the longer interval after a failed one.
 	nextRead time.Time
+	// reading is true while a refresh read is in flight with the mutex
+	// dropped. It is what bounds the number of concurrent reads to ONE, and a
+	// deadline cannot do that job: a timestamp claim EXPIRES, so on a mount
+	// where open(2) blocks forever — the case dropping the lock exists for —
+	// every interval would start another blocking read. Each parks a goroutine
+	// in a file syscall, which pins an OS thread (regular files are not
+	// pollable), so the process walks into the runtime's fatal 10000-thread
+	// limit in hours. Holding the lock across the read pinned exactly one
+	// thread and survived indefinitely; the flag keeps that bound while still
+	// letting every other caller answer from the last-good set.
+	reading bool
 }
 
 // NewRotating reads the token file once, FATALLY: "no path", "unreadable" and
@@ -356,20 +367,23 @@ func (r *Rotating) Tokens() []string {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	now := r.set.now()
-	if !now.Before(r.nextRead) {
+	if !now.Before(r.nextRead) && !r.reading {
 		// Do the file I/O with the lock DROPPED. This is every authenticated
 		// request's read path (the metadata service's /v1/scrape-auth, the
 		// trace tier's internal hop), so holding the mutex across os.ReadFile
 		// would serialise every auth check behind a slow or wedged Secret mount
 		// (a stuck CSI/NFS projection), not just the one request that triggered
-		// the refresh. Claim the refresh slot first (advance nextRead) so a
-		// concurrent caller sees the read as not-yet-due and returns the
-		// last-good set instead of also reading; publish the result after.
+		// the refresh. Concurrent callers return the last-good set instead of
+		// also reading — gated by `reading`, NOT by the advanced deadline,
+		// which expires under exactly the wedged mount this exists for (see
+		// the field). Publish the result after.
+		r.reading = true
 		r.nextRead = now.Add(r.set.refresh)
 		path := r.path
 		r.mu.Unlock()
 		next, err := ReadFile(path)
 		r.mu.Lock()
+		r.reading = false
 		now = r.set.now()
 		if err != nil {
 			r.nextRead = now.Add(r.set.interval)

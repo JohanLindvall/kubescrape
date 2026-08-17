@@ -168,7 +168,16 @@ const (
 // line is dropped as malformed, exactly as a duplicate label name is. Real
 // exposition rarely exceeds a few dozen labels; this is far above any
 // legitimate use.
-const maxLabelsPerSample = 4096
+// It is EXPORTED because the protobuf front in internal/agent/promscrape runs
+// the same quadratic scan over its own label slice and must apply the same
+// ceiling — capping only this one left the other door wide open, and the proto
+// side is the worse of the two: it materialises the whole message before
+// scanning, so there is no interleaved socket read for the scrape deadline to
+// land on.
+const MaxLabelsPerSample = 4096
+
+// maxLabelsPerSample is the internal spelling used below.
+const maxLabelsPerSample = MaxLabelsPerSample
 
 // maxMetaBytes bounds the "# HELP"/"# UNIT" text retained for one exposition.
 // The meta table is per-exposition like the TYPE table, but its VALUES are free

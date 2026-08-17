@@ -100,6 +100,15 @@ func compilePolicies(list []PolicyConfig, sub bool, alloc *bucketAlloc) ([]named
 		if pc.Name == "none" {
 			return nil, false, errPolicy(where, "\"none\" is reserved (it is the metric label for the unattributed default drop); pick another name")
 		}
+		// A sub-policy is labelled "<composite>/<sub>", and a top-level name is
+		// a free string, so a policy called "outer/inner" produces the SAME
+		// metric label as composite "outer"'s sub-policy "inner" and their
+		// counters conflate — the identical failure the "none" reservation
+		// above prevents, reached through the qualified namespace instead of
+		// the reserved word.
+		if strings.Contains(pc.Name, "/") {
+			return nil, false, errPolicy(where, "a policy name may not contain '/': it is the separator for a composite's sub-policy metric label (\"<composite>/<sub>\"), so such a name can collide with one and merge their counters")
+		}
 		if _, dup := seen[pc.Name]; dup {
 			return nil, false, errPolicy(where, "duplicate policy name %q", pc.Name)
 		}

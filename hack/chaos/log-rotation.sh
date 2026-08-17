@@ -58,14 +58,16 @@ sleep $((COUNT / 50 + 150))
 say "did the kubelet actually rotate the log?"
 # A rotated container log is the live <n>.log plus timestamped siblings; more
 # than one file means at least one rename happened under the tailer.
-ROTATED=$(docker exec "$NODE" sh -c \
+ROTATED=$("$CRI" exec "$NODE" sh -c \
   'find /var/log/pods -path "*chaos-rot-writer*" -name "*.log*" 2>/dev/null | wc -l' | tr -d '[:space:]')
 info "container log files on the node: ${ROTATED:-0} (1 = never rotated)"
 if [ "${ROTATED:-0}" -lt 2 ]; then
   fail "the log never rotated, so this run proves nothing about rotation.
     The kubelet's containerLogMaxSize is probably the 10Mi default — recreate the
-    cluster so hack/kind-config.yaml's 1Mi applies (make cluster-down cluster-up),
-    or raise COUNT/PAD until it crosses the threshold."
+    cluster so hack/kind-config.yaml's 1Mi applies (make cluster-down cluster-up).
+    Do NOT simply raise COUNT/PAD to force it: past containerLogMaxFiles (5) the
+    KUBELET deletes the oldest rotated file, and that real loss would be reported
+    here as a kubescrape gap."
 fi
 info "rotations observed: $((ROTATED - 1))"
 

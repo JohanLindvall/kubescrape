@@ -611,6 +611,9 @@ func (r *Reader) stream(ctx context.Context) error {
 			if len(r.batch) > 0 {
 				r.tryFlush(ctx)
 			}
+			// Also on an EMPTY-batch tick: a stream that goes quiet after a
+			// bookmark still has a position worth writing, and tryFlush (which
+			// persists too) does not run here.
 			r.persist(ctx, false)
 		case ev, ok := <-w.ResultChan():
 			if !ok {
@@ -990,6 +993,15 @@ func (r *Reader) tryFlush(ctx context.Context) {
 	if r.flushTicker != nil {
 		r.flushTicker.Reset(r.cfg.FlushInterval)
 	}
+	// Offer to persist after EVERY flush, not only the ticker-driven one.
+	// persist self-throttles on PersistInterval, so this cannot write more
+	// often than configured — but leaving it in the ticker branch alone meant
+	// resetting that ticker here STARVED it: a rate that trips the count
+	// trigger faster than FlushInterval reset the ticker before it could fire,
+	// so the position was never written and the PersistInterval bound on
+	// post-crash replay silently stopped holding (measured: 0 writes under a
+	// count-triggered load that produced 10 with the trigger disabled).
+	r.persist(ctx, false)
 	if !r.flushFailedAt.IsZero() {
 		r.log.Info("event export recovered", "buffered", len(r.batch))
 		r.flushFailedAt, r.flushWarned = time.Time{}, time.Time{}

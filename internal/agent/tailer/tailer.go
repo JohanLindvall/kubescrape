@@ -44,9 +44,16 @@ import (
 	"github.com/JohanLindvall/kubescrape/internal/logdedupe"
 	"github.com/JohanLindvall/kubescrape/internal/logline"
 	"github.com/JohanLindvall/kubescrape/internal/metrics"
+	"github.com/JohanLindvall/kubescrape/internal/obs"
 	"github.com/JohanLindvall/kubescrape/pkg/kubemeta"
 	"github.com/JohanLindvall/kubescrape/pkg/logattrs"
 )
+
+// maxReadWarnPaths bounds the distinct paths the read-failure warn throttles
+// by. logdedupe saturation SUPPRESSES rather than clearing, so the one
+// saturation line is what tells an operator the list is truncated; the counter
+// keeps moving regardless.
+const maxReadWarnPaths = 256
 
 // LogExporter sends one OTLP logs payload.
 type LogExporter interface {
@@ -355,7 +362,7 @@ func New(cfg Config) *Tailer {
 		sources:           sources,
 		scanDirs:          scanDirs,
 		files:             make(map[string]*file),
-		readWarn:          logdedupe.New(256, time.Minute),
+		readWarn:          logdedupe.New(maxReadWarnPaths, time.Minute),
 		retryBackoff:      time.Second,
 		resolveBudget:     defaultResolveBudget,
 		shutdownBudget:    defaultShutdownBudget,
@@ -610,10 +617,22 @@ func (t *Tailer) sweep(ctx context.Context, all bool) {
 				// an instant (a rename+recreate rotation caught mid-sweep) is
 				// resurrected by the gone branch's own stat next sweep.
 				f.gone = true
-			} else if allow, _ := t.readWarn.Allow(path); allow {
+			} else {
+				obs.LogReadErrors.Inc()
 				// Throttled: a persistently unreadable file fails here on every
-				// sweep, and an unthrottled warn is a flood (see readWarn).
-				t.log.Warn("reading log file", "path", path, "error", err)
+				// sweep, and an unthrottled warn is a flood (see readWarn). The
+				// SATURATED flag is what keeps the throttle honest — past the
+				// table's cap a new path is suppressed outright, and without
+				// this line the condition would become invisible rather than
+				// merely quiet. Every other Table user in the tree consumes it;
+				// this one discarded it.
+				if allow, saturated := t.readWarn.Allow(path); allow {
+					t.log.Warn("reading log file", "path", path, "error", err)
+				} else if saturated {
+					t.log.Warn("too many distinct unreadable log files to warn about individually; "+
+						"further paths are suppressed (kubescrape_log_read_errors_total still counts them)",
+						"tracked", maxReadWarnPaths)
+				}
 			}
 		}
 		// Age out fragment runs and multi-line groups that never completed.

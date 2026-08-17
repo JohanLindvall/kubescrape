@@ -27,6 +27,10 @@ const (
 	// own intern tables so one pathological endpoint cannot grow either.
 	maxTrackedFamilies = promparse.MaxTrackedFamilies
 	maxInternedValues  = promparse.MaxInternedValues
+
+	// The per-sample label ceiling, shared with the text parser so BOTH fronts
+	// bound the same quadratic dedupe scan. See promparse.MaxLabelsPerSample.
+	maxLabelsPerSample = promparse.MaxLabelsPerSample
 )
 
 // ErrTooManySamples is returned when a scrape exceeds its sample budget.

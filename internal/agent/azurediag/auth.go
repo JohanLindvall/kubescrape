@@ -270,7 +270,13 @@ func parseTokenResponse(body []byte, what string) (string, time.Duration, error)
 			// time.Duration(+Inf) overflows to a large NEGATIVE duration, so
 			// expiry lands in the past and the token is refreshed on every
 			// connection. Reject non-finite (and cap absurd finite) values.
-			if secs, err := strconv.ParseFloat(s, 64); err == nil && secs > 0 && !math.IsInf(secs, 1) {
+			// Non-finite AND absurd-finite: 1e300 overflows
+			// time.Duration exactly as +Inf does, landing the expiry in the
+			// past and refreshing the token on every connection — the very
+			// symptom the Inf guard was added for. maxTokenTTL is the widest
+			// value that cannot overflow the multiply.
+			const maxTokenTTL = float64(math.MaxInt64) / float64(time.Second)
+			if secs, err := strconv.ParseFloat(s, 64); err == nil && secs > 0 && secs <= maxTokenTTL {
 				ttl = time.Duration(secs * float64(time.Second))
 			}
 		}

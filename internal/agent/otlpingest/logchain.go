@@ -167,6 +167,27 @@ func chainBody(lr plog.LogRecord) (string, bool) {
 	return b.AsString(), true
 }
 
+// escapedLen is what a string COSTS once AsString renders it as JSON, which is
+// what the estimate has to charge: the raw length is not an upper bound on the
+// rendered one. encoding/json escapes a quote or backslash to two bytes and a
+// control byte to six (\u00XX), so charging len() let a body estimate just
+// under the budget and materialise up to 6x past it — on an unauthenticated
+// path, and against a guard whose whole purpose is to prevent exactly that
+// amplification. Measured on a 900 KiB body: 1.00x plain, 2.00x all-quotes,
+// 6.00x all-NUL.
+func escapedLen(s string) int {
+	n := len(s)
+	for i := 0; i < len(s); i++ {
+		switch c := s[i]; {
+		case c == '"' || c == '\\':
+			n++ // -> \" or \\
+		case c < 0x20:
+			n += 5 // -> \u00XX
+		}
+	}
+	return n
+}
+
 // renderedSizeOver estimates the AsString rendering size of a value tree,
 // aborting as soon as the budget is spent. Depth-bounded like scrubValue:
 // bodies come from unauthenticated senders.
@@ -187,7 +208,7 @@ func renderedSizeOver(v pcommon.Value, rem *int, depth int) bool {
 	}
 	switch v.Type() {
 	case pcommon.ValueTypeStr:
-		*rem -= len(v.Str()) + 2
+		*rem -= escapedLen(v.Str()) + 2
 	case pcommon.ValueTypeBytes:
 		*rem -= v.Bytes().Len()*4/3 + 2
 	case pcommon.ValueTypeMap:

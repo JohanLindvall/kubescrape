@@ -547,9 +547,29 @@ func boundedInt() *starlark.Builtin {
 		if err := budgetOf(th).overtime(); err != nil {
 			return nil, positioned(th, err)
 		}
+		// BOTH argument forms: the builtin is int(x, base=10), so checking
+		// args[0] alone left `int(x = "…")` free to spend seconds in one
+		// uninterruptible step — the guard closed nothing for a script that
+		// used the keyword form.
+		check := func(v starlark.Value) error {
+			if s, ok := v.(starlark.String); ok && len(s) > maxIntStringLen {
+				return fmt.Errorf("int() of a %d-character string is over the %d-character limit (the parse is quadratic and uninterruptible)", len(s), maxIntStringLen)
+			}
+			return nil
+		}
 		if len(args) > 0 {
-			if s, ok := args[0].(starlark.String); ok && len(s) > maxIntStringLen {
-				return nil, positioned(th, fmt.Errorf("int() of a %d-character string is over the %d-character limit (the parse is quadratic and uninterruptible)", len(s), maxIntStringLen))
+			if err := check(args[0]); err != nil {
+				return nil, positioned(th, err)
+			}
+		}
+		for _, kv := range kwargs {
+			if len(kv) != 2 {
+				continue
+			}
+			if name, ok := starlark.AsString(kv[0]); ok && name == "x" {
+				if err := check(kv[1]); err != nil {
+					return nil, positioned(th, err)
+				}
 			}
 		}
 		return inner.CallInternal(th, args, kwargs)

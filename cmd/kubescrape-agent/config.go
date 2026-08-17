@@ -767,6 +767,18 @@ func configWarnings(cfg agentConfig) []string {
 					"logAttributes rule %q lifts a log-line value into %q, a RESOLVED-IDENTITY resource attribute: whatever writes the line controls it (k8s.namespace.name keys tenancy routing; service.instance.id and k8s.pod.* forge series identity). The pod-annotation path refuses these keys; lift into a differently-named attribute unless the workload is genuinely authoritative for this one.",
 					r.Key, attr))
 			}
+			// The plumbing markers are the SHARPER case and were missed:
+			// attrs.ReservedPlumbing names this very surface as one it covers,
+			// but only the pod-annotation path consulted it. The router honours
+			// route.ScriptMarker BEFORE its namespace globs, so a rule lifting a
+			// log-line value into it hands whatever writes the line the choice
+			// of route — and its tenant headers — with no namespace forgery
+			// needed at all.
+			if attrs.ReservedPlumbing(attr) {
+				out = append(out, fmt.Sprintf(
+					"logAttributes rule %q lifts a log-line value into %q, which is kubescrape's OWN plumbing, not a describable attribute: the router honours the route marker before its namespace globs, so whatever writes the line chooses the destination (and its tenant headers), and the drop marker deletes the record. The pod-annotation path and the ingest receivers both refuse this key; lift into a differently-named attribute.",
+					r.Key, attr))
+			}
 		}
 	}
 

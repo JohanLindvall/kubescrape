@@ -293,6 +293,23 @@ func isSandbox(ident cadvisorIdentity, labelledPOD, podContainer bool) bool {
 	return ident.podUID == "" && isPauseImage(ident.image)
 }
 
+// archSuffixes are the GOARCH values Kubernetes publishes pause images for.
+var archSuffixes = []string{"amd64", "arm64", "arm", "ppc64le", "s390x", "386", "riscv64"}
+
+// isArchPause reports the "pause-<arch>" shape only.
+func isArchPause(image string) bool {
+	rest, ok := strings.CutPrefix(image, "pause-")
+	if !ok {
+		return false
+	}
+	for _, a := range archSuffixes {
+		if rest == a {
+			return true
+		}
+	}
+	return false
+}
+
 // isPauseImage reports whether an image reference names a sandbox image.
 // Registry and tag are stripped so every mirror spelling matches
 // (registry.k8s.io/pause:3.10, gcr.io/google_containers/pause-amd64:3.1,
@@ -310,7 +327,11 @@ func isPauseImage(image string) bool {
 	if i := strings.IndexByte(image, ':'); i >= 0 {
 		image = image[:i] // tag
 	}
-	return image == "pause" || strings.HasPrefix(image, "pause-") || strings.HasSuffix(image, "-pause")
+	// The prefix arm exists for the arch-suffixed sandbox images (pause-amd64,
+	// pause-arm64, ...), so it is restricted to those rather than accepting any
+	// repository that merely BEGINS "pause-" — registry.k8s.io/pause-monitor is
+	// a plausible workload name and was read as the sandbox image.
+	return image == "pause" || isArchPause(image) || strings.HasSuffix(image, "-pause")
 }
 
 // rollup reports whether the sample belongs to a cgroup above pod level.

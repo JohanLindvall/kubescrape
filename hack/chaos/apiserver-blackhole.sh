@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # CHAOS: the API server is BLACKHOLED (not refused).
 #
-# `docker pause` freezes the control-plane container, so connections hang
+# `"$CRI" pause` freezes the control-plane container, so connections hang
 # instead of being refused. That distinction is the whole point: client-go's
 # watch-error path is SILENT for a hanging outage (the reflector never returns),
 # which is why the metadata service carries its own reachability probe.
@@ -15,7 +15,7 @@
 #   * nothing restarts.
 #
 # kubectl is unusable while paused, so a prober pod records /readyz to a
-# hostPath and we read it back with `docker exec` afterwards.
+# hostPath and we read it back with `"$CRI" exec` afterwards.
 set -uo pipefail
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib.sh"
 need_cluster
@@ -28,7 +28,7 @@ SVCIP=$("${KCTL[@]}" -n "$NS" get pods -l app=kubescrape -o jsonpath='{.items[0]
 info "metadata service on $SVCNODE at $SVCIP; pausing $CP for ${OUTAGE}s"
 
 cleanup() {
-  docker unpause "$CP" >/dev/null 2>&1 || true
+  "$CRI" unpause "$CP" >/dev/null 2>&1 || true
   "${KCTL[@]}" -n default delete pod chaos-readyz-prober --ignore-not-found --grace-period=0 --force >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
@@ -68,21 +68,31 @@ EOF
 "${KCTL[@]}" -n default wait --for=condition=Ready pod/chaos-readyz-prober --timeout=120s >/dev/null
 sleep 15
 
+# The pause MUST be checked. This script has no `set -e`, so a failed pause
+# (a CLUSTER_NAME override, a podman cluster, a multi-control-plane node named
+# ...-control-plane2, an already-stopped container) previously let it sleep with
+# nothing paused, record a prober log of pure OK, and print "CHAOS PASS:
+# readiness latched" — certifying an invariant it never exercised. That is the
+# same vacuous-pass class log-rotation.sh already guards against by asserting
+# the rotation happened.
 say "PAUSING $CP (kubectl is unusable until it is unpaused)"
-docker pause "$CP" >/dev/null
+"$CRI" pause "$CP" >/dev/null || fail "could not pause $CP — no outage was created, so this run would prove nothing"
+paused=$("$CRI" inspect -f '{{.State.Paused}}' "$CP" 2>/dev/null)
+[ "$paused" = "true" ] || fail "$CP did not enter the paused state (got ${paused:-unknown}) — no outage was created"
+"$CRI" pause "$CP" >/dev/null
 sleep "$OUTAGE"
-docker unpause "$CP" >/dev/null
+"$CRI" unpause "$CP" >/dev/null
 say "UNPAUSED; letting the cluster settle"
 sleep 90
 
 say "what the prober saw"
-docker exec "$SVCNODE" sh -c 'cat /var/log/kubescrape-chaos/readyz.log' | sort | uniq -c | sed 's/^/    /'
+"$CRI" exec "$SVCNODE" sh -c 'cat /var/log/kubescrape-chaos/readyz.log' | sort | uniq -c | sed 's/^/    /'
 # `grep -c` prints 0 AND exits 1 when there is no match, so a `|| echo 0`
 # fallback appends a SECOND zero and the comparison below sees "0\n0".
 # Count with awk instead: one line of output, always exit 0.
-BAD=$(docker exec "$SVCNODE" sh -c \
+BAD=$("$CRI" exec "$SVCNODE" sh -c \
   "awk '/FAIL/{n++} END{print n+0}' /var/log/kubescrape-chaos/readyz.log" 2>/dev/null | tr -d '[:space:]')
-OKS=$(docker exec "$SVCNODE" sh -c \
+OKS=$("$CRI" exec "$SVCNODE" sh -c \
   "awk '/OK/{n++} END{print n+0}' /var/log/kubescrape-chaos/readyz.log" 2>/dev/null | tr -d '[:space:]')
 
 say "the compensating signal"
@@ -96,7 +106,13 @@ say "restarts (must be zero)"
   -o jsonpath='{range .items[*]}{"    "}{.metadata.name}{" restarts="}{.status.containerStatuses[0].restartCount}{"\n"}{end}'
 
 say "verdict"
-[ "${OKS:-0}" -gt 0 ] || fail "the prober recorded nothing — it never reached /readyz at all"
+# OKS>0 only proves the prober ran ONCE. It samples every 2s across
+# 15 + OUTAGE + 90 seconds, so a prober that died early (restartPolicy: Never)
+# would also report BAD=0 having observed none of the outage. Require enough
+# samples to have covered the outage itself.
+minSamples=$((OUTAGE / 2))
+[ "${OKS:-0}" -ge "$minSamples" ] || \
+  fail "the prober recorded only ${OKS:-0} samples, fewer than the $minSamples the ${OUTAGE}s outage should have produced — it did not span the outage, so a latched /readyz is not demonstrated"
 if [ "${BAD:-1}" = "0" ]; then
   echo "CHAOS PASS: /readyz answered 200 $OKS/$OKS times across a ${OUTAGE}s API-server blackhole (readiness latched)"
 else

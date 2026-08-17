@@ -24,20 +24,26 @@ const (
 	AnnotationScheme = "prometheus.io/scheme"
 )
 
-// MaxPortsPerPod bounds how many scrape targets one pod may produce from its
-// own (or a selecting Service's) port annotation — the same kind of
-// anti-abuse ceiling as podconfig's maxPodRules, and here for a sharper
-// reason. Every ScrapeTarget embeds the WHOLE pod document by value
-// (kubemeta.ScrapeTarget.Pod), so N targets carry N copies of the pod's
-// annotations; a tenant who can annotate a pod in their own namespace (an
-// ordinary namespaced action) can pair a ~256 KiB annotation object with a
-// long comma-separated prometheus.io/port list and make the singleton
-// metadata service marshal an O(N²) /v1/nodes/{node}/targets body — a
-// fleet-wide OOM built from one pod. A real workload scrapes a handful of
-// ports; this ceiling is far above any legitimate use and caps the response
-// at O(pod) per pod rather than O(pod × ports). The cap is applied at the
-// derivation seam so it protects both /v1/nodes/{node}/targets and
-// /v1/explain (which builds the same targets in an intermediate slice).
+// MaxPortsPerPod bounds how many scrape targets ONE POD may produce, across
+// every door that produces them. Every ScrapeTarget embeds the WHOLE pod
+// document by value (kubemeta.ScrapeTarget.Pod), so N targets carry N copies of
+// the pod's annotations; a tenant who can annotate a pod in their own namespace
+// — or author a ServiceMonitor with many endpoints, which needs no annotation
+// on the pod at all — can otherwise make the singleton metadata service marshal
+// an O(N²) /v1/nodes/{node}/targets body and OOM, taking target discovery for
+// the whole fleet with it.
+//
+// It is ENFORCED where targets are ACCUMULATED (server.targetDedup.add), not
+// here. That is the correction of an earlier attempt that capped only the two
+// doors below: a ServiceMonitor endpoint list bypassed them entirely and
+// reopened the same O(N²) response (measured 20.8 MiB at 1024 endpoints, and it
+// multiplies per pod the Service selects). The doors below still bound how many
+// PORTS one annotation resolves, which keeps the intermediate slices small, but
+// the ceiling that matters is the one on the accumulated output.
+//
+// A refused target is NOT scraped, so it is counted (obs.ScrapeTargetsCapped)
+// and named by /v1/explain rather than dropped silently. A real workload
+// scrapes a handful of ports; this is far above any legitimate use.
 const MaxPortsPerPod = 16
 
 // PodTargets returns the scrape targets derived from a pod's own

@@ -26,7 +26,7 @@ info "SIGKILLing $AGENT on $NODE"
 # pkill inside the node beats deleting the pod: it is a genuine crash, with no
 # graceful shutdown and so no final flush — which is the case the checkpoint
 # exists for.
-docker exec "$NODE" sh -c "pkill -9 -f kubescrape-agent" 2>/dev/null || \
+"$CRI" exec "$NODE" sh -c "pkill -9 -f kubescrape-agent" 2>/dev/null || \
   "${KCTL[@]}" -n "$NS" delete pod "$AGENT" --grace-period=0 --force >/dev/null 2>&1
 info "killed at $(date -Iseconds)"
 

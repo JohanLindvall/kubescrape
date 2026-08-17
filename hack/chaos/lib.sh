@@ -14,6 +14,10 @@ set -uo pipefail
 
 CLUSTER_NAME="${CLUSTER_NAME:-kubescrape}"
 KCTL=(kubectl --context "kind-$CLUSTER_NAME")
+# hack/cluster-up.sh accepts docker OR podman, so the scenarios must not assume
+# one: on a podman cluster a hard-coded `docker` fails, and a scenario that does
+# not check the failure then draws a confidently wrong conclusion.
+CRI="${CRI:-$(command -v docker >/dev/null 2>&1 && echo docker || echo podman)}"
 NS=monitoring
 CHAOS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CAP_DIR="${CAP_DIR:-$CHAOS_DIR/.cap}"
@@ -36,14 +40,26 @@ collector_pod() {
 # grab <signal> — snapshot the collector's captured payloads (logs|metrics|traces).
 #
 # Reads through the `reader` sidecar because the collector image is distroless.
-# NEVER truncate these files in place: the file exporter holds an open fd at its
-# own offset, so a truncate leaves a sparse file and every later line count
-# lies. Use recycle_collector for a clean slate instead.
+#
+# It concatenates the ROTATED siblings too, oldest first. The file exporter
+# rotates at max_megabytes, renaming the old file to <sig>-<timestamp>.json, and
+# reading only the live file made every line written before a rotation
+# unreadable — which gap_report then reports as MISSING, i.e. it accuses
+# kubescrape of losing data the harness itself discarded. That is most likely
+# exactly when `make chaos` is used as intended: four scenarios in a row on a
+# cluster that has been up a while.
+#
+# NEVER truncate these files in place: the exporter holds an open fd at its own
+# offset, so a truncate leaves a sparse file and every later line count lies.
+# Use recycle_collector for a clean slate instead.
 grab() {
   local sig="$1" pod
   pod="$(collector_pod)" || return 1
   [ -n "$pod" ] || return 1
-  "${KCTL[@]}" -n "$NS" exec "$pod" -c reader -- cat "/data/$sig.json" \
+  # `ls -1` sorts the timestamped siblings ascending, and the live file (no
+  # timestamp) sorts before them, so feed it explicitly last.
+  "${KCTL[@]}" -n "$NS" exec "$pod" -c reader -- sh -c \
+    "for f in \$(ls -1 /data/$sig-*.json 2>/dev/null); do cat \"\$f\"; done; cat /data/$sig.json 2>/dev/null" \
     > "$CAP_DIR/$sig.json" 2>/dev/null
 }
 

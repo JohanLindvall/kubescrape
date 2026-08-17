@@ -300,6 +300,22 @@ func (st *Store[S]) StaleAfter() time.Duration { return st.opt.StaleAfter }
 // Render builds one payload under res: the resource, the scope, and whatever
 // Options.Render writes into it. A render that produced no metric at all yields
 // an EMPTY pmetric.Metrics, which Export sends nothing for.
+//
+// A PARTIALLY empty render is dropped down to its populated metrics here, and
+// that is a guarantee this seam owes rather than a repair of its callers.
+// SumMetric and HistMetric append a metric's shell and hand back a data-point
+// slice the caller may or may not write into, so the "leave the scope empty
+// when there is nothing to report" contract in Options.Render's doc is kept by
+// each caller precomputing whether it has anything — spanmetrics returns before
+// creating its three shells on an empty snapshot, servicegraph computes
+// anyClient/anyServer across the whole snapshot before creating either
+// histogram. Both are correct today, and neither is enforced by anything but
+// its own arithmetic. A third aggregator built on this store would create its
+// shells optimistically, and the metric with no data points that follows is
+// legal OTLP: nothing downstream rejects it, so it would ship its name,
+// description, unit and framing on every export forever with no counter
+// anywhere moving. Two hundred nanoseconds once per export interval is a cheap
+// price for making that unrepresentable.
 func (st *Store[S]) Render(res pcommon.Resource, now time.Time) pmetric.Metrics {
 	md := pmetric.NewMetrics()
 	rm := md.ResourceMetrics().AppendEmpty()
@@ -308,10 +324,30 @@ func (st *Store[S]) Render(res pcommon.Resource, now time.Time) pmetric.Metrics 
 	sm.Scope().SetName(st.opt.Scope)
 
 	st.opt.Render(sm, now)
+	sm.Metrics().RemoveIf(noDataPoints)
 	if sm.Metrics().Len() == 0 {
 		return pmetric.NewMetrics() // nothing to send this cycle
 	}
 	return md
+}
+
+// noDataPoints reports whether m carries no data points, across every metric
+// type and including an untyped one.
+func noDataPoints(m pmetric.Metric) bool {
+	switch m.Type() {
+	case pmetric.MetricTypeGauge:
+		return m.Gauge().DataPoints().Len() == 0
+	case pmetric.MetricTypeSum:
+		return m.Sum().DataPoints().Len() == 0
+	case pmetric.MetricTypeHistogram:
+		return m.Histogram().DataPoints().Len() == 0
+	case pmetric.MetricTypeExponentialHistogram:
+		return m.ExponentialHistogram().DataPoints().Len() == 0
+	case pmetric.MetricTypeSummary:
+		return m.Summary().DataPoints().Len() == 0
+	default:
+		return true
+	}
 }
 
 // Export renders the current cumulative aggregate under res and sends it once.

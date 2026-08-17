@@ -337,7 +337,12 @@ func (r *recordingExporter) ExportMetrics(context.Context, pmetric.Metrics) erro
 func TestSelfSinkBypassesTheRouterAndTheTap(t *testing.T) {
 	routedChain, defaultChain := &recordingExporter{}, &recordingExporter{}
 	md := pmetric.NewMetrics()
-	md.ResourceMetrics().AppendEmpty().ScopeMetrics().AppendEmpty().Metrics().AppendEmpty().SetName("kubescrape_up")
+	// A real gauge with a data point: this test is about WHICH chain the
+	// payload takes, and an untyped shell would be pruned as an empty metric
+	// before either chain saw it (transform.pruneDataPoints).
+	up := md.ResourceMetrics().AppendEmpty().ScopeMetrics().AppendEmpty().Metrics().AppendEmpty()
+	up.SetName("kubescrape_up")
+	up.SetEmptyGauge().DataPoints().AppendEmpty().SetIntValue(1)
 
 	// No transforms: the pre-routing chain itself, not whatever the routed
 	// chain grew into (tap, router).

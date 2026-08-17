@@ -293,7 +293,15 @@ func pruneDataPoints(m pmetric.Metric) (dropped int, empty bool) {
 		pts.RemoveIf(func(p pmetric.SummaryDataPoint) bool { return drop(p.Attributes()) })
 		return dropped, pts.Len() == 0
 	}
-	return 0, false
+	// An UNTYPED metric (pmetric.MetricTypeEmpty) has no data points to drop
+	// and no data points to keep, so it is empty by definition and reported as
+	// such — the prune's caller removes it. Reporting `false` here shipped it
+	// instead: a name, a description and a unit, on every export, carrying no
+	// measurement, legal enough that nothing downstream would ever reject it.
+	// Nothing in this repo builds one (pushed ones die at the ingest receipt
+	// seam, otlpingest/emptymetrics.go), which is exactly why this arm needs to
+	// be right rather than exercised.
+	return 0, true
 }
 
 func pruneTraces(td ptrace.Traces) int {

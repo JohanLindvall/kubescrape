@@ -176,6 +176,10 @@ type Server struct {
 	// on purpose (reservation.expire says why).
 	reserveExpiries    atomic.Uint64
 	reserveExpiryWarns logdedupe.Throttle
+	// emptyMetricWarns throttles the empty-metric prune's warning
+	// (emptymetrics.go). Keyless: the condition is one sender-side
+	// instrumentation bug shipped on every push, and the count rides the line.
+	emptyMetricWarns logdedupe.Throttle
 }
 
 // NewServer creates an ingest Server.
@@ -371,8 +375,11 @@ func (g *metricsGRPC) Export(ctx context.Context, req pmetricotlp.ExportRequest)
 	err := grpcExport(ctx, func(ctx context.Context) error {
 		in := req.Metrics()
 		g.s.admitMetrics(in) // admission first (ingest: hook, pre-enrichment)
+		// Metrics with no data points die here, before anything downstream
+		// pays to carry them (emptymetrics.go).
+		g.s.pruneEmptyMetrics(in)
 		if in.ResourceMetrics().Len() == 0 {
-			return nil // everything rejected: acked without a send
+			return nil // everything rejected or empty: acked without a send
 		}
 		// Reserved plumbing keys die before anything reads them (reserved.go).
 		g.s.sanitizeMetrics(in)
@@ -577,8 +584,10 @@ func (s *Server) handleHTTPMetrics(w http.ResponseWriter, r *http.Request) {
 	s.servePush(w, r, "metrics", req.UnmarshalProto, func(ctx context.Context) (ProtoMarshaler, error) {
 		in := req.Metrics()
 		s.admitMetrics(in) // admission first (ingest: hook, pre-enrichment)
+		// Metrics with no data points die here (emptymetrics.go).
+		s.pruneEmptyMetrics(in)
 		if in.ResourceMetrics().Len() == 0 {
-			return pmetricotlp.NewExportResponse(), nil // all rejected: acked
+			return pmetricotlp.NewExportResponse(), nil // all rejected or empty: acked
 		}
 		// Reserved plumbing keys die before anything reads them (reserved.go).
 		s.sanitizeMetrics(in)

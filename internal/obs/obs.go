@@ -411,6 +411,15 @@ var (
 			"route and its tenant headers) or the transform engine's drop marker (whose presence-only prune "+
 			"would delete the element and count it as an operator-intended transform drop whenever a script "+
 			"for that signal is active). The data itself is still forwarded, minus the reserved key.", "key")
+	IngestEmptyMetricsDropped = Registry.Counter("kubescrape_ingest_empty_metrics_dropped_total",
+		"Pushed metrics removed at first receipt because they carried no data points. An empty metric is "+
+			"legal OTLP, so nothing downstream rejects one: it would ride enrichment, the split regrouping, "+
+			"the transform scripts, the router, the disk buffer and the wire, spending its name, description, "+
+			"unit and framing against the send cap on every push, and deliver no measurement. kubescrape's own "+
+			"producers cannot emit one (every metric-building path appends a metric's first data point in the "+
+			"same function that creates its shell), so any rate here is a SENDER creating metric descriptors "+
+			"it never records into — and this counter is the only report of it that exists. The rest of the "+
+			"payload is forwarded unchanged; a push consisting only of empty metrics is acked without a send.")
 )
 
 // Metadata client (agent).

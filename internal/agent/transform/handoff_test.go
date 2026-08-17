@@ -79,7 +79,13 @@ traces: |
 	w := Wrap(next, next, prog)
 
 	md := pmetric.NewMetrics()
-	md.ResourceMetrics().AppendEmpty().ScopeMetrics().AppendEmpty().Metrics().AppendEmpty().SetName("original")
+	// A REAL metric with a data point: this fixture is about renaming, and an
+	// untyped shell would be pruned as empty before the assertion can read it
+	// (pruneDataPoints reports an untyped metric empty, which is what keeps a
+	// point-less metric off the wire).
+	m := md.ResourceMetrics().AppendEmpty().ScopeMetrics().AppendEmpty().Metrics().AppendEmpty()
+	m.SetName("original")
+	m.SetEmptyGauge().DataPoints().AppendEmpty().SetIntValue(1)
 	if err := w.ExportMetrics(Handoff(context.Background()), md); err != nil {
 		t.Fatal(err)
 	}

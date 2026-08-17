@@ -128,8 +128,14 @@ traces: |
 
 	md := pmetric.NewMetrics()
 	sm := md.ResourceMetrics().AppendEmpty().ScopeMetrics().AppendEmpty()
-	sm.Metrics().AppendEmpty().SetName("kill_me")
-	sm.Metrics().AppendEmpty().SetName("old_name")
+	// Real metrics with data points: an untyped shell is pruned as empty, so a
+	// fixture built from one would test the prune rather than the script.
+	kill := sm.Metrics().AppendEmpty()
+	kill.SetName("kill_me")
+	kill.SetEmptyGauge().DataPoints().AppendEmpty().SetIntValue(1)
+	keep := sm.Metrics().AppendEmpty()
+	keep.SetName("old_name")
+	keep.SetEmptyGauge().DataPoints().AppendEmpty().SetIntValue(2)
 	if err := w.ExportMetrics(context.Background(), md); err != nil {
 		t.Fatal(err)
 	}
@@ -289,7 +295,12 @@ func TestMetricDropThenRename(t *testing.T) {
 	next := &capExp{}
 	w := Wrap(next, next, prog)
 	md := pmetric.NewMetrics()
-	md.ResourceMetrics().AppendEmpty().ScopeMetrics().AppendEmpty().Metrics().AppendEmpty().SetName("victim")
+	// A real metric, so the script's drop() is what removes it rather than the
+	// empty-metric prune (an untyped shell would go either way, which would
+	// make this assertion prove nothing).
+	victim := md.ResourceMetrics().AppendEmpty().ScopeMetrics().AppendEmpty().Metrics().AppendEmpty()
+	victim.SetName("victim")
+	victim.SetEmptyGauge().DataPoints().AppendEmpty().SetIntValue(1)
 	if err := w.ExportMetrics(context.Background(), md); err != nil {
 		t.Fatal(err)
 	}
@@ -413,7 +424,9 @@ metrics: |
 
 	one := func() pmetric.Metrics {
 		md := pmetric.NewMetrics()
-		md.ResourceMetrics().AppendEmpty().ScopeMetrics().AppendEmpty().Metrics().AppendEmpty().SetName("original")
+		m := md.ResourceMetrics().AppendEmpty().ScopeMetrics().AppendEmpty().Metrics().AppendEmpty()
+		m.SetName("original")
+		m.SetEmptyGauge().DataPoints().AppendEmpty().SetIntValue(1)
 		return md
 	}
 	if err := f.ExportMetrics(context.Background(), one()); err != nil {

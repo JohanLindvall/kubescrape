@@ -15,10 +15,10 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/JohanLindvall/haste/rapidhash"
 	"github.com/JohanLindvall/kubescrape/internal/logline"
 	"github.com/JohanLindvall/multiline"
 	"github.com/JohanLindvall/multiline/cri"
-	"github.com/cespare/xxhash/v2"
 	"go.opentelemetry.io/collector/pdata/pcommon"
 )
 
@@ -401,7 +401,7 @@ func (f *file) absorbSkipped() {
 //
 // RESIDUAL HOLE, since the hash discriminates only what the body does: a later
 // entry keying identically — same segment, same range, and either a
-// byte-identical body or a 2^-64 xxhash collision — is taken for the recorded
+// byte-identical body or a 2^-64 rapidhash collision — is taken for the recorded
 // one and its observation suppressed. Reaching one at all needs the bytes
 // re-read, which needs a rewind, so what it costs depends on how the recorded
 // identity got into the set:
@@ -445,7 +445,7 @@ func (e entry) obsRange() obsKey {
 // entry as the BATCH holds it, before any per-flush rewriting of the body (the
 // parse hook, the scrubber), so the same bytes always produce the same key.
 //
-// The xxhash is why the two halves are separate: it is computed at the two
+// The body hash is why the two halves are separate: it is computed at the two
 // points that genuinely consume it (a lookup against a NON-EMPTY set, an
 // insertion reReadable has already approved) rather than once per entry per
 // flush on the pinned path. A file with an empty set and nothing re-readable
@@ -454,7 +454,7 @@ func (e entry) obsRange() obsKey {
 // down.
 func (e entry) obsKey() obsKey {
 	k := e.obsRange()
-	k.body = xxhash.Sum64String(e.body)
+	k.body = rapidhash.Sum64String(e.body)
 	return k
 }
 
@@ -496,7 +496,7 @@ const maxObservedEntries = 8192
 //     way, BenchmarkIngestFlush/enrich's own figures. The map is allocated once
 //     per file and reused: prune deletes from it, it does not drop it.
 //   - the added work is CPU, and it is NOT flat in the size of the set: one
-//     xxhash of the body per entry looked up here, one more per entry recorded
+//     rapidhash of the body per entry looked up here, one more per entry recorded
 //     in observe, and one pruneObserved pass over the WHOLE set per touched
 //     file per flush. Only the hashes are per entry; the pass amortises over
 //     the batch, so the per-line overhead is O(|observed| / BatchSize) on top

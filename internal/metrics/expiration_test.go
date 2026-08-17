@@ -4,7 +4,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/zeebo/xxh3"
+	"github.com/JohanLindvall/haste/xxh3"
 )
 
 // expirationSeconds' rounding is load-bearing and was guarded by nothing:

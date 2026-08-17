@@ -9,7 +9,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/zeebo/xxh3"
+	"github.com/JohanLindvall/haste/xxh3"
 	"go.opentelemetry.io/collector/pdata/plog"
 	"go.opentelemetry.io/collector/pdata/pmetric"
 	"go.opentelemetry.io/collector/pdata/ptrace"
@@ -841,7 +841,7 @@ func boolLabel(b bool) string {
 // hit, which is what would otherwise turn a collision back into a miss — so the
 // width IS the whole defence.
 func (s *sink[T]) stuckTooLong(data []byte) bool {
-	h := xxh3.Hash128(data)
+	h := xxh3.Sum128(data)
 	if s.stuck == nil {
 		s.stuck = make(map[xxh3.Uint128]stuckBatch)
 	}
@@ -937,7 +937,7 @@ func respondedError(err error) bool {
 // eventually succeeds does not leak an entry to the maxStuckTracked cap.
 func (s *sink[T]) forget(data []byte) {
 	if s.stuck != nil {
-		delete(s.stuck, xxh3.Hash128(data))
+		delete(s.stuck, xxh3.Sum128(data))
 	}
 }
 
@@ -984,7 +984,7 @@ func (s *sink[T]) accountableLap(data []byte) bool {
 	if len(s.stuck) == 0 {
 		return false
 	}
-	st, seen := s.stuck[xxh3.Hash128(data)]
+	st, seen := s.stuck[xxh3.Sum128(data)]
 	return seen && s.delivered > st.lastDelivered
 }
 

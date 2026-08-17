@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/zeebo/xxh3"
+	"github.com/JohanLindvall/haste/xxh3"
 
 	"github.com/JohanLindvall/kubescrape/internal/testrace"
 	"go.opentelemetry.io/collector/pdata/pcommon"

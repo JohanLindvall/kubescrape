@@ -6,8 +6,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/JohanLindvall/haste/xxh3"
 	"github.com/JohanLindvall/kubescrape/internal/testrace"
-	"github.com/zeebo/xxh3"
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/pmetric"
 )

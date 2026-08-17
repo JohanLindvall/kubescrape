@@ -1,7 +1,7 @@
 package metrics
 
 import (
-	"github.com/zeebo/xxh3"
+	"github.com/JohanLindvall/haste/xxh3"
 	"go.opentelemetry.io/collector/pdata/pcommon"
 )
 

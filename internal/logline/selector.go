@@ -17,7 +17,7 @@ import (
 	"slices"
 	"strings"
 
-	"github.com/cespare/xxhash/v2"
+	"github.com/JohanLindvall/haste/rapidhash"
 )
 
 // A Selectors matches a line against a conjunction of label selectors. Every
@@ -181,7 +181,7 @@ func parseSelector(in string, regex bool) (label, expr string, want bool, hash u
 	}
 	// Hash label and expression separately: a "\n"-joined string let
 	// "a\nb"="c" and "a"="b\nc" share a memo slot.
-	hash = pairHash(xxhash.Sum64String(label), xxhash.Sum64String(expr))
+	hash = pairHash(rapidhash.Sum64String(label), rapidhash.Sum64String(expr))
 	return label, expr, want, hash, nil
 }
 

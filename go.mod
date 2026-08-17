@@ -6,11 +6,11 @@ require (
 	github.com/JohanLindvall/bufpool v0.2.7
 	github.com/JohanLindvall/diskqueue v0.0.13
 	github.com/JohanLindvall/enrich v0.1.14
+	github.com/JohanLindvall/haste v0.1.29
 	github.com/JohanLindvall/lightning v0.0.67
 	github.com/JohanLindvall/logfmt v0.0.15
 	github.com/JohanLindvall/multiline v0.0.13
 	github.com/bmatcuk/doublestar/v4 v4.10.0
-	github.com/cespare/xxhash/v2 v2.3.0
 	github.com/coreos/go-systemd/v22 v22.7.0
 	github.com/fsnotify/fsnotify v1.10.1
 	github.com/klauspost/compress v1.19.2
@@ -18,7 +18,6 @@ require (
 	github.com/prometheus/client_model v0.6.2
 	github.com/twmb/franz-go v1.21.5
 	github.com/twmb/franz-go/pkg/kfake v0.0.0-20260727183601-4176fc0fcaf7
-	github.com/zeebo/xxh3 v1.1.0
 	go.opentelemetry.io/collector/pdata v1.64.0
 	go.starlark.net v0.0.0-20260708150628-5395d018f003
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260810153831-ec0a7760b754
@@ -33,6 +32,7 @@ require (
 
 require (
 	github.com/beorn7/perks v1.0.1 // indirect
+	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/davecgh/go-spew v1.1.2-0.20180830191138-d8f796af33cc // indirect
 	github.com/emicklei/go-restful/v3 v3.13.0 // indirect
 	github.com/fxamacker/cbor/v2 v2.9.2 // indirect
@@ -55,7 +55,6 @@ require (
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/hashicorp/go-version v1.9.0 // indirect
 	github.com/json-iterator/go v1.1.12 // indirect
-	github.com/klauspost/cpuid/v2 v2.2.10 // indirect
 	github.com/modern-go/concurrent v0.0.0-20180306012644-bacd9c7ef1dd // indirect
 	github.com/modern-go/reflect2 v1.0.3-0.20250322232337-35a7c28c31ee // indirect
 	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect

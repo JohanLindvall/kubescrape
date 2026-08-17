@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/zeebo/xxh3"
+	"github.com/JohanLindvall/haste/xxh3"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"

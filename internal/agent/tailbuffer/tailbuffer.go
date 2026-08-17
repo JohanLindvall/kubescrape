@@ -101,7 +101,7 @@
 // thing above the exporter.
 //
 // The head sampler (agent/tracesample) runs ABOVE it, and the two NEST rather
-// than compound: both hash the trace id with the same unsalted xxhash against
+// than compound: both hash the trace id with the same unsalted rapidhash against
 // the same threshold arithmetic, so a tailsample probabilistic policy at 50%
 // keeps exactly the traces a head sampler at probability 0.5 already kept
 // instead of independently discarding half of them again

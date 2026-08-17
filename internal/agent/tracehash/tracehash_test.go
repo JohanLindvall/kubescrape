@@ -1,10 +1,11 @@
 package tracehash
 
 import (
+	"encoding/binary"
 	"math"
 	"testing"
 
-	"github.com/cespare/xxhash/v2"
+	"github.com/JohanLindvall/haste/rapidhash"
 	"go.opentelemetry.io/collector/pdata/pcommon"
 )
 
@@ -69,8 +70,28 @@ func TestKeepIsTheHashComparison(t *testing.T) {
 	for i := byte(0); i < 200; i++ {
 		var id pcommon.TraceID
 		id[0], id[15] = i, i^0x5a
-		if got, want := Keep(id, thr), xxhash.Sum64(id[:]) < thr; got != want {
+		if got, want := Keep(id, thr), rapidhash.Sum64(id[:]) < thr; got != want {
 			t.Fatalf("Keep(%v) = %v, want %v (raw hash comparison)", id, got, want)
+		}
+	}
+}
+
+// Keep feeds the trace id to rapidhash as its two little-endian halves rather
+// than as a slice, because that form takes them in registers and is ~2.6x
+// faster on a path that runs once per span in BOTH samplers. It is only a
+// legitimate substitution because it hashes exactly the same bytes — this pins
+// that, so the fast form can never quietly drift from the definition it
+// shortcuts.
+func TestUint128FormEqualsRawBytes(t *testing.T) {
+	for i := 0; i < 5000; i++ {
+		var id pcommon.TraceID
+		for j := range id {
+			id[j] = byte(i*7 + j*31)
+		}
+		lo := binary.LittleEndian.Uint64(id[0:8])
+		hi := binary.LittleEndian.Uint64(id[8:16])
+		if got, want := rapidhash.Sum64Uint128(lo, hi), rapidhash.Sum64(id[:]); got != want {
+			t.Fatalf("id %x: uint128 form = %x, raw-bytes form = %x", id, got, want)
 		}
 	}
 }

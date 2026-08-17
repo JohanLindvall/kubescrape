@@ -5,7 +5,7 @@
 // 100% of the spans while only the sampled subset is shipped — the classic
 // spanmetrics-plus-sampling arrangement.
 //
-// Decisions are deterministic per trace ID (tracehash: an xxhash of the ID
+// Decisions are deterministic per trace ID (tracehash: a rapidhash of the ID
 // against the probability threshold), so all spans of a trace sample
 // identically on this node AND on every other node running the same config —
 // a node-local sampler still yields whole traces. A sender's retry of a failed

@@ -4,6 +4,8 @@ github.com/JohanLindvall/diskqueue v0.0.13 h1:O0eO03LZjMV9UN5zSZ+37PPMgT4PxUQZZV
 github.com/JohanLindvall/diskqueue v0.0.13/go.mod h1:eeiOq7kMcqGWbbx/qsZplndd7Nnd7dRX+/BD/2pSGVQ=
 github.com/JohanLindvall/enrich v0.1.14 h1:xsKQWfGZ/oFNEePE/8hm++TeJ2LqP+QgEFHA0VfchRI=
 github.com/JohanLindvall/enrich v0.1.14/go.mod h1:qH4klfcRSw11IW/6sh0fs72AlAivQIPQ9nNCEcjHSoE=
+github.com/JohanLindvall/haste v0.1.29 h1:RqbF1u1xBvr9x2fWacQOfiDaFDvInRvBZh8h+VGlMDc=
+github.com/JohanLindvall/haste v0.1.29/go.mod h1:X1QP1YYXfuUYbhaJAXesThyDMNXeKXKa7rqomyO0wNA=
 github.com/JohanLindvall/lightning v0.0.67 h1:e/hm7s6pVvW0ZDzVmwWOoUUIHaV7eNquWioZUv37Ybk=
 github.com/JohanLindvall/lightning v0.0.67/go.mod h1:uGs5O1o/2myfnC3XsItHKPCIKDpVae66exbxNpSq430=
 github.com/JohanLindvall/logfmt v0.0.15 h1:ZsEPN0/xBvQpX35oHc1OAFTZBxvh2G7rLnF9621F5ks=
@@ -81,8 +83,6 @@ github.com/json-iterator/go v1.1.12 h1:PV8peI4a0ysnczrg+LtxykD8LfKY9ML6u2jnxaEnr
 github.com/json-iterator/go v1.1.12/go.mod h1:e30LSqwooZae/UwlEbR2852Gd8hjQvJoHmT4TnhNGBo=
 github.com/klauspost/compress v1.19.2 h1:hMRETovs/pu/dVWN7zIT1PGG8t509MwT6bO7XSi26R8=
 github.com/klauspost/compress v1.19.2/go.mod h1:cwPg85FWrGar70rWktvGQj8/hthj3wpl0PGDogxkrSQ=
-github.com/klauspost/cpuid/v2 v2.2.10 h1:tBs3QSyvjDyFTq3uoc/9xFpCuOsJQFNPiAhYdw2skhE=
-github.com/klauspost/cpuid/v2 v2.2.10/go.mod h1:hqwkgyIinND0mEev00jJYCxPNVRVXFQeu1XKlok6oO0=
 github.com/kylelemons/godebug v1.1.0 h1:RPNrshWIDI6G2gRW9EHilWtl7Z6Sb1BR0xunSBf0SNc=
 github.com/kylelemons/godebug v1.1.0/go.mod h1:9/0rRGxNHcop5bhtWyNeEfOS8JIWk580+fNqagV/RAw=
 github.com/modern-go/concurrent v0.0.0-20180228061459-e0a39a4cb421/go.mod h1:6dJC0mAP4ikYIbvyc7fijjWJddQyLn8Ig3JB5CqoB9Q=
@@ -124,10 +124,6 @@ github.com/twmb/franz-go/pkg/kmsg v1.13.1 h1:fG5kItwysTk5UXqVwb64EpQEy3TydF3vYYK
 github.com/twmb/franz-go/pkg/kmsg v1.13.1/go.mod h1:+DPt4NC8RmI6hqb8G09+3giKObE6uD2Eya6CfqBpeJY=
 github.com/x448/float16 v0.8.4 h1:qLwI1I70+NjRFUR3zs1JPUCgaCXSh3SW62uAKT1mSBM=
 github.com/x448/float16 v0.8.4/go.mod h1:14CWIYCyZA/cWjXOioeEpHeN/83MdbZDRQHoFcYsOfg=
-github.com/zeebo/assert v1.3.0 h1:g7C04CbJuIDKNPFHmsk4hwZDO5O+kntRxzaUoNXj+IQ=
-github.com/zeebo/assert v1.3.0/go.mod h1:Pq9JiuJQpG8JLJdtkwrJESF0Foym2/D9XMU5ciN/wJ0=
-github.com/zeebo/xxh3 v1.1.0 h1:s7DLGDK45Dyfg7++yxI0khrfwq9661w9EN78eP/UZVs=
-github.com/zeebo/xxh3 v1.1.0/go.mod h1:IisAie1LELR4xhVinxWS5+zf1lA4p0MW4T+w+W07F5s=
 go.opentelemetry.io/auto/sdk v1.2.1 h1:jXsnJ4Lmnqd11kwkBV2LgLoFMZKizbCi5fNZ/ipaZ64=
 go.opentelemetry.io/auto/sdk v1.2.1/go.mod h1:KRTj+aOaElaLi+wW1kO/DZRXwkF4C5xPbEe3ZiIhN7Y=
 go.opentelemetry.io/collector/featuregate v1.64.0 h1:lWEUtzSSPxR4n9PdQ/BQrDUaL5d49gCk2vpITBjMYVk=

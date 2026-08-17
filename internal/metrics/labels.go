@@ -6,7 +6,7 @@ import (
 	"slices"
 	"strings"
 
-	"github.com/zeebo/xxh3"
+	"github.com/JohanLindvall/haste/xxh3"
 )
 
 // A metric's label set is a plain slice of key-value pairs. Order does not
@@ -148,7 +148,7 @@ func (l labels) without(key string) labels {
 // falls back to the generic path. BenchmarkDynamicAddBound is the proof —
 // observePreHashed uses a hash precomputed at construction and folds nothing,
 // yet slowed 6.2%. Do not go looking for it in the hashing.
-func strHash(s string) xxh3.Uint128 { return xxh3.HashString128(s) }
+func strHash(s string) xxh3.Uint128 { return xxh3.Sum128String(s) }
 
 // hashAccum is the order-independent accumulator of the label set: every entry
 // contributes combineHash(hash(key), hash(value)) and they are XOR-folded.

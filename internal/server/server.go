@@ -14,7 +14,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/zeebo/xxh3"
+	"github.com/JohanLindvall/haste/xxh3"
 
 	"github.com/JohanLindvall/kubescrape/internal/logdedupe"
 	"github.com/JohanLindvall/kubescrape/internal/obs"
@@ -1047,7 +1047,7 @@ func etagMatches(header, etag string) bool {
 // ETags stay opaque to clients (etagMatches only string-compares, W/ prefix
 // stripped), so widening the digest costs one full 200 per cached client at the
 // upgrade boundary, exactly as any other ETag change would.
-func bodyHash(b []byte) xxh3.Uint128 { return xxh3.Hash128(b) }
+func bodyHash(b []byte) xxh3.Uint128 { return xxh3.Sum128(b) }
 
 func writeError(w http.ResponseWriter, status int, msg string) {
 	writeJSON(w, status, map[string]string{"error": msg})

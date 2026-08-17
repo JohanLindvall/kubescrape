@@ -5,7 +5,7 @@
 //
 // # The nesting contract
 //
-// Both stages hash the trace id UNSALTED with the same xxhash and compare it
+// Both stages hash the trace id UNSALTED with the same rapidhash and compare it
 // against a threshold computed by the same arithmetic, so the two stages NEST
 // rather than compound: a 50% tail policy keeps exactly the traces a head
 // sampler at probability 0.5 already passed, instead of independently
@@ -25,6 +25,19 @@
 // trace in 2^64 whose hash is exactly MaxUint64. Sharing the function is what
 // keeps the next drift from being a bigger one.
 //
+// # Changing the hash re-rolls the sampled set
+//
+// WHICH traces are kept is a property of the hash function, not just of the
+// threshold, so replacing it re-rolls the whole set: the same trace ids decide
+// differently afterwards. That is invisible in steady state — the same
+// FRACTION is kept and any single trace is still decided consistently — but
+// during a ROLLOUT the fleet runs two functions at once, and a trace whose
+// spans are judged by both is kept by one shard and dropped by another, i.e.
+// split. The window is the rollout, it is self-healing, and the alternative
+// (never changing the function) is what this package exists to make a
+// deliberate decision rather than an accident. This hash moved from xxhash to
+// rapidhash once, knowingly, for the ~5x it buys on a per-span path.
+//
 // NOT in scope: agent/servicegraph's ring.TokenFor, which is Tempo's FNV-1
 // 32-bit hash ON PURPOSE — the ring must place spans where Tempo's would, and
 // it distributes load rather than deciding keeps, so it must NOT correlate
@@ -32,9 +45,10 @@
 package tracehash
 
 import (
+	"encoding/binary"
 	"math"
 
-	"github.com/cespare/xxhash/v2"
+	"github.com/JohanLindvall/haste/rapidhash"
 	"go.opentelemetry.io/collector/pdata/pcommon"
 )
 
@@ -62,9 +76,19 @@ func Threshold(fraction float64) uint64 {
 // Hashing the id (rather than reading its low bits, as a W3C-random id would
 // permit) keeps the distribution uniform even for senders whose ids are not
 // random.
+//
+// The id is fed as its two little-endian halves rather than as a slice.
+// rapidhash.Sum64Uint128 hashes exactly the bytes Sum64(id[:]) would — the two
+// are equal for every input, which TestUint128FormEqualsRawBytes pins — but it
+// takes them in registers instead of through a slice header, which on the
+// measured machine is 2.4ns against 6.4ns for the slice form and 12.6ns for
+// the xxhash this replaced. This runs once per span in BOTH samplers, so the
+// difference is worth the two loads.
 func Keep(id pcommon.TraceID, threshold uint64) bool {
 	if threshold == math.MaxUint64 {
 		return true
 	}
-	return xxhash.Sum64(id[:]) < threshold
+	lo := binary.LittleEndian.Uint64(id[0:8])
+	hi := binary.LittleEndian.Uint64(id[8:16])
+	return rapidhash.Sum64Uint128(lo, hi) < threshold
 }

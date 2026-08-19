@@ -252,6 +252,8 @@ type Tailer struct {
 	// pass count because the pass rate is the sweep rate, which ranges from the
 	// poll interval to ~20/s under event-driven load.
 	segmentStallLimit time.Duration
+	// drainCap bounds one drainReader call (see defaultDrainCap).
+	drainCap int64
 
 	// status is the published per-file snapshot for /debug/tailer (written by
 	// the sweep goroutine in publishStatus, read from HTTP handlers).
@@ -301,6 +303,14 @@ const defaultShutdownBudget = 10 * time.Second
 // EMFILE or an EACCES from a runtime mid-rotation is worth waiting out, and the
 // alternative to waiting is losing those lines.
 const defaultSegmentStallLimit = 2 * time.Minute
+
+// defaultDrainCap bounds ONE drain call (drainReader), so a source that outruns
+// the drain cannot pin the single sweep goroutine indefinitely. It is not a
+// budget on what may be recovered: hitting it reports the drain UNFINISHED, and
+// the remainder is replayed as a segment (or re-drained next sweep, for a gone
+// file). A test-settable field rather than a const because the alternative for a
+// regression test is writing a gigabyte.
+const defaultDrainCap = 1 << 30
 
 // New creates a Tailer.
 func New(cfg Config) *Tailer {
@@ -367,6 +377,7 @@ func New(cfg Config) *Tailer {
 		resolveBudget:     defaultResolveBudget,
 		shutdownBudget:    defaultShutdownBudget,
 		segmentStallLimit: defaultSegmentStallLimit,
+		drainCap:          defaultDrainCap,
 		statusEvery:       10 * time.Second,
 	}
 }
@@ -595,6 +606,13 @@ func (t *Tailer) sweep(ctx context.Context, all bool) {
 			if !t.resolveMetadata(ctx, f) {
 				continue
 			}
+		} else {
+			// The resource is not LATCHED at resolve: re-render it when the
+			// node-metadata provider has produced something new (a node
+			// relabel, or the first real fetch landing after the placeholder
+			// the agent seeds selfmeta.Poll with). One pointer compare per
+			// resolved file per sweep — see refreshNodeAttrs.
+			t.refreshNodeAttrs(f)
 		}
 		if f.excluded {
 			// The pod opted out via its annotation; nothing is read, the

@@ -43,7 +43,11 @@ label selectors, with `targetPort` translation. The discovery Services
 ### `scrape_prometheus_k8s_nodes` (kubelet + cadvisor)
 
 `agent.kubeletEndpoint: https://$(NODE_IP):10250` in the chart enables both;
-disable individually with `agent.cadvisor` / `agent.nodeMetrics`. The
+disable individually with `agent.cadvisor` / `agent.nodeMetrics`. That one
+value is right on IPv6 clusters too — `status.hostIP` expands to a bare IPv6
+literal, which is not a parseable URL authority, and the agent brackets the
+host itself; do not pre-bracket it, since `[$(NODE_IP)]` renders `[10.0.0.5]`
+on IPv4 and Go rejects that as an invalid IP-literal. The
 `service_name` arguments and node labels become attribute templates:
 
 ```yaml
@@ -171,7 +175,8 @@ The whole identity derivation is built in: every resource gets
 namespace/pod[/container] → node — the `common` transform's `Concat` chain),
 neither overwritten if a template already set it. The `instance_prefix`
 mechanism is the `instancePrefix` config (default `cadvisor` on the cadvisor
-pipeline, the target's `service.name` on splitter rules, `""` disables;
+pipeline and `summary` on the `-kubelet-summary` one, the target's
+`service.name` on splitter rules, `""` disables;
 top-level `resourceAttributes.instancePrefix` covers the
 cluster-name-prefix rule for shared tenants). Placement nuances:
 
@@ -317,10 +322,18 @@ service stays static).
 
 Built in — `agent.ingest.enabled: true` (flag `-ingest`) receives OTLP/gRPC
 (`:4317`) and OTLP/HTTP (`:4318`) LOGS AND METRICS that apps push to the node, enriches each
-resource with k8s attributes from a `container.id`/`k8s.pod.uid` on the data
-(without overwriting sender-set values), and forwards it — replacing the
-collector-with-k8sattributes-processor you'd otherwise keep as the OTLP
-endpoint.
+resource with k8s attributes from a `container.id`/`k8s.pod.uid` on the data,
+and forwards it — replacing the collector-with-k8sattributes-processor you'd
+otherwise keep as the OTLP endpoint. The merge leaves the sender authoritative
+about *itself* — anything descriptive it set survives — with one deliberate
+exception: the **resolved identity keys** (`k8s.namespace.name`,
+`k8s.pod.name`, `k8s.pod.ip`, `k8s.node.name`, `k8s.container.name`,
+`container.name`) are overwritten with what the metadata service says about
+that exact resource, because `routing` keys tenancy on `k8s.namespace.name`
+and the listeners authenticate nothing. The lookup keys themselves and the
+sender's OTLP service triple are exempt. On a resource that does **not**
+resolve there is nothing to correct with, so those same keys are stripped at
+receipt instead ([OTLP ingest](CONFIGURATION.md#agent-otlp-ingest)).
 
 Traces go to the separate trace tier (`serviceGraph.enabled: true`, flag
 `-service-graph`) rather than to the node's agent: applications point their
@@ -350,7 +363,10 @@ Two association differences from `otelcol.processor.k8sattributes`:
 
 * **No uid-suffixing of sender-set instances**: cmb-alloy appends
   `/<pod uid>` to a pushed `service.instance.id` to force uniqueness across
-  replicas; kubescrape never rewrites sender-set attributes. If replicas
+  replicas; kubescrape leaves a sender-set `service.instance.id` exactly as
+  sent — it is one of the two keys both the identity overwrite and the
+  receipt-time strip exempt, precisely because a sender names itself with
+  them. If replicas
   report colliding instance ids, include the pod uid in the sender's
   `OTEL_RESOURCE_ATTRIBUTES` (as above — `service.instance.id=$(POD_UID)`).
 
@@ -358,7 +374,9 @@ One capacity difference: cmb-alloy raises the receiver's gRPC
 `max_recv_msg_size` to 40 MiB, and kubescrape's default is gRPC's own 4 MiB.
 Carry the raise over with `agent.ingest.grpcMaxRecvBytes: 41943040` (flag
 `-ingest-grpc-max-recv-bytes`; it covers the trace tier's application ports
-too, and the receiver's memory budget scales with it). The OTLP/HTTP body cap
+too, and both of the receiver's memory budgets scale with it — the raw-payload
+one to four times the new cap, the decoded-structure one to eight, so size the
+pod for it). The OTLP/HTTP body cap
 stays 16 MiB. An over-cap push is refused, never truncated, and retrying the
 same batch cannot succeed — the alternative to raising the cap is smaller
 sender batches (an SDK batch-processor setting).
@@ -366,14 +384,26 @@ sender batches (an SDK batch-processor setting).
 ### `input_pure_otlp` (the unenriched listener pair on 14317/14318)
 
 There is no second listener pair and no per-listener enrichment switch —
-but the pure input's job is largely covered by enrichment being strictly
-fill-if-absent: it fires only on a resource carrying a
-`container.id`/`k8s.pod.uid` (connection-IP association stays opt-in), so a
-payload from outside the cluster, or one already fully attributed, passes
-through with its resource attributes untouched. Residual differences: pushed
+but the pure input's job is largely covered by enrichment being fill-if-absent
+for everything a sender describes about itself: it fires only on a resource
+carrying a `container.id`/`k8s.pod.uid` (connection-IP association stays
+opt-in), so a payload from outside the cluster passes through with its
+descriptive attributes untouched. What is *not* left alone is the sender's
+Kubernetes identity claim, on every push these listeners accept: those keys
+are stripped at first receipt (the identity strip —
+[OTLP ingest](CONFIGURATION.md#agent-otlp-ingest)) and then re-derived for the
+resources the receiver can resolve. So "already fully attributed" means
+attributed by *this* cluster, and a sender that ships its own
+`k8s.namespace.name`/`k8s.pod.name` from outside it loses them here — carry
+that identity under keys of your own, or push to the downstream collector
+directly. Residual differences: pushed
 log bodies are still parsed for timestamp/severity/trace ids when `-enrich`
-is on (a global switch shared with the tailer), configured `logs.rules` and
-`logMetrics` apply to pushed log records exactly as to tailed ones, and `datapoint`/`auto`
+is on (a global switch shared with the tailer), configured `logAttributes`,
+`logs.rules` and `logMetrics` apply to pushed log records as to tailed ones
+(a `target: log` lift is written onto the record; a `target: resource` lift
+still resolves for rule keys and metric labels but is not stamped, and a
+`target: scope` lift is dropped outright — a pushed record already lives in the
+sender's grouping, so there is no ScopeLogs of ours to carry it), and `datapoint`/`auto`
 metrics mode may still split a payload whose data points carry IDs
 (`-ingest-metrics-mode resource` disables that). One divergence to plan for:
 cmb-alloy's `resourcedetection env` stamps `k8s.cluster.name` on every

@@ -28,6 +28,7 @@ import (
 	"github.com/JohanLindvall/kubescrape/internal/logdedupe"
 	"github.com/JohanLindvall/kubescrape/internal/logline"
 	"github.com/JohanLindvall/kubescrape/internal/metrics"
+	"github.com/JohanLindvall/kubescrape/pkg/logattrs"
 )
 
 // Exporter forwards enriched telemetry; implemented by otlpexport.Client.
@@ -106,10 +107,33 @@ type ServerConfig struct {
 	// delivered it, the operator chose to drop it (obs.LogRulesDropped). nil
 	// forwards everything.
 	Rules *logline.LineFilter
+	// LogAttrs is the global logAttributes extractor, applied to INGESTED log
+	// records in the producers' position — after scrubbing, before enrichment,
+	// before log-metrics and before Rules — so a rule or a metric label keyed
+	// on a LIFTED name selects identically whether the line was tailed or
+	// pushed. nil lifts nothing.
+	//
+	// The `target: log` half is applied; the resource and scope halves are
+	// deliberately NOT. A producer applies those by GROUPING records into a
+	// resource that carries them, and an ingested record already lives in the
+	// sender's own grouping — writing them onto the shared resource would
+	// stamp one record's lifted values onto every other record beside it. They
+	// The RESOURCE half still RESOLVES for metric labels and rule keys
+	// (Resolver.SetLifted takes exactly that slice — logchain.go), which is
+	// where the divergence was actually visible. The SCOPE half is dropped on
+	// this path entirely: nothing carries it and nothing resolves it. A tailed
+	// line differs there, since the tailer stamps scope lifts onto the
+	// ScopeLogs it groups records into, so they reach the wire.
+	LogAttrs *logattrs.Extractor
 	// LogMetrics observes EVERY ingested log record (before Rules — a metric
 	// counting errors must not fall to zero because a rule stopped shipping
 	// the lines), with the sender's enriched resource as the metric resource.
 	// nil observes nothing.
+	//
+	// Observations here are once per RECEIVE ATTEMPT rather than once per
+	// delivery — the sender's retry of a NACKed push re-runs the chain and
+	// observes again. See chainCommit (logchain.go) for why the tally that
+	// COULD be staged is, and this one is not.
 	LogMetrics *metrics.DynamicMetricSet
 	// MaxInFlight bounds concurrently-processed pushes across both transports
 	// (0 = defaultMaxInFlight). Over the bound, senders are refused with a
@@ -154,6 +178,16 @@ type Server struct {
 	// reading and decoding, which the count above deliberately does not (see
 	// admit.go). Tests lower its limit to exercise the refusal.
 	buffer *byteBudget
+	// decoded bounds what those bytes inflate INTO — the structural half of
+	// the decoded pdata, charged after the unmarshal and released with the
+	// handler (admit.go). Neither of the other two bounds covers it: a count
+	// cannot bound a size, and 30 wire bytes can mint a ResourceLogs.
+	decoded *byteBudget
+	// decodedWarns throttles the one line worth saying about it: a single
+	// push whose structure alone exceeds the whole budget can never be
+	// admitted, and an operator would otherwise read the resulting stream of
+	// 429s as ordinary back-pressure.
+	decodedWarns logdedupe.Throttle
 	// reserveWindow bounds how long ONE gRPC reservation may live, i.e. how long
 	// a peer may sit between its HEADERS frame and a decoded message
 	// (grpcReserveWindow). Tests shorten it to exercise the reclaim.
@@ -165,8 +199,10 @@ type Server struct {
 	// cap. The same reader serves the trace tier's internal listener with a
 	// different cap and no budget (httpbody.go).
 	body *BodyReader
-	// reservedWarns throttles the stripped-reserved-key warning per key. The
-	// key space is the operator-wired ReservedAttrs lists — never
+	// reservedWarns throttles the stripped-key log line per key, for BOTH
+	// classes (the plumbing markers' Warn and the identity claim's Debug — the
+	// two key spaces are disjoint, so one table cannot crowd the other out).
+	// The key space is the operator-wired ReservedAttrs lists — never
 	// sender-chosen — so the table is sized to exactly that.
 	reservedWarns *logdedupe.Table
 	// reserveExpiries is the since-start total of pre-decode reservations
@@ -180,6 +216,10 @@ type Server struct {
 	// (emptymetrics.go). Keyless: the condition is one sender-side
 	// instrumentation bug shipped on every push, and the count rides the line.
 	emptyMetricWarns logdedupe.Throttle
+	// tooDeepWarns throttles the wire-shape refusal's warning (depth.go).
+	// Keyless for the same reason: it is one sender emitting one shape, and a
+	// line per refusal is what an attacker would use to fill the node's disk.
+	tooDeepWarns logdedupe.Throttle
 }
 
 // NewServer creates an ingest Server.
@@ -210,8 +250,10 @@ func NewServer(cfg ServerConfig) *Server {
 		maxInFlight:   n,
 		grpcMaxRecv:   recv,
 		buffer:        &byteBudget{limit: budget},
+		decoded:       &byteBudget{limit: decodedBudgetFactor * budget},
 		reserveWindow: grpcReserveWindow,
-		reservedWarns: logdedupe.New(len(cfg.ReservedAttrs.Resource)+len(cfg.ReservedAttrs.Element), reservedWarnEvery),
+		reservedWarns: logdedupe.New(len(cfg.ReservedAttrs.Resource)+len(cfg.ReservedAttrs.Element)+
+			len(cfg.ReservedAttrs.Identity), reservedWarnEvery),
 	}
 	s.body = newBodyReader(maxIngestBody, s.buffer, log)
 	return s
@@ -234,17 +276,94 @@ func (s *Server) acquire() bool {
 
 func (s *Server) release() { <-s.inFlight }
 
-// limitUnary applies the same bound to gRPC pushes.
+// chargeDecoded reserves a push's estimated decoded structure, reporting
+// whether it fits. A refusal is the same event as a full byte budget or a full
+// slot table — obs.IngestRejected, answered retryably by both transports — with
+// one addition: a push too big for the WHOLE budget is a sender that must batch
+// smaller, and no amount of back-pressure will teach it that, so it gets a line.
+func (s *Server) chargeDecoded(n int64) bool {
+	if n <= 0 || s.decoded.reserve(n) {
+		return true
+	}
+	obs.IngestRejected.Inc()
+	if n > s.decoded.limit && s.decodedWarns.Allow(decodedWarnEvery) {
+		s.log.Warn("ingest: refused a push whose decoded structure alone exceeds the receiver's whole "+
+			"decoded budget; every retry of it will be refused too — the sender must batch smaller",
+			"estimated_bytes", n, "budget_bytes", s.decoded.limit)
+	}
+	return false
+}
+
+// decodedWarnEvery paces that line: a sender batching this large batches this
+// large on every push.
+const decodedWarnEvery = time.Minute
+
+// limitUnary applies the COUNT bound to gRPC pushes and hands the pre-decode
+// reservation over to it.
+//
+// The ORDER is load-bearing and it used to be the other way round. The message
+// is already decoded by the time this runs, so the pre-decode reservation is
+// the only thing accounting for it; releasing that first and only then asking
+// for a slot left a window in which the payload was charged to NOTHING, and a
+// refused push released a reservation it had already given up — so a peer could
+// hold as many decoded messages resident as it could open streams, bounded by
+// the count alone. Take the slot first, then hand the accounting over.
+//
+// What is deliberately NOT here is the DECODED-STRUCTURE charge, and its
+// absence is the correction of a bound that measured zero in production for as
+// long as it existed. grpc-go hands an interceptor the message its GENERATED
+// handler decoded into; for pdata that is *pdata/internal.ExportLogsServiceRequest
+// (and its two siblings), because the public plogotlp.ExportRequest wrapper is
+// constructed one layer further in, by rawLogsServer.Export. The type is in
+// pdata's internal/, so NO type switch here can name it — the charge that sat
+// here matched nothing, reserved nothing, and left a decoded gRPC payload
+// bounded by this count alone, which admit.go's header says in as many words a
+// count cannot do. It is taken in the three Export methods below, where the
+// typed request exists.
 func (s *Server) limitUnary(ctx context.Context, req any, _ *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
-	// The message is decoded by the time we get here, so the buffer
-	// reservation tapAdmit took for the read has done its job: release it and
-	// let the count bound account for the inflated pdata from here on.
-	releaseReservation(ctx)
 	if !s.acquire() {
 		return nil, exhaustedStatus("too many concurrent pushes; retry")
 	}
 	defer s.release()
+	// The slot is held: the reservation tapAdmit took for the read has done its
+	// job and the message buffer itself is already freed by the codec.
+	releaseReservation(ctx)
 	return handler(ctx, req)
+}
+
+// chargeDecodedGRPC charges one gRPC push's estimated decoded structure and
+// returns the release, which the caller defers so EVERY exit — refusal from a
+// downstream guard, a failed forward, an early ack — gives the budget back.
+//
+// The refusal is the retryable ResourceExhausted + RetryInfo that the HTTP arm
+// spells 429 + Retry-After (exhaustedStatus): one condition, one answer,
+// whichever transport a sender used. Bare ResourceExhausted reads as PERMANENT
+// to conformant senders, and a shed that loses data is worse than the OOM it
+// prevents.
+func (s *Server) chargeDecodedGRPC(n int64) (func(), error) {
+	if !s.chargeDecoded(n) {
+		return nil, exhaustedStatus(errDecodedBudget.Error())
+	}
+	return func() { s.decoded.release(n) }, nil
+}
+
+// tooDeepWarnEvery paces the wire-shape refusal warning: a sender emitting a
+// body this deep emits it on every push, and one line names the condition.
+const tooDeepWarnEvery = time.Minute
+
+// noteTooDeep reports a payload refused for its nesting on the gRPC arm. It
+// counts into the same series as the HTTP door's refusals
+// (obs.IngestBodyRejected{reason="too_deep"}) because it is the same event —
+// an application push refused at a listener nothing authenticates — reached
+// through the other transport; the HTTP arm's own counting happens in
+// BodyReader.noteRejected.
+func (s *Server) noteTooDeep() {
+	obs.IngestBodyRejected.WithLabelValues(reasonTooDeep).Inc()
+	if s.tooDeepWarns.Allow(tooDeepWarnEvery) {
+		s.log.Warn("ingest: refused a gRPC push whose payload nests deeper than the decoder may recurse; "+
+			"decoding it costs unbounded goroutine stack, so the shape is refused before the decode",
+			"max_depth", maxNestingDepth)
+	}
 }
 
 // exhaustedStatus builds the gRPC refusal. ResourceExhausted ALONE reads as
@@ -298,6 +417,11 @@ func (s *Server) Run(ctx context.Context) error {
 			grpc.MaxConcurrentStreams(uint32(s.maxInFlight)),
 			grpc.InTapHandle(s.tapAdmit),
 			grpc.UnaryInterceptor(s.limitUnary),
+			// And this is what bounds the DECODE ITSELF (depth.go): the
+			// message is unmarshalled before the interceptor runs, so a
+			// payload's nesting — which costs unbounded goroutine stack — can
+			// only be refused from inside the codec.
+			NestingGuardOption(s.noteTooDeep),
 		)
 		if s.cfg.Exporter != nil {
 			plogotlp.RegisterGRPCServer(l.GRPC, &logsGRPC{s: s})
@@ -342,23 +466,38 @@ type logsGRPC struct {
 }
 
 func (g *logsGRPC) Export(ctx context.Context, req plogotlp.ExportRequest) (plogotlp.ExportResponse, error) {
-	err := grpcExport(ctx, func(ctx context.Context) error {
+	// The decoded structure is charged HERE rather than in limitUnary, which
+	// cannot see the typed request at all (see there), and it is held for the
+	// whole enrich-and-forward step exactly as the HTTP arm holds it for the
+	// whole handler: the payload stays resident until the collector acks.
+	release, err := g.s.chargeDecodedGRPC(decodedLogsSize(req.Logs()))
+	if err != nil {
+		return plogotlp.ExportResponse{}, err
+	}
+	defer release()
+	err = grpcExport(ctx, func(ctx context.Context) error {
 		ld := req.Logs()
 		// Admission first (ingest: hook, per resource, pre-enrichment).
 		g.s.admitLogs(ld)
 		// Reserved plumbing keys die before anything reads them (reserved.go).
 		g.s.sanitizeLogs(ld)
 		g.s.cfg.Enricher.EnrichLogs(ctx, ld)
-		// logs.rules + logMetrics, AFTER enrichment (logchain.go); a payload
-		// filtered to nothing is acked without a send.
-		if !g.s.applyLogChain(ld) {
+		// logAttributes + logs.rules + logMetrics, AFTER enrichment
+		// (logchain.go); a payload filtered to nothing is acked without a send.
+		cc, forward := g.s.applyLogChain(ld)
+		if !forward {
+			cc.commit() // acked without a send: the drops are final
 			return nil
 		}
 		// Handoff (logs and metrics only, never traces — the tier's tap reads
 		// a forwarded trace AFTER the export): on failure the decoded ld dies
 		// with this RPC and the sender's retry re-decodes retransmitted bytes,
 		// so the transform seam may run in place instead of deep-copying.
-		return g.s.cfg.Exporter.ExportLogs(transform.Handoff(ctx), ld)
+		if err := g.s.cfg.Exporter.ExportLogs(transform.Handoff(ctx), ld); err != nil {
+			return err // NOT counted: the sender will resend these very records
+		}
+		cc.commit()
+		return nil
 	})
 	if err != nil {
 		return plogotlp.ExportResponse{}, err
@@ -372,7 +511,15 @@ type metricsGRPC struct {
 }
 
 func (g *metricsGRPC) Export(ctx context.Context, req pmetricotlp.ExportRequest) (pmetricotlp.ExportResponse, error) {
-	err := grpcExport(ctx, func(ctx context.Context) error {
+	// Charged here for the same reason as the logs arm, and estimated BEFORE
+	// pruning: the point-less metrics emptymetrics.go removes are resident by
+	// the time it runs.
+	release, err := g.s.chargeDecodedGRPC(decodedMetricsSize(req.Metrics()))
+	if err != nil {
+		return pmetricotlp.ExportResponse{}, err
+	}
+	defer release()
+	err = grpcExport(ctx, func(ctx context.Context) error {
 		in := req.Metrics()
 		g.s.admitMetrics(in) // admission first (ingest: hook, pre-enrichment)
 		// Metrics with no data points die here, before anything downstream
@@ -474,7 +621,15 @@ func (s *Server) rejectTraces(ctx context.Context, td ptrace.Traces) error {
 }
 
 func (g *tracesGRPC) Export(ctx context.Context, req ptraceotlp.ExportRequest) (ptraceotlp.ExportResponse, error) {
-	err := grpcExport(ctx, func(ctx context.Context) error {
+	// Charged here for the same reason as the logs arm — including for a
+	// payload RejectTraces will refuse: the spans are already decoded and
+	// resident when the guard runs.
+	release, err := g.s.chargeDecodedGRPC(decodedTracesSize(req.Traces()))
+	if err != nil {
+		return ptraceotlp.ExportResponse{}, err
+	}
+	defer release()
+	err = grpcExport(ctx, func(ctx context.Context) error {
 		td := req.Traces()
 		if err := g.s.rejectTraces(ctx, td); err != nil {
 			return err
@@ -520,11 +675,19 @@ func (g *tracesGRPC) Export(ctx context.Context, req ptraceotlp.ExportRequest) (
 //     Retry-After: 1): the sender still holds the payload.
 //  4. A payload that does not unmarshal is 400 — permanent; retrying a
 //     malformed batch can never succeed.
-//  5. A forward failure maps through HTTPForwardStatus (permanent 400 vs
+//  5. The DECODED payload is charged its own budget, held for the rest of the
+//     handler exactly as the raw body's charge is: the raw bytes bound what
+//     arrives, not what it inflates into, and 30 wire bytes can mint a
+//     ResourceLogs (admit.go). Over it, 429 + Retry-After, like the byte
+//     budget — the sender still holds an intact payload.
+//  6. A forward failure maps through HTTPForwardStatus (permanent 400 vs
 //     retryable 503), and success answers with the OTLP proto response.
 func (s *Server) servePush(w http.ResponseWriter, r *http.Request,
 	signal string,
-	unmarshal func(body []byte) error,
+	// decode unmarshals the body and returns the ESTIMATED decoded structure
+	// (decodedLogsSize and its siblings), which only the caller knows the
+	// signal of.
+	decode func(body []byte) (int64, error),
 	handle func(ctx context.Context) (ProtoMarshaler, error),
 ) {
 	body, charged, err := s.body.Read(r)
@@ -539,7 +702,8 @@ func (s *Server) servePush(w http.ResponseWriter, r *http.Request,
 		return
 	}
 	defer s.release()
-	if err := unmarshal(body); err != nil {
+	decoded, err := decode(body)
+	if err != nil {
 		// The same door as the read above, and the same reason label: a body
 		// that arrived intact and is not OTLP. This was answered and counted by
 		// NOTHING while the seam three lines up owned a reason literally called
@@ -549,6 +713,12 @@ func (s *Server) servePush(w http.ResponseWriter, r *http.Request,
 		http.Error(w, "malformed OTLP "+signal+" payload", http.StatusBadRequest)
 		return
 	}
+	if !s.chargeDecoded(decoded) {
+		w.Header().Set("Retry-After", "1")
+		http.Error(w, errDecodedBudget.Error(), http.StatusTooManyRequests)
+		return
+	}
+	defer s.decoded.release(decoded)
 	resp, err := handle(withPeerIP(r.Context(), r.RemoteAddr))
 	if err != nil {
 		http.Error(w, err.Error(), HTTPForwardStatus(err))
@@ -559,29 +729,44 @@ func (s *Server) servePush(w http.ResponseWriter, r *http.Request,
 
 func (s *Server) handleHTTPLogs(w http.ResponseWriter, r *http.Request) {
 	req := plogotlp.NewExportRequest()
-	s.servePush(w, r, "logs", req.UnmarshalProto, func(ctx context.Context) (ProtoMarshaler, error) {
+	decode := func(body []byte) (int64, error) {
+		if err := req.UnmarshalProto(body); err != nil {
+			return 0, err
+		}
+		return decodedLogsSize(req.Logs()), nil
+	}
+	s.servePush(w, r, "logs", decode, func(ctx context.Context) (ProtoMarshaler, error) {
 		ld := req.Logs()
 		s.admitLogs(ld) // admission first (ingest: hook, pre-enrichment)
 		// Reserved plumbing keys die before anything reads them (reserved.go).
 		s.sanitizeLogs(ld)
 		s.cfg.Enricher.EnrichLogs(ctx, ld)
-		// logs.rules + logMetrics, AFTER enrichment (logchain.go); a payload
-		// filtered to nothing is acked without a send.
-		if !s.applyLogChain(ld) {
+		// logAttributes + logs.rules + logMetrics, AFTER enrichment
+		// (logchain.go); a payload filtered to nothing is acked without a send.
+		cc, forward := s.applyLogChain(ld)
+		if !forward {
+			cc.commit() // acked without a send: the drops are final
 			return plogotlp.NewExportResponse(), nil
 		}
 		// Handoff: as on the gRPC arm — the decoded push dies with a failed
 		// request, and the sender's retry re-decodes retransmitted bytes.
 		if err := s.cfg.Exporter.ExportLogs(transform.Handoff(ctx), ld); err != nil {
-			return nil, err
+			return nil, err // NOT counted: the sender will resend these very records
 		}
+		cc.commit()
 		return plogotlp.NewExportResponse(), nil
 	})
 }
 
 func (s *Server) handleHTTPMetrics(w http.ResponseWriter, r *http.Request) {
 	req := pmetricotlp.NewExportRequest()
-	s.servePush(w, r, "metrics", req.UnmarshalProto, func(ctx context.Context) (ProtoMarshaler, error) {
+	decode := func(body []byte) (int64, error) {
+		if err := req.UnmarshalProto(body); err != nil {
+			return 0, err
+		}
+		return decodedMetricsSize(req.Metrics()), nil
+	}
+	s.servePush(w, r, "metrics", decode, func(ctx context.Context) (ProtoMarshaler, error) {
 		in := req.Metrics()
 		s.admitMetrics(in) // admission first (ingest: hook, pre-enrichment)
 		// Metrics with no data points die here (emptymetrics.go).
@@ -602,7 +787,13 @@ func (s *Server) handleHTTPMetrics(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleHTTPTraces(w http.ResponseWriter, r *http.Request) {
 	req := ptraceotlp.NewExportRequest()
-	s.servePush(w, r, "traces", req.UnmarshalProto, func(ctx context.Context) (ProtoMarshaler, error) {
+	decode := func(body []byte) (int64, error) {
+		if err := req.UnmarshalProto(body); err != nil {
+			return 0, err
+		}
+		return decodedTracesSize(req.Traces()), nil
+	}
+	s.servePush(w, r, "traces", decode, func(ctx context.Context) (ProtoMarshaler, error) {
 		td := req.Traces()
 		if err := s.rejectTraces(ctx, td); err != nil {
 			return nil, err

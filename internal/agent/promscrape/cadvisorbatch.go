@@ -163,6 +163,63 @@ type cadvisorIdentity struct {
 	// then removes the only labels that told them apart — two data points with
 	// identical attribute sets in one metric, which is one series downstream.
 	sandbox bool
+	// pathVouched is the CALLER's statement that the cgroup path this identity
+	// was built from really names the container it carries the id of — the one
+	// thing a cadvisor ROW has to prove with labels (see lookupContainerID) and
+	// that internal/agent/cgroupstats proves by construction: it walks the pod
+	// slices itself and collapses a supervisor scope onto the container's own
+	// scope by container id (discover.go's scan.byID and repointLocked), so what
+	// reaches FillContainerResource has already been disambiguated. identityOf
+	// never sets it — nothing in an exposition can vouch for itself.
+	pathVouched bool
+}
+
+// lookupContainerID is the container id that may be RESOLVED through the
+// metadata service, as opposed to the one that is rendered onto the resource:
+// empty unless the row carried evidence that the id names a container the row
+// is ABOUT — its own pod attribution (namespace+pod), or a container name.
+//
+// This is the same positive-evidence rule isSandbox applies, against the same
+// impostor and for a symmetrical reason. CRI-O's crio-conmon-<containerID>.scope
+// is the SUPERVISOR's cgroup, carrying the supervised container's id in its own
+// name, and pkg/cgroupid.Parse extracts that id deliberately (it says so, and
+// hands the exclusion problem here). Looking it up anyway builds the impostor's
+// resource out of the REAL container's metadata: a second ResourceMetrics whose
+// attribute set is byte-identical to the container's, carrying the same
+// cumulative container_* families with the supervisor's unrelated values — one
+// Prometheus series receiving two conflicting samples per scrape, so rate()
+// fabricates a counter reset on every one of them. isSandbox declining to FOLD
+// such a row is not enough on its own: that only buys the row its own resource
+// KEY, and this is what decides what fills it.
+//
+// A row that names nothing therefore keeps the identity its cgroup path gives
+// it (pod uid + container id) and no more. That costs the one case where the id
+// really is the row's own — a container whose CRI lookup inside cadvisor failed,
+// so the labels never arrived — which loses enrichment on a resource that was
+// unattributed anyway. The other direction corrupts a REAL container's
+// cumulative series, and the path cannot tell the two apart: Parse's
+// podContainer is true for a conmon scope by construction.
+func (id cadvisorIdentity) lookupContainerID() string {
+	if id.pathVouched || id.container != "" || (id.namespace != "" && id.pod != "") {
+		return id.containerID
+	}
+	return ""
+}
+
+// keepsCgroupID reports whether the row's `id` label must survive the
+// redundant-label elision in putFilteredLabels. Two shapes need it, and both
+// need it for the same reason — their data points would otherwise render an
+// attribute set identical to another row's on a resource they share, or that
+// looks exactly like theirs:
+//
+//   - the SANDBOX row, which shares the POD's resource by design and is then
+//     distinguished from the pod-cgroup point only by its cgroup path;
+//   - any row cadvisor could not attribute to a pod, whose identity therefore
+//     came from the cgroup PATH alone. Its resource carries no k8s.pod.name and
+//     no container name, so an unattributable child of a pod slice would
+//     otherwise be a point-for-point twin of every other one under that pod.
+func (id cadvisorIdentity) keepsCgroupID() bool {
+	return id.sandbox || id.namespace == "" || id.pod == ""
 }
 
 func (cb *cadvisorBatcher) identityOf(labels []Label) cadvisorIdentity {
@@ -252,6 +309,14 @@ func (cb *cadvisorBatcher) identityOf(labels []Label) cadvisorIdentity {
 // resolves to the same pod, and the worst case is one extra data point —
 // distinguishable, since putFilteredLabels keeps a sandbox row's `id` — never a
 // stripped identity.
+//
+// Declining to fold is only HALF of what an impostor needs, and the other half
+// is lookupContainerID: refusing the fold buys the row its own resource key,
+// while the lookup is what FILLS that resource — and a conmon scope's cgroup
+// path carries the supervised container's real id, so resolving it built the
+// impostor a byte-identical twin of the container it supervises. The two rules
+// are the same positive-evidence rule applied to the two halves of the same
+// question, and neither is sufficient alone.
 //
 // The pause IMAGE corroborates but is never required: containerd's sandbox_image
 // is configurable and a fleet mirroring it under its own name must not regrow
@@ -468,7 +533,7 @@ func (cb *cadvisorBatcher) fillResource(res pcommon.Resource, ident cadvisorIden
 // not resolve want opposite retry policies. See cgroupstats.Resolver for the
 // contract and containerMeta for where the classification comes from.
 func (s *Scraper) FillContainerResource(ctx context.Context, res pcommon.Resource, containerID, podUID string) (ok, answered bool) {
-	return s.fillIdentityResource(ctx, res, cadvisorIdentity{containerID: containerID, podUID: podUID})
+	return s.fillIdentityResource(ctx, res, cadvisorIdentity{containerID: containerID, podUID: podUID, pathVouched: true})
 }
 
 // fillIdentityResource is fillResource's body, lifted onto the Scraper so the
@@ -478,7 +543,10 @@ func (s *Scraper) FillContainerResource(ctx context.Context, res pcommon.Resourc
 // ANSWERED at all.
 func (s *Scraper) fillIdentityResource(ctx context.Context, res pcommon.Resource, ident cadvisorIdentity) (bool, bool) {
 	// Exact container incarnation via the cgroup container ID, else the pod.
-	actx, resolved, answered := s.resolveContext(ctx, ident.containerID, ident.namespace, ident.pod, ident.podUID, ident.container, res)
+	// lookupContainerID, not ident.containerID: a container id a row merely
+	// PARSED out of a cgroup path it does not name itself must not be resolved,
+	// or a supervisor scope inherits the identity of the container it supervises.
+	actx, resolved, answered := s.resolveContext(ctx, ident.lookupContainerID(), ident.namespace, ident.pod, ident.podUID, ident.container, res)
 	actx.Node = s.nodeInfo()
 
 	if !resolved && (ident.pod != "" || ident.podUID != "" || ident.containerID != "") {
@@ -664,7 +732,7 @@ func (cb *cadvisorBatcher) addNumber(s Sample, monotonic bool) {
 	}
 	dp.SetDoubleValue(s.Value)
 	dp.SetTimestamp(pointTS(s.TimestampMs, cb.scrapeTS))
-	cb.putFilteredLabels(dp.Attributes(), s.Labels, podScoped, ident.sandbox)
+	cb.putFilteredLabels(dp.Attributes(), s.Labels, podScoped, ident.keepsCgroupID())
 	cb.points++
 	cb.bytes += numberBytes(s)
 }
@@ -681,7 +749,7 @@ func (cb *cadvisorBatcher) addHistogram(family string, acc *histAcc) {
 	}
 	dp.SetTimestamp(pointTS(acc.ts, cb.scrapeTS))
 	fillHistogramPoint(dp, acc)
-	cb.putFilteredLabels(dp.Attributes(), acc.labels, podScoped, ident.sandbox)
+	cb.putFilteredLabels(dp.Attributes(), acc.labels, podScoped, ident.keepsCgroupID())
 	cb.points++
 	cb.bytes += histBytes(acc)
 }
@@ -698,19 +766,18 @@ func (cb *cadvisorBatcher) addSummary(family string, acc *summAcc) {
 	}
 	dp.SetTimestamp(pointTS(acc.ts, cb.scrapeTS))
 	fillSummaryPoint(dp, acc)
-	cb.putFilteredLabels(dp.Attributes(), acc.labels, podScoped, ident.sandbox)
+	cb.putFilteredLabels(dp.Attributes(), acc.labels, podScoped, ident.keepsCgroupID())
 	cb.points++
 	cb.bytes += summBytes(acc)
 }
 
-func (cb *cadvisorBatcher) putFilteredLabels(attrs pcommon.Map, labels []Label, podScoped, sandbox bool) {
+func (cb *cadvisorBatcher) putFilteredLabels(attrs pcommon.Map, labels []Label, podScoped, keepID bool) {
 	for _, l := range labels {
-		// `id` is kept on a SANDBOX row: it is the one label distinguishing the
-		// pause point from the pod-cgroup point of the same family, which share
-		// a resource by design. Eliding it left two data points with identical
-		// attributes in one metric.
-		keepSandboxID := sandbox && l.Name == "id"
-		if isIdentityLabel(l.Name) || (podScoped && redundantOnPodRow(l.Name) && !keepSandboxID) {
+		// `id` survives the elision for the rows keepsCgroupID names: it is then
+		// the one label telling their points apart from the ones they would
+		// otherwise duplicate.
+		keepCgroupID := keepID && l.Name == "id"
+		if isIdentityLabel(l.Name) || (podScoped && redundantOnPodRow(l.Name) && !keepCgroupID) {
 			continue
 		}
 		attrs.PutStr(l.Name, l.Value)

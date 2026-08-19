@@ -5,9 +5,13 @@ package otlpingest
 // The four log PRODUCERS run the shared chain (internal/agent/logchain):
 // scrub → lift → enrich → log-metrics → rules. Ingest scrubs in EnrichLogs
 // (before anything reads the body) and runs the REST of the chain here, over
-// ONE bounded text rendering of each body — enrichment, metric observation
-// and the rules all read the same view, in the chain's order, so the same
-// config selects identically however the line arrived. The chain's two
+// ONE bounded text rendering of each body — the lift, enrichment, metric
+// observation and the rules all read the same view, in the chain's order, so
+// the same config selects identically however the line arrived. The LIFT is
+// the newest of those and was missing for a while: without it a logAttributes
+// rule that renamed a key made one logs.rules config drop a tailed line and
+// ship the identical pushed one — and, under an allowlist ruleset, discard the
+// pushed one the tailer keeps. The chain's two
 // standing subtleties hold: METRICS OBSERVE EVERY RECORD (before the rules)
 // and RULES RUN AFTER ENRICHMENT (__severity__ selects on the enriched
 // severity, falling back to the OTLP severity-number band for the
@@ -20,7 +24,11 @@ package otlpingest
 // LineFilter, DynamicMetricSet.Bind and Prune.
 //
 // A dropped record is still ACKED to the sender: it was delivered, the
-// operator chose to drop it (obs.LogRulesDropped, the producers' counter).
+// operator chose to drop it (obs.LogRulesDropped, the producers' counter) —
+// and the tally is applied when the push is ACKED, not when the chain runs,
+// because a NACKed push is retransmitted and re-chained (chainCommit). The
+// log-METRIC observation is the one side effect that stays per receive
+// ATTEMPT; chainCommit says why, and it is the only such place in this repo.
 //
 // UNAUTHENTICATED-SENDER BOUNDS (each measured in the adversarial review,
 // each counted into obs.IngestChainSkipped — the records themselves are
@@ -46,6 +54,8 @@ package otlpingest
 //     visibility, and the store's own DroppedCapped counter plus this one
 //     are the alert surface.
 import (
+	"unicode/utf8"
+
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/plog"
 	"go.opentelemetry.io/collector/pdata/pmetric"
@@ -55,6 +65,7 @@ import (
 	"github.com/JohanLindvall/kubescrape/internal/agent/logenrich"
 	"github.com/JohanLindvall/kubescrape/internal/metrics"
 	"github.com/JohanLindvall/kubescrape/internal/obs"
+	"github.com/JohanLindvall/kubescrape/pkg/logattrs"
 )
 
 const (
@@ -63,13 +74,52 @@ const (
 	maxObservedResources     = 256
 )
 
-// applyLogChain enriches, observes and filters an ingested payload in place,
-// reporting whether anything is left to forward — false means the push is
-// acked without a send, exactly as a producer commits an all-dropped batch.
-func (s *Server) applyLogChain(ld plog.Logs) bool {
+// chainCommit holds the side effects of one push's chain that may only be
+// applied once the receiver knows the payload was DELIVERED.
+//
+// The receiver forwards after the chain runs, and a transient forward failure
+// is answered retryably (503 / Unavailable) precisely so the sender resends the
+// identical bytes — which re-runs the whole chain. Counting inside the chain
+// therefore multiplied kubescrape_log_rules_dropped_total by the number of
+// delivery attempts an outage spanned, for records that were never delivered
+// once: measured 5 drops counted for 1 dropped record over a 5-attempt SDK
+// retry policy. The metric's own registered description says the opposite
+// ("Counted ONCE PER RECORD, not once per attempt") and names -ingest among the
+// paths, and the repo already holds this line elsewhere — journald holds its
+// batch rather than rebuilding it, spanmetrics' tap "forwards FIRST and
+// aggregates only on success".
+//
+// So the drop tally is staged here and committed by the caller after the
+// forward returns nil (or after an all-dropped payload is acked without a send,
+// which is a delivery as far as the sender is concerned). What is NOT staged is
+// the log-METRIC observation: the observations are lazy — the value and each
+// label are resolved per rule, inside the metric store, off the record's
+// attributes and the line — so deferring them means either snapshotting a
+// resolved label set per record per rule (an allocation per record on the
+// receive path) or re-reading the record after the export, which is not the
+// same record: the forward is marked transform.Handoff and a script may have
+// mutated the payload in place, and a rules-dropped record is not in it at all.
+// Log-derived metrics on the INGEST path are therefore observed once per
+// RECEIVE ATTEMPT, not once per delivery — the one place in this repo where
+// that is true, and the ingest bullet in the docs says so.
+type chainCommit struct{ dropped int64 }
+
+// commit applies the staged tallies. Called once the push is acked.
+func (c chainCommit) commit() {
+	if c.dropped > 0 {
+		obs.LogRulesDropped.Add(float64(c.dropped))
+	}
+}
+
+// applyLogChain enriches, observes and filters an ingested payload in place. It
+// reports whether anything is left to forward — false means the push is acked
+// without a send, exactly as a producer commits an all-dropped batch — plus the
+// side effects the caller commits once the payload is delivered (chainCommit).
+func (s *Server) applyLogChain(ld plog.Logs) (chainCommit, bool) {
+	var cc chainCommit
 	enrich := s.cfg.Enricher.LinesEnabled()
-	if !enrich && s.cfg.Rules == nil && s.cfg.LogMetrics == nil {
-		return ld.ResourceLogs().Len() > 0
+	if !enrich && s.cfg.Rules == nil && s.cfg.LogMetrics == nil && s.cfg.LogAttrs == nil {
+		return cc, ld.ResourceLogs().Len() > 0
 	}
 	var resolver *logchain.Resolver
 	if s.cfg.Rules != nil || s.cfg.LogMetrics != nil {
@@ -111,6 +161,19 @@ func (s *Server) applyLogChain(ld plog.Logs) bool {
 				if !ok {
 					obs.IngestChainSkipped.WithLabelValues("body_too_large").Inc()
 				}
+				// LIFT, before enrichment and before anything selects on the
+				// record: the producers' chain is scrub -> lift -> enrich ->
+				// log-metrics -> rules, and this step was missing here, so a
+				// logAttributes rule that RENAMES a key (`attribute:` !=
+				// `key:`, the documented canonical use) made the same
+				// logs.rules / logMetrics config select differently for a
+				// pushed line than for the identical tailed one — an allowlist
+				// ruleset silently DISCARDED pushed records the tailer keeps.
+				var lifted logattrs.Result
+				if s.cfg.LogAttrs != nil && ok {
+					lifted = s.cfg.LogAttrs.Extract(body)
+					logattrs.Put(lr.Attributes(), lifted.Log)
+				}
 				if enrich && ok {
 					logenrich.ApplyBodyText(lr, body)
 				}
@@ -124,22 +187,28 @@ func (s *Server) applyLogChain(ld plog.Logs) bool {
 					// A capped body observes as "": attribute-keyed labels
 					// and values still resolve; the record still counts.
 					resolver.Set(lr.Attributes(), rattrs, "")
+					// Set clears the lifted set, so this follows every Set.
+					// The line's RESOURCE-target attributes rank between the
+					// record's and the resource's, exactly as in Chain.Emit.
+					resolver.SetLifted(lifted.Resource)
 					bm.Add(resolver.ValueFn(), resolver.LabelFn(), body)
 				}
 				if s.cfg.Rules == nil {
 					return false
 				}
 				resolver.Set(lr.Attributes(), rattrs, logchain.RecordSeverity(lr))
+				resolver.SetLifted(lifted.Resource)
 				if s.cfg.Rules.Keep(resolver.RuleFn(), body) {
 					return false
 				}
-				obs.LogRulesDropped.Inc()
+				// Staged, not counted: see chainCommit.
+				cc.dropped++
 				return true
 			})
 		}
 	}
 	logchain.Prune(ld)
-	return ld.ResourceLogs().Len() > 0
+	return cc, ld.ResourceLogs().Len() > 0
 }
 
 // chainBody renders the ONE text view of a body that enrichment, log-metrics
@@ -169,21 +238,51 @@ func chainBody(lr plog.LogRecord) (string, bool) {
 
 // escapedLen is what a string COSTS once AsString renders it as JSON, which is
 // what the estimate has to charge: the raw length is not an upper bound on the
-// rendered one. encoding/json escapes a quote or backslash to two bytes and a
-// control byte to six (\u00XX), so charging len() let a body estimate just
-// under the budget and materialise up to 6x past it — on an unauthenticated
-// path, and against a guard whose whole purpose is to prevent exactly that
-// amplification. Measured on a 900 KiB body: 1.00x plain, 2.00x all-quotes,
-// 6.00x all-NUL.
+// rendered one, and charging len() let a body estimate just under the budget
+// and materialise up to 6x past it — on an unauthenticated path, and against a
+// guard whose whole purpose is to prevent exactly that amplification.
+//
+// It MODELS encoding/json (reached through pcommon.Value.AsString ->
+// marshalJSONNoHTMLEscape) rather than measuring it, because measuring means
+// rendering, and AsString renders by boxing the whole tree through AsRaw first
+// — which is the amplification, not a way to avoid it. So the model is pinned
+// to the renderer by test instead (TestEscapedLenNeverUnderchargesTheRenderer),
+// measured per 100-byte input on Go 1.26.5 / pdata v1.65:
+//
+//	plain, <, DEL, é, emoji      1.0x   (nothing escapes; HTML escaping is OFF)
+//	" and \                      2.0x   -> \" \\
+//	\n \r \t                      2.0x   -> the two-byte escapes
+//	other bytes < 0x20           6.0x   -> \u00XX
+//	INVALID UTF-8, per byte      6.0x   -> the literal \ufffd escape
+//	U+2028 / U+2029 (3 bytes)    2.0x   -> \u2028 (JS line terminators)
+//
+// The last two were missing, and they are the ones an attacker reaches for: a
+// megabyte of 0xFF estimated at 1x and rendered at 6x, i.e. the same 6.00x
+// all-NUL case this comment already claimed was fixed. The whole point of the
+// function is that it may never UNDER-charge; over-charging (which it no longer
+// does for \n/\r/\t) only refuses line-derived processing early, and that is
+// counted and still forwards the record.
 func escapedLen(s string) int {
 	n := len(s)
-	for i := 0; i < len(s); i++ {
-		switch c := s[i]; {
-		case c == '"' || c == '\\':
-			n++ // -> \" or \\
-		case c < 0x20:
-			n += 5 // -> \u00XX
+	for i := 0; i < len(s); {
+		if c := s[i]; c < utf8.RuneSelf {
+			switch {
+			case c == '"' || c == '\\', c == '\n', c == '\r', c == '\t':
+				n++ // two-byte escape
+			case c < 0x20:
+				n += 5 // -> \u00XX
+			}
+			i++
+			continue
 		}
+		r, size := utf8.DecodeRuneInString(s[i:])
+		switch {
+		case r == utf8.RuneError && size == 1:
+			n += 5 // one invalid byte -> the six-byte \ufffd escape
+		case r == '\u2028' || r == '\u2029':
+			n += 3 // three bytes in, the six-byte \u2028 escape out
+		}
+		i += size
 	}
 	return n
 }
@@ -210,11 +309,23 @@ func renderedSizeOver(v pcommon.Value, rem *int, depth int) bool {
 	case pcommon.ValueTypeStr:
 		*rem -= escapedLen(v.Str()) + 2
 	case pcommon.ValueTypeBytes:
-		*rem -= v.Bytes().Len()*4/3 + 2
+		// base64 is 4 bytes per 3, ROUNDED UP with padding: the truncating
+		// 4/3 undercharged every value by up to 3 bytes, which is a 2x
+		// undercharge for a payload of many tiny byte arrays. Same invariant
+		// as escapedLen's — this estimate may never come in low. The +4 is the
+		// two quotes, floored at what an EMPTY bytes value actually renders as
+		// (AsRaw hands encoding/json a nil slice, which is `null`, not `""`).
+		*rem -= (v.Bytes().Len()+2)/3*4 + 4
 	case pcommon.ValueTypeMap:
+		*rem -= 2 // the braces themselves: an EMPTY map still renders {}
 		over := false
 		v.Map().Range(func(k string, mv pcommon.Value) bool {
-			*rem -= len(k) + 4
+			// A KEY is a JSON string too, and charging len() for it moved the
+			// exact undercharge escapedLen exists to prevent into the one
+			// position that skipped it: a key of NULs or invalid UTF-8 renders
+			// 6x what it was charged. The +4 is the framing ("k": plus a
+			// separator).
+			*rem -= escapedLen(k) + 4
 			over = renderedSizeOver(mv, rem, depth+1)
 			return !over
 		})
@@ -222,6 +333,7 @@ func renderedSizeOver(v pcommon.Value, rem *int, depth int) bool {
 			return true
 		}
 	case pcommon.ValueTypeSlice:
+		*rem -= 2 // the brackets, as above
 		sl := v.Slice()
 		for i := 0; i < sl.Len(); i++ {
 			*rem -= 2
@@ -230,7 +342,17 @@ func renderedSizeOver(v pcommon.Value, rem *int, depth int) bool {
 			}
 		}
 	default:
-		*rem -= 24 // numbers, bools, empty
+		// Numbers, bools, empty. 26 rather than the obvious 24: encoding/json
+		// renders a float64 in [1e-6, 1e-5) through its 'f' branch rather than
+		// 'e', and a NEGATIVE one there is 25 characters —
+		// -0.0000012345678901234567. 24 undercharged that shape by a byte per
+		// entry, which a map of such values turns into a ~3% breach of a bound
+		// whose whole contract (escapedLen, above) is that it may never
+		// UNDER-charge. The two spare bytes are slack, not arithmetic: an
+		// int64 is at most 20, a bool 5, empty 4 ("null"), and over-charging
+		// only refuses line-derived processing marginally earlier — which is
+		// counted, and still forwards the record.
+		*rem -= 26
 	}
 	return *rem < 0
 }

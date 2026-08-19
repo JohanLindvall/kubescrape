@@ -12,6 +12,7 @@ package otlpingest
 import (
 	"context"
 	"log/slog"
+	"slices"
 	"strings"
 	"time"
 
@@ -587,7 +588,7 @@ func (e *Enricher) applyMetadata(ctx context.Context, a pcommon.Map, cache *reqC
 	if !cOK && !uOK {
 		built, resolved := e.peerFallback(ctx, cache)
 		if resolved {
-			mergeAttrs(built, a)
+			e.mergeAttrs(built, a)
 			return true
 		}
 		return false
@@ -603,14 +604,14 @@ func (e *Enricher) applyMetadata(ctx context.Context, a pcommon.Map, cache *reqC
 	if cOK {
 		if r := e.attrsFor(ctx, cache, cTok); r.resolved {
 			obs.Ingested.WithLabelValues("enriched").Inc()
-			mergeAttrs(r.built, a)
+			e.mergeAttrs(r.built, a)
 			return true
 		}
 	}
 	if uOK {
 		if r := e.attrsFor(ctx, cache, uTok); r.resolved {
 			obs.Ingested.WithLabelValues("enriched").Inc()
-			mergeAttrs(r.built, a)
+			e.mergeAttrs(r.built, a)
 			return true
 		}
 	}
@@ -800,10 +801,93 @@ func (e *Enricher) builtAttrs(ctx context.Context, cache *reqCache, token string
 // default.
 var emptyAttrs = pcommon.NewMap()
 
-// mergeAttrs adds src's attributes to dst, never overwriting keys the sender
-// already set. The sender is authoritative about ITSELF, which is the same
-// rule the self-metadata stamping applies — hence the shared implementation.
-func mergeAttrs(src, dst pcommon.Map) { attrs.FillAbsent(src, dst) }
+// mergeAttrs adds src's attributes to dst. The sender stays authoritative about
+// ITSELF — attrs.FillAbsent's rule, which the self-metadata stamping still
+// applies verbatim — with ONE class of exception this receiver cannot share:
+// the RESOLVED-IDENTITY keys (attrs.ReservedIdentity), which it just derived
+// from the API server for this very resource, overwrite whatever the sender
+// claimed.
+//
+// The exception is a security boundary, not tidiness, and it is the same one
+// attrs.ReservedIdentity documents for the pod-annotation surface.
+// internal/agent/route keys TENANCY on k8s.namespace.name: a plain
+// FillAbsent left a sender's own value in place, so a pod in namespace
+// `attacker` could push `k8s.namespace.name: payments` beside its real
+// container.id and have its records exported to the payments route, under that
+// route's endpoint and X-Scope-OrgID — while the SAME resource carried
+// `service.namespace: default`, this receiver's own resolution of the same
+// fact, written under a different key. One resource, two answers, and the one
+// the router read was the sender's. The sibling keys forge series identity in
+// the backend and on every log-derived metric bound to the resource.
+//
+// The OTLP service triple is deliberately NOT in that set: service.name is
+// descriptive, and a sender renaming its own series is what the key is for,
+// while service.namespace and service.instance.id are the two dimensions
+// beside it — see senderControlledIdentity, whose exemption resolvedWins
+// applies here so the receipt strip and this overwrite agree about what a
+// sender owns.
+//
+// The residual, stated: this can only correct a resource the lookup RESOLVED,
+// and it can only correct the keys the builder actually emitted for it (an
+// operator who filters k8s.namespace.name out of the ingest pipeline's
+// resourceAttributes leaves the sender's copy as the only one there is). For an
+// UNRESOLVABLE resource the sender's declaration is the only namespace that
+// exists, which is why the application-facing listeners also strip these keys
+// at receipt — see Enricher.SenderIdentityStrip.
+func (e *Enricher) mergeAttrs(src, dst pcommon.Map) {
+	src.Range(func(k string, v pcommon.Value) bool {
+		if _, exists := dst.Get(k); !exists || e.resolvedWins(k) {
+			v.CopyTo(dst.PutEmpty(k))
+		}
+		return true
+	})
+}
+
+// resolvedWins reports whether THIS receiver's resolution of a key outranks
+// the sender's claim about it.
+//
+// Reserved-identity keys yes (see mergeAttrs) — with TWO exceptions, and they
+// are exactly the two the receipt strip already carves out
+// (Enricher.SenderIdentityStrip). That is the point: the two lists are one
+// decision about what a sender owns, and if they disagreed the exemption would
+// hold only on the path it is least needed and evaporate on the common one.
+//
+// The LOOKUP INPUT (container.id / k8s.pod.uid, per-Enricher configuration via
+// -ingest-container-id-keys / -ingest-pod-uid-keys — which is why this hangs
+// off the Enricher rather than being a package function): these are the keys
+// the resolution was made BY, so the answer is a function of the value the
+// sender wrote and there is no independent truth to correct it with, and
+// rewriting it into this agent's own spelling (a raw `cafe01` becoming
+// `containerd://cafe01`) would silently change a join key the sender's other
+// telemetry uses.
+//
+// senderControlledIdentity (service.namespace / service.instance.id): the
+// sender names ITSELF to the backend with the OTLP service triple, and
+// service.name — the half that picks which workload's series a sample joins —
+// is sender-controlled by design. Neither of the other two steers anything in
+// kubescrape (routing keys on k8s.namespace.name), so there is nothing here to
+// "correct"; taking them costs a resolved sender its declared job+instance
+// pair, renaming its job to <k8s-namespace>/<service.name> and pinning its
+// instance to the container ID, which changes on every restart and mints a
+// fresh series each time. The k8s.*/container.* siblings are different in kind
+// and still lose: those are facts about the cluster this receiver just read
+// from the API server, and one of them is what route keys tenancy on.
+//
+// The DESCRIBING arm deliberately differs: on the datapoint/split path a
+// resource names an object OTHER than the sender, so the sender's service
+// triple is its own and not the described object's — split.go strips the whole
+// of attrs.SenderIdentityKeys() (service.name included) before overwriteAttrs
+// rather than merging. "The sender is authoritative about itself" is the same
+// rule in both places; only the question of whose resource it is changes.
+func (e *Enricher) resolvedWins(k string) bool {
+	if !attrs.ReservedIdentity(k) {
+		return false
+	}
+	if slices.Contains(senderControlledIdentity, k) {
+		return false
+	}
+	return !slices.Contains(e.containerIDKeys, k) && !slices.Contains(e.podUIDKeys, k)
+}
 
 // overwriteAttrs sets src's attributes on dst, replacing what the sender set.
 // Used only where the resource describes an object OTHER than the sender (the

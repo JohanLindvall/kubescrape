@@ -307,21 +307,17 @@ func (g *metricGrouper) scope(sm pmetric.ScopeMetrics, scopeIdx int, id string) 
 // The strip matters exactly for the keys the described object LACKS —
 // overwriteAttrs replaces only what the builder emits for THAT object, so any
 // builder-emittable key missing here survives from the EXPORTER onto the
-// object it describes. It is therefore attrs.IdentityKeys() (the pinned union
-// of every such key; a hand-copied list here had already drifted, letting a
-// sender's k8s.service.name/uid leak onto every split-described object) plus
-// the semconv siblings senders set that the builder never emits.
-// TestSenderIdentityAttrsCoverEveryBuilderIdentityKey holds the superset.
+// object it describes. It is therefore attrs.SenderIdentityKeys(): the pinned
+// union of every key the builder emits plus the semconv siblings a sender sets
+// that it does not (a hand-copied list here had already drifted, letting a
+// sender's k8s.service.name/uid leak onto every split-described object, and
+// the composition moved next to the mapping it is derived from so the receipt
+// strip and this one cannot disagree about what identity even is).
 //
 // Known, accepted gap: the label attributes (k8s.pod.label.*,
 // k8s.namespace.label.*) are keyed by DATA and not enumerable, so a sender's
 // pod labels whose keys the described object lacks are not stripped.
-var senderIdentityAttrs = append(attrs.IdentityKeys(),
-	// container.name: the bare semconv sibling of k8s.container.name. The
-	// builder never emits it, but SDK container detectors do, and it names the
-	// sender's container as surely as the prefixed form.
-	"container.name",
-)
+var senderIdentityAttrs = attrs.SenderIdentityKeys()
 
 // stripSenderIdentity removes the sender's own identity from a resource that is
 // about to be re-labelled as a described object's.
@@ -414,7 +410,7 @@ func (g *metricGrouper) resource(id string) pmetric.ResourceMetrics {
 			g.rmByID[id] = rm
 			return rm
 		}
-		mergeAttrs(g.enricher.builtAttrs(g.ctx, g.cache, id).built, rm.Resource().Attributes())
+		g.enricher.mergeAttrs(g.enricher.builtAttrs(g.ctx, g.cache, id).built, rm.Resource().Attributes())
 	} else if g.resToken == "" {
 		// No ID anywhere for these points: the opt-in peer-IP fallback still
 		// attributes them to the pushing pod (resolved once per request). The
@@ -428,7 +424,7 @@ func (g *metricGrouper) resource(id string) pmetric.ResourceMetrics {
 		// fold in here) tallied an unresolved sender for a push whose resource
 		// had resolved perfectly.
 		if built, resolved := g.enricher.peerFallback(g.ctx, g.cache); resolved {
-			mergeAttrs(built, rm.Resource().Attributes())
+			g.enricher.mergeAttrs(built, rm.Resource().Attributes())
 		}
 	}
 	g.rmByID[id] = rm

@@ -98,7 +98,7 @@ func compileRule(d *Dynamic, cfg *setConfig, shared map[string]*series) (*metric
 	if rule.resLabels, err = parseLabelTemplates(d.ResourceLabels, d.LabelPrefix); err != nil {
 		return nil, err
 	}
-	if err := rejectHistogramLe(d, kind, rule.labels); err != nil {
+	if err := rejectHistogramLe(d, kind, rule.labels, rule.resLabels); err != nil {
 		return nil, err
 	}
 	if err := rejectUnresolvableKeys(d, rule); err != nil {
@@ -114,13 +114,13 @@ func compileRule(d *Dynamic, cfg *setConfig, shared map[string]*series) (*metric
 	}
 	name := cfg.namePrefix + d.Name
 	if kind == kindHistogram {
-		// maxCardinality counts LABEL COMBINATIONS (and since the one-sample-
-		// per-label-set layout, so does the store — no translation needed), but
-		// a histogram's cost still scales with the PRODUCT: every live sample
-		// carries a counts slot per bucket, and every export renders all of
-		// them. Refuse a combination that could outgrow that budget. The
-		// effective bucket count is what matters: an empty Buckets is replaced
-		// by defaultBuckets in newSeries.
+		// maxCardinality counts SERIES — (resource, label-combination) pairs,
+		// which is what the store keys too since the one-sample-per-label-set
+		// layout, so no translation is needed — but a histogram's cost still
+		// scales with the PRODUCT: every live sample carries a counts slot per
+		// bucket, and every export renders all of them. Refuse a combination
+		// that could outgrow that budget. The effective bucket count is what
+		// matters: an empty Buckets is replaced by defaultBuckets in newSeries.
 		streams := len(d.Buckets) + 1
 		if len(d.Buckets) == 0 {
 			streams = len(defaultBuckets) + 1
@@ -230,7 +230,9 @@ func rejectUnresolvableKeys(d *Dynamic, rule *metricRule) error {
 // cardinalityCap resolves the configured MaxCardinality: unset (or negative)
 // means the documented default of maxCardinalityCap — never unlimited, since
 // the cap is the defense against a high-cardinality label (request id, user
-// id) exhausting the node agent's memory.
+// id) exhausting the node agent's memory. It bounds SERIES, i.e. distinct
+// (resource, label-combination) pairs: one agent-wide set serves every pod on
+// the node, so a rule matching N pods divides one pool among them.
 func cardinalityCap(configured int) int {
 	if configured <= 0 {
 		return maxCardinalityCap
@@ -505,12 +507,23 @@ func buildKeyIndex(rules []*metricRule) logline.KeyIndex {
 	return ki
 }
 
-// rejectHistogramLe refuses a histogram rule that sets a data-point label named
-// "le". The store keys a histogram on ONE sample per label set carrying its
-// whole bucket array, so an "le" in the identity splits the distribution into
-// one sample per value the lines happened to carry, each of which then renders
-// its own complete bucket set — the same conceptual histogram exported several
-// times over, none of them whole.
+// rejectHistogramLe refuses a histogram rule that sets a label named "le" —
+// through EITHER door the config has, `labels` and `resourceLabels`. The store
+// keys a histogram on ONE sample per label set carrying its whole bucket array,
+// so an "le" in the identity splits the distribution into one sample per value
+// the lines happened to carry, each of which then renders its own complete
+// bucket set — the same conceptual histogram exported several times over, none
+// of them whole.
+//
+// Both lists, because both fold into the SAME identity: observeFold XORs the
+// resourceLabels term into the series key exactly as it does the data-point
+// labels (series.go), so a resourceLabels "le" splits the distribution
+// identically — and it is the resource door that most surely meets the
+// generated label downstream, since promoting resource attributes onto data
+// points (promote_resource_attributes / resource_to_telemetry_conversion) is
+// the whole reason to lift a label onto the resource. Checking only `labels`
+// left the guard's own "every static door" claim (registry.go, dynamic.go)
+// false for a rule one keyword away from the refused one.
 //
 // "le" is also what a Prometheus consumer synthesizes per bucket from that
 // array (client_golang's const-histogram bridge does it on the Dump path), so a
@@ -528,15 +541,23 @@ func buildKeyIndex(rules []*metricRule) logline.KeyIndex {
 // Starlark script's label map is the one door whose keys are not known here.
 // It takes the compiled kind and label templates rather than the rule, because
 // rule.series is not assigned until after this runs.
-func rejectHistogramLe(d *Dynamic, kind seriesKind, lbls []labelTemplate) error {
+func rejectHistogramLe(d *Dynamic, kind seriesKind, lbls, resLbls []labelTemplate) error {
 	if kind != kindHistogram {
 		return nil
 	}
-	for _, lt := range lbls {
-		if lt.setKey == leLabel {
-			return fmt.Errorf("metric %q: a histogram may not set a label named %q — "+
-				"it is the bucket-bound label a Prometheus consumer generates from the "+
-				"histogram's own buckets, and setting it splits the distribution", d.Name, leLabel)
+	// The error names WHICH list carried it: the two spell the same mistake in
+	// different config fields, and "a histogram may not set le" against a rule
+	// whose `labels` are clean reads as a false positive.
+	for _, door := range [...]struct {
+		field string
+		lbls  []labelTemplate
+	}{{"labels", lbls}, {"resourceLabels", resLbls}} {
+		for _, lt := range door.lbls {
+			if lt.setKey == leLabel {
+				return fmt.Errorf("metric %q: a histogram may not set a %s entry named %q — "+
+					"it is the bucket-bound label a Prometheus consumer generates from the "+
+					"histogram's own buckets, and setting it splits the distribution", d.Name, door.field, leLabel)
+			}
 		}
 	}
 	return nil

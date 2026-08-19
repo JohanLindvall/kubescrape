@@ -27,6 +27,20 @@ type PortVerdict struct {
 	Note  string  `json:"note,omitempty"`
 }
 
+// CeilingNote is the ONE wording for an entry or endpoint the per-pod target
+// ceiling refuses, so every door reports a refusal the same way and an operator
+// can grep for one string across the whole document.
+//
+// It is EXPORTED because the ceiling that finally decides binds where targets
+// ACCUMULATE (server.targetDedup.add), not at any single door: with a 10-entry
+// pod annotation beside a 10-port Service each door is individually under the
+// ceiling and the accumulator still refuses four targets, so only the server
+// knows which ones. The wording lives here anyway — a second spelling over
+// there is exactly the drift this file exists to prevent.
+func CeilingNote(subject string) string {
+	return fmt.Sprintf("%s is over the per-pod ceiling of %d targets and is NOT scraped", subject, MaxPortsPerPod)
+}
+
 // ScrapeableReasons returns why a pod cannot yield scrape targets — one
 // reason per failed condition of Scrapeable, empty when it is scrapeable.
 func ScrapeableReasons(pod kubemeta.Pod) []string {
@@ -112,7 +126,7 @@ func (f *portFilter) keep(ports []int32) (kept []int32, note string) {
 		notes = append(notes, fmt.Sprintf("port %s is outside 1-65535 and resolves to nothing", strings.Join(bad, ", ")))
 	}
 	if len(capped) > 0 {
-		notes = append(notes, fmt.Sprintf("port %s is over the per-pod ceiling of %d targets and is NOT scraped", strings.Join(capped, ", "), MaxPortsPerPod))
+		notes = append(notes, CeilingNote("port "+strings.Join(capped, ", ")))
 	}
 	return kept, strings.Join(notes, "; ")
 }
@@ -187,7 +201,7 @@ func explainPodPortEntry(pod kubemeta.Pod, entry string, filter *portFilter) Por
 // each translates to. annotated reports whether a port annotation narrowed
 // the selection.
 func ExplainServicePorts(pod kubemeta.Pod, svc *services.Service) (verdicts []PortVerdict, annotated bool) {
-	filter := servicePortFilter{}
+	filter := &servicePortFilter{}
 	// The predicate must be EXACTLY selectServicePorts': absent or all-blank
 	// selects every service port; a present annotation never falls back, even
 	// one whose entries all split away (","), which selects nothing.
@@ -237,21 +251,43 @@ func ExplainServicePorts(pod kubemeta.Pod, svc *services.Service) (verdicts []Po
 // SERVICE port for the note. portFilter is deliberately not reused: podPorts'
 // `add` also range-checks, ServiceTargets does not, and that extra branch
 // would explain away a target the derivation serves.
-type servicePortFilter map[int32]int32
+type servicePortFilter struct {
+	seen map[int32]int32
+	// kept counts the targets this Service has produced, mirroring
+	// ServiceTargets' OWN `len(targets) >= MaxPortsPerPod` break — the half of
+	// the derivation this filter did not mirror at all, so explain reported
+	// every entry past the break as resolving. It bounds ONE door; the ceiling
+	// that finally decides is the accumulator's (server.targetDedup.add),
+	// which spans every door at once and is therefore reported by the SERVER
+	// (see MaxPortsPerPod and CeilingNote). Both are needed: neither can see
+	// the other's refusals.
+	kept int
+}
 
 // claim registers a resolved pod port, or says why a service port resolving
 // to an already-claimed one adds no target.
-func (f servicePortFilter) claim(podPort, svcPort int32) (note string, dup bool) {
-	if claimer, taken := f[podPort]; taken {
+func (f *servicePortFilter) claim(podPort, svcPort int32) (note string, dup bool) {
+	if claimer, taken := f.seen[podPort]; taken {
 		return fmt.Sprintf("resolves to pod port %d, already claimed by service port %d; this entry adds no target", podPort, claimer), true
 	}
-	f[podPort] = svcPort
+	if f.seen == nil {
+		f.seen = map[int32]int32{}
+	}
+	f.seen[podPort] = svcPort
 	return "", false
 }
 
 // servicePortVerdict explains one selected service port's translation to a
-// pod port (TargetPodPort's decision, then ServiceTargets' seen-port dedup).
-func servicePortVerdict(pod kubemeta.Pod, entry string, sp services.Port, filter servicePortFilter) PortVerdict {
+// pod port (ServiceTargets' ceiling break, then TargetPodPort's decision, then
+// its seen-port dedup) — in the derivation's order, which is load-bearing:
+// ServiceTargets BREAKS before it resolves anything, so once this Service has
+// produced MaxPortsPerPod targets every remaining entry yields nothing
+// whatever it would have resolved to, and checking the ceiling after the
+// resolution would explain a port the derivation never looked at.
+func servicePortVerdict(pod kubemeta.Pod, entry string, sp services.Port, filter *servicePortFilter) PortVerdict {
+	if filter.kept >= MaxPortsPerPod {
+		return PortVerdict{Entry: entry, Note: CeilingNote("this entry")}
+	}
 	port, ok := TargetPodPort(pod, sp)
 	if !ok {
 		return PortVerdict{
@@ -262,6 +298,7 @@ func servicePortVerdict(pod kubemeta.Pod, entry string, sp services.Port, filter
 	if note, dup := filter.claim(port, sp.Port); dup {
 		return PortVerdict{Entry: entry, Note: note}
 	}
+	filter.kept++
 	v := PortVerdict{Entry: entry, Ports: []int32{port}}
 	switch {
 	case sp.TargetPortName == "" && !containerDeclaresNumber(pod, port):

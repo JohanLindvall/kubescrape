@@ -203,12 +203,22 @@ type series struct {
 	now func() int64
 
 	action  gaugeAction // gauge fold mode; ignored for other kinds
-	maxSize int         // cap on distinct LABEL COMBINATIONS (config maxCardinality)
-	// db is keyed per LABEL COMBINATION for every kind — a histogram is one
-	// sample carrying its whole per-bucket distribution (sample.counts) — so
-	// len(db) compares against maxSize directly. The store used to key
-	// histograms per bucket STREAM and translate the cap through a derived
-	// maxStreams budget; the translation is gone with the layout.
+	maxSize int         // cap on distinct SERIES (config maxCardinality)
+	// db is keyed per SERIES — one entry per (resource, label-combination)
+	// pair, since observeFold XORs the resource's accumulator into the key —
+	// and per PAIR for every kind, a histogram being one sample carrying its
+	// whole per-bucket distribution (sample.counts), so len(db) compares
+	// against maxSize directly. The store used to key histograms per bucket
+	// STREAM and translate the cap through a derived maxStreams budget; the
+	// translation is gone with the layout.
+	//
+	// The RESOURCE half is what makes the cap a memory bound (the store
+	// retains a serialization of the whole resource per entry), and it is also
+	// what surprises: one agent-wide set serves every pod on the node, so a
+	// rule matching N pods draws its label combinations from ONE pool and the
+	// per-pod budget is maxSize/N. Do not "fix" that by dropping the resource
+	// from the key — a label-set-only cap is unbounded in resources, which is
+	// exactly what cardinalityCap (compile.go) and maxStreamCap defend against.
 	expiration int64 // seconds of inactivity before a combination expires
 	lastWarn   int64 // epoch seconds of the last cardinality warning
 	log        *slog.Logger
@@ -419,7 +429,7 @@ func (s *series) baseAccum(lbls labels) xxh3.Uint128 { return lbls.hashAccum() }
 // runs only on the cold path, so serializing the label set here is cheap.
 func (s *series) admit(hash xxh3.Uint128, lbls labels, now int64, res pcommon.Map, resLabels labels) *expiringSample {
 	if s.maxSize > 0 && len(s.db) >= s.maxSize {
-		s.warnCapped(lbls, now)
+		s.warnCapped(lbls, now, res, resLabels)
 		return nil
 	}
 	samp := &expiringSample{
@@ -454,12 +464,21 @@ func (s *series) streamStart(now int64) int64 {
 
 // warnCapped counts the refused observation and logs the cardinality cap at
 // most hourly (caller holds the lock).
-func (s *series) warnCapped(lbls labels, now int64) {
+//
+// The RESOURCE is on the line because the cap counts (resource, label-set)
+// pairs: without it the message reads "max label count reached … labels=
+// {path=\"/a\"} maxsize=10000" — ONE label set against a cap of ten thousand,
+// which is self-contradictory on its face and leaves the operator unable to
+// tell WHICH pod was refused, or that pods are what consumed the budget at
+// all. Both strings are materialized only on the hourly branch, so the refusal
+// path itself stays as cheap as it was.
+func (s *series) warnCapped(lbls labels, now int64, res pcommon.Map, resLabels labels) {
 	s.drops.recordCapped(s.name)
 	if now-s.lastWarn >= 3600 {
 		s.lastWarn = now
-		s.log.Info("max label count reached for log metric",
-			"metric", s.name, "labels", lbls.String(), "maxsize", s.maxSize)
+		s.log.Info("max series count reached for log metric",
+			"metric", s.name, "labels", lbls.String(), "resource", resourceString(res, resLabels),
+			"series", len(s.db), "maxsize", s.maxSize)
 	}
 }
 

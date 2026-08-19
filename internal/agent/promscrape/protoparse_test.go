@@ -991,3 +991,109 @@ func TestNativeHistogramSchemaAndZeroThresholdBounds(t *testing.T) {
 		})
 	}
 }
+
+// TestFloatNativeHistogramBucketsNeverExceedTheirCount pins the reconciliation
+// in addNativeHistogram.
+//
+// A FLOAT native histogram carries its counts as floats, and OTLP buckets are
+// uint64, so roundCount is applied to the sample count, the zero count and
+// every absolute bucket count — INDEPENDENTLY. A message that is perfectly
+// consistent on the wire (0.6+0.6+0.6 == 1.8) therefore converted to count=2
+// against buckets [1 1 1]: three observations claimed by a point declaring two.
+// The error is not a ±1 artifact, it scales with the bucket count — twenty
+// 0.6 buckets against a count of 12 shipped a 67% overclaim — and the point is
+// invalid in both OTLP and Prometheus' own model, so a validating collector may
+// answer by rejecting the whole chunk and costing every other target in it,
+// with kubescrape_scrape_malformed_total flat at 0 throughout.
+func TestFloatNativeHistogramBucketsNeverExceedTheirCount(t *testing.T) {
+	mk := func(name string, sampleCount, zero float64, counts []float64) *dto.MetricFamily {
+		return &dto.MetricFamily{
+			Name: ptr(name),
+			Type: dto.MetricType_HISTOGRAM.Enum(),
+			Metric: []*dto.Metric{{
+				Histogram: &dto.Histogram{
+					SampleCountFloat: ptr(sampleCount),
+					SampleSum:        ptr(3.5),
+					Schema:           ptr(int32(3)),
+					ZeroThreshold:    ptr(1e-9),
+					ZeroCountFloat:   ptr(zero),
+					PositiveSpan:     []*dto.BucketSpan{{Offset: ptr(int32(1)), Length: ptr(uint32(len(counts)))}},
+					PositiveCount:    counts,
+				},
+			}},
+		}
+	}
+	twenty := make([]float64, 20)
+	for i := range twenty {
+		twenty[i] = 0.6
+	}
+	cases := []struct {
+		name string
+		fam  *dto.MetricFamily
+		want uint64 // the population the rounded buckets actually carry
+	}{
+		{"three-half-buckets", mk("h_small", 1.8, 0, []float64{0.6, 0.6, 0.6}), 3},
+		{"error-scales-with-buckets", mk("h_wide", 12.0, 0.4, twenty), 20},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got, malformed := protoConvert(t, c.fam)
+			if malformed != 0 {
+				t.Fatalf("a wire-consistent float native histogram was counted malformed: %d", malformed)
+			}
+			m, ok := got[c.fam.GetName()]
+			if !ok {
+				t.Fatalf("family dropped; exported %v", slices.Sorted(maps.Keys(got)))
+			}
+			dp := m.ExponentialHistogram().DataPoints().At(0)
+			population := dp.ZeroCount()
+			for _, v := range dp.Positive().BucketCounts().AsRaw() {
+				population += v
+			}
+			for _, v := range dp.Negative().BucketCounts().AsRaw() {
+				population += v
+			}
+			if population > dp.Count() {
+				t.Fatalf("buckets carry %d observations against count = %d (zero=%d pos=%v): invalid OTLP, and a fabricated overclaim of the target's own numbers",
+					population, dp.Count(), dp.ZeroCount(), dp.Positive().BucketCounts().AsRaw())
+			}
+			if dp.Count() != c.want {
+				t.Fatalf("count = %d, want %d (raised to the population its rounded buckets carry, never lowered)", dp.Count(), c.want)
+			}
+		})
+	}
+}
+
+// The reconciliation is ONE-DIRECTIONAL, and this is the half that must NOT
+// move: a count LARGER than the bucket population is a legitimate Prometheus
+// shape — a NaN observation increments count without entering any bucket — so
+// it is the target's own number and is passed through, not clamped down the way
+// the classic path clamps its buckets. Anyone tempted to make the identity
+// symmetric ("just clamp count to the buckets") would silently delete those
+// observations from every histogram that has them.
+func TestNativeHistogramCountAboveItsBucketsIsPassedThrough(t *testing.T) {
+	fam := &dto.MetricFamily{
+		Name: ptr("h_nan_observations"),
+		Type: dto.MetricType_HISTOGRAM.Enum(),
+		Metric: []*dto.Metric{{
+			Histogram: &dto.Histogram{
+				SampleCount:   ptr(uint64(1000000)),
+				Schema:        ptr(int32(0)),
+				ZeroThreshold: ptr(1e-9),
+				PositiveSpan:  []*dto.BucketSpan{{Offset: ptr(int32(1)), Length: ptr(uint32(1))}},
+				PositiveDelta: []int64{3},
+			},
+		}},
+	}
+	got, malformed := protoConvert(t, fam)
+	if malformed != 0 {
+		t.Fatalf("malformed = %d, want 0", malformed)
+	}
+	dp := got["h_nan_observations"].ExponentialHistogram().DataPoints().At(0)
+	if dp.Count() != 1000000 {
+		t.Fatalf("count = %d, want the target's own 1000000 kept", dp.Count())
+	}
+	if bs := dp.Positive().BucketCounts().AsRaw(); !slices.Equal(bs, []uint64{3}) {
+		t.Fatalf("buckets = %v, want the target's own [3] — a symmetric clamp would have rewritten them", bs)
+	}
+}

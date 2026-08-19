@@ -156,14 +156,22 @@ func runConfigCase(cfg agentConfig, scrubber *logscrub.Scrubber, extractor *loga
 	// Metrics observe EVERY line (before rules), exactly as in production; a
 	// fresh set per case keeps cases independent. Compiled through the shared
 	// helper so the prefix participates exactly as it does at a real start.
+	//
+	// Whenever the config HAS the section, not only when a case asserts on it:
+	// the set is also the emit_metric target the transform seam needs below,
+	// and compiling it on demand meant a transforms file using that sanctioned
+	// verb failed every case with "no logMetrics section is configured" —
+	// naming the one section that was in fact present, for a pair a real start
+	// runs correctly.
 	var set *metrics.DynamicMetricSet
-	if len(tc.Expect.Metrics) > 0 {
+	if cfg.LogMetrics != nil {
 		var err error
 		if set, err = compileLogMetrics(cfg.LogMetrics); err != nil {
 			fail("compiling logMetrics: %v", err)
-		} else if set == nil {
-			fail("expect.metrics set but the config has no logMetrics section")
 		}
+	}
+	if len(tc.Expect.Metrics) > 0 && set == nil {
+		fail("expect.metrics set but the config has no logMetrics section")
 	}
 
 	base := logchain.Config{Scrub: scrubber, LogAttrs: extractor, Enrich: *enrichOn}
@@ -217,15 +225,6 @@ func runConfigCase(cfg agentConfig, scrubber *logscrub.Scrubber, extractor *loga
 		}
 	}
 
-	if set != nil {
-		fired := firedMetricNames(set)
-		for _, want := range tc.Expect.Metrics {
-			if !fired[*logsMetricsPrefix+want] && !fired[want] {
-				fail("metric %q did not observe the line (fired: %v)", want, keys(fired))
-			}
-		}
-	}
-
 	// The verdict pass, then the logs transform — kept reflects both.
 	kept := true
 	if rules != nil {
@@ -237,10 +236,34 @@ func runConfigCase(cfg agentConfig, scrubber *logscrub.Scrubber, extractor *loga
 	if kept && transforms != nil {
 		sink := &captureLogs{}
 		w := transform.Wrap(sink, nil, transforms)
+		if set != nil {
+			// The emit_metric bridge, wired exactly as run() wires it
+			// (main.go: transforms.SetMetricEmitter(logMetrics)), including
+			// the typed-value guard — a nil *DynamicMetricSet boxed into the
+			// interface would defeat the builtin's own nil check. Without this
+			// the harness rejected every case of a script using the verb,
+			// which is the opposite of what a CI proof of a transform edit is
+			// for.
+			w.SetMetricEmitter(set)
+		}
 		if err := w.ExportLogs(context.Background(), ld); err != nil {
 			fail("logs transform: %v", err)
 		} else {
 			kept = sink.records > 0
+		}
+	}
+
+	// AFTER the transform arm, so expect.metrics can also assert a series a
+	// script emitted — the export firedMetricNames runs consumes the set, so
+	// asserting before it would have made emit_metric unobservable even once
+	// the emitter is wired. Ordinary chain observations happened further up and
+	// are unaffected by the move.
+	if set != nil {
+		fired := firedMetricNames(set)
+		for _, want := range tc.Expect.Metrics {
+			if !fired[*logsMetricsPrefix+want] && !fired[want] {
+				fail("metric %q did not observe the line (fired: %v)", want, keys(fired))
+			}
 		}
 	}
 	wantKept := tc.Expect.Kept == nil || *tc.Expect.Kept

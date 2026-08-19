@@ -124,10 +124,12 @@ func (t *Tailer) applyPodConfig(f *file, annotations map[string]string) {
 		f.multiline = cfg.Multiline
 		t.newPipeline(f)
 	}
-	attrsMap := f.resource.Attributes()
-	if cfg.ServiceName != "" {
-		attrsMap.PutStr("service.name", cfg.ServiceName)
-	}
+	// The vetting happens HERE, once per file, and only the RESULT is kept:
+	// buildResource re-applies these whenever it re-renders the resource (a
+	// node relabel), and re-vetting there would re-count obs.LogPodAttrsRefused
+	// and re-warn once per refresh, forever.
+	f.podService = cfg.ServiceName
+	f.podAttrs = nil
 	for k, v := range cfg.Attributes {
 		if reservedAttr(k) {
 			// The workload is authoritative about its own DESCRIPTION, never
@@ -138,7 +140,29 @@ func (t *Tailer) applyPodConfig(f *file, annotations map[string]string) {
 				"path", f.path, "key", k, "value", v, "annotation", LogAnnotation)
 			continue
 		}
-		attrsMap.PutStr(k, v)
+		if f.podAttrs == nil {
+			f.podAttrs = make(map[string]string, len(cfg.Attributes))
+		}
+		f.podAttrs[k] = v
+	}
+	f.applyPodResource()
+}
+
+// applyPodResource stamps the pod annotation's vetted resource overrides onto
+// the file's current resource. The workload is authoritative about itself, so
+// these land last — after the builder, the source statics and the path
+// captures — on every render of the resource, not just the first.
+func (f *file) applyPodResource() {
+	if f.podService == "" && len(f.podAttrs) == 0 {
+		return
+	}
+	a := f.resource.Attributes()
+	if f.podService != "" {
+		a.PutStr("service.name", f.podService)
+	}
+	// Distinct keys, so the map's iteration order cannot change the result.
+	for k, v := range f.podAttrs {
+		a.PutStr(k, v)
 	}
 }
 

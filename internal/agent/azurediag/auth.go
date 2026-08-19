@@ -269,13 +269,23 @@ func parseTokenResponse(body []byte, what string) (string, time.Duration, error)
 			// secs > 0 (falls back to the default), but +Inf PASSES it and
 			// time.Duration(+Inf) overflows to a large NEGATIVE duration, so
 			// expiry lands in the past and the token is refreshed on every
-			// connection. Reject non-finite (and cap absurd finite) values.
-			// Non-finite AND absurd-finite: 1e300 overflows
-			// time.Duration exactly as +Inf does, landing the expiry in the
-			// past and refreshing the token on every connection — the very
-			// symptom the Inf guard was added for. maxTokenTTL is the widest
-			// value that cannot overflow the multiply.
-			const maxTokenTTL = float64(math.MaxInt64) / float64(time.Second)
+			// connection. Reject non-finite AND absurd-finite values: 1e300
+			// overflows time.Duration exactly as +Inf does, landing the expiry
+			// in the past — the very symptom the Inf guard was added for.
+			//
+			// The bound is computed in INTEGER space on purpose. Written as
+			// float64(math.MaxInt64)/float64(time.Second) the numerator rounds
+			// UP to exactly 2^63 — float64 cannot hold MaxInt64 — so the
+			// quotient was itself out of range: 9223372036.854776 passed the
+			// test and its product is exactly 2^63, which time.Duration
+			// converts to MinInt64 on amd64 (the Go spec leaves an
+			// out-of-range float→int conversion implementation-defined, so
+			// elsewhere it saturates to MaxInt64 instead — both wrong, in
+			// opposite directions). MaxInt64/int64(time.Second) = 9223372036
+			// is exact as a float64 and its product stays a comfortable
+			// margin below 2^63, so no rounding can carry it over. The
+			// rejected sliver is a TTL of ~292 years.
+			const maxTokenTTL = float64(math.MaxInt64 / int64(time.Second))
 			if secs, err := strconv.ParseFloat(s, 64); err == nil && secs > 0 && secs <= maxTokenTTL {
 				ttl = time.Duration(secs * float64(time.Second))
 			}

@@ -3,7 +3,9 @@
 package metrics
 
 import (
+	"bytes"
 	"context"
+	"log/slog"
 	"math"
 	"strings"
 	"testing"
@@ -46,6 +48,58 @@ func TestHistogramLeIsRefusedAtCompile(t *testing.T) {
 		Name: "c", Type: CounterType, Value: "1", Labels: []string{"le=$bucket"},
 	}}); err != nil {
 		t.Errorf("le on a counter must stay legal: %v", err)
+	}
+}
+
+// TestHistogramResourceLabelLeIsRefusedAtCompile pins the OTHER static door.
+// resourceLabels folds into the same series identity as labels (observeFold
+// XORs its term into the key), so an "le" there splits the distribution
+// identically — and, being a resource attribute, it is the one that meets the
+// generated bucket label downstream once a collector promotes resource
+// attributes onto data points. The guard checked only `labels` and this
+// compiled clean.
+func TestHistogramResourceLabelLeIsRefusedAtCompile(t *testing.T) {
+	_, err := newTestSet([]Dynamic{{
+		Name:           "h",
+		Type:           HistogramType,
+		Value:          "ms",
+		Buckets:        []float64{1, 5},
+		ResourceLabels: []string{"le=$code"},
+	}})
+	if err == nil {
+		t.Fatal("a histogram rule setting le via resourceLabels compiled; want a startup error")
+	}
+	// The message must name the list that carried it, or an operator reads a
+	// refusal about `labels` while staring at a clean `labels`.
+	if !strings.Contains(err.Error(), "resourceLabels") {
+		t.Errorf("error must name the resourceLabels list: %v", err)
+	}
+	if !strings.Contains(err.Error(), "le") || !strings.Contains(err.Error(), "h") {
+		t.Errorf("error must name the label and the metric: %v", err)
+	}
+
+	// labelPrefix composes into resourceLabels too — same name, same refusal.
+	if _, err := newTestSet([]Dynamic{{
+		Name: "h2", Type: HistogramType, Value: "ms", Buckets: []float64{1},
+		LabelPrefix: "l", ResourceLabels: []string{"e=$code"},
+	}}); err == nil {
+		t.Error("labelPrefix composing to \"le\" in resourceLabels compiled; want a startup error")
+	}
+
+	// And the data-point door still names ITS list, so the two are told apart.
+	_, err = newTestSet([]Dynamic{{
+		Name: "h3", Type: HistogramType, Value: "ms", Buckets: []float64{1},
+		Labels: []string{"le=$code"},
+	}})
+	if err == nil || !strings.Contains(err.Error(), "labels") || strings.Contains(err.Error(), "resourceLabels") {
+		t.Errorf("data-point door must name `labels`: %v", err)
+	}
+
+	// Non-histograms are untouched here as well.
+	if _, err := newTestSet([]Dynamic{{
+		Name: "c", Type: CounterType, Value: "1", ResourceLabels: []string{"le=$code"},
+	}}); err != nil {
+		t.Errorf("le on a counter's resourceLabels must stay legal: %v", err)
 	}
 }
 
@@ -645,5 +699,52 @@ func TestGaugeAggregationWindow(t *testing.T) {
 	add("9") // folds into the current (post-export) window
 	if got, _ := gaugeValue(t, set, "g", "", ""); got != 9 {
 		t.Fatalf("window max after fold = %v, want 9", got)
+	}
+}
+
+// TestCardinalityWarningNamesTheResourceThatWasRefused pins the cap's warn
+// line. maxCardinality bounds SERIES — (resource, label-combination) pairs —
+// so one agent-wide set shared by every pod on the node exhausts its budget
+// across pods, not across label sets. The line used to name only the label set
+// and the cap ("labels={path=\"/a\"} maxsize=10000"), which reads as one label
+// set against ten thousand: self-contradictory on its face, and no help at all
+// in finding WHICH pod stopped being measured. Naming the resource is what
+// makes the sizing surprise falsifiable from the logs.
+func TestCardinalityWarningNamesTheResourceThatWasRefused(t *testing.T) {
+	t0 := int64(1_700_600_000)
+	setTimeForTest(time.Unix(t0, 0))
+	defer testEpoch.Store(0)
+
+	var buf bytes.Buffer
+	log := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	s := newTestSeries(seriesSpec{name: "c", kind: kindCounter, maxSize: 1,
+		expiration: time.Hour, log: log})
+
+	res := func(pod string) pcommon.Map {
+		m := pcommon.NewMap()
+		m.PutStr("k8s.namespace.name", "prod")
+		m.PutStr("k8s.pod.name", pod)
+		return m
+	}
+	// ONE label combination, two pods. The cap binds on the second pod, which
+	// is the whole point: the label set is not what exhausted it.
+	lbls := labels{}.set("path", "/a")
+	for _, pod := range []string{"web-0", "web-1"} {
+		r := res(pod)
+		s.observe(lbls, 1, resourceAccum(r), r, nil)
+	}
+	if len(s.db) != 1 || s.drops.Capped() != 1 {
+		t.Fatalf("want one admitted series and one capped drop; db=%d capped=%d", len(s.db), s.drops.Capped())
+	}
+
+	line := buf.String()
+	if !strings.Contains(line, "web-1") {
+		t.Errorf("the cardinality warning must name the refused resource, or the operator cannot tell which pod lost the metric: %q", line)
+	}
+	if !strings.Contains(line, `labels="{path=\"/a\"}"`) && !strings.Contains(line, "path") {
+		t.Errorf("the warning must still name the label set: %q", line)
+	}
+	if !strings.Contains(line, "maxsize=1") {
+		t.Errorf("the warning must still quote the cap: %q", line)
 	}
 }

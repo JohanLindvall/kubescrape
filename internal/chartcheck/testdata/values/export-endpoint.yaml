@@ -1,11 +1,17 @@
 # The COLLECTORLESS arrangement the export section exists for: per-signal
 # destinations in agent.config while agent.otlp.endpoint keeps its default. The
-# derived -logs-exclude-namespaces must carry the release namespace AND every
-# in-cluster destination that receives ALL of the agent's output — the export
-# overrides' — or the agent tails the pods of the very gateway it ships to,
-# which amplifies exactly when that gateway is slow, at DISCOVERY, so nothing
-# counts and nothing warns. Reading only agent.otlp.endpoint (what the
-# derivation used to do) renders `monitoring` alone.
+# derived -logs-exclude-namespaces must carry the release namespace AND the
+# in-cluster namespace of the LOGS destination — here export.logs', which
+# REPLACES the base for that signal — or the agent tails the pods of the very
+# gateway it ships to, which amplifies exactly when that gateway is slow, at
+# DISCOVERY, so nothing counts and nothing warns. Reading only
+# agent.otlp.endpoint (what the derivation used to do) renders `monitoring`
+# alone.
+#
+# This fixture CANNOT see the opposite error — keeping the base alongside the
+# override — because its base is the default otel-collector.MONITORING and the
+# release namespace is monitoring too, so the two terms collapse under `uniq`.
+# export-logs-replaces-base.yaml is the fixture that separates them.
 #
 # The routing route below is the NEGATIVE half and the reason the golden reads
 # `monitoring,logging` and not `monitoring,logging,tenant-a`: a route is

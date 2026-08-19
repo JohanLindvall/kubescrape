@@ -70,9 +70,19 @@ service:
   # (see scrapeAuthSecrets below).
   # NOTE: honouring monitors cluster-wide means any namespace owner can direct
   # every agent's scrapes. Restrict which namespaces' monitors count with
-  # `extraArgs: [-monitor-namespaces=monitoring,platform]` — and note the
+  # `extraArgs: ["-monitor-namespaces=monitoring,platform"]` — and note the
   # allowlist behind scrapeAuthSecrets is derived from the monitors this gate
   # lets through.
+  # The QUOTES are load-bearing in that snippet: a plain scalar in a YAML flow
+  # sequence ends at the comma, so the unquoted form parses to TWO entries and
+  # renders `- -monitor-namespaces=monitoring` followed by a bare `- platform`.
+  # Neither binary inspects flag.Args(), so the stray positional is ignored AND
+  # terminates flag.Parse — every later extraArgs entry is then never parsed,
+  # including one that would otherwise exit 2 as undefined. The mis-parse fails
+  # CLOSED (a narrower allowlist) and the only trace is a Debug line plus
+  # kubescrape_monitor_namespace_refused_total, which is indistinguishable from
+  # the gate doing exactly what the operator believes they asked for. Quote (or
+  # write block style) any extraArgs value containing a comma.
   serviceMonitors: false
   # OTLP endpoint for the service's own self-metrics push.
   otlp:
@@ -370,6 +380,19 @@ agent:
   # which is a pipeline that is never scheduled rather than one that fails, so
   # no counter moves. The agent warns at startup naming whichever of the three
   # was asked for; nothing else would say so.
+  #
+  # IPv6: NODE_IP is status.hostIP, so on an IPv6 node this expands to a BARE
+  # IPv6 literal — https://fd00:10::5:10250 — which net/url refuses ("invalid
+  # port after host"), and all three kubelet pipelines would then fail every
+  # cycle on every node. The agent normalises it, re-forming the authority with
+  # net.JoinHostPort when the endpoint does not parse, so this one default is
+  # correct on IPv4 and IPv6 alike and needs no override. Do NOT "fix" it here
+  # by pre-bracketing: `https://[$(NODE_IP)]:10250` renders `[10.0.0.5]` on an
+  # IPv4 cluster, which Go rejects as an invalid IP-literal — one static value
+  # cannot spell both families, which is why the bracketing is code-side.
+  # Override only when the kubelet is not reachable at the node's hostIP (a
+  # separate management address, a name); write the host bracketed yourself
+  # then — https://[fd00:10::5]:10250.
   kubeletEndpoint: "https://$(NODE_IP):10250"
   kubeletInsecureTLS: true
 
@@ -395,15 +418,19 @@ agent:
       name: ""
       key: token
 
-  # null means "this release's namespace plus the namespace of every IN-CLUSTER
-  # destination that receives ALL of this agent's output" — agent.otlp.endpoint
-  # and each per-signal agent.config.export override (see the template): tailing
-  # the namespace the agent or one of those destinations runs in is a feedback
-  # loop that amplifies exactly when that destination is already struggling, and
-  # the namespaces differ whenever the endpoint default
-  # (otel-collector.monitoring) is kept in a release installed elsewhere — or
-  # whenever a collectorless export section ships a signal somewhere else
-  # entirely.
+  # null means "this release's namespace plus the namespace of the IN-CLUSTER
+  # LOGS destination that receives ALL of this agent's log output" — which is
+  # agent.config.export.logs.endpoint when that names one and agent.otlp.endpoint
+  # otherwise, exactly the way the agent itself resolves it (a non-empty
+  # per-signal endpoint REPLACES the base, it does not add to it). Tailing the
+  # namespace the agent or that destination runs in is a feedback loop that
+  # amplifies exactly when the destination is already struggling, and the
+  # namespaces differ whenever the endpoint default (otel-collector.monitoring)
+  # is kept in a release installed elsewhere — or whenever a collectorless
+  # export section ships the logs somewhere else entirely. A metrics or traces
+  # destination is deliberately NOT included: it receives nothing this flag can
+  # suppress, so excluding its namespace would stop collecting logs it never
+  # caused.
   #
   # agent.config.routing routes are NOT included: a route is selected BY
   # namespace, so per-tenant routing normally names the tenant's own namespace

@@ -269,7 +269,14 @@ Service selecting the pod with the same per-port analysis (including a
 `targetPort` name that matches no container port), every
 ServiceMonitor/PodMonitor endpoint's verdict, and the final target list
 exactly as `/v1/nodes/{node}/targets` would serve it — dedup and merges
-included. Always answers 200 with a JSON document (a missing pod is
+included. A target refused by the per-pod ceiling (`scrape.MaxPortsPerPod`, 16)
+is named where it was refused rather than reported as resolving: the port entry
+loses its `ports` and carries `port N is over the per-pod ceiling of 16 targets
+and is NOT scraped`, a monitor endpoint keeps its resolution and gains the same
+note, and the document's `cappedTargets` counts them — the same refusals
+`kubescrape_scrape_targets_capped_total` counts on the served path. The ceiling
+binds across every door at once, so a pod annotation and a Service each
+individually under it can still overflow together. Always answers 200 with a JSON document (a missing pod is
 `"found": false` plus a hint), so `curl -s .../v1/explain/team-a/api-6f9c…-x2 | jq .`
 is the whole workflow. Diagnostic and read-only: no counters move.
 
@@ -295,10 +302,17 @@ can even probe which secrets a monitor references. The token is compared in
 constant time, and `-scrape-auth-secrets` **without** `-scrape-auth-token-file`
 is a startup error — the service holds cluster-wide `secrets: get`, so an
 unauthenticated endpoint here would hand every referenced Secret key to
-anything that can open a connection to the service. The token file is re-read
-about once a minute, and after a change the previous token stays accepted for
-a 5-minute grace window — rotation is just updating the Secret; the service
-and the agents (which re-read on the same cadence) converge with no restarts.
+anything that can open a connection to the service. Rotation is just updating
+the Secret, and the two ends re-read on DIFFERENT cadences on purpose, because
+only one direction has a grace window. The RECEIVER — the service, whose accept
+set is `bearer.Rotating` — re-reads about once a SECOND (at request time;
+`bearer.DefaultRefreshInterval`, with `DefaultReadInterval`'s minute serving
+only as the idle ticker floor and the back-off after a FAILED read), so the
+direction no grace can cover — an agent whose projection updated first — costs
+one retryable 401, not a minute of them. The CLIENT — each agent's `bearer.File`
+copy of the token it presents — re-reads about once a minute, and that lag is
+what the 5-minute grace covers: after a change the PREVIOUS token stays accepted
+for it. Nothing has to flip in lockstep and nothing restarts.
 Every replica just reads the same file. The rest of the API stays
 unauthenticated: it carries no secret material and agents poll it constantly.
 
@@ -357,7 +371,7 @@ make build           # or: go build ./cmd/kubescrape
 | `-resync`       | `0`     | informer resync period (0 = watch stream only)                            |
 | `-servicemonitors` | `false` | serve targets for ServiceMonitor CRDs — plus PodMonitors when the cluster serves them (see above) |
 | `-scrape-auth-secrets` | `false` | serve the Secret keys monitor endpoints reference (`bearerTokenSecret`, `basicAuth`, `authorization.credentials`, `tlsConfig` ca/cert/keySecret) on `/v1/scrape-auth`; only keys some monitor actually names are served (requires `secrets get` RBAC **and** `-scrape-auth-token-file`) |
-| `-scrape-auth-token-file` | — | file holding the shared bearer token callers must present on `/v1/scrape-auth` (`Authorization: Bearer <token>`); mandatory with `-scrape-auth-secrets`; re-read per minute with a 5-minute grace for the previous token, so rotation needs no restarts |
+| `-scrape-auth-token-file` | — | file holding the shared bearer token callers must present on `/v1/scrape-auth` (`Authorization: Bearer <token>`); mandatory with `-scrape-auth-secrets`; the service re-reads its accept set about once a SECOND (`bearer.Rotating`) and each agent re-reads the token it presents about once a minute (`bearer.File`), with a 5-minute grace for the previous token covering that lag, so rotation needs no restarts |
 
 The service's own metrics are pushed over OTLP (`-self-metrics-interval`);
 the connection uses the agent's exporter flags: `-otlp-endpoint`,
@@ -385,9 +399,12 @@ are the most recent additions.
 
 `make image` builds a container image from the [Dockerfile](Dockerfile);
 `make test` and `make vet` run the test suite and static checks. `make check`
-runs the whole pre-merge story in one command — formatting, vet, lint, chart
+runs the pre-merge story in one command — formatting, vet, lint, chart
 lint (bootstrapping `helm` into `hack/bin` if needed), tests and the
-build-tag guard — and `make e2e` runs the kind-based end-to-end smoke test
+build-tag guard, which also compiles every variant's stub files. It runs the
+TESTS for the default tag set only; CI additionally runs them for the tag-less
+variant (`make build test TAGS=`) and runs `CGO_ENABLED=1 go test -race` over
+the concurrency-touching packages. `make e2e` runs the kind-based end-to-end smoke test
 ([hack/e2e.sh](hack/e2e.sh)): build and load the image, deploy the shipped
 manifests plus a debug collector, and assert readiness, target discovery, a
 container-ID lookup and telemetry arriving at the collector.
@@ -487,11 +504,14 @@ pause or drop) keeps one runaway pod from consuming the pipeline. Set
 `-logs-exclude-namespaces` to the observability namespace to avoid feeding
 the collector its own output. (The Helm chart does this for you: with
 `agent.logsExcludeNamespaces` left at its `null` default it excludes the
-release's own namespace plus, when an in-cluster Service is named as a LOGS
-destination — `agent.otlp.endpoint`, or `agent.config.export.logs.endpoint` —
-that Service's namespace. Only a logs destination counts: excluding a metrics
-or traces endpoint's namespace would drop logs it never caused. An explicit
-`[]` means exclude nothing.)
+release's own namespace plus the namespace of the ONE in-cluster LOGS
+destination: `agent.config.export.logs.endpoint` when that section names one,
+otherwise `agent.otlp.endpoint`. The override REPLACES the base for that signal
+(`otlpexport.ExportOverride.merged`), so with it set the flag endpoint is a
+metrics/traces-only address — with all three signals overridden, an address
+nothing dials at all — and its namespace must not be excluded either. Only a logs destination
+counts: excluding a metrics or traces endpoint's namespace would drop logs it
+never caused. An explicit `[]` means exclude nothing.)
 
 **Unified config file** (`-config`). All of the agent's YAML configuration
 lives in one file, passed with `-config`. Every section is optional, each
@@ -727,7 +747,15 @@ with the [logfmt](https://github.com/JohanLindvall/logfmt) reader — no
 booleans → bool). Because resource and scope attributes determine an OTLP
 record's grouping, records whose line-derived resource/scope attributes differ
 are split into distinct `ResourceLogs`/`ScopeLogs`. The same config applies to
-journald messages.
+journald entries, Kubernetes events and Azure diagnostic records — and, for
+`target: log` rules, to logs pushed to `-ingest`. The ingest exception is the
+grouping again: a pushed record already lives in the *sender's* resource, and
+writing a lifted resource/scope attribute there would stamp one record's value
+onto every record beside it. A `target: resource` lift still resolves for
+`logs.rules` keys and `logMetrics` labels on the ingest path, so a rule selects
+identically whether the line was tailed or pushed; it is just not written. A
+`target: scope` lift is dropped there entirely — neither written nor resolvable
+— so it has no effect on a pushed line.
 
 **Log-derived metrics** (`logMetrics` section). Rather than shipping every line,
 the agent can distill lines into metrics and export only those over OTLP. Each
@@ -738,8 +766,10 @@ record's enriched attributes and resource attributes (k8s metadata) first, then
 **straight from the log line's own JSON or logfmt fields** (dotted keys descend
 into nested JSON) — so a metric can read any field of the line with no separate
 `logAttributes` config. Series expire after `maxAge` of inactivity and are
-capped at `maxCardinality` unique label combinations (hard cap 10000). A
-histogram is one stored sample per label combination, carrying its whole
+capped at `maxCardinality` unique series — (resource, label-combination) pairs,
+so one set shared by every pod on the node divides that budget among them
+(hard cap 10000). A
+histogram is one stored sample per series, carrying its whole
 per-bucket distribution — but each bucket is still a slot in that sample and a
 series in every export, so a configuration whose `maxCardinality` x buckets
 would exceed 150000 bucket slots is rejected at startup.
@@ -876,8 +906,14 @@ monitor-discovered targets (the only format that carries native
 histograms) and converts native histograms to OTLP **exponential
 histogram** points; classic series in a protobuf response convert exactly
 as in text. A family carrying both native and classic data uses the native
-representation; custom-bucket histograms (schema −53) fall back to classic
-buckets. Targets that ignore the Accept header keep serving text (the parse
+representation. A custom-bucket message (NHCB, schema −53) whose bounds live in
+`custom_values` is REFUSED, not converted, and counted — `kubescrape_scrape_malformed_total`
+for a standalone one, `kubescrape_scrape_histogram_mixed_total{dropped="nhcb"}` for one
+sitting inside a native family: client_model v0.6.2, the version Prometheus itself pins,
+does not generate that field, so the bounds are unreachable and the only thing the classic
+path could ship is a correct count and sum beside a single bucket every `histogram_quantile`
+reads as nonsense. A message that ALSO carries classic `bucket` rows is not NHCB by that
+test and converts through the classic path as usual. Targets that ignore the Accept header keep serving text (the parse
 mode always follows the response Content-Type). Splitter-backed targets
 (kube-state-metrics style) take the protobuf path too — native points route
 through the same groupBy/enrichment machinery as every other kind.
@@ -885,7 +921,14 @@ through the same groupBy/enrichment machinery as every other kind.
 **Kubelet metrics.** With `-kubelet-endpoint` (e.g.
 `https://$(NODE_IP):10250`) the agent also scrapes, authenticated with its
 ServiceAccount token (`nodes/metrics` RBAC, see
-[deploy/agent.yaml](deploy/agent.yaml)):
+[deploy/agent.yaml](deploy/agent.yaml)). On an IPv6 node `status.hostIP`
+expands to a bare IPv6 literal (`https://fd00:10::5:10250`), which is not a
+parseable URL authority; the agent brackets the host itself, so the same value
+is correct on IPv4 and IPv6 and needs no per-family override. Do **not**
+pre-bracket it in a manifest — `[$(NODE_IP)]` renders `[10.0.0.5]` on IPv4,
+which Go rejects as an invalid IP-literal. An endpoint the agent cannot turn
+into a request is refused at startup (`-check-config` included) rather than
+failing every scrape cycle. The scrapes are:
 
 * **cadvisor** (`/metrics/cadvisor`): per-container cgroup metrics, split
   into one OTLP resource per pod and container. The `id` label (the cgroup
@@ -1075,14 +1118,37 @@ spans that could never have become an edge.
 For each pushed resource it finds a container ID (`container.id` /
 `k8s.container.id`, keys configurable) or a pod UID (`k8s.pod.uid`), resolves
 the metadata service (a container ID pins the exact incarnation), and merges
-the k8s resource attributes **without overwriting anything the sender already
-set**. Pushed log bodies additionally run the same line enrichment as the
+the k8s resource attributes: the sender stays authoritative about **itself**,
+so everything descriptive it declared is left as it was — **except the
+resolved identity keys** (`k8s.namespace.name`, `k8s.pod.name`, `k8s.pod.ip`,
+`k8s.node.name`, `k8s.container.name`, `container.name`), which this receiver
+has just read from the API server for that exact resource and which therefore
+overwrite whatever the sender claimed. That exception is a security boundary
+rather than tidiness: `routing` keys tenancy on `k8s.namespace.name`, so on a
+resource that resolves, a forged one never reaches the router. The keys the
+lookup was made *by* (`container.id` / `k8s.pod.uid`) and the sender's own
+OTLP service triple are exempt — the first has no independent truth to correct
+it with, the second is how a sender names itself. For the resources that do
+**not** resolve there is nothing to correct with, so the application-facing
+listeners *strip* those same keys at first receipt instead — a sender's
+identity claim dies at the door, counted
+`kubescrape_ingest_identity_stripped_total{key}` and logged at debug, since
+every conformant SDK declares its own pod and the removal is a routine
+correction rather than an alarm (see
+[OTLP ingest](docs/CONFIGURATION.md#agent-otlp-ingest), which also states the
+residual the strip does not close). Pushed log bodies additionally run the same line enrichment as the
 tailer (`-enrich`, filling only fields the sender left unset) — and the rest
 of the log chain reaches them too: `logScrubbing` redacts the bodies, and the
-same compiled `logMetrics` and `logs.rules` that serve the tailer observe and
-filter each ingested record (metrics before rules; a dropped record is still
-acked, and an all-dropped payload acks without a send), so one config selects
-identically however a line arrived. Line-derived processing is
+same compiled `logAttributes`, `logMetrics` and `logs.rules` that serve the
+tailer lift, observe and filter each ingested record (metrics before rules; a
+dropped record is still acked, and an all-dropped payload acks without a
+send), so one config selects identically however a line arrived — with the
+`logAttributes` exception above: only the `target: log` half is written here. One counting
+unit differs here and only here: a rules **drop** is tallied when the push is
+acked, so a retransmitted push does not count its drops twice, while a
+log-derived metric observes once per *receive attempt* — those records arrive
+already built in the sender's grouping, so there is no positional proof to
+deduplicate them against. Line-derived processing is
 sender-bounded (oversized bodies, over-wide or excess resources are skipped
 and counted in `kubescrape_ingest_log_chain_skipped_total{reason}`, the data
 still forwarded), and per-resource admission policy is the transforms file's
@@ -1091,7 +1157,10 @@ still forwarded), and per-resource admission policy is the transforms file's
 Metrics resolve per `-ingest-metrics-mode`: `resource` (the ID is a resource
 attribute), `datapoint` (the ID is a per-point label; points are split into
 one resource per object, as a kube-state-metrics-style stream needs), or
-`auto` (resource when every resource carries an ID, else split). With
+`auto` (resource when every resource carries an ID, else split). A split
+resource describes an object *other* than the sender, so there the resolved
+identity **replaces** the attributes copied from the sender's resource — the
+sender is authoritative about itself, not about the objects it reports on. With
 `-ingest-peer-ip-fallback` (opt-in), a resource carrying **no** ID at all is
 attributed to the pod owning the connection's source address (live,
 non-hostNetwork pods only, via `GET /v1/pod-ips/{ip}`) — so unmodified SDKs get
@@ -1107,11 +1176,29 @@ node-local, and each in-flight request holds its body plus the inflated pdata on
 the process that also tails the node's logs. Over the bound a sender is refused
 **retryably**, never dropped: HTTP `429` with `Retry-After: 1`, gRPC
 `ResourceExhausted` **with a `RetryInfo` detail** (without it, conformant
-senders read the code as permanent and discard the batch). Because a body is
-read (and a gRPC message decoded) *before* a slot is taken, a second bound —
+senders read the code as permanent and discard the batch). The count bounds
+*processing* and nothing else, so there are two further bounds. Because a body
+is read (and a gRPC message decoded) *before* a slot is taken, a second bound —
 64 MiB, or four times `-ingest-grpc-max-recv-bytes` when that flag lifts the
 per-message cap past it — caps the raw payload bytes both transports may buffer
-at once, refused the same retryable way. Refusals count into `kubescrape_ingest_rejected_total`.
+at once. And because a count cannot bound a size, a third caps the **decoded
+structure** at twice that (512 B per resource, 256 B per scope, 256 B per
+record/point/span): a legal 15.99 MiB body of 578 000 minimal `ResourceLogs`
+arrives as ~40 KiB gzipped and inflates about 16x, so the four full-size bodies
+the raw budget is designed to admit would be ~1 GiB of heap on a pod the chart
+limits to 512Mi. All three refuse the same retryable way and count into
+`kubescrape_ingest_rejected_total`. A single push whose structure alone exceeds
+the whole decoded budget — roughly 130 000 resources or 500 000 records, an
+order of magnitude past a batching SDK — is refused every time and logs a
+throttled warning naming the estimate, since "always 429" is otherwise
+indistinguishable from back-pressure; that sender must batch smaller. A body
+that NESTS deeper than 100 length-delimited levels is refused before it is
+decoded at all (`400` / gRPC `Internal`, counted
+`kubescrape_ingest_body_rejected_total{reason="too_deep"}`): pdata's decoder
+recurses without a limit of its own, so ~1.6 MiB of legal, well-inside-every-cap
+body is otherwise 128 MiB of goroutine stack for one decode. 100 wire levels is
+about 31 levels of nested attribute structure and is also protobuf's own
+portability limit, so nothing a real sender emits comes near it.
 
 **Trace sampling** (`traceSampling` section, on the trace tier). Received spans
 can be sampled before export: `probability` keeps that fraction of **traces**
@@ -1378,7 +1465,13 @@ it is a port of its own.
 
 **Metric filtering and splitting** (`metrics` section). This section has two
 subsections. `pipelines` holds ordered keep/drop rules per pipeline
-(`all`, `targets`, `cadvisor`, `node`) — first match wins, no match keeps;
+(`all`, `targets`, `cadvisor`, `node`, `summary` — the authoritative list is
+`filterPipelineNames` in `internal/agent/promscrape/filter.go`, and a typo'd
+name is refused at startup with that list in the error) — first match wins, no
+match keeps; `summary` is the `-kubelet-summary` pipeline and is the lever for
+its cardinality, most of which is one pod's volumes: a rule written under `node`
+compiles fine and never reaches it, and one written under `all` also hits the
+annotation-target, cadvisor and node pipelines;
 rules match the series name and label values with anchored regexes, so
 "drop `container_network_*` except `interface=eth0`" is a keep rule followed
 by a drop rule. `splitters` re-attribute targets whose series describe
@@ -1410,12 +1503,19 @@ also carry `k8s.pod.ip` as a resource attribute (accessible in templates as
 `.Pod.PodIP`; drop it via `resourceAttributes.disable` if unwanted).
 
 An optional `instancePrefix` prepends `prefix-` to the derived
-`service.instance.id`. It defaults to `cadvisor` for the cadvisor pipeline (and
-to the describing target's `service.name` for splitter rules) so that
-describing exporters — whose resources share the pod's `service.name`/namespace
-— don't collide with the pod's own self-scraped `target_info`. Set it per
-pipeline (or per splitter rule); `""` disables it. An explicit pipeline setting
-wins over the built-in default, which wins over a top-level `instancePrefix`.
+`service.instance.id`. It defaults to `cadvisor` for the cadvisor pipeline and
+to `summary` for the `-kubelet-summary` one (`defaultInstancePrefix` in
+`internal/agent/attrs/builder.go` is the authoritative pair), and to the
+describing target's `service.name` for splitter rules, so that describing
+exporters — whose resources share the pod's `service.name`/namespace — don't
+collide with the pod's own self-scraped `target_info`; the summary entry
+prevents the same clash one level up, its node resource carrying `service.name`
+`kubelet` and the node's name exactly as the `-node-metrics` scrape's does. So
+the summary node resource is `service.instance.id: summary-<node>` out of the
+box. Set it per pipeline (or per splitter rule); `""` disables it. An explicit
+pipeline setting wins over the built-in default, which wins over a top-level
+`instancePrefix` — so a top-level `instancePrefix: ""` does NOT strip the
+built-in `summary-`; only `pipelines.summary.instancePrefix: ""` does.
 
 * `resourceAttributes.enable` / `.disable` — anchored regex **lists** matched
   against the full attribute key. An attribute is exported when it matches the
@@ -1445,7 +1545,7 @@ wins over the built-in default, which wins over a top-level `instancePrefix`.
       container.image: '{{ with .Container }}{{ .Image }}{{ end }}'
       k8s.node.zone: '{{ with .Node }}{{ index .Labels "topology.kubernetes.io/zone" }}{{ end }}'
       service.name: '{{ with .Pod }}{{ coalesce (index .Labels "gp/service-name") (index .Labels "app.kubernetes.io/name") .Name }}{{ end }}'
-    pipelines:                # overrides for logs|targets|cadvisor|node|journal|ingest|self
+    pipelines:                # overrides for logs|targets|cadvisor|node|summary|journal|ingest|self
       node:
         attributes:
           service.name: kubelet
@@ -1489,7 +1589,9 @@ logs: |
 Every item also carries two verbs beyond mutation: `route("name")` sends its
 payload to a named `routing` route ahead of the namespace globs (the marker
 is reserved to scripts — a copy arriving on the wire is stripped and counted
-at ingest receipt), and
+at ingest receipt, as are the Kubernetes identity keys a sender declares about
+itself, under their own counter because every SDK sets those; see
+[OTLP ingest](docs/CONFIGURATION.md#agent-otlp-ingest)), and
 `emit_metric(name, value, labels)` observes into a **declared** `logMetrics`
 series (an undeclared name is a script error, as is a label named `le` on a
 histogram — it is generated from the histogram's own buckets). Scripts are predeclared `re`
@@ -1557,7 +1659,10 @@ client-go's klog output through the same handler.
 [charts/kubescrape](charts/kubescrape) deploys both components, exposing the
 commonly-tuned flags as values (everything else via `service.extraArgs` /
 `agent.extraArgs` — `-monitor-namespaces`, for instance, has no value of its
-own), and renders the `agent.config` value verbatim into the single mounted
+own; quote it when the value contains a comma, `extraArgs: ["-monitor-namespaces=monitoring,platform"]`,
+because unquoted the YAML flow sequence splits at the comma and the stray
+positional both is ignored and terminates `flag.Parse`, silently discarding
+every later entry), and renders the `agent.config` value verbatim into the single mounted
 `-config` file:
 
 ```sh

@@ -274,6 +274,44 @@ func TestConnectionStringPasswordIsVerbatim(t *testing.T) {
 	}
 }
 
+// TestParseTokenResponseExpiryBoundIsSafeInIntegerSpace pins the boundary the
+// float-space bound got wrong. float64(math.MaxInt64) rounds UP to exactly
+// 2^63, so the old ceiling (that value divided by float64(time.Second)) was
+// ITSELF unsafe: 9223372036.854776 — the single float64 the decimals around
+// 9223372036.8547758 round to — passed `secs <= maxTokenTTL`, multiplied back
+// to exactly 2^63, and converted to MinInt64 on amd64. The resulting expiry in
+// the year 1734 defeats BOTH halves of tokenSource.get: the refresh-margin
+// cache (a full IMDS/Entra exchange per franz-go SASL session) and the
+// stale-but-valid fallback (a transient token-endpoint blip then fails every
+// new Kafka connection). No output may be a negative duration.
+func TestParseTokenResponseExpiryBoundIsSafeInIntegerSpace(t *testing.T) {
+	for _, s := range []string{
+		"9223372036.8547758",   // the poison value: rounds to 2^63 nanoseconds
+		"9223372036.854775808", // the same float64, spelled exactly
+		"9223372036.8547763824",
+		`"9223372036.8547758"`, // IMDS's string shape takes the same path
+		"1e300",
+		"9223372037",
+	} {
+		_, ttl, err := parseTokenResponse([]byte(`{"access_token":"t","expires_in":`+s+`}`), "test")
+		if err != nil {
+			t.Fatalf("expires_in=%s errored: %v", s, err)
+		}
+		if ttl <= 0 {
+			t.Errorf("expires_in=%s gave ttl=%v; want the positive default", s, ttl)
+		}
+	}
+	// The widest ACCEPTED value still converts to a positive duration — the
+	// bound must reject only what overflows, not everything large.
+	_, ttl, err := parseTokenResponse([]byte(`{"access_token":"t","expires_in":9223372036}`), "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ttl <= 0 || ttl != time.Duration(9223372036*float64(time.Second)) {
+		t.Errorf("the widest accepted expires_in gave ttl=%v; want a positive ~292-year duration", ttl)
+	}
+}
+
 // A non-finite expires_in ("Inf"/"+Inf") must not become a negative TTL (which
 // would force a token refresh on every connection). Regression.
 func TestParseTokenResponseRejectsNonFiniteExpiry(t *testing.T) {

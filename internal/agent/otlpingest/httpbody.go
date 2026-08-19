@@ -148,11 +148,18 @@ const (
 	reasonEncoding  = "content_encoding"
 	reasonMalformed = "malformed"
 	reasonAborted   = "aborted"
+	// reasonTooDeep is the wire-SHAPE refusal (depth.go): a body inside every
+	// size cap whose nesting would recurse the decoder into an unbounded
+	// goroutine stack. It is its own reason rather than "malformed" because
+	// the body is not malformed at all — it decodes perfectly, which is the
+	// problem — and an operator seeing it is looking at a sender emitting
+	// something no conformant decoder accepts, or at an attack.
+	reasonTooDeep = "too_deep"
 )
 
 // bodyRejectReasons is the label set of obs.IngestBodyRejected, listed so the
 // throttle table is sized to it and so the reasons have one home.
-var bodyRejectReasons = []string{reasonTooLarge, reasonMedia, reasonEncoding, reasonMalformed, reasonAborted}
+var bodyRejectReasons = []string{reasonTooLarge, reasonMedia, reasonEncoding, reasonMalformed, reasonAborted, reasonTooDeep}
 
 // bodyRejectReason classifies a refusal for the counter's reason label. The
 // byte-budget refusal never reaches here: it is the receiver protecting itself
@@ -168,6 +175,8 @@ func bodyRejectReason(err error) string {
 		return reasonEncoding
 	case errors.Is(err, errClientAborted):
 		return reasonAborted
+	case errors.Is(err, errBodyTooDeep):
+		return reasonTooDeep
 	}
 	return reasonMalformed
 }
@@ -328,6 +337,15 @@ func (br *BodyReader) Read(r *http.Request) ([]byte, int64, error) {
 	}
 	if int64(len(buf)) > br.max {
 		return fail(br.tooLarge())
+	}
+	// The SHAPE check is the last thing at this door and the first thing that
+	// happens to the bytes: pdata's decoder recurses per nesting level with no
+	// bound of its own, so a body admitted by every size cap here can still
+	// take the process down inside UnmarshalProto (depth.go). It lives in the
+	// reader rather than in the handler so the trace tier's internal hop — the
+	// other user of this seam — cannot be left without it.
+	if err := checkNesting(buf); err != nil {
+		return fail(err)
 	}
 	return buf, bd.held, nil
 }

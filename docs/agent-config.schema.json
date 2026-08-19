@@ -1,6 +1,203 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "additionalProperties": false,
+  "definitions": {
+    "attrs.Config": {
+      "additionalProperties": false,
+      "properties": {
+        "attributes": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "type": "object"
+        },
+        "defaults": {
+          "type": "boolean"
+        },
+        "disable": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "enable": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "instancePrefix": {
+          "type": "string"
+        },
+        "pipelines": {
+          "additionalProperties": {
+            "$ref": "#/definitions/attrs.Config"
+          },
+          "type": "object"
+        },
+        "static": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "type": "object"
+        }
+      },
+      "type": "object"
+    },
+    "tailsample.PolicyConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "and": {
+          "additionalProperties": false,
+          "properties": {
+            "andSubPolicy": {
+              "items": {
+                "$ref": "#/definitions/tailsample.PolicyConfig"
+              },
+              "type": "array"
+            }
+          },
+          "type": "object"
+        },
+        "booleanAttribute": {
+          "additionalProperties": false,
+          "properties": {
+            "key": {
+              "type": "string"
+            },
+            "value": {
+              "type": "boolean"
+            }
+          },
+          "type": "object"
+        },
+        "composite": {
+          "additionalProperties": false,
+          "properties": {
+            "compositeSubPolicy": {
+              "items": {
+                "$ref": "#/definitions/tailsample.PolicyConfig"
+              },
+              "type": "array"
+            },
+            "maxTotalSpansPerSecond": {
+              "type": "number"
+            },
+            "policyOrder": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "rateAllocation": {
+              "items": {
+                "additionalProperties": false,
+                "properties": {
+                  "percent": {
+                    "type": "number"
+                  },
+                  "policy": {
+                    "type": "string"
+                  }
+                },
+                "type": "object"
+              },
+              "type": "array"
+            }
+          },
+          "type": "object"
+        },
+        "latency": {
+          "additionalProperties": false,
+          "properties": {
+            "threshold": {
+              "type": "string"
+            },
+            "upper": {
+              "type": "string"
+            }
+          },
+          "type": "object"
+        },
+        "name": {
+          "type": "string"
+        },
+        "numericAttribute": {
+          "additionalProperties": false,
+          "properties": {
+            "key": {
+              "type": "string"
+            },
+            "maxValue": {
+              "type": "integer"
+            },
+            "minValue": {
+              "type": "integer"
+            }
+          },
+          "type": "object"
+        },
+        "probabilistic": {
+          "additionalProperties": false,
+          "properties": {
+            "samplingPercentage": {
+              "type": "number"
+            }
+          },
+          "type": "object"
+        },
+        "rateLimiting": {
+          "additionalProperties": false,
+          "properties": {
+            "spansPerSecond": {
+              "type": "number"
+            }
+          },
+          "type": "object"
+        },
+        "statusCode": {
+          "additionalProperties": false,
+          "properties": {
+            "statusCodes": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            }
+          },
+          "type": "object"
+        },
+        "stringAttribute": {
+          "additionalProperties": false,
+          "properties": {
+            "cacheMaxSize": {
+              "type": "integer"
+            },
+            "enabledRegexMatching": {
+              "type": "boolean"
+            },
+            "invertMatch": {
+              "type": "boolean"
+            },
+            "key": {
+              "type": "string"
+            },
+            "values": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            }
+          },
+          "type": "object"
+        },
+        "type": {
+          "type": "string"
+        }
+      },
+      "type": "object"
+    }
+  },
   "description": "Unified agent configuration (the -config YAML). Generated from the Go config structs; regenerate with: go test ./cmd/kubescrape-agent -run TestConfigSchemaIsCurrent -update-config-schema. Structural only — semantic validation (regex compilation, duration strings, bounds) is -check-config's. See docs/CONFIGURATION.md for what the fields mean.",
   "properties": {
     "export": {
@@ -502,7 +699,9 @@
           "type": "string"
         },
         "pipelines": {
-          "additionalProperties": {},
+          "additionalProperties": {
+            "$ref": "#/definitions/attrs.Config"
+          },
           "type": "object"
         },
         "static": {
@@ -684,7 +883,9 @@
                 "additionalProperties": false,
                 "properties": {
                   "andSubPolicy": {
-                    "items": {},
+                    "items": {
+                      "$ref": "#/definitions/tailsample.PolicyConfig"
+                    },
                     "type": "array"
                   }
                 },
@@ -706,7 +907,9 @@
                 "additionalProperties": false,
                 "properties": {
                   "compositeSubPolicy": {
-                    "items": {},
+                    "items": {
+                      "$ref": "#/definitions/tailsample.PolicyConfig"
+                    },
                     "type": "array"
                   },
                   "maxTotalSpansPerSecond": {

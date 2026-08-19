@@ -77,7 +77,11 @@ var (
 			"direction to be wrong in: under-claiming only inflates, while over-claiming would destroy "+
 			"observations invisibly. The residual skew is a `sample` rule, whose verdict is a per-filter "+
 			"counter rather than a function of the bytes — after a rewind the re-read samples a DIFFERENT set "+
-			"of lines, and the drops are attributed to the pass that first put those bytes through the chain.")
+			"of lines, and the drops are attributed to the pass that first put those bytes through the chain. "+
+			"The -ingest path holds the same line by a different mechanism, and its unit is per DELIVERY: the "+
+			"tally is staged while the chain runs and applied only once the push is ACKED, so the retransmits "+
+			"of a NACKed push cost nothing — but a push whose ack is LOST is redelivered and recounted, which "+
+			"no receiver can dedupe.")
 	// MonitorFieldsIgnored counts ServiceMonitor/PodMonitor upserts carrying
 	// endpoint fields kubescrape does not interpret — the metric form of the
 	// startup warning, so a partially-applied CR is alertable and not just
@@ -308,13 +312,26 @@ var (
 	// happened; scraped minus dropped is now the number that reaches the
 	// collector.
 	ScrapeSamplesDropped = Registry.CounterVec("kubescrape_scrape_samples_dropped_total",
-		"Parsed samples discarded before conversion, by pipeline and by what discarded them: filter = the config's metrics keep/drop rules, relabel = a monitor's metricRelabelings.", "pipeline", "reason")
+		"Parsed samples that never became data points, by pipeline and by what discarded them. filter (the "+
+			"config's metrics keep/drop rules) and relabel (a monitor's metricRelabelings) discard a sample "+
+			"BEFORE it can become a data point and are the operator's own decision, so a rate on either is the "+
+			"config working. accumulator is refused INSIDE the conversion and is not: one histogram/summary "+
+			"family exceeded maxFamilyAccBytes, the 16 MiB of accumulators the converter may RETAIN for a "+
+			"single family — the bound that keeps a target exposing one such family across ~900k label sets "+
+			"from OOM-killing the agent while its scrape still records outcome ok. Nobody asked for that drop, "+
+			"so unlike the other two it also carries a per-target warn, and any rate on it means a target is "+
+			"losing well-formed series. A dashboard filtering the two config reasons hides the only one that "+
+			"reports a refusal of OURS.",
+		"pipeline", "reason")
 	SummaryUnresolved = Registry.CounterVec("kubescrape_summary_unresolved_total",
 		"Objects in the kubelet's /stats/summary that the metadata service could not place, by the LEVEL of "+
 			"the object: `pod` (no pod of that namespace and name, or one whose UID neither matches nor MIRRORS "+
 			"the UID the kubelet reported — a static pod's kubelet-minted UID is proved against the mirror pod's "+
 			"kubernetes.io/config.mirror or config.hash annotation, and a pod merely REUSING the name carries "+
-			"neither) and `container` (the pod resolved, but the summary named a container it does not list). "+
+			"neither) and `container` (the container's resource carries no container.id, so it does not line up "+
+			"with the cadvisor row for the same container: its pod could not be placed, or the pod was placed "+
+			"and the container was not — a name the cached pod document does not list, or one it lists from the "+
+			"pod SPEC whose status has not reached the API server yet). "+
 			"Counted once per OBJECT per scrape, never per data point — a pod with four statistics is one "+
 			"unplaceable pod. The statistics are still exported, carrying the identity the payload itself gave "+
 			"them, so nothing is lost; what an unplaceable object loses is the JOIN, since a series with no pod "+
@@ -358,45 +375,80 @@ var (
 // OTLP ingest (agent).
 var (
 	// IngestRejected counts pushes refused for exceeding one of the receiver's
-	// admission bounds: the concurrently-processed count, or the raw payload
-	// bytes both transports may buffer while reading and decoding. They are
-	// retryable and the sender still holds the payload, but a persistently
-	// non-zero rate means the node cannot keep up with what is being pushed at
-	// it.
+	// THREE admission bounds: the concurrently-processed count, the raw payload
+	// bytes both transports may buffer while reading and decoding, and the
+	// estimated DECODED structure those bytes inflate into. They are retryable
+	// and the sender still holds the payload, but a persistently non-zero rate
+	// means the node cannot keep up with what is being pushed at it.
+	//
+	// The help enumerates all three because it is the only description the
+	// series has, and the three take DIFFERENT operator responses — the one
+	// knob an operator reaches for first (-ingest-max-in-flight) does nothing
+	// at all for the other two.
 	IngestAdmissionRejected = Registry.Counter("kubescrape_ingest_admission_rejected_total",
 		"Pushed RESOURCES the transforms file's ingest admission hook (ingest: admit(resource)) rejected — "+
 			"removed before enrichment, push still acked. The hook is the operator's per-sender policy on "+
 			"listeners nothing authenticates; a script error fails OPEN (the resource is admitted) and counts "+
 			"into kubescrape_transform_errors_total{signal=\"ingest\"} instead.")
 	IngestBodyRejected = Registry.CounterVec("kubescrape_ingest_body_rejected_total",
-		"OTLP/HTTP request bodies refused at the receiver's door, before anything was decoded, by reason. FOUR "+
-			"of the five describe a request that is WRONG, so the sender must change something before a retry "+
-			"can work: too_large (413, over the receiver's cap in either the compressed or the decompressed "+
-			"direction), media_type (415, a Content-Type that is not application/x-protobuf), content_encoding "+
-			"(400, a Content-Encoding that is neither gzip nor identity) and malformed (400, a body that would "+
-			"not decompress, or bytes that are not a valid OTLP payload). Each of those carries a throttled Warn "+
-			"naming the peer, which on a listener nothing authenticates is the only way to tell a misconfigured "+
-			"sender apart from a probe. `aborted` is the ODD ONE OUT and carries no Warn: the client went away "+
-			"mid-upload (a killed pod, a rolled deployment, an SDK export timeout), so nothing was wrong with "+
-			"the request and the retry is exactly what happens next — a rolling deployment would otherwise log "+
+		"OTLP request bodies refused at the receiver's door, before anything was decoded, by reason. Every "+
+			"reason but one is the OTLP/HTTP door's alone — media_type, content_encoding and aborted have no "+
+			"gRPC equivalent at all, and that arm's own size and decode failures are grpc-go's to answer — but "+
+			"the family is NOT HTTP-only: too_deep is counted from BOTH transports, the gRPC codec being the "+
+			"one hook that runs before pdata's decoder does. FIVE of the six describe a request "+
+			"that is WRONG, so the sender must change something before a retry can work: too_large (413, over "+
+			"the receiver's cap in either the compressed or the decompressed direction), media_type (415, a "+
+			"Content-Type that is not application/x-protobuf), content_encoding (400, a Content-Encoding that "+
+			"is neither gzip nor identity), malformed (400, a body that would not decompress, or bytes that are "+
+			"not a valid OTLP payload) and too_deep (400 on HTTP, gRPC Internal from the codec: a body inside "+
+			"every SIZE cap whose length-delimited NESTING passes 100 levels, which pdata's decoder — it has no "+
+			"recursion limit of its own — would follow into an unbounded goroutine stack. It is deliberately "+
+			"NOT malformed: the body decodes perfectly, which is the problem). Each of those carries a "+
+			"throttled Warn, naming the peer on the HTTP arm — which on a listener nothing authenticates is the "+
+			"only way to tell a misconfigured sender apart from a probe — while the gRPC codec runs with no "+
+			"peer in hand and names the depth bound instead. `aborted` is the ODD ONE OUT and carries no "+
+			"Warn: the client went away mid-upload (a killed pod, a rolled deployment, an SDK export timeout), "+
+			"so nothing was wrong with the request and the retry is exactly what happens next — a rolling "+
+			"deployment would otherwise log "+
 			"one accusation per evicted pod. It is answered 503, deliberately neither 400 nor 408. Also "+
 			"deliberately SEPARATE from kubescrape_ingest_rejected_total, which is the receiver protecting "+
-			"ITSELF (in-flight or byte-budget back-pressure) and is retryable as sent. Only the APPLICATION-"+
+			"ITSELF (its in-flight count, its raw byte budget or its decoded-structure budget) and is "+
+			"retryable as sent. Only the APPLICATION-"+
 			"facing listeners feed this family: the trace tier runs its authenticated internal hop in the same "+
 			"process, and folding sibling-shard traffic in would put bearer-authenticated pushes into the series "+
 			"an operator reads as \"somebody out there is pushing wrong\" — a failed hop is already one "+
 			"kubescrape_service_graph_sends_failed_total on the SENDING shard, where the peer is known.", "reason")
 	IngestChainSkipped = Registry.CounterVec("kubescrape_ingest_log_chain_skipped_total",
-		"Ingested log RECORDS or RESOURCES whose line-derived processing (body enrichment, log-metrics "+
-			"observation) was skipped by an abuse bound — the data itself is still forwarded. Reasons: "+
-			"body_too_large (one record whose body's text view exceeds 1 MiB; the tailer never feeds lines past "+
-			"-logs-max-entry-bytes either, and attribute/severity-keyed rules still apply), resource_too_wide "+
-			"(one resource with more than 64 attributes — the metric store retains a serialization of the whole "+
-			"resource per series, so sender-chosen width is sender-chosen retained heap), resources_capped (a "+
-			"resource past the first 256 of one push). The listeners are unauthenticated; a nonzero rate is a "+
+		"Ingested log RECORDS or RESOURCES on which PART of the line-derived chain was skipped by an abuse "+
+			"bound — the data itself is always still forwarded. WHICH part is what the reason says, and the two "+
+			"halves are not interchangeable: debugging the wrong one is the cost of reading this as a single "+
+			"thing. body_too_large is per RECORD (a body whose text view exceeds 1 MiB; the tailer never feeds "+
+			"lines past -logs-max-entry-bytes either) and skips everything that READS the line — the "+
+			"logAttributes lift, body enrichment, and the content half of the log-metric labels and of the "+
+			"keep/drop rules, both of which still run on the record's attributes and severity, the record still "+
+			"being observed with an empty line. resource_too_wide (a resource carrying more than 64 attributes "+
+			"— the metric store retains a serialization of the whole resource per series, so sender-chosen "+
+			"width is sender-chosen retained heap) and resources_capped (a resource past the first 256 of one "+
+			"push) are per RESOURCE and skip the log-metrics OBSERVATION only: enrichment, the lift and the "+
+			"rules run in full on every record of such a resource, which is also why neither can move at all "+
+			"unless a logMetrics section is configured. The listeners are unauthenticated; a nonzero rate is a "+
 			"sender worth finding.", "reason")
 	IngestRejected = Registry.Counter("kubescrape_ingest_rejected_total",
-		"Pushed OTLP requests refused because a receiver admission bound was reached — concurrent in-flight pushes or buffered payload bytes (retryable: 429 / ResourceExhausted).")
+		"Pushed OTLP requests refused because a receiver admission bound was reached (retryable: 429 / "+
+			"ResourceExhausted — the payload is intact and the sender owns the retry). THREE bounds feed "+
+			"this one series and they bound different things, so read the metric with all three in mind: "+
+			"the CONCURRENT PUSH COUNT (-ingest-max-in-flight) bounds how many pushes are processed at "+
+			"once and bounds no memory at all; the RAW BYTE BUDGET bounds the payload bytes both "+
+			"transports hold while reading and decoding (four full-size bodies, scaled up in step with "+
+			"-ingest-grpc-max-recv-bytes); and the DECODED BUDGET (decodedSize's estimate against "+
+			"decodedBudgetFactor x the raw budget) bounds what those bytes inflate INTO, which the other "+
+			"two cannot — pdata's decoded structure runs several times the wire size, so a body inside "+
+			"every size cap can still be the thing that fills the node. Raising -ingest-max-in-flight or "+
+			"the body cap therefore does nothing for a decoded-budget refusal. One case is retryable in "+
+			"FORM but permanent in PRACTICE and is the reason this counter can sit at a steady rate from "+
+			"one sender: a single push whose decoded structure alone estimates past the whole decoded "+
+			"budget is refused on every retry — it carries a throttled Warn naming the estimate and the "+
+			"budget, and the fix is for that sender to batch smaller, never a larger bound here.")
 	IngestReserveExpired = Registry.Counter("kubescrape_ingest_reserve_expired_total",
 		"gRPC pre-decode buffer reservations reclaimed because the peer sent no message inside the decode "+
 			"window; the reclaim also cancels that stream (the sender sees Canceled, which OTLP lists as "+
@@ -410,7 +462,31 @@ var (
 			"before any routing glob, so a wire-supplied copy would steer the payload onto any configured "+
 			"route and its tenant headers) or the transform engine's drop marker (whose presence-only prune "+
 			"would delete the element and count it as an operator-intended transform drop whenever a script "+
-			"for that signal is active). The data itself is still forwarded, minus the reserved key.", "key")
+			"for that signal is active). The data itself is still forwarded, minus the reserved key. Any "+
+			"rate here is a sender shipping a key nothing but kubescrape has a reason to set, i.e. one "+
+			"worth finding — which is why the sender's own IDENTITY keys, which every conformant SDK "+
+			"sets, are counted separately as kubescrape_ingest_identity_stripped_total.", "key")
+	IngestIdentityStripped = Registry.CounterVec("kubescrape_ingest_identity_stripped_total",
+		"Resource-attribute occurrences removed at first receipt because a sender DECLARED its own "+
+			"Kubernetes identity to an application-facing listener, by key — k8s.namespace.name and the "+
+			"pod/node/container keys a resolved lookup overwrites anyway. This is an EXPECTED condition, "+
+			"not an accusation: a workload instrumented by the OpenTelemetry Operator sets several of "+
+			"these on every push, so a healthy cluster moves this counter continuously and there is "+
+			"nothing here to alert on. It is deliberately not kubescrape_ingest_reserved_stripped_total, "+
+			"whose keys are kubescrape's own plumbing markers and where any rate at all is a sender worth "+
+			"finding. The strip exists because internal/agent/route keys TENANCY on k8s.namespace.name "+
+			"and these listeners authenticate nothing, so a declared namespace would choose another "+
+			"tenant's endpoint and headers; enrichment owns the same keys for a resource it resolves, and "+
+			"a resource it cannot resolve has no correction available. The data itself is still "+
+			"forwarded, minus the key — and service.name, service.namespace and service.instance.id are "+
+			"left to the sender. What the strip does NOT close, stated so this counter is not mistaken "+
+			"for a closed question: the lookup keys (container.id, k8s.pod.uid) are exempt because "+
+			"stripping them would disable attribution entirely, and the metadata service's "+
+			"/v1/pods/{ns}/{name} is unauthenticated while its container index is cluster-wide — so a "+
+			"sender that reads another pod's container id and declares no namespace of its own is "+
+			"RESOLVED into that pod's namespace and routed to its tenant. Nothing on the wire is "+
+			"forged there, so nothing is stripped and this counter does not move. Authenticating the "+
+			"listener or the metadata service is what closes it.", "key")
 	IngestEmptyMetricsDropped = Registry.Counter("kubescrape_ingest_empty_metrics_dropped_total",
 		"Pushed metrics removed at first receipt because they carried no data points. An empty metric is "+
 			"legal OTLP, so nothing downstream rejects one: it would ride enrichment, the split regrouping, "+
@@ -575,7 +651,25 @@ var (
 // OTLP ingest (agent).
 var (
 	Ingested = Registry.CounterVec("kubescrape_ingest_resources_total",
-		"Distinct pushed identities (container id / pod uid, memoized per request) by enrichment outcome. enriched = an id resolved; peer_ip = no id, attributed by the connection's source address; peer_ip_rejected = that address resolved to the RECEIVER's own workload, so it was rewritten in flight (a proxy, a mesh sidecar, or an internal hop addressed to the application port) and nothing was attributed — anything above zero means peer-IP attribution cannot work on that path; unresolved = nothing identified the sender; split_capped = the push exceeded what one payload may inflate into — either its distinct-object count (maxSplitGroups) or the bytes those per-object resource copies would cost (maxSplitCopyBytes) — so the remainder shares the sender's resource unenriched rather than costing one full resource copy each.", "outcome")
+		"RESOURCES by enrichment outcome — the resource being the unit enrichment is APPLIED to, which is not "+
+			"the same denominator on both paths and cannot be. On the resource path (all logs, all traces, "+
+			"-ingest-metrics-mode=resource, and an auto push not demoted to split) it is one count per PUSHED "+
+			"ResourceLogs/ResourceMetrics, so five resources naming one container id count five even though the "+
+			"metadata lookup behind them ran once: the lookup memoises per request, the counter deliberately "+
+			"does not, or the series could not say how much of a push went unattributed. On the "+
+			"datapoint/split path it is one count per DISTINCT DESCRIBED OBJECT per request, that being what "+
+			"the splitter mints a resource for. So read it as resources enriched, never as senders and never "+
+			"as metadata lookups (kubescrape_metadata_requests_total counts those). enriched = an id resolved; "+
+			"peer_ip = no id, attributed by the connection's source address; peer_ip_rejected = that address "+
+			"resolved to the RECEIVER's own workload, so it was rewritten in flight (a proxy, a mesh sidecar, "+
+			"or an internal hop addressed to the application port) and nothing was attributed — anything above "+
+			"zero means peer-IP attribution cannot work on that path; unresolved = nothing identified the "+
+			"object the resource describes, which is the SENDER on the resource path but a DESCRIBED OBJECT on "+
+			"the split path, where the sender's own resource may have resolved perfectly; split_capped = the "+
+			"push exceeded what one payload may inflate into — either its distinct-object count "+
+			"(maxSplitGroups) or the bytes those per-object resource copies would cost (maxSplitCopyBytes) — "+
+			"so the remainder shares the sender's resource unenriched rather than costing one full resource "+
+			"copy each.", "outcome")
 	ExportRejected = Registry.CounterVec("kubescrape_export_rejected_records_total",
 		"Records the collector REJECTED inside a payload it otherwise accepted (OTLP partial_success), by signal. "+
 			"The export succeeded, so every producer advanced its offset, cursor or position past them — these are "+

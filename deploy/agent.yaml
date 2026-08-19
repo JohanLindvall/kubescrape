@@ -98,6 +98,21 @@ spec:
             # -cadvisor=false or -node-metrics=false. Empty here makes all
             # three a no-op — never scheduled rather than failing, so no
             # counter moves — which the agent warns about at startup.
+            #
+            # IPv6: NODE_IP is status.hostIP (below), so on an IPv6 node this
+            # expands to a BARE IPv6 literal — https://fd00:10::5:10250 —
+            # which net/url refuses ("invalid port after host"), and all three
+            # kubelet pipelines would then fail every cycle on every node. The
+            # agent normalises it, re-forming the authority with
+            # net.JoinHostPort when the endpoint does not parse, so this one
+            # line is correct on IPv4 and IPv6 alike. Do NOT pre-bracket it
+            # here: `https://[$(NODE_IP)]:10250` renders `[10.0.0.5]` on an
+            # IPv4 cluster, which Go rejects as an invalid IP-literal — one
+            # static value cannot spell both families, which is why the
+            # bracketing is code-side. Edit this only when the kubelet is not
+            # reachable at the node's hostIP (a separate management address, a
+            # name); write the host bracketed yourself then —
+            # https://[fd00:10::5]:10250.
             - -kubelet-endpoint=https://$(NODE_IP):10250
             # The kubelet's THIRD endpoint, /stats/summary — JSON rather than
             # Prometheus exposition.

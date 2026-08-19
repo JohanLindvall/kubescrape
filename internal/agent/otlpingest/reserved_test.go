@@ -9,6 +9,8 @@ package otlpingest
 import (
 	"bytes"
 	"context"
+	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -315,7 +317,12 @@ func TestSanitizeCleanLogsIsAllocationFree(t *testing.T) {
 	if testrace.Enabled {
 		t.Skip("the race detector's bookkeeping allocations make the ceiling meaningless")
 	}
-	s := NewServer(ServerConfig{ReservedAttrs: testReserved()})
+	// The production shape has BOTH resource lists non-empty — the plumbing
+	// marker and the enricher's identity keys — so the clean walk probes each
+	// resource twice over.
+	ra := testReserved()
+	ra.Identity = NewEnricher(Config{}).SenderIdentityStrip()
+	s := NewServer(ServerConfig{ReservedAttrs: ra})
 	ld := plog.NewLogs()
 	for i := 0; i < 2; i++ {
 		rl := ld.ResourceLogs().AppendEmpty()
@@ -328,5 +335,52 @@ func TestSanitizeCleanLogsIsAllocationFree(t *testing.T) {
 	}
 	if got := testing.AllocsPerRun(100, func() { s.sanitizeLogs(ld) }); got != 0 {
 		t.Errorf("sanitizing a clean payload allocates %.1f times, want 0", got)
+	}
+}
+
+// The identity strip fires for HONEST senders on every push — an
+// OpenTelemetry-Operator-instrumented pod ships several of these keys on every
+// resource — so its throttle must not be consulted unless the Debug line it
+// gates would actually be written. logdedupe.Table.Allow is a process-wide
+// mutex plus a map lookup, and Table.Len is how "was it consulted?" is
+// observable: a consulted table holds the key.
+//
+// The plumbing sibling (stripReserved) deliberately keeps the opposite order —
+// its keys are ones no conformant sender sets, so it essentially never probes.
+func TestIdentityStripSkipsTheThrottleWhenDebugIsOff(t *testing.T) {
+	ra := ReservedAttrs{Identity: []string{"k8s.pod.name", "k8s.namespace.name"}}
+
+	identity := func() plog.Logs {
+		ld := plog.NewLogs()
+		a := ld.ResourceLogs().AppendEmpty().Resource().Attributes()
+		a.PutStr("k8s.pod.name", "claimed")
+		a.PutStr("k8s.namespace.name", "payments")
+		return ld
+	}
+
+	// Info: the line is discarded, so the throttle must never be touched — and
+	// the counter, which is the observable, must still move.
+	s := NewServer(ServerConfig{
+		ReservedAttrs: ra,
+		Logger:        slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelInfo})),
+	})
+	before := obs.IngestIdentityStripped.WithLabelValues("k8s.pod.name").Value()
+	s.sanitizeLogs(identity())
+	if got := s.reservedWarns.Len(); got != 0 {
+		t.Errorf("the identity strip consulted its throttle %d time(s) with Debug off", got)
+	}
+	if got := obs.IngestIdentityStripped.WithLabelValues("k8s.pod.name").Value() - before; got != 1 {
+		t.Errorf("kubescrape_ingest_identity_stripped_total moved %v, want 1: the counter is the observable and must not depend on the log level", got)
+	}
+
+	// Debug: the throttle is still what keeps one chatty sender from minting a
+	// line per push, so it must be consulted then.
+	s = NewServer(ServerConfig{
+		ReservedAttrs: ra,
+		Logger:        slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelDebug})),
+	})
+	s.sanitizeLogs(identity())
+	if got := s.reservedWarns.Len(); got != 2 {
+		t.Errorf("the identity strip claimed %d throttle slot(s) with Debug on, want 2", got)
 	}
 }

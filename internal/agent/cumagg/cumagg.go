@@ -49,6 +49,7 @@ import (
 	"time"
 
 	"github.com/JohanLindvall/kubescrape/internal/agent/transform"
+	"github.com/JohanLindvall/kubescrape/internal/obs"
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/pmetric"
 )
@@ -322,6 +323,13 @@ func (st *Store[S]) Render(res pcommon.Resource, now time.Time) pmetric.Metrics 
 	res.CopyTo(rm.Resource())
 	sm := rm.ScopeMetrics().AppendEmpty()
 	sm.Scope().SetName(st.opt.Scope)
+	// The version is the build's, exactly as every other producer stamps it —
+	// there is no per-aggregator knob because there is nothing per-aggregator
+	// about it. Withholding it here made the two trace-tier families
+	// (traces.span.metrics.*, traces_service_graph_*) the only kubescrape
+	// payloads carrying otel_scope_version="", so a query grouping by that
+	// label silently excluded them from every release.
+	sm.Scope().SetVersion(obs.ScopeVersion)
 
 	st.opt.Render(sm, now)
 	sm.Metrics().RemoveIf(noDataPoints)

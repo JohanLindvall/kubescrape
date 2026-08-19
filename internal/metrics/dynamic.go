@@ -86,8 +86,12 @@ type Dynamic struct {
 	ResourceLabels []string `json:"resourceLabels,omitempty"`
 	// Buckets are the histogram boundaries (histogram type only).
 	Buckets []float64 `json:"buckets,omitempty"`
-	// MaxCardinality caps unique label combinations (default/hard cap 10000);
-	// MaxAge expires idle series (a Go duration, default/cap 24h).
+	// MaxCardinality caps unique SERIES — (resource, label-combination) pairs,
+	// not label combinations alone: the log line's resource attributes are part
+	// of a series' identity, so one agent-wide set shared by every pod on the
+	// node divides ONE pool of this size among the pods a rule matches
+	// (default/hard cap 10000). MaxAge expires idle series (a Go duration,
+	// default/cap 24h).
 	MaxCardinality int    `json:"maxCardinality,omitempty"`
 	MaxAge         string `json:"maxAge,omitempty"`
 	// LabelPrefix is prepended to every set label name.

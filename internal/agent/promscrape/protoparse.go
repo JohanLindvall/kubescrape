@@ -501,6 +501,25 @@ func roundCount(f float64) (uint64, bool) {
 	return uint64(math.Round(f)), true
 }
 
+// bucketPopulation is the number of observations a native histogram's buckets
+// carry — the quantity OTLP requires the point's count to equal. false on
+// overflow: a population that does not fit a uint64 cannot be expressed by any
+// valid point, so the caller refuses the point as malformed rather than
+// shipping a wrapped one, which is roundCount's own discipline.
+func bucketPopulation(zero uint64, pos, neg []uint64) (uint64, bool) {
+	total := zero
+	for _, counts := range [2][]uint64{pos, neg} {
+		for _, v := range counts {
+			sum := total + v
+			if sum < total {
+				return 0, false
+			}
+			total = sum
+		}
+	}
+	return total, true
+}
+
 // addNativeHistogram appends one exponential histogram point to the
 // batcher; false = undecodable, or a value no valid OTLP point can carry
 // (counted malformed by the caller).
@@ -541,6 +560,31 @@ func (s *Scraper) addNativeHistogram(cb chunker, name string, meta metricMeta, l
 	if !ok {
 		return false
 	}
+	// OTLP requires count == zero_count + sum(positive) + sum(negative), and on
+	// the FLOAT encoding nothing upstream of here can hold it: the sample count,
+	// the zero count and every absolute bucket count go through roundCount
+	// INDEPENDENTLY, so a message that is CONSISTENT on the wire
+	// (sample_count_float: 1, positive_count: [0.5, 0.5]) converts to count=1
+	// against buckets [1 1] — buckets claiming twice the observations their
+	// declared population has. The overclaim is not a ±1 artifact either: it
+	// scales with the number of buckets, up to ~2x the population. This is the
+	// exponential sibling of the [run, total] clamp fillHistogramPoint applies
+	// so the classic shape holds the identity BY CONSTRUCTION.
+	//
+	// The reconciliation is ONE-DIRECTIONAL and must stay so. Raising count to
+	// the population its buckets carry is the conservative reading — a
+	// population cannot be smaller than what was observed into it — while
+	// lowering it (or clamping the buckets down, the classic path's move) would
+	// destroy a legitimate shape: a NaN observation increments a Prometheus
+	// histogram's count without entering any bucket (client_golang's own
+	// validateCount permits population <= count for exactly that reason), so
+	// count > bucket sum is the TARGET's truth passed through faithfully, not
+	// something to repair here.
+	population, ok := bucketPopulation(zero, pos, neg)
+	if !ok {
+		return false
+	}
+	count = max(count, population)
 	// A native histogram carries its exemplars on the family message rather
 	// than per bucket; they are point-scoped either way.
 	var exemplars []Exemplar

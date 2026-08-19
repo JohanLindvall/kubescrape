@@ -413,11 +413,33 @@ func (sb *summaryBatcher) scope(t summaryTarget) summaryScope {
 		// unresolved cadvisor row for the same object produces. Consistency in both
 		// states is the point: resolved or not, the two rows are built by one
 		// function from the same inputs.
-		if resolved, _ := sb.s.fillIdentityResource(sb.ctx, res, t.ident); !resolved {
-			switch t.level {
-			case levelPod:
+		resolved, _ := sb.s.fillIdentityResource(sb.ctx, res, t.ident)
+		switch t.level {
+		case levelPod:
+			if !resolved {
 				sb.unresolved.pods++
-			case levelContainer:
+			}
+		case levelContainer:
+			// The container level is counted on the ABSENCE of container.id, not
+			// on `resolved`, because container.id is exactly what the join is
+			// made of: attrs.Identity derives service.instance.id from it when it
+			// is there and from <pod uid>/<name> when it is not, while the
+			// cadvisor row for the same container always has the id — so a
+			// resource without one does not line up with anything, which is the
+			// loss this counter and the warning below both describe.
+			//
+			// `resolved` alone reports only ONE of the three ways to get here (a
+			// pod the service could not place) and stays TRUE for the other two:
+			// resolveContext stamps k8s.container.name and returns true for a
+			// placed pod whose document does not name the container, and returns
+			// true again for a container the document DOES name from the pod spec
+			// but whose status has not reached the API server yet — kubemeta
+			// builds Containers from the spec with status folded in, so that one
+			// has an empty ID and attrs.Container writes no container.id. That
+			// last shape is the ~1s start-up window (widened to podMetaCacheTTL by
+			// this scraper's own cache), i.e. the common case, and a name-miss
+			// test would not see it at all.
+			if _, ok := res.Attributes().Get("container.id"); !ok {
 				sb.unresolved.containers++
 			}
 		}
@@ -553,11 +575,16 @@ func (sb *summaryBatcher) report() {
 	}
 	if u := sb.unresolved; u.pods+u.containers > 0 {
 		// Counted per OBJECT, not per point, and split by which kind of object:
-		// the two have different causes (a pod the service has not seen, versus a
-		// pod it has whose container name is not in it) and the log line below
-		// says it once for the whole process. A condition nobody can alert on is
-		// a condition nobody knows about — the closest sibling is
-		// kubescrape_cgroup_unresolved_total, which exists for exactly this.
+		// `pod` is a pod the metadata service could not place at all, `container`
+		// is a container whose resource carries no container.id — which happens
+		// BOTH when its pod could not be placed (so the two labels do move
+		// together for that cause) and when the pod was placed while the
+		// container was not: an ephemeral container the cached document predates,
+		// or the start-up window where the container is listed from the spec with
+		// no status yet. See scope(); the log line below says it once for the
+		// whole process. A condition nobody can alert on is a condition nobody
+		// knows about — the closest sibling is kubescrape_cgroup_unresolved_total,
+		// which exists for exactly this.
 		if u.pods > 0 {
 			obs.SummaryUnresolved.WithLabelValues(levelPod).Add(float64(u.pods))
 		}

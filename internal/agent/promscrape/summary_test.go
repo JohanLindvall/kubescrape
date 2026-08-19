@@ -1276,9 +1276,11 @@ func TestSummaryRecreatedPodDoesNotLendItsIdentity(t *testing.T) {
 // has to be able to ALERT on it: the log line is said once per process, so
 // without a counter a fleet-wide metadata outage is invisible from the
 // monitoring side. Counted per OBJECT — a pod with four statistics is one
-// unplaceable pod, not four — and split by level, which is what distinguishes a
-// pod the service has never seen from a pod it has whose container name is not
-// in it.
+// unplaceable pod, not four — and split by level: `pod` is a pod the service
+// could not place, `container` a container whose resource carries no
+// container.id, which an unplaceable pod always implies (so the two do move
+// together here) and a placed pod can still cause on its own — see
+// TestSummaryUnresolvedCountsAContainerWhosePodResolved.
 func TestSummaryUnresolvedObjectsAreCounted(t *testing.T) {
 	beforePods := obs.SummaryUnresolved.WithLabelValues(levelPod).Value()
 	beforeCtrs := obs.SummaryUnresolved.WithLabelValues(levelContainer).Value()
@@ -1354,5 +1356,104 @@ func TestSummarySampleCountIsBeforeFiltering(t *testing.T) {
 	}
 	if want := float64(got) - dropped; want != float64(kept) {
 		t.Errorf("scraped(%d) - dropped(%v) = %v, but %d points reached the collector", got, dropped, want, kept)
+	}
+}
+
+// startingPodMetaSource answers for ns1/pod1 with a document that LISTS the
+// container the summary reports and has no ID for it. That is not a contrived
+// shape: kubemeta builds Pod.Containers from the pod SPEC with the status
+// folded in, so between a container starting and its status reaching the API
+// server (widened to podMetaCacheTTL by this scraper's own cache) the document
+// names it with an empty ID — the common way a summary container fails to
+// carry the container.id its join is made of.
+type startingPodMetaSource struct{}
+
+func (startingPodMetaSource) PodByName(_ context.Context, namespace, name string) (*kubemeta.Pod, error) {
+	if namespace != "ns1" || name != "pod1" {
+		return nil, notFound()
+	}
+	p := pod1Meta
+	p.Containers = []kubemeta.Container{
+		{Name: "app", ID: appCID, Image: "img:1"},
+		{Name: "starting", Image: "img:2"}, // declared, not yet running: no ID
+	}
+	return &p, nil
+}
+
+func (startingPodMetaSource) Container(context.Context, string, time.Duration) (*kubemeta.ContainerMetadata, error) {
+	return nil, notFound()
+}
+
+// TestSummaryUnresolvedCountsAContainerWhosePodResolved is the pin for what
+// level="container" means.
+//
+// The counter used to be driven by fillIdentityResource's `resolved` alone,
+// which answers about the POD: it is true whenever the pod was placed, however
+// little of the container was. So the two labels always moved together and the
+// container half could not report the case it exists for — a container of a pod
+// the service HAS, which the service could not place. The join really is lost
+// there (no container.id, so service.instance.id is cadvisor-<uid>/<name> while
+// the cadvisor row for the same container carries cadvisor-<id>), nothing else
+// reports it, and an operator alerting on the counter saw a flat zero.
+//
+// Both ways of getting there are pinned, because they are not the same input:
+// a name the document does not carry at all, and a name it carries with no ID.
+func TestSummaryUnresolvedCountsAContainerWhosePodResolved(t *testing.T) {
+	body := func(container string) []byte {
+		return []byte(`{"pods":[{"podRef":{"name":"pod1","namespace":"ns1","uid":"` + uid1 + `"},
+		  "containers":[
+		    {"name":"app","rootfs":{"usedBytes":100,"inodesUsed":1}},
+		    {"name":"` + container + `","rootfs":{"usedBytes":200,"inodesUsed":3}}
+		  ]}]}`)
+	}
+	cases := []struct {
+		name      string
+		meta      MetaSource
+		container string
+	}{
+		{"name-the-pod-document-does-not-list", &fakeMetaSource{}, "sidecar"},
+		{"listed-from-the-spec-with-no-status-yet", startingPodMetaSource{}, "starting"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			beforePods := obs.SummaryUnresolved.WithLabelValues(levelPod).Value()
+			beforeCtrs := obs.SummaryUnresolved.WithLabelValues(levelContainer).Value()
+
+			exp := &captureExporter{}
+			s := newSummaryScraper(t, "http://unused", c.meta, exp)
+			pts := flattenSummary(convertFixture(t, s, exp, body(c.container)))
+
+			var missed, placed map[string]any
+			for _, p := range pts {
+				switch p.res["k8s.container.name"] {
+				case c.container:
+					missed = p.res
+				case "app":
+					placed = p.res
+				}
+			}
+			if missed == nil || placed == nil {
+				t.Fatalf("both containers must still be EXPORTED (placed=%v missed=%v)", placed, missed)
+			}
+			// Not vacuous: the pod resolved, and its resolvable container joins.
+			if placed["container.id"] != appCID || placed["service.name"] != "dep1" {
+				t.Fatalf("the resolvable container did not resolve, so the counts below measure nothing: %v", placed)
+			}
+			if d := obs.SummaryUnresolved.WithLabelValues(levelPod).Value() - beforePods; d != 0 {
+				t.Errorf("unresolved pods counted %v, want 0: the pod itself resolved", d)
+			}
+			if d := obs.SummaryUnresolved.WithLabelValues(levelContainer).Value() - beforeCtrs; d != 1 {
+				t.Errorf("unresolved containers counted %v, want 1 — the container the service could not place is the case this label documents", d)
+			}
+			// And the loss it stands for: no container.id, so the instance is not
+			// the one the cadvisor row for this container carries.
+			if id, ok := missed["container.id"]; ok {
+				t.Fatalf("the unplaceable container gained a container.id (%v), so there would be nothing to count", id)
+			}
+			if want := "cadvisor-" + uid1 + "/" + c.container; missed["service.instance.id"] != want {
+				t.Errorf("instance = %v, want %v (the shape that does not join the cadvisor row's cadvisor-<id>)",
+					missed["service.instance.id"], want)
+			}
+		})
 	}
 }

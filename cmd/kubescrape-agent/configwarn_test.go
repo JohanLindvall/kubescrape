@@ -5,9 +5,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/JohanLindvall/kubescrape/internal/agent/route"
 	"github.com/JohanLindvall/kubescrape/internal/agent/tailbuffer"
 	"github.com/JohanLindvall/kubescrape/internal/agent/tailsample"
 	"github.com/JohanLindvall/kubescrape/internal/agent/tracesample"
+	"github.com/JohanLindvall/kubescrape/internal/agent/transform"
+	"github.com/JohanLindvall/kubescrape/pkg/logattrs"
 )
 
 // withServiceGraph turns the trace tier on for the duration of a test: the
@@ -261,5 +264,74 @@ func TestInertTraceSamplingSectionWarns(t *testing.T) {
 				t.Fatalf("warned: %q", got)
 			}
 		})
+	}
+}
+
+// attrRules builds a logAttributes section of one rule.
+func attrRules(key, attr string, tgt logattrs.Target) agentConfig {
+	return agentConfig{LogAttributes: &logattrs.Config{
+		Rules: []logattrs.Rule{{Key: key, Attribute: attr, Target: tgt}},
+	}}
+}
+
+// The two plumbing markers are NOT honoured in the same place, so a single
+// `target: resource` gate could only ever be right for one of them: the router
+// reads route.ScriptMarker off a RESOURCE, while the transform prune reads
+// transform.DropMarker off the log RECORD — which is logattrs' DEFAULT target.
+// The old gate warned exactly where the drop marker is inert (asserting a
+// deletion no prune can perform there) and was silent on the placement that
+// deletes records.
+func TestLogAttributesPlumbingWarningFollowsWhereTheMarkerIsHonoured(t *testing.T) {
+	// The default target — what an operator writing no `target:` gets, and
+	// where every matching record is deleted once any logs: script is loaded.
+	got := warnText(attrRules("dbg", transform.DropMarker, ""))
+	if !strings.Contains(got, transform.DropMarker) || !strings.Contains(got, "DELETES") {
+		t.Fatalf("a default-target lift into the drop marker must warn that records are deleted: %q", got)
+	}
+	if !strings.Contains(got, "kubescrape_transform_dropped_total") {
+		t.Fatalf("the warning must name the counter the loss is charged to: %q", got)
+	}
+	// Spelled out, the same thing must warn identically.
+	if same := warnText(attrRules("dbg", transform.DropMarker, logattrs.TargetLog)); same != got {
+		t.Fatalf("an explicit `target: log` must warn exactly as the default does:\n%q\n%q", same, got)
+	}
+
+	// On a resource the prune never looks, so the warning must NOT claim the
+	// deletion — that clause was the false half of the old message.
+	res := warnText(attrRules("dbg", transform.DropMarker, logattrs.TargetResource))
+	if strings.Contains(res, "DELETES") {
+		t.Fatalf("no prune reads the drop marker off a resource; the warning must not assert it: %q", res)
+	}
+	if !strings.Contains(res, "inert") {
+		t.Fatalf("a reserved marker where nothing reads it should still be named, as inert: %q", res)
+	}
+
+	// The route marker is the mirror image: honoured on the resource only.
+	rt := warnText(attrRules("tenant", route.ScriptMarker, logattrs.TargetResource))
+	if !strings.Contains(rt, "route marker") || !strings.Contains(rt, "tenant headers") {
+		t.Fatalf("a resource lift into the route marker must warn about the destination it chooses: %q", rt)
+	}
+	if lg := warnText(attrRules("tenant", route.ScriptMarker, logattrs.TargetLog)); strings.Contains(lg, "route marker") {
+		t.Fatalf("the router never reads its marker off a record; that warning must not claim routing: %q", lg)
+	}
+
+	// And an ordinary attribute stays silent whatever the target.
+	for _, tgt := range []logattrs.Target{"", logattrs.TargetLog, logattrs.TargetScope, logattrs.TargetResource} {
+		if q := warnText(attrRules("level", "log.level", tgt)); strings.Contains(q, "log.level") {
+			t.Fatalf("target %q: an ordinary lift must not warn: %q", tgt, q)
+		}
+	}
+}
+
+// The identity half keeps its resource-only scope: routing keys on the
+// RESOURCE's k8s.namespace.name and series identity is the resource's, so the
+// same key lifted onto a record forges nothing.
+func TestLogAttributesIdentityWarningStaysResourceScoped(t *testing.T) {
+	got := warnText(attrRules("ns", "k8s.namespace.name", logattrs.TargetResource))
+	if !strings.Contains(got, "RESOLVED-IDENTITY") {
+		t.Fatalf("a resource lift into a resolved-identity attribute must warn: %q", got)
+	}
+	if lg := warnText(attrRules("ns", "k8s.namespace.name", logattrs.TargetLog)); strings.Contains(lg, "RESOLVED-IDENTITY") {
+		t.Fatalf("a record-target lift of an identity key forges nothing and must not warn: %q", lg)
 	}
 }

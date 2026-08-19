@@ -23,9 +23,12 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 
+	"github.com/JohanLindvall/kubescrape/internal/obs"
+	"github.com/JohanLindvall/kubescrape/internal/scrape"
 	"github.com/JohanLindvall/kubescrape/pkg/kubemeta"
 )
 
@@ -239,5 +242,51 @@ func TestExplainReportsARepeatedOfferAsAlreadyFolded(t *testing.T) {
 		if want := "already folded in through an earlier Service"; !strings.Contains(em.Note, want) {
 			t.Errorf("repeat verdict note = %q, want it to say %q", em.Note, want)
 		}
+	}
+}
+
+// Parity is about the VERDICTS, not about the telemetry: /v1/explain derives
+// through the same targetDedup as nodeTargets, and the package comment, README
+// and CLAUDE.md all promise it "moves no obs counters". It leaked exactly one —
+// the ceiling refusal inside targetDedup.add, which the two sibling decision
+// signals on this same derivation (obs.TargetIdentityCollisions via
+// reportInstanceCollision, obs.MonitorTargetShadowed via the auth-conflict
+// report) escape only because explain does not CALL them. The counter is
+// per-derivation on the served path, so a dashboard or an operator following
+// the metric's own help text ("see /v1/explain for the pod") manufactured a
+// rate that tracked how often the question was asked.
+//
+// The served half is asserted beside it: the suppression must be the
+// diagnostic's, not the counter's retirement.
+func TestExplainMovesNoCappedCounterWhileTheServedPathStillDoes(t *testing.T) {
+	const endpoints = 20
+	eps := make([]any, 0, endpoints)
+	for i := 0; i < endpoints; i++ {
+		eps = append(eps, map[string]any{"port": "http", "path": "/m" + strconv.Itoa(i)})
+	}
+	monitors := newMonitorIndex(t, "sm-many", eps)
+	s, srv := capFixture(t, nil, monitorSelectedService(), monitors)
+
+	before := obs.ScrapeTargetsCapped.Value()
+	var doc explainDoc
+	for i := 0; i < 3; i++ {
+		getJSON(t, srv.URL+"/v1/explain/default/web-1", http.StatusOK, &doc)
+	}
+	if moved := obs.ScrapeTargetsCapped.Value() - before; moved != 0 {
+		t.Errorf("three /v1/explain requests moved kubescrape_scrape_targets_capped_total by %v; it must move none", moved)
+	}
+	// ... and the document still reports every refusal, which is what the
+	// counter's help text sends the operator here for.
+	if want := endpoints - scrape.MaxPortsPerPod; doc.CappedTargets != want {
+		t.Errorf("doc.cappedTargets = %d, want %d", doc.CappedTargets, want)
+	}
+
+	// The control: one real derivation counts the same refusals.
+	before = obs.ScrapeTargetsCapped.Value()
+	if _, ok := s.nodeTargets("node1"); !ok {
+		t.Fatal("nodeTargets returned not-ok")
+	}
+	if moved, want := obs.ScrapeTargetsCapped.Value()-before, float64(endpoints-scrape.MaxPortsPerPod); moved != want {
+		t.Errorf("the served derivation moved the capped counter by %v, want %v", moved, want)
 	}
 }

@@ -1,0 +1,24 @@
+# `export.logs.endpoint` REPLACES the flag base for the logs signal
+# (otlpexport.ExportOverride.merged), so the base is a metrics/traces-only
+# address here and its namespace must NOT be excluded: this flag governs which
+# namespaces are TAILED, and a destination that receives no logs has nothing to
+# feed itself with. The derived -logs-exclude-namespaces must therefore read
+# `monitoring,logging` — the release namespace plus the LOGS destination's —
+# and never mention `observability`.
+#
+# The base endpoint's namespace is deliberately NEITHER the release namespace
+# NOR the logs override's. export-endpoint.yaml cannot see this: its base is the
+# default otel-collector.MONITORING, which is also the namespace every fixture
+# renders into (chartcheck_test.go), so the release-namespace term and the base
+# term collapse under `uniq` and an over-broad derivation renders identically to
+# a correct one. Every pod in the over-excluded namespace is dropped at
+# DISCOVERY, where nothing counts and nothing warns, so this golden is the only
+# place that failure is visible at all.
+agent:
+  otlp:
+    endpoint: otel-collector.observability.svc:4317
+  config:
+    export:
+      logs:
+        endpoint: http://loki-gateway.logging.svc:4318
+        protocol: http

@@ -324,6 +324,16 @@ type splitBatcher struct {
 	// closed set, but putSplitLabels ran the regex per label per data point.
 	ruleMemo map[string]*compiledSplitRule
 	dropMemo map[dropKey]bool
+	// memoBytes is the key text those two memos hold alive, bounded by
+	// maxMemoBytes — filterSession's budget, for the identical reason and with
+	// the identical failure mode. Their entry caps bound how MANY names are
+	// remembered, and a count is not a memory bound: both keys are text the
+	// TARGET chooses (a series name, a label name), capped only by the parser's
+	// line bound, and the memos deliberately survive reset() so they accumulate
+	// for the whole scrape while the chunks around them flush normally. ONE
+	// budget for the batcher, because it is the batcher's retained heap that
+	// matters and either memo alone can spend it.
+	memoBytes int
 }
 
 // dropKey memoizes one rule's dropLabels verdict on one label name.
@@ -413,8 +423,9 @@ func (b *splitBatcher) route(name string, labels []Label) (splitDest, *compiledS
 	rule, ok := b.ruleMemo[name]
 	if !ok {
 		rule = b.sp.ruleFor(name)
-		if len(b.ruleMemo) < maxTrackedFamilies {
+		if len(b.ruleMemo) < maxTrackedFamilies && b.memoBytes+len(name) <= maxMemoBytes { // bound the per-scrape memo
 			b.ruleMemo[name] = rule
+			b.memoBytes += len(name)
 		}
 	}
 	b.vals = b.vals[:0]
@@ -655,8 +666,9 @@ func (b *splitBatcher) dropped(rule *compiledSplitRule, name string) bool {
 	verdict, ok := b.dropMemo[key]
 	if !ok {
 		verdict = rule.dropLabels.MatchString(name)
-		if len(b.dropMemo) < maxInternedValues {
+		if len(b.dropMemo) < maxInternedValues && b.memoBytes+len(name) <= maxMemoBytes { // bound the per-scrape memo
 			b.dropMemo[key] = verdict
+			b.memoBytes += len(name)
 		}
 	}
 	return verdict

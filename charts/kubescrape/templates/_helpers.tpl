@@ -58,15 +58,20 @@ endpoint, or renders empty when the endpoint does not name an in-cluster
 Service. It takes the endpoint STRING as its context (with or without a scheme,
 port or path).
 
-It is the feedback-loop guard's one derivation, used by agent.yaml for the
-UNCONDITIONAL destinations the chart renders — the -otlp-endpoint flag and each
-per-signal `agent.config.export` override — because every log line the agent
-tails goes to those, including the destination's own, and that amplifies
-precisely when the destination is already struggling. It lived inline beside the
-flag and so covered only the flag: a collectorless
+It is the feedback-loop guard's one derivation, used by agent.yaml for the ONE
+in-cluster LOGS destination the chart renders — `agent.config.export.logs.endpoint`
+when it names one, otherwise the -otlp-endpoint flag, mirroring
+`otlpexport.ExportOverride.merged`, where a non-empty per-signal endpoint REPLACES
+the base rather than adding to it — because every log line the agent tails goes
+there, including the destination's own, and that amplifies precisely when the
+destination is already struggling. It lived inline beside the flag and so covered
+only the flag: a collectorless
 `export.logs.endpoint: http://loki-gateway.logging.svc:4318` reopened exactly the
 loop the default exists to close, silently, since files are skipped at DISCOVERY
-and nothing counts or warns.
+and nothing counts or warns. Reading BOTH is the mirror-image error and just as
+silent: with `export.logs` set the flag base is a metrics/traces-only address
+(with all three signals overridden, one nothing dials), so excluding its
+namespace stops collecting logs it never caused.
 
 `agent.config.routing` routes are deliberately NOT read here. A route is SELECTED
 BY namespace, so its endpoint receives only the namespaces its globs match, and

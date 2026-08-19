@@ -1298,15 +1298,27 @@ func (p *pipelines) startIngest(ctx context.Context) error {
 		MaxRecvBytes: *ingestGRPCMaxRecv,
 		Enricher:     enr,
 		Exporter:     p.out,
-		// Wire-supplied copies of kubescrape's plumbing keys die at receipt
+		// Wire-supplied copies of kubescrape's plumbing keys — and of the
+		// resolved-identity keys this receiver derives itself — die at receipt
 		// (ingestReservedAttrs): the router and the transform prune cannot
-		// tell them from kubescrape's own.
-		ReservedAttrs: ingestReservedAttrs(),
+		// tell them from kubescrape's own, and neither can routing tell a
+		// forged namespace from a resolved one.
+		ReservedAttrs: ingestReservedAttrs(enr),
 		// The operator's cost levers reach pushed logs too: the same compiled
 		// logs.rules chain and the same logMetrics set the tailer, journald,
 		// events and Azure producers run — one config, one behavior, however
 		// the line arrived.
+		//
+		// logAttributes rides along for the same reason, and it is the one that
+		// makes the other two agree with the tailer: a rule that RENAMES a line
+		// key (`attribute:` != `key:`, the documented canonical use) is what a
+		// rule or a metric label then selects on, so without the extractor here
+		// an allowlist ruleset silently DISCARDED pushed records the tailer
+		// keeps. The receiver applies the `target: log` half only — see
+		// ServerConfig.LogAttrs for why the resource and scope halves must not
+		// be written onto a grouping the sender owns.
 		Rules:      p.journalRules,
+		LogAttrs:   p.logAttrs,
 		LogMetrics: p.logMetrics,
 		Logger:     p.log,
 	}
@@ -1336,24 +1348,45 @@ func (p *pipelines) startIngest(ctx context.Context) error {
 	return nil
 }
 
-// ingestReservedAttrs is the reserved-plumbing strip list every
-// APPLICATION-FACING receiver wires — the DaemonSet's ingest listeners
-// (startIngest) and the trace tier's application ports
-// (startServiceGraphIngest); the tier's internal receiver is
-// kubescrape-to-kubescrape and deliberately not on it. Both consumers of
-// these keys are presence-only and cannot tell kubescrape's own mark from a
-// sender's: the router honors route.ScriptMarker on a RESOURCE before its
-// namespace globs, so a wire-supplied copy selects any configured route and
-// that route's tenant headers, and the transform prune deletes any ELEMENT
-// carrying transform.DropMarker whenever a script for its signal is active,
-// counting it as an operator-intended drop. The lists are minimal and true —
-// the router never reads its marker off an element, so ScriptMarker is NOT in
-// Element. One derivation, for enricherBase's reason: spelling it twice is
-// how the two receivers drift.
-func ingestReservedAttrs() otlpingest.ReservedAttrs {
+// ingestReservedAttrs is the strip list every APPLICATION-FACING receiver
+// wires — the DaemonSet's ingest listeners (startIngest) and the trace tier's
+// application ports (startServiceGraphIngest); the tier's internal receiver is
+// kubescrape-to-kubescrape and deliberately not on it.
+//
+// It has two halves, and only the first is about kubescrape's own PLUMBING.
+// Both consumers of those keys are presence-only and cannot tell kubescrape's
+// own mark from a sender's: the router honors route.ScriptMarker on a RESOURCE
+// before its namespace globs, so a wire-supplied copy selects any configured
+// route and that route's tenant headers, and the transform prune deletes any
+// ELEMENT carrying transform.DropMarker whenever a script for its signal is
+// active, counting it as an operator-intended drop. Those lists are minimal
+// and true — the router never reads its marker off an element, so ScriptMarker
+// is NOT in Element.
+//
+// The second half is the sender's IDENTITY CLAIM (Enricher.SenderIdentityStrip,
+// which owns the argument): on a listener with no credentials, a pod declaring
+// someone else's k8s.namespace.name has its records routed to that tenant's
+// endpoint under that tenant's headers, and the k8s.pod.*/k8s.node.name/
+// container.* siblings are the keys a resolved lookup overwrites anyway. It is
+// asked of the ENRICHER rather than spelled here because the strip runs BEFORE
+// enrichment, so it must exclude this receiver's own lookup keys — stripping
+// those would resolve nothing at all, which is the trap in "strip every
+// identity key".
+//
+// It rides ReservedAttrs.Identity rather than being appended to Resource,
+// because the two are not the same event: a plumbing marker on the wire is a
+// key only kubescrape has a reason to set, while these are what every
+// conformant SDK ships — appending them to Resource gave a healthy cluster a
+// climbing kubescrape_ingest_reserved_stripped_total and a throttled Warn per
+// key accusing honest senders of shipping kubescrape's plumbing.
+//
+// One derivation, for enricherBase's reason: spelling it twice is how the two
+// receivers drift.
+func ingestReservedAttrs(enr *otlpingest.Enricher) otlpingest.ReservedAttrs {
 	return otlpingest.ReservedAttrs{
 		Resource: []string{route.ScriptMarker},
 		Element:  []string{transform.DropMarker},
+		Identity: enr.SenderIdentityStrip(),
 	}
 }
 
@@ -1385,7 +1418,21 @@ func (p *pipelines) startScraper(ctx context.Context) *promscrape.Scraper {
 	// The endpoint gates all three kubelet scrapes: with it empty they are not
 	// disabled, they are never scheduled. configWarnings names that, because
 	// nothing else can — no counter moves for a scrape that never ran.
-	kubeletScrapes := *kubeletEndpoint != "" && (*cadvisorOn || *nodeOn || *summaryOn)
+	//
+	// NORMALISED once, here, because this is the one place the flag is read: an
+	// IPv6 host arrives bare from `https://$(NODE_IP):10250` (status.hostIP,
+	// which the chart and the shipped manifests both use, and which cannot be
+	// pre-bracketed without breaking every IPv4 cluster) and every request
+	// built from it would be refused by net/url before it went out. An error is
+	// unreachable at a real start — run() calls validateConfig, which refuses
+	// the same value first — so the raw string is kept rather than silently
+	// substituted: that keeps the failure the loud per-cycle scrape error it
+	// already is instead of turning it into a pipeline that is never scheduled.
+	kubeletEP, err := kubeletBase(*kubeletEndpoint)
+	if err != nil {
+		kubeletEP = *kubeletEndpoint
+	}
+	kubeletScrapes := kubeletEP != "" && (*cadvisorOn || *nodeOn || *summaryOn)
 	var sc0 *promscrape.Scraper
 	if *metricsOn || kubeletScrapes {
 		var targetHook func([]kubemeta.ScrapeTarget) []kubemeta.ScrapeTarget
@@ -1406,7 +1453,7 @@ func (p *pipelines) startScraper(ctx context.Context) *promscrape.Scraper {
 			HealthMetrics:  *healthMetrics,
 			DisableTargets: !*metricsOn,
 			Kubelet: promscrape.KubeletConfig{
-				Endpoint:       *kubeletEndpoint,
+				Endpoint:       kubeletEP,
 				Cadvisor:       *cadvisorOn,
 				DisableRollups: !*rollupsOn,
 				NodeMetrics:    *nodeOn,

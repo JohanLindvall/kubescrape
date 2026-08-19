@@ -2,14 +2,28 @@ package otlpingest
 
 // Admission control for the unauthenticated ingest listeners.
 //
-// There are TWO resources to bound, and one semaphore cannot bound both:
+// There are THREE resources to bound, and no one bound covers another:
 //
 //   - PROCESSING (Server.inFlight, -ingest-max-in-flight): enrichment, the
-//     inflated pdata and the forward. A slot is held for as long as the
+//     forward, and the wall-clock a slot is held for — as long as the
 //     collector takes to ack.
 //   - BUFFERING (byteBudget below): the RAW payload bytes a request holds
 //     while it is being read off the wire and decoded, before any of that
 //     processing starts.
+//   - the DECODED pdata (decodedBudget below): what the bytes inflate INTO,
+//     which is neither of the other two and is the one that decides whether
+//     the container lives.
+//
+// The third was missing, and this file used to claim the count covered it
+// ("the far more expensive resource (inflated pdata)"). It does not: a COUNT
+// cannot bound a size. Measured through the real HTTP handler, a legal
+// 15.99 MiB logs body of 578 000 minimal ResourceLogs (40 KiB gzipped)
+// inflates 16x, to ~256 MiB of live heap; the byte budget deliberately admits
+// FOUR full-size bodies, so the shape it is designed to allow is ~1 GiB of
+// heap on a pod the chart limits to 512Mi — an OOM-kill of the node's whole
+// agent, bought with ~160 KiB of unauthenticated traffic, repeatable into
+// CrashLoopBackOff. The inflation is a property of SHAPE, not of size: the
+// same 16 MiB carrying a realistic 60 000-record batch inflates 1.12x.
 //
 // The count bound alone does not bound buffering. The HTTP handlers read the
 // whole body (up to maxIngestBody) BEFORE taking a slot — deliberately, because
@@ -22,7 +36,7 @@ package otlpingest
 // push until its bytes are already resident, and nothing caps how many
 // connections do that at once (MaxConcurrentStreams is PER CONNECTION).
 //
-// The budget is global across both transports because the memory is: one
+// The budgets are global across both transports because the memory is: one
 // process, one heap. A refusal is always RETRYABLE (429 + Retry-After, or
 // ResourceExhausted carrying RetryInfo) — the sender still holds the payload,
 // which is what makes shedding better than accepting it and running the node
@@ -30,6 +44,39 @@ package otlpingest
 // rejected for the same reason the slot was moved off the read path: it sheds
 // on the wrong axis, punishing a hundred idle keep-alives and letting four busy
 // ones allocate without limit.
+//
+// WHAT THE DECODED BUDGET CHARGES, and what it deliberately leaves to the other
+// two, since the split is the whole design (decodedLogsSize and its two
+// siblings, one per signal — there is deliberately no `decodedSize(any)`
+// dispatcher: see the note on WHERE the charge is taken, below):
+//
+//   - STRUCTURE — one heap object per resource, scope, record/point/span — is
+//     charged here, because it is exactly what the raw budget cannot see: 30
+//     wire bytes can mint a ResourceLogs, and the ratio between the two is
+//     unbounded from the receiver's side.
+//   - CONTENT (the strings a decode copies out of the body) is NOT charged
+//     here, because it is bounded transitively and charging it twice would
+//     shed honest senders: on HTTP the raw body is charged to the byte budget
+//     for the SAME lifetime (the release is deferred to the handler's return),
+//     and content measures ~1.8x the wire bytes it came from, so 64 MiB of
+//     admitted body is ~115 MiB of strings. On gRPC the message buffer is
+//     freed by the codec at decode, and what remains is bounded by the
+//     in-flight count times the per-message cap (32 x 4 MiB, ~230 MiB of
+//     strings in the worst case) — the residual this pair of bounds does not
+//     tighten, and the reason limitUnary now takes the slot BEFORE handing the
+//     reservation over rather than after.
+//
+// WHERE THE CHARGE IS TAKEN, and why it is not the obvious place. On HTTP it is
+// servePush, which has the typed request because it did the unmarshal itself. On
+// gRPC it is the three Export methods (server.go), NOT the unary interceptor:
+// grpc-go hands an interceptor the message its GENERATED handler decoded into,
+// which for pdata is *pdata/internal.ExportLogsServiceRequest — the public
+// plogotlp.ExportRequest wrapper is built one layer further in, by
+// rawLogsServer.Export. That type lives in pdata's internal/, so a type switch
+// in the interceptor can never name it: the charge that used to live there
+// matched nothing, reserved nothing, and left a decoded gRPC payload bounded by
+// the in-flight COUNT alone — the exact thing the top of this file says a count
+// structurally cannot bound. Charge where the typed request exists.
 
 import (
 	"context"
@@ -38,6 +85,9 @@ import (
 	"sync/atomic"
 	"time"
 
+	"go.opentelemetry.io/collector/pdata/plog"
+	"go.opentelemetry.io/collector/pdata/pmetric"
+	"go.opentelemetry.io/collector/pdata/ptrace"
 	"google.golang.org/grpc/tap"
 
 	"github.com/JohanLindvall/kubescrape/internal/obs"
@@ -45,11 +95,11 @@ import (
 
 // maxBufferBytes bounds the raw payload bytes both transports may hold at once,
 // at four full-size requests. It is a floor, not a flag: it must be at least
-// maxIngestBody or a single legal request could never be admitted, NewServer
-// raises it in step with a raised ServerConfig.MaxRecvBytes for the same
-// reason, and the knob an operator actually tunes is -ingest-max-in-flight,
-// which bounds the far more expensive resource (inflated pdata held across a
-// collector's ack latency).
+// maxIngestBody or a single legal request could never be admitted, and
+// NewServer raises it in step with a raised ServerConfig.MaxRecvBytes for the
+// same reason. It bounds RAW bytes and nothing else — what those bytes inflate
+// into is the decoded budget's (decodedLogsSize and its siblings), and the
+// count an operator tunes with -ingest-max-in-flight bounds neither.
 //
 // What is charged is the PAYLOAD as it is read. The buffer it lands in grows by
 // doubling past a small pre-sized head (readAllCapped), so its peak can briefly
@@ -60,6 +110,126 @@ const maxBufferBytes = 4 * maxIngestBody
 // budgetGranule is the top-up size for an in-progress read: a trickled body
 // touches the shared counter once per 64 KiB rather than once per Read.
 const budgetGranule = 64 << 10
+
+// decodedBudgetFactor sizes the decoded-structure budget from the raw one:
+// TWICE the bytes this receiver will hold. The number is a memory decision made
+// against the shipped limit (charts/kubescrape/values.yaml and deploy/agent.yaml
+// both set 512Mi): 64 MiB of raw bodies + ~115 MiB of the strings they decode
+// into + 128 MiB of charged structure leaves the tailer, the scrapers and Go's
+// own slack the rest. Raising ServerConfig.MaxRecvBytes scales it, as it scales
+// the raw budget, because a receiver told to accept bigger messages was told to
+// hold more of everything.
+//
+// The cost of the bound, stated plainly: a SINGLE push whose structure alone
+// estimates past the whole budget can never be admitted, and is answered the
+// same retryable refusal (there is no permanent answer that is safe here — a
+// shed that loses data is worse than the OOM it prevents, and the estimate is a
+// model, not a measurement). At the coefficients below that takes ~130 000
+// resources or ~500 000 records in ONE push, an order of magnitude past what a
+// batching SDK emits; the sender must split. It is warned about, once a minute,
+// because "every push from this sender is 429" is otherwise indistinguishable
+// from ordinary back-pressure.
+const decodedBudgetFactor = 2
+
+// What one decoded object costs on the heap, measured (Go 1.26, pdata v1.65) as
+// the live-heap delta of UnmarshalProto with the result kept alive:
+//
+//	logs    200k resources x 1 tiny record   8.0 MB wire -> 97.9 MB  (489 B/resource-chain)
+//	logs    1 resource x 400k tiny records   4.4 MB wire -> 61.3 MB  (153 B/record)
+//	logs    60k records, 200 B body, 4 attrs 17.6 MB wire -> 38.9 MB (648 B/record, mostly content)
+//	metrics 200k resources x 1 point        11.0 MB wire -> 131.5 MB (657 B/resource-chain)
+//	metrics 1 resource x 400k points         8.8 MB wire -> 74.1 MB  (185 B/point)
+//	traces  200k resources x 1 span         17.8 MB wire -> 139.5 MB (697 B/resource-chain)
+//	traces  1 resource x 200k spans         12.0 MB wire -> 72.3 MB  (361 B/span)
+//
+// The coefficients round those UP, and deliberately so on the resource term:
+// resources are the multiplier a hostile sender reaches for (30 wire bytes
+// each), records are what an honest one has a lot of, and an estimate that is
+// generous where the attack lives and tight where the traffic lives sheds the
+// right one. They are a MODEL of a shape that varies by an order of magnitude,
+// not a measurement of any particular payload — which is why the refusal they
+// drive stays retryable.
+const (
+	decodedResourceBytes = 512
+	decodedScopeBytes    = 256
+	decodedItemBytes     = 256
+)
+
+// decodedLogsSize and its two siblings estimate the STRUCTURAL heap of a
+// decoded payload: one charge per resource, per scope, and per record / data
+// point / span. Content is charged by nobody here, on purpose — see the file
+// comment. There is one per SIGNAL and no `any`-taking dispatcher over them,
+// because the only caller that would have needed one — the gRPC unary
+// interceptor — is handed a type it can never name (see limitUnary).
+//
+// It walks resources and scopes (never the items themselves), which is the same
+// walk plog.Logs.LogRecordCount already does and costs 3.5 ms for a hostile
+// 600 000-node payload against the ~170 ms that payload's decode took. Counting
+// SCOPES rather than trusting a per-resource constant is not tidiness: one
+// resource holding 500 000 empty ScopeLogs is a legal payload whose item count
+// is zero.
+func decodedLogsSize(ld plog.Logs) int64 {
+	rls := ld.ResourceLogs()
+	n := int64(rls.Len()) * decodedResourceBytes
+	for i := 0; i < rls.Len(); i++ {
+		sls := rls.At(i).ScopeLogs()
+		n += int64(sls.Len()) * decodedScopeBytes
+		for j := 0; j < sls.Len(); j++ {
+			n += int64(sls.At(j).LogRecords().Len()) * decodedItemBytes
+		}
+	}
+	return n
+}
+
+func decodedMetricsSize(md pmetric.Metrics) int64 {
+	rms := md.ResourceMetrics()
+	n := int64(rms.Len()) * decodedResourceBytes
+	for i := 0; i < rms.Len(); i++ {
+		sms := rms.At(i).ScopeMetrics()
+		n += int64(sms.Len()) * decodedScopeBytes
+		for j := 0; j < sms.Len(); j++ {
+			ms := sms.At(j).Metrics()
+			// A metric SHELL is charged like an item: a payload of a million
+			// point-less metrics is legal (emptymetrics.go prunes them, but
+			// only after they are resident).
+			n += int64(ms.Len()) * decodedItemBytes
+			for k := 0; k < ms.Len(); k++ {
+				n += int64(metricPoints(ms.At(k))) * decodedItemBytes
+			}
+		}
+	}
+	return n
+}
+
+// metricPoints counts one metric's data points without touching them.
+func metricPoints(m pmetric.Metric) int {
+	switch m.Type() {
+	case pmetric.MetricTypeGauge:
+		return m.Gauge().DataPoints().Len()
+	case pmetric.MetricTypeSum:
+		return m.Sum().DataPoints().Len()
+	case pmetric.MetricTypeHistogram:
+		return m.Histogram().DataPoints().Len()
+	case pmetric.MetricTypeExponentialHistogram:
+		return m.ExponentialHistogram().DataPoints().Len()
+	case pmetric.MetricTypeSummary:
+		return m.Summary().DataPoints().Len()
+	}
+	return 0
+}
+
+func decodedTracesSize(td ptrace.Traces) int64 {
+	rss := td.ResourceSpans()
+	n := int64(rss.Len()) * decodedResourceBytes
+	for i := 0; i < rss.Len(); i++ {
+		sss := rss.At(i).ScopeSpans()
+		n += int64(sss.Len()) * decodedScopeBytes
+		for j := 0; j < sss.Len(); j++ {
+			n += int64(sss.At(j).Spans().Len()) * decodedItemBytes
+		}
+	}
+	return n
+}
 
 // One gRPC push reserves Server.grpcMaxRecv before grpc-go reads it. The size
 // of the message is not knowable at that point — the tap runs on the HEADERS
@@ -105,6 +275,11 @@ const grpcReserveWindow = 10 * time.Second
 // errBufferBudget is the refusal: retryable, and mapped to 429 + Retry-After by
 // bodyErrorStatus / writeBodyError.
 var errBufferBudget = errors.New("receiver is holding its maximum buffered payload bytes; retry")
+
+// errDecodedBudget is its sibling one layer in: the bytes were admitted, and
+// what they decode to does not fit. Same shape of answer for the same reason —
+// the sender still holds the payload.
+var errDecodedBudget = errors.New("receiver is holding its maximum decoded payload; retry")
 
 // byteBudget is a non-blocking counting semaphore over bytes. Reserving is
 // add-then-check-then-undo, so concurrent reservers can transiently overshoot

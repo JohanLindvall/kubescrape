@@ -108,3 +108,42 @@ tests:
 		t.Fatalf("severity/body assertions must hold for a dropped record: %v", err)
 	}
 }
+
+// The harness's transform seam must be wired the way run() wires it, emitter
+// included: `emit_metric` is a sanctioned verb, the harness exists as CI proof
+// of a transform edit, and an unwired emitter made every case of a script using
+// it fail with "no logMetrics section is configured" — naming the one section
+// that IS present, for a pair a real start runs correctly.
+//
+// The declared rule deliberately matches NO line, so the series can only have
+// been observed through the script's emit_metric and not by the per-line chain.
+func TestRunConfigTestsEvaluatesEmitMetric(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := writeFile(t, dir, "config.yaml", `
+logMetrics:
+  metrics:
+    - name: script_lines_total
+      type: gauge
+      action: inc
+      match: ["__line__=no line looks like this"]
+`)
+	cfg, err := loadAgentConfig(cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	transforms := writeFile(t, dir, "transforms.yaml", "logs: |\n"+
+		"  def transform(batch):\n"+
+		"      for r in batch:\n"+
+		"          r.emit_metric(\"script_lines_total\", 1)\n")
+	tests := writeFile(t, dir, "tests.yaml", `
+tests:
+  - name: plain line survives and the script's metric fires
+    line: "hello world"
+    expect:
+      kept: true
+      metrics: [script_lines_total]
+`)
+	if err := runConfigTests(*cfg, transforms, tests, slog.Default()); err != nil {
+		t.Fatalf("emit_metric must be evaluated by -test-config, and its series assertable: %v", err)
+	}
+}

@@ -11,9 +11,22 @@ package server
 // and emits no warnings (reporting a monitor auth conflict from here would
 // double-count what the targets path already reports), and it is deliberately
 // per-pod and unindexed — the cost is one enrichment and a handful of matches.
+//
+// Two of the three decision signals on this derivation are suppressed simply by
+// not being CALLED from here (reportInstanceCollision, hence
+// obs.TargetIdentityCollisions; the auth-conflict warn and
+// obs.MonitorTargetShadowed). The third lives INSIDE targetDedup.add, so it
+// takes a flag — d.diagnostic below — which suppresses the counter while still
+// filling d.capped, because the refusals themselves are exactly what this
+// document has to report (doc.CappedTargets and the per-entry notes). Without
+// it a browser form or a dashboard polling this endpoint added a second,
+// human-driven source to a rate operators read as "endpoints refused per scrape
+// cycle" — on the very pods the counter's help text sends them here to inspect.
 
 import (
 	"net/http"
+	"strconv"
+	"strings"
 
 	"github.com/JohanLindvall/kubescrape/internal/scrape"
 	"github.com/JohanLindvall/kubescrape/internal/services"
@@ -43,6 +56,16 @@ type explainDoc struct {
 	MonitorsEnabled  bool                  `json:"monitorsEnabled"`
 	PodMonitors      []explainMonitor      `json:"podMonitors,omitempty"`
 	Targets          []explainTarget       `json:"targets"`
+	// CappedTargets counts the targets scrape.MaxPortsPerPod refused for this
+	// pod — the same refusals kubescrape_scrape_targets_capped_total counts on
+	// the served path, whose help text sends the operator HERE. Zero (and
+	// absent) on the overwhelming majority of pods. The individual refusals
+	// are named where they were made — portEntries, services[].portEntries,
+	// services[].serviceMonitors[].note, podMonitors[].note — because the
+	// count alone cannot say WHICH endpoint went unscraped; this field exists
+	// so a reader who only skims the head of the document still learns that
+	// the target list below is short by design rather than by misconfiguration.
+	CappedTargets int `json:"cappedTargets,omitempty"`
 }
 
 // explainService is one Service whose selector matches the pod.
@@ -130,6 +153,10 @@ func (s *Server) explainPod(namespace, name string) (explainDoc, []kubemeta.Scra
 	// minus the obs counters and warnings (see the package comment above).
 	var targets []kubemeta.ScrapeTarget
 	var d targetDedup
+	// Read-only: the ceiling's refusals still fill d.capped, which the document
+	// reports below, but obs.ScrapeTargetsCapped belongs to the served
+	// derivation (see targetDedup.diagnostic and the package comment).
+	d.diagnostic = true
 	d.reset(&targets)
 	// The SAME offer dedup nodeTargets uses, not a second one shaped like it:
 	// the monitor endpoints are swept once per matched SERVICE here too, and
@@ -140,18 +167,35 @@ func (s *Server) explainPod(namespace, name string) (explainDoc, []kubemeta.Scra
 	// Services.
 	var offers monitorOffers
 	offers.reset()
+	// refused is reused per door: the ports THIS door produced and the
+	// accumulator turned away. Only the accumulator knows — the mirrors in
+	// internal/scrape resolve one door at a time and the ceiling spans them
+	// all, so a pod annotation and a Service each individually under it can
+	// still overflow together (see targetDedup.add).
+	refused := map[int32]struct{}{}
 	for _, t := range scrape.PodTargets(pod) {
-		d.add(t)
+		if !d.add(t) {
+			refused[t.Port] = struct{}{}
+		}
 	}
+	// Unreachable today — podPorts pre-caps at MaxPortsPerPod and this door
+	// adds first, at d.base, so it can never be the one refused. Wired anyway:
+	// a door whose refusals are silent is precisely this finding, and the cost
+	// of the guard is a map that stays empty.
+	noteCapped(doc.PortEntries, refused)
 	for _, svc := range matched {
 		es := explainService{
 			Name:      svc.Name,
 			Annotated: svc.Annotations[scrape.AnnotationScrape] == "true",
 		}
 		es.PortEntries, es.PortAnnotated = scrape.ExplainServicePorts(pod, svc)
+		clear(refused)
 		for _, t := range scrape.ServiceTargets(pod, svc) {
-			d.add(t)
+			if !d.add(t) {
+				refused[t.Port] = struct{}{}
+			}
 		}
+		noteCapped(es.PortEntries, refused)
 		for _, sme := range monitored[svc.UID] {
 			es.Monitors = append(es.Monitors, s.explainMonitorEndpoint(&d, &offers, pod, svc, sme))
 		}
@@ -171,7 +215,9 @@ func (s *Server) explainPod(namespace, name string) (explainDoc, []kubemeta.Scra
 					em.Note = "merged into the target already held for this URL"
 				} else {
 					for _, t := range scrape.PodMonitorTargets(pod, pm.name, *ep) {
-						d.add(t)
+						if !d.add(t) {
+							em.Note = scrape.CeilingNote("this endpoint")
+						}
 					}
 				}
 			} else {
@@ -200,6 +246,10 @@ func (s *Server) explainPod(namespace, name string) (explainDoc, []kubemeta.Scra
 		})
 	}
 
+	// The accumulator's own count, which is what the served path reports as
+	// kubescrape_scrape_targets_capped_total for this pod.
+	doc.CappedTargets = d.capped
+
 	if len(doc.Targets) == 0 && doc.Hint == "" {
 		// doc.Services lists EVERY selector-matching Service; only one that is
 		// scrape-annotated or selected by a ServiceMonitor is an opt-in, so a
@@ -222,6 +272,47 @@ func (s *Server) explainPod(namespace, name string) (explainDoc, []kubemeta.Scra
 		}
 	}
 	return doc, targets
+}
+
+// noteCapped rewrites the verdicts of the ports one door produced and the
+// accumulator REFUSED. The mirrors in internal/scrape resolve each entry
+// against its own door and cannot see the ceiling — it binds across every door
+// at once — so a verdict that survived its own door may still describe a
+// target the server does not serve, which is not a caveat but the inversion
+// /v1/explain exists to prevent ("why is my 17th port not scraped?" answered
+// with "it is"). The refused port loses its `ports`, exactly as the
+// pod-annotation door's own capped verdicts do, and the note REPLACES whatever
+// caveat the mirror wrote: on the Service door that caveat was "the target is
+// still served, but if nothing listens there the scrape will fail", i.e. an
+// affirmative false statement plus a wild-goose chase.
+//
+// Keyed by pod port because that is what both sides agree on: every door
+// dedupes by resolved pod port, so at most one verdict of a door can claim any
+// given port, and a refused target carries it (kubemeta.ScrapeTarget.Port).
+func noteCapped(verdicts []scrape.PortVerdict, refused map[int32]struct{}) {
+	if len(refused) == 0 {
+		return
+	}
+	for i := range verdicts {
+		v := &verdicts[i]
+		var over []string
+		kept := v.Ports[:0]
+		for _, p := range v.Ports {
+			if _, no := refused[p]; no {
+				over = append(over, strconv.Itoa(int(p)))
+				continue
+			}
+			kept = append(kept, p)
+		}
+		if len(over) == 0 {
+			continue
+		}
+		v.Ports = kept
+		if len(v.Ports) == 0 {
+			v.Ports = nil // omitempty: an empty array reads as "resolves, to nothing"
+		}
+		v.Note = scrape.CeilingNote("port " + strings.Join(over, ", "))
+	}
 }
 
 // explainMonitorEndpoint runs one ServiceMonitor endpoint through the same
@@ -252,7 +343,14 @@ func (s *Server) explainMonitorEndpoint(d *targetDedup, offers *monitorOffers, p
 		return em
 	}
 	for _, t := range scrape.MonitorTargets(pod, svc, sme.monitor, *sme.endpoint) {
-		d.add(t)
+		// Resolved and offered, and REFUSED: the endpoint resolves to a URL
+		// (which is what Resolved reports, exactly as it does on the merged
+		// arm above) but the pod is at the ceiling and it is not scraped. An
+		// empty note here made a refused endpoint byte-identical to a served
+		// one — the inversion this endpoint exists to prevent.
+		if !d.add(t) {
+			em.Note = scrape.CeilingNote("this endpoint")
+		}
 	}
 	return em
 }

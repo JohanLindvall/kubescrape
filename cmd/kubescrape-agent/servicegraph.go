@@ -348,13 +348,24 @@ func (p *pipelines) startServiceGraphIngest(ctx context.Context, owner servicegr
 		MaxRecvBytes: *ingestGRPCMaxRecv,
 		Enricher:     enr,
 		// The application ports are first receipt for traces, so the same
-		// reserved-plumbing strip as the DaemonSet's receiver applies; the
-		// INTERNAL receiver (sgReceiver) deliberately does not — what arrives
-		// there was sanitized when an application pushed it.
-		ReservedAttrs: ingestReservedAttrs(),
+		// reserved strip as the DaemonSet's receiver applies — the plumbing
+		// markers AND the sender's identity claim, which matters here at least
+		// as much: these ports take pushes from every pod in the cluster, and a
+		// span resource declaring another tenant's k8s.namespace.name would
+		// route the whole trace there. The INTERNAL receiver (sgReceiver)
+		// deliberately does not strip — what arrives there was sanitized when
+		// an application pushed it, and re-stripping would delete the identity
+		// the entry shard resolved.
+		ReservedAttrs: ingestReservedAttrs(enr),
 		// Exporter nil: this listener serves TRACES only. Logs and metrics belong
 		// on the node-local DaemonSet, where the sender is a pod on the same node
 		// and the payload crosses no network to be attributed.
+		//
+		// Which is why the log-chain fields the DaemonSet's receiver wires
+		// (Rules, LogAttrs, LogMetrics) are absent here rather than merely
+		// forgotten: with no logs service registered, applyLogChain is
+		// unreachable on this listener, and carrying the config would advertise
+		// a seam that cannot run.
 		Traces: &sgEntry{resharder: resharder, owner: owner},
 		// The loop guard belongs on the RECEIVE path, above enrichment: a payload
 		// that is going to be refused must not spend a metadata lookup per
@@ -700,6 +711,19 @@ func (r *sgReceiver) Run(ctx context.Context) error {
 			// connection carrying an open stream is never idle.
 			otlpingest.KeepaliveOption(),
 			grpc.MaxRecvMsgSize(sgMaxRecvBytes()),
+			// The wire-SHAPE guard, which MaxRecvMsgSize cannot give: pdata's
+			// generated unmarshaller recurses per nesting level, so a small
+			// message of deeply nested groups costs unbounded goroutine stack
+			// and only the codec — which runs before the decode — can refuse
+			// it. Every OTLP gRPC listener in this repo carries it; this one
+			// assembles its own grpc.Server, so it takes the option form.
+			//
+			// nil onRefused, deliberately: this hop is authenticated
+			// kubescrape-to-kubescrape, and the refusal series means "an
+			// APPLICATION push was refused at a listener nothing
+			// authenticates" — the same reason NewBodyReader counts nothing
+			// here.
+			otlpingest.NestingGuardOption(nil),
 			// Authenticate on the HEADERS frame, BEFORE grpc-go reads the
 			// message. A UnaryInterceptor runs only after recvAndDecompress has
 			// pulled the whole thing into memory, so an unauthenticated peer

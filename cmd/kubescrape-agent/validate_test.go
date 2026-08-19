@@ -515,3 +515,32 @@ func TestRouteInsecureUnsetInheritsTheFlagBase(t *testing.T) {
 		t.Fatalf("insecure:true must mean plaintext whatever the base (insecure=%v, err=%v)", got.Insecure, err)
 	}
 }
+
+// The `type: script` tail-sampling cross-check is TIER-ONLY, like every other
+// tier-only refusal in validateConfig. ONE ConfigMap is mounted into the
+// DaemonSet, the events/Azure singleton and the tier, and the chart renders
+// -transforms-file on none of them, so a check that fires wherever the section
+// is merely PRESENT makes a config that is valid exactly where it is read exit
+// every other workload 1 at startup — the singleton unrepairably, since its
+// template exposes no extraVolumes to mount a transforms file with.
+func TestScriptTailSamplingPolicyIsRefusedOnlyOnTheTier(t *testing.T) {
+	cfg := agentConfig{TailSampling: &tailbuffer.Config{Config: tailsample.Config{
+		Policies: []tailsample.PolicyConfig{{Name: "keep-interesting", Type: tailsample.TypeScript}},
+	}}}
+	// The DaemonSet / events singleton: the section is ignored here
+	// (startServiceGraph warns that it is), so nothing about it may be fatal.
+	if err := validateConfig(cfg, ""); err != nil {
+		t.Fatalf("off the trace tier a script tail-sampling policy must not be fatal — the workload never reads the section: %v", err)
+	}
+
+	// On the tier it IS read, and a policy naming a decide(trace) the transforms
+	// file does not define can never be satisfied, so the refusal stays.
+	withServiceGraph(t)
+	token, listen := *serviceGraphToken, *serviceGraphListen
+	defer func() { *serviceGraphToken, *serviceGraphListen = token, listen }()
+	*serviceGraphToken, *serviceGraphListen = "/etc/kubescrape/sg/token", ":4319"
+	err := validateConfig(cfg, "")
+	if err == nil || !strings.Contains(err.Error(), "sample:") {
+		t.Fatalf("on the tier the cross-check must still refuse the unsatisfiable policy, got %v", err)
+	}
+}

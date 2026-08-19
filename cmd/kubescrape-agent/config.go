@@ -5,6 +5,8 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"net"
+	"net/url"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -260,6 +262,94 @@ func checkFlagValues() error {
 	return nil
 }
 
+// kubeletBase normalises -kubelet-endpoint into a base URL net/http will
+// accept, and reports the ones it cannot. Empty stays empty (the kubelet
+// scrapes are then simply not scheduled — configWarnings names that).
+//
+// The one repair it makes is BRACKETING an IPv6 literal, because the shipped
+// default cannot spell both address families and the manifests cannot fix it:
+// NODE_IP is status.hostIP, so `https://$(NODE_IP):10250` expands to
+// `https://fd00:10::5:10250` on an IPv6 node — which net/url has refused since
+// Go 1.26 enforced strict colons for http/https (`invalid port ":10::5:10250"
+// after host`, go.dev/issue/75223), so every request the three kubelet
+// pipelines build fails before it is issued, on every node, forever. Writing
+// `https://[$(NODE_IP)]:10250` instead is NOT the fix: that renders
+// `https://[10.0.0.5]:10250` on an IPv4 cluster, which the same parser rejects
+// as an invalid IP-literal. One static value cannot be right for both families,
+// so the bracketing has to happen where the family is known — here, once, at
+// the one place the endpoint is read.
+//
+// It is net.JoinHostPort's treatment, the same one internal/scrape/targets.go
+// already gives pod addresses; only a host that genuinely parses as an IP
+// literal is bracketed, so an IPv4 address and a DNS name are returned
+// untouched and never acquire brackets Go would then reject.
+func kubeletBase(ep string) (string, error) {
+	// Exactly empty, never trimmed: a whitespace-only value is a mistake, and
+	// reading it as "not configured" would disable all three kubelet pipelines
+	// silently — the one outcome configWarnings exists to prevent. It falls
+	// through to the refusal below instead.
+	if ep == "" {
+		return "", nil
+	}
+	u, err := url.Parse(ep)
+	if err == nil && u.Host != "" {
+		return ep, nil
+	}
+	if fixed, ok := bracketIPLiteralHost(ep); ok {
+		// Re-parsed rather than trusted: the repair must produce something the
+		// request path accepts, or it has merely moved the failure.
+		if v, verr := url.Parse(fixed); verr == nil && v.Host != "" {
+			return fixed, nil
+		}
+	}
+	if err == nil {
+		// Parsed, but with no authority — a scheme-less endpoint like
+		// `10.0.0.5:10250`, which url.Parse reads as scheme+opaque and
+		// http.NewRequest then refuses as an unsupported protocol scheme.
+		err = errors.New("no scheme://host — a bare host:port is read as a URL scheme, not an address")
+	}
+	return "", fmt.Errorf("-kubelet-endpoint=%q is not a base URL the agent can request (%v): all three kubelet scrapes build every request from it, so each would fail before it is issued. "+
+		"Write it as scheme://host[:port] — an IPv6 host may be bare (https://fd00:10::5:10250, which is what $(NODE_IP) expands to on an IPv6 node) or bracketed; an IPv4 host or a name must NOT be bracketed", ep, err)
+}
+
+// bracketIPLiteralHost re-forms scheme://host[:port] with the host bracketed
+// when it is an unbracketed IPv6 literal, returning false for everything else.
+//
+// The two-colon test is what keeps this narrow: an IPv4 authority has at most
+// one colon (its port separator) and a DNS name has none, so neither can reach
+// net.ParseIP here — which matters, because bracketing either is exactly the
+// "invalid IP-literal" refusal this whole function exists to avoid.
+func bracketIPLiteralHost(ep string) (string, bool) {
+	scheme, rest, ok := strings.Cut(ep, "://")
+	if !ok {
+		return "", false
+	}
+	authority, tail := rest, ""
+	if i := strings.IndexAny(rest, "/?#"); i >= 0 {
+		authority, tail = rest[:i], rest[i:]
+	}
+	// Userinfo would make the host split ambiguous, and a kubelet endpoint
+	// never carries one (the credential is a bearer token file). Leave it to
+	// the error rather than guess.
+	if strings.Contains(authority, "@") || strings.Count(authority, ":") < 2 {
+		return "", false
+	}
+	if ip := net.ParseIP(authority); ip != nil { // an address with no port
+		return scheme + "://[" + authority + "]" + tail, true
+	}
+	i := strings.LastIndex(authority, ":")
+	host, port := authority[:i], authority[i+1:]
+	if port == "" || net.ParseIP(host) == nil {
+		return "", false
+	}
+	for _, c := range []byte(port) {
+		if c < '0' || c > '9' {
+			return "", false
+		}
+	}
+	return scheme + "://" + net.JoinHostPort(host, port) + tail, true
+}
+
 // validateConfig compiles every section of the unified config (and the
 // separate transforms file) without acquiring a single resource: no listeners,
 // no log files, no positions file, no spools, no network.
@@ -282,6 +372,15 @@ func validateConfig(cfg agentConfig, transformsFile string) error {
 	// than at the consumer because -check-config is the only place a fleet-wide
 	// flag mistake surfaces before the rollout does.
 	if err := checkFlagValues(); err != nil {
+		return err
+	}
+	// The kubelet base URL, PARSED — nothing used to parse it at all, so a
+	// value no request can be built from (the commonest being an IPv6 host the
+	// chart cannot bracket for us, see kubeletBase) passed -check-config and
+	// then failed every kubelet scrape on every node for the process lifetime.
+	// The result is discarded here: startScraper re-derives it, and this is the
+	// dry run, which acquires nothing.
+	if _, err := kubeletBase(*kubeletEndpoint); err != nil {
 		return err
 	}
 	// The OTLP transport flags. Shape-only (no dial, no file reads), but they
@@ -440,7 +539,18 @@ func validateConfig(cfg agentConfig, transformsFile string) error {
 	// Validate() itself uses a placeholder (the injection has not happened at
 	// check time), so without this a config that CrashLoops the StatefulSet
 	// would pass -check-config.
-	if cfg.TailSampling.Enabled() && cfg.TailSampling.UsesScript() && !prog.HasSample() {
+	//
+	// ON THE TIER ONLY, like every other tier-only refusal in this function
+	// (the token, the listeners, the shard set) and for the same reason the
+	// serviceGraphShards block above records: ONE ConfigMap is shared by the
+	// DaemonSet, the events/Azure singleton and the tier, and the chart renders
+	// -transforms-file on none of them, so a policy that is valid exactly where
+	// it is READ made every other workload exit 1 at startup — the singleton
+	// unrepairably, since events.yaml exposes no extraVolumes to mount a
+	// transforms file with. Off the tier tailSampling is not read at all, and
+	// startServiceGraph's "configured but ignored" warning is already the right
+	// report.
+	if *serviceGraphOn && cfg.TailSampling.Enabled() && cfg.TailSampling.UsesScript() && !prog.HasSample() {
 		return fmt.Errorf("tailSampling: a `type: script` policy requires -transforms-file with a sample: section defining decide(trace)")
 	}
 	return nil
@@ -755,29 +865,57 @@ func configWarnings(cfg agentConfig) []string {
 	// boundary crossed from the other side, and it must be named, not silent.
 	if cfg.LogAttributes != nil {
 		for _, r := range cfg.LogAttributes.Rules {
-			if r.Target != logattrs.TargetResource {
-				continue
-			}
 			attr := r.Attribute
 			if attr == "" {
 				attr = r.Key
 			}
-			if attrs.ReservedIdentity(attr) {
+			// The default, spelled the way pkg/logattrs spells it, because
+			// which marker bites depends on this value and `log` is what an
+			// omitted `target:` means.
+			tgt := r.Target
+			if tgt == "" {
+				tgt = logattrs.TargetLog
+			}
+			// Identity is a RESOURCE concern and nothing else: routing keys on
+			// the resource's k8s.namespace.name, and series identity is the
+			// resource's. A record- or scope-target lift of one of these keys
+			// forges nothing.
+			if tgt == logattrs.TargetResource && attrs.ReservedIdentity(attr) {
 				out = append(out, fmt.Sprintf(
 					"logAttributes rule %q lifts a log-line value into %q, a RESOLVED-IDENTITY resource attribute: whatever writes the line controls it (k8s.namespace.name keys tenancy routing; service.instance.id and k8s.pod.* forge series identity). The pod-annotation path refuses these keys; lift into a differently-named attribute unless the workload is genuinely authoritative for this one.",
 					r.Key, attr))
 			}
-			// The plumbing markers are the SHARPER case and were missed:
-			// attrs.ReservedPlumbing names this very surface as one it covers,
-			// but only the pod-annotation path consulted it. The router honours
-			// route.ScriptMarker BEFORE its namespace globs, so a rule lifting a
-			// log-line value into it hands whatever writes the line the choice
-			// of route — and its tenant headers — with no namespace forgery
-			// needed at all.
-			if attrs.ReservedPlumbing(attr) {
+			// The plumbing markers are the SHARPER case, and the two are NOT
+			// honoured in the same place — which is the same Resource/Element
+			// split ingestReservedAttrs wires on the receivers. The router
+			// reads route.ScriptMarker off a RESOURCE and nowhere else; the
+			// transform engine's post-script prune reads transform.DropMarker
+			// off the ELEMENT, which for logs is the log RECORD — logattrs'
+			// DEFAULT target, and the one this loop used to skip entirely.
+			//
+			// So the old single `target: resource` gate was inverted for the
+			// drop marker: it stayed silent on the placement that deletes
+			// records, and on the placement where nothing reads the marker it
+			// emitted a warning ASSERTING that deletion. Each message now names
+			// the consequence that exists for THIS rule's target.
+			//
+			// The gate stays attrs.ReservedPlumbing (the predicate attrs
+			// documents as shared with the pod-annotation surface, so a marker
+			// added there is still reported here) — but a NEW marker lands on
+			// the inert arm until its honoured-here case is added above it.
+			var why string
+			switch {
+			case attr == route.ScriptMarker && tgt == logattrs.TargetResource:
+				why = "the router honours the route marker on a resource BEFORE its namespace globs, so whatever writes the line chooses the destination — and that route's tenant headers"
+			case attr == transform.DropMarker && tgt == logattrs.TargetLog:
+				why = "with any logs: transform program active, the engine's post-script prune DELETES every record carrying the drop marker and counts it into kubescrape_transform_dropped_total{signal=\"logs\"} as an operator-intended drop, so a line's own content decides whether its record ships"
+			case attrs.ReservedPlumbing(attr):
+				why = fmt.Sprintf("nothing reads this marker off a %s, so the rule is inert today — but it is kubescrape's own control-plane key, one changed `target:` away from the surface that does honour it", tgt)
+			}
+			if why != "" {
 				out = append(out, fmt.Sprintf(
-					"logAttributes rule %q lifts a log-line value into %q, which is kubescrape's OWN plumbing, not a describable attribute: the router honours the route marker before its namespace globs, so whatever writes the line chooses the destination (and its tenant headers), and the drop marker deletes the record. The pod-annotation path and the ingest receivers both refuse this key; lift into a differently-named attribute.",
-					r.Key, attr))
+					"logAttributes rule %q lifts a log-line value into %q, which is kubescrape's OWN plumbing, not a describable attribute: %s. The pod-annotation path and the ingest receivers both refuse this key; lift into a differently-named attribute.",
+					r.Key, attr, why))
 			}
 		}
 	}

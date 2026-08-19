@@ -372,7 +372,7 @@
           "items": {
             "type": "string"
           },
-          "description": "null derives the default (release namespace + the in-cluster namespace of agent.otlp.endpoint); [] excludes nothing"
+          "description": "null derives the default (release namespace + the in-cluster namespace of the ONE logs destination: agent.config.export.logs.endpoint when set, else agent.otlp.endpoint); [] excludes nothing"
         },
         "positionsFile": {
           "type": "string"

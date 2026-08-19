@@ -48,8 +48,16 @@ all: build
 # (reported, not rewritten — `make fmt` fixes), then static analysis, then the
 # chart (helm-lint also bootstraps helm into hack/bin, which the chart golden
 # tests in internal/chartcheck pick up), then the test suite and the build-tag
-# guard. One green `make check` is the whole local CI story except `make e2e`,
-# which needs docker/kind and is deliberately separate.
+# guard.
+#
+# What one green `make check` covers, stated exactly, because it was documented
+# as "the whole local CI story" while a whole file went uncompiled: the DEFAULT
+# tag set is vetted, linted and TESTED, and EVERY variant's stubs are COMPILED
+# (verify-tags, below). What CI adds on top is the tag-less variant's TEST run
+# (`make build test TAGS=`) and `CGO_ENABLED=1 go test -race` over the
+# concurrency-touching packages — the latter already documented as a separate
+# manual step in CLAUDE.md. `make e2e` needs docker/kind and is deliberately
+# separate from both.
 check: fmt-check vet lint helm-lint test verify-tags
 
 # Local build: unstripped, so delve/gdb work. The release IMAGE strips with
@@ -91,11 +99,23 @@ $(GOLANGCI_LINT):
 # CGO-free (a stray import of internal/agent/journald would fail this build,
 # not merely re-add a dependency) and that the agent WITHOUT azure really has
 # dropped franz-go. Cheap enough for CI.
+#
+# The THIRD command is not about linking at all — it is the only step of `make
+# check` that TYPE-CHECKS the stubs. `-tags azure` compiles journald_disabled.go
+# (its `!journald` constraint holds), but the franz-go half is a `go list -deps`,
+# which resolves imports WITHOUT type-checking, so azure_disabled.go — the repo's
+# only `//go:build !azure` file — was compiled by no step of `make check` at all:
+# a broken edit to it passed fmt-check, vet, lint and the whole test suite (its
+# own build constraint excludes it under the default tags) and failed in CI's
+# `make build test TAGS=`. A tag-less build compiles BOTH stubs, needs no cgo and
+# no libsystemd, and costs a few seconds. Do not "simplify" it away as redundant
+# with the -tags azure build above: they cover different files.
 verify-tags:
 	CGO_ENABLED=0 go build $(GOFLAGS) -tags azure -o /dev/null ./cmd/kubescrape-agent
 	@n=$$(go list -deps -tags journald ./cmd/kubescrape-agent | grep -c franz-go || true); \
 		test "$$n" -eq 0 || { echo "franz-go still linked without the azure tag ($$n packages)"; exit 1; }
-	@echo "build tags verified: no cgo without journald, no franz-go without azure"
+	CGO_ENABLED=0 go build $(GOFLAGS) -o /dev/null ./cmd/kubescrape-agent
+	@echo "build tags verified: no cgo without journald, no franz-go without azure, every stub compiles"
 
 run: build
 	./bin/$(BINARY)

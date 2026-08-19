@@ -282,6 +282,41 @@ func IdentityKeys() []string {
 	return slices.Clone(identityKeys)
 }
 
+// senderOnlyIdentityKeys are identity attributes this package never EMITS but
+// which name a resource's own object just as surely, because SDK detectors set
+// them. They exist so SenderIdentityKeys can be a superset of IdentityKeys
+// without anyone hand-copying a list: a receiver deciding "does this attribute
+// claim WHO the resource is" has to answer yes for these too.
+var senderOnlyIdentityKeys = []string{
+	// container.name: the bare semconv sibling of k8s.container.name. The
+	// builder never emits it (kubemeta names containers under the k8s.* form),
+	// but Go's resource.WithContainer, the Java ContainerResource detector and
+	// the collector's resourcedetection processor all do.
+	"container.name",
+}
+
+// SenderIdentityKeys returns (a copy of) every resource-attribute key that
+// names WHOSE data a resource is — IdentityKeys plus the semconv siblings a
+// SENDER may set that this package never emits, sorted.
+//
+// It is the list a receiver uses when it must treat a sender's identity
+// attributes as claims rather than facts: the ingest splitter strips exactly
+// these from a resource it is about to re-label as a DESCRIBED object's,
+// because the overwrite that follows only replaces keys the builder emits for
+// that object, so any key the described object lacks would survive from the
+// exporter onto the object it describes.
+//
+// It lives here, next to the mapping it is derived from, because a hand-copied
+// copy of it in the consumer had already drifted once — a sender's
+// k8s.service.name/uid leaked onto every split-described object when Service
+// grew those keys. TestSenderIdentityKeysCoverEveryBuilderIdentityKey pins it
+// in both directions.
+func SenderIdentityKeys() []string {
+	out := append(slices.Clone(identityKeys), senderOnlyIdentityKeys...)
+	slices.Sort(out)
+	return out
+}
+
 // reservedIdentity is the set behind ReservedIdentity/ReservedIdentityKeys.
 var reservedIdentity = map[string]struct{}{
 	"k8s.namespace.name":  {},

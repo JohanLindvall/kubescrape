@@ -442,10 +442,17 @@ func (r *k8sSecretReader) evictExpiredLocked() {
 // bearer.NewRotating's contract; only the messages are ours, because they name
 // the flag the operator set.
 //
-// Past startup the file is re-read on bearer.DefaultReadInterval and a rotated
-// token keeps its predecessor accepted for bearer.DefaultGrace, so agents —
-// which re-read their copy on their own cadence — never have to flip in
-// lockstep with the service.
+// Past startup the two sides re-read on DIFFERENT cadences, and the asymmetry
+// is deliberate. This RECEIVER refreshes its accept set at request time on
+// bearer.DefaultRefreshInterval (a second; Rotating.Run's
+// bearer.DefaultReadInterval ticker only covers a receiver with no traffic at
+// all, and a FAILED read backs off to it), because a receiver that has not yet
+// read a rotated token has no grace to fall back on — it is a hard 401 for as
+// long as its copy lags. The other direction, an agent still presenting the
+// PREVIOUS token, is what bearer.DefaultGrace covers: agents re-read the copy
+// they present on their own bearer.DefaultReadInterval minute and the
+// predecessor stays accepted for five, so nobody has to flip in lockstep with
+// the service.
 func newScrapeAuthTokens(path string, log *slog.Logger) (*bearer.Rotating, error) {
 	rt, err := bearer.NewRotating(path, log)
 	switch {

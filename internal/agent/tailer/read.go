@@ -85,13 +85,13 @@ func (t *Tailer) resolveMetadata(ctx context.Context, f *file) bool {
 		return false
 	}
 	f.metaBackoff = 0
-	res := pcommon.NewResource()
-	actx := attrs.Context{Pod: &md.Pod, Container: &md.Container}
-	if t.cfg.NodeInfo != nil {
-		actx.Node = t.cfg.NodeInfo()
-	}
-	t.cfg.Attrs.Build(res, actx)
-	f.resource = res
+	// Retained so the resource can be re-rendered without a second lookup when
+	// the NODE metadata changes (refreshNodeAttrs). It is the value metaclient
+	// already holds in its per-URL cache — the maps are shared under that
+	// cache's treat-as-immutable contract — so this costs one struct per
+	// tracked file, not a copy of the pod.
+	f.meta = md
+	t.buildResource(f, t.nodeInfo())
 	f.resolved = true
 	if !f.source.wantLabels(md.Pod.Labels) {
 		// The source selects pods by label; this one does not match. Labels are
@@ -110,54 +110,132 @@ func (t *Tailer) resolveMetadata(ctx context.Context, f *file) bool {
 // the builder plus the source's configured static attributes (which win). A
 // source without an explicit service.name defaults it to the source name.
 func (t *Tailer) resolvePlain(f *file) bool {
-	res := pcommon.NewResource()
-	actx := attrs.Context{}
-	if t.cfg.NodeInfo != nil {
-		actx.Node = t.cfg.NodeInfo()
-		if actx.Node == nil {
-			// A provider is CONFIGURED but has not resolved yet. This runs once
-			// per file and the result is latched as the file's resource, so
-			// building now would permanently strip the node attributes from
-			// every record the file ever exports. Defer instead: the file stays
-			// unresolved (nothing is read before it can be attributed — the
-			// containerd path's rule) and the next sweep retries at one cheap
-			// provider call per sweep. This cannot wedge a file in the shipped
-			// agent: cmd/kubescrape-agent wires NodeInfo from selfmeta.Poll
-			// with a non-nil Initial (the bare node name), so the provider
-			// never returns nil there — nil only happens for a wiring whose
-			// provider genuinely resolves later, which is exactly the case to
-			// wait for. A deployment that wants no node metadata at all leaves
-			// Config.NodeInfo itself nil and resolves immediately.
-			return false
-		}
+	ni := t.nodeInfo()
+	if t.cfg.NodeInfo != nil && ni == nil {
+		// A provider is CONFIGURED but has not produced anything yet. Defer:
+		// the file stays unresolved (nothing is read before it can be
+		// attributed — the containerd path's rule) and the next sweep retries
+		// at one cheap provider call per sweep. This is a first-value guard
+		// only; it is NOT what keeps the resource current, because it cannot
+		// be — the shipped agent seeds selfmeta.Poll with a placeholder
+		// NodeInfo (the bare node name, no labels), so the provider is non-nil
+		// from the first call and this branch never fires there. What covers
+		// the placeholder — and every later node relabel — is refreshNodeAttrs,
+		// which re-renders the resource whenever the provider yields a
+		// different value.
+		return false
 	}
-	t.cfg.Attrs.Build(res, actx)
-	a := res.Attributes()
-	if _, ok := f.source.attributes["service.name"]; !ok && f.source.name != "" {
-		if _, set := a.Get("service.name"); !set {
-			a.PutStr("service.name", f.source.name)
-		}
-	}
-	for k, v := range f.source.attributes {
-		a.PutStr(k, v)
-	}
-	// Path-derived attributes land after the statics: a per-file capture is
-	// more specific than the source-wide constant it may share a key with.
-	for i := range f.source.pathAttrs {
-		f.source.pathAttrs[i].apply(f.path, a)
-	}
-	// The source's attributes land AFTER Build so they beat templates and
-	// defaults — but the pipeline's guarantees must still close over the FINAL
-	// set. Re-derive identity (fill-if-absent: a source-declared
-	// k8s.namespace.name now yields service.namespace, so tenancy routing and
-	// the Mimir job agree about the namespace) and re-apply the operator's
-	// global attribute filter (resourceAttributes.disable could not drop a
-	// plain source's static attribute while the stamp bypassed it).
-	attrs.Identity(res)
-	t.cfg.Attrs.FilterResource(res)
-	f.resource = res
+	t.buildResource(f, ni)
 	f.resolved = true
 	return true
+}
+
+// nodeInfo reads the configured node-metadata provider once, or nil when none
+// is configured. The POINTER it returns is what a file records as "the node
+// metadata my resource was built from": selfmeta.Poll stores a freshly
+// allocated value on every successful resolve, so pointer inequality is exactly
+// "the provider has produced something new since we built".
+func (t *Tailer) nodeInfo() *attrs.NodeInfo {
+	if t.cfg.NodeInfo == nil {
+		return nil
+	}
+	return t.cfg.NodeInfo()
+}
+
+// buildResource renders f.resource from what is known about the file — the
+// retained container metadata for a containerd file, the source's statics and
+// path captures for a plain one — plus the node metadata passed in, and records
+// which node metadata it used.
+//
+// It is called at resolve time and again whenever the node metadata changes
+// (refreshNodeAttrs), so everything that shapes the resource has to live HERE
+// rather than at the resolve call site: an override applied once, next to the
+// resolve, would be silently dropped by the next re-render. That is why the pod
+// annotation's overrides are re-applied from the vetted copy on the file rather
+// than re-parsed (re-parsing would also re-count obs.LogPodAttrsRefused and
+// re-warn, once per refresh, forever).
+func (t *Tailer) buildResource(f *file, ni *attrs.NodeInfo) {
+	res := pcommon.NewResource()
+	actx := attrs.Context{Node: ni}
+	if f.source.containerd {
+		if f.meta == nil {
+			return // nothing to build from; resolveMetadata has not run
+		}
+		actx.Pod, actx.Container = &f.meta.Pod, &f.meta.Container
+		t.cfg.Attrs.Build(res, actx)
+	} else {
+		t.cfg.Attrs.Build(res, actx)
+		a := res.Attributes()
+		if _, ok := f.source.attributes["service.name"]; !ok && f.source.name != "" {
+			if _, set := a.Get("service.name"); !set {
+				a.PutStr("service.name", f.source.name)
+			}
+		}
+		for k, v := range f.source.attributes {
+			a.PutStr(k, v)
+		}
+		// Path-derived attributes land after the statics: a per-file capture is
+		// more specific than the source-wide constant it may share a key with.
+		for i := range f.source.pathAttrs {
+			f.source.pathAttrs[i].apply(f.path, a)
+		}
+		// The source's attributes land AFTER Build so they beat templates and
+		// defaults — but the pipeline's guarantees must still close over the
+		// FINAL set. Re-derive identity (fill-if-absent: a source-declared
+		// k8s.namespace.name now yields service.namespace, so tenancy routing
+		// and the Mimir job agree about the namespace) and re-apply the
+		// operator's global attribute filter (resourceAttributes.disable could
+		// not drop a plain source's static attribute while the stamp bypassed
+		// it).
+		attrs.Identity(res)
+		t.cfg.Attrs.FilterResource(res)
+	}
+	f.resource = res
+	f.nodeInfo = ni
+	f.applyPodResource()
+}
+
+// refreshNodeAttrs re-renders a resolved file's resource when the node-metadata
+// provider has yielded a different value than the one it was built from.
+//
+// The resource used to be LATCHED at first resolve, and that was wrong twice
+// over. The shipped agent seeds selfmeta.Poll with a placeholder NodeInfo
+// carrying the node NAME and no labels, so a file resolved before the first
+// GET /v1/nodes/{name}/metadata landed — deterministically every plain-source
+// file, which resolves on sweep #1 and takes no lookup at all — kept a
+// label-less resource for the whole life of that file while a file discovered a
+// second later carried the real one: ONE node exporting two resource shapes at
+// once, so an operator template over .Node.Labels (k8s.node.zone, the
+// documented example) is missing from half the streams and `sum by
+// (k8s.node.zone)` silently drops them. And with no race at all,
+// -node-metadata-refresh — which exists to propagate a node relabel, and
+// reaches every other pipeline — never reached an already-tailed file.
+//
+// Re-rendering rather than deferring is the shape every other log producer in
+// this repo already has (journald, events, azurediag and ingest rebuild their
+// resource per batch, and so self-heal). Deferring instead would gate log
+// collection on a lookup that can fail forever: a plain source must not stop
+// collecting because the metadata service is unreachable, which is exactly when
+// its logs matter most.
+//
+// It costs one pointer compare per resolved file per sweep, and a re-render
+// only when the provider genuinely produced something new — at most once per
+// -node-metadata-refresh, and never on the per-line path. Records already built
+// are unaffected: flush COPIES f.resource into each ResourceLogs (newScope) and
+// the log-metrics bind cache lives for exactly one flush.
+func (t *Tailer) refreshNodeAttrs(f *file) {
+	if t.cfg.NodeInfo == nil || f.excluded {
+		return
+	}
+	ni := t.cfg.NodeInfo()
+	// nil is a provider that has nothing to say (it cannot happen with
+	// selfmeta.Poll, whose value only ever moves forward). Keep what we have
+	// rather than re-rendering the node attributes away — the same rule as the
+	// resolve-time guard, one direction later.
+	if ni == nil || ni == f.nodeInfo {
+		return
+	}
+	t.buildResource(f, ni)
 }
 
 // swept reports whether every sweep runs this file through readFile's own

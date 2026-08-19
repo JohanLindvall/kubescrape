@@ -668,7 +668,28 @@ type targetDedup struct {
 	// a second door needing no annotation on the pod at all — free to produce
 	// unbounded full-pod targets and reopen the O(N²) response it was added to
 	// close. Everything that materialises a target for a pod goes through add.
+	//
+	// It is READ by explainPod, which puts it on the document (cappedTargets)
+	// beside the per-entry notes add's verdict feeds: for a long time it was
+	// write-only, and the metric's own help text ("see /v1/explain for the
+	// pod") sent the operator to a document that reported every refused
+	// endpoint as resolving.
 	capped int
+	// diagnostic marks a derivation run for /v1/explain rather than for a
+	// served response: capped still counts (the document names the refusals),
+	// but obs.ScrapeTargetsCapped must NOT move. The counter is per-derivation
+	// on the targets path, so a browser or a dashboard polling explain would
+	// otherwise add a second, human-driven source to a rate an operator reads
+	// as "endpoints refused per scrape cycle" — and the counter's own help
+	// text points at explain, so the inflation lands exactly on the pods being
+	// investigated. The two sibling decision signals on this derivation
+	// (obs.TargetIdentityCollisions via reportInstanceCollision, and the
+	// auth-conflict warn/obs.MonitorTargetShadowed) are suppressed by explain
+	// simply not calling them; this one is inside add, so it needs the flag.
+	//
+	// Set once by explainPod BEFORE reset and never cleared: it is a property
+	// of the derivation, not of the pod being reset onto.
+	diagnostic bool
 }
 
 // reset points the dedup at a fresh pod. The maps are reused across pods:
@@ -744,7 +765,15 @@ func (d *targetDedup) monitorHolder(url string) (*kubemeta.ScrapeTarget, bool) {
 	return held, true
 }
 
-func (d *targetDedup) add(t kubemeta.ScrapeTarget) {
+// add offers a target to the accumulator, reporting whether it was ACCEPTED —
+// false means the per-pod ceiling refused it and this pod will not be scraped
+// on that URL. The verdict is returned rather than merely counted because the
+// ceiling binds HERE and nowhere else: with two doors contributing, each
+// individually under the ceiling, no door can tell which of its own targets
+// survived, so /v1/explain can only name a refused port or endpoint by asking
+// the accumulator. The served path ignores the result (it reports the refusal
+// through obs.ScrapeTargetsCapped).
+func (d *targetDedup) add(t kubemeta.ScrapeTarget) bool {
 	i, taken := d.urlOwner[t.URL]
 	if !taken {
 		// The per-pod ceiling, counted on the NEW-URL arm only: a target that
@@ -754,19 +783,23 @@ func (d *targetDedup) add(t kubemeta.ScrapeTarget) {
 		// why it is counted and reported by /v1/explain rather than silent.
 		if len(*d.out)-d.base >= scrape.MaxPortsPerPod {
 			d.capped++
-			obs.ScrapeTargetsCapped.Inc()
-			return
+			if !d.diagnostic {
+				// See diagnostic: explain derives through this same seam, and
+				// a read-only diagnostic must not move a decision counter.
+				obs.ScrapeTargetsCapped.Inc()
+			}
+			return false
 		}
 		d.urlOwner[t.URL] = len(*d.out)
 		*d.out = append(*d.out, t)
-		return
+		return true
 	}
 	// pod source wins over service source, and a monitor wins over both.
 	held := &(*d.out)[i]
 	if configuredTarget(&t) && !configuredTarget(held) {
 		carryForward(&t, held)
 		*held = t
-		return
+		return true
 	}
 	// The holder keeps the URL — and carries forward from the target it
 	// displaces, on this path too. The preference is about which DECLARATION
@@ -778,6 +811,7 @@ func (d *targetDedup) add(t kubemeta.ScrapeTarget) {
 	// replace path, on the arm nobody had looked at. Which Service donates is
 	// deterministic: matchingServices preserves the snapshot's name order.
 	carryForward(held, &t)
+	return true
 }
 
 // carryForward moves the fields the losing target had and the winner lacks.

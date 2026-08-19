@@ -16,7 +16,9 @@ import (
 	"time"
 
 	"github.com/JohanLindvall/haste/rapidhash"
+	"github.com/JohanLindvall/kubescrape/internal/agent/attrs"
 	"github.com/JohanLindvall/kubescrape/internal/logline"
+	"github.com/JohanLindvall/kubescrape/pkg/kubemeta"
 	"github.com/JohanLindvall/multiline"
 	"github.com/JohanLindvall/multiline/cri"
 	"go.opentelemetry.io/collector/pdata/pcommon"
@@ -134,8 +136,20 @@ type file struct {
 	// buffered across a rotation is recovered.
 	ledger
 
-	resource    pcommon.Resource // resolved metadata, valid when resolved
-	resolved    bool
+	resource pcommon.Resource // resolved metadata, valid when resolved
+	resolved bool
+	// meta is the container metadata the resource was built from, retained for
+	// containerd files so buildResource can re-render without a second lookup
+	// when the NODE metadata changes. The maps inside are metaclient's, shared
+	// under its treat-as-immutable contract — this is a struct per tracked
+	// file, not a copy of the pod.
+	meta *kubemeta.ContainerMetadata
+	// nodeInfo is the node metadata the resource was built from, compared by
+	// POINTER against what the provider currently yields (refreshNodeAttrs).
+	// selfmeta.Poll allocates a fresh value per successful resolve, so pointer
+	// inequality is exactly "something new has been produced" — which a value
+	// comparison could not express anyway (NodeInfo carries maps).
+	nodeInfo    *attrs.NodeInfo
 	nextMetaTry time.Time
 	// metaBackoff is the current retry interval for this file's metadata
 	// lookup; it doubles per failure and resets on success.
@@ -166,6 +180,14 @@ type file struct {
 	podConfigErr string
 	multiline    *bool
 	podRules     *logline.LineFilter
+	// podService/podAttrs are the pod annotation's RESOURCE overrides, already
+	// vetted against reservedAttr. They are kept rather than applied once and
+	// forgotten because buildResource re-renders the resource whenever the node
+	// metadata changes, and the workload's overrides must survive that;
+	// re-parsing the annotation there would re-count obs.LogPodAttrsRefused and
+	// re-warn once per refresh, forever.
+	podService string
+	podAttrs   map[string]string
 
 	// Per-file line rate limiting (Config.RateLimit): a token bucket refilled
 	// by elapsed time. limited marks a paused file (tokens exhausted, reading

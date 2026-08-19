@@ -94,16 +94,31 @@ func TestEnrichLogsByPodUID(t *testing.T) {
 	}
 }
 
-func TestEnrichNeverOverwrites(t *testing.T) {
+// The sender is authoritative about what it CALLS itself and about the id it
+// was resolved BY; kubescrape is authoritative about the identity it resolved.
+// The split is attrs.ReservedIdentity minus the lookup keys — see mergeAttrs,
+// where the security argument lives.
+func TestEnrichKeepsSenderDescriptionAndOwnsResolvedIdentity(t *testing.T) {
 	ld := plog.NewLogs()
 	rl := ld.ResourceLogs().AppendEmpty()
-	rl.Resource().Attributes().PutStr("container.id", "cafe01")
-	rl.Resource().Attributes().PutStr("k8s.pod.name", "sender-chosen")
+	a := rl.Resource().Attributes()
+	a.PutStr("container.id", "cafe01")           // the lookup input: stays verbatim
+	a.PutStr("service.name", "checkout")         // descriptive: the sender's to choose
+	a.PutStr("deployment.environment", "canary") // not identity at all
+	a.PutStr("k8s.pod.name", "sender-chosen")    // resolved identity: ours
 	rl.ScopeLogs().AppendEmpty().LogRecords().AppendEmpty()
 
 	newEnricher(newMeta(), MetricsAuto).EnrichLogs(context.Background(), ld)
-	if v, _ := rl.Resource().Attributes().Get("k8s.pod.name"); v.Str() != "sender-chosen" {
-		t.Errorf("overwrote sender attribute: %q", v.Str())
+
+	for k, want := range map[string]string{
+		"container.id":           "cafe01",
+		"service.name":           "checkout",
+		"deployment.environment": "canary",
+		"k8s.pod.name":           "web-1",
+	} {
+		if v, _ := a.Get(k); v.Str() != want {
+			t.Errorf("%s = %q, want %q", k, v.Str(), want)
+		}
 	}
 }
 
@@ -839,5 +854,164 @@ func TestSplitPathCountsRejectedPeer(t *testing.T) {
 	}
 	if n := out.ResourceMetrics().At(0).Resource().Attributes().Len(); n != 0 {
 		t.Errorf("a vetoed peer still enriched the split resource (%d attrs)", n)
+	}
+}
+
+// A resolved sender keeps its whole OTLP service triple. service.namespace and
+// service.instance.id are exempted from the receipt strip
+// (senderControlledIdentity) for the same reason service.name is, and the
+// resolved-wins overwrite has to mean the same thing or the exemption is a
+// no-op on the far more common path: any sender this receiver CAN resolve.
+//
+// The concrete damage, which is why this is pinned rather than argued: those
+// two keys are what attrs.Identity derives service.namespace/service.instance.id
+// from, i.e. half the Prometheus job+instance pair. Overwriting them renames a
+// resolved sender's job to <k8s-namespace>/<service.name> and pins its instance
+// to the container ID — which changes on every container restart, minting a
+// fresh series each time.
+func TestResolvedSenderKeepsItsOwnServiceTriple(t *testing.T) {
+	ld := plog.NewLogs()
+	rl := ld.ResourceLogs().AppendEmpty()
+	a := rl.Resource().Attributes()
+	a.PutStr("container.id", "cafe01")
+	a.PutStr("service.name", "checkout")
+	a.PutStr("service.namespace", "shop")
+	a.PutStr("service.instance.id", "checkout-abcde")
+	rl.ScopeLogs().AppendEmpty().LogRecords().AppendEmpty()
+
+	newEnricher(newMeta(), MetricsAuto).EnrichLogs(context.Background(), ld)
+
+	for k, want := range map[string]string{
+		"service.name":        "checkout",
+		"service.namespace":   "shop",
+		"service.instance.id": "checkout-abcde",
+	} {
+		if v, _ := a.Get(k); v.Str() != want {
+			t.Errorf("%s = %q, want %q: a resolved lookup must not take the sender's own service identity", k, v.Str(), want)
+		}
+	}
+	// The resolved identity this receiver IS authoritative about still wins —
+	// k8s.namespace.name above all, which is what route keys tenancy on.
+	//
+	// Note what that means beside TestResolvedNamespaceBeatsASenderSClaimForRouting,
+	// which asserts the receiver's "two spellings of the same fact" agree: they
+	// agree only while the sender declares neither. A sender that names its own
+	// service.namespace makes them differ ON PURPOSE — service.namespace is an
+	// OTLP grouping the sender owns, not a second spelling of the Kubernetes
+	// namespace — and nothing keys on it, so the disagreement is inert.
+	if v, _ := a.Get("k8s.pod.name"); v.Str() != "web-1" {
+		t.Errorf("k8s.pod.name = %q, want web-1", v.Str())
+	}
+	if v, _ := a.Get("k8s.namespace.name"); v.Str() != "default" {
+		t.Errorf("k8s.namespace.name = %q, want default: the routing key is still ours", v.Str())
+	}
+}
+
+// The other half of the same decision: a sender that declares NEITHER still
+// gets both filled from the resolution, so nothing regresses for a plain SDK.
+// The exemption is "the sender stays authoritative", not "kubescrape stops
+// deriving".
+func TestResolvedSenderWithoutAServiceTripleStillGetsOne(t *testing.T) {
+	ld := plog.NewLogs()
+	rl := ld.ResourceLogs().AppendEmpty()
+	a := rl.Resource().Attributes()
+	a.PutStr("container.id", "cafe01")
+	rl.ScopeLogs().AppendEmpty().LogRecords().AppendEmpty()
+
+	newEnricher(newMeta(), MetricsAuto).EnrichLogs(context.Background(), ld)
+
+	for _, k := range []string{"service.namespace", "service.instance.id"} {
+		if v, ok := a.Get(k); !ok || v.Str() == "" {
+			t.Errorf("%s absent: fill-if-absent must still apply", k)
+		}
+	}
+}
+
+// The other arm of the same rule, pinned beside it so the asymmetry is a
+// decision and not an accident. On the datapoint/split path a resource names an
+// object OTHER than the sender, so the sender's service triple is its OWN and
+// says nothing about the described object: split.go strips the whole of
+// attrs.SenderIdentityKeys() — service.name, service.namespace and
+// service.instance.id included — and overwrites with the described object's.
+//
+// "The sender is authoritative about ITSELF" is the same sentence in both
+// places; only whose resource it is changes. Leaving the exporter's
+// service.instance.id here would put every described object's series on the
+// exporter's instance, which is the collision attrs.PrefixInstance exists to
+// prevent one level up.
+func TestSplitDescribedObjectDoesNotKeepTheSendersServiceTriple(t *testing.T) {
+	meta := &fakeMeta{pods: map[string]*kubemeta.Pod{
+		"pod-uid-2": {Name: "web-2", Namespace: "default", UID: "pod-uid-2", NodeName: "node1"},
+	}}
+	md := pmetric.NewMetrics()
+	rm := md.ResourceMetrics().AppendEmpty()
+	ra := rm.Resource().Attributes()
+	ra.PutStr("service.name", "kube-state-metrics")
+	ra.PutStr("service.namespace", "monitoring")
+	ra.PutStr("service.instance.id", "ksm-0")
+	g := rm.ScopeMetrics().AppendEmpty().Metrics().AppendEmpty()
+	g.SetName("kube_pod_status_ready")
+	dp := g.SetEmptyGauge().DataPoints().AppendEmpty()
+	dp.SetIntValue(1)
+	dp.Attributes().PutStr("k8s.pod.uid", "pod-uid-2") // a DIFFERENT object
+
+	out := newEnricher(meta, MetricsDatapoint).EnrichMetrics(context.Background(), md)
+
+	var found bool
+	for i := 0; i < out.ResourceMetrics().Len(); i++ {
+		a := out.ResourceMetrics().At(i).Resource().Attributes()
+		if v, _ := a.Get("k8s.pod.uid"); v.Str() != "pod-uid-2" {
+			continue
+		}
+		found = true
+		for _, k := range []string{"service.namespace", "service.instance.id"} {
+			v, _ := a.Get(k)
+			if v.Str() == "monitoring" || v.Str() == "ksm-0" {
+				t.Errorf("%s = %q: the exporter's own service identity survived onto an object it merely describes", k, v.Str())
+			}
+		}
+		if v, _ := a.Get("service.name"); v.Str() == "kube-state-metrics" {
+			t.Errorf("service.name = %q: same", v.Str())
+		}
+	}
+	if !found {
+		t.Fatal("no resource for the described pod")
+	}
+}
+
+// The residual documented at SenderIdentityStrip's lookup-key bullet, pinned as
+// BEHAVIOUR so the prose and the code cannot drift apart.
+//
+// The identity strip stops a sender from DECLARING someone else's namespace.
+// It does not stop it from being resolved into one: the metadata service's
+// /v1/pods/{ns}/{name} is unauthenticated and hands out container IDs, and the
+// container index is cluster-wide, so a stolen id plus no k8s.namespace.name of
+// one's own yields the victim's namespace — which internal/agent/route keys
+// tenancy on. The strip removes nothing here, because the forged value never
+// rides the wire; it is derived, correctly, from a stolen input.
+//
+// This test asserts the CURRENT, deliberate answer. If a later change closes
+// the hole it must fail — at which point the fix is to update it together with
+// the three places that describe the residual (this bullet, the CLAUDE.md
+// ingest bullet, and kubescrape_ingest_identity_stripped_total's help text),
+// never to delete it.
+func TestStolenLookupIDStillResolvesTheVictimsNamespace(t *testing.T) {
+	meta := &fakeMeta{containers: map[string]*kubemeta.ContainerMetadata{
+		"victim01": {Container: kubemeta.Container{Name: "api", ID: "containerd://victim01"},
+			Pod: kubemeta.Pod{Name: "api-0", Namespace: "payments", UID: "victim-uid", NodeName: "node9"}},
+	}}
+	ld := plog.NewLogs()
+	rl := ld.ResourceLogs().AppendEmpty()
+	a := rl.Resource().Attributes()
+	a.PutStr("container.id", "victim01") // read off the unauthenticated /v1/pods
+	rl.ScopeLogs().AppendEmpty().LogRecords().AppendEmpty()
+
+	newEnricher(meta, MetricsAuto).EnrichLogs(context.Background(), ld)
+
+	v, ok := a.Get("k8s.namespace.name")
+	if !ok || v.Str() != "payments" {
+		t.Fatalf("k8s.namespace.name = %q (present=%v), want %q — the documented residual changed; "+
+			"update SenderIdentityStrip's lookup-key bullet, the CLAUDE.md ingest bullet and the "+
+			"kubescrape_ingest_identity_stripped_total help text to match", v.Str(), ok, "payments")
 	}
 }

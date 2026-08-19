@@ -349,16 +349,36 @@ metadata:
     app.kubernetes.io/instance: kubescrape
     helm.sh/chart: kubescrape-0.1.0
 rules:
+  # Both objects below are split into a CREATE rule and a resourceNames-scoped
+  # get/update rule. RBAC ignores resourceNames on create — the object has no
+  # name until the request is admitted — so create must stay unscoped, which
+  # costs nothing: create alone cannot touch an object that already exists.
+  # get/update are the verbs that CAN reach a foreign object, and the code only
+  # ever names ONE Lease and ONE ConfigMap, both rendered from the same values
+  # into the flags below, so scoping them is free. Unscoped, this Role let
+  # anything running in the events pod rewrite the kubescrape-agent-config
+  # ConfigMap this chart puts in the same namespace — pointing every agent's
+  # `export:` at another collector on its next restart. Keep the two halves in
+  # step with -events-lease / -events-position-configmap: a name changed in one
+  # place and not the other is a startup that cannot read its own position.
   # Leader election: exactly one replica may watch, or every event ships twice.
   - apiGroups: ["coordination.k8s.io"]
     resources: ["leases"]
-    verbs: ["get", "create", "update"]
+    verbs: ["create"]
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    resourceNames: ["kubescrape-cluster-leader"]
+    verbs: ["get", "update"]
   # The resume position. It cannot be a node-local file like the tailer's
   # positions store: the leader moves, and the successor after a kill is a
   # different pod that must be able to read where the previous one got to.
   - apiGroups: [""]
     resources: ["configmaps"]
-    verbs: ["get", "create", "update"]
+    verbs: ["create"]
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    resourceNames: ["kubescrape-events-position"]
+    verbs: ["get", "update"]
 ---
 # Source: kubescrape/templates/events.yaml
 apiVersion: rbac.authorization.k8s.io/v1

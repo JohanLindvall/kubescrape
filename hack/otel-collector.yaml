@@ -3,12 +3,18 @@
 # summaries via the debug exporter, and — the part assertions depend on —
 # writes every received payload verbatim through the FILE exporter.
 #
-# The debug exporter only prints summaries ("N log records"), which can prove
-# that data arrived but never that an ATTRIBUTE HAS THE RIGHT VALUE. hack/e2e.sh
-# and hack/chaos/* need the latter, so the file exporter captures the payloads
-# and a busybox `reader` sidecar exists purely to `cat` them back out: the
-# collector image is distroless, so `kubectl exec`/`kubectl cp` into it fail
-# (no shell, no tar).
+# At `verbosity: normal` (set below, and load-bearing — see the note there) the
+# debug exporter prints a summary line per push ("N log records", "N data
+# points") AND one line per item: a log record's BODY plus its record
+# attributes, a metric data point's NAME plus its data-point attributes and
+# value. What it never prints at any verbosity below `detailed` is the RESOURCE
+# — normal's marshalers walk ResourceLogs/ResourceMetrics only to reach the
+# leaves and never render resource attributes — so stdout can prove that data
+# arrived, and that a metric NAME or a log BODY is present, but never that a
+# RESOURCE ATTRIBUTE HAS THE RIGHT VALUE. hack/e2e.sh and hack/chaos/* need the
+# latter, so the file exporter captures the payloads verbatim and a busybox
+# `reader` sidecar exists purely to `cat` them back out: the collector image is
+# distroless, so `kubectl exec`/`kubectl cp` into it fail (no shell, no tar).
 #
 # Its own internal metrics (port 8888) are annotated for scraping, closing the
 # loop: the agent scrapes the collector and exports the result back to it.
@@ -26,6 +32,15 @@ data:
             endpoint: 0.0.0.0:4317
     exporters:
       debug:
+        # LOAD-BEARING, not cosmetic. `basic` returns from pushMetrics/pushLogs
+        # BEFORE the marshaler runs, leaving only the summary line — and
+        # hack/e2e.sh's negotiating_scraped() greps collector stdout for the
+        # metric NAME `e2e_classic_latency_seconds`, which only the
+        # per-data-point line carries. Lowering this to trim kind disk usage
+        # makes that assertion time out at its full 180s budget with no hint
+        # why. `detailed` goes the other way: it prints whole payloads, and the
+        # kubelet rotates the collector's own stdout within seconds
+        # (hack/kind-config.yaml sets containerLogMaxSize: 1Mi).
         verbosity: normal
       # One file per signal, read back by the `reader` sidecar. Rotation keeps
       # a long run from filling the node; assertions grab a snapshot and look

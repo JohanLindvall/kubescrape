@@ -34,16 +34,50 @@ func (t *Tailer) drainFile(ctx context.Context, f *file) bool {
 // — kubelet rotates at 10MiB, rate-limit pause mode accumulates arbitrary
 // backlogs); the cap is only a circuit breaker against a source that outruns the
 // drain forever (a writer holding the rotated fd open, or a gzip bomb).
-// It reports false when a mid-drain flush FAILED and rewound this file: the
-// rewind seeks the very fd
-// being drained back to the committed offset, so continuing would re-read the
-// same bytes into a batch whose export just failed — a hot loop burning
-// export attempts on the single sweep goroutine until the 1 GiB cap. The
-// caller must abort and retry the whole drain on a later sweep instead
-// (sweep cadence is the backoff; nothing is lost — the fd stays held and the
-// offsets are rewound).
+//
+// It reports false when the drain did NOT reach the end of the source, which is
+// two cases and both mean "the caller must not treat this incarnation as fully
+// drained":
+//
+//   - a mid-drain flush FAILED and rewound this file: the rewind seeks the very
+//     fd being drained back to the committed offset, so continuing would re-read
+//     the same bytes into a batch whose export just failed — a hot loop burning
+//     export attempts on the single sweep goroutine until the cap. The caller
+//     must abort and retry the whole drain on a later sweep instead (sweep
+//     cadence is the backoff; nothing is lost — the fd stays held and the
+//     offsets are rewound).
+//   - the cap fired. This used to return the same `true` as EOF, and that made
+//     the circuit breaker a SILENT DATA LOSS on the one caller that reads the
+//     verdict: handleRotation then completed the rotation as if the old inode
+//     were exhausted, and everything past the 1 GiB mark became unreachable
+//     forever — no obs.LogPrefixLost, no obs.LogDrainErrors, nothing but one log
+//     line (the sibling read-error arm below was fixed for exactly this class).
+//     A 4 GiB backlog — an agent down for an hour, or a source outrunning the
+//     per-sweep budget — is ordinary, not pathological. Reporting the drain
+//     unfinished routes it into the machinery that already exists for
+//     "un-drained rename": reopen records the old incarnation as an OPEN-ENDED
+//     segment and feedSegments replays it across sweeps under MaxBytesPerSweep,
+//     which is exactly what readFile's own segment gate does when it rotates a
+//     file it may not read yet. The circuit breaker keeps its real job — one
+//     drain call never holds the single sweep goroutine for more than drainCap
+//     bytes — and stops being a loss.
+//
+// The cost of that choice, said out loud because it is what the cap was written
+// to prevent: while the replay is unfinished the LIVE TAIL is not read (readFile
+// gates on it, or the joiner would fuse lines across the gap), so a writer that
+// genuinely outruns the drain forever now gates the new incarnation instead of
+// abandoning the old one. That is the right trade — in that scenario the writer
+// is still writing to the ROTATED inode (it never reopened), so the data being
+// followed is the data being produced — and it is bounded from below by
+// chargeStall only for a replay making NO progress. The alternative on offer was
+// discarding gigabytes with every loss counter flat.
 func (t *Tailer) drainReader(ctx context.Context, f *file, r io.Reader, what string) bool {
-	const drainCap = 1 << 30
+	drainCap := t.drainCap
+	if drainCap <= 0 {
+		// New always sets it; a zero here would read as "drain nothing", which
+		// is the one behaviour this function must never have.
+		drainCap = defaultDrainCap
+	}
 	buf := t.scratch()
 	if len(f.pending) > 0 {
 		// A rate-limit-paused file may hold already-read unconsumed lines; they
@@ -90,8 +124,14 @@ func (t *Tailer) drainReader(ctx context.Context, f *file, r io.Reader, what str
 			return true
 		}
 	}
-	t.log.Error("source still yielding after draining 1GiB, abandoning remainder", "path", f.path, "source", what)
-	return true
+	// Not an Error any more: the remainder is owed, not lost. It stays visible
+	// (a source that outruns a 1 GiB drain is worth an operator's attention —
+	// it is how a deep backlog or a writer that never reopened after logrotate
+	// announces itself) but no loss counter moves, because nothing was given
+	// up on: the caller records the un-drained remainder as a segment.
+	t.log.Warn("source still yielding after draining the per-drain cap; the remainder is replayed as a segment",
+		"path", f.path, "source", what, "drained", drained)
+	return false
 }
 
 // reopen switches to the file now at the path and resets the byte position so
@@ -125,12 +165,33 @@ func (t *Tailer) reopen(ctx context.Context, f *file, renamed, drained bool) {
 	// no longer exists anywhere).
 	if len(f.pending) > 0 {
 		t.consume(ctx, f, true)
-		if n := len(f.pending); n > 0 && renamed {
-			// A trailing unterminated fragment of a RENAMED-away inode can
-			// never complete (the old file is not followed after the drain);
-			// it dies with the reset below on every path — live, rewind
-			// re-feed, and crash-restart (replaySegment feeds only terminated
-			// lines) — so at minimum the loss is visible.
+		if n := len(f.pending); n > 0 && renamed && drained && !f.discarding {
+			// A trailing unterminated fragment of a FULLY DRAINED, RENAMED-away
+			// inode can never complete (the old file is not followed once the
+			// drain reached its end); it dies with the reset below on every
+			// path — live, rewind re-feed, and crash-restart (replaySegment
+			// feeds only terminated lines) — so at minimum the loss is visible.
+			//
+			// The two gates say "these bytes are not a lost line":
+			//
+			// `drained` — an UNFINISHED drain (a mid-drain flush failure, or
+			// the per-drain cap) does not abandon the old inode: the aborted
+			// arm below records it as an OPEN-ENDED segment whose owed range
+			// starts at committed, so this fragment is re-read and completed by
+			// the replay. Counting it here reported a loss for a line that is
+			// then delivered — a false positive on the tailer's own loss
+			// signal, which is worse than useless because it is
+			// indistinguishable from the real thing.
+			//
+			// !f.discarding is the same gate drainGone's structurally
+			// identical block applies: while discarding, these bytes are the
+			// TAIL of an oversized line whose prefix consume already dropped
+			// and already counted into obs.LogOversizedDropped. Counting them
+			// here too moves two loss counters for ONE physical line, and the
+			// Warn — the only human-readable report the oversize path produces
+			// at all — would name the residual fragment (a few KiB) for a drop
+			// of megabytes and blame a rotation that destroyed nothing which
+			// could ever have become a record.
 			obs.LogTornFinalLines.Inc()
 			t.log.Warn("unterminated final line lost at rotation", "path", f.path, "bytes", n)
 		}
@@ -198,8 +259,19 @@ func (t *Tailer) reopen(ctx context.Context, f *file, renamed, drained bool) {
 		// reads to EOF under its own budget and pins `to` then. The normal
 		// fedEnd > committed test cannot be used here because the rewind purged
 		// the pipeline, so nothing would be recorded at all.
+		//
+		// fedTo starts at the FED boundary, which is the one thing that
+		// differs between the two ways a drain can end unfinished. A flush
+		// failure purged the pipeline and rewound, so fedEnd() is floored back
+		// to committed and this is a no-op — the replay re-reads from
+		// committed, as it must. The CAP purged nothing: [committed, fedEnd)
+		// is in the unflushed batch, so resuming at committed would deliver
+		// every one of those records twice for no reason. A later rewind
+		// zeroes fedTo (ledger.reset) and the replay falls back to committed,
+		// which is exactly the contract fedTo already carries.
 		f.segments = append(f.segments, keep(&segment{
-			id: f.tail, inode: f.inode, fp: f.fp, committed: f.committed, to: -1, fed: false,
+			id: f.tail, inode: f.inode, fp: f.fp, committed: f.committed,
+			fedTo: fedEnd, to: -1, fed: false,
 		}))
 		hopAdded = true
 	} else if renamed && fedEnd > f.committed {
@@ -822,11 +894,23 @@ func (t *Tailer) drainGone(ctx context.Context, f *file) {
 		// A large archive is read incrementally across sweeps; a deletion
 		// mid-read leaves the rest readable from the open fd.
 		t.drainArchive(ctx, f)
-	} else {
-		// An aborted drain (mid-drain flush failure) is fine here: drainGone
-		// runs every sweep until settledGone, which stays false while the
-		// rewound range is uncommitted.
-		_ = t.drainFile(ctx, f)
+	} else if !t.drainFile(ctx, f) {
+		// The drain did not reach the end of the inode — a mid-drain flush
+		// failure rewound it, or the per-drain cap fired on a deep backlog.
+		// Stop the cycle here rather than falling through to the settle
+		// accounting below: goneEnd is what releases the file, and stamping it
+		// from a fed boundary the drain never reached would settle the entry —
+		// closing the ONLY handle to the unlinked inode — with its remainder
+		// unread and no counter moving. drainGone re-runs every sweep until
+		// settledGone, so the next one continues from where this fd stopped
+		// (the flush-failure case was always safe this way: the rewind lowers
+		// committed, so settledGone could not fire — the cap case had no such
+		// protection).
+		//
+		// Not feeding pending here is deliberate too: with bytes still owed,
+		// pending is a fragment with more of its line to come, not the
+		// unterminated final line the block below exists for.
+		return
 	}
 	if len(f.pending) > 0 {
 		// An unterminated final line (a process killed mid-write) can never be

@@ -52,7 +52,7 @@ func TestLogChainExportVsInPlaceTransformIsRaceFree(t *testing.T) {
 			defer pushers.Done()
 			for i := 0; i < 200; i++ {
 				ld := pushLogs(map[string][]string{"web": {"x one", "x two"}})
-				if !s.applyLogChain(ld) {
+				if _, forward := s.applyLogChain(ld); !forward {
 					t.Error("payload unexpectedly emptied")
 					return
 				}

@@ -191,22 +191,31 @@ spec:
             - -logs-poll-interval={{ .Values.agent.logsPollInterval }}
             - -logs-fingerprint-bytes={{ int64 .Values.agent.logsFingerprintBytes }}
             - -logs-multiline={{ .Values.agent.multiline }}
-            {{- /* Default: this release's namespace AND the namespace of every
-                   in-cluster UNCONDITIONAL destination this chart renders — the
-                   -otlp-endpoint flag and each per-signal `agent.config.export`
-                   override. Every line the agent tails goes to those, the
-                   destination's own included, so tailing their namespaces is a
-                   loop that amplifies precisely when the destination is already
-                   slow. The release namespace is not enough on its own: the
-                   endpoint defaults to otel-collector.monitoring, so a release
-                   installed anywhere else would tail the collector's own
-                   namespace.
+            {{- /* Default: this release's namespace AND the namespace of the
+                   ONE in-cluster destination this chart renders for the LOGS
+                   signal — `agent.config.export.logs.endpoint` when it names
+                   one, otherwise the -otlp-endpoint flag. Every line the agent
+                   tails goes there, the destination's own included, so tailing
+                   its namespace is a loop that amplifies precisely when the
+                   destination is already slow. The release namespace is not
+                   enough on its own: the endpoint defaults to
+                   otel-collector.monitoring, so a release installed anywhere
+                   else would tail the collector's own namespace.
 
                    It used to read the FLAG endpoint alone, so the collectorless
                    arrangement the export section exists for — `export.logs`
                    pointing at an in-cluster gateway while the flag keeps its
                    default — reopened exactly this loop. Silently: the files are
                    skipped at DISCOVERY, so nothing counts and nothing warns.
+                   The first fix then read BOTH, which broke the same rule from
+                   the other side: with `export.logs` set, `ExportOverride.merged`
+                   REPLACES the base for that signal, so the flag endpoint is a
+                   metrics/traces-only address (or, with all three overridden,
+                   one `BuildExporter` never dials at all) and excluding its
+                   namespace stopped collecting logs it never caused — just as
+                   silently, and invisible to the goldens because every chartcheck
+                   fixture rendered into `monitoring`, the default endpoint's own
+                   namespace, where the two terms collapse under `uniq`.
 
                    `agent.config.routing` routes are deliberately NOT read: a
                    route is selected BY namespace and the per-tenant shape names
@@ -226,24 +235,32 @@ spec:
                    about receiving them". A metrics or traces destination
                    receives nothing this flag can suppress, so excluding its
                    namespace would silently stop collecting logs it never
-                   caused — the flag's base endpoint and the export section's
-                   LOGS endpoint are therefore the only two candidates. A
-                   `routing` route is deliberately not one either: routing
-                   keys ON namespace, so a per-tenant route names the very
-                   namespace whose logs it exists to deliver. */}}
-            {{-   $eps := list (.Values.agent.otlp.endpoint | default "") }}
+                   caused. There is exactly ONE logs destination, never two:
+                   this mirrors `otlpexport.ExportOverride.merged`, where a
+                   non-empty `export.logs.endpoint` REPLACES the base for that
+                   signal rather than adding to it. Do NOT "simplify" this back
+                   into a list of both — that reopens the over-exclusion above,
+                   and the collectorless shape (all three signals overridden)
+                   would exclude the namespace of an address nothing dials.
+                   An export.logs section with an EMPTY endpoint inherits the
+                   base, which is why the fallback is the flag rather than "".
+                   A `routing` route is deliberately not a candidate either:
+                   routing keys ON namespace, so a per-tenant route names the
+                   very namespace whose logs it exists to deliver. */}}
+            {{-   $logsEP := .Values.agent.otlp.endpoint | default "" }}
             {{-   $exp := (get $cfg "export") | default dict }}
             {{-   if kindIs "map" $exp }}
             {{-     $o := (get $exp "logs") | default dict }}
             {{-     if kindIs "map" $o }}
-            {{-       $eps = append $eps ((get $o "endpoint") | default "") }}
+            {{-       $ov := (get $o "endpoint") | default "" }}
+            {{-       if $ov }}
+            {{-         $logsEP = $ov }}
+            {{-       end }}
             {{-     end }}
             {{-   end }}
-            {{-   range $ep := $eps }}
-            {{-     $ns := include "kubescrape.inClusterNamespace" $ep }}
-            {{-     if $ns }}
-            {{-       $excl = append $excl $ns }}
-            {{-     end }}
+            {{-   $ns := include "kubescrape.inClusterNamespace" $logsEP }}
+            {{-   if $ns }}
+            {{-     $excl = append $excl $ns }}
             {{-   end }}
             {{-   $excl = uniq $excl }}
             {{- end }}

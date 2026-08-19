@@ -47,6 +47,19 @@ package transform
 //     both render fresh pdata per export, and the set's failed-chunk retention
 //     (export.go's retain) keeps raw SAMPLES that the next export re-renders —
 //     never the pdata subtree, so a transformed payload cannot re-enter here.
+//   - agent/cgroupstats (Sampler.Run's export loop and FinalExport) — marked at
+//     the agent's call sites for the same reason internal/metrics is: the mark
+//     belongs where the retry policy is known. Its failure path, checked rather
+//     than assumed: export() renders from snapshot(), which RESETS every
+//     container's window as it reads it, so a failed send has nothing left to
+//     re-offer — the windows are counted lost (CgroupWindowsDropped
+//     {reason="export_failed"}) and the next interval measures new ones.
+//     It is the one marker that touches the payload after the call returns,
+//     reading md.ResourceMetrics().Len() for that counter; under an in-place
+//     script run the count is therefore of the post-script survivors. Nothing
+//     re-enters the seam, so the promise's substance holds — but a marker that
+//     reads back at all is exactly what this list exists to have looked at, and
+//     the honest repair is to take the count BEFORE the export, not to unmark.
 //
 // Who must NOT hand off, and keeps the copy:
 //

@@ -6,6 +6,8 @@ import (
 	"strings"
 	"testing"
 
+	"go.opentelemetry.io/collector/pdata/pmetric"
+
 	"github.com/JohanLindvall/kubescrape/pkg/cgroupid"
 )
 
@@ -338,6 +340,21 @@ func impostors(podSlice string) []impostorRow {
 			why: "conmon is an immediate child of the pod slice and parses to a container id, so only the missing pod attribution tells it apart",
 		},
 		{
+			name: "crio-conmon-scope/supervising-a-known-container",
+			// The same shape as the one above, with the id of a container the
+			// metadata service DOES know. That is the ordinary case on a CRI-O
+			// node — conmon carries the id of the container it supervises, so
+			// every conmon scope beside a running container has one — and it is
+			// the case a fixture built on an unresolvable id cannot reach: the
+			// impostor only becomes a twin of the real container once the lookup
+			// it must not make would have SUCCEEDED.
+			labels: []Label{
+				{Name: "id", Value: podSlice + "/crio-conmon-" + appCID + ".scope"},
+				{Name: "name", Value: "crio-conmon-" + appCID + ".scope"},
+			},
+			why: "conmon is an immediate child of the pod slice and parses to a container id, so only the missing pod attribution tells it apart",
+		},
+		{
 			name: "kata-vmm-cgroup",
 			labels: []Label{
 				{Name: "id", Value: podSlice + "/kata_" + pauseCID},
@@ -573,6 +590,177 @@ func TestIsPauseImage(t *testing.T) {
 	for _, c := range cases {
 		if got := isPauseImage(c.image); got != c.want {
 			t.Errorf("isPauseImage(%q) = %v, want %v", c.image, got, c.want)
+		}
+	}
+}
+
+// crioCadvisorBody is one pod as a CRI-O node reports it with the default
+// conmon_cgroup = "pod" (mandatory under cgroup_manager = "cgroupfs", and the
+// pair Kubernetes' own container-runtimes doc prescribes): beside each
+// container's own scope sits crio-conmon-<containerID>.scope, the SUPERVISOR's
+// cgroup, which cadvisor's raw handler reports with no namespace/pod/container
+// labels at all — and whose name carries the supervised container's id, which
+// pkg/cgroupid.Parse extracts on purpose.
+func crioCadvisorBody(podSlice string) string {
+	return fmt.Sprintf(`# TYPE container_cpu_usage_seconds_total counter
+container_cpu_usage_seconds_total{container="app",id=%q,image="img:1",name="k8s_app_pod1_ns1",namespace="ns1",pod="pod1"} 12.5
+container_cpu_usage_seconds_total{container="",id=%q,image="",name=%q,namespace="",pod=""} 0.02
+container_cpu_usage_seconds_total{container="POD",id=%q,image=%q,name="k8s_POD_pod1_ns1",namespace="ns1",pod="pod1"} 0.03
+container_cpu_usage_seconds_total{container="",id=%q,image="",name=%q,namespace="",pod=""} 0.01
+container_cpu_usage_seconds_total{container="",id=%q,image="",name="",namespace="ns1",pod="pod1"} 12.9
+`,
+		podSlice+"/crio-"+appCID+".scope",
+		podSlice+"/crio-conmon-"+appCID+".scope", "crio-conmon-"+appCID+".scope",
+		podSlice+"/crio-"+pauseCID+".scope", pauseImage,
+		podSlice+"/crio-conmon-"+pauseCID+".scope", "crio-conmon-"+pauseCID+".scope",
+		podSlice)
+}
+
+// resourceShape is one emitted ResourceMetrics reduced to IDENTITY: its
+// rendered attribute set, plus the rendered attribute set of every data point
+// under each metric name. Values are deliberately absent — two ResourceMetrics
+// rendering one attribute set are ONE Prometheus series downstream however far
+// apart their values are, which is exactly what makes the duplicate invisible
+// in every counter the agent publishes.
+type resourceShape struct {
+	attrs  string
+	points map[string][]string
+}
+
+// cadvisorShapes scrapes body and returns the shapes per EXPORTED BATCH. Per
+// batch, because a batch is the payload a duplicate identity is a duplicate
+// in: one resource legitimately reappears in a later chunk when the byte
+// budget splits a scrape.
+func cadvisorShapes(t *testing.T, body string, disableRollups bool) [][]resourceShape {
+	t.Helper()
+	srv := serveBody(t, body)
+	exp := &captureExporter{}
+	s := newKubeletScraper(t, srv.URL, &fakeMetaSource{}, exp, disableRollups)
+	if _, err := s.scrapeCadvisor(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	var out [][]resourceShape
+	for _, md := range exp.batches {
+		var batch []resourceShape
+		rms := md.ResourceMetrics()
+		for i := 0; i < rms.Len(); i++ {
+			rm := rms.At(i)
+			sh := resourceShape{attrs: fmt.Sprint(rm.Resource().Attributes().AsRaw()), points: map[string][]string{}}
+			sms := rm.ScopeMetrics()
+			for j := 0; j < sms.Len(); j++ {
+				ms := sms.At(j).Metrics()
+				for k := 0; k < ms.Len(); k++ {
+					m := ms.At(k)
+					if m.Type() != pmetric.MetricTypeSum {
+						continue
+					}
+					dps := m.Sum().DataPoints()
+					for d := 0; d < dps.Len(); d++ {
+						sh.points[m.Name()] = append(sh.points[m.Name()], fmt.Sprint(dps.At(d).Attributes().AsRaw()))
+					}
+				}
+			}
+			batch = append(batch, sh)
+		}
+		out = append(out, batch)
+	}
+	return out
+}
+
+// assertDistinctCadvisorIdentities is the whole invariant in one place: inside
+// one exported payload, no two ResourceMetrics may render the same attribute
+// set, and no two data points of one metric on one resource may render the same
+// attributes. Either collapses into a single Prometheus series receiving two
+// conflicting samples per scrape — and for the cumulative container_* families
+// that is not a lost point but a fabricated counter reset on every scrape,
+// with every scrape counter reading healthy.
+func assertDistinctCadvisorIdentities(t *testing.T, body string, disableRollups bool) {
+	t.Helper()
+	for b, batch := range cadvisorShapes(t, body, disableRollups) {
+		seen := map[string]int{}
+		for _, sh := range batch {
+			seen[sh.attrs]++
+		}
+		if len(seen) != len(batch) {
+			for a, n := range seen {
+				if n > 1 {
+					t.Errorf("batch %d: %d ResourceMetrics share one attribute set — one series, two samples per scrape:\n%s", b, n, a)
+				}
+			}
+		}
+		for _, sh := range batch {
+			for name, dps := range sh.points {
+				pseen := map[string]int{}
+				for _, dp := range dps {
+					pseen[dp]++
+				}
+				for a, n := range pseen {
+					if n > 1 {
+						t.Errorf("batch %d: metric %s on resource %s has %d data points with identical attributes %s",
+							b, name, sh.attrs, n, a)
+					}
+				}
+			}
+		}
+	}
+}
+
+// TestConmonScopeDoesNotDuplicateTheContainerResource is the pin for the CRI-O
+// supervisor scope.
+//
+// isSandbox correctly declines to FOLD a conmon row (it carries no pod
+// attribution, so nothing says WHOSE sandbox it would be), which buys it its
+// own resource KEY — but nothing stopped the metadata lookup from filling that
+// resource with the SUPERVISED container's metadata, since the row's cgroup
+// path carries that container's id. The result was two ResourceMetrics with
+// byte-identical attribute sets, each carrying the same cumulative container_*
+// families with attribute-less points holding unrelated values: the workload's
+// 12.5 and its supervisor's 0.02 landing on one series every scrape.
+//
+// Both halves of the fix are load-bearing and this test needs both:
+// lookupContainerID refuses the lookup, and keepsCgroupID keeps the `id` label
+// on a row whose identity came from the path alone.
+func TestConmonScopeDoesNotDuplicateTheContainerResource(t *testing.T) {
+	for _, podSlice := range []string{systemdPodSlice(uid1), cgroupfsPodSlice(uid1)} {
+		for _, disableRollups := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/rollups=%v", podSlice[:9], !disableRollups), func(t *testing.T) {
+				body := crioCadvisorBody(podSlice)
+				assertDistinctCadvisorIdentities(t, body, disableRollups)
+
+				// The workload's own resource must still be the enriched one, and
+				// must still carry exactly its own point: refusing the impostor's
+				// lookup may not cost the real row its identity.
+				points, _, attrs := cadvisorPoints(t, body, disableRollups)
+				container := uid1 + "/" + appCID + "/app"
+				if attrs[container]["service.name"] != "dep1" || attrs[container]["k8s.pod.name"] != "pod1" {
+					t.Fatalf("the real container resource lost its identity: %v", attrs[container])
+				}
+				if len(points[container]) != 1 || !strings.HasSuffix(points[container][0], "|12.5") {
+					t.Errorf("the workload container's points = %v, want only its own 12.5 cpu row", points[container])
+				}
+			})
+		}
+	}
+}
+
+// TestCadvisorImpostorRowsCannotDuplicateARealResource runs every impostor
+// shape through a full scrape of the pod it is parked in and asserts the same
+// invariant. It is the general form of the conmon case: an unattributable
+// cgroup must never render an attribute set identical to a real container's or
+// to the pod cgroup's, whether it reached that identity through a metadata
+// lookup (conmon, whose path yields a resolvable container id) or by sharing
+// the pod's resource key outright (kata's kata_<id>, whose path yields no
+// container id at all and so keys exactly like the pod's own cgroup).
+func TestCadvisorImpostorRowsCannotDuplicateARealResource(t *testing.T) {
+	podSlice := systemdPodSlice(uid1)
+	for _, imp := range impostors(podSlice) {
+		for _, disableRollups := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/rollups=%v", imp.name, !disableRollups), func(t *testing.T) {
+				const head = "# TYPE container_cpu_usage_seconds_total counter\n"
+				body := head + cadvisorRow("container_cpu_usage_seconds_total", imp.labels, 99) +
+					strings.TrimPrefix(containerdCadvisorBody(podSlice), head)
+				assertDistinctCadvisorIdentities(t, body, disableRollups)
+			})
 		}
 	}
 }

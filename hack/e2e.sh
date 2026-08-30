@@ -78,6 +78,16 @@ trap cleanup EXIT
 # and only the next assertion (a 404 on /debug/targets) exposed it. An e2e that
 # can pass vacuously is worse than one that fails, so a collision dies here,
 # loudly, naming the port.
+# have_ss records whether ss(8) can be used to prove a port-forward bound the
+# port we asked for. Resolved once: it is the difference between a real check
+# and a degraded one, not something to re-probe per call.
+# PROBED, not merely looked up: a broken ss, or one that cannot report pids,
+# passes `command -v` and then never matches, which would fail every run for a
+# reason that has nothing to do with the product being tested.
+have_ss=0
+ss -ltnp >/dev/null 2>&1 && have_ss=1
+warned_no_ss=0
+
 port_forward() {
   local pf_err
   pf_err="$(mktemp)"
@@ -102,7 +112,20 @@ port_forward() {
     # The listener must be OURS. Asking only whether the port is listening is
     # the same vacuous check one level down: a squatter satisfies it, which is
     # exactly the failure being defended against.
-    if ss -ltnp 2>/dev/null | grep "127.0.0.1:$1 " | grep -q "pid=$pid,"; then
+    if [ "$have_ss" = 1 ]; then
+      if ss -ltnp 2>/dev/null | grep "127.0.0.1:$1 " | grep -q "pid=$pid,"; then
+        rm -f "$pf_err"; return 0
+      fi
+    elif [ "$waited" -ge 5 ]; then
+      # No ss: this check cannot prove the listener is ours, and failing the run
+      # over a MISSING TOOL would be this guard breaking the thing it protects.
+      # Fall back to what is still knowable — the process is alive and wrote no
+      # bind error — which is no weaker than the unchecked original, and say so
+      # once so a silent misdirection is at least an expected one.
+      if [ "$warned_no_ss" != 1 ]; then
+        echo "note: ss(8) not found; port-forward bind checking is degraded" >&2
+        warned_no_ss=1
+      fi
       rm -f "$pf_err"; return 0
     fi
     sleep 0.1

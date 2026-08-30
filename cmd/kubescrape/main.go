@@ -12,6 +12,7 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"maps"
 	"net/http"
 	"os"
 	"os/signal"
@@ -164,26 +165,48 @@ func registerOwnerInformers(metaFactory metadatainformer.SharedInformerFactory, 
 	return listers, synced, nil
 }
 
-// ownerChangeHandler bumps the owner change token on real changes only.
+// ownerChangeHandler bumps the owner change token on changes that can actually
+// be SEEN, which is a narrower thing than "the object was written".
 //
-// The resourceVersion comparison on update is the whole subtlety. client-go
-// re-delivers every cached object each `-resync` period as an update whose old
-// and new are byte-identical, so bumping unconditionally would advance the
-// token for every owner, namespace and node in the cluster on a timer — and the
-// memo this token exists to make usable would lapse on that timer instead of on
-// change, giving back exactly what it buys. An unchanged resourceVersion means
-// the API server did not modify the object; a modified one always changes it.
+// Everything this package's informers serve is UID + labels + annotations
+// (owners.Resolver.clusterScoped and Resolve, via kubemeta.CopyMeta), and UID
+// is immutable — so an update touching neither map cannot change any response
+// and must not advance the token.
 //
-// A tombstone on delete carries the object, but the token only has to move, so
-// the shape is irrelevant here.
+// COMPARING resourceVersion IS NOT THAT, and the difference is the whole
+// mechanism working or not. The API server changes the resourceVersion on every
+// write including status-only ones, and the objects behind AllGVRs are written
+// constantly for reasons their metadata never reflects: a kubelet rewrites its
+// Node's status on nodeStatusReportFrequency (5 minutes by default), so a
+// 200-node cluster produces a node write about every 1.5 seconds; a Deployment
+// or ReplicaSet's status moves on every scale and rollout; a Job's counts move
+// throughout its life. This token is SHARED by every node's memo, so each of
+// those would invalidate the whole fleet's — against agents polling every 30s,
+// an RV-keyed token is bumped tens of times between one agent's polls and the
+// memo never validates, while a benchmark (which has no such churn) still
+// reports the full win. Comparing the served maps is both cheaper to be right
+// about and immune to whatever else the object carries.
+//
+// It also subsumes the resync case for free: client-go re-delivers every cached
+// object each `-resync` period, and an identical object compares equal.
+//
+// An unrecognised object type bumps rather than assumes — an unexpected shape
+// is not evidence that nothing changed. A tombstone on delete carries the
+// object, but the token only has to move, so its shape is irrelevant there.
 func ownerChangeHandler(changes *owners.Changes) cache.ResourceEventHandlerFuncs {
 	return cache.ResourceEventHandlerFuncs{
 		AddFunc: func(any) { changes.Bump() },
 		UpdateFunc: func(oldObj, newObj any) {
 			o, okOld := oldObj.(*metav1.PartialObjectMetadata)
 			n, okNew := newObj.(*metav1.PartialObjectMetadata)
-			if okOld && okNew && o.ResourceVersion == n.ResourceVersion {
-				return // a resync re-delivering an unchanged object
+			// Raw maps, not the filtered ones kubemeta.CopyMeta would produce:
+			// running the annotation filter on every event to spot a change
+			// only in an annotation that gets dropped anyway would cost more
+			// than the spare bump it saves, and the spare bump is safe.
+			if okOld && okNew &&
+				maps.Equal(o.Labels, n.Labels) &&
+				maps.Equal(o.Annotations, n.Annotations) {
+				return
 			}
 			changes.Bump()
 		},

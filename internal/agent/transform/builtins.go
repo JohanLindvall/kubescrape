@@ -178,13 +178,20 @@ var scriptLogGates sync.Map // signal -> *logdedupe.Throttle
 // by log(msg) and by print(): the universe's print is reachable from every
 // script, and with Thread.Print unset starlark-go falls back to
 // fmt.Fprintln(os.Stderr) — unstructured lines injected raw into the agent's
-// own stream (non-JSON under -log-format=json), unthrottled. One in-cluster
-// minute measured 68 such print lines against 17 correctly throttled log()
-// ones. They share ONE gate deliberately: the flood is what matters, not which
-// spelling produced it.
+// own stream, unthrottled. One in-cluster minute measured 68 such print lines
+// against 17 correctly throttled log() ones. They share ONE gate deliberately:
+// the flood is what matters, not which spelling produced it.
+//
+// The attribute is `output` and NOT `msg`, which is what it used to be: `msg`
+// is slog's own key for the record's message, so the line carried two of them
+// — `msg="transform script log" … msg="<whatever the script said>"` — and a
+// consumer resolving duplicates last-wins reads the SCRIPT's text as the log
+// message. That is a script writing into a reserved field of the agent's own
+// log, which is a worse property than the unthrottled stderr this function
+// exists to prevent.
 func scriptLog(signal, msg string) {
 	if scriptLogAllowed(signal) {
-		slog.Info("transform script log", "signal", signal, "msg", msg)
+		slog.Info("transform script log", "signal", signal, "output", msg)
 	}
 }
 
@@ -210,7 +217,7 @@ func logBuiltin(signal string) *starlark.Builtin {
 		if !ok {
 			s = msg.String()
 		}
-		slog.Info("transform script log", "signal", signal, "msg", s)
+		slog.Info("transform script log", "signal", signal, "output", s)
 		return starlark.None, nil
 	})
 }

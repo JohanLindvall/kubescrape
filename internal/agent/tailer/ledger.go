@@ -138,6 +138,20 @@ type file struct {
 
 	resource pcommon.Resource // resolved metadata, valid when resolved
 	resolved bool
+	// discovered stamps when this file was first tracked. Nothing is read
+	// before a file resolves, so a file that never resolves produces no
+	// records, moves no counter and loses nothing — the one failure mode in
+	// this package with no symptom at all. publishStatus warns about files that
+	// have been waiting since longer ago than unresolvedWarnAfter, which is
+	// what tells "the metadata service is down" from "this container started a
+	// second ago".
+	discovered time.Time
+	// oversized counts unterminated lines this file had discarded for
+	// exceeding MaxEntryBytes (the aggregate is
+	// kubescrape_log_oversized_dropped_total, which cannot say WHICH file).
+	// Bumped where the counter is, on the first over-cap slab of a line — not
+	// per read chunk and not per line, so it is off the per-line path.
+	oversized int
 	// meta is the container metadata the resource was built from, retained for
 	// containerd files so buildResource can re-render without a second lookup
 	// when the NODE metadata changes. The maps inside are metaclient's, shared

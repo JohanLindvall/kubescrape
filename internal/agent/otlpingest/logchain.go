@@ -54,6 +54,7 @@ package otlpingest
 //     visibility, and the store's own DroppedCapped counter plus this one
 //     are the alert surface.
 import (
+	"time"
 	"unicode/utf8"
 
 	"go.opentelemetry.io/collector/pdata/pcommon"
@@ -125,17 +126,25 @@ func (s *Server) applyLogChain(ld plog.Logs) (chainCommit, bool) {
 	if s.cfg.Rules != nil || s.cfg.LogMetrics != nil {
 		resolver = logchain.New()
 	}
+	// Per-push tallies for the one line the skips get (noteChainSkipped). They
+	// are ints on the stack, incremented beside the counters; the reporting
+	// happens once, after the loop, because these bounds bind for whole
+	// PUSHES — a per-resource or per-record line would be a flood a sender
+	// chooses the volume of.
+	var skipped chainSkips
 	rls := ld.ResourceLogs()
 	for i := 0; i < rls.Len(); i++ {
 		rl := rls.At(i)
 		rattrs := rl.Resource().Attributes()
 		observe := s.cfg.LogMetrics != nil
 		if observe && i >= maxObservedResources {
-			obs.IngestChainSkipped.WithLabelValues("resources_capped").Inc()
+			obs.IngestChainSkipped.WithLabelValues(chainSkipResources).Inc()
+			skipped.resources++
 			observe = false
 		}
 		if observe && rattrs.Len() > maxObservedResourceAttrs {
-			obs.IngestChainSkipped.WithLabelValues("resource_too_wide").Inc()
+			obs.IngestChainSkipped.WithLabelValues(chainSkipTooWide).Inc()
+			skipped.tooWide++
 			observe = false
 		}
 		if resolver != nil {
@@ -159,7 +168,8 @@ func (s *Server) applyLogChain(ld plog.Logs) (chainCommit, bool) {
 			sls.At(j).LogRecords().RemoveIf(func(lr plog.LogRecord) bool {
 				body, ok := chainBody(lr)
 				if !ok {
-					obs.IngestChainSkipped.WithLabelValues("body_too_large").Inc()
+					obs.IngestChainSkipped.WithLabelValues(chainSkipBody).Inc()
+					skipped.bodies++
 				}
 				// LIFT, before enrichment and before anything selects on the
 				// record: the producers' chain is scrub -> lift -> enrich ->
@@ -208,7 +218,68 @@ func (s *Server) applyLogChain(ld plog.Logs) (chainCommit, bool) {
 		}
 	}
 	logchain.Prune(ld)
+	s.noteChainSkipped(skipped)
 	return cc, ld.ResourceLogs().Len() > 0
+}
+
+// The reason label of obs.IngestChainSkipped, and the keys the skip warning
+// throttles on. Named constants because the counter and the line must agree:
+// an operator reading the metric's reason and grepping for it has to find the
+// line that explains it.
+const (
+	chainSkipResources = "resources_capped"
+	chainSkipTooWide   = "resource_too_wide"
+	chainSkipBody      = "body_too_large"
+)
+
+// chainSkips tallies one push's line-derived-processing skips.
+type chainSkips struct {
+	resources int
+	tooWide   int
+	bodies    int
+}
+
+// chainSkipWarnEvery paces the skip warning per reason. Each bound is a
+// property of how the SENDER batches, so it binds on every push until the
+// sender changes.
+const chainSkipWarnEvery = time.Minute
+
+// noteChainSkipped narrates the abuse bounds that silently degrade a pushed
+// payload. The data is still forwarded, which is exactly why this is easy to
+// miss: nothing is dropped, nothing 429s, the sender sees success — but the
+// records skipped here were NOT observed into logMetrics and NOT evaluated
+// against logs.rules, so a metric silently under-counts and a drop rule
+// silently fails to fire, for pushed lines only. The counter carries the rate;
+// this says which bound and how far past it the sender is.
+func (s *Server) noteChainSkipped(sk chainSkips) {
+	if sk.resources == 0 && sk.tooWide == 0 && sk.bodies == 0 {
+		return
+	}
+	warn := func(reason, msg string, args ...any) {
+		if allow, _ := s.chainSkipWarns.Allow(reason); !allow {
+			return
+		}
+		s.log.Warn(msg, append([]any{"reason", reason}, args...)...)
+	}
+	if sk.resources > 0 {
+		warn(chainSkipResources,
+			"ingest: a push carried more resources than log-derived metrics observe, so the remainder was "+
+				"forwarded WITHOUT being observed or rule-evaluated; have the sender batch fewer resources",
+			"resources", sk.resources, "maxResources", maxObservedResources)
+	}
+	if sk.tooWide > 0 {
+		warn(chainSkipTooWide,
+			"ingest: a pushed resource declares more attributes than log-derived metrics will retain, so its "+
+				"records were forwarded WITHOUT being observed or rule-evaluated (the store retains a "+
+				"serialization of the whole resource per series, so its width is retained heap)",
+			"resources", sk.tooWide, "maxAttributes", maxObservedResourceAttrs)
+	}
+	if sk.bodies > 0 {
+		warn(chainSkipBody,
+			"ingest: pushed log bodies exceeded the size line-derived processing will render, so they were "+
+				"forwarded WITHOUT enrichment, log-metric observation or rule evaluation",
+			"records", sk.bodies, "maxBytes", maxChainBodyBytes)
+	}
 }
 
 // chainBody renders the ONE text view of a body that enrichment, log-metrics

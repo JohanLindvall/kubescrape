@@ -27,7 +27,7 @@ func TestMergeBareEndpointIsANoOp(t *testing.T) {
 		MetricRelabelings: []kubemeta.RelabelRule{dropRule},
 	})
 	want := held
-	if _, conflict := MergeMonitorEndpoint(&held, "ns/b", &servicemonitors.Endpoint{Port: "metrics"}); conflict {
+	if rep := MergeMonitorEndpoint(&held, "ns/b", &servicemonitors.Endpoint{Port: "metrics"}); rep.AuthConflict {
 		t.Error("a bare endpoint reported an auth conflict")
 	}
 	if held.Monitors != nil {
@@ -44,9 +44,9 @@ func TestMergeConcatenatesRelabelingsAfterWinners(t *testing.T) {
 	held := mergeHeld("ns/a", servicemonitors.Endpoint{
 		MetricRelabelings: []kubemeta.RelabelRule{dropRule},
 	})
-	if _, conflict := MergeMonitorEndpoint(&held, "ns/b", &servicemonitors.Endpoint{
+	if rep := MergeMonitorEndpoint(&held, "ns/b", &servicemonitors.Endpoint{
 		MetricRelabelings: []kubemeta.RelabelRule{keepRule},
-	}); conflict {
+	}); rep.AuthConflict {
 		t.Error("relabelings reported as an auth conflict")
 	}
 	if len(held.MetricRelabelings) != 2 ||
@@ -66,7 +66,7 @@ func TestMergeSkipsIdenticalRelabelChain(t *testing.T) {
 	held := mergeHeld("ns/a", servicemonitors.Endpoint{
 		MetricRelabelings: []kubemeta.RelabelRule{dropRule, keepRule},
 	})
-	_, _ = MergeMonitorEndpoint(&held, "ns/a", &servicemonitors.Endpoint{
+	_ = MergeMonitorEndpoint(&held, "ns/a", &servicemonitors.Endpoint{
 		MetricRelabelings: []kubemeta.RelabelRule{dropRule, keepRule},
 	})
 	if len(held.MetricRelabelings) != 2 {
@@ -102,7 +102,7 @@ func TestMergeCadence(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			held := mergeHeld("ns/a", servicemonitors.Endpoint{Interval: tc.heldIv, ScrapeTimeout: tc.heldTo})
-			_, _ = MergeMonitorEndpoint(&held, "ns/b", &servicemonitors.Endpoint{Interval: tc.epIv, ScrapeTimeout: tc.epTo})
+			_ = MergeMonitorEndpoint(&held, "ns/b", &servicemonitors.Endpoint{Interval: tc.epIv, ScrapeTimeout: tc.epTo})
 			if held.Interval != tc.wantIv || held.ScrapeTimeout != tc.wantTo {
 				t.Errorf("cadence = %q/%q, want %q/%q", held.Interval, held.ScrapeTimeout, tc.wantIv, tc.wantTo)
 			}
@@ -120,11 +120,11 @@ func TestMergeAdoptsOneSidedAuthWhole(t *testing.T) {
 	held := mergeHeld("ns/a", servicemonitors.Endpoint{
 		MetricRelabelings: []kubemeta.RelabelRule{dropRule},
 	})
-	if _, conflict := MergeMonitorEndpoint(&held, "ns/b", &servicemonitors.Endpoint{
+	if rep := MergeMonitorEndpoint(&held, "ns/b", &servicemonitors.Endpoint{
 		BearerSecret:  "ns/tok/token",
 		TLSCA:         "ns/ca/ca.crt",
 		TLSServerName: "svc.internal",
-	}); conflict {
+	}); rep.AuthConflict {
 		t.Error("one-sided auth reported as a conflict")
 	}
 	if held.AuthSecret != "ns/tok/token" || held.TLSCA != "ns/ca/ca.crt" || held.TLSServerName != "svc.internal" {
@@ -140,14 +140,14 @@ func TestMergeAdoptsOneSidedAuthWhole(t *testing.T) {
 // declaration.
 func TestMergeAuthIdenticalKeepsConflictingReports(t *testing.T) {
 	held := mergeHeld("ns/a", servicemonitors.Endpoint{BearerSecret: "ns/tok/token"})
-	if _, conflict := MergeMonitorEndpoint(&held, "ns/b", &servicemonitors.Endpoint{BearerSecret: "ns/tok/token"}); conflict {
+	if rep := MergeMonitorEndpoint(&held, "ns/b", &servicemonitors.Endpoint{BearerSecret: "ns/tok/token"}); rep.AuthConflict {
 		t.Error("identical auth reported as a conflict")
 	}
 	if held.Monitors != nil {
 		t.Errorf("identical auth listed a contributor: %v", held.Monitors)
 	}
 
-	if _, conflict := MergeMonitorEndpoint(&held, "ns/c", &servicemonitors.Endpoint{BearerSecret: "ns/other/token"}); !conflict {
+	if rep := MergeMonitorEndpoint(&held, "ns/c", &servicemonitors.Endpoint{BearerSecret: "ns/other/token"}); !rep.AuthConflict {
 		t.Error("differing auth not reported as a conflict")
 	}
 	if held.AuthSecret != "ns/tok/token" {
@@ -157,7 +157,7 @@ func TestMergeAuthIdenticalKeepsConflictingReports(t *testing.T) {
 	// decision, and a monitor that verifies must conflict with one that does
 	// not.
 	held2 := mergeHeld("ns/a", servicemonitors.Endpoint{InsecureSkipVerify: true})
-	if _, conflict := MergeMonitorEndpoint(&held2, "ns/b", &servicemonitors.Endpoint{BearerSecret: "ns/tok/token"}); !conflict {
+	if rep := MergeMonitorEndpoint(&held2, "ns/b", &servicemonitors.Endpoint{BearerSecret: "ns/tok/token"}); !rep.AuthConflict {
 		t.Error("skip-verify vs bearer not reported as a conflict")
 	}
 	if !held2.InsecureSkipVerify || held2.AuthSecret != "" {
@@ -170,11 +170,11 @@ func TestMergeAuthIdenticalKeepsConflictingReports(t *testing.T) {
 // refused.
 func TestMergeConflictStillMergesTheRest(t *testing.T) {
 	held := mergeHeld("ns/a", servicemonitors.Endpoint{BearerSecret: "ns/tok/token"})
-	if _, conflict := MergeMonitorEndpoint(&held, "ns/b", &servicemonitors.Endpoint{
+	if rep := MergeMonitorEndpoint(&held, "ns/b", &servicemonitors.Endpoint{
 		BearerSecret:      "ns/other/token",
 		MetricRelabelings: []kubemeta.RelabelRule{dropRule},
 		Interval:          "10s",
-	}); !conflict {
+	}); !rep.AuthConflict {
 		t.Error("differing auth not reported")
 	}
 	if held.AuthSecret != "ns/tok/token" {
@@ -208,7 +208,7 @@ func TestMergeDoesNotAliasTheEndpointsRules(t *testing.T) {
 	if &held.MetricRelabelings[0] == &epA.MetricRelabelings[0] {
 		t.Fatal("stampEndpoint aliased the indexed endpoint's rule slice instead of copying it")
 	}
-	_, _ = MergeMonitorEndpoint(&held, "ns/b", &servicemonitors.Endpoint{
+	_ = MergeMonitorEndpoint(&held, "ns/b", &servicemonitors.Endpoint{
 		MetricRelabelings: []kubemeta.RelabelRule{keepRule},
 	})
 	if len(epA.MetricRelabelings) != 1 || epA.MetricRelabelings[0].Regex != dropRule.Regex {
@@ -239,7 +239,7 @@ func TestMergeSameMonitorSecondEndpointIsNotAContributor(t *testing.T) {
 			held := mergeHeld("ns/pm", servicemonitors.Endpoint{
 				MetricRelabelings: []kubemeta.RelabelRule{dropRule},
 			})
-			_, _ = MergeMonitorEndpoint(&held, "ns/pm", &tc.ep)
+			_ = MergeMonitorEndpoint(&held, "ns/pm", &tc.ep)
 			if held.Monitors != nil {
 				t.Errorf("a single monitor's second endpoint produced monitors = %v, want absent", held.Monitors)
 			}
@@ -249,8 +249,8 @@ func TestMergeSameMonitorSecondEndpointIsNotAContributor(t *testing.T) {
 	// A genuinely second monitor arriving AFTER the holder's own extra endpoint
 	// still lists both — the holder first.
 	held := mergeHeld("ns/pm", servicemonitors.Endpoint{})
-	_, _ = MergeMonitorEndpoint(&held, "ns/pm", &servicemonitors.Endpoint{Interval: "15s"})
-	_, _ = MergeMonitorEndpoint(&held, "ns/other", &servicemonitors.Endpoint{
+	_ = MergeMonitorEndpoint(&held, "ns/pm", &servicemonitors.Endpoint{Interval: "15s"})
+	_ = MergeMonitorEndpoint(&held, "ns/other", &servicemonitors.Endpoint{
 		MetricRelabelings: []kubemeta.RelabelRule{keepRule},
 	})
 	if want := []string{"ns/pm", "ns/other"}; !slices.Equal(held.Monitors, want) {

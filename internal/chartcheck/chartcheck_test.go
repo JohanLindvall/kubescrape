@@ -217,6 +217,34 @@ func TestValuesSchemaRejectsUnknownKeys(t *testing.T) {
 // what protects subchart use, where the parent's schema does not apply. Each
 // assertion is on the one thing both error texts name — the value's key —
 // so a future reshuffle of which layer fires first stays green.
+// serviceGraph.enabled alone used to render a complete StatefulSet that the
+// binary then refused to start: the shard's internal span receiver is reachable
+// from every pod in the cluster, so the agent requires
+// -service-graph-token-file, and the template simply omitted the flag when
+// tokenSecret.name was empty. `helm install` succeeded, every shard
+// CrashLoopBackOff'd, and the reason was visible only in a pod log. The refusal
+// belongs where it can still be acted on. Both directions are asserted, because
+// a guard that also refuses the WORKING config is worse than none: without a
+// token the render must fail naming the value, and with one it must render.
+func TestServiceGraphWithoutTokenIsRefusedAtRender(t *testing.T) {
+	helm := helmBin(t)
+
+	out, err := exec.Command(helm, "template", "kubescrape", "../../charts/kubescrape",
+		"--namespace", "monitoring", "--set", "serviceGraph.enabled=true").CombinedOutput()
+	if err == nil {
+		t.Errorf("serviceGraph.enabled with no tokenSecret.name rendered fine; the binary refuses that flag list, so this is a CrashLoop shipped as a successful install:\n%s", out)
+	} else if !strings.Contains(string(out), "serviceGraph.tokenSecret.name") {
+		t.Errorf("the refusal does not name the value an operator has to set: %s", out)
+	}
+
+	if out, err := exec.Command(helm, "template", "kubescrape", "../../charts/kubescrape",
+		"--namespace", "monitoring",
+		"--set", "serviceGraph.enabled=true",
+		"--set", "serviceGraph.tokenSecret.name=kubescrape-service-graph").CombinedOutput(); err != nil {
+		t.Errorf("naming a tokenSecret must render: %v\n%s", err, out)
+	}
+}
+
 func TestLogsMetricsMaxBytesRejectsHumanSizes(t *testing.T) {
 	helm := helmBin(t)
 	for _, extra := range [][]string{

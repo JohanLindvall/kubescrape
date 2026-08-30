@@ -91,7 +91,9 @@ func TestAuditPartialSendFailsFastCountedOnce(t *testing.T) {
 	}
 	defer func() { _ = c.Close() }()
 
-	beforeErr := obs.Exports.WithLabelValues("logs", "error").Value()
+	// "transient" is the outcome a 503 classifies to (see Class): the label is
+	// the payload's fate, not a bare ok/error.
+	beforeErr := obs.Exports.WithLabelValues("logs", "transient").Value()
 	err = c.ExportLogs(context.Background(), buildLogs(1, 2000, 60))
 	if err == nil {
 		t.Fatal("expected error when part 2 fails")
@@ -100,8 +102,8 @@ func TestAuditPartialSendFailsFastCountedOnce(t *testing.T) {
 	if posts.Load() != 2 {
 		t.Fatalf("posts = %d, want 2 (fail-fast, no send after the failure)", posts.Load())
 	}
-	if delta := obs.Exports.WithLabelValues("logs", "error").Value() - beforeErr; delta != 1 {
-		t.Fatalf("obs.Exports{logs,error} delta = %v, want exactly 1", delta)
+	if delta := obs.Exports.WithLabelValues("logs", "transient").Value() - beforeErr; delta != 1 {
+		t.Fatalf("obs.Exports{logs,transient} delta = %v, want exactly 1", delta)
 	}
 }
 

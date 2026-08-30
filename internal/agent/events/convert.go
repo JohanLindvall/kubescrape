@@ -181,13 +181,24 @@ func (r *Reader) buildResource(ctx context.Context, e *corev1.Event) pcommon.Res
 
 	resolved := false
 	if obj.Kind == "Pod" && obj.Name != "" && obj.Namespace != "" && r.cfg.Meta != nil {
-		if pod, err := r.cfg.Meta.PodByName(ctx, obj.Namespace, obj.Name); err == nil && pod != nil {
-			// Cross-check the UID: a recreated pod of the same name must not
-			// lend its identity to an event about its predecessor.
-			if obj.UID == "" || string(obj.UID) == pod.UID {
-				actx.Pod = pod
-				resolved = true
-			}
+		pod, err := r.cfg.Meta.PodByName(ctx, obj.Namespace, obj.Name)
+		switch {
+		case err != nil || pod == nil:
+			// The correlation this pipeline exists for is what just failed, and
+			// nothing downstream can tell: the event still exports, under the
+			// identity it carries, so every other counter stays green. See
+			// obs.EventsUnresolved.
+			r.reportUnresolved(&obj, reasonLookup, err)
+		case obj.UID != "" && string(obj.UID) != pod.UID:
+			// A pod of that name exists but is a different incarnation, so
+			// adopting it would attribute this event to the wrong pod. Refusing
+			// is right; being silent about it is not — this arm issues a
+			// SUCCESSFUL lookup, so kubescrape_metadata_requests_total cannot
+			// show it either.
+			r.reportUnresolved(&obj, reasonUIDMismatch, nil)
+		default:
+			actx.Pod = pod
+			resolved = true
 		}
 	}
 	a := res.Attributes()
@@ -210,6 +221,47 @@ func (r *Reader) buildResource(ctx context.Context, e *corev1.Event) pcommon.Res
 	}
 	r.cfg.Attrs.Build(res, actx)
 	return res
+}
+
+// Reasons for obs.EventsUnresolved. Metric label VALUES, named once so
+// publishMetrics can give each of them a series at zero — a reason that only
+// appears the first time a cluster produces it is the absent-vs-zero defect the
+// publication exists to close.
+const (
+	reasonLookup      = "lookup"
+	reasonUIDMismatch = "uid_mismatch"
+)
+
+// unresolvedReasons is every value reportUnresolved can pass.
+var unresolvedReasons = []string{reasonLookup, reasonUIDMismatch}
+
+// unresolvedWarnEvery re-warns about unresolvable involved pods at this
+// cadence. The condition is a state (the metadata service is unreachable, or a
+// whole ReplicaSet is past its tombstone TTL), noticed once per distinct
+// involved object per batch — a flood proportional to the cluster's event rate
+// without the throttle.
+const unresolvedWarnEvery = 5 * time.Minute
+
+// reportUnresolved records that an event about a Pod is being exported without
+// that pod's resolved identity: a counter for the rate, a per-object Debug for
+// "why did THIS one lose its labels", and a throttled Warn so the condition is
+// visible without one.
+//
+// Debug is not guarded: every argument is a field read or an already-materialised
+// error, and this runs once per distinct involved object per batch (resource()
+// memoizes), not per event.
+func (r *Reader) reportUnresolved(obj *corev1.ObjectReference, reason string, err error) {
+	obs.EventsUnresolved.WithLabelValues(reason).Inc()
+	args := []any{"reason", reason, "namespace", obj.Namespace, "pod", obj.Name, "uid", string(obj.UID)}
+	if err != nil {
+		// Only when there IS one: the uid_mismatch arm has no error, and
+		// error=<nil> on a line reads as an error nobody can look up.
+		args = append(args, "error", err)
+	}
+	r.log.Debug("the involved pod did not resolve; the event keeps the identity it carries", args...)
+	if r.unresolvedWarn.Allow(unresolvedWarnEvery) {
+		r.log.Warn("events about pods are being exported without the pod's resolved identity (owner chain, labels, node, service.name), so they will not correlate with that pod's logs and metrics", args...)
+	}
 }
 
 // convert groups the batch into one ResourceLogs per involved object. The

@@ -2,6 +2,7 @@ package metrics
 
 import (
 	"context"
+	"log/slog"
 	"sync/atomic"
 	"time"
 
@@ -58,15 +59,21 @@ func (s *DynamicMetricSet) Run(ctx context.Context, exp Exporter, interval time.
 		// killed the process with a runtime panic instead of doing the obvious
 		// thing. Nothing to export on a zero interval; the caller's shutdown
 		// flush still runs.
+		//
+		// SAID OUT LOUD, because the configuration is otherwise indistinguishable
+		// from a working one from the outside: every line is still matched and
+		// observed (the per-line cost is paid in full), the series still expire,
+		// and nothing is ever sent. The effective-config dump prints the interval;
+		// this prints the CONSEQUENCE.
+		s.logger().Warn("log-derived metrics are observed but never exported: the export interval is zero",
+			"interval", interval, "flag", "-logs-metrics-interval", "rules", s.Count)
 		<-ctx.Done()
 		return
 	}
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
-		if err := s.Export(ctx, exp, maxBytes); err != nil {
-			s.log.Warn("exporting log metrics failed", "error", err)
-		}
+		s.noteExport(s.Export(ctx, exp, maxBytes))
 		select {
 		case <-ctx.Done():
 			return
@@ -74,6 +81,71 @@ func (s *DynamicMetricSet) Run(ctx context.Context, exp Exporter, interval time.
 		}
 	}
 }
+
+// noteExport reports one export cycle's outcome as a TRANSITION rather than
+// once per interval.
+//
+// The old shape was one Warn per failed cycle, which on a fleet is one line per
+// node per interval for as long as the collector is down — and, worse, it had
+// no counterpart: an operator watching the lines stop could not tell a recovery
+// from a process that had stopped exporting altogether. So the first failure of
+// a run warns immediately, the repeats restate themselves at reWarnInterval
+// carrying the cost so far, and the recovery is one Info naming what the outage
+// cost. Nothing here is the RATE: the samples that survived are retained (and
+// re-offered), and the ones that did not move
+// kubescrape_log_metrics_dropped_undelivered_total.
+func (s *DynamicMetricSet) noteExport(err error) {
+	s.exportMu.Lock()
+	if err != nil {
+		s.exportFailures++
+		if s.exportFailures == 1 {
+			s.exportFailedAt = time.Now()
+		}
+		n, since := s.exportFailures, time.Since(s.exportFailedAt).Round(time.Second)
+		s.exportMu.Unlock()
+		if n == 1 {
+			// Claim the slot this Warn occupies, or the SECOND failure — a
+			// millisecond later, on the next tick — wins an unclaimed throttle
+			// and warns again.
+			s.exportWarn.Allow(reWarnInterval)
+		}
+		if n == 1 || s.exportWarn.Allow(reWarnInterval) {
+			s.logger().Warn("exporting log metrics failed; the undelivered samples are retained and re-offered",
+				"error", err, "attempts", n, "since", since)
+			return
+		}
+		s.logger().Debug("exporting log metrics failed", "error", err, "attempts", n)
+		return
+	}
+	n, since := s.exportFailures, time.Duration(0)
+	if n > 0 {
+		since = time.Since(s.exportFailedAt).Round(time.Second)
+		s.exportFailures = 0
+	}
+	s.exportMu.Unlock()
+	if n > 0 {
+		s.logger().Info("exporting log metrics succeeded again", "attempts", n, "since", since)
+	}
+}
+
+// logger is the set's logger, defaulting to slog.Default().
+//
+// NewDynamicMetricSet always fills the field, but a set built literally (this
+// package's own tests do it, to reach retain and the export loop without
+// compiling a rule set) leaves it nil, and a nil *slog.Logger panics on use —
+// which is a bad trade for a line whose whole purpose is diagnostics.
+func (s *DynamicMetricSet) logger() *slog.Logger {
+	if s.log == nil {
+		return slog.Default()
+	}
+	return s.log
+}
+
+// reWarnInterval is how often a persisting export or retention failure
+// restates itself. Long against the export interval (so a node contributes at
+// most a line per five minutes to a fleet-wide outage) and short against an
+// operator's attention.
+const reWarnInterval = 5 * time.Minute
 
 // seriesSamples pairs a series with the samples that belong to one resource.
 type seriesSamples struct {
@@ -229,6 +301,7 @@ func (s *DynamicMetricSet) retain(byResource map[string][]seriesSamples, chunk [
 			s.retainedSamples += len(e.samples)
 		}
 	}
+	evicted, lastVictim := 0, ""
 	for len(s.retryOrder) > maxRetainedResources || (s.retainedSamples > maxRetainedSamples && len(s.retryOrder) > 0) {
 		i := s.stalestRetained()
 		victim := s.retryOrder[i]
@@ -238,6 +311,21 @@ func (s *DynamicMetricSet) retain(byResource map[string][]seriesSamples, chunk [
 		}
 		delete(s.retryBy, victim)
 		s.drops.addRetained(1)
+		evicted, lastVictim = evicted+1, victim
+	}
+	// THIS IS LOSS, and it was counted without ever being described: the
+	// retention is what makes a failed export at-least-once, so a resource
+	// evicted from it is observations that no export will ever carry. The
+	// counter (kubescrape_log_metrics_dropped_undelivered_total) says how many;
+	// only a line can say which resource and against which of the two bounds —
+	// the resource cap and the sample cap bind for different reasons and are
+	// tuned separately. Aggregated per retain call and throttled, because a
+	// deep outage evicts on every cycle.
+	if evicted > 0 && s.evictWarn.Allow(reWarnInterval) {
+		s.logger().Warn("dropping undelivered log-metrics samples: the re-offer buffer is full, so these observations are lost",
+			"dropped", evicted, "resource", lastVictim,
+			"resources", len(s.retryOrder), "maxResources", maxRetainedResources,
+			"samples", s.retainedSamples, "maxSamples", maxRetainedSamples)
 	}
 }
 

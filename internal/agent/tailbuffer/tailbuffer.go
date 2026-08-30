@@ -409,6 +409,19 @@ type Buffer struct {
 	lateKept   *metrics.RegCounter
 	lateDrop   *metrics.RegCounter
 	earlyCount map[string]*metrics.RegCounter
+	// earlyPending accumulates early decisions per reason since the last drain
+	// that actually REPORTED them (a suppressed drain leaves them standing, so
+	// the line describes the window it names), and earlyWarn throttles that
+	// report on earlyEvery — a field only so tests can drive the window. The
+	// DECISION path is
+	// allocation-budgeted and runs per trace under the mutex, so it may only
+	// bump a counter; the line belongs to the sweep, which is the repo's rule
+	// for anything a hot path notices (see the tailer's per-line counters).
+	// Pre-populated with every reason at New, so the increment never grows the
+	// map.
+	earlyPending map[string]int
+	earlyWarn    logdedupe.Throttle
+	earlyEvery   time.Duration
 
 	warnGate logdedupe.Throttle
 }
@@ -454,23 +467,25 @@ func New(cfg Config, next TracesExporter, log *slog.Logger) (*Buffer, error) {
 		return nil, err
 	}
 	b := &Buffer{
-		ev:         ev,
-		next:       next,
-		set:        set,
-		tick:       tickFor(set.wait),
-		log:        log,
-		now:        time.Now,
-		trace:      make(map[pcommon.TraceID]*bufTrace, 1024),
-		cache:      newDecisionCache(set.cacheSize, set.cacheTTL),
-		res:        make(map[pcommon.TraceID]ptrace.ResourceSpans, 64),
-		cur:        make(map[pcommon.TraceID]ptrace.ScopeSpans, 64),
-		byPolicy:   make(map[string]policyCounters),
-		spansKept:  obs.TailSampleSpans.WithLabelValues("kept"),
-		spansDrop:  obs.TailSampleSpans.WithLabelValues("dropped"),
-		spansLost:  obs.TailSampleSpans.WithLabelValues("lost"),
-		lateKept:   obs.TailSampleLate.WithLabelValues("kept"),
-		lateDrop:   obs.TailSampleLate.WithLabelValues("dropped"),
-		earlyCount: make(map[string]*metrics.RegCounter, 4),
+		ev:           ev,
+		next:         next,
+		set:          set,
+		tick:         tickFor(set.wait),
+		log:          log,
+		now:          time.Now,
+		trace:        make(map[pcommon.TraceID]*bufTrace, 1024),
+		cache:        newDecisionCache(set.cacheSize, set.cacheTTL),
+		res:          make(map[pcommon.TraceID]ptrace.ResourceSpans, 64),
+		cur:          make(map[pcommon.TraceID]ptrace.ScopeSpans, 64),
+		byPolicy:     make(map[string]policyCounters),
+		spansKept:    obs.TailSampleSpans.WithLabelValues("kept"),
+		spansDrop:    obs.TailSampleSpans.WithLabelValues("dropped"),
+		spansLost:    obs.TailSampleSpans.WithLabelValues("lost"),
+		lateKept:     obs.TailSampleLate.WithLabelValues("kept"),
+		lateDrop:     obs.TailSampleLate.WithLabelValues("dropped"),
+		earlyCount:   make(map[string]*metrics.RegCounter, 4),
+		earlyPending: make(map[string]int, 4),
+		earlyEvery:   earlyWarnEvery,
 	}
 	// "" is the no-policy-had-an-opinion default drop, which is a real and
 	// important outcome — it is what a policy list that matches nothing looks
@@ -483,6 +498,7 @@ func New(cfg Config, next TracesExporter, log *slog.Logger) (*Buffer, error) {
 	}
 	for _, r := range []string{reasonSpansPerTrace, reasonMaxTraces, reasonMaxSpans, reasonShutdown} {
 		b.earlyCount[r] = obs.TailSampleEarly.WithLabelValues(r)
+		b.earlyPending[r] = 0
 	}
 	return b, nil
 }
@@ -866,6 +882,7 @@ func (b *Buffer) decide(out *outbound, e *bufTrace, now time.Time, reason string
 	}
 	if reason != "" {
 		b.earlyCount[reason].Inc()
+		b.earlyPending[reason]++ // reported by the sweep, never from here
 	}
 
 	b.remove(e)
@@ -1019,7 +1036,14 @@ func (b *Buffer) drain(ctx context.Context, all bool) {
 		b.head++
 		b.decide(&out, e, now, reason)
 	}
+	early, report := b.takeEarlyLocked()
 	b.mu.Unlock()
+
+	// Outside the mutex: the report must never hold the lock every concurrent
+	// receive goroutine needs.
+	if report {
+		b.reportEarly(early)
+	}
 
 	if out.spans == 0 {
 		return
@@ -1086,6 +1110,76 @@ func (b *Buffer) sendRetry(ctx context.Context, td ptrace.Traces) error {
 		return b.next.ExportTraces(ctx, td)
 	})
 }
+
+// earlyReport is one sweep's worth of early decisions, taken out of the buffer
+// so the line can be written with the mutex released.
+type earlyReport struct {
+	spansPerTrace, maxTraces, maxSpans, shutdown int
+}
+
+func (e earlyReport) any() bool {
+	// shutdown is deliberately excluded from "is there anything to say": a
+	// graceful stop decides every buffered trace early BY DESIGN, so warning
+	// about it would put a scary line in every rolling update. The count still
+	// rides on the line when one of the real bounds also bound, and
+	// kubescrape_tail_sampling_early_decisions_total{reason="shutdown"} carries
+	// it either way.
+	return e.spansPerTrace > 0 || e.maxTraces > 0 || e.maxSpans > 0
+}
+
+// takeEarlyLocked decides whether this drain may emit the aggregate line and,
+// ONLY IF IT MAY, drains the pending tallies. Called with the mutex held.
+//
+// The order is the whole point. Draining unconditionally and throttling the
+// line afterwards zeroes the tallies on every sweep — a 100ms-1s ticker — while
+// the line that eventually escapes the throttle claims to describe a minute, so
+// the counts it carries understate the window it names by the tick ratio
+// (60-600x). Claiming the throttle slot first and zeroing only on the emitting
+// drain makes the numbers describe the window they are printed against; the
+// suppressed drains simply keep accumulating into it.
+//
+// Allow() is asked only when there is something to say, or a quiet minute would
+// spend the slot and suppress the first drain that actually binds.
+func (b *Buffer) takeEarlyLocked() (earlyReport, bool) {
+	r := earlyReport{
+		spansPerTrace: b.earlyPending[reasonSpansPerTrace],
+		maxTraces:     b.earlyPending[reasonMaxTraces],
+		maxSpans:      b.earlyPending[reasonMaxSpans],
+		shutdown:      b.earlyPending[reasonShutdown],
+	}
+	if !r.any() || !b.earlyWarn.Allow(b.earlyEvery) {
+		return earlyReport{}, false
+	}
+	for k := range b.earlyPending {
+		b.earlyPending[k] = 0
+	}
+	return r, true
+}
+
+// reportEarly is the throttled aggregate line for early decisions.
+//
+// An early decision is not loss — the engine reads a partial trace as a LOWER
+// BOUND, so a slow trace can be missed and a fast one is never invented — but a
+// sustained rate means a bound is sized below this shard's span rate, and the
+// sampling an operator configured is not the sampling they are getting. The
+// counter alone cannot say WHICH bound or how big the shard's backlog was when
+// it bound.
+// The throttle and the emptiness check live in takeEarlyLocked, which is what
+// couples them to the drain that zeroed the tallies.
+func (b *Buffer) reportEarly(r earlyReport) {
+	st := b.Stats() // re-takes the mutex: the caller has released it by now
+	b.log.Warn("traces are being decided before their decisionWait elapsed because a tail-sampling bound bound; the verdicts are made on the spans present, so slow traces can be missed",
+		// bySomething = how many this window; the bare config name = the bound
+		// that forced them. The two must not share a key — a line carrying
+		// maxTraces twice with different meanings is worse than either.
+		"bySpansPerTrace", r.spansPerTrace, "byMaxTraces", r.maxTraces, "byMaxSpans", r.maxSpans,
+		"maxTraces", b.set.maxTraces, "maxSpans", b.set.maxSpans,
+		"maxSpansPerTrace", b.set.maxSpansPerTrace,
+		"bufferedTraces", st.Traces, "bufferedSpans", st.Spans)
+}
+
+// earlyWarnEvery re-warns while a tail-sampling bound keeps binding.
+const earlyWarnEvery = time.Minute
 
 // warn logs at most once per warnEvery.
 func (b *Buffer) warn(msg string, args ...any) {

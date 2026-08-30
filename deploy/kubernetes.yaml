@@ -83,6 +83,14 @@ spec:
       # Cluster-critical: an evicted metadata service stalls attribution
       # cluster-wide (agents block on lookups).
       priorityClassName: system-cluster-critical
+      # Kubernetes' own seccomp default is Unconfined, which is LOOSER than what
+      # a plain container run gets, and PodSecurity's `restricted` profile
+      # rejects a pod without RuntimeDefault outright — without this these pods
+      # fail ADMISSION on a restricted namespace, which on a first install reads
+      # as a broken manifest rather than a policy.
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: kubescrape
           image: ghcr.io/johanlindvall/kubescrape:latest
@@ -95,6 +103,24 @@ spec:
             capabilities:
               drop: ["ALL"]
           args:
+            # The API port. UNAUTHENTICATED BY DESIGN and reachable from every
+            # pod in the cluster: every agent polls these /v1 routes on every
+            # cycle, and what they hand out is pod/owner/namespace metadata the
+            # node's own kubelet already holds — with the deploy tools'
+            # copy-of-the-applied-object annotations stripped, since those carry
+            # the whole spec verbatim. It also serves /healthz, /readyz and the
+            # /debug index, which show the same documents. The one exception is
+            # /v1/scrape-auth, which serves Secret material and is
+            # bearer-authenticated; the binary refuses -scrape-auth-secrets
+            # without -scrape-auth-token-file.
+            #
+            # THERE IS NO NetworkPolicy IN THESE RAW MANIFESTS. The Helm chart
+            # ships one (networkPolicy.enabled) that at least closes the
+            # undeclared ports — pprof above all, which exposes goroutine stacks
+            # and heap contents. If your threat model needs the API itself
+            # restricted to the agents, scope it to the DaemonSet's pods; get it
+            # wrong and every agent stops resolving container metadata at once,
+            # with unattributed telemetry as the only symptom.
             - -listen=:8080
             - -wait-timeout=5s
             - -cache-ttl=5m
@@ -109,6 +135,14 @@ spec:
             httpGet:
               path: /healthz
               port: http
+          # DELIBERATELY NO MEMORY LIMIT, unlike the agent and the two
+          # singletons. This is the only process whose footprint scales with the
+          # SIZE OF THE CLUSTER (one record per pod plus the owner/service
+          # caches), and an OOMKill of this singleton stalls attribution
+          # fleet-wide because every agent blocks on its lookups. The cost of
+          # the trade is Burstable QoS — evictable under node pressure — which is
+          # what the system-cluster-critical priorityClassName above is for. Set
+          # a limit once you have measured yours; do not copy the agent's 512Mi.
           resources:
             requests:
               cpu: 50m

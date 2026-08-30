@@ -22,7 +22,7 @@ func TestResolveOwnerCycleTerminates(t *testing.T) {
 			APIVersion: "apps/v1", Kind: "ReplicaSet", Name: "web-abc", UID: "rs-uid", Controller: &ctrl,
 		}),
 	})
-	got := r.Resolve("default", []metav1.OwnerReference{{
+	got, _ := r.Resolve("default", []metav1.OwnerReference{{
 		APIVersion: "apps/v1", Kind: "ReplicaSet", Name: "web-abc", UID: "rs-uid", Controller: &ctrl,
 	}})
 	if len(got) != 2 || got[0].Kind != "ReplicaSet" || got[1].Kind != "Deployment" {
@@ -38,7 +38,7 @@ func TestResolveSelfOwnedTerminates(t *testing.T) {
 			APIVersion: "apps/v1", Kind: "ReplicaSet", Name: "selfie", UID: "self-uid", Controller: &ctrl,
 		}),
 	})
-	got := r.Resolve("default", []metav1.OwnerReference{{
+	got, _ := r.Resolve("default", []metav1.OwnerReference{{
 		APIVersion: "apps/v1", Kind: "ReplicaSet", Name: "selfie", UID: "self-uid", Controller: &ctrl,
 	}})
 	if len(got) != 1 || got[0].UID != "self-uid" {
@@ -49,7 +49,7 @@ func TestResolveSelfOwnedTerminates(t *testing.T) {
 // Direct-ref duplicates (two refs naming the same UID) collapse to one owner.
 func TestResolveDuplicateRefs(t *testing.T) {
 	ref := metav1.OwnerReference{APIVersion: "apps/v1", Kind: "ReplicaSet", Name: "web-abc", UID: "rs-uid"}
-	got := fakeResolver(nil).Resolve("default", []metav1.OwnerReference{ref, ref})
+	got, _ := fakeResolver(nil).Resolve("default", []metav1.OwnerReference{ref, ref})
 	if len(got) != 1 {
 		t.Fatalf("duplicate refs resolve = %+v", got)
 	}
@@ -58,7 +58,7 @@ func TestResolveDuplicateRefs(t *testing.T) {
 // An unparseable apiVersion in an owner ref must not panic and keeps the
 // reference's own identity.
 func TestResolveGarbageAPIVersion(t *testing.T) {
-	got := fakeResolver(nil).Resolve("default", []metav1.OwnerReference{{
+	got, _ := fakeResolver(nil).Resolve("default", []metav1.OwnerReference{{
 		APIVersion: "a/b/c", Kind: "ReplicaSet", Name: "x", UID: "u",
 	}})
 	if len(got) != 1 || got[0].Name != "x" {
@@ -78,7 +78,7 @@ func TestResolveMissingIntermediateDropsGrandparent(t *testing.T) {
 		// Deployment present, ReplicaSet absent from the cache.
 		"deployments/default/web": obj("dep-uid", map[string]string{"app": "web"}),
 	})
-	got := r.Resolve("default", []metav1.OwnerReference{{
+	got, _ := r.Resolve("default", []metav1.OwnerReference{{
 		APIVersion: "apps/v1", Kind: "ReplicaSet", Name: "web-abc", UID: "rs-uid", Controller: &ctrl,
 	}})
 	if len(got) != 1 || got[0].Kind != "ReplicaSet" || got[0].Labels != nil {

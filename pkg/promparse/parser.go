@@ -234,6 +234,44 @@ type Parser struct {
 	// emitted (finishSample keeps them), so a reader of the two numbers can
 	// tell a target with broken exemplars from one losing data.
 	badExemplars int
+	// detail breaks this parse's malformed count down by the four reasons that
+	// are diagnosable from where they are noticed (see MalformedDetail).
+	detail MalformedDetail
+}
+
+// MalformedDetail names the parts of one parse's malformed count that can be
+// attributed to a CAUSE at the point they are noticed. The total that Parse
+// returns stays the number to alert on; this is what turns it into an action.
+//
+// The four are not interchangeable and lead to opposite remedies: over-long
+// and truncated lines are about the BODY (a bound of ours, or a connection cut
+// mid-stream), while duplicate and excess labels are about the target's
+// EXPOSITION and mean the exporter itself is producing series Prometheus would
+// reject the whole scrape over. Everything else — an unparseable value, a
+// broken TYPE line, a bad quoted name — stays in the total only: those share
+// one shape (this line does not parse) and splitting them further would name
+// parser internals rather than anything an operator can act on.
+type MalformedDetail struct {
+	// OverLongLines is lines dropped for exceeding Options.MaxLineBytes. The
+	// remedy is -scrape-max-line-bytes, or an exporter emitting a single
+	// enormous line.
+	OverLongLines int
+	// TruncatedLines is the partial line left by a body that ended mid-stream
+	// (a read error other than a clean EOF). It means the SCRAPE was cut, so
+	// series are missing beyond it whatever the total says.
+	TruncatedLines int
+	// DuplicateLabels is sample lines dropped for repeating a label NAME.
+	// Prometheus rejects the whole scrape for this; this parser drops the line
+	// (see parseLabels), so a nonzero count is a target bug that costs series.
+	DuplicateLabels int
+	// TooManyLabels is sample lines dropped for exceeding maxLabelsPerSample.
+	TooManyLabels int
+}
+
+// Any reports whether any reason was attributed, so a caller can skip the
+// per-reason report entirely on the ordinary path.
+func (d MalformedDetail) Any() bool {
+	return d.OverLongLines != 0 || d.TruncatedLines != 0 || d.DuplicateLabels != 0 || d.TooManyLabels != 0
 }
 
 // DefaultMaxLineBytes bounds one physical line when Options leaves
@@ -341,6 +379,10 @@ func (pp *Pooled) Parse(r io.Reader, emit func(Sample) error) (int, error) {
 // pooled parser resets the count.
 func (pp *Pooled) MalformedExemplars() int { return pp.p.MalformedExemplars() }
 
+// MalformedDetail breaks the last parse's malformed count down by cause (see
+// Parser.MalformedDetail). Read it before Put, like MalformedExemplars.
+func (pp *Pooled) MalformedDetail() MalformedDetail { return pp.p.MalformedDetail() }
+
 // lastKV caches the previous line's interned name/value at one label
 // position.
 type lastKV struct {
@@ -428,6 +470,11 @@ func (p *Parser) Parse(r io.Reader, emit func(Sample) error) (malformed int, err
 // exemplars: a parser that is not attaching them does not parse them either.
 func (p *Parser) MalformedExemplars() int { return p.badExemplars }
 
+// MalformedDetail reports which causes the last parse's malformed count can be
+// attributed to. The sum of its fields never exceeds the count Parse returned;
+// the remainder is lines that simply did not parse (see MalformedDetail).
+func (p *Parser) MalformedDetail() MalformedDetail { return p.detail }
+
 // resetTypes drops the previous exposition's TYPE declarations together with
 // the byte charge that bounds them. The two must move as one: a charge left
 // standing over a cleared table would refuse to type the NEXT exposition's
@@ -448,10 +495,11 @@ func (p *Parser) resetMeta() {
 }
 
 func (p *Parser) parseFrom(br *bufio.Reader, emit func(Sample) error) (malformed int, err error) {
-	// Per-parse statistic, reset here rather than in Parse: the pooled path
+	// Per-parse statistics, reset here rather than in Parse: the pooled path
 	// enters through parseFrom directly, and a count carried over from the
 	// previous scrape would be charged to this target.
 	p.badExemplars = 0
+	p.detail = MalformedDetail{}
 	for {
 		line, tooLong, rerr := p.readLine(br)
 		// A read error other than io.EOF cut the body mid-line, so what came
@@ -462,6 +510,14 @@ func (p *Parser) parseFrom(br *bufio.Reader, emit func(Sample) error) (malformed
 		truncated := rerr != nil && rerr != io.EOF
 		if tooLong || (truncated && len(line) > 0) {
 			malformed++
+			// Attributed here rather than folded into the total alone: a body
+			// cut mid-stream and a line over the bound look identical in the
+			// count and want opposite responses (see MalformedDetail).
+			if tooLong {
+				p.detail.OverLongLines++
+			} else {
+				p.detail.TruncatedLines++
+			}
 		} else if len(line) > 0 {
 			if ok := p.parseLine(line, emit, &err); err != nil {
 				return malformed, err
@@ -1128,10 +1184,12 @@ func (p *Parser) parseLabels(rest []byte, dst *[]Label, cache *[]lastKV) ([]byte
 		// is uninterruptible by the scrape timeout; drop the line as malformed
 		// past the ceiling (see maxLabelsPerSample) before the scan runs again.
 		if len(*dst) >= maxLabelsPerSample {
+			p.detail.TooManyLabels++
 			return nil, false
 		}
 		for i := range *dst {
 			if (*dst)[i].Name == name {
+				p.detail.DuplicateLabels++
 				return nil, false
 			}
 		}

@@ -25,7 +25,6 @@ import (
 	"github.com/JohanLindvall/kubescrape/internal/agent/attrs"
 	"github.com/JohanLindvall/kubescrape/internal/agent/cgroupstats"
 	"github.com/JohanLindvall/kubescrape/internal/agent/debugtap"
-	"github.com/JohanLindvall/kubescrape/internal/agent/events"
 	"github.com/JohanLindvall/kubescrape/internal/agent/logscrub"
 	"github.com/JohanLindvall/kubescrape/internal/agent/otlpexport"
 	"github.com/JohanLindvall/kubescrape/internal/agent/otlpingest"
@@ -39,7 +38,6 @@ import (
 	"github.com/JohanLindvall/kubescrape/internal/agent/transform"
 	"github.com/JohanLindvall/kubescrape/internal/bearer"
 	"github.com/JohanLindvall/kubescrape/internal/cli"
-	"github.com/JohanLindvall/kubescrape/internal/leader"
 	"github.com/JohanLindvall/kubescrape/internal/logline"
 	"github.com/JohanLindvall/kubescrape/internal/metrics"
 	"github.com/JohanLindvall/kubescrape/internal/obs"
@@ -48,10 +46,16 @@ import (
 	"github.com/JohanLindvall/kubescrape/pkg/logattrs"
 	"github.com/JohanLindvall/kubescrape/pkg/metaclient"
 	"go.opentelemetry.io/collector/pdata/pcommon"
-	"k8s.io/client-go/kubernetes"
 )
 
 func main() {
+	// The process logger cannot exist until -log-level is parsed, and several
+	// refusals happen before that (an unparseable flag, a missing -node-name).
+	// Without this they went out through slog's stdlib default, which is not
+	// logfmt — so the ONE line that says why the pod will not start was the one
+	// line an operator's log pipeline could not parse. Replaced by the leveled
+	// logger a few statements into run().
+	slog.SetDefault(slog.New(cli.NewLogfmtHandler(os.Stderr, slog.LevelInfo)))
 	if err := run(); err != nil {
 		slog.Error("kubescrape-agent failed", "error", err)
 		os.Exit(1)
@@ -148,7 +152,11 @@ func singletonRole() bool {
 var (
 	configFile = flag.String("config", "", "unified YAML config file; sections: "+configSections()+" (docs/CONFIGURATION.md)")
 	nodeName   = flag.String("node-name", os.Getenv("NODE_NAME"), "name of the node this agent runs on (default $NODE_NAME)")
-	listen     = flag.String("listen", ":8081", "HTTP listen address for /healthz, /readyz, /debug/tailer and /debug/targets (empty disables)")
+	listen     = flag.String("listen", ":8081", "HTTP listen address for /healthz, /readyz, the /debug homepage and the debug surfaces it links — /debug/tailer, /debug/targets, /debug/transforms and the live OTLP stream /debug/otlp (+ /debug/otlp/ui). Reachable from every pod in the cluster, so the data-bearing three are gated: see -debug-token-file. Empty disables all of it, /readyz included")
+	// The data-bearing half of that port — /debug/otlp, its UI and
+	// /debug/tailer — is not open: see debugauth.go for why a DaemonSet's tap
+	// is a different exposure from a collector's.
+	debugToken = flag.String("debug-token-file", "", "bearer token file gating the DATA-BEARING debug surfaces on -listen (/debug/otlp, /debug/otlp/ui, /debug/tailer), re-read periodically with the previous value accepted for a grace window so rotating the Secret needs no restart. WITHOUT it those three are served ONLY to a local connection — `kubectl port-forward` (the kubelet dials 127.0.0.1 inside the pod, so port-forward IS the loopback address), a container in this same pod, or, on an agent deliberately put on hostNetwork, the node itself — because /debug/otlp streams verbatim every log record, metric and span this process exports and the port is reachable from every pod in the cluster. A local connection must ALSO carry a loopback Host header (localhost/127.0.0.1/::1), which every direct client sends and a DNS-rebound browser page aimed at a port-forward does not. Set this to read them from anywhere else with `Authorization: Bearer <token>`. /healthz, /readyz, /debug, /debug/targets and /debug/transforms are never gated (probes, and state the metadata service already serves unauthenticated)")
 
 	// The process-observability block (metrics/pprof listeners, self-metrics
 	// cadence, logger) is registered through internal/cli, SHARED with the
@@ -160,7 +168,6 @@ var (
 	pprofListen     = obsFlags.PprofListen
 	selfMetricsIntv = obsFlags.SelfMetricsInterval
 	logLevel        = obsFlags.LogLevel
-	logFormat       = obsFlags.LogFormat
 
 	metadataURL     = flag.String("metadata-endpoint", "http://kubescrape.monitoring", "base URL of the kubescrape metadata service")
 	metadataWait    = flag.Duration("metadata-wait", 5*time.Second, "how long the metadata service may block waiting for a new container")
@@ -477,7 +484,9 @@ func run() error {
 	if *ingestOn && *ingestGRPC == "" && *ingestHTTP == "" {
 		return fmt.Errorf("-ingest is set but both -ingest-grpc-endpoint and -ingest-http-endpoint are empty")
 	}
-	if err := events.ValidateStartMode(*eventsStart); err != nil {
+	// From the tagged file pair: a build without the `events` tag does not link
+	// the package that defines what -events-start means (see buildtags.go).
+	if err := validateEventsFlags(); err != nil {
 		return err
 	}
 	// The -azure-* flag surface, from the tagged file pair: a build without the
@@ -490,11 +499,17 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	log, err := cli.NewLogger(*logLevel, *logFormat)
+	// The process logger, and every other logger in the process routed into
+	// it: client-go's klog (the singleton roles -events and its leader election
+	// are pure client-go, so its lease churn and watch errors would otherwise
+	// go out as glog lines) and grpc-go's grpclog (the OTLP exporter's client,
+	// the ingest listeners and the trace tier's three — i.e. every line that
+	// says why nothing is reaching the collector). Both unconditional: a binary
+	// that logs two formats depending on a flag is worse than either.
+	log, err := cli.SetupLogging(*logLevel)
 	if err != nil {
 		return err
 	}
-	slog.SetDefault(log)
 	// First line of every run: without a build identity a panic trace, a
 	// metric anomaly or a half-finished rollout cannot be tied to a commit.
 	// The optional pipelines ride build tags (buildtags.go), and the Makefile —
@@ -504,6 +519,12 @@ func run() error {
 	// a thing anyone has to discover.
 	log.Info("kubescrape-agent starting", "version", obs.BuildVersion(), "built", obs.BuildTime(),
 		"optionalPipelines", builtPipelines())
+	// Bound the Go heap goal by this container's memory limit, before anything
+	// large is allocated. All three workloads this binary runs as (the
+	// DaemonSet, the events singleton, the trace tier) ship WITH a memory
+	// limit, and each has a measured burst shape that the GC would otherwise
+	// size against nothing at all.
+	cli.SetMemoryLimit(log)
 
 	// All YAML config lives in one file; each section is optional.
 	var fileCfg agentConfig
@@ -520,11 +541,17 @@ func run() error {
 	if err := validateConfig(fileCfg, *transformsFile); err != nil {
 		return err
 	}
-	// Legal combinations that do not mean what they read like. Emitted here, so
-	// -check-config and a real start report the same list.
+	// The effective configuration, then the legal-but-surprising combinations —
+	// what this process WILL do, and what about that is worth a second look.
+	// BOTH are emitted here, by -check-config and by every real start alike, so
+	// a dry run and a rollout can never describe different agents (the
+	// discipline validateConfig already holds for the refusals).
+	printConfigSummary(fileCfg, log)
 	logConfigWarnings(fileCfg, log)
 	if *checkConfig {
-		printConfigSummary(fileCfg, log)
+		// The verdict, on its own line: everything above is a description, and
+		// a dry run's exit status is not visible in a CI log's scrollback.
+		log.Info("config is valid")
 		return nil
 	}
 	if *testConfig != "" {
@@ -615,6 +642,13 @@ func run() error {
 	defer stopPprof()
 
 	ready := newReadiness()
+	// The metric half of /readyz: a gate per subsystem, published from the
+	// moment it is required. The probe body already names the pending gates,
+	// but only to whoever curls the pod — and the pod nobody can reach is
+	// precisely the one holding a rolling update. Registered before any gate
+	// exists: the family renders whatever is registered at export time, and an
+	// agent with no gates at all exports nothing rather than a fake 1.
+	obs.RegisterReadiness(ready.states)
 	var metaReady func()
 	if *nodeRefresh > 0 {
 		// Reaching the metadata service is what separates a working new agent
@@ -669,7 +703,15 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("creating OTLP exporter: %w", err)
 	}
-	defer func() { _ = exporter.Close() }()
+	defer func() {
+		// Swallowed until now. A failing Close is the last thing this process
+		// can say about its connection to the collector, and it is exactly the
+		// moment (a shutdown that has already blown its budget) where an
+		// operator is reading the log to find out what was lost.
+		if err := exporter.Close(); err != nil {
+			log.Warn("closing the OTLP exporter", "error", err)
+		}
+	}()
 
 	var wg sync.WaitGroup
 
@@ -729,7 +771,7 @@ func run() error {
 		// Make a filling buffer visible BEFORE it starts refusing writes: every
 		// other buffer metric only moves once data is already being dropped.
 		obs.RegisterBufferStats(buffered.Stats)
-		log.Info("disk buffer enabled", "dir", *bufferDir, "max-bytes-per-signal", *bufferMax,
+		log.Info("disk buffer enabled", "dir", *bufferDir, "maxBytesPerSignal", *bufferMax,
 			"traces", traceBuf != nil)
 	}
 
@@ -770,7 +812,11 @@ func run() error {
 			if err != nil {
 				return fmt.Errorf("routing route %q: %w", rt.Name, err)
 			}
-			defer func() { _ = rc.Close() }()
+			defer func() {
+				if err := rc.Close(); err != nil {
+					log.Warn("closing a routing destination", "error", err, "route", rt.Name)
+				}
+			}()
 			dests = append(dests, route.Destination{Name: rt.Name, Namespaces: rt.Namespaces, Exporter: rc})
 		}
 		log.Info("routing enabled", "routes", len(dests))
@@ -805,7 +851,7 @@ func run() error {
 			defer wg.Done()
 			transform.Reload(ctx, transforms, *transformsFile, 0, log)
 		}()
-		log.Info("transforms enabled", "file", *transformsFile, "hash", prog.Hash)
+		log.Info("transforms enabled", "path", *transformsFile, "hash", prog.Hash)
 	}
 
 	// Registered AFTER the exporter/spool Close defers (LIFO): an early `return
@@ -954,7 +1000,16 @@ func run() error {
 	if err := p.startCgroupStats(ctx, sc); err != nil {
 		return err
 	}
-	p.startDebugServer(ctx, tl, sc)
+	if err := p.startDebugServer(ctx, tl, sc); err != nil {
+		return err
+	}
+
+	// Every gate is registered by now, so the watchdog can report the whole set:
+	// one Info line when the agent becomes ready, and a repeating Warn naming
+	// the gates that will not clear. A DaemonSet rollout stopped at the first
+	// node is otherwise a process that logged "started" for every pipeline and
+	// then went quiet.
+	p.spawn(func() { ready.watch(ctx, log) })
 
 	<-ctx.Done()
 	log.Info("shutting down")
@@ -987,8 +1042,21 @@ func run() error {
 		log.Warn("producers did not stop within the shutdown budget; continuing with the final exports",
 			"budget", drain)
 	}
+	deadlineWarned := false
 	stepBudget := func() time.Duration {
-		return max(0, min(shutdownStep, time.Until(shutdownBy)))
+		budget := max(0, min(shutdownStep, time.Until(shutdownBy)))
+		// A step reached with nothing left does not fail loudly — it gets an
+		// already-dead context and returns instantly — so a blown deadline is
+		// otherwise indistinguishable from a fast, clean shutdown. It costs
+		// real data here (the last log-metrics window, the last span-metrics
+		// window, the tail-sampling flush, the disk-buffer drain), so it gets a
+		// line. Once, not per step: the operator needs the fact, not six copies.
+		if budget == 0 && !deadlineWarned {
+			deadlineWarned = true
+			log.Warn("shutdown deadline exceeded; the remaining final exports get no budget and their windows are lost",
+				"budget", shutdownTotal)
+		}
+		return budget
 	}
 	// stepCtx is the ONE spelling of a shutdown step's context (six sites used
 	// to hand-roll it): DETACHED — every final flush below must outlive the
@@ -1183,7 +1251,7 @@ func (p *pipelines) startLogs(ctx context.Context) (*tailer.Tailer, error) {
 	// runs with -logs=false, so behind this function's toggle it could never
 	// reach the deployment it was written for. It is a configWarnings entry now
 	// (config.go), which -check-config reports too.
-	p.log.Info("log tailer started", "dir", *logDir, "positions", *positionsFile)
+	p.log.Info("log tailer started", "dir", *logDir, "positionsFile", *positionsFile)
 	return tl, nil
 }
 
@@ -1191,73 +1259,6 @@ func (p *pipelines) startLogs(ctx context.Context) (*tailer.Tailer, error) {
 // (journald_enabled.go / journald_disabled.go, azure_enabled.go /
 // azure_disabled.go): each pipeline is compiled in by the POSITIVE tag of its
 // name, which the Makefile's TAGS sets by default. See buildtags.go.
-
-// startEvents starts the cluster-singleton Kubernetes events reader under a
-// leader election, so exactly one replica watches (N watchers would emit N
-// copies of every event).
-func (p *pipelines) startEvents(ctx context.Context) error {
-	if !*eventsOn {
-		return nil
-	}
-	cfg, err := cli.KubeConfig(*kubeconfig)
-	if err != nil {
-		return fmt.Errorf("events: building the kubernetes client config: %w", err)
-	}
-	cfg.UserAgent = "kubescrape-agent"
-	client, err := kubernetes.NewForConfig(cfg)
-	if err != nil {
-		return fmt.Errorf("events: creating the kubernetes client: %w", err)
-	}
-	ns := *eventsLeaseNS
-	if ns == "" {
-		ns = leader.Namespace()
-	}
-	if ns == "" {
-		return fmt.Errorf("events: no namespace for the lease and position ConfigMap; set -events-lease-namespace or $POD_NAMESPACE (downward API)")
-	}
-	reader := events.New(events.Config{
-		Client:          client,
-		Positions:       &events.ConfigMapStore{Client: client, Namespace: ns, Name: *eventsConfigMap},
-		StartMode:       *eventsStart,
-		Namespace:       *eventsNamespace,
-		BatchSize:       *eventsBatch,
-		FlushInterval:   *eventsFlush,
-		PersistInterval: *eventsPersist,
-		Meta:            p.meta,
-		Enrich:          *enrichOn,
-		Scrub:           p.scrub,
-		LogAttrs:        p.logAttrs,
-		Rules:           p.journalRules, // the same logs.rules chain
-		LogMetrics:      p.logMetrics,
-		Attrs:           p.attrBuilders.Ingest,
-		Exporter:        p.out,
-		Logger:          p.log,
-	})
-	p.spawn(func() {
-		// The election goroutine must be inside the WaitGroup: ReleaseOnCancel
-		// only hands the lease back if Run returns before the process exits.
-		err := leader.Run(ctx, leader.Config{
-			Client:    client,
-			Namespace: ns,
-			Name:      *eventsLease,
-			OnStarted: reader.Run,
-			OnLeading: func(leading bool) {
-				if leading {
-					obs.Leader.Set(1)
-				} else {
-					obs.Leader.Set(0)
-				}
-			},
-			Log: p.log,
-		})
-		if err != nil {
-			p.fatal("events leader election", err)
-		}
-	})
-	p.log.Info("kubernetes events enabled", "lease", *eventsLease, "namespace", ns,
-		"positionConfigMap", *eventsConfigMap, "start", *eventsStart)
-	return nil
-}
 
 // gateIngest is satisfied when the ingest listeners are BOUND. Apps on the node
 // push into them, so a rolling update that advanced before they bound moved
@@ -1344,7 +1345,7 @@ func (p *pipelines) startIngest(ctx context.Context) error {
 			p.fatal("otlp ingest server", err)
 		}
 	})
-	p.log.Info("otlp ingest started", "grpc", *ingestGRPC, "http", *ingestHTTP, "metricsMode", *ingestMetrics)
+	p.log.Info("otlp ingest started", "ingestGRPC", *ingestGRPC, "ingestHTTP", *ingestHTTP, "metricsMode", *ingestMetrics)
 	return nil
 }
 
@@ -1430,6 +1431,13 @@ func (p *pipelines) startScraper(ctx context.Context) *promscrape.Scraper {
 	// already is instead of turning it into a pipeline that is never scheduled.
 	kubeletEP, err := kubeletBase(*kubeletEndpoint)
 	if err != nil {
+		// Unreachable at a real start (validateConfig refuses the same value
+		// first), so this is a "should not happen" branch — which is exactly
+		// the kind that must not be silent. The raw string is kept on purpose:
+		// that keeps the failure the loud per-cycle scrape error it already is,
+		// rather than a pipeline that is never scheduled.
+		p.log.Warn("could not normalise -kubelet-endpoint; using it verbatim, so every kubelet scrape will fail with a URL error",
+			"error", err, "endpoint", *kubeletEndpoint, "flag", "-kubelet-endpoint")
 		kubeletEP = *kubeletEndpoint
 	}
 	kubeletScrapes := kubeletEP != "" && (*cadvisorOn || *nodeOn || *summaryOn)
@@ -1556,12 +1564,11 @@ func (p *pipelines) startCgroupStats(ctx context.Context, sc *promscrape.Scraper
 	return nil
 }
 
-// startDebugServer serves /healthz, /readyz and the /debug endpoints on
-// -listen, shutting down on ctx cancel.
-func (p *pipelines) startDebugServer(ctx context.Context, tl *tailer.Tailer, sc *promscrape.Scraper) {
-	if *listen == "" {
-		return
-	}
+// debugMux is the routing table itself, split out from the server so a test
+// can drive the REAL one. The gate is only as good as its registration: a test
+// that wrapped a handler itself would keep passing after the registration lost
+// the wrapper, which is precisely the regression this split makes impossible.
+func (p *pipelines) debugMux(guard *debugGuard, tl *tailer.Tailer, sc *promscrape.Scraper) *http.ServeMux {
 	mux := http.NewServeMux()
 	// The homepage's link list is appended beside each registration below, so
 	// it can only ever advertise what this process actually serves.
@@ -1588,12 +1595,12 @@ func (p *pipelines) startDebugServer(ctx context.Context, tl *tailer.Tailer, sc 
 	})
 	if tl != nil {
 		// Per-file tail positions and lag (refreshed ~10s), largest lag first.
-		mux.HandleFunc("GET /debug/tailer", func(w http.ResponseWriter, _ *http.Request) {
+		mux.HandleFunc("GET /debug/tailer", guard.protect(func(w http.ResponseWriter, _ *http.Request) {
 			w.Header().Set("Content-Type", "application/json")
 			enc := json.NewEncoder(w)
 			enc.SetIndent("", "  ")
 			_ = enc.Encode(tl.Status())
-		})
+		}))
 		links = append(links, debugLink{"/debug/tailer", "/debug/tailer",
 			"per-file tail positions and lag (largest first), rate-limit state, malformed pod annotations"})
 	}
@@ -1611,8 +1618,8 @@ func (p *pipelines) startDebugServer(ctx context.Context, tl *tailer.Tailer, sc 
 	}
 	// Live OTLP debug stream: what THIS agent is exporting, as JSON lines,
 	// filtered/sampled per request (see internal/agent/debugtap).
-	mux.HandleFunc("GET /debug/otlp", p.debugTap.ServeHTTP)
-	mux.HandleFunc("GET /debug/otlp/ui", p.debugTap.ServeUI)
+	mux.HandleFunc("GET /debug/otlp", guard.protect(p.debugTap.ServeHTTP))
+	mux.HandleFunc("GET /debug/otlp/ui", guard.protect(p.debugTap.ServeUI))
 	links = append(links,
 		debugLink{"/debug/otlp/ui", "/debug/otlp/ui",
 			"live OTLP debug stream (UI): what this agent is exporting, filtered and sampled"},
@@ -1635,6 +1642,18 @@ func (p *pipelines) startDebugServer(ctx context.Context, tl *tailer.Tailer, sc 
 	if *pprofListen != "" {
 		notes = append(notes, "pprof profiles are on their own port: "+*pprofListen+" /debug/pprof/.")
 	}
+	// The homepage links surfaces this reader may well be refused, so it says
+	// which key opens them: without this the refusal is a 403 in a browser tab
+	// with no way back to the flag that governs it.
+	if guard.authenticated() {
+		notes = append(notes, "/debug/otlp, /debug/otlp/ui and /debug/tailer stream this node's exported "+
+			"telemetry: they are served to a local connection (kubectl port-forward) or to a request carrying "+
+			"the -debug-token-file bearer token.")
+	} else {
+		notes = append(notes, "/debug/otlp, /debug/otlp/ui and /debug/tailer stream this node's exported "+
+			"telemetry: they are served ONLY to a local connection (kubectl port-forward, or a container in "+
+			"this pod). Set -debug-token-file to read them from elsewhere with a bearer token.")
+	}
 	home := debugHome(links, notes)
 	mux.HandleFunc("GET /debug", home)
 	mux.HandleFunc("GET /debug/{$}", home)
@@ -1642,6 +1661,32 @@ func (p *pipelines) startDebugServer(ctx context.Context, tl *tailer.Tailer, sc 
 	mux.HandleFunc("GET /{$}", func(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/debug", http.StatusTemporaryRedirect)
 	})
+	return mux
+}
+
+// startDebugServer serves /healthz, /readyz and the /debug endpoints on
+// -listen, shutting down on ctx cancel.
+//
+// The data-bearing surfaces (/debug/otlp, its UI, /debug/tailer) go through
+// debugGuard.protect — this port is reachable from every pod in the cluster and
+// that stream is this node's whole telemetry feed. See debugauth.go.
+func (p *pipelines) startDebugServer(ctx context.Context, tl *tailer.Tailer, sc *promscrape.Scraper) error {
+	if *listen == "" {
+		// Legal, and quietly expensive: /readyz goes with it, so a rolling
+		// update has nothing to gate on and advances across the fleet whatever
+		// the agent's state — and every diagnostic surface an incident needs
+		// (/debug/tailer, /debug/targets, /debug/otlp) is gone with it.
+		p.log.Warn("-listen is empty: no /healthz, no /readyz and no /debug surfaces are served, so a rolling update cannot gate on this agent's readiness",
+			"flag", "-listen")
+		return nil
+	}
+	// Before any handler is registered: a token file that was named and cannot
+	// be read must stop the process, not open the port with the gate half-built.
+	guard, err := newDebugGuard(ctx, *debugToken, p.log)
+	if err != nil {
+		return fmt.Errorf("-debug-token-file: %w", err)
+	}
+	mux := p.debugMux(guard, tl, sc)
 	// Every handler here answers from an in-memory snapshot in
 	// milliseconds, so tight timeouts are safe: ReadHeaderTimeout kills
 	// Slowloris header trickling, Read/WriteTimeout bound trickled bodies
@@ -1656,16 +1701,38 @@ func (p *pipelines) startDebugServer(ctx context.Context, tl *tailer.Tailer, sc 
 	}
 	go func() {
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			p.log.Error("health/metrics server failed", "error", err)
+			// FATAL, like the ingest listener. This port carries /readyz, which
+			// a rolling update advances on: an agent that cannot bind it is one
+			// the kubelet will never call ready, so leaving the process running
+			// buys nothing and hides the cause behind a probe timeout. Exiting
+			// non-zero puts the bind error in the pod's own restart loop, where
+			// somebody is already looking.
+			p.fatal("health/debug server", err)
 		}
 	}()
 	go func() {
 		<-ctx.Done()
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		// WithoutCancel(ctx), never a bare Background: the repo-wide rule for a
+		// detached shutdown step (a bare Background silently strips whatever the
+		// caller put on the context).
+		shutdownCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 		defer cancel()
-		_ = srv.Shutdown(shutdownCtx)
+		if err := srv.Shutdown(shutdownCtx); err != nil {
+			// Not fatal — the process is already leaving — but not silent
+			// either: a debug handler still running here is one whose client is
+			// about to be cut without a response when the process exits.
+			p.log.Warn("health/debug server did not shut down cleanly", "error", err, "addr", *listen)
+		}
 	}()
-	p.log.Info("health/metrics server started", "addr", *listen)
+	// The ACCESS MODE is on the line, not just the address: "who can read this
+	// node's telemetry feed" is a property an operator must be able to read off
+	// a running agent without diffing its flags.
+	access := "local-only"
+	if guard.authenticated() {
+		access = "token"
+	}
+	p.log.Info("health/debug server started", "addr", *listen, "debugAccess", access)
+	return nil
 }
 
 // startNodeInfo provides the node's labels/annotations for attribute

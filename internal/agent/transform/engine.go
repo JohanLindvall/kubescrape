@@ -12,8 +12,11 @@ package transform
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
+	"log/slog"
 	"sync"
+	"time"
 
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/plog"
@@ -22,6 +25,7 @@ import (
 	"go.starlark.net/starlark"
 	"go.starlark.net/syntax"
 
+	"github.com/JohanLindvall/kubescrape/internal/logdedupe"
 	"github.com/JohanLindvall/kubescrape/internal/obs"
 )
 
@@ -136,13 +140,71 @@ func (p *starlarkProgram) call(args ...starlark.Value) (starlark.Value, error) {
 	return v, nil
 }
 
+// scriptPos renders the innermost SCRIPT position of a Starlark failure —
+// "logs.star:3:9" — for the log line.
+//
+// It is the whole reason a line beats the counter here: starlark-go's
+// EvalError.Error() is the bare message ("undefined: foo"), which in a
+// hundred-line transforms file names nothing. Backtrace() carries the position
+// but is multi-line, and a log VALUE spanning lines is unreadable in the one
+// place this is read. The topmost frame is skipped when it is a BUILTIN
+// (<builtin>:0:0 for a fail()/re.match() failure) — that frame is where the
+// error was raised, not where the script called it from. Empty when the error
+// is not a Starlark one, in which case the key is simply absent.
+func scriptPos(err error) string {
+	var e *starlark.EvalError
+	if !errors.As(err, &e) {
+		return ""
+	}
+	for i := range e.CallStack {
+		fr := e.CallStack.At(i)
+		if fr.Pos.Filename() != "<builtin>" {
+			return fr.Pos.String()
+		}
+	}
+	return ""
+}
+
+// runWarnGates throttle the per-signal report of a script that failed at
+// RUNTIME (the compile-time failures are the reloader's, and it logs them).
+// Package-level rather than a field on the program, so a reload loop cannot
+// reset the window; per signal, because a metrics script erroring must not
+// suppress the one line explaining why logs stopped.
+var runWarnGates struct{ logs, metrics, traces logdedupe.Throttle }
+
+func runWarnGate(signal string) *logdedupe.Throttle {
+	switch signal {
+	case "logs":
+		return &runWarnGates.logs
+	case "metrics":
+		return &runWarnGates.metrics
+	}
+	return &runWarnGates.traces
+}
+
 // run invokes transform(batch) on a bounded thread.
+//
+// A runtime error is counted AND reported, once a minute per signal. The
+// counter alone is not enough and neither is the producer's own line: this
+// error fails the EXPORT, so what an operator sees is the producer's
+// "exporting logs failed" — which reads as a collector problem — and on the
+// ingest path not even that, since the error goes back to the pushing SDK as
+// a gRPC status and the agent's own log says nothing at all. This is the one
+// place that knows the failure was the operator's script rather than the
+// network, and the Starlark error carries the file position that identifies
+// the line. It is per BATCH, not per record, and throttled, so a script
+// erroring on every export costs one line a minute.
 func (p *starlarkProgram) run(batch starlark.Value) error {
 	th := p.thread()
 	_, err := starlark.Call(th, p.fn, starlark.Tuple{batch}, nil)
 	p.release(th)
 	if err != nil {
 		obs.TransformErrors.WithLabelValues(p.signal).Inc()
+		if runWarnGate(p.signal).Allow(time.Minute) {
+			slog.Warn("transform script failed at runtime; the batch is NOT exported and its producer will "+
+				"retry it, so this signal stops shipping until the script or the payload changes",
+				"signal", p.signal, "script", scriptPos(err), "error", err)
+		}
 		return fmt.Errorf("transform %s: %w", p.signal, err)
 	}
 	return nil

@@ -192,6 +192,12 @@ func (l *acquireLatch) latch(ler *resourcelock.LeaderElectionRecord, err error) 
 func elect(ctx context.Context, cfg *Config) error {
 	var acquired atomic.Bool
 	work := make(chan struct{})
+	// startedLeading dates the "held" figure on the release/loss line. A lease
+	// held for seconds is a flap (renewals are failing, or two replicas share an
+	// identity); one held for days that ends without a shutdown is the API
+	// server having gone away. The two need different actions and the message
+	// alone cannot tell them apart.
+	startedLeading := time.Now()
 
 	le, err := leaderelection.NewLeaderElector(leaderelection.LeaderElectionConfig{
 		Lock: &acquireLatch{
@@ -214,7 +220,11 @@ func elect(ctx context.Context, cfg *Config) error {
 			OnStartedLeading: func(lctx context.Context) {
 				defer close(work)
 				cfg.OnLeading(true)
-				cfg.Log.Info("acquired leadership", "lease", cfg.Name)
+				// Written before the work starts and read after it stops, on the
+				// same goroutine chain (elect only reads it after <-work, which
+				// happens-after this store), so no synchronisation is needed.
+				startedLeading = time.Now()
+				cfg.Log.Info("acquired leadership", "lease", cfg.Name, "identity", cfg.Identity)
 				cfg.OnStarted(lctx)
 			},
 			OnStoppedLeading: func() {
@@ -256,11 +266,31 @@ func elect(ctx context.Context, cfg *Config) error {
 		// gauge cannot latch at 1. (Reporting from OnStoppedLeading raced
 		// exactly that way.)
 		cfg.OnLeading(false)
-		cfg.Log.Warn("lost leadership", "lease", cfg.Name)
+		// A cancelled context is a GRACEFUL stop: this replica is shutting down
+		// and ReleaseOnCancel hands the lease straight to a successor. Reported
+		// as a Warn it made every rolling update of the singleton print "lost
+		// leadership", which is the line an operator greps for when the
+		// singleton has stopped doing its job — so the one event that means "an
+		// unplanned failover just happened" was indistinguishable from the
+		// dozen that mean "a deploy went through". The distinction is exactly
+		// ctx: le.Run returns on ctx done OR on a lease loss, and only the
+		// latter is unexpected.
+		if ctx.Err() != nil {
+			cfg.Log.Info("released leadership on shutdown; a successor may acquire the lease immediately",
+				"lease", cfg.Name, "identity", cfg.Identity, "held", time.Since(startedLeading).Round(time.Second))
+			return nil
+		}
+		cfg.Log.Warn("lost leadership; the leader-only work has stopped and this replica goes back to competing",
+			"lease", cfg.Name, "identity", cfg.Identity, "held", time.Since(startedLeading).Round(time.Second))
 		return nil
 	case <-time.After(cfg.RenewDeadline):
 		// The work ignored its context and is still running; the gauge
-		// honestly stays up, and the error is fatal to Run's caller.
+		// honestly stays up, and the error is fatal to Run's caller. Logged
+		// HERE as well as returned: the return value reaches whatever started
+		// the election, but this is the one place that knows the lease name and
+		// the deadline that was missed, and the process is about to die on it.
+		cfg.Log.Error("the leader-only work did not stop within the renew deadline, so this process cannot safely re-enter the election and will exit; another replica may already have taken the lease",
+			"lease", cfg.Name, "identity", cfg.Identity, "timeout", cfg.RenewDeadline)
 		return errors.New("leader: leader work did not stop within the renew deadline")
 	}
 }

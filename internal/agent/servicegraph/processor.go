@@ -2,13 +2,16 @@ package servicegraph
 
 import (
 	"log/slog"
+	"slices"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/ptrace"
 
 	"github.com/JohanLindvall/kubescrape/internal/agent/cumagg"
+	"github.com/JohanLindvall/kubescrape/internal/logdedupe"
 	"github.com/JohanLindvall/kubescrape/internal/obs"
 )
 
@@ -92,6 +95,9 @@ type Processor struct {
 	// be, to decode from YAML — see Config.Wait), parsed once here.
 	wait time.Duration
 	log  *slog.Logger
+	// unnamedWarn throttles the no-service.name warning: an unattributable
+	// sender pushes continuously, and the useful information is one line.
+	unnamedWarn logdedupe.Throttle
 
 	store *edgeStore
 	sink  edgeSink
@@ -154,7 +160,7 @@ func NewProcessor(cfg Config, log *slog.Logger) *Processor {
 		p.peerAttrs = append(p.peerAttrs, a)
 		p.peerIsDB = append(p.peerIsDB, strings.HasPrefix(a, "db."))
 	}
-	p.store = newEdgeStore(cfg, wait, p.emit)
+	p.store = newEdgeStore(cfg, wait, p.emit, log)
 	log.Debug("service-graph pairing configured",
 		"wait", wait, "maxItems", cfg.MaxItems,
 		"dimensions", len(p.dims), "peerAttributes", len(p.peerAttrs))
@@ -241,6 +247,7 @@ func (p *Processor) Consume(td ptrace.Traces) {
 			}
 			if n > 0 {
 				obs.ServiceGraphUnnamed.Add(float64(n))
+				p.reportUnnamed(rs.Resource().Attributes(), n)
 			}
 			continue
 		}
@@ -251,6 +258,65 @@ func (p *Processor) Consume(td ptrace.Traces) {
 			}
 		}
 	}
+}
+
+// unnamedHints are the attributes a throttled unnamed-resource warning quotes
+// to identify the sender. They are IDENTITY attributes only — never the whole
+// map, which is sender-controlled and may carry anything.
+var unnamedHints = []string{"k8s.namespace.name", "k8s.pod.name", "host.name", "telemetry.sdk.language"}
+
+// unnamedWarnEvery re-warns while unnameable senders keep pushing.
+const unnamedWarnEvery = 5 * time.Minute
+
+// maxLoggedValueBytes bounds one SENDER-supplied value on a log line. A
+// resource attribute on this tier arrives from an application pushing to the
+// unauthenticated :4317/:4318 ports and is bounded only by the message size —
+// megabytes — so a megabyte of it in a log record is a second flood wearing the
+// shape of one line.
+const maxLoggedValueBytes = 96
+
+// clipForLog renders a sender-supplied value for a log attribute: bounded, and
+// cut on a rune boundary so a clipped UTF-8 sequence does not become a
+// replacement character in whatever reads the line.
+//
+// promscrape and otlpingest each carry this function for the same reason
+// (target-supplied there, sender-supplied here) and deliberately do not share
+// it: neither package should import another for a five-line bound, and the
+// constants are free to differ. This is the third copy under the same rule.
+func clipForLog(v string) string {
+	if len(v) <= maxLoggedValueBytes {
+		return v
+	}
+	cut := maxLoggedValueBytes
+	for cut > 0 && !utf8.RuneStart(v[cut]) {
+		cut--
+	}
+	return v[:cut] + "…"
+}
+
+// reportUnnamed is the context half of kubescrape_service_graph_unnamed_spans_total.
+// The counter says requests are missing from the graph; only a line can say
+// WHOSE, and a resource with no service.name is exactly the one an operator
+// cannot select by. Throttled to the condition — an unattributable sender pushes
+// continuously — and quoting a fixed set of identity keys rather than the map.
+func (p *Processor) reportUnnamed(attrs pcommon.Map, spans int) {
+	if !p.unnamedWarn.Allow(unnamedWarnEvery) {
+		return
+	}
+	args := []any{"spans", spans}
+	for _, k := range unnamedHints {
+		if v, ok := attrs.Get(k); ok {
+			// The KEYS are ours (unnamedHints is a fixed list); the VALUES are
+			// the sender's, and the sender reached an UNAUTHENTICATED port —
+			// so they are clipped. The throttle above bounds how OFTEN this
+			// line is written, never how LARGE it is, and the throttle KEY is
+			// keyless (logdedupe.Throttle, one condition per Processor), so no
+			// sender byte can silence anyone else's warning either.
+			args = append(args, k, clipForLog(v.AsString()))
+		}
+	}
+	p.log.Warn("spans arrived on a resource with no service.name, so they can name no graph node and their requests are on no edge at all; they still reach the collector",
+		args...)
 }
 
 // Sweep retires every half-edge whose Wait has ELAPSED, in bounded passes. Safe
@@ -460,14 +526,32 @@ func (p *Processor) observe(span ptrace.Span, resAttrs pcommon.Map, svc string, 
 
 // namesDatabase reports whether the span carries any of the attributes that
 // identify a database callee.
+//
+// ONE walk of the attributes, gated on the "db." prefix, rather than four
+// Get calls. A pcommon.Map is a SLICE and Get is a linear scan of it, so the
+// four-Get shape walked a realistically instrumented span — otelhttp emits
+// fourteen attributes — four times over, and did it for every CLIENT and
+// PRODUCER span the tier receives. The prefix check is three byte compares
+// against a key that, on a span that names no database, never matches, so the
+// full comparison against databaseAttrs is reached for essentially no key.
+//
+// The gate must stay a strict SUPERSET of databaseAttrs, exactly as
+// agent/logscrub's prefilters must stay supersets of their regexes: a member
+// spelled without the prefix would be silently unreachable, and the failure —
+// a database edge classified as a plain service call — looks like a graph that
+// is merely uninformative. TestDatabaseAttrsAllCarryThePrefix is the alarm.
 func namesDatabase(attrs pcommon.Map) bool {
-	for _, a := range databaseAttrs {
-		if _, ok := attrs.Get(a); ok {
+	for k := range attrs.All() {
+		if len(k) > len(dbAttrPrefix) && k[0] == 'd' && k[1] == 'b' && k[2] == '.' &&
+			slices.Contains(databaseAttrs, k) {
 			return true
 		}
 	}
 	return false
 }
+
+// dbAttrPrefix is the prefix every databaseAttrs entry shares; see namesDatabase.
+const dbAttrPrefix = "db."
 
 // --- helpers ---
 //

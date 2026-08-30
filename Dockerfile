@@ -13,7 +13,7 @@ COPY . .
 # TAGS). Dropping `journald` from TAGS builds a cgo-free agent — but then use
 # Dockerfile.static / `make image-static`, which puts it on a smaller base
 # instead of shipping libsystemd for nothing.
-ARG TAGS=journald,azure
+ARG TAGS=journald,azure,events
 # The metadata service is fully static; the agent is cgo when it carries the
 # journald pipeline (it links libsystemd) and static otherwise.
 # -ldflags="-s -w" strips the symbol table and DWARF (~30% smaller image):

@@ -46,6 +46,34 @@ func KeepaliveOption() grpc.ServerOption {
 	})
 }
 
+// maxHeaderListBytes bounds the HPACK-DECODED size of one request's header
+// block on every kubescrape gRPC receiver.
+//
+// grpc-go's server default is 16 MiB, and nothing in this repo was lowering it.
+// On the listeners this repo documents as unauthenticated — the agent's
+// -ingest :4317 and the trace tier's application ports — that is 16 MiB a peer
+// can make the process decode per stream before any application code runs, and
+// it is worse than an allocation: grpc-go renders a header it cannot decode
+// into its own log line (internal/transport's "Failed to decode metadata
+// header (%q, %q)"), so the same bytes were an amplifier too. internal/cli's
+// grpclog adapter closes the logging half by clipping and by keeping that class
+// at Debug; this closes the RECEIVE half, which is the one that exists whatever
+// the adapter does with the message.
+//
+// 64 KiB is many times the largest header set any OTLP sender writes (a bearer
+// token, a tenant id, the h2 pseudo-headers), so no legitimate push is refused;
+// the internal hop's own token rides in the same budget. A sender past it gets
+// a clean protocol-level refusal rather than a mystery stream reset, because
+// grpc-go advertises the value in its SETTINGS frame and a conformant client
+// checks against it before writing the headers.
+const maxHeaderListBytes = 64 << 10
+
+// MaxHeaderListSizeOption is that bound as a grpc.ServerOption, exported for
+// the trace tier's internal receiver, which assembles its own grpc.Server.
+func MaxHeaderListSizeOption() grpc.ServerOption {
+	return grpc.MaxHeaderListSize(maxHeaderListBytes)
+}
+
 // httpShutdownGrace bounds the HTTP side of a listener shutdown: how long
 // Shutdown waits for in-flight requests before Run force-closes the
 // connections. The Close that follows an expired grace is load-bearing:
@@ -190,6 +218,14 @@ func (l Listeners) Run(ctx context.Context) error {
 			// better a NACK than an ack nothing downstream will honor, because
 			// by this point the final flushes have run and whatever that
 			// handler acked would die with the process.
+			//
+			// Said out loud because from the SENDER's side this is an
+			// unexplained transport failure at exactly the moment a rolling
+			// update is being blamed for something, and it happens at most once
+			// per process — there is no flood to throttle.
+			log.Warn("the ingest HTTP listener still had pushes in flight when the shutdown grace expired; "+
+				"their connections are closed and the senders will retry against the replacement pod",
+				"addr", l.HTTP.Addr, "grace", grace, "error", err)
 			_ = l.HTTP.Close()
 		}
 	}

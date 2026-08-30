@@ -46,6 +46,8 @@ type poisonSender struct {
 	good     int // batches accepted
 	bodies   []string
 	refuseAl bool // refuse EVERYTHING (the outage case)
+	// onAccept is the backlog keeper's replacement handshake; see backlogKeeper.
+	onAccept func()
 }
 
 func (p *poisonSender) ExportLogs(_ context.Context, ld plog.Logs) error {
@@ -58,8 +60,12 @@ func (p *poisonSender) ExportLogs(_ context.Context, ld plog.Logs) error {
 	}
 	p.good++
 	p.bodies = append(p.bodies, body)
+	onAccept := p.onAccept
 	p.mu.Unlock()
 	acceptDelay()
+	if onAccept != nil {
+		onAccept()
+	}
 	return nil
 }
 
@@ -71,43 +77,87 @@ func (p *poisonSender) counts() (poison, good int) {
 	return p.poison, p.good
 }
 
-// acceptDelay is what a delivery to a real collector costs. Without it the
-// in-memory sender drains eight queued batches faster than any producer can top
-// them up, the queue behind the head empties, and a lap then legitimately finds
-// no delivery to make it accountable — which is correct behaviour (a head with
-// nothing behind it is holding nothing up) but is not the situation these tests
-// are about. It is what keeps them measuring the rule rather than the scheduler.
+// acceptDelay is what a delivery to a real collector costs. keepBacklogDeep no
+// longer depends on it to keep the queue non-empty — the depth is conserved by
+// handshake now, not by outrunning the drain — but a sender that returns
+// instantly still makes these tests spin the whole drain loop at wire speed for
+// nothing, so the pacing stays.
 func acceptDelay() { time.Sleep(200 * time.Microsecond) }
 
-// keepBacklogDeep keeps at least `depth` records queued behind the head for the
-// duration of the test. Both integration tests below depend on the shape a real
-// node has and a quiet test does not: OTHER batches waiting behind the head, so
-// a rotation actually rotates and deliveries land BETWEEN the head's laps. That
-// is what makes a lap accountable at all — with an empty queue behind it, a
-// failing head is holding nothing up and correctly keeps its full cycle.
-func keepBacklogDeep(t *testing.T, b *Buffered, buf *Buffer, body string, depth int64) func() {
+// keepBacklogDeep keeps `depth` records queued behind the head for the duration
+// of the test. Both integration tests below depend on the shape a real node has
+// and a quiet test does not: OTHER batches waiting behind the head, so a
+// rotation actually rotates and deliveries land BETWEEN the head's laps. That is
+// what makes a lap accountable at all — with an empty queue behind it, Requeue
+// reports nothing to rotate past, the head stays put, and the next lap correctly
+// keeps its full backed-off cycle.
+//
+// It maintains the depth by CONSERVATION, not by racing the drain, and that is
+// the whole point of the handshake below. The first version was a background
+// goroutine topping the queue up whenever `stats().Backlog` dipped: on a quiet
+// machine it kept up, and under a loaded `go test -race ./...` it did not — the
+// drain emptied the queue behind the head, one lap in maybe five stopped being
+// accountable, and that lap cost stuckAfterAttempts instead of 1. The assertion
+// below then read 13 wire attempts against a want of 8 (5+5+1+1+1: one extra
+// full cycle), i.e. a real scheduler race presenting as a broken bound. So the
+// sender now ASKS for a replacement for every good batch it accepts and waits
+// for that record to be queued before the drain moves on: the depth is an
+// invariant of the loop rather than the outcome of a race, and the attempt count
+// is exactly what the design predicts on any machine.
+//
+// The producer stays on its own goroutine because that is where a real one is —
+// enqueueing into the same diskqueue the drain holds a reservation on is the
+// production shape, and doing it inline on the drain goroutine would be a
+// re-entrant queue call this code never makes.
+//
+// It returns the sender's replace hook (install it as the sender's onAccept)
+// and the keeper's stop func.
+func keepBacklogDeep(t *testing.T, b *Buffered, buf *Buffer, body string, depth int64) (replace func(), stop func()) {
 	t.Helper()
-	stop := make(chan struct{})
+	req := make(chan chan struct{})
+	quit := make(chan struct{})
 	done := make(chan struct{})
 	var once sync.Once
+
+	add := func() {
+		if err := b.ExportLogs(context.Background(), logsWith(body)); err != nil {
+			t.Errorf("keepBacklogDeep enqueue: %v", err)
+		}
+	}
+	// Pre-fill synchronously, so the drain never starts against a queue the
+	// producer has not reached yet.
+	for buf.stats().Backlog < depth {
+		add()
+	}
 	go func() {
 		defer close(done)
 		for {
 			select {
-			case <-stop:
+			case <-quit:
 				return
-			default:
+			case ack := <-req:
+				add()
+				close(ack)
 			}
-			if buf.stats().Backlog < depth {
-				_ = b.ExportLogs(context.Background(), logsWith(body))
-				continue
-			}
-			time.Sleep(time.Millisecond)
 		}
 	}()
+	// replace is what the sender calls after accepting a batch. It returns
+	// immediately once the keeper is stopped, so a drain still in flight during
+	// teardown cannot block on a goroutine that has gone away.
+	replace = func() {
+		ack := make(chan struct{})
+		select {
+		case req <- ack:
+			select {
+			case <-ack:
+			case <-quit:
+			}
+		case <-quit:
+		}
+	}
 	// Idempotent: every caller both defers it and calls it before inspecting the
 	// counters, and a second close(stop) would panic.
-	return func() { once.Do(func() { close(stop) }); <-done }
+	return replace, func() { once.Do(func() { close(quit) }); <-done }
 }
 
 // The whole finding, end to end: a poison head must be given up on within a few
@@ -129,7 +179,10 @@ func TestPoisonHeadDoesNotHoldTheQueueForEveryOtherProducer(t *testing.T) {
 	before := obs.BufferDroppedBatches.WithLabelValues("logs").Value()
 
 	// Everything else on the node keeps logging behind it.
-	stopProducing := keepBacklogDeep(t, b, ls, "good", 8)
+	replace, stopProducing := keepBacklogDeep(t, b, ls, "good", 8)
+	send.mu.Lock()
+	send.onAccept = replace
+	send.mu.Unlock()
 	defer stopProducing()
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -171,13 +224,19 @@ type authFlakySender struct {
 	fails     int
 	tries     int
 	delivered bool
+	// onAccept is the backlog keeper's replacement handshake; see backlogKeeper.
+	onAccept func()
 }
 
 func (a *authFlakySender) ExportLogs(_ context.Context, ld plog.Logs) error {
 	a.mu.Lock()
 	if ld.ResourceLogs().At(0).ScopeLogs().At(0).LogRecords().At(0).Body().Str() != a.body {
+		onAccept := a.onAccept
 		a.mu.Unlock()
 		acceptDelay()
+		if onAccept != nil {
+			onAccept()
+		}
 		return nil
 	}
 	a.tries++
@@ -229,7 +288,10 @@ func TestGoodPayloadKeepsItsFullRetryDepthOnAWarmSink(t *testing.T) {
 		t.Fatal(err)
 	}
 	before := obs.BufferDroppedBatches.WithLabelValues("logs").Value()
-	stopProducing := keepBacklogDeep(t, b, ls, "good", 8)
+	replace, stopProducing := keepBacklogDeep(t, b, ls, "good", 8)
+	send.mu.Lock()
+	send.onAccept = replace
+	send.mu.Unlock()
 	defer stopProducing()
 
 	ctx, cancel := context.WithCancel(context.Background())

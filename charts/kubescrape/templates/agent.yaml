@@ -109,6 +109,21 @@ spec:
       affinity:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+      {{- /* Pod-level seccomp. Kubernetes' own default is Unconfined, which is
+             LOOSER than what a plain `docker run` gets, and PodSecurity's
+             `restricted` profile rejects a pod without RuntimeDefault outright
+             — so on a namespace labelled restricted these pods used to fail
+             ADMISSION, which on a first install looks like the chart being
+             broken. Set `seccompProfile: null` to omit the field entirely —
+             NOT `{}`, which cannot work: helm COALESCES a user map onto the
+             chart's default map, so an empty one arrives here as the default
+             `{type: RuntimeDefault}` and renders. Only an explicit null
+             removes the key. */}}
+      {{- with .Values.seccompProfile }}
+      securityContext:
+        seccompProfile:
+          {{- toYaml . | nindent 10 }}
+      {{- end }}
       containers:
         - name: agent
           image: {{ include "kubescrape.image" . }}
@@ -123,6 +138,17 @@ spec:
             - -scrape-auth-token-file=/etc/kubescrape/scrape-auth/{{ .Values.service.scrapeAuthToken.key | default "token" }}
             {{- end }}
             - -listen={{ .Values.agent.listen }}
+            {{- if .Values.agent.debug.tokenSecret.name }}
+            # /debug/otlp, /debug/otlp/ui and /debug/tailer stream this NODE's
+            # whole telemetry feed — every log line it ships, from every
+            # namespace scheduled here — and this port is reachable from every
+            # pod in the cluster. With no token they answer only a LOCAL
+            # connection (kubectl port-forward, or a container in this pod);
+            # naming a Secret here opens them to a bearer token instead. The
+            # path is the mount below, through one helper, so the two cannot
+            # drift into a silent fallback to local-only.
+            - -debug-token-file={{ include "kubescrape.debugTokenPath" . }}
+            {{- end }}
             - -self-metrics-interval={{ .Values.agent.selfMetricsInterval }}
             - -otlp-endpoint={{ .Values.agent.otlp.endpoint }}
             - -otlp-protocol={{ .Values.agent.otlp.protocol }}
@@ -327,7 +353,6 @@ spec:
             {{- with .Values.pprofListen }}
             - -pprof-listen={{ . }}
             {{- end }}
-            - -log-format={{ .Values.logFormat }}
             {{- range .Values.agent.extraArgs }}
             - {{ . }}
             {{- end }}
@@ -396,6 +421,11 @@ spec:
               mountPath: /etc/kubescrape/scrape-auth
               readOnly: true
             {{- end }}
+            {{- if .Values.agent.debug.tokenSecret.name }}
+            - name: debug-token
+              mountPath: /etc/kubescrape/debug
+              readOnly: true
+            {{- end }}
             - name: varlog
               mountPath: /var/log
               readOnly: true
@@ -452,6 +482,11 @@ spec:
           secret:
             secretName: {{ .Values.service.scrapeAuthToken.existingSecret | default (printf "%s-scrape-auth" .Release.Name) }}
         {{- end }}
+        {{- if .Values.agent.debug.tokenSecret.name }}
+        - name: debug-token
+          secret:
+            secretName: {{ .Values.agent.debug.tokenSecret.name }}
+        {{- end }}
         {{- if .Values.agent.otlp.bearerTokenSecret.name }}
         - name: otlp-token
           secret:
@@ -496,17 +531,73 @@ spec:
       app: {{ .Release.Name }}-agent
   policyTypes: [Ingress]
   ingress:
+    # THREE rules, because these ports have three different audiences and a
+    # NetworkPolicy rule's `from` and `ports` apply TOGETHER — one rule with a
+    # `from` would scope every port in it. Same split, for the same reason, as
+    # the trace tier's policy in servicegraph.yaml.
+    #
+    # 1. The -listen port: /healthz, /readyz, the /debug index, /debug/targets,
+    #    /debug/transforms — and the three DATA-BEARING routes, /debug/otlp,
+    #    /debug/otlp/ui and /debug/tailer, which stream this node's whole
+    #    telemetry feed.
+    #
+    #    OPEN TO EVERY POD BY DEFAULT, and that is deliberate rather than
+    #    unconsidered: the kubelet probes this port and a DaemonSet rolling
+    #    update stops dead on a failing readiness probe, while WHAT IS WORTH
+    #    PROTECTING here is protected in-process instead — the three
+    #    data-bearing routes answer only a local connection (a port-forward
+    #    arrives as loopback) or the agent.debug.tokenSecret bearer token, and
+    #    refuse everything else with kubescrape_debug_refused_total{reason}.
+    #    A neighbour pod reaching this port gets probes and target/transform
+    #    state, which is what the metadata service's /v1 routes already serve
+    #    it unauthenticated.
+    #
+    #    agent.debug.allowFrom narrows it anyway, for a fleet that wants defence
+    #    in depth. Read its comment in values.yaml first: a policy scopes a PORT
+    #    and not a path, so the probes are narrowed with it and the `from` must
+    #    include whatever your CNI presents the kubelet as.
     - ports:
         - port: {{ (split ":" .Values.agent.listen)._1 | int }}
-        {{- if .Values.metrics.enabled }}
+      {{- with .Values.agent.debug.allowFrom }}
+      from:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    {{- if .Values.metrics.enabled }}
+    # 2. The Prometheus scrape port. Deliberately unscoped: metrics.scrapeAnnotations
+    #    asks for it to be scraped from wherever Prometheus runs, and this
+    #    chart cannot know where that is. It serves the process's own
+    #    go_*/process_*/kubescrape_* counters — no telemetry contents.
+    #    Undeclared ports (pprof, which exposes goroutine stacks and heap
+    #    contents) stay closed on every rule here.
+    - ports:
         - port: {{ (split ":" .Values.metrics.listen)._1 | int }}
-        {{- end }}
-        {{- if .Values.agent.ingest.enabled }}
+    {{- end }}
+    {{- /* Guarded on an endpoint EXISTING, not just on `enabled`: a rule whose
+           `ports` list renders empty is `ports: null`, which means EVERY port —
+           so an ingest section enabled with both endpoints blanked would have
+           handed allowFrom's peers the probe and metrics ports as well, in the
+           one rule written to narrow something. */}}
+    {{- if and .Values.agent.ingest.enabled (or .Values.agent.ingest.grpcEndpoint .Values.agent.ingest.httpEndpoint) }}
+    # 3. The OTLP ingest ports — the ones agent.ingest.allowFrom is FOR, and the
+    #    FIRST thing to tighten on this workload.
+    #
+    #    WHAT THEY EXPOSE, stated plainly: any pod that can reach them can push
+    #    arbitrary OTLP logs and metrics through this node's agent, with no
+    #    credential. Enrichment stamps the SENDER's Kubernetes identity where it
+    #    can resolve one, so a forged push is attributable to the pod that sent
+    #    it rather than to whatever it claims — but a sender can still emit
+    #    records naming any service.name it likes, and the cost of the volume it
+    #    pushes is this node's and the collector's. EMPTY MEANS ANY POD MAY PUSH.
+    - ports:
         {{- with .Values.agent.ingest.grpcEndpoint }}
         - port: {{ (split ":" .)._1 | int }}
         {{- end }}
         {{- with .Values.agent.ingest.httpEndpoint }}
         - port: {{ (split ":" .)._1 | int }}
         {{- end }}
-        {{- end }}
+      {{- with .Values.agent.ingest.allowFrom }}
+      from:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    {{- end }}
 {{- end }}

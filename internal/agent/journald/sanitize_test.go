@@ -32,7 +32,7 @@ func TestTruncatedBodyDoesNotPinTheWholeMessage(t *testing.T) {
 	r := sanitizer(1 << 10)
 	msg := strings.Repeat("a", 64<<10)
 
-	body, origLen := r.sanitize(msg)
+	body, origLen := r.sanitize(msg, "unit.service")
 	if origLen != len(msg) {
 		t.Fatalf("origLen = %d, want the raw length %d", origLen, len(msg))
 	}
@@ -44,7 +44,7 @@ func TestTruncatedBodyDoesNotPinTheWholeMessage(t *testing.T) {
 	}
 	// The same must hold once the message needed UTF-8 repair as well.
 	dirty := "\xff\xfe" + msg
-	body, _ = r.sanitize(dirty)
+	body, _ = r.sanitize(dirty, "unit.service")
 	if unsafe.StringData(body) == unsafe.StringData(dirty) {
 		t.Fatal("the repaired-and-truncated body still aliases the journal message")
 	}
@@ -74,7 +74,7 @@ func TestOverCapMessageIsValidatedOnlyUpToTheCap(t *testing.T) {
 	runtime.GC()
 	runtime.ReadMemStats(&before)
 	for range calls {
-		body, _ := r.sanitize(msg)
+		body, _ := r.sanitize(msg, "unit.service")
 		runtime.KeepAlive(body)
 	}
 	runtime.ReadMemStats(&after)
@@ -97,14 +97,14 @@ func TestValidMessageUnderTheCapIsFree(t *testing.T) {
 	r := sanitizer(1 << 20)
 	msg := strings.Repeat("kubelet: pod sandbox ready\n", 64)
 	if n := testing.AllocsPerRun(200, func() {
-		body, _ := r.sanitize(msg)
+		body, _ := r.sanitize(msg, "unit.service")
 		if len(body) == 0 {
 			t.Fatal("empty body")
 		}
 	}); n != 0 {
 		t.Fatalf("sanitize allocated %v times for a valid in-cap message, want 0", n)
 	}
-	body, origLen := r.sanitize(msg)
+	body, origLen := r.sanitize(msg, "unit.service")
 	if origLen != 0 || body != msg {
 		t.Fatalf("sanitize(valid) = (%d bytes, origLen %d), want the message untouched", len(body), origLen)
 	}
@@ -123,7 +123,7 @@ func TestSanitizeRepairsAndCaps(t *testing.T) {
 		{"multibyte on the boundary", strings.Repeat("a", 15) + "é"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			body, origLen := r.sanitize(tc.in)
+			body, origLen := r.sanitize(tc.in, "unit.service")
 			if !utf8.ValidString(body) {
 				t.Errorf("body %q is not valid UTF-8", body)
 			}
@@ -148,7 +148,7 @@ func BenchmarkSanitize(b *testing.B) {
 		b.ReportAllocs()
 		b.SetBytes(int64(len(msg)))
 		for b.Loop() {
-			benchBody, _ = r.sanitize(msg)
+			benchBody, _ = r.sanitize(msg, "unit.service")
 		}
 	}
 	b.Run("valid/small", func(b *testing.B) {

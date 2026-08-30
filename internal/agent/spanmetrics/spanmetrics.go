@@ -30,6 +30,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -106,6 +107,12 @@ type Config struct {
 	// encoding/json, which only accepts a raw nanosecond integer for a
 	// time.Duration, so the documented "15m" spelling would fail to decode.
 	StaleAfter string `json:"staleAfter,omitempty"`
+
+	// Logger reports what New decides for itself: a fallback taken, a
+	// dimension dropped. json:"-" — it is wiring, not config (the same shape as
+	// tailsample.Config.Script), and nil means slog.Default(), which both
+	// binaries install as the logfmt handler before anything runs.
+	Logger *slog.Logger `json:"-"`
 }
 
 // staleAfter parses StaleAfter (empty = the default, "0" disables eviction, a
@@ -215,9 +222,42 @@ func New(cfg Config) *Generator {
 	// Drop configured dimensions that repeat a built-in (or each other). This is
 	// the ONE place this generator's label names are decided, which is why the
 	// guard runs here; cumagg.Builtins holds the rule and the bug it prevents.
+	log := cfg.Logger
+	if log == nil {
+		log = slog.Default()
+	}
 	names := append([]string(nil), builtinDims...)
-	names = append(names, builtins.Filter(cfg.Dimensions)...)
-	stale, _ := cfg.staleAfter() // an unparseable value falls back to the default; Validate reports it
+	kept := builtins.Filter(cfg.Dimensions)
+	names = append(names, kept...)
+	// Filter DROPS a dimension that collides with a built-in (or repeats an
+	// earlier one), because the label would blank the real one and mint two
+	// series with byte-identical label sets — see cumagg.Builtins. Dropping is
+	// right; doing it silently is not: the operator asked for a label, gets no
+	// error, and finds it missing from every series with nothing to grep for.
+	seen := make(map[string]bool, len(cfg.Dimensions))
+	for _, d := range cfg.Dimensions {
+		// Mirrors Filter's own two rejections (a built-in, or a repeat of an
+		// earlier entry) rather than diffing against its output: a repeat IS in
+		// the output, once, so a set difference would report only half of them.
+		switch {
+		case builtins.Has(d):
+			log.Warn("ignoring a traceMetrics dimension: it repeats a built-in span-metric label, and adding it would blank the real label and render two series identically",
+				"key", d, "builtins", strings.Join(builtinDims, ","))
+		case seen[d]:
+			log.Warn("ignoring a repeated traceMetrics dimension", "key", d)
+		}
+		seen[d] = true
+	}
+	stale, err := cfg.staleAfter()
+	if err != nil {
+		// New never refuses to aggregate over a bad value (Validate is what
+		// reports it, and -check-config runs that) — but a start that has
+		// somehow got past Validate must not then apply a DIFFERENT eviction
+		// policy in silence: with eviction off, the cardinality cap becomes the
+		// one-way latch cumagg.ParseStaleAfter exists to prevent.
+		log.Warn("traceMetrics.staleAfter is unparseable; using the default eviction age",
+			"error", err, "staleAfter", stale)
+	}
 	g := &Generator{
 		prefix:    prefix,
 		names:     names,
@@ -253,6 +293,15 @@ func boundsOrDefault(b []float64) []float64 {
 
 // Consume aggregates every span in td (called on the ingest goroutines, so it is
 // safe for concurrent use). It never mutates td.
+//
+// The series mutex is taken PER SPAN, and a chunked hold (fold 64 spans per
+// acquisition) was tried and backed out: the uncontended lock/unlock pair is
+// about a seventh of what folding a span costs, but neither the serial nor the
+// parallel benchmark could resolve a difference (interleaved n=8 and n=12, every
+// row "~", geomean -0.1% and -2.0% against a ±30-46% spread). A longer hold also
+// works against the reason the render is chunked — the batch size is the
+// SENDER's choice — so it bought contested noise at the price of a real
+// invariant.
 func (g *Generator) Consume(td ptrace.Traces) {
 	// One clock read per BATCH, not per span: last-seen only feeds staleness
 	// eviction (minutes), and the hot path must stay allocation- and

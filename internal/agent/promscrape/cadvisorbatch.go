@@ -499,10 +499,21 @@ func (cb *cadvisorBatcher) scope(ident cadvisorIdentity) pmetric.ScopeMetrics {
 // then the pod (by name, cross-checked against the cgroup pod UID), then the
 // raw label identity.
 func (cb *cadvisorBatcher) fillResource(res pcommon.Resource, ident cadvisorIdentity) {
-	// The verdict is the cgroup sampler's business, not a scraped row's: a
-	// cadvisor row is exported either way, with the label identity as its
-	// fallback.
-	_, _ = cb.s.fillIdentityResource(cb.ctx, res, ident)
+	// The verdict does not change what is EXPORTED — a cadvisor row ships
+	// either way, with the label identity as its fallback — but it is reported,
+	// because an unattributed row loses its owner chain, its pod labels and its
+	// derived service.name, and until this counter existed a node whose
+	// cadvisor series had lost every workload label moved nothing at all (see
+	// obs.CadvisorUnresolved).
+	//
+	// Once per RESOURCE, never per sample: this runs from scope() only when a
+	// pod or container is first seen in a chunk.
+	resolved, _ := cb.s.fillIdentityResource(cb.ctx, res, ident)
+	if !resolved && ident.podScoped() {
+		cb.s.reportCadvisorIdentity(ident)
+	} else if ident.sandbox {
+		cb.s.debugSandboxFold(ident)
+	}
 }
 
 // FillContainerResource builds the resource attributes describing one container

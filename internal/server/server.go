@@ -22,6 +22,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 
+	"github.com/JohanLindvall/kubescrape/internal/scrape"
 	"github.com/JohanLindvall/kubescrape/internal/servicemonitors"
 	"github.com/JohanLindvall/kubescrape/internal/services"
 	"github.com/JohanLindvall/kubescrape/internal/store"
@@ -30,8 +31,13 @@ import (
 
 // MetadataResolver enriches pods with related-object metadata: the full
 // owner chain, the pod's namespace metadata and node metadata.
+//
+// Resolve's second result is how many ownerReferences its per-pod ceiling
+// refused to describe (owners.MaxOwners); it rides the served document as
+// kubemeta.Pod.OwnersOmitted so a truncated chain cannot read as a complete
+// one.
 type MetadataResolver interface {
-	Resolve(namespace string, refs []metav1.OwnerReference) []kubemeta.Owner
+	Resolve(namespace string, refs []metav1.OwnerReference) ([]kubemeta.Owner, int)
 	Namespace(name string) *kubemeta.ObjectMeta
 	Node(name string) *kubemeta.ObjectMeta
 }
@@ -176,6 +182,48 @@ type Server struct {
 	warnRefs     *logdedupe.Table
 	warnShadowed *logdedupe.Table
 	warnCollide  *logdedupe.Table
+	// warnRelabelCapped is the per-monitor merged-relabel-chain ceiling. Its
+	// OWN table, never warnShadowed's: both fire on the merge path, but a gate
+	// shared between two independent conditions lets the first suppress the
+	// second — and these two are exactly the pair that would coincide, since a
+	// pile-up of monitors on one URL produces both.
+	warnRelabelCapped *logdedupe.Table
+	// warnContribCapped is the per-monitor contributor-list ceiling, for the
+	// same reason and by the same rule: it is the THIRD condition the merge
+	// path can report, it fires on monitor pile-ups exactly as the other two
+	// do, and one gate for three conditions would report whichever arrived
+	// first and hide the rest.
+	warnContribCapped *logdedupe.Table
+
+	// The scrape-auth refusals that are properties of THIS PROCESS rather than
+	// of a ref, plus the two "cannot happen" reports. Keyless throttles: there
+	// is one condition per holder, so a keyed table would be keyed by
+	// something that grows with the fleet (the peer) or with hostile input
+	// (the path segment) while the answer is always the same line. The zero
+	// value is ready, so New leaves them alone.
+	warnAuthOff        logdedupe.Throttle
+	warnAuthNoMonitors logdedupe.Throttle
+	warnAuthToken      logdedupe.Throttle
+	warnAuthSegment    logdedupe.Throttle
+	warnLookupTimeout  logdedupe.Throttle
+	warnSelfForwarded  logdedupe.Throttle
+	warnSelfPeer       logdedupe.Throttle
+	warnEncode         logdedupe.Throttle
+	warnPodCapped      *logdedupe.Table
+	warnUnresolved     *logdedupe.Table
+	// warnAuthDenied is the allowlist MISS, and it gets its own table rather
+	// than sharing warnRefs: a ref the allowlist refused is by definition one
+	// no monitor named, i.e. three path segments the CALLER chose, unbounded
+	// in length and in count. warnRefs is bounded and saturation SUPPRESSES,
+	// so keying misses into it let a caller holding the scrape-auth token mint
+	// 1024 refusals and stop the RBAC-failure and non-UTF-8 warnings — whose
+	// keys come from the allowlist, and which are the two an operator has to
+	// act on — from ever naming a new ref again. Separated, the only thing a
+	// mint can drown out is the report of further mints, whose rate is on
+	// kubescrape_scrape_auth_failures_total{reason="not_allowed"} regardless;
+	// two genuinely broken refs still get a line each, which is the
+	// granularity the miss was given for.
+	warnAuthDenied *logdedupe.Table
 
 	// inFlight counts /v1 requests currently inside a handler. It exists for
 	// ONE line: when http.Server.Shutdown hits its budget it stops waiting and
@@ -208,21 +256,26 @@ func New(cfg Config) *Server {
 		tokens = func() []string { return []string{token} }
 	}
 	return &Server{
-		secrets:          cfg.Secrets,
-		scrapeAuthTokens: tokens,
-		store:            cfg.Store,
-		services:         cfg.Services,
-		monitors:         cfg.Monitors,
-		resolver:         cfg.Resolver,
-		maxWait:          cfg.MaxWait,
-		cacheTTL:         cfg.CacheTTL,
-		ready:            cfg.Ready,
-		now:              time.Now,
-		logger:           cfg.Log,
-		warnRefs:         logdedupe.New(maxScrapeAuthWarnRefs, scrapeAuthWarnEvery),
-		warnShadowed:     logdedupe.New(maxShadowedWarnPairs, shadowWarnEvery),
-		warnCollide:      logdedupe.New(maxCollisionWarnKeys, collisionWarnEvery),
-		draining:         make(chan struct{}),
+		secrets:           cfg.Secrets,
+		scrapeAuthTokens:  tokens,
+		store:             cfg.Store,
+		services:          cfg.Services,
+		monitors:          cfg.Monitors,
+		resolver:          cfg.Resolver,
+		maxWait:           cfg.MaxWait,
+		cacheTTL:          cfg.CacheTTL,
+		ready:             cfg.Ready,
+		now:               time.Now,
+		logger:            cfg.Log,
+		warnRefs:          logdedupe.New(maxScrapeAuthWarnRefs, scrapeAuthWarnEvery),
+		warnShadowed:      logdedupe.New(maxShadowedWarnPairs, shadowWarnEvery),
+		warnCollide:       logdedupe.New(maxCollisionWarnKeys, collisionWarnEvery),
+		warnRelabelCapped: logdedupe.New(maxRelabelCappedWarnKeys, relabelCappedWarnEvery),
+		warnContribCapped: logdedupe.New(maxContribCappedWarnKeys, contribCappedWarnEvery),
+		warnPodCapped:     logdedupe.New(maxCappedWarnKeys, cappedWarnEvery),
+		warnUnresolved:    logdedupe.New(maxUnresolvedWarnKeys, unresolvedWarnEvery),
+		warnAuthDenied:    logdedupe.New(maxScrapeAuthDeniedRefs, scrapeAuthWarnEvery),
+		draining:          make(chan struct{}),
 	}
 }
 
@@ -287,8 +340,21 @@ const scrapeAuthWarnEvery = 5 * time.Minute
 // — this is belt and braces against a monitor set that churns.
 const maxScrapeAuthWarnRefs = 1024
 
+// maxScrapeAuthDeniedRefs bounds the SEPARATE table the allowlist miss uses
+// (see Server.warnAuthDenied). Same size, different blast radius: those keys
+// are caller-chosen, so that is the table a mint may saturate and it must not
+// be the one carrying the operator-facing failures.
+const maxScrapeAuthDeniedRefs = 1024
+
 // warnScrapeAuth throttles the per-ref scrape-auth failure log, emitting the
 // one-time saturation notice when the table fills.
+//
+// Every key here is ALLOWLIST-derived — the ref has already been matched
+// against AuthSecretRefs, so it names a secret some indexed monitor asked for,
+// bounded in count by the operators' monitors and in length by
+// servicemonitors' own field ceiling. A ref the allowlist REFUSED must not
+// reach this table: those segments are the caller's, so they bound nothing.
+// See warnAuthDenied.
 //
 // The saturation POLICY — suppress further keys, never clear the table — lives
 // in internal/logdedupe, along with the reason. This file had its own copy that
@@ -341,6 +407,105 @@ func (s *Server) reportAuthConflict(kind, winner, loser, url string) {
 					"further warnings for this pair are suppressed for "+shadowWarnEvery.String())
 		}
 	}
+}
+
+// relabelCappedWarnEvery and maxRelabelCappedWarnKeys bound the merged-chain
+// ceiling warning. Like the two throttles above it this is a STEADY state, not
+// an event: the merge is re-decided on every targets request of every agent
+// whose node holds one of the pods, so an unthrottled line is a permanent
+// flood proportional to fleet size. Keys are monitor names, so the live set is
+// bounded by the indexed monitors; the cap is belt and braces against churn.
+const (
+	relabelCappedWarnEvery   = 30 * time.Minute
+	maxRelabelCappedWarnKeys = 1024
+)
+
+// reportRelabelCapped records a monitor endpoint whose metricRelabelings were
+// only partly folded into the target already holding its URL: the merged chain
+// hit scrape.MaxRelabelChainRules/MaxRelabelChainBytes and the rest of the
+// chain filters nothing.
+//
+// It needs a line as well as the counter for the same reason the per-pod
+// ceiling does: the refusal is invisible in the data. A drop rule that was not
+// applied does not fail a scrape and does not log on the agent — the series the
+// operator asked to drop simply arrive, at whatever cardinality they have, and
+// nothing anywhere says which CR stopped being honoured.
+func (s *Server) reportRelabelCapped(kind, monitor, url string) {
+	obs.MonitorRelabelChainCapped.WithLabelValues(kind).Inc()
+	allow, saturated := s.warnRelabelCapped.Allow(kind + "\x00" + monitor)
+	if saturated {
+		s.log().Warn("relabel-ceiling warning dedupe table is full; further distinct monitors are suppressed",
+			"keys", maxRelabelCappedWarnKeys)
+	}
+	if !allow {
+		return
+	}
+	s.log().Warn("monitor metricRelabelings only partly applied: the merged chain for this scrape URL is at the per-target ceiling",
+		"kind", kind, "monitor", monitor, "url", url,
+		"rules", scrape.MaxRelabelChainRules, "bytes", scrape.MaxRelabelChainBytes,
+		"note", "every monitor resolving to one URL on one pod is served as ONE scrape, so their chains "+
+			"concatenate; the rules that fit are applied and the rest filter nothing. Either the chain is "+
+			"enormous or several monitors target this URL — GET /v1/explain/<ns>/<pod> says which. Further "+
+			"warnings for this monitor are suppressed for "+relabelCappedWarnEvery.String())
+}
+
+// contribCappedWarnEvery and maxContribCappedWarnKeys bound the contributor-list
+// ceiling warning. It gets its OWN throttle table rather than sharing the
+// relabel one beside it: the two conditions are independent (the attack that
+// fills the contributor list carries no relabel rules at all), and a shared
+// gate would let whichever fired first suppress the other for half an hour on
+// exactly the monitor an operator is looking at. Same steady-state reasoning as
+// its siblings — the merge is re-decided on every targets request of every
+// agent whose node holds one of the pods.
+//
+// Keys are the URL, NOT the monitor the two siblings key by, because the
+// condition is a property of the URL: "too many monitors resolve here". The
+// refused monitor is a symptom, and there are as many of them as the tenant
+// cares to create — keying by monitor turned one pile-up into one line per
+// refused CR (1,968 of them in the regression test) saying the same thing.
+// /v1/explain is where the per-monitor answer lives, and the line points at it.
+const (
+	contribCappedWarnEvery   = 30 * time.Minute
+	maxContribCappedWarnKeys = 1024
+)
+
+// reportContributorsCapped records a monitor whose endpoint MERGED into the
+// target holding its URL but which is not listed among that target's
+// contributors, the list being at scrape.MaxContributorsPerTarget.
+//
+// Nothing about the scrape changed, which is the entire reason this needs a
+// line and a counter: an operator reading the served target, or the series it
+// produces, has no way to tell that a monitor they can see being honoured is
+// missing from the attribution — and the shape that fills the list (many
+// monitors resolving to one URL on one pod) is worth reconciling on its own.
+// The monitor is named as the EXAMPLE it is: it is whichever one happened to
+// arrive first past the ceiling, not the cause.
+// firstForPod is the caller's per-derivation gate (targetDedup.firstContribCap):
+// the condition is a property of the URL and fires once per monitor past the
+// ceiling, so on a pile-up this used to build one throttle key — an allocation
+// — and take one dedupe-table mutex per REFUSED MONITOR, i.e. the guard that
+// bounds the abuse allocated in proportion to it. The COUNTER still moves on
+// every refusal, because it is the rate an operator alerts on; only the line,
+// which says the same thing every time, is folded to once per URL per pod.
+func (s *Server) reportContributorsCapped(kind, monitor, url string, firstForPod bool) {
+	obs.MonitorContributorsCapped.WithLabelValues(kind).Inc()
+	if !firstForPod {
+		return
+	}
+	allow, saturated := s.warnContribCapped.Allow(kind + "\x00" + url)
+	if saturated {
+		s.log().Warn("contributor-ceiling warning dedupe table is full; further distinct scrape URLs are suppressed",
+			"keys", maxContribCappedWarnKeys)
+	}
+	if !allow {
+		return
+	}
+	s.log().Warn("more monitors resolve to one scrape URL than its contributor list can carry; the rest merge unattributed",
+		"kind", kind, "url", url, "monitors", scrape.MaxContributorsPerTarget, "example", monitor,
+		"note", "the endpoints' metricRelabelings, interval and auth DO merge — only the attribution is "+
+			"refused, so the scrape is unaffected. Every monitor resolving to one URL on one pod is served "+
+			"as ONE scrape; GET /v1/explain/<ns>/<pod> lists every monitor and says which ones are not "+
+			"contributors. Further warnings for this URL are suppressed for "+contribCappedWarnEvery.String())
 }
 
 // Handler returns the HTTP routes.
@@ -793,7 +958,7 @@ func podMonitorsFor(pod kubemeta.Pod, all []podMonitorRef, out []podMonitorRef) 
 
 // enrich fills in owner-chain and namespace metadata on a pod.
 func (s *Server) enrich(pod *kubemeta.Pod, refs []metav1.OwnerReference) {
-	pod.Owners = s.resolver.Resolve(pod.Namespace, refs)
+	pod.Owners, pod.OwnersOmitted = s.resolver.Resolve(pod.Namespace, refs)
 	pod.NamespaceMetadata = s.resolver.Namespace(pod.Namespace)
 }
 
@@ -822,7 +987,7 @@ type enrichCache struct {
 	// smaller and wrong — Resolve takes the WHOLE ref list and reads each ref's
 	// name and kind, and it cross-checks the UID against the cached object, so
 	// two refs agreeing on UID but not on name are two different answers.
-	owners map[string][]kubemeta.Owner
+	owners map[string]resolvedOwners
 	// namespaces caches the pod's namespace metadata. A nil value is a real
 	// answer (the namespace is not in the informer cache), so presence is read
 	// from the lookup's second result, never from the value.
@@ -833,17 +998,30 @@ type enrichCache struct {
 	key []byte
 }
 
+// resolvedOwners is one memoised Resolve answer: the chain and how many
+// entries owners.MaxOwners refused. The count is memoised WITH the chain
+// rather than recomputed, because it is a pure function of the same input and
+// the two must never disagree — a served chain of MaxOwners entries reporting
+// ownersOmitted: 0 is exactly the "truncated reads as complete" failure the
+// field exists to prevent.
+type resolvedOwners struct {
+	owners  []kubemeta.Owner
+	omitted int
+}
+
 // enrichCached is enrich through a request-scoped memo (see enrichCache).
 func (s *Server) enrichCached(c *enrichCache, pod *kubemeta.Pod, refs []metav1.OwnerReference) {
 	c.key = appendOwnerKey(c.key[:0], pod.Namespace, refs)
-	if owners, ok := c.owners[string(c.key)]; ok {
-		pod.Owners = owners
+	if r, ok := c.owners[string(c.key)]; ok {
+		pod.Owners, pod.OwnersOmitted = r.owners, r.omitted
 	} else {
-		pod.Owners = s.resolver.Resolve(pod.Namespace, refs)
+		var r resolvedOwners
+		r.owners, r.omitted = s.resolver.Resolve(pod.Namespace, refs)
 		if c.owners == nil {
-			c.owners = make(map[string][]kubemeta.Owner, 8)
+			c.owners = make(map[string]resolvedOwners, 8)
 		}
-		c.owners[string(c.key)] = pod.Owners
+		c.owners[string(c.key)] = r
+		pod.Owners, pod.OwnersOmitted = r.owners, r.omitted
 	}
 	if meta, ok := c.namespaces[pod.Namespace]; ok {
 		pod.NamespaceMetadata = meta
@@ -969,14 +1147,43 @@ func (s *Server) waitReady(ctx context.Context) error {
 		// answer rather than a coin flip.)
 		return errNotSynced
 	}
+	// As in handleContainer: slog evaluates arguments eagerly, so the clock
+	// read below is behind the level check. Nothing here fires in steady state
+	// — this whole function returns at the first select once the caches are
+	// synced — so these lines exist for exactly the window an operator is
+	// staring at, the startup one, and cost nothing after it.
+	debug := s.log().Enabled(ctx, slog.LevelDebug)
 	if s.store != nil {
 		if !s.store.TryPark() {
+			// Counted on kubescrape_container_lookups_shed_total together with
+			// the store's own refusals, deliberately: same cap, same route. The
+			// counter cannot say WHICH of the two spots bound, and this is the
+			// spot that only exists during the initial sync — which is the
+			// difference between "we are being abused" and "a fleet restarted
+			// against a service that is still filling its caches".
+			if debug {
+				s.log().Debug("container lookup shed while waiting for the initial informer sync",
+					"blockedLookups", s.store.BlockedLookups())
+			}
 			return store.ErrTooManyWaiters
 		}
 		defer s.store.Unpark()
 	}
 	s.readyParked.Add(1)
 	defer s.readyParked.Add(-1)
+	var parkedAt time.Time
+	if debug {
+		parkedAt = time.Now()
+		defer func() {
+			// ONE line per park, on the way out, carrying the outcome: two
+			// lines (enter and leave) would double the volume of the only
+			// window this fires in, and the outcome is the half that answers
+			// "why did the agent's first poll return nothing?".
+			s.log().Debug("container lookup left the readiness park",
+				"waited", time.Since(parkedAt).Round(time.Millisecond),
+				"outcome", s.readyParkOutcome(), "blockedLookups", s.blockedLookups())
+		}()
+	}
 	// Re-check: the caches may have synced while the slot was being taken, and
 	// a request that can be served must not spend a wait budget on the select.
 	select {
@@ -998,6 +1205,30 @@ func (s *Server) waitReady(ctx context.Context) error {
 	case <-ctx.Done():
 		return errNotSynced
 	}
+}
+
+// readyParkOutcome names why a readiness park ended, read at the deferred log
+// line rather than threaded through the select arms: the three arms are a
+// closed set and the state they select on is exactly what these two checks
+// read, so a fourth arm cannot silently acquire a wrong label.
+func (s *Server) readyParkOutcome() string {
+	if s.isReady() {
+		return "synced"
+	}
+	select {
+	case <-s.draining:
+		return "draining"
+	default:
+	}
+	return "expired"
+}
+
+// blockedLookups reports the store's blocked-lookup count, 0 with no store.
+func (s *Server) blockedLookups() int {
+	if s.store == nil {
+		return 0
+	}
+	return s.store.BlockedLookups()
 }
 
 // The two refusals waitReady can produce. Both are retryable 503s, and they say

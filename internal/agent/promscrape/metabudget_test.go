@@ -355,7 +355,6 @@ func TestASpentAllowanceIsWarnedAbout(t *testing.T) {
 		Logger: slog.New(slog.NewTextHandler(&buf, nil)),
 	})
 	ctx, cancel := s.scrapeContext(context.Background(), 20*time.Millisecond, pipelineSummary)
-	defer cancel()
 
 	_, spent, may := s.metaLookup(ctx)
 	if !may {
@@ -363,11 +362,42 @@ func TestASpentAllowanceIsWarnedAbout(t *testing.T) {
 	}
 	time.Sleep(15 * time.Millisecond)
 	spent()
-	if _, _, may := s.metaLookup(ctx); may {
-		t.Fatal("a lookup was issued after the allowance was spent")
+	for range 3 {
+		if _, _, may := s.metaLookup(ctx); may {
+			t.Fatal("a lookup was issued after the allowance was spent")
+		}
 	}
-	if !strings.Contains(buf.String(), "metadata allowance") {
-		t.Errorf("the exhausted allowance was not warned about; log was %q", buf.String())
+	// The line lands when the SCRAPE ends, which is the only moment the shed
+	// count is final — and the count is most of what makes it actionable.
+	if strings.Contains(buf.String(), "metadata allowance") {
+		t.Errorf("the allowance was warned about mid-scrape, where the shed count is not yet final; log was %q", buf.String())
+	}
+	cancel()
+	got := buf.String()
+	for _, want := range []string{"metadata allowance", "pipeline=summary", "unattributed=3"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("the end-of-scrape warning is missing %q; log was %q", want, got)
+		}
+	}
+}
+
+// A scrape that never exhausted its allowance says nothing: the line is about
+// an outage, and one per healthy scrape would be a permanent flood.
+func TestAnUnspentAllowanceIsSilent(t *testing.T) {
+	var buf strings.Builder
+	s := New(Config{
+		Node: "node1", Targets: staticTargets{}, Exporter: &captureExporter{},
+		Logger: slog.New(slog.NewTextHandler(&buf, nil)),
+	})
+	ctx, cancel := s.scrapeContext(context.Background(), time.Second, pipelineCadvisor)
+	_, spent, may := s.metaLookup(ctx)
+	if !may {
+		t.Fatal("the first lookup of a scrape was refused")
+	}
+	spent()
+	cancel()
+	if buf.Len() != 0 {
+		t.Errorf("a scrape within its allowance logged %q", buf.String())
 	}
 }
 

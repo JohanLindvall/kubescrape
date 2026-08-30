@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"runtime"
 	"sync"
 	"testing"
 	"time"
@@ -13,6 +14,7 @@ import (
 	"go.opentelemetry.io/collector/pdata/ptrace"
 
 	"github.com/JohanLindvall/kubescrape/internal/agent/otlpexport"
+	"github.com/JohanLindvall/kubescrape/internal/testrace"
 )
 
 // otlpexportConfigForTest is a flag-built base config as main would hand it to
@@ -786,27 +788,130 @@ func TestNewResharderBuildsRingAndSkipsSelf(t *testing.T) {
 	}
 }
 
+// The split path MOVES each span into its owner's share. Two things follow, and
+// both are contract rather than optimisation: the input is CONSUMED (Reshard's
+// doc says so, and a caller that read td afterwards would read zeroed spans),
+// and the hop's cost stops scaling with what a span CARRIES.
+//
+// The allocation bound is expressed against the cost of copying the same
+// payload, measured here rather than written down, so it pins the property
+// instead of one machine's number and survives a pdata release changing what a
+// span copy costs. The shape this replaced allocated MORE than a whole-payload
+// copy (it copied every span and then built the per-owner grouping around it):
+// 2603 allocations for a 100-span batch against 303 now.
+func TestSplitMovesSpansRatherThanCopyingThem(t *testing.T) {
+	if testrace.Enabled {
+		t.Skip("-race perturbs allocation counts")
+	}
+	clients := map[string]TracesExporter{}
+	for i := 1; i < 8; i++ {
+		clients[fmt.Sprintf("shard-%d", i)] = nopExporter{}
+	}
+	r := testResharder(t, clients, 0)
+
+	in := realisticBatch(20, 3)
+	spans := in.SpanCount()
+	split := mallocsDuring(func() {
+		if _, err := r.Reshard(context.Background(), in); err != nil {
+			t.Fatal(err)
+		}
+	})
+	// Consumed: every span was handed over, so the input holds only the zeroed
+	// husks the move left behind.
+	if got := liveSpans(in); got != 0 {
+		t.Errorf("%d of %d input spans still carry a trace id; split copied instead of moving", got, spans)
+	}
+
+	ref := realisticBatch(20, 3)
+	whole := mallocsDuring(func() {
+		out := ptrace.NewTraces()
+		ref.CopyTo(out)
+	})
+	// A quarter, not half: the measured figure is 303 against ~2450 for the
+	// whole-payload copy — an eighth — and the headroom is there for the eight
+	// per-owner resource copies the split legitimately makes, not for a span
+	// copy creeping back in.
+	if limit := whole / 4; split > limit {
+		t.Errorf("splitting a %d-span batch across 8 shards allocates %d times, want at most %d (a quarter of the %d a whole-payload copy costs)", spans, split, limit, whole)
+	}
+}
+
+// mallocsDuring counts the heap objects f allocates. Exact rather than
+// sampled — MemStats.Mallocs is a counter — so one call is enough and the
+// measurement does not depend on the machine.
+func mallocsDuring(f func()) uint64 {
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	f()
+	runtime.ReadMemStats(&after)
+	return after.Mallocs - before.Mallocs
+}
+
+// liveSpans counts the spans of td that still carry a trace id, i.e. the ones a
+// move has not emptied.
+func liveSpans(td ptrace.Traces) int {
+	n := 0
+	rss := td.ResourceSpans()
+	for i := 0; i < rss.Len(); i++ {
+		sss := rss.At(i).ScopeSpans()
+		for j := 0; j < sss.Len(); j++ {
+			spans := sss.At(j).Spans()
+			for k := 0; k < spans.Len(); k++ {
+				if !spans.At(k).TraceID().IsEmpty() {
+					n++
+				}
+			}
+		}
+	}
+	return n
+}
+
 // --- benchmark ---
 
 // BenchmarkReshard measures what the entry shard pays per pushed batch: the
-// owner walk plus, when the batch spans several owners, the per-span copy. The
-// SEND is a no-op here; the cost being measured is the routing itself.
+// owner walk plus, when the batch spans several owners, the per-span hand-over.
+// The SEND is a no-op here; the cost being measured is the routing itself.
+//
+// Each iteration gets its OWN payload, because Reshard consumes what it splits
+// (it moves each span into its owner's share). Rebuilding one per iteration
+// would measure the builder, so a ring of them is built ahead with the timer
+// STOPPED — testing charges neither time nor allocations to a stopped stretch —
+// and refilled when it runs out.
 func BenchmarkReshard(b *testing.B) {
 	clients := map[string]TracesExporter{}
 	for i := 1; i < 8; i++ {
 		clients[fmt.Sprintf("shard-%d", i)] = nopExporter{}
 	}
 	r := testResharder(b, clients, 0)
-	td := realisticBatch(20, 3)
 	ctx := context.Background()
-	b.ReportAllocs()
-	for b.Loop() {
-		if _, err := r.Reshard(ctx, td); err != nil {
-			b.Fatal(err)
+	const ring = 64
+	batch := make([]ptrace.Traces, ring)
+	spansPerBatch := 0
+	refill := func() {
+		for i := range batch {
+			batch[i] = realisticBatch(20, 3)
 		}
+		spansPerBatch = batch[0].SpanCount()
 	}
 	b.StopTimer()
-	b.ReportMetric(float64(b.Elapsed().Nanoseconds())/float64(b.N)/float64(td.SpanCount()), "ns/span")
+	refill()
+	b.StartTimer()
+	b.ReportAllocs()
+	n := 0
+	for b.Loop() {
+		if n == ring {
+			b.StopTimer()
+			refill()
+			b.StartTimer()
+			n = 0
+		}
+		if _, err := r.Reshard(ctx, batch[n]); err != nil {
+			b.Fatal(err)
+		}
+		n++
+	}
+	b.StopTimer()
+	b.ReportMetric(float64(b.Elapsed().Nanoseconds())/float64(b.N)/float64(spansPerBatch), "ns/span")
 }
 
 // BenchmarkReshardSingleOwner is the fast path: a one-shard tier (and any batch

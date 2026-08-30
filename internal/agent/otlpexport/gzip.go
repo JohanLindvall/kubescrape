@@ -36,8 +36,103 @@ func assertGzipCodec() error {
 }
 
 type gzipCodec struct {
-	writers sync.Pool // *gzip.Writer
-	readers sync.Pool // *gzip.Reader, see Decompress
+	writers gzipWriterCache // see warmPool: a warm slot in front of a sync.Pool
+	readers gzipReaderCache // the same, for Decompress
+}
+
+type (
+	gzipWriterCache = warmPool[gzip.Writer]
+	gzipReaderCache = warmPool[gzip.Reader]
+)
+
+// warmPool is a sync.Pool with ONE slot in front of it that the garbage
+// collector cannot take back.
+//
+// The pool alone could not keep either half of a gzip codec, and the reason is
+// structural rather than a tuning accident: sync.Pool is drained by every GC
+// (the local set becomes the victim cache and the previous victim set is
+// dropped), so an object survives at most one cycle. An agent GCs every
+// 1.9-2.5 s under load while the tailer flushes every 2 s — the same period, so
+// the pool was being asked to bridge a gap it structurally cannot. Measured on
+// a live node: 447 klauspost flate.NewWriter constructions against ~550 gRPC
+// compressions in 1000 s, an ~81% miss rate on a pool whose whole job is that
+// object.
+//
+// What a miss costs, both halves, quoted in ALLOCATIONS rather than
+// nanoseconds — the nanoseconds are swamped by the deflate/inflate itself and
+// did not resolve on a loaded machine:
+//
+//	compress a 460 kB body           1 alloc  ->  1,078,328 B / 17 allocs
+//	decompress the 2-byte response   1 alloc  ->     43,288 B / 10 allocs
+//
+// (BenchmarkGzipCompressGCBetween and BenchmarkGzipDecompressResponseGCBetween,
+// against a pristine pre-warm-slot tree; re-measured 2026-08-29 on go1.26.6 at
+// -benchtime 3000x.)
+//
+// DO NOT QUOTE A WARM-PATH B/op HERE, which two earlier revisions of this
+// comment did with two different numbers. The benchmark still pays ONE cold
+// construction before the slot is warm, so its warm B/op is that construction
+// divided by the iteration count and nothing else: the same compress path
+// reports 3,610 B/op at 3e2 iterations, 375 at 3e3 and 70 at 2e4. The
+// allocation COUNT is the stable figure and it has been 1 every time.
+//
+// The writer figure is the larger because klauspost
+// builds the compressor lazily — gzip.NewWriterLevel itself is 160 B — and the
+// first Write then materialises a level-5 encoder's window and hash tables.
+// That was ~5% of everything the agent allocated, spent rebuilding it twice a
+// second. The reader half is smaller per message but is paid on the SEND path
+// too: grpc-go compresses its responses, so every export decompresses two
+// bytes.
+//
+// ONE slot, not a free list, because the price is retained memory and the
+// benefit is not linear in the count. A warm writer holds 996 KiB
+// (TestWarmGzipWriterRetainedSize pins it) and a reader ~37 kB, while the
+// agent's steady state is SERIAL: the tailer's single sweep goroutine exports
+// inline, the scraper's cycle exports after it, self-metrics once a minute. One
+// slot converts that stream from a miss per export to a hit per export; a
+// second would buy only the rarer overlap, which the sync.Pool behind it
+// already serves — within a burst there is no GC to drain it.
+//
+// So what this pins is ONE object per cache that has been used, which is a
+// ceiling rather than a growth path: the gRPC codec is one cache pair, and the
+// HTTP body path is one per gzip LEVEL, of which a deployment uses one (the
+// flag is a single value; only routes configured at differing levels can reach
+// more). That is ~1 MiB on a DaemonSet running the default pipelines, whose
+// RSS is ~70 MiB (the same process reads 66.9 MiB in internal/cli/memlimit.go's
+// measurement). README's "~28 MB agent RSS" is a DIFFERENT configuration — a
+// metrics-only agent with the tailer off, scraping one 100k-series target — and
+// the two are not in conflict; each names its shape. The metadata
+// service links this too and pushes self-metrics once a minute against a 9-11
+// MiB live heap, where the same MiB is a larger relative cost — and still the
+// right trade, since at 39 collections a second that pool misses every single
+// time, and a slightly larger live heap raises the GC goal rather than the
+// footprint.
+//
+// get takes the warm slot first and falls back to the pool; put fills the warm
+// slot first and falls back to the pool, which is exactly what this did before
+// the slot existed. Both are lock-free: the slot is one atomic swap.
+type warmPool[T any] struct {
+	warm atomic.Pointer[T]
+	pool sync.Pool // *T, the overflow for concurrent use
+}
+
+// get returns an object to reuse, or nil when neither the warm slot nor the
+// pool holds one. The caller Resets it.
+func (c *warmPool[T]) get() *T {
+	if v := c.warm.Swap(nil); v != nil {
+		return v
+	}
+	v, _ := c.pool.Get().(*T)
+	return v
+}
+
+// put offers a finished object back. The warm slot wins when it is empty —
+// that is the one a GC cannot reclaim — and everything else goes to the pool.
+func (c *warmPool[T]) put(v *T) {
+	if c.warm.CompareAndSwap(nil, v) {
+		return
+	}
+	c.pool.Put(v)
 }
 
 // effectiveGzipLevel maps Config.CompressionLevel (0 = "the library default")
@@ -91,12 +186,12 @@ func newGzipWriter(level int) *gzip.Writer {
 }
 
 func (c *gzipCodec) Compress(w io.Writer) (io.WriteCloser, error) {
-	z, ok := c.writers.Get().(*gzip.Writer)
-	if !ok {
+	z := c.writers.get()
+	if z == nil {
 		z = newGzipWriter(int(codecGzipLevel.Load()))
 	}
 	z.Reset(w)
-	return &pooledGzipWriter{Writer: z, pool: &c.writers}, nil
+	return &pooledGzipWriter{Writer: z, cache: &c.writers}, nil
 }
 
 // Decompress hands back a POOLED reader. A gzip reader carries a fixed 32 KiB
@@ -115,8 +210,8 @@ func (c *gzipCodec) Compress(w io.Writer) (io.WriteCloser, error) {
 // contract that makes pooling safe is that nothing can still read from a reader
 // that has gone back. See its doc.
 func (c *gzipCodec) Decompress(r io.Reader) (io.Reader, error) {
-	z, ok := c.readers.Get().(*gzip.Reader)
-	if !ok {
+	z := c.readers.get()
+	if z == nil {
 		z = new(gzip.Reader) // a zero Reader + Reset IS gzip.NewReader
 	}
 	if err := z.Reset(r); err != nil {
@@ -181,14 +276,14 @@ func (c *gzipCodec) Decompress(r io.Reader) (io.Reader, error) {
 // the pool saves per message. What a pooled reader can still hold of any
 // message is then bounded by that bufio's fixed 4 KiB of scratch — our size,
 // not the sender's.
-func putGzipReader(pool *sync.Pool, z *gzip.Reader) {
+func putGzipReader(pool *gzipReaderCache, z *gzip.Reader) {
 	if err := z.Reset(idleGzipSource{}); err != nil {
 		// Unreachable: TestIdleGzipStreamParses pins the constant against the
 		// same parser. A reader whose state we cannot vouch for is dropped
 		// rather than handed to the next message.
 		return
 	}
-	pool.Put(z)
+	pool.put(z)
 }
 
 // idleGzipStream is a complete gzip stream of no bytes: the 10-byte header
@@ -246,7 +341,7 @@ type pooledGzipReader struct {
 	mu   sync.Mutex
 	z    *gzip.Reader // nil once released; never touched again after that
 	err  error        // the terminal error, repeated to every later Read
-	pool *sync.Pool
+	pool *gzipReaderCache
 }
 
 func (p *pooledGzipReader) Read(b []byte) (int, error) {
@@ -291,15 +386,37 @@ func (p *pooledGzipReader) releaseLocked() {
 
 var errGzipReadAfterClose = errors.New("otlpexport: gzip reader read after close")
 
-// pooledGzipWriter returns the writer to the pool on Close.
+// putGzipWriter releases a finished writer's SINK before pooling it, for the
+// same reason putGzipReader releases a finished reader's source — and it became
+// load-bearing when the warm slot did, because the sync.Pool it used to go into
+// was emptied by the next collection and a warm slot is not.
+//
+// A gzip.Writer holds the io.Writer it was Reset onto, in two places (its own
+// z.w and the compressor's huffmanBitWriter), and Close does not clear either.
+// On the gRPC path that sink is grpc-go's message-assembly writer over its
+// pooled mem buffers; on the HTTP path it is a bufpool.Buffer that the caller
+// RELEASES straight afterwards. Pooling the writer as-is would therefore pin
+// another package's recycled allocator objects for the process' lifetime — the
+// one thing a cache that outlives the GC must not do.
+//
+// Reset(nil) is the whole release: klauspost's init re-points both references
+// and PRESERVES the compressor (gzip.go:98-112), so the window and hash tables
+// this cache exists to keep are kept, and nothing sender-controlled travels
+// with them. It is also what makes the writer ready for its next Reset.
+func putGzipWriter(cache *gzipWriterCache, z *gzip.Writer) {
+	z.Reset(nil)
+	cache.put(z)
+}
+
+// pooledGzipWriter returns the writer to the cache on Close.
 type pooledGzipWriter struct {
 	*gzip.Writer
-	pool *sync.Pool
+	cache *gzipWriterCache
 }
 
 func (p *pooledGzipWriter) Close() error {
 	err := p.Writer.Close()
-	p.pool.Put(p.Writer)
+	putGzipWriter(p.cache, p.Writer)
 	return err
 }
 
@@ -310,16 +427,19 @@ func (p *pooledGzipWriter) Close() error {
 // oversized, under-utilized backing array stays pooled) and is level-agnostic.
 var (
 	// Index 0 is gzip.DefaultCompression, 1..9 are the explicit levels.
-	// sync.Pool's zero value is usable; Get returns nil when the pool is empty
-	// and no New is set, which gzipBody handles (New cannot close over a level
-	// from an array literal).
-	httpGzipWriters [10]sync.Pool
+	// warmPool's zero value is usable; get returns nil when neither its warm
+	// slot nor its sync.Pool holds a writer, which gzipBody handles (a
+	// sync.Pool New func cannot close over a level from an array literal, and
+	// the warm slot has no New to give it one).
+	httpGzipWriters [10]gzipWriterCache
 	// bufpool.Pool's zero value is ready to use (and must not be copied).
 	httpGzipBufs bufpool.Pool
 )
 
-// gzipWriterPool selects the pool for an effective gzip level.
-func gzipWriterPool(level int) *sync.Pool {
+// gzipWriterPool selects the cache for an effective gzip level. Each level has
+// its own warm slot, so what this can pin is one writer per level actually
+// USED — a destination compresses at one level, so in practice one.
+func gzipWriterPool(level int) *gzipWriterCache {
 	if level < 1 || level > 9 {
 		return &httpGzipWriters[0] // DefaultCompression (and any level gzip refuses)
 	}
@@ -340,8 +460,8 @@ func gzipWriterPool(level int) *sync.Pool {
 func gzipBody(body []byte, level int) (*bufpool.Buffer, error) {
 	buf := httpGzipBufs.Get()
 	pool := gzipWriterPool(level)
-	z, ok := pool.Get().(*gzip.Writer)
-	if !ok {
+	z := pool.get()
+	if z == nil {
 		z = newGzipWriter(level)
 	}
 	z.Reset(buf)
@@ -349,15 +469,16 @@ func gzipBody(body []byte, level int) (*bufpool.Buffer, error) {
 		buf.Release()
 		// A Reset writer is safe to reuse after a Write/Close error (the next
 		// Reset clears its state); returning it avoids leaking the pooled
-		// writer on the (rare) error path.
-		pool.Put(z)
+		// writer on the (rare) error path. putGzipWriter is what keeps the
+		// just-Released buffer from being pinned by the pooled writer.
+		putGzipWriter(pool, z)
 		return nil, err
 	}
 	if err := z.Close(); err != nil {
 		buf.Release()
-		pool.Put(z)
+		putGzipWriter(pool, z)
 		return nil, err
 	}
-	pool.Put(z)
+	putGzipWriter(pool, z)
 	return buf, nil
 }

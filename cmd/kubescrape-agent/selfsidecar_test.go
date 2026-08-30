@@ -113,9 +113,9 @@ func TestSelfResolveSurvivesASidecarThatAppendsForwardedFor(t *testing.T) {
 // metadata are not what this test is about; the identity is.
 type nullResolver struct{}
 
-func (nullResolver) Resolve(string, []metav1.OwnerReference) []kubemeta.Owner { return nil }
-func (nullResolver) Namespace(string) *kubemeta.ObjectMeta                    { return nil }
-func (nullResolver) Node(string) *kubemeta.ObjectMeta                         { return nil }
+func (nullResolver) Resolve(string, []metav1.OwnerReference) ([]kubemeta.Owner, int) { return nil, 0 }
+func (nullResolver) Namespace(string) *kubemeta.ObjectMeta                           { return nil }
+func (nullResolver) Node(string) *kubemeta.ObjectMeta                                { return nil }
 
 // appendForwardedFor is the sidecar: it adds the header a mesh proxy adds and
 // touches nothing else — in particular NOT the source address, which stays the

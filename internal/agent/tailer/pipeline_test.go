@@ -16,6 +16,7 @@ import (
 	"github.com/JohanLindvall/multiline"
 	"github.com/JohanLindvall/multiline/patterns"
 	"go.opentelemetry.io/collector/pdata/pcommon"
+	"go.opentelemetry.io/collector/pdata/plog"
 )
 
 func TestMultiline(t *testing.T) {
@@ -103,7 +104,7 @@ func TestClosedRunEmissionOffsets(t *testing.T) {
 	off := int64(0)
 	for _, l := range []string{l1, l2, l3} {
 		end := off + int64(len(l)) + 1
-		tl.feedLine(ctx, f, l, off, end)
+		tl.feedLine(ctx, f, l, off, end, time.Now())
 		off = end
 	}
 	endF := int64(len(l1) + len(l2) + 2)
@@ -581,7 +582,7 @@ func TestFlushedPRunKeepsFeedTimeSegment(t *testing.T) {
 		timeNowCRI() + " stdout P frag-b",
 	} {
 		end := off + int64(len(l)) + 1
-		tl.feedLine(ctx, f, l, off, end)
+		tl.feedLine(ctx, f, l, off, end, time.Now())
 		off = end
 	}
 	oldSeg := f.curSeg()
@@ -809,5 +810,66 @@ func TestTraceEmitSurvivesAnEntryClaimingMoreLinesThanTheFifoHolds(t *testing.T)
 	}
 	if n := len(st.live()); n != 0 {
 		t.Fatalf("%d items left in the FIFO: the over-count must consume what is there, no more", n)
+	}
+}
+
+// slowExporter blocks each export for a fixed delay and records when its FIRST
+// one returned: it stands in for a collector whose retries take seconds, which
+// is the one thing that can make the per-chunk clock reading consume hoists
+// genuinely stale.
+type slowExporter struct {
+	delay     time.Duration
+	firstDone time.Time
+	exports   int
+}
+
+func (s *slowExporter) ExportLogs(context.Context, plog.Logs) error {
+	time.Sleep(s.delay)
+	s.exports++
+	if s.firstDone.IsZero() {
+		s.firstDone = time.Now()
+	}
+	return nil
+}
+
+// consume reads the wall clock ONCE per chunk instead of once per line (the
+// clock read was 4-10% of BenchmarkIngestChunk's CPU PROFILE, mean ~6% over
+// four profiles, on the highest-frequency path in the product — see the
+// consume comment for why that is a profile share and not a benchstat delta).
+// That is only safe because a flush inside the loop — which
+// blocks for as long as the export's retries take — re-stamps it: without the
+// re-stamp, every line fed after a slow export carries a reading from BEFORE
+// it, sweep reads `now.Sub(f.lastFed) >= MultilineTimeout` as "this file is
+// idle" and ages groups out on the WALL clock, which is precisely what tears
+// buffered runs during a catch-up (see the age-out comment in sweep).
+//
+// The assertion is on the ORDER of two recorded instants, never on a duration,
+// so a loaded machine cannot make it flaky.
+func TestLastFedIsRestampedAfterAMidChunkFlush(t *testing.T) {
+	ctx := context.Background()
+	tl, f := benchTailer(t, Config{Multiline: true, BatchSize: 4})
+	exp := &slowExporter{delay: 10 * time.Millisecond}
+	tl.cfg.Exporter = exp
+
+	// One chunk holding many complete lines: BatchSize 4 makes the loop flush
+	// repeatedly while the chunk is still being consumed, so most lines are
+	// fed AFTER an export has already blocked.
+	lines := benchLines(64)
+	var chunk []byte
+	for _, l := range lines {
+		chunk = append(chunk, l...)
+		chunk = append(chunk, '\n')
+	}
+
+	tl.ingestChunk(ctx, f, chunk, false)
+
+	if exp.exports < 2 {
+		t.Fatalf("the chunk produced %d exports; the test needs a flush with lines still to feed", exp.exports)
+	}
+	if f.lastFed.Before(exp.firstDone) {
+		t.Fatalf("lastFed (%v) predates the first export's return (%v): the flush inside "+
+			"consume did not re-stamp the chunk clock, so every line after a slow export "+
+			"carries a reading from before it and sweep reads a busy file as idle",
+			f.lastFed, exp.firstDone)
 	}
 }

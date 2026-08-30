@@ -2,9 +2,12 @@ package tailbuffer
 
 import (
 	"context"
+	"encoding/binary"
+	"strconv"
 	"testing"
 	"time"
 
+	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/ptrace"
 
 	"github.com/JohanLindvall/kubescrape/internal/testrace"
@@ -239,5 +242,94 @@ func BenchmarkDecide(b *testing.B) {
 		}
 		clk.advance(2 * time.Minute)
 		buf.Sweep(ctx)
+	}
+}
+
+// --- at the occupancy a shard actually runs at ---
+//
+// Everything above measures a buffer holding one trace or twenty and a decision
+// cache holding one verdict, which is the shape of a test. A shard in steady
+// state holds `push rate x decisionWait` traces — thousands — and its decision
+// cache fills to decisionCacheSize (100000 by default). Both are maps keyed by
+// a 16-byte trace id, which Go cannot specialise the way it specialises a
+// string or a uint64 key, so their cost is a function of how full they are and
+// a one-entry measurement cannot see it.
+
+// fillBuffer parks `traces` assembling traces in the buffer (one span each) and
+// leaves the clock stopped so nothing decides under the measurement.
+func fillBuffer(b *testing.B, buf *Buffer, traces int) {
+	b.Helper()
+	ctx := context.Background()
+	const chunk = 200
+	for base := 0; base < traces; base += chunk {
+		specs := make([]spanSpec, 0, chunk)
+		for i := base; i < min(base+chunk, traces); i++ {
+			specs = append(specs, spanSpec{trace: uint64(i), span: uint64(i), end: 10})
+		}
+		if err := buf.ExportTraces(ctx, payload("checkout", specs...)); err != nil {
+			b.Fatal(err)
+		}
+	}
+	if got := buf.Stats().Traces; got != traces {
+		b.Fatalf("setup: %d traces buffered, want %d", got, traces)
+	}
+}
+
+// BenchmarkReceiveAtOccupancy: a push of 20 spans of new traces into a buffer
+// already holding a realistic in-flight population.
+func BenchmarkReceiveAtOccupancy(b *testing.B) {
+	for _, live := range []int{20, 20000} {
+		const batches, spans = 64, 20
+		payloads := make([]ptrace.Traces, batches)
+		for p := range payloads {
+			specs := make([]spanSpec, spans)
+			for i := range specs {
+				id := uint64(1<<32 + p*spans + i)
+				specs[i] = spanSpec{trace: id, span: id, end: 10, attrs: map[string]any{
+					"http.route": "/api/v1/orders", "http.status_code": 200,
+				}}
+			}
+			payloads[p] = payload("checkout", specs...)
+		}
+		buf := benchBuffer(b, 1<<20)
+		clk := newClock()
+		buf.now = clk.now
+		fillBuffer(b, buf, live)
+		ctx := context.Background()
+		b.Run(strconv.Itoa(live)+"-live", func(b *testing.B) {
+			b.ReportAllocs()
+			i := 0
+			for b.Loop() {
+				if err := buf.ExportTraces(ctx, payloads[i%batches]); err != nil {
+					b.Fatal(err)
+				}
+				i++
+			}
+			b.ReportMetric(float64(b.Elapsed().Nanoseconds())/float64(b.N)/spans, "ns/span")
+		})
+	}
+}
+
+// BenchmarkReceiveLateDropAtCacheSize: the path a heavily-sampling shard spends
+// most of its time on, measured against a decision cache at its configured
+// capacity rather than holding the single verdict the benchmark just made.
+func BenchmarkReceiveLateDropAtCacheSize(b *testing.B) {
+	for _, cached := range []int{1, 100000} {
+		buf, td, ctx := decidedDropBuffer(b)
+		// Fill the cache around the one verdict the probe will hit, so the
+		// lookup pays for a full map.
+		for i := range cached {
+			var id pcommon.TraceID
+			binary.BigEndian.PutUint64(id[8:], uint64(i)+1000)
+			buf.cache.put(id, false, 0, buf.now())
+		}
+		b.Run(strconv.Itoa(cached)+"-cached", func(b *testing.B) {
+			b.ReportAllocs()
+			for b.Loop() {
+				if err := buf.ExportTraces(ctx, td); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
 	}
 }

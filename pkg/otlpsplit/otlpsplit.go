@@ -7,6 +7,16 @@
 // Invariant: a non-empty input never yields zero parts — an over-cap
 // record-less resource is sent whole (rejected and counted at the collector,
 // never silently reported delivered).
+//
+// Second invariant, and the one an ATTACKER tests: the parts are never more
+// than minChunkRoomDiv times the input. Every chunk RE-COPIES the framing it
+// carries (the resource, the scope it is filling, the metric shell of a
+// data-point split), so a payload whose framing sits just under the cap would
+// otherwise split into one part per record, each carrying that framing again —
+// measured at 100,000 parts and 366 GiB of marshal+gzip+send from one 4.5 MiB
+// unauthenticated push. Past the threshold the split is ABANDONED and the
+// remainder ships as a single over-cap part, which is the answer this package
+// already gives a leaf it cannot shrink. See splitPaysOff.
 package otlpsplit
 
 import (
@@ -32,6 +42,49 @@ const DefaultMaxBytes = 4<<20 - 256<<10 // 3.75 MiB
 // never undercounts the real message size — the split stays on the safe side.
 const elemOverhead = 8
 
+// minChunkRoomDiv is the floor on a chunk's usable room: a chunk whose
+// re-copied framing leaves less than maxBytes/minChunkRoomDiv for CONTENT is
+// not worth emitting. The arithmetic is the whole argument — a framing of B
+// bytes against a cap of M carries at most M-B bytes of content per part while
+// costing M on the wire, so the amplification is M/(M-B) and is UNBOUNDED as B
+// approaches M. Holding M-B >= M/d bounds it at d: at most d bytes marshaled,
+// gzipped and sent per byte of input, whatever the input's shape.
+//
+// d = 4 rather than 2 because the guard must not fire on honest producers: a
+// resource built from Kubernetes metadata cannot approach 2.8 MiB of framing
+// (the API server caps an object's annotations at 256 KiB, and scraped HELP
+// text rides its own budget), while the attacker's shape — one sender-chosen
+// attribute a few bytes under the cap — is orders of magnitude past it.
+const minChunkRoomDiv = 4
+
+// splitPaysOff reports whether a chunk whose fixed re-copied framing is base
+// bytes leaves enough room to be worth filling. When it does not, the caller
+// abandons the split and lets the remainder ship as one over-cap part: the
+// collector rejects that part and the loss is counted, where splitting on
+// would have delivered nothing either (every part carries the same over-cap
+// framing) at thousands of times the CPU and wire cost.
+func splitPaysOff(base, maxBytes int) bool {
+	return maxBytes-base >= maxBytes/minChunkRoomDiv
+}
+
+// Report accounts for what a split could NOT do. Both counts are zero for the
+// ordinary case — a payload that fits, or one that splits cleanly. Either one
+// non-zero means parts went out that the collector is expected to reject
+// wholesale, so the caller must surface them; this package cannot count them
+// itself (pkg/ never imports internal/, obs included).
+type Report struct {
+	// Oversize is the number of parts emitted knowingly over maxBytes because
+	// a single leaf — one log record, span or data point, or a resource
+	// carrying no scopes at all — is itself over the cap and nothing here can
+	// shrink it.
+	Oversize int
+	// Abandoned is the number of resources (or over-large metrics) whose split
+	// was given up under splitPaysOff. Their remainder ships as ONE over-cap
+	// part; it is not also counted in Oversize, because the remedy differs —
+	// Oversize says one item is too big, Abandoned says the FRAMING is.
+	Abandoned int
+}
+
 var (
 	logMarshaler    plog.ProtoMarshaler
 	metricMarshaler pmetric.ProtoMarshaler
@@ -43,8 +96,17 @@ var (
 // emitted alone (nothing here can shrink it; it will be rejected and counted).
 // maxBytes <= 0, or a payload already within the cap, returns ld unchanged.
 func Logs(ld plog.Logs, maxBytes int) []plog.Logs {
+	parts, _ := LogsWithReport(ld, maxBytes)
+	return parts
+}
+
+// LogsWithReport is Logs plus the accounting of what the split could NOT do.
+// A caller that can count and warn — the exporter — takes this one, so the
+// parts the collector is expected to reject stop being invisible.
+func LogsWithReport(ld plog.Logs, maxBytes int) ([]plog.Logs, Report) {
+	var rep Report
 	if maxBytes <= 0 || logMarshaler.LogsSize(ld) <= maxBytes {
-		return []plog.Logs{ld}
+		return []plog.Logs{ld}, rep
 	}
 	var out []plog.Logs
 	cur := plog.NewLogs()
@@ -77,18 +139,20 @@ func Logs(ld plog.Logs, maxBytes int) []plog.Logs {
 			part := plog.NewLogs()
 			rl.CopyTo(part.ResourceLogs().AppendEmpty())
 			out = append(out, part)
+			rep.Oversize++
 			continue
 		}
-		splitBigResourceLogs(rl, maxBytes, &out)
+		splitBigResourceLogs(rl, maxBytes, &out, &rep)
 	}
 	flush()
 	// Backstop for the never-zero-parts invariant (a zero-part return would
 	// report the export "delivered" while sending nothing). Logically dead since
 	// the per-resource zero-scope emit above — kept as a cheap final guard.
 	if len(out) == 0 && ld.ResourceLogs().Len() > 0 {
-		return []plog.Logs{ld}
+		rep.Oversize++
+		return []plog.Logs{ld}, rep
 	}
-	return out
+	return out, rep
 }
 
 // splitBigResourceLogs packs one over-large ResourceLogs' records into whole-
@@ -104,7 +168,7 @@ func Logs(ld plog.Logs, maxBytes int) []plog.Logs {
 // auth build, gzip pass and round trip, and on the trace tier the entry
 // shard's forward is synchronous and holds an in-flight slot for the whole
 // sequence.
-func splitBigResourceLogs(rl plog.ResourceLogs, maxBytes int, out *[]plog.Logs) {
+func splitBigResourceLogs(rl plog.ResourceLogs, maxBytes int, out *[]plog.Logs, rep *Report) {
 	// The per-chunk fixed cost is the resource plus the CURRENT scope only,
 	// which is what a chunk actually holds. Measuring it from a copy carrying
 	// EVERY scope's framing charged each chunk (S-1) scopes it does not
@@ -119,12 +183,34 @@ func splitBigResourceLogs(rl plog.ResourceLogs, maxBytes int, out *[]plog.Logs) 
 		open     bool // a chunk is being filled
 		curBytes int
 		held     int // records in the current chunk, across its scopes
+		// giveUp latches when the framing every chunk re-copies leaves too
+		// little room (splitPaysOff): from there on the cap checks are skipped
+		// and everything remaining accumulates into ONE final over-cap part,
+		// which the collector rejects. That is the same delivery outcome as
+		// splitting on — every part would carry the same over-cap framing —
+		// for one round trip instead of hundreds of thousands.
+		giveUp bool
 	)
+	abandon := func() {
+		if !giveUp {
+			giveUp = true
+			rep.Abandoned++
+		}
+	}
 	emit := func() {
 		if open {
+			// A chunk over the cap that was NOT abandoned holds a single leaf
+			// nothing here can shrink; the abandoned remainder is accounted
+			// once, at the decision, so it is not counted twice.
+			if curBytes > maxBytes && !giveUp {
+				rep.Oversize++
+			}
 			*out = append(*out, ld)
 			open = false
 		}
+	}
+	if !splitPaysOff(resBase, maxBytes) {
+		abandon()
 	}
 	openChunk := func() {
 		ld = plog.NewLogs()
@@ -147,7 +233,14 @@ func splitBigResourceLogs(rl plog.ResourceLogs, maxBytes int, out *[]plog.Logs) 
 		// the under-cap path preserves, so it rides along in the current chunk
 		// rather than costing a part of its own.
 		scopeBytes := logMarshaler.ScopeLogsSize(emptyRecordsSL(sl)) + elemOverhead
-		if open && curBytes+scopeBytes > maxBytes {
+		// The scope identity is re-copied per chunk too, so it belongs in the
+		// framing the productivity check weighs: a resource with a modest
+		// attribute set and one scope whose NAME sits just under the cap
+		// degenerates exactly like an over-large resource does.
+		if !splitPaysOff(resBase+scopeBytes, maxBytes) {
+			abandon()
+		}
+		if open && !giveUp && curBytes+scopeBytes > maxBytes {
 			emit()
 		}
 		if !open {
@@ -165,7 +258,7 @@ func splitBigResourceLogs(rl plog.ResourceLogs, maxBytes int, out *[]plog.Logs) 
 			// unchecked and emit an over-cap part. Only a record over the cap
 			// in a chunk of its own — after the reopen leaves exactly
 			// resBase+scopeBytes — goes alone.
-			if (held > 0 || curBytes > resBase+scopeBytes) && curBytes+recBytes > maxBytes {
+			if !giveUp && (held > 0 || curBytes > resBase+scopeBytes) && curBytes+recBytes > maxBytes {
 				emit()
 				openChunk()
 				addScope(sl, scopeBytes)
@@ -202,8 +295,16 @@ func emptyRecordsSL(sl plog.ScopeLogs) plog.ScopeLogs {
 // single data point over the cap goes alone). Producers that pre-chunk never
 // reach the metric split.
 func Metrics(md pmetric.Metrics, maxBytes int) []pmetric.Metrics {
+	parts, _ := MetricsWithReport(md, maxBytes)
+	return parts
+}
+
+// MetricsWithReport is Metrics plus the accounting of what the split could NOT
+// do (see LogsWithReport).
+func MetricsWithReport(md pmetric.Metrics, maxBytes int) ([]pmetric.Metrics, Report) {
+	var rep Report
 	if maxBytes <= 0 || metricMarshaler.MetricsSize(md) <= maxBytes {
-		return []pmetric.Metrics{md}
+		return []pmetric.Metrics{md}, rep
 	}
 	var out []pmetric.Metrics
 	cur := pmetric.NewMetrics()
@@ -233,22 +334,24 @@ func Metrics(md pmetric.Metrics, maxBytes int) []pmetric.Metrics {
 			part := pmetric.NewMetrics()
 			rm.CopyTo(part.ResourceMetrics().AppendEmpty())
 			out = append(out, part)
+			rep.Oversize++
 			continue
 		}
-		splitBigResourceMetrics(rm, maxBytes, &out)
+		splitBigResourceMetrics(rm, maxBytes, &out, &rep)
 	}
 	flush()
 	// A non-empty input must never yield zero parts (see Logs).
 	if len(out) == 0 && md.ResourceMetrics().Len() > 0 {
-		return []pmetric.Metrics{md}
+		rep.Oversize++
+		return []pmetric.Metrics{md}, rep
 	}
-	return out
+	return out, rep
 }
 
 // splitBigResourceMetrics packs one over-large ResourceMetrics' metrics into
 // whole-Metrics chunks. Chunks carry across the scope loop and the per-chunk
 // base counts the CURRENT scope only — see splitBigResourceLogs for both.
-func splitBigResourceMetrics(rm pmetric.ResourceMetrics, maxBytes int, out *[]pmetric.Metrics) {
+func splitBigResourceMetrics(rm pmetric.ResourceMetrics, maxBytes int, out *[]pmetric.Metrics, rep *Report) {
 	resBase := metricMarshaler.ResourceMetricsSize(emptyScopesRM(rm)) + elemOverhead
 	var (
 		md       pmetric.Metrics
@@ -258,12 +361,25 @@ func splitBigResourceMetrics(rm pmetric.ResourceMetrics, maxBytes int, out *[]pm
 		curBytes int
 		held     int
 		scopes   int
+		giveUp   bool // see splitBigResourceLogs
 	)
+	abandon := func() {
+		if !giveUp {
+			giveUp = true
+			rep.Abandoned++
+		}
+	}
 	emit := func() {
 		if open {
+			if curBytes > maxBytes && !giveUp {
+				rep.Oversize++
+			}
 			*out = append(*out, md)
 			open = false
 		}
+	}
+	if !splitPaysOff(resBase, maxBytes) {
+		abandon()
 	}
 	openChunk := func() {
 		md = pmetric.NewMetrics()
@@ -285,7 +401,10 @@ func splitBigResourceMetrics(rm pmetric.ResourceMetrics, maxBytes int, out *[]pm
 		sm := sms.At(i)
 		scopeBytes := metricMarshaler.ScopeMetricsSize(emptyMetricsSM(sm)) + elemOverhead
 		base := resBase + scopeBytes // a chunk holding this scope alone
-		if open && curBytes+scopeBytes > maxBytes {
+		if !splitPaysOff(base, maxBytes) {
+			abandon()
+		}
+		if open && !giveUp && curBytes+scopeBytes > maxBytes {
 			emit()
 		}
 		if !open {
@@ -305,7 +424,7 @@ func splitBigResourceMetrics(rm pmetric.ResourceMetrics, maxBytes int, out *[]pm
 			// rejects wholesale — the exact loss this package exists to
 			// prevent — and a single family (a KSM-style split, a fat
 			// histogram) can be the whole payload.
-			if base+mBytes > maxBytes && dataPointCount(m) > 1 {
+			if !giveUp && base+mBytes > maxBytes && dataPointCount(m) > 1 {
 				// Emit what is carried, unless the chunk holds nothing but this
 				// scope's own identity — the data-point chunks below carry that
 				// same scope, so emitting it would be a part with no content.
@@ -314,7 +433,7 @@ func splitBigResourceMetrics(rm pmetric.ResourceMetrics, maxBytes int, out *[]pm
 				} else {
 					open = false
 				}
-				splitBigMetric(m, base, maxBytes, func() (pmetric.Metrics, pmetric.MetricSlice) {
+				splitBigMetric(m, base, maxBytes, rep, func() (pmetric.Metrics, pmetric.MetricSlice) {
 					nmd := pmetric.NewMetrics()
 					x := nmd.ResourceMetrics().AppendEmpty()
 					rm.Resource().CopyTo(x.Resource())
@@ -328,7 +447,7 @@ func splitBigResourceMetrics(rm pmetric.ResourceMetrics, maxBytes int, out *[]pm
 			}
 			// held > 0 alone missed a chunk carrying earlier record-less
 			// scopes' identity bytes — see the Logs splitter.
-			if (held > 0 || curBytes > base) && curBytes+mBytes > maxBytes {
+			if !giveUp && (held > 0 || curBytes > base) && curBytes+mBytes > maxBytes {
 				emit()
 				openChunk()
 				addScope(sm, scopeBytes)
@@ -351,11 +470,19 @@ func splitBigResourceMetrics(rm pmetric.ResourceMetrics, maxBytes int, out *[]pm
 //
 // base is the fixed per-chunk cost of the resource/scope framing; newChunk
 // yields an empty chunk carrying it.
-func splitBigMetric(m pmetric.Metric, base, maxBytes int, newChunk func() (pmetric.Metrics, pmetric.MetricSlice), out *[]pmetric.Metrics) {
+func splitBigMetric(m pmetric.Metric, base, maxBytes int, rep *Report, newChunk func() (pmetric.Metrics, pmetric.MetricSlice), out *[]pmetric.Metrics) {
 	shell := pmetric.NewMetric()
 	copyMetricShell(m, shell)
 	// Per-chunk fixed cost: resource + scope framing plus the point-less metric.
 	metricBase := base + metricMarshaler.MetricSize(shell) + elemOverhead
+	// The shell is re-copied per chunk like the resource and the scope, and its
+	// description is the SENDER's string on a pushed payload — so the same
+	// degeneration is reachable through a metric nobody's resource is large:
+	// see splitBigResourceLogs.
+	giveUp := !splitPaysOff(metricBase, maxBytes)
+	if giveUp {
+		rep.Abandoned++
+	}
 	newMetricChunk := func() (pmetric.Metrics, pmetric.Metric) {
 		md, ms := newChunk()
 		nm := ms.AppendEmpty()
@@ -367,7 +494,10 @@ func splitBigMetric(m pmetric.Metric, base, maxBytes int, newChunk func() (pmetr
 	curBytes, held := metricBase, 0
 	for i := 0; i < n; i++ {
 		dpBytes := sizeOf(i) + elemOverhead
-		if held > 0 && curBytes+dpBytes > maxBytes {
+		if !giveUp && held > 0 && curBytes+dpBytes > maxBytes {
+			if curBytes > maxBytes {
+				rep.Oversize++
+			}
 			*out = append(*out, md)
 			md, nm = newMetricChunk()
 			curBytes, held = metricBase, 0
@@ -377,6 +507,9 @@ func splitBigMetric(m pmetric.Metric, base, maxBytes int, newChunk func() (pmetr
 		held++
 	}
 	if held > 0 {
+		if curBytes > maxBytes && !giveUp {
+			rep.Oversize++
+		}
 		*out = append(*out, md)
 	}
 }
@@ -478,8 +611,16 @@ func emptyMetricsSM(sm pmetric.ScopeMetrics) pmetric.ScopeMetrics {
 // splitting an over-large resource by span (a single span over the cap goes
 // alone).
 func Traces(td ptrace.Traces, maxBytes int) []ptrace.Traces {
+	parts, _ := TracesWithReport(td, maxBytes)
+	return parts
+}
+
+// TracesWithReport is Traces plus the accounting of what the split could NOT
+// do (see LogsWithReport).
+func TracesWithReport(td ptrace.Traces, maxBytes int) ([]ptrace.Traces, Report) {
+	var rep Report
 	if maxBytes <= 0 || traceMarshaler.TracesSize(td) <= maxBytes {
-		return []ptrace.Traces{td}
+		return []ptrace.Traces{td}, rep
 	}
 	var out []ptrace.Traces
 	cur := ptrace.NewTraces()
@@ -509,22 +650,24 @@ func Traces(td ptrace.Traces, maxBytes int) []ptrace.Traces {
 			part := ptrace.NewTraces()
 			rs.CopyTo(part.ResourceSpans().AppendEmpty())
 			out = append(out, part)
+			rep.Oversize++
 			continue
 		}
-		splitBigResourceSpans(rs, maxBytes, &out)
+		splitBigResourceSpans(rs, maxBytes, &out, &rep)
 	}
 	flush()
 	// A non-empty input must never yield zero parts (see Logs).
 	if len(out) == 0 && td.ResourceSpans().Len() > 0 {
-		return []ptrace.Traces{td}
+		rep.Oversize++
+		return []ptrace.Traces{td}, rep
 	}
-	return out
+	return out, rep
 }
 
 // splitBigResourceSpans packs one over-large ResourceSpans' spans into
 // whole-Traces chunks. Chunks carry across the scope loop and the per-chunk
 // base counts the CURRENT scope only — see splitBigResourceLogs for both.
-func splitBigResourceSpans(rs ptrace.ResourceSpans, maxBytes int, out *[]ptrace.Traces) {
+func splitBigResourceSpans(rs ptrace.ResourceSpans, maxBytes int, out *[]ptrace.Traces, rep *Report) {
 	resBase := traceMarshaler.ResourceSpansSize(emptyScopesRS(rs)) + elemOverhead
 	var (
 		td       ptrace.Traces
@@ -533,12 +676,25 @@ func splitBigResourceSpans(rs ptrace.ResourceSpans, maxBytes int, out *[]ptrace.
 		open     bool
 		curBytes int
 		held     int
+		giveUp   bool // see splitBigResourceLogs
 	)
+	abandon := func() {
+		if !giveUp {
+			giveUp = true
+			rep.Abandoned++
+		}
+	}
 	emit := func() {
 		if open {
+			if curBytes > maxBytes && !giveUp {
+				rep.Oversize++
+			}
 			*out = append(*out, td)
 			open = false
 		}
+	}
+	if !splitPaysOff(resBase, maxBytes) {
+		abandon()
 	}
 	openChunk := func() {
 		td = ptrace.NewTraces()
@@ -558,7 +714,10 @@ func splitBigResourceSpans(rs ptrace.ResourceSpans, maxBytes int, out *[]ptrace.
 	for i := 0; i < sss.Len(); i++ {
 		ss := sss.At(i)
 		scopeBytes := traceMarshaler.ScopeSpansSize(emptySpansSS(ss)) + elemOverhead
-		if open && curBytes+scopeBytes > maxBytes {
+		if !splitPaysOff(resBase+scopeBytes, maxBytes) {
+			abandon()
+		}
+		if open && !giveUp && curBytes+scopeBytes > maxBytes {
 			emit()
 		}
 		if !open {
@@ -571,7 +730,7 @@ func splitBigResourceSpans(rs ptrace.ResourceSpans, maxBytes int, out *[]ptrace.
 			spBytes := traceMarshaler.SpanSize(sp) + elemOverhead
 			// held > 0 alone missed a chunk carrying earlier span-less
 			// scopes' identity bytes — see the Logs splitter.
-			if (held > 0 || curBytes > resBase+scopeBytes) && curBytes+spBytes > maxBytes {
+			if !giveUp && (held > 0 || curBytes > resBase+scopeBytes) && curBytes+spBytes > maxBytes {
 				emit()
 				openChunk()
 				addScope(ss, scopeBytes)

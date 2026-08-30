@@ -14,7 +14,7 @@ import (
 
 func TestRelabelKeepDrop(t *testing.T) {
 	var c relabelCache
-	f, err := c.session([]kubemeta.RelabelRule{
+	f, _, err := c.session([]kubemeta.RelabelRule{
 		{Action: "drop", SourceLabels: []string{"__name__"}, Regex: "go_.*"},
 		{Action: "keep", SourceLabels: []string{"job", "instance"}, Regex: "api;.*"},
 	})
@@ -32,16 +32,16 @@ func TestRelabelKeepDrop(t *testing.T) {
 		t.Fatal("keep rule ignored (join 'web;' must not match 'api;.*')")
 	}
 	// Anchoring: partial matches must not count.
-	f2, _ := c.session([]kubemeta.RelabelRule{{Action: "drop", SourceLabels: []string{"__name__"}, Regex: "go"}})
+	f2, _, _ := c.session([]kubemeta.RelabelRule{{Action: "drop", SourceLabels: []string{"__name__"}, Regex: "go"}})
 	if !f2.Keep("go_goroutines", nil) {
 		t.Fatal("unanchored partial match dropped a sample")
 	}
 	// Bad regex fails the session (never silently exports what was dropped).
-	if _, err := c.session([]kubemeta.RelabelRule{{Action: "drop", Regex: "("}}); err == nil {
+	if _, _, err := c.session([]kubemeta.RelabelRule{{Action: "drop", Regex: "("}}); err == nil {
 		t.Fatal("bad regex must error")
 	}
 	// nil for rule-less targets.
-	if f, _ := c.session(nil); f != nil {
+	if f, _, _ := c.session(nil); f != nil {
 		t.Fatal("no rules must yield nil session")
 	}
 }
@@ -52,7 +52,7 @@ func TestRelabelKeepDrop(t *testing.T) {
 func TestRelabelCacheBounded(t *testing.T) {
 	var c relabelCache
 	for i := 0; i < maxRelabelChains*3; i++ {
-		f, err := c.session([]kubemeta.RelabelRule{
+		f, _, err := c.session([]kubemeta.RelabelRule{
 			{Action: "drop", SourceLabels: []string{"__name__"}, Regex: fmt.Sprintf("metric_%d_.*", i)},
 		})
 		if err != nil {

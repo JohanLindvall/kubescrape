@@ -132,6 +132,31 @@
 // At the maxContainers cap the same measurement over 512 scopes charges 1.22%
 // of one core, the sweep 10.8 ms (21.1 us per container).
 //
+// WHICH of the sweep's three preads, because it says where the remaining cost
+// can and cannot be attacked. Timed separately over a real cgroup v2 hierarchy
+// (275 scopes, held descriptors, 50 rounds, three repeats; a loaded host, so
+// quote the SHARES rather than the absolutes):
+//
+//	memory.stat   inactive_file  10.3-13.9 us   47-65% of the sweep
+//	cpu.stat      usage_usec      4.4- 6.3 us
+//	memory.current                0.6- 1.0 us
+//
+// The same harness reads the whole sweep at 21.4-22.8 us per container, i.e.
+// 0.429-0.456% of one core at 200 containers — an independent confirmation of
+// the 0.43-0.51% above, arrived at without the export or the Welford math.
+//
+// memory.stat is the expensive one by an order of magnitude over
+// memory.current, and it is expensive in the KERNEL: reading it flushes the
+// per-CPU memory accounting (the rstat tree) before rendering ~40 lines, of
+// which this package wants one field. Nothing on the Go side moves that
+// number — BenchmarkSample over a tmpfs tree costs 2.5 us per container, so
+// ~89% of the real per-container cost is the kernel generating the files and
+// ~11% is everything this package does with them (which is already 0-alloc,
+// TestSampleAllocationBudget). The only lever that would move it is reading
+// memory.stat on a SLOWER cadence than memory.current, and that is refused:
+// working set is current MINUS inactive_file, so a stale inactive_file biases
+// exactly the peaks this pipeline exists to catch.
+//
 // SCOPE, because it decides what the numbers mean. This is the pipeline's own
 // cost: it includes the pdata build, the exact proto marshal otlpexport
 // measures with and the gzip it compresses with, and it EXCLUDES the socket

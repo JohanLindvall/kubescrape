@@ -187,6 +187,15 @@ func (r *Ring) OwnerForTenant(tenant string, traceID []byte) string {
 // the first token when key is past the last one. sort.Search is a branch-light
 // binary search over a slice that never changes after construction, so this is
 // lock-free and allocation-free on the per-span path.
+//
+// slices.BinarySearch was tried here and BACKED OUT. It looked like the obvious
+// win — this runs once per SPAN on the entry shard (twice, counting the
+// single-owner pre-pass), and sort.Search takes a closure, which reads like an
+// indirect call per probe over a ring of 1024 tokens per shard. It measures 8.7%
+// SLOWER (interleaved n=15, 140.9ns -> 153.1ns, p=0.001, ±2-4%): the compiler
+// devirtualizes the literal closure, and slices.BinarySearch's generic
+// three-way-compare loop does more work per probe than this predicate does.
+// Do not "modernize" it back without re-measuring.
 func (r *Ring) index(key uint32) int {
 	i := sort.Search(len(r.tokens), func(i int) bool { return r.tokens[i] >= key })
 	if i == len(r.tokens) {

@@ -16,24 +16,31 @@ GOFLAGS := -trimpath
 #   azure     the Azure diagnostics consumer (Event Hubs over Kafka). Eleven
 #             franz-go packages, in every DaemonSet image, for a feature that
 #             only ever runs in the one-replica singleton Deployment.
+#   events    the Kubernetes events reader and its leader election, which are
+#             the ONLY reason the agent links k8s.io/client-go — 926 -> 470
+#             dependency packages (k8s.io/ + sigs.k8s.io/ 412 -> 8) and MORE
+#             THAN HALF the shipped binary (59.16 MB -> 26.27 MB, -55.6%), on
+#             every node, for a pipeline that (like azure) only ever runs in
+#             the one-replica singleton Deployment.
 #
-#   make build                 # both, i.e. today's binaries
-#   make build TAGS=azure      # no journald: CGO_ENABLED=0, static agent
-#   make build TAGS=journald   # no franz-go
-#   make build TAGS=           # neither
+#   make build                 # all three, i.e. today's binaries
+#   make build TAGS=azure,events   # no journald: CGO_ENABLED=0, static agent
+#   make build TAGS=journald,events # no franz-go
+#   make build TAGS=journald,azure  # no client-go: the smallest DaemonSet agent
+#   make build TAGS=           # none of them
 #
 # NOTE: a bare `go build ./cmd/kubescrape-agent/` passes no tags and therefore
-# produces an agent with NEITHER pipeline. `make build` is the supported path.
-# Such a binary still DEFINES -journald and -azure-diagnostics (the manifests
-# pass them and internal/manifestcheck guards that), but enabling one is a
+# produces an agent with NONE of them. `make build` is the supported path.
+# Such a binary still DEFINES -journald, -azure-diagnostics and -events (the
+# manifests pass them and internal/manifestcheck guards that), but enabling one is a
 # startup error naming the tag — and -check-config reports it too, along with
 # an "optionalPipelines" field on the startup log line saying which binary you
 # have.
-TAGS     ?= journald,azure
+TAGS     ?= journald,azure,events
 TAGFLAGS := $(if $(strip $(TAGS)),-tags $(TAGS),)
 # What `make image-static` builds: everything except journald, which is what
 # makes both binaries static (see Dockerfile.static).
-TAGS_STATIC ?= azure
+TAGS_STATIC ?= azure,events
 # The agent needs cgo only for journald; without that tag it builds static.
 AGENT_CGO := $(if $(findstring journald,$(TAGS)),1,0)
 
@@ -111,11 +118,13 @@ $(GOLANGCI_LINT):
 # no libsystemd, and costs a few seconds. Do not "simplify" it away as redundant
 # with the -tags azure build above: they cover different files.
 verify-tags:
-	CGO_ENABLED=0 go build $(GOFLAGS) -tags azure -o /dev/null ./cmd/kubescrape-agent
-	@n=$$(go list -deps -tags journald ./cmd/kubescrape-agent | grep -c franz-go || true); \
+	CGO_ENABLED=0 go build $(GOFLAGS) -tags azure,events -o /dev/null ./cmd/kubescrape-agent
+	@n=$$(go list -deps -tags journald,events ./cmd/kubescrape-agent | grep -c franz-go || true); \
 		test "$$n" -eq 0 || { echo "franz-go still linked without the azure tag ($$n packages)"; exit 1; }
+	@n=$$(go list -deps -tags journald,azure ./cmd/kubescrape-agent | grep -cE '^(k8s\.io/client-go|k8s\.io/api/)' || true); \
+		test "$$n" -eq 0 || { echo "k8s.io/client-go still linked without the events tag ($$n packages) — half the agent binary is riding on one import"; exit 1; }
 	CGO_ENABLED=0 go build $(GOFLAGS) -o /dev/null ./cmd/kubescrape-agent
-	@echo "build tags verified: no cgo without journald, no franz-go without azure, every stub compiles"
+	@echo "build tags verified: no cgo without journald, no franz-go without azure, no client-go without events, every stub compiles"
 
 run: build
 	./bin/$(BINARY)
@@ -128,8 +137,8 @@ image:
 # The Azure consumer is kept (it is cgo-free); pass TAGS_STATIC= to drop it too.
 #
 # TAGS_STATIC, not TAGS: this target deliberately does not read TAGS, because
-# TAGS defaults to journald,azure and journald is the whole reason the static
-# image cannot exist. The comment used to say `TAGS=`, which silently did
+# TAGS defaults to journald,azure,events and journald is the whole reason the
+# static image cannot exist. The comment used to say `TAGS=`, which silently did
 # nothing and left franz-go in the image the operator was trying to slim.
 image-static:
 	docker build -f Dockerfile.static --build-arg TAGS=$(TAGS_STATIC) -t $(IMAGE):$(TAG)-static .

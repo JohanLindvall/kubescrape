@@ -1,7 +1,10 @@
 package logchain
 
 import (
+	"bytes"
 	"context"
+	"log/slog"
+	"strings"
 	"testing"
 	"time"
 
@@ -10,6 +13,7 @@ import (
 	"go.opentelemetry.io/collector/pdata/plog"
 	"go.opentelemetry.io/collector/pdata/pmetric"
 
+	"github.com/JohanLindvall/kubescrape/internal/logdedupe"
 	"github.com/JohanLindvall/kubescrape/internal/logline"
 	"github.com/JohanLindvall/kubescrape/internal/metrics"
 	"github.com/JohanLindvall/kubescrape/internal/obs"
@@ -314,4 +318,45 @@ type captureMetrics struct{ points int }
 func (c *captureMetrics) ExportMetrics(_ context.Context, md pmetric.Metrics) error {
 	c.points += md.DataPointCount()
 	return nil
+}
+
+// The perRecordRules argument is a PROMISE — "no record in this batch carries
+// its own rules" — kept by an ordering argument a package away (the tailer's
+// anyPodRules pass). Emit upgrades rather than panicking when it is broken,
+// which is right, and until now was also silent: the chain would keep working,
+// paying an allocation per flush, with nothing anywhere saying the pre-pass had
+// drifted from what the producer hands over. A branch nobody can observe
+// taking is a fix that regresses unnoticed.
+func TestBrokenPerRecordRulesPromiseIsReported(t *testing.T) {
+	var logged bytes.Buffer
+	old := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logged, nil)))
+	t.Cleanup(func() { slog.SetDefault(old) })
+	promiseWarn = logdedupe.Throttle{}
+
+	// perRecordRules=false, and no global rules — yet a record arrives with
+	// its own. That is exactly the drift.
+	c := NewChain[string](Config{}, false)
+	p := newTestProducer()
+	p.body = "a line"
+	podKeep := dropFilter(t, []logline.LineRule{{Action: "keep", Match: []string{"__line__=~.*"}}})
+	if !c.Emit(p, Input[string]{Body: p.body, Resource: emptyRes(), BoundKey: "k", PodRules: podKeep}) {
+		t.Fatal("the upgraded chain dropped a record its pod rules kept")
+	}
+	if p.records() != 1 {
+		t.Fatalf("payload carries %d records, want 1 — the upgrade must not lose the record", p.records())
+	}
+	if out := logged.String(); !strings.Contains(out, "no record would carry its own rules") {
+		t.Fatalf("the broken promise was not reported:\n%s", out)
+	}
+
+	// Throttled: "once per flush" is every ten seconds on every node.
+	before := strings.Count(logged.String(), "no record would carry its own rules")
+	for range 5 {
+		c2 := NewChain[string](Config{}, false)
+		c2.Emit(newTestProducer(), Input[string]{Body: "x", Resource: emptyRes(), BoundKey: "k", PodRules: podKeep})
+	}
+	if got := strings.Count(logged.String(), "no record would carry its own rules"); got != before {
+		t.Fatalf("the drift was reported %d times inside one window, want %d", got, before)
+	}
 }

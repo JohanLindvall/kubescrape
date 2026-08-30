@@ -130,6 +130,14 @@ spec:
     spec:
       # Room for the final service-graph and self-metrics exports.
       terminationGracePeriodSeconds: 60
+      # Kubernetes' own seccomp default is Unconfined, which is LOOSER than what
+      # a plain container run gets, and PodSecurity's `restricted` profile
+      # rejects a pod without RuntimeDefault outright — without this these pods
+      # fail ADMISSION on a restricted namespace, which on a first install reads
+      # as a broken manifest rather than a policy.
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: servicegraph
           image: ghcr.io/johanlindvall/kubescrape:latest
@@ -165,6 +173,30 @@ spec:
             - -metadata-endpoint=http://kubescrape.monitoring
             - -otlp-endpoint=otel-collector.monitoring:4317
             - -listen=:8081
+            # The port above also serves /debug/otlp and /debug/otlp/ui, which
+            # on a shard stream the TRACES this tier exports — the whole
+            # cluster's, since every instrumented application pushes here. With
+            # no token file those two answer only a LOCAL connection (`kubectl
+            # port-forward`, or a container in this pod) and refuse everything
+            # else, counting kubescrape_debug_refused_total{reason}. Keep that
+            # default; uncomment the flag, the mount and the volume below
+            # TOGETHER to read them remotely with a bearer token instead
+            # (re-read about once a minute, previous value accepted for a grace
+            # window, so rotation needs no restart):
+            #   kubectl -n monitoring create secret generic kubescrape-debug \
+            #     --from-literal=token="$(openssl rand -hex 24)"
+            #- -debug-token-file=/etc/kubescrape/debug/token
+            #
+            # THERE IS NO NetworkPolicy IN THESE RAW MANIFESTS, and this
+            # workload is the one where that matters most: :4317/:4318 are
+            # UNAUTHENTICATED trace receivers any pod in the cluster may push
+            # arbitrary spans into, and :4319 is the internal shard hop, whose
+            # only legitimate clients are the sibling shards (it is guarded by
+            # the bearer token above, not by the network). The Helm chart ships
+            # a four-rule ingress policy covering exactly that split
+            # (networkPolicy.enabled, serviceGraph.ingest.allowFrom,
+            # agent.debug.allowFrom); if you apply these files directly, write
+            # the equivalent yourself and scope the trace ports first.
           env:
             # The agent binary wants a node name for its own self-metrics
             # identity; an edge never carries it (an edge is a property of the
@@ -193,6 +225,12 @@ spec:
             - name: service-graph-token
               mountPath: /etc/kubescrape/service-graph
               readOnly: true
+            # Uncomment with -debug-token-file above and the volume below; the
+            # mount path must match the flag exactly, or the gate falls back to
+            # local-only without saying so.
+            #- name: debug-token
+            #  mountPath: /etc/kubescrape/debug
+            #  readOnly: true
           ports:
             - name: http
               containerPort: 8081
@@ -219,3 +257,7 @@ spec:
         - name: service-graph-token
           secret:
             secretName: kubescrape-service-graph
+        # Uncomment with -debug-token-file and its mount above.
+        #- name: debug-token
+        #  secret:
+        #    secretName: kubescrape-debug

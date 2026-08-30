@@ -53,9 +53,16 @@ func TestStartNodeInfoResolvesAndClearsTheGate(t *testing.T) {
 		t.Fatalf("provider = %+v before the first fetch; want the bare node name", n)
 	}
 
+	// Wait for BOTH, because they do not land together: selfmeta.Poll publishes
+	// the value inside fetch() and calls OnFirst — which is what releases the
+	// gate — only after fetch returns. Breaking on the value alone and then
+	// asserting the gate is a race the test loses whenever the scheduler puts
+	// those two statements either side of a preemption, which under `go test
+	// -race ./...` on a loaded machine it does.
 	deadline := time.Now().Add(30 * time.Second)
 	for time.Now().Before(deadline) {
-		if n := info(); n != nil && n.Labels["topology.kubernetes.io/zone"] == "eu-1a" {
+		n := info()
+		if n != nil && n.Labels["topology.kubernetes.io/zone"] == "eu-1a" && len(ready.pending()) == 0 {
 			break
 		}
 		time.Sleep(time.Millisecond)

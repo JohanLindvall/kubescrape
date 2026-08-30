@@ -78,9 +78,21 @@ func (t *Tailer) resolveMetadata(ctx context.Context, f *file) bool {
 		f.metaBackoff = nextMetaBackoff(f.metaBackoff)
 		f.nextMetaTry = time.Now().Add(jitterMetaBackoff(f.metaBackoff))
 		if metaclient.IsNotFound(err) {
-			t.log.Debug("container metadata not found yet", "id", f.containerID)
-		} else {
-			t.log.Warn("fetching container metadata", "id", f.containerID, "error", err)
+			t.log.Debug("container metadata not found yet", "path", f.path, "id", f.containerID)
+		} else if t.metaWarn.Allow(metaWarnEvery) {
+			// THROTTLED, and keyless on purpose. This fails per FILE, on each
+			// file's own backoff, so an unreachable metadata service made every
+			// tracked file on the node warn about the same thing once a minute
+			// — a flood proportional to fleet size for one cluster-wide
+			// condition. The condition is the service; one example file plus
+			// how many are waiting is what an operator acts on, and the rate
+			// lives on kubescrape_metadata_requests_total, which metaclient
+			// moves per attempt. The waiting count is computed INSIDE the
+			// allowed branch: slog evaluates its arguments eagerly, and this
+			// walks every tracked file.
+			t.log.Warn("fetching container metadata failed; these files are tracked but nothing is read from them until it resolves",
+				"path", f.path, "id", f.containerID, "error", err,
+				"files", t.unresolvedFiles(), "backoff", f.metaBackoff)
 		}
 		return false
 	}
@@ -104,6 +116,20 @@ func (t *Tailer) resolveMetadata(ctx context.Context, f *file) bool {
 	}
 	t.applyPodConfig(f, md.Pod.Annotations)
 	return true
+}
+
+// unresolvedFiles counts tracked files that have not been attributed yet — the
+// scale of an attribution outage, which one file's error cannot convey. Walked
+// only from a throttled log branch and from publishStatus, never per file and
+// never per line.
+func (t *Tailer) unresolvedFiles() int {
+	n := 0
+	for _, f := range t.files {
+		if !f.resolved && !f.excluded {
+			n++
+		}
+	}
+	return n
 }
 
 // resolvePlain builds a non-containerd file's resource: node attributes from
@@ -425,8 +451,25 @@ func (t *Tailer) readFile(ctx context.Context, f *file) error {
 // `return true`, and the caller's abort branch was unreachable code described
 // by a comment that contradicted it. Returning nothing is the honest signature.
 func (t *Tailer) handleRotation(ctx context.Context, f *file, st os.FileInfo, read int) {
+	// Which ARM was taken, and on what evidence: kubescrape_log_rotations_total
+	// counts all three together, so during an incident ("did logrotate
+	// copytruncate under us and eat a window, or was this a clean rename?")
+	// the counter cannot answer the question that decides whether data was
+	// lost — a rename preserves the old inode's remainder as a segment, an
+	// in-place truncation destroys it unmeasurably.
+	//
+	// The report is emitted from INSIDE the classifying switch rather than from
+	// a reporting switch of its own, and that is load-bearing rather than tidy:
+	// the third case's guard preads -logs-fingerprint-bytes off the head and
+	// FNV-hashes them, so a second switch re-deriving the same predicate paid
+	// that read twice per sweep per file — and slog evaluates its arguments
+	// eagerly, so wrapping the report in an Enabled guard would have removed
+	// the second read only for as long as nobody runs at Debug. Every argument
+	// below is a field read, so the lines themselves cost nothing at Info.
 	switch {
 	case inodeOf(st) != f.inode:
+		t.log.Debug("log file rotated", "path", f.path, "reason", "rename",
+			"inode", f.inode, "newInode", inodeOf(st), "committed", f.committed, "readPos", f.readPos)
 		// Rename rotation: the path names a new file. Drain what the old
 		// writer appended after our last read, then switch — carrying a
 		// straddling multi-line group across the boundary. An aborted drain
@@ -455,10 +498,14 @@ func (t *Tailer) handleRotation(ctx context.Context, f *file, st os.FileInfo, re
 			t.log.Debug("opening rotated-in file", "path", f.path, "error", err)
 		}
 	case st.Size() < f.readPos:
+		t.log.Debug("log file rotated", "path", f.path, "reason", "truncated",
+			"inode", f.inode, "bytes", st.Size(), "readPos", f.readPos)
 		// In-place truncation: the unread tail is gone; restart at zero.
 		// (Draining would read the replacement content mid-stream.)
 		t.reopen(ctx, f, false, true)
 	case read == 0 && !st.ModTime().Equal(f.lastMod) && !f.fp.matches(f.f):
+		t.log.Debug("log file rotated", "path", f.path, "reason", "copytruncate",
+			"inode", f.inode, "bytes", st.Size(), "readPos", f.readPos)
 		// The file changed without yielding new bytes past our offset and
 		// its head no longer matches: truncated and rewritten to a size at
 		// or beyond our position (same-size copytruncate). Restart.
@@ -545,6 +592,14 @@ func (t *Tailer) ensureOpen(f *file) error {
 		// with every loss counter flat. Not for archives: their offsets are
 		// in decompressed space and archiveReplaced owns that decision.
 		if !f.compressed {
+			// The one rotation shape no counter distinguishes: it happened
+			// while this process held NO fd, so nothing observed it and the
+			// only evidence is the identity mismatch found here. Whether its
+			// remainder is recovered is decided later by feedSegments (and
+			// counted obs.LogPrefixLost if it is not), so this line is what
+			// says the recovery was even attempted, and from where.
+			t.log.Debug("log file was replaced while no descriptor was held; recording its unread remainder for replay",
+				"path", f.path, "inode", oldInode, "newInode", inode, "committed", oldCommitted)
 			f.segments = append(f.segments, &segment{
 				id: f.tail, inode: oldInode, fp: oldFp, committed: oldCommitted, to: -1, fed: false,
 			})

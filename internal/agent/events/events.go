@@ -44,6 +44,7 @@ import (
 	"github.com/JohanLindvall/kubescrape/internal/agent/logchain"
 	"github.com/JohanLindvall/kubescrape/internal/agent/logscrub"
 	"github.com/JohanLindvall/kubescrape/internal/leader"
+	"github.com/JohanLindvall/kubescrape/internal/logdedupe"
 	"github.com/JohanLindvall/kubescrape/internal/logline"
 	"github.com/JohanLindvall/kubescrape/internal/metrics"
 	"github.com/JohanLindvall/kubescrape/internal/obs"
@@ -249,9 +250,27 @@ type Reader struct {
 	// flushes exported, folded into the committed watermark by secureReplay.
 	// It survives stream restarts: it only ever names exported entries.
 	heldWatermark time.Time
-	// overflowWarned rate-limits the shedOldest warning to one per process;
-	// obs.EventsOverflowDropped carries the ongoing magnitude.
+	// overflowWarned rate-limits the shedOldest warning to one per OUTAGE:
+	// obs.EventsOverflowDropped carries the ongoing magnitude, and re-arming it
+	// on the flush that recovers is what makes a SECOND outage say so. Latched
+	// for the process' life it reported only the first one, which on a
+	// long-lived singleton is usually not the one being investigated.
 	overflowWarned bool
+	// unresolvedWarn throttles the "events are being exported without their
+	// pod's identity" warning. The CONDITION persists for as long as the
+	// metadata service is unreachable and is noticed once per distinct involved
+	// object per batch, so it is exactly the flood logdedupe exists for;
+	// obs.EventsUnresolved carries the rate.
+	unresolvedWarn logdedupe.Throttle
+	// oddObjectWarn throttles the "the watch delivered something that is not an
+	// Event" warning — a should-not-happen branch that, if it ever fires, fires
+	// for every delivery.
+	oddObjectWarn logdedupe.Throttle
+	// persistFailedAt/persistWarned are the transition-warn state for position
+	// writes, following cmd/kubescrape/apiserver.go: a Warn on the first
+	// failure, a throttled re-warn while it persists, an Info on recovery.
+	persistFailedAt time.Time
+	persistWarned   time.Time
 	// resCache memoizes the involved object's resource for the life of the
 	// batch, keyed by the same identity the records group on. See resource().
 	resCache map[string]pcommon.Resource
@@ -370,6 +389,9 @@ func publishMetrics() {
 	obs.EventGapDiscarded.WithLabelValues(stageWatch).Add(0)
 	for _, op := range []string{opLoad, opSave} {
 		obs.EventPositionErrors.WithLabelValues(op).Add(0)
+	}
+	for _, reason := range unresolvedReasons {
+		obs.EventsUnresolved.WithLabelValues(reason).Add(0)
 	}
 }
 
@@ -702,6 +724,10 @@ func (r *Reader) startResourceVersion(ctx context.Context) (startPoint, error) {
 // client-go's reflector default.
 const replayPageSize = 500
 
+// replayProgressEvery is how often the backlog walk reports progress while it
+// holds the reader goroutine (see replayBacklog).
+const replayProgressEvery = 10 * time.Second
+
 // replayBacklog re-reads the events the watch cannot position us into and
 // returns the revision the watch that follows must start at.
 //
@@ -744,6 +770,8 @@ func (r *Reader) replayBacklog(ctx context.Context) (string, error) {
 	// state and the watch that resumes from it cannot start behind one.
 	opts := metav1.ListOptions{Limit: replayPageSize}
 	pages, listed, kept := 0, 0, 0
+	walkStarted := time.Now()
+	walkLogged := walkStarted
 	for {
 		if err := ctx.Err(); err != nil {
 			return "", err
@@ -773,6 +801,18 @@ func (r *Reader) replayBacklog(ctx context.Context) (string, error) {
 		}
 		listed += len(list.Items)
 		pages++
+		// The walk BLOCKS the single reader goroutine — no watch is open, no
+		// ticker is serviced — and an --event-ttl window on a busy cluster is
+		// six figures, i.e. hundreds of pages. Without a progress line the only
+		// thing an operator sees is a pipeline that exports nothing and says
+		// nothing, which is indistinguishable from a wedge. Cadence-based
+		// rather than page-based: what matters is how long the silence is, not
+		// how many pages fit inside it.
+		if time.Since(walkLogged) >= replayProgressEvery {
+			walkLogged = time.Now()
+			r.log.Info("replaying the event backlog", "pages", pages,
+				"listed", listed, "kept", kept, "elapsed", time.Since(walkStarted).Round(time.Second))
+		}
 		if list.Continue == "" {
 			break
 		}
@@ -814,7 +854,8 @@ func (r *Reader) replayBacklog(ctx context.Context) (string, error) {
 		r.tryFlush(ctx)
 	}
 	r.log.Info("replayed the event backlog", "resourceVersion", rv,
-		"pages", pages, "listed", listed, "kept", kept, "awaitingExport", r.replayOwed)
+		"pages", pages, "listed", listed, "kept", kept, "awaitingExport", r.replayOwed,
+		"elapsed", time.Since(walkStarted).Round(time.Millisecond))
 	// A backlog that was empty, entirely filtered, or already flushed secures
 	// right here — otherwise the flush that drains the last owed entry does it.
 	r.maybeSecureReplay()
@@ -887,6 +928,13 @@ func (r *Reader) expire(stage string) {
 	// that did not happen").
 	if r.relist || r.cfg.StartMode == StartBeginning {
 		obs.EventRelists.WithLabelValues(stage).Inc()
+		// A relist is not loss, but it IS the explanation for the duplicate
+		// burst that follows (the backlog is replayed and filtered by a
+		// watermark with a minute of slack) and for the pause while the walk
+		// runs. Info rather than Warn: it is the recovery working, and the
+		// counter is what an alert reads.
+		r.log.Info("the stored resourceVersion aged out of the api server's watch window; replaying the event backlog and filtering it by the exported watermark",
+			"stage", stage, "watermark", r.committed.Watermark)
 		return
 	}
 	// The discard arm is the pipeline's one silent-loss path: it must move a
@@ -931,6 +979,15 @@ func (r *Reader) handle(ctx context.Context, ev watch.Event) error {
 	}
 	e, ok := ev.Object.(*corev1.Event)
 	if !ok {
+		// Should not happen: this is an Events watch. If it ever does, it does
+		// so for every delivery — the stream is decoding into something else —
+		// and the pipeline goes silently to zero exported events with the watch
+		// still healthy and no counter moving. Throttled, because a flood is
+		// exactly the shape it would take.
+		if r.oddObjectWarn.Allow(oddObjectWarnEvery) {
+			r.log.Warn("the event watch delivered an object that is not a core/v1 Event; it is ignored, so nothing from this stream is being exported",
+				"type", fmt.Sprintf("%T", ev.Object), "eventType", string(ev.Type))
+		}
 		return nil
 	}
 	// seenRV records where the STREAM is. Nothing filters here: every event a
@@ -948,6 +1005,9 @@ func (r *Reader) handle(ctx context.Context, ev watch.Event) error {
 
 // flushWarnEvery rate-limits the export-failure warning during an outage.
 const flushWarnEvery = time.Minute
+
+// oddObjectWarnEvery rate-limits the not-an-Event warning (see handle).
+const oddObjectWarnEvery = 5 * time.Minute
 
 // flushDue reports whether the count trigger may attempt an export again. It
 // is unrestricted while flushes are landing; after a failure the batch stays
@@ -1005,6 +1065,11 @@ func (r *Reader) tryFlush(ctx context.Context) {
 	if !r.flushFailedAt.IsZero() {
 		r.log.Info("event export recovered", "buffered", len(r.batch))
 		r.flushFailedAt, r.flushWarned = time.Time{}, time.Time{}
+		// Re-arm the overflow warning with the recovery, not with the process:
+		// the next outage that sheds events is a new loss, and a latch held for
+		// the process' life reported only the first one — on a singleton that
+		// runs for weeks, usually not the one being investigated.
+		r.overflowWarned = false
 	}
 }
 
@@ -1311,8 +1376,8 @@ func (r *Reader) shedOldest() {
 	obs.EventsOverflowDropped.Add(float64(n))
 	if !r.overflowWarned {
 		r.overflowWarned = true
-		r.log.Warn("event batch at capacity with nothing committing; dropping the oldest unexported events",
-			"cap", r.retainCap(), "perShed", shedChunk)
+		r.log.Warn("event batch at capacity with nothing committing; dropping the oldest unexported events, which the watch will not re-deliver",
+			"cap", r.retainCap(), "dropped", n, "perShed", shedChunk)
 	}
 }
 
@@ -1391,8 +1456,43 @@ func (r *Reader) persist(ctx context.Context, force bool) {
 	pos.Holder = hostname()
 	if err := r.cfg.Positions.Save(ctx, pos); err != nil {
 		obs.EventPositionErrors.WithLabelValues(opSave).Inc()
-		r.log.Warn("writing the event position", "error", err)
+		// The transition-warn shape (cmd/kubescrape/apiserver.go): the write
+		// retries every PersistInterval, so an unwritable ConfigMap — a lost
+		// RBAC rule, an API server that is down — would otherwise be one line
+		// every ten seconds for the length of the outage. The FIRST failure is
+		// what an operator needs; the rest is the counter's job.
+		if r.persistFailedAt.IsZero() || time.Since(r.persistWarned) >= positionWarnEvery {
+			r.persistWarned = time.Now()
+			r.log.Warn("writing the event position failed; a restart or leader handover will resume from the last position that was written, replaying what has happened since",
+				"error", err, "eventsPositionConfigmap", r.positionRef(), "resourceVersion", pos.ResourceVersion)
+		}
+		if r.persistFailedAt.IsZero() {
+			r.persistFailedAt = time.Now()
+		}
+		return
 	}
+	if !r.persistFailedAt.IsZero() {
+		r.log.Info("writing the event position recovered", "resourceVersion", pos.ResourceVersion)
+		r.persistFailedAt, r.persistWarned = time.Time{}, time.Time{}
+	}
+	// The position is the one piece of this pipeline's state that outlives the
+	// process, and "is it advancing?" is the first question a handover raises.
+	// Debug, not Info: it writes every PersistInterval forever.
+	r.log.Debug("event position written", "resourceVersion", pos.ResourceVersion,
+		"watermark", pos.Watermark, "forced", force)
+}
+
+// positionWarnEvery re-warns about an unwritable position at this cadence.
+const positionWarnEvery = 5 * time.Minute
+
+// positionRef names the ConfigMap the position lives in, for a log line that
+// has to be actionable without the operator knowing the flag defaults. It is a
+// best-effort read of the store's own fields: a test store is not one.
+func (r *Reader) positionRef() string {
+	if s, ok := r.cfg.Positions.(*ConfigMapStore); ok {
+		return s.Namespace + "/" + s.Name
+	}
+	return ""
 }
 
 func isExpired(err error) bool {

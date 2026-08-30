@@ -1,7 +1,9 @@
 package attrs
 
 import (
+	"context"
 	"fmt"
+	"log/slog"
 	"regexp"
 	"strings"
 
@@ -64,6 +66,15 @@ func compileList(patterns []string) (*regexp.Regexp, error) {
 }
 
 // Keep reports whether an attribute key survives the filter.
+//
+// A REFUSED key is reported once, at Debug, on the memo MISS — the one place
+// the decision is actually taken, so the line costs nothing on the hot path
+// and cannot repeat per resource. It is the only explanation an operator gets
+// for an attribute that a correct config produced and this filter removed:
+// enable/disable are anchored whole-key regexes, and the commonest mistake
+// (`k8s.pod` for `k8s\.pod\..*`) matches nothing and silently strips
+// everything the enable list was supposed to keep. Debug rather than Warn
+// because dropping keys is exactly what a configured filter is for.
 func (f *Filter) Keep(key string) bool {
 	if f == nil {
 		return true
@@ -73,7 +84,21 @@ func (f *Filter) Keep(key string) bool {
 	}
 	keep := f.match(key)
 	f.keep.store(key, keep)
+	if !keep && slog.Default().Enabled(context.Background(), slog.LevelDebug) {
+		slog.Debug("resourceAttributes enable/disable removed an attribute key",
+			"key", key, "reason", f.refusal(key))
+	}
 	return keep
+}
+
+// refusal says WHICH half of the filter refused the key — the two are
+// different mistakes (an enable list too narrow, a disable list too wide) and
+// a line that does not distinguish them sends the operator to the wrong one.
+func (f *Filter) refusal(key string) string {
+	if f.enable != nil && !f.enable.MatchString(key) {
+		return "no enable pattern matched"
+	}
+	return "a disable pattern matched"
 }
 
 // match is Keep's decision without the memo: kept when it matches the enable

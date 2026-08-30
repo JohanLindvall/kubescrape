@@ -71,6 +71,38 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/JohanLindvall/kubescrape/internal/logdedupe"
+	"github.com/JohanLindvall/kubescrape/internal/obs"
+)
+
+// reWarnInterval is how often a PERSISTING read failure re-warns. The first
+// failure of a RUN always warns immediately, the repeats drop to Debug, and
+// this is the cadence at which the condition is restated so a broken mount is
+// not a single line lost in an hour of scrollback. Every failed read is
+// counted regardless (kubescrape_bearer_token_read_errors_total), so the RATE
+// never depends on the throttle.
+//
+// "Of a run" is the failing -> recovered -> failing TRANSITION, and it needs a
+// bit of state beyond the throttle: logdedupe.Throttle's zero value fires once
+// per PROCESS, so a second outage starting within reWarnInterval of the first
+// one's last line would have opened at Debug — with the recovery Info line
+// above it, that reads as a mount that got better and stayed better. The
+// `failing` flag each half already keeps for the recovery line is what says
+// whether a failure is the first of its run; the throttle then bounds the
+// repeats, and a first-of-run line still CLAIMS the throttle slot when the
+// interval has elapsed, so the two never emit back to back.
+const reWarnInterval = 5 * time.Minute
+
+// Roles reported on kubescrape_bearer_token_read_errors_total. The two halves
+// fail differently and an operator has to tell them apart: a client keeps
+// presenting its last good token (or none at all, and every request it feeds
+// goes out unauthenticated), while a receiver keeps ACCEPTING its last good
+// set — so a rotation the receiver cannot read is a fleet-wide 401 the moment
+// the clients catch up.
+const (
+	roleClient   = "client"
+	roleReceiver = "receiver"
 )
 
 const (
@@ -201,6 +233,14 @@ type File struct {
 	token   string
 	fetched time.Time
 	loaded  bool
+	// failing is true while the LAST re-read failed. It exists so the recovery
+	// can be reported: a warn with no matching "it works again" leaves an
+	// operator unable to tell a fixed mount from one nobody is looking at any
+	// more (the transition shape cmd/kubescrape/apiserver.go established).
+	failing bool
+	// warn throttles the re-warn of a persisting failure; the first failure of
+	// each run fires immediately.
+	warn logdedupe.Throttle
 }
 
 // NewFile returns a token file reader. It does NOT read: a client's failure to
@@ -224,8 +264,23 @@ func (f *File) Read() (string, error) {
 		return "", err
 	}
 	f.mu.Lock()
-	f.token, f.fetched, f.loaded = tok, f.set.now(), true
+	// A CHANGED value is one Info line, because it is the event every 401 burst
+	// has to be correlated against: the two ends of a rotation re-read on their
+	// own cadences, so "which side moved first, and when" is the whole question
+	// and neither side could previously answer it. The token itself is never
+	// logged — its LENGTH is, which is enough to tell a real credential from a
+	// truncated projection and discloses nothing a timing-safe compare does not
+	// already leak (see Authorized).
+	changed := f.loaded && tok != f.token
+	recovered := f.failing
+	f.token, f.fetched, f.loaded, f.failing = tok, f.set.now(), true, false
 	f.mu.Unlock()
+	if changed {
+		f.log.Info("bearer token file changed; presenting the new token", "path", f.path, "bytes", len(tok))
+	}
+	if recovered {
+		f.log.Info("re-reading the bearer token file succeeded again", "path", f.path)
+	}
 	return tok, nil
 }
 
@@ -246,10 +301,18 @@ func (f *File) Token() (string, error) {
 	}
 	next, err := f.Read()
 	if err != nil {
+		obs.BearerTokenReadErrors.WithLabelValues(roleClient).Inc()
 		if !loaded {
+			// Nothing to present: every request this token feeds goes out
+			// unauthenticated and is rejected by whatever it talks to. That was
+			// silent here — the error goes back to the caller, and the callers
+			// that can only produce a string (Get) drop it — so on a bad path
+			// or an unmounted Secret the symptom was a 401 storm with no line
+			// naming the file that caused it.
+			f.noteFailure("no bearer token has ever been read; requests are going out unauthenticated", err)
 			return "", err
 		}
-		f.log.Warn("re-reading token file; keeping the last good token", "path", f.path, "error", err)
+		f.noteFailure("re-reading the bearer token file failed; keeping the last good token", err)
 		// Do not retry on every call while the file is broken: the last good
 		// token is being served, and hammering the filesystem per request is
 		// what the interval exists to prevent.
@@ -259,6 +322,24 @@ func (f *File) Token() (string, error) {
 		return tok, nil
 	}
 	return next, nil
+}
+
+// noteFailure reports a failed read once per run of failures and then at
+// reWarnInterval, dropping the repeats to Debug. The counter moves on every
+// failure (in the caller), so the throttle bounds the LOG and never the rate.
+func (f *File) noteFailure(msg string, err error) {
+	f.mu.Lock()
+	first := !f.failing
+	f.failing = true
+	f.mu.Unlock()
+	// Allow is called FIRST, never short-circuited past by `first`: it claims
+	// the throttle slot, so a run opening on a warn is followed by Debug for
+	// the whole interval rather than by an immediate second warn.
+	if f.warn.Allow(reWarnInterval) || first {
+		f.log.Warn(msg, "path", f.path, "error", err)
+		return
+	}
+	f.log.Debug(msg, "path", f.path, "error", err)
 }
 
 // Get is Token with the error dropped, for callers that must produce a string
@@ -299,6 +380,11 @@ type Rotating struct {
 	// thread and survived indefinitely; the flag keeps that bound while still
 	// letting every other caller answer from the last-good set.
 	reading bool
+	// failing is true while the last read failed, so the recovery is one Info
+	// line rather than a warn that simply stops.
+	failing bool
+	// warn throttles the re-warn of a persisting read failure.
+	warn logdedupe.Throttle
 }
 
 // NewRotating reads the token file once, FATALLY: "no path", "unreadable" and
@@ -364,8 +450,16 @@ func (r *Rotating) Run(ctx context.Context) {
 // Run drives this from a ticker so a quiet listener still notices a rotation
 // within one interval; request traffic refreshes it far sooner.
 func (r *Rotating) Tokens() []string {
+	// What the re-read below DECIDED, to be reported once the lock is gone.
+	var (
+		readErr   error
+		firstFail bool
+		recovered bool
+		rotated   bool
+		newBytes  int
+	)
+	path := r.path // immutable after construction
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	now := r.set.now()
 	if !now.Before(r.nextRead) && !r.reading {
 		// Do the file I/O with the lock DROPPED. This is every authenticated
@@ -379,7 +473,6 @@ func (r *Rotating) Tokens() []string {
 		// the field). Publish the result after.
 		r.reading = true
 		r.nextRead = now.Add(r.set.refresh)
-		path := r.path
 		r.mu.Unlock()
 		next, err := ReadFile(path)
 		r.mu.Lock()
@@ -387,18 +480,65 @@ func (r *Rotating) Tokens() []string {
 		now = r.set.now()
 		if err != nil {
 			r.nextRead = now.Add(r.set.interval)
-			r.log.Warn("re-reading token file; keeping the last good token", "path", path, "error", err)
-		} else if next != r.cur {
-			r.prev, r.prevUntil = r.cur, now.Add(r.set.grace)
-			r.cur = next
-			r.log.Info("bearer token rotated; the previous token stays accepted for the grace window",
-				"path", path, "grace", r.set.grace)
+			// Decided here, where the transition is visible: a failure that
+			// OPENS a run always warns, however recently the previous run's
+			// last line was written (see reWarnInterval).
+			firstFail, r.failing = !r.failing, true
+			readErr = err
+		} else {
+			recovered, r.failing = r.failing, false
+			if next != r.cur {
+				r.prev, r.prevUntil = r.cur, now.Add(r.set.grace)
+				r.cur = next
+				rotated, newBytes = true, len(next)
+			}
 		}
 	}
+	var out []string
 	if r.prev != "" && now.Before(r.prevUntil) {
-		return []string{r.cur, r.prev}
+		out = []string{r.cur, r.prev}
+	} else {
+		out = []string{r.cur}
 	}
-	return []string{r.cur}
+	r.mu.Unlock()
+
+	// Report with the lock RELEASED, for the same reason the read above drops
+	// it. An slog record is a handler call plus a write to the process's
+	// stderr, and that write BLOCKS when nothing drains the other end (a
+	// stalled log collector, a full log disk, a 64 KiB pipe with no reader):
+	// emitting it under r.mu would park every concurrent auth check — every
+	// agent's /v1/scrape-auth fetch, every sibling shard's internal span push —
+	// behind a log line, which is exactly the serialisation the lock drop
+	// exists to prevent. The failure branch fires precisely when the mount is
+	// already unhealthy, so the stall would land at the receiver's worst
+	// moment. Decide under the lock, emit after: the shape File.Read and
+	// File.noteFailure already use.
+	if readErr != nil {
+		// Counted on EVERY failure; the line is throttled. A receiver that
+		// cannot read its accept set keeps accepting the last good token,
+		// so the visible symptom arrives late and elsewhere — a fleet-wide
+		// 401 once the clients have rotated past it — which is why the
+		// condition has to be reported where it is known.
+		obs.BearerTokenReadErrors.WithLabelValues(roleReceiver).Inc()
+		// Allow first, so a first-of-run warn claims the slot rather than being
+		// followed by a second one on the next read.
+		if r.warn.Allow(reWarnInterval) || firstFail {
+			r.log.Warn("re-reading the bearer token file failed; still accepting the last good token, so a rotation will 401 every caller", "path", path, "error", readErr)
+		} else {
+			r.log.Debug("re-reading the bearer token file failed; still accepting the last good token", "path", path, "error", readErr)
+		}
+	}
+	if recovered {
+		r.log.Info("re-reading the bearer token file succeeded again", "path", path)
+	}
+	if rotated {
+		// bytes, never the token: a length tells a real credential from a
+		// truncated or half-written projection, and is all the constant-time
+		// compare in Authorized leaks anyway.
+		r.log.Info("bearer token rotated; the previous token stays accepted for the grace window",
+			"path", path, "grace", r.set.grace, "bytes", newBytes)
+	}
+	return out
 }
 
 // Authorized reports whether an `Authorization: Bearer <token>` header carries

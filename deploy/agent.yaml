@@ -81,6 +81,17 @@ spec:
         - key: node-role.kubernetes.io/control-plane
           operator: Exists
           effect: NoSchedule
+      # Kubernetes' own seccomp default is Unconfined, which is LOOSER than what
+      # a plain container run gets, and PodSecurity's `restricted` profile
+      # rejects a pod without RuntimeDefault outright — without this these pods
+      # fail ADMISSION on a restricted namespace, which on a first install reads
+      # as a broken manifest rather than a policy. (This agent additionally runs
+      # as UID 0 and mounts hostPath /var/log, so it can never satisfy
+      # `restricted` whatever this says — its namespace needs `privileged`.
+      # RuntimeDefault is still the right profile for it.)
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: agent
           image: ghcr.io/johanlindvall/kubescrape:latest
@@ -93,6 +104,40 @@ spec:
             - -scrape-interval=30s
             # Do not tail the collector's own output (feedback loop).
             - -logs-exclude-namespaces=monitoring
+            # WHO MAY READ THIS NODE'S TELEMETRY FEED. The port below (:8081)
+            # carries /healthz and /readyz, which the kubelet probes, and it is
+            # reachable from every pod in the cluster — but three of the routes
+            # on it are DATA-BEARING: /debug/otlp and /debug/otlp/ui stream,
+            # verbatim, every log record, metric and span this agent exports
+            # (every container log line on the node, from every namespace
+            # scheduled here), and /debug/tailer enumerates every file it tails.
+            #
+            # Those three are NOT served openly. With no token file they answer
+            # only a LOCAL connection — `kubectl port-forward` (the kubelet
+            # dials 127.0.0.1 inside the pod's netns, so a port-forward arrives
+            # as loopback, and reaching it already needs pods/portforward), or a
+            # container in this same pod — and refuse everything else, counting
+            # kubescrape_debug_refused_total{reason}. That default needs no
+            # configuration and is the one to keep.
+            #
+            # Uncomment the flag, the mount and the volume below TOGETHER to
+            # read them remotely with `Authorization: Bearer <token>` instead;
+            # the file is re-read about once a minute with the previous value
+            # accepted for a grace window, so rotating the Secret needs no
+            # restart:
+            #   kubectl -n monitoring create secret generic kubescrape-debug \
+            #     --from-literal=token="$(openssl rand -hex 24)"
+            #- -debug-token-file=/etc/kubescrape/debug/token
+            #
+            # THERE IS NO NetworkPolicy IN THESE RAW MANIFESTS. Every port this
+            # DaemonSet opens — :8081 above, :9090 metrics, and :4317/:4318 if
+            # you enable -ingest, which is an UNAUTHENTICATED OTLP receiver any
+            # pod could push into — is reachable from every pod in the cluster.
+            # The Helm chart ships ingress policies for all of them (values
+            # networkPolicy.enabled, agent.debug.allowFrom, agent.ingest.allowFrom);
+            # if you apply these files directly, write the equivalent yourself,
+            # and tighten the unauthenticated WRITERS (the ingest ports) before
+            # the readers.
             # Enables the cadvisor, node-metrics and /stats/summary scrapes;
             # disable individual pipelines with -logs=false, -metrics=false,
             # -cadvisor=false or -node-metrics=false. Empty here makes all
@@ -288,6 +333,31 @@ spec:
             #- name: cgroup
             #  mountPath: /sys/fs/cgroup
             #  readOnly: true
+            # The -debug-token-file Secret. Uncomment with the flag above and
+            # the volume below; the path must match the flag exactly, or the
+            # gate falls back to local-only without saying so.
+            #- name: debug-token
+            #  mountPath: /etc/kubescrape/debug
+            #  readOnly: true
+          # 512Mi is not arbitrary: with -ingest on, the receiver bounds itself
+          # at 64 MiB of raw bodies plus ~2x that as charged decoded structure,
+          # and those constants were chosen against this exact limit (see
+          # decodedBudgetFactor in internal/agent/otlpingest/admit.go). Lowering
+          # it removes headroom the receiver already believes it has, and
+          # -ingest-grpc-max-recv-bytes scales both budgets, so raising that is
+          # a memory grant — raise this in step. No CPU limit on purpose:
+          # throttling a log tailer during an incident is how the incident stops
+          # being observable.
+          # The binary reads this limit from its own cgroup at startup and hands
+          # 90% of it to the Go GC as GOMEMLIMIT (internal/cli/memlimit.go), so
+          # a heap excursion becomes GC pressure instead of an OOMKill. Measured:
+          # 0 kills in 16 runs of a burst that killed the unlimited arm 3 times,
+          # and 0.00% cost when the limit does not bind. It follows whatever
+          # number is written here — including one an operator lowers, or a VPA
+          # resizes — so nothing has to be kept in step by hand. Set GOMEMLIMIT
+          # in the pod env to override it; leave the CPU side alone, Go derives
+          # GOMAXPROCS from a cpu limit by itself since go 1.25 (go.mod pins
+          # 1.26), which is why adding one here needs no other change.
           resources:
             requests:
               cpu: 50m
@@ -315,3 +385,7 @@ spec:
         #  hostPath:
         #    path: /sys/fs/cgroup
         #    type: Directory
+        # Uncomment with -debug-token-file and its mount above.
+        #- name: debug-token
+        #  secret:
+        #    secretName: kubescrape-debug

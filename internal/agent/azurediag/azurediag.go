@@ -30,6 +30,7 @@ import (
 	"github.com/JohanLindvall/kubescrape/internal/agent/logchain"
 	"github.com/JohanLindvall/kubescrape/internal/agent/logscrub"
 	"github.com/JohanLindvall/kubescrape/internal/agent/otlpexport"
+	"github.com/JohanLindvall/kubescrape/internal/logdedupe"
 	"github.com/JohanLindvall/kubescrape/internal/logline"
 	"github.com/JohanLindvall/kubescrape/internal/metrics"
 	"github.com/JohanLindvall/kubescrape/internal/obs"
@@ -103,6 +104,10 @@ type Reader struct {
 	log *slog.Logger
 	// open creates the source; a var so tests inject a fake.
 	open func() (source, error)
+	// decodeWarn throttles the undecodable-data warning (see reportDecodeError),
+	// commitWarn the offset-commit failure (once per poll otherwise).
+	decodeWarn logdedupe.Throttle
+	commitWarn logdedupe.Throttle
 
 	scratch [][]byte // GetPaths output, reused across records
 }
@@ -177,7 +182,16 @@ func (r *Reader) consume(ctx context.Context, src source) error {
 		// the partition.
 		if err := src.commit(ctx); err != nil && ctx.Err() == nil {
 			obs.AzureCommitErrors.Inc()
-			r.log.Warn("committing event hubs offsets", "error", err)
+			// Throttled: the commit runs once per poll, so on a busy hub an
+			// unwritable offset is a line per fetch. The consequence is
+			// redelivery (duplicates), not loss, which is why it is a Warn
+			// rather than an Error — but a persistent one means the group's
+			// resume point has stopped advancing and a restart will re-consume
+			// everything since.
+			if r.commitWarn.Allow(commitWarnEvery) {
+				r.log.Warn("committing event hubs offsets failed; the records were delivered, so a redelivery produces duplicates and a restart re-consumes from the last committed offset",
+					"error", err)
+			}
 		}
 	}
 	return ctx.Err()
@@ -187,6 +201,14 @@ func (r *Reader) consume(ctx context.Context, src source) error {
 // are counted and skipped — they will be committed past, as one malformed
 // producer must not stall the hub. A syntax error mid-array keeps the
 // records already decoded and drops the rest of that message as one error.
+//
+// The skip is COUNTED (obs.AzureDecodeErrors) and, throttled, LOGGED: a
+// counter says data is being discarded but not what is wrong with it, and this
+// is committed-past loss, so the message is gone by the time anyone looks. The
+// line carries the decoder's error and the message's SIZE — never its bytes: a
+// diagnostic-settings record is customer data (an activity log carries caller
+// identities and request bodies), and a hub misconfigured to carry something
+// else is exactly when a body would end up in the log aggregator forever.
 func (r *Reader) decode(msgs [][]byte) []record {
 	var recs []record
 	each := func(raw []byte) error {
@@ -194,6 +216,7 @@ func (r *Reader) decode(msgs [][]byte) []record {
 		r.scratch = scratch
 		if err != nil {
 			obs.AzureDecodeErrors.Inc()
+			r.reportDecodeError("record", len(raw), err)
 			return nil // skip the record, keep the rest of the envelope
 		}
 		// signal/plural, the dimension name and values every other producer
@@ -209,9 +232,29 @@ func (r *Reader) decode(msgs [][]byte) []record {
 	for _, msg := range msgs {
 		if err := splitEnvelope(msg, each); err != nil {
 			obs.AzureDecodeErrors.Inc()
+			r.reportDecodeError("envelope", len(msg), err)
 		}
 	}
 	return recs
+}
+
+// commitWarnEvery re-warns while offset commits keep failing.
+const commitWarnEvery = time.Minute
+
+// decodeWarnEvery re-warns about undecodable Event Hubs data at this cadence. A
+// producer writing the wrong shape into a hub does it for every message, so the
+// unthrottled line is one per message forever.
+const decodeWarnEvery = 5 * time.Minute
+
+// reportDecodeError logs the throttled half of a decode skip. See decode on why
+// the message body itself is never in it.
+func (r *Reader) reportDecodeError(what string, size int, err error) {
+	r.log.Debug("skipping undecodable event hubs data", "reason", what, "bytes", size, "error", err)
+	if !r.decodeWarn.Allow(decodeWarnEvery) {
+		return
+	}
+	r.log.Warn("event hubs data could not be decoded as azure diagnostics JSON; it is skipped and committed past, so it is not retried",
+		"reason", what, "bytes", size, "error", err)
 }
 
 // deliver converts and exports both signals, retrying transient failures in

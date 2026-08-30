@@ -26,12 +26,12 @@ import (
 
 type stubResolver struct{}
 
-func (stubResolver) Resolve(_ string, refs []metav1.OwnerReference) []kubemeta.Owner {
+func (stubResolver) Resolve(_ string, refs []metav1.OwnerReference) ([]kubemeta.Owner, int) {
 	out := make([]kubemeta.Owner, 0, len(refs))
 	for _, r := range refs {
 		out = append(out, kubemeta.Owner{APIVersion: r.APIVersion, Kind: r.Kind, Name: r.Name, UID: string(r.UID)})
 	}
-	return out
+	return out, 0
 }
 
 func (stubResolver) Namespace(name string) *kubemeta.ObjectMeta {

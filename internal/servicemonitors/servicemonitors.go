@@ -25,6 +25,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"unicode/utf8"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -91,6 +92,15 @@ type Endpoint struct {
 	// is visible: "narrower than prometheus-operator" is a documented choice,
 	// "silently does something different" is not.
 	Ignored []string
+	// Refused names the field(s) whose size took this endpoint past
+	// enforceFieldBounds' ceilings, and is empty for every ordinary endpoint.
+	// A refused endpoint yields NO targets: the string that was over the
+	// ceiling is the URL to scrape, the name to verify a certificate against or
+	// the credential to present, and none of those has a safe shorter form —
+	// see enforceFieldBounds for why a refusal beats both a truncation and a
+	// fallback to the default. internal/scrape reads it at both endpoint
+	// resolvers and /v1/explain reports it (scrape.MonitorEndpointNote).
+	Refused string
 }
 
 // secretRefs returns POINTERS to every field of this endpoint that carries a
@@ -361,16 +371,386 @@ func (ep endpointSpec) ignoredFields() []string {
 		add("tlsConfig.minVersion", ep.TLSConfig.MinVersion != "")
 		add("tlsConfig.maxVersion", ep.TLSConfig.MaxVersion != "")
 	}
-	for _, r := range ep.MetricRelabelings {
-		if !isKeepDrop(r.Action) {
-			out = append(out, "metricRelabelings.action="+r.Action)
-			continue
-		}
-		if r.Separator != "" && r.Separator != ";" {
-			out = append(out, "metricRelabelings.separator="+r.Separator)
+	// The relabel chain's own report comes from the ONE walk that also decides
+	// which rules are applied (relabelChain): the two verdicts must agree, and
+	// they were parallel loops here and in toEndpoint until the size bounds
+	// gave them something non-trivial to disagree about. The kept half is
+	// discarded here; parsing happens once per monitor upsert, so the second
+	// walk costs nothing worth a shared cache that could go stale.
+	_, relabelIgnored, _ := ep.relabelChain()
+	return append(out, relabelIgnored...)
+}
+
+// Bounds on the metricRelabelings chain ONE monitor endpoint may impose. They
+// exist for the reason the tailer bounds a pod's log rules
+// (internal/agent/tailer/podconfig.go, maxPodRules): the chain is
+// TENANT-SUPPLIED — anyone with namespace edit rights can create a
+// ServiceMonitor, and with -monitor-namespaces unset (the default, "all
+// namespaces honoured") a `selector: {}` + `namespaceSelector.any: true`
+// monitor attaches to every Service in the cluster — and its cost is paid by
+// somebody else, twice over and linearly in its size:
+//
+//   - BYTES. scrape.stampEndpoint copies the whole chain into EVERY
+//     kubemeta.ScrapeTarget the monitor resolves to, and
+//     /v1/nodes/{node}/targets marshals every target of every pod on the node
+//     into one []byte. A 1.14 MiB chain — ~20k rules, comfortably inside
+//     etcd's object limit — turns a ~2 MiB node document into a multi-GiB
+//     allocation, in a singleton whose chart requests 128Mi and sets no limit.
+//     scrape.MaxPortsPerPod does not see this: it bounds the target COUNT
+//     against a per-target cost it models as the pod document (~2 KiB), which
+//     is exactly the lesson recorded there as "a bound on ENTRIES is not a
+//     bound on BYTES".
+//   - CPU, on every agent that scrapes such a target: the agent's
+//     relabelFilter.Keep walks EVERY rule for EVERY sample with no memo (unlike
+//     its sibling filterSession), for the whole scrape timeout, every cycle.
+//
+// The numbers are far above any legitimate chain: kube-prometheus-stack's own
+// monitors carry a handful of rules each, and a metric ALLOWLIST — the one
+// shape that is legitimately large — is normally a single keep rule with a long
+// alternation, which is why ONE rule may spend the whole chain budget while the
+// chain itself is held to it.
+//
+// The excess is REFUSED, never the monitor: rejecting the CR would take every
+// target it contributes with it, which is a bigger outage than the chain is a
+// risk. The refusal rides Endpoint.Ignored like every other clause kubescrape
+// does not apply, so it counts into kubescrape_monitor_fields_ignored_total and
+// names itself in the per-upsert warning instead of being silent.
+//
+// WHICH WAY EACH CEILING FAILS, stated rather than left to be rediscovered — a
+// refused relabel rule is INVISIBLE in the data (the series it would have
+// dropped simply arrive), so the direction is the whole of what an operator
+// gets:
+//
+//   - The two AGGREGATE ceilings (maxRelabelRules, maxRelabelChainBytes) keep
+//     the chain's PREFIX and refuse the tail, which FAILS OPEN for the refused
+//     rules: a `keep` in the tail was an allowlist, and without it the target
+//     exports everything the allowlist excluded. That is deliberate. The
+//     prefix is the head of the operator's own chain applied in the operator's
+//     own order, so it is strictly closer to the CR than nothing; the
+//     merge-time sibling (scrape.MaxRelabelChainRules) has no other option at
+//     all, since it must not refuse a target other monitors legitimately
+//     created; and reaching either ceiling needs a chain no good-faith monitor
+//     writes.
+//   - The PER-RULE ceiling refuses the ENDPOINT — no targets at all — because
+//     failing open there cannot be argued the same way. maxRelabelRuleBytes is
+//     the whole chain budget, so a rule that trips it does not fit ANY chain,
+//     in any order, and dropping it is not an approximation of the CR: it is
+//     the one shape (a single enormous alternation) the legitimately-large
+//     `keep` allowlist has, and honouring the endpoint without it is exactly
+//     the silent inversion — export everything — that the rule was written to
+//     prevent. Not scraping is the outcome an operator NOTICES; over-exporting
+//     is the one that shows up on next month's bill. It is the same trade
+//     enforceFieldBounds makes for path/serverName/credentials below, reached
+//     through the same Refused field, and it is safe for the same reason: a
+//     refused endpoint yields no target, so it cannot shadow, merge with or
+//     upgrade anybody else's.
+//
+// maxRelabelRuleBytes therefore EQUALS maxRelabelChainBytes on purpose. It was
+// half of it, which made a legitimate ~5 KiB allowlist — roughly 170 metric
+// names — trip the per-rule ceiling while a chain of small rules could spend
+// twice as much, and the answer to it was the silent fail-open above.
+const (
+	maxRelabelRules = 64
+	// One rule may spend the whole chain budget; over it is a refusal of the
+	// endpoint, not of the rule.
+	maxRelabelRuleBytes  = maxRelabelChainBytes
+	maxRelabelChainBytes = 8 << 10
+)
+
+// The Ignored entries the bounds above produce. Spelled with a parenthesised
+// suffix like noPortIgnored, because they report a REFUSAL of something
+// kubescrape does interpret rather than a field it ignores wholesale.
+const (
+	relabelCappedIgnored = "metricRelabelings(capped)"
+	// relabelRefusedField is the Refused name for an endpoint carrying a rule
+	// too large to apply, and relabelOversizeIgnored is built FROM it so the
+	// two spellings — the one in Ignored and the one in Refused — cannot drift.
+	relabelRefusedField    = "metricRelabelings.regex"
+	relabelOversizeIgnored = relabelRefusedField + oversizeSuffix
+	// The report's OWN ceiling; see maxRelabelIgnored.
+	relabelReportCappedIgnored = "metricRelabelings(unsupported-capped)"
+)
+
+// maxRelabelIgnored bounds the REPORT the walk below produces, which is the
+// sibling of the bound on the rules it applies — and it is a separate bound for
+// the reason this file keeps re-learning: the two arms that report an
+// unsupported `action` or a custom `separator` embed a TENANT-CHOSEN string and
+// skip the rule, so they never reach the rules ceiling however it is tuned, and
+// bounding only the applied half moved the allocation instead of closing it.
+// Measured through the real parser: a ~1.1 MiB CR fragment of 20,000 keep rules
+// each with a distinct `separator` yields 0 applied rules, 20,000 Ignored
+// entries (1,180,000 bytes retained on the endpoint in the index, forever) and
+// one Warn line of the same order — re-emitted on every edit of the CR, since
+// warnIgnored is gated on UpsertChanged's news.
+//
+// Past the ceiling the walk keeps applying rules it CAN apply (the report is a
+// diagnostic; refusing to honour a valid rule because an earlier one was
+// unreportable would be the wrong half to give up) and folds the rest of the
+// report into one constant entry. A constant, not a count, because these
+// entries reach warnIgnored through IgnoredFields, which dedupes: a per-endpoint
+// tally would be a DISTINCT string per endpoint and the joined line would grow
+// with the endpoint list — the same defect one level up.
+const maxRelabelIgnored = 8
+
+// maxIgnoredValueBytes clips the tenant-chosen halves the two report arms echo
+// (`action=`, `separator=`). Echoing the value is worth keeping — "action=Foo"
+// is the whole diagnosis — but echoing it VERBATIM makes the log line and the
+// retained report as large as the attacker's string, so it is clipped to a
+// length that shows what was written without carrying it. The value is CRD
+// free-form text, never secret material (secret-bearing fields are named by
+// Endpoint.secretRefs and are reported by NAME only).
+const maxIgnoredValueBytes = 48
+
+// clipValue renders a tenant-supplied value for a report entry, cut at
+// maxIgnoredValueBytes with an ellipsis so a reader can tell a clipped value
+// from a short one. Cut on a rune boundary: the entry is written into a log
+// record and a JSON document, and half a rune is a mojibake byte in both.
+func clipValue(s string) string {
+	if len(s) <= maxIgnoredValueBytes {
+		return s
+	}
+	cut := maxIgnoredValueBytes
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut] + "..."
+}
+
+// relabelLabelBytes is what ONE sourceLabels entry costs beyond its own
+// characters: its JSON framing in the served node-targets document (two quotes
+// and a comma) and its slice slot and per-sample visit in the agent's
+// relabelFilter. Charging it is not tidiness — it is the difference between a
+// bound on BYTES and a bound that a list of EMPTY strings walks straight past.
+// Measured through the real parser and json.Marshal: one keep rule with 500,000
+// empty sourceLabels is charged 2 bytes by the length-only accounting (the
+// regex), is admitted whole by both ceilings, and marshals to 1,500,049 bytes
+// in EVERY target the monitor resolves to — once per matched pod, per agent
+// poll. The CR that carries it is ~1.5 MiB, i.e. inside etcd's object limit.
+const relabelLabelBytes = 3
+
+// relabelRuleBytes is one rule's cost in the two places that make the chain
+// worth bounding: the served target it is copied into, and the per-sample walk
+// in the agent's relabelFilter. The action is one of two constants and is not
+// charged. scrape has the same accounting over the wire type
+// (scrape.relabelRuleBytes) for the merged ceiling — the two bound the same
+// quantity at two doors and must stay the same shape.
+func relabelRuleBytes(regex string, sourceLabels []string) int {
+	n := len(regex)
+	for _, l := range sourceLabels {
+		n += len(l) + relabelLabelBytes
+	}
+	return n
+}
+
+// relabelChain walks the endpoint's metricRelabelings ONCE and returns all
+// three parts of the verdict: the rules kubescrape will apply, the report
+// entries for every rule it refused, and whether one of those refusals was an
+// OVERSIZED rule, which refuses the endpoint itself (see the ceilings above —
+// the aggregate ones keep a prefix, this one cannot). One walk, because a rule
+// reported as dropped and then applied (or the reverse) is precisely the silent
+// partial application the Ignored machinery exists to prevent.
+func (ep endpointSpec) relabelChain() (rules []RelabelRule, ignored []string, oversize bool) {
+	chainBytes := 0
+	// report appends one report entry under maxRelabelIgnored, folding
+	// everything past it into the one constant entry. It is a closure rather
+	// than four call sites' worth of `if len(ignored) < …` because the arms it
+	// guards are exactly the ones the applied-rule ceilings cannot reach.
+	reportCapped := false
+	report := func(entry string) {
+		switch {
+		case len(ignored) < maxRelabelIgnored:
+			ignored = append(ignored, entry)
+		case !reportCapped:
+			reportCapped = true
+			ignored = append(ignored, relabelReportCappedIgnored)
 		}
 	}
-	return out
+	for _, r := range ep.MetricRelabelings {
+		if !isKeepDrop(r.Action) {
+			report("metricRelabelings.action=" + clipValue(r.Action))
+			continue
+		}
+		// A custom separator is reported and the rule SKIPPED: the agent joins
+		// sourceLabels with ';', so applying the rule anyway would test the
+		// user's regex against a string it was never written for — silently
+		// inverting a keep into a drop-everything.
+		if r.Separator != "" && r.Separator != ";" {
+			report("metricRelabelings.separator=" + clipValue(r.Separator))
+			continue
+		}
+		// Over the bounds: the PREFIX of the chain is kept and the rest
+		// refused. A prefix rather than nothing because relabel rules are
+		// independent filters applied in order — keeping the ones written
+		// first is strictly closer to the CR than keeping none — and because a
+		// legitimate chain never reaches here at all.
+		if len(rules) >= maxRelabelRules {
+			report(relabelCappedIgnored)
+			break
+		}
+		n := relabelRuleBytes(r.Regex, r.SourceLabels)
+		if n > maxRelabelRuleBytes {
+			// One rule bigger than the WHOLE chain budget refuses the endpoint
+			// (toEndpoint, through enforceFieldBounds): skipping it and
+			// applying its neighbours ships a filter the CR does not describe,
+			// and for the one shape that is legitimately this large — a `keep`
+			// allowlist — that means exporting everything it excluded. The walk
+			// stops here because the chain is discarded either way; the report
+			// entry is what reaches the counter and the warning.
+			report(relabelOversizeIgnored)
+			oversize = true
+			break
+		}
+		if chainBytes+n > maxRelabelChainBytes {
+			report(relabelCappedIgnored)
+			break
+		}
+		chainBytes += n
+		rules = append(rules, RelabelRule{
+			// Normalized, so everything downstream compares one spelling.
+			Action:       strings.ToLower(r.Action),
+			SourceLabels: r.SourceLabels,
+			Regex:        r.Regex,
+		})
+	}
+	return rules, ignored, oversize
+}
+
+// Ceilings on the tenant-supplied endpoint STRINGS that scrape copies onto
+// EVERY target the endpoint resolves to (stampEndpoint, makeTarget). They are
+// the metricRelabelings ceiling's siblings and they exist for the identical
+// reason — the chain was bounded and every other string on the same derivation
+// was left alone, which is this file's own lesson ("a bound on ENTRIES is not a
+// bound on BYTES") applied to one field and not to its neighbours.
+//
+// Measured through the real derivation (MonitorTargets + json.Marshal): ONE
+// endpoint with `path: /<1 MiB of a>` and no metricRelabelings at all — so
+// neither relabel ceiling is approached, and the CR is well inside etcd's
+// object limit — yields ONE target of 2,097,625 bytes, because the path is
+// copied into both t.URL and t.Path. /v1/nodes/{node}/targets embeds one such
+// target per matched pod and is re-derived and re-marshalled on every agent
+// poll (writeCached must build the body to hash the ETag, so a 304 does not
+// save it): ~220 MiB per request on a 110-pod node, once per scrape cycle per
+// node, in the singleton the chart requests 128Mi for with no memory limit.
+// The tenant needs edit rights in ONE namespace and a `selector: {}` +
+// `namespaceSelector.any: true` monitor, which the default -monitor-namespaces
+// honours. scrape.MaxPortsPerPod cannot see it: it bounds the target COUNT
+// against a per-target cost it models as the ~2 KiB pod document.
+//
+// Every ceiling is far above what the field can legitimately hold — a scrape
+// path is a few tens of bytes, an SNI name cannot exceed 253 (RFC 1035), a
+// duration is under twenty, an `authorization.type` is "Bearer", and a rendered
+// "name/key" secret reference cannot exceed 507 even with two maximal DNS-1123
+// subdomains — so no real monitor can reach one.
+const (
+	maxEndpointPathBytes       = 2 << 10
+	maxEndpointServerNameBytes = 256
+	maxEndpointAuthTypeBytes   = 64
+	maxEndpointDurationBytes   = 64
+	maxEndpointSecretRefBytes  = 768
+)
+
+// oversizeSuffix marks a report entry for a field kubescrape DOES interpret but
+// REFUSED for its size, the spelling relabelOversizeIgnored already uses.
+const oversizeSuffix = "(oversize)"
+
+// boundedField is one tenant-supplied endpoint string and its ceiling.
+type boundedField struct {
+	name  string
+	value *string
+	max   int
+}
+
+// boundedFields returns a POINTER to every endpoint string that scrape stamps
+// onto a target, with the ceiling it is held to. It is the sibling of
+// secretRefs and it is one list for the same reason: a new string field on
+// kubemeta.ScrapeTarget that is fed from an endpoint and forgotten here is
+// unbounded, and it fails nowhere until somebody sends a megabyte through it.
+// TestEveryStampedEndpointStringIsBounded walks stampEndpoint's targets against
+// this list, so the omission is a TEST failure rather than a finding.
+//
+// Deliberately NOT here:
+//
+//   - Scheme, which defaultSchemePath maps to one of two constants, so its
+//     size cannot reach a target however long the CR spells it.
+//   - Port and TargetPort, which are resolution INPUTS (a port name is looked
+//     up and the resolved int32 is what a target carries); an absurd one
+//     resolves to nothing and is retained once in the index, not per target.
+//   - MetricRelabelings, bounded by the ceilings above.
+func (e *Endpoint) boundedFields() []boundedField {
+	return []boundedField{
+		{"path", &e.Path, maxEndpointPathBytes},
+		{"interval", &e.Interval, maxEndpointDurationBytes},
+		{"scrapeTimeout", &e.ScrapeTimeout, maxEndpointDurationBytes},
+		{"tlsConfig.serverName", &e.TLSServerName, maxEndpointServerNameBytes},
+		{"authorization.type", &e.AuthType, maxEndpointAuthTypeBytes},
+		{"authorization.credentials", &e.AuthCredentials, maxEndpointSecretRefBytes},
+		{"basicAuth.username", &e.BasicAuthUser, maxEndpointSecretRefBytes},
+		{"basicAuth.password", &e.BasicAuthPass, maxEndpointSecretRefBytes},
+		{"bearerTokenSecret", &e.BearerSecret, maxEndpointSecretRefBytes},
+		{"tlsConfig.ca", &e.TLSCA, maxEndpointSecretRefBytes},
+		{"tlsConfig.cert", &e.TLSCert, maxEndpointSecretRefBytes},
+		{"tlsConfig.keySecret", &e.TLSKey, maxEndpointSecretRefBytes},
+	}
+}
+
+// enforceFieldBounds holds every string above to its ceiling and REFUSES the
+// endpoint — no targets at all — when one is over.
+//
+// Refused, never TRUNCATED and never dropped-to-the-default, and the three
+// outcomes are genuinely different:
+//
+//   - A truncated path scrapes a DIFFERENT URL than the CR names, silently and
+//     forever. So does dropping the path, which defaults it to /metrics — and
+//     that one is worse still, because /metrics is very often a URL the pod
+//     ALREADY has a target for, so the refused endpoint's relabel chain, auth
+//     material and cadence would merge (scrape.MergeMonitorEndpoint) onto
+//     somebody else's working target: a tenant's drop rules applied to a scrape
+//     they never named.
+//   - Dropping a serverName or a credential ref quietly downgrades a security
+//     decision the operator made — verification against a name they chose, or
+//     a scrape that authenticates.
+//
+// So the endpoint yields nothing, which is the one outcome that cannot be
+// mistaken for the CR being honoured, and it says so three ways: the refusal
+// rides Endpoint.Ignored (hence kubescrape_monitor_fields_ignored_total and the
+// per-upsert warning, exactly as relabelCappedIgnored does), Endpoint.Refused
+// names the fields for /v1/explain, and the values are dropped so the index
+// retains none of them. The MONITOR is never rejected — that would take every
+// target its other endpoints contribute with it, the same trade the relabel
+// ceiling makes.
+//
+// Port/TargetPort are cleared too, so an endpoint that is refused here resolves
+// to nothing through the port door as well: a caller that has not learned to
+// read Refused must not end up scraping the default path unauthenticated, which
+// is precisely the silent misapplication above.
+//
+// preRefused carries the field names of refusals decided BEFORE this call and
+// already reported in Ignored — today exactly one, an oversized relabel rule
+// (relabelRefusedField; see the ceilings above for why that one refuses the
+// endpoint while the aggregate ceilings keep a prefix). They are passed in
+// rather than re-derived here so that ONE function decides what a refused
+// endpoint looks like, and appended to Refused only — the Ignored entry is the
+// walk's to write, and writing it twice would double-count
+// kubescrape_monitor_fields_ignored_total.
+func (e *Endpoint) enforceFieldBounds(preRefused ...string) {
+	refused := preRefused
+	for _, f := range e.boundedFields() {
+		if len(*f.value) > f.max {
+			refused = append(refused, f.name)
+			e.Ignored = append(e.Ignored, f.name+oversizeSuffix)
+		}
+	}
+	if len(refused) == 0 {
+		return
+	}
+	e.Refused = strings.Join(refused, ",")
+	for _, f := range e.boundedFields() {
+		*f.value = ""
+	}
+	// The chain goes too: this endpoint yields no target, so a retained chain
+	// is bytes the index holds for the life of the CR and filters nothing.
+	e.MetricRelabelings = nil
+	e.Port, e.TargetPort = "", nil
 }
 
 // toEndpoint converts the spec shape (BearerSecret namespace filled by the
@@ -399,24 +779,21 @@ func (ep endpointSpec) toEndpoint() Endpoint {
 	// secretRef.ref owns the incomplete-ref-is-empty rule; bearerTokenSecret
 	// used to re-spell it inline beside six fields that already went through it.
 	out.BearerSecret = ep.BearerTokenSecret.ref()
-	for _, r := range ep.MetricRelabelings {
-		if !isKeepDrop(r.Action) {
-			continue
-		}
-		// A custom separator is reported (below) and the rule SKIPPED: the
-		// agent joins sourceLabels with ';', so applying the rule anyway
-		// would test the user's regex against a string it was never written
-		// for — silently inverting a keep into a drop-everything.
-		if r.Separator != "" && r.Separator != ";" {
-			continue
-		}
-		out.MetricRelabelings = append(out.MetricRelabelings, RelabelRule{
-			// Normalized, so everything downstream compares one spelling.
-			Action:       strings.ToLower(r.Action),
-			SourceLabels: r.SourceLabels,
-			Regex:        r.Regex,
-		})
+	// The report half is already on out.Ignored (ignoredFields walks the same
+	// function), so it is discarded here rather than appended twice — but the
+	// oversize verdict is not a report, it is a REFUSAL, and it is carried into
+	// enforceFieldBounds so one function decides what a refused endpoint looks
+	// like.
+	rules, _, relabelOversize := ep.relabelChain()
+	out.MetricRelabelings = rules
+	var refusedByChain []string
+	if relabelOversize {
+		refusedByChain = []string{relabelRefusedField}
 	}
+	// Last, because it reads the fields every branch above fills in — including
+	// the RENDERED secret references rather than their CRD halves, which is the
+	// form that reaches a target.
+	out.enforceFieldBounds(refusedByChain...)
 	return out
 }
 
@@ -997,8 +1374,29 @@ func (x *Index) buildAuthSecretRefs() AuthRefs {
 	return AuthRefs{refs: out}
 }
 
+// maxIgnoredFields bounds the report ONE monitor produces, which is the third
+// door of the same shape as maxRelabelIgnored and is here because bounding the
+// second one alone would only have moved the growth up a level: the per-
+// endpoint report is bounded, but a monitor's ENDPOINT LIST is not, every
+// endpoint may contribute report entries carrying a DISTINCT tenant-chosen
+// value (`action=`, `separator=`), and this function's whole output is joined
+// into ONE log record by warnIgnored. A ~1.5 MiB CR of minimal endpoints each
+// carrying a handful of distinct unsupported actions is tens of thousands of
+// distinct entries, re-emitted on every edit of the CR.
+//
+// A monitor whose report needs more than this many DISTINCT field names is not
+// one an operator is going to read to the end anyway.
+const maxIgnoredFields = 64
+
+// ignoredFieldsCapped is the constant that stands for the remainder, sorted
+// last on purpose (the tilde sorts after every field name kubescrape emits) so
+// the entries it replaces are the alphabetic tail rather than an arbitrary
+// prefix of the reader's attention.
+const ignoredFieldsCapped = "~(more fields omitted)"
+
 // IgnoredFields returns the distinct endpoint fields present on these
-// endpoints that kubescrape does not interpret, sorted.
+// endpoints that kubescrape does not interpret, sorted and bounded by
+// maxIgnoredFields.
 //
 // kubescrape deliberately implements a SUBSET of the ServiceMonitor and
 // PodMonitor spec, which is fine — but a partially-applied CR must not be
@@ -1017,6 +1415,12 @@ func IgnoredFields(eps []Endpoint) []string {
 		}
 	}
 	sort.Strings(out)
+	// Sorted FIRST, then cut: the kept prefix has to be a property of the
+	// monitor rather than of the order its endpoints happened to be walked, or
+	// two identical CRs would report differently.
+	if len(out) > maxIgnoredFields {
+		out = append(out[:maxIgnoredFields:maxIgnoredFields], ignoredFieldsCapped)
+	}
 	return out
 }
 

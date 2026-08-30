@@ -94,7 +94,7 @@ type countingResolver struct {
 	namespaces atomic.Int64
 }
 
-func (c *countingResolver) Resolve(namespace string, refs []metav1.OwnerReference) []kubemeta.Owner {
+func (c *countingResolver) Resolve(namespace string, refs []metav1.OwnerReference) ([]kubemeta.Owner, int) {
 	c.resolves.Add(1)
 	return c.stubResolver.Resolve(namespace, refs)
 }

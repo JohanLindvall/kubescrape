@@ -83,7 +83,7 @@ func TestDestinationlessRouterStripsTheMarkerOnMetrics(t *testing.T) {
 // allowed to cost the 4,000-resource KSM/cadvisor shape a copy per export.
 func TestUnmarkedPayloadStillTakesTheFastPath(t *testing.T) {
 	r := New(&capDest{}, nil)
-	if groups := r.split(3, func(int) pcommon.Resource { return pcommon.NewResource() }); groups != nil {
+	if groups := r.split("logs", 3, func(int) pcommon.Resource { return pcommon.NewResource() }); groups != nil {
 		t.Errorf("split returned %v for an unmarked, destination-less payload; want nil "+
 			"(the fast path forwards the original without copying)", groups)
 	}

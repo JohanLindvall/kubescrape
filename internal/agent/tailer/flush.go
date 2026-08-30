@@ -500,6 +500,17 @@ type batchInfo struct {
 // now committed retires (fd closed, checkpoint entry gone).
 func (t *Tailer) commitBatch(inf *batchInfo) {
 	obs.LogEntries.Add(float64(inf.kept))
+	// The RECOVERY half of failBatch's throttled Error. Without it a collector
+	// outage produces a first Error, a warning every minute, and then silence
+	// that is indistinguishable from the process having stopped exporting: the
+	// operator has to watch a counter STOP moving to learn it is over. Two
+	// field reads on the flush path (measured against
+	// TestIngestFlushAllocationBudget, which is unchanged).
+	if t.exportFailures > 0 {
+		t.log.Info("log export recovered", "failures", t.exportFailures,
+			"outage", time.Since(t.exportFailingSince).Round(time.Second))
+		t.exportFailures, t.exportFailingSince = 0, time.Time{}
+	}
 	t.advanceBatch(inf)
 }
 
@@ -567,8 +578,32 @@ func (t *Tailer) advanceBatch(inf *batchInfo) {
 // swaps the batch out into t.flushed before the synchronous export, and nothing
 // appends during it.)
 func (t *Tailer) failBatch(inf *batchInfo, err error) {
-	t.log.Error("exporting logs failed, rewinding", "records", inf.kept, "error", err)
 	obs.LogExportFailures.Inc()
+	// A collector outage fails EVERY flush for its whole duration — one line
+	// every couple of seconds per node, for one condition — so the repeats are
+	// throttled and the rate lives on the counter. The FIRST failure always
+	// logs (exportFailures is 0, so the transition arm runs before the
+	// throttle is consulted), which is the line that says an outage started;
+	// commitBatch logs the one that says it ended.
+	if t.exportFailures == 0 {
+		t.exportFailingSince = time.Now()
+		t.exportFailures++
+		// The transition CLAIMS the throttle's window (the result is
+		// deliberately ignored): without it the very next failed flush — two
+		// seconds later, in the same outage — would be the throttle's first
+		// consultation and would log immediately, so every outage opened with
+		// two lines saying the same thing.
+		t.exportWarn.Allow(exportWarnEvery)
+		t.log.Error("exporting logs failed, rewinding", "records", inf.kept, "error", err,
+			"files", len(inf.cands))
+	} else {
+		t.exportFailures++
+		if t.exportWarn.Allow(exportWarnEvery) {
+			t.log.Error("exporting logs is still failing, rewinding", "records", inf.kept, "error", err,
+				"files", len(inf.cands), "failures", t.exportFailures,
+				"outage", time.Since(t.exportFailingSince).Round(time.Second))
+		}
+	}
 	for f := range inf.cands {
 		t.rewind(f)
 	}

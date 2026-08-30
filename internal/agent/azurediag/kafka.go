@@ -13,6 +13,7 @@ import (
 	"log/slog"
 	"os"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -20,6 +21,7 @@ import (
 	"github.com/twmb/franz-go/pkg/kgo"
 	"github.com/twmb/franz-go/pkg/sasl"
 
+	"github.com/JohanLindvall/kubescrape/internal/logdedupe"
 	"github.com/JohanLindvall/kubescrape/internal/obs"
 )
 
@@ -77,7 +79,7 @@ func (k *KafkaConfig) Resolve(log *slog.Logger) error {
 		if host == "" {
 			return fmt.Errorf("azure event hubs: set -azure-eventhub-namespace or -azure-eventhub-connection-string-file")
 		}
-		k.Mechanism = managedIdentitySource(strings.TrimSuffix(hostOnly(host), ":9093"), k.ClientID, k.TenantID, nil).mechanism()
+		k.Mechanism = managedIdentitySource(strings.TrimSuffix(hostOnly(host), ":9093"), k.ClientID, k.TenantID, nil, log).mechanism()
 	}
 	if !strings.Contains(host, ":") {
 		host += ":9093"
@@ -151,7 +153,22 @@ func readTrimmed(path string) (string, error) {
 type kafkaSource struct {
 	cl  *kgo.Client
 	log *slog.Logger
+	// fetchWarn throttles the per-fetch error line by (topic, partition). An
+	// identity without read permission on one hub of a namespace produces the
+	// SAME error on every poll for as long as the deployment lives, and the
+	// useful information in it is one line per hub — logdedupe's whole subject.
+	// The bound is per-partition keys, and saturation SUPPRESSES: a namespace
+	// wide enough to fill it has already told the operator what to fix.
+	fetchWarn *logdedupe.Table
 }
+
+// fetchWarnKeys / fetchWarnEvery bound the fetch-error throttle: enough keys for
+// a large namespace's partitions, re-warned every five minutes so an operator
+// who fixes the permission sees it stop.
+const (
+	fetchWarnKeys  = 64
+	fetchWarnEvery = 5 * time.Minute
+)
 
 func newKafkaSource(cfg *Config) (source, error) {
 	k := &cfg.Kafka
@@ -186,11 +203,27 @@ func newKafkaSource(cfg *Config) (source, error) {
 	if k.Mechanism != nil {
 		opts = append(opts, kgo.SASL(k.Mechanism))
 	}
+	// kgo retries connection/TLS/SASL failures internally and forever, so
+	// without a logger a wrong credential is a consumer that blocks in silence
+	// (see kgolog.go).
+	opts = append(opts, kgo.WithLogger(kgoLoggerFor(cfg.Logger)))
 	cl, err := kgo.NewClient(opts...)
 	if err != nil {
 		return nil, fmt.Errorf("building the kafka client: %w", err)
 	}
-	return &kafkaSource{cl: cl, log: cfg.Logger}, nil
+	log := cfg.Logger
+	if log == nil {
+		log = slog.Default()
+	}
+	// One line per opened consumer: what it will talk to and how. The topic
+	// selection in particular is derived (an EntityPath, or the ^insights-.*
+	// pattern), so "which hubs am I actually consuming" is otherwise only
+	// answerable from the absence of data. Never the credential — only the SASL
+	// mechanism's name, which is all that may be said about one.
+	log.Info("event hubs consumer opened", "brokers", strings.Join(k.Brokers, ","),
+		"topics", topicSelection(k), "group", k.Group, "mechanism", describeMechanism(k),
+		"startMode", startOrDefault(k.Start))
+	return &kafkaSource{cl: cl, log: cfg.Logger, fetchWarn: logdedupe.New(fetchWarnKeys, fetchWarnEvery)}, nil
 }
 
 // poll blocks for the next fetch and returns the message values.
@@ -199,7 +232,7 @@ func (s *kafkaSource) poll(ctx context.Context) ([][]byte, bool, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, false, err
 	}
-	return pollResult(fetches, s.log)
+	return pollResult(fetches, s.log, s.fetchWarn)
 }
 
 // pollResult separates a fetch's records from its errors, classifies the
@@ -228,7 +261,7 @@ func (s *kafkaSource) poll(ctx context.Context) ([][]byte, bool, error) {
 // the caller must not clear the azure-eventhub readiness gate on it — that is
 // how a consumer which can never consume is kept from reporting ready without
 // also tearing the group down over it.
-func pollResult(fetches kgo.Fetches, log *slog.Logger) (msgs [][]byte, healthy bool, err error) {
+func pollResult(fetches kgo.Fetches, log *slog.Logger, warn *logdedupe.Table) (msgs [][]byte, healthy bool, err error) {
 	var seen bool
 	fetches.EachRecord(func(rec *kgo.Record) {
 		seen = true
@@ -240,7 +273,23 @@ func pollResult(fetches kgo.Fetches, log *slog.Logger) (msgs [][]byte, healthy b
 	var fatal error
 	for _, fe := range errs {
 		obs.AzureFetchErrors.Inc()
-		log.Warn("event hubs fetch error", "topic", fe.Topic, "partition", fe.Partition, "error", fe.Err)
+		// A FATAL error is logged unconditionally: it closes and rebuilds the
+		// client, which is a transition an operator must see every time. A
+		// scoped one is a persisting state (see kafkaSource.fetchWarn).
+		if isFatal := fatalFetchErr(fe); isFatal {
+			log.Warn("event hubs fetch failed for the whole namespace; the consumer is closed and rebuilt with freshly read credentials",
+				"topic", fe.Topic, "partition", fe.Partition, "error", fe.Err)
+		} else if allow, saturated := warnAllow(warn, fe); allow {
+			log.Warn("event hubs fetch error; kgo retries it and the rest of the namespace keeps streaming",
+				"topic", fe.Topic, "partition", fe.Partition, "error", fe.Err)
+			if saturated {
+				// Once, on the call that fills the table: the list above is
+				// truncated from here on, and an operator reading it has to know
+				// that rather than infer a clean namespace.
+				log.Warn("further event hubs fetch errors from other topics are suppressed; this namespace has more failing partitions than the log throttle holds",
+					"maxKeys", fetchWarnKeys)
+			}
+		}
 		if fatal == nil && fatalFetchErr(fe) {
 			fatal = fmt.Errorf("event hubs fetch (topic %q partition %d): %w", fe.Topic, fe.Partition, fe.Err)
 		}
@@ -249,6 +298,19 @@ func pollResult(fetches kgo.Fetches, log *slog.Logger) (msgs [][]byte, healthy b
 		return nil, false, fatal
 	}
 	return msgs, seen || len(errs) == 0, nil
+}
+
+// warnAllow asks the throttle whether this fetch error may log. A nil table
+// (the direct pollResult tests) always allows: the throttle is a production
+// bound, never a behaviour the caller has to construct to get output.
+func warnAllow(t *logdedupe.Table, fe kgo.FetchError) (allow, saturated bool) {
+	if t == nil {
+		return true, false
+	}
+	// Keyed by topic and partition, NOT by the error text: the text is the
+	// broker's and can vary per attempt (host names, correlation ids), which
+	// would defeat the throttle exactly where it is needed.
+	return t.Allow(fe.Topic + "/" + strconv.Itoa(int(fe.Partition)))
 }
 
 // fatalFetchErr reports a fetch error that only a NEW client can clear, which
@@ -276,6 +338,23 @@ func fatalFetchErr(fe kgo.FetchError) bool {
 	}
 	ke := (*kerr.Error)(nil)
 	return errors.As(fe.Err, &ke) && !ke.Retriable
+}
+
+// topicSelection renders what this client subscribes to: the explicit list, or
+// the regex the default uses.
+func topicSelection(k *KafkaConfig) string {
+	if len(k.Topics) > 0 {
+		return strings.Join(k.Topics, ",")
+	}
+	return "^insights-.* (regex)"
+}
+
+// startOrDefault names where a group with no committed offsets begins.
+func startOrDefault(start string) string {
+	if start == StartBeginning {
+		return StartBeginning
+	}
+	return StartEnd
 }
 
 func (s *kafkaSource) commit(ctx context.Context) error {

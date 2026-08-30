@@ -70,6 +70,7 @@ import (
 	"io"
 	"math"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -123,7 +124,7 @@ func (s *Scraper) scrapeSummary(ctx context.Context) (int, error) {
 
 	body, err := readCapped(resp.Body, maxSummaryBytes)
 	if err != nil {
-		return 0, err
+		return 0, classify(reasonBody, err)
 	}
 	return s.convertSummary(ctx, url, body, time.Now())
 }
@@ -140,13 +141,36 @@ func (s *Scraper) scrapeSummary(ctx context.Context) (int, error) {
 // other per-target complaint (there is nothing new to say until someone edits
 // the ClusterRole).
 func (s *Scraper) reportSummaryRefusal(url string, err error) {
-	var se *kubeletStatusError
+	var se *statusError
 	if !errors.As(err, &se) || se.code != http.StatusForbidden {
 		return
 	}
 	s.warnOnce("summaryrbac:"+s.cfg.Kubelet.Endpoint,
 		`the kubelet refused /stats/summary: it authorizes that endpoint against the nodes/stats subresource, not the nodes/metrics the cadvisor and node scrapes use — add {apiGroups: [""], resources: ["nodes/stats"], verbs: ["get"]} to the agent ClusterRole`,
 		"url", url)
+}
+
+// reportKubeletRefusal is the same idea for the two nodes/metrics endpoints,
+// which had no equivalent: a 401 or 403 on /metrics/cadvisor is the ONE
+// first-contact failure that takes down both kubelet pipelines on every node at
+// once, and "status 403" alone does not distinguish a missing ClusterRole rule
+// from a token the kubelet would not accept — which is the whole diagnosis.
+//
+// Keyed on the endpoint and the code, so a 401 arriving after a 403 has been
+// reported still says so; once per process, like every other complaint about
+// something an operator has to go and edit.
+func (s *Scraper) reportKubeletRefusal(pipeline, url string, err error) {
+	var se *statusError
+	if !errors.As(err, &se) || (se.code != http.StatusForbidden && se.code != http.StatusUnauthorized) {
+		return
+	}
+	note := `the agent ClusterRole needs {apiGroups: [""], resources: ["nodes/metrics"], verbs: ["get"]}, bound to this agent's ServiceAccount`
+	if se.code == http.StatusUnauthorized {
+		note = "the kubelet did not accept the token at -kubelet-token-file at all: check that the ServiceAccount token is projected and that the kubelet runs with --authentication-token-webhook"
+	}
+	s.warnOnce("kubeletauth:"+s.cfg.Kubelet.Endpoint+":"+pipeline+":"+strconv.Itoa(se.code),
+		"the kubelet refused the scrape",
+		"pipeline", pipeline, "url", url, "status", se.code, "tokenFile", s.cfg.Kubelet.TokenFile, "note", note)
 }
 
 // readCapped reads r whole, refusing a body over limit. The limit+1 read is
@@ -375,9 +399,11 @@ func (sb *summaryBatcher) addNode(body []byte) error {
 		// stay consistent with every other pipeline's — but an agent scraping
 		// another node's kubelet attributes that node's filesystems to itself,
 		// and nothing else in the payload says so.
+		// The key is the endpoint; the REPORTED name is document content and
+		// rides clipped, per warnOnce's key rule.
 		sb.s.warnOnce("summarynode:"+sb.url,
 			"the kubelet's /stats/summary reports a different node than this agent's -node; its statistics are being exported under this agent's node",
-			"reported", reported, "node", sb.s.cfg.Node, "url", sb.url)
+			"reported", clipForLog(reported), "node", sb.s.cfg.Node, "url", sb.url)
 	}
 	t := summaryTarget{node: true}
 	// Three filesystems, three metric families, deliberately not one family with

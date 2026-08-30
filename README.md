@@ -14,6 +14,17 @@ Two cooperating services:
   an [OpenTelemetry collector](https://github.com/open-telemetry/opentelemetry-collector-contrib),
   enriched with resource attributes fetched from the metadata service.
 
+**Installing for the first time? Start with
+[docs/FIRST-RUN.md](docs/FIRST-RUN.md)** — the pre-flight checklist, the
+smallest useful configuration, what to watch in the first ten minutes (with
+the PromQL), a symptom→cause table, and which counters are worth an alert.
+
+**Security posture**, and the residuals this project deliberately does *not*
+close — a stolen `container.id` on the unauthenticated ingest listeners, a
+peer-driven grpc warning class, a chart schema that cannot express a conditional
+requirement, and floating base-image tags — are in
+[docs/CONFIGURATION.md#accepted-security-residuals](docs/CONFIGURATION.md#accepted-security-residuals).
+
 Full flag and config-file reference with examples:
 [docs/CONFIGURATION.md](docs/CONFIGURATION.md); the exhaustive generated
 per-binary flag inventory: [docs/FLAGS.md](docs/FLAGS.md). Every
@@ -276,7 +287,24 @@ and is NOT scraped`, a monitor endpoint keeps its resolution and gains the same
 note, and the document's `cappedTargets` counts them — the same refusals
 `kubescrape_scrape_targets_capped_total` counts on the served path. The ceiling
 binds across every door at once, so a pod annotation and a Service each
-individually under it can still overflow together. Always answers 200 with a JSON document (a missing pod is
+individually under it can still overflow together.
+
+The **document itself is bounded**, because this route is unauthenticated and
+everything in it is derived from tenant-authored objects: the Services, port
+entries, declared ports and monitor endpoints are capped per list *and* per
+document, and an echoed annotation value is clipped to 512 bytes. Nothing is
+dropped silently — every refusal is counted into a sibling
+`…NotShown` field (`servicesNotShown`, `portEntriesNotShown`,
+`declaredPortsNotShown`, `serviceMonitorsNotShown`, `podMonitorsNotShown`),
+because "which of my monitors stopped contributing?" is answered *wrong* by a
+short list that looks complete. The caps are ceilings on the pathological, not
+budgets for the normal: the served ceiling above all of them is
+`scrape.MaxPortsPerPod` = 16 targets. No counter moves and no line is logged
+for a truncation either — the pathologies that reach these bounds are already
+counted where they are *derived*, and a log line per unauthenticated request
+would be the amplifier this endpoint is being bounded against.
+
+Always answers 200 with a JSON document (a missing pod is
 `"found": false` plus a hint), so `curl -s .../v1/explain/team-a/api-6f9c…-x2 | jq .`
 is the whole workflow. Diagnostic and read-only: no counters move.
 
@@ -356,6 +384,32 @@ They carry no `internal/` dependencies, so they are usable outside this module.
 
 ## Running
 
+**Building needs Go 1.26.6 or newer.** That is a security floor, not a
+language one: `go.mod` names it because it is the version that fixes the ten
+reachable standard-library advisories `govulncheck` reported at the previous
+`1.26.3` (six of which have no earlier fix — see
+[Toolchain and build floor](docs/CONFIGURATION.md#toolchain-and-build-floor)
+for the list and what each is reached from). An older toolchain either
+upgrades itself (`GOTOOLCHAIN=auto`, the default) or refuses to build, so it
+cannot silently produce a vulnerable binary — but the guarantee holds only
+for the Go half: the container base images float on tags rather than digests.
+
+**Both binaries set a Go soft memory limit at startup, from their own
+container's cgroup memory limit (90% of it). There is no flag.** The GC sizes
+the next collection off the *live* heap and knows nothing about the cgroup, so
+a workload whose live heap is small and whose transient burst is large — the
+agent's scrape cycle takes `heap_alloc` from ~9 MB to ~58 MB every
+`-scrape-interval` — has a heap goal that tracks whatever it happens to be
+holding, and a cycle needing more than `limits.memory` is not collected harder,
+it is OOMKilled. A soft limit can only make the GC run *earlier*, so it is pure
+tail insurance: measured at 19.70 GC cycles per GB in both arms when it does
+not bind. An **uncapped** workload gets nothing and that is deliberate — the
+metadata service ships with no `limits.memory` because its footprint scales
+with the cluster. `GOMEMLIMIT` in the environment overrides it; `GOGC` is left
+alone; `GOMAXPROCS` needs nothing, Go having derived it from a cpu limit since
+1.25. See
+[Runtime memory and CPU](docs/CONFIGURATION.md#runtime-memory-and-cpu-gomemlimit-gomaxprocs).
+
 ```sh
 make build           # or: go build ./cmd/kubescrape
 ./bin/kubescrape -listen :8080 -wait-timeout 5s -cache-ttl 5m
@@ -411,39 +465,55 @@ container-ID lookup and telemetry arriving at the collector.
 
 ### Build variants (optional pipelines)
 
-Two **agent** pipelines are behind Go build tags, and the Makefile carries the
+Three **agent** pipelines are behind Go build tags, and the Makefile carries the
 default set — so `make build`, `make test` and `make image` produce exactly the
 binaries and image they always have:
 
 ```sh
-TAGS ?= journald,azure
+TAGS ?= journald,azure,events
 ```
 
-| Build | Contains | Costs / saves |
-|-------|----------|---------------|
-| `make build` | both | today's binaries: agent is `CGO_ENABLED=1`, dynamically linked |
-| `make build TAGS=azure` | Azure only | **no journald ⇒ no cgo**: the agent links statically and needs no libsystemd |
-| `make build TAGS=journald` | journald only | **no franz-go**: 11 packages, ≈5 MB off the stripped binary |
-| `make build TAGS=` | neither | both of the above |
+| Build | Drops | Costs / saves |
+|-------|-------|---------------|
+| `make build` | — | today's binaries: agent is `CGO_ENABLED=1`, dynamically linked |
+| `make build TAGS=azure,events` | journald | **no cgo**: the agent links statically and needs no libsystemd |
+| `make build TAGS=journald,events` | azure | **no franz-go**: 11 packages, ≈5 MB off the stripped binary |
+| `make build TAGS=journald,azure` | events | **no client-go**: 926 → 470 dependency packages (`k8s.io/`+`sigs.k8s.io/` 412 → 8), **−31.4 MiB (−55.6%)** off the stripped agent |
+| `make build TAGS=` | all three | all of the above: 21.0 MB instead of 59.1 MB |
 
 `journald` is the only reason the agent needs cgo (it links libsystemd through
 `coreos/go-systemd/sdjournal`); without that tag both binaries are static, which
 is what [Dockerfile.static](Dockerfile.static) / `make image-static` uses to put
 them on `distroless/static` instead of `distroless/base` plus seven copied `.so`
 files. `azure` is the Event Hubs (Kafka) consumer, which only ever runs in the
-single-replica Deployment yet ships in every DaemonSet image. `make verify-tags`
-asserts both exclusions actually happen.
+single-replica Deployment yet ships in every DaemonSet image. `events` is the
+same argument at six times the size: the events watch and its leader election
+are the *only* reason this binary links `k8s.io/client-go` at all — the agent is
+otherwise documented, correctly, as talking to no Kubernetes API — and they cost
+**half the stripped binary** on every node for a pipeline that (like `azure`)
+only ever runs in the singleton Deployment. `make verify-tags` asserts all three
+exclusions actually happen, which is what turns "the agent talks to no
+Kubernetes API" from prose into something a build can fail on.
+
+> **The −31.4 MiB is an option, not a delivery.** `TAGS` still defaults to
+> all three, so `make image` ships exactly the binaries it always did. And
+> the image carries *both* binaries, of which the metadata service
+> legitimately links client-go, so dropping `events` takes the image's
+> binary payload from **112.98 MB to 80.09 MB (−29.1%)** rather than
+> halving it. Figures re-measured 2026-08-29 on go1.26.6 with
+> `-trimpath -ldflags="-s -w"`, two byte-identical builds per arm.
 
 > **A bare `go build ./cmd/kubescrape-agent/` passes no tags and therefore
-> builds an agent with NEITHER pipeline.** That is the price of a default that
+> builds an agent with NONE of the three.** That is the price of a default that
 > lives in the Makefile rather than in the source; build through `make`, or pass
-> `-tags` yourself. Such a binary still *defines* `-journald` and
-> `-azure-diagnostics` — the manifests pass them, and a missing flag would be
-> `flag provided but not defined` + exit 2 — but enabling one is a startup error
-> naming the tag, which `-check-config` reports too. Every build says which one
-> it is on its first log line (`optionalPipelines=journald,azure`, or `(none)`).
-> The `-config` file is unaffected: no section belongs to either pipeline, so one
-> ConfigMap stays valid for every variant.
+> `-tags` yourself. Such a binary still *defines* `-journald`,
+> `-azure-diagnostics` and `-events` — the manifests pass them, and a missing
+> flag would be `flag provided but not defined` + exit 2 — but enabling one is a
+> startup error naming the tag, which `-check-config` reports too. Every build
+> says which one it is on its first log line
+> (`optionalPipelines=journald,azure,events`, or `(none)`). The `-config` file is
+> unaffected: no section belongs to any of them, so one ConfigMap stays valid for
+> every variant.
 
 ## The node agent
 
@@ -878,7 +948,11 @@ payload marks itself as owned and is spooled like any log batch; a third queue
 metric batches of at most `-metrics-batch-size` data points (default 10 000),
 each exported and released before parsing continues, so a target exposing
 100k+ series never resides in memory (measured: ~28 MB agent RSS while
-continuously scraping a 100 000-series endpoint). Conversion is type-faithful:
+continuously scraping a 100 000-series endpoint — a **metrics-only** agent
+with the log tailer off, which is the configuration this claim is about; a
+DaemonSet running the default pipelines sits near 70 MB, and
+`internal/agent/otlpexport/gzip.go` argues its one warm codec slot against
+that larger figure). Conversion is type-faithful:
 counters become cumulative monotonic sums; histogram families
 (`_bucket`/`_sum`/`_count`) are grouped per label set into proper OTLP
 **Histogram** data points (de-cumulated bucket counts, explicit bounds);
@@ -1451,7 +1525,31 @@ ANDed), by signal (`signal=logs|metrics|traces`) and downsampled
 (`sample=10`), with a built-in page at
 `/debug/otlp/ui`; it costs one atomic load per export until a client
 attaches, and a slow client drops (counted on its own stream) rather than
-ever back-pressuring delivery.
+ever back-pressuring delivery. Attaching and detaching a stream is logged at
+Info, and a stream refused by the four-session cap at Warn: each attached
+stream renders every exported payload on the exporting goroutine, so a
+forgotten session is a standing cost worth being able to find in the log.
+
+**The data-bearing three are gated.** `/debug/otlp`, `/debug/otlp/ui` and
+`/debug/tailer` are the node's telemetry feed and the list of files behind it,
+and this port is reachable from every pod in the cluster — so without
+`-debug-token-file` they are served only to a **local** connection
+(`kubectl port-forward`, which the kubelet implements by dialling `127.0.0.1`
+inside the pod, or a container in the agent's own pod). Set that flag to read
+them from anywhere else with `Authorization: Bearer <token>`; it re-reads and
+rotates like `-scrape-auth-token-file`, and the chart wires it for all three
+agent-binary workloads from one value
+(`agent.debug.tokenSecret.name`). A local request must **also** send a loopback
+`Host` (`localhost`, `127.0.0.1`, `::1`, or none) — every client that dialled
+the port directly does, and a browser page whose DNS name has been rebound onto
+an operator's own port-forward does not, which is the one part of that attack
+it cannot launder; a valid token skips both local checks. Refusals name the flag
+and count `kubescrape_debug_refused_total{reason}` — `no_token`,
+`unauthenticated`, `forwarded`, `host`, each naming a different fix — and every
+start (and `-check-config`) reports the posture as `debugAccess=local-only` or
+`=token`. `/healthz`, `/readyz`, `/debug`, `/debug/targets` and
+`/debug/transforms` stay open: probes must answer, and that state is what `/v1`
+already serves unauthenticated.
 
 **Three separate listeners.** `-listen` carries health and the `/debug`
 surface; `-metrics-listen` (default `:9090`) serves the Prometheus
@@ -1461,7 +1559,11 @@ surface; `-metrics-listen` (default `:9090`) serves the Prometheus
 default) serves
 `net/http/pprof`. Profiles expose goroutine stacks and heap contents, so the
 port carrying them is the one to firewall or bind to localhost — which is why
-it is a port of its own.
+it is a port of its own. (`-listen` is the other one worth a NetworkPolicy —
+`agent.debug.allowFrom` in the chart — even though its data-bearing surfaces are
+gated above: everything else there is process state, but the gate is the
+guarantee, not the network. Read that value's comment first: the policy scopes a
+port, not a path, and `/healthz`+`/readyz` share it with the debug routes.)
 
 **Metric filtering and splitting** (`metrics` section). This section has two
 subsections. `pipelines` holds ordered keep/drop rules per pipeline
@@ -1650,9 +1752,21 @@ routing:
 `-otlp-bearer-token-file` (re-read periodically) authenticates either
 transport; `-otlp-tls-ca-file`/`-otlp-tls-insecure-skip-verify` control TLS;
 metric exports retry with `-otlp-retry-attempts`/`-otlp-retry-backoff`
-(logs already retry through the tailer's rewind). Both binaries take
-`-log-level` and `-log-format` (text/json), and the metadata service routes
-client-go's klog output through the same handler.
+(logs already retry through the tailer's rewind).
+
+**Logging.** Both binaries take `-log-level` (`debug`/`info`/`warn`/`error`)
+and both log **logfmt and only logfmt** — there is no format flag, so one
+parser reads every line every component emits, and both route client-go's klog
+output through the same handler. `info` is quiet in steady state by
+construction: every condition that can persist is throttled, so a healthy
+process produces a build-identity line, five `effective …` lines describing
+what it will actually do, a readiness line, and then nothing.
+Levels, the key vocabulary to grep for, how to raise the level safely, and
+what is deliberately never logged (secrets; per-item lines on the
+allocation-pinned hot paths) are in
+[docs/CONFIGURATION.md#logging](docs/CONFIGURATION.md#logging).
+**Upgraders:** `-log-format` is *gone*, not ignored — a leftover one in
+`extraArgs` is `flag provided but not defined` and exit 2.
 
 ## Helm chart
 

@@ -50,14 +50,12 @@ func RegisterOTLPFlags(fs *flag.FlagSet, endpointHelp string) *OTLPFlags {
 
 // ObsFlags holds the values behind the shared process-observability flag
 // block: the metrics and pprof listeners of the three-listener story, the
-// self-metrics cadence, and the process logger's level/format (NewLogger
-// consumes the last two).
+// self-metrics cadence, and the process logger's level (NewLogger consumes it).
 type ObsFlags struct {
 	MetricsListen       *string
 	PprofListen         *string
 	SelfMetricsInterval *time.Duration
 	LogLevel            *string
-	LogFormat           *string
 }
 
 // RegisterObsFlags registers the shared observability flags on fs. The two
@@ -73,7 +71,10 @@ func RegisterObsFlags(fs *flag.FlagSet, binary, listenServes string) *ObsFlags {
 			"listen address for net/http/pprof under /debug/pprof, on its own port (empty disables). Off by default and separate from -listen and -metrics-listen: profiles expose goroutine stacks and heap contents, so this is the port to firewall or bind to localhost"),
 		SelfMetricsInterval: fs.Duration("self-metrics-interval", time.Minute,
 			"export the "+binary+"'s own metrics over OTLP at this interval (0 disables)"),
-		LogLevel:  fs.String("log-level", "info", "log level: debug, info, warn, error"),
-		LogFormat: fs.String("log-format", "text", "log format: text or json"),
+		// There is no -log-format. The process logs logfmt, always: one format
+		// means every consumer parses the same bytes, and it means the format's
+		// correctness is a property internal/cli holds (see NewLogfmtHandler)
+		// rather than a per-deployment choice between two half-checked ones.
+		LogLevel: fs.String("log-level", "info", "log level: debug, info, warn, error. Output is logfmt (key=value), always — there is no format flag"),
 	}
 }

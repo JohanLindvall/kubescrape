@@ -170,7 +170,7 @@ func TestScopedFetchErrorsAreNotFatal(t *testing.T) {
 		{"group session", errFetch("", 0, &kgo.ErrGroupSession{Err: kerr.RebalanceInProgress})},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			msgs, healthy, err := pollResult(tc.fetches, log)
+			msgs, healthy, err := pollResult(tc.fetches, log, nil)
 			if err != nil {
 				t.Fatalf("err = %v, want nil: a rebuilt client cannot fix this and the LeaveGroup takes every other hub with it", err)
 			}
@@ -201,7 +201,7 @@ func TestUnscopedFatalFetchErrorsFailThePoll(t *testing.T) {
 		{"client closed", errFetch("", -1, kgo.ErrClientClosed), kgo.ErrClientClosed},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			msgs, healthy, err := pollResult(tc.fetches, log)
+			msgs, healthy, err := pollResult(tc.fetches, log, nil)
 			if err == nil {
 				t.Fatal("a cluster-wide failure must fail the poll and reach the reopen arm")
 			}
@@ -228,7 +228,7 @@ func TestRecordsAndCleanFetchesAreHealthy(t *testing.T) {
 			{Partition: 1, Err: kerr.NotLeaderForPartition},
 		},
 	}}}}
-	msgs, healthy, err := pollResult(partial, log)
+	msgs, healthy, err := pollResult(partial, log, nil)
 	if err != nil || !healthy {
 		t.Fatalf("errors beside records: healthy=%v err=%v, want healthy and nil", healthy, err)
 	}
@@ -236,7 +236,7 @@ func TestRecordsAndCleanFetchesAreHealthy(t *testing.T) {
 		t.Fatalf("msgs = %q, want the fetched record kept", msgs)
 	}
 
-	if msgs, healthy, err = pollResult(kgo.Fetches{}, log); err != nil || !healthy || len(msgs) != 0 {
+	if msgs, healthy, err = pollResult(kgo.Fetches{}, log, nil); err != nil || !healthy || len(msgs) != 0 {
 		t.Fatalf("clean empty fetch: msgs=%v healthy=%v err=%v, want empty, healthy and nil", msgs, healthy, err)
 	}
 }

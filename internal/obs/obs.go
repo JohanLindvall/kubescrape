@@ -38,6 +38,45 @@ var (
 		"Log records dropped after a definitive collector rejection (retrying could not succeed; offsets advanced so the pipeline survives).")
 	LogFiles = Registry.Gauge("kubescrape_log_files",
 		"Log files currently tracked.")
+	// LogFilesUnresolved answers the operator's first question — "why is this
+	// pod's log missing?" — for the half of the answers that live INSIDE the
+	// tailer. A tracked file is never read before it can be attributed, so a
+	// file whose container metadata will not resolve produces nothing at all
+	// while every other log metric looks healthy: the file is tracked
+	// (kubescrape_log_files counts it), no byte is read
+	// (kubescrape_log_bytes_total does not move for it) and nothing is lost
+	// (the data waits on disk). A value that stays above zero for longer than a
+	// container's first seconds means the metadata service is unreachable or
+	// the containers are unknown to it; the tailer names the waiting files in a
+	// throttled warning and on GET /debug/tailer.
+	LogFilesUnresolved = Registry.Gauge("kubescrape_log_files_unresolved",
+		"Tracked log files whose metadata has not resolved yet, so nothing is read from them (their content waits on disk and is not lost).")
+	// LogFilesSkipped is the OTHER half of that question: a file the discovery
+	// pass saw and deliberately did not track. Every one of these was silent by
+	// design, so an operator whose pod produced no logs had nothing to look at
+	// — the file simply never appeared anywhere. Counted ONCE PER FILE per
+	// reason (not once per discovery pass, which runs every couple of seconds),
+	// so a rate is "files newly skipped", and a file that changes reason counts
+	// again under the new one. The matching Debug line names the path.
+	LogFilesSkipped = Registry.CounterVec("kubescrape_log_files_skipped_total",
+		"Log files seen by discovery and deliberately not tracked, by reason: source_exclude (the source's exclude "+
+			"globs), excluded_namespace (-logs-exclude-namespaces or the source's excludeNamespaces), "+
+			"namespace_not_selected (the source's namespaces allowlist; another source may still claim the file), "+
+			"unparseable_name (not a CRI <pod>_<namespace>_<container>-<id>.log name), too_old (the source's "+
+			"ignoreOlder cutoff), non_regular (a FIFO/socket/device, never opened because the open would block the "+
+			"sweep goroutine node-wide) and stat_error (the path was listed but could not be stat'd — an EACCES or "+
+			"EIO here is a genuine collection failure, not a selection). Counted once per file per reason.", "reason")
+	// LogMetadataBudgetExhausted is promscrape's ScrapeMetaBudgetExhausted one
+	// pipeline over, and it exists for the same reason: a metadata lookup can
+	// BLOCK server-side for the whole -metadata-wait, every file on the node is
+	// resolved by the SINGLE sweep goroutine, and past the sweep's shared
+	// resolve budget files are simply not reached. No request is issued, so
+	// kubescrape_metadata_requests_total cannot move, and the files stay
+	// unresolved with nothing at all to show for it. Counted ONCE PER SWEEP
+	// (not once per unreached file) so a rate is comparable with the sweep
+	// cadence.
+	LogMetadataBudgetExhausted = Registry.Counter("kubescrape_log_metadata_budget_exhausted_total",
+		"Tailer sweeps that ran out of their shared metadata-resolution budget, leaving files unresolved and unread until a later sweep (nothing is lost; a sustained rate means the metadata service is slow or unreachable).")
 	LogRotations = Registry.Counter("kubescrape_log_rotations_total",
 		"Log file rotations and truncations handled.")
 	LogPrefixLost = Registry.Counter("kubescrape_log_prefix_lost_total",
@@ -120,6 +159,50 @@ var (
 	// path: the RATE is the signal, not the absolute value.
 	MonitorTargetShadowed = Registry.CounterVec("kubescrape_monitor_target_shadowed_total",
 		"Monitor endpoints whose auth/TLS conflicts with the monitor already holding the same URL on that pod (the holder's is served; the rest of the endpoint's configuration still merges).", "kind")
+	// MonitorRelabelChainCapped counts monitor endpoints whose
+	// metricRelabelings were only PARTLY folded into the target holding their
+	// URL, because the merged chain reached scrape.MaxRelabelChainRules /
+	// MaxRelabelChainBytes. Series the refused rules asked to keep or drop are
+	// therefore NOT filtered, which is invisible in the data — the metrics
+	// simply arrive.
+	//
+	// The ceiling exists because the chain is tenant-supplied, is copied into
+	// every served target (so it multiplies through the node-targets document
+	// the metadata singleton marshals in one piece) and is walked per sample by
+	// every agent that scrapes the target. Two monitors' chains concatenate, so
+	// N monitors colliding on one URL multiply it; the per-endpoint half of the
+	// bound lives in internal/servicemonitors and reports itself through
+	// kubescrape_monitor_fields_ignored_total instead.
+	//
+	// A nonzero rate means either a genuinely enormous chain (fix the CR) or
+	// several monitors piling onto one URL (reconcile them). Counted per served
+	// targets request, like every other decision on that path: the RATE is the
+	// signal, not the absolute value.
+	MonitorRelabelChainCapped = Registry.CounterVec("kubescrape_monitor_relabel_chain_capped_total",
+		"Monitor endpoints whose metricRelabelings were partly refused because the merged chain for that scrape URL is at the per-target ceiling (the rules that fit are applied; the rest filter nothing).", "kind")
+	// MonitorContributorsCapped counts monitor endpoints whose configuration
+	// merged into the target already holding their URL but whose monitor NAME
+	// was refused from that target's contributor list (the wire-visible
+	// `monitors` field), because the list is at
+	// scrape.MaxContributorsPerTarget.
+	//
+	// The SCRAPE is unaffected — the endpoint's relabel rules, cadence and
+	// auth merged — so this is a loss of ATTRIBUTION, which is exactly why it
+	// needs a counter: nothing in the served document or in the collected
+	// metrics can reveal it. It is a separate series from
+	// kubescrape_monitor_relabel_chain_capped_total because it is a separate
+	// bound with a separate remedy, and because it binds on the cheaper
+	// attack: a contribution costs a finer `interval` and no relabel rules at
+	// all, so N colliding monitors reached the contributor list unbounded
+	// while both relabel bounds stayed silent.
+	//
+	// A nonzero rate means many monitors resolve to one URL on one pod —
+	// reconcile them; /v1/explain names the pod's monitors and says which
+	// stopped being listed. Counted per served targets request, like every
+	// other decision on that path: the RATE is the signal, not the absolute
+	// value.
+	MonitorContributorsCapped = Registry.CounterVec("kubescrape_monitor_contributors_capped_total",
+		"Monitor endpoints whose configuration merged into the target holding their URL but whose monitor name was refused from that target's contributor list at the per-target ceiling (attribution only; the scrape is unaffected).", "kind")
 	// ScrapeTargetsCapped counts scrape targets REFUSED because one pod
 	// already produced scrape.MaxPortsPerPod of them. Every ScrapeTarget
 	// embeds the whole pod document, so N targets carry N copies of the pod's
@@ -170,7 +253,51 @@ var (
 	// and reusing the name for a failure cause would make one label mean two
 	// unrelated things across metrics an operator reads together.
 	ScrapeAuthFailures = Registry.CounterVec("kubescrape_scrape_auth_failures_total",
-		"Failed /v1/scrape-auth Secret resolutions by cause (not_found = no such Secret or key; upstream = forbidden, timeout or unreachable API server; not_utf8 = value cannot be served as a JSON string).", "reason")
+		"/v1/scrape-auth requests that did NOT yield a credential, by cause — every one of them means a monitor "+
+			"endpoint is about to be scraped without the auth or TLS material its CR declares, i.e. up=0 for that "+
+			"target, and the agent sees only a status code. not_found = no such Secret or key; upstream = "+
+			"forbidden, timeout or unreachable API server (the one to alert on); not_utf8 = value cannot be "+
+			"served as a JSON string; disabled = this service does not run -scrape-auth-secrets, so it serves no "+
+			"credentials at all; no_monitors = -servicemonitors is off, so nothing can be allowlisted; "+
+			"unauthorized = missing or wrong bearer token, which is what a -scrape-auth-token-file mismatch "+
+			"between the agents and this service looks like; not_allowed = the ref is not referenced by any "+
+			"INDEXED monitor endpoint (the monitor failed to parse, was refused by -monitor-namespaces, or the "+
+			"ref is a typo); bad_request = a path segment that cannot name a Kubernetes object. Each cause also "+
+			"logs, throttled, naming the ref or the peer.", "reason")
+	// ContainerLookupTimeouts is the container endpoint's ATTRIBUTION-failure
+	// signal, and it is deliberately separate from the 404 it produces.
+	//
+	// kubescrape_http_requests_total{pattern="/v1/containers",code="404"} counts
+	// an instant miss and a lookup that blocked for the whole -wait-timeout
+	// identically, and the two mean opposite things: the first is the agent
+	// asking about a container this replica has never heard of (an id from a
+	// rotated log file, a pod on another node), while the second is the store
+	// failing to learn about a container the agent is holding log lines for
+	// RIGHT NOW — one blocked-lookup slot spent per occurrence, and the lines
+	// stay unattributed until it resolves.
+	ContainerLookupTimeouts = Registry.Counter("kubescrape_container_lookup_timeouts_total",
+		"Blocking container lookups whose wait budget expired without the container ID appearing in the store. A "+
+			"low rate is normal (the wait covers the ~1s gap between a container starting and the kubelet posting "+
+			"its ID, and a rotated log file's id may never come back); a SUSTAINED rate means this replica's pod "+
+			"informer is not seeing the pods whose logs the agents are shipping — check kubescrape_apiserver_reachable "+
+			"and the pod informer's RBAC. The throttled WARN beside it names one example container id. Requests "+
+			"that never blocked (?wait=0, the cadvisor and ingest pollers) are not counted here, and a client that "+
+			"disconnects mid-wait is not either.")
+	// SelfLookupRefused splits the /v1/self 404s that
+	// kubescrape_http_requests_total cannot tell apart. The answer is an
+	// IDENTITY, so each refusal has a different remedy and the agent's own
+	// counter (kubescrape_self_metadata_lookups_total{outcome="by_name"}) only
+	// says that the fallback ran, never why.
+	SelfLookupRefused = Registry.CounterVec("kubescrape_self_lookups_refused_total",
+		"GET /v1/self requests answered 4xx instead of an identity, by reason. no_pod = the connection's source "+
+			"address owns no live pod, which is EXPECTED and permanent for a hostNetwork agent (it shares the node "+
+			"address) and for one behind SNAT — those fall back to a lookup by name and are fine; forwarded = the "+
+			"request carried Forwarded/X-Forwarded-For/X-Real-Ip, so kubescrape refuses to attribute a connection "+
+			"a hop declared is not its caller's (a service mesh adding the header in the caller's own network "+
+			"namespace lands here too, at the cost of one extra by-name lookup per -self-attributes-refresh); "+
+			"unparseable_peer = the connection had no readable address, which should not happen and is warned. A "+
+			"fleet-wide no_pod rate with self-metrics still carrying pod attributes is the by-name fallback "+
+			"working; the same rate with kubescrape_self_metadata_resolved at 0 is not.", "reason")
 	// InformerWatchErrors counts the list/watch failures the reflector REPORTS
 	// to its error handler — a strictly smaller set than "the watch is
 	// unhealthy", and the difference is the point of this comment.
@@ -209,6 +336,68 @@ var (
 	// should not.
 	InformerWatchErrors = Registry.CounterVec("kubescrape_informer_watch_errors_total",
 		"List/watch failures the informers REPORT, by resource: the refusals the API server ANSWERS (revoked RBAC, a deleted CRD, a rejected watch), plus any relist that fails. It does NOT reliably move while the API server is UNREACHABLE — client-go retries a refused watch internally and never relists, so this stayed flat through outages of up to five minutes — so alert on kubescrape_apiserver_reachable for that half.", "resource")
+
+	// OwnerResolveFailures is internal/owners' ONE signal, and until it existed
+	// that package had none at all — no metric, no log, at any level.
+	//
+	// The owner chain is not decoration: attrs.ServiceName derives service.name
+	// from the workload owner, so a Deployment whose metadata cannot be read
+	// leaves every one of its pods described by its POD NAME instead, which
+	// changes half the Prometheus job of every series the fleet exports for it.
+	// The resolver answers a failed read by returning nil and appending the bare
+	// owner reference, which renders as a perfectly well-formed response — so a
+	// missing RBAC rule, a metadata informer that never synced, or a lister
+	// wired for the wrong type degraded attribution CLUSTER-WIDE while every
+	// counter in the process stayed flat.
+	//
+	// Read the reasons, not the total: they are not equally alarming.
+	// not_found is the only one that is ever normal (a pod tombstone outliving
+	// its deleted owner, or an informer still filling), so a low steady rate
+	// there is expected and a SUSTAINED high one means the owner informer is
+	// not seeing objects the pods reference — check the ClusterRole and
+	// kubescrape_informer_watch_errors_total. lister_error, no_informer and
+	// wrong_type are never normal: they are a broken cache or a wiring bug, and
+	// each carries a throttled Warn naming the object. bad_api_version and
+	// uid_mismatch are per-object oddities (a malformed ownerReference; an
+	// owner deleted and recreated under its old name) that cost that one pod
+	// its owner's labels.
+	OwnerResolveFailures = Registry.CounterVec("kubescrape_owner_resolve_failures_total",
+		"Owner-chain and namespace/node metadata reads that did NOT yield the object's metadata, by kind "+
+			"(ReplicaSet, Deployment, StatefulSet, DaemonSet, Job, CronJob, Namespace, Node) and reason. The "+
+			"affected pod is still served — with the bare owner reference and no owner labels or annotations — so "+
+			"nothing fails visibly while service.name, the workload labels and half the Prometheus job silently "+
+			"degrade. not_found = the object is not in the informer cache (normal at a low rate: a deleted owner "+
+			"under a pod tombstone, or a cache still filling; sustained means the informer is not seeing it); "+
+			"lister_error = the cache returned an error other than NotFound (the RBAC-shaped case — alert on "+
+			"this one); no_informer = no metadata informer is wired for that resource at all (a wiring bug: the "+
+			"kind is in owners.AllGVRs but main did not start it); wrong_type = the cached object is not "+
+			"PartialObjectMetadata (a wiring bug); bad_api_version = the ownerReference's apiVersion does not "+
+			"parse, so the reference can never match a watched kind; uid_mismatch = an object of that name IS "+
+			"cached but under a different UID, so it is refused rather than lending a recreated owner's labels "+
+			"to the old reference; owners_capped = the object named more owners than owners.MaxOwners serves, so "+
+			"the tail of its chain is not described (the served document says so through pod.ownersOmitted). The "+
+			"three wiring/RBAC reasons also log, throttled per object; owners_capped logs once per resolution "+
+			"through a keyless throttle.", "kind", "reason")
+
+	// MetadataAnnotationsOmitted counts objects whose annotations this API
+	// served SHORT — kubemeta.MaxAnnotationValueBytes refused an oversized
+	// value, or kubemeta.MaxAnnotationBytes refused the tail of an oversized
+	// set.
+	//
+	// It exists because the ceiling is otherwise invisible from outside one
+	// document: a pod, an owner or a namespace that quietly stopped carrying an
+	// attribution annotation looks exactly like one that never had it, and the
+	// thing an operator notices is a resource attribute that stopped being
+	// stamped weeks after the annotation was added. The served document is
+	// truthful on its own (kubemeta.OmittedAnnotation names what went), but a
+	// document nobody reads is not a signal.
+	//
+	// The kind label is the OBJECT's, bounded by owners.AllGVRs plus Pod and
+	// Service — never an ownerReference's own Kind, which names arbitrary CRDs.
+	// Any nonzero value is worth looking at: on a cluster whose deploy-tool
+	// blobs are already dropped, no real object comes close to either ceiling.
+	MetadataAnnotationsOmitted = Registry.CounterVec("kubescrape_metadata_annotations_omitted_total",
+		"Objects whose annotations were served SHORT, by kind: a single value over kubemeta.MaxAnnotationValueBytes, or a set over kubemeta.MaxAnnotationBytes. Every ScrapeTarget embeds the whole pod document — the pod's annotations, its namespace's and one set per resolved owner — so an unbounded annotation set is an unbounded response on the route every agent polls each scrape cycle. The served object names the omitted keys in its own kubescrape.io/annotations-omitted annotation; nothing else is truncated and no value is ever served shortened.", "kind")
 
 	// BufferTruncated counts bytes the disk buffer lost to damage discovered
 	// at OPEN (truncated tails, dropped or foreign segments — diskqueue's
@@ -302,6 +491,46 @@ var (
 		"Scrapes by pipeline and outcome.", "pipeline", "outcome")
 	ScrapeDuration = Registry.HistogramVec("kubescrape_scrape_duration_seconds",
 		"Scrape duration by pipeline.", nil, "pipeline")
+	// The breakdown of kubescrape_scrapes_total{outcome="error"}. A separate
+	// family rather than more `outcome` values on that one, because the two
+	// answer different questions and are read at different times: the outcome
+	// label is the up/down ratio a dashboard plots, this is what an operator
+	// looks at once the ratio is already wrong. Their sums agree by
+	// construction (both move from the same place, once per scrape).
+	ScrapeFailures = Registry.CounterVec("kubescrape_scrape_failures_total",
+		"Failed scrapes by pipeline and CAUSE — the number to look at first when targets are up=0, because the "+
+			"reasons take different remedies and several are not the target's fault at all. The target could not "+
+			"be REACHED: dns (the name does not resolve), connect (refused, unreachable, or the connection was "+
+			"reset), tls (the certificate did not verify, the name did not match, or the port speaks plaintext), "+
+			"timeout (the scrape budget expired - raise -scrape-timeout, or the endpoint is slow) and canceled "+
+			"(the agent is shutting down; not a fault). The target ANSWERED and refused: unauthorized (401 or "+
+			"403 - a missing credential, or for the kubelet pipelines a missing RBAC rule; the accompanying warn "+
+			"names which) and status (any other non-200). The scrape never left this agent: auth (a bearer, "+
+			"basicAuth or TLS secret ref could not be resolved - the metadata service needs -scrape-auth-secrets "+
+			"and this agent a matching token file) and relabel (a monitor's metricRelabelings regex would not "+
+			"compile; the scrape fails deliberately rather than export what the rule asked to drop). The target "+
+			"answered WRONG: proto_refused (it served the protobuf exposition without -scrape-native-histograms "+
+			"having asked for it - refused unparsed, since decoding materialises the whole gzip-amplified "+
+			"message), sample_limit (-scrape-max-samples was exceeded; what was converted before the abort is "+
+			"still exported) and body (a response body over this pipeline's cap). Finally export: the payload "+
+			"was scraped and converted and the COLLECTOR - or, with -buffer-dir, the spool - refused it, the one "+
+			"reason where nothing is wrong with the target and kubescrape_export_requests_total is the family to "+
+			"read. other is anything unclassified; a rate on it means this list needs a new value.",
+		"pipeline", "reason")
+	// A gauge rather than a counter because the question is "how many are there
+	// NOW", and ABSENT rather than 0 when target scraping is off: it is only
+	// ever Set by a cycle that fetched the list, so a published 0 always means
+	// "the scraper asked and this node has no targets" and never "-metrics is
+	// false". The empty target list is the most common first-run failure and it
+	// moves no other metric at all.
+	ScrapeTargets = Registry.Gauge("kubescrape_scrape_targets",
+		"Scrape targets the metadata service returned for THIS node on the last successful fetch, after the "+
+			"transforms file's targets: hook. Absent when annotation and monitor scraping is off (-metrics "+
+			"false); 0 means the fetch succeeded and returned nothing - no pod on this node carries "+
+			"prometheus.io/scrape, no annotated Service selects one, and no ServiceMonitor or PodMonitor "+
+			"resolves to one here. It does NOT count the kubelet pipelines, which are configured rather than "+
+			"discovered. A fetch that FAILS leaves the previous value standing; GET /debug/targets on the agent "+
+			"is the per-target view behind this number.")
 	ScrapeSamples = Registry.CounterVec("kubescrape_scrape_samples_total",
 		"Samples parsed by pipeline (before filtering).", "pipeline")
 	// The counterpart to that "before filtering". Filtering happens between
@@ -339,6 +568,23 @@ var (
 			"— a pod that ended between the kubelet building the summary and the lookup landing — while a "+
 			"sustained or fleet-wide rate means the metadata service is not answering, and the ephemeral-storage "+
 			"series it exists for are arriving unattributable.", "level")
+	// The cadvisor pipeline's counterpart to SummaryUnresolved. It did not
+	// exist, and metabudget.go's own comment names the consequence: with the
+	// allowance intact (the ordinary case) a cadvisor scrape shedding
+	// attribution moved NOTHING — the rows still export, still carry their
+	// label identity, and still look healthy on kubescrape_scrapes_total, so an
+	// operator whose cadvisor series had lost every workload label had no
+	// number to point at.
+	CadvisorUnresolved = Registry.CounterVec("kubescrape_cadvisor_unresolved_total",
+		"cadvisor RESOURCES built without a metadata-service answer, by the level of the object: `container` "+
+			"(the row named a container id the store does not know) and `pod` (a pod-level row whose namespace "+
+			"and name resolved to nothing, or to a pod carrying a different UID than the cgroup path). Counted "+
+			"once per resource per exported chunk, never per sample. The rows ARE still exported, carrying the "+
+			"identity their own labels gave them, so this costs attribution rather than data: no owner chain, no "+
+			"pod labels, and a service.name that falls back to the pod name. A steady low rate is ordinary - a "+
+			"just-started container whose id the kubelet has not posted to the API server yet resolves on a "+
+			"later cycle - while a sustained or fleet-wide rate means the metadata service is not answering, and "+
+			"is usually accompanied by kubescrape_scrape_metadata_budget_exhausted_total.", "level")
 	ScrapeMetaBudgetExhausted = Registry.CounterVec("kubescrape_scrape_metadata_budget_exhausted_total",
 		"Scrapes that spent their whole per-scrape metadata allowance, by pipeline. The allowance is half the "+
 			"scrape timeout; past it the remaining objects are NOT looked up at all, so they export under the "+
@@ -369,7 +615,38 @@ var (
 // OTLP exporter (agent).
 var (
 	Exports = Registry.CounterVec("kubescrape_export_requests_total",
-		"OTLP export attempts by signal and outcome.", "signal", "outcome")
+		"OTLP export attempts by signal and outcome: ok, transient (the collector is unreachable or "+
+			"back-pressuring and the payload is retried or spooled), permanent (the collector rejected THIS "+
+			"payload and no retry can help, so a producer drops it). A sustained transient rate means the "+
+			"destination is down; any permanent rate means telemetry is being lost — the accompanying warning "+
+			"names the endpoint, the class and the likeliest cause.", "signal", "outcome")
+	// ExportSplitParts reports the size-split firing. It is otherwise
+	// invisible: a payload over -otlp-max-send-bytes is quietly delivered in
+	// pieces, each its own round trip, auth build and gzip pass — and the one
+	// shape the splitter cannot rescue (a SINGLE record larger than the cap) is
+	// sent alone and rejected by the collector, which surfaces only as a
+	// permanent export failure with no hint of where the size came from.
+	ExportSplitParts = Registry.CounterVec("kubescrape_export_split_parts_total",
+		"Extra parts an over-cap OTLP payload was split into before sending (a payload sent whole adds "+
+			"nothing). A sustained rate means a producer is batching past -otlp-max-send-bytes: lower its "+
+			"batch size, or raise the cap if the collector's receive limit allows it.", "signal")
+	// The other half of the split's story: what it could NOT rescue. Both
+	// reasons ship a part the collector is expected to reject wholesale, which
+	// on its own surfaces only as a permanent export failure naming no size —
+	// and the framing arm is a REFUSAL TO KEEP SPLITTING, so without a series
+	// of its own the loss it trades for would be invisible.
+	ExportOversizeParts = Registry.CounterVec("kubescrape_export_oversize_parts_total",
+		"OTLP parts sent knowingly larger than -otlp-max-send-bytes, by signal and reason — the collector "+
+			"rejects each one, so any rate here is telemetry being lost. item: a SINGLE log record, span or "+
+			"metric data point is itself over the cap and nothing can shrink it, so it ships alone (find the "+
+			"producer of that record — a multi-megabyte log line, a histogram with an enormous label set — or "+
+			"raise the cap if the collector's receive limit allows). framing: the split was ABANDONED because "+
+			"the framing every part re-copies (the resource attributes, the scope identity, or a metric's "+
+			"description) left too little room under the cap for content, so the remainder shipped as one "+
+			"over-cap part instead of as thousands of near-empty ones — on the unauthenticated -ingest and "+
+			"trace-tier listeners that shape is what a hostile sender constructs, so read a rate here as a "+
+			"sender pushing a resource nearly as large as the cap; the accompanying throttled warning names "+
+			"the signal and the sizes.", "signal", "reason")
 )
 
 // OTLP ingest (agent).
@@ -504,6 +781,32 @@ var (
 		"Requests to the metadata service by outcome.", "outcome")
 )
 
+// BearerTokenReadErrors counts failed reads of a mounted bearer-token file, by
+// which half of the rotation contract was reading (internal/bearer).
+//
+// Both halves SURVIVE the failure — that is the package's whole point — so
+// neither produces an immediate symptom, and the counter is what turns a
+// broken projection into something alertable before the delayed symptom
+// arrives. role="client" is the token this process PRESENTS (the kubelet
+// scrape, the OTLP export, the agent's /v1/scrape-auth calls): it keeps
+// sending the last good value, or — when nothing has ever been read — sends
+// none at all and every request it feeds is rejected unauthenticated.
+// role="receiver" is the ACCEPT set (the metadata service's /v1/scrape-auth,
+// the trace tier's internal hop): it keeps accepting the last good token, so
+// the failure surfaces only once the clients have rotated past it, as a
+// fleet-wide 401 with nothing on the receiver to explain it. A nonzero rate
+// sustained past one rotation means an unreadable, empty or unmounted Secret
+// projection: fix the mount. Each failure also carries a throttled Warn naming
+// the path and the error.
+var BearerTokenReadErrors = Registry.CounterVec("kubescrape_bearer_token_read_errors_total",
+	"Failed re-reads of a mounted bearer-token file, by rotation role. client = the token this process "+
+		"presents (it keeps presenting the last good one, or none at all if it never read one, and every "+
+		"request it feeds is then rejected unauthenticated); receiver = the set this process ACCEPTS (it "+
+		"keeps accepting the last good token, so the symptom is a fleet-wide 401 once the clients rotate "+
+		"past it). Sustained nonzero means an unreadable, empty or unmounted Secret projection — fix the "+
+		"mount; a throttled Warn names the path and the error.",
+	"role")
+
 // SelfMetadataLookups counts the agent's own-pod lookups by outcome, SEPARATELY
 // from kubescrape_metadata_requests_total.
 //
@@ -588,6 +891,37 @@ func RegisterSelfMetadata(resolved func() bool) {
 		})
 }
 
+// RegisterReadiness publishes one gauge per startup gate /readyz waits on, so
+// a fleet stuck unready is diagnosable from the metrics as well as from the
+// probe body — registered by both binaries, exactly when they have gates.
+//
+// The probe already names its pending gates, but only to whoever curls it: a
+// rolling update that stops at the first node shows up as a Deployment/DaemonSet
+// that will not progress, and the pod that could answer the question is the one
+// nobody has a shell on. The self-metrics push runs from startup regardless of
+// readiness, so an unready process still reports this.
+//
+// A gate is published from the moment it is REQUIRED, which is what makes 0
+// mean "waiting" rather than "absent"; a gate that never appears was never
+// wired for this deployment (its pipeline is off). The value flips to 1 once
+// and stays there — these are STARTUP gates, not liveness.
+func RegisterReadiness(gates func() map[string]bool) {
+	Registry.GaugeFuncVec("kubescrape_readiness_gate",
+		"1 when this startup gate is satisfied, 0 while it is still pending, by gate. /readyz is 200 only when every gate reads 1, and a rolling update advances on /readyz — so a gate sitting at 0 across the fleet IS the stalled rollout, and the label says which subsystem to look at. Gates are the pipelines this process actually wired, so an absent gate means that pipeline is off rather than healthy. Alert on a gate at 0 for longer than a pod's startup budget.",
+		"gate", func() map[string]float64 {
+			state := gates()
+			out := make(map[string]float64, len(state))
+			for name, ok := range state {
+				if ok {
+					out[name] = 1
+				} else {
+					out[name] = 0
+				}
+			}
+			return out
+		})
+}
+
 // High-frequency cgroup sampler (agent, -cgroup-stats).
 var (
 	CgroupSamples = Registry.Counter("kubescrape_cgroup_samples_total",
@@ -638,6 +972,25 @@ var (
 		"Journal reader restarts.")
 	JournalTruncated = Registry.Counter("kubescrape_journal_truncated_total",
 		"Journal messages truncated at MaxEntryBytes (the record carries log.truncated).")
+	// JournalEntryDefects covers the read-side fallbacks that were silent: the
+	// journal stores raw BYTES, so a message can be invalid UTF-8 and is
+	// rewritten with U+FFFD before it can be exported, and an entry can carry
+	// no realtime stamp at all, in which case the record is dated with the
+	// agent's own clock. Both change the record the operator receives, and
+	// neither is visible in it (a replaced byte looks like the producer wrote
+	// it; a substituted timestamp looks authoritative). One CounterVec rather
+	// than two families because they are the same class of event and an
+	// operator alerts on the family, not on either value.
+	//
+	// Deliberately NOT here: an unknown PRIORITY, which the converter maps to
+	// severity Unspecified. That one IS visible — in the exported record's own
+	// severity field — so it needs no counter to be noticed.
+	JournalEntryDefects = Registry.CounterVec("kubescrape_journal_entry_defects_total",
+		"Journal entries the reader had to repair before exporting, by defect: invalid_utf8 (raw bytes the journal "+
+			"stored that are not valid UTF-8; each is replaced with U+FFFD, so the exported body differs from what "+
+			"the producer wrote) and no_timestamp (the entry carried no realtime stamp, so the record is dated with "+
+			"the agent's clock at read time instead of the producer's). Each carries a throttled warning naming the "+
+			"unit.", "defect")
 	JournalExportFailures = Registry.Counter("kubescrape_journal_export_failures_total",
 		"Journal batch exports that failed and are being retried IN PLACE. The batch is kept and never re-read, "+
 			"so this counts ATTEMPTS — not lost entries, and not re-reads: a steady rate is a collector outage the "+
@@ -681,6 +1034,25 @@ var (
 	// ingest metrics historically; the banner above does not cover them.)
 	Routed = Registry.CounterVec("kubescrape_routed_payload_parts_total",
 		"Payload parts forwarded to a non-default routing destination.", "route", "signal")
+	// RouteFailures is the missing half of Routed. Routed counts only parts a
+	// destination ACCEPTED, so a route that has never worked reads as absence —
+	// indistinguishable from a route nothing matched, which is the likelier
+	// first-run mistake and needs the opposite response. Route destinations are
+	// unbuffered by design, so a failure here is back-pressure onto the
+	// producer (and, for a producer that cannot rewind, loss).
+	RouteFailures = Registry.CounterVec("kubescrape_routed_failures_total",
+		"Payload parts a routing destination refused, by route and signal. The whole export fails when any "+
+			"destination does, so the producer retries and destinations that already accepted the payload see "+
+			"duplicates; a sustained rate means that tenant's telemetry is not arriving — the accompanying "+
+			"warning names the class and the likeliest cause.", "route", "signal")
+	// RouteUnknown deliberately carries NO label. The name a script routes to
+	// is script-chosen and unbounded — exactly what a label must not be — so it
+	// rides the (throttled) log line instead, the same rule the ingest door
+	// follows for a sender's peer address.
+	RouteUnknown = Registry.Counter("kubescrape_routed_unknown_total",
+		"Payloads a transform script routed to a name no route defines. They fall back to the default chain "+
+			"rather than being dropped, so the effect is silent mis-tenanting; the throttled warning names the "+
+			"route the script asked for.")
 	TransformErrors = Registry.CounterVec("kubescrape_transform_errors_total",
 		"Transform program invocations that failed (the batch is NOT exported; the error propagates to the producer's retry path).", "signal")
 	// A transform drop is INTENDED loss, which is exactly why it needs a
@@ -689,7 +1061,7 @@ var (
 	// stream with no error logged and every other metric green. That has
 	// already happened once (see transform/hostobj.go).
 	TransformDropped = Registry.CounterVec("kubescrape_transform_dropped_total",
-		"Records a transform script called drop() on, by signal: log records, metric data points (a dropped metric counts all of its points) and spans. Counted when the batch's export is ACKED (a delivered forward, or a payload transformed to nothing and acked without a send), so a producer's transient retries never re-count. The one exception is the tailer's in-place seam, which counts at transform time: a rewound re-read after a failed export re-runs the (possibly hot-reloaded) script and re-counts.", "signal")
+		"Records a transform script called drop() on, by signal: logs (log records), metrics (data points — a dropped metric counts all of its points), traces (spans) and targets (whole scrape targets the targets: hook dropped, which stop being scraped from that cycle on; there is no other signal for one, since a target that is never fetched has no up series to go to 0). Counted when the batch's export is ACKED (a delivered forward, or a payload transformed to nothing and acked without a send), so a producer's transient retries never re-count. The one exception is the tailer's in-place seam, which counts at transform time: a rewound re-read after a failed export re-runs the (possibly hot-reloaded) script and re-counts.", "signal")
 	TransformReloads = Registry.CounterVec("kubescrape_transform_reloads_total",
 		"Transforms-file reloads by outcome (applied, failed — a failed compile keeps the last good program).", "outcome")
 
@@ -903,6 +1275,16 @@ var (
 		"Event watch expiries with no relist to fall back to (nothing exported yet and none armed): the next stream restarts at the CURRENT revision and whatever the dead watch never delivered is discarded — the events pipeline's one silent-loss arm, worth an alert wherever kubescrape_event_relists_total has one.", "stage")
 	EventPositionErrors = Registry.CounterVec("kubescrape_event_position_errors_total",
 		"Failures reading or writing the event position ConfigMap, by operation (load, save).", "operation")
+	// The whole reason events are collected HERE rather than as a flat stream
+	// is that an event about a pod lands on that pod's resource attributes. A
+	// failed resolution still exports the event — with the identity the event
+	// itself carries — so nothing is lost except the join, which is exactly the
+	// kind of degradation that has no other symptom: the records keep flowing
+	// and every other counter stays green. kubescrape_metadata_requests_total
+	// cannot answer it either, since the uid_mismatch arm issues no request at
+	// all and a lookup error is indistinguishable there from any other caller's.
+	EventsUnresolved = Registry.CounterVec("kubescrape_events_unresolved_total",
+		"Events about a Pod that were exported WITHOUT that pod's resolved identity (owner chain, labels, node, service.name), by reason: lookup = the metadata service could not answer (unreachable, or the pod is gone and past its tombstone TTL), uid_mismatch = a pod of that name exists but is a different incarnation, so adopting it would attribute the event to the wrong pod. Counted once per distinct involved object per batch. The event is still exported under the identity it carries, so this is lost CORRELATION, not lost data.", "reason")
 )
 
 // Azure diagnostics (the Event Hubs consumer in the cluster-singleton deployment).
@@ -937,6 +1319,26 @@ var (
 		"Microsoft Entra token refreshes for the Event Hubs connection, by outcome (ok, error).", "outcome")
 )
 
+// Debug surfaces (agent, -listen). The data-bearing three — /debug/otlp, its
+// UI and /debug/tailer — stream or enumerate this node's whole telemetry feed
+// on a port every pod in the cluster can reach, so they are gated (a local
+// connection, or the -debug-token-file bearer token) and the gate is counted:
+// a refusal an operator cannot see is a refusal that gets configured away, and
+// an ACCEPTED read leaves no other trace than a throttled attach line.
+var DebugRefused = Registry.CounterVec("kubescrape_debug_refused_total",
+	"Requests for the agent's data-bearing debug surfaces (/debug/otlp, /debug/otlp/ui, /debug/tailer) that "+
+		"were refused, by reason. no_token = no -debug-token-file is configured, so these are served only to a "+
+		"local connection (kubectl port-forward, or a container in this pod) and this one came from elsewhere — "+
+		"set the flag and hand the token to whoever needs to read an agent remotely; unauthenticated = a token "+
+		"file IS configured and the request carried no valid bearer token, i.e. a stale token after a rotation, "+
+		"the wrong Secret mounted, or somebody probing the port; forwarded = the connection is local but the "+
+		"request carries a forwarding header, so the address belongs to a relay and cannot stand in for the "+
+		"caller; host = the connection is local but its Host header names something other than localhost, "+
+		"which is what a DNS-rebound browser page reaching a kubectl port-forward looks like (a client that "+
+		"dialled this port directly sends localhost or 127.0.0.1). A steady rate on no_token or "+
+		"unauthenticated from pods that are not yours is somebody trying to read this node's log lines, and "+
+		"any rate on host is a browser being pointed at an operator's port-forward.", "reason")
+
 // HTTP server (metadata service).
 var (
 	HTTPRequests = Registry.CounterVec("kubescrape_http_requests_total",
@@ -948,6 +1350,27 @@ func init() {
 	// here: it owns BuildVersion and imports that package, so the value is
 	// pushed down rather than imported back.
 	metrics.SetScopeVersion(BuildVersion())
+
+	// Registered here rather than through a Register* hook because it is a
+	// property of THIS registry, which always exists — there is no wiring
+	// decision to condition it on, so a published 0 always means "nothing was
+	// skipped". The value is read at export time from the registry's own
+	// atomic; while Dump is serving a scrape it is one dump behind (the func
+	// metrics render after the stored series), which costs a scrape and never a
+	// count.
+	Registry.CounterFunc("kubescrape_self_metrics_points_skipped_total",
+		"Data points of this process's OWN metrics that could not be rendered because their stored label set "+
+			"failed to parse back, and were therefore left out. This should never move: the label sets of these "+
+			"series come from code, not from data. It matters because of WHERE the loss lands — the Prometheus "+
+			"/metrics exposition this process serves for itself, which is the delivery path when "+
+			"-self-metrics-interval=0 and the signal an operator uses to diagnose everything else. A skipped "+
+			"point is simply ABSENT from the response, so without this counter the operator's own telemetry "+
+			"shrinks invisibly. It counts the SCRAPE path only: the OTLP push reads the same stored string but "+
+			"degrades differently (it emits the point with whatever labels parsed, rather than dropping it), so "+
+			"a nonzero value here means the pushed copy of that series is mislabelled rather than missing. Any "+
+			"nonzero value means memory corruption or a bug in the label round-trip; the throttled WARN beside "+
+			"it names the metric.",
+		func() float64 { return float64(Registry.DumpLabelErrors()) })
 }
 
 // RegisterLogMetricsDrops exposes one log-metrics set's refused observations as
@@ -1016,6 +1439,50 @@ func RegisterStoreStats(stats func() (pods, containers int)) {
 		func() float64 { _, containers := stats(); return float64(containers) })
 }
 
+// RegisterStoreAnomalies publishes the two index anomalies that are silent by
+// construction: they are decided under the store's write lock, on the informer
+// goroutine, where nothing may log and no context is available.
+//
+// Both are guards that keep the served data CORRECT, so neither is a bug an
+// operator has to chase — they are worth publishing because they are the only
+// evidence that the condition they guard against is happening at all, and each
+// has a second, un-guarded consequence somewhere else.
+//
+// A hook rather than counters the store bumps directly: internal/store and
+// internal/services publish their STATE through hooks, the same way the store
+// sizes, the waiter state and the buffer stats are wired — a gauge over a
+// value obs would otherwise have to poll. (Both packages do import obs for one
+// thing: MetadataAnnotationsOmitted, a plain event counter bumped once per
+// informer event. A hook cannot serve that one, because its label set spans
+// three packages and a CounterVec and a CounterFuncVec cannot share a name.)
+func RegisterStoreAnomalies(podNameReuse, serviceNameReuse, podIPContested func() int64) {
+	Registry.CounterFuncVec("kubescrape_index_name_reuse_total",
+		"Objects that arrived under a namespace/name a DIFFERENT, still-live UID held, by kind (pod, service). "+
+			"The old record is tombstoned or dropped on the spot, so nothing stale is served — but reaching this "+
+			"at all means a Delete was never delivered (a relist gap: an API-server restart, an etcd compaction, "+
+			"an expired resourceVersion), because the ordinary recreate order tombstones the predecessor first. "+
+			"A low rate around API-server disruption is expected and harmless; a sustained one says this "+
+			"process's watches keep breaking, which is also the condition under which OTHER deletes — the ones "+
+			"no name index can catch — leave a deleted pod being served as a live scrape target until its "+
+			"tombstone expires. Read it beside kubescrape_informer_watch_errors_total.",
+		"kind",
+		func() map[string]float64 {
+			return map[string]float64{
+				"pod":     float64(podNameReuse()),
+				"service": float64(serviceNameReuse()),
+			}
+		})
+	Registry.CounterFunc("kubescrape_pod_ip_contested_total",
+		"Pod-IP claims decided between two pods that were BOTH live (neither terminating) — i.e. the CNI handed "+
+			"an address to a new pod while the store still had a running pod reporting it. The index keeps the "+
+			"later acquisition, which is the right answer, so /v1/pod-ips and /v1/self stay correct; what this "+
+			"counts is the window in which they could have been wrong. Expect a trickle on a churning cluster. A "+
+			"sustained rate means addresses are recycling faster than the pod watch reports the release, and the "+
+			"cost lands on the agent's opt-in peer-IP attribution (-ingest-peer-ip-fallback), where a resource "+
+			"stamped with the previous holder's identity is never revisited.",
+		func() float64 { return float64(podIPContested()) })
+}
+
 // RegisterAPIServerProbe publishes the API-server reachability watchdog's two
 // series: a 1/0 gauge for the last probe's verdict and a counter of failed
 // probes.
@@ -1072,9 +1539,10 @@ func RegisterAPIServerProbe(reachable func() bool, failures func() int64) {
 // the drain is one line per rolling update — and blurring them would make every
 // deploy fire the abuse alert.
 //
-// A hook rather than a counter the store bumps directly: internal/store has no
-// obs dependency, the same way the buffer stats and the self-metadata gauge
-// are wired.
+// A hook rather than a counter the store bumps directly: the store publishes
+// STATE through hooks, the same way the buffer stats and the self-metadata
+// gauge are wired (see RegisterStoreAnomalies for the one direct counter it
+// does bump, and why).
 func RegisterWaiterStats(blocked func() int, shed, drained func() int64) {
 	Registry.GaugeFunc("kubescrape_container_lookups_blocked",
 		"Container lookups currently parked, in EITHER of the two places one can park: waiting for a container "+

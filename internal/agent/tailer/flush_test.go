@@ -761,7 +761,7 @@ func TestCandidateInANewerSegmentThanTheWatermarkIsWithheld(t *testing.T) {
 	// Segment 1: one P fragment, so stage 1 holds an open run.
 	l1 := timeNowCRI() + " stdout P frag-a"
 	end1 := int64(len(l1) + 1)
-	tl.feedLine(ctx, f, l1, 0, end1)
+	tl.feedLine(ctx, f, l1, 0, end1, time.Now())
 
 	// A rename rotation with the run buffered: the pipeline is CARRIED, the
 	// old tail is recorded as a segment and a fresh tail id is issued.
@@ -770,13 +770,13 @@ func TestCandidateInANewerSegmentThanTheWatermarkIsWithheld(t *testing.T) {
 	// Segment 2 (the new inode): the run continues at offset 0 ...
 	l2 := timeNowCRI() + " stdout P frag-b"
 	end2 := int64(len(l2) + 1)
-	tl.feedLine(ctx, f, l2, 0, end2)
+	tl.feedLine(ctx, f, l2, 0, end2, time.Now())
 	// ... and the OTHER stream ships a complete line right after it, whose
 	// end is a commit candidate in the NEW segment while the watermark sits
 	// in the old one.
 	l3 := timeNowCRI() + " stderr F done"
 	end3 := end2 + int64(len(l3)+1)
-	tl.feedLine(ctx, f, l3, end2, end3)
+	tl.feedLine(ctx, f, l3, end2, end3, time.Now())
 
 	tl.flush(ctx)
 

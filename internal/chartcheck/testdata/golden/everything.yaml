@@ -21,11 +21,64 @@ spec:
       app: kubescrape-agent
   policyTypes: [Ingress]
   ingress:
+    # THREE rules, because these ports have three different audiences and a
+    # NetworkPolicy rule's `from` and `ports` apply TOGETHER — one rule with a
+    # `from` would scope every port in it. Same split, for the same reason, as
+    # the trace tier's policy in servicegraph.yaml.
+    #
+    # 1. The -listen port: /healthz, /readyz, the /debug index, /debug/targets,
+    #    /debug/transforms — and the three DATA-BEARING routes, /debug/otlp,
+    #    /debug/otlp/ui and /debug/tailer, which stream this node's whole
+    #    telemetry feed.
+    #
+    #    OPEN TO EVERY POD BY DEFAULT, and that is deliberate rather than
+    #    unconsidered: the kubelet probes this port and a DaemonSet rolling
+    #    update stops dead on a failing readiness probe, while WHAT IS WORTH
+    #    PROTECTING here is protected in-process instead — the three
+    #    data-bearing routes answer only a local connection (a port-forward
+    #    arrives as loopback) or the agent.debug.tokenSecret bearer token, and
+    #    refuse everything else with kubescrape_debug_refused_total{reason}.
+    #    A neighbour pod reaching this port gets probes and target/transform
+    #    state, which is what the metadata service's /v1 routes already serve
+    #    it unauthenticated.
+    #
+    #    agent.debug.allowFrom narrows it anyway, for a fleet that wants defence
+    #    in depth. Read its comment in values.yaml first: a policy scopes a PORT
+    #    and not a path, so the probes are narrowed with it and the `from` must
+    #    include whatever your CNI presents the kubelet as.
     - ports:
         - port: 8081
+      from:
+        - ipBlock:
+            cidr: 10.0.0.0/16
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ops
+    # 2. The Prometheus scrape port. Deliberately unscoped: metrics.scrapeAnnotations
+    #    asks for it to be scraped from wherever Prometheus runs, and this
+    #    chart cannot know where that is. It serves the process's own
+    #    go_*/process_*/kubescrape_* counters — no telemetry contents.
+    #    Undeclared ports (pprof, which exposes goroutine stacks and heap
+    #    contents) stay closed on every rule here.
+    - ports:
         - port: 9090
+    # 3. The OTLP ingest ports — the ones agent.ingest.allowFrom is FOR, and the
+    #    FIRST thing to tighten on this workload.
+    #
+    #    WHAT THEY EXPOSE, stated plainly: any pod that can reach them can push
+    #    arbitrary OTLP logs and metrics through this node's agent, with no
+    #    credential. Enrichment stamps the SENDER's Kubernetes identity where it
+    #    can resolve one, so a forged push is attributable to the pod that sent
+    #    it rather than to whatever it claims — but a sender can still emit
+    #    records naming any service.name it likes, and the cost of the volume it
+    #    pushes is this node's and the collector's. EMPTY MEANS ANY POD MAY PUSH.
+    - ports:
         - port: 4317
         - port: 4318
+      from:
+        - namespaceSelector:
+            matchLabels:
+              shipping-telemetry: "true"
 ---
 # Source: kubescrape/templates/events.yaml
 apiVersion: networking.k8s.io/v1
@@ -43,10 +96,36 @@ spec:
       app: kubescrape-events
   policyTypes: [Ingress]
   ingress:
+    # TWO rules, because these two ports have two audiences and a rule's `from`
+    # and `ports` apply TOGETHER. This singleton opens no receiver of any kind
+    # — it only reads (the Kubernetes Events watch, an Event Hubs consumer) and
+    # exports — so there is no third.
+    #
+    # 1. The -listen port: /healthz and /readyz, which the kubelet probes, the
+    #    /debug index, and — this is what the comment here used to deny by
+    #    saying "nothing else is served" — /debug/otlp and /debug/otlp/ui,
+    #    which stream what THIS replica exports: every Kubernetes Event in the
+    #    cluster, and with azure.enabled every Azure diagnostic record it
+    #    consumes. /debug/tailer is genuinely absent (no tailer runs here).
+    #
+    #    Open to every pod by default, and safe because those two routes are
+    #    gated in-process: local connection (a port-forward arrives as
+    #    loopback) or the agent.debug.tokenSecret bearer token. agent.debug.allowFrom
+    #    narrows the port itself — read its comment first, since the probes
+    #    share it.
     - ports:
-        # Health/readiness (the kubelet probes these) and, when enabled, the
-        # scrape port. Nothing else is served.
         - port: 8081
+      from:
+        - ipBlock:
+            cidr: 10.0.0.0/16
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ops
+    # 2. The Prometheus scrape port: this replica's own go_*/process_*/kubescrape_*
+    #    counters, unscoped because metrics.scrapeAnnotations asks for it to be
+    #    scraped from wherever Prometheus runs. Undeclared ports (pprof) stay
+    #    closed.
+    - ports:
         - port: 9090
 ---
 # Source: kubescrape/templates/service.yaml
@@ -54,6 +133,29 @@ spec:
 # metrics.scrapeAnnotations is on, a scraper reaches the metrics port — so both
 # belong here. The pprof port is deliberately NOT opened: it exposes goroutine
 # stacks and heap contents, and is the one listener the chart wants firewalled.
+#
+# BOTH RULES ARE OPEN TO EVERY POD, and unlike the agent's this is not backed by
+# a second gate: the /v1 routes are unauthenticated BY DESIGN, because every
+# agent polls them on every cycle and a per-agent credential buys nothing the
+# ServiceAccount does not already imply. What they hand out is pod, owner and
+# namespace metadata — object metadata the node's own kubelet already holds, and
+# with kubectl.kubernetes.io/last-applied-configuration and kapp's
+# original-object annotation stripped (kubemeta.FilterAnnotations), because
+# those carry the whole applied spec verbatim. /v1/scrape-auth is the one
+# exception and the one route that serves Secret material: it is bearer-
+# authenticated (service.scrapeAuthToken) and refuses to be enabled without a
+# token. This port also serves the /debug index and its forms, which are
+# ungated for the same reason — they show the same documents the /v1 routes do.
+#
+# TO TIGHTEN IT, add a `from` to the first rule below scoping it to the agent
+# DaemonSet (and to anything else you point at the API):
+#   from:
+#     - podSelector: {matchLabels: {app: <release>-agent}}
+# There is no value for it because the failure mode of getting it wrong is
+# fleet-wide: every agent stops resolving container metadata at once, and the
+# symptom is unattributed telemetry rather than an error anyone is watching.
+# The metrics rule stays separate so scoping the API does not also cut the
+# Prometheus scrape, which metrics.scrapeAnnotations asked for.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -69,8 +171,11 @@ spec:
       app: kubescrape
   policyTypes: [Ingress]
   ingress:
+    # 1. The metadata API, plus /healthz, /readyz and /debug.
     - ports:
         - port: 8080
+    # 2. The Prometheus scrape port.
+    - ports:
         - port: 9090
 ---
 # Source: kubescrape/templates/servicegraph.yaml
@@ -89,7 +194,7 @@ spec:
       app: kubescrape-servicegraph
   policyTypes: [Ingress]
   ingress:
-    # THREE rules, because these ports have three different audiences and a
+    # FOUR rules, because these ports have four different audiences and a
     # NetworkPolicy rule's `from` and `ports` apply TOGETHER. They used to be one
     # rule, so `serviceGraph.ingest.allowFrom` — whose documented job is to scope
     # who may push TRACES — silently scoped the internal shard port along with
@@ -98,13 +203,31 @@ spec:
     # push, and half of every cross-node edge simply never formed, for a reason
     # nothing in values.yaml mentions.
     #
-    # 1. Health/readiness and the scrape port. Deliberately unscoped: the
-    #    kubelet's probes come from the node, and Prometheus discovery comes
-    #    from wherever it runs. Undeclared ports (pprof) stay closed.
+    # 1. The -listen port: /healthz and /readyz, which the kubelet probes, the
+    #    /debug index — and /debug/otlp + /debug/otlp/ui, which on a shard
+    #    stream the TRACES this tier exports, i.e. the whole cluster's, since
+    #    every instrumented application pushes here.
+    #
+    #    Open to every pod by default, because the kubelet probes it and those
+    #    two routes are gated in-process instead: a local connection (a
+    #    port-forward arrives as loopback) or the agent.debug.tokenSecret bearer
+    #    token, everything else refused and counted. agent.debug.allowFrom
+    #    narrows the port; read its comment first, since the probes share it.
     - ports:
         - port: 8081
+      from:
+        - ipBlock:
+            cidr: 10.0.0.0/16
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ops
+    # 2. The Prometheus scrape port. Deliberately unscoped: metrics.scrapeAnnotations
+    #    asks for it to be scraped from wherever Prometheus runs. It serves this
+    #    shard's own counters, not span contents. Undeclared ports (pprof, which
+    #    exposes goroutine stacks and heap contents) stay closed on every rule.
+    - ports:
         - port: 9090
-    # 2. The INTERNAL receiver. Its only legitimate clients are the sibling
+    # 3. The INTERNAL receiver. Its only legitimate clients are the sibling
     #    shards, so it is scoped to this tier's own pods REGARDLESS of
     #    allowFrom — the ring is not optional — and it is authenticated by the
     #    shared bearer token, which is what actually guards it.
@@ -114,7 +237,8 @@ spec:
         - podSelector:
             matchLabels:
               app: kubescrape-servicegraph
-    # 3. The application OTLP trace ports — the ones allowFrom is FOR.
+    # 4. The application OTLP trace ports — the ones allowFrom is FOR, and the
+    #    first thing to tighten on this workload.
     #
     # WHAT THEY EXPOSE, stated plainly: any pod that can reach them can push
     # arbitrary OTLP spans into this cluster's traces, with no credential.
@@ -128,6 +252,46 @@ spec:
     - ports:
         - port: 4317
         - port: 4318
+---
+# Source: kubescrape/templates/service.yaml
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: kubescrape
+  namespace: monitoring
+  labels: 
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/instance: kubescrape
+    helm.sh/chart: kubescrape-0.1.0
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app: kubescrape
+---
+# Source: kubescrape/templates/servicegraph.yaml
+# The tier is a hard cluster-wide dependency for traces: there is no per-node
+# fallback, so while no shard is up every application push is refused and the
+# sender's retry buffer is the only thing holding the spans. A drain that takes
+# every shard at once is therefore a total trace outage, not a degraded one —
+# and each evicted shard also flushes its in-memory pairing store and its
+# tail-sampling buffer, which is only lossless because the eviction is graceful.
+# maxUnavailable rather than minAvailable so a single-shard tier can still be
+# drained: minAvailable: 1 at replicas: 1 blocks a node drain forever.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: kubescrape-servicegraph
+  namespace: monitoring
+  labels: 
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/instance: kubescrape
+    helm.sh/chart: kubescrape-0.1.0
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app: kubescrape-servicegraph
 ---
 # Source: kubescrape/templates/agent.yaml
 apiVersion: v1
@@ -529,6 +693,9 @@ spec:
                 values:
                 - amd64
                 - arm64
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: agent
           image: ghcr.io/johanlindvall/kubescrape:latest
@@ -541,6 +708,15 @@ spec:
             # value so the two sides cannot drift apart.
             - -scrape-auth-token-file=/etc/kubescrape/scrape-auth/token
             - -listen=:8081
+            # /debug/otlp, /debug/otlp/ui and /debug/tailer stream this NODE's
+            # whole telemetry feed — every log line it ships, from every
+            # namespace scheduled here — and this port is reachable from every
+            # pod in the cluster. With no token they answer only a LOCAL
+            # connection (kubectl port-forward, or a container in this pod);
+            # naming a Secret here opens them to a bearer token instead. The
+            # path is the mount below, through one helper, so the two cannot
+            # drift into a silent fallback to local-only.
+            - -debug-token-file=/etc/kubescrape/debug/dbg
             - -self-metrics-interval=1m
             - -otlp-endpoint=otel-collector.monitoring:4317
             - -otlp-protocol=grpc
@@ -597,7 +773,6 @@ spec:
             - -ingest-grpc-max-recv-bytes=41943040
             - -log-level=info
             - -metrics-listen=:9090
-            - -log-format=text
           env:
             - name: NODE_NAME
               valueFrom:
@@ -647,6 +822,9 @@ spec:
             - name: scrape-auth
               mountPath: /etc/kubescrape/scrape-auth
               readOnly: true
+            - name: debug-token
+              mountPath: /etc/kubescrape/debug
+              readOnly: true
             - name: varlog
               mountPath: /var/log
               readOnly: true
@@ -682,6 +860,9 @@ spec:
         - name: scrape-auth
           secret:
             secretName: kubescrape-scrape-auth
+        - name: debug-token
+          secret:
+            secretName: kubescrape-debug
         - name: runlogjournal
           hostPath:
             path: /run/log/journal
@@ -730,6 +911,9 @@ spec:
       terminationGracePeriodSeconds: 60
       nodeSelector:
         kubernetes.io/os: linux
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: events
           image: ghcr.io/johanlindvall/kubescrape:latest
@@ -746,6 +930,12 @@ spec:
             - -ingest=false
             - -metadata-endpoint=http://kubescrape.monitoring
             - -listen=:8081
+            # This replica runs no tailer, so /debug/tailer is not registered —
+            # but /debug/otlp and its UI are, on every workload running the
+            # agent binary, and here they stream the CLUSTER's Kubernetes
+            # Events and (with azure.enabled) its Azure diagnostic records.
+            # Without a token those two answer only a local connection.
+            - -debug-token-file=/etc/kubescrape/debug/dbg
             - -self-metrics-interval=1m
             - -events
             - -events-lease=kubescrape-cluster-leader
@@ -776,7 +966,6 @@ spec:
             - -logs-metrics-name-prefix=acme_
             - -metrics-listen=:9090
             - -log-level=info
-            - -log-format=text
           env:
             # The agent requires a node name (its own self-metrics identity);
             # events themselves never carry it — a described object's node is
@@ -814,6 +1003,9 @@ spec:
             - name: config
               mountPath: /etc/kubescrape/config
               readOnly: true
+            - name: debug-token
+              mountPath: /etc/kubescrape/debug
+              readOnly: true
           resources: 
             limits:
               memory: 256Mi
@@ -824,6 +1016,9 @@ spec:
         - name: config
           configMap:
             name: kubescrape-agent-config
+        - name: debug-token
+          secret:
+            secretName: kubescrape-debug
 ---
 # Source: kubescrape/templates/service.yaml
 apiVersion: apps/v1
@@ -854,6 +1049,9 @@ spec:
     spec:
       serviceAccountName: kubescrape
       priorityClassName: system-cluster-critical
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: kubescrape
           image: ghcr.io/johanlindvall/kubescrape:latest
@@ -882,7 +1080,6 @@ spec:
             - -otlp-timeout=15s
             - -log-level=info
             - -metrics-listen=:9090
-            - -log-format=text
           volumeMounts:
             - name: scrape-auth-token
               mountPath: /etc/kubescrape/scrape-auth
@@ -949,6 +1146,9 @@ spec:
       terminationGracePeriodSeconds: 60
       nodeSelector:
         kubernetes.io/os: linux
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: servicegraph
           image: ghcr.io/johanlindvall/kubescrape:latest
@@ -967,9 +1167,20 @@ spec:
             - -ingest=false
             - -metadata-endpoint=http://kubescrape.monitoring
             - -listen=:8081
+            # /debug/otlp and its UI are registered on every workload running
+            # the agent binary, and on a shard they stream the TRACES this tier
+            # exports — the whole cluster's, since every application pushes
+            # here. Without a token they answer only a local connection.
+            - -debug-token-file=/etc/kubescrape/debug/dbg
             - -self-metrics-interval=1m
             - -service-graph
             - -service-graph-listen=:4319
+            # The INTERNAL receiver is reachable from every pod in the cluster,
+            # and what it accepts is treated as final — already enriched,
+            # already routed — so the hop is authenticated. Re-read
+            # periodically, so rotating the Secret needs no restart. Without it
+            # the binary refuses to open the listener.
+            - -service-graph-token-file=/etc/kubescrape/service-graph/token
             # The APPLICATION-facing listeners, behind the ClusterIP Service
             # above. Unauthenticated by design; scope them with the
             # NetworkPolicy at the bottom of this file.
@@ -1001,7 +1212,6 @@ spec:
             - -config=/etc/kubescrape/config/config.yaml
             - -metrics-listen=:9090
             - -log-level=info
-            - -log-format=text
           env:
             # The agent binary wants a node name for its own self-metrics
             # identity; the edges it emits never carry it (an edge is a
@@ -1047,6 +1257,12 @@ spec:
             - name: config
               mountPath: /etc/kubescrape/config
               readOnly: true
+            - name: service-graph-token
+              mountPath: /etc/kubescrape/service-graph
+              readOnly: true
+            - name: debug-token
+              mountPath: /etc/kubescrape/debug
+              readOnly: true
           resources: 
             limits:
               memory: 512Mi
@@ -1057,3 +1273,9 @@ spec:
         - name: config
           configMap:
             name: kubescrape-agent-config
+        - name: service-graph-token
+          secret:
+            secretName: kubescrape-service-graph
+        - name: debug-token
+          secret:
+            secretName: kubescrape-debug

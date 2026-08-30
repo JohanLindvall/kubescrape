@@ -173,7 +173,7 @@ func (p *pipelines) startServiceGraph(ctx context.Context) error {
 	if err := p.startServiceGraphIngest(ctx, owner); err != nil {
 		return err
 	}
-	p.log.Info("trace tier started", "internalGRPC", *serviceGraphListen, "internalHTTP", *serviceGraphHTTPListen,
+	p.log.Info("trace tier started", "serviceGraphInternalGRPC", *serviceGraphListen, "serviceGraphInternalHTTP", *serviceGraphHTTPListen,
 		"wait", proc.Wait(), "interval", *serviceGraphIv)
 	return nil
 }
@@ -392,7 +392,7 @@ func (p *pipelines) startServiceGraphIngest(ctx context.Context, owner servicegr
 			p.fatal("service-graph trace ingest", err)
 		}
 	})
-	p.log.Info("trace ingest listening", "grpc", *serviceGraphIngestGRPC, "http", *serviceGraphIngestHTTP,
+	p.log.Info("trace ingest listening", "serviceGraphIngestGRPC", *serviceGraphIngestGRPC, "serviceGraphIngestHTTP", *serviceGraphIngestHTTP,
 		"peerIPFallback", *ingestPeerIP)
 	return nil
 }
@@ -711,6 +711,11 @@ func (r *sgReceiver) Run(ctx context.Context) error {
 			// connection carrying an open stream is never idle.
 			otlpingest.KeepaliveOption(),
 			grpc.MaxRecvMsgSize(sgMaxRecvBytes()),
+			// The header-block bound (otlpingest.MaxHeaderListSizeOption).
+			// This hop authenticates, but the credential arrives IN the header
+			// block, so grpc-go has already decoded 16 MiB of it — at the
+			// default — by the time the tap can read the token.
+			otlpingest.MaxHeaderListSizeOption(),
 			// The wire-SHAPE guard, which MaxRecvMsgSize cannot give: pdata's
 			// generated unmarshaller recurses per nesting level, so a small
 			// message of deeply nested groups costs unbounded goroutine stack

@@ -212,27 +212,40 @@ func TestContainerWaiterOverflow503(t *testing.T) {
 		wg.Wait()
 	}()
 
-	// Poll with short-wait lookups until both fillers are parked: at the cap
-	// the lookup is shed immediately as 503 + Retry-After.
-	deadline := time.Now().Add(5 * time.Second)
-	var last int
-	for time.Now().Before(deadline) {
-		resp, err := http.Get(srv.URL + "/v1/containers/overflow1?wait=50ms")
-		if err != nil {
-			t.Fatal(err)
+	// Wait for BOTH fillers to be parked before issuing a single request, and
+	// wait on the store's own count rather than on a request's status.
+	//
+	// Polling the route to find out was the defect: a poll that arrives while
+	// only ONE filler is parked takes the second slot itself, so the filler
+	// that has not run yet is SHED and its goroutine exits — after which the
+	// cap can never be reached again and every later poll 404s until the
+	// deadline. (The same interleaving also 404s for the milder reason: a
+	// ?wait=50ms budget can expire before the handler reaches the cap check at
+	// all, since GetContainer answers an already-expired context without
+	// consulting it.) Both are scheduling races, so the test passed alone and
+	// failed inside a loaded `go test -race ./...`.
+	deadline := time.Now().Add(10 * time.Second)
+	for st.BlockedLookups() < 2 {
+		if time.Now().After(deadline) {
+			t.Fatalf("only %d of 2 fillers parked", st.BlockedLookups())
 		}
-		last = resp.StatusCode
-		retryAfter := resp.Header.Get("Retry-After")
-		_ = resp.Body.Close()
-		if last == http.StatusServiceUnavailable {
-			if retryAfter == "" {
-				t.Error("503 without Retry-After")
-			}
-			return
-		}
-		time.Sleep(20 * time.Millisecond)
+		time.Sleep(time.Millisecond)
 	}
-	t.Fatalf("never saw 503 at waiter cap (last status %d)", last)
+
+	// At the cap the lookup is shed immediately, whatever it asked to wait.
+	resp, err := http.Get(srv.URL + "/v1/containers/overflow1?wait=50ms")
+	if err != nil {
+		t.Fatal(err)
+	}
+	retryAfter := resp.Header.Get("Retry-After")
+	status := resp.StatusCode
+	_ = resp.Body.Close()
+	if status != http.StatusServiceUnavailable {
+		t.Fatalf("status %d at the waiter cap, want 503 (a 404 there is an unretryable answer to a retryable condition)", status)
+	}
+	if retryAfter == "" {
+		t.Error("503 without Retry-After")
+	}
 }
 
 // Hostile paths must produce clean 4xx/404s, never hangs or panics: invalid

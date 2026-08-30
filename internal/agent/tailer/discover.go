@@ -5,6 +5,8 @@ package tailer
 // the symlink dir and resolved target dirs.
 
 import (
+	"context"
+	"log/slog"
 	"os"
 	"path"
 	"path/filepath"
@@ -219,10 +221,62 @@ func parseFileName(name string) (containerID, namespace string, ok bool) {
 // forever, so such a file was never released — fd, unlinked inode, files-map
 // entry and checkpoint entry pinned for the process lifetime with nothing logged
 // and no counter moving.
+//
+// skipped is the third, and it is a REPORTING set rather than a proof: path ->
+// the reason discovery declined to track it. Every one of those decisions used
+// to be silent by design, which made "why is this pod's log missing?" — the
+// operator's first question about a log pipeline — unanswerable from the logs
+// and the metrics, the only two things a first live run has. It is diffed
+// against the previous scan's (Tailer.skipped) so a file counts and logs ONCE
+// per reason instead of once per discovery pass, and an entry that ends up
+// tracked anyway (a later source claimed what an earlier one declined) is
+// dropped before the diff.
 type scanSets struct {
 	seen     map[string]struct{}
 	unproven map[string]struct{}
+	skipped  map[string]string
+	// detail carries the ERROR behind a skip whose reason is a failure rather
+	// than a selection (today only skipStatError). Kept beside skipped rather
+	// than folded into it because skipped's value is the metric label value
+	// AND the change-detection key: an errno that changes while the reason
+	// does not must not re-log.
+	detail map[string]string
 }
+
+// skip records why this path is not being tracked. Last writer wins: sources
+// are consulted in order and a later source's verdict is the more final one.
+// The map is allocated on demand so a zero-value scanSets is usable — the
+// other two sets are proofs every caller must supply, this one is reporting.
+func (s *scanSets) skip(path, reason string) {
+	if s.skipped == nil {
+		s.skipped = make(map[string]string)
+	}
+	s.skipped[path] = reason
+}
+
+// skipErr is skip for a reason that is a FAILURE, recording the error so the
+// report can name it. A counter can say a file was not collected; only the
+// errno says whether to fix a mount, a permission or a disk.
+func (s *scanSets) skipErr(path, reason string, err error) {
+	s.skip(path, reason)
+	if s.detail == nil {
+		s.detail = make(map[string]string)
+	}
+	s.detail[path] = err.Error()
+}
+
+// Discovery skip reasons. They are metric LABEL VALUES
+// (kubescrape_log_files_skipped_total{reason}) as well as log values, so they
+// are spelled once, here, and the metric's help text enumerates exactly these.
+const (
+	skipSourceExclude   = "source_exclude"
+	skipExcludedNS      = "excluded_namespace"
+	skipNamespaceNotSel = "namespace_not_selected"
+	skipUnparseableName = "unparseable_name"
+	skipTooOld          = "too_old"
+	skipNonRegular      = "non_regular"
+	skipStatError       = "stat_error"
+)
 
 // scanDir discovers new and removed log files across all sources by globbing
 // their include patterns. initial marks the startup scan, which seeds the
@@ -241,7 +295,7 @@ func (t *Tailer) scanDir(checkpoints map[string]checkpoint, initial bool) {
 			src.startingUp = true
 		}
 	}
-	sets := scanSets{seen: make(map[string]struct{}), unproven: make(map[string]struct{})}
+	sets := scanSets{seen: make(map[string]struct{}), unproven: make(map[string]struct{}), skipped: make(map[string]string)}
 	discovered := false
 	listingOK := true
 	defer func() {
@@ -263,7 +317,14 @@ func (t *Tailer) scanDir(checkpoints map[string]checkpoint, initial bool) {
 				continue // an earlier source already claimed this file
 			}
 			if src.excluded(path) {
-				continue // the include match is implied: path came from src.glob()
+				// The include match is implied: path came from src.glob().
+				// Recorded rather than dropped silently — an over-broad
+				// exclude glob is the cheapest way to lose a workload's logs
+				// and the hardest to spot, since nothing anywhere names the
+				// file. A later source may still claim it, and reportSkips
+				// drops the entry when one does.
+				sets.skip(path, skipSourceExclude)
+				continue
 			}
 			if t.claimPath(src, path, &sets) {
 				discovered = true
@@ -330,15 +391,112 @@ func (t *Tailer) scanDir(checkpoints map[string]checkpoint, initial bool) {
 	// which the next start treats them as history and skips them to the end —
 	// exactly the loss the flag exists to prevent (see saveCheckpoints).
 	t.lastListingOK = listingOK
+	t.reportSkips(sets.skipped, sets.detail, listingOK)
 	obs.LogFiles.Set(float64(len(t.files)))
 	if discovered && t.checkpointing() {
 		// Persist immediately: until a file has a checkpoint entry, a crash
 		// makes the restart treat it as pre-existing history and skip to its
 		// end — the 10s periodic save left every new file a window in which
 		// kill -9 lost its unread lines (and everything written while down).
-		t.saveCheckpoints()
+		//
+		// Through saveDiscovery, which is still immediate whenever the last
+		// save is older than discoverySaveWindow — i.e. for every ordinary
+		// discovery — and coalesces only the passes of a BURST. scanDir runs
+		// once per fsnotify event, so without that a rolling update paid one
+		// ~15 ms whole-node stall per new container log file.
+		t.saveDiscovery()
 	}
 }
+
+// reportSkips makes this pass's declined files visible, exactly once each.
+//
+// Every skip decision in claimPath is re-taken on EVERY discovery pass — the
+// 2s dirTicker plus every fsnotify event in a scan dir — so counting or
+// logging at the decision site would report one file hundreds of times an
+// hour. The diff against the previous pass is what turns "this file is
+// skipped" (a state, and the thing an operator actually wants) into one count
+// and one line: a newly skipped file, or one whose reason CHANGED, is
+// reported; a file skipped for the same reason as last pass is not; a file
+// that stopped being skipped is forgotten, so it reports again if it comes
+// back.
+//
+// A path some source declined and another then CLAIMED is not a skip at all —
+// that is `namespaces` doing its routing job — so tracked paths are dropped
+// before the diff.
+//
+// The log line is Debug: on a healthy node most of these are the operator's own
+// configuration working (an excluded namespace, an ignoreOlder cutoff), and
+// only the counter belongs in the steady-state signal. It is guarded because
+// slog evaluates arguments eagerly and this loop runs per pass.
+//
+// skipStatError is the ONE exception, and it gets a throttled Warn. Every other
+// reason here is a SELECTION — the operator asked for it, so the counter alone
+// is the right weight. A stat failure is a file the operator meant to collect
+// and is not collecting, and the counter cannot say WHICH file or WHY: an
+// EACCES from a hostPath mounted with the wrong ownership and an EIO from a
+// failing disk are the same number and different jobs. That is precisely the
+// context a counter cannot carry.
+//
+// Two bounds keep it from becoming the flood the Debug default was avoiding.
+// A vanished path is EXCLUDED: an ENOENT here is a rename rotation caught
+// between the readdir and the stat, which is both benign and constant on a busy
+// node — it still COUNTS (the metric's help enumerates stat_error as any
+// unstattable path), it just does not warn. And the surviving cases are gated
+// by one keyless throttle naming a single example plus how many others share
+// the pass, because a wrongly-mounted log directory fails every file in it at
+// once and the remedy is the same for all of them.
+func (t *Tailer) reportSkips(skipped, detail map[string]string, listingOK bool) {
+	if !listingOK {
+		// A failed glob proves nothing about the paths it did not list, and
+		// FORGETTING one is what makes it count again — so a directory
+		// flapping between readable and not would report every file it holds
+		// on every recovery, breaking the "once per file" claim the counter's
+		// help text makes. Carry the undecided ones forward; a later
+		// successful listing drops whatever genuinely stopped being skipped.
+		for path, reason := range t.skipped {
+			if _, decided := skipped[path]; !decided {
+				skipped[path] = reason
+			}
+		}
+	}
+	for path := range skipped {
+		if _, tracked := t.files[path]; tracked {
+			delete(skipped, path)
+		}
+	}
+	debug := t.log.Enabled(context.Background(), slog.LevelDebug)
+	// One example plus a count, rather than a line per file: see the throttle
+	// note above. Collected in the diff loop so an unchanged skip stays silent.
+	var statErrPath, statErrMsg string
+	statErrs := 0
+	for path, reason := range skipped {
+		if was, ok := t.skipped[path]; ok && was == reason {
+			continue
+		}
+		obs.LogFilesSkipped.WithLabelValues(reason).Inc()
+		if reason == skipStatError && !strings.Contains(detail[path], "no such file or directory") {
+			statErrs++
+			if statErrPath == "" {
+				statErrPath, statErrMsg = path, detail[path]
+			}
+		}
+		if debug {
+			t.log.Debug("log file not tracked", "path", path, "reason", reason)
+		}
+	}
+	if statErrs > 0 && t.statErrWarn.Allow(statErrWarnEvery) {
+		t.log.Warn("log file could not be stat'd and is not being collected",
+			"path", statErrPath, "error", statErrMsg, "files", statErrs,
+			"note", "the path was listed but cannot be read: check the ownership and mode of the log hostPath mount, "+
+				"or the node's disk. Further reports are suppressed for "+statErrWarnEvery.String())
+	}
+	t.skipped = skipped
+}
+
+// statErrWarnEvery re-warns about unstattable log files at this cadence. The
+// condition is a STATE (a mount is wrong, a disk is failing), so it persists
+// across every pass of a sweep that runs every two seconds.
+const statErrWarnEvery = 5 * time.Minute
 
 // tooOld reports whether a source's ignoreOlder cutoff excludes this file.
 //
@@ -405,10 +563,19 @@ func (t *Tailer) claimPath(src *compiledSource, path string, sets *scanSets) boo
 		// suppressed here (see scanSets).
 		if err != nil {
 			sets.unproven[path] = struct{}{}
+			// A stat failure is the one entry in this set that is not a
+			// SELECTION: an EACCES (a hostPath mounted with the wrong
+			// ownership) or an EIO is a file the operator meant to collect
+			// and is not collecting. It is reported for exactly that reason,
+			// and a rename rotation caught between the readdir and the stat
+			// reports it once too — the diff means one line, not one per pass.
+			sets.skipErr(path, skipStatError, err)
+		} else {
+			// Non-regular files (FIFOs, sockets, devices) are never tracked:
+			// open(2)/read(2) on a FIFO block indefinitely and would wedge the
+			// single sweep goroutine node-wide.
+			sets.skip(path, skipNonRegular)
 		}
-		// Non-regular files (FIFOs, sockets, devices) are never tracked:
-		// open(2)/read(2) on a FIFO block indefinitely and would wedge the
-		// single sweep goroutine node-wide.
 		return false
 	}
 	var id string
@@ -422,6 +589,7 @@ func (t *Tailer) claimPath(src *compiledSource, path string, sets *scanSets) boo
 			// feedback loop (the agent tails the collector's namespace and
 			// amplifies precisely when the collector is struggling).
 			sets.seen[path] = struct{}{}
+			sets.skip(path, skipExcludedNS)
 			return false
 		}
 		if ok && !src.wantNamespace(namespace) {
@@ -433,6 +601,13 @@ func (t *Tailer) claimPath(src *compiledSource, path string, sets *scanSets) boo
 			// `excludeNamespaces` denies, and denying cannot be undone by a
 			// later source. wantNamespace merges both, so testing it alone
 			// silently took the deny half along and lost the guard above.)
+			//
+			// Reported anyway: an allowlist that matches nothing looks
+			// exactly like a source that is working, and a typo'd namespace
+			// glob is silent otherwise. reportSkips drops the entry when a
+			// later source does claim the file, so the routing case stays
+			// quiet.
+			sets.skip(path, skipNamespaceNotSel)
 			return false
 		}
 		if !ok || slices.Contains(t.cfg.ExcludeNamespaces, namespace) {
@@ -444,6 +619,15 @@ func (t *Tailer) claimPath(src *compiledSource, path string, sets *scanSets) boo
 			// A source's own excludeNamespaces claims-and-skips above for the
 			// same reason. Either way the file is never opened, tracked or read.
 			sets.seen[path] = struct{}{}
+			if !ok {
+				// A file in the containerd log directory whose name is not a
+				// CRI name is a "should not happen" branch that happens — a
+				// stray file, a different runtime's layout, an operator's
+				// backup copy. It reads as a silent selection today.
+				sets.skip(path, skipUnparseableName)
+			} else {
+				sets.skip(path, skipExcludedNS)
+			}
 			return false
 		}
 		id = cid
@@ -457,6 +641,7 @@ func (t *Tailer) claimPath(src *compiledSource, path string, sets *scanSets) boo
 	// allowlist: unclaimed, so a later source with its own (or no) cutoff may
 	// take the file.
 	if src.ignoreOlder > 0 && t.tooOld(st, path, src.ignoreOlder) {
+		sets.skip(path, skipTooOld)
 		return false
 	}
 	sets.seen[path] = struct{}{}
@@ -475,6 +660,7 @@ func (t *Tailer) claimPath(src *compiledSource, path string, sets *scanSets) boo
 		path:        path,
 		source:      src,
 		containerID: id,
+		discovered:  time.Now(),
 		compressed:  src.compressed || strings.HasSuffix(path, ".gz"),
 		dirty:       true, // read on the first (event-driven) sweep
 	}
@@ -590,6 +776,19 @@ func (t *Tailer) initFile(f *file) {
 		if mode == "end" {
 			if st, err := os.Stat(f.path); err == nil {
 				f.committed = st.Size()
+				// The single most consequential silent decision in this
+				// package: everything already in this file is declared
+				// history and will never be exported. It is correct — that is
+				// what the mode means — and it is also the most common "the
+				// agent is collecting nothing" report on a first live run,
+				// because `auto` resolves HERE whenever the positions store is
+				// empty. No counter: skipping history is not a failure and a
+				// rate would page on every fresh volume. The size is what says
+				// how much was skipped. Arguments are field reads and a stat
+				// already taken, so no Enabled guard is warranted.
+				t.log.Debug("existing log file skipped to its end as history",
+					"path", f.path, "bytes", st.Size(), "reason", mode,
+					"flag", "-logs-unknown-files")
 			}
 		}
 	}

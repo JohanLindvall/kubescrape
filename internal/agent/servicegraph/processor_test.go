@@ -1049,3 +1049,17 @@ func unpairableClientSpans(from, n int) ptrace.Traces {
 	}
 	return td
 }
+
+// namesDatabase gates its comparison on the "db." prefix so a realistic span's
+// attributes are walked once instead of four times. That gate is only correct
+// while every member of databaseAttrs actually carries the prefix: one that did
+// not would be unreachable, and the symptom — a database edge rendered as an
+// ordinary service-to-service call — is invisible rather than loud. Same
+// contract as agent/logscrub's prefilters, and the same reason it is a test.
+func TestDatabaseAttrsAllCarryThePrefix(t *testing.T) {
+	for _, a := range databaseAttrs {
+		if len(a) <= len(dbAttrPrefix) || a[:len(dbAttrPrefix)] != dbAttrPrefix {
+			t.Errorf("databaseAttrs member %q does not start with %q, so namesDatabase's prefix gate can never reach it", a, dbAttrPrefix)
+		}
+	}
+}

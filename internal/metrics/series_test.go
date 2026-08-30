@@ -744,7 +744,7 @@ func TestCardinalityWarningNamesTheResourceThatWasRefused(t *testing.T) {
 	if !strings.Contains(line, `labels="{path=\"/a\"}"`) && !strings.Contains(line, "path") {
 		t.Errorf("the warning must still name the label set: %q", line)
 	}
-	if !strings.Contains(line, "maxsize=1") {
+	if !strings.Contains(line, "maxSeries=1") {
 		t.Errorf("the warning must still quote the cap: %q", line)
 	}
 }

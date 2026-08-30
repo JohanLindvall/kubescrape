@@ -36,8 +36,30 @@ metrics:
 # to localhost — hence a separate listener from metrics and health.
 pprofListen: ""
 
-logLevel: info       # both components
-logFormat: text
+# Log level for ALL FOUR workloads: the agent DaemonSet, the metadata service
+# Deployment, the events/Azure singleton and the service-graph StatefulSet — one
+# value, so a fleet can never be half-verbose. Output is logfmt (key=value),
+# always: there is no format value, and passing one is a flag the binaries no
+# longer define (they exit 2 rather than start).
+logLevel: info
+
+# Pod-level seccomp profile for ALL FOUR workloads. RuntimeDefault is what a
+# plain container run already gets; Kubernetes' own default is Unconfined, which
+# is looser, and PodSecurity's `restricted` profile REJECTS a pod that does not
+# set RuntimeDefault — so without this the metadata service, the events/Azure
+# singleton and the trace tier fail ADMISSION on a restricted namespace, which
+# on a first install reads as a broken chart rather than a policy.
+#
+# To omit the field entirely, set it to `null` — NOT to `{}`. helm COALESCES a
+# user map onto the chart's default map, so an empty map arrives at the template
+# as this default and renders anyway; only an explicit null removes the key.
+# (`--set seccompProfile=null` on the command line does the same.)
+#
+# (The agent additionally runs as UID 0 and mounts hostPath /var/log, so it can
+# never satisfy `restricted` whatever this says — its namespace needs
+# `privileged`. The other three can and now do.)
+seccompProfile:
+  type: RuntimeDefault
 
 # The metadata service (Deployment).
 service:
@@ -128,6 +150,23 @@ service:
   # Less-common service flags go here (scrapeAuthSecrets above already passes
   # -scrape-auth-secrets and -scrape-auth-token-file; do not repeat them).
   extraArgs: []
+  # DELIBERATELY NO MEMORY LIMIT, unlike the other three workloads. This is the
+  # only process whose footprint scales with the SIZE OF THE CLUSTER (one record
+  # per pod, plus the owner/service caches), so a number picked here is a number
+  # picked without knowing the cluster — and an OOMKill of this singleton stalls
+  # attribution fleet-wide, because every agent blocks on its lookups. Being
+  # limit-less makes the pod Burstable: it is a candidate for eviction under node
+  # pressure, which is the failure this trades for, and `priorityClassName:
+  # system-cluster-critical` above is what makes that trade survivable. Set a
+  # limit once you have measured YOUR cluster (kubescrape_store_pods x ~2 KiB is
+  # the shape); do not copy the agent's 512Mi, which was sized for a different
+  # workload entirely.
+  # One consequence worth knowing: the GOMEMLIMIT the other three workloads
+  # derive from their memory limit (see agent.resources) is derived from
+  # NOTHING here, deliberately — there is no fallback to the node's RAM,
+  # because a soft limit at a fraction of a machine this pod does not own is
+  # not insurance, it is a number. Setting a limit here turns it on as a side
+  # effect, which is a second reason to set one once you have measured yours.
   resources:
     requests:
       cpu: 50m
@@ -161,6 +200,61 @@ agent:
   # Prometheus /metrics endpoint is NOT here — it has its own port, see the
   # top-level `metrics:` section.
   listen: ":8081"
+  # WHO MAY READ THE AGENT'S TELEMETRY FEED. Three of the routes on `listen`
+  # above are DATA-BEARING — /debug/otlp and /debug/otlp/ui stream, verbatim,
+  # every log record, metric and span this process exports, and /debug/tailer
+  # enumerates every file it is tailing. On the DaemonSet that is every
+  # container log line on the node, from every namespace scheduled there,
+  # selectable by resource-attribute glob; and that port is reachable from
+  # every pod in the cluster. So the binary does NOT serve those three openly.
+  #
+  # These settings apply to EVERY workload that runs the agent binary — the
+  # DaemonSet, the events/Azure singleton and the trace-tier StatefulSet — for
+  # the same reason `listen` above does: they all serve the same routes.
+  debug:
+    # A Secret holding a shared bearer token. Name one and the three surfaces
+    # are served to any request carrying `Authorization: Bearer <token>`;
+    # LEAVE IT EMPTY (the default) and they are served ONLY to a LOCAL
+    # connection — `kubectl port-forward` (the kubelet dials 127.0.0.1 inside
+    # the pod's network namespace, so a port-forward arrives as loopback, and
+    # reaching it already requires `pods/portforward` on the namespace), or a
+    # container in the agent's own pod. That default is the safe one and needs
+    # no configuration; set this only when something must read an agent
+    # REMOTELY — a central debug UI, a support script, a proxy.
+    #
+    # The token is re-read about once a minute, and the previous value stays
+    # accepted for a grace window, exactly like service.scrapeAuthToken — so
+    # rotating the Secret needs no restart of anything.
+    #
+    #   kubectl -n <ns> create secret generic kubescrape-debug \
+    #     --from-literal=token="$(openssl rand -hex 24)"
+    #
+    # Residual, stated so it is not a surprise: the /debug/otlp/ui page cannot
+    # add a header to its own fetch, so with a token configured the UI is
+    # usable through a port-forward or a header-adding proxy. A token is
+    # deliberately NOT accepted as a query parameter — that writes a
+    # credential into every access log between here and the browser.
+    tokenSecret:
+      name: ""           # empty = local-only (no -debug-token-file rendered)
+      key: token         # key within the Secret (mounted at /etc/kubescrape/debug/<key>)
+    # NetworkPolicy `from` selectors for the `listen` port, on every workload
+    # running the agent binary. EMPTY (the default) MEANS ANY POD MAY REACH
+    # IT — which is today's posture and is safe precisely because of the gate
+    # above: the data-bearing three answer only a local connection or the
+    # token, and what is left open is /healthz, /readyz, the /debug index,
+    # /debug/targets and /debug/transforms.
+    #
+    # READ THIS BEFORE SETTING IT. A NetworkPolicy scopes a PORT, not a path,
+    # and /healthz + /readyz share this port with the debug routes — so
+    # narrowing it narrows the KUBELET'S PROBES too. Whether that breaks them
+    # depends on your CNI (several treat node->pod traffic as outside policy;
+    # several do not), and on this chart a failing readiness probe stops a
+    # DaemonSet rolling update dead. If you set this, include the source your
+    # kubelet probes from — typically an ipBlock for the node CIDR:
+    #   allowFrom:
+    #     - ipBlock: {cidr: 10.0.0.0/16}          # nodes, for the probes
+    #     - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: ops}}
+    allowFrom: []
   # Export the agent's own metrics over OTLP at this interval (0 disables). A Go
   # duration string, or a bare 0; anything the duration flag would reject is
   # refused by the schema (see service.selfMetricsInterval above).
@@ -374,6 +468,16 @@ agent:
     # unauthenticated listener — the receive-buffer budget scales with it.
     # Also applied to the trace tier's application ports.
     grpcMaxRecvBytes: 0
+    # NetworkPolicy `from` selectors for the ingest ports, and for those ONLY.
+    # EMPTY MEANS ANY POD IN THE CLUSTER MAY PUSH LOGS AND METRICS INTO THIS
+    # NODE'S AGENT, with no credential — the same bargain every unauthenticated
+    # in-cluster OTLP receiver makes, and the counterpart of
+    # serviceGraph.ingest.allowFrom on the trace tier. The policy is three
+    # rules, so setting this leaves the other two alone: probes and the /debug
+    # index stay reachable, and so does the metrics port.
+    #   allowFrom:
+    #     - namespaceSelector: {matchLabels: {shipping-telemetry: "true"}}
+    allowFrom: []
 
   # Kubelet scraping; empty disables cadvisor, node metrics AND the
   # /stats/summary scrape — all three toggles above are a no-op without it,
@@ -560,6 +664,29 @@ agent:
   # -transforms-file ConfigMap (see extraArgs above).
   extraVolumes: []
   extraVolumeMounts: []
+  # 512Mi IS NOT AN ARBITRARY NUMBER — the ingest receiver's memory budgets are
+  # derived from it. With `ingest.enabled`, the receiver bounds itself at 64 MiB
+  # of raw request bodies plus roughly twice that as charged decoded structure,
+  # and those constants were chosen against this exact limit (see
+  # decodedBudgetFactor in internal/agent/otlpingest/admit.go), leaving the
+  # tailer, the scrapers and Go's own slack the remainder. Two consequences:
+  #   * LOWERING this without turning ingest off removes headroom the receiver
+  #     already believes it has, and the failure is an OOMKill rather than a 429.
+  #   * `-ingest-grpc-max-recv-bytes` (agent.ingest.grpcMaxRecvBytes) SCALES both
+  #     budgets, so raising it is a memory grant — raise this limit in step.
+  # cgroupStats adds ~5.5 MiB at 200 containers. There is deliberately no CPU
+  # limit: throttling a log tailer during an incident is how the incident stops
+  # being observable.
+  # The agent reads this limit from its own cgroup at startup and gives the Go
+  # GC 90% of it as GOMEMLIMIT (internal/cli/memlimit.go), so a heap excursion
+  # is collected instead of OOMKilled — measured at 0 kills in 16 runs of a
+  # burst that killed the unlimited arm 3 times, and at 0.00% cost when the
+  # limit does not bind. It tracks whatever is written here, so lowering this
+  # tightens the GC too and no second number has to be kept in step. Set
+  # GOMEMLIMIT in the pod env to override. Adding a CPU limit needs no change
+  # either: Go has derived GOMAXPROCS from a cpu limit since 1.25 (go.mod pins
+  # 1.26), which is what would otherwise oversubscribe the scheduler on a big
+  # node.
   resources:
     requests:
       cpu: 50m
@@ -641,8 +768,10 @@ serviceGraph:
   # every pod in the cluster and what it accepts is treated as FINAL — never
   # re-enriched, never re-routed — so it MUST be authenticated: create a Secret
   # with a random token and name it here; the file is re-read periodically so
-  # rotating it needs no restart. Leaving `name` empty renders no token flag and
-  # the binary REFUSES TO START that listener.
+  # rotating it needs no restart. REQUIRED whenever serviceGraph.enabled: the
+  # template refuses to render without it, because the binary refuses to start
+  # without it — leaving `name` empty used to install cleanly and then
+  # CrashLoopBackOff every shard.
   #   kubectl -n monitoring create secret generic kubescrape-service-graph \
   #     --from-literal=token="$(openssl rand -hex 24)"
   tokenSecret:
@@ -668,10 +797,12 @@ serviceGraph:
     # NetworkPolicy `from` selectors for the trace ports, and for those ONLY.
     # EMPTY MEANS ANY POD IN THE CLUSTER MAY PUSH TRACES, with no credential —
     # the same bargain every unauthenticated in-cluster OTLP collector makes.
-    # The policy is three rules, so setting this leaves the other two alone:
-    # health and metrics stay reachable (the kubelet's probes come from the
-    # node, Prometheus from wherever it runs) and the internal shard port stays
-    # open to this tier's own pods, which the ring is not optional without.
+    # The policy is four rules, so setting this leaves the other three alone:
+    # the probe/debug port and the metrics port stay reachable (the kubelet's
+    # probes come from the node, Prometheus from wherever it runs — narrow the
+    # first with agent.debug.allowFrom if you want to) and the internal shard
+    # port stays open to this tier's own pods, which the ring is not optional
+    # without.
     #   allowFrom:
     #     - namespaceSelector: {matchLabels: {shipping-traces: "true"}}
     allowFrom: []
@@ -766,12 +897,26 @@ serviceGraph:
   # Memory scales with maxItems (half-edges awaiting a partner) and
   # maxCardinality (edge series), not with the cluster's span rate; CPU scales
   # with the forwarded span rate divided by the shard count.
+  #
+  # tailSampling.maxSpans is sized AGAINST this limit: the binary's rule is that
+  # maxSpans x 1 KiB must fit a quarter of the container's memory limit, and it
+  # LOWERS an unset default that does not fit and REFUSES an explicit ceiling
+  # whose spans alone would need the whole limit. So raising maxSpans without
+  # raising this is a refusal at startup, not a silent OOM — but it is still a
+  # CrashLoop on the workload every trace in the cluster goes through.
   resources:
     requests:
       cpu: 50m
       memory: 128Mi
     limits:
       memory: 512Mi
+  # The tier is a hard cluster-wide dependency for traces — no per-node
+  # fallback — so a drain that takes every shard at once is a total trace
+  # outage. Off by default only because a PDB on a workload an operator has not
+  # sized yet blocks node drains; turn it on for anything but a first look.
+  podDisruptionBudget:
+    enabled: false
+    maxUnavailable: 1
 
 # Azure diagnostic-settings ingestion (resource logs + platform metrics) from
 # an Event Hubs namespace over its Kafka endpoint. Cluster-scoped like
@@ -829,11 +974,33 @@ azure:
 # enforcement worth having, and on a cluster with no NetworkPolicy controller
 # the objects are inert, so the default costs nothing there.
 #
-# NOTE what these actually enforce: the ingress rules declare which PORTS are
-# reachable (so undeclared ones — pprof — are closed), but they carry no `from`
-# selector, so they do NOT restrict WHO may reach the declared ones. The
-# metadata API's documents are object metadata the node's kubelet already has;
-# if your threat model needs the API restricted to the agents, add a `from`
-# selector here.
+# WHAT IS OPEN TO WHOM, by default, once these are on. Every rule declares
+# PORTS, so undeclared listeners (pprof) are closed on every workload; whether a
+# rule also restricts WHO depends on the rule:
+#
+#   * OPEN TO EVERY POD, by default:
+#       - the metadata service's API port (service.listen, :8080) — the /v1
+#         routes are unauthenticated BY DESIGN, agents poll them, and what they
+#         return is pod/owner/namespace metadata the node's kubelet already
+#         holds. The one exception is /v1/scrape-auth, which serves Secret
+#         material and is bearer-authenticated (service.scrapeAuthToken).
+#       - every workload's `listen` port (:8081 on the agent binary) — probes
+#         plus the /debug index. The three DATA-BEARING debug routes on it are
+#         gated in-process (see agent.debug above), not by this policy.
+#       - the metrics port, which metrics.scrapeAnnotations asks Prometheus to
+#         scrape from wherever Prometheus runs.
+#       - the agent's OTLP ingest ports and the trace tier's application trace
+#         ports, when enabled: unauthenticated receivers, by the same bargain
+#         every in-cluster OTLP collector makes.
+#   * ALREADY SCOPED, regardless of any value you set: the trace tier's INTERNAL
+#     shard port, to that tier's own pods — the ring is not optional.
+#
+# WHAT TO TIGHTEN FIRST, in order: agent.ingest.allowFrom and
+# serviceGraph.ingest.allowFrom (unauthenticated writers — a stranger pushing
+# telemetry costs you storage and pollutes your data), then agent.debug.allowFrom
+# (a reader, and one already gated in-process), then the metadata API if your
+# threat model needs it restricted to the agents — add a `from` selector to the
+# service policy in templates/service.yaml for that one; it has no value yet
+# because narrowing it wrongly makes every agent on the cluster stop resolving.
 networkPolicy:
   enabled: true

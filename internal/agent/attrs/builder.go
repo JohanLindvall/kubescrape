@@ -1,9 +1,11 @@
 package attrs
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"regexp"
 	"regexp/syntax"
@@ -11,11 +13,19 @@ import (
 	"sort"
 	"strings"
 	"text/template"
+	"time"
 
 	"go.opentelemetry.io/collector/pdata/pcommon"
 
+	"github.com/JohanLindvall/kubescrape/internal/logdedupe"
 	"github.com/JohanLindvall/kubescrape/pkg/kubemeta"
 )
+
+// templateWarnEvery paces the per-template render-failure line. Build runs
+// per RESOURCE — 12k of them per scrape cycle on a KSM split path — so the
+// window has to be long enough that a template failing on every one of them
+// is still one line.
+const templateWarnEvery = 5 * time.Minute
 
 // NodeInfo is the metadata of the node the agent runs on.
 type NodeInfo struct {
@@ -246,6 +256,14 @@ type Builder struct {
 type dynamicAttr struct {
 	key  string
 	tmpl *template.Template
+	// warn throttles the one line explaining why this attribute is missing.
+	// Per TEMPLATE, not per resource: the failure is a property of the
+	// template plus the SHAPE of the context, so a builder that fails once
+	// fails on every resource of that shape, and one line per template per
+	// window is the whole story. A pointer because Builder values are copied
+	// nowhere but the slice grows by append, and a Throttle must not be
+	// copied after first use.
+	warn *logdedupe.Throttle
 }
 
 // regexCache backs the template regex functions.
@@ -348,7 +366,7 @@ func NewBuilder(cfg *Config, filter *Filter) (*Builder, error) {
 		if err := validateTemplate(tmpl); err != nil {
 			return nil, fmt.Errorf("attribute %q: %w", key, err)
 		}
-		b.dynamic = append(b.dynamic, dynamicAttr{key: key, tmpl: tmpl})
+		b.dynamic = append(b.dynamic, dynamicAttr{key: key, tmpl: tmpl, warn: &logdedupe.Throttle{}})
 	}
 	return b, nil
 }
@@ -437,7 +455,8 @@ func (b *Builder) Build(res pcommon.Resource, ctx Context) {
 			res.Attributes().PutStr(key, value)
 		}
 		var sb strings.Builder
-		for _, d := range b.dynamic {
+		for i := range b.dynamic {
+			d := &b.dynamic[i]
 			sb.Reset()
 			// Execution errors (e.g. a nil .Pod on a node-level resource) and
 			// empty results mean "attribute not applicable here". The silent
@@ -446,7 +465,26 @@ func (b *Builder) Build(res pcommon.Resource, ctx Context) {
 			// value-independent config errors — a typo'd field, a bad literal
 			// regex — were refused at startup, so only not-applicable contexts
 			// and value-dependent misses reach this branch.
-			if err := d.tmpl.Execute(&sb, ctx); err == nil && sb.Len() > 0 {
+			//
+			// Safe is not the same as EXPLICABLE, though, and the difference
+			// is what an operator pays on a first live run: a template that
+			// indexes an owner that is not there, or slices a name shorter
+			// than the slice, produces an attribute that is simply absent —
+			// from every resource, forever, with nothing anywhere saying why.
+			// So the error is reported once per template per window, at Debug
+			// (it is legitimate for the pipelines whose Context lacks the
+			// field, which is why it cannot be a Warn) and behind the level
+			// check, because rendering the error costs more than the field
+			// reads around it. An EMPTY result stays silent: that is the
+			// normal way a `{{ with .Node }}` template says "not here".
+			if err := d.tmpl.Execute(&sb, ctx); err != nil {
+				if slog.Default().Enabled(context.Background(), slog.LevelDebug) && d.warn.Allow(templateWarnEvery) {
+					slog.Debug("a resourceAttributes template failed to render, so the attribute is omitted "+
+						"from this resource", "key", d.key, "error", err)
+				}
+				continue
+			}
+			if sb.Len() > 0 {
 				res.Attributes().PutStr(d.key, sb.String())
 			}
 		}

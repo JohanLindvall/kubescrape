@@ -21,8 +21,40 @@ spec:
       app: kubescrape-agent
   policyTypes: [Ingress]
   ingress:
+    # THREE rules, because these ports have three different audiences and a
+    # NetworkPolicy rule's `from` and `ports` apply TOGETHER — one rule with a
+    # `from` would scope every port in it. Same split, for the same reason, as
+    # the trace tier's policy in servicegraph.yaml.
+    #
+    # 1. The -listen port: /healthz, /readyz, the /debug index, /debug/targets,
+    #    /debug/transforms — and the three DATA-BEARING routes, /debug/otlp,
+    #    /debug/otlp/ui and /debug/tailer, which stream this node's whole
+    #    telemetry feed.
+    #
+    #    OPEN TO EVERY POD BY DEFAULT, and that is deliberate rather than
+    #    unconsidered: the kubelet probes this port and a DaemonSet rolling
+    #    update stops dead on a failing readiness probe, while WHAT IS WORTH
+    #    PROTECTING here is protected in-process instead — the three
+    #    data-bearing routes answer only a local connection (a port-forward
+    #    arrives as loopback) or the agent.debug.tokenSecret bearer token, and
+    #    refuse everything else with kubescrape_debug_refused_total{reason}.
+    #    A neighbour pod reaching this port gets probes and target/transform
+    #    state, which is what the metadata service's /v1 routes already serve
+    #    it unauthenticated.
+    #
+    #    agent.debug.allowFrom narrows it anyway, for a fleet that wants defence
+    #    in depth. Read its comment in values.yaml first: a policy scopes a PORT
+    #    and not a path, so the probes are narrowed with it and the `from` must
+    #    include whatever your CNI presents the kubelet as.
     - ports:
         - port: 8081
+    # 2. The Prometheus scrape port. Deliberately unscoped: metrics.scrapeAnnotations
+    #    asks for it to be scraped from wherever Prometheus runs, and this
+    #    chart cannot know where that is. It serves the process's own
+    #    go_*/process_*/kubescrape_* counters — no telemetry contents.
+    #    Undeclared ports (pprof, which exposes goroutine stacks and heap
+    #    contents) stay closed on every rule here.
+    - ports:
         - port: 9090
 ---
 # Source: kubescrape/templates/service.yaml
@@ -30,6 +62,29 @@ spec:
 # metrics.scrapeAnnotations is on, a scraper reaches the metrics port — so both
 # belong here. The pprof port is deliberately NOT opened: it exposes goroutine
 # stacks and heap contents, and is the one listener the chart wants firewalled.
+#
+# BOTH RULES ARE OPEN TO EVERY POD, and unlike the agent's this is not backed by
+# a second gate: the /v1 routes are unauthenticated BY DESIGN, because every
+# agent polls them on every cycle and a per-agent credential buys nothing the
+# ServiceAccount does not already imply. What they hand out is pod, owner and
+# namespace metadata — object metadata the node's own kubelet already holds, and
+# with kubectl.kubernetes.io/last-applied-configuration and kapp's
+# original-object annotation stripped (kubemeta.FilterAnnotations), because
+# those carry the whole applied spec verbatim. /v1/scrape-auth is the one
+# exception and the one route that serves Secret material: it is bearer-
+# authenticated (service.scrapeAuthToken) and refuses to be enabled without a
+# token. This port also serves the /debug index and its forms, which are
+# ungated for the same reason — they show the same documents the /v1 routes do.
+#
+# TO TIGHTEN IT, add a `from` to the first rule below scoping it to the agent
+# DaemonSet (and to anything else you point at the API):
+#   from:
+#     - podSelector: {matchLabels: {app: <release>-agent}}
+# There is no value for it because the failure mode of getting it wrong is
+# fleet-wide: every agent stops resolving container metadata at once, and the
+# symptom is unattributed telemetry rather than an error anyone is watching.
+# The metrics rule stays separate so scoping the API does not also cut the
+# Prometheus scrape, which metrics.scrapeAnnotations asked for.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -45,8 +100,11 @@ spec:
       app: kubescrape
   policyTypes: [Ingress]
   ingress:
+    # 1. The metadata API, plus /healthz, /readyz and /debug.
     - ports:
         - port: 8080
+    # 2. The Prometheus scrape port.
+    - ports:
         - port: 9090
 ---
 # Source: kubescrape/templates/agent.yaml
@@ -217,6 +275,9 @@ spec:
         - effect: NoSchedule
           key: node-role.kubernetes.io/control-plane
           operator: Exists
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: agent
           image: ghcr.io/johanlindvall/kubescrape:latest
@@ -258,7 +319,6 @@ spec:
             - -scrape-health-metrics=true
             - -log-level=info
             - -metrics-listen=:9090
-            - -log-format=text
           env:
             - name: NODE_NAME
               valueFrom:
@@ -347,6 +407,9 @@ spec:
     spec:
       serviceAccountName: kubescrape
       priorityClassName: system-cluster-critical
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: kubescrape
           image: ghcr.io/johanlindvall/kubescrape:latest
@@ -373,7 +436,6 @@ spec:
             - -otlp-timeout=15s
             - -log-level=info
             - -metrics-listen=:9090
-            - -log-format=text
           ports:
             - name: http
               containerPort: 8080

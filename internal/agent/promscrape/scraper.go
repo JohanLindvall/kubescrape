@@ -12,6 +12,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/pmetric"
@@ -162,6 +163,36 @@ type Scraper struct {
 	// an OUTAGE rather than a configuration mistake, so it is worth saying
 	// again the next time it happens.
 	metaBudgetWarn logdedupe.Throttle
+	// failWarned throttles the per-target "scrape failed" line (failures.go).
+	// A SECOND table rather than `warned`, because the two windows differ on
+	// purpose: a configuration complaint is once per process (nothing changes
+	// until a CR is edited), while a failing scrape re-warns, an operator
+	// having fixed it out of band being the expected outcome.
+	failMu     sync.Mutex
+	failWarned *logdedupe.Table
+	// emptyTargets latches the "this node has no scrape targets" state so the
+	// transition is reported once and the recovery is reported at all — the
+	// apiserver-reachability shape, for the condition that is the most common
+	// first-run failure and moves no counter of its own.
+	emptyTargets    bool
+	emptyTargetWarn logdedupe.Throttle
+	// lastTargets is the previous cycle's target count, for the Debug line that
+	// reports the set changing size. Written only by the cycle goroutine.
+	lastTargets    int
+	lastTargetsSet bool
+	// tlsEvictWarn and relabelEvictWarn throttle the two bounded per-target
+	// caches' eviction notices. Both evict SILENTLY by design — the scrape
+	// still works, it just rebuilds a transport or recompiles a chain — so
+	// nothing at all reported a fleet whose credentials rotate faster than the
+	// cache holds them, which is a handshake per target per cycle.
+	//
+	// ONE GATE PER CACHE, not one shared gate: they are independent conditions
+	// with different remedies (rotate less / stop templating regexes), and a
+	// shared keyless throttle would let whichever fired first suppress the
+	// other for the whole window — the report that never arrives is the one
+	// nobody knows to look for.
+	tlsEvictWarn     logdedupe.Throttle
+	relabelEvictWarn logdedupe.Throttle
 
 	// insecureHTTP serves monitor endpoints with tlsConfig.insecureSkipVerify.
 	insecureHTTP *http.Client
@@ -349,17 +380,24 @@ func (s *Scraper) tickInterval() time.Duration {
 // non-positive value, which is reported once and left to the caller's fallback
 // rather than failing the target — the CR is the user's, and dropping their
 // metrics over a typo in an optional field is worse than scraping at the
-// default cadence. The offending VALUE is part of the warn key, so correcting
-// a typo and re-introducing a different one still warns, while the same bad
-// value on the same monitor never warns twice.
+// default cadence.
+//
+// The offending VALUE rides on the line but is NOT part of the key: see
+// warnOnce. It used to be, so that re-introducing a different typo warned
+// again — a real but small diagnostic gain, paid for by letting anyone who can
+// edit one ServiceMonitor mint an unbounded number of never-expiring keys (one
+// per edit) and permanently saturate the table every other complaint in this
+// package shares. One line per (field, target) is what the operator needs; the
+// second typo on the same field of the same monitor is now silent until a
+// restart, which is the cheap half of that trade.
 func (s *Scraper) parseTargetDuration(t kubemeta.ScrapeTarget, kind, attr, value string) (time.Duration, bool) {
 	// promdur is the shared prometheus-operator duration parser (the metadata
 	// service's monitor merge reads the same values through it); the
 	// non-positive gate below is THIS caller's rule, not the parser's.
 	d, err := promdur.Parse(value)
 	if err != nil || d <= 0 {
-		s.warnOnce(kind+":"+warnTarget(t)+":"+value, "ignoring invalid scrape "+kind+" on target",
-			"url", t.URL, "monitor", t.Monitor, attr, value)
+		s.warnOnce(kind+":"+warnTarget(t), "ignoring invalid scrape "+kind+" on target",
+			"url", t.URL, "monitor", t.Monitor, attr, clipForLog(value))
 		return 0, false
 	}
 	return d, true
@@ -399,7 +437,9 @@ func (s *Scraper) targetTimeout(t kubemeta.ScrapeTarget, interval time.Duration)
 	// once instead of quietly handing back a fifth of what was asked for.
 	got := min(out, interval, s.cfg.Interval)
 	if asked > 0 && got < asked {
-		s.warnOnce("timeoutclamp:"+warnTarget(t)+":"+t.ScrapeTimeout, "scrape timeout clamped below the monitor's scrapeTimeout; raise -scrape-interval to allow a longer one",
+		// The key is the target's identity alone; the value it asked for is a
+		// PARSED duration by now, and rides as an attribute.
+		s.warnOnce("timeoutclamp:"+warnTarget(t), "scrape timeout clamped below the monitor's scrapeTimeout; raise -scrape-interval to allow a longer one",
 			"url", t.URL, "monitor", t.Monitor,
 			"scrapeTimeout", asked, "effective", got, "scrapeInterval", s.cfg.Interval)
 	}
@@ -418,6 +458,18 @@ const maxWarnKeys = 1024
 // complaints that would otherwise repeat every cycle forever. A zero re-warn
 // window is what makes it "once": the operator has to edit a CR, and until they
 // do there is nothing new to say.
+//
+// THE KEY RULE, and it is a security boundary rather than a style preference:
+// **a key is built from IDENTITY, never from content a target supplies.** The
+// window is zero, so nothing in this table ever expires; the cap therefore
+// SUPPRESSES (internal/logdedupe's rule, and the right one — clearing is worse)
+// and the suppression is permanent for the process. A key carrying bytes off a
+// scraped body, or a free-form field a workload can rewrite, hands whoever
+// controls those bytes a way to mint maxWarnKeys distinct keys and shut every
+// FUTURE warning in this package — the kubelet's RBAC refusal, a monitor's
+// uncompilable regex — for the life of the agent. Identity (warnTarget, the
+// kubelet endpoint, a pipeline name) is bounded by the cluster's own objects;
+// content is not. Content still RIDES on the line, through clipForLog.
 func (s *Scraper) warnOnce(key, msg string, args ...any) {
 	s.dueMu.Lock()
 	if s.warned == nil {
@@ -434,6 +486,28 @@ func (s *Scraper) warnOnce(key, msg string, args ...any) {
 	if allow {
 		s.log.Warn(msg, args...)
 	}
+}
+
+// maxLoggedValueBytes bounds one target-supplied value on a log line. A metric
+// family name or a monitor field arrives from outside this process and is
+// bounded only by the body/CR size, and a megabyte of it in a log record is a
+// second flood in the shape of one line.
+const maxLoggedValueBytes = 96
+
+// clipForLog renders a target-supplied value for a log attribute: bounded, and
+// cut on a rune boundary so a clipped UTF-8 sequence does not become a
+// replacement character in whatever reads the line. It is the counterpart of
+// the key rule above — the value cannot be part of the KEY, so this is how it
+// still reaches the operator.
+func clipForLog(v string) string {
+	if len(v) <= maxLoggedValueBytes {
+		return v
+	}
+	cut := maxLoggedValueBytes
+	for cut > 0 && !utf8.RuneStart(v[cut]) {
+		cut--
+	}
+	return v[:cut] + "…"
 }
 
 // warnTarget identifies a target for warnOnce by the CONFIGURATION that
@@ -471,11 +545,22 @@ func (s *Scraper) cycle(ctx context.Context) {
 		targets, err = s.cfg.Targets.NodeTargets(ctx, s.cfg.Node)
 		targetsOK = err == nil
 		if targetsOK && s.cfg.TargetHook != nil {
+			// The hook can drop targets, and a dropped target is
+			// indistinguishable from one the metadata service never returned:
+			// same empty list, same silence. Report the difference so a
+			// transforms-file mistake is not diagnosed as a discovery problem.
+			before := len(targets)
 			targets = s.cfg.TargetHook(targets)
+			if n := before - len(targets); n != 0 {
+				s.log.Debug("the transforms file's targets: hook changed the target list",
+					"node", s.cfg.Node, "targets", len(targets), "dropped", n)
+			}
 		}
 		if err != nil {
 			s.log.Error("fetching scrape targets", "node", s.cfg.Node, "error", err)
 			// The kubelet scrapes below do not depend on the target list.
+		} else {
+			s.reportTargetSet(targets)
 		}
 	}
 
@@ -519,8 +604,16 @@ func (s *Scraper) cycle(ctx context.Context) {
 				pipeline: pipeline, url: url, target: target,
 				ok: err == nil, err: errStr, duration: time.Since(start), samples: samples,
 			})
-			if err != nil && ctx.Err() == nil {
-				s.log.Warn("scrape failed", "pipeline", pipeline, "url", url, "error", err)
+			if err != nil {
+				// Counted (and warned) whatever the context says: a scrape
+				// cancelled by shutdown classifies as `canceled` and reports
+				// only the counter, so the rate stays honest without a rolling
+				// update logging one accusation per target.
+				key := url
+				if target != nil {
+					key = warnTarget(*target)
+				}
+				s.reportScrapeFailure(pipeline, url, key, err, ctx.Err() != nil)
 			}
 		}()
 		return true
@@ -883,11 +976,15 @@ func (s *Scraper) scrapeTarget(ctx context.Context, t kubemeta.ScrapeTarget, tim
 		req.Header.Set("Accept", "text/plain;version=0.0.4")
 	}
 	if err := s.applyAuth(ctx, req, t); err != nil {
-		return 0, err
+		// A credential this agent could not RESOLVE, which is a different
+		// remedy from one the target refused (see failures.go): the metadata
+		// service has to be running -scrape-auth-secrets and this agent has to
+		// hold a matching token.
+		return 0, classify(reasonAuth, err)
 	}
 	client, err := s.clientFor(ctx, t, timeout)
 	if err != nil {
-		return 0, err
+		return 0, classify(reasonTLS, err)
 	}
 	resp, err := client.Do(req)
 	if err != nil {
@@ -895,12 +992,22 @@ func (s *Scraper) scrapeTarget(ctx context.Context, t kubemeta.ScrapeTarget, tim
 	}
 	defer drainClose(resp.Body)
 	if resp.StatusCode != http.StatusOK {
-		return 0, fmt.Errorf("status %d", resp.StatusCode)
+		// The typed form, not fmt.Errorf: it is what lets 401/403 be counted
+		// apart from every other non-200 without matching the message text. The
+		// rendered string is byte-identical to what it replaced.
+		return 0, &statusError{code: resp.StatusCode}
 	}
 
 	// The target decides the format; some exporters serve OpenMetrics
 	// regardless of Accept, so detect from the response.
-	openMetrics := strings.Contains(resp.Header.Get("Content-Type"), "openmetrics")
+	contentType := resp.Header.Get("Content-Type")
+	openMetrics := strings.Contains(contentType, "openmetrics")
+	s.reportNegotiation(t, useProto, contentType, openMetrics)
+
+	// warnTarget, never the URL: the per-scrape complaints are deduped by the
+	// CONFIGURATION that produced the target, so a pod restart neither re-fires
+	// them nor grows the shared dedupe table.
+	warnKey := warnTarget(t)
 
 	var cb chunker
 	if sp := s.splitterFor(t.Pod); sp != nil {
@@ -910,15 +1017,26 @@ func (s *Scraper) scrapeTarget(ctx context.Context, t kubemeta.ScrapeTarget, tim
 			s.fillTargetResource(res, t.URL, &t.Pod, t.Service)
 		}, s.cfg.StartTime, time.Now())
 	}
-	relabel, err := s.relabels.session(t.MetricRelabelings)
-	if err != nil {
-		return 0, err // exporting what the user asked to drop is worse than failing visibly
+	relabel, relabelEvicted, err := s.relabels.session(t.MetricRelabelings)
+	if relabelEvicted {
+		// Reported here rather than inside the cache: session holds the cache's
+		// mutex while it evicts, and every scrape goroutine on the node contends
+		// for it. Nothing is lost — the chain recompiles — so this is a Warn
+		// about COST, and the realistic cause is a controller templating a
+		// distinct regex per monitor, which no counter in this package sees.
+		s.warnCacheEviction(&s.relabelEvictWarn, "compiled metricRelabelings chains", maxRelabelChains,
+			"more distinct rule chains are in use than the cache holds: a controller is probably minting a templated or hashed regex per monitor, so every scrape recompiles its chain")
 	}
-	// warnTarget, never the URL: the per-scrape complaints are deduped by the
-	// CONFIGURATION that produced the target, so a pod restart neither re-fires
-	// them nor grows the shared dedupe table.
-	warnKey := warnTarget(t)
-	if strings.Contains(resp.Header.Get("Content-Type"), "application/vnd.google.protobuf") {
+	if err != nil {
+		// Exporting what the user asked to drop is worse than failing visibly —
+		// but the failure has to name the monitor whose regex is broken, or the
+		// only evidence is one target permanently down for a reason that is not
+		// on the target.
+		s.warnOnce("relabel:"+warnTarget(t), "a monitor's metricRelabelings would not compile; the scrape fails rather than export series the rule asked to drop",
+			"url", t.URL, "monitor", t.Monitor, "error", err)
+		return 0, classify(reasonRelabel, err)
+	}
+	if strings.Contains(contentType, protoContentType) {
 		// Only decode protobuf when the operator OPTED IN (NativeHistograms).
 		// The proto path materialises the whole MetricFamily via proto.Unmarshal
 		// (no streaming bound like the text front's), and the transport
@@ -928,7 +1046,18 @@ func (s *Scraper) scrapeTarget(ctx context.Context, t kubemeta.ScrapeTarget, tim
 		// sent Accept: text/plain, so a protobuf response is a misbehaving
 		// target: fail the scrape visibly (up=0) rather than parse it.
 		if !s.cfg.NativeHistograms {
-			return 0, fmt.Errorf("target served protobuf but native histograms are not enabled")
+			// Named once per target as well as counted: the scrape fails with
+			// up=0 and the operator's next question is whose fault that is —
+			// the answer being that the target ignored our Accept header, and
+			// that one flag makes it work.
+			// The Content-Type is the TARGET's bytes — a header it chose, of
+			// whatever length it chose — so it rides through clipForLog like
+			// every other value from outside this process.
+			s.warnOnce("protorefused:"+warnKey,
+				"target served the protobuf exposition although this agent asked for text; refusing to decode it",
+				"url", t.URL, "monitor", t.Monitor, "contentType", clipForLog(contentType), "flag", "-scrape-native-histograms")
+			return 0, classify(reasonProtoRefused,
+				fmt.Errorf("target served protobuf but native histograms are not enabled"))
 		}
 		return s.scrapeProto(ctx, resp.Body, cb, relabel, t.URL, warnKey)
 	}

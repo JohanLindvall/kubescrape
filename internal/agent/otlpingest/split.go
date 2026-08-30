@@ -280,6 +280,12 @@ func (g *metricGrouper) admit(id string) bool {
 		}
 		g.refused[id] = struct{}{}
 		obs.Ingested.WithLabelValues("split_capped").Inc()
+		// The counter says how many objects lost their enrichment; only a line
+		// can say WHICH bound bound and how far past it the sender is, and the
+		// two have different fixes (fewer objects per push vs smaller pushes).
+		// Once per bound per window, not once per object: a push naming 12,000
+		// pods would otherwise produce ~10,000 lines from one request.
+		g.enricher.noteSplitCapped(grouped, g.cache)
 	}
 	return false
 }

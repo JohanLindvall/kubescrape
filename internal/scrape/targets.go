@@ -3,7 +3,6 @@
 package scrape
 
 import (
-	"net"
 	"strconv"
 	"strings"
 
@@ -44,6 +43,14 @@ const (
 // A refused target is NOT scraped, so it is counted (obs.ScrapeTargetsCapped)
 // and named by /v1/explain rather than dropped silently. A real workload
 // scrapes a handful of ports; this is far above any legitimate use.
+//
+// It bounds the COUNT against a per-target cost it MODELS as "the ~2 KiB pod
+// document" — and a model is not a bound. MaxTargetBytesPerPod (docsize.go) is
+// the sibling that measures the document instead of assuming it, applied at the
+// same seam and counted into the same counter; the two refusals are told apart
+// by the operator through cappedTargetsBySize and SizeCeilingNote. Neither
+// subsumes the other: this one is what keeps a pod with a tiny document from
+// producing eight hundred targets inside that budget.
 const MaxPortsPerPod = 16
 
 // PodTargets returns the scrape targets derived from a pod's own
@@ -59,7 +66,10 @@ func PodTargets(pod kubemeta.Pod) []kubemeta.ScrapeTarget {
 	if pod.Annotations[AnnotationScrape] != "true" || !Scrapeable(pod) {
 		return nil
 	}
-	scheme, path := schemeAndPath(pod.Annotations)
+	scheme, path, ok := schemeAndPath(pod.Annotations)
+	if !ok {
+		return nil
+	}
 	var targets []kubemeta.ScrapeTarget
 	for _, port := range podPorts(pod) {
 		t := makeTarget(pod, scheme, path, port)
@@ -83,7 +93,10 @@ func ServiceTargets(pod kubemeta.Pod, svc *services.Service) []kubemeta.ScrapeTa
 	if svc == nil || svc.Annotations[AnnotationScrape] != "true" || !Scrapeable(pod) {
 		return nil
 	}
-	scheme, path := schemeAndPath(svc.Annotations)
+	scheme, path, ok := schemeAndPath(svc.Annotations)
+	if !ok {
+		return nil
+	}
 	info := serviceInfo(svc)
 	var targets []kubemeta.ScrapeTarget
 	seen := make(map[int32]struct{})
@@ -149,14 +162,22 @@ func MonitorTargetURL(pod kubemeta.Pod, svc *services.Service, ep servicemonitor
 // monitorEndpoint resolves a ServiceMonitor endpoint against a pod behind a
 // Service: the scheme/path defaults and the pod port the endpoint names.
 func monitorEndpoint(pod kubemeta.Pod, svc *services.Service, ep servicemonitors.Endpoint) (scheme, path string, port int32, ok bool) {
-	if svc == nil || !Scrapeable(pod) {
+	// A REFUSED endpoint yields no target on any pod: one of its strings was
+	// over servicemonitors' ceilings, and none of them has a safe shorter form
+	// (see servicemonitors.Endpoint.Refused). Checked before the port so the
+	// refusal is what an operator is told about, not a downstream symptom of
+	// the blanked port.
+	if svc == nil || ep.Refused != "" || !Scrapeable(pod) {
 		return "", "", 0, false
 	}
 	port, ok = monitorPodPort(pod, svc, ep)
 	if !ok {
 		return "", "", 0, false
 	}
-	scheme, path = defaultSchemePath(ep.Scheme, ep.Path)
+	scheme, path, ok = defaultSchemePath(ep.Scheme, ep.Path)
+	if !ok {
+		return "", "", 0, false
+	}
 	return scheme, path, port, true
 }
 
@@ -212,7 +233,8 @@ func PodMonitorTargetURL(pod kubemeta.Pod, ep servicemonitors.Endpoint) (string,
 // podMonitorEndpoint resolves a PodMonitor endpoint against a pod: Port names a
 // CONTAINER port, targetPort (deprecated) is a number or a container port name.
 func podMonitorEndpoint(pod kubemeta.Pod, ep servicemonitors.Endpoint) (scheme, path string, port int32, ok bool) {
-	if !Scrapeable(pod) {
+	// See monitorEndpoint: a refused endpoint resolves to nothing.
+	if ep.Refused != "" || !Scrapeable(pod) {
 		return "", "", 0, false
 	}
 	if ep.Port == "" && ep.TargetPort == nil {
@@ -234,7 +256,10 @@ func podMonitorEndpoint(pod kubemeta.Pod, ep servicemonitors.Endpoint) (scheme, 
 			return "", "", 0, false
 		}
 	}
-	scheme, path = defaultSchemePath(ep.Scheme, ep.Path)
+	scheme, path, ok = defaultSchemePath(ep.Scheme, ep.Path)
+	if !ok {
+		return "", "", 0, false
+	}
 	return scheme, path, port, true
 }
 
@@ -441,14 +466,50 @@ func Scrapeable(pod kubemeta.Pod) bool {
 	return !kubemeta.FinishedPhase(pod.Phase)
 }
 
-func schemeAndPath(annotations map[string]string) (scheme, path string) {
+// MaxTargetPathBytes bounds the scrape PATH a target may carry, at every door
+// that names one. The path is copied into BOTH t.URL and t.Path of every target
+// the door produces, and /v1/nodes/{node}/targets marshals every target of
+// every pod on the node into one body on every agent poll — so an unbounded
+// path is an unbounded body, which is the "a bound on ENTRIES is not a bound on
+// BYTES" lesson MaxPortsPerPod already records: that ceiling bounds the target
+// COUNT against a per-target cost it models as the ~2 KiB pod document — the
+// model MaxTargetBytesPerPod now measures. This bound still earns its keep
+// beside that one (docsize.go says why in full): it refuses a FIELD, with a
+// diagnostic naming the annotation and its size, and it binds on a pod's first
+// target, which the byte budget deliberately never refuses.
+//
+// The monitor door has its OWN ceiling at parse time
+// (servicemonitors.enforceFieldBounds, which carries the measurement and the
+// argument for refusing rather than truncating). This one covers the
+// ANNOTATION door, whose path is likewise attacker-supplied by anyone who can
+// annotate a pod or a Service — bounded by the API server only at the 256 KiB
+// total-annotations limit, i.e. two orders of magnitude above anything a real
+// path needs, and then multiplied by the targets the pod produces.
+// TestMonitorPathDoorIsNoLooserThanTheAnnotationDoor pins the two together.
+//
+// Over the ceiling the door yields NO targets rather than a truncated or
+// defaulted path: see enforceFieldBounds for why those two are the worse
+// outcomes. /v1/explain reports it through the same port-entry verdicts as
+// every other refusal (PathRefusedNote).
+const MaxTargetPathBytes = 2 << 10
+
+// schemeAndPath resolves a door's scheme/path annotations, reporting false when
+// the path is over MaxTargetPathBytes and the door therefore yields nothing.
+func schemeAndPath(annotations map[string]string) (scheme, path string, ok bool) {
 	return defaultSchemePath(annotations[AnnotationScheme], annotations[AnnotationPath])
 }
 
 // defaultSchemePath applies the scrape scheme/path defaults: anything but
 // "https" becomes "http", an empty path becomes "/metrics", and a path is given
-// a leading slash.
-func defaultSchemePath(scheme, path string) (string, string) {
+// a leading slash. It reports false for a path over MaxTargetPathBytes, which
+// no caller may serve.
+//
+// The scheme needs no ceiling: it comes out of here as one of two constants,
+// so its size can never reach a target however long it was written.
+func defaultSchemePath(scheme, path string) (string, string, bool) {
+	if len(path) > MaxTargetPathBytes {
+		return "", "", false
+	}
 	if scheme != "https" {
 		scheme = "http"
 	}
@@ -458,7 +519,7 @@ func defaultSchemePath(scheme, path string) (string, string) {
 	if !strings.HasPrefix(path, "/") {
 		path = "/" + path
 	}
-	return scheme, path
+	return scheme, path, true
 }
 
 // serviceInfo is the kubemeta.Service view stamped onto a service-derived target.
@@ -473,11 +534,19 @@ func serviceInfo(svc *services.Service) *kubemeta.Service {
 }
 
 func makeTarget(pod kubemeta.Pod, scheme, path string, port int32) kubemeta.ScrapeTarget {
-	address := podAddress(pod, port)
+	var buf [urlScratch]byte
+	b, from, to := appendTargetURL(buf[:0], scheme, pod.PodIP, port, path)
+	url := string(b)
 	return kubemeta.ScrapeTarget{
-		URL:     renderURL(scheme, address, path),
-		Scheme:  scheme,
-		Address: address,
+		URL:    url,
+		Scheme: scheme,
+		// A SUBSTRING of the URL rather than a second string: it is the same
+		// bytes, and the two fields are born and die together in this struct,
+		// so sharing the backing array pins nothing that was not already alive.
+		// (The usual hazard of slicing a Go string — a short label holding a
+		// huge original alive, which internal/agent/cumagg.Retain exists for —
+		// needs the two lifetimes to DIFFER, and here they cannot.)
+		Address: url[from:to],
 		Port:    port,
 		Path:    path,
 		Pod:     pod,
@@ -485,19 +554,52 @@ func makeTarget(pod kubemeta.Pod, scheme, path string, port int32) kubemeta.Scra
 }
 
 // targetURL is what makeTarget would name this target, without building it.
-// Both go through renderURL: the URL is a scrape target's IDENTITY (it is what
-// the server dedups on and what the agent keys a scrape by), so the cheap half
-// and the full half must not be able to spell it differently.
+//
+// Both go through appendTargetURL: the URL is a scrape target's IDENTITY (it is
+// what the server dedups on and what the agent keys a scrape by), so the cheap
+// half and the full half must not be able to spell it differently.
+// targeturl_test.go drives both over every resolution shape.
 func targetURL(pod kubemeta.Pod, scheme, path string, port int32) string {
-	return renderURL(scheme, podAddress(pod, port), path)
+	var buf [urlScratch]byte
+	b, _, _ := appendTargetURL(buf[:0], scheme, pod.PodIP, port, path)
+	return string(b)
 }
 
-func podAddress(pod kubemeta.Pod, port int32) string {
-	return net.JoinHostPort(pod.PodIP, strconv.Itoa(int(port)))
-}
+// urlScratch is the stack buffer appendTargetURL builds into: a scheme, "://",
+// a bracketed IPv6 literal, a port and a short path all fit, so the rendered
+// URL costs ONE allocation (the string) instead of the three the obvious
+// spelling costs — net.JoinHostPort, strconv.Itoa and the concatenation.
+//
+// That is not micro-optimisation for its own sake: resolving a URL is the
+// MARGINAL cost of one more monitor endpoint resolving to a pod, which is the
+// whole point of the URL pre-check in the server's merge, and an alloc profile
+// of 100 colliding monitors found renderURL + net.JoinHostPort + FormatInt at
+// 78% of every object the derivation allocated. A path longer than this simply
+// grows onto the heap and is still correct.
+const urlScratch = 128
 
-func renderURL(scheme, address, path string) string {
-	return scheme + "://" + address + path
+// appendTargetURL appends scheme://host:port + path to dst, reporting where the
+// host:port substring begins and ends within the result.
+//
+// The host:port half is net.JoinHostPort's spelling, restated here rather than
+// called, because JoinHostPort takes the port as a STRING and so forces an
+// strconv.Itoa allocation that this can append in place. Its whole rule is the
+// IPv6 bracket, which is the one line below.
+func appendTargetURL(dst []byte, scheme, ip string, port int32, path string) (out []byte, from, to int) {
+	dst = append(dst, scheme...)
+	dst = append(dst, "://"...)
+	from = len(dst)
+	if strings.IndexByte(ip, ':') >= 0 {
+		dst = append(dst, '[')
+		dst = append(dst, ip...)
+		dst = append(dst, ']')
+	} else {
+		dst = append(dst, ip...)
+	}
+	dst = append(dst, ':')
+	dst = strconv.AppendInt(dst, int64(port), 10)
+	to = len(dst)
+	return append(dst, path...), from, to
 }
 
 // podPorts resolves the pod's port annotation (each entry a number or a

@@ -9,7 +9,11 @@ import (
 // registration, so a default or help edit cannot reach one binary and not the
 // other. What CAN still regress is the set itself: a flag renamed or dropped
 // here vanishes from BOTH binaries at once, and internal/manifestcheck only
-// guards the flags the shipped manifests happen to pass. Pin the names and
+// guards the flags the shipped manifests happen to pass. -log-format is the
+// worked example: it was removed deliberately (one format, logfmt, always), and
+// removing it meant fixing the chart templates that passed it in the same
+// change — a flag a manifest still passes is "flag provided but not defined"
+// plus exit 2, on exactly the deployments most likely to have set it. Pin the names and
 // defaults; docs/FLAGS.md then pins the rest (it is generated from these
 // registrations).
 func TestSharedFlagBlocksRegisterThePinnedSet(t *testing.T) {
@@ -31,7 +35,6 @@ func TestSharedFlagBlocksRegisterThePinnedSet(t *testing.T) {
 		"pprof-listen":                  "",
 		"self-metrics-interval":         "1m0s",
 		"log-level":                     "info",
-		"log-format":                    "text",
 	}
 	for name, def := range want {
 		f := fs.Lookup(name)

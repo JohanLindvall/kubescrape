@@ -129,6 +129,14 @@ spec:
       serviceAccountName: kubescrape-events
       # Room for the final events flush and position write (see the agent).
       terminationGracePeriodSeconds: 60
+      # Kubernetes' own seccomp default is Unconfined, which is LOOSER than what
+      # a plain container run gets, and PodSecurity's `restricted` profile
+      # rejects a pod without RuntimeDefault outright — without this these pods
+      # fail ADMISSION on a restricted namespace, which on a first install reads
+      # as a broken manifest rather than a policy.
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: events
           image: ghcr.io/johanlindvall/kubescrape:latest
@@ -144,6 +152,27 @@ spec:
             - -metadata-endpoint=http://kubescrape.monitoring
             - -otlp-endpoint=otel-collector.monitoring:4317
             - -listen=:8081
+            # The port above also serves /debug/otlp and /debug/otlp/ui, which
+            # stream what THIS replica exports: every Kubernetes Event in the
+            # cluster, and with -azure-diagnostics every Azure record it
+            # consumes. (/debug/tailer is not registered here — no tailer runs.)
+            # With no token file those two answer only a LOCAL connection —
+            # `kubectl port-forward`, or a container in this pod — and refuse
+            # everything else, counting kubescrape_debug_refused_total{reason}.
+            # That default is the one to keep; uncomment the flag, the mount and
+            # the volume below TOGETHER to read them remotely with a bearer
+            # token instead (re-read about once a minute, previous value
+            # accepted for a grace window, so rotation needs no restart):
+            #   kubectl -n monitoring create secret generic kubescrape-debug \
+            #     --from-literal=token="$(openssl rand -hex 24)"
+            #- -debug-token-file=/etc/kubescrape/debug/token
+            #
+            # THERE IS NO NetworkPolicy IN THESE RAW MANIFESTS: :8081 and the
+            # metrics port are reachable from every pod in the cluster. This
+            # replica opens no receiver of any kind — it only reads and exports
+            # — so there is nothing here an outsider could WRITE to; the Helm
+            # chart still ships ingress policies for both ports
+            # (networkPolicy.enabled, agent.debug.allowFrom).
             # Azure diagnostics from Event Hubs (logs + metrics). Needs an
             # image built with the `azure` build tag — the default one is; a
             # custom `make build TAGS=journald` binary refuses to start with
@@ -178,10 +207,15 @@ spec:
             runAsUser: 65532
             capabilities:
               drop: ["ALL"]
-          # With the connection-string flag above, mount its secret:
+          # With the connection-string flag above, mount its secret — and with
+          # -debug-token-file, its own. Uncomment `volumeMounts:` once for
+          # whichever of the two you enable.
           #volumeMounts:
           #  - name: azure-eventhub
           #    mountPath: /etc/kubescrape/azure-eventhub
+          #    readOnly: true
+          #  - name: debug-token
+          #    mountPath: /etc/kubescrape/debug
           #    readOnly: true
           ports:
             - name: http
@@ -200,3 +234,6 @@ spec:
       #  - name: azure-eventhub
       #    secret:
       #      secretName: azure-eventhub-connection
+      #  - name: debug-token
+      #    secret:
+      #      secretName: kubescrape-debug

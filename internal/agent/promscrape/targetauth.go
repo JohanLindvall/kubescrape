@@ -157,17 +157,35 @@ func (s *Scraper) clientFor(ctx context.Context, t kubemeta.ScrapeTarget, timeou
 	// steady population above the cap would otherwise rebuild every transport
 	// each cycle, paying a fresh TCP+TLS handshake per target while the orphans
 	// held their pooled connections open for the full idle timeout.
+	var evicted *http.Client
 	if len(s.tlsClients) >= maxTLSClients {
 		for k, victim := range s.tlsClients {
-			if tr, ok := victim.Transport.(*http.Transport); ok {
-				tr.CloseIdleConnections()
-			}
+			evicted = victim
 			delete(s.tlsClients, k)
 			break
 		}
 	}
 	s.tlsClients[key] = client
 	s.tlsMu.Unlock()
+	if evicted != nil {
+		// Both of these are done with the lock DROPPED: closing idle
+		// connections walks the victim's whole connection pool and the warn
+		// renders and writes a slog record, and every scrape goroutine on the
+		// node contends for tlsMu. The victim is unreachable from the map by
+		// now, so nothing can adopt it while we work on it — a scrape already
+		// holding it keeps its live connections either way (CloseIdleConnections
+		// closes only idle ones).
+		if tr, ok := evicted.Transport.(*http.Transport); ok {
+			tr.CloseIdleConnections()
+		}
+		// The eviction is correct and the scrape still works, so this is a Warn
+		// about COST rather than about loss: past the cap every cycle pays a
+		// fresh TCP+TLS handshake for the targets that keep missing. The key
+		// includes the resolved secret bytes, so the realistic cause is
+		// credentials rotating faster than the cache holds them.
+		s.warnCacheEviction(&s.tlsEvictWarn, "per-target TLS clients", maxTLSClients,
+			"more than the cache holds are in use: targets are rotating their CA or client certificate, or too many distinct tlsConfigs are in play")
+	}
 	return client, nil
 }
 

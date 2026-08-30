@@ -483,7 +483,8 @@ func (t *Tailer) chargeStall(f *file, sg *segment, gen int, progressBefore int64
 	}
 	obs.LogPrefixLost.Inc()
 	t.log.Error("a rotated segment's source has been unreadable for too long; giving up on its lines so the file resumes collecting",
-		"path", f.path, "inode", sg.inode, "stalled", stalled)
+		"path", f.path, "inode", sg.inode, "stalled", stalled,
+		"committed", sg.committed, "to", sg.to)
 	f.retire(sg)
 }
 
@@ -544,8 +545,14 @@ func (t *Tailer) openSegmentSource(f *file, p *segment) (fh *os.File, path strin
 	path, found := t.findRotated(f, p)
 	if !found {
 		obs.LogPrefixLost.Inc()
+		// The owed range is the MAGNITUDE of the loss, which
+		// kubescrape_log_prefix_lost_total (one count per given-up segment)
+		// cannot carry: a segment owing 40 bytes and one owing 40 MiB are the
+		// same increment. `to` is -1 for an open-ended segment (a rotation the
+		// agent was down for), where the end is genuinely unknown — the line
+		// says -1 rather than inventing a number.
 		t.log.Warn("rotated segment source not found; its lines are lost",
-			"path", f.path, "inode", p.inode)
+			"path", f.path, "inode", p.inode, "committed", p.committed, "to", p.to)
 		f.retire(p)
 		return nil, "", nil, false, true // retired: nothing to open, nothing owed
 	}
@@ -643,6 +650,9 @@ func (t *Tailer) replaySegment(ctx context.Context, f *file, p *segment) bool {
 	// written for.
 	overrun := false
 	var overrunFrom int64
+	// One clock read per read chunk, exactly as consume does — see the note
+	// there for why f.lastFed does not need a per-line reading.
+	var fedAt time.Time
 	for remaining > 0 && (budget > 0 || overrun) {
 		want := remaining
 		if !overrun {
@@ -650,6 +660,7 @@ func (t *Tailer) replaySegment(ctx context.Context, f *file, p *segment) bool {
 		}
 		n, rerr := fh.Read(buf[:min(int64(len(buf)), want)])
 		if n > 0 {
+			fedAt = time.Now()
 			remaining -= int64(n)
 			budget -= int64(n)
 			carry = append(carry, buf[:n]...)
@@ -690,7 +701,7 @@ func (t *Tailer) replaySegment(ctx context.Context, f *file, p *segment) bool {
 					continue
 				}
 				if len(line) > 0 {
-					t.feedLine(ctx, f, string(line), start, cur)
+					t.feedLine(ctx, f, string(line), start, cur, fedAt)
 					fed = cur
 				}
 			}
@@ -854,7 +865,7 @@ func (t *Tailer) drainGone(ctx context.Context, f *file) {
 		f.unresolvedLost = true
 		obs.LogUnresolvedLost.Inc()
 		t.log.Warn("file deleted before its metadata resolved; content lost",
-			"path", f.path, "containerID", f.containerID)
+			"path", f.path, "id", f.containerID)
 		// Checkpointed segments restored by initFile (created before metadata
 		// could resolve) hold fds and checkpoint entries for content that is
 		// now unattributable. Retire them as lost prefixes — without this
@@ -932,7 +943,7 @@ func (t *Tailer) drainGone(ctx context.Context, f *file) {
 			f.discarding = false
 			f.skipEnd = f.readPos
 		} else {
-			t.feedLine(ctx, f, string(f.pending), f.lineStart, f.readPos)
+			t.feedLine(ctx, f, string(f.pending), f.lineStart, f.readPos, time.Now())
 		}
 		f.pending = f.pending[:0]
 		f.lineStart = f.readPos

@@ -28,11 +28,15 @@ package logchain
 // parameter rather than `any` so the tailer's *file key is not boxed.
 
 import (
+	"log/slog"
+	"time"
+
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/plog"
 
 	"github.com/JohanLindvall/kubescrape/internal/agent/logenrich"
 	"github.com/JohanLindvall/kubescrape/internal/agent/logscrub"
+	"github.com/JohanLindvall/kubescrape/internal/logdedupe"
 	"github.com/JohanLindvall/kubescrape/internal/logline"
 	"github.com/JohanLindvall/kubescrape/internal/metrics"
 	"github.com/JohanLindvall/kubescrape/internal/obs"
@@ -169,6 +173,10 @@ type Input[K comparable] struct {
 	Observed bool
 }
 
+// promiseWarn gates the NewChain-promise drift report (see Emit). Keyless:
+// there is one such promise and one producer that makes it.
+var promiseWarn logdedupe.Throttle
+
 // Chain holds the per-flush state: the key resolver with its closures bound
 // once, the one-record scratch slice, and the bound log-metric handles.
 type Chain[K comparable] struct {
@@ -234,6 +242,21 @@ func (c *Chain[K]) Emit(p Producer, in Input[K]) bool {
 	if scratched && !c.rules {
 		// The perRecordRules promise was violated (see NewChain): upgrade
 		// instead of hitting the zero-value scratch slice.
+		//
+		// This branch exists for a condition that cannot happen — the
+		// tailer's anyPodRules pass over its files is what promises it — and
+		// a branch nobody can observe taking is a bug that is fixed once and
+		// then silently regressed. It is not data loss (records are built and
+		// ruled correctly either way), only an allocation per flush and a
+		// promise that has drifted, so it is a Warn rather than a counter: a
+		// metric for an unreachable condition reads as evidence of absence,
+		// while one line naming the drift is what an operator would forward.
+		// Throttled because "once per flush" is every 10s per node.
+		if promiseWarn.Allow(time.Minute) {
+			slog.Warn("a log producer said no record would carry its own rules and one did; the chain " +
+				"upgraded itself, which costs one allocation per flush — the producer's pre-pass has drifted " +
+				"from what it hands the chain")
+		}
 		c.rules = true
 		c.scratch = plog.NewLogRecordSlice()
 		if c.resolver == nil {

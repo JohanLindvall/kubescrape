@@ -41,6 +41,7 @@ import (
 	"os"
 	"syscall"
 	"time"
+	"unicode/utf8"
 
 	"github.com/klauspost/compress/gzip"
 
@@ -216,11 +217,42 @@ func (br *BodyReader) noteRejected(r *http.Request, err error) {
 		"reason", reason,
 		"status", BodyErrorStatus(err),
 		"peer", r.RemoteAddr,
-		"path", r.URL.Path,
-		"content_type", r.Header.Get("Content-Type"),
-		"content_encoding", r.Header.Get("Content-Encoding"),
-		"content_length", r.ContentLength,
-		"err", err)
+		"path", clipForLog(r.URL.Path),
+		"contentType", clipForLog(r.Header.Get("Content-Type")),
+		"contentEncoding", clipForLog(r.Header.Get("Content-Encoding")),
+		"contentLength", r.ContentLength,
+		"error", err)
+}
+
+// maxLoggedValueBytes bounds one SENDER-supplied value on a log line.
+//
+// This listener is unauthenticated by design, and net/http admits a request
+// line and header block up to Server.MaxHeaderBytes (1 MiB by default) — so the
+// request path and the two Content-* headers are each up to about a megabyte
+// that whoever can reach the port chose. The throttle above bounds how OFTEN
+// this line is emitted; only a clip bounds how BIG it is, and a megabyte per
+// window per reason per node is a log bill and a collector stall, not a
+// diagnostic. peer is exempt: net/http fills RemoteAddr from the connection,
+// not from anything the sender wrote.
+//
+// The value still has to REACH the operator — a wrong Content-Type IS the
+// diagnosis — so it is clipped rather than dropped, and clipped on a rune
+// boundary so a cut UTF-8 sequence does not become a replacement character in
+// whatever reads the line. promscrape has the same function for the same reason
+// on the scrape side (target-supplied there, sender-supplied here); they are
+// not shared because neither package should import the other for a five-line
+// bound, and the constants are free to differ.
+const maxLoggedValueBytes = 96
+
+func clipForLog(v string) string {
+	if len(v) <= maxLoggedValueBytes {
+		return v
+	}
+	cut := maxLoggedValueBytes
+	for cut > 0 && !utf8.RuneStart(v[cut]) {
+		cut--
+	}
+	return v[:cut] + "…"
 }
 
 // noteMalformed counts a body that READ cleanly and then did not decode as OTLP

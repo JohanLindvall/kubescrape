@@ -173,6 +173,21 @@ spec:
       tolerations:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+      {{- /* Pod-level seccomp. Kubernetes' own default is Unconfined, which is
+             LOOSER than what a plain `docker run` gets, and PodSecurity's
+             `restricted` profile rejects a pod without RuntimeDefault outright
+             — so on a namespace labelled restricted these pods used to fail
+             ADMISSION, which on a first install looks like the chart being
+             broken. Set `seccompProfile: null` to omit the field entirely —
+             NOT `{}`, which cannot work: helm COALESCES a user map onto the
+             chart's default map, so an empty one arrives here as the default
+             `{type: RuntimeDefault}` and renders. Only an explicit null
+             removes the key. */}}
+      {{- with .Values.seccompProfile }}
+      securityContext:
+        seccompProfile:
+          {{- toYaml . | nindent 10 }}
+      {{- end }}
       containers:
         - name: events
           image: {{ include "kubescrape.image" . }}
@@ -189,6 +204,14 @@ spec:
             - -ingest=false
             - -metadata-endpoint=http://{{ .Release.Name }}.{{ .Release.Namespace }}
             - -listen={{ .Values.agent.listen }}
+            {{- if .Values.agent.debug.tokenSecret.name }}
+            # This replica runs no tailer, so /debug/tailer is not registered —
+            # but /debug/otlp and its UI are, on every workload running the
+            # agent binary, and here they stream the CLUSTER's Kubernetes
+            # Events and (with azure.enabled) its Azure diagnostic records.
+            # Without a token those two answer only a local connection.
+            - -debug-token-file={{ include "kubescrape.debugTokenPath" . }}
+            {{- end }}
             - -self-metrics-interval={{ .Values.agent.selfMetricsInterval }}
             {{- if .Values.events.enabled }}
             - -events
@@ -280,7 +303,6 @@ spec:
             {{- with .Values.pprofListen }}
             - -pprof-listen={{ . }}
             {{- end }}
-            - -log-format={{ .Values.logFormat }}
             {{- with .Values.events.extraArgs }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
@@ -320,7 +342,7 @@ spec:
           livenessProbe:
             httpGet: {path: /healthz, port: http}
           {{- $azureSecret := and .Values.azure.enabled .Values.azure.eventhub.connectionStringSecret.name }}
-          {{- $anyVolume := or $cfg .Values.agent.otlp.bearerTokenSecret.name $azureSecret }}
+          {{- $anyVolume := or $cfg .Values.agent.otlp.bearerTokenSecret.name $azureSecret .Values.agent.debug.tokenSecret.name }}
           {{- if $anyVolume }}
           volumeMounts:
             {{- if $cfg }}
@@ -336,6 +358,11 @@ spec:
             {{- if $azureSecret }}
             - name: azure-eventhub
               mountPath: /etc/kubescrape/azure-eventhub
+              readOnly: true
+            {{- end }}
+            {{- if .Values.agent.debug.tokenSecret.name }}
+            - name: debug-token
+              mountPath: /etc/kubescrape/debug
               readOnly: true
             {{- end }}
           {{- end }}
@@ -357,6 +384,11 @@ spec:
           secret:
             secretName: {{ .Values.azure.eventhub.connectionStringSecret.name }}
         {{- end }}
+        {{- if .Values.agent.debug.tokenSecret.name }}
+        - name: debug-token
+          secret:
+            secretName: {{ .Values.agent.debug.tokenSecret.name }}
+        {{- end }}
       {{- end }}
 {{- if .Values.networkPolicy.enabled }}
 ---
@@ -372,12 +404,36 @@ spec:
       app: {{ .Release.Name }}-events
   policyTypes: [Ingress]
   ingress:
+    # TWO rules, because these two ports have two audiences and a rule's `from`
+    # and `ports` apply TOGETHER. This singleton opens no receiver of any kind
+    # — it only reads (the Kubernetes Events watch, an Event Hubs consumer) and
+    # exports — so there is no third.
+    #
+    # 1. The -listen port: /healthz and /readyz, which the kubelet probes, the
+    #    /debug index, and — this is what the comment here used to deny by
+    #    saying "nothing else is served" — /debug/otlp and /debug/otlp/ui,
+    #    which stream what THIS replica exports: every Kubernetes Event in the
+    #    cluster, and with azure.enabled every Azure diagnostic record it
+    #    consumes. /debug/tailer is genuinely absent (no tailer runs here).
+    #
+    #    Open to every pod by default, and safe because those two routes are
+    #    gated in-process: local connection (a port-forward arrives as
+    #    loopback) or the agent.debug.tokenSecret bearer token. agent.debug.allowFrom
+    #    narrows the port itself — read its comment first, since the probes
+    #    share it.
     - ports:
-        # Health/readiness (the kubelet probes these) and, when enabled, the
-        # scrape port. Nothing else is served.
         - port: {{ (split ":" .Values.agent.listen)._1 | int }}
-        {{- if .Values.metrics.enabled }}
+      {{- with .Values.agent.debug.allowFrom }}
+      from:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    {{- if .Values.metrics.enabled }}
+    # 2. The Prometheus scrape port: this replica's own go_*/process_*/kubescrape_*
+    #    counters, unscoped because metrics.scrapeAnnotations asks for it to be
+    #    scraped from wherever Prometheus runs. Undeclared ports (pprof) stay
+    #    closed.
+    - ports:
         - port: {{ (split ":" .Values.metrics.listen)._1 | int }}
-        {{- end }}
+    {{- end }}
 {{- end }}
 {{- end }}

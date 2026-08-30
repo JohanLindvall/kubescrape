@@ -26,6 +26,7 @@ import (
 	"github.com/JohanLindvall/kubescrape/internal/logdedupe"
 	"github.com/JohanLindvall/kubescrape/internal/obs"
 	"github.com/JohanLindvall/kubescrape/pkg/kubemeta"
+	"github.com/JohanLindvall/kubescrape/pkg/metaclient"
 )
 
 // MetadataSource resolves pod/container metadata; implemented by
@@ -150,6 +151,14 @@ type Enricher struct {
 	peerWarnGate   logdedupe.Throttle
 	lookupWarnGate logdedupe.Throttle
 	waitWarnGate   logdedupe.Throttle
+	// metaWarnGate throttles the metadata-service-is-broken warning. Keyless:
+	// there is one metadata service and one condition, and every id in every
+	// push meets it at once.
+	metaWarnGate logdedupe.Throttle
+	// splitCapWarnGate throttles the splitter's degradation line. Keyed by
+	// which bound bound (groups vs copied bytes), so the one that fires
+	// constantly cannot hide the other.
+	splitCapWarnGate *logdedupe.Table
 }
 
 // reqCache is the state one push's enrichment shares across every decision it
@@ -288,6 +297,58 @@ func (e *Enricher) warnLookupBudget(exhausted string, bound int) {
 // past it lookups still run and still resolve already-posted ids, they just no
 // longer park in the metadata service's waiter map for ids that may never
 // appear.
+// noteSplitCapped reports the point-split degradation: past either bound the
+// remaining objects' points fold onto the sender's own resource UNENRICHED, so
+// their series keep flowing and quietly describe the wrong object — the
+// failure mode a counter alone reads as a small number next to a large one.
+//
+// grouped distinguishes the two shapes worth telling apart: an object that
+// never got a resource of its own (the group cap) from one that has a resource
+// and is being refused further descriptor copies (the byte cap), which is the
+// mid-push bind an operator has no other way to see.
+func (e *Enricher) noteSplitCapped(grouped bool, cache *reqCache) {
+	reason := "groups"
+	if grouped || cache.splitCopied >= maxSplitCopyBytes {
+		reason = "copied_bytes"
+	}
+	if allow, _ := e.splitCapWarnGate.Allow(reason); !allow {
+		return
+	}
+	e.log.Warn("ingest: a push describes more objects than one payload may split into, so the remainder is "+
+		"forwarded on the SENDER's resource without Kubernetes attribution; those series describe one object "+
+		"and are labelled with another. Have the sender batch fewer objects per push",
+		"reason", reason, "objects", cache.splitGroups, "maxObjects", maxSplitGroups,
+		"bytes", cache.splitCopied, "maxBytes", maxSplitCopyBytes)
+}
+
+// noteLookupFailed reports a metadata lookup that failed for a reason OTHER
+// than "the object is unknown".
+//
+// The two are not the same event and only one is actionable. A 404 is ordinary:
+// an id races the API server, a sender names a container that has already gone,
+// a pod uid belongs to another node — the Debug line above is the right level
+// for it, and kubescrape_ingest_resources_total{outcome="unresolved"} carries
+// the rate. Anything else — a refused connection, a 5xx, a body that does not
+// decode — means the metadata service is not answering THIS agent, and the
+// visible symptom is every pushed resource silently losing its Kubernetes
+// attribution while the counter that moves says only "unresolved", the same
+// thing it says for a stale id. That was diagnosable only at Debug, which is
+// not on during the outage it explains.
+//
+// Throttled and unkeyed: the condition is the metadata service, and during an
+// outage every id in every push takes this path.
+func (e *Enricher) noteLookupFailed(err error) {
+	if metaclient.IsNotFound(err) {
+		return
+	}
+	if !e.metaWarnGate.Allow(lookupBudgetWarnEvery) {
+		return
+	}
+	e.log.Warn("ingest: the metadata service is not answering lookups, so pushed telemetry is being forwarded "+
+		"without Kubernetes attribution (it is not dropped). Check the metadata service and -metadata-endpoint",
+		"error", err)
+}
+
 func (e *Enricher) warnWaitBudget() {
 	if !e.waitWarnGate.Allow(lookupBudgetWarnEvery) {
 		return
@@ -308,6 +369,8 @@ func NewEnricher(cfg Config) *Enricher {
 		podUIDKeys:      cfg.podUIDKeys(),
 		mode:            cfg.metricsMode(),
 		log:             log,
+		// Two keys: the group cap and the copied-bytes cap (noteSplitCapped).
+		splitCapWarnGate: logdedupe.New(2, lookupBudgetWarnEvery),
 	}
 }
 
@@ -992,7 +1055,7 @@ func (e *Enricher) warnPeerRejected(ip string, pod *kubemeta.Pod) {
 		return
 	}
 	e.log.Warn("refusing to attribute pushed telemetry by peer IP: the connection's source address belongs to this receiver's own workload, so it was rewritten in flight (a proxy, a mesh sidecar, or an internal hop addressed to the application port). Those resources stay unenriched; give senders a resource-level container.id or k8s.pod.uid, or make the path preserve the client address",
-		"peerIP", ip, "resolvedPod", pod.Namespace+"/"+pod.Name)
+		"peer", ip, "namespace", pod.Namespace, "pod", pod.Name)
 }
 
 // idToken tags an ID value with its kind so a later lookup knows which
@@ -1146,6 +1209,7 @@ func (e *Enricher) lookupByID(ctx context.Context, cache *reqCache, token string
 		md, err := e.containerLookup(ctx, cache, id, wait)
 		if err != nil {
 			e.log.Debug("ingest: container lookup failed", "id", id, "error", err)
+			e.noteLookupFailed(err)
 			return nil, nil
 		}
 		return &md.Pod, &md.Container
@@ -1154,6 +1218,7 @@ func (e *Enricher) lookupByID(ctx context.Context, cache *reqCache, token string
 		pod, err := e.cfg.Meta.PodByUID(ctx, uid)
 		if err != nil {
 			e.log.Debug("ingest: pod-uid lookup failed", "uid", uid, "error", err)
+			e.noteLookupFailed(err)
 			return nil, nil
 		}
 		return pod, nil

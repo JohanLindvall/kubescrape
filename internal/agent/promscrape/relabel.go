@@ -54,9 +54,16 @@ const maxRelabelChains = 1024
 // session around it. Returns nil for targets without rules; a compile error
 // fails the scrape (silently ignoring a filter would export what the user
 // asked to drop).
-func (c *relabelCache) session(rules []kubemeta.RelabelRule) (*relabelFilter, error) {
+//
+// evicted reports that this call had to make room at the cap. The cache cannot
+// log for itself — it holds no logger and runs on the concurrent scrape
+// goroutines, under its own mutex — so the fact is RETURNED and the caller
+// reports it once the lock is gone. Without it the cache thrashed in total
+// silence: every scrape recompiles its chain, no counter moves, and the only
+// symptom is a node quietly burning CPU.
+func (c *relabelCache) session(rules []kubemeta.RelabelRule) (f *relabelFilter, evicted bool, err error) {
 	if len(rules) == 0 {
-		return nil, nil
+		return nil, false, nil
 	}
 	// Length-prefixed via appendLP (the package's one injective-join rule): a
 	// regex or source label may contain any delimiter byte, and two rule chains
@@ -88,7 +95,7 @@ func (c *relabelCache) session(rules []kubemeta.RelabelRule) (*relabelFilter, er
 			}
 			re, err := regexp.Compile("^(?:" + rx + ")$")
 			if err != nil {
-				return nil, fmt.Errorf("metricRelabelings regex %q: %w", r.Regex, err)
+				return nil, false, fmt.Errorf("metricRelabelings regex %q: %w", r.Regex, err)
 			}
 			compiled = append(compiled, compiledRelabel{keep: r.Action == "keep", src: r.SourceLabels, re: re})
 		}
@@ -102,11 +109,12 @@ func (c *relabelCache) session(rules []kubemeta.RelabelRule) (*relabelFilter, er
 				delete(c.m, k)
 				break
 			}
+			evicted = true
 		}
 		c.m[key] = compiled
 		c.mu.Unlock()
 	}
-	return &relabelFilter{rules: compiled}, nil
+	return &relabelFilter{rules: compiled}, evicted, nil
 }
 
 // Keep reports whether a sample survives the chain.

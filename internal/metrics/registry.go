@@ -6,11 +6,14 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/JohanLindvall/haste/xxh3"
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/pmetric"
+
+	"github.com/JohanLindvall/kubescrape/internal/logdedupe"
 )
 
 // Registry is a set of directly-driven series for a process's OWN
@@ -48,7 +51,25 @@ type Registry struct {
 	// them. They used to land on kubescrape_log_metrics_dropped_*, a metric
 	// documented as the LOG-derived store's.
 	drops drops
+	// dumpLabelErrors counts data points Dump could not render because their
+	// stored label string did not parse back (dump.go). It is PUBLISHED, unlike
+	// drops, and the reason is the path: Dump serves the Prometheus /metrics
+	// exposition, which is how this process's own telemetry is delivered when
+	// -self-metrics-interval=0. A silent skip there shrinks the one signal an
+	// operator uses to diagnose everything else, and it shrinks it invisibly —
+	// the series simply is not in the response.
+	dumpLabelErrors atomic.Uint64
+	// dumpWarn throttles the line beside that counter. Dump runs once per
+	// scrape and the condition is a STATE (the stored string does not become
+	// well-formed on its own), so an unthrottled line is one per series per
+	// scrape, forever.
+	dumpWarn logdedupe.Throttle
 }
+
+// DumpLabelErrors reports how many data points Dump has skipped because their
+// stored label string did not parse. Published through obs as
+// kubescrape_self_metrics_points_skipped_total.
+func (r *Registry) DumpLabelErrors() uint64 { return r.dumpLabelErrors.Load() }
 
 // registryExpiration keeps snapshot's idle handling permanently inactive —
 // a self-metric is cumulative for the process lifetime.
@@ -254,7 +275,7 @@ func (b bound) Value() float64 {
 	b.s.mu.Lock()
 	defer b.s.mu.Unlock()
 	var total float64
-	for _, samp := range b.s.db {
+	for samp := range b.s.all() {
 		if lb, err := parseLabels(samp.labels); err == nil && lb.hash() == want {
 			total += samp.value
 		}
@@ -479,6 +500,13 @@ func (r *Registry) Run(ctx context.Context, exp Exporter, interval time.Duration
 	}
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
+	// Failure state is LOCAL because Run is one goroutine per process: the
+	// transition shape (warn once, restate on a schedule, say when it
+	// recovered) needs no field on the Registry, which is shared by every
+	// package that declares a metric.
+	var failures int
+	var failedAt time.Time
+	var reWarn logdedupe.Throttle
 	for {
 		select {
 		case <-ctx.Done():
@@ -491,8 +519,30 @@ func (r *Registry) Run(ctx context.Context, exp Exporter, interval time.Duration
 			cancel()
 			return
 		case <-ticker.C:
-			if err := r.Export(ctx, exp, res); err != nil {
-				log.Warn("exporting self-metrics failed", "error", err)
+			err := r.Export(ctx, exp, res)
+			switch {
+			case err != nil:
+				failures++
+				if failures == 1 {
+					failedAt = time.Now()
+					reWarn.Allow(reWarnInterval) // claim the slot this Warn occupies
+				}
+				// This is the process's OWN telemetry, so the failure cannot be
+				// counted: the counter that would record it is in the payload
+				// that is not arriving. The line is the only signal there is,
+				// which is why it restates itself rather than going quiet after
+				// the first — and why the repeats between restatements are Debug
+				// rather than nothing.
+				if failures == 1 || reWarn.Allow(reWarnInterval) {
+					log.Warn("exporting self-metrics failed; this process's own telemetry is not reaching the collector",
+						"error", err, "attempts", failures, "since", time.Since(failedAt).Round(time.Second))
+				} else {
+					log.Debug("exporting self-metrics failed", "error", err, "attempts", failures)
+				}
+			case failures > 0:
+				log.Info("exporting self-metrics succeeded again",
+					"attempts", failures, "since", time.Since(failedAt).Round(time.Second))
+				failures = 0
 			}
 		}
 	}

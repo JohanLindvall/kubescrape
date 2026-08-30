@@ -8,8 +8,10 @@ package metrics
 // and the two readers may coexist.
 
 import (
+	"log/slog"
 	"slices"
 	"strings"
+	"time"
 )
 
 // RegistrySeries is one registered metric's current state.
@@ -60,7 +62,7 @@ func (r *Registry) Dump() []RegistrySeries {
 		if funcBacked[s] {
 			continue
 		}
-		if d, ok := dumpSeries(s); ok {
+		if d, ok := r.dumpSeries(s); ok {
 			out = append(out, d)
 		}
 	}
@@ -161,7 +163,12 @@ func dumpFunc(gf *gaugeFunc) RegistrySeries {
 
 // dumpSeries reads one series' samples under its lock. ok is false for kinds
 // the Registry cannot mint (defensive; nothing to render them as).
-func dumpSeries(s *series) (RegistrySeries, bool) {
+//
+// It is a METHOD so an unparseable label string has somewhere to be counted:
+// this is the /metrics serving path, and a skipped point vanishes from the
+// operator's own telemetry with nothing left behind to say a point was skipped
+// at all (see noteLabelParseError).
+func (r *Registry) dumpSeries(s *series) (RegistrySeries, bool) {
 	kind, ok := kindType(s.kind)
 	if !ok {
 		return RegistrySeries{}, false
@@ -174,9 +181,10 @@ func dumpSeries(s *series) (RegistrySeries, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.kind != kindHistogram {
-		for _, samp := range s.db {
+		for samp := range s.all() {
 			lbls, err := parseLabels(samp.labels)
 			if err != nil {
+				r.noteLabelParseError(s.name, samp.labels, err)
 				continue
 			}
 			d.Points = append(d.Points, RegistryPoint{Labels: pairs(lbls), Value: samp.value})
@@ -190,9 +198,10 @@ func dumpSeries(s *series) (RegistrySeries, bool) {
 	// converts its copy to absolute counts. counts is CLONED — the live array
 	// keeps counting after the lock is released — and nothing is mutated (Dump
 	// serves a live Registry beside the push path, TestDumpNonMutating).
-	for _, samp := range s.db {
+	for samp := range s.all() {
 		lbls, err := parseLabels(samp.labels)
 		if err != nil {
+			r.noteLabelParseError(s.name, samp.labels, err)
 			continue
 		}
 		d.Points = append(d.Points, RegistryPoint{
@@ -204,6 +213,52 @@ func dumpSeries(s *series) (RegistrySeries, bool) {
 	}
 	sortPoints(d.Points)
 	return d, true
+}
+
+// dumpLabelWarnEvery bounds the label-parse warning. The condition is a STATE —
+// a stored string does not become well-formed on its own — and Dump runs once
+// per scrape, so an unthrottled line would be one per affected series per
+// scrape interval for the life of the process.
+const dumpLabelWarnEvery = 10 * time.Minute
+
+// noteLabelParseError counts a point Dump could not render and names it, at
+// most once per window.
+//
+// This is called from INSIDE the series lock, and from the path that serves
+// GET /metrics, so it must stay cheap: one atomic add, one atomic CAS, and a
+// formatted line only on the rare window where the throttle opens. The
+// KEYLESS throttle is deliberate — the counter carries the rate and one
+// example is enough to reach the corrupt series, while a keyed table on a
+// serving path would be a map write per skipped point.
+//
+// It cannot be a metric registered here: obs (where every kubescrape_* metric
+// is declared) imports this package, so the counter is exported through
+// DumpLabelErrors and published there as a CounterFunc.
+func (r *Registry) noteLabelParseError(metric, labels string, err error) {
+	r.dumpLabelErrors.Add(1)
+	if !r.dumpWarn.Allow(dumpLabelWarnEvery) {
+		return
+	}
+	// The label STRING is this process's own — every Registry label set comes
+	// from code — so logging it leaks nothing a caller supplied, and it is the
+	// only handle on what went wrong. It is cut, because a corrupt string has
+	// no length anyone reasoned about.
+	slog.Default().Warn("a self-metric data point was skipped: its stored label set could not be parsed back, "+
+		"so it is missing from the Prometheus /metrics response this process serves for itself",
+		"metric", metric, "labels", truncLabelString(labels), "error", err,
+		"skipped", r.dumpLabelErrors.Load(),
+		"note", "the OTLP push path reads the same stored string and degrades differently — it emits the point "+
+			"with whatever labels parsed rather than dropping it — so the pushed copy of this series is "+
+			"mislabelled, not missing. Further reports are suppressed for "+dumpLabelWarnEvery.String())
+}
+
+// truncLabelString bounds what a log line carries from a corrupt label string.
+func truncLabelString(s string) string {
+	const max = 256
+	if len(s) <= max {
+		return s
+	}
+	return s[:max] + "…"
 }
 
 // pairs converts a key-sorted label set into the exported pair form.

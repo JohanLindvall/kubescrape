@@ -2,6 +2,8 @@ package otlpingest
 
 import (
 	"context"
+	"errors"
+	"strconv"
 
 	"log/slog"
 	"net/http"
@@ -20,6 +22,7 @@ import (
 	"google.golang.org/genproto/googleapis/rpc/errdetails"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	grpcpeer "google.golang.org/grpc/peer"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/durationpb"
 
@@ -216,6 +219,13 @@ type Server struct {
 	// (emptymetrics.go). Keyless: the condition is one sender-side
 	// instrumentation bug shipped on every push, and the count rides the line.
 	emptyMetricWarns logdedupe.Throttle
+	// chainSkipWarns throttles the ingested-log-chain skip line, per reason
+	// (logchain.go). Keyed: three bounds, three different sender-side fixes.
+	chainSkipWarns *logdedupe.Table
+	// shedWarns throttles the admission-bound shedding line, per bound
+	// (noteShed). Keyed rather than keyless because the three bounds are three
+	// different problems and the busiest must not suppress the others.
+	shedWarns *logdedupe.Table
 	// tooDeepWarns throttles the wire-shape refusal's warning (depth.go).
 	// Keyless for the same reason: it is one sender emitting one shape, and a
 	// line per refusal is what an attacker would use to fill the node's disk.
@@ -254,6 +264,8 @@ func NewServer(cfg ServerConfig) *Server {
 		reserveWindow: grpcReserveWindow,
 		reservedWarns: logdedupe.New(len(cfg.ReservedAttrs.Resource)+len(cfg.ReservedAttrs.Element)+
 			len(cfg.ReservedAttrs.Identity), reservedWarnEvery),
+		shedWarns:      logdedupe.New(3, shedWarnEvery),      // one key per admission bound
+		chainSkipWarns: logdedupe.New(3, chainSkipWarnEvery), // one key per chain-skip reason
 	}
 	s.body = newBodyReader(maxIngestBody, s.buffer, log)
 	return s
@@ -289,7 +301,7 @@ func (s *Server) chargeDecoded(n int64) bool {
 	if n > s.decoded.limit && s.decodedWarns.Allow(decodedWarnEvery) {
 		s.log.Warn("ingest: refused a push whose decoded structure alone exceeds the receiver's whole "+
 			"decoded budget; every retry of it will be refused too — the sender must batch smaller",
-			"estimated_bytes", n, "budget_bytes", s.decoded.limit)
+			"estimatedBytes", n, "budgetBytes", s.decoded.limit)
 	}
 	return false
 }
@@ -322,6 +334,7 @@ const decodedWarnEvery = time.Minute
 // typed request exists.
 func (s *Server) limitUnary(ctx context.Context, req any, _ *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
 	if !s.acquire() {
+		s.noteShed(shedInFlight, grpcPeerAddr(ctx))
 		return nil, exhaustedStatus("too many concurrent pushes; retry")
 	}
 	defer s.release()
@@ -340,8 +353,9 @@ func (s *Server) limitUnary(ctx context.Context, req any, _ *grpc.UnaryServerInf
 // whichever transport a sender used. Bare ResourceExhausted reads as PERMANENT
 // to conformant senders, and a shed that loses data is worse than the OOM it
 // prevents.
-func (s *Server) chargeDecodedGRPC(n int64) (func(), error) {
+func (s *Server) chargeDecodedGRPC(ctx context.Context, n int64) (func(), error) {
 	if !s.chargeDecoded(n) {
+		s.noteShed(shedDecoded, grpcPeerAddr(ctx))
 		return nil, exhaustedStatus(errDecodedBudget.Error())
 	}
 	return func() { s.decoded.release(n) }, nil
@@ -362,7 +376,7 @@ func (s *Server) noteTooDeep() {
 	if s.tooDeepWarns.Allow(tooDeepWarnEvery) {
 		s.log.Warn("ingest: refused a gRPC push whose payload nests deeper than the decoder may recurse; "+
 			"decoding it costs unbounded goroutine stack, so the shape is refused before the decode",
-			"max_depth", maxNestingDepth)
+			"maxDepth", maxNestingDepth)
 	}
 }
 
@@ -414,6 +428,10 @@ func (s *Server) Run(ctx context.Context) error {
 			//     concurrent BUFFERING — and it can carry the RetryInfo a shed
 			//     needs, because writeEarlyAbort forwards a status' details.
 			grpc.MaxRecvMsgSize(s.grpcMaxRecv),
+			// And this is what bounds the HEADERS, which none of the four
+			// above reach: grpc-go decodes a stream's header block before the
+			// tap runs, at a 16 MiB default (MaxHeaderListSizeOption).
+			MaxHeaderListSizeOption(),
 			grpc.MaxConcurrentStreams(uint32(s.maxInFlight)),
 			grpc.InTapHandle(s.tapAdmit),
 			grpc.UnaryInterceptor(s.limitUnary),
@@ -470,7 +488,7 @@ func (g *logsGRPC) Export(ctx context.Context, req plogotlp.ExportRequest) (plog
 	// cannot see the typed request at all (see there), and it is held for the
 	// whole enrich-and-forward step exactly as the HTTP arm holds it for the
 	// whole handler: the payload stays resident until the collector acks.
-	release, err := g.s.chargeDecodedGRPC(decodedLogsSize(req.Logs()))
+	release, err := g.s.chargeDecodedGRPC(ctx, decodedLogsSize(req.Logs()))
 	if err != nil {
 		return plogotlp.ExportResponse{}, err
 	}
@@ -514,7 +532,7 @@ func (g *metricsGRPC) Export(ctx context.Context, req pmetricotlp.ExportRequest)
 	// Charged here for the same reason as the logs arm, and estimated BEFORE
 	// pruning: the point-less metrics emptymetrics.go removes are resident by
 	// the time it runs.
-	release, err := g.s.chargeDecodedGRPC(decodedMetricsSize(req.Metrics()))
+	release, err := g.s.chargeDecodedGRPC(ctx, decodedMetricsSize(req.Metrics()))
 	if err != nil {
 		return pmetricotlp.ExportResponse{}, err
 	}
@@ -624,7 +642,7 @@ func (g *tracesGRPC) Export(ctx context.Context, req ptraceotlp.ExportRequest) (
 	// Charged here for the same reason as the logs arm — including for a
 	// payload RejectTraces will refuse: the spans are already decoded and
 	// resident when the guard runs.
-	release, err := g.s.chargeDecodedGRPC(decodedTracesSize(req.Traces()))
+	release, err := g.s.chargeDecodedGRPC(ctx, decodedTracesSize(req.Traces()))
 	if err != nil {
 		return ptraceotlp.ExportResponse{}, err
 	}
@@ -692,11 +710,20 @@ func (s *Server) servePush(w http.ResponseWriter, r *http.Request,
 ) {
 	body, charged, err := s.body.Read(r)
 	if err != nil {
+		// The door's own refusals (media type, caps, a truncated upload) are
+		// counted AND warned inside the reader, per reason. The byte BUDGET is
+		// not one of those — it is this receiver protecting itself rather than
+		// the request being wrong — so it is narrated here, on the arm that
+		// still holds the request and can name the sender.
+		if errors.Is(err, errBufferBudget) {
+			s.noteShed(shedBuffer, r.RemoteAddr)
+		}
 		WriteBodyError(w, err)
 		return
 	}
 	defer s.body.Release(charged)
 	if !s.acquire() {
+		s.noteShed(shedInFlight, r.RemoteAddr)
 		w.Header().Set("Retry-After", "1")
 		http.Error(w, "too many concurrent pushes", http.StatusTooManyRequests)
 		return
@@ -714,6 +741,7 @@ func (s *Server) servePush(w http.ResponseWriter, r *http.Request,
 		return
 	}
 	if !s.chargeDecoded(decoded) {
+		s.noteShed(shedDecoded, r.RemoteAddr)
 		w.Header().Set("Retry-After", "1")
 		http.Error(w, errDecodedBudget.Error(), http.StatusTooManyRequests)
 		return
@@ -818,3 +846,94 @@ const maxIngestBody = 16 << 20 // 16 MiB per request
 // maxIngestGRPCMessage caps ONE decoded gRPC message (grpc-go's own default,
 // stated here because the tap reserves exactly this much per push).
 const maxIngestGRPCMessage = 4 << 20
+
+// --- shedding: the CONTEXT half of obs.IngestRejected ---
+
+// The three admission bounds, as throttle keys and as the `reason` on the line.
+// They are the counter's three causes, spelled the same way, because "the
+// receiver is shedding" has three different fixes: too many senders at once,
+// too many raw bytes resident, or too much structure inflated out of them.
+const (
+	shedInFlight = "in_flight"
+	shedBuffer   = "buffer_bytes"
+	shedDecoded  = "decoded_bytes"
+)
+
+// shedWarnEvery paces the shedding line. A receiver at a bound stays at it for
+// as long as the load lasts, and every refused push would otherwise produce a
+// line — on an UNAUTHENTICATED listener, i.e. a log volume a stranger chooses.
+const shedWarnEvery = time.Minute
+
+// noteShed narrates a push refused by an admission bound. The COUNT is taken at
+// each bound (obs.IngestRejected, whose per-bound comments argue for it); this
+// is the half a counter cannot carry — which bound bound, what its limit is,
+// which flag moves it, and who was pushing.
+//
+// It matters because the refusal is INVISIBLE to everything except the sender:
+// the answer is retryable by design (429 + Retry-After / ResourceExhausted +
+// RetryInfo), so a well-behaved SDK simply retries and the operator sees
+// telemetry arriving late, or not at all, with nothing in this process's log
+// saying it refused anything. That was true of all three bounds.
+//
+// peer is empty where the transport cannot supply one. The gRPC pre-decode tap
+// is the real case: grpc-go runs it before the peer reaches the stream context
+// (server.go's peer.NewContext happens per RPC, after the tap) and tap.Info
+// carries no address, so the one refusal taken before any decode is also the
+// one that cannot name its sender. An empty key is omitted rather than logged
+// blank.
+func (s *Server) noteShed(reason, peer string) {
+	if allow, _ := s.shedWarns.Allow(reason); !allow {
+		return
+	}
+	args := []any{"reason", reason}
+	var limit int64
+	switch reason {
+	case shedInFlight:
+		limit = int64(s.maxInFlight)
+		args = append(args, "limit", limit, "flag", "-ingest-max-in-flight")
+	case shedBuffer:
+		limit = s.buffer.limit
+		args = append(args, "limitBytes", limit)
+		args = append(args, s.budgetSourceArgs()...)
+	case shedDecoded:
+		limit = s.decoded.limit
+		args = append(args, "limitBytes", limit)
+		args = append(args, s.budgetSourceArgs()...)
+	}
+	if peer != "" {
+		args = append(args, "peer", peer)
+	}
+	s.log.Warn("ingest: shedding pushes at an admission bound; senders are answered retryably and keep their "+
+		"payloads, so telemetry arrives late or not at all while this lasts", args...)
+}
+
+// budgetSourceArgs says where the byte budget that just bound came FROM, which
+// is not the same question as which flag exists. Both budgets derive from
+// max(maxBufferBytes, 4 x MaxRecvBytes) (NewServer), so at the default 4 MiB
+// receive cap the built-in floor is what binds and
+// -ingest-grpc-max-recv-bytes moves NOTHING until it is set above
+// maxBufferBytes/4. Naming the flag unconditionally — which this line used to
+// do — sends an operator to raise a value that cannot change the limit they
+// are reading in the same record, and the only evidence that it did nothing is
+// the shedding continuing.
+func (s *Server) budgetSourceArgs() []any {
+	if 4*int64(s.grpcMaxRecv) > int64(maxBufferBytes) {
+		return []any{"flag", "-ingest-grpc-max-recv-bytes", "recvBytes", s.grpcMaxRecv}
+	}
+	return []any{
+		"recvBytes", s.grpcMaxRecv,
+		"floorBytes", int64(maxBufferBytes),
+		"note", "the budget is at its built-in floor; -ingest-grpc-max-recv-bytes raises it only once set above " +
+			strconv.Itoa(maxBufferBytes/4) + " bytes, so shrink the senders' batches instead",
+	}
+}
+
+// grpcPeerAddr is the sender's address for a REFUSAL line. It is called only on
+// a refusal: p.Addr.String() allocates, and the admitted path must not pay for
+// a string nothing reads.
+func grpcPeerAddr(ctx context.Context) string {
+	if p, ok := grpcpeer.FromContext(ctx); ok && p.Addr != nil {
+		return p.Addr.String()
+	}
+	return ""
+}

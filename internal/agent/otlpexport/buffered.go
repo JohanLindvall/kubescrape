@@ -18,6 +18,7 @@ import (
 
 	"github.com/JohanLindvall/diskqueue"
 
+	"github.com/JohanLindvall/kubescrape/internal/logdedupe"
 	"github.com/JohanLindvall/kubescrape/internal/obs"
 )
 
@@ -124,6 +125,11 @@ type Buffer struct {
 	// NewBuffered, which is where the signal names live.
 	kind string
 	log  *slog.Logger
+	// reopenWarns throttles the FAILED-reopen line. recover is reached from
+	// every enqueue and every drain iteration while the handle stays dead, so
+	// the condition repeats at the producers' rate; the keyless Throttle is
+	// enough because a Buffer has exactly one of this condition.
+	reopenWarns logdedupe.Throttle
 }
 
 // marshalBytes/unmarshalBytes are the identity codec: the sink owns the pdata
@@ -225,15 +231,56 @@ func (b *Buffer) Close() error {
 // ErrClosed sends the next caller back here, so the reopen retries at the
 // callers' own cadence rather than hot-looping.
 func (b *Buffer) recover(prev *diskqueue.Queue[[]byte]) {
+	lost, reopenErr := b.swap(prev)
+	// EMITTED WITH b.mu RELEASED, and that is the whole reason swap exists as
+	// a separate function. b.mu is read by handles(), which every enqueue,
+	// every drain iteration and every buffer-stats gauge evaluation goes
+	// through, so it is as hot as the node's telemetry rate; a slog call is a
+	// handler plus a write to stderr, and on a pod whose log collector has
+	// backed up that write is unbounded. Holding the WRITE lock across it
+	// would stall every producer on this buffer for as long as the collector
+	// takes to read — during a disk failure, which is when the producers most
+	// need to find out their batches are being refused. Decide under the lock,
+	// render and emit after it.
+	if reopenErr != nil {
+		// The closed queue stays installed, so every later Add and commit
+		// answers ErrClosed and comes back here — the reopen retries at the
+		// callers' cadence rather than hot-looping. That is the right recovery
+		// and it was completely silent: the enqueue side then counts
+		// kubescrape_buffer_enqueue_errors_total forever while the reason the
+		// spool cannot come back (the directory is gone, the mount is
+		// read-only, the flock is held) lived only in this discarded error.
+		if b.log != nil && b.reopenWarns.Allow(bufferWarnEvery) {
+			b.log.Error("the disk buffer could not be reopened after an I/O failure; this signal has no durability "+
+				"until it can be, and each retry happens on the next enqueue or drain",
+				"signal", b.kind, "dir", b.dir, "error", reopenErr)
+		}
+		return
+	}
+	if lost > 0 && b.log != nil {
+		b.log.Error("disk buffer lost data to damage discovered while recovering from an I/O failure",
+			"signal", b.kind, "bytesLost", lost)
+	}
+}
+
+// swap is recover's critical section: it performs the close-and-reopen under
+// b.mu and RETURNS what happened, so the reporting can happen with the lock
+// released. kind, dir and log are immutable after NewBuffered, so recover may
+// read them outside it.
+//
+// The counters stay here rather than moving out with the lines: they are
+// atomics, they cost nothing under the lock, and counting them exactly once
+// per swap is the property worth keeping.
+func (b *Buffer) swap(prev *diskqueue.Queue[[]byte]) (lost uint64, reopenErr error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if b.closed || b.q != prev {
-		return
+		return 0, nil
 	}
 	_ = b.q.Close()
 	q, err := diskqueue.New[[]byte](b.dir, marshalBytes, unmarshalBytes, b.opts)
 	if err != nil {
-		return
+		return 0, err
 	}
 	b.q = q
 	b.rd = q.NewReader()
@@ -244,14 +291,12 @@ func (b *Buffer) recover(prev *diskqueue.Queue[[]byte]) {
 	// the queue) passed with the dedicated loss counter flat.
 	if b.kind != "" {
 		st := q.Stats()
-		if lost := st.LostBytes + st.ForeignBytes + st.DiscardedBytes; lost > 0 {
-			obs.BufferTruncated.WithLabelValues(b.kind).Add(float64(lost))
-			if b.log != nil {
-				b.log.Error("disk buffer lost data to damage discovered while recovering from an I/O failure",
-					"signal", b.kind, "bytes_lost", lost)
-			}
+		if n := st.LostBytes + st.ForeignBytes + st.DiscardedBytes; n > 0 {
+			obs.BufferTruncated.WithLabelValues(b.kind).Add(float64(n))
+			lost = n
 		}
 	}
+	return lost, nil
 }
 
 // queueDead reports an error that poisons the queue handle (recover applies).
@@ -307,7 +352,7 @@ func NewBuffered(inner Exporter, logBuf, metricBuf, traceBuf *Buffer, backoff ti
 		if lost := st.LostBytes + st.ForeignBytes + st.DiscardedBytes; lost > 0 {
 			obs.BufferTruncated.WithLabelValues(kind).Add(float64(lost))
 			log.Error("disk buffer lost data to damage discovered at open",
-				"signal", kind, "bytes_lost", lost)
+				"signal", kind, "bytesLost", lost)
 		}
 	}
 	if logBuf != nil {
@@ -315,11 +360,12 @@ func NewBuffered(inner Exporter, logBuf, metricBuf, traceBuf *Buffer, backoff ti
 		lu := plog.ProtoUnmarshaler{}
 		b.logs = &sink[plog.Logs]{
 			buf: logBuf, backoff: backoff, log: log, kind: "logs",
-			marshal:   lm.MarshalLogs,
-			unmarshal: lu.UnmarshalLogs,
-			count:     plog.Logs.LogRecordCount,
-			send:      sendLogs,
-			sendRaw:   rawLogs, maxSendBytes: rawMaxBytes,
+			enqueueWarns: logdedupe.New(3, bufferWarnEvery),
+			marshal:      lm.MarshalLogs,
+			unmarshal:    lu.UnmarshalLogs,
+			count:        plog.Logs.LogRecordCount,
+			send:         sendLogs,
+			sendRaw:      rawLogs, maxSendBytes: rawMaxBytes,
 		}
 	}
 	if metricBuf != nil {
@@ -327,11 +373,12 @@ func NewBuffered(inner Exporter, logBuf, metricBuf, traceBuf *Buffer, backoff ti
 		mu := pmetric.ProtoUnmarshaler{}
 		b.metrics = &sink[pmetric.Metrics]{
 			buf: metricBuf, backoff: backoff, log: log, kind: "metrics",
-			marshal:   mm.MarshalMetrics,
-			unmarshal: mu.UnmarshalMetrics,
-			count:     pmetric.Metrics.DataPointCount,
-			send:      sendMetrics,
-			sendRaw:   rawMetrics, maxSendBytes: rawMaxBytes,
+			enqueueWarns: logdedupe.New(3, bufferWarnEvery),
+			marshal:      mm.MarshalMetrics,
+			unmarshal:    mu.UnmarshalMetrics,
+			count:        pmetric.Metrics.DataPointCount,
+			send:         sendMetrics,
+			sendRaw:      rawMetrics, maxSendBytes: rawMaxBytes,
 		}
 	}
 	if te, ok := inner.(TracesExporter); ok && traceBuf != nil {
@@ -339,9 +386,10 @@ func NewBuffered(inner Exporter, logBuf, metricBuf, traceBuf *Buffer, backoff ti
 		tu := ptrace.ProtoUnmarshaler{}
 		b.traces = &sink[ptrace.Traces]{
 			buf: traceBuf, backoff: backoff, log: log, kind: "traces",
-			marshal:   tm.MarshalTraces,
-			unmarshal: tu.UnmarshalTraces,
-			count:     ptrace.Traces.SpanCount,
+			enqueueWarns: logdedupe.New(3, bufferWarnEvery),
+			marshal:      tm.MarshalTraces,
+			unmarshal:    tu.UnmarshalTraces,
+			count:        ptrace.Traces.SpanCount,
 			// No counted-unwrap twin here (as sendLogs/sendMetrics have):
 			// Client.ExportTraces is ALREADY a single counted attempt — the
 			// pushing sender's retry has always been the trace path's retry —
@@ -510,6 +558,15 @@ type sink[T any] struct {
 	// a RESPONSE from the collector (vs a transport failure); set by trySend,
 	// read by stuckTooLong (both on the drain goroutine).
 	stuckResponded bool
+	// enqueueWarns throttles this spool's repeating conditions, keyed: the two
+	// WRITE-side refusals, which had counters
+	// and no line at all: a full spool and a spool that cannot be written to.
+	// Both are STATES an operator must act on and both repeat at the producers'
+	// full rate (every tailer flush, every scrape), so they are exactly what
+	// logdedupe exists for. Keyed, because "the disk is full" and "the queue is
+	// at its cap" are different problems with different fixes and one must not
+	// suppress the other. Producer goroutines share it; Table is mutexed.
+	enqueueWarns *logdedupe.Table
 }
 
 type stuckBatch struct {
@@ -558,6 +615,7 @@ func (s *sink[T]) enqueue(v T) error {
 		// ErrRecordTooLarge is one batch larger than the whole cap — a config
 		// problem, but the producer-facing handling is the same refusal.
 		obs.BufferFull.WithLabelValues(s.kind).Inc()
+		s.warnEnqueue(enqueueWarnFull, err)
 	default:
 		// EVERY other refusal is counted too, and separately: a latched I/O
 		// error, a closed queue, or the raw *os.PathError diskqueue returns when
@@ -566,8 +624,60 @@ func (s *sink[T]) enqueue(v T) error {
 		// is the wrong class, _dropped_total is drain-side, and obs.Exports sits
 		// BELOW the buffer and is never reached.
 		obs.BufferEnqueueErrors.WithLabelValues(s.kind).Inc()
+		s.warnEnqueue(enqueueWarnBroken, err)
 	}
 	return err
+}
+
+// The two enqueue-refusal classes, as throttle keys and as the `reason` an
+// operator greps for. They are deliberately not folded into one: a FULL spool
+// is the collector being down for longer than the cap covers (fix the
+// collector, or raise -buffer-max-bytes), while a BROKEN one is the node's disk
+// refusing the write (out of space, read-only mount, a latched fsync failure) —
+// and only the second makes the buffer useless while the collector is fine.
+const (
+	enqueueWarnFull   = "full"
+	enqueueWarnBroken = "write_failed"
+	// drainWarnRequeue shares the table: it is the same spool's condition seen
+	// from the DRAIN side, and it is throttled for the same reason.
+	drainWarnRequeue = "requeue"
+)
+
+// bufferWarnEvery paces both. The condition persists for as long as the
+// collector is down or the disk is full, and every producer on the node meets
+// it on every flush.
+const bufferWarnEvery = time.Minute
+
+// warnEnqueue puts the CONTEXT on a refusal the counters could only ever give a
+// rate for: which spool, how full it is against its cap, and — the whole
+// diagnosis in the broken case — the error the filesystem returned, which is
+// where the *os.PathError naming the directory lives.
+// allowWarn is the throttle gate for this spool's repeating conditions. A sink
+// built without a table (only this package's own tests can make one) warns
+// every time rather than falling silent: losing a diagnostic is the worse of
+// the two failures.
+func (s *sink[T]) allowWarn(reason string) bool {
+	if s.enqueueWarns == nil {
+		return true
+	}
+	allow, _ := s.enqueueWarns.Allow(reason)
+	return allow
+}
+
+func (s *sink[T]) warnEnqueue(reason string, err error) {
+	if !s.allowWarn(reason) {
+		return
+	}
+	st := s.buf.stats()
+	args := []any{"signal", s.kind, "reason", reason, "dir", s.buf.dir,
+		"bytes", st.BacklogBytes, "maxBytes", st.MaxBytes, "error", err}
+	if reason == enqueueWarnFull {
+		s.log.Warn("the disk buffer is refusing new batches: it is at its cap and the collector is not draining it. "+
+			"Producers that can rewind (the tailer) back-pressure; every other producer's batch is lost", args...)
+		return
+	}
+	s.log.Error("the disk buffer cannot be written to, so this signal has no durability and batches are being lost. "+
+		"Check the buffer directory's free space, its mount and its permissions", args...)
 }
 
 // bufOf returns the sink's buffer, nil-safe (a signal can be disabled).
@@ -643,7 +753,7 @@ func (s *sink[T]) drainLoop(ctx context.Context, untilEmpty bool) {
 				s.log.Debug("disk buffer handle retired under the drain", "signal", s.kind, "error", err)
 			} else {
 				obs.BufferReadErrors.WithLabelValues(s.kind, boolLabel(lost)).Inc()
-				s.log.Error("disk buffer read failed", "signal", s.kind, "data_lost", lost, "error", err)
+				s.log.Error("disk buffer read failed", "signal", s.kind, "dataLost", lost, "error", err)
 			}
 			if queueDead(err) {
 				s.buf.recover(q)
@@ -1045,10 +1155,26 @@ func (s *sink[T]) trySend(ctx context.Context, send func(context.Context) error,
 		// rule is not already spending is ever shortened, warm sink or cold.
 		if attempt >= stuckAfterAttempts || (accountable && responded) {
 			s.stuckResponded = responded
-			s.log.Warn("buffered export still failing, requeueing", "signal", s.kind, "error", err, "attempts", attempt)
+			// Throttled: a collector outage produces one of these per signal
+			// per cycle on every node, and the condition is one line. The
+			// destination itself is narrated once by the client's health report
+			// (report.go), which is where the endpoint and the remedy are; this
+			// line's own news is about the SPOOL — the head is going back and
+			// the queue is rotating around it.
+			if s.allowWarn(drainWarnRequeue) {
+				s.log.Warn("a buffered batch has failed a whole drain cycle and is going back to the queue; "+
+					"the spool keeps growing until the collector accepts it",
+					"signal", s.kind, "error", err, "attempts", attempt)
+			}
 			return sendStuck
 		}
-		s.log.Warn("buffered export failed, retrying", "signal", s.kind, "error", err, "backoff", s.cur)
+		// Debug, not Warn: this is one ATTEMPT inside a cycle, and a cycle
+		// against a dead collector makes stuckAfterAttempts of them — per
+		// signal, per node, forever. The state is reported once above and once
+		// by the client's health report; the per-attempt detail belongs to an
+		// incident, not to the steady stream. (Both arguments are field reads,
+		// so no Enabled guard is needed.)
+		s.log.Debug("buffered export failed, retrying", "signal", s.kind, "error", err, "backoff", s.cur)
 		// NewTimer+Stop, not time.After (otlpexport.Retry carries the whole
 		// argument): a cancelled wait must not leave the timer live until it
 		// fires, and at SIGTERM every draining sink abandons its wait at once.

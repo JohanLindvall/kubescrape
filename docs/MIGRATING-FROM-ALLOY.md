@@ -3,7 +3,9 @@
 This guide maps each Alloy component onto its kubescrape equivalent.
 kubescrape is deployed with the [Helm chart](../charts/kubescrape); unlike
 the Alloy configuration, nothing is hard-coded — every behavior below is a
-flag or a config-file entry.
+flag or a config-file entry. If this is also your first kubescrape install,
+read [FIRST-RUN.md](FIRST-RUN.md) alongside it: the mapping tells you what to
+configure, the runbook tells you what to watch while it comes up.
 
 ## Architecture differences
 
@@ -17,13 +19,18 @@ flag or a config-file entry.
 
 ## Top-level blocks
 
-The `logging` block maps to flags on both binaries: `-log-format json` and
-`-log-level` (debug/info/warn/error). `livedebugging` maps to the agent's
+The `logging` block maps to one flag on both binaries: `-log-level`
+(debug/info/warn/error). There is no format choice — kubescrape logs logfmt,
+always, and a `-log-format` in `extraArgs` is `flag provided but not defined`
+plus exit 2 rather than an ignored setting (see
+[CONFIGURATION.md#logging](CONFIGURATION.md#logging)). `livedebugging` maps to the agent's
 `GET /debug/otlp` — the same live-inspection idea, but per HTTP session
 instead of a process-wide toggle: resource-attribute glob filters and a
 sample percentage ride the request, a built-in page lives at
 `/debug/otlp/ui`, and an agent nobody is watching pays one atomic load per
-export. Each binary also serves a `/debug` homepage indexing its whole debug
+export — but unlike a `livedebugging` block, reading it needs either a local
+connection (`kubectl port-forward`) or the `-debug-token-file` token. Each
+binary also serves a `/debug` homepage indexing its whole debug
 surface (`/` redirects there).
 
 ## Component mapping
@@ -268,7 +275,18 @@ curl -sN 'localhost:8081/debug/otlp?signal=logs&attr=k8s.namespace.name=team-*&s
 ```
 
 Nothing is duplicated to the collector and nothing costs anything until a
-client attaches (one atomic load per export). The `debug_otlp_output` pod
+client attaches (one atomic load per export).
+
+> **The data-bearing debug surfaces are not open.** `/debug/otlp`,
+> `/debug/otlp/ui` and `/debug/tailer` stream or enumerate the node's whole
+> telemetry feed, so they are served only to a **local** connection — which is
+> exactly what `kubectl port-forward` produces, so the command above works
+> unchanged — or to a request carrying the `-debug-token-file` bearer token.
+> Set that flag if you want to read an agent from a central debug pod;
+> refusals count `kubescrape_debug_refused_total{reason}` and the startup line
+> reports the posture as `debugAccess=local-only` or `debugAccess=token`.
+
+The `debug_otlp_output` pod
 label becomes a filter value instead of pipeline wiring: expose it as an
 attribute (template below) and stream with
 `attr=debug_otlp_output=true`:

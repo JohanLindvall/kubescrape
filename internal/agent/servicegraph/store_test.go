@@ -36,7 +36,7 @@ func newTestStore(t *testing.T, cfg Config) (*edgeStore, *[]Edge) {
 	if err != nil {
 		t.Fatalf("wait: %v", err)
 	}
-	st := newEdgeStore(cfg.withDefaults(), wait, func(e Edge) { got = append(got, cloneEdge(e)) })
+	st := newEdgeStore(cfg.withDefaults(), wait, func(e Edge) { got = append(got, cloneEdge(e)) }, nil)
 	return st, &got
 }
 
@@ -296,7 +296,7 @@ func TestStoreDimensionsAreLiveDuringRecord(t *testing.T) {
 	var seen []EdgeDimension
 	st := newEdgeStore(Config{}.withDefaults(), time.Second, func(e Edge) {
 		seen = append(seen, e.Dimensions...) // copies during the call, as a sink must
-	})
+	}, nil)
 	k := makeEdgeKey(traceID(1), spanID(1))
 	st.upsert(t0, k, sideClient, halfSpan{service: "a"}, []EdgeDimension{{"client_http.method", "GET"}})
 	st.upsert(t0, k, sideServer, halfSpan{service: "b"}, []EdgeDimension{{"server_http.route", "/orders"}})

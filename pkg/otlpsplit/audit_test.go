@@ -64,15 +64,32 @@ func TestAuditLogsUpperBoundStress(t *testing.T) {
 	for _, cp := range caps {
 		for _, sh := range shapes {
 			ld := buildAdversarialLogs(sh.res, sh.sc, sh.rec, sh.body)
-			parts := Logs(ld, cp)
+			parts, rep := LogsWithReport(ld, cp)
 			for i, p := range parts {
 				sz := m.LogsSize(p)
 				single := p.ResourceLogs().Len() == 1 &&
 					p.ResourceLogs().At(0).ScopeLogs().Len() == 1 &&
 					p.ResourceLogs().At(0).ScopeLogs().At(0).LogRecords().Len() == 1
-				if sz > cp && !single {
-					t.Errorf("cap=%d shape=%v part %d = %d bytes, OVER cap (framing undercounted)", cp, sh, i, sz)
+				// A part may exceed the cap for exactly two reasons, and BOTH
+				// have to be accounted: one leaf nothing can shrink, or a
+				// split abandoned because the re-copied framing left no useful
+				// room (splitPaysOff). An unreported over-cap part is the bug.
+				if sz > cp && !single && rep.Abandoned == 0 {
+					t.Errorf("cap=%d shape=%v part %d = %d bytes, OVER cap and unaccounted (framing undercounted)", cp, sh, i, sz)
 				}
+			}
+			// The amplification bound: the parts together may not cost more
+			// than minChunkRoomDiv times the input, whatever the shape. This is
+			// the invariant an attacker tests — a framing just under the cap
+			// used to turn one push into a part per record, each re-carrying
+			// that framing.
+			var total int
+			for _, p := range parts {
+				total += m.LogsSize(p)
+			}
+			if in := m.LogsSize(ld); total > minChunkRoomDiv*in {
+				t.Errorf("cap=%d shape=%v: parts total %d bytes for a %d-byte input (%.1fx, bound %dx)",
+					cp, sh, total, in, float64(total)/float64(in), minChunkRoomDiv)
 			}
 		}
 	}
@@ -311,13 +328,16 @@ func TestAuditDegenerateInputs(t *testing.T) {
 	if got := Logs(ld, 4096); len(got) != 1 || got[0].ResourceLogs().Len() != 1 {
 		t.Fatalf("zero-scope resource dropped: %d parts", len(got))
 	}
-	// maxBytes=1: an over-cap payload, every record alone (one per part).
+	// maxBytes=1: no part can ever fit, so splitting is futile — the payload
+	// ships whole per resource, ACCOUNTED (rep.Abandoned), rather than as one
+	// over-cap part per record. Nothing is lost or duplicated either way.
 	big := buildLogs(2, 20, 40)
-	parts := Logs(big, 1)
-	for i, p := range parts {
-		if n := p.ResourceLogs().At(0).ScopeLogs().At(0).LogRecords().Len(); n != 1 {
-			t.Fatalf("maxBytes=1: part %d holds %d records, want 1", i, n)
-		}
+	parts, rep := LogsWithReport(big, 1)
+	if len(parts) != 2 {
+		t.Fatalf("maxBytes=1: got %d parts, want one per resource", len(parts))
+	}
+	if rep.Abandoned == 0 {
+		t.Fatalf("maxBytes=1: abandoned split not reported: %+v", rep)
 	}
 	if got := len(collectBodies(parts)); got != 40 {
 		t.Fatalf("maxBytes=1 lost/dup records: got %d want 40", got)

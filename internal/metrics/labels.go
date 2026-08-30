@@ -142,12 +142,24 @@ func (l labels) without(key string) labels {
 // and dropping the second accumulator halves what remains: measured, the fold
 // is 11.4% faster than the 64-bit pair it replaced.
 //
-// The observe path as a whole is nonetheless 2.2-6.2% SLOWER, and the cost is
-// not here: it is series.db's key going from uint64 to a 16-byte struct. Go
-// specialises map[uint64] to mapaccess*_fast64, and a comparable struct key
-// falls back to the generic path. BenchmarkDynamicAddBound is the proof —
-// observePreHashed uses a hash precomputed at construction and folds nothing,
-// yet slowed 6.2%. Do not go looking for it in the hashing.
+// Widening the accumulator to 128 bits did, for a while, make the observe path
+// as a whole 2.2-6.2% SLOWER, and the cost was never here: it was series.db's
+// KEY going from uint64 to a 16-byte struct, because Go specialises
+// map[uint64] to the mapaccess*_fast64 routines and a comparable struct key
+// falls back to the generic path. BenchmarkDynamicAddBound was the proof —
+// observePreHashed folds nothing at all, using a hash precomputed at
+// construction, and it slowed 6.2% anyway.
+//
+// That was diagnosed correctly and then written down as irreducible "while the
+// key is 128 bits wide", which it is not: the map key and the IDENTITY are two
+// different things. series.db now buckets on the key's LOW HALF and compares
+// the full 128 bits inside the bucket, so the fast64 path is back and nothing
+// about this hash changed. Measured (ABBA-interleaved, n=24): DynamicAddBound
+// -11.6%, DynamicAddAttrs -11.8%, DynamicAddHistogram -8.9%, the fleet-scale
+// observe paths -6 to -8%, every allocation count unchanged — and the pure
+// fold benchmarks (LabelsAccums, ResourceAccum, ResLabelsAccum), which touch
+// no map, all "~", which is what says the recovered time was the probe. See
+// series.db.
 func strHash(s string) xxh3.Uint128 { return xxh3.Sum128String(s) }
 
 // hashAccum is the order-independent accumulator of the label set: every entry

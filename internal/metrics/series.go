@@ -1,9 +1,11 @@
 package metrics
 
 import (
+	"iter"
 	"log/slog"
 	"math"
 	"slices"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -182,16 +184,52 @@ type expiringSample struct {
 	// observation between two exports would otherwise be observed and destroyed
 	// without ever being emitted.
 	exported bool
+
+	// key is the sample's FULL 128-bit identity and next chains the samples
+	// whose keys share a low half. Together they are why series.db can be a
+	// map[uint64] without narrowing identity to 64 bits — see there.
+	key  xxh3.Uint128
+	next *expiringSample
 }
 
 // series holds the live values of one metric: a set of label combinations,
 // each expiring after a period of inactivity and capped in number.
 type series struct {
-	mu   sync.Mutex
-	db   map[xxh3.Uint128]*expiringSample
-	name string
-	desc string
-	kind seriesKind
+	mu sync.Mutex
+	// db is the live samples, BUCKETED BY THE LOW HALF of the 128-bit series
+	// key, with the full key kept on the sample and compared on every hit
+	// (find) and the rare low-half collision chained through
+	// expiringSample.next. Identity is still 128 bits — this is a bucket
+	// index, not a narrowing, and no observation can be merged or refused by a
+	// collision.
+	//
+	// The map key is uint64 and NOT the xxh3.Uint128 it indexes because Go
+	// specialises map[uint64] to the mapaccess*_fast64 routines — a hash the
+	// compiler inlines, no indirect Hasher call and no memequal — while a
+	// 16-byte comparable key takes the generic mapaccess1 path. This is the
+	// observe path's single map probe, so the difference is the shape of the
+	// key and nothing else: measured in isolation over a pointer-valued map,
+	// 30ns -> 9ns at one entry and 77ns -> 32ns at ten thousand, and end to
+	// end on the fleet-scale observe benchmarks (see fleet_bench_test.go) the
+	// whole probe is ~11% of a matched line's CPU.
+	//
+	// The chain is what makes the narrow bucket honest. Refusing a colliding
+	// sample instead — which is what the old two-accumulator design did, on a
+	// check hash — would put back a drop that can silently lose a series. The
+	// chain cannot lose anything, and it costs a nil test per probe plus 16
+	// bytes per sample: the full key (16) and the next pointer (8) on the
+	// sample, against the 8 the map key no longer carries. At the 10000-series
+	// cap that is 160 KiB for a metric whose samples already hold two
+	// identity strings each.
+	//
+	// len(db) is therefore NOT the series count (a chain of two is one map
+	// entry and two series): count is, and it is what the cardinality cap
+	// reads.
+	db    map[uint64]*expiringSample
+	count int
+	name  string
+	desc  string
+	kind  seriesKind
 
 	// drops is the OWNING store's refusal counters (never nil; newSeries fills
 	// it in). Per store, not per process: see the type's doc.
@@ -221,7 +259,14 @@ type series struct {
 	// exactly what cardinalityCap (compile.go) and maxStreamCap defend against.
 	expiration int64 // seconds of inactivity before a combination expires
 	lastWarn   int64 // epoch seconds of the last cardinality warning
-	log        *slog.Logger
+	// lastNonFinite is the epoch second of the last non-finite-value notice,
+	// throttled the same way and for the same reason as lastWarn. Both are
+	// hand-rolled rather than internal/logdedupe because this package's clock
+	// is INJECTABLE (series.now, the store.now pattern) and logdedupe reads
+	// time.Now directly: a throttle a test cannot step past would make these
+	// two lines the only untestable behaviour in the file.
+	lastNonFinite int64
+	log           *slog.Logger
 
 	// buckets are the histogram boundaries with +Inf appended; nil for
 	// non-histograms.
@@ -267,7 +312,7 @@ func newSeries(spec seriesSpec) *series {
 		startEpochClock()
 	}
 	s := &series{
-		db:         make(map[xxh3.Uint128]*expiringSample),
+		db:         make(map[uint64]*expiringSample),
 		drops:      dr,
 		now:        spec.now,
 		name:       spec.name,
@@ -344,7 +389,7 @@ func (s *series) observeFold(lbls labels, value float64, res resourceFold, resLa
 		// one such observation pins a counter, summary or histogram sum at Inf
 		// for the whole maxAge (24h by default), which no later real value can
 		// undo. Counted, never admitted.
-		s.drops.nan.Add(1)
+		s.noteNonFinite(value)
 		return
 	}
 	now := s.epoch()
@@ -369,7 +414,7 @@ func (s *series) observeFold(lbls labels, value float64, res resourceFold, resLa
 // construction; a bump pays neither the label rehash nor the avalanche.
 func (s *series) observePreHashed(lbls labels, hash xxh3.Uint128, value float64, res pcommon.Map) {
 	if math.IsNaN(value) || math.IsInf(value, 0) {
-		s.drops.nan.Add(1)
+		s.noteNonFinite(value)
 		return
 	}
 	now := s.epoch()
@@ -382,7 +427,7 @@ func (s *series) observePreHashed(lbls labels, hash xxh3.Uint128, value float64,
 // first sight, then records the value. The
 // caller holds s.mu. Shared by observe and the registry's observePreHashed.
 func (s *series) recordSingle(hash xxh3.Uint128, value float64, lbls labels, now int64, res pcommon.Map, resLabels labels) {
-	samp := s.db[hash]
+	samp := s.find(hash)
 	if samp == nil {
 		samp = s.admit(hash, lbls, now, res, resLabels)
 		if samp == nil {
@@ -409,7 +454,7 @@ func (s *series) materialize(lbls labels, hash xxh3.Uint128) {
 	now := s.epoch()
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if _, ok := s.db[hash]; ok {
+	if s.find(hash) != nil {
 		return
 	}
 	s.admit(hash, lbls, now, emptyResource, nil)
@@ -428,7 +473,7 @@ func (s *series) baseAccum(lbls labels) xxh3.Uint128 { return lbls.hashAccum() }
 // returns nil (warning at most hourly) when the cardinality cap is reached. It
 // runs only on the cold path, so serializing the label set here is cheap.
 func (s *series) admit(hash xxh3.Uint128, lbls labels, now int64, res pcommon.Map, resLabels labels) *expiringSample {
-	if s.maxSize > 0 && len(s.db) >= s.maxSize {
+	if s.maxSize > 0 && s.count >= s.maxSize {
 		s.warnCapped(lbls, now, res, resLabels)
 		return nil
 	}
@@ -439,8 +484,72 @@ func (s *series) admit(hash xxh3.Uint128, lbls labels, now int64, res pcommon.Ma
 	if s.kind == kindHistogram {
 		samp.counts = make([]uint64, len(s.bounds()))
 	}
-	s.db[hash] = samp
+	s.link(samp, hash)
 	return samp
+}
+
+// link inserts samp under its full key, at the head of the bucket its low half
+// indexes. The caller holds s.mu.
+func (s *series) link(samp *expiringSample, hash xxh3.Uint128) {
+	samp.key = hash
+	samp.next = s.db[hash.Lo]
+	s.db[hash.Lo] = samp
+	s.count++
+}
+
+// find returns the sample with this exact 128-bit key, or nil. The chain is a
+// single element for every key a real deployment will ever hold — a low-half
+// collision needs two of the 10000 permitted label combinations to agree on 64
+// hash bits — so this is one fast64 probe and one 16-byte compare.
+func (s *series) find(hash xxh3.Uint128) *expiringSample {
+	samp := s.db[hash.Lo]
+	for samp != nil && samp.key != hash {
+		samp = samp.next
+	}
+	return samp
+}
+
+// unlink removes samp from its bucket chain and decrements the series count.
+// The caller holds s.mu and must not use samp.next afterwards.
+func (s *series) unlink(samp *expiringSample) {
+	head := s.db[samp.key.Lo]
+	if head == samp {
+		if samp.next == nil {
+			delete(s.db, samp.key.Lo)
+		} else {
+			s.db[samp.key.Lo] = samp.next
+		}
+	} else {
+		for p := head; p != nil; p = p.next {
+			if p.next == samp {
+				p.next = samp.next
+				break
+			}
+		}
+	}
+	samp.next = nil
+	s.count--
+}
+
+// all iterates every live sample, walking the collision chains. Cold paths
+// only (export, dump, the failed-export re-arm); the observe path goes through
+// find.
+func (s *series) all() iter.Seq[*expiringSample] {
+	return func(yield func(*expiringSample) bool) {
+		for _, head := range s.db {
+			// next is read BEFORE the yield: snapshot unlinks the sample it is
+			// looking at (the expiry delete), and unlink clears its next
+			// pointer, so reading it afterwards would end the bucket's walk at
+			// the first expired sample and silently skip the rest of its chain.
+			for samp := head; samp != nil; {
+				next := samp.next
+				if !yield(samp) {
+					return
+				}
+				samp = next
+			}
+		}
+	}
 }
 
 // counterBaselineSeconds backdates a COUNTER stream's declared start so that
@@ -476,10 +585,46 @@ func (s *series) warnCapped(lbls labels, now int64, res pcommon.Map, resLabels l
 	s.drops.recordCapped(s.name)
 	if now-s.lastWarn >= 3600 {
 		s.lastWarn = now
-		s.log.Info("max series count reached for log metric",
+		// WARN, not Info: observations are being DROPPED and the cap frees
+		// slots only through idleness, so the metric is blind for maxAge plus
+		// the grace window (24h by default). Info is for lifecycle an operator
+		// reads without asking; a refusal is the definition of a Warn here.
+		s.log.Warn("max series count reached for log metric; further label combinations are refused until existing ones idle out",
 			"metric", s.name, "labels", lbls.String(), "resource", resourceString(res, resLabels),
-			"series", len(s.db), "maxsize", s.maxSize)
+			"series", s.count, "maxSeries", s.maxSize)
 	}
+}
+
+// noteNonFinite counts a refused NaN/Inf observation and names the metric at
+// most hourly.
+//
+// The counter alone (kubescrape_log_metrics_dropped_nan_total) says the
+// extraction is producing garbage but not WHICH rule's, and a set holds every
+// metric on the node — so the operator had a rising number and no way to reach
+// the `value`/`valueRegexp` that produced it. The log line is the context the
+// counter cannot carry; the counter stays the rate.
+//
+// The lock is taken only on this branch (the caller has not taken it yet, and
+// a finite observation never comes here), so the warm path is untouched — the
+// allocation budgets in bench_test.go observe finite values and never reach it.
+func (s *series) noteNonFinite(value float64) {
+	s.drops.nan.Add(1)
+	now := s.epoch()
+	s.mu.Lock()
+	warn := now-s.lastNonFinite >= 3600
+	if warn {
+		s.lastNonFinite = now
+	}
+	s.mu.Unlock()
+	if !warn {
+		return
+	}
+	// dropped is the whole SET's total, not this metric's: the per-metric
+	// breakdown exists only for the cardinality cap (drops.byMetric), and
+	// adding a second per-metric map on a refusal path would be a map write per
+	// bad line for a number the line itself already localises.
+	s.log.Warn("dropping a non-finite log-metric observation; the value extraction produced NaN or Inf, which would poison every aggregate this metric feeds",
+		"metric", s.name, "value", strconv.FormatFloat(value, 'g', -1, 64), "dropped", s.drops.NaN())
 }
 
 // record folds one observation into a sample. Gauges apply their action;
@@ -560,8 +705,8 @@ func (s *series) snapshot() []sample {
 	now := s.epoch()
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	out := make([]sample, 0, len(s.db))
-	for hash, samp := range s.db {
+	out := make([]sample, 0, s.count)
+	for samp := range s.all() {
 		idle := now - samp.when - s.expiration
 		if idle >= 4*60 {
 			// Deleting the sample: emit it first if this value never reached an
@@ -579,7 +724,7 @@ func (s *series) snapshot() []sample {
 				}
 				out = append(out, emit)
 			}
-			delete(s.db, hash)
+			s.unlink(samp)
 			continue
 		}
 		if s.aggregating() {
@@ -649,7 +794,7 @@ func (s *series) rearmInitial(samples []sample) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	for _, e := range s.db {
+	for e := range s.all() {
 		if _, ok := want[e.resource+"\x00"+e.labels]; ok {
 			e.initial = true
 		}

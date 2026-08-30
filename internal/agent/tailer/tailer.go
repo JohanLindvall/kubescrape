@@ -55,6 +55,24 @@ import (
 // keeps moving regardless.
 const maxReadWarnPaths = 256
 
+// Throttle windows for the tailer's persisting-condition warnings. They are
+// all conditions that hold for as long as their cause does — an unreachable
+// metadata service, a collector outage, a file that cannot be attributed — so
+// the line is the CONTEXT a counter cannot carry (which file, which error) and
+// the counter beside it is the rate. One minute for the two that mean "data is
+// not moving right now", five for the aggregate that merely names how many
+// files are waiting.
+const (
+	metaWarnEvery       = time.Minute
+	exportWarnEvery     = time.Minute
+	unresolvedWarnEvery = 5 * time.Minute
+	// unresolvedWarnAfter is how long a file may sit unresolved before it is
+	// worth a warning. Every file is unresolved for its first sweep and a
+	// container genuinely racing the API server resolves within a second or
+	// two, so warning on the state itself would fire on every pod start.
+	unresolvedWarnAfter = 2 * time.Minute
+)
+
 // LogExporter sends one OTLP logs payload.
 type LogExporter interface {
 	ExportLogs(ctx context.Context, ld plog.Logs) error
@@ -198,7 +216,59 @@ type Tailer struct {
 	// number of such files, the exact persisting-state complaint logdedupe
 	// exists to bound. Keyed by path, re-warned on a schedule.
 	readWarn *logdedupe.Table
-	batch    []entry
+	// metaWarn throttles the per-file "fetching container metadata" warning.
+	// The lookup BLOCKS server-side and is retried per file on its own backoff,
+	// so an unreachable metadata service made every tracked file on every node
+	// warn once a minute — a flood proportional to fleet size for one
+	// cluster-wide condition. Keyless: the condition is the metadata service,
+	// not the file, and the line carries one example path plus how many files
+	// are waiting, which is what an operator needs. The RATE is
+	// kubescrape_metadata_requests_total, which metaclient moves per attempt.
+	metaWarn logdedupe.Throttle
+	// budgetWarn throttles the resolve-budget-exhausted warning. Its OWN gate,
+	// not metaWarn's: the two conditions co-occur (a hanging metadata service
+	// makes lookups fail AND spends the budget), so sharing one throttle would
+	// let whichever fired first suppress the other for the window — and they
+	// say different things, one "the lookups are failing", the other "these
+	// files were never even asked about".
+	budgetWarn logdedupe.Throttle
+	// unresolvedWarn throttles publishStatus's "files waiting for metadata"
+	// warning, the aggregate half of the same condition (see
+	// obs.LogFilesUnresolved).
+	unresolvedWarn logdedupe.Throttle
+	// exportWarn throttles failBatch's export-failure Error. A collector outage
+	// fails every flush for its whole duration — one Error every couple of
+	// seconds per node — and the rate is already
+	// kubescrape_log_export_failures_total. The FIRST failure of an outage
+	// always logs (the throttle's window has not opened), and the recovery
+	// logs once at Info: transition, throttled re-warn, recovery, exactly the
+	// shape cmd/kubescrape/apiserver.go uses for a persisting condition.
+	exportWarn logdedupe.Throttle
+	// exportFailures counts consecutive failed flushes since the last
+	// successful one, and exportFailingSince stamps the first of them; both are
+	// zeroed by commitBatch, which is what makes the recovery line possible.
+	exportFailures     int
+	exportFailingSince time.Time
+	// skipped is the previous discovery pass's declined files (path -> reason),
+	// diffed by reportSkips so a skipped file is counted and logged once rather
+	// than once per pass.
+	skipped map[string]string
+	// positionsWarn throttles saveCheckpoints' failed-write Warn, and
+	// positionsFailing is what makes the recovery Info possible. The save runs
+	// on a 10s cadence against a condition that does not change between
+	// attempts (a read-only mount, a full disk), so the unthrottled line was a
+	// permanent 6/minute/node flood for one fact; the rate lives in
+	// kubescrape_positions_save_errors_total. Its OWN gate, not shared with
+	// any other condition — a shared one lets whichever fired first suppress
+	// the other for the window.
+	positionsWarn    logdedupe.Throttle
+	positionsFailing bool
+	// statErrWarn throttles the Warn for a log file that could not be stat'd.
+	// Keyless: a wrongly-mounted log directory fails every file in it for the
+	// same reason and takes one remedy, so the line names one example and how
+	// many others shared the pass rather than minting a key per path.
+	statErrWarn logdedupe.Throttle
+	batch       []entry
 	// flushed is the batch the CURRENT flush is exporting: flush swaps it out of
 	// batch (so batch is empty again the moment the export starts, as every
 	// caller's read loop requires) and walks it once more after the outcome, to
@@ -240,6 +310,11 @@ type Tailer struct {
 	// no save has persisted. The sweep saves once at its end rather than once
 	// per hop (see reopen).
 	hopsUnsaved bool
+
+	// discoveryUnsaved: a discovery pass claimed a file whose entry no save has
+	// persisted yet, because a save from less than discoverySaveWindow ago
+	// coalesced it. housekeeping flushes it once the window has elapsed.
+	discoveryUnsaved bool
 
 	lastIdleScan   time.Time
 	lastFlush      time.Time
@@ -484,7 +559,11 @@ func (t *Tailer) housekeeping(ctx context.Context) {
 	if len(t.batch) > 0 && time.Since(t.lastFlush) >= t.cfg.FlushInterval {
 		t.flush(ctx)
 	}
-	if t.checkpointing() && time.Since(t.lastCheckpoint) >= 10*time.Second {
+	// The 10-second cadence, plus the shorter window that flushes a discovery
+	// coalesced by saveDiscovery — housekeeping runs after every sweep, and a
+	// discovery always schedules one, so a deferred entry never waits for the
+	// cadence.
+	if t.checkpointing() && (time.Since(t.lastCheckpoint) >= 10*time.Second || t.discoverySaveDue()) {
 		t.saveCheckpoints()
 	}
 	if time.Since(t.lastStatus) >= t.statusEvery {
@@ -552,6 +631,12 @@ func (t *Tailer) sweep(ctx context.Context, all bool) {
 	// Set lazily on the first unresolved file, so a sweep with nothing to
 	// resolve pays nothing.
 	var resolveDeadline time.Time
+	// Files this sweep did not even ASK about because the shared resolve
+	// budget ran out. No request is issued, so kubescrape_metadata_requests_total
+	// cannot move for them and the files simply stay unresolved and unread:
+	// without this the state has no signal at all (see
+	// obs.LogMetadataBudgetExhausted).
+	var budgetSkipped int
 	now := time.Now()
 	cutoff := now.Add(-t.cfg.MultilineTimeout)
 	for path, f := range t.files {
@@ -601,6 +686,7 @@ func (t *Tailer) sweep(ctx context.Context, all bool) {
 				resolveDeadline = time.Now().Add(t.resolveBudget)
 			}
 			if time.Now().After(resolveDeadline) {
+				budgetSkipped++
 				continue
 			}
 			if !t.resolveMetadata(ctx, f) {
@@ -687,6 +773,15 @@ func (t *Tailer) sweep(ctx context.Context, all bool) {
 		// they are added. A rewind here needs no handling: this file's
 		// iteration is over.
 		_ = t.maybeFlush(ctx, f)
+	}
+	if budgetSkipped > 0 {
+		// ONCE PER SWEEP, not once per unreached file, so a rate is comparable
+		// with the sweep cadence — promscrape's ScrapeMetaBudgetExhausted rule.
+		obs.LogMetadataBudgetExhausted.Inc()
+		if t.budgetWarn.Allow(metaWarnEvery) {
+			t.log.Warn("the metadata-resolution budget ran out this sweep; these files are tracked but not read until a later sweep",
+				"files", budgetSkipped, "budget", t.resolveBudget, "wait", t.cfg.MetadataWait)
+		}
 	}
 	if t.hopsUnsaved {
 		// One save for every rotation this sweep handled, instead of one per

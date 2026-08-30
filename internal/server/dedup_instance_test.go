@@ -389,8 +389,8 @@ func TestPodAnnotationWinnerKeepsTheServiceMetadata(t *testing.T) {
 // anything below.
 type deploymentResolver struct{ stubResolver }
 
-func (r deploymentResolver) Resolve(ns string, refs []metav1.OwnerReference) []kubemeta.Owner {
-	out := r.stubResolver.Resolve(ns, refs)
+func (r deploymentResolver) Resolve(ns string, refs []metav1.OwnerReference) ([]kubemeta.Owner, int) {
+	out, omitted := r.stubResolver.Resolve(ns, refs)
 	for i := range out {
 		if out[i].Kind != "ReplicaSet" {
 			continue
@@ -398,9 +398,9 @@ func (r deploymentResolver) Resolve(ns string, refs []metav1.OwnerReference) []k
 		return append(out, kubemeta.Owner{
 			APIVersion: "apps/v1", Kind: "Deployment",
 			Name: strings.TrimSuffix(out[i].Name, "-abc"), UID: "deploy-uid",
-		})
+		}), omitted
 	}
-	return out
+	return out, omitted
 }
 
 // replicaPod is one replica of the "web" Deployment, annotated for scraping on

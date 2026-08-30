@@ -925,7 +925,7 @@ func TestSummaryForbiddenNamesTheRBACRule(t *testing.T) {
 	if err == nil {
 		t.Fatal("a 403 reported success")
 	}
-	var se *kubeletStatusError
+	var se *statusError
 	if !errors.As(err, &se) || se.code != http.StatusForbidden {
 		t.Fatalf("the 403 did not survive as a typed status: %v", err)
 	}

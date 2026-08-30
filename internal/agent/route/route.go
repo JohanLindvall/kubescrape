@@ -205,11 +205,50 @@ type Router struct {
 	// unknownRouteGate throttles the typo'd-ScriptMarker warning: the script
 	// stamps every record of a busy stream, and the condition is a state.
 	unknownRouteGate logdedupe.Throttle
+	// log is the router's logger; nil means the process default (logger() in
+	// debug.go says why nothing wires one through New). It carries the Debug
+	// narration of the routing DECISION — the one thing this package could not
+	// answer during an incident.
+	log *slog.Logger
+	// health[i] narrates dests[i]'s outcomes — one line when a destination
+	// starts refusing, one when it starts accepting again, with the class and a
+	// remediation hint (otlpexport.FailureReporter, the same report the default
+	// chain's client makes about the collector). A route destination is
+	// UNBUFFERED by design, so its failure is felt by the producer immediately
+	// and is worth saying out loud; it is also the destination an operator is
+	// least likely to be watching, since a tenant route is usually somebody
+	// else's collector.
+	health []*otlpexport.FailureReporter
 }
 
 // New builds a Router forwarding unmatched resources to def.
 func New(def Exporter, dests []Destination) *Router {
-	return &Router{def: def, dests: dests}
+	r := &Router{def: def, dests: dests}
+	r.health = make([]*otlpexport.FailureReporter, len(dests))
+	for i, d := range dests {
+		// The route NAME, not an endpoint: a Destination holds a built
+		// Exporter and never its address. The startup summary's per-route
+		// lines are what map a name to an endpoint, once.
+		r.health[i] = otlpexport.NewFailureReporter(nil, "a routing destination", "route", d.Name)
+	}
+	return r
+}
+
+// noteDest counts and narrates one destination's result for one signal. Only a
+// DELIVERED part is counted as routed (the producer retries the whole payload,
+// so counting before the send would tally attempts); a refusal moves the
+// failure counter, which is the half that used to be missing entirely — a route
+// that never worked was indistinguishable from a route nothing matched.
+func (r *Router) noteDest(i int, signal string, err error) error {
+	if err == nil {
+		obs.Routed.WithLabelValues(r.dests[i].Name, signal).Inc()
+	} else {
+		obs.RouteFailures.WithLabelValues(r.dests[i].Name, signal).Inc()
+	}
+	if i < len(r.health) && r.health[i] != nil {
+		r.health[i].Note(signal, err)
+	}
+	return err
 }
 
 // match returns the destination index for a resource (-1 = default) and
@@ -217,7 +256,14 @@ func New(def Exporter, dests []Destination) *Router {
 // the default destination: the marker must be stripped before anything is
 // sent, and stripping may only happen on the split's copy — the caller's
 // payload is retried as-is by its producer.
-func (r *Router) match(res pcommon.Resource) (idx int, marked bool) {
+//
+// note gates the unknown-route REPORT, and it exists because split matches one
+// resource twice: its scan stops at the first match and the grouping pass then
+// re-matches from there, so the resource at that boundary passes through here
+// twice for one payload. The throttled warning never showed it; a counter does
+// (kubescrape_routed_unknown_total read 2 for one mis-routed payload). Only the
+// grouping pass reports.
+func (r *Router) match(res pcommon.Resource, note bool) (idx int, marked bool) {
 	attrs := res.Attributes()
 	if v, ok := attrs.Get(ScriptMarker); ok {
 		want := v.Str()
@@ -226,13 +272,18 @@ func (r *Router) match(res pcommon.Resource) (idx int, marked bool) {
 				return i, true
 			}
 		}
+		if !note {
+			return -1, true
+		}
+		obs.RouteUnknown.Inc()
 		if r.unknownRouteGate.Allow(time.Minute) {
-			slog.Warn("transform script routed to an unknown route; using the default chain",
+			r.logger().Warn("a transform script routed a payload to a name no route defines; it goes to the default "+
+				"chain instead, so the records are delivered but not to the tenant the script asked for",
 				"route", want)
 		}
 		return -1, true
 	}
-	ns, ok := attrs.Get("k8s.namespace.name")
+	ns, ok := attrs.Get(namespaceAttr)
 	if !ok {
 		return -1, false
 	}
@@ -249,7 +300,7 @@ func (r *Router) match(res pcommon.Resource) (idx int, marked bool) {
 
 // ExportLogs splits by resource namespace and forwards each group.
 func (r *Router) ExportLogs(ctx context.Context, ld plog.Logs) error {
-	groups := r.split(ld.ResourceLogs().Len(), func(i int) pcommon.Resource {
+	groups := r.split("logs", ld.ResourceLogs().Len(), func(i int) pcommon.Resource {
 		return ld.ResourceLogs().At(i).Resource()
 	})
 	if groups == nil {
@@ -278,15 +329,9 @@ func (r *Router) ExportLogs(ctx context.Context, ld plog.Logs) error {
 	}
 	for i, d := range r.dests {
 		if p := parts[i+1]; p.ResourceLogs().Len() > 0 {
-			err := d.Exporter.ExportLogs(ctx, p)
-			if err == nil {
-				// Count only DELIVERED parts, and only after the send: the
-				// producer (ingest batcher) retries the whole payload on
-				// failure, so counting before the send would tally failed
-				// and retried attempts, not forwarded parts.
-				obs.Routed.WithLabelValues(d.Name, "logs").Inc()
-			}
-			errs = append(errs, err)
+			// noteDest counts the outcome (delivered vs refused) and narrates
+			// a change in this destination's health.
+			errs = append(errs, r.noteDest(i, "logs", d.Exporter.ExportLogs(ctx, p)))
 		}
 	}
 	return joinExportErrs(errs)
@@ -294,7 +339,7 @@ func (r *Router) ExportLogs(ctx context.Context, ld plog.Logs) error {
 
 // ExportMetrics splits by resource namespace and forwards each group.
 func (r *Router) ExportMetrics(ctx context.Context, md pmetric.Metrics) error {
-	groups := r.split(md.ResourceMetrics().Len(), func(i int) pcommon.Resource {
+	groups := r.split("metrics", md.ResourceMetrics().Len(), func(i int) pcommon.Resource {
 		return md.ResourceMetrics().At(i).Resource()
 	})
 	if groups == nil {
@@ -318,11 +363,7 @@ func (r *Router) ExportMetrics(ctx context.Context, md pmetric.Metrics) error {
 	}
 	for i, d := range r.dests {
 		if p := parts[i+1]; p.ResourceMetrics().Len() > 0 {
-			err := d.Exporter.ExportMetrics(ctx, p)
-			if err == nil {
-				obs.Routed.WithLabelValues(d.Name, "metrics").Inc() // see ExportLogs
-			}
-			errs = append(errs, err)
+			errs = append(errs, r.noteDest(i, "metrics", d.Exporter.ExportMetrics(ctx, p))) // see ExportLogs
 		}
 	}
 	return joinExportErrs(errs)
@@ -332,7 +373,7 @@ func (r *Router) ExportMetrics(ctx context.Context, md pmetric.Metrics) error {
 // destinations always support traces (they are otlpexport clients); the
 // default may not — its group then errors only if non-empty.
 func (r *Router) ExportTraces(ctx context.Context, td ptrace.Traces) error {
-	groups := r.split(td.ResourceSpans().Len(), func(i int) pcommon.Resource {
+	groups := r.split("traces", td.ResourceSpans().Len(), func(i int) pcommon.Resource {
 		return td.ResourceSpans().At(i).Resource()
 	})
 	defTraces, defOK := r.def.(TracesExporter)
@@ -367,14 +408,14 @@ func (r *Router) ExportTraces(ctx context.Context, td ptrace.Traces) error {
 		if p := parts[i+1]; p.ResourceSpans().Len() > 0 {
 			te, ok := d.Exporter.(TracesExporter)
 			if !ok {
-				errs = append(errs, errors.New("route "+d.Name+" does not support traces"))
+				// A wiring fault rather than a destination failure, and it
+				// repeats on every export: count and narrate it like one, so
+				// "this route ships no traces" is visible in the same two
+				// places as every other route failure.
+				errs = append(errs, r.noteDest(i, "traces", errors.New("route "+d.Name+" does not support traces")))
 				continue
 			}
-			err := te.ExportTraces(ctx, p)
-			if err == nil {
-				obs.Routed.WithLabelValues(d.Name, "traces").Inc() // see ExportLogs
-			}
-			errs = append(errs, err)
+			errs = append(errs, r.noteDest(i, "traces", te.ExportTraces(ctx, p))) // see ExportLogs
 		}
 	}
 	return joinExportErrs(errs)
@@ -392,15 +433,23 @@ func (r *Router) ExportTraces(ctx context.Context, td ptrace.Traces) error {
 // FIRST match with no allocation, and only then take a second pass into a
 // slice sized exactly once. Resources before that match are all default, so
 // re-matching them would be pure waste.
-func (r *Router) split(n int, res func(int) pcommon.Resource) []int {
+func (r *Router) split(signal string, n int, res func(int) pcommon.Resource) []int {
+	// ONE Enabled call per export decides whether the narration below is built;
+	// slog evaluates arguments eagerly, so an unguarded explainExport would walk
+	// every resource of every payload at Info. The fast path's promise above is
+	// kept: with Debug off this costs one interface call and nothing else.
+	dbg := r.debugEnabled()
 	first := -1
 	for i := 0; i < n; i++ {
-		if idx, marked := r.match(res(i)); idx >= 0 || marked {
+		if idx, marked := r.match(res(i), false); idx >= 0 || marked {
 			first = i
 			break
 		}
 	}
 	if first < 0 {
+		if dbg {
+			r.explainExport(signal, n, res, nil)
+		}
 		return nil
 	}
 	groups := make([]int, n)
@@ -408,7 +457,10 @@ func (r *Router) split(n int, res func(int) pcommon.Resource) []int {
 		groups[i] = -1
 	}
 	for i := first; i < n; i++ {
-		groups[i], _ = r.match(res(i))
+		groups[i], _ = r.match(res(i), true)
+	}
+	if dbg {
+		r.explainExport(signal, n, res, groups)
 	}
 	return groups
 }

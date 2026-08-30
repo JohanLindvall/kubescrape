@@ -1,6 +1,6 @@
 module github.com/JohanLindvall/kubescrape
 
-go 1.26.3
+go 1.26.6
 
 require (
 	github.com/JohanLindvall/bufpool v0.2.7

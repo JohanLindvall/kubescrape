@@ -59,6 +59,10 @@ var endpointMergeClass = map[string]mergeClass{
 	"Path":       inertClass,
 	"Scheme":     inertClass,
 	"Ignored":    inertClass,
+	// A REFUSED endpoint resolves to no URL at all (monitorEndpoint /
+	// podMonitorEndpoint refuse it), so it can never be one of the two
+	// endpoints a merge holds — inert by unreachability, not by indifference.
+	"Refused": inertClass,
 
 	"MetricRelabelings": relabelClass,
 
@@ -75,6 +79,57 @@ var endpointMergeClass = map[string]mergeClass{
 	"TLSCert":            authClass,
 	"TLSKey":             authClass,
 	"TLSServerName":      authClass,
+}
+
+// MergeReport is what one fold of an endpoint into a served target could not
+// honour silently: everything a caller must count, log or explain. It is a
+// struct rather than a fourth positional bool because every bound this merge
+// grows adds one — and at a call site that reads `_, _, capped, _ :=` the
+// wrong blank is a refusal reported as nothing at all, which is precisely the
+// class of defect the caps exist to make impossible.
+type MergeReport struct {
+	// AuthAdopted reports that THIS endpoint's auth/TLS group was adopted
+	// whole (the holder had none): the serving credential now belongs to this
+	// monitor, not the URL-holding one, and the caller records that so a later
+	// conflict warning names the monitor whose material is actually served.
+	AuthAdopted bool
+	// AuthConflict reports the one group a single scrape cannot honour twice:
+	// both sides declare auth/TLS material and it differs, so the holder's is
+	// served and the caller counts the loss.
+	AuthConflict bool
+	// RelabelCapped reports that only a PREFIX of this endpoint's
+	// metricRelabelings was folded in — the merged chain reached
+	// MaxRelabelChainRules/MaxRelabelChainBytes and the rest filter nothing.
+	RelabelCapped bool
+	// ContributorsCapped reports that this endpoint's CONFIGURATION merged but
+	// its monitor's NAME was refused from the target's contributor list, which
+	// is at MaxContributorsPerTarget. Attribution is lost, not configuration —
+	// see addContributor for why that is the half worth refusing.
+	ContributorsCapped bool
+	// Bytes is how much this fold GREW the served target's own document, in
+	// TargetOwnBytes' accounting — the merged relabel chain, the contributor
+	// name, an adopted auth group, a finer cadence.
+	//
+	// It exists because the merge arm is the one place the per-pod byte budget
+	// (MaxTargetBytesPerPod, charged in server.targetDedup.add) used to charge
+	// NOTHING, on the grounds that a merge copies no pod document. That is true
+	// of the pod document and incomplete about the target: the merged chain is
+	// bounded at MaxRelabelChainBytes and the contributor list at
+	// MaxContributorsPerTarget x ~317 bytes, so a fully-merged target can grow
+	// by ~26 KiB, and MaxPortsPerPod of them by ~400 KiB — bounded and
+	// deterministic, needing >=32 monitors on one URL, but strictly on top of a
+	// budget whose whole claim is that it charges the WHOLE target document.
+	// Reporting it here lets the caller charge it, so the claim is true rather
+	// than nearly true; it refuses no merge (refusing one would drop relabel
+	// rules a monitor asked for, changing what is EXPORTED to bound a
+	// response), it only spends the pod's budget so a later NEW url is refused
+	// sooner.
+	//
+	// Measured only when something can have changed: the bare-endpoint gate
+	// returns before the first measurement, so the common cluster-wide-monitor
+	// shape stays the field compares and no walk that monitorHolder's comment
+	// promises.
+	Bytes int
 }
 
 // MergeMonitorEndpoint folds a monitor endpoint into the monitor-derived
@@ -102,10 +157,7 @@ var endpointMergeClass = map[string]mergeClass{
 // compares and no allocation (see targetDedup.monitorHolder in
 // internal/server).
 //
-// authAdopted reports that THIS endpoint's auth/TLS group was adopted whole
-// (the holder had none): the serving credential now belongs to this monitor,
-// not the URL-holding one, and the caller records that so a later conflict
-// warning names the monitor whose material is actually served.
+// What could not be honoured silently comes back in the MergeReport above.
 //
 // # The caller contract: each endpoint is offered to a URL AT MOST ONCE
 //
@@ -130,7 +182,8 @@ var endpointMergeClass = map[string]mergeClass{
 // tripled at three (a single Service is exactly the union, which is why
 // nothing caught it for so long). internal/server's
 // TestMergedChainIsTheUnionAcrossMatchingServices drives the real loop.
-func MergeMonitorEndpoint(t *kubemeta.ScrapeTarget, monitor string, ep *servicemonitors.Endpoint) (authAdopted, authConflict bool) {
+func MergeMonitorEndpoint(t *kubemeta.ScrapeTarget, monitor string, ep *servicemonitors.Endpoint) MergeReport {
+	var rep MergeReport
 	epAuth := endpointAuth(ep)
 	// The bare gate: one arm per mergeable class of endpointMergeClass —
 	// relabel, cadence, and the whole auth group in a single authMaterial
@@ -138,14 +191,20 @@ func MergeMonitorEndpoint(t *kubemeta.ScrapeTarget, monitor string, ep *servicem
 	// only it bare, silently dropping the declaration; merge_guard_test.go
 	// holds every classified field to an arm.
 	if len(ep.MetricRelabelings) == 0 && ep.Interval == "" && ep.ScrapeTimeout == "" && epAuth == (authMaterial{}) {
-		return false, false
+		return rep
 	}
+	// In the byte budget's OWN accounting, so what the merge arm charges and
+	// what the new-URL arm charges cannot drift apart (see MergeReport.Bytes).
+	beforeBytes := TargetOwnBytes(t)
 	contributed := false
 	// stampEndpoint built t.MetricRelabelings as a fresh copy, so appending
 	// never writes into the indexed monitor's own slice.
 	if len(ep.MetricRelabelings) > 0 && !relabelChainsEqual(t.MetricRelabelings, ep.MetricRelabelings) {
-		t.MetricRelabelings = append(t.MetricRelabelings, ep.MetricRelabelings...)
-		contributed = true
+		added, capped := appendRelabelChain(t, ep.MetricRelabelings)
+		if added {
+			contributed = true
+		}
+		rep.RelabelCapped = capped
 	}
 	if mergeCadence(t, ep) {
 		contributed = true
@@ -155,17 +214,127 @@ func MergeMonitorEndpoint(t *kubemeta.ScrapeTarget, monitor string, ep *servicem
 		case authMaterial{}:
 			stampAuth(t, epAuth)
 			contributed = true
-			authAdopted = true
+			rep.AuthAdopted = true
 		case epAuth:
 			// The same material declared twice: served as-is, nothing lost.
 		default:
-			authConflict = true // the holder's material is served
+			rep.AuthConflict = true // the holder's material is served
 		}
 	}
 	if contributed {
-		addContributor(t, monitor)
+		rep.ContributorsCapped = addContributor(t, monitor)
 	}
-	return authAdopted, authConflict
+	rep.Bytes = TargetOwnBytes(t) - beforeBytes
+	return rep
+}
+
+// MaxRelabelChainRules and MaxRelabelChainBytes bound the metricRelabelings a
+// single SERVED target may carry once every monitor that resolved to its URL
+// has folded in.
+//
+// servicemonitors bounds ONE endpoint's chain at parse time (maxRelabelRules /
+// maxRelabelChainBytes there, both strictly under these, so a target stamped
+// from a single endpoint can never arrive here already over). This bounds the
+// SUM, and it is a separate bound because the merge CONCATENATES and nothing
+// bounds how many monitors exist: a tenant with namespace edit rights creates
+// N ServiceMonitors, each individually legal, each `selector: {}` +
+// `namespaceSelector.any: true`, all colliding on one URL per pod — and the
+// per-endpoint cap multiplies by N in the node document every agent fetches
+// each scrape cycle. The same lesson the parse-time cap records: a bound on
+// one contributor is not a bound on the total.
+//
+// Also, and independently: the agent walks the MERGED chain per sample.
+//
+// The excess is refused, the prefix served, and the caller reports it — see
+// the servicemonitors bounds for why refusing the excess beats refusing the
+// monitor.
+const (
+	MaxRelabelChainRules = 128
+	MaxRelabelChainBytes = 16 << 10
+)
+
+// MaxContributorsPerTarget bounds the contributor list a single SERVED target
+// carries (kubemeta.ScrapeTarget.Monitors: the URL holder plus every monitor
+// whose declaration merged into it).
+//
+// It is the SIBLING of the relabel ceiling above and it is needed for exactly
+// the same reason, against a cheaper attack: a contribution costs a finer
+// `interval` and nothing else, so a tenant with edit rights in one namespace
+// creates N ServiceMonitors — each `selector: {}` + `namespaceSelector.any:
+// true`, each carrying no metricRelabelings at all — that all resolve to one
+// URL on one pod, and NEITHER the per-endpoint parse bound nor the merged-chain
+// bound is reached. The list is appended per contribution and scanned per
+// append, so it was O(n²) in CPU and O(n) on the wire PER POD: measured through
+// the real derivation, 2,000 such monitors put 2,000 names into ONE target and
+// turned a ONE-POD node's targets document into 124,793 bytes with 40-character
+// monitor names (~0.6 MB at the name length Kubernetes permits) in ~0.07 s —
+// bounded, the same document is 2,777 bytes. Multiply by the pods on the node,
+// re-derived and re-marshalled on every agent poll, in the singleton the chart
+// requests 128Mi for with no memory limit. MaxPortsPerPod cannot
+// see it — this adds no target — and it is the same lesson twice over: a bound
+// on ONE contributor is not a bound on the total.
+//
+// What is refused is ATTRIBUTION, never CONFIGURATION: the endpoint's relabel
+// rules, cadence and auth have already merged when this binds, so the scrape is
+// unchanged and only the name of a monitor that is one of many stops being
+// listed. That is the right half to refuse — refusing the merge instead would
+// change what is scraped to bound a diagnostic — but it is still a loss no
+// consumer of the document could otherwise detect, so it is counted, warned and
+// named by /v1/explain like every other refusal here.
+//
+// The value is a ceiling on the pathological, not a budget for the normal: real
+// collisions are two or three monitors, and 32 names of the length Kubernetes
+// permits (a namespace and a name, 317 bytes) is ~10 KiB of worst-case wire per
+// target — the same order as MaxRelabelChainBytes.
+const MaxContributorsPerTarget = 32
+
+// appendRelabelChain folds a chain into the target under the ceiling above,
+// reporting whether anything was appended and whether anything was refused.
+//
+// The held size is recomputed per merge rather than carried on the target: the
+// wire model (kubemeta.ScrapeTarget) is served to agents and must not grow a
+// bookkeeping field, chains are small by construction of the bound itself, and
+// a merge happens once per (URL, endpoint) per pod per derivation — not per
+// sample, where the cost would matter.
+func appendRelabelChain(t *kubemeta.ScrapeTarget, add []kubemeta.RelabelRule) (added, capped bool) {
+	held := 0
+	for i := range t.MetricRelabelings {
+		held += relabelRuleBytes(&t.MetricRelabelings[i])
+	}
+	for i := range add {
+		if len(t.MetricRelabelings) >= MaxRelabelChainRules {
+			return added, true
+		}
+		n := relabelRuleBytes(&add[i])
+		if held+n > MaxRelabelChainBytes {
+			return added, true
+		}
+		held += n
+		t.MetricRelabelings = append(t.MetricRelabelings, add[i])
+		added = true
+	}
+	return added, false
+}
+
+// relabelLabelBytes is what ONE sourceLabels entry costs beyond its own
+// characters: its JSON framing in the marshalled node-targets document (two
+// quotes and a comma) and its slice slot and per-sample visit in the agent's
+// relabelFilter. It is charged for the reason its twin in servicemonitors is
+// (servicemonitors.relabelLabelBytes, which carries the measurement): a list of
+// EMPTY strings walks straight past an accounting that charges only characters,
+// so a rule costed at 2 bytes marshals to 1.5 MB in every target. The two doors
+// must stay the same shape, which is why the constant exists on both sides.
+const relabelLabelBytes = 3
+
+// relabelRuleBytes is one rule's cost in the two places the ceiling defends:
+// the marshalled node-targets document, and the per-sample walk in the agent's
+// relabelFilter. The action is one of two constants and is not charged.
+func relabelRuleBytes(r *kubemeta.RelabelRule) int {
+	n := len(r.Regex)
+	for _, l := range r.SourceLabels {
+		n += len(l) + relabelLabelBytes
+	}
+	return n
 }
 
 // mergeCadence resolves the interval/scrapeTimeout pair, reporting whether the
@@ -191,9 +360,20 @@ func mergeCadence(t *kubemeta.ScrapeTarget, ep *servicemonitors.Endpoint) bool {
 		t.Interval, t.ScrapeTimeout = ep.Interval, ep.ScrapeTimeout
 		return true
 	}
-	// Both explicit: the finer wins. Equal or incomparable (either side
-	// unparseable — the agent warns once and falls back at scrape time) keeps
-	// the holder's, deterministically.
+	// Both explicit and spelled the SAME: the holder keeps, which is what the
+	// comparison below decides anyway (equal durations are not finer) — and
+	// that is by far the ordinary collision, two charts' monitors both saying
+	// `interval: 30s` on one endpoint. Short-circuited because promDuration is
+	// a REGEXP: an alloc profile of a colliding-monitor derivation found
+	// regexp.FindStringSubmatch at 48.6% of every object it allocated, two
+	// parses per merge, to re-derive an answer the strings already give. It is
+	// equivalent on the unparseable case too (both sides fail, holder keeps).
+	if t.Interval == ep.Interval {
+		return false
+	}
+	// Otherwise the finer wins. Incomparable (either side unparseable — the
+	// agent warns once and falls back at scrape time) keeps the holder's,
+	// deterministically.
 	held, hok := promDuration(t.Interval)
 	asked, aok := promDuration(ep.Interval)
 	if !hok || !aok || asked >= held {
@@ -266,7 +446,9 @@ func stampAuth(t *kubemeta.ScrapeTarget, a authMaterial) {
 	t.TLSServerName = a.tlsServerName
 }
 
-// addContributor records a monitor whose configuration the target now carries.
+// addContributor records a monitor whose configuration the target now carries,
+// reporting whether the list was at MaxContributorsPerTarget and the name was
+// therefore refused.
 // Initialised lazily with the holder so the field stays ABSENT — and the wire
 // shape unchanged — for the overwhelmingly common single-monitor target; the
 // caller's encounter order keeps the list (and with it the response body and
@@ -281,16 +463,26 @@ func stampAuth(t *kubemeta.ScrapeTarget, a authMaterial) {
 // on a target only ONE monitor describes — which the model documents as absent
 // in that case, and which a consumer reads as "more than one monitor resolved
 // to this URL".
-func addContributor(t *kubemeta.ScrapeTarget, monitor string) {
+func addContributor(t *kubemeta.ScrapeTarget, monitor string) (capped bool) {
 	if len(t.Monitors) == 0 {
 		if monitor == t.Monitor {
-			return
+			return false
 		}
 		t.Monitors = append(t.Monitors, t.Monitor)
 	}
-	if !slices.Contains(t.Monitors, monitor) {
-		t.Monitors = append(t.Monitors, monitor)
+	// The membership test runs BEFORE the ceiling, so a monitor already listed
+	// is never reported as refused however full the list is — it contributed,
+	// and it is on the wire. Over a list this short the scan is cheaper than
+	// the map that would replace it, and the ceiling is what keeps it short:
+	// unbounded, it was the O(n²) half of this function.
+	if slices.Contains(t.Monitors, monitor) {
+		return false
 	}
+	if len(t.Monitors) >= MaxContributorsPerTarget {
+		return true
+	}
+	t.Monitors = append(t.Monitors, monitor)
+	return false
 }
 
 // relabelChainsEqual is the identical-declaration test: two monitors asking

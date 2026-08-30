@@ -18,6 +18,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log/slog"
 	"math"
 	"net/http"
 	"net/url"
@@ -122,6 +123,11 @@ type tokenSource struct {
 	mu    sync.Mutex
 	fetch func(ctx context.Context) (string, time.Duration, error)
 	now   func() time.Time
+	log   *slog.Logger
+	// what names the protocol in the log lines ("workload identity", "imds"),
+	// which is the first thing to check when a managed identity does not work:
+	// the two fail for completely different reasons.
+	what string
 
 	token  string
 	expiry time.Time
@@ -143,14 +149,41 @@ func (t *tokenSource) get(ctx context.Context) (string, error) {
 		if t.token != "" && now.Before(t.expiry) {
 			// Inside the refresh margin but not yet expired: the stale token
 			// still works; a transient token-endpoint blip must not fail
-			// every new Kafka connection.
+			// every new Kafka connection. The FALLBACK is the thing to say —
+			// the pipeline is fine right now and will stop being fine at the
+			// expiry printed here if the endpoint does not come back.
+			t.logger().Warn("refreshing the event hubs entra token failed; serving the last good token until it expires",
+				"error", err, "source", t.what, "expiry", t.expiry.UTC().Format(time.RFC3339))
 			return t.token, nil
 		}
+		// No usable token: every new Kafka connection now fails SASL, and kgo
+		// retries that internally — so without this line the consumer simply
+		// goes quiet (kgolog.go carries the same argument).
+		t.logger().Warn("acquiring an entra token for event hubs failed; the consumer cannot authenticate",
+			"error", err, "source", t.what)
 		return "", err
 	}
 	obs.AzureTokenRefreshes.WithLabelValues("ok").Inc()
+	if t.token == "" {
+		// The FIRST token is a lifecycle event (it is what makes the pipeline
+		// able to run at all); every later refresh is routine and is Debug.
+		t.logger().Info("acquired an entra token for event hubs", "source", t.what, "ttl", ttl)
+	} else {
+		t.logger().Debug("refreshed the entra token for event hubs", "source", t.what, "ttl", ttl)
+	}
 	t.token, t.expiry = tok, now.Add(ttl)
 	return t.token, nil
+}
+
+// logger is the token source's logger, defaulted. NEVER log t.token or the
+// fetched value — an Entra access token is a bearer credential, and a log
+// aggregator keeps it long after it expires. The expiry, the TTL and the
+// protocol are the whole of what may be said.
+func (t *tokenSource) logger() *slog.Logger {
+	if t.log == nil {
+		return slog.Default()
+	}
+	return t.log
 }
 
 // mechanism wraps the source as SASL OAUTHBEARER.
@@ -167,7 +200,7 @@ func (t *tokenSource) mechanism() sasl.Mechanism {
 // managedIdentitySource picks the token protocol: workload identity when the
 // AKS webhook's federation env is present (or flags supply it), else IMDS.
 // namespaceHost scopes the token to the Event Hubs namespace.
-func managedIdentitySource(namespaceHost, clientID, tenantID string, hc *http.Client) *tokenSource {
+func managedIdentitySource(namespaceHost, clientID, tenantID string, hc *http.Client, log *slog.Logger) *tokenSource {
 	if clientID == "" {
 		clientID = os.Getenv("AZURE_CLIENT_ID")
 	}
@@ -183,12 +216,14 @@ func managedIdentitySource(namespaceHost, clientID, tenantID string, hc *http.Cl
 		hc = &http.Client{Timeout: 10 * time.Second}
 	}
 	var fetch func(ctx context.Context) (string, time.Duration, error)
+	what := "imds"
 	if tokenFile != "" && tenantID != "" && clientID != "" {
 		fetch = workloadIdentityFetch(authority, tenantID, clientID, tokenFile, "https://"+namespaceHost+"/.default", hc)
+		what = "workload identity"
 	} else {
 		fetch = imdsFetch(imdsEndpoint, "https://"+namespaceHost, clientID, hc)
 	}
-	return &tokenSource{fetch: fetch}
+	return &tokenSource{fetch: fetch, log: log, what: what}
 }
 
 // workloadIdentityFetch exchanges the projected federated token for an Entra

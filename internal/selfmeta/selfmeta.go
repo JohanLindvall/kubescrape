@@ -18,6 +18,7 @@ package selfmeta
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"os"
 	"strings"
@@ -28,8 +29,16 @@ import (
 	"go.opentelemetry.io/collector/pdata/pmetric"
 
 	"github.com/JohanLindvall/kubescrape/internal/agent/attrs"
+	"github.com/JohanLindvall/kubescrape/internal/logdedupe"
 	"github.com/JohanLindvall/kubescrape/pkg/kubemeta"
 )
+
+// reWarnInterval is how often a lookup that keeps failing restates the
+// condition. Between restatements the failures are Debug; the counter the
+// caller bumps (kubescrape_self_metadata_lookups_total{outcome="error"} for
+// the pod, kubescrape_metadata_requests_total for the node) carries the rate,
+// so nothing is lost by the quiet.
+const reWarnInterval = 5 * time.Minute
 
 // DefaultRefresh is how often the pod a process runs in is re-read, so an
 // edited pod label or namespace label reaches the metrics it stamps. The
@@ -59,7 +68,17 @@ type PollConfig[T any] struct {
 	Initial *T
 	// OnFirst, when non-nil, runs once with the first resolved value.
 	OnFirst func(*T)
-	Log     *slog.Logger
+	// What names WHAT is being resolved, in the log lines this poller writes
+	// ("this pod's own metadata", "this node's metadata"). Empty falls back to
+	// T's type name, which is at least unambiguous.
+	//
+	// It exists because one message served two lookups: the agent resolves its
+	// own pod AND its node's metadata through this, and both failures read
+	// "resolving own metadata failed" — sending an operator to /v1/self for a
+	// failure of /v1/nodes/{name}/metadata, which has a different cause and a
+	// different fix.
+	What string
+	Log  *slog.Logger
 	// stopped, when non-nil, is closed once the background resolver has
 	// exited. Unexported because only this package's tests set it: production
 	// stops a resolver by cancelling its context and never waits for it, while
@@ -87,8 +106,21 @@ func Poll[T any](ctx context.Context, resolve func(context.Context) (*T, error),
 	if log == nil {
 		log = slog.Default()
 	}
+	what := cfg.What
+	if what == "" {
+		// Resolved ONCE, here, rather than per log line: %T on a zero value is
+		// reflection, and this runs on a background resolver that must not pay
+		// for a message it may never emit.
+		var zero T
+		what = fmt.Sprintf("%T", zero)
+	}
 	var current atomic.Pointer[T]
 	var failures atomic.Int64
+	// firstFailure is when the current run of failures began, so the recovery
+	// line can say how long the value was stale. Only the resolver goroutine
+	// touches it (fetch runs nowhere else), so it needs no synchronization.
+	var firstFailure time.Time
+	var reWarn logdedupe.Throttle
 	if cfg.Initial != nil {
 		current.Store(cfg.Initial)
 	}
@@ -107,13 +139,31 @@ func Poll[T any](ctx context.Context, resolve func(context.Context) (*T, error),
 			// First failure at Warn, the rest at Debug: a lookup that never
 			// succeeds was previously silent at the default log level, which
 			// left "my metrics carry no pod" with no trace anywhere. Repeats
-			// stay quiet so a long outage cannot flood the log.
-			if failures.Add(1) == 1 {
-				log.Warn("resolving own metadata failed; retrying", "error", err)
+			// stay quiet so a long outage cannot flood the log — but not
+			// SILENT: a failure that persists is restated at reWarnInterval,
+			// because "one Warn at startup and nothing since" is
+			// indistinguishable from a resolution that later succeeded, and
+			// this lookup is the one whose failure has no other symptom than
+			// missing attributes on somebody else's dashboard.
+			n := failures.Add(1)
+			if n == 1 {
+				firstFailure = time.Now()
+				reWarn.Allow(reWarnInterval) // claim the slot the Warn below occupies
+				log.Warn("resolving "+what+" failed; retrying", "error", err)
+			} else if reWarn.Allow(reWarnInterval) {
+				log.Warn("resolving "+what+" is still failing", "error", err,
+					"attempts", n, "since", time.Since(firstFailure).Round(time.Second))
 			} else {
-				log.Debug("resolving own metadata", "error", err)
+				log.Debug("resolving "+what, "error", err)
 			}
 			return nil
+		}
+		if n := failures.Load(); n > 0 {
+			// The RECOVERY, which had no line at all: a warn that simply stops
+			// says nothing, and the value it stamps had been stale for the
+			// whole outage.
+			log.Info("resolving "+what+" succeeded again", "attempts", n,
+				"since", time.Since(firstFailure).Round(time.Second))
 		}
 		current.Store(v)
 		// Reset, so the FIRST failure of each NEW outage is a Warn again.
@@ -187,6 +237,7 @@ func StartPod(ctx context.Context, resolve func(context.Context) (*kubemeta.Pod,
 func podPollConfig(refresh time.Duration, log *slog.Logger) PollConfig[kubemeta.Pod] {
 	return PollConfig[kubemeta.Pod]{
 		Refresh: refresh,
+		What:    "this pod's own metadata",
 		Log:     log,
 		OnFirst: podReport{host: hostname, log: log}.write,
 	}

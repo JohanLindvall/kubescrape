@@ -1,11 +1,13 @@
 package servicegraph
 
 import (
+	"log/slog"
 	"sync"
 	"time"
 
 	"go.opentelemetry.io/collector/pdata/pcommon"
 
+	"github.com/JohanLindvall/kubescrape/internal/logdedupe"
 	"github.com/JohanLindvall/kubescrape/internal/obs"
 )
 
@@ -171,13 +173,28 @@ type edgeStore struct {
 	// handed to the sink right now needs it, and the mutex that makes the sink
 	// call safe is the same one that makes this buffer safe.
 	dimBuf []EdgeDimension
+
+	// log and fullWarn report the cap binding. The counter says HOW MANY spans
+	// the store refused; only a line can say what the cap is and that the
+	// remedy is serviceGraph.maxItems — and the condition, once it starts, holds
+	// for every span until the sweep drains, so it is throttled rather than
+	// logged per refusal (the refusal path is on the ingest goroutines).
+	log      *slog.Logger
+	fullWarn logdedupe.Throttle
 }
+
+// storeFullWarnEvery re-warns while the pairing store is refusing spans.
+const storeFullWarnEvery = time.Minute
 
 // newEdgeStore builds the store from an already-defaulted config plus the
 // RESOLVED pairing window (Config.Wait is a string — see Config.wait — so the
 // caller parses it once at construction rather than per store method).
-func newEdgeStore(cfg Config, wait time.Duration, onEdge func(Edge)) *edgeStore {
+func newEdgeStore(cfg Config, wait time.Duration, onEdge func(Edge), log *slog.Logger) *edgeStore {
+	if log == nil {
+		log = slog.Default()
+	}
 	return &edgeStore{
+		log:      log,
 		wait:     wait,
 		maxItems: cfg.MaxItems,
 		onEdge:   onEdge,
@@ -204,6 +221,14 @@ func newEdgeStore(cfg Config, wait time.Duration, onEdge func(Edge)) *edgeStore 
 func (s *edgeStore) upsert(now time.Time, k edgeKey, side edgeSide, h halfSpan, dims []EdgeDimension) {
 	if s.insert(now, k, side, h, dims) {
 		obs.ServiceGraphStoreFull.Inc()
+		// The refused span's partner will later expire unpaired too, so ONE
+		// request is lost per two counted spans — and the graph shows that as a
+		// call that never happened. Throttled: at the cap every span takes this
+		// path.
+		if s.fullWarn.Allow(storeFullWarnEvery) {
+			s.log.Warn("the service-graph pairing store is full, so spans are refused and their requests will be missing from the graph entirely; raise serviceGraph.maxItems or shorten serviceGraph.wait",
+				"maxItems", s.maxItems, "wait", s.wait)
+		}
 	}
 }
 

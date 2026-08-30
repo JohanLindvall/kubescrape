@@ -19,6 +19,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 
+	"github.com/JohanLindvall/kubescrape/internal/obs"
 	"github.com/JohanLindvall/kubescrape/internal/peerip"
 	"github.com/JohanLindvall/kubescrape/pkg/kubemeta"
 	"github.com/JohanLindvall/kubescrape/pkg/kubemeta/kubeconvert"
@@ -242,6 +243,21 @@ type Store struct {
 	// means a rolling update, and one counter for both would fire the first
 	// alert on every deploy.
 	drained atomic.Int64
+	// nameReused counts pods that arrived under a namespace/name a DIFFERENT
+	// live UID still held — the missed-delete guard in UpsertPod firing. It is
+	// COUNTED rather than logged because the decision is made under the write
+	// lock on the informer goroutine, where a log line would serialise every
+	// reader behind formatting; the counter is published by
+	// obs.RegisterStoreAnomalies, whose help carries what it means.
+	nameReused atomic.Int64
+	// ipContested counts pod-IP claims decided between two records that are
+	// BOTH live — the recycle race the ipSeq ordering exists to resolve.
+	// Terminating-vs-live hand-offs are the ORDINARY shape of a released
+	// address and are deliberately not counted: they would swamp the signal
+	// with the case that is already handled correctly by construction, and
+	// what is worth seeing is two pods a lookup could legitimately have
+	// confused. Same reason as nameReused for being a counter and not a log.
+	ipContested atomic.Int64
 }
 
 type record struct {
@@ -346,6 +362,15 @@ func (s *Store) UpsertPod(p *corev1.Pod) {
 	}
 
 	pod, containers := kubeconvert.FromPod(p)
+	// The annotation budget's refusal, counted where the object's KIND is
+	// known and once per informer EVENT — not once per served document, which
+	// is the same pod re-marshalled on every agent poll. pkg/kubemeta cannot
+	// import internal/obs, so each of the three doors counts its own kind (see
+	// obs.MetadataAnnotationsOmitted); the served document is truthful on its
+	// own through kubemeta.OmittedAnnotation.
+	if kubemeta.AnnotationsOmitted(pod.Annotations) {
+		obs.MetadataAnnotationsOmitted.WithLabelValues("Pod").Inc()
+	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -407,6 +432,10 @@ func (s *Store) UpsertPod(p *corev1.Pod) {
 	// path a delete would take, so its containers stay resolvable for the TTL.
 	nameKey := pod.Namespace + "/" + pod.Name
 	if prev := s.byPodName[nameKey]; prev != nil && prev != rec && prev.expireAt.IsZero() {
+		// Counted, because taking this branch is EVIDENCE that a Delete was
+		// missed: the ordinary recreate order tombstones the predecessor
+		// first, and expireAt is zero here. See the nameReused field.
+		s.nameReused.Add(1)
 		s.deletePodLocked(types.UID(prev.pod.UID))
 	}
 	s.byPodName[nameKey] = rec
@@ -582,6 +611,7 @@ func (s *Store) claimOneIPLocked(rec *record, ip string, oldIPs []string) {
 		case rec.ipSeq > cur.ipSeq:
 			// Last acquisition wins — including a late-scheduled older pod
 			// legitimately taking a freed address.
+			s.noteContested(rec, cur)
 			s.byPodIP[ip] = rec
 		default:
 			// rec is merely RE-ASSERTING an address it already held while a
@@ -590,6 +620,7 @@ func (s *Store) claimOneIPLocked(rec *record, ip string, oldIPs []string) {
 			// NotReady node, a resurrect after DeletePod, a transient podIP
 			// blip) steal the mapping from the live owner and mis-attribute
 			// every peer-IP lookup until that pod finally went away.
+			s.noteContested(rec, cur)
 		}
 	}
 }
@@ -684,6 +715,27 @@ func (s *Store) dropClaimantLocked(ip string, rec *record) {
 		delete(s.ipClaimants, ip)
 	}
 }
+
+// noteContested records that one address was claimed by two records that are
+// both LIVE, whichever of them the precedence rules picked. It is the only
+// shape of the recycle race in which a peer-IP lookup could legitimately have
+// answered with the wrong pod, which is why the terminating hand-offs — the
+// ordinary way an address is released — are excluded.
+func (s *Store) noteContested(rec, cur *record) {
+	if rec.terminating || cur.terminating {
+		return
+	}
+	s.ipContested.Add(1)
+}
+
+// NameReuses counts pods that arrived under a namespace/name a different live
+// UID still held (see the nameReused field). Published through
+// obs.RegisterStoreAnomalies.
+func (s *Store) NameReuses() int64 { return s.nameReused.Load() }
+
+// ContestedPodIPs counts pod-IP claims decided between two live pods (see the
+// ipContested field). Published through obs.RegisterStoreAnomalies.
+func (s *Store) ContestedPodIPs() int64 { return s.ipContested.Load() }
 
 // cloneOwnerRefs deep-copies owner references: the struct copy alone would
 // alias the informer object's *bool fields (Controller, BlockOwnerDeletion),

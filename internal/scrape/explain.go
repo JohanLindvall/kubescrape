@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/JohanLindvall/kubescrape/internal/servicemonitors"
 	"github.com/JohanLindvall/kubescrape/internal/services"
 	"github.com/JohanLindvall/kubescrape/pkg/kubemeta"
 )
@@ -39,6 +40,108 @@ type PortVerdict struct {
 // there is exactly the drift this file exists to prevent.
 func CeilingNote(subject string) string {
 	return fmt.Sprintf("%s is over the per-pod ceiling of %d targets and is NOT scraped", subject, MaxPortsPerPod)
+}
+
+// SizeCeilingNote is CeilingNote's sibling for the other per-pod ceiling: the
+// entry or endpoint resolved, and the accumulator refused it because this pod's
+// targets have reached MaxTargetBytesPerPod rather than MaxPortsPerPod.
+//
+// The two are spelled apart on purpose. An operator reading "over the per-pod
+// ceiling of 16 targets" against a pod serving TWO targets would be sent to
+// look for thirteen missing ports that do not exist; the remedy is different
+// too (shrink the pod's annotations, or split the workload — not "declare fewer
+// ports"). podBytes is the measured size of this pod's document, which is the
+// number that explains the refusal, and it is the only pod-derived value on the
+// line: a size, never any of the bytes it measures.
+func SizeCeilingNote(subject string, podBytes int) string {
+	return fmt.Sprintf("%s resolves, but this pod's targets are over the per-pod ceiling of %d bytes and it is "+
+		"NOT scraped: every target carries a copy of the pod document, which measures %d bytes here (its labels "+
+		"and annotations dominate). The first target of a pod is always served — this ceiling bounds the "+
+		"MULTIPLIER, so shrinking the pod's annotations, or splitting its ports across workloads, restores the rest",
+		subject, MaxTargetBytesPerPod, podBytes)
+}
+
+// MergedRelabelCeilingNote is the ONE wording — a SUFFIX, appended to the merge
+// note — for a merged endpoint whose metricRelabelings were only partly folded
+// in. It exists for the same reason
+// CeilingNote is: the refusal is invisible in the data (a drop rule that was
+// not applied fails nothing — the series simply arrive), so the explanation
+// has to name it, and it must read identically wherever it is reported.
+func MergedRelabelCeilingNote() string {
+	return fmt.Sprintf("; its metricRelabelings are only PARTLY applied — the merged chain for this URL is at "+
+		"the per-target ceiling of %d rules / %d bytes, and the refused rules filter nothing",
+		MaxRelabelChainRules, MaxRelabelChainBytes)
+}
+
+// MergedContributorCeilingNote is the ONE wording — a SUFFIX, appended to the
+// merge note like MergedRelabelCeilingNote — for a merged endpoint whose
+// monitor could not be added to the target's contributor list. Nothing about
+// the SCRAPE changed (the endpoint's rules, cadence and auth merged), so this
+// is the only place an operator can find out why a monitor that is plainly
+// honoured is missing from the `monitors` list of the target it contributed to.
+func MergedContributorCeilingNote() string {
+	return fmt.Sprintf("; its configuration merged, but the monitor is NOT listed among this target's "+
+		"contributors — the list is at the per-target ceiling of %d monitors (attribution only; the "+
+		"scrape is unaffected)", MaxContributorsPerTarget)
+}
+
+// PathRefusedNote is the ONE wording for a door whose prometheus.io/path is
+// over MaxTargetPathBytes. It is a whole-door verdict rather than a per-entry
+// one — the path is not per port, so every entry of that door resolves to
+// nothing — and it exists because the refusal is otherwise invisible: the pod
+// is annotated, its ports are declared, and no target appears.
+func PathRefusedNote(n int) string {
+	return fmt.Sprintf("the %s annotation is %d bytes, over the ceiling of %d, so NO target is served from this door — "+
+		"a scrape path is copied into the URL of every target the door produces and into the node-targets document on "+
+		"every agent poll. It is refused rather than truncated or defaulted: both of those would silently scrape a "+
+		"URL the annotation does not name", AnnotationPath, n, MaxTargetPathBytes)
+}
+
+// refusedPath reports the length of an over-ceiling path annotation, mirroring
+// what schemeAndPath refuses. The two must agree, which is why this reads the
+// same constant through the same predicate rather than re-deciding.
+func refusedPath(annotations map[string]string) (int, bool) {
+	if n := len(annotations[AnnotationPath]); n > MaxTargetPathBytes {
+		return n, true
+	}
+	return 0, false
+}
+
+// MonitorEndpointNote is the ONE wording for a ServiceMonitor endpoint that
+// resolves to no target on a pod, and it lives here rather than in the handler
+// for the reason the whole file exists: the two REASONS an endpoint resolves to
+// nothing are decided in this package (monitorEndpoint: the port, and
+// servicemonitors' size refusal it honours), and a note spelled over there
+// could name only the one the handler happened to know about — which it did,
+// reporting a size-refused endpoint as naming no port.
+func MonitorEndpointNote(ep servicemonitors.Endpoint) string {
+	if note := refusedEndpointNote(ep); note != "" {
+		return note
+	}
+	return "endpoint resolves to no pod port (port must name a Service port, targetPort a number or declared container-port name; an endpoint naming neither resolves to nothing)"
+}
+
+// PodMonitorEndpointNote is MonitorEndpointNote's PodMonitor half: same two
+// reasons, different port semantics (a PodMonitor's port names a CONTAINER
+// port).
+func PodMonitorEndpointNote(ep servicemonitors.Endpoint) string {
+	if note := refusedEndpointNote(ep); note != "" {
+		return note
+	}
+	return "endpoint resolves to no pod port (port must name a declared container port; targetPort a number or declared name)"
+}
+
+// refusedEndpointNote explains a size-refused endpoint, naming the fields that
+// were over their ceilings — never their VALUES, which are the tenant's
+// megabyte and, for the credential refs, secret-bearing names.
+func refusedEndpointNote(ep servicemonitors.Endpoint) string {
+	if ep.Refused == "" {
+		return ""
+	}
+	return fmt.Sprintf("endpoint field(s) %s are over the per-endpoint size ceiling, so this endpoint is REFUSED and "+
+		"yields NO target: those strings are copied into every target the endpoint resolves to. It is refused rather "+
+		"than truncated — a shortened path, serverName or credential reference would scrape a different URL, verify a "+
+		"different name or present a different credential than the monitor declares", ep.Refused)
 }
 
 // ScrapeableReasons returns why a pod cannot yield scrape targets — one
@@ -135,6 +238,12 @@ func (f *portFilter) keep(ports []int32) (kept []int32, note string) {
 // annotation entry, or — with no (non-blank) annotation — one per declared
 // container port. annotated reports which of the two shapes applied.
 func ExplainPodPorts(pod kubemeta.Pod) (verdicts []PortVerdict, annotated bool) {
+	// PodTargets refuses the whole door before it resolves a single port, so
+	// the mirror has to as well: reporting the ports as resolving would invert
+	// the one question this endpoint answers.
+	if n, refused := refusedPath(pod.Annotations); refused {
+		return []PortVerdict{{Entry: AnnotationPath, Note: PathRefusedNote(n)}}, true
+	}
 	filter := &portFilter{}
 	// The fallback predicate must be EXACTLY podPorts': absent or all-blank
 	// falls back to declared ports; a present annotation never does, even one
@@ -201,6 +310,10 @@ func explainPodPortEntry(pod kubemeta.Pod, entry string, filter *portFilter) Por
 // each translates to. annotated reports whether a port annotation narrowed
 // the selection.
 func ExplainServicePorts(pod kubemeta.Pod, svc *services.Service) (verdicts []PortVerdict, annotated bool) {
+	// ServiceTargets refuses the whole door first; see ExplainPodPorts.
+	if n, refused := refusedPath(svc.Annotations); refused {
+		return []PortVerdict{{Entry: AnnotationPath, Note: PathRefusedNote(n)}}, true
+	}
 	filter := &servicePortFilter{}
 	// The predicate must be EXACTLY selectServicePorts': absent or all-blank
 	// selects every service port; a present annotation never falls back, even

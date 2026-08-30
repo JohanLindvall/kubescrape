@@ -34,8 +34,6 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/encoding"
 	"google.golang.org/grpc/mem"
-
-	"github.com/JohanLindvall/kubescrape/internal/obs"
 )
 
 // errNoRawCodec is the belt-and-braces refusal for a gRPC client with no proto
@@ -98,25 +96,25 @@ func (c *Client) rawSingleAttemptSends() (func(context.Context, []byte) error, f
 	return c.exportRawLogsCounted, c.exportRawMetricsCounted, c.exportRawTracesCounted, c.cfg.MaxSendBytes
 }
 
-// The counted wrappers mirror exportLogsCounted and friends: obs.Exports must
-// carry wire-send outcomes whether or not the drain took the raw path.
+// The counted wrappers mirror exportLogsCounted and friends: the outcome
+// counter AND the destination-health report (noteSend) must carry wire-send
+// outcomes whether or not the drain took the raw path — the spooled
+// configuration is the one an operator is told to alert on, and it is the one
+// where every send goes through here.
 
 func (c *Client) exportRawLogsCounted(ctx context.Context, data []byte) error {
 	err := c.sendRawLogsOnce(ctx, data)
-	obs.Exports.WithLabelValues("logs", outcome(err)).Inc()
-	return err
+	return c.noteSend("logs", err)
 }
 
 func (c *Client) exportRawMetricsCounted(ctx context.Context, data []byte) error {
 	err := c.sendRawMetricsOnce(ctx, data)
-	obs.Exports.WithLabelValues("metrics", outcome(err)).Inc()
-	return err
+	return c.noteSend("metrics", err)
 }
 
 func (c *Client) exportRawTracesCounted(ctx context.Context, data []byte) error {
 	err := c.sendRawTracesOnce(ctx, data)
-	obs.Exports.WithLabelValues("traces", outcome(err)).Inc()
-	return err
+	return c.noteSend("traces", err)
 }
 
 func (c *Client) sendRawLogsOnce(ctx context.Context, data []byte) error {

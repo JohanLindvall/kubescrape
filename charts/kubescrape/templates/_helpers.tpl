@@ -29,6 +29,19 @@ sites sit inside `with`.
 {{- end -}}
 
 {{/*
+kubescrape.debugTokenPath is where agent.debug.tokenSecret is mounted, and
+therefore what -debug-token-file names. ONE definition, because it is rendered
+by three templates (the DaemonSet, the events/Azure singleton and the trace-tier
+StatefulSet) and a path that drifted from its mount would not fail the render —
+it would open the port with the gate silently falling back to local-only, which
+is the failure this gate exists to make impossible to reach by accident. Takes
+the root context.
+*/}}
+{{- define "kubescrape.debugTokenPath" -}}
+/etc/kubescrape/debug/{{ .Values.agent.debug.tokenSecret.key | default "token" }}
+{{- end -}}
+
+{{/*
 kubescrape.agentConfig renders the agent's unified config with the staticAttrs
 convenience value merged into resourceAttributes.static (an explicit config
 value wins). It returns YAML, which callers parse with fromYaml.

@@ -67,9 +67,54 @@ cleanup() {
 trap cleanup EXIT
 
 # port_forward <local-port> <target> <remote-port>
+#
+# The bind is CHECKED, and that is not defensive padding. kubectl writes
+# "unable to listen on port" to stderr and keeps running, so a discarded stderr
+# turns a port already held by something else into a silent misdirection: every
+# later curl reaches the SQUATTER instead of the pod, and an assertion whose
+# endpoint the squatter happens to answer PASSES against the wrong process.
+# That is not hypothetical — a stray agent left on 18081 by another test made
+# ">>> ok: agent /readyz answers 200" pass while the pod was never contacted,
+# and only the next assertion (a 404 on /debug/targets) exposed it. An e2e that
+# can pass vacuously is worse than one that fails, so a collision dies here,
+# loudly, naming the port.
 port_forward() {
-  "${KCTL[@]}" -n monitoring port-forward "$2" "$1:$3" >/dev/null 2>&1 &
-  PF_PIDS+=($!)
+  local pf_err
+  pf_err="$(mktemp)"
+  "${KCTL[@]}" -n monitoring port-forward "$2" "$1:$3" >/dev/null 2>"$pf_err" &
+  local pid=$!
+  PF_PIDS+=("$pid")
+
+  # kubectl reports the bind before it forwards anything, so a short wait for
+  # either outcome is enough: the process dying, or an error on stderr.
+  local waited=0
+  while [ "$waited" -lt 50 ]; do
+    if ! kill -0 "$pid" 2>/dev/null; then
+      echo "FAIL: port-forward to $2 exited immediately: $(cat "$pf_err")" >&2
+      rm -f "$pf_err"; exit 1
+    fi
+    if grep -qiE "unable to listen|address already in use|bind" "$pf_err" 2>/dev/null; then
+      echo "FAIL: cannot bind local port $1 for $2 — something else is already listening" >&2
+      echo "      $(cat "$pf_err")" >&2
+      echo "      (check with: ss -ltnp | grep :$1)" >&2
+      rm -f "$pf_err"; exit 1
+    fi
+    # The listener must be OURS. Asking only whether the port is listening is
+    # the same vacuous check one level down: a squatter satisfies it, which is
+    # exactly the failure being defended against.
+    if ss -ltnp 2>/dev/null | grep "127.0.0.1:$1 " | grep -q "pid=$pid,"; then
+      rm -f "$pf_err"; return 0
+    fi
+    sleep 0.1
+    waited=$((waited + 1))
+  done
+  # No listener of ours after the grace period. kubectl does not always write
+  # the bind failure to stderr before this point, so say the likely cause and
+  # hand over the command that shows it.
+  echo "FAIL: port-forward to $2 never bound local port $1" >&2
+  echo "      most likely something else already holds it — check: ss -ltnp | grep :$1" >&2
+  [ -s "$pf_err" ] && echo "      kubectl said: $(cat "$pf_err")" >&2
+  rm -f "$pf_err"; exit 1
 }
 
 log "ensuring kind cluster '$CLUSTER_NAME'"

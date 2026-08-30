@@ -140,7 +140,7 @@ func registerCoreInformers(factory informers.SharedInformerFactory, st *store.St
 
 // registerOwnerInformers wires a metadata-only informer per owner GVR,
 // returning the listers the owner resolver reads and their HasSynced funcs.
-func registerOwnerInformers(metaFactory metadatainformer.SharedInformerFactory) (map[schema.GroupVersionResource]cache.GenericLister, []syncGate, error) {
+func registerOwnerInformers(metaFactory metadatainformer.SharedInformerFactory, changes *owners.Changes) (map[schema.GroupVersionResource]cache.GenericLister, []syncGate, error) {
 	listers := make(map[schema.GroupVersionResource]cache.GenericLister, len(owners.AllGVRs))
 	var synced []syncGate
 	for _, gvr := range owners.AllGVRs {
@@ -151,10 +151,44 @@ func registerOwnerInformers(metaFactory metadatainformer.SharedInformerFactory) 
 		if err := watchErrors(inf.Informer(), gvr.Resource); err != nil {
 			return nil, nil, fmt.Errorf("%s watch error handler: %w", gvr.Resource, err)
 		}
+		// These informers exist for their LISTERS — the resolver reads them at
+		// request time and nothing here keeps derived state — so this handler
+		// does one thing: advance the change token that lets the node-targets
+		// ETag memo prove a client's copy is current without re-deriving it.
+		if _, err := inf.Informer().AddEventHandler(ownerChangeHandler(changes)); err != nil {
+			return nil, nil, fmt.Errorf("%s change handler: %w", gvr.Resource, err)
+		}
 		listers[gvr] = inf.Lister()
 		synced = append(synced, syncGate{gvr.Resource, inf.Informer().HasSynced})
 	}
 	return listers, synced, nil
+}
+
+// ownerChangeHandler bumps the owner change token on real changes only.
+//
+// The resourceVersion comparison on update is the whole subtlety. client-go
+// re-delivers every cached object each `-resync` period as an update whose old
+// and new are byte-identical, so bumping unconditionally would advance the
+// token for every owner, namespace and node in the cluster on a timer — and the
+// memo this token exists to make usable would lapse on that timer instead of on
+// change, giving back exactly what it buys. An unchanged resourceVersion means
+// the API server did not modify the object; a modified one always changes it.
+//
+// A tombstone on delete carries the object, but the token only has to move, so
+// the shape is irrelevant here.
+func ownerChangeHandler(changes *owners.Changes) cache.ResourceEventHandlerFuncs {
+	return cache.ResourceEventHandlerFuncs{
+		AddFunc: func(any) { changes.Bump() },
+		UpdateFunc: func(oldObj, newObj any) {
+			o, okOld := oldObj.(*metav1.PartialObjectMetadata)
+			n, okNew := newObj.(*metav1.PartialObjectMetadata)
+			if okOld && okNew && o.ResourceVersion == n.ResourceVersion {
+				return // a resync re-delivering an unchanged object
+			}
+			changes.Bump()
+		},
+		DeleteFunc: func(any) { changes.Bump() },
+	}
 }
 
 // startServiceMonitors sets up and starts the dynamic ServiceMonitor informer.
@@ -749,7 +783,8 @@ func run() error {
 	// namespace enrichment: labels/annotations/ownerRefs only, no specs
 	// cached.
 	metaFactory := metadatainformer.NewSharedInformerFactory(metaClient, *resync)
-	listers, ownerSynced, err := registerOwnerInformers(metaFactory)
+	ownerChanges := &owners.Changes{}
+	listers, ownerSynced, err := registerOwnerInformers(metaFactory, ownerChanges)
 	if err != nil {
 		return err
 	}
@@ -942,6 +977,7 @@ func run() error {
 		Services:         svcIndex,
 		Monitors:         monitors,
 		Resolver:         resolver,
+		OwnerGeneration:  ownerChanges.Generation,
 		MaxWait:          *maxWait,
 		CacheTTL:         *metaCacheTTL,
 		Ready:            ready,

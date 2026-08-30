@@ -32,6 +32,15 @@ type targetsFixture struct {
 	services int
 	monitors int
 	cacheTTL time.Duration
+	// ownerGen overrides the owner change token. nil means a constant, which is
+	// the truth for stubResolver; a test that needs owner metadata to change
+	// supplies its own.
+	ownerGen func() uint64
+	// noOwnerGen leaves Config.OwnerGeneration nil, which DISABLES the memo's
+	// change-token path and drops it to the wall-clock fallback. For the tests
+	// that exist to guard that fallback's arithmetic — it is still the
+	// behaviour whenever a deployment has not wired every source.
+	noOwnerGen bool
 	// sharedSelector makes EVERY Service select the pods, so one monitor
 	// reaches each pod through all of them — the shape that must dedup without
 	// being reported as a shadowed monitor.
@@ -105,9 +114,19 @@ func (f targetsFixture) build(t testing.TB) *Server {
 			t.Fatal(err)
 		}
 	}
+	ownerGen := f.ownerGen
+	if ownerGen == nil && !f.noOwnerGen {
+		ownerGen = func() uint64 { return 0 }
+	}
+	// OwnerGeneration is wired because leaving it nil disables the ETag memo's
+	// change-token path, and a fixture that silently measures the wall-clock
+	// fallback would make every assertion about the memo describe the old
+	// design. stubResolver reads nothing that changes, so a constant is the
+	// truth here — tests that need owner metadata to CHANGE drive it themselves.
 	return New(Config{
 		Store: st, Services: svcs, Monitors: monitors, Resolver: stubResolver{},
-		MaxWait: time.Second, CacheTTL: f.cacheTTL, Ready: closedChan(),
+		OwnerGeneration: ownerGen,
+		MaxWait:         time.Second, CacheTTL: f.cacheTTL, Ready: closedChan(),
 	})
 }
 

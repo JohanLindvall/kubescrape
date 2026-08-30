@@ -188,8 +188,15 @@ func condGet(t *testing.T, url, inm string, want int) string {
 // after the list changed. The 304 must grant only the remaining window
 // (floored — rounding up would over-promise), and once nothing remains the
 // store must be consulted.
-func TestNodeTargetsMemo304GrantsOnlyTheRemainingTTL(t *testing.T) {
-	s := targetsFixture{pods: 3, cacheTTL: 10 * time.Second}.build(t)
+// The wall-clock fallback, which is what runs when a deployment has not wired
+// every change-token source (see Config.OwnerGeneration). Its arithmetic is
+// unchanged and still has to hold: without a token the memo cannot know a store
+// write happened, so staleness is bounded by builtAt+TTL and a 304 hands out
+// only what remains of that window. With the token wired this scenario does not
+// arise at all — the change at t=3 is noticed immediately, which is what
+// TestNodeTargetsMemoRebuildsWhenAnySourceChanges pins.
+func TestNodeTargetsMemo304GrantsOnlyTheRemainingTTLWithoutAChangeToken(t *testing.T) {
+	s := targetsFixture{pods: 3, cacheTTL: 10 * time.Second, noOwnerGen: true}.build(t)
 	base := time.Now()
 	now := base
 	s.now = func() time.Time { return now }
@@ -223,8 +230,9 @@ func TestNodeTargetsMemo304GrantsOnlyTheRemainingTTL(t *testing.T) {
 	}
 	builds := s.targetBuilds.Load()
 
-	// t=3: the node's target list actually changes. The memo does not notice —
-	// it is bounded by time, not invalidated by store writes.
+	// t=3: the node's target list actually changes. With no change token the
+	// memo does not notice — it is bounded by time, not invalidated by store
+	// writes. That is precisely the limitation the token removes.
 	addPod(s.store)
 
 	// t=10: client A's window lapsed; it revalidates. The memo (age 8s) still

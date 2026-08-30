@@ -458,6 +458,8 @@ func (s *Server) handleNodeTargets(w http.ResponseWriter, r *http.Request) {
 	if s.nodeTargetsNotModified(w, r, node) {
 		return
 	}
+	// Sampled before the derivation reads a single source (see targetsValidity).
+	valid := s.targetsValidity()
 	targets, built := s.nodeTargets(node)
 	// Cached like the other metadata 200s (Cache-Control max-age + ETag): every
 	// agent re-fetches its target list every cycle, and the response embeds the
@@ -483,7 +485,7 @@ func (s *Server) handleNodeTargets(w http.ResponseWriter, r *http.Request) {
 	// instant it holds the ETag, and remembering afterwards leaves a window in
 	// which the tag this server just handed out is one it cannot recognise.
 	if built {
-		s.rememberNodeTargets(node, etag)
+		s.rememberNodeTargets(node, etag, valid)
 	}
 	s.writeCachedBody(w, r, body, etag, false)
 }
@@ -1956,6 +1958,44 @@ func (s *Server) cacheControl(private bool) string {
 type nodeTargetsETag struct {
 	etag    string
 	builtAt time.Time
+	valid   targetsValidity
+}
+
+// targetsValidity is the composite change token of every source nodeTargets
+// reads. Component-wise rather than hashed or summed on purpose: four uint64s
+// compare in four instructions, and any folding of them into one introduces an
+// aliasing chance for the one thing this must never do — call a changed cluster
+// unchanged.
+//
+// wired reports that EVERY source publishes a token. It is not a formality: an
+// unwired source is indistinguishable from one that never changes, so a missing
+// one would silently turn this into "always valid" and serve a frozen target
+// list until the TTL fallback happened to save it. Absent by CONFIGURATION is a
+// different thing and is fine — a nil Monitors index means monitor-derived
+// targets cannot exist, so its constant zero is the truth.
+type targetsValidity struct {
+	pods, owners, services, monitors uint64
+	wired                            bool
+}
+
+// targetsValidity samples every source nodeTargets derives from. Callers load
+// it BEFORE reading the data (see store.Store's gen field): a change landing
+// mid-derivation then leaves the memo tagged with the older token and the next
+// revalidation rebuilds, which is the safe direction to be wrong in.
+func (s *Server) targetsValidity() targetsValidity {
+	if s.ownerGeneration == nil || s.store == nil || s.services == nil {
+		return targetsValidity{}
+	}
+	v := targetsValidity{
+		pods:     s.store.Generation(),
+		owners:   s.ownerGeneration(),
+		services: s.services.Generation(),
+		wired:    true,
+	}
+	if s.monitors != nil {
+		v.monitors = s.monitors.Generation()
+	}
+	return v
 }
 
 // maxNodeTargetETags bounds the memo. An entry is a node name and a 16-hex tag,
@@ -1977,33 +2017,42 @@ const maxNodeTargetETags = 8192
 // 110 pods: 1.87 ms, 1.90 MB and 7,553 allocations to send an empty 304, with
 // json.Marshal at 48.6% of the request's CPU).
 //
-// WHO REACHES THIS, because it is narrower than it looks and the answer is
-// forced by the arithmetic below: the memo lives for cacheTTL from the build,
-// and cacheTTL is also the max-age the 200 advertises, so a client that honours
-// its own cache asks again exactly when — or after — the memo lapses. The two
-// windows are the same window. A single DaemonSet agent polling on its scrape
-// interval therefore NEVER hits this and pays the full derivation on every
-// poll; what does hit it is a caller asking faster than the max-age it was
-// given — a second agent during a rolling update, an operator's curl loop, a
-// client whose cache was evicted. Making it cover the agent needs a validity
-// signal that is not a wall clock (a change token spanning the pod store, the
-// owner/namespace caches, services.Index and servicemonitors.Index), which the
-// last two publish and the first two do not.
-// TestNodeTargetsMemoCannotServeAConformingClient pins that limit, and
-// BenchmarkNodeTargetsRevalidation reports both shapes side by side.
+// TWO WAYS TO VALIDATE, and which one runs decides whether this is worth
+// having at all.
 //
-// Staleness stays bounded by the TTL because every grant — the 200's and this
-// 304's alike — expires by builtAt+TTL, the last instant the store is known to
-// have agreed with the tag. The 200 hands out exactly that window. The 304 must
-// hand out LESS: the revalidating client is not necessarily the requester whose
-// build stamped builtAt (any other caller — a second agent during a rolling
-// update, an operator's curl, a restarted client — rebuilds the unchanged list
-// and refreshes the memo), so re-stamping a FULL max-age on an up-to-TTL-old
-// memo would entitle a lapsed client to its copy until builtAt+2×TTL while the
-// list may have changed just after builtAt. The 304 therefore advertises only
-// the REMAINING window, floored to whole seconds (rounding can only shorten
-// the grant, never extend it); once nothing remains the memo is ignored and
-// the response is rebuilt, which is where a changed target list becomes a 200.
+// THE CHANGE TOKEN is the one that matters. Every source nodeTargets reads —
+// the pod store, the owner and namespace informer caches, services.Index and
+// servicemonitors.Index — publishes a generation that advances only on a real
+// change, and the memo records what they read at build time. If all four still
+// agree, the client's copy is not merely young: it is PROVABLY current, so the
+// 304 grants a full max-age measured from now, exactly as the 200 does. No
+// clock is consulted.
+//
+// THE WALL CLOCK is the fallback for when some source is not wired (see
+// targetsValidity.wired) — it must not be entered by assuming an unwired token
+// means "unchanged". It bounds staleness by builtAt+TTL, the last instant the
+// store is known to have agreed with the tag, and hands out only the REMAINING
+// window floored to whole seconds. Less than the 200's window, deliberately:
+// the revalidating client is not necessarily the requester whose build stamped
+// builtAt (any other caller rebuilds the unchanged list and refreshes the
+// memo), so re-stamping a full max-age on an up-to-TTL-old memo would entitle a
+// lapsed client to its copy until builtAt+2×TTL while the list may have changed
+// just after builtAt. Once nothing remains the memo is ignored and the response
+// is rebuilt, which is where a changed target list becomes a 200.
+//
+// WHY THE TOKEN WAS ADDED: with only the clock, this was unreachable by the
+// caller it exists for. The memo lived for cacheTTL from the build and cacheTTL
+// is also the max-age the 200 advertises, so a client honouring its own cache
+// asked again exactly when — or after — the memo lapsed; the two windows were
+// the same window. A DaemonSet agent polling on its scrape interval therefore
+// NEVER hit it and re-paid the whole derivation, sort and marshal on every
+// poll (468 µs / 165 KiB / 1,259 allocations at 5,000 pods; 1.85 ms / 650 KiB /
+// 4,945 at 22,000, with marshal 54-71% of it), multiplied by every node in the
+// fleet, in the singleton the chart requests 128Mi for. What reached it was
+// only a caller asking FASTER than the max-age it was given.
+// TestNodeTargetsMemoServesAConformingClient pins the new behaviour,
+// TestNodeTargetsMemoRebuildsWhenAnySourceChanges pins the safety property, and
+// BenchmarkNodeTargetsRevalidation reports both shapes side by side.
 //
 // Only the tag is memoised, never the body: the body is the whole node's pod
 // set (2.21 MB at 110 pods), and holding one per node would put hundreds of
@@ -2016,17 +2065,47 @@ func (s *Server) nodeTargetsNotModified(w http.ResponseWriter, r *http.Request, 
 	if match == "" {
 		return false
 	}
+	// Sampled BEFORE the memo is read, for the same reason a build samples it
+	// before reading the store: if a change lands between the two, the token
+	// compared is the older one and the answer is a rebuild.
+	cur := s.targetsValidity()
+
 	s.targetsMu.Lock()
 	e, ok := s.targetsETags[node]
 	s.targetsMu.Unlock()
 	if !ok || !etagMatches(match, e.etag) {
 		return false
 	}
-	// The remaining window, floored: the client's expiry must not pass
-	// builtAt+TTL (the bound argued above). A remainder under a second grants
-	// nothing, so the memo counts as expired — which subsumes the age >= TTL
-	// check — and the store is consulted.
-	maxAge := int((s.cacheTTL - s.now().Sub(e.builtAt)) / time.Second)
+
+	var maxAge int
+	if cur.wired && e.valid.wired {
+		// The token is AUTHORITATIVE when it is available, in both directions.
+		// A mismatch means rebuild — falling through to the clock here would
+		// answer 304 for a list that provably changed, purely because the memo
+		// happened to be young, which is the one thing this must never do.
+		if e.valid != cur {
+			return false
+		}
+		// Unchanged, so the copy is current as of NOW and the grant is the full
+		// window — the same one a 200 hands out, for the same reason. builtAt
+		// moves with it so the fallback below stays truthful if a source is
+		// later unwired.
+		maxAge = int(s.cacheTTL / time.Second)
+		now := s.now()
+		s.targetsMu.Lock()
+		if cached, still := s.targetsETags[node]; still && cached.etag == e.etag {
+			cached.builtAt = now
+			s.targetsETags[node] = cached
+		}
+		s.targetsMu.Unlock()
+	} else {
+		// No token: the wall-clock fallback. The remaining window, floored —
+		// the client's expiry must not pass builtAt+TTL (the bound argued
+		// above). A remainder under a second grants nothing, so the memo counts
+		// as expired (which subsumes the age >= TTL check) and the store is
+		// consulted.
+		maxAge = int((s.cacheTTL - s.now().Sub(e.builtAt)) / time.Second)
+	}
 	if maxAge < 1 {
 		return false
 	}
@@ -2041,7 +2120,7 @@ func (s *Server) nodeTargetsNotModified(w http.ResponseWriter, r *http.Request, 
 // rememberNodeTargets records what a node's freshly built target list is
 // called, so the next revalidation inside the TTL can be answered without
 // building it again.
-func (s *Server) rememberNodeTargets(node, etag string) {
+func (s *Server) rememberNodeTargets(node, etag string, valid targetsValidity) {
 	if etag == "" { // caching disabled, or the response failed to encode
 		return
 	}
@@ -2064,5 +2143,5 @@ func (s *Server) rememberNodeTargets(node, etag string) {
 			return
 		}
 	}
-	s.targetsETags[node] = nodeTargetsETag{etag: etag, builtAt: now}
+	s.targetsETags[node] = nodeTargetsETag{etag: etag, builtAt: now, valid: valid}
 }

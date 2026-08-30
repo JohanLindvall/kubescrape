@@ -10,9 +10,13 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"runtime"
+	"sync/atomic"
 	"testing"
 	"time"
 	"unsafe"
+
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/JohanLindvall/kubescrape/internal/obs"
 	"github.com/JohanLindvall/kubescrape/internal/testrace"
@@ -29,7 +33,7 @@ import (
 // way a revalidation lands inside the memo's window, because the window and the
 // max-age the response advertises are the same duration. This test therefore
 // pins the MECHANISM and says nothing about whether a DaemonSet agent ever
-// reaches it — TestNodeTargetsMemoCannotServeAConformingClient below is the one
+// reaches it — TestNodeTargetsMemoServesAConformingClient below is the one
 // that answers that, and the answer is no.
 func TestNodeTargetsRevalidationDoesNotRebuild(t *testing.T) {
 	f := targetsFixture{pods: 20, services: 5, cacheTTL: 10 * time.Second}
@@ -76,15 +80,21 @@ func TestNodeTargetsRevalidationDoesNotRebuild(t *testing.T) {
 		t.Errorf("builds after a stale validator = %d, want 3", n)
 	}
 
-	// Past the TTL the memo is ignored: staleness stays bounded by exactly the
-	// lifetime the response advertises, and a changed target list becomes a 200
-	// there.
+	// Past the TTL, with every source's change token still agreeing: 304, and
+	// STILL no derivation. Age stopped being the question the moment the memo
+	// gained a validity signal — staleness is bounded by proof now, not by a
+	// clock, and re-deriving an answer four sources agree has not changed is
+	// exactly the waste the token removes. What bounds staleness instead is
+	// TestNodeTargetsMemoRebuildsWhenAnySourceChanges: a change to any source
+	// is noticed on the next revalidation, at the same instant, with no TTL to
+	// wait out.
 	now = now.Add(11 * time.Second)
 	if status, _ := conditionalGet(t, url, etag); status != http.StatusNotModified {
 		t.Errorf("status = %d, want 304 (the content is in fact unchanged)", status)
 	}
-	if n := s.targetBuilds.Load(); n != 4 {
-		t.Errorf("builds after the TTL lapsed = %d, want 4: the memo must expire", n)
+	if n := s.targetBuilds.Load(); n != 3 {
+		t.Errorf("builds after the TTL lapsed = %d, want 3: with the change token unchanged, "+
+			"age alone must not force a rebuild", n)
 	}
 }
 
@@ -154,7 +164,7 @@ func TestUnknownNodeIsNotMemoised(t *testing.T) {
 // servicemonitors.Index.Generation); the store and internal/owners do not. Until
 // they do, this test is what says the memo is not doing the job its own doc
 // comment describes — and it fails, deliberately, the moment someone makes it.
-func TestNodeTargetsMemoCannotServeAConformingClient(t *testing.T) {
+func TestNodeTargetsMemoServesAConformingClient(t *testing.T) {
 	const ttl, poll = 10 * time.Second, 30 * time.Second
 	f := targetsFixture{pods: 20, services: 5, cacheTTL: ttl}
 	s := f.build(t)
@@ -168,30 +178,85 @@ func TestNodeTargetsMemoCannotServeAConformingClient(t *testing.T) {
 	builds := s.targetBuilds.Load()
 	const polls = 5
 	for range polls {
-		now = now.Add(poll) // the agent's next scrape cycle
+		now = now.Add(poll) // the agent's next scrape cycle, well past the TTL
 		if status, tag := conditionalGet(t, url, etag); status != http.StatusNotModified || tag != etag {
 			t.Fatalf("poll answered %d with tag %s, want 304 with %s", status, tag, etag)
 		}
 	}
-	if got := s.targetBuilds.Load() - builds; got != polls {
-		t.Errorf("derivations across %d polls at %s under a %s TTL = %d, want %d.\n"+
-			"If this is now FEWER, the memo has been given a real validity signal — good, but the "+
-			"staleness bound has to be restated: a 304 must still never claim the list is current "+
-			"as of longer ago than the response's own max-age unless something PROVED it unchanged.",
-			polls, poll, ttl, got, polls)
-	}
-
-	// The reach it does have: a second client asking inside the window is
-	// answered from the memo, which is what keeps this machinery worth its map.
-	now = now.Add(poll)
-	fresh := getETag(t, url, "") // rebuilds, and re-stamps builtAt at `now`
-	builds = s.targetBuilds.Load()
-	now = now.Add(ttl / 2)
-	if status, _ := conditionalGet(t, url, fresh); status != http.StatusNotModified {
-		t.Fatalf("in-window revalidation status = %d, want 304", status)
-	}
+	// The point of the change token: an agent polling on its scrape interval —
+	// the caller this memo exists for, and the one the wall clock could never
+	// reach, since the max-age it is handed IS the memo's lifetime — now costs
+	// nothing while the cluster is quiet.
 	if got := s.targetBuilds.Load() - builds; got != 0 {
-		t.Errorf("derivations for a revalidation %s into a %s window = %d, want 0", ttl/2, ttl, got)
+		t.Errorf("derivations across %d polls at %s under a %s TTL = %d, want 0.\n"+
+			"If this is now MORE, either a source's token is advancing when nothing changed "+
+			"(a resync bumping it is the usual cause) or OwnerGeneration is unwired and the "+
+			"memo has fallen back to the wall clock.", polls, poll, ttl, got)
+	}
+}
+
+// The safety half, and the one that matters: proving the memo cannot serve a
+// STALE list. Each source nodeTargets reads is changed in turn, and each change
+// must force a rebuild on the very next revalidation — no clock involved, since
+// every request here happens at one instant.
+func TestNodeTargetsMemoRebuildsWhenAnySourceChanges(t *testing.T) {
+	var ownerGen atomic.Uint64
+	f := targetsFixture{pods: 5, services: 2, monitors: 1, cacheTTL: 10 * time.Second,
+		ownerGen: ownerGen.Load}
+	s := f.build(t)
+	now := time.Now()
+	s.now = func() time.Time { return now }
+	srv := httptest.NewServer(s.Handler())
+	t.Cleanup(srv.Close)
+	url := srv.URL + "/v1/nodes/node1/targets"
+
+	for _, tc := range []struct {
+		source string
+		change func()
+	}{
+		{"pod store", func() {
+			s.store.UpsertPod(&corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "late-pod", Namespace: "prod", UID: "late-uid", ResourceVersion: "1",
+					Labels:      map[string]string{"app": "web"},
+					Annotations: map[string]string{"prometheus.io/scrape": "true", "prometheus.io/port": "9090"},
+				},
+				Spec:   corev1.PodSpec{NodeName: "node1"},
+				Status: corev1.PodStatus{Phase: corev1.PodRunning, PodIP: "10.0.9.9"},
+			})
+		}},
+		{"owner caches", func() { ownerGen.Add(1) }},
+		{"services index", func() {
+			s.services.Upsert(&corev1.Service{
+				ObjectMeta: metav1.ObjectMeta{Name: "late-svc", Namespace: "prod", UID: "late-svc-uid"},
+				Spec: corev1.ServiceSpec{
+					Selector: map[string]string{"app": "web"},
+					Ports:    []corev1.ServicePort{{Name: "http", Port: 80}},
+				},
+			})
+		}},
+	} {
+		t.Run(tc.source, func(t *testing.T) {
+			etag := getETag(t, url, "")
+			builds := s.targetBuilds.Load()
+			// Unchanged: served from the memo, no derivation.
+			if status, _ := conditionalGet(t, url, etag); status != http.StatusNotModified {
+				t.Fatalf("revalidation before the change = %d, want 304", status)
+			}
+			if got := s.targetBuilds.Load() - builds; got != 0 {
+				t.Fatalf("derivations before the change = %d, want 0", got)
+			}
+			tc.change()
+			// Changed: the token no longer matches, so the SAME request at the
+			// SAME instant must rebuild rather than answer from the memo.
+			builds = s.targetBuilds.Load()
+			status, _ := conditionalGet(t, url, etag)
+			if got := s.targetBuilds.Load() - builds; got == 0 {
+				t.Errorf("a change to the %s was not noticed: revalidation answered %d "+
+					"from the memo without re-deriving. A source whose token does not "+
+					"advance on change is how this serves a stale target list.", tc.source, status)
+			}
+		})
 	}
 }
 

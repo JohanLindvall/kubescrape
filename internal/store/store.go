@@ -258,6 +258,31 @@ type Store struct {
 	// what is worth seeing is two pods a lookup could legitimately have
 	// confused. Same reason as nameReused for being a counter and not a log.
 	ipContested atomic.Int64
+	// gen is a change token: it advances whenever a mutation lands that could
+	// alter what any read of this store returns. It exists so a caller can
+	// prove a derived answer is still current WITHOUT re-deriving it —
+	// internal/server's node-targets ETag memo is the caller, and before this
+	// existed that memo could only be validated by a wall clock, so a
+	// conforming agent (whose poll interval matches the max-age it was handed)
+	// never hit it and re-paid the whole derivation and marshal on every poll.
+	//
+	// TWO ORDERING RULES, and both directions of getting them wrong are real:
+	//
+	//   - The WRITER bumps AFTER the mutation is visible, never before. Bumping
+	//     first lets a reader observe the new token beside the OLD data and
+	//     memoise a stale answer under a token that will never advance again —
+	//     the one way this can serve wrong data rather than merely rebuild.
+	//   - The READER loads the token BEFORE it reads the data. A change landing
+	//     mid-derivation then leaves the memo tagged with the older token, so
+	//     the next revalidation rebuilds. Conservative, which is the direction
+	//     to be wrong in.
+	//
+	// It advances only on a REAL change: a resync that re-delivers a
+	// byte-identical pod returns at resyncNoOp without touching it. That is
+	// not an optimisation but the whole point — client-go re-delivers every
+	// object each resync period, so bumping there would invalidate every memo
+	// in the cluster on a timer and give back exactly what this buys.
+	gen atomic.Uint64
 }
 
 type record struct {
@@ -374,6 +399,12 @@ func (s *Store) UpsertPod(p *corev1.Pod) {
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	// Deferred, so it runs AFTER the mutation below and BEFORE the unlock
+	// (defers are LIFO) — the writer half of the ordering rule on gen. The
+	// resyncNoOp return above is already behind us, so this is a real change;
+	// the write-lock re-check below can still find nothing to do, and the
+	// resulting spare bump costs one rebuild, which is the safe direction.
+	defer s.gen.Add(1)
 
 	rec := s.pods[p.UID]
 	// Re-checked under the write lock, since the probe above dropped its lock:
@@ -733,6 +764,12 @@ func (s *Store) noteContested(rec, cur *record) {
 // obs.RegisterStoreAnomalies.
 func (s *Store) NameReuses() int64 { return s.nameReused.Load() }
 
+// Generation is the store's change token (see the gen field). A caller holding
+// a value derived from this store re-reads it and, if it is unchanged, knows
+// its answer is still current without re-deriving it. Load it BEFORE reading
+// the data it is meant to describe.
+func (s *Store) Generation() uint64 { return s.gen.Load() }
+
 // ContestedPodIPs counts pod-IP claims decided between two live pods (see the
 // ipContested field). Published through obs.RegisterStoreAnomalies.
 func (s *Store) ContestedPodIPs() int64 { return s.ipContested.Load() }
@@ -771,8 +808,9 @@ func (s *Store) DeletePod(uid types.UID) {
 func (s *Store) deletePodLocked(uid types.UID) {
 	rec := s.pods[uid]
 	if rec == nil {
-		return
+		return // nothing changed, so the change token must not move
 	}
+	defer s.gen.Add(1) // after the mutation, before the caller's unlock
 	now := s.now()
 	s.removeFromNodeLocked(rec.pod.NodeName, uid)
 	// EVERY address, through the one helper that drops the claim, deletes the
@@ -889,6 +927,13 @@ func (s *Store) Sweep() {
 		} else {
 			s.sweepContainerLocked(p.id, now)
 		}
+	}
+	if n > 0 {
+		// Something was actually removed. A sweep that finds nothing due — the
+		// common case, on a ticker as short as every five seconds — must leave
+		// the token alone, or the memo it guards would lapse on that ticker
+		// rather than on change.
+		defer s.gen.Add(1)
 	}
 	if n == 0 {
 		return

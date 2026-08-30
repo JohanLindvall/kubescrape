@@ -49,6 +49,17 @@ type Config struct {
 	// Monitors serves ServiceMonitor-derived targets (nil = disabled).
 	Monitors *servicemonitors.Index
 	Resolver MetadataResolver
+	// OwnerGeneration is the change token of the owner and namespace informer
+	// caches Resolver reads (owners.Changes.Generation). It cannot come from
+	// Resolver itself: a Resolver holds no state to notice a change in, and the
+	// informers that do are registered before it exists.
+	//
+	// nil DISABLES the node-targets ETag memo's token path, falling back to the
+	// wall clock — deliberately, because an unwired source is indistinguishable
+	// from one that never changes, and trusting its constant zero would serve a
+	// frozen target list. Wire it or accept the slower path; do not let it
+	// default to something that looks valid.
+	OwnerGeneration func() uint64
 	// MaxWait is the default and maximum time a container lookup may block
 	// waiting for metadata to appear. Requests may shorten it with ?wait=.
 	MaxWait time.Duration
@@ -119,6 +130,7 @@ type Server struct {
 	services         *services.Index
 	monitors         *servicemonitors.Index
 	resolver         MetadataResolver
+	ownerGeneration  func() uint64
 	maxWait          time.Duration
 	cacheTTL         time.Duration
 	ready            <-chan struct{}
@@ -262,6 +274,7 @@ func New(cfg Config) *Server {
 		services:          cfg.Services,
 		monitors:          cfg.Monitors,
 		resolver:          cfg.Resolver,
+		ownerGeneration:   cfg.OwnerGeneration,
 		maxWait:           cfg.MaxWait,
 		cacheTTL:          cfg.CacheTTL,
 		ready:             cfg.Ready,

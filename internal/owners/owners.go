@@ -8,6 +8,7 @@ package owners
 import (
 	"context"
 	"log/slog"
+	"sync/atomic"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -172,6 +173,42 @@ const MaxOwners = 8
 // that table exists. One line per interval names the namespace, the first
 // reference and the counts; the counter carries the rate.
 const ownersCapWarnEvery = 5 * time.Minute
+
+// Changes is the change token for the owner and namespace metadata this
+// package resolves through. Unlike the pod store and the two indexes, a
+// Resolver owns no state to notice a change in — it reads informer caches at
+// request time — so the token has to be fed from the informers themselves:
+// whoever registers them calls Bump on every event, and whoever holds a derived
+// answer compares Generation.
+//
+// It is a separate type rather than a field on Resolver because the informers
+// are registered before the Resolver that reads their listers exists, and the
+// counter has to be in hand at registration time. A nil *Changes reports
+// generation 0 and accepts Bump, so a Resolver built any other way (the tests'
+// shape) needs no wiring — but note what generation 0 MEANS to a caller: an
+// unwired source that never appears to change. internal/server therefore
+// refuses to use the token path at all unless every source is wired, rather
+// than quietly trusting a constant.
+//
+// The ordering rules are the pod store's, for the same reasons: Bump AFTER the
+// informer has applied the event, and load Generation BEFORE reading what it
+// describes.
+type Changes struct{ gen atomic.Uint64 }
+
+// Bump records that owner or namespace metadata changed.
+func (c *Changes) Bump() {
+	if c != nil {
+		c.gen.Add(1)
+	}
+}
+
+// Generation is the current token. Zero from a nil receiver.
+func (c *Changes) Generation() uint64 {
+	if c == nil {
+		return 0
+	}
+	return c.gen.Load()
+}
 
 // NewFromListers builds a Resolver backed by metadata informer listers,
 // keyed by resource.

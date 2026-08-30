@@ -1,6 +1,8 @@
 package positions
 
 import (
+	"bytes"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -230,5 +232,47 @@ func TestOpenSweepsOrphanedTemps(t *testing.T) {
 		if _, err := os.Stat(filepath.Join(dir, name)); err != nil {
 			t.Errorf("unrelated file %s removed: %v", name, err)
 		}
+	}
+}
+
+// TestOpenReportsWhereItResumes pins the two startup lines an operator reads on
+// a first live run. The FIRST-RUN line matters because of what silently follows
+// from it: with no stored positions -logs-unknown-files=auto resolves to "end",
+// so every log file already on the node is skipped to its end and its current
+// contents are never exported — which is the intended behaviour and also the
+// most common "the agent is collecting nothing" report. The RESUME line matters
+// because a restart that silently began from zero (a wiped volume, a
+// -positions-file pointing somewhere new) looks exactly like a healthy one
+// until the duplicates arrive downstream.
+func TestOpenReportsWhereItResumes(t *testing.T) {
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo})))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	path := filepath.Join(t.TempDir(), "positions.json")
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if !strings.Contains(buf.String(), "no positions file yet") {
+		t.Fatalf("a first run did not say so; got:\n%s", buf.String())
+	}
+
+	if err := s.SetLogs(map[string]LogPos{"/var/log/containers/a.log": {Offset: 42}}); err != nil {
+		t.Fatalf("SetLogs: %v", err)
+	}
+	buf.Reset()
+	if _, err := Open(path); err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	out := buf.String()
+	if !strings.Contains(out, "positions loaded") || !strings.Contains(out, "entries=1") {
+		t.Fatalf("the resume line did not report what was restored; got:\n%s", out)
+	}
+	// The cursor is opaque and the paths are unbounded: neither belongs on a
+	// startup line, so only their presence and count are reported.
+	if strings.Contains(out, "/var/log/containers/a.log") {
+		t.Fatalf("the resume line listed stored paths; it must report counts only. got:\n%s", out)
 	}
 }

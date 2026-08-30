@@ -249,8 +249,14 @@ nh_agent="$("${KCTL[@]}" -n monitoring get pods -l app=kubescrape-agent \
   --field-selector "spec.nodeName=$nh_node" -o jsonpath='{.items[0].metadata.name}')"
 
 # Without the opt-in, the forced-protobuf target must fail the scrape VISIBLY.
+#
+# The WHOLE log, not the last three minutes: the per-target scrape-failure line
+# is throttled (one per target per reason per five minutes — fifty broken
+# targets on two hundred nodes would otherwise be 20k identical lines a
+# minute), so a fixed recent window can legitimately hold none of them while the
+# refusal is very much still happening.
 forceproto_refused() {
-  "${KCTL[@]}" -n monitoring logs "$nh_agent" --tail=-1 --since=3m 2>/dev/null \
+  "${KCTL[@]}" -n monitoring logs "$nh_agent" --tail=-1 2>/dev/null \
     | grep "native histograms are not enabled" >/dev/null
 }
 wait_until 120 "a protobuf-serving target is REFUSED without -scrape-native-histograms" \

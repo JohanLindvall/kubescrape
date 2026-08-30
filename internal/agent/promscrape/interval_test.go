@@ -138,16 +138,22 @@ func TestWarnOnceSurvivesPodRestarts(t *testing.T) {
 		t.Errorf("dedupe table holds %d keys, want 1: it grows per pod incarnation", s.warned.Len())
 	}
 
-	// A genuinely different problem still gets through: another monitor, and
-	// the same monitor with a different bad value.
+	// A genuinely different problem still gets through: another monitor.
 	other := testTarget("http://10.9.9.9:9090/metrics")
 	other.Source, other.Monitor, other.Interval = "servicemonitor", "monitoring/other", "10 pancakes"
 	s.targetInterval(other)
+	if h.n != 2 {
+		t.Errorf("logged %d warnings, want 2: a different monitor is a different problem", h.n)
+	}
+	// A DIFFERENT bad value on the same field of the same monitor is NOT: the
+	// value is content somebody can rewrite at will, and this table never
+	// expires, so it may not choose keys (see warnkeys_test.go). The line
+	// carries the value; the key carries the identity.
 	same := testTarget("http://10.9.9.9:9090/metrics")
 	same.Source, same.Monitor, same.Interval = "servicemonitor", "monitoring/api", "12 waffles"
 	s.targetInterval(same)
-	if h.n != 3 {
-		t.Errorf("logged %d warnings, want 3: a new monitor and a new bad value are each a new problem", h.n)
+	if h.n != 2 {
+		t.Errorf("logged %d warnings, want 2: a second typo on one monitor field must not mint a permanent key", h.n)
 	}
 }
 

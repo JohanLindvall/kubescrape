@@ -25,6 +25,10 @@ import (
 	"github.com/JohanLindvall/kubescrape/internal/obs"
 )
 
+// protoContentType is the media type of the protobuf exposition, in both the
+// Accept offer and the response check — one constant so the two cannot drift.
+const protoContentType = "application/vnd.google.protobuf"
+
 // acceptProto is the Accept header offering protobuf exposition first.
 const acceptProto = "application/vnd.google.protobuf;proto=io.prometheus.client.MetricFamily;encoding=delimited;q=1," +
 	"application/openmetrics-text;version=1.0.0;q=0.8,text/plain;version=0.0.4;q=0.5"
@@ -196,6 +200,24 @@ func (s *Scraper) protoFamily(mf *dto.MetricFamily, ss *scrapeSession) (int, err
 		}
 		if droppedNHCB > 0 {
 			obs.ScrapeHistogramMixed.WithLabelValues(ss.pipeline, "nhcb").Add(float64(droppedNHCB))
+		}
+		if droppedClassic > 0 || droppedNHCB > 0 {
+			// The counter says a representation lost; only the line says WHICH
+			// FAMILY and on which target, which is the whole diagnosis — a
+			// family with mixed representations is the exporter's bug and the
+			// operator has to go and find it. Per family per target, once: an
+			// exposition does not change shape between cycles.
+			// Keyed on the TARGET alone, never on the family name: the name
+			// comes off the scraped body, the warnOnce table never expires,
+			// and a target minting fresh family names would fill it and
+			// silence every other complaint in this package for the life of
+			// the process (see warnOnce). So the first mixed family on a
+			// target is the one that speaks — which is enough to send an
+			// operator to that exporter — and the counter carries the rest.
+			ss.s.warnOnce("histmixed:"+ss.warnKey,
+				"a protobuf histogram family carries more than one representation; the metrics in the losing one are dropped",
+				"target", ss.what, "metric", clipForLog(name), "native", native,
+				"droppedClassic", droppedClassic, "droppedNHCB", droppedNHCB)
 		}
 	}()
 	for _, m := range mf.GetMetric() {

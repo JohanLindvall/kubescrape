@@ -96,6 +96,7 @@ func TestExcludedPipelinesRefusedAtStart(t *testing.T) {
 	starts := map[string]func(context.Context) error{
 		"journald":          p.startJournald,
 		"azure-diagnostics": p.startAzure,
+		"events":            p.startEvents,
 	}
 	for _, op := range optionalPipelines() {
 		if op.built {
@@ -123,6 +124,9 @@ func TestUnsetExcludedPipelinesAreFine(t *testing.T) {
 	}
 	if err := p.startAzure(context.Background()); err != nil {
 		t.Fatalf("startAzure with -azure-diagnostics=false: %v", err)
+	}
+	if err := p.startEvents(context.Background()); err != nil {
+		t.Fatalf("startEvents with -events=false: %v", err)
 	}
 }
 

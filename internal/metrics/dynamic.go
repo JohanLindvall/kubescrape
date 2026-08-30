@@ -13,6 +13,7 @@ import (
 
 	"go.opentelemetry.io/collector/pdata/pcommon"
 
+	"github.com/JohanLindvall/kubescrape/internal/logdedupe"
 	"github.com/JohanLindvall/kubescrape/internal/logline"
 )
 
@@ -321,6 +322,15 @@ type DynamicMetricSet struct {
 	retryBy         map[string][]seriesSamples
 	retryOrder      []string
 	retainedSamples int
+	// exportFailures counts consecutive failed export cycles, so a persisting
+	// outage warns once and then restates itself on a schedule instead of once
+	// per interval per node — and so the RECOVERY can be one Info line.
+	// Guarded by exportMu, like the retention beside it.
+	exportFailures int
+	exportFailedAt time.Time
+	// exportWarn throttles the re-warn; evictWarn the retention-eviction one.
+	exportWarn logdedupe.Throttle
+	evictWarn  logdedupe.Throttle
 }
 
 // DroppedCapped counts observations this set rejected because a metric's

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"flag"
 	"fmt"
@@ -29,9 +30,11 @@ import (
 	"github.com/JohanLindvall/kubescrape/internal/agent/tailer"
 	"github.com/JohanLindvall/kubescrape/internal/agent/tracesample"
 	"github.com/JohanLindvall/kubescrape/internal/agent/transform"
+	"github.com/JohanLindvall/kubescrape/internal/cli"
 	"github.com/JohanLindvall/kubescrape/internal/config"
 	"github.com/JohanLindvall/kubescrape/internal/logline"
 	"github.com/JohanLindvall/kubescrape/internal/metrics"
+	"github.com/JohanLindvall/kubescrape/internal/selfmeta"
 	"github.com/JohanLindvall/kubescrape/pkg/logattrs"
 )
 
@@ -1099,8 +1102,21 @@ func baseEndpointUnused(exp *otlpexport.ExportConfig) bool {
 	return true
 }
 
-// printConfigSummary reports what a real start would enable, so -check-config
-// answers "is this valid?" and "is this what I meant?" in one run.
+// printConfigSummary is the EFFECTIVE CONFIGURATION dump: what this process
+// will do, where it will send it, what it will listen on, who it thinks it is,
+// and the knobs most likely to be wrong.
+//
+// It is emitted by every real start AND by -check-config, from one function, so
+// the dry run and the start cannot describe different agents — the same
+// discipline validateConfig already holds for the refusals. On a first live run
+// this is the one thing an operator can grep to answer "is it even configured
+// the way I think?" before any pipeline has produced a byte.
+//
+// A few lines rather than one: an operator greps a message ("effective
+// destinations") and reads the pairs under it, and a single 40-pair line is
+// unreadable in a terminal and in Loki alike. Every line is logfmt, every value
+// is a flag's EFFECTIVE value, and no line carries a credential — only the
+// PATHS credentials are read from (see internal/cli's "never log a secret").
 func printConfigSummary(cfg agentConfig, log *slog.Logger) {
 	on := func(b bool) string {
 		if b {
@@ -1132,27 +1148,126 @@ func printConfigSummary(cfg agentConfig, log *slog.Logger) {
 		cgroupStats = "requested"
 	}
 
-	log.Info("config is valid",
+	log.Info("effective configuration",
+		// Which of the three shapes this process is deployed as. It is derived
+		// from the pipeline toggles rather than from one flag (see shardRole),
+		// and it is the first thing to check when the metrics of two workloads
+		// collide: the role decides service.instance.id.
+		"role", agentRole(),
 		"sections", strings.Join(sections, ","),
 		// Which binary this is, not just whether the config parses: the
 		// optional pipelines are build-tag-gated (buildtags.go).
 		"optionalPipelines", builtPipelines(),
 		"pipelines", fmt.Sprintf("logs=%s metrics=%s cadvisor=%s cgroupStats=%s node=%s summary=%s journald=%s ingest=%s events=%s azure=%s serviceGraph=%s",
 			on(*logsOn), on(*metricsOn), on(*cadvisorOn), cgroupStats, on(*nodeOn), on(*summaryOn), on(*journaldOn), on(*ingestOn), on(*eventsOn), on(*azureOn), on(*serviceGraphOn)),
-		"otlp-endpoint", *otlpEndpoint,
-		"otlp-protocol", *otlpProtocol,
-		"buffer-dir", *bufferDir,
-		"positions-file", *positionsFile,
-		"transforms-file", *transformsFile,
+		"positionsFile", *positionsFile,
+		"transformsFile", *transformsFile,
 		"enrich", *enrichOn,
-		"self-attributes", *selfAttrsOn,
+		"selfAttributes", *selfAttrsOn,
+		"logLevel", *logLevel,
 	)
+
+	// Everything this process will TALK to. An endpoint typo is the single most
+	// common first-run failure and it is otherwise only visible as an export
+	// error per interval, long after startup — and the per-signal overrides are
+	// worse than that, because a healthy default endpoint makes the wrong one
+	// look like a collector problem. Credentials appear as PATHS only.
+	dest := []any{
+		"metadataEndpoint", *metadataURL,
+		"otlpEndpoint", *otlpEndpoint,
+		"otlpProtocol", *otlpProtocol,
+		"otlpCompression", *otlpCompression,
+		"otlpInsecure", *otlpInsecure,
+		"otlpTLSSkipVerify", *otlpSkipTLS,
+		"otlpCAFile", *otlpCAFile,
+		"otlpBearerTokenFile", *otlpBearer,
+		"kubeletEndpoint", *kubeletEndpoint,
+		"bufferDir", *bufferDir,
+		"bufferMaxBytes", *bufferMax,
+	}
+	for _, o := range []struct {
+		key string
+		ov  *otlpexport.ExportOverride
+	}{
+		{"otlpLogsEndpoint", exportOverride(cfg.Export, signalLogs)},
+		{"otlpMetricsEndpoint", exportOverride(cfg.Export, signalMetrics)},
+		{"otlpTracesEndpoint", exportOverride(cfg.Export, signalTraces)},
+	} {
+		if o.ov != nil && o.ov.Endpoint != "" {
+			dest = append(dest, o.key, o.ov.Endpoint)
+		}
+	}
+	log.Info("effective destinations", dest...)
+
+	// Every socket this process will bind. An address already in use is a
+	// startup failure that names itself, but a listener that is simply EMPTY —
+	// and therefore never bound — is silent, and "-metrics-listen=\"\" so there
+	// are no metrics" is a question nobody thinks to ask.
+	listeners := []any{
+		"listen", *listen,
+		// WHO may read the data-bearing debug surfaces on that port — the live
+		// OTLP stream is this node's whole telemetry feed, so "who can read it"
+		// belongs on the same line as "what is bound", and -check-config must
+		// answer it before a rollout rather than after.
+		"debugAccess", debugAccessMode(),
+		"metricsListen", *metricsListen,
+		"pprofListen", *pprofListen,
+	}
+	if *ingestOn {
+		listeners = append(listeners, "ingestGRPC", *ingestGRPC, "ingestHTTP", *ingestHTTP)
+	}
+	if *serviceGraphOn {
+		listeners = append(listeners,
+			"serviceGraphInternalGRPC", *serviceGraphListen,
+			"serviceGraphInternalHTTP", *serviceGraphHTTPListen)
+		if *serviceGraphIngest {
+			listeners = append(listeners,
+				"serviceGraphIngestGRPC", *serviceGraphIngestGRPC,
+				"serviceGraphIngestHTTP", *serviceGraphIngestHTTP)
+		}
+	}
+	log.Info("effective listeners", listeners...)
+
+	// Who this process says it is on every series it produces about itself.
+	// service.instance.id is role-dependent, and getting it wrong makes two
+	// workloads interleave counters on one (job, instance) — a failure that
+	// renders perfectly and is wrong everywhere.
+	log.Info("effective identity",
+		"node", *nodeName,
+		"namespace", selfmeta.Namespace(),
+		"serviceName", agentServiceName,
+		"instance", agentInstance(),
+		"selfAttributesRefresh", *selfAttrsRefresh,
+		"selfMetricsInterval", *selfMetricsIntv,
+	)
+
+	// The knobs whose wrong value is expensive and quiet: a cadence, a cap or
+	// an exclusion. Not every flag — docs/FLAGS.md is the full list — but the
+	// ones a first rollout gets wrong.
+	limits := []any{
+		"scrapeInterval", *scrapeInterval,
+		"scrapeTimeout", *scrapeTimeout,
+		"scrapeConcurrency", *scrapeConcurrency,
+		"metadataWait", *metadataWait,
+		"logsExcludeNamespaces", strings.Join(cli.SplitList(*excludeNs), ","),
+		"logsUnknownFiles", *logsUnknownFiles,
+		"logsBatchSize", *logsBatch,
+		"logsFlushInterval", *logsFlush,
+		"logsMaxEntryBytes", *maxEntryBytes,
+		"logsRateLimit", *logsRateLimit,
+		"logsMetricsInterval", *logsMetricsEvery,
+	}
+	if *ingestOn {
+		limits = append(limits, "ingestMaxInFlight", *ingestMaxInFlight, "ingestMetadataWait", *ingestWait)
+	}
+	log.Info("effective limits", limits...)
+
 	if cfg.LogMetrics != nil {
 		log.Info("logMetrics", "rules", len(cfg.LogMetrics.Metrics))
 	}
 	if cfg.Routing != nil {
 		for _, rt := range cfg.Routing.Routes {
-			log.Info("routing route", "name", rt.Name, "namespaces", strings.Join(rt.Namespaces, ","), "endpoint", rt.Endpoint)
+			log.Info("routing route", "route", rt.Name, "namespaces", strings.Join(rt.Namespaces, ","), "endpoint", rt.Endpoint)
 		}
 	}
 	// The MERGED shard set, not the section: the chart configures this feature
@@ -1169,6 +1284,62 @@ func printConfigSummary(cfg agentConfig, log *slog.Logger) {
 		log.Info("service-graph shard role", "listen", *serviceGraphListen, "httpListen", *serviceGraphHTTPListen,
 			"interval", *serviceGraphIv, "tokenFile", *serviceGraphToken)
 	}
+}
+
+// agentServiceName is the service.name every metric this process generates
+// about ITSELF carries (agentSelfResource sets it); named here so the summary
+// cannot drift from the resource.
+const agentServiceName = "kubescrape-agent"
+
+// agentRole names the deployment shape this process is in, the way
+// agentSelfResource decides it: the two cluster-scoped roles are keyed on every
+// per-node pipeline being off, never on the flag alone.
+func agentRole() string {
+	switch {
+	case shardRole():
+		return "trace-tier-shard"
+	case singletonRole():
+		return "cluster-singleton"
+	default:
+		return "node-agent"
+	}
+}
+
+// agentInstance is the service.instance.id agentSelfResource will derive: the
+// pod for a cluster-scoped role, the node for a node agent. Reported because a
+// collision here merges two processes' cumulative series.
+func agentInstance() string {
+	if singletonRole() || shardRole() {
+		if inst := selfInstanceName(); inst != "" {
+			return inst
+		}
+	}
+	return *nodeName
+}
+
+// The three OTLP signals, as the export section spells them.
+const (
+	signalLogs    = "logs"
+	signalMetrics = "metrics"
+	signalTraces  = "traces"
+)
+
+// exportOverride returns the export section's per-signal override, or nil.
+// A tiny helper rather than three field reads at the call site, because the
+// summary must not be the place that forgets one when a fourth signal appears.
+func exportOverride(exp *otlpexport.ExportConfig, signal string) *otlpexport.ExportOverride {
+	if exp == nil {
+		return nil
+	}
+	switch signal {
+	case signalLogs:
+		return exp.Logs
+	case signalMetrics:
+		return exp.Metrics
+	case signalTraces:
+		return exp.Traces
+	}
+	return nil
 }
 
 // readiness tracks the startup gates /readyz reports on.
@@ -1225,6 +1396,89 @@ func (r *readiness) pending() []string {
 		if !ok {
 			out = append(out, name)
 		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// states is every registered gate and whether it is satisfied, for
+// obs.RegisterReadiness — the metric half of the probe body, so a fleet stuck
+// unready is visible without a shell on one of its pods.
+func (r *readiness) states() map[string]bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make(map[string]bool, len(r.gates))
+	for name, ok := range r.gates {
+		out[name] = ok
+	}
+	return out
+}
+
+// How long a gate may stay pending before it is worth a line, and how often to
+// repeat it. A rolling update that stops at the first node is the worst first-run
+// experience there is, and the process itself is otherwise silent about it: the
+// pipelines all logged "started", the kubelet's probe is failing, and nothing in
+// the log says which subsystem is holding it.
+//
+// The grace is generous on purpose — reaching the metadata service takes a few
+// seconds on a cold cluster, and a warning during normal startup teaches
+// operators to ignore this one.
+// Vars, not consts, so a test can drive the warn without sleeping through the
+// grace — the same reason the store's clock is injectable.
+var (
+	readinessGrace  = 30 * time.Second
+	readinessReWarn = 2 * time.Minute
+)
+
+// watch reports readiness once, and keeps reporting a gate that will not clear.
+// It returns as soon as everything is satisfied (the gates are STARTUP gates:
+// they never go back), or when the process is shutting down.
+func (r *readiness) watch(ctx context.Context, log *slog.Logger) {
+	start := time.Now()
+	// A steady poll, never a backoff: /readyz is what a rolling update advances
+	// on, so the ready line must appear when the agent becomes ready rather than
+	// up to a backoff later, and the check is one mutex-guarded map read. Only
+	// the WARNING is throttled.
+	wait := min(time.Second, readinessGrace)
+	var lastWarn time.Time
+	t := time.NewTimer(wait)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			// Worth a line: a pod killed before it ever became ready is a
+			// different story from one that served and was rolled.
+			if pending := r.pending(); len(pending) > 0 {
+				log.Warn("shutting down before becoming ready",
+					"gates", strings.Join(pending, ","), "waited", time.Since(start).Round(time.Second))
+			}
+			return
+		case <-t.C:
+		}
+		pending := r.pending()
+		if len(pending) == 0 {
+			log.Info("ready", "waited", time.Since(start).Round(time.Second),
+				"gates", strings.Join(r.names(), ","))
+			return
+		}
+		if elapsed := time.Since(start); elapsed >= readinessGrace &&
+			(lastWarn.IsZero() || time.Since(lastWarn) >= readinessReWarn) {
+			log.Warn("not ready: /readyz is 503, so a rolling update will not advance past this pod",
+				"gates", strings.Join(pending, ","), "waited", elapsed.Round(time.Second))
+			lastWarn = time.Now()
+		}
+		t.Reset(wait)
+	}
+}
+
+// names is every registered gate, sorted — what the ready line reports, so the
+// one Info line says what was actually waited for.
+func (r *readiness) names() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]string, 0, len(r.gates))
+	for name := range r.gates {
+		out = append(out, name)
 	}
 	sort.Strings(out)
 	return out

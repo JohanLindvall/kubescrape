@@ -1,7 +1,6 @@
 package cumagg
 
 import (
-	"strconv"
 	"strings"
 	"time"
 
@@ -14,9 +13,29 @@ import (
 // tuples never collide (("a","bc") vs ("ab","c")). Building the key on a stack
 // buffer and looking it up with Store.AdmitLocked keeps a warm series
 // allocation-free.
+//
+// The length is a UVARINT, not decimal. The prefix's only job is to make the
+// concatenation injective — nothing ever reads a key back, and it is never
+// persisted or put on the wire — so the encoding is free to be whatever is
+// cheapest, and the decimal one was not cheap: this is called four to a dozen
+// times per SPAN and per completed edge on the trace tier's receive path, and
+// a profile of the fold at the 20000-series cardinality cap charged 10% of it
+// to strconv.AppendInt's division loop alone. A uvarint is one byte for every
+// value shorter than 128 (which, with cumagg.Trunc cutting at 256, is very
+// nearly all of them), and the two or three bytes it saves per part also
+// shorten the key the map then hashes and compares.
+//
+// Injective for the same reason the decimal form was: a uvarint is
+// prefix-free, so the boundary between the length and the value, and between
+// one part and the next, is unambiguous. TestKeyPartsAreInjective pins it at
+// the encoding's own length boundaries.
 func AppendKeyPart(dst []byte, v string) []byte {
-	dst = strconv.AppendInt(dst, int64(len(v)), 10)
-	dst = append(dst, ':')
+	n := uint(len(v))
+	for n >= 0x80 {
+		dst = append(dst, byte(n)|0x80)
+		n >>= 7
+	}
+	dst = append(dst, byte(n))
 	return append(dst, v...)
 }
 

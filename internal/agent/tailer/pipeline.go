@@ -180,7 +180,14 @@ const plainKey = "line"
 // pipeline. Containerd files go through the CRI stage; plain files feed the
 // trace stage (or emit) directly, sharing the same offset accounting so
 // rotation and cross-rotation multi-line joining work identically.
-func (t *Tailer) feedLine(ctx context.Context, f *file, raw string, start, end int64) {
+//
+// fedAt is the caller's wall-clock reading for the whole chunk it is feeding,
+// not this line's own: it becomes f.lastFed, which is pure bookkeeping (see
+// consume). The PLAIN path deliberately ignores it and reads the clock per
+// line, because there the reading is also the RECORD's timestamp — giving a
+// whole 64 KiB read one timestamp would be a wire-visible change, not a
+// bookkeeping one.
+func (t *Tailer) feedLine(ctx context.Context, f *file, raw string, start, end int64, fedAt time.Time) {
 	if !f.source.containerd {
 		t.feedPlainLine(ctx, f, raw, start, end)
 		return
@@ -204,7 +211,7 @@ func (t *Tailer) feedLine(ctx context.Context, f *file, raw string, start, end i
 		// and either stage may hold lines with Multiline on or off — a
 		// wall-clock cutoff against the lines' own timestamps tears any run
 		// buffered across a sweep boundary during a backlog catch-up.
-		f.lastLineTime, f.lastFed = l.Time, time.Now()
+		f.lastLineTime, f.lastFed = l.Time, fedAt
 	}
 	seg := f.curSeg()
 	startPos, endPos := pos{seg, start}, pos{seg, end}
@@ -373,6 +380,23 @@ func (t *Tailer) consume(ctx context.Context, f *file, draining bool) bool {
 	// calls this again). But in pure-drop mode nothing is ever fed, so no flush
 	// ever runs for this file and this is the only place the frontier can move.
 	defer f.absorbSkipped()
+	// ONE clock read per chunk, not one per physical line. f.lastFed is read
+	// in exactly one place (sweep) and only ever answers "has this file been
+	// quiet for MultilineTimeout?", so its useful resolution is the sweep
+	// cadence — while time.Now() was a mid-single-digit PERCENT OF THE CPU
+	// PROFILE of BenchmarkIngestChunk (4-10% cumulative across four profiles
+	// of the pre-change tree, mean ~6%), paid on the highest-frequency path
+	// in the product (6000 lines/s/node measured on a live agent). The stamp
+	// is at most one chunk of feeding stale, which is orders of magnitude
+	// below the cutoff it is compared against.
+	//
+	// That figure is a PROFILE SHARE and it will not reproduce as a benchstat
+	// delta: BenchmarkIngestChunk's own run-to-run spread is wider than the
+	// effect, so an A/B of this change alone reads "~" (measured p=0.21). A
+	// review has already flagged the old point estimate for failing to
+	// reproduce by using the wrong instrument — the right one is `go tool
+	// pprof -cum` on the benchmark, and the right claim is a range.
+	fedAt := time.Now()
 	for {
 		i := bytes.IndexByte(f.pending, '\n')
 		if i < 0 {
@@ -391,6 +415,11 @@ func (t *Tailer) consume(ctx context.Context, f *file, draining bool) bool {
 				// which is what the metric says it counts.
 				if !f.discarding {
 					obs.LogOversizedDropped.Inc()
+					// Which FILE, which the counter cannot say. One integer
+					// increment on the FIRST over-cap slab of a line (not per
+					// read chunk and not per line), so the per-line allocation
+					// budget is untouched; publishStatus names the files.
+					f.oversized++
 				}
 				f.discarding = true
 			}
@@ -440,15 +469,26 @@ func (t *Tailer) consume(ctx context.Context, f *file, draining bool) bool {
 			f.skipEnd = f.lineStart
 			continue
 		}
-		t.feedLine(ctx, f, string(line), start, f.lineStart)
+		t.feedLine(ctx, f, string(line), start, f.lineStart, fedAt)
 		// The batch threshold belongs HERE, where records are added. Checked
 		// once per file per sweep instead — after readFile had already consumed
 		// up to MaxBytesPerSweep and fed every line of it — -logs-batch-size
 		// ("flush after this many entries") was in practice "flush after a
 		// sweep's worth of them": measured at 10x the configured size on a
 		// backlog, and 90x with a small one.
+		batched := len(t.batch)
 		if !draining && t.maybeFlush(ctx, f) {
 			return true
+		}
+		if len(t.batch) < batched {
+			// A flush ran, and an export blocks for as long as its retries
+			// take: re-stamp, or the rest of this chunk would be fed with a
+			// reading from before an outage and sweep would read the file as
+			// idle — the wall-clock age-out branch, which is exactly what
+			// tears buffered groups during a catch-up. Two slice-length
+			// loads per line is what makes the hoist above safe rather than
+			// sloppy; TestLastFedIsRestampedAfterAMidChunkFlush pins it.
+			fedAt = time.Now()
 		}
 	}
 }

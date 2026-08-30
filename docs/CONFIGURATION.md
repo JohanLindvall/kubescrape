@@ -19,7 +19,11 @@ manifests live in [deploy/](../deploy).
 
 This document is the narrative reference; the exhaustive per-binary flag
 inventory is [FLAGS.md](FLAGS.md), **generated** from the registered flag sets
-— its defaults are authoritative because they cannot drift.
+— its defaults are authoritative because they cannot drift. Installing for the
+first time? [FIRST-RUN.md](FIRST-RUN.md) is the runbook: what must exist
+before you install, the smallest useful configuration, what to watch in the
+first ten minutes, a symptom→cause table, and which counters are worth an
+alert.
 
 Two machine-readable schemas, both generated/enforced by tests:
 [agent-config.schema.json](agent-config.schema.json) is a JSON Schema for the
@@ -35,7 +39,11 @@ the chart carries a `values.schema.json`, so a typo'd Helm value fails
 only — `-check-config` remains the semantic validator (regexes, durations,
 bounds, templates).
 
+- [Toolchain and build floor](#toolchain-and-build-floor)
 - [Build variants (optional pipelines)](#build-variants-optional-pipelines)
+- [Runtime memory and CPU (GOMEMLIMIT, GOMAXPROCS)](#runtime-memory-and-cpu-gomemlimit-gomaxprocs)
+- [Logging](#logging)
+- [Accepted security residuals](#accepted-security-residuals)
 - [Metadata service](#metadata-service)
 - [Agent: general](#agent-general)
 - [Agent: OTLP export](#agent-otlp-export)
@@ -63,22 +71,56 @@ bounds, templates).
 - [Helm values](#helm-values)
 - [Complete example](#complete-example)
 
+## Toolchain and build floor
+
+**Building kubescrape needs Go 1.26.6 or newer.** `go.mod` says `go 1.26.6`,
+and nothing in the source needs that language version — it is a **security
+floor**. `govulncheck` at the previous `go 1.26.3` reported ten reachable
+standard-library advisories; six of them have no earlier fix, which is what
+makes the floor `.6` rather than `.4`:
+
+| Advisory | Package | Reached from |
+|---|---|---|
+| [GO-2026-6218](https://pkg.go.dev/vuln/GO-2026-6218) | `net/url` — quadratic path resolution | every `metaclient` fetch (`http.Client.Do`) |
+| [GO-2026-6090](https://pkg.go.dev/vuln/GO-2026-6090) | `crypto/tls` — unbounded post-handshake messages | every TLS listener and dialer, including the unauthenticated ingest ports |
+| [GO-2026-6089](https://pkg.go.dev/vuln/GO-2026-6089) | `net/http` — `ReadHeaderTimeout` not applied on the h2c check | every `http.Server` this repo starts |
+| [GO-2026-5972](https://pkg.go.dev/vuln/GO-2026-5972) | `encoding/asn1` — recursion depth | `otlpexport`'s mTLS `LoadX509KeyPair` |
+| [GO-2026-5026](https://pkg.go.dev/vuln/GO-2026-5026) | `x/net/idna` vendored into `net/http` — Punycode acceptance | `metaclient`, the scraper's per-target clients |
+| [GO-2026-6091](https://pkg.go.dev/vuln/GO-2026-6091) | `html/template` | only `hack/nhexporter`, the e2e fixture — not a shipped binary |
+
+The other four (`GO-2026-5856`, `GO-2026-5039`, `GO-2026-5038`,
+`GO-2026-5037`) are fixed in 1.26.4/1.26.5 and are closed by the same bump.
+`govulncheck -tags journald,azure,events ./...` is clean as of this writing; re-run it
+rather than trusting the directive, and raise the floor by editing `go.mod` —
+nothing else in the tree states it.
+
+**The directive is enforced, and it fails loudly rather than silently.** Under
+the default `GOTOOLCHAIN=auto` a machine holding an older Go downloads 1.26.6
+and re-execs into it; with `GOTOOLCHAIN=local` the build is refused outright
+(`go.mod requires go >= 1.26.6`). There is no configuration in which an older
+toolchain quietly produces a binary carrying those ten. What the directive does
+**not** govern is everything that is not Go — see
+[Accepted security residuals](#accepted-security-residuals) for the floating
+base-image tags, which are how a stale glibc or libsystemd can still reach a
+shipped image whose Go binary is current.
+
 ## Build variants (optional pipelines)
 
-Two agent pipelines are compiled in through Go **build tags**, and the default
-set lives in the Makefile — so a stock `make build` / `make image` contains both
-and nothing about the shipped artifacts has changed:
+Three agent pipelines are compiled in through Go **build tags**, and the default
+set lives in the Makefile — so a stock `make build` / `make image` contains all
+three and nothing about the shipped artifacts has changed:
 
 ```sh
-TAGS ?= journald,azure          # Makefile; passed to build, test, vet, lint and image
+TAGS ?= journald,azure,events   # Makefile; passed to build, test, vet, lint and image
 ```
 
-| Build | journald | azure | Effect |
-|---|---|---|---|
-| `make build` | ✔ | ✔ | the default: agent is `CGO_ENABLED=1`, dynamically linked |
-| `make build TAGS=azure` | — | ✔ | agent is **cgo-free and static**; no libsystemd needed |
-| `make build TAGS=journald` | ✔ | — | **11 franz-go packages** (≈5 MB) gone |
-| `make build TAGS=` | — | — | both |
+| Build | journald | azure | events | Stripped agent |
+|---|---|---|---|---|
+| `make build` | ✔ | ✔ | ✔ | 59.1 MB — the default: agent is `CGO_ENABLED=1`, dynamically linked |
+| `make build TAGS=azure,events` | — | ✔ | ✔ | 58.9 MB, and **cgo-free and static**; no libsystemd needed |
+| `make build TAGS=journald,events` | ✔ | — | ✔ | 54.1 MB — **11 franz-go packages** (≈5 MB) gone |
+| `make build TAGS=journald,azure` | ✔ | ✔ | — | **26.3 MB** — 926 → 470 dependency packages (`k8s.io/`+`sigs.k8s.io/` **412 → 8**), −31.4 MiB / −55.6% |
+| `make build TAGS=` | — | — | — | 21.0 MB |
 
 * **`journald`** compiles in [the systemd journal reader](#agent-journald). It
   is the *only* reason the agent needs cgo — it links libsystemd through
@@ -89,17 +131,38 @@ TAGS ?= journald,azure          # Makefile; passed to build, test, vet, lint and
 * **`azure`** compiles in [the Azure diagnostics consumer](#agent-azure-diagnostics).
   Its Kafka client rides in every DaemonSet image for a pipeline that only ever
   runs in the one-replica singleton Deployment.
+* **`events`** compiles in [the Kubernetes events reader](#agent-kubernetes-events) and its
+  leader election. This is the same argument as `azure` at six times the size:
+  they are the *only* reason the agent links `k8s.io/client-go` — the binary is
+  otherwise documented, correctly, as talking to no Kubernetes API — and that is
+  412 packages and **half the stripped binary**, carried on every node for a
+  pipeline that only ever runs in the singleton Deployment. `KubeConfig` lives in
+  its own `internal/cli/kubecfg` package for the same reason: `internal/cli` is
+  imported by *every* build, so a `clientcmd` import there would have pinned
+  client-go into the very variant the tag exists to slim.
 
 `make verify-tags` asserts the exclusions really happen (no cgo without
-`journald`, no franz-go without `azure`).
+`journald`, no franz-go without `azure`, no `k8s.io/client-go` without `events`)
+— which is what makes "the agent talks to no Kubernetes API" a property a build
+can fail on rather than a claim in a document.
+
+> **What the table does NOT say: the shipped image is unchanged.** `TAGS`
+> defaults to all three, so `make image` builds exactly what it always did.
+> The image also carries *both* binaries, and the metadata service links
+> client-go legitimately, so dropping `events` takes the image's binary
+> payload from **112.98 MB to 80.09 MB (−29.1%)** — a real saving on every
+> node's pull, but not the −55.6% the agent column shows. Every figure in
+> this section was re-measured 2026-08-29 on go1.26.6 with
+> `-trimpath -ldflags="-s -w"` (`CGO_ENABLED=1` for the `journald` rows,
+> `0` otherwise), two byte-identical builds per arm.
 
 > **A bare `go build ./cmd/kubescrape-agent/` passes no tags and builds an agent
-> with NEITHER pipeline.** `make` is the supported path; otherwise pass `-tags`
+> with NONE of the three.** `make` is the supported path; otherwise pass `-tags`
 > yourself. The same applies to `go test` and `go vet` — `make test` passes
 > `$(TAGS)` so the real code, not the stubs, is what gets tested.
 
-**The flags never disappear.** `-journald` and `-azure-diagnostics` are defined
-in every build (the shipped manifests pass them, and a missing flag would make
+**The flags never disappear.** `-journald`, `-azure-diagnostics` and `-events`
+are defined in every build (the shipped manifests pass them, and a missing flag would make
 the process exit 2 with `flag provided but not defined`). Enabling a pipeline
 the binary does not contain is instead a **startup error naming the tag**:
 
@@ -107,22 +170,423 @@ the binary does not contain is instead a **startup error naming the tag**:
 -journald is set, but this kubescrape-agent was built WITHOUT the "journald"
 build tag, so the systemd journal reader is not compiled into it: either drop
 -journald, or use an agent built with the tag (`make build` / `make image`
-default to TAGS=journald,azure and contain every pipeline; a bare `go build`
-contains neither)
+default to TAGS=journald,azure,events and contain every pipeline; a bare `go
+build` contains none of them)
 ```
 
 `-check-config` raises the same error, so a rollout fails the dry run rather
 than the DaemonSet. Every start (and `-check-config`) also reports which binary
-it is — `optionalPipelines=journald,azure`, or `(none)`.
+it is — `optionalPipelines=journald,azure,events`, or `(none)`.
 
-**The `-config` file is not affected by any of this.** No section belongs to
-either pipeline, so one ConfigMap stays decodable by every variant; only
-*enabling* an absent pipeline fails.
+**The `-config` file is not affected by any of this.** No section belongs to any
+of the three, so one ConfigMap stays decodable by every variant; only *enabling*
+an absent pipeline fails.
+
+## Runtime memory and CPU (GOMEMLIMIT, GOMAXPROCS)
+
+**Both binaries set a Go soft memory limit from their own container's cgroup
+limit at startup. There is no flag; it is on, and the way to change it is the
+container's `resources.limits.memory` or the `GOMEMLIMIT` environment
+variable.** It has no flag and no chart value, so it appears in no table on
+this page — which is exactly why it gets a section.
+
+Go's garbage collector sizes the next collection at `GOGC` percent above the
+*live* heap and knows nothing about the cgroup it runs in. The agent's scrape
+cycle takes `heap_alloc` from about 9 MB to about 58 MB every `-scrape-interval`
+and the heap goal follows it; nothing in that loop knows the DaemonSet ships
+`limits.memory: 512Mi`. A cycle that needs more than the limit is therefore not
+collected harder — it is **OOMKilled**, losing the tailer's unflushed batch and
+every buffered span on whichever node the fat target happened to land on.
+
+A soft limit makes the heap goal `min(GOGC goal, limit goal)`, so it can only
+ever make the GC run *earlier*:
+
+* **When it does not bind it costs nothing.** A workload whose peak sat far
+  below the limit measured 19.70 GC cycles per GB allocated both with the limit
+  and without it (10 interleaved rounds).
+* **When it binds it costs GC and buys survival.** A burst at the boundary of a
+  384 MiB cgroup was OOMKilled 3 times in 16 runs without the limit and 0 times
+  in 16 with it, at 10.7 → 17.2 cycles per GB.
+
+  > That pair is the campaign's single most operator-visible claim and it rests
+  > on **one** harness run; it has not been independently reproduced. Treat the
+  > direction as established and the exact counts as one measurement.
+
+**What it reads.** 90% of *this container's own* cgroup memory limit —
+`/sys/fs/cgroup/…/memory.max` (v2) or `memory.limit_in_bytes` (v1), named by
+`/proc/self/cgroup`, with the mount root as the fallback for the cgroup v1
+bind-mount layout. It never reads an **ancestor's**: with the kubelet's default
+`--enforce-node-allocatable=pods`, `kubepods.slice` carries a limit of the
+node's whole allocatable memory, so walking up and taking the minimum would hand
+an *uncapped* container ~0.9× the **node's** RAM as its heap goal. The remaining
+10% is for everything the Go runtime cannot see — the binary's mapped text, the
+C heap of libsystemd under the `journald` tag, and anything else the kernel
+charges to the cgroup.
+
+**When it does nothing, by design.** An uncapped workload gets no limit and no
+warning: the metadata service ships with **no** `limits.memory` on purpose (its
+footprint scales with the cluster, and a number picked in a values file is a
+number picked without knowing the cluster). If you want the insurance there,
+set a memory limit or `GOMEMLIMIT` — and note that `GOMEMLIMIT` in the
+environment always wins, checked through the runtime's own current value rather
+than `os.Getenv`, so any spelling the runtime accepted takes precedence.
+
+**`GOGC` is left alone.** A soft limit can only lower the heap goal, so it is
+pure tail insurance; raising `GOGC` would trade memory for CPU, which is not a
+trade this code can make on an operator's behalf.
+
+**`GOMAXPROCS` needs nothing.** Go has derived it from a cgroup CPU limit since
+1.25 and `go.mod` pins 1.26 (verified: `CPUQuota=50%` yields `GOMAXPROCS=2`), so
+an operator adding `resources.limits.cpu` is already handled and
+`automaxprocs` would be a dependency for a fixed bug.
+
+**What you see.** One Info line per process, right after the build-identity
+line:
+
+```
+level=INFO msg="Go soft memory limit set from the cgroup memory limit" limitBytes=482344960 cgroupLimitBytes=536870912 share=0.9 path=/sys/fs/cgroup/memory.max note="a heap excursion now costs GC instead of an OOMKill; set GOMEMLIMIT to override"
+```
+
+An already-set `GOMEMLIMIT` logs that it is being left alone. An uncapped
+workload logs nothing at Info — it is a Debug line, because an uncapped
+workload is a legitimate documented shape here and a fleet-wide warning about a
+deliberate choice is noise on every start.
+
+## Logging
+
+Both binaries log **logfmt on stderr, always**. There is no format flag — a
+`-log-format` existed once and was removed — so one parser reads every line
+every component emits. Both binaries route every OTHER logger linked into
+the process through the same handler rather than interleaving a second
+format into the same stream: client-go's klog (leader election, reflector
+backoffs, watch errors) and grpc-go's grpclog (the OTLP exporter's client,
+the ingest listeners, the trace tier) — the latter matters because grpc's
+default logger writes its connection failures straight to stderr in its own
+format, at its default severity, needing no environment variable. Only grpc's
+ERROR class (the one its own default logger prints) keeps a level the default
+prints: its INFO chatter (channel and resolver state transitions) and its
+WARNING class are mapped to `debug`, and its verbose `V(n)` sites are gated off
+unless `-log-level=debug`, so the routing changes the format without changing
+the volume. WARNING is at `debug` because part of that class is **peer-driven**
+— grpc renders a rejected metadata header's name and value verbatim for any
+header any client sends, on ingest listeners that are unauthenticated by design
+— so at a printed level an unauthenticated sender would choose both the rate
+and the size of lines in your log. Every grpc-rendered message is clipped into
+the record whatever the level, for the same reason. `-log-level=debug` shows
+the whole class, including the `addrConn.createTransport failed to connect`
+line that says why nothing reaches the collector.
+
+```
+time=2026-08-29T11:23:14.731+02:00 level=INFO msg="effective listeners" listen=:8081 metricsListen=:9090 pprofListen=""
+```
+
+**Upgrade note:** the flag is *gone*, not ignored. Go's `flag` package uses
+`ExitOnError`, so a leftover `-log-format=json` in `agent.extraArgs`,
+`service.extraArgs` or a hand-edited manifest is
+`flag provided but not defined: -log-format` and exit 2 — a CrashLoop on
+exactly the deployments most likely to have set it. Grep your values files
+before upgrading. The shipped chart and `deploy/` manifests no longer pass it.
+
+### Levels
+
+`-log-level` takes `debug`, `info`, `warn` or `error` (default `info`) on both
+binaries. The levels mean specific things, and the meanings are what make the
+default safe to run:
+
+| Level | Means | Steady state |
+|---|---|---|
+| `error` | a pipeline is dead or data was lost, and a human must act | silent |
+| `warn` | something unexpected that the code HANDLED — a fallback, a refusal, a truncation, a drop, a retry that eventually succeeded | silent |
+| `info` | lifecycle an operator wants without asking: startup, effective configuration, listeners, readiness, leadership, shutdown | **quiet** — a few lines at startup and then nothing |
+| `debug` | the per-object decisions that answer "why did it do THAT?": which file was skipped and why, which target was dropped by a hook, which cadvisor row could not be attributed, which attribute a template omitted | one line per object per cycle |
+
+`info` staying quiet in steady state is a property, not an accident: every
+condition that can PERSIST is throttled (see below), so a healthy agent
+produces no log volume at all after startup. That is what makes a nonzero rate
+of `level=WARN` a usable alerting signal on its own.
+
+**Raising the level in production.** `debug` is per-object and per-cycle, so on
+a busy node it is genuinely loud — a line per tracked log file per discovery
+pass, a line per unresolved cadvisor row per scrape. It is safe (the hot paths
+carry no per-item logging at any level; see below), but budget for the volume:
+raise it on ONE pod, not the fleet. On the agent the level is a flag, so
+raising it is a restart — `kubectl -n <ns> set env` will not do it. Two
+alternatives that need no restart at all and usually answer the question
+faster:
+
+* the **debug endpoints** — `GET /debug` on either binary indexes what that
+  process serves; `/v1/explain/{namespace}/{pod}` answers "why is this pod (not)
+  scraped?" against the same code path that derives the targets;
+  `/debug/tailer` and `/debug/targets` are the agent's per-file and per-target
+  state; `/debug/otlp` streams what the agent is actually exporting.
+* the **metrics** — most of what `debug` explains has a counter with a `reason`
+  or `outcome` label carrying the same classification, and the counter is
+  fleet-wide where the log line is one pod's.
+
+### Reading the output
+
+It is logfmt, so `key=value` pairs with Go-style quoting for values containing
+spaces, `=` or quotes. Anything that reads logfmt reads it:
+[`logfmt`](https://github.com/JohanLindvall/logfmt) (this repo's own parser —
+the format guarantee is a round-trip test against it, not an assumption),
+`lnav`, Grafana Loki's `| logfmt` stage, Vector's `parse_logfmt`, or
+`hcat`/`humanlog` for reading it by eye. In a pinch, `grep` works, which is the
+point of the vocabulary below.
+
+Values round-trip exactly — spaces, `=`, embedded and escaped quotes,
+newlines, backslashes, Windows paths, durations, empty strings, `<nil>`,
+non-ASCII. KEYS are sanitized before they are written (an unsafe byte becomes
+`_`), because a key holding a space or `=` would be quoted and then re-read as
+two wrong pairs, silently. The one known non-round-trip is a control byte other
+than `\n`/`\r`/`\t` inside a value, which is written as Go's `\x00` — byte for
+byte what the reference logfmt encoder writes, and pinned by test as a known
+property of the format.
+
+### The key vocabulary
+
+A logfmt line is only greppable if the same concept is spelled the same way
+everywhere: `error=` must find every failure and `path=` every file. The
+authoritative list is the package documentation of `internal/cli`; new log
+calls take a key from it rather than inventing a synonym beside one. What an
+operator needs to know is what to grep for:
+
+| Key | Carries | Never spelled |
+|---|---|---|
+| `error` | the error | `err`, `cause`, `msg` |
+| `path` / `dir` | a filesystem path / a directory | `file` |
+| `url` / `endpoint` / `addr` | a URL requested / a configured destination / a LISTEN address of this process | |
+| `namespace` / `pod` / `node` / `container` / `uid` / `id` | Kubernetes identity (`namespace` travels beside `pod`, never inside it) | `ns`, `podName` |
+| `target` / `monitor` / `kind` | a scrape target / a ServiceMonitor or PodMonitor as `namespace/name` / the object kind, matching the metric label | |
+| `signal` / `pipeline` / `route` / `unit` | `logs`/`metrics`/`traces` / a kubescrape pipeline name / a routing route / a systemd unit | |
+| `reason` / `outcome` | a classification that **matches the metric label of the same name**, so a log line and a counter can be joined by eye | |
+| `flag` / `note` | the flag an operator would change, spelled with its dash / a remediation hint | |
+| `interval` / `timeout` / `backoff` / `wait` / `grace` / `budget` | durations, rendered as `15s` / `1m0s`, never as a bare number | |
+| `attempts` / `bytes` / plural count nouns | quantities (`records`, `targets`, `entries`, `dropped`, …) | |
+| `version` / `built` / `hash` | build identity / a content hash | |
+| `tokenFile` / `key` | the PATH a credential is read from / a config or secret KEY NAME | |
+
+Keys are lowercase single words where possible and lowerCamelCase for
+multiword, never snake_case. `reason` and `outcome` matching the metric label
+is the load-bearing one: `kubescrape_scrape_failures_total{reason}` and the
+`scrape failed … reason=tls` line classify identically by construction, so the
+counter tells you the rate and the line tells you which URL.
+
+### What is deliberately NOT logged
+
+* **Secrets.** No bearer tokens, passwords, connection strings, `Authorization`
+  headers, secret VALUES or full request/response bodies — ever, at any level.
+  What is logged instead is the REFERENCE: `tokenFile=` is a path,
+  `key=` is a key name, a secret ref appears as `namespace/name/key`. A first
+  live run is exactly when a leaked token reaches a log aggregator and stays
+  there, so this is a boundary rather than a preference.
+* **Per-item lines on the hot paths.** The tailer's per-line and per-flush
+  path, the Prometheus parser's per-sample path, the ingest per-record chain,
+  the per-span service-graph and span-metrics paths, log-metrics observation,
+  scrubbing's no-match path and the tail sampler's decision path are all
+  allocation-pinned by build-failing tests (`TestXxxAllocationBudget`), and a
+  log call on any of them would be several times the entire per-item budget.
+  What those paths produce instead is a **counter** — plus, at most, one
+  throttled aggregate line from the sweep or flush that owns them ("N lines
+  dropped in the last minute"), never one line per item.
+* **The same condition, over and over.** A condition that PERSISTS — a target
+  that keeps failing, a file that cannot be attributed, a monitor field that
+  cannot be honoured — is noticed once per object per cycle per node, so an
+  unthrottled line is a flood proportional to fleet size. Those go through
+  `internal/logdedupe`, which is why a five-minute outage produces a first
+  Error, a re-statement each minute carrying `failures=` and `outage=`, and one
+  recovery Info — rather than one line every two seconds ending in a silence
+  indistinguishable from a stopped pipeline. **The corollary for tooling:** a
+  log-based assertion about a repeating condition must not use a fixed short
+  window, because a legitimately throttled line can be absent from it while the
+  condition is still true.
+
+### What a healthy start looks like
+
+Both binaries describe themselves at startup: a build-identity line, then five
+`effective …` lines naming every pipeline, destination, listener, identity and
+cap that this process will actually use. Credentials appear only as the paths
+they are read from. This is real output from `kubescrape-agent -check-config`,
+which emits the SAME lines from the SAME function as a real start — so a dry
+run and a rollout cannot describe different agents:
+
+```
+level=INFO msg="kubescrape-agent starting" version=v1.2.3 built=2026-08-19T01:10:59Z optionalPipelines=journald,azure,events
+level=INFO msg="effective configuration" role=node-agent sections=logs,logMetrics optionalPipelines=journald,azure,events pipelines="logs=on metrics=on cadvisor=on cgroupStats=off node=on summary=off journald=off ingest=off events=off azure=off serviceGraph=off" positionsFile=/var/lib/kubescrape/positions.json transformsFile="" enrich=true selfAttributes=true logLevel=info
+level=INFO msg="effective destinations" metadataEndpoint=http://kubescrape.monitoring otlpEndpoint=otel-collector.monitoring:4317 otlpProtocol=grpc otlpCompression=gzip otlpInsecure=true otlpTLSSkipVerify=false otlpCAFile="" otlpBearerTokenFile="" kubeletEndpoint=https://10.0.0.5:10250 bufferDir="" bufferMaxBytes=1073741824
+level=INFO msg="effective listeners" listen=:8081 metricsListen=:9090 pprofListen=""
+level=INFO msg="effective identity" node=node-1 namespace=monitoring serviceName=kubescrape-agent instance=node-1 selfAttributesRefresh=1m0s selfMetricsInterval=1m0s
+level=INFO msg="effective limits" scrapeInterval=30s scrapeTimeout=15s scrapeConcurrency=4 metadataWait=5s logsExcludeNamespaces=monitoring logsUnknownFiles=auto logsBatchSize=1024 logsFlushInterval=2s logsMaxEntryBytes=1048576 logsRateLimit=0 logsMetricsInterval=30s
+```
+
+`optionalPipelines` is the one that catches a build surprise: a bare
+`go build` produces an agent with NEITHER optional pipeline, and
+`-journald`/`-azure-diagnostics` on such a binary is a startup error naming
+the tag and the rebuild rather than a flag that silently does nothing.
+
+The metadata service emits the same five messages with its own keys
+(`apiServer`, `kubeconfig`, `servicemonitors`, `monitorNamespaces`,
+`waitTimeout`, `cacheTTL`, …), followed by `informer caches synced` with the
+pod and container counts. Warnings on this path are worth reading rather than
+scrolling past — they are the legal-but-surprising combinations, and each one
+names the flag to change:
+
+```
+level=WARN msg="-kubelet-endpoint is empty, so the kubelet scrapes that depend on it are never scheduled: -cadvisor, -node-metrics. Nothing is attempted and nothing fails — no scrape counter moves and no error is logged — so the only symptom is the missing metrics. Set -kubelet-endpoint=https://$(NODE_IP):10250 (the shipped manifests and the chart do), or turn those flags off so the startup log describes what is actually collected."
+```
+
+### When a rollout will not advance
+
+Both binaries publish `kubescrape_readiness_gate{gate}` — 1 when that startup
+gate is satisfied, 0 while it is pending — and both warn after a 30-second
+grace naming the gates still pending, re-warning every two minutes:
+
+```
+level=WARN msg="not ready: /readyz is 503, so a rolling update will not advance past this pod" gates=metadata-service waited=30s
+level=WARN msg="not ready: informer caches have not synced, so /readyz is 503 and this replica has no Service endpoints" caches=pods,services waited=30s note="a cache that never syncs is usually a missing RBAC rule for that resource; the reflector retries it forever"
+```
+
+The metric exists because the probe body only reaches whoever can curl the pod,
+and a replica stuck unready has no Service endpoints — i.e. nobody can. The
+self-metrics push runs from startup regardless of readiness, so an unready
+process still reports it. The agent's gates are the pipelines it actually
+wired (`metadata-service`, `otlp-ingest`, `service-graph-receiver`,
+`service-graph-ingest`, `azure-eventhub…`); the service's are one per informer
+cache (`pods`, `services`, `replicasets`, `deployments`, `statefulsets`,
+`daemonsets`, `jobs`, `cronjobs`, `namespaces`, `nodes`, plus
+`servicemonitor`/`podmonitor` when watched). An ABSENT gate means that
+pipeline is off, never that it is healthy.
+
+## Accepted security residuals
+
+An adversarial review of this repo's own security work found four things that
+were argued about and **left in place**. They are written here, in the document
+an operator reads, rather than only in the comment at the code that leaves
+them — a residual nobody can find is indistinguishable from one nobody thought
+about. Each says what it is, why the obvious closure was rejected, and what
+lever you actually have.
+
+**1. A stolen `container.id` still crosses a tenancy boundary, and no counter
+moves when it does.** The application-facing OTLP ingest listeners (the
+DaemonSet's `-ingest` ports and the trace tier's application ports) strip the
+Kubernetes identity keys a sender declares *about itself* at first receipt, so
+a pod cannot simply push `k8s.namespace.name: payments` and have
+[routing](#agent-routing) — which keys tenancy on exactly that attribute —
+deliver its records to the payments endpoint and `X-Scope-OrgID`. What the
+strip cannot remove are the **lookup keys** (`-ingest-container-id-keys`,
+`-ingest-pod-uid-keys`), because stripping what the attribution is *made of*
+turns the receiver into one that resolves nothing. So the crossing survives one
+hop over: the metadata service's `/v1/pods/{namespace}/{name}` is
+unauthenticated by design and returns each container's id and the pod UID, and
+the store's container index is cluster-wide rather than node-scoped, so a pod
+that can reach both services reads a victim's `container.id`, pushes it while
+declaring no namespace of its own, and the enricher **derives** the victim's
+namespace — correctly, from a stolen input. Nothing is forged on the wire, so
+`kubescrape_ingest_identity_stripped_total` does not move either.
+
+It is documented rather than closed because the obvious closure fails on both
+axes. Refusing to enrich an object resolved on another *node* would cost
+legitimate attribution — the datapoint/split path exists precisely so a sender
+can describe objects across the cluster, the trace tier receives from every node
+by design, and a DaemonSet receiver behind a Service round-robins away from the
+sender's own node — and it would not even close the hole, a co-located victim
+being the common case on a cluster that spreads namespaces across nodes.
+Narrowing the victim set while silently un-attributing honest senders is the
+worse bargain. **What actually closes it** is a credential on one of the two
+doors — the ingest listener, or the metadata routes that hand out the id — and
+kubescrape has neither on offer: the application-facing receivers are
+unauthenticated by design (every instrumented pod is a sender), and of the `/v1`
+routes only `/v1/scrape-auth`, which serves Secret material, is
+bearer-authenticated. **What you can do
+now**: scope the receivers with a NetworkPolicy (`agent.ingest.allowFrom`,
+`serviceGraph.ingest.allowFrom` — both empty by default, which means *any pod
+may push*), and treat `routing`'s per-tenant endpoints as a convenience rather
+than an isolation boundary. If tenants must not be able to write into each
+other's streams, the split has to happen at a collector that authenticates its
+senders.
+
+**2. grpc-go's own warnings are peer-driven, which is why they are at `debug`.**
+Routing grpc-go's logger into the process logger (which is what makes every line
+logfmt) has to choose a level for grpc's `Warning` class, and part of that class
+is transport-level and therefore driven by the *peer*: `Failed to decode
+metadata header (%q, %q)` renders a header's **name and value verbatim** for any
+header any client sends, before any application code runs, and
+`Encountered http2.StreamError` is likewise one line per broken stream. Against
+an unauthenticated ingest listener at a printed level, the sender would choose
+both the *rate* (one line per attempt, with no honest throttle available — grpc
+hands over an already-rendered string, so a `logdedupe` key would be the peer's
+bytes and one shared gate would let header warnings suppress the collector line)
+and the *size* of records in your log — grpc-go's default header list size is 16
+MiB, which every kubescrape gRPC receiver now lowers to 64 KiB as a *receive*
+bound, far above any real OTLP header set and far below a log flood — and a
+`-bin` header that fails to decode is printed whatever it holds. So
+the class maps to `debug`, which costs nothing relative to grpc's own default —
+that logger sends only its `Error` class to stderr and discards `Warning`
+entirely unless `GRPC_GO_LOG_SEVERITY_LEVEL` says otherwise — and every
+grpc-rendered message is clipped into the record at every level, so the stream
+stays a stream. **What this leaves**: the connection-failure line
+(`addrConn.createTransport failed to connect to …`) is one `-log-level=debug`
+away rather than on by default, and at that level a peer can still drive volume
+(clipped, and only while an operator has deliberately turned it on). The
+NetworkPolicies above (`agent.ingest.allowFrom`, `serviceGraph.ingest.allowFrom`
+— both empty by default, which means *any pod may push*) are what remove the
+peers entirely.
+
+**3. The chart's `values.schema.json` cannot express a CONDITIONAL requirement,
+and has no generator behind it.** Unlike
+[agent-config.schema.json](agent-config.schema.json), which is generated from
+the structs the file decodes into, the chart's schema is hand-maintained. What
+it does catch is real — `additionalProperties: false` turns a typo'd value into
+a refused render, and a key added to `values.yaml` but not to the schema fails
+the chart's own default render, which `internal/chartcheck` runs. What has no
+generator behind it is the schema's *content*: the types, the enums and — the
+part that matters here — anything CONDITIONAL. Two consequences, both real:
+
+* *Conditional requirements live in the templates instead.*
+  `serviceGraph.enabled: true` requires `serviceGraph.tokenSecret.name` — the
+  binary refuses to start without `-service-graph-token-file`, so a chart that
+  rendered anyway shipped a StatefulSet that CrashLoopBackOff'd on every shard
+  with the reason visible only in a pod log. That one is now a template
+  `fail()`, which also protects subchart use, where a parent's schema does not
+  apply. It is *not* in the schema, because that is not a shape the schema
+  expresses today.
+* *An unguarded one is still there.* `seccompProfile.type: Localhost` is
+  accepted by the schema's enum and rendered verbatim, but Kubernetes requires
+  `localhostProfile` alongside it — so that combination renders a pod the API
+  server rejects. Set both, or leave the default `RuntimeDefault`.
+
+The rule for anyone editing the chart: **a new value must be added in two
+places**, `values.yaml` and `values.schema.json`. Forgetting the second is at
+least loud — every render becomes `additional properties … not allowed`, and
+`internal/chartcheck` fails — but a value whose declared TYPE is wrong or merely
+loose is caught by nothing until a cluster rejects the object.
+
+**4. The container base images float.** Both `Dockerfile` and
+`Dockerfile.static` build `FROM golang:1.26-bookworm`, and the runtime is
+`gcr.io/distroless/base-debian12` (`static-debian12` for the static image) —
+tags, not digests. The **Go** half of the supply chain is nailed down anyway by
+`go.mod`'s `go 1.26.6` (see [Toolchain and build floor](#toolchain-and-build-floor)):
+an older toolchain either upgrades itself or refuses to build. The half that
+floats is everything else, and it is not only the runtime base: the default
+(journald) image COPIES `libsystemd` plus its six transitive `.so` files out of
+the **build** stage, so a cached or mirrored `golang:1.26-bookworm` layer puts
+that library into a shipped image whose Go binary is current, while glibc and
+the CA bundle come from the equally floating distroless base. Two builds of the
+same commit are therefore not guaranteed to produce the same image. Pin the bases by digest in your own build
+if reproducibility or base-layer CVE tracking matters to you; `make image` is
+deliberately a developer convenience, not a release pipeline.
+
+**A fifth, smaller one is documented at its flag rather than here**: with
+`-debug-token-file` set, the `/debug/otlp/ui` page cannot present the token from
+its own `fetch`, so the UI is reachable through a port-forward or a
+header-adding proxy but not by pasting a token into the page. A token is
+deliberately **not** accepted as a query parameter — that writes a credential
+into every access log between the browser and the pod.
+
 
 ## Metadata service
 
 ```sh
-kubescrape -listen :8080 -wait-timeout 5s -cache-ttl 5m -log-format json
+kubescrape -listen :8080 -wait-timeout 5s -cache-ttl 5m -log-level debug
 ```
 
 | Flag | Default | Description |
@@ -143,8 +607,8 @@ kubescrape -listen :8080 -wait-timeout 5s -cache-ttl 5m -log-format json
 | `-self-attributes` | `true` | add THIS pod's Kubernetes resource attributes (namespace, pod, uid, owners, labels) to those exported metrics. No API traffic and no manifest wiring: the service reads its own store, its pod name is the hostname and its namespace comes from `$POD_NAMESPACE` or the ServiceAccount projection it already mounts. Re-read once a minute (a bare in-process store lookup), so a pod or namespace relabelled after startup is picked up. Fill-if-absent — `service.name` stays `kubescrape` and `service.instance.id` stays the hostname, but `service.namespace` becomes the pod's namespace, so the job reads `<namespace>/kubescrape`. A process that is not a pod of that name simply gets none, reported by `kubescrape_self_metadata_resolved`. The agent has the same flag (resolved differently — see its section) |
 | `-otlp-*` | as the agent | used by the self-metrics push: `-otlp-endpoint`, `-otlp-protocol`, `-otlp-compression`, `-otlp-compression-level`, `-otlp-insecure`, `-otlp-tls-ca-file`, `-otlp-tls-insecure-skip-verify`, `-otlp-bearer-token-file`, `-otlp-timeout` |
 | `-otlp-header` | — | static `key=value` header sent on every self-metrics export (HTTP header / gRPC metadata, e.g. `X-Scope-OrgID=tenant`); repeatable — repeatable rather than comma-separated so a value may contain commas |
-| `-log-level` | `info` | `debug`, `info`, `warn`, `error` |
-| `-log-format` | `text` | `text` or `json` (client-go's klog is routed through the same handler) |
+| `-check-config` | `false` | validate the flags, print the same startup summary a real start prints, and exit — nothing acquired: no listeners, no informers, no API-server traffic (CI / pre-rollout). The agent has had this since it grew a config file; the SERVICE half of an install was the one that could not be checked before it was rolled out, which is backwards — it is the singleton every agent in the fleet blocks on. `validateConfig` is ONE function that a real start calls too, so a dry run cannot pass a config the process then CrashLoops on. It refuses what is otherwise **silent at runtime**: a `-monitor-namespaces` entry that is a glob or not a namespace name (that flag is an EXACT list, unlike the agent's namespace globs, so such an entry indexes no monitor and says nothing), an empty `-listen` (net/http reads an empty address as `:http`, so the API binds port 80 while every probe, Service and agent addresses the configured port), an unparseable or duplicated listener address, a negative `-resync`/`-apiserver-probe-interval`/`-wait-timeout`/`-cache-ttl`/`-metadata-cache-ttl`, and `-scrape-auth-secrets` without `-scrape-auth-token-file`. It deliberately does NOT judge the ENVIRONMENT — whether the token file is readable and whether an API server answers are both false on the laptop a pre-flight runs from, and both are already fatal at a real start; off-cluster it prints `apiServer=(unresolved)` and still reaches its verdict. Pass it the flags you intend to deploy with, since the check is over those flags. It is a CLI dry run: never render it into a manifest or values file, where it would make the Deployment exit 0 immediately |
+| `-log-level` | `info` | `debug`, `info`, `warn`, `error`. The output format is **logfmt, always** — there is no format flag, so one parser reads every line of every component (client-go's klog is routed through the same handler) |
 
 The service's own metrics (store sizes, HTTP requests per pattern/status)
 are pushed over OTLP on `-self-metrics-interval` (default
@@ -161,6 +625,19 @@ delivery modality, so the same series never ship over both paths.
 default) serves `net/http/pprof` on a third port; profiles expose goroutine
 stacks and heap contents, so it is separate from both.
 
+`kubescrape_self_metrics_points_skipped_total` guards exactly that path: it
+counts data points of this process's own metrics left out of the exposition
+because their stored label set failed to parse back. It should never move —
+these label sets come from code, not from data — and it exists because of where
+the loss would land: a skipped point is simply ABSENT from the response an
+operator is reading to diagnose everything else, so without the counter their
+own telemetry would shrink invisibly. It covers the SCRAPE path only; the OTLP
+push reads the same stored string but degrades the other way (it emits the point
+with whatever labels parsed), so a nonzero value means the pushed copy of that
+series is MISLABELLED rather than missing. Any nonzero value is a bug in the
+label round-trip; a throttled warning beside it names the metric. Both binaries
+publish it.
+
 RBAC (cluster-wide `get`/`list`/`watch`): `pods`, `services`, `namespaces`,
 `nodes`, `replicasets.apps`, `deployments.apps`, `statefulsets.apps`,
 `daemonsets.apps`, `jobs.batch`,
@@ -170,12 +647,68 @@ RBAC (cluster-wide `get`/`list`/`watch`): `pods`, `services`, `namespaces`,
 manifests — enable deliberately) — see
 [deploy/kubernetes.yaml](../deploy/kubernetes.yaml).
 
+Five counters make the service's own quiet failures visible; all five are the
+kind that used to be diagnosable only from a client's symptoms, minutes later
+and somewhere else:
+
+* `kubescrape_container_lookup_timeouts_total` — a blocking lookup whose wait
+  budget expired without the container ID appearing. A low rate is normal (the
+  wait exists to cover the ~1s gap between a container starting and the kubelet
+  posting its ID, and a rotated file's ID may never come back); a SUSTAINED rate
+  means this replica's pod informer is not seeing the pods whose logs the agents
+  are shipping. Read it beside `kubescrape_apiserver_reachable` and the pod
+  informer's RBAC. Requests that never blocked (`?wait=0`) are not counted.
+* `kubescrape_self_lookups_refused_total{reason}` — the `/v1/self` 404s split
+  by cause: `no_pod` (the connection's source address owns no live pod —
+  EXPECTED and permanent under hostNetwork and behind SNAT, where the by-name
+  fallback takes over), `forwarded` (the request carried
+  `Forwarded`/`X-Forwarded-For`/`X-Real-Ip`, so the connection's address is no
+  longer evidence about the caller and the route refuses rather than guessing)
+  and `unparseable_peer` (should not happen; warned).
+* `kubescrape_index_name_reuse_total{kind}` — an object arrived under a
+  namespace/name a DIFFERENT, still-live UID held. The guard keeps served data
+  correct, but reaching it means a Delete was never delivered — a relist gap.
+  Read beside `kubescrape_informer_watch_errors_total`.
+* `kubescrape_pod_ip_contested_total` — the live/live pod-IP recycle race. The
+  index keeps the later acquisition, which is right; this counts the window in
+  which it could have been wrong. The cost lands on the agent's opt-in
+  `-ingest-peer-ip-fallback`, where a resource stamped with the previous
+  holder's identity is never revisited.
+* `kubescrape_owner_resolve_failures_total{kind,reason}` — an owner-chain or
+  namespace/node metadata read that did not yield the object. `internal/owners`
+  had no signal at all until this existed, and the degradation it covers is
+  invisible by construction: a failed read returns the bare owner reference, so
+  the response is well-formed, nothing 500s, and only `service.name` quietly
+  becomes the POD NAME instead of the workload's — changing half the Prometheus
+  job of every series the fleet exports for that workload. **Read the reasons,
+  not the total.** `not_found` is the only one that is ever normal (a pod
+  tombstone outliving its deleted owner, a cache still filling), so a low steady
+  rate is expected and a sustained one means the informer is not seeing objects
+  the pods reference — read it beside `kubescrape_informer_watch_errors_total`
+  and the ClusterRole. `lister_error` is the RBAC-shaped case and the one to
+  alert on; `no_informer` and `wrong_type` are wiring bugs; `bad_api_version`
+  and `uid_mismatch` are per-object oddities costing that one pod its owner's
+  labels. All but `not_found` also carry a throttled warning naming the object.
+
+And every refusal on `/v1/scrape-auth` now names its cause in
+`kubescrape_scrape_auth_failures_total{reason}`: `not_found`, `upstream`,
+`not_utf8`, plus `disabled` (this service does not run `-scrape-auth-secrets`),
+`no_monitors` (`-servicemonitors` is off, so nothing can be allowlisted),
+`unauthorized` (what a `-scrape-auth-token-file` mismatch between the agents and
+this service looks like), `not_allowed` (the ref is not referenced by any
+INDEXED monitor endpoint — the monitor failed to parse, was refused by
+`-monitor-namespaces`, or the ref is a typo) and `bad_request`. Each logs once
+per ref, or once per process for the flag-level ones, and never the token.
+Every one of them becomes `up=0` on a target whose agent sees only a status
+code.
+
 ## Agent: general
 
 | Flag | Default | Description |
 |---|---|---|
 | `-node-name` | `$NODE_NAME` | the node this agent runs on (set via the downward API) |
-| `-listen` | `:8081` | serves `/debug` (homepage linking the debug surfaces), `/healthz`, `/readyz`, `/debug/tailer` (per-file positions/lag, malformed pod annotations), `/debug/targets` (per-target last outcomes, failures first), `/debug/transforms` (active transform program hash), `/debug/otlp` (live stream of exported OTLP as JSON lines; `signal`/`attr`/`sample` query params, UI at `/debug/otlp/ui`); empty disables. NOT `/metrics` — the Prometheus endpoint lives on its own `-metrics-listen` port |
+| `-listen` | `:8081` | serves `/debug` (homepage linking the debug surfaces), `/healthz`, `/readyz`, `/debug/tailer` (per-file positions/lag, malformed pod annotations), `/debug/targets` (per-target last outcomes, failures first), `/debug/transforms` (active transform program hash), `/debug/otlp` (live stream of exported OTLP as JSON lines; `signal`/`attr`/`sample` query params — `attr` is capped at 16 ANDed globs per stream and 512 bytes per glob, since every filter is walked against every resource of every export on the exporting goroutine and a glob's cost is linear in its length — UI at `/debug/otlp/ui`); empty disables. NOT `/metrics` — the Prometheus endpoint lives on its own `-metrics-listen` port |
+| `-debug-token-file` | — | file with a shared bearer token gating the **data-bearing** debug surfaces on `-listen`: `/debug/otlp`, `/debug/otlp/ui` and `/debug/tailer`. Those three stream (or enumerate) everything this process exports — on the DaemonSet that is every container log line on the node, from every namespace scheduled there, selectable by resource-attribute glob — and the port is reachable from every pod in the cluster, so they are **not** open. **Without this flag they are served only to a LOCAL connection**: `kubectl port-forward` (the kubelet dials `127.0.0.1` inside the pod, so port-forward *is* the loopback address, and reaching it already requires `pods/portforward` on the namespace), a container in the agent's own pod, or — on an agent deliberately put on `hostNetwork` — the node itself. Set the flag to read them from anywhere else with `Authorization: Bearer <token>`; it is re-read periodically with the previous value accepted for a grace window, exactly like `-scrape-auth-token-file`, so rotating the Secret needs no restart. A local connection must **also** carry a loopback `Host` header (`localhost`, `127.0.0.1`, `::1`, or none at all): every client that dialled the port directly sends one, and a page in a browser whose DNS name has been rebound to `127.0.0.1` — the classic attack on a local debug UI, which reaches an operator's own `kubectl port-forward` and, being same-origin, can read the answer — keeps sending its own name. A refusal names the flag and counts `kubescrape_debug_refused_total{reason}` (`no_token`, `unauthenticated`, `forwarded`, `host`). `/healthz`, `/readyz`, `/debug`, `/debug/targets` and `/debug/transforms` are never gated: probes must answer, and target/transform state is what the metadata service's `/v1` routes already serve unauthenticated. Residual: the `/debug/otlp/ui` page cannot present a token from its own `fetch`, so with a token configured the UI is reachable through port-forward or a header-adding proxy — a token is deliberately NOT accepted in a query parameter, which would write a credential into every access log |
 | `-self-metrics-interval` | `1m` | export the agent's own metrics over OTLP at this interval (0 disables); both binaries have this flag |
 | `-metadata-endpoint` | `http://kubescrape.monitoring` | base URL of the metadata service |
 | `-metadata-wait` | `5s` | server-side wait for not-yet-known containers (covers the gap between container start and the kubelet posting its status) |
@@ -184,7 +717,7 @@ manifests — enable deliberately) — see
 | `-self-attributes-refresh` | `1m` | how often `-self-attributes` re-reads this pod's own metadata, so a pod or namespace **relabelled after startup** reaches the metrics that stamp it. The poll is nearly free: `/v1/self` answers with `private, max-age=<-metadata-cache-ttl>` + `ETag`, so a fresh entry is served from the client's own cache and a stale one revalidates with `If-None-Match` — a 304 whenever nothing changed. (`private` is what makes caching a caller-dependent response safe: one client belongs to one process, which is the pod the answer describes; shared caches are told not to store it.) Retries before the first success start at 5s and back off to this. `0` disables the lookup entirely (and with it the `kubescrape_self_metadata_resolved` gauge, which is published exactly when the lookup runs — so a `0` reading always means unresolved, never "switched off"). The agent's own metrics bypass the namespace router regardless of this setting: they keep the durable default chain rather than following a route glob that happens to cover the agent's namespace |
 | `-check-config` | `false` | compile every config section plus the flags, print a summary and exit — nothing acquired (CI / pre-rollout). Flag **values** are checked too: one you passed that the process cannot honour — a non-positive `-scrape-timeout`, a `-logs-rate-burst` below one whole token — is an error naming the flag, the value and a usable one, rather than a value quietly replaced by a working default on a fleet you are already rolling out to. Only what you passed: an untouched flag is always its default |
 | `-test-config` | — | run the YAML test cases in this file through the compiled log pipeline (scrub → logAttributes → enrich → logMetrics → `logs.rules` → transforms) and exit non-zero on failure; like `-check-config`, nothing is acquired. See the README's "Config unit tests" for the file shape |
-| `-log-level` / `-log-format` | `info` / `text` | as for the service |
+| `-log-level` | `info` | as for the service (logfmt output, always) |
 
 Pipeline toggles (all default `true` except the opt-in `-journald`,
 `-ingest`, `-events` and `-azure-diagnostics`):
@@ -215,6 +748,35 @@ Pipeline toggles (all default `true` except the opt-in `-journald`,
 | `-otlp-retry-attempts` | `3` | tries per **metrics** export (logs retry via the tailer's rewind, see below) |
 | `-otlp-retry-backoff` | `1s` | initial backoff, doubled per attempt |
 | `-otlp-max-send-bytes` | `0` (≈3.75 MiB) | cap on one payload's encoded protobuf size; a larger payload is split into parts each within the cap before sending, so a non-chunking producer (journald, tailer) never gets a batch rejected wholesale for exceeding the collector's gRPC receive limit. Lower it if the collector's `max_recv_msg_size` is below 4 MiB; negative disables splitting |
+
+Every wire send is counted `kubescrape_export_requests_total{signal,outcome}`
+and narrated once per TRANSITION rather than once per attempt: a Warn when the
+destination goes bad (naming the endpoint, the class and the likeliest cause),
+a re-warn every 5 minutes while it stays bad, an immediate re-warn if the class
+CHANGES (a 401 becoming a connection refusal is a different incident), and one
+Info when it recovers. An over-cap payload's extra parts count
+`kubescrape_export_split_parts_total{signal}` — each is its own round trip,
+auth build and gzip pass, so a sustained rate means a producer is batching past
+`-otlp-max-send-bytes`.
+
+Every mounted bearer-token file in either binary — this one, the kubelet's, the
+`/v1/scrape-auth` shared token, the trace tier's internal hop — is re-read on a
+timer and **keeps its last good value on a failed re-read**, by design, so a
+broken Secret projection produces no immediate symptom anywhere.
+`kubescrape_bearer_token_read_errors_total{role}` is therefore the only signal
+it has: `client` is the token this process PRESENTS, `receiver` the set it
+ACCEPTS. The receiver half has no local symptom at all — it surfaces minutes
+later and elsewhere, as a fleet-wide 401 once the clients rotate past it. Alert
+on it sustained past one rotation interval; the counter moves on every failure
+while the log line is throttled, so the rate never depends on the throttle.
+
+**Upgrade note:** `outcome` used to be `ok` or `error`; it is now `ok`,
+`transient` or `permanent`. An alert selecting `outcome="error"` matches
+nothing after this upgrade, silently. Use
+`outcome=~"transient|permanent"` for the old meaning, and prefer
+`outcome="permanent"` for the alert that means telemetry is being LOST — a
+sustained `transient` rate means the destination is down and the payload is
+being retried or spooled, which is a different page at a different hour.
 
 Examples:
 
@@ -373,6 +935,18 @@ state hostPath) so the buffer survives pod restarts. Note that delivered-but-
 not-yet-reclaimed records linger until their whole segment is retired, so
 physical disk use can exceed the backlog cap by up to one segment (8 MiB).
 
+A full spool and a spool that cannot be WRITTEN TO look the same from the
+collector's side and are opposite problems, so they are counted apart and each
+produces a throttled line naming the directory and the filesystem's own error:
+`kubescrape_buffer_full_total` is the cap binding (the collector is behind),
+while `kubescrape_buffer_enqueue_errors_total` climbing with no `_full_total`
+movement means the DISK — ENOSPC on segment preallocation, a latched fsync
+failure, a read-only remount. Those refusals used to return bare, so a full
+disk made a node go dark with every buffer metric flat. Watch
+`kubescrape_buffer_backlog_bytes / kubescrape_buffer_max_bytes` to see a
+degrading collector before anything is lost; every other buffer counter moves
+only once data is already being refused or dropped.
+
 **Traces are not buffered — with one exception.** A forwarded trace is still
 held by the application that pushed it, and its SDK's retry is a better
 durability story than a queue that would ack that sender and remove the only
@@ -445,7 +1019,21 @@ rebuilds the batch, and rebuilding re-runs the per-record chain, which multiplie
 the log-metric and rules counters by the number of retries an outage spanned.
 The attempts are counted `kubescrape_journal_export_failures_total`. The cursor is
 persisted only through `-positions-file` (there is no standalone journald
-cursor file); without it, every start begins at the journal tail.
+cursor file); without it, every start begins at the journal tail — which the
+reader now says out loud at startup (`start=tail` or `start=cursor`), because
+"everything already in the journal is never exported" is correct behaviour that
+reads exactly like a broken pipeline.
+
+Two read-side repairs change the exported record INVISIBLY and are therefore
+counted, `kubescrape_journal_entry_defects_total{defect}`: `invalid_utf8` (the
+journal stores raw bytes, so U+FFFD replacement makes the body differ from what
+the producer wrote) and `no_timestamp` (the entry carried no realtime stamp, so
+the record is dated with the agent's clock at read time). Each carries a
+throttled warning naming the unit. An unknown PRIORITY is deliberately NOT
+counted — it is visible in the record's own severity field. Over-cap messages
+are a separate, already-visible event:
+`kubescrape_journal_truncated_total`, plus `log.truncated` and
+`log.original_length` on the record itself.
 
 ## Agent: Kubernetes events
 
@@ -501,6 +1089,17 @@ container logs, so events and logs line up in one query. Other kinds get
 (the API server's `count`/`lastTimestamp` rollup) arrive as MODIFIED and are
 exported as fresh occurrences. This reader's own node is never stamped on a
 record — the node an event is about is the involved object's property.
+
+A Pod that does **not** resolve — the metadata service could not answer, or a
+pod of that name exists with a different UID — is still exported, under the
+identity the event itself carries, and counted
+`kubescrape_events_unresolved_total{reason}` (`lookup` or `uid_mismatch`) with a
+throttled Warn naming the pod. That is lost **correlation**, not lost data,
+which is exactly why it needs its own counter: correlation is the point of this
+pipeline, the events keep flowing when it fails, and every other counter stays
+green. A sustained rate means the metadata service is not answering; a
+`uid_mismatch` rate means pods are being recreated under the same name faster
+than the events about them are delivered.
 
 **Delivery** is at-least-once, as everywhere else: the position (the watch
 `resourceVersion` plus a timestamp watermark) is persisted only *after* the
@@ -775,6 +1374,28 @@ Per-source options:
   A file already being tailed, or one carrying a stored offset, is **never**
   ignored however stale it looks: dropping it would abandon the bytes it has
   not shipped and re-ingest the whole file if it were appended to again.
+
+**Every discovery-time selection is reported**, which is what turns "logs are
+missing from namespace X" from a guess into a query:
+`kubescrape_log_files_skipped_total{reason}` counts a declined file ONCE per
+file (never once per discovery pass — the decisions are re-taken every ~2s and
+on every fsnotify event), with a Debug line naming the path. The reasons are
+`source_exclude`, `excluded_namespace`, `namespace_not_selected`,
+`unparseable_name`, `too_old`, `non_regular` and `stat_error` — the last being
+a genuine collection failure (an EACCES or EIO on a listed path) rather than a
+selection. A file a LATER source claims is not counted at all, so `namespaces`
+routing stays silent.
+
+Its sibling is `kubescrape_log_files_unresolved`, the one state in the tailer
+where a file is tracked, nothing is read from it, and nothing is lost: its
+container metadata has not resolved yet. It is counted by
+`kubescrape_log_files`, moves no byte counter, and returns to 0 on resolve — so
+any nonzero value is a CURRENT condition. After two minutes the agent warns
+naming the oldest waiting file, re-stating every five minutes. If the sweep ran
+out of its shared resolve budget it did not even ISSUE the lookups, which
+`kubescrape_metadata_requests_total` therefore cannot show:
+`kubescrape_log_metadata_budget_exhausted_total` (once per sweep) is the only
+signal for that.
 
 - `compressed` reads matched files as gzip, decompressing on the fly (files
   ending in `.gz` are detected automatically). Compressed files are treated as
@@ -1278,6 +1899,12 @@ refused by grpc-go before any kubescrape code runs and moves no counter here at
 all — `-ingest-grpc-max-recv-bytes` and the sender's own batch size are the only
 evidence of it.
 
+The counter says a refusal happened; the LINE says which bound and which knob.
+Each of the three names itself on a throttled warning carrying
+`reason=in_flight|buffer_bytes|decoded_bytes` — the same three values, and the
+two flags they point at are `-ingest-max-in-flight` (the count) and
+`-ingest-grpc-max-recv-bytes` (both byte budgets scale from it).
+
 A persistently non-zero `kubescrape_ingest_rejected_total` means the node cannot
 keep up with what is being pushed at it, but there is no single knob for it:
 raising `-ingest-max-in-flight` relieves ONLY the count, and does nothing
@@ -1301,6 +1928,20 @@ is roughly 31 levels of nested attribute structure (an OTLP log body already sit
 5 down, and each further map/array level costs three), an order of magnitude past
 what any SDK emits, and it is also protobuf's own portability limit — a payload
 deeper than that is already undecodable by a conformant consumer.
+
+A push's **header block** is bounded at **64 KiB** on every kubescrape gRPC
+receiver — the ingest listeners, the trace tier's application ports and its
+internal shard port. grpc-go's own server default is 16 MiB, and the block is
+HPACK-decoded before anything kubescrape wrote runs: before the byte-budget tap,
+before the auth tap on the internal hop (the credential arrives *in* the block),
+before the codec's nesting guard. It was therefore both unbounded buffering per
+stream and, since grpc renders a header it cannot decode into its own log line,
+the amplifier the `debug` mapping above discusses. 64 KiB is many times the
+largest header set an OTLP sender writes — a bearer token, a tenant id, the h2
+pseudo-headers — so no legitimate push is refused; a sender past it gets a clean
+protocol-level refusal rather than a stream reset, because grpc-go advertises
+the value in its `SETTINGS` frame and a conformant client checks against it
+before writing.
 
 **A sender's identity claim dies at the door.** The application-facing
 receivers — the DaemonSet's `-ingest` listeners and the trace tier's
@@ -1930,6 +2571,31 @@ longer contains it. Targets derived from monitor endpoints may carry
 metadata service) and keep/drop `metricRelabelings` applied per sample —
 all honored automatically, no agent flags involved.
 
+**When nothing is being scraped**, read `kubescrape_scrape_targets` first: the
+targets this node was handed on the last successful fetch, after the transforms
+file's `targets:` hook. **Absent** means annotation and monitor scraping is off
+(`-metrics=false`); **0** means the metadata service answered and this node has
+no targets — the agent warns naming the node with a remediation hint, re-states
+it every 30 minutes while it stays true, and logs an Info when targets appear.
+It does not count the kubelet pipelines, which are configured rather than
+discovered.
+
+**When everything is `up=0`**, read `kubescrape_scrape_failures_total{reason}`
+before anything else. It is the breakdown of
+`kubescrape_scrapes_total{outcome="error"}` (the two move from the same place
+once per scrape, so their sums agree by construction), and its fourteen
+reasons take completely different remedies — `dns`/`connect`/`tls`/`timeout` mean the
+target was not reached, `unauthorized`/`status` mean it answered and refused,
+`auth`/`relabel` mean the scrape never left this agent, and `export` means the
+target is **innocent** and the collector is refusing the payload. The
+accompanying `scrape failed` Warn carries the URL and, for
+`unauthorized`/`auth`/`proto_refused`/`export`/`tls`, a `note=` naming the
+remedy. [FIRST-RUN.md](FIRST-RUN.md#every-target-is-up0) has the full table.
+
+At `-log-level=debug` the agent additionally answers, per object, "why is this
+cadvisor series unlabelled" and "why does this pod have (or not have) a pause
+resource".
+
 ## Agent: kubelet scrapes
 
 | Flag | Default | Description |
@@ -1962,6 +2628,18 @@ counts the scrape (once per scrape, not per shed object) and a warning naming
 the allowance and the timeout is logged at most once a minute. A sustained rate
 means the metadata service is slow or unreachable and this node's series are
 arriving unjoinable.
+
+The RESULT of that — a resource built without an answer — is
+`kubescrape_cadvisor_unresolved_total{level}` (`container` or `pod`), counted
+once per resource per exported chunk, and `kubescrape_summary_unresolved_total`
+for `/stats/summary`. The rows still export under whatever identity their own
+labels carry, so this costs the owner chain, the pod labels and a real
+`service.name` rather than the measurement. A steady low rate is ordinary — a
+container started seconds ago has no id in the API server yet and resolves on a
+later cycle — while a sustained or fleet-wide rate is the same condition the
+budget counter reports, seen from the other end. At `-log-level=debug` the
+agent names, per object, why a cadvisor row could not be attributed and why a
+pod did or did not get a pause resource.
 
 cadvisor series are split into one OTLP resource per pod/container, keyed by
 the cgroup path in the `id` label: the container ID resolves the exact
@@ -2274,7 +2952,11 @@ traces: |
   run is bounded four ways, so a pathological script errors out
   (`kubescrape_transform_errors_total{signal}`, the batch is not exported
   and the producer's usual retry applies) instead of wedging an export
-  goroutine or killing the process. The bounds are a **step limit**
+  goroutine or killing the process. A batch script that errors also warns
+  throttled, naming the signal and the failing script position
+  (`script=logs.star:7:14`): without it the only line was the producer's own
+  "exporting logs failed", which reads as a collector problem when the
+  collector was never asked. The bounds are a **step limit**
   (10,000,000 instructions, ~130 ms of pure looping), a **wall clock** (2s),
   **per-value caps** (1Mi elements per sequence, 16 MiB per string, 1Mi bits
   per integer) and a **cumulative allocation budget** (128 MiB per
@@ -2305,7 +2987,10 @@ predeclared environment:
   `re.replace(pat, repl, s)` (Go `$1`/`${name}` references). A bad pattern
   is a script error like any other.
 * **`log(msg)`** — a throttled (1/s per script) line into the agent log, for
-  debugging a predicate without flooding the agent's own stream.
+  debugging a predicate without flooding the agent's own stream. The text
+  arrives as `output=` on a `msg="transform script log"` line — it used to be
+  `msg=`, which collided with slog's own key for the record's message — so
+  `grep 'transform script log'` finds every one of them.
 
 ### Extended fields and verbs
 
@@ -2340,7 +3025,8 @@ Beyond the fields above: log records also expose `time_unix_nano` and
 Four more optional sections in the same hot-reloaded file put scripts at
 other decision points. Each defines its own function, and each **fails
 open** — a script error degrades to "the hook did nothing" (counted in
-`kubescrape_transform_errors_total{signal}`, warned throttled), never to
+`kubescrape_transform_errors_total{signal}`, warned throttled, the warning
+naming the failing script position as `script=targets.star:3:9`), never to
 data loss:
 
 ```yaml
@@ -2350,7 +3036,8 @@ ingest: |                  # per pushed RESOURCE, before enrichment
 targets: |                 # per fetched scrape target, once per cycle
   def target(t):           # t.url/.path/.namespace/.pod/.labels/.source/.monitor
       if t.labels["scrape-tier"] == "none":
-          t.drop()
+          t.drop()         # counted in kubescrape_transform_dropped_total{signal="targets"};
+                           # the dropped URL is named at -log-level=debug
 sample: |                  # the tailSampling `type: script` policy body
   def decide(trace):       # True samples, False drops, None abstains
       for s in trace.spans:
@@ -2366,7 +3053,8 @@ The admission hook is the operator's **per-sender policy** on listeners
 nothing authenticates — the honest mitigation for a sender minting resources
 to latch a cardinality cap, which built-in bounds can only slow. The target
 hook is full relabel-power (drop, rewrite `path`) without growing the
-declarative config. The sample policy plugs into the `tailSampling` policy
+declarative config. A dropped target has no other symptom — it is never
+fetched, so no `up` series falls to 0 — which is why the drop is counted. The sample policy plugs into the `tailSampling` policy
 list as `type: script` (refused at config time if this section is missing).
 A later hot reload that REMOVES the section cannot be refused the same way —
 the reload sees only the transforms file, never `tailSampling` — so the
@@ -2377,6 +3065,10 @@ throttled warning names the remedy (restore the section, or drop the
 `type: script` policy).
 The parse hook runs **only** on plain sources that opt in with
 `parseScript: true` — one Starlark call per line on those sources alone.
+Returning anything OTHER than a dict or `None` leaves the line unparsed too,
+but it is a script bug rather than a decision: it counts
+`kubescrape_transform_errors_total{signal="parse"}` and warns throttled,
+naming the type that came back.
 
 ### Deliberate refusals
 
@@ -2471,6 +3163,18 @@ durability; routes are for tenancy/fan-out, not for doubling the durability
 machinery. Routed parts count into
 `kubescrape_routed_payload_parts_total{route,signal}`.
 
+`kubescrape_routed_failures_total{route,signal}` is the missing half of that:
+parts a destination REFUSED. Without it a route that never worked was
+indistinguishable from a route nothing matched, and those need opposite
+responses. A route outage produces TWO throttled lines — the client's, naming
+the endpoint and the likeliest remedy, and the router's, naming the route —
+because the two layers know different halves of the identity. A third counter,
+`kubescrape_routed_unknown_total`, catches a transform script calling
+`route("name")` for a name no route defines: the payload falls back to the
+default chain, so the effect is silent mis-tenanting rather than loss, and the
+route the script asked for rides the throttled log line (the name is
+script-chosen and unbounded, so it must not become a label).
+
 **The agent's own self-metrics and span metrics BYPASS the router** (and the
 `/debug/otlp` tap, which sits beside it) and always go to the default
 (buffered) chain — with or without a `routing` section configured. `-self-attributes` stamps this pod's
@@ -2534,7 +3238,12 @@ resourceAttributes:
 
   # Go templates evaluated per resource against {Node, Pod, Container,
   # Service}. Empty or failing templates (e.g. .Container on a pod-level
-  # resource) omit the attribute.
+  # resource) omit the attribute. A template that FAILS (as opposed to
+  # rendering empty) says so once per template at -log-level=debug, naming
+  # the attribute key and the error; value-independent mistakes are still
+  # refused at startup, so what reaches that line is a template that does
+  # not fit the context it was given. enable/disable likewise report each
+  # key they remove, once per key, at debug.
   attributes:
     team: '{{ index .Pod.Labels "team" }}'
     container.image: '{{ with .Container }}{{ .Image }}{{ end }}'
@@ -2690,6 +3399,170 @@ and `bearerTokenSecret` are honored (tokens are fetched by agents through
 `metricRelabelings` (`action`, `sourceLabels`, `regex`; `__name__` = the
 metric name — the action is matched case-insensitively, so the CRD-legal
 `Keep`/`Drop` spellings work) is applied per sample by the agent.
+
+That chain is **bounded**, in two places, because it is tenant-authored and
+somebody else pays for it: it is copied into every target the monitor
+resolves to (and the whole node's targets are marshalled into one response
+body per agent poll), and the agent walks it per SAMPLE. One endpoint may
+declare 64 rules totalling 8 KiB of regex and source labels, and a single rule
+may spend that whole 8 KiB (the one shape that is legitimately large is a
+metric allowlist written as one `keep` rule with a long alternation); a
+**served target** may carry 128 rules totalling 16 KiB once every monitor that
+resolved to its URL has merged in (chains concatenate, so N monitors on one URL
+would otherwise multiply). The rule-count and chain-byte ceilings keep the
+PREFIX and refuse the rest — the excess filters nothing, which **fails open**
+for the refused tail: a `keep` that does not survive the cut was an allowlist,
+and without it the target exports what the allowlist excluded. A single rule
+that alone exceeds the whole chain budget is the exception and **refuses the
+endpoint** (no targets at all, like the string ceilings below), because it fits
+no chain in any order and honouring the endpoint without it is precisely that
+silent inversion. Neither is
+reachable by an ordinary chain (kube-prometheus-stack's own monitors carry a
+handful of rules; a metric allowlist is normally one keep rule with a long
+alternation). The parse-time refusal is reported through
+`Endpoint.Ignored`/`kubescrape_monitor_fields_ignored_total`, the merge-time
+one through `kubescrape_monitor_relabel_chain_capped_total{kind}`, a
+throttled warning naming the monitor and the URL, and the endpoint's note in
+`GET /v1/explain/{ns}/{pod}` — a refused rule is invisible in the data, since
+the series it would have dropped simply arrive.
+
+A **third** ceiling bounds the merged target's `monitors` list at 32
+contributors, against the cheaper version of the same attack: a contribution
+costs a finer `interval` and nothing else, so N monitors carrying no
+`metricRelabelings` at all — each `selector: {}` with `namespaceSelector.any`
+— can collide on one URL without reaching either chain bound and without adding
+a target for the per-pod ceiling to see (measured: 2,000 of them made a
+one-pod node's targets document 124,793 bytes instead of 2,777). What that
+ceiling refuses is **attribution only** — the endpoint's rules, cadence and
+auth have already merged, so the scrape is unchanged and a monitor simply stops
+being *named* — which is also why it needs
+`kubescrape_monitor_contributors_capped_total{kind}` and a throttled warning
+keyed by the URL: no consumer of the served document could otherwise tell.
+`GET /v1/explain/{ns}/{pod}` gives the per-monitor answer. Real collisions are
+two or three monitors; if this ever binds, reconcile the CRs.
+
+A **fourth** ceiling holds the endpoint's own STRINGS — `path`,
+`interval`/`scrapeTimeout`, `tlsConfig.serverName`, `authorization.type` and
+the rendered `basicAuth`/`authorization`/`bearerTokenSecret`/`tlsConfig`
+secret references — to a few hundred bytes each (a scrape path to 2 KiB),
+because every one of them is copied into every target the endpoint resolves
+to exactly as the relabel chain is: one endpoint with a 1 MiB `path` and no
+`metricRelabelings` at all yields ONE target of 2,097,625 bytes, once per
+matched pod, in a document re-derived and re-marshalled on every agent poll.
+Like the oversized-single-rule case above and unlike the prefix-keeping
+ceilings, this one **refuses the endpoint** — it yields no targets — rather
+than keeping a prefix: a truncated path scrapes a URL the
+monitor does not name, and a dropped one defaults to `/metrics`, which is
+very often a URL the pod already has a target for, so the endpoint's relabel
+rules and credentials would merge onto somebody else's scrape. The refusal
+rides `Endpoint.Ignored` (hence `kubescrape_monitor_fields_ignored_total` and
+the per-upsert warning) and names the offending fields — never their values —
+in `GET /v1/explain/{ns}/{pod}`. `prometheus.io/path` is held to the same 2
+KiB at the annotation door, with the same refusal and the same explain note.
+The report the ignored-field machinery produces is bounded too (per endpoint,
+and per monitor across endpoints), and the tenant-chosen halves it echoes
+(`metricRelabelings.action=`, `.separator=`) are clipped: a bound on the
+rules a monitor applies is not a bound on the report about the ones it
+refuses.
+
+A **fifth** ceiling is the backstop under all four: one pod's targets may total
+**256 KiB**, whatever they carry. Each of the four above closes one multiplier
+on the node-targets response, and the largest one on that path was never a
+monitor field at all — it is the **pod's own annotations and labels**, which
+every `ScrapeTarget` embeds by value and the document re-marshals once per
+target. Measured with all four fully respected: one pod carrying a 200 KiB
+annotation (the API server permits 256 KiB per object), `prometheus.io/scrape:
+"true"` and a 16-entry `prometheus.io/port` yields 16 targets and a
+3,283,798-byte body — ten such pods on a node is ~33 MB per `GET
+/v1/nodes/{node}/targets`, re-derived and re-marshalled on every agent poll, in
+the singleton the chart requests 128Mi for with no memory limit, and
+`writeCached` must BUILD the body to hash its ETag so a 304 does not save it.
+The charge is the whole target document measured once per pod, so this bounds
+every per-target string there is — including the ones nobody has thought to
+bound yet, which is why it is a backstop rather than a sixth field limit. The
+pod's **first** target is unconditional: annotations are legitimate attribution
+data, so the ceiling bounds the MULTIPLIER and never the workload, and a
+fat-but-honest pod is still scraped. Refusals count into
+`kubescrape_scrape_targets_capped_total` — the same counter the 16-target
+ceiling moves, since either way an endpoint is not being scraped — and `GET
+/v1/explain/{ns}/{pod}` tells the two apart, with `cappedTargetsBySize`,
+`podDocumentBytes` and a wording naming the remedy (shrink the pod's
+annotations, or split its ports across workloads — not "declare fewer ports",
+which is the answer to the other ceiling). None of the four is redundant now:
+the 16-target ceiling still bounds a SMALL pod's target count, the field
+ceilings still give the sharper diagnostic and still bind on the unconditional
+first target, and the merge-time chain and contributor bounds are the only thing
+that can REFUSE on the merge arm. The merge arm is nonetheless **charged**: a
+fold grows the held target by up to 16 KiB of merged chain and 32 contributor
+names (~26 KiB, ~400 KiB across a pod's 16 targets — bounded and deterministic,
+needing ≥32 monitors on one URL), which used to ride entirely outside a budget
+whose claim is that it charges the whole target document. It now spends the
+pod's budget, so the next NEW url is measured against what is really being
+served; nothing is refused by the charge, because refusing a merge would drop
+relabel rules a monitor asked for — changing what is *exported* in order to
+bound a response.
+
+A **sixth** pair of ceilings is one level down, on the **pod document itself**,
+because the fifth cannot see it: the pod's first target is unconditional by
+design, and that one document was unbounded. It carries the pod's own
+annotations, its **namespace's** (copied per pod — `/v1/pods/{ns}/{name}` has to
+serve a self-contained document, so de-duplicating it would be a response-format
+change that helps only the node-targets route), and **one annotation set per
+resolved `ownerReference`** — and Kubernetes bounds neither the
+`ownerReferences` count nor what an owner may annotate, while one fat owner can
+be named by every pod on the node. A tenant with edit rights in ONE namespace
+creates 100 fat ReplicaSets and points every pod at all of them: measured, ~25
+MB per pod document and ~125 MB in a five-pod node's `targets` response.
+
+So annotations are bounded **at the source**, in `kubemeta.CopyMeta`, for every
+object this API serves (pods, owners, namespaces/nodes, Services): a single
+value over **8 KiB** and an object's whole set over **16 KiB**. Real values sit
+far below both once the deploy-tool copies of the applied object are dropped —
+the fattest in the field are an istio sidecar status or a CNI network-status at
+~1–2 KiB. Two rules matter more than the numbers:
+
+* An oversized value is **omitted whole, never truncated**. Annotations are
+  load-bearing for attribution (`resourceAttributes` templates read them), and a
+  silently shortened value is the worse failure — a template that renders half a
+  value looks like it worked.
+* `prometheus.io/*` and `kubescrape.io/*` are admitted **first** when the total
+  budget binds, so an unrelated blob on the same object can never starve the
+  annotations the derivation itself reads. (A pod whose *own* `prometheus.io/*`
+  annotations exceed the budget still loses some — that is self-harm on one pod,
+  not a lever on anyone else. So is a `prometheus.io/port` value over the 8 KiB
+  per-value ceiling: it is refused like any other blob, and the pod then reads as
+  un-annotated.)
+
+The owner **count** is bounded beside it, at **8** chain entries
+(`owners.MaxOwners`) — against a legitimate maximum of two, since a pod has one
+controller reference and this resolver follows at most one parent
+(ReplicaSet → Deployment, Job → CronJob); the handful of extra non-controller
+references some operators add fits comfortably inside 4× that.
+
+Every one of these refusals is **visible**, because a document that is short and
+does not say so is worse than a big one:
+
+* the object's own annotations carry `kubescrape.io/annotations-omitted`, naming
+  the refused keys and the ceiling that refused them (a cluster-supplied copy of
+  that key is stripped at the door, so only kubescrape can set it);
+* `kubemeta.Pod.ownersOmitted` says how many `ownerReferences` were not
+  described;
+* `kubescrape_metadata_annotations_omitted_total{kind}` and
+  `kubescrape_owner_resolve_failures_total{reason="owners_capped"}` count them,
+  with a throttled warning naming the object;
+* `GET /v1/explain/{ns}/{pod}` lifts both onto the head of its document
+  (`annotationsOmitted`, `ownersOmitted`) — without them it would answer "why is
+  this pod not scraped?" with `podAnnotated: false` for a pod whose annotation
+  was refused at the source.
+
+**What is still not bounded, said plainly: labels.** They are selection input —
+Service and PodMonitor selectors match on them — so no filter can know which
+label is load-bearing, and refusing one would silently change *what is scraped*
+in order to bound a response. Each label is small by API-server validation (a
+value of at most 63 bytes), but their count is bounded only by the object's ~1.5
+MiB ceiling, so a pod, an owner or a namespace can still carry ~1 MiB of them.
+That is what the fifth ceiling binds on today.
+
 Per-endpoint `interval`/`scrapeTimeout` **are** interpreted (each target is
 scheduled on its own period — see the `-servicemonitors` row above), as are
 `basicAuth` and `authorization`. Every other field an endpoint or monitor
@@ -2766,9 +3639,12 @@ their SDKs (`http://<release>-traces.<ns>.svc:4318`, or `:4317` for gRPC).
 `-service-graph-shards`, from the one value — scale it with `helm upgrade`, not
 `kubectl scale`, or a shard addresses a width the tier does not have and the
 pushes that hash there fail. `serviceGraph.tokenSecret.name` mounts the shared
-bearer token and passes `-service-graph-token-file`; leaving it empty renders no
-flag, and the binary then refuses to open its cluster-reachable internal
-receiver. `serviceGraph.port` (default 4319) is that receiver.
+bearer token and passes `-service-graph-token-file`, and it is REQUIRED whenever
+the tier is enabled: the internal receiver is reachable from every pod in the
+cluster, so the binary refuses to start without the flag, and the chart now
+refuses to RENDER without the value rather than installing a StatefulSet that
+CrashLoopBackOffs on every shard. `serviceGraph.port` (default 4319) is that
+receiver.
 
 `serviceGraph.ingest.*` covers the application-facing side:
 `grpcEndpoint`/`httpEndpoint` (the ports on the ClusterIP Service),
@@ -2780,13 +3656,61 @@ reachable (the kubelet's probes come from the node, Prometheus from wherever it
 runs) and the internal shard port stays open to this tier's own pods, which the
 ring needs — scoping it along with the trace ports broke the ring at this
 chart's own default `replicas: 2`. Health and metrics being unscoped also means
-the tier's `-listen` port (which serves `/debug/otlp`) is reachable cluster-wide
-unless you add a policy of your own.
+the tier's `-listen` port is reachable cluster-wide unless you add a policy of
+your own — which is why `/debug/otlp` on it is not open: like the DaemonSet's,
+that stream is served only to a local connection (`kubectl port-forward`) or to
+a request carrying the `-debug-token-file` token. See that flag for what the
+gate does and does not cover.
 
 `serviceGraph.spanMetrics` turns on the RED metrics derived from the spans this
 tier receives; tuning is `agent.config.traceMetrics`, and edge-pairing tuning is
 `agent.config.serviceGraph`. The tier mounts the same rendered ConfigMap as the
 DaemonSet and simply ignores the sections that are not its.
+
+`agent.debug.tokenSecret.name` is how you reach the gated debug surfaces from
+somewhere other than a `kubectl port-forward`. Name a Secret and the chart
+mounts it and passes `-debug-token-file` on **every** workload running the agent
+binary — the DaemonSet, the events/Azure singleton and the trace tier — because
+they all serve the same routes; `key` (default `token`) is the key within it,
+mounted at `/etc/kubescrape/debug/<key>`. Leave it empty (the default) and those
+surfaces are local-only, which needs no configuration and is the safe posture:
+
+```sh
+kubectl -n monitoring create secret generic kubescrape-debug \
+  --from-literal=token="$(openssl rand -hex 24)"
+helm upgrade … --set agent.debug.tokenSecret.name=kubescrape-debug
+
+# then, from anywhere:
+curl -sN -H "Authorization: Bearer $TOKEN" http://<agent-pod-ip>:8081/debug/otlp?sample=10
+```
+
+`networkPolicy.enabled` (**true by default**) renders ingress policies that
+restrict each pod to the ports the chart declares, so an undeclared listener
+(pprof) is closed everywhere; on a cluster with no NetworkPolicy controller the
+objects are inert, so the default costs nothing there. What a rule restricts
+*who* to is a separate decision per port, and three values carry it:
+`agent.ingest.allowFrom` (the DaemonSet's OTLP ingest ports),
+`serviceGraph.ingest.allowFrom` (the tier's application trace ports) and
+`agent.debug.allowFrom` (the `listen` port on every agent-binary workload). **All
+three default to empty, which means any pod may connect** — the first two are
+unauthenticated writers and are what to tighten first; the third is a reader that
+is already gated in-process. Read `agent.debug.allowFrom`'s comment in
+[values.yaml](../charts/kubescrape/values.yaml) before setting it: a
+NetworkPolicy scopes a *port*, not a path, and `/healthz`+`/readyz` share that
+port — narrowing it narrows the kubelet's probes too, and a failing readiness
+probe stops a DaemonSet rolling update dead. The metadata service's API port has
+no `allowFrom` value at all, deliberately: narrowing it wrongly makes every agent
+on the cluster stop resolving, so that one is an edit to
+`templates/service.yaml` you make consciously.
+
+`seccompProfile` (default `type: RuntimeDefault`) is a pod-level profile applied
+to all four workloads: PodSecurity's `restricted` profile rejects a pod that does
+not set it, so without it three of the four fail admission on a restricted
+namespace. The agent DaemonSet cannot satisfy `restricted` whatever this says —
+it runs as UID 0 and mounts hostPath `/var/log` — so its namespace needs
+`privileged`. If you set `type: Localhost`, set `localhostProfile` too; the
+chart's schema cannot express that requirement (see
+[Accepted security residuals](#accepted-security-residuals)).
 
 `service.scrapeAuthSecrets: true` is one value that wires three things at
 once, because they must not drift apart: the `-scrape-auth-secrets` flag, the
@@ -2803,7 +3727,7 @@ at your own Secret to manage it yourself, or set
 A production-shaped `values.yaml`:
 
 ```yaml
-logFormat: json
+logLevel: info
 
 service:
   replicas: 2

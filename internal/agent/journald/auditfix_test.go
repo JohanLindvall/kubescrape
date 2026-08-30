@@ -28,7 +28,7 @@ func TestAuditFixTruncationCountedWhenTheRulesDropTheBatch(t *testing.T) {
 
 	exp := &captureExporter{}
 	r := New(Config{Exporter: exp, Rules: rules, MaxEntryBytes: 20})
-	body, origLen := r.sanitize(strings.Repeat("x", 200))
+	body, origLen := r.sanitize(strings.Repeat("x", 200), "unit.service")
 	if origLen == 0 {
 		t.Fatal("precondition: the message must be truncated")
 	}

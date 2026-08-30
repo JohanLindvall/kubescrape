@@ -109,7 +109,7 @@ func runConfigTests(cfg agentConfig, transformsFile, testsFile string, log *slog
 		}
 		failed++
 		for _, p := range problems {
-			log.Error("test-config FAIL", "case", name, "problem", p)
+			log.Error("test-config FAIL", "case", name, "reason", p)
 		}
 	}
 	if failed > 0 {

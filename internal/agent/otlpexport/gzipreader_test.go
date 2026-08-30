@@ -306,8 +306,8 @@ func TestPooledGzipReaderReleasesTheMessagesSource(t *testing.T) {
 			// Taking the reader back out is what makes the measurement mean
 			// something: the source must be unreachable while the reader that
 			// read it is still alive.
-			z, ok := c.readers.Get().(*gzip.Reader)
-			if !ok {
+			z := c.readers.get()
+			if z == nil {
 				t.Fatal("the reader never reached the pool; this test would prove nothing")
 			}
 			// A finalizer runs on its own goroutine after the collection that

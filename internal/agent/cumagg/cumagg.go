@@ -46,9 +46,11 @@ import (
 	"context"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/JohanLindvall/kubescrape/internal/agent/transform"
+	"github.com/JohanLindvall/kubescrape/internal/logdedupe"
 	"github.com/JohanLindvall/kubescrape/internal/obs"
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/pmetric"
@@ -157,6 +159,21 @@ type Store[S Series] struct {
 
 	mu     sync.Mutex
 	series map[string]S
+	// capRefused counts cardinality-cap refusals since the last time the export
+	// loop reported them. The COUNTER (Options.Dropped) carries the rate; this
+	// is what lets the loop emit ONE throttled line per interval instead of one
+	// per refused series on the caller's per-span/per-edge path, which is
+	// allocation-budgeted in both callers. Atomic rather than mutex-guarded
+	// because Run reads it without the series lock.
+	capRefused atomic.Uint64
+	// capWarn throttles that line: the cap, once reached, is reached on every
+	// admission until eviction frees a slot.
+	capWarn logdedupe.Throttle
+	// exportFailed latches a failed export so the recovery can be reported.
+	// Without it an outage is a Warn per interval and the end of it is silence,
+	// which reads the same as the process having stopped exporting.
+	exportFailed atomic.Bool
+
 	// exportGate holds ONE token, taken for the whole of an Export — render,
 	// send and delivery mark together. Export is otherwise NOT safe against
 	// itself: afterDelivered promotes every series whose CURRENT values are
@@ -209,6 +226,10 @@ func (st *Store[S]) AdmitLocked(key []byte, now time.Time) (s S, fresh, ok bool)
 		if st.opt.Dropped != nil {
 			st.opt.Dropped.Inc()
 		}
+		// One atomic add, on the refusal path only: the caller's warm path is
+		// asserted allocation-free and runs per span / per edge, so the LINE is
+		// the export loop's job (reportCapPressure).
+		st.capRefused.Add(1)
 		return s, false, false // s is still the zero value
 	}
 	s = st.opt.NewSeries()
@@ -429,14 +450,62 @@ func (st *Store[S]) Run(ctx context.Context, exp Exporter, interval time.Duratio
 			// detach — the repo's shutdown-context invariant.
 			fctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), finalExportTimeout)
 			if err := st.Export(fctx, exp, res); err != nil {
-				log.Warn("final "+st.opt.Name+" export failed", "error", err)
+				// The aggregate NAME is an attribute rather than part of the
+				// message: one message text is one grep, and an operator
+				// filtering "which aggregate" wants a field to select on.
+				log.Warn("the final cumulative-metrics export failed, so this process' last aggregation window is lost",
+					"error", err, "aggregate", st.opt.Name)
 			}
 			cancel()
 			return
 		case <-ticker.C:
-			if err := st.Export(ctx, exp, res); err != nil {
-				log.Warn("exporting "+st.opt.Name+" failed", "error", err)
+			err := st.Export(ctx, exp, res)
+			if err != nil {
+				log.Warn("exporting cumulative metrics failed; the series are cumulative, so the next export carries them",
+					"error", err, "aggregate", st.opt.Name)
+				st.exportFailed.Store(true)
+			} else if st.exportFailed.Swap(false) {
+				log.Info("cumulative-metrics export recovered", "aggregate", st.opt.Name)
 			}
+			st.reportCapPressure(log)
 		}
 	}
 }
+
+// reportCapPressure emits the throttled aggregate line for cardinality-cap
+// refusals since the last report. It is the sweep-side half of the pattern the
+// repo uses wherever the refusal itself is on an allocation-budgeted path: a
+// counter per item, a line per interval.
+//
+// A refusal is not a slow leak — a cumulative aggregate at its cap reports
+// nothing about anything NEW until eviction frees a slot, so a service that
+// starts after the burst is invisible in RED metrics or in the graph. That is
+// what makes it a Warn rather than an Info.
+//
+// The ORDER is the whole point, and it is the same rule tailbuffer's
+// takeEarlyLocked spells out for the same shape. Draining the tally first and
+// consulting the throttle afterwards zeroes it on every suppressed cycle, so
+// the line that eventually escapes carries ONE export interval's refusals while
+// claiming to describe capWarnEvery — at the default 1m interval against a 5m
+// window that is an operator sizing a cardinality burst ~5x low. Ask the
+// throttle FIRST and drain only on the cycle that actually emits; the
+// suppressed cycles keep accumulating into the number the line will print, so
+// it describes the window it names.
+//
+// Allow is asked only when there is something to say (capRefused.Load() > 0),
+// or a quiet cycle would spend the slot and suppress the first cycle that
+// really binds. The Load/Swap pair is not atomic together, and does not need to
+// be: this runs on Run's single goroutine, and a refusal landing between them
+// is simply carried by the Swap into the line about to be printed.
+func (st *Store[S]) reportCapPressure(log *slog.Logger) {
+	if st.capRefused.Load() == 0 || !st.capWarn.Allow(capWarnEvery) {
+		return
+	}
+	n := st.capRefused.Swap(0)
+	log.Warn("the cumulative-metrics cardinality cap is refusing new series, so anything that starts now is missing from these metrics until eviction frees a slot",
+		"aggregate", st.opt.Name, "dropped", n, "maxCardinality", st.opt.MaxCardinality,
+		"series", st.Len(), "staleAfter", st.opt.StaleAfter)
+}
+
+// capWarnEvery re-warns while the cardinality cap is binding.
+const capWarnEvery = 5 * time.Minute

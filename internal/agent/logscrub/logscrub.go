@@ -195,28 +195,73 @@ func containsFold(sub string) func(string) bool {
 	}
 }
 
-// asciiIndexFold reports whether lowerSub (already lowercase) occurs in s,
-// ASCII-case-insensitively, without allocating. The prefilter needle is short,
-// so the naive scan is cheaper than the per-line ToLower it replaces.
+// asciiIndexFold returns the index of the first ASCII-case-insensitive
+// occurrence of lowerSub (which must already be lowercase) in s, or -1. It
+// allocates nothing.
+//
+// The candidate positions come from strings.IndexByte on the needle's first
+// byte in BOTH cases, not from walking every offset: IndexByte is the
+// architecture's vectorised scan (tens of bytes per cycle) where the walk was
+// a fold and a compare per byte. This function was 46% of the whole no-match
+// scrub path — the two literal prefilters "bearer" and "basic" run it on every
+// exported record on the tailer's single sweep goroutine — and an ordinary log
+// line contains almost no 'b' or 'B' to verify.
+//
+// The two cursors are what keep it LINEAR. A search that restarts both scans
+// after every rejected candidate is quadratic on a line that is dense in one
+// case and holds the other only near the end (a megabyte of 'b' followed by
+// one 'B'), which is exactly the shape a hostile record takes — see
+// BenchmarkScrubHostileLongLine for why that matters here. Each cursor instead
+// resumes where its own previous IndexByte stopped, so each case is scanned
+// across the line at most once in total.
 func asciiIndexFold(s, lowerSub string) int {
 	n := len(lowerSub)
 	if n == 0 {
 		return 0
 	}
-	for i := 0; i+n <= len(s); i++ {
-		k := 0
-		for ; k < n; k++ {
-			c := s[i+k]
-			if 'A' <= c && c <= 'Z' {
-				c += 'a' - 'A'
-			}
-			if c != lowerSub[k] {
-				break
-			}
+	limit := len(s) - n // the last index at which a match can begin
+	if limit < 0 {
+		return -1
+	}
+	lo := lowerSub[0]
+	up := lo
+	if 'a' <= lo && lo <= 'z' {
+		up = lo - ('a' - 'A')
+	}
+	nextLo := indexByteFrom(s, lo, 0)
+	nextUp := -1
+	if up != lo {
+		nextUp = indexByteFrom(s, up, 0)
+	}
+	for {
+		k := nextLo
+		if k < 0 || (nextUp >= 0 && nextUp < k) {
+			k = nextUp
 		}
-		if k == n {
-			return i
+		if k < 0 || k > limit {
+			return -1
 		}
+		if hasPrefixFold(s[k:], lowerSub) {
+			return k
+		}
+		// Advance only the cursor(s) that produced this candidate.
+		if nextLo == k {
+			nextLo = indexByteFrom(s, lo, k+1)
+		}
+		if nextUp == k {
+			nextUp = indexByteFrom(s, up, k+1)
+		}
+	}
+}
+
+// indexByteFrom is strings.IndexByte from an absolute offset, returning an
+// absolute index.
+func indexByteFrom(s string, c byte, from int) int {
+	if from >= len(s) {
+		return -1
+	}
+	if i := strings.IndexByte(s[from:], c); i >= 0 {
+		return from + i
 	}
 	return -1
 }
@@ -279,14 +324,46 @@ var kvDispatch = func() (d [256][]string) {
 	return
 }()
 
+// kvStart is the per-byte GATE — true for the RAW byte, both cases, exactly
+// where kvDispatch holds a spelling. It is derived from kvDispatch, so the
+// vocabulary still has one home and a keyword added to the table reaches the
+// gate with nothing to update.
+//
+// It is a separate table rather than a widening of kvDispatch for two reasons.
+// SIZE: kvDispatch is 256 slice headers — 6 KiB, ninety-six cache lines — and
+// the reject path, which is every byte of every line that does not start a
+// keyword and therefore almost all of them, was loading one of those headers
+// just to test its length; this is 256 bytes, four cache lines, resident
+// beside the line being scanned. And SHAPE: kvDispatch's lowercase-only
+// grouping is pinned by TestSecretKVDispatchDerivation, which is a security
+// pin (a spelling that fell out of the dispatch makes the prefilter narrower
+// than its regex), so it is left exactly as that test describes it and the
+// fold moves off the per-byte path onto the hit path instead.
+var kvStart = func() (g [256]bool) {
+	for c := range kvDispatch {
+		if len(kvDispatch[c]) > 0 {
+			g[c] = true
+			g[upperASCII(byte(c))] = true
+		}
+	}
+	return
+}()
+
+// upperASCII is lowerASCII's inverse, for building the raw-byte gate.
+func upperASCII(c byte) byte {
+	if 'a' <= c && c <= 'z' {
+		c -= 'a' - 'A'
+	}
+	return c
+}
+
 // secretKVCandidate reports whether the line can match the secret-kv regex.
 func secretKVCandidate(s string) bool {
 	for i := 0; i < len(s); i++ {
-		words := kvDispatch[lowerASCII(s[i])]
-		if len(words) == 0 {
+		if !kvStart[s[i]] {
 			continue
 		}
-		for _, w := range words {
+		for _, w := range kvDispatch[lowerASCII(s[i])] {
 			if hasPrefixFold(s[i:], w) && kvTail(s, i+len(w)) {
 				return true
 			}

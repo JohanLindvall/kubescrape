@@ -664,7 +664,7 @@ func TestPrintIsThrottledTogetherWithLog(t *testing.T) {
 	// And that one line is the PRINT — it came first and took the gate. With
 	// print on its own path, log()'s line would be the only one here and the
 	// prints would be 50 unthrottled lines somewhere else.
-	if !strings.Contains(logged.String(), "msg=p") {
+	if !strings.Contains(logged.String(), "output=p") {
 		t.Fatalf("the throttled line is not print's: %q", logged.String())
 	}
 }

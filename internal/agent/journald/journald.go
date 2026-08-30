@@ -29,6 +29,7 @@ import (
 	"github.com/JohanLindvall/kubescrape/internal/agent/logchain"
 	"github.com/JohanLindvall/kubescrape/internal/agent/logscrub"
 	"github.com/JohanLindvall/kubescrape/internal/agent/positions"
+	"github.com/JohanLindvall/kubescrape/internal/logdedupe"
 	"github.com/JohanLindvall/kubescrape/internal/logline"
 	"github.com/JohanLindvall/kubescrape/internal/metrics"
 	"github.com/JohanLindvall/kubescrape/internal/obs"
@@ -135,9 +136,43 @@ type openFunc func(cfg Config, afterCursor string) (source, error)
 // Reader reads the journal and exports its entries. All fields are owned by the
 // single Run goroutine.
 type Reader struct {
-	cfg  Config
-	log  *slog.Logger
-	open openFunc
+	cfg Config
+	log *slog.Logger
+	// defectWarn throttles the read-side repair warnings, ONE GATE PER DEFECT
+	// CLASS (invalid UTF-8, a missing timestamp), indexed by the defect's label
+	// value. A unit logging raw bytes does it on EVERY message, so an
+	// unthrottled line would be one per entry from precisely the noisiest
+	// producer; the rate is kubescrape_journal_entry_defects_total.
+	//
+	// Separate gates because the two classes are INDEPENDENT conditions with
+	// different remedies (a producer writing binary; a producer or transport
+	// handing over no realtime stamp) and they co-occur — an audit or
+	// raw-byte-emitting unit is exactly the kind that also arrives stampless.
+	// One shared gate let whichever fired first suppress the other for the
+	// whole five minutes, so the second condition could be permanently
+	// invisible in the logs while its counter climbed. Same rule, and same
+	// reason, as transform/hooks.go giving the parse-shape complaint its own
+	// gate and the tailer giving budgetWarn one beside metaWarn.
+	defectWarn map[string]*logdedupe.Throttle
+	// unitDebug bounds the per-unit Debug line that answers the one question
+	// this reader could not answer below the aggregate counters: "why is
+	// kubelet.service not shipping?" — is it reaching us at all, and are its
+	// entries surviving the rules? Keyed by unit because that IS the question,
+	// bounded because SYSLOG_IDENTIFIER (the fallback for a transport with no
+	// unit) is producer-chosen and therefore unbounded, and re-reported on a
+	// window so a unit that goes quiet stops appearing rather than being
+	// remembered forever as live.
+	unitDebug *logdedupe.Table
+	// unitCounts is the per-batch scratch behind that report, reused so the
+	// summary costs no allocation per settle. It is only ever filled when
+	// Debug is enabled.
+	unitCounts map[string]int
+	// exportFailures counts the consecutive failed export attempts of the batch
+	// currently being retried in place, so the recovery can say how long the
+	// collector was refusing it. Reset by a successful flush.
+	exportFailures     int
+	exportFailingSince time.Time
+	open               openFunc
 
 	batch       []entry
 	batchBytes  int    // summed body sizes of the buffered entries
@@ -183,12 +218,42 @@ func New(cfg Config) *Reader {
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
 	}
-	return &Reader{cfg: cfg, log: cfg.Logger, open: openJournal}
+	return &Reader{
+		cfg: cfg, log: cfg.Logger, open: openJournal,
+		// One gate per defect class, built here so reportDefect's lookup can
+		// never mint one lazily on the reader goroutine's hot path — and so a
+		// class added without a gate reports its counter and stays silent
+		// rather than sharing another class's window.
+		defectWarn: map[string]*logdedupe.Throttle{
+			defectInvalidUTF8: {},
+			defectNoTimestamp: {},
+		},
+		unitDebug:  logdedupe.New(maxDebugUnits, unitDebugEvery),
+		unitCounts: make(map[string]int, 16),
+	}
 }
 
 // Run reads until ctx is done, restarting the reader on any failure.
 func (r *Reader) Run(ctx context.Context) {
 	r.cursor = r.loadCursor()
+	// Lifecycle, once, and the one journald fact an operator needs on a first
+	// live run: WHERE this reader starts. With no stored cursor the source
+	// seeks to the journal TAIL, so everything already in the journal is never
+	// exported — which is correct (it is history) but is indistinguishable
+	// from a broken reader if you are looking for last night's kubelet logs
+	// and nobody said so. A resumed cursor is the other half of the same
+	// answer: entries between the cursor and now WILL be re-read.
+	//
+	// The cursor is opaque and can be long, so its length stands in for it —
+	// enough to tell "resuming" from "empty" without putting an unbounded
+	// token on every startup line.
+	start := "tail"
+	if r.cursor != "" {
+		start = "cursor"
+	}
+	r.log.Info("journal reader starting", "start", start, "dir", r.cfg.Dir,
+		"units", len(r.cfg.Units), "interval", r.cfg.FlushInterval,
+		"cursorPersisted", r.cfg.Positions != nil)
 	bo := backoff.New(r.cfg.RestartBackoff)
 	for ctx.Err() == nil {
 		// No batch can reach this point: stream retries a failed export IN
@@ -240,6 +305,23 @@ func (r *Reader) Run(ctx context.Context) {
 // inside the pod's terminationGracePeriodSeconds.
 const shutdownFlushBudget = 10 * time.Second
 
+// defectWarnEvery throttles the read-side repair warning. The condition is a
+// PRODUCER writing something the journal cannot hand over intact, which
+// persists for as long as that producer runs, so the useful information is one
+// line naming a unit — the rate belongs to the counter.
+const defectWarnEvery = 5 * time.Minute
+
+// maxDebugUnits and unitDebugEvery bound the per-unit Debug report (see
+// Reader.unitDebug). A node runs tens of units, so the cap is only ever reached
+// through SYSLOG_IDENTIFIER, which a producer chooses; past it the table
+// suppresses new keys and says so once, per logdedupe's saturation rule. The
+// window is short because this line exists to be watched DURING an incident,
+// where a five-minute silence about a unit reads as the unit having stopped.
+const (
+	maxDebugUnits  = 256
+	unitDebugEvery = time.Minute
+)
+
 // stream opens one journal source and reads until it ends, the source errors,
 // or ctx is done. An export failure does NOT end it: flushRetry keeps the batch
 // and retries it in place, so the entries are never re-read and the per-record
@@ -250,6 +332,21 @@ func (r *Reader) stream(ctx context.Context) error {
 		return err
 	}
 	defer func() { _ = src.close() }()
+	// Where this source is positioned, and — the half the startup line reports
+	// only as a COUNT — which units the journal itself will hand over. Matches
+	// are applied inside libsystemd, so an entry from a unit outside the list
+	// never reaches this process at all: with the names logged, "why is
+	// containerd.service not shipping?" is answerable from the log instead of
+	// from re-reading the ConfigMap. Guarded because the Join allocates, and
+	// once per source open (a restart, not a batch) either way.
+	if r.log.Enabled(ctx, slog.LevelDebug) {
+		start := "tail"
+		if r.cursor != "" {
+			start = "cursor"
+		}
+		r.log.Debug("journal source opened", "start", start, "dir", r.cfg.Dir,
+			"units", strings.Join(r.cfg.Units, ","))
+	}
 
 	clear(r.batch)
 	r.batch = r.batch[:0]
@@ -337,7 +434,7 @@ func (r *Reader) stream(ctx context.Context) error {
 					return fmt.Errorf("journal source ended")
 				}
 			}
-			body, origLen := r.sanitize(e.message)
+			body, origLen := r.sanitize(e.message, e.unit)
 			if r.cfg.Scrub != nil {
 				// Scrub before anything copies from the body (logattrs
 				// lifting, enrich's exception attributes, batch accounting).
@@ -390,12 +487,13 @@ const utf8Replacement = "�"
 // 1 MiB), so it bit exactly the operator who LOWERED the entry cap to bound
 // memory. The truncating branch clones; the whole-message branch cannot alias
 // anything the batch does not already own.
-func (r *Reader) sanitize(msg string) (body string, origLen int) {
+func (r *Reader) sanitize(msg, unit string) (body string, origLen int) {
 	raw := len(msg)
 	if raw <= r.cfg.MaxEntryBytes {
 		if utf8.ValidString(msg) {
 			return msg, 0
 		}
+		r.reportDefect(defectInvalidUTF8, unit)
 		msg = strings.ToValidUTF8(msg, utf8Replacement)
 		if len(msg) <= r.cfg.MaxEntryBytes {
 			return msg, 0
@@ -406,11 +504,52 @@ func (r *Reader) sanitize(msg string) (body string, origLen int) {
 	}
 	cut := logchain.TruncateRunes(msg, r.cfg.MaxEntryBytes)
 	if !utf8.ValidString(cut) {
+		// Only the SURVIVING bytes are probed here (the cut already happened),
+		// so an over-cap message whose invalid bytes were all past the cut
+		// reports no defect — correct: the exported body is byte-identical to
+		// what the producer wrote for as far as it goes, and the truncation
+		// itself is already carried by log.truncated and
+		// kubescrape_journal_truncated_total.
+		r.reportDefect(defectInvalidUTF8, unit)
 		// Fresh allocation, so the second cut aliases only itself; clone below
 		// is then a cheap copy of at most MaxEntryBytes.
 		cut = logchain.TruncateRunes(strings.ToValidUTF8(cut, utf8Replacement), r.cfg.MaxEntryBytes)
 	}
 	return strings.Clone(cut), raw
+}
+
+// Defect label values for kubescrape_journal_entry_defects_total. Spelled once
+// here because they are metric label values as well as log values, and the
+// metric's help text enumerates exactly these.
+const (
+	defectInvalidUTF8 = "invalid_utf8"
+	defectNoTimestamp = "no_timestamp"
+)
+
+// reportDefect counts one read-side repair and, throttled, says which unit
+// produced it.
+//
+// The counter is unconditional (it is the rate, and a unit logging raw bytes
+// does this on every message); the line is throttled keylessly PER DEFECT CLASS
+// (see defectWarn), because the condition is a PRODUCER and one example unit is
+// what an operator acts on — keying per unit would let a node with many
+// misbehaving units flood on the same fact, while keying by nothing at all let
+// one defect class hide the other. Both arguments are already-materialised
+// strings, so no Enabled guard is warranted.
+func (r *Reader) reportDefect(defect, unit string) {
+	obs.JournalEntryDefects.WithLabelValues(defect).Inc()
+	gate, ok := r.defectWarn[defect]
+	if !ok || !gate.Allow(defectWarnEvery) {
+		return
+	}
+	switch defect {
+	case defectInvalidUTF8:
+		r.log.Warn("journal message is not valid UTF-8; the invalid bytes are replaced before export, so the exported body differs from what the producer wrote",
+			"unit", unit, "defect", defect)
+	default:
+		r.log.Warn("journal entry carried no timestamp; the record is dated with this agent's clock at read time, not the producer's",
+			"unit", unit, "defect", defect)
+	}
 }
 
 // ingest converts one raw journal entry (body already sanitized) into the
@@ -425,6 +564,12 @@ func (r *Reader) ingest(re rawEntry, body string, origLen int) {
 		origLen:   origLen,
 	}
 	if e.ts.IsZero() {
+		// The journal handed over no realtime stamp, so the record is dated
+		// with OUR clock at read time. That is a silent substitution — the
+		// exported timestamp looks exactly as authoritative as a real one — and
+		// it is what makes a backlog read after a restart appear to have
+		// happened all at once.
+		r.reportDefect(defectNoTimestamp, re.unit)
 		e.ts = time.Now()
 	}
 	e.severity, e.sevText = severity(re.priority)
@@ -484,15 +629,33 @@ func (r *Reader) flushRetry(ctx context.Context) error {
 		}
 		err := r.flush(ctx)
 		if err == nil {
+			// The recovery half. Without it a collector outage produces a
+			// warning per retry and then silence, and the only way to learn
+			// that delivery resumed is to watch a counter stop moving.
+			if r.exportFailures > 0 {
+				r.log.Info("journal export recovered", "failures", r.exportFailures,
+					"outage", time.Since(r.exportFailingSince).Round(time.Second))
+				r.exportFailures, r.exportFailingSince = 0, time.Time{}
+			}
 			return nil
 		}
+		if r.exportFailures == 0 {
+			r.exportFailingSince = time.Now()
+		}
+		r.exportFailures++
 		if ctx.Err() != nil {
 			// Cancelled DURING the export: that attempt really was made and its
 			// failure really was counted, so this arm only avoids the backoff.
 			return err
 		}
+		// Not throttled: the backoff already spaces this out (it grows to the
+		// cap and the batch is held, so the line rate falls as the outage
+		// lasts), and every line carries the attempt count an operator sizes
+		// the outage by.
 		r.log.Warn("journal export failed; retrying the same batch (re-reading it would re-observe its log metrics)",
-			"entries", len(r.batch), "error", err, "backoff", bo.Delay())
+			"entries", len(r.batch), "error", err, "backoff", bo.Delay(),
+			"failures", r.exportFailures,
+			"outage", time.Since(r.exportFailingSince).Round(time.Second))
 		bo.Sleep(ctx)
 	}
 }
@@ -516,14 +679,14 @@ func (r *Reader) flush(ctx context.Context) error {
 		// the tailer's behaviour too: an empty payload still costs a wire RPC
 		// per flush interval — and, with -buffer-dir, an fsync'd spool frame —
 		// on exactly the heavily-sampled journal this feature exists for.
-		r.settleBatch()
+		r.settleBatch(ctx, 0)
 		return nil
 	}
 	if err := r.cfg.Exporter.ExportLogs(ctx, ld); err != nil {
 		if logchain.SettlePermanent(err, r.log, "journal batch", ld.LogRecordCount(),
 			logchain.SettleCounters{Batches: obs.JournalDropped, Records: obs.JournalDroppedRecords},
 			"entries", len(r.batch)) {
-			r.settleBatch()
+			r.settleBatch(ctx, 0)
 			return nil
 		}
 		// The journal's OWN failure counter, not the tailer's
@@ -537,13 +700,13 @@ func (r *Reader) flush(ctx context.Context) error {
 	// Delivered records, not ingested entries: the rules may have dropped some,
 	// and the metric documents itself as entries EXPORTED.
 	obs.JournalEntries.Add(float64(ld.LogRecordCount()))
-	r.settleBatch()
+	r.settleBatch(ctx, ld.LogRecordCount())
 	return nil
 }
 
 // settleBatch clears the batch (releasing the bodies pinned by the backing
 // array), counts its truncations and commits its newest cursor.
-func (r *Reader) settleBatch() {
+func (r *Reader) settleBatch(ctx context.Context, delivered int) {
 	// Truncations are counted on SETTLE because settle is the one point every
 	// terminal path meets — delivered, emptied by the rules, permanently
 	// rejected — and each batch reaches it exactly once. Counting after the
@@ -571,6 +734,14 @@ func (r *Reader) settleBatch() {
 	if truncated > 0 {
 		obs.JournalTruncated.Add(float64(truncated))
 	}
+	// Per BATCH and per UNIT, never per entry: this is the reader's only
+	// answer, below the aggregate counters, to "this unit is in the journal —
+	// where are its logs?". entries vs delivered separates "nothing arrived"
+	// from "the rules dropped it", the per-unit lines say which units the
+	// journal is actually handing over, and settle is the one point every
+	// terminal path meets exactly once per batch (a retried export must not
+	// re-report the batch it is still holding).
+	r.debugBatch(ctx, delivered, truncated)
 	clear(r.batch)
 	r.batch = r.batch[:0]
 	r.batchBytes = 0
@@ -579,6 +750,52 @@ func (r *Reader) settleBatch() {
 	if r.batchCursor != "" {
 		r.cursor = r.batchCursor
 		r.saveCursor()
+		// The commit is what a restart resumes from, so an operator chasing a
+		// gap needs to see that it moved (and, with no positions store, that
+		// it will not survive the restart). The cursor itself is opaque and
+		// unbounded, so its length stands in for it — the same substitution
+		// the startup line makes. Every argument is a field read or a len.
+		r.log.Debug("journal cursor committed", "cursorLen", len(r.cursor),
+			"persisted", r.cfg.Positions != nil)
+	}
+}
+
+// debugBatch reports one settled batch and the units in it, at Debug.
+//
+// Everything here — the per-unit tally included — happens only when Debug is
+// enabled: slog evaluates arguments eagerly, so an unguarded version would pay
+// the walk and the map on every flush at Info, which is the exact defect this
+// campaign found elsewhere. The tally map is reused across batches, so the
+// report allocates nothing steady-state even when it IS enabled.
+func (r *Reader) debugBatch(ctx context.Context, delivered, truncated int) {
+	if !r.log.Enabled(ctx, slog.LevelDebug) {
+		return
+	}
+	clear(r.unitCounts)
+	for i := range r.batch {
+		// The ident fallback convert applies, so the unit named here is the
+		// one the exported resource carries (systemd.unit for a real unit,
+		// the syslog identifier otherwise).
+		unit := r.batch[i].unit
+		if unit == "" {
+			unit = r.batch[i].ident
+		}
+		r.unitCounts[unit]++
+	}
+	r.log.Debug("journal batch settled", "entries", len(r.batch), "records", delivered,
+		"units", len(r.unitCounts), "bytes", r.batchBytes, "truncated", truncated)
+	for unit, n := range r.unitCounts {
+		allow, saturated := r.unitDebug.Allow(unit)
+		if saturated {
+			// logdedupe's rule: the table suppresses new keys rather than
+			// clearing, and says so once. Reached only through a producer
+			// minting syslog identifiers, never through real units.
+			r.log.Debug("journal per-unit reporting is truncated; further units are not named",
+				"count", maxDebugUnits)
+		}
+		if allow {
+			r.log.Debug("journal unit active", "unit", unit, "entries", n)
+		}
 	}
 }
 

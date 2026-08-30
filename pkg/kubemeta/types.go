@@ -107,7 +107,21 @@ type Pod struct {
 	// NamespaceMetadata is the metadata of the pod's namespace.
 	NamespaceMetadata *ObjectMeta `json:"namespaceMetadata,omitempty"`
 	Owners            []Owner     `json:"owners,omitempty"`
-	Containers        []Container `json:"containers"`
+	// OwnersOmitted is how many of the pod's ownerReferences the resolver
+	// refused to describe because the chain reached its per-pod ceiling
+	// (internal/owners.MaxOwners). Absent — the overwhelming majority — means
+	// Owners is the whole chain.
+	//
+	// It is on the wire because a truncated chain must not read as a complete
+	// one: every consumer of this document derives attribution from the owners
+	// (attrs' service.name, the workload labels), and a pod whose real
+	// controller was refused would otherwise look like a pod with a different
+	// controller and nothing to say so. Kubernetes bounds neither how many
+	// ownerReferences a pod may carry nor what each owner may annotate, and
+	// every ScrapeTarget embeds this document by value — see owners.MaxOwners
+	// for the measurement.
+	OwnersOmitted int         `json:"ownersOmitted,omitempty"`
+	Containers    []Container `json:"containers"`
 }
 
 // FinishedPhase reports whether a pod phase (Pod.Phase) means the pod has

@@ -96,6 +96,16 @@ type Client struct {
 	// rejects one class of record rejects it on every export, and
 	// obs.ExportRejected already carries the magnitude.
 	partialLog *logdedupe.Table
+	// splitLog rate-limits the size-split's REFUSALS (noteSplit). Keyed rather
+	// than keyless, because "one record is too big" and "the framing left no
+	// room" are independent conditions with different remedies, and one gate
+	// shared between them would let whichever fires first suppress the other.
+	splitLog *logdedupe.Table
+	// health narrates this destination's wire outcomes: one line when the
+	// collector starts refusing exports, one when it starts accepting again
+	// (report.go). obs.Exports carries the rate; this carries the WHICH and
+	// the WHY, which no counter can.
+	health *FailureReporter
 
 	// gRPC transport.
 	conn    *grpc.ClientConn
@@ -211,6 +221,10 @@ func New(cfg Config) (*Client, error) {
 		return nil, err
 	}
 	partialLog := logdedupe.New(8, time.Minute)
+	// Six keys is the whole space (three signals x two reasons); the window
+	// matches partialLog's, both being "a condition that persists across every
+	// export until someone changes a payload".
+	splitLog := logdedupe.New(6, time.Minute)
 	if cfg.RetryAttempts < 1 {
 		cfg.RetryAttempts = 1
 	}
@@ -235,7 +249,12 @@ func New(cfg Config) (*Client, error) {
 	}
 	// The gzip level is this client's own for the HTTP body path; the gRPC
 	// codec's is pinned process-wide below, where the protocol is known.
-	c := &Client{cfg: cfg, partialLog: partialLog, gzipLevel: effectiveGzipLevel(cfg.CompressionLevel)}
+	c := &Client{
+		cfg: cfg, partialLog: partialLog, splitLog: splitLog,
+		gzipLevel: effectiveGzipLevel(cfg.CompressionLevel),
+		health: NewFailureReporter(nil, "the OTLP collector",
+			"endpoint", cfg.Endpoint, "protocol", cfg.Protocol),
+	}
 	if cfg.BearerTokenFile != "" {
 		// Not read here: a collector credential that is not yet projected must
 		// not stop the agent from starting, and every export path already
@@ -391,12 +410,18 @@ func (c *Client) singleAttemptSends() (func(context.Context, plog.Logs) error, f
 // wire-send outcomes stay counted when -buffer-dir routes around ExportLogs.
 func (c *Client) exportLogsCounted(ctx context.Context, ld plog.Logs) error {
 	err := c.exportLogsOnce(ctx, ld)
-	obs.Exports.WithLabelValues("logs", outcome(err)).Inc()
-	return err
+	return c.noteSend("logs", err)
 }
 
 func (c *Client) exportLogsOnce(ctx context.Context, ld plog.Logs) error {
-	parts := otlpsplit.Logs(ld, c.cfg.MaxSendBytes)
+	parts, rep := otlpsplit.LogsWithReport(ld, c.cfg.MaxSendBytes)
+	c.noteSplit("logs", len(parts), rep)
+	// Deliberately NO cap on len(parts) here. The part count is bounded where
+	// it is CREATED — otlpsplit guarantees the parts cost at most
+	// minChunkRoomDiv times the input, whatever shape a sender chose — so a cap
+	// at this seam could only bind on an honest producer's genuinely large
+	// batch, turning a slow delivery into a refusal. A refusal is the right
+	// answer to an unbounded sequence, not to a bounded one.
 	for _, part := range parts {
 		// A part-send failure returns immediately; the caller retries the whole
 		// payload, re-sending the parts already delivered — at-least-once
@@ -433,12 +458,13 @@ func (c *Client) sendLogsOnce(ctx context.Context, ld plog.Logs) error {
 // retries via the ingest receiver's retryable status).
 func (c *Client) ExportTraces(ctx context.Context, td ptrace.Traces) error {
 	err := c.exportTracesOnce(ctx, td)
-	obs.Exports.WithLabelValues("traces", outcome(err)).Inc()
-	return err
+	return c.noteSend("traces", err)
 }
 
 func (c *Client) exportTracesOnce(ctx context.Context, td ptrace.Traces) error {
-	for _, part := range otlpsplit.Traces(td, c.cfg.MaxSendBytes) {
+	parts, rep := otlpsplit.TracesWithReport(td, c.cfg.MaxSendBytes)
+	c.noteSplit("traces", len(parts), rep)
+	for _, part := range parts {
 		if err := c.sendTracesOnce(ctx, part); err != nil {
 			return err
 		}
@@ -467,11 +493,63 @@ func (c *Client) sendTracesOnce(ctx context.Context, td ptrace.Traces) error {
 	return c.httpExport(ctx, "traces", c.tracesURL, body, tracesPartialSuccess)
 }
 
-func outcome(err error) string {
-	if err != nil {
-		return "error"
+// noteSplit reports a payload the send cap had to break up. Only the EXTRA
+// parts are counted: one part is the ordinary case and must not read as a
+// split. The split itself is not logged per payload — the rate is the whole
+// story, and a producer that batches too large does it on every export.
+//
+// What the split could NOT rescue is a different matter and does get a line.
+// Both reasons ship a part the collector will reject, and the FRAMING one is a
+// deliberate refusal to keep splitting: a resource (or scope, or metric
+// description) nearly as large as the cap makes every part re-carry it, which
+// on the unauthenticated -ingest and trace-tier listeners is a sub-10 KB push
+// away from hundreds of GiB of marshal+gzip+send on the goroutine holding the
+// sender's in-flight slot. Shipping the remainder whole costs one round trip
+// for the same delivery outcome — but it IS a loss, so it is counted and, once
+// per window per (signal, reason), said out loud.
+func (c *Client) noteSplit(signal string, parts int, rep otlpsplit.Report) {
+	if parts > 1 {
+		obs.ExportSplitParts.WithLabelValues(signal).Add(float64(parts - 1))
 	}
-	return "ok"
+	if rep.Oversize > 0 {
+		obs.ExportOversizeParts.WithLabelValues(signal, "item").Add(float64(rep.Oversize))
+		if allow, _ := c.splitLog.Allow(signal + "/item"); allow {
+			slog.Default().Warn("sending an OTLP part larger than the send cap: a single record, span or data "+
+				"point exceeds it and nothing can shrink it, so the collector will reject that part; further "+
+				"reports are throttled",
+				"signal", signal, "parts", rep.Oversize, "maxSendBytes", c.cfg.MaxSendBytes)
+		}
+	}
+	if rep.Abandoned > 0 {
+		obs.ExportOversizeParts.WithLabelValues(signal, "framing").Add(float64(rep.Abandoned))
+		if allow, _ := c.splitLog.Allow(signal + "/framing"); allow {
+			slog.Default().Warn("abandoning an OTLP size split: the resource, scope or metric framing every "+
+				"part must re-copy leaves too little room under the send cap, so the remainder ships whole and "+
+				"the collector will reject it; splitting on would have delivered nothing either, at thousands "+
+				"of times the cost. Look for a sender pushing a near-cap resource attribute; further reports "+
+				"are throttled",
+				"signal", signal, "count", rep.Abandoned, "maxSendBytes", c.cfg.MaxSendBytes)
+		}
+	}
+}
+
+// noteSend is the ONE seam every wire send returns through: it counts the
+// attempt and narrates a change in the destination's health. Both halves live
+// here so a new send path cannot pick up one and miss the other — the six
+// counted wrappers (three pdata, three raw) already had to remember the
+// counter, and the report is the half an operator reads first.
+//
+// The outcome label is the payload's FATE, not a bare ok/error: "permanent"
+// means the collector rejected THIS payload and every producer above will drop
+// it, "transient" means it is coming back. Splitting them is what lets an alert
+// distinguish a collector that is down (transient, self-healing) from one that
+// is refusing what this agent sends (permanent, and losing data every time) —
+// a distinction that previously existed only inside IsPermanent, where no
+// operator could see it.
+func (c *Client) noteSend(signal string, err error) error {
+	obs.Exports.WithLabelValues(signal, Class(err)).Inc()
+	c.health.Note(signal, err)
+	return err
 }
 
 // Retry runs send up to attempts times: the sleep comes BEFORE a retry
@@ -532,12 +610,13 @@ func (c *Client) ExportMetrics(ctx context.Context, md pmetric.Metrics) error {
 // exportLogsCounted).
 func (c *Client) exportMetricsCounted(ctx context.Context, md pmetric.Metrics) error {
 	err := c.exportMetricsOnce(ctx, md)
-	obs.Exports.WithLabelValues("metrics", outcome(err)).Inc()
-	return err
+	return c.noteSend("metrics", err)
 }
 
 func (c *Client) exportMetricsOnce(ctx context.Context, md pmetric.Metrics) error {
-	for _, part := range otlpsplit.Metrics(md, c.cfg.MaxSendBytes) {
+	parts, rep := otlpsplit.MetricsWithReport(md, c.cfg.MaxSendBytes)
+	c.noteSplit("metrics", len(parts), rep)
+	for _, part := range parts {
 		if err := c.sendMetricsOnce(ctx, part); err != nil {
 			return err
 		}
@@ -793,6 +872,6 @@ func (c *Client) notePartial(signal string, rejected int64, msg string) {
 	// process default, as the rest of the package's diagnostics do.
 	if allow, _ := c.partialLog.Allow(signal); allow {
 		slog.Default().Warn("the collector accepted the payload but rejected records within it (partial_success)",
-			"signal", signal, "rejected", rejected, "collector_message", msg)
+			"signal", signal, "rejected", rejected, "collectorMessage", msg)
 	}
 }

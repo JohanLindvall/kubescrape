@@ -367,3 +367,44 @@ func TestProtoClassicHistogramAllocationBudget(t *testing.T) {
 			"the family-invariant names or the bucket-bound strings are being rebuilt per metric", perSample, allocs)
 	}
 }
+
+// BenchmarkScrapeSession drives the WHOLE production text front, which no
+// other benchmark in this package covers: parseAndExportFiltered ->
+// scrapeSession.accept (the MaxSamples bound, the filter session, the relabel
+// chain) -> converter.add -> converter.check -> exportIfFull, over a live
+// batcher whose chunk bound actually flushes.
+//
+// BenchmarkConvertScrape deliberately measures the CONVERTER, so it calls
+// fs.Keep and conv.add directly and builds its converter with a NIL emit hook.
+// The consequence is that the per-sample fullness poll — two interface calls
+// through the batch interface, once per data point — is invisible to it, as is
+// everything accept does. Both are on the real path for every one of the 100k
+// samples this package exists to survive, so a regression in either would have
+// shown up in no benchmark at all.
+//
+// The exporter must DISCARD: captureExporter retains every chunk, which grows
+// the live heap across iterations until the GC, not the parse path, is what is
+// being measured.
+func BenchmarkScrapeSession(b *testing.B) {
+	input := k8sScrapeBody(4000)
+	filters, err := NewMetricFilters(map[string][]FilterRule{
+		"targets": {{Action: "drop", Metrics: "(go_|promhttp_|process_start_).+"}},
+	})
+	if err != nil {
+		b.Fatal(err)
+	}
+	s := New(Config{
+		Node: "node1", Interval: time.Hour, Timeout: time.Second,
+		Targets: staticTargets{}, Exporter: discardExporter{},
+		StartTime: time.Unix(1, 0), Filters: filters,
+	})
+	ctx := context.Background()
+	b.SetBytes(int64(len(input)))
+	b.ReportAllocs()
+	for b.Loop() {
+		cb := newBatcher(func(pcommon.Resource) {}, time.Unix(1, 0), time.Unix(2, 0))
+		if _, err := s.parseAndExportFiltered(ctx, strings.NewReader(input), false, false, cb, "targets", "t", "t", nil); err != nil {
+			b.Fatal(err)
+		}
+	}
+}

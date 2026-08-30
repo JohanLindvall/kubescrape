@@ -70,6 +70,29 @@ agent:
     enabled: true
     grpcMaxRecvBytes: 41943040
     peerIpFallback: true
+    # The `from` half of the ingest NetworkPolicy rule. The agent policy used to
+    # be ONE from-less rule covering probes, metrics and these unauthenticated
+    # receivers together, so there was nothing to scope and nothing to pin; this
+    # is what freezes the three-rule split — a regression that merged them would
+    # silently re-scope the probe port with this selector.
+    allowFrom:
+      - namespaceSelector: {matchLabels: {shipping-telemetry: "true"}}
+  # The -debug-token-file gate, on all THREE workloads that run the agent
+  # binary. /debug/otlp streams every record the process exports, so with no
+  # token those routes answer only a local connection; naming a Secret here is
+  # what makes the golden cover the flag, the mount and the volume at all —
+  # they rendered in no fixture while this was empty, and the flag's path comes
+  # from a helper whose whole job is not to drift from the mount.
+  #
+  # allowFrom is deliberately set too: it must land on the -listen rule ONLY,
+  # never on the metrics or ingest ports beside it.
+  debug:
+    tokenSecret:
+      name: kubescrape-debug
+      key: dbg
+    allowFrom:
+      - ipBlock: {cidr: 10.0.0.0/16}
+      - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: ops}}
   config:
     resourceAttributes:
       attributes:
@@ -88,12 +111,24 @@ service:
   scrapeAuthSecrets: true
   scrapeAuthToken:
     value: golden-pinned-token
+  podDisruptionBudget:
+    enabled: true
 serviceGraph:
   enabled: true
   replicas: 2
   spanMetrics: true
+  # Required: the template refuses to render an unauthenticated internal span
+  # receiver (servicegraph.yaml), which is also what the binary refuses. Naming
+  # it here is what makes the golden cover the token Secret's volume and mount
+  # at all — they rendered in no fixture while this was empty.
+  tokenSecret:
+    name: kubescrape-service-graph
   nodeSelector:
     kubernetes.io/os: linux
+  # Both PDBs are on here so the golden covers them: a template that renders in
+  # no fixture is a template nothing checks.
+  podDisruptionBudget:
+    enabled: true
 events:
   enabled: true
   nodeSelector:

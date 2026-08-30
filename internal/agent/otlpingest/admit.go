@@ -485,6 +485,9 @@ func (s *Server) tapAdmit(ctx context.Context, _ *tap.Info) (context.Context, er
 	reserve := int64(s.grpcMaxRecv)
 	if !s.buffer.reserve(reserve) {
 		obs.IngestRejected.Inc()
+		// No peer: see noteShed. This is the one refusal taken before grpc-go
+		// has put the address anywhere this code can reach.
+		s.noteShed(shedBuffer, "")
 		// The same refusal text as the HTTP arm's (errBufferBudget, which
 		// WriteBodyError answers 429 with): one condition, one description,
 		// whichever transport a sender used.
@@ -525,7 +528,7 @@ func (s *Server) noteReserveExpired() {
 	if s.reserveExpiryWarns.Allow(reserveExpiryWarnEvery) {
 		s.log.Warn("reclaimed a gRPC pre-decode buffer reservation and cancelled the stream: "+
 			"a peer opened a stream and delivered no message inside the decode window",
-			"window", s.reserveWindow, "reserved_bytes", s.grpcMaxRecv, "total", total)
+			"window", s.reserveWindow, "reservedBytes", s.grpcMaxRecv, "total", total)
 	}
 }
 

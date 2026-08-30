@@ -111,7 +111,8 @@ func TestMergeHonoursEveryClassifiedField(t *testing.T) {
 			held := mergeHeld("ns/a", servicemonitors.Endpoint{})
 			if class == inertClass {
 				want := held
-				adopted, conflict := MergeMonitorEndpoint(&held, "ns/b", ep)
+				rep := MergeMonitorEndpoint(&held, "ns/b", ep)
+				adopted, conflict := rep.AuthAdopted, rep.AuthConflict
 				if adopted || conflict || held.Monitors != nil || !reflect.DeepEqual(held, want) {
 					t.Fatalf("Endpoint.%s is classified inert but the merge acted on it: adopted=%v conflict=%v target=%+v",
 						field, adopted, conflict, held)
@@ -123,7 +124,8 @@ func TestMergeHonoursEveryClassifiedField(t *testing.T) {
 					"carrying only it reads as BARE and the declaration is dropped on any shared URL "+
 					"(extend authMaterial/endpointAuth/targetAuth/stampAuth in merge.go)", field)
 			}
-			adopted, conflict := MergeMonitorEndpoint(&held, "ns/b", ep)
+			rep := MergeMonitorEndpoint(&held, "ns/b", ep)
+			adopted, conflict := rep.AuthAdopted, rep.AuthConflict
 			if conflict {
 				t.Fatalf("Endpoint.%s carried alone conflicted against an empty holder", field)
 			}
@@ -173,7 +175,8 @@ func TestEachDeclaredAuthFieldConflictsWhenDiffering(t *testing.T) {
 			held := mergeHeld("ns/a", *ep)
 			ep2 := &servicemonitors.Endpoint{}
 			setEndpointField(t, ep2, field, "sentinel-2-"+field)
-			adopted, conflict := MergeMonitorEndpoint(&held, "ns/b", ep2)
+			rep := MergeMonitorEndpoint(&held, "ns/b", ep2)
+			adopted, conflict := rep.AuthAdopted, rep.AuthConflict
 			if adopted || !conflict {
 				t.Fatalf("Endpoint.%s differing: adopted=%v conflict=%v, want the conflict reported", field, adopted, conflict)
 			}

@@ -72,6 +72,10 @@ var featureFlags = []string{
 	"--set", "events.enabled=true",
 	"--set", "serviceGraph.enabled=true",
 	"--set", "serviceGraph.spanMetrics=true",
+	// Not a feature: the trace tier refuses to RENDER without a token secret
+	// (servicegraph.yaml), because the binary refuses to start without one.
+	// Turning the tier on is what pulls this in.
+	"--set", "serviceGraph.tokenSecret.name=kubescrape-service-graph",
 }
 
 // TestDurationValuesAreSchemaGuarded is the DRIFT guard: it derives, from the

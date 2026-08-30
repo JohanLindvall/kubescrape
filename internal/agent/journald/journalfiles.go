@@ -128,5 +128,5 @@ func warnIfJournalEmpty(cfg Config) {
 	}
 	log.Warn("-journald is enabled but the journal holds no readable journal files: this reader will export nothing",
 		"lookedIn", strings.Join(detail, "; "),
-		"hint", "mount the node's journal into the pod — a VOLATILE journal (systemd Storage=volatile, or auto with no /var/log/journal) lives only under /run/log/journal, which the /var/log mount does not cover; the Helm chart adds that hostPath when agent.journald.enabled is set, and deploy/agent.yaml carries it commented out beside the flag")
+		"note", "mount the node's journal into the pod — a VOLATILE journal (systemd Storage=volatile, or auto with no /var/log/journal) lives only under /run/log/journal, which the /var/log mount does not cover; the Helm chart adds that hostPath when agent.journald.enabled is set, and deploy/agent.yaml carries it commented out beside the flag")
 }

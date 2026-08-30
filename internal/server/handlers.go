@@ -11,9 +11,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"math"
 	"net/http"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -24,9 +25,12 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/validate/content"
 
+	"github.com/JohanLindvall/kubescrape/internal/agent/attrs"
+	"github.com/JohanLindvall/kubescrape/internal/logdedupe"
 	"github.com/JohanLindvall/kubescrape/internal/obs"
 	"github.com/JohanLindvall/kubescrape/internal/peerip"
 	"github.com/JohanLindvall/kubescrape/internal/scrape"
+	"github.com/JohanLindvall/kubescrape/internal/servicemonitors"
 	"github.com/JohanLindvall/kubescrape/internal/services"
 	"github.com/JohanLindvall/kubescrape/internal/store"
 	"github.com/JohanLindvall/kubescrape/pkg/kubemeta"
@@ -75,6 +79,19 @@ func (s *Server) handleContainer(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), wait)
 	defer cancel()
 
+	// The one Debug seam on this route, and the reason it is a seam rather
+	// than a line per request: /v1/containers is polled by every agent for
+	// every log file, so an unconditional entry line is a flood at Info cost.
+	// slog evaluates arguments EAGERLY, so even the time.Now() below is behind
+	// the level check; everything emitted from here reports a TRANSITION (a
+	// lookup that actually blocked, or one that was refused), never the warm
+	// path.
+	debug := s.log().Enabled(ctx, slog.LevelDebug)
+	var started time.Time
+	if debug {
+		started = time.Now()
+	}
+
 	// Don't report "not found" from a cache that hasn't finished its initial
 	// sync; spend the wait budget on readiness first if needed. A drain ends
 	// that wait too — the shutdown path must not leave a request parked here
@@ -101,11 +118,55 @@ func (s *Server) handleContainer(w http.ResponseWriter, r *http.Request) {
 		// (ErrShuttingDown). Either way retryable, never a 404: the container
 		// may exist momentarily, and on the shutdown path the next pod behind
 		// the Service can answer at once.
+		//
+		// Both are counted (kubescrape_container_lookups_shed_total and
+		// _drained_total), and the counters are what an alert reads; this line
+		// is what an incident reads, because a shed storm's counter says how
+		// many and never WHICH — and "the agent's first poll returned nothing"
+		// is answered by seeing the ids that were refused.
+		if debug {
+			s.log().Debug("container lookup refused before it could wait",
+				"id", id, "wait", wait, "error", err)
+		}
 		w.Header().Set("Retry-After", "1")
 		writeError(w, http.StatusServiceUnavailable, err.Error())
 		return
 	}
+	if debug {
+		// A lookup that PARKED and one that hit the warm index are the same
+		// call here — the store does not report which it did — so the elapsed
+		// time is the discriminator, and blockedLookupFloor is what keeps the
+		// warm path (microseconds) from emitting anything. Reporting per
+		// transition rather than per request is the whole discipline: this
+		// fires for a lookup that waited, whatever it then returned.
+		if waited := time.Since(started); waited >= blockedLookupFloor {
+			s.log().Debug("container lookup blocked and then woke",
+				"id", id, "waited", waited.Round(time.Millisecond), "wait", wait, "found", ok)
+		}
+	}
 	if !ok {
+		// A lookup that BLOCKED for its whole budget and a lookup that missed
+		// instantly are the same 404 to
+		// kubescrape_http_requests_total{code="404"}, and they mean opposite
+		// things (see obs.ContainerLookupTimeouts). DeadlineExceeded rather
+		// than any ctx error: a client that hangs up mid-wait cancels, which
+		// says nothing about the store, and wait>0 excludes the ?wait=0
+		// pollers whose context is already expired on arrival.
+		if wait > 0 && errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			obs.ContainerLookupTimeouts.Inc()
+			// Keyless: container ids churn, so a keyed table would fill with
+			// keys that never repeat. The counter carries the rate and the
+			// line carries one example to look up.
+			if s.warnLookupTimeout.Allow(lookupTimeoutWarnEvery) {
+				s.log().Warn("container lookup timed out: the id never appeared in the store within the wait budget",
+					"id", id, "wait", wait,
+					"note", "the agent retries, and the log lines of that container stay unattributed until it "+
+						"resolves. A one-off is normal (the wait covers the gap between a container starting "+
+						"and the kubelet posting its id, and a rotated file's id may never return); a sustained "+
+						"rate means this replica's pod informer is not seeing those pods. Further reports are "+
+						"suppressed for "+lookupTimeoutWarnEvery.String())
+			}
+		}
 		writeError(w, http.StatusNotFound, fmt.Sprintf("container %q not found", id))
 		return
 	}
@@ -116,6 +177,22 @@ func (s *Server) handleContainer(w http.ResponseWriter, r *http.Request) {
 		Pod:         res.Pod,
 	}, false)
 }
+
+// lookupTimeoutWarnEvery bounds the container-lookup timeout warning. Like
+// every other repeating condition in this file it is a STATE — a pod the
+// informer cannot see stays unseen — and the noticing code runs once per
+// agent per file per retry, so an unthrottled line is a flood proportional to
+// fleet size.
+const lookupTimeoutWarnEvery = 5 * time.Minute
+
+// blockedLookupFloor is the elapsed time above which a container lookup is
+// reported (at Debug) as having BLOCKED. A warm hit is a read-locked map probe
+// — microseconds — so anything past a millisecond either parked on the waiter
+// channel or spent time in the readiness park, which are the two transitions
+// worth a per-request line. The floor is deliberately generous: a busy
+// scheduler can stretch a warm lookup, and a false line here is noise on the
+// route with the highest request rate in the process.
+const blockedLookupFloor = time.Millisecond
 
 // cachePolicy selects the cache headers a pod response carries.
 type cachePolicy int
@@ -275,16 +352,53 @@ func (s *Server) handlePodByIP(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleSelf(w http.ResponseWriter, r *http.Request) {
 	ip := peerip.From(r.RemoteAddr)
 	if ip == "" {
+		// net/http builds RemoteAddr from the accepted connection, so this is
+		// a "cannot happen" branch — which is exactly why it is reported
+		// rather than left as a bare 400: reaching it means the listener is
+		// not what this code assumes (a custom net.Listener, a Unix socket),
+		// and every self-attribution on it fails identically and silently.
+		obs.SelfLookupRefused.WithLabelValues("unparseable_peer").Inc()
+		if s.warnSelfPeer.Allow(selfWarnEvery) {
+			s.log().Warn("/v1/self cannot read the connection's source address, so no caller can be attributed",
+				"peer", clipSegment(r.RemoteAddr),
+				"note", "further reports are suppressed for "+selfWarnEvery.String())
+		}
 		writeError(w, http.StatusBadRequest, fmt.Sprintf("unparseable peer address %q", r.RemoteAddr))
 		return
 	}
 	via := forwardedVia(r)
+	if via != "" {
+		// The refusal is deliberate and it COSTS something (see the doc above:
+		// a mesh sidecar in the caller's own network namespace lands here),
+		// so it is counted and named. Without this the only trace was a 404 an
+		// operator cannot tell from "this agent is on hostNetwork", on a route
+		// whose whole job is to hand out an identity.
+		obs.SelfLookupRefused.WithLabelValues("forwarded").Inc()
+		if s.warnSelfForwarded.Allow(selfWarnEvery) {
+			s.log().Warn("/v1/self refused: the request carries a forwarding header, so the connection is a "+
+				"hop's and not the caller's",
+				"header", via, "peer", ip,
+				"note", "the caller falls back to a lookup by name ($POD_NAMESPACE/$POD_NAME), which resolves "+
+					"to the same pod at one extra request per -self-attributes-refresh; if a service mesh adds "+
+					"the header on the caller's own pod this is the only cost. Further reports are suppressed "+
+					"for "+selfWarnEvery.String())
+		}
+	}
 	s.servePod(w, r, cachePrivate,
 		func() (store.NodePod, bool) {
 			if via != "" {
 				return store.NodePod{}, false
 			}
-			return s.store.GetPodByIP(ip)
+			np, ok := s.store.GetPodByIP(ip)
+			if !ok {
+				// EXPECTED for a hostNetwork agent (it shares the node
+				// address) and for one behind SNAT, so it is counted and not
+				// logged: the remedy is the by-name fallback the agent
+				// already runs, and this rate is how an operator tells that
+				// fallback's population from a genuine attribution outage.
+				obs.SelfLookupRefused.WithLabelValues("no_pod").Inc()
+			}
+			return np, ok
 		},
 		func() string {
 			if via != "" {
@@ -294,6 +408,11 @@ func (s *Server) handleSelf(w http.ResponseWriter, r *http.Request) {
 			return fmt.Sprintf("no live pod with peer IP %q", ip)
 		})
 }
+
+// selfWarnEvery bounds the /v1/self refusal warnings. Every agent re-reads its
+// own pod on -self-attributes-refresh (1m), so both conditions repeat once per
+// agent per minute for as long as they last.
+const selfWarnEvery = 15 * time.Minute
 
 // forwardedHeaders are the headers a hop sets when it re-originates a request.
 // Any one of them present is the hop declaring itself, which is the only
@@ -355,6 +474,7 @@ func (s *Server) handleNodeTargets(w http.ResponseWriter, r *http.Request) {
 	}
 	body, err := json.Marshal(doc)
 	if err != nil {
+		s.reportEncodeFailure("node targets", err)
 		writeError(w, http.StatusInternalServerError, "encoding response")
 		return
 	}
@@ -441,6 +561,13 @@ func (s *Server) nodeTargets(node string) (targets []kubemeta.ScrapeTarget, buil
 				// N while the loop used to build 125 targets per pod to keep 2.
 				url, ok := scrape.MonitorTargetURL(np.Pod, svc, *sme.endpoint)
 				if !ok {
+					// The pod is Scrapeable (checked above) and svc is
+					// non-nil, so the ONLY way to get here is the port: the
+					// endpoint names one this pod does not declare. That pod
+					// is simply absent from the target list — no scrape
+					// fails, nothing is logged by the agent, and the series
+					// never appear.
+					s.reportUnresolvedEndpoint("servicemonitor", sme.monitor, sme.endpoint, &np.Pod)
 					continue
 				}
 				// Two Services selecting one pod offer each of their monitors'
@@ -456,12 +583,20 @@ func (s *Server) nodeTargets(node string) (targets []kubemeta.ScrapeTarget, buil
 					// worth reporting, attributed to the monitor whose
 					// material is actually served (which may be a merged
 					// contributor's, not the URL holder's).
-					adopted, conflict := scrape.MergeMonitorEndpoint(held, sme.monitor, sme.endpoint)
-					if adopted {
+					rep := scrape.MergeMonitorEndpoint(held, sme.monitor, sme.endpoint)
+					d.charge(rep.Bytes)
+					if rep.AuthAdopted {
 						d.adoptedAuth(url, sme.monitor)
 					}
-					if conflict {
+					if rep.AuthConflict {
 						s.reportAuthConflict("servicemonitor", d.servingAuth(url, held.Monitor), sme.monitor, url)
+					}
+					if rep.RelabelCapped {
+						s.reportRelabelCapped("servicemonitor", sme.monitor, url)
+					}
+					if rep.ContributorsCapped {
+						s.reportContributorsCapped("servicemonitor", sme.monitor, url,
+							d.firstContribCap("servicemonitor", url))
 					}
 					continue
 				}
@@ -475,15 +610,24 @@ func (s *Server) nodeTargets(node string) (targets []kubemeta.ScrapeTarget, buil
 				ep := &pm.monitor.Endpoints[i]
 				url, ok := scrape.PodMonitorTargetURL(np.Pod, *ep)
 				if !ok {
+					s.reportUnresolvedEndpoint("podmonitor", pm.name, ep, &np.Pod)
 					continue
 				}
 				if held, taken := d.monitorHolder(url); taken {
-					adopted, conflict := scrape.MergeMonitorEndpoint(held, pm.name, ep)
-					if adopted {
+					rep := scrape.MergeMonitorEndpoint(held, pm.name, ep)
+					d.charge(rep.Bytes)
+					if rep.AuthAdopted {
 						d.adoptedAuth(url, pm.name)
 					}
-					if conflict {
+					if rep.AuthConflict {
 						s.reportAuthConflict("podmonitor", d.servingAuth(url, held.Monitor), pm.name, url)
+					}
+					if rep.RelabelCapped {
+						s.reportRelabelCapped("podmonitor", pm.name, url)
+					}
+					if rep.ContributorsCapped {
+						s.reportContributorsCapped("podmonitor", pm.name, url,
+							d.firstContribCap("podmonitor", url))
 					}
 					continue
 				}
@@ -491,6 +635,14 @@ func (s *Server) nodeTargets(node string) (targets []kubemeta.ScrapeTarget, buil
 					d.add(t)
 				}
 			}
+		}
+		// After every door has offered: the ceiling binds across all of them,
+		// so no single door can report it (targetDedup.capped's own comment).
+		// Reported HERE and not inside add, so /v1/explain — which derives
+		// through the same accumulator — stays read-only, like the two sibling
+		// decision signals it suppresses by not calling them.
+		if d.capped > 0 {
+			s.reportPodCapped(&np.Pod, &d)
 		}
 	}
 	s.svcSelectorEvals.Add(evals)
@@ -501,18 +653,16 @@ func (s *Server) nodeTargets(node string) (targets []kubemeta.ScrapeTarget, buil
 	// makes the order TOTAL in the one case URL+monitor+source cannot separate
 	// (two hostNetwork pods sharing the node IP with the same annotated port —
 	// identical URL, empty Monitor, Source "pod", but different pod documents).
-	sort.Slice(targets, func(i, j int) bool {
-		if targets[i].URL != targets[j].URL {
-			return targets[i].URL < targets[j].URL
-		}
-		if targets[i].Monitor != targets[j].Monitor {
-			return targets[i].Monitor < targets[j].Monitor
-		}
-		if targets[i].Source != targets[j].Source {
-			return targets[i].Source < targets[j].Source
-		}
-		return targets[i].Pod.UID < targets[j].Pod.UID
-	})
+	//
+	// Sorted through an index PERMUTATION rather than by moving the targets
+	// themselves. A ScrapeTarget is 616 bytes and embeds the whole pod
+	// document by value, so a comparison sort over the elements does its
+	// ~n log n swaps as 616-byte typedmemmoves — every one of them a write
+	// barrier, taken while this same request is allocating the pod copies that
+	// keep the GC marking. Sorting int32 indices does those swaps 8 bytes at a
+	// time and applies the result in n element moves, and it drops sort.Slice's
+	// reflect swapper (3 allocs) with it.
+	sortTargets(targets)
 	// Every declaration on the node has been offered, so the served list is
 	// final and the identities it exports can be checked against each other.
 	// AFTER the sort, so the members of a group are listed in the order the
@@ -521,6 +671,75 @@ func (s *Server) nodeTargets(node string) (targets []kubemeta.ScrapeTarget, buil
 		s.reportInstanceCollision(c)
 	}
 	return targets, true
+}
+
+// sortTargets orders a node's target list by (URL, Monitor, Source, pod UID)
+// — the total order handleNodeTargets' ETag depends on — without ever moving a
+// ScrapeTarget through a comparison sort.
+//
+// The element is 616 bytes and embeds the pod document, so sorting the slice
+// directly pays ~n log n write-barriered 616-byte moves; sorting a permutation
+// of int32 indices pays them 8 bytes at a time and then applies the answer in
+// n moves. The MACHINE-INDEPENDENT half of that, which is what this repo quotes:
+// 3 allocations (sort.Slice's reflect swapper) become 1, pinned by
+// TestSortTargetsDoesNotAllocateAReflectSwapper. A CPU profile of the route put
+// sort.Slice at 9.1% of handleNodeTargets with 7.0 points of that in
+// typedmemmove and write-barrier flushing, and an isolated single-run
+// comparison at n=110 read 62 µs against 19 µs — indicative only, on a machine
+// whose demonstrated benchmark noise floor is far larger than that gap.
+//
+// slices.SortFunc over the targets THEMSELVES is not the fix and measured worse
+// than sort.Slice: its comparator takes the element BY VALUE, so every
+// comparison copies 616 bytes.
+func sortTargets(targets []kubemeta.ScrapeTarget) {
+	if len(targets) < 2 {
+		return
+	}
+	idx := make([]int32, len(targets))
+	for i := range idx {
+		idx[i] = int32(i)
+	}
+	slices.SortFunc(idx, func(a, b int32) int {
+		// One Compare per field, not an inequality test followed by a Compare:
+		// the URLs of two targets usually DIFFER, so the guard form paid the
+		// string comparison twice on the field that decides almost every call.
+		x, y := &targets[a], &targets[b]
+		if c := strings.Compare(x.URL, y.URL); c != 0 {
+			return c
+		}
+		if c := strings.Compare(x.Monitor, y.Monitor); c != 0 {
+			return c
+		}
+		if c := strings.Compare(x.Source, y.Source); c != 0 {
+			return c
+		}
+		return strings.Compare(x.Pod.UID, y.Pod.UID)
+	})
+	permuteTargets(targets, idx)
+}
+
+// permuteTargets rewrites s so that s[i] becomes the element idx[i] named,
+// following each cycle of the permutation with one element of scratch. It
+// CONSUMES idx (visited slots are marked -1), which is why it is unexported and
+// called only from sortTargets.
+func permuteTargets(s []kubemeta.ScrapeTarget, idx []int32) {
+	for i := range idx {
+		if idx[i] < 0 {
+			continue // already moved as part of an earlier cycle
+		}
+		j := int32(i)
+		tmp := s[i]
+		for {
+			k := idx[j]
+			idx[j] = -1
+			if k == int32(i) {
+				s[j] = tmp // the cycle closes on the element we lifted out
+				break
+			}
+			s[j] = s[k]
+			j = k
+		}
+	}
 }
 
 // podNamespaces lists the distinct namespaces of a node's pods, for the one
@@ -563,7 +782,11 @@ func podNamespaces(pods []store.NodePod) []string {
 //
 // /v1/explain deliberately does NOT narrow: it reports every Service whose
 // selector matches, annotated or not, because "this Service selects your pod
-// and opts into nothing" is exactly the answer an operator came for.
+// and opts into nothing" is exactly the answer an operator came for. It bounds
+// how many it LISTS instead (maxExplainServices, with the remainder counted
+// into servicesNotShown) — an unnarrowed walk over a tenant-grown population
+// is the right answer; materialising all of it into an unauthenticated
+// response is not.
 func optInServices(byNamespace map[string][]*services.Service, monitored map[string][]monitorEndpoint) map[string][]*services.Service {
 	var out map[string][]*services.Service
 	for ns, list := range byNamespace {
@@ -675,6 +898,34 @@ type targetDedup struct {
 	// pod") sent the operator to a document that reported every refused
 	// endpoint as resolving.
 	capped int
+	// cappedBySize is how many of capped were refused by the BYTE ceiling
+	// (scrape.MaxTargetBytesPerPod) rather than by the count one. Both are
+	// per-pod ceilings on the same accumulation and both move the same
+	// counter, but they are different questions to an operator — "you declared
+	// more than 16 ports" versus "your pod document is too big to copy that
+	// many times" — and the second one binds at a target count that looks
+	// perfectly ordinary. It is what the warning names and what /v1/explain
+	// reports beside the total.
+	cappedBySize int
+	// podBytes is scrape.PodDocBytes for the pod currently being derived,
+	// measured ONCE per pod (lazily, off the first target offered) rather than
+	// once per target: every target of a pod embeds the same document, and this
+	// derivation runs for every pod on the node on every agent poll. The walk
+	// is allocation-free and touches the map ENTRIES, not their bytes, so a
+	// 200 KiB annotation costs one addition — 0 allocs/op and ~O(labels +
+	// annotations + containers) per pod, against the json.Marshal per pod the
+	// obvious implementation would pay.
+	//
+	// Zero means "not measured yet": PodDocBytes has a fixed floor and can
+	// never return 0, so the sentinel cannot be confused with an answer.
+	podBytes int
+	// bytes is what THIS pod's accepted targets have charged against
+	// scrape.MaxTargetBytesPerPod. Charged on the NEW-URL arm only, like the
+	// count ceiling: a merge adds no target and therefore no copy of the pod
+	// document (what it CAN grow — the merged relabel chain and the contributor
+	// list — has its own two ceilings, which is why those still earn their
+	// keep beside this one).
+	bytes int
 	// diagnostic marks a derivation run for /v1/explain rather than for a
 	// served response: capped still counts (the document names the refusals),
 	// but obs.ScrapeTargetsCapped must NOT move. The counter is per-derivation
@@ -690,6 +941,44 @@ type targetDedup struct {
 	// Set once by explainPod BEFORE reset and never cleared: it is a property
 	// of the derivation, not of the pod being reset onto.
 	diagnostic bool
+	// contribCapReported holds the (kind, URL) pairs this POD has already
+	// reported as contributor-capped, so the LOG side of that report runs once
+	// per URL per derivation instead of once per refused monitor.
+	//
+	// It exists because the report's throttle key had to be BUILT before the
+	// throttle could refuse it: `kind + "\x00" + url` is an allocation, and the
+	// condition fires once for every monitor past scrape.MaxContributorsPerTarget
+	// — so the guard that bounds an abuse allocated in proportion to it
+	// (measured +68 allocs/op on a 100-monitor pile-up, exactly N-32, and 68
+	// mutex round trips through the dedupe table with them). The counter still
+	// moves per refusal; only the line is folded.
+	//
+	// A struct key rather than a concatenated one: Go hashes a comparable
+	// struct without materialising it, so the lookup that decides is free and
+	// only the first refusal of a URL pays anything. Lazily allocated — a pod
+	// that never fills a contributor list never allocates it — and bounded by
+	// the pod's own URL count, which scrape.MaxPortsPerPod already caps.
+	contribCapReported map[contribCapKey]struct{}
+}
+
+// contribCapKey identifies one contributor-ceiling report within a pod's
+// derivation. The kind is part of it because obs.MonitorContributorsCapped is
+// labelled by kind and the two monitor kinds reach a shared target
+// independently.
+type contribCapKey struct{ kind, url string }
+
+// firstContribCap reports whether this pod's derivation has yet logged the
+// contributor ceiling for (kind, url), recording it if not.
+func (d *targetDedup) firstContribCap(kind, url string) bool {
+	k := contribCapKey{kind: kind, url: url}
+	if _, dup := d.contribCapReported[k]; dup {
+		return false
+	}
+	if d.contribCapReported == nil {
+		d.contribCapReported = make(map[contribCapKey]struct{}, 1)
+	}
+	d.contribCapReported[k] = struct{}{}
+	return true
 }
 
 // reset points the dedup at a fresh pod. The maps are reused across pods:
@@ -698,12 +987,16 @@ func (d *targetDedup) reset(out *[]kubemeta.ScrapeTarget) {
 	d.out = out
 	d.base = len(*out)
 	d.capped = 0
+	d.cappedBySize = 0
+	d.podBytes = 0
+	d.bytes = 0
 	if d.urlOwner == nil {
 		d.urlOwner = make(map[string]int, 4)
 	} else {
 		clear(d.urlOwner)
 	}
 	clear(d.authOwner)
+	clear(d.contribCapReported)
 }
 
 // collisions reports the served targets of THIS pod that the URL dedup keeps
@@ -765,41 +1058,94 @@ func (d *targetDedup) monitorHolder(url string) (*kubemeta.ScrapeTarget, bool) {
 	return held, true
 }
 
-// add offers a target to the accumulator, reporting whether it was ACCEPTED —
-// false means the per-pod ceiling refused it and this pod will not be scraped
+// targetVerdict is add's answer: accepted, or WHICH of the two per-pod ceilings
+// refused it. A bool cannot carry the second half, and the second half is the
+// whole difference between "you declared more ports than the ceiling admits"
+// and "your pod document is too large to copy this many times" — two different
+// remedies, reported to the operator through two different wordings
+// (scrape.CeilingNote and scrape.SizeCeilingNote).
+type targetVerdict int
+
+const (
+	targetAccepted targetVerdict = iota
+	targetRefusedCount
+	targetRefusedBytes
+)
+
+// ok reports whether the target was accepted into the served list.
+func (v targetVerdict) ok() bool { return v == targetAccepted }
+
+// note is the /v1/explain wording for this verdict against subject ("this
+// endpoint", "port 8080, 8081"), empty when the target was accepted. The
+// wordings are internal/scrape's — the one spelling, beside the ceilings
+// themselves.
+func (v targetVerdict) note(subject string, podBytes int) string {
+	switch v {
+	case targetRefusedCount:
+		return scrape.CeilingNote(subject)
+	case targetRefusedBytes:
+		return scrape.SizeCeilingNote(subject, podBytes)
+	}
+	return ""
+}
+
+// add offers a target to the accumulator, reporting whether it was ACCEPTED and
+// — when it was not — which ceiling refused it, so this pod will not be scraped
 // on that URL. The verdict is returned rather than merely counted because the
-// ceiling binds HERE and nowhere else: with two doors contributing, each
-// individually under the ceiling, no door can tell which of its own targets
-// survived, so /v1/explain can only name a refused port or endpoint by asking
-// the accumulator. The served path ignores the result (it reports the refusal
-// through obs.ScrapeTargetsCapped).
-func (d *targetDedup) add(t kubemeta.ScrapeTarget) bool {
+// ceilings bind HERE and nowhere else: with two doors contributing, each
+// individually under both, no door can tell which of its own targets survived,
+// so /v1/explain can only name a refused port or endpoint by asking the
+// accumulator. The served path ignores the result (it reports the refusal
+// through obs.ScrapeTargetsCapped and reportPodCapped).
+func (d *targetDedup) add(t kubemeta.ScrapeTarget) targetVerdict {
 	i, taken := d.urlOwner[t.URL]
 	if !taken {
-		// The per-pod ceiling, counted on the NEW-URL arm only: a target that
+		// Both per-pod ceilings, applied on the NEW-URL arm only: a target that
 		// merges into a URL this pod already holds costs no extra response
 		// bytes, so it must not be refused (16 entries collapsing to 3 URLs
 		// legitimately yields 3). Refusing here loses that endpoint — which is
 		// why it is counted and reported by /v1/explain rather than silent.
 		if len(*d.out)-d.base >= scrape.MaxPortsPerPod {
-			d.capped++
-			if !d.diagnostic {
-				// See diagnostic: explain derives through this same seam, and
-				// a read-only diagnostic must not move a decision counter.
-				obs.ScrapeTargetsCapped.Inc()
-			}
-			return false
+			return d.refuse(targetRefusedCount)
 		}
+		// Measured once per pod, off the first target offered: every target of
+		// this pod embeds the same document (see podBytes).
+		if d.podBytes == 0 {
+			d.podBytes = scrape.PodDocBytes(&t.Pod)
+		}
+		// The pod's FIRST target is unconditional. The byte budget exists to
+		// bound the MULTIPLIER — N copies of one document — and a pod whose
+		// annotations are large but honest must still be scraped somewhere,
+		// or the ceiling silently stops collecting from a workload that did
+		// nothing wrong. Its cost is still CHARGED, so the second target is
+		// measured against the truth.
+		first := len(*d.out) == d.base
+		// The pod document is the FLOOR of any target's cost, so once it alone
+		// no longer fits, nothing offered afterwards can: refuse without
+		// walking the target's own fields. That is the arm a pile-up of
+		// distinct URLs runs down, and the cost of refusing must not scale
+		// with what is being refused.
+		if !first && d.bytes+d.podBytes > scrape.MaxTargetBytesPerPod {
+			return d.refuse(targetRefusedBytes)
+		}
+		cost := scrape.TargetDocBytes(&t, d.podBytes)
+		// And the whole document, for the target whose OWN fields are what
+		// overflow: a 2 KiB path beside a 16 KiB merged chain is inside every
+		// per-field ceiling and still 18 KiB per target.
+		if !first && d.bytes+cost > scrape.MaxTargetBytesPerPod {
+			return d.refuse(targetRefusedBytes)
+		}
+		d.bytes += cost
 		d.urlOwner[t.URL] = len(*d.out)
 		*d.out = append(*d.out, t)
-		return true
+		return targetAccepted
 	}
 	// pod source wins over service source, and a monitor wins over both.
 	held := &(*d.out)[i]
 	if configuredTarget(&t) && !configuredTarget(held) {
 		carryForward(&t, held)
 		*held = t
-		return true
+		return targetAccepted
 	}
 	// The holder keeps the URL — and carries forward from the target it
 	// displaces, on this path too. The preference is about which DECLARATION
@@ -811,7 +1157,39 @@ func (d *targetDedup) add(t kubemeta.ScrapeTarget) bool {
 	// replace path, on the arm nobody had looked at. Which Service donates is
 	// deterministic: matchingServices preserves the snapshot's name order.
 	carryForward(held, &t)
-	return true
+	return targetAccepted
+}
+
+// charge spends n bytes of THIS pod's byte budget on a target the accumulator
+// already holds — the MERGE arm, where nothing is appended and the count
+// ceiling has nothing to look at.
+//
+// The budget's claim is that it charges the whole target document, and until
+// this existed that claim stopped at the merge: a target N monitors fold into
+// grows by its merged relabel chain and its contributor list, both bounded but
+// both on TOP of the budget (see scrape.MergeReport.Bytes for the size). It
+// refuses nothing — a refused merge would drop relabel rules a monitor asked
+// for, i.e. change what is EXPORTED in order to bound a response — it only
+// makes the pod's remaining budget honest, so the next NEW url is measured
+// against what is really being served.
+func (d *targetDedup) charge(n int) { d.bytes += n }
+
+// refuse records one refusal by ceiling v and returns it. Both ceilings move
+// the SAME counter — a refused target is a refused target, and the rate an
+// operator alerts on is "endpoints this node is not scraping" — while
+// cappedBySize keeps the two apart for the warning and for /v1/explain, which
+// have to name the remedy.
+func (d *targetDedup) refuse(v targetVerdict) targetVerdict {
+	d.capped++
+	if v == targetRefusedBytes {
+		d.cappedBySize++
+	}
+	if !d.diagnostic {
+		// See diagnostic: explain derives through this same seam, and a
+		// read-only diagnostic must not move a decision counter.
+		obs.ScrapeTargetsCapped.Inc()
+	}
+	return v
 }
 
 // carryForward moves the fields the losing target had and the winner lacks.
@@ -828,6 +1206,161 @@ func carryForward(winner, loser *kubemeta.ScrapeTarget) {
 	if winner.Service == nil {
 		winner.Service = loser.Service
 	}
+}
+
+// unresolvedWarnEvery and maxUnresolvedWarnKeys bound the unresolved-endpoint
+// warning. Keys are (kind, monitor) — cluster OBJECTS — so the live set is
+// bounded by the monitor CRs however many pods they select, however often
+// those pods are replaced, and however many endpoints each CR declares.
+//
+// The port SPELLING used to be the third part of the key, and it is content
+// rather than identity: one ServiceMonitor may declare as many endpoints as
+// fit in an etcd object, each naming a distinct port string of a length its
+// author picks. That mints keys — arbitrarily many, arbitrarily long — in a
+// bounded table that SUPPRESSES on saturation (internal/logdedupe's rule), so
+// anyone able to write one monitor in one namespace could stop this warning
+// from ever reporting anyone else's broken endpoint. The port still rides the
+// LINE, clipped: the same trade internal/agent/promscrape's warnOnce made when
+// it took a monitor's duration value out of its key. The cost is that a
+// monitor with several unresolved endpoints reports one of them per window
+// instead of each — the line names which, and the remedy is the same CR.
+const (
+	unresolvedWarnEvery   = 30 * time.Minute
+	maxUnresolvedWarnKeys = 1024
+)
+
+// maxLoggedPortBytes bounds the port spelling on the line. A CR field is
+// bounded only by the object's own size, and a megabyte of it in a log record
+// is a second flood in the shape of one line. The sibling constant is
+// internal/agent/promscrape's maxLoggedValueBytes, which bounds the same class
+// of value for the same reason.
+const maxLoggedPortBytes = 96
+
+// clipPort renders a CR-supplied port spelling for a log attribute: bounded,
+// and cut on a rune boundary so a clipped UTF-8 sequence does not reach the
+// log pipeline as a replacement character.
+func clipPort(v string) string {
+	if len(v) <= maxLoggedPortBytes {
+		return v
+	}
+	cut := maxLoggedPortBytes
+	for cut > 0 && !utf8.RuneStart(v[cut]) {
+		cut--
+	}
+	return v[:cut] + "…"
+}
+
+// reportUnresolvedEndpoint warns that a monitor endpoint names a port the pod
+// its selector matched does not declare, so that pod produces no target for it.
+//
+// This is the commonest ServiceMonitor mistake there is — a `port:` naming the
+// Service port that does not exist, or a container port that was renamed — and
+// it was the least visible outcome on the whole derivation: prometheus-operator
+// emits no scrape config for such an endpoint either, so there is no failing
+// scrape, no up=0, and no counter anywhere. The pod is just missing, which
+// looks exactly like a pod nobody asked to scrape. /v1/explain says so per pod,
+// but only to someone who already suspects this pod.
+//
+// An endpoint naming NEITHER port nor targetPort is deliberately skipped: that
+// one already rides Endpoint.Ignored ("port(unset)"), which the metadata
+// service logs once per changed monitor and counts as
+// kubescrape_monitor_fields_ignored_total. Reporting it here too would say the
+// same thing per pod per cycle.
+func (s *Server) reportUnresolvedEndpoint(kind, monitor string, ep *servicemonitors.Endpoint, pod *kubemeta.Pod) {
+	if ep.Port == "" && ep.TargetPort == nil {
+		return
+	}
+	port := endpointPortSpelling(ep)
+	// IDENTITY only: see maxUnresolvedWarnKeys for why the port spelling is on
+	// the line but not in the key.
+	allow, saturated := s.warnUnresolved.Allow(kind + "\x00" + monitor)
+	if saturated {
+		s.log().Warn("unresolved-endpoint warning dedupe table is full; further distinct endpoints are suppressed",
+			"keys", maxUnresolvedWarnKeys)
+	}
+	if !allow {
+		return
+	}
+	s.log().Warn("monitor endpoint names a port the selected pod does not declare, so that pod yields no scrape target",
+		"kind", kind, "monitor", monitor, "port", clipPort(port),
+		"namespace", pod.Namespace, "pod", pod.Name,
+		"note", "the pod is simply absent from the target list — no scrape fails and nothing is exported for it. "+
+			"GET /v1/explain/"+pod.Namespace+"/"+pod.Name+" lists the pod's declared ports beside this verdict. "+
+			"A ServiceMonitor `port` names a SERVICE port (resolved to a pod port through its targetPort); a "+
+			"PodMonitor `port` names a CONTAINER port. Further warnings for this endpoint are suppressed for "+
+			unresolvedWarnEvery.String())
+}
+
+// endpointPortSpelling renders the port an endpoint names, the way its CR
+// spells it, so the warning and the CR can be matched up by eye.
+func endpointPortSpelling(ep *servicemonitors.Endpoint) string {
+	if ep.Port != "" {
+		return ep.Port
+	}
+	if ep.TargetPort != nil {
+		return "targetPort:" + ep.TargetPort.String()
+	}
+	return ""
+}
+
+// cappedWarnEvery and maxCappedWarnKeys bound the per-pod ceiling warning.
+//
+// The refusal is re-derived on every targets request of every agent whose node
+// holds the pod, so this is a STEADY state exactly like the collision and
+// shadowed-monitor warnings beside it, and the same throttle applies. Thirty
+// minutes because the remedy is a configuration change, and nothing about the
+// condition changes in between.
+const (
+	cappedWarnEvery   = 30 * time.Minute
+	maxCappedWarnKeys = 1024
+)
+
+// cappedWarnKey identifies the ceiling refusal by the WORKLOAD, not by the pod:
+// every replica of a Deployment carries the same annotations and the same
+// monitors select all of them, so keying on the pod name would emit one line
+// per replica and another full set on every rollout — the mistake this file
+// records three times already (warnTarget, reportAuthConflict, collisionWarnKey).
+// attrs.ServiceName resolves the workload owner (the Deployment, not the
+// per-revision ReplicaSet), so the key survives a rollout.
+func cappedWarnKey(pod *kubemeta.Pod) string {
+	return pod.Namespace + "\x00" + attrs.ServiceName(*pod)
+}
+
+// reportPodCapped warns that ONE pod produced more scrape targets than the
+// per-pod ceiling admits, so some of its endpoints are not scraped at all.
+//
+// obs.ScrapeTargetsCapped already carries the rate, and its help sends the
+// operator to /v1/explain — which needs a pod NAME the counter cannot supply.
+// A refused endpoint is indistinguishable from one that was never configured:
+// the target simply is not in the list, no scrape fails, and the series it
+// would have produced never appear. This line is the only thing that names the
+// pod to look at.
+func (s *Server) reportPodCapped(pod *kubemeta.Pod, d *targetDedup) {
+	allow, saturated := s.warnPodCapped.Allow(cappedWarnKey(pod))
+	if saturated {
+		s.log().Warn("per-pod target-ceiling warning dedupe table is full; further distinct workloads are suppressed",
+			"keys", maxCappedWarnKeys)
+	}
+	if !allow {
+		return
+	}
+	// Both ceilings on one line, because a reader has to be able to tell which
+	// one bound: "dropped=14 limit=16" against a pod serving TWO targets is a
+	// wild-goose chase, and the byte ceiling binds at a target count that looks
+	// entirely ordinary. podBytes is the pod document's measured size — a
+	// number derived from the pod's annotations, never any of their bytes.
+	s.log().Warn("pod produced more scrape targets than the per-pod ceilings admit; the excess endpoints are NOT scraped",
+		"namespace", pod.Namespace, "pod", pod.Name, "dropped", d.capped,
+		"droppedBySize", d.cappedBySize, "limit", scrape.MaxPortsPerPod,
+		"podBytes", d.podBytes, "byteLimit", scrape.MaxTargetBytesPerPod,
+		"note", "GET /v1/explain/"+pod.Namespace+"/"+pod.Name+" names the refused ports and endpoints; the "+
+			"ceilings are per POD across every door (pod and Service annotations, ServiceMonitor and PodMonitor "+
+			"endpoints), and they exist because every target embeds the whole pod document — so a pod contributes "+
+			"at most 16 targets AND at most 256 KiB of them, whichever binds first. droppedBySize is how many the "+
+			"BYTE ceiling refused: those are answered by shrinking the pod's labels and annotations (podBytes "+
+			"measures them) or by splitting its ports across workloads, not by declaring fewer ports. The first "+
+			"target of a pod is always served. Further warnings for "+
+			"this workload are suppressed for "+cappedWarnEvery.String())
 }
 
 // collisionWarnEvery bounds how often ONE colliding configuration may log. Like
@@ -930,13 +1463,26 @@ func (s *Server) reportInstanceCollision(c scrape.InstanceCollision) {
 	}
 	// Each member names its pod: a group can span pods (two hostNetwork
 	// replicas of one workload), and those members agree on everything else.
-	members := make([]string, 0, len(c.Targets))
-	for _, ct := range c.Targets {
+	//
+	// BOUNDED, and the bound is on the log line rather than on the group: a
+	// collision group is every target on the node sharing one (job, instance),
+	// which on a hostNetwork workload is one member per replica per port —
+	// ~1,760 on a full node, each ~100 bytes, in ONE record. Two examples name
+	// the configuration (a collision needs two), the count says how big it
+	// really is, and the pair the operator fixes is in the same place either
+	// way. Same lesson as the ceilings this campaign added: a throttle bounds
+	// how OFTEN a line is written, never how LARGE it is.
+	const maxMembers = 2
+	members := make([]string, 0, min(len(c.Targets), maxMembers))
+	for _, ct := range c.Targets[:min(len(c.Targets), maxMembers)] {
 		who := ct.Source
 		if ct.Monitor != "" {
 			who += " " + ct.Monitor
 		}
 		members = append(members, ct.URL+" ["+who+" on "+ct.Pod+"]")
+	}
+	if over := len(c.Targets) - len(members); over > 0 {
+		members = append(members, "and "+strconv.Itoa(over)+" more targets on this identity")
 	}
 	s.log().Warn("two scrape targets export the same series identity; both are scraped and their samples collide",
 		"job", c.Job, "instance", c.Address, "targets", strings.Join(members, ", "),
@@ -985,12 +1531,55 @@ func (s *Server) handleScrapeAuth(w http.ResponseWriter, r *http.Request) {
 	if s.secrets == nil {
 		// The feature is off, so there is nothing to protect; keep the
 		// pre-existing "not enabled" 404 rather than a misleading 401.
+		//
+		// Counted and warned, because this is a two-sided configuration
+		// mismatch that nothing else reports: an agent only asks because a
+		// monitor endpoint THIS SERVICE served it names a credential, so every
+		// such scrape is about to run without one and sit at up=0 — and on the
+		// agent the 404 is indistinguishable from "that ref does not exist".
+		// The ref is not logged: it has not been through IsPathSegmentName yet
+		// and the condition is a property of this process, not of the request.
+		obs.ScrapeAuthFailures.WithLabelValues("disabled").Inc()
+		if s.warnAuthOff.Allow(scrapeAuthWarnEvery) {
+			s.log().Warn("a scrape-auth credential was requested but this service does not serve them; "+
+				"every monitor endpoint declaring auth or TLS material will be scraped without it",
+				"flag", "-scrape-auth-secrets",
+				"note", "the agents were served monitor targets carrying secret refs, so enable "+
+					"-scrape-auth-secrets (plus its secrets RBAC and -scrape-auth-token-file) or remove the "+
+					"auth/TLS clauses from those monitors; further reports are suppressed for "+
+					scrapeAuthWarnEvery.String())
+		}
 		writeError(w, http.StatusNotFound, "scrape auth secrets are not enabled (-scrape-auth-secrets)")
 		return
 	}
 	// Authenticate BEFORE any lookup: an unauthenticated client must not be
 	// able to probe which secret refs a monitor names (403 vs 404) either.
 	if !s.authorizedForScrapeAuth(r) {
+		// NEITHER the presented token NOR the Authorization header is ever
+		// logged; what an operator has to fix is one agent's
+		// -scrape-auth-token-file, so the line carries the peer address (the
+		// only thing on the request that names that agent) and whether a
+		// credential was presented at all. Those two cases have different
+		// remedies: `missing` is an agent that was never given the flag,
+		// `mismatch` is a token file that does not match this service's — the
+		// shape a rotation gets wrong, which the service's own 5-minute grace
+		// window is meant to cover.
+		credential := "missing"
+		if r.Header.Get("Authorization") != "" {
+			credential = "mismatch"
+		}
+		obs.ScrapeAuthFailures.WithLabelValues("unauthorized").Inc()
+		// Keyless: the condition is one misconfiguration, and a per-peer table
+		// would be keyed by something that grows with the fleet. The counter
+		// carries the rate; the line only has to name one example.
+		if s.warnAuthToken.Allow(scrapeAuthWarnEvery) {
+			s.log().Warn("scrape-auth request rejected: the caller did not present an accepted bearer token",
+				"peer", peerip.From(r.RemoteAddr), "credential", credential,
+				"tokenFile", "-scrape-auth-token-file",
+				"note", "the agent's -scrape-auth-token-file must hold the same token as this service's; "+
+					"a rotation is covered for five minutes on both sides, so a persistent rate is a "+
+					"mismatch and not a rotation. Further reports are suppressed for "+scrapeAuthWarnEvery.String())
+		}
 		writeUnauthorized(w)
 		return
 	}
@@ -1007,6 +1596,18 @@ func (s *Server) handleScrapeAuth(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if s.monitors == nil {
+		// -scrape-auth-secrets without -servicemonitors: the allowlist that
+		// bounds this route is built from indexed monitors, so nothing can
+		// ever be served and every credential-bearing scrape 401s. Same shape
+		// as the disabled case above, and just as silent before this.
+		obs.ScrapeAuthFailures.WithLabelValues("no_monitors").Inc()
+		if s.warnAuthNoMonitors.Allow(scrapeAuthWarnEvery) {
+			s.log().Warn("a scrape-auth credential was requested but no monitors are indexed, so no secret ref "+
+				"can be allowlisted",
+				"flag", "-servicemonitors",
+				"note", "-scrape-auth-secrets serves only Secret keys an indexed ServiceMonitor/PodMonitor "+
+					"endpoint references; further reports are suppressed for "+scrapeAuthWarnEvery.String())
+		}
 		writeError(w, http.StatusNotFound, "no monitors indexed")
 		return
 	}
@@ -1028,12 +1629,56 @@ func (s *Server) handleScrapeAuth(w http.ResponseWriter, r *http.Request) {
 	// "." and ".." are exactly what re-cutting needs.
 	for what, v := range map[string]string{"namespace": ns, "name": name, "key": key} {
 		if errs := content.IsPathSegmentName(v); len(errs) > 0 {
+			// Counted with the other refusals: no agent this repo ships can
+			// produce one (the ref comes from a monitor CR, whose fields are
+			// already Kubernetes names), so a rate here is either a hand-built
+			// request or the re-cutting attack this check exists for. The
+			// value is CLIPPED before it reaches the log — it is a raw path
+			// segment, bounded only by the header limit.
+			obs.ScrapeAuthFailures.WithLabelValues("bad_request").Inc()
+			if s.warnAuthSegment.Allow(scrapeAuthWarnEvery) {
+				s.log().Warn("scrape-auth request rejected: a path segment cannot name a Kubernetes object",
+					"segment", what, "value", clipSegment(v), "error", errs[0],
+					"note", "further reports are suppressed for "+scrapeAuthWarnEvery.String())
+			}
 			writeError(w, http.StatusBadRequest,
 				fmt.Sprintf("invalid %s %q: %s", what, v, errs[0]))
 			return
 		}
 	}
-	if !s.monitors.AuthSecretRefs().Has(ns + "/" + name + "/" + key) {
+	if ref := ns + "/" + name + "/" + key; !s.monitors.AuthSecretRefs().Has(ref) {
+		// The allowlist is derived from the INDEXED monitors, so a miss is
+		// usually not a hostile probe but the index disagreeing with what the
+		// agent was served: the monitor failed to parse (and was therefore
+		// DELETED from the index, dropping its targets with it), its namespace
+		// is outside -monitor-namespaces, or the ref really is a typo. All
+		// three end the same way — the scrape runs unauthenticated — and none
+		// of them was visible here.
+		//
+		// Per-ref, because two broken credentials must not mask each other —
+		// but through the miss's OWN table, and under a CLIPPED key. These
+		// three segments are the caller's, not the operators' configuration:
+		// they have passed IsPathSegmentName by now and nothing bounds their
+		// length or their number, so keying the shared warnRefs table by them
+		// handed anyone holding the scrape-auth token a way to saturate it and
+		// suppress the RBAC-failure and non-UTF-8 warnings for every real ref
+		// (see Server.warnAuthDenied).
+		obs.ScrapeAuthFailures.WithLabelValues("not_allowed").Inc()
+		allow, saturated := s.warnAuthDenied.Allow(
+			clipSegment(ns) + "\x00" + clipSegment(name) + "\x00" + clipSegment(key))
+		if saturated {
+			s.log().Warn("scrape-auth allowlist-miss warning table is full; further distinct refs are "+
+				"suppressed (the rate stays on kubescrape_scrape_auth_failures_total)",
+				"refs", maxScrapeAuthDeniedRefs)
+		}
+		if allow {
+			s.log().Warn("scrape-auth request refused: no indexed monitor endpoint references this secret key",
+				"namespace", clipSegment(ns), "name", clipSegment(name), "key", clipSegment(key),
+				"note", "check that the monitor naming it parsed (kubescrape_monitor_parse_errors_total) and "+
+					"that its namespace is permitted by -monitor-namespaces; the target is scraped without the "+
+					"credential meanwhile. Further failures for this ref are suppressed for "+
+					scrapeAuthWarnEvery.String())
+		}
 		writeError(w, http.StatusForbidden, "secret is not referenced by any monitor endpoint")
 		return
 	}
@@ -1101,6 +1746,21 @@ func (s *Server) handleScrapeAuth(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"value": val})
 }
 
+// clipSegment bounds a caller-supplied path segment before it reaches a log
+// line. A namespace, a Secret name and a Secret key are all DNS-subdomain-ish
+// in practice (253 bytes at most), but nothing on the wire enforces that here:
+// the segment arrives from a URL path bounded only by the request-head limit,
+// and a log line is the one place a 16 KB value costs something in every
+// direction at once. The truncation is marked, so a clipped value is never
+// mistaken for the whole one.
+func clipSegment(v string) string {
+	const max = 253
+	if len(v) <= max {
+		return v
+	}
+	return v[:max] + "…(truncated)"
+}
+
 // waitBudget determines how long a container lookup may block: MaxWait by
 // default, optionally shortened by ?wait= (a Go duration or plain seconds).
 func (s *Server) waitBudget(r *http.Request) (time.Duration, error) {
@@ -1139,11 +1799,69 @@ func (s *Server) waitBudget(r *http.Request) (time.Duration, error) {
 	return d, nil
 }
 
+// reportEncodeFailure reports a response this process could not serialise.
+//
+// It is an ERROR and it is a bug: every value written here is a kubemeta
+// document built from informer objects, holding nothing encoding/json refuses.
+// If it ever happens it happens for EVERY request on that route — a permanent
+// 500 whose only other trace is
+// kubescrape_http_requests_total{code="500"} — so it is throttled rather than
+// unconditional, and the throttle is keyless because one broken document
+// breaks its whole route.
+func (s *Server) reportEncodeFailure(what string, err error) {
+	if s.warnEncode.Allow(encodeWarnEvery) {
+		s.log().Error("encoding a response failed, so this route answers 500 until the offending object changes",
+			"what", what, "error", err,
+			"note", "this cannot happen for a well-formed metadata document; further reports are suppressed for "+
+				encodeWarnEvery.String())
+	}
+}
+
+// encodeWarnEvery bounds the encode-failure report; see reportEncodeFailure.
+const encodeWarnEvery = 5 * time.Minute
+
 func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(v)
+	// A failure here is almost always the CLIENT going away mid-write, which
+	// is not this server's business and would flood on a rolling agent update.
+	// The three errors that mean the VALUE cannot be encoded are a different
+	// thing entirely — a bug that makes the route answer a truncated 200
+	// forever — so those, and only those, are reported.
+	if err := json.NewEncoder(w).Encode(v); err != nil && unencodable(err) {
+		encodeFailed(err)
+	}
 }
+
+// unencodable reports an error that names the VALUE rather than the connection:
+// encoding/json returns these three before writing anything, so they are the
+// ones that mean "this document can never be served".
+func unencodable(err error) bool {
+	var (
+		unsupportedType  *json.UnsupportedTypeError
+		unsupportedValue *json.UnsupportedValueError
+		marshaler        *json.MarshalerError
+	)
+	return errors.As(err, &unsupportedType) || errors.As(err, &unsupportedValue) || errors.As(err, &marshaler)
+}
+
+// encodeFailed is writeJSON's report. writeJSON is a package function (it
+// predates the Server and is called from handlers that have no reason to be
+// methods), so it cannot reach a Server's throttle; this one is package-level
+// for the same reason, and the condition it reports is a property of the
+// PROCESS — one unserialisable document — not of a Server instance.
+func encodeFailed(err error) {
+	if writeJSONWarn.Allow(encodeWarnEvery) {
+		slog.Error("encoding a response failed after the status line was written, so the client received a "+
+			"truncated body",
+			"error", err,
+			"note", "this cannot happen for a well-formed metadata document; further reports are suppressed for "+
+				encodeWarnEvery.String())
+	}
+}
+
+// writeJSONWarn throttles encodeFailed; see it for why this is package-level.
+var writeJSONWarn logdedupe.Throttle
 
 // writeCached serves a 200 metadata response with standard HTTP cache headers
 // (Cache-Control max-age + ETag), so the agent's client can serve repeat
@@ -1166,6 +1884,7 @@ func (s *Server) writeCached(w http.ResponseWriter, r *http.Request, v any, priv
 	}
 	body, err := json.Marshal(v)
 	if err != nil {
+		s.reportEncodeFailure("metadata response", err)
 		writeError(w, http.StatusInternalServerError, "encoding response")
 		return
 	}

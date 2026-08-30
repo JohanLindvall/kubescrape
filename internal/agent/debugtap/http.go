@@ -7,6 +7,7 @@ package debugtap
 
 import (
 	"fmt"
+	"log/slog"
 	"math"
 	"net/http"
 	"strconv"
@@ -14,7 +15,39 @@ import (
 	"time"
 
 	"github.com/JohanLindvall/kubescrape/internal/config"
+	"github.com/JohanLindvall/kubescrape/internal/logdedupe"
 )
+
+// The two throttles this endpoint needs, and they are SEPARATE on purpose: a
+// refusal and an attach are independent conditions, and one gate shared between
+// them would let the flood of whichever fires first suppress the other — which
+// is the pair an operator most needs to read together (who is holding the slots
+// versus who is being turned away).
+//
+// Both conditions are per REQUEST and neither is rate-limited by anything else:
+// nothing stops a client from retrying `GET /debug/otlp` in a loop, and once
+// the four slots are taken every one of those retries is refused. A refusal is
+// a STATE — someone left a session open — so one line per window carrying the
+// oldest session's age is the whole story, and repeating it per retry only
+// buries it.
+// Pointers, like marshalWarns: a Throttle holds an atomic, so a test that wants
+// a fresh gate has to replace the value rather than assign over it.
+var (
+	streamRefusals = &logdedupe.Throttle{}
+	streamAttaches = &logdedupe.Throttle{}
+	// A third condition, and a third gate for the same reason: a request
+	// refused for asking too much MATCHING — too many filters, or one filter
+	// too large — is somebody probing the render cost, which must not be
+	// suppressed by (or suppress) the two above. The two ceilings share this
+	// one gate deliberately, unlike the pair above: they are one condition
+	// with two spellings (count and bytes), both refused with a 400 to the
+	// same caller, and the line names which ceiling bound — so neither can
+	// hide anything from the operator that the other does not already say.
+	filterRefusals = &logdedupe.Throttle{}
+)
+
+// streamLogEvery is how often either condition may speak again.
+const streamLogEvery = time.Minute
 
 // ServeHTTP streams matching payloads as OTLP JSON Lines until the client
 // disconnects.
@@ -22,8 +55,9 @@ import (
 // Query parameters:
 //
 //	signal  logs | metrics | traces — repeatable; default all three
-//	attr    key=valueGlob — repeatable, ANDed; both halves are path.Match
-//	        globs over the RESOURCE attributes (attr=k8s.namespace.name=team-*)
+//	attr    key=valueGlob — repeatable up to maxAttrFilters and up to
+//	        maxAttrFilterBytes each, ANDed; both halves are path.Match globs
+//	        over the RESOURCE attributes (attr=k8s.namespace.name=team-*)
 //	sample  percentage of matching resources to keep, 0-100 (default 100)
 func (t *Tap) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
@@ -60,8 +94,51 @@ func (t *Tap) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		sample = f
 	}
 
+	// Refuse an over-long filter list BEFORE validating any of it: every filter
+	// is ANDed, and matchAll short-circuits only on a filter that does NOT
+	// match — so a list of filters chosen to all match (`attr=*/*=*`) walks the
+	// resource's whole attribute map once PER FILTER, on the EXPORTING
+	// goroutine, which for logs is the tailer's single sweep goroutine serving
+	// every log file on the node. Measured over a 60-resource batch with the
+	// stdlib's own ceiling of 10,000 query parameters: 3.2 s of CPU per export
+	// per stream against the ~23 ms this endpoint's subscriber cap was sized
+	// for — a 140x multiplier that maxSubscribers=4 does not bound, since it
+	// bounds the number of streams and not the work each one asks for.
+	if n := len(q["attr"]); n > maxAttrFilters {
+		if filterRefusals.Allow(streamLogEvery) {
+			slog.Warn("refusing a /debug/otlp stream: more resource-attribute filters than this endpoint "+
+				"evaluates, and every filter is walked against every resource of every export on the "+
+				"exporting goroutine; further refusals are throttled",
+				"filters", n, "max", maxAttrFilters, "remoteAddr", r.RemoteAddr)
+		}
+		http.Error(w, fmt.Sprintf("too many attr filters (%d; max %d) — they are ANDed, so narrow with fewer",
+			n, maxAttrFilters), http.StatusBadRequest)
+		return
+	}
 	var filters []attrFilter
 	for _, a := range q["attr"] {
+		// The SIZE half of the ceiling above, checked BEFORE anything parses,
+		// validates or echoes the value: a glob's cost is linear in its length
+		// (path.Match is O(pattern x name), and globMatch copies a pattern
+		// containing '/' once per comparison) and it is paid per resource
+		// attribute per resource per export, on the exporting goroutine. The
+		// count bound alone left one glob bounded only by net/http's 1 MiB
+		// request line — the caller's choice, not this endpoint's.
+		//
+		// The refusal names the LENGTH and never the glob: the caller gets its
+		// own bytes back in the 400, but a log line carrying a megabyte the
+		// caller chose is the same flood in a different shape.
+		if len(a) > maxAttrFilterBytes {
+			if filterRefusals.Allow(streamLogEvery) {
+				slog.Warn("refusing a /debug/otlp stream: a resource-attribute filter is larger than this "+
+					"endpoint matches with, and every glob is walked against every attribute of every "+
+					"resource of every export on the exporting goroutine; further refusals are throttled",
+					"bytes", len(a), "max", maxAttrFilterBytes, "remoteAddr", r.RemoteAddr)
+			}
+			http.Error(w, fmt.Sprintf("attr filter is %d bytes (max %d) — each glob is matched against every "+
+				"resource attribute of every export", len(a), maxAttrFilterBytes), http.StatusBadRequest)
+			return
+		}
 		key, val, ok := strings.Cut(a, "=")
 		if !ok || key == "" {
 			http.Error(w, fmt.Sprintf("attr %q is not key=value", a), http.StatusBadRequest)
@@ -84,11 +161,51 @@ func (t *Tap) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// able to answer 503, and headers are one-shot.
 	sub, unsubscribe := t.subscribe(sig, filters, sample)
 	if sub == nil {
+		// The refusal reaches the caller as a 503, but the reason it happened
+		// is on the OTHER streams, which this caller cannot see: someone left
+		// a session open, and every open session costs a render per export on
+		// the exporting goroutine — for the tailer, the single sweep goroutine
+		// serving every log file on the node. So the refusal goes in the
+		// agent's own log — throttled, and carrying the count and the oldest
+		// session's age, because one line per window has to say who is holding
+		// the slots without relying on the (also throttled) attach lines below.
+		if streamRefusals.Allow(streamLogEvery) {
+			oldest, streams := t.oldestStream()
+			slog.Warn("refusing a /debug/otlp stream: every stream slot is taken, and each one costs a render "+
+				"per export on the exporting goroutine; further refusals are throttled",
+				"streams", streams, "max", maxSubscribers,
+				"oldest", oldest.Round(time.Second), "remoteAddr", r.RemoteAddr)
+		}
 		http.Error(w, fmt.Sprintf("too many debug streams (max %d); close one and retry", maxSubscribers),
 			http.StatusServiceUnavailable)
 		return
 	}
-	defer unsubscribe()
+	// Attach and detach are logged at Info because they are a LIFECYCLE event
+	// with a standing cost, not a per-request one: a forgotten `curl` against
+	// this endpoint keeps rendering (and deep-copying) every payload this agent
+	// exports for as long as it is connected, on the goroutine doing the
+	// exporting. The cap bounds how many may be attached AT ONCE; it bounds
+	// nothing about the RATE, so a client reconnecting in a loop would emit an
+	// Info pair per request forever. Hence the throttle.
+	//
+	// The decision is taken ONCE, at attach, and carried to the detach: a lone
+	// "detached" whose "attached" was suppressed reads as a stream that was
+	// never there, so the pair is logged or suppressed together.
+	started := time.Now()
+	announced := streamAttaches.Allow(streamLogEvery)
+	if announced {
+		slog.Info("a /debug/otlp stream attached; it renders every matching payload on the exporting goroutine "+
+			"until it disconnects; further attach/detach lines are throttled",
+			"signal", sigNames(sig), "filters", len(filters), "sample", sample, "remoteAddr", r.RemoteAddr)
+	}
+	defer func() {
+		unsubscribe()
+		if announced {
+			slog.Info("a /debug/otlp stream detached",
+				"signal", sigNames(sig), "wait", time.Since(started).Round(time.Millisecond),
+				"dropped", sub.droppedAll.Load())
+		}
+	}()
 
 	// The -listen server's WriteTimeout would kill this stream after 30s;
 	// streams own their deadline (none — the client's disconnect ends it).

@@ -89,6 +89,14 @@ type metaBudget struct {
 	// spent is atomic because a splitter-bearing scrape may resolve on more
 	// than one goroutine; the value is nanoseconds of measured elapsed time.
 	spent atomic.Int64
+	// shed counts the objects that were never asked about once the allowance
+	// ran out. It is what makes the warning actionable: "the allowance was
+	// spent" says a partition happened, "and 214 objects went out unjoinable"
+	// says how much of this node's cadvisor and summary data an operator should
+	// not trust to join. Nothing else can report it — a lookup that is never
+	// ISSUED moves no request counter, and only the summary pipeline tallies
+	// its unplaced objects.
+	shed atomic.Int64
 }
 
 type metaBudgetKey struct{}
@@ -122,9 +130,16 @@ func (b *metaBudget) remaining() time.Duration {
 // whole scrape, plus the metadata allowance carved out of it. Every scrape
 // entry point goes through here, so the three of them cannot drift on which
 // bound applies to what.
+// The returned cancel also REPORTS a spent allowance, so every scrape entry
+// point gets the line from its existing `defer cancel()` and none can forget
+// it.
 func (s *Scraper) scrapeContext(ctx context.Context, budget time.Duration, pipeline string) (context.Context, context.CancelFunc) {
 	ctx, cancel := context.WithTimeout(ctx, budget)
-	return withMetaBudget(ctx, budget, pipeline), cancel
+	ctx = withMetaBudget(ctx, budget, pipeline)
+	return ctx, func() {
+		s.reportMetaBudget(ctx)
+		cancel()
+	}
 }
 
 // metaLookup bounds ONE live metadata lookup by what remains of the scrape's
@@ -156,7 +171,11 @@ func (s *Scraper) metaLookup(ctx context.Context) (context.Context, func(), bool
 		if !b.exhausted.Swap(true) {
 			obs.ScrapeMetaBudgetExhausted.WithLabelValues(b.pipeline).Inc()
 		}
-		s.warnMetaBudget(b.limit)
+		// The LINE is emitted when the scrape ends (reportMetaBudget), where
+		// the shed count is final; here there is only ever one object's worth
+		// of it, and a warn per shed object would take the throttle's atomic on
+		// a path a 200-pod node walks 200 times.
+		b.shed.Add(1)
 		return ctx, func() {}, false
 	}
 	// WithTimeout takes the earlier of the two deadlines, so a scrape already
@@ -169,16 +188,22 @@ func (s *Scraper) metaLookup(ctx context.Context) (context.Context, func(), bool
 	}, true
 }
 
-// warnMetaBudget names the condition once a minute. The counters are the
-// ongoing signal — kubescrape_scrape_metadata_budget_exhausted_total counts the
-// scrapes, and on the summary pipeline the objects also land in
-// kubescrape_summary_unresolved_total — so this line exists to name the
-// allowance and the timeout it was cut from, which is what an operator needs to
-// decide whether to raise the scrape timeout or fix the metadata service.
-func (s *Scraper) warnMetaBudget(limit time.Duration) {
-	if !s.metaBudgetWarn.Allow(metaBudgetWarnEvery) {
+// reportMetaBudget names the condition once a minute, at the END of a scrape
+// that exhausted its allowance — which is the only moment the shed count is
+// final, and the count is most of what the line is for.
+//
+// The counters are the ongoing signal — kubescrape_scrape_metadata_budget_
+// exhausted_total counts the scrapes, and on the summary pipeline the objects
+// also land in kubescrape_summary_unresolved_total — so what this adds is WHICH
+// pipeline is shedding, HOW MANY objects it shed, and the allowance and timeout
+// it was cut from, which together are what an operator needs to decide whether
+// to raise the scrape timeout or go and fix the metadata service.
+func (s *Scraper) reportMetaBudget(ctx context.Context) {
+	b := metaBudgetFrom(ctx)
+	if b == nil || !b.exhausted.Load() || !s.metaBudgetWarn.Allow(metaBudgetWarnEvery) {
 		return
 	}
 	s.log.Warn("a scrape spent its whole metadata allowance; the objects it had left are exported with their label identity, and the scrape itself still ships",
-		"allowance", limit, "scrapeTimeout", s.cfg.Timeout, "scrapeInterval", s.cfg.Interval)
+		"pipeline", b.pipeline, "unattributed", b.shed.Load(),
+		"allowance", b.limit, "scrapeTimeout", s.cfg.Timeout, "scrapeInterval", s.cfg.Interval)
 }

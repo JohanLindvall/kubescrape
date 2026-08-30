@@ -49,10 +49,13 @@ func TestPodMonitorTargets(t *testing.T) {
 // notStampedVerbatim are the Endpoint string fields that deliberately do NOT
 // carry an arbitrary sentinel to the target: Port resolves to a port NUMBER,
 // Path is folded into the URL, Scheme is normalised by defaultSchemePath
-// (anything but "https" becomes "http"), and Ignored is reporting metadata the
-// target never carries. Each is asserted separately below with a legal value.
+// (anything but "https" becomes "http"), Ignored is reporting metadata the
+// target never carries, and Refused is the parse-time size verdict that means
+// there is no target AT ALL (podMonitorEndpoint returns nothing for it — see
+// TestRefusedEndpointYieldsNoTarget). Each is asserted separately below with a
+// legal value.
 var notStampedVerbatim = map[string]bool{
-	"Port": true, "Path": true, "Scheme": true, "Ignored": true,
+	"Port": true, "Path": true, "Scheme": true, "Ignored": true, "Refused": true,
 }
 
 // stampEndpoint is the DELIVERY site of every endpoint field, and it is a

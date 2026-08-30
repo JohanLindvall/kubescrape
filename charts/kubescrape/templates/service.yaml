@@ -121,6 +121,21 @@ spec:
       topologySpreadConstraints:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+      {{- /* Pod-level seccomp. Kubernetes' own default is Unconfined, which is
+             LOOSER than what a plain `docker run` gets, and PodSecurity's
+             `restricted` profile rejects a pod without RuntimeDefault outright
+             — so on a namespace labelled restricted these pods used to fail
+             ADMISSION, which on a first install looks like the chart being
+             broken. Set `seccompProfile: null` to omit the field entirely —
+             NOT `{}`, which cannot work: helm COALESCES a user map onto the
+             chart's default map, so an empty one arrives here as the default
+             `{type: RuntimeDefault}` and renders. Only an explicit null
+             removes the key. */}}
+      {{- with .Values.seccompProfile }}
+      securityContext:
+        seccompProfile:
+          {{- toYaml . | nindent 10 }}
+      {{- end }}
       containers:
         - name: kubescrape
           image: {{ include "kubescrape.image" . }}
@@ -163,7 +178,6 @@ spec:
             {{- with .Values.pprofListen }}
             - -pprof-listen={{ . }}
             {{- end }}
-            - -log-format={{ .Values.logFormat }}
             {{- range .Values.service.extraArgs }}
             - {{ . }}
             {{- end }}
@@ -242,6 +256,29 @@ spec:
 # metrics.scrapeAnnotations is on, a scraper reaches the metrics port — so both
 # belong here. The pprof port is deliberately NOT opened: it exposes goroutine
 # stacks and heap contents, and is the one listener the chart wants firewalled.
+#
+# BOTH RULES ARE OPEN TO EVERY POD, and unlike the agent's this is not backed by
+# a second gate: the /v1 routes are unauthenticated BY DESIGN, because every
+# agent polls them on every cycle and a per-agent credential buys nothing the
+# ServiceAccount does not already imply. What they hand out is pod, owner and
+# namespace metadata — object metadata the node's own kubelet already holds, and
+# with kubectl.kubernetes.io/last-applied-configuration and kapp's
+# original-object annotation stripped (kubemeta.FilterAnnotations), because
+# those carry the whole applied spec verbatim. /v1/scrape-auth is the one
+# exception and the one route that serves Secret material: it is bearer-
+# authenticated (service.scrapeAuthToken) and refuses to be enabled without a
+# token. This port also serves the /debug index and its forms, which are
+# ungated for the same reason — they show the same documents the /v1 routes do.
+#
+# TO TIGHTEN IT, add a `from` to the first rule below scoping it to the agent
+# DaemonSet (and to anything else you point at the API):
+#   from:
+#     - podSelector: {matchLabels: {app: <release>-agent}}
+# There is no value for it because the failure mode of getting it wrong is
+# fleet-wide: every agent stops resolving container metadata at once, and the
+# symptom is unattributed telemetry rather than an error anyone is watching.
+# The metrics rule stays separate so scoping the API does not also cut the
+# Prometheus scrape, which metrics.scrapeAnnotations asked for.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -254,9 +291,12 @@ spec:
       app: {{ .Release.Name }}
   policyTypes: [Ingress]
   ingress:
+    # 1. The metadata API, plus /healthz, /readyz and /debug.
     - ports:
         - port: {{ (split ":" .Values.service.listen)._1 | int }}
-        {{- if .Values.metrics.enabled }}
+    {{- if .Values.metrics.enabled }}
+    # 2. The Prometheus scrape port.
+    - ports:
         - port: {{ (split ":" .Values.metrics.listen)._1 | int }}
-        {{- end }}
+    {{- end }}
 {{- end }}

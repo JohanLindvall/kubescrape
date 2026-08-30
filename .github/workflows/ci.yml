@@ -24,7 +24,7 @@ jobs:
       - name: Install libsystemd headers
         run: sudo apt-get update && sudo apt-get install -y libsystemd-dev
 
-      # Through `make`, so these carry TAGS (journald,azure) — i.e. the code
+      # Through `make`, so these carry TAGS (journald,azure,events) — i.e. the code
       # that actually ships. A bare `go build ./...` compiles the *_disabled.go
       # stubs instead of the real journald and Azure pipelines, so CI was
       # building and testing a variant nobody deploys and both optional

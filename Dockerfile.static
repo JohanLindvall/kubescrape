@@ -6,7 +6,7 @@
 # `journald` build tag both binaries are CGO-free and fully static, so this
 # image is distroless/STATIC with nothing but the two binaries in it.
 #
-# `make image-static` (TAGS_STATIC defaults to `azure`: everything except
+# `make image-static` (TAGS_STATIC defaults to `azure,events`: everything except
 # journald). The default image is untouched — see Dockerfile.
 #
 # The trade this image makes is exactly the one CLAUDE.md and the README name:
@@ -18,7 +18,7 @@ WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
-ARG TAGS=azure
+ARG TAGS=azure,events
 # Fail loudly rather than emit a broken image: a journald build needs cgo and a
 # libsystemd the static base does not have.
 RUN case "$TAGS" in *journald*) \

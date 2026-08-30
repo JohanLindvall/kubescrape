@@ -78,7 +78,7 @@ func feedAll(tl *Tailer, f *file, lines []string) {
 func feedOne(tl *Tailer, f *file, l string) {
 	start := f.lineStart
 	end := start + int64(len(l)) + 1
-	tl.feedLine(context.Background(), f, l, start, end)
+	tl.feedLine(context.Background(), f, l, start, end, time.Now())
 	f.lineStart = end
 	f.readPos = end
 }

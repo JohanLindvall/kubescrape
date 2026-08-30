@@ -125,6 +125,11 @@ type scrapeSession struct {
 	droppedFilter  int
 	droppedRelabel int
 	exportFailed   bool
+	// detail is the text parser's per-cause breakdown of this scrape's
+	// malformed count, read off the parser before it is returned to the pool
+	// (the protobuf front leaves it zero: its families fail whole, so there is
+	// nothing per-line to attribute).
+	detail promparse.MalformedDetail
 }
 
 func (s *Scraper) newScrapeSession(ctx context.Context, cb chunker, pipeline, what, warnKey string, relabel *relabelFilter, proto bool) *scrapeSession {
@@ -156,7 +161,12 @@ func (ss *scrapeSession) full() bool { return ss.s.chunkFull(ss.cb) }
 func (ss *scrapeSession) export() error {
 	if err := ss.s.cfg.Exporter.ExportMetrics(ss.ctx, ss.cb.take()); err != nil {
 		ss.exportFailed = true
-		return err
+		// Classified here, at the one place every chunk of every pipeline
+		// ships from: a scrape that parsed perfectly and lost its payload at
+		// the COLLECTOR is the failure most often misdiagnosed as a broken
+		// target, and it is the only reason on kubescrape_scrape_failures_total
+		// where the target is innocent.
+		return classify(reasonExport, err)
 	}
 	return nil
 }
@@ -295,11 +305,29 @@ func (ss *scrapeSession) reportMalformed(msg string, malformed int, abortErr err
 		return
 	}
 	obs.ScrapeMalformed.WithLabelValues(ss.pipeline).Add(float64(malformed))
-	if abortErr != nil {
-		ss.s.warnOnce(msg+":"+ss.warnKey, msg, "target", ss.what, "malformed", malformed, "samples", ss.samples, "error", abortErr)
-	} else {
-		ss.s.warnOnce(msg+":"+ss.warnKey, msg, "target", ss.what, "malformed", malformed, "samples", ss.samples)
+	args := []any{"target", ss.what, "malformed", malformed, "samples", ss.samples}
+	// The DETAIL is what turns the number into an action: a line over the
+	// bound, a body cut mid-stream and an exporter repeating a label name read
+	// identically in the count and take three different remedies (see
+	// promparse.MalformedDetail). Only the nonzero ones ride, so an ordinary
+	// unparseable line still logs exactly what it used to.
+	d := ss.detail
+	if d.OverLongLines != 0 {
+		args = append(args, "overLong", d.OverLongLines, "flag", "-scrape-max-line-bytes")
 	}
+	if d.TruncatedLines != 0 {
+		args = append(args, "truncated", d.TruncatedLines)
+	}
+	if d.DuplicateLabels != 0 {
+		args = append(args, "duplicateLabels", d.DuplicateLabels)
+	}
+	if d.TooManyLabels != 0 {
+		args = append(args, "tooManyLabels", d.TooManyLabels)
+	}
+	if abortErr != nil {
+		args = append(args, "error", abortErr)
+	}
+	ss.s.warnOnce(msg+":"+ss.warnKey, msg, args...)
 }
 
 // reportBadExemplars counts a scrape's unparseable exemplar suffixes, apart
@@ -346,6 +374,7 @@ func (s *Scraper) parseAndExportFiltered(ctx context.Context, body io.Reader, op
 	// and on the abort path too: a body that tripped the sample limit still
 	// carried whatever exemplars were parsed before it.
 	ss.reportBadExemplars(parser.MalformedExemplars())
+	ss.detail = parser.MalformedDetail()
 	if err != nil {
 		ss.salvage()
 		ss.reportMalformed("aborted scrape had malformed lines", malformed+ss.conv.malformed, err)
@@ -379,8 +408,9 @@ const (
 	acceptJSON       = "application/json"
 )
 
-// kubeletStatusError is a non-200 from the kubelet, carrying the code so a
-// caller can say something more useful about it than the number.
+// statusError is a non-200 from a scrape — a kubelet endpoint or a discovered
+// target — carrying the code so a caller can say something more useful about it
+// than the number.
 //
 // The bare number is not diagnosable for the one status an operator will
 // actually meet: the kubelet authorizes each of its endpoints against its own
@@ -388,9 +418,13 @@ const (
 // means a missing RBAC RULE, not a broken credential — and the text says so
 // where the summary scrape catches it. The message is unchanged from the
 // fmt.Errorf it replaced, so nothing reading the log line moves.
-type kubeletStatusError struct{ code int }
+//
+// It is the TARGET path's status error too (it began as the kubelet's alone),
+// so failureReason can split 401/403 out of every pipeline's non-200s without
+// matching on the message text.
+type statusError struct{ code int }
 
-func (e *kubeletStatusError) Error() string { return "status " + strconv.Itoa(e.code) }
+func (e *statusError) Error() string { return "status " + strconv.Itoa(e.code) }
 
 // kubeletGet fetches a kubelet URL with bearer-token authentication, offering
 // accept as the request's Accept header. The caller must close the response
@@ -407,7 +441,15 @@ func (s *Scraper) kubeletGet(ctx context.Context, url, accept string) (*http.Res
 		// (internal/bearer).
 		token, err := s.kubeletToken.Token()
 		if err != nil {
-			return nil, fmt.Errorf("reading token: %w", err)
+			// `auth` rather than `unauthorized`: nothing was sent, so the
+			// kubelet refused nothing — the projection at -kubelet-token-file
+			// has never been readable by this process (internal/bearer keeps
+			// the last good value across a transient failure, so reaching here
+			// means there has never been one). The path, never the token.
+			s.warnOnce("kubelettoken:"+s.cfg.Kubelet.TokenFile,
+				"the kubelet bearer token could not be read; every kubelet scrape on this node will fail",
+				"tokenFile", s.cfg.Kubelet.TokenFile, "error", err)
+			return nil, classify(reasonAuth, fmt.Errorf("reading token: %w", err))
 		}
 		req.Header.Set("Authorization", "Bearer "+token)
 	}
@@ -417,7 +459,7 @@ func (s *Scraper) kubeletGet(ctx context.Context, url, accept string) (*http.Res
 	}
 	if resp.StatusCode != http.StatusOK {
 		drainClose(resp.Body)
-		return nil, &kubeletStatusError{code: resp.StatusCode}
+		return nil, &statusError{code: resp.StatusCode}
 	}
 	return resp, nil
 }
@@ -456,6 +498,7 @@ func (s *Scraper) scrapeCadvisor(ctx context.Context) (int, error) {
 	url := strings.TrimRight(s.cfg.Kubelet.Endpoint, "/") + "/metrics/cadvisor"
 	resp, err := s.kubeletGet(ctx, url, acceptExposition)
 	if err != nil {
+		s.reportKubeletRefusal(pipelineCadvisor, url, err)
 		return 0, err
 	}
 	defer drainClose(resp.Body)
@@ -475,6 +518,7 @@ func (s *Scraper) scrapeNodeMetrics(ctx context.Context) (int, error) {
 	url := strings.TrimRight(s.cfg.Kubelet.Endpoint, "/") + "/metrics"
 	resp, err := s.kubeletGet(ctx, url, acceptExposition)
 	if err != nil {
+		s.reportKubeletRefusal(pipelineNode, url, err)
 		return 0, err
 	}
 	defer drainClose(resp.Body)

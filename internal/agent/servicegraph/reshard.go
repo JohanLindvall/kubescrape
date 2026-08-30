@@ -606,10 +606,13 @@ func (r *Resharder) Close() error {
 // share THIS shard owns, for local pairing, span metrics and export. The
 // returned Traces holds no spans when this shard owns none.
 //
-// It TAKES OWNERSHIP of td: the single-owner fast path returns (or forwards) the
-// caller's own payload rather than copying it, and stamps the loop marker on it
-// when that owner is remote. Callers hand over a freshly-decoded request and use
-// only the return value.
+// It TAKES OWNERSHIP of td, and the multi-owner path CONSUMES it: the
+// single-owner fast path returns (or forwards) the caller's own payload rather
+// than copying it and stamps the loop marker on it when that owner is remote,
+// while the split path MOVES each span into its owner's share, leaving td
+// holding zeroed spans. Callers hand over a freshly-decoded request and use
+// only the return value — reading td afterwards, or resharding it twice, reads
+// an emptied payload.
 //
 // # Failure
 //
@@ -640,7 +643,13 @@ func (r *Resharder) Reshard(ctx context.Context, td ptrace.Traces) (ptrace.Trace
 	local, remote := r.split(td)
 	for name, g := range remote {
 		client, ok := r.clients[name]
-		if !ok { // unreachable: the ring is built from the client map's keys plus self
+		if !ok {
+			// Unreachable: the ring is built from the client map's keys plus
+			// self. If it ever happens it happens for every push, and the
+			// caller only sees a failed export — indistinguishable from a shard
+			// that is down, which is the wrong thing to go and look at.
+			r.warn("a service-graph ring owner has no client, so its share cannot be forwarded and the push is refused; this is a bug in the ring construction, not an unreachable shard",
+				"shard", name, "ring", strings.Join(r.ring.Shards(), ","))
 			return ptrace.NewTraces(), fmt.Errorf("service-graph shard %q has no client", name)
 		}
 		n := uint64(g.SpanCount())
@@ -694,10 +703,12 @@ func (r *Resharder) countUnkeyed(td ptrace.Traces) {
 	}
 }
 
-// split partitions td by owning shard. The single-owner case — a one-shard tier,
-// a small batch, or any batch whose traces happen to hash to one place — returns
-// the caller's payload untouched, which is the difference between this hop
-// costing a copy of every span and costing nothing.
+// split partitions td by owning shard, CONSUMING td: every span it routes is
+// moved out of the input rather than copied (see the move below). The
+// single-owner case — a one-shard tier, a small batch, or any batch whose
+// traces happen to hash to one place — returns the caller's payload untouched,
+// which is the difference between this hop costing a walk of every span and
+// costing nothing.
 func (r *Resharder) split(td ptrace.Traces) (local ptrace.Traces, remote map[string]ptrace.Traces) {
 	if only, ok := r.singleOwner(td); ok {
 		if only == r.self {
@@ -749,7 +760,21 @@ func (r *Resharder) split(td ptrace.Traces) (local ptrace.Traces, remote map[str
 					dst.SetSchemaUrl(ss.SchemaUrl())
 					cur[owner] = dst
 				}
-				span.CopyTo(dst.Spans().AppendEmpty())
+				// MOVED, not copied. Reshard takes ownership of td (see its
+				// doc, and the single-owner arm above, which already hands the
+				// caller's own payload on), and nothing reads td once split
+				// returns — the entry exporter uses only the local share and
+				// the shares that were sent. A move is a struct swap; a copy
+				// duplicates the span's attributes, events and links one heap
+				// object at a time, which measured 26 allocations and ~1.5 kB
+				// per SPAN on a realistically instrumented batch, paid on the
+				// tier's entry hop for every span the cluster emits.
+				//
+				// The source slice is walked by index and only element k is
+				// swapped, so the walk is unaffected; the resource and the
+				// scope are still COPIED, because one source resource fans out
+				// to as many owners as its spans hash to.
+				span.MoveTo(dst.Spans().AppendEmpty())
 			}
 		}
 	}

@@ -39,6 +39,6 @@ func (p *pipelines) startJournald(ctx context.Context) error {
 	p.spawn(func() {
 		jr.Run(ctx)
 	})
-	p.log.Info("journald reader started", "dir", *journaldDir, "units", *journaldUnits, "positions", *positionsFile)
+	p.log.Info("journald reader started", "dir", *journaldDir, "units", *journaldUnits, "positionsFile", *positionsFile)
 	return nil
 }

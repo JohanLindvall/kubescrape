@@ -59,7 +59,7 @@ func selfResolver(st *store.Store, resolver server.MetadataResolver) func(contex
 		}
 		obs.SelfMetadataLookups.WithLabelValues(obs.SelfLookupByName).Inc()
 		pod := np.Pod
-		pod.Owners = resolver.Resolve(pod.Namespace, np.OwnerRefs)
+		pod.Owners, pod.OwnersOmitted = resolver.Resolve(pod.Namespace, np.OwnerRefs)
 		pod.NamespaceMetadata = resolver.Namespace(pod.Namespace)
 		return &pod, nil
 	}

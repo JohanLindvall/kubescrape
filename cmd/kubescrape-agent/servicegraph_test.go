@@ -809,18 +809,25 @@ func TestEverySpanReachesExactlyOneOwnerChain(t *testing.T) {
 	entry := &sgEntry{resharder: resharder, owner: localOwner}
 
 	// Enough distinct traces that the ring splits them across both shards.
-	td := ptrace.NewTraces()
-	rs := td.ResourceSpans().AppendEmpty()
-	rs.Resource().Attributes().PutStr("service.name", "checkout")
-	ss := rs.ScopeSpans().AppendEmpty()
+	//
+	// Built per push, never reused: Reshard CONSUMES the payload it splits (it
+	// MOVES each span into its owner's share rather than copying it), which is
+	// what a receiver hands it — one freshly decoded request per push.
 	const traces = 200
-	for i := 0; i < traces; i++ {
-		sp := ss.Spans().AppendEmpty()
-		sp.SetTraceID(pcommon.TraceID{byte(i), byte(i >> 8), 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 1})
-		sp.SetSpanID(pcommon.SpanID{byte(i), 2, 3, 4, 5, 6, 7, 8})
-		sp.SetKind(ptrace.SpanKindClient)
+	push := func() ptrace.Traces {
+		td := ptrace.NewTraces()
+		rs := td.ResourceSpans().AppendEmpty()
+		rs.Resource().Attributes().PutStr("service.name", "checkout")
+		ss := rs.ScopeSpans().AppendEmpty()
+		for i := 0; i < traces; i++ {
+			sp := ss.Spans().AppendEmpty()
+			sp.SetTraceID(pcommon.TraceID{byte(i), byte(i >> 8), 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 1})
+			sp.SetSpanID(pcommon.SpanID{byte(i), 2, 3, 4, 5, 6, 7, 8})
+			sp.SetKind(ptrace.SpanKindClient)
+		}
+		return td
 	}
-	if err := entry.ExportTraces(context.Background(), td); err != nil {
+	if err := entry.ExportTraces(context.Background(), push()); err != nil {
 		t.Fatalf("ExportTraces: %v", err)
 	}
 
@@ -840,7 +847,7 @@ func TestEverySpanReachesExactlyOneOwnerChain(t *testing.T) {
 	// The internal hop is a real hop: its failure must fail the push, or the
 	// entry shard would ack spans it is the only copy of.
 	sibling.err = errors.New("shard down")
-	if err := entry.ExportTraces(context.Background(), td); err == nil {
+	if err := entry.ExportTraces(context.Background(), push()); err == nil {
 		t.Fatal("the entry shard acked a push whose internal hop failed; those spans have no other copy")
 	}
 }

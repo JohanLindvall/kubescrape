@@ -35,7 +35,7 @@ func TestResolveReplicaSetToDeployment(t *testing.T) {
 		}),
 		"deployments/default/web": obj("dep-uid", map[string]string{"team": "core"}),
 	})
-	got := r.Resolve("default", []metav1.OwnerReference{{
+	got, _ := r.Resolve("default", []metav1.OwnerReference{{
 		APIVersion: "apps/v1", Kind: "ReplicaSet", Name: "web-abc", UID: "rs-uid", Controller: &ctrl,
 	}})
 	want := []kubemeta.Owner{
@@ -56,7 +56,7 @@ func TestResolveJobToCronJob(t *testing.T) {
 			APIVersion: "batch/v1", Kind: "CronJob", Name: "backup", UID: "cj-uid", Controller: &ctrl,
 		}),
 	})
-	got := r.Resolve("batch-ns", []metav1.OwnerReference{{
+	got, _ := r.Resolve("batch-ns", []metav1.OwnerReference{{
 		APIVersion: "batch/v1", Kind: "Job", Name: "backup-123", UID: "job-uid", Controller: &ctrl,
 	}})
 	if len(got) != 2 || got[1].Kind != "CronJob" || got[1].Name != "backup" {
@@ -71,7 +71,7 @@ func TestResolveJobToCronJob(t *testing.T) {
 
 func TestResolveUnknownParentKeepsDirectOwner(t *testing.T) {
 	r := fakeResolver(nil) // ReplicaSet not in cache
-	got := r.Resolve("default", []metav1.OwnerReference{{
+	got, _ := r.Resolve("default", []metav1.OwnerReference{{
 		APIVersion: "apps/v1", Kind: "ReplicaSet", Name: "gone", UID: "rs-uid",
 	}})
 	if len(got) != 1 || got[0].Kind != "ReplicaSet" {
@@ -81,13 +81,13 @@ func TestResolveUnknownParentKeepsDirectOwner(t *testing.T) {
 
 func TestResolveNonFollowedKinds(t *testing.T) {
 	r := fakeResolver(nil)
-	got := r.Resolve("default", []metav1.OwnerReference{{
+	got, _ := r.Resolve("default", []metav1.OwnerReference{{
 		APIVersion: "apps/v1", Kind: "DaemonSet", Name: "ds", UID: "ds-uid",
 	}})
 	if len(got) != 1 || got[0].Kind != "DaemonSet" {
 		t.Fatalf("got %+v", got)
 	}
-	if got := r.Resolve("default", nil); got != nil {
+	if got, _ := r.Resolve("default", nil); got != nil {
 		t.Fatalf("no refs should resolve to nil, got %+v", got)
 	}
 }
@@ -108,7 +108,7 @@ func TestResolveDirectOwnerWorkloadLabels(t *testing.T) {
 			metav1.OwnerReference{APIVersion: "example.com/v1", Kind: "Agent", Name: "logging", UID: "cr-uid"}),
 	})
 
-	sts := r.Resolve("db", []metav1.OwnerReference{{
+	sts, _ := r.Resolve("db", []metav1.OwnerReference{{
 		APIVersion: "apps/v1", Kind: "StatefulSet", Name: "postgres", UID: "sts-uid", Controller: &ctrl,
 	}})
 	want := []kubemeta.Owner{{
@@ -119,7 +119,7 @@ func TestResolveDirectOwnerWorkloadLabels(t *testing.T) {
 		t.Errorf("statefulset owner\n got %+v\nwant %+v", sts, want)
 	}
 
-	ds := r.Resolve("kube-system", []metav1.OwnerReference{{
+	ds, _ := r.Resolve("kube-system", []metav1.OwnerReference{{
 		APIVersion: "apps/v1", Kind: "DaemonSet", Name: "fluentd", UID: "ds-uid", Controller: &ctrl,
 	}})
 	if len(ds) != 1 || ds[0].Labels["app"] != "fluentd" {
@@ -177,7 +177,7 @@ func TestNewFromListers(t *testing.T) {
 	})
 
 	ctrl := true
-	got := r.Resolve("default", []metav1.OwnerReference{{
+	got, _ := r.Resolve("default", []metav1.OwnerReference{{
 		APIVersion: "apps/v1", Kind: "ReplicaSet", Name: "web-abc", UID: "rs-uid", Controller: &ctrl,
 	}})
 	if len(got) != 1 || got[0].Name != "web-abc" || got[0].Kind != "ReplicaSet" {
@@ -186,7 +186,7 @@ func TestNewFromListers(t *testing.T) {
 
 	// Unknown resource kinds (no lister) and unknown names resolve to the
 	// direct reference only, without panicking.
-	got = r.Resolve("default", []metav1.OwnerReference{{
+	got, _ = r.Resolve("default", []metav1.OwnerReference{{
 		APIVersion: "batch/v1", Kind: "Job", Name: "j1", UID: "j-uid", Controller: &ctrl,
 	}})
 	if len(got) != 1 || got[0].Kind != "Job" {
@@ -207,7 +207,7 @@ func TestResolveUIDMismatchKeepsRefIdentity(t *testing.T) {
 			APIVersion: "apps/v1", Kind: "Deployment", Name: "web", UID: "dep-uid", Controller: &ctrl,
 		}),
 	})
-	got := r.Resolve("default", []metav1.OwnerReference{{
+	got, _ := r.Resolve("default", []metav1.OwnerReference{{
 		APIVersion: "apps/v1", Kind: "ReplicaSet", Name: "web-abc", UID: "OLD-uid", Controller: &ctrl,
 	}})
 	want := []kubemeta.Owner{

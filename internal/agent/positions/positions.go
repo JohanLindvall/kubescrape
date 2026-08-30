@@ -18,6 +18,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/JohanLindvall/haste/xxh3"
 	"github.com/JohanLindvall/kubescrape/internal/obs"
 )
 
@@ -58,6 +59,17 @@ type Store struct {
 	// error keeps nothing, a type error keeps the well-formed entries — so a
 	// missing entry must not be mistaken for a first run (see Corrupt).
 	corrupt bool
+	// written identifies the document THIS process last renamed into place, so
+	// save can skip a write whose bytes are already durable. It is a 128-bit
+	// xxh3 of the marshalled document rather than the bytes themselves: this is
+	// identity hashing (a collision would skip a write that was needed), which
+	// is what the repo's 128-bit half is for, and retaining the bytes would pin
+	// a second copy of a document that reaches ~1.8 MB at 3000 tracked files.
+	// writtenValid is false until a write of ours has SUCCEEDED, so the first
+	// save of a process always writes: the file on disk may have been left by
+	// an older build, or hand-edited, and its bytes are not ours to assume.
+	written      [16]byte
+	writtenValid bool
 }
 
 // Open loads the store at path, tolerating a missing or corrupt file (it
@@ -79,12 +91,37 @@ func Open(path string) (*Store, error) {
 	// embedding the path in a filepath.Glob pattern: a positions path holding
 	// a glob metacharacter ([ * ?) would otherwise make the pattern match — and
 	// remove — files that are not this store's temps.
-	if entries, err := os.ReadDir(filepath.Dir(path)); err == nil {
+	if entries, err := os.ReadDir(filepath.Dir(path)); err != nil {
+		// Not fatal — a missing or unreadable parent is diagnosed properly
+		// below, on the path where it decides whether saves can work at all —
+		// but worth saying, because it is also why no sweep happened.
+		slog.Debug("could not list the positions directory to sweep stale temporary files",
+			"dir", filepath.Dir(path), "error", err)
+	} else {
 		prefix := filepath.Base(path) + ".tmp-"
+		swept, failed := 0, 0
 		for _, e := range entries {
-			if strings.HasPrefix(e.Name(), prefix) {
-				_ = os.Remove(filepath.Join(filepath.Dir(path), e.Name()))
+			if !strings.HasPrefix(e.Name(), prefix) {
+				continue
 			}
+			if err := os.Remove(filepath.Join(filepath.Dir(path), e.Name())); err != nil {
+				failed++
+				continue
+			}
+			swept++
+		}
+		if failed > 0 {
+			// Each leftover is a save that died between CreateTemp and Rename,
+			// and one that cannot be removed says the directory is not writable
+			// the way this store needs it — which is the same condition that
+			// will make every save fail (counted
+			// kubescrape_positions_save_errors_total, but only once a save is
+			// attempted, which is one flush interval too late to be the first
+			// thing an operator sees).
+			slog.Warn("could not remove stale positions temporary files; the positions directory may not be writable",
+				"dir", filepath.Dir(path), "entries", failed)
+		} else if swept > 0 {
+			slog.Info("swept stale positions temporary files left by a previous process", "dir", filepath.Dir(path), "entries", swept)
 		}
 	}
 	data, err := os.ReadFile(path)
@@ -105,6 +142,16 @@ func Open(path string) (*Store, error) {
 		if !fi.IsDir() {
 			return nil, fmt.Errorf("positions file %s: parent %s is not a directory", path, dir)
 		}
+		// FIRST RUN, and it is worth one line, because of what follows from it:
+		// with no stored positions -logs-unknown-files=auto resolves to "end",
+		// so every log file that already exists on the node is skipped to its
+		// end as history and its current contents are never exported. That is
+		// the intended behaviour and it is also the single most common "the
+		// agent is not collecting anything" report on a first live run — an
+		// operator who sees this line knows to look at the flag rather than at
+		// the pipeline.
+		slog.Info("no positions file yet; this is a first run for this volume, so existing log files are treated per -logs-unknown-files and the journal starts at its tail",
+			"path", path)
 		return s, nil
 	}
 	// A corrupt file must not wedge startup, but it must not look like a FIRST
@@ -123,6 +170,13 @@ func Open(path string) (*Store, error) {
 		slog.Warn("positions file corrupt; whatever decoded is kept, and inputs without an entry are re-read from the start rather than skipped as history",
 			"path", path, "error", err)
 	}
+	// Lifecycle, once: WHERE the agent resumes from. Without it a restart that
+	// silently resumed at zero (a wiped volume, a mistyped -positions-file
+	// pointing somewhere new) looks exactly like a healthy one until the
+	// duplicate records arrive downstream. Counts only — a cursor is opaque and
+	// a path list is unbounded, and neither belongs on a startup line.
+	slog.Info("positions loaded", "path", path, "entries", len(s.doc.Logs),
+		"bytes", len(data), "journalCursor", s.doc.JournalCursor != "", "corrupt", s.corrupt)
 	return s, nil
 }
 
@@ -165,6 +219,23 @@ func (s *Store) SetLogs(m map[string]LogPos) error {
 	return s.save()
 }
 
+// SetLogsOwned replaces the log section with a map the store TAKES OVER, and
+// persists. The caller must never read or write m (nor any Pending slice it
+// holds) after the call — the store keeps it, and Logs hands copies out from
+// it on other goroutines.
+//
+// It exists for the tailer's saveCheckpoints, which builds a fresh map on every
+// save and drops it on return: SetLogs' defensive copy then duplicated ~3000
+// entries and every Pending slice for nothing, on the single sweep goroutine
+// that serves every log file on the node. Callers that keep their map must use
+// SetLogs.
+func (s *Store) SetLogsOwned(m map[string]LogPos) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.doc.Logs = m
+	return s.save()
+}
+
 // clonePrefixes copies a Pending slice (Prefix holds no reference types, so a
 // slice copy is a deep one); len 0 maps to nil, keeping omitempty encoding.
 func clonePrefixes(p []Prefix) []Prefix {
@@ -190,7 +261,9 @@ func (s *Store) SetJournalCursor(cursor string) error {
 }
 
 // save writes the whole document atomically and durably (write + fsync +
-// rename + best-effort directory sync). The caller holds the mutex. Without
+// rename + best-effort directory sync), unless the document is byte-identical
+// to the one this process last wrote (see below). The caller holds the mutex.
+// Without
 // the fsync a power loss shortly after the rename can leave a zero-length
 // file — and an empty positions file means the tailer skips every existing
 // log to its end and journald seeks to the tail, silently losing the entire
@@ -200,21 +273,48 @@ func (s *Store) SetJournalCursor(cursor string) error {
 // the call sites: callers only Warn and carry on, so offsets silently not
 // persisting — a bad path, a read-only mount, a full disk — would otherwise
 // leave every metric flat while a restart re-reads or skips a stale window.
+//
+// A save whose document is byte-identical to the one this process last wrote
+// is SKIPPED. That is not an optimisation with a semantic cost: writing bytes
+// that are already durable at that path changes nothing on disk, and it is
+// what the two fsyncs are spent on. Measured on ext4/nvme, one save is ~11 ms
+// at 100 tracked files and ~15 ms at 3000, of which ~11 ms is the two fsyncs
+// and the rest is marshalling — so the skip turns the tailer's 10-second
+// cadence on a quiet node, and every repeat save inside one sweep, from a
+// whole-node stall into a marshal.
+//
+// The one behaviour it gives up is re-asserting our document over a
+// concurrent writer's: a terminating pod's agent and its replacement overlap
+// for a few seconds, and where the old code would rename our (identical)
+// document back over the old process's final save, we now leave that one in
+// place while ours is unchanged. Both are complete documents and "last rename
+// wins" already permitted exactly that ordering (see write); as soon as this
+// process makes any progress its next save writes.
 func (s *Store) save() error {
-	if err := s.write(); err != nil {
+	data, err := json.Marshal(&s.doc)
+	if err != nil {
 		obs.PositionsSaveErrors.Inc()
 		return err
 	}
+	sum := xxh3.Sum128(data).Bytes()
+	if s.writtenValid && sum == s.written {
+		return nil
+	}
+	if err := s.write(data); err != nil {
+		// The identity is cleared, not left stale: a failed write may have
+		// renamed nothing, or (a full disk mid-fsync) left the path holding
+		// something else entirely, so the next save must write unconditionally.
+		s.writtenValid = false
+		obs.PositionsSaveErrors.Inc()
+		return err
+	}
+	s.written, s.writtenValid = sum, true
 	return nil
 }
 
-// write is save's I/O half: marshal, unique temp file, fsync, rename, best-
-// effort directory sync.
-func (s *Store) write() error {
-	data, err := json.Marshal(s.doc)
-	if err != nil {
-		return err
-	}
+// write is save's I/O half: unique temp file, fsync, rename, best-effort
+// directory sync.
+func (s *Store) write(data []byte) error {
 	// Unique temp name (not a fixed ".tmp"): a terminating pod's agent and
 	// its replacement can briefly run concurrently, and with a shared name
 	// one writer could rename the other's half-written file into place.

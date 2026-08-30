@@ -74,7 +74,7 @@ issue tracker.
 | Per-workload (annotation) log config | ✔ `kubescrape.io/logs` (exclude, multiline, rules, attributes) | ~ PodLogs CRD (GA: per-workload selection/relabeling; no multiline/rule overrides) | ~ `vector.dev/exclude` label + exclude-containers annotation | ~ `fluentbit.io/exclude`, parser annotations | ✘ | ✔✔ hints (`co.elastic.logs/*`: enable, parsers, multiline, processors, whole modules) — the broadest here |
 | Body rewriting / templating | ✔ opt-in (Starlark transforms; the built-in pipeline never modifies bodies) | ✔ | ✔ VRL | ✔ | ✔ OTTL | ✔ processors + ES ingest pipelines |
 | General transform language | **Starlark** (per-batch plus ingest/targets/sample/parse hooks; `route()`/`emit_metric()` verbs; hot-reloaded, opt-in) | River/stages | **VRL** | Lua/WASM/SQL stream processor/processors | **OTTL** | processors + JS `script`; Painless ingest pipelines backend-side (OTTL in EDOT mode) |
-| Live debug tap of shipped data | ✔ `GET /debug/otlp`: streamed OTLP JSON, resource-attr glob filters + sample %, built-in UI, zero cost unattached; a `GET /debug` homepage on both binaries indexes every debug surface | ✔ Alloy `livedebugging` UI (per component) | ✔ `vector tap` (glob on component IDs) | ✘ | ~ debug exporter (always-on config, whole feed, needs a config edit + restart) | ✘ (diagnostics bundle after the fact; `output.console` is a config change + restart) |
+| Live debug tap of shipped data | ✔ `GET /debug/otlp`: streamed OTLP JSON, resource-attr glob filters + sample %, built-in UI, zero cost unattached, and **gated** (local connection — i.e. `kubectl port-forward` — or the `-debug-token-file` bearer token); a `GET /debug` homepage on both binaries indexes every debug surface | ✔ Alloy `livedebugging` UI (per component) | ✔ `vector tap` (glob on component IDs) | ✘ | ~ debug exporter (always-on config, whole feed, needs a config edit + restart) | ✘ (diagnostics bundle after the fact; `output.console` is a config change + restart) |
 | "Why is this pod (not) scraped?" | ✔ `GET /v1/explain/{ns}/{pod}`: the whole decision chain, verdict by verdict | ~ targets pages show the post-relabel result, not the why | ✘ | ✘ | ~ targetallocator debug endpoints (jobs/targets, no per-pod verdicts) | ~ `elastic-agent inspect` renders the resolved autodiscover inputs (config, not verdicts) |
 
 † Cells describe Alloy; Promtail differences are noted inline. Promtail
@@ -384,3 +384,16 @@ metrics, already covered by node_exporter, are not. Even that cost is now a
 choice: the reader sits behind the `journald` build tag, which the default
 build sets — dropping it yields a cgo-free, fully static agent at the price
 of the node's unit logs.
+
+The same lever applies twice more, and the second one is the large one.
+`azure` compiles out the Event Hubs consumer (11 franz-go packages, ≈5 MB
+stripped) and `events` compiles out the Kubernetes events reader and its
+leader election — which are the *only* reason the agent links
+`k8s.io/client-go`. Both pipelines run exclusively in a one-replica
+Deployment, so a DaemonSet that will never run either can drop both:
+`make build TAGS=journald` takes the stripped agent from **59.16 MB to
+21.27 MB**, and `TAGS=journald,azure` (dropping only `events`) takes it to
+**26.27 MB**, −55.6%. `make verify-tags` asserts the exclusions really
+happen, which is what makes "this agent talks to no Kubernetes API" a
+property a build can fail on rather than a claim on a comparison page.
+Figures measured on go1.26.6, `-trimpath -ldflags="-s -w"`.

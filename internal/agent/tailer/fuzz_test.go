@@ -5,6 +5,7 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 )
 
 // FuzzFeedLine pushes arbitrary byte lines (split on '\n', as consume does)
@@ -63,7 +64,7 @@ func FuzzFeedLine(f *testing.F) {
 			if len(line) == 0 {
 				continue // consume drops empty physical lines but the offset advances
 			}
-			tl.feedLine(ctx, file, string(line), start, total)
+			tl.feedLine(ctx, file, string(line), start, total, time.Now())
 			checkWatermark("after feed")
 		}
 		file.lineStart, file.readPos = total, total

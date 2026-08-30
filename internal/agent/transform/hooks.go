@@ -16,6 +16,7 @@ package transform
 // kubescrape_transform_errors_total{signal} and logged throttled.
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
 	"time"
@@ -33,6 +34,10 @@ import (
 // then takes its fail-open path.
 var hookWarnGates struct {
 	ingest, targets, sample, parse logdedupe.Throttle
+	// parseShape gates ParseLine's wrong-return-type warning separately from
+	// parse (the script-error gate), for the reason spelled out at its call
+	// site: the two classes alternate across the edit that causes them.
+	parseShape logdedupe.Throttle
 	// sampleGone gates SampleDecider's section-removed warning SEPARATELY
 	// from sample (the script-error gate): the two classes alternate across
 	// the very transitions the messages exist to report — an error-warned
@@ -46,7 +51,11 @@ var hookWarnGates struct {
 func hookErr(gate *logdedupe.Throttle, signal string, err error) {
 	obs.TransformErrors.WithLabelValues(signal).Inc()
 	if gate.Allow(time.Minute) {
-		slog.Warn("transform hook failed (failing open)", "hook", signal, "error", err)
+		// The position matters more here than anywhere: a hook fails open, so
+		// the ONLY symptom is that nothing happened, and the bare Starlark
+		// message ("undefined: foo") names no line in the file.
+		slog.Warn("transform hook failed (failing open)",
+			"hook", signal, "script", scriptPos(err), "error", err)
 	}
 }
 
@@ -113,6 +122,14 @@ func (w *Wrapper) TransformTargets(ts []kubemeta.ScrapeTarget) []kubemeta.Scrape
 	if p == nil || p.targets == nil {
 		return ts
 	}
+	// A dropped target is INTENDED loss with no other symptom: it is simply
+	// never fetched, so there is no `up` series to fall to 0 and nothing in
+	// the scrape pipeline can report the absence — the same argument that gave
+	// script drop() its counter. The URL is what identifies it, and that is
+	// per target, so it goes at Debug behind ONE level check per cycle (the
+	// hook runs once per scrape cycle over every target on the node).
+	debug := slog.Default().Enabled(context.Background(), slog.LevelDebug)
+	dropped := 0
 	out := make([]kubemeta.ScrapeTarget, 0, len(ts))
 	for i := range ts {
 		t := ts[i] // value copy: the script's writes must never reach the cached element
@@ -127,10 +144,23 @@ func (w *Wrapper) TransformTargets(ts []kubemeta.ScrapeTarget) []kubemeta.Scrape
 		}
 		if tgt.mutatedPath {
 			t.URL = t.Scheme + "://" + t.Address + t.Path
+			if debug {
+				slog.Debug("targets hook rewrote a scrape target's path",
+					"namespace", t.Pod.Namespace, "pod", t.Pod.Name, "url", t.URL)
+			}
 		}
 		if !tgt.dropped {
 			out = append(out, t)
+			continue
 		}
+		dropped++
+		if debug {
+			slog.Debug("targets hook dropped a scrape target; it will not be scraped this cycle",
+				"namespace", t.Pod.Namespace, "pod", t.Pod.Name, "url", ts[i].URL)
+		}
+	}
+	if dropped > 0 {
+		obs.TransformDropped.WithLabelValues("targets").Add(float64(dropped))
 	}
 	return out
 }
@@ -381,7 +411,24 @@ func (w *Wrapper) ParseLine(line string) (Parsed, bool) {
 	}
 	d, ok := v.(*starlark.Dict)
 	if !ok {
-		return Parsed{}, false // None (or anything else): unparsed
+		// None is the documented "leave this line alone". ANYTHING ELSE is a
+		// script that believes it is parsing and is not: every line falls
+		// through unparsed, the source's records keep their raw bodies, and
+		// the only difference from a working hook is the absence of fields
+		// nobody is looking for yet. Counted and warned like a script error,
+		// which is what it is — under its OWN gate, because the two classes
+		// alternate across exactly the edit that causes them (a script that
+		// errors, is fixed into one that returns the wrong shape) and a shared
+		// window would let the first suppress the second's only line.
+		if v != starlark.None {
+			obs.TransformErrors.WithLabelValues("parse").Inc()
+			if hookWarnGates.parseShape.Allow(time.Minute) {
+				slog.Warn("the parse hook returned neither a dict nor None, so the line is left unparsed "+
+					"(parse(line) must return {\"body\": ...} or None)",
+					"hook", "parse", "type", v.Type())
+			}
+		}
+		return Parsed{}, false
 	}
 	var out Parsed
 	if bv, found, _ := d.Get(starlark.String("body")); found {

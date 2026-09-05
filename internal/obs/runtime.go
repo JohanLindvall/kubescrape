@@ -96,7 +96,19 @@ func ServeMetrics(addr string, internal bool, log *slog.Logger) (func(), error) 
 	}
 	mux := http.NewServeMux()
 	mux.Handle("GET /metrics", RuntimeHandler(internal))
-	srv := &http.Server{Addr: addr, Handler: mux, ReadHeaderTimeout: 10 * time.Second}
+	// Bounded like the agent's debug server: this port is open to every pod
+	// (the chart's NetworkPolicy leaves the scrape port unscoped by design),
+	// and a client that opens a connection and then neither finishes its
+	// request nor closes holds a file descriptor on a process whose tailer
+	// needs one per log file. ReadHeaderTimeout alone bounds only the head.
+	srv := &http.Server{
+		Addr:              addr,
+		Handler:           mux,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
 	// Bind SYNCHRONOUSLY so a failure reaches the caller. It used to be logged
 	// from inside the goroutine and dropped: with -self-metrics-interval=0 —
 	// the documented way to choose the scrape modality over the OTLP push —
@@ -169,7 +181,17 @@ func ServePprof(addr string, log *slog.Logger) (func(), error) {
 	// ReadHeaderTimeout only: no whole-request Read/WriteTimeout, because
 	// /debug/pprof/profile legitimately streams for its full ?seconds=
 	// duration and either bound would cut a long profile off mid-body.
-	srv := &http.Server{Addr: addr, Handler: mux, ReadHeaderTimeout: 10 * time.Second}
+	// No WriteTimeout here: /debug/pprof/profile?seconds=N streams for as long
+	// as it was asked to, and a write deadline would cut a 30-second CPU
+	// profile short. The read side and idle keep-alives are bounded as on the
+	// metrics port.
+	srv := &http.Server{
+		Addr:              addr,
+		Handler:           mux,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		return func() {}, fmt.Errorf("pprof endpoint %s: %w", addr, err)

@@ -98,6 +98,23 @@ jobs:
       # run, and it would have drifted from the Makefile regardless.
       - run: make lint
 
+  vulncheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+      - run: sudo apt-get update && sudo apt-get install -y libsystemd-dev
+      # go.mod's `go` directive is a SECURITY floor (CLAUDE.md: the advisories
+      # it was raised for), and the floor only holds while nothing reachable
+      # is newly advisable. Run against the shipped tag set, so the journald,
+      # Azure and events pipelines' dependencies are in the reachability
+      # analysis rather than the stubs.
+      - name: govulncheck
+        run: go run golang.org/x/vuln/cmd/govulncheck@latest -tags journald,azure,events ./...
+
   helm:
     runs-on: ubuntu-latest
     steps:

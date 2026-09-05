@@ -128,6 +128,10 @@ spec:
         prometheus.io/port: "9090"
         prometheus.io/path: /metrics
     spec:
+      # No ServiceAccount and nothing here reads the Kubernetes API, so the
+      # default account's token is not projected into a pod whose
+      # application-facing ports take pushes from every pod in the cluster.
+      automountServiceAccountToken: false
       # Room for the final service-graph and self-metrics exports.
       terminationGracePeriodSeconds: 60
       # Kubernetes' own seccomp default is Unconfined, which is LOOSER than what

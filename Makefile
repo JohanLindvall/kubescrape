@@ -45,7 +45,10 @@ TAGS_STATIC ?= azure,events
 AGENT_CGO := $(if $(findstring journald,$(TAGS)),1,0)
 
 GOLANGCI_LINT_VERSION := v2.12.2
-GOLANGCI_LINT         := $(shell go env GOPATH)/bin/golangci-lint
+# Under hack/bin like helm, never GOPATH/bin: the pin is enforced by
+# reinstalling, and a developer's own golangci-lint must not be the binary that
+# gets replaced.
+GOLANGCI_LINT         := hack/bin/golangci-lint
 
 .PHONY: all build test vet fmt fmt-check tidy lint run image image-static verify-tags helm-lint check cluster-up cluster-down e2e chaos clean
 
@@ -96,11 +99,19 @@ helm-lint:
 tidy:
 	go mod tidy
 
+# The version is checked on every run, not only when the binary is absent: a
+# golangci-lint already in GOPATH/bin at another version silently ran a
+# different rule set from CI's — passing locally on rules CI refuses, or the
+# reverse — and the file target below can only see that the binary exists.
 lint: $(GOLANGCI_LINT)
+	@v="$$($(GOLANGCI_LINT) version --short 2>/dev/null || $(GOLANGCI_LINT) version 2>/dev/null)"; \
+		case "$$v" in *$(patsubst v%,%,$(GOLANGCI_LINT_VERSION))*) ;; \
+		*) echo "golangci-lint is $$v, the Makefile pins $(GOLANGCI_LINT_VERSION); reinstalling"; \
+		   mkdir -p hack/bin && GOBIN="$(abspath hack/bin)" go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(GOLANGCI_LINT_VERSION) ;; esac
 	$(GOLANGCI_LINT) run $(if $(strip $(TAGS)),--build-tags=$(TAGS),)
 
 $(GOLANGCI_LINT):
-	go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(GOLANGCI_LINT_VERSION)
+	mkdir -p hack/bin && GOBIN="$(abspath hack/bin)" go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(GOLANGCI_LINT_VERSION)
 
 # The guard for the build tags: that the agent WITHOUT journald really is
 # CGO-free (a stray import of internal/agent/journald would fail this build,

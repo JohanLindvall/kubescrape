@@ -1,0 +1,20 @@
+# The build stages need go.mod, go.sum and the Go sources under cmd/, internal/,
+# pkg/ and hack/nhexporter (in the main module). Everything else in the tree is
+# docs, deployment files, test fixtures and tooling: sending it made every doc
+# or chart edit invalidate the `COPY . .` layer and shipped nothing.
+.git
+.github
+bin
+charts
+deploy
+docs
+todo
+*.md
+Dockerfile
+Dockerfile.static
+hack/bin
+hack/*.sh
+hack/*.yaml
+hack/chaos
+hack/helm-version
+**/testdata

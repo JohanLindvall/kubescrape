@@ -32,14 +32,14 @@ package otlpexport
 // endpoint, TLS, headers, credentials — from their own configuration, and may
 // override the transport fields they own (the reshard hop pins RetryAttempts
 // to 1, for instance).
-func (c Config) TransportOnly() Config {
+func (cfg Config) TransportOnly() Config {
 	return Config{
-		Protocol:         c.Protocol,
-		Compression:      c.Compression,
-		CompressionLevel: c.CompressionLevel,
-		Timeout:          c.Timeout,
-		RetryAttempts:    c.RetryAttempts,
-		RetryBackoff:     c.RetryBackoff,
-		MaxSendBytes:     c.MaxSendBytes,
+		Protocol:         cfg.Protocol,
+		Compression:      cfg.Compression,
+		CompressionLevel: cfg.CompressionLevel,
+		Timeout:          cfg.Timeout,
+		RetryAttempts:    cfg.RetryAttempts,
+		RetryBackoff:     cfg.RetryBackoff,
+		MaxSendBytes:     cfg.MaxSendBytes,
 	}
 }

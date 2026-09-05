@@ -75,25 +75,25 @@ func ParsePodMonitor(u *unstructured.Unstructured) (*PodMonitor, error) {
 // endpoints being dropped carry the bearerTokenSecret refs AuthSecretRefs
 // allowlists, so a stale monitor would keep /v1/scrape-auth willing to serve
 // a Secret the live spec no longer names).
-func (x *Index) UpsertPodMonitor(u *unstructured.Unstructured) error {
-	_, err := x.UpsertPodMonitorChanged(u)
+func (ix *Index) UpsertPodMonitor(u *unstructured.Unstructured) error {
+	_, err := ix.UpsertPodMonitorChanged(u)
 	return err
 }
 
 // UpsertPodMonitorChanged is UpsertPodMonitor, additionally reporting whether
 // the delivery was news — Index.UpsertChanged's mirror, and for the same
 // caller.
-func (x *Index) UpsertPodMonitorChanged(u *unstructured.Unstructured) (bool, error) {
+func (ix *Index) UpsertPodMonitorChanged(u *unstructured.Unstructured) (bool, error) {
 	m, err := ParsePodMonitor(u)
-	return upsertMonitor(x, x.podMonitors, x.rejectedPodMonitors,
+	return upsertMonitor(ix, ix.podMonitors, ix.rejectedPodMonitors,
 		u.GetNamespace()+"/"+u.GetName(), u.GetResourceVersion(), m, err)
 }
 
 // DeletePodMonitor removes one.
-func (x *Index) DeletePodMonitor(namespace, name string) {
-	x.mu.Lock()
-	defer x.mu.Unlock()
-	deleteMonitor(x, x.podMonitors, x.rejectedPodMonitors, namespace+"/"+name)
+func (ix *Index) DeletePodMonitor(namespace, name string) {
+	ix.mu.Lock()
+	defer ix.mu.Unlock()
+	deleteMonitor(ix, ix.podMonitors, ix.rejectedPodMonitors, namespace+"/"+name)
 }
 
 // PodMonitors returns all pod monitors (shared, treat as immutable).
@@ -103,8 +103,8 @@ func (x *Index) DeletePodMonitor(namespace, name string) {
 // endpoint configuration merged into the first's (scrape.MergeMonitorEndpoint)
 // — so map-iteration order must not decide which monitor names the target,
 // whose relabel chain runs first, or whose auth wins a conflict.
-func (x *Index) PodMonitors() []*PodMonitor {
-	x.mu.RLock()
-	defer x.mu.RUnlock()
-	return sortedMonitors(x.podMonitors, func(m *PodMonitor) (string, string) { return m.Namespace, m.Name })
+func (ix *Index) PodMonitors() []*PodMonitor {
+	ix.mu.RLock()
+	defer ix.mu.RUnlock()
+	return sortedMonitors(ix.podMonitors, func(m *PodMonitor) (string, string) { return m.Namespace, m.Name })
 }

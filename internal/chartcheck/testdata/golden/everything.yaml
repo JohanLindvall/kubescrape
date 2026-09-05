@@ -1140,6 +1140,12 @@ spec:
         prometheus.io/port: "9090"
         prometheus.io/path: /metrics
     spec:
+      # No ServiceAccount of its own and nothing here reads the Kubernetes API
+      # (the header comment), so the DEFAULT account's token must not be
+      # projected into a pod whose application-facing ports take pushes from
+      # every pod in the cluster: a token nothing legitimately uses is only
+      # ever a credential for whoever gets code execution here.
+      automountServiceAccountToken: false
       # A shard restart drops whatever half-edges it was holding, so the
       # shutdown budget matters here for the same reason it does elsewhere:
       # the final service-graph and self-metrics exports run before exit.

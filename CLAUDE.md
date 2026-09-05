@@ -9,7 +9,7 @@ make build              # build to bin/kubescrape
 make test               # go test ./...
 go test ./internal/store/ -run TestWaitIsPerContainer -v   # single test
 make vet fmt tidy
-make lint               # golangci-lint v2 (auto-installed to GOPATH/bin; config .golangci.yml)
+make lint               # golangci-lint v2 at the version the Makefile pins (installed into hack/bin, reinstalled on a version mismatch; config .golangci.yml)
 make image              # docker build; service is CGO_ENABLED=0 static, agent is CGO_ENABLED=1 (libsystemd/journald) on distroless/base; release binaries strip -s -w (~30% smaller; panic traces unaffected — the runtime reads pclntab). `make build` stays unstripped for delve/gdb.
 make build TAGS=journald,azure   # optional-pipeline build tags; TAGS defaults to journald,azure,events
 make verify-tags        # the guard: no cgo without journald, no franz-go without azure — and, in its third command, the only step of `make check` that COMPILES the tag-less variant, hence the only one that type-checks `azure_disabled.go`

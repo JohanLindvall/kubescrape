@@ -9,6 +9,7 @@ import (
 
 	"github.com/JohanLindvall/kubescrape/internal/agent/azurediag"
 	"github.com/JohanLindvall/kubescrape/internal/cli"
+	"github.com/JohanLindvall/kubescrape/internal/obs"
 )
 
 // azureBuilt reports that this build contains the Azure diagnostics consumer:
@@ -58,6 +59,9 @@ func (p *pipelines) startAzure(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("azure diagnostics: %w", err)
 	}
+	// Registered exactly when the pipeline runs, so a published 0 means
+	// "joined and owns nothing", never "off" (obs.RegisterAzurePartitions).
+	obs.RegisterAzurePartitions(azurediag.AssignedPartitions)
 	// One Reader per source: each owns its kgo client, its poll/export/commit
 	// loop and its offsets, and they share the compiled chain and the
 	// exporter exactly as the other pipelines already do concurrently.

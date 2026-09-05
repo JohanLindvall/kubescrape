@@ -103,7 +103,8 @@ func TestDecodedStructureIsChargedNotOnlyRawBytes(t *testing.T) {
 	if got := decodedLogsSize(ld); got <= s.decoded.limit {
 		t.Fatalf("fixture estimates %d bytes, want more than the %d budget", got, s.decoded.limit)
 	}
-	before := obs.IngestRejected.Value()
+	before := ingestRejectedTotal()
+	beforeDecoded := obs.IngestRejected.WithLabelValues(shedDecoded).Value()
 
 	resp := postLogs(t, srv.URL, ld)
 	if resp.StatusCode != http.StatusTooManyRequests {
@@ -116,8 +117,11 @@ func TestDecodedStructureIsChargedNotOnlyRawBytes(t *testing.T) {
 	if len(exp.logs) != 0 {
 		t.Errorf("a refused push was forwarded (%d exports)", len(exp.logs))
 	}
-	if got := obs.IngestRejected.Value() - before; got != 1 {
+	if got := ingestRejectedTotal() - before; got != 1 {
 		t.Errorf("kubescrape_ingest_rejected_total moved %v, want 1", got)
+	}
+	if got := obs.IngestRejected.WithLabelValues(shedDecoded).Value() - beforeDecoded; got != 1 {
+		t.Errorf("kubescrape_ingest_rejected_total{reason=%q} moved %v, want 1: the label must name the bound", shedDecoded, got)
 	}
 	// And the charge does not leak: the next push, which fits, is admitted.
 	if used := s.decoded.used.Load(); used != 0 {
@@ -267,7 +271,7 @@ func TestGRPCDecodedBudgetRefusalIsRetryable(t *testing.T) {
 			if got := sig.size(n); got <= s.decoded.limit {
 				t.Fatalf("fixture estimates %d bytes, want more than the %d budget", got, s.decoded.limit)
 			}
-			before := obs.IngestRejected.Value()
+			before := ingestRejectedTotal()
 
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 			defer cancel()
@@ -294,7 +298,7 @@ func TestGRPCDecodedBudgetRefusalIsRetryable(t *testing.T) {
 			if got := p.forwards.Load(); got != 0 {
 				t.Errorf("a refused push was forwarded (%d exports)", got)
 			}
-			if got := obs.IngestRejected.Value() - before; got != 1 {
+			if got := ingestRejectedTotal() - before; got != 1 {
 				t.Errorf("kubescrape_ingest_rejected_total moved %v, want 1", got)
 			}
 			if used := s.decoded.used.Load(); used != 0 {

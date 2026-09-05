@@ -18,6 +18,7 @@ import (
 	"os/signal"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -72,19 +73,22 @@ func main() {
 // typedHandler builds informer callbacks that type-assert every payload to T:
 // Add and Update call upsert; Delete unwraps a DeletedFinalStateUnknown
 // tombstone first, then calls del. A payload of the wrong type is ignored.
-func typedHandler[T any](upsert, del func(T)) cache.ResourceEventHandlerFuncs {
+func typedHandler[T any](note func(), upsert, del func(T)) cache.ResourceEventHandlerFuncs {
 	return cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj any) {
+			note()
 			if v, ok := obj.(T); ok {
 				upsert(v)
 			}
 		},
 		UpdateFunc: func(_, obj any) {
+			note()
 			if v, ok := obj.(T); ok {
 				upsert(v)
 			}
 		},
 		DeleteFunc: func(obj any) {
+			note()
 			if tombstone, ok := obj.(cache.DeletedFinalStateUnknown); ok {
 				obj = tombstone.Obj
 			}
@@ -94,6 +98,48 @@ func typedHandler[T any](upsert, del func(T)) cache.ResourceEventHandlerFuncs {
 		},
 	}
 }
+
+// informerFreshness is the last-event clock of every informer this process
+// runs, published as kubescrape_informer_last_event_timestamp_seconds. Each
+// handler stamps its resource's slot on every event it delivers — one atomic
+// store on the informer goroutine — and the gauge reads the slots at export
+// time. It is the freshness half of the reachability probe (apiserver.go): the
+// probe proves a NEW connection reaches the API server, and this is what
+// notices an ESTABLISHED watch that has silently stopped delivering, which
+// the probe cannot.
+type informerFreshness struct {
+	mu    sync.Mutex
+	slots map[string]*atomic.Int64
+}
+
+// slot registers a resource and returns the stamp its handlers call per event.
+func (f *informerFreshness) slot(resource string) func() {
+	s := new(atomic.Int64)
+	f.mu.Lock()
+	if f.slots == nil {
+		f.slots = map[string]*atomic.Int64{}
+	}
+	f.slots[resource] = s
+	f.mu.Unlock()
+	return func() { s.Store(time.Now().Unix()) }
+}
+
+// snapshot is the gauge's read: every registered resource, 0 until its first
+// event.
+func (f *informerFreshness) snapshot() map[string]float64 {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make(map[string]float64, len(f.slots))
+	for resource, s := range f.slots {
+		out[resource] = float64(s.Load())
+	}
+	return out
+}
+
+// freshness is the process's one informerFreshness: the informers are wired in
+// three functions, and a package-level clock is what lets each stamp its own
+// resource without threading a value through all of them.
+var freshness informerFreshness
 
 // registerCoreInformers wires the pod and service informers into the store
 // and the service index, returning their HasSynced funcs.
@@ -112,7 +158,7 @@ func registerCoreInformers(factory informers.SharedInformerFactory, st *store.St
 	if err := watchErrors(podInformer, "pods"); err != nil {
 		return nil, fmt.Errorf("pod watch error handler: %w", err)
 	}
-	podReg, err := podInformer.AddEventHandler(typedHandler(
+	podReg, err := podInformer.AddEventHandler(typedHandler(freshness.slot("pods"),
 		func(pod *corev1.Pod) { st.UpsertPod(pod) },
 		func(pod *corev1.Pod) { st.DeletePod(pod.UID) },
 	))
@@ -126,7 +172,7 @@ func registerCoreInformers(factory informers.SharedInformerFactory, st *store.St
 	if err := watchErrors(svcInformer, "services"); err != nil {
 		return nil, fmt.Errorf("service watch error handler: %w", err)
 	}
-	svcReg, err := svcInformer.AddEventHandler(typedHandler(
+	svcReg, err := svcInformer.AddEventHandler(typedHandler(freshness.slot("services"),
 		func(svc *corev1.Service) { svcIndex.Upsert(svc) },
 		func(svc *corev1.Service) { svcIndex.Delete(svc.Namespace, svc.UID) },
 	))
@@ -156,7 +202,7 @@ func registerOwnerInformers(metaFactory metadatainformer.SharedInformerFactory, 
 		// request time and nothing here keeps derived state — so this handler
 		// does one thing: advance the change token that lets the node-targets
 		// ETag memo prove a client's copy is current without re-deriving it.
-		if _, err := inf.Informer().AddEventHandler(ownerChangeHandler(changes)); err != nil {
+		if _, err := inf.Informer().AddEventHandler(ownerChangeHandler(changes, freshness.slot(gvr.Resource))); err != nil {
 			return nil, nil, fmt.Errorf("%s change handler: %w", gvr.Resource, err)
 		}
 		listers[gvr] = inf.Lister()
@@ -193,10 +239,13 @@ func registerOwnerInformers(metaFactory metadatainformer.SharedInformerFactory, 
 // An unrecognised object type bumps rather than assumes — an unexpected shape
 // is not evidence that nothing changed. A tombstone on delete carries the
 // object, but the token only has to move, so its shape is irrelevant there.
-func ownerChangeHandler(changes *owners.Changes) cache.ResourceEventHandlerFuncs {
+func ownerChangeHandler(changes *owners.Changes, note func()) cache.ResourceEventHandlerFuncs {
 	return cache.ResourceEventHandlerFuncs{
-		AddFunc: func(any) { changes.Bump() },
+		AddFunc: func(any) { note(); changes.Bump() },
 		UpdateFunc: func(oldObj, newObj any) {
+			// Stamped before the status-only shortcut: an update that bumps no
+			// token is still the watch delivering.
+			note()
 			o, okOld := oldObj.(*metav1.PartialObjectMetadata)
 			n, okNew := newObj.(*metav1.PartialObjectMetadata)
 			// Raw maps, not the filtered ones kubemeta.CopyMeta would produce:
@@ -210,7 +259,7 @@ func ownerChangeHandler(changes *owners.Changes) cache.ResourceEventHandlerFuncs
 			}
 			changes.Bump()
 		},
-		DeleteFunc: func(any) { changes.Bump() },
+		DeleteFunc: func(any) { note(); changes.Bump() },
 	}
 }
 
@@ -322,7 +371,7 @@ func monitorInformer(
 	if err := watchErrors(inf, gvr.Resource); err != nil {
 		return nil, fmt.Errorf("%s watch error handler: %w", kind, err)
 	}
-	reg, err := inf.AddEventHandler(typedHandler(
+	reg, err := inf.AddEventHandler(typedHandler(freshness.slot(gvr.Resource),
 		func(u *unstructured.Unstructured) {
 			if !monitorAllowed(allowNS, kind, u, log) {
 				return
@@ -797,6 +846,9 @@ func run() error {
 	// on the informer goroutine, where nothing may log — see
 	// obs.RegisterStoreAnomalies for what each one means.
 	obs.RegisterStoreAnomalies(st.NameReuses, svcIndex.NameReuses, st.ContestedPodIPs)
+	// The informers' last-event clock, registered before any of them is wired
+	// so every slot the wiring adds is in the export from its first event.
+	obs.RegisterInformerFreshness(freshness.snapshot)
 	synced, err := registerCoreInformers(factory, st, svcIndex)
 	if err != nil {
 		return err
@@ -869,7 +921,7 @@ func run() error {
 	// SIGKILLed mid-sequence against an unreachable collector, losing the very
 	// exports the budgets exist to fit inside it. Sharing a deadline means a
 	// slow step spends what the later ones would have had, and nothing overruns.
-	var shutdownBy time.Time
+	var shutdownBy, shutdownStart time.Time
 	// stepBudget is what remains of the deadline, capped per step. A zero
 	// shutdownBy means we are NOT on the signal path — an early return, where
 	// nothing is racing a termination grace — and each step gets its full
@@ -1071,7 +1123,8 @@ func run() error {
 		runErr = fmt.Errorf("http server: %w", err)
 	case <-ctx.Done():
 		log.Info("shutting down")
-		shutdownBy = time.Now().Add(shutdownTotal)
+		shutdownStart = time.Now()
+		shutdownBy = shutdownStart.Add(shutdownTotal)
 		// WithoutCancel(ctx) rather than a bare Background: ctx is already
 		// cancelled, but its VALUES must survive into every shutdown step (the
 		// repo-wide rule — otlpexport's ownership marker rides on a context).
@@ -1101,6 +1154,14 @@ func run() error {
 		fctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), stepBudget())
 		obs.Registry.FinalExport(fctx, selfOut, selfRes, log)
 		cancel()
+	}
+	if !shutdownStart.IsZero() {
+		// The one line that says how the shutdown FIT: an operator sizing
+		// terminationGracePeriodSeconds, or reading a pod that was SIGKILLed,
+		// needs the elapsed time against the budget, and the deadline warning
+		// above fires only once it has already been blown.
+		log.Info("shutdown complete", "took", time.Since(shutdownStart).Round(time.Millisecond),
+			"budget", shutdownTotal, "deadlineExceeded", deadlineWarned)
 	}
 	return runErr
 }

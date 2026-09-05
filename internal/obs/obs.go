@@ -36,6 +36,18 @@ var (
 	// an alert for the buffered chain belongs.
 	LogPermanentDropped = Registry.Counter("kubescrape_log_permanent_dropped_total",
 		"Log records dropped after a definitive collector rejection (retrying could not succeed; offsets advanced so the pipeline survives).")
+	// LogSweeps is the tailer's HEARTBEAT. One sweep goroutine serves every
+	// file on the node, and the lag gauges below are published FROM it, so when
+	// it wedges — an export retry loop against a dead collector, an open(2)
+	// that blocks — they freeze at their last value and the node reads as
+	// quiet. A rate of zero here is the one signal for that state.
+	LogSweeps = Registry.Counter("kubescrape_log_sweeps_total",
+		"Sweeps the log tailer completed: its heartbeat. The single sweep goroutine serves every log file on "+
+			"the node and publishes the lag gauges itself, so when it wedges (an export retry loop against a "+
+			"dead collector, an open that blocks) those gauges FREEZE at their last value rather than move — a "+
+			"rate of zero here, with -logs on, is the signal that the tailer has stopped, where the lag gauges "+
+			"would say nothing changed. Poll-driven at -logs-poll-interval (500ms) plus one per file event, so "+
+			"the steady rate is a few per second.")
 	LogFiles = Registry.Gauge("kubescrape_log_files",
 		"Log files currently tracked.")
 	// LogFilesUnresolved answers the operator's first question — "why is this
@@ -275,6 +287,17 @@ var (
 	// failing to learn about a container the agent is holding log lines for
 	// RIGHT NOW — one blocked-lookup slot spent per occurrence, and the lines
 	// stay unattributed until it resolves.
+	// ContainerLookupWait is the timeouts counter's leading edge: how long the
+	// lookups that DID park waited. The informer lagging the kubelet shows here
+	// as a rising p90 well before waits start expiring, and resolved against
+	// timeout says whether the wait budget fits this cluster.
+	ContainerLookupWait = Registry.HistogramVec("kubescrape_container_lookup_wait_seconds",
+		"How long a blocking container lookup was parked before it was answered, by outcome: resolved (the "+
+			"container ID appeared and the wait paid off) or timeout (the budget expired first). Only lookups "+
+			"that actually parked are observed — an ID already in the store costs no wait and is not here — so "+
+			"the count is the parked-lookup rate and the distribution is the pod informer's lag behind the "+
+			"kubelet: a p90 creeping up under a timeout rate of zero is the informer falling behind before "+
+			"kubescrape_container_lookup_timeouts_total starts to move.", nil, "outcome")
 	ContainerLookupTimeouts = Registry.Counter("kubescrape_container_lookup_timeouts_total",
 		"Blocking container lookups whose wait budget expired without the container ID appearing in the store. A "+
 			"low rate is normal (the wait covers the ~1s gap between a container starting and the kubelet posting "+
@@ -336,6 +359,18 @@ var (
 	// should not.
 	InformerWatchErrors = Registry.CounterVec("kubescrape_informer_watch_errors_total",
 		"List/watch failures the informers REPORT, by resource: the refusals the API server ANSWERS (revoked RBAC, a deleted CRD, a rejected watch), plus any relist that fails. It does NOT reliably move while the API server is UNREACHABLE — client-go retries a refused watch internally and never relists, so this stayed flat through outages of up to five minutes — so alert on kubescrape_apiserver_reachable for that half.", "resource")
+
+	// NodeTargetsBuilds makes the node-targets ETag memo observable in
+	// production: the benchmark measured the win, and nothing else could say
+	// whether a running fleet gets it.
+	NodeTargetsBuilds = Registry.CounterVec("kubescrape_node_targets_builds_total",
+		"GET /v1/nodes/{node}/targets answers by how they were produced: built (the whole derivation, sort and "+
+			"marshal for that node ran) or memo_hit (a conditional GET whose ETag was current by the change "+
+			"token or the clock, answered 304 without building). Agents poll this route every scrape interval "+
+			"per node, so with the change tokens wired the steady state is almost all memo_hit and a built rate "+
+			"tracking real pod, Service and monitor churn; a built rate near the poll rate means the memo is "+
+			"not reaching the caller it exists for (a source publishing no change token, agents that send no "+
+			"If-None-Match, or a memo evicted at its cap).", "result")
 
 	// OwnerResolveFailures is internal/owners' ONE signal, and until it existed
 	// that package had none at all — no metric, no log, at any level.
@@ -620,6 +655,16 @@ var (
 			"payload and no retry can help, so a producer drops it). A sustained transient rate means the "+
 			"destination is down; any permanent rate means telemetry is being lost — the accompanying warning "+
 			"names the endpoint, the class and the likeliest cause.", "signal", "outcome")
+	// ExportDuration is what the outcome counter cannot say: a collector that
+	// is SLOW rather than down. Every attempt takes -otlp-timeout to fail when
+	// the collector hangs, and a p90 climbing towards that timeout is the
+	// warning before Exports{outcome="transient"} starts moving.
+	ExportDuration = Registry.HistogramVec("kubescrape_export_duration_seconds",
+		"Wall-clock duration of one OTLP export attempt by signal, successful or not (retries and split parts "+
+			"are separate attempts). The outcome counter says whether the collector answered; this says how "+
+			"long it took to, and a p90 climbing towards -otlp-timeout (15s) is the collector back-pressuring "+
+			"or a network path degrading before a single attempt fails — the tailer's flush and the ingest "+
+			"receiver's push both wait on exactly this.", nil, "signal")
 	// ExportSplitParts reports the size-split firing. It is otherwise
 	// invisible: a payload over -otlp-max-send-bytes is quietly delivered in
 	// pieces, each its own round trip, auth build and gzip pass — and the one
@@ -710,22 +755,21 @@ var (
 			"rules run in full on every record of such a resource, which is also why neither can move at all "+
 			"unless a logMetrics section is configured. The listeners are unauthenticated; a nonzero rate is a "+
 			"sender worth finding.", "reason")
-	IngestRejected = Registry.Counter("kubescrape_ingest_rejected_total",
+	IngestRejected = Registry.CounterVec("kubescrape_ingest_rejected_total",
 		"Pushed OTLP requests refused because a receiver admission bound was reached (retryable: 429 / "+
-			"ResourceExhausted — the payload is intact and the sender owns the retry). THREE bounds feed "+
-			"this one series and they bound different things, so read the metric with all three in mind: "+
-			"the CONCURRENT PUSH COUNT (-ingest-max-in-flight) bounds how many pushes are processed at "+
-			"once and bounds no memory at all; the RAW BYTE BUDGET bounds the payload bytes both "+
-			"transports hold while reading and decoding (four full-size bodies, scaled up in step with "+
-			"-ingest-grpc-max-recv-bytes); and the DECODED BUDGET (decodedSize's estimate against "+
-			"decodedBudgetFactor x the raw budget) bounds what those bytes inflate INTO, which the other "+
-			"two cannot — pdata's decoded structure runs several times the wire size, so a body inside "+
-			"every size cap can still be the thing that fills the node. Raising -ingest-max-in-flight or "+
-			"the body cap therefore does nothing for a decoded-budget refusal. One case is retryable in "+
-			"FORM but permanent in PRACTICE and is the reason this counter can sit at a steady rate from "+
-			"one sender: a single push whose decoded structure alone estimates past the whole decoded "+
-			"budget is refused on every retry — it carries a throttled Warn naming the estimate and the "+
-			"budget, and the fix is for that sender to batch smaller, never a larger bound here.")
+			"ResourceExhausted — the payload is intact and the sender owns the retry), by the bound that "+
+			"refused, which is also the remedy: in_flight is the CONCURRENT PUSH COUNT (-ingest-max-in-flight), "+
+			"which bounds how many pushes are processed at once and bounds no memory at all; buffer_bytes is the "+
+			"RAW BYTE BUDGET, the payload bytes both transports hold while reading and decoding (four full-size "+
+			"bodies, scaled up in step with -ingest-grpc-max-recv-bytes); decoded_bytes is the DECODED BUDGET "+
+			"(decodedSize's estimate against decodedBudgetFactor x the raw budget), what those bytes inflate "+
+			"INTO, which the other two cannot bound — pdata's decoded structure runs several times the wire "+
+			"size, so a body inside every size cap can still be the thing that fills the node, and raising "+
+			"-ingest-max-in-flight or the body cap does nothing for a decoded_bytes refusal. One decoded_bytes "+
+			"case is retryable in FORM but permanent in PRACTICE and is the reason this series can sit at a "+
+			"steady rate from one sender: a single push whose decoded structure alone estimates past the whole "+
+			"decoded budget is refused on every retry — it carries a throttled Warn naming the estimate and the "+
+			"budget, and the fix is for that sender to batch smaller, never a larger bound here.", "reason")
 	IngestReserveExpired = Registry.Counter("kubescrape_ingest_reserve_expired_total",
 		"gRPC pre-decode buffer reservations reclaimed because the peer sent no message inside the decode "+
 			"window; the reclaim also cancels that stream (the sender sees Canceled, which OTLP lists as "+
@@ -867,6 +911,44 @@ func RegisterMonitorsRejected(rejected func() map[string]int) {
 			}
 			return out
 		})
+}
+
+// RegisterInformerFreshness publishes the last time each informer delivered an
+// event, as a unix timestamp per resource. It is the FRESHNESS half of the
+// reachability probe: kubescrape_apiserver_reachable says a NEW connection
+// reaches the API server, which an established watch that has silently stopped
+// delivering (a blackholed connection, a proxy dropping the stream) does not
+// contradict — and this is what does. On a cluster whose pods change at all,
+// time() minus this gauge staying above a few minutes for pods is a watch that
+// is no longer advancing; on a quiet cluster the age is genuinely ambiguous,
+// which is why it is a gauge to read beside the probe rather than an alert on
+// its own.
+func RegisterInformerFreshness(last func() map[string]float64) {
+	Registry.GaugeFuncVec("kubescrape_informer_last_event_timestamp_seconds",
+		"Unix time of the last add, update or delete each informer delivered, by resource. The freshness half "+
+			"of kubescrape_apiserver_reachable: the probe says a NEW connection reaches the API server, which an "+
+			"established watch that has silently stopped delivering does not contradict, while this gauge stops "+
+			"advancing exactly then. time() minus this for pods staying above a few minutes on a cluster whose "+
+			"pods change at all is a watch that is no longer advancing; on a quiet cluster the age is ambiguous, "+
+			"so read it beside the probe and kubescrape_informer_watch_errors_total rather than alerting on it "+
+			"alone. 0 until the first event.", "resource", last)
+}
+
+// RegisterAzurePartitions publishes how many Event Hubs partitions the
+// consumer currently owns, summed over every configured source. It is
+// registered exactly when the pipeline runs, so a published 0 always means
+// "joined and owns nothing" — the state a topic pattern matching no hub, an
+// entity-scoped credential in a shared group, or a rebalance that assigned
+// this member nothing leaves behind, and which the records counter cannot tell
+// from a quiet hub.
+func RegisterAzurePartitions(assigned func() float64) {
+	Registry.GaugeFunc("kubescrape_azure_partitions_assigned",
+		"Event Hubs partitions currently assigned to this consumer, summed over every configured source. "+
+			"Registered only while -azure-diagnostics runs, so 0 means the consumer group was joined and this "+
+			"member owns nothing — a -azure-eventhub-topics pattern that matches no hub, an entity-scoped "+
+			"credential in a group shared with siblings that cannot see its hub, or a rebalance in progress — "+
+			"which kubescrape_azure_records_total cannot tell from a hub that is simply quiet. The assignment "+
+			"Info line names the topics and partitions each time it changes.", assigned)
 }
 
 // RegisterSelfMetadata exposes whether this process has resolved the pod it

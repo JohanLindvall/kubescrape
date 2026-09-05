@@ -467,7 +467,7 @@ type reservationKey struct{}
 func (s *Server) tapAdmit(ctx context.Context, _ *tap.Info) (context.Context, error) {
 	reserve := int64(s.grpcMaxRecv)
 	if !s.buffer.reserve(reserve) {
-		obs.IngestRejected.Inc()
+		obs.IngestRejected.WithLabelValues(shedBuffer).Inc()
 		// No peer: see noteShed. This is the one refusal taken before grpc-go
 		// has put the address anywhere this code can reach.
 		s.noteShed(shedBuffer, "")

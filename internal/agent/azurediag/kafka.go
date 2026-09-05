@@ -11,10 +11,12 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"os"
 	"slices"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/twmb/franz-go/pkg/kerr"
@@ -170,8 +172,37 @@ const (
 	fetchWarnEvery = 5 * time.Minute
 )
 
+// assignedPartitions is how many Event Hubs partitions this process's
+// consumers currently own, summed over every source; kubescrape_azure_partitions_assigned
+// reads it (obs.RegisterAzurePartitions). Package-level because the gauge is
+// one series for the process and the sources are built one at a time.
+var assignedPartitions atomic.Int64
+
+// AssignedPartitions reports the partitions currently assigned across every
+// consumer this process runs — the metric's read function.
+func AssignedPartitions() float64 { return float64(assignedPartitions.Load()) }
+
+// countPartitions is the partition count of a kgo assignment map.
+func countPartitions(m map[string][]int32) int {
+	n := 0
+	for _, ps := range m {
+		n += len(ps)
+	}
+	return n
+}
+
+// topicList renders an assignment map's topics for a log line, sorted so two
+// lines about the same set read the same.
+func topicList(m map[string][]int32) string {
+	return strings.Join(slices.Sorted(maps.Keys(m)), ",")
+}
+
 func newKafkaSource(cfg *Config) (source, error) {
 	k := &cfg.Kafka
+	log := cfg.Logger
+	if log == nil {
+		log = slog.Default()
+	}
 	opts := []kgo.Opt{
 		kgo.SeedBrokers(k.Brokers...),
 		kgo.ClientID("kubescrape-agent"),
@@ -207,11 +238,38 @@ func newKafkaSource(cfg *Config) (source, error) {
 	// without a logger a wrong credential is a consumer that blocks in silence
 	// (see kgolog.go).
 	opts = append(opts, kgo.WithLogger(kgoLoggerFor(cfg.Logger)))
+	// The assignment callbacks feed kubescrape_azure_partitions_assigned and
+	// narrate each change at Info: a consumer that joined its group and owns
+	// NOTHING (a topic pattern matching no hub, an entity-scoped credential in
+	// a shared group whose leader cannot see its hub) had no signal at all —
+	// the records counter reads exactly like a quiet hub — and a rebalance is
+	// a lifecycle event an operator wants without asking. Lost is separate
+	// from revoked: it means the group gave this member up without a handshake
+	// (a missed heartbeat), which is worth a Warn where a revoke is not.
+	opts = append(opts,
+		kgo.OnPartitionsAssigned(func(_ context.Context, _ *kgo.Client, assigned map[string][]int32) {
+			n := countPartitions(assigned)
+			total := assignedPartitions.Add(int64(n))
+			log.Info("event hubs partitions assigned", "group", k.Group, "topics", topicList(assigned),
+				"partitions", n, "assignedTotal", total)
+		}),
+		kgo.OnPartitionsRevoked(func(_ context.Context, _ *kgo.Client, revoked map[string][]int32) {
+			n := countPartitions(revoked)
+			total := assignedPartitions.Add(-int64(n))
+			log.Info("event hubs partitions revoked (rebalance)", "group", k.Group, "topics", topicList(revoked),
+				"partitions", n, "assignedTotal", total)
+		}),
+		kgo.OnPartitionsLost(func(_ context.Context, _ *kgo.Client, lost map[string][]int32) {
+			n := countPartitions(lost)
+			total := assignedPartitions.Add(-int64(n))
+			log.Warn("event hubs partitions lost: the group gave this member up without a rebalance handshake; they are reassigned by the next one",
+				"group", k.Group, "topics", topicList(lost), "partitions", n, "assignedTotal", total)
+		}),
+	)
 	cl, err := kgo.NewClient(opts...)
 	if err != nil {
 		return nil, fmt.Errorf("building the kafka client: %w", err)
 	}
-	log := cfg.Logger
 	if log == nil {
 		log = slog.Default()
 	}

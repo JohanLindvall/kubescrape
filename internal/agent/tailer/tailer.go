@@ -628,6 +628,11 @@ func (t *Tailer) closeIdleFiles() {
 // sweep reads newly appended data; all sweeps every file (polling
 // fallback), otherwise only files marked dirty by events are read.
 func (t *Tailer) sweep(ctx context.Context, all bool) {
+	// The heartbeat, counted on the way OUT: a sweep that wedges inside (an
+	// export retry loop, a blocking open) is exactly the one that must not
+	// count, and the lag gauges — published from this goroutine — freeze
+	// rather than move while it does (obs.LogSweeps).
+	defer obs.LogSweeps.Inc()
 	// Set lazily on the first unresolved file, so a sweep with nothing to
 	// resolve pays nothing.
 	var resolveDeadline time.Time

@@ -209,11 +209,11 @@ func TestBudgetRefusalStaysOnTheAdmissionCounter(t *testing.T) {
 	r := httptest.NewRequest("POST", "/v1/logs", bytes.NewReader(bytes.Repeat([]byte{0x0a}, 4096)))
 	r.Header.Set("Content-Type", "application/x-protobuf")
 
-	before, beforeAdmission := snapshotRejects(), obs.IngestRejected.Value()
+	before, beforeAdmission := snapshotRejects(), ingestRejectedTotal()
 	if _, _, err := br.Read(r); err == nil {
 		t.Fatal("the request must be refused")
 	}
-	if got := obs.IngestRejected.Value(); got != beforeAdmission+1 {
+	if got := ingestRejectedTotal(); got != beforeAdmission+1 {
 		t.Errorf("kubescrape_ingest_rejected_total = %v, want %v", got, beforeAdmission+1)
 	}
 	for _, reason := range bodyRejectReasons {
@@ -238,7 +238,7 @@ func TestBudgetRefusalKeepsItsClassWhenTheUploadAlsoAborted(t *testing.T) {
 	r := httptest.NewRequest("POST", "/v1/logs", &abortingBody{err: syscall.ECONNRESET})
 	r.Header.Set("Content-Type", "application/x-protobuf")
 
-	before, beforeAdmission := snapshotRejects(), obs.IngestRejected.Value()
+	before, beforeAdmission := snapshotRejects(), ingestRejectedTotal()
 	_, _, err := br.Read(r)
 	if !errors.Is(err, errBufferBudget) {
 		t.Fatalf("Read returned %v, want the budget refusal", err)
@@ -251,7 +251,7 @@ func TestBudgetRefusalKeepsItsClassWhenTheUploadAlsoAborted(t *testing.T) {
 	if got := w.Header().Get("Retry-After"); got != "1" {
 		t.Errorf("Retry-After = %q, want \"1\": the sender still holds an intact payload", got)
 	}
-	if got := obs.IngestRejected.Value(); got != beforeAdmission+1 {
+	if got := ingestRejectedTotal(); got != beforeAdmission+1 {
 		t.Errorf("kubescrape_ingest_rejected_total = %v, want %v", got, beforeAdmission+1)
 	}
 	for _, reason := range bodyRejectReasons {

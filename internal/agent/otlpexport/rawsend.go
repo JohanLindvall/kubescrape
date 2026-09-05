@@ -27,6 +27,7 @@ package otlpexport
 import (
 	"context"
 	"errors"
+	"time"
 
 	"go.opentelemetry.io/collector/pdata/plog/plogotlp"
 	"go.opentelemetry.io/collector/pdata/pmetric/pmetricotlp"
@@ -103,18 +104,21 @@ func (c *Client) rawSingleAttemptSends() (func(context.Context, []byte) error, f
 // where every send goes through here.
 
 func (c *Client) exportRawLogsCounted(ctx context.Context, data []byte) error {
+	started := time.Now()
 	err := c.sendRawLogsOnce(ctx, data)
-	return c.noteSend("logs", err)
+	return c.noteSend("logs", err, started)
 }
 
 func (c *Client) exportRawMetricsCounted(ctx context.Context, data []byte) error {
+	started := time.Now()
 	err := c.sendRawMetricsOnce(ctx, data)
-	return c.noteSend("metrics", err)
+	return c.noteSend("metrics", err, started)
 }
 
 func (c *Client) exportRawTracesCounted(ctx context.Context, data []byte) error {
+	started := time.Now()
 	err := c.sendRawTracesOnce(ctx, data)
-	return c.noteSend("traces", err)
+	return c.noteSend("traces", err, started)
 }
 
 func (c *Client) sendRawLogsOnce(ctx context.Context, data []byte) error {

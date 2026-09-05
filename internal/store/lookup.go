@@ -10,9 +10,11 @@ package store
 
 import (
 	"context"
+	"time"
 
 	"k8s.io/apimachinery/pkg/types"
 
+	"github.com/JohanLindvall/kubescrape/internal/obs"
 	"github.com/JohanLindvall/kubescrape/internal/peerip"
 	"github.com/JohanLindvall/kubescrape/pkg/kubemeta"
 )
@@ -48,6 +50,10 @@ func (s *Store) GetContainer(ctx context.Context, id string) (ContainerResult, b
 		// a waiter key (memory amplification) — degrade to a plain miss.
 		return ContainerResult{}, false, nil
 	}
+	// parkedAt is when this lookup first parked; zero while it never has. Only
+	// a parked lookup is observed (noteWait), so the fast paths above and the
+	// first pass below cost nothing.
+	var parkedAt time.Time
 	for {
 		// Double-checked: the ID may have been indexed since the read-locked
 		// miss (e.g. every waiter waking at once); re-checking under the read
@@ -56,6 +62,7 @@ func (s *Store) GetContainer(ctx context.Context, id string) (ContainerResult, b
 		res, ok, gone = s.lookupLocked(id)
 		s.mu.RUnlock()
 		if ok || gone {
+			noteWait(parkedAt, waitResolved)
 			return res, ok, nil
 		}
 		if ctx.Err() != nil {
@@ -67,12 +74,14 @@ func (s *Store) GetContainer(ctx context.Context, id string) (ContainerResult, b
 			// is the route's cheapest hostile shape (?wait=0, or a client that
 			// hung up), and write-lock churn is contended by every reader and by
 			// the informer goroutine.
+			noteWait(parkedAt, waitTimeout)
 			return ContainerResult{}, false, nil
 		}
 		s.mu.Lock()
 		res, ok, gone = s.lookupLocked(id)
 		if ok || gone {
 			s.mu.Unlock()
+			noteWait(parkedAt, waitResolved)
 			return res, ok, nil
 		}
 		if s.draining {
@@ -101,6 +110,9 @@ func (s *Store) GetContainer(ctx context.Context, id string) (ContainerResult, b
 		s.waiters[id] = append(s.waiters[id], ch)
 		s.nWaiters++
 		s.mu.Unlock()
+		if parkedAt.IsZero() {
+			parkedAt = time.Now()
+		}
 
 		select {
 		case <-ctx.Done():
@@ -111,6 +123,11 @@ func (s *Store) GetContainer(ctx context.Context, id string) (ContainerResult, b
 			s.mu.RLock()
 			res, ok, _ = s.lookupLocked(id)
 			s.mu.RUnlock()
+			if ok {
+				noteWait(parkedAt, waitResolved)
+			} else {
+				noteWait(parkedAt, waitTimeout)
+			}
 			return res, ok, nil
 		case <-ch:
 			// The ID was indexed; loop to fetch it.
@@ -326,4 +343,21 @@ func (s *Store) PodsOnNode(node string) []NodePod {
 		out = append(out, NodePod{Pod: rec.pod, OwnerRefs: rec.ownerRefs})
 	}
 	return out
+}
+
+// The outcomes kubescrape_container_lookup_wait_seconds is labelled by.
+const (
+	waitResolved = "resolved"
+	waitTimeout  = "timeout"
+)
+
+// noteWait observes how long a lookup was parked, once it is answered. A zero
+// parkedAt is a lookup that never parked, which is every warm-path answer and
+// deliberately not observed: the histogram is the pod informer's lag behind
+// the kubelet, and a hit costs no wait to lag.
+func noteWait(parkedAt time.Time, outcome string) {
+	if parkedAt.IsZero() {
+		return
+	}
+	obs.ContainerLookupWait.WithLabelValues(outcome).Observe(time.Since(parkedAt).Seconds())
 }

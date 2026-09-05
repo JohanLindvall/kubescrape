@@ -64,6 +64,16 @@ type file struct {
 	// drained. committed and readPos both rewind on a failed export, so they
 	// cannot tell whether the drained bytes were ever exported; this can.
 	goneEnd int64
+	// goneDrained: a gone-file drain has reached the end of what its fd can
+	// yield at least once, so goneEnd describes the inode and settledGone may
+	// compare against it. Zero on the first cycle and zeroed by resurrect; a
+	// cycle whose drain stops early (a mid-drain export failure rewound the
+	// fd, the per-drain cap fired, an archive would not reopen) leaves it
+	// unset, and the settle gate reads "committed >= goneEnd" as "nothing owed"
+	// only once it is set — on a first cycle goneEnd is still 0, so without
+	// this the rewound file settled and released the ONLY handle to the
+	// unlinked inode with every line past the rewind still behind it.
+	goneDrained bool
 	// archiveDone marks a compressed file read to completion; size/mod pin
 	// the on-disk identity so sweeps skip it until the file changes.
 	archiveDone bool

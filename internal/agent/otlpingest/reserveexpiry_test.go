@@ -35,7 +35,7 @@ func TestReserveWindowExpiryIsNotAnAdmissionRejection(t *testing.T) {
 	if err := export(t, client); err != nil {
 		t.Fatalf("warm-up push: %v", err) // also establishes the connection
 	}
-	before := obs.IngestRejected.Value()
+	before := ingestRejectedTotal()
 	expiredBefore := obs.IngestReserveExpired.Value()
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -59,7 +59,7 @@ func TestReserveWindowExpiryIsNotAnAdmissionRejection(t *testing.T) {
 			"streams: the reclaim cancels a peer's stream on an unauthenticated listener and must be "+
 			"visible to Prometheus, not only to whoever reads the throttled log line", got, 10*window)
 	}
-	if got := obs.IngestRejected.Value() - before; got != 0 {
+	if got := ingestRejectedTotal() - before; got != 0 {
 		t.Fatalf("kubescrape_ingest_rejected_total moved by %v on reclaimed decode windows; it counts pushes "+
 			"refused because an admission bound was reached, and nothing here was refused", got)
 	}
@@ -83,7 +83,7 @@ func TestBudgetRefusalStillCountsAsAnAdmissionRejection(t *testing.T) {
 	if err := export(t, client); err != nil {
 		t.Fatalf("warm-up push: %v", err)
 	}
-	before := obs.IngestRejected.Value()
+	before := ingestRejectedTotal()
 	expiredBefore := obs.IngestReserveExpired.Value()
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -100,7 +100,7 @@ func TestBudgetRefusalStillCountsAsAnAdmissionRejection(t *testing.T) {
 	if err := export(t, client); err == nil {
 		t.Fatal("a push with no budget left was served")
 	}
-	if got := obs.IngestRejected.Value() - before; got != 1 {
+	if got := ingestRejectedTotal() - before; got != 1 {
 		t.Fatalf("kubescrape_ingest_rejected_total moved by %v, want 1 for the shed push", got)
 	}
 	// The split has to hold in both directions, or the two series are one series

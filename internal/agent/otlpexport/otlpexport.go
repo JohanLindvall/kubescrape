@@ -419,8 +419,9 @@ func (c *Client) singleAttemptSends() (func(context.Context, plog.Logs) error, f
 // count — the unit both the public method and the buffered drain use, so
 // wire-send outcomes stay counted when -buffer-dir routes around ExportLogs.
 func (c *Client) exportLogsCounted(ctx context.Context, ld plog.Logs) error {
+	started := time.Now()
 	err := c.exportLogsOnce(ctx, ld)
-	return c.noteSend("logs", err)
+	return c.noteSend("logs", err, started)
 }
 
 func (c *Client) exportLogsOnce(ctx context.Context, ld plog.Logs) error {
@@ -467,8 +468,9 @@ func (c *Client) sendLogsOnce(ctx context.Context, ld plog.Logs) error {
 // ExportTraces sends one traces payload (single attempt; the pushing sender
 // retries via the ingest receiver's retryable status).
 func (c *Client) ExportTraces(ctx context.Context, td ptrace.Traces) error {
+	started := time.Now()
 	err := c.exportTracesOnce(ctx, td)
-	return c.noteSend("traces", err)
+	return c.noteSend("traces", err, started)
 }
 
 func (c *Client) exportTracesOnce(ctx context.Context, td ptrace.Traces) error {
@@ -556,8 +558,12 @@ func (c *Client) noteSplit(signal string, parts int, rep otlpsplit.Report) {
 // is refusing what this agent sends (permanent, and losing data every time) —
 // a distinction that previously existed only inside IsPermanent, where no
 // operator could see it.
-func (c *Client) noteSend(signal string, err error) error {
+func (c *Client) noteSend(signal string, err error, started time.Time) error {
 	obs.Exports.WithLabelValues(signal, Class(err)).Inc()
+	// The duration beside the outcome: a collector that is SLOW rather than
+	// down answers every attempt inside -otlp-timeout and moves no outcome
+	// counter, and this is where that is visible (obs.ExportDuration).
+	obs.ExportDuration.WithLabelValues(signal).Observe(time.Since(started).Seconds())
 	c.health.Note(signal, err)
 	return err
 }
@@ -619,8 +625,9 @@ func (c *Client) ExportMetrics(ctx context.Context, md pmetric.Metrics) error {
 // exportMetricsCounted is one attempt plus the obs.Exports outcome count (see
 // exportLogsCounted).
 func (c *Client) exportMetricsCounted(ctx context.Context, md pmetric.Metrics) error {
+	started := time.Now()
 	err := c.exportMetricsOnce(ctx, md)
-	return c.noteSend("metrics", err)
+	return c.noteSend("metrics", err, started)
 }
 
 func (c *Client) exportMetricsOnce(ctx context.Context, md pmetric.Metrics) error {

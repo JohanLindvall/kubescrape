@@ -39,7 +39,7 @@ func partial(rv string, labels, annotations map[string]string) *metav1.PartialOb
 // would still report the full win.
 func TestStatusOnlyUpdatesDoNotAdvanceTheOwnerToken(t *testing.T) {
 	var c owners.Changes
-	h := ownerChangeHandler(&c)
+	h := ownerChangeHandler(&c, func() {})
 
 	for _, tc := range []struct {
 		name     string
@@ -105,7 +105,7 @@ func TestServedChangesAdvanceTheOwnerToken(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var c owners.Changes
-			h := ownerChangeHandler(&c)
+			h := ownerChangeHandler(&c, func() {})
 			var oldObj, newObj any = tc.old, tc.new
 			if tc.old == nil {
 				oldObj, newObj = "not-metadata", "not-metadata either"
@@ -121,7 +121,7 @@ func TestServedChangesAdvanceTheOwnerToken(t *testing.T) {
 	// Add and delete always move it: an object appearing or disappearing
 	// changes what every pod owned by it resolves to.
 	var c owners.Changes
-	h := ownerChangeHandler(&c)
+	h := ownerChangeHandler(&c, func() {})
 	h.AddFunc(partial("1", nil, nil))
 	if c.Generation() == 0 {
 		t.Error("add did not advance the token")

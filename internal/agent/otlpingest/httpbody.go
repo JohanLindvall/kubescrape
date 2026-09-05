@@ -299,7 +299,7 @@ func (br *BodyReader) Read(r *http.Request) ([]byte, int64, error) {
 	fail := func(err error) ([]byte, int64, error) {
 		br.Release(bd.held)
 		if errors.Is(err, errBufferBudget) {
-			obs.IngestRejected.Inc()
+			obs.IngestRejected.WithLabelValues(shedBuffer).Inc()
 			return nil, 0, err
 		}
 		br.noteRejected(r, err)

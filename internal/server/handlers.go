@@ -459,6 +459,9 @@ func (s *Server) handleNodeTargets(w http.ResponseWriter, r *http.Request) {
 	if s.nodeTargetsNotModified(w, r, node) {
 		return
 	}
+	// Every answer that is not the memo's is a derivation, and the pair is
+	// what says whether the memo reaches the fleet (obs.NodeTargetsBuilds).
+	obs.NodeTargetsBuilds.WithLabelValues("built").Inc()
 	// Sampled before the derivation reads a single source (see targetsValidity).
 	valid := s.targetsValidity()
 	targets, built := s.nodeTargets(node)
@@ -2101,6 +2104,7 @@ func (s *Server) nodeTargetsNotModified(w http.ResponseWriter, r *http.Request, 
 	if maxAge < 1 {
 		return false
 	}
+	obs.NodeTargetsBuilds.WithLabelValues("memo_hit").Inc()
 	h := w.Header()
 	h.Set("Content-Type", "application/json")
 	h.Set("Cache-Control", "max-age="+strconv.Itoa(maxAge))

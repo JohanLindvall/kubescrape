@@ -1013,6 +1013,7 @@ func run() error {
 
 	<-ctx.Done()
 	log.Info("shutting down")
+	shutdownStart := time.Now()
 	// One DEADLINE for the whole shutdown sequence, rather than a fixed budget
 	// per step. Summed literals could exceed the pod's termination grace on a
 	// fully-configured trace tier — each step is individually reasonable and
@@ -1169,6 +1170,12 @@ func run() error {
 		finalDrain(dctx)
 		dcancel()
 	}
+	// The one line that says how the shutdown FIT: an operator sizing
+	// terminationGracePeriodSeconds, or reading a pod that was SIGKILLed, needs
+	// the elapsed time against the budget, and the deadline warning above
+	// fires only once it has already been blown.
+	log.Info("shutdown complete", "took", time.Since(shutdownStart).Round(time.Millisecond),
+		"budget", shutdownTotal, "deadlineExceeded", deadlineWarned)
 	if ferr := fatalErr.Load(); ferr != nil {
 		return *ferr
 	}

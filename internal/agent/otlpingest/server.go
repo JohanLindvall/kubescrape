@@ -280,7 +280,7 @@ func (s *Server) acquire() bool {
 	case s.inFlight <- struct{}{}:
 		return true
 	default:
-		obs.IngestRejected.Inc()
+		obs.IngestRejected.WithLabelValues(shedInFlight).Inc()
 		return false
 	}
 }
@@ -296,7 +296,7 @@ func (s *Server) chargeDecoded(n int64) bool {
 	if n <= 0 || s.decoded.reserve(n) {
 		return true
 	}
-	obs.IngestRejected.Inc()
+	obs.IngestRejected.WithLabelValues(shedDecoded).Inc()
 	if n > s.decoded.limit && s.decodedWarns.Allow(decodedWarnEvery) {
 		s.log.Warn("ingest: refused a push whose decoded structure alone exceeds the receiver's whole "+
 			"decoded budget; every retry of it will be refused too — the sender must batch smaller",

@@ -326,8 +326,11 @@ func (t *Tailer) archiveReplaced(f *file) bool {
 
 // drainArchive finishes reading a mid-read archive from its still-open fd
 // (the file may already be unlinked) so its remainder is not lost when the
-// file drops.
-func (t *Tailer) drainArchive(ctx context.Context, f *file) {
+// file drops. It reports whether the drain reached the end of what the fd can
+// yield — drainFile's contract, and read by drainGone the same way: a cycle
+// that stopped early (a mid-drain flush failure, the per-drain cap, a reopen
+// that failed) must not settle the file.
+func (t *Tailer) drainArchive(ctx context.Context, f *file) bool {
 	if f.gz == nil {
 		// Reader closed at EOF or by a rewind, but the data is not committed and
 		// the fd is still held: re-decompress the uncommitted suffix from it.
@@ -352,10 +355,10 @@ func (t *Tailer) drainArchive(ctx context.Context, f *file) {
 					"path", f.path, "committed", f.committed, "owedTo", f.goneEnd)
 				f.goneEnd = f.committed
 			}
-			return
+			return true // nothing left that a drain could reach: settle
 		}
 		if f.archiveEOF || f.committed >= f.readPos && f.archiveDone {
-			return
+			return true // everything fed; only its flush is pending
 		}
 		if err := t.openArchive(f); err != nil {
 			// A failed reopen is a drain that ended in an error without
@@ -364,12 +367,12 @@ func (t *Tailer) drainArchive(ctx context.Context, f *file) {
 			// unreachable-goneEnd wedge chargeGoneStall bounds.
 			f.drainErred = true
 			t.log.Warn("re-opening archive to drain", "path", f.path, "error", err)
-			return
+			return false
 		}
 	}
 	// An aborted drain (mid-drain flush failure) retries on a later sweep:
 	// the gone-file loop calls drainGone every sweep until settledGone.
-	_ = t.drainReader(ctx, f, f.gz, "archive")
+	return t.drainReader(ctx, f, f.gz, "archive")
 }
 
 // closeArchive releases the archive's readers.

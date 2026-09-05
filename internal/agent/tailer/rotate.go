@@ -357,6 +357,7 @@ func (t *Tailer) reopen(ctx context.Context, f *file, renamed, drained bool) {
 	// A new incarnation: any goneEnd from an earlier one no longer describes
 	// this file (see the resurrect path in sweep).
 	f.goneEnd = 0
+	f.goneDrained = false
 	f.inode = 0
 	f.fp = fingerprint{}
 	f.committed = 0
@@ -510,7 +511,7 @@ func (t *Tailer) chargeStall(f *file, sg *segment, gen int, progressBefore int64
 // normal gone cleanup (the next successful-listing save prunes its checkpoint
 // line). It reports whether the file was given up on.
 func (t *Tailer) chargeGoneStall(f *file, gen int, progressBefore int64) bool {
-	if f.rewindGen != gen || !f.drainErred || f.committed > progressBefore || f.committed >= f.goneEnd {
+	if f.rewindGen != gen || !f.drainErred || f.committed > progressBefore || (f.goneDrained && f.committed >= f.goneEnd) {
 		f.goneStalledSince = time.Time{}
 		return false
 	}
@@ -862,6 +863,9 @@ func (t *Tailer) drainGone(ctx context.Context, f *file) {
 		// gone file can never resolve (the gone check precedes metadata
 		// resolution), so re-counting here spammed the metric and the log ~2/s
 		// per file forever.
+		// Nothing was ever read, so there is nothing to drain: the entry may
+		// settle on this sweep.
+		f.goneDrained = true
 		if f.unresolvedLost {
 			return
 		}
@@ -888,6 +892,7 @@ func (t *Tailer) drainGone(ctx context.Context, f *file) {
 		// the same intent-not-loss (no counter). goneEnd stays untouched, so
 		// settledGone releases the entry on this sweep.
 		t.dropExcludedBacklog(f)
+		f.goneDrained = true
 		return
 	}
 	// Incomplete segments are OLDER than the current inode's remainder and
@@ -904,22 +909,32 @@ func (t *Tailer) drainGone(ctx context.Context, f *file) {
 		// merely waits its turn.
 		return
 	}
+	var drained bool
 	if f.compressed {
 		// A large archive is read incrementally across sweeps; a deletion
 		// mid-read leaves the rest readable from the open fd.
-		t.drainArchive(ctx, f)
-	} else if !t.drainFile(ctx, f) {
+		drained = t.drainArchive(ctx, f)
+	} else {
+		drained = t.drainFile(ctx, f)
+	}
+	if !drained {
 		// The drain did not reach the end of the inode — a mid-drain flush
-		// failure rewound it, or the per-drain cap fired on a deep backlog.
-		// Stop the cycle here rather than falling through to the settle
-		// accounting below: goneEnd is what releases the file, and stamping it
-		// from a fed boundary the drain never reached would settle the entry —
-		// closing the ONLY handle to the unlinked inode — with its remainder
-		// unread and no counter moving. drainGone re-runs every sweep until
-		// settledGone, so the next one continues from where this fd stopped
-		// (the flush-failure case was always safe this way: the rewind lowers
-		// committed, so settledGone could not fire — the cap case had no such
-		// protection).
+		// failure rewound it, the per-drain cap fired on a deep backlog, or an
+		// archive would not reopen. Stop the cycle here rather than falling
+		// through to the settle accounting below: goneEnd is what releases the
+		// file, and stamping it from a fed boundary the drain never reached
+		// would settle the entry — closing the ONLY handle to the unlinked
+		// inode — with its remainder unread and no counter moving. drainGone
+		// re-runs every sweep until settledGone, so the next one continues
+		// from where this fd stopped.
+		//
+		// Returning is not enough on its own, and it used to be all this did:
+		// on a FIRST cycle goneEnd is still zero, so "committed >= goneEnd"
+		// held after the rewind and settledGone released the fd anyway — every
+		// line past the rewind lost, silently, for a pod deleted during a
+		// collector outage (TestGoneFileMidDrainExportFailureDoesNotSettle).
+		// goneDrained is what tells the gate that goneEnd means nothing yet; it
+		// is stamped below, only by a cycle that reached the end.
 		//
 		// Not feeding pending here is deliberate too: with bytes still owed,
 		// pending is a fragment with more of its line to come, not the
@@ -958,6 +973,7 @@ func (t *Tailer) drainGone(ctx context.Context, f *file) {
 	// covering them held the fd and the files-map entry forever (max keeps it
 	// rewind-proof — a failed export must not lower an already-drained end).
 	f.goneEnd = max(f.goneEnd, f.fedEnd())
+	f.goneDrained = true
 }
 
 // resurrect withdraws a gone verdict for a file whose path is proven alive
@@ -986,6 +1002,7 @@ func (t *Tailer) drainGone(ctx context.Context, f *file) {
 func (f *file) resurrect() {
 	f.gone = false
 	f.goneEnd = 0
+	f.goneDrained = false
 	f.goneStalledSince = time.Time{}
 }
 
@@ -1009,6 +1026,11 @@ func (t *Tailer) release(f *file) {
 // to committed, which would otherwise look settled while the data is still
 // unexported and reachable only through our fd.
 func (t *Tailer) settledGone(f *file) bool {
+	if !f.goneDrained {
+		// No drain has reached the inode's end yet, so goneEnd describes
+		// nothing: the fd is the only route to what is still owed.
+		return false
+	}
 	if len(f.segments) > 0 {
 		// Incomplete segments still hold unexported lines whose only handles
 		// are the retained fds release() would close; commitBatch retires

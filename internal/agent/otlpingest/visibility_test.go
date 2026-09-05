@@ -66,7 +66,8 @@ func TestSheddingAtTheInFlightBoundIsReportedOnBothTransports(t *testing.T) {
 			}
 			defer s.release()
 
-			before := obs.IngestRejected.Value()
+			before := ingestRejectedTotal()
+			beforeInFlight := obs.IngestRejected.WithLabelValues(shedInFlight).Value()
 			switch transport {
 			case "grpc":
 				_, err := s.limitUnary(context.Background(), nil, &grpc.UnaryServerInfo{},
@@ -88,8 +89,11 @@ func TestSheddingAtTheInFlightBoundIsReportedOnBothTransports(t *testing.T) {
 					t.Fatalf("status = %d, want 429", rec.Code)
 				}
 			}
-			if got := obs.IngestRejected.Value() - before; got != 1 {
+			if got := ingestRejectedTotal() - before; got != 1 {
 				t.Errorf("kubescrape_ingest_rejected_total delta = %v, want 1", got)
+			}
+			if got := obs.IngestRejected.WithLabelValues(shedInFlight).Value() - beforeInFlight; got != 1 {
+				t.Errorf("kubescrape_ingest_rejected_total{reason=%q} delta = %v, want 1: the label must name the bound", shedInFlight, got)
 			}
 			out := dump()
 			if !strings.Contains(out, "shedding pushes at an admission bound") {
